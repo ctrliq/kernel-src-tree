@@ -1,0 +1,573 @@
+powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8" (Thomas Huth) [1269653]
+Rebuild_FUZZ: 94.34%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 23316316c1af0677a041c81f3ad6efb9dc470b33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/23316316.failed
+
+This reverts commit 9678cdaae939 ("Use the POWER8 Micro Partition
+Prefetch Engine in KVM HV on POWER8") because the original commit had
+multiple, partly self-cancelling bugs, that could cause occasional
+memory corruption.
+
+In fact the logmpp instruction was incorrectly using register r0 as the
+source of the buffer address and operation code, and depending on what
+was in r0, it would either do nothing or corrupt the 64k page pointed to
+by r0.
+
+The logmpp instruction encoding and the operation code definitions could
+be corrected, but then there is the problem that there is no clearly
+defined way to know when the hardware has finished writing to the
+buffer.
+
+The original commit attempted to work around this by aborting the
+write-out before starting the prefetch, but this is ineffective in the
+case where the virtual core is now executing on a different physical
+core from the one where the write-out was initiated.
+
+These problems plus advice from the hardware designers not to use the
+function (since the measured performance improvement from using the
+feature was actually mostly negative), mean that reverting the code is
+the best option.
+
+Fixes: 9678cdaae939 ("Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 23316316c1af0677a041c81f3ad6efb9dc470b33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/include/asm/ppc-opcode.h
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index d17590f243b6,887c259556df..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -314,18 -297,28 +314,22 @@@ struct kvmppc_vcore 
+  	u32 arch_compat;
+  	ulong pcr;
+  	ulong dpdes;		/* doorbell state (POWER8) */
+++<<<<<<< HEAD
+ +	void *mpp_buffer; /* Micro Partition Prefetch buffer */
+ +	bool mpp_buffer_is_valid;
+++=======
++ 	ulong conferring_threads;
+++>>>>>>> 23316316c1af (powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+  };
+  
+ -#define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
+ -#define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
+ -#define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
+ -
+ -/* This bit is used when a vcore exit is triggered from outside the vcore */
+ -#define VCORE_EXIT_REQ		0x10000
+ +#define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+ +#define VCORE_EXIT_COUNT(vc)	((vc)->entry_exit_count >> 8)
+  
+ -/*
+ - * Values for vcore_state.
+ - * Note that these are arranged such that lower values
+ - * (< VCORE_SLEEPING) don't require stolen time accounting
+ - * on load/unload, and higher values do.
+ - */
+ +/* Values for vcore_state */
+  #define VCORE_INACTIVE	0
+ -#define VCORE_PREEMPT	1
+ -#define VCORE_PIGGYBACK	2
+ -#define VCORE_SLEEPING	3
+ -#define VCORE_RUNNING	4
+ -#define VCORE_EXITING	5
+ +#define VCORE_SLEEPING	1
+ +#define VCORE_RUNNING	2
+ +#define VCORE_EXITING	3
+  
+  /*
+   * Struct used to manage memory for a virtual processor area
+diff --cc arch/powerpc/include/asm/ppc-opcode.h
+index c636841fc772,7ab04fc59e24..000000000000
+--- a/arch/powerpc/include/asm/ppc-opcode.h
++++ b/arch/powerpc/include/asm/ppc-opcode.h
+@@@ -276,20 -284,6 +275,23 @@@
+  #define __PPC_EH(eh)	0
+  #endif
+  
+++<<<<<<< HEAD
+ +/* POWER8 Micro Partition Prefetch (MPP) parameters */
+ +/* Address mask is common for LOGMPP instruction and MPPR SPR */
+ +#define PPC_MPPE_ADDRESS_MASK 0xffffffffc000
+ +
+ +/* Bits 60 and 61 of MPP SPR should be set to one of the following */
+ +/* Aborting the fetch is indeed setting 00 in the table size bits */
+ +#define PPC_MPPR_FETCH_ABORT (0x0ULL << 60)
+ +#define PPC_MPPR_FETCH_WHOLE_TABLE (0x2ULL << 60)
+ +
+ +/* Bits 54 and 55 of register for LOGMPP instruction should be set to: */
+ +#define PPC_LOGMPP_LOG_L2 (0x02ULL << 54)
+ +#define PPC_LOGMPP_LOG_L2L3 (0x01ULL << 54)
+ +#define PPC_LOGMPP_LOG_ABORT (0x03ULL << 54)
+ +
+++=======
+++>>>>>>> 23316316c1af (powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+  /* Deal with instructions that older assemblers aren't aware of */
+  #define	PPC_DCBAL(a, b)		stringify_in_c(.long PPC_INST_DCBAL | \
+  					__PPC_RA(a) | __PPC_RB(b))
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903,9c26c5a96ea2..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -70,12 -74,12 +69,21 @@@
+  
+  static DECLARE_BITMAP(default_enabled_hcalls, MAX_HCALL_OPCODE/4 + 1);
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_PPC_64K_PAGES)
+ +#define MPP_BUFFER_ORDER	0
+ +#elif defined(CONFIG_PPC_4K_PAGES)
+ +#define MPP_BUFFER_ORDER	3
+ +#endif
+ +
+++=======
++ static int dynamic_mt_modes = 6;
++ module_param(dynamic_mt_modes, int, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(dynamic_mt_modes, "Set of allowed dynamic micro-threading modes: 0 (= none), 2, 4, or 6 (= 2 or 4)");
++ static int target_smt_mode;
++ module_param(target_smt_mode, int, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(target_smt_mode, "Target threads per core (0 = max)");
+++>>>>>>> 23316316c1af (powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+  
+  static void kvmppc_end_cede(struct kvm_vcpu *vcpu);
+  static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu);
+@@@ -1365,14 -1446,8 +1373,7 @@@ static struct kvmppc_vcore *kvmppc_vcor
+  	vcore->lpcr = kvm->arch.lpcr;
+  	vcore->first_vcpuid = core * threads_per_subcore;
+  	vcore->kvm = kvm;
+ -	INIT_LIST_HEAD(&vcore->preempt_list);
+  
+- 	vcore->mpp_buffer_is_valid = false;
+- 
+- 	if (cpu_has_feature(CPU_FTR_ARCH_207S))
+- 		vcore->mpp_buffer = (void *)__get_free_pages(
+- 			GFP_KERNEL|__GFP_ZERO,
+- 			MPP_BUFFER_ORDER);
+- 
+  	return vcore;
+  }
+  
+@@@ -1649,31 -1880,276 +1650,304 @@@ static int on_primary_thread(void
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static void kvmppc_start_saving_l2_cache(struct kvmppc_vcore *vc)
+ +{
+ +	phys_addr_t phy_addr, mpp_addr;
+ +
+ +	phy_addr = (phys_addr_t)virt_to_phys(vc->mpp_buffer);
+ +	mpp_addr = phy_addr & PPC_MPPE_ADDRESS_MASK;
+ +
+ +	mtspr(SPRN_MPPR, mpp_addr | PPC_MPPR_FETCH_ABORT);
+ +	logmpp(mpp_addr | PPC_LOGMPP_LOG_L2);
+ +
+ +	vc->mpp_buffer_is_valid = true;
+ +}
+ +
+ +static void kvmppc_start_restoring_l2_cache(const struct kvmppc_vcore *vc)
+ +{
+ +	phys_addr_t phy_addr, mpp_addr;
+ +
+ +	phy_addr = virt_to_phys(vc->mpp_buffer);
+ +	mpp_addr = phy_addr & PPC_MPPE_ADDRESS_MASK;
+ +
+ +	/* We must abort any in-progress save operations to ensure
+ +	 * the table is valid so that prefetch engine knows when to
+ +	 * stop prefetching. */
+ +	logmpp(mpp_addr | PPC_LOGMPP_LOG_ABORT);
+ +	mtspr(SPRN_MPPR, mpp_addr | PPC_MPPR_FETCH_WHOLE_TABLE);
+++=======
++ /*
++  * A list of virtual cores for each physical CPU.
++  * These are vcores that could run but their runner VCPU tasks are
++  * (or may be) preempted.
++  */
++ struct preempted_vcore_list {
++ 	struct list_head	list;
++ 	spinlock_t		lock;
++ };
++ 
++ static DEFINE_PER_CPU(struct preempted_vcore_list, preempted_vcores);
++ 
++ static void init_vcore_lists(void)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct preempted_vcore_list *lp = &per_cpu(preempted_vcores, cpu);
++ 		spin_lock_init(&lp->lock);
++ 		INIT_LIST_HEAD(&lp->list);
++ 	}
++ }
++ 
++ static void kvmppc_vcore_preempt(struct kvmppc_vcore *vc)
++ {
++ 	struct preempted_vcore_list *lp = this_cpu_ptr(&preempted_vcores);
++ 
++ 	vc->vcore_state = VCORE_PREEMPT;
++ 	vc->pcpu = smp_processor_id();
++ 	if (vc->num_threads < threads_per_subcore) {
++ 		spin_lock(&lp->lock);
++ 		list_add_tail(&vc->preempt_list, &lp->list);
++ 		spin_unlock(&lp->lock);
++ 	}
++ 
++ 	/* Start accumulating stolen time */
++ 	kvmppc_core_start_stolen(vc);
++ }
++ 
++ static void kvmppc_vcore_end_preempt(struct kvmppc_vcore *vc)
++ {
++ 	struct preempted_vcore_list *lp;
++ 
++ 	kvmppc_core_end_stolen(vc);
++ 	if (!list_empty(&vc->preempt_list)) {
++ 		lp = &per_cpu(preempted_vcores, vc->pcpu);
++ 		spin_lock(&lp->lock);
++ 		list_del_init(&vc->preempt_list);
++ 		spin_unlock(&lp->lock);
++ 	}
++ 	vc->vcore_state = VCORE_INACTIVE;
++ }
++ 
++ /*
++  * This stores information about the virtual cores currently
++  * assigned to a physical core.
++  */
++ struct core_info {
++ 	int		n_subcores;
++ 	int		max_subcore_threads;
++ 	int		total_threads;
++ 	int		subcore_threads[MAX_SUBCORES];
++ 	struct kvm	*subcore_vm[MAX_SUBCORES];
++ 	struct list_head vcs[MAX_SUBCORES];
++ };
++ 
++ /*
++  * This mapping means subcores 0 and 1 can use threads 0-3 and 4-7
++  * respectively in 2-way micro-threading (split-core) mode.
++  */
++ static int subcore_thread_map[MAX_SUBCORES] = { 0, 4, 2, 6 };
++ 
++ static void init_core_info(struct core_info *cip, struct kvmppc_vcore *vc)
++ {
++ 	int sub;
++ 
++ 	memset(cip, 0, sizeof(*cip));
++ 	cip->n_subcores = 1;
++ 	cip->max_subcore_threads = vc->num_threads;
++ 	cip->total_threads = vc->num_threads;
++ 	cip->subcore_threads[0] = vc->num_threads;
++ 	cip->subcore_vm[0] = vc->kvm;
++ 	for (sub = 0; sub < MAX_SUBCORES; ++sub)
++ 		INIT_LIST_HEAD(&cip->vcs[sub]);
++ 	list_add_tail(&vc->preempt_list, &cip->vcs[0]);
++ }
++ 
++ static bool subcore_config_ok(int n_subcores, int n_threads)
++ {
++ 	/* Can only dynamically split if unsplit to begin with */
++ 	if (n_subcores > 1 && threads_per_subcore < MAX_SMT_THREADS)
++ 		return false;
++ 	if (n_subcores > MAX_SUBCORES)
++ 		return false;
++ 	if (n_subcores > 1) {
++ 		if (!(dynamic_mt_modes & 2))
++ 			n_subcores = 4;
++ 		if (n_subcores > 2 && !(dynamic_mt_modes & 4))
++ 			return false;
++ 	}
++ 
++ 	return n_subcores * roundup_pow_of_two(n_threads) <= MAX_SMT_THREADS;
++ }
++ 
++ static void init_master_vcore(struct kvmppc_vcore *vc)
++ {
++ 	vc->master_vcore = vc;
++ 	vc->entry_exit_map = 0;
++ 	vc->in_guest = 0;
++ 	vc->napping_threads = 0;
++ 	vc->conferring_threads = 0;
++ }
++ 
++ /*
++  * See if the existing subcores can be split into 3 (or fewer) subcores
++  * of at most two threads each, so we can fit in another vcore.  This
++  * assumes there are at most two subcores and at most 6 threads in total.
++  */
++ static bool can_split_piggybacked_subcores(struct core_info *cip)
++ {
++ 	int sub, new_sub;
++ 	int large_sub = -1;
++ 	int thr;
++ 	int n_subcores = cip->n_subcores;
++ 	struct kvmppc_vcore *vc, *vcnext;
++ 	struct kvmppc_vcore *master_vc = NULL;
++ 
++ 	for (sub = 0; sub < cip->n_subcores; ++sub) {
++ 		if (cip->subcore_threads[sub] <= 2)
++ 			continue;
++ 		if (large_sub >= 0)
++ 			return false;
++ 		large_sub = sub;
++ 		vc = list_first_entry(&cip->vcs[sub], struct kvmppc_vcore,
++ 				      preempt_list);
++ 		if (vc->num_threads > 2)
++ 			return false;
++ 		n_subcores += (cip->subcore_threads[sub] - 1) >> 1;
++ 	}
++ 	if (n_subcores > 3 || large_sub < 0)
++ 		return false;
++ 
++ 	/*
++ 	 * Seems feasible, so go through and move vcores to new subcores.
++ 	 * Note that when we have two or more vcores in one subcore,
++ 	 * all those vcores must have only one thread each.
++ 	 */
++ 	new_sub = cip->n_subcores;
++ 	thr = 0;
++ 	sub = large_sub;
++ 	list_for_each_entry_safe(vc, vcnext, &cip->vcs[sub], preempt_list) {
++ 		if (thr >= 2) {
++ 			list_del(&vc->preempt_list);
++ 			list_add_tail(&vc->preempt_list, &cip->vcs[new_sub]);
++ 			/* vc->num_threads must be 1 */
++ 			if (++cip->subcore_threads[new_sub] == 1) {
++ 				cip->subcore_vm[new_sub] = vc->kvm;
++ 				init_master_vcore(vc);
++ 				master_vc = vc;
++ 				++cip->n_subcores;
++ 			} else {
++ 				vc->master_vcore = master_vc;
++ 				++new_sub;
++ 			}
++ 		}
++ 		thr += vc->num_threads;
++ 	}
++ 	cip->subcore_threads[large_sub] = 2;
++ 	cip->max_subcore_threads = 2;
++ 
++ 	return true;
++ }
++ 
++ static bool can_dynamic_split(struct kvmppc_vcore *vc, struct core_info *cip)
++ {
++ 	int n_threads = vc->num_threads;
++ 	int sub;
++ 
++ 	if (!cpu_has_feature(CPU_FTR_ARCH_207S))
++ 		return false;
++ 
++ 	if (n_threads < cip->max_subcore_threads)
++ 		n_threads = cip->max_subcore_threads;
++ 	if (subcore_config_ok(cip->n_subcores + 1, n_threads)) {
++ 		cip->max_subcore_threads = n_threads;
++ 	} else if (cip->n_subcores <= 2 && cip->total_threads <= 6 &&
++ 		   vc->num_threads <= 2) {
++ 		/*
++ 		 * We may be able to fit another subcore in by
++ 		 * splitting an existing subcore with 3 or 4
++ 		 * threads into two 2-thread subcores, or one
++ 		 * with 5 or 6 threads into three subcores.
++ 		 * We can only do this if those subcores have
++ 		 * piggybacked virtual cores.
++ 		 */
++ 		if (!can_split_piggybacked_subcores(cip))
++ 			return false;
++ 	} else {
++ 		return false;
++ 	}
++ 
++ 	sub = cip->n_subcores;
++ 	++cip->n_subcores;
++ 	cip->total_threads += vc->num_threads;
++ 	cip->subcore_threads[sub] = vc->num_threads;
++ 	cip->subcore_vm[sub] = vc->kvm;
++ 	init_master_vcore(vc);
++ 	list_del(&vc->preempt_list);
++ 	list_add_tail(&vc->preempt_list, &cip->vcs[sub]);
++ 
++ 	return true;
++ }
++ 
++ static bool can_piggyback_subcore(struct kvmppc_vcore *pvc,
++ 				  struct core_info *cip, int sub)
++ {
++ 	struct kvmppc_vcore *vc;
++ 	int n_thr;
++ 
++ 	vc = list_first_entry(&cip->vcs[sub], struct kvmppc_vcore,
++ 			      preempt_list);
++ 
++ 	/* require same VM and same per-core reg values */
++ 	if (pvc->kvm != vc->kvm ||
++ 	    pvc->tb_offset != vc->tb_offset ||
++ 	    pvc->pcr != vc->pcr ||
++ 	    pvc->lpcr != vc->lpcr)
++ 		return false;
++ 
++ 	/* P8 guest with > 1 thread per core would see wrong TIR value */
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S) &&
++ 	    (vc->num_threads > 1 || pvc->num_threads > 1))
++ 		return false;
++ 
++ 	n_thr = cip->subcore_threads[sub] + pvc->num_threads;
++ 	if (n_thr > cip->max_subcore_threads) {
++ 		if (!subcore_config_ok(cip->n_subcores, n_thr))
++ 			return false;
++ 		cip->max_subcore_threads = n_thr;
++ 	}
++ 
++ 	cip->total_threads += pvc->num_threads;
++ 	cip->subcore_threads[sub] = n_thr;
++ 	pvc->master_vcore = vc;
++ 	list_del(&pvc->preempt_list);
++ 	list_add_tail(&pvc->preempt_list, &cip->vcs[sub]);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Work out whether it is possible to piggyback the execution of
++  * vcore *pvc onto the execution of the other vcores described in *cip.
++  */
++ static bool can_piggyback(struct kvmppc_vcore *pvc, struct core_info *cip,
++ 			  int target_threads)
++ {
++ 	int sub;
++ 
++ 	if (cip->total_threads + pvc->num_threads > target_threads)
++ 		return false;
++ 	for (sub = 0; sub < cip->n_subcores; ++sub)
++ 		if (cip->subcore_threads[sub] &&
++ 		    can_piggyback_subcore(pvc, cip, sub))
++ 			return true;
++ 
++ 	if (can_dynamic_split(pvc, cip))
++ 		return true;
++ 
++ 	return false;
+++>>>>>>> 23316316c1af (powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+  }
+  
+  static void prepare_threads(struct kvmppc_vcore *vc)
+@@@ -1756,29 -2430,46 +2030,35 @@@ static void kvmppc_run_core(struct kvmp
+  
+  	srcu_idx = srcu_read_lock(&vc->kvm->srcu);
+  
+- 	if (vc->mpp_buffer_is_valid)
+- 		kvmppc_start_restoring_l2_cache(vc);
+- 
+  	__kvmppc_vcore_entry();
+  
+++<<<<<<< HEAD
+ +	spin_lock(&vc->lock);
+ +
+ +	if (vc->mpp_buffer)
+ +		kvmppc_start_saving_l2_cache(vc);
+ +
+ +	/* disable sending of IPIs on virtual external irqs */
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list)
+ +		vcpu->cpu = -1;
+++=======
++ 	srcu_read_unlock(&vc->kvm->srcu, srcu_idx);
++ 
++ 	spin_lock(&vc->lock);
++ 	/* prevent other vcpu threads from doing kvmppc_start_thread() now */
++ 	vc->vcore_state = VCORE_EXITING;
++ 
+++>>>>>>> 23316316c1af (powerpc: Revert "Use the POWER8 Micro Partition Prefetch Engine in KVM HV on POWER8")
+  	/* wait for secondary threads to finish writing their state to memory */
+  	kvmppc_wait_for_nap();
+ -
+ -	/* Return to whole-core mode if we split the core earlier */
+ -	if (split > 1) {
+ -		unsigned long hid0 = mfspr(SPRN_HID0);
+ -		unsigned long loops = 0;
+ -
+ -		hid0 &= ~HID0_POWER8_DYNLPARDIS;
+ -		stat_bit = HID0_POWER8_2LPARMODE | HID0_POWER8_4LPARMODE;
+ -		mb();
+ -		mtspr(SPRN_HID0, hid0);
+ -		isync();
+ -		for (;;) {
+ -			hid0 = mfspr(SPRN_HID0);
+ -			if (!(hid0 & stat_bit))
+ -				break;
+ -			cpu_relax();
+ -			++loops;
+ -		}
+ -		split_info.do_nap = 0;
+ -	}
+ -
+ -	/* Let secondaries go back to the offline loop */
+ -	for (i = 0; i < threads_per_subcore; ++i) {
+ -		kvmppc_release_hwthread(pcpu + i);
+ -		if (sip && sip->napped[i])
+ -			kvmppc_ipi_thread(pcpu + i);
+ -	}
+ -
+ +	for (i = 0; i < threads_per_subcore; ++i)
+ +		kvmppc_release_hwthread(vc->pcpu + i);
+ +	/* prevent other vcpu threads from doing kvmppc_start_thread() now */
+ +	vc->vcore_state = VCORE_EXITING;
+  	spin_unlock(&vc->lock);
+  
+ +	srcu_read_unlock(&vc->kvm->srcu, srcu_idx);
+ +
+  	/* make sure updates to secondary vcpu structs are visible now */
+  	smp_mb();
+  	kvm_guest_exit();
+diff --git a/arch/powerpc/include/asm/cache.h b/arch/powerpc/include/asm/cache.h
+index 34a05a1a990b..ed0afc1e44a4 100644
+--- a/arch/powerpc/include/asm/cache.h
++++ b/arch/powerpc/include/asm/cache.h
+@@ -3,7 +3,6 @@
+ 
+ #ifdef __KERNEL__
+ 
+-#include <asm/reg.h>
+ 
+ /* bytes per L1 cache line */
+ #if defined(CONFIG_8xx) || defined(CONFIG_403GCX)
+@@ -40,12 +39,6 @@ struct ppc64_caches {
+ };
+ 
+ extern struct ppc64_caches ppc64_caches;
+-
+-static inline void logmpp(u64 x)
+-{
+-	asm volatile(PPC_LOGMPP(R1) : : "r" (x));
+-}
+-
+ #endif /* __powerpc64__ && ! __ASSEMBLY__ */
+ 
+ #if defined(__ASSEMBLY__)
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+* Unmerged path arch/powerpc/include/asm/ppc-opcode.h
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index d6140b94c770..08275e580d51 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -227,7 +227,6 @@
+ #define   CTRL_TE	0x00c00000	/* thread enable */
+ #define   CTRL_RUNLATCH	0x1
+ #define SPRN_DAWR	0xB4
+-#define SPRN_MPPR	0xB8	/* Micro Partition Prefetch Register */
+ #define SPRN_RPR	0xBA	/* Relative Priority Register */
+ #define SPRN_CIABR	0xBB
+ #define   CIABR_PRIV		0x3
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
