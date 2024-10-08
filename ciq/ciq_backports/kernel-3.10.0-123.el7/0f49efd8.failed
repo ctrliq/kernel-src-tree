@@ -1,0 +1,187 @@
+xfs: get rid of XFS_INODE_CLUSTER_SIZE macros
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jie Liu <jeff.liu@oracle.com>
+commit 0f49efd805229fc747761213ec820c1ba3ab64db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0f49efd8.failed
+
+Get rid of XFS_INODE_CLUSTER_SIZE() macros, use mp->m_inode_cluster_size
+directly.
+
+	Signed-off-by: Jie Liu <jeff.liu@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 0f49efd805229fc747761213ec820c1ba3ab64db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_resv.c
+diff --cc fs/xfs/xfs_trans_resv.c
+index a90fe66930d0,51c181dde119..000000000000
+--- a/fs/xfs/xfs_trans_resv.c
++++ b/fs/xfs/xfs_trans_resv.c
+@@@ -358,11 -382,10 +358,15 @@@ xfs_calc_ifree_reservation
+  	struct xfs_mount	*mp)
+  {
+  	return XFS_DQUOT_LOGRES(mp) +
+ -		xfs_calc_inode_res(mp, 1) +
+ +		xfs_calc_buf_res(1, mp->m_sb.sb_inodesize) +
+  		xfs_calc_buf_res(2, mp->m_sb.sb_sectsize) +
+  		xfs_calc_buf_res(1, XFS_FSB_TO_B(mp, 1)) +
+++<<<<<<< HEAD
+ +		MAX((__uint16_t)XFS_FSB_TO_B(mp, 1),
+ +		    XFS_INODE_CLUSTER_SIZE(mp)) +
+++=======
++ 		max_t(uint, XFS_FSB_TO_B(mp, 1), mp->m_inode_cluster_size) +
+++>>>>>>> 0f49efd80522 (xfs: get rid of XFS_INODE_CLUSTER_SIZE macros)
+  		xfs_calc_buf_res(1, 0) +
+  		xfs_calc_buf_res(2 + XFS_IALLOC_BLOCKS(mp) +
+  				 mp->m_in_maxlevels, 0) +
+diff --git a/fs/xfs/xfs_ialloc.c b/fs/xfs/xfs_ialloc.c
+index d1401a0cf9be..4d14d5b5991a 100644
+--- a/fs/xfs/xfs_ialloc.c
++++ b/fs/xfs/xfs_ialloc.c
+@@ -52,7 +52,7 @@ xfs_ialloc_cluster_alignment(
+ {
+ 	if (xfs_sb_version_hasalign(&args->mp->m_sb) &&
+ 	    args->mp->m_sb.sb_inoalignmt >=
+-	     XFS_B_TO_FSBT(args->mp, XFS_INODE_CLUSTER_SIZE(args->mp)))
++	     XFS_B_TO_FSBT(args->mp, args->mp->m_inode_cluster_size))
+ 		return args->mp->m_sb.sb_inoalignmt;
+ 	return 1;
+ }
+@@ -181,12 +181,12 @@ xfs_ialloc_inode_init(
+ 	 * For small block sizes, manipulate the inodes in buffers
+ 	 * which are multiples of the blocks size.
+ 	 */
+-	if (mp->m_sb.sb_blocksize >= XFS_INODE_CLUSTER_SIZE(mp)) {
++	if (mp->m_sb.sb_blocksize >= mp->m_inode_cluster_size) {
+ 		blks_per_cluster = 1;
+ 		nbufs = length;
+ 		ninodes = mp->m_sb.sb_inopblock;
+ 	} else {
+-		blks_per_cluster = XFS_INODE_CLUSTER_SIZE(mp) /
++		blks_per_cluster = mp->m_inode_cluster_size /
+ 				   mp->m_sb.sb_blocksize;
+ 		nbufs = length / blks_per_cluster;
+ 		ninodes = blks_per_cluster * mp->m_sb.sb_inopblock;
+@@ -1384,7 +1384,7 @@ xfs_imap(
+ 		return XFS_ERROR(EINVAL);
+ 	}
+ 
+-	blks_per_cluster = XFS_INODE_CLUSTER_SIZE(mp) >> mp->m_sb.sb_blocklog;
++	blks_per_cluster = mp->m_inode_cluster_size >> mp->m_sb.sb_blocklog;
+ 
+ 	/*
+ 	 * For bulkstat and handle lookups, we have an untrusted inode number
+@@ -1405,7 +1405,7 @@ xfs_imap(
+ 	 * If the inode cluster size is the same as the blocksize or
+ 	 * smaller we get to the buffer by simple arithmetics.
+ 	 */
+-	if (XFS_INODE_CLUSTER_SIZE(mp) <= mp->m_sb.sb_blocksize) {
++	if (mp->m_inode_cluster_size <= mp->m_sb.sb_blocksize) {
+ 		offset = XFS_INO_TO_OFFSET(mp, ino);
+ 		ASSERT(offset < mp->m_sb.sb_inopblock);
+ 
+diff --git a/fs/xfs/xfs_ialloc.h b/fs/xfs/xfs_ialloc.h
+index c7e2d43d80dc..cc16c3e7fcf1 100644
+--- a/fs/xfs/xfs_ialloc.h
++++ b/fs/xfs/xfs_ialloc.h
+@@ -29,11 +29,8 @@ struct xfs_trans;
+  */
+ #define	XFS_IALLOC_BLOCKS(mp)	(mp)->m_ialloc_blks
+ 
+-/*
+- * Move inodes in clusters of this size.
+- */
++/* Move inodes in clusters of this size */
+ #define	XFS_INODE_BIG_CLUSTER_SIZE	8192
+-#define	XFS_INODE_CLUSTER_SIZE(mp)	(mp)->m_inode_cluster_size
+ 
+ /*
+  * Make an inode pointer out of the buffer/offset.
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index a18b684cea27..dbfeb8d68e85 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1051,13 +1051,13 @@ xfs_ifree_cluster(
+ 	struct xfs_perag	*pag;
+ 
+ 	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, inum));
+-	if (mp->m_sb.sb_blocksize >= XFS_INODE_CLUSTER_SIZE(mp)) {
++	if (mp->m_sb.sb_blocksize >= mp->m_inode_cluster_size) {
+ 		blks_per_cluster = 1;
+ 		ninodes = mp->m_sb.sb_inopblock;
+ 		nbufs = XFS_IALLOC_BLOCKS(mp);
+ 	} else {
+-		blks_per_cluster = XFS_INODE_CLUSTER_SIZE(mp) /
+-					mp->m_sb.sb_blocksize;
++		blks_per_cluster = mp->m_inode_cluster_size /
++				   mp->m_sb.sb_blocksize;
+ 		ninodes = blks_per_cluster * mp->m_sb.sb_inopblock;
+ 		nbufs = XFS_IALLOC_BLOCKS(mp) / blks_per_cluster;
+ 	}
+@@ -1322,13 +1322,13 @@ xfs_iflush_cluster(
+ 
+ 	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+ 
+-	inodes_per_cluster = XFS_INODE_CLUSTER_SIZE(mp) >> mp->m_sb.sb_inodelog;
++	inodes_per_cluster = mp->m_inode_cluster_size >> mp->m_sb.sb_inodelog;
+ 	ilist_size = inodes_per_cluster * sizeof(xfs_inode_t *);
+ 	ilist = kmem_alloc(ilist_size, KM_MAYFAIL|KM_NOFS);
+ 	if (!ilist)
+ 		goto out_put;
+ 
+-	mask = ~(((XFS_INODE_CLUSTER_SIZE(mp) >> mp->m_sb.sb_inodelog)) - 1);
++	mask = ~(((mp->m_inode_cluster_size >> mp->m_sb.sb_inodelog)) - 1);
+ 	first_index = XFS_INO_TO_AGINO(mp, ip->i_ino) & mask;
+ 	rcu_read_lock();
+ 	/* really need a gang lookup range call here */
+diff --git a/fs/xfs/xfs_itable.c b/fs/xfs/xfs_itable.c
+index 4f50e637f33b..abc20e276dfc 100644
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@ -244,9 +244,9 @@ xfs_bulkstat(
+ 	*done = 0;
+ 	fmterror = 0;
+ 	ubufp = ubuffer;
+-	nicluster = mp->m_sb.sb_blocksize >= XFS_INODE_CLUSTER_SIZE(mp) ?
++	nicluster = mp->m_sb.sb_blocksize >= mp->m_inode_cluster_size ?
+ 		mp->m_sb.sb_inopblock :
+-		(XFS_INODE_CLUSTER_SIZE(mp) >> mp->m_sb.sb_inodelog);
++		(mp->m_inode_cluster_size >> mp->m_sb.sb_inodelog);
+ 	nimask = ~(nicluster - 1);
+ 	nbcluster = nicluster >> mp->m_sb.sb_inopblog;
+ 	irbuf = kmem_zalloc_greedy(&irbsize, PAGE_SIZE, PAGE_SIZE * 4);
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 623e21454e1d..ba8ea8878c2f 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -2660,19 +2660,19 @@ xlog_recover_buffer_pass2(
+ 	 *
+ 	 * Also make sure that only inode buffers with good sizes stay in
+ 	 * the buffer cache.  The kernel moves inodes in buffers of 1 block
+-	 * or XFS_INODE_CLUSTER_SIZE bytes, whichever is bigger.  The inode
++	 * or mp->m_inode_cluster_size bytes, whichever is bigger.  The inode
+ 	 * buffers in the log can be a different size if the log was generated
+ 	 * by an older kernel using unclustered inode buffers or a newer kernel
+ 	 * running with a different inode cluster size.  Regardless, if the
+-	 * the inode buffer size isn't MAX(blocksize, XFS_INODE_CLUSTER_SIZE)
+-	 * for *our* value of XFS_INODE_CLUSTER_SIZE, then we need to keep
++	 * the inode buffer size isn't MAX(blocksize, mp->m_inode_cluster_size)
++	 * for *our* value of mp->m_inode_cluster_size, then we need to keep
+ 	 * the buffer out of the buffer cache so that the buffer won't
+ 	 * overlap with future reads of those inodes.
+ 	 */
+ 	if (XFS_DINODE_MAGIC ==
+ 	    be16_to_cpu(*((__be16 *)xfs_buf_offset(bp, 0))) &&
+ 	    (BBTOB(bp->b_io_length) != MAX(log->l_mp->m_sb.sb_blocksize,
+-			(__uint32_t)XFS_INODE_CLUSTER_SIZE(log->l_mp)))) {
++			(__uint32_t)log->l_mp->m_inode_cluster_size))) {
+ 		xfs_buf_stale(bp);
+ 		error = xfs_bwrite(bp);
+ 	} else {
+* Unmerged path fs/xfs/xfs_trans_resv.c
