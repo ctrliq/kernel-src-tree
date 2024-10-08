@@ -1,0 +1,197 @@
+nftables: Convert nft_hash to use generic rhashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit cfe4a9dda034e2b5b6ba0b6313b65dfb89ee451c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cfe4a9dd.failed
+
+The sizing of the hash table and the practice of requiring a lookup
+to retrieve the pprev to be stored in the element cookie before the
+deletion of an entry is left intact.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Patrick McHardy <kaber@trash.net>
+	Reviewed-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cfe4a9dda034e2b5b6ba0b6313b65dfb89ee451c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_hash.c
+diff --cc net/netfilter/nft_hash.c
+index 1dfeb6786832,28fb8f38e6ba..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -58,160 -33,14 +33,155 @@@ static bool nft_hash_lookup(const struc
+  			    const struct nft_data *key,
+  			    struct nft_data *data)
+  {
+- 	const struct nft_hash *priv = nft_set_priv(set);
+- 	const struct nft_hash_table *tbl = rcu_dereference(priv->tbl);
++ 	const struct rhashtable *priv = nft_set_priv(set);
+  	const struct nft_hash_elem *he;
+- 	unsigned int h;
+  
+- 	h = nft_hash_data(key, tbl->size, set->klen);
+- 	nft_hash_for_each_entry_rcu(he, tbl->buckets[h]) {
+- 		if (nft_data_cmp(&he->key, key, set->klen))
+- 			continue;
+- 		if (set->flags & NFT_SET_MAP)
+- 			nft_data_copy(data, he->data);
+- 		return true;
+- 	}
+- 	return false;
+- }
++ 	he = rhashtable_lookup(priv, key);
++ 	if (he && set->flags & NFT_SET_MAP)
++ 		nft_data_copy(data, he->data);
+  
+++<<<<<<< HEAD
+ +static void nft_hash_tbl_free(const struct nft_hash_table *tbl)
+ +{
+ +	if (is_vmalloc_addr(tbl))
+ +		vfree(tbl);
+ +	else
+ +		kfree(tbl);
+ +}
+ +
+ +static unsigned int nft_hash_tbl_size(unsigned int nelem)
+ +{
+ +	return max(roundup_pow_of_two(nelem * 4 / 3), NFT_HASH_MIN_SIZE);
+ +}
+ +
+ +static struct nft_hash_table *nft_hash_tbl_alloc(unsigned int nbuckets)
+ +{
+ +	struct nft_hash_table *tbl;
+ +	size_t size;
+ +
+ +	size = sizeof(*tbl) + nbuckets * sizeof(tbl->buckets[0]);
+ +	tbl = kzalloc(size, GFP_KERNEL | __GFP_REPEAT | __GFP_NOWARN);
+ +	if (tbl == NULL)
+ +		tbl = vzalloc(size);
+ +	if (tbl == NULL)
+ +		return NULL;
+ +	tbl->size = nbuckets;
+ +
+ +	return tbl;
+ +}
+ +
+ +static void nft_hash_chain_unzip(const struct nft_set *set,
+ +				 const struct nft_hash_table *ntbl,
+ +				 struct nft_hash_table *tbl, unsigned int n)
+ +{
+ +	struct nft_hash_elem *he, *last, *next;
+ +	unsigned int h;
+ +
+ +	he = nft_dereference(tbl->buckets[n]);
+ +	if (he == NULL)
+ +		return;
+ +	h = nft_hash_data(&he->key, ntbl->size, set->klen);
+ +
+ +	/* Find last element of first chain hashing to bucket h */
+ +	last = he;
+ +	nft_hash_for_each_entry(he, he->next) {
+ +		if (nft_hash_data(&he->key, ntbl->size, set->klen) != h)
+ +			break;
+ +		last = he;
+ +	}
+ +
+ +	/* Unlink first chain from the old table */
+ +	RCU_INIT_POINTER(tbl->buckets[n], last->next);
+ +
+ +	/* If end of chain reached, done */
+ +	if (he == NULL)
+ +		return;
+ +
+ +	/* Find first element of second chain hashing to bucket h */
+ +	next = NULL;
+ +	nft_hash_for_each_entry(he, he->next) {
+ +		if (nft_hash_data(&he->key, ntbl->size, set->klen) != h)
+ +			continue;
+ +		next = he;
+ +		break;
+ +	}
+ +
+ +	/* Link the two chains */
+ +	RCU_INIT_POINTER(last->next, next);
+ +}
+ +
+ +static int nft_hash_tbl_expand(const struct nft_set *set, struct nft_hash *priv)
+ +{
+ +	struct nft_hash_table *tbl = nft_dereference(priv->tbl), *ntbl;
+ +	struct nft_hash_elem *he;
+ +	unsigned int i, h;
+ +	bool complete;
+ +
+ +	ntbl = nft_hash_tbl_alloc(tbl->size * 2);
+ +	if (ntbl == NULL)
+ +		return -ENOMEM;
+ +
+ +	/* Link new table's buckets to first element in the old table
+ +	 * hashing to the new bucket.
+ +	 */
+ +	for (i = 0; i < ntbl->size; i++) {
+ +		h = i < tbl->size ? i : i - tbl->size;
+ +		nft_hash_for_each_entry(he, tbl->buckets[h]) {
+ +			if (nft_hash_data(&he->key, ntbl->size, set->klen) != i)
+ +				continue;
+ +			RCU_INIT_POINTER(ntbl->buckets[i], he);
+ +			break;
+ +		}
+ +	}
+ +
+ +	/* Publish new table */
+ +	rcu_assign_pointer(priv->tbl, ntbl);
+ +
+ +	/* Unzip interleaved hash chains */
+ +	do {
+ +		/* Wait for readers to use new table/unzipped chains */
+ +		synchronize_rcu();
+ +
+ +		complete = true;
+ +		for (i = 0; i < tbl->size; i++) {
+ +			nft_hash_chain_unzip(set, ntbl, tbl, i);
+ +			if (tbl->buckets[i] != NULL)
+ +				complete = false;
+ +		}
+ +	} while (!complete);
+ +
+ +	nft_hash_tbl_free(tbl);
+ +	return 0;
+ +}
+ +
+ +static int nft_hash_tbl_shrink(const struct nft_set *set, struct nft_hash *priv)
+ +{
+ +	struct nft_hash_table *tbl = nft_dereference(priv->tbl), *ntbl;
+ +	struct nft_hash_elem __rcu **pprev;
+ +	unsigned int i;
+ +
+ +	ntbl = nft_hash_tbl_alloc(tbl->size / 2);
+ +	if (ntbl == NULL)
+ +		return -ENOMEM;
+ +
+ +	for (i = 0; i < ntbl->size; i++) {
+ +		ntbl->buckets[i] = tbl->buckets[i];
+ +
+ +		for (pprev = &ntbl->buckets[i]; *pprev != NULL;
+ +		     pprev = &nft_dereference(*pprev)->next)
+ +			;
+ +		RCU_INIT_POINTER(*pprev, tbl->buckets[i + ntbl->size]);
+ +	}
+ +
+ +	/* Publish new table */
+ +	rcu_assign_pointer(priv->tbl, ntbl);
+ +	synchronize_rcu();
+ +
+ +	nft_hash_tbl_free(tbl);
+ +	return 0;
+++=======
++ 	return !!he;
+++>>>>>>> cfe4a9dda034 (nftables: Convert nft_hash to use generic rhashtable)
+  }
+  
+  static int nft_hash_insert(const struct nft_set *set,
+* Unmerged path net/netfilter/nft_hash.c
