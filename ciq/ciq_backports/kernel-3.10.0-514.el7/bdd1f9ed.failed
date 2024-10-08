@@ -1,0 +1,183 @@
+tcp: add tcpi_bytes_received to tcp_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit bdd1f9edacb5f5835d1e6276571bbbe5b88ded48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bdd1f9ed.failed
+
+This patch tracks total number of payload bytes received on a TCP socket.
+This is the sum of all changes done to tp->rcv_nxt
+
+RFC4898 named this : tcpEStatsAppHCThruOctetsReceived
+
+This is a 64bit field, and can be fetched both from TCP_INFO
+getsockopt() if one has a handle on a TCP socket, or from inet_diag
+netlink facility (iproute2/ss patch will follow)
+
+Note that tp->bytes_received was placed near tp->rcv_nxt for
+best data locality and minimal performance impact.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Cc: Matt Mathis <mattmathis@google.com>
+	Cc: Eric Salo <salo@google.com>
+	Cc: Martin Lau <kafai@fb.com>
+	Cc: Chris Rapier <rapier@psc.edu>
+	Acked-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bdd1f9edacb5f5835d1e6276571bbbe5b88ded48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_fastopen.c
+diff --cc net/ipv4/tcp_fastopen.c
+index d57bae06bc0b,3c673d5e6cff..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -190,22 -191,33 +190,44 @@@ static bool tcp_fastopen_create_child(s
+  	 * (any reason not to?) but no need to queue the skb since
+  	 * there is no data. How about SYN+FIN?
+  	 */
+++<<<<<<< HEAD
+ +	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
+ +		skb = skb_get(skb);
+ +		skb_dst_drop(skb);
+ +		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+ +		skb_set_owner_r(skb, child);
+ +		__skb_queue_tail(&child->sk_receive_queue, skb);
+ +		tp->syn_data_acked = 1;
+++=======
++ 	end_seq = TCP_SKB_CB(skb)->end_seq;
++ 	if (end_seq != TCP_SKB_CB(skb)->seq + 1) {
++ 		struct sk_buff *skb2;
++ 
++ 		if (unlikely(skb_shared(skb)))
++ 			skb2 = skb_clone(skb, GFP_ATOMIC);
++ 		else
++ 			skb2 = skb_get(skb);
++ 
++ 		if (likely(skb2)) {
++ 			skb_dst_drop(skb2);
++ 			__skb_pull(skb2, tcp_hdrlen(skb));
++ 			skb_set_owner_r(skb2, child);
++ 			__skb_queue_tail(&child->sk_receive_queue, skb2);
++ 			tp->syn_data_acked = 1;
++ 			tp->bytes_received = end_seq - TCP_SKB_CB(skb)->seq - 1;
++ 		} else {
++ 			end_seq = TCP_SKB_CB(skb)->seq + 1;
++ 		}
+++>>>>>>> bdd1f9edacb5 (tcp: add tcpi_bytes_received to tcp_info)
+  	}
+ -	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = end_seq;
+ -	sk->sk_data_ready(sk);
+ +	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +	sk->sk_data_ready(sk, 0);
+  	bh_unlock_sock(child);
+  	sock_put(child);
+ -	WARN_ON(!req->sk);
+ +	WARN_ON(req->sk == NULL);
+  	return true;
+  }
+ +EXPORT_SYMBOL(tcp_fastopen_create_child);
+  
+  static bool tcp_fastopen_queue_check(struct sock *sk)
+  {
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 1c6e31feb254..3c93cd34c1c2 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -147,6 +147,10 @@ struct tcp_sock {
+  *	read the code and the spec side by side (and laugh ...)
+  *	See RFC793 and RFC1122. The RFC writes these in capitals.
+  */
++	u64	bytes_received;	/* RFC4898 tcpEStatsAppHCThruOctetsReceived
++				 * sum(delta(rcv_nxt)), or how many bytes
++				 * were acked.
++				 */
+  	u32	rcv_nxt;	/* What we want to receive next 	*/
+ 	u32	copied_seq;	/* Head of yet unread data		*/
+ 	u32	rcv_wup;	/* rcv_nxt on last window update sent	*/
+diff --git a/include/uapi/linux/tcp.h b/include/uapi/linux/tcp.h
+index 6666e98a0af9..a48f93f3207b 100644
+--- a/include/uapi/linux/tcp.h
++++ b/include/uapi/linux/tcp.h
+@@ -190,6 +190,7 @@ struct tcp_info {
+ 	__u64	tcpi_pacing_rate;
+ 	__u64	tcpi_max_pacing_rate;
+ 	__u64	tcpi_bytes_acked; /* RFC4898 tcpEStatsAppHCThruOctetsAcked */
++	__u64	tcpi_bytes_received; /* RFC4898 tcpEStatsAppHCThruOctetsReceived */
+ };
+ 
+ /* for TCP_MD5SIG socket option */
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index d8ad7f7bb200..80fca76b7757 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -2688,6 +2688,7 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
+ 
+ 	spin_lock_bh(&sk->sk_lock.slock);
+ 	info->tcpi_bytes_acked = tp->bytes_acked;
++	info->tcpi_bytes_received = tp->bytes_received;
+ 	spin_unlock_bh(&sk->sk_lock.slock);
+ }
+ EXPORT_SYMBOL_GPL(tcp_get_info);
+* Unmerged path net/ipv4/tcp_fastopen.c
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index a74414e9e6cd..0cd37a5517cd 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3264,6 +3264,15 @@ static void tcp_snd_una_update(struct tcp_sock *tp, u32 ack)
+ 	tp->snd_una = ack;
+ }
+ 
++/* If we update tp->rcv_nxt, also update tp->bytes_received */
++static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
++{
++	u32 delta = seq - tp->rcv_nxt;
++
++	tp->bytes_received += delta;
++	tp->rcv_nxt = seq;
++}
++
+ /* Update our send window.
+  *
+  * Window update algorithm, described in RFC793/RFC1122 (used in linux-2.2
+@@ -4184,7 +4193,7 @@ static void tcp_ofo_queue(struct sock *sk)
+ 
+ 		tail = skb_peek_tail(&sk->sk_receive_queue);
+ 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
+-		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
++		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+ 		if (!eaten)
+ 			__skb_queue_tail(&sk->sk_receive_queue, skb);
+ 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+@@ -4352,7 +4361,7 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int
+ 	__skb_pull(skb, hdrlen);
+ 	eaten = (tail &&
+ 		 tcp_try_coalesce(sk, tail, skb, fragstolen)) ? 1 : 0;
+-	tcp_sk(sk)->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
++	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
+ 	if (!eaten) {
+ 		__skb_queue_tail(&sk->sk_receive_queue, skb);
+ 		skb_set_owner_r(skb, sk);
+@@ -4447,7 +4456,7 @@ queue_and_out:
+ 			}
+ 			eaten = tcp_queue_rcv(sk, skb, 0, &fragstolen);
+ 		}
+-		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
++		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+ 		if (skb->len)
+ 			tcp_event_data_recv(sk, skb);
+ 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+@@ -5194,7 +5203,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+ 					tcp_rcv_rtt_measure_ts(sk, skb);
+ 
+ 					__skb_pull(skb, tcp_header_len);
+-					tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
++					tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
+ 					NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPHITSTOUSER);
+ 					eaten = 1;
+ 				}
