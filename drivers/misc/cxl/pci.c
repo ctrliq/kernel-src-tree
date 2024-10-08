@@ -578,7 +578,7 @@ err:
 
 static void cxl_unmap_slice_regs(struct cxl_afu *afu)
 {
-	if (afu->p1n_mmio)
+	if (afu->p2n_mmio)
 		iounmap(afu->p2n_mmio);
 	if (afu->p1n_mmio)
 		iounmap(afu->p1n_mmio);
