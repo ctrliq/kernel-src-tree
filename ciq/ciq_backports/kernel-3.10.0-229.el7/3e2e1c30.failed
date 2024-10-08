@@ -1,0 +1,131 @@
+dm cache: when reloading a discard bitset allow for a different discard block size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [md] dm-cache: when reloading a discard bitset allow for a different discard block size (Mike Snitzer) [1165050]
+Rebuild_FUZZ: 98.78%
+commit-author Joe Thornber <ejt@redhat.com>
+commit 3e2e1c3098fcc02369f0eea822d0a7914b691567
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3e2e1c30.failed
+
+The discard block size can change if the origin changes size or if an
+old DM cache is upgraded from using a discard block size that was equal
+to cache block size.
+
+To fix this an extent of discarded blocks is established for the purpose
+of translating the old discard block size to the new in-core discard
+block size and set bits.  The old (potentially huge) discard bitset is
+left ondisk until it is re-written using the new in-core information on
+the next successful DM cache shutdown.
+
+Fixes: 7ae34e777896 ("dm cache: improve discard support")
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 3e2e1c3098fcc02369f0eea822d0a7914b691567)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index e75d70ec363a,2c66315553f2..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -2679,15 -2817,86 +2679,93 @@@ static int load_mapping(void *context, 
+  	return 0;
+  }
+  
++ /*
++  * The discard block size in the on disk metadata is not
++  * neccessarily the same as we're currently using.  So we have to
++  * be careful to only set the discarded attribute if we know it
++  * covers a complete block of the new size.
++  */
++ struct discard_load_info {
++ 	struct cache *cache;
++ 
++ 	/*
++ 	 * These blocks are sized using the on disk dblock size, rather
++ 	 * than the current one.
++ 	 */
++ 	dm_block_t block_size;
++ 	dm_block_t discard_begin, discard_end;
++ };
++ 
++ static void discard_load_info_init(struct cache *cache,
++ 				   struct discard_load_info *li)
++ {
++ 	li->cache = cache;
++ 	li->discard_begin = li->discard_end = 0;
++ }
++ 
++ static void set_discard_range(struct discard_load_info *li)
++ {
++ 	sector_t b, e;
++ 
++ 	if (li->discard_begin == li->discard_end)
++ 		return;
++ 
++ 	/*
++ 	 * Convert to sectors.
++ 	 */
++ 	b = li->discard_begin * li->block_size;
++ 	e = li->discard_end * li->block_size;
++ 
++ 	/*
++ 	 * Then convert back to the current dblock size.
++ 	 */
++ 	b = dm_sector_div_up(b, li->cache->discard_block_size);
++ 	sector_div(e, li->cache->discard_block_size);
++ 
++ 	/*
++ 	 * The origin may have shrunk, so we need to check we're still in
++ 	 * bounds.
++ 	 */
++ 	if (e > from_dblock(li->cache->discard_nr_blocks))
++ 		e = from_dblock(li->cache->discard_nr_blocks);
++ 
++ 	for (; b < e; b++)
++ 		set_discard(li->cache, to_dblock(b));
++ }
++ 
+  static int load_discard(void *context, sector_t discard_block_size,
+ -			dm_dblock_t dblock, bool discard)
+ +			dm_oblock_t oblock, bool discard)
+  {
+- 	struct cache *cache = context;
++ 	struct discard_load_info *li = context;
+  
+++<<<<<<< HEAD
+ +	if (discard)
+ +		set_discard(cache, oblock);
+ +	else
+ +		clear_discard(cache, oblock);
+++=======
++ 	li->block_size = discard_block_size;
++ 
++ 	if (discard) {
++ 		if (from_dblock(dblock) == li->discard_end)
++ 			/*
++ 			 * We're already in a discard range, just extend it.
++ 			 */
++ 			li->discard_end = li->discard_end + 1ULL;
++ 
++ 		else {
++ 			/*
++ 			 * Emit the old range and start a new one.
++ 			 */
++ 			set_discard_range(li);
++ 			li->discard_begin = from_dblock(dblock);
++ 			li->discard_end = li->discard_begin + 1ULL;
++ 		}
++ 	} else {
++ 		set_discard_range(li);
++ 		li->discard_begin = li->discard_end = 0;
++ 	}
+++>>>>>>> 3e2e1c3098fc (dm cache: when reloading a discard bitset allow for a different discard block size)
+  
+  	return 0;
+  }
+* Unmerged path drivers/md/dm-cache-target.c
