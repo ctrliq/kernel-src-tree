@@ -202,6 +202,7 @@ void perf_evsel__init(struct perf_evsel *evsel,
 	evsel->leader	   = evsel;
 	evsel->unit	   = "";
 	evsel->scale	   = 1.0;
+	evsel->evlist	   = NULL;
 	INIT_LIST_HEAD(&evsel->node);
 	perf_evsel__object.init(evsel);
 	evsel->sample_size = __perf_evsel__sample_size(attr->sample_type);
@@ -905,6 +906,7 @@ void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
 void perf_evsel__exit(struct perf_evsel *evsel)
 {
 	assert(list_empty(&evsel->node));
+	assert(evsel->evlist == NULL);
 	perf_evsel__free_fd(evsel);
 	perf_evsel__free_id(evsel);
 	close_cgroup(evsel->cgrp);
