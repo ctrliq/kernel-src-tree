@@ -1,0 +1,706 @@
+tick: Nohz: Rework next timer evaluation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit c1ad348b452aacd784fb97403d03d71723c72ee1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c1ad348b.failed
+
+The evaluation of the next timer in the nohz code is based on jiffies
+while all the tick internals are nano seconds based. We have also to
+convert hrtimer nanoseconds to jiffies in the !highres case. That's
+just wrong and introduces interesting corner cases.
+
+Turn it around and convert the next timer wheel timer expiry and the
+rcu event to clock monotonic and base all calculations on
+nanoseconds. That identifies the case where no timer is pending
+clearly with an absolute expiry value of KTIME_MAX.
+
+Makes the code more readable and gets rid of the jiffies magic in the
+nohz code.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+	Cc: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+Link: http://lkml.kernel.org/r/20150414203502.184198593@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit c1ad348b452aacd784fb97403d03d71723c72ee1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rcupdate.h
+#	include/linux/rcutree.h
+#	kernel/hrtimer.c
+#	kernel/rcutree_plugin.h
+#	kernel/time/tick-internal.h
+#	kernel/time/tick-sched.c
+#	kernel/time/tick-sched.h
+diff --cc include/linux/rcupdate.h
+index 2f6a705960a3,0627a447c589..000000000000
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@@ -44,20 -44,61 +44,26 @@@
+  #include <linux/debugobjects.h>
+  #include <linux/bug.h>
+  #include <linux/compiler.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/ktime.h>
++ 
++ #include <asm/barrier.h>
+ -
+ -extern int rcu_expedited; /* for sysctl */
+ -
+ -#ifdef CONFIG_TINY_RCU
+ -/* Tiny RCU doesn't expedite, as its purpose in life is instead to be tiny. */
+ -static inline bool rcu_gp_is_expedited(void)  /* Internal RCU use. */
+ -{
+ -	return false;
+ -}
+ -
+ -static inline void rcu_expedite_gp(void)
+ -{
+ -}
+ -
+ -static inline void rcu_unexpedite_gp(void)
+ -{
+ -}
+ -#else /* #ifdef CONFIG_TINY_RCU */
+ -bool rcu_gp_is_expedited(void);  /* Internal RCU use. */
+ -void rcu_expedite_gp(void);
+ -void rcu_unexpedite_gp(void);
+ -#endif /* #else #ifdef CONFIG_TINY_RCU */
+ -
+ -enum rcutorture_type {
+ -	RCU_FLAVOR,
+ -	RCU_BH_FLAVOR,
+ -	RCU_SCHED_FLAVOR,
+ -	RCU_TASKS_FLAVOR,
+ -	SRCU_FLAVOR,
+ -	INVALID_RCU_FLAVOR
+ -};
+ -
+ -#if defined(CONFIG_TREE_RCU) || defined(CONFIG_PREEMPT_RCU)
+ -void rcutorture_get_gp_data(enum rcutorture_type test_type, int *flags,
+ -			    unsigned long *gpnum, unsigned long *completed);
+ -void rcutorture_record_test_transition(void);
+ -void rcutorture_record_progress(unsigned long vernum);
+ -void do_trace_rcu_torture_read(const char *rcutorturename,
+ -			       struct rcu_head *rhp,
+ -			       unsigned long secs,
+ -			       unsigned long c_old,
+ -			       unsigned long c);
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+ +
+ +#ifdef CONFIG_RCU_TORTURE_TEST
+ +extern int rcutorture_runnable; /* for sysctl */
+ +#endif /* #ifdef CONFIG_RCU_TORTURE_TEST */
+ +
+ +#if defined(CONFIG_TREE_RCU) || defined(CONFIG_TREE_PREEMPT_RCU)
+ +extern void rcutorture_record_test_transition(void);
+ +extern void rcutorture_record_progress(unsigned long vernum);
+ +extern void do_trace_rcu_torture_read(char *rcutorturename,
+ +				      struct rcu_head *rhp,
+ +				      unsigned long secs,
+ +				      unsigned long c_old,
+ +				      unsigned long c);
+  #else
+ -static inline void rcutorture_get_gp_data(enum rcutorture_type test_type,
+ -					  int *flags,
+ -					  unsigned long *gpnum,
+ -					  unsigned long *completed)
+ -{
+ -	*flags = 0;
+ -	*gpnum = 0;
+ -	*completed = 0;
+ -}
+  static inline void rcutorture_record_test_transition(void)
+  {
+  }
+@@@ -1023,11 -1155,39 +1029,26 @@@ static inline notrace void rcu_read_unl
+  #define kfree_rcu(ptr, rcu_head)					\
+  	__kfree_rcu(&((ptr)->rcu_head), offsetof(typeof(*(ptr)), rcu_head))
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_RCU_NOCB_CPU
+ +extern bool rcu_is_nocb_cpu(int cpu);
+++=======
++ #if defined(CONFIG_TINY_RCU) || defined(CONFIG_RCU_NOCB_CPU_ALL)
++ static inline int rcu_needs_cpu(u64 basemono, u64 *nextevt)
++ {
++ 	*nextevt = KTIME_MAX;
++ 	return 0;
++ }
++ #endif /* #if defined(CONFIG_TINY_RCU) || defined(CONFIG_RCU_NOCB_CPU_ALL) */
++ 
++ #if defined(CONFIG_RCU_NOCB_CPU_ALL)
++ static inline bool rcu_is_nocb_cpu(int cpu) { return true; }
++ #elif defined(CONFIG_RCU_NOCB_CPU)
++ bool rcu_is_nocb_cpu(int cpu);
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+  #else
+  static inline bool rcu_is_nocb_cpu(int cpu) { return false; }
+ -#endif
+ -
+ -
+ -/* Only for use by adaptive-ticks code. */
+ -#ifdef CONFIG_NO_HZ_FULL_SYSIDLE
+ -bool rcu_sys_is_idle(void);
+ -void rcu_sysidle_force_exit(void);
+ -#else /* #ifdef CONFIG_NO_HZ_FULL_SYSIDLE */
+ -
+ -static inline bool rcu_sys_is_idle(void)
+ -{
+ -	return false;
+ -}
+ -
+ -static inline void rcu_sysidle_force_exit(void)
+ -{
+ -}
+ -
+ -#endif /* #else #ifdef CONFIG_NO_HZ_FULL_SYSIDLE */
+ +#endif /* #else #ifdef CONFIG_RCU_NOCB_CPU */
+  
+  
+  #endif /* __LINUX_RCUPDATE_H */
+diff --cc include/linux/rcutree.h
+index 11057b8de78c,db2e31beaae7..000000000000
+--- a/include/linux/rcutree.h
++++ b/include/linux/rcutree.h
+@@@ -30,10 -30,11 +30,18 @@@
+  #ifndef __LINUX_RCUTREE_H
+  #define __LINUX_RCUTREE_H
+  
+++<<<<<<< HEAD
+ +extern void rcu_init(void);
+ +extern void rcu_note_context_switch(int cpu);
+ +extern int rcu_needs_cpu(int cpu, unsigned long *delta_jiffies);
+ +extern void rcu_cpu_stall_reset(void);
+++=======
++ void rcu_note_context_switch(void);
++ #ifndef CONFIG_RCU_NOCB_CPU_ALL
++ int rcu_needs_cpu(u64 basem, u64 *nextevt);
++ #endif /* #ifndef CONFIG_RCU_NOCB_CPU_ALL */
++ void rcu_cpu_stall_reset(void);
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+  
+  /*
+   * Note a virtualization-based context switch.  This is simply a
+diff --cc kernel/hrtimer.c
+index b2012c5568af,179b991cfdcb..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -1153,35 -1080,18 +1153,44 @@@ EXPORT_SYMBOL_GPL(hrtimer_get_remaining
+  /**
+   * hrtimer_get_next_event - get the time until next expiry event
+   *
+-  * Returns the delta to the next expiry event or KTIME_MAX if no timer
+-  * is pending.
++  * Returns the next expiry time or KTIME_MAX if no timer is pending.
+   */
+- ktime_t hrtimer_get_next_event(void)
++ u64 hrtimer_get_next_event(void)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+ +	struct hrtimer_clock_base *base = cpu_base->clock_base;
+ +	ktime_t delta, mindelta = { .tv64 = KTIME_MAX };
+++=======
++ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
++ 	u64 expires = KTIME_MAX;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation):kernel/time/hrtimer.c
+  	unsigned long flags;
+ +	int i;
+  
+  	raw_spin_lock_irqsave(&cpu_base->lock, flags);
+  
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	if (!hrtimer_hres_active()) {
+ +		for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++, base++) {
+ +			struct hrtimer *timer;
+ +			struct timerqueue_node *next;
+ +
+ +			next = timerqueue_getnext(&base->active);
+ +			if (!next)
+ +				continue;
+ +
+ +			timer = container_of(next, struct hrtimer, node);
+ +			delta.tv64 = hrtimer_get_expires_tv64(timer);
+ +			delta = ktime_sub(delta, base->get_time());
+ +			if (delta.tv64 < mindelta.tv64)
+ +				mindelta.tv64 = delta.tv64;
+ +		}
+ +	}
+++=======
++ 	if (!__hrtimer_hres_active(cpu_base))
++ 		expires = __hrtimer_get_next_event(cpu_base).tv64;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation):kernel/time/hrtimer.c
+  
+  	raw_spin_unlock_irqrestore(&cpu_base->lock, flags);
+  
+diff --cc kernel/rcutree_plugin.h
+index 1d6c5cb9a366,0ef80a0bbabb..000000000000
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@@ -1541,11 -1367,13 +1541,19 @@@ static void rcu_prepare_kthreads(int cp
+   * Because we not have RCU_FAST_NO_HZ, just check whether this CPU needs
+   * any flavor of RCU.
+   */
+++<<<<<<< HEAD:kernel/rcutree_plugin.h
+ +int rcu_needs_cpu(int cpu, unsigned long *delta_jiffies)
+ +{
+ +	*delta_jiffies = ULONG_MAX;
+ +	return rcu_cpu_has_callbacks(cpu, NULL);
+++=======
++ #ifndef CONFIG_RCU_NOCB_CPU_ALL
++ int rcu_needs_cpu(u64 basemono, u64 *nextevt)
++ {
++ 	*nextevt = KTIME_MAX;
++ 	return rcu_cpu_has_callbacks(NULL);
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation):kernel/rcu/tree_plugin.h
+  }
+ -#endif /* #ifndef CONFIG_RCU_NOCB_CPU_ALL */
+  
+  /*
+   * Because we do not have RCU_FAST_NO_HZ, don't bother cleaning up
+@@@ -1645,16 -1480,18 +1653,29 @@@ static bool rcu_try_advance_all_cbs(voi
+   *
+   * The caller must have disabled interrupts.
+   */
+++<<<<<<< HEAD:kernel/rcutree_plugin.h
+ +int rcu_needs_cpu(int cpu, unsigned long *dj)
+ +{
+ +	struct rcu_dynticks *rdtp = &per_cpu(rcu_dynticks, cpu);
+++=======
++ #ifndef CONFIG_RCU_NOCB_CPU_ALL
++ int rcu_needs_cpu(u64 basemono, u64 *nextevt)
++ {
++ 	struct rcu_dynticks *rdtp = this_cpu_ptr(&rcu_dynticks);
++ 	unsigned long dj;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation):kernel/rcu/tree_plugin.h
+  
+  	/* Snapshot to detect later posting of non-lazy callback. */
+  	rdtp->nonlazy_posted_snap = rdtp->nonlazy_posted;
+  
+  	/* If no callbacks, RCU doesn't need the CPU. */
+++<<<<<<< HEAD:kernel/rcutree_plugin.h
+ +	if (!rcu_cpu_has_callbacks(cpu, &rdtp->all_lazy)) {
+ +		*dj = ULONG_MAX;
+++=======
++ 	if (!rcu_cpu_has_callbacks(&rdtp->all_lazy)) {
++ 		*nextevt = KTIME_MAX;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation):kernel/rcu/tree_plugin.h
+  		return 0;
+  	}
+  
+@@@ -1668,13 -1505,15 +1689,14 @@@
+  
+  	/* Request timer delay depending on laziness, and round. */
+  	if (!rdtp->all_lazy) {
+- 		*dj = round_up(rcu_idle_gp_delay + jiffies,
++ 		dj = round_up(rcu_idle_gp_delay + jiffies,
+  			       rcu_idle_gp_delay) - jiffies;
+  	} else {
+- 		*dj = round_jiffies(rcu_idle_lazy_gp_delay + jiffies) - jiffies;
++ 		dj = round_jiffies(rcu_idle_lazy_gp_delay + jiffies) - jiffies;
+  	}
++ 	*nextevt = basemono + dj * TICK_NSEC;
+  	return 0;
+  }
+ -#endif /* #ifndef CONFIG_RCU_NOCB_CPU_ALL */
+  
+  /*
+   * Prepare a CPU for idle from an RCU perspective.  The first major task
+diff --cc kernel/time/tick-internal.h
+index cfd35adb83f6,65273f0a11ed..000000000000
+--- a/kernel/time/tick-internal.h
++++ b/kernel/time/tick-internal.h
+@@@ -43,106 -121,21 +43,110 @@@ extern int tick_resume_broadcast_onesho
+  extern int tick_broadcast_oneshot_active(void);
+  extern void tick_check_oneshot_broadcast_this_cpu(void);
+  bool tick_broadcast_oneshot_available(void);
+ -extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+ -#else /* !(BROADCAST && ONESHOT): */
+ -static inline void tick_broadcast_setup_oneshot(struct clock_event_device *bc) { BUG(); }
+ +# else /* BROADCAST */
+ +static inline void tick_broadcast_setup_oneshot(struct clock_event_device *bc)
+ +{
+ +	BUG();
+ +}
+ +static inline void tick_broadcast_oneshot_control(unsigned long reason) { }
+  static inline void tick_broadcast_switch_to_oneshot(void) { }
+ -static inline void tick_shutdown_broadcast_oneshot(unsigned int cpu) { }
+ +static inline void tick_shutdown_broadcast_oneshot(unsigned int *cpup) { }
+  static inline int tick_broadcast_oneshot_active(void) { return 0; }
+  static inline void tick_check_oneshot_broadcast_this_cpu(void) { }
+ -static inline bool tick_broadcast_oneshot_available(void) { return tick_oneshot_possible(); }
+ -#endif /* !(BROADCAST && ONESHOT) */
+ -
+ -/* NO_HZ_FULL internal */
+ -#ifdef CONFIG_NO_HZ_FULL
+ -extern void tick_nohz_init(void);
+ -# else
+ -static inline void tick_nohz_init(void) { }
+ +static inline bool tick_broadcast_oneshot_available(void) { return true; }
+ +# endif /* !BROADCAST */
+ +
+ +#else /* !ONESHOT */
+ +static inline
+ +void tick_setup_oneshot(struct clock_event_device *newdev,
+ +			void (*handler)(struct clock_event_device *),
+ +			ktime_t nextevt)
+ +{
+ +	BUG();
+ +}
+ +static inline void tick_resume_oneshot(void)
+ +{
+ +	BUG();
+ +}
+ +static inline int tick_program_event(ktime_t expires, int force)
+ +{
+ +	return 0;
+ +}
+ +static inline void tick_oneshot_notify(void) { }
+ +static inline void tick_broadcast_setup_oneshot(struct clock_event_device *bc)
+ +{
+ +	BUG();
+ +}
+ +static inline void tick_broadcast_oneshot_control(unsigned long reason) { }
+ +static inline void tick_shutdown_broadcast_oneshot(unsigned int *cpup) { }
+ +static inline int tick_resume_broadcast_oneshot(struct clock_event_device *bc)
+ +{
+ +	return 0;
+ +}
+ +static inline int tick_broadcast_oneshot_active(void) { return 0; }
+ +static inline bool tick_broadcast_oneshot_available(void) { return false; }
+ +#endif /* !TICK_ONESHOT */
+ +
+ +/*
+ + * Broadcasting support
+ + */
+ +#ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
+ +extern int tick_device_uses_broadcast(struct clock_event_device *dev, int cpu);
+ +extern void tick_install_broadcast_device(struct clock_event_device *dev);
+ +extern int tick_is_broadcast_device(struct clock_event_device *dev);
+ +extern void tick_broadcast_on_off(unsigned long reason, int *oncpu);
+ +extern void tick_shutdown_broadcast(unsigned int *cpup);
+ +extern void tick_suspend_broadcast(void);
+ +extern int tick_resume_broadcast(void);
+ +extern void tick_broadcast_init(void);
+ +extern void
+ +tick_set_periodic_handler(struct clock_event_device *dev, int broadcast);
+ +
+ +#else /* !BROADCAST */
+ +
+ +static inline void tick_install_broadcast_device(struct clock_event_device *dev)
+ +{
+ +}
+ +
+ +static inline int tick_is_broadcast_device(struct clock_event_device *dev)
+ +{
+ +	return 0;
+ +}
+ +static inline int tick_device_uses_broadcast(struct clock_event_device *dev,
+ +					     int cpu)
+ +{
+ +	return 0;
+ +}
+ +static inline void tick_do_periodic_broadcast(struct clock_event_device *d) { }
+ +static inline void tick_broadcast_on_off(unsigned long reason, int *oncpu) { }
+ +static inline void tick_shutdown_broadcast(unsigned int *cpup) { }
+ +static inline void tick_suspend_broadcast(void) { }
+ +static inline int tick_resume_broadcast(void) { return 0; }
+ +static inline void tick_broadcast_init(void) { }
+ +
+ +/*
+ + * Set the periodic handler in non broadcast mode
+ + */
+ +static inline void tick_set_periodic_handler(struct clock_event_device *dev,
+ +					     int broadcast)
+ +{
+ +	dev->event_handler = tick_handle_periodic;
+ +}
+ +#endif /* !BROADCAST */
+ +
+ +/*
+ + * Check, if the device is functional or a dummy for broadcast
+ + */
+ +static inline int tick_device_is_functional(struct clock_event_device *dev)
+ +{
+ +	return !(dev->features & CLOCK_EVT_FEAT_DUMMY);
+ +}
+ +
+  #endif
+  
+++<<<<<<< HEAD
+ +extern void do_timer(unsigned long ticks);
+ +extern void update_wall_time(void);
+++=======
++ extern u64 get_next_timer_interrupt(unsigned long basej, u64 basem);
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+diff --cc kernel/time/tick-sched.c
+index 411c7f4f2e87,753c211f6195..000000000000
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@@ -560,39 -582,46 +560,63 @@@ static void tick_nohz_restart(struct ti
+  static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
+  					 ktime_t now, int cpu)
+  {
+++<<<<<<< HEAD
+ +	unsigned long seq, last_jiffies, next_jiffies, delta_jiffies;
+ +	ktime_t last_update, expires, ret = { .tv64 = 0 };
+ +	unsigned long rcu_delta_jiffies;
+ +	struct clock_event_device *dev = __get_cpu_var(tick_cpu_device).evtdev;
+ +	u64 time_delta;
+ +
+ +	time_delta = timekeeping_max_deferment();
+++=======
++ 	struct clock_event_device *dev = __this_cpu_read(tick_cpu_device.evtdev);
++ 	u64 basemono, next_tick, next_tmr, next_rcu, delta, expires;
++ 	unsigned long seq, basejiff;
++ 	ktime_t	tick;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+  
+  	/* Read jiffies and the time when jiffies were updated last */
+  	do {
+  		seq = read_seqbegin(&jiffies_lock);
+- 		last_update = last_jiffies_update;
+- 		last_jiffies = jiffies;
++ 		basemono = last_jiffies_update.tv64;
++ 		basejiff = jiffies;
+  	} while (read_seqretry(&jiffies_lock, seq));
++ 	ts->last_jiffies = basejiff;
+  
+++<<<<<<< HEAD
+ +	if (rcu_needs_cpu(cpu, &rcu_delta_jiffies) ||
+ +	    arch_needs_cpu(cpu) || irq_work_needs_cpu()) {
+ +		next_jiffies = last_jiffies + 1;
+ +		delta_jiffies = 1;
+++=======
++ 	if (rcu_needs_cpu(basemono, &next_rcu) ||
++ 	    arch_needs_cpu() || irq_work_needs_cpu()) {
++ 		next_tick = basemono + TICK_NSEC;
+++>>>>>>> c1ad348b452a (tick: Nohz: Rework next timer evaluation)
+  	} else {
+- 		/* Get the next timer wheel timer */
+- 		next_jiffies = get_next_timer_interrupt(last_jiffies);
+- 		delta_jiffies = next_jiffies - last_jiffies;
+- 		if (rcu_delta_jiffies < delta_jiffies) {
+- 			next_jiffies = last_jiffies + rcu_delta_jiffies;
+- 			delta_jiffies = rcu_delta_jiffies;
+- 		}
++ 		/*
++ 		 * Get the next pending timer. If high resolution
++ 		 * timers are enabled this only takes the timer wheel
++ 		 * timers into account. If high resolution timers are
++ 		 * disabled this also looks at the next expiring
++ 		 * hrtimer.
++ 		 */
++ 		next_tmr = get_next_timer_interrupt(basejiff, basemono);
++ 		ts->next_timer = next_tmr;
++ 		/* Take the next rcu event into account */
++ 		next_tick = next_rcu < next_tmr ? next_rcu : next_tmr;
+  	}
+  
+- 	if ((long)delta_jiffies <= 1) {
++ 	/*
++ 	 * If the tick is due in the next period, keep it ticking or
++ 	 * restart it proper.
++ 	 */
++ 	delta = next_tick - basemono;
++ 	if (delta <= (u64)TICK_NSEC) {
++ 		tick.tv64 = 0;
+  		if (!ts->tick_stopped)
+  			goto out;
+- 		if (delta_jiffies == 0) {
++ 		if (delta == 0) {
+  			/* Tick is stopped, but required now. Enforce it */
+  			tick_nohz_restart(ts, now);
+  			goto out;
+* Unmerged path kernel/time/tick-sched.h
+diff --git a/include/linux/hrtimer.h b/include/linux/hrtimer.h
+index 9944ae0be366..dd84fec2160a 100644
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@ -394,7 +394,7 @@ static inline int hrtimer_restart(struct hrtimer *timer)
+ extern ktime_t hrtimer_get_remaining(const struct hrtimer *timer);
+ extern int hrtimer_get_res(const clockid_t which_clock, struct timespec *tp);
+ 
+-extern ktime_t hrtimer_get_next_event(void);
++extern u64 hrtimer_get_next_event(void);
+ 
+ /*
+  * A timer is active, when it is enqueued into the rbtree or the
+* Unmerged path include/linux/rcupdate.h
+* Unmerged path include/linux/rcutree.h
+diff --git a/include/linux/timer.h b/include/linux/timer.h
+index 8c5a197e1587..fbb80e0030bf 100644
+--- a/include/linux/timer.h
++++ b/include/linux/timer.h
+@@ -187,13 +187,6 @@ extern void set_timer_slack(struct timer_list *time, int slack_hz);
+  */
+ #define NEXT_TIMER_MAX_DELTA	((1UL << 30) - 1)
+ 
+-/*
+- * Return when the next timer-wheel timeout occurs (in absolute jiffies),
+- * locks the timer base and does the comparison against the given
+- * jiffie.
+- */
+-extern unsigned long get_next_timer_interrupt(unsigned long now);
+-
+ /*
+  * Timer-statistics info:
+  */
+* Unmerged path kernel/hrtimer.c
+* Unmerged path kernel/rcutree_plugin.h
+* Unmerged path kernel/time/tick-internal.h
+* Unmerged path kernel/time/tick-sched.c
+* Unmerged path kernel/time/tick-sched.h
+diff --git a/kernel/time/timer_list.c b/kernel/time/timer_list.c
+index 61ed862cdd37..9174c0a7c787 100644
+--- a/kernel/time/timer_list.c
++++ b/kernel/time/timer_list.c
+@@ -184,7 +184,7 @@ static void print_cpu(struct seq_file *m, int cpu, u64 now)
+ 		P_ns(idle_sleeptime);
+ 		P_ns(iowait_sleeptime);
+ 		P(last_jiffies);
+-		P(next_jiffies);
++		P(next_timer);
+ 		P_ns(idle_expires);
+ 		SEQ_printf(m, "jiffies: %Lu\n",
+ 			   (unsigned long long)jiffies);
+@@ -256,7 +256,7 @@ static void timer_list_show_tickdevices_header(struct seq_file *m)
+ 
+ static inline void timer_list_header(struct seq_file *m, u64 now)
+ {
+-	SEQ_printf(m, "Timer List Version: v0.7\n");
++	SEQ_printf(m, "Timer List Version: v0.8\n");
+ 	SEQ_printf(m, "HRTIMER_MAX_CLOCK_BASES: %d\n", HRTIMER_MAX_CLOCK_BASES);
+ 	SEQ_printf(m, "now at %Ld nsecs\n", (unsigned long long)now);
+ 	SEQ_printf(m, "\n");
+diff --git a/kernel/timer.c b/kernel/timer.c
+index 62910332f08c..69ba824127db 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -49,6 +49,8 @@
+ #include <asm/timex.h>
+ #include <asm/io.h>
+ 
++#include "tick-internal.h"
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/timer.h>
+ 
+@@ -1296,54 +1298,48 @@ cascade:
+  * Check, if the next hrtimer event is before the next timer wheel
+  * event:
+  */
+-static unsigned long cmp_next_hrtimer_event(unsigned long now,
+-					    unsigned long expires)
++static u64 cmp_next_hrtimer_event(u64 basem, u64 expires)
+ {
+-	ktime_t hr_delta = hrtimer_get_next_event();
+-	struct timespec tsdelta;
+-	unsigned long delta;
+-
+-	if (hr_delta.tv64 == KTIME_MAX)
+-		return expires;
++	u64 nextevt = hrtimer_get_next_event();
+ 
+ 	/*
+-	 * Expired timer available, let it expire in the next tick
++	 * If high resolution timers are enabled
++	 * hrtimer_get_next_event() returns KTIME_MAX.
+ 	 */
+-	if (hr_delta.tv64 <= 0)
+-		return now + 1;
+-
+-	tsdelta = ktime_to_timespec(hr_delta);
+-	delta = timespec_to_jiffies(&tsdelta);
++	if (expires <= nextevt)
++		return expires;
+ 
+ 	/*
+-	 * Limit the delta to the max value, which is checked in
+-	 * tick_nohz_stop_sched_tick():
++	 * If the next timer is already expired, return the tick base
++	 * time so the tick is fired immediately.
+ 	 */
+-	if (delta > NEXT_TIMER_MAX_DELTA)
+-		delta = NEXT_TIMER_MAX_DELTA;
++	if (nextevt <= basem)
++		return basem;
+ 
+ 	/*
+-	 * Take rounding errors in to account and make sure, that it
+-	 * expires in the next tick. Otherwise we go into an endless
+-	 * ping pong due to tick_nohz_stop_sched_tick() retriggering
+-	 * the timer softirq
++	 * Round up to the next jiffie. High resolution timers are
++	 * off, so the hrtimers are expired in the tick and we need to
++	 * make sure that this tick really expires the timer to avoid
++	 * a ping pong of the nohz stop code.
++	 *
++	 * Use DIV_ROUND_UP_ULL to prevent gcc calling __divdi3
+ 	 */
+-	if (delta < 1)
+-		delta = 1;
+-	now += delta;
+-	if (time_before(now, expires))
+-		return now;
+-	return expires;
++	return DIV_ROUND_UP_ULL(nextevt, TICK_NSEC) * TICK_NSEC;
+ }
+ 
+ /**
+- * get_next_timer_interrupt - return the jiffy of the next pending timer
+- * @now: current time (in jiffies)
++ * get_next_timer_interrupt - return the time (clock mono) of the next timer
++ * @basej:	base time jiffies
++ * @basem:	base time clock monotonic
++ *
++ * Returns the tick aligned clock monotonic time of the next pending
++ * timer or KTIME_MAX if no timer is pending.
+  */
+-unsigned long get_next_timer_interrupt(unsigned long now)
++u64 get_next_timer_interrupt(unsigned long basej, u64 basem)
+ {
+ 	struct tvec_base *base = __this_cpu_read(tvec_bases);
+-	unsigned long expires = now + NEXT_TIMER_MAX_DELTA;
++	u64 expires = KTIME_MAX;
++	unsigned long nextevt;
+ 
+ 	/*
+ 	 * Pretend that there is no timer pending if the cpu is offline.
+@@ -1356,14 +1352,15 @@ unsigned long get_next_timer_interrupt(unsigned long now)
+ 	if (base->active_timers) {
+ 		if (time_before_eq(base->next_timer, base->timer_jiffies))
+ 			base->next_timer = __next_timer_interrupt(base);
+-		expires = base->next_timer;
++		nextevt = base->next_timer;
++		if (time_before_eq(nextevt, basej))
++			expires = basem;
++		else
++			expires = basem + (nextevt - basej) * TICK_NSEC;
+ 	}
+ 	spin_unlock(&base->lock);
+ 
+-	if (time_before_eq(expires, now))
+-		return now;
+-
+-	return cmp_next_hrtimer_event(now, expires);
++	return cmp_next_hrtimer_event(basem, expires);
+ }
+ #endif
+ 
