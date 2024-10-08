@@ -1,0 +1,297 @@
+mm: new pfn_mkwrite same as page_mkwrite for VM_PFNMAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] new pfn_mkwrite same as page_mkwrite for VM_PFNMAP (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 96.15%
+commit-author Boaz Harrosh <boaz@plexistor.com>
+commit dd9061846a3ba01b0fa45423aaa087e4a69187fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dd906184.failed
+
+This will allow FS that uses VM_PFNMAP | VM_MIXEDMAP (no page structs) to
+get notified when access is a write to a read-only PFN.
+
+This can happen if we mmap() a file then first mmap-read from it to
+page-in a read-only PFN, than we mmap-write to the same page.
+
+We need this functionality to fix a DAX bug, where in the scenario above
+we fail to set ctime/mtime though we modified the file.  An xfstest is
+attached to this patchset that shows the failure and the fix.  (A DAX
+patch will follow)
+
+This functionality is extra important for us, because upon dirtying of a
+pmem page we also want to RDMA the page to a remote cluster node.
+
+We define a new pfn_mkwrite and do not reuse page_mkwrite because
+  1 - The name ;-)
+  2 - But mainly because it would take a very long and tedious
+      audit of all page_mkwrite functions of VM_MIXEDMAP/VM_PFNMAP
+      users. To make sure they do not now CRASH. For example current
+      DAX code (which this is for) would crash.
+      If we would want to reuse page_mkwrite, We will need to first
+      patch all users, so to not-crash-on-no-page. Then enable this
+      patch. But even if I did that I would not sleep so well at night.
+      Adding a new vector is the safest thing to do, and is not that
+      expensive. an extra pointer at a static function vector per driver.
+      Also the new vector is better for performance, because else we
+      Will call all current Kernel vectors, so to:
+        check-ha-no-page-do-nothing and return.
+
+No need to call it from do_shared_fault because do_wp_page is called to
+change pte permissions anyway.
+
+	Signed-off-by: Yigal Korman <yigal@plexistor.com>
+	Signed-off-by: Boaz Harrosh <boaz@plexistor.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dd9061846a3ba01b0fa45423aaa087e4a69187fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index fce51319197b,22e037e3364e..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3097,10 -2178,179 +3097,184 @@@ oom
+  	if (old_page)
+  		page_cache_release(old_page);
+  	return VM_FAULT_OOM;
+ -}
+  
+++<<<<<<< HEAD
+ +unwritable_page:
+ +	page_cache_release(old_page);
+ +	return ret;
+++=======
++ /*
++  * Handle write page faults for VM_MIXEDMAP or VM_PFNMAP for a VM_SHARED
++  * mapping
++  */
++ static int wp_pfn_shared(struct mm_struct *mm,
++ 			struct vm_area_struct *vma, unsigned long address,
++ 			pte_t *page_table, spinlock_t *ptl, pte_t orig_pte,
++ 			pmd_t *pmd)
++ {
++ 	if (vma->vm_ops && vma->vm_ops->pfn_mkwrite) {
++ 		struct vm_fault vmf = {
++ 			.page = NULL,
++ 			.pgoff = linear_page_index(vma, address),
++ 			.virtual_address = (void __user *)(address & PAGE_MASK),
++ 			.flags = FAULT_FLAG_WRITE | FAULT_FLAG_MKWRITE,
++ 		};
++ 		int ret;
++ 
++ 		pte_unmap_unlock(page_table, ptl);
++ 		ret = vma->vm_ops->pfn_mkwrite(vma, &vmf);
++ 		if (ret & VM_FAULT_ERROR)
++ 			return ret;
++ 		page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
++ 		/*
++ 		 * We might have raced with another page fault while we
++ 		 * released the pte_offset_map_lock.
++ 		 */
++ 		if (!pte_same(*page_table, orig_pte)) {
++ 			pte_unmap_unlock(page_table, ptl);
++ 			return 0;
++ 		}
++ 	}
++ 	return wp_page_reuse(mm, vma, address, page_table, ptl, orig_pte,
++ 			     NULL, 0, 0);
++ }
++ 
++ static int wp_page_shared(struct mm_struct *mm, struct vm_area_struct *vma,
++ 			  unsigned long address, pte_t *page_table,
++ 			  pmd_t *pmd, spinlock_t *ptl, pte_t orig_pte,
++ 			  struct page *old_page)
++ 	__releases(ptl)
++ {
++ 	int page_mkwrite = 0;
++ 
++ 	page_cache_get(old_page);
++ 
++ 	/*
++ 	 * Only catch write-faults on shared writable pages,
++ 	 * read-only shared pages can get COWed by
++ 	 * get_user_pages(.write=1, .force=1).
++ 	 */
++ 	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
++ 		int tmp;
++ 
++ 		pte_unmap_unlock(page_table, ptl);
++ 		tmp = do_page_mkwrite(vma, old_page, address);
++ 		if (unlikely(!tmp || (tmp &
++ 				      (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
++ 			page_cache_release(old_page);
++ 			return tmp;
++ 		}
++ 		/*
++ 		 * Since we dropped the lock we need to revalidate
++ 		 * the PTE as someone else may have changed it.  If
++ 		 * they did, we just return, as we can count on the
++ 		 * MMU to tell us if they didn't also make it writable.
++ 		 */
++ 		page_table = pte_offset_map_lock(mm, pmd, address,
++ 						 &ptl);
++ 		if (!pte_same(*page_table, orig_pte)) {
++ 			unlock_page(old_page);
++ 			pte_unmap_unlock(page_table, ptl);
++ 			page_cache_release(old_page);
++ 			return 0;
++ 		}
++ 		page_mkwrite = 1;
++ 	}
++ 
++ 	return wp_page_reuse(mm, vma, address, page_table, ptl,
++ 			     orig_pte, old_page, page_mkwrite, 1);
++ }
++ 
++ /*
++  * This routine handles present pages, when users try to write
++  * to a shared page. It is done by copying the page to a new address
++  * and decrementing the shared-page counter for the old page.
++  *
++  * Note that this routine assumes that the protection checks have been
++  * done by the caller (the low-level page fault routine in most cases).
++  * Thus we can safely just mark it writable once we've done any necessary
++  * COW.
++  *
++  * We also mark the page dirty at this point even though the page will
++  * change only once the write actually happens. This avoids a few races,
++  * and potentially makes it more efficient.
++  *
++  * We enter with non-exclusive mmap_sem (to exclude vma changes,
++  * but allow concurrent faults), with pte both mapped and locked.
++  * We return with mmap_sem still held, but pte unmapped and unlocked.
++  */
++ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
++ 		unsigned long address, pte_t *page_table, pmd_t *pmd,
++ 		spinlock_t *ptl, pte_t orig_pte)
++ 	__releases(ptl)
++ {
++ 	struct page *old_page;
++ 
++ 	old_page = vm_normal_page(vma, address, orig_pte);
++ 	if (!old_page) {
++ 		/*
++ 		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a
++ 		 * VM_PFNMAP VMA.
++ 		 *
++ 		 * We should not cow pages in a shared writeable mapping.
++ 		 * Just mark the pages writable and/or call ops->pfn_mkwrite.
++ 		 */
++ 		if ((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
++ 				     (VM_WRITE|VM_SHARED))
++ 			return wp_pfn_shared(mm, vma, address, page_table, ptl,
++ 					     orig_pte, pmd);
++ 
++ 		pte_unmap_unlock(page_table, ptl);
++ 		return wp_page_copy(mm, vma, address, page_table, pmd,
++ 				    orig_pte, old_page);
++ 	}
++ 
++ 	/*
++ 	 * Take out anonymous pages first, anonymous shared vmas are
++ 	 * not dirty accountable.
++ 	 */
++ 	if (PageAnon(old_page) && !PageKsm(old_page)) {
++ 		if (!trylock_page(old_page)) {
++ 			page_cache_get(old_page);
++ 			pte_unmap_unlock(page_table, ptl);
++ 			lock_page(old_page);
++ 			page_table = pte_offset_map_lock(mm, pmd, address,
++ 							 &ptl);
++ 			if (!pte_same(*page_table, orig_pte)) {
++ 				unlock_page(old_page);
++ 				pte_unmap_unlock(page_table, ptl);
++ 				page_cache_release(old_page);
++ 				return 0;
++ 			}
++ 			page_cache_release(old_page);
++ 		}
++ 		if (reuse_swap_page(old_page)) {
++ 			/*
++ 			 * The page is all ours.  Move it to our anon_vma so
++ 			 * the rmap code will not search our parent or siblings.
++ 			 * Protected against the rmap code by the page lock.
++ 			 */
++ 			page_move_anon_rmap(old_page, vma, address);
++ 			unlock_page(old_page);
++ 			return wp_page_reuse(mm, vma, address, page_table, ptl,
++ 					     orig_pte, old_page, 0, 0);
++ 		}
++ 		unlock_page(old_page);
++ 	} else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
++ 					(VM_WRITE|VM_SHARED))) {
++ 		return wp_page_shared(mm, vma, address, page_table, pmd,
++ 				      ptl, orig_pte, old_page);
++ 	}
++ 
++ 	/*
++ 	 * Ok, we need to copy. Oh, well..
++ 	 */
++ 	page_cache_get(old_page);
++ 
++ 	pte_unmap_unlock(page_table, ptl);
++ 	return wp_page_copy(mm, vma, address, page_table, pmd,
++ 			    orig_pte, old_page);
+++>>>>>>> dd9061846a3b (mm: new pfn_mkwrite same as page_mkwrite for VM_PFNMAP)
+  }
+  
+  static void unmap_mapping_range_vma(struct vm_area_struct *vma,
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index af63b7f9e0d8..7bcb98c3b25a 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -522,6 +522,7 @@ prototypes:
+ 	void (*close)(struct vm_area_struct*);
+ 	int (*fault)(struct vm_area_struct*, struct vm_fault *);
+ 	int (*page_mkwrite)(struct vm_area_struct *, struct vm_fault *);
++	int (*pfn_mkwrite)(struct vm_area_struct *, struct vm_fault *);
+ 	int (*access)(struct vm_area_struct *, unsigned long, void*, int, int);
+ 
+ locking rules:
+@@ -530,6 +531,7 @@ open:		yes
+ close:		yes
+ fault:		yes		can return with page locked
+ page_mkwrite:	yes		can return with page locked
++pfn_mkwrite:	yes
+ access:		yes
+ 
+ 	->fault() is called when a previously not present pte is about
+@@ -547,6 +549,12 @@ the page has been truncated, the filesystem should not look up a new page
+ like the ->fault() handler, but simply return with VM_FAULT_NOPAGE, which
+ will cause the VM to retry the fault.
+ 
++	->pfn_mkwrite() is the same as page_mkwrite but when the pte is
++VM_PFNMAP or VM_MIXEDMAP with a page-less entry. Expected return is
++VM_FAULT_NOPAGE. Or one of the VM_FAULT_ERROR types. The default behavior
++after this call is to make the pte read-write, unless pfn_mkwrite returns
++an error.
++
+ 	->access() is called when get_user_pages() fails in
+ acces_process_vm(), typically used to debug a process through
+ /proc/pid/mem or ptrace.  This function is needed only for
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index c7c33f7729de..0872edf55346 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -234,6 +234,9 @@ struct vm_operations_struct {
+ 	 * writable, if an error is returned it will cause a SIGBUS */
+ 	int (*page_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
+ 
++	/* same as page_mkwrite when using VM_PFNMAP|VM_MIXEDMAP */
++	int (*pfn_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
++
+ 	/* called by access_process_vm when get_user_pages() fails, typically
+ 	 * for use by special VMAs that can switch between memory and hardware
+ 	 */
+* Unmerged path mm/memory.c
