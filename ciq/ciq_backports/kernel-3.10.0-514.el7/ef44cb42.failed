@@ -1,0 +1,723 @@
+usb: allow to supply the PHY in the drivers when using HCD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [usb] allow to supply the PHY in the drivers when using HCD (Don Zickus) [1303209]
+Rebuild_FUZZ: 95.50%
+commit-author Antoine Tenart <antoine.tenart@free-electrons.com>
+commit ef44cb4226d132146e44f8ea562a16b27ff61126
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ef44cb42.failed
+
+This patch modify the generic code handling PHYs to allow them to be
+supplied from the drivers. This adds checks to ensure no PHY was already
+there when looking for one in the generic code. This also makes sure we
+do not modify its state in the generic HCD functions, it was provided by
+the driver.
+
+	Signed-off-by: Antoine Tenart <antoine.tenart@free-electrons.com>
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit ef44cb4226d132146e44f8ea562a16b27ff61126)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/chipidea/ci.h
+#	drivers/usb/chipidea/ci_hdrc_imx.c
+#	drivers/usb/chipidea/ci_hdrc_msm.c
+#	drivers/usb/chipidea/core.c
+#	drivers/usb/chipidea/debug.c
+#	drivers/usb/chipidea/host.c
+#	drivers/usb/chipidea/otg_fsm.c
+#	drivers/usb/chipidea/udc.c
+#	drivers/usb/core/hcd.c
+#	include/linux/usb/chipidea.h
+diff --cc drivers/usb/chipidea/ci.h
+index b0a6bce064ca,9015139a8027..000000000000
+--- a/drivers/usb/chipidea/ci.h
++++ b/drivers/usb/chipidea/ci.h
+@@@ -235,8 -55,198 +235,200 @@@ enum ci13xxx_regs 
+  	OP_LAST = OP_ENDPTCTRL + ENDPT_MAX / 2,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /******************************************************************************
++  * STRUCTURES
++  *****************************************************************************/
++ /**
++  * struct ci_hw_ep - endpoint representation
++  * @ep: endpoint structure for gadget drivers
++  * @dir: endpoint direction (TX/RX)
++  * @num: endpoint number
++  * @type: endpoint type
++  * @name: string description of the endpoint
++  * @qh: queue head for this endpoint
++  * @wedge: is the endpoint wedged
++  * @ci: pointer to the controller
++  * @lock: pointer to controller's spinlock
++  * @td_pool: pointer to controller's TD pool
++  */
++ struct ci_hw_ep {
++ 	struct usb_ep				ep;
++ 	u8					dir;
++ 	u8					num;
++ 	u8					type;
++ 	char					name[16];
++ 	struct {
++ 		struct list_head	queue;
++ 		struct ci_hw_qh		*ptr;
++ 		dma_addr_t		dma;
++ 	}					qh;
++ 	int					wedge;
++ 
++ 	/* global resources */
++ 	struct ci_hdrc				*ci;
++ 	spinlock_t				*lock;
++ 	struct dma_pool				*td_pool;
++ 	struct td_node				*pending_td;
++ };
++ 
++ enum ci_role {
++ 	CI_ROLE_HOST = 0,
++ 	CI_ROLE_GADGET,
++ 	CI_ROLE_END,
++ };
++ 
++ /**
++  * struct ci_role_driver - host/gadget role driver
++  * @start: start this role
++  * @stop: stop this role
++  * @irq: irq handler for this role
++  * @name: role name string (host/gadget)
++  */
++ struct ci_role_driver {
++ 	int		(*start)(struct ci_hdrc *);
++ 	void		(*stop)(struct ci_hdrc *);
++ 	irqreturn_t	(*irq)(struct ci_hdrc *);
++ 	const char	*name;
++ };
++ 
++ /**
++  * struct hw_bank - hardware register mapping representation
++  * @lpm: set if the device is LPM capable
++  * @phys: physical address of the controller's registers
++  * @abs: absolute address of the beginning of register window
++  * @cap: capability registers
++  * @op: operational registers
++  * @size: size of the register window
++  * @regmap: register lookup table
++  */
++ struct hw_bank {
++ 	unsigned	lpm;
++ 	resource_size_t	phys;
++ 	void __iomem	*abs;
++ 	void __iomem	*cap;
++ 	void __iomem	*op;
++ 	size_t		size;
++ 	void __iomem	*regmap[OP_LAST + 1];
++ };
++ 
++ /**
++  * struct ci_hdrc - chipidea device representation
++  * @dev: pointer to parent device
++  * @lock: access synchronization
++  * @hw_bank: hardware register mapping
++  * @irq: IRQ number
++  * @roles: array of supported roles for this controller
++  * @role: current role
++  * @is_otg: if the device is otg-capable
++  * @fsm: otg finite state machine
++  * @fsm_timer: pointer to timer list of otg fsm
++  * @work: work for role changing
++  * @wq: workqueue thread
++  * @qh_pool: allocation pool for queue heads
++  * @td_pool: allocation pool for transfer descriptors
++  * @gadget: device side representation for peripheral controller
++  * @driver: gadget driver
++  * @hw_ep_max: total number of endpoints supported by hardware
++  * @ci_hw_ep: array of endpoints
++  * @ep0_dir: ep0 direction
++  * @ep0out: pointer to ep0 OUT endpoint
++  * @ep0in: pointer to ep0 IN endpoint
++  * @status: ep0 status request
++  * @setaddr: if we should set the address on status completion
++  * @address: usb address received from the host
++  * @remote_wakeup: host-enabled remote wakeup
++  * @suspended: suspended by host
++  * @test_mode: the selected test mode
++  * @platdata: platform specific information supplied by parent device
++  * @vbus_active: is VBUS active
++  * @usb_phy: pointer to USB PHY, if any
++  * @hcd: pointer to usb_hcd for ehci host driver
++  * @debugfs: root dentry for this controller in debugfs
++  * @id_event: indicates there is an id event, and handled at ci_otg_work
++  * @b_sess_valid_event: indicates there is a vbus event, and handled
++  * at ci_otg_work
++  * @imx28_write_fix: Freescale imx28 needs swp instruction for writing
++  */
++ struct ci_hdrc {
++ 	struct device			*dev;
++ 	spinlock_t			lock;
++ 	struct hw_bank			hw_bank;
++ 	int				irq;
++ 	struct ci_role_driver		*roles[CI_ROLE_END];
++ 	enum ci_role			role;
++ 	bool				is_otg;
++ 	struct usb_otg			otg;
++ 	struct otg_fsm			fsm;
++ 	struct ci_otg_fsm_timer_list	*fsm_timer;
++ 	struct work_struct		work;
++ 	struct workqueue_struct		*wq;
++ 
++ 	struct dma_pool			*qh_pool;
++ 	struct dma_pool			*td_pool;
++ 
++ 	struct usb_gadget		gadget;
++ 	struct usb_gadget_driver	*driver;
++ 	unsigned			hw_ep_max;
++ 	struct ci_hw_ep			ci_hw_ep[ENDPT_MAX];
++ 	u32				ep0_dir;
++ 	struct ci_hw_ep			*ep0out, *ep0in;
++ 
++ 	struct usb_request		*status;
++ 	bool				setaddr;
++ 	u8				address;
++ 	u8				remote_wakeup;
++ 	u8				suspended;
++ 	u8				test_mode;
++ 
++ 	struct ci_hdrc_platform_data	*platdata;
++ 	int				vbus_active;
++ 	struct usb_phy			*usb_phy;
++ 	struct usb_hcd			*hcd;
++ 	struct dentry			*debugfs;
++ 	bool				id_event;
++ 	bool				b_sess_valid_event;
++ 	bool				imx28_write_fix;
++ };
++ 
++ static inline struct ci_role_driver *ci_role(struct ci_hdrc *ci)
++ {
++ 	BUG_ON(ci->role >= CI_ROLE_END || !ci->roles[ci->role]);
++ 	return ci->roles[ci->role];
++ }
++ 
++ static inline int ci_role_start(struct ci_hdrc *ci, enum ci_role role)
++ {
++ 	int ret;
++ 
++ 	if (role >= CI_ROLE_END)
++ 		return -EINVAL;
++ 
++ 	if (!ci->roles[role])
++ 		return -ENXIO;
++ 
++ 	ret = ci->roles[role]->start(ci);
++ 	if (!ret)
++ 		ci->role = role;
++ 	return ret;
++ }
++ 
++ static inline void ci_role_stop(struct ci_hdrc *ci)
++ {
++ 	enum ci_role role = ci->role;
++ 
++ 	if (role == CI_ROLE_END)
++ 		return;
++ 
++ 	ci->role = CI_ROLE_END;
++ 
++ 	ci->roles[role]->stop(ci);
++ }
++ 
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  /**
+   * hw_read: reads from a hw register
+ - * @ci: the controller
+   * @reg:  register index
+   * @mask: bitfield mask
+   *
+diff --cc drivers/usb/chipidea/core.c
+index 475c9c114689,30f89426bf05..000000000000
+--- a/drivers/usb/chipidea/core.c
++++ b/drivers/usb/chipidea/core.c
+@@@ -208,6 -257,80 +208,83 @@@ static int hw_device_init(struct ci13xx
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hw_phymode_configure(struct ci_hdrc *ci)
++ {
++ 	u32 portsc, lpm, sts = 0;
++ 
++ 	switch (ci->platdata->phy_mode) {
++ 	case USBPHY_INTERFACE_MODE_UTMI:
++ 		portsc = PORTSC_PTS(PTS_UTMI);
++ 		lpm = DEVLC_PTS(PTS_UTMI);
++ 		break;
++ 	case USBPHY_INTERFACE_MODE_UTMIW:
++ 		portsc = PORTSC_PTS(PTS_UTMI) | PORTSC_PTW;
++ 		lpm = DEVLC_PTS(PTS_UTMI) | DEVLC_PTW;
++ 		break;
++ 	case USBPHY_INTERFACE_MODE_ULPI:
++ 		portsc = PORTSC_PTS(PTS_ULPI);
++ 		lpm = DEVLC_PTS(PTS_ULPI);
++ 		break;
++ 	case USBPHY_INTERFACE_MODE_SERIAL:
++ 		portsc = PORTSC_PTS(PTS_SERIAL);
++ 		lpm = DEVLC_PTS(PTS_SERIAL);
++ 		sts = 1;
++ 		break;
++ 	case USBPHY_INTERFACE_MODE_HSIC:
++ 		portsc = PORTSC_PTS(PTS_HSIC);
++ 		lpm = DEVLC_PTS(PTS_HSIC);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	if (ci->hw_bank.lpm) {
++ 		hw_write(ci, OP_DEVLC, DEVLC_PTS(7) | DEVLC_PTW, lpm);
++ 		if (sts)
++ 			hw_write(ci, OP_DEVLC, DEVLC_STS, DEVLC_STS);
++ 	} else {
++ 		hw_write(ci, OP_PORTSC, PORTSC_PTS(7) | PORTSC_PTW, portsc);
++ 		if (sts)
++ 			hw_write(ci, OP_PORTSC, PORTSC_STS, PORTSC_STS);
++ 	}
++ }
++ 
++ /**
++  * ci_usb_phy_init: initialize phy according to different phy type
++  * @ci: the controller
++  *
++  * This function returns an error code if usb_phy_init has failed
++  */
++ static int ci_usb_phy_init(struct ci_hdrc *ci)
++ {
++ 	int ret;
++ 
++ 	switch (ci->platdata->phy_mode) {
++ 	case USBPHY_INTERFACE_MODE_UTMI:
++ 	case USBPHY_INTERFACE_MODE_UTMIW:
++ 	case USBPHY_INTERFACE_MODE_HSIC:
++ 		ret = usb_phy_init(ci->usb_phy);
++ 		if (ret)
++ 			return ret;
++ 		hw_phymode_configure(ci);
++ 		break;
++ 	case USBPHY_INTERFACE_MODE_ULPI:
++ 	case USBPHY_INTERFACE_MODE_SERIAL:
++ 		hw_phymode_configure(ci);
++ 		ret = usb_phy_init(ci->usb_phy);
++ 		if (ret)
++ 			return ret;
++ 		break;
++ 	default:
++ 		ret = usb_phy_init(ci->usb_phy);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  /**
+   * hw_device_reset: resets chip (execute without interruption)
+   * @ci: the controller
+@@@ -394,6 -605,38 +471,41 @@@ static int ci_hdrc_probe(struct platfor
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ci->platdata->usb_phy)
++ 		ci->usb_phy = ci->platdata->usb_phy;
++ 	else
++ 		ci->usb_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
++ 
++ 	if (IS_ERR(ci->usb_phy)) {
++ 		ret = PTR_ERR(ci->usb_phy);
++ 		/*
++ 		 * if -ENXIO is returned, it means PHY layer wasn't
++ 		 * enabled, so it makes no sense to return -EPROBE_DEFER
++ 		 * in that case, since no PHY driver will ever probe.
++ 		 */
++ 		if (ret == -ENXIO)
++ 			return ret;
++ 
++ 		dev_err(dev, "no usb2 phy configured\n");
++ 		return -EPROBE_DEFER;
++ 	}
++ 
++ 	ret = ci_usb_phy_init(ci);
++ 	if (ret) {
++ 		dev_err(dev, "unable to init phy: %d\n", ret);
++ 		return ret;
++ 	} else {
++ 		/* 
++ 		 * The delay to sync PHY's status, the maximum delay is
++ 		 * 2ms since the otgsc uses 1ms timer to debounce the
++ 		 * PHY's input
++ 		 */
++ 		usleep_range(2000, 2500);
++ 	}
++ 
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  	ci->hw_bank.phys = res->start;
+  
+  	ci->irq = platform_get_irq(pdev, 0);
+@@@ -457,23 -726,22 +569,35 @@@
+  
+  	free_irq(ci->irq, ci);
+  stop:
+++<<<<<<< HEAD
+ +	ci_role_stop(ci);
+ +rm_wq:
+ +	flush_workqueue(ci->wq);
+ +	destroy_workqueue(ci->wq);
+++=======
++ 	ci_role_destroy(ci);
++ deinit_phy:
++ 	usb_phy_shutdown(ci->usb_phy);
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  
+  	return ret;
+  }
+  
+  static int ci_hdrc_remove(struct platform_device *pdev)
+  {
+ -	struct ci_hdrc *ci = platform_get_drvdata(pdev);
+ +	struct ci13xxx *ci = platform_get_drvdata(pdev);
+  
+  	dbg_remove_files(ci);
+ +	flush_workqueue(ci->wq);
+ +	destroy_workqueue(ci->wq);
+  	free_irq(ci->irq, ci);
+++<<<<<<< HEAD
+ +	ci_role_stop(ci);
+++=======
++ 	ci_role_destroy(ci);
++ 	ci_hdrc_enter_lpm(ci, true);
++ 	usb_phy_shutdown(ci->usb_phy);
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  
+  	return 0;
+  }
+diff --cc drivers/usb/chipidea/debug.c
+index 36a7063a6cba,268e4236e84c..000000000000
+--- a/drivers/usb/chipidea/debug.c
++++ b/drivers/usb/chipidea/debug.c
+@@@ -199,9 -208,83 +199,86 @@@ static const struct file_operations ci_
+  	.release	= single_release,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int ci_otg_show(struct seq_file *s, void *unused)
++ {
++ 	struct ci_hdrc *ci = s->private;
++ 	struct otg_fsm *fsm;
++ 
++ 	if (!ci || !ci_otg_is_fsm_mode(ci))
++ 		return 0;
++ 
++ 	fsm = &ci->fsm;
++ 
++ 	/* ------ State ----- */
++ 	seq_printf(s, "OTG state: %s\n\n",
++ 			usb_otg_state_string(ci->otg.state));
++ 
++ 	/* ------ State Machine Variables ----- */
++ 	seq_printf(s, "a_bus_drop: %d\n", fsm->a_bus_drop);
++ 
++ 	seq_printf(s, "a_bus_req: %d\n", fsm->a_bus_req);
++ 
++ 	seq_printf(s, "a_srp_det: %d\n", fsm->a_srp_det);
++ 
++ 	seq_printf(s, "a_vbus_vld: %d\n", fsm->a_vbus_vld);
++ 
++ 	seq_printf(s, "b_conn: %d\n", fsm->b_conn);
++ 
++ 	seq_printf(s, "adp_change: %d\n", fsm->adp_change);
++ 
++ 	seq_printf(s, "power_up: %d\n", fsm->power_up);
++ 
++ 	seq_printf(s, "a_bus_resume: %d\n", fsm->a_bus_resume);
++ 
++ 	seq_printf(s, "a_bus_suspend: %d\n", fsm->a_bus_suspend);
++ 
++ 	seq_printf(s, "a_conn: %d\n", fsm->a_conn);
++ 
++ 	seq_printf(s, "b_bus_req: %d\n", fsm->b_bus_req);
++ 
++ 	seq_printf(s, "b_bus_suspend: %d\n", fsm->b_bus_suspend);
++ 
++ 	seq_printf(s, "b_se0_srp: %d\n", fsm->b_se0_srp);
++ 
++ 	seq_printf(s, "b_ssend_srp: %d\n", fsm->b_ssend_srp);
++ 
++ 	seq_printf(s, "b_sess_vld: %d\n", fsm->b_sess_vld);
++ 
++ 	seq_printf(s, "b_srp_done: %d\n", fsm->b_srp_done);
++ 
++ 	seq_printf(s, "drv_vbus: %d\n", fsm->drv_vbus);
++ 
++ 	seq_printf(s, "loc_conn: %d\n", fsm->loc_conn);
++ 
++ 	seq_printf(s, "loc_sof: %d\n", fsm->loc_sof);
++ 
++ 	seq_printf(s, "adp_prb: %d\n", fsm->adp_prb);
++ 
++ 	seq_printf(s, "id: %d\n", fsm->id);
++ 
++ 	seq_printf(s, "protocol: %d\n", fsm->protocol);
++ 
++ 	return 0;
++ }
++ 
++ static int ci_otg_open(struct inode *inode, struct file *file)
++ {
++ 	return single_open(file, ci_otg_show, inode->i_private);
++ }
++ 
++ static const struct file_operations ci_otg_fops = {
++ 	.open			= ci_otg_open,
++ 	.read			= seq_read,
++ 	.llseek			= seq_lseek,
++ 	.release		= single_release,
++ };
++ 
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  static int ci_role_show(struct seq_file *s, void *data)
+  {
+ -	struct ci_hdrc *ci = s->private;
+ +	struct ci13xxx *ci = s->private;
+  
+  	seq_printf(s, "%s\n", ci_role(ci)->name);
+  
+diff --cc drivers/usb/chipidea/host.c
+index 8e9d31277c43,789809f680aa..000000000000
+--- a/drivers/usb/chipidea/host.c
++++ b/drivers/usb/chipidea/host.c
+@@@ -58,19 -59,44 +58,39 @@@ static int host_start(struct ci13xxx *c
+  	hcd->has_tt = 1;
+  
+  	hcd->power_budget = ci->platdata->power_budget;
+++<<<<<<< HEAD
+ +	hcd->phy = ci->transceiver;
+++=======
++ 	hcd->usb_phy = ci->usb_phy;
++ 	hcd->tpl_support = ci->platdata->tpl_support;
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  
+  	ehci = hcd_to_ehci(hcd);
+  	ehci->caps = ci->hw_bank.cap;
+  	ehci->has_hostpc = ci->hw_bank.lpm;
+ -	ehci->has_tdi_phy_lpm = ci->hw_bank.lpm;
+ -	ehci->imx28_write_fix = ci->imx28_write_fix;
+ -
+ -	/*
+ -	 * vbus is always on if host is not in OTG FSM mode,
+ -	 * otherwise should be controlled by OTG FSM
+ -	 */
+ -	if (ci->platdata->reg_vbus && !ci_otg_is_fsm_mode(ci)) {
+ -		ret = regulator_enable(ci->platdata->reg_vbus);
+ -		if (ret) {
+ -			dev_err(ci->dev,
+ -				"Failed to enable vbus regulator, ret=%d\n",
+ -				ret);
+ -			goto put_hcd;
+ -		}
+ -	}
+  
+  	ret = usb_add_hcd(hcd, 0, 0);
+++<<<<<<< HEAD
+ +	if (ret)
+ +		usb_put_hcd(hcd);
+ +	else
+ +		ci->hcd = hcd;
+++=======
++ 	if (ret) {
++ 		goto disable_reg;
++ 	} else {
++ 		struct usb_otg *otg = &ci->otg;
++ 
++ 		ci->hcd = hcd;
++ 
++ 		if (ci_otg_is_fsm_mode(ci)) {
++ 			otg->host = &hcd->self;
++ 			hcd->self.otg_port = 1;
++ 		}
++ 	}
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  
+ -	if (ci->platdata->flags & CI_HDRC_DISABLE_STREAMING)
+ +	if (ci->platdata->flags & CI13XXX_DISABLE_STREAMING)
+  		hw_write(ci, OP_USBMODE, USBMODE_CI_SDIS, USBMODE_CI_SDIS);
+  
+  	return ret;
+diff --cc drivers/usb/chipidea/udc.c
+index b501346484ae,a2d80ab3d9c4..000000000000
+--- a/drivers/usb/chipidea/udc.c
++++ b/drivers/usb/chipidea/udc.c
+@@@ -1388,12 -1515,12 +1388,17 @@@ out
+  	return ret;
+  }
+  
+ -static int ci_udc_vbus_draw(struct usb_gadget *_gadget, unsigned ma)
+ +static int ci13xxx_vbus_draw(struct usb_gadget *_gadget, unsigned mA)
+  {
+ -	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
+ +	struct ci13xxx *ci = container_of(_gadget, struct ci13xxx, gadget);
+  
+++<<<<<<< HEAD
+ +	if (ci->transceiver)
+ +		return usb_phy_set_power(ci->transceiver, mA);
+++=======
++ 	if (ci->usb_phy)
++ 		return usb_phy_set_power(ci->usb_phy, ma);
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  	return -ENOTSUPP;
+  }
+  
+diff --cc drivers/usb/core/hcd.c
+index 28c5a88b883b,6a2a2fd990ab..000000000000
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@@ -2643,6 -2643,30 +2643,33 @@@ int usb_add_hcd(struct usb_hcd *hcd
+  				usb_put_phy(phy);
+  				return retval;
+  			}
+++<<<<<<< HEAD
+++=======
++ 			hcd->usb_phy = phy;
++ 			hcd->remove_phy = 1;
++ 		}
++ 	}
++ 
++ 	if (IS_ENABLED(CONFIG_GENERIC_PHY) && !hcd->phy) {
++ 		struct phy *phy = phy_get(hcd->self.controller, "usb");
++ 
++ 		if (IS_ERR(phy)) {
++ 			retval = PTR_ERR(phy);
++ 			if (retval == -EPROBE_DEFER)
++ 				goto err_phy;
++ 		} else {
++ 			retval = phy_init(phy);
++ 			if (retval) {
++ 				phy_put(phy);
++ 				goto err_phy;
++ 			}
++ 			retval = phy_power_on(phy);
++ 			if (retval) {
++ 				phy_exit(phy);
++ 				phy_put(phy);
++ 				goto err_phy;
++ 			}
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  			hcd->phy = phy;
+  			hcd->remove_phy = 1;
+  		}
+@@@ -2796,6 -2814,19 +2823,22 @@@ err_allocate_root_hub
+  	usb_deregister_bus(&hcd->self);
+  err_register_bus:
+  	hcd_buffer_destroy(hcd);
+++<<<<<<< HEAD
+++=======
++ err_create_buf:
++ 	if (IS_ENABLED(CONFIG_GENERIC_PHY) && hcd->remove_phy && hcd->phy) {
++ 		phy_power_off(hcd->phy);
++ 		phy_exit(hcd->phy);
++ 		phy_put(hcd->phy);
++ 		hcd->phy = NULL;
++ 	}
++ err_phy:
++ 	if (hcd->remove_phy && hcd->usb_phy) {
++ 		usb_phy_shutdown(hcd->usb_phy);
++ 		usb_put_phy(hcd->usb_phy);
++ 		hcd->usb_phy = NULL;
++ 	}
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  	return retval;
+  }
+  EXPORT_SYMBOL_GPL(usb_add_hcd);
+@@@ -2868,6 -2899,18 +2911,21 @@@ void usb_remove_hcd(struct usb_hcd *hcd
+  	usb_deregister_bus(&hcd->self);
+  	hcd_buffer_destroy(hcd);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (IS_ENABLED(CONFIG_GENERIC_PHY) && hcd->remove_phy && hcd->phy) {
++ 		phy_power_off(hcd->phy);
++ 		phy_exit(hcd->phy);
++ 		phy_put(hcd->phy);
++ 		hcd->phy = NULL;
++ 	}
++ 	if (hcd->remove_phy && hcd->usb_phy) {
++ 		usb_phy_shutdown(hcd->usb_phy);
++ 		usb_put_phy(hcd->usb_phy);
++ 		hcd->usb_phy = NULL;
++ 	}
++ 
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  	usb_put_invalidate_rhdev(hcd);
+  }
+  EXPORT_SYMBOL_GPL(usb_remove_hcd);
+diff --cc include/linux/usb/chipidea.h
+index 544825dde823,4fe161a84c7d..000000000000
+--- a/include/linux/usb/chipidea.h
++++ b/include/linux/usb/chipidea.h
+@@@ -13,16 -13,25 +13,21 @@@ struct ci13xxx_platform_data 
+  	/* offset of the capability registers */
+  	uintptr_t	 capoffset;
+  	unsigned	 power_budget;
+++<<<<<<< HEAD
+ +	struct usb_phy	*phy;
+++=======
++ 	struct usb_phy	*usb_phy;
++ 	enum usb_phy_interface phy_mode;
+++>>>>>>> ef44cb4226d1 (usb: allow to supply the PHY in the drivers when using HCD)
+  	unsigned long	 flags;
+ -#define CI_HDRC_REGS_SHARED		BIT(0)
+ -#define CI_HDRC_REQUIRE_TRANSCEIVER	BIT(1)
+ -#define CI_HDRC_DISABLE_STREAMING	BIT(3)
+ -	/*
+ -	 * Only set it when DCCPARAMS.DC==1 and DCCPARAMS.HC==1,
+ -	 * but otg is not supported (no register otgsc).
+ -	 */
+ -#define CI_HDRC_DUAL_ROLE_NOT_OTG	BIT(4)
+ -#define CI_HDRC_IMX28_WRITE_FIX		BIT(5)
+ -#define CI_HDRC_FORCE_FULLSPEED		BIT(6)
+ -	enum usb_dr_mode	dr_mode;
+ -#define CI_HDRC_CONTROLLER_RESET_EVENT		0
+ -#define CI_HDRC_CONTROLLER_STOPPED_EVENT	1
+ -	void	(*notify_event) (struct ci_hdrc *ci, unsigned event);
+ -	struct regulator	*reg_vbus;
+ -	bool			tpl_support;
+ +#define CI13XXX_REGS_SHARED		BIT(0)
+ +#define CI13XXX_REQUIRE_TRANSCEIVER	BIT(1)
+ +#define CI13XXX_PULLUP_ON_VBUS		BIT(2)
+ +#define CI13XXX_DISABLE_STREAMING	BIT(3)
+ +
+ +#define CI13XXX_CONTROLLER_RESET_EVENT		0
+ +#define CI13XXX_CONTROLLER_STOPPED_EVENT	1
+ +	void	(*notify_event) (struct ci13xxx *ci, unsigned event);
+  };
+  
+  /* Default offset of capability registers */
+* Unmerged path drivers/usb/chipidea/ci_hdrc_imx.c
+* Unmerged path drivers/usb/chipidea/ci_hdrc_msm.c
+* Unmerged path drivers/usb/chipidea/otg_fsm.c
+* Unmerged path drivers/usb/chipidea/ci.h
+* Unmerged path drivers/usb/chipidea/ci_hdrc_imx.c
+* Unmerged path drivers/usb/chipidea/ci_hdrc_msm.c
+* Unmerged path drivers/usb/chipidea/core.c
+* Unmerged path drivers/usb/chipidea/debug.c
+* Unmerged path drivers/usb/chipidea/host.c
+* Unmerged path drivers/usb/chipidea/otg_fsm.c
+* Unmerged path drivers/usb/chipidea/udc.c
+* Unmerged path drivers/usb/core/hcd.c
+* Unmerged path include/linux/usb/chipidea.h
