@@ -1,0 +1,232 @@
+ALSA: hda - Add power-welll support for haswell HDA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [alsa] hda: Add power-welll support for haswell HDA (Jaroslav Kysela) [1044022]
+Rebuild_FUZZ: 90.53%
+commit-author Wang Xingchao <xingchao.wang@linux.intel.com>
+commit 99a2008d0b32d72dfc2a54e7be1eb698dd2e3bd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/99a2008d.failed
+
+For Intel Haswell chip, HDA controller and codec have
+power well dependency from GPU side. This patch added support
+to request/release power well in audio driver. Power save
+feature should be enabled to get runtime power saving.
+
+There's deadlock when request_module(i915) in azx_probe.
+It looks like:
+device_lock(audio pci device) -> azx_probe -> module_request
+(or symbol_request) -> modprobe (userspace) -> i915 init ->
+drm_pci_init -> pci_register_driver -> bus_add_driver -> driver_attach ->
+which in turn tries all locks on pci bus, and when it tries the one on the
+audio device, it will deadlock.
+
+This patch introduce a work to store remaining probe stuff, and let
+request_module run in safe work context.
+
+	Signed-off-by: Wang Xingchao <xingchao.wang@linux.intel.com>
+	Reviewed-by: Takashi Iwai <tiwai@suse.de>
+	Reviewed-by: Liam Girdwood <liam.r.girdwood@intel.com>
+	Reviewed-by: David Henningsson <david.henningsson@canonical.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 99a2008d0b32d72dfc2a54e7be1eb698dd2e3bd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_intel.c
+diff --cc sound/pci/hda/hda_intel.c
+index f39de9055097,35e9f8b010a7..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -2962,8 -2953,9 +2972,10 @@@ static int azx_runtime_suspend(struct d
+  	struct azx *chip = card->private_data;
+  
+  	azx_stop_chip(chip);
+ +	azx_enter_link_reset(chip);
+  	azx_clear_irq_pending(chip);
++ 	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL)
++ 		hda_display_power(false);
+  	return 0;
+  }
+  
+@@@ -3792,6 -3809,21 +3833,23 @@@ static int azx_probe_continue(struct az
+  	int dev = chip->dev_index;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Request power well for Haswell HDA controller and codec */
++ 	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL) {
++ 		err = hda_i915_init();
++ 		if (err < 0) {
++ 			snd_printk(KERN_ERR SFX "Error request power-well from i915\n");
++ 			goto out_free;
++ 		}
++ 		hda_display_power(true);
++ 	}
++ 
++ 	err = azx_first_init(chip);
++ 	if (err < 0)
++ 		goto out_free;
++ 
+++>>>>>>> 99a2008d0b32 (ALSA: hda - Add power-welll support for haswell HDA)
+  #ifdef CONFIG_SND_HDA_INPUT_BEEP
+  	chip->beep_mode = beep_mode[dev];
+  #endif
+diff --git a/sound/pci/hda/Kconfig b/sound/pci/hda/Kconfig
+index 0c5371abecd2..59c5e9c03d53 100644
+--- a/sound/pci/hda/Kconfig
++++ b/sound/pci/hda/Kconfig
+@@ -151,6 +151,16 @@ config SND_HDA_CODEC_HDMI
+ 	  snd-hda-codec-hdmi.
+ 	  This module is automatically loaded at probing.
+ 
++config SND_HDA_I915
++	bool "Build Display HD-audio controller/codec power well support for i915 cards"
++	depends on DRM_I915
++	help
++	  Say Y here to include full HDMI and DisplayPort HD-audio controller/codec
++	  power-well support for Intel Haswell graphics cards based on the i915 driver.
++
++	  Note that this option must be enabled for Intel Haswell C+ stepping machines, otherwise
++	  the GPU audio controller/codecs will not be initialized or damaged when exit from S3 mode.
++
+ config SND_HDA_CODEC_CIRRUS
+ 	bool "Build Cirrus Logic codec support"
+ 	default y
+diff --git a/sound/pci/hda/Makefile b/sound/pci/hda/Makefile
+index 24a251497a1f..c091438286a3 100644
+--- a/sound/pci/hda/Makefile
++++ b/sound/pci/hda/Makefile
+@@ -1,4 +1,6 @@
+ snd-hda-intel-objs := hda_intel.o
++# for haswell power well
++snd-hda-intel-$(CONFIG_SND_HDA_I915) +=	hda_i915.o
+ 
+ snd-hda-codec-y := hda_codec.o hda_jack.o hda_auto_parser.o
+ snd-hda-codec-$(CONFIG_SND_HDA_GENERIC) += hda_generic.o
+diff --git a/sound/pci/hda/hda_i915.c b/sound/pci/hda/hda_i915.c
+new file mode 100644
+index 000000000000..76c13d5b3ca0
+--- /dev/null
++++ b/sound/pci/hda/hda_i915.c
+@@ -0,0 +1,75 @@
++/*
++ *  hda_i915.c - routines for Haswell HDA controller power well support
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the Free
++ *  Software Foundation; either version 2 of the License, or (at your option)
++ *  any later version.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ *  or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ *  for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software Foundation,
++ *  Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <sound/core.h>
++#include <drm/i915_powerwell.h>
++#include "hda_i915.h"
++
++static void (*get_power)(void);
++static void (*put_power)(void);
++
++void hda_display_power(bool enable)
++{
++	if (!get_power || !put_power)
++		return;
++
++	snd_printdd("HDA display power %s \n",
++			enable ? "Enable" : "Disable");
++	if (enable)
++		get_power();
++	else
++		put_power();
++}
++
++int hda_i915_init(void)
++{
++	int err = 0;
++
++	get_power = symbol_request(i915_request_power_well);
++	if (!get_power) {
++		snd_printk(KERN_WARNING "hda-i915: get_power symbol get fail\n");
++		return -ENODEV;
++	}
++
++	put_power = symbol_request(i915_release_power_well);
++	if (!put_power) {
++		symbol_put(i915_request_power_well);
++		get_power = NULL;
++		return -ENODEV;
++	}
++
++	snd_printd("HDA driver get symbol successfully from i915 module\n");
++
++	return err;
++}
++
++int hda_i915_exit(void)
++{
++	if (get_power) {
++		symbol_put(i915_request_power_well);
++		get_power = NULL;
++	}
++	if (put_power) {
++		symbol_put(i915_release_power_well);
++		put_power = NULL;
++	}
++
++	return 0;
++}
+diff --git a/sound/pci/hda/hda_i915.h b/sound/pci/hda/hda_i915.h
+new file mode 100644
+index 000000000000..5a63da2c53e5
+--- /dev/null
++++ b/sound/pci/hda/hda_i915.h
+@@ -0,0 +1,35 @@
++/*
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the Free
++ *  Software Foundation; either version 2 of the License, or (at your option)
++ *  any later version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT
++ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ *  more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program; if not, write to the Free Software Foundation, Inc., 59
++ *  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++ */
++#ifndef __SOUND_HDA_I915_H
++#define __SOUND_HDA_I915_H
++
++#ifdef CONFIG_SND_HDA_I915
++void hda_display_power(bool enable);
++int hda_i915_init(void);
++int hda_i915_exit(void);
++#else
++static inline void hda_display_power(bool enable) {}
++static inline int hda_i915_init(void)
++{
++	return -ENODEV;
++}
++static inline int hda_i915_exit(void)
++{
++	return 0;
++}
++#endif
++
++#endif
+* Unmerged path sound/pci/hda/hda_intel.c
