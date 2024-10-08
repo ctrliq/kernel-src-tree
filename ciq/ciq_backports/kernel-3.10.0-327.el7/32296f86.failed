@@ -1,0 +1,724 @@
+xfs: fix set-but-unused warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 32296f865e8d41ff8c337ce6f0b97eeda08988a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/32296f86.failed
+
+The kernel compile doesn't turn on these checks by default, so it's
+only when I do a kernel-user sync that I find that there are lots of
+compiler warnings waiting to be fixed. Fix up these set-but-unused
+warnings.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 32296f865e8d41ff8c337ce6f0b97eeda08988a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_da_btree.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index b6f15ccf3239,a0a4db80a4a6..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5402,3 -5402,298 +5402,301 @@@ error0
+  	}
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Determine whether an extent shift can be accomplished by a merge with the
++  * extent that precedes the target hole of the shift.
++  */
++ STATIC bool
++ xfs_bmse_can_merge(
++ 	struct xfs_bmbt_irec	*left,	/* preceding extent */
++ 	struct xfs_bmbt_irec	*got,	/* current extent to shift */
++ 	xfs_fileoff_t		shift)	/* shift fsb */
++ {
++ 	xfs_fileoff_t		startoff;
++ 
++ 	startoff = got->br_startoff - shift;
++ 
++ 	/*
++ 	 * The extent, once shifted, must be adjacent in-file and on-disk with
++ 	 * the preceding extent.
++ 	 */
++ 	if ((left->br_startoff + left->br_blockcount != startoff) ||
++ 	    (left->br_startblock + left->br_blockcount != got->br_startblock) ||
++ 	    (left->br_state != got->br_state) ||
++ 	    (left->br_blockcount + got->br_blockcount > MAXEXTLEN))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /*
++  * A bmap extent shift adjusts the file offset of an extent to fill a preceding
++  * hole in the file. If an extent shift would result in the extent being fully
++  * adjacent to the extent that currently precedes the hole, we can merge with
++  * the preceding extent rather than do the shift.
++  *
++  * This function assumes the caller has verified a shift-by-merge is possible
++  * with the provided extents via xfs_bmse_can_merge().
++  */
++ STATIC int
++ xfs_bmse_merge(
++ 	struct xfs_inode		*ip,
++ 	int				whichfork,
++ 	xfs_fileoff_t			shift,		/* shift fsb */
++ 	int				current_ext,	/* idx of gotp */
++ 	struct xfs_bmbt_rec_host	*gotp,		/* extent to shift */
++ 	struct xfs_bmbt_rec_host	*leftp,		/* preceding extent */
++ 	struct xfs_btree_cur		*cur,
++ 	int				*logflags)	/* output */
++ {
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		left;
++ 	xfs_filblks_t			blockcount;
++ 	int				error, i;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 	xfs_bmbt_get_all(leftp, &left);
++ 	blockcount = left.br_blockcount + got.br_blockcount;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
++ 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
++ 	ASSERT(xfs_bmse_can_merge(&left, &got, shift));
++ 
++ 	/*
++ 	 * Merge the in-core extents. Note that the host record pointers and
++ 	 * current_ext index are invalid once the extent has been removed via
++ 	 * xfs_iext_remove().
++ 	 */
++ 	xfs_bmbt_set_blockcount(leftp, blockcount);
++ 	xfs_iext_remove(ip, current_ext, 1, 0);
++ 
++ 	/*
++ 	 * Update the on-disk extent count, the btree if necessary and log the
++ 	 * inode.
++ 	 */
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) - 1);
++ 	*logflags |= XFS_ILOG_CORE;
++ 	if (!cur) {
++ 		*logflags |= XFS_ILOG_DEXT;
++ 		return 0;
++ 	}
++ 
++ 	/* lookup and remove the extent to merge */
++ 	error = xfs_bmbt_lookup_eq(cur, got.br_startoff, got.br_startblock,
++ 				   got.br_blockcount, &i);
++ 	if (error)
++ 		return error;
++ 	XFS_WANT_CORRUPTED_RETURN(i == 1);
++ 
++ 	error = xfs_btree_delete(cur, &i);
++ 	if (error)
++ 		return error;
++ 	XFS_WANT_CORRUPTED_RETURN(i == 1);
++ 
++ 	/* lookup and update size of the previous extent */
++ 	error = xfs_bmbt_lookup_eq(cur, left.br_startoff, left.br_startblock,
++ 				   left.br_blockcount, &i);
++ 	if (error)
++ 		return error;
++ 	XFS_WANT_CORRUPTED_RETURN(i == 1);
++ 
++ 	left.br_blockcount = blockcount;
++ 
++ 	return xfs_bmbt_update(cur, left.br_startoff, left.br_startblock,
++ 			       left.br_blockcount, left.br_state);
++ }
++ 
++ /*
++  * Shift a single extent.
++  */
++ STATIC int
++ xfs_bmse_shift_one(
++ 	struct xfs_inode		*ip,
++ 	int				whichfork,
++ 	xfs_fileoff_t			offset_shift_fsb,
++ 	int				*current_ext,
++ 	struct xfs_bmbt_rec_host	*gotp,
++ 	struct xfs_btree_cur		*cur,
++ 	int				*logflags)
++ {
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fileoff_t			startoff;
++ 	struct xfs_bmbt_rec_host	*leftp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		left;
++ 	int				error;
++ 	int				i;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 	startoff = got.br_startoff - offset_shift_fsb;
++ 
++ 	/* delalloc extents should be prevented by caller */
++ 	XFS_WANT_CORRUPTED_RETURN(!isnullstartblock(got.br_startblock));
++ 
++ 	/*
++ 	 * Check for merge if we've got an extent to the left, otherwise make
++ 	 * sure there's enough room at the start of the file for the shift.
++ 	 */
++ 	if (*current_ext) {
++ 		/* grab the left extent and check for a large enough hole */
++ 		leftp = xfs_iext_get_ext(ifp, *current_ext - 1);
++ 		xfs_bmbt_get_all(leftp, &left);
++ 
++ 		if (startoff < left.br_startoff + left.br_blockcount)
++ 			return -EINVAL;
++ 
++ 		/* check whether to merge the extent or shift it down */
++ 		if (xfs_bmse_can_merge(&left, &got, offset_shift_fsb)) {
++ 			return xfs_bmse_merge(ip, whichfork, offset_shift_fsb,
++ 					      *current_ext, gotp, leftp, cur,
++ 					      logflags);
++ 		}
++ 	} else if (got.br_startoff < offset_shift_fsb)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Increment the extent index for the next iteration, update the start
++ 	 * offset of the in-core extent and update the btree if applicable.
++ 	 */
++ 	(*current_ext)++;
++ 	xfs_bmbt_set_startoff(gotp, startoff);
++ 	*logflags |= XFS_ILOG_CORE;
++ 	if (!cur) {
++ 		*logflags |= XFS_ILOG_DEXT;
++ 		return 0;
++ 	}
++ 
++ 	error = xfs_bmbt_lookup_eq(cur, got.br_startoff, got.br_startblock,
++ 				   got.br_blockcount, &i);
++ 	if (error)
++ 		return error;
++ 	XFS_WANT_CORRUPTED_RETURN(i == 1);
++ 
++ 	got.br_startoff = startoff;
++ 	return xfs_bmbt_update(cur, got.br_startoff, got.br_startblock,
++ 				got.br_blockcount, got.br_state);
++ }
++ 
++ /*
++  * Shift extent records to the left to cover a hole.
++  *
++  * The maximum number of extents to be shifted in a single operation is
++  * @num_exts. @start_fsb specifies the file offset to start the shift and the
++  * file offset where we've left off is returned in @next_fsb. @offset_shift_fsb
++  * is the length by which each extent is shifted. If there is no hole to shift
++  * the extents into, this will be considered invalid operation and we abort
++  * immediately.
++  */
++ int
++ xfs_bmap_shift_extents(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		start_fsb,
++ 	xfs_fileoff_t		offset_shift_fsb,
++ 	int			*done,
++ 	xfs_fileoff_t		*next_fsb,
++ 	xfs_fsblock_t		*firstblock,
++ 	struct xfs_bmap_free	*flist,
++ 	int			num_exts)
++ {
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec            got;
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_extnum_t			nexts = 0;
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				whichfork = XFS_DATA_FORK;
++ 	int				logflags = 0;
++ 	int				total_extents;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT, XFS_RANDOM_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_shift_extents",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
++ 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstblock;
++ 		cur->bc_private.b.flist = flist;
++ 		cur->bc_private.b.flags = 0;
++ 	}
++ 
++ 	/*
++ 	 * Look up the extent index for the fsb where we start shifting. We can
++ 	 * henceforth iterate with current_ext as extent list changes are locked
++ 	 * out via ilock.
++ 	 *
++ 	 * gotp can be null in 2 cases: 1) if there are no extents or 2)
++ 	 * start_fsb lies in a hole beyond which there are no extents. Either
++ 	 * way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, start_fsb, &current_ext);
++ 	if (!gotp) {
++ 		*done = 1;
++ 		goto del_cursor;
++ 	}
++ 
++ 	/*
++ 	 * There may be delalloc extents in the data fork before the range we
++ 	 * are collapsing out, so we cannot use the count of real extents here.
++ 	 * Instead we have to calculate it from the incore fork.
++ 	 */
++ 	total_extents = ifp->if_bytes / sizeof(xfs_bmbt_rec_t);
++ 	while (nexts++ < num_exts && current_ext < total_extents) {
++ 		error = xfs_bmse_shift_one(ip, whichfork, offset_shift_fsb,
++ 					&current_ext, gotp, cur, &logflags);
++ 		if (error)
++ 			goto del_cursor;
++ 
++ 		/* update total extent count and grab the next record */
++ 		total_extents = ifp->if_bytes / sizeof(xfs_bmbt_rec_t);
++ 		if (current_ext >= total_extents)
++ 			break;
++ 		gotp = xfs_iext_get_ext(ifp, current_ext);
++ 	}
++ 
++ 	/* Check if we are done */
++ 	if (current_ext == total_extents) {
++ 		*done = 1;
++ 	} else if (next_fsb) {
++ 		xfs_bmbt_get_all(gotp, &got);
++ 		*next_fsb = got.br_startoff;
++ 	}
++ 
++ del_cursor:
++ 	if (cur)
++ 		xfs_btree_del_cursor(cur,
++ 			error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 
++ 	return error;
++ }
+++>>>>>>> 32296f865e8d (xfs: fix set-but-unused warnings)
+diff --cc fs/xfs/libxfs/xfs_da_btree.c
+index 8b5e6f9cec38,50cdc32aed1b..000000000000
+--- a/fs/xfs/libxfs/xfs_da_btree.c
++++ b/fs/xfs/libxfs/xfs_da_btree.c
+@@@ -2356,11 -2346,7 +2353,15 @@@ xfs_da_shrink_inode
+  	dp = args->dp;
+  	w = args->whichfork;
+  	tp = args->trans;
+++<<<<<<< HEAD
+ +	mp = dp->i_mount;
+ +	if (w == XFS_DATA_FORK)
+ +		count = mp->m_dirblkfsbs;
+ +	else
+ +		count = 1;
+++=======
++ 	count = args->geo->fsbcount;
+++>>>>>>> 32296f865e8d (xfs: fix set-but-unused warnings)
+  	for (;;) {
+  		/*
+  		 * Remove extents.  If we get ENOSPC for a dir we have to move
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_da_btree.c
+diff --git a/fs/xfs/libxfs/xfs_dir2_block.c b/fs/xfs/libxfs/xfs_dir2_block.c
+index 525993902ddb..351c19d14a77 100644
+--- a/fs/xfs/libxfs/xfs_dir2_block.c
++++ b/fs/xfs/libxfs/xfs_dir2_block.c
+@@ -354,7 +354,6 @@ xfs_dir2_block_addname(
+ 	int			low;		/* low index for binary srch */
+ 	int			lowstale;	/* low stale index */
+ 	int			mid=0;		/* midpoint for binary srch */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needlog;	/* need to log header */
+ 	int			needscan;	/* need to rescan freespace */
+ 	__be16			*tagp;		/* pointer to tag value */
+@@ -364,7 +363,6 @@ xfs_dir2_block_addname(
+ 
+ 	dp = args->dp;
+ 	tp = args->trans;
+-	mp = dp->i_mount;
+ 
+ 	/* Read the (one and only) directory block into bp. */
+ 	error = xfs_dir3_block_read(tp, dp, &bp);
+@@ -619,7 +617,6 @@ xfs_dir2_block_lookup(
+ 	xfs_inode_t		*dp;		/* incore inode */
+ 	int			ent;		/* entry index */
+ 	int			error;		/* error return value */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 
+ 	trace_xfs_dir2_block_lookup(args);
+ 
+@@ -630,7 +627,6 @@ xfs_dir2_block_lookup(
+ 	if ((error = xfs_dir2_block_lookup_int(args, &bp, &ent)))
+ 		return error;
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	hdr = bp->b_addr;
+ 	xfs_dir3_data_check(dp, bp);
+ 	btp = xfs_dir2_block_tail_p(mp, hdr);
+@@ -770,7 +766,6 @@ xfs_dir2_block_removename(
+ 	xfs_inode_t		*dp;		/* incore inode */
+ 	int			ent;		/* block leaf entry index */
+ 	int			error;		/* error return value */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needlog;	/* need to log block header */
+ 	int			needscan;	/* need to fixup bestfree */
+ 	xfs_dir2_sf_hdr_t	sfh;		/* shortform header */
+@@ -788,7 +783,6 @@ xfs_dir2_block_removename(
+ 	}
+ 	dp = args->dp;
+ 	tp = args->trans;
+-	mp = dp->i_mount;
+ 	hdr = bp->b_addr;
+ 	btp = xfs_dir2_block_tail_p(mp, hdr);
+ 	blp = xfs_dir2_block_leaf_p(btp);
+@@ -851,7 +845,6 @@ xfs_dir2_block_replace(
+ 	xfs_inode_t		*dp;		/* incore inode */
+ 	int			ent;		/* leaf entry index */
+ 	int			error;		/* error return value */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 
+ 	trace_xfs_dir2_block_replace(args);
+ 
+@@ -863,7 +856,6 @@ xfs_dir2_block_replace(
+ 		return error;
+ 	}
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	hdr = bp->b_addr;
+ 	btp = xfs_dir2_block_tail_p(mp, hdr);
+ 	blp = xfs_dir2_block_leaf_p(btp);
+diff --git a/fs/xfs/libxfs/xfs_dir2_leaf.c b/fs/xfs/libxfs/xfs_dir2_leaf.c
+index 4d5097750d39..386c6ca11cf2 100644
+--- a/fs/xfs/libxfs/xfs_dir2_leaf.c
++++ b/fs/xfs/libxfs/xfs_dir2_leaf.c
+@@ -382,7 +382,6 @@ xfs_dir2_block_to_leaf(
+ 	xfs_dir2_db_t		ldb;		/* leaf block's bno */
+ 	xfs_dir2_leaf_t		*leaf;		/* leaf structure */
+ 	xfs_dir2_leaf_tail_t	*ltp;		/* leaf's tail */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needlog;	/* need to log block header */
+ 	int			needscan;	/* need to rescan bestfree */
+ 	xfs_trans_t		*tp;		/* transaction pointer */
+@@ -393,7 +392,6 @@ xfs_dir2_block_to_leaf(
+ 	trace_xfs_dir2_block_to_leaf(args);
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	tp = args->trans;
+ 	/*
+ 	 * Add the leaf block to the inode.
+@@ -624,7 +622,6 @@ xfs_dir2_leaf_addname(
+ 	int			lfloghigh;	/* high leaf logging index */
+ 	int			lowstale;	/* index of prev stale leaf */
+ 	xfs_dir2_leaf_tail_t	*ltp;		/* leaf tail pointer */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needbytes;	/* leaf block bytes needed */
+ 	int			needlog;	/* need to log data header */
+ 	int			needscan;	/* need to rescan data free */
+@@ -639,7 +636,6 @@ xfs_dir2_leaf_addname(
+ 
+ 	dp = args->dp;
+ 	tp = args->trans;
+-	mp = dp->i_mount;
+ 
+ 	error = xfs_dir3_leaf_read(tp, dp, mp->m_dirleafblk, -1, &lbp);
+ 	if (error)
+@@ -1350,11 +1346,9 @@ xfs_dir2_leaf_removename(
+ 	xfs_dir2_leaf_t		*leaf;		/* leaf structure */
+ 	xfs_dir2_leaf_entry_t	*lep;		/* leaf entry */
+ 	xfs_dir2_leaf_tail_t	*ltp;		/* leaf tail structure */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needlog;	/* need to log data header */
+ 	int			needscan;	/* need to rescan data frees */
+ 	xfs_dir2_data_off_t	oldbest;	/* old value of best free */
+-	xfs_trans_t		*tp;		/* transaction pointer */
+ 	struct xfs_dir2_data_free *bf;		/* bestfree table */
+ 	struct xfs_dir2_leaf_entry *ents;
+ 	struct xfs_dir3_icleaf_hdr leafhdr;
+@@ -1368,8 +1362,6 @@ xfs_dir2_leaf_removename(
+ 		return error;
+ 	}
+ 	dp = args->dp;
+-	tp = args->trans;
+-	mp = dp->i_mount;
+ 	leaf = lbp->b_addr;
+ 	hdr = dbp->b_addr;
+ 	xfs_dir3_data_check(dp, dbp);
+@@ -1600,11 +1592,9 @@ xfs_dir2_leaf_trim_data(
+ 	int			error;		/* error return value */
+ 	xfs_dir2_leaf_t		*leaf;		/* leaf structure */
+ 	xfs_dir2_leaf_tail_t	*ltp;		/* leaf tail structure */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	xfs_trans_t		*tp;		/* transaction pointer */
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	tp = args->trans;
+ 	/*
+ 	 * Read the offending data block.  We need its buffer.
+diff --git a/fs/xfs/libxfs/xfs_dir2_node.c b/fs/xfs/libxfs/xfs_dir2_node.c
+index 697fc13c6486..f902c58b21e9 100644
+--- a/fs/xfs/libxfs/xfs_dir2_node.c
++++ b/fs/xfs/libxfs/xfs_dir2_node.c
+@@ -297,7 +297,6 @@ xfs_dir2_leaf_to_node(
+ 	int			i;		/* leaf freespace index */
+ 	xfs_dir2_leaf_t		*leaf;		/* leaf structure */
+ 	xfs_dir2_leaf_tail_t	*ltp;		/* leaf tail structure */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			n;		/* count of live freespc ents */
+ 	xfs_dir2_data_off_t	off;		/* freespace entry value */
+ 	__be16			*to;		/* pointer to freespace entry */
+@@ -307,7 +306,6 @@ xfs_dir2_leaf_to_node(
+ 	trace_xfs_dir2_leaf_to_node(args);
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	tp = args->trans;
+ 	/*
+ 	 * Add a freespace block to the directory.
+@@ -387,16 +385,12 @@ xfs_dir2_leafn_add(
+ 	int			lfloghigh;	/* high leaf entry logging */
+ 	int			lfloglow;	/* low leaf entry logging */
+ 	int			lowstale;	/* previous stale entry */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+-	xfs_trans_t		*tp;		/* transaction pointer */
+ 	struct xfs_dir3_icleaf_hdr leafhdr;
+ 	struct xfs_dir2_leaf_entry *ents;
+ 
+ 	trace_xfs_dir2_leafn_add(args, index);
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+-	tp = args->trans;
+ 	leaf = bp->b_addr;
+ 	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+ 	ents = dp->d_ops->leaf_ents_p(leaf);
+@@ -1168,7 +1162,6 @@ xfs_dir2_leafn_remove(
+ 	xfs_dir2_leaf_entry_t	*lep;		/* leaf entry */
+ 	int			longest;	/* longest data free entry */
+ 	int			off;		/* data block entry offset */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	int			needlog;	/* need to log data header */
+ 	int			needscan;	/* need to rescan data frees */
+ 	xfs_trans_t		*tp;		/* transaction pointer */
+@@ -1180,7 +1173,6 @@ xfs_dir2_leafn_remove(
+ 
+ 	dp = args->dp;
+ 	tp = args->trans;
+-	mp = dp->i_mount;
+ 	leaf = bp->b_addr;
+ 	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+ 	ents = dp->d_ops->leaf_ents_p(leaf);
+@@ -1319,7 +1311,6 @@ xfs_dir2_leafn_split(
+ 	xfs_da_args_t		*args;		/* operation arguments */
+ 	xfs_dablk_t		blkno;		/* new leaf block number */
+ 	int			error;		/* error return value */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	struct xfs_inode	*dp;
+ 
+ 	/*
+@@ -1327,7 +1318,6 @@ xfs_dir2_leafn_split(
+ 	 */
+ 	args = state->args;
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	ASSERT(oldblk->magic == XFS_DIR2_LEAFN_MAGIC);
+ 	error = xfs_da_grow_inode(args, &blkno);
+ 	if (error) {
+@@ -2232,12 +2222,10 @@ xfs_dir2_node_trim_free(
+ 	xfs_inode_t		*dp;		/* incore directory inode */
+ 	int			error;		/* error return code */
+ 	xfs_dir2_free_t		*free;		/* freespace structure */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	xfs_trans_t		*tp;		/* transaction pointer */
+ 	struct xfs_dir3_icfree_hdr freehdr;
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 	tp = args->trans;
+ 	/*
+ 	 * Read the freespace block.
+diff --git a/fs/xfs/libxfs/xfs_dir2_sf.c b/fs/xfs/libxfs/xfs_dir2_sf.c
+index 7aab8ec117ad..f6b37308819f 100644
+--- a/fs/xfs/libxfs/xfs_dir2_sf.c
++++ b/fs/xfs/libxfs/xfs_dir2_sf.c
+@@ -458,13 +458,11 @@ xfs_dir2_sf_addname_hard(
+ 	xfs_dir2_sf_hdr_t	*oldsfp;	/* original shortform dir */
+ 	xfs_dir2_sf_entry_t	*sfep;		/* entry in new dir */
+ 	xfs_dir2_sf_hdr_t	*sfp;		/* new shortform dir */
+-	struct xfs_mount	*mp;
+ 
+ 	/*
+ 	 * Copy the old directory to the stack buffer.
+ 	 */
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 
+ 	sfp = (xfs_dir2_sf_hdr_t *)dp->i_df.if_u1.if_data;
+ 	old_isize = (int)dp->i_d.di_size;
+@@ -547,7 +545,6 @@ xfs_dir2_sf_addname_pick(
+ 	xfs_inode_t		*dp;		/* incore directory inode */
+ 	int			holefit;	/* found hole it will fit in */
+ 	int			i;		/* entry number */
+-	xfs_mount_t		*mp;		/* filesystem mount point */
+ 	xfs_dir2_data_aoff_t	offset;		/* data block offset */
+ 	xfs_dir2_sf_entry_t	*sfep;		/* shortform entry */
+ 	xfs_dir2_sf_hdr_t	*sfp;		/* shortform structure */
+@@ -555,7 +552,6 @@ xfs_dir2_sf_addname_pick(
+ 	int			used;		/* data bytes used */
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 
+ 	sfp = (xfs_dir2_sf_hdr_t *)dp->i_df.if_u1.if_data;
+ 	size = dp->d_ops->data_entsize(args->namelen);
+@@ -626,10 +622,8 @@ xfs_dir2_sf_check(
+ 	int			offset;		/* data offset */
+ 	xfs_dir2_sf_entry_t	*sfep;		/* shortform dir entry */
+ 	xfs_dir2_sf_hdr_t	*sfp;		/* shortform structure */
+-	struct xfs_mount	*mp;
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 
+ 	sfp = (xfs_dir2_sf_hdr_t *)dp->i_df.if_u1.if_data;
+ 	offset = dp->d_ops->data_first_offset;
+@@ -1042,12 +1036,10 @@ xfs_dir2_sf_toino4(
+ 	int			oldsize;	/* old inode size */
+ 	xfs_dir2_sf_entry_t	*sfep;		/* new sf entry */
+ 	xfs_dir2_sf_hdr_t	*sfp;		/* new sf directory */
+-	struct xfs_mount	*mp;
+ 
+ 	trace_xfs_dir2_sf_toino4(args);
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 
+ 	/*
+ 	 * Copy the old directory to the buffer.
+@@ -1120,12 +1112,10 @@ xfs_dir2_sf_toino8(
+ 	int			oldsize;	/* old inode size */
+ 	xfs_dir2_sf_entry_t	*sfep;		/* new sf entry */
+ 	xfs_dir2_sf_hdr_t	*sfp;		/* new sf directory */
+-	struct xfs_mount	*mp;
+ 
+ 	trace_xfs_dir2_sf_toino8(args);
+ 
+ 	dp = args->dp;
+-	mp = dp->i_mount;
+ 
+ 	/*
+ 	 * Copy the old directory to the buffer.
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index f0c92c3ecc50..4a897627320e 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -2459,9 +2459,7 @@ xfs_remove(
+ 	xfs_fsblock_t           first_block;
+ 	int			cancel_flags;
+ 	int			committed;
+-	int			link_zero;
+ 	uint			resblks;
+-	uint			log_count;
+ 
+ 	trace_xfs_remove(dp, name);
+ 
+@@ -2476,13 +2474,10 @@ xfs_remove(
+ 	if (error)
+ 		goto std_return;
+ 
+-	if (is_dir) {
++	if (is_dir)
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_RMDIR);
+-		log_count = XFS_DEFAULT_LOG_COUNT;
+-	} else {
++	else
+ 		tp = xfs_trans_alloc(mp, XFS_TRANS_REMOVE);
+-		log_count = XFS_REMOVE_LOG_COUNT;
+-	}
+ 	cancel_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 
+ 	/*
+@@ -2550,9 +2545,6 @@ xfs_remove(
+ 	if (error)
+ 		goto out_trans_cancel;
+ 
+-	/* Determine if this is the last link while the inode is locked */
+-	link_zero = (ip->i_d.di_nlink == 0);
+-
+ 	xfs_bmap_init(&free_list, &first_block);
+ 	error = xfs_dir_removename(tp, dp, name, ip->i_ino,
+ 					&first_block, &free_list, resblks);
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 33960a862c89..f2236b45cef9 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -263,7 +263,6 @@ xfs_iomap_eof_want_preallocate(
+ {
+ 	xfs_fileoff_t   start_fsb;
+ 	xfs_filblks_t   count_fsb;
+-	xfs_fsblock_t	firstblock;
+ 	int		n, error, imaps;
+ 	int		found_delalloc = 0;
+ 
+@@ -288,7 +287,6 @@ xfs_iomap_eof_want_preallocate(
+ 	count_fsb = XFS_B_TO_FSB(mp, mp->m_super->s_maxbytes);
+ 	while (count_fsb > 0) {
+ 		imaps = nimaps;
+-		firstblock = NULLFSBLOCK;
+ 		error = xfs_bmapi_read(ip, start_fsb, count_fsb, imap, &imaps,
+ 				       0);
+ 		if (error)
+diff --git a/fs/xfs/xfs_itable.c b/fs/xfs/xfs_itable.c
+index 00889cf40587..0f5b292a961d 100644
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@ -276,7 +276,6 @@ xfs_bulkstat(
+ 	int			*done)	/* 1 if there are more stats to get */
+ {
+ 	xfs_buf_t		*agbp;	/* agi header buffer */
+-	xfs_agi_t		*agi;	/* agi header data */
+ 	xfs_agino_t		agino;	/* inode # in allocation group */
+ 	xfs_agnumber_t		agno;	/* allocation group number */
+ 	int			chunkidx; /* current index into inode chunk */
+@@ -340,7 +339,6 @@ xfs_bulkstat(
+ 		error = xfs_ialloc_read_agi(mp, NULL, agno, &agbp);
+ 		if (error)
+ 			break;
+-		agi = XFS_BUF_TO_AGI(agbp);
+ 		/*
+ 		 * Allocate and initialize a btree cursor for ialloc btree.
+ 		 */
