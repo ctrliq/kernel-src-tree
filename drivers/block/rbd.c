@@ -493,7 +493,6 @@ static int rbd_open(struct block_device *bdev, fmode_t mode)
 		return -ENOENT;
 
 	(void) get_device(&rbd_dev->dev);
-	set_device_ro(bdev, rbd_dev->mapping.read_only);
 
 	return 0;
 }
@@ -5059,6 +5058,7 @@ static int rbd_dev_device_setup(struct rbd_device *rbd_dev)
 	if (ret)
 		goto err_out_disk;
 	set_capacity(rbd_dev->disk, rbd_dev->mapping.size / SECTOR_SIZE);
+	set_disk_ro(rbd_dev->disk, rbd_dev->mapping.read_only);
 
 	ret = rbd_bus_add_dev(rbd_dev);
 	if (ret)
