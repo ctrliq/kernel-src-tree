@@ -749,7 +749,7 @@ again:
 		int slot = path->slots[0] + 1;
 		/* we didn't find a csum item, insert one */
 		nritems = btrfs_header_nritems(path->nodes[0]);
-		if (path->slots[0] >= nritems - 1) {
+		if (!nritems || (path->slots[0] >= nritems - 1)) {
 			ret = btrfs_next_leaf(root, path);
 			if (ret == 1)
 				found_next = 1;
