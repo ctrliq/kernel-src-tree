@@ -1,0 +1,223 @@
+smp: Remove wait argument from __smp_call_function_single()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit fce8ad1568c57e7f334018dec4fa1744c926c135
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/fce8ad15.failed
+
+The main point of calling __smp_call_function_single() is to send
+an IPI in a pure asynchronous way. By embedding a csd in an object,
+a caller can send the IPI without waiting for a previous one to complete
+as is required by smp_call_function_single() for example. As such,
+sending this kind of IPI can be safe even when irqs are disabled.
+
+This flexibility comes at the expense of the caller who then needs to
+synchronize the csd lifecycle by himself and make sure that IPIs on a
+single csd are serialized.
+
+This is how __smp_call_function_single() works when wait = 0 and this
+usecase is relevant.
+
+Now there don't seem to be any usecase with wait = 1 that can't be
+covered by smp_call_function_single() instead, which is safer. Lets look
+at the two possible scenario:
+
+1) The user calls __smp_call_function_single(wait = 1) on a csd embedded
+   in an object. It looks like a nice and convenient pattern at the first
+   sight because we can then retrieve the object from the IPI handler easily.
+
+   But actually it is a waste of memory space in the object since the csd
+   can be allocated from the stack by smp_call_function_single(wait = 1)
+   and the object can be passed an the IPI argument.
+
+   Besides that, embedding the csd in an object is more error prone
+   because the caller must take care of the serialization of the IPIs
+   for this csd.
+
+2) The user calls __smp_call_function_single(wait = 1) on a csd that
+   is allocated on the stack. It's ok but smp_call_function_single()
+   can do it as well and it already takes care of the allocation on the
+   stack. Again it's more simple and less error prone.
+
+Therefore, using the underscore prepend API version with wait = 1
+is a bad pattern and a sign that the caller can do safer and more
+simple.
+
+There was a single user of that which has just been converted.
+So lets remove this option to discourage further users.
+
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jens Axboe <axboe@fb.com>
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit fce8ad1568c57e7f334018dec4fa1744c926c135)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/smp.h
+#	kernel/smp.c
+#	kernel/up.c
+diff --cc include/linux/smp.h
+index 2bbbb7e1e96a,b410a1f23281..000000000000
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@@ -29,8 -29,28 +29,33 @@@ extern unsigned int total_cpus
+  int smp_call_function_single(int cpuid, smp_call_func_t func, void *info,
+  			     int wait);
+  
+++<<<<<<< HEAD
+ +void __smp_call_function_single(int cpuid, struct call_single_data *data,
+ +				int wait);
+++=======
++ /*
++  * Call a function on all processors
++  */
++ int on_each_cpu(smp_call_func_t func, void *info, int wait);
++ 
++ /*
++  * Call a function on processors specified by mask, which might include
++  * the local one.
++  */
++ void on_each_cpu_mask(const struct cpumask *mask, smp_call_func_t func,
++ 		void *info, bool wait);
++ 
++ /*
++  * Call a function on each processor for which the supplied function
++  * cond_func returns a positive value. This may include the local
++  * processor.
++  */
++ void on_each_cpu_cond(bool (*cond_func)(int cpu, void *info),
++ 		smp_call_func_t func, void *info, bool wait,
++ 		gfp_t gfp_flags);
++ 
++ int __smp_call_function_single(int cpu, struct call_single_data *csd);
+++>>>>>>> fce8ad1568c5 (smp: Remove wait argument from __smp_call_function_single())
+  
+  #ifdef CONFIG_SMP
+  
+diff --cc kernel/smp.c
+index 74100ac030d3,b76763189752..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -264,6 -237,27 +264,30 @@@ int smp_call_function_single(int cpu, s
+  }
+  EXPORT_SYMBOL(smp_call_function_single);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * __smp_call_function_single(): Run a function on a specific CPU
++  * @cpu: The CPU to run on.
++  * @csd: Pre-allocated and setup data structure
++  *
++  * Like smp_call_function_single(), but allow caller to pass in a
++  * pre-allocated data structure. Useful for embedding @data inside
++  * other structures, for instance.
++  */
++ int __smp_call_function_single(int cpu, struct call_single_data *csd)
++ {
++ 	int err = 0;
++ 
++ 	preempt_disable();
++ 	err = generic_exec_single(cpu, csd, csd->func, csd->info, 0);
++ 	preempt_enable();
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__smp_call_function_single);
++ 
+++>>>>>>> fce8ad1568c5 (smp: Remove wait argument from __smp_call_function_single())
+  /*
+   * smp_call_function_any - Run a function on any of the given cpus
+   * @mask: The mask of cpus it can run on.
+diff --cc kernel/up.c
+index 7841a634056c,4e199d4cef8e..000000000000
+--- a/kernel/up.c
++++ b/kernel/up.c
+@@@ -20,8 -22,7 +20,12 @@@ int smp_call_function_single(int cpu, v
+  }
+  EXPORT_SYMBOL(smp_call_function_single);
+  
+++<<<<<<< HEAD
+ +void __smp_call_function_single(int cpu, struct call_single_data *csd,
+ +				int wait)
+++=======
++ int __smp_call_function_single(int cpu, struct call_single_data *csd)
+++>>>>>>> fce8ad1568c5 (smp: Remove wait argument from __smp_call_function_single())
+  {
+  	unsigned long flags;
+  
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 32c41cfd8e8a..2b21dfe01702 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -320,7 +320,7 @@ void __blk_mq_complete_request(struct request *rq)
+ 		rq->csd.func = __blk_mq_complete_request_remote;
+ 		rq->csd.info = rq;
+ 		rq->csd.flags = 0;
+-		__smp_call_function_single(ctx->cpu, &rq->csd, 0);
++		__smp_call_function_single(ctx->cpu, &rq->csd);
+ 	} else {
+ 		rq->q->softirq_done_fn(rq);
+ 	}
+diff --git a/block/blk-softirq.c b/block/blk-softirq.c
+index ec9e60636f43..dfe0545fdb50 100644
+--- a/block/blk-softirq.c
++++ b/block/blk-softirq.c
+@@ -65,7 +65,7 @@ static int raise_blk_irq(int cpu, struct request *rq)
+ 		data->info = rq;
+ 		data->flags = 0;
+ 
+-		__smp_call_function_single(cpu, data, 0);
++		__smp_call_function_single(cpu, data);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/cpuidle/coupled.c b/drivers/cpuidle/coupled.c
+index fe853903fe10..1523e577148f 100644
+--- a/drivers/cpuidle/coupled.c
++++ b/drivers/cpuidle/coupled.c
+@@ -323,7 +323,7 @@ static void cpuidle_coupled_poke(int cpu)
+ 	struct call_single_data *csd = &per_cpu(cpuidle_coupled_poke_cb, cpu);
+ 
+ 	if (!cpumask_test_and_set_cpu(cpu, &cpuidle_coupled_poke_pending))
+-		__smp_call_function_single(cpu, csd, 0);
++		__smp_call_function_single(cpu, csd);
+ }
+ 
+ /**
+* Unmerged path include/linux/smp.h
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d145b810c4ff..baa10331fa12 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -432,7 +432,7 @@ void hrtick_start(struct rq *rq, u64 delay)
+ 	if (rq == this_rq()) {
+ 		hrtimer_restart(timer);
+ 	} else if (!rq->hrtick_csd_pending) {
+-		__smp_call_function_single(cpu_of(rq), &rq->hrtick_csd, 0);
++		__smp_call_function_single(cpu_of(rq), &rq->hrtick_csd);
+ 		rq->hrtick_csd_pending = 1;
+ 	}
+ }
+* Unmerged path kernel/smp.c
+* Unmerged path kernel/up.c
+diff --git a/net/core/dev.c b/net/core/dev.c
+index d06cd723bba7..7588eafb13a3 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4012,7 +4012,7 @@ static void net_rps_action_and_irq_enable(struct softnet_data *sd)
+ 
+ 			if (cpu_online(remsd->cpu))
+ 				__smp_call_function_single(remsd->cpu,
+-							   &remsd->csd, 0);
++							   &remsd->csd);
+ 			remsd = next;
+ 		}
+ 	} else
