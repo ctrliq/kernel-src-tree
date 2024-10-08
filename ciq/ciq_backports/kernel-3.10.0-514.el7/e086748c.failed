@@ -1,0 +1,156 @@
+Drivers: hv: vmbus: Teardown clockevent devices on module unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] vmbus: Teardown clockevent devices on module unload (Vitaly Kuznetsov) [1202375]
+Rebuild_FUZZ: 88.70%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit e086748c655ab99bac91b87d1bb59d9cc45867b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e086748c.failed
+
+Newly introduced clockevent devices made it impossible to unload hv_vmbus
+module as clockevents_config_and_register() takes additional reverence to
+the module. To make it possible again we do the following:
+- avoid setting dev->owner for clockevent devices;
+- implement hv_synic_clockevents_cleanup() doing clockevents_unbind_device();
+- call it from vmbus_exit().
+
+In theory hv_synic_clockevents_cleanup() can be merged with hv_synic_cleanup(),
+however, we call hv_synic_cleanup() from smp_call_function_single() and this
+doesn't work for clockevents_unbind_device() as it does such call on its own. I
+opted for a separate function.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit e086748c655ab99bac91b87d1bb59d9cc45867b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv.c
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/hv.c
+index fde1fba7aa3a,d3943bceecc3..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -261,6 -266,62 +261,65 @@@ u16 hv_signal_event(void *con_id
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int hv_ce_set_next_event(unsigned long delta,
++ 				struct clock_event_device *evt)
++ {
++ 	cycle_t current_tick;
++ 
++ 	WARN_ON(evt->mode != CLOCK_EVT_MODE_ONESHOT);
++ 
++ 	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
++ 	current_tick += delta;
++ 	wrmsrl(HV_X64_MSR_STIMER0_COUNT, current_tick);
++ 	return 0;
++ }
++ 
++ static void hv_ce_setmode(enum clock_event_mode mode,
++ 			  struct clock_event_device *evt)
++ {
++ 	union hv_timer_config timer_cfg;
++ 
++ 	switch (mode) {
++ 	case CLOCK_EVT_MODE_PERIODIC:
++ 		/* unsupported */
++ 		break;
++ 
++ 	case CLOCK_EVT_MODE_ONESHOT:
++ 		timer_cfg.enable = 1;
++ 		timer_cfg.auto_enable = 1;
++ 		timer_cfg.sintx = VMBUS_MESSAGE_SINT;
++ 		wrmsrl(HV_X64_MSR_STIMER0_CONFIG, timer_cfg.as_uint64);
++ 		break;
++ 
++ 	case CLOCK_EVT_MODE_UNUSED:
++ 	case CLOCK_EVT_MODE_SHUTDOWN:
++ 		wrmsrl(HV_X64_MSR_STIMER0_COUNT, 0);
++ 		wrmsrl(HV_X64_MSR_STIMER0_CONFIG, 0);
++ 		break;
++ 	case CLOCK_EVT_MODE_RESUME:
++ 		break;
++ 	}
++ }
++ 
++ static void hv_init_clockevent_device(struct clock_event_device *dev, int cpu)
++ {
++ 	dev->name = "Hyper-V clockevent";
++ 	dev->features = CLOCK_EVT_FEAT_ONESHOT;
++ 	dev->cpumask = cpumask_of(cpu);
++ 	dev->rating = 1000;
++ 	/*
++ 	 * Avoid settint dev->owner = THIS_MODULE deliberately as doing so will
++ 	 * result in clockevents_config_and_register() taking additional
++ 	 * references to the hv_vmbus module making it impossible to unload.
++ 	 */
++ 
++ 	dev->set_mode = hv_ce_setmode;
++ 	dev->set_next_event = hv_ce_set_next_event;
++ }
++ 
+++>>>>>>> e086748c655a (Drivers: hv: vmbus: Teardown clockevent devices on module unload)
+  
+  int hv_synic_alloc(void)
+  {
+diff --cc drivers/hv/vmbus_drv.c
+index 42f61fe233fb,6d99aa5c49d6..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -1134,27 -1031,17 +1134,31 @@@ static void __exit vmbus_exit(void
+  {
+  	int cpu;
+  
+ +	hv_remove_kexec_handler();
+ +	hv_remove_crash_handler();
+  	vmbus_connection.conn_state = DISCONNECTED;
+++<<<<<<< HEAD
+ +	vmbus_disconnect();
+++=======
++ 	hv_synic_clockevents_cleanup();
+++>>>>>>> e086748c655a (Drivers: hv: vmbus: Teardown clockevent devices on module unload)
+  	hv_remove_vmbus_irq();
+ +	tasklet_kill(&msg_dpc);
+  	vmbus_free_channels();
+ +	if (ms_hyperv.misc_features & HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE) {
+ +		unregister_die_notifier(&hyperv_die_block);
+ +		atomic_notifier_chain_unregister(&panic_notifier_list,
+ +						 &hyperv_panic_block);
+ +	}
+  	bus_unregister(&hv_bus);
+  	hv_cleanup();
+ -	for_each_online_cpu(cpu)
+ +	for_each_online_cpu(cpu) {
+ +		tasklet_kill(hv_context.event_dpc[cpu]);
+  		smp_call_function_single(cpu, hv_synic_cleanup, NULL, 1);
+ +	}
+ +	hv_synic_free();
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+  	hv_cpu_hotplug_quirk(false);
+ -	vmbus_disconnect();
+  }
+  
+  
+* Unmerged path drivers/hv/hv.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 7a18d55dbb4a..c98369528a21 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -562,6 +562,8 @@ extern void hv_synic_init(void *irqarg);
+ 
+ extern void hv_synic_cleanup(void *arg);
+ 
++extern void hv_synic_clockevents_cleanup(void);
++
+ /*
+  * Host version information.
+  */
+* Unmerged path drivers/hv/vmbus_drv.c
