@@ -1,0 +1,216 @@
+net/mlx5e: Use function pointers for RX data path handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Use function pointers for RX data path handling (kamal heib) [1275159 1296272 1296405 1298421 1298422 1298423 1298424 1298425]
+Rebuild_FUZZ: 96.43%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 2f48af128d9aa64dd4e8c6fe97491b0bde3681b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2f48af12.failed
+
+In preparation for Striding RQ feature, which will need its own
+RX handlers.
+This patch does not change any functionality.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Achiad Shochat <achiad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f48af128d9aa64dd4e8c6fe97491b0bde3681b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 2dc1f9b26b65,d7cccedddf34..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -36,9 -35,14 +36,8 @@@
+  #include <linux/tcp.h>
+  #include <net/busy_poll.h>
+  #include "en.h"
+ -#include "en_tc.h"
+ -
+ -static inline bool mlx5e_rx_hw_stamp(struct mlx5e_tstamp *tstamp)
+ -{
+ -	return tstamp->hwtstamp_config.rx_filter == HWTSTAMP_FILTER_ALL;
+ -}
+  
+- static inline int mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
+- 				     struct mlx5e_rx_wqe *wqe, u16 ix)
++ int mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe, u16 ix)
+  {
+  	struct sk_buff *skb;
+  	dma_addr_t dma_addr;
+@@@ -215,8 -224,45 +214,43 @@@ static inline void mlx5e_build_rx_skb(s
+  	if (cqe_has_vlan(cqe))
+  		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+  				       be16_to_cpu(cqe->vlan_info));
+ -
+ -	skb->mark = be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK;
+  }
+  
++ void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_rx_wqe *wqe;
++ 	struct sk_buff *skb;
++ 	__be16 wqe_counter_be;
++ 	u16 wqe_counter;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	skb            = rq->skb[wqe_counter];
++ 	prefetch(skb->data);
++ 	rq->skb[wqe_counter] = NULL;
++ 
++ 	dma_unmap_single(rq->pdev,
++ 			 *((dma_addr_t *)skb->cb),
++ 			 rq->wqe_sz,
++ 			 DMA_FROM_DEVICE);
++ 
++ 	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
++ 		rq->stats.wqe_err++;
++ 		dev_kfree_skb(skb);
++ 		goto wq_ll_pop;
++ 	}
++ 
++ 	mlx5e_build_rx_skb(cqe, rq, skb);
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += be32_to_cpu(cqe->byte_cnt);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ wq_ll_pop:
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+  {
+  	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
+@@@ -235,32 -276,7 +264,36 @@@
+  
+  		mlx5_cqwq_pop(&cq->wq);
+  
+++<<<<<<< HEAD
+ +		wqe_counter_be = cqe->wqe_counter;
+ +		wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +		wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +		skb            = rq->skb[wqe_counter];
+ +		prefetch(skb->data);
+ +		skb_mark_napi_id(skb, cq->napi);
+ +		rq->skb[wqe_counter] = NULL;
+ +
+ +		dma_unmap_single(rq->pdev,
+ +				 *((dma_addr_t *)skb->cb),
+ +				 rq->wqe_sz,
+ +				 DMA_FROM_DEVICE);
+ +
+ +		if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
+ +			rq->stats.wqe_err++;
+ +			dev_kfree_skb(skb);
+ +			goto wq_ll_pop;
+ +		}
+ +
+ +		mlx5e_build_rx_skb(cqe, rq, skb);
+ +		rq->stats.packets++;
+ +		napi_gro_receive(cq->napi, skb);
+ +
+ +wq_ll_pop:
+ +		mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +			       &wqe->next.next_wqe_index);
+++=======
++ 		rq->handle_rx_cqe(rq, cqe);
+++>>>>>>> 2f48af128d9a (net/mlx5e: Use function pointers for RX data path handling)
+  	}
+  
+  	mlx5_cqwq_update_db_record(&cq->wq);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index b2b207af1d60..2acce28e8f29 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -68,6 +68,17 @@
+ #define MLX5E_SQ_BF_BUDGET             16
+ 
+ #define MLX5E_NUM_MAIN_GROUPS 9
++#define MLX5E_NET_IP_ALIGN 2
++
++struct mlx5e_tx_wqe {
++	struct mlx5_wqe_ctrl_seg ctrl;
++	struct mlx5_wqe_eth_seg  eth;
++};
++
++struct mlx5e_rx_wqe {
++	struct mlx5_wqe_srq_next_seg  next;
++	struct mlx5_wqe_data_seg      data;
++};
+ 
+ static const char vport_strings[][ETH_GSTRING_LEN] = {
+ 	/* vport statistics */
+@@ -305,6 +316,12 @@ struct mlx5e_cq {
+ 	struct mlx5_wq_ctrl        wq_ctrl;
+ } ____cacheline_aligned_in_smp;
+ 
++struct mlx5e_rq;
++typedef void (*mlx5e_fp_handle_rx_cqe)(struct mlx5e_rq *rq,
++				       struct mlx5_cqe64 *cqe);
++typedef int (*mlx5e_fp_alloc_wqe)(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe,
++				  u16 ix);
++
+ struct mlx5e_rq {
+ 	/* data path */
+ 	struct mlx5_wq_ll      wq;
+@@ -315,6 +332,8 @@ struct mlx5e_rq {
+ 	struct net_device     *netdev;
+ 	struct mlx5e_rq_stats  stats;
+ 	struct mlx5e_cq        cq;
++	mlx5e_fp_handle_rx_cqe handle_rx_cqe;
++	mlx5e_fp_alloc_wqe     alloc_wqe;
+ 
+ 	unsigned long          state;
+ 	int                    ix;
+@@ -513,18 +532,6 @@ struct mlx5e_priv {
+ 	struct mlx5e_stats         stats;
+ };
+ 
+-#define MLX5E_NET_IP_ALIGN 2
+-
+-struct mlx5e_tx_wqe {
+-	struct mlx5_wqe_ctrl_seg ctrl;
+-	struct mlx5_wqe_eth_seg  eth;
+-};
+-
+-struct mlx5e_rx_wqe {
+-	struct mlx5_wqe_srq_next_seg  next;
+-	struct mlx5_wqe_data_seg      data;
+-};
+-
+ enum mlx5e_link_mode {
+ 	MLX5E_1000BASE_CX_SGMII	 = 0,
+ 	MLX5E_1000BASE_KX	 = 1,
+@@ -566,7 +573,9 @@ void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event);
+ int mlx5e_napi_poll(struct napi_struct *napi, int budget);
+ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq);
+ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
++void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+ bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq);
++int mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe, u16 ix);
+ struct mlx5_cqe64 *mlx5e_get_cqe(struct mlx5e_cq *cq);
+ 
+ void mlx5e_update_stats(struct mlx5e_priv *priv);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 23ff9e4eac90..9cfa86787146 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -340,6 +340,8 @@ static int mlx5e_create_rq(struct mlx5e_channel *c,
+ 			cpu_to_be32(byte_count | MLX5_HW_START_PADDING);
+ 	}
+ 
++	rq->handle_rx_cqe = mlx5e_handle_rx_cqe;
++	rq->alloc_wqe = mlx5e_alloc_rx_wqe;
+ 	rq->pdev    = c->pdev;
+ 	rq->netdev  = c->netdev;
+ 	rq->channel = c;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
