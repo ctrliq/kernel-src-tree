@@ -1,0 +1,114 @@
+fs: Call security_ops->inode_killpriv on truncate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] Call security_ops->inode_killpriv on truncate (Eric Sandeen) [1197686]
+Rebuild_FUZZ: 95.74%
+commit-author Jan Kara <jack@suse.cz>
+commit 45f147a1bc97c743c6101a8d2741c69a51f583e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/45f147a1.failed
+
+Comment in include/linux/security.h says that ->inode_killpriv() should
+be called when setuid bit is being removed and that similar security
+labels (in fact this applies only to file capabilities) should be
+removed at this time as well. However we don't call ->inode_killpriv()
+when we remove suid bit on truncate.
+
+We fix the problem by calling ->inode_need_killpriv() and subsequently
+->inode_killpriv() on truncate the same way as we do it on file write.
+
+After this patch there's only one user of should_remove_suid() - ocfs2 -
+and indeed it's buggy because it doesn't call ->inode_killpriv() on
+write. However fixing it is difficult because of special locking
+constraints.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 45f147a1bc97c743c6101a8d2741c69a51f583e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+#	include/linux/fs.h
+diff --cc fs/inode.c
+index 237190a851c4,0401d2c6d087..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -1646,7 -1673,31 +1646,35 @@@ int should_remove_suid(struct dentry *d
+  }
+  EXPORT_SYMBOL(should_remove_suid);
+  
+++<<<<<<< HEAD
+ +static int __remove_suid(struct dentry *dentry, int kill)
+++=======
++ /*
++  * Return mask of changes for notify_change() that need to be done as a
++  * response to write or truncate. Return 0 if nothing has to be changed.
++  * Negative value on error (change should be denied).
++  */
++ int dentry_needs_remove_privs(struct dentry *dentry)
++ {
++ 	struct inode *inode = d_inode(dentry);
++ 	int mask = 0;
++ 	int ret;
++ 
++ 	if (IS_NOSEC(inode))
++ 		return 0;
++ 
++ 	mask = should_remove_suid(dentry);
++ 	ret = security_inode_need_killpriv(dentry);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (ret)
++ 		mask |= ATTR_KILL_PRIV;
++ 	return mask;
++ }
++ EXPORT_SYMBOL(dentry_needs_remove_privs);
++ 
++ static int __remove_privs(struct dentry *dentry, int kill)
+++>>>>>>> 45f147a1bc97 (fs: Call security_ops->inode_killpriv on truncate)
+  {
+  	struct iattr newattrs;
+  
+diff --cc include/linux/fs.h
+index 37d4ac39152e,1e658b11c265..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2627,7 -2553,12 +2627,16 @@@ extern struct inode *new_inode_pseudo(s
+  extern struct inode *new_inode(struct super_block *sb);
+  extern void free_inode_nonrcu(struct inode *inode);
+  extern int should_remove_suid(struct dentry *);
+++<<<<<<< HEAD
+ +extern int file_remove_suid(struct file *);
+++=======
++ extern int file_remove_privs(struct file *);
++ extern int dentry_needs_remove_privs(struct dentry *dentry);
++ static inline int file_needs_remove_privs(struct file *file)
++ {
++ 	return dentry_needs_remove_privs(file->f_path.dentry);
++ }
+++>>>>>>> 45f147a1bc97 (fs: Call security_ops->inode_killpriv on truncate)
+  
+  extern void __insert_inode_hash(struct inode *, unsigned long hashval);
+  static inline void insert_inode_hash(struct inode *inode)
+* Unmerged path fs/inode.c
+diff --git a/fs/open.c b/fs/open.c
+index eeadbd924dc1..a255bd0153a1 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -51,8 +51,10 @@ int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
+ 		newattrs.ia_valid |= ATTR_FILE;
+ 	}
+ 
+-	/* Remove suid/sgid on truncate too */
+-	ret = should_remove_suid(dentry);
++	/* Remove suid, sgid, and file capabilities on truncate too */
++	ret = dentry_needs_remove_privs(dentry);
++	if (ret < 0)
++		return ret;
+ 	if (ret)
+ 		newattrs.ia_valid |= ret | ATTR_FORCE;
+ 
+* Unmerged path include/linux/fs.h
