@@ -1,0 +1,139 @@
+powerpc/powernv: Change NPU PE# assignment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Change NPU PE# assignment (Gustavo Duarte) [1275657]
+Rebuild_FUZZ: 89.47%
+commit-author Alistair Popple <alistair@popple.id.au>
+commit b521549a09ddfac3bed38e261168cda92d04ce81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b521549a.failed
+
+The P8+ hardware supports four partitionable endpoints (PEs) however
+the hardware reports all errors as occurring on PE#0. This means we
+need to reserve this PE for error handling (EEH) and not assign it to
+a NPU device, implying that some devices will need to share PEs.
+
+This patch changes the PE assignment for NPU devices such that NPU
+devices which connect to the same GPU are assigned to the same
+PE#.
+
+	Signed-off-by: Alistair Popple <alistair@popple.id.au>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit b521549a09ddfac3bed38e261168cda92d04ce81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index fe5c4ee44e89,0b625272f3ca..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -1092,6 -1074,77 +1092,80 @@@ static void pnv_ioda_setup_bus_PE(struc
+  	pnv_ioda_link_pe_by_weight(phb, pe);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct pnv_ioda_pe *pnv_ioda_setup_npu_PE(struct pci_dev *npu_pdev)
++ {
++ 	int pe_num, found_pe = false, rc;
++ 	long rid;
++ 	struct pnv_ioda_pe *pe;
++ 	struct pci_dev *gpu_pdev;
++ 	struct pci_dn *npu_pdn;
++ 	struct pci_controller *hose = pci_bus_to_host(npu_pdev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 
++ 	/*
++ 	 * Due to a hardware errata PE#0 on the NPU is reserved for
++ 	 * error handling. This means we only have three PEs remaining
++ 	 * which need to be assigned to four links, implying some
++ 	 * links must share PEs.
++ 	 *
++ 	 * To achieve this we assign PEs such that NPUs linking the
++ 	 * same GPU get assigned the same PE.
++ 	 */
++ 	gpu_pdev = pnv_pci_get_gpu_dev(npu_pdev);
++ 	for (pe_num = 0; pe_num < phb->ioda.total_pe; pe_num++) {
++ 		pe = &phb->ioda.pe_array[pe_num];
++ 		if (!pe->pdev)
++ 			continue;
++ 
++ 		if (pnv_pci_get_gpu_dev(pe->pdev) == gpu_pdev) {
++ 			/*
++ 			 * This device has the same peer GPU so should
++ 			 * be assigned the same PE as the existing
++ 			 * peer NPU.
++ 			 */
++ 			dev_info(&npu_pdev->dev,
++ 				"Associating to existing PE %d\n", pe_num);
++ 			pci_dev_get(npu_pdev);
++ 			npu_pdn = pci_get_pdn(npu_pdev);
++ 			rid = npu_pdev->bus->number << 8 | npu_pdn->devfn;
++ 			npu_pdn->pcidev = npu_pdev;
++ 			npu_pdn->pe_number = pe_num;
++ 			pe->dma_weight += pnv_ioda_dma_weight(npu_pdev);
++ 			phb->ioda.pe_rmap[rid] = pe->pe_number;
++ 
++ 			/* Map the PE to this link */
++ 			rc = opal_pci_set_pe(phb->opal_id, pe_num, rid,
++ 					OpalPciBusAll,
++ 					OPAL_COMPARE_RID_DEVICE_NUMBER,
++ 					OPAL_COMPARE_RID_FUNCTION_NUMBER,
++ 					OPAL_MAP_PE);
++ 			WARN_ON(rc != OPAL_SUCCESS);
++ 			found_pe = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!found_pe)
++ 		/*
++ 		 * Could not find an existing PE so allocate a new
++ 		 * one.
++ 		 */
++ 		return pnv_ioda_setup_dev_PE(npu_pdev);
++ 	else
++ 		return pe;
++ }
++ 
++ static void pnv_ioda_setup_npu_PEs(struct pci_bus *bus)
++ {
++ 	struct pci_dev *pdev;
++ 
++ 	list_for_each_entry(pdev, &bus->devices, bus_list)
++ 		pnv_ioda_setup_npu_PE(pdev);
++ }
++ 
+++>>>>>>> b521549a09dd (powerpc/powernv: Change NPU PE# assignment)
+  static void pnv_ioda_setup_PEs(struct pci_bus *bus)
+  {
+  	struct pci_dev *dev;
+@@@ -1125,10 -1178,18 +1199,22 @@@ static void pnv_pci_ioda_setup_PEs(void
+  		phb = hose->private_data;
+  
+  		/* M64 layout might affect PE allocation */
+ -		if (phb->reserve_m64_pe)
+ -			phb->reserve_m64_pe(hose->bus, NULL, true);
+ +		if (phb->alloc_m64_pe)
+ +			phb->alloc_m64_pe(phb);
+  
+++<<<<<<< HEAD
+ +		pnv_ioda_setup_PEs(hose->bus);
+++=======
++ 		/*
++ 		 * On NPU PHB, we expect separate PEs for individual PCI
++ 		 * functions. PCI bus dependent PEs are required for the
++ 		 * remaining types of PHBs.
++ 		 */
++ 		if (phb->type == PNV_PHB_NPU)
++ 			pnv_ioda_setup_npu_PEs(hose->bus);
++ 		else
++ 			pnv_ioda_setup_PEs(hose->bus);
+++>>>>>>> b521549a09dd (powerpc/powernv: Change NPU PE# assignment)
+  	}
+  }
+  
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
