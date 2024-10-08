@@ -1,0 +1,578 @@
+usb: introduce port status lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [usb] introduce port status lock (Don Zickus) [1110939]
+Rebuild_FUZZ: 91.23%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 5c79a1e303363d46082408fd306cdea6d33013fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5c79a1e3.failed
+
+In general we do not want khubd to act on port status changes that are
+the result of in progress resets or USB runtime PM operations.
+Specifically port power control testing has been able to trigger an
+unintended disconnect in hub_port_connect_change(), paraphrasing:
+
+	if ((portstatus & USB_PORT_STAT_CONNECTION) && udev &&
+	    udev->state != USB_STATE_NOTATTACHED) {
+		if (portstatus & USB_PORT_STAT_ENABLE) {
+			/* Nothing to do */
+		} else if (udev->state == USB_STATE_SUSPENDED &&
+				udev->persist_enabled) {
+			...
+		} else {
+			/* Don't resuscitate */;
+		}
+	}
+
+...by falling to the "Don't resuscitate" path or missing
+USB_PORT_STAT_CONNECTION because usb_port_resume() was in the middle of
+modifying the port status.
+
+So, we want a new lock to hold off khubd for a given port while the
+child device is being suspended, resumed, or reset.  The lock ordering
+rules are now usb_lock_device() => usb_lock_port().  This is mandated by
+the device core which may hold the device_lock on the usb_device before
+invoking usb_port_{suspend|resume} which in turn take the status_lock on
+the usb_port.  We attempt to hold the status_lock for the duration of a
+port_event() run, and drop/re-acquire it when needing to take the
+device_lock.  The lock is also dropped/re-acquired during
+hub_port_reconnect().
+
+This patch also deletes hub->busy_bits as all use cases are now covered
+by port PM runtime synchronization or the port->status_lock and it
+pushes down usb_device_lock() into usb_remote_wakeup().
+
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5c79a1e303363d46082408fd306cdea6d33013fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/hub.c
+#	drivers/usb/core/hub.h
+#	drivers/usb/core/port.c
+diff --cc drivers/usb/core/hub.c
+index 2f5db8b4a93a,d43054e8e257..000000000000
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@@ -3258,10 -3269,6 +3278,13 @@@ int usb_port_resume(struct usb_device *
+  	if (status == 0 && !port_is_suspended(hub, portstatus))
+  		goto SuspendCleared;
+  
+++<<<<<<< HEAD
+ +	// dev_dbg(hub->intfdev, "resume port %d\n", port1);
+ +
+ +	set_bit(port1, hub->busy_bits);
+ +
+++=======
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+  	/* see 7.1.7.7; affects power usage, but not budgeting */
+  	if (hub_is_superspeed(hub->hdev))
+  		status = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_U0);
+@@@ -4669,12 -4633,76 +4696,78 @@@ done
+  	hub_port_disable(hub, port1, 1);
+  	if (hcd->driver->relinquish_port && !hub->hdev->parent)
+  		hcd->driver->relinquish_port(hcd, port1);
+++<<<<<<< HEAD
+++=======
++ 
++ }
++ 
++ /* Handle physical or logical connection change events.
++  * This routine is called when:
++  *	a port connection-change occurs;
++  *	a port enable-change occurs (often caused by EMI);
++  *	usb_reset_and_verify_device() encounters changed descriptors (as from
++  *		a firmware download)
++  * caller already locked the hub
++  */
++ static void hub_port_connect_change(struct usb_hub *hub, int port1,
++ 					u16 portstatus, u16 portchange)
++ 		__must_hold(&port_dev->status_lock)
++ {
++ 	struct usb_port *port_dev = hub->ports[port1 - 1];
++ 	struct usb_device *udev = port_dev->child;
++ 	int status = -ENODEV;
++ 
++ 	dev_dbg(&port_dev->dev, "status %04x, change %04x, %s\n", portstatus,
++ 			portchange, portspeed(hub, portstatus));
++ 
++ 	if (hub->has_indicators) {
++ 		set_port_led(hub, port1, HUB_LED_AUTO);
++ 		hub->indicator[port1-1] = INDICATOR_AUTO;
++ 	}
++ 
++ #ifdef	CONFIG_USB_OTG
++ 	/* during HNP, don't repeat the debounce */
++ 	if (hub->hdev->bus->is_b_host)
++ 		portchange &= ~(USB_PORT_STAT_C_CONNECTION |
++ 				USB_PORT_STAT_C_ENABLE);
++ #endif
++ 
++ 	/* Try to resuscitate an existing device */
++ 	if ((portstatus & USB_PORT_STAT_CONNECTION) && udev &&
++ 			udev->state != USB_STATE_NOTATTACHED) {
++ 		if (portstatus & USB_PORT_STAT_ENABLE) {
++ 			status = 0;		/* Nothing to do */
++ #ifdef CONFIG_PM_RUNTIME
++ 		} else if (udev->state == USB_STATE_SUSPENDED &&
++ 				udev->persist_enabled) {
++ 			/* For a suspended device, treat this as a
++ 			 * remote wakeup event.
++ 			 */
++ 			usb_unlock_port(port_dev);
++ 			status = usb_remote_wakeup(udev);
++ 			usb_lock_port(port_dev);
++ #endif
++ 		} else {
++ 			/* Don't resuscitate */;
++ 		}
++ 	}
++ 	clear_bit(port1, hub->change_bits);
++ 
++ 	/* successfully revalidated the connection */
++ 	if (status == 0)
++ 		return;
++ 
++ 	usb_unlock_port(port_dev);
++ 	hub_port_connect(hub, port1, portstatus, portchange);
++ 	usb_lock_port(port_dev);
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+  }
+  
+  /* Returns 1 if there was a remote wakeup and a connect status change. */
+  static int hub_handle_remote_wakeup(struct usb_hub *hub, unsigned int port,
+  		u16 portstatus, u16 portchange)
++ 		__must_hold(&port_dev->status_lock)
+  {
+ -	struct usb_port *port_dev = hub->ports[port - 1];
+  	struct usb_device *hdev;
+  	struct usb_device *udev;
+  	int connect_change = 0;
+@@@ -4711,6 -4738,128 +4804,131 @@@
+  	return connect_change;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void port_event(struct usb_hub *hub, int port1)
++ 		__must_hold(&port_dev->status_lock)
++ {
++ 	int connect_change, reset_device = 0;
++ 	struct usb_port *port_dev = hub->ports[port1 - 1];
++ 	struct usb_device *udev = port_dev->child;
++ 	struct usb_device *hdev = hub->hdev;
++ 	u16 portstatus, portchange;
++ 
++ 	connect_change = test_bit(port1, hub->change_bits);
++ 	clear_bit(port1, hub->event_bits);
++ 	clear_bit(port1, hub->wakeup_bits);
++ 
++ 	if (hub_port_status(hub, port1, &portstatus, &portchange) < 0)
++ 		return;
++ 
++ 	if (portchange & USB_PORT_STAT_C_CONNECTION) {
++ 		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
++ 		connect_change = 1;
++ 	}
++ 
++ 	if (portchange & USB_PORT_STAT_C_ENABLE) {
++ 		if (!connect_change)
++ 			dev_dbg(&port_dev->dev, "enable change, status %08x\n",
++ 					portstatus);
++ 		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
++ 
++ 		/*
++ 		 * EM interference sometimes causes badly shielded USB devices
++ 		 * to be shutdown by the hub, this hack enables them again.
++ 		 * Works at least with mouse driver.
++ 		 */
++ 		if (!(portstatus & USB_PORT_STAT_ENABLE)
++ 		    && !connect_change && udev) {
++ 			dev_err(&port_dev->dev, "disabled by hub (EMI?), re-enabling...\n");
++ 			connect_change = 1;
++ 		}
++ 	}
++ 
++ 	if (portchange & USB_PORT_STAT_C_OVERCURRENT) {
++ 		u16 status = 0, unused;
++ 
++ 		dev_dbg(&port_dev->dev, "over-current change\n");
++ 		usb_clear_port_feature(hdev, port1,
++ 				USB_PORT_FEAT_C_OVER_CURRENT);
++ 		msleep(100);	/* Cool down */
++ 		hub_power_on(hub, true);
++ 		hub_port_status(hub, port1, &status, &unused);
++ 		if (status & USB_PORT_STAT_OVERCURRENT)
++ 			dev_err(&port_dev->dev, "over-current condition\n");
++ 	}
++ 
++ 	if (portchange & USB_PORT_STAT_C_RESET) {
++ 		dev_dbg(&port_dev->dev, "reset change\n");
++ 		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_RESET);
++ 	}
++ 	if ((portchange & USB_PORT_STAT_C_BH_RESET)
++ 	    && hub_is_superspeed(hdev)) {
++ 		dev_dbg(&port_dev->dev, "warm reset change\n");
++ 		usb_clear_port_feature(hdev, port1,
++ 				USB_PORT_FEAT_C_BH_PORT_RESET);
++ 	}
++ 	if (portchange & USB_PORT_STAT_C_LINK_STATE) {
++ 		dev_dbg(&port_dev->dev, "link state change\n");
++ 		usb_clear_port_feature(hdev, port1,
++ 				USB_PORT_FEAT_C_PORT_LINK_STATE);
++ 	}
++ 	if (portchange & USB_PORT_STAT_C_CONFIG_ERROR) {
++ 		dev_warn(&port_dev->dev, "config error\n");
++ 		usb_clear_port_feature(hdev, port1,
++ 				USB_PORT_FEAT_C_PORT_CONFIG_ERROR);
++ 	}
++ 
++ 	/* skip port actions that require the port to be powered on */
++ 	if (!pm_runtime_active(&port_dev->dev))
++ 		return;
++ 
++ 	if (hub_handle_remote_wakeup(hub, port1, portstatus, portchange))
++ 		connect_change = 1;
++ 
++ 	/*
++ 	 * Warm reset a USB3 protocol port if it's in
++ 	 * SS.Inactive state.
++ 	 */
++ 	if (hub_port_warm_reset_required(hub, portstatus)) {
++ 		dev_dbg(&port_dev->dev, "do warm reset\n");
++ 		if (!udev || !(portstatus & USB_PORT_STAT_CONNECTION)
++ 				|| udev->state == USB_STATE_NOTATTACHED) {
++ 			if (hub_port_reset(hub, port1, NULL,
++ 					HUB_BH_RESET_TIME, true) < 0)
++ 				hub_port_disable(hub, port1, 1);
++ 		} else
++ 			reset_device = 1;
++ 	}
++ 
++ 	/*
++ 	 * On disconnect USB3 protocol ports transit from U0 to
++ 	 * SS.Inactive to Rx.Detect. If this happens a warm-
++ 	 * reset is not needed, but a (re)connect may happen
++ 	 * before khubd runs and sees the disconnect, and the
++ 	 * device may be an unknown state.
++ 	 *
++ 	 * If the port went through SS.Inactive without khubd
++ 	 * seeing it the C_LINK_STATE change flag will be set,
++ 	 * and we reset the dev to put it in a known state.
++ 	 */
++ 	if (reset_device || (udev && hub_is_superspeed(hub->hdev)
++ 				&& (portchange & USB_PORT_STAT_C_LINK_STATE)
++ 				&& (portstatus & USB_PORT_STAT_CONNECTION))) {
++ 		usb_unlock_port(port_dev);
++ 		usb_lock_device(udev);
++ 		usb_reset_device(udev);
++ 		usb_unlock_device(udev);
++ 		usb_lock_port(port_dev);
++ 		connect_change = 0;
++ 	}
++ 
++ 	if (connect_change)
++ 		hub_port_connect_change(hub, port1, portstatus, portchange);
++ }
++ 
++ 
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+  static void hub_events(void)
+  {
+  	struct list_head *tmp;
+@@@ -4797,146 -4943,28 +5015,167 @@@
+  
+  		/* deal with port status changes */
+  		for (i = 1; i <= hdev->maxchild; i++) {
+ -			struct usb_port *port_dev = hub->ports[i - 1];
+ +			struct usb_device *udev = hub->ports[i - 1]->child;
+  
+++<<<<<<< HEAD
+ +			if (test_bit(i, hub->busy_bits))
+ +				continue;
+ +			connect_change = test_bit(i, hub->change_bits);
+ +			wakeup_change = test_and_clear_bit(i, hub->wakeup_bits);
+ +			if (!test_and_clear_bit(i, hub->event_bits) &&
+ +					!connect_change && !wakeup_change)
+ +				continue;
+ +
+ +			ret = hub_port_status(hub, i,
+ +					&portstatus, &portchange);
+ +			if (ret < 0)
+ +				continue;
+ +
+ +			if (portchange & USB_PORT_STAT_C_CONNECTION) {
+ +				usb_clear_port_feature(hdev, i,
+ +					USB_PORT_FEAT_C_CONNECTION);
+ +				connect_change = 1;
+++=======
++ 			if (test_bit(i, hub->event_bits)
++ 					|| test_bit(i, hub->change_bits)
++ 					|| test_bit(i, hub->wakeup_bits)) {
++ 				/*
++ 				 * The get_noresume and barrier ensure that if
++ 				 * the port was in the process of resuming, we
++ 				 * flush that work and keep the port active for
++ 				 * the duration of the port_event().  However,
++ 				 * if the port is runtime pm suspended
++ 				 * (powered-off), we leave it in that state, run
++ 				 * an abbreviated port_event(), and move on.
++ 				 */
++ 				pm_runtime_get_noresume(&port_dev->dev);
++ 				pm_runtime_barrier(&port_dev->dev);
++ 				usb_lock_port(port_dev);
++ 				port_event(hub, i);
++ 				usb_unlock_port(port_dev);
++ 				pm_runtime_put_sync(&port_dev->dev);
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+ +			}
+ +
+ +			if (portchange & USB_PORT_STAT_C_ENABLE) {
+ +				if (!connect_change)
+ +					dev_dbg (hub_dev,
+ +						"port %d enable change, "
+ +						"status %08x\n",
+ +						i, portstatus);
+ +				usb_clear_port_feature(hdev, i,
+ +					USB_PORT_FEAT_C_ENABLE);
+ +
+ +				/*
+ +				 * EM interference sometimes causes badly
+ +				 * shielded USB devices to be shutdown by
+ +				 * the hub, this hack enables them again.
+ +				 * Works at least with mouse driver. 
+ +				 */
+ +				if (!(portstatus & USB_PORT_STAT_ENABLE)
+ +				    && !connect_change
+ +				    && hub->ports[i - 1]->child) {
+ +					dev_err (hub_dev,
+ +					    "port %i "
+ +					    "disabled by hub (EMI?), "
+ +					    "re-enabling...\n",
+ +						i);
+ +					connect_change = 1;
+ +				}
+ +			}
+ +
+ +			if (hub_handle_remote_wakeup(hub, i,
+ +						portstatus, portchange))
+ +				connect_change = 1;
+ +
+ +			if (portchange & USB_PORT_STAT_C_OVERCURRENT) {
+ +				u16 status = 0;
+ +				u16 unused;
+ +
+ +				dev_dbg(hub_dev, "over-current change on port "
+ +					"%d\n", i);
+ +				usb_clear_port_feature(hdev, i,
+ +					USB_PORT_FEAT_C_OVER_CURRENT);
+ +				msleep(100);	/* Cool down */
+ +				hub_power_on(hub, true);
+ +				hub_port_status(hub, i, &status, &unused);
+ +				if (status & USB_PORT_STAT_OVERCURRENT)
+ +					dev_err(hub_dev, "over-current "
+ +						"condition on port %d\n", i);
+ +			}
+ +
+ +			if (portchange & USB_PORT_STAT_C_RESET) {
+ +				dev_dbg (hub_dev,
+ +					"reset change on port %d\n",
+ +					i);
+ +				usb_clear_port_feature(hdev, i,
+ +					USB_PORT_FEAT_C_RESET);
+ +			}
+ +			if ((portchange & USB_PORT_STAT_C_BH_RESET) &&
+ +					hub_is_superspeed(hub->hdev)) {
+ +				dev_dbg(hub_dev,
+ +					"warm reset change on port %d\n",
+ +					i);
+ +				usb_clear_port_feature(hdev, i,
+ +					USB_PORT_FEAT_C_BH_PORT_RESET);
+ +			}
+ +			if (portchange & USB_PORT_STAT_C_LINK_STATE) {
+ +				usb_clear_port_feature(hub->hdev, i,
+ +						USB_PORT_FEAT_C_PORT_LINK_STATE);
+ +			}
+ +			if (portchange & USB_PORT_STAT_C_CONFIG_ERROR) {
+ +				dev_warn(hub_dev,
+ +					"config error on port %d\n",
+ +					i);
+ +				usb_clear_port_feature(hub->hdev, i,
+ +						USB_PORT_FEAT_C_PORT_CONFIG_ERROR);
+ +			}
+ +
+ +			/* Warm reset a USB3 protocol port if it's in
+ +			 * SS.Inactive state.
+ +			 */
+ +			if (hub_port_warm_reset_required(hub, portstatus)) {
+ +				int status;
+ +
+ +				dev_dbg(hub_dev, "warm reset port %d\n", i);
+ +				if (!udev ||
+ +				    !(portstatus & USB_PORT_STAT_CONNECTION) ||
+ +				    udev->state == USB_STATE_NOTATTACHED) {
+ +					status = hub_port_reset(hub, i,
+ +							NULL, HUB_BH_RESET_TIME,
+ +							true);
+ +					if (status < 0)
+ +						hub_port_disable(hub, i, 1);
+ +				} else {
+ +					usb_lock_device(udev);
+ +					status = usb_reset_device(udev);
+ +					usb_unlock_device(udev);
+ +					connect_change = 0;
+ +				}
+ +			/*
+ +			 * On disconnect USB3 protocol ports transit from U0 to
+ +			 * SS.Inactive to Rx.Detect. If this happens a warm-
+ +			 * reset is not needed, but a (re)connect may happen
+ +			 * before khubd runs and sees the disconnect, and the
+ +			 * device may be an unknown state.
+ +			 *
+ +			 * If the port went through SS.Inactive without khubd
+ +			 * seeing it the C_LINK_STATE change flag will be set,
+ +			 * and we reset the dev to put it in a known state.
+ +			 */
+ +			} else if (udev && hub_is_superspeed(hub->hdev) &&
+ +				   (portchange & USB_PORT_STAT_C_LINK_STATE) &&
+ +				   (portstatus & USB_PORT_STAT_CONNECTION)) {
+ +				usb_lock_device(udev);
+ +				usb_reset_device(udev);
+ +				usb_unlock_device(udev);
+ +				connect_change = 0;
+  			}
+ -		}
+ +
+ +			if (connect_change)
+ +				hub_port_connect_change(hub, i,
+ +						portstatus, portchange);
+ +		} /* end for i */
+  
+  		/* deal with hub status changes */
+  		if (test_and_clear_bit(0, hub->event_bits) == 0)
+diff --cc drivers/usb/core/hub.h
+index e10d5b4e1587,0a7cdc0ef0a9..000000000000
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@@ -85,15 -83,23 +83,25 @@@ struct usb_hub 
+   * @child: usb device attached to the port
+   * @dev: generic device interface
+   * @port_owner: port's owner
+ - * @peer: related usb2 and usb3 ports (share the same connector)
+   * @connect_type: port's connect type
+++<<<<<<< HEAD
+++=======
++  * @location: opaque representation of platform connector location
++  * @status_lock: synchronize port_event() vs usb_port_{suspend|resume}
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+   * @portnum: port index num based one
+ - * @is_superspeed cache super-speed status
+   */
+  struct usb_port {
+  	struct usb_device *child;
+  	struct device dev;
+ -	struct usb_dev_state *port_owner;
+ -	struct usb_port *peer;
+ +	struct dev_state *port_owner;
+  	enum usb_port_connect_type connect_type;
+++<<<<<<< HEAD
+++=======
++ 	usb_port_location_t location;
++ 	struct mutex status_lock;
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+  	u8 portnum;
+ -	unsigned int is_superspeed:1;
+  };
+  
+  #define to_usb_port(_dev) \
+diff --cc drivers/usb/core/port.c
+index 7cfc3c98920d,8b1655700104..000000000000
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@@ -86,10 -87,16 +86,8 @@@ static int usb_port_runtime_resume(stru
+  		return 0;
+  	}
+  
+ -	/*
+ -	 * Power on our usb3 peer before this usb2 port to prevent a usb3
+ -	 * device from degrading to its usb2 connection
+ -	 */
+ -	if (!port_dev->is_superspeed && peer)
+ -		pm_runtime_get_sync(&peer->dev);
+ -
+  	usb_autopm_get_interface(intf);
+- 	set_bit(port1, hub->busy_bits);
+- 
+  	retval = usb_hub_set_port_power(hdev, hub, port1, true);
+ -	msleep(hub_power_on_good_delay(hub));
+  	if (port_dev->child && !retval) {
+  		/*
+  		 * Attempt to wait for usb hub port to be reconnected in order
+@@@ -104,8 -111,8 +102,7 @@@
+  		retval = 0;
+  	}
+  
+- 	clear_bit(port1, hub->busy_bits);
+  	usb_autopm_put_interface(intf);
+ -
+  	return retval;
+  }
+  
+@@@ -133,8 -140,16 +129,7 @@@ static int usb_port_runtime_suspend(str
+  	usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
+  	if (!port_dev->is_superspeed)
+  		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
+- 	clear_bit(port1, hub->busy_bits);
+  	usb_autopm_put_interface(intf);
+ -
+ -	/*
+ -	 * Our peer usb3 port may now be able to suspend, so
+ -	 * asynchronously queue a suspend request to observe that this
+ -	 * usb2 port is now off.
+ -	 */
+ -	if (!port_dev->is_superspeed && peer)
+ -		pm_runtime_put(&peer->dev);
+ -
+  	return retval;
+  }
+  #endif
+@@@ -169,8 -390,12 +164,17 @@@ int usb_hub_create_port_device(struct u
+  	port_dev->dev.parent = hub->intfdev;
+  	port_dev->dev.groups = port_dev_group;
+  	port_dev->dev.type = &usb_port_device_type;
+++<<<<<<< HEAD
+ +	dev_set_name(&port_dev->dev, "port%d", port1);
+ +
+++=======
++ 	port_dev->dev.driver = &usb_port_driver;
++ 	if (hub_is_superspeed(hub->hdev))
++ 		port_dev->is_superspeed = 1;
++ 	dev_set_name(&port_dev->dev, "%s-port%d", dev_name(&hub->hdev->dev),
++ 			port1);
++ 	mutex_init(&port_dev->status_lock);
+++>>>>>>> 5c79a1e30336 (usb: introduce port status lock)
+  	retval = device_register(&port_dev->dev);
+  	if (retval)
+  		goto error_register;
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index 72b62e0d6494..0f6b0b9490ef 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -2268,9 +2268,7 @@ static void hcd_resume_work(struct work_struct *work)
+ 	struct usb_hcd *hcd = container_of(work, struct usb_hcd, wakeup_work);
+ 	struct usb_device *udev = hcd->self.root_hub;
+ 
+-	usb_lock_device(udev);
+ 	usb_remote_wakeup(udev);
+-	usb_unlock_device(udev);
+ }
+ 
+ /**
+* Unmerged path drivers/usb/core/hub.c
+* Unmerged path drivers/usb/core/hub.h
+* Unmerged path drivers/usb/core/port.c
