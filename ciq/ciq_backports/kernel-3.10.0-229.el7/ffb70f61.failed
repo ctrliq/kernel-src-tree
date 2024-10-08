@@ -1,0 +1,182 @@
+KEYS: validate certificate trust only with selected key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Dmitry Kasatkin <d.kasatkin@samsung.com>
+commit ffb70f61bab1482a3bd0f85fd8f1e9c9909df2ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ffb70f61.failed
+
+Instead of allowing public keys, with certificates signed by any
+key on the system trusted keyring, to be added to a trusted keyring,
+this patch further restricts the certificates to those signed by a
+particular key on the system keyring.
+
+This patch defines a new kernel parameter 'ca_keys' to identify the
+specific key which must be used for trust validation of certificates.
+
+Simplified Mimi's "KEYS: define an owner trusted keyring" patch.
+
+Changelog:
+- support for builtin x509 public keys only
+- export "asymmetric_keyid_match"
+- remove ifndefs MODULE
+- rename kernel boot parameter from keys_ownerid to ca_keys
+
+	Signed-off-by: Dmitry Kasatkin <d.kasatkin@samsung.com>
+	Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+(cherry picked from commit ffb70f61bab1482a3bd0f85fd8f1e9c9909df2ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/asymmetric_keys/x509_public_key.c
+diff --cc crypto/asymmetric_keys/x509_public_key.c
+index 2fcf47e69b21,d376195e1d08..000000000000
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@@ -23,6 -24,71 +23,22 @@@
+  #include "public_key.h"
+  #include "x509_parser.h"
+  
++ static char *ca_keyid;
++ 
++ #ifndef MODULE
++ static int __init ca_keys_setup(char *str)
++ {
++ 	if (!str)		/* default system keyring */
++ 		return 1;
++ 
++ 	if (strncmp(str, "id:", 3) == 0)
++ 		ca_keyid = str;	/* owner key 'id:xxxxxx' */
++ 
++ 	return 1;
++ }
++ __setup("ca_keys=", ca_keys_setup);
++ #endif
++ 
+ -/*
+ - * Find a key in the given keyring by issuer and authority.
+ - */
+ -static struct key *x509_request_asymmetric_key(struct key *keyring,
+ -					       const char *signer,
+ -					       size_t signer_len,
+ -					       const char *authority,
+ -					       size_t auth_len)
+ -{
+ -	key_ref_t key;
+ -	char *id;
+ -
+ -	/* Construct an identifier. */
+ -	id = kmalloc(signer_len + 2 + auth_len + 1, GFP_KERNEL);
+ -	if (!id)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	memcpy(id, signer, signer_len);
+ -	id[signer_len + 0] = ':';
+ -	id[signer_len + 1] = ' ';
+ -	memcpy(id + signer_len + 2, authority, auth_len);
+ -	id[signer_len + 2 + auth_len] = 0;
+ -
+ -	pr_debug("Look up: \"%s\"\n", id);
+ -
+ -	key = keyring_search(make_key_ref(keyring, 1),
+ -			     &key_type_asymmetric, id);
+ -	if (IS_ERR(key))
+ -		pr_debug("Request for module key '%s' err %ld\n",
+ -			 id, PTR_ERR(key));
+ -	kfree(id);
+ -
+ -	if (IS_ERR(key)) {
+ -		switch (PTR_ERR(key)) {
+ -			/* Hide some search errors */
+ -		case -EACCES:
+ -		case -ENOTDIR:
+ -		case -EAGAIN:
+ -			return ERR_PTR(-ENOKEY);
+ -		default:
+ -			return ERR_CAST(key);
+ -		}
+ -	}
+ -
+ -	pr_devel("<==%s() = 0 [%x]\n", __func__,
+ -		 key_serial(key_ref_to_ptr(key)));
+ -	return key_ref_to_ptr(key);
+ -}
+ -
+  /*
+   * Set up the signature parameters in an X.509 certificate.  This involves
+   * digesting the signed data and extracting the signature.
+@@@ -103,6 -169,40 +119,43 @@@ int x509_check_signature(const struct p
+  EXPORT_SYMBOL_GPL(x509_check_signature);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Check the new certificate against the ones in the trust keyring.  If one of
++  * those is the signing key and validates the new certificate, then mark the
++  * new certificate as being trusted.
++  *
++  * Return 0 if the new certificate was successfully validated, 1 if we couldn't
++  * find a matching parent certificate in the trusted list and an error if there
++  * is a matching certificate but the signature check fails.
++  */
++ static int x509_validate_trust(struct x509_certificate *cert,
++ 			       struct key *trust_keyring)
++ {
++ 	const struct public_key *pk;
++ 	struct key *key;
++ 	int ret = 1;
++ 
++ 	if (!trust_keyring)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (ca_keyid && !asymmetric_keyid_match(cert->authority, ca_keyid))
++ 		return -EPERM;
++ 
++ 	key = x509_request_asymmetric_key(trust_keyring,
++ 					  cert->issuer, strlen(cert->issuer),
++ 					  cert->authority,
++ 					  strlen(cert->authority));
++ 	if (!IS_ERR(key))  {
++ 		pk = key->payload.data;
++ 		ret = x509_check_signature(pk, cert);
++ 		key_put(key);
++ 	}
++ 	return ret;
++ }
++ 
++ /*
+++>>>>>>> ffb70f61bab1 (KEYS: validate certificate trust only with selected key)
+   * Attempt to parse a data blob for a key as an X509 certificate.
+   */
+  static int x509_key_preparse(struct key_preparsed_payload *prep)
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index d726a752a002..1cf7e2fda6fc 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -458,6 +458,11 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			possible to determine what the correct size should be.
+ 			This option provides an override for these situations.
+ 
++	ca_keys=	[KEYS] This parameter identifies a specific key(s) on
++			the system trusted keyring to be used for certificate
++			trust validation.
++			format: id:<keyid>
++
+ 	ccw_timeout_log [S390]
+ 			See Documentation/s390/CommonIO for details.
+ 
+diff --git a/crypto/asymmetric_keys/asymmetric_type.c b/crypto/asymmetric_keys/asymmetric_type.c
+index 1fd1d304a15a..c948df5c4ecd 100644
+--- a/crypto/asymmetric_keys/asymmetric_type.c
++++ b/crypto/asymmetric_keys/asymmetric_type.c
+@@ -49,6 +49,7 @@ int asymmetric_keyid_match(const char *kid, const char *id)
+ 
+ 	return 1;
+ }
++EXPORT_SYMBOL_GPL(asymmetric_keyid_match);
+ 
+ /*
+  * Match asymmetric keys on (part of) their name
+* Unmerged path crypto/asymmetric_keys/x509_public_key.c
