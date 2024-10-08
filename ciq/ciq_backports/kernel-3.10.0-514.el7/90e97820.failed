@@ -1,0 +1,336 @@
+resources: Move struct resource_list_entry from ACPI into resource core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 90e97820619dc912b52cc9d103272819d8b51259
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/90e97820.failed
+
+Currently ACPI, PCI and pnp all implement the same resource list
+management with different data structure. We need to transfer from
+one data structure into another when passing resources from one
+subsystem into another subsystem. So move struct resource_list_entry
+from ACPI into resource core and rename it as resource_entry,
+then it could be reused by different subystems and avoid the data
+structure conversion.
+
+Introduce dedicated header file resource_ext.h instead of embedding
+it into ioport.h to avoid header file inclusion order issues.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Acked-by: Vinod Koul <vinod.koul@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 90e97820619dc912b52cc9d103272819d8b51259)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpi_platform.c
+#	drivers/acpi/resource.c
+#	include/linux/acpi.h
+diff --cc drivers/acpi/acpi_platform.c
+index 4a7dc6c4e2de,1284138e42ab..000000000000
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@@ -48,31 -45,36 +48,45 @@@ struct platform_device *acpi_create_pla
+  	struct platform_device *pdev = NULL;
+  	struct acpi_device *acpi_parent;
+  	struct platform_device_info pdevinfo;
+- 	struct resource_list_entry *rentry;
++ 	struct resource_entry *rentry;
+  	struct list_head resource_list;
+ -	struct resource *resources = NULL;
+ +	struct resource *resources;
+  	int count;
+  
+  	/* If the ACPI node already has a physical device attached, skip it. */
+  	if (adev->physical_node_count)
+  		return NULL;
+  
+ -	if (!acpi_match_device_ids(adev, forbidden_id_list))
+ -		return ERR_PTR(-EINVAL);
+ -
+  	INIT_LIST_HEAD(&resource_list);
+  	count = acpi_dev_get_resources(adev, &resource_list, NULL, NULL);
+ -	if (count < 0) {
+ +	if (count <= 0)
+  		return NULL;
+++<<<<<<< HEAD
+++=======
++ 	} else if (count > 0) {
++ 		resources = kmalloc(count * sizeof(struct resource),
++ 				    GFP_KERNEL);
++ 		if (!resources) {
++ 			dev_err(&adev->dev, "No memory for resources\n");
++ 			acpi_dev_free_resource_list(&resource_list);
++ 			return ERR_PTR(-ENOMEM);
++ 		}
++ 		count = 0;
++ 		list_for_each_entry(rentry, &resource_list, node)
++ 			resources[count++] = *rentry->res;
+++>>>>>>> 90e97820619d (resources: Move struct resource_list_entry from ACPI into resource core)
+  
+ +	resources = kmalloc(count * sizeof(struct resource), GFP_KERNEL);
+ +	if (!resources) {
+ +		dev_err(&adev->dev, "No memory for resources\n");
+  		acpi_dev_free_resource_list(&resource_list);
+ +		return ERR_PTR(-ENOMEM);
+  	}
+ +	count = 0;
+ +	list_for_each_entry(rentry, &resource_list, node)
+ +		resources[count++] = rentry->res;
+ +
+ +	acpi_dev_free_resource_list(&resource_list);
+  
+  	memset(&pdevinfo, 0, sizeof(pdevinfo));
+  	/*
+diff --cc drivers/acpi/resource.c
+index 1203700d74b8,4752b9939987..000000000000
+--- a/drivers/acpi/resource.c
++++ b/drivers/acpi/resource.c
+@@@ -423,18 -456,19 +418,24 @@@ struct res_proc_context 
+  	int error;
+  };
+  
+ -static acpi_status acpi_dev_new_resource_entry(struct resource_win *win,
+ +static acpi_status acpi_dev_new_resource_entry(struct resource *r,
+  					       struct res_proc_context *c)
+  {
+- 	struct resource_list_entry *rentry;
++ 	struct resource_entry *rentry;
+  
+- 	rentry = kmalloc(sizeof(*rentry), GFP_KERNEL);
++ 	rentry = resource_list_create_entry(NULL, 0);
+  	if (!rentry) {
+  		c->error = -ENOMEM;
+  		return AE_NO_MEMORY;
+  	}
+++<<<<<<< HEAD
+ +	rentry->res = *r;
+ +	list_add_tail(&rentry->node, c->list);
+++=======
++ 	*rentry->res = win->res;
++ 	rentry->offset = win->offset;
++ 	resource_list_add_tail(rentry, c->list);
+++>>>>>>> 90e97820619d (resources: Move struct resource_list_entry from ACPI into resource core)
+  	c->count++;
+  	return AE_OK;
+  }
+diff --cc include/linux/acpi.h
+index b227b042935b,e53822148b6a..000000000000
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@@ -27,9 -27,9 +27,10 @@@
+  
+  #include <linux/errno.h>
+  #include <linux/ioport.h>	/* for struct resource */
++ #include <linux/resource_ext.h>
+  #include <linux/device.h>
+ -#include <linux/property.h>
+ +
+ +#ifdef	CONFIG_ACPI
+  
+  #ifndef _LINUX
+  #define _LINUX
+@@@ -278,11 -296,6 +279,14 @@@ unsigned long acpi_dev_irq_flags(u8 tri
+  bool acpi_dev_resource_interrupt(struct acpi_resource *ares, int index,
+  				 struct resource *res);
+  
+++<<<<<<< HEAD
+ +struct resource_list_entry {
+ +	struct list_head node;
+ +	struct resource res;
+ +};
+ +
+++=======
+++>>>>>>> 90e97820619d (resources: Move struct resource_list_entry from ACPI into resource core)
+  void acpi_dev_free_resource_list(struct list_head *list);
+  int acpi_dev_get_resources(struct acpi_device *adev, struct list_head *list,
+  			   int (*preproc)(struct acpi_resource *, void *),
+diff --git a/drivers/acpi/acpi_lpss.c b/drivers/acpi/acpi_lpss.c
+index 3c4f836c31c0..73adb5861fc5 100644
+--- a/drivers/acpi/acpi_lpss.c
++++ b/drivers/acpi/acpi_lpss.c
+@@ -280,7 +280,7 @@ static int acpi_lpss_create_device(struct acpi_device *adev,
+ {
+ 	struct lpss_device_desc *dev_desc;
+ 	struct lpss_private_data *pdata;
+-	struct resource_list_entry *rentry;
++	struct resource_entry *rentry;
+ 	struct list_head resource_list;
+ 	struct platform_device *pdev;
+ 	int ret;
+@@ -300,12 +300,12 @@ static int acpi_lpss_create_device(struct acpi_device *adev,
+ 		goto err_out;
+ 
+ 	list_for_each_entry(rentry, &resource_list, node)
+-		if (resource_type(&rentry->res) == IORESOURCE_MEM) {
++		if (resource_type(rentry->res) == IORESOURCE_MEM) {
+ 			if (dev_desc->prv_size_override)
+ 				pdata->mmio_size = dev_desc->prv_size_override;
+ 			else
+-				pdata->mmio_size = resource_size(&rentry->res);
+-			pdata->mmio_base = ioremap(rentry->res.start,
++				pdata->mmio_size = resource_size(rentry->res);
++			pdata->mmio_base = ioremap(rentry->res->start,
+ 						   pdata->mmio_size);
+ 			if (!pdata->mmio_base)
+ 				goto err_out;
+* Unmerged path drivers/acpi/acpi_platform.c
+* Unmerged path drivers/acpi/resource.c
+diff --git a/drivers/dma/acpi-dma.c b/drivers/dma/acpi-dma.c
+index 5a18f82f732a..95a2f23365db 100644
+--- a/drivers/dma/acpi-dma.c
++++ b/drivers/dma/acpi-dma.c
+@@ -41,7 +41,7 @@ static int acpi_dma_parse_resource_group(const struct acpi_csrt_group *grp,
+ {
+ 	const struct acpi_csrt_shared_info *si;
+ 	struct list_head resource_list;
+-	struct resource_list_entry *rentry;
++	struct resource_entry *rentry;
+ 	resource_size_t mem = 0, irq = 0;
+ 	u32 vendor_id;
+ 	int ret;
+@@ -55,10 +55,10 @@ static int acpi_dma_parse_resource_group(const struct acpi_csrt_group *grp,
+ 		return 0;
+ 
+ 	list_for_each_entry(rentry, &resource_list, node) {
+-		if (resource_type(&rentry->res) == IORESOURCE_MEM)
+-			mem = rentry->res.start;
+-		else if (resource_type(&rentry->res) == IORESOURCE_IRQ)
+-			irq = rentry->res.start;
++		if (resource_type(rentry->res) == IORESOURCE_MEM)
++			mem = rentry->res->start;
++		else if (resource_type(rentry->res) == IORESOURCE_IRQ)
++			irq = rentry->res->start;
+ 	}
+ 
+ 	acpi_dev_free_resource_list(&resource_list);
+* Unmerged path include/linux/acpi.h
+diff --git a/include/linux/resource_ext.h b/include/linux/resource_ext.h
+new file mode 100644
+index 000000000000..e2bf63d881d4
+--- /dev/null
++++ b/include/linux/resource_ext.h
+@@ -0,0 +1,77 @@
++/*
++ * Copyright (C) 2015, Intel Corporation
++ * Author: Jiang Liu <jiang.liu@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++#ifndef _LINUX_RESOURCE_EXT_H
++#define _LINUX_RESOURCE_EXT_H
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/ioport.h>
++#include <linux/slab.h>
++
++/* Represent resource window for bridge devices */
++struct resource_win {
++	struct resource res;		/* In master (CPU) address space */
++	resource_size_t offset;		/* Translation offset for bridge */
++};
++
++/*
++ * Common resource list management data structure and interfaces to support
++ * ACPI, PNP and PCI host bridge etc.
++ */
++struct resource_entry {
++	struct list_head	node;
++	struct resource		*res;	/* In master (CPU) address space */
++	resource_size_t		offset;	/* Translation offset for bridge */
++	struct resource		__res;	/* Default storage for res */
++};
++
++extern struct resource_entry *
++resource_list_create_entry(struct resource *res, size_t extra_size);
++extern void resource_list_free(struct list_head *head);
++
++static inline void resource_list_add(struct resource_entry *entry,
++				     struct list_head *head)
++{
++	list_add(&entry->node, head);
++}
++
++static inline void resource_list_add_tail(struct resource_entry *entry,
++					  struct list_head *head)
++{
++	list_add_tail(&entry->node, head);
++}
++
++static inline void resource_list_del(struct resource_entry *entry)
++{
++	list_del(&entry->node);
++}
++
++static inline void resource_list_free_entry(struct resource_entry *entry)
++{
++	kfree(entry);
++}
++
++static inline void
++resource_list_destroy_entry(struct resource_entry *entry)
++{
++	resource_list_del(entry);
++	resource_list_free_entry(entry);
++}
++
++#define resource_list_for_each_entry(entry, list)	\
++	list_for_each_entry((entry), (list), node)
++
++#define resource_list_for_each_entry_safe(entry, tmp, list)	\
++	list_for_each_entry_safe((entry), (tmp), (list), node)
++
++#endif /* _LINUX_RESOURCE_EXT_H */
+diff --git a/kernel/resource.c b/kernel/resource.c
+index eaf1c7384470..2d528a781f47 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -22,6 +22,7 @@
+ #include <linux/device.h>
+ #include <linux/pfn.h>
+ #include <linux/mm.h>
++#include <linux/resource_ext.h>
+ #include <asm/io.h>
+ 
+ 
+@@ -1471,6 +1472,30 @@ int iomem_is_exclusive(u64 addr)
+ 	return err;
+ }
+ 
++struct resource_entry *resource_list_create_entry(struct resource *res,
++						  size_t extra_size)
++{
++	struct resource_entry *entry;
++
++	entry = kzalloc(sizeof(*entry) + extra_size, GFP_KERNEL);
++	if (entry) {
++		INIT_LIST_HEAD(&entry->node);
++		entry->res = res ? res : &entry->__res;
++	}
++
++	return entry;
++}
++EXPORT_SYMBOL(resource_list_create_entry);
++
++void resource_list_free(struct list_head *head)
++{
++	struct resource_entry *entry, *tmp;
++
++	list_for_each_entry_safe(entry, tmp, head, node)
++		resource_list_destroy_entry(entry);
++}
++EXPORT_SYMBOL(resource_list_free);
++
+ static int __init strict_iomem(char *str)
+ {
+ 	if (strstr(str, "relaxed"))
