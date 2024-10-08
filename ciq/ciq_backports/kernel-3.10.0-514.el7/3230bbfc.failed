@@ -1,0 +1,202 @@
+ACPI: introduce ACPI int340x thermal scan handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Zhang Rui <rui.zhang@intel.com>
+commit 3230bbfce8a9270acc77fafd0d9ff90e94f28993
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3230bbfc.failed
+
+Newer laptops and tablets that use ACPI may have thermal sensors and
+other devices with thermal control capabilities outside the core CPU/SOC,
+for thermal safety reasons.
+They are exposed for the OS to use via
+1) INT3400 ACPI device object as the master.
+2) INT3401 ~ INT340B ACPI device objects as the slaves.
+
+This patch introduces a scan handler to enumerate the INT3400
+ACPI device object to platform bus, and prevent its slaves
+from being enumerated before the controller driver being probed.
+
+	Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+(cherry picked from commit 3230bbfce8a9270acc77fafd0d9ff90e94f28993)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thermal/Kconfig
+diff --cc drivers/thermal/Kconfig
+index 21faa8a5bcf8,2ff7416ca930..000000000000
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@@ -168,4 -196,73 +168,76 @@@ config INTEL_POWERCLAM
+  	  enforce idle time which results in more package C-state residency. The
+  	  user interface is exposed via generic thermal framework.
+  
+++<<<<<<< HEAD
+++=======
++ config X86_PKG_TEMP_THERMAL
++ 	tristate "X86 package temperature thermal driver"
++ 	depends on X86_THERMAL_VECTOR
++ 	select THERMAL_GOV_USER_SPACE
++ 	default m
++ 	help
++ 	  Enable this to register CPU digital sensor for package temperature as
++ 	  thermal zone. Each package will have its own thermal zone. There are
++ 	  two trip points which can be set by user to get notifications via thermal
++ 	  notification methods.
++ 
++ config ACPI_INT3403_THERMAL
++ 	tristate "ACPI INT3403 thermal driver"
++ 	depends on X86 && ACPI
++ 	help
++ 	  Newer laptops and tablets that use ACPI may have thermal sensors
++ 	  outside the core CPU/SOC for thermal safety reasons. These
++ 	  temperature sensors are also exposed for the OS to use via the so
++ 	  called INT3403 ACPI object. This driver will, on devices that have
++ 	  such sensors, expose the temperature information from these sensors
++ 	  to userspace via the normal thermal framework. This means that a wide
++ 	  range of applications and GUI widgets can show this information to
++ 	  the user or use this information for making decisions. For example,
++ 	  the Intel Thermal Daemon can use this information to allow the user
++ 	  to select his laptop to run without turning on the fans.
++ 
++ config INTEL_SOC_DTS_THERMAL
++ 	tristate "Intel SoCs DTS thermal driver"
++ 	depends on X86 && IOSF_MBI
++ 	help
++ 	  Enable this to register Intel SoCs (e.g. Bay Trail) platform digital
++ 	  temperature sensor (DTS). These SoCs have two additional DTSs in
++ 	  addition to DTSs on CPU cores. Each DTS will be registered as a
++ 	  thermal zone. There are two trip points. One of the trip point can
++ 	  be set by user mode programs to get notifications via Linux thermal
++ 	  notification methods.The other trip is a critical trip point, which
++ 	  was set by the driver based on the TJ MAX temperature.
++ 
++ config INT340X_THERMAL
++ 	bool
++ 	depends on X86 && ACPI
++ 	help
++ 	  Newer laptops and tablets that use ACPI may have thermal sensors and
++ 	  other devices with thermal control capabilities outside the core
++ 	  CPU/SOC, for thermal safety reasons.
++ 	  They are exposed for the OS to use via the INT3400 ACPI device object
++ 	  as the master, and INT3401~INT340B ACPI device objects as the slaves.
++ 	  Enable this to expose the temperature information and cooling ability
++ 	  from these objects to userspace via the normal thermal framework.
++ 	  This means that a wide range of applications and GUI widgets can show
++ 	  the information to the user or use this information for making
++ 	  decisions. For example, the Intel Thermal Daemon can use this
++ 	  information to allow the user to select his laptop to run without
++ 	  turning on the fans.
++ 
++ menu "Texas Instruments thermal drivers"
++ source "drivers/thermal/ti-soc-thermal/Kconfig"
++ endmenu
++ 
++ menu "Samsung thermal drivers"
++ depends on ARCH_EXYNOS
++ source "drivers/thermal/samsung/Kconfig"
++ endmenu
++ 
++ menu "STMicroelectronics thermal drivers"
++ depends on ARCH_STI && OF
++ source "drivers/thermal/st/Kconfig"
++ endmenu
++ 
+++>>>>>>> 3230bbfce8a9 (ACPI: introduce ACPI int340x thermal scan handler)
+  endif
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index 686c7dd77086..f417f87ffdce 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -42,6 +42,7 @@ acpi-y				+= pci_root.o pci_link.o pci_irq.o
+ acpi-y				+= acpi_lpss.o
+ acpi-y				+= acpi_platform.o
+ acpi-y				+= acpi_pnp.o
++acpi-y				+= int340x_thermal.o
+ acpi-y				+= power.o
+ acpi-y				+= event.o
+ acpi-y				+= sysfs.o
+diff --git a/drivers/acpi/int340x_thermal.c b/drivers/acpi/int340x_thermal.c
+new file mode 100644
+index 000000000000..2103bb6d9016
+--- /dev/null
++++ b/drivers/acpi/int340x_thermal.c
+@@ -0,0 +1,51 @@
++/*
++ * ACPI support for int340x thermal drivers
++ *
++ * Copyright (C) 2014, Intel Corporation
++ * Authors: Zhang Rui <rui.zhang@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/acpi.h>
++#include <linux/module.h>
++
++#include "internal.h"
++
++#define DO_ENUMERATION 0x01
++static const struct acpi_device_id int340x_thermal_device_ids[] = {
++	{"INT3400", DO_ENUMERATION },
++	{"INT3401"},
++	{"INT3402"},
++	{"INT3403"},
++	{"INT3404"},
++	{"INT3406"},
++	{"INT3407"},
++	{"INT3408"},
++	{"INT3409"},
++	{"INT340A"},
++	{"INT340B"},
++	{""},
++};
++
++static int int340x_thermal_handler_attach(struct acpi_device *adev,
++					const struct acpi_device_id *id)
++{
++#ifdef CONFIG_INT340X_THERMAL
++	if (id->driver_data == DO_ENUMERATION)
++		acpi_create_platform_device(adev);
++#endif
++	return 1;
++}
++
++static struct acpi_scan_handler int340x_thermal_handler = {
++	.ids = int340x_thermal_device_ids,
++	.attach = int340x_thermal_handler_attach,
++};
++
++void __init acpi_int340x_thermal_init(void)
++{
++	acpi_scan_add_handler(&int340x_thermal_handler);
++}
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 7d374d497109..da15caa70242 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -31,6 +31,7 @@ void acpi_pci_link_init(void);
+ void acpi_processor_init(void);
+ void acpi_platform_init(void);
+ void acpi_pnp_init(void);
++void acpi_int340x_thermal_init(void);
+ int acpi_sysfs_init(void);
+ #ifdef CONFIG_ACPI_CONTAINER
+ void acpi_container_init(void);
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 88c2d0368315..a83a0533002d 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -2184,6 +2184,7 @@ int __init acpi_scan_init(void)
+ 	acpi_container_init();
+ 	acpi_memory_hotplug_init();
+ 	acpi_pnp_init();
++	acpi_int340x_thermal_init();
+ 
+ 	mutex_lock(&acpi_scan_lock);
+ 	/*
+* Unmerged path drivers/thermal/Kconfig
