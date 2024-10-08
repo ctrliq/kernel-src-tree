@@ -1,0 +1,219 @@
+virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [virtio] virtio-net: get rid of virtio_net_hdr/skb_vnet_hdr (Jason Wang) [1227339]
+Rebuild_FUZZ: 98.00%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 012873d057a449c4480e7679e733a7daa9aa540f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/012873d0.failed
+
+virtio 1.0 doesn't use virtio_net_hdr anymore, and in fact, it's not
+really useful since virtio_net_hdr_mrg_rxbuf includes that as the first
+field anyway.
+
+Let's drop it, precalculate header len and store within vi instead.
+
+This way we can also remove struct skb_vnet_hdr.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+	Reviewed-by: Jason Wang <jasowang@redhat.com>
+
+
+
+
+(cherry picked from commit 012873d057a449c4480e7679e733a7daa9aa540f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index b7322df89f47,516f2cb034b5..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -109,8 -123,8 +109,13 @@@ struct virtnet_info 
+  	/* Host can handle any s/g split between our header and packet data */
+  	bool any_header_sg;
+  
+++<<<<<<< HEAD
+ +	/* enable config space updates */
+ +	bool config_enable;
+++=======
++ 	/* Packet virtio header size */
++ 	u8 hdr_len;
+++>>>>>>> 012873d057a4 (virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr)
+  
+  	/* Active statistics */
+  	struct virtnet_stats __percpu *stats;
+@@@ -234,16 -237,17 +232,21 @@@ static void set_skb_frag(struct sk_buf
+  }
+  
+  /* Called from bottom half context */
+ -static struct sk_buff *page_to_skb(struct virtnet_info *vi,
+ -				   struct receive_queue *rq,
+ -				   struct page *page, unsigned int offset,
+ -				   unsigned int len, unsigned int truesize)
+ +static struct sk_buff *page_to_skb(struct receive_queue *rq,
+ +				   struct page *page, unsigned int len)
+  {
+ +	struct virtnet_info *vi = rq->vq->vdev->priv;
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+ +	struct skb_vnet_hdr *hdr;
+ +	unsigned int copy, hdr_len, offset;
+++=======
++ 	struct virtio_net_hdr_mrg_rxbuf *hdr;
++ 	unsigned int copy, hdr_len, hdr_padded_len;
+++>>>>>>> 012873d057a4 (virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr)
+  	char *p;
+  
+ -	p = page_address(page) + offset;
+ +	p = page_address(page);
+  
+  	/* copy small packet so we can reuse these pages for small data */
+  	skb = netdev_alloc_skb_ip_align(vi->dev, GOOD_COPY_LEN);
+@@@ -252,13 -256,11 +255,21 @@@
+  
+  	hdr = skb_vnet_hdr(skb);
+  
+++<<<<<<< HEAD
+ +	if (vi->mergeable_rx_bufs) {
+ +		hdr_len = sizeof hdr->mhdr;
+ +		offset = hdr_len;
+ +	} else {
+ +		hdr_len = sizeof hdr->hdr;
+ +		offset = sizeof(struct padded_vnet_hdr);
+ +	}
+++=======
++ 	hdr_len = vi->hdr_len;
++ 	if (vi->mergeable_rx_bufs)
++ 		hdr_padded_len = sizeof *hdr;
++ 	else
++ 		hdr_padded_len = sizeof(struct padded_vnet_hdr);
+++>>>>>>> 012873d057a4 (virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr)
+  
+  	memcpy(hdr, p, hdr_len);
+  
+@@@ -326,30 -342,33 +337,48 @@@ err
+  }
+  
+  static struct sk_buff *receive_mergeable(struct net_device *dev,
+ -					 struct virtnet_info *vi,
+  					 struct receive_queue *rq,
+ -					 unsigned long ctx,
+ +					 void *buf,
+  					 unsigned int len)
+  {
+++<<<<<<< HEAD
+ +	struct skb_vnet_hdr *hdr = page_address(buf);
+ +	int num_buf = hdr->mhdr.num_buffers;
+ +	struct page *page = buf;
+ +	struct sk_buff *skb = page_to_skb(rq, page, len);
+ +	int i;
+++=======
++ 	void *buf = mergeable_ctx_to_buf_address(ctx);
++ 	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
++ 	u16 num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
++ 	struct page *page = virt_to_head_page(buf);
++ 	int offset = buf - page_address(page);
++ 	unsigned int truesize = max(len, mergeable_ctx_to_buf_truesize(ctx));
+++>>>>>>> 012873d057a4 (virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr)
+  
+ -	struct sk_buff *head_skb = page_to_skb(vi, rq, page, offset, len,
+ -					       truesize);
+ -	struct sk_buff *curr_skb = head_skb;
+ -
+ -	if (unlikely(!curr_skb))
+ +	if (unlikely(!skb))
+  		goto err_skb;
+ -	while (--num_buf) {
+ -		int num_skb_frags;
+  
+++<<<<<<< HEAD
+ +	while (--num_buf) {
+ +		i = skb_shinfo(skb)->nr_frags;
+ +		if (i >= MAX_SKB_FRAGS) {
+ +			pr_debug("%s: packet too long\n", skb->dev->name);
+ +			skb->dev->stats.rx_length_errors++;
+ +			return NULL;
+ +		}
+ +		page = virtqueue_get_buf(rq->vq, &len);
+ +		if (!page) {
+ +			pr_debug("%s: rx error: %d buffers %d missing\n",
+ +				 dev->name, hdr->mhdr.num_buffers, num_buf);
+++=======
++ 		ctx = (unsigned long)virtqueue_get_buf(rq->vq, &len);
++ 		if (unlikely(!ctx)) {
++ 			pr_debug("%s: rx error: %d buffers out of %d missing\n",
++ 				 dev->name, num_buf,
++ 				 virtio16_to_cpu(vi->vdev,
++ 						 hdr->num_buffers));
+++>>>>>>> 012873d057a4 (virtio_net: get rid of virtio_net_hdr/skb_vnet_hdr)
+  			dev->stats.rx_length_errors++;
+  			goto err_buf;
+  		}
+@@@ -393,18 -440,24 +422,18 @@@ static void receive_buf(struct receive_
+  	if (unlikely(len < sizeof(struct virtio_net_hdr) + ETH_HLEN)) {
+  		pr_debug("%s: short packet %i\n", dev->name, len);
+  		dev->stats.rx_length_errors++;
+ -		if (vi->mergeable_rx_bufs) {
+ -			unsigned long ctx = (unsigned long)buf;
+ -			void *base = mergeable_ctx_to_buf_address(ctx);
+ -			put_page(virt_to_head_page(base));
+ -		} else if (vi->big_packets) {
+ +		if (vi->mergeable_rx_bufs || vi->big_packets)
+  			give_pages(rq, buf);
+ -		} else {
+ +		else
+  			dev_kfree_skb(buf);
+ -		}
+  		return;
+  	}
+ -
+  	if (vi->mergeable_rx_bufs)
+ -		skb = receive_mergeable(dev, vi, rq, (unsigned long)buf, len);
+ +		skb = receive_mergeable(dev, rq, buf, len);
+  	else if (vi->big_packets)
+ -		skb = receive_big(dev, vi, rq, buf, len);
+ +		skb = receive_big(dev, rq, buf, len);
+  	else
+- 		skb = receive_small(buf, len);
++ 		skb = receive_small(vi, buf, len);
+  
+  	if (unlikely(!skb))
+  		return;
+@@@ -470,14 -535,14 +499,14 @@@ frame_err
+  	dev_kfree_skb(skb);
+  }
+  
+ -static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
+ -			     gfp_t gfp)
+ +static int add_recvbuf_small(struct receive_queue *rq, gfp_t gfp)
+  {
+ +	struct virtnet_info *vi = rq->vq->vdev->priv;
+  	struct sk_buff *skb;
+- 	struct skb_vnet_hdr *hdr;
++ 	struct virtio_net_hdr_mrg_rxbuf *hdr;
+  	int err;
+  
+ -	skb = __netdev_alloc_skb_ip_align(vi->dev, GOOD_PACKET_LEN, gfp);
+ +	skb = __netdev_alloc_skb_ip_align(vi->dev, MAX_PACKET_LEN, gfp);
+  	if (unlikely(!skb))
+  		return -ENOMEM;
+  
+@@@ -578,9 -672,9 +608,9 @@@ static bool try_fill_recv(struct receiv
+  		if (vi->mergeable_rx_bufs)
+  			err = add_recvbuf_mergeable(rq, gfp);
+  		else if (vi->big_packets)
+- 			err = add_recvbuf_big(rq, gfp);
++ 			err = add_recvbuf_big(vi, rq, gfp);
+  		else
+ -			err = add_recvbuf_small(vi, rq, gfp);
+ +			err = add_recvbuf_small(rq, gfp);
+  
+  		oom = err == -ENOMEM;
+  		if (err)
+* Unmerged path drivers/net/virtio_net.c
