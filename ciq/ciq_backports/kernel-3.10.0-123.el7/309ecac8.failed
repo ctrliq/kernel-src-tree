@@ -1,0 +1,187 @@
+xfs: rename xfs_ilock_map_shared
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 309ecac8e7c937c5811ef8f0efc14b3d1bd18775
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/309ecac8.failed
+
+Make it clear that we're only locking against the extent map on the data
+fork.  Also clean the function up a little bit.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Ben Myers <bpm@sgi.com>
+
+(cherry picked from commit 309ecac8e7c937c5811ef8f0efc14b3d1bd18775)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+#	fs/xfs/xfs_inode.h
+diff --cc fs/xfs/xfs_inode.c
+index a18b684cea27,fdd483783365..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -86,24 -88,18 +86,19 @@@ xfs_get_extsz_hint
+   * have been read in yet, and only lock the inode exclusively if they have not.
+   *
+   * The function returns a value which should be given to the corresponding
+ - * xfs_iunlock() call.
+ + * xfs_iunlock_map_shared().  This value is the mode in which the lock was
+ + * actually taken.
+   */
+  uint
+- xfs_ilock_map_shared(
+- 	xfs_inode_t	*ip)
++ xfs_ilock_data_map_shared(
++ 	struct xfs_inode	*ip)
+  {
+- 	uint	lock_mode;
++ 	uint			lock_mode = XFS_ILOCK_SHARED;
+  
+- 	if ((ip->i_d.di_format == XFS_DINODE_FMT_BTREE) &&
+- 	    ((ip->i_df.if_flags & XFS_IFEXTENTS) == 0)) {
++ 	if (ip->i_d.di_format == XFS_DINODE_FMT_BTREE &&
++ 	    (ip->i_df.if_flags & XFS_IFEXTENTS) == 0)
+  		lock_mode = XFS_ILOCK_EXCL;
+- 	} else {
+- 		lock_mode = XFS_ILOCK_SHARED;
+- 	}
+- 
+  	xfs_ilock(ip, lock_mode);
+- 
+  	return lock_mode;
+  }
+  
+@@@ -383,6 -549,49 +378,52 @@@ xfs_dic2xflags
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Lookups up an inode from "name". If ci_name is not NULL, then a CI match
++  * is allowed, otherwise it has to be an exact match. If a CI match is found,
++  * ci_name->name will point to a the actual name (caller must free) or
++  * will be set to NULL if an exact match is found.
++  */
++ int
++ xfs_lookup(
++ 	xfs_inode_t		*dp,
++ 	struct xfs_name		*name,
++ 	xfs_inode_t		**ipp,
++ 	struct xfs_name		*ci_name)
++ {
++ 	xfs_ino_t		inum;
++ 	int			error;
++ 	uint			lock_mode;
++ 
++ 	trace_xfs_lookup(dp, name);
++ 
++ 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
++ 		return XFS_ERROR(EIO);
++ 
++ 	lock_mode = xfs_ilock_data_map_shared(dp);
++ 	error = xfs_dir_lookup(NULL, dp, name, &inum, ci_name);
++ 	xfs_iunlock(dp, lock_mode);
++ 
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_iget(dp->i_mount, NULL, inum, 0, 0, ipp);
++ 	if (error)
++ 		goto out_free_name;
++ 
++ 	return 0;
++ 
++ out_free_name:
++ 	if (ci_name)
++ 		kmem_free(ci_name->name);
++ out:
++ 	*ipp = NULL;
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 309ecac8e7c9 (xfs: rename xfs_ilock_map_shared)
+   * Allocate an inode on disk and return a copy of its in-core version.
+   * The in-core inode is locked exclusively.  Set mode, nlink, and rdev
+   * appropriately within the inode.  The uid and gid for the inode are
+diff --cc fs/xfs/xfs_inode.h
+index 8f775ed722a9,fde368624ea7..000000000000
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@@ -323,8 -337,7 +323,12 @@@ int		xfs_ilock_nowait(xfs_inode_t *, ui
+  void		xfs_iunlock(xfs_inode_t *, uint);
+  void		xfs_ilock_demote(xfs_inode_t *, uint);
+  int		xfs_isilocked(xfs_inode_t *, uint);
+++<<<<<<< HEAD
+ +uint		xfs_ilock_map_shared(xfs_inode_t *);
+ +void		xfs_iunlock_map_shared(xfs_inode_t *, uint);
+++=======
++ uint		xfs_ilock_data_map_shared(struct xfs_inode *);
+++>>>>>>> 309ecac8e7c9 (xfs: rename xfs_ilock_map_shared)
+  int		xfs_ialloc(struct xfs_trans *, xfs_inode_t *, umode_t,
+  			   xfs_nlink_t, xfs_dev_t, prid_t, int,
+  			   struct xfs_buf **, xfs_inode_t **);
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 014a48dacda5..bc2537d95c31 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1226,7 +1226,7 @@ __xfs_get_blocks(
+ 		lockmode = XFS_ILOCK_EXCL;
+ 		xfs_ilock(ip, lockmode);
+ 	} else {
+-		lockmode = xfs_ilock_map_shared(ip);
++		lockmode = xfs_ilock_data_map_shared(ip);
+ 	}
+ 
+ 	ASSERT(offset <= mp->m_super->s_maxbytes);
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index e877b47203d1..e29a063b3bda 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -630,7 +630,7 @@ xfs_getbmap(
+ 		 */
+ 	}
+ 
+-	lock = xfs_ilock_map_shared(ip);
++	lock = xfs_ilock_data_map_shared(ip);
+ 
+ 	/*
+ 	 * Don't let nex be bigger than the number of extents
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 3be477a9f116..55ba881b956e 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -893,7 +893,7 @@ xfs_dir_open(
+ 	 * If there are any blocks, read-ahead block 0 as we're almost
+ 	 * certain to have the next operation be a read there.
+ 	 */
+-	mode = xfs_ilock_map_shared(ip);
++	mode = xfs_ilock_data_map_shared(ip);
+ 	if (ip->i_d.di_nextents > 0)
+ 		xfs_dir3_data_readahead(NULL, ip, 0, -1);
+ 	xfs_iunlock(ip, mode);
+@@ -1198,7 +1198,7 @@ xfs_seek_data(
+ 	uint			lock;
+ 	int			error;
+ 
+-	lock = xfs_ilock_map_shared(ip);
++	lock = xfs_ilock_data_map_shared(ip);
+ 
+ 	isize = i_size_read(inode);
+ 	if (start >= isize) {
+@@ -1303,7 +1303,7 @@ xfs_seek_hole(
+ 	if (XFS_FORCED_SHUTDOWN(mp))
+ 		return -XFS_ERROR(EIO);
+ 
+-	lock = xfs_ilock_map_shared(ip);
++	lock = xfs_ilock_data_map_shared(ip);
+ 
+ 	isize = i_size_read(inode);
+ 	if (start >= isize) {
+* Unmerged path fs/xfs/xfs_inode.c
+* Unmerged path fs/xfs/xfs_inode.h
