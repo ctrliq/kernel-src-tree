@@ -1,0 +1,163 @@
+net: Fix behaviour of unreachable, blackhole and prohibit routes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] fix behaviour of unreachable, blackhole and prohibit routes (Xin Long) [1270662]
+Rebuild_FUZZ: 95.93%
+commit-author Nikola Forró <nforro@redhat.com>
+commit 0315e382704817b279e5693dca8ab9d89aa20b3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0315e382.failed
+
+Man page of ip-route(8) says following about route types:
+
+  unreachable - these destinations are unreachable.  Packets are dis‐
+  carded and the ICMP message host unreachable is generated.  The local
+  senders get an EHOSTUNREACH error.
+
+  blackhole - these destinations are unreachable.  Packets are dis‐
+  carded silently.  The local senders get an EINVAL error.
+
+  prohibit - these destinations are unreachable.  Packets are discarded
+  and the ICMP message communication administratively prohibited is
+  generated.  The local senders get an EACCES error.
+
+In the inet6 address family, this was correct, except the local senders
+got ENETUNREACH error instead of EHOSTUNREACH in case of unreachable route.
+In the inet address family, all three route types generated ICMP message
+net unreachable, and the local senders got ENETUNREACH error.
+
+In both address families all three route types now behave consistently
+with documentation.
+
+	Signed-off-by: Nikola Forró <nforro@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0315e382704817b279e5693dca8ab9d89aa20b3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_fib.h
+#	net/ipv4/route.c
+diff --cc include/net/ip_fib.h
+index 8aa6f829293d,727d6e9a9685..000000000000
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@@ -231,14 -235,12 +231,23 @@@ static inline int fib_lookup(struct ne
+  
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	for (err = 0; !err; err = -ENETUNREACH) {
+ +		tb = fib_get_table(net, RT_TABLE_LOCAL);
+ +		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ +			break;
+ +		tb = fib_get_table(net, RT_TABLE_MAIN);
+ +		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ +			break;
+ +	}
+++=======
++ 	tb = fib_get_table(net, RT_TABLE_MAIN);
++ 	if (tb)
++ 		err = fib_table_lookup(tb, flp, res, flags | FIB_LOOKUP_NOREF);
++ 
++ 	if (err == -EAGAIN)
++ 		err = -ENETUNREACH;
+++>>>>>>> 0315e3827048 (net: Fix behaviour of unreachable, blackhole and prohibit routes)
+  
+  	rcu_read_unlock();
+  
+@@@ -252,34 -254,37 +261,51 @@@ void __net_exit fib4_rules_exit(struct 
+  struct fib_table *fib_new_table(struct net *net, u32 id);
+  struct fib_table *fib_get_table(struct net *net, u32 id);
+  
+ -int __fib_lookup(struct net *net, struct flowi4 *flp,
+ -		 struct fib_result *res, unsigned int flags);
+ +int __fib_lookup(struct net *net, struct flowi4 *flp, struct fib_result *res);
+  
+  static inline int fib_lookup(struct net *net, struct flowi4 *flp,
+ -			     struct fib_result *res, unsigned int flags)
+ +			     struct fib_result *res)
+  {
+  	struct fib_table *tb;
+- 	int err;
++ 	int err = -ENETUNREACH;
+  
+ -	flags |= FIB_LOOKUP_NOREF;
+  	if (net->ipv4.fib_has_custom_rules)
+ -		return __fib_lookup(net, flp, res, flags);
+ +		return __fib_lookup(net, flp, res);
+  
+  	rcu_read_lock();
+  
+  	res->tclassid = 0;
+  
+++<<<<<<< HEAD
+ +	for (err = 0; !err; err = -ENETUNREACH) {
+ +		tb = rcu_dereference_rtnl(net->ipv4.fib_local);
+ +		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ +			break;
+ +
+ +		tb = rcu_dereference_rtnl(net->ipv4.fib_main);
+ +		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ +			break;
+ +
+ +		tb = rcu_dereference_rtnl(net->ipv4.fib_default);
+ +		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ +			break;
+ +	}
+++=======
++ 	tb = rcu_dereference_rtnl(net->ipv4.fib_main);
++ 	if (tb)
++ 		err = fib_table_lookup(tb, flp, res, flags);
++ 
++ 	if (!err)
++ 		goto out;
++ 
++ 	tb = rcu_dereference_rtnl(net->ipv4.fib_default);
++ 	if (tb)
++ 		err = fib_table_lookup(tb, flp, res, flags);
++ 
++ out:
++ 	if (err == -EAGAIN)
++ 		err = -ENETUNREACH;
+++>>>>>>> 0315e3827048 (net: Fix behaviour of unreachable, blackhole and prohibit routes)
+  
+  	rcu_read_unlock();
+  
+diff --cc net/ipv4/route.c
+index bc344977f369,c6ad99ad0ffb..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -2096,7 -2154,8 +2097,12 @@@ struct rtable *__ip_route_output_key(st
+  		goto make_route;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (fib_lookup(net, fl4, &res)) {
+++=======
++ 	err = fib_lookup(net, fl4, &res, 0);
++ 	if (err) {
+++>>>>>>> 0315e3827048 (net: Fix behaviour of unreachable, blackhole and prohibit routes)
+  		res.fi = NULL;
+  		res.table = NULL;
+  		if (fl4->flowi4_oif) {
+* Unmerged path include/net/ip_fib.h
+* Unmerged path net/ipv4/route.c
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index b8667d4711b0..0f0388fdc18d 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1624,9 +1624,11 @@ int ip6_route_add(struct fib6_config *cfg)
+ 			rt->dst.input = ip6_pkt_prohibit;
+ 			break;
+ 		case RTN_THROW:
++		case RTN_UNREACHABLE:
+ 		default:
+ 			rt->dst.error = (cfg->fc_type == RTN_THROW) ? -EAGAIN
+-					: -ENETUNREACH;
++					: (cfg->fc_type == RTN_UNREACHABLE)
++					? -EHOSTUNREACH : -ENETUNREACH;
+ 			rt->dst.output = ip6_pkt_discard_out;
+ 			rt->dst.input = ip6_pkt_discard;
+ 			break;
