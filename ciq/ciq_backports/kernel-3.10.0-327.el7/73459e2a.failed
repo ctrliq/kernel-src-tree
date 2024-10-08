@@ -1,0 +1,240 @@
+x86: pvclock: Really remove the sched notifier for cross-cpu migrations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 73459e2a1ada09a68c02cc5b73f3116fc8194b3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/73459e2a.failed
+
+This reverts commits 0a4e6be9ca17c54817cf814b4b5aa60478c6df27
+and 80f7fdb1c7f0f9266421f823964fd1962681f6ce.
+
+The task migration notifier was originally introduced in order to support
+the pvclock vsyscall with non-synchronized TSC, but KVM only supports it
+with synchronized TSC.  Hence, on KVM the race condition is only needed
+due to a bad implementation on the host side, and even then it's so rare
+that it's mostly theoretical.
+
+As far as KVM is concerned it's possible to fix the host, avoiding the
+additional complexity in the vDSO and the (re)introduction of the task
+migration notifier.
+
+Xen, on the other hand, hasn't yet implemented vsyscall support at
+all, so we do not care about its plans for non-synchronized TSC.
+
+	Reported-by: Peter Zijlstra <peterz@infradead.org>
+	Suggested-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 73459e2a1ada09a68c02cc5b73f3116fc8194b3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 5bf119981e9e,fe22f7510bce..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -994,17 -1012,10 +994,10 @@@ void check_preempt_curr(struct rq *rq, 
+  	 * A queue event has occurred, and we're going to schedule.  In
+  	 * this case, we can save a useless back to back clock update.
+  	 */
+ -	if (task_on_rq_queued(rq->curr) && test_tsk_need_resched(rq->curr))
+ -		rq_clock_skip_update(rq, true);
+ +	if (rq->curr->on_rq && test_tsk_need_resched(rq->curr))
+ +		rq->skip_clock_update = 1;
+  }
+  
+- static ATOMIC_NOTIFIER_HEAD(task_migration_notifier);
+- 
+- void register_task_migration_notifier(struct notifier_block *n)
+- {
+- 	atomic_notifier_chain_register(&task_migration_notifier, n);
+- }
+- 
+  #ifdef CONFIG_SMP
+  void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+  {
+@@@ -1038,15 -1049,7 +1031,17 @@@
+  		if (p->sched_class->migrate_task_rq)
+  			p->sched_class->migrate_task_rq(p, new_cpu);
+  		p->se.nr_migrations++;
+++<<<<<<< HEAD
+ +		perf_sw_event(PERF_COUNT_SW_CPU_MIGRATIONS, 1, NULL, 0);
+ +
+ +		tmn.task = p;
+ +		tmn.from_cpu = task_cpu(p);
+ +		tmn.to_cpu = new_cpu;
+ +
+ +		atomic_notifier_call_chain(&task_migration_notifier, 0, &tmn);
+++=======
++ 		perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
+++>>>>>>> 73459e2a1ada (x86: pvclock: Really remove the sched notifier for cross-cpu migrations)
+  	}
+  
+  	__set_task_cpu(p, new_cpu);
+diff --git a/arch/x86/include/asm/pvclock.h b/arch/x86/include/asm/pvclock.h
+index 25b1cc07d496..d6b078e9fa28 100644
+--- a/arch/x86/include/asm/pvclock.h
++++ b/arch/x86/include/asm/pvclock.h
+@@ -95,7 +95,6 @@ unsigned __pvclock_read_cycles(const struct pvclock_vcpu_time_info *src,
+ 
+ struct pvclock_vsyscall_time_info {
+ 	struct pvclock_vcpu_time_info pvti;
+-	u32 migrate_count;
+ } __attribute__((__aligned__(SMP_CACHE_BYTES)));
+ 
+ #define PVTI_SIZE sizeof(struct pvclock_vsyscall_time_info)
+diff --git a/arch/x86/kernel/pvclock.c b/arch/x86/kernel/pvclock.c
+index e5ecd20e72dd..2f355d229a58 100644
+--- a/arch/x86/kernel/pvclock.c
++++ b/arch/x86/kernel/pvclock.c
+@@ -141,46 +141,7 @@ void pvclock_read_wallclock(struct pvclock_wall_clock *wall_clock,
+ 	set_normalized_timespec(ts, now.tv_sec, now.tv_nsec);
+ }
+ 
+-static struct pvclock_vsyscall_time_info *pvclock_vdso_info;
+-
+-static struct pvclock_vsyscall_time_info *
+-pvclock_get_vsyscall_user_time_info(int cpu)
+-{
+-	if (!pvclock_vdso_info) {
+-		BUG();
+-		return NULL;
+-	}
+-
+-	return &pvclock_vdso_info[cpu];
+-}
+-
+-struct pvclock_vcpu_time_info *pvclock_get_vsyscall_time_info(int cpu)
+-{
+-	return &pvclock_get_vsyscall_user_time_info(cpu)->pvti;
+-}
+-
+ #ifdef CONFIG_X86_64
+-static int pvclock_task_migrate(struct notifier_block *nb, unsigned long l,
+-			        void *v)
+-{
+-	struct task_migration_notifier *mn = v;
+-	struct pvclock_vsyscall_time_info *pvti;
+-
+-	pvti = pvclock_get_vsyscall_user_time_info(mn->from_cpu);
+-
+-	/* this is NULL when pvclock vsyscall is not initialized */
+-	if (unlikely(pvti == NULL))
+-		return NOTIFY_DONE;
+-
+-	pvti->migrate_count++;
+-
+-	return NOTIFY_DONE;
+-}
+-
+-static struct notifier_block pvclock_migrate = {
+-	.notifier_call = pvclock_task_migrate,
+-};
+-
+ /*
+  * Initialize the generic pvclock vsyscall state.  This will allocate
+  * a/some page(s) for the per-vcpu pvclock information, set up a
+@@ -194,17 +155,12 @@ int __init pvclock_init_vsyscall(struct pvclock_vsyscall_time_info *i,
+ 
+ 	WARN_ON (size != PVCLOCK_VSYSCALL_NR_PAGES*PAGE_SIZE);
+ 
+-	pvclock_vdso_info = i;
+-
+ 	for (idx = 0; idx <= (PVCLOCK_FIXMAP_END-PVCLOCK_FIXMAP_BEGIN); idx++) {
+ 		__set_fixmap(PVCLOCK_FIXMAP_BEGIN + idx,
+ 			     __pa(i) + (idx*PAGE_SIZE),
+ 			     PAGE_KERNEL_VVAR);
+ 	}
+ 
+-
+-	register_task_migration_notifier(&pvclock_migrate);
+-
+ 	return 0;
+ }
+ #endif
+diff --git a/arch/x86/vdso/vclock_gettime.c b/arch/x86/vdso/vclock_gettime.c
+index e298190f05b9..72074d528400 100644
+--- a/arch/x86/vdso/vclock_gettime.c
++++ b/arch/x86/vdso/vclock_gettime.c
+@@ -85,15 +85,18 @@ static notrace cycle_t vread_pvclock(int *mode)
+ 	cycle_t ret;
+ 	u64 last;
+ 	u32 version;
+-	u32 migrate_count;
+ 	u8 flags;
+ 	unsigned cpu, cpu1;
+ 
+ 
+ 	/*
+-	 * When looping to get a consistent (time-info, tsc) pair, we
+-	 * also need to deal with the possibility we can switch vcpus,
+-	 * so make sure we always re-fetch time-info for the current vcpu.
++	 * Note: hypervisor must guarantee that:
++	 * 1. cpu ID number maps 1:1 to per-CPU pvclock time info.
++	 * 2. that per-CPU pvclock time info is updated if the
++	 *    underlying CPU changes.
++	 * 3. that version is increased whenever underlying CPU
++	 *    changes.
++	 *
+ 	 */
+ 	do {
+ 		cpu = __getcpu() & VGETCPU_CPU_MASK;
+@@ -102,27 +105,20 @@ static notrace cycle_t vread_pvclock(int *mode)
+ 		 * __getcpu() calls (Gleb).
+ 		 */
+ 
+-		/* Make sure migrate_count will change if we leave the VCPU. */
+-		do {
+-			pvti = get_pvti(cpu);
+-			migrate_count = pvti->migrate_count;
+-
+-			cpu1 = cpu;
+-			cpu = __getcpu() & VGETCPU_CPU_MASK;
+-		} while (unlikely(cpu != cpu1));
++		pvti = get_pvti(cpu);
+ 
+ 		version = __pvclock_read_cycles(&pvti->pvti, &ret, &flags);
+ 
+ 		/*
+ 		 * Test we're still on the cpu as well as the version.
+-		 * - We must read TSC of pvti's VCPU.
+-		 * - KVM doesn't follow the versioning protocol, so data could
+-		 *   change before version if we left the VCPU.
++		 * We could have been migrated just after the first
++		 * vgetcpu but before fetching the version, so we
++		 * wouldn't notice a version change.
+ 		 */
+-		smp_rmb();
+-	} while (unlikely((pvti->pvti.version & 1) ||
+-			  pvti->pvti.version != version ||
+-			  pvti->migrate_count != migrate_count));
++		cpu1 = __getcpu() & VGETCPU_CPU_MASK;
++	} while (unlikely(cpu != cpu1 ||
++			  (pvti->pvti.version & 1) ||
++			  pvti->pvti.version != version));
+ 
+ 	if (unlikely(!(flags & PVCLOCK_TSC_STABLE_BIT)))
+ 		*mode = VCLOCK_NONE;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 83644643f4da..c38544115745 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -108,14 +108,6 @@ extern unsigned long this_cpu_load(void);
+ extern void calc_global_load(unsigned long ticks);
+ extern void update_cpu_load_nohz(void);
+ 
+-/* Notifier for when a task gets migrated to a new CPU */
+-struct task_migration_notifier {
+-	struct task_struct *task;
+-	int from_cpu;
+-	int to_cpu;
+-};
+-extern void register_task_migration_notifier(struct notifier_block *n);
+-
+ extern unsigned long get_parent_ip(unsigned long addr);
+ 
+ extern void dump_cpu_task(int cpu);
+* Unmerged path kernel/sched/core.c
