@@ -1,0 +1,167 @@
+slub: add support for kmem_cache_debug in bulk calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 3eed034d045ce93a40e232a6bd5f86127342053a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3eed034d.failed
+
+Per request of Joonsoo Kim adding kmem debug support.
+
+I've tested that when debugging is disabled, then there is almost no
+performance impact as this code basically gets removed by the compiler.
+
+Need some guidance in enabling and testing this.
+
+bulk- PREVIOUS                  - THIS-PATCH
+  1 -  43 cycles(tsc) 10.811 ns -  44 cycles(tsc) 11.236 ns  improved  -2.3%
+  2 -  27 cycles(tsc)  6.867 ns -  28 cycles(tsc)  7.019 ns  improved  -3.7%
+  3 -  21 cycles(tsc)  5.496 ns -  22 cycles(tsc)  5.526 ns  improved  -4.8%
+  4 -  24 cycles(tsc)  6.038 ns -  19 cycles(tsc)  4.786 ns  improved  20.8%
+  8 -  17 cycles(tsc)  4.280 ns -  18 cycles(tsc)  4.572 ns  improved  -5.9%
+ 16 -  17 cycles(tsc)  4.483 ns -  18 cycles(tsc)  4.658 ns  improved  -5.9%
+ 30 -  18 cycles(tsc)  4.531 ns -  18 cycles(tsc)  4.568 ns  improved   0.0%
+ 32 -  58 cycles(tsc) 14.586 ns -  65 cycles(tsc) 16.454 ns  improved -12.1%
+ 34 -  53 cycles(tsc) 13.391 ns -  63 cycles(tsc) 15.932 ns  improved -18.9%
+ 48 -  65 cycles(tsc) 16.268 ns -  50 cycles(tsc) 12.506 ns  improved  23.1%
+ 64 -  53 cycles(tsc) 13.440 ns -  63 cycles(tsc) 15.929 ns  improved -18.9%
+128 -  79 cycles(tsc) 19.899 ns -  86 cycles(tsc) 21.583 ns  improved  -8.9%
+158 -  90 cycles(tsc) 22.732 ns -  90 cycles(tsc) 22.552 ns  improved   0.0%
+250 -  95 cycles(tsc) 23.916 ns -  98 cycles(tsc) 24.589 ns  improved  -3.2%
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3eed034d045ce93a40e232a6bd5f86127342053a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 9bb60eec298f,48bdb4e5a985..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2659,6 -2750,113 +2659,116 @@@ void kmem_cache_free(struct kmem_cache 
+  }
+  EXPORT_SYMBOL(kmem_cache_free);
+  
+++<<<<<<< HEAD
+++=======
++ /* Note that interrupts must be enabled when calling this function. */
++ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++ {
++ 	struct kmem_cache_cpu *c;
++ 	struct page *page;
++ 	int i;
++ 
++ 	local_irq_disable();
++ 	c = this_cpu_ptr(s->cpu_slab);
++ 
++ 	for (i = 0; i < size; i++) {
++ 		void *object = p[i];
++ 
++ 		BUG_ON(!object);
++ 		/* kmem cache debug support */
++ 		s = cache_from_obj(s, object);
++ 		if (unlikely(!s))
++ 			goto exit;
++ 		slab_free_hook(s, object);
++ 
++ 		page = virt_to_head_page(object);
++ 
++ 		if (c->page == page) {
++ 			/* Fastpath: local CPU free */
++ 			set_freepointer(s, object, c->freelist);
++ 			c->freelist = object;
++ 		} else {
++ 			c->tid = next_tid(c->tid);
++ 			local_irq_enable();
++ 			/* Slowpath: overhead locked cmpxchg_double_slab */
++ 			__slab_free(s, page, object, _RET_IP_);
++ 			local_irq_disable();
++ 			c = this_cpu_ptr(s->cpu_slab);
++ 		}
++ 	}
++ exit:
++ 	c->tid = next_tid(c->tid);
++ 	local_irq_enable();
++ }
++ EXPORT_SYMBOL(kmem_cache_free_bulk);
++ 
++ /* Note that interrupts must be enabled when calling this function. */
++ bool kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++ 			   void **p)
++ {
++ 	struct kmem_cache_cpu *c;
++ 	int i;
++ 
++ 	/*
++ 	 * Drain objects in the per cpu slab, while disabling local
++ 	 * IRQs, which protects against PREEMPT and interrupts
++ 	 * handlers invoking normal fastpath.
++ 	 */
++ 	local_irq_disable();
++ 	c = this_cpu_ptr(s->cpu_slab);
++ 
++ 	for (i = 0; i < size; i++) {
++ 		void *object = c->freelist;
++ 
++ 		if (unlikely(!object)) {
++ 			local_irq_enable();
++ 			/*
++ 			 * Invoking slow path likely have side-effect
++ 			 * of re-populating per CPU c->freelist
++ 			 */
++ 			p[i] = __slab_alloc(s, flags, NUMA_NO_NODE,
++ 					    _RET_IP_, c);
++ 			if (unlikely(!p[i])) {
++ 				__kmem_cache_free_bulk(s, i, p);
++ 				return false;
++ 			}
++ 			local_irq_disable();
++ 			c = this_cpu_ptr(s->cpu_slab);
++ 			continue; /* goto for-loop */
++ 		}
++ 
++ 		/* kmem_cache debug support */
++ 		s = slab_pre_alloc_hook(s, flags);
++ 		if (unlikely(!s)) {
++ 			__kmem_cache_free_bulk(s, i, p);
++ 			c->tid = next_tid(c->tid);
++ 			local_irq_enable();
++ 			return false;
++ 		}
++ 
++ 		c->freelist = get_freepointer(s, object);
++ 		p[i] = object;
++ 
++ 		/* kmem_cache debug support */
++ 		slab_post_alloc_hook(s, flags, object);
++ 	}
++ 	c->tid = next_tid(c->tid);
++ 	local_irq_enable();
++ 
++ 	/* Clear memory outside IRQ disabled fastpath loop */
++ 	if (unlikely(flags & __GFP_ZERO)) {
++ 		int j;
++ 
++ 		for (j = 0; j < i; j++)
++ 			memset(p[j], 0, s->object_size);
++ 	}
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++ 
++ 
+++>>>>>>> 3eed034d045c (slub: add support for kmem_cache_debug in bulk calls)
+  /*
+   * Object placement in a slab is made very easy because we always start at
+   * offset 0. If we tune the size of the object to the alignment then we can
+* Unmerged path mm/slub.c
