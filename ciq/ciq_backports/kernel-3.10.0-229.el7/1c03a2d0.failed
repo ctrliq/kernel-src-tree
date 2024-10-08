@@ -1,0 +1,457 @@
+cpufreq: add support for intermediate (stable) frequencies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] add support for intermediate (stable) frequencies (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 91.59%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 1c03a2d04d7ab6d27c1fef8614f08187d974bd21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1c03a2d0.failed
+
+Douglas Anderson, recently pointed out an interesting problem due to which
+udelay() was expiring earlier than it should.
+
+While transitioning between frequencies few platforms may temporarily switch to
+a stable frequency, waiting for the main PLL to stabilize.
+
+For example: When we transition between very low frequencies on exynos, like
+between 200MHz and 300MHz, we may temporarily switch to a PLL running at 800MHz.
+No CPUFREQ notification is sent for that. That means there's a period of time
+when we're running at 800MHz but loops_per_jiffy is calibrated at between 200MHz
+and 300MHz. And so udelay behaves badly.
+
+To get this fixed in a generic way, introduce another set of callbacks
+get_intermediate() and target_intermediate(), only for drivers with
+target_index() and CPUFREQ_ASYNC_NOTIFICATION unset.
+
+get_intermediate() should return a stable intermediate frequency platform wants
+to switch to, and target_intermediate() should set CPU to that frequency,
+before jumping to the frequency corresponding to 'index'. Core will take care of
+sending notifications and driver doesn't have to handle them in
+target_intermediate() or target_index().
+
+NOTE: ->target_index() should restore to policy->restore_freq in case of
+failures as core would send notifications for that.
+
+	Tested-by: Stephen Warren <swarren@nvidia.com>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Doug Anderson <dianders@chromium.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1c03a2d04d7ab6d27c1fef8614f08187d974bd21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/cpu-freq/cpu-drivers.txt
+#	drivers/cpufreq/cpufreq.c
+#	include/linux/cpufreq.h
+diff --cc Documentation/cpu-freq/cpu-drivers.txt
+index b076f3dcf6da,14f4e6336d88..000000000000
+--- a/Documentation/cpu-freq/cpu-drivers.txt
++++ b/Documentation/cpu-freq/cpu-drivers.txt
+@@@ -23,9 -23,10 +23,10 @@@ Contents
+  1.1  Initialization
+  1.2  Per-CPU Initialization
+  1.3  verify
+ -1.4  target/target_index or setpolicy?
+ -1.5  target/target_index
+ +1.4  target or setpolicy?
+ +1.5  target
+  1.6  setpolicy
++ 1.7  get_intermediate and target_intermediate
+  2.   Frequency Table Helpers
+  
+  
+@@@ -146,9 -156,20 +151,26 @@@ Some cpufreq-capable processors switch 
+  limits on their own. These shall use the ->setpolicy call
+  
+  
+++<<<<<<< HEAD
+ +1.4. target
+ +-------------
+ +
+++=======
++ 1.5. target/target_index
++ -------------
++ 
++ The target_index call has two arguments: struct cpufreq_policy *policy,
++ and unsigned int index (into the exposed frequency table).
++ 
++ The CPUfreq driver must set the new frequency when called here. The
++ actual frequency must be determined by freq_table[index].frequency.
++ 
++ It should always restore to earlier frequency (i.e. policy->restore_freq) in
++ case of errors, even if we switched to intermediate frequency earlier.
++ 
++ Deprecated:
++ ----------
+++>>>>>>> 1c03a2d04d7a (cpufreq: add support for intermediate (stable) frequencies)
+  The target call has three arguments: struct cpufreq_policy *policy,
+  unsigned int target_frequency, unsigned int relation.
+  
+diff --cc drivers/cpufreq/cpufreq.c
+index a029f5bcbc1e,aed2b0cb83dc..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1595,6 -1816,86 +1595,89 @@@ EXPORT_SYMBOL(cpufreq_unregister_notifi
+   *                              GOVERNORS                            *
+   *********************************************************************/
+  
+++<<<<<<< HEAD
+++=======
++ /* Must set freqs->new to intermediate frequency */
++ static int __target_intermediate(struct cpufreq_policy *policy,
++ 				 struct cpufreq_freqs *freqs, int index)
++ {
++ 	int ret;
++ 
++ 	freqs->new = cpufreq_driver->get_intermediate(policy, index);
++ 
++ 	/* We don't need to switch to intermediate freq */
++ 	if (!freqs->new)
++ 		return 0;
++ 
++ 	pr_debug("%s: cpu: %d, switching to intermediate freq: oldfreq: %u, intermediate freq: %u\n",
++ 		 __func__, policy->cpu, freqs->old, freqs->new);
++ 
++ 	cpufreq_freq_transition_begin(policy, freqs);
++ 	ret = cpufreq_driver->target_intermediate(policy, index);
++ 	cpufreq_freq_transition_end(policy, freqs, ret);
++ 
++ 	if (ret)
++ 		pr_err("%s: Failed to change to intermediate frequency: %d\n",
++ 		       __func__, ret);
++ 
++ 	return ret;
++ }
++ 
++ static int __target_index(struct cpufreq_policy *policy,
++ 			  struct cpufreq_frequency_table *freq_table, int index)
++ {
++ 	struct cpufreq_freqs freqs = {.old = policy->cur, .flags = 0};
++ 	unsigned int intermediate_freq = 0;
++ 	int retval = -EINVAL;
++ 	bool notify;
++ 
++ 	notify = !(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION);
++ 	if (notify) {
++ 		/* Handle switching to intermediate frequency */
++ 		if (cpufreq_driver->get_intermediate) {
++ 			retval = __target_intermediate(policy, &freqs, index);
++ 			if (retval)
++ 				return retval;
++ 
++ 			intermediate_freq = freqs.new;
++ 			/* Set old freq to intermediate */
++ 			if (intermediate_freq)
++ 				freqs.old = freqs.new;
++ 		}
++ 
++ 		freqs.new = freq_table[index].frequency;
++ 		pr_debug("%s: cpu: %d, oldfreq: %u, new freq: %u\n",
++ 			 __func__, policy->cpu, freqs.old, freqs.new);
++ 
++ 		cpufreq_freq_transition_begin(policy, &freqs);
++ 	}
++ 
++ 	retval = cpufreq_driver->target_index(policy, index);
++ 	if (retval)
++ 		pr_err("%s: Failed to change cpu frequency: %d\n", __func__,
++ 		       retval);
++ 
++ 	if (notify) {
++ 		cpufreq_freq_transition_end(policy, &freqs, retval);
++ 
++ 		/*
++ 		 * Failed after setting to intermediate freq? Driver should have
++ 		 * reverted back to initial frequency and so should we. Check
++ 		 * here for intermediate_freq instead of get_intermediate, in
++ 		 * case we have't switched to intermediate freq at all.
++ 		 */
++ 		if (unlikely(retval && intermediate_freq)) {
++ 			freqs.old = intermediate_freq;
++ 			freqs.new = policy->restore_freq;
++ 			cpufreq_freq_transition_begin(policy, &freqs);
++ 			cpufreq_freq_transition_end(policy, &freqs, 0);
++ 		}
++ 	}
++ 
++ 	return retval;
++ }
++ 
+++>>>>>>> 1c03a2d04d7a (cpufreq: add support for intermediate (stable) frequencies)
+  int __cpufreq_driver_target(struct cpufreq_policy *policy,
+  			    unsigned int target_freq,
+  			    unsigned int relation)
+@@@ -1619,9 -1918,43 +1702,12 @@@
+  	if (target_freq == policy->cur)
+  		return 0;
+  
++ 	/* Save last value to restore later on errors */
++ 	policy->restore_freq = policy->cur;
++ 
+  	if (cpufreq_driver->target)
+  		retval = cpufreq_driver->target(policy, target_freq, relation);
+ -	else if (cpufreq_driver->target_index) {
+ -		struct cpufreq_frequency_table *freq_table;
+ -		int index;
+  
+ -		freq_table = cpufreq_frequency_get_table(policy->cpu);
+ -		if (unlikely(!freq_table)) {
+ -			pr_err("%s: Unable to find freq_table\n", __func__);
+ -			goto out;
+ -		}
+ -
+ -		retval = cpufreq_frequency_table_target(policy, freq_table,
+ -				target_freq, relation, &index);
+ -		if (unlikely(retval)) {
+ -			pr_err("%s: Unable to find matching freq\n", __func__);
+ -			goto out;
+ -		}
+ -
+ -		if (freq_table[index].frequency == policy->cur) {
+ -			retval = 0;
+ -			goto out;
+ -		}
+ -
+ -		retval = __target_index(policy, freq_table, index);
+ -	}
+ -
+ -out:
+  	return retval;
+  }
+  EXPORT_SYMBOL_GPL(__cpufreq_driver_target);
+@@@ -2024,7 -2410,11 +2110,15 @@@ int cpufreq_register_driver(struct cpuf
+  		return -ENODEV;
+  
+  	if (!driver_data || !driver_data->verify || !driver_data->init ||
+++<<<<<<< HEAD
+ +	    ((!driver_data->setpolicy) && (!driver_data->target)))
+++=======
++ 	    !(driver_data->setpolicy || driver_data->target_index ||
++ 		    driver_data->target) ||
++ 	     (driver_data->setpolicy && (driver_data->target_index ||
++ 		    driver_data->target)) ||
++ 	     (!!driver_data->get_intermediate != !!driver_data->target_intermediate))
+++>>>>>>> 1c03a2d04d7a (cpufreq: add support for intermediate (stable) frequencies)
+  		return -EINVAL;
+  
+  	pr_debug("trying to register driver %s\n", driver_data->name);
+diff --cc include/linux/cpufreq.h
+index 3972fb457f19,ec4112d257bc..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -102,6 -75,9 +102,12 @@@ struct cpufreq_policy 
+  	unsigned int		max;    /* in kHz */
+  	unsigned int		cur;    /* in kHz, only needed if cpufreq
+  					 * governors are used */
+++<<<<<<< HEAD
+++=======
++ 	unsigned int		restore_freq; /* = policy->cur before transition */
++ 	unsigned int		suspend_freq; /* freq to set during suspend */
++ 
+++>>>>>>> 1c03a2d04d7a (cpufreq: add support for intermediate (stable) frequencies)
+  	unsigned int		policy; /* see above */
+  	struct cpufreq_governor	*governor; /* see below */
+  	void			*governor_data;
+@@@ -331,39 -211,168 +337,138 @@@ __ATTR(_name, 0444, show_##_name, NULL
+  static struct global_attr _name =		\
+  __ATTR(_name, 0644, show_##_name, store_##_name)
+  
+++<<<<<<< HEAD
+ +struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu);
+ +void cpufreq_cpu_put(struct cpufreq_policy *data);
+++=======
++ 
++ struct cpufreq_driver {
++ 	char			name[CPUFREQ_NAME_LEN];
++ 	u8			flags;
++ 
++ 	/* needed by all drivers */
++ 	int	(*init)		(struct cpufreq_policy *policy);
++ 	int	(*verify)	(struct cpufreq_policy *policy);
++ 
++ 	/* define one out of two */
++ 	int	(*setpolicy)	(struct cpufreq_policy *policy);
++ 
++ 	/*
++ 	 * On failure, should always restore frequency to policy->restore_freq
++ 	 * (i.e. old freq).
++ 	 */
++ 	int	(*target)	(struct cpufreq_policy *policy,	/* Deprecated */
++ 				 unsigned int target_freq,
++ 				 unsigned int relation);
++ 	int	(*target_index)	(struct cpufreq_policy *policy,
++ 				 unsigned int index);
++ 	/*
++ 	 * Only for drivers with target_index() and CPUFREQ_ASYNC_NOTIFICATION
++ 	 * unset.
++ 	 *
++ 	 * get_intermediate should return a stable intermediate frequency
++ 	 * platform wants to switch to and target_intermediate() should set CPU
++ 	 * to to that frequency, before jumping to the frequency corresponding
++ 	 * to 'index'. Core will take care of sending notifications and driver
++ 	 * doesn't have to handle them in target_intermediate() or
++ 	 * target_index().
++ 	 *
++ 	 * Drivers can return '0' from get_intermediate() in case they don't
++ 	 * wish to switch to intermediate frequency for some target frequency.
++ 	 * In that case core will directly call ->target_index().
++ 	 */
++ 	unsigned int (*get_intermediate)(struct cpufreq_policy *policy,
++ 					 unsigned int index);
++ 	int	(*target_intermediate)(struct cpufreq_policy *policy,
++ 				       unsigned int index);
++ 
++ 	/* should be defined, if possible */
++ 	unsigned int	(*get)	(unsigned int cpu);
++ 
++ 	/* optional */
++ 	int	(*bios_limit)	(int cpu, unsigned int *limit);
++ 
++ 	int	(*exit)		(struct cpufreq_policy *policy);
++ 	void	(*stop_cpu)	(struct cpufreq_policy *policy);
++ 	int	(*suspend)	(struct cpufreq_policy *policy);
++ 	int	(*resume)	(struct cpufreq_policy *policy);
++ 	struct freq_attr	**attr;
++ 
++ 	/* platform specific boost support code */
++ 	bool                    boost_supported;
++ 	bool                    boost_enabled;
++ 	int     (*set_boost)    (int state);
++ };
++ 
++ /* flags */
++ #define CPUFREQ_STICKY		(1 << 0)	/* driver isn't removed even if
++ 						   all ->init() calls failed */
++ #define CPUFREQ_CONST_LOOPS	(1 << 1)	/* loops_per_jiffy or other
++ 						   kernel "constants" aren't
++ 						   affected by frequency
++ 						   transitions */
++ #define CPUFREQ_PM_NO_WARN	(1 << 2)	/* don't warn on suspend/resume
++ 						   speed mismatches */
++ 
++ /*
++  * This should be set by platforms having multiple clock-domains, i.e.
++  * supporting multiple policies. With this sysfs directories of governor would
++  * be created in cpu/cpu<num>/cpufreq/ directory and so they can use the same
++  * governor with different tunables for different clusters.
++  */
++ #define CPUFREQ_HAVE_GOVERNOR_PER_POLICY (1 << 3)
++ 
++ /*
++  * Driver will do POSTCHANGE notifications from outside of their ->target()
++  * routine and so must set cpufreq_driver->flags with this flag, so that core
++  * can handle them specially.
++  */
++ #define CPUFREQ_ASYNC_NOTIFICATION  (1 << 4)
++ 
++ /*
++  * Set by drivers which want cpufreq core to check if CPU is running at a
++  * frequency present in freq-table exposed by the driver. For these drivers if
++  * CPU is found running at an out of table freq, we will try to set it to a freq
++  * from the table. And if that fails, we will stop further boot process by
++  * issuing a BUG_ON().
++  */
++ #define CPUFREQ_NEED_INITIAL_FREQ_CHECK	(1 << 5)
++ 
++ int cpufreq_register_driver(struct cpufreq_driver *driver_data);
++ int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
++ 
+++>>>>>>> 1c03a2d04d7a (cpufreq: add support for intermediate (stable) frequencies)
+  const char *cpufreq_get_current_driver(void);
+  
+ -static inline void cpufreq_verify_within_limits(struct cpufreq_policy *policy,
+ -		unsigned int min, unsigned int max)
+ -{
+ -	if (policy->min < min)
+ -		policy->min = min;
+ -	if (policy->max < min)
+ -		policy->max = min;
+ -	if (policy->min > max)
+ -		policy->min = max;
+ -	if (policy->max > max)
+ -		policy->max = max;
+ -	if (policy->min > policy->max)
+ -		policy->min = policy->max;
+ -	return;
+ -}
+ -
+ -static inline void
+ -cpufreq_verify_within_cpu_limits(struct cpufreq_policy *policy)
+ -{
+ -	cpufreq_verify_within_limits(policy, policy->cpuinfo.min_freq,
+ -			policy->cpuinfo.max_freq);
+ -}
+ +/*********************************************************************
+ + *                        CPUFREQ 2.6. INTERFACE                     *
+ + *********************************************************************/
+ +u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
+ +int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
+ +int cpufreq_update_policy(unsigned int cpu);
+ +bool have_governor_per_policy(void);
+ +struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+  
+  #ifdef CONFIG_CPU_FREQ
+ -void cpufreq_suspend(void);
+ -void cpufreq_resume(void);
+ -int cpufreq_generic_suspend(struct cpufreq_policy *policy);
+ +/*
+ + * query the current CPU frequency (in kHz). If zero, cpufreq couldn't detect it
+ + */
+ +unsigned int cpufreq_get(unsigned int cpu);
+  #else
+ -static inline void cpufreq_suspend(void) {}
+ -static inline void cpufreq_resume(void) {}
+ +static inline unsigned int cpufreq_get(unsigned int cpu)
+ +{
+ +	return 0;
+ +}
+  #endif
+  
+ -/*********************************************************************
+ - *                     CPUFREQ NOTIFIER INTERFACE                    *
+ - *********************************************************************/
+ -
+ -#define CPUFREQ_TRANSITION_NOTIFIER	(0)
+ -#define CPUFREQ_POLICY_NOTIFIER		(1)
+ -
+ -/* Transition notifiers */
+ -#define CPUFREQ_PRECHANGE		(0)
+ -#define CPUFREQ_POSTCHANGE		(1)
+ -
+ -/* Policy Notifiers  */
+ -#define CPUFREQ_ADJUST			(0)
+ -#define CPUFREQ_INCOMPATIBLE		(1)
+ -#define CPUFREQ_NOTIFY			(2)
+ -#define CPUFREQ_START			(3)
+ -#define CPUFREQ_UPDATE_POLICY_CPU	(4)
+ -#define CPUFREQ_CREATE_POLICY		(5)
+ -#define CPUFREQ_REMOVE_POLICY		(6)
+ -
+ +/*
+ + * query the last known CPU freq (in kHz). If zero, cpufreq couldn't detect it
+ + */
+  #ifdef CONFIG_CPU_FREQ
+ -int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list);
+ -int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list);
+ -
+ -void cpufreq_freq_transition_begin(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs);
+ -void cpufreq_freq_transition_end(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs, int transition_failed);
+ -
+ -#else /* CONFIG_CPU_FREQ */
+ -static inline int cpufreq_register_notifier(struct notifier_block *nb,
+ -						unsigned int list)
+ +unsigned int cpufreq_quick_get(unsigned int cpu);
+ +unsigned int cpufreq_quick_get_max(unsigned int cpu);
+ +#else
+ +static inline unsigned int cpufreq_quick_get(unsigned int cpu)
+  {
+  	return 0;
+  }
+* Unmerged path Documentation/cpu-freq/cpu-drivers.txt
+* Unmerged path drivers/cpufreq/cpufreq.c
+* Unmerged path include/linux/cpufreq.h
