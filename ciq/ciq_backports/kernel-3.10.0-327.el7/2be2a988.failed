@@ -1,0 +1,126 @@
+megaraid_sas : Modify return value of megasas_issue_blocked_cmd() and wait_and_poll() to consider command status returned by firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: Modify return value of megasas_issue_blocked_cmd() and wait_and_poll() to consider command status returned by firmware (Tomas Henzl) [1207092]
+Rebuild_FUZZ: 99.62%
+commit-author Sumit.Saxena@avagotech.com <Sumit.Saxena@avagotech.com>
+commit 2be2a98845e6742a96d48534294d2c5ba582e57f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2be2a988.failed
+
+This patch is rebased on top of recently sent 18 patches(submitted by me) for
+megaraid_sas driver.
+
+Change the return value of wait_and_poll() and megsas_issue_blocked_cmd()
+based on MFI_STAT returned by firmware for that command. Earlier driver always
+send return type based on command completion (but never check MFI_STAT_OK for
+that command), so even if command is failed by firmware still driver will
+return SUCCESS status from these functions wait_and_poll() and
+megsas_issue_blocked_cmd() and if caller of these functions does not check
+command status (MFI_STAT), then it may endup using invalid data returned in
+DMA buffers(one of the example is megasas_ld_list_query DCMD). Best thing to
+avoid this type of issue is do error handling and set proper return type from
+caller function wait_and_poll() and megsas_issue_blocked_cmd().
+
+The change proposed in this patch will fix the regression introduced in patch-
+"90dc9d9 megaraid_sas : MFI MPT linked list corruption fix" inside function
+megasas_ld_list_query().  Prior to this MFI MPT linked list corruption fix
+patch, megasas_ld_list_query() function used to check DCMD status(returned by
+firmware) but with this linked list corruption fix patch, DCMD status will not
+be checked inside function megasas_ld_list_query() and introduced this issue
+of wrong data being used by function megasas_ld_list_query().
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 2be2a98845e6742a96d48534294d2c5ba582e57f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index c10b601d153c,a022c39153cf..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -952,9 -940,8 +952,9 @@@ megasas_issue_blocked_cmd(struct megasa
+  			  struct megasas_cmd *cmd, int timeout)
+  {
+  	int ret = 0;
+- 	cmd->cmd_status = ENODATA;
++ 	cmd->cmd_status_drv = MFI_STAT_INVALID_STATUS;
+  
+ +	cmd->is_wait_event = 1;
+  	instance->instancet->issue_dcmd(instance, cmd);
+  	if (timeout) {
+  		ret = wait_event_timeout(instance->int_cmd_wait_q,
+@@@ -2225,24 -2203,18 +2226,27 @@@ int megasas_sriov_start_heartbeat(struc
+  	printk(KERN_WARNING "megasas: SR-IOV: Starting heartbeat for scsi%d\n",
+  	       instance->host->host_no);
+  
+++<<<<<<< HEAD
+ +	if (!megasas_issue_polled(instance, cmd)) {
+ +		retval = 0;
+ +	} else {
+ +		printk(KERN_WARNING "megasas: SR-IOV: MR_DCMD_CTRL_SHARED_HOST"
+ +		       "_MEM_ALLOC DCMD timed out for scsi%d\n",
+ +		       instance->host->host_no);
+++=======
++ 	if (instance->ctrl_context && !instance->mask_interrupts)
++ 		retval = megasas_issue_blocked_cmd(instance, cmd,
++ 			MEGASAS_ROUTINE_WAIT_TIME_VF);
++ 	else
++ 		retval = megasas_issue_polled(instance, cmd);
++ 
++ 	if (retval) {
++ 		dev_warn(&instance->pdev->dev, "SR-IOV: MR_DCMD_CTRL_SHARED_HOST"
++ 			"_MEM_ALLOC DCMD %s for scsi%d\n",
++ 			(dcmd->cmd_status == MFI_STAT_INVALID_STATUS) ?
++ 			"timed out" : "failed", instance->host->host_no);
+++>>>>>>> 2be2a98845e6 (megaraid_sas : Modify return value of megasas_issue_blocked_cmd() and wait_and_poll() to consider command status returned by firmware)
+  		retval = 1;
+- 		goto out;
+- 	}
+- 
+- 
+- 	if (dcmd->cmd_status) {
+- 		printk(KERN_WARNING "megasas: SR-IOV: MR_DCMD_CTRL_SHARED_HOST"
+- 		       "_MEM_ALLOC DCMD failed with status 0x%x for scsi%d\n",
+- 		       dcmd->cmd_status,
+- 		       instance->host->host_no);
+- 		retval = 1;
+- 		goto out;
+  	}
+  
+  out:
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 89eb6e0252ff..38a88033131f 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1892,7 +1892,7 @@ struct megasas_cmd {
+ 
+ 	u32 index;
+ 	u8 sync_cmd;
+-	u8 cmd_status;
++	u8 cmd_status_drv;
+ 	u8 abort_aen;
+ 	u8 retry_for_fw_reset;
+ 
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 8b61bbd4b86c..fb25acbe9f6e 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -612,7 +612,8 @@ wait_and_poll(struct megasas_instance *instance, struct megasas_cmd *cmd,
+ 		return -ETIME;
+ 	}
+ 
+-	return 0;
++	return (frame_hdr->cmd_status == MFI_STAT_OK) ?
++		0 : 1;
+ }
+ 
+ /**
