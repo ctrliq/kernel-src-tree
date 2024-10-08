@@ -1,0 +1,239 @@
+x86_64, traps: Stop using IST for #SS
+
+jira LE-1907
+cve CVE-2014-9322
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [x86] traps: stop using IST for #SS (Petr  Matousek) [1172813] {CVE-2014-9322}
+Rebuild_FUZZ: 87.88%
+commit-author Andy Lutomirski <luto@amacapital.net>
+commit 6f442be2fb22be02cafa606f1769fa1e6f894441
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6f442be2.failed
+
+On a 32-bit kernel, this has no effect, since there are no IST stacks.
+
+On a 64-bit kernel, #SS can only happen in user code, on a failed iret
+to user space, a canonical violation on access via RSP or RBP, or a
+genuine stack segment violation in 32-bit kernel code.  The first two
+cases don't need IST, and the latter two cases are unlikely fatal bugs,
+and promoting them to double faults would be fine.
+
+This fixes a bug in which the espfix64 code mishandles a stack segment
+violation.
+
+This saves 4k of memory per CPU and a tiny bit of code.
+
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6f442be2fb22be02cafa606f1769fa1e6f894441)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/entry_64.S
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/entry_64.S
+index 7f8b571df8f4,49a0c1781253..000000000000
+--- a/arch/x86/kernel/entry_64.S
++++ b/arch/x86/kernel/entry_64.S
+@@@ -1494,26 -1257,21 +1494,32 @@@ apicinterrupt3 HYPERVISOR_CALLBACK_VECT
+  	hyperv_callback_vector hyperv_vector_handler
+  #endif /* CONFIG_HYPERV */
+  
+++<<<<<<< HEAD
+ +/*
+ + * Some functions should be protected against kprobes
+ + */
+ +	.pushsection .kprobes.text, "ax"
+ +
+ +paranoidzeroentry_ist debug do_debug DEBUG_STACK
+ +paranoidzeroentry_ist int3 do_int3 DEBUG_STACK
+ +paranoiderrorentry stack_segment do_stack_segment
+++=======
++ idtentry debug do_debug has_error_code=0 paranoid=1 shift_ist=DEBUG_STACK
++ idtentry int3 do_int3 has_error_code=0 paranoid=1 shift_ist=DEBUG_STACK
++ idtentry stack_segment do_stack_segment has_error_code=1
+++>>>>>>> 6f442be2fb22 (x86_64, traps: Stop using IST for #SS)
+  #ifdef CONFIG_XEN
+ -idtentry xen_debug do_debug has_error_code=0
+ -idtentry xen_int3 do_int3 has_error_code=0
+ -idtentry xen_stack_segment do_stack_segment has_error_code=1
+ +zeroentry xen_debug do_debug
+ +zeroentry xen_int3 do_int3
+ +errorentry xen_stack_segment do_stack_segment
+  #endif
+ -idtentry general_protection do_general_protection has_error_code=1
+ -trace_idtentry page_fault do_page_fault has_error_code=1
+ +errorentry general_protection do_general_protection
+ +trace_errorentry page_fault do_page_fault
+  #ifdef CONFIG_KVM_GUEST
+ -idtentry async_page_fault do_async_page_fault has_error_code=1
+ +errorentry async_page_fault do_async_page_fault
+  #endif
+  #ifdef CONFIG_X86_MCE
+ -idtentry machine_check has_error_code=0 paranoid=1 do_sym=*machine_check_vector(%rip)
+ +paranoidzeroentry machine_check *machine_check_vector(%rip)
+  #endif
+  
+  	/*
+diff --cc arch/x86/kernel/traps.c
+index 523a3cc6f512,48035e9cdde9..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -167,64 -200,41 +167,76 @@@ do_trap(int trapnr, int signr, char *st
+  	}
+  #endif
+  
+ -	force_sig_info(signr, info ?: SEND_SIG_PRIV, tsk);
+ +	if (info)
+ +		force_sig_info(signr, info, tsk);
+ +	else
+ +		force_sig(signr, tsk);
+  }
+ -NOKPROBE_SYMBOL(do_trap);
+ -
+ -static void do_error_trap(struct pt_regs *regs, long error_code, char *str,
+ -			  unsigned long trapnr, int signr)
+ -{
+ -	enum ctx_state prev_state = exception_enter();
+ -	siginfo_t info;
+ -
+ -	if (notify_die(DIE_TRAP, str, regs, error_code, trapnr, signr) !=
+ -			NOTIFY_STOP) {
+ -		conditional_sti(regs);
+ -		do_trap(trapnr, signr, str, regs, error_code,
+ -			fill_trap_info(regs, signr, trapnr, &info));
+ -	}
+  
+ -	exception_exit(prev_state);
+ +#define DO_ERROR(trapnr, signr, str, name)				\
+ +dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	\
+ +{									\
+ +	enum ctx_state prev_state;					\
+ +									\
+ +	prev_state = exception_enter();					\
+ +	if (notify_die(DIE_TRAP, str, regs, error_code,			\
+ +			trapnr, signr) == NOTIFY_STOP) {		\
+ +		exception_exit(prev_state);				\
+ +		return;							\
+ +	}								\
+ +	conditional_sti(regs);						\
+ +	do_trap(trapnr, signr, str, regs, error_code, NULL);		\
+ +	exception_exit(prev_state);					\
+  }
+  
+ -#define DO_ERROR(trapnr, signr, str, name)				\
+++<<<<<<< HEAD
+ +#define DO_ERROR_INFO(trapnr, signr, str, name, sicode, siaddr)		\
+  dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	\
+  {									\
+ -	do_error_trap(regs, error_code, str, trapnr, signr);		\
+ +	siginfo_t info;							\
+ +	enum ctx_state prev_state;					\
+ +									\
+ +	info.si_signo = signr;						\
+ +	info.si_errno = 0;						\
+ +	info.si_code = sicode;						\
+ +	info.si_addr = (void __user *)siaddr;				\
+ +	prev_state = exception_enter();					\
+ +	if (notify_die(DIE_TRAP, str, regs, error_code,			\
+ +			trapnr, signr) == NOTIFY_STOP) {		\
+ +		exception_exit(prev_state);				\
+ +		return;							\
+ +	}								\
+ +	conditional_sti(regs);						\
+ +	do_trap(trapnr, signr, str, regs, error_code, &info);		\
+ +	exception_exit(prev_state);					\
+  }
+  
+ +DO_ERROR_INFO(X86_TRAP_DE, SIGFPE, "divide error", divide_error, FPE_INTDIV,
+ +		regs->ip)
+ +DO_ERROR(X86_TRAP_OF, SIGSEGV, "overflow", overflow)
+ +DO_ERROR(X86_TRAP_BR, SIGSEGV, "bounds", bounds)
+ +DO_ERROR_INFO(X86_TRAP_UD, SIGILL, "invalid opcode", invalid_op, ILL_ILLOPN,
+ +		regs->ip)
+ +DO_ERROR(X86_TRAP_OLD_MF, SIGFPE, "coprocessor segment overrun",
+ +		coprocessor_segment_overrun)
+ +DO_ERROR(X86_TRAP_TS, SIGSEGV, "invalid TSS", invalid_TSS)
+ +DO_ERROR(X86_TRAP_NP, SIGBUS, "segment not present", segment_not_present)
+ +#ifdef CONFIG_X86_32
+ +DO_ERROR(X86_TRAP_SS, SIGBUS, "stack segment", stack_segment)
+ +#endif
+ +DO_ERROR_INFO(X86_TRAP_AC, SIGBUS, "alignment check", alignment_check,
+ +		BUS_ADRALN, 0)
+++=======
++ DO_ERROR(X86_TRAP_DE,     SIGFPE,  "divide error",		divide_error)
++ DO_ERROR(X86_TRAP_OF,     SIGSEGV, "overflow",			overflow)
++ DO_ERROR(X86_TRAP_BR,     SIGSEGV, "bounds",			bounds)
++ DO_ERROR(X86_TRAP_UD,     SIGILL,  "invalid opcode",		invalid_op)
++ DO_ERROR(X86_TRAP_OLD_MF, SIGFPE,  "coprocessor segment overrun",coprocessor_segment_overrun)
++ DO_ERROR(X86_TRAP_TS,     SIGSEGV, "invalid TSS",		invalid_TSS)
++ DO_ERROR(X86_TRAP_NP,     SIGBUS,  "segment not present",	segment_not_present)
++ DO_ERROR(X86_TRAP_SS,     SIGBUS,  "stack segment",		stack_segment)
++ DO_ERROR(X86_TRAP_AC,     SIGBUS,  "alignment check",		alignment_check)
+++>>>>>>> 6f442be2fb22 (x86_64, traps: Stop using IST for #SS)
+  
+  #ifdef CONFIG_X86_64
+  /* Runs on IST stack */
+diff --git a/arch/x86/include/asm/page_32_types.h b/arch/x86/include/asm/page_32_types.h
+index ef17af013475..4376b458aef7 100644
+--- a/arch/x86/include/asm/page_32_types.h
++++ b/arch/x86/include/asm/page_32_types.h
+@@ -18,7 +18,6 @@
+ #define THREAD_SIZE_ORDER	1
+ #define THREAD_SIZE		(PAGE_SIZE << THREAD_SIZE_ORDER)
+ 
+-#define STACKFAULT_STACK 0
+ #define DOUBLEFAULT_STACK 1
+ #define NMI_STACK 0
+ #define DEBUG_STACK 0
+diff --git a/arch/x86/include/asm/page_64_types.h b/arch/x86/include/asm/page_64_types.h
+index 6c896fbe21db..970f3097ee33 100644
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@ -14,12 +14,11 @@
+ #define IRQ_STACK_ORDER 2
+ #define IRQ_STACK_SIZE (PAGE_SIZE << IRQ_STACK_ORDER)
+ 
+-#define STACKFAULT_STACK 1
+-#define DOUBLEFAULT_STACK 2
+-#define NMI_STACK 3
+-#define DEBUG_STACK 4
+-#define MCE_STACK 5
+-#define N_EXCEPTION_STACKS 5  /* hw limit: 7 */
++#define DOUBLEFAULT_STACK 1
++#define NMI_STACK 2
++#define DEBUG_STACK 3
++#define MCE_STACK 4
++#define N_EXCEPTION_STACKS 4  /* hw limit: 7 */
+ 
+ #define PUD_PAGE_SIZE		(_AC(1, UL) << PUD_SHIFT)
+ #define PUD_PAGE_MASK		(~(PUD_PAGE_SIZE-1))
+diff --git a/arch/x86/include/asm/traps.h b/arch/x86/include/asm/traps.h
+index caf2b93f3cb7..d017966d93ee 100644
+--- a/arch/x86/include/asm/traps.h
++++ b/arch/x86/include/asm/traps.h
+@@ -43,6 +43,7 @@ asmlinkage void simd_coprocessor_error(void);
+ 
+ #ifdef CONFIG_TRACING
+ asmlinkage void trace_page_fault(void);
++#define trace_stack_segment stack_segment
+ #define trace_divide_error divide_error
+ #define trace_bounds bounds
+ #define trace_invalid_op invalid_op
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index addb207dab92..66e274a3d968 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -24,7 +24,6 @@ static char x86_stack_ids[][8] = {
+ 		[ DEBUG_STACK-1			]	= "#DB",
+ 		[ NMI_STACK-1			]	= "NMI",
+ 		[ DOUBLEFAULT_STACK-1		]	= "#DF",
+-		[ STACKFAULT_STACK-1		]	= "#SS",
+ 		[ MCE_STACK-1			]	= "#MC",
+ #if DEBUG_STKSZ > EXCEPTION_STKSZ
+ 		[ N_EXCEPTION_STACKS ...
+* Unmerged path arch/x86/kernel/entry_64.S
+* Unmerged path arch/x86/kernel/traps.c
