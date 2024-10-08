@@ -1,0 +1,337 @@
+x86/smp: Fix __max_logical_packages value setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] smp: Fix __max_logical_packages value setup (Frank Ramsay) [1358312]
+Rebuild_FUZZ: 95.56%
+commit-author Jiri Olsa <jolsa@redhat.com>
+commit 7b0501b1e7cddd32b265178e32d332bdfbb532d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7b0501b1.failed
+
+Frank reported kernel panic when he disabled several cores in BIOS
+via following option:
+
+  Core Disable Bitmap(Hex)   [0]
+
+with number 0xFFE, which leaves 16 CPUs in system (out of 48).
+
+The kernel panic below goes along with following messages:
+
+ smpboot: Max logical packages: 2^M
+ smpboot: APIC(0) Converting physical 0 to logical package 0^M
+ smpboot: APIC(20) Converting physical 1 to logical package 1^M
+ smpboot: APIC(40) Package 2 exceeds logical package map^M
+ smpboot: CPU 8 APICId 40 disabled^M
+ smpboot: APIC(60) Package 3 exceeds logical package map^M
+ smpboot: CPU 12 APICId 60 disabled^M
+ ...
+ general protection fault: 0000 [#1] SMP^M
+ Modules linked in:^M
+ CPU: 15 PID: 1 Comm: swapper/0 Not tainted 4.7.0-rc5+ #1^M
+ Hardware name: SGI UV300/UV300, BIOS SGI UV 300 series BIOS 05/25/2016^M
+ task: ffff8801673e0000 ti: ffff8801673ac000 task.ti: ffff8801673ac000^M
+ RIP: 0010:[<ffffffff81014d54>]  [<ffffffff81014d54>] uncore_change_context+0xd4/0x180^M
+ ...
+  [<ffffffff810158ac>] uncore_event_init_cpu+0x6c/0x70^M
+  [<ffffffff81d8c91c>] intel_uncore_init+0x1c2/0x2dd^M
+  [<ffffffff81d8c75a>] ? uncore_cpu_setup+0x17/0x17^M
+  [<ffffffff81002190>] do_one_initcall+0x50/0x190^M
+  [<ffffffff810ab193>] ? parse_args+0x293/0x480^M
+  [<ffffffff81d87365>] kernel_init_freeable+0x1a5/0x249^M
+  [<ffffffff81d86a35>] ? set_debug_rodata+0x12/0x12^M
+  [<ffffffff816dc19e>] kernel_init+0xe/0x110^M
+  [<ffffffff816e93bf>] ret_from_fork+0x1f/0x40^M
+  [<ffffffff816dc190>] ? rest_init+0x80/0x80^M
+
+The reason for the panic is wrong value of __max_logical_packages,
+which lets logical_package_map uninitialized and the uncore code
+relying on this map being properly initialized (maybe we should
+add some safety checks there as well).
+
+The __max_logical_packages is computed as:
+
+  DIV_ROUND_UP(total_cpus, ncpus);
+  - ncpus being number of cores
+
+With above BIOS setup we get total_cpus == 16 which set
+__max_logical_packages to 2 (ncpus is 12).
+
+Once topology_update_package_map processes CPU with logical
+pkg over 2 we display above messages and fail to initialize
+the physical_to_logical_pkg map, which makes the uncore code
+crash.
+
+The fix is to remove logical_package_map bitmap completely
+and keep and update the logical_packages number instead.
+
+After we enumerate all the present CPUs, we check if the
+enumerated logical packages count is within its computed
+maximum from BIOS data.
+
+If it's not the case, we set this maximum to the new enumerated
+value and freeze any new addition of logical packages.
+
+The freeze is because lot of init code like uncore/rapl/cqm
+depends on having maximum logical package value set to allocate
+their data, so we can't change it later on.
+
+Prarit Bhargava tested the patch and confirms that it solves
+the problem:
+
+  From dmidecode:
+          Core Count: 24
+          Core Enabled: 24
+          Thread Count: 48
+
+Orig kernel boot log:
+
+ [    0.464981] smpboot: Max logical packages: 19
+ [    0.469861] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.477261] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.484760] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.492258] smpboot: APIC(c0) Converting physical 3 to logical package 3
+
+1.  nr_cpus=8, should stop enumerating in package 0:
+
+ [    0.533664] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.539596] smpboot: Max logical packages: 19
+
+2.  max_cpus=8, should still enumerate all packages:
+
+ [    0.526494] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.532428] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.538456] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.544486] smpboot: APIC(c0) Converting physical 3 to logical package 3
+ [    0.550524] smpboot: Max logical packages: 19
+
+3.  nr_cpus=49 ( 2 socket + 1 core on 3rd socket), should stop enumerating in
+    package 2:
+
+ [    0.521378] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.527314] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.533345] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.539368] smpboot: Max logical packages: 19
+
+4.  maxcpus=49, should still enumerate all packages:
+
+ [    0.525591] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.531525] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.537547] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.543579] smpboot: APIC(c0) Converting physical 3 to logical package 3
+ [    0.549624] smpboot: Max logical packages: 19
+
+5.  kdump (nr_cpus=1) works as well.
+
+	Reported-by: Frank Ramsay <framsay@redhat.com>
+	Tested-by: Prarit Bhargava <prarit@redhat.com>
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Reviewed-by: Prarit Bhargava <prarit@redhat.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20160815101700.GA30090@krava
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7b0501b1e7cddd32b265178e32d332bdfbb532d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 7dbc496614e0,4296beb8fdd3..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -100,12 -94,57 +100,63 @@@ EXPORT_PER_CPU_SYMBOL(cpu_core_map)
+  DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
+  
+  /* Per CPU bogomips and other parameters */
+ -DEFINE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
+ +DEFINE_PER_CPU_SHARED_ALIGNED(struct cpuinfo_x86, cpu_info);
+  EXPORT_PER_CPU_SYMBOL(cpu_info);
+ +DEFINE_PER_CPU_SHARED_ALIGNED(struct rh_cpuinfo_x86, rh_cpu_info);
+ +EXPORT_PER_CPU_SYMBOL(rh_cpu_info);
+  
+++<<<<<<< HEAD
+ +atomic_t init_deasserted;
+++=======
++ /* Logical package management. We might want to allocate that dynamically */
++ static int *physical_to_logical_pkg __read_mostly;
++ static unsigned long *physical_package_map __read_mostly;;
++ static unsigned int max_physical_pkg_id __read_mostly;
++ unsigned int __max_logical_packages __read_mostly;
++ EXPORT_SYMBOL(__max_logical_packages);
++ static unsigned int logical_packages __read_mostly;
++ static bool logical_packages_frozen __read_mostly;
++ 
++ /* Maximum number of SMT threads on any online core */
++ int __max_smt_threads __read_mostly;
++ 
++ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0xa, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 	local_flush_tlb();
++ 	pr_debug("1.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_HIGH)) =
++ 							start_eip >> 4;
++ 	pr_debug("2.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) =
++ 							start_eip & 0xf;
++ 	pr_debug("3.\n");
++ }
++ 
++ static inline void smpboot_restore_warm_reset_vector(void)
++ {
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Install writable page 0 entry to set BIOS data area.
++ 	 */
++ 	local_flush_tlb();
++ 
++ 	/*
++ 	 * Paranoid:  Set warm reset code and vector here back
++ 	 * to default values.
++ 	 */
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 
++ 	*((volatile u32 *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) = 0;
++ }
+++>>>>>>> 7b0501b1e7cd (x86/smp: Fix __max_logical_packages value setup)
+  
+  /*
+   * Report back to the Boot Processor during boot time or to the caller processor
+@@@ -233,7 -260,122 +284,126 @@@ static void notrace start_secondary(voi
+  	x86_cpuinit.setup_percpu_clockev();
+  
+  	wmb();
+++<<<<<<< HEAD
+ +	cpu_startup_entry(CPUHP_ONLINE);
+++=======
++ 	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
++ }
++ 
++ int topology_update_package_map(unsigned int apicid, unsigned int cpu)
++ {
++ 	unsigned int new, pkg = apicid >> boot_cpu_data.x86_coreid_bits;
++ 
++ 	/* Called from early boot ? */
++ 	if (!physical_package_map)
++ 		return 0;
++ 
++ 	if (pkg >= max_physical_pkg_id)
++ 		return -EINVAL;
++ 
++ 	/* Set the logical package id */
++ 	if (test_and_set_bit(pkg, physical_package_map))
++ 		goto found;
++ 
++ 	if (logical_packages_frozen) {
++ 		physical_to_logical_pkg[pkg] = -1;
++ 		pr_warn("APIC(%x) Package %u exceeds logical package max\n",
++ 			apicid, pkg);
++ 		return -ENOSPC;
++ 	}
++ 
++ 	new = logical_packages++;
++ 	pr_info("APIC(%x) Converting physical %u to logical package %u\n",
++ 		apicid, pkg, new);
++ 	physical_to_logical_pkg[pkg] = new;
++ 
++ found:
++ 	cpu_data(cpu).logical_proc_id = physical_to_logical_pkg[pkg];
++ 	return 0;
++ }
++ 
++ /**
++  * topology_phys_to_logical_pkg - Map a physical package id to a logical
++  *
++  * Returns logical package id or -1 if not found
++  */
++ int topology_phys_to_logical_pkg(unsigned int phys_pkg)
++ {
++ 	if (phys_pkg >= max_physical_pkg_id)
++ 		return -1;
++ 	return physical_to_logical_pkg[phys_pkg];
++ }
++ EXPORT_SYMBOL(topology_phys_to_logical_pkg);
++ 
++ static void __init smp_init_package_map(void)
++ {
++ 	unsigned int ncpus, cpu;
++ 	size_t size;
++ 
++ 	/*
++ 	 * Today neither Intel nor AMD support heterogenous systems. That
++ 	 * might change in the future....
++ 	 *
++ 	 * While ideally we'd want '* smp_num_siblings' in the below @ncpus
++ 	 * computation, this won't actually work since some Intel BIOSes
++ 	 * report inconsistent HT data when they disable HT.
++ 	 *
++ 	 * In particular, they reduce the APIC-IDs to only include the cores,
++ 	 * but leave the CPUID topology to say there are (2) siblings.
++ 	 * This means we don't know how many threads there will be until
++ 	 * after the APIC enumeration.
++ 	 *
++ 	 * By not including this we'll sometimes over-estimate the number of
++ 	 * logical packages by the amount of !present siblings, but this is
++ 	 * still better than MAX_LOCAL_APIC.
++ 	 *
++ 	 * We use total_cpus not nr_cpu_ids because nr_cpu_ids can be limited
++ 	 * on the command line leading to a similar issue as the HT disable
++ 	 * problem because the hyperthreads are usually enumerated after the
++ 	 * primary cores.
++ 	 */
++ 	ncpus = boot_cpu_data.x86_max_cores;
++ 	if (!ncpus) {
++ 		pr_warn("x86_max_cores == zero !?!?");
++ 		ncpus = 1;
++ 	}
++ 
++ 	__max_logical_packages = DIV_ROUND_UP(total_cpus, ncpus);
++ 	logical_packages = 0;
++ 
++ 	/*
++ 	 * Possibly larger than what we need as the number of apic ids per
++ 	 * package can be smaller than the actual used apic ids.
++ 	 */
++ 	max_physical_pkg_id = DIV_ROUND_UP(MAX_LOCAL_APIC, ncpus);
++ 	size = max_physical_pkg_id * sizeof(unsigned int);
++ 	physical_to_logical_pkg = kmalloc(size, GFP_KERNEL);
++ 	memset(physical_to_logical_pkg, 0xff, size);
++ 	size = BITS_TO_LONGS(max_physical_pkg_id) * sizeof(unsigned long);
++ 	physical_package_map = kzalloc(size, GFP_KERNEL);
++ 
++ 	for_each_present_cpu(cpu) {
++ 		unsigned int apicid = apic->cpu_present_to_apicid(cpu);
++ 
++ 		if (apicid == BAD_APICID || !apic->apic_id_valid(apicid))
++ 			continue;
++ 		if (!topology_update_package_map(apicid, cpu))
++ 			continue;
++ 		pr_warn("CPU %u APICId %x disabled\n", cpu, apicid);
++ 		per_cpu(x86_bios_cpu_apicid, cpu) = BAD_APICID;
++ 		set_cpu_possible(cpu, false);
++ 		set_cpu_present(cpu, false);
++ 	}
++ 
++ 	if (logical_packages > __max_logical_packages) {
++ 		pr_warn("Detected more packages (%u), then computed by BIOS data (%u).\n",
++ 			logical_packages, __max_logical_packages);
++ 		logical_packages_frozen = true;
++ 		__max_logical_packages  = logical_packages;
++ 	}
++ 
++ 	pr_info("Max logical packages: %u\n", __max_logical_packages);
+++>>>>>>> 7b0501b1e7cd (x86/smp: Fix __max_logical_packages value setup)
+  }
+  
+  void __init smp_store_boot_cpu_info(void)
+* Unmerged path arch/x86/kernel/smpboot.c
