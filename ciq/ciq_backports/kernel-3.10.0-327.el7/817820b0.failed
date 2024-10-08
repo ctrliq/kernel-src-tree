@@ -1,0 +1,167 @@
+powerpc/iommu: Support "hybrid" iommu/direct DMA ops for coherent_mask < dma_mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] iommu: Support "hybrid" iommu/direct DMA ops for coherent_mask < dma_mask (Gustavo Duarte) [1246880]
+Rebuild_FUZZ: 94.81%
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit 817820b0226a1376f0fc68827ab8e42d86431117
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/817820b0.failed
+
+This patch adds the ability to the DMA direct ops to fallback to the IOMMU
+ops for coherent alloc/free if the coherent mask of the device isn't
+suitable for accessing the direct DMA space and the device also happens
+to have an active IOMMU table.
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 817820b0226a1376f0fc68827ab8e42d86431117)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/Kconfig
+#	arch/powerpc/kernel/dma.c
+diff --cc arch/powerpc/Kconfig
+index 3551c1672eeb,fe2f2c595fd9..000000000000
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@@ -141,8 -147,18 +144,20 @@@ config PP
+  	select ARCH_USE_BUILTIN_BSWAP
+  	select OLD_SIGSUSPEND
+  	select OLD_SIGACTION if PPC32
+ -	select HAVE_DEBUG_STACKOVERFLOW
+  	select HAVE_IRQ_EXIT_ON_IRQ_STACK
+  	select ARCH_USE_CMPXCHG_LOCKREF if PPC64
+++<<<<<<< HEAD
+++=======
++ 	select HAVE_ARCH_AUDITSYSCALL
++ 	select ARCH_SUPPORTS_ATOMIC_RMW
++ 	select DCACHE_WORD_ACCESS if PPC64 && CPU_LITTLE_ENDIAN
++ 	select NO_BOOTMEM
++ 	select HAVE_GENERIC_RCU_GUP
++ 	select HAVE_PERF_EVENTS_NMI if PPC64
++ 	select EDAC_SUPPORT
++ 	select EDAC_ATOMIC_SCRUB
++ 	select ARCH_HAS_DMA_SET_COHERENT_MASK
+++>>>>>>> 817820b0226a (powerpc/iommu: Support "hybrid" iommu/direct DMA ops for coherent_mask < dma_mask)
+  
+  config GENERIC_CSUM
+  	def_bool CPU_LITTLE_ENDIAN
+diff --cc arch/powerpc/kernel/dma.c
+index ee78f6e49d64,1558f81ac1ff..000000000000
+--- a/arch/powerpc/kernel/dma.c
++++ b/arch/powerpc/kernel/dma.c
+@@@ -15,6 -15,8 +15,11 @@@
+  #include <asm/vio.h>
+  #include <asm/bug.h>
+  #include <asm/machdep.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/swiotlb.h>
++ #include <asm/iommu.h>
+++>>>>>>> 817820b0226a (powerpc/iommu: Support "hybrid" iommu/direct DMA ops for coherent_mask < dma_mask)
+  
+  /*
+   * Generic direct DMA implementation
+@@@ -25,10 -27,44 +30,32 @@@
+   * default the offset is PCI_DRAM_OFFSET.
+   */
+  
+ -static u64 __maybe_unused get_pfn_limit(struct device *dev)
+ -{
+ -	u64 pfn = (dev->coherent_dma_mask >> PAGE_SHIFT) + 1;
+ -	struct dev_archdata __maybe_unused *sd = &dev->archdata;
+ -
+ -#ifdef CONFIG_SWIOTLB
+ -	if (sd->max_direct_dma_addr && sd->dma_ops == &swiotlb_dma_ops)
+ -		pfn = min_t(u64, pfn, sd->max_direct_dma_addr >> PAGE_SHIFT);
+ -#endif
+ -
+ -	return pfn;
+ -}
+  
+- void *dma_direct_alloc_coherent(struct device *dev, size_t size,
+- 				dma_addr_t *dma_handle, gfp_t flag,
+- 				struct dma_attrs *attrs)
++ static int dma_direct_dma_supported(struct device *dev, u64 mask)
++ {
++ #ifdef CONFIG_PPC64
++ 	u64 limit = get_dma_offset(dev) + (memblock_end_of_DRAM() - 1);
++ 
++ 	/* Limit fits in the mask, we are good */
++ 	if (mask >= limit)
++ 		return 1;
++ 
++ #ifdef CONFIG_FSL_SOC
++ 	/* Freescale gets another chance via ZONE_DMA/ZONE_DMA32, however
++ 	 * that will have to be refined if/when they support iommus
++ 	 */
++ 	return 1;
++ #endif
++ 	/* Sorry ... */
++ 	return 0;
++ #else
++ 	return 1;
++ #endif
++ }
++ 
++ void *__dma_direct_alloc_coherent(struct device *dev, size_t size,
++ 				  dma_addr_t *dma_handle, gfp_t flag,
++ 				  struct dma_attrs *attrs)
+  {
+  	void *ret;
+  #ifdef CONFIG_NOT_COHERENT_CACHE
+* Unmerged path arch/powerpc/Kconfig
+diff --git a/arch/powerpc/include/asm/dma-mapping.h b/arch/powerpc/include/asm/dma-mapping.h
+index 150866b2a3fe..5d922a13295f 100644
+--- a/arch/powerpc/include/asm/dma-mapping.h
++++ b/arch/powerpc/include/asm/dma-mapping.h
+@@ -21,12 +21,12 @@
+ #define DMA_ERROR_CODE		(~(dma_addr_t)0x0)
+ 
+ /* Some dma direct funcs must be visible for use in other dma_ops */
+-extern void *dma_direct_alloc_coherent(struct device *dev, size_t size,
+-				       dma_addr_t *dma_handle, gfp_t flag,
++extern void *__dma_direct_alloc_coherent(struct device *dev, size_t size,
++					 dma_addr_t *dma_handle, gfp_t flag,
++					 struct dma_attrs *attrs);
++extern void __dma_direct_free_coherent(struct device *dev, size_t size,
++				       void *vaddr, dma_addr_t dma_handle,
+ 				       struct dma_attrs *attrs);
+-extern void dma_direct_free_coherent(struct device *dev, size_t size,
+-				     void *vaddr, dma_addr_t dma_handle,
+-				     struct dma_attrs *attrs);
+ extern int dma_direct_mmap_coherent(struct device *dev,
+ 				    struct vm_area_struct *vma,
+ 				    void *cpu_addr, dma_addr_t handle,
+diff --git a/arch/powerpc/kernel/dma-iommu.c b/arch/powerpc/kernel/dma-iommu.c
+index 54d0116256f7..a550b67b8f4b 100644
+--- a/arch/powerpc/kernel/dma-iommu.c
++++ b/arch/powerpc/kernel/dma-iommu.c
+@@ -73,7 +73,7 @@ static void dma_iommu_unmap_sg(struct device *dev, struct scatterlist *sglist,
+ }
+ 
+ /* We support DMA to/from any memory page via the iommu */
+-static int dma_iommu_dma_supported(struct device *dev, u64 mask)
++int dma_iommu_dma_supported(struct device *dev, u64 mask)
+ {
+ 	struct iommu_table *tbl = get_iommu_table_base(dev);
+ 
+diff --git a/arch/powerpc/kernel/dma-swiotlb.c b/arch/powerpc/kernel/dma-swiotlb.c
+index bd1a2aba599f..de0585269e69 100644
+--- a/arch/powerpc/kernel/dma-swiotlb.c
++++ b/arch/powerpc/kernel/dma-swiotlb.c
+@@ -47,8 +47,8 @@ static u64 swiotlb_powerpc_get_required(struct device *dev)
+  * for everything else.
+  */
+ struct dma_map_ops swiotlb_dma_ops = {
+-	.alloc = dma_direct_alloc_coherent,
+-	.free = dma_direct_free_coherent,
++	.alloc = __dma_direct_alloc_coherent,
++	.free = __dma_direct_free_coherent,
+ 	.mmap = dma_direct_mmap_coherent,
+ 	.map_sg = swiotlb_map_sg_attrs,
+ 	.unmap_sg = swiotlb_unmap_sg_attrs,
+* Unmerged path arch/powerpc/kernel/dma.c
