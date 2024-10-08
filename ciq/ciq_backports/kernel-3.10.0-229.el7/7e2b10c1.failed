@@ -1,0 +1,106 @@
+net: Support for multiple checksums with gso
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] Support for multiple checksums with gso (Florian Westphal) [1131999]
+Rebuild_FUZZ: 93.98%
+commit-author Tom Herbert <therbert@google.com>
+commit 7e2b10c1e52ca37fb522be49f4be367f9311d0cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7e2b10c1.failed
+
+When creating a GSO packet segment we may need to set more than
+one checksum in the packet (for instance a TCP checksum and
+UDP checksum for VXLAN encapsulation). To be efficient, we want
+to do checksum calculation for any part of the packet at most once.
+
+This patch adds csum_start offset to skb_gso_cb. This tracks the
+starting offset for skb->csum which is initially set in skb_segment.
+When a protocol needs to compute a transport checksum it calls
+gso_make_checksum which computes the checksum value from the start
+of transport header to csum_start and then adds in skb->csum to get
+the full checksum. skb->csum and csum_start are then updated to reflect
+the checksum of the resultant packet starting from the transport header.
+
+This patch also adds a flag to skbuff, encap_hdr_csum, which is set
+in *gso_segment fucntions to indicate that a tunnel protocol needs
+checksum calculation
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7e2b10c1e52ca37fb522be49f4be367f9311d0cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index cb31685bcfcb,d8d397acb52c..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -493,7 -567,8 +493,12 @@@ struct sk_buff 
+  	 * headers if needed
+  	 */
+  	__u8			encapsulation:1;
+++<<<<<<< HEAD
+ +	/* 7/9 bit hole (depending on ndisc_nodetype presence) */
+++=======
++ 	__u8			encap_hdr_csum:1;
++ 	/* 5/7 bit hole (depending on ndisc_nodetype presence) */
+++>>>>>>> 7e2b10c1e52c (net: Support for multiple checksums with gso)
+  	kmemcheck_bitfield_end(flags2);
+  
+  #if defined CONFIG_NET_DMA || defined CONFIG_NET_RX_BUSY_POLL
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 25fb6ef7b10e..60a6c27f86ab 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2852,7 +2852,9 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+ 	if (unlikely(!proto))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	csum = !!can_checksum_protocol(features, proto);
++	csum = !head_skb->encap_hdr_csum &&
++	    !!can_checksum_protocol(features, proto);
++
+ 	__skb_push(head_skb, doffset);
+ 	headroom = skb_headroom(head_skb);
+ 	pos = skb_headlen(head_skb);
+@@ -2950,6 +2952,8 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+ 			nskb->csum = skb_copy_and_csum_bits(head_skb, offset,
+ 							    skb_put(nskb, len),
+ 							    len, 0);
++			SKB_GSO_CB(nskb)->csum_start =
++			    skb_headroom(nskb) + offset;
+ 			continue;
+ 		}
+ 
+@@ -3019,6 +3023,8 @@ perform_csum_check:
+ 			nskb->csum = skb_checksum(nskb, doffset,
+ 						  nskb->len - doffset, 0);
+ 			nskb->ip_summed = CHECKSUM_NONE;
++			SKB_GSO_CB(nskb)->csum_start =
++			    skb_headroom(nskb) + doffset;
+ 		}
+ 	} while ((offset += len) < head_skb->len);
+ 
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index 88e0d3412e71..86575b88229d 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -138,6 +138,14 @@ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb,
+ 		return skb;
+ 	}
+ 
++	/* If packet is not gso and we are resolving any partial checksum,
++	 * clear encapsulation flag. This allows setting CHECKSUM_PARTIAL
++	 * on the outer header without confusing devices that implement
++	 * NETIF_F_IP_CSUM with encapsulation.
++	 */
++	if (csum_help)
++		skb->encapsulation = 0;
++
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL && csum_help) {
+ 		err = skb_checksum_help(skb);
+ 		if (unlikely(err))
