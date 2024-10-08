@@ -1,0 +1,114 @@
+perf/core: Define PERF_PMU_TXN_READ interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sukadev Bhattiprolu <sukadev@linux.vnet.ibm.com>
+commit 4a00c16e552ea5e71756cd29cd2df7557ec9cac4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4a00c16e.failed
+
+Define a new PERF_PMU_TXN_READ interface to read a group of counters
+at once.
+
+        pmu->start_txn()                // Initialize before first event
+
+        for each event in group
+                pmu->read(event);       // Queue each event to be read
+
+        rc = pmu->commit_txn()          // Read/update all queued counters
+
+Note that we use this interface with all PMUs.  PMUs that implement this
+interface use the ->read() operation to _queue_ the counters to be read
+and use ->commit_txn() to actually read all the queued counters at once.
+
+PMUs that don't implement PERF_PMU_TXN_READ ignore ->start_txn() and
+->commit_txn() and continue to read counters one at a time.
+
+Thanks to input from Peter Zijlstra.
+
+	Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1441336073-22750-9-git-send-email-sukadev@linux.vnet.ibm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4a00c16e552ea5e71756cd29cd2df7557ec9cac4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index 855e6baed4cb,b83cea932f74..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -177,6 -201,9 +177,12 @@@ struct perf_event
+   */
+  #define PERF_EVENT_TXN 0x1
+  
+++<<<<<<< HEAD
+++=======
++ #define PERF_PMU_TXN_ADD  0x1		/* txn to add/schedule event on PMU */
++ #define PERF_PMU_TXN_READ 0x2		/* txn to read event group from PMU */
++ 
+++>>>>>>> 4a00c16e552e (perf/core: Define PERF_PMU_TXN_READ interface)
+  /**
+   * pmu::capabilities flags
+   */
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 126bd0066585..d3ed99a2c28c 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3202,6 +3202,7 @@ static void __perf_event_read(void *info)
+ 	struct perf_event *sub, *event = data->event;
+ 	struct perf_event_context *ctx = event->ctx;
+ 	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
++	struct pmu *pmu = event->pmu;
+ 
+ 	/*
+ 	 * If this is a task context, we need to check whether it is
+@@ -3220,18 +3221,31 @@ static void __perf_event_read(void *info)
+ 	}
+ 
+ 	update_event_times(event);
+-	if (event->state == PERF_EVENT_STATE_ACTIVE)
+-		event->pmu->read(event);
++	if (event->state != PERF_EVENT_STATE_ACTIVE)
++		goto unlock;
+ 
+-	if (!data->group)
++	if (!data->group) {
++		pmu->read(event);
++		data->ret = 0;
+ 		goto unlock;
++	}
++
++	pmu->start_txn(pmu, PERF_PMU_TXN_READ);
++
++	pmu->read(event);
+ 
+ 	list_for_each_entry(sub, &event->sibling_list, group_entry) {
+ 		update_event_times(sub);
+-		if (sub->state == PERF_EVENT_STATE_ACTIVE)
++		if (sub->state == PERF_EVENT_STATE_ACTIVE) {
++			/*
++			 * Use sibling's PMU rather than @event's since
++			 * sibling could be on different (eg: software) PMU.
++			 */
+ 			sub->pmu->read(sub);
++		}
+ 	}
+-	data->ret = 0;
++
++	data->ret = pmu->commit_txn(pmu);
+ 
+ unlock:
+ 	raw_spin_unlock(&ctx->lock);
