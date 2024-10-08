@@ -1,0 +1,167 @@
+Adding stateid information to tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Olga Kornievskaia <kolga@netapp.com>
+commit 48c9579a1afe4315be4576ec4c0b24c2715da0e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/48c9579a.failed
+
+Operations to which stateid information is added:
+close, delegreturn, open, read, setattr, layoutget, layoutcommit, test_stateid,
+write, lock, locku, lockt
+
+Format is "stateid=<seqid>:<crc32 hash stateid.other>", also "openstateid=",
+"layoutstateid=", and "lockstateid=" for open_file, layoutget, set_lock
+tracepoints.
+
+New function is added to internal.h, nfs_stateid_hash(), to compute the hash
+
+trace_nfs4_setattr() is moved from nfs4_do_setattr() to _nfs4_do_setattr()
+to get access to stateid.
+
+trace_nfs4_setattr and trace_nfs4_delegreturn are changed from INODE_EVENT
+to new event type, INODE_STATEID_EVENT which is same as INODE_EVENT but adds
+stateid information
+
+for locking tracepoints, moved trace_nfs4_set_lock() into _nfs4_do_setlk()
+to get access to stateid information, and removed trace_nfs4_lock_reclaim(),
+trace_nfs4_lock_expired() as they call into _nfs4_do_setlk() and both were
+previously same LOCK_EVENT type.
+
+	Signed-off-by: Olga Kornievskaia <kolga@netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 48c9579a1afe4315be4576ec4c0b24c2715da0e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4trace.h
+diff --cc fs/nfs/nfs4trace.h
+index e86782b3460b,9058aecc248e..000000000000
+--- a/fs/nfs/nfs4trace.h
++++ b/fs/nfs/nfs4trace.h
+@@@ -1170,7 -1358,8 +1358,12 @@@ TRACE_EVENT(nfs4_layoutget
+  		),
+  
+  		TP_fast_assign(
+++<<<<<<< HEAD
+ +			const struct inode *inode = ctx->dentry->d_inode;
+++=======
++ 			const struct inode *inode = d_inode(ctx->dentry);
++ 			const struct nfs4_state *state = ctx->state;
+++>>>>>>> 48c9579a1afe (Adding stateid information to tracepoints)
+  			__entry->dev = inode->i_sb->s_dev;
+  			__entry->fileid = NFS_FILEID(inode);
+  			__entry->fhandle = nfs_fhandle_hash(NFS_FH(inode));
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 81e2e6a142b3..00472837f1b3 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -681,9 +681,18 @@ static inline u32 nfs_fhandle_hash(const struct nfs_fh *fh)
+ {
+ 	return ~crc32_le(0xFFFFFFFF, &fh->data[0], fh->size);
+ }
++static inline u32 nfs_stateid_hash(const nfs4_stateid *stateid)
++{
++	return ~crc32_le(0xFFFFFFFF, &stateid->other[0],
++				NFS4_STATEID_OTHER_SIZE);
++}
+ #else
+ static inline u32 nfs_fhandle_hash(const struct nfs_fh *fh)
+ {
+ 	return 0;
+ }
++static inline u32 nfs_stateid_hash(nfs4_stateid *stateid)
++{
++	return 0;
++}
+ #endif
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index d44b2c9742e5..686f129884d5 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2703,6 +2703,7 @@ static int _nfs4_do_setattr(struct inode *inode, struct rpc_cred *cred,
+ 	status = nfs4_call_sync(server->client, server, &msg, &arg.seq_args, &res.seq_res, 1);
+ 	if (status == 0 && state != NULL)
+ 		renew_lease(server, timestamp);
++	trace_nfs4_setattr(inode, &arg.stateid, status);
+ 	return status;
+ }
+ 
+@@ -2719,7 +2720,6 @@ static int nfs4_do_setattr(struct inode *inode, struct rpc_cred *cred,
+ 	int err;
+ 	do {
+ 		err = _nfs4_do_setattr(inode, cred, fattr, sattr, state, ilabel, olabel);
+-		trace_nfs4_setattr(inode, err);
+ 		switch (err) {
+ 		case -NFS4ERR_OPENMODE:
+ 			if (!(sattr->ia_valid & ATTR_SIZE)) {
+@@ -5378,7 +5378,7 @@ int nfs4_proc_delegreturn(struct inode *inode, struct rpc_cred *cred, const nfs4
+ 	int err;
+ 	do {
+ 		err = _nfs4_proc_delegreturn(inode, cred, stateid, issync);
+-		trace_nfs4_delegreturn(inode, err);
++		trace_nfs4_delegreturn(inode, stateid, err);
+ 		switch (err) {
+ 			case -NFS4ERR_STALE_STATEID:
+ 			case -NFS4ERR_EXPIRED:
+@@ -5899,6 +5899,7 @@ static int _nfs4_do_setlk(struct nfs4_state *state, int cmd, struct file_lock *f
+ 		data->cancelled = 1;
+ 	rpc_put_task(task);
+ 	dprintk("%s: done, ret = %d!\n", __func__, ret);
++	trace_nfs4_set_lock(fl, state, &data->res.stateid, cmd, ret);
+ 	return ret;
+ }
+ 
+@@ -5915,7 +5916,6 @@ static int nfs4_lock_reclaim(struct nfs4_state *state, struct file_lock *request
+ 		if (test_bit(NFS_DELEGATED_STATE, &state->flags) != 0)
+ 			return 0;
+ 		err = _nfs4_do_setlk(state, F_SETLK, request, NFS_LOCK_RECLAIM);
+-		trace_nfs4_lock_reclaim(request, state, F_SETLK, err);
+ 		if (err != -NFS4ERR_DELAY)
+ 			break;
+ 		nfs4_handle_exception(server, err, &exception);
+@@ -5942,7 +5942,6 @@ static int nfs4_lock_expired(struct nfs4_state *state, struct file_lock *request
+ 		if (test_bit(NFS_DELEGATED_STATE, &state->flags) != 0)
+ 			return 0;
+ 		err = _nfs4_do_setlk(state, F_SETLK, request, NFS_LOCK_EXPIRED);
+-		trace_nfs4_lock_expired(request, state, F_SETLK, err);
+ 		switch (err) {
+ 		default:
+ 			goto out;
+@@ -6054,7 +6053,6 @@ static int nfs4_proc_setlk(struct nfs4_state *state, int cmd, struct file_lock *
+ 
+ 	do {
+ 		err = _nfs4_proc_setlk(state, cmd, request);
+-		trace_nfs4_set_lock(request, state, cmd, err);
+ 		if (err == -NFS4ERR_DENIED)
+ 			err = -EAGAIN;
+ 		err = nfs4_handle_exception(NFS_SERVER(state->inode),
+@@ -7966,6 +7964,7 @@ nfs4_proc_layoutget(struct nfs4_layoutget *lgp, gfp_t gfp_flags)
+ 	trace_nfs4_layoutget(lgp->args.ctx,
+ 			&lgp->args.range,
+ 			&lgp->res.range,
++			&lgp->res.stateid,
+ 			status);
+ 	/* if layoutp->len is 0, nfs4_layoutget_prepare called rpc_exit */
+ 	if (status == 0 && lgp->res.layoutp->len)
+@@ -8072,7 +8071,7 @@ int nfs4_proc_layoutreturn(struct nfs4_layoutreturn *lrp, bool sync)
+ 		return PTR_ERR(task);
+ 	if (sync)
+ 		status = task->tk_status;
+-	trace_nfs4_layoutreturn(lrp->args.inode, status);
++	trace_nfs4_layoutreturn(lrp->args.inode, &lrp->args.stateid, status);
+ 	dprintk("<-- %s status=%d\n", __func__, status);
+ 	rpc_put_task(task);
+ 	return status;
+@@ -8220,7 +8219,7 @@ nfs4_proc_layoutcommit(struct nfs4_layoutcommit_data *data, bool sync)
+ 		return PTR_ERR(task);
+ 	if (sync)
+ 		status = task->tk_status;
+-	trace_nfs4_layoutcommit(data->args.inode, status);
++	trace_nfs4_layoutcommit(data->args.inode, &data->args.stateid, status);
+ 	dprintk("%s: status %d\n", __func__, status);
+ 	rpc_put_task(task);
+ 	return status;
+* Unmerged path fs/nfs/nfs4trace.h
