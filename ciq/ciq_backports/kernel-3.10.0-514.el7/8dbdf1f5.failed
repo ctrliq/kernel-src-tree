@@ -1,0 +1,297 @@
+sctp: implement prsctp PRIO policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 8dbdf1f5b09cb22560e7c7173b52fe3c631046bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8dbdf1f5.failed
+
+prsctp PRIO policy is a policy to abandon lower priority chunks when
+asoc doesn't have enough snd buffer, so that the current chunk with
+higher priority can be queued successfully.
+
+Similar to TTL/RTX policy, we will set the priority of the chunk to
+prsctp_param with sinfo->sinfo_timetolive in sctp_set_prsctp_policy().
+So if PRIO policy is enabled, msg->expire_at won't work.
+
+asoc->sent_cnt_removable will record how many chunks can be checked to
+remove. If priority policy is enabled, when the chunk is queued into
+the out_queue, we will increase sent_cnt_removable. When the chunk is
+moved to abandon_queue or dequeue and free, we will decrease
+sent_cnt_removable.
+
+In sctp_sendmsg, we will check if there is enough snd buffer for current
+msg and if sent_cnt_removable is not 0. Then try to abandon chunks in
+sctp_prune_prsctp when sendmsg from the retransmit/transmited queue, and
+free chunks from out_queue in right order until the abandon+free size >
+msg_len - sctp_wfree. For the abandon size, we have to wait until it
+sends FORWARD TSN, receives the sack and the chunks are really freed.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8dbdf1f5b09cb22560e7c7173b52fe3c631046bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/structs.h
+#	net/sctp/chunk.c
+#	net/sctp/sm_make_chunk.c
+diff --cc include/net/sctp/structs.h
+index 7fbce55da678,8626bdd3249a..000000000000
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@@ -1075,7 -1083,9 +1075,13 @@@ void sctp_outq_restart(struct sctp_out
+  void sctp_retransmit(struct sctp_outq *, struct sctp_transport *,
+  		     sctp_retransmit_reason_t);
+  void sctp_retransmit_mark(struct sctp_outq *, struct sctp_transport *, __u8);
+++<<<<<<< HEAD
+ +int sctp_outq_uncork(struct sctp_outq *);
+++=======
++ int sctp_outq_uncork(struct sctp_outq *, gfp_t gfp);
++ void sctp_prsctp_prune(struct sctp_association *asoc,
++ 		       struct sctp_sndrcvinfo *sinfo, int msg_len);
+++>>>>>>> 8dbdf1f5b09c (sctp: implement prsctp PRIO policy)
+  /* Uncork and flush an outqueue.  */
+  static inline void sctp_outq_cork(struct sctp_outq *q)
+  {
+@@@ -1865,9 -1861,15 +1871,17 @@@ struct sctp_association 
+  	__u16 active_key_id;
+  
+  	__u8 need_ecne:1,	/* Need to send an ECNE Chunk? */
+ -	     temp:1,		/* Is it a temporary association? */
+ -	     prsctp_enable:1;
+ +	     temp:1;		/* Is it a temporary association? */
+  
+  	struct sctp_priv_assoc_stats stats;
+++<<<<<<< HEAD
+++=======
++ 
++ 	int sent_cnt_removable;
++ 
++ 	__u64 abandoned_unsent[SCTP_PR_INDEX(MAX) + 1];
++ 	__u64 abandoned_sent[SCTP_PR_INDEX(MAX) + 1];
+++>>>>>>> 8dbdf1f5b09c (sctp: implement prsctp PRIO policy)
+  };
+  
+  
+diff --cc net/sctp/chunk.c
+index 9c5bf4f38327,a55e54738b81..000000000000
+--- a/net/sctp/chunk.c
++++ b/net/sctp/chunk.c
+@@@ -353,13 -335,32 +353,22 @@@ errout
+  /* Check whether this message has expired. */
+  int sctp_chunk_abandoned(struct sctp_chunk *chunk)
+  {
+ -	if (!chunk->asoc->prsctp_enable ||
+ -	    !SCTP_PR_POLICY(chunk->sinfo.sinfo_flags)) {
+ -		struct sctp_datamsg *msg = chunk->msg;
+ -
+ -		if (!msg->can_abandon)
+ -			return 0;
+ -
+ -		if (time_after(jiffies, msg->expires_at))
+ -			return 1;
+ +	struct sctp_datamsg *msg = chunk->msg;
+  
+ +	if (!msg->can_abandon)
+  		return 0;
+ -	}
+  
+ -	if (SCTP_PR_TTL_ENABLED(chunk->sinfo.sinfo_flags) &&
+ -	    time_after(jiffies, chunk->prsctp_param)) {
+ -		if (chunk->sent_count)
+ -			chunk->asoc->abandoned_sent[SCTP_PR_INDEX(TTL)]++;
+ -		else
+ -			chunk->asoc->abandoned_unsent[SCTP_PR_INDEX(TTL)]++;
+ +	if (time_after(jiffies, msg->expires_at))
+  		return 1;
+++<<<<<<< HEAD
+++=======
++ 	} else if (SCTP_PR_RTX_ENABLED(chunk->sinfo.sinfo_flags) &&
++ 		   chunk->sent_count > chunk->prsctp_param) {
++ 		chunk->asoc->abandoned_sent[SCTP_PR_INDEX(RTX)]++;
++ 		return 1;
++ 	}
++ 	/* PRIO policy is processed by sendmsg, not here */
+++>>>>>>> 8dbdf1f5b09c (sctp: implement prsctp PRIO policy)
+  
+  	return 0;
+  }
+diff --cc net/sctp/sm_make_chunk.c
+index 580d58afabf7,1c96f4740e67..000000000000
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@@ -688,6 -711,20 +688,23 @@@ nodata
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sctp_set_prsctp_policy(struct sctp_chunk *chunk,
++ 				   const struct sctp_sndrcvinfo *sinfo)
++ {
++ 	if (!chunk->asoc->prsctp_enable)
++ 		return;
++ 
++ 	if (SCTP_PR_TTL_ENABLED(sinfo->sinfo_flags))
++ 		chunk->prsctp_param =
++ 			jiffies + msecs_to_jiffies(sinfo->sinfo_timetolive);
++ 	else if (SCTP_PR_RTX_ENABLED(sinfo->sinfo_flags) ||
++ 		 SCTP_PR_PRIO_ENABLED(sinfo->sinfo_flags))
++ 		chunk->prsctp_param = sinfo->sinfo_timetolive;
++ }
++ 
+++>>>>>>> 8dbdf1f5b09c (sctp: implement prsctp PRIO policy)
+  /* Make a DATA chunk for the given association from the provided
+   * parameters.  However, do not populate the data payload.
+   */
+* Unmerged path include/net/sctp/structs.h
+* Unmerged path net/sctp/chunk.c
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index df332ca4fbe2..26057044d96e 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -335,6 +335,9 @@ int sctp_outq_tail(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 
+ 			sctp_chunk_hold(chunk);
+ 			sctp_outq_tail_data(q, chunk);
++			if (chunk->asoc->prsctp_enable &&
++			    SCTP_PR_PRIO_ENABLED(chunk->sinfo.sinfo_flags))
++				chunk->asoc->sent_cnt_removable++;
+ 			if (chunk->chunk_hdr->flags & SCTP_DATA_UNORDERED)
+ 				SCTP_INC_STATS(net, SCTP_MIB_OUTUNORDERCHUNKS);
+ 			else
+@@ -382,6 +385,96 @@ static void sctp_insert_list(struct list_head *head, struct list_head *new)
+ 		list_add_tail(new, head);
+ }
+ 
++static int sctp_prsctp_prune_sent(struct sctp_association *asoc,
++				  struct sctp_sndrcvinfo *sinfo,
++				  struct list_head *queue, int msg_len)
++{
++	struct sctp_chunk *chk, *temp;
++
++	list_for_each_entry_safe(chk, temp, queue, transmitted_list) {
++		if (!SCTP_PR_PRIO_ENABLED(chk->sinfo.sinfo_flags) ||
++		    chk->prsctp_param <= sinfo->sinfo_timetolive)
++			continue;
++
++		list_del_init(&chk->transmitted_list);
++		sctp_insert_list(&asoc->outqueue.abandoned,
++				 &chk->transmitted_list);
++
++		asoc->sent_cnt_removable--;
++		asoc->abandoned_sent[SCTP_PR_INDEX(PRIO)]++;
++
++		if (!chk->tsn_gap_acked) {
++			if (chk->transport)
++				chk->transport->flight_size -=
++						sctp_data_size(chk);
++			asoc->outqueue.outstanding_bytes -= sctp_data_size(chk);
++		}
++
++		msg_len -= SCTP_DATA_SNDSIZE(chk) +
++			   sizeof(struct sk_buff) +
++			   sizeof(struct sctp_chunk);
++		if (msg_len <= 0)
++			break;
++	}
++
++	return msg_len;
++}
++
++static int sctp_prsctp_prune_unsent(struct sctp_association *asoc,
++				    struct sctp_sndrcvinfo *sinfo,
++				    struct list_head *queue, int msg_len)
++{
++	struct sctp_chunk *chk, *temp;
++
++	list_for_each_entry_safe(chk, temp, queue, list) {
++		if (!SCTP_PR_PRIO_ENABLED(chk->sinfo.sinfo_flags) ||
++		    chk->prsctp_param <= sinfo->sinfo_timetolive)
++			continue;
++
++		list_del_init(&chk->list);
++		asoc->sent_cnt_removable--;
++		asoc->abandoned_unsent[SCTP_PR_INDEX(PRIO)]++;
++
++		msg_len -= SCTP_DATA_SNDSIZE(chk) +
++			   sizeof(struct sk_buff) +
++			   sizeof(struct sctp_chunk);
++		sctp_chunk_free(chk);
++		if (msg_len <= 0)
++			break;
++	}
++
++	return msg_len;
++}
++
++/* Abandon the chunks according their priorities */
++void sctp_prsctp_prune(struct sctp_association *asoc,
++		       struct sctp_sndrcvinfo *sinfo, int msg_len)
++{
++	struct sctp_transport *transport;
++
++	if (!asoc->prsctp_enable || !asoc->sent_cnt_removable)
++		return;
++
++	msg_len = sctp_prsctp_prune_sent(asoc, sinfo,
++					 &asoc->outqueue.retransmit,
++					 msg_len);
++	if (msg_len <= 0)
++		return;
++
++	list_for_each_entry(transport, &asoc->peer.transport_addr_list,
++			    transports) {
++		msg_len = sctp_prsctp_prune_sent(asoc, sinfo,
++						 &transport->transmitted,
++						 msg_len);
++		if (msg_len <= 0)
++			return;
++	}
++
++	sctp_prsctp_prune_unsent(asoc, sinfo,
++				 &asoc->outqueue.out_chunk_list,
++				 msg_len);
++}
++
+ /* Mark all the eligible packets on a transport for retransmission.  */
+ void sctp_retransmit_mark(struct sctp_outq *q,
+ 			  struct sctp_transport *transport,
+@@ -973,6 +1066,9 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 
+ 				/* Mark as failed send. */
+ 				sctp_chunk_fail(chunk, SCTP_ERROR_INV_STRM);
++				if (asoc->prsctp_enable &&
++				    SCTP_PR_PRIO_ENABLED(chunk->sinfo.sinfo_flags))
++					asoc->sent_cnt_removable--;
+ 				sctp_chunk_free(chunk);
+ 				continue;
+ 			}
+@@ -1270,6 +1366,9 @@ int sctp_outq_sack(struct sctp_outq *q, struct sctp_chunk *chunk)
+ 		tsn = ntohl(tchunk->subh.data_hdr->tsn);
+ 		if (TSN_lte(tsn, ctsn)) {
+ 			list_del_init(&tchunk->transmitted_list);
++			if (asoc->prsctp_enable &&
++			    SCTP_PR_PRIO_ENABLED(chunk->sinfo.sinfo_flags))
++				asoc->sent_cnt_removable--;
+ 			sctp_chunk_free(tchunk);
+ 		}
+ 	}
+* Unmerged path net/sctp/sm_make_chunk.c
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 34a2b15b5d0d..7a08960eabb0 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -1917,6 +1917,9 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 		goto out_free;
+ 	}
+ 
++	if (sctp_wspace(asoc) < msg_len)
++		sctp_prsctp_prune(asoc, sinfo, msg_len - sctp_wspace(asoc));
++
+ 	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+ 	if (!sctp_wspace(asoc)) {
+ 		err = sctp_wait_for_sndbuf(asoc, &timeo, msg_len);
