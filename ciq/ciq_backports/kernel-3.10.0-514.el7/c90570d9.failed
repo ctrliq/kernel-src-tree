@@ -1,0 +1,168 @@
+PCI: Assign resources before drivers claim devices (pci_scan_bus())
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [pci] Assign resources before drivers claim devices (pci_scan_bus()) (Myron Stowe) [1332667]
+Rebuild_FUZZ: 96.12%
+commit-author Yijing Wang <wangyijing@huawei.com>
+commit c90570d9511d42421c85709b46bffd366185d835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c90570d9.failed
+
+Previously, pci_scan_bus() created a root PCI bus, enumerated the devices
+on it, and called pci_bus_add_devices(), which made the devices available
+for drivers to claim them.
+
+Most callers assigned resources to devices after pci_scan_bus() returns,
+which may be after drivers have claimed the devices.  This is incorrect;
+the PCI core should not change device resources while a driver is managing
+the device.
+
+Remove pci_bus_add_devices() from pci_scan_bus() and do it after any
+resource assignment in the callers.
+
+[bhelgaas: changelog, check for failure in mcf_pci_init()]
+	Signed-off-by: Yijing Wang <wangyijing@huawei.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Geert Uytterhoeven <geert@linux-m68k.org>
+CC: Guan Xuetao <gxt@mprc.pku.edu.cn>
+CC: Richard Henderson <rth@twiddle.net>
+CC: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+CC: Matt Turner <mattst88@gmail.com>
+(cherry picked from commit c90570d9511d42421c85709b46bffd366185d835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/m68k/platform/coldfire/pci.c
+#	arch/unicore32/kernel/pci.c
+diff --cc arch/m68k/platform/coldfire/pci.c
+index 8572246db84d,821de928dc3f..000000000000
+--- a/arch/m68k/platform/coldfire/pci.c
++++ b/arch/m68k/platform/coldfire/pci.c
+@@@ -319,7 -322,6 +322,10 @@@ static int __init mcf_pci_init(void
+  	pci_fixup_irqs(pci_common_swizzle, mcf_pci_map_irq);
+  	pci_bus_size_bridges(rootbus);
+  	pci_bus_assign_resources(rootbus);
+++<<<<<<< HEAD:arch/m68k/platform/coldfire/pci.c
+ +	pci_enable_bridges(rootbus);
+++=======
+++>>>>>>> c90570d9511d (PCI: Assign resources before drivers claim devices (pci_scan_bus())):arch/m68k/coldfire/pci.c
+  	pci_bus_add_devices(rootbus);
+  	return 0;
+  }
+diff --cc arch/unicore32/kernel/pci.c
+index ef69c0c82825,d45fa5f3e9c4..000000000000
+--- a/arch/unicore32/kernel/pci.c
++++ b/arch/unicore32/kernel/pci.c
+@@@ -266,22 -266,10 +266,19 @@@ static int __init pci_common_init(void
+  	pci_fixup_irqs(pci_common_swizzle, pci_puv3_map_irq);
+  
+  	if (!pci_has_flag(PCI_PROBE_ONLY)) {
+- 		/*
+- 		 * Size the bridge windows.
+- 		 */
+  		pci_bus_size_bridges(puv3_bus);
+- 
+- 		/*
+- 		 * Assign resources.
+- 		 */
+  		pci_bus_assign_resources(puv3_bus);
+  	}
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * Tell drivers about devices found.
+ +	 */
+ +	pci_bus_add_devices(puv3_bus);
+ +
+++=======
++ 	pci_bus_add_devices(puv3_bus);
+++>>>>>>> c90570d9511d (PCI: Assign resources before drivers claim devices (pci_scan_bus()))
+  	return 0;
+  }
+  subsys_initcall(pci_common_init);
+diff --git a/arch/alpha/kernel/sys_nautilus.c b/arch/alpha/kernel/sys_nautilus.c
+index 1d4aabfcf9a1..20763344efc1 100644
+--- a/arch/alpha/kernel/sys_nautilus.c
++++ b/arch/alpha/kernel/sys_nautilus.c
+@@ -207,6 +207,9 @@ nautilus_init_pci(void)
+ 
+ 	/* Scan our single hose.  */
+ 	bus = pci_scan_bus(0, alpha_mv.pci_ops, hose);
++	if (!bus)
++		return;
++
+ 	hose->bus = bus;
+ 	pcibios_claim_one_bus(bus);
+ 
+@@ -253,6 +256,7 @@ nautilus_init_pci(void)
+ 	   for the root bus, so just clear it. */
+ 	bus->self = NULL;
+ 	pci_fixup_irqs(alpha_mv.pci_swizzle, alpha_mv.pci_map_irq);
++	pci_bus_add_devices(bus);
+ }
+ 
+ /*
+* Unmerged path arch/m68k/platform/coldfire/pci.c
+diff --git a/arch/sparc/kernel/pcic.c b/arch/sparc/kernel/pcic.c
+index 09f4fdd8d808..185cfcf1a8a4 100644
+--- a/arch/sparc/kernel/pcic.c
++++ b/arch/sparc/kernel/pcic.c
+@@ -391,12 +391,16 @@ static void __init pcic_pbm_scan_bus(struct linux_pcic *pcic)
+ 	struct linux_pbm_info *pbm = &pcic->pbm;
+ 
+ 	pbm->pci_bus = pci_scan_bus(pbm->pci_first_busno, &pcic_ops, pbm);
++	if (!pbm->pci_bus)
++		return;
++
+ #if 0 /* deadwood transplanted from sparc64 */
+ 	pci_fill_in_pbm_cookies(pbm->pci_bus, pbm, pbm->prom_node);
+ 	pci_record_assignments(pbm, pbm->pci_bus);
+ 	pci_assign_unassigned(pbm, pbm->pci_bus);
+ 	pci_fixup_irq(pbm, pbm->pci_bus);
+ #endif
++	pci_bus_add_devices(pbm->pci_bus);
+ }
+ 
+ /*
+* Unmerged path arch/unicore32/kernel/pci.c
+diff --git a/drivers/pci/hotplug/ibmphp_core.c b/drivers/pci/hotplug/ibmphp_core.c
+index 3efaf4c38528..1d5b646e3db8 100644
+--- a/drivers/pci/hotplug/ibmphp_core.c
++++ b/drivers/pci/hotplug/ibmphp_core.c
+@@ -740,7 +740,7 @@ static void ibm_unconfigure_device(struct pci_func *func)
+  */
+ static u8 bus_structure_fixup(u8 busno)
+ {
+-	struct pci_bus *bus;
++	struct pci_bus *bus, *b;
+ 	struct pci_dev *dev;
+ 	u16 l;
+ 
+@@ -767,7 +767,11 @@ static u8 bus_structure_fixup(u8 busno)
+ 					(l != 0x0000) && (l != 0xffff)) {
+ 			debug("%s - Inside bus_structure_fixup()\n",
+ 							__func__);
+-			pci_scan_bus(busno, ibmphp_pci_bus->ops, NULL);
++			b = pci_scan_bus(busno, ibmphp_pci_bus->ops, NULL);
++			if (!b)
++				continue;
++
++			pci_bus_add_devices(b);
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index d406323a17b0..b61e61f82d91 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -2179,7 +2179,6 @@ struct pci_bus *pci_scan_bus(int bus, struct pci_ops *ops,
+ 	b = pci_create_root_bus(NULL, bus, ops, sysdata, &resources);
+ 	if (b) {
+ 		pci_scan_child_bus(b);
+-		pci_bus_add_devices(b);
+ 	} else {
+ 		pci_free_resource_list(&resources);
+ 	}
