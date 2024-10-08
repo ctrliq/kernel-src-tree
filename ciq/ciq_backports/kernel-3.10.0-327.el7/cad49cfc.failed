@@ -1,0 +1,192 @@
+s390/nmi: fix vector register corruption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] nmi: fix vector register corruption (Hendrik Brueckner) [1247500]
+Rebuild_FUZZ: 93.33%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit cad49cfc44a5160e3fa09b18e4e7f7cacd13f27d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cad49cfc.failed
+
+If a machine check happens, the machine has the vector facility installed
+and the extended save area exists, the cpu will save vector register
+contents into the extended save area. This is regardless of control
+register 0 contents, which enables and disables the vector facility during
+runtime.
+
+On each machine check we should validate the vector registers. The current
+code however tries to validate the registers only if the running task is
+using vector registers in user space.
+
+However even the current code is broken and causes vector register
+corruption on machine checks, if user space uses them:
+the prefix area contains a pointer (absolute address) to the machine check
+extended save area. In order to save some space the save area was put into
+an unused area of the second prefix page.
+When validating vector register contents the code uses the absolute address
+of the extended save area, which is wrong. Due to prefixing the vector
+instructions will then access contents using absolute addresses instead
+of real addresses, where the machine stored the contents.
+
+If the above would work there is still the problem that register validition
+would only happen if user space uses vector registers. If kernel space uses
+them also, this may also lead to vector register content corruption:
+if the kernel makes use of vector instructions, but the current running
+user space context does not, the machine check handler will validate
+floating point registers instead of vector registers.
+Given the fact that writing to a floating point register may change the
+upper halve of the corresponding vector register, we also experience vector
+register corruption in this case.
+
+Fix all of these issues, and always validate vector registers on each
+machine check, if the machine has the vector facility installed and the
+extended save area is defined.
+
+	Cc: <stable@vger.kernel.org> # 4.1+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit cad49cfc44a5160e3fa09b18e4e7f7cacd13f27d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/nmi.c
+diff --cc arch/s390/kernel/nmi.c
+index 504175ebf8b0,56b550893593..000000000000
+--- a/arch/s390/kernel/nmi.c
++++ b/arch/s390/kernel/nmi.c
+@@@ -20,6 -20,8 +20,11 @@@
+  #include <asm/cputime.h>
+  #include <asm/nmi.h>
+  #include <asm/crw.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/switch_to.h>
++ #include <asm/ctl_reg.h>
+++>>>>>>> cad49cfc44a5 (s390/nmi: fix vector register corruption)
+  
+  struct mcck_struct {
+  	int kill_task;
+@@@ -116,52 -118,55 +121,102 @@@ static int notrace s390_revalidate_regi
+  		 */
+  		kill_task = 1;
+  	}
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +	asm volatile(
+ +		"	ld	0,0(%0)\n"
+ +		"	ld	2,8(%0)\n"
+ +		"	ld	4,16(%0)\n"
+ +		"	ld	6,24(%0)"
+ +		: : "a" (&S390_lowcore.floating_pt_save_area));
+ +#endif
+ +
+ +	if (MACHINE_HAS_IEEE) {
+ +#ifdef CONFIG_64BIT
+ +		fpt_save_area = &S390_lowcore.floating_pt_save_area;
+ +		fpt_creg_save_area = &S390_lowcore.fpt_creg_save_area;
+ +#else
+ +		fpt_save_area = (void *) S390_lowcore.extended_save_area_addr;
+ +		fpt_creg_save_area = fpt_save_area + 128;
+ +#endif
+ +		if (!mci->fc) {
+++=======
++ 	fpt_save_area = &S390_lowcore.floating_pt_save_area;
++ 	fpt_creg_save_area = &S390_lowcore.fpt_creg_save_area;
++ 	if (!mci->fc) {
++ 		/*
++ 		 * Floating point control register can't be restored.
++ 		 * Task will be terminated.
++ 		 */
++ 		asm volatile("lfpc 0(%0)" : : "a" (&zero), "m" (zero));
++ 		kill_task = 1;
++ 	} else
++ 		asm volatile("lfpc 0(%0)" : : "a" (fpt_creg_save_area));
++ 
++ 	if (!MACHINE_HAS_VX) {
++ 		/* Revalidate floating point registers */
++ 		asm volatile(
++ 			"	ld	0,0(%0)\n"
++ 			"	ld	1,8(%0)\n"
++ 			"	ld	2,16(%0)\n"
++ 			"	ld	3,24(%0)\n"
++ 			"	ld	4,32(%0)\n"
++ 			"	ld	5,40(%0)\n"
++ 			"	ld	6,48(%0)\n"
++ 			"	ld	7,56(%0)\n"
++ 			"	ld	8,64(%0)\n"
++ 			"	ld	9,72(%0)\n"
++ 			"	ld	10,80(%0)\n"
++ 			"	ld	11,88(%0)\n"
++ 			"	ld	12,96(%0)\n"
++ 			"	ld	13,104(%0)\n"
++ 			"	ld	14,112(%0)\n"
++ 			"	ld	15,120(%0)\n"
++ 			: : "a" (fpt_save_area));
++ 	} else {
++ 		/* Revalidate vector registers */
++ 		union ctlreg0 cr0;
++ 
++ 		if (!mci->vr) {
+++>>>>>>> cad49cfc44a5 (s390/nmi: fix vector register corruption)
+  			/*
+ -			 * Vector registers can't be restored and therefore
+ -			 * the process needs to be terminated.
+ +			 * Floating point control register can't be restored.
+ +			 * Task will be terminated.
+  			 */
+ +			asm volatile("lfpc 0(%0)" : : "a" (&zero), "m" (zero));
+  			kill_task = 1;
+++<<<<<<< HEAD
+ +
+ +		} else
+ +			asm volatile("lfpc 0(%0)" : : "a" (fpt_creg_save_area));
+ +
+ +		asm volatile(
+ +			"	ld	0,0(%0)\n"
+ +			"	ld	1,8(%0)\n"
+ +			"	ld	2,16(%0)\n"
+ +			"	ld	3,24(%0)\n"
+ +			"	ld	4,32(%0)\n"
+ +			"	ld	5,40(%0)\n"
+ +			"	ld	6,48(%0)\n"
+ +			"	ld	7,56(%0)\n"
+ +			"	ld	8,64(%0)\n"
+ +			"	ld	9,72(%0)\n"
+ +			"	ld	10,80(%0)\n"
+ +			"	ld	11,88(%0)\n"
+ +			"	ld	12,96(%0)\n"
+ +			"	ld	13,104(%0)\n"
+ +			"	ld	14,112(%0)\n"
+ +			"	ld	15,120(%0)\n"
+ +			: : "a" (fpt_save_area));
+++=======
++ 		}
++ 		cr0.val = S390_lowcore.cregs_save_area[0];
++ 		cr0.afp = cr0.vx = 1;
++ 		__ctl_load(cr0.val, 0, 0);
++ 		restore_vx_regs((__vector128 *)
++ 				&S390_lowcore.vector_save_area);
++ 		__ctl_load(S390_lowcore.cregs_save_area[0], 0, 0);
+++>>>>>>> cad49cfc44a5 (s390/nmi: fix vector register corruption)
+  	}
+  	/* Revalidate access registers */
+  	asm volatile(
+diff --git a/arch/s390/include/asm/ctl_reg.h b/arch/s390/include/asm/ctl_reg.h
+index 01b9dc972c09..e8289bc6d454 100644
+--- a/arch/s390/include/asm/ctl_reg.h
++++ b/arch/s390/include/asm/ctl_reg.h
+@@ -71,7 +71,10 @@ union ctlreg0 {
+ 		unsigned long lap  : 1; /* Low-address-protection control */
+ 		unsigned long	   : 4;
+ 		unsigned long edat : 1; /* Enhanced-DAT-enablement control */
+-		unsigned long	   : 23;
++		unsigned long	   : 4;
++		unsigned long afp  : 1; /* AFP-register control */
++		unsigned long vx   : 1; /* Vector enablement control */
++		unsigned long	   : 17;
+ 	};
+ };
+ 
+* Unmerged path arch/s390/kernel/nmi.c
