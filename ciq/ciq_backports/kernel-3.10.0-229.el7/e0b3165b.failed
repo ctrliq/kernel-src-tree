@@ -1,0 +1,612 @@
+cpufreq: add 'freq_table' in struct cpufreq_policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] add 'freq_table' in struct cpufreq_policy (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 90.11%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit e0b3165ba521c6824b3e9f563f38a701dfa2d8e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e0b3165b.failed
+
+freq table is not per CPU but per policy, so it makes more sense to
+keep it within struct cpufreq_policy instead of a per-cpu variable.
+
+This patch does it. Over that, there is no need to set policy->freq_table
+to NULL in ->exit(), as policy structure is going to be freed soon.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit e0b3165ba521c6824b3e9f563f38a701dfa2d8e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+#	drivers/cpufreq/freq_table.c
+#	drivers/cpufreq/loongson2_cpufreq.c
+#	drivers/cpufreq/ppc-corenet-cpufreq.c
+#	drivers/cpufreq/sparc-us2e-cpufreq.c
+#	drivers/cpufreq/sparc-us3-cpufreq.c
+#	drivers/cpufreq/tegra-cpufreq.c
+#	include/linux/cpufreq.h
+diff --cc drivers/cpufreq/cpufreq.c
+index c8bc717e8458,dddbefb857c9..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -182,6 -146,57 +182,60 @@@ u64 get_cpu_idle_time(unsigned int cpu
+  }
+  EXPORT_SYMBOL_GPL(get_cpu_idle_time);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This is a generic cpufreq init() routine which can be used by cpufreq
++  * drivers of SMP systems. It will do following:
++  * - validate & show freq table passed
++  * - set policies transition latency
++  * - policy->cpus with all possible CPUs
++  */
++ int cpufreq_generic_init(struct cpufreq_policy *policy,
++ 		struct cpufreq_frequency_table *table,
++ 		unsigned int transition_latency)
++ {
++ 	int ret;
++ 
++ 	ret = cpufreq_table_validate_and_show(policy, table);
++ 	if (ret) {
++ 		pr_err("%s: invalid frequency table: %d\n", __func__, ret);
++ 		return ret;
++ 	}
++ 
++ 	policy->cpuinfo.transition_latency = transition_latency;
++ 
++ 	/*
++ 	 * The driver only supports the SMP configuartion where all processors
++ 	 * share the clock and voltage and clock.
++ 	 */
++ 	cpumask_setall(policy->cpus);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_generic_init);
++ 
++ unsigned int cpufreq_generic_get(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
++ 
++ 	if (!policy || IS_ERR(policy->clk)) {
++ 		pr_err("%s: No %s associated to cpu: %d\n",
++ 		       __func__, policy ? "clk" : "policy", cpu);
++ 		return 0;
++ 	}
++ 
++ 	return clk_get_rate(policy->clk) / 1000;
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_generic_get);
++ 
++ /* Only for cpufreq core internal use */
++ struct cpufreq_policy *cpufreq_cpu_get_raw(unsigned int cpu)
++ {
++ 	return per_cpu(cpufreq_cpu_data, cpu);
++ }
++ 
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
+  {
+  	struct cpufreq_policy *policy = NULL;
+@@@ -911,16 -951,98 +965,111 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	policy->governor = NULL;
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	init_rwsem(&policy->rwsem);
++ 
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
++ {
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_REMOVE_POLICY, policy);
++ 
++ 	down_read(&policy->rwsem);
++ 	kobj = &policy->kobj;
++ 	cmp = &policy->kobj_unregister;
++ 	up_read(&policy->rwsem);
++ 	kobject_put(kobj);
++ 
++ 	/*
++ 	 * We need to make sure that the underlying kobj is
++ 	 * actually not referenced anymore by anybody before we
++ 	 * proceed with unloading.
++ 	 */
++ 	pr_debug("waiting for dropping of refcount\n");
++ 	wait_for_completion(cmp);
++ 	pr_debug("wait complete\n");
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
++ {
++ 	if (WARN_ON(cpu == policy->cpu))
++ 		return;
++ 
++ 	down_write(&policy->rwsem);
++ 
++ 	policy->last_cpu = policy->cpu;
++ 	policy->cpu = cpu;
++ 
++ 	up_write(&policy->rwsem);
++ 
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_UPDATE_POLICY_CPU, policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+diff --cc drivers/cpufreq/freq_table.c
+index 8962d53f6e56,65a477075b3f..000000000000
+--- a/drivers/cpufreq/freq_table.c
++++ b/drivers/cpufreq/freq_table.c
+@@@ -86,6 -90,20 +86,23 @@@ int cpufreq_frequency_table_verify(stru
+  }
+  EXPORT_SYMBOL_GPL(cpufreq_frequency_table_verify);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Generic routine to verify policy & frequency table, requires driver to set
++  * policy->freq_table prior to it.
++  */
++ int cpufreq_generic_frequency_table_verify(struct cpufreq_policy *policy)
++ {
++ 	struct cpufreq_frequency_table *table =
++ 		cpufreq_frequency_get_table(policy->cpu);
++ 	if (!table)
++ 		return -ENODEV;
++ 
++ 	return cpufreq_frequency_table_verify(policy, table);
++ }
++ EXPORT_SYMBOL_GPL(cpufreq_generic_frequency_table_verify);
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  
+  int cpufreq_frequency_table_target(struct cpufreq_policy *policy,
+  				   struct cpufreq_frequency_table *table,
+@@@ -188,20 -206,16 +205,15 @@@ EXPORT_SYMBOL_GPL(cpufreq_frequency_tab
+  /**
+   * show_available_freqs - show available frequencies for the specified CPU
+   */
+ -static ssize_t show_available_freqs(struct cpufreq_policy *policy, char *buf,
+ -				    bool show_boost)
+ +static ssize_t show_available_freqs(struct cpufreq_policy *policy, char *buf)
+  {
+  	unsigned int i = 0;
+- 	unsigned int cpu = policy->cpu;
+  	ssize_t count = 0;
+- 	struct cpufreq_frequency_table *table;
++ 	struct cpufreq_frequency_table *table = policy->freq_table;
+  
+- 	if (!per_cpu(cpufreq_show_table, cpu))
++ 	if (!table)
+  		return -ENODEV;
+  
+- 	table = per_cpu(cpufreq_show_table, cpu);
+- 
+  	for (i = 0; (table[i].frequency != CPUFREQ_TABLE_END); i++) {
+  		if (table[i].frequency == CPUFREQ_ENTRY_INVALID)
+  			continue;
+@@@ -213,33 -241,43 +225,14 @@@
+  
+  }
+  
+ -#define cpufreq_attr_available_freq(_name)	  \
+ -struct freq_attr cpufreq_freq_attr_##_name##_freqs =     \
+ -__ATTR_RO(_name##_frequencies)
+ -
+ -/**
+ - * show_scaling_available_frequencies - show available normal frequencies for
+ - * the specified CPU
+ - */
+ -static ssize_t scaling_available_frequencies_show(struct cpufreq_policy *policy,
+ -						  char *buf)
+ -{
+ -	return show_available_freqs(policy, buf, false);
+ -}
+ -cpufreq_attr_available_freq(scaling_available);
+ -EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_available_freqs);
+ -
+ -/**
+ - * show_available_boost_freqs - show available boost frequencies for
+ - * the specified CPU
+ - */
+ -static ssize_t scaling_boost_frequencies_show(struct cpufreq_policy *policy,
+ -					      char *buf)
+ -{
+ -	return show_available_freqs(policy, buf, true);
+ -}
+ -cpufreq_attr_available_freq(scaling_boost);
+ -EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_boost_freqs);
+ -
+ -struct freq_attr *cpufreq_generic_attr[] = {
+ -	&cpufreq_freq_attr_scaling_available_freqs,
+ -#ifdef CONFIG_CPU_FREQ_BOOST_SW
+ -	&cpufreq_freq_attr_scaling_boost_freqs,
+ -#endif
+ -	NULL,
+ +struct freq_attr cpufreq_freq_attr_scaling_available_freqs = {
+ +	.attr = { .name = "scaling_available_frequencies",
+ +		  .mode = 0444,
+ +		},
+ +	.show = show_available_freqs,
+  };
+ -EXPORT_SYMBOL_GPL(cpufreq_generic_attr);
+ +EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_available_freqs);
+  
+- /*
+-  * if you use these, you must assure that the frequency table is valid
+-  * all the time between get_attr and put_attr!
+-  */
+- void cpufreq_frequency_table_get_attr(struct cpufreq_frequency_table *table,
+- 				      unsigned int cpu)
+- {
+- 	pr_debug("setting show_table for cpu %u to %p\n", cpu, table);
+- 	per_cpu(cpufreq_show_table, cpu) = table;
+- }
+- EXPORT_SYMBOL_GPL(cpufreq_frequency_table_get_attr);
+- 
+- void cpufreq_frequency_table_put_attr(unsigned int cpu)
+- {
+- 	pr_debug("clearing show_table for cpu %u\n", cpu);
+- 	per_cpu(cpufreq_show_table, cpu) = NULL;
+- }
+- EXPORT_SYMBOL_GPL(cpufreq_frequency_table_put_attr);
+- 
+  int cpufreq_table_validate_and_show(struct cpufreq_policy *policy,
+  				      struct cpufreq_frequency_table *table)
+  {
+diff --cc drivers/cpufreq/loongson2_cpufreq.c
+index f92b02ae20be,a3588d61d933..000000000000
+--- a/drivers/cpufreq/loongson2_cpufreq.c
++++ b/drivers/cpufreq/loongson2_cpufreq.c
+@@@ -148,7 -104,7 +148,11 @@@ static int loongson2_cpufreq_verify(str
+  
+  static int loongson2_cpufreq_exit(struct cpufreq_policy *policy)
+  {
+++<<<<<<< HEAD
+ +	clk_put(cpuclk);
+++=======
++ 	clk_put(policy->clk);
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  	return 0;
+  }
+  
+diff --cc drivers/cpufreq/sparc-us2e-cpufreq.c
+index 306ae462bba6,b73feeb666f9..000000000000
+--- a/drivers/cpufreq/sparc-us2e-cpufreq.c
++++ b/drivers/cpufreq/sparc-us2e-cpufreq.c
+@@@ -330,7 -302,7 +330,11 @@@ static int __init us2e_freq_cpu_init(st
+  static int us2e_freq_cpu_exit(struct cpufreq_policy *policy)
+  {
+  	if (cpufreq_us2e_driver)
+++<<<<<<< HEAD
+ +		us2e_set_cpu_divider_index(policy, 0);
+++=======
++ 		us2e_freq_target(policy, 0);
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  
+  	return 0;
+  }
+diff --cc drivers/cpufreq/sparc-us3-cpufreq.c
+index c71ee142347a,9bb42ba50efa..000000000000
+--- a/drivers/cpufreq/sparc-us3-cpufreq.c
++++ b/drivers/cpufreq/sparc-us3-cpufreq.c
+@@@ -187,7 -157,7 +187,11 @@@ static int __init us3_freq_cpu_init(str
+  static int us3_freq_cpu_exit(struct cpufreq_policy *policy)
+  {
+  	if (cpufreq_us3_driver)
+++<<<<<<< HEAD
+ +		us3_set_cpu_divider_index(policy, 0);
+++=======
++ 		us3_freq_target(policy, 0);
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  
+  	return 0;
+  }
+diff --cc drivers/cpufreq/tegra-cpufreq.c
+index c74c0e130ef4,63f00598a251..000000000000
+--- a/drivers/cpufreq/tegra-cpufreq.c
++++ b/drivers/cpufreq/tegra-cpufreq.c
+@@@ -234,7 -136,7 +234,11 @@@ static int tegra_cpu_init(struct cpufre
+  
+  static int tegra_cpu_exit(struct cpufreq_policy *policy)
+  {
+++<<<<<<< HEAD
+ +	cpufreq_frequency_table_cpuinfo(policy, freq_table);
+++=======
++ 	clk_disable_unprepare(cpu_clk);
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  	clk_disable_unprepare(emc_clk);
+  	return 0;
+  }
+diff --cc include/linux/cpufreq.h
+index 4d87da0ff71a,79341350f498..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -111,18 -85,27 +111,19 @@@ struct cpufreq_policy 
+  					 * called, but you're in IRQ context */
+  
+  	struct cpufreq_real_policy	user_policy;
++ 	struct cpufreq_frequency_table	*freq_table;
+  
+ -	struct list_head        policy_list;
+  	struct kobject		kobj;
+  	struct completion	kobj_unregister;
+ -
+ -	/*
+ -	 * The rules for this semaphore:
+ -	 * - Any routine that wants to read from the policy structure will
+ -	 *   do a down_read on this semaphore.
+ -	 * - Any routine that will write to the policy structure and/or may take away
+ -	 *   the policy altogether (eg. CPU hotplug), will hold this lock in write
+ -	 *   mode before doing so.
+ -	 *
+ -	 * Additional rules:
+ -	 * - Lock should not be held across
+ -	 *     __cpufreq_governor(data, CPUFREQ_GOV_POLICY_EXIT);
+ -	 */
+ -	struct rw_semaphore	rwsem;
+ +	int			transition_ongoing; /* Tracks transition status */
+  };
+  
+ +#define CPUFREQ_ADJUST			(0)
+ +#define CPUFREQ_INCOMPATIBLE		(1)
+ +#define CPUFREQ_NOTIFY			(2)
+ +#define CPUFREQ_START			(3)
+ +#define CPUFREQ_UPDATE_POLICY_CPU	(4)
+ +
+  /* Only for ACPI */
+  #define CPUFREQ_SHARED_TYPE_NONE (0) /* None */
+  #define CPUFREQ_SHARED_TYPE_HW	 (1) /* HW does needed coordination */
+@@@ -427,20 -475,42 +428,59 @@@ int cpufreq_frequency_table_target(stru
+  int cpufreq_frequency_table_get_index(struct cpufreq_policy *policy,
+  		unsigned int freq);
+  
+++<<<<<<< HEAD
+ +/* the following 3 funtions are for cpufreq core use only */
+++=======
++ ssize_t cpufreq_show_cpus(const struct cpumask *mask, char *buf);
++ 
++ #ifdef CONFIG_CPU_FREQ
++ int cpufreq_boost_trigger_state(int state);
++ int cpufreq_boost_supported(void);
++ int cpufreq_boost_enabled(void);
++ #else
++ static inline int cpufreq_boost_trigger_state(int state)
++ {
++ 	return 0;
++ }
++ static inline int cpufreq_boost_supported(void)
++ {
++ 	return 0;
++ }
++ static inline int cpufreq_boost_enabled(void)
++ {
++ 	return 0;
++ }
++ #endif
++ /* the following funtion is for cpufreq core use only */
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  struct cpufreq_frequency_table *cpufreq_frequency_get_table(unsigned int cpu);
+  
+  /* the following are really really optional */
+  extern struct freq_attr cpufreq_freq_attr_scaling_available_freqs;
+++<<<<<<< HEAD
+ +
+ +void cpufreq_frequency_table_get_attr(struct cpufreq_frequency_table *table,
+ +				      unsigned int cpu);
+ +void cpufreq_frequency_table_update_policy_cpu(struct cpufreq_policy *policy);
+ +
+ +void cpufreq_frequency_table_put_attr(unsigned int cpu);
+ +int cpufreq_table_validate_and_show(struct cpufreq_policy *policy,
+ +				      struct cpufreq_frequency_table *table);
+ +
+ +ssize_t cpufreq_show_cpus(const struct cpumask *mask, char *buf);
+++=======
++ extern struct freq_attr *cpufreq_generic_attr[];
++ int cpufreq_table_validate_and_show(struct cpufreq_policy *policy,
++ 				      struct cpufreq_frequency_table *table);
++ 
++ unsigned int cpufreq_generic_get(unsigned int cpu);
++ int cpufreq_generic_init(struct cpufreq_policy *policy,
++ 		struct cpufreq_frequency_table *table,
++ 		unsigned int transition_latency);
++ static inline int cpufreq_generic_exit(struct cpufreq_policy *policy)
++ {
++ 	return 0;
++ }
+++>>>>>>> e0b3165ba521 (cpufreq: add 'freq_table' in struct cpufreq_policy)
+  
+  #endif /* _LINUX_CPUFREQ_H */
+* Unmerged path drivers/cpufreq/ppc-corenet-cpufreq.c
+diff --git a/drivers/cpufreq/acpi-cpufreq.c b/drivers/cpufreq/acpi-cpufreq.c
+index 10095bf1ccaa..a63bbd6ac53b 100644
+--- a/drivers/cpufreq/acpi-cpufreq.c
++++ b/drivers/cpufreq/acpi-cpufreq.c
+@@ -879,7 +879,6 @@ static int acpi_cpufreq_cpu_exit(struct cpufreq_policy *policy)
+ 	pr_debug("acpi_cpufreq_cpu_exit\n");
+ 
+ 	if (data) {
+-		cpufreq_frequency_table_put_attr(policy->cpu);
+ 		per_cpu(acfreq_data, policy->cpu) = NULL;
+ 		acpi_processor_unregister_performance(data->acpi_data,
+ 						      policy->cpu);
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/drivers/cpufreq/e_powersaver.c b/drivers/cpufreq/e_powersaver.c
+index 37380fb92621..b838ccfd246d 100644
+--- a/drivers/cpufreq/e_powersaver.c
++++ b/drivers/cpufreq/e_powersaver.c
+@@ -415,7 +415,6 @@ static int eps_cpu_exit(struct cpufreq_policy *policy)
+ 	unsigned int cpu = policy->cpu;
+ 
+ 	/* Bye */
+-	cpufreq_frequency_table_put_attr(policy->cpu);
+ 	kfree(eps_cpu[cpu]);
+ 	eps_cpu[cpu] = NULL;
+ 	return 0;
+* Unmerged path drivers/cpufreq/freq_table.c
+diff --git a/drivers/cpufreq/ia64-acpi-cpufreq.c b/drivers/cpufreq/ia64-acpi-cpufreq.c
+index c0075dbaa633..4c885ff984ba 100644
+--- a/drivers/cpufreq/ia64-acpi-cpufreq.c
++++ b/drivers/cpufreq/ia64-acpi-cpufreq.c
+@@ -385,7 +385,6 @@ acpi_cpufreq_cpu_exit (
+ 	pr_debug("acpi_cpufreq_cpu_exit\n");
+ 
+ 	if (data) {
+-		cpufreq_frequency_table_put_attr(policy->cpu);
+ 		acpi_io_data[policy->cpu] = NULL;
+ 		acpi_processor_unregister_performance(&data->acpi_data,
+ 		                                      policy->cpu);
+* Unmerged path drivers/cpufreq/loongson2_cpufreq.c
+diff --git a/drivers/cpufreq/pasemi-cpufreq.c b/drivers/cpufreq/pasemi-cpufreq.c
+index b704da404067..77f05f93b8fe 100644
+--- a/drivers/cpufreq/pasemi-cpufreq.c
++++ b/drivers/cpufreq/pasemi-cpufreq.c
+@@ -249,7 +249,6 @@ static int pas_cpufreq_cpu_exit(struct cpufreq_policy *policy)
+ 	if (sdcpwr_mapbase)
+ 		iounmap(sdcpwr_mapbase);
+ 
+-	cpufreq_frequency_table_put_attr(policy->cpu);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cpufreq/powernow-k6.c b/drivers/cpufreq/powernow-k6.c
+index a5b23da513dc..760b8213f510 100644
+--- a/drivers/cpufreq/powernow-k6.c
++++ b/drivers/cpufreq/powernow-k6.c
+@@ -176,7 +176,6 @@ static int powernow_k6_cpu_exit(struct cpufreq_policy *policy)
+ 		if (i == max_multiplier)
+ 			powernow_k6_set_state(policy, i);
+ 	}
+-	cpufreq_frequency_table_put_attr(policy->cpu);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cpufreq/powernow-k7.c b/drivers/cpufreq/powernow-k7.c
+index e369f59f7aa1..f0ae5318fd99 100644
+--- a/drivers/cpufreq/powernow-k7.c
++++ b/drivers/cpufreq/powernow-k7.c
+@@ -684,8 +684,6 @@ static int powernow_cpu_init(struct cpufreq_policy *policy)
+ 
+ static int powernow_cpu_exit(struct cpufreq_policy *policy)
+ {
+-	cpufreq_frequency_table_put_attr(policy->cpu);
+-
+ #ifdef CONFIG_X86_POWERNOW_K7_ACPI
+ 	if (acpi_processor_perf) {
+ 		acpi_processor_unregister_performance(acpi_processor_perf, 0);
+diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
+index 0895590c15f4..818b26372169 100644
+--- a/drivers/cpufreq/powernow-k8.c
++++ b/drivers/cpufreq/powernow-k8.c
+@@ -1188,8 +1188,6 @@ static int powernowk8_cpu_exit(struct cpufreq_policy *pol)
+ 
+ 	powernow_k8_cpu_exit_acpi(data);
+ 
+-	cpufreq_frequency_table_put_attr(pol->cpu);
+-
+ 	kfree(data->powernow_table);
+ 	kfree(data);
+ 	for_each_cpu(cpu, pol->cpus)
+* Unmerged path drivers/cpufreq/ppc-corenet-cpufreq.c
+diff --git a/drivers/cpufreq/sh-cpufreq.c b/drivers/cpufreq/sh-cpufreq.c
+index bf6083325a6f..834aa3ee1bf4 100644
+--- a/drivers/cpufreq/sh-cpufreq.c
++++ b/drivers/cpufreq/sh-cpufreq.c
+@@ -145,7 +145,6 @@ static int sh_cpufreq_cpu_exit(struct cpufreq_policy *policy)
+ 	unsigned int cpu = policy->cpu;
+ 	struct clk *cpuclk = &per_cpu(sh_cpuclk, cpu);
+ 
+-	cpufreq_frequency_table_put_attr(cpu);
+ 	clk_put(cpuclk);
+ 
+ 	return 0;
+* Unmerged path drivers/cpufreq/sparc-us2e-cpufreq.c
+* Unmerged path drivers/cpufreq/sparc-us3-cpufreq.c
+diff --git a/drivers/cpufreq/speedstep-centrino.c b/drivers/cpufreq/speedstep-centrino.c
+index f897d5105842..537704914fd1 100644
+--- a/drivers/cpufreq/speedstep-centrino.c
++++ b/drivers/cpufreq/speedstep-centrino.c
+@@ -420,8 +420,6 @@ static int centrino_cpu_exit(struct cpufreq_policy *policy)
+ 	if (!per_cpu(centrino_model, cpu))
+ 		return -ENODEV;
+ 
+-	cpufreq_frequency_table_put_attr(cpu);
+-
+ 	per_cpu(centrino_model, cpu) = NULL;
+ 
+ 	return 0;
+* Unmerged path drivers/cpufreq/tegra-cpufreq.c
+* Unmerged path include/linux/cpufreq.h
