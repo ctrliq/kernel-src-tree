@@ -1960,6 +1960,9 @@ static int mlx4_init_counters_table(struct mlx4_dev *dev)
 	if (!(dev->caps.flags & MLX4_DEV_CAP_FLAG_COUNTERS))
 		return -ENOENT;
 
+	if (!dev->caps.max_counters)
+		return -ENOSPC;
+
 	nent_pow2 = roundup_pow_of_two(dev->caps.max_counters);
 	/* reserve last counter index for sink counter */
 	return mlx4_bitmap_init(&priv->counters_bitmap, nent_pow2,
@@ -1970,6 +1973,9 @@ static int mlx4_init_counters_table(struct mlx4_dev *dev)
 static void mlx4_cleanup_counters_table(struct mlx4_dev *dev)
 {
 	if (!(dev->caps.flags & MLX4_DEV_CAP_FLAG_COUNTERS))
+		return;
+
+	if (!dev->caps.max_counters)
 		return;
 
 	mlx4_bitmap_cleanup(&mlx4_priv(dev)->counters_bitmap);
@@ -2156,10 +2162,12 @@ static int mlx4_setup_hca(struct mlx4_dev *dev)
 		goto err_srq_table_free;
 	}
 
-	err = mlx4_init_counters_table(dev);
-	if (err && err != -ENOENT) {
-		mlx4_err(dev, "Failed to initialize counters table, aborting\n");
-		goto err_qp_table_free;
+	if (!mlx4_is_slave(dev)) {
+		err = mlx4_init_counters_table(dev);
+		if (err && err != -ENOENT) {
+			mlx4_err(dev, "Failed to initialize counters table, aborting\n");
+			goto err_qp_table_free;
+		}
 	}
 
 	if (!mlx4_is_slave(dev)) {
@@ -2201,7 +2209,8 @@ static int mlx4_setup_hca(struct mlx4_dev *dev)
 	return 0;
 
 err_counters_table_free:
-	mlx4_cleanup_counters_table(dev);
+	if (!mlx4_is_slave(dev))
+		mlx4_cleanup_counters_table(dev);
 
 err_qp_table_free:
 	mlx4_cleanup_qp_table(dev);
@@ -2725,7 +2734,8 @@ err_port:
 	for (--port; port >= 1; --port)
 		mlx4_cleanup_port_info(&priv->port[port]);
 
-	mlx4_cleanup_counters_table(dev);
+	if (!mlx4_is_slave(dev))
+		mlx4_cleanup_counters_table(dev);
 	mlx4_cleanup_qp_table(dev);
 	mlx4_cleanup_srq_table(dev);
 	mlx4_cleanup_cq_table(dev);
@@ -2990,7 +3000,8 @@ static void mlx4_unload_one(struct pci_dev *pdev)
 		mlx4_free_resource_tracker(dev,
 					   RES_TR_FREE_SLAVES_ONLY);
 
-	mlx4_cleanup_counters_table(dev);
+	if (!mlx4_is_slave(dev))
+		mlx4_cleanup_counters_table(dev);
 	mlx4_cleanup_qp_table(dev);
 	mlx4_cleanup_srq_table(dev);
 	mlx4_cleanup_cq_table(dev);
