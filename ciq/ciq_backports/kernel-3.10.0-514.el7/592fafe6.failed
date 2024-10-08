@@ -1,0 +1,162 @@
+Add resilienthandles mount parm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Steve French <smfrench@gmail.com>
+commit 592fafe644bf3a48b9e00e182a67d301493634fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/592fafe6.failed
+
+Since many servers (Windows clients, and non-clustered servers) do not
+support persistent handles but do support resilient handles, allow
+the user to specify a mount option "resilienthandles" in order
+to get more reliable connections and less chance of data loss
+(at least when SMB2.1 or later).  Default resilient handle
+timeout (120 seconds to recent Windows server) is used.
+
+	Reviewed-by: Pavel Shilovsky <pshilovsky@samba.org>
+	Signed-off-by: Steve French <steve.french@primarydata.com>
+(cherry picked from commit 592fafe644bf3a48b9e00e182a67d301493634fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+diff --cc fs/cifs/cifsglob.h
+index 4e6513215bc6,2b510c537a0d..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -889,6 -898,8 +890,11 @@@ struct cifs_tcon 
+  	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
+  	bool broken_sparse_sup; /* if server or share does not support sparse */
+  	bool need_reconnect:1; /* connection reset, tid now invalid */
+++<<<<<<< HEAD
+++=======
++ 	bool use_resilient:1; /* use resilient instead of durable handles */
++ 	bool use_persistent:1; /* use persistent instead of durable handles */
+++>>>>>>> 592fafe644bf (Add resilienthandles mount parm)
+  #ifdef CONFIG_CIFS_SMB2
+  	bool print:1;		/* set if connection to printer share */
+  	bool bad_network_name:1; /* set if ret status STATUS_BAD_NETWORK_NAME */
+diff --cc fs/cifs/connect.c
+index 9f435e420f24,4042996ddc7c..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -2680,6 -2687,42 +2694,45 @@@ cifs_get_tcon(struct cifs_ses *ses, str
+  		cifs_dbg(FYI, "DFS disabled (%d)\n", tcon->Flags);
+  	}
+  	tcon->seal = volume_info->seal;
+++<<<<<<< HEAD
+++=======
++ 	tcon->use_persistent = false;
++ 	/* check if SMB2 or later, CIFS does not support persistent handles */
++ 	if (volume_info->persistent) {
++ 		if (ses->server->vals->protocol_id == 0) {
++ 			cifs_dbg(VFS,
++ 			     "SMB3 or later required for persistent handles\n");
++ 			rc = -EOPNOTSUPP;
++ 			goto out_fail;
++ #ifdef CONFIG_CIFS_SMB2
++ 		} else if (ses->server->capabilities &
++ 			   SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
++ 			tcon->use_persistent = true;
++ 		else /* persistent handles requested but not supported */ {
++ 			cifs_dbg(VFS,
++ 				"Persistent handles not supported on share\n");
++ 			rc = -EOPNOTSUPP;
++ 			goto out_fail;
++ #endif /* CONFIG_CIFS_SMB2 */
++ 		}
++ #ifdef CONFIG_CIFS_SMB2
++ 	} else if ((tcon->capabilities & SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY)
++ 	     && (ses->server->capabilities & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
++ 	     && (volume_info->nopersistent == false)) {
++ 		cifs_dbg(FYI, "enabling persistent handles\n");
++ 		tcon->use_persistent = true;
++ #endif /* CONFIG_CIFS_SMB2 */
++ 	} else if (volume_info->resilient) {
++ 		if (ses->server->vals->protocol_id == 0) {
++ 			cifs_dbg(VFS,
++ 			     "SMB2.1 or later required for resilient handles\n");
++ 			rc = -EOPNOTSUPP;
++ 			goto out_fail;
++ 		}
++ 		tcon->use_resilient = true;
++ 	}
++ 
+++>>>>>>> 592fafe644bf (Add resilienthandles mount parm)
+  	/*
+  	 * We can have only one retry value for a connection to a share so for
+  	 * resources mounted more than once to the same server share the last
+@@@ -3528,6 -3571,15 +3581,18 @@@ try_mount_again
+  		goto mount_fail_check;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CIFS_SMB2
++ 	if ((volume_info->persistent == true) && ((ses->server->capabilities &
++ 		SMB2_GLOBAL_CAP_PERSISTENT_HANDLES) == 0)) {
++ 		cifs_dbg(VFS, "persistent handles not supported by server\n");
++ 		rc = -EOPNOTSUPP;
++ 		goto mount_fail_check;
++ 	}
++ #endif /* CONFIG_CIFS_SMB2*/
++ 
+++>>>>>>> 592fafe644bf (Add resilienthandles mount parm)
+  	/* search for existing tcon to this server share */
+  	tcon = cifs_get_tcon(ses, volume_info);
+  	if (IS_ERR(tcon)) {
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index 4ea236c06c2f..f0eab541a48c 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -456,6 +456,8 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
+ 		seq_puts(s, ",hard");
+ 	if (tcon->use_persistent)
+ 		seq_puts(s, ",persistenthandles");
++	else if (tcon->use_resilient)
++		seq_puts(s, ",resilienthandles");
+ 	if (tcon->unix_ext)
+ 		seq_puts(s, ",unix");
+ 	else
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/smb2file.c b/fs/cifs/smb2file.c
+index 7198eac5dddd..0aab1130a86d 100644
+--- a/fs/cifs/smb2file.c
++++ b/fs/cifs/smb2file.c
+@@ -43,6 +43,7 @@ smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
+ 	struct smb2_file_all_info *smb2_data = NULL;
+ 	__u8 smb2_oplock[17];
+ 	struct cifs_fid *fid = oparms->fid;
++	struct network_resiliency_req nr_ioctl_req;
+ 
+ 	smb2_path = cifs_convert_path_to_utf16(oparms->path, oparms->cifs_sb);
+ 	if (smb2_path == NULL) {
+@@ -67,6 +68,24 @@ smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
+ 	if (rc)
+ 		goto out;
+ 
++
++	 if (oparms->tcon->use_resilient) {
++		nr_ioctl_req.Timeout = 0; /* use server default (120 seconds) */
++		nr_ioctl_req.Reserved = 0;
++		rc = SMB2_ioctl(xid, oparms->tcon, fid->persistent_fid,
++			fid->volatile_fid, FSCTL_LMR_REQUEST_RESILIENCY, true,
++			(char *)&nr_ioctl_req, sizeof(nr_ioctl_req),
++			NULL, NULL /* no return info */);
++		if (rc == -EOPNOTSUPP) {
++			cifs_dbg(VFS,
++			     "resiliency not supported by server, disabling\n");
++			oparms->tcon->use_resilient = false;
++		} else if (rc)
++			cifs_dbg(FYI, "error %d setting resiliency\n", rc);
++
++		rc = 0;
++	}
++
+ 	if (buf) {
+ 		/* open response does not have IndexNumber field - get it */
+ 		rc = SMB2_get_srv_num(xid, oparms->tcon, fid->persistent_fid,
