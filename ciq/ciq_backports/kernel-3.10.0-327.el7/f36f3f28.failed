@@ -1,0 +1,736 @@
+KVM: add "new" argument to kvm_arch_commit_memory_region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] add "new" argument to kvm_arch_commit_memory_region (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 95.33%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit f36f3f2846b5578d62910ee0b6dbef59fdd1cfa4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f36f3f28.failed
+
+This lets the function access the new memory slot without going through
+kvm_memslots and id_to_memslot.  It will simplify the code when more
+than one address space will be supported.
+
+Unfortunately, the "const"ness of the new argument must be casted
+away in two places.  Fixing KVM to accept const struct kvm_memory_slot
+pointers would require modifications in pretty much all architectures,
+and is left for later.
+
+	Reviewed-by: Radim Krcmar <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f36f3f2846b5578d62910ee0b6dbef59fdd1cfa4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kvm/mmu.c
+#	arch/mips/kvm/kvm_mips.c
+#	arch/powerpc/include/asm/kvm_ppc.h
+#	arch/powerpc/kvm/book3s.c
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_pr.c
+#	arch/powerpc/kvm/booke.c
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/arm/kvm/mmu.c
+index 84ba67b982c0,7f473e6d3bf5..000000000000
+--- a/arch/arm/kvm/mmu.c
++++ b/arch/arm/kvm/mmu.c
+@@@ -842,3 -1717,212 +842,215 @@@ out
+  	free_hyp_pgds();
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void kvm_arch_commit_memory_region(struct kvm *kvm,
++ 				   const struct kvm_userspace_memory_region *mem,
++ 				   const struct kvm_memory_slot *old,
++ 				   const struct kvm_memory_slot *new,
++ 				   enum kvm_mr_change change)
++ {
++ 	/*
++ 	 * At this point memslot has been committed and there is an
++ 	 * allocated dirty_bitmap[], dirty pages will be be tracked while the
++ 	 * memory slot is write protected.
++ 	 */
++ 	if (change != KVM_MR_DELETE && mem->flags & KVM_MEM_LOG_DIRTY_PAGES)
++ 		kvm_mmu_wp_memory_region(kvm, mem->slot);
++ }
++ 
++ int kvm_arch_prepare_memory_region(struct kvm *kvm,
++ 				   struct kvm_memory_slot *memslot,
++ 				   const struct kvm_userspace_memory_region *mem,
++ 				   enum kvm_mr_change change)
++ {
++ 	hva_t hva = mem->userspace_addr;
++ 	hva_t reg_end = hva + mem->memory_size;
++ 	bool writable = !(mem->flags & KVM_MEM_READONLY);
++ 	int ret = 0;
++ 
++ 	if (change != KVM_MR_CREATE && change != KVM_MR_MOVE &&
++ 			change != KVM_MR_FLAGS_ONLY)
++ 		return 0;
++ 
++ 	/*
++ 	 * Prevent userspace from creating a memory region outside of the IPA
++ 	 * space addressable by the KVM guest IPA space.
++ 	 */
++ 	if (memslot->base_gfn + memslot->npages >=
++ 	    (KVM_PHYS_SIZE >> PAGE_SHIFT))
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * A memory region could potentially cover multiple VMAs, and any holes
++ 	 * between them, so iterate over all of them to find out if we can map
++ 	 * any of them right now.
++ 	 *
++ 	 *     +--------------------------------------------+
++ 	 * +---------------+----------------+   +----------------+
++ 	 * |   : VMA 1     |      VMA 2     |   |    VMA 3  :    |
++ 	 * +---------------+----------------+   +----------------+
++ 	 *     |               memory region                |
++ 	 *     +--------------------------------------------+
++ 	 */
++ 	do {
++ 		struct vm_area_struct *vma = find_vma(current->mm, hva);
++ 		hva_t vm_start, vm_end;
++ 
++ 		if (!vma || vma->vm_start >= reg_end)
++ 			break;
++ 
++ 		/*
++ 		 * Mapping a read-only VMA is only allowed if the
++ 		 * memory region is configured as read-only.
++ 		 */
++ 		if (writable && !(vma->vm_flags & VM_WRITE)) {
++ 			ret = -EPERM;
++ 			break;
++ 		}
++ 
++ 		/*
++ 		 * Take the intersection of this VMA with the memory region
++ 		 */
++ 		vm_start = max(hva, vma->vm_start);
++ 		vm_end = min(reg_end, vma->vm_end);
++ 
++ 		if (vma->vm_flags & VM_PFNMAP) {
++ 			gpa_t gpa = mem->guest_phys_addr +
++ 				    (vm_start - mem->userspace_addr);
++ 			phys_addr_t pa = (vma->vm_pgoff << PAGE_SHIFT) +
++ 					 vm_start - vma->vm_start;
++ 
++ 			/* IO region dirty page logging not allowed */
++ 			if (memslot->flags & KVM_MEM_LOG_DIRTY_PAGES)
++ 				return -EINVAL;
++ 
++ 			ret = kvm_phys_addr_ioremap(kvm, gpa, pa,
++ 						    vm_end - vm_start,
++ 						    writable);
++ 			if (ret)
++ 				break;
++ 		}
++ 		hva = vm_end;
++ 	} while (hva < reg_end);
++ 
++ 	if (change == KVM_MR_FLAGS_ONLY)
++ 		return ret;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	if (ret)
++ 		unmap_stage2_range(kvm, mem->guest_phys_addr, mem->memory_size);
++ 	else
++ 		stage2_flush_memslot(kvm, memslot);
++ 	spin_unlock(&kvm->mmu_lock);
++ 	return ret;
++ }
++ 
++ void kvm_arch_free_memslot(struct kvm *kvm, struct kvm_memory_slot *free,
++ 			   struct kvm_memory_slot *dont)
++ {
++ }
++ 
++ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
++ 			    unsigned long npages)
++ {
++ 	/*
++ 	 * Readonly memslots are not incoherent with the caches by definition,
++ 	 * but in practice, they are used mostly to emulate ROMs or NOR flashes
++ 	 * that the guest may consider devices and hence map as uncached.
++ 	 * To prevent incoherency issues in these cases, tag all readonly
++ 	 * regions as incoherent.
++ 	 */
++ 	if (slot->flags & KVM_MEM_READONLY)
++ 		slot->flags |= KVM_MEMSLOT_INCOHERENT;
++ 	return 0;
++ }
++ 
++ void kvm_arch_memslots_updated(struct kvm *kvm, struct kvm_memslots *slots)
++ {
++ }
++ 
++ void kvm_arch_flush_shadow_all(struct kvm *kvm)
++ {
++ }
++ 
++ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
++ 				   struct kvm_memory_slot *slot)
++ {
++ 	gpa_t gpa = slot->base_gfn << PAGE_SHIFT;
++ 	phys_addr_t size = slot->npages << PAGE_SHIFT;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	unmap_stage2_range(kvm, gpa, size);
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ /*
++  * See note at ARMv7 ARM B1.14.4 (TL;DR: S/W ops are not easily virtualized).
++  *
++  * Main problems:
++  * - S/W ops are local to a CPU (not broadcast)
++  * - We have line migration behind our back (speculation)
++  * - System caches don't support S/W at all (damn!)
++  *
++  * In the face of the above, the best we can do is to try and convert
++  * S/W ops to VA ops. Because the guest is not allowed to infer the
++  * S/W to PA mapping, it can only use S/W to nuke the whole cache,
++  * which is a rather good thing for us.
++  *
++  * Also, it is only used when turning caches on/off ("The expected
++  * usage of the cache maintenance instructions that operate by set/way
++  * is associated with the cache maintenance instructions associated
++  * with the powerdown and powerup of caches, if this is required by
++  * the implementation.").
++  *
++  * We use the following policy:
++  *
++  * - If we trap a S/W operation, we enable VM trapping to detect
++  *   caches being turned on/off, and do a full clean.
++  *
++  * - We flush the caches on both caches being turned on and off.
++  *
++  * - Once the caches are enabled, we stop trapping VM ops.
++  */
++ void kvm_set_way_flush(struct kvm_vcpu *vcpu)
++ {
++ 	unsigned long hcr = vcpu_get_hcr(vcpu);
++ 
++ 	/*
++ 	 * If this is the first time we do a S/W operation
++ 	 * (i.e. HCR_TVM not set) flush the whole memory, and set the
++ 	 * VM trapping.
++ 	 *
++ 	 * Otherwise, rely on the VM trapping to wait for the MMU +
++ 	 * Caches to be turned off. At that point, we'll be able to
++ 	 * clean the caches again.
++ 	 */
++ 	if (!(hcr & HCR_TVM)) {
++ 		trace_kvm_set_way_flush(*vcpu_pc(vcpu),
++ 					vcpu_has_cache_enabled(vcpu));
++ 		stage2_flush_vm(vcpu->kvm);
++ 		vcpu_set_hcr(vcpu, hcr | HCR_TVM);
++ 	}
++ }
++ 
++ void kvm_toggle_cache(struct kvm_vcpu *vcpu, bool was_enabled)
++ {
++ 	bool now_enabled = vcpu_has_cache_enabled(vcpu);
++ 
++ 	/*
++ 	 * If switching the MMU+caches on, need to invalidate the caches.
++ 	 * If switching it off, need to clean the caches.
++ 	 * Clean + invalidate does the trick always.
++ 	 */
++ 	if (now_enabled != was_enabled)
++ 		stage2_flush_vm(vcpu->kvm);
++ 
++ 	/* Caches are now on, stop trapping VM ops (until a S/W op) */
++ 	if (now_enabled)
++ 		vcpu_set_hcr(vcpu, vcpu_get_hcr(vcpu) & ~HCR_TVM);
++ 
++ 	trace_kvm_toggle_cache(*vcpu_pc(vcpu), was_enabled, now_enabled);
++ }
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+diff --cc arch/mips/kvm/kvm_mips.c
+index 8d16253c5c0f,cd4c129ce743..000000000000
+--- a/arch/mips/kvm/kvm_mips.c
++++ b/arch/mips/kvm/kvm_mips.c
+@@@ -222,12 -205,13 +222,19 @@@ int kvm_arch_prepare_memory_region(stru
+  }
+  
+  void kvm_arch_commit_memory_region(struct kvm *kvm,
+++<<<<<<< HEAD:arch/mips/kvm/kvm_mips.c
+ +                                struct kvm_userspace_memory_region *mem,
+ +                                const struct kvm_memory_slot *old,
+ +                                enum kvm_mr_change change)
+++=======
++ 				   const struct kvm_userspace_memory_region *mem,
++ 				   const struct kvm_memory_slot *old,
++ 				   const struct kvm_memory_slot *new,
++ 				   enum kvm_mr_change change)
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region):arch/mips/kvm/mips.c
+  {
+  	unsigned long npages = 0;
+ -	int i;
+ +	int i, err = 0;
+  
+  	kvm_debug("%s: kvm: %p slot: %d, GPA: %llx, size: %llx, QVA: %llx\n",
+  		  __func__, kvm, mem->slot, mem->guest_phys_addr,
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index 84fd02a102c7,c6ef05bd0765..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -168,10 -182,11 +168,16 @@@ extern int kvmppc_core_create_memslot(s
+  				      unsigned long npages);
+  extern int kvmppc_core_prepare_memory_region(struct kvm *kvm,
+  				struct kvm_memory_slot *memslot,
+ -				const struct kvm_userspace_memory_region *mem);
+ +				struct kvm_userspace_memory_region *mem);
+  extern void kvmppc_core_commit_memory_region(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				struct kvm_userspace_memory_region *mem,
+ +				const struct kvm_memory_slot *old);
+++=======
++ 				const struct kvm_userspace_memory_region *mem,
++ 				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new);
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  extern int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm,
+  				      struct kvm_ppc_smmu_info *info);
+  extern void kvmppc_core_flush_memslot(struct kvm *kvm,
+@@@ -226,10 -244,11 +232,16 @@@ struct kvmppc_ops 
+  	void (*flush_memslot)(struct kvm *kvm, struct kvm_memory_slot *memslot);
+  	int (*prepare_memory_region)(struct kvm *kvm,
+  				     struct kvm_memory_slot *memslot,
+ -				     const struct kvm_userspace_memory_region *mem);
+ +				     struct kvm_userspace_memory_region *mem);
+  	void (*commit_memory_region)(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				     struct kvm_userspace_memory_region *mem,
+ +				     const struct kvm_memory_slot *old);
+++=======
++ 				     const struct kvm_userspace_memory_region *mem,
++ 				     const struct kvm_memory_slot *old,
++ 				     const struct kvm_memory_slot *new);
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  	int (*unmap_hva)(struct kvm *kvm, unsigned long hva);
+  	int (*unmap_hva_range)(struct kvm *kvm, unsigned long start,
+  			   unsigned long end);
+diff --cc arch/powerpc/kvm/book3s.c
+index 0813f1479c26,05ea8fc7f829..000000000000
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@@ -902,10 -763,11 +902,16 @@@ int kvmppc_core_prepare_memory_region(s
+  }
+  
+  void kvmppc_core_commit_memory_region(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				struct kvm_userspace_memory_region *mem,
+ +				const struct kvm_memory_slot *old)
+++=======
++ 				const struct kvm_userspace_memory_region *mem,
++ 				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new)
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  {
+- 	kvm->arch.kvm_ops->commit_memory_region(kvm, mem, old);
++ 	kvm->arch.kvm_ops->commit_memory_region(kvm, mem, old, new);
+  }
+  
+  int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 68c809978734,68d067ad4222..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -2253,10 -2382,12 +2253,16 @@@ static int kvmppc_core_prepare_memory_r
+  }
+  
+  static void kvmppc_core_commit_memory_region_hv(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				struct kvm_userspace_memory_region *mem,
+ +				const struct kvm_memory_slot *old)
+++=======
++ 				const struct kvm_userspace_memory_region *mem,
++ 				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new)
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  {
+  	unsigned long npages = mem->memory_size >> PAGE_SHIFT;
+ -	struct kvm_memslots *slots;
+  	struct kvm_memory_slot *memslot;
+  
+  	if (npages && old->npages) {
+diff --cc arch/powerpc/kvm/book3s_pr.c
+index c3d6bbd6f89a,64891b081ad5..000000000000
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@@ -1576,8 -1579,9 +1576,14 @@@ static int kvmppc_core_prepare_memory_r
+  }
+  
+  static void kvmppc_core_commit_memory_region_pr(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				struct kvm_userspace_memory_region *mem,
+ +				const struct kvm_memory_slot *old)
+++=======
++ 				const struct kvm_userspace_memory_region *mem,
++ 				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new)
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  {
+  	return;
+  }
+diff --cc arch/powerpc/kvm/booke.c
+index 7d018d01c5b1,cc5842657161..000000000000
+--- a/arch/powerpc/kvm/booke.c
++++ b/arch/powerpc/kvm/booke.c
+@@@ -1595,8 -1790,9 +1595,14 @@@ int kvmppc_core_prepare_memory_region(s
+  }
+  
+  void kvmppc_core_commit_memory_region(struct kvm *kvm,
+++<<<<<<< HEAD
+ +				struct kvm_userspace_memory_region *mem,
+ +				const struct kvm_memory_slot *old)
+++=======
++ 				const struct kvm_userspace_memory_region *mem,
++ 				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new)
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  {
+  }
+  
+diff --cc arch/x86/include/asm/kvm_host.h
+index 1442e6fbe132,7276107b35df..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -827,7 -871,19 +827,23 @@@ void kvm_mmu_set_mask_ptes(u64 user_mas
+  		u64 dirty_mask, u64 nx_mask, u64 x_mask);
+  
+  void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +void kvm_mmu_slot_remove_write_access(struct kvm *kvm, int slot);
+++=======
++ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
++ 				      struct kvm_memory_slot *memslot);
++ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
++ 				   const struct kvm_memory_slot *memslot);
++ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
++ 				   struct kvm_memory_slot *memslot);
++ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
++ 					struct kvm_memory_slot *memslot);
++ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
++ 			    struct kvm_memory_slot *memslot);
++ void kvm_mmu_clear_dirty_pt_masked(struct kvm *kvm,
++ 				   struct kvm_memory_slot *slot,
++ 				   gfn_t gfn_offset, unsigned long mask);
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  void kvm_mmu_zap_all(struct kvm *kvm);
+  void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm);
+  unsigned int kvm_mmu_calculate_mmu_pages(struct kvm *kvm);
+diff --cc arch/x86/kvm/mmu.c
+index d6d08b25fa7b,1bf2ae9ca521..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4375,6 -4587,106 +4375,109 @@@ void kvm_mmu_slot_remove_write_access(s
+  		kvm_flush_remote_tlbs(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
++ 		unsigned long *rmapp)
++ {
++ 	u64 *sptep;
++ 	struct rmap_iterator iter;
++ 	int need_tlb_flush = 0;
++ 	pfn_t pfn;
++ 	struct kvm_mmu_page *sp;
++ 
++ restart:
++ 	for_each_rmap_spte(rmapp, &iter, sptep) {
++ 		sp = page_header(__pa(sptep));
++ 		pfn = spte_to_pfn(*sptep);
++ 
++ 		/*
++ 		 * We cannot do huge page mapping for indirect shadow pages,
++ 		 * which are found on the last rmap (level = 1) when not using
++ 		 * tdp; such shadow pages are synced with the page table in
++ 		 * the guest, and the guest page table is using 4K page size
++ 		 * mapping if the indirect sp has level = 1.
++ 		 */
++ 		if (sp->role.direct &&
++ 			!kvm_is_reserved_pfn(pfn) &&
++ 			PageTransCompound(pfn_to_page(pfn))) {
++ 			drop_spte(kvm, sptep);
++ 			need_tlb_flush = 1;
++ 			goto restart;
++ 		}
++ 	}
++ 
++ 	return need_tlb_flush;
++ }
++ 
++ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
++ 				   const struct kvm_memory_slot *memslot)
++ {
++ 	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
++ 	spin_lock(&kvm->mmu_lock);
++ 	slot_handle_leaf(kvm, (struct kvm_memory_slot *)memslot,
++ 			 kvm_mmu_zap_collapsible_spte, true);
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
++ 				   struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/*
++ 	 * It's also safe to flush TLBs out of mmu lock here as currently this
++ 	 * function is only used for dirty logging, in which case flushing TLB
++ 	 * out of mmu lock also guarantees no dirty pages will be lost in
++ 	 * dirty_bitmap.
++ 	 */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_leaf_clear_dirty);
++ 
++ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
++ 					struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_large_level(kvm, memslot, slot_rmap_write_protect,
++ 					false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	/* see kvm_mmu_slot_remove_write_access */
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_largepage_remove_write_access);
++ 
++ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
++ 			    struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_all_level(kvm, memslot, __rmap_set_dirty, false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/* see kvm_mmu_slot_leaf_clear_dirty */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_set_dirty);
++ 
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  #define BATCH_ZAP_PAGES	10
+  static void kvm_zap_obsolete_pages(struct kvm *kvm)
+  {
+diff --cc arch/x86/kvm/x86.c
+index d9fe72002acd,ba7b0cc52fed..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7482,15 -7727,65 +7482,19 @@@ int kvm_arch_prepare_memory_region(stru
+  	return 0;
+  }
+  
+ -static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ -				     struct kvm_memory_slot *new)
+ -{
+ -	/* Still write protect RO slot */
+ -	if (new->flags & KVM_MEM_READONLY) {
+ -		kvm_mmu_slot_remove_write_access(kvm, new);
+ -		return;
+ -	}
+ -
+ -	/*
+ -	 * Call kvm_x86_ops dirty logging hooks when they are valid.
+ -	 *
+ -	 * kvm_x86_ops->slot_disable_log_dirty is called when:
+ -	 *
+ -	 *  - KVM_MR_CREATE with dirty logging is disabled
+ -	 *  - KVM_MR_FLAGS_ONLY with dirty logging is disabled in new flag
+ -	 *
+ -	 * The reason is, in case of PML, we need to set D-bit for any slots
+ -	 * with dirty logging disabled in order to eliminate unnecessary GPA
+ -	 * logging in PML buffer (and potential PML buffer full VMEXT). This
+ -	 * guarantees leaving PML enabled during guest's lifetime won't have
+ -	 * any additonal overhead from PML when guest is running with dirty
+ -	 * logging disabled for memory slots.
+ -	 *
+ -	 * kvm_x86_ops->slot_enable_log_dirty is called when switching new slot
+ -	 * to dirty logging mode.
+ -	 *
+ -	 * If kvm_x86_ops dirty logging hooks are invalid, use write protect.
+ -	 *
+ -	 * In case of write protect:
+ -	 *
+ -	 * Write protect all pages for dirty logging.
+ -	 *
+ -	 * All the sptes including the large sptes which point to this
+ -	 * slot are set to readonly. We can not create any new large
+ -	 * spte on this slot until the end of the logging.
+ -	 *
+ -	 * See the comments in fast_page_fault().
+ -	 */
+ -	if (new->flags & KVM_MEM_LOG_DIRTY_PAGES) {
+ -		if (kvm_x86_ops->slot_enable_log_dirty)
+ -			kvm_x86_ops->slot_enable_log_dirty(kvm, new);
+ -		else
+ -			kvm_mmu_slot_remove_write_access(kvm, new);
+ -	} else {
+ -		if (kvm_x86_ops->slot_disable_log_dirty)
+ -			kvm_x86_ops->slot_disable_log_dirty(kvm, new);
+ -	}
+ -}
+ -
+  void kvm_arch_commit_memory_region(struct kvm *kvm,
+ -				const struct kvm_userspace_memory_region *mem,
+ +				struct kvm_userspace_memory_region *mem,
+  				const struct kvm_memory_slot *old,
++ 				const struct kvm_memory_slot *new,
+  				enum kvm_mr_change change)
+  {
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  	int nr_mmu_pages = 0;
+  
+- 	if ((mem->slot >= KVM_USER_MEM_SLOTS) && (change == KVM_MR_DELETE)) {
++ 	if (change == KVM_MR_DELETE && old->id >= KVM_USER_MEM_SLOTS) {
+  		int ret;
+  
+  		ret = vm_munmap(old->userspace_addr,
+@@@ -7506,17 -7801,36 +7510,33 @@@
+  
+  	if (nr_mmu_pages)
+  		kvm_mmu_change_mmu_pages(kvm, nr_mmu_pages);
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  	/*
+ -	 * Dirty logging tracks sptes in 4k granularity, meaning that large
+ -	 * sptes have to be split.  If live migration is successful, the guest
+ -	 * in the source machine will be destroyed and large sptes will be
+ -	 * created in the destination. However, if the guest continues to run
+ -	 * in the source machine (for example if live migration fails), small
+ -	 * sptes will remain around and cause bad performance.
+ +	 * Write protect all pages for dirty logging.
+  	 *
+ -	 * Scan sptes if dirty logging has been stopped, dropping those
+ -	 * which can be collapsed into a single large-page spte.  Later
+ -	 * page faults will create the large-page sptes.
+ -	 */
+ -	if ((change != KVM_MR_DELETE) &&
+ -		(old->flags & KVM_MEM_LOG_DIRTY_PAGES) &&
+ -		!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))
+ -		kvm_mmu_zap_collapsible_sptes(kvm, new);
+ -
+ -	/*
+ -	 * Set up write protection and/or dirty logging for the new slot.
+ +	 * All the sptes including the large sptes which point to this
+ +	 * slot are set to readonly. We can not create any new large
+ +	 * spte on this slot until the end of the logging.
+  	 *
+++<<<<<<< HEAD
+ +	 * See the comments in fast_page_fault().
+ +	 */
+ +	if ((change != KVM_MR_DELETE) && (mem->flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		kvm_mmu_slot_remove_write_access(kvm, mem->slot);
+++=======
++ 	 * For KVM_MR_DELETE and KVM_MR_MOVE, the shadow pages of old slot have
++ 	 * been zapped so no dirty logging staff is needed for old slot. For
++ 	 * KVM_MR_FLAGS_ONLY, the old slot is essentially the same one as the
++ 	 * new and it's also covered when dealing with the new slot.
++ 	 *
++ 	 * FIXME: const-ify all uses of struct kvm_memory_slot.
++ 	 */
++ 	if (change != KVM_MR_DELETE)
++ 		kvm_mmu_slot_apply_flags(kvm, (struct kvm_memory_slot *) new);
+++>>>>>>> f36f3f2846b5 (KVM: add "new" argument to kvm_arch_commit_memory_region)
+  }
+  
+  void kvm_arch_flush_shadow_all(struct kvm *kvm)
+* Unmerged path arch/arm/kvm/mmu.c
+* Unmerged path arch/mips/kvm/kvm_mips.c
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+* Unmerged path arch/powerpc/kvm/book3s.c
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_pr.c
+* Unmerged path arch/powerpc/kvm/booke.c
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 4d01f57ff5f6..e56fccdb4220 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -549,9 +549,10 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 				   struct kvm_userspace_memory_region *mem,
+ 				   const struct kvm_memory_slot *old,
++				   const struct kvm_memory_slot *new,
+ 				   enum kvm_mr_change change)
+ {
+-	kvmppc_core_commit_memory_region(kvm, mem, old);
++	kvmppc_core_commit_memory_region(kvm, mem, old, new);
+ }
+ 
+ void kvm_arch_flush_shadow_all(struct kvm *kvm)
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 47964050ad30..9f4824f56d20 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -1132,6 +1132,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 				struct kvm_userspace_memory_region *mem,
+ 				const struct kvm_memory_slot *old,
++				const struct kvm_memory_slot *new,
+ 				enum kvm_mr_change change)
+ {
+ 	int rc;
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 8cf2b0938902..6d0de0dc7f0c 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -512,6 +512,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 				struct kvm_userspace_memory_region *mem,
+ 				const struct kvm_memory_slot *old,
++				const struct kvm_memory_slot *new,
+ 				enum kvm_mr_change change);
+ bool kvm_largepages_enabled(void);
+ void kvm_disable_largepages(void);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 1aa6c9846964..065580532b98 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -909,7 +909,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 	update_memslots(slots, &new);
+ 	old_memslots = install_new_memslots(kvm, slots);
+ 
+-	kvm_arch_commit_memory_region(kvm, mem, &old, change);
++	kvm_arch_commit_memory_region(kvm, mem, &old, &new, change);
+ 
+ 	kvm_free_memslot(kvm, &old, &new);
+ 	kvfree(old_memslots);
