@@ -1,0 +1,300 @@
+mtip32xx: minor performance enhancements
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Sam Bradshaw <sbradshaw@micron.com>
+commit f45c40a92d2c6915a0e88ff8a947095be2ba1c8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f45c40a9.failed
+
+This patch adds the following:
+
+1) Compiler hinting in the fast path.
+2) A prefetch of port->flags to eliminate moderate cpu stalling later
+in mtip_hw_submit_io().
+3) Eliminate a redundant rq_data_dir().
+4) Reorder members of driver_data to eliminate false cacheline sharing
+between irq_workers_active and unal_qdepth.
+
+With some workload and topology configurations, I'm seeing ~1.5%
+throughput improvement in small block random read benchmarks as well
+as improved latency std. dev.
+
+	Signed-off-by: Sam Bradshaw <sbradshaw@micron.com>
+
+Add include of <linux/prefetch.h>
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f45c40a92d2c6915a0e88ff8a947095be2ba1c8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/mtip32xx/mtip32xx.c
+diff --cc drivers/block/mtip32xx/mtip32xx.c
+index 9912f3d7777e,295f3afbbef5..000000000000
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@@ -2618,9 -2381,10 +2619,11 @@@ static void mtip_hw_submit_io(struct dr
+  	/* Map the scatter list for DMA access */
+  	nents = dma_map_sg(&dd->pdev->dev, command->sg, nents, dma_dir);
+  
++ 	prefetch(&port->flags);
++ 
+  	command->scatter_ents = nents;
+  
+ +	command->unaligned = unaligned;
+  	/*
+  	 * The number of retries for this command before it is
+  	 * reported as a failure to the upper layers.
+@@@ -2631,8 -2395,10 +2634,15 @@@
+  	fis = command->command;
+  	fis->type        = 0x27;
+  	fis->opts        = 1 << 7;
+++<<<<<<< HEAD
+ +	fis->command     =
+ +		(dir == READ ? ATA_CMD_FPDMA_READ : ATA_CMD_FPDMA_WRITE);
+++=======
++ 	if (dma_dir == DMA_FROM_DEVICE)
++ 		fis->command = ATA_CMD_FPDMA_READ;
++ 	else
++ 		fis->command = ATA_CMD_FPDMA_WRITE;
+++>>>>>>> f45c40a92d2c (mtip32xx: minor performance enhancements)
+  	fis->lba_low     = start & 0xFF;
+  	fis->lba_mid     = (start >> 8) & 0xFF;
+  	fis->lba_hi      = (start >> 16) & 0xFF;
+@@@ -2649,7 -2415,7 +2659,11 @@@
+  	fis->res3        = 0;
+  	fill_command_sg(dd, command, nents);
+  
+++<<<<<<< HEAD
+ +	if (unaligned)
+++=======
++ 	if (unlikely(command->unaligned))
+++>>>>>>> f45c40a92d2c (mtip32xx: minor performance enhancements)
+  		fis->device |= 1 << 7;
+  
+  	/* Populate the command header */
+@@@ -2677,8 -2436,8 +2691,13 @@@
+  	 * To prevent this command from being issued
+  	 * if an internal command is in progress or error handling is active.
+  	 */
+++<<<<<<< HEAD
+ +	if (port->flags & MTIP_PF_PAUSE_IO) {
+ +		set_bit(tag, port->cmds_to_issue);
+++=======
++ 	if (unlikely(port->flags & MTIP_PF_PAUSE_IO)) {
++ 		set_bit(rq->tag, port->cmds_to_issue);
+++>>>>>>> f45c40a92d2c (mtip32xx: minor performance enhancements)
+  		set_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags);
+  		return;
+  	}
+@@@ -4054,75 -3726,119 +4073,140 @@@ static void mtip_make_request(struct re
+  		}
+  		if (unlikely(test_bit(MTIP_DDF_WRITE_PROTECT_BIT,
+  							&dd->dd_flag) &&
+ -				rq_data_dir(rq))) {
+ -			return -ENODATA;
+ +				bio_data_dir(bio))) {
+ +			bio_endio(bio, -ENODATA);
+ +			return;
+ +		}
+ +		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag))) {
+ +			bio_endio(bio, -ENODATA);
+ +			return;
+ +		}
+ +		if (test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag)) {
+ +			bio_endio(bio, -ENXIO);
+ +			return;
+  		}
+ -		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag)))
+ -			return -ENODATA;
+ -		if (test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag))
+ -			return -ENXIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
+ +		bio_endio(bio, mtip_send_trim(dd, bio->bi_sector,
+ +						bio_sectors(bio)));
+++=======
++ 	if (rq->cmd_flags & REQ_DISCARD) {
++ 		int err;
++ 
++ 		err = mtip_send_trim(dd, blk_rq_pos(rq), blk_rq_sectors(rq));
++ 		blk_mq_end_io(rq, err);
++ 		return 0;
++ 	}
++ 
++ 	/* Create the scatter list for this request. */
++ 	nents = blk_rq_map_sg(hctx->queue, rq, cmd->sg);
++ 
++ 	/* Issue the read/write. */
++ 	mtip_hw_submit_io(dd, rq, cmd, nents, hctx);
++ 	return 0;
++ }
++ 
++ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
++ 				  struct request *rq)
++ {
++ 	struct driver_data *dd = hctx->queue->queuedata;
++ 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	if (rq_data_dir(rq) == READ || !dd->unal_qdepth)
++ 		return false;
++ 
++ 	/*
++ 	 * If unaligned depth must be limited on this controller, mark it
++ 	 * as unaligned if the IO isn't on a 4k boundary (start of length).
++ 	 */
++ 	if (blk_rq_sectors(rq) <= 64) {
++ 		if ((blk_rq_pos(rq) & 7) || (blk_rq_sectors(rq) & 7))
++ 			cmd->unaligned = 1;
++ 	}
++ 
++ 	if (cmd->unaligned && down_trylock(&dd->port->cmd_slot_unal))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
++ {
++ 	int ret;
++ 
++ 	if (unlikely(mtip_check_unal_depth(hctx, rq)))
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	ret = mtip_submit_request(hctx, rq);
++ 	if (likely(!ret))
++ 		return BLK_MQ_RQ_QUEUE_OK;
++ 
++ 	rq->errors = ret;
++ 	return BLK_MQ_RQ_QUEUE_ERROR;
++ }
++ 
++ static void mtip_free_cmd(void *data, struct request *rq,
++ 			  unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct driver_data *dd = data;
++ 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	if (!cmd->command)
+++>>>>>>> f45c40a92d2c (mtip32xx: minor performance enhancements)
+  		return;
+ +	}
+  
+ -	dmam_free_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+ -				cmd->command, cmd->command_dma);
+ -}
+ -
+ -static int mtip_init_cmd(void *data, struct request *rq, unsigned int hctx_idx,
+ -			 unsigned int request_idx, unsigned int numa_node)
+ -{
+ -	struct driver_data *dd = data;
+ -	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ -	u32 host_cap_64 = readl(dd->mmio + HOST_CAP) & HOST_CAP_64;
+ -
+ -	cmd->command = dmam_alloc_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+ -			&cmd->command_dma, GFP_KERNEL);
+ -	if (!cmd->command)
+ -		return -ENOMEM;
+ +	if (unlikely(!bio_has_data(bio))) {
+ +		blk_queue_flush(queue, 0);
+ +		bio_endio(bio, 0);
+ +		return;
+ +	}
+  
+ -	memset(cmd->command, 0, CMD_DMA_ALLOC_SZ);
+ +	if (bio_data_dir(bio) == WRITE && bio_sectors(bio) <= 64 &&
+ +							dd->unal_qdepth) {
+ +		if (bio->bi_sector % 8 != 0) /* Unaligned on 4k boundaries */
+ +			unaligned = 1;
+ +		else if (bio_sectors(bio) % 8 != 0) /* Aligned but not 4k/8k */
+ +			unaligned = 1;
+ +	}
+  
+ -	/* Point the command headers at the command tables. */
+ -	cmd->command_header = dd->port->command_list +
+ -				(sizeof(struct mtip_cmd_hdr) * request_idx);
+ -	cmd->command_header_dma = dd->port->command_list_dma +
+ -				(sizeof(struct mtip_cmd_hdr) * request_idx);
+ +	sg = mtip_hw_get_scatterlist(dd, &tag, unaligned);
+ +	if (likely(sg != NULL)) {
+ +		blk_queue_bounce(queue, &bio);
+  
+ -	if (host_cap_64)
+ -		cmd->command_header->ctbau = __force_bit2int cpu_to_le32((cmd->command_dma >> 16) >> 16);
+ +		if (unlikely((bio)->bi_vcnt > MTIP_MAX_SG)) {
+ +			dev_warn(&dd->pdev->dev,
+ +				"Maximum number of SGL entries exceeded\n");
+ +			bio_io_error(bio);
+ +			mtip_hw_release_scatterlist(dd, tag, unaligned);
+ +			return;
+ +		}
+  
+ -	cmd->command_header->ctba = __force_bit2int cpu_to_le32(cmd->command_dma & 0xFFFFFFFF);
+ +		/* Create the scatter list for this bio. */
+ +		bio_for_each_segment(bvec, bio, i) {
+ +			sg_set_page(&sg[nents],
+ +					bvec->bv_page,
+ +					bvec->bv_len,
+ +					bvec->bv_offset);
+ +			nents++;
+ +		}
+  
+ -	sg_init_table(cmd->sg, MTIP_MAX_SG);
+ -	return 0;
+ +		/* Issue the read/write. */
+ +		mtip_hw_submit_io(dd,
+ +				bio->bi_sector,
+ +				bio_sectors(bio),
+ +				nents,
+ +				tag,
+ +				bio_endio,
+ +				bio,
+ +				bio_data_dir(bio),
+ +				unaligned);
+ +	} else
+ +		bio_io_error(bio);
+  }
+  
+ -static struct blk_mq_ops mtip_mq_ops = {
+ -	.queue_rq	= mtip_queue_rq,
+ -	.map_queue	= blk_mq_map_queue,
+ -	.init_request	= mtip_init_cmd,
+ -	.exit_request	= mtip_free_cmd,
+ -};
+ -
+  /*
+   * Block layer initialization function.
+   *
+* Unmerged path drivers/block/mtip32xx/mtip32xx.c
+diff --git a/drivers/block/mtip32xx/mtip32xx.h b/drivers/block/mtip32xx/mtip32xx.h
+index 54174cb32feb..109ef4526589 100644
+--- a/drivers/block/mtip32xx/mtip32xx.h
++++ b/drivers/block/mtip32xx/mtip32xx.h
+@@ -509,19 +509,19 @@ struct driver_data {
+ 
+ 	struct workqueue_struct *isr_workq;
+ 
+-	struct mtip_work work[MTIP_MAX_SLOT_GROUPS];
+-
+ 	atomic_t irq_workers_active;
+ 
++	struct mtip_work work[MTIP_MAX_SLOT_GROUPS];
++
+ 	int isr_binding;
+ 
+ 	struct block_device *bdev;
+ 
+-	int unal_qdepth; /* qdepth of unaligned IO queue */
+-
+ 	struct list_head online_list; /* linkage for online list */
+ 
+ 	struct list_head remove_list; /* linkage for removing list */
++
++	int unal_qdepth; /* qdepth of unaligned IO queue */
+ };
+ 
+ #endif
