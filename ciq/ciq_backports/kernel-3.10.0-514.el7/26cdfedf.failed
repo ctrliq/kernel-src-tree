@@ -1,0 +1,76 @@
+rcu: Reject memory-order-induced stall-warning false positives
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+commit 26cdfedf6a902345f8604ea8e0b7dd2566b37a46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/26cdfedf.failed
+
+If a system is idle from an RCU perspective for longer than specified
+by CONFIG_RCU_CPU_STALL_TIMEOUT, and if one CPU starts a grace period
+just as a second checks for CPU stalls, and if this second CPU happens
+to see the old value of rsp->jiffies_stall, it will incorrectly report a
+CPU stall.  This is quite rare, but apparently occurs deterministically
+on systems with about 6TB of memory.
+
+This commit therefore orders accesses to the data used to determine
+whether or not a CPU stall is in progress.  Grace-period initialization
+and cleanup first increments rsp->completed to mark the end of the
+previous grace period, then records the current jiffies in rsp->gp_start,
+then records the jiffies at which a stall can be expected to occur in
+rsp->jiffies_stall, and finally increments rsp->gpnum to mark the start
+of the new grace period.  Now, this ordering by itself does not prevent
+false positives.  For example, if grace-period initialization was delayed
+between recording rsp->gp_start and rsp->jiffies_stall, the CPU stall
+warning code might still see an old value of rsp->jiffies_stall.
+
+Therefore, this commit also orders the CPU stall warning accesses as
+well, loading rsp->gpnum and jiffies, then rsp->jiffies_stall, then
+rsp->gp_start, and finally rsp->completed.  This ordering means that
+the false-positive scenario in the previous paragraph would result
+in rsp->completed being greater than or equal to rsp->gpnum, which is
+never valid for a CPU stall, allowing the false positive to be rejected.
+Furthermore, any fetch that gets an old value of rsp->jiffies_stall
+must also get an old value of rsp->gpnum, which will again be rejected
+by the comparison of rsp->gpnum and rsp->completed.  Situations where
+rsp->gp_start is later than rsp->jiffies_stall are also rejected, as
+are situations where jiffies is less than rsp->jiffies_stall.
+
+Although use of unsynchronized accesses means that there are likely
+still some false-positive scenarios (synchronization has proven to be
+a very bad idea on large systems), this should get rid of a large class
+of these scenarios.
+
+	Reported-by: Fabian Herschel <fabian.herschel@suse.com>
+	Reported-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Reviewed-by: Michal Hocko <mhocko@suse.cz>
+	Tested-by: Jochen Striepe <jochen@tolot.escape.de>
+(cherry picked from commit 26cdfedf6a902345f8604ea8e0b7dd2566b37a46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcutree.c
+diff --cc kernel/rcutree.c
+index 8a3ca028ee72,b618d72bd8ec..000000000000
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@@ -1427,9 -1351,10 +1461,15 @@@ static int rcu_gp_init(struct rcu_stat
+  	}
+  
+  	/* Advance to a new grace period and initialize state. */
++ 	record_gp_stall_check_time(rsp);
++ 	smp_wmb(); /* Record GP times before starting GP. */
+  	rsp->gpnum++;
+++<<<<<<< HEAD
+ +	trace_rcu_grace_period(rsp->name, rsp->gpnum, "start");
+ +	record_gp_stall_check_time(rsp);
+++=======
++ 	trace_rcu_grace_period(rsp->name, rsp->gpnum, TPS("start"));
+++>>>>>>> 26cdfedf6a90 (rcu: Reject memory-order-induced stall-warning false positives)
+  	raw_spin_unlock_irq(&rnp->lock);
+  
+  	/* Exclude any concurrent CPU-hotplug operations. */
+* Unmerged path kernel/rcutree.c
