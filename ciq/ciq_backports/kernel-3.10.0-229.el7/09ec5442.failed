@@ -1,0 +1,128 @@
+clocksource: Move cycle_last validation to core code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] time/clocksource: Move cycle_last validation to core code (Prarit Bhargava) [1148398]
+Rebuild_FUZZ: 95.41%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 09ec54429c6d10f87d1f084de53ae2c1c3a81108
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/09ec5442.failed
+
+The only user of the cycle_last validation is the x86 TSC. In order to
+provide NMI safe accessor functions for clock monotonic and
+monotonic_raw we need to do that in the core.
+
+We can't do the TSC specific
+
+    if (now < cycle_last)
+       	    now = cycle_last;
+
+for the other wrapping around clocksources, but TSC has
+CLOCKSOURCE_MASK(64) which actually does not mask out anything so if
+now is less than cycle_last the subtraction will give a negative
+result. So we can check for that in clocksource_delta() and return 0
+for that case.
+
+Implement and enable it for x86
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+(cherry picked from commit 09ec54429c6d10f87d1f084de53ae2c1c3a81108)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	kernel/time/timekeeping_internal.h
+diff --cc arch/x86/Kconfig
+index a9a20295a8de,d08e061c187a..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -104,11 -105,13 +104,16 @@@ config X8
+  	select HAVE_ARCH_SECCOMP_FILTER
+  	select BUILDTIME_EXTABLE_SORT
+  	select GENERIC_CMOS_UPDATE
+ -	select HAVE_ARCH_SOFT_DIRTY if X86_64
+ -	select CLOCKSOURCE_WATCHDOG
+  	select GENERIC_CLOCKEVENTS
+++<<<<<<< HEAD
+ +	select ARCH_CLOCKSOURCE_DATA if X86_64
+++=======
++ 	select ARCH_CLOCKSOURCE_DATA
++ 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
+++>>>>>>> 09ec54429c6d (clocksource: Move cycle_last validation to core code)
+  	select GENERIC_CLOCKEVENTS_BROADCAST if X86_64 || (X86_32 && X86_LOCAL_APIC)
+ -	select GENERIC_TIME_VSYSCALL
+ +	select GENERIC_TIME_VSYSCALL if X86_64
+ +	select KTIME_SCALAR if X86_32
+  	select GENERIC_STRNCPY_FROM_USER
+  	select GENERIC_STRNLEN_USER
+  	select HAVE_CONTEXT_TRACKING if X86_64
+* Unmerged path kernel/time/timekeeping_internal.h
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index c81028337c49..1223076474dc 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -753,7 +753,7 @@ core_initcall(cpufreq_tsc);
+ static struct clocksource clocksource_tsc;
+ 
+ /*
+- * We compare the TSC to the cycle_last value in the clocksource
++ * We used to compare the TSC to the cycle_last value in the clocksource
+  * structure to avoid a nasty time-warp. This can be observed in a
+  * very small window right after one CPU updated cycle_last under
+  * xtime/vsyscall_gtod lock and the other CPU reads a TSC value which
+@@ -763,26 +763,23 @@ static struct clocksource clocksource_tsc;
+  * due to the unsigned delta calculation of the time keeping core
+  * code, which is necessary to support wrapping clocksources like pm
+  * timer.
++ *
++ * This sanity check is now done in the core timekeeping code.
++ * checking the result of read_tsc() - cycle_last for being negative.
++ * That works because CLOCKSOURCE_MASK(64) does not mask out any bit.
+  */
+ static cycle_t read_tsc(struct clocksource *cs)
+ {
+-	cycle_t ret = (cycle_t)get_cycles();
+-
+-	return ret >= clocksource_tsc.cycle_last ?
+-		ret : clocksource_tsc.cycle_last;
+-}
+-
+-static void resume_tsc(struct clocksource *cs)
+-{
+-	if (!boot_cpu_has(X86_FEATURE_NONSTOP_TSC_S3))
+-		clocksource_tsc.cycle_last = 0;
++	return (cycle_t)get_cycles();
+ }
+ 
++/*
++ * .mask MUST be CLOCKSOURCE_MASK(64). See comment above read_tsc()
++ */
+ static struct clocksource clocksource_tsc = {
+ 	.name                   = "tsc",
+ 	.rating                 = 300,
+ 	.read                   = read_tsc,
+-	.resume			= resume_tsc,
+ 	.mask                   = CLOCKSOURCE_MASK(64),
+ 	.flags                  = CLOCK_SOURCE_IS_CONTINUOUS |
+ 				  CLOCK_SOURCE_MUST_VERIFY,
+diff --git a/kernel/time/Kconfig b/kernel/time/Kconfig
+index 747bbc70f53b..32a5eec8e9b0 100644
+--- a/kernel/time/Kconfig
++++ b/kernel/time/Kconfig
+@@ -12,6 +12,11 @@ config CLOCKSOURCE_WATCHDOG
+ config ARCH_CLOCKSOURCE_DATA
+ 	bool
+ 
++# Clocksources require validation of the clocksource against the last
++# cycle update - x86/TSC misfeature
++config CLOCKSOURCE_VALIDATE_LAST_CYCLE
++	bool
++
+ # Timekeeping vsyscall support
+ config GENERIC_TIME_VSYSCALL
+ 	bool
+* Unmerged path kernel/time/timekeeping_internal.h
