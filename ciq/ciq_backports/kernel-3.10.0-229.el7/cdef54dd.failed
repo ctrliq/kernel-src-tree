@@ -1,0 +1,641 @@
+blk-mq: remove alloc_hctx and free_hctx methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit cdef54dd85ad66e77262ea57796a3e81683dd5d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cdef54dd.failed
+
+There is no need for drivers to control hardware context allocation
+now that we do the context to node mapping in common code.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit cdef54dd85ad66e77262ea57796a3e81683dd5d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/block/null_blk.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 38a2854d3606,f27fe44230c2..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -962,25 -1335,149 +962,170 @@@ struct blk_mq_hw_ctx *blk_mq_map_queue(
+  }
+  EXPORT_SYMBOL(blk_mq_map_queue);
+  
+++<<<<<<< HEAD
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *reg,
+ +						   unsigned int hctx_index)
+ +{
+ +	return kmalloc_node(sizeof(struct blk_mq_hw_ctx),
+ +				GFP_KERNEL | __GFP_ZERO, reg->numa_node);
+ +}
+ +EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+ +
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *hctx,
+ +				 unsigned int hctx_index)
+ +{
+ +	kfree(hctx);
+ +}
+ +EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+ +
+ +static int blk_mq_hctx_notify(void *data, unsigned long action,
+ +			      unsigned int cpu)
+++=======
++ static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
++ 		struct blk_mq_tags *tags, unsigned int hctx_idx)
++ {
++ 	struct page *page;
++ 
++ 	if (tags->rqs && set->ops->exit_request) {
++ 		int i;
++ 
++ 		for (i = 0; i < tags->nr_tags; i++) {
++ 			if (!tags->rqs[i])
++ 				continue;
++ 			set->ops->exit_request(set->driver_data, tags->rqs[i],
++ 						hctx_idx, i);
++ 		}
++ 	}
++ 
++ 	while (!list_empty(&tags->page_list)) {
++ 		page = list_first_entry(&tags->page_list, struct page, lru);
++ 		list_del_init(&page->lru);
++ 		__free_pages(page, page->private);
++ 	}
++ 
++ 	kfree(tags->rqs);
++ 
++ 	blk_mq_free_tags(tags);
++ }
++ 
++ static size_t order_to_size(unsigned int order)
++ {
++ 	return (size_t)PAGE_SIZE << order;
++ }
++ 
++ static struct blk_mq_tags *blk_mq_init_rq_map(struct blk_mq_tag_set *set,
++ 		unsigned int hctx_idx)
++ {
++ 	struct blk_mq_tags *tags;
++ 	unsigned int i, j, entries_per_page, max_order = 4;
++ 	size_t rq_size, left;
++ 
++ 	tags = blk_mq_init_tags(set->queue_depth, set->reserved_tags,
++ 				set->numa_node);
++ 	if (!tags)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&tags->page_list);
++ 
++ 	tags->rqs = kmalloc_node(set->queue_depth * sizeof(struct request *),
++ 					GFP_KERNEL, set->numa_node);
++ 	if (!tags->rqs) {
++ 		blk_mq_free_tags(tags);
++ 		return NULL;
++ 	}
++ 
++ 	/*
++ 	 * rq_size is the size of the request plus driver payload, rounded
++ 	 * to the cacheline size
++ 	 */
++ 	rq_size = round_up(sizeof(struct request) + set->cmd_size,
++ 				cache_line_size());
++ 	left = rq_size * set->queue_depth;
++ 
++ 	for (i = 0; i < set->queue_depth; ) {
++ 		int this_order = max_order;
++ 		struct page *page;
++ 		int to_do;
++ 		void *p;
++ 
++ 		while (left < order_to_size(this_order - 1) && this_order)
++ 			this_order--;
++ 
++ 		do {
++ 			page = alloc_pages_node(set->numa_node, GFP_KERNEL,
++ 						this_order);
++ 			if (page)
++ 				break;
++ 			if (!this_order--)
++ 				break;
++ 			if (order_to_size(this_order) < rq_size)
++ 				break;
++ 		} while (1);
++ 
++ 		if (!page)
++ 			goto fail;
++ 
++ 		page->private = this_order;
++ 		list_add_tail(&page->lru, &tags->page_list);
++ 
++ 		p = page_address(page);
++ 		entries_per_page = order_to_size(this_order) / rq_size;
++ 		to_do = min(entries_per_page, set->queue_depth - i);
++ 		left -= to_do * rq_size;
++ 		for (j = 0; j < to_do; j++) {
++ 			tags->rqs[i] = p;
++ 			if (set->ops->init_request) {
++ 				if (set->ops->init_request(set->driver_data,
++ 						tags->rqs[i], hctx_idx, i,
++ 						set->numa_node))
++ 					goto fail;
++ 			}
++ 
++ 			p += rq_size;
++ 			i++;
++ 		}
++ 	}
++ 
++ 	return tags;
++ 
++ fail:
++ 	pr_warn("%s: failed to allocate requests\n", __func__);
++ 	blk_mq_free_rq_map(set, tags, hctx_idx);
++ 	return NULL;
++ }
++ 
++ static void blk_mq_free_bitmap(struct blk_mq_ctxmap *bitmap)
++ {
++ 	kfree(bitmap->map);
++ }
++ 
++ static int blk_mq_alloc_bitmap(struct blk_mq_ctxmap *bitmap, int node)
++ {
++ 	unsigned int bpw = 8, total, num_maps, i;
++ 
++ 	bitmap->bits_per_word = bpw;
++ 
++ 	num_maps = ALIGN(nr_cpu_ids, bpw) / bpw;
++ 	bitmap->map = kzalloc_node(num_maps * sizeof(struct blk_align_bitmap),
++ 					GFP_KERNEL, node);
++ 	if (!bitmap->map)
++ 		return -ENOMEM;
++ 
++ 	bitmap->map_size = num_maps;
++ 
++ 	total = nr_cpu_ids;
++ 	for (i = 0; i < num_maps; i++) {
++ 		bitmap->map[i].depth = min(total, bitmap->bits_per_word);
++ 		total -= bitmap->map[i].depth;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int blk_mq_hctx_cpu_offline(struct blk_mq_hw_ctx *hctx, int cpu)
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  {
+ +	struct blk_mq_hw_ctx *hctx = data;
+  	struct request_queue *q = hctx->queue;
+  	struct blk_mq_ctx *ctx;
+  	LIST_HEAD(tmp);
+@@@ -1084,106 -1553,30 +1229,120 @@@ void blk_mq_free_commands(struct reques
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned int i;
+  
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		if (i == nr_queue)
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_free_hw_commands(hctx, free, data);
+ +}
+ +EXPORT_SYMBOL(blk_mq_free_commands);
+ +
+ +static void blk_mq_free_rq_map(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	struct page *page;
+ +
+ +	while (!list_empty(&hctx->page_list)) {
+ +		page = list_first_entry(&hctx->page_list, struct page, lru);
+ +		list_del_init(&page->lru);
+ +		__free_pages(page, page->private);
+ +	}
+ +
+ +	kfree(hctx->rqs);
+ +
+ +	if (hctx->tags)
+ +		blk_mq_free_tags(hctx->tags);
+ +}
+ +
+ +static size_t order_to_size(unsigned int order)
+ +{
+ +	return (size_t)PAGE_SIZE << order;
+ +}
+ +
+ +static int blk_mq_init_rq_map(struct blk_mq_hw_ctx *hctx,
+ +			      unsigned int reserved_tags, int node)
+ +{
+ +	unsigned int i, j, entries_per_page, max_order = 4;
+ +	size_t rq_size, left;
+ +
+ +	INIT_LIST_HEAD(&hctx->page_list);
+ +
+ +	hctx->rqs = kmalloc_node(hctx->queue_depth * sizeof(struct request *),
+ +					GFP_KERNEL, node);
+ +	if (!hctx->rqs)
+ +		return -ENOMEM;
+ +
+ +	/*
+ +	 * rq_size is the size of the request plus driver payload, rounded
+ +	 * to the cacheline size
+ +	 */
+ +	rq_size = round_up(sizeof(struct request) + hctx->cmd_size,
+ +				cache_line_size());
+ +	left = rq_size * hctx->queue_depth;
+ +
+ +	for (i = 0; i < hctx->queue_depth;) {
+ +		int this_order = max_order;
+ +		struct page *page;
+ +		int to_do;
+ +		void *p;
+ +
+ +		while (left < order_to_size(this_order - 1) && this_order)
+ +			this_order--;
+ +
+ +		do {
+ +			page = alloc_pages_node(node, GFP_KERNEL, this_order);
+ +			if (page)
+ +				break;
+ +			if (!this_order--)
+ +				break;
+ +			if (order_to_size(this_order) < rq_size)
+ +				break;
+ +		} while (1);
+ +
+ +		if (!page)
+  			break;
+  
+ -		if (set->ops->exit_hctx)
+ -			set->ops->exit_hctx(hctx, i);
+ +		page->private = this_order;
+ +		list_add_tail(&page->lru, &hctx->page_list);
+  
+ -		blk_mq_unregister_cpu_notifier(&hctx->cpu_notifier);
+ -		kfree(hctx->ctxs);
+ -		blk_mq_free_bitmap(&hctx->ctx_map);
+ +		p = page_address(page);
+ +		entries_per_page = order_to_size(this_order) / rq_size;
+ +		to_do = min(entries_per_page, hctx->queue_depth - i);
+ +		left -= to_do * rq_size;
+ +		for (j = 0; j < to_do; j++) {
+ +			hctx->rqs[i] = p;
+ +			blk_mq_rq_init(hctx, hctx->rqs[i]);
+ +			p += rq_size;
+ +			i++;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (i < (reserved_tags + BLK_MQ_TAG_MIN))
+ +		goto err_rq_map;
+ +	else if (i != hctx->queue_depth) {
+ +		hctx->queue_depth = i;
+ +		pr_warn("%s: queue depth set to %u because of low memory\n",
+ +					__func__, i);
+++=======
++ }
++ 
++ static void blk_mq_free_hw_queues(struct request_queue *q,
++ 		struct blk_mq_tag_set *set)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	unsigned int i;
++ 
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		free_cpumask_var(hctx->cpumask);
++ 		kfree(hctx);
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+ +	}
+ +
+ +	hctx->tags = blk_mq_init_tags(hctx->queue_depth, reserved_tags, node);
+ +	if (!hctx->tags) {
+ +err_rq_map:
+ +		blk_mq_free_rq_map(hctx);
+ +		return -ENOMEM;
+  	}
+ +
+ +	return 0;
+  }
+  
+  static int blk_mq_init_hw_queues(struct request_queue *q,
+@@@ -1355,8 -1789,15 +1514,20 @@@ struct request_queue *blk_mq_init_queue
+  	if (!hctxs)
+  		goto err_percpu;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < reg->nr_hw_queues; i++) {
+ +		hctxs[i] = reg->ops->alloc_hctx(reg, i);
+++=======
++ 	map = blk_mq_make_queue_map(set);
++ 	if (!map)
++ 		goto err_map;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		int node = blk_mq_hw_queue_to_node(map, i);
++ 
++ 		hctxs[i] = kzalloc_node(sizeof(struct blk_mq_hw_ctx),
++ 					GFP_KERNEL, node);
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  		if (!hctxs[i])
+  			goto err_hctxs;
+  
+@@@ -1427,8 -1884,9 +1598,12 @@@ err_hctxs
+  		if (!hctxs[i])
+  			break;
+  		free_cpumask_var(hctxs[i]->cpumask);
+++<<<<<<< HEAD
+ +		reg->ops->free_hctx(hctxs[i], i);
+++=======
++ 		kfree(hctxs[i]);
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  	}
+ -err_map:
+  	kfree(hctxs);
+  err_percpu:
+  	free_percpu(ctx);
+@@@ -1505,6 -1958,81 +1680,84 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth || set->queue_depth > BLK_MQ_MAX_DEPTH)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues || !set->ops->queue_rq || !set->ops->map_queue)
++ 		return -EINVAL;
++ 
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		goto out;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ out:
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		if (set->tags[i])
++ 			blk_mq_free_rq_map(set, set->tags[i], i);
++ 	}
++ 
++ 	kfree(set->tags);
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i, ret;
++ 
++ 	if (!set || nr > set->queue_depth)
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		ret = blk_mq_tag_update_depth(hctx->tags, nr);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (!ret)
++ 		q->nr_requests = nr;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+diff --cc drivers/block/null_blk.c
+index 3ae5f19b54ef,b40af63a5476..000000000000
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@@ -320,46 -321,6 +320,49 @@@ static int null_queue_rq(struct blk_mq_
+  	return BLK_MQ_RQ_QUEUE_OK;
+  }
+  
+++<<<<<<< HEAD
+ +static struct blk_mq_hw_ctx *null_alloc_hctx(struct blk_mq_reg *reg, unsigned int hctx_index)
+ +{
+ +	int b_size = DIV_ROUND_UP(reg->nr_hw_queues, nr_online_nodes);
+ +	int tip = (reg->nr_hw_queues % nr_online_nodes);
+ +	int node = 0, i, n;
+ +
+ +	/*
+ +	 * Split submit queues evenly wrt to the number of nodes. If uneven,
+ +	 * fill the first buckets with one extra, until the rest is filled with
+ +	 * no extra.
+ +	 */
+ +	for (i = 0, n = 1; i < hctx_index; i++, n++) {
+ +		if (n % b_size == 0) {
+ +			n = 0;
+ +			node++;
+ +
+ +			tip--;
+ +			if (!tip)
+ +				b_size = reg->nr_hw_queues / nr_online_nodes;
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * A node might not be online, therefore map the relative node id to the
+ +	 * real node id.
+ +	 */
+ +	for_each_online_node(n) {
+ +		if (!node)
+ +			break;
+ +		node--;
+ +	}
+ +
+ +	return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, n);
+ +}
+ +
+ +static void null_free_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_index)
+ +{
+ +	kfree(hctx);
+ +}
+ +
+++=======
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq)
+  {
+  	BUG_ON(!nullb);
+@@@ -387,13 -348,6 +390,16 @@@ static struct blk_mq_ops null_mq_ops = 
+  	.map_queue      = blk_mq_map_queue,
+  	.init_hctx	= null_init_hctx,
+  	.complete	= null_softirq_done_fn,
+++<<<<<<< HEAD
+ +};
+ +
+ +static struct blk_mq_reg null_mq_reg = {
+ +	.ops		= &null_mq_ops,
+ +	.queue_depth	= 64,
+ +	.cmd_size	= sizeof(struct nullb_cmd),
+ +	.flags		= BLK_MQ_F_SHOULD_MERGE,
+++=======
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  };
+  
+  static void null_del_dev(struct nullb *nullb)
+@@@ -510,25 -466,31 +516,35 @@@ static int null_add_dev(void
+  
+  	spin_lock_init(&nullb->lock);
+  
+ -	if (queue_mode == NULL_Q_MQ && use_per_node_hctx)
+ -		submit_queues = nr_online_nodes;
+ -
+  	if (setup_queues(nullb))
+ -		goto out_free_nullb;
+ +		goto err;
+  
+  	if (queue_mode == NULL_Q_MQ) {
+++<<<<<<< HEAD
+ +		null_mq_reg.numa_node = home_node;
+ +		null_mq_reg.queue_depth = hw_queue_depth;
+ +		null_mq_reg.nr_hw_queues = submit_queues;
+++=======
++ 		nullb->tag_set.ops = &null_mq_ops;
++ 		nullb->tag_set.nr_hw_queues = submit_queues;
++ 		nullb->tag_set.queue_depth = hw_queue_depth;
++ 		nullb->tag_set.numa_node = home_node;
++ 		nullb->tag_set.cmd_size	= sizeof(struct nullb_cmd);
++ 		nullb->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
++ 		nullb->tag_set.driver_data = nullb;
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+ +
+ +		if (use_per_node_hctx) {
+ +			null_mq_reg.ops->alloc_hctx = null_alloc_hctx;
+ +			null_mq_reg.ops->free_hctx = null_free_hctx;
+ +		} else {
+ +			null_mq_reg.ops->alloc_hctx = blk_mq_alloc_single_hw_queue;
+ +			null_mq_reg.ops->free_hctx = blk_mq_free_single_hw_queue;
+ +		}
+  
+ -		if (blk_mq_alloc_tag_set(&nullb->tag_set))
+ -			goto out_cleanup_queues;
+ -
+ -		nullb->q = blk_mq_init_queue(&nullb->tag_set);
+ -		if (!nullb->q)
+ -			goto out_cleanup_tags;
+ +		nullb->q = blk_mq_init_queue(&null_mq_reg, nullb);
+  	} else if (queue_mode == NULL_Q_BIO) {
+  		nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
+ -		if (!nullb->q)
+ -			goto out_cleanup_queues;
+  		blk_queue_make_request(nullb->q, null_queue_bio);
+  		init_driver_queues(nullb);
+  	} else {
+diff --cc include/linux/blk-mq.h
+index 712a6b843fbe,91dfb75ce39f..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -63,10 -79,12 +63,13 @@@ struct blk_mq_reg 
+  
+  typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+  typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+++<<<<<<< HEAD
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ +typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+++=======
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ -typedef int (init_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int, unsigned int);
+ -typedef void (exit_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int);
+  
+  struct blk_mq_ops {
+  	/*
+@@@ -126,26 -151,19 +123,30 @@@ void blk_mq_insert_request(struct reque
+  void blk_mq_run_queues(struct request_queue *q, bool async);
+  void blk_mq_free_request(struct request *rq);
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+ -struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+ -		gfp_t gfp, bool reserved);
+ -struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ +struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+++<<<<<<< HEAD
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+++=======
++ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+++>>>>>>> cdef54dd85ad (blk-mq: remove alloc_hctx and free_hctx methods)
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+ -void blk_mq_requeue_request(struct request *rq);
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
+ -void blk_mq_kick_requeue_list(struct request_queue *q);
+ +/*
+ + * Complete request through potential IPI for right placement. Driver must
+ + * have defined a mq_ops->complete() hook for this.
+ + */
+  void blk_mq_complete_request(struct request *rq);
+  
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/block/null_blk.c
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 961c85a227b1..6e09702d551b 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -483,8 +483,6 @@ static const struct device_attribute dev_attr_cache_type_rw =
+ static struct blk_mq_ops virtio_mq_ops = {
+ 	.queue_rq	= virtio_queue_rq,
+ 	.map_queue	= blk_mq_map_queue,
+-	.alloc_hctx	= blk_mq_alloc_single_hw_queue,
+-	.free_hctx	= blk_mq_free_single_hw_queue,
+ 	.complete	= virtblk_request_done,
+ };
+ 
+* Unmerged path include/linux/blk-mq.h
