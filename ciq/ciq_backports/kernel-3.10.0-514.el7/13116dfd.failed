@@ -1,0 +1,185 @@
+fanotify: Fix use after free in mask checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 13116dfd13c8c9d60ea04ece13419af2de8e2e37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/13116dfd.failed
+
+We cannot use the event structure returned from
+fsnotify_add_notify_event() because that event can be freed by the time
+that function returns. Use the mask argument passed into the event
+handler directly instead. This also fixes a possible problem when we
+could unnecessarily wait for permission response for a normal fanotify
+event which got merged with a permission event.
+
+We also disallow merging of permission event with any other event so
+that we know the permission event which we just created is the one on
+which we should wait for permission response.
+
+Reported-and-tested-by: Jiri Kosina <jkosina@suse.cz>
+Reported-and-tested-by: Dave Jones <davej@fedoraproject.org>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 13116dfd13c8c9d60ea04ece13419af2de8e2e37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,cc78e2fbc8e4..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -9,31 -9,21 +9,42 @@@
+  #include <linux/types.h>
+  #include <linux/wait.h>
+  
+ -#include "fanotify.h"
+ -
+ -static bool should_merge(struct fsnotify_event *old_fsn,
+ -			 struct fsnotify_event *new_fsn)
+ +static bool should_merge(struct fsnotify_event *old, struct fsnotify_event *new)
+  {
+ -	struct fanotify_event_info *old, *new;
+ -
+ +	pr_debug("%s: old=%p new=%p\n", __func__, old, new);
+ +
+++<<<<<<< HEAD
+ +	if (old->to_tell == new->to_tell &&
+ +	    old->data_type == new->data_type &&
+ +	    old->tgid == new->tgid) {
+ +		switch (old->data_type) {
+ +		case (FSNOTIFY_EVENT_PATH):
+ +#ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+ +			/* dont merge two permission events */
+ +			if ((old->mask & FAN_ALL_PERM_EVENTS) &&
+ +			    (new->mask & FAN_ALL_PERM_EVENTS))
+ +				return false;
+ +#endif
+ +			if ((old->path.mnt == new->path.mnt) &&
+ +			    (old->path.dentry == new->path.dentry))
+ +				return true;
+ +			break;
+ +		case (FSNOTIFY_EVENT_NONE):
+ +			return true;
+ +		default:
+ +			BUG();
+ +		};
+ +	}
+++=======
++ 	pr_debug("%s: old=%p new=%p\n", __func__, old_fsn, new_fsn);
++ 	old = FANOTIFY_E(old_fsn);
++ 	new = FANOTIFY_E(new_fsn);
++ 
++ 	if (old_fsn->inode == new_fsn->inode && old->tgid == new->tgid &&
++ 	    old->path.mnt == new->path.mnt &&
++ 	    old->path.dentry == new->path.dentry)
++ 		return true;
+++>>>>>>> 13116dfd13c8 (fanotify: Fix use after free in mask checking)
+  	return false;
+  }
+  
+@@@ -47,10 -36,19 +58,26 @@@ static struct fsnotify_event *fanotify_
+  
+  	pr_debug("%s: list=%p event=%p\n", __func__, list, event);
+  
+++<<<<<<< HEAD
+ +
+ +	list_for_each_entry_reverse(test_holder, list, event_list) {
+ +		if (should_merge(test_holder->event, event)) {
+ +			test_event = test_holder->event;
+++=======
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	/*
++ 	 * Don't merge a permission event with any other event so that we know
++ 	 * the event structure we have created in fanotify_handle_event() is the
++ 	 * one we should check for permission response.
++ 	 */
++ 	if (event->mask & FAN_ALL_PERM_EVENTS)
++ 		return NULL;
++ #endif
++ 
++ 	list_for_each_entry_reverse(test_event, list, list) {
++ 		if (should_merge(test_event, event)) {
++ 			do_merge = true;
+++>>>>>>> 13116dfd13c8 (fanotify: Fix use after free in mask checking)
+  			break;
+  		}
+  	}
+@@@ -217,6 -143,71 +244,74 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 	struct fsnotify_event *notify_fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	fsnotify_init_event(fsn_event, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (data_type == FSNOTIFY_EVENT_PATH) {
++ 		struct path *path = data;
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	event->response = 0;
++ #endif
++ 
++ 	notify_fsn_event = fsnotify_add_notify_event(group, fsn_event,
++ 						     fanotify_merge);
++ 	if (notify_fsn_event) {
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 		if (IS_ERR(notify_fsn_event))
++ 			return PTR_ERR(notify_fsn_event);
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS)
++ 		ret = fanotify_get_response_from_access(group, event);
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> 13116dfd13c8 (fanotify: Fix use after free in mask checking)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+* Unmerged path fs/notify/fanotify/fanotify.c
