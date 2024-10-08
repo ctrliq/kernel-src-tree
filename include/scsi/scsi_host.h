@@ -720,6 +720,9 @@ struct Scsi_Host {
 	 */
 	struct workqueue_struct *tmf_work_q;
 
+	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
+	unsigned no_scsi2_lun_in_cdb:1;
+
 	/*
 	 * Host has rejected a command because it was busy.
 	 */
