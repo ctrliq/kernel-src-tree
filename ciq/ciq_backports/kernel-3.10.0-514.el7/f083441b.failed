@@ -1,0 +1,340 @@
+fanotify: use fanotify event structure for permission response processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit f083441ba86acb9e2ef9c1d1747725e488c8b1ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f083441b.failed
+
+Currently, fanotify creates new structure to track the fact that
+permission event has been reported to userspace and someone is waiting
+for a response to it.  As event structures are now completely in the
+hands of each notification framework, we can use the event structure for
+this tracking instead of allocating a new structure.
+
+Since this makes the event structures for normal events and permission
+events even more different and the structures have different lifetime
+rules, we split them into two separate structures (where permission
+event structure contains the structure for a normal event).  This makes
+normal events 8 bytes smaller and the code a tad bit cleaner.
+
+[akpm@linux-foundation.org: fix build]
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Cc: Eric Paris <eparis@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Wu Fengguang <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f083441ba86acb9e2ef9c1d1747725e488c8b1ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/fanotify/fanotify.h
+#	fs/notify/fanotify/fanotify_user.c
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,ee9cb3795c2b..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -92,8 -60,8 +92,13 @@@ static struct fsnotify_event *fanotify_
+  }
+  
+  #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+++<<<<<<< HEAD
+ +static int fanotify_get_response_from_access(struct fsnotify_group *group,
+ +					     struct fsnotify_event *event)
+++=======
++ static int fanotify_get_response(struct fsnotify_group *group,
++ 				 struct fanotify_perm_event_info *event)
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  {
+  	int ret;
+  
+@@@ -217,6 -142,93 +222,96 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct fanotify_event_info *fanotify_alloc_event(struct inode *inode, u32 mask,
++ 						 struct path *path)
++ {
++ 	struct fanotify_event_info *event;
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		struct fanotify_perm_event_info *pevent;
++ 
++ 		pevent = kmem_cache_alloc(fanotify_perm_event_cachep,
++ 					  GFP_KERNEL);
++ 		if (!pevent)
++ 			return NULL;
++ 		event = &pevent->fae;
++ 		pevent->response = 0;
++ 		goto init;
++ 	}
++ #endif
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (!event)
++ 		return NULL;
++ init: __maybe_unused
++ 	fsnotify_init_event(&event->fse, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (path) {
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ 	return event;
++ }
++ 
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name, u32 cookie)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = fanotify_alloc_event(inode, mask, data);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	ret = fsnotify_add_notify_event(group, fsn_event, fanotify_merge);
++ 	if (ret) {
++ 		/* Permission events shouldn't be merged */
++ 		BUG_ON(ret == 1 && mask & FAN_ALL_PERM_EVENTS);
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 
++ 		return 0;
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		ret = fanotify_get_response(group, FANOTIFY_PE(fsn_event));
++ 		fsnotify_destroy_event(group, fsn_event);
++ 	}
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+@@@ -226,10 -238,25 +321,30 @@@
+  	free_uid(user);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fanotify_free_event(struct fsnotify_event *fsn_event)
++ {
++ 	struct fanotify_event_info *event;
++ 
++ 	event = FANOTIFY_E(fsn_event);
++ 	path_put(&event->path);
++ 	put_pid(event->tgid);
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (fsn_event->mask & FAN_ALL_PERM_EVENTS) {
++ 		kmem_cache_free(fanotify_perm_event_cachep,
++ 				FANOTIFY_PE(fsn_event));
++ 		return;
++ 	}
++ #endif
++ 	kmem_cache_free(fanotify_event_cachep, event);
++ }
++ 
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  const struct fsnotify_ops fanotify_fsnotify_ops = {
+  	.handle_event = fanotify_handle_event,
+ +	.should_send_event = fanotify_should_send_event,
+  	.free_group_priv = fanotify_free_group_priv,
+ -	.free_event = fanotify_free_event,
+ +	.free_event_priv = NULL,
+ +	.freeing_mark = NULL,
+  };
+diff --cc fs/notify/fanotify/fanotify_user.c
+index 8ef1b0f829ee,8f5e85269110..000000000000
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@@ -27,13 -28,8 +27,18 @@@
+  extern const struct fsnotify_ops fanotify_fsnotify_ops;
+  
+  static struct kmem_cache *fanotify_mark_cache __read_mostly;
+++<<<<<<< HEAD
+ +static struct kmem_cache *fanotify_response_event_cache __read_mostly;
+ +
+ +struct fanotify_response_event {
+ +	struct list_head list;
+ +	__s32 fd;
+ +	struct fsnotify_event *event;
+ +};
+++=======
++ struct kmem_cache *fanotify_event_cachep __read_mostly;
++ struct kmem_cache *fanotify_perm_event_cachep __read_mostly;
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  
+  /*
+   * Get an fsnotify notification event if one exists and is small
+@@@ -183,58 -176,15 +189,58 @@@ static int process_access_response(stru
+  	if (fd < 0)
+  		return -EINVAL;
+  
+- 	re = dequeue_re(group, fd);
+- 	if (!re)
++ 	event = dequeue_event(group, fd);
++ 	if (!event)
+  		return -ENOENT;
+  
+- 	re->event->response = response;
+- 
++ 	event->response = response;
+  	wake_up(&group->fanotify_data.access_waitq);
+  
+- 	kmem_cache_free(fanotify_response_event_cache, re);
+- 
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +
+ +static int prepare_for_access_response(struct fsnotify_group *group,
+ +				       struct fsnotify_event *event,
+ +				       __s32 fd)
+ +{
+ +	struct fanotify_response_event *re;
+ +
+ +	if (!(event->mask & FAN_ALL_PERM_EVENTS))
+ +		return 0;
+ +
+ +	re = kmem_cache_alloc(fanotify_response_event_cache, GFP_KERNEL);
+ +	if (!re)
+ +		return -ENOMEM;
+ +
+ +	re->event = event;
+ +	re->fd = fd;
+ +
+ +	mutex_lock(&group->fanotify_data.access_mutex);
+ +
+ +	if (atomic_read(&group->fanotify_data.bypass_perm)) {
+ +		mutex_unlock(&group->fanotify_data.access_mutex);
+ +		kmem_cache_free(fanotify_response_event_cache, re);
+ +		event->response = FAN_ALLOW;
+ +		return 0;
+ +	}
+ +		
+ +	list_add_tail(&re->list, &group->fanotify_data.access_list);
+ +	mutex_unlock(&group->fanotify_data.access_mutex);
+ +
+ +	return 0;
+ +}
+ +
+ +#else
+ +static int prepare_for_access_response(struct fsnotify_group *group,
+ +				       struct fsnotify_event *event,
+ +				       __s32 fd)
+ +{
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  #endif
+  
+  static ssize_t copy_event_to_user(struct fsnotify_group *group,
+@@@ -273,7 -232,7 +288,11 @@@ out_close_fd
+  out:
+  #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+  	if (event->mask & FAN_ALL_PERM_EVENTS) {
+++<<<<<<< HEAD
+ +		event->response = FAN_DENY;
+++=======
++ 		FANOTIFY_PE(event)->response = FAN_DENY;
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  		wake_up(&group->fanotify_data.access_waitq);
+  	}
+  #endif
+@@@ -321,7 -280,12 +340,16 @@@ static ssize_t fanotify_read(struct fil
+  			if (IS_ERR(kevent))
+  				break;
+  			ret = copy_event_to_user(group, kevent, buf);
+++<<<<<<< HEAD
+ +			fsnotify_put_event(kevent);
+++=======
++ 			/*
++ 			 * Permission events get queued to wait for response.
++ 			 * Other events can be destroyed now.
++ 			 */
++ 			if (!(kevent->mask & FAN_ALL_PERM_EVENTS))
++ 				fsnotify_destroy_event(group, kevent);
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  			if (ret < 0)
+  				break;
+  			buf += ret;
+@@@ -706,8 -691,13 +733,18 @@@ SYSCALL_DEFINE2(fanotify_init, unsigne
+  	group->fanotify_data.user = user;
+  	atomic_inc(&user->fanotify_listeners);
+  
+++<<<<<<< HEAD
+ +	if (force_o_largefile())
+ +		event_f_flags |= O_LARGEFILE;
+++=======
++ 	oevent = fanotify_alloc_event(NULL, FS_Q_OVERFLOW, NULL);
++ 	if (unlikely(!oevent)) {
++ 		fd = -ENOMEM;
++ 		goto out_destroy_group;
++ 	}
++ 	group->overflow_event = &oevent->fse;
++ 
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  	group->fanotify_data.f_flags = event_f_flags;
+  #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+  	mutex_init(&group->fanotify_data.access_mutex);
+@@@ -885,8 -875,11 +922,16 @@@ COMPAT_SYSCALL_DEFINE6(fanotify_mark
+  static int __init fanotify_user_setup(void)
+  {
+  	fanotify_mark_cache = KMEM_CACHE(fsnotify_mark, SLAB_PANIC);
+++<<<<<<< HEAD
+ +	fanotify_response_event_cache = KMEM_CACHE(fanotify_response_event,
+ +						   SLAB_PANIC);
+++=======
++ 	fanotify_event_cachep = KMEM_CACHE(fanotify_event_info, SLAB_PANIC);
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	fanotify_perm_event_cachep = KMEM_CACHE(fanotify_perm_event_info,
++ 						SLAB_PANIC);
++ #endif
+++>>>>>>> f083441ba86a (fanotify: use fanotify event structure for permission response processing)
+  
+  	return 0;
+  }
+* Unmerged path fs/notify/fanotify/fanotify.h
+* Unmerged path fs/notify/fanotify/fanotify.c
+* Unmerged path fs/notify/fanotify/fanotify.h
+* Unmerged path fs/notify/fanotify/fanotify_user.c
