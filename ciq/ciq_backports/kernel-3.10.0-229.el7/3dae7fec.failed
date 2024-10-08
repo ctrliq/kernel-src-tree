@@ -1,0 +1,158 @@
+mm: memcontrol: remove hierarchy restrictions for swappiness and oom_control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [mm] memcontrol: remove hierarchy restrictions for swappiness and oom_control (Johannes Weiner) [1124110]
+Rebuild_FUZZ: 97.30%
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 3dae7fec5e884a4e72e5416db0894de66f586201
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3dae7fec.failed
+
+Per-memcg swappiness and oom killing can currently not be tweaked on a
+memcg that is part of a hierarchy, but not the root of that hierarchy.
+Users have complained that they can't configure this when they turned on
+hierarchy mode.  In fact, with hierarchy mode becoming the default, this
+restriction disables the tunables entirely.
+
+But there is no good reason for this restriction.  The settings for
+swappiness and OOM killing are taken from whatever memcg whose limit
+triggered reclaim and OOM invocation, regardless of its position in the
+hierarchy tree.
+
+Allow setting swappiness on any group.  The knob on the root memcg
+already reads the global VM swappiness, make it writable as well.
+
+Allow disabling the OOM killer on any non-root memcg.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3dae7fec5e884a4e72e5416db0894de66f586201)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index c16fc7c588be,20f47d9cd8b2..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -5488,31 -5440,18 +5488,42 @@@ static u64 mem_cgroup_swappiness_read(s
+  	return mem_cgroup_swappiness(memcg);
+  }
+  
+ -static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
+ -				       struct cftype *cft, u64 val)
+ +static int mem_cgroup_swappiness_write(struct cgroup *cgrp, struct cftype *cft,
+ +				       u64 val)
+  {
+++<<<<<<< HEAD
+ +	struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
+ +	struct mem_cgroup *parent;
+++=======
++ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+++>>>>>>> 3dae7fec5e88 (mm: memcontrol: remove hierarchy restrictions for swappiness and oom_control)
+  
+  	if (val > 100)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (cgrp->parent == NULL)
+ +		return -EINVAL;
+ +
+ +	parent = mem_cgroup_from_cont(cgrp->parent);
+ +
+ +	mutex_lock(&memcg_create_mutex);
+ +
+ +	/* If under hierarchy, only empty-root can set this value */
+ +	if ((parent->use_hierarchy) || memcg_has_children(memcg)) {
+ +		mutex_unlock(&memcg_create_mutex);
+ +		return -EINVAL;
+ +	}
+ +
+ +	memcg->swappiness = val;
+ +
+ +	mutex_unlock(&memcg_create_mutex);
+++=======
++ 	if (css_parent(css))
++ 		memcg->swappiness = val;
++ 	else
++ 		vm_swappiness = val;
+++>>>>>>> 3dae7fec5e88 (mm: memcontrol: remove hierarchy restrictions for swappiness and oom_control)
+  
+  	return 0;
+  }
+@@@ -5832,24 -5779,15 +5843,33 @@@ static int mem_cgroup_oom_control_read(
+  	return 0;
+  }
+  
+ -static int mem_cgroup_oom_control_write(struct cgroup_subsys_state *css,
+ +static int mem_cgroup_oom_control_write(struct cgroup *cgrp,
+  	struct cftype *cft, u64 val)
+  {
+++<<<<<<< HEAD
+ +	struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
+ +	struct mem_cgroup *parent;
+ +
+ +	/* cannot set to root cgroup and only 0 and 1 are allowed */
+ +	if (!cgrp->parent || !((val == 0) || (val == 1)))
+ +		return -EINVAL;
+ +
+ +	parent = mem_cgroup_from_cont(cgrp->parent);
+ +
+ +	mutex_lock(&memcg_create_mutex);
+ +	/* oom-kill-disable is a flag for subhierarchy. */
+ +	if ((parent->use_hierarchy) || memcg_has_children(memcg)) {
+ +		mutex_unlock(&memcg_create_mutex);
+ +		return -EINVAL;
+ +	}
+++=======
++ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++ 
++ 	/* cannot set to root cgroup and only 0 and 1 are allowed */
++ 	if (!css_parent(css) || !((val == 0) || (val == 1)))
++ 		return -EINVAL;
++ 
+++>>>>>>> 3dae7fec5e88 (mm: memcontrol: remove hierarchy restrictions for swappiness and oom_control)
+  	memcg->oom_kill_disable = val;
+  	if (!val)
+  		memcg_oom_recover(memcg);
+diff --git a/Documentation/cgroups/memory.txt b/Documentation/cgroups/memory.txt
+index ddf4f93967a9..9059928028bc 100644
+--- a/Documentation/cgroups/memory.txt
++++ b/Documentation/cgroups/memory.txt
+@@ -533,17 +533,15 @@ Note:
+ 
+ 5.3 swappiness
+ 
+-Similar to /proc/sys/vm/swappiness, but affecting a hierarchy of groups only.
++Similar to /proc/sys/vm/swappiness, but only affecting reclaim that is
++triggered by this cgroup's hard limit.  The tunable in the root cgroup
++corresponds to the global swappiness setting.
++
+ Please note that unlike the global swappiness, memcg knob set to 0
+ really prevents from any swapping even if there is a swap storage
+ available. This might lead to memcg OOM killer if there are no file
+ pages to reclaim.
+ 
+-Following cgroups' swappiness can't be changed.
+-- root cgroup (uses /proc/sys/vm/swappiness).
+-- a cgroup which uses hierarchy and it has other cgroup(s) below it.
+-- a cgroup which uses hierarchy and not the root of hierarchy.
+-
+ 5.4 failcnt
+ 
+ A memory cgroup provides memory.failcnt and memory.memsw.failcnt files.
+@@ -748,7 +746,6 @@ You can disable the OOM-killer by writing "1" to memory.oom_control file, as:
+ 
+ 	#echo 1 > memory.oom_control
+ 
+-This operation is only allowed to the top cgroup of a sub-hierarchy.
+ If OOM-killer is disabled, tasks under cgroup will hang/sleep
+ in memory cgroup's OOM-waitqueue when they request accountable memory.
+ 
+* Unmerged path mm/memcontrol.c
