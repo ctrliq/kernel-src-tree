@@ -1,0 +1,180 @@
+efi: Add shared printk wrapper for consistent prefixing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Roy Franz <roy.franz@linaro.org>
+commit f966ea021f947b20c22b31194d7e3042375c7f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f966ea02.failed
+
+Add a wrapper for printk to standardize the prefix for informational and
+error messages from the EFI stub.
+
+	Signed-off-by: Roy Franz <roy.franz@linaro.org>
+	Signed-off-by: Leif Lindholm <leif.lindholm@linaro.org>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit f966ea021f947b20c22b31194d7e3042375c7f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efi-stub-helper.c
+diff --cc drivers/firmware/efi/efi-stub-helper.c
+index f243c3499856,1bf439be9138..000000000000
+--- a/drivers/firmware/efi/efi-stub-helper.c
++++ b/drivers/firmware/efi/efi-stub-helper.c
+@@@ -291,15 -307,13 +294,19 @@@ static efi_status_t handle_ramdisks(efi
+  			str++;
+  	}
+  
+ -	if (!nr_files)
+ +	if (!nr_initrds)
+  		return EFI_SUCCESS;
+  
+ -	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+ -				nr_files * sizeof(*files), (void **)&files);
+ +	status = efi_call_phys3(sys_table_arg->boottime->allocate_pool,
+ +				EFI_LOADER_DATA,
+ +				nr_initrds * sizeof(*initrds),
+ +				&initrds);
+  	if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD
+ +		efi_printk(sys_table_arg, "Failed to alloc mem for initrds\n");
+++=======
++ 		pr_efi_err(sys_table_arg, "Failed to alloc mem for file handle list\n");
+++>>>>>>> f966ea021f94 (efi: Add shared printk wrapper for consistent prefixing)
+  		goto fail;
+  	}
+  
+@@@ -412,41 -370,42 +419,55 @@@ grow
+  		unsigned long addr;
+  
+  		/*
+ -		 * Multiple files need to be at consecutive addresses in memory,
+ -		 * so allocate enough memory for all the files.  This is used
+ -		 * for loading multiple files.
+ +		 * Multiple initrd's need to be at consecutive
+ +		 * addresses in memory, so allocate enough memory for
+ +		 * all the initrd's.
+  		 */
+ -		status = efi_high_alloc(sys_table_arg, file_size_total, 0x1000,
+ -				    &file_addr, max_addr);
+ +		status = efi_high_alloc(sys_table_arg, initrd_total, 0x1000,
+ +				    &initrd_addr, hdr->initrd_addr_max);
+  		if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD
+ +			efi_printk(sys_table_arg, "Failed to alloc highmem for initrds\n");
+++=======
++ 			pr_efi_err(sys_table_arg, "Failed to alloc highmem for files\n");
+++>>>>>>> f966ea021f94 (efi: Add shared printk wrapper for consistent prefixing)
+  			goto close_handles;
+  		}
+  
+  		/* We've run out of free low memory. */
+++<<<<<<< HEAD
+ +		if (initrd_addr > hdr->initrd_addr_max) {
+ +			efi_printk(sys_table_arg, "We've run out of free low memory\n");
+++=======
++ 		if (file_addr > max_addr) {
++ 			pr_efi_err(sys_table_arg, "We've run out of free low memory\n");
+++>>>>>>> f966ea021f94 (efi: Add shared printk wrapper for consistent prefixing)
+  			status = EFI_INVALID_PARAMETER;
+ -			goto free_file_total;
+ +			goto free_initrd_total;
+  		}
+  
+ -		addr = file_addr;
+ -		for (j = 0; j < nr_files; j++) {
+ -			unsigned long size;
+ +		addr = initrd_addr;
+ +		for (j = 0; j < nr_initrds; j++) {
+ +			u64 size;
+  
+ -			size = files[j].size;
+ +			size = initrds[j].size;
+  			while (size) {
+ -				unsigned long chunksize;
+ +				u64 chunksize;
+  				if (size > EFI_READ_CHUNK_SIZE)
+  					chunksize = EFI_READ_CHUNK_SIZE;
+  				else
+  					chunksize = size;
+ -
+ -				status = efi_file_read(files[j].handle,
+ -						       &chunksize,
+ -						       (void *)addr);
+ +				status = efi_call_phys3(fh->read,
+ +							initrds[j].handle,
+ +							&chunksize, addr);
+  				if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD
+ +					efi_printk(sys_table_arg, "Failed to read initrd\n");
+ +					goto free_initrd_total;
+++=======
++ 					pr_efi_err(sys_table_arg, "Failed to read file\n");
++ 					goto free_file_total;
+++>>>>>>> f966ea021f94 (efi: Add shared printk wrapper for consistent prefixing)
+  				}
+  				addr += chunksize;
+  				size -= chunksize;
+@@@ -486,30 -460,47 +507,39 @@@ static efi_status_t relocate_kernel(str
+  
+  	/*
+  	 * The EFI firmware loader could have placed the kernel image
+ -	 * anywhere in memory, but the kernel has restrictions on the
+ -	 * max physical address it can run at.  Some architectures
+ -	 * also have a prefered address, so first try to relocate
+ -	 * to the preferred address.  If that fails, allocate as low
+ -	 * as possible while respecting the required alignment.
+ -	 */
+ -	nr_pages = round_up(alloc_size, EFI_PAGE_SIZE) / EFI_PAGE_SIZE;
+ -	status = efi_call_early(allocate_pages,
+ -				EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+ -				nr_pages, &efi_addr);
+ -	new_addr = efi_addr;
+ -	/*
+ -	 * If preferred address allocation failed allocate as low as
+ +	 * anywhere in memory, but the kernel has various restrictions
+ +	 * on the max physical address it can run at. Attempt to move
+ +	 * the kernel to boot_params.pref_address, or as low as
+  	 * possible.
+  	 */
+ +	start = hdr->pref_address;
+ +	nr_pages = round_up(hdr->init_size, EFI_PAGE_SIZE) / EFI_PAGE_SIZE;
+ +
+ +	status = efi_call_phys4(sys_table->boottime->allocate_pages,
+ +				EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+ +				nr_pages, &start);
+  	if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD
+ +		status = efi_low_alloc(sys_table, hdr->init_size,
+ +				   hdr->kernel_alignment, &start);
+ +		if (status != EFI_SUCCESS)
+ +			efi_printk(sys_table, "Failed to alloc mem for kernel\n");
+++=======
++ 		status = efi_low_alloc(sys_table_arg, alloc_size, alignment,
++ 				       &new_addr);
++ 	}
++ 	if (status != EFI_SUCCESS) {
++ 		pr_efi_err(sys_table_arg, "Failed to allocate usable memory for kernel.\n");
++ 		return status;
+++>>>>>>> f966ea021f94 (efi: Add shared printk wrapper for consistent prefixing)
+  	}
+  
+ -	/*
+ -	 * We know source/dest won't overlap since both memory ranges
+ -	 * have been allocated by UEFI, so we can safely use memcpy.
+ -	 */
+ -	memcpy((void *)new_addr, (void *)cur_image_addr, image_size);
+ +	if (status == EFI_SUCCESS)
+ +		memcpy((void *)start, (void *)(unsigned long)hdr->code32_start,
+ +		       hdr->init_size);
+  
+ -	/* Return the new address of the relocated image. */
+ -	*image_addr = new_addr;
+ +	hdr->pref_address = hdr->code32_start;
+ +	hdr->code32_start = (__u32)start;
+  
+  	return status;
+  }
+* Unmerged path drivers/firmware/efi/efi-stub-helper.c
