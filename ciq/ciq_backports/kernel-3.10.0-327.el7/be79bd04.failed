@@ -1,0 +1,219 @@
+bonding: add RCU for bond_3ad_state_machine_handler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit be79bd048abe9fb6aee049ea903d1e70b44d6480
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/be79bd04.failed
+
+The bond_3ad_state_machine_handler() use the bond lock to protect
+the bond slave list and slave port together, but it is not enough,
+the bond slave list was link and unlink in RTNL, not bond lock,
+so I add RCU to protect the slave list from leaving.
+
+The bond lock is still used here, because when the slave has been
+removed from the list by the time the state machine runs, it appears
+to be possible for both function to manupulate the same aggregator->lag_ports
+by finding the aggregator via two different ports that are both members of
+that aggregator (i.e., port A of the agg is being unbound, and port B
+of the agg is runing its state machine).
+
+If I remove the bond lock, there are nothing to mutex changes
+to aggregator->lag_ports between bond_3ad_state_machine_handler and
+bond_3ad_unbind_slave, So the bond lock is the simplest way to protect
+aggregator->lag_ports.
+
+There was a lot of function need RCU protect, I have two choice
+to make the function in RCU-safe, (1) create new similar functions
+and make the bond slave list in RCU. (2) modify the existed functions
+and make them in read-side critical section, because the RCU
+read-side critical sections may be nested.
+
+I choose (2) because it is no need to create more similar functions.
+
+The nots in the function is still too old, clean up the nots.
+
+	Suggested-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Suggested-by: Jay Vosburgh <fubar@us.ibm.com>
+	Suggested-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit be79bd048abe9fb6aee049ea903d1e70b44d6480)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_3ad.c
+index e5814f7909df,58c2249a3324..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -178,31 -145,15 +178,41 @@@ static inline struct port *__get_next_p
+  static inline struct aggregator *__get_first_agg(struct port *port)
+  {
+  	struct bonding *bond = __get_bond_by_port(port);
+ -	struct slave *first_slave;
+  
+++<<<<<<< HEAD
+ +	// If there's no bond for this port, or bond has no slaves
+ +	if ((bond == NULL) || (bond->slave_cnt == 0))
+ +		return NULL;
+ +
+ +	return &(SLAVE_AD_INFO(bond->first_slave).aggregator);
+ +}
+ +
+ +/**
+ + * __get_next_agg - get the next aggregator in the bond
+ + * @aggregator: the aggregator we're looking at
+ + *
+ + * Return the aggregator of the slave that is next in line of @aggregator's
+ + * slave in the bond, or %NULL if it can't be found.
+ + */
+ +static inline struct aggregator *__get_next_agg(struct aggregator *aggregator)
+ +{
+ +	struct slave *slave = aggregator->slave;
+ +	struct bonding *bond = bond_get_bond_by_slave(slave);
+ +
+ +	// If there's no bond for this aggregator, or this is the last slave
+ +	if ((bond == NULL) || (slave->next == bond->first_slave))
+ +		return NULL;
+ +
+ +	return &(SLAVE_AD_INFO(slave->next).aggregator);
+++=======
++ 	/* If there's no bond for this port, or bond has no slaves */
++ 	if (bond == NULL)
++ 		return NULL;
++ 	rcu_read_lock();
++ 	first_slave = bond_first_slave_rcu(bond);
++ 	rcu_read_unlock();
++ 	return first_slave ? &(SLAVE_AD_INFO(first_slave).aggregator) : NULL;
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  }
+  
+  /*
+@@@ -2113,21 -2072,25 +2131,37 @@@ void bond_3ad_state_machine_handler(str
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    ad_work.work);
+ -	struct aggregator *aggregator;
+ -	struct list_head *iter;
+ -	struct slave *slave;
+  	struct port *port;
+ +	struct aggregator *aggregator;
+  
+++<<<<<<< HEAD
+ +	if (!rtnl_trylock()) {
+ +		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+ +		return;
+ +	}
+ +	//check if there are any slaves
+ +	if (bond->slave_cnt == 0)
+++=======
++ 	read_lock(&bond->lock);
++ 	rcu_read_lock();
++ 
++ 	/* check if there are any slaves */
++ 	if (!bond_has_slaves(bond))
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  		goto re_arm;
+  
+- 	// check if agg_select_timer timer after initialize is timed out
++ 	/* check if agg_select_timer timer after initialize is timed out */
+  	if (BOND_AD_INFO(bond).agg_select_timer && !(--BOND_AD_INFO(bond).agg_select_timer)) {
+++<<<<<<< HEAD
+ +		// select the active aggregator for the bond
+ +		if ((port = __get_first_port(bond))) {
+++=======
++ 		slave = bond_first_slave_rcu(bond);
++ 		port = slave ? &(SLAVE_AD_INFO(slave).port) : NULL;
++ 
++ 		/* select the active aggregator for the bond */
++ 		if (port) {
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  			if (!port->slave) {
+  				pr_warning("%s: Warning: bond's first port is uninitialized\n",
+  					   bond->dev->name);
+@@@ -2140,8 -2103,9 +2174,14 @@@
+  		bond_3ad_set_carrier(bond);
+  	}
+  
+++<<<<<<< HEAD
+ +	// for each port run the state machines
+ +	for (port = __get_first_port(bond); port; port = __get_next_port(port)) {
+++=======
++ 	/* for each port run the state machines */
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		port = &(SLAVE_AD_INFO(slave).port);
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  		if (!port->slave) {
+  			pr_warning("%s: Warning: Found an uninitialized port\n",
+  				   bond->dev->name);
+@@@ -2168,7 -2132,8 +2208,12 @@@
+  	}
+  
+  re_arm:
+++<<<<<<< HEAD
+ +	rtnl_unlock();
+++=======
++ 	rcu_read_unlock();
++ 	read_unlock(&bond->lock);
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  	queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+  }
+  
+@@@ -2346,8 -2311,14 +2391,17 @@@ void bond_3ad_handle_link_change(struc
+  int bond_3ad_set_carrier(struct bonding *bond)
+  {
+  	struct aggregator *active;
+ -	struct slave *first_slave;
+  
+++<<<<<<< HEAD
+ +	active = __get_active_agg(&(SLAVE_AD_INFO(bond->first_slave).aggregator));
+++=======
++ 	rcu_read_lock();
++ 	first_slave = bond_first_slave_rcu(bond);
++ 	rcu_read_unlock();
++ 	if (!first_slave)
++ 		return 0;
++ 	active = __get_active_agg(&(SLAVE_AD_INFO(first_slave).aggregator));
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  	if (active) {
+  		/* are enough slaves available to consider link up? */
+  		if (active->num_of_ports < bond->params.min_links) {
+diff --cc drivers/net/bonding/bond_main.c
+index b9b7314b42bb,720a826eb071..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1975,22 -1702,11 +1975,24 @@@ static int __bond_release_one(struct ne
+  	netdev_rx_handler_unregister(slave_dev);
+  	write_lock_bh(&bond->lock);
+  
+ +	if (!all && !bond->params.fail_over_mac) {
+ +		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ +		    bond->slave_cnt > 1)
+ +			pr_warning("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
+ +				   bond_dev->name, slave_dev->name,
+ +				   slave->perm_hwaddr,
+ +				   bond_dev->name, slave_dev->name);
+ +	}
+ +
+  	/* Inform AD package of unbinding of slave. */
+- 	if (bond->params.mode == BOND_MODE_8023AD) {
+- 		/* must be called before the slave is
+- 		 * detached from the list
+- 		 */
++ 	if (bond->params.mode == BOND_MODE_8023AD)
+  		bond_3ad_unbind_slave(slave);
+++<<<<<<< HEAD
+ +	}
+++=======
++ 
++ 	write_unlock_bh(&bond->lock);
+++>>>>>>> be79bd048abe (bonding: add RCU for bond_3ad_state_machine_handler())
+  
+  	pr_info("%s: releasing %s interface %s\n",
+  		bond_dev->name,
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_main.c
