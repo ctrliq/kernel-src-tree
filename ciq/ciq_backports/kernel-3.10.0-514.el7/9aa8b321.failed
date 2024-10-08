@@ -1,0 +1,1089 @@
+IB/core: Enhance ib_map_mr_sg()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 9aa8b3217ed3c13d4e3496020b140da0e6f49a08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9aa8b321.failed
+
+The SRP initiator allows to set max_sectors to a value that exceeds
+the largest amount of data that can be mapped at once with an mlx4
+HCA using fast registration and a page size of 4 KB. Hence modify
+ib_map_mr_sg() such that it can map partial sg-elements. If an
+sg-element has been mapped partially, let the caller know
+which fraction has been mapped by adjusting *sg_offset.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Tested-by: Laurence Oberman <loberman@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9aa8b3217ed3c13d4e3496020b140da0e6f49a08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rw.c
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/hw/cxgb3/iwch_provider.c
+#	drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+#	drivers/infiniband/hw/cxgb4/mem.c
+#	drivers/infiniband/hw/i40iw/i40iw_verbs.c
+#	drivers/infiniband/hw/mlx4/mlx4_ib.h
+#	drivers/infiniband/hw/mlx4/mr.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	drivers/infiniband/hw/nes/nes_verbs.c
+#	drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+#	drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+#	drivers/infiniband/ulp/iser/iser_memory.c
+#	drivers/infiniband/ulp/srp/ib_srp.c
+#	include/rdma/ib_verbs.h
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+diff --cc drivers/infiniband/core/verbs.c
+index b3474557c499,1d7d4cf442e3..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1461,3 -1588,333 +1461,336 @@@ int ib_check_mr_status(struct ib_mr *mr
+  		mr->device->check_mr_status(mr, check_mask, mr_status) : -ENOSYS;
+  }
+  EXPORT_SYMBOL(ib_check_mr_status);
+++<<<<<<< HEAD
+++=======
++ 
++ int ib_set_vf_link_state(struct ib_device *device, int vf, u8 port,
++ 			 int state)
++ {
++ 	if (!device->set_vf_link_state)
++ 		return -ENOSYS;
++ 
++ 	return device->set_vf_link_state(device, vf, port, state);
++ }
++ EXPORT_SYMBOL(ib_set_vf_link_state);
++ 
++ int ib_get_vf_config(struct ib_device *device, int vf, u8 port,
++ 		     struct ifla_vf_info *info)
++ {
++ 	if (!device->get_vf_config)
++ 		return -ENOSYS;
++ 
++ 	return device->get_vf_config(device, vf, port, info);
++ }
++ EXPORT_SYMBOL(ib_get_vf_config);
++ 
++ int ib_get_vf_stats(struct ib_device *device, int vf, u8 port,
++ 		    struct ifla_vf_stats *stats)
++ {
++ 	if (!device->get_vf_stats)
++ 		return -ENOSYS;
++ 
++ 	return device->get_vf_stats(device, vf, port, stats);
++ }
++ EXPORT_SYMBOL(ib_get_vf_stats);
++ 
++ int ib_set_vf_guid(struct ib_device *device, int vf, u8 port, u64 guid,
++ 		   int type)
++ {
++ 	if (!device->set_vf_guid)
++ 		return -ENOSYS;
++ 
++ 	return device->set_vf_guid(device, vf, port, guid, type);
++ }
++ EXPORT_SYMBOL(ib_set_vf_guid);
++ 
++ /**
++  * ib_map_mr_sg() - Map the largest prefix of a dma mapped SG list
++  *     and set it the memory region.
++  * @mr:            memory region
++  * @sg:            dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @sg_offset:     offset in bytes into sg
++  * @page_size:     page vector desired page size
++  *
++  * Constraints:
++  * - The first sg element is allowed to have an offset.
++  * - Each sg element must be aligned to page_size (or physically
++  *   contiguous to the previous element). In case an sg element has a
++  *   non contiguous offset, the mapping prefix will not include it.
++  * - The last sg element is allowed to have length less than page_size.
++  * - If sg_nents total byte length exceeds the mr max_num_sge * page_size
++  *   then only max_num_sg entries will be mapped.
++  * - If the MR was allocated with type IB_MR_TYPE_SG_GAPS_REG, non of these
++  *   constraints holds and the page_size argument is ignored.
++  *
++  * Returns the number of sg elements that were mapped to the memory region.
++  *
++  * After this completes successfully, the  memory region
++  * is ready for registration.
++  */
++ int ib_map_mr_sg(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
++ 		 unsigned int *sg_offset, unsigned int page_size)
++ {
++ 	if (unlikely(!mr->device->map_mr_sg))
++ 		return -ENOSYS;
++ 
++ 	mr->page_size = page_size;
++ 
++ 	return mr->device->map_mr_sg(mr, sg, sg_nents, sg_offset);
++ }
++ EXPORT_SYMBOL(ib_map_mr_sg);
++ 
++ /**
++  * ib_sg_to_pages() - Convert the largest prefix of a sg list
++  *     to a page vector
++  * @mr:            memory region
++  * @sgl:           dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @sg_offset_p:   IN:  start offset in bytes into sg
++  *                 OUT: offset in bytes for element n of the sg of the first
++  *                      byte that has not been processed where n is the return
++  *                      value of this function.
++  * @set_page:      driver page assignment function pointer
++  *
++  * Core service helper for drivers to convert the largest
++  * prefix of given sg list to a page vector. The sg list
++  * prefix converted is the prefix that meet the requirements
++  * of ib_map_mr_sg.
++  *
++  * Returns the number of sg elements that were assigned to
++  * a page vector.
++  */
++ int ib_sg_to_pages(struct ib_mr *mr, struct scatterlist *sgl, int sg_nents,
++ 		unsigned int *sg_offset_p, int (*set_page)(struct ib_mr *, u64))
++ {
++ 	struct scatterlist *sg;
++ 	u64 last_end_dma_addr = 0;
++ 	unsigned int sg_offset = sg_offset_p ? *sg_offset_p : 0;
++ 	unsigned int last_page_off = 0;
++ 	u64 page_mask = ~((u64)mr->page_size - 1);
++ 	int i, ret;
++ 
++ 	if (unlikely(sg_nents <= 0 || sg_offset > sg_dma_len(&sgl[0])))
++ 		return -EINVAL;
++ 
++ 	mr->iova = sg_dma_address(&sgl[0]) + sg_offset;
++ 	mr->length = 0;
++ 
++ 	for_each_sg(sgl, sg, sg_nents, i) {
++ 		u64 dma_addr = sg_dma_address(sg) + sg_offset;
++ 		u64 prev_addr = dma_addr;
++ 		unsigned int dma_len = sg_dma_len(sg) - sg_offset;
++ 		u64 end_dma_addr = dma_addr + dma_len;
++ 		u64 page_addr = dma_addr & page_mask;
++ 
++ 		/*
++ 		 * For the second and later elements, check whether either the
++ 		 * end of element i-1 or the start of element i is not aligned
++ 		 * on a page boundary.
++ 		 */
++ 		if (i && (last_page_off != 0 || page_addr != dma_addr)) {
++ 			/* Stop mapping if there is a gap. */
++ 			if (last_end_dma_addr != dma_addr)
++ 				break;
++ 
++ 			/*
++ 			 * Coalesce this element with the last. If it is small
++ 			 * enough just update mr->length. Otherwise start
++ 			 * mapping from the next page.
++ 			 */
++ 			goto next_page;
++ 		}
++ 
++ 		do {
++ 			ret = set_page(mr, page_addr);
++ 			if (unlikely(ret < 0)) {
++ 				sg_offset = prev_addr - sg_dma_address(sg);
++ 				mr->length += prev_addr - dma_addr;
++ 				if (sg_offset_p)
++ 					*sg_offset_p = sg_offset;
++ 				return i || sg_offset ? i : ret;
++ 			}
++ 			prev_addr = page_addr;
++ next_page:
++ 			page_addr += mr->page_size;
++ 		} while (page_addr < end_dma_addr);
++ 
++ 		mr->length += dma_len;
++ 		last_end_dma_addr = end_dma_addr;
++ 		last_page_off = end_dma_addr & ~page_mask;
++ 
++ 		sg_offset = 0;
++ 	}
++ 
++ 	if (sg_offset_p)
++ 		*sg_offset_p = 0;
++ 	return i;
++ }
++ EXPORT_SYMBOL(ib_sg_to_pages);
++ 
++ struct ib_drain_cqe {
++ 	struct ib_cqe cqe;
++ 	struct completion done;
++ };
++ 
++ static void ib_drain_qp_done(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct ib_drain_cqe *cqe = container_of(wc->wr_cqe, struct ib_drain_cqe,
++ 						cqe);
++ 
++ 	complete(&cqe->done);
++ }
++ 
++ /*
++  * Post a WR and block until its completion is reaped for the SQ.
++  */
++ static void __ib_drain_sq(struct ib_qp *qp)
++ {
++ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
++ 	struct ib_drain_cqe sdrain;
++ 	struct ib_send_wr swr = {}, *bad_swr;
++ 	int ret;
++ 
++ 	if (qp->send_cq->poll_ctx == IB_POLL_DIRECT) {
++ 		WARN_ONCE(qp->send_cq->poll_ctx == IB_POLL_DIRECT,
++ 			  "IB_POLL_DIRECT poll_ctx not supported for drain\n");
++ 		return;
++ 	}
++ 
++ 	swr.wr_cqe = &sdrain.cqe;
++ 	sdrain.cqe.done = ib_drain_qp_done;
++ 	init_completion(&sdrain.done);
++ 
++ 	ret = ib_modify_qp(qp, &attr, IB_QP_STATE);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain send queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	ret = ib_post_send(qp, &swr, &bad_swr);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain send queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	wait_for_completion(&sdrain.done);
++ }
++ 
++ /*
++  * Post a WR and block until its completion is reaped for the RQ.
++  */
++ static void __ib_drain_rq(struct ib_qp *qp)
++ {
++ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
++ 	struct ib_drain_cqe rdrain;
++ 	struct ib_recv_wr rwr = {}, *bad_rwr;
++ 	int ret;
++ 
++ 	if (qp->recv_cq->poll_ctx == IB_POLL_DIRECT) {
++ 		WARN_ONCE(qp->recv_cq->poll_ctx == IB_POLL_DIRECT,
++ 			  "IB_POLL_DIRECT poll_ctx not supported for drain\n");
++ 		return;
++ 	}
++ 
++ 	rwr.wr_cqe = &rdrain.cqe;
++ 	rdrain.cqe.done = ib_drain_qp_done;
++ 	init_completion(&rdrain.done);
++ 
++ 	ret = ib_modify_qp(qp, &attr, IB_QP_STATE);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain recv queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	ret = ib_post_recv(qp, &rwr, &bad_rwr);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain recv queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	wait_for_completion(&rdrain.done);
++ }
++ 
++ /**
++  * ib_drain_sq() - Block until all SQ CQEs have been consumed by the
++  *		   application.
++  * @qp:            queue pair to drain
++  *
++  * If the device has a provider-specific drain function, then
++  * call that.  Otherwise call the generic drain function
++  * __ib_drain_sq().
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ and SQ for the drain work request and
++  * completion.
++  *
++  * allocate the CQ using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_sq(struct ib_qp *qp)
++ {
++ 	if (qp->device->drain_sq)
++ 		qp->device->drain_sq(qp);
++ 	else
++ 		__ib_drain_sq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_sq);
++ 
++ /**
++  * ib_drain_rq() - Block until all RQ CQEs have been consumed by the
++  *		   application.
++  * @qp:            queue pair to drain
++  *
++  * If the device has a provider-specific drain function, then
++  * call that.  Otherwise call the generic drain function
++  * __ib_drain_rq().
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ and RQ for the drain work request and
++  * completion.
++  *
++  * allocate the CQ using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_rq(struct ib_qp *qp)
++ {
++ 	if (qp->device->drain_rq)
++ 		qp->device->drain_rq(qp);
++ 	else
++ 		__ib_drain_rq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_rq);
++ 
++ /**
++  * ib_drain_qp() - Block until all CQEs have been consumed by the
++  *		   application on both the RQ and SQ.
++  * @qp:            queue pair to drain
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ(s), SQ, and RQ for drain work requests
++  * and completions.
++  *
++  * allocate the CQs using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_qp(struct ib_qp *qp)
++ {
++ 	ib_drain_sq(qp);
++ 	if (!qp->srq)
++ 		ib_drain_rq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_qp);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+diff --cc drivers/infiniband/hw/cxgb3/iwch_provider.c
+index 3f8009da73e6,47cb927a0dd6..000000000000
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@@ -831,26 -771,26 +831,31 @@@ err
+  	return ERR_PTR(ret);
+  }
+  
+ -static int iwch_set_page(struct ib_mr *ibmr, u64 addr)
+ +static struct ib_fast_reg_page_list *iwch_alloc_fastreg_pbl(
+ +					struct ib_device *device,
+ +					int page_list_len)
+  {
+ -	struct iwch_mr *mhp = to_iwch_mr(ibmr);
+ +	struct ib_fast_reg_page_list *page_list;
+  
+ -	if (unlikely(mhp->npages == mhp->attr.pbl_size))
+ -		return -ENOMEM;
+ +	page_list = kmalloc(sizeof *page_list + page_list_len * sizeof(u64),
+ +			    GFP_KERNEL);
+ +	if (!page_list)
+ +		return ERR_PTR(-ENOMEM);
+  
+ -	mhp->pages[mhp->npages++] = addr;
+ +	page_list->page_list = (u64 *)(page_list + 1);
+ +	page_list->max_page_list_len = page_list_len;
+  
+ -	return 0;
+ +	return page_list;
+  }
+  
+++<<<<<<< HEAD
+ +static void iwch_free_fastreg_pbl(struct ib_fast_reg_page_list *page_list)
+++=======
++ static int iwch_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg,
++ 			  int sg_nents, unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+ -	struct iwch_mr *mhp = to_iwch_mr(ibmr);
+ -
+ -	mhp->npages = 0;
+ -
+ -	return ib_sg_to_pages(ibmr, sg, sg_nents, sg_offset, iwch_set_page);
+ +	kfree(page_list);
+  }
+  
+  static int iwch_destroy_qp(struct ib_qp *ib_qp)
+diff --cc drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index 0b7096947a75,1ff3ba8ab67b..000000000000
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@@ -981,8 -917,11 +981,13 @@@ struct ib_fast_reg_page_list *c4iw_allo
+  struct ib_mr *c4iw_alloc_mr(struct ib_pd *pd,
+  			    enum ib_mr_type mr_type,
+  			    u32 max_num_sg);
+++<<<<<<< HEAD
+++=======
++ int c4iw_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		   unsigned int *sg_offset);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  int c4iw_dealloc_mw(struct ib_mw *mw);
+ -struct ib_mw *c4iw_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
+ -			    struct ib_udata *udata);
+ +struct ib_mw *c4iw_alloc_mw(struct ib_pd *pd, enum ib_mw_type type);
+  struct ib_mr *c4iw_reg_user_mr(struct ib_pd *pd, u64 start,
+  					   u64 length, u64 virt, int acc,
+  					   struct ib_udata *udata);
+diff --cc drivers/infiniband/hw/cxgb4/mem.c
+index 1409aa925532,83960df6fe60..000000000000
+--- a/drivers/infiniband/hw/cxgb4/mem.c
++++ b/drivers/infiniband/hw/cxgb4/mem.c
+@@@ -887,49 -678,26 +887,54 @@@ err
+  	return ERR_PTR(ret);
+  }
+  
+ -static int c4iw_set_page(struct ib_mr *ibmr, u64 addr)
+ +struct ib_fast_reg_page_list *c4iw_alloc_fastreg_pbl(struct ib_device *device,
+ +						     int page_list_len)
+  {
+ -	struct c4iw_mr *mhp = to_c4iw_mr(ibmr);
+ +	struct c4iw_fr_page_list *c4pl;
+ +	struct c4iw_dev *dev = to_c4iw_dev(device);
+ +	dma_addr_t dma_addr;
+ +	int pll_len = roundup(page_list_len * sizeof(u64), 32);
+  
+ -	if (unlikely(mhp->mpl_len == mhp->max_mpl_len))
+ -		return -ENOMEM;
+ +	c4pl = kmalloc(sizeof(*c4pl), GFP_KERNEL);
+ +	if (!c4pl)
+ +		return ERR_PTR(-ENOMEM);
+  
+ -	mhp->mpl[mhp->mpl_len++] = addr;
+ +	c4pl->ibpl.page_list = dma_alloc_coherent(&dev->rdev.lldi.pdev->dev,
+ +						  pll_len, &dma_addr,
+ +						  GFP_KERNEL);
+ +	if (!c4pl->ibpl.page_list) {
+ +		kfree(c4pl);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +	dma_unmap_addr_set(c4pl, mapping, dma_addr);
+ +	c4pl->dma_addr = dma_addr;
+ +	c4pl->dev = dev;
+ +	c4pl->pll_len = pll_len;
+  
+ -	return 0;
+ +	PDBG("%s c4pl %p pll_len %u page_list %p dma_addr %pad\n",
+ +	     __func__, c4pl, c4pl->pll_len, c4pl->ibpl.page_list,
+ +	     &c4pl->dma_addr);
+ +
+ +	return &c4pl->ibpl;
+  }
+  
+++<<<<<<< HEAD
+ +void c4iw_free_fastreg_pbl(struct ib_fast_reg_page_list *ibpl)
+++=======
++ int c4iw_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		   unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+ -	struct c4iw_mr *mhp = to_c4iw_mr(ibmr);
+ +	struct c4iw_fr_page_list *c4pl = to_c4iw_fr_page_list(ibpl);
+  
+ -	mhp->mpl_len = 0;
+ +	PDBG("%s c4pl %p pll_len %u page_list %p dma_addr %pad\n",
+ +	     __func__, c4pl, c4pl->pll_len, c4pl->ibpl.page_list,
+ +	     &c4pl->dma_addr);
+  
+ -	return ib_sg_to_pages(ibmr, sg, sg_nents, sg_offset, c4iw_set_page);
+ +	dma_free_coherent(&c4pl->dev->rdev.lldi.pdev->dev,
+ +			  c4pl->pll_len,
+ +			  c4pl->ibpl.page_list, dma_unmap_addr(c4pl, mapping));
+ +	kfree(c4pl);
+  }
+  
+  int c4iw_dereg_mr(struct ib_mr *ib_mr)
+diff --cc drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 845de4c52d08,4a740f7a0519..000000000000
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@@ -1571,7 -1573,8 +1571,12 @@@ static int i40iw_set_page(struct ib_mr 
+   * @sg: scatter gather list for fmr
+   * @sg_nents: number of sg pages
+   */
+++<<<<<<< HEAD
+ +static int i40iw_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents)
+++=======
++ static int i40iw_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg,
++ 			   int sg_nents, unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+  	struct i40iw_mr *iwmr = to_iwmr(ibmr);
+  
+diff --cc drivers/infiniband/hw/mlx4/mlx4_ib.h
+index c3377d0b54d4,6c5ac5d8f32f..000000000000
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@@ -725,10 -717,8 +725,15 @@@ int mlx4_ib_dealloc_mw(struct ib_mw *mw
+  struct ib_mr *mlx4_ib_alloc_mr(struct ib_pd *pd,
+  			       enum ib_mr_type mr_type,
+  			       u32 max_num_sg);
+++<<<<<<< HEAD
+ +struct ib_fast_reg_page_list *mlx4_ib_alloc_fast_reg_page_list(struct ib_device *ibdev,
+ +							       int page_list_len);
+ +void mlx4_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list);
+ +
+++=======
++ int mlx4_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		      unsigned int *sg_offset);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  int mlx4_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period);
+  int mlx4_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata);
+  struct ib_cq *mlx4_ib_create_cq(struct ib_device *ibdev,
+diff --cc drivers/infiniband/hw/mlx4/mr.c
+index 2542fd3c1a49,631272172a0b..000000000000
+--- a/drivers/infiniband/hw/mlx4/mr.c
++++ b/drivers/infiniband/hw/mlx4/mr.c
+@@@ -528,3 -515,36 +528,39 @@@ int mlx4_ib_fmr_dealloc(struct ib_fmr *
+  
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int mlx4_set_page(struct ib_mr *ibmr, u64 addr)
++ {
++ 	struct mlx4_ib_mr *mr = to_mmr(ibmr);
++ 
++ 	if (unlikely(mr->npages == mr->max_pages))
++ 		return -ENOMEM;
++ 
++ 	mr->pages[mr->npages++] = cpu_to_be64(addr | MLX4_MTT_FLAG_PRESENT);
++ 
++ 	return 0;
++ }
++ 
++ int mlx4_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		      unsigned int *sg_offset)
++ {
++ 	struct mlx4_ib_mr *mr = to_mmr(ibmr);
++ 	int rc;
++ 
++ 	mr->npages = 0;
++ 
++ 	ib_dma_sync_single_for_cpu(ibmr->device, mr->page_map,
++ 				   sizeof(u64) * mr->max_pages,
++ 				   DMA_TO_DEVICE);
++ 
++ 	rc = ib_sg_to_pages(ibmr, sg, sg_nents, sg_offset, mlx4_set_page);
++ 
++ 	ib_dma_sync_single_for_device(ibmr->device, mr->page_map,
++ 				      sizeof(u64) * mr->max_pages,
++ 				      DMA_TO_DEVICE);
++ 
++ 	return rc;
++ }
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 9b6378921a8d,f05cf57f874c..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -647,12 -712,8 +647,17 @@@ int mlx5_ib_dereg_mr(struct ib_mr *ibmr
+  struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
+  			       enum ib_mr_type mr_type,
+  			       u32 max_num_sg);
+++<<<<<<< HEAD
+ +int mlx5_ib_map_mr_sg(struct ib_mr *ibmr,
+ +		      struct scatterlist *sg,
+ +		      int sg_nents);
+ +struct ib_fast_reg_page_list *mlx5_ib_alloc_fast_reg_page_list(struct ib_device *ibdev,
+ +							       int page_list_len);
+ +void mlx5_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list);
+++=======
++ int mlx5_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		      unsigned int *sg_offset);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  int mlx5_ib_process_mad(struct ib_device *ibdev, int mad_flags, u8 port_num,
+  			const struct ib_wc *in_wc, const struct ib_grh *in_grh,
+  			const struct ib_mad_hdr *in, size_t in_mad_size,
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 9a8b4ea88eb7,8cf2ce50511f..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1701,6 -1748,39 +1701,42 @@@ done
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlx5_ib_sg_to_klms(struct mlx5_ib_mr *mr,
++ 		   struct scatterlist *sgl,
++ 		   unsigned short sg_nents,
++ 		   unsigned int *sg_offset_p)
++ {
++ 	struct scatterlist *sg = sgl;
++ 	struct mlx5_klm *klms = mr->descs;
++ 	unsigned int sg_offset = sg_offset_p ? *sg_offset_p : 0;
++ 	u32 lkey = mr->ibmr.pd->local_dma_lkey;
++ 	int i;
++ 
++ 	mr->ibmr.iova = sg_dma_address(sg) + sg_offset;
++ 	mr->ibmr.length = 0;
++ 	mr->ndescs = sg_nents;
++ 
++ 	for_each_sg(sgl, sg, sg_nents, i) {
++ 		if (unlikely(i > mr->max_descs))
++ 			break;
++ 		klms[i].va = cpu_to_be64(sg_dma_address(sg) + sg_offset);
++ 		klms[i].bcount = cpu_to_be32(sg_dma_len(sg) - sg_offset);
++ 		klms[i].key = cpu_to_be32(lkey);
++ 		mr->ibmr.length += sg_dma_len(sg);
++ 
++ 		sg_offset = 0;
++ 	}
++ 
++ 	if (sg_offset_p)
++ 		*sg_offset_p = sg_offset;
++ 
++ 	return i;
++ }
++ 
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  static int mlx5_set_page(struct ib_mr *ibmr, u64 addr)
+  {
+  	struct mlx5_ib_mr *mr = to_mmr(ibmr);
+@@@ -1715,9 -1795,8 +1751,14 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5_ib_map_mr_sg(struct ib_mr *ibmr,
+ +		      struct scatterlist *sg,
+ +		      int sg_nents)
+++=======
++ int mlx5_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		      unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+  	struct mlx5_ib_mr *mr = to_mmr(ibmr);
+  	int n;
+diff --cc drivers/infiniband/hw/nes/nes_verbs.c
+index cbbc2523f4aa,4ebea4c8c9b5..000000000000
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@@ -475,9 -402,8 +475,14 @@@ static int nes_set_page(struct ib_mr *i
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int nes_map_mr_sg(struct ib_mr *ibmr,
+ +			 struct scatterlist *sg,
+ +			 int sg_nents)
+++=======
++ static int nes_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg,
++ 			 int sg_nents, unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+  	struct nes_mr *nesmr = to_nesmr(ibmr);
+  
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index afd5be994fe7,b1a3d91fe8b9..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@@ -3331,9 -3081,8 +3331,14 @@@ static int ocrdma_set_page(struct ib_m
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ocrdma_map_mr_sg(struct ib_mr *ibmr,
+ +		     struct scatterlist *sg,
+ +		     int sg_nents)
+++=======
++ int ocrdma_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		     unsigned int *sg_offset)
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  {
+  	struct ocrdma_mr *mr = get_ocrdma_mr(ibmr);
+  
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+index 1b2d3ac10203,704ef1e9271b..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+@@@ -125,12 -122,7 +125,17 @@@ struct ib_mr *ocrdma_reg_user_mr(struc
+  struct ib_mr *ocrdma_alloc_mr(struct ib_pd *pd,
+  			      enum ib_mr_type mr_type,
+  			      u32 max_num_sg);
+++<<<<<<< HEAD
+ +int ocrdma_map_mr_sg(struct ib_mr *ibmr,
+ +		     struct scatterlist *sg,
+ +		     int sg_nents);
+ +struct ib_fast_reg_page_list *ocrdma_alloc_frmr_page_list(struct ib_device
+ +							*ibdev,
+ +							int page_list_len);
+ +void ocrdma_free_frmr_page_list(struct ib_fast_reg_page_list *page_list);
+++=======
++ int ocrdma_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
++ 		     unsigned int *sg_offset);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  
+  #endif				/* __OCRDMA_VERBS_H__ */
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index 5502beb685d5,90be56893414..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -507,12 -233,11 +507,20 @@@ int iser_fast_reg_fmr(struct iscsi_iser
+  	struct ib_pool_fmr *fmr;
+  	int ret, plen;
+  
+++<<<<<<< HEAD
+ +	plen = iser_sg_to_page_vec(mem, device->ib_device,
+ +				   page_vec->pages,
+ +				   &page_vec->offset,
+ +				   &page_vec->data_size);
+ +	page_vec->length = plen;
+ +	if (plen * SIZE_4K < page_vec->data_size) {
+++=======
++ 	page_vec->npages = 0;
++ 	page_vec->fake_mr.page_size = SIZE_4K;
++ 	plen = ib_sg_to_pages(&page_vec->fake_mr, mem->sg,
++ 			      mem->size, NULL, iser_set_page);
++ 	if (unlikely(plen < mem->size)) {
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  		iser_err("page vec too short to hold this SG\n");
+  		iser_data_buf_dump(mem, device->ib_device);
+  		iser_dump_page_vec(page_vec);
+@@@ -803,58 -435,36 +811,66 @@@ static int iser_fast_reg_mr(struct iscs
+  			    struct iser_reg_resources *rsc,
+  			    struct iser_mem_reg *reg)
+  {
+ -	struct iser_tx_desc *tx_desc = &iser_task->desc;
+ -	struct ib_cqe *cqe = &iser_task->iser_conn->ib_conn.reg_cqe;
+ -	struct ib_mr *mr = rsc->mr;
+ -	struct ib_reg_wr *wr;
+ -	int n;
+ -
+ -	if (rsc->mr_valid)
+ -		iser_inv_rkey(iser_tx_next_wr(tx_desc), mr, cqe);
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct iser_device *device = ib_conn->device;
+ +	struct ib_mr *mr;
+ +	struct ib_fast_reg_page_list *frpl;
+ +	struct ib_send_wr fastreg_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	int ret, offset, size, plen;
+ +
+ +	/* if there a single dma entry, dma mr suffices */
+ +	if (mem->dma_nents == 1)
+ +		return iser_reg_dma(device, mem, reg);
+  
+ -	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
+ +	mr = rsc->mr;
+ +	frpl = rsc->frpl;
+  
+++<<<<<<< HEAD
+ +	plen = iser_sg_to_page_vec(mem, device->ib_device, frpl->page_list,
+ +				   &offset, &size);
+ +	if (plen * SIZE_4K < size) {
+ +		iser_err("fast reg page_list too short to hold this SG\n");
+ +		return -EINVAL;
+++=======
++ 	n = ib_map_mr_sg(mr, mem->sg, mem->size, NULL, SIZE_4K);
++ 	if (unlikely(n != mem->size)) {
++ 		iser_err("failed to map sg (%d/%d)\n",
++ 			 n, mem->size);
++ 		return n < 0 ? n : -EINVAL;
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+ +	}
+ +
+ +	if (!rsc->mr_valid) {
+ +		iser_inv_rkey(&inv_wr, mr);
+ +		wr = &inv_wr;
+  	}
+  
+ -	wr = reg_wr(iser_tx_next_wr(tx_desc));
+ -	wr->wr.opcode = IB_WR_REG_MR;
+ -	wr->wr.wr_cqe = cqe;
+ -	wr->wr.send_flags = 0;
+ -	wr->wr.num_sge = 0;
+ -	wr->mr = mr;
+ -	wr->key = mr->rkey;
+ -	wr->access = IB_ACCESS_LOCAL_WRITE  |
+ -		     IB_ACCESS_REMOTE_WRITE |
+ -		     IB_ACCESS_REMOTE_READ;
+ +	/* Prepare FASTREG WR */
+ +	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+ +	fastreg_wr.wr_id = ISER_FASTREG_LI_WRID;
+ +	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+ +	fastreg_wr.wr.fast_reg.iova_start = frpl->page_list[0] + offset;
+ +	fastreg_wr.wr.fast_reg.page_list = frpl;
+ +	fastreg_wr.wr.fast_reg.page_list_len = plen;
+ +	fastreg_wr.wr.fast_reg.page_shift = SHIFT_4K;
+ +	fastreg_wr.wr.fast_reg.length = size;
+ +	fastreg_wr.wr.fast_reg.rkey = mr->rkey;
+ +	fastreg_wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE  |
+ +					       IB_ACCESS_REMOTE_WRITE |
+ +					       IB_ACCESS_REMOTE_READ);
+ +
+ +	if (!wr)
+ +		wr = &fastreg_wr;
+ +	else
+ +		wr->next = &fastreg_wr;
+  
+ -	rsc->mr_valid = 1;
+ +	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ +	if (ret) {
+ +		iser_err("fast registration failed, ret:%d\n", ret);
+ +		return ret;
+ +	}
+ +	rsc->mr_valid = 0;
+  
+  	reg->sge.lkey = mr->lkey;
+  	reg->rkey = mr->rkey;
+diff --cc drivers/infiniband/ulp/srp/ib_srp.c
+index eb57f69536ed,54f4c1310897..000000000000
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@@ -1326,21 -1329,27 +1326,32 @@@ static int srp_map_finish_fr(struct srp
+  	rkey = ib_inc_rkey(desc->mr->rkey);
+  	ib_update_fast_reg_key(desc->mr, rkey);
+  
+++<<<<<<< HEAD
+ +	memcpy(desc->frpl->page_list, state->pages,
+ +	       sizeof(state->pages[0]) * state->npages);
+++=======
++ 	n = ib_map_mr_sg(desc->mr, state->sg, sg_nents, NULL, dev->mr_page_size);
++ 	if (unlikely(n < 0)) {
++ 		srp_fr_pool_put(ch->fr_pool, &desc, 1);
++ 		pr_debug("%s: ib_map_mr_sg(%d) returned %d.\n",
++ 			 dev_name(&req->scmnd->device->sdev_gendev), sg_nents,
++ 			 n);
++ 		return n;
++ 	}
+ -
+ -	req->reg_cqe.done = srp_reg_mr_err_done;
+ -
+ -	wr.wr.next = NULL;
+ -	wr.wr.opcode = IB_WR_REG_MR;
+ -	wr.wr.wr_cqe = &req->reg_cqe;
+ -	wr.wr.num_sge = 0;
+ -	wr.wr.send_flags = 0;
+ -	wr.mr = desc->mr;
+ -	wr.key = desc->mr->rkey;
+ -	wr.access = (IB_ACCESS_LOCAL_WRITE |
+ -		     IB_ACCESS_REMOTE_READ |
+ -		     IB_ACCESS_REMOTE_WRITE);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+ +
+ +	memset(&wr, 0, sizeof(wr));
+ +	wr.opcode = IB_WR_FAST_REG_MR;
+ +	wr.wr_id = FAST_REG_WR_ID_MASK;
+ +	wr.wr.fast_reg.iova_start = state->base_dma_addr;
+ +	wr.wr.fast_reg.page_list = desc->frpl;
+ +	wr.wr.fast_reg.page_list_len = state->npages;
+ +	wr.wr.fast_reg.page_shift = ilog2(dev->mr_page_size);
+ +	wr.wr.fast_reg.length = state->dma_len;
+ +	wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE |
+ +				       IB_ACCESS_REMOTE_READ |
+ +				       IB_ACCESS_REMOTE_WRITE);
+ +	wr.wr.fast_reg.rkey = desc->mr->lkey;
+  
+  	*state->fr.next++ = desc;
+  	state->nmdesc++;
+diff --cc include/rdma/ib_verbs.h
+index b3a28d2dd6e1,56bb0f39ce79..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -1774,21 -1845,13 +1774,28 @@@ struct ib_device 
+  	struct ib_mr *		   (*alloc_mr)(struct ib_pd *pd,
+  					       enum ib_mr_type mr_type,
+  					       u32 max_num_sg);
+++<<<<<<< HEAD
+ +	struct ib_fast_reg_page_list * (*alloc_fast_reg_page_list)(struct ib_device *device,
+ +								   int page_list_len);
+ +	void			   (*free_fast_reg_page_list)(struct ib_fast_reg_page_list *page_list);
+ +	int                        (*rereg_phys_mr)(struct ib_mr *mr,
+ +						    int mr_rereg_mask,
+ +						    struct ib_pd *pd,
+ +						    struct ib_phys_buf *phys_buf_array,
+ +						    int num_phys_buf,
+ +						    int mr_access_flags,
+ +						    u64 *iova_start);
+++=======
++ 	int                        (*map_mr_sg)(struct ib_mr *mr,
++ 						struct scatterlist *sg,
++ 						int sg_nents,
++ 						unsigned int *sg_offset);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  	struct ib_mw *             (*alloc_mw)(struct ib_pd *pd,
+ -					       enum ib_mw_type type,
+ -					       struct ib_udata *udata);
+ +					       enum ib_mw_type type);
+ +	int                        (*bind_mw)(struct ib_qp *qp,
+ +					      struct ib_mw *mw,
+ +					      struct ib_mw_bind *mw_bind);
+  	int                        (*dealloc_mw)(struct ib_mw *mw);
+  	struct ib_fmr *	           (*alloc_fmr)(struct ib_pd *pd,
+  						int mr_access_flags,
+@@@ -3087,4 -3144,25 +3094,28 @@@ struct net_device *ib_get_net_dev_by_pa
+  					    u16 pkey, const union ib_gid *gid,
+  					    const struct sockaddr *addr);
+  
+++<<<<<<< HEAD
+++=======
++ int ib_map_mr_sg(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
++ 		 unsigned int *sg_offset, unsigned int page_size);
++ 
++ static inline int
++ ib_map_mr_sg_zbva(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
++ 		  unsigned int *sg_offset, unsigned int page_size)
++ {
++ 	int n;
++ 
++ 	n = ib_map_mr_sg(mr, sg, sg_nents, sg_offset, page_size);
++ 	mr->iova = 0;
++ 
++ 	return n;
++ }
++ 
++ int ib_sg_to_pages(struct ib_mr *mr, struct scatterlist *sgl, int sg_nents,
++ 		unsigned int *sg_offset, int (*set_page)(struct ib_mr *, u64));
++ 
++ void ib_drain_rq(struct ib_qp *qp);
++ void ib_drain_sq(struct ib_qp *qp);
++ void ib_drain_qp(struct ib_qp *qp);
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  #endif /* IB_VERBS_H */
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 944b72ffed6c,94c3fa910b85..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -283,28 -412,43 +283,48 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+  			break;
+  	}
+ -	frmr->sg_nents = i;
+ +	dprintk("RPC:       %s: Using frmr %p to map %d segments (%d bytes)\n",
+ +		__func__, mw, i, len);
+  
+++<<<<<<< HEAD
+ +	frmr->fr_state = FRMR_IS_VALID;
+++=======
++ 	dma_nents = ib_dma_map_sg(device, frmr->sg, frmr->sg_nents, direction);
++ 	if (!dma_nents) {
++ 		pr_err("RPC:       %s: failed to dma map sg %p sg_nents %u\n",
++ 		       __func__, frmr->sg, frmr->sg_nents);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	n = ib_map_mr_sg(mr, frmr->sg, frmr->sg_nents, NULL, PAGE_SIZE);
++ 	if (unlikely(n != frmr->sg_nents)) {
++ 		pr_err("RPC:       %s: failed to map mr %p (%u/%u)\n",
++ 		       __func__, frmr->fr_mr, n, frmr->sg_nents);
++ 		rc = n < 0 ? n : -EINVAL;
++ 		goto out_senderr;
++ 	}
++ 
++ 	dprintk("RPC:       %s: Using frmr %p to map %u segments (%u bytes)\n",
++ 		__func__, mw, frmr->sg_nents, mr->length);
+ -
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+ +
+ +	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+ +	fastreg_wr.wr_id = (unsigned long)(void *)mw;
+ +	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+ +	fastreg_wr.wr.fast_reg.iova_start = seg1->mr_dma + pageoff;
+ +	fastreg_wr.wr.fast_reg.page_list = frmr->fr_pgl;
+ +	fastreg_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
+ +	fastreg_wr.wr.fast_reg.page_list_len = page_no;
+ +	fastreg_wr.wr.fast_reg.length = len;
+ +	fastreg_wr.wr.fast_reg.access_flags = writing ?
+ +				IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE :
+ +				IB_ACCESS_REMOTE_READ;
+  	key = (u8)(mr->rkey & 0x000000FF);
+  	ib_update_fast_reg_key(mr, ++key);
+ -
+ -	reg_wr->wr.next = NULL;
+ -	reg_wr->wr.opcode = IB_WR_REG_MR;
+ -	frmr->fr_cqe.done = frwr_wc_fastreg;
+ -	reg_wr->wr.wr_cqe = &frmr->fr_cqe;
+ -	reg_wr->wr.num_sge = 0;
+ -	reg_wr->wr.send_flags = 0;
+ -	reg_wr->mr = mr;
+ -	reg_wr->key = mr->rkey;
+ -	reg_wr->access = writing ?
+ -			 IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE :
+ -			 IB_ACCESS_REMOTE_READ;
+ +	fastreg_wr.wr.fast_reg.rkey = mr->rkey;
+  
+  	DECR_CQCOUNT(&r_xprt->rx_ep);
+ -	rc = ib_post_send(ia->ri_id->qp, &reg_wr->wr, &bad_wr);
+ +	rc = ib_post_send(ia->ri_id->qp, &fastreg_wr, &bad_wr);
+  	if (rc)
+  		goto out_senderr;
+  
+diff --cc net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index f0c3ff67ca98,fbe7444e7de6..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@@ -279,6 -271,23 +279,26 @@@ int rdma_read_chunk_frmr(struct svcxprt
+  	else
+  		clear_bit(RDMACTXT_F_LAST_CTXT, &ctxt->flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	dma_nents = ib_dma_map_sg(xprt->sc_cm_id->device,
++ 				  frmr->sg, frmr->sg_nents,
++ 				  frmr->direction);
++ 	if (!dma_nents) {
++ 		pr_err("svcrdma: failed to dma map sg %p\n",
++ 		       frmr->sg);
++ 		return -ENOMEM;
++ 	}
++ 	atomic_inc(&xprt->sc_dma_used);
++ 
++ 	n = ib_map_mr_sg(frmr->mr, frmr->sg, frmr->sg_nents, NULL, PAGE_SIZE);
++ 	if (unlikely(n != frmr->sg_nents)) {
++ 		pr_err("svcrdma: failed to map mr %p (%d/%d elements)\n",
++ 		       frmr->mr, n, frmr->sg_nents);
++ 		return n < 0 ? n : -EINVAL;
++ 	}
++ 
+++>>>>>>> 9aa8b3217ed3 (IB/core: Enhance ib_map_mr_sg())
+  	/* Bump the key */
+  	key = (u8)(frmr->mr->lkey & 0x000000FF);
+  	ib_update_fast_reg_key(frmr->mr, ++key);
+* Unmerged path drivers/infiniband/core/rw.c
+* Unmerged path drivers/infiniband/core/rw.c
+* Unmerged path drivers/infiniband/core/verbs.c
+* Unmerged path drivers/infiniband/hw/cxgb3/iwch_provider.c
+* Unmerged path drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+* Unmerged path drivers/infiniband/hw/cxgb4/mem.c
+* Unmerged path drivers/infiniband/hw/i40iw/i40iw_verbs.c
+* Unmerged path drivers/infiniband/hw/mlx4/mlx4_ib.h
+* Unmerged path drivers/infiniband/hw/mlx4/mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path drivers/infiniband/hw/nes/nes_verbs.c
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
+* Unmerged path drivers/infiniband/ulp/srp/ib_srp.c
+* Unmerged path include/rdma/ib_verbs.h
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
