@@ -1,0 +1,100 @@
+Drivers: hv: vmbus: prevent cpu offlining on newer hypervisors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: prevent cpu offlining on newer hypervisors (Vitaly Kuznetsov) [1167380]
+Rebuild_FUZZ: 88.29%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit e513229b4c386e6c9f66298c13fde92f73e6e1ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e513229b.failed
+
+When an SMP Hyper-V guest is running on top of 2012R2 Server and secondary
+cpus are sent offline (with echo 0 > /sys/devices/system/cpu/cpu$cpu/online)
+the system freeze is observed. This happens due to the fact that on newer
+hypervisors (Win8, WS2012R2, ...) vmbus channel handlers are distributed
+across all cpus (see init_vp_index() function in drivers/hv/channel_mgmt.c)
+and on cpu offlining nobody reassigns them to CPU0. Prevent cpu offlining
+when vmbus is loaded until the issue is fixed host-side.
+
+This patch also disables hibernation but it is OK as it is also broken (MCE
+error is hit on resume). Suspend still works.
+
+Tested with WS2008R2 and WS2012R2.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit e513229b4c386e6c9f66298c13fde92f73e6e1ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 143d8f6191ee,3b18a665ef4c..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -33,6 -32,8 +33,11 @@@
+  #include <linux/completion.h>
+  #include <linux/hyperv.h>
+  #include <linux/kernel_stat.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/clockchips.h>
++ #include <linux/cpu.h>
+++>>>>>>> e513229b4c38 (Drivers: hv: vmbus: prevent cpu offlining on newer hypervisors)
+  #include <asm/hyperv.h>
+  #include <asm/hypervisor.h>
+  #include <asm/mshyperv.h>
+@@@ -540,10 -697,47 +545,43 @@@ static void vmbus_isr(void
+  	msg = (struct hv_message *)page_addr + VMBUS_MESSAGE_SINT;
+  
+  	/* Check if there are actual msgs to be processed */
+ -	if (msg->header.message_type != HVMSG_NONE) {
+ -		if (msg->header.message_type == HVMSG_TIMER_EXPIRED)
+ -			hv_process_timer_expiration(msg, cpu);
+ -		else
+ -			tasklet_schedule(&msg_dpc);
+ -	}
+ +	if (msg->header.message_type != HVMSG_NONE)
+ +		tasklet_schedule(&msg_dpc);
+  }
+  
++ #ifdef CONFIG_HOTPLUG_CPU
++ static int hyperv_cpu_disable(void)
++ {
++ 	return -ENOSYS;
++ }
++ 
++ static void hv_cpu_hotplug_quirk(bool vmbus_loaded)
++ {
++ 	static void *previous_cpu_disable;
++ 
++ 	/*
++ 	 * Offlining a CPU when running on newer hypervisors (WS2012R2, Win8,
++ 	 * ...) is not supported at this moment as channel interrupts are
++ 	 * distributed across all of them.
++ 	 */
++ 
++ 	if ((vmbus_proto_version == VERSION_WS2008) ||
++ 	    (vmbus_proto_version == VERSION_WIN7))
++ 		return;
++ 
++ 	if (vmbus_loaded) {
++ 		previous_cpu_disable = smp_ops.cpu_disable;
++ 		smp_ops.cpu_disable = hyperv_cpu_disable;
++ 		pr_notice("CPU offlining is not supported by hypervisor\n");
++ 	} else if (previous_cpu_disable)
++ 		smp_ops.cpu_disable = previous_cpu_disable;
++ }
++ #else
++ static void hv_cpu_hotplug_quirk(bool vmbus_loaded)
++ {
++ }
++ #endif
++ 
+  /*
+   * vmbus_bus_init -Main vmbus driver initialization routine.
+   *
+* Unmerged path drivers/hv/vmbus_drv.c
