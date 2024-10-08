@@ -1,0 +1,119 @@
+asix: Continue processing URB if no RX netdev buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Jenkins <Dean_Jenkins@mentor.com>
+commit 6a570814cd430fa5ef4f278e8046dcf12ee63f13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6a570814.failed
+
+Avoid a loss of synchronisation of the Ethernet Data header 32-bit
+word due to a failure to get a netdev socket buffer.
+
+The ASIX RX handling algorithm returned 0 upon a failure to get
+an allocation of a netdev socket buffer. This causes the URB
+processing to stop which potentially causes a loss of synchronisation
+with the Ethernet Data header 32-bit word. Therefore, subsequent
+processing of URBs may be rejected due to a loss of synchronisation.
+This may cause additional good Ethernet frames to be discarded
+along with outputting of synchronisation error messages.
+
+Implement a solution which checks whether a netdev socket buffer
+has been allocated before trying to copy the Ethernet frame into
+the netdev socket buffer. But continue to process the URB so that
+synchronisation is maintained. Therefore, only a single Ethernet
+frame is discarded when no netdev socket buffer is available.
+
+	Signed-off-by: Dean Jenkins <Dean_Jenkins@mentor.com>
+	Signed-off-by: Mark Craske <Mark_Craske@mentor.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6a570814cd430fa5ef4f278e8046dcf12ee63f13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/asix_common.c
+diff --cc drivers/net/usb/asix_common.c
+index f7ee6338a446,a186b0a12d50..000000000000
+--- a/drivers/net/usb/asix_common.c
++++ b/drivers/net/usb/asix_common.c
+@@@ -109,44 -110,45 +111,65 @@@ int asix_rx_fixup_internal(struct usbne
+  				offset += sizeof(u32);
+  			}
+  
+ -			/* take frame length from Data header 32-bit word */
+ -			size = (u16)(rx->header & 0x7ff);
+ -			if (size != ((~rx->header >> 16) & 0x7ff)) {
+ +			/* get the packet length */
+ +			rx->size = (u16) (rx->header & 0x7ff);
+ +			if (rx->size != ((~rx->header >> 16) & 0x7ff)) {
+  				netdev_err(dev->net, "asix_rx_fixup() Bad Header Length 0x%x, offset %d\n",
+  					   rx->header, offset);
+ +				rx->size = 0;
+  				return 0;
+  			}
+ -			if (size > dev->net->mtu + ETH_HLEN + VLAN_HLEN) {
+ -				netdev_err(dev->net, "asix_rx_fixup() Bad RX Length %d\n",
+ -					   size);
+ +			rx->ax_skb = netdev_alloc_skb_ip_align(dev->net,
+ +							       rx->size);
+ +			if (!rx->ax_skb) {
+ +				rx->size = 0;
+  				return 0;
+  			}
+++<<<<<<< HEAD
+++=======
++ 
++ 			/* Sometimes may fail to get a netdev socket buffer but
++ 			 * continue to process the URB socket buffer so that
++ 			 * synchronisation of the Ethernet frame Data header
++ 			 * word is maintained.
++ 			 */
++ 			rx->ax_skb = netdev_alloc_skb_ip_align(dev->net, size);
++ 
++ 			rx->remaining = size;
+++>>>>>>> 6a570814cd43 (asix: Continue processing URB if no RX netdev buffer)
+  		}
+  
+ -		if (rx->remaining > skb->len - offset) {
+ -			copy_length = skb->len - offset;
+ -			rx->remaining -= copy_length;
+ -		} else {
+ -			copy_length = rx->remaining;
+ -			rx->remaining = 0;
+ +		if (rx->size > dev->net->mtu + ETH_HLEN + VLAN_HLEN) {
+ +			netdev_err(dev->net, "asix_rx_fixup() Bad RX Length %d\n",
+ +				   rx->size);
+ +			kfree_skb(rx->ax_skb);
+ +			rx->ax_skb = NULL;
+ +			rx->size = 0U;
+ +
+ +			return 0;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (rx->size > skb->len - offset) {
+ +			remaining = rx->size - (skb->len - offset);
+ +			rx->size = skb->len - offset;
+ +		}
+ +
+ +		data = skb_put(rx->ax_skb, rx->size);
+ +		memcpy(data, skb->data + offset, rx->size);
+ +		if (!remaining)
+ +			usbnet_skb_return(dev, rx->ax_skb);
+++=======
++ 		if (rx->ax_skb) {
++ 			data = skb_put(rx->ax_skb, copy_length);
++ 			memcpy(data, skb->data + offset, copy_length);
++ 			if (!rx->remaining)
++ 				usbnet_skb_return(dev, rx->ax_skb);
++ 		}
+++>>>>>>> 6a570814cd43 (asix: Continue processing URB if no RX netdev buffer)
+  
+ -		offset += (copy_length + 1) & 0xfffe;
+ +		offset += (rx->size + 1) & 0xfffe;
+ +		rx->size = remaining;
+  	}
+  
+  	if (skb->len != offset) {
+* Unmerged path drivers/net/usb/asix_common.c
