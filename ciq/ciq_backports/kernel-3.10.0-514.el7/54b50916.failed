@@ -1,0 +1,258 @@
+perf stat: Implement --metric-only mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 54b5091606c18f68a7fc8b4ab03ac4592c7d2922
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/54b50916.failed
+
+Add a new mode to only print metrics. Sometimes we don't care about the
+raw values, just want the computed metrics. This allows more compact
+printing, so with -I each sample is only a single line.  This also
+allows easier plotting and processing with other tools.
+
+The main target is with using --topdown, but it also works with -T and
+standard perf stat. A few metrics are not supported.
+
+To avoiding having to hardcode all the metrics in the code it uses a two
+pass approach: first compute dummy metrics and only print the headers in
+the print_metric callback. Then use the callback to print the actual
+values.
+
+There are some additional changes in the stat printout code to handle
+all metrics being on a single line.
+
+One issue is that the column code doesn't know in advance what events
+are not supported by the CPU, and it would be hard to find out as this
+could change based on dynamic conditions. That causes empty columns in
+some cases.
+
+The output can be fairly wide, often you may need more than 80 columns.
+
+Example:
+
+% perf stat -a -I 1000 --metric-only
+     1.001452803 frontend cycles idle insn per cycle       stalled cycles per insn branch-misses of all branches
+     1.001452803  158.91%               0.66                2.39                    2.92%
+     2.002192321  180.63%               0.76                2.08                    2.96%
+     3.003088282  150.59%               0.62                2.57                    2.84%
+     4.004369835  196.20%               0.98                1.62                    3.79%
+     5.005227314  231.98%               0.84                1.90                    4.71%
+
+v2: Lots of updates.
+v3: Use slightly narrower columns
+v4: Add comment
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/1457049458-28956-6-git-send-email-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 54b5091606c18f68a7fc8b4ab03ac4592c7d2922)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-stat.c
+diff --cc tools/perf/builtin-stat.c
+index 35c69cb8a5c1,74508c9d0742..000000000000
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@@ -117,9 -122,28 +117,10 @@@ static bool			sync_run			= false
+  static unsigned int		initial_delay			= 0;
+  static unsigned int		unit_width			= 4; /* strlen("unit") */
+  static bool			forever				= false;
++ static bool			metric_only			= false;
+  static struct timespec		ref_time;
+  static struct cpu_map		*aggr_map;
+ -static aggr_get_id_t		aggr_get_id;
+ -static bool			append_file;
+ -static const char		*output_name;
+ -static int			output_fd;
+ -
+ -struct perf_stat {
+ -	bool			 record;
+ -	struct perf_data_file	 file;
+ -	struct perf_session	*session;
+ -	u64			 bytes_written;
+ -	struct perf_tool	 tool;
+ -	bool			 maps_allocated;
+ -	struct cpu_map		*cpus;
+ -	struct thread_map	*threads;
+ -	enum aggr_mode		 aggr_mode;
+ -};
+ -
+ -static struct perf_stat		perf_stat;
+ -#define STAT_RECORD		perf_stat.record
+ +static int			(*aggr_get_id)(struct cpu_map *m, int cpu);
+  
+  static volatile int done = 0;
+  
+@@@ -1061,8 -1472,122 +1235,123 @@@ static int stat__set_big_num(const stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct option stat_options[] = {
++ 	OPT_BOOLEAN('T', "transaction", &transaction_run,
++ 		    "hardware transaction statistics"),
++ 	OPT_CALLBACK('e', "event", &evsel_list, "event",
++ 		     "event selector. use 'perf list' to list available events",
++ 		     parse_events_option),
++ 	OPT_CALLBACK(0, "filter", &evsel_list, "filter",
++ 		     "event filter", parse_filter),
++ 	OPT_BOOLEAN('i', "no-inherit", &no_inherit,
++ 		    "child tasks do not inherit counters"),
++ 	OPT_STRING('p', "pid", &target.pid, "pid",
++ 		   "stat events on existing process id"),
++ 	OPT_STRING('t', "tid", &target.tid, "tid",
++ 		   "stat events on existing thread id"),
++ 	OPT_BOOLEAN('a', "all-cpus", &target.system_wide,
++ 		    "system-wide collection from all CPUs"),
++ 	OPT_BOOLEAN('g', "group", &group,
++ 		    "put the counters into a counter group"),
++ 	OPT_BOOLEAN('c', "scale", &stat_config.scale, "scale/normalize counters"),
++ 	OPT_INCR('v', "verbose", &verbose,
++ 		    "be more verbose (show counter open errors, etc)"),
++ 	OPT_INTEGER('r', "repeat", &run_count,
++ 		    "repeat command and print average + stddev (max: 100, forever: 0)"),
++ 	OPT_BOOLEAN('n', "null", &null_run,
++ 		    "null run - dont start any counters"),
++ 	OPT_INCR('d', "detailed", &detailed_run,
++ 		    "detailed run - start a lot of events"),
++ 	OPT_BOOLEAN('S', "sync", &sync_run,
++ 		    "call sync() before starting a run"),
++ 	OPT_CALLBACK_NOOPT('B', "big-num", NULL, NULL,
++ 			   "print large numbers with thousands\' separators",
++ 			   stat__set_big_num),
++ 	OPT_STRING('C', "cpu", &target.cpu_list, "cpu",
++ 		    "list of cpus to monitor in system-wide"),
++ 	OPT_SET_UINT('A', "no-aggr", &stat_config.aggr_mode,
++ 		    "disable CPU count aggregation", AGGR_NONE),
++ 	OPT_STRING('x', "field-separator", &csv_sep, "separator",
++ 		   "print counts with custom separator"),
++ 	OPT_CALLBACK('G', "cgroup", &evsel_list, "name",
++ 		     "monitor event in cgroup name only", parse_cgroups),
++ 	OPT_STRING('o', "output", &output_name, "file", "output file name"),
++ 	OPT_BOOLEAN(0, "append", &append_file, "append to the output file"),
++ 	OPT_INTEGER(0, "log-fd", &output_fd,
++ 		    "log output to fd, instead of stderr"),
++ 	OPT_STRING(0, "pre", &pre_cmd, "command",
++ 			"command to run prior to the measured command"),
++ 	OPT_STRING(0, "post", &post_cmd, "command",
++ 			"command to run after to the measured command"),
++ 	OPT_UINTEGER('I', "interval-print", &stat_config.interval,
++ 		    "print counts at regular interval in ms (>= 10)"),
++ 	OPT_SET_UINT(0, "per-socket", &stat_config.aggr_mode,
++ 		     "aggregate counts per processor socket", AGGR_SOCKET),
++ 	OPT_SET_UINT(0, "per-core", &stat_config.aggr_mode,
++ 		     "aggregate counts per physical processor core", AGGR_CORE),
++ 	OPT_SET_UINT(0, "per-thread", &stat_config.aggr_mode,
++ 		     "aggregate counts per thread", AGGR_THREAD),
++ 	OPT_UINTEGER('D', "delay", &initial_delay,
++ 		     "ms to wait before starting measurement after program start"),
++ 	OPT_BOOLEAN(0, "metric-only", &metric_only,
++ 			"Only print computed metrics. No raw values"),
++ 	OPT_END()
++ };
++ 
++ static int perf_stat__get_socket(struct cpu_map *map, int cpu)
++ {
++ 	return cpu_map__get_socket(map, cpu, NULL);
++ }
++ 
++ static int perf_stat__get_core(struct cpu_map *map, int cpu)
++ {
++ 	return cpu_map__get_core(map, cpu, NULL);
++ }
++ 
++ static int cpu_map__get_max(struct cpu_map *map)
++ {
++ 	int i, max = -1;
++ 
++ 	for (i = 0; i < map->nr; i++) {
++ 		if (map->map[i] > max)
++ 			max = map->map[i];
++ 	}
++ 
++ 	return max;
++ }
++ 
++ static struct cpu_map *cpus_aggr_map;
++ 
++ static int perf_stat__get_aggr(aggr_get_id_t get_id, struct cpu_map *map, int idx)
++ {
++ 	int cpu;
++ 
++ 	if (idx >= map->nr)
++ 		return -1;
++ 
++ 	cpu = map->map[idx];
++ 
++ 	if (cpus_aggr_map->map[cpu] == -1)
++ 		cpus_aggr_map->map[cpu] = get_id(map, idx);
++ 
++ 	return cpus_aggr_map->map[cpu];
++ }
++ 
++ static int perf_stat__get_socket_cached(struct cpu_map *map, int idx)
++ {
++ 	return perf_stat__get_aggr(perf_stat__get_socket, map, idx);
++ }
++ 
++ static int perf_stat__get_core_cached(struct cpu_map *map, int idx)
++ {
++ 	return perf_stat__get_aggr(perf_stat__get_core, map, idx);
++ }
++ 
+++>>>>>>> 54b5091606c1 (perf stat: Implement --metric-only mode)
+  static int perf_stat_init_aggr_mode(void)
+  {
+ -	int nr;
+ -
+  	switch (stat_config.aggr_mode) {
+  	case AGGR_SOCKET:
+  		if (cpu_map__build_socket_map(evsel_list->cpus, &aggr_map)) {
+@@@ -1368,9 -2173,24 +1657,24 @@@ int cmd_stat(int argc, const char **arg
+  		goto out;
+  	}
+  
++ 	if (metric_only && stat_config.aggr_mode == AGGR_THREAD) {
++ 		fprintf(stderr, "--metric-only is not supported with --per-thread\n");
++ 		goto out;
++ 	}
++ 
++ 	if (metric_only && stat_config.aggr_mode == AGGR_NONE) {
++ 		fprintf(stderr, "--metric-only is not supported with -A\n");
++ 		goto out;
++ 	}
++ 
++ 	if (metric_only && run_count > 1) {
++ 		fprintf(stderr, "--metric-only is not supported with -r\n");
++ 		goto out;
++ 	}
++ 
+  	if (output_fd < 0) {
+  		fprintf(stderr, "argument to --log-fd must be a > 0\n");
+ -		parse_options_usage(stat_usage, stat_options, "log-fd", 0);
+ +		parse_options_usage(stat_usage, options, "log-fd", 0);
+  		goto out;
+  	}
+  
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index 6f76e661d983..e975c26514e8 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -140,6 +140,10 @@ Print count deltas every N milliseconds (minimum: 10ms)
+ The overhead percentage could be high in some cases, for instance with small, sub 100ms intervals.  Use with caution.
+ 	example: 'perf stat -I 1000 -e cycles -a sleep 5'
+ 
++--metric-only::
++Only print computed metrics. Print them in a single line.
++Don't show any raw values. Not supported with -A or --per-thread.
++
+ --per-socket::
+ Aggregate counts per processor socket for system-wide mode measurements.  This
+ is a useful mode to detect imbalance between sockets.  To enable this mode,
+* Unmerged path tools/perf/builtin-stat.c
