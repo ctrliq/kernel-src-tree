@@ -1,0 +1,208 @@
+blk-mq: rework I/O completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 30a91cb4ef385fe1b260df204ef314d86fff2850
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/30a91cb4.failed
+
+Rework I/O completions to work more like the old code path.  blk_mq_end_io
+now stays out of the business of deferring completions to others CPUs
+and calling blk_mark_rq_complete.  The latter is very important to allow
+completing requests that have timed out and thus are already marked completed,
+the former allows using the IPI callout even for driver specific completions
+instead of having to reimplement them.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 30a91cb4ef385fe1b260df204ef314d86fff2850)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index ae79a9409728,14c8f35946e1..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -353,85 -351,53 +353,126 @@@ void blk_mq_end_io(struct request *rq, 
+  	else
+  		blk_mq_free_request(rq);
+  }
++ EXPORT_SYMBOL(blk_mq_end_io);
+  
+++<<<<<<< HEAD
+ +void __blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	if (!blk_mark_rq_complete(rq))
+ +		blk_mq_complete_request(rq, error);
+ +}
+ +
+ +#if defined(CONFIG_SMP) && defined(CONFIG_USE_GENERIC_SMP_HELPERS)
+ +
+ +/*
+ + * Called with interrupts disabled.
+ + */
+ +static void ipi_end_io(void *data)
+ +{
+ +	struct llist_head *list = &per_cpu(ipi_lists, smp_processor_id());
+ +	struct llist_node *entry, *next;
+ +	struct request *rq;
+ +
+ +	entry = llist_del_all(list);
+ +
+ +	while (entry) {
+ +		next = entry->next;
+ +		rq = llist_entry(entry, struct request, ll_list);
+ +		__blk_mq_end_io(rq, rq->errors);
+ +		entry = next;
+ +	}
+ +}
+ +
+ +static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
+ +			  struct request *rq, const int error)
+ +{
+ +	struct call_single_data *data = &rq->csd;
+ +
+ +	rq->errors = error;
+ +	rq->ll_list.next = NULL;
+ +
+ +	/*
+ +	 * If the list is non-empty, an existing IPI must already
+ +	 * be "in flight". If that is the case, we need not schedule
+ +	 * a new one.
+ +	 */
+ +	if (llist_add(&rq->ll_list, &per_cpu(ipi_lists, ctx->cpu))) {
+ +		data->func = ipi_end_io;
+ +		data->flags = 0;
+ +		__smp_call_function_single(ctx->cpu, data, 0);
+ +	}
+ +
+ +	return true;
+ +}
+ +#else /* CONFIG_SMP && CONFIG_USE_GENERIC_SMP_HELPERS */
+ +static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
+ +			  struct request *rq, const int error)
+ +{
+ +	return false;
+ +}
+ +#endif
+ +
+ +/*
+ + * End IO on this request on a multiqueue enabled driver. We'll either do
+ + * it directly inline, or punt to a local IPI handler on the matching
+ + * remote CPU.
+ + */
+ +void blk_mq_end_io(struct request *rq, int error)
+++=======
++ static void __blk_mq_complete_request_remote(void *data)
++ {
++ 	struct request *rq = data;
++ 
++ 	rq->q->softirq_done_fn(rq);
++ }
++ 
++ void __blk_mq_complete_request(struct request *rq)
+++>>>>>>> 30a91cb4ef38 (blk-mq: rework I/O completions)
+  {
+  	struct blk_mq_ctx *ctx = rq->mq_ctx;
+  	int cpu;
+  
+- 	if (!ctx->ipi_redirect)
+- 		return __blk_mq_end_io(rq, error);
++ 	if (!ctx->ipi_redirect) {
++ 		rq->q->softirq_done_fn(rq);
++ 		return;
++ 	}
+  
+  	cpu = get_cpu();
+++<<<<<<< HEAD
+ +
+ +	if (cpu == ctx->cpu || !cpu_online(ctx->cpu) ||
+ +	    !ipi_remote_cpu(ctx, cpu, rq, error))
+ +		__blk_mq_end_io(rq, error);
+ +
+++=======
++ 	if (cpu != ctx->cpu && cpu_online(ctx->cpu)) {
++ 		rq->csd.func = __blk_mq_complete_request_remote;
++ 		rq->csd.info = rq;
++ 		rq->csd.flags = 0;
++ 		__smp_call_function_single(ctx->cpu, &rq->csd, 0);
++ 	} else {
++ 		rq->q->softirq_done_fn(rq);
++ 	}
+++>>>>>>> 30a91cb4ef38 (blk-mq: rework I/O completions)
+  	put_cpu();
+  }
+- EXPORT_SYMBOL(blk_mq_end_io);
++ 
++ /**
++  * blk_mq_complete_request - end I/O on a request
++  * @rq:		the request being processed
++  *
++  * Description:
++  *	Ends all I/O on a request. It does not handle partial completions.
++  *	The actual completion happens out-of-order, through a IPI handler.
++  **/
++ void blk_mq_complete_request(struct request *rq)
++ {
++ 	if (unlikely(blk_should_fake_timeout(rq->q)))
++ 		return;
++ 	if (!blk_mark_rq_complete(rq))
++ 		__blk_mq_complete_request(rq);
++ }
++ EXPORT_SYMBOL(blk_mq_complete_request);
+  
+  static void blk_mq_start_request(struct request *rq)
+  {
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index e151a2f4f171..079e1d544a25 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -22,8 +22,7 @@ struct blk_mq_ctx {
+ 	struct kobject		kobj;
+ };
+ 
+-void __blk_mq_end_io(struct request *rq, int error);
+-void blk_mq_complete_request(struct request *rq, int error);
++void __blk_mq_complete_request(struct request *rq);
+ void blk_mq_run_request(struct request *rq, bool run_queue, bool async);
+ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+ void blk_mq_init_flush(struct request_queue *q);
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 697680294770..c1bb70d719dc 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -90,7 +90,7 @@ static void blk_rq_timed_out(struct request *req)
+ 	case BLK_EH_HANDLED:
+ 		/* Can we use req->errors here? */
+ 		if (q->mq_ops)
+-			blk_mq_complete_request(req, req->errors);
++			__blk_mq_complete_request(req);
+ 		else
+ 			__blk_complete_request(req);
+ 		break;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 21fa523f146e..94b72d1d4b49 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -86,6 +86,8 @@ struct blk_mq_ops {
+ 	 */
+ 	rq_timed_out_fn		*timeout;
+ 
++	softirq_done_fn		*complete;
++
+ 	/*
+ 	 * Override for hctx allocations (should probably go)
+ 	 */
+@@ -137,6 +139,8 @@ void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+ 
+ void blk_mq_end_io(struct request *rq, int error);
+ 
++void blk_mq_complete_request(struct request *rq);
++
+ void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+ void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
+ void blk_mq_stop_hw_queues(struct request_queue *q);
