@@ -1,0 +1,271 @@
+cpufreq: make return type of lock_policy_rwsem_{read|write}() as void
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] make return type of lock_policy_rwsem_{read|write}() as void (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 93.02%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 1b750e3bdae5b2d0f3d377b0c56e7465f85b67f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1b750e3b.failed
+
+lock_policy_rwsem_{read|write}() currently has return type of int,
+but it always returns zero and hence its return type should be void
+instead. This patch makes that change and modifies all of the users
+accordingly.
+
+	Reported-by: Jon Medhurst<tixy@linaro.org>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1b750e3bdae5b2d0f3d377b0c56e7465f85b67f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 10242e0afeba,eb993d997bef..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -66,13 -67,11 +66,19 @@@ static DEFINE_PER_CPU(int, cpufreq_poli
+  static DEFINE_PER_CPU(struct rw_semaphore, cpu_policy_rwsem);
+  
+  #define lock_policy_rwsem(mode, cpu)					\
+- static int lock_policy_rwsem_##mode(int cpu)				\
++ static void lock_policy_rwsem_##mode(int cpu)				\
+  {									\
+++<<<<<<< HEAD
+ +	int policy_cpu = per_cpu(cpufreq_policy_cpu, cpu);		\
+ +	BUG_ON(policy_cpu == -1);					\
+ +	down_##mode(&per_cpu(cpu_policy_rwsem, policy_cpu));		\
+ +									\
+ +	return 0;							\
+++=======
++ 	struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);	\
++ 	BUG_ON(!policy);						\
++ 	down_##mode(&per_cpu(cpu_policy_rwsem, policy->cpu));		\
+++>>>>>>> 1b750e3bdae5 (cpufreq: make return type of lock_policy_rwsem_{read|write}() as void)
+  }
+  
+  lock_policy_rwsem(read, cpu);
+@@@ -1088,16 -1140,11 +1089,21 @@@ static int cpufreq_nominate_new_policy_
+  	if (ret) {
+  		pr_err("%s: Failed to move kobj: %d", __func__, ret);
+  
+++<<<<<<< HEAD
+ +		WARN_ON(lock_policy_rwsem_write(old_cpu));
+ +		cpumask_set_cpu(old_cpu, data->cpus);
+ +
+ +		write_lock_irqsave(&cpufreq_driver_lock, flags);
+ +		per_cpu(cpufreq_cpu_data, old_cpu) = data;
+ +		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+++=======
++ 		lock_policy_rwsem_write(old_cpu);
++ 		cpumask_set_cpu(old_cpu, policy->cpus);
+++>>>>>>> 1b750e3bdae5 (cpufreq: make return type of lock_policy_rwsem_{read|write}() as void)
+  		unlock_policy_rwsem_write(old_cpu);
+  
+ -		ret = sysfs_create_link(&cpu_dev->kobj, &policy->kobj,
+ +		ret = sysfs_create_link(&cpu_dev->kobj, &data->kobj,
+  					"cpufreq");
+  
+  		return -EINVAL;
+@@@ -1106,6 -1153,155 +1112,158 @@@
+  	return cpu_dev->id;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __cpufreq_remove_dev_prepare(struct device *dev,
++ 					struct subsys_interface *sif,
++ 					bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int new_cpu, ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 
++ 	pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 
++ 	/* Save the policy somewhere when doing a light-weight tear-down */
++ 	if (frozen)
++ 		per_cpu(cpufreq_cpu_data_fallback, cpu) = policy;
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (cpufreq_driver->target) {
++ 		ret = __cpufreq_governor(policy, CPUFREQ_GOV_STOP);
++ 		if (ret) {
++ 			pr_err("%s: Failed to stop governor\n", __func__);
++ 			return ret;
++ 		}
++ 	}
++ 
++ #ifdef CONFIG_HOTPLUG_CPU
++ 	if (!cpufreq_driver->setpolicy)
++ 		strncpy(per_cpu(cpufreq_cpu_governor, cpu),
++ 			policy->governor->name, CPUFREQ_NAME_LEN);
++ #endif
++ 
++ 	lock_policy_rwsem_read(cpu);
++ 	cpus = cpumask_weight(policy->cpus);
++ 	unlock_policy_rwsem_read(cpu);
++ 
++ 	if (cpu != policy->cpu) {
++ 		if (!frozen)
++ 			sysfs_remove_link(&dev->kobj, "cpufreq");
++ 	} else if (cpus > 1) {
++ 
++ 		new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu, frozen);
++ 		if (new_cpu >= 0) {
++ 			update_policy_cpu(policy, new_cpu);
++ 
++ 			if (!frozen) {
++ 				pr_debug("%s: policy Kobject moved to cpu: %d "
++ 					 "from: %d\n",__func__, new_cpu, cpu);
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __cpufreq_remove_dev_finish(struct device *dev,
++ 				       struct subsys_interface *sif,
++ 				       bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	lock_policy_rwsem_write(cpu);
++ 	cpus = cpumask_weight(policy->cpus);
++ 
++ 	if (cpus > 1)
++ 		cpumask_clear_cpu(cpu, policy->cpus);
++ 	unlock_policy_rwsem_write(cpu);
++ 
++ 	/* If cpu is last user of policy, free policy */
++ 	if (cpus == 1) {
++ 		if (cpufreq_driver->target) {
++ 			ret = __cpufreq_governor(policy,
++ 					CPUFREQ_GOV_POLICY_EXIT);
++ 			if (ret) {
++ 				pr_err("%s: Failed to exit governor\n",
++ 						__func__);
++ 				return ret;
++ 			}
++ 		}
++ 
++ 		if (!frozen) {
++ 			lock_policy_rwsem_read(cpu);
++ 			kobj = &policy->kobj;
++ 			cmp = &policy->kobj_unregister;
++ 			unlock_policy_rwsem_read(cpu);
++ 			kobject_put(kobj);
++ 
++ 			/*
++ 			 * We need to make sure that the underlying kobj is
++ 			 * actually not referenced anymore by anybody before we
++ 			 * proceed with unloading.
++ 			 */
++ 			pr_debug("waiting for dropping of refcount\n");
++ 			wait_for_completion(cmp);
++ 			pr_debug("wait complete\n");
++ 		}
++ 
++ 		/*
++ 		 * Perform the ->exit() even during light-weight tear-down,
++ 		 * since this is a core component, and is essential for the
++ 		 * subsequent light-weight ->init() to succeed.
++ 		 */
++ 		if (cpufreq_driver->exit)
++ 			cpufreq_driver->exit(policy);
++ 
++ 		/* Remove policy from list of active policies */
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		list_del(&policy->policy_list);
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 		if (!frozen)
++ 			cpufreq_policy_free(policy);
++ 	} else {
++ 		if (cpufreq_driver->target) {
++ 			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
++ 					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
++ 				pr_err("%s: Failed to start governor\n",
++ 						__func__);
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 
++ 	per_cpu(cpufreq_cpu_data, cpu) = NULL;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1b750e3bdae5 (cpufreq: make return type of lock_policy_rwsem_{read|write}() as void)
+  /**
+   * __cpufreq_remove_dev - remove a CPU device
+   *
+@@@ -1871,17 -1983,14 +2024,14 @@@ int cpufreq_update_policy(unsigned int 
+  		goto no_policy;
+  	}
+  
+- 	if (unlikely(lock_policy_rwsem_write(cpu))) {
+- 		ret = -EINVAL;
+- 		goto fail;
+- 	}
++ 	lock_policy_rwsem_write(cpu);
+  
+  	pr_debug("updating policy for CPU %u\n", cpu);
+ -	memcpy(&new_policy, policy, sizeof(*policy));
+ -	new_policy.min = policy->user_policy.min;
+ -	new_policy.max = policy->user_policy.max;
+ -	new_policy.policy = policy->user_policy.policy;
+ -	new_policy.governor = policy->user_policy.governor;
+ +	memcpy(&policy, data, sizeof(struct cpufreq_policy));
+ +	policy.min = data->user_policy.min;
+ +	policy.max = data->user_policy.max;
+ +	policy.policy = data->user_policy.policy;
+ +	policy.governor = data->user_policy.governor;
+  
+  	/*
+  	 * BIOS might change freq behind our back
+@@@ -1903,8 -2012,7 +2053,12 @@@
+  
+  	unlock_policy_rwsem_write(cpu);
+  
+++<<<<<<< HEAD
+ +fail:
+ +	cpufreq_cpu_put(data);
+++=======
++ 	cpufreq_cpu_put(policy);
+++>>>>>>> 1b750e3bdae5 (cpufreq: make return type of lock_policy_rwsem_{read|write}() as void)
+  no_policy:
+  	return ret;
+  }
+* Unmerged path drivers/cpufreq/cpufreq.c
