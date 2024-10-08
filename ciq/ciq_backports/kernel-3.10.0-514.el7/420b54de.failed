@@ -1,0 +1,168 @@
+mfd: watchdog: iTCO_wdt: Expose watchdog properties using platform data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 420b54de25828c45f3fc1f12d52d9657f5e90a53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/420b54de.failed
+
+Intel Sunrisepoint (Skylake PCH) has the iTCO watchdog accessible across
+the SMBus, unlike previous generations of PCH/ICH where it was on the
+LPC bus. Because it's on the SMBus, it doesn't make sense to pass around
+a 'struct lpc_ich_info', and leaking the type of bus into the iTCO
+watchdog driver is kind of backwards anyway.
+
+This change introduces a new 'struct itco_wdt_platform_data' for use
+inside the iTCO watchdog driver and by the upcoming Intel Sunrisepoint
+code, which neatly avoids having to include lpc_ich headers in the i801
+i2c driver.
+
+This change is overdue because lpc_ich_info has already found its way
+into other TCO watchdog users, notably the intel_pmc_ipc driver where
+the watchdog actually isn't on the LPC bus as far as I can see.
+
+A simple translation layer is provided for converting from the existing
+'struct lpc_ich_info' inside the lpc_ich mfd driver.
+
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+	Acked-by: Darren Hart <dvhart@linux.intel.com> [drivers/x86 refactoring]
+	Reviewed-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Lee Jones <lee.jones@linaro.org>
+(cherry picked from commit 420b54de25828c45f3fc1f12d52d9657f5e90a53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/intel_pmc_ipc.c
+#	drivers/watchdog/iTCO_wdt.c
+diff --cc drivers/watchdog/iTCO_wdt.c
+index 3797760540ea,a94401b2deca..000000000000
+--- a/drivers/watchdog/iTCO_wdt.c
++++ b/drivers/watchdog/iTCO_wdt.c
+@@@ -417,9 -417,9 +416,13 @@@ static int iTCO_wdt_probe(struct platfo
+  {
+  	int ret = -ENODEV;
+  	unsigned long val32;
+++<<<<<<< HEAD
+ +	struct lpc_ich_info *ich_info = dev->dev.platform_data;
+++=======
++ 	struct itco_wdt_platform_data *pdata = dev_get_platdata(&dev->dev);
+++>>>>>>> 420b54de2582 (mfd: watchdog: iTCO_wdt: Expose watchdog properties using platform data)
+  
+- 	if (!ich_info)
++ 	if (!pdata)
+  		goto out;
+  
+  	spin_lock_init(&iTCO_wdt_private.io_lock);
+* Unmerged path drivers/platform/x86/intel_pmc_ipc.c
+diff --git a/drivers/mfd/lpc_ich.c b/drivers/mfd/lpc_ich.c
+index e99f0a220683..bcdbe757203c 100644
+--- a/drivers/mfd/lpc_ich.c
++++ b/drivers/mfd/lpc_ich.c
+@@ -66,6 +66,7 @@
+ #include <linux/pci.h>
+ #include <linux/mfd/core.h>
+ #include <linux/mfd/lpc_ich.h>
++#include <linux/platform_data/itco_wdt.h>
+ 
+ #define ACPIBASE		0x40
+ #define ACPIBASE_GPE_OFF	0x28
+@@ -811,9 +812,31 @@ static void lpc_ich_enable_pmc_space(struct pci_dev *dev)
+ 	priv->actrl_pbase_save = reg_save;
+ }
+ 
+-static void lpc_ich_finalize_cell(struct pci_dev *dev, struct mfd_cell *cell)
++static int lpc_ich_finalize_wdt_cell(struct pci_dev *dev)
+ {
++	struct itco_wdt_platform_data *pdata;
+ 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
++	struct lpc_ich_info *info;
++	struct mfd_cell *cell = &lpc_ich_cells[LPC_WDT];
++
++	pdata = devm_kzalloc(&dev->dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		return -ENOMEM;
++
++	info = &lpc_chipset_info[priv->chipset];
++
++	pdata->version = info->iTCO_version;
++	strlcpy(pdata->name, info->name, sizeof(pdata->name));
++
++	cell->platform_data = pdata;
++	cell->pdata_size = sizeof(*pdata);
++	return 0;
++}
++
++static void lpc_ich_finalize_gpio_cell(struct pci_dev *dev)
++{
++	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
++	struct mfd_cell *cell = &lpc_ich_cells[LPC_GPIO];
+ 
+ 	cell->platform_data = &lpc_chipset_info[priv->chipset];
+ 	cell->pdata_size = sizeof(struct lpc_ich_info);
+@@ -909,7 +932,7 @@ gpe0_done:
+ 	lpc_chipset_info[priv->chipset].use_gpio = ret;
+ 	lpc_ich_enable_gpio_space(dev);
+ 
+-	lpc_ich_finalize_cell(dev, &lpc_ich_cells[LPC_GPIO]);
++	lpc_ich_finalize_gpio_cell(dev);
+ 	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
+ 			      &lpc_ich_cells[LPC_GPIO], 1, NULL, 0, NULL);
+ 
+@@ -983,7 +1006,10 @@ static int lpc_ich_init_wdt(struct pci_dev *dev)
+ 		res->end = base_addr + ACPIBASE_PMC_END;
+ 	}
+ 
+-	lpc_ich_finalize_cell(dev, &lpc_ich_cells[LPC_WDT]);
++	ret = lpc_ich_finalize_wdt_cell(dev);
++	if (ret)
++		goto wdt_done;
++
+ 	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
+ 			      &lpc_ich_cells[LPC_WDT], 1, NULL, 0, NULL);
+ 
+* Unmerged path drivers/platform/x86/intel_pmc_ipc.c
+* Unmerged path drivers/watchdog/iTCO_wdt.c
+diff --git a/include/linux/mfd/lpc_ich.h b/include/linux/mfd/lpc_ich.h
+index 8feac782fa83..2b300b44f994 100644
+--- a/include/linux/mfd/lpc_ich.h
++++ b/include/linux/mfd/lpc_ich.h
+@@ -20,12 +20,6 @@
+ #ifndef LPC_ICH_H
+ #define LPC_ICH_H
+ 
+-/* Watchdog resources */
+-#define ICH_RES_IO_TCO		0
+-#define ICH_RES_IO_SMI		1
+-#define ICH_RES_MEM_OFF		2
+-#define ICH_RES_MEM_GCS_PMC	0
+-
+ /* GPIO resources */
+ #define ICH_RES_GPIO	0
+ #define ICH_RES_GPE0	1
+diff --git a/include/linux/platform_data/itco_wdt.h b/include/linux/platform_data/itco_wdt.h
+new file mode 100644
+index 000000000000..f16542c77ff7
+--- /dev/null
++++ b/include/linux/platform_data/itco_wdt.h
+@@ -0,0 +1,19 @@
++/*
++ * Platform data for the Intel TCO Watchdog
++ */
++
++#ifndef _ITCO_WDT_H_
++#define _ITCO_WDT_H_
++
++/* Watchdog resources */
++#define ICH_RES_IO_TCO		0
++#define ICH_RES_IO_SMI		1
++#define ICH_RES_MEM_OFF		2
++#define ICH_RES_MEM_GCS_PMC	0
++
++struct itco_wdt_platform_data {
++	char name[32];
++	unsigned int version;
++};
++
++#endif /* _ITCO_WDT_H_ */
