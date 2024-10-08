@@ -1,0 +1,222 @@
+ALSA: hda - Replace bus pm_notify with the standard runtime PM framework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] hda - Replace bus pm_notify with the standard runtime PM framework (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 95.65%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 55ed9cd1feee80764937913afe760161b86cfb11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/55ed9cd1.failed
+
+Now the final bit of runtime PM cleanup: instead of manual
+notification of the power up/down of the codec via hda_bus pm_notify
+ops, use the standard runtime PM feature.
+
+The child codec device will kick off the runtime PM of the parent
+(PCI) device upon suspend/resume automatically.  For managing whether
+the link can be really turned off, we use the bit flags
+bus->codec_powered instead of the earlier bus->power_keep_link_on.
+flag.  Each codec driver is responsible to set/clear the bit flag, and
+the controller device can be turned off only when all these bits are
+cleared.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 55ed9cd1feee80764937913afe760161b86cfb11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_controller.c
+#	sound/pci/hda/hda_intel.c
+diff --cc sound/pci/hda/hda_controller.c
+index a14aba1015db,789ca66c3094..000000000000
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@@ -1783,22 -1785,6 +1783,25 @@@ static void azx_bus_reset(struct hda_bu
+  	bus->in_reset = 0;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PM
+ +/* power-up/down the controller */
+ +static void azx_power_notify(struct hda_bus *bus, bool power_up)
+ +{
+ +	struct azx *chip = bus->private_data;
+ +
+ +	if (!(chip->driver_caps & AZX_DCAPS_PM_RUNTIME))
+ +		return;
+ +
+ +	if (power_up)
+ +		pm_runtime_get_sync(chip->card->dev);
+ +	else
+ +		pm_runtime_put_sync(chip->card->dev);
+ +}
+ +#endif
+ +
+++=======
+++>>>>>>> 55ed9cd1feee (ALSA: hda - Replace bus pm_notify with the standard runtime PM framework)
+  static int get_jackpoll_interval(struct azx *chip)
+  {
+  	int i;
+diff --cc sound/pci/hda/hda_intel.c
+index 0301732dd71a,738d332351d5..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -922,8 -918,8 +922,13 @@@ static int azx_runtime_idle(struct devi
+  	if (chip->disabled || hda->init_failed)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (!power_save_controller ||
+ +	    !(chip->driver_caps & AZX_DCAPS_PM_RUNTIME))
+++=======
++ 	if (!power_save_controller || !azx_has_pm_runtime(chip) ||
++ 	    chip->bus->codec_powered)
+++>>>>>>> 55ed9cd1feee (ALSA: hda - Replace bus pm_notify with the standard runtime PM framework)
+  		return -EBUSY;
+  
+  	return 0;
+diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
+index d0dbc62c9147..1798de2bcb13 100644
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -46,23 +46,9 @@
+ #define codec_in_pm(codec)	atomic_read(&(codec)->in_pm)
+ #define hda_codec_is_power_on(codec) \
+ 	(!pm_runtime_suspended(hda_codec_dev(codec)))
+-
+-static void hda_call_pm_notify(struct hda_codec *codec, bool power_up)
+-{
+-	struct hda_bus *bus = codec->bus;
+-
+-	if ((power_up && codec->pm_up_notified) ||
+-	    (!power_up && !codec->pm_up_notified))
+-		return;
+-	if (bus->ops.pm_notify)
+-		bus->ops.pm_notify(bus, power_up);
+-	codec->pm_up_notified = power_up;
+-}
+-
+ #else
+ #define codec_in_pm(codec)	0
+ #define hda_codec_is_power_on(codec)	1
+-#define hda_call_pm_notify(codec, state) {}
+ #endif
+ 
+ /**
+@@ -1152,7 +1138,7 @@ static void snd_hda_codec_free(struct hda_codec *codec)
+ 	snd_array_free(&codec->spdif_out);
+ 	remove_conn_list(codec);
+ 	codec->bus->caddr_tbl[codec->addr] = NULL;
+-	hda_call_pm_notify(codec, false); /* cancel leftover refcounts */
++	clear_bit(codec->addr, &codec->bus->codec_powered);
+ 	snd_hda_sysfs_clear(codec);
+ 	free_hda_cache(&codec->amp_cache);
+ 	free_hda_cache(&codec->cmd_cache);
+@@ -1279,10 +1265,10 @@ int snd_hda_codec_new(struct hda_bus *bus,
+ 	 * the caller has to power down appropriatley after initialization
+ 	 * phase.
+ 	 */
++	set_bit(codec->addr, &bus->codec_powered);
+ 	pm_runtime_set_active(hda_codec_dev(codec));
+ 	pm_runtime_get_noresume(hda_codec_dev(codec));
+ 	codec->power_jiffies = jiffies;
+-	hda_call_pm_notify(codec, true);
+ #endif
+ 
+ 	snd_hda_sysfs_init(codec);
+@@ -1342,11 +1328,6 @@ int snd_hda_codec_new(struct hda_bus *bus,
+ #endif
+ 	codec->epss = snd_hda_codec_get_supported_ps(codec, fg,
+ 					AC_PWRST_EPSS);
+-#ifdef CONFIG_PM
+-	if (!codec->d3_stop_clk || !codec->epss)
+-		bus->power_keep_link_on = 1;
+-#endif
+-
+ 
+ 	/* power-up all before initialization */
+ 	hda_set_power_state(codec, AC_PWRST_D0);
+@@ -3956,7 +3937,6 @@ static void hda_call_codec_resume(struct hda_codec *codec)
+ 	hda_mark_cmd_cache_dirty(codec);
+ 
+ 	codec->power_jiffies = jiffies;
+-	hda_call_pm_notify(codec, true);
+ 
+ 	hda_set_power_state(codec, AC_PWRST_D0);
+ 	restore_shutup_pins(codec);
+@@ -3988,14 +3968,17 @@ static int hda_codec_runtime_suspend(struct device *dev)
+ 	for (i = 0; i < codec->num_pcms; i++)
+ 		snd_pcm_suspend_all(codec->pcm_info[i].pcm);
+ 	state = hda_call_codec_suspend(codec);
+-	if (!codec->bus->power_keep_link_on && (state & AC_PWRST_CLK_STOP_OK))
+-		hda_call_pm_notify(codec, false);
++	if (codec->d3_stop_clk && codec->epss && (state & AC_PWRST_CLK_STOP_OK))
++		clear_bit(codec->addr, &codec->bus->codec_powered);
+ 	return 0;
+ }
+ 
+ static int hda_codec_runtime_resume(struct device *dev)
+ {
+-	hda_call_codec_resume(dev_to_hda_codec(dev));
++	struct hda_codec *codec = dev_to_hda_codec(dev);
++
++	set_bit(codec->addr, &codec->bus->codec_powered);
++	hda_call_codec_resume(codec);
+ 	pm_runtime_mark_last_busy(dev);
+ 	return 0;
+ }
+diff --git a/sound/pci/hda/hda_codec.h b/sound/pci/hda/hda_codec.h
+index 593956fc384b..7425748f486d 100644
+--- a/sound/pci/hda/hda_codec.h
++++ b/sound/pci/hda/hda_codec.h
+@@ -83,10 +83,6 @@ struct hda_bus_ops {
+ 			  struct hda_pcm *pcm);
+ 	/* reset bus for retry verb */
+ 	void (*bus_reset)(struct hda_bus *bus);
+-#ifdef CONFIG_PM
+-	/* notify power-up/down from codec to controller */
+-	void (*pm_notify)(struct hda_bus *bus, bool power_up);
+-#endif
+ #ifdef CONFIG_SND_HDA_DSP_LOADER
+ 	/* prepare DSP transfer */
+ 	int (*load_dsp_prepare)(struct hda_bus *bus, unsigned int format,
+@@ -151,10 +147,10 @@ struct hda_bus {
+ 	unsigned int rirb_error:1;	/* error in codec communication */
+ 	unsigned int response_reset:1;	/* controller was reset */
+ 	unsigned int in_reset:1;	/* during reset operation */
+-	unsigned int power_keep_link_on:1; /* don't power off HDA link */
+ 	unsigned int no_response_fallback:1; /* don't fallback at RIRB error */
+ 
+ 	int primary_dig_out_type;	/* primary digital out PCM type */
++	unsigned long codec_powered;	/* bit flags of powered codecs */
+ };
+ 
+ /*
+@@ -373,7 +369,6 @@ struct hda_codec {
+ 	unsigned int dump_coef:1; /* dump processing coefs in codec proc file */
+ #ifdef CONFIG_PM
+ 	unsigned int d3_stop_clk:1;	/* support D3 operation without BCLK */
+-	unsigned int pm_up_notified:1;	/* PM notified to controller */
+ 	atomic_t in_pm;		/* suspend/resume being performed */
+ 	unsigned long power_on_acct;
+ 	unsigned long power_off_acct;
+* Unmerged path sound/pci/hda/hda_controller.c
+* Unmerged path sound/pci/hda/hda_intel.c
+diff --git a/sound/pci/hda/patch_sigmatel.c b/sound/pci/hda/patch_sigmatel.c
+index 6a2163056216..2956a6ba6bf0 100644
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -2132,8 +2132,10 @@ static void stac92hd83xxx_fixup_hp_mic_led(struct hda_codec *codec,
+ 
+ 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
+ 		spec->mic_mute_led_gpio = 0x08; /* GPIO3 */
++#ifdef CONFIG_PM
+ 		/* resetting controller clears GPIO, so we need to keep on */
+-		codec->bus->power_keep_link_on = 1;
++		codec->d3_stop_clk = 0;
++#endif
+ 	}
+ }
+ 
