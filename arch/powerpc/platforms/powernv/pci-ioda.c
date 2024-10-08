@@ -1493,6 +1493,7 @@ static int pnv_pci_ioda_dma_set_mask(struct pnv_phb *phb,
 		dev_info(&pdev->dev, "Using 32-bit DMA via iommu\n");
 		set_dma_ops(&pdev->dev, &dma_iommu_ops);
 	}
+	*pdev->dev.dma_mask = dma_mask;
 	return 0;
 }
 
