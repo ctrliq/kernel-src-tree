@@ -1671,7 +1671,7 @@ megasas_build_ldio_fusion(struct megasas_instance *instance,
 				   local_map_ptr, start_lba_lo);
 		io_request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
 		cmd->request_desc->SCSIIO.RequestFlags =
-			(MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY
+			(MPI2_REQ_DESCRIPT_FLAGS_FP_IO
 			 << MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
 		if ((instance->pdev->device == PCI_DEVICE_ID_LSI_INVADER) ||
 			(instance->pdev->device == PCI_DEVICE_ID_LSI_FURY)) {
@@ -1806,7 +1806,7 @@ static void megasas_build_ld_nonrw_fusion(struct megasas_instance *instance,
 
 		/* build request descriptor */
 		cmd->request_desc->SCSIIO.RequestFlags =
-			(MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY <<
+			(MPI2_REQ_DESCRIPT_FLAGS_FP_IO <<
 			MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
 		cmd->request_desc->SCSIIO.DevHandle = devHandle;
 
@@ -1913,7 +1913,7 @@ megasas_build_syspd_fusion(struct megasas_instance *instance,
 				cpu_to_le16(MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH);
 		}
 		cmd->request_desc->SCSIIO.RequestFlags =
-			(MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY <<
+			(MPI2_REQ_DESCRIPT_FLAGS_FP_IO <<
 				MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
 	}
 }
