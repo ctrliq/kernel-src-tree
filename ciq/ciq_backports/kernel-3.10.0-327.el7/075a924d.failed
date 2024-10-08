@@ -1,0 +1,164 @@
+xfs: use i_mmaplock on write faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 075a924d45cc69c75a35f20b4912b85aa98b180a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/075a924d.failed
+
+Take the i_mmaplock over write page faults. These come through the
+->page_mkwrite callout, so we need to wrap that calls with the
+i_mmaplock.
+
+This gives us a lock order of mmap_sem -> i_mmaplock -> page_lock
+-> i_lock.
+
+Also, move the page_mkwrite wrapper to the same region of xfs_file.c
+as the read fault wrappers and add a tracepoint.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 075a924d45cc69c75a35f20b4912b85aa98b180a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,d55f011401bf..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1006,23 -990,9 +1006,9 @@@ xfs_file_mmap
+  	return 0;
+  }
+  
+- /*
+-  * mmap()d file has taken write protection fault and is being made
+-  * writable. We can set the page state up correctly for a writable
+-  * page, which means we can do correct delalloc accounting (ENOSPC
+-  * checking!) and unwritten extent mapping.
+-  */
+- STATIC int
+- xfs_vm_page_mkwrite(
+- 	struct vm_area_struct	*vma,
+- 	struct vm_fault		*vmf)
+- {
+- 	return block_page_mkwrite(vma, vmf, xfs_get_blocks);
+- }
+- 
+  /*
+   * This type is designed to indicate the type of offset we would like
+ - * to search from page cache for xfs_seek_hole_data().
+ + * to search from page cache for either xfs_seek_data() or xfs_seek_hole().
+   */
+  enum {
+  	HOLE_OFF = 0,
+@@@ -1469,14 -1365,63 +1455,66 @@@ xfs_file_llseek
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Locking for serialisation of IO during page faults. This results in a lock
++  * ordering of:
++  *
++  * mmap_sem (MM)
++  *   i_mmap_lock (XFS - truncate serialisation)
++  *     page_lock (MM)
++  *       i_lock (XFS - extent map serialisation)
++  */
++ STATIC int
++ xfs_filemap_fault(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
++ 	int			error;
++ 
++ 	trace_xfs_filemap_fault(ip);
++ 
++ 	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
++ 	error = filemap_fault(vma, vmf);
++ 	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
++ 
++ 	return error;
++ }
++ 
++ /*
++  * mmap()d file has taken write protection fault and is being made writable. We
++  * can set the page state up correctly for a writable page, which means we can
++  * do correct delalloc accounting (ENOSPC checking!) and unwritten extent
++  * mapping.
++  */
++ STATIC int
++ xfs_filemap_page_mkwrite(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
++ 	int			error;
++ 
++ 	trace_xfs_filemap_page_mkwrite(ip);
++ 
++ 	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
++ 	error = block_page_mkwrite(vma, vmf, xfs_get_blocks);
++ 	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
++ 
++ 	return error;
++ }
++ 
+++>>>>>>> 075a924d45cc (xfs: use i_mmaplock on write faults)
+  const struct file_operations xfs_file_operations = {
+  	.llseek		= xfs_file_llseek,
+ -	.read		= new_sync_read,
+ -	.write		= new_sync_write,
+ -	.read_iter	= xfs_file_read_iter,
+ -	.write_iter	= xfs_file_write_iter,
+ +	.read		= do_sync_read,
+ +	.write		= do_sync_write,
+ +	.aio_read	= xfs_file_aio_read,
+ +	.aio_write	= xfs_file_aio_write,
+  	.splice_read	= xfs_file_splice_read,
+ -	.splice_write	= iter_file_splice_write,
+ +	.splice_write	= xfs_file_splice_write,
+  	.unlocked_ioctl	= xfs_file_ioctl,
+  #ifdef CONFIG_COMPAT
+  	.compat_ioctl	= xfs_file_compat_ioctl,
+@@@ -1501,7 -1446,7 +1539,13 @@@ const struct file_operations xfs_dir_fi
+  };
+  
+  static const struct vm_operations_struct xfs_file_vm_ops = {
+++<<<<<<< HEAD
+ +	.fault		= filemap_fault,
+ +	.page_mkwrite	= xfs_vm_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+++=======
++ 	.fault		= xfs_filemap_fault,
++ 	.map_pages	= filemap_map_pages,
++ 	.page_mkwrite	= xfs_filemap_page_mkwrite,
+++>>>>>>> 075a924d45cc (xfs: use i_mmaplock on write faults)
+  };
+diff --cc fs/xfs/xfs_trace.h
+index 27fdd8bb499c,b1e059b398c0..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -625,6 -685,9 +625,12 @@@ DEFINE_INODE_EVENT(xfs_inode_set_eofblo
+  DEFINE_INODE_EVENT(xfs_inode_clear_eofblocks_tag);
+  DEFINE_INODE_EVENT(xfs_inode_free_eofblocks_invalid);
+  
+++<<<<<<< HEAD
+++=======
++ DEFINE_INODE_EVENT(xfs_filemap_fault);
++ DEFINE_INODE_EVENT(xfs_filemap_page_mkwrite);
++ 
+++>>>>>>> 075a924d45cc (xfs: use i_mmaplock on write faults)
+  DECLARE_EVENT_CLASS(xfs_iref_class,
+  	TP_PROTO(struct xfs_inode *ip, unsigned long caller_ip),
+  	TP_ARGS(ip, caller_ip),
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_trace.h
