@@ -1,0 +1,248 @@
+KEYS: Fix keyring quota misaccounting on key replacement and unlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 034faeb9ef390d58239e1dce748143f6b35a0d9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/034faeb9.failed
+
+If a key is displaced from a keyring by a matching one, then four more bytes
+of quota are allocated to the keyring - despite the fact that the keyring does
+not change in size.
+
+Further, when a key is unlinked from a keyring, the four bytes of quota
+allocated the link isn't recovered and returned to the user's pool.
+
+The first can be tested by repeating:
+
+	keyctl add big_key a fred @s
+	cat /proc/key-users
+
+(Don't put it in a shell loop otherwise the garbage collector won't have time
+to clear the displaced keys, thus affecting the result).
+
+This was causing the kerberos keyring to run out of room fairly quickly.
+
+The second can be tested by:
+
+	cat /proc/key-users
+	a=`keyctl add user a a @s`
+	cat /proc/key-users
+	keyctl unlink $a
+	sleep 1 # Give RCU a chance to delete the key
+	cat /proc/key-users
+
+assuming no system activity that otherwise adds/removes keys, the amount of
+key data allocated should go up (say 40/20000 -> 47/20000) and then return to
+the original value at the end.
+
+	Reported-by: Stephen Gallagher <sgallagh@redhat.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+(cherry picked from commit 034faeb9ef390d58239e1dce748143f6b35a0d9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/keys/keyring.c
+diff --cc security/keys/keyring.c
+index eeef1a073db4,d80311e571c3..000000000000
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@@ -772,88 -1063,29 +772,111 @@@ int __key_link_begin(struct key *keyrin
+  	if (index_key->type == &key_type_keyring)
+  		down_write(&keyring_serialise_link_sem);
+  
+++<<<<<<< HEAD
+ +	klist = rcu_dereference_locked_keyring(keyring);
+ +
+ +	/* see if there's a matching key we can displace */
+ +	lru = -1;
+ +	if (klist && klist->nkeys > 0) {
+ +		lowest_lru = TIME_T_MAX;
+ +		for (loop = klist->nkeys - 1; loop >= 0; loop--) {
+ +			struct key *key = rcu_deref_link_locked(klist, loop,
+ +								keyring);
+ +			if (key->type == index_key->type &&
+ +			    strcmp(key->description, index_key->description) == 0) {
+ +				/* Found a match - we'll replace the link with
+ +				 * one to the new key.  We record the slot
+ +				 * position.
+ +				 */
+ +				klist->delkey = loop;
+ +				prealloc = 0;
+ +				goto done;
+ +			}
+ +			if (key->last_used_at < lowest_lru) {
+ +				lowest_lru = key->last_used_at;
+ +				lru = loop;
+ +			}
+ +		}
+ +	}
+ +
+ +	/* If the keyring is full then do an LRU discard */
+ +	if (klist &&
+ +	    klist->nkeys == klist->maxkeys &&
+ +	    klist->maxkeys >= MAX_KEYRING_LINKS) {
+ +		kdebug("LRU discard %d\n", lru);
+ +		klist->delkey = lru;
+ +		prealloc = 0;
+ +		goto done;
+ +	}
+ +
+ +	/* check that we aren't going to overrun the user's quota */
+ +	ret = key_payload_reserve(keyring,
+ +				  keyring->datalen + KEYQUOTA_LINK_BYTES);
+ +	if (ret < 0)
+ +		goto error_sem;
+ +
+ +	if (klist && klist->nkeys < klist->maxkeys) {
+ +		/* there's sufficient slack space to append directly */
+ +		klist->delkey = klist->nkeys;
+ +		prealloc = KEY_LINK_FIXQUOTA;
+ +	} else {
+ +		/* grow the key list */
+ +		max = 4;
+ +		if (klist) {
+ +			max += klist->maxkeys;
+ +			if (max > MAX_KEYRING_LINKS)
+ +				max = MAX_KEYRING_LINKS;
+ +			BUG_ON(max <= klist->maxkeys);
+ +		}
+ +
+ +		size = sizeof(*klist) + sizeof(struct key *) * max;
+ +
+ +		ret = -ENOMEM;
+ +		nklist = kmalloc(size, GFP_KERNEL);
+ +		if (!nklist)
+ +			goto error_quota;
+ +
+ +		nklist->maxkeys = max;
+ +		if (klist) {
+ +			memcpy(nklist->keys, klist->keys,
+ +			       sizeof(struct key *) * klist->nkeys);
+ +			nklist->delkey = klist->nkeys;
+ +			nklist->nkeys = klist->nkeys + 1;
+ +			klist->delkey = USHRT_MAX;
+ +		} else {
+ +			nklist->nkeys = 1;
+ +			nklist->delkey = 0;
+ +		}
+ +
+ +		/* add the key into the new space */
+ +		RCU_INIT_POINTER(nklist->keys[nklist->delkey], NULL);
+ +		prealloc = (unsigned long)nklist | KEY_LINK_FIXQUOTA;
+++=======
++ 	/* Create an edit script that will insert/replace the key in the
++ 	 * keyring tree.
++ 	 */
++ 	edit = assoc_array_insert(&keyring->keys,
++ 				  &keyring_assoc_array_ops,
++ 				  index_key,
++ 				  NULL);
++ 	if (IS_ERR(edit)) {
++ 		ret = PTR_ERR(edit);
++ 		goto error_sem;
++ 	}
++ 
++ 	/* If we're not replacing a link in-place then we're going to need some
++ 	 * extra quota.
++ 	 */
++ 	if (!edit->dead_leaf) {
++ 		ret = key_payload_reserve(keyring,
++ 					  keyring->datalen + KEYQUOTA_LINK_BYTES);
++ 		if (ret < 0)
++ 			goto error_cancel;
+++>>>>>>> 034faeb9ef39 (KEYS: Fix keyring quota misaccounting on key replacement and unlink)
+  	}
+  
+ -	*_edit = edit;
+ +done:
+ +	*_prealloc = prealloc;
+  	kleave(" = 0");
+  	return 0;
+  
+@@@ -967,12 -1148,10 +988,19 @@@ void __key_link_end(struct key *keyring
+  	if (index_key->type == &key_type_keyring)
+  		up_write(&keyring_serialise_link_sem);
+  
+++<<<<<<< HEAD
+ +	if (prealloc) {
+ +		if (prealloc & KEY_LINK_FIXQUOTA)
+ +			key_payload_reserve(keyring,
+ +					    keyring->datalen -
+ +					    KEYQUOTA_LINK_BYTES);
+ +		kfree((struct keyring_list *)(prealloc & ~KEY_LINK_FIXQUOTA));
+++=======
++ 	if (edit && !edit->dead_leaf) {
++ 		key_payload_reserve(keyring,
++ 				    keyring->datalen - KEYQUOTA_LINK_BYTES);
++ 		assoc_array_cancel_edit(edit);
+++>>>>>>> 034faeb9ef39 (KEYS: Fix keyring quota misaccounting on key replacement and unlink)
+  	}
+  	up_write(&keyring->sem);
+  }
+@@@ -1048,50 -1234,18 +1076,55 @@@ int key_unlink(struct key *keyring, str
+  
+  	down_write(&keyring->sem);
+  
+ -	edit = assoc_array_delete(&keyring->keys, &keyring_assoc_array_ops,
+ -				  &key->index_key);
+ -	if (IS_ERR(edit)) {
+ -		ret = PTR_ERR(edit);
+ -		goto error;
+ +	klist = rcu_dereference_locked_keyring(keyring);
+ +	if (klist) {
+ +		/* search the keyring for the key */
+ +		for (loop = 0; loop < klist->nkeys; loop++)
+ +			if (rcu_access_pointer(klist->keys[loop]) == key)
+ +				goto key_is_present;
+  	}
+ +
+++<<<<<<< HEAD
+ +	up_write(&keyring->sem);
+  	ret = -ENOENT;
+ -	if (edit == NULL)
+ -		goto error;
+ +	goto error;
+ +
+ +key_is_present:
+ +	/* we need to copy the key list for RCU purposes */
+ +	nklist = kmalloc(sizeof(*klist) +
+ +			 sizeof(struct key *) * klist->maxkeys,
+ +			 GFP_KERNEL);
+ +	if (!nklist)
+ +		goto nomem;
+ +	nklist->maxkeys = klist->maxkeys;
+ +	nklist->nkeys = klist->nkeys - 1;
+ +
+ +	if (loop > 0)
+ +		memcpy(&nklist->keys[0],
+ +		       &klist->keys[0],
+ +		       loop * sizeof(struct key *));
+ +
+ +	if (loop < nklist->nkeys)
+ +		memcpy(&nklist->keys[loop],
+ +		       &klist->keys[loop + 1],
+ +		       (nklist->nkeys - loop) * sizeof(struct key *));
+ +
+ +	/* adjust the user's quota */
+ +	key_payload_reserve(keyring,
+ +			    keyring->datalen - KEYQUOTA_LINK_BYTES);
+ +
+ +	rcu_assign_pointer(keyring->payload.subscriptions, nklist);
+  
+ +	up_write(&keyring->sem);
+ +
+ +	/* schedule for later cleanup */
+ +	klist->delkey = loop;
+ +	call_rcu(&klist->rcu, keyring_unlink_rcu_disposal);
+ +
+++=======
++ 	assoc_array_apply_edit(edit);
++ 	key_payload_reserve(keyring, keyring->datalen - KEYQUOTA_LINK_BYTES);
+++>>>>>>> 034faeb9ef39 (KEYS: Fix keyring quota misaccounting on key replacement and unlink)
+  	ret = 0;
+  
+  error:
+* Unmerged path security/keys/keyring.c
