@@ -1,0 +1,193 @@
+nvme: merge nvme_abort_req and nvme_timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 31c7c7d2c9f17dc98a98c59c17e184bf164ee760
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/31c7c7d2.failed
+
+We want to be able to return bettern error values frmo nvme_timeout, which
+is significantly easier if the two functions are merged.  Also clean up and
+reduce the printk spew so that we only get one message per abort.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 31c7c7d2c9f17dc98a98c59c17e184bf164ee760)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,99c5b6319d8d..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1039,55 -1078,7 +1039,59 @@@ static int adapter_delete_sq(struct nvm
+  	return adapter_delete_queue(dev, nvme_admin_delete_sq, sqid);
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +int nvme_identify(struct nvme_dev *dev, unsigned nsid, unsigned cns,
+ +							dma_addr_t dma_addr)
+ +{
+ +	struct nvme_command c;
+ +
+ +	memset(&c, 0, sizeof(c));
+ +	c.identify.opcode = nvme_admin_identify;
+ +	c.identify.nsid = cpu_to_le32(nsid);
+ +	c.identify.prp1 = cpu_to_le64(dma_addr);
+ +	c.identify.cns = cpu_to_le32(cns);
+ +
+ +	return nvme_submit_sync_cmd(dev->admin_q, &c);
+ +}
+ +
+ +int nvme_get_features(struct nvme_dev *dev, unsigned fid, unsigned nsid,
+ +					dma_addr_t dma_addr, u32 *result)
+ +{
+ +	struct nvme_command c;
+ +
+ +	memset(&c, 0, sizeof(c));
+ +	c.features.opcode = nvme_admin_get_features;
+ +	c.features.nsid = cpu_to_le32(nsid);
+ +	c.features.prp1 = cpu_to_le64(dma_addr);
+ +	c.features.fid = cpu_to_le32(fid);
+ +
+ +	return __nvme_submit_sync_cmd(dev->admin_q, &c, result, 0);
+ +}
+ +
+ +int nvme_set_features(struct nvme_dev *dev, unsigned fid, unsigned dword11,
+ +					dma_addr_t dma_addr, u32 *result)
+ +{
+ +	struct nvme_command c;
+ +
+ +	memset(&c, 0, sizeof(c));
+ +	c.features.opcode = nvme_admin_set_features;
+ +	c.features.prp1 = cpu_to_le64(dma_addr);
+ +	c.features.fid = cpu_to_le32(fid);
+ +	c.features.dword11 = cpu_to_le32(dword11);
+ +
+ +	return __nvme_submit_sync_cmd(dev->admin_q, &c, result, 0);
+ +}
+ +
+ +/**
+ + * nvme_abort_req - Attempt aborting a request
+ + *
+ + * Schedule controller reset if the command was already aborted once before and
+ + * still hasn't been returned to the driver, or if this is the admin queue.
+ + */
+ +static void nvme_abort_req(struct request *req)
+++=======
++ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+++>>>>>>> 31c7c7d2c9f1 (nvme: merge nvme_abort_req and nvme_timeout):drivers/nvme/host/pci.c
+  {
+  	struct nvme_cmd_info *cmd_rq = blk_mq_rq_to_pdu(req);
+  	struct nvme_queue *nvmeq = cmd_rq->nvmeq;
+@@@ -1096,30 -1087,29 +1100,50 @@@
+  	struct nvme_cmd_info *abort_cmd;
+  	struct nvme_command cmd;
+  
++ 	/*
++ 	 * Schedule controller reset if the command was already aborted once
++ 	 * before and still hasn't been returned to the driver, or if this is
++ 	 * the admin queue.
++ 	 */
+  	if (!nvmeq->qid || cmd_rq->aborted) {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(&dev_list_lock, flags);
+ +		if (work_busy(&dev->reset_work))
+ +			goto out;
+ +		list_del_init(&dev->node);
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"I/O %d QID %d timeout, reset controller\n",
+ +							req->tag, nvmeq->qid);
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ + out:
+ +		spin_unlock_irqrestore(&dev_list_lock, flags);
+ +		return;
+ +	}
+ +
+ +	if (!dev->abort_limit)
+ +		return;
+++=======
++ 		spin_lock_irq(&dev_list_lock);
++ 		if (!__nvme_reset(dev)) {
++ 			dev_warn(dev->dev,
++ 				 "I/O %d QID %d timeout, reset controller\n",
++ 				 req->tag, nvmeq->qid);
++ 		}
++ 		spin_unlock_irq(&dev_list_lock);
++ 		return BLK_EH_RESET_TIMER;
++ 	}
++ 
++ 	if (!dev->ctrl.abort_limit)
++ 		return BLK_EH_RESET_TIMER;
+++>>>>>>> 31c7c7d2c9f1 (nvme: merge nvme_abort_req and nvme_timeout):drivers/nvme/host/pci.c
+  
+ -	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE,
+ -			BLK_MQ_REQ_NOWAIT);
+ +	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+  	if (IS_ERR(abort_req))
+- 		return;
++ 		return BLK_EH_RESET_TIMER;
+  
+  	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+  	nvme_set_info(abort_cmd, abort_req, abort_completion);
+@@@ -1130,12 -1120,19 +1154,19 @@@
+  	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+  	cmd.abort.command_id = abort_req->tag;
+  
+ -	--dev->ctrl.abort_limit;
+ +	--dev->abort_limit;
+  	cmd_rq->aborted = 1;
+  
+- 	dev_warn(nvmeq->q_dmadev, "Aborting I/O %d QID %d\n", req->tag,
+- 							nvmeq->qid);
++ 	dev_warn(nvmeq->q_dmadev, "I/O %d QID %d timeout, aborting\n",
++ 				 req->tag, nvmeq->qid);
+  	nvme_submit_cmd(dev->queues[0], &cmd);
++ 
++ 	/*
++ 	 * The aborted req will be completed on receiving the abort req.
++ 	 * We enable the timer again. If hit twice, it'll cause a device reset,
++ 	 * as the device then is in a faulty state.
++ 	 */
++ 	return BLK_EH_RESET_TIMER;
+  }
+  
+  static void nvme_cancel_queue_ios(struct request *req, void *data, bool reserved)
+@@@ -1166,25 -1163,6 +1197,28 @@@
+  	fn(nvmeq, ctx, &cqe);
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ +{
+ +	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
+ +	struct nvme_queue *nvmeq = cmd->nvmeq;
+ +
+ +	dev_warn(nvmeq->q_dmadev, "Timeout I/O %d QID %d\n", req->tag,
+ +							nvmeq->qid);
+ +	spin_lock_irq(&nvmeq->q_lock);
+ +	nvme_abort_req(req);
+ +	spin_unlock_irq(&nvmeq->q_lock);
+ +
+ +	/*
+ +	 * The aborted req will be completed on receiving the abort req.
+ +	 * We enable the timer again. If hit twice, it'll cause a device reset,
+ +	 * as the device then is in a faulty state.
+ +	 */
+ +	return BLK_EH_RESET_TIMER;
+ +}
+ +
+++=======
+++>>>>>>> 31c7c7d2c9f1 (nvme: merge nvme_abort_req and nvme_timeout):drivers/nvme/host/pci.c
+  static void nvme_free_queue(struct nvme_queue *nvmeq)
+  {
+  	dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
+* Unmerged path drivers/block/nvme-core.c
