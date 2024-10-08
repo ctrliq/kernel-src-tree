@@ -731,7 +731,7 @@ static void ixgbevf_diag_test(struct net_device *netdev,
 
 		if (if_running)
 			/* indicate we're in test mode */
-			dev_close(netdev);
+			ixgbevf_close(netdev);
 		else
 			ixgbevf_reset(adapter);
 
@@ -743,7 +743,7 @@ static void ixgbevf_diag_test(struct net_device *netdev,
 
 		clear_bit(__IXGBEVF_TESTING, &adapter->state);
 		if (if_running)
-			dev_open(netdev);
+			ixgbevf_open(netdev);
 	} else {
 		hw_dbg(&adapter->hw, "online testing starting\n");
 		/* Online tests */
