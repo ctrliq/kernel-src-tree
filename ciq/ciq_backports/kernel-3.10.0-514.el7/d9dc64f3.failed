@@ -1,0 +1,200 @@
+x86/asm: Add support for the CLWB instruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] asm: Add support for the CLWB instruction (Steve Best) [1253832]
+Rebuild_FUZZ: 95.35%
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit d9dc64f30abe42f71bc7e9eb9d38c41006cf39f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d9dc64f3.failed
+
+Add support for the new CLWB (cache line write back)
+instruction.  This instruction was announced in the document
+"Intel Architecture Instruction Set Extensions Programming
+Reference" with reference number 319433-022.
+
+  https://software.intel.com/sites/default/files/managed/0d/53/319433-022.pdf
+
+The CLWB instruction is used to write back the contents of
+dirtied cache lines to memory without evicting the cache lines
+from the processor's cache hierarchy.  This should be used in
+favor of clflushopt or clflush in cases where you require the
+cache line to be written to memory but plan to access the data
+again in the near future.
+
+One of the main use cases for this is with persistent memory
+where CLWB can be used with PCOMMIT to ensure that data has been
+accepted to memory and is durable on the DIMM.
+
+This function shows how to properly use CLWB/CLFLUSHOPT/CLFLUSH
+and PCOMMIT with appropriate fencing:
+
+void flush_and_commit_buffer(void *vaddr, unsigned int size)
+{
+	void *vend = vaddr + size - 1;
+
+	for (; vaddr < vend; vaddr += boot_cpu_data.x86_clflush_size)
+		clwb(vaddr);
+
+	/* Flush any possible final partial cacheline */
+	clwb(vend);
+
+	/*
+	 * Use SFENCE to order CLWB/CLFLUSHOPT/CLFLUSH cache flushes.
+	 * (MFENCE via mb() also works)
+	 */
+	wmb();
+
+	/* PCOMMIT and the required SFENCE for ordering */
+	pcommit_sfence();
+}
+
+After this function completes the data pointed to by vaddr is
+has been accepted to memory and will be durable if the vaddr
+points to persistent memory.
+
+Regarding the details of how the alternatives assembly is set
+up, we need one additional byte at the beginning of the CLFLUSH
+so that we can flip it into a CLFLUSHOPT by changing that byte
+into a 0x66 prefix.  Two options are to either insert a 1 byte
+ASM_NOP1, or to add a 1 byte NOP_DS_PREFIX.  Both have no
+functional effect with the plain CLFLUSH, but I've been told
+that executing a CLFLUSH + prefix should be faster than
+executing a CLFLUSH + NOP.
+
+We had to hard code the assembly for CLWB because, lacking the
+ability to assemble the CLWB instruction itself, the next
+closest thing is to have an xsaveopt instruction with a 0x66
+prefix.  Unfortunately XSAVEOPT itself is also relatively new,
+and isn't included by all the GCC versions that the kernel needs
+to support.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Acked-by: H. Peter Anvin <hpa@linux.intel.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1422377631-8986-3-git-send-email-ross.zwisler@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d9dc64f30abe42f71bc7e9eb9d38c41006cf39f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeature.h
+#	arch/x86/include/asm/special_insns.h
+diff --cc arch/x86/include/asm/cpufeature.h
+index 91de7e25553c,854c04b3c9c2..000000000000
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@@ -210,38 -216,33 +210,62 @@@
+  
+  
+  /* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx), word 9 */
+++<<<<<<< HEAD
+ +#define X86_FEATURE_FSGSBASE	(9*32+ 0) /* {RD/WR}{FS/GS}BASE instructions*/
+ +#define X86_FEATURE_TSC_ADJUST	(9*32+ 1) /* TSC adjustment MSR 0x3b */
+ +#define X86_FEATURE_BMI1	(9*32+ 3) /* 1st group bit manipulation extensions */
+ +#define X86_FEATURE_HLE		(9*32+ 4) /* Hardware Lock Elision */
+ +#define X86_FEATURE_AVX2	(9*32+ 5) /* AVX2 instructions */
+ +#define X86_FEATURE_SMEP	(9*32+ 7) /* Supervisor Mode Execution Protection */
+ +#define X86_FEATURE_BMI2	(9*32+ 8) /* 2nd group bit manipulation extensions */
+ +#define X86_FEATURE_ERMS	(9*32+ 9) /* Enhanced REP MOVSB/STOSB */
+ +#define X86_FEATURE_INVPCID	(9*32+10) /* Invalidate Processor Context ID */
+ +#define X86_FEATURE_RTM		(9*32+11) /* Restricted Transactional Memory */
+ +#define X86_FEATURE_CQM		(9*32+12) /* Cache QoS Monitoring */
+ +#define X86_FEATURE_MPX		(9*32+14) /* Memory Protection Extension */
+ +#define X86_FEATURE_AVX512F	(9*32+16) /* AVX-512 Foundation */
+ +#define X86_FEATURE_RDSEED	(9*32+18) /* The RDSEED instruction */
+ +#define X86_FEATURE_ADX		(9*32+19) /* The ADCX and ADOX instructions */
+ +#define X86_FEATURE_SMAP	(9*32+20) /* Supervisor Mode Access Prevention */
+ +#define X86_FEATURE_CLFLUSHOPT	(9*32+23) /* CLFLUSHOPT instruction */
+ +#define X86_FEATURE_AVX512PF	(9*32+26) /* AVX-512 Prefetch */
+ +#define X86_FEATURE_AVX512ER	(9*32+27) /* AVX-512 Exponential and Reciprocal */
+ +#define X86_FEATURE_AVX512CD	(9*32+28) /* AVX-512 Conflict Detection */
+++=======
++ #define X86_FEATURE_FSGSBASE	( 9*32+ 0) /* {RD/WR}{FS/GS}BASE instructions*/
++ #define X86_FEATURE_TSC_ADJUST	( 9*32+ 1) /* TSC adjustment MSR 0x3b */
++ #define X86_FEATURE_BMI1	( 9*32+ 3) /* 1st group bit manipulation extensions */
++ #define X86_FEATURE_HLE		( 9*32+ 4) /* Hardware Lock Elision */
++ #define X86_FEATURE_AVX2	( 9*32+ 5) /* AVX2 instructions */
++ #define X86_FEATURE_SMEP	( 9*32+ 7) /* Supervisor Mode Execution Protection */
++ #define X86_FEATURE_BMI2	( 9*32+ 8) /* 2nd group bit manipulation extensions */
++ #define X86_FEATURE_ERMS	( 9*32+ 9) /* Enhanced REP MOVSB/STOSB */
++ #define X86_FEATURE_INVPCID	( 9*32+10) /* Invalidate Processor Context ID */
++ #define X86_FEATURE_RTM		( 9*32+11) /* Restricted Transactional Memory */
++ #define X86_FEATURE_MPX		( 9*32+14) /* Memory Protection Extension */
++ #define X86_FEATURE_AVX512F	( 9*32+16) /* AVX-512 Foundation */
++ #define X86_FEATURE_RDSEED	( 9*32+18) /* The RDSEED instruction */
++ #define X86_FEATURE_ADX		( 9*32+19) /* The ADCX and ADOX instructions */
++ #define X86_FEATURE_SMAP	( 9*32+20) /* Supervisor Mode Access Prevention */
++ #define X86_FEATURE_PCOMMIT	( 9*32+22) /* PCOMMIT instruction */
++ #define X86_FEATURE_CLFLUSHOPT	( 9*32+23) /* CLFLUSHOPT instruction */
++ #define X86_FEATURE_CLWB	( 9*32+24) /* CLWB instruction */
++ #define X86_FEATURE_AVX512PF	( 9*32+26) /* AVX-512 Prefetch */
++ #define X86_FEATURE_AVX512ER	( 9*32+27) /* AVX-512 Exponential and Reciprocal */
++ #define X86_FEATURE_AVX512CD	( 9*32+28) /* AVX-512 Conflict Detection */
+++>>>>>>> d9dc64f30abe (x86/asm: Add support for the CLWB instruction)
+  
+  /* Extended state features, CPUID level 0x0000000d:1 (eax), word 10 */
+ -#define X86_FEATURE_XSAVEOPT	(10*32+ 0) /* XSAVEOPT */
+ -#define X86_FEATURE_XSAVEC	(10*32+ 1) /* XSAVEC */
+ -#define X86_FEATURE_XGETBV1	(10*32+ 2) /* XGETBV with ECX = 1 */
+ -#define X86_FEATURE_XSAVES	(10*32+ 3) /* XSAVES/XRSTORS */
+ +#define X86_FEATURE_XSAVEOPT   (10*32+ 0) /* XSAVEOPT */
+ +#define X86_FEATURE_XSAVEC     (10*32+ 1) /* XSAVEC */
+ +#define X86_FEATURE_XGETBV1    (10*32+ 2) /* XGETBV with ECX = 1 */
+ +#define X86_FEATURE_XSAVES     (10*32+ 3) /* XSAVES/XRSTORS */
+ +
+ +/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:0 (edx), word 11 */
+ +#define X86_FEATURE_CQM_LLC	(11*32+ 1) /* LLC QoS if 1 */
+ +
+ +/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:1 (edx), word 12 */
+ +#define X86_FEATURE_CQM_OCCUP_LLC (12*32+ 0) /* LLC occupancy monitoring if 1 */
+  
+  /*
+   * BUG word(s)
+diff --cc arch/x86/include/asm/special_insns.h
+index fc7d11200445,aeb4666e0c0a..000000000000
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@@ -199,6 -201,28 +199,31 @@@ static inline void clflushopt(volatile 
+  		       "+m" (*(volatile char __force *)__p));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void clwb(volatile void *__p)
++ {
++ 	volatile struct { char x[64]; } *p = __p;
++ 
++ 	asm volatile(ALTERNATIVE_2(
++ 		".byte " __stringify(NOP_DS_PREFIX) "; clflush (%[pax])",
++ 		".byte 0x66; clflush (%[pax])", /* clflushopt (%%rax) */
++ 		X86_FEATURE_CLFLUSHOPT,
++ 		".byte 0x66, 0x0f, 0xae, 0x30",  /* clwb (%%rax) */
++ 		X86_FEATURE_CLWB)
++ 		: [p] "+m" (*p)
++ 		: [pax] "a" (p));
++ }
++ 
++ static inline void pcommit_sfence(void)
++ {
++ 	alternative(ASM_NOP7,
++ 		    ".byte 0x66, 0x0f, 0xae, 0xf8\n\t" /* pcommit */
++ 		    "sfence",
++ 		    X86_FEATURE_PCOMMIT);
++ }
++ 
+++>>>>>>> d9dc64f30abe (x86/asm: Add support for the CLWB instruction)
+  #define nop() asm volatile ("nop")
+  
+  
+* Unmerged path arch/x86/include/asm/cpufeature.h
+* Unmerged path arch/x86/include/asm/special_insns.h
