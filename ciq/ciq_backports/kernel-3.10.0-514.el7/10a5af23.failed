@@ -1,0 +1,347 @@
+vxlan: simplify metadata_dst usage in vxlan_rcv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 10a5af238cd29b7e43af0dc0690ae9baa0650c36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/10a5af23.failed
+
+Now when the packet is scrubbed early, the metadata_dst can be assigned to
+the skb as soon as it is allocated. This simplifies the error cleanup path,
+as the dst will be freed by kfree_skb. It is also not necessary to pass it
+as a parameter to functions anymore.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10a5af238cd29b7e43af0dc0690ae9baa0650c36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,775ddb48388d..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1133,34 -1144,120 +1133,125 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  {
+  	size_t start, offset, plen;
+  
+ -	if (!(unparsed->vx_flags & VXLAN_HF_RCO) || skb->remcsum_offload)
+ -		goto out;
+ +	if (skb->remcsum_offload)
+ +		return vh;
+  
+ -	start = vxlan_rco_start(unparsed->vx_vni);
+ -	offset = start + vxlan_rco_offset(unparsed->vx_vni);
+ +	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
+ +	offset = start + ((data & VXLAN_RCO_UDP) ?
+ +			  offsetof(struct udphdr, check) :
+ +			  offsetof(struct tcphdr, check));
+  
+ -	plen = sizeof(struct vxlanhdr) + offset + sizeof(u16);
+ +	plen = hdrlen + offset + sizeof(u16);
+  
+  	if (!pskb_may_pull(skb, plen))
+ -		return false;
+ +		return NULL;
+  
+ -	skb_remcsum_process(skb, (void *)(vxlan_hdr(skb) + 1), start, offset,
+ -			    !!(vxflags & VXLAN_F_REMCSUM_NOPARTIAL));
+ -out:
+ -	unparsed->vx_flags &= ~VXLAN_HF_RCO;
+ -	unparsed->vx_vni &= VXLAN_VNI_MASK;
+ -	return true;
+ -}
+ +	vh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+  
+++<<<<<<< HEAD
+ +	skb_remcsum_process(skb, (void *)vh + hdrlen, start, offset,
+ +			    nopartial);
+ +
+ +	return vh;
+++=======
++ static void vxlan_parse_gbp_hdr(struct vxlanhdr *unparsed,
++ 				struct sk_buff *skb, u32 vxflags,
++ 				struct vxlan_metadata *md)
++ {
++ 	struct vxlanhdr_gbp *gbp = (struct vxlanhdr_gbp *)unparsed;
++ 	struct metadata_dst *tun_dst;
++ 
++ 	if (!(unparsed->vx_flags & VXLAN_HF_GBP))
++ 		goto out;
++ 
++ 	md->gbp = ntohs(gbp->policy_id);
++ 
++ 	tun_dst = (struct metadata_dst *)skb_dst(skb);
++ 	if (tun_dst)
++ 		tun_dst->u.tun_info.key.tun_flags |= TUNNEL_VXLAN_OPT;
++ 
++ 	if (gbp->dont_learn)
++ 		md->gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 	if (gbp->policy_applied)
++ 		md->gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 	/* In flow-based mode, GBP is carried in dst_metadata */
++ 	if (!(vxflags & VXLAN_F_COLLECT_METADATA))
++ 		skb->mark = md->gbp;
++ out:
++ 	unparsed->vx_flags &= ~VXLAN_GBP_USED_BITS;
++ }
++ 
++ static bool vxlan_set_mac(struct vxlan_dev *vxlan,
++ 			  struct vxlan_sock *vs,
++ 			  struct sk_buff *skb)
++ {
++ 	union vxlan_addr saddr;
++ 
++ 	skb_reset_mac_header(skb);
++ 	skb->protocol = eth_type_trans(skb, vxlan->dev);
++ 	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
++ 
++ 	/* Ignore packet loops (and multicast echo) */
++ 	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
++ 		return false;
++ 
++ 	/* Get address from the outer IP header */
++ 	if (vxlan_get_sk_family(vs) == AF_INET) {
++ 		saddr.sin.sin_addr.s_addr = ip_hdr(skb)->saddr;
++ 		saddr.sa.sa_family = AF_INET;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		saddr.sin6.sin6_addr = ipv6_hdr(skb)->saddr;
++ 		saddr.sa.sa_family = AF_INET6;
++ #endif
++ 	}
++ 
++ 	if ((vxlan->flags & VXLAN_F_LEARN) &&
++ 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool vxlan_ecn_decapsulate(struct vxlan_sock *vs, void *oiph,
++ 				  struct sk_buff *skb)
++ {
++ 	int err = 0;
++ 
++ 	if (vxlan_get_sk_family(vs) == AF_INET)
++ 		err = IP_ECN_decapsulate(oiph, skb);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else
++ 		err = IP6_ECN_decapsulate(oiph, skb);
++ #endif
++ 
++ 	if (unlikely(err) && log_ecn_error) {
++ 		if (vxlan_get_sk_family(vs) == AF_INET)
++ 			net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
++ 					     &((struct iphdr *)oiph)->saddr,
++ 					     ((struct iphdr *)oiph)->tos);
++ 		else
++ 			net_info_ratelimited("non-ECT from %pI6\n",
++ 					     &((struct ipv6hdr *)oiph)->saddr);
++ 	}
++ 	return err <= 1;
+++>>>>>>> 10a5af238cd2 (vxlan: simplify metadata_dst usage in vxlan_rcv)
+  }
+  
+  /* Callback from net/ipv4/udp.c to receive packets */
+ -static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+ +static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct pcpu_sw_netstats *stats;
++ 	struct vxlan_dev *vxlan;
+++>>>>>>> 10a5af238cd2 (vxlan: simplify metadata_dst usage in vxlan_rcv)
+  	struct vxlan_sock *vs;
+ -	struct vxlanhdr unparsed;
+ -	struct vxlan_metadata _md;
+ -	struct vxlan_metadata *md = &_md;
+ -	void *oiph;
+ +	struct vxlanhdr *vxh;
+ +	u32 flags, vni;
+ +	struct vxlan_metadata md = {0};
+  
+  	/* Need Vxlan and inner Ethernet header to be present */
+  	if (!pskb_may_pull(skb, VXLAN_HLEN))
+@@@ -1185,35 -1279,41 +1276,69 @@@
+  	if (!vs)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
+ +		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni,
+ +				    !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL));
+ +		if (!vxh)
+ +			goto drop;
+ +
+ +		flags &= ~VXLAN_HF_RCO;
+ +		vni &= VXLAN_VNI_MASK;
+++=======
++ 	vxlan = vxlan_vs_find_vni(vs, vxlan_vni(vxlan_hdr(skb)->vx_vni));
++ 	if (!vxlan)
++ 		goto drop;
++ 
++ 	if (iptunnel_pull_header(skb, VXLAN_HLEN, htons(ETH_P_TEB),
++ 				 !net_eq(vxlan->net, dev_net(vxlan->dev))))
++ 		goto drop;
++ 
++ 	if (vxlan_collect_metadata(vs)) {
++ 		__be32 vni = vxlan_vni(vxlan_hdr(skb)->vx_vni);
++ 		struct metadata_dst *tun_dst;
++ 
++ 		tun_dst = udp_tun_rx_dst(skb, vxlan_get_sk_family(vs), TUNNEL_KEY,
++ 					 vxlan_vni_to_tun_id(vni), sizeof(*md));
++ 
++ 		if (!tun_dst)
++ 			goto drop;
++ 
++ 		md = ip_tunnel_info_opts(&tun_dst->u.tun_info);
++ 
++ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
++ 	} else {
++ 		memset(md, 0, sizeof(*md));
+++>>>>>>> 10a5af238cd2 (vxlan: simplify metadata_dst usage in vxlan_rcv)
+  	}
+  
+  	/* For backwards compatibility, only allow reserved fields to be
+  	 * used by VXLAN extensions if explicitly requested.
+  	 */
+++<<<<<<< HEAD
+ +	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
+ +		struct vxlanhdr_gbp *gbp;
+++=======
++ 	if (vs->flags & VXLAN_F_REMCSUM_RX)
++ 		if (!vxlan_remcsum(&unparsed, skb, vs->flags))
++ 			goto drop;
++ 	if (vs->flags & VXLAN_F_GBP)
++ 		vxlan_parse_gbp_hdr(&unparsed, skb, vs->flags, md);
+++>>>>>>> 10a5af238cd2 (vxlan: simplify metadata_dst usage in vxlan_rcv)
+ +
+ +		gbp = (struct vxlanhdr_gbp *)vxh;
+ +		md.gbp = ntohs(gbp->policy_id);
+ +
+ +		if (gbp->dont_learn)
+ +			md.gbp |= VXLAN_GBP_DONT_LEARN;
+  
+ -	if (unparsed.vx_flags || unparsed.vx_vni) {
+ +		if (gbp->policy_applied)
+ +			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
+ +
+ +		flags &= ~VXLAN_GBP_USED_BITS;
+ +	}
+ +
+ +	if (flags || vni & ~VXLAN_VNI_MASK) {
+  		/* If there are any unprocessed flags remaining treat
+  		 * this as a malformed packet. This behavior diverges from
+  		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
+@@@ -1222,95 -1322,19 +1347,99 @@@
+  		 * is more robust and provides a little more security in
+  		 * adding extensions to VXLAN.
+  		 */
+ +
+ +		goto bad_flags;
+ +	}
+ +
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+ +	return 0;
+ +
+ +drop:
+ +	/* Consume bad packet */
+ +	kfree_skb(skb);
+ +	return 0;
+ +
+ +bad_flags:
+ +	netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
+ +		   ntohl(vxh->vx_flags), ntohl(vxh->vx_vni));
+ +
+ +error:
+ +	/* Return non vxlan pkt */
+ +	return 1;
+ +}
+ +
+ +static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ +		      struct vxlan_metadata *md)
+ +{
+ +	struct iphdr *oip = NULL;
+ +	struct ipv6hdr *oip6 = NULL;
+ +	struct vxlan_dev *vxlan;
+ +	struct pcpu_sw_netstats *stats;
+ +	union vxlan_addr saddr;
+ +	__u32 vni;
+ +	int err = 0;
+ +	union vxlan_addr *remote_ip;
+ +
+ +	vni = ntohl(md->vni) >> 8;
+ +	/* Is this VNI defined? */
+ +	vxlan = vxlan_vs_find_vni(vs, vni);
+ +	if (!vxlan)
+  		goto drop;
+ +
+++<<<<<<< HEAD
+ +	remote_ip = &vxlan->default_dst.remote_ip;
+ +	skb_reset_mac_header(skb);
+ +	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
+ +	skb->protocol = eth_type_trans(skb, vxlan->dev);
+ +	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ +
+ +	/* Ignore packet loops (and multicast echo) */
+ +	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
+ +		goto drop;
+ +
+ +	/* Re-examine inner Ethernet packet */
+ +	if (remote_ip->sa.sa_family == AF_INET) {
+ +		oip = ip_hdr(skb);
+ +		saddr.sin.sin_addr.s_addr = oip->saddr;
+ +		saddr.sa.sa_family = AF_INET;
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	} else {
+ +		oip6 = ipv6_hdr(skb);
+ +		saddr.sin6.sin6_addr = oip6->saddr;
+ +		saddr.sa.sa_family = AF_INET6;
+ +#endif
+  	}
+  
+ -	if (!vxlan_set_mac(vxlan, vs, skb))
+ +	if ((vxlan->flags & VXLAN_F_LEARN) &&
+ +	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
+  		goto drop;
+  
+++=======
++ 	oiph = skb_network_header(skb);
+++>>>>>>> 10a5af238cd2 (vxlan: simplify metadata_dst usage in vxlan_rcv)
+  	skb_reset_network_header(skb);
+ +	skb->mark = md->gbp;
+  
+ -	if (!vxlan_ecn_decapsulate(vs, oiph, skb)) {
+ -		++vxlan->dev->stats.rx_frame_errors;
+ -		++vxlan->dev->stats.rx_errors;
+ -		goto drop;
+ +	if (oip6)
+ +		err = IP6_ECN_decapsulate(oip6, skb);
+ +	if (oip)
+ +		err = IP_ECN_decapsulate(oip, skb);
+ +
+ +	if (unlikely(err)) {
+ +		if (log_ecn_error) {
+ +			if (oip6)
+ +				net_info_ratelimited("non-ECT from %pI6\n",
+ +						     &oip6->saddr);
+ +			if (oip)
+ +				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
+ +						     &oip->saddr, oip->tos);
+ +		}
+ +		if (err > 1) {
+ +			++vxlan->dev->stats.rx_frame_errors;
+ +			++vxlan->dev->stats.rx_errors;
+ +			goto drop;
+ +		}
+  	}
+  
+  	stats = this_cpu_ptr(vxlan->dev->tstats);
+* Unmerged path drivers/net/vxlan.c
