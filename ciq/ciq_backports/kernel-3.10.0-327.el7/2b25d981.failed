@@ -1,0 +1,191 @@
+NVMe: Fix double free irq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 2b25d981790b830f0e045881386866b970bf9066
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2b25d981.failed
+
+Sets the vector to an invalid value after it's freed so we don't free
+it twice.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 2b25d981790b830f0e045881386866b970bf9066)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,52d0f2d9fecd..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1341,15 -1131,16 +1341,24 @@@ static void nvme_free_queues(struct nvm
+   */
+  static int nvme_suspend_queue(struct nvme_queue *nvmeq)
+  {
+- 	int vector = nvmeq->dev->entry[nvmeq->cq_vector].vector;
++ 	int vector;
+  
+  	spin_lock_irq(&nvmeq->q_lock);
+++<<<<<<< HEAD
+ +	if (nvmeq->q_suspended) {
+ +		spin_unlock_irq(&nvmeq->q_lock);
+ +		return 1;
+ +	}
+ +	nvmeq->q_suspended = 1;
+++=======
++ 	if (nvmeq->cq_vector == -1) {
++ 		spin_unlock_irq(&nvmeq->q_lock);
++ 		return 1;
++ 	}
++ 	vector = nvmeq->dev->entry[nvmeq->cq_vector].vector;
+++>>>>>>> 2b25d981790b (NVMe: Fix double free irq)
+  	nvmeq->dev->online_queues--;
++ 	nvmeq->cq_vector = -1;
+  	spin_unlock_irq(&nvmeq->q_lock);
+  
+  	irq_set_affinity_hint(vector, NULL);
+@@@ -1385,11 -1179,10 +1394,11 @@@ static void nvme_disable_queue(struct n
+  }
+  
+  static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
+- 							int depth, int vector)
++ 							int depth)
+  {
+  	struct device *dmadev = &dev->pci_dev->dev;
+ -	struct nvme_queue *nvmeq = kzalloc(sizeof(*nvmeq), GFP_KERNEL);
+ +	unsigned extra = nvme_queue_extra(depth);
+ +	struct nvme_queue *nvmeq = kzalloc(sizeof(*nvmeq) + extra, GFP_KERNEL);
+  	if (!nvmeq)
+  		return NULL;
+  
+@@@ -1414,16 -1203,11 +1423,15 @@@
+  	spin_lock_init(&nvmeq->q_lock);
+  	nvmeq->cq_head = 0;
+  	nvmeq->cq_phase = 1;
+ +	init_waitqueue_head(&nvmeq->sq_full);
+ +	bio_list_init(&nvmeq->sq_cong);
+ +	INIT_LIST_HEAD(&nvmeq->iod_bio);
+  	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
+  	nvmeq->q_depth = depth;
+- 	nvmeq->cq_vector = vector;
+  	nvmeq->qid = qid;
+ +	nvmeq->q_suspended = 1;
+  	dev->queue_count++;
+ -	dev->queues[qid] = nvmeq;
+ +	rcu_assign_pointer(dev->queues[qid], nvmeq);
+  
+  	return nvmeq;
+  
+@@@ -1572,9 -1420,9 +1581,13 @@@ static int nvme_configure_admin_queue(s
+  	if (result < 0)
+  		return result;
+  
+ -	nvmeq = dev->queues[0];
+ +	nvmeq = raw_nvmeq(dev, 0);
+  	if (!nvmeq) {
+++<<<<<<< HEAD
+ +		nvmeq = nvme_alloc_queue(dev, 0, 64, 0);
+++=======
++ 		nvmeq = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
+++>>>>>>> 2b25d981790b (NVMe: Fix double free irq)
+  		if (!nvmeq)
+  			return -ENOMEM;
+  	}
+@@@ -1594,12 -1443,23 +1607,13 @@@
+  
+  	result = nvme_enable_ctrl(dev, cap);
+  	if (result)
+ -		goto free_nvmeq;
+ -
+ -	result = nvme_alloc_admin_tags(dev);
+ -	if (result)
+ -		goto free_nvmeq;
+ +		return result;
+  
++ 	nvmeq->cq_vector = 0;
+  	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
+  	if (result)
+ -		goto free_tags;
+ -
+ -	return result;
+ +		return result;
+  
+ - free_tags:
+ -	nvme_free_admin_tags(dev);
+ - free_nvmeq:
+ -	nvme_free_queues(dev, 0);
+  	return result;
+  }
+  
+@@@ -2140,58 -1946,16 +2154,63 @@@ static struct nvme_ns *nvme_alloc_ns(st
+  	return NULL;
+  }
+  
+ +static int nvme_find_closest_node(int node)
+ +{
+ +	int n, val, min_val = INT_MAX, best_node = node;
+ +
+ +	for_each_online_node(n) {
+ +		if (n == node)
+ +			continue;
+ +		val = node_distance(node, n);
+ +		if (val < min_val) {
+ +			min_val = val;
+ +			best_node = n;
+ +		}
+ +	}
+ +	return best_node;
+ +}
+ +
+ +static void nvme_set_queue_cpus(cpumask_t *qmask, struct nvme_queue *nvmeq,
+ +								int count)
+ +{
+ +	int cpu;
+ +	for_each_cpu(cpu, qmask) {
+ +		if (cpumask_weight(nvmeq->cpu_mask) >= count)
+ +			break;
+ +		if (!cpumask_test_and_set_cpu(cpu, nvmeq->cpu_mask))
+ +			*per_cpu_ptr(nvmeq->dev->io_queue, cpu) = nvmeq->qid;
+ +	}
+ +}
+ +
+ +static void nvme_add_cpus(cpumask_t *mask, const cpumask_t *unassigned_cpus,
+ +	const cpumask_t *new_mask, struct nvme_queue *nvmeq, int cpus_per_queue)
+ +{
+ +	int next_cpu;
+ +	for_each_cpu(next_cpu, new_mask) {
+ +		cpumask_or(mask, mask, get_cpu_mask(next_cpu));
+ +		cpumask_or(mask, mask, topology_thread_cpumask(next_cpu));
+ +		cpumask_and(mask, mask, unassigned_cpus);
+ +		nvme_set_queue_cpus(mask, nvmeq, cpus_per_queue);
+ +	}
+ +}
+ +
+  static void nvme_create_io_queues(struct nvme_dev *dev)
+  {
+ -	unsigned i;
+ +	unsigned i, max;
+  
+++<<<<<<< HEAD
+ +	max = min(dev->max_qid, num_online_cpus());
+ +	for (i = dev->queue_count; i <= max; i++)
+ +		if (!nvme_alloc_queue(dev, i, dev->q_depth, i - 1))
+++=======
++ 	for (i = dev->queue_count; i <= dev->max_qid; i++)
++ 		if (!nvme_alloc_queue(dev, i, dev->q_depth))
+++>>>>>>> 2b25d981790b (NVMe: Fix double free irq)
+  			break;
+  
+ -	for (i = dev->online_queues; i <= dev->queue_count - 1; i++)
+ -		if (nvme_create_queue(dev->queues[i], i))
+ +	max = min(dev->queue_count - 1, num_online_cpus());
+ +	for (i = dev->online_queues; i <= max; i++)
+ +		if (nvme_create_queue(raw_nvmeq(dev, i), i))
+  			break;
+  }
+  
+* Unmerged path drivers/block/nvme-core.c
