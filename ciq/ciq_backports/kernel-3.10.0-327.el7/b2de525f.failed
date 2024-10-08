@@ -1,0 +1,129 @@
+Return short read or 0 at end of a raw device, not EIO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author David Jeffery <djeffery@redhat.com>
+commit b2de525f095708b2adbadaec3f1e4017a23d1e09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b2de525f.failed
+
+Author: David Jeffery <djeffery@redhat.com>
+Changes to the basic direct I/O code have broken the raw driver when reading
+to the end of a raw device.  Instead of returning a short read for a read that
+extends partially beyond the device's end or 0 when at the end of the device,
+these reads now return EIO.
+
+The raw driver needs the same end of device handling as was added for normal
+block devices.  Using blkdev_read_iter, which has the needed size checks,
+prevents the EIO conditions at the end of the device.
+
+	Signed-off-by: David Jeffery <djeffery@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit b2de525f095708b2adbadaec3f1e4017a23d1e09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/raw.c
+#	fs/block_dev.c
+#	include/linux/fs.h
+diff --cc drivers/char/raw.c
+index f3223aac4df1,a24891b97547..000000000000
+--- a/drivers/char/raw.c
++++ b/drivers/char/raw.c
+@@@ -284,10 -284,10 +284,17 @@@ static long raw_ctl_compat_ioctl(struc
+  #endif
+  
+  static const struct file_operations raw_fops = {
+++<<<<<<< HEAD
+ +	.read		= do_sync_read,
+ +	.aio_read	= generic_file_aio_read,
+ +	.write		= do_sync_write,
+ +	.aio_write	= blkdev_aio_write,
+++=======
++ 	.read		= new_sync_read,
++ 	.read_iter	= blkdev_read_iter,
++ 	.write		= new_sync_write,
++ 	.write_iter	= blkdev_write_iter,
+++>>>>>>> b2de525f0957 (Return short read or 0 at end of a raw device, not EIO)
+  	.fsync		= blkdev_fsync,
+  	.open		= raw_open,
+  	.release	= raw_release,
+diff --cc fs/block_dev.c
+index 51fd4563b1a6,1d9c9f3754f8..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1545,10 -1583,9 +1545,14 @@@ ssize_t blkdev_aio_write(struct kiocb *
+  	blk_finish_plug(&plug);
+  	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(blkdev_write_iter);
+ +EXPORT_SYMBOL_GPL(blkdev_aio_write);
+  
+++<<<<<<< HEAD
+ +static ssize_t blkdev_aio_read(struct kiocb *iocb, const struct iovec *iov,
+ +			 unsigned long nr_segs, loff_t pos)
+++=======
++ ssize_t blkdev_read_iter(struct kiocb *iocb, struct iov_iter *to)
+++>>>>>>> b2de525f0957 (Return short read or 0 at end of a raw device, not EIO)
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct inode *bd_inode = file->f_mapping->host;
+@@@ -1558,10 -1596,10 +1562,11 @@@
+  		return 0;
+  
+  	size -= pos;
+ -	iov_iter_truncate(to, size);
+ -	return generic_file_read_iter(iocb, to);
+ +	if (size < iocb->ki_left)
+ +		nr_segs = iov_shorten((struct iovec *)iov, nr_segs, size);
+ +	return generic_file_aio_read(iocb, iov, nr_segs, pos);
+  }
++ EXPORT_SYMBOL_GPL(blkdev_read_iter);
+  
+  /*
+   * Try to release a page associated with block device when the system
+diff --cc include/linux/fs.h
+index 664b4d164818,9ab779e8a63c..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2564,24 -2457,20 +2564,29 @@@ extern int generic_file_mmap(struct fil
+  extern int generic_file_readonly_mmap(struct file *, struct vm_area_struct *);
+  extern int generic_file_remap_pages(struct vm_area_struct *, unsigned long addr,
+  		unsigned long size, pgoff_t pgoff);
+ +extern int file_read_actor(read_descriptor_t * desc, struct page *page, unsigned long offset, unsigned long size);
+  int generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk);
+ -extern ssize_t generic_file_read_iter(struct kiocb *, struct iov_iter *);
+ -extern ssize_t __generic_file_write_iter(struct kiocb *, struct iov_iter *);
+ -extern ssize_t generic_file_write_iter(struct kiocb *, struct iov_iter *);
+ -extern ssize_t generic_file_direct_write(struct kiocb *, struct iov_iter *, loff_t);
+ -extern ssize_t generic_perform_write(struct file *, struct iov_iter *, loff_t);
+ +extern ssize_t generic_file_aio_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ +extern ssize_t __generic_file_aio_write(struct kiocb *, const struct iovec *, unsigned long,
+ +		loff_t *);
+ +extern ssize_t generic_file_aio_write(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ +extern ssize_t generic_file_direct_write(struct kiocb *, const struct iovec *,
+ +		unsigned long *, loff_t, loff_t *, size_t, size_t);
+ +extern ssize_t generic_file_buffered_write(struct kiocb *, const struct iovec *,
+ +		unsigned long, loff_t, loff_t *, size_t, ssize_t);
+  extern ssize_t do_sync_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos);
+  extern ssize_t do_sync_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos);
+ -extern ssize_t new_sync_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos);
+ -extern ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos);
+ +extern int generic_segment_checks(const struct iovec *iov,
+ +		unsigned long *nr_segs, size_t *count, int access_flags);
+  
+  /* fs/block_dev.c */
+++<<<<<<< HEAD
+ +extern ssize_t blkdev_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ +				unsigned long nr_segs, loff_t pos);
+++=======
++ extern ssize_t blkdev_read_iter(struct kiocb *iocb, struct iov_iter *to);
++ extern ssize_t blkdev_write_iter(struct kiocb *iocb, struct iov_iter *from);
+++>>>>>>> b2de525f0957 (Return short read or 0 at end of a raw device, not EIO)
+  extern int blkdev_fsync(struct file *filp, loff_t start, loff_t end,
+  			int datasync);
+  extern void block_sync_page(struct page *page);
+* Unmerged path drivers/char/raw.c
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/fs.h
