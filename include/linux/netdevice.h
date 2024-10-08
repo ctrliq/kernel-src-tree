@@ -1702,6 +1702,7 @@ struct offload_callbacks {
 
 struct packet_offload {
 	__be16			 type;	/* This is really htons(ether_type). */
+	u16			 priority;
 	struct offload_callbacks callbacks;
 	struct list_head	 list;
 };
