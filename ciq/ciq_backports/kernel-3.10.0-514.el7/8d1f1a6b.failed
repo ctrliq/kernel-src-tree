@@ -1,0 +1,139 @@
+RDMA/iw_cxgb4: parent_ep has to be dereferenced in case of passive accept failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hariprasad S <hariprasad@chelsio.com>
+commit 8d1f1a6b3fccfce5d95ee0d6456b1437e93f2bba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8d1f1a6b.failed
+
+-> On passive side of connection parent_ep referenced during connection
+request has to be dereferenced during the passive accept failure.
+-> As passive accept failure error handlinglogic runs in atomic context,
+the parent ep is dereferenced by scheduling work request.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8d1f1a6b3fccfce5d95ee0d6456b1437e93f2bba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/cm.c
+diff --cc drivers/infiniband/hw/cxgb4/cm.c
+index f2044b015bfe,cae1794cef83..000000000000
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@@ -446,6 -452,65 +446,68 @@@ static void arp_failure_discard(void *h
+  	kfree_skb(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum {
++ 	NUM_FAKE_CPLS = 2,
++ 	FAKE_CPL_PUT_EP_SAFE = NUM_CPL_CMDS + 0,
++ 	FAKE_CPL_PASS_PUT_EP_SAFE = NUM_CPL_CMDS + 1,
++ };
++ 
++ static int _put_ep_safe(struct c4iw_dev *dev, struct sk_buff *skb)
++ {
++ 	struct c4iw_ep *ep;
++ 
++ 	ep = *((struct c4iw_ep **)(skb->cb + 2 * sizeof(void *)));
++ 	release_ep_resources(ep);
++ 	return 0;
++ }
++ 
++ static int _put_pass_ep_safe(struct c4iw_dev *dev, struct sk_buff *skb)
++ {
++ 	struct c4iw_ep *ep;
++ 
++ 	ep = *((struct c4iw_ep **)(skb->cb + 2 * sizeof(void *)));
++ 	c4iw_put_ep(&ep->parent_ep->com);
++ 	release_ep_resources(ep);
++ 	return 0;
++ }
++ 
++ /*
++  * Fake up a special CPL opcode and call sched() so process_work() will call
++  * _put_ep_safe() in a safe context to free the ep resources.  This is needed
++  * because ARP error handlers are called in an ATOMIC context, and
++  * _c4iw_free_ep() needs to block.
++  */
++ static void queue_arp_failure_cpl(struct c4iw_ep *ep, struct sk_buff *skb,
++ 				  int cpl)
++ {
++ 	struct cpl_act_establish *rpl = cplhdr(skb);
++ 
++ 	/* Set our special ARP_FAILURE opcode */
++ 	rpl->ot.opcode = cpl;
++ 
++ 	/*
++ 	 * Save ep in the skb->cb area, after where sched() will save the dev
++ 	 * ptr.
++ 	 */
++ 	*((struct c4iw_ep **)(skb->cb + 2 * sizeof(void *))) = ep;
++ 	sched(ep->com.dev, skb);
++ }
++ 
++ /* Handle an ARP failure for an accept */
++ static void pass_accept_rpl_arp_failure(void *handle, struct sk_buff *skb)
++ {
++ 	struct c4iw_ep *ep = handle;
++ 
++ 	pr_err(MOD "ARP failure during accept - tid %u -dropping connection\n",
++ 	       ep->hwtid);
++ 
++ 	__state_set(&ep->com, DEAD);
++ 	queue_arp_failure_cpl(ep, skb, FAKE_CPL_PASS_PUT_EP_SAFE);
++ }
++ 
+++>>>>>>> 8d1f1a6b3fcc (RDMA/iw_cxgb4: parent_ep has to be dereferenced in case of passive accept failure)
+  /*
+   * Handle an ARP failure for an active open.
+   */
+@@@ -453,15 -518,18 +515,19 @@@ static void act_open_req_arp_failure(vo
+  {
+  	struct c4iw_ep *ep = handle;
+  
+ -	printk(KERN_ERR MOD "ARP failure during connect\n");
+ +	printk(KERN_ERR MOD "ARP failure duing connect\n");
+ +	kfree_skb(skb);
+  	connect_reply_upcall(ep, -EHOSTUNREACH);
+ -	__state_set(&ep->com, DEAD);
+ -	if (ep->com.remote_addr.ss_family == AF_INET6) {
+ -		struct sockaddr_in6 *sin6 =
+ -			(struct sockaddr_in6 *)&ep->com.local_addr;
+ -		cxgb4_clip_release(ep->com.dev->rdev.lldi.ports[0],
+ -				   (const u32 *)&sin6->sin6_addr.s6_addr, 1);
+ -	}
+ +	state_set(&ep->com, DEAD);
+  	remove_handle(ep->com.dev, &ep->com.dev->atid_idr, ep->atid);
+  	cxgb4_free_atid(ep->com.dev->rdev.lldi.tids, ep->atid);
+++<<<<<<< HEAD
+ +	dst_release(ep->dst);
+ +	cxgb4_l2t_release(ep->l2t);
+ +	c4iw_put_ep(&ep->com);
+++=======
++ 	queue_arp_failure_cpl(ep, skb, FAKE_CPL_PUT_EP_SAFE);
+++>>>>>>> 8d1f1a6b3fcc (RDMA/iw_cxgb4: parent_ep has to be dereferenced in case of passive accept failure)
+  }
+  
+  /*
+@@@ -3853,7 -3946,9 +3919,13 @@@ static c4iw_handler_func work_handlers[
+  	[CPL_RDMA_TERMINATE] = terminate,
+  	[CPL_FW4_ACK] = fw4_ack,
+  	[CPL_FW6_MSG] = deferred_fw6_msg,
+++<<<<<<< HEAD
+ +	[CPL_RX_PKT] = rx_pkt
+++=======
++ 	[CPL_RX_PKT] = rx_pkt,
++ 	[FAKE_CPL_PUT_EP_SAFE] = _put_ep_safe,
++ 	[FAKE_CPL_PASS_PUT_EP_SAFE] = _put_pass_ep_safe
+++>>>>>>> 8d1f1a6b3fcc (RDMA/iw_cxgb4: parent_ep has to be dereferenced in case of passive accept failure)
+  };
+  
+  static void process_timeout(struct c4iw_ep *ep)
+* Unmerged path drivers/infiniband/hw/cxgb4/cm.c
