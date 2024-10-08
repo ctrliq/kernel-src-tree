@@ -611,5 +611,5 @@ int unwind__get_entries(unwind_entry_cb_t cb, void *arg,
 	if (ret)
 		return -ENOMEM;
 
-	return get_entries(&ui, cb, arg, max_stack);
+	return --max_stack > 0 ? get_entries(&ui, cb, arg, max_stack) : 0;
 }
