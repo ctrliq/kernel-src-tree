@@ -1,0 +1,482 @@
+param: convert some "on"/"off" users to strtobool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kees Cook <keescook@chromium.org>
+commit 4cc7ecb7f2a60e8deb783b8fbf7c1ae467acb920
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4cc7ecb7.failed
+
+This changes several users of manual "on"/"off" parsing to use
+strtobool.
+
+Some side-effects:
+- these uses will now parse y/n/1/0 meaningfully too
+- the early_param uses will now bubble up parse errors
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Amitkumar Karwar <akarwar@marvell.com>
+	Cc: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Joe Perches <joe@perches.com>
+	Cc: Kalle Valo <kvalo@codeaurora.org>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Nishant Sarmukadam <nishants@marvell.com>
+	Cc: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+	Cc: Steve French <sfrench@samba.org>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4cc7ecb7f2a60e8deb783b8fbf7c1ae467acb920)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/topology.c
+#	include/linux/tick.h
+#	kernel/hrtimer.c
+#	kernel/time/tick-sched.c
+diff --cc arch/s390/kernel/topology.c
+index 02c1293fec71,64298a867589..000000000000
+--- a/arch/s390/kernel/topology.c
++++ b/arch/s390/kernel/topology.c
+@@@ -34,11 -37,13 +34,11 @@@ static void set_topology_timer(void)
+  static void topology_work_fn(struct work_struct *work);
+  static struct sysinfo_15_1_x *tl_info;
+  
+- static int topology_enabled = 1;
++ static bool topology_enabled = true;
+  static DECLARE_WORK(topology_work, topology_work_fn);
+  
+ -/*
+ - * Socket/Book linked lists and per_cpu(cpu_topology) updates are
+ - * protected by "sched_domains_mutex".
+ - */
+ +/* topology_lock protects the socket and book linked lists */
+ +static DEFINE_SPINLOCK(topology_lock);
+  static struct mask_info socket_info;
+  static struct mask_info book_info;
+  
+@@@ -463,15 -426,78 +463,84 @@@ int topology_cpu_init(struct cpu *cpu
+  	return sysfs_create_group(&cpu->dev.kobj, &topology_cpu_attr_group);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct cpumask *cpu_thread_mask(int cpu)
++ {
++ 	return &per_cpu(cpu_topology, cpu).thread_mask;
++ }
++ 
++ 
++ const struct cpumask *cpu_coregroup_mask(int cpu)
++ {
++ 	return &per_cpu(cpu_topology, cpu).core_mask;
++ }
++ 
++ static const struct cpumask *cpu_book_mask(int cpu)
++ {
++ 	return &per_cpu(cpu_topology, cpu).book_mask;
++ }
++ 
++ static int __init early_parse_topology(char *p)
++ {
++ 	return kstrtobool(p, &topology_enabled);
++ }
++ early_param("topology", early_parse_topology);
++ 
++ static struct sched_domain_topology_level s390_topology[] = {
++ 	{ cpu_thread_mask, cpu_smt_flags, SD_INIT_NAME(SMT) },
++ 	{ cpu_coregroup_mask, cpu_core_flags, SD_INIT_NAME(MC) },
++ 	{ cpu_book_mask, SD_INIT_NAME(BOOK) },
++ 	{ cpu_cpu_mask, SD_INIT_NAME(DIE) },
++ 	{ NULL, },
++ };
++ 
++ static void __init alloc_masks(struct sysinfo_15_1_x *info,
++ 			       struct mask_info *mask, int offset)
++ {
++ 	int i, nr_masks;
++ 
++ 	nr_masks = info->mag[TOPOLOGY_NR_MAG - offset];
++ 	for (i = 0; i < info->mnest - offset; i++)
++ 		nr_masks *= info->mag[TOPOLOGY_NR_MAG - offset - 1 - i];
++ 	nr_masks = max(nr_masks, 1);
++ 	for (i = 0; i < nr_masks; i++) {
++ 		mask->next = kzalloc(sizeof(*mask->next), GFP_KERNEL);
++ 		mask = mask->next;
++ 	}
++ }
++ 
++ static int __init s390_topology_init(void)
++ {
++ 	struct sysinfo_15_1_x *info;
++ 	int i;
++ 
++ 	if (!MACHINE_HAS_TOPOLOGY)
++ 		return 0;
++ 	tl_info = (struct sysinfo_15_1_x *)__get_free_page(GFP_KERNEL);
++ 	info = tl_info;
++ 	store_topology(info);
++ 	pr_info("The CPU configuration topology of the machine is:");
++ 	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
++ 		printk(KERN_CONT " %d", info->mag[i]);
++ 	printk(KERN_CONT " / %d\n", info->mnest);
++ 	alloc_masks(info, &socket_info, 1);
++ 	alloc_masks(info, &book_info, 2);
++ 	set_sched_topology(s390_topology);
++ 	return 0;
++ }
++ early_initcall(s390_topology_init);
++ 
+++>>>>>>> 4cc7ecb7f2a6 (param: convert some "on"/"off" users to strtobool)
+  static int __init topology_init(void)
+  {
+ -	if (MACHINE_HAS_TOPOLOGY)
+ -		set_topology_timer();
+ -	else
+ +	if (!MACHINE_HAS_TOPOLOGY) {
+  		topology_update_polarization_simple();
+ +		goto out;
+ +	}
+ +	set_topology_timer();
+ +out:
+ +	update_cpu_masks();
+  	return device_create_file(cpu_subsys.dev_root, &dev_attr_dispatching);
+  }
+  device_initcall(topology_init);
+diff --cc include/linux/tick.h
+index 2503a03a1237,62be0786d6d0..000000000000
+--- a/include/linux/tick.h
++++ b/include/linux/tick.h
+@@@ -19,126 -50,69 +19,132 @@@ extern void hotplug_cpu__broadcast_tick
+  static inline void hotplug_cpu__broadcast_tick_pull(int dead_cpu) { }
+  #endif
+  
+ -enum tick_broadcast_mode {
+ -	TICK_BROADCAST_OFF,
+ -	TICK_BROADCAST_ON,
+ -	TICK_BROADCAST_FORCE,
+ +#ifdef CONFIG_GENERIC_CLOCKEVENTS
+ +
+ +enum tick_device_mode {
+ +	TICKDEV_MODE_PERIODIC,
+ +	TICKDEV_MODE_ONESHOT,
+  };
+  
+ -enum tick_broadcast_state {
+ -	TICK_BROADCAST_EXIT,
+ -	TICK_BROADCAST_ENTER,
+ +struct tick_device {
+ +	struct clock_event_device *evtdev;
+ +	enum tick_device_mode mode;
+  };
+  
+ -#ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
+ -extern void tick_broadcast_control(enum tick_broadcast_mode mode);
+ -#else
+ -static inline void tick_broadcast_control(enum tick_broadcast_mode mode) { }
+ -#endif /* BROADCAST */
+ +enum tick_nohz_mode {
+ +	NOHZ_MODE_INACTIVE,
+ +	NOHZ_MODE_LOWRES,
+ +	NOHZ_MODE_HIGHRES,
+ +};
+  
+ -#ifdef CONFIG_GENERIC_CLOCKEVENTS
+ -extern int tick_broadcast_oneshot_control(enum tick_broadcast_state state);
+ -#else
+ -static inline int tick_broadcast_oneshot_control(enum tick_broadcast_state state)
+ -{
+ -	return 0;
+ -}
+ -#endif
+ +/**
+ + * struct tick_sched - sched tick emulation and no idle tick control/stats
+ + * @sched_timer:	hrtimer to schedule the periodic tick in high
+ + *			resolution mode
+ + * @last_tick:		Store the last tick expiry time when the tick
+ + *			timer is modified for nohz sleeps. This is necessary
+ + *			to resume the tick timer operation in the timeline
+ + *			when the CPU returns from nohz sleep.
+ + * @tick_stopped:	Indicator that the idle tick has been stopped
+ + * @idle_jiffies:	jiffies at the entry to idle for idle time accounting
+ + * @idle_calls:		Total number of idle calls
+ + * @idle_sleeps:	Number of idle calls, where the sched tick was stopped
+ + * @idle_entrytime:	Time when the idle call was entered
+ + * @idle_waketime:	Time when the idle was interrupted
+ + * @idle_exittime:	Time when the idle state was left
+ + * @idle_sleeptime:	Sum of the time slept in idle with sched tick stopped
+ + * @iowait_sleeptime:	Sum of the time slept in idle with sched tick stopped, with IO outstanding
+ + * @sleep_length:	Duration of the current idle sleep
+ + * @do_timer_lst:	CPU was the last one doing do_timer before going idle
+ + */
+ +struct tick_sched {
+ +	struct hrtimer			sched_timer;
+ +	unsigned long			check_clocks;
+ +	enum tick_nohz_mode		nohz_mode;
+ +	ktime_t				last_tick;
+ +	int				inidle;
+ +	int				tick_stopped;
+ +	unsigned long			idle_jiffies;
+ +	unsigned long			idle_calls;
+ +	unsigned long			idle_sleeps;
+ +	int				idle_active;
+ +	ktime_t				idle_entrytime;
+ +	ktime_t				idle_waketime;
+ +	ktime_t				idle_exittime;
+ +	ktime_t				idle_sleeptime;
+ +	ktime_t				iowait_sleeptime;
+ +	ktime_t				sleep_length;
+ +	unsigned long			last_jiffies;
+ +	u64				next_timer;
+ +	ktime_t				idle_expires;
+ +	int				do_timer_last;
+ +};
+  
+ -static inline void tick_broadcast_enable(void)
+ -{
+ -	tick_broadcast_control(TICK_BROADCAST_ON);
+ -}
+ -static inline void tick_broadcast_disable(void)
+ -{
+ -	tick_broadcast_control(TICK_BROADCAST_OFF);
+ -}
+ -static inline void tick_broadcast_force(void)
+ -{
+ -	tick_broadcast_control(TICK_BROADCAST_FORCE);
+ -}
+ -static inline int tick_broadcast_enter(void)
+ -{
+ -	return tick_broadcast_oneshot_control(TICK_BROADCAST_ENTER);
+ -}
+ -static inline void tick_broadcast_exit(void)
+ -{
+ -	tick_broadcast_oneshot_control(TICK_BROADCAST_EXIT);
+ -}
+ +extern void __init tick_init(void);
+ +extern int tick_is_oneshot_available(void);
+ +extern struct tick_device *tick_get_device(int cpu);
+  
+ -enum tick_dep_bits {
+ -	TICK_DEP_BIT_POSIX_TIMER	= 0,
+ -	TICK_DEP_BIT_PERF_EVENTS	= 1,
+ -	TICK_DEP_BIT_SCHED		= 2,
+ -	TICK_DEP_BIT_CLOCK_UNSTABLE	= 3
+ -};
+ +# ifdef CONFIG_HIGH_RES_TIMERS
+ +extern int tick_init_highres(void);
+ +extern int tick_program_event(ktime_t expires, int force);
+ +extern void tick_setup_sched_timer(void);
+ +# endif
+ +
+ +# if defined CONFIG_NO_HZ_COMMON || defined CONFIG_HIGH_RES_TIMERS
+ +extern void tick_cancel_sched_timer(int cpu);
+ +# else
+ +static inline void tick_cancel_sched_timer(int cpu) { }
+ +# endif
+ +
+ +# ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
+ +extern struct tick_device *tick_get_broadcast_device(void);
+ +extern struct cpumask *tick_get_broadcast_mask(void);
+ +
+ +#  ifdef CONFIG_TICK_ONESHOT
+ +extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+ +#  endif
+ +
+ +# endif /* BROADCAST */
+ +
+ +# ifdef CONFIG_TICK_ONESHOT
+ +extern void tick_clock_notify(void);
+ +extern int tick_check_oneshot_change(int allow_nohz);
+ +extern struct tick_sched *tick_get_tick_sched(int cpu);
+ +extern void tick_check_idle(void);
+ +extern int tick_oneshot_mode_active(void);
+ +#  ifndef arch_needs_cpu
+ +#   define arch_needs_cpu(cpu) (0)
+ +#  endif
+ +# else
+ +static inline void tick_clock_notify(void) { }
+ +static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
+ +static inline void tick_check_idle(void) { }
+ +static inline int tick_oneshot_mode_active(void) { return 0; }
+ +# endif
+ +
+ +#else /* CONFIG_GENERIC_CLOCKEVENTS */
+ +static inline void tick_init(void) { }
+ +static inline void tick_cancel_sched_timer(int cpu) { }
+ +static inline void tick_clock_notify(void) { }
+ +static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
+ +static inline void tick_check_idle(void) { }
+ +static inline int tick_oneshot_mode_active(void) { return 0; }
+ +#endif /* !CONFIG_GENERIC_CLOCKEVENTS */
+  
+ -#define TICK_DEP_MASK_NONE		0
+ -#define TICK_DEP_MASK_POSIX_TIMER	(1 << TICK_DEP_BIT_POSIX_TIMER)
+ -#define TICK_DEP_MASK_PERF_EVENTS	(1 << TICK_DEP_BIT_PERF_EVENTS)
+ -#define TICK_DEP_MASK_SCHED		(1 << TICK_DEP_BIT_SCHED)
+ -#define TICK_DEP_MASK_CLOCK_UNSTABLE	(1 << TICK_DEP_BIT_CLOCK_UNSTABLE)
+ +# ifdef CONFIG_NO_HZ_COMMON
+ +DECLARE_PER_CPU(struct tick_sched, tick_cpu_sched);
+  
+ +static inline int tick_nohz_tick_stopped(void)
+ +{
+ +	return __this_cpu_read(tick_cpu_sched.tick_stopped);
+ +}
+ +
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NO_HZ_COMMON
++ extern bool tick_nohz_enabled;
++ extern int tick_nohz_tick_stopped(void);
+++>>>>>>> 4cc7ecb7f2a6 (param: convert some "on"/"off" users to strtobool)
+  extern void tick_nohz_idle_enter(void);
+  extern void tick_nohz_idle_exit(void);
+  extern void tick_nohz_irq_exit(void);
+diff --cc kernel/hrtimer.c
+index ba5949c3e0ec,fa0b983290cf..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -530,7 -515,9 +530,13 @@@ static inline ktime_t hrtimer_update_ba
+  /*
+   * High resolution timer enabled ?
+   */
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +static int hrtimer_hres_enabled __read_mostly  = 1;
+++=======
++ static bool hrtimer_hres_enabled __read_mostly  = true;
++ unsigned int hrtimer_resolution __read_mostly = LOW_RES_NSEC;
++ EXPORT_SYMBOL_GPL(hrtimer_resolution);
+++>>>>>>> 4cc7ecb7f2a6 (param: convert some "on"/"off" users to strtobool):kernel/time/hrtimer.c
+  
+  /*
+   * Enable / Disable high resolution mode
+diff --cc kernel/time/tick-sched.c
+index 12287fcd01dd,195fe7d2caad..000000000000
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@@ -381,8 -486,8 +381,13 @@@ void __init tick_nohz_init(void
+  /*
+   * NO HZ enabled ?
+   */
+++<<<<<<< HEAD
+ +static int tick_nohz_enabled __read_mostly  = 1;
+ +int tick_nohz_active  __read_mostly;
+++=======
++ bool tick_nohz_enabled __read_mostly  = true;
++ unsigned long tick_nohz_active  __read_mostly;
+++>>>>>>> 4cc7ecb7f2a6 (param: convert some "on"/"off" users to strtobool)
+  /*
+   * Enable / Disable tickless mode
+   */
+diff --git a/arch/powerpc/kernel/rtasd.c b/arch/powerpc/kernel/rtasd.c
+index e736387fee6a..83dcedb127b0 100644
+--- a/arch/powerpc/kernel/rtasd.c
++++ b/arch/powerpc/kernel/rtasd.c
+@@ -49,7 +49,7 @@ static unsigned int rtas_error_log_buffer_max;
+ static unsigned int event_scan;
+ static unsigned int rtas_event_scan_rate;
+ 
+-static int full_rtas_msgs = 0;
++static bool full_rtas_msgs;
+ 
+ /* Stop logging to nvram after first fatal error */
+ static int logging_enabled; /* Until we initialize everything,
+@@ -592,11 +592,6 @@ __setup("surveillance=", surveillance_setup);
+ 
+ static int __init rtasmsgs_setup(char *str)
+ {
+-	if (strcmp(str, "on") == 0)
+-		full_rtas_msgs = 1;
+-	else if (strcmp(str, "off") == 0)
+-		full_rtas_msgs = 0;
+-
+-	return 1;
++	return (kstrtobool(str, &full_rtas_msgs) == 0);
+ }
+ __setup("rtasmsgs=", rtasmsgs_setup);
+diff --git a/arch/powerpc/platforms/pseries/hotplug-cpu.c b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+index 5c375f93c669..ddbeaaf3ddf8 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-cpu.c
++++ b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+@@ -43,20 +43,14 @@ static DEFINE_PER_CPU(enum cpu_state_vals, current_state) = CPU_STATE_OFFLINE;
+ 
+ static enum cpu_state_vals default_offline_state = CPU_STATE_OFFLINE;
+ 
+-static int cede_offline_enabled __read_mostly = 1;
++static bool cede_offline_enabled __read_mostly = true;
+ 
+ /*
+  * Enable/disable cede_offline when available.
+  */
+ static int __init setup_cede_offline(char *str)
+ {
+-	if (!strcmp(str, "off"))
+-		cede_offline_enabled = 0;
+-	else if (!strcmp(str, "on"))
+-		cede_offline_enabled = 1;
+-	else
+-		return 0;
+-	return 1;
++	return (kstrtobool(str, &cede_offline_enabled) == 0);
+ }
+ 
+ __setup("cede_offline=", setup_cede_offline);
+diff --git a/arch/s390/kernel/time.c b/arch/s390/kernel/time.c
+index 386d37a228bb..6fd90e3f38b5 100644
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@ -1412,7 +1412,7 @@ device_initcall(etr_init_sysfs);
+ /*
+  * Server Time Protocol (STP) code.
+  */
+-static int stp_online;
++static bool stp_online;
+ static struct stp_sstpi stp_info;
+ static void *stp_page;
+ 
+@@ -1423,11 +1423,7 @@ static struct timer_list stp_timer;
+ 
+ static int __init early_parse_stp(char *p)
+ {
+-	if (strncmp(p, "off", 3) == 0)
+-		stp_online = 0;
+-	else if (strncmp(p, "on", 2) == 0)
+-		stp_online = 1;
+-	return 0;
++	return kstrtobool(p, &stp_online);
+ }
+ early_param("stp", early_parse_stp);
+ 
+* Unmerged path arch/s390/kernel/topology.c
+diff --git a/arch/x86/kernel/aperture_64.c b/arch/x86/kernel/aperture_64.c
+index 6e85f713641d..0a2bb1f62e72 100644
+--- a/arch/x86/kernel/aperture_64.c
++++ b/arch/x86/kernel/aperture_64.c
+@@ -227,19 +227,11 @@ static u32 __init search_agp_bridge(u32 *order, int *valid_agp)
+ 	return 0;
+ }
+ 
+-static int gart_fix_e820 __initdata = 1;
++static bool gart_fix_e820 __initdata = true;
+ 
+ static int __init parse_gart_mem(char *p)
+ {
+-	if (!p)
+-		return -EINVAL;
+-
+-	if (!strncmp(p, "off", 3))
+-		gart_fix_e820 = 0;
+-	else if (!strncmp(p, "on", 2))
+-		gart_fix_e820 = 1;
+-
+-	return 0;
++	return kstrtobool(p, &gart_fix_e820);
+ }
+ early_param("gart_fix_e820", parse_gart_mem);
+ 
+* Unmerged path include/linux/tick.h
+* Unmerged path kernel/hrtimer.c
+* Unmerged path kernel/time/tick-sched.c
