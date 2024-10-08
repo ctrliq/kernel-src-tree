@@ -1,0 +1,148 @@
+[SCSI] Return ENODATA on medium error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [scsi] Return ENODATA on medium error (Mike Snitzer) [1010437]
+Rebuild_FUZZ: 89.55%
+commit-author Hannes Reinecke <hare@suse.de>
+commit 7e782af57649f8a8e943d80104c946a5cd7af7cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/7e782af5.failed
+
+When a medium error is detected the SCSI stack should return
+ENODATA to the upper layers.
+
+[jejb: fix whitespace error]
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 7e782af57649f8a8e943d80104c946a5cd7af7cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	drivers/scsi/scsi_lib.c
+#	include/scsi/scsi.h
+diff --cc block/blk-core.c
+index cdcac988987e,c04505358342..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2337,6 -2315,15 +2337,18 @@@ bool blk_update_request(struct request 
+  		case -EBADE:
+  			error_type = "critical nexus";
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case -ETIMEDOUT:
++ 			error_type = "timeout";
++ 			break;
++ 		case -ENOSPC:
++ 			error_type = "critical space allocation";
++ 			break;
++ 		case -ENODATA:
++ 			error_type = "critical medium";
++ 			break;
+++>>>>>>> 7e782af57649 ([SCSI] Return ENODATA on medium error)
+  		case -EIO:
+  		default:
+  			error_type = "I/O";
+diff --cc drivers/scsi/scsi_lib.c
+index 01b09c33ca40,36b5c898db9d..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -726,6 -726,8 +726,11 @@@ EXPORT_SYMBOL(scsi_release_buffers)
+   * -ENOLINK	temporary transport failure
+   * -EREMOTEIO	permanent target failure, do not retry
+   * -EBADE	permanent nexus failure, retry on other path
+++<<<<<<< HEAD
+++=======
++  * -ENOSPC	No write space available
++  * -ENODATA	Medium error
+++>>>>>>> 7e782af57649 ([SCSI] Return ENODATA on medium error)
+   * -EIO		unspecified I/O error
+   */
+  static int __scsi_error_from_host_byte(struct scsi_cmnd *cmd, int result)
+@@@ -744,6 -746,14 +749,17 @@@
+  		set_host_byte(cmd, DID_OK);
+  		error = -EBADE;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case DID_ALLOC_FAILURE:
++ 		set_host_byte(cmd, DID_OK);
++ 		error = -ENOSPC;
++ 		break;
++ 	case DID_MEDIUM_ERROR:
++ 		set_host_byte(cmd, DID_OK);
++ 		error = -ENODATA;
++ 		break;
+++>>>>>>> 7e782af57649 ([SCSI] Return ENODATA on medium error)
+  	default:
+  		error = -EIO;
+  		break;
+diff --cc include/scsi/scsi.h
+index 07d4bd916526,d477bfb73fb9..000000000000
+--- a/include/scsi/scsi.h
++++ b/include/scsi/scsi.h
+@@@ -452,6 -457,8 +452,11 @@@ static inline int scsi_is_wlun(unsigne
+  				 * other paths */
+  #define DID_NEXUS_FAILURE 0x11  /* Permanent nexus failure, retry on other
+  				 * paths might yield different results */
+++<<<<<<< HEAD
+++=======
++ #define DID_ALLOC_FAILURE 0x12  /* Space allocation on the device failed */
++ #define DID_MEDIUM_ERROR  0x13  /* Medium error */
+++>>>>>>> 7e782af57649 ([SCSI] Return ENODATA on medium error)
+  #define DRIVER_OK       0x00	/* Driver status                           */
+  
+  /*
+* Unmerged path block/blk-core.c
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index 5adede17ddf6..b759a127f9c3 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -1261,6 +1261,20 @@ static void activate_path(struct work_struct *work)
+ 				pg_init_done, pgpath);
+ }
+ 
++static int noretry_error(int error)
++{
++	switch (error) {
++	case -EOPNOTSUPP:
++	case -EREMOTEIO:
++	case -EILSEQ:
++	case -ENODATA:
++		return 1;
++	}
++
++	/* Anything else could be a path failure, so should be retried */
++	return 0;
++}
++
+ /*
+  * end_io handling
+  */
+@@ -1284,7 +1298,7 @@ static int do_end_io(struct multipath *m, struct request *clone,
+ 	if (!error && !clone->errors)
+ 		return 0;	/* I/O complete */
+ 
+-	if (error == -EOPNOTSUPP || error == -EREMOTEIO || error == -EILSEQ)
++	if (noretry_error(error))
+ 		return error;
+ 
+ 	if (mpio->pgpath)
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index a3cba193ecd4..bac3ce8f97ce 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -426,7 +426,7 @@ static int scsi_check_sense(struct scsi_cmnd *scmd)
+ 		if (sshdr.asc == 0x11 || /* UNRECOVERED READ ERR */
+ 		    sshdr.asc == 0x13 || /* AMNF DATA FIELD */
+ 		    sshdr.asc == 0x14) { /* RECORD NOT FOUND */
+-			set_host_byte(scmd, DID_TARGET_FAILURE);
++			set_host_byte(scmd, DID_MEDIUM_ERROR);
+ 			return SUCCESS;
+ 		}
+ 		return NEEDS_RETRY;
+* Unmerged path drivers/scsi/scsi_lib.c
+* Unmerged path include/scsi/scsi.h
