@@ -1,0 +1,354 @@
+hv_netvsc: avoid deadlocks between rtnl lock and vf_use_cnt wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit d072218f214929194db06069564495b6b9fff34a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d072218f.failed
+
+Here is a deadlock scenario:
+- netvsc_vf_up() schedules netvsc_notify_peers() work and quits.
+- netvsc_vf_down() runs before netvsc_notify_peers() gets executed. As it
+  is being executed from netdev notifier chain we hold rtnl lock when we
+  get here.
+- we enter while (atomic_read(&net_device_ctx->vf_use_cnt) != 0) loop and
+  wait till netvsc_notify_peers() drops vf_use_cnt.
+- netvsc_notify_peers() starts on some other CPU but netdev_notify_peers()
+  will hang on rtnl_lock().
+- deadlock!
+
+Instead of introducing additional synchronization I suggest we drop
+gwrk.dwrk completely and call NETDEV_NOTIFY_PEERS directly. As we're
+acting under rtnl lock this is legitimate.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Acked-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d072218f214929194db06069564495b6b9fff34a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,591af71eae56..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -595,11 -622,68 +595,73 @@@ struct nvsp_message 
+  #define NETVSC_PACKET_SIZE                      4096
+  
+  #define VRSS_SEND_TAB_SIZE 16
+ -#define VRSS_CHANNEL_MAX 64
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	struct sk_buff *skb; /* skb containing the pkt */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync syncp;
++ };
++ 
++ struct netvsc_reconfig {
++ 	struct list_head list;
++ 	u32 event;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	/* netvsc_device */
++ 	struct netvsc_device *nvdev;
++ 	/* reconfigure work */
++ 	struct delayed_work dwork;
++ 	/* last reconfig time */
++ 	unsigned long last_reconfig;
++ 	/* reconfig events */
++ 	struct list_head reconfig_events;
++ 	/* list protection */
++ 	spinlock_t lock;
++ 
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ 
++ 	/* Ethtool settings */
++ 	u8 duplex;
++ 	u32 speed;
++ 
++ 	/* the device is going away */
++ 	bool start_remove;
++ 
++ 	/* State to manage the associated VF interface. */
++ 	struct net_device *vf_netdev;
++ 	bool vf_inject;
++ 	atomic_t vf_use_cnt;
++ 	/* 1: allocated, serial number is valid. 0: not allocated */
++ 	u32 vf_alloc;
++ 	/* Serial number of the VF to team with */
++ 	u32 vf_serial;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> d072218f2149 (hv_netvsc: avoid deadlocks between rtnl lock and vf_use_cnt wait)
+  struct netvsc_device {
+ +	struct hv_device *dev;
+ +
+  	u32 nvsp_version;
+  
+  	atomic_t num_outstanding_sends;
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 822e657fcee7,70317fa24cde..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -857,8 -1129,191 +857,183 @@@ static void netvsc_link_change(struct w
+  
+  	if (notify)
+  		netdev_notify_peers(net);
+ -
+ -	/* link_watch only sends one notification with current state per
+ -	 * second, handle next reconfig event in 2 seconds.
+ -	 */
+ -	if (reschedule)
+ -		schedule_delayed_work(&ndev_ctx->dwork, LINKCHANGE_INT);
+ -
+ -	return;
+ -
+ -out_unlock:
+ -	rtnl_unlock();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void netvsc_free_netdev(struct net_device *netdev)
++ {
++ 	struct net_device_context *net_device_ctx = netdev_priv(netdev);
++ 
++ 	free_percpu(net_device_ctx->tx_stats);
++ 	free_percpu(net_device_ctx->rx_stats);
++ 	free_netdev(netdev);
++ }
++ 
++ static struct net_device *get_netvsc_net_device(char *mac)
++ {
++ 	struct net_device *dev, *found = NULL;
++ 	int rtnl_locked;
++ 
++ 	rtnl_locked = rtnl_trylock();
++ 
++ 	for_each_netdev(&init_net, dev) {
++ 		if (memcmp(dev->dev_addr, mac, ETH_ALEN) == 0) {
++ 			if (dev->netdev_ops != &device_ops)
++ 				continue;
++ 			found = dev;
++ 			break;
++ 		}
++ 	}
++ 	if (rtnl_locked)
++ 		rtnl_unlock();
++ 
++ 	return found;
++ }
++ 
++ static int netvsc_register_vf(struct net_device *vf_netdev)
++ {
++ 	struct net_device *ndev;
++ 	struct net_device_context *net_device_ctx;
++ 	struct netvsc_device *netvsc_dev;
++ 	const struct ethtool_ops *eth_ops = vf_netdev->ethtool_ops;
++ 
++ 	if (eth_ops == NULL || eth_ops == &ethtool_ops)
++ 		return NOTIFY_DONE;
++ 
++ 	/*
++ 	 * We will use the MAC address to locate the synthetic interface to
++ 	 * associate with the VF interface. If we don't find a matching
++ 	 * synthetic interface, move on.
++ 	 */
++ 	ndev = get_netvsc_net_device(vf_netdev->dev_addr);
++ 	if (!ndev)
++ 		return NOTIFY_DONE;
++ 
++ 	net_device_ctx = netdev_priv(ndev);
++ 	netvsc_dev = net_device_ctx->nvdev;
++ 	if (netvsc_dev == NULL)
++ 		return NOTIFY_DONE;
++ 
++ 	netdev_info(ndev, "VF registering: %s\n", vf_netdev->name);
++ 	/*
++ 	 * Take a reference on the module.
++ 	 */
++ 	try_module_get(THIS_MODULE);
++ 	net_device_ctx->vf_netdev = vf_netdev;
++ 	return NOTIFY_OK;
++ }
++ 
++ 
++ static int netvsc_vf_up(struct net_device *vf_netdev)
++ {
++ 	struct net_device *ndev;
++ 	struct netvsc_device *netvsc_dev;
++ 	const struct ethtool_ops *eth_ops = vf_netdev->ethtool_ops;
++ 	struct net_device_context *net_device_ctx;
++ 
++ 	if (eth_ops == &ethtool_ops)
++ 		return NOTIFY_DONE;
++ 
++ 	ndev = get_netvsc_net_device(vf_netdev->dev_addr);
++ 	if (!ndev)
++ 		return NOTIFY_DONE;
++ 
++ 	net_device_ctx = netdev_priv(ndev);
++ 	netvsc_dev = net_device_ctx->nvdev;
++ 
++ 	if (!netvsc_dev || !net_device_ctx->vf_netdev)
++ 		return NOTIFY_DONE;
++ 
++ 	netdev_info(ndev, "VF up: %s\n", vf_netdev->name);
++ 	net_device_ctx->vf_inject = true;
++ 
++ 	/*
++ 	 * Open the device before switching data path.
++ 	 */
++ 	rndis_filter_open(netvsc_dev);
++ 
++ 	/*
++ 	 * notify the host to switch the data path.
++ 	 */
++ 	netvsc_switch_datapath(ndev, true);
++ 	netdev_info(ndev, "Data path switched to VF: %s\n", vf_netdev->name);
++ 
++ 	netif_carrier_off(ndev);
++ 
++ 	/* Now notify peers through VF device. */
++ 	call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, vf_netdev);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ 
++ static int netvsc_vf_down(struct net_device *vf_netdev)
++ {
++ 	struct net_device *ndev;
++ 	struct netvsc_device *netvsc_dev;
++ 	struct net_device_context *net_device_ctx;
++ 	const struct ethtool_ops *eth_ops = vf_netdev->ethtool_ops;
++ 
++ 	if (eth_ops == &ethtool_ops)
++ 		return NOTIFY_DONE;
++ 
++ 	ndev = get_netvsc_net_device(vf_netdev->dev_addr);
++ 	if (!ndev)
++ 		return NOTIFY_DONE;
++ 
++ 	net_device_ctx = netdev_priv(ndev);
++ 	netvsc_dev = net_device_ctx->nvdev;
++ 
++ 	if (!netvsc_dev || !net_device_ctx->vf_netdev)
++ 		return NOTIFY_DONE;
++ 
++ 	netdev_info(ndev, "VF down: %s\n", vf_netdev->name);
++ 	net_device_ctx->vf_inject = false;
++ 	/*
++ 	 * Wait for currently active users to
++ 	 * drain out.
++ 	 */
++ 
++ 	while (atomic_read(&net_device_ctx->vf_use_cnt) != 0)
++ 		udelay(50);
++ 	netvsc_switch_datapath(ndev, false);
++ 	netdev_info(ndev, "Data path switched from VF: %s\n", vf_netdev->name);
++ 	rndis_filter_close(netvsc_dev);
++ 	netif_carrier_on(ndev);
++ 
++ 	/* Now notify peers through netvsc device. */
++ 	call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, ndev);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ 
++ static int netvsc_unregister_vf(struct net_device *vf_netdev)
++ {
++ 	struct net_device *ndev;
++ 	struct netvsc_device *netvsc_dev;
++ 	const struct ethtool_ops *eth_ops = vf_netdev->ethtool_ops;
++ 	struct net_device_context *net_device_ctx;
++ 
++ 	if (eth_ops == &ethtool_ops)
++ 		return NOTIFY_DONE;
++ 
++ 	ndev = get_netvsc_net_device(vf_netdev->dev_addr);
++ 	if (!ndev)
++ 		return NOTIFY_DONE;
++ 
++ 	net_device_ctx = netdev_priv(ndev);
++ 	netvsc_dev = net_device_ctx->nvdev;
++ 	if (netvsc_dev == NULL)
++ 		return NOTIFY_DONE;
++ 	netdev_info(ndev, "VF unregistering: %s\n", vf_netdev->name);
++ 
++ 	net_device_ctx->vf_netdev = NULL;
++ 	module_put(THIS_MODULE);
++ 	return NOTIFY_OK;
++ }
+++>>>>>>> d072218f2149 (hv_netvsc: avoid deadlocks between rtnl lock and vf_use_cnt wait)
+  
+  static int netvsc_probe(struct hv_device *dev,
+  			const struct hv_vmbus_device_id *dev_id)
+@@@ -878,9 -1333,36 +1053,19 @@@
+  
+  	net_device_ctx = netdev_priv(net);
+  	net_device_ctx->device_ctx = dev;
+ -	net_device_ctx->msg_enable = netif_msg_init(debug, default_msg);
+ -	if (netif_msg_probe(net_device_ctx))
+ -		netdev_dbg(net, "netvsc msg_enable: %d\n",
+ -			   net_device_ctx->msg_enable);
+ -
+ -	net_device_ctx->tx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ -	if (!net_device_ctx->tx_stats) {
+ -		free_netdev(net);
+ -		return -ENOMEM;
+ -	}
+ -	net_device_ctx->rx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ -	if (!net_device_ctx->rx_stats) {
+ -		free_percpu(net_device_ctx->tx_stats);
+ -		free_netdev(net);
+ -		return -ENOMEM;
+ -	}
+ -
+  	hv_set_drvdata(dev, net);
+ -
+ -	net_device_ctx->start_remove = false;
+ -
+  	INIT_DELAYED_WORK(&net_device_ctx->dwork, netvsc_link_change);
+  	INIT_WORK(&net_device_ctx->work, do_set_multicast);
+++<<<<<<< HEAD
+++=======
++ 
++ 	spin_lock_init(&net_device_ctx->lock);
++ 	INIT_LIST_HEAD(&net_device_ctx->reconfig_events);
++ 
++ 	atomic_set(&net_device_ctx->vf_use_cnt, 0);
++ 	net_device_ctx->vf_netdev = NULL;
++ 	net_device_ctx->vf_inject = false;
+++>>>>>>> d072218f2149 (hv_netvsc: avoid deadlocks between rtnl lock and vf_use_cnt wait)
+  
+  	net->netdev_ops = &device_ops;
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
