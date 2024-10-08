@@ -1,0 +1,251 @@
+ext4: fix performance regression in ext4_writepages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Ming Lei <ming.lei@canonical.com>
+commit aeac589a74b91c4c07458272767e089810fbd23d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/aeac589a.failed
+
+Commit 4e7ea81db5(ext4: restructure writeback path) introduces another
+performance regression on random write:
+
+- one more page may be added to ext4 extent in
+  mpage_prepare_extent_to_map, and will be submitted for I/O so
+  nr_to_write will become -1 before 'done' is set
+
+- the worse thing is that dirty pages may still be retrieved from page
+  cache after nr_to_write becomes negative, so lots of small chunks
+  can be submitted to block device when page writeback is catching up
+  with write path, and performance is hurted.
+
+On one arm A15 board with sata 3.0 SSD(CPU: 1.5GHz dura core, RAM:
+2GB, SATA controller: 3.0Gbps), this patch can improve below test's
+result from 157MB/sec to 174MB/sec(>10%):
+
+	dd if=/dev/zero of=./z.img bs=8K count=512K
+
+The above test is actually prototype of block write in bonnie++
+utility.
+
+This patch makes sure no more pages than nr_to_write can be added to
+extent for mapping, so that nr_to_write won't become negative.
+
+	Cc: linux-ext4@vger.kernel.org
+	Acked-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit aeac589a74b91c4c07458272767e089810fbd23d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 9b251a9a30ad,94aac67b55c9..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -2219,34 -2276,38 +2219,48 @@@ static int ext4_da_writepages_trans_blo
+  }
+  
+  /*
+ - * mpage_prepare_extent_to_map - find & lock contiguous range of dirty pages
+ - * 				 and underlying extent to map
+ - *
+ - * @mpd - where to look for pages
+ - *
+ - * Walk dirty pages in the mapping. If they are fully mapped, submit them for
+ - * IO immediately. When we find a page which isn't mapped we start accumulating
+ - * extent of buffers underlying these pages that needs mapping (formed by
+ - * either delayed or unwritten buffers). We also lock the pages containing
+ - * these buffers. The extent found is returned in @mpd structure (starting at
+ - * mpd->lblk with length mpd->len blocks).
+ - *
+ - * Note that this function can attach bios to one io_end structure which are
+ - * neither logically nor physically contiguous. Although it may seem as an
+ - * unnecessary complication, it is actually inevitable in blocksize < pagesize
+ - * case as we need to track IO to all buffers underlying a page in one io_end.
+ + * write_cache_pages_da - walk the list of dirty pages of the given
+ + * address space and accumulate pages that need writing, and call
+ + * mpage_da_map_and_submit to map a single contiguous memory region
+ + * and then write them.
+   */
+ -static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ +static int write_cache_pages_da(handle_t *handle,
+ +				struct address_space *mapping,
+ +				struct writeback_control *wbc,
+ +				struct mpage_da_data *mpd,
+ +				pgoff_t *done_index)
+  {
+++<<<<<<< HEAD
+ +	struct buffer_head	*bh, *head;
+ +	struct inode		*inode = mapping->host;
+ +	struct pagevec		pvec;
+ +	unsigned int		nr_pages;
+ +	sector_t		logical;
+ +	pgoff_t			index, end;
+ +	long			nr_to_write = wbc->nr_to_write;
+ +	int			i, tag, ret = 0;
+++=======
++ 	struct address_space *mapping = mpd->inode->i_mapping;
++ 	struct pagevec pvec;
++ 	unsigned int nr_pages;
++ 	long left = mpd->wbc->nr_to_write;
++ 	pgoff_t index = mpd->first_page;
++ 	pgoff_t end = mpd->last_page;
++ 	int tag;
++ 	int i, err = 0;
++ 	int blkbits = mpd->inode->i_blkbits;
++ 	ext4_lblk_t lblk;
++ 	struct buffer_head *head;
+++>>>>>>> aeac589a74b9 (ext4: fix performance regression in ext4_writepages)
+  
+ -	if (mpd->wbc->sync_mode == WB_SYNC_ALL || mpd->wbc->tagged_writepages)
+ +	memset(mpd, 0, sizeof(struct mpage_da_data));
+ +	mpd->wbc = wbc;
+ +	mpd->inode = inode;
+ +	pagevec_init(&pvec, 0);
+ +	index = wbc->range_start >> PAGE_CACHE_SHIFT;
+ +	end = wbc->range_end >> PAGE_CACHE_SHIFT;
+ +
+ +	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+  		tag = PAGECACHE_TAG_TOWRITE;
+  	else
+  		tag = PAGECACHE_TAG_DIRTY;
+@@@ -2271,27 -2334,28 +2285,44 @@@
+  			if (page->index > end)
+  				goto out;
+  
+++<<<<<<< HEAD
+ +			*done_index = page->index + 1;
+ +
+ +			/*
+ +			 * If we can't merge this page, and we have
+ +			 * accumulated an contiguous region, write it
+ +			 */
+ +			if ((mpd->next_page != page->index) &&
+ +			    (mpd->next_page != mpd->first_page)) {
+ +				mpage_da_map_and_submit(mpd);
+ +				goto ret_extent_tail;
+ +			}
+++=======
++ 			/*
++ 			 * Accumulated enough dirty pages? This doesn't apply
++ 			 * to WB_SYNC_ALL mode. For integrity sync we have to
++ 			 * keep going because someone may be concurrently
++ 			 * dirtying pages, and we might have synced a lot of
++ 			 * newly appeared dirty pages, but have not synced all
++ 			 * of the old dirty pages.
++ 			 */
++ 			if (mpd->wbc->sync_mode == WB_SYNC_NONE && left <= 0)
++ 				goto out;
++ 
++ 			/* If we can't merge this page, we are done. */
++ 			if (mpd->map.m_len > 0 && mpd->next_page != page->index)
++ 				goto out;
+++>>>>>>> aeac589a74b9 (ext4: fix performance regression in ext4_writepages)
+  
+  			lock_page(page);
+ +
+  			/*
+ -			 * If the page is no longer dirty, or its mapping no
+ -			 * longer corresponds to inode we are writing (which
+ -			 * means it has been truncated or invalidated), or the
+ -			 * page is already under writeback and we are not doing
+ -			 * a data integrity writeback, skip the page
+ +			 * If the page is no longer dirty, or its
+ +			 * mapping no longer corresponds to inode we
+ +			 * are writing (which means it has been
+ +			 * truncated or invalidated), or the page is
+ +			 * already under writeback and we are not
+ +			 * doing a data integrity writeback, skip the page
+  			 */
+  			if (!PageDirty(page) ||
+  			    (PageWriteback(page) &&
+@@@ -2304,72 -2368,18 +2335,84 @@@
+  			wait_on_page_writeback(page);
+  			BUG_ON(PageWriteback(page));
+  
+ -			if (mpd->map.m_len == 0)
+ +			/*
+ +			 * If we have inline data and arrive here, it means that
+ +			 * we will soon create the block for the 1st page, so
+ +			 * we'd better clear the inline data here.
+ +			 */
+ +			if (ext4_has_inline_data(inode)) {
+ +				BUG_ON(ext4_test_inode_state(inode,
+ +						EXT4_STATE_MAY_INLINE_DATA));
+ +				ext4_destroy_inline_data(handle, inode);
+ +			}
+ +
+ +			if (mpd->next_page != page->index)
+  				mpd->first_page = page->index;
+  			mpd->next_page = page->index + 1;
+++<<<<<<< HEAD
+ +			logical = (sector_t) page->index <<
+ +				(PAGE_CACHE_SHIFT - inode->i_blkbits);
+ +
+ +			/* Add all dirty buffers to mpd */
+ +			head = page_buffers(page);
+ +			bh = head;
+ +			do {
+ +				BUG_ON(buffer_locked(bh));
+ +				/*
+ +				 * We need to try to allocate unmapped blocks
+ +				 * in the same page.  Otherwise we won't make
+ +				 * progress with the page in ext4_writepage
+ +				 */
+ +				if (ext4_bh_delay_or_unwritten(NULL, bh)) {
+ +					mpage_add_bh_to_extent(mpd, logical,
+ +							       bh->b_state);
+ +					if (mpd->io_done)
+ +						goto ret_extent_tail;
+ +				} else if (buffer_dirty(bh) &&
+ +					   buffer_mapped(bh)) {
+ +					/*
+ +					 * mapped dirty buffer. We need to
+ +					 * update the b_state because we look
+ +					 * at b_state in mpage_da_map_blocks.
+ +					 * We don't update b_size because if we
+ +					 * find an unmapped buffer_head later
+ +					 * we need to use the b_state flag of
+ +					 * that buffer_head.
+ +					 */
+ +					if (mpd->b_size == 0)
+ +						mpd->b_state =
+ +							bh->b_state & BH_FLAGS;
+ +				}
+ +				logical++;
+ +			} while ((bh = bh->b_this_page) != head);
+ +
+ +			if (nr_to_write > 0) {
+ +				nr_to_write--;
+ +				if (nr_to_write == 0 &&
+ +				    wbc->sync_mode == WB_SYNC_NONE)
+ +					/*
+ +					 * We stop writing back only if we are
+ +					 * not doing integrity sync. In case of
+ +					 * integrity sync we have to keep going
+ +					 * because someone may be concurrently
+ +					 * dirtying pages, and we might have
+ +					 * synced a lot of newly appeared dirty
+ +					 * pages, but have not synced all of the
+ +					 * old dirty pages.
+ +					 */
+ +					goto out;
+ +			}
+++=======
++ 			/* Add all dirty buffers to mpd */
++ 			lblk = ((ext4_lblk_t)page->index) <<
++ 				(PAGE_CACHE_SHIFT - blkbits);
++ 			head = page_buffers(page);
++ 			err = mpage_process_page_bufs(mpd, head, head, lblk);
++ 			if (err <= 0)
++ 				goto out;
++ 			err = 0;
++ 			left--;
+++>>>>>>> aeac589a74b9 (ext4: fix performance regression in ext4_writepages)
+  		}
+  		pagevec_release(&pvec);
+  		cond_resched();
+* Unmerged path fs/ext4/inode.c
