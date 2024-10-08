@@ -1,0 +1,99 @@
+xprtrdma: Prevent loss of completion signals
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 4220a07264c0517006a534aed201e29c8d297306
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4220a072.failed
+
+Commit 8301a2c047cc ("xprtrdma: Limit work done by completion
+handler") was supposed to prevent xprtrdma's upcall handlers from
+starving other softIRQ work by letting them return to the provider
+before all CQEs have been polled.
+
+The logic assumes the provider will call the upcall handler again
+immediately if the CQ is re-armed while there are still queued CQEs.
+
+This assumption is invalid. The IBTA spec says that after a CQ is
+armed, the hardware must interrupt only when a new CQE is inserted.
+xprtrdma can't rely on the provider calling again, even though some
+providers do.
+
+Therefore, leaving CQEs on queue makes sense only when there is
+another mechanism that ensures all remaining CQEs are consumed in a
+timely fashion. xprtrdma does not have such a mechanism. If a CQE
+remains queued, the transport can wait forever to send the next RPC.
+
+Finally, move the wcs array back onto the stack to ensure that the
+poll array is always local to the CPU where the completion upcall is
+running.
+
+Fixes: 8301a2c047cc ("xprtrdma: Limit work done by completion ...")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@avagotech.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 4220a07264c0517006a534aed201e29c8d297306)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 6115ededb593,6661b1b95758..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -739,8 -624,8 +741,13 @@@ rpcrdma_ep_create(struct rpcrdma_ep *ep
+  	INIT_DELAYED_WORK(&ep->rep_connect_worker, rpcrdma_connect_worker);
+  
+  	cq_attr.cqe = ep->rep_attr.cap.max_send_wr + 1;
+++<<<<<<< HEAD
+ +	sendcq = ib_create_cq(ia->ri_id->device, rpcrdma_sendcq_upcall,
+ +				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+++=======
++ 	sendcq = ib_create_cq(ia->ri_device, rpcrdma_sendcq_upcall,
++ 			      rpcrdma_cq_async_error_upcall, NULL, &cq_attr);
+++>>>>>>> 4220a07264c0 (xprtrdma: Prevent loss of completion signals)
+  	if (IS_ERR(sendcq)) {
+  		rc = PTR_ERR(sendcq);
+  		dprintk("RPC:       %s: failed to create send CQ: %i\n",
+@@@ -756,8 -641,8 +763,13 @@@
+  	}
+  
+  	cq_attr.cqe = ep->rep_attr.cap.max_recv_wr + 1;
+++<<<<<<< HEAD
+ +	recvcq = ib_create_cq(ia->ri_id->device, rpcrdma_recvcq_upcall,
+ +				  rpcrdma_cq_async_error_upcall, ep, &cq_attr);
+++=======
++ 	recvcq = ib_create_cq(ia->ri_device, rpcrdma_recvcq_upcall,
++ 			      rpcrdma_cq_async_error_upcall, NULL, &cq_attr);
+++>>>>>>> 4220a07264c0 (xprtrdma: Prevent loss of completion signals)
+  	if (IS_ERR(recvcq)) {
+  		rc = PTR_ERR(recvcq);
+  		dprintk("RPC:       %s: failed to create recv CQ: %i\n",
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index b2d2c86a7023..edd208b0a23b 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -78,9 +78,6 @@ struct rpcrdma_ia {
+  * RDMA Endpoint -- one per transport instance
+  */
+ 
+-#define RPCRDMA_WC_BUDGET	(128)
+-#define RPCRDMA_POLLSIZE	(16)
+-
+ struct rpcrdma_ep {
+ 	atomic_t		rep_cqcount;
+ 	int			rep_cqinit;
+@@ -91,8 +88,6 @@ struct rpcrdma_ep {
+ 	struct rdma_conn_param	rep_remote_cma;
+ 	struct sockaddr_storage	rep_remote_addr;
+ 	struct delayed_work	rep_connect_worker;
+-	struct ib_wc		rep_send_wcs[RPCRDMA_POLLSIZE];
+-	struct ib_wc		rep_recv_wcs[RPCRDMA_POLLSIZE];
+ };
+ 
+ /*
