@@ -1,0 +1,250 @@
+qlcnic: Add support to process commands in atomic context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Rajesh Borundia <rajesh.borundia@qlogic.com>
+commit 74b7ba1a8bc994f92cfe4716d80c17f90df5eba3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/74b7ba1a.failed
+
+o Commands from VF may sleep during PF-VF communication.
+  Earlier we use to process qlcnic_sriov_vf_set_multi
+  function in process context. Now individual commands
+  that are called in atomic context are processed in
+  process context without waiting for completion of
+  command.
+
+	Signed-off-by: Rajesh Borundia <rajesh.borundia@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 74b7ba1a8bc994f92cfe4716d80c17f90df5eba3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index d2a7490f797d,44cd5bd03744..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@@ -35,7 -35,12 +35,14 @@@ static void qlcnic_sriov_vf_cancel_fw_w
+  static void qlcnic_sriov_cleanup_transaction(struct qlcnic_bc_trans *);
+  static int qlcnic_sriov_issue_cmd(struct qlcnic_adapter *,
+  				  struct qlcnic_cmd_args *);
+ -static int qlcnic_sriov_channel_cfg_cmd(struct qlcnic_adapter *, u8);
+  static void qlcnic_sriov_process_bc_cmd(struct work_struct *);
+++<<<<<<< HEAD
+++=======
++ static int qlcnic_sriov_vf_shutdown(struct pci_dev *);
++ static int qlcnic_sriov_vf_resume(struct qlcnic_adapter *);
++ static int qlcnic_sriov_async_issue_cmd(struct qlcnic_adapter *,
++ 					struct qlcnic_cmd_args *);
+++>>>>>>> 74b7ba1a8bc9 (qlcnic: Add support to process commands in atomic context)
+  
+  static struct qlcnic_hardware_ops qlcnic_sriov_vf_hw_ops = {
+  	.read_crb			= qlcnic_83xx_read_crb,
+@@@ -1433,7 -1430,17 +1440,21 @@@ free_cmd
+  	return rsp;
+  }
+  
+++<<<<<<< HEAD
+ +int qlcnic_sriov_channel_cfg_cmd(struct qlcnic_adapter *adapter, u8 cmd_op)
+++=======
++ 
++ static int qlcnic_sriov_issue_cmd(struct qlcnic_adapter *adapter,
++ 				  struct qlcnic_cmd_args *cmd)
++ {
++ 	if (cmd->type == QLC_83XX_MBX_CMD_NO_WAIT)
++ 		return qlcnic_sriov_async_issue_cmd(adapter, cmd);
++ 	else
++ 		return __qlcnic_sriov_issue_cmd(adapter, cmd);
++ }
++ 
++ static int qlcnic_sriov_channel_cfg_cmd(struct qlcnic_adapter *adapter, u8 cmd_op)
+++>>>>>>> 74b7ba1a8bc9 (qlcnic: Add support to process commands in atomic context)
+  {
+  	struct qlcnic_cmd_args cmd;
+  	struct qlcnic_vf_info *vf = &adapter->ahw->sriov->vf_info[0];
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index d72671739763..feda4cbad271 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -1646,7 +1646,7 @@ int qlcnic_read_mac_addr(struct qlcnic_adapter *);
+ int qlcnic_setup_netdev(struct qlcnic_adapter *, struct net_device *, int);
+ void qlcnic_set_netdev_features(struct qlcnic_adapter *,
+ 				struct qlcnic_esw_func_cfg *);
+-void qlcnic_sriov_vf_schedule_multi(struct net_device *);
++void qlcnic_sriov_vf_set_multi(struct net_device *);
+ int qlcnic_is_valid_nic_func(struct qlcnic_adapter *, u8);
+ int qlcnic_get_pci_func_type(struct qlcnic_adapter *, u16, u16 *, u16 *,
+ 			     u16 *);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+index e6947af977a9..8d24de807a3d 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+@@ -567,28 +567,14 @@ void __qlcnic_set_multi(struct net_device *netdev, u16 vlan)
+ void qlcnic_set_multi(struct net_device *netdev)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+-	struct qlcnic_mac_vlan_list *cur;
+-	struct netdev_hw_addr *ha;
+-	size_t temp;
+ 
+ 	if (!test_bit(__QLCNIC_FW_ATTACHED, &adapter->state))
+ 		return;
+-	if (qlcnic_sriov_vf_check(adapter)) {
+-		if (!netdev_mc_empty(netdev)) {
+-			netdev_for_each_mc_addr(ha, netdev) {
+-				temp = sizeof(struct qlcnic_mac_vlan_list);
+-				cur = kzalloc(temp, GFP_ATOMIC);
+-				if (cur == NULL)
+-					break;
+-				memcpy(cur->mac_addr,
+-				       ha->addr, ETH_ALEN);
+-				list_add_tail(&cur->list, &adapter->vf_mc_list);
+-			}
+-		}
+-		qlcnic_sriov_vf_schedule_multi(adapter->netdev);
+-		return;
+-	}
+-	__qlcnic_set_multi(netdev, 0);
++
++	if (qlcnic_sriov_vf_check(adapter))
++		qlcnic_sriov_vf_set_multi(netdev);
++	else
++		__qlcnic_set_multi(netdev, 0);
+ }
+ 
+ int qlcnic_82xx_nic_set_promisc(struct qlcnic_adapter *adapter, u32 mode)
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index ccf682b59be0..61fa91baeb98 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -1723,8 +1723,6 @@ void __qlcnic_down(struct qlcnic_adapter *adapter, struct net_device *netdev)
+ 	if (!test_and_clear_bit(__QLCNIC_DEV_UP, &adapter->state))
+ 		return;
+ 
+-	if (qlcnic_sriov_vf_check(adapter))
+-		qlcnic_sriov_cleanup_async_list(&adapter->ahw->sriov->bc);
+ 	smp_mb();
+ 	netif_carrier_off(netdev);
+ 	adapter->ahw->linkup = 0;
+@@ -1736,6 +1734,8 @@ void __qlcnic_down(struct qlcnic_adapter *adapter, struct net_device *netdev)
+ 		qlcnic_delete_lb_filters(adapter);
+ 
+ 	qlcnic_nic_set_promisc(adapter, QLCNIC_NIU_NON_PROMISC_MODE);
++	if (qlcnic_sriov_vf_check(adapter))
++		qlcnic_sriov_cleanup_async_list(&adapter->ahw->sriov->bc);
+ 
+ 	qlcnic_napi_disable(adapter);
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
+index e14d58c59b01..b2f1a25a97a0 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
+@@ -151,13 +151,14 @@ struct qlcnic_vf_info {
+ 	struct qlcnic_trans_list	rcv_pend;
+ 	struct qlcnic_adapter		*adapter;
+ 	struct qlcnic_vport		*vp;
+-	struct mutex			vlan_list_lock;	/* Lock for VLAN list */
++	spinlock_t			vlan_list_lock;	/* Lock for VLAN list */
+ };
+ 
+ struct qlcnic_async_work_list {
+ 	struct list_head	list;
+ 	struct work_struct	work;
+ 	void			*ptr;
++	struct qlcnic_cmd_args	*cmd;
+ };
+ 
+ struct qlcnic_back_channel {
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index b61dbb8406ae..1cc3fc958c65 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -776,7 +776,7 @@ static int qlcnic_sriov_cfg_vf_def_mac(struct qlcnic_adapter *adapter,
+ 				       struct qlcnic_vf_info *vf,
+ 				       u16 vlan, u8 op)
+ {
+-	struct qlcnic_cmd_args cmd;
++	struct qlcnic_cmd_args *cmd;
+ 	struct qlcnic_macvlan_mbx mv;
+ 	struct qlcnic_vport *vp;
+ 	u8 *addr;
+@@ -786,21 +786,27 @@ static int qlcnic_sriov_cfg_vf_def_mac(struct qlcnic_adapter *adapter,
+ 
+ 	vp = vf->vp;
+ 
+-	if (qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_CONFIG_MAC_VLAN))
++	cmd = kzalloc(sizeof(*cmd), GFP_ATOMIC);
++	if (!cmd)
+ 		return -ENOMEM;
+ 
++	err = qlcnic_alloc_mbx_args(cmd, adapter, QLCNIC_CMD_CONFIG_MAC_VLAN);
++	if (err)
++		goto free_cmd;
++
++	cmd->type = QLC_83XX_MBX_CMD_NO_WAIT;
+ 	vpid = qlcnic_sriov_pf_get_vport_handle(adapter, vf->pci_func);
+ 	if (vpid < 0) {
+ 		err = -EINVAL;
+-		goto out;
++		goto free_args;
+ 	}
+ 
+ 	if (vlan)
+ 		op = ((op == QLCNIC_MAC_ADD || op == QLCNIC_MAC_VLAN_ADD) ?
+ 		      QLCNIC_MAC_VLAN_ADD : QLCNIC_MAC_VLAN_DEL);
+ 
+-	cmd.req.arg[1] = op | (1 << 8) | (3 << 6);
+-	cmd.req.arg[1] |= ((vpid & 0xffff) << 16) | BIT_31;
++	cmd->req.arg[1] = op | (1 << 8) | (3 << 6);
++	cmd->req.arg[1] |= ((vpid & 0xffff) << 16) | BIT_31;
+ 
+ 	addr = vp->mac;
+ 	mv.vlan = vlan;
+@@ -810,18 +816,18 @@ static int qlcnic_sriov_cfg_vf_def_mac(struct qlcnic_adapter *adapter,
+ 	mv.mac_addr3 = addr[3];
+ 	mv.mac_addr4 = addr[4];
+ 	mv.mac_addr5 = addr[5];
+-	buf = &cmd.req.arg[2];
++	buf = &cmd->req.arg[2];
+ 	memcpy(buf, &mv, sizeof(struct qlcnic_macvlan_mbx));
+ 
+-	err = qlcnic_issue_cmd(adapter, &cmd);
++	err = qlcnic_issue_cmd(adapter, cmd);
+ 
+-	if (err)
+-		dev_err(&adapter->pdev->dev,
+-			"MAC-VLAN %s to CAM failed, err=%d.\n",
+-			((op == 1) ? "add " : "delete "), err);
++	if (!err)
++		return err;
+ 
+-out:
+-	qlcnic_free_mbx_args(&cmd);
++free_args:
++	qlcnic_free_mbx_args(cmd);
++free_cmd:
++	kfree(cmd);
+ 	return err;
+ }
+ 
+@@ -843,7 +849,7 @@ static void qlcnic_83xx_cfg_default_mac_vlan(struct qlcnic_adapter *adapter,
+ 
+ 	sriov = adapter->ahw->sriov;
+ 
+-	mutex_lock(&vf->vlan_list_lock);
++	spin_lock_bh(&vf->vlan_list_lock);
+ 	if (vf->num_vlan) {
+ 		for (i = 0; i < sriov->num_allowed_vlans; i++) {
+ 			vlan = vf->sriov_vlans[i];
+@@ -852,7 +858,7 @@ static void qlcnic_83xx_cfg_default_mac_vlan(struct qlcnic_adapter *adapter,
+ 							    opcode);
+ 		}
+ 	}
+-	mutex_unlock(&vf->vlan_list_lock);
++	spin_unlock_bh(&vf->vlan_list_lock);
+ 
+ 	if (vf->vp->vlan_mode != QLC_PVID_MODE) {
+ 		if (qlcnic_83xx_pf_check(adapter) &&
