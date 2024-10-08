@@ -1,0 +1,202 @@
+xfs: don't allocate an ioend for direct I/O completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 2ba66237029d1ad6c1a5e2241b0ffbbfff55f750
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2ba66237.failed
+
+Back in the days when the direct I/O ->end_io callback could be called
+from interrupt context for AIO we needed a structure to hand off to the
+workqueue, and reused the ioend structure for this purpose.  These days
+->end_io is always called from user or workqueue context, which allows us
+to avoid this memory allocation and simplify the code significantly.
+
+[dchinner: removed now unused xfs_finish_ioend_sync() function after
+	   Brian Foster did an initial review. ]
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 2ba66237029d1ad6c1a5e2241b0ffbbfff55f750)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_aops.h
+diff --cc fs/xfs/xfs_aops.c
+index bb6024910e57,3a9b7a1b8704..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -281,8 -258,6 +266,11 @@@ xfs_alloc_ioend
+  	 * all the I/O from calling the completion routine too early.
+  	 */
+  	atomic_set(&ioend->io_remaining, 1);
+++<<<<<<< HEAD
+ +	ioend->io_isasync = 0;
+ +	ioend->io_isdirect = 0;
+++=======
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  	ioend->io_error = 0;
+  	ioend->io_list = NULL;
+  	ioend->io_type = type;
+@@@ -1479,49 -1450,47 +1463,82 @@@ xfs_end_io_direct_write
+  	struct kiocb		*iocb,
+  	loff_t			offset,
+  	ssize_t			size,
+ -	void			*private)
+ +	void			*private,
+ +	int			ret,
+ +	bool			is_async)
+  {
+++<<<<<<< HEAD
+ +	struct xfs_ioend	*ioend = iocb->private;
+ +	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+ +	unsigned long		flags;
+++=======
++ 	struct inode		*inode = file_inode(iocb->ki_filp);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return;
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  
+  	/*
+  	 * While the generic direct I/O code updates the inode size, it does
+  	 * so only after the end_io handler is called, which means our
+  	 * end_io handler thinks the on-disk size is outside the in-core
+  	 * size.  To prevent this just update it a little bit earlier here.
+ +	 *
+ +	 * We need to lock the test/set EOF update as we can be racing with
+ +	 * other IO completions here to update the EOF. Failing to serialise
+ +	 * here can result in EOF moving backwards and Bad Things Happen when
+ +	 * that occurs.
+  	 */
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ip->i_size_lock, flags);
+ +	if (offset + size > i_size_read(ioend->io_inode))
+ +		i_size_write(ioend->io_inode, offset + size);
+ +	spin_unlock_irqrestore(&ip->i_size_lock, flags);
+++=======
++ 	if (offset + size > i_size_read(inode))
++ 		i_size_write(inode, offset + size);
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  
+  	/*
+- 	 * blockdev_direct_IO can return an error even after the I/O
+- 	 * completion handler was called.  Thus we need to protect
+- 	 * against double-freeing.
++ 	 * For direct I/O we do not know if we need to allocate blocks or not,
++ 	 * so we can't preallocate an append transaction, as that results in
++ 	 * nested reservations and log space deadlocks. Hence allocate the
++ 	 * transaction here. While this is sub-optimal and can block IO
++ 	 * completion for some time, we're stuck with doing it this way until
++ 	 * we can pass the ioend to the direct IO allocation callbacks and
++ 	 * avoid nesting that way.
+  	 */
+- 	iocb->private = NULL;
++ 	if (private && size > 0) {
++ 		xfs_iomap_write_unwritten(ip, offset, size);
++ 	} else if (offset + size > ip->i_d.di_size) {
++ 		struct xfs_trans	*tp;
++ 		int			error;
+  
+++<<<<<<< HEAD
+ +	ioend->io_offset = offset;
+ +	ioend->io_size = size;
+ +	ioend->io_iocb = iocb;
+ +	ioend->io_result = ret;
+ +	if (private && size > 0)
+ +		ioend->io_type = XFS_IO_UNWRITTEN;
+ +
+ +	if (is_async) {
+ +		ioend->io_isasync = 1;
+ +		xfs_finish_ioend(ioend);
+ +	} else {
+ +		xfs_finish_ioend_sync(ioend);
+++=======
++ 		tp = xfs_trans_alloc(mp, XFS_TRANS_FSYNC_TS);
++ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_fsyncts, 0, 0);
++ 		if (error) {
++ 			xfs_trans_cancel(tp, 0);
++ 			return;
++ 		}
++ 
++ 		xfs_setfilesize(ip, tp, offset, size);
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  	}
+  }
+  
+@@@ -1535,41 -1503,16 +1552,43 @@@ xfs_vm_direct_IO
+  {
+  	struct inode		*inode = iocb->ki_filp->f_mapping->host;
+  	struct block_device	*bdev = xfs_find_bdev_for_inode(inode);
+- 	struct xfs_ioend	*ioend = NULL;
+- 	ssize_t			ret;
+  
+  	if (rw & WRITE) {
+++<<<<<<< HEAD
+ +		size_t size = iov_length(iov, nr_segs);
+ +
+ +		/*
+ +		 * We cannot preallocate a size update transaction here as we
+ +		 * don't know whether allocation is necessary or not. Hence we
+ +		 * can only tell IO completion that one is necessary if we are
+ +		 * not doing unwritten extent conversion.
+ +		 */
+ +		iocb->private = ioend = xfs_alloc_ioend(inode, XFS_IO_DIRECT);
+ +		if (offset + size > XFS_I(inode)->i_d.di_size)
+ +			ioend->io_isdirect = 1;
+ +
+ +		ret = __blockdev_direct_IO(rw, iocb, inode, bdev, iov,
+ +					    offset, nr_segs,
+ +					    xfs_get_blocks_direct,
+ +					    xfs_end_io_direct_write, NULL,
+ +					    DIO_ASYNC_EXTEND);
+ +		if (ret != -EIOCBQUEUED && iocb->private)
+ +			goto out_destroy_ioend;
+ +	} else {
+ +		ret = __blockdev_direct_IO(rw, iocb, inode, bdev, iov,
+ +					    offset, nr_segs,
+ +					    xfs_get_blocks_direct,
+ +					    NULL, NULL, 0);
+++=======
++ 		return __blockdev_direct_IO(rw, iocb, inode, bdev, iter,
++ 					    offset, xfs_get_blocks_direct,
++ 					    xfs_end_io_direct_write, NULL,
++ 					    DIO_ASYNC_EXTEND);
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  	}
+- 
+- 	return ret;
+- 
+- out_destroy_ioend:
+- 	xfs_destroy_ioend(ioend);
+- 	return ret;
++ 	return __blockdev_direct_IO(rw, iocb, inode, bdev, iter,
++ 				    offset, xfs_get_blocks_direct,
++ 				    NULL, NULL, 0);
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_aops.h
+index c325abb8d61a,ac644e0137a4..000000000000
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@@ -45,8 -43,6 +43,11 @@@ typedef struct xfs_ioend 
+  	unsigned int		io_type;	/* delalloc / unwritten */
+  	int			io_error;	/* I/O error code */
+  	atomic_t		io_remaining;	/* hold count */
+++<<<<<<< HEAD
+ +	unsigned int		io_isasync : 1;	/* needs aio_complete */
+ +	unsigned int		io_isdirect : 1;/* direct I/O */
+++=======
+++>>>>>>> 2ba66237029d (xfs: don't allocate an ioend for direct I/O completions)
+  	struct inode		*io_inode;	/* file being written to */
+  	struct buffer_head	*io_buffer_head;/* buffer linked list head */
+  	struct buffer_head	*io_buffer_tail;/* buffer linked list tail */
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_aops.h
