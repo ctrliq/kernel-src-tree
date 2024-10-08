@@ -1,0 +1,142 @@
+IB/srp: Fix srp_create_target() error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit f83b2561a6d4ff12959660ad597580097b744941
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f83b2561.failed
+
+Avoid that the following kernel oops occurs if memory pool
+allocation fails:
+
+BUG: unable to handle kernel NULL pointer dereference at (null)
+IP: [<ffffffffa048d0a0>] ib_drain_rq+0x0/0x20 [ib_core]
+Call Trace:
+ [<ffffffffa04af386>] srp_create_target+0xca6/0x13a9 [ib_srp]
+ [<ffffffff813cc863>] dev_attr_store+0x13/0x20
+ [<ffffffff81214b50>] sysfs_kf_write+0x40/0x50
+ [<ffffffff81213f1c>] kernfs_fop_write+0x13c/0x180
+ [<ffffffff81197683>] __vfs_write+0x23/0xf0
+ [<ffffffff81198744>] vfs_write+0xa4/0x1a0
+ [<ffffffff81199a44>] SyS_write+0x44/0xa0
+ [<ffffffff8159e3e9>] entry_SYSCALL_64_fastpath+0x1c/0xac
+
+Fixes: 1dc7b1f10dcb ("IB/srp: use the new CQ API")
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Tested-by: Laurence Oberman <loberman@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: <stable@vger.kernel.org> # v4.5+
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f83b2561a6d4ff12959660ad597580097b744941)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srp/ib_srp.c
+diff --cc drivers/infiniband/ulp/srp/ib_srp.c
+index eb57f69536ed,6b9c5688e26a..000000000000
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@@ -455,37 -447,16 +455,42 @@@ static struct srp_fr_pool *srp_alloc_fr
+  
+  /**
+   * srp_destroy_qp() - destroy an RDMA queue pair
+-  * @ch: SRP RDMA channel.
++  * @qp: RDMA queue pair.
+   *
+ - * Drain the qp before destroying it.  This avoids that the receive
+ - * completion handler can access the queue pair while it is
+ + * Change a queue pair into the error state and wait until all receive
+ + * completions have been processed before destroying it. This avoids that
+ + * the receive completion handler can access the queue pair while it is
+   * being destroyed.
+   */
+- static void srp_destroy_qp(struct srp_rdma_ch *ch)
++ static void srp_destroy_qp(struct ib_qp *qp)
+  {
+++<<<<<<< HEAD
+ +	static struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+ +	static struct ib_recv_wr wr = { 0 };
+ +	struct ib_recv_wr *bad_wr;
+ +	int ret;
+ +
+ +	wr.wr_id = SRP_LAST_WR_ID;
+ +	/* Destroying a QP and reusing ch->done is only safe if not connected */
+ +	WARN_ON_ONCE(ch->connected);
+ +
+ +	ret = ib_modify_qp(ch->qp, &attr, IB_QP_STATE);
+ +	WARN_ONCE(ret, "ib_cm_init_qp_attr() returned %d\n", ret);
+ +	if (ret)
+ +		goto out;
+ +
+ +	init_completion(&ch->done);
+ +	ret = ib_post_recv(ch->qp, &wr, &bad_wr);
+ +	WARN_ONCE(ret, "ib_post_recv() returned %d\n", ret);
+ +	if (ret == 0)
+ +		wait_for_completion(&ch->done);
+ +
+ +out:
+ +	ib_destroy_qp(ch->qp);
+++=======
++ 	ib_drain_rq(qp);
++ 	ib_destroy_qp(qp);
+++>>>>>>> f83b2561a6d4 (IB/srp: Fix srp_create_target() error handling)
+  }
+  
+  static int srp_create_ch_ib(struct srp_rdma_ch *ch)
+@@@ -565,11 -529,11 +570,11 @@@
+  	}
+  
+  	if (ch->qp)
+- 		srp_destroy_qp(ch);
++ 		srp_destroy_qp(ch->qp);
+  	if (ch->recv_cq)
+ -		ib_free_cq(ch->recv_cq);
+ +		ib_destroy_cq(ch->recv_cq);
+  	if (ch->send_cq)
+ -		ib_free_cq(ch->send_cq);
+ +		ib_destroy_cq(ch->send_cq);
+  
+  	ch->qp = qp;
+  	ch->recv_cq = recv_cq;
+@@@ -589,13 -553,13 +594,17 @@@
+  	return 0;
+  
+  err_qp:
+++<<<<<<< HEAD
+ +	ib_destroy_qp(qp);
+++=======
++ 	srp_destroy_qp(qp);
+++>>>>>>> f83b2561a6d4 (IB/srp: Fix srp_create_target() error handling)
+  
+  err_send_cq:
+ -	ib_free_cq(send_cq);
+ +	ib_destroy_cq(send_cq);
+  
+  err_recv_cq:
+ -	ib_free_cq(recv_cq);
+ +	ib_destroy_cq(recv_cq);
+  
+  err:
+  	kfree(init_attr);
+@@@ -631,9 -595,10 +640,16 @@@ static void srp_free_ch_ib(struct srp_t
+  		if (ch->fmr_pool)
+  			ib_destroy_fmr_pool(ch->fmr_pool);
+  	}
+++<<<<<<< HEAD
+ +	srp_destroy_qp(ch);
+ +	ib_destroy_cq(ch->send_cq);
+ +	ib_destroy_cq(ch->recv_cq);
+++=======
++ 
++ 	srp_destroy_qp(ch->qp);
++ 	ib_free_cq(ch->send_cq);
++ 	ib_free_cq(ch->recv_cq);
+++>>>>>>> f83b2561a6d4 (IB/srp: Fix srp_create_target() error handling)
+  
+  	/*
+  	 * Avoid that the SCSI error handler tries to use this channel after
+* Unmerged path drivers/infiniband/ulp/srp/ib_srp.c
