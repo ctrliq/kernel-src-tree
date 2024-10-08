@@ -1,0 +1,198 @@
+blk-mq: blk_mq_tag_to_rq should handle flush request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shaohua Li <shli@kernel.org>
+commit 2230237500821aedfcf2bba2a79d9cbca389233c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/22302375.failed
+
+flush request is special, which borrows the tag from the parent
+request. Hence blk_mq_tag_to_rq needs special handling to return
+the flush request from the tag.
+
+	Signed-off-by: Shaohua Li <shli@fusionio.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 2230237500821aedfcf2bba2a79d9cbca389233c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 210626be5c6c,21f952ab3581..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -412,6 -473,86 +412,89 @@@ static void blk_mq_requeue_request(stru
+  		rq->nr_phys_segments--;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_requeue_request(struct request *rq)
++ {
++ 	__blk_mq_requeue_request(rq);
++ 	blk_clear_rq_complete(rq);
++ 
++ 	BUG_ON(blk_queued_rq(rq));
++ 	blk_mq_add_to_requeue_list(rq, true);
++ }
++ EXPORT_SYMBOL(blk_mq_requeue_request);
++ 
++ static void blk_mq_requeue_work(struct work_struct *work)
++ {
++ 	struct request_queue *q =
++ 		container_of(work, struct request_queue, requeue_work);
++ 	LIST_HEAD(rq_list);
++ 	struct request *rq, *next;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	list_splice_init(&q->requeue_list, &rq_list);
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ 
++ 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
++ 		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
++ 			continue;
++ 
++ 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, true, false, false);
++ 	}
++ 
++ 	while (!list_empty(&rq_list)) {
++ 		rq = list_entry(rq_list.next, struct request, queuelist);
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, false, false, false);
++ 	}
++ 
++ 	blk_mq_run_queues(q, false);
++ }
++ 
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
++ {
++ 	struct request_queue *q = rq->q;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We abuse this flag that is otherwise used by the I/O scheduler to
++ 	 * request head insertation from the workqueue.
++ 	 */
++ 	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	if (at_head) {
++ 		rq->cmd_flags |= REQ_SOFTBARRIER;
++ 		list_add(&rq->queuelist, &q->requeue_list);
++ 	} else {
++ 		list_add_tail(&rq->queuelist, &q->requeue_list);
++ 	}
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ }
++ EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
++ 
++ void blk_mq_kick_requeue_list(struct request_queue *q)
++ {
++ 	kblockd_schedule_work(&q->requeue_work);
++ }
++ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
++ 
++ struct request *blk_mq_tag_to_rq(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 
++ 	if ((q->flush_rq->cmd_flags & REQ_FLUSH_SEQ) &&
++ 	    q->flush_rq->tag == tag)
++ 		return q->flush_rq;
++ 
++ 	return hctx->tags->rqs[tag];
++ }
++ EXPORT_SYMBOL(blk_mq_tag_to_rq);
++ 
+++>>>>>>> 223023750082 (blk-mq: blk_mq_tag_to_rq should handle flush request)
+  struct blk_mq_timeout_data {
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned long *next;
+@@@ -433,12 -574,13 +516,18 @@@ static void blk_mq_timeout_check(void *
+  	do {
+  		struct request *rq;
+  
+ -		tag = find_next_zero_bit(free_tags, hctx->tags->nr_tags, tag);
+ -		if (tag >= hctx->tags->nr_tags)
+ +		tag = find_next_zero_bit(free_tags, hctx->queue_depth, tag);
+ +		if (tag >= hctx->queue_depth)
+  			break;
+  
+++<<<<<<< HEAD
+ +		rq = hctx->rqs[tag++];
+ +
+++=======
++ 		rq = blk_mq_tag_to_rq(hctx, tag++);
++ 		if (rq->q != hctx->queue)
++ 			continue;
+++>>>>>>> 223023750082 (blk-mq: blk_mq_tag_to_rq should handle flush request)
+  		if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+  			continue;
+  
+diff --cc include/linux/blk-mq.h
+index 0f2259d5e784,ad3adb73cc70..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -125,26 -152,19 +125,32 @@@ void blk_mq_insert_request(struct reque
+  void blk_mq_run_queues(struct request_queue *q, bool async);
+  void blk_mq_free_request(struct request *rq);
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+++<<<<<<< HEAD
+ +struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+++=======
++ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
++ 		gfp_t gfp, bool reserved);
++ struct request *blk_mq_tag_to_rq(struct blk_mq_hw_ctx *hctx, unsigned int tag);
+++>>>>>>> 223023750082 (blk-mq: blk_mq_tag_to_rq should handle flush request)
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ -struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+ -void blk_mq_requeue_request(struct request *rq);
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
+ -void blk_mq_kick_requeue_list(struct request_queue *q);
+ +/*
+ + * Complete request through potential IPI for right placement. Driver must
+ + * have defined a mq_ops->complete() hook for this.
+ + */
+  void blk_mq_complete_request(struct request *rq);
+  
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 1c9013bca5a0..b86ccaa8958e 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -231,8 +231,10 @@ static void flush_end_io(struct request *flush_rq, int error)
+ 	struct request *rq, *n;
+ 	unsigned long flags = 0;
+ 
+-	if (q->mq_ops)
++	if (q->mq_ops) {
+ 		spin_lock_irqsave(&q->mq_flush_lock, flags);
++		q->flush_rq->cmd_flags = 0;
++	}
+ 
+ 	running = &q->flush_queue[q->flush_running_idx];
+ 	BUG_ON(q->flush_pending_idx == q->flush_running_idx);
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
