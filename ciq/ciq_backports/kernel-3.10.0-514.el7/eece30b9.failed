@@ -1,0 +1,230 @@
+Drivers: hv: balloon: replace ha_region_mutex with spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] balloon: replace ha_region_mutex with spinlock (Vitaly Kuznetsov) [1361245]
+Rebuild_FUZZ: 87.62%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit eece30b9f0046cee810a2c7caa2247f3f8dc85e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/eece30b9.failed
+
+lockdep reports possible circular locking dependency when udev is used
+for memory onlining:
+
+ systemd-udevd/3996 is trying to acquire lock:
+  ((memory_chain).rwsem){++++.+}, at: [<ffffffff810d137e>] __blocking_notifier_call_chain+0x4e/0xc0
+
+ but task is already holding lock:
+  (&dm_device.ha_region_mutex){+.+.+.}, at: [<ffffffffa015382e>] hv_memory_notifier+0x5e/0xc0 [hv_balloon]
+ ...
+
+which is probably a false positive because we take and release
+ha_region_mutex from memory notifier chain depending on the arg. No real
+deadlocks were reported so far (though I'm not really sure about
+preemptible kernels...) but we don't really need to hold the mutex
+for so long. We use it to protect ha_region_list (and its members) and the
+num_pages_onlined counter. None of these operations require us to sleep
+and nothing is slow, switch to using spinlock with interrupts disabled.
+
+While on it, replace list_for_each -> list_for_each_entry as we actually
+need entries in all these cases, drop meaningless list_empty() checks.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit eece30b9f0046cee810a2c7caa2247f3f8dc85e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv_balloon.c
+diff --cc drivers/hv/hv_balloon.c
+index 42c82e4ffb07,d55e0e7650bf..000000000000
+--- a/drivers/hv/hv_balloon.c
++++ b/drivers/hv/hv_balloon.c
+@@@ -681,44 -724,61 +685,73 @@@ static void hv_online_page(struct page 
+  	struct hv_hotadd_state *has;
+  	unsigned long cur_start_pgp;
+  	unsigned long cur_end_pgp;
++ 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	list_for_each(cur, &dm_device.ha_region_list) {
+ +		has = list_entry(cur, struct hv_hotadd_state, list);
+ +		cur_start_pgp = (unsigned long)pfn_to_page(has->start_pfn);
+ +		cur_end_pgp = (unsigned long)pfn_to_page(has->covered_end_pfn);
+++=======
++ 	spin_lock_irqsave(&dm_device.ha_lock, flags);
++ 	list_for_each_entry(has, &dm_device.ha_region_list, list) {
++ 		cur_start_pgp = (unsigned long)
++ 			pfn_to_page(has->start_pfn);
++ 		cur_end_pgp = (unsigned long)pfn_to_page(has->end_pfn);
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  
+ -		/* The page belongs to a different HAS. */
+ -		if (((unsigned long)pg < cur_start_pgp) ||
+ -		    ((unsigned long)pg >= cur_end_pgp))
+ -			continue;
+ -
+ -		hv_page_online_one(has, pg);
+ -		break;
+ +		if (((unsigned long)pg >= cur_start_pgp) &&
+ +			((unsigned long)pg < cur_end_pgp)) {
+ +			/*
+ +			 * This frame is currently backed; online the
+ +			 * page.
+ +			 */
+ +			__online_page_set_limits(pg);
+ +			__online_page_increment_counters(pg);
+ +			__online_page_free(pg);
+ +		}
+  	}
++ 	spin_unlock_irqrestore(&dm_device.ha_lock, flags);
+  }
+  
+ -static int pfn_covered(unsigned long start_pfn, unsigned long pfn_cnt)
+ +static bool pfn_covered(unsigned long start_pfn, unsigned long pfn_cnt)
+  {
+- 	struct list_head *cur;
+  	struct hv_hotadd_state *has;
+ -	struct hv_hotadd_gap *gap;
+  	unsigned long residual, new_inc;
++ 	int ret = 0;
++ 	unsigned long flags;
+  
+- 	if (list_empty(&dm_device.ha_region_list))
+- 		return false;
+- 
+- 	list_for_each(cur, &dm_device.ha_region_list) {
+- 		has = list_entry(cur, struct hv_hotadd_state, list);
+- 
++ 	spin_lock_irqsave(&dm_device.ha_lock, flags);
++ 	list_for_each_entry(has, &dm_device.ha_region_list, list) {
+  		/*
+  		 * If the pfn range we are dealing with is not in the current
+  		 * "hot add block", move on.
+  		 */
+  		if (start_pfn < has->start_pfn || start_pfn >= has->end_pfn)
+  			continue;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * If the current start pfn is not where the covered_end
++ 		 * is, create a gap and update covered_end_pfn.
++ 		 */
++ 		if (has->covered_end_pfn != start_pfn) {
++ 			gap = kzalloc(sizeof(struct hv_hotadd_gap), GFP_ATOMIC);
++ 			if (!gap) {
++ 				ret = -ENOMEM;
++ 				break;
++ 			}
++ 
++ 			INIT_LIST_HEAD(&gap->list);
++ 			gap->start_pfn = has->covered_end_pfn;
++ 			gap->end_pfn = start_pfn;
++ 			list_add_tail(&gap->list, &has->gap_list);
++ 
++ 			has->covered_end_pfn = start_pfn;
++ 		}
++ 
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  		/*
+  		 * If the current hot add-request extends beyond
+  		 * our current limit; extend it.
+@@@ -735,19 -795,12 +768,29 @@@
+  			has->end_pfn += new_inc;
+  		}
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If the current start pfn is not where the covered_end
+ +		 * is, update it.
+ +		 */
+ +
+ +		if (has->covered_end_pfn != start_pfn)
+ +			has->covered_end_pfn = start_pfn;
+ +
+ +		return true;
+ +
+++=======
++ 		ret = 1;
++ 		break;
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  	}
++ 	spin_unlock_irqrestore(&dm_device.ha_lock, flags);
+  
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	return ret;
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  }
+  
+  static unsigned long handle_pg_range(unsigned long pg_start,
+@@@ -835,6 -887,8 +877,11 @@@ static unsigned long process_hot_add(un
+  					unsigned long rg_size)
+  {
+  	struct hv_hotadd_state *ha_region = NULL;
+++<<<<<<< HEAD
+++=======
++ 	int covered;
++ 	unsigned long flags;
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  
+  	if (pfn_cnt == 0)
+  		return 0;
+@@@ -853,12 -912,17 +900,15 @@@
+  			return 0;
+  
+  		INIT_LIST_HEAD(&ha_region->list);
+ -		INIT_LIST_HEAD(&ha_region->gap_list);
+  
+- 		list_add_tail(&ha_region->list, &dm_device.ha_region_list);
+  		ha_region->start_pfn = rg_start;
+  		ha_region->ha_end_pfn = rg_start;
+ -		ha_region->covered_start_pfn = pg_start;
+  		ha_region->covered_end_pfn = pg_start;
+  		ha_region->end_pfn = rg_start + rg_size;
++ 
++ 		spin_lock_irqsave(&dm_device.ha_lock, flags);
++ 		list_add_tail(&ha_region->list, &dm_device.ha_region_list);
++ 		spin_unlock_irqrestore(&dm_device.ha_lock, flags);
+  	}
+  
+  do_pg_range:
+@@@ -1582,8 -1645,9 +1630,14 @@@ probe_error0
+  static int balloon_remove(struct hv_device *dev)
+  {
+  	struct hv_dynmem_device *dm = hv_get_drvdata(dev);
+++<<<<<<< HEAD
+ +	struct list_head *cur, *tmp;
+ +	struct hv_hotadd_state *has;
+++=======
++ 	struct hv_hotadd_state *has, *tmp;
++ 	struct hv_hotadd_gap *gap, *tmp_gap;
++ 	unsigned long flags;
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  
+  	if (dm->num_pages_ballooned != 0)
+  		pr_warn("Ballooned pages: %d\n", dm->num_pages_ballooned);
+@@@ -1598,8 -1662,12 +1652,17 @@@
+  	restore_online_page_callback(&hv_online_page);
+  	unregister_memory_notifier(&hv_memory_nb);
+  #endif
+++<<<<<<< HEAD
+ +	list_for_each_safe(cur, tmp, &dm->ha_region_list) {
+ +		has = list_entry(cur, struct hv_hotadd_state, list);
+++=======
++ 	spin_lock_irqsave(&dm_device.ha_lock, flags);
++ 	list_for_each_entry_safe(has, tmp, &dm->ha_region_list, list) {
++ 		list_for_each_entry_safe(gap, tmp_gap, &has->gap_list, list) {
++ 			list_del(&gap->list);
++ 			kfree(gap);
++ 		}
+++>>>>>>> eece30b9f004 (Drivers: hv: balloon: replace ha_region_mutex with spinlock)
+  		list_del(&has->list);
+  		kfree(has);
+  	}
+* Unmerged path drivers/hv/hv_balloon.c
