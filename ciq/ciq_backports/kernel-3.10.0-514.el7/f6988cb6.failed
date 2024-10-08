@@ -1,0 +1,77 @@
+team: don't call netdev_change_features under team->lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit f6988cb63a4e698d8a62a1d085d263d1fcc351ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f6988cb6.failed
+
+The team_device_event() notifier calls team_compute_features() to fix
+vlan_features under team->lock to protect team->port_list. The problem is
+that subsequent __team_compute_features() calls netdev_change_features()
+to propagate vlan_features to upper vlan devices while team->lock is still
+taken. This can lead to deadlock when NETIF_F_LRO is modified on lower
+devices or team device itself.
+
+Example:
+The team0 as active backup with eth0 and eth1 NICs. Both eth0 & eth1 are
+LRO capable and LRO is enabled. Thus LRO is also enabled on team0.
+
+The command 'ethtool -K team0 lro off' now hangs due to this deadlock:
+
+dev_ethtool()
+-> ethtool_set_features()
+ -> __netdev_update_features(team)
+  -> netdev_sync_lower_features()
+   -> netdev_update_features(lower_1)
+    -> __netdev_update_features(lower_1)
+    -> netdev_features_change(lower_1)
+     -> call_netdevice_notifiers(...)
+      -> team_device_event(lower_1)
+       -> team_compute_features(team) [TAKES team->lock]
+        -> netdev_change_features(team)
+         -> __netdev_update_features(team)
+          -> netdev_sync_lower_features()
+           -> netdev_update_features(lower_2)
+            -> __netdev_update_features(lower_2)
+            -> netdev_features_change(lower_2)
+             -> call_netdevice_notifiers(...)
+              -> team_device_event(lower_2)
+               -> team_compute_features(team) [DEADLOCK]
+
+The bug is present in team from the beginning but it appeared after the commit
+fd867d5 (net/core: generic support for disabling netdev features down stack)
+that adds synchronization of features with lower devices.
+
+Fixes: fd867d5 (net/core: generic support for disabling netdev features down stack)
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f6988cb63a4e698d8a62a1d085d263d1fcc351ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/team/team.c
+diff --cc drivers/net/team/team.c
+index f7cd90a41375,2ace126533cd..000000000000
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@@ -970,7 -987,10 +970,14 @@@ static void team_port_disable(struct te
+  			    NETIF_F_FRAGLIST | NETIF_F_ALL_TSO | \
+  			    NETIF_F_HIGHDMA | NETIF_F_LRO)
+  
+++<<<<<<< HEAD
+ +static void __team_compute_features(struct team *team)
+++=======
++ #define TEAM_ENC_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
++ 				 NETIF_F_RXCSUM | NETIF_F_ALL_TSO)
++ 
++ static void ___team_compute_features(struct team *team)
+++>>>>>>> f6988cb63a4e (team: don't call netdev_change_features under team->lock)
+  {
+  	struct team_port *port;
+  	u32 vlan_features = TEAM_VLAN_FEATURES & NETIF_F_ALL_FOR_ALL;
+* Unmerged path drivers/net/team/team.c
