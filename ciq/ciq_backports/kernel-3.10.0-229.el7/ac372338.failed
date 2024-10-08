@@ -1,0 +1,187 @@
+ACPI / hotplug / PCI: Refactor slot allocation code in register_slot()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Refactor slot allocation code in register_slot() (Myron Stowe) [1114228]
+Rebuild_FUZZ: 93.13%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit ac372338b750648355bcc64bb0bca13fc6f0a3d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ac372338.failed
+
+To make the code in register_slot() a bit easier to follow, change
+the way the slot allocation part is organized.  Drop one local
+variable that's not used any more after that modification.
+
+This code change should not lead to any changes in behavior.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit ac372338b750648355bcc64bb0bca13fc6f0a3d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index b5069ad47c47,95af39c9a396..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -195,16 -274,16 +195,16 @@@ static void acpiphp_dock_release(void *
+  }
+  
+  /* callback routine to register each ACPI PCI slot object */
+ -static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+ -				 void **rv)
+ +static acpi_status
+ +register_slot(acpi_handle handle, u32 lvl, void *context, void **rv)
+  {
+ -	struct acpiphp_bridge *bridge = data;
+ -	struct acpiphp_context *context;
+ +	struct acpiphp_bridge *bridge = (struct acpiphp_bridge *)context;
+  	struct acpiphp_slot *slot;
+  	struct acpiphp_func *newfunc;
+ +	acpi_handle tmp;
+  	acpi_status status = AE_OK;
+  	unsigned long long adr, sun;
+- 	int device, function, retval, found = 0;
++ 	int device, function, retval;
+  	struct pci_bus *pbus = bridge->pci_bus;
+  	struct pci_dev *pdev;
+  	u32 val;
+@@@ -260,43 -351,50 +260,88 @@@
+  	list_for_each_entry(slot, &bridge->slots, node)
+  		if (slot->device == device) {
+  			if (slot->sun != sun)
+++<<<<<<< HEAD
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+ +
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+ +
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+ +
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+ +		bridge->nr_slots++;
+ +
+ +		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+ +		if (retval) {
+ +			if (retval == -EBUSY)
+ +				pr_warn("Slot %llu already registered by another "
+ +					"hotplug driver\n", slot->sun);
+ +			else
+ +				pr_warn("acpiphp_register_hotplug_slot failed "
+ +					"(err code = 0x%x)\n", retval);
+ +			goto err_exit;
+ +		}
+++=======
++ 				warn("sibling found, but _SUN doesn't match!\n");
++ 
++ 			goto slot_found;
++ 		}
++ 
++ 	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
++ 	if (!slot) {
++ 		status = AE_NO_MEMORY;
++ 		goto err;
+++>>>>>>> ac372338b750 (ACPI / hotplug / PCI: Refactor slot allocation code in register_slot())
++ 	}
++ 
++ 	slot->bridge = bridge;
++ 	slot->device = device;
++ 	slot->sun = sun;
++ 	INIT_LIST_HEAD(&slot->funcs);
++ 	mutex_init(&slot->crit_sect);
++ 
++ 	mutex_lock(&bridge_mutex);
++ 	list_add_tail(&slot->node, &bridge->slots);
++ 	mutex_unlock(&bridge_mutex);
++ 	bridge->nr_slots++;
++ 
++ 	dbg("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
++ 	    slot->sun, pci_domain_nr(pbus), pbus->number, device);
++ 
++ 	retval = acpiphp_register_hotplug_slot(slot);
++ 	if (retval) {
++ 		if (retval == -EBUSY)
++ 			warn("Slot %llu already registered by another "
++ 				"hotplug driver\n", slot->sun);
++ 		else
++ 			warn("acpiphp_register_hotplug_slot failed "
++ 				"(err code = 0x%x)\n", retval);
++ 
++ 		bridge->nr_slots--;
++ 		mutex_lock(&bridge_mutex);
++ 		list_del(&slot->node);
++ 		mutex_unlock(&bridge_mutex);
++ 		kfree(slot);
++ 		status = AE_OK;
++ 		goto err;
+  	}
+  
++  slot_found:
+  	newfunc->slot = slot;
+  	mutex_lock(&bridge_mutex);
+  	list_add_tail(&newfunc->sibling, &slot->funcs);
+@@@ -328,27 -418,24 +373,35 @@@
+  
+  	/* install notify handler */
+  	if (!(newfunc->flags & FUNC_HAS_DCK)) {
+ -		status = acpi_install_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+ -						     handle_hotplug_event,
+ -						     context);
+ -		if (ACPI_SUCCESS(status))
+ -			context->handler_for_func = true;
+ -		else
+ -			err("failed to register interrupt notify handler\n");
+ -	}
+ +		status = acpi_install_notify_handler(handle,
+ +					     ACPI_SYSTEM_NOTIFY,
+ +					     handle_hotplug_event_func,
+ +					     newfunc);
+  
+ -	return AE_OK;
+ +		if (ACPI_FAILURE(status))
+ +			pr_err("failed to register interrupt notify handler\n");
+ +	} else
+ +		status = AE_OK;
+  
+++<<<<<<< HEAD
+ +	return status;
+ +
+ + err_exit:
+ +	bridge->nr_slots--;
+ +	mutex_lock(&bridge_mutex);
+ +	list_del(&slot->node);
+ +	mutex_unlock(&bridge_mutex);
+ +	kfree(slot);
+++=======
++  err:
++ 	mutex_lock(&acpiphp_context_lock);
++ 	context->func = NULL;
++ 	acpiphp_put_context(context);
++ 	mutex_unlock(&acpiphp_context_lock);
+++>>>>>>> ac372338b750 (ACPI / hotplug / PCI: Refactor slot allocation code in register_slot())
+  	kfree(newfunc);
+ -	return status;
+ +
+ +	return AE_OK;
+  }
+  
+  
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
