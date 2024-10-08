@@ -1,0 +1,209 @@
+drm/i915: Enable polling when we don't have hpd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915: Enable polling when we don't have hpd (Lyude Paul) [1277863]
+Rebuild_FUZZ: 95.56%
+commit-author Lyude <cpaul@redhat.com>
+commit 19625e85c6ec56038368aa72c44f5f55b221f0fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/19625e85.failed
+
+Unfortunately, there's two situations where we lose hpd right now:
+- Runtime suspend
+- When we've shut off all of the power wells on Valleyview/Cherryview
+
+While it would be nice if this didn't cause issues, this has the
+ability to get us in some awkward states where a user won't be able to
+get their display to turn on. For instance; if we boot a Valleyview
+system without any monitors connected, it won't need any of it's power
+wells and thus shut them off. Since this causes us to lose HPD, this
+means that unless the user knows how to ssh into their machine and do a
+manual reprobe for monitors, none of the monitors they connect after
+booting will actually work.
+
+Eventually we should come up with a better fix then having to enable
+polling for this, since this makes rpm a lot less useful, but for now
+the infrastructure in i915 just isn't there yet to get hpd in these
+situations.
+
+Changes since v1:
+ - Add comment explaining the addition of the if
+   (!mode_config->poll_running) in intel_hpd_init()
+ - Remove unneeded if (!dev->mode_config.poll_enabled) in
+   i915_hpd_poll_init_work()
+ - Call to drm_helper_hpd_irq_event() after we disable polling
+ - Add cancel_work_sync() call to intel_hpd_cancel_work()
+
+Changes since v2:
+ - Apparently dev->mode_config.poll_running doesn't actually reflect
+   whether or not a poll is currently in progress, and is actually used
+   for dynamic module paramter enabling/disabling. So now we instead
+   keep track of our own poll_running variable in dev_priv->hotplug
+ - Clean i915_hpd_poll_init_work() a little bit
+
+Changes since v3:
+ - Remove the now-redundant connector loop in intel_hpd_init(), just
+   rely on intel_hpd_poll_enable() for setting connector->polled
+   correctly on each connector
+ - Get rid of poll_running
+ - Don't assign enabled in i915_hpd_poll_init_work before we actually
+   lock dev->mode_config.mutex
+ - Wrap enabled assignment in i915_hpd_poll_init_work() in READ_ONCE()
+   for doc purposes
+ - Do the same for dev_priv->hotplug.poll_enabled with WRITE_ONCE in
+   intel_hpd_poll_enable()
+ - Add some comments about racing not mattering in intel_hpd_poll_enable
+
+Changes since v4:
+ - Rename intel_hpd_poll_enable() to intel_hpd_poll_init()
+ - Drop the bool argument from intel_hpd_poll_init()
+ - Remove redundant calls to intel_hpd_poll_init()
+ - Rename poll_enable_work to poll_init_work
+ - Add some kerneldoc for intel_hpd_poll_init()
+ - Cross-reference intel_hpd_poll_init() in intel_hpd_init()
+ - Just copy the loop from intel_hpd_init() in intel_hpd_poll_init()
+
+Changes since v5:
+ - Minor kerneldoc nitpicks
+
+	Cc: stable@vger.kernel.org
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 19625e85c6ec56038368aa72c44f5f55b221f0fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_drv.h
+#	drivers/gpu/drm/i915/intel_hotplug.c
+#	drivers/gpu/drm/i915/intel_runtime_pm.c
+diff --cc drivers/gpu/drm/i915/i915_drv.h
+index f691be6f9546,1ec523d29789..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@@ -217,6 -260,43 +217,45 @@@ enum hpd_pin 
+  	HPD_NUM_PINS
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define for_each_hpd_pin(__pin) \
++ 	for ((__pin) = (HPD_NONE + 1); (__pin) < HPD_NUM_PINS; (__pin)++)
++ 
++ struct i915_hotplug {
++ 	struct work_struct hotplug_work;
++ 
++ 	struct {
++ 		unsigned long last_jiffies;
++ 		int count;
++ 		enum {
++ 			HPD_ENABLED = 0,
++ 			HPD_DISABLED = 1,
++ 			HPD_MARK_DISABLED = 2
++ 		} state;
++ 	} stats[HPD_NUM_PINS];
++ 	u32 event_bits;
++ 	struct delayed_work reenable_work;
++ 
++ 	struct intel_digital_port *irq_port[I915_MAX_PORTS];
++ 	u32 long_port_mask;
++ 	u32 short_port_mask;
++ 	struct work_struct dig_port_work;
++ 
++ 	struct work_struct poll_init_work;
++ 	bool poll_enabled;
++ 
++ 	/*
++ 	 * if we get a HPD irq from DP and a HPD irq from non-DP
++ 	 * the non-DP HPD could block the workqueue on a mode config
++ 	 * mutex getting, that userspace may have taken. However
++ 	 * userspace is waiting on the DP workqueue to run which is
++ 	 * blocked behind the non-DP one.
++ 	 */
++ 	struct workqueue_struct *dp_wq;
++ };
++ 
+++>>>>>>> 19625e85c6ec (drm/i915: Enable polling when we don't have hpd)
+  #define I915_GEM_GPU_DOMAINS \
+  	(I915_GEM_DOMAIN_RENDER | \
+  	 I915_GEM_DOMAIN_SAMPLER | \
+diff --cc drivers/gpu/drm/i915/intel_runtime_pm.c
+index ce00e6994eeb,1c603bbe5784..000000000000
+--- a/drivers/gpu/drm/i915/intel_runtime_pm.c
++++ b/drivers/gpu/drm/i915/intel_runtime_pm.c
+@@@ -572,7 -1114,37 +572,41 @@@ static void vlv_display_power_well_enab
+  
+  	intel_hpd_init(dev_priv);
+  
+++<<<<<<< HEAD
+ +	i915_redisable_vga_power_on(dev_priv->dev);
+++=======
++ 	/* Re-enable the ADPA, if we have one */
++ 	for_each_intel_encoder(&dev_priv->drm, encoder) {
++ 		if (encoder->type == INTEL_OUTPUT_ANALOG)
++ 			intel_crt_reset(&encoder->base);
++ 	}
++ 
++ 	i915_redisable_vga_power_on(&dev_priv->drm);
++ }
++ 
++ static void vlv_display_power_well_deinit(struct drm_i915_private *dev_priv)
++ {
++ 	spin_lock_irq(&dev_priv->irq_lock);
++ 	valleyview_disable_display_irqs(dev_priv);
++ 	spin_unlock_irq(&dev_priv->irq_lock);
++ 
++ 	/* make sure we're done processing display irqs */
++ 	synchronize_irq(dev_priv->drm.irq);
++ 
++ 	intel_power_sequencer_reset(dev_priv);
++ 
++ 	intel_hpd_poll_init(dev_priv);
++ }
++ 
++ static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
++ 					  struct i915_power_well *power_well)
++ {
++ 	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
++ 
++ 	vlv_set_power_well(dev_priv, power_well, true);
++ 
++ 	vlv_display_power_well_init(dev_priv);
+++>>>>>>> 19625e85c6ec (drm/i915: Enable polling when we don't have hpd)
+  }
+  
+  static void vlv_display_power_well_disable(struct drm_i915_private *dev_priv,
+* Unmerged path drivers/gpu/drm/i915/intel_hotplug.c
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index a19d2c71e205..006ea17e58a8 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1440,6 +1440,9 @@ static int intel_runtime_suspend(struct device *device)
+ 
+ 	assert_forcewakes_inactive(dev_priv);
+ 
++	if (!IS_VALLEYVIEW(dev_priv) || !IS_CHERRYVIEW(dev_priv))
++		intel_hpd_poll_init(dev_priv);
++
+ 	DRM_DEBUG_KMS("Device suspended\n");
+ 	return 0;
+ }
+* Unmerged path drivers/gpu/drm/i915/i915_drv.h
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09..6f919d9d4563 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1101,6 +1101,8 @@ void intel_dsi_init(struct drm_device *dev);
+ 
+ /* intel_dvo.c */
+ void intel_dvo_init(struct drm_device *dev);
++/* intel_hotplug.c */
++void intel_hpd_poll_init(struct drm_i915_private *dev_priv);
+ 
+ 
+ /* legacy fbdev emulation in intel_fbdev.c */
+* Unmerged path drivers/gpu/drm/i915/intel_hotplug.c
+* Unmerged path drivers/gpu/drm/i915/intel_runtime_pm.c
