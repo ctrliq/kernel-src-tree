@@ -1,0 +1,226 @@
+dax: don't abuse get_block mapping for endio callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit e842f2903908934187af7232fb5b21da527d1757
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e842f290.failed
+
+dax_fault() currently relies on the get_block callback to attach an
+io completion callback to the mapping buffer head so that it can
+run unwritten extent conversion after zeroing allocated blocks.
+
+Instead of this hack, pass the conversion callback directly into
+dax_fault() similar to the get_block callback. When the filesystem
+allocates unwritten extents, it will set the buffer_unwritten()
+flag, and hence the dax_fault code can call the completion function
+in the contexts where it is necessary without overloading the
+mapping buffer head.
+
+Note: The changes to ext4 to use this interface are suspect at best.
+In fact, the way ext4 did this end_io assignment in the first place
+looks suspect because it only set a completion callback when there
+wasn't already some other write() call taking place on the same
+inode. The ext4 end_io code looks rather intricate and fragile with
+all it's reference counting and passing to different contexts for
+modification via inode private pointers that aren't protected by
+locks...
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Acked-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit e842f2903908934187af7232fb5b21da527d1757)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext2/file.c
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+#	include/linux/fs.h
+diff --cc fs/ext2/file.c
+index a5b3a5db3120,3b57c9f83c9b..000000000000
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@@ -25,6 -25,37 +25,40 @@@
+  #include "xattr.h"
+  #include "acl.h"
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static int ext2_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext2_get_block, NULL);
++ }
++ 
++ static int ext2_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext2_get_block, NULL);
++ }
++ 
++ static const struct vm_operations_struct ext2_dax_vm_ops = {
++ 	.fault		= ext2_dax_fault,
++ 	.page_mkwrite	= ext2_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ 
++ static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	if (!IS_DAX(file_inode(file)))
++ 		return generic_file_mmap(file, vma);
++ 
++ 	file_accessed(file);
++ 	vma->vm_ops = &ext2_dax_vm_ops;
++ 	vma->vm_flags |= VM_MIXEDMAP;
++ 	return 0;
++ }
++ #else
++ #define ext2_file_mmap	generic_file_mmap
++ #endif
++ 
+++>>>>>>> e842f2903908 (dax: don't abuse get_block mapping for endio callbacks)
+  /*
+   * Called when filp is released. This happens when all file descriptors
+   * for a single struct file are closed. Note that different open() calls
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,f713cfcc43a2..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -200,10 -187,47 +200,46 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static void ext4_end_io_unwritten(struct buffer_head *bh, int uptodate)
++ {
++ 	struct inode *inode = bh->b_assoc_map->host;
++ 	/* XXX: breaks on 32-bit > 16GB. Is that even supported? */
++ 	loff_t offset = (loff_t)(uintptr_t)bh->b_private << inode->i_blkbits;
++ 	int err;
++ 	if (!uptodate)
++ 		return;
++ 	WARN_ON(!buffer_unwritten(bh));
++ 	err = ext4_convert_unwritten_extents(NULL, inode, offset, bh->b_size);
++ }
++ 
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext4_get_block, ext4_end_io_unwritten);
++ 					/* Is this the right get_block? */
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext4_get_block, ext4_end_io_unwritten);
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
+++>>>>>>> e842f2903908 (dax: don't abuse get_block mapping for endio callbacks)
+  static const struct vm_operations_struct ext4_file_vm_ops = {
+  	.fault		= filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --cc fs/ext4/inode.c
+index 7e00e3fcc247,7c38ed3494cb..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -702,8 -689,22 +702,23 @@@ static int _ext4_get_block(struct inod
+  
+  	ret = ext4_map_blocks(handle, inode, &map, flags);
+  	if (ret > 0) {
+ -		ext4_io_end_t *io_end = ext4_inode_aio(inode);
+ -
+  		map_bh(bh, inode->i_sb, map.m_pblk);
+  		bh->b_state = (bh->b_state & ~EXT4_MAP_FLAGS) | map.m_flags;
+++<<<<<<< HEAD
+++=======
++ 		if (IS_DAX(inode) && buffer_unwritten(bh)) {
++ 			/*
++ 			 * dgc: I suspect unwritten conversion on ext4+DAX is
++ 			 * fundamentally broken here when there are concurrent
++ 			 * read/write in progress on this inode.
++ 			 */
++ 			WARN_ON_ONCE(io_end);
++ 			bh->b_assoc_map = inode->i_mapping;
++ 			bh->b_private = (void *)(unsigned long)iblock;
++ 		}
++ 		if (io_end && io_end->flag & EXT4_IO_END_UNWRITTEN)
++ 			set_buffer_defer_completion(bh);
+++>>>>>>> e842f2903908 (dax: don't abuse get_block mapping for endio callbacks)
+  		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
+  		ret = 0;
+  	}
+diff --cc include/linux/fs.h
+index 37d4ac39152e,c9b4cca9e08d..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -63,8 -69,8 +63,13 @@@ struct buffer_head
+  typedef int (get_block_t)(struct inode *inode, sector_t iblock,
+  			struct buffer_head *bh_result, int create);
+  typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+++<<<<<<< HEAD
+ +			ssize_t bytes, void *private, int ret,
+ +			bool is_async);
+++=======
++ 			ssize_t bytes, void *private);
++ typedef void (dax_iodone_t)(struct buffer_head *bh_map, int uptodate);
+++>>>>>>> e842f2903908 (dax: don't abuse get_block mapping for endio callbacks)
+  
+  #define MAY_EXEC		0x00000001
+  #define MAY_WRITE		0x00000002
+@@@ -2706,19 -2623,15 +2711,31 @@@ extern loff_t fixed_size_llseek(struct 
+  extern int generic_file_open(struct inode * inode, struct file * filp);
+  extern int nonseekable_open(struct inode * inode, struct file * filp);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FS_XIP
+ +extern ssize_t xip_file_read(struct file *filp, char __user *buf, size_t len,
+ +			     loff_t *ppos);
+ +extern int xip_file_mmap(struct file * file, struct vm_area_struct * vma);
+ +extern ssize_t xip_file_write(struct file *filp, const char __user *buf,
+ +			      size_t len, loff_t *ppos);
+ +extern int xip_truncate_page(struct address_space *mapping, loff_t from);
+ +#else
+ +static inline int xip_truncate_page(struct address_space *mapping, loff_t from)
+ +{
+ +	return 0;
+ +}
+ +#endif
+++=======
++ ssize_t dax_do_io(struct kiocb *, struct inode *, struct iov_iter *, loff_t,
++ 		  get_block_t, dio_iodone_t, int flags);
++ int dax_clear_blocks(struct inode *, sector_t block, long size);
++ int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
++ int dax_truncate_page(struct inode *, loff_t from, get_block_t);
++ int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
++ 		dax_iodone_t);
++ int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
++ #define dax_mkwrite(vma, vmf, gb, iod)	dax_fault(vma, vmf, gb, iod)
+++>>>>>>> e842f2903908 (dax: don't abuse get_block mapping for endio callbacks)
+  
+  #ifdef CONFIG_BLOCK
+  typedef void (dio_submit_t)(int rw, struct bio *bio, struct inode *inode,
+* Unmerged path fs/dax.c
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext2/file.c
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path include/linux/fs.h
