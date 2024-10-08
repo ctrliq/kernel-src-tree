@@ -1,0 +1,226 @@
+KVM: MMU: introduce PT_MAX_HUGEPAGE_LEVEL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] mmu: introduce PT_MAX_HUGEPAGE_LEVEL (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 93.51%
+commit-author Xiao Guangrong <guangrong.xiao@linux.intel.com>
+commit 8a3d08f16fc63400f637dfa69aa5c7ea016ee18a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8a3d08f1.failed
+
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8a3d08f16fc63400f637dfa69aa5c7ea016ee18a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 10d8f908481b,b1f5f09e0c29..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4372,6 -4453,185 +4367,188 @@@ void kvm_mmu_slot_remove_write_access(s
+  		kvm_flush_remote_tlbs(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
++ 		unsigned long *rmapp)
++ {
++ 	u64 *sptep;
++ 	struct rmap_iterator iter;
++ 	int need_tlb_flush = 0;
++ 	pfn_t pfn;
++ 	struct kvm_mmu_page *sp;
++ 
++ restart:
++ 	for_each_rmap_spte(rmapp, &iter, sptep) {
++ 		sp = page_header(__pa(sptep));
++ 		pfn = spte_to_pfn(*sptep);
++ 
++ 		/*
++ 		 * We cannot do huge page mapping for indirect shadow pages,
++ 		 * which are found on the last rmap (level = 1) when not using
++ 		 * tdp; such shadow pages are synced with the page table in
++ 		 * the guest, and the guest page table is using 4K page size
++ 		 * mapping if the indirect sp has level = 1.
++ 		 */
++ 		if (sp->role.direct &&
++ 			!kvm_is_reserved_pfn(pfn) &&
++ 			PageTransCompound(pfn_to_page(pfn))) {
++ 			drop_spte(kvm, sptep);
++ 			need_tlb_flush = 1;
++ 			goto restart;
++ 		}
++ 	}
++ 
++ 	return need_tlb_flush;
++ }
++ 
++ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
++ 			struct kvm_memory_slot *memslot)
++ {
++ 	bool flush = false;
++ 	unsigned long *rmapp;
++ 	unsigned long last_index, index;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 
++ 	rmapp = memslot->arch.rmap[0];
++ 	last_index = gfn_to_index(memslot->base_gfn + memslot->npages - 1,
++ 				memslot->base_gfn, PT_PAGE_TABLE_LEVEL);
++ 
++ 	for (index = 0; index <= last_index; ++index, ++rmapp) {
++ 		if (*rmapp)
++ 			flush |= kvm_mmu_zap_collapsible_spte(kvm, rmapp);
++ 
++ 		if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++ 			if (flush) {
++ 				kvm_flush_remote_tlbs(kvm);
++ 				flush = false;
++ 			}
++ 			cond_resched_lock(&kvm->mmu_lock);
++ 		}
++ 	}
++ 
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ 
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
++ 				   struct kvm_memory_slot *memslot)
++ {
++ 	gfn_t last_gfn;
++ 	unsigned long *rmapp;
++ 	unsigned long last_index, index;
++ 	bool flush = false;
++ 
++ 	last_gfn = memslot->base_gfn + memslot->npages - 1;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 
++ 	rmapp = memslot->arch.rmap[PT_PAGE_TABLE_LEVEL - 1];
++ 	last_index = gfn_to_index(last_gfn, memslot->base_gfn,
++ 			PT_PAGE_TABLE_LEVEL);
++ 
++ 	for (index = 0; index <= last_index; ++index, ++rmapp) {
++ 		if (*rmapp)
++ 			flush |= __rmap_clear_dirty(kvm, rmapp);
++ 
++ 		if (need_resched() || spin_needbreak(&kvm->mmu_lock))
++ 			cond_resched_lock(&kvm->mmu_lock);
++ 	}
++ 
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/*
++ 	 * It's also safe to flush TLBs out of mmu lock here as currently this
++ 	 * function is only used for dirty logging, in which case flushing TLB
++ 	 * out of mmu lock also guarantees no dirty pages will be lost in
++ 	 * dirty_bitmap.
++ 	 */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_leaf_clear_dirty);
++ 
++ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
++ 					struct kvm_memory_slot *memslot)
++ {
++ 	gfn_t last_gfn;
++ 	int i;
++ 	bool flush = false;
++ 
++ 	last_gfn = memslot->base_gfn + memslot->npages - 1;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 
++ 	/* skip rmap for 4K page */
++ 	for (i = PT_PAGE_TABLE_LEVEL + 1; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++ 		unsigned long *rmapp;
++ 		unsigned long last_index, index;
++ 
++ 		rmapp = memslot->arch.rmap[i - PT_PAGE_TABLE_LEVEL];
++ 		last_index = gfn_to_index(last_gfn, memslot->base_gfn, i);
++ 
++ 		for (index = 0; index <= last_index; ++index, ++rmapp) {
++ 			if (*rmapp)
++ 				flush |= __rmap_write_protect(kvm, rmapp,
++ 						false);
++ 
++ 			if (need_resched() || spin_needbreak(&kvm->mmu_lock))
++ 				cond_resched_lock(&kvm->mmu_lock);
++ 		}
++ 	}
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	/* see kvm_mmu_slot_remove_write_access */
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_largepage_remove_write_access);
++ 
++ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
++ 			    struct kvm_memory_slot *memslot)
++ {
++ 	gfn_t last_gfn;
++ 	int i;
++ 	bool flush = false;
++ 
++ 	last_gfn = memslot->base_gfn + memslot->npages - 1;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 
++ 	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++ 		unsigned long *rmapp;
++ 		unsigned long last_index, index;
++ 
++ 		rmapp = memslot->arch.rmap[i - PT_PAGE_TABLE_LEVEL];
++ 		last_index = gfn_to_index(last_gfn, memslot->base_gfn, i);
++ 
++ 		for (index = 0; index <= last_index; ++index, ++rmapp) {
++ 			if (*rmapp)
++ 				flush |= __rmap_set_dirty(kvm, rmapp);
++ 
++ 			if (need_resched() || spin_needbreak(&kvm->mmu_lock))
++ 				cond_resched_lock(&kvm->mmu_lock);
++ 		}
++ 	}
++ 
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/* see kvm_mmu_slot_leaf_clear_dirty */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_set_dirty);
++ 
+++>>>>>>> 8a3d08f16fc6 (KVM: MMU: introduce PT_MAX_HUGEPAGE_LEVEL)
+  #define BATCH_ZAP_PAGES	10
+  static void kvm_zap_obsolete_pages(struct kvm *kvm)
+  {
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 420fe4206164..bebbfb5eddc5 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -43,6 +43,7 @@
+ #define PT_PDPE_LEVEL 3
+ #define PT_DIRECTORY_LEVEL 2
+ #define PT_PAGE_TABLE_LEVEL 1
++#define PT_MAX_HUGEPAGE_LEVEL (PT_PAGE_TABLE_LEVEL + KVM_NR_PAGE_SIZES - 1)
+ 
+ #define PFERR_PRESENT_BIT 0
+ #define PFERR_WRITE_BIT 1
