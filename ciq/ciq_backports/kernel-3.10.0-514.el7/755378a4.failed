@@ -1,0 +1,206 @@
+sched/deadline: Add period support for SCHED_DEADLINE tasks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Harald Gustafsson <harald.gustafsson@ericsson.com>
+commit 755378a47192a3d1f7c3a8ca6c15c1cf76de0af2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/755378a4.failed
+
+Make it possible to specify a period (different or equal than
+deadline) for -deadline tasks. Relative deadlines (D_i) are used on
+task arrivals to generate new scheduling (absolute) deadlines as "d =
+t + D_i", and periods (P_i) to postpone the scheduling deadlines as "d
+= d + P_i" when the budget is zero.
+
+This is in general useful to model (and schedule) tasks that have slow
+activation rates (long periods), but have to be scheduled soon once
+activated (short deadlines).
+
+	Signed-off-by: Harald Gustafsson <harald.gustafsson@ericsson.com>
+	Signed-off-by: Dario Faggioli <raistlin@linux.it>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1383831828-15501-7-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 755378a47192a3d1f7c3a8ca6c15c1cf76de0af2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+diff --cc include/linux/sched.h
+index e57aba91f593,158f4c2dd852..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1104,6 -1092,46 +1104,49 @@@ struct sched_rt_entity 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct sched_dl_entity {
++ 	struct rb_node	rb_node;
++ 
++ 	/*
++ 	 * Original scheduling parameters. Copied here from sched_attr
++ 	 * during sched_setscheduler2(), they will remain the same until
++ 	 * the next sched_setscheduler2().
++ 	 */
++ 	u64 dl_runtime;		/* maximum runtime for each instance	*/
++ 	u64 dl_deadline;	/* relative deadline of each instance	*/
++ 	u64 dl_period;		/* separation of two instances (period) */
++ 
++ 	/*
++ 	 * Actual scheduling parameters. Initialized with the values above,
++ 	 * they are continously updated during task execution. Note that
++ 	 * the remaining runtime could be < 0 in case we are in overrun.
++ 	 */
++ 	s64 runtime;		/* remaining runtime for this instance	*/
++ 	u64 deadline;		/* absolute deadline for this instance	*/
++ 	unsigned int flags;	/* specifying the scheduler behaviour	*/
++ 
++ 	/*
++ 	 * Some bool flags:
++ 	 *
++ 	 * @dl_throttled tells if we exhausted the runtime. If so, the
++ 	 * task has to wait for a replenishment to be performed at the
++ 	 * next firing of dl_timer.
++ 	 *
++ 	 * @dl_new tells if a new instance arrived. If so we must
++ 	 * start executing it with full runtime and reset its absolute
++ 	 * deadline;
++ 	 */
++ 	int dl_throttled, dl_new;
++ 
++ 	/*
++ 	 * Bandwidth enforcement timer. Each -deadline task has its
++ 	 * own bandwidth to be enforced, thus we need one timer per task.
++ 	 */
++ 	struct hrtimer dl_timer;
++ };
+++>>>>>>> 755378a47192 (sched/deadline: Add period support for SCHED_DEADLINE tasks)
+  
+  struct rcu_node;
+  
+diff --cc kernel/sched/core.c
+index f167fdc57a94,069230b5c3fb..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1827,6 -1719,13 +1827,16 @@@ static void __sched_fork(unsigned long 
+  	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	RB_CLEAR_NODE(&p->dl.rb_node);
++ 	hrtimer_init(&p->dl.dl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 	p->dl.dl_runtime = p->dl.runtime = 0;
++ 	p->dl.dl_deadline = p->dl.deadline = 0;
++ 	p->dl.dl_period = 0;
++ 	p->dl.flags = 0;
++ 
+++>>>>>>> 755378a47192 (sched/deadline: Add period support for SCHED_DEADLINE tasks)
+  	INIT_LIST_HEAD(&p->rt.run_list);
+  
+  #ifdef CONFIG_PREEMPT_NOTIFIERS
+@@@ -4083,22 -3011,83 +4093,72 @@@ static struct task_struct *find_process
+  	return pid ? find_task_by_vpid(pid) : current;
+  }
+  
+ -/*
+ - * This function initializes the sched_dl_entity of a newly becoming
+ - * SCHED_DEADLINE task.
+ - *
+ - * Only the static values are considered here, the actual runtime and the
+ - * absolute deadline will be properly calculated when the task is enqueued
+ - * for the first time with its new policy.
+ - */
+ +/* Actually do priority change: must hold rq lock. */
+  static void
+ -__setparam_dl(struct task_struct *p, const struct sched_attr *attr)
+ +__setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	init_dl_task_timer(dl_se);
++ 	dl_se->dl_runtime = attr->sched_runtime;
++ 	dl_se->dl_deadline = attr->sched_deadline;
++ 	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
++ 	dl_se->flags = attr->sched_flags;
++ 	dl_se->dl_throttled = 0;
++ 	dl_se->dl_new = 1;
++ }
++ 
++ /* Actually do priority change: must hold pi & rq lock. */
++ static void __setscheduler(struct rq *rq, struct task_struct *p,
++ 			   const struct sched_attr *attr)
++ {
++ 	int policy = attr->sched_policy;
++ 
+++>>>>>>> 755378a47192 (sched/deadline: Add period support for SCHED_DEADLINE tasks)
+  	p->policy = policy;
+ -
+ -	if (dl_policy(policy))
+ -		__setparam_dl(p, attr);
+ -	else if (rt_policy(policy))
+ -		p->rt_priority = attr->sched_priority;
+ -	else
+ -		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ -
+ +	p->rt_priority = prio;
+  	p->normal_prio = normal_prio(p);
+ +	/* we are holding p->pi_lock already */
+  	p->prio = rt_mutex_getprio(p);
+ -
+ -	if (dl_prio(p->prio))
+ -		p->sched_class = &dl_sched_class;
+ -	else if (rt_prio(p->prio))
+ +	if (rt_prio(p->prio))
+  		p->sched_class = &rt_sched_class;
+  	else
+  		p->sched_class = &fair_sched_class;
+  	set_load_weight(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __getparam_dl(struct task_struct *p, struct sched_attr *attr)
++ {
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	attr->sched_priority = p->rt_priority;
++ 	attr->sched_runtime = dl_se->dl_runtime;
++ 	attr->sched_deadline = dl_se->dl_deadline;
++ 	attr->sched_period = dl_se->dl_period;
++ 	attr->sched_flags = dl_se->flags;
++ }
++ 
++ /*
++  * This function validates the new parameters of a -deadline task.
++  * We ask for the deadline not being zero, and greater or equal
++  * than the runtime, as well as the period of being zero or
++  * greater than deadline.
++  */
++ static bool
++ __checkparam_dl(const struct sched_attr *attr)
++ {
++ 	return attr && attr->sched_deadline != 0 &&
++ 		(attr->sched_period == 0 ||
++ 		(s64)(attr->sched_period   - attr->sched_deadline) >= 0) &&
++ 		(s64)(attr->sched_deadline - attr->sched_runtime ) >= 0;
++ }
++ 
+++>>>>>>> 755378a47192 (sched/deadline: Add period support for SCHED_DEADLINE tasks)
+  /*
+   * check the target process has a UID that matches the current process's
+   */
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
