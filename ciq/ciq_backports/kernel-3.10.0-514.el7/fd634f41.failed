@@ -1,0 +1,551 @@
+nvme: merge probe_work and reset_work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit fd634f4142861e533ac57e88ece8e98ab5851edb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fd634f41.failed
+
+If we're using two work queues we're always going to run into races where
+one item is tearing down what the other one is initializing.  So insted
+merge the two work queues, and let the old probe_work also tear the
+controller down first if it was alive.  Together with the better detection
+of the probe path using a flag this gives us a properly serialized
+reset/probe path that also doesn't accidentally trigger when two commands
+time out and the second one tries to reset the controller while the first
+reset is still in progress.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit fd634f4142861e533ac57e88ece8e98ab5851edb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,23cbd93c0c56..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -95,6 -93,44 +95,47 @@@ struct async_cmd_info 
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
++  */
++ struct nvme_dev {
++ 	struct list_head node;
++ 	struct nvme_queue **queues;
++ 	struct blk_mq_tag_set tagset;
++ 	struct blk_mq_tag_set admin_tagset;
++ 	u32 __iomem *dbs;
++ 	struct device *dev;
++ 	struct dma_pool *prp_page_pool;
++ 	struct dma_pool *prp_small_pool;
++ 	unsigned queue_count;
++ 	unsigned online_queues;
++ 	unsigned max_qid;
++ 	int q_depth;
++ 	u32 db_stride;
++ 	struct msix_entry *entry;
++ 	void __iomem *bar;
++ 	struct work_struct reset_work;
++ 	struct work_struct scan_work;
++ 	struct mutex shutdown_lock;
++ 	bool subsystem;
++ 	void __iomem *cmb;
++ 	dma_addr_t cmb_dma_addr;
++ 	u64 cmb_size;
++ 	u32 cmbsz;
++ 	unsigned long flags;
++ #define NVME_CTRL_RESETTING    0
++ 
++ 	struct nvme_ctrl ctrl;
++ };
++ 
++ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
++ {
++ 	return container_of(ctrl, struct nvme_dev, ctrl);
++ }
++ 
++ /*
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+   * An NVM Express queue.  Each device has at least two (one for admin
+   * commands and one for I/O commands).
+   */
+@@@ -1096,30 -1088,48 +1137,53 @@@ static void nvme_abort_req(struct reque
+  	struct nvme_cmd_info *abort_cmd;
+  	struct nvme_command cmd;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++ 	/*
++ 	 * Shutdown immediately if controller times out while starting. The
++ 	 * reset work will see the pci device disabled when it gets the forced
++ 	 * cancellation error. All outstanding requests are completed on
++ 	 * shutdown, so we return BLK_EH_HANDLED.
++ 	 */
++ 	if (test_bit(NVME_CTRL_RESETTING, &dev->flags)) {
++ 		dev_warn(dev->dev,
++ 			 "I/O %d QID %d timeout, disable controller\n",
++ 			 req->tag, nvmeq->qid);
++ 		nvme_dev_shutdown(dev);
++ 		req->errors = NVME_SC_CANCELLED;
++ 		return BLK_EH_HANDLED;
++ 	}
++ 
++ 	/*
++  	 * Shutdown the controller immediately and schedule a reset if the
++  	 * command was already aborted once before and still hasn't been
++  	 * returned to the driver, or if this is the admin queue.
++ 	 */
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  	if (!nvmeq->qid || cmd_rq->aborted) {
+ -		dev_warn(dev->dev,
+ -			 "I/O %d QID %d timeout, reset controller\n",
+ -			 req->tag, nvmeq->qid);
+ -		nvme_dev_shutdown(dev);
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(&dev_list_lock, flags);
+ +		if (work_busy(&dev->reset_work))
+ +			goto out;
+ +		list_del_init(&dev->node);
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"I/O %d QID %d timeout, reset controller\n",
+ +							req->tag, nvmeq->qid);
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+  		queue_work(nvme_workq, &dev->reset_work);
+ -
+ -		/*
+ -		 * Mark the request as handled, since the inline shutdown
+ -		 * forces all outstanding requests to complete.
+ -		 */
+ -		req->errors = NVME_SC_CANCELLED;
+ -		return BLK_EH_HANDLED;
+ + out:
+ +		spin_unlock_irqrestore(&dev_list_lock, flags);
+ +		return;
+  	}
+  
+ -	if (!dev->ctrl.abort_limit)
+ -		return BLK_EH_RESET_TIMER;
+ +	if (!dev->abort_limit)
+ +		return;
+  
+ -	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE,
+ -			BLK_MQ_REQ_NOWAIT);
+ +	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+  	if (IS_ERR(abort_req))
+ -		return BLK_EH_RESET_TIMER;
+ +		return;
+  
+  	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+  	nvme_set_info(abort_cmd, abort_req, abort_completion);
+@@@ -2845,93 -2147,26 +2909,111 @@@ static void nvme_free_dev(struct kref *
+  	kfree(dev);
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static int nvme_dev_open(struct inode *inode, struct file *f)
+ +{
+ +	struct nvme_dev *dev;
+ +	int instance = iminor(inode);
+ +	int ret = -ENODEV;
+ +
+ +	spin_lock(&dev_list_lock);
+ +	list_for_each_entry(dev, &dev_list, node) {
+ +		if (dev->instance == instance) {
+ +			if (!dev->admin_q) {
+ +				ret = -EWOULDBLOCK;
+ +				break;
+ +			}
+ +			if (!kref_get_unless_zero(&dev->kref))
+ +				break;
+ +			f->private_data = dev;
+ +			ret = 0;
+ +			break;
+ +		}
+ +	}
+ +	spin_unlock(&dev_list_lock);
+ +
+ +	return ret;
+ +}
+ +
+ +static int nvme_dev_release(struct inode *inode, struct file *f)
+ +{
+ +	struct nvme_dev *dev = f->private_data;
+ +	kref_put(&dev->kref, nvme_free_dev);
+ +	return 0;
+ +}
+ +
+ +static long nvme_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ +{
+ +	struct nvme_dev *dev = f->private_data;
+ +	struct nvme_ns *ns;
+ +
+ +	switch (cmd) {
+ +	case NVME_IOCTL_ADMIN_CMD:
+ +		return nvme_user_cmd(dev, NULL, (void __user *)arg);
+ +	case NVME_IOCTL_IO_CMD:
+ +		if (list_empty(&dev->namespaces))
+ +			return -ENOTTY;
+ +		ns = list_first_entry(&dev->namespaces, struct nvme_ns, list);
+ +		return nvme_user_cmd(dev, ns, (void __user *)arg);
+ +	case NVME_IOCTL_RESET:
+ +		dev_warn(&dev->pci_dev->dev, "resetting controller\n");
+ +		return nvme_reset(dev);
+ +	case NVME_IOCTL_SUBSYS_RESET:
+ +		return nvme_subsys_reset(dev);
+ +	default:
+ +		return -ENOTTY;
+ +	}
+ +}
+ +
+ +static const struct file_operations nvme_dev_fops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= nvme_dev_open,
+ +	.release	= nvme_dev_release,
+ +	.unlocked_ioctl	= nvme_dev_ioctl,
+ +	.compat_ioctl	= nvme_dev_ioctl,
+ +};
+ +
+ +static void nvme_set_irq_hints(struct nvme_dev *dev)
+ +{
+ +	struct nvme_queue *nvmeq;
+ +	int i;
+ +
+ +	for (i = 0; i < dev->online_queues; i++) {
+ +		nvmeq = dev->queues[i];
+ +
+ +		if (!nvmeq->tags || !(*nvmeq->tags))
+ +			continue;
+ +
+ +		irq_set_affinity_hint(dev->entry[nvmeq->cq_vector].vector,
+ +					blk_mq_tags_cpumask(*nvmeq->tags));
+ +	}
+ +}
+ +
+ +static int nvme_dev_start(struct nvme_dev *dev)
+ +{
+++=======
++ static void nvme_reset_work(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, reset_work);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  	int result;
+ +	bool start_thread = false;
+  
++ 	if (WARN_ON(test_bit(NVME_CTRL_RESETTING, &dev->flags)))
++ 		goto out;
++ 
++ 	/*
++ 	 * If we're called to reset a live controller first shut it down before
++ 	 * moving on.
++ 	 */
++ 	if (dev->bar)
++ 		nvme_dev_shutdown(dev);
++ 
++ 	set_bit(NVME_CTRL_RESETTING, &dev->flags);
++ 
+  	result = nvme_dev_map(dev);
+  	if (result)
+ -		goto out;
+ +		return result;
+  
+  	result = nvme_configure_admin_queue(dev);
+  	if (result)
+@@@ -2965,22 -2185,41 +3047,48 @@@
+  	if (result)
+  		goto free_tags;
+  
+ -	dev->ctrl.event_limit = 1;
+ +	nvme_set_irq_hints(dev);
+  
+ -	result = nvme_dev_list_add(dev);
+ -	if (result)
+ -		goto remove;
+ +	dev->event_limit = 1;
+ +	return result;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++ 	/*
++ 	 * Keep the controller around but remove all namespaces if we don't have
++ 	 * any working I/O queue.
++ 	 */
++ 	if (dev->online_queues < 2) {
++ 		dev_warn(dev->dev, "IO queues not created\n");
++ 		nvme_remove_namespaces(&dev->ctrl);
++ 	} else {
++ 		nvme_unfreeze_queues(dev);
++ 		nvme_dev_add(dev);
++ 	}
++ 
++ 	clear_bit(NVME_CTRL_RESETTING, &dev->flags);
++ 	return;
++ 
++  remove:
++ 	nvme_dev_list_remove(dev);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+   free_tags:
+  	nvme_dev_remove_admin(dev);
+ -	blk_put_queue(dev->ctrl.admin_q);
+ -	dev->ctrl.admin_q = NULL;
+ +	blk_put_queue(dev->admin_q);
+ +	dev->admin_q = NULL;
+  	dev->queues[0]->tags = NULL;
+   disable:
+  	nvme_disable_queue(dev, 0);
+ +	nvme_dev_list_remove(dev);
+   unmap:
+  	nvme_dev_unmap(dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	return result;
+++=======
++  out:
++ 	if (!work_pending(&dev->reset_work))
++ 		nvme_dead_ctrl(dev);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  }
+  
+  static int nvme_remove_dead_ctrl(void *arg)
+@@@ -3034,73 -2245,57 +3142,81 @@@ static void nvme_dead_ctrl(struct nvme_
+  	}
+  }
+  
+ -static int nvme_reset(struct nvme_dev *dev)
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_dev_reset(struct nvme_dev *dev)
+  {
+ -	if (!dev->ctrl.admin_q || blk_queue_dying(dev->ctrl.admin_q))
+ -		return -ENODEV;
+ +	bool in_probe = work_busy(&dev->probe_work);
+  
+ -	if (!queue_work(nvme_workq, &dev->reset_work))
+ -		return -EBUSY;
+ +	nvme_dev_shutdown(dev);
+  
+ -	flush_work(&dev->reset_work);
+ -	return 0;
+ -}
+ +	/* Synchronize with device probe so that work will see failure status
+ +	 * and exit gracefully without trying to schedule another reset */
+ +	flush_work(&dev->probe_work);
+  
+ -static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ -{
+ -	*val = readl(to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ +	/* Fail this device if reset occured during probe to avoid
+ +	 * infinite initialization loops. */
+ +	if (in_probe) {
+ +		nvme_dead_ctrl(dev);
+ +		return;
+ +	}
+ +	/* Schedule device resume asynchronously so the reset work is available
+ +	 * to cleanup errors that may occur during reinitialization */
+ +	schedule_work(&dev->probe_work);
+  }
+  
+ -static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
+ +static void nvme_reset_failed_dev(struct work_struct *ws)
+  {
+ -	writel(val, to_nvme_dev(ctrl)->bar + off);
+ -	return 0;
+ +	struct nvme_dev *dev = container_of(ws, struct nvme_dev, reset_work);
+ +	nvme_dev_reset(dev);
+  }
+  
+ -static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
+++=======
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+ +static int nvme_reset(struct nvme_dev *dev)
+  {
+ -	*val = readq(to_nvme_dev(ctrl)->bar + off);
+ +	int ret = -EBUSY;
+ +
+ +	if (!dev->admin_q || blk_queue_dying(dev->admin_q))
+ +		return -ENODEV;
+ +
+ +	spin_lock(&dev_list_lock);
+ +	if (!work_pending(&dev->reset_work)) {
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &dev->reset_work);
+ +		ret = 0;
+ +	}
+ +	spin_unlock(&dev_list_lock);
+ +
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (!ret) {
+ +		flush_work(&dev->reset_work);
+ +		flush_work(&dev->probe_work);
+ +		return 0;
+ +	}
+ +
+ +	return ret;
+++=======
+++	flush_work(&dev->reset_work);
++ 	return 0;
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  }
+  
+ -static bool nvme_pci_io_incapable(struct nvme_ctrl *ctrl)
+ +static ssize_t nvme_sysfs_reset(struct device *dev,
+ +				struct device_attribute *attr, const char *buf,
+ +				size_t count)
+  {
+ -	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ +	struct nvme_dev *ndev = dev_get_drvdata(dev);
+ +	int ret;
+  
+ -	return !dev->bar || dev->online_queues < 2;
+ -}
+ +	ret = nvme_reset(ndev);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
+ -{
+ -	return nvme_reset(to_nvme_dev(ctrl));
+ +	return count;
+  }
+ +static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+  
+ -static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+ -	.reg_read32		= nvme_pci_reg_read32,
+ -	.reg_write32		= nvme_pci_reg_write32,
+ -	.reg_read64		= nvme_pci_reg_read64,
+ -	.io_incapable		= nvme_pci_io_incapable,
+ -	.reset_ctrl		= nvme_pci_reset_ctrl,
+ -	.free_ctrl		= nvme_pci_free_ctrl,
+ -};
+ -
+ +static void nvme_async_probe(struct work_struct *work);
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int node, result = -ENOMEM;
+@@@ -3122,48 -2317,30 +3238,62 @@@
+  	if (!dev->queues)
+  		goto free;
+  
+ -	dev->dev = get_device(&pdev->dev);
+ +	INIT_LIST_HEAD(&dev->namespaces);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	dev->pci_dev = pci_dev_get(pdev);
+  	pci_set_drvdata(pdev, dev);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	result = nvme_set_instance(dev);
+++=======
++ 
++ 	INIT_LIST_HEAD(&dev->node);
++ 	INIT_WORK(&dev->scan_work, nvme_dev_scan);
++ 	INIT_WORK(&dev->reset_work, nvme_reset_work);
++ 	mutex_init(&dev->shutdown_lock);
++ 
++ 	result = nvme_setup_prp_pools(dev);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  	if (result)
+  		goto put_pci;
+  
+ -	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_pci_ctrl_ops,
+ -			id->driver_data);
+ +	result = nvme_setup_prp_pools(dev);
+  	if (result)
+ +		goto release;
+ +
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	kref_init(&dev->kref);
+ +	dev->device = device_create(nvme_class, &pdev->dev,
+ +				MKDEV(nvme_char_major, dev->instance),
+ +				dev, "nvme%d", dev->instance);
+ +	if (IS_ERR(dev->device)) {
+ +		result = PTR_ERR(dev->device);
+  		goto release_pools;
+ +	}
+ +	get_device(dev->device);
+ +	dev_set_drvdata(dev->device, dev);
+  
+ +	result = device_create_file(dev->device, &dev_attr_reset_controller);
+ +	if (result)
+ +		goto put_dev;
+ +
+ +	INIT_LIST_HEAD(&dev->node);
+ +	INIT_WORK(&dev->scan_work, nvme_dev_scan);
+ +	INIT_WORK(&dev->probe_work, nvme_async_probe);
+ +	schedule_work(&dev->probe_work);
+++=======
++ 	schedule_work(&dev->reset_work);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  	return 0;
+  
+ + put_dev:
+ +	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+ +	put_device(dev->device);
+   release_pools:
+  	nvme_release_prp_pools(dev);
+ + release:
+ +	nvme_release_instance(dev);
+   put_pci:
+ -	put_device(dev->dev);
+ +	pci_dev_put(dev->pci_dev);
+   free:
+  	kfree(dev->queues);
+  	kfree(dev->entry);
+@@@ -3186,7 -2355,7 +3316,11 @@@ static void nvme_reset_notify(struct pc
+  	if (prepare)
+  		nvme_dev_shutdown(dev);
+  	else
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +		nvme_dev_resume(dev);
+++=======
++ 		schedule_work(&dev->reset_work);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  }
+  
+  static void nvme_shutdown(struct pci_dev *pdev)
+@@@ -3204,17 -2373,15 +3338,16 @@@ static void nvme_remove(struct pci_dev 
+  	spin_unlock(&dev_list_lock);
+  
+  	pci_set_drvdata(pdev, NULL);
+- 	flush_work(&dev->probe_work);
+  	flush_work(&dev->reset_work);
+  	flush_work(&dev->scan_work);
+ -	nvme_remove_namespaces(&dev->ctrl);
+ +	device_remove_file(dev->device, &dev_attr_reset_controller);
+ +	nvme_dev_remove(dev);
+  	nvme_dev_shutdown(dev);
+  	nvme_dev_remove_admin(dev);
+ +	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+  	nvme_free_queues(dev, 0);
+ -	nvme_release_cmb(dev);
+  	nvme_release_prp_pools(dev);
+ -	nvme_put_ctrl(&dev->ctrl);
+ +	kref_put(&dev->kref, nvme_free_dev);
+  }
+  
+  /* These functions are yet to be implemented */
+@@@ -3238,12 -2406,10 +3371,16 @@@ static int nvme_resume(struct device *d
+  	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct nvme_dev *ndev = pci_get_drvdata(pdev);
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (nvme_dev_resume(ndev) && !work_busy(&ndev->reset_work)) {
+ +		PREPARE_WORK(&ndev->reset_work, nvme_reset_failed_dev);
+ +		queue_work(nvme_workq, &ndev->reset_work);
+ +	}
+++=======
++ 	schedule_work(&ndev->reset_work);
+++>>>>>>> fd634f414286 (nvme: merge probe_work and reset_work):drivers/nvme/host/pci.c
+  	return 0;
+  }
+ -#endif
+  
+  static SIMPLE_DEV_PM_OPS(nvme_dev_pm_ops, nvme_suspend, nvme_resume);
+  
+* Unmerged path drivers/block/nvme-core.c
