@@ -1,0 +1,267 @@
+GFS2: Move quota bitmap operations under their own lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 2d9e72303d538024627fb1fe2cbde48aec12acc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2d9e7230.failed
+
+Gradually, the global qd_lock is being used for less and less.
+After this patch it will only be used for the per super block
+list whose purpose is to allow syncing of changes back to the
+master quota file from the local quota changes file. Fixing
+up that process to make it more efficient will be the subject
+of a later patch, however this patch removes another barrier
+to doing that.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Abhijith Das <adas@redhat.com>
+(cherry picked from commit 2d9e72303d538024627fb1fe2cbde48aec12acc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/incore.h
+index 88b757b58e69,8c64e268b7ef..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -726,8 -733,8 +726,13 @@@ struct gfs2_sbd 
+  	spinlock_t sd_trunc_lock;
+  
+  	unsigned int sd_quota_slots;
+++<<<<<<< HEAD
+ +	unsigned int sd_quota_chunks;
+ +	unsigned char **sd_quota_bitmap;
+++=======
++ 	unsigned long *sd_quota_bitmap;
++ 	spinlock_t sd_bitmap_lock;
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  
+  	u64 sd_quota_sync_gen;
+  
+diff --cc fs/gfs2/quota.c
+index 679b366e073c,02a2740f2468..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -66,17 -71,45 +66,24 @@@
+  #include "inode.h"
+  #include "util.h"
+  
+ -#define GFS2_QD_HASH_SHIFT      12
+ -#define GFS2_QD_HASH_SIZE       (1 << GFS2_QD_HASH_SHIFT)
+ -#define GFS2_QD_HASH_MASK       (GFS2_QD_HASH_SIZE - 1)
+ +struct gfs2_quota_change_host {
+ +	u64 qc_change;
+ +	u32 qc_flags; /* GFS2_QCF_... */
+ +	struct kqid qc_id;
+ +};
+  
+++<<<<<<< HEAD
+ +static LIST_HEAD(qd_lru_list);
+ +static atomic_t qd_lru_count = ATOMIC_INIT(0);
+ +static DEFINE_SPINLOCK(qd_lru_lock);
+++=======
++ /* Lock order: qd_lock -> bucket lock -> qd->lockref.lock -> lru lock */
++ /*                     -> sd_bitmap_lock                              */
++ static DEFINE_SPINLOCK(qd_lock);
++ struct list_lru gfs2_qd_lru;
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  
+ -static struct hlist_bl_head qd_hash_table[GFS2_QD_HASH_SIZE];
+ -
+ -static unsigned int gfs2_qd_hash(const struct gfs2_sbd *sdp,
+ -				 const struct kqid qid)
+ -{
+ -	unsigned int h;
+ -
+ -	h = jhash(&sdp, sizeof(struct gfs2_sbd *), 0);
+ -	h = jhash(&qid, sizeof(struct kqid), h);
+ -
+ -	return h & GFS2_QD_HASH_MASK;
+ -}
+ -
+ -static inline void spin_lock_bucket(unsigned int hash)
+ -{
+ -        hlist_bl_lock(&qd_hash_table[hash]);
+ -}
+ -
+ -static inline void spin_unlock_bucket(unsigned int hash)
+ -{
+ -        hlist_bl_unlock(&qd_hash_table[hash]);
+ -}
+ -
+ -static void gfs2_qd_dealloc(struct rcu_head *rcu)
+ -{
+ -	struct gfs2_quota_data *qd = container_of(rcu, struct gfs2_quota_data, qd_rcu);
+ -	kmem_cache_free(gfs2_quotad_cachep, qd);
+ -}
+ -
+ -static void gfs2_qd_dispose(struct list_head *list)
+ +int gfs2_shrink_qd_memory(struct shrinker *shrink, struct shrink_control *sc)
+  {
+  	struct gfs2_quota_data *qd;
+  	struct gfs2_sbd *sdp;
+@@@ -241,88 -316,48 +248,113 @@@ static void qd_put(struct gfs2_quota_da
+  
+  static int slot_get(struct gfs2_quota_data *qd)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ -	unsigned int bit;
+ -	int error = 0;
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+ +	unsigned int c, o = 0, b;
+ +	unsigned char byte = 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&qd_lru_lock);
+++=======
++ 	spin_lock(&sdp->sd_bitmap_lock);
++ 	if (qd->qd_slot_count != 0)
++ 		goto out;
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  
+ -	error = -ENOSPC;
+ -	bit = find_first_zero_bit(sdp->sd_quota_bitmap, sdp->sd_quota_slots);
+ -	if (bit < sdp->sd_quota_slots) {
+ -		set_bit(bit, sdp->sd_quota_bitmap);
+ -		qd->qd_slot = bit;
+ -out:
+ -		qd->qd_slot_count++;
+ +	if (qd->qd_slot_count++) {
+ +		spin_unlock(&qd_lru_lock);
+ +		return 0;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&sdp->sd_bitmap_lock);
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  
+ -	return error;
+ +	for (c = 0; c < sdp->sd_quota_chunks; c++)
+ +		for (o = 0; o < PAGE_SIZE; o++) {
+ +			byte = sdp->sd_quota_bitmap[c][o];
+ +			if (byte != 0xFF)
+ +				goto found;
+ +		}
+ +
+ +	goto fail;
+ +
+ +found:
+ +	for (b = 0; b < 8; b++)
+ +		if (!(byte & (1 << b)))
+ +			break;
+ +	qd->qd_slot = c * (8 * PAGE_SIZE) + o * 8 + b;
+ +
+ +	if (qd->qd_slot >= sdp->sd_quota_slots)
+ +		goto fail;
+ +
+ +	sdp->sd_quota_bitmap[c][o] |= 1 << b;
+ +
+ +	spin_unlock(&qd_lru_lock);
+ +
+ +	return 0;
+ +
+ +fail:
+ +	qd->qd_slot_count--;
+ +	spin_unlock(&qd_lru_lock);
+ +	return -ENOSPC;
+  }
+  
+  static void slot_hold(struct gfs2_quota_data *qd)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+ +
+++<<<<<<< HEAD
+ +	spin_lock(&qd_lru_lock);
+ +	gfs2_assert(sdp, qd->qd_slot_count);
+ +	qd->qd_slot_count++;
+ +	spin_unlock(&qd_lru_lock);
+ +}
+  
+ +static void gfs2_icbit_munge(struct gfs2_sbd *sdp, unsigned char **bitmap,
+ +			     unsigned int bit, int new_value)
+ +{
+ +	unsigned int c, o, b = bit;
+ +	int old_value;
+ +
+ +	c = b / (8 * PAGE_SIZE);
+ +	b %= 8 * PAGE_SIZE;
+ +	o = b / 8;
+ +	b %= 8;
+ +
+ +	old_value = (bitmap[c][o] & (1 << b));
+ +	gfs2_assert_withdraw(sdp, !old_value != !new_value);
+ +
+ +	if (new_value)
+ +		bitmap[c][o] |= 1 << b;
+ +	else
+ +		bitmap[c][o] &= ~(1 << b);
+++=======
++ 	spin_lock(&sdp->sd_bitmap_lock);
++ 	gfs2_assert(sdp, qd->qd_slot_count);
++ 	qd->qd_slot_count++;
++ 	spin_unlock(&sdp->sd_bitmap_lock);
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  }
+  
+  static void slot_put(struct gfs2_quota_data *qd)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&qd_lru_lock);
+++=======
++ 	spin_lock(&sdp->sd_bitmap_lock);
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  	gfs2_assert(sdp, qd->qd_slot_count);
+  	if (!--qd->qd_slot_count) {
+ -		BUG_ON(!test_and_clear_bit(qd->qd_slot, sdp->sd_quota_bitmap));
+ +		gfs2_icbit_munge(sdp, sdp->sd_quota_bitmap, qd->qd_slot, 0);
+  		qd->qd_slot = -1;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&qd_lru_lock);
+++=======
++ 	spin_unlock(&sdp->sd_bitmap_lock);
+++>>>>>>> 2d9e72303d53 (GFS2: Move quota bitmap operations under their own lock)
+  }
+  
+  static int bh_get(struct gfs2_quota_data *qd)
+@@@ -394,14 -429,13 +426,13 @@@ static int qd_check_sync(struct gfs2_sb
+  	    (sync_gen && (qd->qd_sync_gen >= *sync_gen)))
+  		return 0;
+  
+ -	if (!lockref_get_not_dead(&qd->qd_lockref))
+ -		return 0;
+ -
+  	list_move_tail(&qd->qd_list, &sdp->sd_quota_list);
+ +
+  	set_bit(QDF_LOCKED, &qd->qd_flags);
+ +	gfs2_assert_warn(sdp, !__lockref_is_dead(&qd->qd_lockref));
+ +	lockref_get(&qd->qd_lockref);
+  	qd->qd_change_sync = qd->qd_change;
+- 	gfs2_assert_warn(sdp, qd->qd_slot_count);
+- 	qd->qd_slot_count++;
++ 	slot_hold(qd);
+  	return 1;
+  }
+  
+* Unmerged path fs/gfs2/incore.h
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 08ac6d84be14..a93c8ceb27d8 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -98,6 +98,7 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
+ 	init_waitqueue_head(&sdp->sd_quota_wait);
+ 	INIT_LIST_HEAD(&sdp->sd_trunc_list);
+ 	spin_lock_init(&sdp->sd_trunc_lock);
++	spin_lock_init(&sdp->sd_bitmap_lock);
+ 
+ 	spin_lock_init(&sdp->sd_log_lock);
+ 	atomic_set(&sdp->sd_log_pinned, 0);
+* Unmerged path fs/gfs2/quota.c
