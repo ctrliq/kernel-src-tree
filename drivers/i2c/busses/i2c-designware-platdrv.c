@@ -117,10 +117,8 @@ static int dw_i2c_probe(struct platform_device *pdev)
 	int irq, r;
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "no irq resource?\n");
-		return irq; /* -ENXIO */
-	}
+	if (irq < 0)
+		return irq;
 
 	dev = devm_kzalloc(&pdev->dev, sizeof(struct dw_i2c_dev), GFP_KERNEL);
 	if (!dev)
