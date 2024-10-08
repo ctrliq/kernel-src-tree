@@ -1291,7 +1291,7 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
 					void *driver_data)
 {
 	struct blk_mq_hw_ctx **hctxs;
-	struct blk_mq_ctx *ctx;
+	struct blk_mq_ctx __percpu *ctx;
 	struct request_queue *q;
 	int i;
 
