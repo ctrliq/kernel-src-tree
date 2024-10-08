@@ -110,7 +110,7 @@ struct nvme_queue {
 	struct list_head iod_bio;
 	u32 __iomem *q_db;
 	u16 q_depth;
-	u16 cq_vector;
+	s16 cq_vector;
 	u16 sq_head;
 	u16 sq_tail;
 	u16 cq_head;
