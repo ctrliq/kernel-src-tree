@@ -1,0 +1,151 @@
+xfs: kill xfs_bioerror_relse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8b131973d1628f1a0c5a36fe02269d696bbe60a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8b131973.failed
+
+There is only one caller now - xfs_trans_read_buf_map() - and it has
+very well defined call semantics - read, synchronous, and b_iodone
+is NULL. Hence it's pretty clear what error handling is necessary
+for this case. The bigger problem of untangling
+xfs_trans_read_buf_map error handling is left to a future patch.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 8b131973d1628f1a0c5a36fe02269d696bbe60a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index 84e0417dc6f7,108eba7ad5c1..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1099,81 -1071,9 +1099,84 @@@ xfs_buf_ioerror_alert
+  {
+  	xfs_alert(bp->b_target->bt_mount,
+  "metadata I/O error: block 0x%llx (\"%s\") error %d numblks %d",
+ -		(__uint64_t)XFS_BUF_ADDR(bp), func, -bp->b_error, bp->b_length);
+ +		(__uint64_t)XFS_BUF_ADDR(bp), func, bp->b_error, bp->b_length);
+ +}
+ +
+ +/*
+ + * Called when we want to stop a buffer from getting written or read.
+ + * We attach the EIO error, muck with its flags, and call xfs_buf_ioend
+ + * so that the proper iodone callbacks get called.
+ + */
+ +STATIC int
+ +xfs_bioerror(
+ +	xfs_buf_t *bp)
+ +{
+ +#ifdef XFSERRORDEBUG
+ +	ASSERT(XFS_BUF_ISREAD(bp) || bp->b_iodone);
+ +#endif
+ +
+ +	/*
+ +	 * No need to wait until the buffer is unpinned, we aren't flushing it.
+ +	 */
+ +	xfs_buf_ioerror(bp, EIO);
+ +
+ +	/*
+ +	 * We're calling xfs_buf_ioend, so delete XBF_DONE flag. For
+ +	 * sync IO, xfs_buf_ioend is going to remove a ref here.
+ +	 */
+ +	if (!(bp->b_flags & XBF_ASYNC))
+ +		xfs_buf_hold(bp);
+ +	XFS_BUF_UNREAD(bp);
+ +	XFS_BUF_UNDONE(bp);
+ +	xfs_buf_stale(bp);
+ +
+ +	xfs_buf_ioend(bp, 0);
+ +
+ +	return EIO;
+ +}
+ +
+++<<<<<<< HEAD
+ +/*
+ + * Same as xfs_bioerror, except that we are releasing the buffer
+ + * here ourselves, and avoiding the xfs_buf_ioend call.
+ + * This is meant for userdata errors; metadata bufs come with
+ + * iodone functions attached, so that we can track down errors.
+ + */
+ +int
+ +xfs_bioerror_relse(
+ +	struct xfs_buf	*bp)
+ +{
+ +	int64_t		fl = bp->b_flags;
+ +	/*
+ +	 * No need to wait until the buffer is unpinned.
+ +	 * We aren't flushing it.
+ +	 *
+ +	 * chunkhold expects B_DONE to be set, whether
+ +	 * we actually finish the I/O or not. We don't want to
+ +	 * change that interface.
+ +	 */
+ +	XFS_BUF_UNREAD(bp);
+ +	XFS_BUF_DONE(bp);
+ +	xfs_buf_stale(bp);
+ +	bp->b_iodone = NULL;
+ +	if (!(fl & XBF_ASYNC)) {
+ +		/*
+ +		 * Mark b_error and B_ERROR _both_.
+ +		 * Lot's of chunkcache code assumes that.
+ +		 * There's no reason to mark error for
+ +		 * ASYNC buffers.
+ +		 */
+ +		xfs_buf_ioerror(bp, EIO);
+ +		complete(&bp->b_iowait);
+ +	} else {
+ +		xfs_buf_relse(bp);
+ +	}
+ +
+ +	return EIO;
+  }
+  
+++=======
+++>>>>>>> 8b131973d162 (xfs: kill xfs_bioerror_relse)
+  int
+  xfs_bwrite(
+  	struct xfs_buf		*bp)
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 75e98ced9b68..cede44be4d2f 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -293,8 +293,6 @@ extern void xfs_buf_iomove(xfs_buf_t *, size_t, size_t, void *,
+ #define xfs_buf_zero(bp, off, len) \
+ 	    xfs_buf_iomove((bp), (off), (len), NULL, XBRW_ZERO)
+ 
+-extern int xfs_bioerror_relse(struct xfs_buf *);
+-
+ /* Buffer Utility Routines */
+ extern xfs_caddr_t xfs_buf_offset(xfs_buf_t *, size_t);
+ 
+diff --git a/fs/xfs/xfs_trans_buf.c b/fs/xfs/xfs_trans_buf.c
+index fe41e8efbe96..e4b5be249220 100644
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@ -324,11 +324,14 @@ xfs_trans_read_buf_map(
+ 			 */
+ 			if (XFS_FORCED_SHUTDOWN(mp)) {
+ 				trace_xfs_bdstrat_shut(bp, _RET_IP_);
+-				xfs_bioerror_relse(bp);
+-			} else {
+-				xfs_buf_iorequest(bp);
++				bp->b_flags &= ~(XBF_READ | XBF_DONE);
++				xfs_buf_ioerror(bp, -EIO);
++				xfs_buf_stale(bp);
++				xfs_buf_relse(bp);
++				return -EIO;
+ 			}
+ 
++			xfs_buf_iorequest(bp);
+ 			error = xfs_buf_iowait(bp);
+ 			if (error) {
+ 				xfs_buf_ioerror_alert(bp, __func__);
