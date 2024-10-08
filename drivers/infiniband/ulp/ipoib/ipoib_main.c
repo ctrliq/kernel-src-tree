@@ -1661,9 +1661,7 @@ static void ipoib_add_one(struct ib_device *device)
 	struct net_device *dev;
 	struct ipoib_dev_priv *priv;
 	int s, e, p;
-
-	if (rdma_node_get_transport(device->node_type) != RDMA_TRANSPORT_IB)
-		return;
+	int count = 0;
 
 	dev_list = kmalloc(sizeof *dev_list, GFP_KERNEL);
 	if (!dev_list)
@@ -1680,13 +1678,19 @@ static void ipoib_add_one(struct ib_device *device)
 	}
 
 	for (p = s; p <= e; ++p) {
-		if (rdma_port_get_link_layer(device, p) != IB_LINK_LAYER_INFINIBAND)
+		if (!rdma_protocol_ib(device, p))
 			continue;
 		dev = ipoib_add_port("ib%d", device, p);
 		if (!IS_ERR(dev)) {
 			priv = netdev_priv(dev);
 			list_add_tail(&priv->list, dev_list);
+			count++;
 		}
+	}
+
+	if (!count) {
+		kfree(dev_list);
+		return;
 	}
 
 	ib_set_client_data(device, &ipoib_client, dev_list);
@@ -1696,9 +1700,6 @@ static void ipoib_remove_one(struct ib_device *device)
 {
 	struct ipoib_dev_priv *priv, *tmp;
 	struct list_head *dev_list;
-
-	if (rdma_node_get_transport(device->node_type) != RDMA_TRANSPORT_IB)
-		return;
 
 	dev_list = ib_get_client_data(device, &ipoib_client);
 	if (!dev_list)
