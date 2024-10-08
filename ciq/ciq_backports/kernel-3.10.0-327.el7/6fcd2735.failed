@@ -1,0 +1,487 @@
+net/mlx4_en: Support general selective view of ethtool statistics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Support general selective view of ethtool statistics (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 96.83%
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 6fcd27354b36fb9234aabeecde337b40d5a16842
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6fcd2735.failed
+
+The driver uses a bitmask to indicate which statistics should be
+displayed to the user in ethtool. The bitmask is u64, therefore we are
+limited for a selective view of up to 64 statistics. Extend the bitmap
+in order to show more than 64 statistics.
+
+In addition, add packet statistics to the ethtool display for PF.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6fcd27354b36fb9234aabeecde337b40d5a16842)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 496c65027ae1,b7710321a2ca..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -2433,9 -2469,217 +2433,218 @@@ static const struct net_device_ops mlx4
+  #ifdef CONFIG_MLX4_EN_VXLAN
+  	.ndo_add_vxlan_port	= mlx4_en_add_vxlan_port,
+  	.ndo_del_vxlan_port	= mlx4_en_del_vxlan_port,
+ -	.ndo_features_check	= mlx4_en_features_check,
+  #endif
+ -	.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx4_en_bond {
++ 	struct work_struct work;
++ 	struct mlx4_en_priv *priv;
++ 	int is_bonded;
++ 	struct mlx4_port_map port_map;
++ };
++ 
++ static void mlx4_en_bond_work(struct work_struct *work)
++ {
++ 	struct mlx4_en_bond *bond = container_of(work,
++ 						     struct mlx4_en_bond,
++ 						     work);
++ 	int err = 0;
++ 	struct mlx4_dev *dev = bond->priv->mdev->dev;
++ 
++ 	if (bond->is_bonded) {
++ 		if (!mlx4_is_bonded(dev)) {
++ 			err = mlx4_bond(dev);
++ 			if (err)
++ 				en_err(bond->priv, "Fail to bond device\n");
++ 		}
++ 		if (!err) {
++ 			err = mlx4_port_map_set(dev, &bond->port_map);
++ 			if (err)
++ 				en_err(bond->priv, "Fail to set port map [%d][%d]: %d\n",
++ 				       bond->port_map.port1,
++ 				       bond->port_map.port2,
++ 				       err);
++ 		}
++ 	} else if (mlx4_is_bonded(dev)) {
++ 		err = mlx4_unbond(dev);
++ 		if (err)
++ 			en_err(bond->priv, "Fail to unbond device\n");
++ 	}
++ 	dev_put(bond->priv->dev);
++ 	kfree(bond);
++ }
++ 
++ static int mlx4_en_queue_bond_work(struct mlx4_en_priv *priv, int is_bonded,
++ 				   u8 v2p_p1, u8 v2p_p2)
++ {
++ 	struct mlx4_en_bond *bond = NULL;
++ 
++ 	bond = kzalloc(sizeof(*bond), GFP_ATOMIC);
++ 	if (!bond)
++ 		return -ENOMEM;
++ 
++ 	INIT_WORK(&bond->work, mlx4_en_bond_work);
++ 	bond->priv = priv;
++ 	bond->is_bonded = is_bonded;
++ 	bond->port_map.port1 = v2p_p1;
++ 	bond->port_map.port2 = v2p_p2;
++ 	dev_hold(priv->dev);
++ 	queue_work(priv->mdev->workqueue, &bond->work);
++ 	return 0;
++ }
++ 
++ int mlx4_en_netdev_event(struct notifier_block *this,
++ 			 unsigned long event, void *ptr)
++ {
++ 	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
++ 	u8 port = 0;
++ 	struct mlx4_en_dev *mdev;
++ 	struct mlx4_dev *dev;
++ 	int i, num_eth_ports = 0;
++ 	bool do_bond = true;
++ 	struct mlx4_en_priv *priv;
++ 	u8 v2p_port1 = 0;
++ 	u8 v2p_port2 = 0;
++ 
++ 	if (!net_eq(dev_net(ndev), &init_net))
++ 		return NOTIFY_DONE;
++ 
++ 	mdev = container_of(this, struct mlx4_en_dev, nb);
++ 	dev = mdev->dev;
++ 
++ 	/* Go into this mode only when two network devices set on two ports
++ 	 * of the same mlx4 device are slaves of the same bonding master
++ 	 */
++ 	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH) {
++ 		++num_eth_ports;
++ 		if (!port && (mdev->pndev[i] == ndev))
++ 			port = i;
++ 		mdev->upper[i] = mdev->pndev[i] ?
++ 			netdev_master_upper_dev_get(mdev->pndev[i]) : NULL;
++ 		/* condition not met: network device is a slave */
++ 		if (!mdev->upper[i])
++ 			do_bond = false;
++ 		if (num_eth_ports < 2)
++ 			continue;
++ 		/* condition not met: same master */
++ 		if (mdev->upper[i] != mdev->upper[i-1])
++ 			do_bond = false;
++ 	}
++ 	/* condition not met: 2 salves */
++ 	do_bond = (num_eth_ports ==  2) ? do_bond : false;
++ 
++ 	/* handle only events that come with enough info */
++ 	if ((do_bond && (event != NETDEV_BONDING_INFO)) || !port)
++ 		return NOTIFY_DONE;
++ 
++ 	priv = netdev_priv(ndev);
++ 	if (do_bond) {
++ 		struct netdev_notifier_bonding_info *notifier_info = ptr;
++ 		struct netdev_bonding_info *bonding_info =
++ 			&notifier_info->bonding_info;
++ 
++ 		/* required mode 1, 2 or 4 */
++ 		if ((bonding_info->master.bond_mode != BOND_MODE_ACTIVEBACKUP) &&
++ 		    (bonding_info->master.bond_mode != BOND_MODE_XOR) &&
++ 		    (bonding_info->master.bond_mode != BOND_MODE_8023AD))
++ 			do_bond = false;
++ 
++ 		/* require exactly 2 slaves */
++ 		if (bonding_info->master.num_slaves != 2)
++ 			do_bond = false;
++ 
++ 		/* calc v2p */
++ 		if (do_bond) {
++ 			if (bonding_info->master.bond_mode ==
++ 			    BOND_MODE_ACTIVEBACKUP) {
++ 				/* in active-backup mode virtual ports are
++ 				 * mapped to the physical port of the active
++ 				 * slave */
++ 				if (bonding_info->slave.state ==
++ 				    BOND_STATE_BACKUP) {
++ 					if (port == 1) {
++ 						v2p_port1 = 2;
++ 						v2p_port2 = 2;
++ 					} else {
++ 						v2p_port1 = 1;
++ 						v2p_port2 = 1;
++ 					}
++ 				} else { /* BOND_STATE_ACTIVE */
++ 					if (port == 1) {
++ 						v2p_port1 = 1;
++ 						v2p_port2 = 1;
++ 					} else {
++ 						v2p_port1 = 2;
++ 						v2p_port2 = 2;
++ 					}
++ 				}
++ 			} else { /* Active-Active */
++ 				/* in active-active mode a virtual port is
++ 				 * mapped to the native physical port if and only
++ 				 * if the physical port is up */
++ 				__s8 link = bonding_info->slave.link;
++ 
++ 				if (port == 1)
++ 					v2p_port2 = 2;
++ 				else
++ 					v2p_port1 = 1;
++ 				if ((link == BOND_LINK_UP) ||
++ 				    (link == BOND_LINK_FAIL)) {
++ 					if (port == 1)
++ 						v2p_port1 = 1;
++ 					else
++ 						v2p_port2 = 2;
++ 				} else { /* BOND_LINK_DOWN || BOND_LINK_BACK */
++ 					if (port == 1)
++ 						v2p_port1 = 2;
++ 					else
++ 						v2p_port2 = 1;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	mlx4_en_queue_bond_work(priv, do_bond,
++ 				v2p_port1, v2p_port2);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
++ 			      unsigned long *stats_bitmap)
++ {
++ 	int last_i = 0;
++ 
++ 	bitmap_zero(stats_bitmap, NUM_ALL_STATS);
++ 
++ 	if (mlx4_is_slave(dev)) {
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(rx_packets), 1);
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(tx_packets), 1);
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(rx_bytes), 1);
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(tx_bytes), 1);
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(rx_dropped), 1);
++ 		bitmap_set(stats_bitmap, last_i +
++ 					 MLX4_FIND_NETDEV_STAT(tx_dropped), 1);
++ 	} else {
++ 		bitmap_set(stats_bitmap, last_i, NUM_MAIN_STATS);
++ 	}
++ 	last_i += NUM_MAIN_STATS;
++ 
++ 	bitmap_set(stats_bitmap, last_i, NUM_PORT_STATS);
++ 	last_i += NUM_PORT_STATS;
++ 
++ 	if (!mlx4_is_slave(dev))
++ 		bitmap_set(stats_bitmap, last_i, NUM_PKT_STATS);
++ }
++ 
+++>>>>>>> 6fcd27354b36 (net/mlx4_en: Support general selective view of ethtool statistics)
+  int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+  			struct mlx4_en_port_profile *prof)
+  {
+@@@ -2648,15 -2913,7 +2857,19 @@@
+  		queue_delayed_work(mdev->workqueue, &priv->service_task,
+  				   SERVICE_TASK_DELAY);
+  
+++<<<<<<< HEAD
+ +	mlx4_set_stats_bitmap(mdev->dev, &priv->stats_bitmap);
+ +
+ +	err = register_netdev(dev);
+ +	if (err) {
+ +		en_err(priv, "Netdev registration failed for port %d\n", port);
+ +		goto out;
+ +	}
+ +
+ +	priv->registered = 1;
+++=======
++ 	mlx4_en_set_stats_bitmap(mdev->dev, priv->stats_bitmap);
+++>>>>>>> 6fcd27354b36 (net/mlx4_en: Support general selective view of ethtool statistics)
+  
+  	return 0;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 29a881cbb841,a612bfd921f7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -727,6 -730,9 +727,12 @@@ int mlx4_en_init_netdev(struct mlx4_en_
+  int mlx4_en_start_port(struct net_device *dev);
+  void mlx4_en_stop_port(struct net_device *dev, int detach);
+  
+++<<<<<<< HEAD
+++=======
++ void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
++ 			      unsigned long *stats_bitmap);
++ 
+++>>>>>>> 6fcd27354b36 (net/mlx4_en: Support general selective view of ethtool statistics)
+  void mlx4_en_free_resources(struct mlx4_en_priv *priv);
+  int mlx4_en_alloc_resources(struct mlx4_en_priv *priv);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index ecc91038e731..da67da73b196 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@ -38,6 +38,7 @@
+ #include <linux/mlx4/device.h>
+ #include <linux/in.h>
+ #include <net/ip.h>
++#include <linux/bitmap.h>
+ 
+ #include "mlx4_en.h"
+ #include "en_port.h"
+@@ -104,6 +105,7 @@ static const char mlx4_en_priv_flags[][ETH_GSTRING_LEN] = {
+ };
+ 
+ static const char main_strings[][ETH_GSTRING_LEN] = {
++	/* main statistics */
+ 	"rx_packets", "tx_packets", "rx_bytes", "tx_bytes", "rx_errors",
+ 	"tx_errors", "rx_dropped", "tx_dropped", "multicast", "collisions",
+ 	"rx_length_errors", "rx_over_errors", "rx_crc_errors",
+@@ -222,14 +224,50 @@ static int mlx4_en_set_wol(struct net_device *netdev,
+ 	return err;
+ }
+ 
++struct bitmap_iterator {
++	unsigned long *stats_bitmap;
++	unsigned int count;
++	unsigned int iterator;
++	bool advance_array; /* if set, force no increments */
++};
++
++static inline void bitmap_iterator_init(struct bitmap_iterator *h,
++					unsigned long *stats_bitmap,
++					int count)
++{
++	h->iterator = 0;
++	h->advance_array = !bitmap_empty(stats_bitmap, count);
++	h->count = h->advance_array ? bitmap_weight(stats_bitmap, count)
++		: count;
++	h->stats_bitmap = stats_bitmap;
++}
++
++static inline int bitmap_iterator_test(struct bitmap_iterator *h)
++{
++	return !h->advance_array ? 1 : test_bit(h->iterator, h->stats_bitmap);
++}
++
++static inline int bitmap_iterator_inc(struct bitmap_iterator *h)
++{
++	return h->iterator++;
++}
++
++static inline unsigned int
++bitmap_iterator_count(struct bitmap_iterator *h)
++{
++	return h->count;
++}
++
+ static int mlx4_en_get_sset_count(struct net_device *dev, int sset)
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+-	int bit_count = hweight64(priv->stats_bitmap);
++	struct bitmap_iterator it;
++
++	bitmap_iterator_init(&it, priv->stats_bitmap, NUM_ALL_STATS);
+ 
+ 	switch (sset) {
+ 	case ETH_SS_STATS:
+-		return (priv->stats_bitmap ? bit_count : NUM_ALL_STATS) +
++		return bitmap_iterator_count(&it) +
+ 			(priv->tx_ring_num * 2) +
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 			(priv->rx_ring_num * 5);
+@@ -251,34 +289,25 @@ static void mlx4_en_get_ethtool_stats(struct net_device *dev,
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	int index = 0;
+-	int i, j = 0;
++	int i;
++	struct bitmap_iterator it;
++
++	bitmap_iterator_init(&it, priv->stats_bitmap, NUM_ALL_STATS);
+ 
+ 	spin_lock_bh(&priv->stats_lock);
+ 
+-	if (!(priv->stats_bitmap)) {
+-		for (i = 0; i < NUM_MAIN_STATS; i++)
+-			data[index++] =
+-				((unsigned long *) &priv->stats)[i];
+-		for (i = 0; i < NUM_PORT_STATS; i++)
+-			data[index++] =
+-				((unsigned long *) &priv->port_stats)[i];
+-		for (i = 0; i < NUM_PKT_STATS; i++)
+-			data[index++] =
+-				((unsigned long *) &priv->pkstats)[i];
+-	} else {
+-		for (i = 0; i < NUM_MAIN_STATS; i++) {
+-			if ((priv->stats_bitmap >> j) & 1)
+-				data[index++] =
+-				((unsigned long *) &priv->stats)[i];
+-			j++;
+-		}
+-		for (i = 0; i < NUM_PORT_STATS; i++) {
+-			if ((priv->stats_bitmap >> j) & 1)
+-				data[index++] =
+-				((unsigned long *) &priv->port_stats)[i];
+-			j++;
+-		}
+-	}
++	for (i = 0; i < NUM_MAIN_STATS; i++, bitmap_iterator_inc(&it))
++		if (bitmap_iterator_test(&it))
++			data[index++] = ((unsigned long *)&priv->stats)[i];
++
++	for (i = 0; i < NUM_PORT_STATS; i++, bitmap_iterator_inc(&it))
++		if (bitmap_iterator_test(&it))
++			data[index++] = ((unsigned long *)&priv->port_stats)[i];
++
++	for (i = 0; i < NUM_PKT_STATS; i++, bitmap_iterator_inc(&it))
++		if (bitmap_iterator_test(&it))
++			data[index++] = ((unsigned long *)&priv->pkstats)[i];
++
+ 	for (i = 0; i < priv->tx_ring_num; i++) {
+ 		data[index++] = priv->tx_ring[i]->packets;
+ 		data[index++] = priv->tx_ring[i]->bytes;
+@@ -307,7 +336,10 @@ static void mlx4_en_get_strings(struct net_device *dev,
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	int index = 0;
+-	int i;
++	int i, strings = 0;
++	struct bitmap_iterator it;
++
++	bitmap_iterator_init(&it, priv->stats_bitmap, NUM_ALL_STATS);
+ 
+ 	switch (stringset) {
+ 	case ETH_SS_TEST:
+@@ -320,29 +352,24 @@ static void mlx4_en_get_strings(struct net_device *dev,
+ 
+ 	case ETH_SS_STATS:
+ 		/* Add main counters */
+-		if (!priv->stats_bitmap) {
+-			for (i = 0; i < NUM_MAIN_STATS; i++)
++		for (i = 0; i < NUM_MAIN_STATS; i++, strings++,
++		     bitmap_iterator_inc(&it))
++			if (bitmap_iterator_test(&it))
+ 				strcpy(data + (index++) * ETH_GSTRING_LEN,
+-					main_strings[i]);
+-			for (i = 0; i < NUM_PORT_STATS; i++)
++				       main_strings[strings]);
++
++		for (i = 0; i < NUM_PORT_STATS; i++, strings++,
++		     bitmap_iterator_inc(&it))
++			if (bitmap_iterator_test(&it))
+ 				strcpy(data + (index++) * ETH_GSTRING_LEN,
+-					main_strings[i +
+-					NUM_MAIN_STATS]);
+-			for (i = 0; i < NUM_PKT_STATS; i++)
++				       main_strings[strings]);
++
++		for (i = 0; i < NUM_PKT_STATS; i++, strings++,
++		     bitmap_iterator_inc(&it))
++			if (bitmap_iterator_test(&it))
+ 				strcpy(data + (index++) * ETH_GSTRING_LEN,
+-					main_strings[i +
+-					NUM_MAIN_STATS +
+-					NUM_PORT_STATS]);
+-		} else
+-			for (i = 0; i < NUM_MAIN_STATS + NUM_PORT_STATS; i++) {
+-				if ((priv->stats_bitmap >> i) & 1) {
+-					strcpy(data +
+-					       (index++) * ETH_GSTRING_LEN,
+-					       main_strings[i]);
+-				}
+-				if (!(priv->stats_bitmap >> i))
+-					break;
+-			}
++				       main_strings[strings]);
++
+ 		for (i = 0; i < priv->tx_ring_num; i++) {
+ 			sprintf(data + (index++) * ETH_GSTRING_LEN,
+ 				"tx%d_packets", i);
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
+index abea7a527abf..d7183e30b40b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
+@@ -44,4 +44,8 @@ struct mlx4_en_perf_stats {
+ #define NUM_MAIN_STATS	21
+ #define NUM_ALL_STATS	(NUM_MAIN_STATS + NUM_PORT_STATS + NUM_PKT_STATS + \
+ 			 NUM_PERF_STATS)
++
++#define MLX4_FIND_NETDEV_STAT(n) (offsetof(struct net_device_stats, n) / \
++				  sizeof(((struct net_device_stats *)0)->n))
++
+ #endif
