@@ -1071,7 +1071,7 @@ int audit_receive_filter(int type, int pid, int seq, void *data, size_t datasz)
 			return PTR_ERR(entry);
 
 		err = audit_add_rule(entry);
-		audit_log_rule_change("add rule", &entry->rule, !err);
+		audit_log_rule_change("add_rule", &entry->rule, !err);
 		if (err)
 			audit_free_rule(entry);
 		break;
@@ -1081,7 +1081,7 @@ int audit_receive_filter(int type, int pid, int seq, void *data, size_t datasz)
 			return PTR_ERR(entry);
 
 		err = audit_del_rule(entry);
-		audit_log_rule_change("remove rule", &entry->rule, !err);
+		audit_log_rule_change("remove_rule", &entry->rule, !err);
 		audit_free_rule(entry);
 		break;
 	default:
