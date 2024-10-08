@@ -1,0 +1,414 @@
+NFS: Implement SEEK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Anna Schumaker <Anna.Schumaker@netapp.com>
+commit 1c6dcbe5ceff81c2cf8d929646af675cd59fe7c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1c6dcbe5.failed
+
+The SEEK operation is used when an application makes an lseek call with
+either the SEEK_HOLE or SEEK_DATA flags set.  I fall back on
+nfs_file_llseek() if the server does not have SEEK support.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 1c6dcbe5ceff81c2cf8d929646af675cd59fe7c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4file.c
+diff --cc fs/nfs/nfs4file.c
+index cb5f89c48651,4dffa3a64731..000000000000
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@@ -115,12 -119,33 +119,40 @@@ nfs4_file_fsync(struct file *file, loff
+  	return ret;
+  }
+  
++ #ifdef CONFIG_NFS_V4_2
++ static loff_t nfs4_file_llseek(struct file *filep, loff_t offset, int whence)
++ {
++ 	loff_t ret;
++ 
++ 	switch (whence) {
++ 	case SEEK_HOLE:
++ 	case SEEK_DATA:
++ 		ret = nfs42_proc_llseek(filep, offset, whence);
++ 		if (ret != -ENOTSUPP)
++ 			return ret;
++ 	default:
++ 		return nfs_file_llseek(filep, offset, whence);
++ 	}
++ }
++ #endif /* CONFIG_NFS_V4_2 */
++ 
+  const struct file_operations nfs4_file_operations = {
++ #ifdef CONFIG_NFS_V4_2
++ 	.llseek		= nfs4_file_llseek,
++ #else
+  	.llseek		= nfs_file_llseek,
+++<<<<<<< HEAD
+ +	.read		= do_sync_read,
+ +	.write		= do_sync_write,
+ +	.aio_read	= nfs_file_read,
+ +	.aio_write	= nfs_file_write,
+++=======
++ #endif
++ 	.read		= new_sync_read,
++ 	.write		= new_sync_write,
++ 	.read_iter	= nfs_file_read,
++ 	.write_iter	= nfs_file_write,
+++>>>>>>> 1c6dcbe5ceff (NFS: Implement SEEK)
+  	.mmap		= nfs_file_mmap,
+  	.open		= nfs4_file_open,
+  	.flush		= nfs_file_flush,
+diff --git a/fs/nfs/Makefile b/fs/nfs/Makefile
+index 64e052cd7402..b6c7b6f1c1e6 100644
+--- a/fs/nfs/Makefile
++++ b/fs/nfs/Makefile
+@@ -28,6 +28,7 @@ nfsv4-y := nfs4proc.o nfs4xdr.o nfs4state.o nfs4renewd.o nfs4super.o nfs4file.o
+ nfsv4-$(CONFIG_NFS_USE_LEGACY_DNS) += cache_lib.o
+ nfsv4-$(CONFIG_SYSCTL)	+= nfs4sysctl.o
+ nfsv4-$(CONFIG_NFS_V4_1)	+= pnfs.o pnfs_dev.o
++nfsv4-$(CONFIG_NFS_V4_2)	+= nfs42proc.o
+ 
+ obj-$(CONFIG_PNFS_FILE_LAYOUT) += filelayout/
+ obj-$(CONFIG_PNFS_OBJLAYOUT) += objlayout/
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 3f66e2951a18..c8152c1b4518 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -719,6 +719,7 @@ struct nfs_lock_context *nfs_get_lock_context(struct nfs_open_context *ctx)
+ 	kfree(new);
+ 	return res;
+ }
++EXPORT_SYMBOL_GPL(nfs_get_lock_context);
+ 
+ void nfs_put_lock_context(struct nfs_lock_context *l_ctx)
+ {
+@@ -731,6 +732,7 @@ void nfs_put_lock_context(struct nfs_lock_context *l_ctx)
+ 	spin_unlock(&inode->i_lock);
+ 	kfree(l_ctx);
+ }
++EXPORT_SYMBOL_GPL(nfs_put_lock_context);
+ 
+ /**
+  * nfs_close_context - Common close_context() routine NFSv2/v3
+diff --git a/fs/nfs/nfs42.h b/fs/nfs/nfs42.h
+new file mode 100644
+index 000000000000..d10333a197bf
+--- /dev/null
++++ b/fs/nfs/nfs42.h
+@@ -0,0 +1,14 @@
++/*
++ * Copyright (c) 2014 Anna Schumaker <Anna.Schumaker@Netapp.com>
++ */
++
++#ifndef __LINUX_FS_NFS_NFS4_2_H
++#define __LINUX_FS_NFS_NFS4_2_H
++
++/* nfs4.2proc.c */
++loff_t nfs42_proc_llseek(struct file *, loff_t, int);
++
++/* nfs4.2xdr.h */
++extern struct rpc_procinfo nfs4_2_procedures[];
++
++#endif /* __LINUX_FS_NFS_NFS4_2_H */
+diff --git a/fs/nfs/nfs42proc.c b/fs/nfs/nfs42proc.c
+new file mode 100644
+index 000000000000..0886f1db5917
+--- /dev/null
++++ b/fs/nfs/nfs42proc.c
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) 2014 Anna Schumaker <Anna.Schumaker@Netapp.com>
++ */
++#include <linux/fs.h>
++#include <linux/sunrpc/sched.h>
++#include <linux/nfs.h>
++#include <linux/nfs3.h>
++#include <linux/nfs4.h>
++#include <linux/nfs_xdr.h>
++#include <linux/nfs_fs.h>
++#include "nfs4_fs.h"
++#include "nfs42.h"
++
++static int nfs42_set_rw_stateid(nfs4_stateid *dst, struct file *file,
++				fmode_t fmode)
++{
++	struct nfs_open_context *open;
++	struct nfs_lock_context *lock;
++	int ret;
++
++	open = get_nfs_open_context(nfs_file_open_context(file));
++	lock = nfs_get_lock_context(open);
++	if (IS_ERR(lock)) {
++		put_nfs_open_context(open);
++		return PTR_ERR(lock);
++	}
++
++	ret = nfs4_set_rw_stateid(dst, open, lock, fmode);
++
++	nfs_put_lock_context(lock);
++	put_nfs_open_context(open);
++	return ret;
++}
++
++loff_t nfs42_proc_llseek(struct file *filep, loff_t offset, int whence)
++{
++	struct inode *inode = file_inode(filep);
++	struct nfs42_seek_args args = {
++		.sa_fh		= NFS_FH(inode),
++		.sa_offset	= offset,
++		.sa_what	= (whence == SEEK_HOLE) ?
++					NFS4_CONTENT_HOLE : NFS4_CONTENT_DATA,
++	};
++	struct nfs42_seek_res res;
++	struct rpc_message msg = {
++		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_SEEK],
++		.rpc_argp = &args,
++		.rpc_resp = &res,
++	};
++	struct nfs_server *server = NFS_SERVER(inode);
++	int status;
++
++	if (!(server->caps & NFS_CAP_SEEK))
++		return -ENOTSUPP;
++
++	status = nfs42_set_rw_stateid(&args.sa_stateid, filep, FMODE_READ);
++	if (status)
++		return status;
++
++	nfs_wb_all(inode);
++	status = nfs4_call_sync(server->client, server, &msg,
++				&args.seq_args, &res.seq_res, 0);
++	if (status == -ENOTSUPP)
++		server->caps &= ~NFS_CAP_SEEK;
++	if (status)
++		return status;
++
++	return vfs_setpos(filep, res.sr_offset, inode->i_sb->s_maxbytes);
++}
+diff --git a/fs/nfs/nfs42xdr.c b/fs/nfs/nfs42xdr.c
+new file mode 100644
+index 000000000000..c90469b604b8
+--- /dev/null
++++ b/fs/nfs/nfs42xdr.c
+@@ -0,0 +1,98 @@
++/*
++ * Copyright (c) 2014 Anna Schumaker <Anna.Schumaker@Netapp.com>
++ */
++#ifndef __LINUX_FS_NFS_NFS4_2XDR_H
++#define __LINUX_FS_NFS_NFS4_2XDR_H
++
++#define encode_seek_maxsz		(op_encode_hdr_maxsz + \
++					 encode_stateid_maxsz + \
++					 2 /* offset */ + \
++					 1 /* whence */)
++#define decode_seek_maxsz		(op_decode_hdr_maxsz + \
++					 1 /* eof */ + \
++					 1 /* whence */ + \
++					 2 /* offset */ + \
++					 2 /* length */)
++
++#define NFS4_enc_seek_sz		(compound_encode_hdr_maxsz + \
++					 encode_putfh_maxsz + \
++					 encode_seek_maxsz)
++#define NFS4_dec_seek_sz		(compound_decode_hdr_maxsz + \
++					 decode_putfh_maxsz + \
++					 decode_seek_maxsz)
++
++
++static void encode_seek(struct xdr_stream *xdr,
++			struct nfs42_seek_args *args,
++			struct compound_hdr *hdr)
++{
++	encode_op_hdr(xdr, OP_SEEK, decode_seek_maxsz, hdr);
++	encode_nfs4_stateid(xdr, &args->sa_stateid);
++	encode_uint64(xdr, args->sa_offset);
++	encode_uint32(xdr, args->sa_what);
++}
++
++/*
++ * Encode SEEK request
++ */
++static void nfs4_xdr_enc_seek(struct rpc_rqst *req,
++			      struct xdr_stream *xdr,
++			      struct nfs42_seek_args *args)
++{
++	struct compound_hdr hdr = {
++		.minorversion = nfs4_xdr_minorversion(&args->seq_args),
++	};
++
++	encode_compound_hdr(xdr, req, &hdr);
++	encode_sequence(xdr, &args->seq_args, &hdr);
++	encode_putfh(xdr, args->sa_fh, &hdr);
++	encode_seek(xdr, args, &hdr);
++	encode_nops(&hdr);
++}
++
++static int decode_seek(struct xdr_stream *xdr, struct nfs42_seek_res *res)
++{
++	int status;
++	__be32 *p;
++
++	status = decode_op_hdr(xdr, OP_SEEK);
++	if (status)
++		return status;
++
++	p = xdr_inline_decode(xdr, 4 + 8);
++	if (unlikely(!p))
++		goto out_overflow;
++
++	res->sr_eof = be32_to_cpup(p++);
++	p = xdr_decode_hyper(p, &res->sr_offset);
++	return 0;
++
++out_overflow:
++	print_overflow_msg(__func__, xdr);
++	return -EIO;
++}
++
++/*
++ * Decode SEEK request
++ */
++static int nfs4_xdr_dec_seek(struct rpc_rqst *rqstp,
++			     struct xdr_stream *xdr,
++			     struct nfs42_seek_res *res)
++{
++	struct compound_hdr hdr;
++	int status;
++
++	status = decode_compound_hdr(xdr, &hdr);
++	if (status)
++		goto out;
++	status = decode_sequence(xdr, &res->seq_res, rqstp);
++	if (status)
++		goto out;
++	status = decode_putfh(xdr);
++	if (status)
++		goto out;
++	status = decode_seek(xdr, res);
++out:
++	return status;
++}
++#endif /* __LINUX_FS_NFS_NFS4_2XDR_H */
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index 88a315c883c6..ad57f98fd062 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -226,6 +226,9 @@ int nfs4_replace_transport(struct nfs_server *server,
+ 				const struct nfs4_fs_locations *locations);
+ 
+ /* nfs4proc.c */
++extern int nfs4_call_sync(struct rpc_clnt *, struct nfs_server *,
++			  struct rpc_message *, struct nfs4_sequence_args *,
++			  struct nfs4_sequence_res *, int);
+ extern int nfs4_proc_setclientid(struct nfs_client *, u32, unsigned short, struct rpc_cred *, struct nfs4_setclientid_res *);
+ extern int nfs4_proc_setclientid_confirm(struct nfs_client *, struct nfs4_setclientid_res *arg, struct rpc_cred *);
+ extern int nfs4_proc_get_rootfh(struct nfs_server *, struct nfs_fh *, struct nfs_fsinfo *, bool);
+* Unmerged path fs/nfs/nfs4file.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 21f0de0c3a8b..6f26ab58c2fd 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -891,7 +891,6 @@ static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
+ 	return ret;
+ }
+ 
+-static
+ int nfs4_call_sync(struct rpc_clnt *clnt,
+ 		   struct nfs_server *server,
+ 		   struct rpc_message *msg,
+@@ -8480,7 +8479,8 @@ static const struct nfs4_minor_version_ops nfs_v4_1_minor_ops = {
+ 		| NFS_CAP_CHANGE_ATTR
+ 		| NFS_CAP_POSIX_LOCK
+ 		| NFS_CAP_STATEID_NFSV41
+-		| NFS_CAP_ATOMIC_OPEN_V1,
++		| NFS_CAP_ATOMIC_OPEN_V1
++		| NFS_CAP_SEEK,
+ 	.init_client = nfs41_init_client,
+ 	.shutdown_client = nfs41_shutdown_client,
+ 	.match_stateid = nfs41_match_stateid,
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index bd5ef45c5e50..262375cd98be 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -7438,6 +7438,10 @@ nfs4_stat_to_errno(int stat)
+ 	return -stat;
+ }
+ 
++#ifdef CONFIG_NFS_V4_2
++#include "nfs42xdr.c"
++#endif /* CONFIG_NFS_V4_2 */
++
+ #define PROC(proc, argtype, restype)				\
+ [NFSPROC4_CLNT_##proc] = {					\
+ 	.p_proc   = NFSPROC4_COMPOUND,				\
+@@ -7506,6 +7510,9 @@ struct rpc_procinfo	nfs4_procedures[] = {
+ 			enc_bind_conn_to_session, dec_bind_conn_to_session),
+ 	PROC(DESTROY_CLIENTID,	enc_destroy_clientid,	dec_destroy_clientid),
+ #endif /* CONFIG_NFS_V4_1 */
++#ifdef CONFIG_NFS_V4_2
++	PROC(SEEK,		enc_seek,		dec_seek),
++#endif /* CONFIG_NFS_V4_2 */
+ };
+ 
+ const struct rpc_version nfs_version4 = {
+diff --git a/include/linux/nfs4.h b/include/linux/nfs4.h
+index d56c4c28a3c0..f8d44ba4ff89 100644
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@ -489,6 +489,9 @@ enum {
+ 	NFSPROC4_CLNT_GETDEVICELIST,
+ 	NFSPROC4_CLNT_BIND_CONN_TO_SESSION,
+ 	NFSPROC4_CLNT_DESTROY_CLIENTID,
++
++	/* nfs42 */
++	NFSPROC4_CLNT_SEEK,
+ };
+ 
+ /* nfs41 types */
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 922be2e050f5..a32ba0d7a98f 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -230,5 +230,6 @@ struct nfs_server {
+ #define NFS_CAP_STATEID_NFSV41	(1U << 16)
+ #define NFS_CAP_ATOMIC_OPEN_V1	(1U << 17)
+ #define NFS_CAP_SECURITY_LABEL	(1U << 18)
++#define NFS_CAP_SEEK		(1U << 19)
+ 
+ #endif
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index d874b38c2470..41537aaf6fdc 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1256,6 +1256,25 @@ nfs_free_pnfs_ds_cinfo(struct pnfs_ds_commit_info *cinfo)
+ 
+ #endif /* CONFIG_NFS_V4_1 */
+ 
++#ifdef CONFIG_NFS_V4_2
++struct nfs42_seek_args {
++	struct nfs4_sequence_args	seq_args;
++
++	struct nfs_fh			*sa_fh;
++	nfs4_stateid			sa_stateid;
++	u64				sa_offset;
++	u32				sa_what;
++};
++
++struct nfs42_seek_res {
++	struct nfs4_sequence_res	seq_res;
++	unsigned int			status;
++
++	u32	sr_eof;
++	u64	sr_offset;
++};
++#endif
++
+ struct nfs_page;
+ 
+ #define NFS_PAGEVEC_SIZE	(8U)
