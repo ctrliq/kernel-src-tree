@@ -1,0 +1,166 @@
+mm: add find_get_entries_tag()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] add find_get_entries_tag() (Jeff Moyer) [1346083 1346084 1346445 1346449 1346472 1347091 1359806]
+Rebuild_FUZZ: 92.86%
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 7e7f774984cd88c45c18e7ffaf0256c3e9118043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7e7f7749.failed
+
+Add find_get_entries_tag() to the family of functions that include
+find_get_entries(), find_get_pages() and find_get_pages_tag().  This is
+needed for DAX dirty page handling because we need a list of both page
+offsets and radix tree entries ('indices' and 'entries' in this
+function) that are marked with the PAGECACHE_TAG_TOWRITE tag.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "J. Bruce Fields" <bfields@fieldses.org>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jeff Layton <jlayton@poochiereds.net>
+	Cc: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7e7f774984cd88c45c18e7ffaf0256c3e9118043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index 813fbe54f73b,1e215fc36c83..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -1367,37 -1500,72 +1367,106 @@@ repeat
+  EXPORT_SYMBOL(find_get_pages_tag);
+  
+  /**
+++<<<<<<< HEAD
+ + * grab_cache_page_nowait - returns locked page at given index in given cache
+ + * @mapping: target address_space
+ + * @index: the page index
+ + *
+ + * Same as grab_cache_page(), but do not wait if the page is unavailable.
+ + * This is intended for speculative data generators, where the data can
+ + * be regenerated if the page couldn't be grabbed.  This routine should
+ + * be safe to call while holding the lock for another page.
+ + *
+ + * Clear __GFP_FS when allocating the page to avoid recursion into the fs
+ + * and deadlock against the caller's locked page.
+ + */
+ +struct page *
+ +grab_cache_page_nowait(struct address_space *mapping, pgoff_t index)
+ +{
+ +	struct page *page = find_get_page(mapping, index);
+ +
+ +	if (page) {
+ +		if (trylock_page(page))
+ +			return page;
+ +		page_cache_release(page);
+ +		return NULL;
+ +	}
+ +	page = __page_cache_alloc(mapping_gfp_mask(mapping) & ~__GFP_FS);
+ +	if (page && add_to_page_cache_lru(page, mapping, index, GFP_NOFS)) {
+ +		page_cache_release(page);
+ +		page = NULL;
+ +	}
+ +	return page;
+ +}
+ +EXPORT_SYMBOL(grab_cache_page_nowait);
+++=======
++  * find_get_entries_tag - find and return entries that match @tag
++  * @mapping:	the address_space to search
++  * @start:	the starting page cache index
++  * @tag:	the tag index
++  * @nr_entries:	the maximum number of entries
++  * @entries:	where the resulting entries are placed
++  * @indices:	the cache indices corresponding to the entries in @entries
++  *
++  * Like find_get_entries, except we only return entries which are tagged with
++  * @tag.
++  */
++ unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
++ 			int tag, unsigned int nr_entries,
++ 			struct page **entries, pgoff_t *indices)
++ {
++ 	void **slot;
++ 	unsigned int ret = 0;
++ 	struct radix_tree_iter iter;
++ 
++ 	if (!nr_entries)
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ restart:
++ 	radix_tree_for_each_tagged(slot, &mapping->page_tree,
++ 				   &iter, start, tag) {
++ 		struct page *page;
++ repeat:
++ 		page = radix_tree_deref_slot(slot);
++ 		if (unlikely(!page))
++ 			continue;
++ 		if (radix_tree_exception(page)) {
++ 			if (radix_tree_deref_retry(page)) {
++ 				/*
++ 				 * Transient condition which can only trigger
++ 				 * when entry at index 0 moves out of or back
++ 				 * to root: none yet gotten, safe to restart.
++ 				 */
++ 				goto restart;
++ 			}
++ 
++ 			/*
++ 			 * A shadow entry of a recently evicted page, a swap
++ 			 * entry from shmem/tmpfs or a DAX entry.  Return it
++ 			 * without attempting to raise page count.
++ 			 */
++ 			goto export;
++ 		}
++ 		if (!page_cache_get_speculative(page))
++ 			goto repeat;
++ 
++ 		/* Has the page moved? */
++ 		if (unlikely(page != *slot)) {
++ 			page_cache_release(page);
++ 			goto repeat;
++ 		}
++ export:
++ 		indices[ret] = iter.index;
++ 		entries[ret] = page;
++ 		if (++ret == nr_entries)
++ 			break;
++ 	}
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ EXPORT_SYMBOL(find_get_entries_tag);
+++>>>>>>> 7e7f774984cd (mm: add find_get_entries_tag())
+  
+  /*
+   * CD/DVDs are error prone. When a medium error occurs, the driver may fail
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 64c42592c528..9b0a6a52de41 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -274,6 +274,9 @@ unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t start,
+ 			       unsigned int nr_pages, struct page **pages);
+ unsigned find_get_pages_tag(struct address_space *mapping, pgoff_t *index,
+ 			int tag, unsigned int nr_pages, struct page **pages);
++unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
++			int tag, unsigned int nr_entries,
++			struct page **entries, pgoff_t *indices);
+ 
+ struct page *grab_cache_page_write_begin(struct address_space *mapping,
+ 			pgoff_t index, unsigned flags);
+* Unmerged path mm/filemap.c
