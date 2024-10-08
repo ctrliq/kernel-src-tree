@@ -1,0 +1,108 @@
+mm, hugetlb: fix race in region tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] hugetlb: fix race in region tracking (Aristeu Rozanski) [1252129]
+Rebuild_FUZZ: 94.74%
+commit-author Davidlohr Bueso <davidlohr@hp.com>
+commit 7b24d8616be33616efd41ff67d3c76362c60ca84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7b24d861.failed
+
+There is a race condition if we map a same file on different processes.
+Region tracking is protected by mmap_sem and hugetlb_instantiation_mutex.
+When we do mmap, we don't grab a hugetlb_instantiation_mutex, but only
+mmap_sem (exclusively).  This doesn't prevent other tasks from modifying
+the region structure, so it can be modified by two processes
+concurrently.
+
+To solve this, introduce a spinlock to resv_map and make region
+manipulation function grab it before they do actual work.
+
+[davidlohr@hp.com: updated changelog]
+	Signed-off-by: Davidlohr Bueso <davidlohr@hp.com>
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Suggested-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Acked-by: David Gibson <david@gibson.dropbear.id.au>
+	Cc: David Gibson <david@gibson.dropbear.id.au>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7b24d8616be33616efd41ff67d3c76362c60ca84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 7af5a0235d54,5a2515a774b5..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -142,15 -135,8 +142,20 @@@ static inline struct hugepage_subpool *
+   * Region tracking -- allows tracking of reservations and instantiated pages
+   *                    across the pages in a mapping.
+   *
+++<<<<<<< HEAD
+ + * The region data structures are protected by a combination of the mmap_sem
+ + * and the hugetlb_instantion_mutex.  To access or modify a region the caller
+ + * must either hold the mmap_sem for write, or the mmap_sem for read and
+ + * the hugetlb_instantiation mutex:
+ + *
+ + *	down_write(&mm->mmap_sem);
+ + * or
+ + *	down_read(&mm->mmap_sem);
+ + *	mutex_lock(&hugetlb_instantiation_mutex);
+++=======
++  * The region data structures are embedded into a resv_map and
++  * protected by a resv_map's lock
+++>>>>>>> 7b24d8616be3 (mm, hugetlb: fix race in region tracking)
+   */
+  struct file_region {
+  	struct list_head link;
+@@@ -158,10 -144,12 +163,11 @@@
+  	long to;
+  };
+  
+ -static long region_add(struct resv_map *resv, long f, long t)
+ +static long region_add(struct list_head *head, long f, long t)
+  {
+ -	struct list_head *head = &resv->regions;
+  	struct file_region *rg, *nrg, *trg;
+  
++ 	spin_lock(&resv->lock);
+  	/* Locate the region we are either in or before. */
+  	list_for_each_entry(rg, head, link)
+  		if (f <= rg->to)
+@@@ -194,11 -183,14 +201,18 @@@
+  	return 0;
+  }
+  
+ -static long region_chg(struct resv_map *resv, long f, long t)
+ +static long region_chg(struct list_head *head, long f, long t)
+  {
+++<<<<<<< HEAD
+ +	struct file_region *rg, *nrg;
+++=======
++ 	struct list_head *head = &resv->regions;
++ 	struct file_region *rg, *nrg = NULL;
+++>>>>>>> 7b24d8616be3 (mm, hugetlb: fix race in region tracking)
+  	long chg = 0;
+  
++ retry:
++ 	spin_lock(&resv->lock);
+  	/* Locate the region we are before or in. */
+  	list_for_each_entry(rg, head, link)
+  		if (f <= rg->to)
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 4e6427fbf7db..52062d54edc4 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -27,6 +27,7 @@ struct hugepage_subpool {
+ 
+ struct resv_map {
+ 	struct kref refs;
++	spinlock_t lock;
+ 	struct list_head regions;
+ };
+ extern struct resv_map *resv_map_alloc(void);
+* Unmerged path mm/hugetlb.c
