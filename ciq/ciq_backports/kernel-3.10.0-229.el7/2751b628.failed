@@ -1,0 +1,187 @@
+powerpc: Fix SMP issues with ppc64le ABIv2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] Fix SMP issues with ppc64le ABIv2 (Don Zickus) [1127366]
+Rebuild_FUZZ: 88.00%
+commit-author Anton Blanchard <anton@samba.org>
+commit 2751b628c97e66e61f482935ca59148751972941
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2751b628.failed
+
+There is no need to put a function descriptor in
+__secondary_hold_spinloop. Use ppc_function_entry to get the
+instruction address and put it in __secondary_hold_spinloop instead.
+
+Also fix an issue where we assumed cur_cpu_spec held a function
+descriptor.
+
+	Signed-off-by: Anton Blanchard <anton@samba.org>
+(cherry picked from commit 2751b628c97e66e61f482935ca59148751972941)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/smp.c
+diff --cc arch/powerpc/platforms/powernv/smp.c
+index e91f28f2ca7b,b370b86263a6..000000000000
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@@ -30,7 -30,7 +30,11 @@@
+  #include <asm/cputhreads.h>
+  #include <asm/xics.h>
+  #include <asm/opal.h>
+++<<<<<<< HEAD
+ +#include <asm/runlatch.h>
+++=======
++ #include <asm/code-patching.h>
+++>>>>>>> 2751b628c97e (powerpc: Fix SMP issues with ppc64le ABIv2)
+  
+  #include "powernv.h"
+  
+diff --git a/arch/powerpc/kernel/head_64.S b/arch/powerpc/kernel/head_64.S
+index c999bfe1a439..e31c29ece7f8 100644
+--- a/arch/powerpc/kernel/head_64.S
++++ b/arch/powerpc/kernel/head_64.S
+@@ -75,10 +75,9 @@ END_FTR_SECTION(0, 1)
+ 	/* Catch branch to 0 in real mode */
+ 	trap
+ 
+-	/* Secondary processors spin on this value until it becomes nonzero.
+-	 * When it does it contains the real address of the descriptor
+-	 * of the function that the cpu should jump to to continue
+-	 * initialization.
++	/* Secondary processors spin on this value until it becomes non-zero.
++	 * When non-zero, it contains the real address of the function the cpu
++	 * should jump to.
+ 	 */
+ 	.balign 8
+ 	.globl  __secondary_hold_spinloop
+@@ -146,9 +145,6 @@ __secondary_hold:
+ #if defined(CONFIG_SMP) || defined(CONFIG_KEXEC)
+ #ifdef CONFIG_PPC_BOOK3E
+ 	tovirt(r12,r12)
+-#endif
+-#if !defined(_CALL_ELF) || _CALL_ELF != 2
+-	ld	r12,0(r12)		/* deref function descriptor */
+ #endif
+ 	mtctr	r12
+ 	mr	r3,r24
+@@ -265,10 +261,12 @@ generic_secondary_common_init:
+ 	/* See if we need to call a cpu state restore handler */
+ 	LOAD_REG_ADDR(r23, cur_cpu_spec)
+ 	ld	r23,0(r23)
+-	ld	r23,CPU_SPEC_RESTORE(r23)
+-	cmpdi	0,r23,0
++	ld	r12,CPU_SPEC_RESTORE(r23)
++	cmpdi	0,r12,0
+ 	beq	3f
+-	ld	r12,0(r23)
++#if !defined(_CALL_ELF) || _CALL_ELF != 2
++	ld	r12,0(r12)
++#endif
+ 	mtctr	r12
+ 	bctrl
+ 
+diff --git a/arch/powerpc/kernel/setup_64.c b/arch/powerpc/kernel/setup_64.c
+index ce84cd70d839..0c6855f2358a 100644
+--- a/arch/powerpc/kernel/setup_64.c
++++ b/arch/powerpc/kernel/setup_64.c
+@@ -294,7 +294,7 @@ void smp_release_cpus(void)
+ 
+ 	ptr  = (unsigned long *)((unsigned long)&__secondary_hold_spinloop
+ 			- PHYSICAL_START);
+-	*ptr = __pa(generic_secondary_smp_init);
++	*ptr = ppc_function_entry(generic_secondary_smp_init);
+ 
+ 	/* And wait a bit for them to catch up */
+ 	for (i = 0; i < 100000; i++) {
+diff --git a/arch/powerpc/platforms/85xx/smp.c b/arch/powerpc/platforms/85xx/smp.c
+index 67f9777cde8c..f5268edde0c5 100644
+--- a/arch/powerpc/platforms/85xx/smp.c
++++ b/arch/powerpc/platforms/85xx/smp.c
+@@ -26,6 +26,7 @@
+ #include <asm/cacheflush.h>
+ #include <asm/dbell.h>
+ #include <asm/fsl_guts.h>
++#include <asm/code-patching.h>
+ 
+ #include <sysdev/fsl_soc.h>
+ #include <sysdev/mpic.h>
+@@ -241,7 +242,7 @@ out:
+ 	flush_spin_table(spin_table);
+ 	out_be32(&spin_table->pir, hw_cpu);
+ 	out_be64((u64 *)(&spin_table->addr_h),
+-	  __pa((u64)*((unsigned long long *)generic_secondary_smp_init)));
++		__pa(ppc_function_entry(generic_secondary_smp_init)));
+ 	flush_spin_table(spin_table);
+ #endif
+ 
+diff --git a/arch/powerpc/platforms/cell/smp.c b/arch/powerpc/platforms/cell/smp.c
+index 90745eaa45fe..c8017a7bcabd 100644
+--- a/arch/powerpc/platforms/cell/smp.c
++++ b/arch/powerpc/platforms/cell/smp.c
+@@ -40,6 +40,7 @@
+ #include <asm/firmware.h>
+ #include <asm/rtas.h>
+ #include <asm/cputhreads.h>
++#include <asm/code-patching.h>
+ 
+ #include "interrupt.h"
+ #include <asm/udbg.h>
+@@ -70,8 +71,8 @@ static cpumask_t of_spin_map;
+ static inline int smp_startup_cpu(unsigned int lcpu)
+ {
+ 	int status;
+-	unsigned long start_here = __pa((u32)*((unsigned long *)
+-					       generic_secondary_smp_init));
++	unsigned long start_here =
++			__pa(ppc_function_entry(generic_secondary_smp_init));
+ 	unsigned int pcpu;
+ 	int start_cpu;
+ 
+* Unmerged path arch/powerpc/platforms/powernv/smp.c
+diff --git a/arch/powerpc/platforms/pseries/smp.c b/arch/powerpc/platforms/pseries/smp.c
+index 24f58cb0a543..a3555b10c1a5 100644
+--- a/arch/powerpc/platforms/pseries/smp.c
++++ b/arch/powerpc/platforms/pseries/smp.c
+@@ -44,6 +44,7 @@
+ #include <asm/xics.h>
+ #include <asm/dbell.h>
+ #include <asm/plpar_wrappers.h>
++#include <asm/code-patching.h>
+ 
+ #include "pseries.h"
+ #include "offline_states.h"
+@@ -96,8 +97,8 @@ int smp_query_cpu_stopped(unsigned int pcpu)
+ static inline int smp_startup_cpu(unsigned int lcpu)
+ {
+ 	int status;
+-	unsigned long start_here = __pa((u32)*((unsigned long *)
+-					       generic_secondary_smp_init));
++	unsigned long start_here =
++			__pa(ppc_function_entry(generic_secondary_smp_init));
+ 	unsigned int pcpu;
+ 	int start_cpu;
+ 
+diff --git a/arch/powerpc/platforms/wsp/scom_smp.c b/arch/powerpc/platforms/wsp/scom_smp.c
+index 268bc899c1f7..8c79ce016cf1 100644
+--- a/arch/powerpc/platforms/wsp/scom_smp.c
++++ b/arch/powerpc/platforms/wsp/scom_smp.c
+@@ -20,6 +20,7 @@
+ #include <asm/reg_a2.h>
+ #include <asm/scom.h>
+ #include <asm/udbg.h>
++#include <asm/code-patching.h>
+ 
+ #include "wsp.h"
+ 
+@@ -405,7 +406,7 @@ int a2_scom_startup_cpu(unsigned int lcpu, int thr_idx, struct device_node *np)
+ 			goto fail;
+ 	}
+ 
+-	start_here = *(unsigned long *)(core_setup ? generic_secondary_smp_init
++	start_here = ppc_function_entry(core_setup ? generic_secondary_smp_init
+ 					: generic_secondary_thread_init);
+ 	pr_devel("CPU%d entry point at 0x%lx...\n", lcpu, start_here);
+ 
