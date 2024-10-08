@@ -1,0 +1,248 @@
+zram: close race by open overriding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+commit f405c445a4866caa43101c231721123805a23bbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f405c445.failed
+
+[ Original patch from Minchan Kim <minchan@kernel.org> ]
+
+Commit ba6b17d68c8e ("zram: fix umount-reset_store-mount race
+condition") introduced bdev->bd_mutex to protect a race between mount
+and reset.  At that time, we don't have dynamic zram-add/remove feature
+so it was okay.
+
+However, as we introduce dynamic device feature, bd_mutex became
+trouble.
+
+	CPU 0
+
+echo 1 > /sys/block/zram<id>/reset
+  -> kernfs->s_active(A)
+    -> zram:reset_store->bd_mutex(B)
+
+	CPU 1
+
+echo <id> > /sys/class/zram/zram-remove
+  ->zram:zram_remove: bd_mutex(B)
+  -> sysfs_remove_group
+    -> kernfs->s_active(A)
+
+IOW, AB -> BA deadlock
+
+The reason we are holding bd_mutex for zram_remove is to prevent
+any incoming open /dev/zram[0-9]. Otherwise, we could remove zram
+others already have opened. But it causes above deadlock problem.
+
+To fix the problem, this patch overrides block_device.open and
+it returns -EBUSY if zram asserts he claims zram to reset so any
+incoming open will be failed so we don't need to hold bd_mutex
+for zram_remove ayn more.
+
+This patch is to prepare for zram-add/remove feature.
+
+[sergey.senozhatsky@gmail.com: simplify reset_store()]
+	Signed-off-by: Minchan Kim <minchan@kernel.org>
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f405c445a4866caa43101c231721123805a23bbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index f4772ab5159f,6a3b36d5bad6..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -772,132 -1082,50 +779,162 @@@ static ssize_t reset_store(struct devic
+  	if (!bdev)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* Do not reset an active device! */
+ +	if (bdev->bd_openers) {
+ +		ret = -EBUSY;
+ +		goto out;
+++=======
++ 	mutex_lock(&bdev->bd_mutex);
++ 	/* Do not reset an active device or claimed device */
++ 	if (bdev->bd_openers || zram->claim) {
++ 		mutex_unlock(&bdev->bd_mutex);
++ 		bdput(bdev);
++ 		return -EBUSY;
+++>>>>>>> f405c445a486 (zram: close race by open overriding)
+  	}
+  
+- 	ret = kstrtou16(buf, 10, &do_reset);
+- 	if (ret)
+- 		goto out;
++ 	/* From now on, anyone can't open /dev/zram[0-9] */
++ 	zram->claim = true;
++ 	mutex_unlock(&bdev->bd_mutex);
+  
+- 	if (!do_reset) {
+- 		ret = -EINVAL;
+- 		goto out;
+- 	}
+- 
+- 	/* Make sure all pending I/O is finished */
++ 	/* Make sure all the pending I/O are finished */
+  	fsync_bdev(bdev);
+++<<<<<<< HEAD
+ +	bdput(bdev);
+ +
+ +	zram_reset_device(zram, true);
+ +	return len;
+ +
+ +out:
+ +	bdput(bdev);
+++=======
++ 	zram_reset_device(zram);
++ 	revalidate_disk(zram->disk);
++ 	bdput(bdev);
++ 
++ 	mutex_lock(&bdev->bd_mutex);
++ 	zram->claim = false;
++ 	mutex_unlock(&bdev->bd_mutex);
++ 
++ 	return len;
++ }
++ 
++ static int zram_open(struct block_device *bdev, fmode_t mode)
++ {
++ 	int ret = 0;
++ 	struct zram *zram;
++ 
++ 	WARN_ON(!mutex_is_locked(&bdev->bd_mutex));
++ 
++ 	zram = bdev->bd_disk->private_data;
++ 	/* zram was claimed to reset so open request fails */
++ 	if (zram->claim)
++ 		ret = -EBUSY;
++ 
+++>>>>>>> f405c445a486 (zram: close race by open overriding)
+  	return ret;
+  }
+  
+ +static void __zram_make_request(struct zram *zram, struct bio *bio, int rw)
+ +{
+ +	int i, offset;
+ +	u32 index;
+ +	struct bio_vec *bvec;
+ +
+ +	switch (rw) {
+ +	case READ:
+ +		atomic64_inc(&zram->stats.num_reads);
+ +		break;
+ +	case WRITE:
+ +		atomic64_inc(&zram->stats.num_writes);
+ +		break;
+ +	}
+ +
+ +	index = bio->bi_sector >> SECTORS_PER_PAGE_SHIFT;
+ +	offset = (bio->bi_sector & (SECTORS_PER_PAGE - 1)) << SECTOR_SHIFT;
+ +
+ +	bio_for_each_segment(bvec, bio, i) {
+ +		int max_transfer_size = PAGE_SIZE - offset;
+ +
+ +		if (bvec->bv_len > max_transfer_size) {
+ +			/*
+ +			 * zram_bvec_rw() can only make operation on a single
+ +			 * zram page. Split the bio vector.
+ +			 */
+ +			struct bio_vec bv;
+ +
+ +			bv.bv_page = bvec->bv_page;
+ +			bv.bv_len = max_transfer_size;
+ +			bv.bv_offset = bvec->bv_offset;
+ +
+ +			if (zram_bvec_rw(zram, &bv, index, offset, bio, rw) < 0)
+ +				goto out;
+ +
+ +			bv.bv_len = bvec->bv_len - max_transfer_size;
+ +			bv.bv_offset += max_transfer_size;
+ +			if (zram_bvec_rw(zram, &bv, index+1, 0, bio, rw) < 0)
+ +				goto out;
+ +		} else
+ +			if (zram_bvec_rw(zram, bvec, index, offset, bio, rw)
+ +			    < 0)
+ +				goto out;
+ +
+ +		update_position(&index, &offset, bvec);
+ +	}
+ +
+ +	set_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	bio_endio(bio, 0);
+ +	return;
+ +
+ +out:
+ +	bio_io_error(bio);
+ +}
+ +
+ +/*
+ + * Handler function for all zram I/O requests.
+ + */
+ +static void zram_make_request(struct request_queue *queue, struct bio *bio)
+ +{
+ +	struct zram *zram = queue->queuedata;
+ +
+ +	down_read(&zram->init_lock);
+ +	if (unlikely(!init_done(zram)))
+ +		goto error;
+ +
+ +	if (!valid_io_request(zram, bio)) {
+ +		atomic64_inc(&zram->stats.invalid_io);
+ +		goto error;
+ +	}
+ +
+ +	__zram_make_request(zram, bio, bio_data_dir(bio));
+ +	up_read(&zram->init_lock);
+ +
+ +	return;
+ +
+ +error:
+ +	up_read(&zram->init_lock);
+ +	bio_io_error(bio);
+ +}
+ +
+ +static void zram_slot_free_notify(struct block_device *bdev,
+ +				unsigned long index)
+ +{
+ +	struct zram *zram;
+ +	struct zram_meta *meta;
+ +
+ +	zram = bdev->bd_disk->private_data;
+ +	meta = zram->meta;
+ +
+ +	write_lock(&meta->tb_lock);
+ +	zram_free_page(zram, index);
+ +	write_unlock(&meta->tb_lock);
+ +	atomic64_inc(&zram->stats.notify_free);
+ +}
+ +
+  static const struct block_device_operations zram_devops = {
++ 	.open = zram_open,
+  	.swap_slot_free_notify = zram_slot_free_notify,
+ -	.rw_page = zram_rw_page,
+  	.owner = THIS_MODULE
+  };
+  
+* Unmerged path drivers/block/zram/zram_drv.c
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index 7d655c176e09..67beb7bdbf9e 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -107,5 +107,9 @@ struct zram {
+ 	unsigned long limit_pages;
+ 
+ 	char compressor[10];
++	/*
++	 * zram is claimed so open request will be failed
++	 */
++	bool claim; /* Protected by bdev->bd_mutex */
+ };
+ #endif
