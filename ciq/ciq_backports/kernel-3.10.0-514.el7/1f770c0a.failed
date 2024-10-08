@@ -1,0 +1,177 @@
+netlink: Fix autobind race condition that leads to zero port ID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 1f770c0a09da855a2b51af6d19de97fb955eca85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1f770c0a.failed
+
+The commit c0bb07df7d981e4091432754e30c9c720e2c0c78 ("netlink:
+Reset portid after netlink_insert failure") introduced a race
+condition where if two threads try to autobind the same socket
+one of them may end up with a zero port ID.  This led to kernel
+deadlocks that were observed by multiple people.
+
+This patch reverts that commit and instead fixes it by introducing
+a separte rhash_portid variable so that the real portid is only set
+after the socket has been successfully hashed.
+
+Fixes: c0bb07df7d98 ("netlink: Reset portid after netlink_insert failure")
+	Reported-by: Tejun Heo <tj@kernel.org>
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1f770c0a09da855a2b51af6d19de97fb955eca85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/af_netlink.c
+diff --cc net/netlink/af_netlink.c
+index 8c03375d5550,9f51608b968a..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -1018,25 -1021,46 +1018,54 @@@ struct netlink_compare_ar
+  	u32 portid;
+  };
+  
+ -/* Doing sizeof directly may yield 4 extra bytes on 64-bit. */
+ -#define netlink_compare_arg_len \
+ -	(offsetof(struct netlink_compare_arg, portid) + sizeof(u32))
+ -
+ -static inline int netlink_compare(struct rhashtable_compare_arg *arg,
+ -				  const void *ptr)
+ +static bool netlink_compare(void *ptr, void *arg)
+  {
+ -	const struct netlink_compare_arg *x = arg->key;
+ -	const struct netlink_sock *nlk = ptr;
+ +	struct netlink_compare_arg *x = arg;
+ +	struct sock *sk = ptr;
+  
+++<<<<<<< HEAD
+ +	return nlk_sk(sk)->portid == x->portid &&
+ +	       net_eq(sock_net(sk), x->net);
+++=======
++ 	return nlk->rhash_portid != x->portid ||
++ 	       !net_eq(sock_net(&nlk->sk), read_pnet(&x->pnet));
++ }
++ 
++ static void netlink_compare_arg_init(struct netlink_compare_arg *arg,
++ 				     struct net *net, u32 portid)
++ {
++ 	memset(arg, 0, sizeof(*arg));
++ 	write_pnet(&arg->pnet, net);
++ 	arg->portid = portid;
+++>>>>>>> 1f770c0a09da (netlink: Fix autobind race condition that leads to zero port ID)
+  }
+  
+  static struct sock *__netlink_lookup(struct netlink_table *table, u32 portid,
+  				     struct net *net)
+  {
+ -	struct netlink_compare_arg arg;
+ +	struct netlink_compare_arg arg = {
+ +		.net = net,
+ +		.portid = portid,
+ +	};
+  
+++<<<<<<< HEAD
+ +	return rhashtable_lookup_compare(&table->hash, &portid,
+ +					 &netlink_compare, &arg);
+++=======
++ 	netlink_compare_arg_init(&arg, net, portid);
++ 	return rhashtable_lookup_fast(&table->hash, &arg,
++ 				      netlink_rhashtable_params);
++ }
++ 
++ static int __netlink_insert(struct netlink_table *table, struct sock *sk)
++ {
++ 	struct netlink_compare_arg arg;
++ 
++ 	netlink_compare_arg_init(&arg, sock_net(sk), nlk_sk(sk)->rhash_portid);
++ 	return rhashtable_lookup_insert_key(&table->hash, &arg,
++ 					    &nlk_sk(sk)->node,
++ 					    netlink_rhashtable_params);
+++>>>>>>> 1f770c0a09da (netlink: Fix autobind race condition that leads to zero port ID)
+  }
+  
+  static struct sock *netlink_lookup(struct net *net, int protocol, u32 portid)
+@@@ -1093,15 -1115,30 +1122,34 @@@ static int netlink_insert(struct sock *
+  		goto err;
+  
+  	err = -ENOMEM;
+ -	if (BITS_PER_LONG > 32 &&
+ -	    unlikely(atomic_read(&table->hash.nelems) >= UINT_MAX))
+ +	if (BITS_PER_LONG > 32 && unlikely(table->hash.nelems >= UINT_MAX))
+  		goto err;
+  
+- 	nlk_sk(sk)->portid = portid;
++ 	nlk_sk(sk)->rhash_portid = portid;
+  	sock_hold(sk);
+++<<<<<<< HEAD
+ +	rhashtable_insert(&table->hash, &nlk_sk(sk)->node);
+ +	err = 0;
+++=======
++ 
++ 	err = __netlink_insert(table, sk);
++ 	if (err) {
++ 		/* In case the hashtable backend returns with -EBUSY
++ 		 * from here, it must not escape to the caller.
++ 		 */
++ 		if (unlikely(err == -EBUSY))
++ 			err = -EOVERFLOW;
++ 		if (err == -EEXIST)
++ 			err = -EADDRINUSE;
++ 		sock_put(sk);
++ 		goto err;
++ 	}
++ 
++ 	nlk_sk(sk)->portid = portid;
++ 
+++>>>>>>> 1f770c0a09da (netlink: Fix autobind race condition that leads to zero port ID)
+  err:
+ -	release_sock(sk);
+ +	mutex_unlock(&nl_sk_hash_lock);
+  	return err;
+  }
+  
+@@@ -3161,6 -3268,23 +3209,26 @@@ static struct pernet_operations __net_i
+  	.exit = netlink_net_exit,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline u32 netlink_hash(const void *data, u32 len, u32 seed)
++ {
++ 	const struct netlink_sock *nlk = data;
++ 	struct netlink_compare_arg arg;
++ 
++ 	netlink_compare_arg_init(&arg, sock_net(&nlk->sk), nlk->rhash_portid);
++ 	return jhash2((u32 *)&arg, netlink_compare_arg_len / sizeof(u32), seed);
++ }
++ 
++ static const struct rhashtable_params netlink_rhashtable_params = {
++ 	.head_offset = offsetof(struct netlink_sock, node),
++ 	.key_len = netlink_compare_arg_len,
++ 	.obj_hashfn = netlink_hash,
++ 	.obj_cmpfn = netlink_compare,
++ 	.automatic_shrinking = true,
++ };
++ 
+++>>>>>>> 1f770c0a09da (netlink: Fix autobind race condition that leads to zero port ID)
+  static int __init netlink_proto_init(void)
+  {
+  	int i;
+* Unmerged path net/netlink/af_netlink.c
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 5b5d85a60dfc..d2bfcc76e304 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -24,6 +24,7 @@ struct netlink_ring {
+ struct netlink_sock {
+ 	/* struct sock has to be the first member of netlink_sock */
+ 	struct sock		sk;
++	u32			rhash_portid;
+ 	u32			portid;
+ 	u32			dst_portid;
+ 	u32			dst_group;
