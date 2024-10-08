@@ -630,7 +630,7 @@ void qlcnic_prune_lb_filters(struct qlcnic_adapter *adapter)
 	struct hlist_node *n;
 	struct hlist_head *head;
 	int i;
-	unsigned long time;
+	unsigned long expires;
 	u8 cmd;
 
 	for (i = 0; i < adapter->fhash.fbucket_size; i++) {
@@ -638,8 +638,8 @@ void qlcnic_prune_lb_filters(struct qlcnic_adapter *adapter)
 		hlist_for_each_entry_safe(tmp_fil, n, head, fnode) {
 			cmd =  tmp_fil->vlan_id ? QLCNIC_MAC_VLAN_DEL :
 						  QLCNIC_MAC_DEL;
-			time = tmp_fil->ftime;
-			if (jiffies > (QLCNIC_FILTER_AGE * HZ + time)) {
+			expires = tmp_fil->ftime + QLCNIC_FILTER_AGE * HZ;
+			if (time_before(expires, jiffies)) {
 				qlcnic_sre_macaddr_change(adapter,
 							  tmp_fil->faddr,
 							  tmp_fil->vlan_id,
@@ -657,8 +657,8 @@ void qlcnic_prune_lb_filters(struct qlcnic_adapter *adapter)
 
 		hlist_for_each_entry_safe(tmp_fil, n, head, fnode)
 		{
-			time = tmp_fil->ftime;
-			if (jiffies > (QLCNIC_FILTER_AGE * HZ + time)) {
+			expires = tmp_fil->ftime + QLCNIC_FILTER_AGE * HZ;
+			if (time_before(expires, jiffies)) {
 				spin_lock_bh(&adapter->rx_mac_learn_lock);
 				adapter->rx_fhash.fnum--;
 				hlist_del(&tmp_fil->fnode);
