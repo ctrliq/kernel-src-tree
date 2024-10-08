@@ -1,0 +1,430 @@
+tcp: use tcp_v4_send_synack on first SYN-ACK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Yuchung Cheng <ycheng@google.com>
+commit 843f4a55e336e6d0c7bb92e7f9621535bc8d5fcd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/843f4a55.failed
+
+To avoid large code duplication in IPv6, we need to first simplify
+the complicate SYN-ACK sending code in tcp_v4_conn_request().
+
+To use tcp_v4(6)_send_synack() to send all SYN-ACKs, we need to
+initialize the mini socket's receive window before trying to
+create the child socket and/or building the SYN-ACK packet. So we move
+that initialization from tcp_make_synack() to tcp_v4_conn_request()
+as a new function tcp_openreq_init_req_rwin().
+
+After this refactoring the SYN-ACK sending code is simpler and easier
+to implement Fast Open for IPv6.
+
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Daniel Lee <longinus00@gmail.com>
+	Signed-off-by: Jerry Chu <hkchu@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 843f4a55e336e6d0c7bb92e7f9621535bc8d5fcd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_fastopen.c
+#	net/ipv4/tcp_ipv4.c
+diff --cc include/net/tcp.h
+index ba45accd7103,f5d6ca4a9d28..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -1101,7 -1114,10 +1101,14 @@@ static inline void tcp_openreq_init(str
+  	ireq->ir_num = ntohs(tcp_hdr(skb)->dest);
+  }
+  
+++<<<<<<< HEAD
+ +extern void tcp_enter_memory_pressure(struct sock *sk);
+++=======
++ extern void tcp_openreq_init_rwin(struct request_sock *req,
++ 				  struct sock *sk, struct dst_entry *dst);
++ 
++ void tcp_enter_memory_pressure(struct sock *sk);
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  
+  static inline int keepalive_intvl_when(const struct tcp_sock *tp)
+  {
+@@@ -1312,9 -1326,11 +1319,17 @@@ void tcp_free_fastopen_req(struct tcp_s
+  
+  extern struct tcp_fastopen_context __rcu *tcp_fastopen_ctx;
+  int tcp_fastopen_reset_cipher(void *key, unsigned int len);
+++<<<<<<< HEAD
+ +extern void tcp_fastopen_cookie_gen(__be32 src, __be32 dst,
+ +				    struct tcp_fastopen_cookie *foc);
+ +
+++=======
++ bool tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
++ 		      struct request_sock *req,
++ 		      struct tcp_fastopen_cookie *foc,
++ 		      struct dst_entry *dst);
++ void tcp_fastopen_init_key_once(bool publish);
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  #define TCP_FASTOPEN_KEY_LENGTH 16
+  
+  /* Fastopen key context */
+diff --cc net/ipv4/tcp_fastopen.c
+index ab7bd35bb312,9b947a9aaf6e..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -79,13 -95,172 +79,185 @@@ void tcp_fastopen_cookie_gen(__be32 src
+  	rcu_read_unlock();
+  }
+  
+++<<<<<<< HEAD
+ +static int __init tcp_fastopen_init(void)
+ +{
+ +	__u8 key[TCP_FASTOPEN_KEY_LENGTH];
+ +
+ +	get_random_bytes(key, sizeof(key));
+ +	tcp_fastopen_reset_cipher(key, sizeof(key));
+ +	return 0;
+++=======
++ static bool tcp_fastopen_create_child(struct sock *sk,
++ 				      struct sk_buff *skb,
++ 				      struct dst_entry *dst,
++ 				      struct request_sock *req)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
++ 	struct sock *child;
++ 
++ 	req->num_retrans = 0;
++ 	req->num_timeout = 0;
++ 	req->sk = NULL;
++ 
++ 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL);
++ 	if (child == NULL)
++ 		return false;
++ 
++ 	spin_lock(&queue->fastopenq->lock);
++ 	queue->fastopenq->qlen++;
++ 	spin_unlock(&queue->fastopenq->lock);
++ 
++ 	/* Initialize the child socket. Have to fix some values to take
++ 	 * into account the child is a Fast Open socket and is created
++ 	 * only out of the bits carried in the SYN packet.
++ 	 */
++ 	tp = tcp_sk(child);
++ 
++ 	tp->fastopen_rsk = req;
++ 	/* Do a hold on the listner sk so that if the listener is being
++ 	 * closed, the child that has been accepted can live on and still
++ 	 * access listen_lock.
++ 	 */
++ 	sock_hold(sk);
++ 	tcp_rsk(req)->listener = sk;
++ 
++ 	/* RFC1323: The window in SYN & SYN/ACK segments is never
++ 	 * scaled. So correct it appropriately.
++ 	 */
++ 	tp->snd_wnd = ntohs(tcp_hdr(skb)->window);
++ 
++ 	/* Activate the retrans timer so that SYNACK can be retransmitted.
++ 	 * The request socket is not added to the SYN table of the parent
++ 	 * because it's been added to the accept queue directly.
++ 	 */
++ 	inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
++ 				  TCP_TIMEOUT_INIT, TCP_RTO_MAX);
++ 
++ 	/* Add the child socket directly into the accept queue */
++ 	inet_csk_reqsk_queue_add(sk, req, child);
++ 
++ 	/* Now finish processing the fastopen child socket. */
++ 	inet_csk(child)->icsk_af_ops->rebuild_header(child);
++ 	tcp_init_congestion_control(child);
++ 	tcp_mtup_init(child);
++ 	tcp_init_metrics(child);
++ 	tcp_init_buffer_space(child);
++ 
++ 	/* Queue the data carried in the SYN packet. We need to first
++ 	 * bump skb's refcnt because the caller will attempt to free it.
++ 	 *
++ 	 * XXX (TFO) - we honor a zero-payload TFO request for now,
++ 	 * (any reason not to?) but no need to queue the skb since
++ 	 * there is no data. How about SYN+FIN?
++ 	 */
++ 	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
++ 		skb = skb_get(skb);
++ 		skb_dst_drop(skb);
++ 		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
++ 		skb_set_owner_r(skb, child);
++ 		__skb_queue_tail(&child->sk_receive_queue, skb);
++ 		tp->syn_data_acked = 1;
++ 	}
++ 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
++ 	sk->sk_data_ready(sk);
++ 	bh_unlock_sock(child);
++ 	sock_put(child);
++ 	WARN_ON(req->sk == NULL);
++ 	return true;
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  }
+ -EXPORT_SYMBOL(tcp_fastopen_create_child);
+  
+++<<<<<<< HEAD
+ +late_initcall(tcp_fastopen_init);
+++=======
++ static bool tcp_fastopen_queue_check(struct sock *sk)
++ {
++ 	struct fastopen_queue *fastopenq;
++ 
++ 	/* Make sure the listener has enabled fastopen, and we don't
++ 	 * exceed the max # of pending TFO requests allowed before trying
++ 	 * to validating the cookie in order to avoid burning CPU cycles
++ 	 * unnecessarily.
++ 	 *
++ 	 * XXX (TFO) - The implication of checking the max_qlen before
++ 	 * processing a cookie request is that clients can't differentiate
++ 	 * between qlen overflow causing Fast Open to be disabled
++ 	 * temporarily vs a server not supporting Fast Open at all.
++ 	 */
++ 	fastopenq = inet_csk(sk)->icsk_accept_queue.fastopenq;
++ 	if (fastopenq == NULL || fastopenq->max_qlen == 0)
++ 		return false;
++ 
++ 	if (fastopenq->qlen >= fastopenq->max_qlen) {
++ 		struct request_sock *req1;
++ 		spin_lock(&fastopenq->lock);
++ 		req1 = fastopenq->rskq_rst_head;
++ 		if ((req1 == NULL) || time_after(req1->expires, jiffies)) {
++ 			spin_unlock(&fastopenq->lock);
++ 			NET_INC_STATS_BH(sock_net(sk),
++ 					 LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
++ 			return false;
++ 		}
++ 		fastopenq->rskq_rst_head = req1->dl_next;
++ 		fastopenq->qlen--;
++ 		spin_unlock(&fastopenq->lock);
++ 		reqsk_free(req1);
++ 	}
++ 	return true;
++ }
++ 
++ /* Returns true if we should perform Fast Open on the SYN. The cookie (foc)
++  * may be updated and return the client in the SYN-ACK later. E.g., Fast Open
++  * cookie request (foc->len == 0).
++  */
++ bool tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
++ 		      struct request_sock *req,
++ 		      struct tcp_fastopen_cookie *foc,
++ 		      struct dst_entry *dst)
++ {
++ 	struct tcp_fastopen_cookie valid_foc = { .len = -1 };
++ 	bool syn_data = TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1;
++ 
++ 	if (!((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) &&
++ 	      (syn_data || foc->len >= 0) &&
++ 	      tcp_fastopen_queue_check(sk))) {
++ 		foc->len = -1;
++ 		return false;
++ 	}
++ 
++ 	if (syn_data && (sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_REQD))
++ 		goto fastopen;
++ 
++ 	tcp_fastopen_cookie_gen(ip_hdr(skb)->saddr,
++ 				ip_hdr(skb)->daddr, &valid_foc);
++ 
++ 	if (foc->len == TCP_FASTOPEN_COOKIE_SIZE &&
++ 	    foc->len == valid_foc.len &&
++ 	    !memcmp(foc->val, valid_foc.val, foc->len)) {
++ 		/* Cookie is valid. Create a (full) child socket to accept
++ 		 * the data in SYN before returning a SYN-ACK to ack the
++ 		 * data. If we fail to create the socket, fall back and
++ 		 * ack the ISN only but includes the same cookie.
++ 		 *
++ 		 * Note: Data-less SYN with valid cookie is allowed to send
++ 		 * data in SYN_RECV state.
++ 		 */
++ fastopen:
++ 		if (tcp_fastopen_create_child(sk, skb, dst, req)) {
++ 			foc->len = -1;
++ 			NET_INC_STATS_BH(sock_net(sk),
++ 					 LINUX_MIB_TCPFASTOPENPASSIVE);
++ 			return true;
++ 		}
++ 	}
++ 
++ 	NET_INC_STATS_BH(sock_net(sk), foc->len ?
++ 			 LINUX_MIB_TCPFASTOPENPASSIVEFAIL :
++ 			 LINUX_MIB_TCPFASTOPENCOOKIEREQD);
++ 	*foc = valid_foc;
++ 	return false;
++ }
++ EXPORT_SYMBOL(tcp_try_fastopen);
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+diff --cc net/ipv4/tcp_ipv4.c
+index 33c014498f1d,1665f0f84233..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -1452,12 -1271,10 +1453,16 @@@ int tcp_v4_conn_request(struct sock *sk
+  	__be32 saddr = ip_hdr(skb)->saddr;
+  	__be32 daddr = ip_hdr(skb)->daddr;
+  	__u32 isn = TCP_SKB_CB(skb)->when;
+- 	bool want_cookie = false;
++ 	bool want_cookie = false, fastopen;
+  	struct flowi4 fl4;
+  	struct tcp_fastopen_cookie foc = { .len = -1 };
+++<<<<<<< HEAD
+ +	struct tcp_fastopen_cookie valid_foc = { .len = -1 };
+ +	struct sk_buff *skb_synack;
+ +	int do_fastopen;
+++=======
++ 	int err;
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  
+  	/* Never answer to SYNs send to broadcast or multicast */
+  	if (skb_rtable(skb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
+@@@ -1556,52 -1373,24 +1561,62 @@@
+  
+  		isn = tcp_v4_init_sequence(skb);
+  	}
+++<<<<<<< HEAD
+ +	tcp_rsk(req)->snt_isn = isn;
+ +
+ +	if (dst == NULL) {
+ +		dst = inet_csk_route_req(sk, &fl4, req);
+ +		if (dst == NULL)
+ +			goto drop_and_free;
+ +	}
+ +	do_fastopen = tcp_fastopen_check(sk, skb, req, &foc, &valid_foc);
+ +
+ +	/* We don't call tcp_v4_send_synack() directly because we need
+ +	 * to make sure a child socket can be created successfully before
+ +	 * sending back synack!
+ +	 *
+ +	 * XXX (TFO) - Ideally one would simply call tcp_v4_send_synack()
+ +	 * (or better yet, call tcp_send_synack() in the child context
+ +	 * directly, but will have to fix bunch of other code first)
+ +	 * after syn_recv_sock() except one will need to first fix the
+ +	 * latter to remove its dependency on the current implementation
+ +	 * of tcp_v4_send_synack()->tcp_select_initial_window().
+ +	 */
+ +	skb_synack = tcp_make_synack(sk, dst, req,
+ +	    fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);
+ +
+ +	if (skb_synack) {
+ +		__tcp_v4_send_check(skb_synack, ireq->ir_loc_addr, ireq->ir_rmt_addr);
+ +		skb_set_queue_mapping(skb_synack, skb_get_queue_mapping(skb));
+ +	} else
+++=======
++ 	if (!dst && (dst = inet_csk_route_req(sk, &fl4, req)) == NULL)
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  		goto drop_and_free;
+  
+- 	if (likely(!do_fastopen)) {
+- 		int err;
+- 		err = ip_build_and_send_pkt(skb_synack, sk, ireq->ir_loc_addr,
+- 		     ireq->ir_rmt_addr, ireq->opt);
+- 		err = net_xmit_eval(err);
++ 	tcp_rsk(req)->snt_isn = isn;
++ 	tcp_rsk(req)->snt_synack = tcp_time_stamp;
++ 	tcp_openreq_init_rwin(req, sk, dst);
++ 	fastopen = !want_cookie &&
++ 		   tcp_try_fastopen(sk, skb, req, &foc, dst);
++ 	err = tcp_v4_send_synack(sk, dst, req,
++ 				 skb_get_queue_mapping(skb), &foc);
++ 	if (!fastopen) {
+  		if (err || want_cookie)
+  			goto drop_and_free;
+  
+  		tcp_rsk(req)->snt_synack = tcp_time_stamp;
+  		tcp_rsk(req)->listener = NULL;
+- 		/* Add the request_sock to the SYN table */
+  		inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
+++<<<<<<< HEAD
+ +		if (fastopen_cookie_present(&foc) && foc.len != 0)
+ +			NET_INC_STATS_BH(sock_net(sk),
+ +			    LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
+ +	} else if (tcp_v4_conn_req_fastopen(sk, skb, skb_synack, req))
+ +		goto drop_and_free;
+++=======
++ 	}
+++>>>>>>> 843f4a55e336 (tcp: use tcp_v4_send_synack on first SYN-ACK)
+  
+  	return 0;
+  
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp_fastopen.c
+* Unmerged path net/ipv4/tcp_ipv4.c
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 7a436c517e44..78eceeb6b17e 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -362,6 +362,37 @@ void tcp_twsk_destructor(struct sock *sk)
+ }
+ EXPORT_SYMBOL_GPL(tcp_twsk_destructor);
+ 
++void tcp_openreq_init_rwin(struct request_sock *req,
++			   struct sock *sk, struct dst_entry *dst)
++{
++	struct inet_request_sock *ireq = inet_rsk(req);
++	struct tcp_sock *tp = tcp_sk(sk);
++	__u8 rcv_wscale;
++	int mss = dst_metric_advmss(dst);
++
++	if (tp->rx_opt.user_mss && tp->rx_opt.user_mss < mss)
++		mss = tp->rx_opt.user_mss;
++
++	/* Set this up on the first call only */
++	req->window_clamp = tp->window_clamp ? : dst_metric(dst, RTAX_WINDOW);
++
++	/* limit the window selection if the user enforce a smaller rx buffer */
++	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK &&
++	    (req->window_clamp > tcp_full_space(sk) || req->window_clamp == 0))
++		req->window_clamp = tcp_full_space(sk);
++
++	/* tcp_full_space because it is guaranteed to be the first packet */
++	tcp_select_initial_window(tcp_full_space(sk),
++		mss - (ireq->tstamp_ok ? TCPOLEN_TSTAMP_ALIGNED : 0),
++		&req->rcv_wnd,
++		&req->window_clamp,
++		ireq->wscale_ok,
++		&rcv_wscale,
++		dst_metric(dst, RTAX_INITRWND));
++	ireq->rcv_wscale = rcv_wscale;
++}
++EXPORT_SYMBOL(tcp_openreq_init_rwin);
++
+ static inline void TCP_ECN_openreq_child(struct tcp_sock *tp,
+ 					 struct request_sock *req)
+ {
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index d009567a0b52..4576b45c3800 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -2759,27 +2759,6 @@ struct sk_buff *tcp_make_synack(struct sock *sk, struct dst_entry *dst,
+ 	if (tp->rx_opt.user_mss && tp->rx_opt.user_mss < mss)
+ 		mss = tp->rx_opt.user_mss;
+ 
+-	if (req->rcv_wnd == 0) { /* ignored for retransmitted syns */
+-		__u8 rcv_wscale;
+-		/* Set this up on the first call only */
+-		req->window_clamp = tp->window_clamp ? : dst_metric(dst, RTAX_WINDOW);
+-
+-		/* limit the window selection if the user enforce a smaller rx buffer */
+-		if (sk->sk_userlocks & SOCK_RCVBUF_LOCK &&
+-		    (req->window_clamp > tcp_full_space(sk) || req->window_clamp == 0))
+-			req->window_clamp = tcp_full_space(sk);
+-
+-		/* tcp_full_space because it is guaranteed to be the first packet */
+-		tcp_select_initial_window(tcp_full_space(sk),
+-			mss - (ireq->tstamp_ok ? TCPOLEN_TSTAMP_ALIGNED : 0),
+-			&req->rcv_wnd,
+-			&req->window_clamp,
+-			ireq->wscale_ok,
+-			&rcv_wscale,
+-			dst_metric(dst, RTAX_INITRWND));
+-		ireq->rcv_wscale = rcv_wscale;
+-	}
+-
+ 	memset(&opts, 0, sizeof(opts));
+ #ifdef CONFIG_SYN_COOKIES
+ 	if (unlikely(req->cookie_ts))
