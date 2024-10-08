@@ -1,0 +1,183 @@
+iommu/vt-d: Copy IR table from old kernel when in kdump mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Copy IR table from old kernel when in kdump mode (Myron Stowe) [1050021]
+Rebuild_FUZZ: 94.74%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit af3b358e48115588d905cc07a47b3f356e0d01d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/af3b358e.failed
+
+When we are booting into a kdump kernel and find IR enabled,
+copy over the contents of the previous IR table so that
+spurious interrupts will not be target aborted.
+
+	Tested-by: ZhenHua Li <zhen-hual@hp.com>
+	Tested-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit af3b358e48115588d905cc07a47b3f356e0d01d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel_irq_remapping.c
+diff --cc drivers/iommu/intel_irq_remapping.c
+index 085a116a8b0a,2a901219f953..000000000000
+--- a/drivers/iommu/intel_irq_remapping.c
++++ b/drivers/iommu/intel_irq_remapping.c
+@@@ -6,6 -9,9 +6,12 @@@
+  #include <linux/hpet.h>
+  #include <linux/pci.h>
+  #include <linux/irq.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/intel-iommu.h>
++ #include <linux/acpi.h>
++ #include <linux/crash_dump.h>
+++>>>>>>> af3b358e4811 (iommu/vt-d: Copy IR table from old kernel when in kdump mode)
+  #include <asm/io_apic.h>
+  #include <asm/smp.h>
+  #include <asm/cpu.h>
+@@@ -51,11 -55,31 +57,31 @@@ static struct hpet_scope ir_hpet[MAX_HP
+   */
+  static DEFINE_RAW_SPINLOCK(irq_2_ir_lock);
+  
++ static void iommu_disable_irq_remapping(struct intel_iommu *iommu);
+  static int __init parse_ioapics_under_ir(void);
+  
++ static bool ir_pre_enabled(struct intel_iommu *iommu)
++ {
++ 	return (iommu->flags & VTD_FLAG_IRQ_REMAP_PRE_ENABLED);
++ }
++ 
++ static void clear_ir_pre_enabled(struct intel_iommu *iommu)
++ {
++ 	iommu->flags &= ~VTD_FLAG_IRQ_REMAP_PRE_ENABLED;
++ }
++ 
++ static void init_ir_status(struct intel_iommu *iommu)
++ {
++ 	u32 gsts;
++ 
++ 	gsts = readl(iommu->reg + DMAR_GSTS_REG);
++ 	if (gsts & DMA_GSTS_IRES)
++ 		iommu->flags |= VTD_FLAG_IRQ_REMAP_PRE_ENABLED;
++ }
++ 
+  static struct irq_2_iommu *irq_2_iommu(unsigned int irq)
+  {
+ -	struct irq_cfg *cfg = irq_cfg(irq);
+ +	struct irq_cfg *cfg = irq_get_chip_data(irq);
+  	return cfg ? &cfg->irq_2_iommu : NULL;
+  }
+  
+@@@ -424,11 -447,49 +450,49 @@@ static int set_msi_sid(struct irte *irt
+  	return 0;
+  }
+  
++ static int iommu_load_old_irte(struct intel_iommu *iommu)
++ {
++ 	struct irte *old_ir_table;
++ 	phys_addr_t irt_phys;
++ 	size_t size;
++ 	u64 irta;
++ 
++ 	if (!is_kdump_kernel()) {
++ 		pr_warn("IRQ remapping was enabled on %s but we are not in kdump mode\n",
++ 			iommu->name);
++ 		clear_ir_pre_enabled(iommu);
++ 		iommu_disable_irq_remapping(iommu);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check whether the old ir-table has the same size as ours */
++ 	irta = dmar_readq(iommu->reg + DMAR_IRTA_REG);
++ 	if ((irta & INTR_REMAP_TABLE_REG_SIZE_MASK)
++ 	     != INTR_REMAP_TABLE_REG_SIZE)
++ 		return -EINVAL;
++ 
++ 	irt_phys = irta & VTD_PAGE_MASK;
++ 	size     = INTR_REMAP_TABLE_ENTRIES*sizeof(struct irte);
++ 
++ 	/* Map the old IR table */
++ 	old_ir_table = ioremap_cache(irt_phys, size);
++ 	if (!old_ir_table)
++ 		return -ENOMEM;
++ 
++ 	/* Copy data over */
++ 	memcpy(iommu->ir_table->base, old_ir_table, size);
++ 
++ 	__iommu_flush_cache(iommu, iommu->ir_table->base, size);
++ 
++ 	return 0;
++ }
++ 
++ 
+  static void iommu_set_irq_remapping(struct intel_iommu *iommu, int mode)
+  {
+ -	unsigned long flags;
+  	u64 addr;
+  	u32 sts;
+ +	unsigned long flags;
+  
+  	addr = virt_to_phys((void *)iommu->ir_table->base);
+  
+@@@ -505,8 -572,41 +569,42 @@@ static int intel_setup_irq_remapping(st
+  	ir_table->base = page_address(pages);
+  	ir_table->bitmap = bitmap;
+  	iommu->ir_table = ir_table;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * If the queued invalidation is already initialized,
++ 	 * shouldn't disable it.
++ 	 */
++ 	if (!iommu->qi) {
++ 		/*
++ 		 * Clear previous faults.
++ 		 */
++ 		dmar_fault(-1, iommu);
++ 		dmar_disable_qi(iommu);
++ 
++ 		if (dmar_enable_qi(iommu)) {
++ 			pr_err("Failed to enable queued invalidation\n");
++ 			goto out_free_bitmap;
++ 		}
++ 	}
++ 
++ 	init_ir_status(iommu);
++ 
++ 	if (ir_pre_enabled(iommu)) {
++ 		if (iommu_load_old_irte(iommu))
++ 			pr_err("Failed to copy IR table for %s from previous kernel\n",
++ 			       iommu->name);
++ 		else
++ 			pr_info("Copied IR table for %s from previous kernel\n",
++ 				iommu->name);
++ 	}
++ 
++ 	iommu_set_irq_remapping(iommu, eim_mode);
++ 
+++>>>>>>> af3b358e4811 (iommu/vt-d: Copy IR table from old kernel when in kdump mode)
+  	return 0;
+  
+ -out_free_bitmap:
+ -	kfree(bitmap);
+  out_free_pages:
+  	__free_pages(pages, INTR_REMAP_PAGE_ORDER);
+  out_free_table:
+* Unmerged path drivers/iommu/intel_irq_remapping.c
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index a240e61a7700..546486ac4f34 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -296,6 +296,7 @@ struct q_inval {
+ /* 1MB - maximum possible interrupt remapping table size */
+ #define INTR_REMAP_PAGE_ORDER	8
+ #define INTR_REMAP_TABLE_REG_SIZE	0xf
++#define INTR_REMAP_TABLE_REG_SIZE_MASK  0xf
+ 
+ #define INTR_REMAP_TABLE_ENTRIES	65536
+ 
