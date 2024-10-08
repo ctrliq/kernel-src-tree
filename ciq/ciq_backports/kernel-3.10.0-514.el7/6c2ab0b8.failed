@@ -1,0 +1,152 @@
+staging/rdma/hfi1: Insure last cursor is updated prior to complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Insure last cursor is updated prior to complete (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 93.55%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 6c2ab0b857d1b674c5f710d2cbf06a0f3ac52313
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6c2ab0b8.failed
+
+This patch is a prerequisite for adding a separate lock
+for post send.
+
+The timing of updating s_last needs to be before returning
+any send completion to avoid a race between a poll cq seeing
+a completion and the post send checking for a full queue.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6c2ab0b857d1b674c5f710d2cbf06a0f3ac52313)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/rc.c
+diff --cc drivers/staging/hfi1/rc.c
+index dd57d65aa9b2,e54e0b4bb5e5..000000000000
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@@ -1017,22 -1118,30 +1017,34 @@@ void hfi1_rc_send_complete(struct hfi1_
+  	 */
+  	if ((psn & IB_BTH_REQ_ACK) && qp->s_acked != qp->s_tail &&
+  	    !(qp->s_flags &
+ -		(RVT_S_TIMER | RVT_S_WAIT_RNR | RVT_S_WAIT_PSN)) &&
+ -		(ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK))
+ -		hfi1_add_retry_timer(qp);
+ +		(HFI1_S_TIMER | HFI1_S_WAIT_RNR | HFI1_S_WAIT_PSN)) &&
+ +		(ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_RECV_OK))
+ +		start_timer(qp);
+  
+  	while (qp->s_last != qp->s_acked) {
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +		wqe = get_swqe_ptr(qp, qp->s_last);
+++=======
++ 		u32 s_last;
++ 
++ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+++>>>>>>> 6c2ab0b857d1 (staging/rdma/hfi1: Insure last cursor is updated prior to complete):drivers/staging/rdma/hfi1/rc.c
+  		if (cmp_psn(wqe->lpsn, qp->s_sending_psn) >= 0 &&
+  		    cmp_psn(qp->s_sending_psn, qp->s_sending_hpsn) <= 0)
+  			break;
++ 		s_last = qp->s_last;
++ 		if (++s_last >= qp->s_size)
++ 			s_last = 0;
++ 		qp->s_last = s_last;
++ 		/* see post_send() */
++ 		barrier();
+  		for (i = 0; i < wqe->wr.num_sge; i++) {
+ -			struct rvt_sge *sge = &wqe->sg_list[i];
+ +			struct hfi1_sge *sge = &wqe->sg_list[i];
+  
+ -			rvt_put_mr(sge->mr);
+ +			hfi1_put_mr(sge->mr);
+  		}
+  		/* Post a send completion queue entry if requested. */
+ -		if (!(qp->s_flags & RVT_S_SIGNAL_REQ_WR) ||
+ +		if (!(qp->s_flags & HFI1_S_SIGNAL_REQ_WR) ||
+  		    (wqe->wr.send_flags & IB_SEND_SIGNALED)) {
+  			memset(&wc, 0, sizeof(wc));
+  			wc.wr_id = wqe->wr.wr_id;
+@@@ -1040,10 -1149,8 +1052,8 @@@
+  			wc.opcode = ib_hfi1_wc_opcode[wqe->wr.opcode];
+  			wc.byte_len = wqe->length;
+  			wc.qp = &qp->ibqp;
+ -			rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.send_cq), &wc, 0);
+ +			hfi1_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
+  		}
+- 		if (++qp->s_last >= qp->s_size)
+- 			qp->s_last = 0;
+  	}
+  	/*
+  	 * If we were waiting for sends to complete before re-sending,
+@@@ -1083,13 -1190,21 +1093,21 @@@ static struct hfi1_swqe *do_rc_completi
+  	 */
+  	if (cmp_psn(wqe->lpsn, qp->s_sending_psn) < 0 ||
+  	    cmp_psn(qp->s_sending_psn, qp->s_sending_hpsn) > 0) {
++ 		u32 s_last;
++ 
+  		for (i = 0; i < wqe->wr.num_sge; i++) {
+ -			struct rvt_sge *sge = &wqe->sg_list[i];
+ +			struct hfi1_sge *sge = &wqe->sg_list[i];
+  
+ -			rvt_put_mr(sge->mr);
+ +			hfi1_put_mr(sge->mr);
+  		}
++ 		s_last = qp->s_last;
++ 		if (++s_last >= qp->s_size)
++ 			s_last = 0;
++ 		qp->s_last = s_last;
++ 		/* see post_send() */
++ 		barrier();
+  		/* Post a send completion queue entry if requested. */
+ -		if (!(qp->s_flags & RVT_S_SIGNAL_REQ_WR) ||
+ +		if (!(qp->s_flags & HFI1_S_SIGNAL_REQ_WR) ||
+  		    (wqe->wr.send_flags & IB_SEND_SIGNALED)) {
+  			memset(&wc, 0, sizeof(wc));
+  			wc.wr_id = wqe->wr.wr_id;
+@@@ -1097,10 -1212,8 +1115,8 @@@
+  			wc.opcode = ib_hfi1_wc_opcode[wqe->wr.opcode];
+  			wc.byte_len = wqe->length;
+  			wc.qp = &qp->ibqp;
+ -			rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.send_cq), &wc, 0);
+ +			hfi1_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
+  		}
+- 		if (++qp->s_last >= qp->s_size)
+- 			qp->s_last = 0;
+  	} else {
+  		struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+  
+* Unmerged path drivers/staging/hfi1/rc.c
+diff --git a/drivers/staging/hfi1/ruc.c b/drivers/staging/hfi1/ruc.c
+index c4280b6f47d4..9442201f3aa9 100644
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@ -885,6 +885,13 @@ void hfi1_send_complete(struct hfi1_qp *qp, struct hfi1_swqe *wqe,
+ 	if (!(ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_OR_FLUSH_SEND))
+ 		return;
+ 
++	last = qp->s_last;
++	old_last = last;
++	if (++last >= qp->s_size)
++		last = 0;
++	qp->s_last = last;
++	/* See post_send() */
++	barrier();
+ 	for (i = 0; i < wqe->wr.num_sge; i++) {
+ 		struct hfi1_sge *sge = &wqe->sg_list[i];
+ 
+@@ -912,11 +919,6 @@ void hfi1_send_complete(struct hfi1_qp *qp, struct hfi1_swqe *wqe,
+ 			      status != IB_WC_SUCCESS);
+ 	}
+ 
+-	last = qp->s_last;
+-	old_last = last;
+-	if (++last >= qp->s_size)
+-		last = 0;
+-	qp->s_last = last;
+ 	if (qp->s_acked == old_last)
+ 		qp->s_acked = last;
+ 	if (qp->s_cur == old_last)
