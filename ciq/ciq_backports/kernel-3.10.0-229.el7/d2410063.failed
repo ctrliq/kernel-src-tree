@@ -1,0 +1,165 @@
+uprobes/x86: Emulate nop's using ops->emulate()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Emulate nop's using ops->emulate() (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 95.56%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit d241006354c550c7d22f304e2fdf90137fb8eaab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d2410063.failed
+
+Finally we can kill the ugly (and very limited) code in __skip_sstep().
+Just change branch_setup_xol_ops() to treat "nop" as jmp to the next insn.
+
+Thanks to lib/insn.c, it is clever enough. OPCODE1() == 0x90 includes
+"(rep;)+ nop;" at least, and (afaics) much more.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit d241006354c550c7d22f304e2fdf90137fb8eaab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/kernel/uprobes.c
+index 7ea7d2b3594b,f3c4212f3819..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -402,6 -402,100 +402,103 @@@ static int validate_insn_bits(struct ar
+  }
+  #endif /* CONFIG_X86_64 */
+  
+++<<<<<<< HEAD
+++=======
++ struct uprobe_xol_ops {
++ 	bool	(*emulate)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*pre_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*post_xol)(struct arch_uprobe *, struct pt_regs *);
++ };
++ 
++ static inline int sizeof_long(void)
++ {
++ 	return is_ia32_task() ? 4 : 8;
++ }
++ 
++ static int default_pre_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	pre_xol_rip_insn(auprobe, regs, &current->utask->autask);
++ 	return 0;
++ }
++ 
++ /*
++  * Adjust the return address pushed by a call insn executed out of line.
++  */
++ static int adjust_ret_addr(unsigned long sp, long correction)
++ {
++ 	int rasize = sizeof_long();
++ 	long ra;
++ 
++ 	if (copy_from_user(&ra, (void __user *)sp, rasize))
++ 		return -EFAULT;
++ 
++ 	ra += correction;
++ 	if (copy_to_user((void __user *)sp, &ra, rasize))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	struct uprobe_task *utask = current->utask;
++ 	long correction = (long)(utask->vaddr - utask->xol_vaddr);
++ 
++ 	handle_riprel_post_xol(auprobe, regs, &correction);
++ 	if (auprobe->fixups & UPROBE_FIX_IP)
++ 		regs->ip += correction;
++ 
++ 	if (auprobe->fixups & UPROBE_FIX_CALL) {
++ 		if (adjust_ret_addr(regs->sp, correction)) {
++ 			regs->sp += sizeof_long();
++ 			return -ERESTART;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct uprobe_xol_ops default_xol_ops = {
++ 	.pre_xol  = default_pre_xol_op,
++ 	.post_xol = default_post_xol_op,
++ };
++ 
++ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	regs->ip += auprobe->branch.ilen + auprobe->branch.offs;
++ 	return true;
++ }
++ 
++ static struct uprobe_xol_ops branch_xol_ops = {
++ 	.emulate  = branch_emulate_op,
++ };
++ 
++ /* Returns -ENOSYS if branch_xol_ops doesn't handle this insn */
++ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 
++ 	switch (OPCODE1(insn)) {
++ 	case 0xeb:	/* jmp 8 */
++ 	case 0xe9:	/* jmp 32 */
++ 	case 0x90:	/* prefix* + nop; same as jmp with .offs = 0 */
++ 		break;
++ 	default:
++ 		return -ENOSYS;
++ 	}
++ 
++ 	/* has the side-effect of processing the entire instruction */
++ 	insn_get_length(insn);
++ 	if (WARN_ON_ONCE(!insn_complete(insn)))
++ 		return -ENOEXEC;
++ 
++ 	auprobe->branch.ilen = insn->length;
++ 	auprobe->branch.offs = insn->immediate.value;
++ 
++ 	auprobe->ops = &branch_xol_ops;
++ 	return 0;
++ }
++ 
+++>>>>>>> d241006354c5 (uprobes/x86: Emulate nop's using ops->emulate())
+  /**
+   * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
+   * @mm: the probed address space.
+@@@ -632,25 -711,10 +729,26 @@@ void arch_uprobe_abort_xol(struct arch_
+  		regs->flags &= ~X86_EFLAGS_TF;
+  }
+  
+- /*
+-  * Skip these instructions as per the currently known x86 ISA.
+-  * rep=0x66*; nop=0x90
+-  */
+  static bool __skip_sstep(struct arch_uprobe *auprobe, struct pt_regs *regs)
+  {
+++<<<<<<< HEAD
+ +	int i;
+ +
+ +	for (i = 0; i < MAX_UINSN_BYTES; i++) {
+ +		if (auprobe->insn[i] == 0x66)
+ +			continue;
+ +
+ +		if (auprobe->insn[i] == 0x90) {
+ +			regs->ip += i + 1;
+ +			return true;
+ +		}
+ +
+ +		break;
+ +	}
+++=======
++ 	if (auprobe->ops->emulate)
++ 		return auprobe->ops->emulate(auprobe, regs);
+++>>>>>>> d241006354c5 (uprobes/x86: Emulate nop's using ops->emulate())
+  	return false;
+  }
+  
+* Unmerged path arch/x86/kernel/uprobes.c
