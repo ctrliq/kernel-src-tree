@@ -1,0 +1,231 @@
+x86, irq, PCI: Keep IRQ assignment for runtime power management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq, pci: Keep IRQ assignment for runtime power management (Steve Best) [1231358 1238216]
+Rebuild_FUZZ: 95.87%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 9eabc99a635a77cbf0948ce17d3cbc2b51680d4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9eabc99a.failed
+
+Now IOAPIC driver dynamically allocates IRQ numbers for IOAPIC pins.
+We need to keep IRQ assignment for PCI devices during runtime power
+management, otherwise it may cause failure of device wakeups.
+
+Commit 3eec595235c17a7 "x86, irq, PCI: Keep IRQ assignment for PCI
+devices during suspend/hibernation" has fixed the issue for suspend/
+hibernation, we also need the same fix for runtime device sleep too.
+
+Fix: https://bugzilla.kernel.org/show_bug.cgi?id=83271
+Reported-and-Tested-by: EmanueL Czirai <amanual@openmailbox.org>
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: EmanueL Czirai <amanual@openmailbox.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Grant Likely <grant.likely@linaro.org>
+Link: http://lkml.kernel.org/r/1409304383-18806-1-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 9eabc99a635a77cbf0948ce17d3cbc2b51680d4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/io_apic.c
+#	arch/x86/pci/irq.c
+#	arch/x86/pci/mrst.c
+#	drivers/acpi/pci_irq.c
+diff --cc arch/x86/kernel/apic/io_apic.c
+index 07a33b81b46c,337ce5a9b15c..000000000000
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@@ -3863,6 -3880,97 +3863,100 @@@ void __init mp_register_ioapic(int id, 
+  	nr_ioapics++;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mp_irqdomain_map(struct irq_domain *domain, unsigned int virq,
++ 		     irq_hw_number_t hwirq)
++ {
++ 	int ioapic = (int)(long)domain->host_data;
++ 	struct mp_pin_info *info = mp_pin_info(ioapic, hwirq);
++ 	struct io_apic_irq_attr attr;
++ 
++ 	/* Get default attribute if not set by caller yet */
++ 	if (!info->set) {
++ 		u32 gsi = mp_pin_to_gsi(ioapic, hwirq);
++ 
++ 		if (acpi_get_override_irq(gsi, &info->trigger,
++ 					  &info->polarity) < 0) {
++ 			/*
++ 			 * PCI interrupts are always polarity one level
++ 			 * triggered.
++ 			 */
++ 			info->trigger = 1;
++ 			info->polarity = 1;
++ 		}
++ 		info->node = NUMA_NO_NODE;
++ 
++ 		/*
++ 		 * setup_IO_APIC_irqs() programs all legacy IRQs with default
++ 		 * trigger and polarity attributes. Don't set the flag for that
++ 		 * case so the first legacy IRQ user could reprogram the pin
++ 		 * with real trigger and polarity attributes.
++ 		 */
++ 		if (virq >= nr_legacy_irqs() || info->count)
++ 			info->set = 1;
++ 	}
++ 	set_io_apic_irq_attr(&attr, ioapic, hwirq, info->trigger,
++ 			     info->polarity);
++ 
++ 	return io_apic_setup_irq_pin(virq, info->node, &attr);
++ }
++ 
++ void mp_irqdomain_unmap(struct irq_domain *domain, unsigned int virq)
++ {
++ 	struct irq_data *data = irq_get_irq_data(virq);
++ 	struct irq_cfg *cfg = irq_cfg(virq);
++ 	int ioapic = (int)(long)domain->host_data;
++ 	int pin = (int)data->hwirq;
++ 
++ 	ioapic_mask_entry(ioapic, pin);
++ 	__remove_pin_from_irq(cfg, ioapic, pin);
++ 	WARN_ON(cfg->irq_2_pin != NULL);
++ 	arch_teardown_hwirq(virq);
++ }
++ 
++ int mp_set_gsi_attr(u32 gsi, int trigger, int polarity, int node)
++ {
++ 	int ret = 0;
++ 	int ioapic, pin;
++ 	struct mp_pin_info *info;
++ 
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return -ENODEV;
++ 
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 	info = mp_pin_info(ioapic, pin);
++ 	trigger = trigger ? 1 : 0;
++ 	polarity = polarity ? 1 : 0;
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 	if (!info->set) {
++ 		info->trigger = trigger;
++ 		info->polarity = polarity;
++ 		info->node = node;
++ 		info->set = 1;
++ 	} else if (info->trigger != trigger || info->polarity != polarity) {
++ 		ret = -EBUSY;
++ 	}
++ 	mutex_unlock(&ioapic_mutex);
++ 
++ 	return ret;
++ }
++ 
++ bool mp_should_keep_irq(struct device *dev)
++ {
++ 	if (dev->power.is_prepared)
++ 		return true;
++ #ifdef	CONFIG_PM_RUNTIME
++ 	if (dev->power.runtime_status == RPM_SUSPENDING)
++ 		return true;
++ #endif
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 9eabc99a635a (x86, irq, PCI: Keep IRQ assignment for runtime power management)
+  /* Enable IOAPIC early just for system timer */
+  void __init pre_init_apic_IRQ0(void)
+  {
+diff --cc arch/x86/pci/irq.c
+index 84112f55dd7a,eb500c2592ad..000000000000
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@@ -1254,3 -1253,12 +1254,15 @@@ static int pirq_enable_irq(struct pci_d
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void pirq_disable_irq(struct pci_dev *dev)
++ {
++ 	if (io_apic_assign_pci_irqs && !mp_should_keep_irq(&dev->dev) &&
++ 	    dev->irq) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq = 0;
++ 	}
++ }
+++>>>>>>> 9eabc99a635a (x86, irq, PCI: Keep IRQ assignment for runtime power management)
+diff --cc arch/x86/pci/mrst.c
+index 903fded50786,b9958c364075..000000000000
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@@ -225,7 -227,13 +225,17 @@@ static int mrst_pci_irq_enable(struct p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +struct pci_ops pci_mrst_ops = {
+++=======
++ static void intel_mid_pci_irq_disable(struct pci_dev *dev)
++ {
++ 	if (!mp_should_keep_irq(&dev->dev) && dev->irq > 0)
++ 		mp_unmap_irq(dev->irq);
++ }
++ 
++ struct pci_ops intel_mid_pci_ops = {
+++>>>>>>> 9eabc99a635a (x86, irq, PCI: Keep IRQ assignment for runtime power management):arch/x86/pci/intel_mid_pci.c
+  	.read = pci_read,
+  	.write = pci_write,
+  };
+diff --cc drivers/acpi/pci_irq.c
+index d8cd9b655f87,6e6b80eb0bba..000000000000
+--- a/drivers/acpi/pci_irq.c
++++ b/drivers/acpi/pci_irq.c
+@@@ -468,6 -481,14 +468,17 @@@ void acpi_pci_irq_disable(struct pci_de
+  	if (!pin)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Keep IOAPIC pin configuration when suspending */
++ 	if (dev->dev.power.is_prepared)
++ 		return;
++ #ifdef	CONFIG_PM_RUNTIME
++ 	if (dev->dev.power.runtime_status == RPM_SUSPENDING)
++ 		return;
++ #endif
++ 
+++>>>>>>> 9eabc99a635a (x86, irq, PCI: Keep IRQ assignment for runtime power management)
+  	entry = acpi_pci_irq_lookup(dev, pin);
+  	if (!entry)
+  		return;
+diff --git a/arch/x86/include/asm/io_apic.h b/arch/x86/include/asm/io_apic.h
+index 7eb3755fee9a..6fb44b6ba5b3 100644
+--- a/arch/x86/include/asm/io_apic.h
++++ b/arch/x86/include/asm/io_apic.h
+@@ -211,6 +211,8 @@ static inline void io_apic_modify(unsigned int apic, unsigned int reg, unsigned
+ 
+ extern void io_apic_eoi(unsigned int apic, unsigned int vector);
+ 
++extern bool mp_should_keep_irq(struct device *dev);
++
+ #else  /* !CONFIG_X86_IO_APIC */
+ 
+ #define io_apic_assign_pci_irqs 0
+* Unmerged path arch/x86/kernel/apic/io_apic.c
+* Unmerged path arch/x86/pci/irq.c
+* Unmerged path arch/x86/pci/mrst.c
+* Unmerged path drivers/acpi/pci_irq.c
