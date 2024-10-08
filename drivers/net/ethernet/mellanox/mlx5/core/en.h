@@ -343,6 +343,11 @@ enum {
 	MLX5E_SQ_STATE_WAKE_TXQ_ENABLE,
 };
 
+struct mlx5e_ico_wqe_info {
+	u8  opcode;
+	u8  num_wqebbs;
+};
+
 struct mlx5e_sq {
 	/* data path */
 
@@ -383,6 +388,7 @@ struct mlx5e_sq {
 	struct mlx5_uar            uar;
 	struct mlx5e_channel      *channel;
 	int                        tc;
+	struct mlx5e_ico_wqe_info *ico_wqe_info;
 } ____cacheline_aligned_in_smp;
 
 static inline bool mlx5e_sq_has_room_for(struct mlx5e_sq *sq, u16 n)
@@ -399,6 +405,7 @@ struct mlx5e_channel {
 	/* data path */
 	struct mlx5e_rq            rq;
 	struct mlx5e_sq            sq[MLX5E_MAX_NUM_TC];
+	struct mlx5e_sq            icosq;   /* internal control operations */
 	struct napi_struct         napi;
 	struct device             *pdev;
 	struct net_device         *netdev;
