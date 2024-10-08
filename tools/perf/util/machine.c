@@ -678,6 +678,9 @@ int __machine__create_kernel_maps(struct machine *machine, struct dso *kernel)
 			machine->vmlinux_maps[type]->unmap_ip =
 				identity__map_ip;
 		kmap = map__kmap(machine->vmlinux_maps[type]);
+		if (!kmap)
+			return -1;
+
 		kmap->kmaps = &machine->kmaps;
 		map_groups__insert(&machine->kmaps,
 				   machine->vmlinux_maps[type]);
@@ -699,7 +702,7 @@ void machine__destroy_kernel_maps(struct machine *machine)
 		kmap = map__kmap(machine->vmlinux_maps[type]);
 		map_groups__remove(&machine->kmaps,
 				   machine->vmlinux_maps[type]);
-		if (kmap->ref_reloc_sym) {
+		if (kmap && kmap->ref_reloc_sym) {
 			/*
 			 * ref_reloc_sym is shared among all maps, so free just
 			 * on one of them.
