@@ -1,0 +1,241 @@
+mm: numa: Do not batch handle PMD pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] numa: Do not batch handle PMD pages (Rik van Riel) [683513]
+Rebuild_FUZZ: 94.59%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 0f19c17929c952c6f0966d93ab05558e7bf814cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0f19c179.failed
+
+With the THP migration races closed it is still possible to occasionally
+see corruption. The problem is related to handling PMD pages in batch.
+When a page fault is handled it can be assumed that the page being
+faulted will also be flushed from the TLB. The same flushing does not
+happen when handling PMD pages in batch. Fixing is straight forward but
+there are a number of reasons not to
+
+1. Multiple TLB flushes may have to be sent depending on what pages get
+   migrated
+2. The handling of PMDs in batch means that faults get accounted to
+   the task that is handling the fault. While care is taken to only
+   mark PMDs where the last CPU and PID match it can still have problems
+   due to PID truncation when matching PIDs.
+3. Batching on the PMD level may reduce faults but setting pmd_numa
+   requires taking a heavy lock that can contend with THP migration
+   and handling the fault requires the release/acquisition of the PTL
+   for every page migrated. It's still pretty heavy.
+
+PMD batch handling is not something that people ever have been happy
+with. This patch removes it and later patches will deal with the
+additional fault overhead using more installigent migrate rate adaption.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-48-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0f19c17929c952c6f0966d93ab05558e7bf814cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+#	mm/mprotect.c
+diff --cc mm/memory.c
+index 6285e7df615f,9898eeb9a21c..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3578,94 -3600,12 +3578,97 @@@ int do_numa_page(struct mm_struct *mm, 
+  
+  out:
+  	if (page_nid != -1)
+ -		task_numa_fault(last_cpupid, page_nid, 1, flags);
+ +		task_numa_fault(page_nid, 1, migrated);
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +/* NUMA hinting page fault entry point for regular pmds */
+ +#ifdef CONFIG_NUMA_BALANCING
+ +static int do_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ +		     unsigned long addr, pmd_t *pmdp)
+ +{
+ +	pmd_t pmd;
+ +	pte_t *pte, *orig_pte;
+ +	unsigned long _addr = addr & PMD_MASK;
+ +	unsigned long offset;
+ +	spinlock_t *ptl;
+ +	bool numa = false;
+ +
+ +	spin_lock(&mm->page_table_lock);
+ +	pmd = *pmdp;
+ +	if (pmd_numa(pmd)) {
+ +		set_pmd_at(mm, _addr, pmdp, pmd_mknonnuma(pmd));
+ +		numa = true;
+ +	}
+ +	spin_unlock(&mm->page_table_lock);
+ +
+ +	if (!numa)
+ +		return 0;
+ +
+ +	/* we're in a page fault so some vma must be in the range */
+ +	BUG_ON(!vma);
+ +	BUG_ON(vma->vm_start >= _addr + PMD_SIZE);
+ +	offset = max(_addr, vma->vm_start) & ~PMD_MASK;
+ +	VM_BUG_ON(offset >= PMD_SIZE);
+ +	orig_pte = pte = pte_offset_map_lock(mm, pmdp, _addr, &ptl);
+ +	pte += offset >> PAGE_SHIFT;
+ +	for (addr = _addr + offset; addr < _addr + PMD_SIZE; pte++, addr += PAGE_SIZE) {
+ +		pte_t pteval = *pte;
+ +		struct page *page;
+ +		int page_nid = -1;
+ +		int target_nid;
+ +		bool migrated = false;
+ +
+ +		if (!pte_present(pteval))
+ +			continue;
+ +		if (!pte_numa(pteval))
+ +			continue;
+ +		if (addr >= vma->vm_end) {
+ +			vma = find_vma(mm, addr);
+ +			/* there's a pte present so there must be a vma */
+ +			BUG_ON(!vma);
+ +			BUG_ON(addr < vma->vm_start);
+ +		}
+ +		if (pte_numa(pteval)) {
+ +			pteval = pte_mknonnuma(pteval);
+ +			set_pte_at(mm, addr, pte, pteval);
+ +		}
+ +		page = vm_normal_page(vma, addr, pteval);
+ +		if (unlikely(!page))
+ +			continue;
+ +
+ +		page_nid = page_to_nid(page);
+ +		target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+ +		pte_unmap_unlock(pte, ptl);
+ +		if (target_nid != -1) {
+ +			migrated = migrate_misplaced_page(page, vma, target_nid);
+ +			if (migrated)
+ +				page_nid = target_nid;
+ +		} else {
+ +			put_page(page);
+ +		}
+ +
+ +		if (page_nid != -1)
+ +			task_numa_fault(page_nid, 1, migrated);
+ +
+ +		pte = pte_offset_map_lock(mm, pmdp, addr, &ptl);
+ +	}
+ +	pte_unmap_unlock(orig_pte, ptl);
+ +
+  	return 0;
+  }
+ +#else
+ +static int do_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ +		     unsigned long addr, pmd_t *pmdp)
+ +{
+ +	BUG();
+ +	return 0;
+ +}
+ +#endif /* CONFIG_NUMA_BALANCING */
+  
+++=======
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  /*
+   * These routines also need to handle stuff like marking pages dirty
+   * and/or accessed for architectures that don't do it in hardware (most
+diff --cc mm/mprotect.c
+index 41e02923fcd9,a0302ac0be98..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -37,14 -37,12 +37,21 @@@ static inline pgprot_t pgprot_modify(pg
+  
+  static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+  		unsigned long addr, unsigned long end, pgprot_t newprot,
+++<<<<<<< HEAD
+ +		int dirty_accountable, int prot_numa, bool *ret_all_same_node)
+++=======
++ 		int dirty_accountable, int prot_numa)
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  {
+  	struct mm_struct *mm = vma->vm_mm;
+  	pte_t *pte, oldpte;
+  	spinlock_t *ptl;
+  	unsigned long pages = 0;
+++<<<<<<< HEAD
+ +	bool all_same_node = true;
+ +	int last_nid = -1;
+++=======
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  
+  	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+  	arch_enter_lazy_mmu_mode();
+@@@ -63,12 -61,6 +70,15 @@@
+  
+  				page = vm_normal_page(vma, addr, oldpte);
+  				if (page) {
+++<<<<<<< HEAD
+ +					int this_nid = page_to_nid(page);
+ +					if (last_nid == -1)
+ +						last_nid = this_nid;
+ +					if (last_nid != this_nid)
+ +						all_same_node = false;
+ +
+++=======
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  					if (!pte_numa(oldpte)) {
+  						ptent = pte_mknuma(ptent);
+  						updated = true;
+@@@ -107,7 -99,6 +117,10 @@@
+  	arch_leave_lazy_mmu_mode();
+  	pte_unmap_unlock(pte - 1, ptl);
+  
+++<<<<<<< HEAD
+ +	*ret_all_same_node = all_same_node;
+++=======
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  	return pages;
+  }
+  
+@@@ -134,7 -109,6 +131,10 @@@ static inline unsigned long change_pmd_
+  	pmd_t *pmd;
+  	unsigned long next;
+  	unsigned long pages = 0;
+++<<<<<<< HEAD
+ +	bool all_same_node;
+++=======
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  
+  	pmd = pmd_offset(pud, addr);
+  	do {
+@@@ -157,17 -133,9 +157,23 @@@
+  		}
+  		if (pmd_none_or_clear_bad(pmd))
+  			continue;
+++<<<<<<< HEAD
+ +		pages += change_pte_range(vma, pmd, addr, next, newprot,
+ +				 dirty_accountable, prot_numa, &all_same_node);
+ +
+ +		/*
+ +		 * If we are changing protections for NUMA hinting faults then
+ +		 * set pmd_numa if the examined pages were all on the same
+ +		 * node. This allows a regular PMD to be handled as one fault
+ +		 * and effectively batches the taking of the PTL
+ +		 */
+ +		if (prot_numa && all_same_node)
+ +			change_pmd_protnuma(vma->vm_mm, addr, pmd);
+++=======
++ 		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
++ 				 dirty_accountable, prot_numa);
++ 		pages += this_pages;
+++>>>>>>> 0f19c17929c9 (mm: numa: Do not batch handle PMD pages)
+  	} while (pmd++, addr = next, addr != end);
+  
+  	return pages;
+* Unmerged path mm/memory.c
+* Unmerged path mm/mprotect.c
