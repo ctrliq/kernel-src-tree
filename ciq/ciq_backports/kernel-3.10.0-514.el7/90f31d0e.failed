@@ -1,0 +1,117 @@
+mm: rcu-protected get_mm_exe_file()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit 90f31d0ea88880f780574f3d0bb1a227c4c66ca3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/90f31d0e.failed
+
+This patch removes mm->mmap_sem from mm->exe_file read side.
+Also it kills dup_mm_exe_file() and moves exe_file duplication into
+dup_mmap() where both mmap_sems are locked.
+
+[akpm@linux-foundation.org: fix comment typo]
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: "Paul E. McKenney" <paulmck@us.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 90f31d0ea88880f780574f3d0bb1a227c4c66ca3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file.c
+#	kernel/fork.c
+diff --cc fs/file.c
+index 4a78f981557a,93c5f89c248b..000000000000
+--- a/fs/file.c
++++ b/fs/file.c
+@@@ -654,8 -638,7 +654,12 @@@ struct file *fget(unsigned int fd
+  	file = fcheck_files(files, fd);
+  	if (file) {
+  		/* File object ref couldn't be taken */
+++<<<<<<< HEAD
+ +		if (file->f_mode & FMODE_PATH ||
+ +		    !atomic_long_inc_not_zero(&file->f_count))
+++=======
++ 		if ((file->f_mode & mask) || !get_file_rcu(file))
+++>>>>>>> 90f31d0ea888 (mm: rcu-protected get_mm_exe_file())
+  			file = NULL;
+  	}
+  	rcu_read_unlock();
+diff --cc kernel/fork.c
+index a14b2bbebc6a,259202637531..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -362,14 -403,14 +362,25 @@@ static int dup_mmap(struct mm_struct *m
+  	 */
+  	down_write_nested(&mm->mmap_sem, SINGLE_DEPTH_NESTING);
+  
+++<<<<<<< HEAD
+ +	mm->locked_vm = 0;
+ +	mm->mmap = NULL;
+ +	mm->mmap_cache = NULL;
+ +	mm->free_area_cache = oldmm->mmap_base;
+ +	mm->cached_hole_size = ~0UL;
+ +	mm->map_count = 0;
+ +	cpumask_clear(mm_cpumask(mm));
+ +	mm->mm_rb = RB_ROOT;
+++=======
++ 	/* No ordering required: file already has been exposed. */
++ 	RCU_INIT_POINTER(mm->exe_file, get_mm_exe_file(oldmm));
++ 
++ 	mm->total_vm = oldmm->total_vm;
++ 	mm->shared_vm = oldmm->shared_vm;
++ 	mm->exec_vm = oldmm->exec_vm;
++ 	mm->stack_vm = oldmm->stack_vm;
++ 
+++>>>>>>> 90f31d0ea888 (mm: rcu-protected get_mm_exe_file())
+  	rb_link = &mm->mm_rb.rb_node;
+  	rb_parent = NULL;
+  	pprev = &mm->mmap;
+@@@ -834,11 -907,6 +862,14 @@@ struct mm_struct *dup_mm(struct task_st
+  	if (!mm_init(mm, tsk))
+  		goto fail_nomem;
+  
+++<<<<<<< HEAD
+ +	if (init_new_context(tsk, mm))
+ +		goto fail_nocontext;
+ +
+ +	dup_mm_exe_file(oldmm, mm);
+ +
+++=======
+++>>>>>>> 90f31d0ea888 (mm: rcu-protected get_mm_exe_file())
+  	err = dup_mmap(mm, oldmm);
+  	if (err)
+  		goto free_pt;
+* Unmerged path fs/file.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 37d4ac39152e..746cd4570dfc 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -895,6 +895,7 @@ static inline struct file *get_file(struct file *f)
+ 	atomic_long_inc(&f->f_count);
+ 	return f;
+ }
++#define get_file_rcu(x) atomic_long_inc_not_zero(&(x)->f_count)
+ #define fput_atomic(x)	atomic_long_add_unless(&(x)->f_count, -1, 1)
+ #define file_count(x)	atomic_long_read(&(x)->f_count)
+ 
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 43f423b198b4..6a5b19edb42f 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -433,7 +433,7 @@ struct mm_struct {
+ #endif
+ 
+ 	/* store ref to file /proc/<pid>/exe symlink points to */
+-	struct file *exe_file;
++	struct file __rcu *exe_file;
+ #ifdef CONFIG_MMU_NOTIFIER
+ 	struct mmu_notifier_mm *mmu_notifier_mm;
+ #endif
+* Unmerged path kernel/fork.c
