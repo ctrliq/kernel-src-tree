@@ -1,0 +1,271 @@
+net: add skb functions to process remote checksum offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] add skb functions to process remote checksum offload (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 95.41%
+commit-author Tom Herbert <therbert@google.com>
+commit dcdc8994697faa789669c3fdaca1a8bc27a8f356
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dcdc8994.failed
+
+This patch adds skb_remcsum_process and skb_gro_remcsum_process to
+perform the appropriate adjustments to the skb when receiving
+remote checksum offload.
+
+Updated vxlan and gue to use these functions.
+
+Tested: Ran TCP_RR and TCP_STREAM netperf for VXLAN and GUE, did
+not see any change in performance.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dcdc8994697faa789669c3fdaca1a8bc27a8f356)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/ipv4/fou.c
+diff --cc drivers/net/vxlan.c
+index 3440d933b3ec,c184717e8b28..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -549,7 -552,43 +549,47 @@@ static int vxlan_fdb_append(struct vxla
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff **vxlan_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct vxlanhdr *vxlan_gro_remcsum(struct sk_buff *skb,
++ 					  unsigned int off,
++ 					  struct vxlanhdr *vh, size_t hdrlen,
++ 					  u32 data)
++ {
++ 	size_t start, offset, plen;
++ 
++ 	if (skb->remcsum_offload)
++ 		return vh;
++ 
++ 	if (!NAPI_GRO_CB(skb)->csum_valid)
++ 		return NULL;
++ 
++ 	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ 	offset = start + ((data & VXLAN_RCO_UDP) ?
++ 			  offsetof(struct udphdr, check) :
++ 			  offsetof(struct tcphdr, check));
++ 
++ 	plen = hdrlen + offset + sizeof(u16);
++ 
++ 	/* Pull checksum that will be written */
++ 	if (skb_gro_header_hard(skb, off + plen)) {
++ 		vh = skb_gro_header_slow(skb, off + plen, off);
++ 		if (!vh)
++ 			return NULL;
++ 	}
++ 
++ 	skb_gro_remcsum_process(skb, (void *)vh + hdrlen, start, offset);
++ 
++ 	skb->remcsum_offload = 1;
++ 
++ 	return vh;
++ }
++ 
++ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head,
++ 					  struct sk_buff *skb,
++ 					  struct udp_offload *uoff)
+++>>>>>>> dcdc8994697f (net: add skb functions to process remote checksum offload)
+  {
+  	struct sk_buff *p, **pp = NULL;
+  	struct vxlanhdr *vh, *vh2;
+@@@ -1094,6 -1149,34 +1134,37 @@@ static void vxlan_igmp_leave(struct wor
+  	dev_put(vxlan->dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct vxlanhdr *vxlan_remcsum(struct sk_buff *skb, struct vxlanhdr *vh,
++ 				      size_t hdrlen, u32 data)
++ {
++ 	size_t start, offset, plen;
++ 
++ 	if (skb->remcsum_offload) {
++ 		/* Already processed in GRO path */
++ 		skb->remcsum_offload = 0;
++ 		return vh;
++ 	}
++ 
++ 	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ 	offset = start + ((data & VXLAN_RCO_UDP) ?
++ 			  offsetof(struct udphdr, check) :
++ 			  offsetof(struct tcphdr, check));
++ 
++ 	plen = hdrlen + offset + sizeof(u16);
++ 
++ 	if (!pskb_may_pull(skb, plen))
++ 		return NULL;
++ 
++ 	vh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
++ 
++ 	skb_remcsum_process(skb, (void *)vh + hdrlen, start, offset);
++ 
++ 	return vh;
++ }
++ 
+++>>>>>>> dcdc8994697f (net: add skb functions to process remote checksum offload)
+  /* Callback from net/ipv4/udp.c to receive packets */
+  static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+diff --cc net/ipv4/fou.c
+index a87e3c956cb2,92ddea1e6457..000000000000
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@@ -62,8 -58,39 +62,44 @@@ static int fou_udp_recv(struct sock *sk
+  	if (!fou)
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	return fou_udp_encap_recv_deliver(skb, fou->protocol,
+ +					  sizeof(struct udphdr));
+++=======
++ 	fou_recv_pull(skb, sizeof(struct udphdr));
++ 
++ 	return -fou->protocol;
++ }
++ 
++ static struct guehdr *gue_remcsum(struct sk_buff *skb, struct guehdr *guehdr,
++ 				  void *data, size_t hdrlen, u8 ipproto)
++ {
++ 	__be16 *pd = data;
++ 	size_t start = ntohs(pd[0]);
++ 	size_t offset = ntohs(pd[1]);
++ 	size_t plen = hdrlen + max_t(size_t, offset + sizeof(u16), start);
++ 
++ 	if (skb->remcsum_offload) {
++ 		/* Already processed in GRO path */
++ 		skb->remcsum_offload = 0;
++ 		return guehdr;
++ 	}
++ 
++ 	if (!pskb_may_pull(skb, plen))
++ 		return NULL;
++ 	guehdr = (struct guehdr *)&udp_hdr(skb)[1];
++ 
++ 	skb_remcsum_process(skb, (void *)guehdr + hdrlen, start, offset);
++ 
++ 	return guehdr;
++ }
++ 
++ static int gue_control_message(struct sk_buff *skb, struct guehdr *guehdr)
++ {
++ 	/* No support yet */
++ 	kfree_skb(skb);
++ 	return 0;
+++>>>>>>> dcdc8994697f (net: add skb functions to process remote checksum offload)
+  }
+  
+  static int gue_udp_recv(struct sock *sk, struct sk_buff *skb)
+@@@ -149,8 -212,38 +185,40 @@@ out_unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct guehdr *gue_gro_remcsum(struct sk_buff *skb, unsigned int off,
++ 				      struct guehdr *guehdr, void *data,
++ 				      size_t hdrlen, u8 ipproto)
++ {
++ 	__be16 *pd = data;
++ 	size_t start = ntohs(pd[0]);
++ 	size_t offset = ntohs(pd[1]);
++ 	size_t plen = hdrlen + max_t(size_t, offset + sizeof(u16), start);
++ 
++ 	if (skb->remcsum_offload)
++ 		return guehdr;
++ 
++ 	if (!NAPI_GRO_CB(skb)->csum_valid)
++ 		return NULL;
++ 
++ 	/* Pull checksum that will be written */
++ 	if (skb_gro_header_hard(skb, off + plen)) {
++ 		guehdr = skb_gro_header_slow(skb, off + plen, off);
++ 		if (!guehdr)
++ 			return NULL;
++ 	}
++ 
++ 	skb_gro_remcsum_process(skb, (void *)guehdr + hdrlen, start, offset);
++ 
++ 	skb->remcsum_offload = 1;
++ 
++ 	return guehdr;
++ }
++ 
+++>>>>>>> dcdc8994697f (net: add skb functions to process remote checksum offload)
+  static struct sk_buff **gue_gro_receive(struct sk_buff **head,
+ -					struct sk_buff *skb,
+ -					struct udp_offload *uoff)
+ +					struct sk_buff *skb)
+  {
+  	const struct net_offload **offloads;
+  	const struct net_offload *ops;
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 93c2d6dc113c..970c05826a74 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2001,6 +2001,21 @@ do {									\
+ 					   compute_pseudo(skb, proto));	\
+ } while (0)
+ 
++static inline void skb_gro_remcsum_process(struct sk_buff *skb, void *ptr,
++					   int start, int offset)
++{
++	__wsum delta;
++
++	BUG_ON(!NAPI_GRO_CB(skb)->csum_valid);
++
++	delta = remcsum_adjust(ptr, NAPI_GRO_CB(skb)->csum, start, offset);
++
++	/* Adjust skb->csum since we changed the packet */
++	skb->csum = csum_add(skb->csum, delta);
++	NAPI_GRO_CB(skb)->csum = csum_add(NAPI_GRO_CB(skb)->csum, delta);
++}
++
++
+ static inline int dev_hard_header(struct sk_buff *skb, struct net_device *dev,
+ 				  unsigned short type,
+ 				  const void *daddr, const void *saddr,
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 9599a478ca15..e78e0cebe988 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2969,6 +2969,27 @@ do {									\
+ 				       compute_pseudo(skb, proto));	\
+ } while (0)
+ 
++/* Update skbuf and packet to reflect the remote checksum offload operation.
++ * When called, ptr indicates the starting point for skb->csum when
++ * ip_summed is CHECKSUM_COMPLETE. If we need create checksum complete
++ * here, skb_postpull_rcsum is done so skb->csum start is ptr.
++ */
++static inline void skb_remcsum_process(struct sk_buff *skb, void *ptr,
++				       int start, int offset)
++{
++	__wsum delta;
++
++	 if (unlikely(skb->ip_summed != CHECKSUM_COMPLETE)) {
++		__skb_checksum_complete(skb);
++		skb_postpull_rcsum(skb, skb->data, ptr - (void *)skb->data);
++	}
++
++	delta = remcsum_adjust(ptr, skb->csum, start, offset);
++
++	/* Adjust skb->csum since we changed the packet */
++	skb->csum = csum_add(skb->csum, delta);
++}
++
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ extern void nf_conntrack_destroy(struct nf_conntrack *nfct);
+ static inline void nf_conntrack_put(struct nf_conntrack *nfct)
+* Unmerged path net/ipv4/fou.c
