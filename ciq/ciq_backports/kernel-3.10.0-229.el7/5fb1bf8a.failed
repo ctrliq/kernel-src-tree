@@ -1,0 +1,153 @@
+mpt2sas: Added Reply Descriptor Post Queue (RDPQ) Array support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Sreekanth Reddy <sreekanth.reddy@avagotech.com>
+commit 5fb1bf8aaa832e1e9ca3198de7bbecb8eff7db9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5fb1bf8a.failed
+
+Up to now, Driver allocates a single contiguous block of memory
+pool for all reply queues and passes down a single address in the
+ReplyDescriptorPostQueueAddress field of the IOC Init Request
+Message to the firmware.
+
+When firmware receives this address, it will program each of the
+Reply Descriptor Post Queue registers, as each reply queue has its
+own register. Thus the firmware, starting from a base address it
+determines the starting address of the subsequent reply queues
+through some simple arithmetic calculations.
+
+The size of this contiguous block of memory pool is directly proportional
+to number of MSI-X vectors and the HBA queue depth. For example higher
+MSIX vectors requires larger contiguous block of memory pool.
+
+But some of the OS kernels are unable to allocate this larger
+contiguous block of memory pool.
+
+So, the proposal is to allocate memory independently for each
+Reply Queue and pass down all of the addresses to the firmware.
+Then the firmware will just take each address and program the value
+into the correct register.
+
+When HBAs with older firmware(i.e. without RDPQ capability) is used
+with this new driver then the max_msix_vectors value would be set
+to 8 by default.
+
+Change_set in v1:
+
+1. Declared _base_get_ioc_facts() function at the beginning of the mpt2sas_base.c
+file instead of moving all these functions before mpt2sas_base_map_resources() function
+        a. _base_wait_for_doorbell_int()
+        b. _base_wait_for_doorbell_ack()
+        c. _base_wait_for_doorbell_not_used()
+        d. _base_handshake_req_reply_wait()
+        e. _base_get_ioc_facts()
+
+2. Initially set the consistent DMA mask to 32 bit and then change it to 64 bit mask
+after allocating RDPQ pools by calling the function _base_change_consistent_dma_mask.
+This is to ensure that all the upper 32 bits of RDPQ entries's base address to be same.
+
+3. Reduced the redundancy between the RDPQ and non-RDPQ support in these following functions
+        a. _base_release_memory_pools()
+        b. _base_allocate_memory_pools()
+        c. _base_send_ioc_init()
+        d. _base_make_ioc_operational()
+
+	Signed-off-by: Sreekanth Reddy <Sreekanth.Reddy@avagotech.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 5fb1bf8aaa832e1e9ca3198de7bbecb8eff7db9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt2sas/mpt2sas_base.c
+diff --cc drivers/scsi/mpt2sas/mpt2sas_base.c
+index 2f86ba8ae9c2,fc9dfda72699..000000000000
+--- a/drivers/scsi/mpt2sas/mpt2sas_base.c
++++ b/drivers/scsi/mpt2sas/mpt2sas_base.c
+@@@ -1402,6 -1425,20 +1421,23 @@@ _base_enable_msix(struct MPT2SAS_ADAPTE
+  	ioc->reply_queue_count = min_t(int, ioc->cpu_count,
+  	    ioc->msix_vector_count);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!ioc->rdpq_array_enable && max_msix_vectors == -1)
++ 		max_msix_vectors = 8;
++ 
++ 	if (max_msix_vectors > 0) {
++ 		ioc->reply_queue_count = min_t(int, max_msix_vectors,
++ 		    ioc->reply_queue_count);
++ 		ioc->msix_vector_count = ioc->reply_queue_count;
++ 	} else if (max_msix_vectors == 0)
++ 		goto try_ioapic;
++ 
++ 	printk(MPT2SAS_INFO_FMT
++ 	"MSI-X vectors supported: %d, no of cores: %d, max_msix_vectors: %d\n",
++ 	 ioc->name, ioc->msix_vector_count, ioc->cpu_count, max_msix_vectors);
++ 
+++>>>>>>> 5fb1bf8aaa83 (mpt2sas: Added Reply Descriptor Post Queue (RDPQ) Array support)
+  	entries = kcalloc(ioc->reply_queue_count, sizeof(struct msix_entry),
+  	    GFP_KERNEL);
+  	if (!entries) {
+* Unmerged path drivers/scsi/mpt2sas/mpt2sas_base.c
+diff --git a/drivers/scsi/mpt2sas/mpt2sas_base.h b/drivers/scsi/mpt2sas/mpt2sas_base.h
+index e0e4dd48e9dc..9bc8e0b915b8 100644
+--- a/drivers/scsi/mpt2sas/mpt2sas_base.h
++++ b/drivers/scsi/mpt2sas/mpt2sas_base.h
+@@ -636,6 +636,11 @@ struct mpt2sas_port_facts {
+ 	u16			MaxPostedCmdBuffers;
+ };
+ 
++struct reply_post_struct {
++	Mpi2ReplyDescriptorsUnion_t	*reply_post_free;
++	dma_addr_t			reply_post_free_dma;
++};
++
+ /**
+  * enum mutex_type - task management mutex type
+  * @TM_MUTEX_OFF: mutex is not required becuase calling function is acquiring it
+@@ -663,6 +668,7 @@ typedef void (*MPT2SAS_FLUSH_RUNNING_CMDS)(struct MPT2SAS_ADAPTER *ioc);
+  * @ir_firmware: IR firmware present
+  * @bars: bitmask of BAR's that must be configured
+  * @mask_interrupts: ignore interrupt
++ * @dma_mask: used to set the consistent dma mask
+  * @fault_reset_work_q_name: fw fault work queue
+  * @fault_reset_work_q: ""
+  * @fault_reset_work: ""
+@@ -779,8 +785,11 @@ typedef void (*MPT2SAS_FLUSH_RUNNING_CMDS)(struct MPT2SAS_ADAPTER *ioc);
+  * @reply_free_dma_pool:
+  * @reply_free_host_index: tail index in pool to insert free replys
+  * @reply_post_queue_depth: reply post queue depth
+- * @reply_post_free: pool for reply post (64bit descriptor)
+- * @reply_post_free_dma:
++ * @reply_post_struct: struct for reply_post_free physical & virt address
++ * @rdpq_array_capable: FW supports multiple reply queue addresses in ioc_init
++ * @rdpq_array_enable: rdpq_array support is enabled in the driver
++ * @rdpq_array_enable_assigned: this ensures that rdpq_array_enable flag
++ *				is assigned only ones
+  * @reply_queue_count: number of reply queue's
+  * @reply_queue_list: link list contaning the reply queue info
+  * @reply_post_host_index: head index in the pool where FW completes IO
+@@ -802,6 +811,7 @@ struct MPT2SAS_ADAPTER {
+ 	u8		ir_firmware;
+ 	int		bars;
+ 	u8		mask_interrupts;
++	int		dma_mask;
+ 
+ 	/* fw fault handler */
+ 	char		fault_reset_work_q_name[20];
+@@ -972,8 +982,10 @@ struct MPT2SAS_ADAPTER {
+ 
+ 	/* reply post queue */
+ 	u16 		reply_post_queue_depth;
+-	Mpi2ReplyDescriptorsUnion_t *reply_post_free;
+-	dma_addr_t	reply_post_free_dma;
++	struct reply_post_struct *reply_post;
++	u8		rdpq_array_capable;
++	u8		rdpq_array_enable;
++	u8		rdpq_array_enable_assigned;
+ 	struct dma_pool *reply_post_free_dma_pool;
+ 	u8		reply_queue_count;
+ 	struct list_head reply_queue_list;
