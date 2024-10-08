@@ -114,6 +114,8 @@ obj-$(CONFIG_CRASH_DUMP) += crash_dump.o
 obj-$(CONFIG_JUMP_LABEL) += jump_label.o
 obj-$(CONFIG_CONTEXT_TRACKING) += context_tracking.o
 
+obj-$(CONFIG_HAS_IOMEM) += memremap.o
+
 $(obj)/configs.o: $(obj)/config_data.h
 
 $(obj)/modsign_uefi.o: KBUILD_CFLAGS += -fshort-wchar
