@@ -1,0 +1,438 @@
+vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexei Starovoitov <ast@plumgrid.com>
+commit da8b43c0e1dcea3bcac5f37ea59934ddaa137aed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/da8b43c0.failed
+
+IFLA_VXLAN_FLOWBASED is useless without IFLA_VXLAN_COLLECT_METADATA,
+so combine them into single IFLA_VXLAN_COLLECT_METADATA flag.
+'flowbased' doesn't convey real meaning of the vxlan tunnel mode.
+This mode can be used by routing, tc+bpf and ovs.
+Only ovs is strictly flow based, so 'collect metadata' is a better
+name for this tunnel mode.
+
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit da8b43c0e1dcea3bcac5f37ea59934ddaa137aed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+#	include/uapi/linux/if_link.h
+#	net/openvswitch/vport-vxlan.c
+diff --cc drivers/net/vxlan.c
+index e2461103c0f3,b6731fad19ba..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1159,6 -1128,102 +1159,105 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  	return vh;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
++ 		      struct vxlan_metadata *md, u32 vni,
++ 		      struct metadata_dst *tun_dst)
++ {
++ 	struct iphdr *oip = NULL;
++ 	struct ipv6hdr *oip6 = NULL;
++ 	struct vxlan_dev *vxlan;
++ 	struct pcpu_sw_netstats *stats;
++ 	union vxlan_addr saddr;
++ 	int err = 0;
++ 	union vxlan_addr *remote_ip;
++ 
++ 	/* For flow based devices, map all packets to VNI 0 */
++ 	if (vs->flags & VXLAN_F_COLLECT_METADATA)
++ 		vni = 0;
++ 
++ 	/* Is this VNI defined? */
++ 	vxlan = vxlan_vs_find_vni(vs, vni);
++ 	if (!vxlan)
++ 		goto drop;
++ 
++ 	remote_ip = &vxlan->default_dst.remote_ip;
++ 	skb_reset_mac_header(skb);
++ 	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
++ 	skb->protocol = eth_type_trans(skb, vxlan->dev);
++ 	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
++ 
++ 	/* Ignore packet loops (and multicast echo) */
++ 	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
++ 		goto drop;
++ 
++ 	/* Re-examine inner Ethernet packet */
++ 	if (remote_ip->sa.sa_family == AF_INET) {
++ 		oip = ip_hdr(skb);
++ 		saddr.sin.sin_addr.s_addr = oip->saddr;
++ 		saddr.sa.sa_family = AF_INET;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		oip6 = ipv6_hdr(skb);
++ 		saddr.sin6.sin6_addr = oip6->saddr;
++ 		saddr.sa.sa_family = AF_INET6;
++ #endif
++ 	}
++ 
++ 	if (tun_dst) {
++ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
++ 		tun_dst = NULL;
++ 	}
++ 
++ 	if ((vxlan->flags & VXLAN_F_LEARN) &&
++ 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
++ 		goto drop;
++ 
++ 	skb_reset_network_header(skb);
++ 	/* In flow-based mode, GBP is carried in dst_metadata */
++ 	if (!(vs->flags & VXLAN_F_COLLECT_METADATA))
++ 		skb->mark = md->gbp;
++ 
++ 	if (oip6)
++ 		err = IP6_ECN_decapsulate(oip6, skb);
++ 	if (oip)
++ 		err = IP_ECN_decapsulate(oip, skb);
++ 
++ 	if (unlikely(err)) {
++ 		if (log_ecn_error) {
++ 			if (oip6)
++ 				net_info_ratelimited("non-ECT from %pI6\n",
++ 						     &oip6->saddr);
++ 			if (oip)
++ 				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
++ 						     &oip->saddr, oip->tos);
++ 		}
++ 		if (err > 1) {
++ 			++vxlan->dev->stats.rx_frame_errors;
++ 			++vxlan->dev->stats.rx_errors;
++ 			goto drop;
++ 		}
++ 	}
++ 
++ 	stats = this_cpu_ptr(vxlan->dev->tstats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->rx_packets++;
++ 	stats->rx_bytes += skb->len;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	netif_rx(skb);
++ 
++ 	return;
++ drop:
++ 	if (tun_dst)
++ 		dst_release((struct dst_entry *)tun_dst);
++ 
++ 	/* Consume bad packet */
++ 	kfree_skb(skb);
++ }
++ 
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  /* Callback from net/ipv4/udp.c to receive packets */
+  static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+@@@ -2076,6 -2129,12 +2175,15 @@@ static netdev_tx_t vxlan_xmit(struct sk
+  #endif
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vxlan->flags & VXLAN_F_COLLECT_METADATA &&
++ 	    info && info->mode == IP_TUNNEL_INFO_TX) {
++ 		vxlan_xmit_one(skb, dev, NULL, false);
++ 		return NETDEV_TX_OK;
++ 	}
++ 
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  	f = vxlan_find_mac(vxlan, eth->h_dest);
+  	did_rsc = false;
+  
+@@@ -2404,6 -2462,7 +2512,10 @@@ static const struct nla_policy vxlan_po
+  	[IFLA_VXLAN_RSC]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_L2MISS]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_L3MISS]	= { .type = NLA_U8 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_VXLAN_COLLECT_METADATA]	= { .type = NLA_U8 },
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  	[IFLA_VXLAN_PORT]	= { .type = NLA_U16 },
+  	[IFLA_VXLAN_UDP_CSUM]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]	= { .type = NLA_U8 },
+@@@ -2748,6 -2725,151 +2860,154 @@@ static int vxlan_newlink(struct net *sr
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct net_device *vxlan_dev_create(struct net *net, const char *name,
++ 				    u8 name_assign_type, struct vxlan_config *conf)
++ {
++ 	struct nlattr *tb[IFLA_MAX+1];
++ 	struct net_device *dev;
++ 	int err;
++ 
++ 	memset(&tb, 0, sizeof(tb));
++ 
++ 	dev = rtnl_create_link(net, name, name_assign_type,
++ 			       &vxlan_link_ops, tb);
++ 	if (IS_ERR(dev))
++ 		return dev;
++ 
++ 	err = vxlan_dev_configure(net, dev, conf);
++ 	if (err < 0) {
++ 		free_netdev(dev);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	return dev;
++ }
++ EXPORT_SYMBOL_GPL(vxlan_dev_create);
++ 
++ static int vxlan_newlink(struct net *src_net, struct net_device *dev,
++ 			 struct nlattr *tb[], struct nlattr *data[])
++ {
++ 	struct vxlan_config conf;
++ 	int err;
++ 
++ 	if (!data[IFLA_VXLAN_ID])
++ 		return -EINVAL;
++ 
++ 	memset(&conf, 0, sizeof(conf));
++ 	conf.vni = nla_get_u32(data[IFLA_VXLAN_ID]);
++ 
++ 	if (data[IFLA_VXLAN_GROUP]) {
++ 		conf.remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
++ 	} else if (data[IFLA_VXLAN_GROUP6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		conf.remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
++ 		conf.remote_ip.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LOCAL]) {
++ 		conf.saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
++ 		conf.saddr.sa.sa_family = AF_INET;
++ 	} else if (data[IFLA_VXLAN_LOCAL6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		/* TODO: respect scope id */
++ 		conf.saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
++ 		conf.saddr.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LINK])
++ 		conf.remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
++ 
++ 	if (data[IFLA_VXLAN_TOS])
++ 		conf.tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
++ 
++ 	if (data[IFLA_VXLAN_TTL])
++ 		conf.ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
++ 
++ 	if (!data[IFLA_VXLAN_LEARNING] || nla_get_u8(data[IFLA_VXLAN_LEARNING]))
++ 		conf.flags |= VXLAN_F_LEARN;
++ 
++ 	if (data[IFLA_VXLAN_AGEING])
++ 		conf.age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
++ 
++ 	if (data[IFLA_VXLAN_PROXY] && nla_get_u8(data[IFLA_VXLAN_PROXY]))
++ 		conf.flags |= VXLAN_F_PROXY;
++ 
++ 	if (data[IFLA_VXLAN_RSC] && nla_get_u8(data[IFLA_VXLAN_RSC]))
++ 		conf.flags |= VXLAN_F_RSC;
++ 
++ 	if (data[IFLA_VXLAN_L2MISS] && nla_get_u8(data[IFLA_VXLAN_L2MISS]))
++ 		conf.flags |= VXLAN_F_L2MISS;
++ 
++ 	if (data[IFLA_VXLAN_L3MISS] && nla_get_u8(data[IFLA_VXLAN_L3MISS]))
++ 		conf.flags |= VXLAN_F_L3MISS;
++ 
++ 	if (data[IFLA_VXLAN_LIMIT])
++ 		conf.addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
++ 
++ 	if (data[IFLA_VXLAN_COLLECT_METADATA] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
++ 		conf.flags |= VXLAN_F_COLLECT_METADATA;
++ 
++ 	if (data[IFLA_VXLAN_PORT_RANGE]) {
++ 		const struct ifla_vxlan_port_range *p
++ 			= nla_data(data[IFLA_VXLAN_PORT_RANGE]);
++ 		conf.port_min = ntohs(p->low);
++ 		conf.port_max = ntohs(p->high);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT])
++ 		conf.dst_port = nla_get_be16(data[IFLA_VXLAN_PORT]);
++ 
++ 	if (data[IFLA_VXLAN_UDP_CSUM] && nla_get_u8(data[IFLA_VXLAN_UDP_CSUM]))
++ 		conf.flags |= VXLAN_F_UDP_CSUM;
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]))
++ 		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
++ 		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 		conf.flags |= VXLAN_F_REMCSUM_TX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 		conf.flags |= VXLAN_F_REMCSUM_RX;
++ 
++ 	if (data[IFLA_VXLAN_GBP])
++ 		conf.flags |= VXLAN_F_GBP;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL])
++ 		conf.flags |= VXLAN_F_REMCSUM_NOPARTIAL;
++ 
++ 	err = vxlan_dev_configure(src_net, dev, &conf);
++ 	switch (err) {
++ 	case -ENODEV:
++ 		pr_info("ifindex %d does not exist\n", conf.remote_ifindex);
++ 		break;
++ 
++ 	case -EPERM:
++ 		pr_info("IPv6 is disabled via sysctl\n");
++ 		break;
++ 
++ 	case -EEXIST:
++ 		pr_info("duplicate VNI %u\n", conf.vni);
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  static void vxlan_dellink(struct net_device *dev, struct list_head *head)
+  {
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+@@@ -2776,6 -2898,7 +3036,10 @@@ static size_t vxlan_get_size(const stru
+  		nla_total_size(sizeof(__u8)) +	/* IFLA_VXLAN_RSC */
+  		nla_total_size(sizeof(__u8)) +	/* IFLA_VXLAN_L2MISS */
+  		nla_total_size(sizeof(__u8)) +	/* IFLA_VXLAN_L3MISS */
+++<<<<<<< HEAD
+++=======
++ 		nla_total_size(sizeof(__u8)) +	/* IFLA_VXLAN_COLLECT_METADATA */
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  		nla_total_size(sizeof(__u32)) +	/* IFLA_VXLAN_AGEING */
+  		nla_total_size(sizeof(__u32)) +	/* IFLA_VXLAN_LIMIT */
+  		nla_total_size(sizeof(struct ifla_vxlan_port_range)) +
+@@@ -2842,9 -2965,11 +3106,17 @@@ static int vxlan_fill_info(struct sk_bu
+  			!!(vxlan->flags & VXLAN_F_L2MISS)) ||
+  	    nla_put_u8(skb, IFLA_VXLAN_L3MISS,
+  			!!(vxlan->flags & VXLAN_F_L3MISS)) ||
+++<<<<<<< HEAD
+ +	    nla_put_u32(skb, IFLA_VXLAN_AGEING, vxlan->age_interval) ||
+ +	    nla_put_u32(skb, IFLA_VXLAN_LIMIT, vxlan->addrmax) ||
+ +	    nla_put_be16(skb, IFLA_VXLAN_PORT, vxlan->dst_port) ||
+++=======
++ 	    nla_put_u8(skb, IFLA_VXLAN_COLLECT_METADATA,
++ 		       !!(vxlan->flags & VXLAN_F_COLLECT_METADATA)) ||
++ 	    nla_put_u32(skb, IFLA_VXLAN_AGEING, vxlan->cfg.age_interval) ||
++ 	    nla_put_u32(skb, IFLA_VXLAN_LIMIT, vxlan->cfg.addrmax) ||
++ 	    nla_put_be16(skb, IFLA_VXLAN_PORT, vxlan->cfg.dst_port) ||
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  	    nla_put_u8(skb, IFLA_VXLAN_UDP_CSUM,
+  			!!(vxlan->flags & VXLAN_F_UDP_CSUM)) ||
+  	    nla_put_u8(skb, IFLA_VXLAN_UDP_ZERO_CSUM6_TX,
+diff --cc include/net/vxlan.h
+index 0082b5d33d7d,e4534f1b2d8c..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -130,6 -180,7 +130,10 @@@ struct vxlan_sock 
+  #define VXLAN_F_REMCSUM_RX		0x400
+  #define VXLAN_F_GBP			0x800
+  #define VXLAN_F_REMCSUM_NOPARTIAL	0x1000
+++<<<<<<< HEAD
+++=======
++ #define VXLAN_F_COLLECT_METADATA	0x2000
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  
+  /* Flags that are used in the receive path. These flags must match in
+   * order for a socket to be shareable
+@@@ -137,18 -188,16 +141,23 @@@
+  #define VXLAN_F_RCV_FLAGS		(VXLAN_F_GBP |			\
+  					 VXLAN_F_UDP_ZERO_CSUM6_RX |	\
+  					 VXLAN_F_REMCSUM_RX |		\
+++<<<<<<< HEAD
+ +					 VXLAN_F_REMCSUM_NOPARTIAL)
+++=======
++ 					 VXLAN_F_REMCSUM_NOPARTIAL |	\
++ 					 VXLAN_F_COLLECT_METADATA)
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+ +
+ +struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
+ +				  vxlan_rcv_t *rcv, void *data,
+ +				  bool no_share, u32 flags);
+  
+ -struct net_device *vxlan_dev_create(struct net *net, const char *name,
+ -				    u8 name_assign_type, struct vxlan_config *conf);
+ +void vxlan_sock_release(struct vxlan_sock *vs);
+  
+ -static inline __be16 vxlan_dev_dst_port(struct vxlan_dev *vxlan)
+ -{
+ -	return inet_sk(vxlan->vn_sock->sock->sk)->inet_sport;
+ -}
+ +int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+ +		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ +		   __be16 src_port, __be16 dst_port, struct vxlan_metadata *md,
+ +		   bool xnet, u32 vxflags);
+  
+  static inline netdev_features_t vxlan_features_check(struct sk_buff *skb,
+  						     netdev_features_t features)
+diff --cc include/uapi/linux/if_link.h
+index fb2ef8ee8ad1,f24ec99a2262..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -337,6 -382,7 +337,10 @@@ enum 
+  	IFLA_VXLAN_REMCSUM_RX,
+  	IFLA_VXLAN_GBP,
+  	IFLA_VXLAN_REMCSUM_NOPARTIAL,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_VXLAN_COLLECT_METADATA,
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  	__IFLA_VXLAN_MAX
+  };
+  #define IFLA_VXLAN_MAX	(__IFLA_VXLAN_MAX - 1)
+diff --cc net/openvswitch/vport-vxlan.c
+index 6f7986fabb70,c6e937e36f8b..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -152,12 -84,14 +152,19 @@@ static struct vport *vxlan_tnl_create(c
+  {
+  	struct net *net = ovs_dp_get_net(parms->dp);
+  	struct nlattr *options = parms->options;
+ -	struct net_device *dev;
+ +	struct vxlan_port *vxlan_port;
+ +	struct vxlan_sock *vs;
+  	struct vport *vport;
+  	struct nlattr *a;
+ +	u16 dst_port;
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	struct vxlan_config conf = {
++ 		.no_share = true,
++ 		.flags = VXLAN_F_COLLECT_METADATA,
++ 	};
+++>>>>>>> da8b43c0e1dc (vxlan: combine VXLAN_FLOWBASED into VXLAN_COLLECT_METADATA)
+  
+  	if (!options) {
+  		err = -EINVAL;
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/openvswitch/vport-vxlan.c
