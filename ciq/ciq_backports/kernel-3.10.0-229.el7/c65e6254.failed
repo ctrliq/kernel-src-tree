@@ -1,0 +1,523 @@
+nfs: remove unused writeverf code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit c65e6254ca4db1584c5bf5f228ee26556477a9fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c65e6254.failed
+
+Remove duplicate writeverf structure from merge of nfs_pgio_header and
+nfs_pgio_data and remove writeverf related flags and logic to handle
+more than one RPC per nfs_pgio_header.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit c65e6254ca4db1584c5bf5f228ee26556477a9fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/blocklayout/blocklayout.c
+#	fs/nfs/direct.c
+#	fs/nfs/objlayout/objlayout.c
+#	fs/nfs/pagelist.c
+#	fs/nfs/write.c
+#	include/linux/nfs_xdr.h
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index 8fe72d727e75,04ac32b339f8..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -452,10 -444,10 +452,17 @@@ static void bl_end_par_io_write(void *d
+  					num_se);
+  	}
+  
+++<<<<<<< HEAD
+ +	wdata->task.tk_status = wdata->header->pnfs_error;
+ +	wdata->verf.committed = NFS_FILE_SYNC;
+ +	INIT_WORK(&wdata->task.u.tk_work, bl_write_cleanup);
+ +	schedule_work(&wdata->task.u.tk_work);
+++=======
++ 	hdr->task.tk_status = hdr->pnfs_error;
++ 	hdr->verf.committed = NFS_FILE_SYNC;
++ 	INIT_WORK(&hdr->task.u.tk_work, bl_write_cleanup);
++ 	schedule_work(&hdr->task.u.tk_work);
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  }
+  
+  /* FIXME STUB - mark intersection of layout and page as bad, so is not
+diff --cc fs/nfs/direct.c
+index ddbc02a05958,2a3293a5dda0..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -801,40 -729,34 +801,44 @@@ static void nfs_direct_write_completion
+  		dreq->flags = 0;
+  		dreq->error = hdr->error;
+  	}
+- 	if (dreq->error != 0)
+- 		bit = NFS_IOHDR_ERROR;
+- 	else {
++ 	if (dreq->error == 0) {
+  		dreq->count += hdr->good_bytes;
+- 		if (test_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags)) {
+- 			dreq->flags = NFS_ODIRECT_RESCHED_WRITES;
+- 			bit = NFS_IOHDR_NEED_RESCHED;
+- 		} else if (test_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags)) {
++ 		if (nfs_write_need_commit(hdr)) {
+  			if (dreq->flags == NFS_ODIRECT_RESCHED_WRITES)
+- 				bit = NFS_IOHDR_NEED_RESCHED;
++ 				request_commit = true;
+  			else if (dreq->flags == 0) {
+++<<<<<<< HEAD
+ +				memcpy(&dreq->verf, hdr->verf,
+ +				       sizeof(dreq->verf));
+ +				bit = NFS_IOHDR_NEED_COMMIT;
+ +				dreq->flags = NFS_ODIRECT_DO_COMMIT;
+ +			} else if (dreq->flags == NFS_ODIRECT_DO_COMMIT) {
+ +				if (memcmp(&dreq->verf, hdr->verf, sizeof(dreq->verf))) {
+ +					dreq->flags = NFS_ODIRECT_RESCHED_WRITES;
+ +					bit = NFS_IOHDR_NEED_RESCHED;
+ +				} else
+ +					bit = NFS_IOHDR_NEED_COMMIT;
+++=======
++ 				nfs_direct_set_hdr_verf(dreq, hdr);
++ 				request_commit = true;
++ 				dreq->flags = NFS_ODIRECT_DO_COMMIT;
++ 			} else if (dreq->flags == NFS_ODIRECT_DO_COMMIT) {
++ 				request_commit = true;
++ 				if (nfs_direct_set_or_cmp_hdr_verf(dreq, hdr))
++ 					dreq->flags =
++ 						NFS_ODIRECT_RESCHED_WRITES;
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  			}
+  		}
+  	}
+  	spin_unlock(&dreq->lock);
+  
+  	while (!list_empty(&hdr->pages)) {
+ -		bool do_destroy = true;
+ -
+  		req = nfs_list_entry(hdr->pages.next);
+  		nfs_list_remove_request(req);
+- 		switch (bit) {
+- 		case NFS_IOHDR_NEED_RESCHED:
+- 		case NFS_IOHDR_NEED_COMMIT:
++ 		if (request_commit) {
+  			kref_get(&req->wb_kref);
+  			nfs_mark_request_commit(req, hdr->lseg, &cinfo);
+ -			do_destroy = false;
+  		}
+  		nfs_unlock_and_release_request(req);
+  	}
+diff --cc fs/nfs/objlayout/objlayout.c
+index dd7dcf3fd2ca,697a16d11fac..000000000000
+--- a/fs/nfs/objlayout/objlayout.c
++++ b/fs/nfs/objlayout/objlayout.c
+@@@ -324,26 -323,26 +324,35 @@@ static void _rpc_write_complete(struct 
+  void
+  objlayout_write_done(struct objlayout_io_res *oir, ssize_t status, bool sync)
+  {
+ -	struct nfs_pgio_header *hdr = oir->rpcdata;
+ +	struct nfs_write_data *wdata = oir->rpcdata;
+  
+ -	oir->status = hdr->task.tk_status = status;
+ +	oir->status = wdata->task.tk_status = status;
+  	if (status >= 0) {
+++<<<<<<< HEAD
+ +		wdata->res.count = status;
+ +		wdata->verf.committed = oir->committed;
+++=======
++ 		hdr->res.count = status;
++ 		hdr->verf.committed = oir->committed;
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  	} else {
+ -		hdr->pnfs_error = status;
+ +		wdata->header->pnfs_error = status;
+  	}
+  	objlayout_iodone(oir);
+  	/* must not use oir after this point */
+  
+  	dprintk("%s: Return status %zd committed %d sync=%d\n", __func__,
+++<<<<<<< HEAD
+ +		status, wdata->verf.committed, sync);
+++=======
++ 		status, hdr->verf.committed, sync);
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  
+  	if (sync)
+ -		pnfs_ld_write_done(hdr);
+ +		pnfs_ld_write_done(wdata);
+  	else {
+ -		INIT_WORK(&hdr->task.u.tk_work, _rpc_write_complete);
+ -		schedule_work(&hdr->task.u.tk_work);
+ +		INIT_WORK(&wdata->task.u.tk_work, _rpc_write_complete);
+ +		schedule_work(&wdata->task.u.tk_work);
+  	}
+  }
+  
+diff --cc fs/nfs/pagelist.c
+index 00f3d2d2a504,7dd0d5f101a4..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -307,6 -452,190 +307,193 @@@ size_t nfs_generic_pg_test(struct nfs_p
+  }
+  EXPORT_SYMBOL_GPL(nfs_generic_pg_test);
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs_pgio_header *nfs_pgio_header_alloc(const struct nfs_rw_ops *ops)
++ {
++ 	struct nfs_pgio_header *hdr = ops->rw_alloc_header();
++ 
++ 	if (hdr) {
++ 		INIT_LIST_HEAD(&hdr->pages);
++ 		spin_lock_init(&hdr->lock);
++ 		atomic_set(&hdr->refcnt, 0);
++ 		hdr->rw_ops = ops;
++ 	}
++ 	return hdr;
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_alloc);
++ 
++ /*
++  * nfs_pgio_header_free - Free a read or write header
++  * @hdr: The header to free
++  */
++ void nfs_pgio_header_free(struct nfs_pgio_header *hdr)
++ {
++ 	hdr->rw_ops->rw_free_header(hdr);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_free);
++ 
++ /**
++  * nfs_pgio_data_alloc - Allocate pageio data
++  * @hdr: The header making a request
++  * @pagecount: Number of pages to create
++  */
++ static bool nfs_pgio_data_init(struct nfs_pgio_header *hdr,
++ 			       unsigned int pagecount)
++ {
++ 	if (nfs_pgarray_set(&hdr->page_array, pagecount)) {
++ 		atomic_inc(&hdr->refcnt);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ /**
++  * nfs_pgio_data_destroy - Properly release pageio data
++  * @hdr: The header with data to destroy
++  */
++ void nfs_pgio_data_destroy(struct nfs_pgio_header *hdr)
++ {
++ 	put_nfs_open_context(hdr->args.context);
++ 	if (hdr->page_array.pagevec != hdr->page_array.page_array)
++ 		kfree(hdr->page_array.pagevec);
++ 	if (atomic_dec_and_test(&hdr->refcnt))
++ 		hdr->completion_ops->completion(hdr);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_data_destroy);
++ 
++ /**
++  * nfs_pgio_rpcsetup - Set up arguments for a pageio call
++  * @hdr: The pageio hdr
++  * @count: Number of bytes to read
++  * @offset: Initial offset
++  * @how: How to commit data (writes only)
++  * @cinfo: Commit information for the call (writes only)
++  */
++ static void nfs_pgio_rpcsetup(struct nfs_pgio_header *hdr,
++ 			      unsigned int count, unsigned int offset,
++ 			      int how, struct nfs_commit_info *cinfo)
++ {
++ 	struct nfs_page *req = hdr->req;
++ 
++ 	/* Set up the RPC argument and reply structs
++ 	 * NB: take care not to mess about with hdr->commit et al. */
++ 
++ 	hdr->args.fh     = NFS_FH(hdr->inode);
++ 	hdr->args.offset = req_offset(req) + offset;
++ 	/* pnfs_set_layoutcommit needs this */
++ 	hdr->mds_offset = hdr->args.offset;
++ 	hdr->args.pgbase = req->wb_pgbase + offset;
++ 	hdr->args.pages  = hdr->page_array.pagevec;
++ 	hdr->args.count  = count;
++ 	hdr->args.context = get_nfs_open_context(req->wb_context);
++ 	hdr->args.lock_context = req->wb_lock_context;
++ 	hdr->args.stable  = NFS_UNSTABLE;
++ 	switch (how & (FLUSH_STABLE | FLUSH_COND_STABLE)) {
++ 	case 0:
++ 		break;
++ 	case FLUSH_COND_STABLE:
++ 		if (nfs_reqs_to_commit(cinfo))
++ 			break;
++ 	default:
++ 		hdr->args.stable = NFS_FILE_SYNC;
++ 	}
++ 
++ 	hdr->res.fattr   = &hdr->fattr;
++ 	hdr->res.count   = count;
++ 	hdr->res.eof     = 0;
++ 	hdr->res.verf    = &hdr->verf;
++ 	nfs_fattr_init(&hdr->fattr);
++ }
++ 
++ /**
++  * nfs_pgio_prepare - Prepare pageio hdr to go over the wire
++  * @task: The current task
++  * @calldata: pageio header to prepare
++  */
++ static void nfs_pgio_prepare(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_header *hdr = calldata;
++ 	int err;
++ 	err = NFS_PROTO(hdr->inode)->pgio_rpc_prepare(task, hdr);
++ 	if (err)
++ 		rpc_exit(task, err);
++ }
++ 
++ int nfs_initiate_pgio(struct rpc_clnt *clnt, struct nfs_pgio_header *hdr,
++ 		      const struct rpc_call_ops *call_ops, int how, int flags)
++ {
++ 	struct inode *inode = hdr->inode;
++ 	struct rpc_task *task;
++ 	struct rpc_message msg = {
++ 		.rpc_argp = &hdr->args,
++ 		.rpc_resp = &hdr->res,
++ 		.rpc_cred = hdr->cred,
++ 	};
++ 	struct rpc_task_setup task_setup_data = {
++ 		.rpc_client = clnt,
++ 		.task = &hdr->task,
++ 		.rpc_message = &msg,
++ 		.callback_ops = call_ops,
++ 		.callback_data = hdr,
++ 		.workqueue = nfsiod_workqueue,
++ 		.flags = RPC_TASK_ASYNC | flags,
++ 	};
++ 	int ret = 0;
++ 
++ 	hdr->rw_ops->rw_initiate(hdr, &msg, &task_setup_data, how);
++ 
++ 	dprintk("NFS: %5u initiated pgio call "
++ 		"(req %s/%llu, %u bytes @ offset %llu)\n",
++ 		hdr->task.tk_pid,
++ 		inode->i_sb->s_id,
++ 		(unsigned long long)NFS_FILEID(inode),
++ 		hdr->args.count,
++ 		(unsigned long long)hdr->args.offset);
++ 
++ 	task = rpc_run_task(&task_setup_data);
++ 	if (IS_ERR(task)) {
++ 		ret = PTR_ERR(task);
++ 		goto out;
++ 	}
++ 	if (how & FLUSH_SYNC) {
++ 		ret = rpc_wait_for_completion_task(task);
++ 		if (ret == 0)
++ 			ret = task->tk_status;
++ 	}
++ 	rpc_put_task(task);
++ out:
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nfs_initiate_pgio);
++ 
++ /**
++  * nfs_pgio_error - Clean up from a pageio error
++  * @desc: IO descriptor
++  * @hdr: pageio header
++  */
++ static int nfs_pgio_error(struct nfs_pageio_descriptor *desc,
++ 			  struct nfs_pgio_header *hdr)
++ {
++ 	set_bit(NFS_IOHDR_REDO, &hdr->flags);
++ 	nfs_pgio_data_destroy(hdr);
++ 	desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 	return -ENOMEM;
++ }
++ 
++ /**
++  * nfs_pgio_release - Release pageio data
++  * @calldata: The pageio header to release
++  */
++ static void nfs_pgio_release(void *calldata)
++ {
++ 	struct nfs_pgio_header *hdr = calldata;
++ 	if (hdr->rw_ops->rw_release)
++ 		hdr->rw_ops->rw_release(hdr);
++ 	nfs_pgio_data_destroy(hdr);
++ }
++ 
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  /**
+   * nfs_pageio_init - initialise a page io descriptor
+   * @desc: pointer to descriptor
+diff --cc fs/nfs/write.c
+index 7571542ecbdc,8534ee5c207d..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -641,12 -595,11 +641,20 @@@ nfs_clear_request_commit(struct nfs_pag
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +int nfs_write_need_commit(struct nfs_write_data *data)
+ +{
+ +	if (data->verf.committed == NFS_DATA_SYNC)
+ +		return data->header->lseg == NULL;
+ +	return data->verf.committed != NFS_FILE_SYNC;
+++=======
++ int nfs_write_need_commit(struct nfs_pgio_header *hdr)
++ {
++ 	if (hdr->verf.committed == NFS_DATA_SYNC)
++ 		return hdr->lseg == NULL;
++ 	return hdr->verf.committed != NFS_FILE_SYNC;
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  }
+  
+  #else
+@@@ -672,8 -625,7 +680,12 @@@ nfs_clear_request_commit(struct nfs_pag
+  {
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +int nfs_write_need_commit(struct nfs_write_data *data)
+++=======
++ int nfs_write_need_commit(struct nfs_pgio_header *hdr)
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  {
+  	return 0;
+  }
+@@@ -699,12 -652,8 +711,17 @@@ static void nfs_write_completion(struc
+  			nfs_context_set_write_error(req->wb_context, hdr->error);
+  			goto remove_req;
+  		}
+++<<<<<<< HEAD
+ +		if (test_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags)) {
+ +			nfs_mark_request_dirty(req);
+ +			goto next;
+ +		}
+ +		if (test_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags)) {
+ +			memcpy(&req->wb_verf, &hdr->verf->verifier, sizeof(req->wb_verf));
+++=======
++ 		if (nfs_write_need_commit(hdr)) {
++ 			memcpy(&req->wb_verf, &hdr->verf.verifier, sizeof(req->wb_verf));
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  			nfs_mark_request_commit(req, hdr->lseg, &cinfo);
+  			goto next;
+  		}
+@@@ -712,7 -661,8 +729,12 @@@ remove_req
+  		nfs_inode_remove_request(req);
+  next:
+  		nfs_unlock_request(req);
+++<<<<<<< HEAD
+ +		nfs_end_page_writeback(req->wb_page);
+++=======
++ 		nfs_end_page_writeback(req);
++ 		do_destroy = !nfs_write_need_commit(hdr);
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  		nfs_release_request(req);
+  	}
+  out:
+@@@ -1381,45 -1080,11 +1403,49 @@@ void nfs_commit_prepare(struct rpc_tas
+  	NFS_PROTO(data->inode)->commit_rpc_prepare(task, data);
+  }
+  
+ -static void nfs_writeback_release_common(struct nfs_pgio_header *hdr)
+ +/*
+ + * Handle a write reply that flushes a whole page.
+ + *
+ + * FIXME: There is an inherent race with invalidate_inode_pages and
+ + *	  writebacks since the page->count is kept > 1 for as long
+ + *	  as the page has a write request pending.
+ + */
+ +static void nfs_writeback_done_common(struct rpc_task *task, void *calldata)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_write_data	*data = calldata;
+ +
+ +	nfs_writeback_done(task, data);
+ +}
+ +
+ +static void nfs_writeback_release_common(void *calldata)
+ +{
+ +	struct nfs_write_data	*data = calldata;
+ +	struct nfs_pgio_header *hdr = data->header;
+ +	int status = data->task.tk_status;
+ +
+ +	if ((status >= 0) && nfs_write_need_commit(data)) {
+ +		spin_lock(&hdr->lock);
+ +		if (test_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags))
+ +			; /* Do nothing */
+ +		else if (!test_and_set_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags))
+ +			memcpy(hdr->verf, &data->verf, sizeof(*hdr->verf));
+ +		else if (memcmp(hdr->verf, &data->verf, sizeof(*hdr->verf)))
+ +			set_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags);
+ +		spin_unlock(&hdr->lock);
+ +	}
+ +	nfs_writedata_release(data);
+++=======
++ 	/* do nothing! */
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  }
+  
+ +static const struct rpc_call_ops nfs_write_common_ops = {
+ +	.rpc_call_prepare = nfs_write_prepare,
+ +	.rpc_call_done = nfs_writeback_done_common,
+ +	.rpc_release = nfs_writeback_release_common,
+ +};
+ +
+  /*
+   * Special version of should_remove_suid() that ignores capabilities.
+   */
+diff --cc include/linux/nfs_xdr.h
+index 381f832b03c6,e1b7b3b7c40f..000000000000
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@@ -1291,19 -1276,12 +1289,22 @@@ struct nfs_pgio_header 
+  	int			error;		/* merge with pnfs_error */
+  	unsigned long		good_bytes;	/* boundary of good data */
+  	unsigned long		flags;
+ +};
+  
+ -	/*
+ -	 * rpc data
+ -	 */
+ +struct nfs_read_header {
+ +	struct nfs_pgio_header	header;
+ +	struct nfs_read_data	rpc_data;
+ +};
+ +
+ +struct nfs_write_data {
+ +	struct nfs_pgio_header	*header;
+ +	struct list_head	list;
+  	struct rpc_task		task;
+  	struct nfs_fattr	fattr;
+++<<<<<<< HEAD
+ +	struct nfs_writeverf	verf;
+++=======
+++>>>>>>> c65e6254ca4d (nfs: remove unused writeverf code)
+  	struct nfs_pgio_args	args;		/* argument struct */
+  	struct nfs_pgio_res	res;		/* result struct */
+  	unsigned long		timestamp;	/* For lease renewal */
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
+* Unmerged path fs/nfs/direct.c
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 96bd22580dbf..15125dbfe526 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -449,6 +449,7 @@ int nfs_scan_commit(struct inode *inode, struct list_head *dst,
+ void nfs_mark_request_commit(struct nfs_page *req,
+ 			     struct pnfs_layout_segment *lseg,
+ 			     struct nfs_commit_info *cinfo);
++int nfs_write_need_commit(struct nfs_pgio_header *);
+ int nfs_generic_commit_list(struct inode *inode, struct list_head *head,
+ 			    int how, struct nfs_commit_info *cinfo);
+ void nfs_retry_commit(struct list_head *page_list,
+* Unmerged path fs/nfs/objlayout/objlayout.c
+* Unmerged path fs/nfs/pagelist.c
+* Unmerged path fs/nfs/write.c
+* Unmerged path include/linux/nfs_xdr.h
