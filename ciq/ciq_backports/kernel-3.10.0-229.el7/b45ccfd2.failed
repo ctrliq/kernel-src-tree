@@ -1,0 +1,186 @@
+xprtrdma: Remove MEMWINDOWS registration modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] sunrpc/xprtrdma: Remove MEMWINDOWS registration modes (Steve Dickson) [1113248]
+Rebuild_FUZZ: 92.93%
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b45ccfd25d506e83d9ecf93d0ac7edf031d35d2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b45ccfd2.failed
+
+The MEMWINDOWS and MEMWINDOWS_ASYNC memory registration modes were
+intended as stop-gap modes before the introduction of FRMR. They
+are now considered obsolete.
+
+MEMWINDOWS_ASYNC is also considered unsafe because it can leave
+client memory registered and exposed for an indeterminant time after
+each I/O.
+
+At this point, the MEMWINDOWS modes add needless complexity, so
+remove them.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b45ccfd25d506e83d9ecf93d0ac7edf031d35d2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 0ce6cc091efd,304c7adc83c4..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1259,6 -1163,33 +1196,36 @@@ rpcrdma_buffer_destroy(struct rpcrdma_b
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	while (!list_empty(&buf->rb_mws)) {
++ 		r = list_entry(buf->rb_mws.next,
++ 			struct rpcrdma_mw, mw_list);
++ 		list_del(&r->mw_list);
++ 		switch (ia->ri_memreg_strategy) {
++ 		case RPCRDMA_FRMR:
++ 			rc = ib_dereg_mr(r->r.frmr.fr_mr);
++ 			if (rc)
++ 				dprintk("RPC:       %s:"
++ 					" ib_dereg_mr"
++ 					" failed %i\n",
++ 					__func__, rc);
++ 			ib_free_fast_reg_page_list(r->r.frmr.fr_pgl);
++ 			break;
++ 		case RPCRDMA_MTHCAFMR:
++ 			rc = ib_dealloc_fmr(r->r.fmr);
++ 			if (rc)
++ 				dprintk("RPC:       %s:"
++ 					" ib_dealloc_fmr"
++ 					" failed %i\n",
++ 					__func__, rc);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> b45ccfd25d50 (xprtrdma: Remove MEMWINDOWS registration modes)
+  	kfree(buf->rb_pool);
+  }
+  
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 02b29419e372..46b51727227b 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -199,7 +199,6 @@ rpcrdma_create_chunks(struct rpc_rqst *rqst, struct xdr_buf *target,
+ 		return 0;
+ 
+ 	do {
+-		/* bind/register the memory, then build chunk from result. */
+ 		int n = rpcrdma_register_external(seg, nsegs,
+ 						cur_wchunk != NULL, r_xprt);
+ 		if (n <= 0)
+@@ -697,16 +696,6 @@ rpcrdma_conn_func(struct rpcrdma_ep *ep)
+ 	schedule_delayed_work(&ep->rep_connect_worker, 0);
+ }
+ 
+-/*
+- * This function is called when memory window unbind which we are waiting
+- * for completes. Just use rr_func (zeroed by upcall) to signal completion.
+- */
+-static void
+-rpcrdma_unbind_func(struct rpcrdma_rep *rep)
+-{
+-	wake_up(&rep->rr_unbind);
+-}
+-
+ /*
+  * Called as a tasklet to do req/reply match and complete a request
+  * Errors must result in the RPC task either being awakened, or
+@@ -721,7 +710,7 @@ rpcrdma_reply_handler(struct rpcrdma_rep *rep)
+ 	struct rpc_xprt *xprt = rep->rr_xprt;
+ 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+ 	__be32 *iptr;
+-	int i, rdmalen, status;
++	int rdmalen, status;
+ 
+ 	/* Check status. If bad, signal disconnect and return rep to pool */
+ 	if (rep->rr_len == ~0U) {
+@@ -850,27 +839,6 @@ badheader:
+ 		break;
+ 	}
+ 
+-	/* If using mw bind, start the deregister process now. */
+-	/* (Note: if mr_free(), cannot perform it here, in tasklet context) */
+-	if (req->rl_nchunks) switch (r_xprt->rx_ia.ri_memreg_strategy) {
+-	case RPCRDMA_MEMWINDOWS:
+-		for (i = 0; req->rl_nchunks-- > 1;)
+-			i += rpcrdma_deregister_external(
+-				&req->rl_segments[i], r_xprt, NULL);
+-		/* Optionally wait (not here) for unbinds to complete */
+-		rep->rr_func = rpcrdma_unbind_func;
+-		(void) rpcrdma_deregister_external(&req->rl_segments[i],
+-						   r_xprt, rep);
+-		break;
+-	case RPCRDMA_MEMWINDOWS_ASYNC:
+-		for (i = 0; req->rl_nchunks--;)
+-			i += rpcrdma_deregister_external(&req->rl_segments[i],
+-							 r_xprt, NULL);
+-		break;
+-	default:
+-		break;
+-	}
+-
+ 	dprintk("RPC:       %s: xprt_complete_rqst(0x%p, 0x%p, %d)\n",
+ 			__func__, xprt, rqst, status);
+ 	xprt_complete_rqst(rqst->rq_task, status);
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 8c5035a2792e..c23b0c13f77f 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -566,9 +566,7 @@ xprt_rdma_free(void *buffer)
+ 		__func__, rep, (rep && rep->rr_func) ? " (with waiter)" : "");
+ 
+ 	/*
+-	 * Finish the deregistration. When using mw bind, this was
+-	 * begun in rpcrdma_reply_handler(). In all other modes, we
+-	 * do it here, in thread context. The process is considered
++	 * Finish the deregistration.  The process is considered
+ 	 * complete when the rr_func vector becomes NULL - this
+ 	 * was put in place during rpcrdma_reply_handler() - the wait
+ 	 * call below will not block if the dereg is "done". If
+@@ -580,11 +578,6 @@ xprt_rdma_free(void *buffer)
+ 			&req->rl_segments[i], r_xprt, NULL);
+ 	}
+ 
+-	if (rep && wait_event_interruptible(rep->rr_unbind, !rep->rr_func)) {
+-		rep->rr_func = NULL;	/* abandon the callback */
+-		req->rl_reply = NULL;
+-	}
+-
+ 	if (req->rl_iov.length == 0) {	/* see allocate above */
+ 		struct rpcrdma_req *oreq = (struct rpcrdma_req *)req->rl_buffer;
+ 		oreq->rl_reply = req->rl_reply;
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index c620d1332933..bf08ee0b81e0 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -127,7 +127,6 @@ struct rpcrdma_rep {
+ 	struct rpc_xprt	*rr_xprt;	/* needed for request/reply matching */
+ 	void (*rr_func)(struct rpcrdma_rep *);/* called by tasklet in softint */
+ 	struct list_head rr_list;	/* tasklet list */
+-	wait_queue_head_t rr_unbind;	/* optional unbind wait */
+ 	struct ib_sge	rr_iov;		/* for posting */
+ 	struct ib_mr	*rr_handle;	/* handle for mem in rr_iov */
+ 	char	rr_base[MAX_RPCRDMAHDR]; /* minimal inline receive buffer */
+@@ -162,7 +161,6 @@ struct rpcrdma_mr_seg {		/* chunk descriptors */
+ 		struct ib_mr	*rl_mr;		/* if registered directly */
+ 		struct rpcrdma_mw {		/* if registered from region */
+ 			union {
+-				struct ib_mw	*mw;
+ 				struct ib_fmr	*fmr;
+ 				struct {
+ 					struct ib_fast_reg_page_list *fr_pgl;
