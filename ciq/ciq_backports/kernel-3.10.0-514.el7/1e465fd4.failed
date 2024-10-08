@@ -1,0 +1,324 @@
+xprtrdma: Replace send and receive arrays
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 1e465fd4ff475cc29c866ee75496c941b3908e69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1e465fd4.failed
+
+The rb_send_bufs and rb_recv_bufs arrays are used to implement a
+pair of stacks for keeping track of free rpcrdma_req and rpcrdma_rep
+structs. Replace those arrays with free lists.
+
+To allow more than 512 RPCs in-flight at once, each of these arrays
+would be larger than a page (assuming 8-byte addresses and 4KB
+pages). Allowing up to 64K in-flight RPCs (as TCP now does), each
+buffer array would have to be 128 pages. That's an order-6
+allocation. (Not that we're going there.)
+
+A list is easier to expand dynamically. Instead of allocating a
+larger array of pointers and copying the existing pointers to the
+new array, simply append more buffers to each list.
+
+This also makes it simpler to manage receive buffers that might
+catch backwards-direction calls, or to post receive buffers in
+bulk to amortize the overhead of ib_post_recv.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@avagotech.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 1e465fd4ff475cc29c866ee75496c941b3908e69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 6115ededb593,c09f1b6c3f0a..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1173,148 -1063,6 +1171,151 @@@ rpcrdma_put_mw(struct rpcrdma_xprt *r_x
+  	spin_unlock(&buf->rb_mwlock);
+  }
+  
+++<<<<<<< HEAD
+ +/* "*mw" can be NULL when rpcrdma_buffer_get_mrs() fails, leaving
+ + * some req segments uninitialized.
+ + */
+ +static void
+ +rpcrdma_buffer_put_mr(struct rpcrdma_mw **mw, struct rpcrdma_buffer *buf)
+ +{
+ +	if (*mw) {
+ +		list_add_tail(&(*mw)->mw_list, &buf->rb_mws);
+ +		*mw = NULL;
+ +	}
+ +}
+ +
+ +/* Cycle mw's back in reverse order, and "spin" them.
+ + * This delays and scrambles reuse as much as possible.
+ + */
+ +static void
+ +rpcrdma_buffer_put_mrs(struct rpcrdma_req *req, struct rpcrdma_buffer *buf)
+ +{
+ +	struct rpcrdma_mr_seg *seg = req->rl_segments;
+ +	struct rpcrdma_mr_seg *seg1 = seg;
+ +	int i;
+ +
+ +	for (i = 1, seg++; i < RPCRDMA_MAX_SEGS; seg++, i++)
+ +		rpcrdma_buffer_put_mr(&seg->rl_mw, buf);
+ +	rpcrdma_buffer_put_mr(&seg1->rl_mw, buf);
+ +}
+ +
+ +static void
+ +rpcrdma_buffer_put_sendbuf(struct rpcrdma_req *req, struct rpcrdma_buffer *buf)
+ +{
+ +	buf->rb_send_bufs[--buf->rb_send_index] = req;
+ +	req->rl_niovs = 0;
+ +	if (req->rl_reply) {
+ +		buf->rb_recv_bufs[--buf->rb_recv_index] = req->rl_reply;
+ +		req->rl_reply = NULL;
+ +	}
+ +}
+ +
+ +/* rpcrdma_unmap_one() was already done during deregistration.
+ + * Redo only the ib_post_send().
+ + */
+ +static void
+ +rpcrdma_retry_local_inv(struct rpcrdma_mw *r, struct rpcrdma_ia *ia)
+ +{
+ +	struct rpcrdma_xprt *r_xprt =
+ +				container_of(ia, struct rpcrdma_xprt, rx_ia);
+ +	struct ib_send_wr invalidate_wr, *bad_wr;
+ +	int rc;
+ +
+ +	dprintk("RPC:       %s: FRMR %p is stale\n", __func__, r);
+ +
+ +	/* When this FRMR is re-inserted into rb_mws, it is no longer stale */
+ +	r->r.frmr.fr_state = FRMR_IS_INVALID;
+ +
+ +	memset(&invalidate_wr, 0, sizeof(invalidate_wr));
+ +	invalidate_wr.wr_id = (unsigned long)(void *)r;
+ +	invalidate_wr.opcode = IB_WR_LOCAL_INV;
+ +	invalidate_wr.ex.invalidate_rkey = r->r.frmr.fr_mr->rkey;
+ +	DECR_CQCOUNT(&r_xprt->rx_ep);
+ +
+ +	dprintk("RPC:       %s: frmr %p invalidating rkey %08x\n",
+ +		__func__, r, r->r.frmr.fr_mr->rkey);
+ +
+ +	read_lock(&ia->ri_qplock);
+ +	rc = ib_post_send(ia->ri_id->qp, &invalidate_wr, &bad_wr);
+ +	read_unlock(&ia->ri_qplock);
+ +	if (rc) {
+ +		/* Force rpcrdma_buffer_get() to retry */
+ +		r->r.frmr.fr_state = FRMR_IS_STALE;
+ +		dprintk("RPC:       %s: ib_post_send failed, %i\n",
+ +			__func__, rc);
+ +	}
+ +}
+ +
+ +static void
+ +rpcrdma_retry_flushed_linv(struct list_head *stale,
+ +			   struct rpcrdma_buffer *buf)
+ +{
+ +	struct rpcrdma_ia *ia = rdmab_to_ia(buf);
+ +	struct list_head *pos;
+ +	struct rpcrdma_mw *r;
+ +	unsigned long flags;
+ +
+ +	list_for_each(pos, stale) {
+ +		r = list_entry(pos, struct rpcrdma_mw, mw_list);
+ +		rpcrdma_retry_local_inv(r, ia);
+ +	}
+ +
+ +	spin_lock_irqsave(&buf->rb_lock, flags);
+ +	list_splice_tail(stale, &buf->rb_mws);
+ +	spin_unlock_irqrestore(&buf->rb_lock, flags);
+ +}
+ +
+ +static struct rpcrdma_req *
+ +rpcrdma_buffer_get_frmrs(struct rpcrdma_req *req, struct rpcrdma_buffer *buf,
+ +			 struct list_head *stale)
+ +{
+ +	struct rpcrdma_mw *r;
+ +	int i;
+ +
+ +	i = RPCRDMA_MAX_SEGS - 1;
+ +	while (!list_empty(&buf->rb_mws)) {
+ +		r = list_entry(buf->rb_mws.next,
+ +			       struct rpcrdma_mw, mw_list);
+ +		list_del(&r->mw_list);
+ +		if (r->r.frmr.fr_state == FRMR_IS_STALE) {
+ +			list_add(&r->mw_list, stale);
+ +			continue;
+ +		}
+ +		req->rl_segments[i].rl_mw = r;
+ +		if (unlikely(i-- == 0))
+ +			return req;	/* Success */
+ +	}
+ +
+ +	/* Not enough entries on rb_mws for this req */
+ +	rpcrdma_buffer_put_sendbuf(req, buf);
+ +	rpcrdma_buffer_put_mrs(req, buf);
+ +	return NULL;
+ +}
+ +
+ +static struct rpcrdma_req *
+ +rpcrdma_buffer_get_fmrs(struct rpcrdma_req *req, struct rpcrdma_buffer *buf)
+ +{
+ +	struct rpcrdma_mw *r;
+ +	int i;
+ +
+ +	i = RPCRDMA_MAX_SEGS - 1;
+ +	while (!list_empty(&buf->rb_mws)) {
+ +		r = list_entry(buf->rb_mws.next,
+ +			       struct rpcrdma_mw, mw_list);
+ +		list_del(&r->mw_list);
+ +		req->rl_segments[i].rl_mw = r;
+ +		if (unlikely(i-- == 0))
+ +			return req;	/* Success */
+ +	}
+ +
+ +	/* Not enough entries on rb_mws for this req */
+ +	rpcrdma_buffer_put_sendbuf(req, buf);
+ +	rpcrdma_buffer_put_mrs(req, buf);
+ +	return NULL;
+ +}
+ +
+++=======
+++>>>>>>> 1e465fd4ff47 (xprtrdma: Replace send and receive arrays)
+  /*
+   * Get a set of request/reply buffers.
+   *
+@@@ -1333,39 -1075,24 +1330,58 @@@ rpcrdma_buffer_get(struct rpcrdma_buffe
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&buffers->rb_lock, flags);
+++<<<<<<< HEAD
+ +	if (buffers->rb_send_index == buffers->rb_max_requests) {
+ +		spin_unlock_irqrestore(&buffers->rb_lock, flags);
+ +		dprintk("RPC:       %s: out of request buffers\n", __func__);
+ +		return ((struct rpcrdma_req *)NULL);
+ +	}
+ +
+ +	req = buffers->rb_send_bufs[buffers->rb_send_index];
+ +	if (buffers->rb_send_index < buffers->rb_recv_index) {
+ +		dprintk("RPC:       %s: %d extra receives outstanding (ok)\n",
+ +			__func__,
+ +			buffers->rb_recv_index - buffers->rb_send_index);
+ +		req->rl_reply = NULL;
+ +	} else {
+ +		req->rl_reply = buffers->rb_recv_bufs[buffers->rb_recv_index];
+ +		buffers->rb_recv_bufs[buffers->rb_recv_index++] = NULL;
+ +	}
+ +	buffers->rb_send_bufs[buffers->rb_send_index++] = NULL;
+ +
+ +	INIT_LIST_HEAD(&stale);
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +		req = rpcrdma_buffer_get_frmrs(req, buffers, &stale);
+ +		break;
+ +	case RPCRDMA_MTHCAFMR:
+ +		req = rpcrdma_buffer_get_fmrs(req, buffers);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+++=======
++ 	if (list_empty(&buffers->rb_send_bufs))
++ 		goto out_reqbuf;
++ 	req = rpcrdma_buffer_get_req_locked(buffers);
++ 	if (list_empty(&buffers->rb_recv_bufs))
++ 		goto out_repbuf;
++ 	req->rl_reply = rpcrdma_buffer_get_rep_locked(buffers);
+++>>>>>>> 1e465fd4ff47 (xprtrdma: Replace send and receive arrays)
+  	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+ +	if (!list_empty(&stale))
+ +		rpcrdma_retry_flushed_linv(&stale, buffers);
+  	return req;
++ 
++ out_reqbuf:
++ 	spin_unlock_irqrestore(&buffers->rb_lock, flags);
++ 	pr_warn("RPC:       %s: out of request buffers\n", __func__);
++ 	return NULL;
++ out_repbuf:
++ 	spin_unlock_irqrestore(&buffers->rb_lock, flags);
++ 	pr_warn("RPC:       %s: out of reply buffers\n", __func__);
++ 	req->rl_reply = NULL;
++ 	return req;
+  }
+  
+  /*
+@@@ -1376,19 -1103,16 +1392,32 @@@ voi
+  rpcrdma_buffer_put(struct rpcrdma_req *req)
+  {
+  	struct rpcrdma_buffer *buffers = req->rl_buffer;
+++<<<<<<< HEAD
+ +	struct rpcrdma_ia *ia = rdmab_to_ia(buffers);
+++=======
++ 	struct rpcrdma_rep *rep = req->rl_reply;
+++>>>>>>> 1e465fd4ff47 (xprtrdma: Replace send and receive arrays)
+  	unsigned long flags;
+  
++ 	req->rl_niovs = 0;
++ 	req->rl_reply = NULL;
++ 
+  	spin_lock_irqsave(&buffers->rb_lock, flags);
+++<<<<<<< HEAD
+ +	rpcrdma_buffer_put_sendbuf(req, buffers);
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +	case RPCRDMA_MTHCAFMR:
+ +		rpcrdma_buffer_put_mrs(req, buffers);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+++=======
++ 	list_add_tail(&req->rl_free, &buffers->rb_send_bufs);
++ 	if (rep)
++ 		list_add_tail(&rep->rr_list, &buffers->rb_recv_bufs);
+++>>>>>>> 1e465fd4ff47 (xprtrdma: Replace send and receive arrays)
+  	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+  }
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index b2d2c86a7023,e6a358fd1f1d..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -249,16 -249,19 +249,24 @@@ struct rpcrdma_mr_seg {		/* chunk descr
+  	char		*mr_offset;	/* kva if no page, else offset */
+  };
+  
+ -#define RPCRDMA_MAX_IOVS	(2)
+ -
+  struct rpcrdma_req {
+++<<<<<<< HEAD
+ +	unsigned int	rl_niovs;	/* 0, 2 or 4 */
+ +	unsigned int	rl_nchunks;	/* non-zero if chunks */
+ +	unsigned int	rl_connect_cookie;	/* retry detection */
+ +	struct rpcrdma_buffer *rl_buffer; /* home base for this structure */
+++=======
++ 	struct list_head	rl_free;
++ 	unsigned int		rl_niovs;
++ 	unsigned int		rl_nchunks;
++ 	unsigned int		rl_connect_cookie;
++ 	struct rpcrdma_buffer	*rl_buffer;
+++>>>>>>> 1e465fd4ff47 (xprtrdma: Replace send and receive arrays)
+  	struct rpcrdma_rep	*rl_reply;/* holder for reply buffer */
+ -	struct ib_sge		rl_send_iov[RPCRDMA_MAX_IOVS];
+ -	struct rpcrdma_regbuf	*rl_rdmabuf;
+ -	struct rpcrdma_regbuf	*rl_sendbuf;
+ -	struct rpcrdma_mr_seg	rl_segments[RPCRDMA_MAX_SEGS];
+ +	struct ib_sge	rl_send_iov[4];	/* for active requests */
+ +	struct rpcrdma_regbuf *rl_rdmabuf;
+ +	struct rpcrdma_regbuf *rl_sendbuf;
+ +	struct rpcrdma_mr_seg rl_segments[RPCRDMA_MAX_SEGS];
+  };
+  
+  static inline struct rpcrdma_req *
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
