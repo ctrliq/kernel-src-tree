@@ -990,6 +990,9 @@ again:
 
 			handler = evsel->handler.func;
 			handler(trace, evsel, &sample);
+
+			if (done)
+				goto out_unmap_evlist;
 		}
 	}
 
