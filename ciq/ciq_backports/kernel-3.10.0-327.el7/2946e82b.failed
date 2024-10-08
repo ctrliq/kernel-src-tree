@@ -1,0 +1,501 @@
+hpsa: use scsi host_no as hpsa controller number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 2946e82bdd76568dd6a3ebb49fe977ac222c0a19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2946e82b.failed
+
+Rather than numbering the hpsa controllers with an
+incrementing 0..n value (e.g., that shows up in
+/proc/interrupts), use the scsi midlayer
+host_no (e.g. matching /sys/class/scsi_host/hostNN).
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 2946e82bdd76568dd6a3ebb49fe977ac222c0a19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 86152e9b07dd,c88cb1bb8412..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -278,13 -281,51 +278,19 @@@ static inline struct ctlr_info *shost_t
+  static int check_for_unit_attention(struct ctlr_info *h,
+  	struct CommandList *c)
+  {
+ -	u8 sense_key, asc, ascq;
+ -	int sense_len;
+ -
+ -	if (c->err_info->SenseLen > sizeof(c->err_info->SenseInfo))
+ -		sense_len = sizeof(c->err_info->SenseInfo);
+ -	else
+ -		sense_len = c->err_info->SenseLen;
+ -
+ -	decode_sense_data(c->err_info->SenseInfo, sense_len,
+ -				&sense_key, &asc, &ascq);
+ -	if (sense_key != UNIT_ATTENTION || asc == -1)
+ +	if (c->err_info->SenseInfo[2] != UNIT_ATTENTION)
+  		return 0;
+  
+ -	switch (asc) {
+ +	switch (c->err_info->SenseInfo[12]) {
+  	case STATE_CHANGED:
+++<<<<<<< HEAD
+ +		dev_warn(&h->pdev->dev, HPSA "%d: a state change "
+ +			"detected, command retried\n", h->ctlr);
+++=======
++ 		dev_warn(&h->pdev->dev,
++ 			"%s: a state change detected, command retried\n",
++ 			h->devname);
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  		break;
+  	case LUN_FAILED:
+  		dev_warn(&h->pdev->dev,
+@@@ -4049,32 -4767,7 +4058,36 @@@ static int hpsa_scan_finished(struct Sc
+  	return finished;
+  }
+  
+++<<<<<<< HEAD
+ +static int hpsa_change_queue_depth(struct scsi_device *sdev,
+ +	int qdepth, int reason)
+ +{
+ +	struct ctlr_info *h = sdev_to_hba(sdev);
+ +
+ +	if (reason != SCSI_QDEPTH_DEFAULT)
+ +		return -ENOTSUPP;
+ +
+ +	if (qdepth < 1)
+ +		qdepth = 1;
+ +	else
+ +		if (qdepth > h->nr_cmds)
+ +			qdepth = h->nr_cmds;
+ +	scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), qdepth);
+ +	return sdev->queue_depth;
+ +}
+ +
+ +static void hpsa_unregister_scsi(struct ctlr_info *h)
+ +{
+ +	/* we are being forcibly unloaded, and may not refuse. */
+ +	scsi_remove_host(h->scsi_host);
+ +	scsi_host_put(h->scsi_host);
+ +	h->scsi_host = NULL;
+ +}
+ +
+ +static int hpsa_register_scsi(struct ctlr_info *h)
+++=======
++ static int hpsa_scsi_host_alloc(struct ctlr_info *h)
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  {
+  	struct Scsi_Host *sh;
+  	int error;
+@@@ -4090,38 -4785,97 +4105,64 @@@
+  	sh->max_cmd_len = MAX_COMMAND_SIZE;
+  	sh->max_lun = HPSA_MAX_LUN;
+  	sh->max_id = HPSA_MAX_LUN;
+ -	sh->can_queue = h->nr_cmds - HPSA_NRESERVED_CMDS;
+ -	sh->cmd_per_lun = sh->can_queue;
+ +	sh->can_queue = h->nr_cmds -
+ +			HPSA_CMDS_RESERVED_FOR_ABORTS -
+ +			HPSA_CMDS_RESERVED_FOR_DRIVER -
+ +			HPSA_MAX_CONCURRENT_PASSTHRUS;
+ +	if (h->hba_mode_enabled)
+ +		sh->cmd_per_lun = 7;
+ +	else
+ +		sh->cmd_per_lun = sh->can_queue;
+  	sh->sg_tablesize = h->maxsgentries;
+- 	h->scsi_host = sh;
+  	sh->hostdata[0] = (unsigned long) h;
+  	sh->irq = h->intr[h->intr_mode];
+  	sh->unique_id = sh->irq;
+++<<<<<<< HEAD
+ +	error = scsi_add_host(sh, &h->pdev->dev);
+ +	if (error)
+ +		goto fail_host_put;
+ +	scsi_scan_host(sh);
+++=======
++ 	error = scsi_init_shared_tag_map(sh, sh->can_queue);
++ 	if (error) {
++ 		dev_err(&h->pdev->dev,
++ 			"%s: scsi_init_shared_tag_map failed for controller %d\n",
++ 			__func__, h->ctlr);
++ 			scsi_host_put(sh);
++ 			return error;
++ 	}
++ 	h->scsi_host = sh;
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  	return 0;
++ }
+  
+++<<<<<<< HEAD
+ + fail_host_put:
+ +	dev_err(&h->pdev->dev, "%s: scsi_add_host"
+ +		" failed for controller %d\n", __func__, h->ctlr);
+ +	scsi_host_put(sh);
+ +	return error;
+ + fail:
+ +	dev_err(&h->pdev->dev, "%s: scsi_host_alloc"
+ +		" failed for controller %d\n", __func__, h->ctlr);
+ +	return -ENOMEM;
+++=======
++ static int hpsa_scsi_add_host(struct ctlr_info *h)
++ {
++ 	int rv;
++ 
++ 	rv = scsi_add_host(h->scsi_host, &h->pdev->dev);
++ 	if (rv) {
++ 		dev_err(&h->pdev->dev, "scsi_add_host failed\n");
++ 		return rv;
++ 	}
++ 	scsi_scan_host(h->scsi_host);
++ 	return 0;
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  }
+  
+ -/*
+ - * The block layer has already gone to the trouble of picking out a unique,
+ - * small-integer tag for this request.  We use an offset from that value as
+ - * an index to select our command block.  (The offset allows us to reserve the
+ - * low-numbered entries for our own uses.)
+ - */
+ -static int hpsa_get_cmd_index(struct scsi_cmnd *scmd)
+ -{
+ -	int idx = scmd->request->tag;
+ -
+ -	if (idx < 0)
+ -		return idx;
+ -
+ -	/* Offset to leave space for internal cmds. */
+ -	return idx += HPSA_NRESERVED_CMDS;
+ -}
+ -
+ -/*
+ - * Send a TEST_UNIT_READY command to the specified LUN using the specified
+ - * reply queue; returns zero if the unit is ready, and non-zero otherwise.
+ - */
+ -static int hpsa_send_test_unit_ready(struct ctlr_info *h,
+ -				struct CommandList *c, unsigned char lunaddr[],
+ -				int reply_queue)
+ -{
+ -	int rc;
+ -
+ -	/* Send the Test Unit Ready, fill_cmd can't fail, no mapping */
+ -	(void) fill_cmd(c, TEST_UNIT_READY, h,
+ -			NULL, 0, 0, lunaddr, TYPE_CMD);
+ -	rc = hpsa_scsi_do_simple_cmd(h, c, reply_queue, NO_TIMEOUT);
+ -	if (rc)
+ -		return rc;
+ -	/* no unmap needed here because no data xfer. */
+ -
+ -	/* Check if the unit is already ready. */
+ -	if (c->err_info->CommandStatus == CMD_SUCCESS)
+ -		return 0;
+ -
+ -	/*
+ -	 * The first command sent after reset will receive "unit attention" to
+ -	 * indicate that the LUN has been reset...this is actually what we're
+ -	 * looking for (but, success is good too).
+ -	 */
+ -	if (c->err_info->CommandStatus == CMD_TARGET_STATUS &&
+ -		c->err_info->ScsiStatus == SAM_STAT_CHECK_CONDITION &&
+ -			(c->err_info->SenseInfo[2] == NO_SENSE ||
+ -			 c->err_info->SenseInfo[2] == UNIT_ATTENTION))
+ -		return 0;
+ -
+ -	return 1;
+ -}
+ -
+ -/*
+ - * Wait for a TEST_UNIT_READY command to complete, retrying as necessary;
+ - * returns zero when the unit is ready, and non-zero when giving up.
+ - */
+ -static int hpsa_wait_for_test_unit_ready(struct ctlr_info *h,
+ -				struct CommandList *c,
+ -				unsigned char lunaddr[], int reply_queue)
+ +static int wait_for_device_to_become_ready(struct ctlr_info *h,
+ +	unsigned char lunaddr[])
+  {
+  	int rc;
+  	int count = 0;
+@@@ -6508,19 -7475,24 +6549,40 @@@ static void hpsa_free_reply_queues(stru
+  
+  static void hpsa_undo_allocations_after_kdump_soft_reset(struct ctlr_info *h)
+  {
+++<<<<<<< HEAD
+ +	hpsa_free_irqs(h);
+ +	hpsa_free_sg_chain_blocks(h);
+ +	hpsa_free_cmd_pool(h);
+ +	kfree(h->blockFetchTable);		/* perf 2 */
+ +	hpsa_free_reply_queues(h);		/* perf 1 */
+ +	hpsa_free_ioaccel1_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_ioaccel2_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_cfgtables(h);			/* pci_init 4 */
+ +	iounmap(h->vaddr);			/* pci_init 3 */
+ +	hpsa_disable_interrupt_mode(h);		/* pci_init 2 */
+ +	pci_disable_device(h->pdev);
+ +	pci_release_regions(h->pdev);		/* pci_init 2 */
+ +	kfree(h);
+++=======
++ 	hpsa_free_performant_mode(h);		/* init_one 7 */
++ 	hpsa_free_sg_chain_blocks(h);		/* init_one 6 */
++ 	hpsa_free_cmd_pool(h);			/* init_one 5 */
++ 	hpsa_free_irqs(h);			/* init_one 4 */
++ 	scsi_host_put(h->scsi_host);		/* init_one 3 */
++ 	h->scsi_host = NULL;			/* init_one 3 */
++ 	hpsa_free_pci_init(h);			/* init_one 2_5 */
++ 	free_percpu(h->lockup_detected);	/* init_one 2 */
++ 	h->lockup_detected = NULL;		/* init_one 2 */
++ 	if (h->resubmit_wq) {
++ 		destroy_workqueue(h->resubmit_wq);	/* init_one 1 */
++ 		h->resubmit_wq = NULL;
++ 	}
++ 	if (h->rescan_ctlr_wq) {
++ 		destroy_workqueue(h->rescan_ctlr_wq);
++ 		h->rescan_ctlr_wq = NULL;
++ 	}
++ 	kfree(h);				/* init_one 1 */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  }
+  
+  /* Called when controller lockup detected. */
+@@@ -6781,10 -7790,16 +6843,21 @@@ reinit_after_soft_reset
+  	set_lockup_detected_for_all_cpus(h, 0);
+  
+  	rc = hpsa_pci_init(h);
+++<<<<<<< HEAD
+ +	if (rc != 0)
+ +		goto clean1;
+++=======
++ 	if (rc)
++ 		goto clean2;	/* lu, aer/h */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
++ 
++ 	/* relies on h-> settings made by hpsa_pci_init, including
++ 	 * interrupt_mode h->intr */
++ 	rc = hpsa_scsi_host_alloc(h);
++ 	if (rc)
++ 		goto clean2_5;	/* pci, lu, aer/h */
+  
+- 	sprintf(h->devname, HPSA "%d", number_of_controllers);
++ 	sprintf(h->devname, HPSA "%d", h->scsi_host->host_no);
+  	h->ctlr = number_of_controllers;
+  	number_of_controllers++;
+  
+@@@ -6798,34 -7813,56 +6871,61 @@@
+  			dac = 0;
+  		} else {
+  			dev_err(&pdev->dev, "no suitable DMA available\n");
+++<<<<<<< HEAD
+ +			goto clean2;
+++=======
++ 			goto clean3;	/* shost, pci, lu, aer/h */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  		}
+  	}
+  
+  	/* make sure the board interrupts are off */
+  	h->access.set_intr_mask(h, HPSA_INTR_OFF);
+  
+++<<<<<<< HEAD
+ +	if (hpsa_request_irqs(h, do_hpsa_intr_msi, do_hpsa_intr_intx))
+ +		goto clean2;
+ +	dev_info(&pdev->dev, "%s: <0x%x> at IRQ %d%s using DAC\n",
+ +	       h->devname, pdev->device,
+ +	       h->intr[h->intr_mode], dac ? "" : " not");
+ +	rc = hpsa_alloc_cmd_pool(h);
+ +	if (rc)
+ +		goto clean2_and_free_irqs;
+ +	if (hpsa_allocate_sg_chain_blocks(h))
+ +		goto clean4;
+++=======
++ 	rc = hpsa_request_irqs(h, do_hpsa_intr_msi, do_hpsa_intr_intx);
++ 	if (rc)
++ 		goto clean3;	/* shost, pci, lu, aer/h */
++ 	rc = hpsa_alloc_cmd_pool(h);
++ 	if (rc)
++ 		goto clean4;	/* irq, shost, pci, lu, aer/h */
++ 	rc = hpsa_alloc_sg_chain_blocks(h);
++ 	if (rc)
++ 		goto clean5;	/* cmd, irq, shost, pci, lu, aer/h */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  	init_waitqueue_head(&h->scan_wait_queue);
+ -	init_waitqueue_head(&h->abort_cmd_wait_queue);
+ -	init_waitqueue_head(&h->abort_sync_wait_queue);
+  	h->scan_finished = 1; /* no scan currently in progress */
+  
+  	pci_set_drvdata(pdev, h);
+  	h->ndevices = 0;
+  	h->hba_mode_enabled = 0;
+- 	h->scsi_host = NULL;
++ 
+  	spin_lock_init(&h->devlock);
+++<<<<<<< HEAD
+ +	hpsa_put_ctlr_into_performant_mode(h);
+++=======
++ 	rc = hpsa_put_ctlr_into_performant_mode(h);
++ 	if (rc)
++ 		goto clean6; /* sg, cmd, irq, shost, pci, lu, aer/h */
++ 
++ 	/* hook into SCSI subsystem */
++ 	rc = hpsa_scsi_add_host(h);
++ 	if (rc)
++ 		goto clean7; /* perf, sg, cmd, irq, shost, pci, lu, aer/h */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  
+ -	/* create the resubmit workqueue */
+ -	h->rescan_ctlr_wq = hpsa_create_controller_wq(h, "rescan");
+ -	if (!h->rescan_ctlr_wq) {
+ -		rc = -ENOMEM;
+ -		goto clean7;
+ -	}
+ -
+ -	h->resubmit_wq = hpsa_create_controller_wq(h, "resubmit");
+ -	if (!h->resubmit_wq) {
+ -		rc = -ENOMEM;
+ -		goto clean7;	/* aer/h */
+ -	}
+ -
+ -	/*
+ -	 * At this point, the controller is ready to take commands.
+ +	/* At this point, the controller is ready to take commands.
+  	 * Now, if reset_devices and the hard reset didn't work, try
+  	 * the soft reset and see if that works.
+  	 */
+@@@ -6864,7 -7901,7 +6964,11 @@@
+  		rc = hpsa_kdump_soft_reset(h);
+  		if (rc)
+  			/* Neither hard nor soft reset worked, we're hosed. */
+++<<<<<<< HEAD
+ +			goto clean7;
+++=======
++ 			goto clean9;
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  
+  		dev_info(&h->pdev->dev, "Board READY.\n");
+  		dev_info(&h->pdev->dev,
+@@@ -6899,29 -7936,47 +7003,53 @@@
+  	h->access.set_intr_mask(h, HPSA_INTR_ON);
+  
+  	hpsa_hba_inquiry(h);
+++<<<<<<< HEAD
+ +	rc = hpsa_register_scsi(h); /* hook ourselves into SCSI subsystem */
+ +	if (rc)
+ +		goto clean4;
+++=======
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  
+  	/* Monitor the controller for firmware lockups */
+  	h->heartbeat_sample_interval = HEARTBEAT_SAMPLE_INTERVAL;
+  	INIT_DELAYED_WORK(&h->monitor_ctlr_work, hpsa_monitor_ctlr_worker);
+  	schedule_delayed_work(&h->monitor_ctlr_work,
+  				h->heartbeat_sample_interval);
+ -	INIT_DELAYED_WORK(&h->rescan_ctlr_work, hpsa_rescan_ctlr_worker);
+ -	queue_delayed_work(h->rescan_ctlr_wq, &h->rescan_ctlr_work,
+ -				h->heartbeat_sample_interval);
+  	return 0;
+  
+++<<<<<<< HEAD
+ +clean4:
+ +	hpsa_free_sg_chain_blocks(h);
+ +	hpsa_free_cmd_pool(h);
+ +	hpsa_free_ioaccel1_cmd_and_bft(h);
+ +	hpsa_free_ioaccel2_cmd_and_bft(h);
+ +clean2_and_free_irqs:
+ +	hpsa_free_irqs(h);
+ +clean2:
+ +	hpsa_free_pci_init(h);
+ +clean1:
+ +	if (h->lockup_detected)
+++=======
++ clean9: /* wq, sh, perf, sg, cmd, irq, shost, pci, lu, aer/h */
++ 	kfree(h->hba_inquiry_data);
++ clean7: /* perf, sg, cmd, irq, shost, pci, lu, aer/h */
++ 	hpsa_free_performant_mode(h);
++ 	h->access.set_intr_mask(h, HPSA_INTR_OFF);
++ clean6: /* sg, cmd, irq, pci, lockup, wq/aer/h */
++ 	hpsa_free_sg_chain_blocks(h);
++ clean5: /* cmd, irq, shost, pci, lu, aer/h */
++ 	hpsa_free_cmd_pool(h);
++ clean4: /* irq, shost, pci, lu, aer/h */
++ 	hpsa_free_irqs(h);
++ clean3: /* shost, pci, lu, aer/h */
++ 	scsi_host_put(h->scsi_host);
++ 	h->scsi_host = NULL;
++ clean2_5: /* pci, lu, aer/h */
++ 	hpsa_free_pci_init(h);
++ clean2: /* lu, aer/h */
++ 	if (h->lockup_detected) {
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  		free_percpu(h->lockup_detected);
+ -		h->lockup_detected = NULL;
+ -	}
+ -clean1:	/* wq/aer/h */
+ -	if (h->resubmit_wq) {
+ -		destroy_workqueue(h->resubmit_wq);
+ -		h->resubmit_wq = NULL;
+ -	}
+ -	if (h->rescan_ctlr_wq) {
+ -		destroy_workqueue(h->rescan_ctlr_wq);
+ -		h->rescan_ctlr_wq = NULL;
+ -	}
+  	kfree(h);
+  	return rc;
+  }
+@@@ -7003,20 -8060,29 +7131,42 @@@ static void hpsa_remove_one(struct pci_
+  	/* includes hpsa_disable_interrupt_mode - pci_init 2 */
+  	hpsa_shutdown(pdev);
+  
+++<<<<<<< HEAD
+ +	hpsa_free_device_info(h);
+ +	hpsa_free_sg_chain_blocks(h);
+ +	kfree(h->blockFetchTable);		/* perf 2 */
+ +	hpsa_free_reply_queues(h);		/* perf 1 */
+ +	hpsa_free_ioaccel1_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_ioaccel2_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_cmd_pool(h);			/* init_one 5 */
+ +	kfree(h->hba_inquiry_data);
+++=======
++ 	hpsa_free_device_info(h);		/* scan */
++ 
++ 	kfree(h->hba_inquiry_data);			/* init_one 10 */
++ 	h->hba_inquiry_data = NULL;			/* init_one 10 */
++ 	if (h->scsi_host)
++ 		scsi_remove_host(h->scsi_host);		/* init_one 8 */
++ 	hpsa_free_ioaccel2_sg_chain_blocks(h);
++ 	hpsa_free_performant_mode(h);			/* init_one 7 */
++ 	hpsa_free_sg_chain_blocks(h);			/* init_one 6 */
++ 	hpsa_free_cmd_pool(h);				/* init_one 5 */
++ 
++ 	/* hpsa_free_irqs already called via hpsa_shutdown init_one 4 */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
++ 
++ 	scsi_host_put(h->scsi_host);			/* init_one 3 */
++ 	h->scsi_host = NULL;				/* init_one 3 */
+  
+  	/* includes hpsa_disable_interrupt_mode - pci_init 2 */
+++<<<<<<< HEAD
+ +	hpsa_free_pci_init(h);
+++=======
++ 	hpsa_free_pci_init(h);				/* init_one 2.5 */
+++>>>>>>> 2946e82bdd76 (hpsa: use scsi host_no as hpsa controller number)
+  
+ -	free_percpu(h->lockup_detected);		/* init_one 2 */
+ -	h->lockup_detected = NULL;			/* init_one 2 */
+ -	/* (void) pci_disable_pcie_error_reporting(pdev); */	/* init_one 1 */
+ -	kfree(h);					/* init_one 1 */
+ +	free_percpu(h->lockup_detected);
+ +	kfree(h);
+  }
+  
+  static int hpsa_suspend(__attribute__((unused)) struct pci_dev *pdev,
+* Unmerged path drivers/scsi/hpsa.c
