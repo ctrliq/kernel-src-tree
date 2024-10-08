@@ -1,0 +1,273 @@
+net: Split sk_no_check into sk_no_check_{rx,tx}
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] Split sk_no_check into sk_no_check_{rx, tx} (Florian Westphal) [1131999]
+Rebuild_FUZZ: 93.33%
+commit-author Tom Herbert <therbert@google.com>
+commit 28448b80456feafe07e2d05b6363b00f61f6171e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/28448b80.failed
+
+Define separate fields in the sock structure for configuring disabling
+checksums in both TX and RX-- sk_no_check_tx and sk_no_check_rx.
+The SO_NO_CHECK socket option only affects sk_no_check_tx. Also,
+removed UDP_CSUM_* defines since they are no longer necessary.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 28448b80456feafe07e2d05b6363b00f61f6171e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/udp.c
+diff --cc net/ipv6/udp.c
+index d21783b5711c,b8db453133aa..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -751,7 -794,12 +751,16 @@@ static int __udp6_lib_mcast_deliver(str
+  	dif = inet6_iif(skb);
+  	sk = udp_v6_mcast_next(net, sk, uh->dest, daddr, uh->source, saddr, dif);
+  	while (sk) {
+++<<<<<<< HEAD
+ +		stack[count++] = sk;
+++=======
++ 		/* If zero checksum and sk_no_check is not on for
++ 		 * the socket then skip it.
++ 		 */
++ 		if (uh->check || sk->sk_no_check_rx)
++ 			stack[count++] = sk;
++ 
+++>>>>>>> 28448b80456f (net: Split sk_no_check into sk_no_check_{rx,tx})
+  		sk = udp_v6_mcast_next(net, sk_nulls_next(sk), uh->dest, daddr,
+  				       uh->source, saddr, dif);
+  		if (unlikely(count == ARRAY_SIZE(stack))) {
+@@@ -839,7 -887,12 +848,16 @@@ int __udp6_lib_rcv(struct sk_buff *skb
+  	if (sk != NULL) {
+  		int ret;
+  
+++<<<<<<< HEAD
+ +		sk_mark_napi_id(sk, skb);
+++=======
++ 		if (!uh->check && !sk->sk_no_check_rx) {
++ 			sock_put(sk);
++ 			udp6_csum_zero_error(skb);
++ 			goto csum_error;
++ 		}
++ 
+++>>>>>>> 28448b80456f (net: Split sk_no_check into sk_no_check_{rx,tx})
+  		ret = udpv6_queue_rcv_skb(sk, skb);
+  		sock_put(sk);
+  
+@@@ -979,7 -1037,10 +997,14 @@@ static int udp_v6_push_pending_frames(s
+  
+  	if (is_udplite)
+  		csum = udplite_csum_outgoing(sk, skb);
+++<<<<<<< HEAD
+ +	else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+++=======
++ 	else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
++ 		skb->ip_summed = CHECKSUM_NONE;
++ 		goto send;
++ 	} else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+++>>>>>>> 28448b80456f (net: Split sk_no_check into sk_no_check_{rx,tx})
+  		udp6_hwcsum_outgoing(sk, skb, &fl6->saddr, &fl6->daddr,
+  				     up->len);
+  		goto send;
+diff --git a/drivers/scsi/iscsi_tcp.c b/drivers/scsi/iscsi_tcp.c
+index add6d1566ec8..a70e7d920c87 100644
+--- a/drivers/scsi/iscsi_tcp.c
++++ b/drivers/scsi/iscsi_tcp.c
+@@ -244,7 +244,7 @@ iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_conn *conn)
+ 	sk->sk_data_ready   = tcp_sw_conn->old_data_ready;
+ 	sk->sk_state_change = tcp_sw_conn->old_state_change;
+ 	sk->sk_write_space  = tcp_sw_conn->old_write_space;
+-	sk->sk_no_check	 = 0;
++	sk->sk_no_check_tx = 0;
+ 	write_unlock_bh(&sk->sk_callback_lock);
+ }
+ 
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 64ff6c79a908..baaa41a94498 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -242,7 +242,8 @@ struct cg_proto;
+   *	@sk_sndbuf: size of send buffer in bytes
+   *	@sk_flags: %SO_LINGER (l_onoff), %SO_BROADCAST, %SO_KEEPALIVE,
+   *		   %SO_OOBINLINE settings, %SO_TIMESTAMPING settings
+-  *	@sk_no_check: %SO_NO_CHECK setting, whether or not checkup packets
++  *	@sk_no_check_tx: %SO_NO_CHECK setting, set checksum in TX packets
++  *	@sk_no_check_rx: allow zero checksum in RX packets
+   *	@sk_route_caps: route capabilities (e.g. %NETIF_F_TSO)
+   *	@sk_route_nocaps: forbidden route capabilities (e.g NETIF_F_GSO_MASK)
+   *	@sk_gso_type: GSO type (e.g. %SKB_GSO_TCPV4)
+@@ -370,7 +371,8 @@ struct sock {
+ 	struct sk_buff_head	sk_write_queue;
+ 	kmemcheck_bitfield_begin(flags);
+ 	unsigned int		sk_shutdown  : 2,
+-				sk_no_check  : 2,
++				sk_no_check_tx : 1,
++				sk_no_check_rx : 1,
+ 				sk_userlocks : 4,
+ 				sk_protocol  : 8,
+ 				sk_type      : 16;
+diff --git a/include/net/udp.h b/include/net/udp.h
+index 74c10ec5e74f..8244638142a9 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -95,15 +95,6 @@ static inline struct udp_hslot *udp_hashslot2(struct udp_table *table,
+ 	return &table->hash2[hash & table->mask];
+ }
+ 
+-/* Note: this must match 'valbool' in sock_setsockopt */
+-#define UDP_CSUM_NOXMIT		1
+-
+-/* Used by SunRPC/xprt layer. */
+-#define UDP_CSUM_NORCV		2
+-
+-/* Default, as per the RFC, is to always do csums. */
+-#define UDP_CSUM_DEFAULT	0
+-
+ extern struct proto udp_prot;
+ 
+ extern atomic_long_t udp_memory_allocated;
+diff --git a/net/appletalk/ddp.c b/net/appletalk/ddp.c
+index 0018daccdea9..e5d9f6541365 100644
+--- a/net/appletalk/ddp.c
++++ b/net/appletalk/ddp.c
+@@ -1669,7 +1669,7 @@ static int atalk_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr
+ 		goto out;
+ 	}
+ 
+-	if (sk->sk_no_check == 1)
++	if (sk->sk_no_check_tx)
+ 		ddp->deh_sum = 0;
+ 	else
+ 		ddp->deh_sum = atalk_checksum(skb, len + sizeof(*ddp));
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 2c097c5a35dd..9745114aff5f 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -740,7 +740,7 @@ set_rcvbuf:
+ 		break;
+ 
+ 	case SO_NO_CHECK:
+-		sk->sk_no_check = valbool;
++		sk->sk_no_check_tx = valbool;
+ 		break;
+ 
+ 	case SO_PRIORITY:
+@@ -1014,7 +1014,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
+ 		break;
+ 
+ 	case SO_NO_CHECK:
+-		v.val = sk->sk_no_check;
++		v.val = sk->sk_no_check_tx;
+ 		break;
+ 
+ 	case SO_PRIORITY:
+diff --git a/net/decnet/af_decnet.c b/net/decnet/af_decnet.c
+index c21f200eed93..6dd2854cfce4 100644
+--- a/net/decnet/af_decnet.c
++++ b/net/decnet/af_decnet.c
+@@ -481,7 +481,7 @@ static struct sock *dn_alloc_sock(struct net *net, struct socket *sock, gfp_t gf
+ 
+ 	sk->sk_backlog_rcv = dn_nsp_backlog_rcv;
+ 	sk->sk_destruct    = dn_destruct;
+-	sk->sk_no_check    = 1;
++	sk->sk_no_check_tx = 1;
+ 	sk->sk_family      = PF_DECnet;
+ 	sk->sk_protocol    = 0;
+ 	sk->sk_allocation  = gfp;
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index ada82fb0fea4..57aed34c908d 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -764,7 +764,7 @@ static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4)
+ 	if (is_udplite)  				 /*     UDP-Lite      */
+ 		csum = udplite_csum(skb);
+ 
+-	else if (sk->sk_no_check == UDP_CSUM_NOXMIT) {   /* UDP csum disabled */
++	else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
+ 
+ 		skb->ip_summed = CHECKSUM_NONE;
+ 		goto send;
+* Unmerged path net/ipv6/udp.c
+diff --git a/net/ipx/af_ipx.c b/net/ipx/af_ipx.c
+index e0897377b3b4..ddb12ddd1601 100644
+--- a/net/ipx/af_ipx.c
++++ b/net/ipx/af_ipx.c
+@@ -1368,7 +1368,7 @@ static int ipx_create(struct net *net, struct socket *sock, int protocol,
+ 
+ 	sk_refcnt_debug_inc(sk);
+ 	sock_init_data(sock, sk);
+-	sk->sk_no_check = 1;		/* Checksum off by default */
++	sk->sk_no_check_tx = 1;		/* Checksum off by default */
+ 	sock->ops = &ipx_dgram_ops;
+ 	rc = 0;
+ out:
+diff --git a/net/ipx/ipx_route.c b/net/ipx/ipx_route.c
+index 30f4519b092f..eb36df2853f0 100644
+--- a/net/ipx/ipx_route.c
++++ b/net/ipx/ipx_route.c
+@@ -240,7 +240,8 @@ int ipxrtr_route_packet(struct sock *sk, struct sockaddr_ipx *usipx,
+ 	}
+ 
+ 	/* Apply checksum. Not allowed on 802.3 links. */
+-	if (sk->sk_no_check || intrfc->if_dlink_type == htons(IPX_FRAME_8023))
++	if (sk->sk_no_check_tx ||
++	    intrfc->if_dlink_type == htons(IPX_FRAME_8023))
+ 		ipx->ipx_checksum = htons(0xFFFF);
+ 	else
+ 		ipx->ipx_checksum = ipx_cksum(ipx, len + sizeof(struct ipxhdr));
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+index bc5c8150a746..fb4cad29a924 100644
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -1207,7 +1207,7 @@ int l2tp_xmit_skb(struct l2tp_session *session, struct sk_buff *skb, int hdr_len
+ 			l2tp_xmit_ipv6_csum(sk, skb, udp_len);
+ 		else
+ #endif
+-		if (sk->sk_no_check == UDP_CSUM_NOXMIT)
++		if (sk->sk_no_check_tx)
+ 			skb->ip_summed = CHECKSUM_NONE;
+ 		else if ((skb_dst(skb) && skb_dst(skb)->dev) &&
+ 			 (!(skb_dst(skb)->dev->features & NETIF_F_V4_CSUM))) {
+@@ -1484,7 +1484,7 @@ static int l2tp_tunnel_sock_create(struct net *net,
+ 		}
+ 
+ 		if (!cfg->use_udp_checksums)
+-			sock->sk->sk_no_check = UDP_CSUM_NOXMIT;
++			sock->sk->sk_no_check_tx = 1;
+ 
+ 		break;
+ 
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index be446d517bc9..03a794f71cc9 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -297,8 +297,7 @@ static int l2tp_nl_tunnel_send(struct sk_buff *skb, u32 portid, u32 seq, int fla
+ 	case L2TP_ENCAPTYPE_UDP:
+ 		if (nla_put_u16(skb, L2TP_ATTR_UDP_SPORT, ntohs(inet->inet_sport)) ||
+ 		    nla_put_u16(skb, L2TP_ATTR_UDP_DPORT, ntohs(inet->inet_dport)) ||
+-		    nla_put_u8(skb, L2TP_ATTR_UDP_CSUM,
+-			       (sk->sk_no_check != UDP_CSUM_NOXMIT)))
++		    nla_put_u8(skb, L2TP_ATTR_UDP_CSUM, !sk->sk_no_check_tx))
+ 			goto nla_put_failure;
+ 		/* NOBREAK */
+ 	case L2TP_ENCAPTYPE_IP:
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 27e489066f05..06894f8e5e94 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -6886,7 +6886,8 @@ void sctp_copy_sock(struct sock *newsk, struct sock *sk,
+ 	newsk->sk_type = sk->sk_type;
+ 	newsk->sk_bound_dev_if = sk->sk_bound_dev_if;
+ 	newsk->sk_flags = sk->sk_flags;
+-	newsk->sk_no_check = sk->sk_no_check;
++	newsk->sk_no_check_tx = sk->sk_no_check_tx;
++	newsk->sk_no_check_rx = sk->sk_no_check_rx;
+ 	newsk->sk_reuse = sk->sk_reuse;
+ 
+ 	newsk->sk_shutdown = sk->sk_shutdown;
