@@ -1,0 +1,350 @@
+libceph: put request only if it's done in handle_reply()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit dc045a9168c83b2dc590930a0565e066346de382
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dc045a91.failed
+
+handle_reply() may be called twice on the same request: on ack and then
+on commit.  This occurs on btrfs-formatted OSDs or if cephfs sync write
+path is triggered - CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK.
+
+handle_reply() handles this with the help of done_request().
+
+Fixes: 5aea3dcd5021 ("libceph: a major OSD client update")
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit dc045a9168c83b2dc590930a0565e066346de382)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/osd_client.c
+diff --cc net/ceph/osd_client.c
+index b1bd089d52f0,cfe0be8bf2b7..000000000000
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@@ -1827,125 -2739,222 +1827,157 @@@ static void handle_reply(struct ceph_os
+  	}
+  
+  	if (decode_redir) {
+ -		ret = ceph_redirect_decode(&p, end, &m->redirect);
+ -		if (ret)
+ -			return ret;
+ +		err = ceph_redirect_decode(&p, end, &redir);
+ +		if (err)
+ +			goto bad_put;
+  	} else {
+ -		ceph_oloc_init(&m->redirect.oloc);
+ +		redir.oloc.pool = -1;
+  	}
+  
+ -	return 0;
+ -
+ -e_inval:
+ -	return -EINVAL;
+ -}
+ +	if (redir.oloc.pool != -1) {
+ +		dout("redirect pool %lld\n", redir.oloc.pool);
+  
+ -/*
+ - * We are done with @req if
+ - *   - @m is a safe reply, or
+ - *   - @m is an unsafe reply and we didn't want a safe one
+ - */
+ -static bool done_request(const struct ceph_osd_request *req,
+ -			 const struct MOSDOpReply *m)
+ -{
+ -	return (m->result < 0 ||
+ -		(m->flags & CEPH_OSD_FLAG_ONDISK) ||
+ -		!(req->r_flags & CEPH_OSD_FLAG_ONDISK));
+ -}
+ +		__unregister_request(osdc, req);
+  
+ -/*
+ - * handle osd op reply.  either call the callback if it is specified,
+ - * or do the completion to wake up the waiting thread.
+ - *
+ - * ->r_unsafe_callback is set?	yes			no
+ - *
+ - * first reply is OK (needed	r_cb/r_completion,	r_cb/r_completion,
+ - * any or needed/got safe)	r_safe_completion	r_safe_completion
+ - *
+ - * first reply is unsafe	r_unsafe_cb(true)	(nothing)
+ - *
+ - * when we get the safe reply	r_unsafe_cb(false),	r_cb/r_completion,
+ - *				r_safe_completion	r_safe_completion
+ - */
+ -static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
+ -{
+ -	struct ceph_osd_client *osdc = osd->o_osdc;
+ -	struct ceph_osd_request *req;
+ -	struct MOSDOpReply m;
+ -	u64 tid = le64_to_cpu(msg->hdr.tid);
+ -	u32 data_len = 0;
+ -	bool already_acked;
+ -	int ret;
+ -	int i;
+ +		req->r_target_oloc = redir.oloc; /* struct */
+  
+ -	dout("%s msg %p tid %llu\n", __func__, msg, tid);
+ +		/*
+ +		 * Start redirect requests with nofail=true.  If
+ +		 * mapping fails, request will end up on the notarget
+ +		 * list, waiting for the new osdmap (which can take
+ +		 * a while), even though the original request mapped
+ +		 * successfully.  In the future we might want to follow
+ +		 * original request's nofail setting here.
+ +		 */
+ +		err = __ceph_osdc_start_request(osdc, req, true);
+ +		BUG_ON(err);
+  
+ -	down_read(&osdc->lock);
+ -	if (!osd_registered(osd)) {
+ -		dout("%s osd%d unknown\n", __func__, osd->o_osd);
+ -		goto out_unlock_osdc;
+ +		goto out_unlock;
+  	}
+ -	WARN_ON(osd->o_osd != le64_to_cpu(msg->hdr.src.num));
+  
+ -	mutex_lock(&osd->lock);
+ -	req = lookup_request(&osd->o_requests, tid);
+ -	if (!req) {
+ -		dout("%s osd%d tid %llu unknown\n", __func__, osd->o_osd, tid);
+ -		goto out_unlock_session;
+ -	}
+ +	already_completed = req->r_got_reply;
+ +	if (!req->r_got_reply) {
+ +		req->r_result = result;
+ +		dout("handle_reply result %d bytes %d\n", req->r_result,
+ +		     bytes);
+ +		if (req->r_result == 0)
+ +			req->r_result = bytes;
+  
+ -	ret = decode_MOSDOpReply(msg, &m);
+ -	if (ret) {
+ -		pr_err("failed to decode MOSDOpReply for tid %llu: %d\n",
+ -		       req->r_tid, ret);
+ -		ceph_msg_dump(msg);
+ -		goto fail_request;
+ -	}
+ -	dout("%s req %p tid %llu flags 0x%llx pgid %llu.%x epoch %u attempt %d v %u'%llu uv %llu\n",
+ -	     __func__, req, req->r_tid, m.flags, m.pgid.pool, m.pgid.seed,
+ -	     m.epoch, m.retry_attempt, le32_to_cpu(m.replay_version.epoch),
+ -	     le64_to_cpu(m.replay_version.version), m.user_version);
+ -
+ -	if (m.retry_attempt >= 0) {
+ -		if (m.retry_attempt != req->r_attempts - 1) {
+ -			dout("req %p tid %llu retry_attempt %d != %d, ignoring\n",
+ -			     req, req->r_tid, m.retry_attempt,
+ -			     req->r_attempts - 1);
+ -			goto out_unlock_session;
+ -		}
+ -	} else {
+ -		WARN_ON(1); /* MOSDOpReply v4 is assumed */
+ -	}
+ +		/* in case this is a write and we need to replay, */
+ +		req->r_reassert_version.epoch = cpu_to_le32(reassert_epoch);
+ +		req->r_reassert_version.version = cpu_to_le64(reassert_version);
+  
+ -	if (!ceph_oloc_empty(&m.redirect.oloc)) {
+ -		dout("req %p tid %llu redirect pool %lld\n", req, req->r_tid,
+ -		     m.redirect.oloc.pool);
+ -		unlink_request(osd, req);
+ -		mutex_unlock(&osd->lock);
+ -
+ -		ceph_oloc_copy(&req->r_t.target_oloc, &m.redirect.oloc);
+ -		req->r_flags |= CEPH_OSD_FLAG_REDIRECTED;
+ -		req->r_tid = 0;
+ -		__submit_request(req, false);
+ -		goto out_unlock_osdc;
+ +		req->r_got_reply = 1;
+ +	} else if ((flags & CEPH_OSD_FLAG_ONDISK) == 0) {
+ +		dout("handle_reply tid %llu dup ack\n", tid);
+ +		goto out_unlock;
+  	}
+  
+ -	if (m.num_ops != req->r_num_ops) {
+ -		pr_err("num_ops %d != %d for tid %llu\n", m.num_ops,
+ -		       req->r_num_ops, req->r_tid);
+ -		goto fail_request;
+ -	}
+ -	for (i = 0; i < req->r_num_ops; i++) {
+ -		dout(" req %p tid %llu op %d rval %d len %u\n", req,
+ -		     req->r_tid, i, m.rval[i], m.outdata_len[i]);
+ -		req->r_ops[i].rval = m.rval[i];
+ -		req->r_ops[i].outdata_len = m.outdata_len[i];
+ -		data_len += m.outdata_len[i];
+ -	}
+ -	if (data_len != le32_to_cpu(msg->hdr.data_len)) {
+ -		pr_err("sum of lens %u != %u for tid %llu\n", data_len,
+ -		       le32_to_cpu(msg->hdr.data_len), req->r_tid);
+ -		goto fail_request;
+ -	}
+ -	dout("%s req %p tid %llu acked %d result %d data_len %u\n", __func__,
+ -	     req, req->r_tid, req->r_got_reply, m.result, data_len);
+ -
+ -	already_acked = req->r_got_reply;
+ -	if (!already_acked) {
+ -		req->r_result = m.result ?: data_len;
+ -		req->r_replay_version = m.replay_version; /* struct */
+ -		req->r_got_reply = true;
+ -	} else if (!(m.flags & CEPH_OSD_FLAG_ONDISK)) {
+ -		dout("req %p tid %llu dup ack\n", req, req->r_tid);
+ -		goto out_unlock_session;
+ -	}
+ +	dout("handle_reply tid %llu flags %d\n", tid, flags);
+ +
+ +	if (req->r_linger && (flags & CEPH_OSD_FLAG_ONDISK))
+ +		__register_linger_request(osdc, req);
+ +
+ +	/* either this is a read, or we got the safe response */
+ +	if (result < 0 ||
+ +	    (flags & CEPH_OSD_FLAG_ONDISK) ||
+ +	    ((flags & CEPH_OSD_FLAG_WRITE) == 0))
+ +		__unregister_request(osdc, req);
+ +
+ +	mutex_unlock(&osdc->request_mutex);
+ +	up_read(&osdc->map_sem);
+  
+++<<<<<<< HEAD
+ +	if (!already_completed) {
+ +		if (req->r_unsafe_callback &&
+ +		    result >= 0 && !(flags & CEPH_OSD_FLAG_ONDISK))
+++=======
++ 	if (done_request(req, &m)) {
++ 		__finish_request(req);
++ 		if (req->r_linger) {
++ 			WARN_ON(req->r_unsafe_callback);
++ 			dout("req %p tid %llu cb (locked)\n", req, req->r_tid);
++ 			__complete_request(req);
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&osd->lock);
++ 	up_read(&osdc->lock);
++ 
++ 	if (done_request(req, &m)) {
++ 		if (already_acked && req->r_unsafe_callback) {
++ 			dout("req %p tid %llu safe-cb\n", req, req->r_tid);
++ 			req->r_unsafe_callback(req, false);
++ 		} else if (!req->r_linger) {
++ 			dout("req %p tid %llu cb\n", req, req->r_tid);
++ 			__complete_request(req);
++ 		}
++ 		if (m.flags & CEPH_OSD_FLAG_ONDISK)
++ 			complete_all(&req->r_safe_completion);
++ 		ceph_osdc_put_request(req);
++ 	} else {
++ 		if (req->r_unsafe_callback) {
++ 			dout("req %p tid %llu unsafe-cb\n", req, req->r_tid);
+++>>>>>>> dc045a9168c8 (libceph: put request only if it's done in handle_reply())
+  			req->r_unsafe_callback(req, true);
+ -		} else {
+ -			WARN_ON(1);
+ -		}
+ +		if (req->r_callback)
+ +			req->r_callback(req, msg);
+ +		else
+ +			complete_all(&req->r_completion);
+  	}
+  
+ -	return;
+ -
+ -fail_request:
+ -	complete_request(req, -EIO);
+ -out_unlock_session:
+ -	mutex_unlock(&osd->lock);
+ -out_unlock_osdc:
+ -	up_read(&osdc->lock);
+ -}
+ -
+ -static void set_pool_was_full(struct ceph_osd_client *osdc)
+ -{
+ -	struct rb_node *n;
+ -
+ -	for (n = rb_first(&osdc->osdmap->pg_pools); n; n = rb_next(n)) {
+ -		struct ceph_pg_pool_info *pi =
+ -		    rb_entry(n, struct ceph_pg_pool_info, node);
+ -
+ -		pi->was_full = __pool_full(pi);
+++<<<<<<< HEAD
+ +	if (flags & CEPH_OSD_FLAG_ONDISK) {
+ +		if (req->r_unsafe_callback && already_completed)
+ +			req->r_unsafe_callback(req, false);
+ +		complete_request(req);
+  	}
+ -}
+ -
+ -static bool pool_cleared_full(struct ceph_osd_client *osdc, s64 pool_id)
+ -{
+ -	struct ceph_pg_pool_info *pi;
+  
+ -	pi = ceph_pg_pool_by_id(osdc->osdmap, pool_id);
+ -	if (!pi)
+ -		return false;
+ +out:
+ +	dout("req=%p req->r_linger=%d\n", req, req->r_linger);
+ +	ceph_osdc_put_request(req);
+++=======
+++>>>>>>> dc045a9168c8 (libceph: put request only if it's done in handle_reply())
+ +	return;
+ +out_unlock:
+ +	mutex_unlock(&osdc->request_mutex);
+ +	up_read(&osdc->map_sem);
+ +	goto out;
+  
+ -	return pi->was_full && !__pool_full(pi);
+ +bad_put:
+ +	req->r_result = -EIO;
+ +	__unregister_request(osdc, req);
+ +	if (req->r_callback)
+ +		req->r_callback(req, msg);
+ +	else
+ +		complete_all(&req->r_completion);
+ +	complete_request(req);
+ +	ceph_osdc_put_request(req);
+ +bad_mutex:
+ +	mutex_unlock(&osdc->request_mutex);
+ +	up_read(&osdc->map_sem);
+ +bad:
+ +	pr_err("corrupt osd_op_reply got %d %d\n",
+ +	       (int)msg->front.iov_len, le32_to_cpu(msg->hdr.front_len));
+ +	ceph_msg_dump(msg);
+  }
+  
+ -static enum calc_target_result
+ -recalc_linger_target(struct ceph_osd_linger_request *lreq)
+ +static void reset_changed_osds(struct ceph_osd_client *osdc)
+  {
+ -	struct ceph_osd_client *osdc = lreq->osdc;
+ -	enum calc_target_result ct_res;
+ +	struct rb_node *p, *n;
+  
+ -	ct_res = calc_target(osdc, &lreq->t, &lreq->last_force_resend, true);
+ -	if (ct_res == CALC_TARGET_NEED_RESEND) {
+ -		struct ceph_osd *osd;
+ +	dout("%s %p\n", __func__, osdc);
+ +	for (p = rb_first(&osdc->osds); p; p = n) {
+ +		struct ceph_osd *osd = rb_entry(p, struct ceph_osd, o_node);
+  
+ -		osd = lookup_create_osd(osdc, lreq->t.osd, true);
+ -		if (osd != lreq->osd) {
+ -			unlink_linger(lreq->osd, lreq);
+ -			link_linger(osd, lreq);
+ -		}
+ +		n = rb_next(p);
+ +		if (!ceph_osd_is_up(osdc->osdmap, osd->o_osd) ||
+ +		    memcmp(&osd->o_con.peer_addr,
+ +			   ceph_osd_addr(osdc->osdmap,
+ +					 osd->o_osd),
+ +			   sizeof(struct ceph_entity_addr)) != 0)
+ +			__reset_osd(osdc, osd);
+  	}
+ -
+ -	return ct_res;
+  }
+  
+  /*
+* Unmerged path net/ceph/osd_client.c
