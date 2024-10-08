@@ -137,6 +137,9 @@ static int rds_tcp_accept_one(struct socket *sock)
 		rds_conn_drop(conn);
 		ret = 0;
 		goto out;
+	} else if (rs_tcp->t_sock) {
+		rds_tcp_restore_callbacks(rs_tcp->t_sock, rs_tcp);
+		conn->c_outgoing = 0;
 	}
 
 	rds_tcp_set_callbacks(new_sock, conn);
