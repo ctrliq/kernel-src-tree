@@ -1,0 +1,100 @@
+dm thin: defer whole cells rather than individual bios
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [md] dm-thin: defer whole cells rather than individual bios (Mike Snitzer) [1156164]
+Rebuild_FUZZ: 98.15%
+commit-author Joe Thornber <ejt@redhat.com>
+commit a374bb217b449a00eb96d0584bb833a8b62b672a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a374bb21.failed
+
+This avoids dropping the cell, so increases the probability that other
+bios will collect within the cell, rather than being passed individually
+to the worker.
+
+Also add required process_cell and process_discard_cell error handling
+wrappers and set associated pool-mode function pointers accordingly.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit a374bb217b449a00eb96d0584bb833a8b62b672a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index 13e9a0386d73,912d7f4d89d1..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -705,10 -726,34 +725,32 @@@ static void cell_defer_no_holder(struc
+  	wake_worker(pool);
+  }
+  
++ static void thin_defer_bio(struct thin_c *tc, struct bio *bio);
++ 
++ static void inc_remap_and_issue_cell(struct thin_c *tc,
++ 				     struct dm_bio_prison_cell *cell,
++ 				     dm_block_t block)
++ {
++ 	struct bio *bio;
++ 	struct bio_list bios;
++ 
++ 	bio_list_init(&bios);
++ 	cell_release_no_holder(tc->pool, cell, &bios);
++ 
++ 	while ((bio = bio_list_pop(&bios))) {
++ 		if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA))
++ 			thin_defer_bio(tc, bio);
++ 		else {
++ 			inc_all_io_entry(tc->pool, bio);
++ 			remap_and_issue(tc, bio, block);
++ 		}
++ 	}
++ }
++ 
+  static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
+  {
+ -	if (m->bio) {
+ +	if (m->bio)
+  		m->bio->bi_end_io = m->saved_bi_end_io;
+ -		atomic_inc(&m->bio->bi_remaining);
+ -	}
+  	cell_error(m->tc->pool, m->cell);
+  	list_del(&m->list);
+  	mempool_free(m, m->tc->pool->mapping_pool);
+@@@ -1444,11 -1522,15 +1516,19 @@@ static void __process_bio_read_only(str
+  	r = dm_thin_find_block(tc->td, block, 1, &lookup_result);
+  	switch (r) {
+  	case 0:
+++<<<<<<< HEAD
+ +		if (lookup_result.shared && (rw == WRITE) && bio->bi_size)
+++=======
++ 		if (lookup_result.shared && (rw == WRITE) && bio->bi_iter.bi_size) {
+++>>>>>>> a374bb217b44 (dm thin: defer whole cells rather than individual bios)
+  			handle_unserviceable_bio(tc->pool, bio);
+- 		else {
++ 			if (cell)
++ 				cell_defer_no_holder(tc, cell);
++ 		} else {
+  			inc_all_io_entry(tc->pool, bio);
+  			remap_and_issue(tc, bio, lookup_result.block);
++ 			if (cell)
++ 				inc_remap_and_issue_cell(tc, cell, lookup_result.block);
+  		}
+  		break;
+  
+diff --git a/drivers/md/dm-bio-prison.h b/drivers/md/dm-bio-prison.h
+index 997a43960e77..c0cddb118582 100644
+--- a/drivers/md/dm-bio-prison.h
++++ b/drivers/md/dm-bio-prison.h
+@@ -35,6 +35,7 @@ struct dm_cell_key {
+  * themselves.
+  */
+ struct dm_bio_prison_cell {
++	struct list_head user_list;	/* for client use */
+ 	struct rb_node node;
+ 
+ 	struct dm_cell_key key;
+* Unmerged path drivers/md/dm-thin.c
