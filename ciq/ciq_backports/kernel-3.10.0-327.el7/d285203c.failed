@@ -1,0 +1,711 @@
+scsi: add support for a blk-mq based I/O path.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] add support for a blk-mq based I/O path (Ewan Milne) [1109348]
+Rebuild_FUZZ: 91.76%
+commit-author Christoph Hellwig <hch@lst.de>
+commit d285203cf647d7c97db3a1c33794315c9008593f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d285203c.failed
+
+This patch adds support for an alternate I/O path in the scsi midlayer
+which uses the blk-mq infrastructure instead of the legacy request code.
+
+Use of blk-mq is fully transparent to drivers, although for now a host
+template field is provided to opt out of blk-mq usage in case any unforseen
+incompatibilities arise.
+
+In general replacing the legacy request code with blk-mq is a simple and
+mostly mechanical transformation.  The biggest exception is the new code
+that deals with the fact the I/O submissions in blk-mq must happen from
+process context, which slightly complicates the I/O completion handler.
+The second biggest differences is that blk-mq is build around the concept
+of preallocated requests that also include driver specific data, which
+in SCSI context means the scsi_cmnd structure.  This completely avoids
+dynamic memory allocations for the fast path through I/O submission.
+
+Due the preallocated requests the MQ code path exclusively uses the
+host-wide shared tag allocator instead of a per-LUN one.  This only
+affects drivers actually using the block layer provided tag allocator
+instead of their own.  Unlike the old path blk-mq always provides a tag,
+although drivers don't have to use it.
+
+For now the blk-mq path is disable by defauly and must be enabled using
+the "use_blk_mq" module parameter.  Once the remaining work in the block
+layer to make blk-mq more suitable for slow devices is complete I hope
+to make it the default and eventually even remove the old code path.
+
+Based on the earlier scsi-mq prototype by Nicholas Bellinger.
+
+Thanks to Bart Van Assche and Robert Elliot for testing, benchmarking and
+various sugestions and code contributions.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Webb Scales <webbnh@hp.com>
+	Acked-by: Jens Axboe <axboe@kernel.dk>
+	Tested-by: Bart Van Assche <bvanassche@acm.org>
+	Tested-by: Robert Elliott <elliott@hp.com>
+(cherry picked from commit d285203cf647d7c97db3a1c33794315c9008593f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+#	include/scsi/scsi_host.h
+diff --cc drivers/scsi/scsi_lib.c
+index 4ddd184ab02c,9c44392b748f..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -20,7 -21,7 +21,11 @@@
+  #include <linux/delay.h>
+  #include <linux/hardirq.h>
+  #include <linux/scatterlist.h>
+++<<<<<<< HEAD
+ +#include <linux/ratelimit.h>
+++=======
++ #include <linux/blk-mq.h>
+++>>>>>>> d285203cf647 (scsi: add support for a blk-mq based I/O path.)
+  
+  #include <scsi/scsi.h>
+  #include <scsi/scsi_cmnd.h>
+@@@ -293,18 -310,28 +312,26 @@@ void scsi_device_unbusy(struct scsi_dev
+  	struct scsi_target *starget = scsi_target(sdev);
+  	unsigned long flags;
+  
+ -	atomic_dec(&shost->host_busy);
+ -	if (starget->can_queue > 0)
+ -		atomic_dec(&starget->target_busy);
+ -
+ +	spin_lock_irqsave(shost->host_lock, flags);
+ +	shost->host_busy--;
+ +	atomic_dec(&starget->target_busy);
+  	if (unlikely(scsi_host_in_recovery(shost) &&
+ -		     (shost->host_failed || shost->host_eh_scheduled))) {
+ -		spin_lock_irqsave(shost->host_lock, flags);
+ +		     (shost->host_failed || shost->host_eh_scheduled)))
+  		scsi_eh_wakeup(shost);
+ -		spin_unlock_irqrestore(shost->host_lock, flags);
+ -	}
+ -
+ -	atomic_dec(&sdev->device_busy);
+ +	spin_unlock(shost->host_lock);
+ +	spin_lock(sdev->request_queue->queue_lock);
+ +	sdev->device_busy--;
+ +	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+  }
+  
++ static void scsi_kick_queue(struct request_queue *q)
++ {
++ 	if (q->mq_ops)
++ 		blk_mq_start_hw_queues(q);
++ 	else
++ 		blk_run_queue(q);
++ }
++ 
+  /*
+   * Called for single_lun devices on IO completion. Clear starget_sdev_user,
+   * and call blk_run_queue for all the scsi_devices on the target -
+@@@ -588,17 -673,16 +665,17 @@@ static void scsi_mq_uninit_cmd(struct s
+   *		the __init_io() function.  Primarily this would involve
+   *		the scatter-gather table.
+   */
+ -static void scsi_release_buffers(struct scsi_cmnd *cmd)
+ +void scsi_release_buffers(struct scsi_cmnd *cmd)
+  {
+  	if (cmd->sdb.table.nents)
+- 		scsi_free_sgtable(&cmd->sdb);
++ 		scsi_free_sgtable(&cmd->sdb, false);
+  
+  	memset(&cmd->sdb, 0, sizeof(cmd->sdb));
+  
+  	if (scsi_prot_sg_count(cmd))
+- 		scsi_free_sgtable(cmd->prot_sdb);
++ 		scsi_free_sgtable(cmd->prot_sdb, false);
+  }
+ +EXPORT_SYMBOL(scsi_release_buffers);
+  
+  static void scsi_release_bidi_buffers(struct scsi_cmnd *cmd)
+  {
+@@@ -960,12 -1078,9 +1065,11 @@@ static int scsi_init_sgtable(struct req
+  	 * If sg table allocation fails, requeue request later.
+  	 */
+  	if (unlikely(scsi_alloc_sgtable(sdb, req->nr_phys_segments,
+- 					gfp_mask))) {
++ 					gfp_mask, req->mq_ctx != NULL)))
+  		return BLKPREP_DEFER;
+- 	}
+  
+ +	req->buffer = NULL;
+ +
+  	/* 
+  	 * Next, walk the list, and fill in the addresses and sizes of
+  	 * each segment.
+@@@ -1018,20 -1138,10 +1127,20 @@@ int scsi_init_io(struct scsi_cmnd *cmd
+  		struct scsi_data_buffer *prot_sdb = cmd->prot_sdb;
+  		int ivecs, count;
+  
+ -		BUG_ON(prot_sdb == NULL);
+ +		if (prot_sdb == NULL) {
+ +			/*
+ +			 * This can happen if someone (e.g. multipath)
+ +			 * queues a command to a device on an adapter
+ +			 * that does not support DIX.
+ +			 */
+ +			WARN_ON_ONCE(1);
+ +			error = BLKPREP_KILL;
+ +			goto err_exit;
+ +		}
+ +
+  		ivecs = blk_rq_count_integrity_sg(rq->q, rq->bio);
+  
+- 		if (scsi_alloc_sgtable(prot_sdb, ivecs, gfp_mask)) {
++ 		if (scsi_alloc_sgtable(prot_sdb, ivecs, gfp_mask, is_mq)) {
+  			error = BLKPREP_DEFER;
+  			goto err_exit;
+  		}
+@@@ -1285,22 -1397,27 +1391,34 @@@ static inline int scsi_dev_queue_ready(
+  		/*
+  		 * unblock after device_blocked iterates to zero
+  		 */
+++<<<<<<< HEAD
+ +		if (--sdev->device_blocked == 0) {
+ +			SCSI_LOG_MLQUEUE(3,
+ +				   sdev_printk(KERN_INFO, sdev,
+++=======
++ 		if (atomic_dec_return(&sdev->device_blocked) > 0) {
++ 			/*
++ 			 * For the MQ case we take care of this in the caller.
++ 			 */
++ 			if (!q->mq_ops)
++ 				blk_delay_queue(q, SCSI_QUEUE_DELAY);
++ 			goto out_dec;
++ 		}
++ 		SCSI_LOG_MLQUEUE(3, sdev_printk(KERN_INFO, sdev,
+++>>>>>>> d285203cf647 (scsi: add support for a blk-mq based I/O path.)
+  				   "unblocking device at zero depth\n"));
+ +		} else {
+ +			blk_delay_queue(q, SCSI_QUEUE_DELAY);
+ +			return 0;
+ +		}
+  	}
+ -
+ -	if (busy >= sdev->queue_depth)
+ -		goto out_dec;
+ +	if (scsi_device_is_busy(sdev))
+ +		return 0;
+  
+  	return 1;
+ -out_dec:
+ -	atomic_dec(&sdev->device_busy);
+ -	return 0;
+  }
+  
+ +
+  /*
+   * scsi_target_queue_ready: checks if there we can send commands to target
+   * @sdev: scsi device on starget to check.
+@@@ -1650,7 -1778,181 +1768,185 @@@ out_delay
+  		blk_delay_queue(q, SCSI_QUEUE_DELAY);
+  }
+  
+++<<<<<<< HEAD
+ +u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++=======
++ static inline int prep_to_mq(int ret)
++ {
++ 	switch (ret) {
++ 	case BLKPREP_OK:
++ 		return 0;
++ 	case BLKPREP_DEFER:
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 	default:
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ }
++ 
++ static int scsi_mq_prep_fn(struct request *req)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	struct scsi_device *sdev = req->q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned char *sense_buf = cmd->sense_buffer;
++ 	struct scatterlist *sg;
++ 
++ 	memset(cmd, 0, sizeof(struct scsi_cmnd));
++ 
++ 	req->special = cmd;
++ 
++ 	cmd->request = req;
++ 	cmd->device = sdev;
++ 	cmd->sense_buffer = sense_buf;
++ 
++ 	cmd->tag = req->tag;
++ 
++ 	req->cmd = req->__cmd;
++ 	cmd->cmnd = req->cmd;
++ 	cmd->prot_op = SCSI_PROT_NORMAL;
++ 
++ 	INIT_LIST_HEAD(&cmd->list);
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies;
++ 
++ 	/*
++ 	 * XXX: cmd_list lookups are only used by two drivers, try to get
++ 	 * rid of this list in common code.
++ 	 */
++ 	spin_lock_irq(&sdev->list_lock);
++ 	list_add_tail(&cmd->list, &sdev->cmd_list);
++ 	spin_unlock_irq(&sdev->list_lock);
++ 
++ 	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
++ 	cmd->sdb.table.sgl = sg;
++ 
++ 	if (scsi_host_get_prot(shost)) {
++ 		cmd->prot_sdb = (void *)sg +
++ 			shost->sg_tablesize * sizeof(struct scatterlist);
++ 		memset(cmd->prot_sdb, 0, sizeof(struct scsi_data_buffer));
++ 
++ 		cmd->prot_sdb->table.sgl =
++ 			(struct scatterlist *)(cmd->prot_sdb + 1);
++ 	}
++ 
++ 	if (blk_bidi_rq(req)) {
++ 		struct request *next_rq = req->next_rq;
++ 		struct scsi_data_buffer *bidi_sdb = blk_mq_rq_to_pdu(next_rq);
++ 
++ 		memset(bidi_sdb, 0, sizeof(struct scsi_data_buffer));
++ 		bidi_sdb->table.sgl =
++ 			(struct scatterlist *)(bidi_sdb + 1);
++ 
++ 		next_rq->special = bidi_sdb;
++ 	}
++ 
++ 	return scsi_setup_cmnd(sdev, req);
++ }
++ 
++ static void scsi_mq_done(struct scsi_cmnd *cmd)
++ {
++ 	trace_scsi_dispatch_cmd_done(cmd);
++ 	blk_mq_complete_request(cmd->request);
++ }
++ 
++ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
++ {
++ 	struct request_queue *q = req->q;
++ 	struct scsi_device *sdev = q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	int ret;
++ 	int reason;
++ 
++ 	ret = prep_to_mq(scsi_prep_state_check(sdev, req));
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 	if (!get_device(&sdev->sdev_gendev))
++ 		goto out;
++ 
++ 	if (!scsi_dev_queue_ready(q, sdev))
++ 		goto out_put_device;
++ 	if (!scsi_target_queue_ready(shost, sdev))
++ 		goto out_dec_device_busy;
++ 	if (!scsi_host_queue_ready(q, shost, sdev))
++ 		goto out_dec_target_busy;
++ 
++ 	if (!(req->cmd_flags & REQ_DONTPREP)) {
++ 		ret = prep_to_mq(scsi_mq_prep_fn(req));
++ 		if (ret)
++ 			goto out_dec_host_busy;
++ 		req->cmd_flags |= REQ_DONTPREP;
++ 	}
++ 
++ 	scsi_init_cmd_errh(cmd);
++ 	cmd->scsi_done = scsi_mq_done;
++ 
++ 	reason = scsi_dispatch_cmd(cmd);
++ 	if (reason) {
++ 		scsi_set_blocked(cmd, reason);
++ 		ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 		goto out_dec_host_busy;
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ 
++ out_dec_host_busy:
++ 	atomic_dec(&shost->host_busy);
++ out_dec_target_busy:
++ 	if (scsi_target(sdev)->can_queue > 0)
++ 		atomic_dec(&scsi_target(sdev)->target_busy);
++ out_dec_device_busy:
++ 	atomic_dec(&sdev->device_busy);
++ out_put_device:
++ 	put_device(&sdev->sdev_gendev);
++ out:
++ 	switch (ret) {
++ 	case BLK_MQ_RQ_QUEUE_BUSY:
++ 		blk_mq_stop_hw_queue(hctx);
++ 		if (atomic_read(&sdev->device_busy) == 0 &&
++ 		    !scsi_device_blocked(sdev))
++ 			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
++ 		break;
++ 	case BLK_MQ_RQ_QUEUE_ERROR:
++ 		/*
++ 		 * Make sure to release all allocated ressources when
++ 		 * we hit an error, as we will never see this command
++ 		 * again.
++ 		 */
++ 		if (req->cmd_flags & REQ_DONTPREP)
++ 			scsi_mq_uninit_cmd(cmd);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int scsi_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->sense_buffer = kzalloc_node(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL,
++ 			numa_node);
++ 	if (!cmd->sense_buffer)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void scsi_exit_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	kfree(cmd->sense_buffer);
++ }
++ 
++ static u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++>>>>>>> d285203cf647 (scsi: add support for a blk-mq based I/O path.)
+  {
+  	struct device *host_dev;
+  	u64 bounce_limit = 0xffffffff;
+@@@ -1670,18 -1972,11 +1966,12 @@@
+  
+  	return bounce_limit;
+  }
+ +EXPORT_SYMBOL(scsi_calculate_bounce_limit);
+  
+- struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
+- 					 request_fn_proc *request_fn)
++ static void __scsi_init_queue(struct Scsi_Host *shost, struct request_queue *q)
+  {
+- 	struct request_queue *q;
+  	struct device *dev = shost->dma_dev;
+  
+- 	q = blk_init_queue(request_fn, NULL);
+- 	if (!q)
+- 		return NULL;
+- 
+  	/*
+  	 * this limit is imposed by hardware restrictions
+  	 */
+diff --cc include/scsi/scsi_host.h
+index ade595fc29cc,ba2034779961..000000000000
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@@ -7,10 -7,9 +7,11 @@@
+  #include <linux/workqueue.h>
+  #include <linux/mutex.h>
+  #include <linux/seq_file.h>
++ #include <linux/blk-mq.h>
+  #include <scsi/scsi.h>
+  
+ +#include <linux/rh_kabi.h>
+ +
+  struct request_queue;
+  struct block_device;
+  struct completion;
+@@@ -541,10 -509,11 +542,18 @@@ struct scsi_host_template 
+  	/*
+  	 * Additional per-command data allocated for the driver.
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(unsigned int scsi_mq_reserved1, unsigned int cmd_size)
+ +	unsigned int scsi_mq_reserved2;
+ +	RH_KABI_REPLACE(void *scsi_mq_reserved3, struct scsi_host_cmd_pool *cmd_pool)
+ +	void *scsi_mq_reserved4;
+++=======
++ 	unsigned int cmd_size;
++ 	struct scsi_host_cmd_pool *cmd_pool;
++ 
++ 	/* temporary flag to disable blk-mq I/O path */
++ 	bool disable_blk_mq;
+++>>>>>>> d285203cf647 (scsi: add support for a blk-mq based I/O path.)
+  };
+  
+  /*
+@@@ -615,15 -584,16 +624,18 @@@ struct Scsi_Host 
+  	 * Area to keep a shared tag map (if needed, will be
+  	 * NULL if not).
+  	 */
+- 	struct blk_queue_tag	*bqt;
++ 	union {
++ 		struct blk_queue_tag	*bqt;
++ 		struct blk_mq_tag_set	tag_set;
++ 	};
+  
+ -	atomic_t host_busy;		   /* commands actually active on low-level */
+ -	atomic_t host_blocked;
+ -
+ -	unsigned int host_failed;	   /* commands that failed.
+ -					      protected by host_lock */
+ +	/*
+ +	 * The following two fields are protected with host_lock;
+ +	 * however, eh routines can safely access during eh processing
+ +	 * without acquiring the lock.
+ +	 */
+ +	unsigned int host_busy;		   /* commands actually active on low-level */
+ +	unsigned int host_failed;	   /* commands that failed. */
+  	unsigned int host_eh_scheduled;    /* EH scheduled without command */
+      
+  	unsigned int host_no;  /* Used for IOCTL_GET_IDLUN, /proc/scsi et al. */
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index 0632eee82620..6de80e352871 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -213,9 +213,24 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
+ 		goto fail;
+ 	}
+ 
++	if (shost_use_blk_mq(shost)) {
++		error = scsi_mq_setup_tags(shost);
++		if (error)
++			goto fail;
++	}
++
++	/*
++	 * Note that we allocate the freelist even for the MQ case for now,
++	 * as we need a command set aside for scsi_reset_provider.  Having
++	 * the full host freelist and one command available for that is a
++	 * little heavy-handed, but avoids introducing a special allocator
++	 * just for this.  Eventually the structure of scsi_reset_provider
++	 * will need a major overhaul.
++	 */
+ 	error = scsi_setup_command_freelist(shost);
+ 	if (error)
+-		goto fail;
++		goto out_destroy_tags;
++
+ 
+ 	if (!shost->shost_gendev.parent)
+ 		shost->shost_gendev.parent = dev ? dev : &platform_bus;
+@@ -226,7 +241,7 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
+ 
+ 	error = device_add(&shost->shost_gendev);
+ 	if (error)
+-		goto out;
++		goto out_destroy_freelist;
+ 
+ 	pm_runtime_set_active(&shost->shost_gendev);
+ 	pm_runtime_enable(&shost->shost_gendev);
+@@ -279,8 +294,11 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
+ 	device_del(&shost->shost_dev);
+  out_del_gendev:
+ 	device_del(&shost->shost_gendev);
+- out:
++ out_destroy_freelist:
+ 	scsi_destroy_command_freelist(shost);
++ out_destroy_tags:
++	if (shost_use_blk_mq(shost))
++		scsi_mq_destroy_tags(shost);
+  fail:
+ 	return error;
+ }
+@@ -309,8 +327,13 @@ static void scsi_host_dev_release(struct device *dev)
+ 	}
+ 
+ 	scsi_destroy_command_freelist(shost);
+-	if (shost->bqt)
+-		blk_free_tags(shost->bqt);
++	if (shost_use_blk_mq(shost)) {
++		if (shost->tag_set.tags)
++			scsi_mq_destroy_tags(shost);
++	} else {
++		if (shost->bqt)
++			blk_free_tags(shost->bqt);
++	}
+ 
+ 	kfree(shost->shost_data);
+ 
+@@ -436,6 +459,8 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
+ 	else
+ 		shost->dma_boundary = 0xffffffff;
+ 
++	shost->use_blk_mq = scsi_use_blk_mq && !shost->hostt->disable_blk_mq;
++
+ 	device_initialize(&shost->shost_gendev);
+ 	dev_set_name(&shost->shost_gendev, "host%d", shost->host_no);
+ 	shost->shost_gendev.bus = &scsi_bus_type;
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 7501822c879a..25c747337df0 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -794,7 +794,7 @@ void scsi_adjust_queue_depth(struct scsi_device *sdev, int tagged, int tags)
+ 	 * is more IO than the LLD's can_queue (so there are not enuogh
+ 	 * tags) request_fn's host queue ready check will handle it.
+ 	 */
+-	if (!sdev->host->bqt) {
++	if (!shost_use_blk_mq(sdev->host) && !sdev->host->bqt) {
+ 		if (blk_queue_tagged(sdev->request_queue) &&
+ 		    blk_queue_resize_tags(sdev->request_queue, tags) != 0)
+ 			goto out;
+@@ -1350,6 +1350,9 @@ MODULE_LICENSE("GPL");
+ module_param(scsi_logging_level, int, S_IRUGO|S_IWUSR);
+ MODULE_PARM_DESC(scsi_logging_level, "a bit mask of logging levels");
+ 
++bool scsi_use_blk_mq = false;
++module_param_named(use_blk_mq, scsi_use_blk_mq, bool, S_IWUSR | S_IRUGO);
++
+ static int __init init_scsi(void)
+ {
+ 	int error;
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/drivers/scsi/scsi_priv.h b/drivers/scsi/scsi_priv.h
+index f079a598bed4..b6c54de9e6ae 100644
+--- a/drivers/scsi/scsi_priv.h
++++ b/drivers/scsi/scsi_priv.h
+@@ -88,6 +88,9 @@ extern void scsi_next_command(struct scsi_cmnd *cmd);
+ extern void scsi_io_completion(struct scsi_cmnd *, unsigned int);
+ extern void scsi_run_host_queues(struct Scsi_Host *shost);
+ extern struct request_queue *scsi_alloc_queue(struct scsi_device *sdev);
++extern struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev);
++extern int scsi_mq_setup_tags(struct Scsi_Host *shost);
++extern void scsi_mq_destroy_tags(struct Scsi_Host *shost);
+ extern int scsi_init_queue(void);
+ extern void scsi_exit_queue(void);
+ struct request_queue;
+diff --git a/drivers/scsi/scsi_scan.c b/drivers/scsi/scsi_scan.c
+index 75e7113227ff..3d8373ce0219 100644
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -264,7 +264,10 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
+ 	 */
+ 	sdev->borken = 1;
+ 
+-	sdev->request_queue = scsi_alloc_queue(sdev);
++	if (shost_use_blk_mq(shost))
++		sdev->request_queue = scsi_mq_alloc_queue(sdev);
++	else
++		sdev->request_queue = scsi_alloc_queue(sdev);
+ 	if (!sdev->request_queue) {
+ 		/* release fn is set up in scsi_sysfs_device_initialise, so
+ 		 * have to free and put manually here */
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index bf9f0637b768..00c7de8e029c 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -333,6 +333,7 @@ store_shost_eh_deadline(struct device *dev, struct device_attribute *attr,
+ 
+ static DEVICE_ATTR(eh_deadline, S_IRUGO | S_IWUSR, show_shost_eh_deadline, store_shost_eh_deadline);
+ 
++shost_rd_attr(use_blk_mq, "%d\n");
+ shost_rd_attr(unique_id, "%u\n");
+ shost_rd_attr(host_busy, "%hu\n");
+ shost_rd_attr(cmd_per_lun, "%hd\n");
+@@ -345,6 +346,7 @@ shost_rd_attr(prot_guard_type, "%hd\n");
+ shost_rd_attr2(proc_name, hostt->proc_name, "%s\n");
+ 
+ static struct attribute *scsi_sysfs_shost_attrs[] = {
++	&dev_attr_use_blk_mq.attr,
+ 	&dev_attr_unique_id.attr,
+ 	&dev_attr_host_busy.attr,
+ 	&dev_attr_cmd_per_lun.attr,
+* Unmerged path include/scsi/scsi_host.h
+diff --git a/include/scsi/scsi_tcq.h b/include/scsi/scsi_tcq.h
+index 81dd12edc38c..cdcc90b07ecb 100644
+--- a/include/scsi/scsi_tcq.h
++++ b/include/scsi/scsi_tcq.h
+@@ -67,7 +67,8 @@ static inline void scsi_activate_tcq(struct scsi_device *sdev, int depth)
+ 	if (!sdev->tagged_supported)
+ 		return;
+ 
+-	if (!blk_queue_tagged(sdev->request_queue))
++	if (!shost_use_blk_mq(sdev->host) &&
++	    blk_queue_tagged(sdev->request_queue))
+ 		blk_queue_init_tags(sdev->request_queue, depth,
+ 				    sdev->host->bqt);
+ 
+@@ -80,7 +81,8 @@ static inline void scsi_activate_tcq(struct scsi_device *sdev, int depth)
+  **/
+ static inline void scsi_deactivate_tcq(struct scsi_device *sdev, int depth)
+ {
+-	if (blk_queue_tagged(sdev->request_queue))
++	if (!shost_use_blk_mq(sdev->host) &&
++	    blk_queue_tagged(sdev->request_queue))
+ 		blk_queue_free_tags(sdev->request_queue);
+ 	scsi_adjust_queue_depth(sdev, 0, depth);
+ }
+@@ -108,6 +110,15 @@ static inline int scsi_populate_tag_msg(struct scsi_cmnd *cmd, char *msg)
+ 	return 0;
+ }
+ 
++static inline struct scsi_cmnd *scsi_mq_find_tag(struct Scsi_Host *shost,
++		unsigned int hw_ctx, int tag)
++{
++	struct request *req;
++
++	req = blk_mq_tag_to_rq(shost->tag_set.tags[hw_ctx], tag);
++	return req ? (struct scsi_cmnd *)req->special : NULL;
++}
++
+ /**
+  * scsi_find_tag - find a tagged command by device
+  * @SDpnt:	pointer to the ScSI device
+@@ -118,10 +129,12 @@ static inline int scsi_populate_tag_msg(struct scsi_cmnd *cmd, char *msg)
+  **/
+ static inline struct scsi_cmnd *scsi_find_tag(struct scsi_device *sdev, int tag)
+ {
+-
+         struct request *req;
+ 
+         if (tag != SCSI_NO_TAG) {
++		if (shost_use_blk_mq(sdev->host))
++			return scsi_mq_find_tag(sdev->host, 0, tag);
++
+         	req = blk_queue_find_tag(sdev->request_queue, tag);
+ 	        return req ? (struct scsi_cmnd *)req->special : NULL;
+ 	}
+@@ -130,6 +143,7 @@ static inline struct scsi_cmnd *scsi_find_tag(struct scsi_device *sdev, int tag)
+ 	return sdev->current_cmnd;
+ }
+ 
++
+ /**
+  * scsi_init_shared_tag_map - create a shared tag map
+  * @shost:	the host to share the tag map among all devices
+@@ -137,6 +151,12 @@ static inline struct scsi_cmnd *scsi_find_tag(struct scsi_device *sdev, int tag)
+  */
+ static inline int scsi_init_shared_tag_map(struct Scsi_Host *shost, int depth)
+ {
++	/*
++	 * We always have a shared tag map around when using blk-mq.
++	 */
++	if (shost_use_blk_mq(shost))
++		return 0;
++
+ 	/*
+ 	 * If the shared tag map isn't already initialized, do it now.
+ 	 * This saves callers from having to check ->bqt when setting up
+@@ -165,6 +185,8 @@ static inline struct scsi_cmnd *scsi_host_find_tag(struct Scsi_Host *shost,
+ 	struct request *req;
+ 
+ 	if (tag != SCSI_NO_TAG) {
++		if (shost_use_blk_mq(shost))
++			return scsi_mq_find_tag(shost, 0, tag);
+ 		req = blk_map_queue_find_tag(shost->bqt, tag);
+ 		return req ? (struct scsi_cmnd *)req->special : NULL;
+ 	}
