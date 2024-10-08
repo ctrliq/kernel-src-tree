@@ -1,0 +1,165 @@
+ipv4: Use percpu Cache route in IP tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] ip_tunnel: Use percpu Cache route in IP tunnels (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 89.89%
+commit-author Tom Herbert <therbert@google.com>
+commit 9a4aa9af447f784f0a47313c8dcb79ac63442cf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9a4aa9af.failed
+
+percpu route cache eliminates share of dst refcnt between CPUs.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9a4aa9af447f784f0a47313c8dcb79ac63442cf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_tunnels.h
+#	net/ipv4/ip_tunnel.c
+diff --cc include/net/ip_tunnels.h
+index 8d95b01ba42b,9e25b1bc31da..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -56,6 -59,8 +61,11 @@@ struct ip_tunnel 
+  	int		hlen;		/* Precalculated header length */
+  	int		mlink;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct ip_tunnel_dst __percpu *dst_cache;
++ 
+++>>>>>>> 9a4aa9af447f (ipv4: Use percpu Cache route in IP tunnels)
+  	struct ip_tunnel_parm parms;
+  
+  	/* for SIT */
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,e2c9cff26eb5..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,6 -68,63 +68,66 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 				    struct dst_entry *dst)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	if (dst && (dst->flags & DST_NOCACHE))
++ 		dst = NULL;
++ 
++ 	spin_lock_bh(&idst->lock);
++ 	old_dst = rcu_dereference(idst->dst);
++ 	rcu_assign_pointer(idst->dst, dst);
++ 	dst_release(old_dst);
++ 	spin_unlock_bh(&idst->lock);
++ }
++ 
++ static inline void tunnel_dst_set(struct ip_tunnel *t, struct dst_entry *dst)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst);
++ }
++ 
++ static inline void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL);
++ }
++ 
++ static void tunnel_dst_reset_all(struct ip_tunnel *t)
++ {
++ 	int i;
++ 
++ 	for_each_possible_cpu(i)
++ 		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL);
++ }
++ 
++ static inline struct dst_entry *tunnel_dst_get(struct ip_tunnel *t)
++ {
++ 	struct dst_entry *dst;
++ 
++ 	rcu_read_lock();
++ 	dst = rcu_dereference(this_cpu_ptr(t->dst_cache)->dst);
++ 	if (dst)
++ 		dst_hold(dst);
++ 	rcu_read_unlock();
++ 	return dst;
++ }
++ 
++ struct dst_entry *tunnel_dst_check(struct ip_tunnel *t, u32 cookie)
++ {
++ 	struct dst_entry *dst = tunnel_dst_get(t);
++ 
++ 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
++ 		tunnel_dst_reset(t);
++ 		return NULL;
++ 	}
++ 
++ 	return dst;
++ }
++ 
+++>>>>>>> 9a4aa9af447f (ipv4: Use percpu Cache route in IP tunnels)
+  /* Often modified stats are per cpu, other are shared (netdev->stats) */
+  struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+  						struct rtnl_link_stats64 *tot)
+@@@ -703,6 -764,7 +763,10 @@@ static void ip_tunnel_update(struct ip_
+  		if (set_mtu)
+  			dev->mtu = mtu;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	tunnel_dst_reset_all(t);
+++>>>>>>> 9a4aa9af447f (ipv4: Use percpu Cache route in IP tunnels)
+  	netdev_state_change(dev);
+  }
+  
+@@@ -1001,8 -1053,27 +1066,30 @@@ int ip_tunnel_init(struct net_device *d
+  	if (!dev->tstats)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	for_each_possible_cpu(i) {
++ 		struct pcpu_tstats *ipt_stats;
++ 		ipt_stats = per_cpu_ptr(dev->tstats, i);
++ 		u64_stats_init(&ipt_stats->syncp);
++ 	}
++ 
++ 	tunnel->dst_cache = alloc_percpu(struct ip_tunnel_dst);
++ 	if (!tunnel->dst_cache) {
++ 		free_percpu(dev->tstats);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for_each_possible_cpu(i) {
++ 		struct ip_tunnel_dst *idst = per_cpu_ptr(tunnel->dst_cache, i);
++ 		idst-> dst = NULL;
++ 		spin_lock_init(&idst->lock);
++ 	}
++ 
+++>>>>>>> 9a4aa9af447f (ipv4: Use percpu Cache route in IP tunnels)
+  	err = gro_cells_init(&tunnel->gro_cells, dev);
+  	if (err) {
++ 		free_percpu(tunnel->dst_cache);
+  		free_percpu(dev->tstats);
+  		return err;
+  	}
+@@@ -1027,6 -1098,8 +1114,11 @@@ void ip_tunnel_uninit(struct net_devic
+  	/* fb_tunnel_dev will be unregisted in net-exit call. */
+  	if (itn->fb_tunnel_dev != dev)
+  		ip_tunnel_del(netdev_priv(dev));
+++<<<<<<< HEAD
+++=======
++ 
++ 	tunnel_dst_reset_all(tunnel);
+++>>>>>>> 9a4aa9af447f (ipv4: Use percpu Cache route in IP tunnels)
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_uninit);
+  
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path net/ipv4/ip_tunnel.c
