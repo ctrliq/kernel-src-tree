@@ -1,0 +1,77 @@
+af_unix: Guard against other == sk in unix_dgram_sendmsg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rainer Weikusat <rweikusat@mobileactivedefense.com>
+commit a5527dda344fff0514b7989ef7a755729769daa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a5527dda.failed
+
+The unix_dgram_sendmsg routine use the following test
+
+if (unlikely(unix_peer(other) != sk && unix_recvq_full(other))) {
+
+to determine if sk and other are in an n:1 association (either
+established via connect or by using sendto to send messages to an
+unrelated socket identified by address). This isn't correct as the
+specified address could have been bound to the sending socket itself or
+because this socket could have been connected to itself by the time of
+the unix_peer_get but disconnected before the unix_state_lock(other). In
+both cases, the if-block would be entered despite other == sk which
+might either block the sender unintentionally or lead to trying to unlock
+the same spin lock twice for a non-blocking send. Add a other != sk
+check to guard against this.
+
+Fixes: 7d267278a9ec ("unix: avoid use-after-free in ep_remove_wait_queue")
+Reported-By: Philipp Hahn <pmhahn@pmhahn.de>
+	Signed-off-by: Rainer Weikusat <rweikusat@mobileactivedefense.com>
+	Tested-by: Philipp Hahn <pmhahn@pmhahn.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5527dda344fff0514b7989ef7a755729769daa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index 28170973dc3c,c51e2831f498..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -1603,9 -1781,31 +1603,35 @@@ restart
+  			goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unix_peer(other) != sk && unix_recvq_full(other)) {
+ +		if (!timeo) {
+++=======
++ 	/* other == sk && unix_peer(other) != sk if
++ 	 * - unix_peer(sk) == NULL, destination address bound to sk
++ 	 * - unix_peer(sk) == sk by time of get but disconnected before lock
++ 	 */
++ 	if (other != sk &&
++ 	    unlikely(unix_peer(other) != sk && unix_recvq_full(other))) {
++ 		if (timeo) {
++ 			timeo = unix_wait_for_peer(other, timeo);
++ 
++ 			err = sock_intr_errno(timeo);
++ 			if (signal_pending(current))
++ 				goto out_free;
++ 
++ 			goto restart;
++ 		}
++ 
++ 		if (!sk_locked) {
++ 			unix_state_unlock(other);
++ 			unix_state_double_lock(sk, other);
++ 		}
++ 
++ 		if (unix_peer(sk) != other ||
++ 		    unix_dgram_peer_wake_me(sk, other)) {
+++>>>>>>> a5527dda344f (af_unix: Guard against other == sk in unix_dgram_sendmsg)
+  			err = -EAGAIN;
+ -			sk_locked = 1;
+  			goto out_unlock;
+  		}
+  
+* Unmerged path net/unix/af_unix.c
