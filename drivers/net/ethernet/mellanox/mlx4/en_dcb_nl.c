@@ -35,6 +35,7 @@
 #include <linux/math64.h>
 
 #include "mlx4_en.h"
+#include "fw_qos.h"
 
 static int mlx4_en_dcbnl_ieee_getets(struct net_device *dev,
 				   struct ieee_ets *ets)
