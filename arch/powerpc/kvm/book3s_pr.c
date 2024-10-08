@@ -1179,7 +1179,7 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
 	kvmppc_set_pvr(vcpu, vcpu->arch.pvr);
 	vcpu->arch.slb_nr = 64;
 
-	vcpu->arch.shadow_msr = MSR_USER64;
+	vcpu->arch.shadow_msr = MSR_USER64 & ~MSR_LE;
 
 	err = kvmppc_mmu_init(vcpu);
 	if (err < 0)
