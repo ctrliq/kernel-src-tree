@@ -1,0 +1,155 @@
+sched: Fix the rq->next_balance logic in rebalance_domains() and idle_balance()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jason Low <jason.low2@hp.com>
+commit 52a08ef1f13a11289c9e18cd4cfb4e51c024058b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/52a08ef1.failed
+
+Currently, in idle_balance(), we update rq->next_balance when we pull_tasks.
+However, it is also important to update this in the !pulled_tasks case too.
+
+When the CPU is "busy" (the CPU isn't idle), rq->next_balance gets computed
+using sd->busy_factor (so we increase the balance interval when the CPU is
+busy). However, when the CPU goes idle, rq->next_balance could still be set
+to a large value that was computed with the sd->busy_factor.
+
+Thus, we need to also update rq->next_balance in idle_balance() in the cases
+where !pulled_tasks too, so that rq->next_balance gets updated without taking
+the busy_factor into account when the CPU is about to go idle.
+
+This patch makes rq->next_balance get updated independently of whether or
+not we pulled_task. Also, we add logic to ensure that we always traverse
+at least 1 of the sched domains to get a proper next_balance value for
+updating rq->next_balance.
+
+Additionally, since load_balance() modifies the sd->balance_interval, we
+need to re-obtain the sched domain's interval after the call to
+load_balance() in rebalance_domains() before we update rq->next_balance.
+
+This patch adds and uses 2 new helper functions, update_next_balance() and
+get_sd_balance_interval() to update next_balance and obtain the sched
+domain's balance_interval.
+
+	Signed-off-by: Jason Low <jason.low2@hp.com>
+	Reviewed-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: daniel.lezcano@linaro.org
+	Cc: alex.shi@linaro.org
+	Cc: efault@gmx.de
+	Cc: vincent.guittot@linaro.org
+	Cc: morten.rasmussen@arm.com
+	Cc: aswin@hp.com
+Link: http://lkml.kernel.org/r/1399596562.2200.7.camel@j-VirtualBox
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 52a08ef1f13a11289c9e18cd4cfb4e51c024058b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 7973c13361a7,26ec6686a00b..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -6519,18 -6703,31 +6546,31 @@@ update_next_balance(struct sched_domai
+   * idle_balance is called by schedule() if this_cpu is about to become
+   * idle. Attempts to pull tasks from other CPUs.
+   */
+ -static int idle_balance(struct rq *this_rq)
+ +void idle_balance(int this_cpu, struct rq *this_rq)
+  {
++ 	unsigned long next_balance = jiffies + HZ;
++ 	int this_cpu = this_rq->cpu;
+  	struct sched_domain *sd;
+  	int pulled_task = 0;
+- 	unsigned long next_balance = jiffies + HZ;
+  	u64 curr_cost = 0;
+  
+ -	idle_enter_fair(this_rq);
+ -
+ -	/*
+ -	 * We must set idle_stamp _before_ calling idle_balance(), such that we
+ -	 * measure the duration of idle_balance() as idle time.
+ -	 */
+  	this_rq->idle_stamp = rq_clock(this_rq);
+  
+++<<<<<<< HEAD
+ +	if (this_rq->avg_idle < sysctl_sched_migration_cost ||
+ +	    !this_rq->rd->overload)
+ +		return;
+++=======
++ 	if (this_rq->avg_idle < sysctl_sched_migration_cost) {
++ 		rcu_read_lock();
++ 		sd = rcu_dereference_check_sched_domain(this_rq->sd);
++ 		if (sd)
++ 			update_next_balance(sd, 0, &next_balance);
++ 		rcu_read_unlock();
++ 
++ 		goto out;
++ 	}
+++>>>>>>> 52a08ef1f13a (sched: Fix the rq->next_balance logic in rebalance_domains() and idle_balance())
+  
+  	/*
+  	 * Drop the rq->lock, but keep IRQ/preempt disabled.
+@@@ -6540,8 -6737,7 +6580,12 @@@
+  	update_blocked_averages(this_cpu);
+  	rcu_read_lock();
+  	for_each_domain(this_cpu, sd) {
+++<<<<<<< HEAD
+ +		unsigned long interval;
+ +		int should_balance;
+++=======
++ 		int continue_balancing = 1;
+++>>>>>>> 52a08ef1f13a (sched: Fix the rq->next_balance logic in rebalance_domains() and idle_balance())
+  		u64 t0, domain_cost;
+  
+  		if (!(sd->flags & SD_LOAD_BALANCE))
+@@@ -6581,16 -6775,32 +6625,45 @@@
+  
+  	raw_spin_lock(&this_rq->lock);
+  
+++<<<<<<< HEAD
+ +	if (pulled_task || time_after(jiffies, this_rq->next_balance)) {
+ +		/*
+ +		 * We are going idle. next_balance may be set based on
+ +		 * a busy processor. So reset next_balance.
+ +		 */
+ +		this_rq->next_balance = next_balance;
+ +	}
+ +
+ +	if (curr_cost > this_rq->max_idle_balance_cost)
+ +		this_rq->max_idle_balance_cost = curr_cost;
+++=======
++ 	if (curr_cost > this_rq->max_idle_balance_cost)
++ 		this_rq->max_idle_balance_cost = curr_cost;
++ 
++ 	/*
++ 	 * While browsing the domains, we released the rq lock, a task could
++ 	 * have been enqueued in the meantime. Since we're not going idle,
++ 	 * pretend we pulled a task.
++ 	 */
++ 	if (this_rq->cfs.h_nr_running && !pulled_task)
++ 		pulled_task = 1;
++ 
++ out:
++ 	/* Move the next balance forward */
++ 	if (time_after(this_rq->next_balance, next_balance))
++ 		this_rq->next_balance = next_balance;
++ 
++ 	/* Is there a task of a high priority class? */
++ 	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
++ 		pulled_task = -1;
++ 
++ 	if (pulled_task) {
++ 		idle_exit_fair(this_rq);
++ 		this_rq->idle_stamp = 0;
++ 	}
++ 
++ 	return pulled_task;
+++>>>>>>> 52a08ef1f13a (sched: Fix the rq->next_balance logic in rebalance_domains() and idle_balance())
+  }
+  
+  /*
+* Unmerged path kernel/sched/fair.c
