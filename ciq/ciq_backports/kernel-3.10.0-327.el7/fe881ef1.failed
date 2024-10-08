@@ -1,0 +1,281 @@
+gue: Use checksum partial with remote checksum offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit fe881ef11cf0220f118816181930494d484c4883
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fe881ef1.failed
+
+Change remote checksum handling to set checksum partial as default
+behavior. Added an iflink parameter to configure not using
+checksum partial (calling csum_partial to update checksum).
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fe881ef11cf0220f118816181930494d484c4883)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fou.c
+diff --cc net/ipv4/fou.c
+index a87e3c956cb2,ff069f6597ac..000000000000
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@@ -62,8 -62,35 +66,40 @@@ static int fou_udp_recv(struct sock *sk
+  	if (!fou)
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	return fou_udp_encap_recv_deliver(skb, fou->protocol,
+ +					  sizeof(struct udphdr));
+++=======
++ 	fou_recv_pull(skb, sizeof(struct udphdr));
++ 
++ 	return -fou->protocol;
++ }
++ 
++ static struct guehdr *gue_remcsum(struct sk_buff *skb, struct guehdr *guehdr,
++ 				  void *data, size_t hdrlen, u8 ipproto,
++ 				  bool nopartial)
++ {
++ 	__be16 *pd = data;
++ 	size_t start = ntohs(pd[0]);
++ 	size_t offset = ntohs(pd[1]);
++ 	size_t plen = hdrlen + max_t(size_t, offset + sizeof(u16), start);
++ 
++ 	if (!pskb_may_pull(skb, plen))
++ 		return NULL;
++ 	guehdr = (struct guehdr *)&udp_hdr(skb)[1];
++ 
++ 	skb_remcsum_process(skb, (void *)guehdr + hdrlen,
++ 			    start, offset, nopartial);
++ 
++ 	return guehdr;
++ }
++ 
++ static int gue_control_message(struct sk_buff *skb, struct guehdr *guehdr)
++ {
++ 	/* No support yet */
++ 	kfree_skb(skb);
++ 	return 0;
+++>>>>>>> fe881ef11cf0 (gue: Use checksum partial with remote checksum offload)
+  }
+  
+  static int gue_udp_recv(struct sock *sk, struct sk_buff *skb)
+@@@ -87,18 -116,52 +123,49 @@@
+  	if (!pskb_may_pull(skb, len))
+  		goto drop;
+  
+ -	/* guehdr may change after pull */
+ -	guehdr = (struct guehdr *)&udp_hdr(skb)[1];
+ -
+ -	hdrlen = sizeof(struct guehdr) + optlen;
+ +	uh = udp_hdr(skb);
+ +	guehdr = (struct guehdr *)&uh[1];
+  
+ -	if (guehdr->version != 0 || validate_gue_flags(guehdr, optlen))
+ +	if (guehdr->version != 0)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	if (guehdr->flags) {
+ +		/* No support yet */
+ +		goto drop;
+++=======
++ 	hdrlen = sizeof(struct guehdr) + optlen;
++ 
++ 	ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(skb)->tot_len) - len);
++ 
++ 	/* Pull csum through the guehdr now . This can be used if
++ 	 * there is a remote checksum offload.
++ 	 */
++ 	skb_postpull_rcsum(skb, udp_hdr(skb), len);
++ 
++ 	data = &guehdr[1];
++ 
++ 	if (guehdr->flags & GUE_FLAG_PRIV) {
++ 		__be32 flags = *(__be32 *)(data + doffset);
++ 
++ 		doffset += GUE_LEN_PRIV;
++ 
++ 		if (flags & GUE_PFLAG_REMCSUM) {
++ 			guehdr = gue_remcsum(skb, guehdr, data + doffset,
++ 					     hdrlen, guehdr->proto_ctype,
++ 					     !!(fou->flags &
++ 						FOU_F_REMCSUM_NOPARTIAL));
++ 			if (!guehdr)
++ 				goto drop;
++ 
++ 			data = &guehdr[1];
++ 
++ 			doffset += GUE_PLEN_REMCSUM;
++ 		}
+++>>>>>>> fe881ef11cf0 (gue: Use checksum partial with remote checksum offload)
+  	}
+  
+ -	if (unlikely(guehdr->control))
+ -		return gue_control_message(skb, guehdr);
+ -
+ -	__skb_pull(skb, sizeof(struct udphdr) + hdrlen);
+ -	skb_reset_transport_header(skb);
+ -
+ -	return -guehdr->proto_ctype;
+ -
+ +	return fou_udp_encap_recv_deliver(skb, guehdr->next_hdr, len);
+  drop:
+  	kfree_skb(skb);
+  	return 0;
+@@@ -149,45 -214,109 +216,124 @@@ out_unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct guehdr *gue_gro_remcsum(struct sk_buff *skb, unsigned int off,
++ 				      struct guehdr *guehdr, void *data,
++ 				      size_t hdrlen, u8 ipproto,
++ 				      struct gro_remcsum *grc, bool nopartial)
++ {
++ 	__be16 *pd = data;
++ 	size_t start = ntohs(pd[0]);
++ 	size_t offset = ntohs(pd[1]);
++ 	size_t plen = hdrlen + max_t(size_t, offset + sizeof(u16), start);
++ 
++ 	if (skb->remcsum_offload)
++ 		return NULL;
++ 
++ 	if (!NAPI_GRO_CB(skb)->csum_valid)
++ 		return NULL;
++ 
++ 	/* Pull checksum that will be written */
++ 	if (skb_gro_header_hard(skb, off + plen)) {
++ 		guehdr = skb_gro_header_slow(skb, off + plen, off);
++ 		if (!guehdr)
++ 			return NULL;
++ 	}
++ 
++ 	skb_gro_remcsum_process(skb, (void *)guehdr + hdrlen,
++ 				start, offset, grc, nopartial);
++ 
++ 	skb->remcsum_offload = 1;
++ 
++ 	return guehdr;
++ }
++ 
+++>>>>>>> fe881ef11cf0 (gue: Use checksum partial with remote checksum offload)
+  static struct sk_buff **gue_gro_receive(struct sk_buff **head,
+ -					struct sk_buff *skb,
+ -					struct udp_offload *uoff)
+ +					struct sk_buff *skb)
+  {
+  	const struct net_offload **offloads;
+  	const struct net_offload *ops;
+  	struct sk_buff **pp = NULL;
+  	struct sk_buff *p;
+ +	u8 proto;
+  	struct guehdr *guehdr;
+ -	size_t len, optlen, hdrlen, off;
+ -	void *data;
+ -	u16 doffset = 0;
+ +	unsigned int hlen, guehlen;
+ +	unsigned int off;
+  	int flush = 1;
+++<<<<<<< HEAD
+++=======
++ 	struct fou *fou = container_of(uoff, struct fou, udp_offloads);
++ 	struct gro_remcsum grc;
++ 
++ 	skb_gro_remcsum_init(&grc);
+++>>>>>>> fe881ef11cf0 (gue: Use checksum partial with remote checksum offload)
+  
+  	off = skb_gro_offset(skb);
+ -	len = off + sizeof(*guehdr);
+ -
+ +	hlen = off + sizeof(*guehdr);
+  	guehdr = skb_gro_header_fast(skb, off);
+ -	if (skb_gro_header_hard(skb, len)) {
+ -		guehdr = skb_gro_header_slow(skb, len, off);
+ +	if (skb_gro_header_hard(skb, hlen)) {
+ +		guehdr = skb_gro_header_slow(skb, hlen, off);
+  		if (unlikely(!guehdr))
+  			goto out;
+  	}
+  
+ -	optlen = guehdr->hlen << 2;
+ -	len += optlen;
+ +	proto = guehdr->next_hdr;
+ +
+ +	rcu_read_lock();
+ +	offloads = NAPI_GRO_CB(skb)->is_ipv6 ? inet6_offloads : inet_offloads;
+ +	ops = rcu_dereference(offloads[proto]);
+ +	if (WARN_ON(!ops || !ops->callbacks.gro_receive))
+ +		goto out_unlock;
+  
+ -	if (skb_gro_header_hard(skb, len)) {
+ -		guehdr = skb_gro_header_slow(skb, len, off);
+ +	guehlen = sizeof(*guehdr) + (guehdr->hlen << 2);
+ +
+ +	hlen = off + guehlen;
+ +	if (skb_gro_header_hard(skb, hlen)) {
+ +		guehdr = skb_gro_header_slow(skb, hlen, off);
+  		if (unlikely(!guehdr))
+ -			goto out;
+ +			goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(guehdr->control) || guehdr->version != 0 ||
++ 	    validate_gue_flags(guehdr, optlen))
++ 		goto out;
++ 
++ 	hdrlen = sizeof(*guehdr) + optlen;
++ 
++ 	/* Adjust NAPI_GRO_CB(skb)->csum to account for guehdr,
++ 	 * this is needed if there is a remote checkcsum offload.
++ 	 */
++ 	skb_gro_postpull_rcsum(skb, guehdr, hdrlen);
++ 
++ 	data = &guehdr[1];
++ 
++ 	if (guehdr->flags & GUE_FLAG_PRIV) {
++ 		__be32 flags = *(__be32 *)(data + doffset);
++ 
++ 		doffset += GUE_LEN_PRIV;
++ 
++ 		if (flags & GUE_PFLAG_REMCSUM) {
++ 			guehdr = gue_gro_remcsum(skb, off, guehdr,
++ 						 data + doffset, hdrlen,
++ 						 guehdr->proto_ctype, &grc,
++ 						 !!(fou->flags &
++ 						    FOU_F_REMCSUM_NOPARTIAL));
++ 			if (!guehdr)
++ 				goto out;
++ 
++ 			data = &guehdr[1];
++ 
++ 			doffset += GUE_PLEN_REMCSUM;
++ 		}
++ 	}
++ 
++ 	skb_gro_pull(skb, hdrlen);
++ 
+++>>>>>>> fe881ef11cf0 (gue: Use checksum partial with remote checksum offload)
+  	flush = 0;
+  
+  	for (p = *head; p; p = p->next) {
+diff --git a/include/uapi/linux/fou.h b/include/uapi/linux/fou.h
+index 8df06894da23..c303588bb767 100644
+--- a/include/uapi/linux/fou.h
++++ b/include/uapi/linux/fou.h
+@@ -14,6 +14,7 @@ enum {
+ 	FOU_ATTR_AF,				/* u8 */
+ 	FOU_ATTR_IPPROTO,			/* u8 */
+ 	FOU_ATTR_TYPE,				/* u8 */
++	FOU_ATTR_REMCSUM_NOPARTIAL,		/* flag */
+ 
+ 	__FOU_ATTR_MAX,
+ };
+* Unmerged path net/ipv4/fou.c
