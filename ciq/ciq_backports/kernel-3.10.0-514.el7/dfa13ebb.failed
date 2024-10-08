@@ -1,0 +1,209 @@
+mmc: host: Add facility to support re-tuning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit dfa13ebbe3340e538b988f5608efd9ff2ca7fc35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dfa13ebb.failed
+
+Currently, there is core support for tuning during
+initialization. There can also be a need to re-tune
+periodically (e.g. sdhci) or to re-tune after the
+host controller is powered off (e.g. after PM
+runtime suspend / resume) or to re-tune in response
+to CRC errors.
+
+The main requirements for re-tuning are:
+  - ability to enable / disable re-tuning
+  - ability to flag that re-tuning is needed
+  - ability to re-tune before any request
+  - ability to hold off re-tuning if the card is busy
+  - ability to hold off re-tuning if re-tuning is in
+  progress
+  - ability to run a re-tuning timer
+
+To support those requirements 7 members are added to struct
+mmc_host:
+
+  unsigned int		can_retune:1;	/* re-tuning can be used */
+  unsigned int		doing_retune:1;	/* re-tuning in progress */
+  unsigned int		retune_now:1;   /* do re-tuning at next req */
+  int			need_retune;	/* re-tuning is needed */
+  int			hold_retune;	/* hold off re-tuning */
+  unsigned int		retune_period;  /* re-tuning period in secs */
+  struct timer_list	retune_timer;	/* for periodic re-tuning */
+
+need_retune is an integer so it can be set without needing
+synchronization. hold_retune is a integer to allow nesting.
+
+Various simple functions are provided to set / clear those
+variables.
+
+Subsequent patches take those functions into use.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit dfa13ebbe3340e538b988f5608efd9ff2ca7fc35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmc/host.h
+diff --cc include/linux/mmc/host.h
+index 4d8d14da1237,f471193ef6d6..000000000000
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@@ -478,4 -494,46 +487,49 @@@ static inline unsigned int mmc_host_clk
+  	return host->ios.clock;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int mmc_card_hs(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_SD_HS ||
++ 		card->host->ios.timing == MMC_TIMING_MMC_HS;
++ }
++ 
++ static inline int mmc_card_uhs(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing >= MMC_TIMING_UHS_SDR12 &&
++ 		card->host->ios.timing <= MMC_TIMING_UHS_DDR50;
++ }
++ 
++ static inline bool mmc_card_hs200(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS200;
++ }
++ 
++ static inline bool mmc_card_ddr52(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_DDR52;
++ }
++ 
++ static inline bool mmc_card_hs400(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS400;
++ }
++ 
++ void mmc_retune_timer_stop(struct mmc_host *host);
++ 
++ static inline void mmc_retune_needed(struct mmc_host *host)
++ {
++ 	if (host->can_retune)
++ 		host->need_retune = 1;
++ }
++ 
++ static inline void mmc_retune_recheck(struct mmc_host *host)
++ {
++ 	if (host->hold_retune <= 1)
++ 		host->retune_now = 1;
++ }
++ 
+++>>>>>>> dfa13ebbe334 (mmc: host: Add facility to support re-tuning)
+  #endif /* LINUX_MMC_HOST_H */
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index 1ef8c2a03585..c8d8356102ce 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -300,6 +300,73 @@ static inline void mmc_host_clk_sysfs_init(struct mmc_host *host)
+ 
+ #endif
+ 
++void mmc_retune_enable(struct mmc_host *host)
++{
++	host->can_retune = 1;
++	if (host->retune_period)
++		mod_timer(&host->retune_timer,
++			  jiffies + host->retune_period * HZ);
++}
++
++void mmc_retune_disable(struct mmc_host *host)
++{
++	host->can_retune = 0;
++	del_timer_sync(&host->retune_timer);
++	host->retune_now = 0;
++	host->need_retune = 0;
++}
++
++void mmc_retune_timer_stop(struct mmc_host *host)
++{
++	del_timer_sync(&host->retune_timer);
++}
++EXPORT_SYMBOL(mmc_retune_timer_stop);
++
++void mmc_retune_hold(struct mmc_host *host)
++{
++	if (!host->hold_retune)
++		host->retune_now = 1;
++	host->hold_retune += 1;
++}
++
++void mmc_retune_release(struct mmc_host *host)
++{
++	if (host->hold_retune)
++		host->hold_retune -= 1;
++	else
++		WARN_ON(1);
++}
++
++int mmc_retune(struct mmc_host *host)
++{
++	int err;
++
++	if (host->retune_now)
++		host->retune_now = 0;
++	else
++		return 0;
++
++	if (!host->need_retune || host->doing_retune || !host->card)
++		return 0;
++
++	host->need_retune = 0;
++
++	host->doing_retune = 1;
++
++	err = mmc_execute_tuning(host->card);
++
++	host->doing_retune = 0;
++
++	return err;
++}
++
++static void mmc_retune_timer(unsigned long data)
++{
++	struct mmc_host *host = (struct mmc_host *)data;
++
++	mmc_retune_needed(host);
++}
++
+ /**
+  *	mmc_of_parse() - parse host's device-tree node
+  *	@host: host whose node should be parsed.
+@@ -518,6 +585,7 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
+ #ifdef CONFIG_PM
+ 	host->pm_notify.notifier_call = mmc_pm_notify;
+ #endif
++	setup_timer(&host->retune_timer, mmc_retune_timer, (unsigned long)host);
+ 
+ 	/*
+ 	 * By default, hosts do not support SGIO or large requests.
+diff --git a/drivers/mmc/core/host.h b/drivers/mmc/core/host.h
+index f2ab9e578126..992bf5397633 100644
+--- a/drivers/mmc/core/host.h
++++ b/drivers/mmc/core/host.h
+@@ -15,5 +15,11 @@
+ int mmc_register_host_class(void);
+ void mmc_unregister_host_class(void);
+ 
++void mmc_retune_enable(struct mmc_host *host);
++void mmc_retune_disable(struct mmc_host *host);
++void mmc_retune_hold(struct mmc_host *host);
++void mmc_retune_release(struct mmc_host *host);
++int mmc_retune(struct mmc_host *host);
++
+ #endif
+ 
+* Unmerged path include/linux/mmc/host.h
