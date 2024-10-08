@@ -1,0 +1,686 @@
+blk-mq: allow changing of queue depth through sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit e3a2b3f931f59d5284abd13faf8bded726884ffd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e3a2b3f9.failed
+
+For request_fn based devices, the block layer exports a 'nr_requests'
+file through sysfs to allow adjusting of queue depth on the fly.
+Currently this returns -EINVAL for blk-mq, since it's not wired up.
+Wire this up for blk-mq, so that it now also always dynamic
+adjustments of the allowed queue depth for any given block device
+managed by blk-mq.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit e3a2b3f931f59d5284abd13faf8bded726884ffd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq-tag.c
+index 83ae96c51a27,f6dea968b710..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -28,11 -33,228 +28,230 @@@ void blk_mq_wait_for_tags(struct blk_mq
+  
+  bool blk_mq_has_free_tags(struct blk_mq_tags *tags)
+  {
+ -	if (!tags)
+ -		return true;
+ -
+ -	return bt_has_free_tags(&tags->bitmap_tags);
+ +	return !tags ||
+ +		percpu_ida_free_tags(&tags->free_tags, nr_cpu_ids) != 0;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp)
+++=======
++ static inline void bt_index_inc(unsigned int *index)
++ {
++ 	*index = (*index + 1) & (BT_WAIT_QUEUES - 1);
++ }
++ 
++ /*
++  * If a previously inactive queue goes active, bump the active user count.
++  */
++ bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
++ {
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
++ 	    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		atomic_inc(&hctx->tags->active_queues);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Wakeup all potentially sleeping on normal (non-reserved) tags
++  */
++ static void blk_mq_tag_wakeup_all(struct blk_mq_tags *tags)
++ {
++ 	struct blk_mq_bitmap_tags *bt;
++ 	int i, wake_index;
++ 
++ 	bt = &tags->bitmap_tags;
++ 	wake_index = bt->wake_index;
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++) {
++ 		struct bt_wait_state *bs = &bt->bs[wake_index];
++ 
++ 		if (waitqueue_active(&bs->wait))
++ 			wake_up(&bs->wait);
++ 
++ 		bt_index_inc(&wake_index);
++ 	}
++ }
++ 
++ /*
++  * If a previously busy queue goes inactive, potential waiters could now
++  * be allowed to queue. Wake them up and check.
++  */
++ void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct blk_mq_tags *tags = hctx->tags;
++ 
++ 	if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return;
++ 
++ 	atomic_dec(&tags->active_queues);
++ 
++ 	blk_mq_tag_wakeup_all(tags);
++ }
++ 
++ /*
++  * For shared tag users, we track the number of currently active users
++  * and attempt to provide a fair share of the tag depth for each of them.
++  */
++ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
++ 				  struct blk_mq_bitmap_tags *bt)
++ {
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_SHARED))
++ 		return true;
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->depth == 1)
++ 		return true;
++ 
++ 	users = atomic_read(&hctx->tags->active_queues);
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->depth + users - 1) / users, 4U);
++ 	return atomic_read(&hctx->nr_active) < depth;
++ }
++ 
++ static int __bt_get_word(struct blk_align_bitmap *bm, unsigned int last_tag)
++ {
++ 	int tag, org_last_tag, end;
++ 
++ 	org_last_tag = last_tag;
++ 	end = bm->depth;
++ 	do {
++ restart:
++ 		tag = find_next_zero_bit(&bm->word, end, last_tag);
++ 		if (unlikely(tag >= end)) {
++ 			/*
++ 			 * We started with an offset, start from 0 to
++ 			 * exhaust the map.
++ 			 */
++ 			if (org_last_tag && last_tag) {
++ 				end = last_tag;
++ 				last_tag = 0;
++ 				goto restart;
++ 			}
++ 			return -1;
++ 		}
++ 		last_tag = tag + 1;
++ 	} while (test_and_set_bit_lock(tag, &bm->word));
++ 
++ 	return tag;
++ }
++ 
++ /*
++  * Straight forward bitmap tag implementation, where each bit is a tag
++  * (cleared == free, and set == busy). The small twist is using per-cpu
++  * last_tag caches, which blk-mq stores in the blk_mq_ctx software queue
++  * contexts. This enables us to drastically limit the space searched,
++  * without dirtying an extra shared cacheline like we would if we stored
++  * the cache value inside the shared blk_mq_bitmap_tags structure. On top
++  * of that, each word of tags is in a separate cacheline. This means that
++  * multiple users will tend to stick to different cachelines, at least
++  * until the map is exhausted.
++  */
++ static int __bt_get(struct blk_mq_hw_ctx *hctx, struct blk_mq_bitmap_tags *bt,
++ 		    unsigned int *tag_cache)
++ {
++ 	unsigned int last_tag, org_last_tag;
++ 	int index, i, tag;
++ 
++ 	if (!hctx_may_queue(hctx, bt))
++ 		return -1;
++ 
++ 	last_tag = org_last_tag = *tag_cache;
++ 	index = TAG_TO_INDEX(bt, last_tag);
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		tag = __bt_get_word(&bt->map[index], TAG_TO_BIT(bt, last_tag));
++ 		if (tag != -1) {
++ 			tag += (index << bt->bits_per_word);
++ 			goto done;
++ 		}
++ 
++ 		last_tag = 0;
++ 		if (++index >= bt->map_nr)
++ 			index = 0;
++ 	}
++ 
++ 	*tag_cache = 0;
++ 	return -1;
++ 
++ 	/*
++ 	 * Only update the cache from the allocation path, if we ended
++ 	 * up using the specific cached tag.
++ 	 */
++ done:
++ 	if (tag == org_last_tag) {
++ 		last_tag = tag + 1;
++ 		if (last_tag >= bt->depth - 1)
++ 			last_tag = 0;
++ 
++ 		*tag_cache = last_tag;
++ 	}
++ 
++ 	return tag;
++ }
++ 
++ static struct bt_wait_state *bt_wait_ptr(struct blk_mq_bitmap_tags *bt,
++ 					 struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct bt_wait_state *bs;
++ 
++ 	if (!hctx)
++ 		return &bt->bs[0];
++ 
++ 	bs = &bt->bs[hctx->wait_index];
++ 	bt_index_inc(&hctx->wait_index);
++ 	return bs;
++ }
++ 
++ static int bt_get(struct blk_mq_bitmap_tags *bt, struct blk_mq_hw_ctx *hctx,
++ 		  unsigned int *last_tag, gfp_t gfp)
++ {
++ 	struct bt_wait_state *bs;
++ 	DEFINE_WAIT(wait);
++ 	int tag;
++ 
++ 	tag = __bt_get(hctx, bt, last_tag);
++ 	if (tag != -1)
++ 		return tag;
++ 
++ 	if (!(gfp & __GFP_WAIT))
++ 		return -1;
++ 
++ 	bs = bt_wait_ptr(bt, hctx);
++ 	do {
++ 		bool was_empty;
++ 
++ 		was_empty = list_empty(&wait.task_list);
++ 		prepare_to_wait(&bs->wait, &wait, TASK_UNINTERRUPTIBLE);
++ 
++ 		tag = __bt_get(hctx, bt, last_tag);
++ 		if (tag != -1)
++ 			break;
++ 
++ 		if (was_empty)
++ 			atomic_set(&bs->wait_cnt, bt->wake_cnt);
++ 
++ 		io_schedule();
++ 	} while (1);
++ 
++ 	finish_wait(&bs->wait, &wait);
++ 	return tag;
++ }
++ 
++ static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags,
++ 				     struct blk_mq_hw_ctx *hctx,
++ 				     unsigned int *last_tag, gfp_t gfp)
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  {
+  	int tag;
+  
+@@@ -118,6 -401,115 +337,118 @@@ void blk_mq_tag_busy_iter(struct blk_mq
+  	kfree(tag_map);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int bt_unused_tags(struct blk_mq_bitmap_tags *bt)
++ {
++ 	unsigned int i, used;
++ 
++ 	for (i = 0, used = 0; i < bt->map_nr; i++) {
++ 		struct blk_align_bitmap *bm = &bt->map[i];
++ 
++ 		used += bitmap_weight(&bm->word, bm->depth);
++ 	}
++ 
++ 	return bt->depth - used;
++ }
++ 
++ static void bt_update_count(struct blk_mq_bitmap_tags *bt,
++ 			    unsigned int depth)
++ {
++ 	unsigned int tags_per_word = 1U << bt->bits_per_word;
++ 	unsigned int map_depth = depth;
++ 
++ 	if (depth) {
++ 		int i;
++ 
++ 		for (i = 0; i < bt->map_nr; i++) {
++ 			bt->map[i].depth = min(map_depth, tags_per_word);
++ 			map_depth -= bt->map[i].depth;
++ 		}
++ 	}
++ 
++ 	bt->wake_cnt = BT_WAIT_BATCH;
++ 	if (bt->wake_cnt > depth / 4)
++ 		bt->wake_cnt = max(1U, depth / 4);
++ 
++ 	bt->depth = depth;
++ }
++ 
++ static int bt_alloc(struct blk_mq_bitmap_tags *bt, unsigned int depth,
++ 			int node, bool reserved)
++ {
++ 	int i;
++ 
++ 	bt->bits_per_word = ilog2(BITS_PER_LONG);
++ 
++ 	/*
++ 	 * Depth can be zero for reserved tags, that's not a failure
++ 	 * condition.
++ 	 */
++ 	if (depth) {
++ 		unsigned int nr, tags_per_word;
++ 
++ 		tags_per_word = (1 << bt->bits_per_word);
++ 
++ 		/*
++ 		 * If the tag space is small, shrink the number of tags
++ 		 * per word so we spread over a few cachelines, at least.
++ 		 * If less than 4 tags, just forget about it, it's not
++ 		 * going to work optimally anyway.
++ 		 */
++ 		if (depth >= 4) {
++ 			while (tags_per_word * 4 > depth) {
++ 				bt->bits_per_word--;
++ 				tags_per_word = (1 << bt->bits_per_word);
++ 			}
++ 		}
++ 
++ 		nr = ALIGN(depth, tags_per_word) / tags_per_word;
++ 		bt->map = kzalloc_node(nr * sizeof(struct blk_align_bitmap),
++ 						GFP_KERNEL, node);
++ 		if (!bt->map)
++ 			return -ENOMEM;
++ 
++ 		bt->map_nr = nr;
++ 	}
++ 
++ 	bt->bs = kzalloc(BT_WAIT_QUEUES * sizeof(*bt->bs), GFP_KERNEL);
++ 	if (!bt->bs) {
++ 		kfree(bt->map);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++)
++ 		init_waitqueue_head(&bt->bs[i].wait);
++ 
++ 	bt_update_count(bt, depth);
++ 	return 0;
++ }
++ 
++ static void bt_free(struct blk_mq_bitmap_tags *bt)
++ {
++ 	kfree(bt->map);
++ 	kfree(bt->bs);
++ }
++ 
++ static struct blk_mq_tags *blk_mq_init_bitmap_tags(struct blk_mq_tags *tags,
++ 						   int node)
++ {
++ 	unsigned int depth = tags->nr_tags - tags->nr_reserved_tags;
++ 
++ 	if (bt_alloc(&tags->bitmap_tags, depth, node, false))
++ 		goto enomem;
++ 	if (bt_alloc(&tags->breserved_tags, tags->nr_reserved_tags, node, true))
++ 		goto enomem;
++ 
++ 	return tags;
++ enomem:
++ 	bt_free(&tags->bitmap_tags);
++ 	kfree(tags);
++ 	return NULL;
++ }
++ 
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  struct blk_mq_tags *blk_mq_init_tags(unsigned int total_tags,
+  				     unsigned int reserved_tags, int node)
+  {
+@@@ -181,6 -537,28 +512,31 @@@ void blk_mq_free_tags(struct blk_mq_tag
+  	kfree(tags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_tag_init_last_tag(struct blk_mq_tags *tags, unsigned int *tag)
++ {
++ 	unsigned int depth = tags->nr_tags - tags->nr_reserved_tags;
++ 
++ 	*tag = prandom_u32() % depth;
++ }
++ 
++ int blk_mq_tag_update_depth(struct blk_mq_tags *tags, unsigned int tdepth)
++ {
++ 	tdepth -= tags->nr_reserved_tags;
++ 	if (tdepth > tags->nr_tags)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Don't need (or can't) update reserved tags here, they remain
++ 	 * static and should never need resizing.
++ 	 */
++ 	bt_update_count(&tags->bitmap_tags, tdepth);
++ 	blk_mq_tag_wakeup_all(tags);
++ 	return 0;
++ }
++ 
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page)
+  {
+  	char *orig_page = page;
+diff --cc block/blk-mq-tag.h
+index 947ba2c6148e,e7ff5ceeeb97..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -12,6 -54,8 +12,11 @@@ extern void blk_mq_put_tag(struct blk_m
+  extern void blk_mq_tag_busy_iter(struct blk_mq_tags *tags, void (*fn)(void *data, unsigned long *), void *data);
+  extern bool blk_mq_has_free_tags(struct blk_mq_tags *tags);
+  extern ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page);
+++<<<<<<< HEAD
+++=======
++ extern void blk_mq_tag_init_last_tag(struct blk_mq_tags *tags, unsigned int *last_tag);
++ extern int blk_mq_tag_update_depth(struct blk_mq_tags *tags, unsigned int depth);
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  
+  enum {
+  	BLK_MQ_TAG_CACHE_MIN	= 1,
+diff --cc block/blk-mq.c
+index 16306cf3ce81,7b71ab1b1536..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1472,6 -1737,80 +1472,83 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth || set->queue_depth > BLK_MQ_MAX_DEPTH)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues ||
++ 	    !set->ops->queue_rq || !set->ops->map_queue ||
++ 	    !set->ops->alloc_hctx || !set->ops->free_hctx)
++ 		return -EINVAL;
++ 
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		goto out;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ out:
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ 	kfree(set->tags);
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i, ret;
++ 
++ 	if (!set || nr > set->queue_depth)
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		ret = blk_mq_tag_update_depth(hctx->tags, nr);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (!ret)
++ 		q->nr_requests = nr;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+diff --cc block/blk-mq.h
+index aeffa309e46e,7db4fe4bd002..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -26,7 -30,9 +26,13 @@@ void blk_mq_run_hw_queue(struct blk_mq_
+  void blk_mq_init_flush(struct request_queue *q);
+  void blk_mq_drain_queue(struct request_queue *q);
+  void blk_mq_free_queue(struct request_queue *q);
+++<<<<<<< HEAD
+ +void blk_mq_rq_init(struct blk_mq_hw_ctx *hctx, struct request *rq);
+++=======
++ void blk_mq_clone_flush_request(struct request *flush_rq,
++ 		struct request *orig_rq);
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+++>>>>>>> e3a2b3f931f5 (blk-mq: allow changing of queue depth through sysfs)
+  
+  /*
+   * CPU hotplug helpers
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 2f17a3a5bc1d..39dea57f264c 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -845,6 +845,47 @@ static void freed_request(struct request_list *rl, unsigned int flags)
+ 		__freed_request(rl, sync ^ 1);
+ }
+ 
++int blk_update_nr_requests(struct request_queue *q, unsigned int nr)
++{
++	struct request_list *rl;
++
++	spin_lock_irq(q->queue_lock);
++	q->nr_requests = nr;
++	blk_queue_congestion_threshold(q);
++
++	/* congestion isn't cgroup aware and follows root blkcg for now */
++	rl = &q->root_rl;
++
++	if (rl->count[BLK_RW_SYNC] >= queue_congestion_on_threshold(q))
++		blk_set_queue_congested(q, BLK_RW_SYNC);
++	else if (rl->count[BLK_RW_SYNC] < queue_congestion_off_threshold(q))
++		blk_clear_queue_congested(q, BLK_RW_SYNC);
++
++	if (rl->count[BLK_RW_ASYNC] >= queue_congestion_on_threshold(q))
++		blk_set_queue_congested(q, BLK_RW_ASYNC);
++	else if (rl->count[BLK_RW_ASYNC] < queue_congestion_off_threshold(q))
++		blk_clear_queue_congested(q, BLK_RW_ASYNC);
++
++	blk_queue_for_each_rl(rl, q) {
++		if (rl->count[BLK_RW_SYNC] >= q->nr_requests) {
++			blk_set_rl_full(rl, BLK_RW_SYNC);
++		} else {
++			blk_clear_rl_full(rl, BLK_RW_SYNC);
++			wake_up(&rl->wait[BLK_RW_SYNC]);
++		}
++
++		if (rl->count[BLK_RW_ASYNC] >= q->nr_requests) {
++			blk_set_rl_full(rl, BLK_RW_ASYNC);
++		} else {
++			blk_clear_rl_full(rl, BLK_RW_ASYNC);
++			wake_up(&rl->wait[BLK_RW_ASYNC]);
++		}
++	}
++
++	spin_unlock_irq(q->queue_lock);
++	return 0;
++}
++
+ /*
+  * Determine if elevator data should be initialized when allocating the
+  * request associated with @bio.
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index fccaa5845434..89e54d0e2eab 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -48,11 +48,10 @@ static ssize_t queue_requests_show(struct request_queue *q, char *page)
+ static ssize_t
+ queue_requests_store(struct request_queue *q, const char *page, size_t count)
+ {
+-	struct request_list *rl;
+ 	unsigned long nr;
+-	int ret;
++	int ret, err;
+ 
+-	if (!q->request_fn)
++	if (!q->request_fn && !q->mq_ops)
+ 		return -EINVAL;
+ 
+ 	ret = queue_var_store(&nr, page, count);
+@@ -62,40 +61,14 @@ queue_requests_store(struct request_queue *q, const char *page, size_t count)
+ 	if (nr < BLKDEV_MIN_RQ)
+ 		nr = BLKDEV_MIN_RQ;
+ 
+-	spin_lock_irq(q->queue_lock);
+-	q->nr_requests = nr;
+-	blk_queue_congestion_threshold(q);
+-
+-	/* congestion isn't cgroup aware and follows root blkcg for now */
+-	rl = &q->root_rl;
+-
+-	if (rl->count[BLK_RW_SYNC] >= queue_congestion_on_threshold(q))
+-		blk_set_queue_congested(q, BLK_RW_SYNC);
+-	else if (rl->count[BLK_RW_SYNC] < queue_congestion_off_threshold(q))
+-		blk_clear_queue_congested(q, BLK_RW_SYNC);
+-
+-	if (rl->count[BLK_RW_ASYNC] >= queue_congestion_on_threshold(q))
+-		blk_set_queue_congested(q, BLK_RW_ASYNC);
+-	else if (rl->count[BLK_RW_ASYNC] < queue_congestion_off_threshold(q))
+-		blk_clear_queue_congested(q, BLK_RW_ASYNC);
+-
+-	blk_queue_for_each_rl(rl, q) {
+-		if (rl->count[BLK_RW_SYNC] >= q->nr_requests) {
+-			blk_set_rl_full(rl, BLK_RW_SYNC);
+-		} else {
+-			blk_clear_rl_full(rl, BLK_RW_SYNC);
+-			wake_up(&rl->wait[BLK_RW_SYNC]);
+-		}
+-
+-		if (rl->count[BLK_RW_ASYNC] >= q->nr_requests) {
+-			blk_set_rl_full(rl, BLK_RW_ASYNC);
+-		} else {
+-			blk_clear_rl_full(rl, BLK_RW_ASYNC);
+-			wake_up(&rl->wait[BLK_RW_ASYNC]);
+-		}
+-	}
++	if (q->request_fn)
++		err = blk_update_nr_requests(q, nr);
++	else
++		err = blk_mq_update_nr_requests(q, nr);
++
++	if (err)
++		return err;
+ 
+-	spin_unlock_irq(q->queue_lock);
+ 	return ret;
+ }
+ 
+diff --git a/block/blk.h b/block/blk.h
+index c90e1d8f7a2b..e15ef3515ef8 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -185,6 +185,8 @@ static inline int queue_congestion_off_threshold(struct request_queue *q)
+ 	return q->nr_congestion_off;
+ }
+ 
++extern int blk_update_nr_requests(struct request_queue *, unsigned int);
++
+ /*
+  * Contribute to IO statistics IFF:
+  *
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 82a4a8e60c38..bb186e264895 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -53,7 +53,7 @@ struct blk_mq_hw_ctx {
+ struct blk_mq_reg {
+ 	struct blk_mq_ops	*ops;
+ 	unsigned int		nr_hw_queues;
+-	unsigned int		queue_depth;
++	unsigned int		queue_depth;	/* max hw supported */
+ 	unsigned int		reserved_tags;
+ 	unsigned int		cmd_size;	/* per-request extra data */
+ 	int			numa_node;
