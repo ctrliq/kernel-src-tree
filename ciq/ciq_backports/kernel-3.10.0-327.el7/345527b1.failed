@@ -1,0 +1,314 @@
+clockevents: Fix cpu_down() race for hrtimer based broadcasting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Preeti U Murthy <preeti@linux.vnet.ibm.com>
+commit 345527b1edce8df719e0884500c76832a18211c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/345527b1.failed
+
+It was found when doing a hotplug stress test on POWER, that the
+machine either hit softlockups or rcu_sched stall warnings.  The
+issue was traced to commit:
+
+  7cba160ad789 ("powernv/cpuidle: Redesign idle states management")
+
+which exposed the cpu_down() race with hrtimer based broadcast mode:
+
+  5d1638acb9f6 ("tick: Introduce hrtimer based broadcast")
+
+The race is the following:
+
+Assume CPU1 is the CPU which holds the hrtimer broadcasting duty
+before it is taken down.
+
+	CPU0					CPU1
+
+	cpu_down()				take_cpu_down()
+						disable_interrupts()
+
+	cpu_die()
+
+	while (CPU1 != CPU_DEAD) {
+		msleep(100);
+		switch_to_idle();
+		stop_cpu_timer();
+		schedule_broadcast();
+	}
+
+	tick_cleanup_cpu_dead()
+		take_over_broadcast()
+
+So after CPU1 disabled interrupts it cannot handle the broadcast
+hrtimer anymore, so CPU0 will be stuck forever.
+
+Fix this by explicitly taking over broadcast duty before cpu_die().
+
+This is a temporary workaround. What we really want is a callback
+in the clockevent device which allows us to do that from the dying
+CPU by pushing the hrtimer onto a different cpu. That might involve
+an IPI and is definitely more complex than this immediate fix.
+
+Changelog was picked up from:
+
+    https://lkml.org/lkml/2015/2/16/213
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Nicolas Pitre <nico@linaro.org>
+	Signed-off-by: Preeti U. Murthy <preeti@linux.vnet.ibm.com>
+	Cc: linuxppc-dev@lists.ozlabs.org
+	Cc: mpe@ellerman.id.au
+	Cc: nicolas.pitre@linaro.org
+	Cc: peterz@infradead.org
+	Cc: rjw@rjwysocki.net
+Fixes: http://linuxppc.10917.n7.nabble.com/offlining-cpus-breakage-td88619.html
+Link: http://lkml.kernel.org/r/20150330092410.24979.59887.stgit@preeti.in.ibm.com
+[ Merged it to the latest timer tree, renamed the callback, tidied up the changelog. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 345527b1edce8df719e0884500c76832a18211c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tick.h
+#	kernel/cpu.c
+#	kernel/time/tick-broadcast.c
+diff --cc include/linux/tick.h
+index 495ced0d799c,f9ff225d53c0..000000000000
+--- a/include/linux/tick.h
++++ b/include/linux/tick.h
+@@@ -9,130 -7,43 +9,141 @@@
+  #include <linux/clockchips.h>
+  #include <linux/irqflags.h>
+  #include <linux/percpu.h>
+ +#include <linux/hrtimer.h>
+  #include <linux/context_tracking_state.h>
+  #include <linux/cpumask.h>
+ -#include <linux/sched.h>
+  
+  #ifdef CONFIG_GENERIC_CLOCKEVENTS
+ +
+ +enum tick_device_mode {
+ +	TICKDEV_MODE_PERIODIC,
+ +	TICKDEV_MODE_ONESHOT,
+ +};
+ +
+ +struct tick_device {
+ +	struct clock_event_device *evtdev;
+ +	enum tick_device_mode mode;
+ +};
+ +
+ +enum tick_nohz_mode {
+ +	NOHZ_MODE_INACTIVE,
+ +	NOHZ_MODE_LOWRES,
+ +	NOHZ_MODE_HIGHRES,
+ +};
+ +
+ +/**
+ + * struct tick_sched - sched tick emulation and no idle tick control/stats
+ + * @sched_timer:	hrtimer to schedule the periodic tick in high
+ + *			resolution mode
+ + * @last_tick:		Store the last tick expiry time when the tick
+ + *			timer is modified for nohz sleeps. This is necessary
+ + *			to resume the tick timer operation in the timeline
+ + *			when the CPU returns from nohz sleep.
+ + * @tick_stopped:	Indicator that the idle tick has been stopped
+ + * @idle_jiffies:	jiffies at the entry to idle for idle time accounting
+ + * @idle_calls:		Total number of idle calls
+ + * @idle_sleeps:	Number of idle calls, where the sched tick was stopped
+ + * @idle_entrytime:	Time when the idle call was entered
+ + * @idle_waketime:	Time when the idle was interrupted
+ + * @idle_exittime:	Time when the idle state was left
+ + * @idle_sleeptime:	Sum of the time slept in idle with sched tick stopped
+ + * @iowait_sleeptime:	Sum of the time slept in idle with sched tick stopped, with IO outstanding
+ + * @sleep_length:	Duration of the current idle sleep
+ + * @do_timer_lst:	CPU was the last one doing do_timer before going idle
+ + */
+ +struct tick_sched {
+ +	struct hrtimer			sched_timer;
+ +	unsigned long			check_clocks;
+ +	enum tick_nohz_mode		nohz_mode;
+ +	ktime_t				last_tick;
+ +	int				inidle;
+ +	int				tick_stopped;
+ +	unsigned long			idle_jiffies;
+ +	unsigned long			idle_calls;
+ +	unsigned long			idle_sleeps;
+ +	int				idle_active;
+ +	ktime_t				idle_entrytime;
+ +	ktime_t				idle_waketime;
+ +	ktime_t				idle_exittime;
+ +	ktime_t				idle_sleeptime;
+ +	ktime_t				iowait_sleeptime;
+ +	ktime_t				sleep_length;
+ +	unsigned long			last_jiffies;
+ +	unsigned long			next_jiffies;
+ +	ktime_t				idle_expires;
+ +	int				do_timer_last;
+ +};
+ +
+  extern void __init tick_init(void);
+ -extern void tick_freeze(void);
+ -extern void tick_unfreeze(void);
+ -/* Should be core only, but ARM BL switcher requires it */
+ -extern void tick_suspend_local(void);
+ -/* Should be core only, but XEN resume magic and ARM BL switcher require it */
+ -extern void tick_resume_local(void);
+ -#else /* CONFIG_GENERIC_CLOCKEVENTS */
+ -static inline void tick_init(void) { }
+ -static inline void tick_freeze(void) { }
+ -static inline void tick_unfreeze(void) { }
+ -static inline void tick_suspend_local(void) { }
+ -static inline void tick_resume_local(void) { }
+ -#endif /* !CONFIG_GENERIC_CLOCKEVENTS */
+ +extern int tick_is_oneshot_available(void);
+ +extern struct tick_device *tick_get_device(int cpu);
+ +
+ +# ifdef CONFIG_HIGH_RES_TIMERS
+ +extern int tick_init_highres(void);
+ +extern int tick_program_event(ktime_t expires, int force);
+ +extern void tick_setup_sched_timer(void);
+ +# endif
+ +
+ +# if defined CONFIG_NO_HZ_COMMON || defined CONFIG_HIGH_RES_TIMERS
+ +extern void tick_cancel_sched_timer(int cpu);
+ +# else
+ +static inline void tick_cancel_sched_timer(int cpu) { }
+ +# endif
+ +
+ +# ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
+ +extern struct tick_device *tick_get_broadcast_device(void);
+ +extern struct cpumask *tick_get_broadcast_mask(void);
+  
+ -#ifdef CONFIG_TICK_ONESHOT
+ -extern void tick_irq_enter(void);
+ +#  ifdef CONFIG_TICK_ONESHOT
+ +extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+ +#  endif
+ +
+ +# endif /* BROADCAST */
+ +
+ +# ifdef CONFIG_TICK_ONESHOT
+ +extern void tick_clock_notify(void);
+ +extern int tick_check_oneshot_change(int allow_nohz);
+ +extern struct tick_sched *tick_get_tick_sched(int cpu);
+ +extern void tick_check_idle(void);
+ +extern int tick_oneshot_mode_active(void);
+  #  ifndef arch_needs_cpu
+ -#   define arch_needs_cpu() (0)
+ +#   define arch_needs_cpu(cpu) (0)
+  #  endif
+  # else
+ -static inline void tick_irq_enter(void) { }
+ -#endif
+ +static inline void tick_clock_notify(void) { }
+ +static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
+ +static inline void tick_check_idle(void) { }
+ +static inline int tick_oneshot_mode_active(void) { return 0; }
+ +# endif
+ +
+ +#else /* CONFIG_GENERIC_CLOCKEVENTS */
+ +static inline void tick_init(void) { }
+ +static inline void tick_cancel_sched_timer(int cpu) { }
+ +static inline void tick_clock_notify(void) { }
+ +static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
+ +static inline void tick_check_idle(void) { }
+ +static inline int tick_oneshot_mode_active(void) { return 0; }
+ +#endif /* !CONFIG_GENERIC_CLOCKEVENTS */
+ +
+ +# ifdef CONFIG_NO_HZ_COMMON
+ +DECLARE_PER_CPU(struct tick_sched, tick_cpu_sched);
+ +
+ +static inline int tick_nohz_tick_stopped(void)
+ +{
+ +	return __this_cpu_read(tick_cpu_sched.tick_stopped);
+ +}
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_GENERIC_CLOCKEVENTS_BROADCAST) && defined(CONFIG_TICK_ONESHOT)
++ extern void hotplug_cpu__broadcast_tick_pull(int dead_cpu);
++ #else
++ static inline void hotplug_cpu__broadcast_tick_pull(int dead_cpu) { }
++ #endif
++ 
++ #ifdef CONFIG_NO_HZ_COMMON
++ extern int tick_nohz_tick_stopped(void);
+++>>>>>>> 345527b1edce (clockevents: Fix cpu_down() race for hrtimer based broadcasting)
+  extern void tick_nohz_idle_enter(void);
+  extern void tick_nohz_idle_exit(void);
+  extern void tick_nohz_irq_exit(void);
+diff --cc kernel/cpu.c
+index 8fd14d71bd10,af5db20e5803..000000000000
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@@ -20,6 -20,8 +20,11 @@@
+  #include <linux/gfp.h>
+  #include <linux/suspend.h>
+  #include <linux/lockdep.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/tick.h>
++ #include <trace/events/power.h>
+++>>>>>>> 345527b1edce (clockevents: Fix cpu_down() race for hrtimer based broadcasting)
+  
+  #include "smpboot.h"
+  
+diff --cc kernel/time/tick-broadcast.c
+index 4d061d5a816c,f5e0fd5652dc..000000000000
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@@ -626,6 -654,47 +626,50 @@@ again
+  	raw_spin_unlock(&tick_broadcast_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
++ {
++ 	if (!(bc->features & CLOCK_EVT_FEAT_HRTIMER))
++ 		return 0;
++ 	if (bc->next_event.tv64 == KTIME_MAX)
++ 		return 0;
++ 	return bc->bound_on == cpu ? -EBUSY : 0;
++ }
++ 
++ static void broadcast_shutdown_local(struct clock_event_device *bc,
++ 				     struct clock_event_device *dev)
++ {
++ 	/*
++ 	 * For hrtimer based broadcasting we cannot shutdown the cpu
++ 	 * local device if our own event is the first one to expire or
++ 	 * if we own the broadcast timer.
++ 	 */
++ 	if (bc->features & CLOCK_EVT_FEAT_HRTIMER) {
++ 		if (broadcast_needs_cpu(bc, smp_processor_id()))
++ 			return;
++ 		if (dev->next_event.tv64 < bc->next_event.tv64)
++ 			return;
++ 	}
++ 	clockevents_set_state(dev, CLOCK_EVT_STATE_SHUTDOWN);
++ }
++ 
++ void hotplug_cpu__broadcast_tick_pull(int deadcpu)
++ {
++ 	struct clock_event_device *bc;
++ 	unsigned long flags;
++ 
++ 	raw_spin_lock_irqsave(&tick_broadcast_lock, flags);
++ 	bc = tick_broadcast_device.evtdev;
++ 
++ 	if (bc && broadcast_needs_cpu(bc, deadcpu)) {
++ 		/* This moves the broadcast assignment to this CPU: */
++ 		clockevents_program_event(bc, bc->next_event, 1);
++ 	}
++ 	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
++ }
++ 
+++>>>>>>> 345527b1edce (clockevents: Fix cpu_down() race for hrtimer based broadcasting)
+  /*
+   * Powerstate information: The system enters/leaves a state, where
+   * affected devices might stop
+* Unmerged path include/linux/tick.h
+* Unmerged path kernel/cpu.c
+* Unmerged path kernel/time/tick-broadcast.c
