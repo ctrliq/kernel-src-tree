@@ -1,0 +1,168 @@
+xprtrdma: Saving IRQs no longer needed for rb_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit a5b027e1897c811401862877d0ba4ca26fabc4da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a5b027e1.failed
+
+Now that RPC replies are processed in a workqueue, there's no need
+to disable IRQs when managing send and receive buffers. This saves
+noticeable overhead per RPC.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit a5b027e1897c811401862877d0ba4ca26fabc4da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 6115ededb593,baa0523476a4..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1327,44 -1062,26 +1327,64 @@@ rpcrdma_buffer_get_fmrs(struct rpcrdma_
+  struct rpcrdma_req *
+  rpcrdma_buffer_get(struct rpcrdma_buffer *buffers)
+  {
+ +	struct rpcrdma_ia *ia = rdmab_to_ia(buffers);
+ +	struct list_head stale;
+  	struct rpcrdma_req *req;
+- 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&buffers->rb_lock, flags);
+ +	if (buffers->rb_send_index == buffers->rb_max_requests) {
+ +		spin_unlock_irqrestore(&buffers->rb_lock, flags);
+ +		dprintk("RPC:       %s: out of request buffers\n", __func__);
+ +		return ((struct rpcrdma_req *)NULL);
+ +	}
+ +
+ +	req = buffers->rb_send_bufs[buffers->rb_send_index];
+ +	if (buffers->rb_send_index < buffers->rb_recv_index) {
+ +		dprintk("RPC:       %s: %d extra receives outstanding (ok)\n",
+ +			__func__,
+ +			buffers->rb_recv_index - buffers->rb_send_index);
+ +		req->rl_reply = NULL;
+ +	} else {
+ +		req->rl_reply = buffers->rb_recv_bufs[buffers->rb_recv_index];
+ +		buffers->rb_recv_bufs[buffers->rb_recv_index++] = NULL;
+ +	}
+ +	buffers->rb_send_bufs[buffers->rb_send_index++] = NULL;
+ +
+ +	INIT_LIST_HEAD(&stale);
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +		req = rpcrdma_buffer_get_frmrs(req, buffers, &stale);
+ +		break;
+ +	case RPCRDMA_MTHCAFMR:
+ +		req = rpcrdma_buffer_get_fmrs(req, buffers);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+ +	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+ +	if (!list_empty(&stale))
+ +		rpcrdma_retry_flushed_linv(&stale, buffers);
+++=======
++ 	spin_lock(&buffers->rb_lock);
++ 	if (list_empty(&buffers->rb_send_bufs))
++ 		goto out_reqbuf;
++ 	req = rpcrdma_buffer_get_req_locked(buffers);
++ 	if (list_empty(&buffers->rb_recv_bufs))
++ 		goto out_repbuf;
++ 	req->rl_reply = rpcrdma_buffer_get_rep_locked(buffers);
++ 	spin_unlock(&buffers->rb_lock);
++ 	return req;
++ 
++ out_reqbuf:
++ 	spin_unlock(&buffers->rb_lock);
++ 	pr_warn("RPC:       %s: out of request buffers\n", __func__);
++ 	return NULL;
++ out_repbuf:
++ 	spin_unlock(&buffers->rb_lock);
++ 	pr_warn("RPC:       %s: out of reply buffers\n", __func__);
++ 	req->rl_reply = NULL;
+++>>>>>>> a5b027e1897c (xprtrdma: Saving IRQs no longer needed for rb_lock)
+  	return req;
+  }
+  
+@@@ -1376,20 -1093,16 +1396,33 @@@ voi
+  rpcrdma_buffer_put(struct rpcrdma_req *req)
+  {
+  	struct rpcrdma_buffer *buffers = req->rl_buffer;
+++<<<<<<< HEAD
+ +	struct rpcrdma_ia *ia = rdmab_to_ia(buffers);
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&buffers->rb_lock, flags);
+ +	rpcrdma_buffer_put_sendbuf(req, buffers);
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +	case RPCRDMA_MTHCAFMR:
+ +		rpcrdma_buffer_put_mrs(req, buffers);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+ +	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+++=======
++ 	struct rpcrdma_rep *rep = req->rl_reply;
++ 
++ 	req->rl_niovs = 0;
++ 	req->rl_reply = NULL;
++ 
++ 	spin_lock(&buffers->rb_lock);
++ 	list_add_tail(&req->rl_free, &buffers->rb_send_bufs);
++ 	if (rep)
++ 		list_add_tail(&rep->rr_list, &buffers->rb_recv_bufs);
++ 	spin_unlock(&buffers->rb_lock);
+++>>>>>>> a5b027e1897c (xprtrdma: Saving IRQs no longer needed for rb_lock)
+  }
+  
+  /*
+@@@ -1401,14 -1113,11 +1434,20 @@@ voi
+  rpcrdma_recv_buffer_get(struct rpcrdma_req *req)
+  {
+  	struct rpcrdma_buffer *buffers = req->rl_buffer;
+- 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&buffers->rb_lock, flags);
+ +	if (buffers->rb_recv_index < buffers->rb_max_requests) {
+ +		req->rl_reply = buffers->rb_recv_bufs[buffers->rb_recv_index];
+ +		buffers->rb_recv_bufs[buffers->rb_recv_index++] = NULL;
+ +	}
+ +	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+++=======
++ 	spin_lock(&buffers->rb_lock);
++ 	if (!list_empty(&buffers->rb_recv_bufs))
++ 		req->rl_reply = rpcrdma_buffer_get_rep_locked(buffers);
++ 	spin_unlock(&buffers->rb_lock);
+++>>>>>>> a5b027e1897c (xprtrdma: Saving IRQs no longer needed for rb_lock)
+  }
+  
+  /*
+@@@ -1419,11 -1128,10 +1458,16 @@@ voi
+  rpcrdma_recv_buffer_put(struct rpcrdma_rep *rep)
+  {
+  	struct rpcrdma_buffer *buffers = &rep->rr_rxprt->rx_buf;
+- 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&buffers->rb_lock, flags);
+ +	buffers->rb_recv_bufs[--buffers->rb_recv_index] = rep;
+ +	spin_unlock_irqrestore(&buffers->rb_lock, flags);
+++=======
++ 	spin_lock(&buffers->rb_lock);
++ 	list_add_tail(&rep->rr_list, &buffers->rb_recv_bufs);
++ 	spin_unlock(&buffers->rb_lock);
+++>>>>>>> a5b027e1897c (xprtrdma: Saving IRQs no longer needed for rb_lock)
+  }
+  
+  /*
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
