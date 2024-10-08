@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, Mellanox Technologies. All rights reserved.
+ * Copyright (c) 2015-2016, Mellanox Technologies. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -29,6 +29,8 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+#ifndef __MLX5_EN_H__
+#define __MLX5_EN_H__
 
 #include <linux/if_vlan.h>
 #include <linux/etherdevice.h>
@@ -632,3 +634,5 @@ static inline int mlx5e_get_max_num_channels(struct mlx5_core_dev *mdev)
 
 extern const struct ethtool_ops mlx5e_ethtool_ops;
 u16 mlx5e_get_max_inline_cap(struct mlx5_core_dev *mdev);
+
+#endif /* __MLX5_EN_H__ */
