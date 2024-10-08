@@ -1,0 +1,211 @@
+cxgb4/cxgb4vf: global named must be unique
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Stephen Rothwell <sfr@canb.auug.org.au>
+commit dd0bcc0bc842e0d2c981102376d867c1a8bad320
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dd0bcc0b.failed
+
+	Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dd0bcc0bc842e0d2c981102376d867c1a8bad320)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 964362d43ed6,1645f59648f0..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -3805,6 -3809,22 +3805,25 @@@ u64 cxgb4_read_sge_timestamp(struct net
+  }
+  EXPORT_SYMBOL(cxgb4_read_sge_timestamp);
+  
+++<<<<<<< HEAD
+++=======
++ int cxgb4_bar2_sge_qregs(struct net_device *dev,
++ 			 unsigned int qid,
++ 			 enum cxgb4_bar2_qtype qtype,
++ 			 u64 *pbar2_qoffset,
++ 			 unsigned int *pbar2_qid)
++ {
++ 	return cxgb4_t4_bar2_sge_qregs(netdev2adap(dev),
++ 				 qid,
++ 				 (qtype == CXGB4_BAR2_QTYPE_EGRESS
++ 				  ? T4_BAR2_QTYPE_EGRESS
++ 				  : T4_BAR2_QTYPE_INGRESS),
++ 				 pbar2_qoffset,
++ 				 pbar2_qid);
++ }
++ EXPORT_SYMBOL(cxgb4_bar2_sge_qregs);
++ 
+++>>>>>>> dd0bcc0bc842 (cxgb4/cxgb4vf: global named must be unique)
+  static struct pci_driver cxgb4_driver;
+  
+  static void check_neigh_update(struct neighbour *neigh)
+@@@ -3987,31 -4007,18 +4006,42 @@@ static void process_db_drop(struct work
+  		u32 dropped_db = t4_read_reg(adap, 0x010ac);
+  		u16 qid = (dropped_db >> 15) & 0x1ffff;
+  		u16 pidx_inc = dropped_db & 0x1fff;
+ -		u64 bar2_qoffset;
+ -		unsigned int bar2_qid;
+ -		int ret;
+ +		unsigned int s_qpp;
+ +		unsigned short udb_density;
+ +		unsigned long qpshift;
+ +		int page;
+ +		u32 udb;
+  
+++<<<<<<< HEAD
+ +		dev_warn(adap->pdev_dev,
+ +			 "Dropped DB 0x%x qid %d bar2 %d coalesce %d pidx %d\n",
+ +			 dropped_db, qid,
+ +			 (dropped_db >> 14) & 1,
+ +			 (dropped_db >> 13) & 1,
+ +			 pidx_inc);
+ +
+ +		drain_db_fifo(adap, 1);
+ +
+ +		s_qpp = QUEUESPERPAGEPF1 * adap->fn;
+ +		udb_density = 1 << QUEUESPERPAGEPF0_GET(t4_read_reg(adap,
+ +				SGE_EGRESS_QUEUES_PER_PAGE_PF) >> s_qpp);
+ +		qpshift = PAGE_SHIFT - ilog2(udb_density);
+ +		udb = qid << qpshift;
+ +		udb &= PAGE_MASK;
+ +		page = udb / PAGE_SIZE;
+ +		udb += (qid - (page * udb_density)) * 128;
+ +
+ +		writel(PIDX(pidx_inc),  adap->bar2 + udb + 8);
+++=======
++ 		ret = cxgb4_t4_bar2_sge_qregs(adap, qid, T4_BAR2_QTYPE_EGRESS,
++ 					&bar2_qoffset, &bar2_qid);
++ 		if (ret)
++ 			dev_err(adap->pdev_dev, "doorbell drop recovery: "
++ 				"qid=%d, pidx_inc=%d\n", qid, pidx_inc);
++ 		else
++ 			writel(PIDX_T5(pidx_inc) | QID(bar2_qid),
++ 			       adap->bar2 + bar2_qoffset + SGE_UDB_KDOORBELL);
+++>>>>>>> dd0bcc0bc842 (cxgb4/cxgb4vf: global named must be unique)
+  
+  		/* Re-enable BAR2 WC */
+  		t4_set_reg_field(adap, 0x10b0, 1<<15, 1<<15);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index b5afc3f0dd91,ebf935a1e352..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -2235,48 -2250,32 +2235,55 @@@ static void sge_tx_timer_cb(unsigned lo
+  }
+  
+  /**
+ - *	bar2_address - return the BAR2 address for an SGE Queue's Registers
+ - *	@adapter: the adapter
+ - *	@qid: the SGE Queue ID
+ - *	@qtype: the SGE Queue Type (Egress or Ingress)
+ - *	@pbar2_qid: BAR2 Queue ID or 0 for Queue ID inferred SGE Queues
+ + *      udb_address - return the BAR2 User Doorbell address for a Queue
+ + *      @adap: the adapter
+ + *      @cntxt_id: the Queue Context ID
+ + *      @qpp: Queues Per Page (for all PFs)
+   *
+ - *	Returns the BAR2 address for the SGE Queue Registers associated with
+ - *	@qid.  If BAR2 SGE Registers aren't available, returns NULL.  Also
+ - *	returns the BAR2 Queue ID to be used with writes to the BAR2 SGE
+ - *	Queue Registers.  If the BAR2 Queue ID is 0, then "Inferred Queue ID"
+ - *	Registers are supported (e.g. the Write Combining Doorbell Buffer).
+ - */
+ -static void __iomem *bar2_address(struct adapter *adapter,
+ -				  unsigned int qid,
+ -				  enum t4_bar2_qtype qtype,
+ -				  unsigned int *pbar2_qid)
+ -{
+ -	u64 bar2_qoffset;
+ -	int ret;
+ -
+ + *      Returns the BAR2 address of the user Doorbell associated with the
+ + *      indicated Queue Context ID.  Note that this is only applicable
+ + *      for T5 and later.
+ + */
+ +static u64 udb_address(struct adapter *adap, unsigned int cntxt_id,
+ +		       unsigned int qpp)
+ +{
+ +	u64 udb;
+ +	unsigned int s_qpp;
+ +	unsigned short udb_density;
+ +	unsigned long qpshift;
+ +	int page;
+ +
+++<<<<<<< HEAD
+ +	BUG_ON(is_t4(adap->params.chip));
+++=======
++ 	ret = cxgb4_t4_bar2_sge_qregs(adapter, qid, qtype,
++ 				&bar2_qoffset, pbar2_qid);
++ 	if (ret)
++ 		return NULL;
+++>>>>>>> dd0bcc0bc842 (cxgb4/cxgb4vf: global named must be unique)
+  
+ -	return adapter->bar2 + bar2_qoffset;
+ +	s_qpp = (QUEUESPERPAGEPF0 +
+ +		(QUEUESPERPAGEPF1 - QUEUESPERPAGEPF0) * adap->fn);
+ +	udb_density = 1 << ((qpp >> s_qpp) & QUEUESPERPAGEPF0_MASK);
+ +	qpshift = PAGE_SHIFT - ilog2(udb_density);
+ +	udb = cntxt_id << qpshift;
+ +	udb &= PAGE_MASK;
+ +	page = udb / PAGE_SIZE;
+ +	udb += (cntxt_id - (page * udb_density)) * SGE_UDB_SIZE;
+ +
+ +	return udb;
+ +}
+ +
+ +static u64 udb_address_eq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_EGRESS_QUEUES_PER_PAGE_PF));
+ +}
+ +
+ +static u64 udb_address_iq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_INGRESS_QUEUES_PER_PAGE_PF));
+  }
+  
+  int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index e01f9954d513..1bdd63b95882 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -996,7 +996,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
+ int t4_prep_adapter(struct adapter *adapter);
+ 
+ enum t4_bar2_qtype { T4_BAR2_QTYPE_EGRESS, T4_BAR2_QTYPE_INGRESS };
+-int t4_bar2_sge_qregs(struct adapter *adapter,
++int cxgb4_t4_bar2_sge_qregs(struct adapter *adapter,
+ 		      unsigned int qid,
+ 		      enum t4_bar2_qtype qtype,
+ 		      u64 *pbar2_qoffset,
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 9630bec07b66..387e41d77850 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -3971,7 +3971,7 @@ int t4_prep_adapter(struct adapter *adapter)
+ }
+ 
+ /**
+- *	t4_bar2_sge_qregs - return BAR2 SGE Queue register information
++ *	cxgb4_t4_bar2_sge_qregs - return BAR2 SGE Queue register information
+  *	@adapter: the adapter
+  *	@qid: the Queue ID
+  *	@qtype: the Ingress or Egress type for @qid
+@@ -3995,7 +3995,7 @@ int t4_prep_adapter(struct adapter *adapter)
+  *	Write Combining Doorbell Buffer. If the BAR2 Queue ID is not 0,
+  *	then these "Inferred Queue ID" register may not be used.
+  */
+-int t4_bar2_sge_qregs(struct adapter *adapter,
++int cxgb4_t4_bar2_sge_qregs(struct adapter *adapter,
+ 		      unsigned int qid,
+ 		      enum t4_bar2_qtype qtype,
+ 		      u64 *pbar2_qoffset,
