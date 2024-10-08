@@ -1,0 +1,200 @@
+perf hists: Fix dynamic entry display in hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit e049d4a3fa194c8aa0d3ca29a9b11b32387ca6e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e049d4a3.failed
+
+When dynamic sort key is used it might not show pretty printed output.
+This is because the trace output was not set only for the first dynamic
+sort key.  During hierarchy_insert_entry() it missed to pass the
+trace_output to dynamic entries.  Also even if it did, only first entry
+will have it.  Subsequent entries might set it during collapsing stage
+but it's not guaranteed.
+
+Before:
+
+  $ perf report --hierarchy --stdio -s ptr,bytes_req,gfp_flags -g none
+  #
+  #       Overhead  ptr / bytes_req / gfp_flags
+  # ..............  ..........................................
+  #
+      37.50%        0xffff8803f7669400
+         37.50%        448
+            37.50%        66080
+      10.42%        0xffff8803f766be00
+          8.33%        96
+             8.33%        66080
+          2.08%        512
+             2.08%        67280
+
+After:
+
+  #
+  #       Overhead  ptr / bytes_req / gfp_flags
+  # ..............  ..........................................
+  #
+      37.50%        0xffff8803f7669400
+         37.50%        448
+            37.50%        GFP_ATOMIC|GFP_NOWARN|GFP_NOMEMALLOC
+      10.42%        0xffff8803f766be00
+          8.33%        96
+             8.33%        GFP_ATOMIC|GFP_NOWARN|GFP_NOMEMALLOC
+          2.08%        512
+             2.08%        GFP_KERNEL|GFP_NOWARN|GFP_REPEAT|GFP
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456512767-1164-4-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit e049d4a3fa194c8aa0d3ca29a9b11b32387ca6e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.c
+diff --cc tools/perf/util/hist.c
+index 9a525a5b649f,9b3f582867d6..000000000000
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@@ -1039,6 -1086,114 +1039,117 @@@ void hist_entry__delete(struct hist_ent
+   * collapse the histogram
+   */
+  
+++<<<<<<< HEAD
+++=======
++ static void hists__apply_filters(struct hists *hists, struct hist_entry *he);
++ 
++ static struct hist_entry *hierarchy_insert_entry(struct hists *hists,
++ 						 struct rb_root *root,
++ 						 struct hist_entry *he,
++ 						 struct perf_hpp_fmt *fmt)
++ {
++ 	struct rb_node **p = &root->rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct hist_entry *iter, *new;
++ 	int64_t cmp;
++ 
++ 	while (*p != NULL) {
++ 		parent = *p;
++ 		iter = rb_entry(parent, struct hist_entry, rb_node_in);
++ 
++ 		cmp = fmt->collapse(fmt, iter, he);
++ 		if (!cmp) {
++ 			he_stat__add_stat(&iter->stat, &he->stat);
++ 			return iter;
++ 		}
++ 
++ 		if (cmp < 0)
++ 			p = &parent->rb_left;
++ 		else
++ 			p = &parent->rb_right;
++ 	}
++ 
++ 	new = hist_entry__new(he, true);
++ 	if (new == NULL)
++ 		return NULL;
++ 
++ 	hists__apply_filters(hists, new);
++ 	hists->nr_entries++;
++ 
++ 	/* save related format for output */
++ 	new->fmt = fmt;
++ 
++ 	/* some fields are now passed to 'new' */
++ 	if (perf_hpp__is_trace_entry(fmt) || perf_hpp__is_dynamic_entry(fmt))
++ 		he->trace_output = NULL;
++ 	else
++ 		new->trace_output = NULL;
++ 
++ 	if (perf_hpp__is_srcline_entry(fmt))
++ 		he->srcline = NULL;
++ 	else
++ 		new->srcline = NULL;
++ 
++ 	if (perf_hpp__is_srcfile_entry(fmt))
++ 		he->srcfile = NULL;
++ 	else
++ 		new->srcfile = NULL;
++ 
++ 	rb_link_node(&new->rb_node_in, parent, p);
++ 	rb_insert_color(&new->rb_node_in, root);
++ 	return new;
++ }
++ 
++ static int hists__hierarchy_insert_entry(struct hists *hists,
++ 					 struct rb_root *root,
++ 					 struct hist_entry *he)
++ {
++ 	struct perf_hpp_fmt *fmt;
++ 	struct hist_entry *new_he = NULL;
++ 	struct hist_entry *parent = NULL;
++ 	int depth = 0;
++ 	int ret = 0;
++ 
++ 	hists__for_each_sort_list(hists, fmt) {
++ 		if (!perf_hpp__is_sort_entry(fmt) &&
++ 		    !perf_hpp__is_dynamic_entry(fmt))
++ 			continue;
++ 		if (perf_hpp__should_skip(fmt, hists))
++ 			continue;
++ 
++ 		/* insert copy of 'he' for each fmt into the hierarchy */
++ 		new_he = hierarchy_insert_entry(hists, root, he, fmt);
++ 		if (new_he == NULL) {
++ 			ret = -1;
++ 			break;
++ 		}
++ 
++ 		root = &new_he->hroot_in;
++ 		new_he->parent_he = parent;
++ 		new_he->depth = depth++;
++ 		parent = new_he;
++ 	}
++ 
++ 	if (new_he) {
++ 		new_he->leaf = true;
++ 
++ 		if (symbol_conf.use_callchain) {
++ 			callchain_cursor_reset(&callchain_cursor);
++ 			if (callchain_merge(&callchain_cursor,
++ 					    new_he->callchain,
++ 					    he->callchain) < 0)
++ 				ret = -1;
++ 		}
++ 	}
++ 
++ 	/* 'he' is no longer used */
++ 	hist_entry__delete(he);
++ 
++ 	/* return 0 (or -1) since it already applied filters */
++ 	return ret;
++ }
++ 
+++>>>>>>> e049d4a3fa19 (perf hists: Fix dynamic entry display in hierarchy)
+  int hists__collapse_insert_entry(struct hists *hists, struct rb_root *root,
+  				 struct hist_entry *he)
+  {
+* Unmerged path tools/perf/util/hist.c
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index 8f36c1d6fd38..b0eaa6961efa 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -1639,6 +1639,9 @@ static int __sort__hde_entry(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
+ 	if (hists_to_evsel(he->hists) != hde->evsel)
+ 		return scnprintf(hpp->buf, hpp->size, "%*.*s", len, len, "N/A");
+ 
++	if (!he->trace_output)
++		he->trace_output = get_trace_output(he);
++
+ 	field = hde->field;
+ 
+ 	namelen = strlen(field->name);
