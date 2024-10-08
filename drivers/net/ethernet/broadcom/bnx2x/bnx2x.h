@@ -2338,12 +2338,6 @@ enum {
 
 #define NUM_MACS	8
 
-enum bnx2x_pci_bus_speed {
-	BNX2X_PCI_LINK_SPEED_2500 = 2500,
-	BNX2X_PCI_LINK_SPEED_5000 = 5000,
-	BNX2X_PCI_LINK_SPEED_8000 = 8000
-};
-
 void bnx2x_set_local_cmng(struct bnx2x *bp);
 
 #define MCPR_SCRATCH_BASE(bp) \
