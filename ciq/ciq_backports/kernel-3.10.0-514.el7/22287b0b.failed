@@ -1,0 +1,747 @@
+crypto: akcipher - Changes to asymmetric key API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tadeusz Struk <tadeusz.struk@intel.com>
+commit 22287b0b5988b603b5f0daa282c89aaf2b877313
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/22287b0b.failed
+
+Setkey function has been split into set_priv_key and set_pub_key.
+Akcipher requests takes sgl for src and dst instead of void *.
+Users of the API i.e. two existing RSA implementation and
+test mgr code have been updated accordingly.
+
+	Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 22287b0b5988b603b5f0daa282c89aaf2b877313)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_common/Makefile
+#	drivers/crypto/qat/qat_common/qat_asym_algs.c
+diff --cc drivers/crypto/qat/qat_common/Makefile
+index e0424dc382fe,9e9e196c6d51..000000000000
+--- a/drivers/crypto/qat/qat_common/Makefile
++++ b/drivers/crypto/qat/qat_common/Makefile
+@@@ -1,3 -1,11 +1,14 @@@
+++<<<<<<< HEAD
+++=======
++ $(obj)/qat_rsapubkey-asn1.o: $(obj)/qat_rsapubkey-asn1.c \
++ 			     $(obj)/qat_rsapubkey-asn1.h
++ $(obj)/qat_rsaprivkey-asn1.o: $(obj)/qat_rsaprivkey-asn1.c \
++ 			      $(obj)/qat_rsaprivkey-asn1.h
++ 
++ clean-files += qat_rsapubkey-asn1.c qat_rsapubkey-asn1.h
++ clean-files += qat_rsaprivkey-asn1.c qat_rsapvivkey-asn1.h
++ 
+++>>>>>>> 22287b0b5988 (crypto: akcipher - Changes to asymmetric key API)
+  obj-$(CONFIG_CRYPTO_DEV_QAT) += intel_qat.o
+  intel_qat-objs := adf_cfg.o \
+  	adf_ctl_drv.o \
+@@@ -6,8 -14,13 +17,14 @@@
+  	adf_accel_engine.o \
+  	adf_aer.o \
+  	adf_transport.o \
+ -	adf_admin.o \
+ -	adf_hw_arbiter.o \
+  	qat_crypto.o \
+  	qat_algs.o \
+++<<<<<<< HEAD
+++=======
++ 	qat_rsapubkey-asn1.o \
++ 	qat_rsaprivkey-asn1.o \
++ 	qat_asym_algs.o \
+++>>>>>>> 22287b0b5988 (crypto: akcipher - Changes to asymmetric key API)
+  	qat_uclo.o \
+  	qat_hal.o
+  
+* Unmerged path drivers/crypto/qat/qat_common/qat_asym_algs.c
+diff --git a/crypto/Makefile b/crypto/Makefile
+index ba2999788c9a..bd50196cc5b2 100644
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -29,10 +29,13 @@ obj-$(CONFIG_CRYPTO_HASH2) += crypto_hash.o
+ obj-$(CONFIG_CRYPTO_PCOMP2) += pcompress.o
+ obj-$(CONFIG_CRYPTO_AKCIPHER2) += akcipher.o
+ 
+-$(obj)/rsakey-asn1.o: $(obj)/rsakey-asn1.c $(obj)/rsakey-asn1.h
+-clean-files += rsakey-asn1.c rsakey-asn1.h
++$(obj)/rsapubkey-asn1.o: $(obj)/rsapubkey-asn1.c $(obj)/rsapubkey-asn1.h
++$(obj)/rsaprivkey-asn1.o: $(obj)/rsaprivkey-asn1.c $(obj)/rsaprivkey-asn1.h
++clean-files += rsapubkey-asn1.c rsapubkey-asn1.h
++clean-files += rsaprivkey-asn1.c rsaprivkey-asn1.h
+ 
+-rsa_generic-y := rsakey-asn1.o
++rsa_generic-y := rsapubkey-asn1.o
++rsa_generic-y += rsaprivkey-asn1.o
+ rsa_generic-y += rsa.o
+ rsa_generic-y += rsa_helper.o
+ rsa_generic-y += rsa-pkcs1pad.o
+diff --git a/crypto/rsa.c b/crypto/rsa.c
+index 59e90d43ff6e..16dc0d1acf76 100644
+--- a/crypto/rsa.c
++++ b/crypto/rsa.c
+@@ -98,24 +98,21 @@ static int rsa_enc(struct akcipher_request *req)
+ 		goto err_free_c;
+ 	}
+ 
+-	m = mpi_read_raw_data(req->src, req->src_len);
+-	if (!m) {
+-		ret = -ENOMEM;
++	ret = -ENOMEM;
++	m = mpi_read_raw_from_sgl(req->src, req->src_len);
++	if (!m)
+ 		goto err_free_c;
+-	}
+ 
+ 	ret = _rsa_enc(pkey, c, m);
+ 	if (ret)
+ 		goto err_free_m;
+ 
+-	ret = mpi_read_buffer(c, req->dst, req->dst_len, &req->dst_len, &sign);
++	ret = mpi_write_to_sgl(c, req->dst, &req->dst_len, &sign);
+ 	if (ret)
+ 		goto err_free_m;
+ 
+-	if (sign < 0) {
++	if (sign < 0)
+ 		ret = -EBADMSG;
+-		goto err_free_m;
+-	}
+ 
+ err_free_m:
+ 	mpi_free(m);
+@@ -146,25 +143,21 @@ static int rsa_dec(struct akcipher_request *req)
+ 		goto err_free_m;
+ 	}
+ 
+-	c = mpi_read_raw_data(req->src, req->src_len);
+-	if (!c) {
+-		ret = -ENOMEM;
++	ret = -ENOMEM;
++	c = mpi_read_raw_from_sgl(req->src, req->src_len);
++	if (!c)
+ 		goto err_free_m;
+-	}
+ 
+ 	ret = _rsa_dec(pkey, m, c);
+ 	if (ret)
+ 		goto err_free_c;
+ 
+-	ret = mpi_read_buffer(m, req->dst, req->dst_len, &req->dst_len, &sign);
++	ret = mpi_write_to_sgl(m, req->dst, &req->dst_len, &sign);
+ 	if (ret)
+ 		goto err_free_c;
+ 
+-	if (sign < 0) {
++	if (sign < 0)
+ 		ret = -EBADMSG;
+-		goto err_free_c;
+-	}
+-
+ err_free_c:
+ 	mpi_free(c);
+ err_free_m:
+@@ -194,24 +187,21 @@ static int rsa_sign(struct akcipher_request *req)
+ 		goto err_free_s;
+ 	}
+ 
+-	m = mpi_read_raw_data(req->src, req->src_len);
+-	if (!m) {
+-		ret = -ENOMEM;
++	ret = -ENOMEM;
++	m = mpi_read_raw_from_sgl(req->src, req->src_len);
++	if (!m)
+ 		goto err_free_s;
+-	}
+ 
+ 	ret = _rsa_sign(pkey, s, m);
+ 	if (ret)
+ 		goto err_free_m;
+ 
+-	ret = mpi_read_buffer(s, req->dst, req->dst_len, &req->dst_len, &sign);
++	ret = mpi_write_to_sgl(s, req->dst, &req->dst_len, &sign);
+ 	if (ret)
+ 		goto err_free_m;
+ 
+-	if (sign < 0) {
++	if (sign < 0)
+ 		ret = -EBADMSG;
+-		goto err_free_m;
+-	}
+ 
+ err_free_m:
+ 	mpi_free(m);
+@@ -242,7 +232,8 @@ static int rsa_verify(struct akcipher_request *req)
+ 		goto err_free_m;
+ 	}
+ 
+-	s = mpi_read_raw_data(req->src, req->src_len);
++	ret = -ENOMEM;
++	s = mpi_read_raw_from_sgl(req->src, req->src_len);
+ 	if (!s) {
+ 		ret = -ENOMEM;
+ 		goto err_free_m;
+@@ -252,14 +243,12 @@ static int rsa_verify(struct akcipher_request *req)
+ 	if (ret)
+ 		goto err_free_s;
+ 
+-	ret = mpi_read_buffer(m, req->dst, req->dst_len, &req->dst_len, &sign);
++	ret = mpi_write_to_sgl(m, req->dst, &req->dst_len, &sign);
+ 	if (ret)
+ 		goto err_free_s;
+ 
+-	if (sign < 0) {
++	if (sign < 0)
+ 		ret = -EBADMSG;
+-		goto err_free_s;
+-	}
+ 
+ err_free_s:
+ 	mpi_free(s);
+@@ -283,13 +272,13 @@ static int rsa_check_key_length(unsigned int len)
+ 	return -EINVAL;
+ }
+ 
+-static int rsa_setkey(struct crypto_akcipher *tfm, const void *key,
+-		      unsigned int keylen)
++static int rsa_set_pub_key(struct crypto_akcipher *tfm, const void *key,
++			   unsigned int keylen)
+ {
+ 	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+ 	int ret;
+ 
+-	ret = rsa_parse_key(pkey, key, keylen);
++	ret = rsa_parse_pub_key(pkey, key, keylen);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -300,6 +289,30 @@ static int rsa_setkey(struct crypto_akcipher *tfm, const void *key,
+ 	return ret;
+ }
+ 
++static int rsa_set_priv_key(struct crypto_akcipher *tfm, const void *key,
++			    unsigned int keylen)
++{
++	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
++	int ret;
++
++	ret = rsa_parse_priv_key(pkey, key, keylen);
++	if (ret)
++		return ret;
++
++	if (rsa_check_key_length(mpi_get_size(pkey->n) << 3)) {
++		rsa_free_key(pkey);
++		ret = -EINVAL;
++	}
++	return ret;
++}
++
++static int rsa_max_size(struct crypto_akcipher *tfm)
++{
++	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
++
++	return pkey->n ? mpi_get_size(pkey->n) : -EINVAL;
++}
++
+ static void rsa_exit_tfm(struct crypto_akcipher *tfm)
+ {
+ 	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+@@ -312,7 +325,9 @@ static struct akcipher_alg rsa = {
+ 	.decrypt = rsa_dec,
+ 	.sign = rsa_sign,
+ 	.verify = rsa_verify,
+-	.setkey = rsa_setkey,
++	.set_priv_key = rsa_set_priv_key,
++	.set_pub_key = rsa_set_pub_key,
++	.max_size = rsa_max_size,
+ 	.exit = rsa_exit_tfm,
+ 	.base = {
+ 		.cra_name = "rsa",
+diff --git a/crypto/rsa_helper.c b/crypto/rsa_helper.c
+index 3e8e0a9e5a8e..e8fccd3be61a 100644
+--- a/crypto/rsa_helper.c
++++ b/crypto/rsa_helper.c
+@@ -15,7 +15,8 @@
+ #include <linux/err.h>
+ #include <linux/fips.h>
+ #include <crypto/internal/rsa.h>
+-#include "rsakey-asn1.h"
++#include "rsapubkey-asn1.h"
++#include "rsaprivkey-asn1.h"
+ 
+ int rsa_get_n(void *context, size_t hdrlen, unsigned char tag,
+ 	      const void *value, size_t vlen)
+@@ -94,8 +95,8 @@ void rsa_free_key(struct rsa_key *key)
+ EXPORT_SYMBOL_GPL(rsa_free_key);
+ 
+ /**
+- * rsa_parse_key() - extracts an rsa key from BER encoded buffer
+- *		     and stores it in the provided struct rsa_key
++ * rsa_parse_pub_key() - extracts an rsa public key from BER encoded buffer
++ *			 and stores it in the provided struct rsa_key
+  *
+  * @rsa_key:	struct rsa_key key representation
+  * @key:	key in BER format
+@@ -103,13 +104,13 @@ EXPORT_SYMBOL_GPL(rsa_free_key);
+  *
+  * Return:	0 on success or error code in case of error
+  */
+-int rsa_parse_key(struct rsa_key *rsa_key, const void *key,
+-		  unsigned int key_len)
++int rsa_parse_pub_key(struct rsa_key *rsa_key, const void *key,
++		      unsigned int key_len)
+ {
+ 	int ret;
+ 
+ 	free_mpis(rsa_key);
+-	ret = asn1_ber_decoder(&rsakey_decoder, rsa_key, key, key_len);
++	ret = asn1_ber_decoder(&rsapubkey_decoder, rsa_key, key, key_len);
+ 	if (ret < 0)
+ 		goto error;
+ 
+@@ -118,4 +119,31 @@ error:
+ 	free_mpis(rsa_key);
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(rsa_parse_key);
++EXPORT_SYMBOL_GPL(rsa_parse_pub_key);
++
++/**
++ * rsa_parse_pub_key() - extracts an rsa private key from BER encoded buffer
++ *			 and stores it in the provided struct rsa_key
++ *
++ * @rsa_key:	struct rsa_key key representation
++ * @key:	key in BER format
++ * @key_len:	length of key
++ *
++ * Return:	0 on success or error code in case of error
++ */
++int rsa_parse_priv_key(struct rsa_key *rsa_key, const void *key,
++		       unsigned int key_len)
++{
++	int ret;
++
++	free_mpis(rsa_key);
++	ret = asn1_ber_decoder(&rsaprivkey_decoder, rsa_key, key, key_len);
++	if (ret < 0)
++		goto error;
++
++	return 0;
++error:
++	free_mpis(rsa_key);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(rsa_parse_priv_key);
+diff --git a/crypto/rsakey.asn1 b/crypto/rsakey.asn1
+deleted file mode 100644
+index 3c7b5df7b428..000000000000
+--- a/crypto/rsakey.asn1
++++ /dev/null
+@@ -1,5 +0,0 @@
+-RsaKey ::= SEQUENCE {
+-	n INTEGER ({ rsa_get_n }),
+-	e INTEGER ({ rsa_get_e }),
+-	d INTEGER ({ rsa_get_d })
+-}
+diff --git a/crypto/rsaprivkey.asn1 b/crypto/rsaprivkey.asn1
+new file mode 100644
+index 000000000000..731aea5edb0c
+--- /dev/null
++++ b/crypto/rsaprivkey.asn1
+@@ -0,0 +1,11 @@
++RsaPrivKey ::= SEQUENCE {
++	version		INTEGER,
++	n		INTEGER ({ rsa_get_n }),
++	e		INTEGER ({ rsa_get_e }),
++	d		INTEGER ({ rsa_get_d }),
++	prime1		INTEGER,
++	prime2		INTEGER,
++	exponent1	INTEGER,
++	exponent2	INTEGER,
++	coefficient	INTEGER
++}
+diff --git a/crypto/rsapubkey.asn1 b/crypto/rsapubkey.asn1
+new file mode 100644
+index 000000000000..725498e461d2
+--- /dev/null
++++ b/crypto/rsapubkey.asn1
+@@ -0,0 +1,4 @@
++RsaPubKey ::= SEQUENCE {
++	n INTEGER ({ rsa_get_n }),
++	e INTEGER ({ rsa_get_e })
++}
+diff --git a/crypto/testmgr.c b/crypto/testmgr.c
+index 5e4cc3e054b1..c038c50a4e08 100644
+--- a/crypto/testmgr.c
++++ b/crypto/testmgr.c
+@@ -1738,34 +1738,34 @@ static int do_test_rsa(struct crypto_akcipher *tfm,
+ 	struct tcrypt_result result;
+ 	unsigned int out_len_max, out_len = 0;
+ 	int err = -ENOMEM;
++	struct scatterlist src, dst, src_tab[2];
+ 
+ 	req = akcipher_request_alloc(tfm, GFP_KERNEL);
+ 	if (!req)
+ 		return err;
+ 
+ 	init_completion(&result.completion);
+-	err = crypto_akcipher_setkey(tfm, vecs->key, vecs->key_len);
+-	if (err)
+-		goto free_req;
+ 
+-	akcipher_request_set_crypt(req, vecs->m, outbuf_enc, vecs->m_size,
+-				   out_len);
+-	/* expect this to fail, and update the required buf len */
+-	crypto_akcipher_encrypt(req);
+-	out_len = req->dst_len;
+-	if (!out_len) {
+-		err = -EINVAL;
++	if (vecs->public_key_vec)
++		err = crypto_akcipher_set_pub_key(tfm, vecs->key,
++						  vecs->key_len);
++	else
++		err = crypto_akcipher_set_priv_key(tfm, vecs->key,
++						   vecs->key_len);
++	if (err)
+ 		goto free_req;
+-	}
+ 
+-	out_len_max = out_len;
+-	err = -ENOMEM;
++	out_len_max = crypto_akcipher_maxsize(tfm);
+ 	outbuf_enc = kzalloc(out_len_max, GFP_KERNEL);
+ 	if (!outbuf_enc)
+ 		goto free_req;
+ 
+-	akcipher_request_set_crypt(req, vecs->m, outbuf_enc, vecs->m_size,
+-				   out_len);
++	sg_init_table(src_tab, 2);
++	sg_set_buf(&src_tab[0], vecs->m, 8);
++	sg_set_buf(&src_tab[1], vecs->m + 8, vecs->m_size - 8);
++	sg_init_one(&dst, outbuf_enc, out_len_max);
++	akcipher_request_set_crypt(req, src_tab, &dst, vecs->m_size,
++				   out_len_max);
+ 	akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+ 				      tcrypt_complete, &result);
+ 
+@@ -1775,13 +1775,13 @@ static int do_test_rsa(struct crypto_akcipher *tfm,
+ 		pr_err("alg: rsa: encrypt test failed. err %d\n", err);
+ 		goto free_all;
+ 	}
+-	if (out_len != vecs->c_size) {
++	if (req->dst_len != vecs->c_size) {
+ 		pr_err("alg: rsa: encrypt test failed. Invalid output len\n");
+ 		err = -EINVAL;
+ 		goto free_all;
+ 	}
+ 	/* verify that encrypted message is equal to expected */
+-	if (memcmp(vecs->c, outbuf_enc, vecs->c_size)) {
++	if (memcmp(vecs->c, sg_virt(req->dst), vecs->c_size)) {
+ 		pr_err("alg: rsa: encrypt test failed. Invalid output\n");
+ 		err = -EINVAL;
+ 		goto free_all;
+@@ -1796,9 +1796,10 @@ static int do_test_rsa(struct crypto_akcipher *tfm,
+ 		err = -ENOMEM;
+ 		goto free_all;
+ 	}
++	sg_init_one(&src, vecs->c, vecs->c_size);
++	sg_init_one(&dst, outbuf_dec, out_len_max);
+ 	init_completion(&result.completion);
+-	akcipher_request_set_crypt(req, outbuf_enc, outbuf_dec, vecs->c_size,
+-				   out_len);
++	akcipher_request_set_crypt(req, &src, &dst, vecs->c_size, out_len_max);
+ 
+ 	/* Run RSA decrypt - m = c^d mod n;*/
+ 	err = wait_async_op(&result, crypto_akcipher_decrypt(req));
+diff --git a/crypto/testmgr.h b/crypto/testmgr.h
+index 77149cbe5f69..d0d747df26bf 100644
+--- a/crypto/testmgr.h
++++ b/crypto/testmgr.h
+@@ -131,7 +131,8 @@ static struct akcipher_testvec rsa_tv_template[] = {
+ 	{
+ #ifndef CONFIG_CRYPTO_FIPS
+ 	.key =
+-	"\x30\x81\x88" /* sequence of 136 bytes */
++	"\x30\x81\x9A" /* sequence of 154 bytes */
++	"\x02\x01\x01" /* version - integer of 1 byte */
+ 	"\x02\x41" /* modulus - integer of 65 bytes */
+ 	"\x00\xAA\x36\xAB\xCE\x88\xAC\xFD\xFF\x55\x52\x3C\x7F\xC4\x52\x3F"
+ 	"\x90\xEF\xA0\x0D\xF3\x77\x4A\x25\x9F\x2E\x62\xB4\xC5\xD9\x9C\xB5"
+@@ -143,19 +144,25 @@ static struct akcipher_testvec rsa_tv_template[] = {
+ 	"\x0A\x03\x37\x48\x62\x64\x87\x69\x5F\x5F\x30\xBC\x38\xB9\x8B\x44"
+ 	"\xC2\xCD\x2D\xFF\x43\x40\x98\xCD\x20\xD8\xA1\x38\xD0\x90\xBF\x64"
+ 	"\x79\x7C\x3F\xA7\xA2\xCD\xCB\x3C\xD1\xE0\xBD\xBA\x26\x54\xB4\xF9"
+-	"\xDF\x8E\x8A\xE5\x9D\x73\x3D\x9F\x33\xB3\x01\x62\x4A\xFD\x1D\x51",
++	"\xDF\x8E\x8A\xE5\x9D\x73\x3D\x9F\x33\xB3\x01\x62\x4A\xFD\x1D\x51"
++	"\x02\x01\x00" /* prime1 - integer of 1 byte */
++	"\x02\x01\x00" /* prime2 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent1 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent2 - integer of 1 byte */
++	"\x02\x01\x00", /* coefficient - integer of 1 byte */
+ 	.m = "\x54\x85\x9b\x34\x2c\x49\xea\x2a",
+ 	.c =
+ 	"\x63\x1c\xcd\x7b\xe1\x7e\xe4\xde\xc9\xa8\x89\xa1\x74\xcb\x3c\x63"
+ 	"\x7d\x24\xec\x83\xc3\x15\xe4\x7f\x73\x05\x34\xd1\xec\x22\xbb\x8a"
+ 	"\x5e\x32\x39\x6d\xc1\x1d\x7d\x50\x3b\x9f\x7a\xad\xf0\x2e\x25\x53"
+ 	"\x9f\x6e\xbd\x4c\x55\x84\x0c\x9b\xcf\x1a\x4b\x51\x1e\x9e\x0c\x06",
+-	.key_len = 139,
++	.key_len = 157,
+ 	.m_size = 8,
+ 	.c_size = 64,
+ 	}, {
+ 	.key =
+-	"\x30\x82\x01\x0B" /* sequence of 267 bytes */
++	"\x30\x82\x01\x1D" /* sequence of 285 bytes */
++	"\x02\x01\x01" /* version - integer of 1 byte */
+ 	"\x02\x81\x81" /* modulus - integer of 129 bytes */
+ 	"\x00\xBB\xF8\x2F\x09\x06\x82\xCE\x9C\x23\x38\xAC\x2B\x9D\xA8\x71"
+ 	"\xF7\x36\x8D\x07\xEE\xD4\x10\x43\xA4\x40\xD6\xB6\xF0\x74\x54\xF5"
+@@ -176,8 +183,13 @@ static struct akcipher_testvec rsa_tv_template[] = {
+ 	"\x44\xE5\x6A\xAF\x68\xC5\x6C\x09\x2C\xD3\x8D\xC3\xBE\xF5\xD2\x0A"
+ 	"\x93\x99\x26\xED\x4F\x74\xA1\x3E\xDD\xFB\xE1\xA1\xCE\xCC\x48\x94"
+ 	"\xAF\x94\x28\xC2\xB7\xB8\x88\x3F\xE4\x46\x3A\x4B\xC8\x5B\x1C\xB3"
+-	"\xC1",
+-	.key_len = 271,
++	"\xC1"
++	"\x02\x01\x00" /* prime1 - integer of 1 byte */
++	"\x02\x01\x00" /* prime2 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent1 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent2 - integer of 1 byte */
++	"\x02\x01\x00", /* coefficient - integer of 1 byte */
++	.key_len = 289,
+ 	.m = "\x54\x85\x9b\x34\x2c\x49\xea\x2a",
+ 	.c =
+ 	"\x74\x1b\x55\xac\x47\xb5\x08\x0a\x6e\x2b\x2d\xf7\x94\xb8\x8a\x95"
+@@ -193,7 +205,8 @@ static struct akcipher_testvec rsa_tv_template[] = {
+ 	}, {
+ #endif
+ 	.key =
+-	"\x30\x82\x02\x0D" /* sequence of 525 bytes */
++	"\x30\x82\x02\x1F" /* sequence of 543 bytes */
++	"\x02\x01\x01" /* version - integer of 1 byte */
+ 	"\x02\x82\x01\x00" /* modulus - integer of 256 bytes */
+ 	"\xDB\x10\x1A\xC2\xA3\xF1\xDC\xFF\x13\x6B\xED\x44\xDF\xF0\x02\x6D"
+ 	"\x13\xC7\x88\xDA\x70\x6B\x54\xF1\xE8\x27\xDC\xC3\x0F\x99\x6A\xFA"
+@@ -228,8 +241,13 @@ static struct akcipher_testvec rsa_tv_template[] = {
+ 	"\x77\xAF\x51\x27\x5B\x5E\x69\xB8\x81\xE6\x11\xC5\x43\x23\x81\x04"
+ 	"\x62\xFF\xE9\x46\xB8\xD8\x44\xDB\xA5\xCC\x31\x54\x34\xCE\x3E\x82"
+ 	"\xD6\xBF\x7A\x0B\x64\x21\x6D\x88\x7E\x5B\x45\x12\x1E\x63\x8D\x49"
+-	"\xA7\x1D\xD9\x1E\x06\xCD\xE8\xBA\x2C\x8C\x69\x32\xEA\xBE\x60\x71",
+-	.key_len = 529,
++	"\xA7\x1D\xD9\x1E\x06\xCD\xE8\xBA\x2C\x8C\x69\x32\xEA\xBE\x60\x71"
++	"\x02\x01\x00" /* prime1 - integer of 1 byte */
++	"\x02\x01\x00" /* prime2 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent1 - integer of 1 byte */
++	"\x02\x01\x00" /* exponent2 - integer of 1 byte */
++	"\x02\x01\x00", /* coefficient - integer of 1 byte */
++	.key_len = 547,
+ 	.m = "\x54\x85\x9b\x34\x2c\x49\xea\x2a",
+ 	.c =
+ 	"\xb2\x97\x76\xb4\xae\x3e\x38\x3c\x7e\x64\x1f\xcc\xa2\x7f\xf6\xbe"
+* Unmerged path drivers/crypto/qat/qat_common/Makefile
+* Unmerged path drivers/crypto/qat/qat_common/qat_asym_algs.c
+diff --git a/drivers/crypto/qat/qat_common/qat_rsaprivkey.asn1 b/drivers/crypto/qat/qat_common/qat_rsaprivkey.asn1
+new file mode 100644
+index 000000000000..f0066adb79b8
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/qat_rsaprivkey.asn1
+@@ -0,0 +1,11 @@
++RsaPrivKey ::= SEQUENCE {
++	version		INTEGER,
++	n		INTEGER ({ qat_rsa_get_n }),
++	e		INTEGER ({ qat_rsa_get_e }),
++	d		INTEGER ({ qat_rsa_get_d }),
++	prime1		INTEGER,
++	prime2		INTEGER,
++	exponent1	INTEGER,
++	exponent2	INTEGER,
++	coefficient	INTEGER
++}
+diff --git a/drivers/crypto/qat/qat_common/qat_rsapubkey.asn1 b/drivers/crypto/qat/qat_common/qat_rsapubkey.asn1
+new file mode 100644
+index 000000000000..bd667b31a21a
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/qat_rsapubkey.asn1
+@@ -0,0 +1,4 @@
++RsaPubKey ::= SEQUENCE {
++	n INTEGER ({ qat_rsa_get_n }),
++	e INTEGER ({ qat_rsa_get_e })
++}
+diff --git a/include/crypto/akcipher.h b/include/crypto/akcipher.h
+index 69d163e39101..45cd5b328040 100644
+--- a/include/crypto/akcipher.h
++++ b/include/crypto/akcipher.h
+@@ -18,21 +18,21 @@
+  * struct akcipher_request - public key request
+  *
+  * @base:	Common attributes for async crypto requests
+- * @src:	Pointer to memory containing the input parameters
+- *		The format of the parameter(s) is expeted to be Octet String
+- * @dst:	Pointer to memory whare the result will be stored
+- * @src_len:	Size of the input parameter
++ * @src:	Source data
++ * @dst:	Destination data
++ * @src_len:	Size of the input buffer
+  * @dst_len:	Size of the output buffer. It needs to be at leaset
+  *		as big as the expected result depending	on the operation
+  *		After operation it will be updated with the acctual size of the
+- *		result. In case of error, where the dst_len was insufficient,
++ *		result.
++ *		In case of error where the dst sgl size was insufficient,
+  *		it will be updated to the size required for the operation.
+  * @__ctx:	Start of private context data
+  */
+ struct akcipher_request {
+ 	struct crypto_async_request base;
+-	void *src;
+-	void *dst;
++	struct scatterlist *src;
++	struct scatterlist *dst;
+ 	unsigned int src_len;
+ 	unsigned int dst_len;
+ 	void *__ctx[] CRYPTO_MINALIGN_ATTR;
+@@ -67,8 +67,13 @@ struct crypto_akcipher {
+  *		algorithm. In case of error, where the dst_len was insufficient,
+  *		the req->dst_len will be updated to the size required for the
+  *		operation
+- * @setkey:	Function invokes the algorithm specific set key function, which
+- *		knows how to decode and interpret the BER encoded key
++ * @set_pub_key: Function invokes the algorithm specific set public key
++ *		function, which knows how to decode and interpret
++ *		the BER encoded public key
++ * @set_priv_key: Function invokes the algorithm specific set private key
++ *		function, which knows how to decode and interpret
++ *		the BER encoded private key
++ * @max_size:	Function returns dest buffer size reqired for a given key.
+  * @init:	Initialize the cryptographic transformation object.
+  *		This function is used to initialize the cryptographic
+  *		transformation object. This function is called only once at
+@@ -89,8 +94,11 @@ struct akcipher_alg {
+ 	int (*verify)(struct akcipher_request *req);
+ 	int (*encrypt)(struct akcipher_request *req);
+ 	int (*decrypt)(struct akcipher_request *req);
+-	int (*setkey)(struct crypto_akcipher *tfm, const void *key,
+-		      unsigned int keylen);
++	int (*set_pub_key)(struct crypto_akcipher *tfm, const void *key,
++			   unsigned int keylen);
++	int (*set_priv_key)(struct crypto_akcipher *tfm, const void *key,
++			    unsigned int keylen);
++	int (*max_size)(struct crypto_akcipher *tfm);
+ 	int (*init)(struct crypto_akcipher *tfm);
+ 	void (*exit)(struct crypto_akcipher *tfm);
+ 
+@@ -229,14 +237,14 @@ static inline void akcipher_request_set_callback(struct akcipher_request *req,
+  * Sets parameters required by crypto operation
+  *
+  * @req:	public key request
+- * @src:	ptr to input parameter
+- * @dst:	ptr of output parameter
+- * @src_len:	size of the input buffer
+- * @dst_len:	size of the output buffer. It will be updated by the
+- *		implementation to reflect the acctual size of the result
++ * @src:	ptr to input scatter list
++ * @dst:	ptr to output scatter list
++ * @src_len:	size of the src input scatter list to be processed
++ * @dst_len:	size of the dst output scatter list
+  */
+ static inline void akcipher_request_set_crypt(struct akcipher_request *req,
+-					      void *src, void *dst,
++					      struct scatterlist *src,
++					      struct scatterlist *dst,
+ 					      unsigned int src_len,
+ 					      unsigned int dst_len)
+ {
+@@ -246,6 +254,22 @@ static inline void akcipher_request_set_crypt(struct akcipher_request *req,
+ 	req->dst_len = dst_len;
+ }
+ 
++/**
++ * crypto_akcipher_maxsize() -- Get len for output buffer
++ *
++ * Function returns the dest buffer size required for a given key
++ *
++ * @tfm:	AKCIPHER tfm handle allocated with crypto_alloc_akcipher()
++ *
++ * Return: minimum len for output buffer or error code in key hasn't been set
++ */
++static inline int crypto_akcipher_maxsize(struct crypto_akcipher *tfm)
++{
++	struct akcipher_alg *alg = crypto_akcipher_alg(tfm);
++
++	return alg->max_size(tfm);
++}
++
+ /**
+  * crypto_akcipher_encrypt() -- Invoke public key encrypt operation
+  *
+@@ -319,22 +343,44 @@ static inline int crypto_akcipher_verify(struct akcipher_request *req)
+ }
+ 
+ /**
+- * crypto_akcipher_setkey() -- Invoke public key setkey operation
++ * crypto_akcipher_set_pub_key() -- Invoke set public key operation
++ *
++ * Function invokes the algorithm specific set key function, which knows
++ * how to decode and interpret the encoded key
++ *
++ * @tfm:	tfm handle
++ * @key:	BER encoded public key
++ * @keylen:	length of the key
++ *
++ * Return: zero on success; error code in case of error
++ */
++static inline int crypto_akcipher_set_pub_key(struct crypto_akcipher *tfm,
++					      const void *key,
++					      unsigned int keylen)
++{
++	struct akcipher_alg *alg = crypto_akcipher_alg(tfm);
++
++	return alg->set_pub_key(tfm, key, keylen);
++}
++
++/**
++ * crypto_akcipher_set_priv_key() -- Invoke set private key operation
+  *
+  * Function invokes the algorithm specific set key function, which knows
+  * how to decode and interpret the encoded key
+  *
+  * @tfm:	tfm handle
+- * @key:	BER encoded private or public key
++ * @key:	BER encoded private key
+  * @keylen:	length of the key
+  *
+  * Return: zero on success; error code in case of error
+  */
+-static inline int crypto_akcipher_setkey(struct crypto_akcipher *tfm, void *key,
+-					 unsigned int keylen)
++static inline int crypto_akcipher_set_priv_key(struct crypto_akcipher *tfm,
++					       const void *key,
++					       unsigned int keylen)
+ {
+ 	struct akcipher_alg *alg = crypto_akcipher_alg(tfm);
+ 
+-	return alg->setkey(tfm, key, keylen);
++	return alg->set_priv_key(tfm, key, keylen);
+ }
+ #endif
+diff --git a/include/crypto/internal/rsa.h b/include/crypto/internal/rsa.h
+index 162baf98d57b..c7585bdecbc2 100644
+--- a/include/crypto/internal/rsa.h
++++ b/include/crypto/internal/rsa.h
+@@ -20,8 +20,11 @@ struct rsa_key {
+ 	MPI d;
+ };
+ 
+-int rsa_parse_key(struct rsa_key *rsa_key, const void *key,
+-		  unsigned int key_len);
++int rsa_parse_pub_key(struct rsa_key *rsa_key, const void *key,
++		      unsigned int key_len);
++
++int rsa_parse_priv_key(struct rsa_key *rsa_key, const void *key,
++		       unsigned int key_len);
+ 
+ void rsa_free_key(struct rsa_key *rsa_key);
+ 
