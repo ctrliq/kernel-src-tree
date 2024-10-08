@@ -308,6 +308,19 @@ do {									\
 	finish_wait(&wq, &__wait);					\
 } while (0)
 
+#define __wait_event_exclusive_cmd(wq, condition, cmd1, cmd2)		\
+	(void)___wait_event(wq, condition, TASK_UNINTERRUPTIBLE, 1, 0,	\
+			    cmd1; schedule(); cmd2)
+/*
+ * Just like wait_event_cmd(), except it sets exclusive flag
+ */
+#define wait_event_exclusive_cmd(wq, condition, cmd1, cmd2)		\
+do {									\
+	if (condition)							\
+		break;							\
+	__wait_event_exclusive_cmd(wq, condition, cmd1, cmd2);		\
+} while (0)
+
 #define __wait_event_cmd(wq, condition, cmd1, cmd2)			\
 	(void)___wait_event(wq, condition, TASK_UNINTERRUPTIBLE, 0, 0,	\
 			    cmd1; schedule(); cmd2)
