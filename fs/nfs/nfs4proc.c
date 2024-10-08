@@ -6961,10 +6961,7 @@ nfs4_layoutcommit_done(struct rpc_task *task, void *calldata)
 	case -NFS4ERR_BADLAYOUT:     /* no layout */
 	case -NFS4ERR_GRACE:	    /* loca_recalim always false */
 		task->tk_status = 0;
-		break;
 	case 0:
-		nfs_post_op_update_inode_force_wcc(data->args.inode,
-						   data->res.fattr);
 		break;
 	default:
 		if (nfs4_async_handle_error(task, server, NULL) == -EAGAIN) {
@@ -6979,6 +6976,8 @@ static void nfs4_layoutcommit_release(void *calldata)
 	struct nfs4_layoutcommit_data *data = calldata;
 
 	pnfs_cleanup_layoutcommit(data);
+	nfs_post_op_update_inode_force_wcc(data->args.inode,
+					   data->res.fattr);
 	put_rpccred(data->cred);
 	kfree(data);
 }
