@@ -1,0 +1,313 @@
+target/user: Fix comments to not refer to data ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andy Grover <agrover@redhat.com>
+commit 3d9b95558f5874ac5d63a057813dc66b480de7e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3d9b9555.failed
+
+We no longer use a ringbuffer for the data area, so this might cause
+confusion. Just call it the data area.
+
+	Signed-off-by: Andy Grover <agrover@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 3d9b95558f5874ac5d63a057813dc66b480de7e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 1a1bcf71ec9d,47562509b489..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -97,13 -96,12 +97,18 @@@ struct tcmu_dev 
+  	size_t dev_size;
+  	u32 cmdr_size;
+  	u32 cmdr_last_cleaned;
+++<<<<<<< HEAD
+ +	/* Offset of data ring from start of mb */
+++=======
++ 	/* Offset of data area from start of mb */
++ 	/* Must add data_off and mb_addr to get the address */
+++>>>>>>> 3d9b95558f58 (target/user: Fix comments to not refer to data ring)
+  	size_t data_off;
+  	size_t data_size;
+ -
+ -	DECLARE_BITMAP(data_bitmap, DATA_BLOCK_BITS);
+ +	/* Ring head + tail values. */
+ +	/* Must add data_off and mb_addr to get the address */
+ +	size_t data_head;
+ +	size_t data_tail;
+  
+  	wait_queue_head_t wait_cmdr;
+  	/* TODO should this be a mutex? */
+@@@ -230,11 -227,129 +235,16 @@@ static inline size_t head_to_end(size_
+  	return size - head;
+  }
+  
+ -static inline void new_iov(struct iovec **iov, int *iov_cnt,
+ -			   struct tcmu_dev *udev)
+ -{
+ -	struct iovec *iovec;
+ -
+ -	if (*iov_cnt != 0)
+ -		(*iov)++;
+ -	(*iov_cnt)++;
+ -
+ -	iovec = *iov;
+ -	memset(iovec, 0, sizeof(struct iovec));
+ -}
+ -
+  #define UPDATE_HEAD(head, used, size) smp_store_release(&head, ((head % size) + used) % size)
+  
+ -/* offset is relative to mb_addr */
+ -static inline size_t get_block_offset(struct tcmu_dev *dev,
+ -		int block, int remaining)
+ -{
+ -	return dev->data_off + block * DATA_BLOCK_SIZE +
+ -		DATA_BLOCK_SIZE - remaining;
+ -}
+ -
+ -static inline size_t iov_tail(struct tcmu_dev *udev, struct iovec *iov)
+ -{
+ -	return (size_t)iov->iov_base + iov->iov_len;
+ -}
+ -
+ -static void alloc_and_scatter_data_area(struct tcmu_dev *udev,
+ -	struct scatterlist *data_sg, unsigned int data_nents,
+ -	struct iovec **iov, int *iov_cnt, bool copy_data)
+ -{
+ -	int i, block;
+ -	int block_remaining = 0;
+ -	void *from, *to;
+ -	size_t copy_bytes, to_offset;
+ -	struct scatterlist *sg;
+ -
+ -	for_each_sg(data_sg, sg, data_nents, i) {
+ -		int sg_remaining = sg->length;
+ -		from = kmap_atomic(sg_page(sg)) + sg->offset;
+ -		while (sg_remaining > 0) {
+ -			if (block_remaining == 0) {
+ -				block = find_first_zero_bit(udev->data_bitmap,
+ -						DATA_BLOCK_BITS);
+ -				block_remaining = DATA_BLOCK_SIZE;
+ -				set_bit(block, udev->data_bitmap);
+ -			}
+ -			copy_bytes = min_t(size_t, sg_remaining,
+ -					block_remaining);
+ -			to_offset = get_block_offset(udev, block,
+ -					block_remaining);
+ -			to = (void *)udev->mb_addr + to_offset;
+ -			if (*iov_cnt != 0 &&
+ -			    to_offset == iov_tail(udev, *iov)) {
+ -				(*iov)->iov_len += copy_bytes;
+ -			} else {
+ -				new_iov(iov, iov_cnt, udev);
+ -				(*iov)->iov_base = (void __user *) to_offset;
+ -				(*iov)->iov_len = copy_bytes;
+ -			}
+ -			if (copy_data) {
+ -				memcpy(to, from + sg->length - sg_remaining,
+ -					copy_bytes);
+ -				tcmu_flush_dcache_range(to, copy_bytes);
+ -			}
+ -			sg_remaining -= copy_bytes;
+ -			block_remaining -= copy_bytes;
+ -		}
+ -		kunmap_atomic(from - sg->offset);
+ -	}
+ -}
+ -
+ -static void free_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd)
+ -{
+ -	bitmap_xor(udev->data_bitmap, udev->data_bitmap, cmd->data_bitmap,
+ -		   DATA_BLOCK_BITS);
+ -}
+ -
+ -static void gather_data_area(struct tcmu_dev *udev, unsigned long *cmd_bitmap,
+ -		struct scatterlist *data_sg, unsigned int data_nents)
+ -{
+ -	int i, block;
+ -	int block_remaining = 0;
+ -	void *from, *to;
+ -	size_t copy_bytes, from_offset;
+ -	struct scatterlist *sg;
+ -
+ -	for_each_sg(data_sg, sg, data_nents, i) {
+ -		int sg_remaining = sg->length;
+ -		to = kmap_atomic(sg_page(sg)) + sg->offset;
+ -		while (sg_remaining > 0) {
+ -			if (block_remaining == 0) {
+ -				block = find_first_bit(cmd_bitmap,
+ -						DATA_BLOCK_BITS);
+ -				block_remaining = DATA_BLOCK_SIZE;
+ -				clear_bit(block, cmd_bitmap);
+ -			}
+ -			copy_bytes = min_t(size_t, sg_remaining,
+ -					block_remaining);
+ -			from_offset = get_block_offset(udev, block,
+ -					block_remaining);
+ -			from = (void *) udev->mb_addr + from_offset;
+ -			tcmu_flush_dcache_range(from, copy_bytes);
+ -			memcpy(to + sg->length - sg_remaining, from,
+ -					copy_bytes);
+ -
+ -			sg_remaining -= copy_bytes;
+ -			block_remaining -= copy_bytes;
+ -		}
+ -		kunmap_atomic(to - sg->offset);
+ -	}
+ -}
+ -
+ -static inline size_t spc_bitmap_free(unsigned long *bitmap)
+ -{
+ -	return DATA_BLOCK_SIZE * (DATA_BLOCK_BITS -
+ -			bitmap_weight(bitmap, DATA_BLOCK_BITS));
+ -}
+ -
+  /*
+++<<<<<<< HEAD
+ + * We can't queue a command until we have space available on the cmd ring *and* space
+ + * space avail on the data ring.
+++=======
++  * We can't queue a command until we have space available on the cmd ring *and*
++  * space available on the data area.
+++>>>>>>> 3d9b95558f58 (target/user: Fix comments to not refer to data ring)
+   *
+   * Called with ring lock held.
+   */
+@@@ -311,13 -428,21 +321,25 @@@ static int tcmu_queue_cmd_ring(struct t
+  
+  	mb = udev->mb_addr;
+  	cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
+++<<<<<<< HEAD
+ +	if ((command_size > (udev->cmdr_size / 2))
+ +	    || tcmu_cmd->data_length > (udev->data_size - 1))
+ +		pr_warn("TCMU: Request of size %zu/%zu may be too big for %u/%zu "
+ +			"cmd/data ring buffers\n", command_size, tcmu_cmd->data_length,
+++=======
++ 	data_length = se_cmd->data_length;
++ 	if (se_cmd->se_cmd_flags & SCF_BIDI) {
++ 		BUG_ON(!(se_cmd->t_bidi_data_sg && se_cmd->t_bidi_data_nents));
++ 		data_length += se_cmd->t_bidi_data_sg->length;
++ 	}
++ 	if ((command_size > (udev->cmdr_size / 2)) ||
++ 	    data_length > udev->data_size) {
++ 		pr_warn("TCMU: Request of size %zu/%zu is too big for %u/%zu "
++ 			"cmd ring/data area\n", command_size, data_length,
+++>>>>>>> 3d9b95558f58 (target/user: Fix comments to not refer to data ring)
+  			udev->cmdr_size, udev->data_size);
+ -		spin_unlock_irq(&udev->cmdr_lock);
+ -		return TCM_INVALID_CDB_FIELD;
+ -	}
+  
+ -	while (!is_ring_space_avail(udev, command_size, data_length)) {
+ +	while (!is_ring_space_avail(udev, command_size, tcmu_cmd->data_length)) {
+  		int ret;
+  		DEFINE_WAIT(__wait);
+  
+@@@ -355,56 -483,33 +377,54 @@@
+  
+  	entry = (void *) mb + CMDR_OFF + cmd_head;
+  	tcmu_flush_dcache_range(entry, sizeof(*entry));
+ -	tcmu_hdr_set_op(&entry->hdr.len_op, TCMU_OP_CMD);
+ -	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
+ -	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
+ -	entry->hdr.kflags = 0;
+ -	entry->hdr.uflags = 0;
+ -
+ -	bitmap_copy(old_bitmap, udev->data_bitmap, DATA_BLOCK_BITS);
+ +	tcmu_hdr_set_op(&entry->hdr, TCMU_OP_CMD);
+ +	tcmu_hdr_set_len(&entry->hdr, command_size);
+ +	entry->cmd_id = tcmu_cmd->cmd_id;
+  
+- 	/*
+- 	 * Fix up iovecs, and handle if allocation in data ring wrapped.
+- 	 */
++ 	/* Handle allocating space from the data area */
+  	iov = &entry->req.iov[0];
+ -	iov_cnt = 0;
+ -	copy_to_data_area = (se_cmd->data_direction == DMA_TO_DEVICE
+ -		|| se_cmd->se_cmd_flags & SCF_BIDI);
+ -	alloc_and_scatter_data_area(udev, se_cmd->t_data_sg,
+ -		se_cmd->t_data_nents, &iov, &iov_cnt, copy_to_data_area);
+ -	entry->req.iov_cnt = iov_cnt;
+ -	entry->req.iov_dif_cnt = 0;
+ +	for_each_sg(se_cmd->t_data_sg, sg, se_cmd->t_data_nents, i) {
+ +		size_t copy_bytes = min((size_t)sg->length,
+ +				     head_to_end(udev->data_head, udev->data_size));
+ +		void *from = kmap_atomic(sg_page(sg)) + sg->offset;
+ +		void *to = (void *) mb + udev->data_off + udev->data_head;
+ +
+ +		if (tcmu_cmd->se_cmd->data_direction == DMA_TO_DEVICE) {
+ +			memcpy(to, from, copy_bytes);
+ +			tcmu_flush_dcache_range(to, copy_bytes);
+ +		}
+ +
+ +		/* Even iov_base is relative to mb_addr */
+ +		iov->iov_len = copy_bytes;
+ +		iov->iov_base = (void *) udev->data_off + udev->data_head;
+ +		iov_cnt++;
+ +		iov++;
+ +
+ +		UPDATE_HEAD(udev->data_head, copy_bytes, udev->data_size);
+  
+ -	/* Handle BIDI commands */
+ -	iov_cnt = 0;
+ -	alloc_and_scatter_data_area(udev, se_cmd->t_bidi_data_sg,
+ -		se_cmd->t_bidi_data_nents, &iov, &iov_cnt, false);
+ -	entry->req.iov_bidi_cnt = iov_cnt;
+ +		/* Uh oh, we wrapped the buffer. Must split sg across 2 iovs. */
+ +		if (sg->length != copy_bytes) {
+ +			from += copy_bytes;
+ +			copy_bytes = sg->length - copy_bytes;
+ +
+ +			iov->iov_len = copy_bytes;
+ +			iov->iov_base = (void *) udev->data_off + udev->data_head;
+ +
+ +			if (se_cmd->data_direction == DMA_TO_DEVICE) {
+ +				to = (void *) mb + udev->data_off + udev->data_head;
+ +				memcpy(to, from, copy_bytes);
+ +				tcmu_flush_dcache_range(to, copy_bytes);
+ +			}
+  
+ -	/* cmd's data_bitmap is what changed in process */
+ -	bitmap_xor(tcmu_cmd->data_bitmap, old_bitmap, udev->data_bitmap,
+ -			DATA_BLOCK_BITS);
+ +			iov_cnt++;
+ +			iov++;
+ +
+ +			UPDATE_HEAD(udev->data_head, copy_bytes, udev->data_size);
+ +		}
+ +
+ +		kunmap_atomic(from);
+ +	}
+ +	entry->req.iov_cnt = iov_cnt;
+  
+  	/* All offsets relative to mb_addr, not start of entry! */
+  	cdb_off = CMDR_OFF + cmd_head + base_command_size;
+@@@ -456,9 -562,13 +476,19 @@@ static void tcmu_handle_completion(stru
+  	struct tcmu_dev *udev = cmd->tcmu_dev;
+  
+  	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
+++<<<<<<< HEAD
+ +		/* cmd has been completed already from timeout, just reclaim data
+ +		   ring space */
+ +		UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
+++=======
++ 		/*
++ 		 * cmd has been completed already from timeout, just reclaim
++ 		 * data area space and free cmd
++ 		 */
++ 		free_data_area(udev, cmd);
++ 
++ 		kmem_cache_free(tcmu_cmd_cache, cmd);
+++>>>>>>> 3d9b95558f58 (target/user: Fix comments to not refer to data ring)
+  		return;
+  	}
+  
+* Unmerged path drivers/target/target_core_user.c
