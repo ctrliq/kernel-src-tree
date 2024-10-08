@@ -1,0 +1,213 @@
+KVM: MMU: fix MTRR update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] mmu: fix MTRR update (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 88.89%
+commit-author Xiao Guangrong <guangrong.xiao@linux.intel.com>
+commit efdfe536d8c643391e19d5726b072f82964bfbdb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/efdfe536.failed
+
+Currently, whenever guest MTRR registers are changed
+kvm_mmu_reset_context is called to switch to the new root shadow page
+table, however, it's useless since:
+1) the cache type is not cached into shadow page's attribute so that
+   the original root shadow page will be reused
+
+2) the cache type is set on the last spte, that means we should sync
+   the last sptes when MTRR is changed
+
+This patch fixs this issue by drop all the spte in the gfn range which
+is being updated by MTRR
+
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit efdfe536d8c643391e19d5726b072f82964bfbdb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 03a51e87134a,5bebec1191f1..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4350,6 -4482,86 +4350,89 @@@ void kvm_mmu_slot_remove_write_access(s
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (flush && lock_flush_tlb) {
++ 		kvm_flush_remote_tlbs(kvm);
++ 		flush = false;
++ 	}
++ 
++ 	return flush;
++ }
++ 
++ static bool
++ slot_handle_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		  slot_level_handler fn, int start_level, int end_level,
++ 		  bool lock_flush_tlb)
++ {
++ 	return slot_handle_level_range(kvm, memslot, fn, start_level,
++ 			end_level, memslot->base_gfn,
++ 			memslot->base_gfn + memslot->npages - 1,
++ 			lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_all_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		      slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_large_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 			slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL + 1,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		 slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_PAGE_TABLE_LEVEL, lock_flush_tlb);
++ }
++ 
++ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
++ {
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *memslot;
++ 
++ 	slots = kvm_memslots(kvm);
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	kvm_for_each_memslot(memslot, slots) {
++ 		gfn_t start, end;
++ 
++ 		start = max(gfn_start, memslot->base_gfn);
++ 		end = min(gfn_end, memslot->base_gfn + memslot->npages);
++ 		if (start >= end)
++ 			continue;
++ 
++ 		slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
++ 				PT_PAGE_TABLE_LEVEL, PT_MAX_HUGEPAGE_LEVEL,
++ 				start, end - 1, true);
++ 	}
++ 
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ static bool slot_rmap_write_protect(struct kvm *kvm, unsigned long *rmapp)
++ {
++ 	return __rmap_write_protect(kvm, rmapp, false);
++ }
++ 
++ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
++ 				      struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_all_level(kvm, memslot, slot_rmap_write_protect,
++ 				      false);
+++>>>>>>> efdfe536d8c6 (KVM: MMU: fix MTRR update)
+  	spin_unlock(&kvm->mmu_lock);
+  
+  	/*
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 420fe4206164..9355c5722d2a 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -182,4 +182,5 @@ static inline bool permission_fault(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ }
+ 
+ void kvm_mmu_invalidate_zap_all_pages(struct kvm *kvm);
++void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end);
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c09978a6a4ee..7b7a6cab7650 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1834,6 +1834,63 @@ bool kvm_mtrr_valid(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ }
+ EXPORT_SYMBOL_GPL(kvm_mtrr_valid);
+ 
++static void update_mtrr(struct kvm_vcpu *vcpu, u32 msr)
++{
++	struct mtrr_state_type *mtrr_state = &vcpu->arch.mtrr_state;
++	unsigned char mtrr_enabled = mtrr_state->enabled;
++	gfn_t start, end, mask;
++	int index;
++	bool is_fixed = true;
++
++	if (msr == MSR_IA32_CR_PAT || !tdp_enabled ||
++	      !kvm_arch_has_noncoherent_dma(vcpu->kvm))
++		return;
++
++	if (!(mtrr_enabled & 0x2) && msr != MSR_MTRRdefType)
++		return;
++
++	switch (msr) {
++	case MSR_MTRRfix64K_00000:
++		start = 0x0;
++		end = 0x80000;
++		break;
++	case MSR_MTRRfix16K_80000:
++		start = 0x80000;
++		end = 0xa0000;
++		break;
++	case MSR_MTRRfix16K_A0000:
++		start = 0xa0000;
++		end = 0xc0000;
++		break;
++	case MSR_MTRRfix4K_C0000 ... MSR_MTRRfix4K_F8000:
++		index = msr - MSR_MTRRfix4K_C0000;
++		start = 0xc0000 + index * (32 << 10);
++		end = start + (32 << 10);
++		break;
++	case MSR_MTRRdefType:
++		is_fixed = false;
++		start = 0x0;
++		end = ~0ULL;
++		break;
++	default:
++		/* variable range MTRRs. */
++		is_fixed = false;
++		index = (msr - 0x200) / 2;
++		start = (((u64)mtrr_state->var_ranges[index].base_hi) << 32) +
++		       (mtrr_state->var_ranges[index].base_lo & PAGE_MASK);
++		mask = (((u64)mtrr_state->var_ranges[index].mask_hi) << 32) +
++		       (mtrr_state->var_ranges[index].mask_lo & PAGE_MASK);
++		mask |= ~0ULL << cpuid_maxphyaddr(vcpu);
++
++		end = ((start & mask) | ~mask) + 1;
++	}
++
++	if (is_fixed && !(mtrr_enabled & 0x1))
++		return;
++
++	kvm_zap_gfn_range(vcpu->kvm, gpa_to_gfn(start), gpa_to_gfn(end));
++}
++
+ static int set_msr_mtrr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ {
+ 	u64 *p = (u64 *)&vcpu->arch.mtrr_state.fixed_ranges;
+@@ -1867,7 +1924,7 @@ static int set_msr_mtrr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 		*pt = data;
+ 	}
+ 
+-	kvm_mmu_reset_context(vcpu);
++	update_mtrr(vcpu, msr);
+ 	return 0;
+ }
+ 
