@@ -1,0 +1,262 @@
+bonding: add netlink attributes to slave link dev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author sfeldma@cumulusnetworks.com <sfeldma@cumulusnetworks.com>
+commit 1d3ee88ae0d605629bf369ab0b868dae8ca62a48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1d3ee88a.failed
+
+If link is IFF_SLAVE, extend link dev netlink attributes to include
+slave attributes with new IFLA_SLAVE nest.  Add netlink notification
+(RTM_NEWLINK) when slave status changes from backup to active, or
+visa-versa.
+
+Adds new ndo_get_slave op to net_device_ops to fill skb with IFLA_SLAVE
+attributes.  Currently only used by bonding driver, but could be
+used by other aggregating devices with slaves.
+
+	Signed-off-by: Scott Feldman <sfeldma@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1d3ee88ae0d605629bf369ab0b868dae8ca62a48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bonding.h
+#	include/uapi/linux/if_link.h
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,8a935f8f2b3c..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -415,15 -428,14 +421,20 @@@ int bond_create(struct net *net, const 
+  int bond_create_sysfs(struct bond_net *net);
+  void bond_destroy_sysfs(struct bond_net *net);
+  void bond_prepare_sysfs_group(struct bonding *bond);
+ -int bond_sysfs_slave_add(struct slave *slave);
+ -void bond_sysfs_slave_del(struct slave *slave);
+ +int bond_create_slave_symlinks(struct net_device *master, struct net_device *slave);
+ +void bond_destroy_slave_symlinks(struct net_device *master, struct net_device *slave);
+  int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev);
+  int bond_release(struct net_device *bond_dev, struct net_device *slave_dev);
+++<<<<<<< HEAD
+ +void bond_mii_monitor(struct work_struct *);
+ +void bond_loadbalance_arp_mon(struct work_struct *);
+ +void bond_activebackup_arp_mon(struct work_struct *);
+ +void bond_set_mode_ops(struct bonding *bond, int mode);
+++=======
++ int bond_get_slave(struct net_device *slave_dev, struct sk_buff *skb);
++ int bond_xmit_hash(struct bonding *bond, struct sk_buff *skb, int count);
+++>>>>>>> 1d3ee88ae0d6 (bonding: add netlink attributes to slave link dev)
+  int bond_parse_parm(const char *mode_arg, const struct bond_parm_tbl *tbl);
+ -int bond_parm_tbl_lookup(int mode, const struct bond_parm_tbl *tbl);
+  void bond_select_active_slave(struct bonding *bond);
+  void bond_change_active_slave(struct bonding *bond, struct slave *new_active);
+  void bond_create_debugfs(void);
+diff --cc include/uapi/linux/if_link.h
+index 4efe6bcb6e67,ba2f3bf5fdf5..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -345,6 -358,29 +346,32 @@@ enum 
+  
+  #define IFLA_BOND_MAX	(__IFLA_BOND_MAX - 1)
+  
+++<<<<<<< HEAD
+++=======
++ enum {
++ 	IFLA_BOND_AD_INFO_AGGREGATOR,
++ 	IFLA_BOND_AD_INFO_NUM_PORTS,
++ 	IFLA_BOND_AD_INFO_ACTOR_KEY,
++ 	IFLA_BOND_AD_INFO_PARTNER_KEY,
++ 	IFLA_BOND_AD_INFO_PARTNER_MAC,
++ 	__IFLA_BOND_AD_INFO_MAX,
++ };
++ 
++ #define IFLA_BOND_AD_INFO_MAX	(__IFLA_BOND_AD_INFO_MAX - 1)
++ 
++ enum {
++ 	IFLA_SLAVE_STATE,
++ 	IFLA_SLAVE_MII_STATUS,
++ 	IFLA_SLAVE_LINK_FAILURE_COUNT,
++ 	IFLA_SLAVE_PERM_HWADDR,
++ 	IFLA_SLAVE_QUEUE_ID,
++ 	IFLA_SLAVE_AD_AGGREGATOR_ID,
++ 	__IFLA_SLAVE_MAX,
++ };
++ 
++ #define IFLA_SLAVE_MAX	(__IFLA_SLAVE_MAX - 1)
++ 
+++>>>>>>> 1d3ee88ae0d6 (bonding: add netlink attributes to slave link dev)
+  /* SR-IOV virtual function management section */
+  
+  enum {
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 4ea3a26a679d..b82274c546fd 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4245,6 +4245,7 @@ static const struct net_device_ops bond_netdev_ops = {
+ #endif
+ 	.ndo_add_slave		= bond_enslave,
+ 	.ndo_del_slave		= bond_release,
++	.ndo_get_slave		= bond_get_slave,
+ 	.ndo_fix_features	= bond_fix_features,
+ };
+ 
+diff --git a/drivers/net/bonding/bond_netlink.c b/drivers/net/bonding/bond_netlink.c
+index 40e7b1cb4aea..04044954f9a4 100644
+--- a/drivers/net/bonding/bond_netlink.c
++++ b/drivers/net/bonding/bond_netlink.c
+@@ -20,6 +20,42 @@
+ #include <net/rtnetlink.h>
+ #include "bonding.h"
+ 
++int bond_get_slave(struct net_device *slave_dev, struct sk_buff *skb)
++{
++	struct slave *slave = bond_slave_get_rtnl(slave_dev);
++	const struct aggregator *agg;
++
++	if (nla_put_u8(skb, IFLA_SLAVE_STATE, bond_slave_state(slave)))
++		goto nla_put_failure;
++
++	if (nla_put_u8(skb, IFLA_SLAVE_MII_STATUS, slave->link))
++		goto nla_put_failure;
++
++	if (nla_put_u32(skb, IFLA_SLAVE_LINK_FAILURE_COUNT,
++			slave->link_failure_count))
++		goto nla_put_failure;
++
++	if (nla_put(skb, IFLA_SLAVE_PERM_HWADDR,
++		    slave_dev->addr_len, slave->perm_hwaddr))
++		goto nla_put_failure;
++
++	if (nla_put_u16(skb, IFLA_SLAVE_QUEUE_ID, slave->queue_id))
++		goto nla_put_failure;
++
++	if (slave->bond->params.mode == BOND_MODE_8023AD) {
++		agg = SLAVE_AD_INFO(slave).port.aggregator;
++		if (agg)
++			if (nla_put_u16(skb, IFLA_SLAVE_AD_AGGREGATOR_ID,
++					agg->aggregator_identifier))
++				goto nla_put_failure;
++	}
++
++	return 0;
++
++nla_put_failure:
++	return -EMSGSIZE;
++}
++
+ static const struct nla_policy bond_policy[IFLA_BOND_MAX + 1] = {
+ 	[IFLA_BOND_MODE]		= { .type = NLA_U8 },
+ 	[IFLA_BOND_ACTIVE_SLAVE]	= { .type = NLA_U32 },
+* Unmerged path drivers/net/bonding/bonding.h
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 3cf462ffc113..e85dda1622fb 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -908,6 +908,9 @@ struct netdev_phys_port_id {
+  * int (*ndo_del_slave)(struct net_device *dev, struct net_device *slave_dev);
+  *	Called to release previously enslaved netdev.
+  *
++ * int (*ndo_get_slave)(struct net_device *slave_dev, struct sk_buff *skb);
++ *	Called to fill netlink skb with slave info.
++ *
+  *      Feature/offload setting functions.
+  * netdev_features_t (*ndo_fix_features)(struct net_device *dev,
+  *		netdev_features_t features);
+@@ -1060,6 +1063,8 @@ struct net_device_ops {
+ 						 struct net_device *slave_dev);
+ 	int			(*ndo_del_slave)(struct net_device *dev,
+ 						 struct net_device *slave_dev);
++	int			(*ndo_get_slave)(struct net_device *slave_dev,
++						 struct sk_buff *skb);
+ 	netdev_features_t	(*ndo_fix_features)(struct net_device *dev,
+ 						    netdev_features_t features);
+ 	int			(*ndo_set_features)(struct net_device *dev,
+* Unmerged path include/uapi/linux/if_link.h
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 46e91a591c6a..6476c3947fe7 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -778,6 +778,28 @@ static size_t rtnl_port_size(const struct net_device *dev,
+ 		return port_self_size;
+ }
+ 
++static size_t rtnl_bond_slave_size(const struct net_device *dev)
++{
++	struct net_device *bond;
++	size_t slave_size =
++		nla_total_size(sizeof(struct nlattr)) +	/* IFLA_SLAVE */
++		nla_total_size(1) +	/* IFLA_SLAVE_STATE */
++		nla_total_size(1) +	/* IFLA_SLAVE_MII_STATUS */
++		nla_total_size(4) +	/* IFLA_SLAVE_LINK_FAILURE_COUNT */
++		nla_total_size(MAX_ADDR_LEN) +	/* IFLA_SLAVE_PERM_HWADDR */
++		nla_total_size(2) +	/* IFLA_SLAVE_QUEUE_ID */
++		nla_total_size(2) +	/* IFLA_SLAVE_AD_AGGREGATOR_ID */
++		0;
++
++	if (netif_is_bond_slave((struct net_device *)dev)) {
++		bond = netdev_master_upper_dev_get((struct net_device *)dev);
++		if (bond && bond->netdev_ops->ndo_get_slave)
++			return slave_size;
++	}
++
++	return 0;
++}
++
+ static noinline size_t if_nlmsg_size(const struct net_device *dev,
+ 				     u32 ext_filter_mask)
+ {
+@@ -807,6 +829,7 @@ static noinline size_t if_nlmsg_size(const struct net_device *dev,
+ 	       + rtnl_port_size(dev, ext_filter_mask) /* IFLA_VF_PORTS + IFLA_PORT_SELF */
+ 	       + rtnl_link_get_size(dev) /* IFLA_LINKINFO */
+ 	       + rtnl_link_get_af_size(dev) /* IFLA_AF_SPEC */
++	       + rtnl_bond_slave_size(dev) /* IFLA_SLAVE */
+ 	       + nla_total_size(MAX_PHYS_PORT_ID_LEN); /* IFLA_PHYS_PORT_ID */
+ }
+ 
+@@ -906,6 +929,34 @@ static int rtnl_phys_port_id_fill(struct sk_buff *skb, struct net_device *dev)
+ 	return 0;
+ }
+ 
++static size_t rtnl_bond_slave_fill(struct sk_buff *skb, struct net_device *dev)
++{
++	struct net_device *bond;
++	struct nlattr *nest;
++	int err;
++
++	if (!netif_is_bond_slave(dev))
++		return 0;
++
++	bond = netdev_master_upper_dev_get(dev);
++	if (!bond || !bond->netdev_ops->ndo_get_slave)
++		return 0;
++
++	nest = nla_nest_start(skb, IFLA_SLAVE);
++	if (!nest)
++		return -EMSGSIZE;
++
++	err = bond->netdev_ops->ndo_get_slave(dev, skb);
++	if (err) {
++		nla_nest_cancel(skb, nest);
++		return (err == -EMSGSIZE) ? err : 0;
++	}
++
++	nla_nest_end(skb, nest);
++
++	return 0;
++}
++
+ static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+ 			    int type, u32 pid, u32 seq, u32 change,
+ 			    unsigned int flags, u32 ext_filter_mask)
+@@ -1060,6 +1111,9 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+ 	if (rtnl_port_fill(skb, dev, ext_filter_mask))
+ 		goto nla_put_failure;
+ 
++	if (rtnl_bond_slave_fill(skb, dev))
++		goto nla_put_failure;
++
+ 	if (dev->rtnl_link_ops) {
+ 		if (rtnl_link_fill(skb, dev) < 0)
+ 			goto nla_put_failure;
