@@ -1,0 +1,438 @@
+drm/i915: Fix locking for intel_enable_pipe_a()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] i915: Fix locking for intel_enable_pipe_a() (Rob Clark) [1153301]
+Rebuild_FUZZ: 95.56%
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 208bf9fdcd3575aa4a5d48b3e0295f7cdaf6fc44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/208bf9fd.failed
+
+intel_enable_pipe_a() gets called with all the modeset locks already
+held (by drm_modeset_lock_all()), so trying to grab the same
+locks using another drm_modeset_acquire_ctx is going to fail miserably.
+
+Move most of the drm_modeset_acquire_ctx handling (init/drop/fini)
+out from intel_{get,release}_load_detect_pipe() into the callers
+(intel_{crt,tv}_detect()). Only the actual locking and backoff
+handling is left in intel_get_load_detect_pipe(). And in
+intel_enable_pipe_a() we just share the mode_config.acquire_ctx from
+drm_modeset_lock_all() which is already holding all the relevant locks.
+
+It's perfectly legal to lock the same ww_mutex multiple times using the
+same ww_acquire_ctx. drm_modeset_lock() will convert the returned
+-EALREADY into 0, so the caller doesn't need to do antyhing special.
+
+Fixes a hang on resume on my 830.
+
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+(cherry picked from commit 208bf9fdcd3575aa4a5d48b3e0295f7cdaf6fc44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_crt.c
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_drv.h
+#	drivers/gpu/drm/i915/intel_tv.c
+diff --cc drivers/gpu/drm/i915/intel_crt.c
+index 10d1de5bce6f,e8abfce40976..000000000000
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@@ -649,14 -689,20 +649,16 @@@ intel_crt_detect(struct drm_connector *
+  	 * broken monitor (without edid) to work behind a broken kvm (that fails
+  	 * to have the right resistors for HP detection) needs to fix this up.
+  	 * For now just bail out. */
+ -	if (I915_HAS_HOTPLUG(dev)) {
+ -		status = connector_status_disconnected;
+ -		goto out;
+ -	}
+ +	if (I915_HAS_HOTPLUG(dev))
+ +		return connector_status_disconnected;
+  
+ -	if (!force) {
+ -		status = connector->status;
+ -		goto out;
+ -	}
+ +	if (!force)
+ +		return connector->status;
+  
++ 	drm_modeset_acquire_init(&ctx, 0);
++ 
+  	/* for pre-945g platforms use load detect */
+ -	if (intel_get_load_detect_pipe(connector, NULL, &tmp, &ctx)) {
+ +	if (intel_get_load_detect_pipe(connector, NULL, &tmp)) {
+  		if (intel_crt_detect_ddc(connector))
+  			status = connector_status_connected;
+  		else
+@@@ -665,6 -711,11 +667,14 @@@
+  	} else
+  		status = connector_status_unknown;
+  
+++<<<<<<< HEAD
+++=======
++ 	drm_modeset_drop_locks(&ctx);
++ 	drm_modeset_acquire_fini(&ctx);
++ 
++ out:
++ 	intel_display_power_put(dev_priv, power_domain);
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  	return status;
+  }
+  
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 5d5f48ca549a,f02c80d4039c..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -7176,11 -8455,17 +7176,21 @@@ bool intel_get_load_detect_pipe(struct 
+  	struct drm_crtc *crtc = NULL;
+  	struct drm_device *dev = encoder->dev;
+  	struct drm_framebuffer *fb;
+ -	struct drm_mode_config *config = &dev->mode_config;
+ -	int ret, i = -1;
+ +	int i = -1;
+  
+  	DRM_DEBUG_KMS("[CONNECTOR:%d:%s], [ENCODER:%d:%s]\n",
+++<<<<<<< HEAD
+ +		      connector->base.id, drm_get_connector_name(connector),
+ +		      encoder->base.id, drm_get_encoder_name(encoder));
+++=======
++ 		      connector->base.id, connector->name,
++ 		      encoder->base.id, encoder->name);
++ 
++ retry:
++ 	ret = drm_modeset_lock(&config->connection_mutex, ctx);
++ 	if (ret)
++ 		goto fail_unlock;
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  
+  	/*
+  	 * Algorithm gets a little messy:
+@@@ -7274,6 -8559,20 +7284,23 @@@
+  	/* let the connector get through one full cycle before testing */
+  	intel_wait_for_vblank(dev, intel_crtc->pipe);
+  	return true;
+++<<<<<<< HEAD
+++=======
++ 
++  fail:
++ 	intel_crtc->new_enabled = crtc->enabled;
++ 	if (intel_crtc->new_enabled)
++ 		intel_crtc->new_config = &intel_crtc->config;
++ 	else
++ 		intel_crtc->new_config = NULL;
++ fail_unlock:
++ 	if (ret == -EDEADLK) {
++ 		drm_modeset_backoff(ctx);
++ 		goto retry;
++ 	}
++ 
++ 	return false;
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  }
+  
+  void intel_release_load_detect_pipe(struct drm_connector *connector,
+@@@ -7298,15 -8600,28 +7325,37 @@@
+  			drm_framebuffer_unreference(old->release_fb);
+  		}
+  
+++<<<<<<< HEAD
+ +		mutex_unlock(&crtc->mutex);
+++=======
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  		return;
+  	}
+  
+  	/* Switch crtc and encoder back off if necessary */
+  	if (old->dpms_mode != DRM_MODE_DPMS_ON)
+  		connector->funcs->dpms(connector, old->dpms_mode);
+++<<<<<<< HEAD
+ +
+ +	mutex_unlock(&crtc->mutex);
+++=======
++ }
++ 
++ static int i9xx_pll_refclk(struct drm_device *dev,
++ 			   const struct intel_crtc_config *pipe_config)
++ {
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
++ 	u32 dpll = pipe_config->dpll_hw_state.dpll;
++ 
++ 	if ((dpll & PLL_REF_INPUT_MASK) == PLLB_REF_INPUT_SPREADSPECTRUMIN)
++ 		return dev_priv->vbt.lvds_ssc_freq;
++ 	else if (HAS_PCH_SPLIT(dev))
++ 		return 120000;
++ 	else if (!IS_GEN2(dev))
++ 		return 96000;
++ 	else
++ 		return 48000;
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  }
+  
+  /* Returns the clock of the currently programmed mode of the given pipe. */
+@@@ -10233,6 -12648,7 +10282,10 @@@ static void intel_enable_pipe_a(struct 
+  	struct intel_connector *connector;
+  	struct drm_connector *crt = NULL;
+  	struct intel_load_detect_pipe load_detect_temp;
+++<<<<<<< HEAD
+++=======
++ 	struct drm_modeset_acquire_ctx *ctx = dev->mode_config.acquire_ctx;
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  
+  	/* We can't just switch on the pipe A, we need to set things up with a
+  	 * proper mode and output configuration. As a gross hack, enable pipe A
+@@@ -10249,10 -12665,8 +10302,15 @@@
+  	if (!crt)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp))
+ +		intel_release_load_detect_pipe(crt, &load_detect_temp);
+ +
+ +
+++=======
++ 	if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp, ctx))
++ 		intel_release_load_detect_pipe(crt, &load_detect_temp);
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  }
+  
+  static bool
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 7f2b384ac939,fe3431f96900..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -616,73 -710,141 +616,100 @@@ hdmi_to_dig_port(struct intel_hdmi *int
+  	return container_of(intel_hdmi, struct intel_digital_port, hdmi);
+  }
+  
+ -
+ -/* i915_irq.c */
+ -bool intel_set_cpu_fifo_underrun_reporting(struct drm_device *dev,
+ -					   enum pipe pipe, bool enable);
+ -bool intel_set_pch_fifo_underrun_reporting(struct drm_device *dev,
+ -					   enum transcoder pch_transcoder,
+ -					   bool enable);
+ -void gen5_enable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void gen5_disable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void gen6_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void gen6_disable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void gen8_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void gen8_disable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ -void intel_runtime_pm_disable_interrupts(struct drm_device *dev);
+ -void intel_runtime_pm_restore_interrupts(struct drm_device *dev);
+ -static inline bool intel_irqs_enabled(struct drm_i915_private *dev_priv)
+ -{
+ -	/*
+ -	 * We only use drm_irq_uninstall() at unload and VT switch, so
+ -	 * this is the only thing we need to check.
+ -	 */
+ -	return !dev_priv->pm._irqs_disabled;
+ -}
+ -
+ -int intel_get_crtc_scanline(struct intel_crtc *crtc);
+ -void i9xx_check_fifo_underruns(struct drm_device *dev);
+ -void gen8_irq_power_well_post_enable(struct drm_i915_private *dev_priv);
+ -
+ -/* intel_crt.c */
+ -void intel_crt_init(struct drm_device *dev);
+ -
+ -
+ -/* intel_ddi.c */
+ -void intel_prepare_ddi(struct drm_device *dev);
+ -void hsw_fdi_link_train(struct drm_crtc *crtc);
+ -void intel_ddi_init(struct drm_device *dev, enum port port);
+ -enum port intel_ddi_get_encoder_port(struct intel_encoder *intel_encoder);
+ -bool intel_ddi_get_hw_state(struct intel_encoder *encoder, enum pipe *pipe);
+ -int intel_ddi_get_cdclk_freq(struct drm_i915_private *dev_priv);
+ -void intel_ddi_pll_init(struct drm_device *dev);
+ -void intel_ddi_enable_transcoder_func(struct drm_crtc *crtc);
+ -void intel_ddi_disable_transcoder_func(struct drm_i915_private *dev_priv,
+ -				       enum transcoder cpu_transcoder);
+ -void intel_ddi_enable_pipe_clock(struct intel_crtc *intel_crtc);
+ -void intel_ddi_disable_pipe_clock(struct intel_crtc *intel_crtc);
+ -bool intel_ddi_pll_select(struct intel_crtc *crtc);
+ -void intel_ddi_set_pipe_settings(struct drm_crtc *crtc);
+ -void intel_ddi_prepare_link_retrain(struct drm_encoder *encoder);
+ -bool intel_ddi_connector_get_hw_state(struct intel_connector *intel_connector);
+ -void intel_ddi_fdi_disable(struct drm_crtc *crtc);
+ -void intel_ddi_get_config(struct intel_encoder *encoder,
+ -			  struct intel_crtc_config *pipe_config);
+ -
+ -void intel_ddi_init_dp_buf_reg(struct intel_encoder *encoder);
+ -void intel_ddi_clock_get(struct intel_encoder *encoder,
+ -			 struct intel_crtc_config *pipe_config);
+ -void intel_ddi_set_vc_payload_alloc(struct drm_crtc *crtc, bool state);
+ -
+ -/* intel_display.c */
+ -const char *intel_output_name(int output);
+ -bool intel_has_pending_fb_unpin(struct drm_device *dev);
+ -int intel_pch_rawclk(struct drm_device *dev);
+ -void intel_mark_busy(struct drm_device *dev);
+ -void intel_fb_obj_invalidate(struct drm_i915_gem_object *obj,
+ -			     struct intel_engine_cs *ring);
+ -void intel_frontbuffer_flip_prepare(struct drm_device *dev,
+ -				    unsigned frontbuffer_bits);
+ -void intel_frontbuffer_flip_complete(struct drm_device *dev,
+ -				     unsigned frontbuffer_bits);
+ -void intel_frontbuffer_flush(struct drm_device *dev,
+ -			     unsigned frontbuffer_bits);
+ -/**
+ - * intel_frontbuffer_flip - prepare frontbuffer flip
+ - * @dev: DRM device
+ - * @frontbuffer_bits: frontbuffer plane tracking bits
+ - *
+ - * This function gets called after scheduling a flip on @obj. This is for
+ - * synchronous plane updates which will happen on the next vblank and which will
+ - * not get delayed by pending gpu rendering.
+ - *
+ - * Can be called without any locks held.
+ - */
+ -static inline
+ -void intel_frontbuffer_flip(struct drm_device *dev,
+ -			    unsigned frontbuffer_bits)
+ -{
+ -	intel_frontbuffer_flush(dev, frontbuffer_bits);
+ -}
+ -
+ -void intel_fb_obj_flush(struct drm_i915_gem_object *obj, bool retire);
+ -void intel_mark_idle(struct drm_device *dev);
+ -void intel_crtc_restore_mode(struct drm_crtc *crtc);
+ -void intel_crtc_control(struct drm_crtc *crtc, bool enable);
+ -void intel_crtc_update_dpms(struct drm_crtc *crtc);
+ -void intel_encoder_destroy(struct drm_encoder *encoder);
+ -void intel_connector_dpms(struct drm_connector *, int mode);
+ -bool intel_connector_get_hw_state(struct intel_connector *connector);
+ -void intel_modeset_check_state(struct drm_device *dev);
+  bool ibx_digital_port_connected(struct drm_i915_private *dev_priv,
+  				struct intel_digital_port *port);
+ -void intel_connector_attach_encoder(struct intel_connector *connector,
+ -				    struct intel_encoder *encoder);
+ -struct drm_encoder *intel_best_encoder(struct drm_connector *connector);
+ -struct drm_display_mode *intel_crtc_mode_get(struct drm_device *dev,
+ -					     struct drm_crtc *crtc);
+ -enum pipe intel_get_pipe_from_connector(struct intel_connector *connector);
+ +
+ +extern void intel_connector_attach_encoder(struct intel_connector *connector,
+ +					   struct intel_encoder *encoder);
+ +extern struct drm_encoder *intel_best_encoder(struct drm_connector *connector);
+ +
+ +extern struct drm_display_mode *intel_crtc_mode_get(struct drm_device *dev,
+ +						    struct drm_crtc *crtc);
+  int intel_get_pipe_from_crtc_id(struct drm_device *dev, void *data,
+  				struct drm_file *file_priv);
+++<<<<<<< HEAD
+ +extern enum transcoder
+ +intel_pipe_to_cpu_transcoder(struct drm_i915_private *dev_priv,
+ +			     enum pipe pipe);
+ +extern void intel_wait_for_vblank(struct drm_device *dev, int pipe);
+ +extern void intel_wait_for_pipe_off(struct drm_device *dev, int pipe);
+ +extern int ironlake_get_lanes_required(int target_clock, int link_bw, int bpp);
+ +extern void vlv_wait_port_ready(struct drm_i915_private *dev_priv, int port);
+ +
+ +struct intel_load_detect_pipe {
+ +	struct drm_framebuffer *release_fb;
+ +	bool load_detect_temp;
+ +	int dpms_mode;
+ +};
+ +extern bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ +				       struct drm_display_mode *mode,
+ +				       struct intel_load_detect_pipe *old);
+ +extern void intel_release_load_detect_pipe(struct drm_connector *connector,
+ +					   struct intel_load_detect_pipe *old);
+ +
+ +extern void intel_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
+ +				    u16 blue, int regno);
+ +extern void intel_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
+ +				    u16 *blue, int regno);
+ +
+ +extern int intel_pin_and_fence_fb_obj(struct drm_device *dev,
+ +				      struct drm_i915_gem_object *obj,
+ +				      struct intel_ring_buffer *pipelined);
+ +extern void intel_unpin_fb_obj(struct drm_i915_gem_object *obj);
+ +
+ +extern int intel_framebuffer_init(struct drm_device *dev,
+ +				  struct intel_framebuffer *ifb,
+ +				  struct drm_mode_fb_cmd2 *mode_cmd,
+ +				  struct drm_i915_gem_object *obj);
+ +extern void intel_framebuffer_fini(struct intel_framebuffer *fb);
+ +extern int intel_fbdev_init(struct drm_device *dev);
+ +extern void intel_fbdev_initial_config(struct drm_device *dev);
+ +extern void intel_fbdev_fini(struct drm_device *dev);
+ +extern void intel_fbdev_set_suspend(struct drm_device *dev, int state);
+ +extern void intel_prepare_page_flip(struct drm_device *dev, int plane);
+ +extern void intel_finish_page_flip(struct drm_device *dev, int pipe);
+ +extern void intel_finish_page_flip_plane(struct drm_device *dev, int plane);
+ +
+ +extern void intel_setup_overlay(struct drm_device *dev);
+ +extern void intel_cleanup_overlay(struct drm_device *dev);
+ +extern int intel_overlay_switch_off(struct intel_overlay *overlay);
+ +extern int intel_overlay_put_image(struct drm_device *dev, void *data,
+ +				   struct drm_file *file_priv);
+ +extern int intel_overlay_attrs(struct drm_device *dev, void *data,
+ +			       struct drm_file *file_priv);
+ +
+ +extern void intel_fb_output_poll_changed(struct drm_device *dev);
+ +extern void intel_fb_restore_mode(struct drm_device *dev);
+ +
+ +struct intel_shared_dpll *
+ +intel_crtc_to_shared_dpll(struct intel_crtc *crtc);
+++=======
++ enum transcoder intel_pipe_to_cpu_transcoder(struct drm_i915_private *dev_priv,
++ 					     enum pipe pipe);
++ void intel_wait_for_vblank(struct drm_device *dev, int pipe);
++ void intel_wait_for_pipe_off(struct drm_device *dev, int pipe);
++ int ironlake_get_lanes_required(int target_clock, int link_bw, int bpp);
++ void vlv_wait_port_ready(struct drm_i915_private *dev_priv,
++ 			 struct intel_digital_port *dport);
++ bool intel_get_load_detect_pipe(struct drm_connector *connector,
++ 				struct drm_display_mode *mode,
++ 				struct intel_load_detect_pipe *old,
++ 				struct drm_modeset_acquire_ctx *ctx);
++ void intel_release_load_detect_pipe(struct drm_connector *connector,
++ 				    struct intel_load_detect_pipe *old);
++ int intel_pin_and_fence_fb_obj(struct drm_device *dev,
++ 			       struct drm_i915_gem_object *obj,
++ 			       struct intel_engine_cs *pipelined);
++ void intel_unpin_fb_obj(struct drm_i915_gem_object *obj);
++ struct drm_framebuffer *
++ __intel_framebuffer_create(struct drm_device *dev,
++ 			   struct drm_mode_fb_cmd2 *mode_cmd,
++ 			   struct drm_i915_gem_object *obj);
++ void intel_prepare_page_flip(struct drm_device *dev, int plane);
++ void intel_finish_page_flip(struct drm_device *dev, int pipe);
++ void intel_finish_page_flip_plane(struct drm_device *dev, int plane);
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  
+ -/* shared dpll functions */
+ -struct intel_shared_dpll *intel_crtc_to_shared_dpll(struct intel_crtc *crtc);
+  void assert_shared_dpll(struct drm_i915_private *dev_priv,
+  			struct intel_shared_dpll *pll,
+  			bool state);
+diff --cc drivers/gpu/drm/i915/intel_tv.c
+index dd6f84bf6c22,32186a656816..000000000000
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@@ -1316,8 -1321,11 +1316,14 @@@ intel_tv_detect(struct drm_connector *c
+  
+  	if (force) {
+  		struct intel_load_detect_pipe tmp;
+ -		struct drm_modeset_acquire_ctx ctx;
+  
+++<<<<<<< HEAD
+ +		if (intel_get_load_detect_pipe(connector, &mode, &tmp)) {
+++=======
++ 		drm_modeset_acquire_init(&ctx, 0);
++ 
++ 		if (intel_get_load_detect_pipe(connector, &mode, &tmp, &ctx)) {
+++>>>>>>> 208bf9fdcd35 (drm/i915: Fix locking for intel_enable_pipe_a())
+  			type = intel_tv_detect_type(intel_tv, connector);
+  			intel_release_load_detect_pipe(connector, &tmp);
+  		} else
+* Unmerged path drivers/gpu/drm/i915/intel_crt.c
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+* Unmerged path drivers/gpu/drm/i915/intel_tv.c
