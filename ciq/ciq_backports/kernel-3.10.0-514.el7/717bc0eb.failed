@@ -1,0 +1,260 @@
+xfs: refactor in-core log state update to helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 717bc0ebca0bce9cb3edfc31b49b384a1d55db1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/717bc0eb.failed
+
+Once the record at the head of the log is identified and verified, the
+in-core log state is updated based on the record. This includes
+information such as the current head block and cycle, the start block of
+the last record written to the log, the tail lsn, etc.
+
+Once torn write detection is conditional, this logic will need to be
+reused. Factor the code to update the in-core log data structures into a
+new helper function. This patch does not change behavior.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 717bc0ebca0bce9cb3edfc31b49b384a1d55db1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_recover.c
+diff --cc fs/xfs/xfs_log_recover.c
+index 9a0cd900d9ce,9ac8aa8dc38c..000000000000
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@@ -1199,6 -1199,115 +1199,118 @@@ xlog_verify_head
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Check whether the head of the log points to an unmount record. In other
++  * words, determine whether the log is clean. If so, update the in-core state
++  * appropriately.
++  */
++ static int
++ xlog_check_unmount_rec(
++ 	struct xlog		*log,
++ 	xfs_daddr_t		*head_blk,
++ 	xfs_daddr_t		*tail_blk,
++ 	struct xlog_rec_header	*rhead,
++ 	xfs_daddr_t		rhead_blk,
++ 	struct xfs_buf		*bp,
++ 	bool			*clean)
++ {
++ 	struct xlog_op_header	*op_head;
++ 	xfs_daddr_t		umount_data_blk;
++ 	xfs_daddr_t		after_umount_blk;
++ 	int			hblks;
++ 	int			error;
++ 	char			*offset;
++ 
++ 	*clean = false;
++ 
++ 	/*
++ 	 * Look for unmount record. If we find it, then we know there was a
++ 	 * clean unmount. Since 'i' could be the last block in the physical
++ 	 * log, we convert to a log block before comparing to the head_blk.
++ 	 *
++ 	 * Save the current tail lsn to use to pass to xlog_clear_stale_blocks()
++ 	 * below. We won't want to clear the unmount record if there is one, so
++ 	 * we pass the lsn of the unmount record rather than the block after it.
++ 	 */
++ 	if (xfs_sb_version_haslogv2(&log->l_mp->m_sb)) {
++ 		int	h_size = be32_to_cpu(rhead->h_size);
++ 		int	h_version = be32_to_cpu(rhead->h_version);
++ 
++ 		if ((h_version & XLOG_VERSION_2) &&
++ 		    (h_size > XLOG_HEADER_CYCLE_SIZE)) {
++ 			hblks = h_size / XLOG_HEADER_CYCLE_SIZE;
++ 			if (h_size % XLOG_HEADER_CYCLE_SIZE)
++ 				hblks++;
++ 		} else {
++ 			hblks = 1;
++ 		}
++ 	} else {
++ 		hblks = 1;
++ 	}
++ 	after_umount_blk = rhead_blk + hblks + BTOBB(be32_to_cpu(rhead->h_len));
++ 	after_umount_blk = do_mod(after_umount_blk, log->l_logBBsize);
++ 	if (*head_blk == after_umount_blk &&
++ 	    be32_to_cpu(rhead->h_num_logops) == 1) {
++ 		umount_data_blk = rhead_blk + hblks;
++ 		umount_data_blk = do_mod(umount_data_blk, log->l_logBBsize);
++ 		error = xlog_bread(log, umount_data_blk, 1, bp, &offset);
++ 		if (error)
++ 			return error;
++ 
++ 		op_head = (struct xlog_op_header *)offset;
++ 		if (op_head->oh_flags & XLOG_UNMOUNT_TRANS) {
++ 			/*
++ 			 * Set tail and last sync so that newly written log
++ 			 * records will point recovery to after the current
++ 			 * unmount record.
++ 			 */
++ 			xlog_assign_atomic_lsn(&log->l_tail_lsn,
++ 					log->l_curr_cycle, after_umount_blk);
++ 			xlog_assign_atomic_lsn(&log->l_last_sync_lsn,
++ 					log->l_curr_cycle, after_umount_blk);
++ 			*tail_blk = after_umount_blk;
++ 
++ 			*clean = true;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ xlog_set_state(
++ 	struct xlog		*log,
++ 	xfs_daddr_t		head_blk,
++ 	struct xlog_rec_header	*rhead,
++ 	xfs_daddr_t		rhead_blk,
++ 	bool			bump_cycle)
++ {
++ 	/*
++ 	 * Reset log values according to the state of the log when we
++ 	 * crashed.  In the case where head_blk == 0, we bump curr_cycle
++ 	 * one because the next write starts a new cycle rather than
++ 	 * continuing the cycle of the last good log record.  At this
++ 	 * point we have guaranteed that all partial log records have been
++ 	 * accounted for.  Therefore, we know that the last good log record
++ 	 * written was complete and ended exactly on the end boundary
++ 	 * of the physical log.
++ 	 */
++ 	log->l_prev_block = rhead_blk;
++ 	log->l_curr_block = (int)head_blk;
++ 	log->l_curr_cycle = be32_to_cpu(rhead->h_cycle);
++ 	if (bump_cycle)
++ 		log->l_curr_cycle++;
++ 	atomic64_set(&log->l_tail_lsn, be64_to_cpu(rhead->h_tail_lsn));
++ 	atomic64_set(&log->l_last_sync_lsn, be64_to_cpu(rhead->h_lsn));
++ 	xlog_assign_grant_head(&log->l_reserve_head.grant, log->l_curr_cycle,
++ 					BBTOB(log->l_curr_block));
++ 	xlog_assign_grant_head(&log->l_write_head.grant, log->l_curr_cycle,
++ 					BBTOB(log->l_curr_block));
++ }
++ 
++ /*
+++>>>>>>> 717bc0ebca0b (xfs: refactor in-core log state update to helper)
+   * Find the sync block number or the tail of the log.
+   *
+   * This will be the block number of the last record to have its
+@@@ -1281,86 -1387,27 +1393,83 @@@ xlog_find_tail
+  		goto done;
+  
+  	/*
+- 	 * Reset log values according to the state of the log when we
+- 	 * crashed.  In the case where head_blk == 0, we bump curr_cycle
+- 	 * one because the next write starts a new cycle rather than
+- 	 * continuing the cycle of the last good log record.  At this
+- 	 * point we have guaranteed that all partial log records have been
+- 	 * accounted for.  Therefore, we know that the last good log record
+- 	 * written was complete and ended exactly on the end boundary
+- 	 * of the physical log.
++ 	 * Set the log state based on the current head record.
+  	 */
+ -	xlog_set_state(log, *head_blk, rhead, rhead_blk, wrapped);
+ -	tail_lsn = atomic64_read(&log->l_tail_lsn);
+++<<<<<<< HEAD
+ +	log->l_prev_block = rhead_blk;
+ +	log->l_curr_block = (int)*head_blk;
+ +	log->l_curr_cycle = be32_to_cpu(rhead->h_cycle);
+ +	if (wrapped)
+ +		log->l_curr_cycle++;
+ +	atomic64_set(&log->l_tail_lsn, be64_to_cpu(rhead->h_tail_lsn));
+ +	atomic64_set(&log->l_last_sync_lsn, be64_to_cpu(rhead->h_lsn));
+ +	xlog_assign_grant_head(&log->l_reserve_head.grant, log->l_curr_cycle,
+ +					BBTOB(log->l_curr_block));
+ +	xlog_assign_grant_head(&log->l_write_head.grant, log->l_curr_cycle,
+ +					BBTOB(log->l_curr_block));
+  
+  	/*
+ -	 * Look for an unmount record at the head of the log. This sets the log
+ -	 * state to determine whether recovery is necessary.
+ +	 * Look for unmount record.  If we find it, then we know there
+ +	 * was a clean unmount.  Since 'i' could be the last block in
+ +	 * the physical log, we convert to a log block before comparing
+ +	 * to the head_blk.
+ +	 *
+ +	 * Save the current tail lsn to use to pass to
+ +	 * xlog_clear_stale_blocks() below.  We won't want to clear the
+ +	 * unmount record if there is one, so we pass the lsn of the
+ +	 * unmount record rather than the block after it.
+  	 */
+ -	error = xlog_check_unmount_rec(log, head_blk, tail_blk, rhead,
+ -				       rhead_blk, bp, &clean);
+ -	if (error)
+ -		goto done;
+ +	if (xfs_sb_version_haslogv2(&log->l_mp->m_sb)) {
+ +		int	h_size = be32_to_cpu(rhead->h_size);
+ +		int	h_version = be32_to_cpu(rhead->h_version);
+  
+ -	/*
+ -	 * Note that the unmount was clean. If the unmount was not clean, we
+ -	 * need to know this to rebuild the superblock counters from the perag
+ -	 * headers if we have a filesystem using non-persistent counters.
+ -	 */
+ -	if (clean)
+ -		log->l_mp->m_flags |= XFS_MOUNT_WAS_CLEAN;
+ +		if ((h_version & XLOG_VERSION_2) &&
+ +		    (h_size > XLOG_HEADER_CYCLE_SIZE)) {
+ +			hblks = h_size / XLOG_HEADER_CYCLE_SIZE;
+ +			if (h_size % XLOG_HEADER_CYCLE_SIZE)
+ +				hblks++;
+ +		} else {
+ +			hblks = 1;
+ +		}
+ +	} else {
+ +		hblks = 1;
+ +	}
+ +	after_umount_blk = rhead_blk + hblks + BTOBB(be32_to_cpu(rhead->h_len));
+ +	after_umount_blk = do_mod(after_umount_blk, log->l_logBBsize);
+++=======
+++	xlog_set_state(log, *head_blk, rhead, rhead_blk, wrapped);
+++>>>>>>> 717bc0ebca0b (xfs: refactor in-core log state update to helper)
+ +	tail_lsn = atomic64_read(&log->l_tail_lsn);
+ +	if (*head_blk == after_umount_blk &&
+ +	    be32_to_cpu(rhead->h_num_logops) == 1) {
+ +		umount_data_blk = rhead_blk + hblks;
+ +		umount_data_blk = do_mod(umount_data_blk, log->l_logBBsize);
+ +		error = xlog_bread(log, umount_data_blk, 1, bp, &offset);
+ +		if (error)
+ +			goto done;
+ +
+ +		op_head = (xlog_op_header_t *)offset;
+ +		if (op_head->oh_flags & XLOG_UNMOUNT_TRANS) {
+ +			/*
+ +			 * Set tail and last sync so that newly written
+ +			 * log records will point recovery to after the
+ +			 * current unmount record.
+ +			 */
+ +			xlog_assign_atomic_lsn(&log->l_tail_lsn,
+ +					log->l_curr_cycle, after_umount_blk);
+ +			xlog_assign_atomic_lsn(&log->l_last_sync_lsn,
+ +					log->l_curr_cycle, after_umount_blk);
+ +			*tail_blk = after_umount_blk;
+ +
+ +			/*
+ +			 * Note that the unmount was clean. If the unmount
+ +			 * was not clean, we need to know this to rebuild the
+ +			 * superblock counters from the perag headers if we
+ +			 * have a filesystem using non-persistent counters.
+ +			 */
+ +			log->l_mp->m_flags |= XFS_MOUNT_WAS_CLEAN;
+ +		}
+ +	}
+  
+  	/*
+  	 * Make sure that there are no blocks in front of the head
+* Unmerged path fs/xfs/xfs_log_recover.c
