@@ -1,0 +1,736 @@
+mei: bus: add me client device list infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 0ff0a8d853039aa60bba3ca3e04e4fb74584a736
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0ff0a8d8.failed
+
+Instead of holding the list of host clients (me_cl)
+we want to keep the list me client devices (mei_cl_device)
+This way we can create host to me client connection only when needed.
+Add list head to mei_cl_device and cl_bus_lock
+Add bus_added flag to the me client (mei_me_client) to track if
+the appropriate mei_cl_device was already created and is_added
+flag to mei_cl_device to track if it was already added to the device
+list across the bus rescans
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 0ff0a8d853039aa60bba3ca3e04e4fb74584a736)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/init.c
+#	drivers/misc/mei/mei_dev.h
+#	include/linux/mei_cl_bus.h
+diff --cc drivers/misc/mei/bus.c
+index 3365981198e7,34b14dda050c..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -31,195 -30,311 +31,204 @@@
+  #define to_mei_cl_driver(d) container_of(d, struct mei_cl_driver, driver)
+  #define to_mei_cl_device(d) container_of(d, struct mei_cl_device, dev)
+  
+ -/**
+ - * __mei_cl_send - internal client send (write)
+ - *
+ - * @cl: host client
+ - * @buf: buffer to send
+ - * @length: buffer length
+ - * @blocking: wait for write completion
+ - *
+ - * Return: written size bytes or < 0 on error
+ - */
+ -ssize_t __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length,
+ -			bool blocking)
+ +static int mei_cl_device_match(struct device *dev, struct device_driver *drv)
+  {
+ -	struct mei_device *bus;
+ -	struct mei_cl_cb *cb = NULL;
+ -	ssize_t rets;
+ -
+ -	if (WARN_ON(!cl || !cl->dev))
+ -		return -ENODEV;
+ +	struct mei_cl_device *device = to_mei_cl_device(dev);
+ +	struct mei_cl_driver *driver = to_mei_cl_driver(drv);
+ +	const struct mei_cl_device_id *id;
+  
+ -	bus = cl->dev;
+ +	if (!device)
+ +		return 0;
+  
+ -	mutex_lock(&bus->device_lock);
+ -	if (!mei_cl_is_connected(cl)) {
+ -		rets = -ENODEV;
+ -		goto out;
+ -	}
+ +	if (!driver || !driver->id_table)
+ +		return 0;
+  
+ -	/* Check if we have an ME client device */
+ -	if (!mei_me_cl_is_active(cl->me_cl)) {
+ -		rets = -ENOTTY;
+ -		goto out;
+ -	}
+ +	id = driver->id_table;
+  
+ -	if (length > mei_cl_mtu(cl)) {
+ -		rets = -EFBIG;
+ -		goto out;
+ -	}
+ +	while (id->name[0]) {
+ +		if (!strncmp(dev_name(dev), id->name, sizeof(id->name)))
+ +			return 1;
+  
+ -	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, NULL);
+ -	if (!cb) {
+ -		rets = -ENOMEM;
+ -		goto out;
+ +		id++;
+  	}
+  
+ -	memcpy(cb->buf.data, buf, length);
+ -
+ -	rets = mei_cl_write(cl, cb, blocking);
+ -
+ -out:
+ -	mutex_unlock(&bus->device_lock);
+ -	if (rets < 0)
+ -		mei_io_cb_free(cb);
+ -
+ -	return rets;
+ +	return 0;
+  }
+  
+ -/**
+ - * __mei_cl_recv - internal client receive (read)
+ - *
+ - * @cl: host client
+ - * @buf: buffer to send
+ - * @length: buffer length
+ - *
+ - * Return: read size in bytes of < 0 on error
+ - */
+ -ssize_t __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length)
+ +static int mei_cl_device_probe(struct device *dev)
+  {
+ -	struct mei_device *bus;
+ -	struct mei_cl_cb *cb;
+ -	size_t r_length;
+ -	ssize_t rets;
+ +	struct mei_cl_device *device = to_mei_cl_device(dev);
+ +	struct mei_cl_driver *driver;
+ +	struct mei_cl_device_id id;
+  
+ -	if (WARN_ON(!cl || !cl->dev))
+ -		return -ENODEV;
+ -
+ -	bus = cl->dev;
+ -
+ -	mutex_lock(&bus->device_lock);
+ -
+ -	cb = mei_cl_read_cb(cl, NULL);
+ -	if (cb)
+ -		goto copy;
+ +	if (!device)
+ +		return 0;
+  
+ -	rets = mei_cl_read_start(cl, length, NULL);
+ -	if (rets && rets != -EBUSY)
+ -		goto out;
+ +	driver = to_mei_cl_driver(dev->driver);
+ +	if (!driver || !driver->probe)
+ +		return -ENODEV;
+  
+ -	/* wait on event only if there is no other waiter */
+ -	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
+ +	dev_dbg(dev, "Device probe\n");
+  
+ -		mutex_unlock(&bus->device_lock);
+ +	strlcpy(id.name, dev_name(dev), sizeof(id.name));
+  
+ -		if (wait_event_interruptible(cl->rx_wait,
+ -				(!list_empty(&cl->rd_completed)) ||
+ -				(!mei_cl_is_connected(cl)))) {
+ +	return driver->probe(device, &id);
+ +}
+  
+ -			if (signal_pending(current))
+ -				return -EINTR;
+ -			return -ERESTARTSYS;
+ -		}
+ +static int mei_cl_device_remove(struct device *dev)
+ +{
+ +	struct mei_cl_device *device = to_mei_cl_device(dev);
+ +	struct mei_cl_driver *driver;
+  
+ -		mutex_lock(&bus->device_lock);
+ +	if (!device || !dev->driver)
+ +		return 0;
+  
+ -		if (!mei_cl_is_connected(cl)) {
+ -			rets = -EBUSY;
+ -			goto out;
+ -		}
+ +	if (device->event_cb) {
+ +		device->event_cb = NULL;
+ +		cancel_work_sync(&device->event_work);
+  	}
+  
+ -	cb = mei_cl_read_cb(cl, NULL);
+ -	if (!cb) {
+ -		rets = 0;
+ -		goto out;
+ -	}
+ +	driver = to_mei_cl_driver(dev->driver);
+ +	if (!driver->remove) {
+ +		dev->driver = NULL;
+  
+ -copy:
+ -	if (cb->status) {
+ -		rets = cb->status;
+ -		goto free;
+ +		return 0;
+  	}
+  
+ -	r_length = min_t(size_t, length, cb->buf_idx);
+ -	memcpy(buf, cb->buf.data, r_length);
+ -	rets = r_length;
+ -
+ -free:
+ -	mei_io_cb_free(cb);
+ -out:
+ -	mutex_unlock(&bus->device_lock);
+ -
+ -	return rets;
+ +	return driver->remove(device);
+  }
+  
+ -/**
+ - * mei_cl_send - me device send  (write)
+ - *
+ - * @cldev: me client device
+ - * @buf: buffer to send
+ - * @length: buffer length
+ - *
+ - * Return: written size in bytes or < 0 on error
+ - */
+ -ssize_t mei_cl_send(struct mei_cl_device *cldev, u8 *buf, size_t length)
+ +static ssize_t modalias_show(struct device *dev, struct device_attribute *a,
+ +			     char *buf)
+  {
+ -	struct mei_cl *cl = cldev->cl;
+ +	int len;
+  
+ -	if (cl == NULL)
+ -		return -ENODEV;
+ +	len = snprintf(buf, PAGE_SIZE, "mei:%s\n", dev_name(dev));
+  
+ -	return __mei_cl_send(cl, buf, length, 1);
+ +	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
+  }
+ -EXPORT_SYMBOL_GPL(mei_cl_send);
+ +static DEVICE_ATTR_RO(modalias);
+ +
+ +static struct attribute *mei_cl_dev_attrs[] = {
+ +	&dev_attr_modalias.attr,
+ +	NULL,
+ +};
+ +ATTRIBUTE_GROUPS(mei_cl_dev);
+  
+  /**
+ - * mei_cl_recv - client receive (read)
+ + * mei_cl_device_uevent - me client bus uevent handler
+   *
+ - * @cldev: me client device
+ - * @buf: buffer to send
+ - * @length: buffer length
+ + * @dev: device
+ + * @env: uevent kobject
+   *
+ - * Return: read size in bytes of < 0 on error
+ + * Return: 0 on success -ENOMEM on when add_uevent_var fails
+   */
+ -ssize_t mei_cl_recv(struct mei_cl_device *cldev, u8 *buf, size_t length)
+ +static int mei_cl_device_uevent(struct device *dev, struct kobj_uevent_env *env)
+  {
+ -	struct mei_cl *cl = cldev->cl;
+ -
+ -	if (cl == NULL)
+ -		return -ENODEV;
+ +	if (add_uevent_var(env, "MODALIAS=mei:%s", dev_name(dev)))
+ +		return -ENOMEM;
+  
+ -	return __mei_cl_recv(cl, buf, length);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(mei_cl_recv);
+  
+ -/**
+ - * mei_bus_event_work  - dispatch rx event for a bus device
+ - *    and schedule new work
+ - *
+ - * @work: work
+ - */
+ -static void mei_bus_event_work(struct work_struct *work)
+ +static struct bus_type mei_cl_bus_type = {
+ +	.name		= "mei",
+ +	.dev_groups	= mei_cl_dev_groups,
+ +	.match		= mei_cl_device_match,
+ +	.probe		= mei_cl_device_probe,
+ +	.remove		= mei_cl_device_remove,
+ +	.uevent		= mei_cl_device_uevent,
+ +};
+ +
+ +static void mei_cl_dev_release(struct device *dev)
+  {
+ -	struct mei_cl_device *cldev;
+ +	kfree(to_mei_cl_device(dev));
+ +}
+  
+ -	cldev = container_of(work, struct mei_cl_device, event_work);
+ +static struct device_type mei_cl_device_type = {
+ +	.release	= mei_cl_dev_release,
+ +};
+  
+ -	if (cldev->event_cb)
+ -		cldev->event_cb(cldev, cldev->events, cldev->event_context);
+ +static struct mei_cl *mei_bus_find_mei_cl_by_uuid(struct mei_device *dev,
+ +						uuid_le uuid)
+ +{
+ +	struct mei_cl *cl;
+  
+ -	cldev->events = 0;
+ +	list_for_each_entry(cl, &dev->device_list, device_link) {
+ +		if (!uuid_le_cmp(uuid, cl->device_uuid))
+ +			return cl;
+ +	}
+  
+ -	/* Prepare for the next read */
+ -	mei_cl_read_start(cldev->cl, 0, NULL);
+ +	return NULL;
+  }
+ -
+ -/**
+ - * mei_cl_bus_rx_event  - schedule rx evenet
+ - *
+ - * @cl: host client
+ - */
+ -void mei_cl_bus_rx_event(struct mei_cl *cl)
+ +struct mei_cl_device *mei_cl_add_device(struct mei_device *dev,
+ +					uuid_le uuid, char *name,
+ +					struct mei_cl_ops *ops)
+  {
+ -	struct mei_cl_device *cldev = cl->cldev;
+ +	struct mei_cl_device *device;
+ +	struct mei_cl *cl;
+ +	int status;
+  
+ -	if (!cldev || !cldev->event_cb)
+ -		return;
+ +	cl = mei_bus_find_mei_cl_by_uuid(dev, uuid);
+ +	if (cl == NULL)
+ +		return NULL;
+  
+ -	set_bit(MEI_CL_EVENT_RX, &cldev->events);
+ +	device = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
+ +	if (!device)
+ +		return NULL;
+  
+ -	schedule_work(&cldev->event_work);
+ -}
+++<<<<<<< HEAD
+ +	device->cl = cl;
+ +	device->ops = ops;
+++=======
+++	cldev->cl = cl;
+++	cldev->dev.parent = bus->dev;
+++	cldev->dev.bus = &mei_cl_bus_type;
+++	cldev->dev.type = &mei_cl_device_type;
+++	cldev->bus      = mei_dev_bus_get(bus);
+++	INIT_LIST_HEAD(&cldev->bus_list);
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+  
+ -/**
+ - * mei_cl_register_event_cb - register event callback
+ - *
+ - * @cldev: me client devices
+ - * @event_cb: callback function
+ - * @context: driver context data
+ - *
+ - * Return: 0 on success
+ - *         -EALREADY if an callback is already registered
+ - *         <0 on other errors
+ - */
+ -int mei_cl_register_event_cb(struct mei_cl_device *cldev,
+ -			  mei_cl_event_cb_t event_cb, void *context)
+ -{
+ -	int ret;
+ +	device->dev.parent = &dev->pdev->dev;
+ +	device->dev.bus = &mei_cl_bus_type;
+ +	device->dev.type = &mei_cl_device_type;
+  
+ -	if (cldev->event_cb)
+ -		return -EALREADY;
+ +	dev_set_name(&device->dev, "%s", name);
+  
+ -	cldev->events = 0;
+ -	cldev->event_cb = event_cb;
+ -	cldev->event_context = context;
+ -	INIT_WORK(&cldev->event_work, mei_bus_event_work);
+ +	status = device_register(&device->dev);
+ +	if (status) {
+ +		dev_err(&dev->pdev->dev, "Failed to register MEI device\n");
+ +		kfree(device);
+ +		return NULL;
+ +	}
+  
+ -	ret = mei_cl_read_start(cldev->cl, 0, NULL);
+ -	if (ret && ret != -EBUSY)
+ -		return ret;
+ +	cl->device = device;
+  
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL_GPL(mei_cl_register_event_cb);
+ +	dev_dbg(&device->dev, "client %s registered\n", name);
+  
+ -/**
+ - * mei_cl_get_drvdata - driver data getter
+ - *
+ - * @cldev: mei client device
+ - *
+ - * Return: driver private data
+ - */
+ -void *mei_cl_get_drvdata(const struct mei_cl_device *cldev)
+ -{
+ -	return dev_get_drvdata(&cldev->dev);
+ +	return device;
+  }
+ -EXPORT_SYMBOL_GPL(mei_cl_get_drvdata);
+ +EXPORT_SYMBOL_GPL(mei_cl_add_device);
+  
+ -/**
+ - * mei_cl_set_drvdata - driver data setter
+ - *
+ - * @cldev: mei client device
+ - * @data: data to store
+ - */
+ -void mei_cl_set_drvdata(struct mei_cl_device *cldev, void *data)
+ +void mei_cl_remove_device(struct mei_cl_device *device)
+  {
+ -	dev_set_drvdata(&cldev->dev, data);
+ +	device_unregister(&device->dev);
+  }
+ -EXPORT_SYMBOL_GPL(mei_cl_set_drvdata);
+ +EXPORT_SYMBOL_GPL(mei_cl_remove_device);
+  
+ -/**
+ - * mei_cl_enable_device - enable me client device
+ - *     create connection with me client
+ - *
+ - * @cldev: me client device
+ - *
+ - * Return: 0 on success and < 0 on error
+ - */
+ -int mei_cl_enable_device(struct mei_cl_device *cldev)
+ +int __mei_cl_driver_register(struct mei_cl_driver *driver, struct module *owner)
+  {
+  	int err;
+ -	struct mei_device *bus;
+ -	struct mei_cl *cl = cldev->cl;
+ -
+ -	if (cl == NULL)
+ -		return -ENODEV;
+ -
+ -	bus = cl->dev;
+ -
+ -	mutex_lock(&bus->device_lock);
+ -
+ -	if (mei_cl_is_connected(cl)) {
+ -		mutex_unlock(&bus->device_lock);
+ -		dev_warn(bus->dev, "Already connected");
+ -		return -EBUSY;
+ -	}
+  
+ -	err = mei_cl_connect(cl, cldev->me_cl, NULL);
+ -	if (err < 0) {
+ -		mutex_unlock(&bus->device_lock);
+ -		dev_err(bus->dev, "Could not connect to the ME client");
+ +	driver->driver.name = driver->name;
+ +	driver->driver.owner = owner;
+ +	driver->driver.bus = &mei_cl_bus_type;
+  
+ +	err = driver_register(&driver->driver);
+ +	if (err)
+  		return err;
+ -	}
+  
+ -	mutex_unlock(&bus->device_lock);
+ +	pr_debug("mei: driver [%s] registered\n", driver->driver.name);
+  
+  	return 0;
+  }
+diff --cc drivers/misc/mei/init.c
+index 08331e745faf,15000e9231b1..000000000000
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@@ -368,7 -387,10 +368,12 @@@ void mei_device_init(struct mei_device 
+  	/* setup our list array */
+  	INIT_LIST_HEAD(&dev->file_list);
+  	INIT_LIST_HEAD(&dev->device_list);
+ -	INIT_LIST_HEAD(&dev->me_clients);
+  	mutex_init(&dev->device_lock);
+++<<<<<<< HEAD
+++=======
++ 	init_rwsem(&dev->me_clients_rwsem);
++ 	mutex_init(&dev->cl_bus_lock);
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+  	init_waitqueue_head(&dev->wait_hw_ready);
+  	init_waitqueue_head(&dev->wait_pg);
+  	init_waitqueue_head(&dev->wait_hbm_start);
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,882e6f77084a..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -173,14 -172,22 +173,29 @@@ struct mei_fw_status 
+  /**
+   * struct mei_me_client - representation of me (fw) client
+   *
+++<<<<<<< HEAD
+ + * @props  - client properties
+ + * @client_id - me client id
+ + * @mei_flow_ctrl_creds - flow control credits
+++=======
++  * @list: link in me client list
++  * @refcnt: struct reference count
++  * @props: client properties
++  * @client_id: me client id
++  * @mei_flow_ctrl_creds: flow control credits
++  * @connect_count: number connections to this client
++  * @bus_added: added to bus
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+   */
+  struct mei_me_client {
+ -	struct list_head list;
+ -	struct kref refcnt;
+  	struct mei_client_properties props;
+  	u8 client_id;
+  	u8 mei_flow_ctrl_creds;
+++<<<<<<< HEAD
+++=======
++ 	u8 connect_count;
++ 	u8 bus_added;
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+  };
+  
+  
+@@@ -382,55 -375,95 +397,129 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported : hbm feature pgi protocol
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @allow_fixed_address: allow user space to connect a fixed client
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  * @cl_bus_lock : client bus list lock
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+   */
+  struct mei_device {
+ -	struct device *dev;
+ -	struct cdev cdev;
+ -	int minor;
+ -
+ -	struct mei_cl_cb write_list;
+ -	struct mei_cl_cb write_waiting_list;
+ -	struct mei_cl_cb ctrl_wr_list;
+ -	struct mei_cl_cb ctrl_rd_list;
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+diff --cc include/linux/mei_cl_bus.h
+index d14af7b722ef,85239138251c..000000000000
+--- a/include/linux/mei_cl_bus.h
++++ b/include/linux/mei_cl_bus.h
+@@@ -3,8 -3,52 +3,54 @@@
+  
+  #include <linux/device.h>
+  #include <linux/uuid.h>
+ -#include <linux/mod_devicetable.h>
+  
+  struct mei_cl_device;
+++<<<<<<< HEAD
+++=======
++ struct mei_device;
++ 
++ typedef void (*mei_cl_event_cb_t)(struct mei_cl_device *device,
++ 			       u32 events, void *context);
++ 
++ /**
++  * struct mei_cl_device - MEI device handle
++  * An mei_cl_device pointer is returned from mei_add_device()
++  * and links MEI bus clients to their actual ME host client pointer.
++  * Drivers for MEI devices will get an mei_cl_device pointer
++  * when being probed and shall use it for doing ME bus I/O.
++  *
++  * @bus_list: device on the bus list
++  * @bus: parent mei device
++  * @dev: linux driver model device pointer
++  * @me_cl: me client
++  * @cl: mei client
++  * @name: device name
++  * @event_work: async work to execute event callback
++  * @event_cb: Drivers register this callback to get asynchronous ME
++  *	events (e.g. Rx buffer pending) notifications.
++  * @event_context: event callback run context
++  * @events: Events bitmask sent to the driver.
++  * @is_added: device is already scanned
++  * @priv_data: client private data
++  */
++ struct mei_cl_device {
++ 	struct list_head bus_list;
++ 	struct mei_device *bus;
++ 	struct device dev;
++ 
++ 	struct mei_me_client *me_cl;
++ 	struct mei_cl *cl;
++ 	char name[MEI_CL_NAME_SIZE];
++ 
++ 	struct work_struct event_work;
++ 	mei_cl_event_cb_t event_cb;
++ 	void *event_context;
++ 	unsigned long events;
++ 	unsigned int is_added:1;
++ 
++ 	void *priv_data;
++ };
+++>>>>>>> 0ff0a8d85303 (mei: bus: add me client device list infrastructure)
+  
+  struct mei_cl_driver {
+  	struct device_driver driver;
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/init.c
+* Unmerged path drivers/misc/mei/mei_dev.h
+* Unmerged path include/linux/mei_cl_bus.h
