@@ -2540,7 +2540,7 @@ static int i40e_set_rxfh(struct net_device *netdev, const u32 *indir,
  *
  * Returns a u32 bitmap of flags.
  **/
-u32 i40e_get_priv_flags(struct net_device *dev)
+static u32 i40e_get_priv_flags(struct net_device *dev)
 {
 	struct i40e_netdev_priv *np = netdev_priv(dev);
 	struct i40e_vsi *vsi = np->vsi;
