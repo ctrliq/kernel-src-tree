@@ -1,0 +1,316 @@
+sched/numa: Be more careful about joining numa groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Rik van Riel <riel@redhat.com>
+commit dabe1d992414a6456e60e41f1d1ad8affc6d444d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/dabe1d99.failed
+
+Due to the way the pid is truncated, and tasks are moved between
+CPUs by the scheduler, it is possible for the current task_numa_fault
+to group together tasks that do not actually share memory together.
+
+This patch adds a few easy sanity checks to task_numa_fault, joining
+tasks together if they share the same tsk->mm, or if the fault was on
+a page with an elevated mapcount, in a shared VMA.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-57-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit dabe1d992414a6456e60e41f1d1ad8affc6d444d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/fair.c
+#	mm/memory.c
+diff --cc include/linux/sched.h
+index 664a046b12fb,59f953b2e413..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1441,13 -1452,24 +1441,20 @@@ struct task_struct 
+  /* Future-safe accessor for struct task_struct's cpus_allowed. */
+  #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+  
+++<<<<<<< HEAD
+++=======
++ #define TNF_MIGRATED	0x01
++ #define TNF_NO_GROUP	0x02
++ #define TNF_SHARED	0x04
++ 
+++>>>>>>> dabe1d992414 (sched/numa: Be more careful about joining numa groups)
+  #ifdef CONFIG_NUMA_BALANCING
+ -extern void task_numa_fault(int last_node, int node, int pages, int flags);
+ -extern pid_t task_numa_group_id(struct task_struct *p);
+ +extern void task_numa_fault(int node, int pages, bool migrated);
+  extern void set_numabalancing_state(bool enabled);
+ -extern void task_numa_free(struct task_struct *p);
+  #else
+ -static inline void task_numa_fault(int last_node, int node, int pages,
+ -				   int flags)
+ +static inline void task_numa_fault(int node, int pages, bool migrated)
+  {
+  }
+ -static inline pid_t task_numa_group_id(struct task_struct *p)
+ -{
+ -	return 0;
+ -}
+  static inline void set_numabalancing_state(bool enabled)
+  {
+  }
+diff --cc kernel/sched/fair.c
+index 98cee68da024,222c2d0b6ae2..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -866,11 -1326,180 +866,181 @@@ static void task_numa_placement(struct 
+  			max_faults = faults;
+  			max_nid = nid;
+  		}
+ -
+ -		if (group_faults > max_group_faults) {
+ -			max_group_faults = group_faults;
+ -			max_group_nid = nid;
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Update the tasks preferred node if necessary */
+ +	if (max_faults && max_nid != p->numa_preferred_nid)
+ +		p->numa_preferred_nid = max_nid;
+++=======
++ 	if (p->numa_group) {
++ 		/*
++ 		 * If the preferred task and group nids are different,
++ 		 * iterate over the nodes again to find the best place.
++ 		 */
++ 		if (max_nid != max_group_nid) {
++ 			unsigned long weight, max_weight = 0;
++ 
++ 			for_each_online_node(nid) {
++ 				weight = task_weight(p, nid) + group_weight(p, nid);
++ 				if (weight > max_weight) {
++ 					max_weight = weight;
++ 					max_nid = nid;
++ 				}
++ 			}
++ 		}
++ 
++ 		spin_unlock(group_lock);
++ 	}
++ 
++ 	/* Preferred node as the node with the most faults */
++ 	if (max_faults && max_nid != p->numa_preferred_nid) {
++ 		/* Update the preferred nid and migrate task if possible */
++ 		sched_setnuma(p, max_nid);
++ 		numa_migrate_preferred(p);
++ 	}
++ }
++ 
++ static inline int get_numa_group(struct numa_group *grp)
++ {
++ 	return atomic_inc_not_zero(&grp->refcount);
++ }
++ 
++ static inline void put_numa_group(struct numa_group *grp)
++ {
++ 	if (atomic_dec_and_test(&grp->refcount))
++ 		kfree_rcu(grp, rcu);
++ }
++ 
++ static void double_lock(spinlock_t *l1, spinlock_t *l2)
++ {
++ 	if (l1 > l2)
++ 		swap(l1, l2);
++ 
++ 	spin_lock(l1);
++ 	spin_lock_nested(l2, SINGLE_DEPTH_NESTING);
++ }
++ 
++ static void task_numa_group(struct task_struct *p, int cpupid, int flags)
++ {
++ 	struct numa_group *grp, *my_grp;
++ 	struct task_struct *tsk;
++ 	bool join = false;
++ 	int cpu = cpupid_to_cpu(cpupid);
++ 	int i;
++ 
++ 	if (unlikely(!p->numa_group)) {
++ 		unsigned int size = sizeof(struct numa_group) +
++ 				    2*nr_node_ids*sizeof(atomic_long_t);
++ 
++ 		grp = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
++ 		if (!grp)
++ 			return;
++ 
++ 		atomic_set(&grp->refcount, 1);
++ 		spin_lock_init(&grp->lock);
++ 		INIT_LIST_HEAD(&grp->task_list);
++ 		grp->gid = p->pid;
++ 
++ 		for (i = 0; i < 2*nr_node_ids; i++)
++ 			atomic_long_set(&grp->faults[i], p->numa_faults[i]);
++ 
++ 		atomic_long_set(&grp->total_faults, p->total_numa_faults);
++ 
++ 		list_add(&p->numa_entry, &grp->task_list);
++ 		grp->nr_tasks++;
++ 		rcu_assign_pointer(p->numa_group, grp);
++ 	}
++ 
++ 	rcu_read_lock();
++ 	tsk = ACCESS_ONCE(cpu_rq(cpu)->curr);
++ 
++ 	if (!cpupid_match_pid(tsk, cpupid))
++ 		goto unlock;
++ 
++ 	grp = rcu_dereference(tsk->numa_group);
++ 	if (!grp)
++ 		goto unlock;
++ 
++ 	my_grp = p->numa_group;
++ 	if (grp == my_grp)
++ 		goto unlock;
++ 
++ 	/*
++ 	 * Only join the other group if its bigger; if we're the bigger group,
++ 	 * the other task will join us.
++ 	 */
++ 	if (my_grp->nr_tasks > grp->nr_tasks)
++ 		goto unlock;
++ 
++ 	/*
++ 	 * Tie-break on the grp address.
++ 	 */
++ 	if (my_grp->nr_tasks == grp->nr_tasks && my_grp > grp)
++ 		goto unlock;
++ 
++ 	/* Always join threads in the same process. */
++ 	if (tsk->mm == current->mm)
++ 		join = true;
++ 
++ 	/* Simple filter to avoid false positives due to PID collisions */
++ 	if (flags & TNF_SHARED)
++ 		join = true;
++ 
++ 	if (join && !get_numa_group(grp))
++ 		join = false;
++ 
++ unlock:
++ 	rcu_read_unlock();
++ 
++ 	if (!join)
++ 		return;
++ 
++ 	for (i = 0; i < 2*nr_node_ids; i++) {
++ 		atomic_long_sub(p->numa_faults[i], &my_grp->faults[i]);
++ 		atomic_long_add(p->numa_faults[i], &grp->faults[i]);
++ 	}
++ 	atomic_long_sub(p->total_numa_faults, &my_grp->total_faults);
++ 	atomic_long_add(p->total_numa_faults, &grp->total_faults);
++ 
++ 	double_lock(&my_grp->lock, &grp->lock);
++ 
++ 	list_move(&p->numa_entry, &grp->task_list);
++ 	my_grp->nr_tasks--;
++ 	grp->nr_tasks++;
++ 
++ 	spin_unlock(&my_grp->lock);
++ 	spin_unlock(&grp->lock);
++ 
++ 	rcu_assign_pointer(p->numa_group, grp);
++ 
++ 	put_numa_group(my_grp);
++ }
++ 
++ void task_numa_free(struct task_struct *p)
++ {
++ 	struct numa_group *grp = p->numa_group;
++ 	int i;
++ 	void *numa_faults = p->numa_faults;
++ 
++ 	if (grp) {
++ 		for (i = 0; i < 2*nr_node_ids; i++)
++ 			atomic_long_sub(p->numa_faults[i], &grp->faults[i]);
++ 
++ 		atomic_long_sub(p->total_numa_faults, &grp->total_faults);
++ 
++ 		spin_lock(&grp->lock);
++ 		list_del(&p->numa_entry);
++ 		grp->nr_tasks--;
++ 		spin_unlock(&grp->lock);
++ 		rcu_assign_pointer(p->numa_group, NULL);
++ 		put_numa_group(grp);
++ 	}
++ 
++ 	p->numa_faults = NULL;
++ 	p->numa_faults_buffer = NULL;
++ 	kfree(numa_faults);
+++>>>>>>> dabe1d992414 (sched/numa: Be more careful about joining numa groups)
+  }
+  
+  /*
+@@@ -893,7 -1532,20 +1063,24 @@@ void task_numa_fault(int node, int page
+  			return;
+  
+  		BUG_ON(p->numa_faults_buffer);
+++<<<<<<< HEAD
+ +		p->numa_faults_buffer = p->numa_faults + nr_node_ids;
+++=======
++ 		p->numa_faults_buffer = p->numa_faults + (2 * nr_node_ids);
++ 		p->total_numa_faults = 0;
++ 	}
++ 
++ 	/*
++ 	 * First accesses are treated as private, otherwise consider accesses
++ 	 * to be private if the accessing pid has not changed
++ 	 */
++ 	if (unlikely(last_cpupid == (-1 & LAST_CPUPID_MASK))) {
++ 		priv = 1;
++ 	} else {
++ 		priv = cpupid_match_pid(p, last_cpupid);
++ 		if (!priv && !(flags & TNF_NO_GROUP))
++ 			task_numa_group(p, last_cpupid, flags);
+++>>>>>>> dabe1d992414 (sched/numa: Be more careful about joining numa groups)
+  	}
+  
+  	/*
+diff --cc mm/memory.c
+index 6285e7df615f,823720c43ea9..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3563,6 -3576,22 +3563,25 @@@ int do_numa_page(struct mm_struct *mm, 
+  	}
+  	BUG_ON(is_zero_pfn(page_to_pfn(page)));
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Avoid grouping on DSO/COW pages in specific and RO pages
++ 	 * in general, RO pages shouldn't hurt as much anyway since
++ 	 * they can be in shared cache state.
++ 	 */
++ 	if (!pte_write(pte))
++ 		flags |= TNF_NO_GROUP;
++ 
++ 	/*
++ 	 * Flag if the page is shared between multiple address spaces. This
++ 	 * is later used when determining whether to group tasks together
++ 	 */
++ 	if (page_mapcount(page) > 1 && (vma->vm_flags & VM_SHARED))
++ 		flags |= TNF_SHARED;
++ 
++ 	last_cpupid = page_cpupid_last(page);
+++>>>>>>> dabe1d992414 (sched/numa: Be more careful about joining numa groups)
+  	page_nid = page_to_nid(page);
+  	target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+  	pte_unmap_unlock(ptep, ptl);
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/fair.c
+* Unmerged path mm/memory.c
