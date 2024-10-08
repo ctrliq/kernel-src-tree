@@ -1,0 +1,561 @@
+KVM: PPC: Book3S HV: Accumulate timing information for real-mode code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s: Accumulate timing information for real-mode code (Thomas Huth) [1287474]
+Rebuild_FUZZ: 93.85%
+commit-author Paul Mackerras <paulus@samba.org>
+commit b6c295df3131c6fa25f8f29625ee0609506150ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b6c295df.failed
+
+This reads the timebase at various points in the real-mode guest
+entry/exit code and uses that to accumulate total, minimum and
+maximum time spent in those parts of the code.  Currently these
+times are accumulated per vcpu in 5 parts of the code:
+
+* rm_entry - time taken from the start of kvmppc_hv_entry() until
+  just before entering the guest.
+* rm_intr - time from when we take a hypervisor interrupt in the
+  guest until we either re-enter the guest or decide to exit to the
+  host.  This includes time spent handling hcalls in real mode.
+* rm_exit - time from when we decide to exit the guest until the
+  return from kvmppc_hv_entry().
+* guest - time spend in the guest
+* cede - time spent napping in real mode due to an H_CEDE hcall
+  while other threads in the same vcore are active.
+
+These times are exposed in debugfs in a directory per vcpu that
+contains a file called "timings".  This file contains one line for
+each of the 5 timings above, with the name followed by a colon and
+4 numbers, which are the count (number of times the code has been
+executed), the total time, the minimum time, and the maximum time,
+all in nanoseconds.
+
+The overhead of the extra code amounts to about 30ns for an hcall that
+is handled in real mode (e.g. H_SET_DABR), which is about 25%.  Since
+production environments may not wish to incur this overhead, the new
+code is conditional on a new config symbol,
+CONFIG_KVM_BOOK3S_HV_EXIT_TIMING.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit b6c295df3131c6fa25f8f29625ee0609506150ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 80d8d3b3232d,b06fe53fd509..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -262,15 -225,16 +262,21 @@@ kvm_novcpu_wakeup
+  	/* Got an IPI but other vcpus aren't yet exiting, must be a latecomer */
+  	ld	r4, HSTATE_KVM_VCPU(r13)
+  	cmpdi	r4, 0
+- 	bne	kvmppc_got_guest
++ 	beq	kvmppc_primary_no_guest
++ 
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r4, VCPU_TB_RMENTRY
++ 	bl	kvmhv_start_timing
++ #endif
++ 	b	kvmppc_got_guest
+  
+  kvm_novcpu_exit:
+ -	b	hdec_soon
+ +13:	mr	r3, r12
+ +	stw	r12, 112-4(r1)
+ +	bl	kvmhv_commence_exit
+ +	nop
+ +	lwz	r12, 112-4(r1)
+ +	b	kvmhv_switch_to_host
+  
+  /*
+   * We come in here when wakened from nap mode.
+@@@ -1151,22 -937,22 +1171,41 @@@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR
+  	hrfid
+  	b	.
+  
+++<<<<<<< HEAD
+ +secondary_too_late:
+ +	li	r12, 0
+ +	cmpdi	r4, 0
+ +	beq	11f
+ +	stw	r12, VCPU_TRAP(r4)
+ +11:	b	kvmhv_switch_to_host
+ +
+ +no_switch_exit:
+ +	HMT_MEDIUM
+ +	li	r12, 0
+ +	b	12f
+ +hdec_soon:
+ +	li	r12, BOOK3S_INTERRUPT_HV_DECREMENTER
+ +12:	stw	r12, VCPU_TRAP(r4)
+ +	mr	r9, r4
+ +	b	guest_exit_cont
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ secondary_too_late:
++ 	cmpdi	r4, 0
++ 	beq	11f
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ 11:	b	kvmhv_switch_to_host
++ 
++ hdec_soon:
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	cmpdi	r4, 0
++ 	beq	12f
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ 12:	b	kvmhv_do_exit
++ #endif
+++>>>>>>> b6c295df3131 (KVM: PPC: Book3S HV: Accumulate timing information for real-mode code)
+  
+  /******************************************************************************
+   *                                                                            *
+@@@ -1342,20 -1120,14 +1391,25 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  	cmpwi	r12, BOOK3S_INTERRUPT_MACHINE_CHECK
+  	beq	machine_check_realmode
+  mc_cont:
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r9, VCPU_TB_RMEXIT
++ 	mr	r4, r9
++ 	bl	kvmhv_accumulate_time
++ #endif
+  
+ +	/* Increment exit count, poke other threads to exit */
+ +	bl	kvmhv_commence_exit
+ +	nop
+ +	ld	r9, HSTATE_KVM_VCPU(r13)
+ +	lwz	r12, VCPU_TRAP(r9)
+ +
+ +	/* Stop others sending VCPU interrupts to this physical CPU */
+ +	li	r0, -1
+ +	stw	r0, VCPU_CPU(r9)
+ +	stw	r0, VCPU_THREAD_CPU(r9)
+ +
+  	/* Save guest CTRL register, set runlatch to 1 */
+ -6:	mfspr	r6,SPRN_CTRLF
+ +	mfspr	r6,SPRN_CTRLF
+  	stw	r6,VCPU_CTRL(r9)
+  	andi.	r0,r6,1
+  	bne	4f
+@@@ -1713,18 -1469,74 +1767,74 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  	slbia
+  	ptesync
+  
+++<<<<<<< HEAD
+ +BEGIN_FTR_SECTION
+ +	b	32f
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+++=======
++ #ifndef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ hdec_soon:
++ #endif
++ kvmhv_do_exit:			/* r12 = trap, r13 = paca */
+++>>>>>>> b6c295df3131 (KVM: PPC: Book3S HV: Accumulate timing information for real-mode code)
+  	/*
+ -	 * POWER7/POWER8 guest -> host partition switch code.
+ +	 * POWER7 guest -> host partition switch code.
+  	 * We don't have to lock against tlbies but we do
+  	 * have to coordinate the hardware threads.
+  	 */
+ -	/* Increment the threads-exiting-guest count in the 0xff00
+ -	   bits of vcore->entry_exit_count */
+ -	ld	r5,HSTATE_KVM_VCORE(r13)
+ -	addi	r6,r5,VCORE_ENTRY_EXIT
+ -41:	lwarx	r3,0,r6
+ -	addi	r0,r3,0x100
+ -	stwcx.	r0,0,r6
+ -	bne	41b
+ -	isync		/* order stwcx. vs. reading napping_threads */
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * At this point we have an interrupt that we have to pass
++ 	 * up to the kernel or qemu; we can't handle it in real mode.
++ 	 * Thus we have to do a partition switch, so we have to
++ 	 * collect the other threads, if we are the first thread
++ 	 * to take an interrupt.  To do this, we set the HDEC to 0,
++ 	 * which causes an HDEC interrupt in all threads within 2ns
++ 	 * because the HDEC register is shared between all 4 threads.
++ 	 * However, we don't need to bother if this is an HDEC
++ 	 * interrupt, since the other threads will already be on their
++ 	 * way here in that case.
++ 	 */
++ 	cmpwi	r3,0x100	/* Are we the first here? */
++ 	bge	43f
++ 	cmpwi	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
++ 	beq	40f
++ 	li	r0,0
++ 	mtspr	SPRN_HDEC,r0
++ 40:
++ 	/*
++ 	 * Send an IPI to any napping threads, since an HDEC interrupt
++ 	 * doesn't wake CPUs up from nap.
++ 	 */
++ 	lwz	r3,VCORE_NAPPING_THREADS(r5)
++ 	lbz	r4,HSTATE_PTID(r13)
++ 	li	r0,1
++ 	sld	r0,r0,r4
++ 	andc.	r3,r3,r0		/* no sense IPI'ing ourselves */
++ 	beq	43f
++ 	/* Order entry/exit update vs. IPIs */
++ 	sync
++ 	mulli	r4,r4,PACA_SIZE		/* get paca for thread 0 */
++ 	subf	r6,r4,r13
++ 42:	andi.	r0,r3,1
++ 	beq	44f
++ 	ld	r8,HSTATE_XICS_PHYS(r6)	/* get thread's XICS reg addr */
++ 	li	r0,IPI_PRIORITY
++ 	li	r7,XICS_MFRR
++ 	stbcix	r0,r7,r8		/* trigger the IPI */
++ 44:	srdi.	r3,r3,1
++ 	addi	r6,r6,PACA_SIZE
++ 	bne	42b
++ 
++ #ifndef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ secondary_too_late:
++ #endif
+++>>>>>>> b6c295df3131 (KVM: PPC: Book3S HV: Accumulate timing information for real-mode code)
+  kvmhv_switch_to_host:
+  	/* Secondary threads wait for primary to do partition switch */
+ -43:	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+  	ld	r4,VCORE_KVM(r5)	/* pointer to struct kvm */
+  	lbz	r3,HSTATE_PTID(r13)
+  	cmpwi	r3,0
+@@@ -2289,34 -2136,16 +2408,40 @@@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206
+  	/* save FP state */
+  	bl	kvmppc_save_fp
+  
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	addi	r3, r4, VCPU_TB_CEDE
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 
+ +	/*
+ +	 * Set DEC to the smaller of DEC and HDEC, so that we wake
+ +	 * no later than the end of our timeslice (HDEC interrupts
+ +	 * don't wake us from nap).
+ +	 */
+ +	mfspr	r3, SPRN_DEC
+ +	mfspr	r4, SPRN_HDEC
+ +	mftb	r5
+ +	cmpw	r3, r4
+ +	ble	67f
+ +	mtspr	SPRN_DEC, r4
+ +67:
+ +	/* save expiry time of guest decrementer */
+ +	extsw	r3, r3
+ +	add	r3, r3, r5
+ +	ld	r4, HSTATE_KVM_VCPU(r13)
+ +	ld	r5, HSTATE_KVM_VCORE(r13)
+ +	ld	r6, VCORE_TB_OFFSET(r5)
+ +	subf	r3, r6, r3	/* convert to host TB value */
+ +	std	r3, VCPU_DEC_EXPIRES(r4)
+ +
+ +	lis	r3, LPCR_PECEDP@h	/* Do wake on privileged doorbell */
+ +
+  	/*
+  	 * Take a nap until a decrementer or external or doobell interrupt
+ -	 * occurs, with PECE1, PECE0 and PECEDP set in LPCR. Also clear the
+ -	 * runlatch bit before napping.
+ +	 * occurs, with PECE1 and PECE0 set in LPCR.
+ +	 * On POWER8, set PECEDH, and if we are ceding, also set PECEDP.
+ +	 * Also clear the runlatch bit before napping.
+  	 */
+  kvm_do_nap:
+  	mfspr	r2, SPRN_CTRLF
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8c6b88818b5e..0fa52d04b034 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -393,6 +393,14 @@ struct kvmppc_slb {
+ 	u8 base_page_size;	/* MMU_PAGE_xxx */
+ };
+ 
++/* Struct used to accumulate timing information in HV real mode code */
++struct kvmhv_tb_accumulator {
++	u64	seqcount;	/* used to synchronize access, also count * 2 */
++	u64	tb_total;	/* total time in timebase ticks */
++	u64	tb_min;		/* min time */
++	u64	tb_max;		/* max time */
++};
++
+ # ifdef CONFIG_PPC_FSL_BOOK3E
+ #define KVMPPC_BOOKE_IAC_NUM	2
+ #define KVMPPC_BOOKE_DAC_NUM	2
+@@ -692,6 +700,19 @@ struct kvm_vcpu_arch {
+ 
+ 	u32 emul_inst;
+ #endif
++
++#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++	struct kvmhv_tb_accumulator *cur_activity;	/* What we're timing */
++	u64	cur_tb_start;			/* when it started */
++	struct kvmhv_tb_accumulator rm_entry;	/* real-mode entry code */
++	struct kvmhv_tb_accumulator rm_intr;	/* real-mode intr handling */
++	struct kvmhv_tb_accumulator rm_exit;	/* real-mode exit code */
++	struct kvmhv_tb_accumulator guest_time;	/* guest execution */
++	struct kvmhv_tb_accumulator cede_time;	/* time napping inside guest */
++
++	struct dentry *debugfs_dir;
++	struct dentry *debugfs_timings;
++#endif /* CONFIG_KVM_BOOK3S_HV_EXIT_TIMING */
+ };
+ 
+ #define VCPU_FPR(vcpu, i)	(vcpu)->arch.fp.fpr[i][TS_FPROFFSET]
+diff --git a/arch/powerpc/include/asm/time.h b/arch/powerpc/include/asm/time.h
+index 03cbada59d3a..10fc784a2ad4 100644
+--- a/arch/powerpc/include/asm/time.h
++++ b/arch/powerpc/include/asm/time.h
+@@ -211,5 +211,8 @@ extern void secondary_cpu_time_init(void);
+ 
+ DECLARE_PER_CPU(u64, decrementers_next_tb);
+ 
++/* Convert timebase ticks to nanoseconds */
++unsigned long long tb_to_ns(unsigned long long tb_ticks);
++
+ #endif /* __KERNEL__ */
+ #endif /* __POWERPC_TIME_H */
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index c65560f9a64f..0c838a27e778 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -452,6 +452,19 @@ int main(void)
+ 	DEFINE(VCPU_SPRG1, offsetof(struct kvm_vcpu, arch.shregs.sprg1));
+ 	DEFINE(VCPU_SPRG2, offsetof(struct kvm_vcpu, arch.shregs.sprg2));
+ 	DEFINE(VCPU_SPRG3, offsetof(struct kvm_vcpu, arch.shregs.sprg3));
++#endif
++#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++	DEFINE(VCPU_TB_RMENTRY, offsetof(struct kvm_vcpu, arch.rm_entry));
++	DEFINE(VCPU_TB_RMINTR, offsetof(struct kvm_vcpu, arch.rm_intr));
++	DEFINE(VCPU_TB_RMEXIT, offsetof(struct kvm_vcpu, arch.rm_exit));
++	DEFINE(VCPU_TB_GUEST, offsetof(struct kvm_vcpu, arch.guest_time));
++	DEFINE(VCPU_TB_CEDE, offsetof(struct kvm_vcpu, arch.cede_time));
++	DEFINE(VCPU_CUR_ACTIVITY, offsetof(struct kvm_vcpu, arch.cur_activity));
++	DEFINE(VCPU_ACTIVITY_START, offsetof(struct kvm_vcpu, arch.cur_tb_start));
++	DEFINE(TAS_SEQCOUNT, offsetof(struct kvmhv_tb_accumulator, seqcount));
++	DEFINE(TAS_TOTAL, offsetof(struct kvmhv_tb_accumulator, tb_total));
++	DEFINE(TAS_MIN, offsetof(struct kvmhv_tb_accumulator, tb_min));
++	DEFINE(TAS_MAX, offsetof(struct kvmhv_tb_accumulator, tb_max));
+ #endif
+ 	DEFINE(VCPU_SHARED_SPRG3, offsetof(struct kvm_vcpu_arch_shared, sprg3));
+ 	DEFINE(VCPU_SHARED_SPRG4, offsetof(struct kvm_vcpu_arch_shared, sprg4));
+diff --git a/arch/powerpc/kernel/time.c b/arch/powerpc/kernel/time.c
+index 914a1aebfc59..859343e21b75 100644
+--- a/arch/powerpc/kernel/time.c
++++ b/arch/powerpc/kernel/time.c
+@@ -607,6 +607,12 @@ void arch_suspend_enable_irqs(void)
+ }
+ #endif
+ 
++unsigned long long tb_to_ns(unsigned long long ticks)
++{
++	return mulhdu(ticks, tb_to_ns_scale) << tb_to_ns_shift;
++}
++EXPORT_SYMBOL_GPL(tb_to_ns);
++
+ /*
+  * Scheduler clock - returns current time in nanosec units.
+  *
+diff --git a/arch/powerpc/kvm/Kconfig b/arch/powerpc/kvm/Kconfig
+index acd7a573cffa..4ec24122d057 100644
+--- a/arch/powerpc/kvm/Kconfig
++++ b/arch/powerpc/kvm/Kconfig
+@@ -109,6 +109,20 @@ config KVM_BOOK3S_64_PR
+ 	  processor, including emulating 32-bit processors on a 64-bit
+ 	  host.
+ 
++config KVM_BOOK3S_HV_EXIT_TIMING
++	bool "Detailed timing for hypervisor real-mode code"
++	depends on KVM_BOOK3S_HV_POSSIBLE && DEBUG_FS
++	---help---
++	  Calculate time taken for each vcpu in the real-mode guest entry,
++	  exit, and interrupt handling code, plus time spent in the guest
++	  and in nap mode due to idle (cede) while other threads are still
++	  in the guest.  The total, minimum and maximum times in nanoseconds
++	  together with the number of executions are reported in debugfs in
++	  kvm/vm#/vcpu#/timings.  The overhead is of the order of 30 - 40
++	  ns per exit on POWER8.
++
++	  If unsure, say N.
++
+ config KVM_BOOKE_HV
+ 	bool
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 24c07628d44c..d9e255e08a59 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1467,6 +1467,154 @@ static struct kvmppc_vcore *kvmppc_vcore_create(struct kvm *kvm, int core)
+ 	return vcore;
+ }
+ 
++#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++static struct debugfs_timings_element {
++	const char *name;
++	size_t offset;
++} timings[] = {
++	{"rm_entry",	offsetof(struct kvm_vcpu, arch.rm_entry)},
++	{"rm_intr",	offsetof(struct kvm_vcpu, arch.rm_intr)},
++	{"rm_exit",	offsetof(struct kvm_vcpu, arch.rm_exit)},
++	{"guest",	offsetof(struct kvm_vcpu, arch.guest_time)},
++	{"cede",	offsetof(struct kvm_vcpu, arch.cede_time)},
++};
++
++#define N_TIMINGS	(sizeof(timings) / sizeof(timings[0]))
++
++struct debugfs_timings_state {
++	struct kvm_vcpu	*vcpu;
++	unsigned int	buflen;
++	char		buf[N_TIMINGS * 100];
++};
++
++static int debugfs_timings_open(struct inode *inode, struct file *file)
++{
++	struct kvm_vcpu *vcpu = inode->i_private;
++	struct debugfs_timings_state *p;
++
++	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	kvm_get_kvm(vcpu->kvm);
++	p->vcpu = vcpu;
++	file->private_data = p;
++
++	return nonseekable_open(inode, file);
++}
++
++static int debugfs_timings_release(struct inode *inode, struct file *file)
++{
++	struct debugfs_timings_state *p = file->private_data;
++
++	kvm_put_kvm(p->vcpu->kvm);
++	kfree(p);
++	return 0;
++}
++
++static ssize_t debugfs_timings_read(struct file *file, char __user *buf,
++				    size_t len, loff_t *ppos)
++{
++	struct debugfs_timings_state *p = file->private_data;
++	struct kvm_vcpu *vcpu = p->vcpu;
++	char *s, *buf_end;
++	struct kvmhv_tb_accumulator tb;
++	u64 count;
++	loff_t pos;
++	ssize_t n;
++	int i, loops;
++	bool ok;
++
++	if (!p->buflen) {
++		s = p->buf;
++		buf_end = s + sizeof(p->buf);
++		for (i = 0; i < N_TIMINGS; ++i) {
++			struct kvmhv_tb_accumulator *acc;
++
++			acc = (struct kvmhv_tb_accumulator *)
++				((unsigned long)vcpu + timings[i].offset);
++			ok = false;
++			for (loops = 0; loops < 1000; ++loops) {
++				count = acc->seqcount;
++				if (!(count & 1)) {
++					smp_rmb();
++					tb = *acc;
++					smp_rmb();
++					if (count == acc->seqcount) {
++						ok = true;
++						break;
++					}
++				}
++				udelay(1);
++			}
++			if (!ok)
++				snprintf(s, buf_end - s, "%s: stuck\n",
++					timings[i].name);
++			else
++				snprintf(s, buf_end - s,
++					"%s: %llu %llu %llu %llu\n",
++					timings[i].name, count / 2,
++					tb_to_ns(tb.tb_total),
++					tb_to_ns(tb.tb_min),
++					tb_to_ns(tb.tb_max));
++			s += strlen(s);
++		}
++		p->buflen = s - p->buf;
++	}
++
++	pos = *ppos;
++	if (pos >= p->buflen)
++		return 0;
++	if (len > p->buflen - pos)
++		len = p->buflen - pos;
++	n = copy_to_user(buf, p->buf + pos, len);
++	if (n) {
++		if (n == len)
++			return -EFAULT;
++		len -= n;
++	}
++	*ppos = pos + len;
++	return len;
++}
++
++static ssize_t debugfs_timings_write(struct file *file, const char __user *buf,
++				     size_t len, loff_t *ppos)
++{
++	return -EACCES;
++}
++
++static const struct file_operations debugfs_timings_ops = {
++	.owner	 = THIS_MODULE,
++	.open	 = debugfs_timings_open,
++	.release = debugfs_timings_release,
++	.read	 = debugfs_timings_read,
++	.write	 = debugfs_timings_write,
++	.llseek	 = generic_file_llseek,
++};
++
++/* Create a debugfs directory for the vcpu */
++static void debugfs_vcpu_init(struct kvm_vcpu *vcpu, unsigned int id)
++{
++	char buf[16];
++	struct kvm *kvm = vcpu->kvm;
++
++	snprintf(buf, sizeof(buf), "vcpu%u", id);
++	if (IS_ERR_OR_NULL(kvm->arch.debugfs_dir))
++		return;
++	vcpu->arch.debugfs_dir = debugfs_create_dir(buf, kvm->arch.debugfs_dir);
++	if (IS_ERR_OR_NULL(vcpu->arch.debugfs_dir))
++		return;
++	vcpu->arch.debugfs_timings =
++		debugfs_create_file("timings", 0444, vcpu->arch.debugfs_dir,
++				    vcpu, &debugfs_timings_ops);
++}
++
++#else /* CONFIG_KVM_BOOK3S_HV_EXIT_TIMING */
++static void debugfs_vcpu_init(struct kvm_vcpu *vcpu, unsigned int id)
++{
++}
++#endif /* CONFIG_KVM_BOOK3S_HV_EXIT_TIMING */
++
+ static struct kvm_vcpu *kvmppc_core_vcpu_create_hv(struct kvm *kvm,
+ 						   unsigned int id)
+ {
+@@ -1537,6 +1685,8 @@ static struct kvm_vcpu *kvmppc_core_vcpu_create_hv(struct kvm *kvm,
+ 	vcpu->arch.cpu_type = KVM_CPU_3S_64;
+ 	kvmppc_sanity_check(vcpu);
+ 
++	debugfs_vcpu_init(vcpu, id);
++
+ 	return vcpu;
+ 
+ free_vcpu:
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
