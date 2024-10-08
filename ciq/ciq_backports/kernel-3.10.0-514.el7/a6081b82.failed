@@ -1,0 +1,250 @@
+svcrdma: Make RDMA_ERROR messages work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit a6081b82c533d78041acb76738716aa7dafb339a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6081b82.failed
+
+Fix several issues with svc_rdma_send_error():
+
+ - Post a receive buffer to replace the one that was consumed by
+   the incoming request
+ - Posting a send should use DMA_TO_DEVICE, not DMA_FROM_DEVICE
+ - No need to put_page _and_ free pages in svc_rdma_put_context
+ - Make sure the sge is set up completely in case the error
+   path goes through svc_rdma_unmap_dma()
+ - Replace the use of ENOSYS, which has a reserved meaning
+
+Related fixes in svc_rdma_recvfrom():
+
+ - Don't leak the ctxt associated with the incoming request
+ - Don't close the connection after sending an error reply
+ - Let svc_rdma_send_error() figure out the right header error code
+
+As a last clean up, move svc_rdma_send_error() to svc_rdma_sendto.c
+with other similar functions. There is some common logic in these
+functions that could someday be combined to reduce code duplication.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Tested-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit a6081b82c533d78041acb76738716aa7dafb339a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 9188de1921b0,15c8fa3ee794..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@@ -1456,57 -1433,3 +1456,60 @@@ int svc_rdma_send(struct svcxprt_rdma *
+  	}
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +
+ +void svc_rdma_send_error(struct svcxprt_rdma *xprt, struct rpcrdma_msg *rmsgp,
+ +			 enum rpcrdma_errcode err)
+ +{
+ +	struct ib_send_wr err_wr;
+ +	struct page *p;
+ +	struct svc_rdma_op_ctxt *ctxt;
+ +	__be32 *va;
+ +	int length;
+ +	int ret;
+ +
+ +	p = alloc_page(GFP_KERNEL);
+ +	if (!p)
+ +		return;
+ +	va = page_address(p);
+ +
+ +	/* XDR encode error */
+ +	length = svc_rdma_xdr_encode_error(xprt, rmsgp, err, va);
+ +
+ +	ctxt = svc_rdma_get_context(xprt);
+ +	ctxt->direction = DMA_FROM_DEVICE;
+ +	ctxt->count = 1;
+ +	ctxt->pages[0] = p;
+ +
+ +	/* Prepare SGE for local address */
+ +	ctxt->sge[0].addr = ib_dma_map_page(xprt->sc_cm_id->device,
+ +					    p, 0, length, DMA_FROM_DEVICE);
+ +	if (ib_dma_mapping_error(xprt->sc_cm_id->device, ctxt->sge[0].addr)) {
+ +		put_page(p);
+ +		svc_rdma_put_context(ctxt, 1);
+ +		return;
+ +	}
+ +	atomic_inc(&xprt->sc_dma_used);
+ +	ctxt->sge[0].lkey = xprt->sc_dma_lkey;
+ +	ctxt->sge[0].length = length;
+ +
+ +	/* Prepare SEND WR */
+ +	memset(&err_wr, 0, sizeof err_wr);
+ +	ctxt->wr_op = IB_WR_SEND;
+ +	err_wr.wr_id = (unsigned long)ctxt;
+ +	err_wr.sg_list = ctxt->sge;
+ +	err_wr.num_sge = 1;
+ +	err_wr.opcode = IB_WR_SEND;
+ +	err_wr.send_flags = IB_SEND_SIGNALED;
+ +
+ +	/* Post It */
+ +	ret = svc_rdma_send(xprt, &err_wr);
+ +	if (ret) {
+ +		dprintk("svcrdma: Error %d posting send for protocol error\n",
+ +			ret);
+ +		svc_rdma_unmap_dma(ctxt);
+ +		svc_rdma_put_context(ctxt, 1);
+ +	}
+ +}
+++=======
+++>>>>>>> a6081b82c533 (svcrdma: Make RDMA_ERROR messages work)
+diff --git a/include/linux/sunrpc/svc_rdma.h b/include/linux/sunrpc/svc_rdma.h
+index aa20d5f0dab3..c2158ecd3b8f 100644
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -220,11 +220,11 @@ extern int svc_rdma_map_xdr(struct svcxprt_rdma *, struct xdr_buf *,
+ extern int svc_rdma_sendto(struct svc_rqst *);
+ extern struct rpcrdma_read_chunk *
+ 	svc_rdma_get_read_chunk(struct rpcrdma_msg *);
++extern void svc_rdma_send_error(struct svcxprt_rdma *, struct rpcrdma_msg *,
++				int);
+ 
+ /* svc_rdma_transport.c */
+ extern int svc_rdma_send(struct svcxprt_rdma *, struct ib_send_wr *);
+-extern void svc_rdma_send_error(struct svcxprt_rdma *, struct rpcrdma_msg *,
+-				enum rpcrdma_errcode);
+ extern int svc_rdma_post_recv(struct svcxprt_rdma *, gfp_t);
+ extern int svc_rdma_create_listen(struct svc_serv *, int, struct sockaddr *);
+ extern struct svc_rdma_op_ctxt *svc_rdma_get_context(struct svcxprt_rdma *);
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_marshal.c b/net/sunrpc/xprtrdma/svc_rdma_marshal.c
+index e2fca7617242..f74fc523d95b 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_marshal.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_marshal.c
+@@ -162,7 +162,7 @@ int svc_rdma_xdr_decode_req(struct rpcrdma_msg **rdma_req,
+ 	}
+ 
+ 	if (rmsgp->rm_vers != rpcrdma_version)
+-		return -ENOSYS;
++		return -EPROTONOSUPPORT;
+ 
+ 	/* Pull in the extra for the padded case and bump our pointer */
+ 	if (rmsgp->rm_type == rdma_msgp) {
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index f0c3ff67ca98..720f5f2c1193 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@ -573,7 +573,6 @@ int svc_rdma_recvfrom(struct svc_rqst *rqstp)
+ 	struct svc_rdma_op_ctxt *ctxt = NULL;
+ 	struct rpcrdma_msg *rmsgp;
+ 	int ret = 0;
+-	int len;
+ 
+ 	dprintk("svcrdma: rqstp=%p\n", rqstp);
+ 
+@@ -615,15 +614,10 @@ int svc_rdma_recvfrom(struct svc_rqst *rqstp)
+ 	rdma_build_arg_xdr(rqstp, ctxt, ctxt->byte_len);
+ 
+ 	/* Decode the RDMA header. */
+-	len = svc_rdma_xdr_decode_req(&rmsgp, rqstp);
+-	rqstp->rq_xprt_hlen = len;
+-
+-	/* If the request is invalid, reply with an error */
+-	if (len < 0) {
+-		if (len == -ENOSYS)
+-			svc_rdma_send_error(rdma_xprt, rmsgp, ERR_VERS);
+-		goto close_out;
+-	}
++	ret = svc_rdma_xdr_decode_req(&rmsgp, rqstp);
++	if (ret < 0)
++		goto out_err;
++	rqstp->rq_xprt_hlen = ret;
+ 
+ 	/* Read read-list data. */
+ 	ret = rdma_read_chunks(rdma_xprt, rmsgp, rqstp, ctxt);
+@@ -650,6 +644,11 @@ int svc_rdma_recvfrom(struct svc_rqst *rqstp)
+ 	svc_xprt_copy_addrs(rqstp, xprt);
+ 	return ret;
+ 
++out_err:
++	svc_rdma_send_error(rdma_xprt, rmsgp, ret);
++	svc_rdma_put_context(ctxt, 0);
++	return 0;
++
+  close_out:
+ 	if (ctxt)
+ 		svc_rdma_put_context(ctxt, 1);
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_sendto.c b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 239a59349b34..5553b0e184df 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@ -644,3 +644,65 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
+ 	svc_rdma_put_context(ctxt, 0);
+ 	return ret;
+ }
++
++void svc_rdma_send_error(struct svcxprt_rdma *xprt, struct rpcrdma_msg *rmsgp,
++			 int status)
++{
++	struct ib_send_wr err_wr;
++	struct page *p;
++	struct svc_rdma_op_ctxt *ctxt;
++	enum rpcrdma_errcode err;
++	__be32 *va;
++	int length;
++	int ret;
++
++	ret = svc_rdma_repost_recv(xprt, GFP_KERNEL);
++	if (ret)
++		return;
++
++	p = alloc_page(GFP_KERNEL);
++	if (!p)
++		return;
++	va = page_address(p);
++
++	/* XDR encode an error reply */
++	err = ERR_CHUNK;
++	if (status == -EPROTONOSUPPORT)
++		err = ERR_VERS;
++	length = svc_rdma_xdr_encode_error(xprt, rmsgp, err, va);
++
++	ctxt = svc_rdma_get_context(xprt);
++	ctxt->direction = DMA_TO_DEVICE;
++	ctxt->count = 1;
++	ctxt->pages[0] = p;
++
++	/* Prepare SGE for local address */
++	ctxt->sge[0].lkey = xprt->sc_pd->local_dma_lkey;
++	ctxt->sge[0].length = length;
++	ctxt->sge[0].addr = ib_dma_map_page(xprt->sc_cm_id->device,
++					    p, 0, length, DMA_TO_DEVICE);
++	if (ib_dma_mapping_error(xprt->sc_cm_id->device, ctxt->sge[0].addr)) {
++		dprintk("svcrdma: Error mapping buffer for protocol error\n");
++		svc_rdma_put_context(ctxt, 1);
++		return;
++	}
++	atomic_inc(&xprt->sc_dma_used);
++
++	/* Prepare SEND WR */
++	memset(&err_wr, 0, sizeof(err_wr));
++	ctxt->wr_op = IB_WR_SEND;
++	err_wr.wr_id = (unsigned long)ctxt;
++	err_wr.sg_list = ctxt->sge;
++	err_wr.num_sge = 1;
++	err_wr.opcode = IB_WR_SEND;
++	err_wr.send_flags = IB_SEND_SIGNALED;
++
++	/* Post It */
++	ret = svc_rdma_send(xprt, &err_wr);
++	if (ret) {
++		dprintk("svcrdma: Error %d posting send for protocol error\n",
++			ret);
++		svc_rdma_unmap_dma(ctxt);
++		svc_rdma_put_context(ctxt, 1);
++	}
++}
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_transport.c
