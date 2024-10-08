@@ -1,0 +1,159 @@
+net/mlx4_core: Allocate default counter per port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_core: Allocate default counter per port (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 95.65%
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 6de5f7f6a1fa2288552d46b3effbb6d5571413e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6de5f7f6.failed
+
+Default counter per port will be allocated at the mlx4 core driver load.
+
+Every QP opened by the Ethernet driver will be attached to the port's default
+counter.  This is an infrastructure step to collect VF statistics from the PF.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6de5f7f6a1fa2288552d46b3effbb6d5571413e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/main.c
+index 3392a2db1658,4e69cf52a579..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@@ -2058,6 -2342,45 +2104,48 @@@ void mlx4_counter_free(struct mlx4_dev 
+  }
+  EXPORT_SYMBOL_GPL(mlx4_counter_free);
+  
+++<<<<<<< HEAD
+++=======
++ int mlx4_get_default_counter_index(struct mlx4_dev *dev, int port)
++ {
++ 	struct mlx4_priv *priv = mlx4_priv(dev);
++ 
++ 	return priv->def_counter[port - 1];
++ }
++ EXPORT_SYMBOL_GPL(mlx4_get_default_counter_index);
++ 
++ void mlx4_set_admin_guid(struct mlx4_dev *dev, __be64 guid, int entry, int port)
++ {
++ 	struct mlx4_priv *priv = mlx4_priv(dev);
++ 
++ 	priv->mfunc.master.vf_admin[entry].vport[port].guid = guid;
++ }
++ EXPORT_SYMBOL_GPL(mlx4_set_admin_guid);
++ 
++ __be64 mlx4_get_admin_guid(struct mlx4_dev *dev, int entry, int port)
++ {
++ 	struct mlx4_priv *priv = mlx4_priv(dev);
++ 
++ 	return priv->mfunc.master.vf_admin[entry].vport[port].guid;
++ }
++ EXPORT_SYMBOL_GPL(mlx4_get_admin_guid);
++ 
++ void mlx4_set_random_admin_guid(struct mlx4_dev *dev, int entry, int port)
++ {
++ 	struct mlx4_priv *priv = mlx4_priv(dev);
++ 	__be64 guid;
++ 
++ 	/* hw GUID */
++ 	if (entry == 0)
++ 		return;
++ 
++ 	get_random_bytes((char *)&guid, sizeof(guid));
++ 	guid &= ~(cpu_to_be64(1ULL << 56));
++ 	guid |= cpu_to_be64(1ULL << 57);
++ 	priv->mfunc.master.vf_admin[entry].vport[port].guid = guid;
++ }
++ 
+++>>>>>>> 6de5f7f6a1fa (net/mlx4_core: Allocate default counter per port)
+  static int mlx4_setup_hca(struct mlx4_dev *dev)
+  {
+  	struct mlx4_priv *priv = mlx4_priv(dev);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 9a988b45c844..dfa4766d42ec 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1597,6 +1597,9 @@ int mlx4_en_start_port(struct net_device *dev)
+ 	}
+ 	mdev->mac_removed[priv->port] = 0;
+ 
++	priv->counter_index =
++			mlx4_get_default_counter_index(mdev->dev, priv->port);
++
+ 	err = mlx4_en_config_rss_steer(priv);
+ 	if (err) {
+ 		en_err(priv, "Failed configuring rss steering\n");
+@@ -1755,6 +1758,7 @@ void mlx4_en_stop_port(struct net_device *dev, int detach)
+ 
+ 	/* Set port as not active */
+ 	priv->port_up = false;
++	priv->counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
+ 
+ 	/* Promsicuous mode */
+ 	if (mdev->dev->caps.steering_mode ==
+@@ -2471,6 +2475,7 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+ 
+ 	priv = netdev_priv(dev);
+ 	memset(priv, 0, sizeof(struct mlx4_en_priv));
++	priv->counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
+ 	spin_lock_init(&priv->stats_lock);
+ 	INIT_WORK(&priv->rx_mode_task, mlx4_en_do_set_rx_mode);
+ 	INIT_WORK(&priv->watchdog_task, mlx4_en_restart);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_resources.c b/drivers/net/ethernet/mellanox/mlx4/en_resources.c
+index 97bcb9135f8d..e482fa1bb741 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_resources.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_resources.c
+@@ -66,7 +66,7 @@ void mlx4_en_fill_qp_context(struct mlx4_en_priv *priv, int size, int stride,
+ 		context->pri_path.sched_queue |= user_prio << 3;
+ 		context->pri_path.feup = MLX4_FEUP_FORCE_ETH_UP;
+ 	}
+-	context->pri_path.counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
++	context->pri_path.counter_index = priv->counter_index;
+ 	context->cqn_send = cpu_to_be32(cqn);
+ 	context->cqn_recv = cpu_to_be32(cqn);
+ 	context->db_rec_addr = cpu_to_be64(priv->res.db.dma << 2);
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4.h b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index cd5c0ac55f20..3c6e8e40d32d 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -856,6 +856,7 @@ struct mlx4_priv {
+ 	struct mlx4_qp_table	qp_table;
+ 	struct mlx4_mcg_table	mcg_table;
+ 	struct mlx4_bitmap	counters_bitmap;
++	int			def_counter[MLX4_MAX_PORTS];
+ 
+ 	struct mlx4_catas_err	catas_err;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 16811bfb94e5..d14b5c6a1ffe 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -572,6 +572,7 @@ struct mlx4_en_priv {
+ 	int base_tx_qpn;
+ 	struct hlist_head mac_hash[MLX4_EN_MAC_HASH_SIZE];
+ 	struct hwtstamp_config hwtstamp_config;
++	u32 counter_index;
+ 
+ #ifdef CONFIG_MLX4_EN_DCB
+ 	struct ieee_ets ets;
+diff --git a/include/linux/mlx4/device.h b/include/linux/mlx4/device.h
+index 4242e439bf86..13bf1dfad0eb 100644
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -1258,6 +1258,7 @@ int mlx4_wol_write(struct mlx4_dev *dev, u64 config, int port);
+ 
+ int mlx4_counter_alloc(struct mlx4_dev *dev, u32 *idx);
+ void mlx4_counter_free(struct mlx4_dev *dev, u32 idx);
++int mlx4_get_default_counter_index(struct mlx4_dev *dev, int port);
+ 
+ int mlx4_flow_attach(struct mlx4_dev *dev,
+ 		     struct mlx4_net_trans_rule *rule, u64 *reg_id);
