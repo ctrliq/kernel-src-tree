@@ -175,7 +175,7 @@ static struct lock_class_key socket_class;
 
 static void queue_con(struct ceph_connection *con);
 static void cancel_con(struct ceph_connection *con);
-static void con_work(struct work_struct *);
+static void ceph_con_workfn(struct work_struct *);
 static void con_fault(struct ceph_connection *con);
 
 /*
@@ -745,7 +745,7 @@ void ceph_con_init(struct ceph_connection *con, void *private,
 	mutex_init(&con->mutex);
 	INIT_LIST_HEAD(&con->out_queue);
 	INIT_LIST_HEAD(&con->out_sent);
-	INIT_DELAYED_WORK(&con->work, con_work);
+	INIT_DELAYED_WORK(&con->work, ceph_con_workfn);
 
 	con->state = CON_STATE_CLOSED;
 }
@@ -2800,7 +2800,7 @@ static void con_fault_finish(struct ceph_connection *con)
 /*
  * Do some work on a connection.  Drop a connection ref when we're done.
  */
-static void con_work(struct work_struct *work)
+static void ceph_con_workfn(struct work_struct *work)
 {
 	struct ceph_connection *con = container_of(work, struct ceph_connection,
 						   work.work);
