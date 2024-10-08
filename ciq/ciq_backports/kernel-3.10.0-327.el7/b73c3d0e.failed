@@ -1,0 +1,243 @@
+net: Save TX flow hash in sock and set in skbuf on xmit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] ip: Save TX flow hash in sock and set in skbuf on xmit (Ivan Vecera) [1215920]
+Rebuild_FUZZ: 95.41%
+commit-author Tom Herbert <therbert@google.com>
+commit b73c3d0e4f0e1961e15bec18720e48aabebe2109
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b73c3d0e.failed
+
+For a connected socket we can precompute the flow hash for setting
+in skb->hash on output. This is a performance advantage over
+calculating the skb->hash for every packet on the connection. The
+computation is done using the common hash algorithm to be consistent
+with computations done for packets of the connection in other states
+where thers is no socket (e.g. time-wait, syn-recv, syn-cookies).
+
+This patch adds sk_txhash to the sock structure. inet_set_txhash and
+ip6_set_txhash functions are added which are called from points in
+TCP and UDP where socket moves to established state.
+
+skb_set_hash_from_sk is a function which sets skb->hash from the
+sock txhash value. This is called in UDP and TCP transmit path when
+transmitting within the context of a socket.
+
+Tested: ran super_netperf with 200 TCP_RR streams over a vxlan
+interface (in this case skb_get_hash called on every TX packet to
+create a UDP source port).
+
+Before fix:
+
+  95.02% CPU utilization
+  154/256/505 90/95/99% latencies
+  1.13042e+06 tps
+
+  Time in functions:
+    0.28% skb_flow_dissect
+    0.21% __skb_get_hash
+
+After fix:
+
+  94.95% CPU utilization
+  156/254/485 90/95/99% latencies
+  1.15447e+06
+
+  Neither __skb_get_hash nor skb_flow_dissect appear in perf
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b73c3d0e4f0e1961e15bec18720e48aabebe2109)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+diff --cc include/net/ip.h
+index 01f9ccf5f537,2e8f055989c3..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -355,12 -354,17 +356,26 @@@ static inline __wsum inet_compute_pseud
+  				  skb->len, proto, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static inline __wsum inet_gro_compute_pseudo(struct sk_buff *skb, int proto)
+ +{
+ +	const struct iphdr *iph = skb_gro_network_header(skb);
+ +
+ +	return csum_tcpudp_nofold(iph->saddr, iph->daddr,
+ +				  skb_gro_len(skb), proto, 0);
+++=======
++ static inline void inet_set_txhash(struct sock *sk)
++ {
++ 	struct inet_sock *inet = inet_sk(sk);
++ 	struct flow_keys keys;
++ 
++ 	keys.src = inet->inet_saddr;
++ 	keys.dst = inet->inet_daddr;
++ 	keys.port16[0] = inet->inet_sport;
++ 	keys.port16[1] = inet->inet_dport;
++ 
++ 	sk->sk_txhash = flow_hash_from_keys(&keys);
+++>>>>>>> b73c3d0e4f0e (net: Save TX flow hash in sock and set in skbuf on xmit)
+  }
+  
+  /*
+* Unmerged path include/net/ip.h
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index a8cae4809670..794cd66114f6 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -19,6 +19,7 @@
+ #include <net/if_inet6.h>
+ #include <net/ndisc.h>
+ #include <net/flow.h>
++#include <net/flow_keys.h>
+ #include <net/snmp.h>
+ 
+ #define SIN6_LEN_RFC2133	24
+@@ -656,6 +657,20 @@ extern void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt);
+ 
+ extern int ip6_dst_hoplimit(struct dst_entry *dst);
+ 
++static inline void ip6_set_txhash(struct sock *sk)
++{
++	struct inet_sock *inet = inet_sk(sk);
++	struct ipv6_pinfo *np = inet6_sk(sk);
++	struct flow_keys keys;
++
++	keys.src = (__force __be32)ipv6_addr_hash(&np->saddr);
++	keys.dst = (__force __be32)ipv6_addr_hash(&sk->sk_v6_daddr);
++	keys.port16[0] = inet->inet_sport;
++	keys.port16[1] = inet->inet_dport;
++
++	sk->sk_txhash = flow_hash_from_keys(&keys);
++}
++
+ /*
+  *	Header manipulation
+  */
+diff --git a/include/net/sock.h b/include/net/sock.h
+index a7480947869a..8dca2cff4d13 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -272,6 +272,7 @@ struct cg_proto;
+   *	@sk_rcvtimeo: %SO_RCVTIMEO setting
+   *	@sk_sndtimeo: %SO_SNDTIMEO setting
+   *	@sk_rxhash: flow hash received from netif layer
++  *	@sk_txhash: computed flow hash for use on transmit
+   *	@sk_filter: socket filtering instructions
+   *	@sk_protinfo: private area, net family specific, when not using slab
+   *	@sk_timer: sock cleanup timer
+@@ -345,6 +346,7 @@ struct sock {
+ #ifdef CONFIG_RPS
+ 	__u32			sk_rxhash;
+ #endif
++	__u32			sk_txhash;
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	unsigned int		sk_napi_id;
+ 	unsigned int		sk_ll_usec;
+@@ -2031,6 +2033,14 @@ static inline void sock_poll_wait(struct file *filp,
+ 	}
+ }
+ 
++static inline void skb_set_hash_from_sk(struct sk_buff *skb, struct sock *sk)
++{
++	if (sk->sk_txhash) {
++		skb->l4_hash = 1;
++		skb->hash = sk->sk_txhash;
++	}
++}
++
+ /*
+  *	Queue a received datagram if it will fit. Stream and sequenced
+  *	protocols can't normally use this as they need to fit buffers in
+@@ -2045,6 +2055,7 @@ static inline void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+ 	skb->destructor = sock_wfree;
++	skb_set_hash_from_sk(skb, sk);
+ 	/*
+ 	 * We used to take a refcount on sk, but following operation
+ 	 * is enough to guarantee sk_free() wont free this sock until
+diff --git a/net/ipv4/datagram.c b/net/ipv4/datagram.c
+index 5f3dc1df04bf..5f3e5f2b0209 100644
+--- a/net/ipv4/datagram.c
++++ b/net/ipv4/datagram.c
+@@ -76,6 +76,7 @@ int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 	inet->inet_daddr = fl4->daddr;
+ 	inet->inet_dport = usin->sin_port;
+ 	sk->sk_state = TCP_ESTABLISHED;
++	inet_set_txhash(sk);
+ 	inet->inet_id = jiffies;
+ 
+ 	sk_dst_set(sk, &rt->dst);
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 10efd403b538..4aa2a5f2e08e 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -207,6 +207,8 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 	inet->inet_dport = usin->sin_port;
+ 	inet->inet_daddr = daddr;
+ 
++	inet_set_txhash(sk);
++
+ 	inet_csk(sk)->icsk_ext_hdr_len = 0;
+ 	if (inet_opt)
+ 		inet_csk(sk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+@@ -1650,6 +1652,7 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+ 	newinet->mc_ttl	      = ip_hdr(skb)->ttl;
+ 	newinet->rcv_tos      = ip_hdr(skb)->tos;
+ 	inet_csk(newsk)->icsk_ext_hdr_len = 0;
++	inet_set_txhash(newsk);
+ 	if (inet_opt)
+ 		inet_csk(newsk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+ 	newinet->inet_id = newtp->write_seq ^ jiffies;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 074c9a68acbd..e469653015da 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -924,6 +924,7 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+ 	skb->destructor = tcp_wfree;
++	skb_set_hash_from_sk(skb, sk);
+ 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
+ 
+ 	/* Build TCP header and checksum it. */
+diff --git a/net/ipv6/datagram.c b/net/ipv6/datagram.c
+index 8dfe1f4d3c1a..7d3ab1671434 100644
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@ -200,6 +200,7 @@ ipv4_connected:
+ 		      NULL);
+ 
+ 	sk->sk_state = TCP_ESTABLISHED;
++	ip6_set_txhash(sk);
+ out:
+ 	fl6_sock_release(flowlabel);
+ 	return err;
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 715cc96a3475..d0e03b9ebd2a 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -203,6 +203,8 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+ 	sk->sk_v6_daddr = usin->sin6_addr;
+ 	np->flow_label = fl6.flowlabel;
+ 
++	ip6_set_txhash(sk);
++
+ 	/*
+ 	 *	TCP over IPv4
+ 	 */
+@@ -1219,6 +1221,8 @@ static struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+ 	newsk->sk_v6_rcv_saddr = ireq->ir_v6_loc_addr;
+ 	newsk->sk_bound_dev_if = ireq->ir_iif;
+ 
++	ip6_set_txhash(newsk);
++
+ 	/* Now IPv6 options...
+ 
+ 	   First: no IPv4 options.
