@@ -1788,6 +1788,15 @@ out:
 	return status;
 }
 
+static int nvme_subsys_reset(struct nvme_dev *dev)
+{
+	if (!dev->subsystem)
+		return -ENOTTY;
+
+	writel(0x4E564D65, &dev->bar->nssr); /* "NVMe" */
+	return 0;
+}
+
 static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 							unsigned long arg)
 {
@@ -2799,6 +2808,8 @@ static long nvme_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case NVME_IOCTL_RESET:
 		dev_warn(&dev->pci_dev->dev, "resetting controller\n");
 		return nvme_reset(dev);
+	case NVME_IOCTL_SUBSYS_RESET:
+		return nvme_subsys_reset(dev);
 	default:
 		return -ENOTTY;
 	}
