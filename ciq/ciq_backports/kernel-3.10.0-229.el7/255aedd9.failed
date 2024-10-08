@@ -1,0 +1,207 @@
+kexec: use common function for kimage_normal_alloc() and kimage_crash_alloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 255aedd90e3e804fb52e1a71636a3b22cf12f81b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/255aedd9.failed
+
+kimage_normal_alloc() and kimage_crash_alloc() are doing lot of similar
+things and differ only little.  So instead of having two separate
+functions create a common function kimage_alloc_init() and pass it the
+"flags" argument which tells whether it is normal kexec or kexec_on_panic.
+ And this function should be able to deal with both the cases.
+
+This consolidation also helps later where we can use a common function
+kimage_file_alloc_init() to handle normal and crash cases for new file
+based kexec syscall.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Matthew Garrett <mjg59@srcf.ucam.org>
+	Cc: Greg Kroah-Hartman <greg@kroah.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: WANG Chao <chaowang@redhat.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 255aedd90e3e804fb52e1a71636a3b22cf12f81b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kexec.c
+diff --cc kernel/kexec.c
+index 4b1d9ca3907c,bfdda316697d..000000000000
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@@ -236,18 -261,41 +236,48 @@@ out
+  
+  static void kimage_free_page_list(struct list_head *list);
+  
+- static int kimage_normal_alloc(struct kimage **rimage, unsigned long entry,
+- 				unsigned long nr_segments,
+- 				struct kexec_segment __user *segments)
++ static int kimage_alloc_init(struct kimage **rimage, unsigned long entry,
++ 			     unsigned long nr_segments,
++ 			     struct kexec_segment __user *segments,
++ 			     unsigned long flags)
+  {
+- 	int result;
++ 	int ret;
+  	struct kimage *image;
++ 	bool kexec_on_panic = flags & KEXEC_ON_CRASH;
++ 
++ 	if (kexec_on_panic) {
++ 		/* Verify we have a valid entry point */
++ 		if ((entry < crashk_res.start) || (entry > crashk_res.end))
++ 			return -EADDRNOTAVAIL;
++ 	}
+  
+  	/* Allocate and initialize a controlling structure */
+++<<<<<<< HEAD
+ +	image = NULL;
+ +	result = do_kimage_alloc(&image, entry, nr_segments, segments);
+ +	if (result)
+ +		goto out;
+++=======
++ 	image = do_kimage_alloc_init();
++ 	if (!image)
++ 		return -ENOMEM;
++ 
++ 	image->start = entry;
++ 
++ 	ret = copy_user_segment_list(image, nr_segments, segments);
++ 	if (ret)
++ 		goto out_free_image;
++ 
++ 	ret = sanity_check_segment_list(image);
++ 	if (ret)
++ 		goto out_free_image;
+++>>>>>>> 255aedd90e3e (kexec: use common function for kimage_normal_alloc() and kimage_crash_alloc())
++ 
++ 	 /* Enable the special crash kernel control page allocation policy. */
++ 	if (kexec_on_panic) {
++ 		image->control_page = crashk_res.start;
++ 		image->type = KEXEC_TYPE_CRASH;
++ 	}
+  
+  	/*
+  	 * Find a location for the control code buffer, and add it
+@@@ -258,92 -306,25 +288,105 @@@
+  	image->control_code_page = kimage_alloc_control_pages(image,
+  					   get_order(KEXEC_CONTROL_PAGE_SIZE));
+  	if (!image->control_code_page) {
+ -		pr_err("Could not allocate control_code_buffer\n");
+ -		goto out_free_image;
+ +		printk(KERN_ERR "Could not allocate control_code_buffer\n");
+ +		goto out_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	image->swap_page = kimage_alloc_control_pages(image, 0);
+ +	if (!image->swap_page) {
+ +		printk(KERN_ERR "Could not allocate swap buffer\n");
+ +		goto out_free;
+++=======
++ 	if (!kexec_on_panic) {
++ 		image->swap_page = kimage_alloc_control_pages(image, 0);
++ 		if (!image->swap_page) {
++ 			pr_err("Could not allocate swap buffer\n");
++ 			goto out_free_control_pages;
++ 		}
+++>>>>>>> 255aedd90e3e (kexec: use common function for kimage_normal_alloc() and kimage_crash_alloc())
+  	}
+  
+  	*rimage = image;
+  	return 0;
+ -out_free_control_pages:
+ +
+ +out_free:
+  	kimage_free_page_list(&image->control_pages);
+ -out_free_image:
+  	kfree(image);
+++<<<<<<< HEAD
+ +out:
+ +	return result;
+ +}
+ +
+ +static int kimage_crash_alloc(struct kimage **rimage, unsigned long entry,
+ +				unsigned long nr_segments,
+ +				struct kexec_segment __user *segments)
+ +{
+ +	int result;
+ +	struct kimage *image;
+ +	unsigned long i;
+ +
+ +	image = NULL;
+ +	/* Verify we have a valid entry point */
+ +	if ((entry < crashk_res.start) || (entry > crashk_res.end)) {
+ +		result = -EADDRNOTAVAIL;
+ +		goto out;
+ +	}
+ +
+ +	/* Allocate and initialize a controlling structure */
+ +	result = do_kimage_alloc(&image, entry, nr_segments, segments);
+ +	if (result)
+ +		goto out;
+ +
+ +	/* Enable the special crash kernel control page
+ +	 * allocation policy.
+ +	 */
+ +	image->control_page = crashk_res.start;
+ +	image->type = KEXEC_TYPE_CRASH;
+ +
+ +	/*
+ +	 * Verify we have good destination addresses.  Normally
+ +	 * the caller is responsible for making certain we don't
+ +	 * attempt to load the new image into invalid or reserved
+ +	 * areas of RAM.  But crash kernels are preloaded into a
+ +	 * reserved area of ram.  We must ensure the addresses
+ +	 * are in the reserved area otherwise preloading the
+ +	 * kernel could corrupt things.
+ +	 */
+ +	result = -EADDRNOTAVAIL;
+ +	for (i = 0; i < nr_segments; i++) {
+ +		unsigned long mstart, mend;
+ +
+ +		mstart = image->segment[i].mem;
+ +		mend = mstart + image->segment[i].memsz - 1;
+ +		/* Ensure we are within the crash kernel limits */
+ +		if ((mstart < crashk_res.start) || (mend > crashk_res.end))
+ +			goto out_free;
+ +	}
+ +
+ +	/*
+ +	 * Find a location for the control code buffer, and add
+ +	 * the vector of segments so that it's pages will also be
+ +	 * counted as destination pages.
+ +	 */
+ +	result = -ENOMEM;
+ +	image->control_code_page = kimage_alloc_control_pages(image,
+ +					   get_order(KEXEC_CONTROL_PAGE_SIZE));
+ +	if (!image->control_code_page) {
+ +		printk(KERN_ERR "Could not allocate control_code_buffer\n");
+ +		goto out_free;
+ +	}
+ +
+ +	*rimage = image;
+ +	return 0;
+ +
+ +out_free:
+ +	kfree(image);
+ +out:
+ +	return result;
+++=======
++ 	return ret;
+++>>>>>>> 255aedd90e3e (kexec: use common function for kimage_normal_alloc() and kimage_crash_alloc())
+  }
+  
+  static int kimage_is_destination_range(struct kimage *image,
+* Unmerged path kernel/kexec.c
