@@ -1493,6 +1493,8 @@ static int l2tp_tunnel_sock_create(struct net *net,
 		if (!cfg->use_udp_checksums)
 			sock->sk->sk_no_check = UDP_CSUM_NOXMIT;
 
+		udp_set_convert_csum(sock->sk, true);
+
 		break;
 
 	case L2TP_ENCAPTYPE_IP:
