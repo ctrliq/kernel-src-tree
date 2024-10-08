@@ -638,12 +638,10 @@ __cpuinit void start_secondary(void *unused)
 
 	vdso_getcpu_init();
 #endif
-	notify_cpu_starting(cpu);
-	set_cpu_online(cpu, true);
 	/* Update sibling maps */
 	base = cpu_first_thread_sibling(cpu);
 	for (i = 0; i < threads_per_core; i++) {
-		if (cpu_is_offline(base + i))
+		if (cpu_is_offline(base + i) && (cpu != base + i))
 			continue;
 		cpumask_set_cpu(cpu, cpu_sibling_mask(base + i));
 		cpumask_set_cpu(base + i, cpu_sibling_mask(cpu));
@@ -667,6 +665,10 @@ __cpuinit void start_secondary(void *unused)
 		of_node_put(np);
 	}
 	of_node_put(l2_cache);
+
+	smp_wmb();
+	notify_cpu_starting(cpu);
+	set_cpu_online(cpu, true);
 
 	local_irq_enable();
 
