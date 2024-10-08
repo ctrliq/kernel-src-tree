@@ -1,0 +1,103 @@
+Btrfs: fix a warning when iput a file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+commit 180589efde8a01b4a30af273f670ac81c8abf9c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/180589ef.failed
+
+See the warning below:
+
+[ 1209.102076]  [<ffffffffa04721b9>] remove_extent_mapping+0x69/0x70 [btrfs]
+[ 1209.102084]  [<ffffffffa0466b06>] btrfs_evict_inode+0x96/0x4d0 [btrfs]
+[ 1209.102089]  [<ffffffff81073010>] ? wake_atomic_t_function+0x40/0x40
+[ 1209.102092]  [<ffffffff8118ab2e>] evict+0x9e/0x190
+[ 1209.102094]  [<ffffffff8118b313>] iput+0xf3/0x180
+[ 1209.102101]  [<ffffffffa0461fd1>] btrfs_run_delayed_iputs+0xb1/0xd0 [btrfs]
+[ 1209.102107]  [<ffffffffa045d358>] __btrfs_end_transaction+0x268/0x350 [btrfs]
+
+clear extent bit here to avoid triggering WARN_ON() in remove_extent_mapping()
+
+	Signed-off-by: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 180589efde8a01b4a30af273f670ac81c8abf9c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/inode.c
+index 151b376fc279,2ccf8e6b1e16..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -4482,6 -4482,64 +4482,67 @@@ static int btrfs_setattr(struct dentry 
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * While truncating the inode pages during eviction, we get the VFS calling
++  * btrfs_invalidatepage() against each page of the inode. This is slow because
++  * the calls to btrfs_invalidatepage() result in a huge amount of calls to
++  * lock_extent_bits() and clear_extent_bit(), which keep merging and splitting
++  * extent_state structures over and over, wasting lots of time.
++  *
++  * Therefore if the inode is being evicted, let btrfs_invalidatepage() skip all
++  * those expensive operations on a per page basis and do only the ordered io
++  * finishing, while we release here the extent_map and extent_state structures,
++  * without the excessive merging and splitting.
++  */
++ static void evict_inode_truncate_pages(struct inode *inode)
++ {
++ 	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
++ 	struct extent_map_tree *map_tree = &BTRFS_I(inode)->extent_tree;
++ 	struct rb_node *node;
++ 
++ 	ASSERT(inode->i_state & I_FREEING);
++ 	truncate_inode_pages(&inode->i_data, 0);
++ 
++ 	write_lock(&map_tree->lock);
++ 	while (!RB_EMPTY_ROOT(&map_tree->map)) {
++ 		struct extent_map *em;
++ 
++ 		node = rb_first(&map_tree->map);
++ 		em = rb_entry(node, struct extent_map, rb_node);
++ 		clear_bit(EXTENT_FLAG_PINNED, &em->flags);
++ 		clear_bit(EXTENT_FLAG_LOGGING, &em->flags);
++ 		remove_extent_mapping(map_tree, em);
++ 		free_extent_map(em);
++ 	}
++ 	write_unlock(&map_tree->lock);
++ 
++ 	spin_lock(&io_tree->lock);
++ 	while (!RB_EMPTY_ROOT(&io_tree->state)) {
++ 		struct extent_state *state;
++ 		struct extent_state *cached_state = NULL;
++ 
++ 		node = rb_first(&io_tree->state);
++ 		state = rb_entry(node, struct extent_state, rb_node);
++ 		atomic_inc(&state->refs);
++ 		spin_unlock(&io_tree->lock);
++ 
++ 		lock_extent_bits(io_tree, state->start, state->end,
++ 				 0, &cached_state);
++ 		clear_extent_bit(io_tree, state->start, state->end,
++ 				 EXTENT_LOCKED | EXTENT_DIRTY |
++ 				 EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING |
++ 				 EXTENT_DEFRAG, 1, 1,
++ 				 &cached_state, GFP_NOFS);
++ 		free_extent_state(state);
++ 
++ 		spin_lock(&io_tree->lock);
++ 	}
++ 	spin_unlock(&io_tree->lock);
++ }
++ 
+++>>>>>>> 180589efde8a (Btrfs: fix a warning when iput a file)
+  void btrfs_evict_inode(struct inode *inode)
+  {
+  	struct btrfs_trans_handle *trans;
+* Unmerged path fs/btrfs/inode.c
