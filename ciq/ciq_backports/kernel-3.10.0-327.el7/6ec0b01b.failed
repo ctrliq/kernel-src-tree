@@ -1,0 +1,243 @@
+CIFS: Fix wsize usage in iovec write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Pavel Shilovsky <pshilovsky@samba.org>
+commit 6ec0b01b2691d1465bb7219e031e8bf38ccd9397
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6ec0b01b.failed
+
+If a server change maximum buffer size for write (wsize) requests
+on reconnect we can fail on repeating with a big size buffer on
+-EAGAIN error in iovec write. Fix this by checking wsize all the
+time before repeating request in iovec write.
+
+	Reviewed-by: Shirish Pargaonkar <spargaonkar@suse.com>
+	Signed-off-by: Pavel Shilovsky <pshilovsky@samba.org>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 6ec0b01b2691d1465bb7219e031e8bf38ccd9397)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+diff --cc fs/cifs/file.c
+index 6b4ebc406ff2,c9c4f5ac3c78..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2405,72 -2401,71 +2405,135 @@@ cifs_uncached_writev_complete(struct wo
+  	kref_put(&wdata->refcount, cifs_uncached_writedata_release);
+  }
+  
+++<<<<<<< HEAD
+ +/* attempt to send write to server, retry on any -EAGAIN errors */
+ +static int
+ +cifs_uncached_retry_writev(struct cifs_writedata *wdata)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server;
+ +
+ +	server = tlink_tcon(wdata->cfile->tlink)->ses->server;
+ +
+ +	do {
+ +		if (wdata->cfile->invalidHandle) {
+ +			rc = cifs_reopen_file(wdata->cfile, false);
+ +			if (rc != 0)
+ +				continue;
+ +		}
+ +		rc = server->ops->async_writev(wdata,
+ +					       cifs_uncached_writedata_release);
+ +	} while (rc == -EAGAIN);
+ +
+ +	return rc;
+ +}
+ +
+ +static ssize_t
+ +cifs_iovec_write(struct file *file, const struct iovec *iov,
+ +		 unsigned long nr_segs, loff_t *poffset)
+ +{
+ +	unsigned long nr_pages, i;
+ +	size_t bytes, copied, len, cur_len;
+ +	ssize_t total_written = 0;
+ +	loff_t offset;
+ +	struct iov_iter it;
+ +	struct cifsFileInfo *open_file;
+ +	struct cifs_tcon *tcon;
+ +	struct cifs_sb_info *cifs_sb;
+ +	struct cifs_writedata *wdata, *tmp;
+ +	struct list_head wdata_list;
+ +	int rc;
+++=======
++ static int
++ wdata_fill_from_iovec(struct cifs_writedata *wdata, struct iov_iter *from,
++ 		      size_t *len, unsigned long *num_pages)
++ {
++ 	size_t save_len, copied, bytes, cur_len = *len;
++ 	unsigned long i, nr_pages = *num_pages;
++ 
++ 	save_len = cur_len;
++ 	for (i = 0; i < nr_pages; i++) {
++ 		bytes = min_t(const size_t, cur_len, PAGE_SIZE);
++ 		copied = copy_page_from_iter(wdata->pages[i], 0, bytes, from);
++ 		cur_len -= copied;
++ 		/*
++ 		 * If we didn't copy as much as we expected, then that
++ 		 * may mean we trod into an unmapped area. Stop copying
++ 		 * at that point. On the next pass through the big
++ 		 * loop, we'll likely end up getting a zero-length
++ 		 * write and bailing out of it.
++ 		 */
++ 		if (copied < bytes)
++ 			break;
++ 	}
++ 	cur_len = save_len - cur_len;
++ 	*len = cur_len;
++ 
++ 	/*
++ 	 * If we have no data to send, then that probably means that
++ 	 * the copy above failed altogether. That's most likely because
++ 	 * the address in the iovec was bogus. Return -EFAULT and let
++ 	 * the caller free anything we allocated and bail out.
++ 	 */
++ 	if (!cur_len)
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * i + 1 now represents the number of pages we actually used in
++ 	 * the copy phase above.
++ 	 */
++ 	*num_pages = i + 1;
++ 	return 0;
++ }
++ 
++ static int
++ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
++ 		     struct cifsFileInfo *open_file,
++ 		     struct cifs_sb_info *cifs_sb, struct list_head *wdata_list)
++ {
++ 	int rc = 0;
++ 	size_t cur_len;
++ 	unsigned long nr_pages, num_pages, i;
++ 	struct cifs_writedata *wdata;
++ 	struct iov_iter saved_from;
++ 	loff_t saved_offset = offset;
+++>>>>>>> 6ec0b01b2691 (CIFS: Fix wsize usage in iovec write)
+  	pid_t pid;
++ 	struct TCP_Server_Info *server;
+  
+ +	len = iov_length(iov, nr_segs);
+ +	if (!len)
+ +		return 0;
+ +
+ +	rc = generic_write_checks(file, poffset, &len, 0);
+ +	if (rc)
+ +		return rc;
+ +
+ +	INIT_LIST_HEAD(&wdata_list);
+ +	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
+ +	open_file = file->private_data;
+ +	tcon = tlink_tcon(open_file->tlink);
+ +
+ +	if (!tcon->ses->server->ops->async_writev)
+ +		return -ENOSYS;
+ +
+ +	offset = *poffset;
+ +
+  	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_RWPIDFORWARD)
+  		pid = open_file->pid;
+  	else
+  		pid = current->tgid;
+  
+++<<<<<<< HEAD
+ +	iov_iter_init(&it, iov, nr_segs, len, 0);
+++=======
++ 	server = tlink_tcon(open_file->tlink)->ses->server;
++ 	memcpy(&saved_from, from, sizeof(struct iov_iter));
++ 
+++>>>>>>> 6ec0b01b2691 (CIFS: Fix wsize usage in iovec write)
+  	do {
+ +		size_t save_len;
+ +
+  		nr_pages = get_numpages(cifs_sb->wsize, len, &cur_len);
+  		wdata = cifs_writedata_alloc(nr_pages,
+  					     cifs_uncached_writev_complete);
+@@@ -2546,6 -2526,45 +2619,48 @@@
+  		len -= cur_len;
+  	} while (len > 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	return rc;
++ }
++ 
++ static ssize_t
++ cifs_iovec_write(struct file *file, struct iov_iter *from, loff_t *poffset)
++ {
++ 	size_t len;
++ 	ssize_t total_written = 0;
++ 	struct cifsFileInfo *open_file;
++ 	struct cifs_tcon *tcon;
++ 	struct cifs_sb_info *cifs_sb;
++ 	struct cifs_writedata *wdata, *tmp;
++ 	struct list_head wdata_list;
++ 	struct iov_iter saved_from;
++ 	int rc;
++ 
++ 	len = iov_iter_count(from);
++ 	rc = generic_write_checks(file, poffset, &len, 0);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (!len)
++ 		return 0;
++ 
++ 	iov_iter_truncate(from, len);
++ 
++ 	INIT_LIST_HEAD(&wdata_list);
++ 	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
++ 	open_file = file->private_data;
++ 	tcon = tlink_tcon(open_file->tlink);
++ 
++ 	if (!tcon->ses->server->ops->async_writev)
++ 		return -ENOSYS;
++ 
++ 	memcpy(&saved_from, from, sizeof(struct iov_iter));
++ 
++ 	rc = cifs_write_from_iter(*poffset, len, from, open_file, cifs_sb,
++ 				  &wdata_list);
++ 
+++>>>>>>> 6ec0b01b2691 (CIFS: Fix wsize usage in iovec write)
+  	/*
+  	 * If at least one write was successfully sent, then discard any rc
+  	 * value from the later writes. If the other write succeeds, then
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index 52cfd8cf0db0..1b3f0aef01e3 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -196,10 +196,6 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
+ 	if (rc)
+ 		goto out;
+ 
+-	/*
+-	 * FIXME: check if wsize needs updated due to negotiated smb buffer
+-	 * 	  size shrinking
+-	 */
+ 	atomic_inc(&tconInfoReconnectCount);
+ 
+ 	/* tell server Unix caps we support */
+* Unmerged path fs/cifs/file.c
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index ba60063879ce..6cefa3a3de19 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -245,10 +245,6 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon)
+ 	if (rc)
+ 		goto out;
+ 	atomic_inc(&tconInfoReconnectCount);
+-	/*
+-	 * BB FIXME add code to check if wsize needs update due to negotiated
+-	 * smb buffer size shrinking.
+-	 */
+ out:
+ 	/*
+ 	 * Check if handle based operation so we know whether we can continue
