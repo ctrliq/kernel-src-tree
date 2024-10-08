@@ -1,0 +1,257 @@
+sched: Remove get_online_cpus() usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6acce3ef84520537f8a09a12c9ddbe814a584dd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6acce3ef.failed
+
+Remove get_online_cpus() usage from the scheduler; there's 4 sites that
+use it:
+
+ - sched_init_smp(); where its completely superfluous since we're in
+   'early' boot and there simply cannot be any hotplugging.
+
+ - sched_getaffinity(); we already take a raw spinlock to protect the
+   task cpus_allowed mask, this disables preemption and therefore
+   also stabilizes cpu_online_mask as that's modified using
+   stop_machine. However switch to active mask for symmetry with
+   sched_setaffinity()/set_cpus_allowed_ptr(). We guarantee active
+   mask stability by inserting sync_rcu/sched() into _cpu_down.
+
+ - sched_setaffinity(); we don't appear to need get_online_cpus()
+   either, there's two sites where hotplug appears relevant:
+    * cpuset_cpus_allowed(); for the !cpuset case we use possible_mask,
+      for the cpuset case we hold task_lock, which is a spinlock and
+      thus for mainline disables preemption (might cause pain on RT).
+    * set_cpus_allowed_ptr(); Holds all scheduler locks and thus has
+      preemption properly disabled; also it already deals with hotplug
+      races explicitly where it releases them.
+
+ - migrate_swap(); we can make stop_two_cpus() do the heavy lifting for
+   us with a little trickery. By adding a sync_sched/rcu() after the
+   CPU_DOWN_PREPARE notifier we can provide preempt/rcu guarantees for
+   cpu_active_mask. Use these to validate that both our cpus are active
+   when queueing the stop work before we queue the stop_machine works
+   for take_cpu_down().
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: "Srivatsa S. Bhat" <srivatsa.bhat@linux.vnet.ibm.com>
+	Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+Link: http://lkml.kernel.org/r/20131011123820.GV3081@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6acce3ef84520537f8a09a12c9ddbe814a584dd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index c43e920b195e,c06b8d345fae..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1030,6 -1013,107 +1030,110 @@@ void set_task_cpu(struct task_struct *p
+  	__set_task_cpu(p, new_cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __migrate_swap_task(struct task_struct *p, int cpu)
++ {
++ 	if (p->on_rq) {
++ 		struct rq *src_rq, *dst_rq;
++ 
++ 		src_rq = task_rq(p);
++ 		dst_rq = cpu_rq(cpu);
++ 
++ 		deactivate_task(src_rq, p, 0);
++ 		set_task_cpu(p, cpu);
++ 		activate_task(dst_rq, p, 0);
++ 		check_preempt_curr(dst_rq, p, 0);
++ 	} else {
++ 		/*
++ 		 * Task isn't running anymore; make it appear like we migrated
++ 		 * it before it went to sleep. This means on wakeup we make the
++ 		 * previous cpu our targer instead of where it really is.
++ 		 */
++ 		p->wake_cpu = cpu;
++ 	}
++ }
++ 
++ struct migration_swap_arg {
++ 	struct task_struct *src_task, *dst_task;
++ 	int src_cpu, dst_cpu;
++ };
++ 
++ static int migrate_swap_stop(void *data)
++ {
++ 	struct migration_swap_arg *arg = data;
++ 	struct rq *src_rq, *dst_rq;
++ 	int ret = -EAGAIN;
++ 
++ 	src_rq = cpu_rq(arg->src_cpu);
++ 	dst_rq = cpu_rq(arg->dst_cpu);
++ 
++ 	double_raw_lock(&arg->src_task->pi_lock,
++ 			&arg->dst_task->pi_lock);
++ 	double_rq_lock(src_rq, dst_rq);
++ 	if (task_cpu(arg->dst_task) != arg->dst_cpu)
++ 		goto unlock;
++ 
++ 	if (task_cpu(arg->src_task) != arg->src_cpu)
++ 		goto unlock;
++ 
++ 	if (!cpumask_test_cpu(arg->dst_cpu, tsk_cpus_allowed(arg->src_task)))
++ 		goto unlock;
++ 
++ 	if (!cpumask_test_cpu(arg->src_cpu, tsk_cpus_allowed(arg->dst_task)))
++ 		goto unlock;
++ 
++ 	__migrate_swap_task(arg->src_task, arg->dst_cpu);
++ 	__migrate_swap_task(arg->dst_task, arg->src_cpu);
++ 
++ 	ret = 0;
++ 
++ unlock:
++ 	double_rq_unlock(src_rq, dst_rq);
++ 	raw_spin_unlock(&arg->dst_task->pi_lock);
++ 	raw_spin_unlock(&arg->src_task->pi_lock);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Cross migrate two tasks
++  */
++ int migrate_swap(struct task_struct *cur, struct task_struct *p)
++ {
++ 	struct migration_swap_arg arg;
++ 	int ret = -EINVAL;
++ 
++ 	arg = (struct migration_swap_arg){
++ 		.src_task = cur,
++ 		.src_cpu = task_cpu(cur),
++ 		.dst_task = p,
++ 		.dst_cpu = task_cpu(p),
++ 	};
++ 
++ 	if (arg.src_cpu == arg.dst_cpu)
++ 		goto out;
++ 
++ 	/*
++ 	 * These three tests are all lockless; this is OK since all of them
++ 	 * will be re-checked with proper locks held further down the line.
++ 	 */
++ 	if (!cpu_active(arg.src_cpu) || !cpu_active(arg.dst_cpu))
++ 		goto out;
++ 
++ 	if (!cpumask_test_cpu(arg.dst_cpu, tsk_cpus_allowed(arg.src_task)))
++ 		goto out;
++ 
++ 	if (!cpumask_test_cpu(arg.src_cpu, tsk_cpus_allowed(arg.dst_task)))
++ 		goto out;
++ 
++ 	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
++ 
++ out:
++ 	return ret;
++ }
++ 
+++>>>>>>> 6acce3ef8452 (sched: Remove get_online_cpus() usage)
+  struct migration_arg {
+  	struct task_struct *task;
+  	int dest_cpu;
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 198a38883e64..7d4ce439cf4d 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -311,6 +311,23 @@ static int __ref _cpu_down(unsigned int cpu, int tasks_frozen)
+ 	}
+ 	smpboot_park_threads(cpu);
+ 
++	/*
++	 * By now we've cleared cpu_active_mask, wait for all preempt-disabled
++	 * and RCU users of this state to go away such that all new such users
++	 * will observe it.
++	 *
++	 * For CONFIG_PREEMPT we have preemptible RCU and its sync_rcu() might
++	 * not imply sync_sched(), so explicitly call both.
++	 */
++#ifdef CONFIG_PREEMPT
++	synchronize_sched();
++#endif
++	synchronize_rcu();
++
++	/*
++	 * So now all preempt/rcu users must observe !cpu_active().
++	 */
++
+ 	err = __stop_machine(take_cpu_down, &tcd_param, cpumask_of(cpu));
+ 	if (err) {
+ 		/* CPU didn't die: tell everyone.  Can't complain. */
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index 32a6c44d8f78..c530bc5be7cf 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -234,11 +234,13 @@ static void irq_cpu_stop_queue_work(void *arg)
+  */
+ int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *arg)
+ {
+-	int call_cpu;
+ 	struct cpu_stop_done done;
+ 	struct cpu_stop_work work1, work2;
+ 	struct irq_cpu_stop_queue_work_info call_args;
+-	struct multi_stop_data msdata = {
++	struct multi_stop_data msdata;
++
++	preempt_disable();
++	msdata = (struct multi_stop_data){
+ 		.fn = fn,
+ 		.data = arg,
+ 		.num_threads = 2,
+@@ -261,17 +263,31 @@ int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *
+ 	cpu_stop_init_done(&done, 2);
+ 	set_state(&msdata, MULTI_STOP_PREPARE);
+ 
++	/*
++	 * If we observe both CPUs active we know _cpu_down() cannot yet have
++	 * queued its stop_machine works and therefore ours will get executed
++	 * first. Or its not either one of our CPUs that's getting unplugged,
++	 * in which case we don't care.
++	 *
++	 * This relies on the stopper workqueues to be FIFO.
++	 */
++	if (!cpu_active(cpu1) || !cpu_active(cpu2)) {
++		preempt_enable();
++		return -ENOENT;
++	}
++
+ 	/*
+ 	 * Queuing needs to be done by the lowest numbered CPU, to ensure
+ 	 * that works are always queued in the same order on every CPU.
+ 	 * This prevents deadlocks.
+ 	 */
+-	call_cpu = min(cpu1, cpu2);
+-
+-	smp_call_function_single(call_cpu, &irq_cpu_stop_queue_work,
++	smp_call_function_single(min(cpu1, cpu2),
++				 &irq_cpu_stop_queue_work,
+ 				 &call_args, 0);
++	preempt_enable();
+ 
+ 	wait_for_completion(&done.completion);
++
+ 	return done.executed ? done.ret : -ENOENT;
+ }
+ 
