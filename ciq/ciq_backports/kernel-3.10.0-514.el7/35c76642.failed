@@ -1,0 +1,93 @@
+Btrfs: fix mutex unlock without prior lock on space cache truncation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Filipe Manana <fdmanana@suse.com>
+commit 35c766425adc8e6cd1bdc8554fa540364f218fb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/35c76642.failed
+
+If the call to btrfs_truncate_inode_items() failed and we don't have a block
+group, we were unlocking the cache_write_mutex without having locked it (we
+do it only if we have a block group).
+
+Fixes: 1bbc621ef284 ("Btrfs: allow block group cache writeout
+                      outside critical section in commit")
+
+	Signed-off-by: Filipe Manana <fdmanana@suse.com>
+	Reviewed-by: David Sterba <dsterba@suse.cz>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 35c766425adc8e6cd1bdc8554fa540364f218fb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/free-space-cache.c
+diff --cc fs/btrfs/free-space-cache.c
+index b64b4a73cb91,fb5a6b1c62a6..000000000000
+--- a/fs/btrfs/free-space-cache.c
++++ b/fs/btrfs/free-space-cache.c
+@@@ -229,6 -229,36 +229,38 @@@ int btrfs_truncate_free_space_cache(str
+  				    struct inode *inode)
+  {
+  	int ret = 0;
+++<<<<<<< HEAD
+++=======
++ 	struct btrfs_path *path = btrfs_alloc_path();
++ 	bool locked = false;
++ 
++ 	if (!path) {
++ 		ret = -ENOMEM;
++ 		goto fail;
++ 	}
++ 
++ 	if (block_group) {
++ 		locked = true;
++ 		mutex_lock(&trans->transaction->cache_write_mutex);
++ 		if (!list_empty(&block_group->io_list)) {
++ 			list_del_init(&block_group->io_list);
++ 
++ 			btrfs_wait_cache_io(root, trans, block_group,
++ 					    &block_group->io_ctl, path,
++ 					    block_group->key.objectid);
++ 			btrfs_put_block_group(block_group);
++ 		}
++ 
++ 		/*
++ 		 * now that we've truncated the cache away, its no longer
++ 		 * setup or written
++ 		 */
++ 		spin_lock(&block_group->lock);
++ 		block_group->disk_cache_state = BTRFS_DC_CLEAR;
++ 		spin_unlock(&block_group->lock);
++ 	}
++ 	btrfs_free_path(path);
+++>>>>>>> 35c766425adc (Btrfs: fix mutex unlock without prior lock on space cache truncation)
+  
+  	btrfs_i_size_write(inode, 0);
+  	truncate_pagecache(inode, 0);
+@@@ -241,12 -271,14 +273,23 @@@
+  	 */
+  	ret = btrfs_truncate_inode_items(trans, root, inode,
+  					 0, BTRFS_EXTENT_DATA_KEY);
+++<<<<<<< HEAD
+ +	if (ret) {
+ +		btrfs_abort_transaction(trans, root, ret);
+ +		return ret;
+ +	}
+ +
+ +	ret = btrfs_update_inode(trans, root, inode);
+++=======
++ 	if (ret)
++ 		goto fail;
++ 
++ 	ret = btrfs_update_inode(trans, root, inode);
++ 
++ fail:
++ 	if (locked)
++ 		mutex_unlock(&trans->transaction->cache_write_mutex);
+++>>>>>>> 35c766425adc (Btrfs: fix mutex unlock without prior lock on space cache truncation)
+  	if (ret)
+  		btrfs_abort_transaction(trans, root, ret);
+  
+* Unmerged path fs/btrfs/free-space-cache.c
