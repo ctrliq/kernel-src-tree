@@ -1,0 +1,127 @@
+tcp: rename sk_forced_wmem_schedule() to sk_forced_mem_schedule()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit a6c5ea4ccf0033591e6e476d7a273c0074c07aa7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6c5ea4c.failed
+
+We plan to use sk_forced_wmem_schedule() in input path as well,
+so make it non static and rename it.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6c5ea4ccf0033591e6e476d7a273c0074c07aa7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index ddd2a6fe0e83,bac1a950d087..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -2725,37 -2812,61 +2725,64 @@@ begin_fwd
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/* Send a fin.  The caller locks the socket for us.  This cannot be
+ + * allowed to fail queueing a FIN frame under any circumstances.
+++=======
++ /* We allow to exceed memory limits for FIN packets to expedite
++  * connection tear down and (memory) recovery.
++  * Otherwise tcp_send_fin() could be tempted to either delay FIN
++  * or even be forced to close flow without any FIN.
++  * In general, we want to allow one skb per socket to avoid hangs
++  * with edge trigger epoll()
++  */
++ void sk_forced_mem_schedule(struct sock *sk, int size)
++ {
++ 	int amt, status;
++ 
++ 	if (size <= sk->sk_forward_alloc)
++ 		return;
++ 	amt = sk_mem_pages(size);
++ 	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
++ 	sk_memory_allocated_add(sk, amt, &status);
++ }
++ 
++ /* Send a FIN. The caller locks the socket for us.
++  * We should try to send a FIN packet really hard, but eventually give up.
+++>>>>>>> a6c5ea4ccf00 (tcp: rename sk_forced_wmem_schedule() to sk_forced_mem_schedule())
+   */
+  void tcp_send_fin(struct sock *sk)
+  {
+ -	struct sk_buff *skb, *tskb = tcp_write_queue_tail(sk);
+  	struct tcp_sock *tp = tcp_sk(sk);
+ +	struct sk_buff *skb = tcp_write_queue_tail(sk);
+ +	int mss_now;
+  
+ -	/* Optimization, tack on the FIN if we have one skb in write queue and
+ -	 * this skb was not yet sent, or we are under memory pressure.
+ -	 * Note: in the latter case, FIN packet will be sent after a timeout,
+ -	 * as TCP stack thinks it has already been transmitted.
+ +	/* Optimization, tack on the FIN if we have a queue of
+ +	 * unsent frames.  But be careful about outgoing SACKS
+ +	 * and IP options.
+  	 */
+ -	if (tskb && (tcp_send_head(sk) || sk_under_memory_pressure(sk))) {
+ -coalesce:
+ -		TCP_SKB_CB(tskb)->tcp_flags |= TCPHDR_FIN;
+ -		TCP_SKB_CB(tskb)->end_seq++;
+ +	mss_now = tcp_current_mss(sk);
+ +
+ +	if (tcp_send_head(sk) != NULL) {
+ +		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_FIN;
+ +		TCP_SKB_CB(skb)->end_seq++;
+  		tp->write_seq++;
+ -		if (!tcp_send_head(sk)) {
+ -			/* This means tskb was already sent.
+ -			 * Pretend we included the FIN on previous transmit.
+ -			 * We need to set tp->snd_nxt to the value it would have
+ -			 * if FIN had been sent. This is because retransmit path
+ -			 * does not change tp->snd_nxt.
+ -			 */
+ -			tp->snd_nxt++;
+ -			return;
+ -		}
+  	} else {
+ -		skb = alloc_skb_fclone(MAX_TCP_HEADER, sk->sk_allocation);
+ -		if (unlikely(!skb)) {
+ -			if (tskb)
+ -				goto coalesce;
+ -			return;
+ +		/* Socket is locked, keep trying until memory is available. */
+ +		for (;;) {
+ +			skb = alloc_skb_fclone(MAX_TCP_HEADER,
+ +					       sk->sk_allocation);
+ +			if (skb)
+ +				break;
+ +			yield();
+  		}
+ +
+ +		/* Reserve space for headers and prepare control bits. */
+  		skb_reserve(skb, MAX_TCP_HEADER);
+++<<<<<<< HEAD
+++=======
++ 		sk_forced_mem_schedule(sk, skb->truesize);
+++>>>>>>> a6c5ea4ccf00 (tcp: rename sk_forced_wmem_schedule() to sk_forced_mem_schedule())
+  		/* FIN eats a sequence byte, write_seq advanced by tcp_queue_skb(). */
+  		tcp_init_nondata_skb(skb, tp->write_seq,
+  				     TCPHDR_ACK | TCPHDR_FIN);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 83fa42687eea..604b41ddc298 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -308,6 +308,8 @@ static inline bool tcp_out_of_memory(struct sock *sk)
+ 	return false;
+ }
+ 
++void sk_forced_mem_schedule(struct sock *sk, int size);
++
+ static inline bool tcp_too_many_orphans(struct sock *sk, int shift)
+ {
+ 	struct percpu_counter *ocp = sk->sk_prot->orphan_count;
+* Unmerged path net/ipv4/tcp_output.c
