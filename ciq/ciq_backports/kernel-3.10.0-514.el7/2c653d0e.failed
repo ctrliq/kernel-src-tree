@@ -1,0 +1,315 @@
+ksm: introduce ksm_max_page_sharing per page deduplication limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 2c653d0ee2ae78ff3a174cc877a057c8afac7069
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2c653d0e.failed
+
+Without a max deduplication limit for each KSM page, the list of the
+rmap_items associated to each stable_node can grow infinitely large.
+
+During the rmap walk each entry can take up to ~10usec to process
+because of IPIs for the TLB flushing (both for the primary MMU and the
+secondary MMUs with the MMU notifier).  With only 16GB of address space
+shared in the same KSM page, that would amount to dozens of seconds of
+kernel runtime.
+
+A ~256 max deduplication factor will reduce the latencies of the rmap
+walks on KSM pages to order of a few msec.  Just doing the
+cond_resched() during the rmap walks is not enough, the list size must
+have a limit too, otherwise the caller could get blocked in (schedule
+friendly) kernel computations for seconds, unexpectedly.
+
+There's room for optimization to significantly reduce the IPI delivery
+cost during the page_referenced(), but at least for page_migration in
+the KSM case (used by hard NUMA bindings, compaction and NUMA balancing)
+it may be inevitable to send lots of IPIs if each rmap_item->mm is
+active on a different CPU and there are lots of CPUs.  Even if we ignore
+the IPI delivery cost, we've still to walk the whole KSM rmap list, so
+we can't allow millions or billions (ulimited) number of entries in the
+KSM stable_node rmap_item lists.
+
+The limit is enforced efficiently by adding a second dimension to the
+stable rbtree.  So there are three types of stable_nodes: the regular
+ones (identical as before, living in the first flat dimension of the
+stable rbtree), the "chains" and the "dups".
+
+Every "chain" and all "dups" linked into a "chain" enforce the invariant
+that they represent the same write protected memory content, even if
+each "dup" will be pointed by a different KSM page copy of that content.
+This way the stable rbtree lookup computational complexity is unaffected
+if compared to an unlimited max_sharing_limit.  It is still enforced
+that there cannot be KSM page content duplicates in the stable rbtree
+itself.
+
+Adding the second dimension to the stable rbtree only after the
+max_page_sharing limit hits, provides for a zero memory footprint
+increase on 64bit archs.  The memory overhead of the per-KSM page
+stable_tree and per virtual mapping rmap_item is unchanged.  Only after
+the max_page_sharing limit hits, we need to allocate a stable_tree
+"chain" and rb_replace() the "regular" stable_node with the newly
+allocated stable_node "chain".  After that we simply add the "regular"
+stable_node to the chain as a stable_node "dup" by linking hlist_dup in
+the stable_node_chain->hlist.  This way the "regular" (flat) stable_node
+is converted to a stable_node "dup" living in the second dimension of
+the stable rbtree.
+
+During stable rbtree lookups the stable_node "chain" is identified as
+stable_node->rmap_hlist_len == STABLE_NODE_CHAIN (aka
+is_stable_node_chain()).
+
+When dropping stable_nodes, the stable_node "dup" is identified as
+stable_node->head == STABLE_NODE_DUP_HEAD (aka is_stable_node_dup()).
+
+The STABLE_NODE_DUP_HEAD must be an unique valid pointer never used
+elsewhere in any stable_node->head/node to avoid a clashes with the
+stable_node->node.rb_parent_color pointer, and different from
+&migrate_nodes.  So the second field of &migrate_nodes is picked and
+verified as always safe with a BUILD_BUG_ON in case the list_head
+implementation changes in the future.
+
+The STABLE_NODE_DUP is picked as a random negative value in
+stable_node->rmap_hlist_len.  rmap_hlist_len cannot become negative when
+it's a "regular" stable_node or a stable_node "dup".
+
+The stable_node_chain->nid is irrelevant.  The stable_node_chain->kpfn
+is aliased in a union with a time field used to rate limit the
+stable_node_chain->hlist prunes.
+
+The garbage collection of the stable_node_chain happens lazily during
+stable rbtree lookups (as for all other kind of stable_nodes), or while
+disabling KSM with "echo 2 >/sys/kernel/mm/ksm/run" while collecting the
+entire stable rbtree.
+
+While the "regular" stable_nodes and the stable_node "dups" must wait
+for their underlying tree_page to be freed before they can be freed
+themselves, the stable_node "chains" can be freed immediately if the
+stable_node->hlist turns empty.  This is because the "chains" are never
+pointed by any page->mapping and they're effectively stable rbtree KSM
+self contained metadata.
+
+[akpm@linux-foundation.org: fix non-NUMA build]
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Tested-by: Petr Holasek <pholasek@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Arjan van de Ven <arjan@linux.intel.com>
+	Cc: Evgheni Dereveanchin <ederevea@redhat.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Gavin Guo <gavin.guo@canonical.com>
+	Cc: Jay Vosburgh <jay.vosburgh@canonical.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2c653d0ee2ae78ff3a174cc877a057c8afac7069)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/vm/ksm.txt
+#	mm/ksm.c
+diff --cc Documentation/vm/ksm.txt
+index f34a8ee6f860,6686bd267dc9..000000000000
+--- a/Documentation/vm/ksm.txt
++++ b/Documentation/vm/ksm.txt
+@@@ -80,6 -84,64 +80,67 @@@ run              - set 0 to stop ksmd f
+                     Default: 0 (must be changed to 1 to activate KSM,
+                                 except if CONFIG_SYSFS is disabled)
+  
+++<<<<<<< HEAD
+++=======
++ use_zero_pages   - specifies whether empty pages (i.e. allocated pages
++                    that only contain zeroes) should be treated specially.
++                    When set to 1, empty pages are merged with the kernel
++                    zero page(s) instead of with each other as it would
++                    happen normally. This can improve the performance on
++                    architectures with coloured zero pages, depending on
++                    the workload. Care should be taken when enabling this
++                    setting, as it can potentially degrade the performance
++                    of KSM for some workloads, for example if the checksums
++                    of pages candidate for merging match the checksum of
++                    an empty page. This setting can be changed at any time,
++                    it is only effective for pages merged after the change.
++                    Default: 0 (normal KSM behaviour as in earlier releases)
++ 
++ max_page_sharing - Maximum sharing allowed for each KSM page. This
++                    enforces a deduplication limit to avoid the virtual
++                    memory rmap lists to grow too large. The minimum
++                    value is 2 as a newly created KSM page will have at
++                    least two sharers. The rmap walk has O(N)
++                    complexity where N is the number of rmap_items
++                    (i.e. virtual mappings) that are sharing the page,
++                    which is in turn capped by max_page_sharing. So
++                    this effectively spread the the linear O(N)
++                    computational complexity from rmap walk context
++                    over different KSM pages. The ksmd walk over the
++                    stable_node "chains" is also O(N), but N is the
++                    number of stable_node "dups", not the number of
++                    rmap_items, so it has not a significant impact on
++                    ksmd performance. In practice the best stable_node
++                    "dup" candidate will be kept and found at the head
++                    of the "dups" list. The higher this value the
++                    faster KSM will merge the memory (because there
++                    will be fewer stable_node dups queued into the
++                    stable_node chain->hlist to check for pruning) and
++                    the higher the deduplication factor will be, but
++                    the slowest the worst case rmap walk could be for
++                    any given KSM page. Slowing down the rmap_walk
++                    means there will be higher latency for certain
++                    virtual memory operations happening during
++                    swapping, compaction, NUMA balancing and page
++                    migration, in turn decreasing responsiveness for
++                    the caller of those virtual memory operations. The
++                    scheduler latency of other tasks not involved with
++                    the VM operations doing the rmap walk is not
++                    affected by this parameter as the rmap walks are
++                    always schedule friendly themselves.
++ 
++ stable_node_chains_prune_millisecs - How frequently to walk the whole
++                    list of stable_node "dups" linked in the
++                    stable_node "chains" in order to prune stale
++                    stable_nodes. Smaller milllisecs values will free
++                    up the KSM metadata with lower latency, but they
++                    will make ksmd use more CPU during the scan. This
++                    only applies to the stable_node chains so it's a
++                    noop if not a single KSM page hit the
++                    max_page_sharing yet (there would be no stable_node
++                    chains in such case).
++ 
+++>>>>>>> 2c653d0ee2ae (ksm: introduce ksm_max_page_sharing per page deduplication limit)
+  The effectiveness of KSM and MADV_MERGEABLE is shown in /sys/kernel/mm/ksm/:
+  
+  pages_shared     - how many shared pages are being used
+diff --cc mm/ksm.c
+index 5a86c9f42e41,21c5f4ff7229..000000000000
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@@ -738,10 -871,34 +866,35 @@@ static int remove_stable_node(struct st
+  	return err;
+  }
+  
++ static int remove_stable_node_chain(struct stable_node *stable_node,
++ 				    struct rb_root *root)
++ {
++ 	struct stable_node *dup;
++ 	struct hlist_node *hlist_safe;
++ 
++ 	if (!is_stable_node_chain(stable_node)) {
++ 		VM_BUG_ON(is_stable_node_dup(stable_node));
++ 		if (remove_stable_node(stable_node))
++ 			return true;
++ 		else
++ 			return false;
++ 	}
++ 
++ 	hlist_for_each_entry_safe(dup, hlist_safe,
++ 				  &stable_node->hlist, hlist_dup) {
++ 		VM_BUG_ON(!is_stable_node_dup(dup));
++ 		if (remove_stable_node(dup))
++ 			return true;
++ 	}
++ 	BUG_ON(!hlist_empty(&stable_node->hlist));
++ 	free_stable_node_chain(stable_node, root);
++ 	return false;
++ }
++ 
+  static int remove_all_stable_nodes(void)
+  {
+ -	struct stable_node *stable_node, *next;
+ +	struct stable_node *stable_node;
+ +	struct list_head *this, *next;
+  	int nid;
+  	int err = 0;
+  
+@@@ -2356,6 -2787,69 +2872,72 @@@ static ssize_t merge_across_nodes_store
+  KSM_ATTR(merge_across_nodes);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t use_zero_pages_show(struct kobject *kobj,
++ 				struct kobj_attribute *attr, char *buf)
++ {
++ 	return sprintf(buf, "%u\n", ksm_use_zero_pages);
++ }
++ static ssize_t use_zero_pages_store(struct kobject *kobj,
++ 				   struct kobj_attribute *attr,
++ 				   const char *buf, size_t count)
++ {
++ 	int err;
++ 	bool value;
++ 
++ 	err = kstrtobool(buf, &value);
++ 	if (err)
++ 		return -EINVAL;
++ 
++ 	ksm_use_zero_pages = value;
++ 
++ 	return count;
++ }
++ KSM_ATTR(use_zero_pages);
++ 
++ static ssize_t max_page_sharing_show(struct kobject *kobj,
++ 				     struct kobj_attribute *attr, char *buf)
++ {
++ 	return sprintf(buf, "%u\n", ksm_max_page_sharing);
++ }
++ 
++ static ssize_t max_page_sharing_store(struct kobject *kobj,
++ 				      struct kobj_attribute *attr,
++ 				      const char *buf, size_t count)
++ {
++ 	int err;
++ 	int knob;
++ 
++ 	err = kstrtoint(buf, 10, &knob);
++ 	if (err)
++ 		return err;
++ 	/*
++ 	 * When a KSM page is created it is shared by 2 mappings. This
++ 	 * being a signed comparison, it implicitly verifies it's not
++ 	 * negative.
++ 	 */
++ 	if (knob < 2)
++ 		return -EINVAL;
++ 
++ 	if (READ_ONCE(ksm_max_page_sharing) == knob)
++ 		return count;
++ 
++ 	mutex_lock(&ksm_thread_mutex);
++ 	wait_while_offlining();
++ 	if (ksm_max_page_sharing != knob) {
++ 		if (ksm_pages_shared || remove_all_stable_nodes())
++ 			err = -EBUSY;
++ 		else
++ 			ksm_max_page_sharing = knob;
++ 	}
++ 	mutex_unlock(&ksm_thread_mutex);
++ 
++ 	return err ? err : count;
++ }
++ KSM_ATTR(max_page_sharing);
++ 
+++>>>>>>> 2c653d0ee2ae (ksm: introduce ksm_max_page_sharing per page deduplication limit)
+  static ssize_t pages_shared_show(struct kobject *kobj,
+  				 struct kobj_attribute *attr, char *buf)
+  {
+@@@ -2413,6 -2947,11 +3035,14 @@@ static struct attribute *ksm_attrs[] = 
+  #ifdef CONFIG_NUMA
+  	&merge_across_nodes_attr.attr,
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	&max_page_sharing_attr.attr,
++ 	&stable_node_chains_attr.attr,
++ 	&stable_node_dups_attr.attr,
++ 	&stable_node_chains_prune_millisecs_attr.attr,
++ 	&use_zero_pages_attr.attr,
+++>>>>>>> 2c653d0ee2ae (ksm: introduce ksm_max_page_sharing per page deduplication limit)
+  	NULL,
+  };
+  
+* Unmerged path Documentation/vm/ksm.txt
+* Unmerged path mm/ksm.c
