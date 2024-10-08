@@ -1,0 +1,178 @@
+ACPI/APEI: Add parameter check before error injection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [acpi] apei: Add parameter check before error injection (Jeff Moyer) [1342696]
+Rebuild_FUZZ: 95.05%
+commit-author Chen Gong <gong.chen@linux.intel.com>
+commit c5a130325f13b219438cb100e2da71a3e31199f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c5a13032.failed
+
+When param1 is enabled in EINJ but not assigned with a valid
+value, sometimes it will cause the error like below:
+
+APEI: Can not request [mem 0x7aaa7000-0x7aaa7007] for APEI EINJ Trigger registers
+
+It is because some firmware will access target address specified in
+param1 to trigger the error when injecting memory error. This will
+cause resource conflict with regular memory. So It must be removed
+from trigger table resources, but incorrect param1/param2
+combination will stop this action. Add extra check to avoid
+this kind of error.
+
+	Signed-off-by: Chen Gong <gong.chen@linux.intel.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+(cherry picked from commit c5a130325f13b219438cb100e2da71a3e31199f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/resource.c
+diff --cc kernel/resource.c
+index eaf1c7384470,77bf11a86c7d..000000000000
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@@ -490,53 -410,6 +490,56 @@@ int __weak page_is_ram(unsigned long pf
+  	return walk_system_ram_range(pfn, 1, NULL, __is_ram) == 1;
+  }
+  EXPORT_SYMBOL_GPL(page_is_ram);
+++<<<<<<< HEAD
+ +
+ +/**
+ + * region_intersects() - determine intersection of region with known resources
+ + * @start: region start address
+ + * @size: size of region
+ + * @name: name of resource (in iomem_resource)
+ + *
+ + * Check if the specified region partially overlaps or fully eclipses a
+ + * resource identified by @name.  Return REGION_DISJOINT if the region
+ + * does not overlap @name, return REGION_MIXED if the region overlaps
+ + * @type and another resource, and return REGION_INTERSECTS if the
+ + * region overlaps @type and no other defined resource. Note, that
+ + * REGION_INTERSECTS is also returned in the case when the specified
+ + * region overlaps RAM and undefined memory holes.
+ + *
+ + * region_intersect() is used by memory remapping functions to ensure
+ + * the user is not remapping RAM and is a vast speed up over walking
+ + * through the resource table page by page.
+ + */
+ +int region_intersects(resource_size_t start, size_t size, const char *name)
+ +{
+ +	unsigned long flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+ +	resource_size_t end = start + size - 1;
+ +	int type = 0; int other = 0;
+ +	struct resource *p;
+ +
+ +	read_lock(&resource_lock);
+ +	for (p = iomem_resource.child; p ; p = p->sibling) {
+ +		bool is_type = strcmp(p->name, name) == 0 && p->flags == flags;
+ +
+ +		if (start >= p->start && start <= p->end)
+ +			is_type ? type++ : other++;
+ +		if (end >= p->start && end <= p->end)
+ +			is_type ? type++ : other++;
+ +		if (p->start >= start && p->end <= end)
+ +			is_type ? type++ : other++;
+ +	}
+ +	read_unlock(&resource_lock);
+ +
+ +	if (other == 0)
+ +		return type ? REGION_INTERSECTS : REGION_DISJOINT;
+ +
+ +	if (type)
+ +		return REGION_MIXED;
+ +
+ +	return REGION_DISJOINT;
+ +}
+++=======
+++>>>>>>> c5a130325f13 (ACPI/APEI: Add parameter check before error injection)
+  
+  void __weak arch_remove_reservations(struct resource *avail)
+  {
+diff --git a/drivers/acpi/apei/einj.c b/drivers/acpi/apei/einj.c
+index 2cc8e034a3c0..fb57d03e698b 100644
+--- a/drivers/acpi/apei/einj.c
++++ b/drivers/acpi/apei/einj.c
+@@ -32,6 +32,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/nmi.h>
+ #include <linux/delay.h>
++#include <linux/mm.h>
+ #include <acpi/acpi.h>
+ 
+ #include "apei-internal.h"
+@@ -41,6 +42,10 @@
+ #define SPIN_UNIT		100			/* 100ns */
+ /* Firmware should respond within 1 milliseconds */
+ #define FIRMWARE_TIMEOUT	(1 * NSEC_PER_MSEC)
++#define ACPI5_VENDOR_BIT	BIT(31)
++#define MEM_ERROR_MASK		(ACPI_EINJ_MEMORY_CORRECTABLE | \
++				ACPI_EINJ_MEMORY_UNCORRECTABLE | \
++				ACPI_EINJ_MEMORY_FATAL)
+ 
+ /*
+  * ACPI version 5 provides a SET_ERROR_TYPE_WITH_ADDRESS action.
+@@ -367,7 +372,7 @@ static int __einj_error_trigger(u64 trigger_paddr, u32 type,
+ 	 * This will cause resource conflict with regular memory.  So
+ 	 * remove it from trigger table resources.
+ 	 */
+-	if ((param_extension || acpi5) && (type & 0x0038) && param2) {
++	if ((param_extension || acpi5) && (type & MEM_ERROR_MASK) && param2) {
+ 		struct apei_resources addr_resources;
+ 		apei_resources_init(&addr_resources);
+ 		trigger_param_region = einj_get_trigger_parameter_region(
+@@ -427,7 +432,7 @@ static int __einj_error_inject(u32 type, u64 param1, u64 param2)
+ 		struct set_error_type_with_address *v5param = einj_param;
+ 
+ 		v5param->type = type;
+-		if (type & 0x80000000) {
++		if (type & ACPI5_VENDOR_BIT) {
+ 			switch (vendor_flags) {
+ 			case SETWA_FLAGS_APICID:
+ 				v5param->apicid = param1;
+@@ -512,7 +517,34 @@ static int __einj_error_inject(u32 type, u64 param1, u64 param2)
+ static int einj_error_inject(u32 type, u64 param1, u64 param2)
+ {
+ 	int rc;
++	unsigned long pfn;
+ 
++	/*
++	 * We need extra sanity checks for memory errors.
++	 * Other types leap directly to injection.
++	 */
++
++	/* ensure param1/param2 existed */
++	if (!(param_extension || acpi5))
++		goto inject;
++
++	/* ensure injection is memory related */
++	if (type & ACPI5_VENDOR_BIT) {
++		if (vendor_flags != SETWA_FLAGS_MEM)
++			goto inject;
++	} else if (!(type & MEM_ERROR_MASK))
++		goto inject;
++
++	/*
++	 * Disallow crazy address masks that give BIOS leeway to pick
++	 * injection address almost anywhere. Insist on page or
++	 * better granularity and that target address is normal RAM.
++	 */
++	pfn = PFN_DOWN(param1 & param2);
++	if (!page_is_ram(pfn) || ((param2 & PAGE_MASK) != PAGE_MASK))
++		return -EINVAL;
++
++inject:
+ 	mutex_lock(&einj_mutex);
+ 	rc = __einj_error_inject(type, param1, param2);
+ 	mutex_unlock(&einj_mutex);
+@@ -590,7 +622,7 @@ static int error_type_set(void *data, u64 val)
+ 	 * Vendor defined types have 0x80000000 bit set, and
+ 	 * are not enumerated by ACPI_EINJ_GET_ERROR_TYPE
+ 	 */
+-	vendor = val & 0x80000000;
++	vendor = val & ACPI5_VENDOR_BIT;
+ 	tval = val & 0x7fffffff;
+ 
+ 	/* Only one error type can be specified */
+* Unmerged path kernel/resource.c
