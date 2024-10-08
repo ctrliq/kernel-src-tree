@@ -1,0 +1,124 @@
+powerpc/powernv: Add OPAL IPMI interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Add OPAL IPMI interface (Gustavo Duarte) [1221064]
+Rebuild_FUZZ: 88.89%
+commit-author Jeremy Kerr <jk@ozlabs.org>
+commit 608b286d1ddf38a7ceb624d2b689af095816d91c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/608b286d.failed
+
+Recent OPAL firmare adds a couple of functions to send and receive IPMI
+messages:
+
+  https://github.com/open-power/skiboot/commit/b2a374da
+
+This change updates the token list and wrappers to suit, and adds the
+platform devices for any IPMI interfaces.
+
+	Signed-off-by: Jeremy Kerr <jk@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 608b286d1ddf38a7ceb624d2b689af095816d91c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/opal.h
+#	arch/powerpc/platforms/powernv/opal-wrappers.S
+diff --cc arch/powerpc/include/asm/opal.h
+index 5683e9a3a478,5d073e50cac8..000000000000
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@@ -147,9 -147,15 +147,11 @@@ struct opal_sg_list 
+  #define OPAL_GET_PARAM				89
+  #define OPAL_SET_PARAM				90
+  #define OPAL_DUMP_RESEND			91
+ -#define OPAL_PCI_SET_PHB_CXL_MODE		93
+  #define OPAL_DUMP_INFO2				94
+ -#define OPAL_PCI_ERR_INJECT			96
+ -#define OPAL_PCI_EEH_FREEZE_SET			97
+ -#define OPAL_HANDLE_HMI				98
+  #define OPAL_REGISTER_DUMP_REGION		101
+  #define OPAL_UNREGISTER_DUMP_REGION		102
++ #define OPAL_IPMI_SEND				107
++ #define OPAL_IPMI_RECV				108
+  
+  #ifndef __ASSEMBLY__
+  
+@@@ -864,8 -972,14 +877,16 @@@ int64_t opal_get_param(uint64_t token, 
+  int64_t opal_set_param(uint64_t token, uint32_t param_id, uint64_t buffer,
+  		uint64_t length);
+  int64_t opal_sensor_read(uint32_t sensor_hndl, int token, __be32 *sensor_data);
+ -int64_t opal_handle_hmi(void);
+  int64_t opal_register_dump_region(uint32_t id, uint64_t start, uint64_t end);
+  int64_t opal_unregister_dump_region(uint32_t id);
+++<<<<<<< HEAD
+++=======
++ int64_t opal_pci_set_phb_cxl_mode(uint64_t phb_id, uint64_t mode, uint64_t pe_number);
++ int64_t opal_ipmi_send(uint64_t interface, struct opal_ipmi_msg *msg,
++ 		uint64_t msg_len);
++ int64_t opal_ipmi_recv(uint64_t interface, struct opal_ipmi_msg *msg,
++ 		uint64_t *msg_len);
+++>>>>>>> 608b286d1ddf (powerpc/powernv: Add OPAL IPMI interface)
+  
+  /* Internal functions */
+  extern int early_init_dt_scan_opal(unsigned long node, const char *uname,
+diff --cc arch/powerpc/platforms/powernv/opal-wrappers.S
+index af5726c0359f,4f4e4009c289..000000000000
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@@ -147,5 -246,9 +147,11 @@@ OPAL_CALL(opal_sync_host_reboot,		OPAL_
+  OPAL_CALL(opal_sensor_read,			OPAL_SENSOR_READ);
+  OPAL_CALL(opal_get_param,			OPAL_GET_PARAM);
+  OPAL_CALL(opal_set_param,			OPAL_SET_PARAM);
+ -OPAL_CALL(opal_handle_hmi,			OPAL_HANDLE_HMI);
+  OPAL_CALL(opal_register_dump_region,		OPAL_REGISTER_DUMP_REGION);
+  OPAL_CALL(opal_unregister_dump_region,		OPAL_UNREGISTER_DUMP_REGION);
+++<<<<<<< HEAD
+++=======
++ OPAL_CALL(opal_pci_set_phb_cxl_mode,		OPAL_PCI_SET_PHB_CXL_MODE);
++ OPAL_CALL(opal_ipmi_send,			OPAL_IPMI_SEND);
++ OPAL_CALL(opal_ipmi_recv,			OPAL_IPMI_RECV);
+++>>>>>>> 608b286d1ddf (powerpc/powernv: Add OPAL IPMI interface)
+* Unmerged path arch/powerpc/include/asm/opal.h
+* Unmerged path arch/powerpc/platforms/powernv/opal-wrappers.S
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 2542700371c7..c4db695bac1b 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -589,6 +589,16 @@ static void __init opal_dump_region_init(void)
+ 		pr_warn("DUMP: Failed to register kernel log buffer. "
+ 			"rc = %d\n", rc);
+ }
++
++static void opal_ipmi_init(struct device_node *opal_node)
++{
++	struct device_node *np;
++
++	for_each_child_of_node(opal_node, np)
++		if (of_device_is_compatible(np, "ibm,opal-ipmi"))
++			of_platform_device_create(np, NULL, NULL);
++}
++
+ static int __init opal_init(void)
+ {
+ 	struct device_node *np, *consoles;
+@@ -652,6 +662,8 @@ static int __init opal_init(void)
+ 		opal_msglog_init();
+ 	}
+ 
++	opal_ipmi_init(opal_node);
++
+ 	return 0;
+ }
+ machine_subsys_initcall(powernv, opal_init);
+@@ -687,6 +699,8 @@ void opal_shutdown(void)
+ 
+ /* Export this so that test modules can use it */
+ EXPORT_SYMBOL_GPL(opal_invalid_call);
++EXPORT_SYMBOL_GPL(opal_ipmi_send);
++EXPORT_SYMBOL_GPL(opal_ipmi_recv);
+ 
+ /* Convert a region of vmalloc memory to an opal sg list */
+ struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
