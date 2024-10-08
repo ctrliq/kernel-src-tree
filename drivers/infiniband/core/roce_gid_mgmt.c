@@ -103,18 +103,6 @@ static enum bonding_slave_state is_eth_active_slave_of_bonding_rcu(struct net_de
 	return BONDING_SLAVE_STATE_NA;
 }
 
-static bool is_upper_dev_rcu(struct net_device *dev, struct net_device *upper)
-{
-	struct net_device *_upper = NULL;
-	struct list_head *iter;
-
-	netdev_for_each_all_upper_dev_rcu(dev, _upper, iter)
-		if (_upper == upper)
-			break;
-
-	return _upper == upper;
-}
-
 #define REQUIRED_BOND_STATES		(BONDING_SLAVE_STATE_ACTIVE |	\
 					 BONDING_SLAVE_STATE_NA)
 static int is_eth_port_of_netdev(struct ib_device *ib_dev, u8 port,
@@ -132,7 +120,7 @@ static int is_eth_port_of_netdev(struct ib_device *ib_dev, u8 port,
 	if (!real_dev)
 		real_dev = event_ndev;
 
-	res = ((is_upper_dev_rcu(rdma_ndev, event_ndev) &&
+	res = ((rdma_is_upper_dev_rcu(rdma_ndev, event_ndev) &&
 	       (is_eth_active_slave_of_bonding_rcu(rdma_ndev, real_dev) &
 		REQUIRED_BOND_STATES)) ||
 	       real_dev == rdma_ndev);
@@ -178,7 +166,7 @@ static int upper_device_filter(struct ib_device *ib_dev, u8 port,
 		return 1;
 
 	rcu_read_lock();
-	res = is_upper_dev_rcu(rdma_ndev, event_ndev);
+	res = rdma_is_upper_dev_rcu(rdma_ndev, event_ndev);
 	rcu_read_unlock();
 
 	return res;
@@ -206,7 +194,7 @@ static void enum_netdev_default_gids(struct ib_device *ib_dev,
 	rcu_read_lock();
 	if (!rdma_ndev ||
 	    ((rdma_ndev != event_ndev &&
-	      !is_upper_dev_rcu(rdma_ndev, event_ndev)) ||
+	      !rdma_is_upper_dev_rcu(rdma_ndev, event_ndev)) ||
 	     is_eth_active_slave_of_bonding_rcu(rdma_ndev,
 						netdev_master_upper_dev_get_rcu(rdma_ndev)) ==
 	     BONDING_SLAVE_STATE_INACTIVE)) {
@@ -234,7 +222,7 @@ static void bond_delete_netdev_default_gids(struct ib_device *ib_dev,
 
 	rcu_read_lock();
 
-	if (is_upper_dev_rcu(rdma_ndev, event_ndev) &&
+	if (rdma_is_upper_dev_rcu(rdma_ndev, event_ndev) &&
 	    is_eth_active_slave_of_bonding_rcu(rdma_ndev, real_dev) ==
 	    BONDING_SLAVE_STATE_INACTIVE) {
 		rcu_read_unlock();
