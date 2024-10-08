@@ -1,0 +1,120 @@
+megaraid_sas : fix megasas_fire_cmd_fusion calling convention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: fix megasas_fire_cmd_fusion calling convention (Tomas Henzl) [1185944]
+Rebuild_FUZZ: 99.17%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 01d7f03ba00796bda4ffee6767785e9a0eb80962
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/01d7f03b.failed
+
+The fusion HBAs don't really use the instance template like the other
+variants, as it branches off at a much higher level.  So instead of
+trying to squeeze megasas_fire_cmd_fusion into the wrong calling
+convention call it locally with argument data types that match what
+is passed.
+
+[jejb: fix up 32 bit compile failure]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 01d7f03ba00796bda4ffee6767785e9a0eb80962)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 8b61bbd4b86c,1c11a8bb8bf4..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -189,46 -177,35 +189,71 @@@ struct megasas_cmd_fusion *megasas_get_
+  inline void megasas_return_cmd_fusion(struct megasas_instance *instance,
+  	struct megasas_cmd_fusion *cmd)
+  {
+ +	unsigned long flags;
+ +	struct fusion_context *fusion =
+ +		(struct fusion_context *)instance->ctrl_context;
+ +
+ +	spin_lock_irqsave(&fusion->mpt_pool_lock, flags);
+ +
+  	cmd->scmd = NULL;
+ +	cmd->sync_cmd_idx = (u32)ULONG_MAX;
+  	memset(cmd->io_request, 0, sizeof(struct MPI2_RAID_SCSI_IO_REQUEST));
+ +	list_add(&cmd->list, (&fusion->cmd_pool)->next);
+ +
+ +	spin_unlock_irqrestore(&fusion->mpt_pool_lock, flags);
+ +}
+ +
+ +/**
+ + * megasas_return_mfi_mpt_pthr - Return a mfi and mpt to free command pool
+ + * @instance:		Adapter soft state
+ + * @cmd_mfi:		MFI Command packet to be returned to free command pool
+ + * @cmd_mpt:		MPT Command packet to be returned to free command pool
+ + */
+ +inline void megasas_return_mfi_mpt_pthr(struct megasas_instance *instance,
+ +	struct megasas_cmd *cmd_mfi, struct megasas_cmd_fusion *cmd_fusion)
+ +{
+ +	unsigned long flags;
+ +
+ +	/* 
+ + 	 * TO DO: optimize this code and use only one lock instead of two
+ + 	 * locks being used currently- mpt_pool_lock is acquired
+ + 	 * inside mfi_pool_lock
+ + 	 */
+ +	spin_lock_irqsave(&instance->mfi_pool_lock, flags);
+ +	megasas_return_cmd_fusion(instance, cmd_fusion);
+ +	if (atomic_read(&cmd_mfi->mfi_mpt_pthr) != MFI_MPT_ATTACHED)
+ +		dev_err(&instance->pdev->dev, "Possible bug from %s %d\n",
+ +			__func__, __LINE__);
+ +	atomic_set(&cmd_mfi->mfi_mpt_pthr, MFI_MPT_DETACHED);
+ +	__megasas_return_cmd(instance, cmd_mfi);
+ +	spin_unlock_irqrestore(&instance->mfi_pool_lock, flags);
+  }
+  
++ /**
++  * megasas_fire_cmd_fusion -	Sends command to the FW
++  */
++ static void
++ megasas_fire_cmd_fusion(struct megasas_instance *instance,
++ 		union MEGASAS_REQUEST_DESCRIPTOR_UNION *req_desc)
++ {
++ #if defined(writeq) && defined(CONFIG_64BIT)
++ 	u64 req_data = (((u64)le32_to_cpu(req_desc->u.high) << 32) |
++ 			le32_to_cpu(req_desc->u.low));
++ 
++ 	writeq(req_data, &instance->reg_set->inbound_low_queue_port);
++ #else
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&instance->hba_lock, flags);
++ 	writel(le32_to_cpu(req_desc->u.low),
++ 		&instance->reg_set->inbound_low_queue_port);
++ 	writel(le32_to_cpu(req_desc->u.high),
++ 		&instance->reg_set->inbound_high_queue_port);
++ 	spin_unlock_irqrestore(&instance->hba_lock, flags);
++ #endif
++ }
++ 
++ 
+  /**
+   * megasas_teardown_frame_pool_fusion -	Destroy the cmd frame DMA pool
+   * @instance:				Adapter soft state
+@@@ -2358,9 -2305,7 +2352,13 @@@ megasas_issue_dcmd_fusion(struct megasa
+  		printk(KERN_ERR "Couldn't issue MFI pass thru cmd\n");
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	atomic_set(&cmd->mfi_mpt_pthr, MFI_MPT_ATTACHED);
+ +	instance->instancet->fire_cmd(instance, req_desc->u.low,
+ +				      req_desc->u.high, instance->reg_set);
+++=======
++ 	megasas_fire_cmd_fusion(instance, req_desc);
+++>>>>>>> 01d7f03ba007 (megaraid_sas : fix megasas_fire_cmd_fusion calling convention)
+  }
+  
+  /**
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
