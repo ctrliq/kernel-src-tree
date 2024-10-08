@@ -1,0 +1,294 @@
+xfs: introduce xlog_copy_iovec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 1234351cba958cd5d4338172ccfc869a687cd736
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/1234351c.failed
+
+Add a helper to abstract out filling the log iovecs in the log item
+format handlers.  This will allow us to change the way we do the log
+item formatting more easily.
+
+The copy in the name is a bit confusing for now as it just assigns a
+pointer and lets the CIL code perform the copy, but that will change
+soon.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 1234351cba958cd5d4338172ccfc869a687cd736)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode_item.c
+diff --cc fs/xfs/xfs_inode_item.c
+index f86ec16592fa,c75e14beff06..000000000000
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@@ -30,6 -27,10 +30,12 @@@
+  #include "xfs_inode_item.h"
+  #include "xfs_error.h"
+  #include "xfs_trace.h"
+++<<<<<<< HEAD
+++=======
++ #include "xfs_trans_priv.h"
++ #include "xfs_dinode.h"
++ #include "xfs_log.h"
+++>>>>>>> 1234351cba95 (xfs: introduce xlog_copy_iovec)
+  
+  
+  kmem_zone_t	*xfs_ili_zone;		/* inode log item zone */
+diff --git a/fs/xfs/xfs_buf_item.c b/fs/xfs/xfs_buf_item.c
+index 0b8551a96aee..0ef9edf9a624 100644
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@ -181,20 +181,18 @@ xfs_buf_item_size(
+ 	trace_xfs_buf_item_size(bip);
+ }
+ 
+-static inline struct xfs_log_iovec *
++static inline void
+ xfs_buf_item_copy_iovec(
+-	struct xfs_log_iovec	*vecp,
++	struct xfs_log_iovec	**vecp,
+ 	struct xfs_buf		*bp,
+ 	uint			offset,
+ 	int			first_bit,
+ 	uint			nbits)
+ {
+ 	offset += first_bit * XFS_BLF_CHUNK;
+-
+-	vecp->i_type = XLOG_REG_TYPE_BCHUNK;
+-	vecp->i_addr = xfs_buf_offset(bp, offset);
+-	vecp->i_len = nbits * XFS_BLF_CHUNK;
+-	return vecp + 1;
++	xlog_copy_iovec(vecp, XLOG_REG_TYPE_BCHUNK,
++			xfs_buf_offset(bp, offset),
++			nbits * XFS_BLF_CHUNK);
+ }
+ 
+ static inline bool
+@@ -209,10 +207,10 @@ xfs_buf_item_straddle(
+ 		 XFS_BLF_CHUNK);
+ }
+ 
+-static struct xfs_log_iovec *
++static void
+ xfs_buf_item_format_segment(
+ 	struct xfs_buf_log_item	*bip,
+-	struct xfs_log_iovec	*vecp,
++	struct xfs_log_iovec	**vecp,
+ 	uint			offset,
+ 	struct xfs_buf_log_format *blfp)
+ {
+@@ -244,10 +242,7 @@ xfs_buf_item_format_segment(
+ 		goto out;
+ 	}
+ 
+-	vecp->i_addr = blfp;
+-	vecp->i_len = base_size;
+-	vecp->i_type = XLOG_REG_TYPE_BFORMAT;
+-	vecp++;
++	xlog_copy_iovec(vecp, XLOG_REG_TYPE_BFORMAT, blfp, base_size);
+ 	nvecs = 1;
+ 
+ 	if (bip->bli_flags & XFS_BLI_STALE) {
+@@ -290,8 +285,8 @@ xfs_buf_item_format_segment(
+ 			break;
+ 		} else if (next_bit != last_bit + 1 ||
+ 		           xfs_buf_item_straddle(bp, offset, next_bit, last_bit)) {
+-			vecp = xfs_buf_item_copy_iovec(vecp, bp, offset,
+-						       first_bit, nbits);
++			xfs_buf_item_copy_iovec(vecp, bp, offset,
++						first_bit, nbits);
+ 			nvecs++;
+ 			first_bit = next_bit;
+ 			last_bit = next_bit;
+@@ -303,7 +298,6 @@ xfs_buf_item_format_segment(
+ 	}
+ out:
+ 	blfp->blf_size = nvecs;
+-	return vecp;
+ }
+ 
+ /*
+@@ -359,8 +353,8 @@ xfs_buf_item_format(
+ 	}
+ 
+ 	for (i = 0; i < bip->bli_format_count; i++) {
+-		vecp = xfs_buf_item_format_segment(bip, vecp, offset,
+-						&bip->bli_formats[i]);
++		xfs_buf_item_format_segment(bip, &vecp, offset,
++					    &bip->bli_formats[i]);
+ 		offset += bp->b_maps[i].bm_len;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_dquot_item.c b/fs/xfs/xfs_dquot_item.c
+index e838d84b4e85..ec5e631e4908 100644
+--- a/fs/xfs/xfs_dquot_item.c
++++ b/fs/xfs/xfs_dquot_item.c
+@@ -61,20 +61,18 @@ xfs_qm_dquot_logitem_size(
+ STATIC void
+ xfs_qm_dquot_logitem_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*logvec)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_dq_logitem	*qlip = DQUOT_ITEM(lip);
+ 
+-	logvec->i_addr = &qlip->qli_format;
+-	logvec->i_len  = sizeof(xfs_dq_logformat_t);
+-	logvec->i_type = XLOG_REG_TYPE_QFORMAT;
+-	logvec++;
+-	logvec->i_addr = &qlip->qli_dquot->q_core;
+-	logvec->i_len  = sizeof(xfs_disk_dquot_t);
+-	logvec->i_type = XLOG_REG_TYPE_DQUOT;
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_QFORMAT,
++			&qlip->qli_format,
++			sizeof(struct xfs_dq_logformat));
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_DQUOT,
++			&qlip->qli_dquot->q_core,
++			sizeof(struct xfs_disk_dquot));
+ 
+ 	qlip->qli_format.qlf_size = 2;
+-
+ }
+ 
+ /*
+@@ -308,15 +306,16 @@ xfs_qm_qoff_logitem_size(
+ STATIC void
+ xfs_qm_qoff_logitem_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*log_vector)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_qoff_logitem	*qflip = QOFF_ITEM(lip);
+ 
+ 	ASSERT(qflip->qql_format.qf_type == XFS_LI_QUOTAOFF);
+ 
+-	log_vector->i_addr = &qflip->qql_format;
+-	log_vector->i_len = sizeof(xfs_qoff_logitem_t);
+-	log_vector->i_type = XLOG_REG_TYPE_QUOTAOFF;
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_QUOTAOFF,
++			&qflip->qql_format,
++			sizeof(struct xfs_qoff_logitem));
++
+ 	qflip->qql_format.qf_size = 1;
+ }
+ 
+diff --git a/fs/xfs/xfs_extfree_item.c b/fs/xfs/xfs_extfree_item.c
+index dc53e8febbbe..f46bbee6b6e9 100644
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@ -26,6 +26,7 @@
+ #include "xfs_mount.h"
+ #include "xfs_trans_priv.h"
+ #include "xfs_extfree_item.h"
++#include "xfs_log.h"
+ 
+ 
+ kmem_zone_t	*xfs_efi_zone;
+@@ -101,7 +102,7 @@ xfs_efi_item_size(
+ STATIC void
+ xfs_efi_item_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*log_vector)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_efi_log_item	*efip = EFI_ITEM(lip);
+ 
+@@ -111,10 +112,9 @@ xfs_efi_item_format(
+ 	efip->efi_format.efi_type = XFS_LI_EFI;
+ 	efip->efi_format.efi_size = 1;
+ 
+-	log_vector->i_addr = &efip->efi_format;
+-	log_vector->i_len = xfs_efi_item_sizeof(efip);
+-	log_vector->i_type = XLOG_REG_TYPE_EFI_FORMAT;
+-	ASSERT(log_vector->i_len >= sizeof(xfs_efi_log_format_t));
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_EFI_FORMAT,
++			&efip->efi_format,
++			xfs_efi_item_sizeof(efip));
+ }
+ 
+ 
+@@ -368,7 +368,7 @@ xfs_efd_item_size(
+ STATIC void
+ xfs_efd_item_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*log_vector)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_efd_log_item	*efdp = EFD_ITEM(lip);
+ 
+@@ -377,10 +377,9 @@ xfs_efd_item_format(
+ 	efdp->efd_format.efd_type = XFS_LI_EFD;
+ 	efdp->efd_format.efd_size = 1;
+ 
+-	log_vector->i_addr = &efdp->efd_format;
+-	log_vector->i_len = xfs_efd_item_sizeof(efdp);
+-	log_vector->i_type = XLOG_REG_TYPE_EFD_FORMAT;
+-	ASSERT(log_vector->i_len >= sizeof(xfs_efd_log_format_t));
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_EFD_FORMAT,
++			&efdp->efd_format,
++			xfs_efd_item_sizeof(efdp));
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index d08ed2f5644f..58857491da66 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -39,6 +39,7 @@
+ #include "xfs_ialloc.h"
+ #include "xfs_error.h"
+ #include "xfs_icreate_item.h"
++#include "xfs_log.h"
+ 
+ kmem_zone_t	*xfs_icreate_zone;		/* inode create item zone */
+ 
+@@ -69,13 +70,13 @@ xfs_icreate_item_size(
+ STATIC void
+ xfs_icreate_item_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*log_vector)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+ 
+-	log_vector->i_addr = (xfs_caddr_t)&icp->ic_format;
+-	log_vector->i_len  = sizeof(struct xfs_icreate_log);
+-	log_vector->i_type = XLOG_REG_TYPE_ICREATE;
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_ICREATE,
++			&icp->ic_format,
++			sizeof(struct xfs_icreate_log));
+ }
+ 
+ 
+* Unmerged path fs/xfs/xfs_inode_item.c
+diff --git a/fs/xfs/xfs_log.h b/fs/xfs/xfs_log.h
+index 1c458487f000..4aca7823098e 100644
+--- a/fs/xfs/xfs_log.h
++++ b/fs/xfs/xfs_log.h
+@@ -32,6 +32,19 @@ struct xfs_log_vec {
+ 
+ #define XFS_LOG_VEC_ORDERED	(-1)
+ 
++static inline void *
++xlog_copy_iovec(struct xfs_log_iovec **vecp, uint type, void *data, int len)
++{
++	struct xfs_log_iovec *vec = *vecp;
++
++	vec->i_type = type;
++	vec->i_addr = data;
++	vec->i_len = len;
++
++	*vecp = vec + 1;
++	return vec->i_addr;
++}
++
+ /*
+  * Structure used to pass callback function and the function's argument
+  * to the log manager.
