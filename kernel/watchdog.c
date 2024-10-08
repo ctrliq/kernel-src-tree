@@ -825,6 +825,7 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 	int err, old, new;
 	int *watchdog_param = (int *)table->data;
 
+	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
 
 	/*
@@ -869,6 +870,7 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 	}
 out:
 	mutex_unlock(&watchdog_proc_mutex);
+	put_online_cpus();
 	return err;
 }
 
@@ -910,6 +912,7 @@ int proc_watchdog_thresh(struct ctl_table *table, int write,
 {
 	int err, old;
 
+	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
 
 	old = ACCESS_ONCE(watchdog_thresh);
@@ -929,6 +932,7 @@ int proc_watchdog_thresh(struct ctl_table *table, int write,
 	}
 out:
 	mutex_unlock(&watchdog_proc_mutex);
+	put_online_cpus();
 	return err;
 }
 
@@ -942,6 +946,7 @@ int proc_dowatchdog(struct ctl_table *table, int write,
 	int err, old_thresh, old_enabled;
 	bool old_hardlockup;
 
+	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
 	old_thresh = ACCESS_ONCE(watchdog_thresh);
 	old_enabled = ACCESS_ONCE(watchdog_user_enabled);
@@ -976,6 +981,7 @@ int proc_dowatchdog(struct ctl_table *table, int write,
 	}
 out:
 	mutex_unlock(&watchdog_proc_mutex);
+	put_online_cpus();
 	return err;
 }
 #endif /* CONFIG_SYSCTL */
