@@ -1,0 +1,899 @@
+net: core: explicitly select a txq before doing l2 forwarding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] core: explicitly select a txq before doing l2 forwarding (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 95.73%
+commit-author Jason Wang <jasowang@redhat.com>
+commit f663dd9aaf9ed124f25f0f8452edf238f087ad50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f663dd9a.failed
+
+Currently, the tx queue were selected implicitly in ndo_dfwd_start_xmit(). The
+will cause several issues:
+
+- NETIF_F_LLTX were removed for macvlan, so txq lock were done for macvlan
+  instead of lower device which misses the necessary txq synchronization for
+  lower device such as txq stopping or frozen required by dev watchdog or
+  control path.
+- dev_hard_start_xmit() was called with NULL txq which bypasses the net device
+  watchdog.
+- dev_hard_start_xmit() does not check txq everywhere which will lead a crash
+  when tso is disabled for lower device.
+
+Fix this by explicitly introducing a new param for .ndo_select_queue() for just
+selecting queues in the case of l2 forwarding offload. netdev_pick_tx() was also
+extended to accept this parameter and dev_queue_xmit_accel() was used to do l2
+forwarding transmission.
+
+With this fixes, NETIF_F_LLTX could be preserved for macvlan and there's no need
+to check txq against NULL in dev_hard_start_xmit(). Also there's no need to keep
+a dedicated ndo_dfwd_start_xmit() and we can just reuse the code of
+dev_queue_xmit() to do the transmission.
+
+In the future, it was also required for macvtap l2 forwarding support since it
+provides a necessary synchronization method.
+
+	Cc: John Fastabend <john.r.fastabend@intel.com>
+	Cc: Neil Horman <nhorman@tuxdriver.com>
+	Cc: e1000-devel@lists.sourceforge.net
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Acked-by: John Fastabend <john.r.fastabend@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f663dd9aaf9ed124f25f0f8452edf238f087ad50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/macvlan.c
+#	drivers/net/wireless/mwifiex/main.c
+#	drivers/staging/rtl8188eu/os_dep/os_intfs.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/mac80211/iface.c
+#	net/sched/sch_generic.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index e464f2e3e2eb,5bcc870f8367..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -7033,9 -6801,37 +7033,42 @@@ static void ixgbe_atr(struct ixgbe_rin
+  					      input, common, ring->queue_index);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef IXGBE_FCOE
+ +static u16 ixgbe_select_queue(struct net_device *dev, struct sk_buff *skb)
+++=======
++ static int __ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
++ {
++ 	netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
++ 	/* Herbert's original patch had:
++ 	 *  smp_mb__after_netif_stop_queue();
++ 	 * but since that doesn't exist yet, just open code it. */
++ 	smp_mb();
++ 
++ 	/* We need to check again in a case another CPU has just
++ 	 * made room available. */
++ 	if (likely(ixgbe_desc_unused(tx_ring) < size))
++ 		return -EBUSY;
++ 
++ 	/* A reprieve! - use start_queue because it doesn't call schedule */
++ 	netif_start_subqueue(tx_ring->netdev, tx_ring->queue_index);
++ 	++tx_ring->tx_stats.restart_queue;
++ 	return 0;
++ }
++ 
++ static inline int ixgbe_maybe_stop_tx(struct ixgbe_ring *tx_ring, u16 size)
++ {
++ 	if (likely(ixgbe_desc_unused(tx_ring) >= size))
++ 		return 0;
++ 	return __ixgbe_maybe_stop_tx(tx_ring, size);
++ }
++ 
++ static u16 ixgbe_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 			      void *accel_priv)
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  {
++ 	struct ixgbe_fwd_adapter *fwd_adapter = accel_priv;
++ #ifdef IXGBE_FCOE
+  	struct ixgbe_adapter *adapter;
+  	struct ixgbe_ring_feature *f;
+  	int txq;
+@@@ -7769,8 -7547,96 +7810,101 @@@ static int ixgbe_ndo_bridge_getlink(str
+  	if (!(adapter->flags & IXGBE_FLAG_SRIOV_ENABLED))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	return ndo_dflt_bridge_getlink(skb, pid, seq, dev,
+ +				       adapter->bridge_mode, 0, 0);
+++=======
++ 	if (adapter->flags2 & IXGBE_FLAG2_BRIDGE_MODE_VEB)
++ 		mode = BRIDGE_MODE_VEB;
++ 	else
++ 		mode = BRIDGE_MODE_VEPA;
++ 
++ 	return ndo_dflt_bridge_getlink(skb, pid, seq, dev, mode);
++ }
++ 
++ static void *ixgbe_fwd_add(struct net_device *pdev, struct net_device *vdev)
++ {
++ 	struct ixgbe_fwd_adapter *fwd_adapter = NULL;
++ 	struct ixgbe_adapter *adapter = netdev_priv(pdev);
++ 	unsigned int limit;
++ 	int pool, err;
++ 
++ #ifdef CONFIG_RPS
++ 	if (vdev->num_rx_queues != vdev->num_tx_queues) {
++ 		netdev_info(pdev, "%s: Only supports a single queue count for TX and RX\n",
++ 			    vdev->name);
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ #endif
++ 	/* Check for hardware restriction on number of rx/tx queues */
++ 	if (vdev->num_tx_queues > IXGBE_MAX_L2A_QUEUES ||
++ 	    vdev->num_tx_queues == IXGBE_BAD_L2A_QUEUE) {
++ 		netdev_info(pdev,
++ 			    "%s: Supports RX/TX Queue counts 1,2, and 4\n",
++ 			    pdev->name);
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	if (((adapter->flags & IXGBE_FLAG_DCB_ENABLED) &&
++ 	      adapter->num_rx_pools > IXGBE_MAX_DCBMACVLANS - 1) ||
++ 	    (adapter->num_rx_pools > IXGBE_MAX_MACVLANS))
++ 		return ERR_PTR(-EBUSY);
++ 
++ 	fwd_adapter = kcalloc(1, sizeof(struct ixgbe_fwd_adapter), GFP_KERNEL);
++ 	if (!fwd_adapter)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	pool = find_first_zero_bit(&adapter->fwd_bitmask, 32);
++ 	adapter->num_rx_pools++;
++ 	set_bit(pool, &adapter->fwd_bitmask);
++ 	limit = find_last_bit(&adapter->fwd_bitmask, 32);
++ 
++ 	/* Enable VMDq flag so device will be set in VM mode */
++ 	adapter->flags |= IXGBE_FLAG_VMDQ_ENABLED | IXGBE_FLAG_SRIOV_ENABLED;
++ 	adapter->ring_feature[RING_F_VMDQ].limit = limit + 1;
++ 	adapter->ring_feature[RING_F_RSS].limit = vdev->num_tx_queues;
++ 
++ 	/* Force reinit of ring allocation with VMDQ enabled */
++ 	err = ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
++ 	if (err)
++ 		goto fwd_add_err;
++ 	fwd_adapter->pool = pool;
++ 	fwd_adapter->real_adapter = adapter;
++ 	err = ixgbe_fwd_ring_up(vdev, fwd_adapter);
++ 	if (err)
++ 		goto fwd_add_err;
++ 	netif_tx_start_all_queues(vdev);
++ 	return fwd_adapter;
++ fwd_add_err:
++ 	/* unwind counter and free adapter struct */
++ 	netdev_info(pdev,
++ 		    "%s: dfwd hardware acceleration failed\n", vdev->name);
++ 	clear_bit(pool, &adapter->fwd_bitmask);
++ 	adapter->num_rx_pools--;
++ 	kfree(fwd_adapter);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void ixgbe_fwd_del(struct net_device *pdev, void *priv)
++ {
++ 	struct ixgbe_fwd_adapter *fwd_adapter = priv;
++ 	struct ixgbe_adapter *adapter = fwd_adapter->real_adapter;
++ 	unsigned int limit;
++ 
++ 	clear_bit(fwd_adapter->pool, &adapter->fwd_bitmask);
++ 	adapter->num_rx_pools--;
++ 
++ 	limit = find_last_bit(&adapter->fwd_bitmask, 32);
++ 	adapter->ring_feature[RING_F_VMDQ].limit = limit + 1;
++ 	ixgbe_fwd_ring_down(fwd_adapter->netdev, fwd_adapter);
++ 	ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
++ 	netdev_dbg(pdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
++ 		   fwd_adapter->pool, adapter->num_rx_pools,
++ 		   fwd_adapter->rx_base_queue,
++ 		   fwd_adapter->rx_base_queue + adapter->num_rx_queues_per_pool,
++ 		   adapter->fwd_bitmask);
++ 	kfree(fwd_adapter);
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  }
+  
+  static const struct net_device_ops ixgbe_netdev_ops = {
+@@@ -7818,6 -7681,8 +7950,11 @@@
+  	.ndo_fdb_add		= ixgbe_ndo_fdb_add,
+  	.ndo_bridge_setlink	= ixgbe_ndo_bridge_setlink,
+  	.ndo_bridge_getlink	= ixgbe_ndo_bridge_getlink,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_dfwd_add_station	= ixgbe_fwd_add,
++ 	.ndo_dfwd_del_station	= ixgbe_fwd_del,
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  };
+  
+  /**
+diff --cc drivers/net/macvlan.c
+index 108ceb8a23fa,bc8faaec33f5..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -368,7 -297,13 +368,17 @@@ netdev_tx_t macvlan_start_xmit(struct s
+  	int ret;
+  	const struct macvlan_dev *vlan = netdev_priv(dev);
+  
+++<<<<<<< HEAD
+ +	ret = macvlan_queue_xmit(skb, dev);
+++=======
++ 	if (vlan->fwd_priv) {
++ 		skb->dev = vlan->lowerdev;
++ 		ret = dev_queue_xmit_accel(skb, vlan->fwd_priv);
++ 	} else {
++ 		ret = macvlan_queue_xmit(skb, dev);
++ 	}
++ 
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
+  		struct macvlan_pcpu_stats *pcpu_stats;
+  
+@@@ -415,6 -355,20 +425,23 @@@ static int macvlan_open(struct net_devi
+  		goto hash_add;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (lowerdev->features & NETIF_F_HW_L2FW_DOFFLOAD &&
++ 	    dev->rtnl_link_ops == &macvlan_link_ops) {
++ 		vlan->fwd_priv =
++ 		      lowerdev->netdev_ops->ndo_dfwd_add_station(lowerdev, dev);
++ 
++ 		/* If we get a NULL pointer back, or if we get an error
++ 		 * then we should just fall through to the non accelerated path
++ 		 */
++ 		if (IS_ERR_OR_NULL(vlan->fwd_priv)) {
++ 			vlan->fwd_priv = NULL;
++ 		} else
++ 			return 0;
++ 	}
++ 
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  	err = -EBUSY;
+  	if (macvlan_addr_busy(vlan->port, dev->dev_addr))
+  		goto out;
+@@@ -733,7 -700,7 +760,11 @@@ static netdev_features_t macvlan_fix_fe
+  	features = netdev_increment_features(vlan->lowerdev->features,
+  					     features,
+  					     mask);
+++<<<<<<< HEAD
+ +	features |= ALWAYS_ON_FEATURES;
+++=======
++ 	features |= NETIF_F_LLTX;
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  
+  	return features;
+  }
+diff --cc drivers/net/wireless/mwifiex/main.c
+index 823418877a35,8bb8988c435c..000000000000
+--- a/drivers/net/wireless/mwifiex/main.c
++++ b/drivers/net/wireless/mwifiex/main.c
+@@@ -977,14 -746,10 +977,19 @@@ static struct net_device_stats *mwifiex
+  }
+  
+  static u16
+++<<<<<<< HEAD
+ +#if 0 /* Not in RHEL */
+ +mwifiex_netdev_select_wmm_queue(struct net_device *dev, struct sk_buff *skb,
+ +				void *accel_priv, select_queue_fallback_t fallback)
+ +#else
+ +mwifiex_netdev_select_wmm_queue(struct net_device *dev, struct sk_buff *skb)
+ +#endif
+++=======
++ mwifiex_netdev_select_wmm_queue(struct net_device *dev, struct sk_buff *skb,
++ 				void *accel_priv)
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  {
+ -	skb->priority = cfg80211_classify8021d(skb);
+ +	skb->priority = cfg80211_classify8021d(skb, NULL);
+  	return mwifiex_1d_to_wmm_queue[skb->priority];
+  }
+  
+diff --cc include/linux/netdevice.h
+index 7b10147de03d,ce2a1f5f9a1e..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2030,9 -1820,9 +2033,10 @@@ int dev_alloc_name(struct net_device *d
+  int dev_open(struct net_device *dev);
+  int dev_close(struct net_device *dev);
+  void dev_disable_lro(struct net_device *dev);
+ -int dev_loopback_xmit(struct sk_buff *newskb);
+ +int dev_loopback_xmit(struct sock *sk, struct sk_buff *newskb);
+ +int dev_queue_xmit_sk(struct sock *sk, struct sk_buff *skb);
+  int dev_queue_xmit(struct sk_buff *skb);
++ int dev_queue_xmit_accel(struct sk_buff *skb, void *accel_priv);
+  int register_netdevice(struct net_device *dev);
+  void unregister_netdevice_queue(struct net_device *dev, struct list_head *head);
+  void unregister_netdevice_many(struct list_head *head);
+@@@ -2785,12 -2429,9 +2789,17 @@@ int dev_set_mac_address(struct net_devi
+  int dev_change_carrier(struct net_device *, bool new_carrier);
+  int dev_get_phys_port_id(struct net_device *dev,
+  			 struct netdev_phys_port_id *ppid);
+++<<<<<<< HEAD
+ +struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev);
+ +struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ +				    struct netdev_queue *txq, int *ret);
+ +int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+++=======
++ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
++ 			struct netdev_queue *txq);
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+ +bool is_skb_forwardable(struct net_device *dev, struct sk_buff *skb);
+  
+  extern int		netdev_budget;
+  
+diff --cc net/core/dev.c
+index b52e68f2dd45,0ce469e5ec80..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2534,110 -2523,133 +2534,221 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+ -/*
+ - * Returns true if either:
+ - *	1. skb has frag_list and the device doesn't support FRAGLIST, or
+ - *	2. skb is fragmented and the device does not support SG.
+ - */
+ -static inline int skb_needs_linearize(struct sk_buff *skb,
+ -				      netdev_features_t features)
+ +static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+ +		    struct netdev_queue *txq, bool more)
+  {
+ -	return skb_is_nonlinear(skb) &&
+ -			((skb_has_frag_list(skb) &&
+ -				!(features & NETIF_F_FRAGLIST)) ||
+ -			(skb_shinfo(skb)->nr_frags &&
+ -				!(features & NETIF_F_SG)));
+ -}
+ +	unsigned int len;
+ +	int rc;
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(&ptype_all))
+ +		dev_queue_xmit_nit(skb, dev);
+++=======
++ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
++ 			struct netdev_queue *txq)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int rc = NETDEV_TX_OK;
++ 	unsigned int skb_len;
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  
+ -	if (likely(!skb->next)) {
+ -		netdev_features_t features;
+ +	len = skb->len;
+ +	rc = netdev_start_xmit(skb, dev, txq, more);
+ +	trace_net_dev_xmit(skb, rc, dev, len);
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * If device doesn't need skb->dst, release it right now while
++ 		 * its hot in this cpu cache
++ 		 */
++ 		if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
++ 			skb_dst_drop(skb);
++ 
++ 		features = netif_skb_features(skb);
++ 
++ 		if (vlan_tx_tag_present(skb) &&
++ 		    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
++ 			skb = __vlan_put_tag(skb, skb->vlan_proto,
++ 					     vlan_tx_tag_get(skb));
++ 			if (unlikely(!skb))
++ 				goto out;
++ 
++ 			skb->vlan_tci = 0;
++ 		}
++ 
++ 		/* If encapsulation offload request, verify we are testing
++ 		 * hardware encapsulation features instead of standard
++ 		 * features for the netdev
++ 		 */
++ 		if (skb->encapsulation)
++ 			features &= dev->hw_enc_features;
++ 
++ 		if (netif_needs_gso(skb, features)) {
++ 			if (unlikely(dev_gso_segment(skb, features)))
++ 				goto out_kfree_skb;
++ 			if (skb->next)
++ 				goto gso;
++ 		} else {
++ 			if (skb_needs_linearize(skb, features) &&
++ 			    __skb_linearize(skb))
++ 				goto out_kfree_skb;
++ 
++ 			/* If packet is not checksummed and device does not
++ 			 * support checksumming for this protocol, complete
++ 			 * checksumming here.
++ 			 */
++ 			if (skb->ip_summed == CHECKSUM_PARTIAL) {
++ 				if (skb->encapsulation)
++ 					skb_set_inner_transport_header(skb,
++ 						skb_checksum_start_offset(skb));
++ 				else
++ 					skb_set_transport_header(skb,
++ 						skb_checksum_start_offset(skb));
++ 				if (!(features & NETIF_F_ALL_CSUM) &&
++ 				     skb_checksum_help(skb))
++ 					goto out_kfree_skb;
++ 			}
++ 		}
++ 
++ 		if (!list_empty(&ptype_all))
++ 			dev_queue_xmit_nit(skb, dev);
++ 
++ 		skb_len = skb->len;
++ 			rc = ops->ndo_start_xmit(skb, dev);
++ 
++ 		trace_net_dev_xmit(skb, rc, dev, skb_len);
++ 		if (rc == NETDEV_TX_OK)
++ 			txq_trans_update(txq);
++ 		return rc;
++ 	}
++ 
++ gso:
++ 	do {
++ 		struct sk_buff *nskb = skb->next;
++ 
++ 		skb->next = nskb->next;
++ 		nskb->next = NULL;
++ 
++ 		if (!list_empty(&ptype_all))
++ 			dev_queue_xmit_nit(nskb, dev);
++ 
++ 		skb_len = nskb->len;
++ 		rc = ops->ndo_start_xmit(nskb, dev);
++ 		trace_net_dev_xmit(nskb, rc, dev, skb_len);
++ 		if (unlikely(rc != NETDEV_TX_OK)) {
++ 			if (rc & ~NETDEV_TX_MASK)
++ 				goto out_kfree_gso_skb;
++ 			nskb->next = skb->next;
++ 			skb->next = nskb;
++ 			return rc;
++ 		}
++ 		txq_trans_update(txq);
++ 		if (unlikely(netif_xmit_stopped(txq) && skb->next))
++ 			return NETDEV_TX_BUSY;
++ 	} while (skb->next);
++ 
++ out_kfree_gso_skb:
++ 	if (likely(skb->next == NULL)) {
++ 		skb->destructor = DEV_GSO_CB(skb)->destructor;
++ 		consume_skb(skb);
++ 		return rc;
++ 	}
++ out_kfree_skb:
++ 	kfree_skb(skb);
++ out:
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  	return rc;
+  }
+ -EXPORT_SYMBOL_GPL(dev_hard_start_xmit);
+ +
+ +struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
+ +				    struct netdev_queue *txq, int *ret)
+ +{
+ +	struct sk_buff *skb = first;
+ +	int rc = NETDEV_TX_OK;
+ +
+ +	while (skb) {
+ +		struct sk_buff *next = skb->next;
+ +
+ +		skb->next = NULL;
+ +		rc = xmit_one(skb, dev, txq, next != NULL);
+ +		if (unlikely(!dev_xmit_complete(rc))) {
+ +			skb->next = next;
+ +			goto out;
+ +		}
+ +
+ +		skb = next;
+ +		if (netif_xmit_stopped(txq) && skb) {
+ +			rc = NETDEV_TX_BUSY;
+ +			break;
+ +		}
+ +	}
+ +
+ +out:
+ +	*ret = rc;
+ +	return skb;
+ +}
+ +
+ +static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
+ +					  netdev_features_t features)
+ +{
+ +	if (skb_vlan_tag_present(skb) &&
+ +	    !vlan_hw_offload_capable(features, skb->vlan_proto))
+ +		skb = __vlan_hwaccel_push_inside(skb);
+ +	return skb;
+ +}
+ +
+ +struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
+ +{
+ +	netdev_features_t features;
+ +
+ +	if (skb->next)
+ +		return skb;
+ +
+ +	features = netif_skb_features(skb);
+ +	skb = validate_xmit_vlan(skb, features);
+ +	if (unlikely(!skb))
+ +		goto out_null;
+ +
+ +	if (netif_needs_gso(skb, features)) {
+ +		struct sk_buff *segs;
+ +
+ +		segs = skb_gso_segment(skb, features);
+ +		if (IS_ERR(segs)) {
+ +			goto out_kfree_skb;
+ +		} else if (segs) {
+ +			consume_skb(skb);
+ +			skb = segs;
+ +		}
+ +	} else {
+ +		if (skb_needs_linearize(skb, features) &&
+ +		    __skb_linearize(skb))
+ +			goto out_kfree_skb;
+ +
+ +		/* If packet is not checksummed and device does not
+ +		 * support checksumming for this protocol, complete
+ +		 * checksumming here.
+ +		 */
+ +		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ +			if (skb->encapsulation)
+ +				skb_set_inner_transport_header(skb,
+ +							       skb_checksum_start_offset(skb));
+ +			else
+ +				skb_set_transport_header(skb,
+ +							 skb_checksum_start_offset(skb));
+ +			if (!(features & NETIF_F_ALL_CSUM) &&
+ +			    skb_checksum_help(skb))
+ +				goto out_kfree_skb;
+ +		}
+ +	}
+ +
+ +	return skb;
+ +
+ +out_kfree_skb:
+ +	kfree_skb(skb);
+ +out_null:
+ +	return NULL;
+ +}
+  
+  static void qdisc_pkt_len_init(struct sk_buff *skb)
+  {
+@@@ -2809,15 -2821,7 +2920,19 @@@ int __dev_queue_xmit(struct sk_buff *sk
+  
+  	skb_update_prio(skb);
+  
+++<<<<<<< HEAD
+ +	/* If device/qdisc don't need skb->dst, release it right now while
+ +	 * its hot in this cpu cache.
+ +	 */
+ +	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+ +		skb_dst_drop(skb);
+ +	else
+ +		skb_dst_force(skb);
+ +
+ +	txq = netdev_pick_tx(dev, skb);
+++=======
++ 	txq = netdev_pick_tx(dev, skb, accel_priv);
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  	q = rcu_dereference_bh(txq->qdisc);
+  
+  #ifdef CONFIG_NET_CLS_ACT
+@@@ -2857,7 -2857,7 +2972,11 @@@
+  
+  			if (!netif_xmit_stopped(txq)) {
+  				__this_cpu_inc(xmit_recursion);
+++<<<<<<< HEAD
+ +				skb = dev_hard_start_xmit(skb, dev, txq, &rc);
+++=======
++ 				rc = dev_hard_start_xmit(skb, dev, txq);
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  				__this_cpu_dec(xmit_recursion);
+  				if (dev_xmit_complete(rc)) {
+  					HARD_TX_UNLOCK(dev, txq);
+@@@ -2887,13 -2886,19 +3006,27 @@@ out
+  	rcu_read_unlock_bh();
+  	return rc;
+  }
++ 
++ int dev_queue_xmit(struct sk_buff *skb)
++ {
++ 	return __dev_queue_xmit(skb, NULL);
++ }
+  EXPORT_SYMBOL(dev_queue_xmit);
+  
+++<<<<<<< HEAD
+ +int dev_queue_xmit_sk(struct sock *sk, struct sk_buff *skb)
+ +{
+ +	return dev_queue_xmit(skb);
+ +}
+ +EXPORT_SYMBOL(dev_queue_xmit_sk);
+++=======
++ int dev_queue_xmit_accel(struct sk_buff *skb, void *accel_priv)
++ {
++ 	return __dev_queue_xmit(skb, accel_priv);
++ }
++ EXPORT_SYMBOL(dev_queue_xmit_accel);
++ 
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  
+  /*=======================================================================
+  			Receiver routines
+diff --cc net/mac80211/iface.c
+index 2ce1784757ad,a0757913046e..000000000000
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@@ -1110,13 -1061,8 +1110,18 @@@ static void ieee80211_uninit(struct net
+  }
+  
+  static u16 ieee80211_netdev_select_queue(struct net_device *dev,
+++<<<<<<< HEAD
+ +#if 0 /* Not in RHEL */
+ +					 struct sk_buff *skb,
+ +					 void *accel_priv,
+ +					 select_queue_fallback_t fallback)
+ +#else
+ +					 struct sk_buff *skb)
+ +#endif
+++=======
++ 					 struct sk_buff *skb,
++ 					 void *accel_priv)
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  {
+  	return ieee80211_select_queue(IEEE80211_DEV_TO_SUB_IF(dev), skb);
+  }
+@@@ -1133,13 -1079,8 +1138,18 @@@ static const struct net_device_ops ieee
+  };
+  
+  static u16 ieee80211_monitor_select_queue(struct net_device *dev,
+++<<<<<<< HEAD
+ +#if 0 /* Not in RHEL */
+ +					  struct sk_buff *skb,
+ +					  void *accel_priv,
+ +					  select_queue_fallback_t fallback)
+ +#else
+ +					  struct sk_buff *skb)
+ +#endif
+++=======
++ 					  struct sk_buff *skb,
++ 					  void *accel_priv)
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  {
+  	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+  	struct ieee80211_local *local = sdata->local;
+diff --cc net/sched/sch_generic.c
+index c21b460c19da,7fc899a943a8..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -163,7 -126,7 +163,11 @@@ int sch_direct_xmit(struct sk_buff *skb
+  
+  	HARD_TX_LOCK(dev, txq, smp_processor_id());
+  	if (!netif_xmit_frozen_or_stopped(txq))
+++<<<<<<< HEAD
+ +		skb = dev_hard_start_xmit(skb, dev, txq, &ret);
+++=======
++ 		ret = dev_hard_start_xmit(skb, dev, txq);
+++>>>>>>> f663dd9aaf9e (net: core: explicitly select a txq before doing l2 forwarding)
+  
+  	HARD_TX_UNLOCK(dev, txq);
+  
+* Unmerged path drivers/staging/rtl8188eu/os_dep/os_intfs.c
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index dd9219794eca..9cce8ee815ab 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -3898,7 +3898,8 @@ static inline int bond_slave_override(struct bonding *bond,
+ }
+ 
+ 
+-static u16 bond_select_queue(struct net_device *dev, struct sk_buff *skb)
++static u16 bond_select_queue(struct net_device *dev, struct sk_buff *skb,
++			     void *accel_priv)
+ {
+ 	/* This helper function exists to help dev_pick_tx get the correct
+ 	 * destination queue.  Using a helper function skips a call to
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index d064e02443c2..1c081831932f 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -1924,7 +1924,8 @@ void bnx2x_netif_stop(struct bnx2x *bp, int disable_hw)
+ 		bnx2x_napi_disable_cnic(bp);
+ }
+ 
+-u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb)
++u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb,
++		       void *accel_priv)
+ {
+ 	struct bnx2x *bp = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
+index 265d0ec91d32..e4be6d402938 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
+@@ -491,7 +491,8 @@ int bnx2x_set_vf_mac(struct net_device *dev, int queue, u8 *mac);
+ int bnx2x_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos);
+ 
+ /* select_queue callback */
+-u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb);
++u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb,
++		       void *accel_priv);
+ 
+ static inline void bnx2x_update_rx_prod(struct bnx2x *bp,
+ 					struct bnx2x_fastpath *fp,
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/lantiq_etop.c b/drivers/net/ethernet/lantiq_etop.c
+index bfdb06860397..ceaab7979eb0 100644
+--- a/drivers/net/ethernet/lantiq_etop.c
++++ b/drivers/net/ethernet/lantiq_etop.c
+@@ -621,7 +621,8 @@ ltq_etop_set_multicast_list(struct net_device *dev)
+ }
+ 
+ static u16
+-ltq_etop_select_queue(struct net_device *dev, struct sk_buff *skb)
++ltq_etop_select_queue(struct net_device *dev, struct sk_buff *skb,
++		      void *accel_priv)
+ {
+ 	/* we are currently only using the first queue */
+ 	return 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 49eb82ce6e53..8673d6b75727 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -680,7 +680,8 @@ static void build_inline_wqe(struct mlx4_en_tx_desc *tx_desc,
+ 	}
+ }
+ 
+-u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb)
++u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb,
++			 void *accel_priv)
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	u16 rings_p_up = priv->num_tx_rings_p_up;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index aec9d953ef9e..94ad2366a4dd 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -758,7 +758,8 @@ int mlx4_en_set_cq_moder(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq);
+ int mlx4_en_arm_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq);
+ 
+ void mlx4_en_tx_irq(struct mlx4_cq *mcq);
+-u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb);
++u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb,
++			 void *accel_priv);
+ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev);
+ 
+ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+diff --git a/drivers/net/ethernet/tile/tilegx.c b/drivers/net/ethernet/tile/tilegx.c
+index f3c2d034b32c..2c2bdf238c1f 100644
+--- a/drivers/net/ethernet/tile/tilegx.c
++++ b/drivers/net/ethernet/tile/tilegx.c
+@@ -1710,7 +1710,8 @@ static int tile_net_tx(struct sk_buff *skb, struct net_device *dev)
+ }
+ 
+ /* Return subqueue id on this core (one per core). */
+-static u16 tile_net_select_queue(struct net_device *dev, struct sk_buff *skb)
++static u16 tile_net_select_queue(struct net_device *dev, struct sk_buff *skb,
++				 void *accel_priv)
+ {
+ 	return smp_processor_id();
+ }
+* Unmerged path drivers/net/macvlan.c
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 6ef5eb991fa3..2247e082ea31 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -1685,7 +1685,8 @@ static netdev_tx_t team_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	return NETDEV_TX_OK;
+ }
+ 
+-static u16 team_select_queue(struct net_device *dev, struct sk_buff *skb)
++static u16 team_select_queue(struct net_device *dev, struct sk_buff *skb,
++			     void *accel_priv)
+ {
+ 	/*
+ 	 * This helper function exists to help dev_pick_tx get the correct
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index 0b2c3191eea2..4e4708a678b1 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -423,7 +423,8 @@ unlock:
+  * different rxq no. here. If we could not get rxhash, then we would
+  * hope the rxq no. may help here.
+  */
+-static u16 tun_select_queue(struct net_device *dev, struct sk_buff *skb)
++static u16 tun_select_queue(struct net_device *dev, struct sk_buff *skb,
++			    void *accel_priv)
+ {
+ 	struct tun_struct *tun = netdev_priv(dev);
+ 	struct tun_flow_entry *e;
+* Unmerged path drivers/net/wireless/mwifiex/main.c
+diff --git a/drivers/staging/bcm/Bcmnet.c b/drivers/staging/bcm/Bcmnet.c
+index 4e470d4bb4e8..e3415b5d9eaf 100644
+--- a/drivers/staging/bcm/Bcmnet.c
++++ b/drivers/staging/bcm/Bcmnet.c
+@@ -39,7 +39,8 @@ static INT bcm_close(struct net_device *dev)
+ 	return 0;
+ }
+ 
+-static u16 bcm_select_queue(struct net_device *dev, struct sk_buff *skb)
++static u16 bcm_select_queue(struct net_device *dev, struct sk_buff *skb,
++			    void *accel_priv)
+ {
+ 	return ClassifyPacket(netdev_priv(dev), skb);
+ }
+diff --git a/drivers/staging/netlogic/xlr_net.c b/drivers/staging/netlogic/xlr_net.c
+index dd98cb1468a4..7e9d30641b9d 100644
+--- a/drivers/staging/netlogic/xlr_net.c
++++ b/drivers/staging/netlogic/xlr_net.c
+@@ -304,7 +304,8 @@ static netdev_tx_t xlr_net_start_xmit(struct sk_buff *skb,
+ 	return NETDEV_TX_OK;
+ }
+ 
+-static u16 xlr_net_select_queue(struct net_device *ndev, struct sk_buff *skb)
++static u16 xlr_net_select_queue(struct net_device *ndev, struct sk_buff *skb,
++				void *accel_priv)
+ {
+ 	return (u16)smp_processor_id();
+ }
+* Unmerged path drivers/staging/rtl8188eu/os_dep/os_intfs.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
+index 243f397103e5..8baa51057c09 100644
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -427,17 +427,21 @@ u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb)
+ EXPORT_SYMBOL(__netdev_pick_tx);
+ 
+ struct netdev_queue *netdev_pick_tx(struct net_device *dev,
+-				    struct sk_buff *skb)
++				    struct sk_buff *skb,
++				    void *accel_priv)
+ {
+ 	int queue_index = 0;
+ 
+ 	if (dev->real_num_tx_queues != 1) {
+ 		const struct net_device_ops *ops = dev->netdev_ops;
+ 		if (ops->ndo_select_queue)
+-			queue_index = ops->ndo_select_queue(dev, skb);
++			queue_index = ops->ndo_select_queue(dev, skb,
++							    accel_priv);
+ 		else
+ 			queue_index = __netdev_pick_tx(dev, skb);
+-		queue_index = dev_cap_txqueue(dev, queue_index);
++
++		if (!accel_priv)
++			queue_index = dev_cap_txqueue(dev, queue_index);
+ 	}
+ 
+ 	skb_set_queue_mapping(skb, queue_index);
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index ed269cb11ae0..f7a87d179c79 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -335,7 +335,7 @@ void netpoll_send_skb_on_dev(struct netpoll *np, struct sk_buff *skb,
+ 	if (skb_queue_len(&npinfo->txq) == 0 && !netpoll_owner_active(dev)) {
+ 		struct netdev_queue *txq;
+ 
+-		txq = netdev_pick_tx(dev, skb);
++		txq = netdev_pick_tx(dev, skb, NULL);
+ 
+ 		/* try until next clock tick */
+ 		for (tries = jiffies_to_usecs(1)/USEC_PER_POLL;
+* Unmerged path net/mac80211/iface.c
+* Unmerged path net/sched/sch_generic.c
