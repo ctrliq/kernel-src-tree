@@ -1,0 +1,391 @@
+fs: create and use seq_show_option for escaping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] create and use seq_show_option for escaping (Vivek Goyal) [1306358]
+Rebuild_FUZZ: 95.56%
+commit-author Kees Cook <keescook@chromium.org>
+commit a068acf2ee77693e0bf39d6e07139ba704f461c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a068acf2.failed
+
+Many file systems that implement the show_options hook fail to correctly
+escape their output which could lead to unescaped characters (e.g.  new
+lines) leaking into /proc/mounts and /proc/[pid]/mountinfo files.  This
+could lead to confusion, spoofed entries (resulting in things like
+systemd issuing false d-bus "mount" notifications), and who knows what
+else.  This looks like it would only be the root user stepping on
+themselves, but it's possible weird things could happen in containers or
+in other situations with delegated mount privileges.
+
+Here's an example using overlay with setuid fusermount trusting the
+contents of /proc/mounts (via the /etc/mtab symlink).  Imagine the use
+of "sudo" is something more sneaky:
+
+  $ BASE="ovl"
+  $ MNT="$BASE/mnt"
+  $ LOW="$BASE/lower"
+  $ UP="$BASE/upper"
+  $ WORK="$BASE/work/ 0 0
+  none /proc fuse.pwn user_id=1000"
+  $ mkdir -p "$LOW" "$UP" "$WORK"
+  $ sudo mount -t overlay -o "lowerdir=$LOW,upperdir=$UP,workdir=$WORK" none /mnt
+  $ cat /proc/mounts
+  none /root/ovl/mnt overlay rw,relatime,lowerdir=ovl/lower,upperdir=ovl/upper,workdir=ovl/work/ 0 0
+  none /proc fuse.pwn user_id=1000 0 0
+  $ fusermount -u /proc
+  $ cat /proc/mounts
+  cat: /proc/mounts: No such file or directory
+
+This fixes the problem by adding new seq_show_option and
+seq_show_option_n helpers, and updating the vulnerable show_option
+handlers to use them as needed.  Some, like SELinux, need to be open
+coded due to unusual existing escape mechanisms.
+
+[akpm@linux-foundation.org: add lost chunk, per Kees]
+[keescook@chromium.org: seq_show_option should be using const parameters]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Serge Hallyn <serge.hallyn@canonical.com>
+	Acked-by: Jan Kara <jack@suse.com>
+	Acked-by: Paul Moore <paul@paul-moore.com>
+	Cc: J. R. Okajima <hooanon05g@gmail.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a068acf2ee77693e0bf39d6e07139ba704f461c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup.c
+diff --cc kernel/cgroup.c
+index c773b1f779f5,a8538e443784..000000000000
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@@ -1084,27 -1331,33 +1084,45 @@@ static int rebind_subsystems(struct cgr
+  	return 0;
+  }
+  
+ -static int cgroup_show_options(struct seq_file *seq,
+ -			       struct kernfs_root *kf_root)
+ +static int cgroup_show_options(struct seq_file *seq, struct dentry *dentry)
+  {
+ -	struct cgroup_root *root = cgroup_root_from_kf(kf_root);
+ +	struct cgroupfs_root *root = dentry->d_sb->s_fs_info;
+  	struct cgroup_subsys *ss;
+ -	int ssid;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&cgroup_root_mutex);
+ +	for_each_subsys(root, ss)
+ +		seq_printf(seq, ",%s", ss->name);
+ +	if (root->flags & CGRP_ROOT_SANE_BEHAVIOR)
+ +		seq_puts(seq, ",sane_behavior");
+++=======
++ 	if (root != &cgrp_dfl_root)
++ 		for_each_subsys(ss, ssid)
++ 			if (root->subsys_mask & (1 << ssid))
++ 				seq_show_option(seq, ss->name, NULL);
+++>>>>>>> a068acf2ee77 (fs: create and use seq_show_option for escaping)
+  	if (root->flags & CGRP_ROOT_NOPREFIX)
+  		seq_puts(seq, ",noprefix");
+  	if (root->flags & CGRP_ROOT_XATTR)
+  		seq_puts(seq, ",xattr");
+ -
+ -	spin_lock(&release_agent_path_lock);
+  	if (strlen(root->release_agent_path))
+++<<<<<<< HEAD
+ +		seq_printf(seq, ",release_agent=%s", root->release_agent_path);
+ +	if (test_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->top_cgroup.flags))
+ +		seq_puts(seq, ",clone_children");
+ +	if (strlen(root->name))
+ +		seq_printf(seq, ",name=%s", root->name);
+ +	mutex_unlock(&cgroup_root_mutex);
+++=======
++ 		seq_show_option(seq, "release_agent",
++ 				root->release_agent_path);
++ 	spin_unlock(&release_agent_path_lock);
++ 
++ 	if (test_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->cgrp.flags))
++ 		seq_puts(seq, ",clone_children");
++ 	if (strlen(root->name))
++ 		seq_show_option(seq, "name", root->name);
+++>>>>>>> a068acf2ee77 (fs: create and use seq_show_option for escaping)
+  	return 0;
+  }
+  
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index 9acdf48b8d6b..58f760d788ae 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -441,7 +441,7 @@ static int ceph_show_options(struct seq_file *m, struct dentry *root)
+ 	if (fsopt->max_readdir_bytes != CEPH_MAX_READDIR_BYTES_DEFAULT)
+ 		seq_printf(m, ",readdir_max_bytes=%d", fsopt->max_readdir_bytes);
+ 	if (strcmp(fsopt->snapdir_name, CEPH_SNAPDIRNAME_DEFAULT))
+-		seq_printf(m, ",snapdirname=%s", fsopt->snapdir_name);
++		seq_show_option(m, "snapdirname", fsopt->snapdir_name);
+ 
+ 	return 0;
+ }
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index ebf30dc19d9d..d0979316f003 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -395,17 +395,17 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
+ 	struct sockaddr *srcaddr;
+ 	srcaddr = (struct sockaddr *)&tcon->ses->server->srcaddr;
+ 
+-	seq_printf(s, ",vers=%s", tcon->ses->server->vals->version_string);
++	seq_show_option(s, "vers", tcon->ses->server->vals->version_string);
+ 	cifs_show_security(s, tcon->ses);
+ 	cifs_show_cache_flavor(s, cifs_sb);
+ 
+ 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MULTIUSER)
+ 		seq_puts(s, ",multiuser");
+ 	else if (tcon->ses->user_name)
+-		seq_printf(s, ",username=%s", tcon->ses->user_name);
++		seq_show_option(s, "username", tcon->ses->user_name);
+ 
+ 	if (tcon->ses->domainName)
+-		seq_printf(s, ",domain=%s", tcon->ses->domainName);
++		seq_show_option(s, "domain", tcon->ses->domainName);
+ 
+ 	if (srcaddr->sa_family != AF_UNSPEC) {
+ 		struct sockaddr_in *saddr4;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 31618f12ab5f..7b4481dc2325 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1757,10 +1757,10 @@ static inline void ext4_show_quota_options(struct seq_file *seq,
+ 	}
+ 
+ 	if (sbi->s_qf_names[USRQUOTA])
+-		seq_printf(seq, ",usrjquota=%s", sbi->s_qf_names[USRQUOTA]);
++		seq_show_option(seq, "usrjquota", sbi->s_qf_names[USRQUOTA]);
+ 
+ 	if (sbi->s_qf_names[GRPQUOTA])
+-		seq_printf(seq, ",grpjquota=%s", sbi->s_qf_names[GRPQUOTA]);
++		seq_show_option(seq, "grpjquota", sbi->s_qf_names[GRPQUOTA]);
+ #endif
+ }
+ 
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 7c8f12885717..179414ffa58c 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1291,11 +1291,11 @@ static int gfs2_show_options(struct seq_file *s, struct dentry *root)
+ 	if (is_ancestor(root, sdp->sd_master_dir))
+ 		seq_printf(s, ",meta");
+ 	if (args->ar_lockproto[0])
+-		seq_printf(s, ",lockproto=%s", args->ar_lockproto);
++		seq_show_option(s, "lockproto", args->ar_lockproto);
+ 	if (args->ar_locktable[0])
+-		seq_printf(s, ",locktable=%s", args->ar_locktable);
++		seq_show_option(s, "locktable", args->ar_locktable);
+ 	if (args->ar_hostdata[0])
+-		seq_printf(s, ",hostdata=%s", args->ar_hostdata);
++		seq_show_option(s, "hostdata", args->ar_hostdata);
+ 	if (args->ar_spectator)
+ 		seq_printf(s, ",spectator");
+ 	if (args->ar_localflocks)
+diff --git a/fs/hfs/super.c b/fs/hfs/super.c
+index 2d2039e754cd..52cd1873bca3 100644
+--- a/fs/hfs/super.c
++++ b/fs/hfs/super.c
+@@ -134,9 +134,9 @@ static int hfs_show_options(struct seq_file *seq, struct dentry *root)
+ 	struct hfs_sb_info *sbi = HFS_SB(root->d_sb);
+ 
+ 	if (sbi->s_creator != cpu_to_be32(0x3f3f3f3f))
+-		seq_printf(seq, ",creator=%.4s", (char *)&sbi->s_creator);
++		seq_show_option_n(seq, "creator", (char *)&sbi->s_creator, 4);
+ 	if (sbi->s_type != cpu_to_be32(0x3f3f3f3f))
+-		seq_printf(seq, ",type=%.4s", (char *)&sbi->s_type);
++		seq_show_option_n(seq, "type", (char *)&sbi->s_type, 4);
+ 	seq_printf(seq, ",uid=%u,gid=%u",
+ 			from_kuid_munged(&init_user_ns, sbi->s_uid),
+ 			from_kgid_munged(&init_user_ns, sbi->s_gid));
+diff --git a/fs/hfsplus/options.c b/fs/hfsplus/options.c
+index 968eab5bc1f5..beaae4ee0215 100644
+--- a/fs/hfsplus/options.c
++++ b/fs/hfsplus/options.c
+@@ -219,9 +219,9 @@ int hfsplus_show_options(struct seq_file *seq, struct dentry *root)
+ 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(root->d_sb);
+ 
+ 	if (sbi->creator != HFSPLUS_DEF_CR_TYPE)
+-		seq_printf(seq, ",creator=%.4s", (char *)&sbi->creator);
++		seq_show_option_n(seq, "creator", (char *)&sbi->creator, 4);
+ 	if (sbi->type != HFSPLUS_DEF_CR_TYPE)
+-		seq_printf(seq, ",type=%.4s", (char *)&sbi->type);
++		seq_show_option_n(seq, "type", (char *)&sbi->type, 4);
+ 	seq_printf(seq, ",umask=%o,uid=%u,gid=%u", sbi->umask,
+ 			from_kuid_munged(&init_user_ns, sbi->uid),
+ 			from_kgid_munged(&init_user_ns, sbi->gid));
+diff --git a/fs/hostfs/hostfs_kern.c b/fs/hostfs/hostfs_kern.c
+index a24b38350010..208e6f79ce7a 100644
+--- a/fs/hostfs/hostfs_kern.c
++++ b/fs/hostfs/hostfs_kern.c
+@@ -264,7 +264,7 @@ static int hostfs_show_options(struct seq_file *seq, struct dentry *root)
+ 	size_t offset = strlen(root_ino) + 1;
+ 
+ 	if (strlen(root_path) > offset)
+-		seq_printf(seq, ",%s", root_path + offset);
++		seq_show_option(seq, root_path + offset, NULL);
+ 
+ 	return 0;
+ }
+diff --git a/fs/ocfs2/super.c b/fs/ocfs2/super.c
+index 01b85165552b..50a05c5e4fcd 100644
+--- a/fs/ocfs2/super.c
++++ b/fs/ocfs2/super.c
+@@ -1579,8 +1579,8 @@ static int ocfs2_show_options(struct seq_file *s, struct dentry *root)
+ 		seq_printf(s, ",localflocks,");
+ 
+ 	if (osb->osb_cluster_stack[0])
+-		seq_printf(s, ",cluster_stack=%.*s", OCFS2_STACK_LABEL_LEN,
+-			   osb->osb_cluster_stack);
++		seq_show_option_n(s, "cluster_stack", osb->osb_cluster_stack,
++				  OCFS2_STACK_LABEL_LEN);
+ 	if (opts & OCFS2_MOUNT_USRQUOTA)
+ 		seq_printf(s, ",usrquota");
+ 	if (opts & OCFS2_MOUNT_GRPQUOTA)
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 7e0388b76097..3496d4e996fc 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -587,10 +587,10 @@ static int ovl_show_options(struct seq_file *m, struct dentry *dentry)
+ 	struct super_block *sb = dentry->d_sb;
+ 	struct ovl_fs *ufs = sb->s_fs_info;
+ 
+-	seq_printf(m, ",lowerdir=%s", ufs->config.lowerdir);
++	seq_show_option(m, "lowerdir", ufs->config.lowerdir);
+ 	if (ufs->config.upperdir) {
+-		seq_printf(m, ",upperdir=%s", ufs->config.upperdir);
+-		seq_printf(m, ",workdir=%s", ufs->config.workdir);
++		seq_show_option(m, "upperdir", ufs->config.upperdir);
++		seq_show_option(m, "workdir", ufs->config.workdir);
+ 	}
+ 	return 0;
+ }
+diff --git a/fs/reiserfs/super.c b/fs/reiserfs/super.c
+index e2e202a07b31..c3743cd5c43c 100644
+--- a/fs/reiserfs/super.c
++++ b/fs/reiserfs/super.c
+@@ -688,18 +688,20 @@ static int reiserfs_show_options(struct seq_file *seq, struct dentry *root)
+ 		seq_puts(seq, ",acl");
+ 
+ 	if (REISERFS_SB(s)->s_jdev)
+-		seq_printf(seq, ",jdev=%s", REISERFS_SB(s)->s_jdev);
++		seq_show_option(seq, "jdev", REISERFS_SB(s)->s_jdev);
+ 
+ 	if (journal->j_max_commit_age != journal->j_default_max_commit_age)
+ 		seq_printf(seq, ",commit=%d", journal->j_max_commit_age);
+ 
+ #ifdef CONFIG_QUOTA
+ 	if (REISERFS_SB(s)->s_qf_names[USRQUOTA])
+-		seq_printf(seq, ",usrjquota=%s", REISERFS_SB(s)->s_qf_names[USRQUOTA]);
++		seq_show_option(seq, "usrjquota",
++				REISERFS_SB(s)->s_qf_names[USRQUOTA]);
+ 	else if (opts & (1 << REISERFS_USRQUOTA))
+ 		seq_puts(seq, ",usrquota");
+ 	if (REISERFS_SB(s)->s_qf_names[GRPQUOTA])
+-		seq_printf(seq, ",grpjquota=%s", REISERFS_SB(s)->s_qf_names[GRPQUOTA]);
++		seq_show_option(seq, "grpjquota",
++				REISERFS_SB(s)->s_qf_names[GRPQUOTA]);
+ 	else if (opts & (1 << REISERFS_GRPQUOTA))
+ 		seq_puts(seq, ",grpquota");
+ 	if (REISERFS_SB(s)->s_jquota_fmt) {
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 5385dfd365ef..4c3cdc66e804 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -516,9 +516,9 @@ xfs_showargs(
+ 		seq_printf(m, "," MNTOPT_LOGBSIZE "=%dk", mp->m_logbsize >> 10);
+ 
+ 	if (mp->m_logname)
+-		seq_printf(m, "," MNTOPT_LOGDEV "=%s", mp->m_logname);
++		seq_show_option(m, MNTOPT_LOGDEV, mp->m_logname);
+ 	if (mp->m_rtname)
+-		seq_printf(m, "," MNTOPT_RTDEV "=%s", mp->m_rtname);
++		seq_show_option(m, MNTOPT_RTDEV, mp->m_rtname);
+ 
+ 	if (mp->m_dalign > 0)
+ 		seq_printf(m, "," MNTOPT_SUNIT "=%d",
+diff --git a/include/linux/seq_file.h b/include/linux/seq_file.h
+index 4e32edc8f506..9ef521d1af42 100644
+--- a/include/linux/seq_file.h
++++ b/include/linux/seq_file.h
+@@ -143,6 +143,41 @@ static inline struct user_namespace *seq_user_ns(struct seq_file *seq)
+ #endif
+ }
+ 
++/**
++ * seq_show_options - display mount options with appropriate escapes.
++ * @m: the seq_file handle
++ * @name: the mount option name
++ * @value: the mount option name's value, can be NULL
++ */
++static inline void seq_show_option(struct seq_file *m, const char *name,
++				   const char *value)
++{
++	seq_putc(m, ',');
++	seq_escape(m, name, ",= \t\n\\");
++	if (value) {
++		seq_putc(m, '=');
++		seq_escape(m, value, ", \t\n\\");
++	}
++}
++
++/**
++ * seq_show_option_n - display mount options with appropriate escapes
++ *		       where @value must be a specific length.
++ * @m: the seq_file handle
++ * @name: the mount option name
++ * @value: the mount option name's value, cannot be NULL
++ * @length: the length of @value to display
++ *
++ * This is a macro since this uses "length" to define the size of the
++ * stack buffer.
++ */
++#define seq_show_option_n(m, name, value, length) {	\
++	char val_buf[length + 1];			\
++	strncpy(val_buf, value, length);		\
++	val_buf[length] = '\0';				\
++	seq_show_option(m, name, val_buf);		\
++}
++
+ #define SEQ_START_TOKEN ((void *)1)
+ /*
+  * Helpers for iteration over list_head-s in seq_files
+* Unmerged path kernel/cgroup.c
+diff --git a/net/ceph/ceph_common.c b/net/ceph/ceph_common.c
+index 79e8f71aef5b..3f76eb84b395 100644
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@ -495,8 +495,11 @@ int ceph_print_client_options(struct seq_file *m, struct ceph_client *client)
+ 	struct ceph_options *opt = client->options;
+ 	size_t pos = m->count;
+ 
+-	if (opt->name)
+-		seq_printf(m, "name=%s,", opt->name);
++	if (opt->name) {
++		seq_puts(m, "name=");
++		seq_escape(m, opt->name, ", \t\n\\");
++		seq_putc(m, ',');
++	}
+ 	if (opt->key)
+ 		seq_puts(m, "secret=<hidden>,");
+ 
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index f9c380d1d0d0..1bdc2f5abcb7 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -1078,7 +1078,7 @@ static void selinux_write_opts(struct seq_file *m,
+ 		seq_puts(m, prefix);
+ 		if (has_comma)
+ 			seq_putc(m, '\"');
+-		seq_puts(m, opts->mnt_opts[i]);
++		seq_escape(m, opts->mnt_opts[i], "\"\n\\");
+ 		if (has_comma)
+ 			seq_putc(m, '\"');
+ 	}
