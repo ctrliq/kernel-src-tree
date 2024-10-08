@@ -1,0 +1,144 @@
+net/mlx4_core: Fix build failure introduced by the EQ pool changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_core: Fix build failure introduced by the EQ pool changes (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 96.88%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit db9777e376b0e038fc01d1361c7ea3eaf801c718
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/db9777e3.failed
+
+When CONFIG_RFS_ACCEL or SMP aren't set, we fail to build, fix it.
+
+Also, avoid build warning as of unused function on that setup.
+
+Fixes: c66fa19c405a ('net/mlx4: Add EQ pool')
+	Reported-by: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit db9777e376b0e038fc01d1361c7ea3eaf801c718)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/eq.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/eq.c
+index 25bcdb02089f,aae13adfb492..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/eq.c
+@@@ -220,6 -221,22 +220,25 @@@ static void mlx4_slave_event(struct mlx
+  	slave_event(dev, slave, eqe);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_SMP)
++ static void mlx4_set_eq_affinity_hint(struct mlx4_priv *priv, int vec)
++ {
++ 	int hint_err;
++ 	struct mlx4_dev *dev = &priv->dev;
++ 	struct mlx4_eq *eq = &priv->eq_table.eq[vec];
++ 
++ 	if (!eq->affinity_mask || cpumask_empty(eq->affinity_mask))
++ 		return;
++ 
++ 	hint_err = irq_set_affinity_hint(eq->irq, eq->affinity_mask);
++ 	if (hint_err)
++ 		mlx4_warn(dev, "irq_set_affinity_hint failed, err %d\n", hint_err);
++ }
++ #endif
++ 
+++>>>>>>> db9777e376b0 (net/mlx4_core: Fix build failure introduced by the EQ pool changes)
+  int mlx4_gen_pkey_eqe(struct mlx4_dev *dev, int slave, u8 port)
+  {
+  	struct mlx4_eqe eqe;
+@@@ -1159,43 -1200,51 +1178,85 @@@ int mlx4_init_eq_table(struct mlx4_dev 
+  			GFP_KERNEL);
+  	if (!priv->eq_table.irq_names) {
+  		err = -ENOMEM;
+ -		goto err_out_clr_int;
+ +		goto err_out_bitmap;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < dev->caps.num_comp_vectors; ++i) {
+ +		err = mlx4_create_eq(dev, dev->caps.num_cqs -
+ +					  dev->caps.reserved_cqs +
+ +					  MLX4_NUM_SPARE_EQE,
+ +				     (dev->flags & MLX4_FLAG_MSI_X) ? i : 0,
+ +				     &priv->eq_table.eq[i]);
+ +		if (err) {
+ +			--i;
+++=======
++ 	for (i = 0; i < dev->caps.num_comp_vectors + 1; ++i) {
++ 		if (i == MLX4_EQ_ASYNC) {
++ 			err = mlx4_create_eq(dev,
++ 					     MLX4_NUM_ASYNC_EQE + MLX4_NUM_SPARE_EQE,
++ 					     0, &priv->eq_table.eq[MLX4_EQ_ASYNC]);
++ 		} else {
++ 			struct mlx4_eq	*eq = &priv->eq_table.eq[i];
++ #ifdef CONFIG_RFS_ACCEL
++ 			int port = find_first_bit(eq->actv_ports.ports,
++ 						  dev->caps.num_ports) + 1;
++ 
++ 			if (port <= dev->caps.num_ports) {
++ 				struct mlx4_port_info *info =
++ 					&mlx4_priv(dev)->port[port];
++ 
++ 				if (!info->rmap) {
++ 					info->rmap = alloc_irq_cpu_rmap(
++ 						mlx4_get_eqs_per_port(dev, port));
++ 					if (!info->rmap) {
++ 						mlx4_warn(dev, "Failed to allocate cpu rmap\n");
++ 						err = -ENOMEM;
++ 						goto err_out_unmap;
++ 					}
++ 				}
++ 
++ 				err = irq_cpu_rmap_add(
++ 					info->rmap, eq->irq);
++ 				if (err)
++ 					mlx4_warn(dev, "Failed adding irq rmap\n");
++ 			}
++ #endif
++ 			err = mlx4_create_eq(dev, dev->caps.num_cqs -
++ 						  dev->caps.reserved_cqs +
++ 						  MLX4_NUM_SPARE_EQE,
++ 					     (dev->flags & MLX4_FLAG_MSI_X) ?
++ 					     i + 1 - !!(i > MLX4_EQ_ASYNC) : 0,
++ 					     eq);
++ 		}
++ 		if (err)
+++>>>>>>> db9777e376b0 (net/mlx4_core: Fix build failure introduced by the EQ pool changes)
+  			goto err_out_unmap;
+ +		}
+ +	}
+ +
+ +	err = mlx4_create_eq(dev, MLX4_NUM_ASYNC_EQE + MLX4_NUM_SPARE_EQE,
+ +			     (dev->flags & MLX4_FLAG_MSI_X) ? dev->caps.num_comp_vectors : 0,
+ +			     &priv->eq_table.eq[dev->caps.num_comp_vectors]);
+ +	if (err)
+ +		goto err_out_comp;
+ +
+ +	/*if additional completion vectors poolsize is 0 this loop will not run*/
+ +	for (i = dev->caps.num_comp_vectors + 1;
+ +	      i < dev->caps.num_comp_vectors + dev->caps.comp_pool + 1; ++i) {
+ +
+ +		err = mlx4_create_eq(dev, dev->caps.num_cqs -
+ +					  dev->caps.reserved_cqs +
+ +					  MLX4_NUM_SPARE_EQE,
+ +				     (dev->flags & MLX4_FLAG_MSI_X) ? i : 0,
+ +				     &priv->eq_table.eq[i]);
+ +		if (err) {
+ +			--i;
+ +			goto err_out_unmap;
+ +		}
+  	}
+  
+ +
+  	if (dev->flags & MLX4_FLAG_MSI_X) {
+  		const char *eq_name;
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/eq.c
