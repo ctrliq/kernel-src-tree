@@ -4448,7 +4448,10 @@ retry_lock2:
 void
 qla83xx_idc_unlock(scsi_qla_host_t *base_vha, uint16_t requester_id)
 {
-	uint16_t options = (requester_id << 15) | BIT_7, retry;
+#if 0
+	uint16_t options = (requester_id << 15) | BIT_7;
+#endif
+	uint16_t retry;
 	uint32_t data;
 	struct qla_hw_data *ha = base_vha->hw;
 
@@ -4484,6 +4487,7 @@ retry_unlock:
 
 	return;
 
+#if 0
 	/* XXX: IDC-unlock implementation using access-control mbx */
 	retry = 0;
 retry_unlock2:
@@ -4499,6 +4503,7 @@ retry_unlock2:
 	}
 
 	return;
+#endif
 }
 
 int
