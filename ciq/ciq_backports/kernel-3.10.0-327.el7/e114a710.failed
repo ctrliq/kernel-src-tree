@@ -1,0 +1,224 @@
+tcp: fix cwnd limited checking to improve congestion control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit e114a710aa5058c0ba4aa1dfb105132aefeb5e04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e114a710.failed
+
+Yuchung discovered tcp_is_cwnd_limited() was returning false in
+slow start phase even if the application filled the socket write queue.
+
+All congestion modules take into account tcp_is_cwnd_limited()
+before increasing cwnd, so this behavior limits slow start from
+probing the bandwidth at full speed.
+
+The problem is that even if write queue is full (aka we are _not_
+application limited), cwnd can be under utilized if TSO should auto
+defer or TCP Small queues decided to hold packets.
+
+So the in_flight can be kept to smaller value, and we can get to the
+point tcp_is_cwnd_limited() returns false.
+
+With TCP Small Queues and FQ/pacing, this issue is more visible.
+
+We fix this by having tcp_cwnd_validate(), which is supposed to track
+such things, take into account unsent_segs, the number of segs that we
+are not sending at the moment due to TSO or TSQ, but intend to send
+real soon. Then when we are cwnd-limited, remember this fact while we
+are processing the window of ACKs that comes back.
+
+For example, suppose we have a brand new connection with cwnd=10; we
+are in slow start, and we send a flight of 9 packets. By the time we
+have received ACKs for all 9 packets we want our cwnd to be 18.
+We implement this by setting tp->lsnd_pending to 9, and
+considering ourselves to be cwnd-limited while cwnd is less than
+twice tp->lsnd_pending (2*9 -> 18).
+
+This makes tcp_is_cwnd_limited() more understandable, by removing
+the GSO/TSO kludge, that tried to work around the issue.
+
+Note the in_flight parameter can be removed in a followup cleanup
+patch.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e114a710aa5058c0ba4aa1dfb105132aefeb5e04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_cong.c
+#	net/ipv4/tcp_output.c
+diff --cc include/net/tcp.h
+index ba45accd7103,a9fe7bc4f4bb..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -978,7 -974,27 +978,31 @@@ static inline u32 tcp_wnd_end(const str
+  {
+  	return tp->snd_una + tp->snd_wnd;
+  }
+++<<<<<<< HEAD
+ +extern bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight);
+++=======
++ 
++ /* We follow the spirit of RFC2861 to validate cwnd but implement a more
++  * flexible approach. The RFC suggests cwnd should not be raised unless
++  * it was fully used previously. But we allow cwnd to grow as long as the
++  * application has used half the cwnd.
++  * Example :
++  *    cwnd is 10 (IW10), but application sends 9 frames.
++  *    We allow cwnd to reach 18 when all frames are ACKed.
++  * This check is safe because it's as aggressive as slow start which already
++  * risks 100% overshoot. The advantage is that we discourage application to
++  * either send more filler packets or data to artificially blow up the cwnd
++  * usage, and allow application-limited process to probe bw more aggressively.
++  *
++  * TODO: remove in_flight once we can fix all callers, and their callers...
++  */
++ static inline bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
++ {
++ 	const struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	return tp->snd_cwnd < 2 * tp->lsnd_pending;
++ }
+++>>>>>>> e114a710aa50 (tcp: fix cwnd limited checking to improve congestion control)
+  
+  static inline void tcp_check_probe_timer(struct sock *sk)
+  {
+diff --cc net/ipv4/tcp_cong.c
+index 31e31ad03cad,a93b41ba05ff..000000000000
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@@ -278,55 -276,24 +278,66 @@@ int tcp_set_congestion_control(struct s
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +/* RFC2861 Check whether we are limited by application or congestion window
+ + * This is the inverse of cwnd check in tcp_tso_should_defer
+ + */
+ +bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+ +{
+ +	const struct tcp_sock *tp = tcp_sk(sk);
+ +	u32 left;
+ +
+ +	if (in_flight >= tp->snd_cwnd)
+ +		return true;
+ +
+ +	left = tp->snd_cwnd - in_flight;
+ +	if (sk_can_gso(sk) &&
+ +	    left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&
+ +	    left < tp->xmit_size_goal_segs)
+ +		return true;
+ +	return left <= tcp_max_tso_deferred_mss(tp);
+ +}
+ +EXPORT_SYMBOL_GPL(tcp_is_cwnd_limited);
+ +
+ +/*
+ + * Slow start is used when congestion window is less than slow start
+ + * threshold. This version implements the basic RFC2581 version
+ + * and optionally supports:
+ + * 	RFC3742 Limited Slow Start  	  - growth limited to max_ssthresh
+ + *	RFC3465 Appropriate Byte Counting - growth limited by bytes acknowledged
+++=======
++ /* Slow start is used when congestion window is no greater than the slow start
++  * threshold. We base on RFC2581 and also handle stretch ACKs properly.
++  * We do not implement RFC3465 Appropriate Byte Counting (ABC) per se but
++  * something better;) a packet is only considered (s)acked in its entirety to
++  * defend the ACK attacks described in the RFC. Slow start processes a stretch
++  * ACK of degree N as if N acks of degree 1 are received back to back except
++  * ABC caps N to 2. Slow start exits when cwnd grows over ssthresh and
++  * returns the leftover acks to adjust cwnd in congestion avoidance mode.
+++>>>>>>> e114a710aa50 (tcp: fix cwnd limited checking to improve congestion control)
+   */
+ -int tcp_slow_start(struct tcp_sock *tp, u32 acked)
+ +void tcp_slow_start(struct tcp_sock *tp)
+  {
+ -	u32 cwnd = tp->snd_cwnd + acked;
+ +	int cnt; /* increase in packets */
+ +	unsigned int delta = 0;
+ +	u32 snd_cwnd = tp->snd_cwnd;
+  
+ -	if (cwnd > tp->snd_ssthresh)
+ -		cwnd = tp->snd_ssthresh + 1;
+ -	acked -= cwnd - tp->snd_cwnd;
+ -	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
+ -	return acked;
+ +	if (unlikely(!snd_cwnd)) {
+ +		pr_err_once("snd_cwnd is nul, please report this bug.\n");
+ +		snd_cwnd = 1U;
+ +	}
+ +
+ +	if (sysctl_tcp_max_ssthresh > 0 && tp->snd_cwnd > sysctl_tcp_max_ssthresh)
+ +		cnt = sysctl_tcp_max_ssthresh >> 1;	/* limited slow start */
+ +	else
+ +		cnt = snd_cwnd;				/* exponential increase */
+ +
+ +	tp->snd_cwnd_cnt += cnt;
+ +	while (tp->snd_cwnd_cnt >= snd_cwnd) {
+ +		tp->snd_cwnd_cnt -= snd_cwnd;
+ +		delta++;
+ +	}
+ +	tp->snd_cwnd = min(snd_cwnd + delta, tp->snd_cwnd_clamp);
+  }
+  EXPORT_SYMBOL_GPL(tcp_slow_start);
+  
+diff --cc net/ipv4/tcp_output.c
+index d009567a0b52,f9181a133462..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -1389,8 -1380,29 +1389,34 @@@ unsigned int tcp_current_mss(struct soc
+  	return mss_now;
+  }
+  
+++<<<<<<< HEAD
+ +/* Congestion window validation. (RFC2861) */
+ +static void tcp_cwnd_validate(struct sock *sk)
+++=======
++ /* RFC2861, slow part. Adjust cwnd, after it was not full during one rto.
++  * As additional protections, we do not touch cwnd in retransmission phases,
++  * and if application hit its sndbuf limit recently.
++  */
++ static void tcp_cwnd_application_limited(struct sock *sk)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	if (inet_csk(sk)->icsk_ca_state == TCP_CA_Open &&
++ 	    sk->sk_socket && !test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
++ 		/* Limited by application or receiver window. */
++ 		u32 init_win = tcp_init_cwnd(tp, __sk_dst_get(sk));
++ 		u32 win_used = max(tp->snd_cwnd_used, init_win);
++ 		if (win_used < tp->snd_cwnd) {
++ 			tp->snd_ssthresh = tcp_current_ssthresh(sk);
++ 			tp->snd_cwnd = (tp->snd_cwnd + win_used) >> 1;
++ 		}
++ 		tp->snd_cwnd_used = 0;
++ 	}
++ 	tp->snd_cwnd_stamp = tcp_time_stamp;
++ }
++ 
++ static void tcp_cwnd_validate(struct sock *sk, u32 unsent_segs)
+++>>>>>>> e114a710aa50 (tcp: fix cwnd limited checking to improve congestion control)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+  
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f022e6a239f4..528053fc164b 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -230,6 +230,7 @@ struct tcp_sock {
+ 	u32	snd_cwnd_clamp; /* Do not allow snd_cwnd to grow above this */
+ 	u32	snd_cwnd_used;
+ 	u32	snd_cwnd_stamp;
++	u32	lsnd_pending;	/* packets inflight or unsent since last xmit */
+ 	u32	prior_cwnd;	/* Congestion window at start of Recovery. */
+ 	u32	prr_delivered;	/* Number of newly delivered packets to
+ 				 * receiver in Recovery. */
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp_cong.c
+* Unmerged path net/ipv4/tcp_output.c
