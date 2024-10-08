@@ -1,0 +1,169 @@
+IB/iser: Use more completion queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Use more completion queues (Amir Vadai) [1164539]
+Rebuild_FUZZ: 95.52%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit da64bdb25b541ff261bdfc1bfba3408520cbaff0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/da64bdb2.failed
+
+No reason to settle with four, can use the min between device max comp
+vectors and number of cores.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit da64bdb25b541ff261bdfc1bfba3408520cbaff0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index 50ec84465483,4234a9c0ebfd..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -262,28 -326,60 +262,32 @@@ struct iser_rx_desc 
+  	char		             pad[ISER_RX_PAD_SIZE];
+  } __attribute__((packed));
+  
+- #define ISER_MAX_CQ 4
+- 
+  struct iser_conn;
+ -struct ib_conn;
+  struct iscsi_iser_task;
+  
+ -/**
+ - * struct iser_comp - iSER completion context
+ - *
+ - * @device:     pointer to device handle
+ - * @cq:         completion queue
+ - * @wcs:        work completion array
+ - * @tasklet:    Tasklet handle
+ - * @active_qps: Number of active QPs attached
+ - *              to completion context
+ - */
+ -struct iser_comp {
+ -	struct iser_device      *device;
+ -	struct ib_cq		*cq;
+ -	struct ib_wc		 wcs[ISER_WC_BATCH_COUNT];
+ -	struct tasklet_struct	 tasklet;
+ -	int                      active_qps;
+ -};
+ -
+ -/**
+ - * struct iser_device - iSER device handle
+ - *
+ - * @ib_device:     RDMA device
+ - * @pd:            Protection Domain for this device
+ - * @dev_attr:      Device attributes container
+ - * @mr:            Global DMA memory region
+ - * @event_handler: IB events handle routine
+ - * @ig_list:	   entry in devices list
+ - * @refcount:      Reference counter, dominated by open iser connections
+ - * @comps_used:    Number of completion contexts used, Min between online
+ - *                 cpus and device max completion vectors
+ - * @comps:         Dinamically allocated array of completion handlers
+ - * Memory registration pool Function pointers (FMR or Fastreg):
+ - *     @iser_alloc_rdma_reg_res: Allocation of memory regions pool
+ - *     @iser_free_rdma_reg_res:  Free of memory regions pool
+ - *     @iser_reg_rdma_mem:       Memory registration routine
+ - *     @iser_unreg_rdma_mem:     Memory deregistration routine
+ - */
+  struct iser_device {
+  	struct ib_device             *ib_device;
+  	struct ib_pd	             *pd;
+  	struct ib_device_attr	     dev_attr;
+ +	struct ib_cq	             *rx_cq[ISER_MAX_CQ];
+ +	struct ib_cq	             *tx_cq[ISER_MAX_CQ];
+  	struct ib_mr	             *mr;
+ +	struct tasklet_struct	     cq_tasklet[ISER_MAX_CQ];
+  	struct ib_event_handler      event_handler;
+ -	struct list_head             ig_list;
+ +	struct list_head             ig_list; /* entry in ig devices list */
+  	int                          refcount;
+++<<<<<<< HEAD
+ +	int                          cq_active_qps[ISER_MAX_CQ];
+ +	int			     cqs_used;
+ +	struct iser_cq_desc	     *cq_desc;
+ +	int                          (*iser_alloc_rdma_reg_res)(struct iser_conn *ib_conn,
+++=======
++ 	int			     comps_used;
++ 	struct iser_comp	     *comps;
++ 	int                          (*iser_alloc_rdma_reg_res)(struct ib_conn *ib_conn,
+++>>>>>>> da64bdb25b54 (IB/iser: Use more completion queues)
+  								unsigned cmds_max);
+ -	void                         (*iser_free_rdma_reg_res)(struct ib_conn *ib_conn);
+ +	void                         (*iser_free_rdma_reg_res)(struct iser_conn *ib_conn);
+  	int                          (*iser_reg_rdma_mem)(struct iscsi_iser_task *iser_task,
+  							  enum iser_data_dir cmd_dir);
+  	void                         (*iser_unreg_rdma_mem)(struct iscsi_iser_task *iser_task,
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 4cafd44ad193,5d69927e9efc..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -101,16 -104,19 +101,32 @@@ static int iser_create_device_ib_res(st
+  		return -1;
+  	}
+  
+++<<<<<<< HEAD
+ +	device->cqs_used = min(ISER_MAX_CQ, device->ib_device->num_comp_vectors);
+ +	iser_info("using %d CQs, device %s supports %d vectors\n",
+ +		  device->cqs_used, device->ib_device->name,
+ +		  device->ib_device->num_comp_vectors);
+ +
+ +	device->cq_desc = kmalloc(sizeof(struct iser_cq_desc) * device->cqs_used,
+ +				  GFP_KERNEL);
+ +	if (device->cq_desc == NULL)
+ +		goto cq_desc_err;
+ +	cq_desc = device->cq_desc;
+++=======
++ 	device->comps_used = min_t(int, num_online_cpus(),
++ 				 device->ib_device->num_comp_vectors);
++ 
++ 	device->comps = kcalloc(device->comps_used, sizeof(*device->comps),
++ 				GFP_KERNEL);
++ 	if (!device->comps)
++ 		goto comps_err;
++ 
++ 	max_cqe = min(ISER_MAX_CQ_LEN, dev_attr->max_cqe);
++ 
++ 	iser_info("using %d CQs, device %s supports %d vectors max_cqe %d\n",
++ 		  device->comps_used, device->ib_device->name,
++ 		  device->ib_device->num_comp_vectors, max_cqe);
+++>>>>>>> da64bdb25b54 (IB/iser: Use more completion queues)
+  
+  	device->pd = ib_alloc_pd(device->ib_device);
+  	if (IS_ERR(device->pd))
+@@@ -177,8 -170,8 +193,13 @@@ cq_err
+  	}
+  	ib_dealloc_pd(device->pd);
+  pd_err:
+++<<<<<<< HEAD
+ +	kfree(device->cq_desc);
+ +cq_desc_err:
+++=======
++ 	kfree(device->comps);
++ comps_err:
+++>>>>>>> da64bdb25b54 (IB/iser: Use more completion queues)
+  	iser_err("failed to allocate an IB resource\n");
+  	return -1;
+  }
+@@@ -204,7 -197,8 +225,12 @@@ static void iser_free_device_ib_res(str
+  	(void)ib_dereg_mr(device->mr);
+  	(void)ib_dealloc_pd(device->pd);
+  
+++<<<<<<< HEAD
+ +	kfree(device->cq_desc);
+++=======
++ 	kfree(device->comps);
++ 	device->comps = NULL;
+++>>>>>>> da64bdb25b54 (IB/iser: Use more completion queues)
+  
+  	device->mr = NULL;
+  	device->pd = NULL;
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
