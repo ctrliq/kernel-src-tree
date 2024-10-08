@@ -1,0 +1,282 @@
+drm/i915/skl: Ensure pipes with changed wms get added to the state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915/skl: Ensure pipes with changed wms get added to the state (Lyude Paul) [1341633 1355776]
+Rebuild_FUZZ: 96.88%
+commit-author Lyude <cpaul@redhat.com>
+commit 05a76d3d6ad1ee9f9814f88949cc9305fc165460
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/05a76d3d.failed
+
+If we're enabling a pipe, we'll need to modify the watermarks on all
+active planes. Since those planes won't be added to the state on
+their own, we need to add them ourselves.
+
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+	Cc: stable@vger.kernel.org
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1471463761-26796-6-git-send-email-cpaul@redhat.com
+(cherry picked from commit 05a76d3d6ad1ee9f9814f88949cc9305fc165460)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 29a433e4d2d1,5e3f17059bed..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -3253,72 -4015,194 +3253,169 @@@ static void skl_flush_wm_values(struct 
+  	}
+  }
+  
+ -static int skl_update_pipe_wm(struct drm_crtc_state *cstate,
+ -			      struct skl_ddb_allocation *ddb, /* out */
+ -			      struct skl_pipe_wm *pipe_wm, /* out */
+ -			      bool *changed /* out */)
+ +static bool skl_update_pipe_wm(struct drm_crtc *crtc,
+ +			       struct skl_pipe_wm_parameters *params,
+ +			       struct intel_wm_config *config,
+ +			       struct skl_ddb_allocation *ddb, /* out */
+ +			       struct skl_pipe_wm *pipe_wm /* out */)
+  {
+ -	struct intel_crtc *intel_crtc = to_intel_crtc(cstate->crtc);
+ -	struct intel_crtc_state *intel_cstate = to_intel_crtc_state(cstate);
+ -	int ret;
+ -
+ -	ret = skl_build_pipe_wm(intel_cstate, ddb, pipe_wm);
+ -	if (ret)
+ -		return ret;
+ -
+ -	if (!memcmp(&intel_crtc->wm.active.skl, pipe_wm, sizeof(*pipe_wm)))
+ -		*changed = false;
+ -	else
+ -		*changed = true;
+ -
+ -	return 0;
+ -}
+ +	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+  
+ -static uint32_t
+ -pipes_modified(struct drm_atomic_state *state)
+ -{
+ -	struct drm_crtc *crtc;
+ -	struct drm_crtc_state *cstate;
+ -	uint32_t i, ret = 0;
+ +	skl_compute_wm_pipe_parameters(crtc, params);
+ +	skl_allocate_pipe_ddb(crtc, config, params, ddb);
+ +	skl_compute_pipe_wm(crtc, ddb, params, pipe_wm);
+  
+ -	for_each_crtc_in_state(state, crtc, cstate, i)
+ -		ret |= drm_crtc_mask(crtc);
+ +	if (!memcmp(&intel_crtc->wm.skl_active, pipe_wm, sizeof(*pipe_wm)))
+ +		return false;
+  
+ -	return ret;
+ +	intel_crtc->wm.skl_active = *pipe_wm;
+ +	return true;
+  }
+  
+ -static int
+ -skl_compute_ddb(struct drm_atomic_state *state)
+ +static void skl_update_other_pipe_wm(struct drm_device *dev,
+ +				     struct drm_crtc *crtc,
+ +				     struct intel_wm_config *config,
+ +				     struct skl_wm_values *r)
+  {
+ -	struct drm_device *dev = state->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+  	struct intel_crtc *intel_crtc;
+ -	struct skl_ddb_allocation *ddb = &intel_state->wm_results.ddb;
+ -	uint32_t realloc_pipes = pipes_modified(state);
+ -	int ret;
+ +	struct intel_crtc *this_crtc = to_intel_crtc(crtc);
+  
+  	/*
+ -	 * If this is our first atomic update following hardware readout,
+ -	 * we can't trust the DDB that the BIOS programmed for us.  Let's
+ -	 * pretend that all pipes switched active status so that we'll
+ -	 * ensure a full DDB recompute.
+ +	 * If the WM update hasn't changed the allocation for this_crtc (the
+ +	 * crtc we are currently computing the new WM values for), other
+ +	 * enabled crtcs will keep the same allocation and we don't need to
+ +	 * recompute anything for them.
+  	 */
+ -	if (dev_priv->wm.distrust_bios_wm) {
+ -		ret = drm_modeset_lock(&dev->mode_config.connection_mutex,
+ -				       state->acquire_ctx);
+ -		if (ret)
+ -			return ret;
+ -
+ -		intel_state->active_pipe_changes = ~0;
+ -
+ -		/*
+ -		 * We usually only initialize intel_state->active_crtcs if we
+ -		 * we're doing a modeset; make sure this field is always
+ -		 * initialized during the sanitization process that happens
+ -		 * on the first commit too.
+ -		 */
+ -		if (!intel_state->modeset)
+ -			intel_state->active_crtcs = dev_priv->active_crtcs;
+ -	}
+ +	if (!skl_ddb_allocation_changed(&r->ddb, this_crtc))
+ +		return;
+  
+  	/*
+ -	 * If the modeset changes which CRTC's are active, we need to
+ -	 * recompute the DDB allocation for *all* active pipes, even
+ -	 * those that weren't otherwise being modified in any way by this
+ -	 * atomic commit.  Due to the shrinking of the per-pipe allocations
+ -	 * when new active CRTC's are added, it's possible for a pipe that
+ -	 * we were already using and aren't changing at all here to suddenly
+ -	 * become invalid if its DDB needs exceeds its new allocation.
+ -	 *
+ -	 * Note that if we wind up doing a full DDB recompute, we can't let
+ -	 * any other display updates race with this transaction, so we need
+ -	 * to grab the lock on *all* CRTC's.
+ +	 * Otherwise, because of this_crtc being freshly enabled/disabled, the
+ +	 * other active pipes need new DDB allocation and WM values.
+  	 */
+ -	if (intel_state->active_pipe_changes) {
+ -		realloc_pipes = ~0;
+ -		intel_state->wm_results.dirty_pipes = ~0;
+ -	}
+ -
+ +	list_for_each_entry(intel_crtc, &dev->mode_config.crtc_list,
+ +				base.head) {
+ +		struct skl_pipe_wm_parameters params = {};
+ +		struct skl_pipe_wm pipe_wm = {};
+ +		bool wm_changed;
+ +
+++<<<<<<< HEAD
+ +		if (this_crtc->pipe == intel_crtc->pipe)
+++=======
++ 	for_each_intel_crtc_mask(dev, intel_crtc, realloc_pipes) {
++ 		struct intel_crtc_state *cstate;
++ 
++ 		cstate = intel_atomic_get_crtc_state(state, intel_crtc);
++ 		if (IS_ERR(cstate))
++ 			return PTR_ERR(cstate);
++ 
++ 		ret = skl_allocate_pipe_ddb(cstate, ddb);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = drm_atomic_add_affected_planes(state, &intel_crtc->base);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ skl_copy_wm_for_pipe(struct skl_wm_values *dst,
++ 		     struct skl_wm_values *src,
++ 		     enum pipe pipe)
++ {
++ 	dst->wm_linetime[pipe] = src->wm_linetime[pipe];
++ 	memcpy(dst->plane[pipe], src->plane[pipe],
++ 	       sizeof(dst->plane[pipe]));
++ 	memcpy(dst->plane_trans[pipe], src->plane_trans[pipe],
++ 	       sizeof(dst->plane_trans[pipe]));
++ 
++ 	dst->ddb.pipe[pipe] = src->ddb.pipe[pipe];
++ 	memcpy(dst->ddb.y_plane[pipe], src->ddb.y_plane[pipe],
++ 	       sizeof(dst->ddb.y_plane[pipe]));
++ 	memcpy(dst->ddb.plane[pipe], src->ddb.plane[pipe],
++ 	       sizeof(dst->ddb.plane[pipe]));
++ }
++ 
++ static int
++ skl_compute_wm(struct drm_atomic_state *state)
++ {
++ 	struct drm_crtc *crtc;
++ 	struct drm_crtc_state *cstate;
++ 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
++ 	struct skl_wm_values *results = &intel_state->wm_results;
++ 	struct skl_pipe_wm *pipe_wm;
++ 	bool changed = false;
++ 	int ret, i;
++ 
++ 	/*
++ 	 * If this transaction isn't actually touching any CRTC's, don't
++ 	 * bother with watermark calculation.  Note that if we pass this
++ 	 * test, we're guaranteed to hold at least one CRTC state mutex,
++ 	 * which means we can safely use values like dev_priv->active_crtcs
++ 	 * since any racing commits that want to update them would need to
++ 	 * hold _all_ CRTC state mutexes.
++ 	 */
++ 	for_each_crtc_in_state(state, crtc, cstate, i)
++ 		changed = true;
++ 	if (!changed)
++ 		return 0;
++ 
++ 	/* Clear all dirty flags */
++ 	results->dirty_pipes = 0;
++ 
++ 	ret = skl_compute_ddb(state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * Calculate WM's for all pipes that are part of this transaction.
++ 	 * Note that the DDB allocation above may have added more CRTC's that
++ 	 * weren't otherwise being modified (and set bits in dirty_pipes) if
++ 	 * pipe allocations had to change.
++ 	 *
++ 	 * FIXME:  Now that we're doing this in the atomic check phase, we
++ 	 * should allow skl_update_pipe_wm() to return failure in cases where
++ 	 * no suitable watermark values can be found.
++ 	 */
++ 	for_each_crtc_in_state(state, crtc, cstate, i) {
++ 		struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ 		struct intel_crtc_state *intel_cstate =
++ 			to_intel_crtc_state(cstate);
++ 
++ 		pipe_wm = &intel_cstate->wm.skl.optimal;
++ 		ret = skl_update_pipe_wm(cstate, &results->ddb, pipe_wm,
++ 					 &changed);
++ 		if (ret)
++ 			return ret;
++ 
++ 		if (changed)
++ 			results->dirty_pipes |= drm_crtc_mask(crtc);
++ 
++ 		if ((results->dirty_pipes & drm_crtc_mask(crtc)) == 0)
++ 			/* This pipe's WM's did not change */
+++>>>>>>> 05a76d3d6ad1 (drm/i915/skl: Ensure pipes with changed wms get added to the state)
+  			continue;
+  
+ -		intel_cstate->update_wm_pre = true;
+ -		skl_compute_wm_results(crtc->dev, pipe_wm, results, intel_crtc);
+ -	}
+ +		if (!intel_crtc->active)
+ +			continue;
+  
+ -	return 0;
+ +		wm_changed = skl_update_pipe_wm(&intel_crtc->base,
+ +						&params, config,
+ +						&r->ddb, &pipe_wm);
+ +
+ +		/*
+ +		 * If we end up re-computing the other pipe WM values, it's
+ +		 * because it was really needed, so we expect the WM values to
+ +		 * be different.
+ +		 */
+ +		WARN_ON(!wm_changed);
+ +
+ +		skl_compute_wm_results(dev, &params, &pipe_wm, r, intel_crtc);
+ +		r->dirty[intel_crtc->pipe] = true;
+ +	}
+  }
+  
+  static void skl_update_wm(struct drm_crtc *crtc)
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
