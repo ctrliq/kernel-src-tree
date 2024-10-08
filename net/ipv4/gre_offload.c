@@ -176,8 +176,6 @@ static struct sk_buff **gre_gro_receive(struct sk_buff **head,
 					     null_compute_pseudo);
 	}
 
-	flush = 0;
-
 	for (p = *head; p; p = p->next) {
 		const struct gre_base_hdr *greh2;
 
@@ -214,6 +212,7 @@ static struct sk_buff **gre_gro_receive(struct sk_buff **head,
 	skb_gro_postpull_rcsum(skb, greh, grehlen);
 
 	pp = ptype->callbacks.gro_receive(head, skb);
+	flush = 0;
 
 out_unlock:
 	rcu_read_unlock();
