@@ -29,7 +29,7 @@ test-stackprotector-all:
 	$(BUILD) -Werror -fstack-protector-all
 
 test-stackprotector:
-	$(BUILD) -Werror -fstack-protector
+	$(BUILD) -Werror -fstack-protector -Wstack-protector
 
 test-volatile-register-var:
 	$(BUILD) -Werror -Wvolatile-register-var
