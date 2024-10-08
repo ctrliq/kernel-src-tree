@@ -1,0 +1,117 @@
+bonding: Added bond_tlb_xmit() for tlb mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] bonding: Added bond_tlb_xmit() for tlb mode (Nikolay Aleksandrov) [1166647]
+Rebuild_FUZZ: 98.85%
+commit-author Mahesh Bandewar <maheshb@google.com>
+commit f05b42eaa22cd7c6736d31316e6046c5127f8721
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f05b42ea.failed
+
+Re-organized the xmit function for the lb mode separating tlb xmit
+from the alb mode. This will enable use of the hashing policies
+like 802.3ad mode. Also extended use of xmit-hash-policy to tlb mode.
+
+Now the tlb-mode defaults to BOND_XMIT_POLICY_LAYER2 if the xmit policy
+module parameter is not set (just like 802.3ad, or Xor mode).
+
+Change-Id: I140257403d272df75f477b380207338d0f04963e
+	Signed-off-by: Mahesh Bandewar <maheshb@google.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f05b42eaa22cd7c6736d31316e6046c5127f8721)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_options.c
+diff --git a/Documentation/networking/bonding.txt b/Documentation/networking/bonding.txt
+index 58926da1a5a1..a6d207a22a81 100644
+--- a/Documentation/networking/bonding.txt
++++ b/Documentation/networking/bonding.txt
+@@ -751,7 +751,7 @@ use_carrier
+ xmit_hash_policy
+ 
+ 	Selects the transmit hash policy to use for slave selection in
+-	balance-xor and 802.3ad modes.  Possible values are:
++	balance-xor, 802.3ad, and tlb modes.  Possible values are:
+ 
+ 	layer2
+ 
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index d3256b311be3..d6c5b062041c 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -1319,6 +1319,32 @@ void bond_alb_deinitialize(struct bonding *bond)
+ 	}
+ }
+ 
++int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++{
++	struct bonding *bond = netdev_priv(bond_dev);
++	struct ethhdr *eth_data;
++	struct slave *tx_slave = NULL;
++	u32 hash_index;
++
++	skb_reset_mac_header(skb);
++	eth_data = eth_hdr(skb);
++
++	/* Do not TX balance any multicast or broadcast */
++	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++		switch (skb->protocol) {
++		case htons(ETH_P_IP):
++		case htons(ETH_P_IPX):
++		    /* In case of IPX, it will falback to L2 hash */
++		case htons(ETH_P_IPV6):
++			hash_index = bond_xmit_hash(bond, skb);
++			tx_slave = tlb_choose_channel(bond, hash_index & 0xFF, skb->len);
++			break;
++		}
++	}
++
++	return bond_do_alb_xmit(skb, bond, tx_slave);
++}
++
+ int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+ {
+ 	struct bonding *bond = netdev_priv(bond_dev);
+diff --git a/drivers/net/bonding/bond_alb.h b/drivers/net/bonding/bond_alb.h
+index 1dfbe69caad3..a962ca25710a 100644
+--- a/drivers/net/bonding/bond_alb.h
++++ b/drivers/net/bonding/bond_alb.h
+@@ -179,6 +179,7 @@ void bond_alb_deinit_slave(struct bonding *bond, struct slave *slave);
+ void bond_alb_handle_link_change(struct bonding *bond, struct slave *slave, char link);
+ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave);
+ int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev);
++int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev);
+ void bond_alb_monitor(struct work_struct *);
+ int bond_alb_set_mac_address(struct net_device *bond_dev, void *addr);
+ void bond_alb_clear_vlan(struct bonding *bond, unsigned short vlan_id);
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index d0eec7c786f0..7cf0b15999d9 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4077,8 +4077,9 @@ static netdev_tx_t __bond_start_xmit(struct sk_buff *skb, struct net_device *dev
+ 	case BOND_MODE_8023AD:
+ 		return bond_3ad_xmit_xor(skb, dev);
+ 	case BOND_MODE_ALB:
+-	case BOND_MODE_TLB:
+ 		return bond_alb_xmit(skb, dev);
++	case BOND_MODE_TLB:
++		return bond_tlb_xmit(skb, dev);
+ 	default:
+ 		/* Should never happen, mode already checked */
+ 		pr_err("%s: Error: Unknown bonding mode %d\n",
+@@ -4364,7 +4365,8 @@ static int bond_check_params(struct bond_params *params)
+ 
+ 	if (xmit_hash_policy) {
+ 		if ((bond_mode != BOND_MODE_XOR) &&
+-		    (bond_mode != BOND_MODE_8023AD)) {
++		    (bond_mode != BOND_MODE_8023AD) &&
++		    (bond_mode != BOND_MODE_TLB)) {
+ 			pr_info("xmit_hash_policy param is irrelevant in mode %s\n",
+ 			       bond_mode_name(bond_mode));
+ 		} else {
+* Unmerged path drivers/net/bonding/bond_options.c
