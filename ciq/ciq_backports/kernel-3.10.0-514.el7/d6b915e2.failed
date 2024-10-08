@@ -1,0 +1,284 @@
+ip_fragment: don't forward defragmented DF packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ipv4: don't forward defragmented DF packet (Thadeu Lima de Souza Cascardo) [1274845]
+Rebuild_FUZZ: 87.91%
+commit-author Florian Westphal <fw@strlen.de>
+commit d6b915e29f4adea94bc02ba7675bb4f84e6a1abd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d6b915e2.failed
+
+We currently always send fragments without DF bit set.
+
+Thus, given following setup:
+
+mtu1500 - mtu1500:1400 - mtu1400:1280 - mtu1280
+   A           R1              R2         B
+
+Where R1 and R2 run linux with netfilter defragmentation/conntrack
+enabled, then if Host A sent a fragmented packet _with_ DF set to B, R1
+will respond with icmp too big error if one of these fragments exceeded
+1400 bytes.
+
+However, if R1 receives fragment sizes 1200 and 100, it would
+forward the reassembled packet without refragmenting, i.e.
+R2 will send an icmp error in response to a packet that was never sent,
+citing mtu that the original sender never exceeded.
+
+The other minor issue is that a refragmentation on R1 will conceal the
+MTU of R2-B since refragmentation does not set DF bit on the fragments.
+
+This modifies ip_fragment so that we track largest fragment size seen
+both for DF and non-DF packets, and set frag_max_size to the largest
+value.
+
+If the DF fragment size is larger or equal to the non-df one, we will
+consider the packet a path mtu probe:
+We set DF bit on the reassembled skb and also tag it with a new IPCB flag
+to force refragmentation even if skb fits outdev mtu.
+
+We will also set DF bit on each fragment in this case.
+
+Joint work with Hannes Frederic Sowa.
+
+	Reported-by: Jesse Gross <jesse@nicira.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d6b915e29f4adea94bc02ba7675bb4f84e6a1abd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_frag.h
+#	net/ipv4/ip_output.c
+diff --cc include/net/inet_frag.h
+index a1af4828c9e5,e1300b3dd597..000000000000
+--- a/include/net/inet_frag.h
++++ b/include/net/inet_frag.h
+@@@ -19,25 -15,49 +19,59 @@@ struct netns_frags 
+  	int			low_thresh;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * fragment queue flags
++  *
++  * @INET_FRAG_FIRST_IN: first fragment has arrived
++  * @INET_FRAG_LAST_IN: final fragment has arrived
++  * @INET_FRAG_COMPLETE: frag queue has been processed and is due for destruction
++  * @INET_FRAG_EVICTED: frag queue is being evicted
++  */
++ enum {
++ 	INET_FRAG_FIRST_IN	= BIT(0),
++ 	INET_FRAG_LAST_IN	= BIT(1),
++ 	INET_FRAG_COMPLETE	= BIT(2),
++ 	INET_FRAG_EVICTED	= BIT(3)
++ };
++ 
++ /**
++  * struct inet_frag_queue - fragment queue
++  *
++  * @lock: spinlock protecting the queue
++  * @timer: queue expiration timer
++  * @list: hash bucket list
++  * @refcnt: reference count of the queue
++  * @fragments: received fragments head
++  * @fragments_tail: received fragments tail
++  * @stamp: timestamp of the last received fragment
++  * @len: total length of the original datagram
++  * @meat: length of received fragments so far
++  * @flags: fragment queue flags
++  * @max_size: maximum received fragment size
++  * @net: namespace that this frag belongs to
++  */
+++>>>>>>> d6b915e29f4a (ip_fragment: don't forward defragmented DF packet)
+  struct inet_frag_queue {
+  	spinlock_t		lock;
+ -	struct timer_list	timer;
+ +	struct timer_list	timer;      /* when will this queue expire? */
+ +	struct list_head	lru_list;   /* lru list member */
+  	struct hlist_node	list;
+  	atomic_t		refcnt;
+ -	struct sk_buff		*fragments;
+ +	struct sk_buff		*fragments; /* list of received fragments */
+  	struct sk_buff		*fragments_tail;
+  	ktime_t			stamp;
+ -	int			len;
+ +	int			len;        /* total length of orig datagram */
+  	int			meat;
+ -	__u8			flags;
+ +	__u8			last_in;    /* first/last segment arrived? */
+ +
+ +#define INET_FRAG_COMPLETE	4
+ +#define INET_FRAG_FIRST_IN	2
+ +#define INET_FRAG_LAST_IN	1
+ +
+  	u16			max_size;
+ +
+  	struct netns_frags	*net;
+  };
+  
+diff --cc net/ipv4/ip_output.c
+index f60554e30748,f5f5ef1cebd5..000000000000
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@@ -265,11 -274,12 +265,16 @@@ static int ip_finish_output(struct soc
+  		return dst_output_sk(sk, skb);
+  	}
+  #endif
+ -	mtu = ip_skb_dst_mtu(skb);
+  	if (skb_is_gso(skb))
+ -		return ip_finish_output_gso(sk, skb, mtu);
+ +		return ip_finish_output_gso(sk, skb);
+  
+++<<<<<<< HEAD
+ +	if (skb->len > ip_skb_dst_mtu(skb))
+ +		return ip_fragment(sk, skb, ip_finish_output2);
+++=======
++ 	if (skb->len > mtu || (IPCB(skb)->flags & IPSKB_FRAG_PMTU))
++ 		return ip_fragment(sk, skb, mtu, ip_finish_output2);
+++>>>>>>> d6b915e29f4a (ip_fragment: don't forward defragmented DF packet)
+  
+  	return ip_finish_output2(sk, skb);
+  }
+@@@ -479,6 -486,31 +484,34 @@@ static void ip_copy_metadata(struct sk_
+  	skb_copy_secmark(to, from);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ip_fragment(struct sock *sk, struct sk_buff *skb,
++ 		       unsigned int mtu,
++ 		       int (*output)(struct sock *, struct sk_buff *))
++ {
++ 	struct iphdr *iph = ip_hdr(skb);
++ 
++ 	if ((iph->frag_off & htons(IP_DF)) == 0)
++ 		return ip_do_fragment(sk, skb, output);
++ 
++ 	if (unlikely(!skb->ignore_df ||
++ 		     (IPCB(skb)->frag_max_size &&
++ 		      IPCB(skb)->frag_max_size > mtu))) {
++ 		struct rtable *rt = skb_rtable(skb);
++ 		struct net_device *dev = rt->dst.dev;
++ 
++ 		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
++ 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
++ 			  htonl(mtu));
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ 
++ 	return ip_do_fragment(sk, skb, output);
++ }
++ 
+++>>>>>>> d6b915e29f4a (ip_fragment: don't forward defragmented DF packet)
+  /*
+   *	This IP datagram is too large to be sent in one piece.  Break it up into
+   *	smaller pieces (each of size equal to IP header plus
+@@@ -508,15 -540,8 +541,20 @@@ int ip_fragment(struct sock *sk, struc
+  	iph = ip_hdr(skb);
+  
+  	mtu = ip_skb_dst_mtu(skb);
+++<<<<<<< HEAD
+ +	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
+ +		     (IPCB(skb)->frag_max_size &&
+ +		      IPCB(skb)->frag_max_size > mtu))) {
+ +		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+ +		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+ +			  htonl(mtu));
+ +		kfree_skb(skb);
+ +		return -EMSGSIZE;
+ +	}
+++=======
++ 	if (IPCB(skb)->frag_max_size && IPCB(skb)->frag_max_size < mtu)
++ 		mtu = IPCB(skb)->frag_max_size;
+++>>>>>>> d6b915e29f4a (ip_fragment: don't forward defragmented DF packet)
+  
+  	/*
+  	 *	Setup starting values.
+* Unmerged path include/net/inet_frag.h
+diff --git a/include/net/ip.h b/include/net/ip.h
+index ac68d6939a5b..5b026754e7a7 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -45,6 +45,7 @@ struct inet_skb_parm {
+ #define IPSKB_FRAG_COMPLETE	BIT(3)
+ #define IPSKB_REROUTED		BIT(4)
+ #define IPSKB_DOREDIRECT	BIT(5)
++#define IPSKB_FRAG_PMTU		BIT(6)
+ 
+ 	u16			frag_max_size;
+ };
+diff --git a/net/ipv4/ip_fragment.c b/net/ipv4/ip_fragment.c
+index c10a3ce5cbff..7d4c44ff0511 100644
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -74,6 +74,7 @@ struct ipq {
+ 	__be16		id;
+ 	u8		protocol;
+ 	u8		ecn; /* RFC3168 support */
++	u16		max_df_size; /* largest frag with DF set seen */
+ 	int             iif;
+ 	unsigned int    rid;
+ 	struct inet_peer *peer;
+@@ -334,6 +335,7 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+ {
+ 	struct sk_buff *prev, *next;
+ 	struct net_device *dev;
++	unsigned int fragsize;
+ 	int flags, offset;
+ 	int ihl, end;
+ 	int err = -ENOENT;
+@@ -489,9 +491,14 @@ found:
+ 	if (offset == 0)
+ 		qp->q.last_in |= INET_FRAG_FIRST_IN;
+ 
++	fragsize = skb->len + ihl;
++
++	if (fragsize > qp->q.max_size)
++		qp->q.max_size = fragsize;
++
+ 	if (ip_hdr(skb)->frag_off & htons(IP_DF) &&
+-	    skb->len + ihl > qp->q.max_size)
+-		qp->q.max_size = skb->len + ihl;
++	    fragsize > qp->max_df_size)
++		qp->max_df_size = fragsize;
+ 
+ 	if (qp->q.last_in == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ 	    qp->q.meat == qp->q.len) {
+@@ -621,13 +628,27 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *prev,
+ 	head->next = NULL;
+ 	head->dev = dev;
+ 	head->tstamp = qp->q.stamp;
+-	IPCB(head)->frag_max_size = qp->q.max_size;
++	IPCB(head)->frag_max_size = max(qp->max_df_size, qp->q.max_size);
+ 
+ 	iph = ip_hdr(head);
+-	/* max_size != 0 implies at least one fragment had IP_DF set */
+-	iph->frag_off = qp->q.max_size ? htons(IP_DF) : 0;
+ 	iph->tot_len = htons(len);
+ 	iph->tos |= ecn;
++
++	/* When we set IP_DF on a refragmented skb we must also force a
++	 * call to ip_fragment to avoid forwarding a DF-skb of size s while
++	 * original sender only sent fragments of size f (where f < s).
++	 *
++	 * We only set DF/IPSKB_FRAG_PMTU if such DF fragment was the largest
++	 * frag seen to avoid sending tiny DF-fragments in case skb was built
++	 * from one very small df-fragment and one large non-df frag.
++	 */
++	if (qp->max_df_size == qp->q.max_size) {
++		IPCB(head)->flags |= IPSKB_FRAG_PMTU;
++		iph->frag_off = htons(IP_DF);
++	} else {
++		iph->frag_off = 0;
++	}
++
+ 	IP_INC_STATS_BH(net, IPSTATS_MIB_REASMOKS);
+ 	qp->q.fragments = NULL;
+ 	qp->q.fragments_tail = NULL;
+* Unmerged path net/ipv4/ip_output.c
