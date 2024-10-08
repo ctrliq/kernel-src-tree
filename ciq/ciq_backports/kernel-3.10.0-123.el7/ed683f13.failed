@@ -1,0 +1,188 @@
+netfilter: nf_tables: add ARP filtering support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit ed683f138b3dbc8a5e878e24a0bfa0bb61043a09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ed683f13.failed
+
+This patch registers the ARP family and he filter chain type
+for this family.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit ed683f138b3dbc8a5e878e24a0bfa0bb61043a09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/nftables.h
+#	net/ipv4/netfilter/Kconfig
+#	net/ipv4/netfilter/Makefile
+diff --cc net/ipv4/netfilter/Kconfig
+index e7916c193932,40d56073cd19..000000000000
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@@ -36,6 -36,27 +36,30 @@@ config NF_CONNTRACK_PROC_COMPA
+  
+  	  If unsure, say Y.
+  
+++<<<<<<< HEAD
+++=======
++ config NF_TABLES_IPV4
++ 	depends on NF_TABLES
++ 	tristate "IPv4 nf_tables support"
++ 
++ config NFT_REJECT_IPV4
++ 	depends on NF_TABLES_IPV4
++ 	tristate "nf_tables IPv4 reject support"
++ 
++ config NFT_CHAIN_ROUTE_IPV4
++ 	depends on NF_TABLES_IPV4
++ 	tristate "IPv4 nf_tables route chain support"
++ 
++ config NFT_CHAIN_NAT_IPV4
++ 	depends on NF_TABLES_IPV4
++ 	depends on NF_NAT_IPV4 && NFT_NAT
++ 	tristate "IPv4 nf_tables nat chain support"
++ 
++ config NF_TABLES_ARP
++ 	depends on NF_TABLES
++ 	tristate "ARP nf_tables support"
++ 
+++>>>>>>> ed683f138b3d (netfilter: nf_tables: add ARP filtering support)
+  config IP_NF_IPTABLES
+  	tristate "IP tables support (required for filtering/masq/NAT)"
+  	default m if NETFILTER_ADVANCED=n
+diff --cc net/ipv4/netfilter/Makefile
+index 007b128eecc9,19df72b7ba88..000000000000
+--- a/net/ipv4/netfilter/Makefile
++++ b/net/ipv4/netfilter/Makefile
+@@@ -27,6 -27,12 +27,15 @@@ obj-$(CONFIG_NF_NAT_SNMP_BASIC) += nf_n
+  # NAT protocols (nf_nat)
+  obj-$(CONFIG_NF_NAT_PROTO_GRE) += nf_nat_proto_gre.o
+  
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_NF_TABLES_IPV4) += nf_tables_ipv4.o
++ obj-$(CONFIG_NFT_REJECT_IPV4) += nft_reject_ipv4.o
++ obj-$(CONFIG_NFT_CHAIN_ROUTE_IPV4) += nft_chain_route_ipv4.o
++ obj-$(CONFIG_NFT_CHAIN_NAT_IPV4) += nft_chain_nat_ipv4.o
++ obj-$(CONFIG_NF_TABLES_ARP) += nf_tables_arp.o
++ 
+++>>>>>>> ed683f138b3d (netfilter: nf_tables: add ARP filtering support)
+  # generic IP tables 
+  obj-$(CONFIG_IP_NF_IPTABLES) += ip_tables.o
+  
+* Unmerged path include/net/netns/nftables.h
+* Unmerged path include/net/netns/nftables.h
+* Unmerged path net/ipv4/netfilter/Kconfig
+* Unmerged path net/ipv4/netfilter/Makefile
+diff --git a/net/ipv4/netfilter/nf_tables_arp.c b/net/ipv4/netfilter/nf_tables_arp.c
+new file mode 100644
+index 000000000000..3e67ef1c676f
+--- /dev/null
++++ b/net/ipv4/netfilter/nf_tables_arp.c
+@@ -0,0 +1,102 @@
++/*
++ * Copyright (c) 2008-2010 Patrick McHardy <kaber@trash.net>
++ * Copyright (c) 2013 Pablo Neira Ayuso <pablo@netfilter.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Development of this code funded by Astaro AG (http://www.astaro.com/)
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/netfilter_arp.h>
++#include <net/netfilter/nf_tables.h>
++
++static struct nft_af_info nft_af_arp __read_mostly = {
++	.family		= NFPROTO_ARP,
++	.nhooks		= NF_ARP_NUMHOOKS,
++	.owner		= THIS_MODULE,
++};
++
++static int nf_tables_arp_init_net(struct net *net)
++{
++	net->nft.arp = kmalloc(sizeof(struct nft_af_info), GFP_KERNEL);
++	if (net->nft.arp== NULL)
++		return -ENOMEM;
++
++	memcpy(net->nft.arp, &nft_af_arp, sizeof(nft_af_arp));
++
++	if (nft_register_afinfo(net, net->nft.arp) < 0)
++		goto err;
++
++	return 0;
++err:
++	kfree(net->nft.arp);
++	return -ENOMEM;
++}
++
++static void nf_tables_arp_exit_net(struct net *net)
++{
++	nft_unregister_afinfo(net->nft.arp);
++	kfree(net->nft.arp);
++}
++
++static struct pernet_operations nf_tables_arp_net_ops = {
++	.init   = nf_tables_arp_init_net,
++	.exit   = nf_tables_arp_exit_net,
++};
++
++static unsigned int
++nft_do_chain_arp(const struct nf_hook_ops *ops,
++		  struct sk_buff *skb,
++		  const struct net_device *in,
++		  const struct net_device *out,
++		  int (*okfn)(struct sk_buff *))
++{
++	struct nft_pktinfo pkt;
++
++	nft_set_pktinfo(&pkt, ops, skb, in, out);
++
++	return nft_do_chain_pktinfo(&pkt, ops);
++}
++
++static struct nf_chain_type filter_arp = {
++	.family		= NFPROTO_ARP,
++	.name		= "filter",
++	.type		= NFT_CHAIN_T_DEFAULT,
++	.hook_mask	= (1 << NF_ARP_IN) |
++			  (1 << NF_ARP_OUT) |
++			  (1 << NF_ARP_FORWARD),
++	.fn		= {
++		[NF_ARP_IN]		= nft_do_chain_arp,
++		[NF_ARP_OUT]		= nft_do_chain_arp,
++		[NF_ARP_FORWARD]	= nft_do_chain_arp,
++	},
++};
++
++static int __init nf_tables_arp_init(void)
++{
++	int ret;
++
++	nft_register_chain_type(&filter_arp);
++	ret = register_pernet_subsys(&nf_tables_arp_net_ops);
++	if (ret < 0)
++		nft_unregister_chain_type(&filter_arp);
++
++	return ret;
++}
++
++static void __exit nf_tables_arp_exit(void)
++{
++	unregister_pernet_subsys(&nf_tables_arp_net_ops);
++	nft_unregister_chain_type(&filter_arp);
++}
++
++module_init(nf_tables_arp_init);
++module_exit(nf_tables_arp_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Patrick McHardy <kaber@trash.net>");
++MODULE_ALIAS_NFT_FAMILY(3); /* NFPROTO_ARP */
