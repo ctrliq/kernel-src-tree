@@ -1,0 +1,81 @@
+macvlan: Move broadcasts into a work queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 412ca1550cbecb2cbed6086df51af08aa3452c86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/412ca155.failed
+
+Currently broadcasts are handled in network RX context, where
+the packets are sent through netif_rx.  This means that the number
+of macvlans will be constrained by the capacity of netif_rx.
+
+For example, setting up 4096 macvlans practically causes all
+broadcast packets to be dropped as the default netif_rx queue
+size simply can't handle 4096 skbs being stuffed into it all
+at once.
+
+Fundamentally, we need to ensure that the amount of work handled
+in each netif_rx backlog run is constrained.  As broadcasts are
+anything but constrained, it either needs to be limited per run
+or moved to process context.
+
+This patch picks the second option and moves all broadcast handling
+bar the trivial case of packets going to a single interface into
+a work queue.  Obviously there also needs to be a limit on how
+many broadcast packets we postpone in this way.  I've arbitrarily
+chosen tx_queue_len of the master device as the limit (act_mirred
+also happens to use this parameter in a similar way).
+
+In order to ensure we don't exceed the backlog queue we will use
+netif_rx_ni instead of netif_rx for broadcast packets.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+
+Thanks,
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 412ca1550cbecb2cbed6086df51af08aa3452c86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvlan.c
+diff --cc drivers/net/macvlan.c
+index 6af48508e014,8b8220fcdd3d..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -118,11 -127,9 +127,11 @@@ static int macvlan_broadcast_one(struc
+  				 const struct ethhdr *eth, bool local)
+  {
+  	struct net_device *dev = vlan->dev;
+ +	if (!skb)
+ +		return NET_RX_DROP;
+  
+  	if (local)
+- 		return dev_forward_skb(dev, skb);
++ 		return __dev_forward_skb(dev, skb);
+  
+  	skb->dev = dev;
+  	if (ether_addr_equal_64bits(eth->h_dest, dev->broadcast))
+@@@ -171,9 -178,14 +180,17 @@@ static void macvlan_broadcast(struct sk
+  			hash = mc_hash(vlan, eth->h_dest);
+  			if (!test_bit(hash, vlan->mc_filter))
+  				continue;
+ -
+ -			err = NET_RX_DROP;
+  			nskb = skb_clone(skb, GFP_ATOMIC);
+++<<<<<<< HEAD
+ +			err = macvlan_broadcast_one(nskb, vlan, eth,
+ +					 mode == MACVLAN_MODE_BRIDGE);
+++=======
++ 			if (likely(nskb))
++ 				err = macvlan_broadcast_one(
++ 					nskb, vlan, eth,
++ 					mode == MACVLAN_MODE_BRIDGE) ?:
++ 				      netif_rx_ni(nskb);
+++>>>>>>> 412ca1550cbe (macvlan: Move broadcasts into a work queue)
+  			macvlan_count_rx(vlan, skb->len + ETH_HLEN,
+  					 err == NET_RX_SUCCESS, 1);
+  		}
+* Unmerged path drivers/net/macvlan.c
