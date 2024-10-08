@@ -1,0 +1,108 @@
+uprobes/x86: Send SIGILL if arch_uprobe_post_xol() fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Send SIGILL if arch_uprobe_post_xol() fails (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 96.30%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 014940bad8e46ca7bd0483f760f9cba60088a3d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/014940ba.failed
+
+Currently the error from arch_uprobe_post_xol() is silently ignored.
+This doesn't look good and this can lead to the hard-to-debug problems.
+
+1. Change handle_singlestep() to loudly complain and send SIGILL.
+
+   Note: this only affects x86, ppc/arm can't fail.
+
+2. Change arch_uprobe_post_xol() to call arch_uprobe_abort_xol() and
+   avoid TF games if it is going to return an error.
+
+   This can help to to analyze the problem, if nothing else we should
+   not report ->ip = xol_slot in the core-file.
+
+   Note: this means that handle_riprel_post_xol() can be called twice,
+   but this is fine because it is idempotent.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 014940bad8e46ca7bd0483f760f9cba60088a3d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/kernel/uprobes.c
+index 7ea7d2b3594b,e72903eacd43..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -563,6 -595,14 +563,17 @@@ int arch_uprobe_post_xol(struct arch_up
+  
+  	WARN_ON_ONCE(current->thread.trap_nr != UPROBE_TRAP_NR);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (auprobe->ops->post_xol) {
++ 		int err = auprobe->ops->post_xol(auprobe, regs);
++ 		if (err) {
++ 			arch_uprobe_abort_xol(auprobe, regs);
++ 			return err;
++ 		}
++ 	}
++ 
+++>>>>>>> 014940bad8e4 (uprobes/x86: Send SIGILL if arch_uprobe_post_xol() fails)
+  	current->thread.trap_nr = utask->autask.saved_trap_nr;
+  	/*
+  	 * arch_uprobe_pre_xol() doesn't save the state of TIF_BLOCKSTEP
+@@@ -574,15 -614,7 +585,19 @@@
+  	else if (!(auprobe->fixups & UPROBE_FIX_SETF))
+  		regs->flags &= ~X86_EFLAGS_TF;
+  
+++<<<<<<< HEAD
+ +	correction = (long)(utask->vaddr - utask->xol_vaddr);
+ +	handle_riprel_post_xol(auprobe, regs, &correction);
+ +	if (auprobe->fixups & UPROBE_FIX_IP)
+ +		regs->ip += correction;
+ +
+ +	if (auprobe->fixups & UPROBE_FIX_CALL)
+ +		result = adjust_ret_addr(regs->sp, correction);
+ +
+ +	return result;
+++=======
++ 	return 0;
+++>>>>>>> 014940bad8e4 (uprobes/x86: Send SIGILL if arch_uprobe_post_xol() fails)
+  }
+  
+  /* callback routine for handling exceptions. */
+* Unmerged path arch/x86/kernel/uprobes.c
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index b77e5413ed2c..8e32ec0622e6 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -1846,10 +1846,11 @@ out:
+ static void handle_singlestep(struct uprobe_task *utask, struct pt_regs *regs)
+ {
+ 	struct uprobe *uprobe;
++	int err = 0;
+ 
+ 	uprobe = utask->active_uprobe;
+ 	if (utask->state == UTASK_SSTEP_ACK)
+-		arch_uprobe_post_xol(&uprobe->arch, regs);
++		err = arch_uprobe_post_xol(&uprobe->arch, regs);
+ 	else if (utask->state == UTASK_SSTEP_TRAPPED)
+ 		arch_uprobe_abort_xol(&uprobe->arch, regs);
+ 	else
+@@ -1863,6 +1864,11 @@ static void handle_singlestep(struct uprobe_task *utask, struct pt_regs *regs)
+ 	spin_lock_irq(&current->sighand->siglock);
+ 	recalc_sigpending(); /* see uprobe_deny_signal() */
+ 	spin_unlock_irq(&current->sighand->siglock);
++
++	if (unlikely(err)) {
++		uprobe_warn(current, "execute the probed insn, sending SIGILL.");
++		force_sig_info(SIGILL, SEND_SIG_FORCED, current);
++	}
+ }
+ 
+ /*
