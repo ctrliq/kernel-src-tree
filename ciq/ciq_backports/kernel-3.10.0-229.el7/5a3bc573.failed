@@ -1,0 +1,331 @@
+ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Drop handle field from struct acpiphp_func (Myron Stowe) [1114228]
+Rebuild_FUZZ: 92.44%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 5a3bc573ae32a71bb9e307812d4de1bdcab6b9fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5a3bc573.failed
+
+The ACPI handle stored in struct acpiphp_func is also stored in the
+struct acpiphp_context object containing it and it is trivial to get
+from a struct acpiphp_func pointer to the handle field of the outer
+struct acpiphp_context.
+
+Hence, the handle field of struct acpiphp_func is redundant, so drop
+it and provide a helper function, func_to_handle(), allowing it
+users to get the ACPI handle for the given struct acpiphp_func
+pointer.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 5a3bc573ae32a71bb9e307812d4de1bdcab6b9fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp.h
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp.h
+index 8d99e4e1e51d,dbb94258da57..000000000000
+--- a/drivers/pci/hotplug/acpiphp.h
++++ b/drivers/pci/hotplug/acpiphp.h
+@@@ -112,13 -119,28 +112,36 @@@ struct acpiphp_func 
+  	struct acpiphp_slot *slot;	/* parent */
+  
+  	struct list_head sibling;
+++<<<<<<< HEAD
+ +	struct notifier_block nb;
+ +	acpi_handle	handle;
+++=======
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  
+  	u8		function;	/* pci function# */
+  	u32		flags;		/* see below */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct acpiphp_context {
++ 	acpi_handle handle;
++ 	struct acpiphp_func func;
++ 	struct acpiphp_bridge *bridge;
++ 	unsigned int refcount;
++ };
++ 
++ static inline struct acpiphp_context *func_to_context(struct acpiphp_func *func)
++ {
++ 	return container_of(func, struct acpiphp_context, func);
++ }
++ 
++ static inline acpi_handle func_to_handle(struct acpiphp_func *func)
++ {
++ 	return func_to_context(func)->handle;
++ }
++ 
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  /*
+   * struct acpiphp_attention_info - device specific attention registration
+   *
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index b5069ad47c47,9e4ad6f37647..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -221,82 -285,79 +221,93 @@@ register_slot(acpi_handle handle, u32 l
+  	device = (adr >> 16) & 0xffff;
+  	function = adr & 0xffff;
+  
+++<<<<<<< HEAD
+ +	pdev = bridge->pci_dev;
+ +	if (pdev && device_is_managed_by_native_pciehp(pdev))
+ +		return AE_OK;
+ +
+ +	newfunc = kzalloc(sizeof(struct acpiphp_func), GFP_KERNEL);
+ +	if (!newfunc)
+ +		return AE_NO_MEMORY;
+ +
+ +	newfunc->handle = handle;
+++=======
++ 	mutex_lock(&acpiphp_context_lock);
++ 	context = acpiphp_init_context(handle);
++ 	if (!context) {
++ 		mutex_unlock(&acpiphp_context_lock);
++ 		acpi_handle_err(handle, "No hotplug context\n");
++ 		return AE_NOT_EXIST;
++ 	}
++ 	newfunc = &context->func;
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  	newfunc->function = function;
+ -	mutex_unlock(&acpiphp_context_lock);
+  
+ -	if (acpi_has_method(handle, "_EJ0"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_EJ0", &tmp)))
+  		newfunc->flags = FUNC_HAS_EJ0;
+  
+ -	if (acpi_has_method(handle, "_STA"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_STA", &tmp)))
+  		newfunc->flags |= FUNC_HAS_STA;
+  
+ -	if (acpi_has_method(handle, "_PS0"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS0", &tmp)))
+  		newfunc->flags |= FUNC_HAS_PS0;
+  
+ -	if (acpi_has_method(handle, "_PS3"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_PS3", &tmp)))
+  		newfunc->flags |= FUNC_HAS_PS3;
+  
+ -	if (acpi_has_method(handle, "_DCK"))
+ +	if (ACPI_SUCCESS(acpi_get_handle(handle, "_DCK", &tmp)))
+  		newfunc->flags |= FUNC_HAS_DCK;
+  
+ -	/* search for objects that share the same slot */
+ -	list_for_each_entry(slot, &bridge->slots, node)
+ -		if (slot->device == device)
+ -			goto slot_found;
+ -
+ -	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ -	if (!slot) {
+ -		status = AE_NO_MEMORY;
+ -		goto err;
+ +	status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ +	if (ACPI_FAILURE(status)) {
+ +		/*
+ +		 * use the count of the number of slots we've found
+ +		 * for the number of the slot
+ +		 */
+ +		sun = bridge->nr_slots+1;
+  	}
+  
+ -	slot->bridge = bridge;
+ -	slot->device = device;
+ -	INIT_LIST_HEAD(&slot->funcs);
+ -	mutex_init(&slot->crit_sect);
+ +	/* search for objects that share the same slot */
+ +	list_for_each_entry(slot, &bridge->slots, node)
+ +		if (slot->device == device) {
+ +			if (slot->sun != sun)
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+  
+ -	mutex_lock(&bridge_mutex);
+ -	list_add_tail(&slot->node, &bridge->slots);
+ -	mutex_unlock(&bridge_mutex);
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+  
+ -	/* Register slots for ejectable funtions only. */
+ -	if (acpi_pci_check_ejectable(pbus, handle)  || is_dock_device(handle)) {
+ -		unsigned long long sun;
+ -		int retval;
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+  
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+  		bridge->nr_slots++;
+ -		status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ -		if (ACPI_FAILURE(status))
+ -			sun = bridge->nr_slots;
+ -
+ -		dbg("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ -		    sun, pci_domain_nr(pbus), pbus->number, device);
+  
+ -		retval = acpiphp_register_hotplug_slot(slot, sun);
+ +		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+  		if (retval) {
+ -			bridge->nr_slots--;
+  			if (retval == -EBUSY)
+ -				warn("Slot %llu already registered by another "
+ -					"hotplug driver\n", sun);
+ +				pr_warn("Slot %llu already registered by another "
+ +					"hotplug driver\n", slot->sun);
+  			else
+ -				warn("acpiphp_register_hotplug_slot failed "
+ +				pr_warn("acpiphp_register_hotplug_slot failed "
+  					"(err code = 0x%x)\n", retval);
+ +			goto err_exit;
+  		}
+ -		/* Even if the slot registration fails, we can still use it. */
+  	}
+  
+ - slot_found:
+  	newfunc->slot = slot;
+  	mutex_lock(&bridge_mutex);
+  	list_add_tail(&newfunc->sibling, &slot->funcs);
+@@@ -473,16 -424,17 +484,28 @@@ static void cleanup_bridge(struct acpip
+  
+  	list_for_each_entry(slot, &bridge->slots, node) {
+  		list_for_each_entry(func, &slot->funcs, sibling) {
+++<<<<<<< HEAD
+ +			if (is_dock_device(func->handle)) {
+ +				unregister_hotplug_dock_device(func->handle);
+ +				unregister_dock_notifier(&func->nb);
+ +			}
+ +			if (!(func->flags & FUNC_HAS_DCK)) {
+ +				status = acpi_remove_notify_handler(func->handle,
+ +						ACPI_SYSTEM_NOTIFY,
+ +						handle_hotplug_event_func);
+++=======
++ 			acpi_handle handle = func_to_handle(func);
++ 
++ 			if (is_dock_device(handle))
++ 				unregister_hotplug_dock_device(handle);
++ 
++ 			if (!(func->flags & FUNC_HAS_DCK)) {
++ 				status = acpi_remove_notify_handler(handle,
++ 							ACPI_SYSTEM_NOTIFY,
++ 							handle_hotplug_event);
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  				if (ACPI_FAILURE(status))
+ -					err("failed to remove notify handler\n");
+ +					pr_err("failed to remove notify handler\n");
+  			}
+  		}
+  		acpiphp_unregister_hotplug_slot(slot);
+@@@ -505,10 -457,11 +528,16 @@@ static int power_on_slot(struct acpiphp
+  
+  	list_for_each_entry(func, &slot->funcs, sibling) {
+  		if (func->flags & FUNC_HAS_PS0) {
+++<<<<<<< HEAD
+ +			pr_debug("%s: executing _PS0\n", __func__);
+ +			status = acpi_evaluate_object(func->handle, "_PS0", NULL, NULL);
+++=======
++ 			dbg("%s: executing _PS0\n", __func__);
++ 			status = acpi_evaluate_object(func_to_handle(func),
++ 						      "_PS0", NULL, NULL);
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  			if (ACPI_FAILURE(status)) {
+ -				warn("%s: _PS0 failed\n", __func__);
+ +				pr_warn("%s: _PS0 failed\n", __func__);
+  				retval = -1;
+  				goto err_exit;
+  			} else
+@@@ -538,9 -491,10 +567,10 @@@ static int power_off_slot(struct acpiph
+  
+  	list_for_each_entry(func, &slot->funcs, sibling) {
+  		if (func->flags & FUNC_HAS_PS3) {
+- 			status = acpi_evaluate_object(func->handle, "_PS3", NULL, NULL);
++ 			status = acpi_evaluate_object(func_to_handle(func),
++ 						      "_PS3", NULL, NULL);
+  			if (ACPI_FAILURE(status)) {
+ -				warn("%s: _PS3 failed\n", __func__);
+ +				pr_warn("%s: _PS3 failed\n", __func__);
+  				retval = -1;
+  				goto err_exit;
+  			} else
+@@@ -595,20 -550,20 +626,25 @@@ static int acpiphp_bus_add(struct acpip
+  	struct acpi_device *device;
+  	int ret_val;
+  
+++<<<<<<< HEAD
+ +	if (!acpi_bus_get_device(func->handle, &device)) {
+ +		pr_debug("bus exists... trim\n");
+++=======
++ 	if (!acpi_bus_get_device(handle, &device)) {
++ 		dbg("bus exists... trim\n");
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  		/* this shouldn't be in here, so remove
+  		 * the bus then re-add it...
+  		 */
+  		acpi_bus_trim(device);
+  	}
+  
+- 	ret_val = acpi_bus_scan(func->handle);
++ 	ret_val = acpi_bus_scan(handle);
+  	if (!ret_val)
+- 		ret_val = acpi_bus_get_device(func->handle, &device);
++ 		ret_val = acpi_bus_get_device(handle, &device);
+  
+  	if (ret_val)
+ -		dbg("error adding bus, %x\n", -ret_val);
+ +		pr_debug("error adding bus, %x\n", -ret_val);
+  
+  	return ret_val;
+  }
+@@@ -851,20 -805,13 +890,30 @@@ int acpiphp_eject_slot(struct acpiphp_s
+  
+  	list_for_each_entry(func, &slot->funcs, sibling) {
+  		/* We don't want to call _EJ0 on non-existing functions. */
+++<<<<<<< HEAD
+ +		if ((func->flags & FUNC_HAS_EJ0)) {
+ +			/* _EJ0 method take one argument */
+ +			arg_list.count = 1;
+ +			arg_list.pointer = &arg;
+ +			arg.type = ACPI_TYPE_INTEGER;
+ +			arg.integer.value = 1;
+ +
+ +			status = acpi_evaluate_object(func->handle, "_EJ0", &arg_list, NULL);
+ +			if (ACPI_FAILURE(status)) {
+ +				pr_warn("%s: _EJ0 failed\n", __func__);
+ +				return -1;
+ +			} else
+ +				break;
+ +		}
+++=======
++ 		if (!(func->flags & FUNC_HAS_EJ0))
++ 			continue;
++ 
++ 		if (ACPI_FAILURE(acpi_evaluate_ej0(func_to_handle(func))))
++ 			return -1;
++ 		else
++ 			break;
+++>>>>>>> 5a3bc573ae32 (ACPI / hotplug / PCI: Drop handle field from struct acpiphp_func)
+  	}
+  	return 0;
+  }
+* Unmerged path drivers/pci/hotplug/acpiphp.h
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
