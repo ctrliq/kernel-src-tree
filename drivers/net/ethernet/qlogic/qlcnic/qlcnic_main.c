@@ -1645,6 +1645,7 @@ int __qlcnic_up(struct qlcnic_adapter *adapter, struct net_device *netdev)
 	qlcnic_linkevent_request(adapter, 1);
 
 	adapter->ahw->reset_context = 0;
+	netif_tx_start_all_queues(netdev);
 	return 0;
 }
 
@@ -2465,14 +2466,8 @@ static int qlcnic_open(struct net_device *netdev)
 
 	err = __qlcnic_up(adapter, netdev);
 	if (err)
-		goto err_out;
+		qlcnic_detach(adapter);
 
-	netif_tx_start_all_queues(netdev);
-
-	return 0;
-
-err_out:
-	qlcnic_detach(adapter);
 	return err;
 }
 
