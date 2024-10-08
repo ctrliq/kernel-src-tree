@@ -1151,6 +1151,7 @@ static struct flags {
 	{ NFSEXP_NOSUBTREECHECK, {"no_subtree_check", ""}},
 	{ NFSEXP_NOAUTHNLM, {"insecure_locks", ""}},
 	{ NFSEXP_V4ROOT, {"v4root", ""}},
+	{ NFSEXP_PNFS, {"pnfs", ""}},
 	{ 0, {"", ""}}
 };
 
