@@ -1,0 +1,313 @@
+libceph: handle_one_map()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 42c1b1240326cbea86f15f5d4ce565d8b54be31f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/42c1b124.failed
+
+Separate osdmap handling from decoding and iterating over a bag of maps
+in a fresh MOSDMap message.  This sets up the scene for the updated OSD
+client.
+
+Of particular importance here is the addition of pi->was_full, which
+can be used to answer "did this pool go full -> not-full in this map?".
+This is the key bit for supporting pool quotas.
+
+We won't be able to downgrade map_sem for much longer, so drop
+downgrade_write().
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 42c1b1240326cbea86f15f5d4ce565d8b54be31f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/mon_client.h
+#	net/ceph/osd_client.c
+diff --cc include/linux/ceph/mon_client.h
+index 3edc0664b7fc,c14e9d861cda..000000000000
+--- a/include/linux/ceph/mon_client.h
++++ b/include/linux/ceph/mon_client.h
+@@@ -98,8 -112,10 +98,15 @@@ extern void ceph_monc_stop(struct ceph_
+   * periodically rerequest the map from the monitor cluster until we
+   * get what we want.
+   */
+++<<<<<<< HEAD
+ +extern int ceph_monc_got_mdsmap(struct ceph_mon_client *monc, u32 have);
+ +extern int ceph_monc_got_osdmap(struct ceph_mon_client *monc, u32 have);
+++=======
++ bool ceph_monc_want_map(struct ceph_mon_client *monc, int sub, u32 epoch,
++ 			bool continuous);
++ void ceph_monc_got_map(struct ceph_mon_client *monc, int sub, u32 epoch);
++ void ceph_monc_renew_subs(struct ceph_mon_client *monc);
+++>>>>>>> 42c1b1240326 (libceph: handle_one_map())
+  
+  extern void ceph_monc_request_next_osdmap(struct ceph_mon_client *monc);
+  extern int ceph_monc_wait_osdmap(struct ceph_mon_client *monc, u32 epoch,
+diff --cc net/ceph/osd_client.c
+index 4e649b707367,4227c55226c3..000000000000
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@@ -1285,6 -1240,26 +1285,29 @@@ void ceph_osdc_set_request_linger(struc
+  }
+  EXPORT_SYMBOL(ceph_osdc_set_request_linger);
+  
+++<<<<<<< HEAD
+++=======
++ static bool __pool_full(struct ceph_pg_pool_info *pi)
++ {
++ 	return pi->flags & CEPH_POOL_FLAG_FULL;
++ }
++ 
++ static bool have_pool_full(struct ceph_osd_client *osdc)
++ {
++ 	struct rb_node *n;
++ 
++ 	for (n = rb_first(&osdc->osdmap->pg_pools); n; n = rb_next(n)) {
++ 		struct ceph_pg_pool_info *pi =
++ 		    rb_entry(n, struct ceph_pg_pool_info, node);
++ 
++ 		if (__pool_full(pi))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 42c1b1240326 (libceph: handle_one_map())
+  /*
+   * Returns whether a request should be blocked from being sent
+   * based on the current osdmap and osd_client settings.
+@@@ -1482,10 -1648,32 +1505,30 @@@ static void __send_queued(struct ceph_o
+  	struct ceph_osd_request *req, *tmp;
+  
+  	dout("__send_queued\n");
+ -	list_for_each_entry_safe(req, tmp, &osdc->req_unsent, r_req_lru_item) {
+ -		list_move_tail(&req->r_req_lru_item, &osdc->req_lru);
+ -		send_request(req);
+ -	}
+ +	list_for_each_entry_safe(req, tmp, &osdc->req_unsent, r_req_lru_item)
+ +		__send_request(osdc, req);
+  }
+  
++ static void maybe_request_map(struct ceph_osd_client *osdc)
++ {
++ 	bool continuous = false;
++ 
++ 	WARN_ON(!osdc->osdmap->epoch);
++ 
++ 	if (ceph_osdmap_flag(osdc->osdmap, CEPH_OSDMAP_FULL) ||
++ 	    ceph_osdmap_flag(osdc->osdmap, CEPH_OSDMAP_PAUSERD) ||
++ 	    ceph_osdmap_flag(osdc->osdmap, CEPH_OSDMAP_PAUSEWR)) {
++ 		dout("%s osdc %p continuous\n", __func__, osdc);
++ 		continuous = true;
++ 	} else {
++ 		dout("%s osdc %p onetime\n", __func__, osdc);
++ 	}
++ 
++ 	if (ceph_monc_want_map(&osdc->client->monc, CEPH_SUB_OSDMAP,
++ 			       osdc->osdmap->epoch + 1, continuous))
++ 		ceph_monc_renew_subs(&osdc->client->monc);
++ }
++ 
+  /*
+   * Caller should hold map_sem for read and request_mutex.
+   */
+@@@ -1862,49 -2120,52 +1905,61 @@@ static void handle_reply(struct ceph_os
+  	mutex_unlock(&osdc->request_mutex);
+  	up_read(&osdc->map_sem);
+  
+ -	if (done_request(req, &m)) {
+ -		if (already_acked && req->r_unsafe_callback) {
+ -			dout("req %p tid %llu safe-cb\n", req, req->r_tid);
+ -			req->r_unsafe_callback(req, false);
+ -		} else {
+ -			dout("req %p tid %llu cb\n", req, req->r_tid);
+ -			__complete_request(req);
+ -		}
+ -	} else {
+ -		if (req->r_unsafe_callback) {
+ -			dout("req %p tid %llu unsafe-cb\n", req, req->r_tid);
+ +	if (!already_completed) {
+ +		if (req->r_unsafe_callback &&
+ +		    result >= 0 && !(flags & CEPH_OSD_FLAG_ONDISK))
+  			req->r_unsafe_callback(req, true);
+ -		} else {
+ -			WARN_ON(1);
+ -		}
+ +		if (req->r_callback)
+ +			req->r_callback(req, msg);
+ +		else
+ +			complete_all(&req->r_completion);
+  	}
+ -	if (m.flags & CEPH_OSD_FLAG_ONDISK)
+ -		complete_all(&req->r_safe_completion);
+  
+ +	if (flags & CEPH_OSD_FLAG_ONDISK) {
+ +		if (req->r_unsafe_callback && already_completed)
+ +			req->r_unsafe_callback(req, false);
+ +		complete_request(req);
+ +	}
+ +
+ +out:
+ +	dout("req=%p req->r_linger=%d\n", req, req->r_linger);
+  	ceph_osdc_put_request(req);
+  	return;
+ +out_unlock:
+ +	mutex_unlock(&osdc->request_mutex);
+ +	up_read(&osdc->map_sem);
+ +	goto out;
+  
+ -fail_request:
+ +bad_put:
+  	req->r_result = -EIO;
+  	__unregister_request(osdc, req);
+ -	__complete_request(req);
+ -	complete_all(&req->r_safe_completion);
+ -out_put:
+ +	if (req->r_callback)
+ +		req->r_callback(req, msg);
+ +	else
+ +		complete_all(&req->r_completion);
+ +	complete_request(req);
+  	ceph_osdc_put_request(req);
+ -out_unlock:
+ +bad_mutex:
+  	mutex_unlock(&osdc->request_mutex);
+  	up_read(&osdc->map_sem);
+ +bad:
+ +	pr_err("corrupt osd_op_reply got %d %d\n",
+ +	       (int)msg->front.iov_len, le32_to_cpu(msg->hdr.front_len));
+ +	ceph_msg_dump(msg);
+  }
+  
++ static void set_pool_was_full(struct ceph_osd_client *osdc)
++ {
++ 	struct rb_node *n;
++ 
++ 	for (n = rb_first(&osdc->osdmap->pg_pools); n; n = rb_next(n)) {
++ 		struct ceph_pg_pool_info *pi =
++ 		    rb_entry(n, struct ceph_pg_pool_info, node);
++ 
++ 		pi->was_full = __pool_full(pi);
++ 	}
++ }
++ 
+  static void reset_changed_osds(struct ceph_osd_client *osdc)
+  {
+  	struct rb_node *p, *n;
+@@@ -2033,17 -2345,18 +2139,24 @@@ static int handle_one_map(struct ceph_o
+   */
+  void ceph_osdc_handle_map(struct ceph_osd_client *osdc, struct ceph_msg *msg)
+  {
+- 	void *p, *end, *next;
++ 	void *p = msg->front.iov_base;
++ 	void *const end = p + msg->front.iov_len;
+  	u32 nr_maps, maplen;
+  	u32 epoch;
+- 	struct ceph_osdmap *newmap = NULL, *oldmap;
+- 	int err;
+  	struct ceph_fsid fsid;
+- 	bool was_full;
++ 	bool handled_incremental = false;
++ 	bool was_pauserd, was_pausewr;
++ 	bool pauserd, pausewr;
++ 	int err;
+  
+++<<<<<<< HEAD
+ +	dout("handle_map have %u\n", osdc->osdmap ? osdc->osdmap->epoch : 0);
+ +	p = msg->front.iov_base;
+ +	end = p + msg->front.iov_len;
+++=======
++ 	dout("%s have %u\n", __func__, osdc->osdmap->epoch);
++ 	down_write(&osdc->map_sem);
+++>>>>>>> 42c1b1240326 (libceph: handle_one_map())
+  
+  	/* verify fsid */
+  	ceph_decode_need(&p, end, sizeof(fsid), bad);
+@@@ -2063,25 -2377,14 +2177,19 @@@
+  		epoch = ceph_decode_32(&p);
+  		maplen = ceph_decode_32(&p);
+  		ceph_decode_need(&p, end, maplen, bad);
+++<<<<<<< HEAD
+ +		next = p + maplen;
+ +		if (osdc->osdmap && osdc->osdmap->epoch+1 == epoch) {
+++=======
++ 		if (osdc->osdmap->epoch &&
++ 		    osdc->osdmap->epoch + 1 == epoch) {
+++>>>>>>> 42c1b1240326 (libceph: handle_one_map())
+  			dout("applying incremental map %u len %d\n",
+  			     epoch, maplen);
+- 			newmap = osdmap_apply_incremental(&p, next,
+- 							  osdc->osdmap);
+- 			if (IS_ERR(newmap)) {
+- 				err = PTR_ERR(newmap);
++ 			err = handle_one_map(osdc, p, p + maplen, true);
++ 			if (err)
+  				goto bad;
+- 			}
+- 			BUG_ON(!newmap);
+- 			if (newmap != osdc->osdmap) {
+- 				ceph_osdmap_destroy(osdc->osdmap);
+- 				osdc->osdmap = newmap;
+- 			}
+- 			was_full = was_full ||
+- 				ceph_osdmap_flag(osdc->osdmap,
+- 						 CEPH_OSDMAP_FULL);
+- 			kick_requests(osdc, 0, was_full);
++ 			handled_incremental = true;
+  		} else {
+  			dout("ignoring incremental map %u len %d\n",
+  			     epoch, maplen);
+@@@ -2133,12 -2420,7 +2225,15 @@@
+  		nr_maps--;
+  	}
+  
+ +	if (!osdc->osdmap)
+ +		goto bad;
+  done:
+++<<<<<<< HEAD
+ +	downgrade_write(&osdc->map_sem);
+ +	ceph_monc_got_osdmap(&osdc->client->monc, osdc->osdmap->epoch);
+ +
+++=======
+++>>>>>>> 42c1b1240326 (libceph: handle_one_map())
+  	/*
+  	 * subscribe to subsequent osdmap updates if full to ensure
+  	 * we find out when we are no longer full and stop returning
+* Unmerged path include/linux/ceph/mon_client.h
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index e8bf68758dc4..62e657f82ad4 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -44,6 +44,8 @@ struct ceph_pg_pool_info {
+ 	s64 write_tier; /* wins for read+write ops */
+ 	u64 flags; /* CEPH_POOL_FLAG_* */
+ 	char *name;
++
++	bool was_full;  /* for handle_one_map() */
+ };
+ 
+ static inline bool ceph_can_shift_osds(struct ceph_pg_pool_info *pool)
+diff --git a/net/ceph/mon_client.c b/net/ceph/mon_client.c
+index 5340ac9328bd..1350a5ee5bc1 100644
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@ -277,6 +277,14 @@ int ceph_monc_got_osdmap(struct ceph_mon_client *monc, u32 got)
+ 	return 0;
+ }
+ 
++void ceph_monc_renew_subs(struct ceph_mon_client *monc)
++{
++	mutex_lock(&monc->mutex);
++	__send_subscribe(monc);
++	mutex_unlock(&monc->mutex);
++}
++EXPORT_SYMBOL(ceph_monc_renew_subs);
++
+ /*
+  * Register interest in the next osdmap
+  */
+* Unmerged path net/ceph/osd_client.c
