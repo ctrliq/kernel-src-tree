@@ -1,0 +1,185 @@
+ipv6: support for fib route lwtunnel encap attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit 19e42e45150672124b6a4341e2bc7982d247f0ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/19e42e45.failed
+
+This patch adds support in ipv6 fib functions to parse Netlink
+RTA encap attributes and attach encap state data to rt6_info.
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 19e42e45150672124b6a4341e2bc7982d247f0ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_fib.c
+#	net/ipv6/route.c
+diff --cc net/ipv6/ip6_fib.c
+index f06e53333b5c,d715f2e0c4e7..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -161,10 -155,33 +162,36 @@@ static __inline__ void node_free(struc
+  	kmem_cache_free(fib6_node_kmem, fn);
+  }
+  
+ -static void rt6_free_pcpu(struct rt6_info *non_pcpu_rt)
+ +static __inline__ void rt6_release(struct rt6_info *rt)
+  {
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&rt->rt6i_ref))
+++=======
++ 	int cpu;
++ 
++ 	if (!non_pcpu_rt->rt6i_pcpu)
++ 		return;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct rt6_info **ppcpu_rt;
++ 		struct rt6_info *pcpu_rt;
++ 
++ 		ppcpu_rt = per_cpu_ptr(non_pcpu_rt->rt6i_pcpu, cpu);
++ 		pcpu_rt = *ppcpu_rt;
++ 		if (pcpu_rt) {
++ 			dst_free(&pcpu_rt->dst);
++ 			*ppcpu_rt = NULL;
++ 		}
++ 	}
++ }
++ 
++ static void rt6_release(struct rt6_info *rt)
++ {
++ 	if (atomic_dec_and_test(&rt->rt6i_ref)) {
++ 		lwtunnel_state_put(rt->rt6i_lwtstate);
++ 		rt6_free_pcpu(rt);
+++>>>>>>> 19e42e451506 (ipv6: support for fib route lwtunnel encap attributes)
+  		dst_free(&rt->dst);
+ -	}
+  }
+  
+  static void fib6_link_table(struct net *net, struct fib6_table *tb)
+diff --cc net/ipv6/route.c
+index 1b3524b3978c,b3431b79dfb1..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -1610,12 -1771,21 +1611,23 @@@ int ip6_route_add(struct fib6_config *c
+  
+  	rt->dst.output = ip6_output;
+  
++ 	if (cfg->fc_encap) {
++ 		struct lwtunnel_state *lwtstate;
++ 
++ 		err = lwtunnel_build_state(dev, cfg->fc_encap_type,
++ 					   cfg->fc_encap, &lwtstate);
++ 		if (err)
++ 			goto out;
++ 		lwtunnel_state_get(lwtstate);
++ 		rt->rt6i_lwtstate = lwtstate;
++ 	}
++ 
+  	ipv6_addr_prefix(&rt->rt6i_dst.addr, &cfg->fc_dst, cfg->fc_dst_len);
+  	rt->rt6i_dst.plen = cfg->fc_dst_len;
+ -	if (rt->rt6i_dst.plen == 128)
+ +	if (rt->rt6i_dst.plen == 128) {
+  		rt->dst.flags |= DST_HOST;
+ +		dst_metrics_set_force_overwrite(&rt->dst);
+ +	}
+  
+  #ifdef CONFIG_IPV6_SUBTREES
+  	ipv6_addr_prefix(&rt->rt6i_src.addr, &cfg->fc_src, cfg->fc_src_len);
+@@@ -2433,6 -2606,9 +2445,12 @@@ static const struct nla_policy rtm_ipv6
+  	[RTA_PRIORITY]          = { .type = NLA_U32 },
+  	[RTA_METRICS]           = { .type = NLA_NESTED },
+  	[RTA_MULTIPATH]		= { .len = sizeof(struct rtnexthop) },
+++<<<<<<< HEAD
+++=======
++ 	[RTA_PREF]              = { .type = NLA_U8 },
++ 	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
++ 	[RTA_ENCAP]		= { .type = NLA_NESTED },
+++>>>>>>> 19e42e451506 (ipv6: support for fib route lwtunnel encap attributes)
+  };
+  
+  static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@@ -2518,6 -2695,20 +2536,23 @@@
+  		cfg->fc_mp_len = nla_len(tb[RTA_MULTIPATH]);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (tb[RTA_PREF]) {
++ 		pref = nla_get_u8(tb[RTA_PREF]);
++ 		if (pref != ICMPV6_ROUTER_PREF_LOW &&
++ 		    pref != ICMPV6_ROUTER_PREF_HIGH)
++ 			pref = ICMPV6_ROUTER_PREF_MEDIUM;
++ 		cfg->fc_flags |= RTF_PREF(pref);
++ 	}
++ 
++ 	if (tb[RTA_ENCAP])
++ 		cfg->fc_encap = tb[RTA_ENCAP];
++ 
++ 	if (tb[RTA_ENCAP_TYPE])
++ 		cfg->fc_encap_type = nla_get_u16(tb[RTA_ENCAP_TYPE]);
++ 
+++>>>>>>> 19e42e451506 (ipv6: support for fib route lwtunnel encap attributes)
+  	err = 0;
+  errout:
+  	return err;
+@@@ -2621,7 -2820,9 +2660,13 @@@ static inline size_t rt6_nlmsg_size(str
+  	       + nla_total_size(4) /* RTA_PRIORITY */
+  	       + RTAX_MAX * nla_total_size(4) /* RTA_METRICS */
+  	       + nla_total_size(sizeof(struct rta_cacheinfo))
+++<<<<<<< HEAD
+ +	       + nla_total_size(TCP_CA_NAME_MAX); /* RTAX_CC_ALGO */
+++=======
++ 	       + nla_total_size(TCP_CA_NAME_MAX) /* RTAX_CC_ALGO */
++ 	       + nla_total_size(1) /* RTA_PREF */
++ 	       + lwtunnel_get_encap_size(rt->rt6i_lwtstate);
+++>>>>>>> 19e42e451506 (ipv6: support for fib route lwtunnel encap attributes)
+  }
+  
+  static int rt6_fill_node(struct net *net,
+@@@ -2762,7 -2967,13 +2807,17 @@@
+  	if (rtnl_put_cacheinfo(skb, &rt->dst, 0, expires, rt->dst.error) < 0)
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +	return nlmsg_end(skb, nlh);
+++=======
++ 	if (nla_put_u8(skb, RTA_PREF, IPV6_EXTRACT_PREF(rt->rt6i_flags)))
++ 		goto nla_put_failure;
++ 
++ 	lwtunnel_fill_encap(skb, rt->rt6i_lwtstate);
++ 
++ 	nlmsg_end(skb, nlh);
++ 	return 0;
+++>>>>>>> 19e42e451506 (ipv6: support for fib route lwtunnel encap attributes)
+  
+  nla_put_failure:
+  	nlmsg_cancel(skb, nlh);
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index 3a818e1c0aa8..2d475155c4b3 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -51,6 +51,8 @@ struct fib6_config {
+ 	struct nlattr	*fc_mp;
+ 
+ 	struct nl_info	fc_nlinfo;
++	struct nlattr	*fc_encap;
++	u16		fc_encap_type;
+ };
+ 
+ struct fib6_node {
+@@ -134,6 +136,7 @@ struct rt6_info {
+ 	unsigned short			rt6i_nfheader_len;
+ 
+ 	u8				rt6i_protocol;
++	struct lwtunnel_state		*rt6i_lwtstate;
+ };
+ 
+ static inline struct inet_peer *rt6_peer_ptr(struct rt6_info *rt)
+* Unmerged path net/ipv6/ip6_fib.c
+* Unmerged path net/ipv6/route.c
