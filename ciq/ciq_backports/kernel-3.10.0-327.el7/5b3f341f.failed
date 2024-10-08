@@ -1,0 +1,163 @@
+blk-mq: make plug work for mutiple disks and queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Shaohua Li <shli@fb.com>
+commit 5b3f341f098d60da2970758db6a05bd851eb6b39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5b3f341f.failed
+
+Last patch makes plug work for multiple queue case. However it only
+works for single disk case, because it assumes only one request in the
+plug list. If a task is accessing multiple disks, eg MD/DM, the
+assumption is wrong. Let blk_attempt_plug_merge() record request from
+the same queue.
+
+V2: use NULL parameter in !mq case. Fix a bug. Add comments in
+blk_attempt_plug_merge to make it less (hopefully) confusion.
+
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5b3f341f098d60da2970758db6a05bd851eb6b39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 5f9ca0666f29,31df47443699..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1201,6 -1267,9 +1201,12 @@@ static void blk_mq_make_request(struct 
+  	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	struct blk_map_ctx data;
+  	struct request *rq;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int request_count = 0;
++ 	struct blk_plug *plug;
++ 	struct request *same_queue_rq = NULL;
+++>>>>>>> 5b3f341f098d (blk-mq: make plug work for mutiple disks and queues)
+  
+  	blk_queue_bounce(q, &bio);
+  
+@@@ -1209,6 -1278,10 +1215,13 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!is_flush_fua && !blk_queue_nomerges(q) &&
++ 	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
++ 		return;
++ 
+++>>>>>>> 5b3f341f098d (blk-mq: make plug work for mutiple disks and queues)
+  	rq = blk_mq_map_request(q, bio, &data);
+  	if (unlikely(!rq))
+  		return;
+@@@ -1225,24 -1305,29 +1238,35 @@@
+  		blk_mq_bio_to_request(rq, bio);
+  
+  		/*
+ -		 * we do limited pluging. If bio can be merged, do merge.
+ -		 * Otherwise the existing request in the plug list will be
+ -		 * issued. So the plug list will have one request at most
+ +		 * For OK queue, we are done. For error, kill it. Any other
+ +		 * error (busy), just add it to our list as we previously
+ +		 * would have done
+  		 */
+++<<<<<<< HEAD
+ +		ret = q->mq_ops->queue_rq(data.hctx, rq, true);
+ +		if (ret == BLK_MQ_RQ_QUEUE_OK)
+ +			goto done;
+ +		else {
+ +			__blk_mq_requeue_request(rq);
+ +
+ +			if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
+ +				rq->errors = -EIO;
+ +				blk_mq_end_request(rq, rq->errors);
+ +				goto done;
+++=======
++ 		if (plug) {
++ 			/*
++ 			 * The plug list might get flushed before this. If that
++ 			 * happens, same_queue_rq is invalid and plug list is empty
++ 			 **/
++ 			if (same_queue_rq && !list_empty(&plug->mq_list)) {
++ 				old_rq = same_queue_rq;
++ 				list_del_init(&old_rq->queuelist);
+++>>>>>>> 5b3f341f098d (blk-mq: make plug work for mutiple disks and queues)
+  			}
+ -			list_add_tail(&rq->queuelist, &plug->mq_list);
+ -		} else /* is_sync */
+ -			old_rq = rq;
+ -		blk_mq_put_ctx(data.ctx);
+ -		if (!old_rq)
+ +			blk_mq_insert_request(rq, false, true, true);
+  			return;
+ -		if (!blk_mq_direct_issue_request(old_rq))
+ -			return;
+ -		blk_mq_insert_request(old_rq, false, true, true);
+ -		return;
+ +		}
+  	}
+  
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+diff --git a/block/blk-core.c b/block/blk-core.c
+index ffbfb47af131..ae380cb1f9af 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1517,7 +1517,8 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
+  * Caller must ensure !blk_queue_nomerges(q) beforehand.
+  */
+ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+-			    unsigned int *request_count)
++			    unsigned int *request_count,
++			    struct request **same_queue_rq)
+ {
+ 	struct blk_plug *plug;
+ 	struct request *rq;
+@@ -1537,8 +1538,16 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+ 	list_for_each_entry_reverse(rq, plug_list, queuelist) {
+ 		int el_ret;
+ 
+-		if (rq->q == q)
++		if (rq->q == q) {
+ 			(*request_count)++;
++			/*
++			 * Only blk-mq multiple hardware queues case checks the
++			 * rq in the same queue, there should be only one such
++			 * rq in a queue
++			 **/
++			if (same_queue_rq)
++				*same_queue_rq = rq;
++		}
+ 
+ 		if (rq->q != q || !blk_rq_merge_ok(rq, bio))
+ 			continue;
+@@ -1603,7 +1612,7 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
+ 	 * any locks.
+ 	 */
+ 	if (!blk_queue_nomerges(q) &&
+-	    blk_attempt_plug_merge(q, bio, &request_count))
++	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ 		return;
+ 
+ 	spin_lock_irq(q->queue_lock);
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk.h b/block/blk.h
+index e515a285d4c9..7720cd561d46 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -48,7 +48,8 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
+ bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
+ 			    struct bio *bio);
+ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+-			    unsigned int *request_count);
++			    unsigned int *request_count,
++			    struct request **same_queue_rq);
+ 
+ void blk_account_io_start(struct request *req, bool new_io);
+ void blk_account_io_completion(struct request *req, unsigned int bytes);
