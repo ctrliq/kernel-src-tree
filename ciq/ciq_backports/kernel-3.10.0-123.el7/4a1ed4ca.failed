@@ -1,0 +1,137 @@
+x86, pvticketlock: When paravirtualizing ticket locks, increment by 2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [virt] pvticketlock: When paravirtualizing ticket locks, increment by 2 (Rik van Riel) [970737]
+Rebuild_FUZZ: 96.24%
+commit-author Jeremy Fitzhardinge <jeremy@goop.org>
+commit 4a1ed4ca681e7df38ed1b609a11aab38cbc515b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4a1ed4ca.failed
+
+Increment ticket head/tails by 2 rather than 1 to leave the LSB free
+to store a "is in slowpath state" bit.  This halves the number
+of possible CPUs for a given ticket size, but this shouldn't matter
+in practice - kernels built for 32k+ CPU systems are probably
+specially built for the hardware rather than a generic distro
+kernel.
+
+	Signed-off-by: Jeremy Fitzhardinge <jeremy@goop.org>
+Link: http://lkml.kernel.org/r/1376058122-8248-9-git-send-email-raghavendra.kt@linux.vnet.ibm.com
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Tested-by: Attilio Rao <attilio.rao@citrix.com>
+	Signed-off-by: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+(cherry picked from commit 4a1ed4ca681e7df38ed1b609a11aab38cbc515b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/spinlock.h
+diff --cc arch/x86/include/asm/spinlock.h
+index 33692eaabab5,04a5cd5e97cb..000000000000
+--- a/arch/x86/include/asm/spinlock.h
++++ b/arch/x86/include/asm/spinlock.h
+@@@ -47,9 -76,9 +47,9 @@@
+   * in the high part, because a wide xadd increment of the low part would carry
+   * up and contaminate the high part.
+   */
+ -static __always_inline void arch_spin_lock(struct arch_spinlock *lock)
+ +static __always_inline void __ticket_spin_lock(arch_spinlock_t *lock)
+  {
+- 	register struct __raw_tickets inc = { .tail = 1 };
++ 	register struct __raw_tickets inc = { .tail = TICKET_LOCK_INC };
+  
+  	inc = xadd(&lock->tickets, inc);
+  
+@@@ -76,12 -110,15 +76,19 @@@ static __always_inline int __ticket_spi
+  	return cmpxchg(&lock->head_tail, old.head_tail, new.head_tail) == old.head_tail;
+  }
+  
+ -static __always_inline void arch_spin_unlock(arch_spinlock_t *lock)
+ +static __always_inline void __ticket_spin_unlock(arch_spinlock_t *lock)
+  {
+++<<<<<<< HEAD
+ +	__add(&lock->tickets.head, 1, UNLOCK_LOCK_PREFIX);
+++=======
++ 	__ticket_t next = lock->tickets.head + TICKET_LOCK_INC;
++ 
++ 	__add(&lock->tickets.head, TICKET_LOCK_INC, UNLOCK_LOCK_PREFIX);
++ 	__ticket_unlock_kick(lock, next);
+++>>>>>>> 4a1ed4ca681e (x86, pvticketlock: When paravirtualizing ticket locks, increment by 2)
+  }
+  
+ -static inline int arch_spin_is_locked(arch_spinlock_t *lock)
+ +static inline int __ticket_spin_is_locked(arch_spinlock_t *lock)
+  {
+  	struct __raw_tickets tmp = ACCESS_ONCE(lock->tickets);
+  
+@@@ -92,37 -129,10 +99,37 @@@ static inline int __ticket_spin_is_cont
+  {
+  	struct __raw_tickets tmp = ACCESS_ONCE(lock->tickets);
+  
+- 	return (__ticket_t)(tmp.tail - tmp.head) > 1;
++ 	return (__ticket_t)(tmp.tail - tmp.head) > TICKET_LOCK_INC;
+  }
+ +
+ +#ifndef CONFIG_PARAVIRT_SPINLOCKS
+ +
+ +static inline int arch_spin_is_locked(arch_spinlock_t *lock)
+ +{
+ +	return __ticket_spin_is_locked(lock);
+ +}
+ +
+ +static inline int arch_spin_is_contended(arch_spinlock_t *lock)
+ +{
+ +	return __ticket_spin_is_contended(lock);
+ +}
+  #define arch_spin_is_contended	arch_spin_is_contended
+  
+ +static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
+ +{
+ +	__ticket_spin_lock(lock);
+ +}
+ +
+ +static __always_inline int arch_spin_trylock(arch_spinlock_t *lock)
+ +{
+ +	return __ticket_spin_trylock(lock);
+ +}
+ +
+ +static __always_inline void arch_spin_unlock(arch_spinlock_t *lock)
+ +{
+ +	__ticket_spin_unlock(lock);
+ +}
+ +
+  static __always_inline void arch_spin_lock_flags(arch_spinlock_t *lock,
+  						  unsigned long flags)
+  {
+* Unmerged path arch/x86/include/asm/spinlock.h
+diff --git a/arch/x86/include/asm/spinlock_types.h b/arch/x86/include/asm/spinlock_types.h
+index ad0ad07fc006..32cd4ad915a5 100644
+--- a/arch/x86/include/asm/spinlock_types.h
++++ b/arch/x86/include/asm/spinlock_types.h
+@@ -7,7 +7,13 @@
+ 
+ #include <linux/types.h>
+ 
+-#if (CONFIG_NR_CPUS < 256)
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++#define __TICKET_LOCK_INC	2
++#else
++#define __TICKET_LOCK_INC	1
++#endif
++
++#if (CONFIG_NR_CPUS < (256 / __TICKET_LOCK_INC))
+ typedef u8  __ticket_t;
+ typedef u16 __ticketpair_t;
+ #else
+@@ -15,6 +21,8 @@ typedef u16 __ticket_t;
+ typedef u32 __ticketpair_t;
+ #endif
+ 
++#define TICKET_LOCK_INC	((__ticket_t)__TICKET_LOCK_INC)
++
+ #define TICKET_SHIFT	(sizeof(__ticket_t) * 8)
+ 
+ typedef struct arch_spinlock {
