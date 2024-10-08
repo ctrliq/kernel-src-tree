@@ -1,0 +1,224 @@
+net: add lower_dev_list to net_device and make a full mesh
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] add lower_dev_list to net_device and make a full mesh (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 95.50%
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 5d261913ca3daf6c2d21d38924235667b3d07c40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5d261913.failed
+
+This patch adds lower_dev_list list_head to net_device, which is the same
+as upper_dev_list, only for lower devices, and begins to use it in the same
+way as the upper list.
+
+It also changes the way the whole adjacent device lists work - now they
+contain *all* of upper/lower devices, not only the first level. The first
+level devices are distinguished by the bool neighbour field in
+netdev_adjacent, also added by this patch.
+
+There are cases when a device can be added several times to the adjacent
+list, the simplest would be:
+
+     /---- eth0.10 ---\
+eth0-		       --- bond0
+     \---- eth0.20 ---/
+
+where both bond0 and eth0 'see' each other in the adjacent lists two times.
+To avoid duplication of netdev_adjacent structures ref_nr is being kept as
+the number of times the device was added to the list.
+
+The 'full view' is achieved by adding, on link creation, all of the
+upper_dev's upper_dev_list devices as upper devices to all of the
+lower_dev's lower_dev_list devices (and to the lower_dev itself), and vice
+versa. On unlink they are removed using the same logic.
+
+I've tested it with thousands vlans/bonds/bridges, everything works ok and
+no observable lags even on a huge number of interfaces.
+
+Memory footprint for 128 devices interconnected with each other via both
+upper and lower (which is impossible, but for the comparison) lists would be:
+
+128*128*2*sizeof(netdev_adjacent) = 1.5MB
+
+but in the real world we usualy have at most several devices with slaves
+and a lot of vlans, so the footprint will be much lower.
+
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Eric Dumazet <edumazet@google.com>
+CC: Jiri Pirko <jiri@resnulli.us>
+CC: Alexander Duyck <alexander.h.duyck@intel.com>
+CC: Cong Wang <amwang@redhat.com>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5d261913ca3daf6c2d21d38924235667b3d07c40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 853d90c0f78c,2aa914eee057..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4645,22 -4680,76 +4809,86 @@@ static int __netdev_upper_dev_link(stru
+  	if (master && netdev_master_upper_dev_get(dev))
+  		return -EBUSY;
+  
+- 	upper = kmalloc(sizeof(*upper), GFP_KERNEL);
+- 	if (!upper)
+- 		return -ENOMEM;
++ 	ret = __netdev_adjacent_dev_link_neighbour(dev, upper_dev, master);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Now that we linked these devs, make all the upper_dev's
++ 	 * upper_dev_list visible to every dev's lower_dev_list and vice
++ 	 * versa, and don't forget the devices itself. All of these
++ 	 * links are non-neighbours.
++ 	 */
++ 	list_for_each_entry(i, &upper_dev->upper_dev_list, list) {
++ 		list_for_each_entry(j, &dev->lower_dev_list, list) {
++ 			ret = __netdev_adjacent_dev_link(i->dev, j->dev);
++ 			if (ret)
++ 				goto rollback_mesh;
++ 		}
++ 	}
+  
+- 	upper->dev = upper_dev;
+- 	upper->master = master;
+- 	INIT_LIST_HEAD(&upper->search_list);
++ 	/* add dev to every upper_dev's upper device */
++ 	list_for_each_entry(i, &upper_dev->upper_dev_list, list) {
++ 		ret = __netdev_adjacent_dev_link(dev, i->dev);
++ 		if (ret)
++ 			goto rollback_upper_mesh;
++ 	}
++ 
++ 	/* add upper_dev to every dev's lower device */
++ 	list_for_each_entry(i, &dev->lower_dev_list, list) {
++ 		ret = __netdev_adjacent_dev_link(i->dev, upper_dev);
++ 		if (ret)
++ 			goto rollback_lower_mesh;
++ 	}
+  
+++<<<<<<< HEAD
+ +	/* Ensure that master upper link is always the first item in list. */
+ +	if (master)
+ +		list_add_rcu(&upper->list, &dev->upper_dev_list);
+ +	else
+ +		list_add_tail_rcu(&upper->list, &dev->upper_dev_list);
+ +	dev_hold(upper_dev);
+ +
+++=======
++ 	call_netdevice_notifiers(NETDEV_CHANGEUPPER, dev);
+++>>>>>>> 5d261913ca3d (net: add lower_dev_list to net_device and make a full mesh)
+  	return 0;
++ 
++ rollback_lower_mesh:
++ 	to_i = i;
++ 	list_for_each_entry(i, &dev->lower_dev_list, list) {
++ 		if (i == to_i)
++ 			break;
++ 		__netdev_adjacent_dev_unlink(i->dev, upper_dev);
++ 	}
++ 
++ 	i = NULL;
++ 
++ rollback_upper_mesh:
++ 	to_i = i;
++ 	list_for_each_entry(i, &upper_dev->upper_dev_list, list) {
++ 		if (i == to_i)
++ 			break;
++ 		__netdev_adjacent_dev_unlink(dev, i->dev);
++ 	}
++ 
++ 	i = j = NULL;
++ 
++ rollback_mesh:
++ 	to_i = i;
++ 	to_j = j;
++ 	list_for_each_entry(i, &dev->lower_dev_list, list) {
++ 		list_for_each_entry(j, &upper_dev->upper_dev_list, list) {
++ 			if (i == to_i && j == to_j)
++ 				break;
++ 			__netdev_adjacent_dev_unlink(i->dev, j->dev);
++ 		}
++ 		if (i == to_i)
++ 			break;
++ 	}
++ 
++ 	__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 
++ 	return ret;
+  }
+  
+  /**
+@@@ -4709,16 -4798,29 +4937,38 @@@ EXPORT_SYMBOL(netdev_master_upper_dev_l
+  void netdev_upper_dev_unlink(struct net_device *dev,
+  			     struct net_device *upper_dev)
+  {
+- 	struct netdev_adjacent *upper;
+- 
++ 	struct netdev_adjacent *i, *j;
+  	ASSERT_RTNL();
+  
+++<<<<<<< HEAD
+ +	upper = __netdev_find_upper(dev, upper_dev);
+ +	if (!upper)
+ +		return;
+ +	list_del_rcu(&upper->list);
+ +	dev_put(upper_dev);
+ +	kfree_rcu(upper, rcu);
+++=======
++ 	__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 
++ 	/* Here is the tricky part. We must remove all dev's lower
++ 	 * devices from all upper_dev's upper devices and vice
++ 	 * versa, to maintain the graph relationship.
++ 	 */
++ 	list_for_each_entry(i, &dev->lower_dev_list, list)
++ 		list_for_each_entry(j, &upper_dev->upper_dev_list, list)
++ 			__netdev_adjacent_dev_unlink(i->dev, j->dev);
++ 
++ 	/* remove also the devices itself from lower/upper device
++ 	 * list
++ 	 */
++ 	list_for_each_entry(i, &dev->lower_dev_list, list)
++ 		__netdev_adjacent_dev_unlink(i->dev, upper_dev);
++ 
++ 	list_for_each_entry(i, &upper_dev->upper_dev_list, list)
++ 		__netdev_adjacent_dev_unlink(dev, i->dev);
++ 
++ 	call_netdevice_notifiers(NETDEV_CHANGEUPPER, dev);
+++>>>>>>> 5d261913ca3d (net: add lower_dev_list to net_device and make a full mesh)
+  }
+  EXPORT_SYMBOL(netdev_upper_dev_unlink);
+  
+@@@ -6041,7 -6080,8 +6291,12 @@@ struct net_device *alloc_netdev_mqs(in
+  	INIT_LIST_HEAD(&dev->unreg_list);
+  	INIT_LIST_HEAD(&dev->link_watch_list);
+  	INIT_LIST_HEAD(&dev->upper_dev_list);
+++<<<<<<< HEAD
+ +	dev->priv_flags = IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM;
+++=======
++ 	INIT_LIST_HEAD(&dev->lower_dev_list);
++ 	dev->priv_flags = IFF_XMIT_DST_RELEASE;
+++>>>>>>> 5d261913ca3d (net: add lower_dev_list to net_device and make a full mesh)
+  	setup(dev);
+  
+  	dev->num_tx_queues = txqs;
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 7b10147de03d..dc356151ac4e 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1318,6 +1318,7 @@ struct net_device {
+ 	struct list_head	napi_list;
+ 	struct list_head	unreg_list;
+ 	struct list_head	upper_dev_list; /* List of upper devices */
++	struct list_head	lower_dev_list;
+ 
+ 
+ 	/* currently active device features */
+* Unmerged path net/core/dev.c
