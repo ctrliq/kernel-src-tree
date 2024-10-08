@@ -1,0 +1,314 @@
+netfilter: nf_tables: variable sized set element keys / data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 7d7402642eaf385aef0772eff5a35e34fc4995d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7d740264.failed
+
+This patch changes sets to support variable sized set element keys / data
+up to 64 bytes each by using variable sized set extensions. This allows
+to use concatenations with bigger data items suchs as IPv6 addresses.
+
+As a side effect, small keys/data now don't require the full 16 bytes
+of struct nft_data anymore but just the space they need.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 7d7402642eaf385aef0772eff5a35e34fc4995d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_hash.c
+#	net/netfilter/nft_rbtree.c
+diff --cc include/net/netfilter/nf_tables.h
+index 4ab50d820db0,cb42da1011ef..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -137,19 -154,15 +137,27 @@@ struct nft_userdata 
+  /**
+   *	struct nft_set_elem - generic representation of set elements
+   *
+ + *	@cookie: implementation specific element cookie
+   *	@key: element key
+ - *	@priv: element private data and extensions
+ + *	@data: element data (maps only)
+ + *	@flags: element flags (end of interval)
+ + *
+ + *	The cookie can be used to store a handle to the element for subsequent
+ + *	removal.
+   */
+  struct nft_set_elem {
+++<<<<<<< HEAD
+ +	void			*cookie;
+ +	struct nft_data		key;
+ +	struct nft_data		data;
+ +	u32			flags;
+++=======
++ 	union {
++ 		u32		buf[NFT_DATA_VALUE_MAXLEN / sizeof(u32)];
++ 		struct nft_data	val;
++ 	} key;
++ 	void			*priv;
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  };
+  
+  struct nft_set;
+diff --cc net/netfilter/nf_tables_api.c
+index 399ca83793bb,ed0e70ea2bc5..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3191,19 -3287,33 +3188,42 @@@ static int nft_add_set_elem(struct nft_
+  			return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = nft_data_init(ctx, &elem.key, &d1, nla[NFTA_SET_ELEM_KEY]);
+++=======
++ 	timeout = 0;
++ 	if (nla[NFTA_SET_ELEM_TIMEOUT] != NULL) {
++ 		if (!(set->flags & NFT_SET_TIMEOUT))
++ 			return -EINVAL;
++ 		timeout = be64_to_cpu(nla_get_be64(nla[NFTA_SET_ELEM_TIMEOUT]));
++ 	} else if (set->flags & NFT_SET_TIMEOUT) {
++ 		timeout = set->timeout;
++ 	}
++ 
++ 	err = nft_data_init(ctx, &elem.key.val, sizeof(elem.key), &d1,
++ 			    nla[NFTA_SET_ELEM_KEY]);
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  	if (err < 0)
+  		goto err1;
+  	err = -EINVAL;
+  	if (d1.type != NFT_DATA_VALUE || d1.len != set->klen)
+  		goto err2;
+  
+++<<<<<<< HEAD
+ +	err = -EEXIST;
+ +	if (set->ops->get(set, &elem) == 0)
+ +		goto err2;
+++=======
++ 	nft_set_ext_add_length(&tmpl, NFT_SET_EXT_KEY, d1.len);
++ 	if (timeout > 0) {
++ 		nft_set_ext_add(&tmpl, NFT_SET_EXT_EXPIRATION);
++ 		if (timeout != set->timeout)
++ 			nft_set_ext_add(&tmpl, NFT_SET_EXT_TIMEOUT);
++ 	}
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  
+  	if (nla[NFTA_SET_ELEM_DATA] != NULL) {
+ -		err = nft_data_init(ctx, &data, sizeof(data), &d2,
+ -				    nla[NFTA_SET_ELEM_DATA]);
+ +		err = nft_data_init(ctx, &elem.data, &d2, nla[NFTA_SET_ELEM_DATA]);
+  		if (err < 0)
+  			goto err2;
+  
+@@@ -3227,6 -3338,35 +3247,38 @@@
+  			if (err < 0)
+  				goto err3;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		nft_set_ext_add_length(&tmpl, NFT_SET_EXT_DATA, d2.len);
++ 	}
++ 
++ 	/* The full maximum length of userdata can exceed the maximum
++ 	 * offset value (U8_MAX) for following extensions, therefor it
++ 	 * must be the last extension added.
++ 	 */
++ 	ulen = 0;
++ 	if (nla[NFTA_SET_ELEM_USERDATA] != NULL) {
++ 		ulen = nla_len(nla[NFTA_SET_ELEM_USERDATA]);
++ 		if (ulen > 0)
++ 			nft_set_ext_add_length(&tmpl, NFT_SET_EXT_USERDATA,
++ 					       ulen);
++ 	}
++ 
++ 	err = -ENOMEM;
++ 	elem.priv = nft_set_elem_init(set, &tmpl, elem.key.val.data, data.data,
++ 				      timeout, GFP_KERNEL);
++ 	if (elem.priv == NULL)
++ 		goto err3;
++ 
++ 	ext = nft_set_elem_ext(set, elem.priv);
++ 	if (flags)
++ 		*nft_set_ext_flags(ext) = flags;
++ 	if (ulen > 0) {
++ 		udata = nft_set_ext_userdata(ext);
++ 		udata->len = ulen - 1;
++ 		nla_memcpy(&udata->data, nla[NFTA_SET_ELEM_USERDATA], ulen);
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  	}
+  
+  	trans = nft_trans_elem_alloc(ctx, NFT_MSG_NEWSETELEM, set);
+@@@ -3241,13 -3382,15 +3293,13 @@@
+  	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+  	return 0;
+  
+ -err5:
+ -	kfree(trans);
+  err4:
+ -	kfree(elem.priv);
+ +	kfree(trans);
+  err3:
+  	if (nla[NFTA_SET_ELEM_DATA] != NULL)
+ -		nft_data_uninit(&data, d2.type);
+ +		nft_data_uninit(&elem.data, d2.type);
+  err2:
+- 	nft_data_uninit(&elem.key, d1.type);
++ 	nft_data_uninit(&elem.key.val, d1.type);
+  err1:
+  	return err;
+  }
+@@@ -3310,7 -3457,8 +3362,12 @@@ static int nft_del_setelem(struct nft_c
+  	if (nla[NFTA_SET_ELEM_KEY] == NULL)
+  		goto err1;
+  
+++<<<<<<< HEAD
+ +	err = nft_data_init(ctx, &elem.key, &desc, nla[NFTA_SET_ELEM_KEY]);
+++=======
++ 	err = nft_data_init(ctx, &elem.key.val, sizeof(elem.key), &desc,
++ 			    nla[NFTA_SET_ELEM_KEY]);
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  	if (err < 0)
+  		goto err1;
+  
+@@@ -3331,8 -3475,17 +3388,8 @@@
+  	nft_trans_elem(trans) = elem;
+  	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+  	return 0;
+ -
+ -err3:
+ -	kfree(trans);
+  err2:
+- 	nft_data_uninit(&elem.key, desc.type);
++ 	nft_data_uninit(&elem.key.val, desc.type);
+  err1:
+  	return err;
+  }
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,3f9d45d3d9b7..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -46,37 -92,85 +46,71 @@@ static bool nft_hash_lookup(const struc
+  static int nft_hash_insert(const struct nft_set *set,
+  			   const struct nft_set_elem *elem)
+  {
+++<<<<<<< HEAD
+ +	struct rhashtable *priv = nft_set_priv(set);
+ +	struct nft_hash_elem *he;
+ +	unsigned int size;
+++=======
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he = elem->priv;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = elem->key.val.data,
++ 	};
++ 
++ 	return rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
++ 					    nft_hash_params);
++ }
++ 
++ static void nft_hash_activate(const struct nft_set *set,
++ 			      const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash_elem *he = elem->priv;
++ 
++ 	nft_set_elem_change_active(set, &he->ext);
++ 	nft_set_elem_clear_busy(&he->ext);
++ }
++ 
++ static void *nft_hash_deactivate(const struct nft_set *set,
++ 				 const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = elem->key.val.data,
++ 	};
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  
+ -	rcu_read_lock();
+ -	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ -	if (he != NULL) {
+ -		if (!nft_set_elem_mark_busy(&he->ext))
+ -			nft_set_elem_change_active(set, &he->ext);
+ -		else
+ -			he = NULL;
+ -	}
+ -	rcu_read_unlock();
+ +	if (elem->flags != 0)
+ +		return -EINVAL;
+ +
+ +	size = sizeof(*he);
+ +	if (set->flags & NFT_SET_MAP)
+ +		size += sizeof(he->data[0]);
+ +
+ +	he = kzalloc(size, GFP_KERNEL);
+ +	if (he == NULL)
+ +		return -ENOMEM;
+ +
+ +	nft_data_copy(&he->key, &elem->key);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_copy(he->data, &elem->data);
+  
+ -	return he;
+ +	rhashtable_insert(priv, &he->node);
+ +
+ +	return 0;
+ +}
+ +
+ +static void nft_hash_elem_destroy(const struct nft_set *set,
+ +				  struct nft_hash_elem *he)
+ +{
+ +	nft_data_uninit(&he->key, NFT_DATA_VALUE);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_uninit(he->data, set->dtype);
+ +	kfree(he);
+  }
+  
+  static void nft_hash_remove(const struct nft_set *set,
+diff --cc net/netfilter/nft_rbtree.c
+index 2c75361077f7,1c30f41cff5b..000000000000
+--- a/net/netfilter/nft_rbtree.c
++++ b/net/netfilter/nft_rbtree.c
+@@@ -162,7 -152,8 +162,12 @@@ static int nft_rbtree_get(const struct 
+  	while (parent != NULL) {
+  		rbe = rb_entry(parent, struct nft_rbtree_elem, node);
+  
+++<<<<<<< HEAD
+ +		d = nft_data_cmp(&rbe->key, &elem->key, set->klen);
+++=======
++ 		d = memcmp(nft_set_ext_key(&rbe->ext), &elem->key.val,
++ 					   set->klen);
+++>>>>>>> 7d7402642eaf (netfilter: nf_tables: variable sized set element keys / data)
+  		if (d < 0)
+  			parent = parent->rb_left;
+  		else if (d > 0)
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index 971d245e7378..24a4b4f58c9d 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -353,6 +353,9 @@ enum nft_data_attributes {
+ };
+ #define NFTA_DATA_MAX		(__NFTA_DATA_MAX - 1)
+ 
++/* Maximum length of a value */
++#define NFT_DATA_VALUE_MAXLEN	64
++
+ /**
+  * enum nft_verdict_attributes - nf_tables verdict netlink attributes
+  *
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_hash.c
+* Unmerged path net/netfilter/nft_rbtree.c
