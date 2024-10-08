@@ -1,0 +1,168 @@
+PCI: Keep individual VF BAR size in struct pci_sriov
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Wei Yang <weiyang@linux.vnet.ibm.com>
+commit 0e6c9122a6ec96d19f1db61e9750287d86b6829c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0e6c9122.failed
+
+Currently we don't store the individual VF BAR size.  We calculate it when
+needed by dividing the PF's IOV resource size (which contains space for
+*all* the VFs) by total_VFs or by reading the BAR in the SR-IOV capability
+again.
+
+Keep the individual VF BAR size in struct pci_sriov.barsz[], add
+pci_iov_resource_size() to retrieve it, and use that instead of doing the
+division or reading the SR-IOV capability BAR.
+
+[bhelgaas: rename to "barsz[]", simplify barsz[] index computation, remove
+SR-IOV capability BAR sizing]
+	Signed-off-by: Wei Yang <weiyang@linux.vnet.ibm.com>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 0e6c9122a6ec96d19f1db61e9750287d86b6829c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci.h
+diff --cc drivers/pci/pci.h
+index f90671e34816,57329645dd01..000000000000
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@@ -239,8 -247,7 +239,12 @@@ struct pci_sriov 
+  	struct pci_dev *dev;	/* lowest numbered PF */
+  	struct pci_dev *self;	/* this PF */
+  	struct mutex lock;	/* lock for VF bus */
+++<<<<<<< HEAD
+ +	struct work_struct mtask; /* Obsolete as of RHEL7.1 */
+ +	u8 __iomem *mstate;	/* Obsolete as of RHEL7.1 */
+++=======
++ 	resource_size_t barsz[PCI_SRIOV_NUM_BARS];	/* VF BAR size */
+++>>>>>>> 0e6c9122a6ec (PCI: Keep individual VF BAR size in struct pci_sriov)
+  };
+  
+  #ifdef CONFIG_PCI_ATS
+diff --git a/drivers/pci/iov.c b/drivers/pci/iov.c
+index a413b0e05038..06f092cc02fd 100644
+--- a/drivers/pci/iov.c
++++ b/drivers/pci/iov.c
+@@ -57,6 +57,14 @@ static void virtfn_remove_bus(struct pci_bus *physbus, struct pci_bus *virtbus)
+ 		pci_remove_bus(virtbus);
+ }
+ 
++resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno)
++{
++	if (!dev->is_physfn)
++		return 0;
++
++	return dev->sriov->barsz[resno - PCI_IOV_RESOURCES];
++}
++
+ static int virtfn_add(struct pci_dev *dev, int id, int reset)
+ {
+ 	int i;
+@@ -92,8 +100,7 @@ static int virtfn_add(struct pci_dev *dev, int id, int reset)
+ 			continue;
+ 		virtfn->resource[i].name = pci_name(virtfn);
+ 		virtfn->resource[i].flags = res->flags;
+-		size = resource_size(res);
+-		do_div(size, iov->total_VFs);
++		size = pci_iov_resource_size(dev, i + PCI_IOV_RESOURCES);
+ 		virtfn->resource[i].start = res->start + size * id;
+ 		virtfn->resource[i].end = virtfn->resource[i].start + size - 1;
+ 		rc = request_resource(res, &virtfn->resource[i]);
+@@ -308,7 +315,7 @@ static void sriov_disable(struct pci_dev *dev)
+ 
+ static int sriov_init(struct pci_dev *dev, int pos)
+ {
+-	int i;
++	int i, bar64;
+ 	int rc;
+ 	int nres;
+ 	u32 pgsz;
+@@ -357,29 +364,29 @@ found:
+ 	pgsz &= ~(pgsz - 1);
+ 	pci_write_config_dword(dev, pos + PCI_SRIOV_SYS_PGSIZE, pgsz);
+ 
++	iov = kzalloc(sizeof(*iov), GFP_KERNEL);
++	if (!iov)
++		return -ENOMEM;
++
+ 	nres = 0;
+ 	for (i = 0; i < PCI_SRIOV_NUM_BARS; i++) {
+ 		res = dev->resource + PCI_IOV_RESOURCES + i;
+-		i += __pci_read_base(dev, pci_bar_unknown, res,
+-				     pos + PCI_SRIOV_BAR + i * 4);
++		bar64 = __pci_read_base(dev, pci_bar_unknown, res,
++					pos + PCI_SRIOV_BAR + i * 4);
+ 		if (!res->flags)
+ 			continue;
+ 		if (resource_size(res) & (PAGE_SIZE - 1)) {
+ 			rc = -EIO;
+ 			goto failed;
+ 		}
++		iov->barsz[i] = resource_size(res);
+ 		res->end = res->start + resource_size(res) * total - 1;
+ 		dev_info(&dev->dev, "VF(n) BAR%d space: %pR (contains BAR%d for %d VFs)\n",
+ 			 i, res, i, total);
++		i += bar64;
+ 		nres++;
+ 	}
+ 
+-	iov = kzalloc(sizeof(*iov), GFP_KERNEL);
+-	if (!iov) {
+-		rc = -ENOMEM;
+-		goto failed;
+-	}
+-
+ 	iov->pos = pos;
+ 	iov->nres = nres;
+ 	iov->ctrl = ctrl;
+@@ -411,6 +418,7 @@ failed:
+ 		res->flags = 0;
+ 	}
+ 
++	kfree(iov);
+ 	return rc;
+ }
+ 
+@@ -507,14 +515,7 @@ int pci_iov_resource_bar(struct pci_dev *dev, int resno)
+  */
+ resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno)
+ {
+-	struct resource tmp;
+-	int reg = pci_iov_resource_bar(dev, resno);
+-
+-	if (!reg)
+-		return 0;
+-
+-	 __pci_read_base(dev, pci_bar_unknown, &tmp, reg);
+-	return resource_alignment(&tmp);
++	return pci_iov_resource_size(dev, resno);
+ }
+ 
+ /**
+* Unmerged path drivers/pci/pci.h
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index be12434c750f..155b78edd733 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1647,6 +1647,7 @@ int pci_num_vf(struct pci_dev *dev);
+ int pci_vfs_assigned(struct pci_dev *dev);
+ int pci_sriov_set_totalvfs(struct pci_dev *dev, u16 numvfs);
+ int pci_sriov_get_totalvfs(struct pci_dev *dev);
++resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno);
+ #else
+ static inline int pci_enable_sriov(struct pci_dev *dev, int nr_virtfn)
+ { return -ENODEV; }
+@@ -1658,6 +1659,8 @@ static inline int pci_sriov_set_totalvfs(struct pci_dev *dev, u16 numvfs)
+ { return 0; }
+ static inline int pci_sriov_get_totalvfs(struct pci_dev *dev)
+ { return 0; }
++static inline resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno)
++{ return 0; }
+ #endif
+ 
+ #if defined(CONFIG_HOTPLUG_PCI) || defined(CONFIG_HOTPLUG_PCI_MODULE)
