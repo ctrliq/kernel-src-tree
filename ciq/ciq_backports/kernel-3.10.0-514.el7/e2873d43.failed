@@ -1,0 +1,117 @@
+ixgbe: Fix ATR so that it correctly handles IPv6 extension headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit e2873d43f9c607e9d855b8ae120d5990ba1722df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e2873d43.failed
+
+The ATR code was assuming that it would be able to use tcp_hdr for
+every TCP frame that came through.  However this isn't the case as it
+is possible for a frame to arrive that is TCP but sent through something
+like a raw socket.  As a result the driver was setting up bad filters in
+which tcp_hdr was really pointing to the network header so the data was
+all invalid.
+
+In order to correct this I have added a bit of parsing logic that will
+determine the TCP header location based off of the network header and
+either the offset in the case of the IPv4 header, or a walk through the
+IPv6 extension headers until it encounters the header that indicates
+IPPROTO_TCP.  In addition I have added checks to verify that the lowest
+protocol provided is recognized as IPv4 or IPv6 to help mitigate raw
+sockets using ETH_P_ALL from having ATR applied to them.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit e2873d43f9c607e9d855b8ae120d5990ba1722df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index f19dfa0e85cb,ee81618bb9f0..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -7109,7 -7558,10 +7109,13 @@@ static void ixgbe_atr(struct ixgbe_rin
+  		struct ipv6hdr *ipv6;
+  	} hdr;
+  	struct tcphdr *th;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int hlen;
++ 	struct sk_buff *skb;
+++>>>>>>> e2873d43f9c6 (ixgbe: Fix ATR so that it correctly handles IPv6 extension headers)
+  	__be16 vlan_id;
++ 	int l4_proto;
+  
+  	/* if ring doesn't have a interrupt vector, cannot perform ATR */
+  	if (!q_vector)
+@@@ -7121,20 -7573,50 +7127,61 @@@
+  
+  	ring->atr_count++;
+  
++ 	/* currently only IPv4/IPv6 with TCP is supported */
++ 	if ((first->protocol != htons(ETH_P_IP)) &&
++ 	    (first->protocol != htons(ETH_P_IPV6)))
++ 		return;
++ 
+  	/* snag network header to get L4 type and address */
+++<<<<<<< HEAD
+ +	hdr.network = skb_network_header(first->skb);
+ +
+ +	/* Currently only IPv4/IPv6 with TCP is supported */
+ +	if ((first->protocol != htons(ETH_P_IPV6) ||
+ +	     hdr.ipv6->nexthdr != IPPROTO_TCP) &&
+ +	    (first->protocol != htons(ETH_P_IP) ||
+ +	     hdr.ipv4->protocol != IPPROTO_TCP))
+++=======
++ 	skb = first->skb;
++ 	hdr.network = skb_network_header(skb);
++ #ifdef CONFIG_IXGBE_VXLAN
++ 	if (skb->encapsulation &&
++ 	    first->protocol == htons(ETH_P_IP) &&
++ 	    hdr.ipv4->protocol != IPPROTO_UDP) {
++ 		struct ixgbe_adapter *adapter = q_vector->adapter;
++ 
++ 		/* verify the port is recognized as VXLAN */
++ 		if (adapter->vxlan_port &&
++ 		    udp_hdr(skb)->dest == adapter->vxlan_port)
++ 			hdr.network = skb_inner_network_header(skb);
++ 	}
++ #endif /* CONFIG_IXGBE_VXLAN */
++ 
++ 	/* Currently only IPv4/IPv6 with TCP is supported */
++ 	switch (hdr.ipv4->version) {
++ 	case IPVERSION:
++ 		/* access ihl as u8 to avoid unaligned access on ia64 */
++ 		hlen = (hdr.network[0] & 0x0F) << 2;
++ 		l4_proto = hdr.ipv4->protocol;
++ 		break;
++ 	case 6:
++ 		hlen = hdr.network - skb->data;
++ 		l4_proto = ipv6_find_hdr(skb, &hlen, IPPROTO_TCP, NULL, NULL);
++ 		hlen -= hdr.network - skb->data;
++ 		break;
++ 	default:
+++>>>>>>> e2873d43f9c6 (ixgbe: Fix ATR so that it correctly handles IPv6 extension headers)
+  		return;
+ -	}
+ +
+ +	th = tcp_hdr(first->skb);
+  
+- 	/* skip this packet since it is invalid or the socket is closing */
+- 	if (!th || th->fin)
++ 	if (l4_proto != IPPROTO_TCP)
++ 		return;
++ 
++ 	th = (struct tcphdr *)(hdr.network + hlen);
++ 
++ 	/* skip this packet since the socket is closing */
++ 	if (th->fin)
+  		return;
+  
+  	/* sample on all syn packets or once every atr sample count */
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
