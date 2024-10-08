@@ -1,0 +1,173 @@
+xprtrdma: Refactor reply handler error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b0e178a2d8ad4bd6c6bbf5d3f3cf50ca8907581b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b0e178a2.failed
+
+Clean up: The error cases in rpcrdma_reply_handler() almost never
+execute. Ensure the compiler places them out of the hot path.
+
+No behavior change expected.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Devesh Sharma <devesh.sharma@avagotech.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b0e178a2d8ad4bd6c6bbf5d3f3cf50ca8907581b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 6115ededb593,a60b4c4d9886..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -278,8 -224,8 +278,13 @@@ out_schedule
+  out_fail:
+  	if (wc->status != IB_WC_WR_FLUSH_ERR)
+  		pr_err("RPC:       %s: rep %p: %s\n",
+++<<<<<<< HEAD
+ +		       __func__, rep, COMPLETION_MSG(wc->status));
+ +	rep->rr_len = ~0U;
+++=======
++ 		       __func__, rep, ib_wc_status_msg(wc->status));
++ 	rep->rr_len = RPCRDMA_BAD_LEN;
+++>>>>>>> b0e178a2d8ad (xprtrdma: Refactor reply handler error handling)
+  	goto out_schedule;
+  }
+  
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index cbbf36c8c6ad..c06abed168a8 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -759,52 +759,27 @@ rpcrdma_reply_handler(struct rpcrdma_rep *rep)
+ 	unsigned long cwnd;
+ 	u32 credits;
+ 
+-	/* Check status. If bad, signal disconnect and return rep to pool */
+-	if (rep->rr_len == ~0U) {
+-		rpcrdma_recv_buffer_put(rep);
+-		if (r_xprt->rx_ep.rep_connected == 1) {
+-			r_xprt->rx_ep.rep_connected = -EIO;
+-			rpcrdma_conn_func(&r_xprt->rx_ep);
+-		}
+-		return;
+-	}
+-	if (rep->rr_len < RPCRDMA_HDRLEN_MIN) {
+-		dprintk("RPC:       %s: short/invalid reply\n", __func__);
+-		goto repost;
+-	}
++	dprintk("RPC:       %s: incoming rep %p\n", __func__, rep);
++
++	if (rep->rr_len == RPCRDMA_BAD_LEN)
++		goto out_badstatus;
++	if (rep->rr_len < RPCRDMA_HDRLEN_MIN)
++		goto out_shortreply;
++
+ 	headerp = rdmab_to_msg(rep->rr_rdmabuf);
+-	if (headerp->rm_vers != rpcrdma_version) {
+-		dprintk("RPC:       %s: invalid version %d\n",
+-			__func__, be32_to_cpu(headerp->rm_vers));
+-		goto repost;
+-	}
++	if (headerp->rm_vers != rpcrdma_version)
++		goto out_badversion;
+ 
+ 	/* Get XID and try for a match. */
+ 	spin_lock(&xprt->transport_lock);
+ 	rqst = xprt_lookup_rqst(xprt, headerp->rm_xid);
+-	if (rqst == NULL) {
+-		spin_unlock(&xprt->transport_lock);
+-		dprintk("RPC:       %s: reply 0x%p failed "
+-			"to match any request xid 0x%08x len %d\n",
+-			__func__, rep, be32_to_cpu(headerp->rm_xid),
+-			rep->rr_len);
+-repost:
+-		r_xprt->rx_stats.bad_reply_count++;
+-		if (rpcrdma_ep_post_recv(&r_xprt->rx_ia, &r_xprt->rx_ep, rep))
+-			rpcrdma_recv_buffer_put(rep);
+-
+-		return;
+-	}
++	if (!rqst)
++		goto out_nomatch;
+ 
+ 	/* get request object */
+ 	req = rpcr_to_rdmar(rqst);
+-	if (req->rl_reply) {
+-		spin_unlock(&xprt->transport_lock);
+-		dprintk("RPC:       %s: duplicate reply 0x%p to RPC "
+-			"request 0x%p: xid 0x%08x\n", __func__, rep, req,
+-			be32_to_cpu(headerp->rm_xid));
+-		goto repost;
+-	}
++	if (req->rl_reply)
++		goto out_duplicate;
+ 
+ 	dprintk("RPC:       %s: reply 0x%p completes request 0x%p\n"
+ 		"                   RPC request 0x%p xid 0x%08x\n",
+@@ -901,8 +876,44 @@ badheader:
+ 	if (xprt->cwnd > cwnd)
+ 		xprt_release_rqst_cong(rqst->rq_task);
+ 
++	xprt_complete_rqst(rqst->rq_task, status);
++	spin_unlock(&xprt->transport_lock);
+ 	dprintk("RPC:       %s: xprt_complete_rqst(0x%p, 0x%p, %d)\n",
+ 			__func__, xprt, rqst, status);
+-	xprt_complete_rqst(rqst->rq_task, status);
++	return;
++
++out_badstatus:
++	rpcrdma_recv_buffer_put(rep);
++	if (r_xprt->rx_ep.rep_connected == 1) {
++		r_xprt->rx_ep.rep_connected = -EIO;
++		rpcrdma_conn_func(&r_xprt->rx_ep);
++	}
++	return;
++
++out_shortreply:
++	dprintk("RPC:       %s: short/invalid reply\n", __func__);
++	goto repost;
++
++out_badversion:
++	dprintk("RPC:       %s: invalid version %d\n",
++		__func__, be32_to_cpu(headerp->rm_vers));
++	goto repost;
++
++out_nomatch:
++	spin_unlock(&xprt->transport_lock);
++	dprintk("RPC:       %s: no match for incoming xid 0x%08x len %d\n",
++		__func__, be32_to_cpu(headerp->rm_xid),
++		rep->rr_len);
++	goto repost;
++
++out_duplicate:
+ 	spin_unlock(&xprt->transport_lock);
++	dprintk("RPC:       %s: "
++		"duplicate reply %p to RPC request %p: xid 0x%08x\n",
++		__func__, rep, req, be32_to_cpu(headerp->rm_xid));
++
++repost:
++	r_xprt->rx_stats.bad_reply_count++;
++	if (rpcrdma_ep_post_recv(&r_xprt->rx_ia, &r_xprt->rx_ep, rep))
++		rpcrdma_recv_buffer_put(rep);
+ }
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index b2d2c86a7023..bc78f1a2a5cf 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -175,6 +175,8 @@ struct rpcrdma_rep {
+ 	struct rpcrdma_regbuf	*rr_rdmabuf;
+ };
+ 
++#define RPCRDMA_BAD_LEN		(~0U)
++
+ /*
+  * struct rpcrdma_mw - external memory region metadata
+  *
