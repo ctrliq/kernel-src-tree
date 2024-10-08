@@ -528,12 +528,6 @@ static int byt_gpio_probe(struct platform_device *pdev)
 	gc->can_sleep = 0;
 	gc->dev = dev;
 
-	ret = gpiochip_add(gc);
-	if (ret) {
-		dev_err(&pdev->dev, "failed adding byt-gpio chip\n");
-		return ret;
-	}
-
 	/* set up interrupts  */
 	irq_rc = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	if (irq_rc && irq_rc->start) {
@@ -552,6 +546,12 @@ static int byt_gpio_probe(struct platform_device *pdev)
 
 		/* Register interrupt handlers for gpio signaled acpi events */
 		acpi_gpiochip_request_interrupts(gc);
+	}
+
+	ret = gpiochip_add(gc);
+	if (ret) {
+		dev_err(&pdev->dev, "failed adding byt-gpio chip\n");
+		return ret;
 	}
 
 	pm_runtime_enable(dev);
