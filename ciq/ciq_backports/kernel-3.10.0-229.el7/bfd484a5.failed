@@ -1,0 +1,106 @@
+nfs: use blocking page_group_lock in add_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit bfd484a5606d6a0379a0a2f04251b1e5c1f8995c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bfd484a5.failed
+
+__nfs_pageio_add_request was calling nfs_page_group_lock nonblocking, but
+this can return -EAGAIN which would end up passing -EIO to the application.
+
+There is no reason not to block in this path, so change the two calls to
+do so. Also, there is no need to check the return value of
+nfs_page_group_lock when nonblock=false, so remove the error handling code.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Reviewed-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit bfd484a5606d6a0379a0a2f04251b1e5c1f8995c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 3e37cab99ceb,30c9626f96b0..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -441,16 -861,63 +441,71 @@@ static void nfs_pageio_doio(struct nfs_
+  static int __nfs_pageio_add_request(struct nfs_pageio_descriptor *desc,
+  			   struct nfs_page *req)
+  {
+++<<<<<<< HEAD
+ +	while (!nfs_pageio_do_add_request(desc, req)) {
+ +		desc->pg_moreio = 1;
+ +		nfs_pageio_doio(desc);
+ +		if (desc->pg_error < 0)
+ +			return 0;
+ +		desc->pg_moreio = 0;
+ +		if (desc->pg_recoalesce)
+ +			return 0;
+ +	}
+++=======
++ 	struct nfs_page *subreq;
++ 	unsigned int bytes_left = 0;
++ 	unsigned int offset, pgbase;
++ 
++ 	nfs_page_group_lock(req, false);
++ 
++ 	subreq = req;
++ 	bytes_left = subreq->wb_bytes;
++ 	offset = subreq->wb_offset;
++ 	pgbase = subreq->wb_pgbase;
++ 
++ 	do {
++ 		if (!nfs_pageio_do_add_request(desc, subreq)) {
++ 			/* make sure pg_test call(s) did nothing */
++ 			WARN_ON_ONCE(subreq->wb_bytes != bytes_left);
++ 			WARN_ON_ONCE(subreq->wb_offset != offset);
++ 			WARN_ON_ONCE(subreq->wb_pgbase != pgbase);
++ 
++ 			nfs_page_group_unlock(req);
++ 			desc->pg_moreio = 1;
++ 			nfs_pageio_doio(desc);
++ 			if (desc->pg_error < 0)
++ 				return 0;
++ 			if (desc->pg_recoalesce)
++ 				return 0;
++ 			/* retry add_request for this subreq */
++ 			nfs_page_group_lock(req, false);
++ 			continue;
++ 		}
++ 
++ 		/* check for buggy pg_test call(s) */
++ 		WARN_ON_ONCE(subreq->wb_bytes + subreq->wb_pgbase > PAGE_SIZE);
++ 		WARN_ON_ONCE(subreq->wb_bytes > bytes_left);
++ 		WARN_ON_ONCE(subreq->wb_bytes == 0);
++ 
++ 		bytes_left -= subreq->wb_bytes;
++ 		offset += subreq->wb_bytes;
++ 		pgbase += subreq->wb_bytes;
++ 
++ 		if (bytes_left) {
++ 			subreq = nfs_create_request(req->wb_context,
++ 					req->wb_page,
++ 					subreq, pgbase, bytes_left);
++ 			if (IS_ERR(subreq))
++ 				goto err_ptr;
++ 			nfs_lock_request(subreq);
++ 			subreq->wb_offset  = offset;
++ 			subreq->wb_index = req->wb_index;
++ 		}
++ 	} while (bytes_left > 0);
++ 
++ 	nfs_page_group_unlock(req);
+++>>>>>>> bfd484a5606d (nfs: use blocking page_group_lock in add_request)
+  	return 1;
+ -err_ptr:
+ -	desc->pg_error = PTR_ERR(subreq);
+ -	nfs_page_group_unlock(req);
+ -	return 0;
+  }
+  
+  static int nfs_do_recoalesce(struct nfs_pageio_descriptor *desc)
+* Unmerged path fs/nfs/pagelist.c
