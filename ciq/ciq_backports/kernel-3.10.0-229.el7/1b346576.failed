@@ -1,0 +1,156 @@
+ipv4: yet another new IP_MTU_DISCOVER option IP_PMTUDISC_OMIT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 1b346576359c72bee34b1476b4fc63d77d37b314
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1b346576.failed
+
+IP_PMTUDISC_INTERFACE has a design error: because it does not allow the
+generation of fragments if the interface mtu is exceeded, it is very
+hard to make use of this option in already deployed name server software
+for which I introduced this option.
+
+This patch adds yet another new IP_MTU_DISCOVER option to not honor any
+path mtu information and not accepting new icmp notifications destined for
+the socket this option is enabled on. But we allow outgoing fragmentation
+in case the packet size exceeds the outgoing interface mtu.
+
+As such this new option can be used as a drop-in replacement for
+IP_PMTUDISC_DONT, which is currently in use by most name server software
+making the adoption of this option very smooth and easy.
+
+The original advantage of IP_PMTUDISC_INTERFACE is still maintained:
+ignoring incoming path MTU updates and not honoring discovered path MTUs
+in the output path.
+
+Fixes: 482fc6094afad5 ("ipv4: introduce new IP_MTU_DISCOVER mode IP_PMTUDISC_INTERFACE")
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1b346576359c72bee34b1476b4fc63d77d37b314)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+diff --cc include/net/ip.h
+index 3bcd4b1a964e,b885d75cede4..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -270,7 -264,47 +270,51 @@@ int ip_dont_fragment(struct sock *sk, s
+  		 !(dst_metric_locked(dst, RTAX_MTU)));
+  }
+  
+++<<<<<<< HEAD
+ +extern void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+++=======
++ static inline bool ip_sk_accept_pmtu(const struct sock *sk)
++ {
++ 	return inet_sk(sk)->pmtudisc != IP_PMTUDISC_INTERFACE &&
++ 	       inet_sk(sk)->pmtudisc != IP_PMTUDISC_OMIT;
++ }
++ 
++ static inline bool ip_sk_use_pmtu(const struct sock *sk)
++ {
++ 	return inet_sk(sk)->pmtudisc < IP_PMTUDISC_PROBE;
++ }
++ 
++ static inline bool ip_sk_local_df(const struct sock *sk)
++ {
++ 	return inet_sk(sk)->pmtudisc < IP_PMTUDISC_DO ||
++ 	       inet_sk(sk)->pmtudisc == IP_PMTUDISC_OMIT;
++ }
++ 
++ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
++ 						    bool forwarding)
++ {
++ 	struct net *net = dev_net(dst->dev);
++ 
++ 	if (net->ipv4.sysctl_ip_fwd_use_pmtu ||
++ 	    dst_metric_locked(dst, RTAX_MTU) ||
++ 	    !forwarding)
++ 		return dst_mtu(dst);
++ 
++ 	return min(dst->dev->mtu, IP_MAX_MTU);
++ }
++ 
++ static inline unsigned int ip_skb_dst_mtu(const struct sk_buff *skb)
++ {
++ 	if (!skb->sk || ip_sk_use_pmtu(skb->sk)) {
++ 		bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
++ 		return ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
++ 	} else {
++ 		return min(skb_dst(skb)->dev->mtu, IP_MAX_MTU);
++ 	}
++ }
++ 
++ void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+++>>>>>>> 1b346576359c (ipv4: yet another new IP_MTU_DISCOVER option IP_PMTUDISC_OMIT)
+  
+  static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk)
+  {
+* Unmerged path include/net/ip.h
+diff --git a/include/uapi/linux/in.h b/include/uapi/linux/in.h
+index 07ef373b164a..d3a61dfec95d 100644
+--- a/include/uapi/linux/in.h
++++ b/include/uapi/linux/in.h
+@@ -97,6 +97,10 @@ struct in_addr {
+  * this socket to prevent accepting spoofed ones.
+  */
+ #define IP_PMTUDISC_INTERFACE		4
++/* weaker version of IP_PMTUDISC_INTERFACE, which allos packets to get
++ * fragmented if they exeed the interface mtu
++ */
++#define IP_PMTUDISC_OMIT		5
+ 
+ #define IP_MULTICAST_IF			32
+ #define IP_MULTICAST_TTL 		33
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 912402752f2f..ff9a7f62c80e 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -823,8 +823,7 @@ static int __ip_append_data(struct sock *sk,
+ 
+ 	fragheaderlen = sizeof(struct iphdr) + (opt ? opt->optlen : 0);
+ 	maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen;
+-	maxnonfragsize = (inet->pmtudisc >= IP_PMTUDISC_DO) ?
+-			 mtu : 0xFFFF;
++	maxnonfragsize = ip_sk_local_df(sk) ? 0xFFFF : mtu;
+ 
+ 	if (cork->length + length > maxnonfragsize - fragheaderlen) {
+ 		ip_local_error(sk, EMSGSIZE, fl4->daddr, inet->inet_dport,
+@@ -1147,8 +1146,7 @@ ssize_t	ip_append_page(struct sock *sk, struct flowi4 *fl4, struct page *page,
+ 
+ 	fragheaderlen = sizeof(struct iphdr) + (opt ? opt->optlen : 0);
+ 	maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen;
+-	maxnonfragsize = (inet->pmtudisc >= IP_PMTUDISC_DO) ?
+-			 mtu : 0xFFFF;
++	maxnonfragsize = ip_sk_local_df(sk) ? 0xFFFF : mtu;
+ 
+ 	if (cork->length + size > maxnonfragsize - fragheaderlen) {
+ 		ip_local_error(sk, EMSGSIZE, fl4->daddr, inet->inet_dport, mtu);
+@@ -1308,8 +1306,7 @@ struct sk_buff *__ip_make_skb(struct sock *sk,
+ 	 * to fragment the frame generated here. No matter, what transforms
+ 	 * how transforms change size of the packet, it will come out.
+ 	 */
+-	if (inet->pmtudisc < IP_PMTUDISC_DO)
+-		skb->local_df = 1;
++	skb->local_df = ip_sk_local_df(sk);
+ 
+ 	/* DF bit is set when we want to see DF on outgoing frames.
+ 	 * If local_df is set too, we still allow to fragment this frame
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 453ac742126d..8d174ced1b69 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -628,7 +628,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 		inet->nodefrag = val ? 1 : 0;
+ 		break;
+ 	case IP_MTU_DISCOVER:
+-		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_INTERFACE)
++		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_OMIT)
+ 			goto e_inval;
+ 		inet->pmtudisc = val;
+ 		break;
