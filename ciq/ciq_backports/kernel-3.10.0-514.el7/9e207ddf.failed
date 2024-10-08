@@ -1,0 +1,175 @@
+perf report: Show call graph from reference events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit 9e207ddfa20781e56465ce9a537f0a377c9d34fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9e207ddf.failed
+
+Introduce --show-ref-call-graph for perf report to print reference
+callgraph for no callgraph event.
+
+Here is an example.
+
+ perf report --show-ref-call-graph --stdio
+
+ # To display the perf.data header info, please use
+ --header/--header-only options.
+ #
+ #
+ # Total Lost Samples: 0
+ #
+ # Samples: 5  of event 'cpu/cpu-cycles,call-graph=fp/'
+ # Event count (approx.): 144985
+ #
+ # Children      Self  Command  Shared Object     Symbol
+ # ........  ........  .......  ................  ........................................
+ #
+    72.30%     0.00%  sleep    [kernel.vmlinux]  [k] entry_SYSCALL_64_fastpath
+              |
+              ---entry_SYSCALL_64_fastpath
+                 |
+                 |--22.62%-- __GI___libc_nanosleep
+                  --77.38%-- [...]
+
+......
+
+ # Samples: 6  of event 'cpu/instructions,call-graph=no/', show reference callgraph
+ # Event count (approx.): 172780
+ #
+ # Children      Self  Command  Shared Object     Symbol
+ # ........  ........  .......  ................  ........................................
+ #
+    73.16%     0.00%  sleep    [kernel.vmlinux]  [k] entry_SYSCALL_64_fastpath
+              |
+              ---entry_SYSCALL_64_fastpath
+                 |
+                 |--31.44%-- __GI___libc_nanosleep
+                  --68.56%-- [...]
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1439289050-40510-3-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 9e207ddfa20781e56465ce9a537f0a377c9d34fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.c
+diff --cc tools/perf/util/hist.c
+index 6bccfae334b1,08b6cd945f1e..000000000000
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@@ -1139,6 -1140,13 +1139,16 @@@ void hists__output_resort(struct hists 
+  	struct rb_node *next;
+  	struct hist_entry *n;
+  	u64 min_callchain_hits;
+++<<<<<<< HEAD
+++=======
++ 	struct perf_evsel *evsel = hists_to_evsel(hists);
++ 	bool use_callchain;
++ 
++ 	if (evsel && !symbol_conf.show_ref_callgraph)
++ 		use_callchain = evsel->attr.sample_type & PERF_SAMPLE_CALLCHAIN;
++ 	else
++ 		use_callchain = symbol_conf.use_callchain;
+++>>>>>>> 9e207ddfa207 (perf report: Show call graph from reference events)
+  
+  	min_callchain_hits = hists->stats.total_period * (callchain_param.min_percent / 100);
+  
+diff --git a/tools/perf/Documentation/perf-report.txt b/tools/perf/Documentation/perf-report.txt
+index 7b07d19e2d54..a18ba757a0ed 100644
+--- a/tools/perf/Documentation/perf-report.txt
++++ b/tools/perf/Documentation/perf-report.txt
+@@ -359,6 +359,17 @@ OPTIONS
+ --full-source-path::
+ 	Show the full path for source files for srcline output.
+ 
++--show-ref-call-graph::
++	When multiple events are sampled, it may not be needed to collect
++	callgraphs for all of them. The sample sites are usually nearby,
++	and it's enough to collect the callgraphs on a reference event.
++	So user can use "call-graph=no" event modifier to disable callgraph
++	for other events to reduce the overhead.
++	However, perf report cannot show callgraphs for the event which
++	disable the callgraph.
++	This option extends the perf report to show reference callgraphs,
++	which collected by reference event, in no callgraph event.
++
+ include::callchain-overhead-calculation.txt[]
+ 
+ SEE ALSO
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index f301e865001f..62b285e32aa5 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -316,6 +316,11 @@ static size_t hists__fprintf_nr_sample_events(struct hists *hists, struct report
+ 	if (evname != NULL)
+ 		ret += fprintf(fp, " of event '%s'", evname);
+ 
++	if (symbol_conf.show_ref_callgraph &&
++	    strstr(evname, "call-graph=no")) {
++		ret += fprintf(fp, ", show reference callgraph");
++	}
++
+ 	if (rep->mem_mode) {
+ 		ret += fprintf(fp, "\n# Total weight : %" PRIu64, nr_events);
+ 		ret += fprintf(fp, "\n# Sort order   : %s", sort_order ? : default_mem_sort_order);
+@@ -740,6 +745,8 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ 			    itrace_parse_synth_opts),
+ 	OPT_BOOLEAN(0, "full-source-path", &srcline_full_filename,
+ 			"Show full source file name path for source lines"),
++	OPT_BOOLEAN(0, "show-ref-call-graph", &symbol_conf.show_ref_callgraph,
++		    "Show callgraph from reference event"),
+ 	OPT_END()
+ 	};
+ 	struct perf_data_file file = {
+diff --git a/tools/perf/ui/browsers/hists.c b/tools/perf/ui/browsers/hists.c
+index f296b7348449..10c7ec041039 100644
+--- a/tools/perf/ui/browsers/hists.c
++++ b/tools/perf/ui/browsers/hists.c
+@@ -1267,6 +1267,8 @@ static int hists__browser_title(struct hists *hists,
+ 	const char *ev_name = perf_evsel__name(evsel);
+ 	char buf[512];
+ 	size_t buflen = sizeof(buf);
++	char ref[30] = " show reference callgraph, ";
++	bool enable_ref = false;
+ 
+ 	if (symbol_conf.filter_relative) {
+ 		nr_samples = hists->stats.nr_non_filtered_samples;
+@@ -1292,10 +1294,13 @@ static int hists__browser_title(struct hists *hists,
+ 		}
+ 	}
+ 
++	if (symbol_conf.show_ref_callgraph &&
++	    strstr(ev_name, "call-graph=no"))
++		enable_ref = true;
+ 	nr_samples = convert_unit(nr_samples, &unit);
+ 	printed = scnprintf(bf, size,
+-			   "Samples: %lu%c of event '%s', Event count (approx.): %" PRIu64,
+-			   nr_samples, unit, ev_name, nr_events);
++			   "Samples: %lu%c of event '%s',%sEvent count (approx.): %" PRIu64,
++			   nr_samples, unit, ev_name, enable_ref ? ref : " ", nr_events);
+ 
+ 
+ 	if (hists->uid_filter_str)
+* Unmerged path tools/perf/util/hist.c
+diff --git a/tools/perf/util/symbol.h b/tools/perf/util/symbol.h
+index b98ce51af142..a4cde92afbad 100644
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@ -106,7 +106,8 @@ struct symbol_conf {
+ 			filter_relative,
+ 			show_hist_headers,
+ 			branch_callstack,
+-			has_filter;
++			has_filter,
++			show_ref_callgraph;
+ 	const char	*vmlinux_name,
+ 			*kallsyms_name,
+ 			*source_prefix,
