@@ -2573,7 +2573,6 @@ static void atapi_request_sense(struct ata_queued_cmd *qc)
 
 	DPRINTK("ATAPI request sense\n");
 
-	/* FIXME: is this needed? */
 	memset(cmd->sense_buffer, 0, SCSI_SENSE_BUFFERSIZE);
 
 #ifdef CONFIG_ATA_SFF
