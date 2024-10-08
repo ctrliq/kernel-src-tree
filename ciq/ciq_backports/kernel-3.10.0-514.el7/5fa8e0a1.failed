@@ -1,0 +1,464 @@
+fs: Rename file_remove_suid() to file_remove_privs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] Rename file_remove_suid() to file_remove_privs() (Eric Sandeen) [1197686]
+Rebuild_FUZZ: 96.00%
+commit-author Jan Kara <jack@suse.cz>
+commit 5fa8e0a1c6a762857ae67d1628c58b9a02362003
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5fa8e0a1.failed
+
+file_remove_suid() is a misnomer since it removes also file capabilities
+stored in xattrs and sets S_NOSEC flag. Also should_remove_suid() tells
+something else than whether file_remove_suid() call is necessary which
+leads to bugs.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5fa8e0a1c6a762857ae67d1628c58b9a02362003)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file.c
+#	fs/ceph/file.c
+#	fs/ntfs/file.c
+#	mm/filemap.c
+diff --cc fs/btrfs/file.c
+index fffea6628b71,86f97282779a..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -1770,32 -1735,20 +1770,37 @@@ static ssize_t btrfs_file_aio_write(str
+  	u64 start_pos;
+  	u64 end_pos;
+  	ssize_t num_written = 0;
+ +	ssize_t err = 0;
+ +	size_t count, ocount;
+  	bool sync = (file->f_flags & O_DSYNC) || IS_SYNC(file->f_mapping->host);
+ -	ssize_t err;
+ -	loff_t pos;
+ -	size_t count;
+  
+  	mutex_lock(&inode->i_mutex);
+ -	err = generic_write_checks(iocb, from);
+ -	if (err <= 0) {
+ +
+ +	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
+ +	if (err) {
+  		mutex_unlock(&inode->i_mutex);
+ -		return err;
+ +		goto out;
+ +	}
+ +	count = ocount;
+ +
+ +	current->backing_dev_info = inode->i_mapping->backing_dev_info;
+ +	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+ +	if (err) {
+ +		mutex_unlock(&inode->i_mutex);
+ +		goto out;
+  	}
+  
+ +	if (count == 0) {
+ +		mutex_unlock(&inode->i_mutex);
+ +		goto out;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	err = file_remove_suid(file);
+++=======
++ 	current->backing_dev_info = inode_to_bdi(inode);
++ 	err = file_remove_privs(file);
+++>>>>>>> 5fa8e0a1c6a7 (fs: Rename file_remove_suid() to file_remove_privs())
+  	if (err) {
+  		mutex_unlock(&inode->i_mutex);
+  		goto out;
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,e55fe32c6224..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -996,21 -950,16 +996,27 @@@ static ssize_t ceph_aio_write(struct ki
+  
+  	mutex_lock(&inode->i_mutex);
+  
+ +	err = generic_segment_checks(iov, &nr_segs, &count, VERIFY_READ);
+ +	if (err)
+ +		goto out;
+ +
+  	/* We can write back this queue in page reclaim */
+ -	current->backing_dev_info = inode_to_bdi(inode);
+ +	current->backing_dev_info = file->f_mapping->backing_dev_info;
+ +
+ +	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+ +	if (err)
+ +		goto out;
+  
+ -	err = generic_write_checks(iocb, from);
+ -	if (err <= 0)
+ +	if (count == 0)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	err = file_remove_suid(file);
+++=======
++ 	pos = iocb->ki_pos;
++ 	count = iov_iter_count(from);
++ 	err = file_remove_privs(file);
+++>>>>>>> 5fa8e0a1c6a7 (fs: Rename file_remove_suid() to file_remove_privs())
+  	if (err)
+  		goto out;
+  
+diff --cc fs/ntfs/file.c
+index ea4ba9daeb47,182bb93aa79c..000000000000
+--- a/fs/ntfs/file.c
++++ b/fs/ntfs/file.c
+@@@ -330,62 -328,166 +330,213 @@@ err_out
+  	return err;
+  }
+  
+ -static ssize_t ntfs_prepare_file_for_write(struct kiocb *iocb,
+ -		struct iov_iter *from)
+ +/**
+ + * ntfs_fault_in_pages_readable -
+ + *
+ + * Fault a number of userspace pages into pagetables.
+ + *
+ + * Unlike include/linux/pagemap.h::fault_in_pages_readable(), this one copes
+ + * with more than two userspace pages as well as handling the single page case
+ + * elegantly.
+ + *
+ + * If you find this difficult to understand, then think of the while loop being
+ + * the following code, except that we do without the integer variable ret:
+ + *
+ + *	do {
+ + *		ret = __get_user(c, uaddr);
+ + *		uaddr += PAGE_SIZE;
+ + *	} while (!ret && uaddr < end);
+ + *
+ + * Note, the final __get_user() may well run out-of-bounds of the user buffer,
+ + * but _not_ out-of-bounds of the page the user buffer belongs to, and since
+ + * this is only a read and not a write, and since it is still in the same page,
+ + * it should not matter and this makes the code much simpler.
+ + */
+ +static inline void ntfs_fault_in_pages_readable(const char __user *uaddr,
+ +		int bytes)
+  {
+ -	loff_t pos;
+ -	s64 end, ll;
+ -	ssize_t err;
+ -	unsigned long flags;
+ -	struct file *file = iocb->ki_filp;
+ -	struct inode *vi = file_inode(file);
+ -	ntfs_inode *base_ni, *ni = NTFS_I(vi);
+ -	ntfs_volume *vol = ni->vol;
+ +	const char __user *end;
+ +	volatile char c;
+ +
+++<<<<<<< HEAD
+ +	/* Set @end to the first byte outside the last page we care about. */
+ +	end = (const char __user*)PAGE_ALIGN((unsigned long)uaddr + bytes);
+  
+ +	while (!__get_user(c, uaddr) && (uaddr += PAGE_SIZE, uaddr < end))
+ +		;
+ +}
+ +
+ +/**
+ + * ntfs_fault_in_pages_readable_iovec -
+ + *
+ + * Same as ntfs_fault_in_pages_readable() but operates on an array of iovecs.
+ + */
+ +static inline void ntfs_fault_in_pages_readable_iovec(const struct iovec *iov,
+ +		size_t iov_ofs, int bytes)
+ +{
+ +	do {
+ +		const char __user *buf;
+ +		unsigned len;
+ +
+ +		buf = iov->iov_base + iov_ofs;
+ +		len = iov->iov_len - iov_ofs;
+ +		if (len > bytes)
+ +			len = bytes;
+ +		ntfs_fault_in_pages_readable(buf, len);
+ +		bytes -= len;
+ +		iov++;
+ +		iov_ofs = 0;
+ +	} while (bytes);
+++=======
++ 	ntfs_debug("Entering for i_ino 0x%lx, attribute type 0x%x, pos "
++ 			"0x%llx, count 0x%zx.", vi->i_ino,
++ 			(unsigned)le32_to_cpu(ni->type),
++ 			(unsigned long long)iocb->ki_pos,
++ 			iov_iter_count(from));
++ 	err = generic_write_checks(iocb, from);
++ 	if (unlikely(err <= 0))
++ 		goto out;
++ 	/*
++ 	 * All checks have passed.  Before we start doing any writing we want
++ 	 * to abort any totally illegal writes.
++ 	 */
++ 	BUG_ON(NInoMstProtected(ni));
++ 	BUG_ON(ni->type != AT_DATA);
++ 	/* If file is encrypted, deny access, just like NT4. */
++ 	if (NInoEncrypted(ni)) {
++ 		/* Only $DATA attributes can be encrypted. */
++ 		/*
++ 		 * Reminder for later: Encrypted files are _always_
++ 		 * non-resident so that the content can always be encrypted.
++ 		 */
++ 		ntfs_debug("Denying write access to encrypted file.");
++ 		err = -EACCES;
++ 		goto out;
++ 	}
++ 	if (NInoCompressed(ni)) {
++ 		/* Only unnamed $DATA attribute can be compressed. */
++ 		BUG_ON(ni->name_len);
++ 		/*
++ 		 * Reminder for later: If resident, the data is not actually
++ 		 * compressed.  Only on the switch to non-resident does
++ 		 * compression kick in.  This is in contrast to encrypted files
++ 		 * (see above).
++ 		 */
++ 		ntfs_error(vi->i_sb, "Writing to compressed files is not "
++ 				"implemented yet.  Sorry.");
++ 		err = -EOPNOTSUPP;
++ 		goto out;
++ 	}
++ 	base_ni = ni;
++ 	if (NInoAttr(ni))
++ 		base_ni = ni->ext.base_ntfs_ino;
++ 	err = file_remove_privs(file);
++ 	if (unlikely(err))
++ 		goto out;
++ 	/*
++ 	 * Our ->update_time method always succeeds thus file_update_time()
++ 	 * cannot fail either so there is no need to check the return code.
++ 	 */
++ 	file_update_time(file);
++ 	pos = iocb->ki_pos;
++ 	/* The first byte after the last cluster being written to. */
++ 	end = (pos + iov_iter_count(from) + vol->cluster_size_mask) &
++ 			~(u64)vol->cluster_size_mask;
++ 	/*
++ 	 * If the write goes beyond the allocated size, extend the allocation
++ 	 * to cover the whole of the write, rounded up to the nearest cluster.
++ 	 */
++ 	read_lock_irqsave(&ni->size_lock, flags);
++ 	ll = ni->allocated_size;
++ 	read_unlock_irqrestore(&ni->size_lock, flags);
++ 	if (end > ll) {
++ 		/*
++ 		 * Extend the allocation without changing the data size.
++ 		 *
++ 		 * Note we ensure the allocation is big enough to at least
++ 		 * write some data but we do not require the allocation to be
++ 		 * complete, i.e. it may be partial.
++ 		 */
++ 		ll = ntfs_attr_extend_allocation(ni, end, -1, pos);
++ 		if (likely(ll >= 0)) {
++ 			BUG_ON(pos >= ll);
++ 			/* If the extension was partial truncate the write. */
++ 			if (end > ll) {
++ 				ntfs_debug("Truncating write to inode 0x%lx, "
++ 						"attribute type 0x%x, because "
++ 						"the allocation was only "
++ 						"partially extended.",
++ 						vi->i_ino, (unsigned)
++ 						le32_to_cpu(ni->type));
++ 				iov_iter_truncate(from, ll - pos);
++ 			}
++ 		} else {
++ 			err = ll;
++ 			read_lock_irqsave(&ni->size_lock, flags);
++ 			ll = ni->allocated_size;
++ 			read_unlock_irqrestore(&ni->size_lock, flags);
++ 			/* Perform a partial write if possible or fail. */
++ 			if (pos < ll) {
++ 				ntfs_debug("Truncating write to inode 0x%lx "
++ 						"attribute type 0x%x, because "
++ 						"extending the allocation "
++ 						"failed (error %d).",
++ 						vi->i_ino, (unsigned)
++ 						le32_to_cpu(ni->type),
++ 						(int)-err);
++ 				iov_iter_truncate(from, ll - pos);
++ 			} else {
++ 				if (err != -ENOSPC)
++ 					ntfs_error(vi->i_sb, "Cannot perform "
++ 							"write to inode "
++ 							"0x%lx, attribute "
++ 							"type 0x%x, because "
++ 							"extending the "
++ 							"allocation failed "
++ 							"(error %ld).",
++ 							vi->i_ino, (unsigned)
++ 							le32_to_cpu(ni->type),
++ 							(long)-err);
++ 				else
++ 					ntfs_debug("Cannot perform write to "
++ 							"inode 0x%lx, "
++ 							"attribute type 0x%x, "
++ 							"because there is not "
++ 							"space left.",
++ 							vi->i_ino, (unsigned)
++ 							le32_to_cpu(ni->type));
++ 				goto out;
++ 			}
++ 		}
++ 	}
++ 	/*
++ 	 * If the write starts beyond the initialized size, extend it up to the
++ 	 * beginning of the write and initialize all non-sparse space between
++ 	 * the old initialized size and the new one.  This automatically also
++ 	 * increments the vfs inode->i_size to keep it above or equal to the
++ 	 * initialized_size.
++ 	 */
++ 	read_lock_irqsave(&ni->size_lock, flags);
++ 	ll = ni->initialized_size;
++ 	read_unlock_irqrestore(&ni->size_lock, flags);
++ 	if (pos > ll) {
++ 		/*
++ 		 * Wait for ongoing direct i/o to complete before proceeding.
++ 		 * New direct i/o cannot start as we hold i_mutex.
++ 		 */
++ 		inode_dio_wait(vi);
++ 		err = ntfs_attr_extend_initialized(ni, pos);
++ 		if (unlikely(err < 0))
++ 			ntfs_error(vi->i_sb, "Cannot perform write to inode "
++ 					"0x%lx, attribute type 0x%x, because "
++ 					"extending the initialized size "
++ 					"failed (error %d).", vi->i_ino,
++ 					(unsigned)le32_to_cpu(ni->type),
++ 					(int)-err);
++ 	}
++ out:
++ 	return err;
+++>>>>>>> 5fa8e0a1c6a7 (fs: Rename file_remove_suid() to file_remove_privs())
+  }
+  
+  /**
+diff --cc mm/filemap.c
+index 813fbe54f73b,f851e36802d5..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -2927,33 -2529,14 +2927,38 @@@ ssize_t __generic_file_aio_write(struc
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct address_space * mapping = file->f_mapping;
+ +	size_t ocount;		/* original count */
+ +	size_t count;		/* after file limit checks */
+  	struct inode 	*inode = mapping->host;
+ -	ssize_t		written = 0;
+ +	loff_t		pos;
+ +	ssize_t		written;
+  	ssize_t		err;
+ -	ssize_t		status;
+ +
+ +	ocount = 0;
+ +	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
+ +	if (err)
+ +		return err;
+ +
+ +	count = ocount;
+ +	pos = *ppos;
+  
+  	/* We can write back this queue in page reclaim */
+++<<<<<<< HEAD
+ +	current->backing_dev_info = mapping->backing_dev_info;
+ +	written = 0;
+ +
+ +	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+ +	if (err)
+ +		goto out;
+ +
+ +	if (count == 0)
+ +		goto out;
+ +
+ +	err = file_remove_suid(file);
+++=======
++ 	current->backing_dev_info = inode_to_bdi(inode);
++ 	err = file_remove_privs(file);
+++>>>>>>> 5fa8e0a1c6a7 (fs: Rename file_remove_suid() to file_remove_privs())
+  	if (err)
+  		goto out;
+  
+* Unmerged path fs/btrfs/file.c
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index ad3e78ae6f05..ed212b08f7f8 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1119,7 +1119,7 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 	if (count == 0)
+ 		goto out;
+ 
+-	err = file_remove_suid(file);
++	err = file_remove_privs(file);
+ 	if (err)
+ 		goto out;
+ 
+diff --git a/fs/inode.c b/fs/inode.c
+index 237190a851c4..a44f7d1b435a 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -1658,7 +1658,11 @@ static int __remove_suid(struct dentry *dentry, int kill)
+ 	return notify_change(dentry, &newattrs, NULL);
+ }
+ 
+-int file_remove_suid(struct file *file)
++/*
++ * Remove special file priviledges (suid, capabilities) when file is written
++ * to or truncated.
++ */
++int file_remove_privs(struct file *file)
+ {
+ 	struct dentry *dentry = file->f_path.dentry;
+ 	struct inode *inode = dentry->d_inode;
+@@ -1684,7 +1688,7 @@ int file_remove_suid(struct file *file)
+ 
+ 	return error;
+ }
+-EXPORT_SYMBOL(file_remove_suid);
++EXPORT_SYMBOL(file_remove_privs);
+ 
+ /**
+  *	file_update_time	-	update mtime and ctime time
+@@ -1965,9 +1969,8 @@ EXPORT_SYMBOL(inode_dio_done);
+  * inode is being instantiated).  The reason for the cmpxchg() loop
+  * --- which wouldn't be necessary if all code paths which modify
+  * i_flags actually followed this rule, is that there is at least one
+- * code path which doesn't today --- for example,
+- * __generic_file_aio_write() calls file_remove_suid() without holding
+- * i_mutex --- so we use cmpxchg() out of an abundance of caution.
++ * code path which doesn't today so we use cmpxchg() out of an abundance
++ * of caution.
+  *
+  * In the long run, i_mutex is overkill, and we should probably look
+  * at using the i_lock spinlock to protect i_flags, and then make sure
+* Unmerged path fs/ntfs/file.c
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index ff72b4ea0a57..54504153e73a 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -703,7 +703,7 @@ restart:
+ 	 * setgid bits if the process is not being run by root.  This keeps
+ 	 * people from modifying setuid and setgid binaries.
+ 	 */
+-	return file_remove_suid(file);
++	return file_remove_privs(file);
+ }
+ 
+ /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 37d4ac39152e..b8662d8ae9f7 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2627,7 +2627,7 @@ extern struct inode *new_inode_pseudo(struct super_block *sb);
+ extern struct inode *new_inode(struct super_block *sb);
+ extern void free_inode_nonrcu(struct inode *inode);
+ extern int should_remove_suid(struct dentry *);
+-extern int file_remove_suid(struct file *);
++extern int file_remove_privs(struct file *);
+ 
+ extern void __insert_inode_hash(struct inode *, unsigned long hashval);
+ static inline void insert_inode_hash(struct inode *inode)
+* Unmerged path mm/filemap.c
