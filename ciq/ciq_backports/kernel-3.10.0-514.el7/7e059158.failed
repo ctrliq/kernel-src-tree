@@ -1,0 +1,512 @@
+vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author David Wragg <david@weave.works>
+commit 7e059158d57b79159eaf1f504825d19866ef2c42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7e059158.failed
+
+Prior to 4.3, openvswitch tunnel vports (vxlan, gre and geneve) could
+transmit vxlan packets of any size, constrained only by the ability to
+send out the resulting packets.  4.3 introduced netdevs corresponding
+to tunnel vports.  These netdevs have an MTU, which limits the size of
+a packet that can be successfully encapsulated.  The default MTU
+values are low (1500 or less), which is awkwardly small in the context
+of physical networks supporting jumbo frames, and leads to a
+conspicuous change in behaviour for userspace.
+
+Instead, set the MTU on openvswitch-created netdevs to be the relevant
+maximum (i.e. the maximum IP packet size minus any relevant overhead),
+effectively restoring the behaviour prior to 4.3.
+
+	Signed-off-by: David Wragg <david@weave.works>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7e059158d57b79159eaf1f504825d19866ef2c42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+#	drivers/net/vxlan.c
+#	net/ipv4/ip_gre.c
+#	net/openvswitch/vport-vxlan.c
+diff --cc drivers/net/geneve.c
+index 7c79843ccb40,028e3873c310..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -1004,12 -1451,23 +1004,31 @@@ struct net_device *geneve_dev_create_fb
+  	if (IS_ERR(dev))
+  		return dev;
+  
+++<<<<<<< HEAD
+ +	err = geneve_configure(net, dev, 0, 0, 0, 0, htons(dst_port), true);
+ +	if (err) {
+ +		free_netdev(dev);
+ +		return ERR_PTR(err);
+ +	}
+++=======
++ 	err = geneve_configure(net, dev, &geneve_remote_unspec,
++ 			       0, 0, 0, htons(dst_port), true, 0);
++ 	if (err)
++ 		goto err;
++ 
++ 	/* openvswitch users expect packet sizes to be unrestricted,
++ 	 * so set the largest MTU we can.
++ 	 */
++ 	err = geneve_change_mtu(dev, IP_MAX_MTU);
++ 	if (err)
++ 		goto err;
++ 
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  	return dev;
++ 
++  err:
++ 	free_netdev(dev);
++ 	return ERR_PTR(err);
+  }
+  EXPORT_SYMBOL_GPL(geneve_dev_create_fb);
+  
+diff --cc drivers/net/vxlan.c
+index 3a7e78618607,a31cd954b308..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2578,59 -2735,73 +2578,70 @@@ struct vxlan_sock *vxlan_sock_add(struc
+  		}
+  		spin_unlock(&vn->sock_lock);
+  	}
+ -	if (!vs)
+ -		vs = vxlan_socket_create(vxlan->net, ipv6,
+ -					 vxlan->cfg.dst_port, vxlan->flags);
+ -	if (IS_ERR(vs))
+ -		return PTR_ERR(vs);
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	if (ipv6)
+ -		vxlan->vn6_sock = vs;
+ -	else
+ -#endif
+ -		vxlan->vn4_sock = vs;
+ -	vxlan_vs_add_dev(vs, vxlan);
+ -	return 0;
+ -}
+  
+ -static int vxlan_sock_add(struct vxlan_dev *vxlan)
+ -{
+ -	bool ipv6 = vxlan->flags & VXLAN_F_IPV6;
+ -	bool metadata = vxlan->flags & VXLAN_F_COLLECT_METADATA;
+ -	int ret = 0;
+ -
+ -	vxlan->vn4_sock = NULL;
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	vxlan->vn6_sock = NULL;
+ -	if (ipv6 || metadata)
+ -		ret = __vxlan_sock_add(vxlan, true);
+ -#endif
+ -	if (!ret && (!ipv6 || metadata))
+ -		ret = __vxlan_sock_add(vxlan, false);
+ -	if (ret < 0)
+ -		vxlan_sock_release(vxlan);
+ -	return ret;
+ +	return vxlan_socket_create(net, port, rcv, data, flags);
+  }
+ +EXPORT_SYMBOL_GPL(vxlan_sock_add);
+  
+ -static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
+ -			       struct vxlan_config *conf)
+ +static int vxlan_newlink(struct net *src_net, struct net_device *dev,
+ +			 struct nlattr *tb[], struct nlattr *data[])
+  {
+  	struct vxlan_net *vn = net_generic(src_net, vxlan_net_id);
+ -	struct vxlan_dev *vxlan = netdev_priv(dev), *tmp;
+ +	struct vxlan_dev *vxlan = netdev_priv(dev);
+  	struct vxlan_rdst *dst = &vxlan->default_dst;
+ -	unsigned short needed_headroom = ETH_HLEN;
+ +	__u32 vni;
+  	int err;
+  	bool use_ipv6 = false;
+++<<<<<<< HEAD
+ +
+ +	if (!data[IFLA_VXLAN_ID])
+ +		return -EINVAL;
+++=======
++ 	__be16 default_port = vxlan->cfg.dst_port;
++ 	struct net_device *lowerdev = NULL;
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  
+  	vxlan->net = src_net;
+  
+ -	dst->remote_vni = conf->vni;
+ -
+ -	memcpy(&dst->remote_ip, &conf->remote_ip, sizeof(conf->remote_ip));
+ +	vni = nla_get_u32(data[IFLA_VXLAN_ID]);
+ +	dst->remote_vni = vni;
+  
+  	/* Unless IPv6 is explicitly requested, assume IPv4 */
+ -	if (!dst->remote_ip.sa.sa_family)
+ -		dst->remote_ip.sa.sa_family = AF_INET;
+ +	dst->remote_ip.sa.sa_family = AF_INET;
+ +	if (data[IFLA_VXLAN_GROUP]) {
+ +		dst->remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
+ +	} else if (data[IFLA_VXLAN_GROUP6]) {
+ +		if (!IS_ENABLED(CONFIG_IPV6))
+ +			return -EPFNOSUPPORT;
+ +
+ +		dst->remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
+ +		dst->remote_ip.sa.sa_family = AF_INET6;
+ +		use_ipv6 = true;
+ +	}
+  
+ -	if (dst->remote_ip.sa.sa_family == AF_INET6 ||
+ -	    vxlan->cfg.saddr.sa.sa_family == AF_INET6) {
+++<<<<<<< HEAD
+ +	if (data[IFLA_VXLAN_LOCAL]) {
+ +		vxlan->saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
+ +		vxlan->saddr.sa.sa_family = AF_INET;
+ +	} else if (data[IFLA_VXLAN_LOCAL6]) {
+  		if (!IS_ENABLED(CONFIG_IPV6))
+  			return -EPFNOSUPPORT;
+ +
+ +		/* TODO: respect scope id */
+ +		vxlan->saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
+ +		vxlan->saddr.sa.sa_family = AF_INET6;
+  		use_ipv6 = true;
+ -		vxlan->flags |= VXLAN_F_IPV6;
+  	}
+  
+ +	if (data[IFLA_VXLAN_LINK] &&
+ +	    (dst->remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]))) {
+ +		struct net_device *lowerdev
+ +			 = __dev_get_by_index(src_net, dst->remote_ifindex);
+++=======
++ 	if (conf->remote_ifindex) {
++ 		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
++ 		dst->remote_ifindex = conf->remote_ifindex;
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  
+  		if (!lowerdev) {
+  			pr_info("ifindex %d does not exist\n", dst->remote_ifindex);
+@@@ -2648,46 -2818,159 +2659,57 @@@
+  		}
+  #endif
+  
+ -		if (!conf->mtu)
+ +		if (!tb[IFLA_MTU])
+  			dev->mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+  
+ -		needed_headroom = lowerdev->hard_header_len;
+ +		dev->needed_headroom = lowerdev->hard_header_len +
+ +				       (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+ +	} else if (use_ipv6) {
+ +		vxlan->flags |= VXLAN_F_IPV6;
+ +		dev->needed_headroom = ETH_HLEN + VXLAN6_HEADROOM;
+ +	} else {
+ +		dev->needed_headroom = ETH_HLEN + VXLAN_HEADROOM;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (data[IFLA_VXLAN_TOS])
+ +		vxlan->tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
+ +
+ +	if (data[IFLA_VXLAN_TTL])
+ +		vxlan->ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
+ +
+ +	if (!data[IFLA_VXLAN_LEARNING] || nla_get_u8(data[IFLA_VXLAN_LEARNING]))
+ +		vxlan->flags |= VXLAN_F_LEARN;
+ +
+ +	if (data[IFLA_VXLAN_AGEING])
+ +		vxlan->age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
+++=======
++ 	if (conf->mtu) {
++ 		err = __vxlan_change_mtu(dev, lowerdev, dst, conf->mtu, false);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	if (use_ipv6 || conf->flags & VXLAN_F_COLLECT_METADATA)
++ 		needed_headroom += VXLAN6_HEADROOM;
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  	else
+ -		needed_headroom += VXLAN_HEADROOM;
+ -	dev->needed_headroom = needed_headroom;
+ -
+ -	memcpy(&vxlan->cfg, conf, sizeof(*conf));
+ -	if (!vxlan->cfg.dst_port)
+ -		vxlan->cfg.dst_port = default_port;
+ -	vxlan->flags |= conf->flags;
+ -
+ -	if (!vxlan->cfg.age_interval)
+ -		vxlan->cfg.age_interval = FDB_AGE_DEFAULT;
+ -
+ -	list_for_each_entry(tmp, &vn->vxlan_list, next) {
+ -		if (tmp->cfg.vni == conf->vni &&
+ -		    (tmp->default_dst.remote_ip.sa.sa_family == AF_INET6 ||
+ -		     tmp->cfg.saddr.sa.sa_family == AF_INET6) == use_ipv6 &&
+ -		    tmp->cfg.dst_port == vxlan->cfg.dst_port &&
+ -		    (tmp->flags & VXLAN_F_RCV_FLAGS) ==
+ -		    (vxlan->flags & VXLAN_F_RCV_FLAGS))
+ -		return -EEXIST;
+ -	}
+ -
+ -	dev->ethtool_ops = &vxlan_ethtool_ops;
+ -
+ -	/* create an fdb entry for a valid default destination */
+ -	if (!vxlan_addr_any(&vxlan->default_dst.remote_ip)) {
+ -		err = vxlan_fdb_create(vxlan, all_zeros_mac,
+ -				       &vxlan->default_dst.remote_ip,
+ -				       NUD_REACHABLE|NUD_PERMANENT,
+ -				       NLM_F_EXCL|NLM_F_CREATE,
+ -				       vxlan->cfg.dst_port,
+ -				       vxlan->default_dst.remote_vni,
+ -				       vxlan->default_dst.remote_ifindex,
+ -				       NTF_SELF);
+ -		if (err)
+ -			return err;
+ -	}
+ -
+ -	err = register_netdevice(dev);
+ -	if (err) {
+ -		vxlan_fdb_delete_default(vxlan);
+ -		return err;
+ -	}
+ -
+ -	list_add(&vxlan->next, &vn->vxlan_list);
+ -
+ -	return 0;
+ -}
+ -
+ -struct net_device *vxlan_dev_create(struct net *net, const char *name,
+ -				    u8 name_assign_type, struct vxlan_config *conf)
+ -{
+ -	struct nlattr *tb[IFLA_MAX+1];
+ -	struct net_device *dev;
+ -	int err;
+ -
+ -	memset(&tb, 0, sizeof(tb));
+ -
+ -	dev = rtnl_create_link(net, name, name_assign_type,
+ -			       &vxlan_link_ops, tb);
+ -	if (IS_ERR(dev))
+ -		return dev;
+ -
+ -	err = vxlan_dev_configure(net, dev, conf);
+ -	if (err < 0) {
+ -		free_netdev(dev);
+ -		return ERR_PTR(err);
+ -	}
+ -
+ -	return dev;
+ -}
+ -EXPORT_SYMBOL_GPL(vxlan_dev_create);
+ -
+ -static int vxlan_newlink(struct net *src_net, struct net_device *dev,
+ -			 struct nlattr *tb[], struct nlattr *data[])
+ -{
+ -	struct vxlan_config conf;
+ -	int err;
+ -
+ -	memset(&conf, 0, sizeof(conf));
+ -
+ -	if (data[IFLA_VXLAN_ID])
+ -		conf.vni = nla_get_u32(data[IFLA_VXLAN_ID]);
+ -
+ -	if (data[IFLA_VXLAN_GROUP]) {
+ -		conf.remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
+ -	} else if (data[IFLA_VXLAN_GROUP6]) {
+ -		if (!IS_ENABLED(CONFIG_IPV6))
+ -			return -EPFNOSUPPORT;
+ -
+ -		conf.remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
+ -		conf.remote_ip.sa.sa_family = AF_INET6;
+ -	}
+ -
+ -	if (data[IFLA_VXLAN_LOCAL]) {
+ -		conf.saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
+ -		conf.saddr.sa.sa_family = AF_INET;
+ -	} else if (data[IFLA_VXLAN_LOCAL6]) {
+ -		if (!IS_ENABLED(CONFIG_IPV6))
+ -			return -EPFNOSUPPORT;
+ -
+ -		/* TODO: respect scope id */
+ -		conf.saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
+ -		conf.saddr.sa.sa_family = AF_INET6;
+ -	}
+ -
+ -	if (data[IFLA_VXLAN_LINK])
+ -		conf.remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
+ -
+ -	if (data[IFLA_VXLAN_TOS])
+ -		conf.tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
+ -
+ -	if (data[IFLA_VXLAN_TTL])
+ -		conf.ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
+ -
+ -	if (!data[IFLA_VXLAN_LEARNING] || nla_get_u8(data[IFLA_VXLAN_LEARNING]))
+ -		conf.flags |= VXLAN_F_LEARN;
+ -
+ -	if (data[IFLA_VXLAN_AGEING])
+ -		conf.age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
+ +		vxlan->age_interval = FDB_AGE_DEFAULT;
+  
+  	if (data[IFLA_VXLAN_PROXY] && nla_get_u8(data[IFLA_VXLAN_PROXY]))
+ -		conf.flags |= VXLAN_F_PROXY;
+ +		vxlan->flags |= VXLAN_F_PROXY;
+  
+  	if (data[IFLA_VXLAN_RSC] && nla_get_u8(data[IFLA_VXLAN_RSC]))
+ -		conf.flags |= VXLAN_F_RSC;
+ +		vxlan->flags |= VXLAN_F_RSC;
+  
+  	if (data[IFLA_VXLAN_L2MISS] && nla_get_u8(data[IFLA_VXLAN_L2MISS]))
+ -		conf.flags |= VXLAN_F_L2MISS;
+ +		vxlan->flags |= VXLAN_F_L2MISS;
+  
+  	if (data[IFLA_VXLAN_L3MISS] && nla_get_u8(data[IFLA_VXLAN_L3MISS]))
+ -		conf.flags |= VXLAN_F_L3MISS;
+ +		vxlan->flags |= VXLAN_F_L3MISS;
+  
+  	if (data[IFLA_VXLAN_LIMIT])
+ -		conf.addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
+ -
+ -	if (data[IFLA_VXLAN_COLLECT_METADATA] &&
+ -	    nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
+ -		conf.flags |= VXLAN_F_COLLECT_METADATA;
+ +		vxlan->addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
+  
+  	if (data[IFLA_VXLAN_PORT_RANGE]) {
+  		const struct ifla_vxlan_port_range *p
+diff --cc net/ipv4/ip_gre.c
+index afc4a83f7ee7,56fdf4e0dce4..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -847,9 -1218,46 +847,49 @@@ static struct rtnl_link_ops ipgre_tap_o
+  	.get_link_net	= ip_tunnel_get_link_net,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct net_device *gretap_fb_dev_create(struct net *net, const char *name,
++ 					u8 name_assign_type)
++ {
++ 	struct nlattr *tb[IFLA_MAX + 1];
++ 	struct net_device *dev;
++ 	struct ip_tunnel *t;
++ 	int err;
++ 
++ 	memset(&tb, 0, sizeof(tb));
++ 
++ 	dev = rtnl_create_link(net, name, name_assign_type,
++ 			       &ipgre_tap_ops, tb);
++ 	if (IS_ERR(dev))
++ 		return dev;
++ 
++ 	/* Configure flow based GRE device. */
++ 	t = netdev_priv(dev);
++ 	t->collect_md = true;
++ 
++ 	err = ipgre_newlink(net, dev, tb, NULL);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	/* openvswitch users expect packet sizes to be unrestricted,
++ 	 * so set the largest MTU we can.
++ 	 */
++ 	err = __ip_tunnel_change_mtu(dev, IP_MAX_MTU, false);
++ 	if (err)
++ 		goto out;
++ 
++ 	return dev;
++ out:
++ 	free_netdev(dev);
++ 	return ERR_PTR(err);
++ }
++ EXPORT_SYMBOL_GPL(gretap_fb_dev_create);
++ 
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  static int __net_init ipgre_tap_init_net(struct net *net)
+  {
+ -	return ip_tunnel_init_net(net, gre_tap_net_id, &ipgre_tap_ops, "gretap0");
+ +	return ip_tunnel_init_net(net, gre_tap_net_id, &ipgre_tap_ops, NULL);
+  }
+  
+  static void __net_exit ipgre_tap_exit_net(struct net *net)
+diff --cc net/openvswitch/vport-vxlan.c
+index 6f7986fabb70,de9cb19efb6a..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -152,12 -84,16 +152,21 @@@ static struct vport *vxlan_tnl_create(c
+  {
+  	struct net *net = ovs_dp_get_net(parms->dp);
+  	struct nlattr *options = parms->options;
+ -	struct net_device *dev;
+ +	struct vxlan_port *vxlan_port;
+ +	struct vxlan_sock *vs;
+  	struct vport *vport;
+  	struct nlattr *a;
+ +	u16 dst_port;
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	struct vxlan_config conf = {
++ 		.no_share = true,
++ 		.flags = VXLAN_F_COLLECT_METADATA,
++ 		/* Don't restrict the packets that can be sent by MTU */
++ 		.mtu = IP_MAX_MTU,
++ 	};
+++>>>>>>> 7e059158d57b (vxlan, gre, geneve: Set a large MTU on ovs-created tunnel devices)
+  
+  	if (!options) {
+  		err = -EINVAL;
+* Unmerged path drivers/net/geneve.c
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 3a5ac80169cf..4e308fb32914 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -226,6 +226,7 @@ void ip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ int ip_tunnel_ioctl(struct net_device *dev, struct ip_tunnel_parm *p, int cmd);
+ int ip_tunnel_encap(struct sk_buff *skb, struct ip_tunnel *t,
+ 		    u8 *protocol, struct flowi4 *fl4);
++int __ip_tunnel_change_mtu(struct net_device *dev, int new_mtu, bool strict);
+ int ip_tunnel_change_mtu(struct net_device *dev, int new_mtu);
+ 
+ struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+* Unmerged path net/ipv4/ip_gre.c
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 9e87861a5733..a20fa3e13799 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -933,17 +933,31 @@ done:
+ }
+ EXPORT_SYMBOL_GPL(ip_tunnel_ioctl);
+ 
+-int ip_tunnel_change_mtu(struct net_device *dev, int new_mtu)
++int __ip_tunnel_change_mtu(struct net_device *dev, int new_mtu, bool strict)
+ {
+ 	struct ip_tunnel *tunnel = netdev_priv(dev);
+ 	int t_hlen = tunnel->hlen + sizeof(struct iphdr);
++	int max_mtu = 0xFFF8 - dev->hard_header_len - t_hlen;
+ 
+-	if (new_mtu < 68 ||
+-	    new_mtu > 0xFFF8 - dev->hard_header_len - t_hlen)
++	if (new_mtu < 68)
+ 		return -EINVAL;
++
++	if (new_mtu > max_mtu) {
++		if (strict)
++			return -EINVAL;
++
++		new_mtu = max_mtu;
++	}
++
+ 	dev->mtu = new_mtu;
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(__ip_tunnel_change_mtu);
++
++int ip_tunnel_change_mtu(struct net_device *dev, int new_mtu)
++{
++	return __ip_tunnel_change_mtu(dev, new_mtu, true);
++}
+ EXPORT_SYMBOL_GPL(ip_tunnel_change_mtu);
+ 
+ static void ip_tunnel_dev_free(struct net_device *dev)
+* Unmerged path net/openvswitch/vport-vxlan.c
