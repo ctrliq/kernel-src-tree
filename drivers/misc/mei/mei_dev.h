@@ -403,6 +403,9 @@ struct mei_cfg {
 
  * @reset_count - limits the number of consecutive resets
  * @hbm_state - state of host bus message protocol
+ *
+ * @hbm_f_pg_supported - hbm feature pgi protocol
+ *
  * @pg_event - power gating event
  * @mem_addr - mem mapped base register address
 
@@ -471,6 +474,7 @@ struct mei_device {
 	} wr_msg;
 
 	struct hbm_version version;
+	unsigned int hbm_f_pg_supported:1;
 
 	struct mei_me_client *me_clients; /* Note: memory has to be allocated */
 	DECLARE_BITMAP(me_clients_map, MEI_CLIENTS_MAX);
