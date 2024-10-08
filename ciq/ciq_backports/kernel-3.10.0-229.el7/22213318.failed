@@ -1,0 +1,125 @@
+fix races between __d_instantiate() and checks of dentry flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [fs] dcache: fix races between __d_instantiate() and checks of dentry flags (David Howells) [985875]
+Rebuild_FUZZ: 93.94%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 22213318af7ae265bc6cd8aef2febbc2d69a2440
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/22213318.failed
+
+in non-lazy walk we need to be careful about dentry switching from
+negative to positive - both ->d_flags and ->d_inode are updated,
+and in some places we might see only one store.  The cases where
+dentry has been obtained by dcache lookup with ->i_mutex held on
+parent are safe - ->d_lock and ->i_mutex provide all the barriers
+we need.  However, there are several places where we run into
+trouble:
+	* do_last() fetches ->d_inode, then checks ->d_flags and
+assumes that inode won't be NULL unless d_is_negative() is true.
+Race with e.g. creat() - we might have fetched the old value of
+->d_inode (still NULL) and new value of ->d_flags (already not
+DCACHE_MISS_TYPE).  Lin Ming has observed and reported the resulting
+oops.
+	* a bunch of places checks ->d_inode for being non-NULL,
+then checks ->d_flags for "is it a symlink".  Race with symlink(2)
+in case if our CPU sees ->d_inode update first - we see non-NULL
+there, but ->d_flags still contains DCACHE_MISS_TYPE instead of
+DCACHE_SYMLINK_TYPE.  Result: false negative on "should we follow
+link here?", with subsequent unpleasantness.
+
+	Cc: stable@vger.kernel.org # 3.13 and 3.14 need that one
+Reported-and-tested-by: Lin Ming <minggr@gmail.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 22213318af7ae265bc6cd8aef2febbc2d69a2440)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/namei.c
+diff --cc fs/dcache.c
+index cb811980d831,494a9def5dce..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1493,14 -1615,41 +1493,19 @@@ void d_set_d_op(struct dentry *dentry, 
+  }
+  EXPORT_SYMBOL(d_set_d_op);
+  
+ -static unsigned d_flags_for_inode(struct inode *inode)
+ -{
+ -	unsigned add_flags = DCACHE_FILE_TYPE;
+ -
+ -	if (!inode)
+ -		return DCACHE_MISS_TYPE;
+ -
+ -	if (S_ISDIR(inode->i_mode)) {
+ -		add_flags = DCACHE_DIRECTORY_TYPE;
+ -		if (unlikely(!(inode->i_opflags & IOP_LOOKUP))) {
+ -			if (unlikely(!inode->i_op->lookup))
+ -				add_flags = DCACHE_AUTODIR_TYPE;
+ -			else
+ -				inode->i_opflags |= IOP_LOOKUP;
+ -		}
+ -	} else if (unlikely(!(inode->i_opflags & IOP_NOFOLLOW))) {
+ -		if (unlikely(inode->i_op->follow_link))
+ -			add_flags = DCACHE_SYMLINK_TYPE;
+ -		else
+ -			inode->i_opflags |= IOP_NOFOLLOW;
+ -	}
+ -
+ -	if (unlikely(IS_AUTOMOUNT(inode)))
+ -		add_flags |= DCACHE_NEED_AUTOMOUNT;
+ -	return add_flags;
+ -}
+ -
+  static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+  {
+ -	unsigned add_flags = d_flags_for_inode(inode);
+ -
+  	spin_lock(&dentry->d_lock);
+++<<<<<<< HEAD
+ +	if (inode) {
+ +		if (unlikely(IS_AUTOMOUNT(inode)))
+ +			dentry->d_flags |= DCACHE_NEED_AUTOMOUNT;
+++=======
++ 	__d_set_type(dentry, add_flags);
++ 	if (inode)
+++>>>>>>> 22213318af7a (fix races between __d_instantiate() and checks of dentry flags)
+  		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+ +	}
+  	dentry->d_inode = inode;
+  	dentry_rcuwalk_barrier(dentry);
+  	spin_unlock(&dentry->d_lock);
+diff --cc fs/namei.c
+index d87d2e09b208,80168273396b..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -1558,10 -1542,10 +1558,10 @@@ static inline int walk_component(struc
+  		inode = path->dentry->d_inode;
+  	}
+  	err = -ENOENT;
+- 	if (!inode)
++ 	if (!inode || d_is_negative(path->dentry))
+  		goto out_path_put;
+  
+ -	if (should_follow_link(path->dentry, follow)) {
+ +	if (should_follow_link(inode, follow)) {
+  		if (nd->flags & LOOKUP_RCU) {
+  			if (unlikely(unlazy_walk(nd, path->dentry))) {
+  				err = -ECHILD;
+@@@ -3039,7 -2994,7 +3039,11 @@@ retry_lookup
+  finish_lookup:
+  	/* we _can_ be in RCU mode here */
+  	error = -ENOENT;
+++<<<<<<< HEAD
+ +	if (!inode) {
+++=======
++ 	if (!inode || d_is_negative(path->dentry)) {
+++>>>>>>> 22213318af7a (fix races between __d_instantiate() and checks of dentry flags)
+  		path_to_nameidata(path, nd);
+  		goto out;
+  	}
+* Unmerged path fs/dcache.c
+* Unmerged path fs/namei.c
