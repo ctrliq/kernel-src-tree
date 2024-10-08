@@ -1492,9 +1492,6 @@ static void ap_scan_bus(struct work_struct *unused)
 				continue;
 			}
 			break;
-		case 11:
-			ap_dev->device_type = 10;
-			break;
 		default:
 			ap_dev->device_type = device_type;
 		}
