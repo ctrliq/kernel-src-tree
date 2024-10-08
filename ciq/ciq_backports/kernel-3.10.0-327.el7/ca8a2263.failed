@@ -1,0 +1,180 @@
+tcp: make cwnd-limited checks measurement-based, and gentler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Neal Cardwell <ncardwell@google.com>
+commit ca8a22634381537c92b5a10308652e1c38fd9edf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ca8a2263.failed
+
+Experience with the recent e114a710aa50 ("tcp: fix cwnd limited
+checking to improve congestion control") has shown that there are
+common cases where that commit can cause cwnd to be much larger than
+necessary. This leads to TSO autosizing cooking skbs that are too
+large, among other things.
+
+The main problems seemed to be:
+
+(1) That commit attempted to predict the future behavior of the
+connection by looking at the write queue (if TSO or TSQ limit
+sending). That prediction sometimes overestimated future outstanding
+packets.
+
+(2) That commit always allowed cwnd to grow to twice the number of
+outstanding packets (even in congestion avoidance, where this is not
+needed).
+
+This commit improves both of these, by:
+
+(1) Switching to a measurement-based approach where we explicitly
+track the largest number of packets in flight during the past window
+("max_packets_out"), and remember whether we were cwnd-limited at the
+moment we finished sending that flight.
+
+(2) Only allowing cwnd to grow to twice the number of outstanding
+packets ("max_packets_out") in slow start. In congestion avoidance
+mode we now only allow cwnd to grow if it was fully utilized.
+
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ca8a22634381537c92b5a10308652e1c38fd9edf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_output.c
+diff --cc include/net/tcp.h
+index ba45accd7103,e80abe4486cb..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -978,7 -968,30 +978,34 @@@ static inline u32 tcp_wnd_end(const str
+  {
+  	return tp->snd_una + tp->snd_wnd;
+  }
+++<<<<<<< HEAD
+ +extern bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight);
+++=======
++ 
++ /* We follow the spirit of RFC2861 to validate cwnd but implement a more
++  * flexible approach. The RFC suggests cwnd should not be raised unless
++  * it was fully used previously. And that's exactly what we do in
++  * congestion avoidance mode. But in slow start we allow cwnd to grow
++  * as long as the application has used half the cwnd.
++  * Example :
++  *    cwnd is 10 (IW10), but application sends 9 frames.
++  *    We allow cwnd to reach 18 when all frames are ACKed.
++  * This check is safe because it's as aggressive as slow start which already
++  * risks 100% overshoot. The advantage is that we discourage application to
++  * either send more filler packets or data to artificially blow up the cwnd
++  * usage, and allow application-limited process to probe bw more aggressively.
++  */
++ static inline bool tcp_is_cwnd_limited(const struct sock *sk)
++ {
++ 	const struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	/* If in slow start, ensure cwnd grows to twice what was ACKed. */
++ 	if (tp->snd_cwnd <= tp->snd_ssthresh)
++ 		return tp->snd_cwnd < 2 * tp->max_packets_out;
++ 
++ 	return tp->is_cwnd_limited;
++ }
+++>>>>>>> ca8a22634381 (tcp: make cwnd-limited checks measurement-based, and gentler)
+  
+  static inline void tcp_check_probe_timer(struct sock *sk)
+  {
+diff --cc net/ipv4/tcp_output.c
+index d009567a0b52,d463c35db33d..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -1394,7 -1388,35 +1394,39 @@@ static void tcp_cwnd_validate(struct so
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+  
+++<<<<<<< HEAD
+ +	if (tp->packets_out >= tp->snd_cwnd) {
+++=======
++ 	if (inet_csk(sk)->icsk_ca_state == TCP_CA_Open &&
++ 	    sk->sk_socket && !test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
++ 		/* Limited by application or receiver window. */
++ 		u32 init_win = tcp_init_cwnd(tp, __sk_dst_get(sk));
++ 		u32 win_used = max(tp->snd_cwnd_used, init_win);
++ 		if (win_used < tp->snd_cwnd) {
++ 			tp->snd_ssthresh = tcp_current_ssthresh(sk);
++ 			tp->snd_cwnd = (tp->snd_cwnd + win_used) >> 1;
++ 		}
++ 		tp->snd_cwnd_used = 0;
++ 	}
++ 	tp->snd_cwnd_stamp = tcp_time_stamp;
++ }
++ 
++ static void tcp_cwnd_validate(struct sock *sk, bool is_cwnd_limited)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	/* Track the maximum number of outstanding packets in each
++ 	 * window, and remember whether we were cwnd-limited then.
++ 	 */
++ 	if (!before(tp->snd_una, tp->max_packets_seq) ||
++ 	    tp->packets_out > tp->max_packets_out) {
++ 		tp->max_packets_out = tp->packets_out;
++ 		tp->max_packets_seq = tp->snd_nxt;
++ 		tp->is_cwnd_limited = is_cwnd_limited;
++ 	}
++ 
++ 	if (tcp_is_cwnd_limited(sk)) {
+++>>>>>>> ca8a22634381 (tcp: make cwnd-limited checks measurement-based, and gentler)
+  		/* Network is feed fully. */
+  		tp->snd_cwnd_used = 0;
+  		tp->snd_cwnd_stamp = tcp_time_stamp;
+@@@ -1910,7 -1938,8 +1948,12 @@@ static bool tcp_write_xmit(struct sock 
+  						      nonagle : TCP_NAGLE_PUSH))))
+  				break;
+  		} else {
+++<<<<<<< HEAD
+ +			if (!push_one && tcp_tso_should_defer(sk, skb))
+++=======
++ 			if (!push_one &&
++ 			    tcp_tso_should_defer(sk, skb, &is_cwnd_limited))
+++>>>>>>> ca8a22634381 (tcp: make cwnd-limited checks measurement-based, and gentler)
+  				break;
+  		}
+  
+@@@ -1977,7 -2006,7 +2020,11 @@@ repair
+  		/* Send one loss probe per tail loss episode. */
+  		if (push_one != 2)
+  			tcp_schedule_loss_probe(sk);
+++<<<<<<< HEAD
+ +		tcp_cwnd_validate(sk);
+++=======
++ 		tcp_cwnd_validate(sk, is_cwnd_limited);
+++>>>>>>> ca8a22634381 (tcp: make cwnd-limited checks measurement-based, and gentler)
+  		return false;
+  	}
+  	return (push_one == 2) || (!tp->packets_out && tcp_send_head(sk));
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f022e6a239f4..9476f3f469f9 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -197,7 +197,8 @@ struct tcp_sock {
+ 	u8	do_early_retrans:1,/* Enable RFC5827 early-retransmit  */
+ 		syn_data:1,	/* SYN includes data */
+ 		syn_fastopen:1,	/* SYN includes Fast Open option */
+-		syn_data_acked:1;/* data in SYN is acked by SYN-ACK */
++		syn_data_acked:1,/* data in SYN is acked by SYN-ACK */
++		is_cwnd_limited:1;/* forward progress limited by snd_cwnd? */
+ 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
+ 
+ /* RTT measurement */
+@@ -209,6 +210,8 @@ struct tcp_sock {
+ 
+ 	u32	packets_out;	/* Packets which are "in flight"	*/
+ 	u32	retrans_out;	/* Retransmitted packets out		*/
++	u32	max_packets_out;  /* max packets_out in last window */
++	u32	max_packets_seq;  /* right edge of max_packets_out flight */
+ 
+ 	u16	urg_data;	/* Saved octet of OOB data and control flags */
+ 	u8	ecn_flags;	/* ECN status bits.			*/
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp_output.c
