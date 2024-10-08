@@ -1,0 +1,252 @@
+gue: Add infrastructure for flags and options
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit 5024c33ac354577635c5671498891eb197f3ec4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5024c33a.failed
+
+Add functions and basic definitions for processing standard flags,
+private flags, and control messages. This includes definitions
+to compute length of optional fields corresponding to a set of flags.
+Flag validation is in validate_gue_flags function. This checks for
+unknown flags, and that length of optional fields is <= length
+in guehdr hlen.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5024c33ac354577635c5671498891eb197f3ec4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fou.c
+diff --cc net/ipv4/fou.c
+index 32e78924e246,a3b8c5b36303..000000000000
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@@ -487,6 -516,96 +516,99 @@@ static const struct genl_ops fou_nl_ops
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void fou_build_udp(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 			  struct flowi4 *fl4, u8 *protocol, __be16 sport)
++ {
++ 	struct udphdr *uh;
++ 
++ 	skb_push(skb, sizeof(struct udphdr));
++ 	skb_reset_transport_header(skb);
++ 
++ 	uh = udp_hdr(skb);
++ 
++ 	uh->dest = e->dport;
++ 	uh->source = sport;
++ 	uh->len = htons(skb->len);
++ 	uh->check = 0;
++ 	udp_set_csum(!(e->flags & TUNNEL_ENCAP_FLAG_CSUM), skb,
++ 		     fl4->saddr, fl4->daddr, skb->len);
++ 
++ 	*protocol = IPPROTO_UDP;
++ }
++ 
++ int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	__be16 sport;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(fou_build_header);
++ 
++ int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	struct guehdr *guehdr;
++ 	size_t optlen = 0;
++ 	__be16 sport;
++ 	void *data;
++ 	bool need_priv = false;
++ 
++ 	optlen += need_priv ? GUE_LEN_PRIV : 0;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	/* Get source port (based on flow hash) before skb_push */
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 
++ 	skb_push(skb, sizeof(struct guehdr) + optlen);
++ 
++ 	guehdr = (struct guehdr *)skb->data;
++ 
++ 	guehdr->control = 0;
++ 	guehdr->version = 0;
++ 	guehdr->hlen = optlen >> 2;
++ 	guehdr->flags = 0;
++ 	guehdr->proto_ctype = *protocol;
++ 
++ 	data = &guehdr[1];
++ 
++ 	if (need_priv) {
++ 		__be32 *flags = data;
++ 
++ 		guehdr->flags |= GUE_FLAG_PRIV;
++ 		*flags = 0;
++ 		data += GUE_LEN_PRIV;
++ 
++ 		/* Add private flags */
++ 	}
++ 
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(gue_build_header);
++ 
+++>>>>>>> 5024c33ac354 (gue: Add infrastructure for flags and options)
+  static int __init fou_init(void)
+  {
+  	int ret;
+diff --git a/include/net/gue.h b/include/net/gue.h
+index b6c332788084..cb68ae843c77 100644
+--- a/include/net/gue.h
++++ b/include/net/gue.h
+@@ -1,23 +1,113 @@
+ #ifndef __NET_GUE_H
+ #define __NET_GUE_H
+ 
++/* Definitions for the GUE header, standard and private flags, lengths
++ * of optional fields are below.
++ *
++ * Diagram of GUE header:
++ *
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |Ver|C|  Hlen   | Proto/ctype   |        Standard flags       |P|
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                                                               |
++ * ~                      Fields (optional)                        ~
++ * |                                                               |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |            Private flags (optional, P bit is set)             |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                                                               |
++ * ~                   Private fields (optional)                   ~
++ * |                                                               |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ *
++ * C bit indicates contol message when set, data message when unset.
++ * For a control message, proto/ctype is interpreted as a type of
++ * control message. For data messages, proto/ctype is the IP protocol
++ * of the next header.
++ *
++ * P bit indicates private flags field is present. The private flags
++ * may refer to options placed after this field.
++ */
++
+ struct guehdr {
+ 	union {
+ 		struct {
+ #if defined(__LITTLE_ENDIAN_BITFIELD)
+-			__u8	hlen:4,
+-			version:4;
++			__u8	hlen:5,
++				control:1,
++				version:2;
+ #elif defined (__BIG_ENDIAN_BITFIELD)
+-			__u8	version:4,
+-				hlen:4;
++			__u8	version:2,
++				control:1,
++				hlen:5;
+ #else
+ #error  "Please fix <asm/byteorder.h>"
+ #endif
+-			__u8    next_hdr;
++			__u8    proto_ctype;
+ 			__u16   flags;
+ 		};
+ 		__u32 word;
+ 	};
+ };
+ 
++/* Standard flags in GUE header */
++
++#define GUE_FLAG_PRIV	htons(1<<0)	/* Private flags are in options */
++#define GUE_LEN_PRIV	4
++
++#define GUE_FLAGS_ALL	(GUE_FLAG_PRIV)
++
++/* Private flags in the private option extension */
++
++#define GUE_PFLAGS_ALL	(0)
++
++/* Functions to compute options length corresponding to flags.
++ * If we ever have a lot of flags this can be potentially be
++ * converted to a more optimized algorithm (table lookup
++ * for instance).
++ */
++static inline size_t guehdr_flags_len(__be16 flags)
++{
++	return ((flags & GUE_FLAG_PRIV) ? GUE_LEN_PRIV : 0);
++}
++
++static inline size_t guehdr_priv_flags_len(__be32 flags)
++{
++	return 0;
++}
++
++/* Validate standard and private flags. Returns non-zero (meaning invalid)
++ * if there is an unknown standard or private flags, or the options length for
++ * the flags exceeds the options length specific in hlen of the GUE header.
++ */
++static inline int validate_gue_flags(struct guehdr *guehdr,
++				     size_t optlen)
++{
++	size_t len;
++	__be32 flags = guehdr->flags;
++
++	if (flags & ~GUE_FLAGS_ALL)
++		return 1;
++
++	len = guehdr_flags_len(flags);
++	if (len > optlen)
++		return 1;
++
++	if (flags & GUE_FLAG_PRIV) {
++		/* Private flags are last four bytes accounted in
++		 * guehdr_flags_len
++		 */
++		flags = *(__be32 *)((void *)&guehdr[1] + len - GUE_LEN_PRIV);
++
++		if (flags & ~GUE_PFLAGS_ALL)
++			return 1;
++
++		len += guehdr_priv_flags_len(flags);
++		if (len > optlen)
++			return 1;
++	}
++
++	return 0;
++}
++
+ #endif
+* Unmerged path net/ipv4/fou.c
