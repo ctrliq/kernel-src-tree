@@ -1,0 +1,477 @@
+fib_trie: Drop unnecessary calls to leaf_pull_suffix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 1513069edcf8dd86cfd8d5daef482b97d6b93df6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1513069e.failed
+
+It was reported that update_suffix was taking a long time on systems where
+a large number of leaves were attached to a single node.  As it turns out
+fib_table_flush was calling update_suffix for each leaf that didn't have all
+of the aliases stripped from it.  As a result, on this large node removing
+one leaf would result in us calling update_suffix for every other leaf on
+the node.
+
+The fix is to just remove the calls to leaf_pull_suffix since they are
+redundant as we already have a call in resize that will go through and
+update the suffix length for the node before we exit out of
+fib_table_flush or fib_table_flush_external.
+
+	Reported-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Tested-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1513069edcf8dd86cfd8d5daef482b97d6b93df6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 8be89b1a8b93,37c4bb89a708..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1562,139 -1551,318 +1562,399 @@@ int fib_table_delete(struct fib_table *
+  	return 0;
+  }
+  
+ -/* Scan for the next leaf starting at the provided key value */
+ -static struct key_vector *leaf_walk_rcu(struct key_vector **tn, t_key key)
+ +static int trie_flush_list(struct list_head *head)
+  {
+++<<<<<<< HEAD
+ +	struct fib_alias *fa, *fa_node;
+++=======
++ 	struct key_vector *pn, *n = *tn;
++ 	unsigned long cindex;
++ 
++ 	/* this loop is meant to try and find the key in the trie */
++ 	do {
++ 		/* record parent and next child index */
++ 		pn = n;
++ 		cindex = key ? get_index(key, pn) : 0;
++ 
++ 		if (cindex >> pn->bits)
++ 			break;
++ 
++ 		/* descend into the next child */
++ 		n = get_child_rcu(pn, cindex++);
++ 		if (!n)
++ 			break;
++ 
++ 		/* guarantee forward progress on the keys */
++ 		if (IS_LEAF(n) && (n->key >= key))
++ 			goto found;
++ 	} while (IS_TNODE(n));
++ 
++ 	/* this loop will search for the next leaf with a greater key */
++ 	while (!IS_TRIE(pn)) {
++ 		/* if we exhausted the parent node we will need to climb */
++ 		if (cindex >= (1ul << pn->bits)) {
++ 			t_key pkey = pn->key;
++ 
++ 			pn = node_parent_rcu(pn);
++ 			cindex = get_index(pkey, pn) + 1;
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child_rcu(pn, cindex++);
++ 		if (!n)
++ 			continue;
++ 
++ 		/* no need to compare keys since we bumped the index */
++ 		if (IS_LEAF(n))
++ 			goto found;
++ 
++ 		/* Rescan start scanning in new node */
++ 		pn = n;
++ 		cindex = 0;
++ 	}
++ 
++ 	*tn = pn;
++ 	return NULL; /* Root of trie */
++ found:
++ 	/* if we are at the limit for keys just return NULL for the tnode */
++ 	*tn = pn;
++ 	return n;
++ }
++ 
++ static void fib_trie_free(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order and free everything */
++ 	for (;;) {
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			n = pn;
++ 			pn = node_parent(pn);
++ 
++ 			/* drop emptied tnode */
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			hlist_del_rcu(&fa->fa_list);
++ 			alias_free_mem_rcu(fa);
++ 		}
++ 
++ 		put_child_root(pn, n->key, NULL);
++ 		node_free(n);
++ 	}
++ 
++ #ifdef CONFIG_IP_FIB_TRIE_STATS
++ 	free_percpu(t->stats);
++ #endif
++ 	kfree(tb);
++ }
++ 
++ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
++ {
++ 	struct trie *ot = (struct trie *)oldtb->tb_data;
++ 	struct key_vector *l, *tp = ot->kv;
++ 	struct fib_table *local_tb;
++ 	struct fib_alias *fa;
++ 	struct trie *lt;
++ 	t_key key = 0;
++ 
++ 	if (oldtb->tb_data == oldtb->__data)
++ 		return oldtb;
++ 
++ 	local_tb = fib_trie_table(RT_TABLE_LOCAL, NULL);
++ 	if (!local_tb)
++ 		return NULL;
++ 
++ 	lt = (struct trie *)local_tb->tb_data;
++ 
++ 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
++ 		struct key_vector *local_l = NULL, *local_tp;
++ 
++ 		hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
++ 			struct fib_alias *new_fa;
++ 
++ 			if (local_tb->tb_id != fa->tb_id)
++ 				continue;
++ 
++ 			/* clone fa for new local table */
++ 			new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);
++ 			if (!new_fa)
++ 				goto out;
++ 
++ 			memcpy(new_fa, fa, sizeof(*fa));
++ 
++ 			/* insert clone into table */
++ 			if (!local_l)
++ 				local_l = fib_find_node(lt, &local_tp, l->key);
++ 
++ 			if (fib_insert_alias(lt, local_tp, local_l, new_fa,
++ 					     NULL, l->key))
++ 				goto out;
++ 		}
++ 
++ 		/* stop loop if key wrapped back to 0 */
++ 		key = l->key + 1;
++ 		if (key < l->key)
++ 			break;
++ 	}
++ 
++ 	return local_tb;
++ out:
++ 	fib_trie_free(local_tb);
++ 
++ 	return NULL;
++ }
++ 
++ /* Caller must hold RTNL */
++ void fib_table_flush_external(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order */
++ 	for (;;) {
++ 		unsigned char slen = 0;
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			/* cannot resize the trie vector */
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			/* resize completed node */
++ 			pn = resize(t, pn);
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			struct fib_info *fi = fa->fa_info;
++ 
++ 			/* if alias was cloned to local then we just
++ 			 * need to remove the local copy from main
++ 			 */
++ 			if (tb->tb_id != fa->tb_id) {
++ 				hlist_del_rcu(&fa->fa_list);
++ 				alias_free_mem_rcu(fa);
++ 				continue;
++ 			}
++ 
++ 			/* record local slen */
++ 			slen = fa->fa_slen;
++ 
++ 			if (!fi || !(fi->fib_flags & RTNH_F_OFFLOAD))
++ 				continue;
++ 
++ 			switchdev_fib_ipv4_del(n->key, KEYLENGTH - fa->fa_slen,
++ 					       fi, fa->fa_tos, fa->fa_type,
++ 					       tb->tb_id);
++ 		}
++ 
++ 		/* update leaf slen */
++ 		n->slen = slen;
++ 
++ 		if (hlist_empty(&n->leaf)) {
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 		}
++ 	}
++ }
++ 
++ /* Caller must hold RTNL. */
++ int fib_table_flush(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
+++>>>>>>> 1513069edcf8 (fib_trie: Drop unnecessary calls to leaf_pull_suffix)
+  	int found = 0;
+  
+ -	/* walk trie in reverse order */
+ -	for (;;) {
+ -		unsigned char slen = 0;
+ -		struct key_vector *n;
+ +	list_for_each_entry_safe(fa, fa_node, head, fa_list) {
+ +		struct fib_info *fi = fa->fa_info;
+  
+ -		if (!(cindex--)) {
+ -			t_key pkey = pn->key;
+ +		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
+ +			list_del_rcu(&fa->fa_list);
+ +			fib_release_info(fa->fa_info);
+ +			alias_free_mem_rcu(fa);
+ +			found++;
+ +		}
+ +	}
+ +	return found;
+ +}
+  
+ -			/* cannot resize the trie vector */
+ -			if (IS_TRIE(pn))
+ -				break;
+ +static int trie_flush_leaf(struct tnode *l)
+ +{
+ +	int found = 0;
+ +	struct hlist_head *lih = &l->list;
+ +	struct hlist_node *tmp;
+ +	struct leaf_info *li = NULL;
+ +	unsigned char plen = KEYLENGTH;
+  
+ -			/* resize completed node */
+ -			pn = resize(t, pn);
+ -			cindex = get_index(pkey, pn);
+++<<<<<<< HEAD
+ +	hlist_for_each_entry_safe(li, tmp, lih, hlist) {
+ +		found += trie_flush_list(&li->falh);
+  
+ +		if (list_empty(&li->falh)) {
+ +			hlist_del_rcu(&li->hlist);
+ +			free_leaf_info(li);
+  			continue;
+++=======
+++		if (hlist_empty(&n->leaf)) {
+++			put_child_root(pn, n->key, NULL);
+++			node_free(n);
+++>>>>>>> 1513069edcf8 (fib_trie: Drop unnecessary calls to leaf_pull_suffix)
+  		}
+  
+ -		/* grab the next available node */
+ -		n = get_child(pn, cindex);
+ -		if (!n)
+ -			continue;
+ +		plen = li->plen;
+ +	}
+  
+ -		if (IS_TNODE(n)) {
+ -			/* record pn and cindex for leaf walking */
+ -			pn = n;
+ -			cindex = 1ul << n->bits;
+ +	l->slen = KEYLENGTH - plen;
+  
+ -			continue;
+ -		}
+ +	return found;
+ +}
+  
+ -		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
+ -			struct fib_info *fi = fa->fa_info;
+ +/*
+ + * Scan for the next right leaf starting at node p->child[idx]
+ + * Since we have back pointer, no recursion necessary.
+ + */
+ +static struct tnode *leaf_walk_rcu(struct tnode *p, struct tnode *c)
+ +{
+ +	do {
+ +		unsigned long idx = c ? idx = get_index(c->key, p) + 1 : 0;
+  
+ -			if (!fi || !(fi->fib_flags & RTNH_F_DEAD)) {
+ -				slen = fa->fa_slen;
+ +		while (idx < tnode_child_length(p)) {
+ +			c = tnode_get_child_rcu(p, idx++);
+ +			if (!c)
+  				continue;
+ -			}
+  
+ -			switchdev_fib_ipv4_del(n->key, KEYLENGTH - fa->fa_slen,
+ -					       fi, fa->fa_tos, fa->fa_type,
+ -					       tb->tb_id);
+ -			hlist_del_rcu(&fa->fa_list);
+ -			fib_release_info(fa->fa_info);
+ -			alias_free_mem_rcu(fa);
+ -			found++;
+ +			if (IS_LEAF(c))
+ +				return c;
+ +
+ +			/* Rescan start scanning in new node */
+ +			p = c;
+ +			idx = 0;
+  		}
+  
+ -		/* update leaf slen */
+ -		n->slen = slen;
+ +		/* Node empty, walk back up to parent */
+ +		c = p;
+ +	} while ((p = node_parent_rcu(c)) != NULL);
+  
+ -		if (hlist_empty(&n->leaf)) {
+ -			put_child_root(pn, n->key, NULL);
+ -			node_free(n);
+ +	return NULL; /* Root of trie */
+ +}
+ +
+ +static struct tnode *trie_firstleaf(struct trie *t)
+ +{
+ +	struct tnode *n = rcu_dereference_rtnl(t->trie);
+ +
+ +	if (!n)
+ +		return NULL;
+ +
+ +	if (IS_LEAF(n))          /* trie is just a leaf */
+ +		return n;
+ +
+ +	return leaf_walk_rcu(n, NULL);
+ +}
+ +
+ +static struct tnode *trie_nextleaf(struct tnode *l)
+ +{
+ +	struct tnode *p = node_parent_rcu(l);
+ +
+ +	if (!p)
+ +		return NULL;	/* trie with just one leaf */
+ +
+ +	return leaf_walk_rcu(p, l);
+ +}
+ +
+ +static struct tnode *trie_leafindex(struct trie *t, int index)
+ +{
+ +	struct tnode *l = trie_firstleaf(t);
+ +
+ +	while (l && index-- > 0)
+ +		l = trie_nextleaf(l);
+ +
+ +	return l;
+ +}
+ +
+ +
+ +/*
+ + * Caller must hold RTNL.
+ + */
+ +int fib_table_flush(struct fib_table *tb)
+ +{
+ +	struct trie *t = (struct trie *) tb->tb_data;
+ +	struct tnode *l, *ll = NULL;
+ +	int found = 0;
+ +
+ +	for (l = trie_firstleaf(t); l; l = trie_nextleaf(l)) {
+ +		found += trie_flush_leaf(l);
+ +
+ +		if (ll) {
+ +			if (hlist_empty(&ll->list))
+ +				trie_leaf_remove(t, ll);
+ +			else
+ +				leaf_pull_suffix(ll);
+  		}
+ +
+ +		ll = l;
+ +	}
+ +
+ +	if (ll) {
+ +		if (hlist_empty(&ll->list))
+ +			trie_leaf_remove(t, ll);
+ +		else
+ +			leaf_pull_suffix(ll);
+  	}
+  
+  	pr_debug("trie_flush found=%d\n", found);
+* Unmerged path net/ipv4/fib_trie.c
