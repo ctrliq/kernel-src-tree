@@ -1,0 +1,118 @@
+nfsd: convert nfs4_file searches to use RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@primarydata.com>
+commit 5b095e99928cc13332d364f7cca7a9ca684369b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5b095e99.failed
+
+The global state_lock protects the file_hashtbl, and that has the
+potential to be a scalability bottleneck.
+
+Address this by making the file_hashtbl use RCU. Add a rcu_head to the
+nfs4_file and use that when freeing ones that have been hashed. In order
+to conserve space, we union the fi_rcu field with the fi_delegations
+list_head which must be clear by the time the last reference to the file
+is dropped.
+
+Convert find_file_locked to use RCU lookup primitives and not to require
+that the state_lock be held, and convert find_file to do a lockless
+lookup. Convert find_or_add_file to attempt a lockless lookup first, and
+then fall back to doing a locked search and insert if that fails to find
+anything.
+
+Also, minimize the number of times we need to calculate the hash value
+by passing it in as an argument to the search and insert functions, and
+optimize the order of arguments in nfsd4_init_file.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 5b095e99928cc13332d364f7cca7a9ca684369b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+diff --cc fs/nfsd/nfs4state.c
+index 562b28caa2a8,1379d86f7b4f..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -271,12 -275,14 +271,14 @@@ opaque_hashval(const void *ptr, int nby
+  	return x;
+  }
+  
+- static void nfsd4_free_file(struct nfs4_file *f)
++ static void nfsd4_free_file_rcu(struct rcu_head *rcu)
+  {
+- 	kmem_cache_free(file_slab, f);
++ 	struct nfs4_file *fp = container_of(rcu, struct nfs4_file, fi_rcu);
++ 
++ 	kmem_cache_free(file_slab, fp);
+  }
+  
+ -static inline void
+ +void
+  put_nfs4_file(struct nfs4_file *fi)
+  {
+  	might_lock(&state_lock);
+@@@ -3114,11 -3075,7 +3116,15 @@@ static void nfsd4_init_file(struct knfs
+  	fp->fi_share_deny = 0;
+  	memset(fp->fi_fds, 0, sizeof(fp->fi_fds));
+  	memset(fp->fi_access, 0, sizeof(fp->fi_access));
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NFSD_PNFS
+ +	INIT_LIST_HEAD(&fp->fi_lo_states);
+ +	atomic_set(&fp->fi_lo_recalls, 0);
+ +#endif
+ +	hlist_add_head(&fp->fi_hash, &file_hashtbl[hashval]);
+++=======
++ 	hlist_add_head_rcu(&fp->fi_hash, &file_hashtbl[hashval]);
+++>>>>>>> 5b095e99928c (nfsd: convert nfs4_file searches to use RCU)
+  }
+  
+  void
+@@@ -3341,17 -3296,14 +3347,23 @@@ move_to_close_lru(struct nfs4_ol_statei
+  
+  /* search file_hashtbl[] for file */
+  static struct nfs4_file *
+- find_file_locked(struct knfsd_fh *fh)
++ find_file_locked(struct knfsd_fh *fh, unsigned int hashval)
+  {
+- 	unsigned int hashval = file_hashval(fh);
+  	struct nfs4_file *fp;
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&state_lock);
+ +
+ +	hlist_for_each_entry(fp, &file_hashtbl[hashval], fi_hash) {
+ +		if (fh_match(&fp->fi_fhandle, fh)) {
+ +			get_nfs4_file(fp);
+ +			return fp;
+++=======
++ 	hlist_for_each_entry_rcu(fp, &file_hashtbl[hashval], fi_hash) {
++ 		if (nfsd_fh_match(&fp->fi_fhandle, fh)) {
++ 			if (atomic_inc_not_zero(&fp->fi_ref))
++ 				return fp;
+++>>>>>>> 5b095e99928c (nfsd: convert nfs4_file searches to use RCU)
+  		}
+  	}
+  	return NULL;
+* Unmerged path fs/nfsd/nfs4state.c
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 842085dcb758..478f2498b1b6 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -478,7 +478,10 @@ struct nfs4_file {
+ 	spinlock_t		fi_lock;
+ 	struct hlist_node       fi_hash;	/* hash on fi_fhandle */
+ 	struct list_head        fi_stateids;
+-	struct list_head	fi_delegations;
++	union {
++		struct list_head	fi_delegations;
++		struct rcu_head		fi_rcu;
++	};
+ 	/* One each for O_RDONLY, O_WRONLY, O_RDWR: */
+ 	struct file *		fi_fds[3];
+ 	/*
