@@ -1,0 +1,127 @@
+nfsd: fix pNFS return on close semantics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sachin Bhamare <sachin.bhamare@primarydata.com>
+commit 8287f009bd95a5e548059dba62a67727bb9549cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8287f009.failed
+
+For the sake of forgetful clients, the server should return the layouts
+to the file system on 'last close' of a file (assuming that there are no
+delegations outstanding to that particular client) or on delegreturn
+(assuming that there are no opens on a file from that particular
+client).
+
+In theory the information is all there in current data structures, but
+it's not efficiently available; nfs4_file->fi_ref includes references on
+the file across all clients, but we need a per-(client, file) count.
+Walking through lots of stateid's to calculate this on each close or
+delegreturn would be painful.
+
+This patch introduces infrastructure to maintain per-client opens and
+delegation counters on a per-file basis.
+
+[hch: ported to the mainline pNFS support, merged various fixes from Jeff]
+	Signed-off-by: Sachin Bhamare <sachin.bhamare@primarydata.com>
+	Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 8287f009bd95a5e548059dba62a67727bb9549cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+#	fs/nfsd/state.h
+diff --cc fs/nfsd/nfs4state.c
+index 479402aa7249,66067a291267..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -272,9 -280,11 +273,15 @@@ put_nfs4_file(struct nfs4_file *fi
+  	might_lock(&state_lock);
+  
+  	if (atomic_dec_and_lock(&fi->fi_ref, &state_lock)) {
+ -		hlist_del_rcu(&fi->fi_hash);
+ +		hlist_del(&fi->fi_hash);
+  		spin_unlock(&state_lock);
+++<<<<<<< HEAD
+ +		nfsd4_free_file(fi);
+++=======
++ 		WARN_ON_ONCE(!list_empty(&fi->fi_clnt_odstate));
++ 		WARN_ON_ONCE(!list_empty(&fi->fi_delegations));
++ 		call_rcu(&fi->fi_rcu, nfsd4_free_file_rcu);
+++>>>>>>> 8287f009bd95 (nfsd: fix pNFS return on close semantics)
+  	}
+  }
+  
+@@@ -707,15 -796,12 +797,21 @@@ unhash_delegation_locked(struct nfs4_de
+  
+  static void destroy_delegation(struct nfs4_delegation *dp)
+  {
+ +	bool unhashed;
+ +
+  	spin_lock(&state_lock);
+ -	unhash_delegation_locked(dp);
+ +	unhashed = unhash_delegation_locked(dp);
+  	spin_unlock(&state_lock);
+++<<<<<<< HEAD
+ +	if (unhashed) {
+ +		nfs4_put_deleg_lease(dp->dl_stid.sc_file);
+ +		nfs4_put_stid(&dp->dl_stid);
+ +	}
+++=======
++ 	put_clnt_odstate(dp->dl_clnt_odstate);
++ 	nfs4_put_deleg_lease(dp->dl_stid.sc_file);
++ 	nfs4_put_stid(&dp->dl_stid);
+++>>>>>>> 8287f009bd95 (nfsd: fix pNFS return on close semantics)
+  }
+  
+  static void revoke_delegation(struct nfs4_delegation *dp)
+@@@ -4165,9 -4237,11 +4286,11 @@@ void nfsd4_cleanup_open_state(struct nf
+  		nfs4_put_stateowner(so);
+  	}
+  	if (open->op_file)
+ -		kmem_cache_free(file_slab, open->op_file);
+ +		nfsd4_free_file(open->op_file);
+  	if (open->op_stp)
+  		nfs4_put_stid(&open->op_stp->st_stid);
++ 	if (open->op_odstate)
++ 		kmem_cache_free(odstate_slab, open->op_odstate);
+  }
+  
+  __be32
+diff --cc fs/nfsd/state.h
+index 93d2faef6355,bde45d90b746..000000000000
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@@ -478,7 -493,11 +490,15 @@@ struct nfs4_file 
+  	spinlock_t		fi_lock;
+  	struct hlist_node       fi_hash;	/* hash on fi_fhandle */
+  	struct list_head        fi_stateids;
+++<<<<<<< HEAD
+ +	struct list_head	fi_delegations;
+++=======
++ 	union {
++ 		struct list_head	fi_delegations;
++ 		struct rcu_head		fi_rcu;
++ 	};
++ 	struct list_head	fi_clnt_odstate;
+++>>>>>>> 8287f009bd95 (nfsd: fix pNFS return on close semantics)
+  	/* One each for O_RDONLY, O_WRONLY, O_RDWR: */
+  	struct file *		fi_fds[3];
+  	/*
+* Unmerged path fs/nfsd/nfs4state.c
+* Unmerged path fs/nfsd/state.h
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index 556ce2e47555..2c38cce6c812 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -247,6 +247,7 @@ struct nfsd4_open {
+ 	struct nfs4_openowner *op_openowner; /* used during processing */
+ 	struct nfs4_file *op_file;          /* used during processing */
+ 	struct nfs4_ol_stateid *op_stp;	    /* used during processing */
++	struct nfs4_clnt_odstate *op_odstate; /* used during processing */
+ 	struct nfs4_acl *op_acl;
+ 	struct xdr_netobj op_label;
+ };
