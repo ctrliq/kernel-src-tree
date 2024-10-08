@@ -1,0 +1,389 @@
+bonding: initial RCU conversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author nikolay@redhat.com <nikolay@redhat.com>
+commit 278b20837511776dc9d5f6ee1c7fabd5479838bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/278b2083.failed
+
+This patch does the initial bonding conversion to RCU. After it the
+following modes are protected by RCU alone: roundrobin, active-backup,
+broadcast and xor. Modes ALB/TLB and 3ad still acquire bond->lock for
+reading, and will be dealt with later. curr_active_slave needs to be
+dereferenced via rcu in the converted modes because the only thing
+protecting the slave after this patch is rcu_read_lock, so we need the
+proper barrier for weakly ordered archs and to make sure we don't have
+stale pointer. It's not tagged with __rcu yet because there's still work
+to be done to remove the curr_slave_lock, so sparse will complain when
+rcu_assign_pointer and rcu_dereference are used, but the alternative to use
+rcu_dereference_protected would've created much bigger code churn which is
+more difficult to test and review. That will be converted in time.
+
+1. Active-backup mode
+ 1.1 Perf recording while doing iperf -P 4
+  - old bonding: iperf spent 0.55% in bonding, system spent 0.29% CPU
+                 in bonding
+  - new bonding: iperf spent 0.29% in bonding, system spent 0.15% CPU
+                 in bonding
+ 1.2. Bandwidth measurements
+  - old bonding: 16.1 gbps consistently
+  - new bonding: 17.5 gbps consistently
+
+2. Round-robin mode
+ 2.1 Perf recording while doing iperf -P 4
+  - old bonding: iperf spent 0.51% in bonding, system spent 0.24% CPU
+                 in bonding
+  - new bonding: iperf spent 0.16% in bonding, system spent 0.11% CPU
+                 in bonding
+ 2.2 Bandwidth measurements
+  - old bonding: 8 gbps (variable due to packet reorderings)
+  - new bonding: 10 gbps (variable due to packet reorderings)
+
+Of course the latency has improved in all converted modes, and moreover
+while
+doing enslave/release (since it doesn't affect tx anymore).
+
+Also I've stress tested all modes doing enslave/release in a loop while
+transmitting traffic.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 278b20837511776dc9d5f6ee1c7fabd5479838bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index ef8213746e65,1d37a9657e0d..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1182,17 -1128,7 +1183,21 @@@ void bond_select_active_slave(struct bo
+   */
+  static void bond_attach_slave(struct bonding *bond, struct slave *new_slave)
+  {
+++<<<<<<< HEAD
+ +	if (bond->first_slave == NULL) { /* attaching the first slave */
+ +		new_slave->next = new_slave;
+ +		new_slave->prev = new_slave;
+ +		bond->first_slave = new_slave;
+ +	} else {
+ +		new_slave->next = bond->first_slave;
+ +		new_slave->prev = bond->first_slave->prev;
+ +		new_slave->next->prev = new_slave;
+ +		new_slave->prev->next = new_slave;
+ +	}
+ +
+++=======
++ 	list_add_tail_rcu(&new_slave->list, &bond->slave_list);
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  	bond->slave_cnt++;
+  }
+  
+@@@ -1208,22 -1144,7 +1213,26 @@@
+   */
+  static void bond_detach_slave(struct bonding *bond, struct slave *slave)
+  {
+++<<<<<<< HEAD
+ +	if (slave->next)
+ +		slave->next->prev = slave->prev;
+ +
+ +	if (slave->prev)
+ +		slave->prev->next = slave->next;
+ +
+ +	if (bond->first_slave == slave) { /* slave is the first slave */
+ +		if (bond->slave_cnt > 1) { /* there are more slave */
+ +			bond->first_slave = slave->next;
+ +		} else {
+ +			bond->first_slave = NULL; /* slave was the last one */
+ +		}
+ +	}
+ +
+ +	slave->next = NULL;
+ +	slave->prev = NULL;
+++=======
++ 	list_del_rcu(&slave->list);
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  	bond->slave_cnt--;
+  }
+  
+@@@ -2053,8 -1984,9 +2062,9 @@@ static int __bond_release_one(struct ne
+  
+  	write_unlock_bh(&bond->lock);
+  	unblock_netpoll_tx();
++ 	synchronize_rcu();
+  
+ -	if (list_empty(&bond->slave_list)) {
+ +	if (bond->slave_cnt == 0) {
+  		call_netdevice_notifiers(NETDEV_CHANGEADDR, bond->dev);
+  		call_netdevice_notifiers(NETDEV_RELEASE, bond->dev);
+  	}
+@@@ -3914,6 -3797,45 +3924,48 @@@ unwind
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * bond_xmit_slave_id - transmit skb through slave with slave_id
++  * @bond: bonding device that is transmitting
++  * @skb: buffer to transmit
++  * @slave_id: slave id up to slave_cnt-1 through which to transmit
++  *
++  * This function tries to transmit through slave with slave_id but in case
++  * it fails, it tries to find the first available slave for transmission.
++  * The skb is consumed in all cases, thus the function is void.
++  */
++ void bond_xmit_slave_id(struct bonding *bond, struct sk_buff *skb, int slave_id)
++ {
++ 	struct slave *slave;
++ 	int i = slave_id;
++ 
++ 	/* Here we start from the slave with slave_id */
++ 	bond_for_each_slave_rcu(bond, slave) {
++ 		if (--i < 0) {
++ 			if (slave_can_tx(slave)) {
++ 				bond_dev_queue_xmit(bond, skb, slave->dev);
++ 				return;
++ 			}
++ 		}
++ 	}
++ 
++ 	/* Here we start from the first slave up to slave_id */
++ 	i = slave_id;
++ 	bond_for_each_slave_rcu(bond, slave) {
++ 		if (--i < 0)
++ 			break;
++ 		if (slave_can_tx(slave)) {
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 			return;
++ 		}
++ 	}
++ 	/* no slave that can tx has been found */
++ 	kfree_skb(skb);
++ }
++ 
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+@@@ -3928,40 -3849,15 +3980,49 @@@
+  	 * send the join/membership reports.  The curr_active_slave found
+  	 * will send all of this type of traffic.
+  	 */
+++<<<<<<< HEAD
+ +	if ((iph->protocol == IPPROTO_IGMP) &&
+ +	    (skb->protocol == htons(ETH_P_IP))) {
+ +		slave = bond->curr_active_slave;
+ +		if (!slave)
+ +			goto out;
+++=======
++ 	if (iph->protocol == IPPROTO_IGMP && skb->protocol == htons(ETH_P_IP)) {
++ 		slave = rcu_dereference(bond->curr_active_slave);
++ 		if (slave && slave_can_tx(slave))
++ 			bond_dev_queue_xmit(bond, skb, slave->dev);
++ 		else
++ 			bond_xmit_slave_id(bond, skb, 0);
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  	} else {
+ -		bond_xmit_slave_id(bond, skb,
+ -				   bond->rr_tx_counter++ % bond->slave_cnt);
+ +		/*
+ +		 * Concurrent TX may collide on rr_tx_counter; we accept
+ +		 * that as being rare enough not to justify using an
+ +		 * atomic op here.
+ +		 */
+ +		slave_no = bond->rr_tx_counter++ % bond->slave_cnt;
+ +
+ +		bond_for_each_slave(bond, slave, i) {
+ +			slave_no--;
+ +			if (slave_no < 0)
+ +				break;
+ +		}
+ +	}
+ +
+ +	start_at = slave;
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (IS_UP(slave->dev) &&
+ +		    (slave->link == BOND_LINK_UP) &&
+ +		    bond_is_active_slave(slave)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+ +
+ +out:
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+  	}
+  
+  	return NETDEV_TX_OK;
+@@@ -3976,14 -3871,11 +4037,14 @@@ static int bond_xmit_activebackup(struc
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+  	struct slave *slave;
+ +	int res = 1;
+  
+- 	slave = bond->curr_active_slave;
++ 	slave = rcu_dereference(bond->curr_active_slave);
+  	if (slave)
+ -		bond_dev_queue_xmit(bond, skb, slave->dev);
+ -	else
+ +		res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +
+ +	if (res)
+ +		/* no suitable interface, frame not sent */
+  		kfree_skb(skb);
+  
+  	return NETDEV_TX_OK;
+@@@ -4090,7 -3957,7 +4151,11 @@@ static inline int bond_slave_override(s
+  		return 1;
+  
+  	/* Find out if any slaves have the same mapping as this skb. */
+++<<<<<<< HEAD
+ +	bond_for_each_slave(bond, check_slave, i) {
+++=======
++ 	bond_for_each_slave_rcu(bond, check_slave) {
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  		if (check_slave->queue_id == skb->queue_mapping) {
+  			slave = check_slave;
+  			break;
+@@@ -4175,9 -4042,8 +4240,14 @@@ static netdev_tx_t bond_start_xmit(stru
+  	if (is_netpoll_tx_blocked(dev))
+  		return NETDEV_TX_BUSY;
+  
+++<<<<<<< HEAD
+ +	read_lock(&bond->lock);
+ +
+ +	if (bond->slave_cnt)
+++=======
++ 	rcu_read_lock();
++ 	if (!list_empty(&bond->slave_list))
+++>>>>>>> 278b20837511 (bonding: initial RCU conversion)
+  		ret = __bond_start_xmit(skb, dev);
+  	else
+  		kfree_skb(skb);
+diff --git a/drivers/net/bonding/bond_3ad.c b/drivers/net/bonding/bond_3ad.c
+index 390061d09693..087928bbc698 100644
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@ -2415,6 +2415,7 @@ int bond_3ad_xmit_xor(struct sk_buff *skb, struct net_device *dev)
+ 	struct ad_info ad_info;
+ 	int res = 1;
+ 
++	read_lock(&bond->lock);
+ 	if (__bond_3ad_get_active_agg_info(bond, &ad_info)) {
+ 		pr_debug("%s: Error: __bond_3ad_get_active_agg_info failed\n",
+ 			 dev->name);
+@@ -2464,6 +2465,7 @@ int bond_3ad_xmit_xor(struct sk_buff *skb, struct net_device *dev)
+ 	}
+ 
+ out:
++	read_unlock(&bond->lock);
+ 	if (res) {
+ 		/* no suitable interface, frame not sent */
+ 		kfree_skb(skb);
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index 03b70088d85c..0eb0851668bd 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -1342,6 +1342,7 @@ int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+ 
+ 	/* make sure that the curr_active_slave do not change during tx
+ 	 */
++	read_lock(&bond->lock);
+ 	read_lock(&bond->curr_slave_lock);
+ 
+ 	switch (ntohs(skb->protocol)) {
+@@ -1446,11 +1447,12 @@ int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+ 	}
+ 
+ 	read_unlock(&bond->curr_slave_lock);
+-
++	read_unlock(&bond->lock);
+ 	if (res) {
+ 		/* no suitable interface, frame not sent */
+ 		kfree_skb(skb);
+ 	}
++
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -1672,7 +1674,7 @@ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave
+ 	}
+ 
+ 	swap_slave = bond->curr_active_slave;
+-	bond->curr_active_slave = new_slave;
++	rcu_assign_pointer(bond->curr_active_slave, new_slave);
+ 
+ 	if (!new_slave || (bond->slave_cnt == 0)) {
+ 		return;
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index c0344ce23f37..060a906fab1c 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -1250,16 +1250,16 @@ static ssize_t bonding_show_active_slave(struct device *d,
+ 					 struct device_attribute *attr,
+ 					 char *buf)
+ {
+-	struct slave *curr;
+ 	struct bonding *bond = to_bond(d);
++	struct slave *curr;
+ 	int count = 0;
+ 
+-	read_lock(&bond->curr_slave_lock);
+-	curr = bond->curr_active_slave;
+-	read_unlock(&bond->curr_slave_lock);
+-
++	rcu_read_lock();
++	curr = rcu_dereference(bond->curr_active_slave);
+ 	if (USES_PRIMARY(bond->params.mode) && curr)
+ 		count = sprintf(buf, "%s\n", curr->dev->name);
++	rcu_read_unlock();
++
+ 	return count;
+ }
+ 
+@@ -1293,7 +1293,7 @@ static ssize_t bonding_store_active_slave(struct device *d,
+ 	if (!strlen(ifname) || buf[0] == '\n') {
+ 		pr_info("%s: Clearing current active slave.\n",
+ 			bond->dev->name);
+-		bond->curr_active_slave = NULL;
++		rcu_assign_pointer(bond->curr_active_slave, NULL);
+ 		bond_select_active_slave(bond);
+ 		goto out;
+ 	}
+@@ -1356,14 +1356,9 @@ static ssize_t bonding_show_mii_status(struct device *d,
+ 				       struct device_attribute *attr,
+ 				       char *buf)
+ {
+-	struct slave *curr;
+ 	struct bonding *bond = to_bond(d);
+ 
+-	read_lock(&bond->curr_slave_lock);
+-	curr = bond->curr_active_slave;
+-	read_unlock(&bond->curr_slave_lock);
+-
+-	return sprintf(buf, "%s\n", curr ? "up" : "down");
++	return sprintf(buf, "%s\n", bond->curr_active_slave ? "up" : "down");
+ }
+ static DEVICE_ATTR(mii_status, S_IRUGO, bonding_show_mii_status, NULL);
+ 
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 4bb1446618e2..abdfb6e5171c 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -100,6 +100,10 @@
+ 	     ((cnt < (bond)->slave_cnt) && (pos != (stop)->next));	\
+              cnt++, pos = (pos)->next)
+ 
++/* Caller must have rcu_read_lock */
++#define bond_for_each_slave_rcu(bond, pos) \
++	list_for_each_entry_rcu(pos, &(bond)->slave_list, list)
++
+ /**
+  * bond_for_each_slave - iterate the slaves list from head
+  * @bond:	the bond holding this list.
