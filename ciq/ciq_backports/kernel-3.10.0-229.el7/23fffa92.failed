@@ -1,0 +1,118 @@
+fs: move falloc collapse range check into the filesystem methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [fs] ext4: move falloc collapse range check into the filesystem methods (Lukas Czerner) [1150171]
+Rebuild_FUZZ: 95.38%
+commit-author Lukas Czerner <lczerner@redhat.com>
+commit 23fffa925ea2c9a2bcb1a4453e2c542635aa3545
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/23fffa92.failed
+
+Currently in do_fallocate in collapse range case we're checking
+whether offset + len is not bigger than i_size.  However there is
+nothing which would prevent i_size from changing so the check is
+pointless.  It should be done in the file system itself and the file
+system needs to make sure that i_size is not going to change.  The
+i_size check for the other fallocate modes are also done in the
+filesystems.
+
+As it is now we can easily crash the kernel by having two processes
+doing truncate and fallocate collapse range at the same time.  This
+can be reproduced on ext4 and it is theoretically possible on xfs even
+though I was not able to trigger it with this simple test.
+
+This commit removes the check from do_fallocate and adds it to the
+file system.
+
+	Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+	Acked-by: Dave Chinner <david@fromorbit.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 23fffa925ea2c9a2bcb1a4453e2c542635aa3545)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+#	fs/xfs/xfs_file.c
+diff --cc fs/ext4/extents.c
+index 098279c61cc8,ac5460d0d133..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -5116,9 -5396,12 +5114,18 @@@ int ext4_collapse_range(struct inode *i
+  	/* Take mutex lock */
+  	mutex_lock(&inode->i_mutex);
+  
+++<<<<<<< HEAD
+ +	/* It's not possible punch hole on append only file */
+ +	if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) {
+ +		ret = -EPERM;
+++=======
++ 	/*
++ 	 * There is no need to overlap collapse range with EOF, in which case
++ 	 * it is effectively a truncate operation
++ 	 */
++ 	if (offset + len >= i_size_read(inode)) {
++ 		ret = -EINVAL;
+++>>>>>>> 23fffa925ea2 (fs: move falloc collapse range check into the filesystem methods)
+  		goto out_mutex;
+  	}
+  
+diff --cc fs/xfs/xfs_file.c
+index 5b02668e1067,3cb528c4f27c..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -840,6 -832,28 +840,31 @@@ xfs_file_fallocate
+  		error = xfs_free_file_space(ip, offset, len);
+  		if (error)
+  			goto out_unlock;
+++<<<<<<< HEAD
+++=======
++ 	} else if (mode & FALLOC_FL_COLLAPSE_RANGE) {
++ 		unsigned blksize_mask = (1 << inode->i_blkbits) - 1;
++ 
++ 		if (offset & blksize_mask || len & blksize_mask) {
++ 			error = -EINVAL;
++ 			goto out_unlock;
++ 		}
++ 
++ 		/*
++ 		 * There is no need to overlap collapse range with EOF,
++ 		 * in which case it is effectively a truncate operation
++ 		 */
++ 		if (offset + len >= i_size_read(inode)) {
++ 			error = -EINVAL;
++ 			goto out_unlock;
++ 		}
++ 
++ 		new_size = i_size_read(inode) - len;
++ 
++ 		error = xfs_collapse_file_space(ip, offset, len);
++ 		if (error)
++ 			goto out_unlock;
+++>>>>>>> 23fffa925ea2 (fs: move falloc collapse range check into the filesystem methods)
+  	} else {
+  		if (!(mode & FALLOC_FL_KEEP_SIZE) &&
+  		    offset + len > i_size_read(inode)) {
+* Unmerged path fs/ext4/extents.c
+diff --git a/fs/open.c b/fs/open.c
+index 05cad6df8e3f..f2efc37410c2 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -281,14 +281,6 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+ 	if (((offset + len) > inode->i_sb->s_maxbytes) || ((offset + len) < 0))
+ 		return -EFBIG;
+ 
+-	/*
+-	 * There is no need to overlap collapse range with EOF, in which case
+-	 * it is effectively a truncate operation
+-	 */
+-	if ((mode & FALLOC_FL_COLLAPSE_RANGE) &&
+-	    (offset + len >= i_size_read(inode)))
+-		return -EINVAL;
+-
+ 	if (!file->f_op->fallocate)
+ 		return -EOPNOTSUPP;
+ 
+* Unmerged path fs/xfs/xfs_file.c
