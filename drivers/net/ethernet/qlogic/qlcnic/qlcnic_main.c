@@ -431,6 +431,9 @@ static void qlcnic_82xx_cancel_idc_work(struct qlcnic_adapter *adapter)
 	while (test_and_set_bit(__QLCNIC_RESETTING, &adapter->state))
 		usleep_range(10000, 11000);
 
+	if (!adapter->fw_work.work.func)
+		return;
+
 	cancel_delayed_work_sync(&adapter->fw_work);
 }
 
@@ -2276,8 +2279,9 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		adapter->portnum = adapter->ahw->pci_func;
 		err = qlcnic_start_firmware(adapter);
 		if (err) {
-			dev_err(&pdev->dev, "Loading fw failed.Please Reboot\n");
-			goto err_out_free_hw;
+			dev_err(&pdev->dev, "Loading fw failed.Please Reboot\n"
+				"\t\tIf reboot doesn't help, try flashing the card\n");
+			goto err_out_maintenance_mode;
 		}
 
 		qlcnic_get_multiq_capability(adapter);
@@ -2409,6 +2413,22 @@ err_out_disable_pdev:
 	pci_set_drvdata(pdev, NULL);
 	pci_disable_device(pdev);
 	return err;
+
+err_out_maintenance_mode:
+	netdev->netdev_ops = &qlcnic_netdev_failed_ops;
+	SET_ETHTOOL_OPS(netdev, &qlcnic_ethtool_failed_ops);
+	err = register_netdev(netdev);
+
+	if (err) {
+		dev_err(&pdev->dev, "Failed to register net device\n");
+		qlcnic_clr_all_drv_state(adapter, 0);
+		goto err_out_free_hw;
+	}
+
+	pci_set_drvdata(pdev, adapter);
+	qlcnic_add_sysfs(adapter);
+
+	return 0;
 }
 
 static void qlcnic_remove(struct pci_dev *pdev)
@@ -2519,7 +2539,15 @@ static int qlcnic_resume(struct pci_dev *pdev)
 static int qlcnic_open(struct net_device *netdev)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+	u32 state;
 	int err;
+
+	state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
+	if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD) {
+		netdev_err(netdev, "%s: Device is in FAILED state\n", __func__);
+
+		return -EIO;
+	}
 
 	netif_carrier_off(netdev);
 
@@ -3223,6 +3251,13 @@ void qlcnic_82xx_dev_request_reset(struct qlcnic_adapter *adapter, u32 key)
 		return;
 
 	state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
+	if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD) {
+		netdev_err(adapter->netdev, "%s: Device is in FAILED state\n",
+			   __func__);
+		qlcnic_api_unlock(adapter);
+
+		return;
+	}
 
 	if (state == QLCNIC_DEV_READY) {
 		QLC_SHARED_REG_WR32(adapter, QLCNIC_CRB_DEV_STATE,
