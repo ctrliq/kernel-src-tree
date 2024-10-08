@@ -1,0 +1,128 @@
+perf: Decouple unthrottling and rotating
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] Decouple unthrottling and rotating (Jiri Olsa) [1209607]
+Rebuild_FUZZ: 91.89%
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 2fde4f94e0a9531251e706fa57131b51b0df042e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2fde4f94.failed
+
+Currently the adjusments made as part of perf_event_task_tick() use the
+percpu rotation lists to iterate over any active PMU contexts, but these
+are not used by the context rotation code, having been replaced by
+separate (per-context) hrtimer callbacks. However, some manipulation of
+the rotation lists (i.e. removal of contexts) has remained in
+perf_rotate_context(). This leads to the following issues:
+
+* Contexts are not always removed from the rotation lists. Removal of
+  PMUs which have been placed in rotation lists, but have not been
+  removed by a hrtimer callback can result in corruption of the rotation
+  lists (when memory backing the context is freed).
+
+  This has been observed to result in hangs when PMU drivers built as
+  modules are inserted and removed around the creation of events for
+  said PMUs.
+
+* Contexts which do not require rotation may be removed from the
+  rotation lists as a result of a hrtimer, and will not be considered by
+  the unthrottling code in perf_event_task_tick.
+
+This patch fixes the issue by updating the rotation ist when events are
+scheduled in/out, ensuring that each rotation list stays in sync with
+the HW state. As each event holds a refcount on the module of its PMU,
+this ensures that when a PMU module is unloaded none of its CPU contexts
+can be in a rotation list. By maintaining a list of perf_event_contexts
+rather than perf_event_cpu_contexts, we don't need separate paths to
+handle the cpu and task contexts, which also makes the code a little
+simpler.
+
+As the rotation_list variables are not used for rotation, these are
+renamed to active_ctx_list, which better matches their current function.
+perf_pmu_rotate_{start,stop} are renamed to
+perf_pmu_ctx_{activate,deactivate}.
+
+	Reported-by: Johannes Jensen <johannes.jensen@arm.com>
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Will Deacon <Will.Deacon@arm.com>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20150129134511.GR17721@leverpostej
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2fde4f94e0a9531251e706fa57131b51b0df042e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 093406211bc9,7f2fbb8b5069..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -888,17 -872,17 +888,22 @@@ void perf_pmu_enable(struct pmu *pmu
+  		pmu->pmu_enable(pmu);
+  }
+  
+- static DEFINE_PER_CPU(struct list_head, rotation_list);
++ static DEFINE_PER_CPU(struct list_head, active_ctx_list);
+  
+  /*
+-  * perf_pmu_rotate_start() and perf_rotate_context() are fully serialized
+-  * because they're strictly cpu affine and rotate_start is called with IRQs
+-  * disabled, while rotate_context is called from IRQ context.
++  * perf_event_ctx_activate(), perf_event_ctx_deactivate(), and
++  * perf_event_task_tick() are fully serialized because they're strictly cpu
++  * affine and perf_event_ctx{activate,deactivate} are called with IRQs
++  * disabled, while perf_event_task_tick is called from IRQ context.
+   */
+- static void perf_pmu_rotate_start(struct pmu *pmu)
++ static void perf_event_ctx_activate(struct perf_event_context *ctx)
+  {
+++<<<<<<< HEAD
+ +	struct perf_cpu_context *cpuctx = this_cpu_ptr(pmu->pmu_cpu_context);
+ +	struct list_head *head = &__get_cpu_var(rotation_list);
+++=======
++ 	struct list_head *head = this_cpu_ptr(&active_ctx_list);
+++>>>>>>> 2fde4f94e0a9 (perf: Decouple unthrottling and rotating)
+  
+  	WARN_ON(!irqs_disabled());
+  
+@@@ -3112,9 -3091,8 +3112,14 @@@ bool perf_event_can_stop_tick(void
+  
+  void perf_event_task_tick(void)
+  {
+++<<<<<<< HEAD
+ +	struct list_head *head = &__get_cpu_var(rotation_list);
+ +	struct perf_cpu_context *cpuctx, *tmp;
+ +	struct perf_event_context *ctx;
+++=======
++ 	struct list_head *head = this_cpu_ptr(&active_ctx_list);
++ 	struct perf_event_context *ctx, *tmp;
+++>>>>>>> 2fde4f94e0a9 (perf: Decouple unthrottling and rotating)
+  	int throttled;
+  
+  	WARN_ON(!irqs_disabled());
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index c585d3fabc76..dab9d954a897 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -492,6 +492,7 @@ struct perf_event_context {
+ 	 */
+ 	struct mutex			mutex;
+ 
++	struct list_head		active_ctx_list;
+ 	struct list_head		pinned_groups;
+ 	struct list_head		flexible_groups;
+ 	struct list_head		event_list;
+@@ -542,7 +543,6 @@ struct perf_cpu_context {
+ 	int				exclusive;
+ 	struct hrtimer			hrtimer;
+ 	ktime_t				hrtimer_interval;
+-	struct list_head		rotation_list;
+ 	struct pmu			*unique_pmu;
+ 	struct perf_cgroup		*cgrp;
+ };
+* Unmerged path kernel/events/core.c
