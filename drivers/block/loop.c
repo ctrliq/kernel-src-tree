@@ -1000,7 +1000,7 @@ static int loop_clr_fd(struct loop_device *lo)
 	 * <dev>/do something like mkfs/losetup -d <dev> causing the losetup -d
 	 * command to fail with EBUSY.
 	 */
-	if (lo->lo_refcnt > 1) {
+	if (atomic_read(&lo->lo_refcnt) > 1) {
 		lo->lo_flags |= LO_FLAGS_AUTOCLEAR;
 		mutex_unlock(&lo->lo_ctl_mutex);
 		return 0;
@@ -1008,6 +1008,9 @@ static int loop_clr_fd(struct loop_device *lo)
 
 	if (filp == NULL)
 		return -EINVAL;
+
+	/* freeze request queue during the transition */
+	blk_mq_freeze_queue(lo->lo_queue);
 
 	spin_lock_irq(&lo->lo_lock);
 	lo->lo_state = Lo_rundown;
@@ -1046,6 +1049,8 @@ static int loop_clr_fd(struct loop_device *lo)
 	lo->lo_state = Lo_unbound;
 	/* This is safe: open() is still holding a reference. */
 	module_put(THIS_MODULE);
+	blk_mq_unfreeze_queue(lo->lo_queue);
+
 	if (lo->lo_flags & LO_FLAGS_PARTSCAN && bdev)
 		ioctl_by_bdev(bdev, BLKRRPART, 0);
 	lo->lo_flags = 0;
@@ -1503,9 +1508,7 @@ static int lo_open(struct block_device *bdev, fmode_t mode)
 		goto out;
 	}
 
-	mutex_lock(&lo->lo_ctl_mutex);
-	lo->lo_refcnt++;
-	mutex_unlock(&lo->lo_ctl_mutex);
+	atomic_inc(&lo->lo_refcnt);
 out:
 	mutex_unlock(&loop_index_mutex);
 	return err;
@@ -1516,11 +1519,10 @@ static void lo_release(struct gendisk *disk, fmode_t mode)
 	struct loop_device *lo = disk->private_data;
 	int err;
 
+	if (atomic_dec_return(&lo->lo_refcnt))
+		return;
+
 	mutex_lock(&lo->lo_ctl_mutex);
-
-	if (--lo->lo_refcnt)
-		goto out;
-
 	if (lo->lo_flags & LO_FLAGS_AUTOCLEAR) {
 		/*
 		 * In autoclear mode, stop the loop thread
@@ -1662,6 +1664,7 @@ static int loop_add(struct loop_device **l, int i)
 		disk->flags |= GENHD_FL_NO_PART_SCAN;
 	disk->flags |= GENHD_FL_EXT_DEVT;
 	mutex_init(&lo->lo_ctl_mutex);
+	atomic_set(&lo->lo_refcnt, 0);
 	lo->lo_number		= i;
 	lo->lo_thread		= NULL;
 	init_waitqueue_head(&lo->lo_event);
@@ -1779,7 +1782,7 @@ static long loop_control_ioctl(struct file *file, unsigned int cmd,
 			mutex_unlock(&lo->lo_ctl_mutex);
 			break;
 		}
-		if (lo->lo_refcnt > 0) {
+		if (atomic_read(&lo->lo_refcnt) > 0) {
 			ret = -EBUSY;
 			mutex_unlock(&lo->lo_ctl_mutex);
 			break;
