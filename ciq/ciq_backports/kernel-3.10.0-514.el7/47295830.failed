@@ -1,0 +1,70 @@
+cpuset: fix a locking issue in cpuset_migrate_mm()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Li Zefan <lizefan@huawei.com>
+commit 4729583006772b9530404bc1bb7c3aa4a10ffd4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/47295830.failed
+
+I can trigger a lockdep warning:
+
+  # mount -t cgroup -o cpuset xxx /cgroup
+  # mkdir /cgroup/cpuset
+  # mkdir /cgroup/tmp
+  # echo 0 > /cgroup/tmp/cpuset.cpus
+  # echo 0 > /cgroup/tmp/cpuset.mems
+  # echo 1 > /cgroup/tmp/cpuset.memory_migrate
+  # echo $$ > /cgroup/tmp/tasks
+  # echo 1 > /cgruop/tmp/cpuset.mems
+
+  ===============================
+  [ INFO: suspicious RCU usage. ]
+  3.14.0-rc1-0.1-default+ #32 Not tainted
+  -------------------------------
+  include/linux/cgroup.h:682 suspicious rcu_dereference_check() usage!
+  ...
+    [<ffffffff81582174>] dump_stack+0x72/0x86
+    [<ffffffff810b8f01>] lockdep_rcu_suspicious+0x101/0x140
+    [<ffffffff81105ba1>] cpuset_migrate_mm+0xb1/0xe0
+  ...
+
+We used to hold cgroup_mutex when calling cpuset_migrate_mm(), but now
+we hold cpuset_mutex, which causes task_css() to complain.
+
+This is not a false-positive but a real issue.
+
+Holding cpuset_mutex won't prevent a task from migrating to another
+cpuset, and it won't prevent the original task->cgroup from destroying
+during this change.
+
+Fixes: 5d21cc2db040 (cpuset: replace cgroup_mutex locking with cpuset internal locking)
+	Cc: <stable@vger.kernel.org> # 3.9+
+	Signed-off-by: Li Zefan <lizefan@huawei.com>
+Sigend-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 4729583006772b9530404bc1bb7c3aa4a10ffd4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cpuset.c
+diff --cc kernel/cpuset.c
+index 7e3a1129e077,dba9e4aef69a..000000000000
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@@ -957,7 -990,10 +951,14 @@@ static void cpuset_migrate_mm(struct mm
+  
+  	do_migrate_pages(mm, from, to, MPOL_MF_MOVE_ALL);
+  
+++<<<<<<< HEAD
+ +	guarantee_online_mems(task_cs(tsk),&tsk->mems_allowed);
+++=======
++ 	rcu_read_lock();
++ 	mems_cs = effective_nodemask_cpuset(task_cs(tsk));
++ 	guarantee_online_mems(mems_cs, &tsk->mems_allowed);
++ 	rcu_read_unlock();
+++>>>>>>> 472958300677 (cpuset: fix a locking issue in cpuset_migrate_mm())
+  }
+  
+  /*
+* Unmerged path kernel/cpuset.c
