@@ -1,0 +1,147 @@
+net: Support for csum_bad in skbuff
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] Support for csum_bad in skbuff (Florian Westphal) [1131999]
+Rebuild_FUZZ: 92.31%
+commit-author Tom Herbert <therbert@google.com>
+commit 5a21232983aa7acfe7fd26170832a9e0a4a7b4ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5a212329.failed
+
+This flag indicates that an invalid checksum was detected in the
+packet. __skb_mark_checksum_bad helper function was added to set this.
+
+Checksums can be marked bad from a driver or the GRO path (the latter
+is implemented in this patch). csum_bad is checked in
+__skb_checksum_validate_complete (i.e. calling that when ip_summed ==
+CHECKSUM_NONE).
+
+csum_bad works in conjunction with ip_summed value. In the case that
+ip_summed is CHECKSUM_NONE and csum_bad is set, this implies that the
+first (or next) checksum encountered in the packet is bad. When
+ip_summed is CHECKSUM_UNNECESSARY, the first checksum after the last
+one validated is bad. For example, if ip_summed == CHECKSUM_UNNECESSARY,
+csum_level == 1, and csum_bad is set-- then the third checksum in the
+packet is bad. In the normal path, the packet will be dropped when
+processing the protocol layer of the bad checksum:
+__skb_decr_checksum_unnecessary called twice for the good checksums
+changing ip_summed to CHECKSUM_NONE so that
+__skb_checksum_validate_complete is called to validate the third
+checksum and that will fail since csum_bad is set.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5a21232983aa7acfe7fd26170832a9e0a4a7b4ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index 8237a39f2330,23710a243439..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -535,7 -616,9 +535,13 @@@ struct sk_buff 
+  	};
+  
+  	kmemcheck_bitfield_begin(flags3);
+++<<<<<<< HEAD
+ +	/* 16 bit hole */
+++=======
++ 	__u8			csum_level:2;
++ 	__u8			csum_bad:1;
++ 	/* 13 bit hole */
+++>>>>>>> 5a21232983aa (net: Support for csum_bad in skbuff)
+  	kmemcheck_bitfield_end(flags3);
+  
+  	__be16			inner_protocol;
+@@@ -2693,6 -2805,42 +2699,45 @@@ static inline __sum16 skb_checksum_comp
+  	       0 : __skb_checksum_complete(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __skb_decr_checksum_unnecessary(struct sk_buff *skb)
++ {
++ 	if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
++ 		if (skb->csum_level == 0)
++ 			skb->ip_summed = CHECKSUM_NONE;
++ 		else
++ 			skb->csum_level--;
++ 	}
++ }
++ 
++ static inline void __skb_incr_checksum_unnecessary(struct sk_buff *skb)
++ {
++ 	if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
++ 		if (skb->csum_level < SKB_MAX_CSUM_LEVEL)
++ 			skb->csum_level++;
++ 	} else if (skb->ip_summed == CHECKSUM_NONE) {
++ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 		skb->csum_level = 0;
++ 	}
++ }
++ 
++ static inline void __skb_mark_checksum_bad(struct sk_buff *skb)
++ {
++ 	/* Mark current checksum as bad (typically called from GRO
++ 	 * path). In the case that ip_summed is CHECKSUM_NONE
++ 	 * this must be the first checksum encountered in the packet.
++ 	 * When ip_summed is CHECKSUM_UNNECESSARY, this is the first
++ 	 * checksum after the last one validated. For UDP, a zero
++ 	 * checksum can not be marked as bad.
++ 	 */
++ 
++ 	if (skb->ip_summed == CHECKSUM_NONE ||
++ 	    skb->ip_summed == CHECKSUM_UNNECESSARY)
++ 		skb->csum_bad = 1;
++ }
++ 
+++>>>>>>> 5a21232983aa (net: Support for csum_bad in skbuff)
+  /* Check if we need to perform checksum complete validation.
+   *
+   * Returns true if checksum complete is needed, false otherwise
+@@@ -2732,9 -2879,12 +2777,12 @@@ static inline __sum16 __skb_checksum_va
+  {
+  	if (skb->ip_summed == CHECKSUM_COMPLETE) {
+  		if (!csum_fold(csum_add(psum, skb->csum))) {
+ -			skb->csum_valid = 1;
+ +			skb->ip_summed = CHECKSUM_UNNECESSARY;
+  			return 0;
+  		}
++ 	} else if (skb->csum_bad) {
++ 		/* ip_summed == CHECKSUM_NONE in this case */
++ 		return 1;
+  	}
+  
+  	skb->csum = psum;
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index f11cff50ae03..b417a4f31659 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1953,7 +1953,9 @@ static inline void skb_gro_incr_csum_unnecessary(struct sk_buff *skb)
+ 	if (__skb_gro_checksum_validate_needed(skb, zero_okay, check))	\
+ 		__ret = __skb_gro_checksum_validate_complete(skb,	\
+ 				compute_pseudo(skb, proto));		\
+-	if (!__ret)							\
++	if (__ret)							\
++		__skb_mark_checksum_bad(skb);				\
++	else								\
+ 		skb_gro_incr_csum_unnecessary(skb);			\
+ 	__ret;								\
+ })
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1f493766fca3..ac09a06f24da 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3763,7 +3763,7 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 	if (!(skb->dev->features & NETIF_F_GRO) || netpoll_rx_on(skb))
+ 		goto normal;
+ 
+-	if (skb_is_gso(skb) || skb_has_frag_list(skb))
++	if (skb_is_gso(skb) || skb_has_frag_list(skb) || skb->csum_bad)
+ 		goto normal;
+ 
+ 	skb_gro_reset_offset(skb);
