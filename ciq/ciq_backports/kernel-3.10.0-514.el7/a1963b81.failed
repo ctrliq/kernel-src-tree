@@ -1,0 +1,170 @@
+sched/deadline: Fix rt runtime corruption when dl fails its global constraints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Wanpeng Li <wanpeng.li@linux.intel.com>
+commit a1963b81deec54c113e770b0020e5f1c3188a087
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a1963b81.failed
+
+One version of sched_rt_global_constaints() (the !rt-cgroup one)
+changes state, therefore if we fail the later sched_dl_global_constraints()
+call the state is left in an inconsistent state.
+
+Fix this by changing the order of the calls.
+
+	Signed-off-by: Wanpeng Li <wanpeng.li@linux.intel.com>
+[ Improved the changelog. ]
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Juri Lelli <juri.lelli@arm.com>
+Link: http://lkml.kernel.org/r/1426590931-4639-2-git-send-email-wanpeng.li@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a1963b81deec54c113e770b0020e5f1c3188a087)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f8654b1100de,4b3b6887c6b1..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -7988,9 -7800,131 +7988,137 @@@ static int sched_rt_global_constraints(
+  	}
+  	raw_spin_unlock_irqrestore(&def_rt_bandwidth.rt_runtime_lock, flags);
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +}
+ +#endif /* CONFIG_RT_GROUP_SCHED */
+++=======
++ 	return ret;
++ }
++ #endif /* CONFIG_RT_GROUP_SCHED */
++ 
++ static int sched_dl_global_validate(void)
++ {
++ 	u64 runtime = global_rt_runtime();
++ 	u64 period = global_rt_period();
++ 	u64 new_bw = to_ratio(period, runtime);
++ 	struct dl_bw *dl_b;
++ 	int cpu, ret = 0;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Here we want to check the bandwidth not being set to some
++ 	 * value smaller than the currently allocated bandwidth in
++ 	 * any of the root_domains.
++ 	 *
++ 	 * FIXME: Cycling on all the CPUs is overdoing, but simpler than
++ 	 * cycling on root_domains... Discussion on different/better
++ 	 * solutions is welcome!
++ 	 */
++ 	for_each_possible_cpu(cpu) {
++ 		rcu_read_lock_sched();
++ 		dl_b = dl_bw_of(cpu);
++ 
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		if (new_bw < dl_b->total_bw)
++ 			ret = -EBUSY;
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 
++ 		rcu_read_unlock_sched();
++ 
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void sched_dl_do_global(void)
++ {
++ 	u64 new_bw = -1;
++ 	struct dl_bw *dl_b;
++ 	int cpu;
++ 	unsigned long flags;
++ 
++ 	def_dl_bandwidth.dl_period = global_rt_period();
++ 	def_dl_bandwidth.dl_runtime = global_rt_runtime();
++ 
++ 	if (global_rt_runtime() != RUNTIME_INF)
++ 		new_bw = to_ratio(global_rt_period(), global_rt_runtime());
++ 
++ 	/*
++ 	 * FIXME: As above...
++ 	 */
++ 	for_each_possible_cpu(cpu) {
++ 		rcu_read_lock_sched();
++ 		dl_b = dl_bw_of(cpu);
++ 
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		dl_b->bw = new_bw;
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 
++ 		rcu_read_unlock_sched();
++ 	}
++ }
++ 
++ static int sched_rt_global_validate(void)
++ {
++ 	if (sysctl_sched_rt_period <= 0)
++ 		return -EINVAL;
++ 
++ 	if ((sysctl_sched_rt_runtime != RUNTIME_INF) &&
++ 		(sysctl_sched_rt_runtime > sysctl_sched_rt_period))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static void sched_rt_do_global(void)
++ {
++ 	def_rt_bandwidth.rt_runtime = global_rt_runtime();
++ 	def_rt_bandwidth.rt_period = ns_to_ktime(global_rt_period());
++ }
++ 
++ int sched_rt_handler(struct ctl_table *table, int write,
++ 		void __user *buffer, size_t *lenp,
++ 		loff_t *ppos)
++ {
++ 	int old_period, old_runtime;
++ 	static DEFINE_MUTEX(mutex);
++ 	int ret;
++ 
++ 	mutex_lock(&mutex);
++ 	old_period = sysctl_sched_rt_period;
++ 	old_runtime = sysctl_sched_rt_runtime;
++ 
++ 	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++ 
++ 	if (!ret && write) {
++ 		ret = sched_rt_global_validate();
++ 		if (ret)
++ 			goto undo;
++ 
++ 		ret = sched_dl_global_validate();
++ 		if (ret)
++ 			goto undo;
++ 
++ 		ret = sched_rt_global_constraints();
++ 		if (ret)
++ 			goto undo;
++ 
++ 		sched_rt_do_global();
++ 		sched_dl_do_global();
++ 	}
++ 	if (0) {
++ undo:
++ 		sysctl_sched_rt_period = old_period;
++ 		sysctl_sched_rt_runtime = old_runtime;
++ 	}
++ 	mutex_unlock(&mutex);
++ 
++ 	return ret;
++ }
+++>>>>>>> a1963b81deec (sched/deadline: Fix rt runtime corruption when dl fails its global constraints)
+  
+  int sched_rr_handler(struct ctl_table *table, int write,
+  		void __user *buffer, size_t *lenp,
+* Unmerged path kernel/sched/core.c
