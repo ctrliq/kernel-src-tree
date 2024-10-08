@@ -1,0 +1,469 @@
+block,scsi: fixup blk_get_request dead queue scenarios
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [block] block, scsi: fixup blk_get_request dead queue scenarios (Jeff Moyer) [1209624]
+Rebuild_FUZZ: 99.08%
+commit-author Joe Lawrence <joe.lawrence@stratus.com>
+commit a492f075450f3ba87de36e5ffe92a9d0c7af9723
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a492f075.failed
+
+The blk_get_request function may fail in low-memory conditions or during
+device removal (even if __GFP_WAIT is set). To distinguish between these
+errors, modify the blk_get_request call stack to return the appropriate
+ERR_PTR. Verify that all callers check the return status and consider
+IS_ERR instead of a simple NULL pointer check.
+
+For consistency, make a similar change to the blk_mq_alloc_request leg
+of blk_get_request.  It may fail if the queue is dead, or the caller was
+unwilling to wait.
+
+	Signed-off-by: Joe Lawrence <joe.lawrence@stratus.com>
+	Acked-by: Jiri Kosina <jkosina@suse.cz> [for pktdvd]
+	Acked-by: Boaz Harrosh <bharrosh@panasas.com> [for osd]
+	Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit a492f075450f3ba87de36e5ffe92a9d0c7af9723)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_pscsi.c
+diff --cc drivers/target/target_core_pscsi.c
+index 0f5a96cb7d9f,70d9f6dabba0..000000000000
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@@ -1050,9 -1050,8 +1050,14 @@@ pscsi_execute_cmd(struct se_cmd *cmd
+  		req = blk_get_request(pdv->pdv_sd->request_queue,
+  				(data_direction == DMA_TO_DEVICE),
+  				GFP_KERNEL);
+++<<<<<<< HEAD
+ +		if (!req || IS_ERR(req)) {
+ +			pr_err("PSCSI: blk_get_request() failed: %ld\n",
+ +					req ? IS_ERR(req) : -ENOMEM);
+++=======
++ 		if (IS_ERR(req)) {
++ 			pr_err("PSCSI: blk_get_request() failed\n");
+++>>>>>>> a492f075450f (block,scsi: fixup blk_get_request dead queue scenarios)
+  			ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  			goto fail;
+  		}
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 6c8ecd3370db..4da7ad514f01 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -932,9 +932,9 @@ static struct io_context *rq_ioc(struct bio *bio)
+  * Get a free request from @q.  This function may fail under memory
+  * pressure or if @q is dead.
+  *
+- * Must be callled with @q->queue_lock held and,
+- * Returns %NULL on failure, with @q->queue_lock held.
+- * Returns !%NULL on success, with @q->queue_lock *not held*.
++ * Must be called with @q->queue_lock held and,
++ * Returns ERR_PTR on failure, with @q->queue_lock held.
++ * Returns request pointer on success, with @q->queue_lock *not held*.
+  */
+ static struct request *__get_request(struct request_list *rl, int rw_flags,
+ 				     struct bio *bio, gfp_t gfp_mask)
+@@ -948,7 +948,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
+ 	int may_queue;
+ 
+ 	if (unlikely(blk_queue_dying(q)))
+-		return NULL;
++		return ERR_PTR(-ENODEV);
+ 
+ 	may_queue = elv_may_queue(q, rw_flags);
+ 	if (may_queue == ELV_MQUEUE_NO)
+@@ -973,7 +973,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
+ 					 * process is not a "batcher", and not
+ 					 * exempted by the IO scheduler
+ 					 */
+-					return NULL;
++					return ERR_PTR(-ENOMEM);
+ 				}
+ 			}
+ 		}
+@@ -991,7 +991,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
+ 	 * allocated with any setting of ->nr_requests
+ 	 */
+ 	if (rl->count[is_sync] >= (3 * q->nr_requests / 2))
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	q->nr_rqs[is_sync]++;
+ 	rl->count[is_sync]++;
+@@ -1096,7 +1096,7 @@ fail_alloc:
+ rq_starved:
+ 	if (unlikely(rl->count[is_sync] == 0))
+ 		rl->starved[is_sync] = 1;
+-	return NULL;
++	return ERR_PTR(-ENOMEM);
+ }
+ 
+ /**
+@@ -1109,9 +1109,9 @@ rq_starved:
+  * Get a free request from @q.  If %__GFP_WAIT is set in @gfp_mask, this
+  * function keeps retrying under memory pressure and fails iff @q is dead.
+  *
+- * Must be callled with @q->queue_lock held and,
+- * Returns %NULL on failure, with @q->queue_lock held.
+- * Returns !%NULL on success, with @q->queue_lock *not held*.
++ * Must be called with @q->queue_lock held and,
++ * Returns ERR_PTR on failure, with @q->queue_lock held.
++ * Returns request pointer on success, with @q->queue_lock *not held*.
+  */
+ static struct request *get_request(struct request_queue *q, int rw_flags,
+ 				   struct bio *bio, gfp_t gfp_mask)
+@@ -1124,12 +1124,12 @@ static struct request *get_request(struct request_queue *q, int rw_flags,
+ 	rl = blk_get_rl(q, bio);	/* transferred to @rq on success */
+ retry:
+ 	rq = __get_request(rl, rw_flags, bio, gfp_mask);
+-	if (rq)
++	if (!IS_ERR(rq))
+ 		return rq;
+ 
+ 	if (!(gfp_mask & __GFP_WAIT) || unlikely(blk_queue_dying(q))) {
+ 		blk_put_rl(rl);
+-		return NULL;
++		return rq;
+ 	}
+ 
+ 	/* wait on @rl and retry */
+@@ -1166,7 +1166,7 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
+ 
+ 	spin_lock_irq(q->queue_lock);
+ 	rq = get_request(q, rw, NULL, gfp_mask);
+-	if (!rq)
++	if (IS_ERR(rq))
+ 		spin_unlock_irq(q->queue_lock);
+ 	/* q->queue_lock is unlocked at this point */
+ 
+@@ -1218,8 +1218,8 @@ struct request *blk_make_request(struct request_queue *q, struct bio *bio,
+ {
+ 	struct request *rq = blk_get_request(q, bio_data_dir(bio), gfp_mask);
+ 
+-	if (unlikely(!rq))
+-		return ERR_PTR(-ENOMEM);
++	if (IS_ERR(rq))
++		return rq;
+ 
+ 	blk_rq_set_block_pc(rq);
+ 
+@@ -1621,8 +1621,8 @@ get_rq:
+ 	 * Returns with the queue unlocked.
+ 	 */
+ 	req = get_request(q, rw_flags, bio, GFP_NOIO);
+-	if (unlikely(!req)) {
+-		bio_endio(bio, -ENODEV);	/* @q is dead */
++	if (IS_ERR(req)) {
++		bio_endio(bio, PTR_ERR(req));	/* @q is dead */
+ 		goto out_unlock;
+ 	}
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e8c957f7825d..2a01a1867347 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -232,9 +232,11 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp,
+ 	struct blk_mq_hw_ctx *hctx;
+ 	struct request *rq;
+ 	struct blk_mq_alloc_data alloc_data;
++	int ret;
+ 
+-	if (blk_mq_queue_enter(q))
+-		return NULL;
++	ret = blk_mq_queue_enter(q);
++	if (ret)
++		return ERR_PTR(ret);
+ 
+ 	ctx = blk_mq_get_ctx(q);
+ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+@@ -254,6 +256,8 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp,
+ 		ctx = alloc_data.ctx;
+ 	}
+ 	blk_mq_put_ctx(ctx);
++	if (!rq)
++		return ERR_PTR(-EWOULDBLOCK);
+ 	return rq;
+ }
+ EXPORT_SYMBOL(blk_mq_alloc_request);
+diff --git a/block/bsg.c b/block/bsg.c
+index 992c00b4b8e4..3407de4f11de 100644
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@ -270,8 +270,8 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
+ 	 * map scatter-gather elements separately and string them to request
+ 	 */
+ 	rq = blk_get_request(q, rw, GFP_KERNEL);
+-	if (!rq)
+-		return ERR_PTR(-ENOMEM);
++	if (IS_ERR(rq))
++		return rq;
+ 	blk_rq_set_block_pc(rq);
+ 
+ 	ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, has_write_perm);
+@@ -285,8 +285,8 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
+ 		}
+ 
+ 		next_rq = blk_get_request(q, READ, GFP_KERNEL);
+-		if (!next_rq) {
+-			ret = -ENOMEM;
++		if (IS_ERR(next_rq)) {
++			ret = PTR_ERR(next_rq);
+ 			goto out;
+ 		}
+ 		rq->next_rq = next_rq;
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index ae69bdf39596..8ca2960c30dd 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -317,8 +317,8 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+ 		}
+ 
+ 	rq = blk_get_request(q, writing ? WRITE : READ, GFP_KERNEL);
+-	if (!rq)
+-		return -ENOMEM;
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
+ 	blk_rq_set_block_pc(rq);
+ 
+ 	if (blk_fill_sghdr_rq(q, rq, hdr, mode)) {
+@@ -465,8 +465,8 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
+ 	}
+ 
+ 	rq = blk_get_request(q, in_len ? WRITE : READ, __GFP_WAIT);
+-	if (!rq) {
+-		err = -ENODEV;
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
+ 		goto error_free_buffer;
+ 	}
+ 
+@@ -556,8 +556,8 @@ static int __blk_send_generic(struct request_queue *q, struct gendisk *bd_disk,
+ 	int err;
+ 
+ 	rq = blk_get_request(q, WRITE, __GFP_WAIT);
+-	if (!rq)
+-		return -ENODEV;
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
+ 	blk_rq_set_block_pc(rq);
+ 	rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
+ 	rq->cmd[0] = cmd;
+diff --git a/drivers/block/paride/pd.c b/drivers/block/paride/pd.c
+index 856178a34f9a..2af41011d13f 100644
+--- a/drivers/block/paride/pd.c
++++ b/drivers/block/paride/pd.c
+@@ -722,8 +722,8 @@ static int pd_special_command(struct pd_unit *disk,
+ 	int err = 0;
+ 
+ 	rq = blk_get_request(disk->gd->queue, READ, __GFP_WAIT);
+-	if (!rq)
+-		return -ENODEV;
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
+ 
+ 	rq->cmd_type = REQ_TYPE_SPECIAL;
+ 	rq->special = func;
+diff --git a/drivers/block/pktcdvd.c b/drivers/block/pktcdvd.c
+index 097a8d849e84..4d77724aaf45 100644
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -712,8 +712,8 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
+ 
+ 	rq = blk_get_request(q, (cgc->data_direction == CGC_DATA_WRITE) ?
+ 			     WRITE : READ, __GFP_WAIT);
+-	if (!rq)
+-		return -ENODEV;
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
+ 	blk_rq_set_block_pc(rq);
+ 
+ 	if (cgc->buflen) {
+diff --git a/drivers/block/sx8.c b/drivers/block/sx8.c
+index 3fb6ab4c8b4e..911b7fc5bfdf 100644
+--- a/drivers/block/sx8.c
++++ b/drivers/block/sx8.c
+@@ -568,7 +568,7 @@ static struct carm_request *carm_get_special(struct carm_host *host)
+ 		return NULL;
+ 
+ 	rq = blk_get_request(host->oob_q, WRITE /* bogus */, GFP_KERNEL);
+-	if (!rq) {
++	if (IS_ERR(rq)) {
+ 		spin_lock_irqsave(&host->lock, flags);
+ 		carm_put_request(host, crq);
+ 		spin_unlock_irqrestore(&host->lock, flags);
+diff --git a/drivers/cdrom/cdrom.c b/drivers/cdrom/cdrom.c
+index 1ca0772c713f..a240bab1ab74 100644
+--- a/drivers/cdrom/cdrom.c
++++ b/drivers/cdrom/cdrom.c
+@@ -2161,8 +2161,8 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
+ 		len = nr * CD_FRAMESIZE_RAW;
+ 
+ 		rq = blk_get_request(q, READ, GFP_KERNEL);
+-		if (!rq) {
+-			ret = -ENOMEM;
++		if (IS_ERR(rq)) {
++			ret = PTR_ERR(rq);
+ 			break;
+ 		}
+ 		blk_rq_set_block_pc(rq);
+diff --git a/drivers/ide/ide-park.c b/drivers/ide/ide-park.c
+index 6ab9ab2a5081..5d074e2eeb89 100644
+--- a/drivers/ide/ide-park.c
++++ b/drivers/ide/ide-park.c
+@@ -46,7 +46,7 @@ static void issue_park_cmd(ide_drive_t *drive, unsigned long timeout)
+ 	 * timeout has expired, so power management will be reenabled.
+ 	 */
+ 	rq = blk_get_request(q, READ, GFP_NOWAIT);
+-	if (unlikely(!rq))
++	if (IS_ERR(rq))
+ 		goto out;
+ 
+ 	rq->cmd[0] = REQ_UNPARK_HEADS;
+diff --git a/drivers/scsi/device_handler/scsi_dh_alua.c b/drivers/scsi/device_handler/scsi_dh_alua.c
+index b8729cadfb69..fd78bdc53528 100644
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@ -115,7 +115,7 @@ static struct request *get_alua_req(struct scsi_device *sdev,
+ 
+ 	rq = blk_get_request(q, rw, GFP_NOIO);
+ 
+-	if (!rq) {
++	if (IS_ERR(rq)) {
+ 		sdev_printk(KERN_INFO, sdev,
+ 			    "%s: blk_get_request failed\n", __func__);
+ 		return NULL;
+diff --git a/drivers/scsi/device_handler/scsi_dh_emc.c b/drivers/scsi/device_handler/scsi_dh_emc.c
+index 6f07f7fe3aa1..84765384c47c 100644
+--- a/drivers/scsi/device_handler/scsi_dh_emc.c
++++ b/drivers/scsi/device_handler/scsi_dh_emc.c
+@@ -275,7 +275,7 @@ static struct request *get_req(struct scsi_device *sdev, int cmd,
+ 
+ 	rq = blk_get_request(sdev->request_queue,
+ 			(cmd != INQUIRY) ? WRITE : READ, GFP_NOIO);
+-	if (!rq) {
++	if (IS_ERR(rq)) {
+ 		sdev_printk(KERN_INFO, sdev, "get_req: blk_get_request failed");
+ 		return NULL;
+ 	}
+diff --git a/drivers/scsi/device_handler/scsi_dh_hp_sw.c b/drivers/scsi/device_handler/scsi_dh_hp_sw.c
+index e9d9fea9e272..4ee2759f5299 100644
+--- a/drivers/scsi/device_handler/scsi_dh_hp_sw.c
++++ b/drivers/scsi/device_handler/scsi_dh_hp_sw.c
+@@ -117,7 +117,7 @@ static int hp_sw_tur(struct scsi_device *sdev, struct hp_sw_dh_data *h)
+ 
+ retry:
+ 	req = blk_get_request(sdev->request_queue, WRITE, GFP_NOIO);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return SCSI_DH_RES_TEMP_UNAVAIL;
+ 
+ 	blk_rq_set_block_pc(req);
+@@ -247,7 +247,7 @@ static int hp_sw_start_stop(struct hp_sw_dh_data *h)
+ 	struct request *req;
+ 
+ 	req = blk_get_request(h->sdev->request_queue, WRITE, GFP_ATOMIC);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return SCSI_DH_RES_TEMP_UNAVAIL;
+ 
+ 	blk_rq_set_block_pc(req);
+diff --git a/drivers/scsi/device_handler/scsi_dh_rdac.c b/drivers/scsi/device_handler/scsi_dh_rdac.c
+index 826069db9848..1b5bc9293e37 100644
+--- a/drivers/scsi/device_handler/scsi_dh_rdac.c
++++ b/drivers/scsi/device_handler/scsi_dh_rdac.c
+@@ -274,7 +274,7 @@ static struct request *get_rdac_req(struct scsi_device *sdev,
+ 
+ 	rq = blk_get_request(q, rw, GFP_NOIO);
+ 
+-	if (!rq) {
++	if (IS_ERR(rq)) {
+ 		sdev_printk(KERN_INFO, sdev,
+ 				"get_rdac_req: blk_get_request failed.\n");
+ 		return NULL;
+diff --git a/drivers/scsi/osd/osd_initiator.c b/drivers/scsi/osd/osd_initiator.c
+index 11bd87eaf01c..2db03fef9bf9 100644
+--- a/drivers/scsi/osd/osd_initiator.c
++++ b/drivers/scsi/osd/osd_initiator.c
+@@ -1567,8 +1567,8 @@ static struct request *_make_request(struct request_queue *q, bool has_write,
+ 		struct request *req;
+ 
+ 		req = blk_get_request(q, has_write ? WRITE : READ, flags);
+-		if (unlikely(!req))
+-			return ERR_PTR(-ENOMEM);
++		if (IS_ERR(req))
++			return req;
+ 
+ 		blk_rq_set_block_pc(req);
+ 		return req;
+diff --git a/drivers/scsi/osst.c b/drivers/scsi/osst.c
+index 0727ea7cc387..dff37a250d79 100644
+--- a/drivers/scsi/osst.c
++++ b/drivers/scsi/osst.c
+@@ -362,7 +362,7 @@ static int osst_execute(struct osst_request *SRpnt, const unsigned char *cmd,
+ 	int write = (data_direction == DMA_TO_DEVICE);
+ 
+ 	req = blk_get_request(SRpnt->stp->device->request_queue, write, GFP_KERNEL);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return DRIVER_ERROR << 24;
+ 
+ 	blk_rq_set_block_pc(req);
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index b74813882330..f34377bcb91f 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -1978,7 +1978,7 @@ static void scsi_eh_lock_door(struct scsi_device *sdev)
+ 	 * request becomes available
+ 	 */
+ 	req = blk_get_request(sdev->request_queue, READ, GFP_KERNEL);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return;
+ 
+ 	blk_rq_set_block_pc(req);
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 2eb9f5889dec..feed3ff80f3d 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -194,7 +194,7 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
+ 	int ret = DRIVER_ERROR << 24;
+ 
+ 	req = blk_get_request(sdev->request_queue, write, __GFP_WAIT);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return ret;
+ 	blk_rq_set_block_pc(req);
+ 
+diff --git a/drivers/scsi/sg.c b/drivers/scsi/sg.c
+index d99b8913f6b1..2d1f063a645c 100644
+--- a/drivers/scsi/sg.c
++++ b/drivers/scsi/sg.c
+@@ -1702,9 +1702,9 @@ sg_start_req(Sg_request *srp, unsigned char *cmd)
+ 	}
+ 
+ 	rq = blk_get_request(q, rw, GFP_ATOMIC);
+-	if (!rq) {
++	if (IS_ERR(rq)) {
+ 		kfree(long_cmdp);
+-		return -ENOMEM;
++		return PTR_ERR(rq);
+ 	}
+ 
+ 	blk_rq_set_block_pc(rq);
+diff --git a/drivers/scsi/st.c b/drivers/scsi/st.c
+index 3f45d80381ab..86838118e62f 100644
+--- a/drivers/scsi/st.c
++++ b/drivers/scsi/st.c
+@@ -497,7 +497,7 @@ static int st_scsi_execute(struct st_request *SRpnt, const unsigned char *cmd,
+ 
+ 	req = blk_get_request(SRpnt->stp->device->request_queue, write,
+ 			      GFP_KERNEL);
+-	if (!req)
++	if (IS_ERR(req))
+ 		return DRIVER_ERROR << 24;
+ 
+ 	blk_rq_set_block_pc(req);
+* Unmerged path drivers/target/target_core_pscsi.c
