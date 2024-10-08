@@ -1,0 +1,222 @@
+hv_netvsc: synchronize netvsc_change_mtu()/netvsc_set_channels() with netvsc_remove()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 6da7225f5a95ba68e3c6225c4051182bef30eed4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6da7225f.failed
+
+When netvsc device is removed during mtu change or channels setup we get
+into troubles as both paths are trying to remove the device. Synchronize
+them with start_remove flag and rtnl lock.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6da7225f5a95ba68e3c6225c4051182bef30eed4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 822e657fcee7,6a69b5cc9fe2..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -728,16 -747,167 +728,169 @@@ static void netvsc_get_channels(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int netvsc_set_channels(struct net_device *net,
++ 			       struct ethtool_channels *channels)
++ {
++ 	struct net_device_context *net_device_ctx = netdev_priv(net);
++ 	struct hv_device *dev = net_device_ctx->device_ctx;
++ 	struct netvsc_device *nvdev = net_device_ctx->nvdev;
++ 	struct netvsc_device_info device_info;
++ 	u32 num_chn;
++ 	u32 max_chn;
++ 	int ret = 0;
++ 	bool recovering = false;
++ 
++ 	if (net_device_ctx->start_remove || !nvdev || nvdev->destroy)
++ 		return -ENODEV;
++ 
++ 	num_chn = nvdev->num_chn;
++ 	max_chn = min_t(u32, nvdev->max_chn, num_online_cpus());
++ 
++ 	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5) {
++ 		pr_info("vRSS unsupported before NVSP Version 5\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* We do not support rx, tx, or other */
++ 	if (!channels ||
++ 	    channels->rx_count ||
++ 	    channels->tx_count ||
++ 	    channels->other_count ||
++ 	    (channels->combined_count < 1))
++ 		return -EINVAL;
++ 
++ 	if (channels->combined_count > max_chn) {
++ 		pr_info("combined channels too high, using %d\n", max_chn);
++ 		channels->combined_count = max_chn;
++ 	}
++ 
++ 	ret = netvsc_close(net);
++ 	if (ret)
++ 		goto out;
++ 
++  do_set:
++ 	net_device_ctx->start_remove = true;
++ 	rndis_filter_device_remove(dev);
++ 
++ 	nvdev->num_chn = channels->combined_count;
++ 
++ 	memset(&device_info, 0, sizeof(device_info));
++ 	device_info.num_chn = nvdev->num_chn; /* passed to RNDIS */
++ 	device_info.ring_size = ring_size;
++ 	device_info.max_num_vrss_chns = max_num_vrss_chns;
++ 
++ 	ret = rndis_filter_device_add(dev, &device_info);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "unable to add netvsc device (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++ 	nvdev = net_device_ctx->nvdev;
++ 
++ 	ret = netif_set_real_num_tx_queues(net, nvdev->num_chn);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "could not set tx queue count (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++ 	ret = netif_set_real_num_rx_queues(net, nvdev->num_chn);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "could not set rx queue count (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++  out:
++ 	netvsc_open(net);
++ 	net_device_ctx->start_remove = false;
++ 	/* We may have missed link change notifications */
++ 	schedule_delayed_work(&net_device_ctx->dwork, 0);
++ 
++ 	return ret;
++ 
++  recover:
++ 	/* If the above failed, we attempt to recover through the same
++ 	 * process but with the original number of channels.
++ 	 */
++ 	netdev_err(net, "could not set channels, recovering\n");
++ 	recovering = true;
++ 	channels->combined_count = num_chn;
++ 	goto do_set;
++ }
++ 
++ static bool netvsc_validate_ethtool_ss_cmd(const struct ethtool_cmd *cmd)
++ {
++ 	struct ethtool_cmd diff1 = *cmd;
++ 	struct ethtool_cmd diff2 = {};
++ 
++ 	ethtool_cmd_speed_set(&diff1, 0);
++ 	diff1.duplex = 0;
++ 	/* advertising and cmd are usually set */
++ 	diff1.advertising = 0;
++ 	diff1.cmd = 0;
++ 	/* We set port to PORT_OTHER */
++ 	diff2.port = PORT_OTHER;
++ 
++ 	return !memcmp(&diff1, &diff2, sizeof(diff1));
++ }
++ 
++ static void netvsc_init_settings(struct net_device *dev)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 
++ 	ndc->speed = SPEED_UNKNOWN;
++ 	ndc->duplex = DUPLEX_UNKNOWN;
++ }
++ 
++ static int netvsc_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 
++ 	ethtool_cmd_speed_set(cmd, ndc->speed);
++ 	cmd->duplex = ndc->duplex;
++ 	cmd->port = PORT_OTHER;
++ 
++ 	return 0;
++ }
++ 
++ static int netvsc_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 	u32 speed;
++ 
++ 	speed = ethtool_cmd_speed(cmd);
++ 	if (!ethtool_validate_speed(speed) ||
++ 	    !ethtool_validate_duplex(cmd->duplex) ||
++ 	    !netvsc_validate_ethtool_ss_cmd(cmd))
++ 		return -EINVAL;
++ 
++ 	ndc->speed = speed;
++ 	ndc->duplex = cmd->duplex;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6da7225f5a95 (hv_netvsc: synchronize netvsc_change_mtu()/netvsc_set_channels() with netvsc_remove())
+  static int netvsc_change_mtu(struct net_device *ndev, int mtu)
+  {
+  	struct net_device_context *ndevctx = netdev_priv(ndev);
+ -	struct netvsc_device *nvdev = ndevctx->nvdev;
+ -	struct hv_device *hdev = ndevctx->device_ctx;
+ +	struct hv_device *hdev =  ndevctx->device_ctx;
+ +	struct netvsc_device *nvdev = hv_get_drvdata(hdev);
+  	struct netvsc_device_info device_info;
+  	int limit = ETH_DATA_LEN;
+ -	u32 num_chn;
+  	int ret = 0;
+  
+- 	if (nvdev == NULL || nvdev->destroy)
++ 	if (ndevctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+  
+  	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
+@@@ -936,9 -1441,17 +1089,21 @@@ static int netvsc_remove(struct hv_devi
+  		return 0;
+  	}
+  
+ +	net_device->start_remove = true;
+  
+  	ndev_ctx = netdev_priv(net);
+++<<<<<<< HEAD
+++=======
++ 	net_device = ndev_ctx->nvdev;
++ 
++ 	/* Avoid racing with netvsc_change_mtu()/netvsc_set_channels()
++ 	 * removing the device.
++ 	 */
++ 	rtnl_lock();
++ 	ndev_ctx->start_remove = true;
++ 	rtnl_unlock();
++ 
+++>>>>>>> 6da7225f5a95 (hv_netvsc: synchronize netvsc_change_mtu()/netvsc_set_channels() with netvsc_remove())
+  	cancel_delayed_work_sync(&ndev_ctx->dwork);
+  	cancel_work_sync(&ndev_ctx->work);
+  
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
