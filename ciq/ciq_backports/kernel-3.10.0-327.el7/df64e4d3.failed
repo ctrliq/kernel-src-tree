@@ -1,0 +1,378 @@
+cxgb4/cxgb4vf: Use new interfaces to calculate BAR2 SGE Queue Register addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit df64e4d38c904dd3210f097c5e9bb8b036af55c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/df64e4d3.failed
+
+Use BAR2 Going To Sleep (GTS) for T5 and later. Use new BAR2 User Doorbells for
+T5 for both cxgb4 and cxgb4vf driver.
+
+Based on original work by Casey Leedom <leedom@chelsio.com>
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df64e4d38c904dd3210f097c5e9bb8b036af55c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+#	drivers/net/ethernet/chelsio/cxgb4vf/sge.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index b5afc3f0dd91,f12debd98dac..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -851,8 -853,8 +853,13 @@@ static void write_sgl(const struct sk_b
+  }
+  
+  /* This function copies 64 byte coalesced work request to
+++<<<<<<< HEAD
+ + * memory mapped BAR2 space(user space writes).
+ + * For coalesced WR SGE, fetches data from the FIFO instead of from Host.
+++=======
++  * memory mapped BAR2 space. For coalesced WR SGE fetches
++  * data from the FIFO instead of from Host.
+++>>>>>>> df64e4d38c90 (cxgb4/cxgb4vf: Use new interfaces to calculate BAR2 SGE Queue Register addresses)
+   */
+  static void cxgb_pio_copy(u64 __iomem *dst, u64 *src)
+  {
+@@@ -914,14 -917,14 +922,23 @@@ static inline void ring_tx_db(struct ad
+  			int index = (q->pidx
+  				     ? (q->pidx - 1)
+  				     : (q->size - 1));
+++<<<<<<< HEAD
+ +			unsigned int *wr = (unsigned int *)&q->desc[index];
+ +
+ +			cxgb_pio_copy((u64 __iomem *)
+ +				      (adap->bar2 + q->udb +
+ +				       SGE_UDB_WCDOORBELL),
+ +				      (u64 *)wr);
+++=======
++ 			u64 *wr = (u64 *)&q->desc[index];
++ 
++ 			cxgb_pio_copy((u64 __iomem *)
++ 				      (q->bar2_addr + SGE_UDB_WCDOORBELL),
++ 				      wr);
+++>>>>>>> df64e4d38c90 (cxgb4/cxgb4vf: Use new interfaces to calculate BAR2 SGE Queue Register addresses)
+  		} else {
+- 			writel(val,  adap->bar2 + q->udb + SGE_UDB_KDOORBELL);
++ 			writel(val | QID(q->bar2_qid),
++ 			       q->bar2_addr + SGE_UDB_KDOORBELL);
+  		}
+  
+  		/* This Write Memory Barrier will force the write to the User
+@@@ -2235,48 -2250,32 +2262,57 @@@ static void sge_tx_timer_cb(unsigned lo
+  }
+  
+  /**
+-  *      udb_address - return the BAR2 User Doorbell address for a Queue
+-  *      @adap: the adapter
+-  *      @cntxt_id: the Queue Context ID
+-  *      @qpp: Queues Per Page (for all PFs)
++  *	bar2_address - return the BAR2 address for an SGE Queue's Registers
++  *	@adapter: the adapter
++  *	@qid: the SGE Queue ID
++  *	@qtype: the SGE Queue Type (Egress or Ingress)
++  *	@pbar2_qid: BAR2 Queue ID or 0 for Queue ID inferred SGE Queues
+   *
+-  *      Returns the BAR2 address of the user Doorbell associated with the
+-  *      indicated Queue Context ID.  Note that this is only applicable
+-  *      for T5 and later.
+-  */
+- static u64 udb_address(struct adapter *adap, unsigned int cntxt_id,
+- 		       unsigned int qpp)
+- {
+- 	u64 udb;
+- 	unsigned int s_qpp;
+- 	unsigned short udb_density;
+- 	unsigned long qpshift;
+- 	int page;
++  *	Returns the BAR2 address for the SGE Queue Registers associated with
++  *	@qid.  If BAR2 SGE Registers aren't available, returns NULL.  Also
++  *	returns the BAR2 Queue ID to be used with writes to the BAR2 SGE
++  *	Queue Registers.  If the BAR2 Queue ID is 0, then "Inferred Queue ID"
++  *	Registers are supported (e.g. the Write Combining Doorbell Buffer).
++  */
++ static void __iomem *bar2_address(struct adapter *adapter,
++ 				  unsigned int qid,
++ 				  enum t4_bar2_qtype qtype,
++ 				  unsigned int *pbar2_qid)
++ {
++ 	u64 bar2_qoffset;
++ 	int ret;
+  
+- 	BUG_ON(is_t4(adap->params.chip));
++ 	ret = t4_bar2_sge_qregs(adapter, qid, qtype,
++ 				&bar2_qoffset, pbar2_qid);
++ 	if (ret)
++ 		return NULL;
+  
+++<<<<<<< HEAD
+ +	s_qpp = (QUEUESPERPAGEPF0 +
+ +		(QUEUESPERPAGEPF1 - QUEUESPERPAGEPF0) * adap->fn);
+ +	udb_density = 1 << ((qpp >> s_qpp) & QUEUESPERPAGEPF0_MASK);
+ +	qpshift = PAGE_SHIFT - ilog2(udb_density);
+ +	udb = cntxt_id << qpshift;
+ +	udb &= PAGE_MASK;
+ +	page = udb / PAGE_SIZE;
+ +	udb += (cntxt_id - (page * udb_density)) * SGE_UDB_SIZE;
+ +
+ +	return udb;
+ +}
+ +
+ +static u64 udb_address_eq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_EGRESS_QUEUES_PER_PAGE_PF));
+ +}
+ +
+ +static u64 udb_address_iq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_INGRESS_QUEUES_PER_PAGE_PF));
+++=======
++ 	return adapter->bar2 + bar2_qoffset;
+++>>>>>>> df64e4d38c90 (cxgb4/cxgb4vf: Use new interfaces to calculate BAR2 SGE Queue Register addresses)
+  }
+  
+  int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
+diff --cc drivers/net/ethernet/chelsio/cxgb4vf/sge.c
+index 4e4e43e07043,f7fd1317d996..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/sge.c
+@@@ -2293,9 -2430,13 +2428,17 @@@ int t4vf_sge_alloc_eth_txq(struct adapt
+  	txq->q.cidx = 0;
+  	txq->q.pidx = 0;
+  	txq->q.stat = (void *)&txq->q.desc[txq->q.size];
+++<<<<<<< HEAD
+ +	txq->q.cntxt_id = FW_EQ_ETH_CMD_EQID_GET(be32_to_cpu(rpl.eqid_pkd));
+++=======
++ 	txq->q.cntxt_id = FW_EQ_ETH_CMD_EQID_G(be32_to_cpu(rpl.eqid_pkd));
++ 	txq->q.bar2_addr = bar2_address(adapter,
++ 					txq->q.cntxt_id,
++ 					T4_BAR2_QTYPE_EGRESS,
++ 					&txq->q.bar2_qid);
+++>>>>>>> df64e4d38c90 (cxgb4/cxgb4vf: Use new interfaces to calculate BAR2 SGE Queue Register addresses)
+  	txq->q.abs_id =
+ -		FW_EQ_ETH_CMD_PHYSEQID_G(be32_to_cpu(rpl.physeqid_pkd));
+ +		FW_EQ_ETH_CMD_PHYSEQID_GET(be32_to_cpu(rpl.physeqid_pkd));
+  	txq->txq = devq;
+  	txq->tso = 0;
+  	txq->tx_cso = 0;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index e01f9954d513..3a637b3df179 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -433,7 +433,8 @@ struct sge_fl {                     /* SGE free-buffer queue state */
+ 	struct rx_sw_desc *sdesc;   /* address of SW Rx descriptor ring */
+ 	__be64 *desc;               /* address of HW Rx descriptor ring */
+ 	dma_addr_t addr;            /* bus address of HW ring start */
+-	u64 udb;                    /* BAR2 offset of User Doorbell area */
++	void __iomem *bar2_addr;    /* address of BAR2 Queue registers */
++	unsigned int bar2_qid;      /* Queue ID for BAR2 Queue registers */
+ };
+ 
+ /* A packet gather list */
+@@ -463,7 +464,8 @@ struct sge_rspq {                   /* state for an SGE response queue */
+ 	u16 abs_id;                 /* absolute SGE id for the response q */
+ 	__be64 *desc;               /* address of HW response ring */
+ 	dma_addr_t phys_addr;       /* physical address of the ring */
+-	u64 udb;                    /* BAR2 offset of User Doorbell area */
++	void __iomem *bar2_addr;    /* address of BAR2 Queue registers */
++	unsigned int bar2_qid;      /* Queue ID for BAR2 Queue registers */
+ 	unsigned int iqe_len;       /* entry size */
+ 	unsigned int size;          /* capacity of response queue */
+ 	struct adapter *adap;
+@@ -521,7 +523,8 @@ struct sge_txq {
+ 	int db_disabled;
+ 	unsigned short db_pidx;
+ 	unsigned short db_pidx_inc;
+-	u64 udb;                    /* BAR2 offset of User Doorbell area */
++	void __iomem *bar2_addr;    /* address of BAR2 Queue registers */
++	unsigned int bar2_qid;      /* Queue ID for BAR2 Queue registers */
+ };
+ 
+ struct sge_eth_txq {                /* state for an SGE Ethernet Tx queue */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 964362d43ed6..168f033e4cb7 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -3805,6 +3805,22 @@ u64 cxgb4_read_sge_timestamp(struct net_device *dev)
+ }
+ EXPORT_SYMBOL(cxgb4_read_sge_timestamp);
+ 
++int cxgb4_bar2_sge_qregs(struct net_device *dev,
++			 unsigned int qid,
++			 enum cxgb4_bar2_qtype qtype,
++			 u64 *pbar2_qoffset,
++			 unsigned int *pbar2_qid)
++{
++	return t4_bar2_sge_qregs(netdev2adap(dev),
++				 qid,
++				 (qtype == CXGB4_BAR2_QTYPE_EGRESS
++				  ? T4_BAR2_QTYPE_EGRESS
++				  : T4_BAR2_QTYPE_INGRESS),
++				 pbar2_qoffset,
++				 pbar2_qid);
++}
++EXPORT_SYMBOL(cxgb4_bar2_sge_qregs);
++
+ static struct pci_driver cxgb4_driver;
+ 
+ static void check_neigh_update(struct neighbour *neigh)
+@@ -3987,31 +4003,18 @@ static void process_db_drop(struct work_struct *work)
+ 		u32 dropped_db = t4_read_reg(adap, 0x010ac);
+ 		u16 qid = (dropped_db >> 15) & 0x1ffff;
+ 		u16 pidx_inc = dropped_db & 0x1fff;
+-		unsigned int s_qpp;
+-		unsigned short udb_density;
+-		unsigned long qpshift;
+-		int page;
+-		u32 udb;
+-
+-		dev_warn(adap->pdev_dev,
+-			 "Dropped DB 0x%x qid %d bar2 %d coalesce %d pidx %d\n",
+-			 dropped_db, qid,
+-			 (dropped_db >> 14) & 1,
+-			 (dropped_db >> 13) & 1,
+-			 pidx_inc);
+-
+-		drain_db_fifo(adap, 1);
++		u64 bar2_qoffset;
++		unsigned int bar2_qid;
++		int ret;
+ 
+-		s_qpp = QUEUESPERPAGEPF1 * adap->fn;
+-		udb_density = 1 << QUEUESPERPAGEPF0_GET(t4_read_reg(adap,
+-				SGE_EGRESS_QUEUES_PER_PAGE_PF) >> s_qpp);
+-		qpshift = PAGE_SHIFT - ilog2(udb_density);
+-		udb = qid << qpshift;
+-		udb &= PAGE_MASK;
+-		page = udb / PAGE_SIZE;
+-		udb += (qid - (page * udb_density)) * 128;
+-
+-		writel(PIDX(pidx_inc),  adap->bar2 + udb + 8);
++		ret = t4_bar2_sge_qregs(adap, qid, T4_BAR2_QTYPE_EGRESS,
++					&bar2_qoffset, &bar2_qid);
++		if (ret)
++			dev_err(adap->pdev_dev, "doorbell drop recovery: "
++				"qid=%d, pidx_inc=%d\n", qid, pidx_inc);
++		else
++			writel(PIDX_T5(pidx_inc) | QID(bar2_qid),
++			       adap->bar2 + bar2_qoffset + SGE_UDB_KDOORBELL);
+ 
+ 		/* Re-enable BAR2 WC */
+ 		t4_set_reg_field(adap, 0x10b0, 1<<15, 1<<15);
+@@ -4069,12 +4072,8 @@ static void uld_attach(struct adapter *adap, unsigned int uld)
+ 	lli.adapter_type = adap->params.chip;
+ 	lli.iscsi_iolen = MAXRXDATA_GET(t4_read_reg(adap, TP_PARA_REG2));
+ 	lli.cclk_ps = 1000000000 / adap->params.vpd.cclk;
+-	lli.udb_density = 1 << QUEUESPERPAGEPF0_GET(
+-			t4_read_reg(adap, SGE_EGRESS_QUEUES_PER_PAGE_PF) >>
+-			(adap->fn * 4));
+-	lli.ucq_density = 1 << QUEUESPERPAGEPF0_GET(
+-			t4_read_reg(adap, SGE_INGRESS_QUEUES_PER_PAGE_PF) >>
+-			(adap->fn * 4));
++	lli.udb_density = 1 << adap->params.sge.eq_qpp;
++	lli.ucq_density = 1 << adap->params.sge.iq_qpp;
+ 	lli.filt_mode = adap->params.tp.vlan_pri_map;
+ 	/* MODQ_REQ_MAP sets queues 0-3 to chan 0-3 */
+ 	for (i = 0; i < NCHAN; i++)
+@@ -5930,6 +5929,7 @@ static int adap_init0(struct adapter *adap)
+ 		t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
+ 			     adap->params.b_wnd);
+ 	}
++	t4_init_sge_params(adap);
+ 	t4_init_tp_params(adap);
+ 	adap->flags |= FW_OK;
+ 	return 0;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index 1366ba620c87..01315a91b6a5 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@ -304,4 +304,11 @@ void cxgb4_enable_db_coalescing(struct net_device *dev);
+ int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte);
+ u64 cxgb4_read_sge_timestamp(struct net_device *dev);
+ 
++enum cxgb4_bar2_qtype { CXGB4_BAR2_QTYPE_EGRESS, CXGB4_BAR2_QTYPE_INGRESS };
++int cxgb4_bar2_sge_qregs(struct net_device *dev,
++			 unsigned int qid,
++			 enum cxgb4_bar2_qtype qtype,
++			 u64 *pbar2_qoffset,
++			 unsigned int *pbar2_qid);
++
+ #endif  /* !__CXGB4_OFLD_H */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4vf/adapter.h b/drivers/net/ethernet/chelsio/cxgb4vf/adapter.h
+index 3d06e77d7121..d00a751f0588 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/adapter.h
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/adapter.h
+@@ -138,6 +138,8 @@ struct sge_fl {
+ 	struct rx_sw_desc *sdesc;	/* address of SW RX descriptor ring */
+ 	__be64 *desc;			/* address of HW RX descriptor ring */
+ 	dma_addr_t addr;		/* PCI bus address of hardware ring */
++	void __iomem *bar2_addr;	/* address of BAR2 Queue registers */
++	unsigned int bar2_qid;		/* Queue ID for BAR2 Queue registers */
+ };
+ 
+ /*
+@@ -178,6 +180,8 @@ struct sge_rspq {
+ 	u16 abs_id;			/* SGE abs QID for the response Q */
+ 	__be64 *desc;			/* address of hardware response ring */
+ 	dma_addr_t phys_addr;		/* PCI bus address of ring */
++	void __iomem *bar2_addr;	/* address of BAR2 Queue registers */
++	unsigned int bar2_qid;		/* Queue ID for BAR2 Queue registers */
+ 	unsigned int iqe_len;		/* entry size */
+ 	unsigned int size;		/* capcity of response Q */
+ 	struct adapter *adapter;	/* our adapter */
+@@ -240,6 +244,8 @@ struct sge_txq {
+ 	struct tx_sw_desc *sdesc;	/* address of SW TX descriptor ring */
+ 	struct sge_qstat *stat;		/* queue status entry */
+ 	dma_addr_t phys_addr;		/* PCI bus address of hardware ring */
++	void __iomem *bar2_addr;	/* address of BAR2 Queue registers */
++	unsigned int bar2_qid;		/* Queue ID for BAR2 Queue registers */
+ };
+ 
+ /*
+@@ -345,6 +351,7 @@ struct sge {
+ struct adapter {
+ 	/* PCI resources */
+ 	void __iomem *regs;
++	void __iomem *bar2;
+ 	struct pci_dev *pdev;
+ 	struct device *pdev_dev;
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c b/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
+index 0b0c9434b272..f75fab534a4d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
+@@ -2095,7 +2095,6 @@ static int adap_init0(struct adapter *adapter)
+ 	unsigned int ethqsets;
+ 	int err;
+ 	u32 param, val = 0;
+-	unsigned int chipid;
+ 
+ 	/*
+ 	 * Wait for the device to become ready before proceeding ...
+@@ -2123,17 +2122,6 @@ static int adap_init0(struct adapter *adapter)
+ 		return err;
+ 	}
+ 
+-	adapter->params.chip = 0;
+-	switch (adapter->pdev->device >> 12) {
+-	case CHELSIO_T4:
+-		adapter->params.chip = CHELSIO_CHIP_CODE(CHELSIO_T4, 0);
+-		break;
+-	case CHELSIO_T5:
+-		chipid = G_REV(t4_read_reg(adapter, A_PL_VF_REV));
+-		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T5, chipid);
+-		break;
+-	}
+-
+ 	/*
+ 	 * Grab basic operational parameters.  These will predominantly have
+ 	 * been set up by the Physical Function Driver or will be hard coded
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4vf/sge.c
