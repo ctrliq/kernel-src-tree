@@ -1,0 +1,1027 @@
+xfs: saner xfs_trans_commit interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 70393313dd0b26a6a79e2737b6dff1f1937b936d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/70393313.failed
+
+The flags argument to xfs_trans_commit is not useful for most callers, as
+a commit of a transaction without a permanent log reservation must pass
+0 here, and all callers for a transaction with a permanent log reservation
+except for xfs_trans_roll must pass XFS_TRANS_RELEASE_LOG_RES.  So remove
+the flags argument from the public xfs_trans_commit interfaces, and
+introduce low-level __xfs_trans_commit variant just for xfs_trans_roll
+that regrants a log reservation instead of releasing it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 70393313dd0b26a6a79e2737b6dff1f1937b936d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_shared.h
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_attr_inactive.c
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 7500d26379cf,caca2c59de96..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5677,3 -5747,188 +5677,191 @@@ del_cursor
+  
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Splits an extent into two extents at split_fsb block such that it is
++  * the first block of the current_ext. @current_ext is a target extent
++  * to be split. @split_fsb is a block where the extents is split.
++  * If split_fsb lies in a hole or the first block of extents, just return 0.
++  */
++ STATIC int
++ xfs_bmap_split_extent_at(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		split_fsb,
++ 	xfs_fsblock_t		*firstfsb,
++ 	struct xfs_bmap_free	*free_list)
++ {
++ 	int				whichfork = XFS_DATA_FORK;
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		new; /* split extent */
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fsblock_t			gotblkcnt; /* new block count for got */
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				logflags = 0;
++ 	int				i = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT, XFS_RANDOM_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_split_extent_at",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * gotp can be null in 2 cases: 1) if there are no extents
++ 	 * or 2) split_fsb lies in a hole beyond which there are
++ 	 * no extents. Either way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, split_fsb, &current_ext);
++ 	if (!gotp)
++ 		return 0;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 
++ 	/*
++ 	 * Check split_fsb lies in a hole or the start boundary offset
++ 	 * of the extent.
++ 	 */
++ 	if (got.br_startoff >= split_fsb)
++ 		return 0;
++ 
++ 	gotblkcnt = split_fsb - got.br_startoff;
++ 	new.br_startoff = split_fsb;
++ 	new.br_startblock = got.br_startblock + gotblkcnt;
++ 	new.br_blockcount = got.br_blockcount - gotblkcnt;
++ 	new.br_state = got.br_state;
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstfsb;
++ 		cur->bc_private.b.flist = free_list;
++ 		cur->bc_private.b.flags = 0;
++ 		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	xfs_bmbt_set_blockcount(gotp, gotblkcnt);
++ 	got.br_blockcount = gotblkcnt;
++ 
++ 	logflags = XFS_ILOG_CORE;
++ 	if (cur) {
++ 		error = xfs_bmbt_update(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				got.br_state);
++ 		if (error)
++ 			goto del_cursor;
++ 	} else
++ 		logflags |= XFS_ILOG_DEXT;
++ 
++ 	/* Add new extent */
++ 	current_ext++;
++ 	xfs_iext_insert(ip, current_ext, 1, &new, 0);
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) + 1);
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, new.br_startoff,
++ 				new.br_startblock, new.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 0, del_cursor);
++ 		cur->bc_rec.b.br_state = new.br_state;
++ 
++ 		error = xfs_btree_insert(cur, &i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	/*
++ 	 * Convert to a btree if necessary.
++ 	 */
++ 	if (xfs_bmap_needs_btree(ip, whichfork)) {
++ 		int tmp_logflags; /* partial log flag return val */
++ 
++ 		ASSERT(cur == NULL);
++ 		error = xfs_bmap_extents_to_btree(tp, ip, firstfsb, free_list,
++ 				&cur, 0, &tmp_logflags, whichfork);
++ 		logflags |= tmp_logflags;
++ 	}
++ 
++ del_cursor:
++ 	if (cur) {
++ 		cur->bc_private.b.allocated = 0;
++ 		xfs_btree_del_cursor(cur,
++ 				error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	}
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_split_extent(
++ 	struct xfs_inode        *ip,
++ 	xfs_fileoff_t           split_fsb)
++ {
++ 	struct xfs_mount        *mp = ip->i_mount;
++ 	struct xfs_trans        *tp;
++ 	struct xfs_bmap_free    free_list;
++ 	xfs_fsblock_t           firstfsb;
++ 	int                     committed;
++ 	int                     error;
++ 
++ 	tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 			XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 	if (error) {
++ 		xfs_trans_cancel(tp);
++ 		return error;
++ 	}
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	xfs_bmap_init(&free_list, &firstfsb);
++ 
++ 	error = xfs_bmap_split_extent_at(tp, ip, split_fsb,
++ 			&firstfsb, &free_list);
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 	if (error)
++ 		goto out;
++ 
++ 	return xfs_trans_commit(tp);
++ 
++ out:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
+++>>>>>>> 70393313dd0b (xfs: saner xfs_trans_commit interface)
+diff --cc fs/xfs/libxfs/xfs_shared.h
+index 8dda4b321343,5be529707903..000000000000
+--- a/fs/xfs/libxfs/xfs_shared.h
++++ b/fs/xfs/libxfs/xfs_shared.h
+@@@ -182,12 -182,6 +182,15 @@@ int	xfs_log_calc_minimum_size(struct xf
+  #define XFS_TRANS_FREEZE_PROT	0x40	/* Transaction has elevated writer
+  					   count in superblock */
+  /*
+++<<<<<<< HEAD
+ + * Values for call flags parameter.
+ + */
+ +#define	XFS_TRANS_RELEASE_LOG_RES	0x4
+ +#define	XFS_TRANS_ABORT			0x8
+ +
+ +/*
+++=======
+++>>>>>>> 70393313dd0b (xfs: saner xfs_trans_commit interface)
+   * Field values for xfs_trans_mod_sb.
+   */
+  #define	XFS_TRANS_SB_ICOUNT		0x00000001
+diff --cc fs/xfs/xfs_aops.c
+index bb6024910e57,7246a3936c6f..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -143,6 -134,32 +143,35 @@@ xfs_setfilesize_trans_alloc
+   */
+  STATIC int
+  xfs_setfilesize(
+++<<<<<<< HEAD
+++=======
++ 	struct xfs_inode	*ip,
++ 	struct xfs_trans	*tp,
++ 	xfs_off_t		offset,
++ 	size_t			size)
++ {
++ 	xfs_fsize_t		isize;
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	isize = xfs_new_eof(ip, offset + size);
++ 	if (!isize) {
++ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 		xfs_trans_cancel(tp);
++ 		return 0;
++ 	}
++ 
++ 	trace_xfs_setfilesize(ip, offset, size);
++ 
++ 	ip->i_d.di_size = isize;
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++ 
++ 	return xfs_trans_commit(tp);
++ }
++ 
++ STATIC int
++ xfs_setfilesize_ioend(
+++>>>>>>> 70393313dd0b (xfs: saner xfs_trans_commit interface)
+  	struct xfs_ioend	*ioend)
+  {
+  	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+diff --cc fs/xfs/xfs_attr_inactive.c
+index 73e75a87af50,48f26ff08880..000000000000
+--- a/fs/xfs/xfs_attr_inactive.c
++++ b/fs/xfs/xfs_attr_inactive.c
+@@@ -436,36 -423,28 +436,42 @@@ xfs_attr_inactive
+  	xfs_trans_ijoin(trans, dp, 0);
+  
+  	/*
+ -	 * Decide on what work routines to call based on the inode size.
+ +	 * Invalidate and truncate the attribute fork extents. Make sure the
+ +	 * fork actually has attributes as otherwise the invalidation has no
+ +	 * blocks to read and returns an error. In this case, just do the fork
+ +	 * removal below.
+  	 */
+ -	if (!xfs_inode_hasattr(dp) ||
+ -	    dp->i_d.di_aformat == XFS_DINODE_FMT_LOCAL) {
+ -		error = 0;
+ -		goto out;
+ +	if (xfs_inode_hasattr(dp) &&
+ +	    dp->i_d.di_aformat != XFS_DINODE_FMT_LOCAL) {
+ +		error = xfs_attr3_root_inactive(&trans, dp);
+ +		if (error)
+ +			goto out_cancel;
+ +
+ +		error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
+ +		if (error)
+ +			goto out_cancel;
+  	}
+ -	error = xfs_attr3_root_inactive(&trans, dp);
+ -	if (error)
+ -		goto out;
+  
+ -	error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
+ -	if (error)
+ -		goto out;
+ +	/* Reset the attribute fork - this also destroys the in-core fork */
+ +	xfs_attr_fork_remove(dp, trans);
+  
+++<<<<<<< HEAD
+ +	error = xfs_trans_commit(trans, XFS_TRANS_RELEASE_LOG_RES);
+ +	xfs_iunlock(dp, lock_mode);
+++=======
++ 	error = xfs_trans_commit(trans);
++ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
++ 
+++>>>>>>> 70393313dd0b (xfs: saner xfs_trans_commit interface)
+  	return error;
+  
+ -out:
+ -	xfs_trans_cancel(trans);
+ -	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ +out_cancel:
+ +	xfs_trans_cancel(trans, cancel_flags);
+ +out_destroy_fork:
+ +	/* kill the in-core attr fork before we drop the inode lock */
+ +	if (dp->i_afp)
+ +		xfs_idestroy_fork(dp, XFS_ATTR_FORK);
+ +	if (lock_mode)
+ +		xfs_iunlock(dp, lock_mode);
+  	return error;
+  }
+diff --cc fs/xfs/xfs_bmap_util.c
+index d31faf0a2920,1f0215d9a471..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -891,12 -891,9 +891,11 @@@ xfs_free_eofblocks
+  			 * If we get an error at this point we simply don't
+  			 * bother truncating the file.
+  			 */
+ -			xfs_trans_cancel(tp);
+ +			xfs_trans_cancel(tp,
+ +					 (XFS_TRANS_RELEASE_LOG_RES |
+ +					  XFS_TRANS_ABORT));
+  		} else {
+- 			error = xfs_trans_commit(tp,
+- 						XFS_TRANS_RELEASE_LOG_RES);
++ 			error = xfs_trans_commit(tp);
+  			if (!error)
+  				xfs_inode_clear_eofblocks_tag(ip);
+  		}
+@@@ -1375,6 -1356,133 +1374,136 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * @next_fsb will keep track of the extent currently undergoing shift.
++  * @stop_fsb will keep track of the extent at which we have to stop.
++  * If we are shifting left, we will start with block (offset + len) and
++  * shift each extent till last extent.
++  * If we are shifting right, we will start with last extent inside file space
++  * and continue until we reach the block corresponding to offset.
++  */
++ static int
++ xfs_shift_file_space(
++ 	struct xfs_inode        *ip,
++ 	xfs_off_t               offset,
++ 	xfs_off_t               len,
++ 	enum shift_direction	direction)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_bmap_free	free_list;
++ 	xfs_fsblock_t		first_block;
++ 	int			committed;
++ 	xfs_fileoff_t		stop_fsb;
++ 	xfs_fileoff_t		next_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
++ 
++ 	if (direction == SHIFT_LEFT) {
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
++ 
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
++ 	 * into the accessible region of the file.
++ 	 */
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(mp, ip, false);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate cache for the remainder of the file as we're
++ 	 * about to shift down every extent from offset to EOF.
++ 	 */
++ 	error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 					     offset, -1);
++ 	if (error)
++ 		return error;
++ 	error = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					offset >> PAGE_CACHE_SHIFT, -1);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	while (!error && !done) {
++ 		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 		/*
++ 		 * We would need to reserve permanent block for transaction.
++ 		 * This will come into picture when after shifting extent into
++ 		 * hole we found that adjacent extents can be merged which
++ 		 * may lead to freeing of a block during record update.
++ 		 */
++ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 		if (error) {
++ 			xfs_trans_cancel(tp);
++ 			break;
++ 		}
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out;
++ 
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 		xfs_bmap_init(&free_list, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &free_list,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_trans_commit(tp);
++ 	}
++ 
++ 	return error;
++ 
++ out:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 70393313dd0b (xfs: saner xfs_trans_commit interface)
+   * xfs_collapse_file_space()
+   *	This routine frees disk space and shift extent for the given file.
+   *	The first thing we do is to free data blocks in the specified range
+diff --git a/fs/xfs/libxfs/xfs_attr.c b/fs/xfs/libxfs/xfs_attr.c
+index 0a472fbe06d4..6020eb153b68 100644
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -320,8 +320,7 @@ xfs_attr_set(
+ 				xfs_trans_ichgtime(args.trans, dp,
+ 							XFS_ICHGTIME_CHG);
+ 			}
+-			err2 = xfs_trans_commit(args.trans,
+-						 XFS_TRANS_RELEASE_LOG_RES);
++			err2 = xfs_trans_commit(args.trans);
+ 			xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 
+ 			return error ? error : err2;
+@@ -383,7 +382,7 @@ xfs_attr_set(
+ 	 * Commit the last in the sequence of transactions.
+ 	 */
+ 	xfs_trans_log_inode(args.trans, dp, XFS_ILOG_CORE);
+-	error = xfs_trans_commit(args.trans, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(args.trans);
+ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 
+ 	return error;
+@@ -501,7 +500,7 @@ xfs_attr_remove(
+ 	 * Commit the last in the sequence of transactions.
+ 	 */
+ 	xfs_trans_log_inode(args.trans, dp, XFS_ILOG_CORE);
+-	error = xfs_trans_commit(args.trans, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(args.trans);
+ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 
+ 	return error;
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_sb.c b/fs/xfs/libxfs/xfs_sb.c
+index 019dc324a146..0509027d0102 100644
+--- a/fs/xfs/libxfs/xfs_sb.c
++++ b/fs/xfs/libxfs/xfs_sb.c
+@@ -825,5 +825,5 @@ xfs_sync_sb(
+ 	xfs_log_sb(tp);
+ 	if (wait)
+ 		xfs_trans_set_sync(tp);
+-	return xfs_trans_commit(tp, 0);
++	return xfs_trans_commit(tp);
+ }
+* Unmerged path fs/xfs/libxfs/xfs_shared.h
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_attr_inactive.c
+* Unmerged path fs/xfs/xfs_bmap_util.c
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index a0f4af03c7d8..f4045ae4b27e 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -670,7 +670,7 @@ xfs_qm_dqread(
+ 	xfs_trans_brelse(tp, bp);
+ 
+ 	if (tp) {
+-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++		error = xfs_trans_commit(tp);
+ 		if (error)
+ 			goto error0;
+ 	}
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index a43abe74112c..5ff8ba8ddc5b 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -161,7 +161,7 @@ xfs_update_prealloc_flags(
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 	if (flags & XFS_PREALLOC_SYNC)
+ 		xfs_trans_set_sync(tp);
+-	return xfs_trans_commit(tp, 0);
++	return xfs_trans_commit(tp);
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_fsops.c b/fs/xfs/xfs_fsops.c
+index 4bd6463cd931..e2b35b150c36 100644
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@ -491,7 +491,7 @@ xfs_growfs_data_private(
+ 	if (dpct)
+ 		xfs_trans_mod_sb(tp, XFS_TRANS_SB_IMAXPCT, dpct);
+ 	xfs_trans_set_sync(tp);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index d9c271cb1792..2c1da57cfb23 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1235,7 +1235,7 @@ xfs_create(
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out_release_inode;
+ 
+@@ -1349,7 +1349,7 @@ xfs_create_tmpfile(
+ 	if (error)
+ 		goto out_trans_abort;
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out_release_inode;
+ 
+@@ -1481,7 +1481,7 @@ xfs_link(
+ 		goto abort_return;
+ 	}
+ 
+-	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	return xfs_trans_commit(tp);
+ 
+  abort_return:
+ 	cancel_flags |= XFS_TRANS_ABORT;
+@@ -1720,7 +1720,7 @@ xfs_inactive_truncate(
+ 
+ 	ASSERT(ip->i_d.di_nextents == 0);
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto error_unlock;
+ 
+@@ -1817,7 +1817,7 @@ xfs_inactive_ifree(
+ 	if (error)
+ 		xfs_notice(mp, "%s: xfs_bmap_finish returned error %d",
+ 			__func__, error);
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		xfs_notice(mp, "%s: xfs_trans_commit returned error %d",
+ 			__func__, error);
+@@ -2600,7 +2600,7 @@ xfs_remove(
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto std_return;
+ 
+@@ -2690,7 +2690,7 @@ xfs_finish_rename(
+ 		return error;
+ 	}
+ 
+-	return xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	return xfs_trans_commit(tp);
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 6326af4aa381..31cf9baae163 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -372,7 +372,7 @@ xfs_set_dmattrs(
+ 	ip->i_d.di_dmstate  = state;
+ 
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 
+ 	return error;
+ }
+@@ -1279,7 +1279,7 @@ xfs_ioctl_setattr(
+ 	else
+ 		ip->i_d.di_extsize = 0;
+ 
+-	code = xfs_trans_commit(tp, 0);
++	code = xfs_trans_commit(tp);
+ 
+ 	/*
+ 	 * Release any dquot(s) the inode had kept before chown.
+@@ -1368,7 +1368,7 @@ xfs_ioc_setxflags(
+ 		goto out_drop_write;
+ 	}
+ 
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ out_drop_write:
+ 	mnt_drop_write_file(filp);
+ 	return error;
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 38e633bad8c2..82416de382bc 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -213,7 +213,7 @@ xfs_iomap_write_direct(
+ 	error = xfs_bmap_finish(&tp, &free_list, &committed);
+ 	if (error)
+ 		goto out_bmap_cancel;
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out_unlock;
+ 
+@@ -760,7 +760,7 @@ xfs_iomap_write_allocate(
+ 			if (error)
+ 				goto trans_cancel;
+ 
+-			error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++			error = xfs_trans_commit(tp);
+ 			if (error)
+ 				goto error0;
+ 
+@@ -890,7 +890,7 @@ xfs_iomap_write_unwritten(
+ 		if (error)
+ 			goto error_on_bmapi_transaction;
+ 
+-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++		error = xfs_trans_commit(tp);
+ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 		if (error)
+ 			return error;
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index 5e33f3364b73..dce864df4692 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -699,7 +699,7 @@ xfs_setattr_nonsize(
+ 
+ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
+ 		xfs_trans_set_sync(tp);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 
+@@ -925,7 +925,7 @@ xfs_setattr_size(
+ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
+ 		xfs_trans_set_sync(tp);
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ out_unlock:
+ 	if (lock_flags)
+ 		xfs_iunlock(ip, lock_flags);
+@@ -1003,7 +1003,7 @@ xfs_vn_update_time(
+ 	}
+ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_TIMESTAMP);
+-	return xfs_trans_commit(tp, 0);
++	return xfs_trans_commit(tp);
+ }
+ 
+ #define XFS_FIEMAP_FLAGS	(FIEMAP_FLAG_SYNC|FIEMAP_FLAG_XATTR)
+diff --git a/fs/xfs/xfs_log.h b/fs/xfs/xfs_log.h
+index 84e0deb95abd..4040c477892f 100644
+--- a/fs/xfs/xfs_log.h
++++ b/fs/xfs/xfs_log.h
+@@ -183,7 +183,7 @@ struct xlog_ticket *xfs_log_ticket_get(struct xlog_ticket *ticket);
+ void	  xfs_log_ticket_put(struct xlog_ticket *ticket);
+ 
+ void	xfs_log_commit_cil(struct xfs_mount *mp, struct xfs_trans *tp,
+-				xfs_lsn_t *commit_lsn, int flags);
++				xfs_lsn_t *commit_lsn, bool regrant);
+ bool	xfs_log_item_in_current_chkpt(struct xfs_log_item *lip);
+ 
+ void	xfs_log_work_queue(struct xfs_mount *mp);
+diff --git a/fs/xfs/xfs_log_cil.c b/fs/xfs/xfs_log_cil.c
+index a8d75ff47029..f14554c4df9c 100644
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@ -779,13 +779,13 @@ xfs_log_commit_cil(
+ 	struct xfs_mount	*mp,
+ 	struct xfs_trans	*tp,
+ 	xfs_lsn_t		*commit_lsn,
+-	int			flags)
++	bool			regrant)
+ {
+ 	struct xlog		*log = mp->m_log;
+ 	struct xfs_cil		*cil = log->l_cilp;
+ 	int			log_flags = 0;
+ 
+-	if (flags & XFS_TRANS_RELEASE_LOG_RES)
++	if (!regrant)
+ 		log_flags = XFS_LOG_REL_PERM_RESERV;
+ 
+ 	/* lock out background commit */
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 29e2fbb305f9..e656169a82fe 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -3783,7 +3783,7 @@ xlog_recover_process_efi(
+ 	}
+ 
+ 	set_bit(XFS_EFI_RECOVERED, &efip->efi_flags);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 	return error;
+ 
+ abort_error:
+@@ -3889,7 +3889,7 @@ xlog_recover_clear_agi_bucket(
+ 	xfs_trans_log_buf(tp, agibp, offset,
+ 			  (offset + sizeof(xfs_agino_t) - 1));
+ 
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out_error;
+ 	return;
+diff --git a/fs/xfs/xfs_pnfs.c b/fs/xfs/xfs_pnfs.c
+index 981a657eca39..6ca0b7e4d7ba 100644
+--- a/fs/xfs/xfs_pnfs.c
++++ b/fs/xfs/xfs_pnfs.c
+@@ -321,7 +321,7 @@ xfs_fs_commit_blocks(
+ 	}
+ 
+ 	xfs_trans_set_sync(tp);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 
+ out_drop_iolock:
+ 	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index c93b497fa09e..ddd468683266 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -652,7 +652,7 @@ xfs_qm_qino_alloc(
+ 	spin_unlock(&mp->m_sb_lock);
+ 	xfs_log_sb(tp);
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error) {
+ 		ASSERT(XFS_FORCED_SHUTDOWN(mp));
+ 		xfs_alert(mp, "%s failed (error %d)!", __func__, error);
+diff --git a/fs/xfs/xfs_qm_syscalls.c b/fs/xfs/xfs_qm_syscalls.c
+index 784c41b3ad84..c6d13b8ed2c3 100644
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@ -262,7 +262,7 @@ xfs_qm_scall_trunc_qfile(
+ 	ASSERT(ip->i_d.di_nextents == 0);
+ 
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 
+ out_unlock:
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL | XFS_IOLOCK_EXCL);
+@@ -703,7 +703,7 @@ xfs_qm_scall_setqlim(
+ 	dqp->dq_flags |= XFS_DQ_DIRTY;
+ 	xfs_trans_log_dquot(tp, dqp);
+ 
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 
+ out_rele:
+ 	xfs_qm_dqrele(dqp);
+@@ -740,8 +740,7 @@ xfs_qm_log_quotaoff_end(
+ 	 * We don't care about quotoff's performance.
+ 	 */
+ 	xfs_trans_set_sync(tp);
+-	error = xfs_trans_commit(tp, 0);
+-	return error;
++	return xfs_trans_commit(tp);
+ }
+ 
+ 
+@@ -779,7 +778,7 @@ xfs_qm_log_quotaoff(
+ 	 * We don't care about quotoff's performance.
+ 	 */
+ 	xfs_trans_set_sync(tp);
+-	error = xfs_trans_commit(tp, 0);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out;
+ 
+diff --git a/fs/xfs/xfs_rtalloc.c b/fs/xfs/xfs_rtalloc.c
+index f2079b6911cc..c5d68b796b4b 100644
+--- a/fs/xfs/xfs_rtalloc.c
++++ b/fs/xfs/xfs_rtalloc.c
+@@ -818,7 +818,7 @@ xfs_growfs_rt_alloc(
+ 		error = xfs_bmap_finish(&tp, &flist, &committed);
+ 		if (error)
+ 			goto error_cancel;
+-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++		error = xfs_trans_commit(tp);
+ 		if (error)
+ 			goto error;
+ 		/*
+@@ -859,7 +859,7 @@ error_cancel:
+ 			/*
+ 			 * Commit the transaction.
+ 			 */
+-			error = xfs_trans_commit(tp, 0);
++			error = xfs_trans_commit(tp);
+ 			if (error)
+ 				goto error;
+ 		}
+@@ -1076,7 +1076,7 @@ error_cancel:
+ 		mp->m_rsumlevels = nrsumlevels;
+ 		mp->m_rsumsize = nrsumsize;
+ 
+-		error = xfs_trans_commit(tp, 0);
++		error = xfs_trans_commit(tp);
+ 		if (error)
+ 			break;
+ 	}
+diff --git a/fs/xfs/xfs_symlink.c b/fs/xfs/xfs_symlink.c
+index 3df411eadb86..5654418dc31b 100644
+--- a/fs/xfs/xfs_symlink.c
++++ b/fs/xfs/xfs_symlink.c
+@@ -394,7 +394,7 @@ xfs_symlink(
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error)
+ 		goto out_release_inode;
+ 
+@@ -533,7 +533,7 @@ xfs_inactive_symlink_rmt(
+ 	/*
+ 	 * Commit the transaction containing extent freeing and EFDs.
+ 	 */
+-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++	error = xfs_trans_commit(tp);
+ 	if (error) {
+ 		ASSERT(XFS_FORCED_SHUTDOWN(mp));
+ 		goto error_unlock;
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 42a1adf81dad..06c6c7c8eac9 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -892,26 +892,16 @@ xfs_trans_committed_bulk(
+  * have already been unlocked as if the commit had succeeded.
+  * Do not reference the transaction structure after this call.
+  */
+-int
+-xfs_trans_commit(
++static int
++__xfs_trans_commit(
+ 	struct xfs_trans	*tp,
+-	uint			flags)
++	bool			regrant)
+ {
+ 	struct xfs_mount	*mp = tp->t_mountp;
+ 	xfs_lsn_t		commit_lsn = -1;
+ 	int			error = 0;
+-	int			log_flags = 0;
+ 	int			sync = tp->t_flags & XFS_TRANS_SYNC;
+ 
+-	/*
+-	 * Determine whether this commit is releasing a permanent
+-	 * log reservation or not.
+-	 */
+-	if (flags & XFS_TRANS_RELEASE_LOG_RES) {
+-		ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+-		log_flags = XFS_LOG_REL_PERM_RESERV;
+-	}
+-
+ 	/*
+ 	 * If there is nothing to be logged by the transaction,
+ 	 * then unlock all of the items associated with the
+@@ -936,7 +926,7 @@ xfs_trans_commit(
+ 		xfs_trans_apply_sb_deltas(tp);
+ 	xfs_trans_apply_dquot_deltas(tp);
+ 
+-	xfs_log_commit_cil(mp, tp, &commit_lsn, flags);
++	xfs_log_commit_cil(mp, tp, &commit_lsn, regrant);
+ 
+ 	current_restore_flags_nested(&tp->t_pflags, PF_FSTRANS);
+ 	xfs_trans_free(tp);
+@@ -964,6 +954,12 @@ out_unreserve:
+ 	 */
+ 	xfs_trans_unreserve_and_mod_dquots(tp);
+ 	if (tp->t_ticket) {
++		int			log_flags = 0;
++
++		if (regrant)
++			ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
++		else
++			log_flags = XFS_LOG_REL_PERM_RESERV;
+ 		commit_lsn = xfs_log_done(mp, tp->t_ticket, NULL, log_flags);
+ 		if (commit_lsn == -1 && !error)
+ 			error = -EIO;
+@@ -976,6 +972,13 @@ out_unreserve:
+ 	return error;
+ }
+ 
++int
++xfs_trans_commit(
++	struct xfs_trans	*tp)
++{
++	return __xfs_trans_commit(tp, false);
++}
++
+ /*
+  * Unlock all of the transaction's items and free the transaction.
+  * The transaction must not have modified any of its items, because
+@@ -1038,7 +1041,7 @@ xfs_trans_cancel(
+ /*
+  * Roll from one trans in the sequence of PERMANENT transactions to
+  * the next: permanent transactions are only flushed out when
+- * committed with XFS_TRANS_RELEASE_LOG_RES, but we still want as soon
++ * committed with xfs_trans_commit(), but we still want as soon
+  * as possible to let chunks of it go to the log. So we commit the
+  * chunk we've been working on and get a new transaction to continue.
+  */
+@@ -1072,7 +1075,7 @@ xfs_trans_roll(
+ 	 * is in progress. The caller takes the responsibility to cancel
+ 	 * the duplicate transaction that gets returned.
+ 	 */
+-	error = xfs_trans_commit(trans, 0);
++	error = __xfs_trans_commit(trans, true);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index 3bfb4176e19b..e1959c155230 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -225,7 +225,7 @@ void		xfs_trans_log_efd_extent(xfs_trans_t *,
+ 					 struct xfs_efd_log_item *,
+ 					 xfs_fsblock_t,
+ 					 xfs_extlen_t);
+-int		xfs_trans_commit(xfs_trans_t *, uint flags);
++int		xfs_trans_commit(struct xfs_trans *);
+ int		xfs_trans_roll(struct xfs_trans **, struct xfs_inode *);
+ void		xfs_trans_cancel(xfs_trans_t *, int);
+ int		xfs_trans_ail_init(struct xfs_mount *);
