@@ -1,0 +1,626 @@
+KVM: PPC: Book3S HV: Make use of unused threads when running guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Make use of unused threads when running guests (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 94.57%
+commit-author Paul Mackerras <paulus@samba.org>
+commit ec257165082616841a354dd915801ed43e3553be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ec257165.failed
+
+When running a virtual core of a guest that is configured with fewer
+threads per core than the physical cores have, the extra physical
+threads are currently unused.  This makes it possible to use them to
+run one or more other virtual cores from the same guest when certain
+conditions are met.  This applies on POWER7, and on POWER8 to guests
+with one thread per virtual core.  (It doesn't apply to POWER8 guests
+with multiple threads per vcore because they require a 1-1 virtual to
+physical thread mapping in order to be able to use msgsndp and the
+TIR.)
+
+The idea is that we maintain a list of preempted vcores for each
+physical cpu (i.e. each core, since the host runs single-threaded).
+Then, when a vcore is about to run, it checks to see if there are
+any vcores on the list for its physical cpu that could be
+piggybacked onto this vcore's execution.  If so, those additional
+vcores are put into state VCORE_PIGGYBACK and their runnable VCPU
+threads are started as well as the original vcore, which is called
+the master vcore.
+
+After the vcores have exited the guest, the extra ones are put back
+onto the preempted list if any of their VCPUs are still runnable and
+not idle.
+
+This means that vcpu->arch.ptid is no longer necessarily the same as
+the physical thread that the vcpu runs on.  In order to make it easier
+for code that wants to send an IPI to know which CPU to target, we
+now store that in a new field in struct vcpu_arch, called thread_cpu.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Tested-by: Laurent Vivier <lvivier@redhat.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit ec257165082616841a354dd915801ed43e3553be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/kernel/asm-offsets.c
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index d17590f243b6,2b7449017ae8..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -316,16 -295,25 +318,29 @@@ struct kvmppc_vcore 
+  	ulong dpdes;		/* doorbell state (POWER8) */
+  	void *mpp_buffer; /* Micro Partition Prefetch buffer */
+  	bool mpp_buffer_is_valid;
+ -	ulong conferring_threads;
+  };
+  
+ -#define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
+ -#define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
+ -#define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
+ +#define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+ +#define VCORE_EXIT_COUNT(vc)	((vc)->entry_exit_count >> 8)
+  
+- /* Values for vcore_state */
++ /*
++  * Values for vcore_state.
++  * Note that these are arranged such that lower values
++  * (< VCORE_SLEEPING) don't require stolen time accounting
++  * on load/unload, and higher values do.
++  */
+  #define VCORE_INACTIVE	0
+++<<<<<<< HEAD
+ +#define VCORE_SLEEPING	1
+ +#define VCORE_RUNNING	2
+ +#define VCORE_EXITING	3
+++=======
++ #define VCORE_PREEMPT	1
++ #define VCORE_PIGGYBACK	2
++ #define VCORE_SLEEPING	3
++ #define VCORE_RUNNING	4
++ #define VCORE_EXITING	5
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  
+  /*
+   * Struct used to manage memory for a virtual processor area
+diff --cc arch/powerpc/kernel/asm-offsets.c
+index b98af275a63f,a78cdbf9b622..000000000000
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@@ -492,6 -511,9 +492,12 @@@ int main(void
+  	DEFINE(VCPU_DAR, offsetof(struct kvm_vcpu, arch.shregs.dar));
+  	DEFINE(VCPU_VPA, offsetof(struct kvm_vcpu, arch.vpa.pinned_addr));
+  	DEFINE(VCPU_VPA_DIRTY, offsetof(struct kvm_vcpu, arch.vpa.dirty));
+++<<<<<<< HEAD
+++=======
++ 	DEFINE(VCPU_HEIR, offsetof(struct kvm_vcpu, arch.emul_inst));
++ 	DEFINE(VCPU_CPU, offsetof(struct kvm_vcpu, cpu));
++ 	DEFINE(VCPU_THREAD_CPU, offsetof(struct kvm_vcpu, arch.thread_cpu));
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  #endif
+  #ifdef CONFIG_PPC_BOOK3S
+  	DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903,0173ce221111..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -80,10 -88,36 +83,14 @@@ MODULE_PARM_DESC(target_smt_mode, "Targ
+  static void kvmppc_end_cede(struct kvm_vcpu *vcpu);
+  static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu);
+  
+ -static bool kvmppc_ipi_thread(int cpu)
+ -{
+ -	/* On POWER8 for IPIs to threads in the same core, use msgsnd */
+ -	if (cpu_has_feature(CPU_FTR_ARCH_207S)) {
+ -		preempt_disable();
+ -		if (cpu_first_thread_sibling(cpu) ==
+ -		    cpu_first_thread_sibling(smp_processor_id())) {
+ -			unsigned long msg = PPC_DBELL_TYPE(PPC_DBELL_SERVER);
+ -			msg |= cpu_thread_in_core(cpu);
+ -			smp_mb();
+ -			__asm__ __volatile__ (PPC_MSGSND(%0) : : "r" (msg));
+ -			preempt_enable();
+ -			return true;
+ -		}
+ -		preempt_enable();
+ -	}
+ -
+ -#if defined(CONFIG_PPC_ICP_NATIVE) && defined(CONFIG_SMP)
+ -	if (cpu >= 0 && cpu < nr_cpu_ids && paca[cpu].kvm_hstate.xics_phys) {
+ -		xics_wake_cpu(cpu);
+ -		return true;
+ -	}
+ -#endif
+ -
+ -	return false;
+ -}
+ -
+  static void kvmppc_fast_vcpu_kick_hv(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	int me;
+ +	int cpu = vcpu->cpu;
+++=======
++ 	int cpu;
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  	wait_queue_head_t *wqp;
+  
+  	wqp = kvm_arch_vcpu_wq(vcpu);
+@@@ -92,20 -126,13 +99,30 @@@
+  		++vcpu->stat.halt_wakeup;
+  	}
+  
+++<<<<<<< HEAD
+ +	me = get_cpu();
+ +
+ +	/* CPU points to the first thread of the core */
+ +	if (cpu != me && cpu >= 0 && cpu < nr_cpu_ids) {
+ +#ifdef CONFIG_PPC_ICP_NATIVE
+ +		int real_cpu = cpu + vcpu->arch.ptid;
+ +		if (paca[real_cpu].kvm_hstate.xics_phys)
+ +			xics_wake_cpu(real_cpu);
+ +		else
+ +#endif
+ +		if (cpu_online(cpu))
+ +			smp_send_reschedule(cpu);
+ +	}
+ +	put_cpu();
+++=======
++ 	if (kvmppc_ipi_thread(vcpu->arch.thread_cpu))
++ 		return;
++ 
++ 	/* CPU points to the first thread of the core */
++ 	cpu = vcpu->cpu;
++ 	if (cpu >= 0 && cpu < nr_cpu_ids && cpu_online(cpu))
++ 		smp_send_reschedule(cpu);
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  }
+  
+  /*
+@@@ -607,6 -645,41 +638,44 @@@ static int kvmppc_h_set_mode(struct kvm
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_arch_vcpu_yield_to(struct kvm_vcpu *target)
++ {
++ 	struct kvmppc_vcore *vcore = target->arch.vcore;
++ 
++ 	/*
++ 	 * We expect to have been called by the real mode handler
++ 	 * (kvmppc_rm_h_confer()) which would have directly returned
++ 	 * H_SUCCESS if the source vcore wasn't idle (e.g. if it may
++ 	 * have useful work to do and should not confer) so we don't
++ 	 * recheck that here.
++ 	 */
++ 
++ 	spin_lock(&vcore->lock);
++ 	if (target->arch.state == KVMPPC_VCPU_RUNNABLE &&
++ 	    vcore->vcore_state != VCORE_INACTIVE &&
++ 	    vcore->runner)
++ 		target = vcore->runner;
++ 	spin_unlock(&vcore->lock);
++ 
++ 	return kvm_vcpu_yield_to(target);
++ }
++ 
++ static int kvmppc_get_yield_count(struct kvm_vcpu *vcpu)
++ {
++ 	int yield_count = 0;
++ 	struct lppaca *lppaca;
++ 
++ 	spin_lock(&vcpu->arch.vpa_update_lock);
++ 	lppaca = (struct lppaca *)vcpu->arch.vpa.pinned_addr;
++ 	if (lppaca)
++ 		yield_count = be32_to_cpu(lppaca->yield_count);
++ 	spin_unlock(&vcpu->arch.vpa_update_lock);
++ 	return yield_count;
++ }
++ 
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+  {
+  	unsigned long req = kvmppc_get_gpr(vcpu, 3);
+@@@ -1578,16 -1816,15 +1650,17 @@@ static void kvmppc_start_thread(struct 
+  	}
+  	cpu = vc->pcpu + vcpu->arch.ptid;
+  	tpaca = &paca[cpu];
+- 	tpaca->kvm_hstate.kvm_vcore = vc;
+- 	tpaca->kvm_hstate.ptid = vcpu->arch.ptid;
+- 	vcpu->cpu = vc->pcpu;
+- 	/* Order stores to hstate.kvm_vcore etc. before store to kvm_vcpu */
++ 	tpaca->kvm_hstate.kvm_vcore = mvc;
++ 	tpaca->kvm_hstate.ptid = cpu - mvc->pcpu;
++ 	vcpu->cpu = mvc->pcpu;
++ 	vcpu->arch.thread_cpu = cpu;
++ 	/* Order stores to hstate.kvm_vcpu etc. before store to kvm_vcore */
+  	smp_wmb();
+  	tpaca->kvm_hstate.kvm_vcpu = vcpu;
+ +#if defined(CONFIG_PPC_ICP_NATIVE) && defined(CONFIG_SMP)
+  	if (cpu != smp_processor_id())
+ -		kvmppc_ipi_thread(cpu);
+ +		xics_wake_cpu(cpu);
+ +#endif
+  }
+  
+  static void kvmppc_wait_for_nap(void)
+@@@ -1695,17 -2040,103 +1876,108 @@@ static void prepare_threads(struct kvmp
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void collect_piggybacks(struct core_info *cip, int target_threads)
++ {
++ 	struct preempted_vcore_list *lp = this_cpu_ptr(&preempted_vcores);
++ 	struct kvmppc_vcore *pvc, *vcnext;
++ 
++ 	spin_lock(&lp->lock);
++ 	list_for_each_entry_safe(pvc, vcnext, &lp->list, preempt_list) {
++ 		if (!spin_trylock(&pvc->lock))
++ 			continue;
++ 		prepare_threads(pvc);
++ 		if (!pvc->n_runnable) {
++ 			list_del_init(&pvc->preempt_list);
++ 			if (pvc->runner == NULL) {
++ 				pvc->vcore_state = VCORE_INACTIVE;
++ 				kvmppc_core_end_stolen(pvc);
++ 			}
++ 			spin_unlock(&pvc->lock);
++ 			continue;
++ 		}
++ 		if (!can_piggyback(pvc, cip, target_threads)) {
++ 			spin_unlock(&pvc->lock);
++ 			continue;
++ 		}
++ 		kvmppc_core_end_stolen(pvc);
++ 		pvc->vcore_state = VCORE_PIGGYBACK;
++ 		if (cip->total_threads >= target_threads)
++ 			break;
++ 	}
++ 	spin_unlock(&lp->lock);
++ }
++ 
++ static void post_guest_process(struct kvmppc_vcore *vc, bool is_master)
++ {
++ 	int still_running = 0;
++ 	u64 now;
++ 	long ret;
++ 	struct kvm_vcpu *vcpu, *vnext;
++ 
++ 	spin_lock(&vc->lock);
++ 	now = get_tb();
++ 	list_for_each_entry_safe(vcpu, vnext, &vc->runnable_threads,
++ 				 arch.run_list) {
++ 		/* cancel pending dec exception if dec is positive */
++ 		if (now < vcpu->arch.dec_expires &&
++ 		    kvmppc_core_pending_dec(vcpu))
++ 			kvmppc_core_dequeue_dec(vcpu);
++ 
++ 		trace_kvm_guest_exit(vcpu);
++ 
++ 		ret = RESUME_GUEST;
++ 		if (vcpu->arch.trap)
++ 			ret = kvmppc_handle_exit_hv(vcpu->arch.kvm_run, vcpu,
++ 						    vcpu->arch.run_task);
++ 
++ 		vcpu->arch.ret = ret;
++ 		vcpu->arch.trap = 0;
++ 
++ 		if (is_kvmppc_resume_guest(vcpu->arch.ret)) {
++ 			if (vcpu->arch.pending_exceptions)
++ 				kvmppc_core_prepare_to_enter(vcpu);
++ 			if (vcpu->arch.ceded)
++ 				kvmppc_set_timer(vcpu);
++ 			else
++ 				++still_running;
++ 		} else {
++ 			kvmppc_remove_runnable(vc, vcpu);
++ 			wake_up(&vcpu->arch.cpu_run);
++ 		}
++ 	}
++ 	list_del_init(&vc->preempt_list);
++ 	if (!is_master) {
++ 		vc->vcore_state = vc->runner ? VCORE_PREEMPT : VCORE_INACTIVE;
++ 		if (still_running > 0)
++ 			kvmppc_vcore_preempt(vc);
++ 		if (vc->n_runnable > 0 && vc->runner == NULL) {
++ 			/* make sure there's a candidate runner awake */
++ 			vcpu = list_first_entry(&vc->runnable_threads,
++ 						struct kvm_vcpu, arch.run_list);
++ 			wake_up(&vcpu->arch.cpu_run);
++ 		}
++ 	}
++ 	spin_unlock(&vc->lock);
++ }
++ 
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  /*
+   * Run a set of guest threads on a physical core.
+   * Called with vc->lock held.
+   */
+ -static noinline void kvmppc_run_core(struct kvmppc_vcore *vc)
+ +static void kvmppc_run_core(struct kvmppc_vcore *vc)
+  {
+  	struct kvm_vcpu *vcpu, *vnext;
+ +	long ret;
+ +	u64 now;
+  	int i;
+  	int srcu_idx;
++ 	struct core_info core_info;
++ 	struct kvmppc_vcore *pvc, *vcnext;
++ 	int pcpu, thr;
++ 	int target_threads;
+  
+  	/*
+  	 * Remove from the list any threads that have a signal pending
+@@@ -1720,10 -2151,8 +1992,15 @@@
+  	/*
+  	 * Initialize *vc.
+  	 */
+++<<<<<<< HEAD
+ +	vc->entry_exit_count = 0;
+ +	vc->preempt_tb = TB_NIL;
+ +	vc->in_guest = 0;
+ +	vc->napping_threads = 0;
+++=======
++ 	init_master_vcore(vc);
++ 	vc->preempt_tb = TB_NIL;
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  
+  	/*
+  	 * Make sure we are running on primary threads, and that secondary
+@@@ -1737,11 -2167,31 +2014,35 @@@
+  		goto out;
+  	}
+  
+- 
++ 	/*
++ 	 * See if we could run any other vcores on the physical core
++ 	 * along with this one.
++ 	 */
++ 	init_core_info(&core_info, vc);
++ 	pcpu = smp_processor_id();
++ 	target_threads = threads_per_subcore;
++ 	if (target_smt_mode && target_smt_mode < target_threads)
++ 		target_threads = target_smt_mode;
++ 	if (vc->num_threads < target_threads)
++ 		collect_piggybacks(&core_info, target_threads);
++ 
+++<<<<<<< HEAD
+ +	vc->pcpu = smp_processor_id();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		kvmppc_start_thread(vcpu);
+ +		kvmppc_create_dtl_entry(vcpu, vc);
+++=======
++ 	thr = 0;
++ 	list_for_each_entry(pvc, &core_info.vcs, preempt_list) {
++ 		pvc->pcpu = pcpu + thr;
++ 		list_for_each_entry(vcpu, &pvc->runnable_threads,
++ 				    arch.run_list) {
++ 			kvmppc_start_thread(vcpu);
++ 			kvmppc_create_dtl_entry(vcpu, pvc);
++ 			trace_kvm_guest_enter(vcpu);
++ 		}
++ 		thr += pvc->num_threads;
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  	}
+  
+  	/* Set this explicitly in case thread 0 doesn't have a vcpu */
+@@@ -1750,7 -2200,11 +2051,15 @@@
+  
+  	vc->vcore_state = VCORE_RUNNING;
+  	preempt_disable();
+++<<<<<<< HEAD
+ +	spin_unlock(&vc->lock);
+++=======
++ 
++ 	trace_kvmppc_run_core(vc, 0);
++ 
++ 	list_for_each_entry(pvc, &core_info.vcs, preempt_list)
++ 		spin_unlock(&pvc->lock);
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  
+  	kvm_guest_enter();
+  
+@@@ -1783,32 -2234,11 +2089,40 @@@
+  	smp_mb();
+  	kvm_guest_exit();
+  
+++<<<<<<< HEAD
+ +	preempt_enable();
+ +	cond_resched();
+ +
+ +	spin_lock(&vc->lock);
+ +	now = get_tb();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		/* cancel pending dec exception if dec is positive */
+ +		if (now < vcpu->arch.dec_expires &&
+ +		    kvmppc_core_pending_dec(vcpu))
+ +			kvmppc_core_dequeue_dec(vcpu);
+ +
+ +		ret = RESUME_GUEST;
+ +		if (vcpu->arch.trap)
+ +			ret = kvmppc_handle_exit_hv(vcpu->arch.kvm_run, vcpu,
+ +						    vcpu->arch.run_task);
+ +
+ +		vcpu->arch.ret = ret;
+ +		vcpu->arch.trap = 0;
+ +
+ +		if (vcpu->arch.ceded) {
+ +			if (!is_kvmppc_resume_guest(ret))
+ +				kvmppc_end_cede(vcpu);
+ +			else
+ +				kvmppc_set_timer(vcpu);
+ +		}
+ +	}
+++=======
++ 	list_for_each_entry_safe(pvc, vcnext, &core_info.vcs, preempt_list)
++ 		post_guest_process(pvc, pvc == vc);
++ 
++ 	spin_lock(&vc->lock);
++ 	preempt_enable();
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  
+   out:
+  	vc->vcore_state = VCORE_INACTIVE;
+@@@ -1903,10 -2335,22 +2221,26 @@@ static int kvmppc_run_vcpu(struct kvm_r
+  	 * this thread straight away and have it join in.
+  	 */
+  	if (!signal_pending(current)) {
+++<<<<<<< HEAD
+ +		if (vc->vcore_state == VCORE_RUNNING &&
+ +		    VCORE_EXIT_COUNT(vc) == 0) {
+++=======
++ 		if (vc->vcore_state == VCORE_PIGGYBACK) {
++ 			struct kvmppc_vcore *mvc = vc->master_vcore;
++ 			if (spin_trylock(&mvc->lock)) {
++ 				if (mvc->vcore_state == VCORE_RUNNING &&
++ 				    !VCORE_IS_EXITING(mvc)) {
++ 					kvmppc_create_dtl_entry(vcpu, vc);
++ 					kvmppc_start_thread(vcpu);
++ 					trace_kvm_guest_enter(vcpu);
++ 				}
++ 				spin_unlock(&mvc->lock);
++ 			}
++ 		} else if (vc->vcore_state == VCORE_RUNNING &&
++ 			   !VCORE_IS_EXITING(vc)) {
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  			kvmppc_create_dtl_entry(vcpu, vc);
+  			kvmppc_start_thread(vcpu);
+ -			trace_kvm_guest_enter(vcpu);
+  		} else if (vc->vcore_state == VCORE_SLEEPING) {
+  			wake_up(&vc->wq);
+  		}
+@@@ -1942,10 -2386,18 +2277,20 @@@
+  			else
+  				v->arch.ceded = 0;
+  		}
+ -		vc->runner = vcpu;
+ -		if (n_ceded == vc->n_runnable) {
+ +		if (n_ceded == vc->n_runnable)
+  			kvmppc_vcore_blocked(vc);
+++<<<<<<< HEAD
+ +		else
+++=======
++ 		} else if (should_resched()) {
++ 			kvmppc_vcore_preempt(vc);
++ 			/* Let something else run */
++ 			cond_resched_lock(&vc->lock);
++ 			if (vc->vcore_state == VCORE_PREEMPT)
++ 				kvmppc_vcore_end_preempt(vc);
++ 		} else {
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  			kvmppc_run_core(vc);
+ -		}
+  		vc->runner = NULL;
+  	}
+  
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index f719a1437a31,1fd0e3057396..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -175,18 -94,42 +175,51 @@@ void __init kvm_cma_reserve(void
+  	if (selected_size) {
+  		pr_debug("%s: reserving %ld MiB for global area\n", __func__,
+  			 (unsigned long)selected_size / SZ_1M);
+ -		align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
+ -		cma_declare_contiguous(0, selected_size, 0, align_size,
+ -			KVM_CMA_CHUNK_ORDER - PAGE_SHIFT, false, &kvm_cma);
+ +		/*
+ +		 * Old CPUs require HPT aligned on a multiple of its size. So for them
+ +		 * make the alignment as max size we could request.
+ +		 */
+ +		if (!cpu_has_feature(CPU_FTR_ARCH_206))
+ +			align_size = __rounddown_pow_of_two(selected_size);
+ +		else
+ +			align_size = HPT_ALIGN_PAGES << PAGE_SHIFT;
+ +
+++<<<<<<< HEAD
+ +		align_size = max(kvm_rma_pages << PAGE_SHIFT, align_size);
+ +		kvm_cma_declare_contiguous(selected_size, align_size);
+  	}
+ -}
+ -
+++=======
++ /*
++  * Real-mode H_CONFER implementation.
++  * We check if we are the only vcpu out of this virtual core
++  * still running in the guest and not ceded.  If so, we pop up
++  * to the virtual-mode implementation; if not, just return to
++  * the guest.
++  */
++ long int kvmppc_rm_h_confer(struct kvm_vcpu *vcpu, int target,
++ 			    unsigned int yield_count)
++ {
++ 	struct kvmppc_vcore *vc = local_paca->kvm_hstate.kvm_vcore;
++ 	int ptid = local_paca->kvm_hstate.ptid;
++ 	int threads_running;
++ 	int threads_ceded;
++ 	int threads_conferring;
++ 	u64 stop = get_tb() + 10 * tb_ticks_per_usec;
++ 	int rv = H_SUCCESS; /* => don't yield */
++ 
++ 	set_bit(ptid, &vc->conferring_threads);
++ 	while ((get_tb() < stop) && !VCORE_IS_EXITING(vc)) {
++ 		threads_running = VCORE_ENTRY_MAP(vc);
++ 		threads_ceded = vc->napping_threads;
++ 		threads_conferring = vc->conferring_threads;
++ 		if ((threads_ceded | threads_conferring) == threads_running) {
++ 			rv = H_TOO_HARD; /* => do yield */
++ 			break;
++ 		}
++ 	}
++ 	clear_bit(ptid, &vc->conferring_threads);
++ 	return rv;
+++>>>>>>> ec2571650826 (KVM: PPC: Book3S HV: Make use of unused threads when running guests)
+  }
+  
+  /*
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+* Unmerged path arch/powerpc/kernel/asm-offsets.c
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_xics.c b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 7b066f6b02ad..ef3b160a85c3 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@ -47,14 +47,12 @@ static void icp_rm_set_vcpu_irq(struct kvm_vcpu *vcpu,
+ 	}
+ 
+ 	/* Check if the core is loaded, if not, too hard */
+-	cpu = vcpu->cpu;
++	cpu = vcpu->arch.thread_cpu;
+ 	if (cpu < 0 || cpu >= nr_cpu_ids) {
+ 		this_icp->rm_action |= XICS_RM_KICK_VCPU;
+ 		this_icp->rm_kick_target = vcpu;
+ 		return;
+ 	}
+-	/* In SMT cpu will always point to thread 0, we adjust it */
+-	cpu += vcpu->arch.ptid;
+ 
+ 	/* Not too hard, then poke the target */
+ 	xics_phys = paca[cpu].kvm_hstate.xics_phys;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 499fdba9ddf8..d596daad7365 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -1196,6 +1196,11 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 	beq	machine_check_realmode
+ mc_cont:
+ 
++	/* Stop others sending VCPU interrupts to this physical CPU */
++	li	r0, -1
++	stw	r0, VCPU_CPU(r9)
++	stw	r0, VCPU_THREAD_CPU(r9)
++
+ 	/* Save guest CTRL register, set runlatch to 1 */
+ 6:	mfspr	r6,SPRN_CTRLF
+ 	stw	r6,VCPU_CTRL(r9)
