@@ -1,0 +1,693 @@
+tcp/dccp: remove twchain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 05dbc7b59481ca891bbcfe6799a562d48159fbf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/05dbc7b5.failed
+
+TCP listener refactoring, part 3 :
+
+Our goal is to hash SYN_RECV sockets into main ehash for fast lookup,
+and parallel SYN processing.
+
+Current inet_ehash_bucket contains two chains, one for ESTABLISH (and
+friend states) sockets, another for TIME_WAIT sockets only.
+
+As the hash table is sized to get at most one socket per bucket, it
+makes little sense to have separate twchain, as it makes the lookup
+slightly more complicated, and doubles hash table memory usage.
+
+If we make sure all socket types have the lookup keys at the same
+offsets, we can use a generic and faster lookup. It turns out TIME_WAIT
+and ESTABLISHED sockets already have common lookup fields for IPv4.
+
+[ INET_TW_MATCH() is no longer needed ]
+
+I'll provide a follow-up to factorize IPv6 lookup as well, to remove
+INET6_TW_MATCH()
+
+This way, SYN_RECV pseudo sockets will be supported the same.
+
+A new sock_gen_put() helper is added, doing either a sock_put() or
+inet_twsk_put() [ and will support SYN_RECV later ].
+
+Note this helper should only be called in real slow path, when rcu
+lookup found a socket that was moved to another identity (freed/reused
+immediately), but could eventually be used in other contexts, like
+sock_edemux()
+
+Before patch :
+
+dmesg | grep "TCP established"
+
+TCP established hash table entries: 524288 (order: 11, 8388608 bytes)
+
+After patch :
+
+TCP established hash table entries: 524288 (order: 10, 4194304 bytes)
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 05dbc7b59481ca891bbcfe6799a562d48159fbf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/inet_hashtables.c
+#	net/ipv6/inet6_hashtables.c
+diff --cc net/ipv4/inet_hashtables.c
+index 6af375afeeef,a4b66bbe4f21..000000000000
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@@ -271,37 -284,9 +284,42 @@@ begin
+  	 */
+  	if (get_nulls_value(node) != slot)
+  		goto begin;
+++<<<<<<< HEAD
+ +
+ +begintw:
+ +	/* Must check for a TIME_WAIT'er before going to listener hash. */
+ +	sk_nulls_for_each_rcu(sk, node, &head->twchain) {
+ +		if (sk->sk_hash != hash)
+ +			continue;
+ +		if (likely(INET_TW_MATCH(sk, net, acookie,
+ +					 saddr, daddr, ports,
+ +					 dif))) {
+ +			if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt))) {
+ +				sk = NULL;
+ +				goto out;
+ +			}
+ +			if (unlikely(!INET_TW_MATCH(sk, net, acookie,
+ +						    saddr, daddr, ports,
+ +						    dif))) {
+ +				sock_put(sk);
+ +				goto begintw;
+ +			}
+ +			goto out;
+ +		}
+ +	}
+ +	/*
+ +	 * if the nulls value we got at the end of this lookup is
+ +	 * not the expected one, we must restart lookup.
+ +	 * We probably met an item that was moved to another chain.
+ +	 */
+ +	if (get_nulls_value(node) != slot)
+ +		goto begintw;
+ +	sk = NULL;
+++=======
+++>>>>>>> 05dbc7b59481 (tcp/dccp: remove twchain)
+  out:
++ 	sk = NULL;
++ found:
+  	rcu_read_unlock();
+  	return sk;
+  }
+diff --cc net/ipv6/inet6_hashtables.c
+index 32b4a1675d82,46440777e1c5..000000000000
+--- a/net/ipv6/inet6_hashtables.c
++++ b/net/ipv6/inet6_hashtables.c
+@@@ -102,30 -116,9 +116,35 @@@ begin
+  	}
+  	if (get_nulls_value(node) != slot)
+  		goto begin;
+++<<<<<<< HEAD
+ +
+ +begintw:
+ +	/* Must check for a TIME_WAIT'er before going to listener hash. */
+ +	sk_nulls_for_each_rcu(sk, node, &head->twchain) {
+ +		if (sk->sk_hash != hash)
+ +			continue;
+ +		if (likely(INET6_TW_MATCH(sk, net, saddr, daddr,
+ +					  ports, dif))) {
+ +			if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt))) {
+ +				sk = NULL;
+ +				goto out;
+ +			}
+ +			if (unlikely(!INET6_TW_MATCH(sk, net, saddr, daddr,
+ +						     ports, dif))) {
+ +				sock_put(sk);
+ +				goto begintw;
+ +			}
+ +			goto out;
+ +		}
+ +	}
+ +	if (get_nulls_value(node) != slot)
+ +		goto begintw;
+ +	sk = NULL;
+++=======
+++>>>>>>> 05dbc7b59481 (tcp/dccp: remove twchain)
+  out:
++ 	sk = NULL;
++ found:
+  	rcu_read_unlock();
+  	return sk;
+  }
+diff --git a/include/net/inet_hashtables.h b/include/net/inet_hashtables.h
+index 10d6838378c3..1bdb47715def 100644
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -37,12 +37,11 @@
+ #include <asm/byteorder.h>
+ 
+ /* This is for all connections with a full identity, no wildcards.
+- * One chain is dedicated to TIME_WAIT sockets.
+- * I'll experiment with dynamic table growth later.
++ * The 'e' prefix stands for Establish, but we really put all sockets
++ * but LISTEN ones.
+  */
+ struct inet_ehash_bucket {
+ 	struct hlist_nulls_head chain;
+-	struct hlist_nulls_head twchain;
+ };
+ 
+ /* There are a few simple rules, which allow for local port reuse by
+@@ -123,7 +122,6 @@ struct inet_hashinfo {
+ 	 *
+ 	 *          TCP_ESTABLISHED <= sk->sk_state < TCP_CLOSE
+ 	 *
+-	 * TIME_WAIT sockets use a separate chain (twchain).
+ 	 */
+ 	struct inet_ehash_bucket	*ehash;
+ 	spinlock_t			*ehash_locks;
+@@ -318,9 +316,6 @@ static inline struct sock *inet_lookup_listener(struct net *net,
+ 	 net_eq(sock_net(__sk), (__net)))
+ #endif /* 64-bit arch */
+ 
+-#define INET_TW_MATCH(__sk, __net, __cookie, __saddr, __daddr, __ports, __dif)\
+-	INET_MATCH(__sk, __net, __cookie, __saddr, __daddr, __ports, __dif)
+-
+ /*
+  * Sockets in TCP_CLOSE state are _always_ taken out of the hash, so we need
+  * not check it for lookups anymore, thanks Alexey. -DaveM
+diff --git a/include/net/inet_timewait_sock.h b/include/net/inet_timewait_sock.h
+index f528d1b0ac95..de9e3ab7d43d 100644
+--- a/include/net/inet_timewait_sock.h
++++ b/include/net/inet_timewait_sock.h
+@@ -141,18 +141,6 @@ struct inet_timewait_sock {
+ };
+ #define tw_tclass tw_tos
+ 
+-static inline void inet_twsk_add_node_rcu(struct inet_timewait_sock *tw,
+-				      struct hlist_nulls_head *list)
+-{
+-	hlist_nulls_add_head_rcu(&tw->tw_node, list);
+-}
+-
+-static inline void inet_twsk_add_bind_node(struct inet_timewait_sock *tw,
+-					   struct hlist_head *list)
+-{
+-	hlist_add_head(&tw->tw_bind_node, list);
+-}
+-
+ static inline int inet_twsk_dead_hashed(const struct inet_timewait_sock *tw)
+ {
+ 	return !hlist_unhashed(&tw->tw_death_node);
+@@ -192,6 +180,7 @@ static inline struct inet_timewait_sock *inet_twsk(const struct sock *sk)
+ 	return (struct inet_timewait_sock *)sk;
+ }
+ 
++void inet_twsk_free(struct inet_timewait_sock *tw);
+ void inet_twsk_put(struct inet_timewait_sock *tw);
+ 
+ int inet_twsk_unhash(struct inet_timewait_sock *tw);
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 2a46842833ba..b3cd58bda401 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -156,7 +156,7 @@ typedef __u64 __bitwise __addrpair;
+  */
+ struct sock_common {
+ 	/* skc_daddr and skc_rcv_saddr must be grouped on a 8 bytes aligned
+-	 * address on 64bit arches : cf INET_MATCH() and INET_TW_MATCH()
++	 * address on 64bit arches : cf INET_MATCH()
+ 	 */
+ 	union {
+ 		__addrpair	skc_addrpair;
+@@ -297,6 +297,8 @@ struct sock {
+ #define sk_dontcopy_end		__sk_common.skc_dontcopy_end
+ #define sk_hash			__sk_common.skc_hash
+ #define sk_portpair		__sk_common.skc_portpair
++#define sk_num			__sk_common.skc_num
++#define sk_dport		__sk_common.skc_dport
+ #define sk_addrpair		__sk_common.skc_addrpair
+ #define sk_daddr		__sk_common.skc_daddr
+ #define sk_rcv_saddr		__sk_common.skc_rcv_saddr
+@@ -1656,6 +1658,10 @@ static inline void sock_put(struct sock *sk)
+ 	if (atomic_dec_and_test(&sk->sk_refcnt))
+ 		sk_free(sk);
+ }
++/* Generic version of sock_put(), dealing with all sockets
++ * (TCP_TIMEWAIT, ESTABLISHED...)
++ */
++void sock_gen_put(struct sock *sk);
+ 
+ extern int sk_receive_skb(struct sock *sk, struct sk_buff *skb,
+ 			  const int nested);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 172534716ebb..b970dac09714 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1518,7 +1518,6 @@ enum tcp_seq_states {
+ 	TCP_SEQ_STATE_LISTENING,
+ 	TCP_SEQ_STATE_OPENREQ,
+ 	TCP_SEQ_STATE_ESTABLISHED,
+-	TCP_SEQ_STATE_TIME_WAIT,
+ };
+ 
+ int tcp_seq_open(struct inode *inode, struct file *file);
+diff --git a/net/dccp/proto.c b/net/dccp/proto.c
+index 6c7c78b83940..391511f6cefc 100644
+--- a/net/dccp/proto.c
++++ b/net/dccp/proto.c
+@@ -1158,10 +1158,8 @@ static int __init dccp_init(void)
+ 		goto out_free_bind_bucket_cachep;
+ 	}
+ 
+-	for (i = 0; i <= dccp_hashinfo.ehash_mask; i++) {
++	for (i = 0; i <= dccp_hashinfo.ehash_mask; i++)
+ 		INIT_HLIST_NULLS_HEAD(&dccp_hashinfo.ehash[i].chain, i);
+-		INIT_HLIST_NULLS_HEAD(&dccp_hashinfo.ehash[i].twchain, i);
+-	}
+ 
+ 	if (inet_ehash_locks_alloc(&dccp_hashinfo))
+ 			goto out_free_dccp_ehash;
+diff --git a/net/ipv4/inet_diag.c b/net/ipv4/inet_diag.c
+index 22000279efc8..8e1e40653357 100644
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -635,12 +635,14 @@ static int inet_csk_diag_dump(struct sock *sk,
+ 				  cb->nlh->nlmsg_seq, NLM_F_MULTI, cb->nlh);
+ }
+ 
+-static int inet_twsk_diag_dump(struct inet_timewait_sock *tw,
++static int inet_twsk_diag_dump(struct sock *sk,
+ 			       struct sk_buff *skb,
+ 			       struct netlink_callback *cb,
+ 			       struct inet_diag_req_v2 *r,
+ 			       const struct nlattr *bc)
+ {
++	struct inet_timewait_sock *tw = inet_twsk(sk);
++
+ 	if (bc != NULL) {
+ 		struct inet_diag_entry entry;
+ 
+@@ -911,8 +913,7 @@ skip_listen_ht:
+ 
+ 		num = 0;
+ 
+-		if (hlist_nulls_empty(&head->chain) &&
+-			hlist_nulls_empty(&head->twchain))
++		if (hlist_nulls_empty(&head->chain))
+ 			continue;
+ 
+ 		if (i > s_i)
+@@ -920,7 +921,7 @@ skip_listen_ht:
+ 
+ 		spin_lock_bh(lock);
+ 		sk_nulls_for_each(sk, node, &head->chain) {
+-			struct inet_sock *inet = inet_sk(sk);
++			int res;
+ 
+ 			if (!net_eq(sock_net(sk), net))
+ 				continue;
+@@ -929,15 +930,19 @@ skip_listen_ht:
+ 			if (!(r->idiag_states & (1 << sk->sk_state)))
+ 				goto next_normal;
+ 			if (r->sdiag_family != AF_UNSPEC &&
+-					sk->sk_family != r->sdiag_family)
++			    sk->sk_family != r->sdiag_family)
+ 				goto next_normal;
+-			if (r->id.idiag_sport != inet->inet_sport &&
++			if (r->id.idiag_sport != htons(sk->sk_num) &&
+ 			    r->id.idiag_sport)
+ 				goto next_normal;
+-			if (r->id.idiag_dport != inet->inet_dport &&
++			if (r->id.idiag_dport != sk->sk_dport &&
+ 			    r->id.idiag_dport)
+ 				goto next_normal;
+-			if (inet_csk_diag_dump(sk, skb, cb, r, bc) < 0) {
++			if (sk->sk_state == TCP_TIME_WAIT)
++				res = inet_twsk_diag_dump(sk, skb, cb, r, bc);
++			else
++				res = inet_csk_diag_dump(sk, skb, cb, r, bc);
++			if (res < 0) {
+ 				spin_unlock_bh(lock);
+ 				goto done;
+ 			}
+@@ -945,33 +950,6 @@ next_normal:
+ 			++num;
+ 		}
+ 
+-		if (r->idiag_states & TCPF_TIME_WAIT) {
+-			struct inet_timewait_sock *tw;
+-
+-			inet_twsk_for_each(tw, node,
+-				    &head->twchain) {
+-				if (!net_eq(twsk_net(tw), net))
+-					continue;
+-
+-				if (num < s_num)
+-					goto next_dying;
+-				if (r->sdiag_family != AF_UNSPEC &&
+-						tw->tw_family != r->sdiag_family)
+-					goto next_dying;
+-				if (r->id.idiag_sport != tw->tw_sport &&
+-				    r->id.idiag_sport)
+-					goto next_dying;
+-				if (r->id.idiag_dport != tw->tw_dport &&
+-				    r->id.idiag_dport)
+-					goto next_dying;
+-				if (inet_twsk_diag_dump(tw, skb, cb, r, bc) < 0) {
+-					spin_unlock_bh(lock);
+-					goto done;
+-				}
+-next_dying:
+-				++num;
+-			}
+-		}
+ 		spin_unlock_bh(lock);
+ 	}
+ 
+* Unmerged path net/ipv4/inet_hashtables.c
+diff --git a/net/ipv4/inet_timewait_sock.c b/net/ipv4/inet_timewait_sock.c
+index 9bcd8f7234ec..6d592f8555fb 100644
+--- a/net/ipv4/inet_timewait_sock.c
++++ b/net/ipv4/inet_timewait_sock.c
+@@ -87,19 +87,11 @@ static void __inet_twsk_kill(struct inet_timewait_sock *tw,
+ 	refcnt += inet_twsk_bind_unhash(tw, hashinfo);
+ 	spin_unlock(&bhead->lock);
+ 
+-#ifdef SOCK_REFCNT_DEBUG
+-	if (atomic_read(&tw->tw_refcnt) != 1) {
+-		pr_debug("%s timewait_sock %p refcnt=%d\n",
+-			 tw->tw_prot->name, tw, atomic_read(&tw->tw_refcnt));
+-	}
+-#endif
+-	while (refcnt) {
+-		inet_twsk_put(tw);
+-		refcnt--;
+-	}
++	BUG_ON(refcnt >= atomic_read(&tw->tw_refcnt));
++	atomic_sub(refcnt, &tw->tw_refcnt);
+ }
+ 
+-static noinline void inet_twsk_free(struct inet_timewait_sock *tw)
++void inet_twsk_free(struct inet_timewait_sock *tw)
+ {
+ 	struct module *owner = tw->tw_prot->owner;
+ 	twsk_destructor((struct sock *)tw);
+@@ -118,6 +110,18 @@ void inet_twsk_put(struct inet_timewait_sock *tw)
+ }
+ EXPORT_SYMBOL_GPL(inet_twsk_put);
+ 
++static void inet_twsk_add_node_rcu(struct inet_timewait_sock *tw,
++				   struct hlist_nulls_head *list)
++{
++	hlist_nulls_add_head_rcu(&tw->tw_node, list);
++}
++
++static void inet_twsk_add_bind_node(struct inet_timewait_sock *tw,
++				    struct hlist_head *list)
++{
++	hlist_add_head(&tw->tw_bind_node, list);
++}
++
+ /*
+  * Enter the time wait state. This is called with locally disabled BH.
+  * Essentially we whip up a timewait bucket, copy the relevant info into it
+@@ -146,26 +150,21 @@ void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,
+ 	spin_lock(lock);
+ 
+ 	/*
+-	 * Step 2: Hash TW into TIMEWAIT chain.
+-	 * Should be done before removing sk from established chain
+-	 * because readers are lockless and search established first.
++	 * Step 2: Hash TW into tcp ehash chain.
++	 * Notes :
++	 * - tw_refcnt is set to 3 because :
++	 * - We have one reference from bhash chain.
++	 * - We have one reference from ehash chain.
++	 * We can use atomic_set() because prior spin_lock()/spin_unlock()
++	 * committed into memory all tw fields.
+ 	 */
+-	inet_twsk_add_node_rcu(tw, &ehead->twchain);
++	atomic_set(&tw->tw_refcnt, 1 + 1 + 1);
++	inet_twsk_add_node_rcu(tw, &ehead->chain);
+ 
+-	/* Step 3: Remove SK from established hash. */
++	/* Step 3: Remove SK from hash chain */
+ 	if (__sk_nulls_del_node_init_rcu(sk))
+ 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
+ 
+-	/*
+-	 * Notes :
+-	 * - We initially set tw_refcnt to 0 in inet_twsk_alloc()
+-	 * - We add one reference for the bhash link
+-	 * - We add one reference for the ehash link
+-	 * - We want this refcnt update done before allowing other
+-	 *   threads to find this tw in ehash chain.
+-	 */
+-	atomic_add(1 + 1 + 1, &tw->tw_refcnt);
+-
+ 	spin_unlock(lock);
+ }
+ EXPORT_SYMBOL_GPL(__inet_twsk_hashdance);
+@@ -490,7 +489,9 @@ void inet_twsk_purge(struct inet_hashinfo *hashinfo,
+ restart_rcu:
+ 		rcu_read_lock();
+ restart:
+-		sk_nulls_for_each_rcu(sk, node, &head->twchain) {
++		sk_nulls_for_each_rcu(sk, node, &head->chain) {
++			if (sk->sk_state != TCP_TIME_WAIT)
++				continue;
+ 			tw = inet_twsk(sk);
+ 			if ((tw->tw_family != family) ||
+ 				atomic_read(&twsk_net(tw)->count))
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 023942fc4b2b..688e916e411c 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -3162,10 +3162,9 @@ void __init tcp_init(void)
+ 					&tcp_hashinfo.ehash_mask,
+ 					0,
+ 					thash_entries ? 0 : 512 * 1024);
+-	for (i = 0; i <= tcp_hashinfo.ehash_mask; i++) {
++	for (i = 0; i <= tcp_hashinfo.ehash_mask; i++)
+ 		INIT_HLIST_NULLS_HEAD(&tcp_hashinfo.ehash[i].chain, i);
+-		INIT_HLIST_NULLS_HEAD(&tcp_hashinfo.ehash[i].twchain, i);
+-	}
++
+ 	if (inet_ehash_locks_alloc(&tcp_hashinfo))
+ 		panic("TCP: failed to alloc ehash_locks");
+ 	tcp_hashinfo.bhash =
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index aa2a51f0becf..389c3baccff4 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2203,18 +2203,6 @@ EXPORT_SYMBOL(tcp_v4_destroy_sock);
+ #ifdef CONFIG_PROC_FS
+ /* Proc filesystem TCP sock list dumping. */
+ 
+-static inline struct inet_timewait_sock *tw_head(struct hlist_nulls_head *head)
+-{
+-	return hlist_nulls_empty(head) ? NULL :
+-		list_entry(head->first, struct inet_timewait_sock, tw_node);
+-}
+-
+-static inline struct inet_timewait_sock *tw_next(struct inet_timewait_sock *tw)
+-{
+-	return !is_a_nulls(tw->tw_node.next) ?
+-		hlist_nulls_entry(tw->tw_node.next, typeof(*tw), tw_node) : NULL;
+-}
+-
+ /*
+  * Get next listener socket follow cur.  If cur is NULL, get first socket
+  * starting from bucket given in st->bucket; when st->bucket is zero the
+@@ -2318,10 +2306,9 @@ static void *listening_get_idx(struct seq_file *seq, loff_t *pos)
+ 	return rc;
+ }
+ 
+-static inline bool empty_bucket(struct tcp_iter_state *st)
++static inline bool empty_bucket(const struct tcp_iter_state *st)
+ {
+-	return hlist_nulls_empty(&tcp_hashinfo.ehash[st->bucket].chain) &&
+-		hlist_nulls_empty(&tcp_hashinfo.ehash[st->bucket].twchain);
++	return hlist_nulls_empty(&tcp_hashinfo.ehash[st->bucket].chain);
+ }
+ 
+ /*
+@@ -2338,7 +2325,6 @@ static void *established_get_first(struct seq_file *seq)
+ 	for (; st->bucket <= tcp_hashinfo.ehash_mask; ++st->bucket) {
+ 		struct sock *sk;
+ 		struct hlist_nulls_node *node;
+-		struct inet_timewait_sock *tw;
+ 		spinlock_t *lock = inet_ehash_lockp(&tcp_hashinfo, st->bucket);
+ 
+ 		/* Lockless fast path for the common case of empty buckets */
+@@ -2354,18 +2340,7 @@ static void *established_get_first(struct seq_file *seq)
+ 			rc = sk;
+ 			goto out;
+ 		}
+-		st->state = TCP_SEQ_STATE_TIME_WAIT;
+-		inet_twsk_for_each(tw, node,
+-				   &tcp_hashinfo.ehash[st->bucket].twchain) {
+-			if (tw->tw_family != st->family ||
+-			    !net_eq(twsk_net(tw), net)) {
+-				continue;
+-			}
+-			rc = tw;
+-			goto out;
+-		}
+ 		spin_unlock_bh(lock);
+-		st->state = TCP_SEQ_STATE_ESTABLISHED;
+ 	}
+ out:
+ 	return rc;
+@@ -2374,7 +2349,6 @@ out:
+ static void *established_get_next(struct seq_file *seq, void *cur)
+ {
+ 	struct sock *sk = cur;
+-	struct inet_timewait_sock *tw;
+ 	struct hlist_nulls_node *node;
+ 	struct tcp_iter_state *st = seq->private;
+ 	struct net *net = seq_file_net(seq);
+@@ -2382,45 +2356,16 @@ static void *established_get_next(struct seq_file *seq, void *cur)
+ 	++st->num;
+ 	++st->offset;
+ 
+-	if (st->state == TCP_SEQ_STATE_TIME_WAIT) {
+-		tw = cur;
+-		tw = tw_next(tw);
+-get_tw:
+-		while (tw && (tw->tw_family != st->family || !net_eq(twsk_net(tw), net))) {
+-			tw = tw_next(tw);
+-		}
+-		if (tw) {
+-			cur = tw;
+-			goto out;
+-		}
+-		spin_unlock_bh(inet_ehash_lockp(&tcp_hashinfo, st->bucket));
+-		st->state = TCP_SEQ_STATE_ESTABLISHED;
+-
+-		/* Look for next non empty bucket */
+-		st->offset = 0;
+-		while (++st->bucket <= tcp_hashinfo.ehash_mask &&
+-				empty_bucket(st))
+-			;
+-		if (st->bucket > tcp_hashinfo.ehash_mask)
+-			return NULL;
+-
+-		spin_lock_bh(inet_ehash_lockp(&tcp_hashinfo, st->bucket));
+-		sk = sk_nulls_head(&tcp_hashinfo.ehash[st->bucket].chain);
+-	} else
+-		sk = sk_nulls_next(sk);
++	sk = sk_nulls_next(sk);
+ 
+ 	sk_nulls_for_each_from(sk, node) {
+ 		if (sk->sk_family == st->family && net_eq(sock_net(sk), net))
+-			goto found;
++			return sk;
+ 	}
+ 
+-	st->state = TCP_SEQ_STATE_TIME_WAIT;
+-	tw = tw_head(&tcp_hashinfo.ehash[st->bucket].twchain);
+-	goto get_tw;
+-found:
+-	cur = sk;
+-out:
+-	return cur;
++	spin_unlock_bh(inet_ehash_lockp(&tcp_hashinfo, st->bucket));
++	++st->bucket;
++	return established_get_first(seq);
+ }
+ 
+ static void *established_get_idx(struct seq_file *seq, loff_t pos)
+@@ -2473,10 +2418,9 @@ static void *tcp_seek_last_pos(struct seq_file *seq)
+ 		if (rc)
+ 			break;
+ 		st->bucket = 0;
++		st->state = TCP_SEQ_STATE_ESTABLISHED;
+ 		/* Fallthrough */
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+-	case TCP_SEQ_STATE_TIME_WAIT:
+-		st->state = TCP_SEQ_STATE_ESTABLISHED;
+ 		if (st->bucket > tcp_hashinfo.ehash_mask)
+ 			break;
+ 		rc = established_get_first(seq);
+@@ -2533,7 +2477,6 @@ static void *tcp_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+ 		}
+ 		break;
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+-	case TCP_SEQ_STATE_TIME_WAIT:
+ 		rc = established_get_next(seq, v);
+ 		break;
+ 	}
+@@ -2557,7 +2500,6 @@ static void tcp_seq_stop(struct seq_file *seq, void *v)
+ 		if (v != SEQ_START_TOKEN)
+ 			spin_unlock_bh(&tcp_hashinfo.listening_hash[st->bucket].lock);
+ 		break;
+-	case TCP_SEQ_STATE_TIME_WAIT:
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+ 		if (v)
+ 			spin_unlock_bh(inet_ehash_lockp(&tcp_hashinfo, st->bucket));
+@@ -2716,6 +2658,7 @@ static void get_timewait4_sock(const struct inet_timewait_sock *tw,
+ static int tcp4_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct tcp_iter_state *st;
++	struct sock *sk = v;
+ 	int len;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+@@ -2730,14 +2673,14 @@ static int tcp4_seq_show(struct seq_file *seq, void *v)
+ 	switch (st->state) {
+ 	case TCP_SEQ_STATE_LISTENING:
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+-		get_tcp4_sock(v, seq, st->num, &len);
++		if (sk->sk_state == TCP_TIME_WAIT)
++			get_timewait4_sock(v, seq, st->num, &len);
++		else
++			get_tcp4_sock(v, seq, st->num, &len);
+ 		break;
+ 	case TCP_SEQ_STATE_OPENREQ:
+ 		get_openreq4(st->syn_wait_sk, v, seq, st->num, st->uid, &len);
+ 		break;
+-	case TCP_SEQ_STATE_TIME_WAIT:
+-		get_timewait4_sock(v, seq, st->num, &len);
+-		break;
+ 	}
+ 	seq_printf(seq, "%*s\n", TMPSZ - 1 - len, "");
+ out:
+* Unmerged path net/ipv6/inet6_hashtables.c
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 8152594274ab..e3ce954505d9 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1836,6 +1836,7 @@ static void get_timewait6_sock(struct seq_file *seq,
+ static int tcp6_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct tcp_iter_state *st;
++	struct sock *sk = v;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+ 		seq_puts(seq,
+@@ -1851,14 +1852,14 @@ static int tcp6_seq_show(struct seq_file *seq, void *v)
+ 	switch (st->state) {
+ 	case TCP_SEQ_STATE_LISTENING:
+ 	case TCP_SEQ_STATE_ESTABLISHED:
+-		get_tcp6_sock(seq, v, st->num);
++		if (sk->sk_state == TCP_TIME_WAIT)
++			get_timewait6_sock(seq, v, st->num);
++		else
++			get_tcp6_sock(seq, v, st->num);
+ 		break;
+ 	case TCP_SEQ_STATE_OPENREQ:
+ 		get_openreq6(seq, st->syn_wait_sk, v, st->num, st->uid);
+ 		break;
+-	case TCP_SEQ_STATE_TIME_WAIT:
+-		get_timewait6_sock(seq, v, st->num);
+-		break;
+ 	}
+ out:
+ 	return 0;
