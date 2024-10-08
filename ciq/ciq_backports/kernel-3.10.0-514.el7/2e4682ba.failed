@@ -1,0 +1,132 @@
+KVM: add missing memory barrier in kvm_{make,check}_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [virt] kvm: add missing memory barrier in kvm_{make, check}_request (Paolo Bonzini) [1347370]
+Rebuild_FUZZ: 99.16%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 2e4682ba2ed79d8082b78d292b3b80f54d970b7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2e4682ba.failed
+
+kvm_make_request and kvm_check_request imply a producer-consumer
+relationship; add implicit memory barriers to them.  There was indeed
+already a place that was adding an explicit smp_mb() to order between
+kvm_check_request and the processing of the request.  That memory
+barrier can be removed (as an added benefit, kvm_check_request can use
+smp_mb__after_atomic which is free on x86).
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2e4682ba2ed79d8082b78d292b3b80f54d970b7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/irq_comm.c
+diff --cc arch/x86/kvm/irq_comm.c
+index c5bb82b0cf6b,dfb4c6476877..000000000000
+--- a/arch/x86/kvm/irq_comm.c
++++ b/arch/x86/kvm/irq_comm.c
+@@@ -327,3 -358,69 +327,72 @@@ int kvm_setup_default_irq_routing(struc
+  	return kvm_set_irq_routing(kvm, default_routing,
+  				   ARRAY_SIZE(default_routing), 0);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static const struct kvm_irq_routing_entry empty_routing[] = {};
++ 
++ int kvm_setup_empty_irq_routing(struct kvm *kvm)
++ {
++ 	return kvm_set_irq_routing(kvm, empty_routing, 0, 0);
++ }
++ 
++ void kvm_arch_post_irq_routing_update(struct kvm *kvm)
++ {
++ 	if (ioapic_in_kernel(kvm) || !irqchip_in_kernel(kvm))
++ 		return;
++ 	kvm_make_scan_ioapic_request(kvm);
++ }
++ 
++ void kvm_scan_ioapic_routes(struct kvm_vcpu *vcpu,
++ 			    ulong *ioapic_handled_vectors)
++ {
++ 	struct kvm *kvm = vcpu->kvm;
++ 	struct kvm_kernel_irq_routing_entry *entry;
++ 	struct kvm_irq_routing_table *table;
++ 	u32 i, nr_ioapic_pins;
++ 	int idx;
++ 
++ 	idx = srcu_read_lock(&kvm->irq_srcu);
++ 	table = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
++ 	nr_ioapic_pins = min_t(u32, table->nr_rt_entries,
++ 			       kvm->arch.nr_reserved_ioapic_pins);
++ 	for (i = 0; i < nr_ioapic_pins; ++i) {
++ 		hlist_for_each_entry(entry, &table->map[i], link) {
++ 			u32 dest_id, dest_mode;
++ 			bool level;
++ 
++ 			if (entry->type != KVM_IRQ_ROUTING_MSI)
++ 				continue;
++ 			dest_id = (entry->msi.address_lo >> 12) & 0xff;
++ 			dest_mode = (entry->msi.address_lo >> 2) & 0x1;
++ 			level = entry->msi.data & MSI_DATA_TRIGGER_LEVEL;
++ 			if (level && kvm_apic_match_dest(vcpu, NULL, 0,
++ 						dest_id, dest_mode)) {
++ 				u32 vector = entry->msi.data & 0xff;
++ 
++ 				__set_bit(vector,
++ 					  ioapic_handled_vectors);
++ 			}
++ 		}
++ 	}
++ 	srcu_read_unlock(&kvm->irq_srcu, idx);
++ }
++ 
++ int kvm_arch_set_irq(struct kvm_kernel_irq_routing_entry *irq, struct kvm *kvm,
++ 		     int irq_source_id, int level, bool line_status)
++ {
++ 	switch (irq->type) {
++ 	case KVM_IRQ_ROUTING_HV_SINT:
++ 		return kvm_hv_set_sint(irq, kvm, irq_source_id, level,
++ 				       line_status);
++ 	default:
++ 		return -EWOULDBLOCK;
++ 	}
++ }
++ 
++ void kvm_arch_irq_routing_update(struct kvm *kvm)
++ {
++ 	kvm_hv_irq_routing_update(kvm);
++ }
+++>>>>>>> 2e4682ba2ed7 (KVM: add missing memory barrier in kvm_{make,check}_request)
+* Unmerged path arch/x86/kvm/irq_comm.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index cf1b632f8991..9b2edbae5317 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1029,6 +1029,11 @@ static inline bool kvm_vcpu_compatible(struct kvm_vcpu *vcpu) { return true; }
+ 
+ static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
+ {
++	/*
++	 * Ensure the rest of the request is published to kvm_check_request's
++	 * caller.  Paired with the smp_mb__after_atomic in kvm_check_request.
++	 */
++	smp_wmb();
+ 	set_bit(req, &vcpu->requests);
+ }
+ 
+@@ -1036,6 +1041,12 @@ static inline bool kvm_check_request(int req, struct kvm_vcpu *vcpu)
+ {
+ 	if (test_bit(req, &vcpu->requests)) {
+ 		clear_bit(req, &vcpu->requests);
++
++		/*
++		 * Ensure the rest of the request is visible to kvm_check_request's
++		 * caller.  Paired with the smp_wmb in kvm_make_request.
++		 */
++		smp_mb__after_atomic();
+ 		return true;
+ 	} else {
+ 		return false;
