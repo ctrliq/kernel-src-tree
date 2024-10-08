@@ -1,0 +1,250 @@
+IB/srp: use the new CQ API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1dc7b1f10dcbbaf875a0770b2b26d63bc326d92a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1dc7b1f1.failed
+
+This also moves recv completion handling from hardirq context into
+softirq context.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 1dc7b1f10dcbbaf875a0770b2b26d63bc326d92a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srp/ib_srp.c
+diff --cc drivers/infiniband/ulp/srp/ib_srp.c
+index 207f50dbdbb8,dfed5d468ed8..000000000000
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@@ -498,8 -501,7 +510,12 @@@ static int srp_create_ch_ib(struct srp_
+  	struct ib_qp *qp;
+  	struct ib_fmr_pool *fmr_pool = NULL;
+  	struct srp_fr_pool *fr_pool = NULL;
+++<<<<<<< HEAD
+ +	const int m = dev->use_fast_reg ? 3 : 1;
+ +	struct ib_cq_init_attr cq_attr = {};
+++=======
++ 	const int m = 1 + dev->use_fast_reg;
+++>>>>>>> 1dc7b1f10dcb (IB/srp: use the new CQ API)
+  	int ret;
+  
+  	init_attr = kzalloc(sizeof *init_attr, GFP_KERNEL);
+@@@ -1038,19 -1035,22 +1049,25 @@@ static int srp_connect_ch(struct srp_rd
+  		case SRP_STALE_CONN:
+  			shost_printk(KERN_ERR, target->scsi_host, PFX
+  				     "giving up on stale connection\n");
+ -			ch->status = -ECONNRESET;
+ -			return ch->status;
+ +			ret = -ECONNRESET;
+ +			goto out;
+  
+  		default:
+ -			return ch->status;
+ +			goto out;
+  		}
+  	}
+ +
+ +out:
+ +	return ret <= 0 ? ret : -ENODEV;
+  }
+  
+- static int srp_inv_rkey(struct srp_rdma_ch *ch, u32 rkey)
++ static void srp_inv_rkey_err_done(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	srp_handle_qp_err(cq, wc, "INV RKEY");
++ }
++ 
++ static int srp_inv_rkey(struct srp_request *req, struct srp_rdma_ch *ch,
++ 		u32 rkey)
+  {
+  	struct ib_send_wr *bad_wr;
+  	struct ib_send_wr wr = {
+@@@ -1327,21 -1361,23 +1350,36 @@@ static int srp_map_finish_fr(struct srp
+  	rkey = ib_inc_rkey(desc->mr->rkey);
+  	ib_update_fast_reg_key(desc->mr, rkey);
+  
+ -	n = ib_map_mr_sg(desc->mr, state->sg, state->sg_nents,
+ -			 dev->mr_page_size);
+ -	if (unlikely(n < 0))
+ -		return n;
+ -
+ +	memcpy(desc->frpl->page_list, state->pages,
+ +	       sizeof(state->pages[0]) * state->npages);
+ +
+++<<<<<<< HEAD
+ +	memset(&wr, 0, sizeof(wr));
+ +	wr.opcode = IB_WR_FAST_REG_MR;
+ +	wr.wr_id = FAST_REG_WR_ID_MASK;
+ +	wr.wr.fast_reg.iova_start = state->base_dma_addr;
+ +	wr.wr.fast_reg.page_list = desc->frpl;
+ +	wr.wr.fast_reg.page_list_len = state->npages;
+ +	wr.wr.fast_reg.page_shift = ilog2(dev->mr_page_size);
+ +	wr.wr.fast_reg.length = state->dma_len;
+ +	wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE |
+ +				       IB_ACCESS_REMOTE_READ |
+ +				       IB_ACCESS_REMOTE_WRITE);
+ +	wr.wr.fast_reg.rkey = desc->mr->lkey;
+++=======
++ 	req->reg_cqe.done = srp_reg_mr_err_done;
++ 
++ 	wr.wr.next = NULL;
++ 	wr.wr.opcode = IB_WR_REG_MR;
++ 	wr.wr.wr_cqe = &req->reg_cqe;
++ 	wr.wr.num_sge = 0;
++ 	wr.wr.send_flags = 0;
++ 	wr.mr = desc->mr;
++ 	wr.key = desc->mr->rkey;
++ 	wr.access = (IB_ACCESS_LOCAL_WRITE |
++ 		     IB_ACCESS_REMOTE_READ |
++ 		     IB_ACCESS_REMOTE_WRITE);
+++>>>>>>> 1dc7b1f10dcb (IB/srp: use the new CQ API)
+  
+  	*state->fr.next++ = desc;
+  	state->nmdesc++;
+@@@ -1422,9 -1435,63 +1460,69 @@@ static int srp_map_sg_entry(struct srp_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int srp_map_sg(struct srp_map_state *state, struct srp_rdma_ch *ch,
+ +		      struct srp_request *req, struct scatterlist *scat,
+ +		      int count)
+++=======
++ static int srp_map_sg_fmr(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			  struct srp_request *req, struct scatterlist *scat,
++ 			  int count)
++ {
++ 	struct scatterlist *sg;
++ 	int i, ret;
++ 
++ 	state->desc = req->indirect_desc;
++ 	state->pages = req->map_page;
++ 	state->fmr.next = req->fmr_list;
++ 	state->fmr.end = req->fmr_list + ch->target->cmd_sg_cnt;
++ 
++ 	for_each_sg(scat, sg, count, i) {
++ 		ret = srp_map_sg_entry(state, ch, sg, i);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ret = srp_map_finish_fmr(state, ch);
++ 	if (ret)
++ 		return ret;
++ 
++ 	req->nmdesc = state->nmdesc;
++ 
++ 	return 0;
++ }
++ 
++ static int srp_map_sg_fr(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			 struct srp_request *req, struct scatterlist *scat,
++ 			 int count)
++ {
++ 	state->desc = req->indirect_desc;
++ 	state->fr.next = req->fr_list;
++ 	state->fr.end = req->fr_list + ch->target->cmd_sg_cnt;
++ 	state->sg = scat;
++ 	state->sg_nents = scsi_sg_count(req->scmnd);
++ 
++ 	while (state->sg_nents) {
++ 		int i, n;
++ 
++ 		n = srp_map_finish_fr(state, req, ch);
++ 		if (unlikely(n < 0))
++ 			return n;
++ 
++ 		state->sg_nents -= n;
++ 		for (i = 0; i < n; i++)
++ 			state->sg = sg_next(state->sg);
++ 	}
++ 
++ 	req->nmdesc = state->nmdesc;
++ 
++ 	return 0;
++ }
++ 
++ static int srp_map_sg_dma(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			  struct srp_request *req, struct scatterlist *scat,
++ 			  int count)
+++>>>>>>> 1dc7b1f10dcb (IB/srp: use the new CQ API)
+  {
+  	struct srp_target_port *target = ch->target;
+  	struct srp_device *dev = target->srp_host->srp_dev;
+@@@ -1488,15 -1534,28 +1586,38 @@@ static int srp_map_idb(struct srp_rdma_
+  	state.gen.next = next_mr;
+  	state.gen.end = end_mr;
+  	state.desc = &idb_desc;
+ +	state.pages = idb_pages;
+ +	state.pages[0] = (req->indirect_dma_addr &
+ +			  dev->mr_page_mask);
+ +	state.npages = 1;
+  	state.base_dma_addr = req->indirect_dma_addr;
+  	state.dma_len = idb_len;
+++<<<<<<< HEAD
+ +	ret = srp_finish_mapping(&state, ch);
+ +	if (ret < 0)
+ +		goto out;
+++=======
++ 
++ 	if (dev->use_fast_reg) {
++ 		state.sg = idb_sg;
++ 		state.sg_nents = 1;
++ 		sg_set_buf(idb_sg, req->indirect_desc, idb_len);
++ 		idb_sg->dma_address = req->indirect_dma_addr; /* hack! */
++ 		ret = srp_map_finish_fr(&state, req, ch);
++ 		if (ret < 0)
++ 			return ret;
++ 	} else if (dev->use_fmr) {
++ 		state.pages = idb_pages;
++ 		state.pages[0] = (req->indirect_dma_addr &
++ 				  dev->mr_page_mask);
++ 		state.npages = 1;
++ 		ret = srp_map_finish_fmr(&state, ch);
++ 		if (ret < 0)
++ 			return ret;
++ 	} else {
++ 		return -EINVAL;
++ 	}
+++>>>>>>> 1dc7b1f10dcb (IB/srp: use the new CQ API)
+  
+  	*idb_rkey = idb_desc.key;
+  
+* Unmerged path drivers/infiniband/ulp/srp/ib_srp.c
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.h b/drivers/infiniband/ulp/srp/ib_srp.h
+index 3608f2e4819c..0efdd84d604e 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.h
++++ b/drivers/infiniband/ulp/srp/ib_srp.h
+@@ -66,11 +66,6 @@ enum {
+ 	SRP_TAG_TSK_MGMT	= 1U << 31,
+ 
+ 	SRP_MAX_PAGES_PER_MR	= 512,
+-
+-	LOCAL_INV_WR_ID_MASK	= 1,
+-	FAST_REG_WR_ID_MASK	= 2,
+-
+-	SRP_LAST_WR_ID		= 0xfffffffcU,
+ };
+ 
+ enum srp_target_state {
+@@ -128,6 +123,7 @@ struct srp_request {
+ 	struct srp_direct_buf  *indirect_desc;
+ 	dma_addr_t		indirect_dma_addr;
+ 	short			nmdesc;
++	struct ib_cqe		reg_cqe;
+ };
+ 
+ /**
+@@ -231,6 +227,7 @@ struct srp_iu {
+ 	void		       *buf;
+ 	size_t			size;
+ 	enum dma_data_direction	direction;
++	struct ib_cqe		cqe;
+ };
+ 
+ /**
