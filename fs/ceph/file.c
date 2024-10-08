@@ -249,7 +249,7 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
 	if (err)
 		goto out_err;
 
-	if (err == 0 && (flags & O_CREAT) && !req->r_reply_info.head->is_dentry)
+	if ((flags & O_CREAT) && !req->r_reply_info.head->is_dentry)
 		err = ceph_handle_notrace_create(dir, dentry);
 
 	if (d_unhashed(dentry)) {
