@@ -1,0 +1,284 @@
+xen-blkfront: use a different scatterlist for each request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Roger Pau Monne <roger.pau@citrix.com>
+commit b7649158a0d241f8d53d13ff7441858539e16656
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/b7649158.failed
+
+In blkif_queue_request blkfront iterates over the scatterlist in order
+to set the segments of the request, and in blkif_completion blkfront
+iterates over the raw request, which makes it hard to know the exact
+position of the source and destination memory positions.
+
+This can be solved by allocating a scatterlist for each request, that
+will be keep until the request is finished, allowing us to copy the
+data back to the original memory without having to iterate over the
+raw request.
+
+Oracle-Bug: 16660413 - LARGE ASYNCHRONOUS READS APPEAR BROKEN ON 2.6.39-400
+CC: stable@vger.kernel.org
+	Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
+Reported-and-Tested-by: Anne Milicia <anne.milicia@oracle.com>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit b7649158a0d241f8d53d13ff7441858539e16656)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/xen-blkfront.c
+diff --cc drivers/block/xen-blkfront.c
+index d89ef86220f4,bac8cf31319b..000000000000
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@@ -74,7 -74,15 +74,19 @@@ struct grant 
+  struct blk_shadow {
+  	struct blkif_request req;
+  	struct request *request;
+++<<<<<<< HEAD
+ +	struct grant *grants_used[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+++=======
++ 	struct grant **grants_used;
++ 	struct grant **indirect_grants;
++ 	struct scatterlist *sg;
++ };
++ 
++ struct split_bio {
++ 	struct bio *bio;
++ 	atomic_t pending;
++ 	int err;
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  };
+  
+  static DEFINE_MUTEX(blkfront_mutex);
+@@@ -98,7 -114,6 +110,10 @@@ struct blkfront_inf
+  	enum blkif_state connected;
+  	int ring_ref;
+  	struct blkif_front_ring ring;
+++<<<<<<< HEAD
+ +	struct scatterlist sg[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+++=======
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  	unsigned int evtchn, irq;
+  	struct request_queue *rq;
+  	struct work_struct work;
+@@@ -421,12 -434,42 +436,51 @@@ static int blkif_queue_request(struct r
+  		else
+  			ring_req->u.discard.flag = 0;
+  	} else {
+++<<<<<<< HEAD
+ +		ring_req->u.rw.nr_segments = blk_rq_map_sg(req->q, req,
+ +							   info->sg);
+ +		BUG_ON(ring_req->u.rw.nr_segments >
+ +		       BLKIF_MAX_SEGMENTS_PER_REQUEST);
+ +
+ +		for_each_sg(info->sg, sg, ring_req->u.rw.nr_segments, i) {
+++=======
++ 		BUG_ON(info->max_indirect_segments == 0 &&
++ 		       req->nr_phys_segments > BLKIF_MAX_SEGMENTS_PER_REQUEST);
++ 		BUG_ON(info->max_indirect_segments &&
++ 		       req->nr_phys_segments > info->max_indirect_segments);
++ 		nseg = blk_rq_map_sg(req->q, req, info->shadow[id].sg);
++ 		ring_req->u.rw.id = id;
++ 		if (nseg > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
++ 			/*
++ 			 * The indirect operation can only be a BLKIF_OP_READ or
++ 			 * BLKIF_OP_WRITE
++ 			 */
++ 			BUG_ON(req->cmd_flags & (REQ_FLUSH | REQ_FUA));
++ 			ring_req->operation = BLKIF_OP_INDIRECT;
++ 			ring_req->u.indirect.indirect_op = rq_data_dir(req) ?
++ 				BLKIF_OP_WRITE : BLKIF_OP_READ;
++ 			ring_req->u.indirect.sector_number = (blkif_sector_t)blk_rq_pos(req);
++ 			ring_req->u.indirect.handle = info->handle;
++ 			ring_req->u.indirect.nr_segments = nseg;
++ 		} else {
++ 			ring_req->u.rw.sector_number = (blkif_sector_t)blk_rq_pos(req);
++ 			ring_req->u.rw.handle = info->handle;
++ 			ring_req->operation = rq_data_dir(req) ?
++ 				BLKIF_OP_WRITE : BLKIF_OP_READ;
++ 			if (req->cmd_flags & (REQ_FLUSH | REQ_FUA)) {
++ 				/*
++ 				 * Ideally we can do an unordered flush-to-disk. In case the
++ 				 * backend onlysupports barriers, use that. A barrier request
++ 				 * a superset of FUA, so we can implement it the same
++ 				 * way.  (It's also a FLUSH+FUA, since it is
++ 				 * guaranteed ordered WRT previous writes.)
++ 				 */
++ 				ring_req->operation = info->flush_op;
++ 			}
++ 			ring_req->u.rw.nr_segments = nseg;
++ 		}
++ 		for_each_sg(info->shadow[id].sg, sg, nseg, i) {
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  			fsect = sg->offset >> 9;
+  			lsect = fsect + (sg->length >> 9) - 1;
+  
+@@@ -843,6 -914,47 +897,50 @@@ static void blkif_free(struct blkfront_
+  	}
+  	BUG_ON(info->persistent_gnts_c != 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	for (i = 0; i < BLK_RING_SIZE; i++) {
++ 		/*
++ 		 * Clear persistent grants present in requests already
++ 		 * on the shared ring
++ 		 */
++ 		if (!info->shadow[i].request)
++ 			goto free_shadow;
++ 
++ 		segs = info->shadow[i].req.operation == BLKIF_OP_INDIRECT ?
++ 		       info->shadow[i].req.u.indirect.nr_segments :
++ 		       info->shadow[i].req.u.rw.nr_segments;
++ 		for (j = 0; j < segs; j++) {
++ 			persistent_gnt = info->shadow[i].grants_used[j];
++ 			gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
++ 			__free_page(pfn_to_page(persistent_gnt->pfn));
++ 			kfree(persistent_gnt);
++ 		}
++ 
++ 		if (info->shadow[i].req.operation != BLKIF_OP_INDIRECT)
++ 			/*
++ 			 * If this is not an indirect operation don't try to
++ 			 * free indirect segments
++ 			 */
++ 			goto free_shadow;
++ 
++ 		for (j = 0; j < INDIRECT_GREFS(segs); j++) {
++ 			persistent_gnt = info->shadow[i].indirect_grants[j];
++ 			gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
++ 			__free_page(pfn_to_page(persistent_gnt->pfn));
++ 			kfree(persistent_gnt);
++ 		}
++ 
++ free_shadow:
++ 		kfree(info->shadow[i].grants_used);
++ 		info->shadow[i].grants_used = NULL;
++ 		kfree(info->shadow[i].indirect_grants);
++ 		info->shadow[i].indirect_grants = NULL;
++ 		kfree(info->shadow[i].sg);
++ 		info->shadow[i].sg = NULL;
++ 	}
++ 
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  	/* No more gnttab callback work. */
+  	gnttab_cancel_free_callback(&info->callback);
+  	spin_unlock_irq(&info->io_lock);
+@@@ -867,12 -979,13 +965,17 @@@ static void blkif_completion(struct blk
+  			     struct blkif_response *bret)
+  {
+  	int i = 0;
+- 	struct bio_vec *bvec;
+- 	struct req_iterator iter;
+- 	unsigned long flags;
++ 	struct scatterlist *sg;
+  	char *bvec_data;
+  	void *shared_data;
+++<<<<<<< HEAD
+ +	unsigned int offset = 0;
+++=======
++ 	int nseg;
++ 
++ 	nseg = s->req.operation == BLKIF_OP_INDIRECT ?
++ 		s->req.u.indirect.nr_segments : s->req.u.rw.nr_segments;
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  
+  	if (bret->operation == BLKIF_OP_READ) {
+  		/*
+@@@ -881,19 -994,16 +984,24 @@@
+  		 * than PAGE_SIZE, we have to keep track of the current offset,
+  		 * to be sure we are copying the data from the right shared page.
+  		 */
+++<<<<<<< HEAD
+ +		rq_for_each_segment(bvec, s->request, iter) {
+ +			BUG_ON((bvec->bv_offset + bvec->bv_len) > PAGE_SIZE);
+ +			if (bvec->bv_offset < offset)
+ +				i++;
+ +			BUG_ON(i >= s->req.u.rw.nr_segments);
+++=======
++ 		for_each_sg(s->sg, sg, nseg, i) {
++ 			BUG_ON(sg->offset + sg->length > PAGE_SIZE);
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  			shared_data = kmap_atomic(
+  				pfn_to_page(s->grants_used[i]->pfn));
+- 			bvec_data = bvec_kmap_irq(bvec, &flags);
+- 			memcpy(bvec_data, shared_data + bvec->bv_offset,
+- 				bvec->bv_len);
+- 			bvec_kunmap_irq(bvec_data, &flags);
++ 			bvec_data = kmap_atomic(sg_page(sg));
++ 			memcpy(bvec_data   + sg->offset,
++ 			       shared_data + sg->offset,
++ 			       sg->length);
++ 			kunmap_atomic(bvec_data);
+  			kunmap_atomic(shared_data);
+- 			offset = bvec->bv_offset + bvec->bv_len;
+  		}
+  	}
+  	/* Add the persistent grant into the list of free grants */
+@@@ -1387,6 -1634,60 +1495,63 @@@ static void blkfront_setup_discard(stru
+  	kfree(type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int blkfront_setup_indirect(struct blkfront_info *info)
++ {
++ 	unsigned int indirect_segments, segs;
++ 	int err, i;
++ 
++ 	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
++ 			    "feature-max-indirect-segments", "%u", &indirect_segments,
++ 			    NULL);
++ 	if (err) {
++ 		info->max_indirect_segments = 0;
++ 		segs = BLKIF_MAX_SEGMENTS_PER_REQUEST;
++ 	} else {
++ 		info->max_indirect_segments = min(indirect_segments,
++ 						  xen_blkif_max_segments);
++ 		segs = info->max_indirect_segments;
++ 	}
++ 
++ 	err = fill_grant_buffer(info, (segs + INDIRECT_GREFS(segs)) * BLK_RING_SIZE);
++ 	if (err)
++ 		goto out_of_memory;
++ 
++ 	for (i = 0; i < BLK_RING_SIZE; i++) {
++ 		info->shadow[i].grants_used = kzalloc(
++ 			sizeof(info->shadow[i].grants_used[0]) * segs,
++ 			GFP_NOIO);
++ 		info->shadow[i].sg = kzalloc(sizeof(info->shadow[i].sg[0]) * segs, GFP_NOIO);
++ 		if (info->max_indirect_segments)
++ 			info->shadow[i].indirect_grants = kzalloc(
++ 				sizeof(info->shadow[i].indirect_grants[0]) *
++ 				INDIRECT_GREFS(segs),
++ 				GFP_NOIO);
++ 		if ((info->shadow[i].grants_used == NULL) ||
++ 			(info->shadow[i].sg == NULL) ||
++ 		     (info->max_indirect_segments &&
++ 		     (info->shadow[i].indirect_grants == NULL)))
++ 			goto out_of_memory;
++ 		sg_init_table(info->shadow[i].sg, segs);
++ 	}
++ 
++ 
++ 	return 0;
++ 
++ out_of_memory:
++ 	for (i = 0; i < BLK_RING_SIZE; i++) {
++ 		kfree(info->shadow[i].grants_used);
++ 		info->shadow[i].grants_used = NULL;
++ 		kfree(info->shadow[i].sg);
++ 		info->shadow[i].sg = NULL;
++ 		kfree(info->shadow[i].indirect_grants);
++ 		info->shadow[i].indirect_grants = NULL;
++ 	}
++ 	return -ENOMEM;
++ }
++ 
+++>>>>>>> b7649158a0d2 (xen-blkfront: use a different scatterlist for each request)
+  /*
+   * Invoked when the backend is finally 'ready' (and has told produced
+   * the details about the physical device - #sectors, size, etc).
+* Unmerged path drivers/block/xen-blkfront.c
