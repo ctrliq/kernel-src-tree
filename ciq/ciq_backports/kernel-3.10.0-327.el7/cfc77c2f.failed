@@ -1,0 +1,144 @@
+sfc: save old MAC address in case sriov_mac_address_changed fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Shradha Shah <sshah@solarflare.com>
+commit cfc77c2fbadf5b806fea2e35738c7437fc62f522
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cfc77c2f.failed
+
+Otherwise the PF and VF can disagree on the VF's MAC address and
+this leads to strange behaviour, up to and including kernel panics.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cfc77c2fbadf5b806fea2e35738c7437fc62f522)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10_sriov.h
+#	drivers/net/ethernet/sfc/siena_sriov.c
+diff --cc drivers/net/ethernet/sfc/ef10_sriov.h
+index 6ea115e3c3f2,8b67163e2f81..000000000000
+--- a/drivers/net/ethernet/sfc/ef10_sriov.h
++++ b/drivers/net/ethernet/sfc/ef10_sriov.h
+@@@ -18,18 -30,15 +18,26 @@@ static inline bool efx_ef10_sriov_wante
+  }
+  
+  int efx_ef10_sriov_configure(struct efx_nic *efx, int num_vfs);
+++<<<<<<< HEAD
+ +
+ +static inline int efx_ef10_sriov_init(struct efx_nic *efx)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+ +
+ +static inline void efx_ef10_sriov_mac_address_changed(struct efx_nic *efx) {}
+++=======
++ int efx_ef10_sriov_init(struct efx_nic *efx);
++ static inline int efx_ef10_sriov_mac_address_changed(struct efx_nic *efx)
++ {
++ 	return -EOPNOTSUPP;
++ }
+++>>>>>>> cfc77c2fbadf (sfc: save old MAC address in case sriov_mac_address_changed fails)
+  static inline void efx_ef10_sriov_reset(struct efx_nic *efx) {}
+ -void efx_ef10_sriov_fini(struct efx_nic *efx);
+ +static inline void efx_ef10_sriov_fini(struct efx_nic *efx) {}
+  static inline void efx_ef10_sriov_flr(struct efx_nic *efx, unsigned vf_i) {}
+  
+ +#ifdef CONFIG_SFC_SRIOV
+  static inline int efx_ef10_sriov_set_vf_mac(struct efx_nic *efx, int vf,
+  					    u8 *mac)
+  {
+diff --cc drivers/net/ethernet/sfc/siena_sriov.c
+index d347c1f697f6,da7b94f34604..000000000000
+--- a/drivers/net/ethernet/sfc/siena_sriov.c
++++ b/drivers/net/ethernet/sfc/siena_sriov.c
+@@@ -1481,12 -1474,10 +1481,12 @@@ void efx_siena_sriov_flr(struct efx_ni
+  	efx_vfdi_flush_clear(vf);
+  
+  	vf->evq0_count = 0;
+ +#endif /* CONFIG_SFC_SRIOV */
+  }
+  
+- void efx_siena_sriov_mac_address_changed(struct efx_nic *efx)
++ int efx_siena_sriov_mac_address_changed(struct efx_nic *efx)
+  {
+ +#ifdef CONFIG_SFC_SRIOV
+  	struct siena_nic_data *nic_data = efx->nic_data;
+  	struct vfdi_status *vfdi_status = nic_data->vfdi_status.addr;
+  
+@@@ -1495,7 -1486,8 +1495,12 @@@
+  	ether_addr_copy(vfdi_status->peers[0].mac_addr,
+  			efx->net_dev->dev_addr);
+  	queue_work(vfdi_workqueue, &nic_data->peer_work);
+++<<<<<<< HEAD
+ +#endif /* CONFIG_SFC_SRIOV */
+++=======
++ 
++ 	return 0;
+++>>>>>>> cfc77c2fbadf (sfc: save old MAC address in case sriov_mac_address_changed fails)
+  }
+  
+  void efx_siena_sriov_tx_flush_done(struct efx_nic *efx, efx_qword_t *event)
+* Unmerged path drivers/net/ethernet/sfc/ef10_sriov.h
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 9557690dd00f..382cf350b4e7 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -2167,6 +2167,8 @@ static int efx_set_mac_address(struct net_device *net_dev, void *data)
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	struct sockaddr *addr = data;
+ 	u8 *new_addr = addr->sa_data;
++	u8 old_addr[6];
++	int rc;
+ 
+ 	if (!is_valid_ether_addr(new_addr)) {
+ 		netif_err(efx, drv, efx->net_dev,
+@@ -2175,9 +2177,16 @@ static int efx_set_mac_address(struct net_device *net_dev, void *data)
+ 		return -EADDRNOTAVAIL;
+ 	}
+ 
++	/* save old address */
++	ether_addr_copy(old_addr, net_dev->dev_addr);
+ 	ether_addr_copy(net_dev->dev_addr, new_addr);
+-	if (efx->type->sriov_mac_address_changed)
+-		efx->type->sriov_mac_address_changed(efx);
++	if (efx->type->sriov_mac_address_changed) {
++		rc = efx->type->sriov_mac_address_changed(efx);
++		if (rc) {
++			ether_addr_copy(net_dev->dev_addr, old_addr);
++			return rc;
++		}
++	}
+ 
+ 	/* Reconfigure the MAC */
+ 	mutex_lock(&efx->mac_lock);
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index a6f4d9aadd40..fe3a2d4587a9 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -1333,7 +1333,7 @@ struct efx_nic_type {
+ 	int (*sriov_configure)(struct efx_nic *efx, int num_vfs);
+ 	int (*sriov_init)(struct efx_nic *efx);
+ 	void (*sriov_fini)(struct efx_nic *efx);
+-	void (*sriov_mac_address_changed)(struct efx_nic *efx);
++	int (*sriov_mac_address_changed)(struct efx_nic *efx);
+ 	bool (*sriov_wanted)(struct efx_nic *efx);
+ 	void (*sriov_reset)(struct efx_nic *efx);
+ 	void (*sriov_flr)(struct efx_nic *efx, unsigned vf_i);
+* Unmerged path drivers/net/ethernet/sfc/siena_sriov.c
+diff --git a/drivers/net/ethernet/sfc/siena_sriov.h b/drivers/net/ethernet/sfc/siena_sriov.h
+index 8b2ca430a4ea..8227512f0c14 100644
+--- a/drivers/net/ethernet/sfc/siena_sriov.h
++++ b/drivers/net/ethernet/sfc/siena_sriov.h
+@@ -44,7 +44,7 @@
+ int efx_siena_sriov_configure(struct efx_nic *efx, int num_vfs);
+ int efx_siena_sriov_init(struct efx_nic *efx);
+ void efx_siena_sriov_fini(struct efx_nic *efx);
+-void efx_siena_sriov_mac_address_changed(struct efx_nic *efx);
++int efx_siena_sriov_mac_address_changed(struct efx_nic *efx);
+ bool efx_siena_sriov_wanted(struct efx_nic *efx);
+ void efx_siena_sriov_reset(struct efx_nic *efx);
+ void efx_siena_sriov_flr(struct efx_nic *efx, unsigned flr);
