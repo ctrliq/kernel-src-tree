@@ -1,0 +1,124 @@
+fs/mpage.c: factor page_endio() out of mpage_end_io()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] mpage: factor page_endio() out of mpage_end_io() (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 95.05%
+commit-author Matthew Wilcox <matthew.r.wilcox@intel.com>
+commit 57d998456ae8680ed446aa1993f45f4d8a9a5973
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/57d99845.failed
+
+page_endio() takes care of updating all the appropriate page flags once
+I/O has finished to a page.  Switch to using mapping_set_error() instead
+of setting AS_EIO directly; this will handle thin-provisioned devices
+correctly.
+
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Dheeraj Reddy <dheeraj.reddy@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 57d998456ae8680ed446aa1993f45f4d8a9a5973)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/mpage.c
+diff --cc fs/mpage.c
+index 9612b5db0b94,10da0da73017..000000000000
+--- a/fs/mpage.c
++++ b/fs/mpage.c
+@@@ -43,31 -43,14 +43,39 @@@
+   */
+  static void mpage_end_io(struct bio *bio, int err)
+  {
+ -	struct bio_vec *bv;
+ -	int i;
+ +	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+  
+++<<<<<<< HEAD
+ +	do {
+ +		struct page *page = bvec->bv_page;
+ +
+ +		if (--bvec >= bio->bi_io_vec)
+ +			prefetchw(&bvec->bv_page->flags);
+ +		if (bio_data_dir(bio) == READ) {
+ +			if (uptodate) {
+ +				SetPageUptodate(page);
+ +			} else {
+ +				ClearPageUptodate(page);
+ +				SetPageError(page);
+ +			}
+ +			unlock_page(page);
+ +		} else { /* bio_data_dir(bio) == WRITE */
+ +			if (!uptodate) {
+ +				SetPageError(page);
+ +				if (page->mapping)
+ +					set_bit(AS_EIO, &page->mapping->flags);
+ +			}
+ +			end_page_writeback(page);
+ +		}
+ +	} while (bvec >= bio->bi_io_vec);
+++=======
++ 	bio_for_each_segment_all(bv, bio, i) {
++ 		struct page *page = bv->bv_page;
++ 		page_endio(page, bio_data_dir(bio), err);
++ 	}
++ 
+++>>>>>>> 57d998456ae8 (fs/mpage.c: factor page_endio() out of mpage_end_io())
+  	bio_put(bio);
+  }
+  
+* Unmerged path fs/mpage.c
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 64c42592c528..088be2d57f15 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -441,6 +441,8 @@ static inline void wait_on_page_writeback(struct page *page)
+ extern void end_page_writeback(struct page *page);
+ void wait_for_stable_page(struct page *page);
+ 
++void page_endio(struct page *page, int rw, int err);
++
+ /*
+  * Add an arbitrary waiter to a page's wait queue
+  */
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 813fbe54f73b..ea82f367588a 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -754,6 +754,31 @@ void end_page_writeback(struct page *page)
+ }
+ EXPORT_SYMBOL(end_page_writeback);
+ 
++/*
++ * After completing I/O on a page, call this routine to update the page
++ * flags appropriately
++ */
++void page_endio(struct page *page, int rw, int err)
++{
++	if (rw == READ) {
++		if (!err) {
++			SetPageUptodate(page);
++		} else {
++			ClearPageUptodate(page);
++			SetPageError(page);
++		}
++		unlock_page(page);
++	} else { /* rw == WRITE */
++		if (err) {
++			SetPageError(page);
++			if (page->mapping)
++				mapping_set_error(page->mapping, err);
++		}
++		end_page_writeback(page);
++	}
++}
++EXPORT_SYMBOL_GPL(page_endio);
++
+ /**
+  * __lock_page - get a lock on the page, assuming we need to sleep to get it
+  * @page: the page to lock
