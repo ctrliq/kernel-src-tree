@@ -1,0 +1,121 @@
+cifs: dynamic allocation of ntlmssp blob
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jerome Marchand <jmarchan@redhat.com>
+commit b8da344b74c822e966c6d19d6b2321efe82c5d97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b8da344b.failed
+
+In sess_auth_rawntlmssp_authenticate(), the ntlmssp blob is allocated
+statically and its size is an "empirical" 5*sizeof(struct
+_AUTHENTICATE_MESSAGE) (320B on x86_64). I don't know where this value
+comes from or if it was ever appropriate, but it is currently
+insufficient: the user and domain name in UTF16 could take 1kB by
+themselves. Because of that, build_ntlmssp_auth_blob() might corrupt
+memory (out-of-bounds write). The size of ntlmssp_blob in
+SMB2_sess_setup() is too small too (sizeof(struct _NEGOTIATE_MESSAGE)
++ 500).
+
+This patch allocates the blob dynamically in
+build_ntlmssp_auth_blob().
+
+	Signed-off-by: Jerome Marchand <jmarchan@redhat.com>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+CC: Stable <stable@vger.kernel.org>
+(cherry picked from commit b8da344b74c822e966c6d19d6b2321efe82c5d97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/sess.c
+diff --cc fs/cifs/sess.c
+index fe8c9dd13580,a42e99c8e00e..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -399,23 -423,27 +423,43 @@@ int build_ntlmssp_auth_blob(unsigned ch
+  	sec_blob->LmChallengeResponse.Length = 0;
+  	sec_blob->LmChallengeResponse.MaximumLength = 0;
+  
+++<<<<<<< HEAD
+ +	sec_blob->NtChallengeResponse.BufferOffset = cpu_to_le32(tmp - pbuffer);
+ +	rc = setup_ntlmv2_rsp(ses, nls_cp);
+ +	if (rc) {
+ +		cifs_dbg(VFS, "Error %d during NTLMSSP authentication\n", rc);
+ +		goto setup_ntlmv2_ret;
+++=======
++ 	sec_blob->NtChallengeResponse.BufferOffset =
++ 				cpu_to_le32(tmp - *pbuffer);
++ 	if (ses->user_name != NULL) {
++ 		memcpy(tmp, ses->auth_key.response + CIFS_SESS_KEY_SIZE,
++ 				ses->auth_key.len - CIFS_SESS_KEY_SIZE);
++ 		tmp += ses->auth_key.len - CIFS_SESS_KEY_SIZE;
++ 
++ 		sec_blob->NtChallengeResponse.Length =
++ 				cpu_to_le16(ses->auth_key.len - CIFS_SESS_KEY_SIZE);
++ 		sec_blob->NtChallengeResponse.MaximumLength =
++ 				cpu_to_le16(ses->auth_key.len - CIFS_SESS_KEY_SIZE);
++ 	} else {
++ 		/*
++ 		 * don't send an NT Response for anonymous access
++ 		 */
++ 		sec_blob->NtChallengeResponse.Length = 0;
++ 		sec_blob->NtChallengeResponse.MaximumLength = 0;
+++>>>>>>> b8da344b74c8 (cifs: dynamic allocation of ntlmssp blob)
+  	}
+ +	memcpy(tmp, ses->auth_key.response + CIFS_SESS_KEY_SIZE,
+ +			ses->auth_key.len - CIFS_SESS_KEY_SIZE);
+ +	tmp += ses->auth_key.len - CIFS_SESS_KEY_SIZE;
+ +
+ +	sec_blob->NtChallengeResponse.Length =
+ +			cpu_to_le16(ses->auth_key.len - CIFS_SESS_KEY_SIZE);
+ +	sec_blob->NtChallengeResponse.MaximumLength =
+ +			cpu_to_le16(ses->auth_key.len - CIFS_SESS_KEY_SIZE);
+  
+  	if (ses->domainName == NULL) {
+- 		sec_blob->DomainName.BufferOffset = cpu_to_le32(tmp - pbuffer);
++ 		sec_blob->DomainName.BufferOffset = cpu_to_le32(tmp - *pbuffer);
+  		sec_blob->DomainName.Length = 0;
+  		sec_blob->DomainName.MaximumLength = 0;
+  		tmp += 2;
+diff --git a/fs/cifs/ntlmssp.h b/fs/cifs/ntlmssp.h
+index 848249fa120f..3079b38f0afb 100644
+--- a/fs/cifs/ntlmssp.h
++++ b/fs/cifs/ntlmssp.h
+@@ -133,6 +133,6 @@ typedef struct _AUTHENTICATE_MESSAGE {
+ 
+ int decode_ntlmssp_challenge(char *bcc_ptr, int blob_len, struct cifs_ses *ses);
+ void build_ntlmssp_negotiate_blob(unsigned char *pbuffer, struct cifs_ses *ses);
+-int build_ntlmssp_auth_blob(unsigned char *pbuffer, u16 *buflen,
++int build_ntlmssp_auth_blob(unsigned char **pbuffer, u16 *buflen,
+ 			struct cifs_ses *ses,
+ 			const struct nls_table *nls_cp);
+* Unmerged path fs/cifs/sess.c
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 1422c727c24f..944117925b58 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -587,7 +587,7 @@ SMB2_sess_setup(const unsigned int xid, struct cifs_ses *ses,
+ 	u16 blob_length = 0;
+ 	struct key *spnego_key = NULL;
+ 	char *security_blob = NULL;
+-	char *ntlmssp_blob = NULL;
++	unsigned char *ntlmssp_blob = NULL;
+ 	bool use_spnego = false; /* else use raw ntlmssp */
+ 
+ 	cifs_dbg(FYI, "Session Setup\n");
+@@ -712,13 +712,7 @@ ssetup_ntlmssp_authenticate:
+ 		iov[1].iov_len = blob_length;
+ 	} else if (phase == NtLmAuthenticate) {
+ 		req->hdr.SessionId = ses->Suid;
+-		ntlmssp_blob = kzalloc(sizeof(struct _NEGOTIATE_MESSAGE) + 500,
+-				       GFP_KERNEL);
+-		if (ntlmssp_blob == NULL) {
+-			rc = -ENOMEM;
+-			goto ssetup_exit;
+-		}
+-		rc = build_ntlmssp_auth_blob(ntlmssp_blob, &blob_length, ses,
++		rc = build_ntlmssp_auth_blob(&ntlmssp_blob, &blob_length, ses,
+ 					     nls_cp);
+ 		if (rc) {
+ 			cifs_dbg(FYI, "build_ntlmssp_auth_blob failed %d\n",
