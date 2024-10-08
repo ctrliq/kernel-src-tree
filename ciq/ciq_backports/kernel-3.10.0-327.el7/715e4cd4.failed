@@ -1,0 +1,166 @@
+libceph: specify position of extent operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 715e4cd405cfd67bd058e410b3e599bab2072645
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/715e4cd4.failed
+
+allow specifying position of extent operation in multi-operations
+osd request. This is required for cephfs to convert inline data to
+normal data (compare xattr, then write object).
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+	Reviewed-by: Ilya Dryomov <idryomov@redhat.com>
+(cherry picked from commit 715e4cd405cfd67bd058e410b3e599bab2072645)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index f23bd8e109ef,c03ac4c4bcd1..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -589,13 -609,16 +589,23 @@@ ceph_sync_direct_write(struct kiocb *io
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		num_pages = calc_pages_for(page_align, len);
+ +		pages = ceph_get_direct_page_vector(data, num_pages, false);
+ +		if (IS_ERR(pages)) {
+ +			ret = PTR_ERR(pages);
+ +			goto out;
+++=======
++ 		osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
++ 
++ 		n = iov_iter_get_pages_alloc(from, &pages, len, &start);
++ 		if (unlikely(n < 0)) {
++ 			ret = n;
++ 			ceph_osdc_put_request(req);
++ 			break;
+++>>>>>>> 715e4cd405cf (libceph: specify position of extent operation)
+  		}
+  
+ -		num_pages = (n + start + PAGE_SIZE - 1) / PAGE_SIZE;
+  		/*
+  		 * throw out any page cache pages in this range. this
+  		 * may block.
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index a6ef4243deaa..46226d530ab9 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -301,7 +301,7 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
+ 	     off, len);
+ 	vino = ceph_vino(inode);
+ 	req = ceph_osdc_new_request(osdc, &ci->i_layout, vino, off, &len,
+-				    1, CEPH_OSD_OP_READ,
++				    0, 1, CEPH_OSD_OP_READ,
+ 				    CEPH_OSD_FLAG_READ, NULL,
+ 				    ci->i_truncate_seq, ci->i_truncate_size,
+ 				    false);
+@@ -722,7 +722,6 @@ retry:
+ 	last_snapc = snapc;
+ 
+ 	while (!done && index <= end) {
+-		int num_ops = do_sync ? 2 : 1;
+ 		unsigned i;
+ 		int first;
+ 		pgoff_t next;
+@@ -822,7 +821,8 @@ get_more_pages:
+ 				len = wsize;
+ 				req = ceph_osdc_new_request(&fsc->client->osdc,
+ 							&ci->i_layout, vino,
+-							offset, &len, num_ops,
++							offset, &len, 0,
++							do_sync ? 2 : 1,
+ 							CEPH_OSD_OP_WRITE,
+ 							CEPH_OSD_FLAG_WRITE |
+ 							CEPH_OSD_FLAG_ONDISK,
+@@ -834,6 +834,9 @@ get_more_pages:
+ 					break;
+ 				}
+ 
++				if (do_sync)
++					osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
++
+ 				req->r_callback = writepages_finish;
+ 				req->r_inode = inode;
+ 
+* Unmerged path fs/ceph/file.c
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index bcf9c2180ea5..5d86416d35f2 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -328,7 +328,8 @@ extern struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *,
+ 				      struct ceph_file_layout *layout,
+ 				      struct ceph_vino vino,
+ 				      u64 offset, u64 *len,
+-				      int num_ops, int opcode, int flags,
++				      unsigned int which, int num_ops,
++				      int opcode, int flags,
+ 				      struct ceph_snap_context *snapc,
+ 				      u32 truncate_seq, u64 truncate_size,
+ 				      bool use_mempool);
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index a7d79a84c714..44beecacab9f 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -753,7 +753,8 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
+ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+ 					       struct ceph_file_layout *layout,
+ 					       struct ceph_vino vino,
+-					       u64 off, u64 *plen, int num_ops,
++					       u64 off, u64 *plen,
++					       unsigned int which, int num_ops,
+ 					       int opcode, int flags,
+ 					       struct ceph_snap_context *snapc,
+ 					       u32 truncate_seq,
+@@ -785,7 +786,7 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+ 	}
+ 
+ 	if (opcode == CEPH_OSD_OP_CREATE || opcode == CEPH_OSD_OP_DELETE) {
+-		osd_req_op_init(req, 0, opcode);
++		osd_req_op_init(req, which, opcode);
+ 	} else {
+ 		u32 object_size = le32_to_cpu(layout->fl_object_size);
+ 		u32 object_base = off - objoff;
+@@ -798,17 +799,9 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+ 					truncate_size = object_size;
+ 			}
+ 		}
+-
+-		osd_req_op_extent_init(req, 0, opcode, objoff, objlen,
++		osd_req_op_extent_init(req, which, opcode, objoff, objlen,
+ 				       truncate_size, truncate_seq);
+ 	}
+-	/*
+-	 * A second op in the ops array means the caller wants to
+-	 * also issue a include a 'startsync' command so that the
+-	 * osd will flush data quickly.
+-	 */
+-	if (num_ops > 1)
+-		osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
+ 
+ 	req->r_base_oloc.pool = ceph_file_layout_pg_pool(*layout);
+ 
+@@ -2677,7 +2670,7 @@ int ceph_osdc_readpages(struct ceph_osd_client *osdc,
+ 
+ 	dout("readpages on ino %llx.%llx on %llu~%llu\n", vino.ino,
+ 	     vino.snap, off, *plen);
+-	req = ceph_osdc_new_request(osdc, layout, vino, off, plen, 1,
++	req = ceph_osdc_new_request(osdc, layout, vino, off, plen, 0, 1,
+ 				    CEPH_OSD_OP_READ, CEPH_OSD_FLAG_READ,
+ 				    NULL, truncate_seq, truncate_size,
+ 				    false);
+@@ -2720,7 +2713,7 @@ int ceph_osdc_writepages(struct ceph_osd_client *osdc, struct ceph_vino vino,
+ 	int page_align = off & ~PAGE_MASK;
+ 
+ 	BUG_ON(vino.snap != CEPH_NOSNAP);	/* snapshots aren't writeable */
+-	req = ceph_osdc_new_request(osdc, layout, vino, off, &len, 1,
++	req = ceph_osdc_new_request(osdc, layout, vino, off, &len, 0, 1,
+ 				    CEPH_OSD_OP_WRITE,
+ 				    CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_WRITE,
+ 				    snapc, truncate_seq, truncate_size,
