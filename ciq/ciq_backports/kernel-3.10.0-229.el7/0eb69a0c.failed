@@ -1,0 +1,173 @@
+s390/airq: silence lockdep warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [s390] airq: silence lockdep warning (Hendrik Brueckner) [1088554]
+Rebuild_FUZZ: 92.06%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 0eb69a0c584d0eaec6c2b6663e03184625c3517b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0eb69a0c.failed
+
+airq_iv_(alloc|free) is called by some users with interrupts enabled
+and by some with interrupts disabled which leads to the following
+lockdep warning:
+
+[ INFO: possible irq lock inversion dependency detected ]
+3.14.0-15249-gbf29b7b-dirty #25 Not tainted
+---------------------------------------------------------
+insmod/2108 just changed the state of lock:
+ (&(&iv->lock)->rlock){+.....}, at: [<000000000046ee3e>] airq_iv_alloc+0x62/0x228
+but this lock was taken by another, HARDIRQ-READ-safe lock in the past:
+ (&info->lock){.-.-..}
+
+and interrupts could create inverse lock ordering between them.
+
+other info that might help us debug this:
+ Possible interrupt unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&iv->lock)->rlock);
+                               local_irq_disable();
+                               lock(&info->lock);
+                               lock(&(&iv->lock)->rlock);
+  <Interrupt>
+    lock(&info->lock);
+
+ *** DEADLOCK ***
+
+Although this is a false alarm (since each airq user consistently
+calls these functions from the same context) fix this by ensuring
+that interrupts are disabled when the airq lock is held.
+
+	Reported-by: Frank Blaschka <frank.blaschka@de.ibm.com>
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 0eb69a0c584d0eaec6c2b6663e03184625c3517b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/airq.c
+diff --cc drivers/s390/cio/airq.c
+index 6ead6d076445,00bfbee0af9e..000000000000
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@@ -169,58 -186,70 +169,96 @@@ void airq_iv_release(struct airq_iv *iv
+  EXPORT_SYMBOL(airq_iv_release);
+  
+  /**
+ - * airq_iv_alloc - allocate irq bits from an interrupt vector
+ + * airq_iv_alloc_bit - allocate an irq bit from an interrupt vector
+   * @iv: pointer to an interrupt vector structure
+ - * @num: number of consecutive irq bits to allocate
+   *
+ - * Returns the bit number of the first irq in the allocated block of irqs,
+ - * or -1UL if no bit is available or the AIRQ_IV_ALLOC flag has not been
+ - * specified
+ + * Returns the bit number of the allocated irq, or -1UL if no bit
+ + * is available or the AIRQ_IV_ALLOC flag has not been specified
+   */
+ -unsigned long airq_iv_alloc(struct airq_iv *iv, unsigned long num)
+ +unsigned long airq_iv_alloc_bit(struct airq_iv *iv)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+ +	unsigned long bit;
+++=======
++ 	unsigned long bit, i, flags;
+++>>>>>>> 0eb69a0c584d (s390/airq: silence lockdep warning)
+  
+ -	if (!iv->avail || num == 0)
+ +	if (!iv->avail)
+  		return -1UL;
+++<<<<<<< HEAD
+ +	spin_lock(&iv->lock);
+ +	bit = find_first_bit_left(iv->avail, iv->bits);
+ +	if (bit < iv->bits) {
+ +		clear_bit(bit ^ be_to_le, iv->avail);
+ +		if (bit >= iv->end)
+ +			iv->end = bit + 1;
+ +	} else
+++=======
++ 	spin_lock_irqsave(&iv->lock, flags);
++ 	bit = find_first_bit_inv(iv->avail, iv->bits);
++ 	while (bit + num <= iv->bits) {
++ 		for (i = 1; i < num; i++)
++ 			if (!test_bit_inv(bit + i, iv->avail))
++ 				break;
++ 		if (i >= num) {
++ 			/* Found a suitable block of irqs */
++ 			for (i = 0; i < num; i++)
++ 				clear_bit_inv(bit + i, iv->avail);
++ 			if (bit + num >= iv->end)
++ 				iv->end = bit + num + 1;
++ 			break;
++ 		}
++ 		bit = find_next_bit_inv(iv->avail, iv->bits, bit + i + 1);
++ 	}
++ 	if (bit + num > iv->bits)
+++>>>>>>> 0eb69a0c584d (s390/airq: silence lockdep warning)
+  		bit = -1UL;
+- 	spin_unlock(&iv->lock);
++ 	spin_unlock_irqrestore(&iv->lock, flags);
+  	return bit;
+- 
+  }
+ -EXPORT_SYMBOL(airq_iv_alloc);
+ +EXPORT_SYMBOL(airq_iv_alloc_bit);
+  
+  /**
+ - * airq_iv_free - free irq bits of an interrupt vector
+ + * airq_iv_free_bit - free an irq bit of an interrupt vector
+   * @iv: pointer to interrupt vector structure
+ - * @bit: number of the first irq bit to free
+ - * @num: number of consecutive irq bits to free
+ + * @bit: number of the irq bit to free
+   */
+ -void airq_iv_free(struct airq_iv *iv, unsigned long bit, unsigned long num)
+ +void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+++=======
++ 	unsigned long i, flags;
+++>>>>>>> 0eb69a0c584d (s390/airq: silence lockdep warning)
+  
+ -	if (!iv->avail || num == 0)
+ +	if (!iv->avail)
+  		return;
+++<<<<<<< HEAD
+ +	spin_lock(&iv->lock);
+ +	/* Clear (possibly left over) interrupt bit */
+ +	clear_bit(bit ^ be_to_le, iv->vector);
+ +	/* Make the bit position available again */
+ +	set_bit(bit ^ be_to_le, iv->avail);
+ +	if (bit == iv->end - 1) {
+++=======
++ 	spin_lock_irqsave(&iv->lock, flags);
++ 	for (i = 0; i < num; i++) {
++ 		/* Clear (possibly left over) interrupt bit */
++ 		clear_bit_inv(bit + i, iv->vector);
++ 		/* Make the bit positions available again */
++ 		set_bit_inv(bit + i, iv->avail);
++ 	}
++ 	if (bit + num >= iv->end) {
+++>>>>>>> 0eb69a0c584d (s390/airq: silence lockdep warning)
+  		/* Find new end of bit-field */
+ -		while (iv->end > 0 && !test_bit_inv(iv->end - 1, iv->avail))
+ -			iv->end--;
+ +		while (--iv->end > 0)
+ +			if (!test_bit((iv->end - 1) ^ be_to_le, iv->avail))
+ +				break;
+  	}
+- 	spin_unlock(&iv->lock);
++ 	spin_unlock_irqrestore(&iv->lock, flags);
+  }
+ -EXPORT_SYMBOL(airq_iv_free);
+ +EXPORT_SYMBOL(airq_iv_free_bit);
+  
+  /**
+   * airq_iv_scan - scan interrupt vector for non-zero bits
+* Unmerged path drivers/s390/cio/airq.c
