@@ -1,0 +1,259 @@
+time: Remove duplicated code in ktime_get_raw_and_real()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christopher S. Hall <christopher.s.hall@intel.com>
+commit ba26621e63ce6dc481d90ab9f6902e058d4ea39a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ba26621e.failed
+
+The code in ktime_get_snapshot() is a superset of the code in
+ktime_get_raw_and_real() code. Further, ktime_get_raw_and_real() is
+called only by the PPS code, pps_get_ts(). Consolidate the
+pps_get_ts() code into a single function calling ktime_get_snapshot()
+and eliminate ktime_get_raw_and_real(). A side effect of this is that
+the raw and real results of pps_get_ts() correspond to exactly the
+same clock cycle. Previously these values represented separate reads
+of the system clock.
+
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Richard Cochran <richardcochran@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: kevin.b.stanton@intel.com
+	Cc: kevin.j.clarke@intel.com
+	Cc: hpa@zytor.com
+	Cc: jeffrey.t.kirsher@intel.com
+	Cc: netdev@vger.kernel.org
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Christopher S. Hall <christopher.s.hall@intel.com>
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+(cherry picked from commit ba26621e63ce6dc481d90ab9f6902e058d4ea39a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pps_kernel.h
+#	kernel/time/timekeeping.c
+diff --cc include/linux/pps_kernel.h
+index 7db3eb93a079,35ac903956c7..000000000000
+--- a/include/linux/pps_kernel.h
++++ b/include/linux/pps_kernel.h
+@@@ -111,28 -111,23 +111,41 @@@ static inline void timespec_to_pps_ktim
+  	kt->nsec = ts.tv_nsec;
+  }
+  
++ static inline void pps_get_ts(struct pps_event_time *ts)
++ {
++ 	struct system_time_snapshot snap;
++ 
++ 	ktime_get_snapshot(&snap);
++ 	ts->ts_real = ktime_to_timespec64(snap.real);
+  #ifdef CONFIG_NTP_PPS
+++<<<<<<< HEAD
+ +
+ +static inline void pps_get_ts(struct pps_event_time *ts)
+ +{
+ +	getnstime_raw_and_real(&ts->ts_raw, &ts->ts_real);
+ +}
+ +
+ +#else /* CONFIG_NTP_PPS */
+ +
+ +static inline void pps_get_ts(struct pps_event_time *ts)
+ +{
+ +	getnstimeofday(&ts->ts_real);
+ +}
+ +
+ +#endif /* CONFIG_NTP_PPS */
+ +
+++=======
++ 	ts->ts_raw = ktime_to_timespec64(snap.raw);
++ #endif
++ }
++ 
+++>>>>>>> ba26621e63ce (time: Remove duplicated code in ktime_get_raw_and_real())
+  /* Subtract known time delay from PPS event time(s) */
+ -static inline void pps_sub_ts(struct pps_event_time *ts, struct timespec64 delta)
+ +static inline void pps_sub_ts(struct pps_event_time *ts, struct timespec delta)
+  {
+ -	ts->ts_real = timespec64_sub(ts->ts_real, delta);
+ +	ts->ts_real = timespec_sub(ts->ts_real, delta);
+  #ifdef CONFIG_NTP_PPS
+ -	ts->ts_raw = timespec64_sub(ts->ts_raw, delta);
+ +	ts->ts_raw = timespec_sub(ts->ts_raw, delta);
+  #endif
+  }
+  
+diff --cc kernel/time/timekeeping.c
+index 7bb86335a3a9,af19a49d5223..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -421,90 -814,99 +421,127 @@@ void ktime_get_ts64(struct timespec64 *
+  }
+  EXPORT_SYMBOL_GPL(ktime_get_ts64);
+  
+ +
+  /**
+ - * ktime_get_seconds - Get the seconds portion of CLOCK_MONOTONIC
+ + * timekeeping_clocktai - Returns the TAI time of day in a timespec
+ + * @ts:		pointer to the timespec to be set
+   *
+ - * Returns the seconds portion of CLOCK_MONOTONIC with a single non
+ - * serialized read. tk->ktime_sec is of type 'unsigned long' so this
+ - * works on both 32 and 64 bit systems. On 32 bit systems the readout
+ - * covers ~136 years of uptime which should be enough to prevent
+ - * premature wrap arounds.
+ + * Returns the time of day in a timespec.
+   */
+ -time64_t ktime_get_seconds(void)
+ +void timekeeping_clocktai(struct timespec *ts)
+  {
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ +	struct timekeeper *tk = &timekeeper;
+ +	struct timespec64 ts64;
+ +	unsigned long seq;
+ +	u64 nsecs;
+  
+  	WARN_ON(timekeeping_suspended);
+ -	return tk->ktime_sec;
+ +
+ +	do {
+ +		seq = read_seqcount_begin(&timekeeper_seq);
+ +
+ +		ts64.tv_sec = tk->xtime_sec + tk->tai_offset;
+ +		nsecs = timekeeping_get_ns(tk);
+ +
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+ +
+ +	ts64.tv_nsec = 0;
+ +	timespec64_add_ns(&ts64, nsecs);
+ +	*ts = timespec64_to_timespec(ts64);
+ +
+  }
+ -EXPORT_SYMBOL_GPL(ktime_get_seconds);
+ +EXPORT_SYMBOL(timekeeping_clocktai);
+ +
+  
+  /**
+ - * ktime_get_real_seconds - Get the seconds portion of CLOCK_REALTIME
+ + * ktime_get_clocktai - Returns the TAI time of day in a ktime
+   *
+ - * Returns the wall clock seconds since 1970. This replaces the
+ - * get_seconds() interface which is not y2038 safe on 32bit systems.
+ + * Returns the time of day in a ktime.
+ + */
+ +ktime_t ktime_get_clocktai(void)
+ +{
+ +	struct timespec ts;
+ +
+ +	timekeeping_clocktai(&ts);
+ +	return timespec_to_ktime(ts);
+ +}
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(ktime_get_clocktai);
+ +
+ +#ifdef CONFIG_NTP_PPS
+ +
+ +/**
+ + * getnstime_raw_and_real - get day and raw monotonic time in timespec format
+ + * @ts_raw:	pointer to the timespec to be set to raw monotonic time
+ + * @ts_real:	pointer to the timespec to be set to the time of day
+   *
+ - * For 64bit systems the fast access to tk->xtime_sec is preserved. On
+ - * 32bit systems the access must be protected with the sequence
+ - * counter to provide "atomic" access to the 64bit tk->xtime_sec
+ - * value.
+ + * This function reads both the time of day and raw monotonic time at the
+ + * same time atomically and stores the resulting timestamps in timespec
+ + * format.
+   */
+ -time64_t ktime_get_real_seconds(void)
+ +void getnstime_raw_and_real(struct timespec *ts_raw, struct timespec *ts_real)
+  {
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ -	time64_t seconds;
+ -	unsigned int seq;
+ +	struct timekeeper *tk = &timekeeper;
+ +	unsigned long seq;
+ +	s64 nsecs_raw, nsecs_real;
+  
+ -	if (IS_ENABLED(CONFIG_64BIT))
+ -		return tk->xtime_sec;
+ +	WARN_ON_ONCE(timekeeping_suspended);
+  
+  	do {
+ -		seq = read_seqcount_begin(&tk_core.seq);
+ -		seconds = tk->xtime_sec;
+ +		seq = read_seqcount_begin(&timekeeper_seq);
+  
+ -	} while (read_seqcount_retry(&tk_core.seq, seq));
+ +		*ts_raw = timespec64_to_timespec(tk->raw_time);
+ +		ts_real->tv_sec = tk->xtime_sec;
+ +		ts_real->tv_nsec = 0;
+  
+ -	return seconds;
+ -}
+ -EXPORT_SYMBOL_GPL(ktime_get_real_seconds);
+ +		nsecs_raw = timekeeping_get_ns_raw(tk);
+ +		nsecs_real = timekeeping_get_ns(tk);
+  
+ -/**
+ - * __ktime_get_real_seconds - The same as ktime_get_real_seconds
+ - * but without the sequence counter protect. This internal function
+ - * is called just when timekeeping lock is already held.
+ - */
+ -time64_t __ktime_get_real_seconds(void)
+ -{
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+  
+ -	return tk->xtime_sec;
+ +	timespec_add_ns(ts_raw, nsecs_raw);
+ +	timespec_add_ns(ts_real, nsecs_real);
+  }
+ +EXPORT_SYMBOL(getnstime_raw_and_real);
+ +
+ +#endif /* CONFIG_NTP_PPS */
+ +
+++=======
++ 
++ /**
++  * ktime_get_snapshot - snapshots the realtime/monotonic raw clocks with counter
++  * @systime_snapshot:	pointer to struct receiving the system time snapshot
++  */
++ void ktime_get_snapshot(struct system_time_snapshot *systime_snapshot)
++ {
++ 	struct timekeeper *tk = &tk_core.timekeeper;
++ 	unsigned long seq;
++ 	ktime_t base_raw;
++ 	ktime_t base_real;
++ 	s64 nsec_raw;
++ 	s64 nsec_real;
++ 	cycle_t now;
++ 
++ 	WARN_ON_ONCE(timekeeping_suspended);
++ 
++ 	do {
++ 		seq = read_seqcount_begin(&tk_core.seq);
++ 
++ 		now = tk->tkr_mono.read(tk->tkr_mono.clock);
++ 		base_real = ktime_add(tk->tkr_mono.base,
++ 				      tk_core.timekeeper.offs_real);
++ 		base_raw = tk->tkr_raw.base;
++ 		nsec_real = timekeeping_cycles_to_ns(&tk->tkr_mono, now);
++ 		nsec_raw  = timekeeping_cycles_to_ns(&tk->tkr_raw, now);
++ 	} while (read_seqcount_retry(&tk_core.seq, seq));
++ 
++ 	systime_snapshot->cycles = now;
++ 	systime_snapshot->real = ktime_add_ns(base_real, nsec_real);
++ 	systime_snapshot->raw = ktime_add_ns(base_raw, nsec_raw);
++ }
++ EXPORT_SYMBOL_GPL(ktime_get_snapshot);
++ 
+++>>>>>>> ba26621e63ce (time: Remove duplicated code in ktime_get_raw_and_real())
+  /**
+   * do_gettimeofday - Returns the time of day in a timeval
+   * @tv:		pointer to the timeval to be set
+* Unmerged path include/linux/pps_kernel.h
+* Unmerged path kernel/time/timekeeping.c
