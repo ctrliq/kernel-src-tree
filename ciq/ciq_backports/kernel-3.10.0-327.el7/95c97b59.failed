@@ -1,0 +1,140 @@
+ipmi: Check the BT interrupt enable periodically
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit 95c97b5941542a4dedb22649adea98e25a88923e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/95c97b59.failed
+
+On a reset, the BMC may reset the BT enable in the processor
+registers (different than the global enables in the BMC).  Check
+it periodically and fix it if necessary.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+	Tested-by: Tony Rex <tony.rex@ericsson.com>
+	Tested-by: Magnus Johansson E <magnus.e.johansson@ericsson.com>
+(cherry picked from commit 95c97b5941542a4dedb22649adea98e25a88923e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si_intf.c
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index 34e8ceebcb73,90c7fdf95419..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -520,6 -530,55 +520,58 @@@ static void handle_flags(struct smi_inf
+  		smi_info->si_state = SI_NORMAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Global enables we care about.
++  */
++ #define GLOBAL_ENABLES_MASK (IPMI_BMC_EVT_MSG_BUFF | IPMI_BMC_RCV_MSG_INTR | \
++ 			     IPMI_BMC_EVT_MSG_INTR)
++ 
++ static u8 current_global_enables(struct smi_info *smi_info, u8 base,
++ 				 bool *irq_on)
++ {
++ 	u8 enables = 0;
++ 
++ 	if (smi_info->supports_event_msg_buff)
++ 		enables |= IPMI_BMC_EVT_MSG_BUFF;
++ 	else
++ 		enables &= ~IPMI_BMC_EVT_MSG_BUFF;
++ 
++ 	if (smi_info->irq && !smi_info->interrupt_disabled)
++ 		enables |= IPMI_BMC_RCV_MSG_INTR;
++ 	else
++ 		enables &= ~IPMI_BMC_RCV_MSG_INTR;
++ 
++ 	if (smi_info->supports_event_msg_buff &&
++ 	    smi_info->irq && !smi_info->interrupt_disabled)
++ 
++ 		enables |= IPMI_BMC_EVT_MSG_INTR;
++ 	else
++ 		enables &= ~IPMI_BMC_EVT_MSG_INTR;
++ 
++ 	*irq_on = enables & (IPMI_BMC_EVT_MSG_INTR | IPMI_BMC_RCV_MSG_INTR);
++ 
++ 	return enables;
++ }
++ 
++ static void check_bt_irq(struct smi_info *smi_info, bool irq_on)
++ {
++ 	u8 irqstate = smi_info->io.inputb(&smi_info->io, IPMI_BT_INTMASK_REG);
++ 
++ 	irqstate &= IPMI_BT_INTMASK_ENABLE_IRQ_BIT;
++ 
++ 	if ((bool)irqstate == irq_on)
++ 		return;
++ 
++ 	if (irq_on)
++ 		smi_info->io.outputb(&smi_info->io, IPMI_BT_INTMASK_REG,
++ 				     IPMI_BT_INTMASK_ENABLE_IRQ_BIT);
++ 	else
++ 		smi_info->io.outputb(&smi_info->io, IPMI_BT_INTMASK_REG, 0);
++ }
++ 
+++>>>>>>> 95c97b594154 (ipmi: Check the BT interrupt enable periodically)
+  static void handle_transaction_done(struct smi_info *smi_info)
+  {
+  	struct ipmi_smi_msg *msg;
+@@@ -668,9 -723,11 +720,14 @@@
+  		break;
+  	}
+  
+ -	case SI_CHECKING_ENABLES:
+ +	case SI_ENABLE_INTERRUPTS1:
+  	{
+  		unsigned char msg[4];
+++<<<<<<< HEAD
+++=======
++ 		u8 enables;
++ 		bool irq_on;
+++>>>>>>> 95c97b594154 (ipmi: Check the BT interrupt enable periodically)
+  
+  		/* We got the flags from the SMI, now handle them. */
+  		smi_info->handlers->get_result(smi_info->si_sm, msg, 4);
+@@@ -680,15 -737,29 +737,26 @@@
+  			dev_warn(smi_info->dev,
+  				 "Maybe ok, but ipmi might run very slowly.\n");
+  			smi_info->si_state = SI_NORMAL;
+++<<<<<<< HEAD
+ +		} else {
+++=======
++ 			break;
++ 		}
++ 		enables = current_global_enables(smi_info, 0, &irq_on);
++ 		if (smi_info->si_type == SI_BT)
++ 			/* BT has its own interrupt enable bit. */
++ 			check_bt_irq(smi_info, irq_on);
++ 		if (enables != (msg[3] & GLOBAL_ENABLES_MASK)) {
++ 			/* Enables are not correct, fix them. */
+++>>>>>>> 95c97b594154 (ipmi: Check the BT interrupt enable periodically)
+  			msg[0] = (IPMI_NETFN_APP_REQUEST << 2);
+  			msg[1] = IPMI_SET_BMC_GLOBAL_ENABLES_CMD;
+ -			msg[2] = enables | (msg[3] & ~GLOBAL_ENABLES_MASK);
+ +			msg[2] = (msg[3] |
+ +				  IPMI_BMC_RCV_MSG_INTR |
+ +				  IPMI_BMC_EVT_MSG_INTR);
+  			smi_info->handlers->start_transaction(
+  				smi_info->si_sm, msg, 3);
+ -			smi_info->si_state = SI_SETTING_ENABLES;
+ -		} else if (smi_info->supports_event_msg_buff) {
+ -			smi_info->curr_msg = ipmi_alloc_smi_msg();
+ -			if (!smi_info->curr_msg) {
+ -				smi_info->si_state = SI_NORMAL;
+ -				break;
+ -			}
+ -			start_getting_msg_queue(smi_info);
+ -		} else {
+ -			smi_info->si_state = SI_NORMAL;
+ +			smi_info->si_state = SI_ENABLE_INTERRUPTS2;
+  		}
+  		break;
+  	}
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
