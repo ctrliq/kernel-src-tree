@@ -1,0 +1,107 @@
+netfilter: nft_payload: work around vlan header stripping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 8cfd23e6740158817d2045915f6ea5a2daf11bce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8cfd23e6.failed
+
+make payload expression aware of the fact that VLAN offload may have
+removed a vlan header.
+
+When we encounter tagged skb, transparently insert the tag into the
+register so that vlan header matching can work without userspace being
+aware of offload features.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8cfd23e6740158817d2045915f6ea5a2daf11bce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_payload.c
+diff --cc net/netfilter/nft_payload.c
+index 85daa84bfdfe,09b4b07eb676..000000000000
+--- a/net/netfilter/nft_payload.c
++++ b/net/netfilter/nft_payload.c
+@@@ -17,15 -18,63 +18,63 @@@
+  #include <net/netfilter/nf_tables_core.h>
+  #include <net/netfilter/nf_tables.h>
+  
++ /* add vlan header into the user buffer for if tag was removed by offloads */
++ static bool
++ nft_payload_copy_vlan(u32 *d, const struct sk_buff *skb, u8 offset, u8 len)
++ {
++ 	int mac_off = skb_mac_header(skb) - skb->data;
++ 	u8 vlan_len, *vlanh, *dst_u8 = (u8 *) d;
++ 	struct vlan_ethhdr veth;
++ 
++ 	vlanh = (u8 *) &veth;
++ 	if (offset < ETH_HLEN) {
++ 		u8 ethlen = min_t(u8, len, ETH_HLEN - offset);
++ 
++ 		if (skb_copy_bits(skb, mac_off, &veth, ETH_HLEN))
++ 			return false;
++ 
++ 		veth.h_vlan_proto = skb->vlan_proto;
++ 
++ 		memcpy(dst_u8, vlanh + offset, ethlen);
++ 
++ 		len -= ethlen;
++ 		if (len == 0)
++ 			return true;
++ 
++ 		dst_u8 += ethlen;
++ 		offset = ETH_HLEN;
++ 	} else if (offset >= VLAN_ETH_HLEN) {
++ 		offset -= VLAN_HLEN;
++ 		goto skip;
++ 	}
++ 
++ 	veth.h_vlan_TCI = htons(skb_vlan_tag_get(skb));
++ 	veth.h_vlan_encapsulated_proto = skb->protocol;
++ 
++ 	vlanh += offset;
++ 
++ 	vlan_len = min_t(u8, len, VLAN_ETH_HLEN - offset);
++ 	memcpy(dst_u8, vlanh, vlan_len);
++ 
++ 	len -= vlan_len;
++ 	if (!len)
++ 		return true;
++ 
++ 	dst_u8 += vlan_len;
++  skip:
++ 	return skb_copy_bits(skb, offset + mac_off, dst_u8, len) == 0;
++ }
++ 
+  static void nft_payload_eval(const struct nft_expr *expr,
+ -			     struct nft_regs *regs,
+ +			     struct nft_data data[NFT_REG_MAX + 1],
+  			     const struct nft_pktinfo *pkt)
+  {
+  	const struct nft_payload *priv = nft_expr_priv(expr);
+  	const struct sk_buff *skb = pkt->skb;
+ -	u32 *dest = &regs->data[priv->dreg];
+ +	struct nft_data *dest = &data[priv->dreg];
+  	int offset;
+  
++ 	dest[priv->len / NFT_REG32_SIZE] = 0;
+  	switch (priv->base) {
+  	case NFT_PAYLOAD_LL_HEADER:
+  		if (!skb_mac_header_was_set(skb))
+@@@ -43,7 -99,7 +99,11 @@@
+  	}
+  	offset += priv->offset;
+  
+++<<<<<<< HEAD
+ +	if (skb_copy_bits(skb, offset, dest->data, priv->len) < 0)
+++=======
++ 	if (skb_copy_bits(skb, offset, dest, priv->len) < 0)
+++>>>>>>> 8cfd23e67401 (netfilter: nft_payload: work around vlan header stripping)
+  		goto err;
+  	return;
+  err:
+* Unmerged path net/netfilter/nft_payload.c
