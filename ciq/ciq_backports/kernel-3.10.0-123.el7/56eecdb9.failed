@@ -1,0 +1,205 @@
+mm: Use ptep/pmdp_set_numa() for updating _PAGE_NUMA bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] Use ptep/pmdp_set_numa() for updating _PAGE_NUMA bit (Steve Best) [1049012]
+Rebuild_FUZZ: 96.30%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 56eecdb912b536a4fa97fb5bfe5a940a54d79be6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/56eecdb9.failed
+
+Archs like ppc64 doesn't do tlb flush in set_pte/pmd functions when using
+a hash table MMU for various reasons (the flush is handled as part of
+the PTE modification when necessary).
+
+ppc64 thus doesn't implement flush_tlb_range for hash based MMUs.
+
+Additionally ppc64 require the tlb flushing to be batched within ptl locks.
+
+The reason to do that is to ensure that the hash page table is in sync with
+linux page table.
+
+We track the hpte index in linux pte and if we clear them without flushing
+hash and drop the ptl lock, we can have another cpu update the pte and can
+end up with duplicate entry in the hash table, which is fatal.
+
+We also want to keep set_pte_at simpler by not requiring them to do hash
+flush for performance reason. We do that by assuming that set_pte_at() is
+never *ever* called on a PTE that is already valid.
+
+This was the case until the NUMA code went in which broke that assumption.
+
+Fix that by introducing a new pair of helpers to set _PAGE_NUMA in a
+way similar to ptep/pmdp_set_wrprotect(), with a generic implementation
+using set_pte_at() and a powerpc specific one using the appropriate
+mechanism needed to keep the hash table in sync.
+
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 56eecdb912b536a4fa97fb5bfe5a940a54d79be6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+diff --cc mm/huge_memory.c
+index 2b345c81f273,da23eb96779f..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1516,12 -1562,7 +1516,16 @@@ int change_huge_pmd(struct vm_area_stru
+  				ret = HPAGE_PMD_NR;
+  			}
+  		}
+++<<<<<<< HEAD
+ +
+ +		/* Set PMD if cleared earlier */
+ +		if (ret == HPAGE_PMD_NR)
+ +			set_pmd_at(mm, addr, pmd, entry);
+ +
+ +		spin_unlock(&vma->vm_mm->page_table_lock);
+++=======
++ 		spin_unlock(ptl);
+++>>>>>>> 56eecdb912b5 (mm: Use ptep/pmdp_set_numa() for updating _PAGE_NUMA bit)
+  	}
+  
+  	return ret;
+diff --git a/arch/powerpc/include/asm/pgtable.h b/arch/powerpc/include/asm/pgtable.h
+index 95af8dc3bdc4..78784a7a2379 100644
+--- a/arch/powerpc/include/asm/pgtable.h
++++ b/arch/powerpc/include/asm/pgtable.h
+@@ -75,12 +75,34 @@ static inline pte_t pte_mknuma(pte_t pte)
+ 	return pte;
+ }
+ 
++#define ptep_set_numa ptep_set_numa
++static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pte_t *ptep)
++{
++	if ((pte_val(*ptep) & _PAGE_PRESENT) == 0)
++		VM_BUG_ON(1);
++
++	pte_update(mm, addr, ptep, _PAGE_PRESENT, _PAGE_NUMA, 0);
++	return;
++}
++
+ #define pmd_numa pmd_numa
+ static inline int pmd_numa(pmd_t pmd)
+ {
+ 	return pte_numa(pmd_pte(pmd));
+ }
+ 
++#define pmdp_set_numa pmdp_set_numa
++static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pmd_t *pmdp)
++{
++	if ((pmd_val(*pmdp) & _PAGE_PRESENT) == 0)
++		VM_BUG_ON(1);
++
++	pmd_hugepage_update(mm, addr, pmdp, _PAGE_PRESENT, _PAGE_NUMA);
++	return;
++}
++
+ #define pmd_mknonnuma pmd_mknonnuma
+ static inline pmd_t pmd_mknonnuma(pmd_t pmd)
+ {
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index 062e62d2f76a..4f3db0c202d9 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -642,6 +642,18 @@ static inline pte_t pte_mknuma(pte_t pte)
+ }
+ #endif
+ 
++#ifndef ptep_set_numa
++static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pte_t *ptep)
++{
++	pte_t ptent = *ptep;
++
++	ptent = pte_mknuma(ptent);
++	set_pte_at(mm, addr, ptep, ptent);
++	return;
++}
++#endif
++
+ #ifndef pmd_mknuma
+ static inline pmd_t pmd_mknuma(pmd_t pmd)
+ {
+@@ -649,6 +661,18 @@ static inline pmd_t pmd_mknuma(pmd_t pmd)
+ 	return pmd_clear_flags(pmd, _PAGE_PRESENT);
+ }
+ #endif
++
++#ifndef pmdp_set_numa
++static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pmd_t *pmdp)
++{
++	pmd_t pmd = *pmdp;
++
++	pmd = pmd_mknuma(pmd);
++	set_pmd_at(mm, addr, pmdp, pmd);
++	return;
++}
++#endif
+ #else
+ extern int pte_numa(pte_t pte);
+ extern int pmd_numa(pmd_t pmd);
+@@ -656,6 +680,8 @@ extern pte_t pte_mknonnuma(pte_t pte);
+ extern pmd_t pmd_mknonnuma(pmd_t pmd);
+ extern pte_t pte_mknuma(pte_t pte);
+ extern pmd_t pmd_mknuma(pmd_t pmd);
++extern void ptep_set_numa(struct mm_struct *mm, unsigned long addr, pte_t *ptep);
++extern void pmdp_set_numa(struct mm_struct *mm, unsigned long addr, pmd_t *pmdp);
+ #endif /* CONFIG_ARCH_USES_NUMA_PROT_NONE */
+ #else
+ static inline int pmd_numa(pmd_t pmd)
+@@ -683,10 +709,23 @@ static inline pte_t pte_mknuma(pte_t pte)
+ 	return pte;
+ }
+ 
++static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pte_t *ptep)
++{
++	return;
++}
++
++
+ static inline pmd_t pmd_mknuma(pmd_t pmd)
+ {
+ 	return pmd;
+ }
++
++static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
++				 pmd_t *pmdp)
++{
++	return ;
++}
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+ #endif /* CONFIG_MMU */
+* Unmerged path mm/huge_memory.c
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 39150957c01d..92d147b3638c 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -70,7 +70,6 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 			} else {
+ 				struct page *page;
+ 
+-				ptent = *pte;
+ 				page = vm_normal_page(vma, addr, oldpte);
+ 				if (page) {
+ 					int this_nid = page_to_nid(page);
+@@ -80,8 +79,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 						all_same_node = false;
+ 
+ 					if (!pte_numa(oldpte)) {
+-						ptent = pte_mknuma(ptent);
+-						set_pte_at(mm, addr, pte, ptent);
++						ptep_set_numa(mm, addr, pte);
+ 						updated = true;
+ 					}
+ 				}
