@@ -1,0 +1,146 @@
+net: replace remaining users of arch_fast_hash with jhash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] openvswitch: replace remaining users of arch_fast_hash with jhash (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 91.80%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit 87545899b52f9c8b1621be4347f443890c0cb196
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/87545899.failed
+
+This patch effectively reverts commit 500f80872645 ("net: ovs: use CRC32
+accelerated flow hash if available"), and other remaining arch_fast_hash()
+users such as from nfsd via commit 6282cd565553 ("NFSD: Don't hand out
+delegations for 30 seconds after recalling them.") where it has been used
+as a hash function for bloom filtering.
+
+While we think that these users are actually not much of concern, it has
+been requested to remove the arch_fast_hash() library bits that arose
+from [1] entirely as per recent discussion [2]. The main argument is that
+using it as a hash may introduce bias due to its linearity (see avalanche
+criterion) and thus makes it less clear (though we tried to document that)
+when this security/performance trade-off is actually acceptable for a
+general purpose library function.
+
+Lets therefore avoid any further confusion on this matter and remove it to
+prevent any future accidental misuse of it. For the time being, this is
+going to make hashing of flow keys a bit more expensive in the ovs case,
+but future work could reevaluate a different hashing discipline.
+
+  [1] https://patchwork.ozlabs.org/patch/299369/
+  [2] https://patchwork.ozlabs.org/patch/418756/
+
+	Cc: Neil Brown <neilb@suse.de>
+	Cc: Francesco Fusco <fusco@ntop.org>
+	Cc: Jesse Gross <jesse@nicira.com>
+	Cc: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 87545899b52f9c8b1621be4347f443890c0cb196)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 081be3ba9ea8,6c3c723e902b..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -531,8 -524,10 +531,13 @@@ static size_t rounded_hashtable_size(st
+   *	.head_offset = offsetof(struct test_obj, node),
+   *	.key_offset = offsetof(struct test_obj, key),
+   *	.key_len = sizeof(int),
+++<<<<<<< HEAD
+ + *	.hashfn = arch_fast_hash,
+++=======
++  *	.hashfn = jhash,
++  * #ifdef CONFIG_PROVE_LOCKING
+++>>>>>>> 87545899b52f (net: replace remaining users of arch_fast_hash with jhash)
+   *	.mutex_is_held = &my_mutex_is_held,
+ - * #endif
+   * };
+   *
+   * Configuration Example 2: Variable length keys
+@@@ -550,9 -545,11 +555,9 @@@
+   *
+   * struct rhashtable_params params = {
+   *	.head_offset = offsetof(struct test_obj, node),
+-  *	.hashfn = arch_fast_hash,
++  *	.hashfn = jhash,
+   *	.obj_hashfn = my_hash_fn,
+ - * #ifdef CONFIG_PROVE_LOCKING
+   *	.mutex_is_held = &my_mutex_is_held,
+ - * #endif
+   * };
+   */
+  int rhashtable_init(struct rhashtable *ht, struct rhashtable_params *params)
+@@@ -766,8 -778,10 +771,13 @@@ static int __init test_rht_init(void
+  		.head_offset = offsetof(struct test_obj, node),
+  		.key_offset = offsetof(struct test_obj, value),
+  		.key_len = sizeof(int),
+++<<<<<<< HEAD
+ +		.hashfn = arch_fast_hash,
+++=======
++ 		.hashfn = jhash,
++ #ifdef CONFIG_PROVE_LOCKING
+++>>>>>>> 87545899b52f (net: replace remaining users of arch_fast_hash with jhash)
+  		.mutex_is_held = &test_mutex_is_held,
+ -#endif
+  		.grow_decision = rht_grow_above_75,
+  		.shrink_decision = rht_shrink_below_30,
+  	};
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 551f32d7f5c7..08b05c0e90d1 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -41,7 +41,7 @@
+ #include <linux/ratelimit.h>
+ #include <linux/sunrpc/svcauth_gss.h>
+ #include <linux/sunrpc/addr.h>
+-#include <linux/hash.h>
++#include <linux/jhash.h>
+ #include "xdr4.h"
+ #include "xdr4cb.h"
+ #include "vfs.h"
+@@ -589,7 +589,7 @@ static int delegation_blocked(struct knfsd_fh *fh)
+ 		}
+ 		spin_unlock(&blocked_delegations_lock);
+ 	}
+-	hash = arch_fast_hash(&fh->fh_base, fh->fh_size, 0);
++	hash = jhash(&fh->fh_base, fh->fh_size, 0);
+ 	if (test_bit(hash&255, bd->set[0]) &&
+ 	    test_bit((hash>>8)&255, bd->set[0]) &&
+ 	    test_bit((hash>>16)&255, bd->set[0]))
+@@ -608,7 +608,7 @@ static void block_delegations(struct knfsd_fh *fh)
+ 	u32 hash;
+ 	struct bloom_pair *bd = &blocked_delegations;
+ 
+-	hash = arch_fast_hash(&fh->fh_base, fh->fh_size, 0);
++	hash = jhash(&fh->fh_base, fh->fh_size, 0);
+ 
+ 	spin_lock(&blocked_delegations_lock);
+ 	__set_bit(hash&255, bd->set[bd->new]);
+* Unmerged path lib/rhashtable.c
+diff --git a/net/openvswitch/flow_table.c b/net/openvswitch/flow_table.c
+index e0a7fefc1edf..5899bf161c61 100644
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@ -25,7 +25,7 @@
+ #include <linux/if_vlan.h>
+ #include <net/llc_pdu.h>
+ #include <linux/kernel.h>
+-#include <linux/hash.h>
++#include <linux/jhash.h>
+ #include <linux/jiffies.h>
+ #include <linux/llc.h>
+ #include <linux/module.h>
+@@ -366,7 +366,7 @@ static u32 flow_hash(const struct sw_flow_key *key, int key_start,
+ 	/* Make sure number of hash bytes are multiple of u32. */
+ 	BUILD_BUG_ON(sizeof(long) % sizeof(u32));
+ 
+-	return arch_fast_hash2(hash_key, hash_u32s, 0);
++	return jhash2(hash_key, hash_u32s, 0);
+ }
+ 
+ static int flow_key_start(const struct sw_flow_key *key)
