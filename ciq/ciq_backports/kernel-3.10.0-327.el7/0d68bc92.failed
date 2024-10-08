@@ -1,0 +1,146 @@
+perf kmem: Analyze page allocator events also
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] kmem: Analyze page allocator events also (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 94.12%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 0d68bc92c48167130b61b449f08be27dc862dba2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0d68bc92.failed
+
+The perf kmem command records and analyze kernel memory allocation only
+for SLAB objects.  This patch implement a simple page allocator analyzer
+using kmem:mm_page_alloc and kmem:mm_page_free events.
+
+It adds two new options of --slab and --page.  The --slab option is for
+analyzing SLAB allocator and that's what perf kmem currently does.
+
+The new --page option enables page allocator events and analyze kernel
+memory usage in page unit.  Currently, 'stat --alloc' subcommand is
+implemented only.
+
+If none of these --slab nor --page is specified, --slab is implied.
+
+First run 'perf kmem record' to generate a suitable perf.data file:
+
+  # perf kmem record --page sleep 5
+
+Then run 'perf kmem stat' to postprocess the perf.data file:
+
+  # perf kmem stat --page --alloc --line 10
+
+  -------------------------------------------------------------------------------
+   PFN              | Total alloc (KB) | Hits     | Order | Mig.type | GFP flags
+  -------------------------------------------------------------------------------
+            4045014 |               16 |        1 |     2 |  RECLAIM |  00285250
+            4143980 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3938658 |               16 |        1 |     2 |  RECLAIM |  00285250
+            4045400 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3568708 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3729824 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3657210 |               16 |        1 |     2 |  RECLAIM |  00285250
+            4120750 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3678850 |               16 |        1 |     2 |  RECLAIM |  00285250
+            3693874 |               16 |        1 |     2 |  RECLAIM |  00285250
+   ...              | ...              | ...      | ...   | ...      | ...
+  -------------------------------------------------------------------------------
+
+  SUMMARY (page allocator)
+  ========================
+  Total allocation requests     :           44,260   [          177,256 KB ]
+  Total free requests           :              117   [              468 KB ]
+
+  Total alloc+freed requests    :               49   [              196 KB ]
+  Total alloc-only requests     :           44,211   [          177,060 KB ]
+  Total free-only requests      :               68   [              272 KB ]
+
+  Total allocation failures     :                0   [                0 KB ]
+
+  Order     Unmovable   Reclaimable       Movable      Reserved  CMA/Isolated
+  -----  ------------  ------------  ------------  ------------  ------------
+      0            32             .        44,210             .             .
+      1             .             .             .             .             .
+      2             .            18             .             .             .
+      3             .             .             .             .             .
+      4             .             .             .             .             .
+      5             .             .             .             .             .
+      6             .             .             .             .             .
+      7             .             .             .             .             .
+      8             .             .             .             .             .
+      9             .             .             .             .             .
+     10             .             .             .             .             .
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Joonsoo Kim <js1304@gmail.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/1428298576-9785-4-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 0d68bc92c48167130b61b449f08be27dc862dba2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-kmem.c
+diff --cc tools/perf/builtin-kmem.c
+index 625af3a853c2,63ea01349b6e..000000000000
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@@ -426,10 -830,20 +830,25 @@@ static int __cmd_kmem(struct perf_sessi
+  		goto out;
+  	}
+  
++ 	evlist__for_each(session->evlist, evsel) {
++ 		if (!strcmp(perf_evsel__name(evsel), "kmem:mm_page_alloc") &&
++ 		    perf_evsel__field(evsel, "pfn")) {
++ 			use_pfn = true;
++ 			break;
++ 		}
++ 	}
++ 
+  	setup_pager();
+++<<<<<<< HEAD
+ +	err = perf_session__process_events(session, &perf_kmem);
+ +	if (err != 0)
+++=======
++ 	err = perf_session__process_events(session);
++ 	if (err != 0) {
++ 		pr_err("error during process events: %d\n", err);
+++>>>>>>> 0d68bc92c481 (perf kmem: Analyze page allocator events also)
+  		goto out;
++ 	}
+  	sort_result();
+  	print_result(session);
+  out:
+diff --git a/tools/perf/Documentation/perf-kmem.txt b/tools/perf/Documentation/perf-kmem.txt
+index 150253cc3c97..23219c65c16f 100644
+--- a/tools/perf/Documentation/perf-kmem.txt
++++ b/tools/perf/Documentation/perf-kmem.txt
+@@ -3,7 +3,7 @@ perf-kmem(1)
+ 
+ NAME
+ ----
+-perf-kmem - Tool to trace/measure kernel memory(slab) properties
++perf-kmem - Tool to trace/measure kernel memory properties
+ 
+ SYNOPSIS
+ --------
+@@ -46,6 +46,12 @@ OPTIONS
+ --raw-ip::
+ 	Print raw ip instead of symbol
+ 
++--slab::
++	Analyze SLAB allocator events.
++
++--page::
++	Analyze page allocator events
++
+ SEE ALSO
+ --------
+ linkperf:perf-record[1]
+* Unmerged path tools/perf/builtin-kmem.c
