@@ -1,0 +1,144 @@
+sched/core: Make dl_b->lock IRQ safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit 495163420ab5398c84af96ca3eae2c6aa4a140da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/49516342.failed
+
+Fix this lockdep warning:
+
+[   44.804600] =========================================================
+[   44.805746] [ INFO: possible irq lock inversion dependency detected ]
+[   44.805746] 3.14.0-rc2-test+ #14 Not tainted
+[   44.805746] ---------------------------------------------------------
+[   44.805746] bash/3674 just changed the state of lock:
+[   44.805746]  (&dl_b->lock){+.....}, at: [<ffffffff8106ad15>] sched_rt_handler+0x132/0x248
+[   44.805746] but this lock was taken by another, HARDIRQ-safe lock in the past:
+[   44.805746]  (&rq->lock){-.-.-.}
+
+and interrupts could create inverse lock ordering between them.
+
+[   44.805746]
+[   44.805746] other info that might help us debug this:
+[   44.805746]  Possible interrupt unsafe locking scenario:
+[   44.805746]
+[   44.805746]        CPU0                    CPU1
+[   44.805746]        ----                    ----
+[   44.805746]   lock(&dl_b->lock);
+[   44.805746]                                local_irq_disable();
+[   44.805746]                                lock(&rq->lock);
+[   44.805746]                                lock(&dl_b->lock);
+[   44.805746]   <Interrupt>
+[   44.805746]     lock(&rq->lock);
+
+by making dl_b->lock acquiring always IRQ safe.
+
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1392107067-19907-3-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 495163420ab5398c84af96ca3eae2c6aa4a140da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index f167fdc57a94,33d030a133d2..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -7979,11 -7412,85 +7979,83 @@@ static int sched_rt_global_constraints(
+  	}
+  	raw_spin_unlock_irqrestore(&def_rt_bandwidth.rt_runtime_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ #endif /* CONFIG_RT_GROUP_SCHED */
++ 
++ static int sched_dl_global_constraints(void)
++ {
++ 	u64 runtime = global_rt_runtime();
++ 	u64 period = global_rt_period();
++ 	u64 new_bw = to_ratio(period, runtime);
++ 	int cpu, ret = 0;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Here we want to check the bandwidth not being set to some
++ 	 * value smaller than the currently allocated bandwidth in
++ 	 * any of the root_domains.
++ 	 *
++ 	 * FIXME: Cycling on all the CPUs is overdoing, but simpler than
++ 	 * cycling on root_domains... Discussion on different/better
++ 	 * solutions is welcome!
++ 	 */
++ 	for_each_possible_cpu(cpu) {
++ 		struct dl_bw *dl_b = dl_bw_of(cpu);
++ 
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		if (new_bw < dl_b->total_bw)
++ 			ret = -EBUSY;
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void sched_dl_do_global(void)
++ {
++ 	u64 new_bw = -1;
++ 	int cpu;
++ 	unsigned long flags;
++ 
++ 	def_dl_bandwidth.dl_period = global_rt_period();
++ 	def_dl_bandwidth.dl_runtime = global_rt_runtime();
++ 
++ 	if (global_rt_runtime() != RUNTIME_INF)
++ 		new_bw = to_ratio(global_rt_period(), global_rt_runtime());
++ 
++ 	/*
++ 	 * FIXME: As above...
++ 	 */
++ 	for_each_possible_cpu(cpu) {
++ 		struct dl_bw *dl_b = dl_bw_of(cpu);
++ 
++ 		raw_spin_lock_irqsave(&dl_b->lock, flags);
++ 		dl_b->bw = new_bw;
++ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
++ 	}
++ }
++ 
++ static int sched_rt_global_validate(void)
++ {
++ 	if (sysctl_sched_rt_period <= 0)
++ 		return -EINVAL;
++ 
++ 	if ((sysctl_sched_rt_runtime != RUNTIME_INF) &&
++ 		(sysctl_sched_rt_runtime > sysctl_sched_rt_period))
++ 		return -EINVAL;
++ 
+++>>>>>>> 495163420ab5 (sched/core: Make dl_b->lock IRQ safe)
+  	return 0;
+  }
+ +#endif /* CONFIG_RT_GROUP_SCHED */
+  
+ -static void sched_rt_do_global(void)
+ -{
+ -	def_rt_bandwidth.rt_runtime = global_rt_runtime();
+ -	def_rt_bandwidth.rt_period = ns_to_ktime(global_rt_period());
+ -}
+ -
+ -int sched_rt_handler(struct ctl_table *table, int write,
+ +int sched_rr_handler(struct ctl_table *table, int write,
+  		void __user *buffer, size_t *lenp,
+  		loff_t *ppos)
+  {
+* Unmerged path kernel/sched/core.c
