@@ -1,0 +1,522 @@
+x86/asm/tsc: Replace rdtscll() with native_read_tsc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] tsc: Replace rdtscll() with native_read_tsc() (Prarit Bhargava) [1302325]
+Rebuild_FUZZ: 91.84%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 87be28aaf1458445d5f648688c2eec0f13b8f3b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/87be28aa.failed
+
+Now that the ->read_tsc() paravirt hook is gone, rdtscll() is
+just a wrapper around native_read_tsc(). Unwrap it.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Huang Rui <ray.huang@amd.com>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Len Brown <lenb@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: kvm ML <kvm@vger.kernel.org>
+Link: http://lkml.kernel.org/r/d2449ae62c1b1fb90195bcfb19ef4a35883a04dc.1434501121.git.luto@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 87be28aaf1458445d5f648688c2eec0f13b8f3b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/aslr.c
+#	arch/x86/include/asm/msr.h
+#	arch/x86/kernel/apic/apic.c
+#	arch/x86/kernel/espfix_64.c
+#	arch/x86/kernel/tsc.c
+diff --cc arch/x86/include/asm/msr.h
+index de36f22eb0b9,7273b74e0f99..000000000000
+--- a/arch/x86/include/asm/msr.h
++++ b/arch/x86/include/asm/msr.h
+@@@ -194,6 -187,11 +194,14 @@@ do {							
+  
+  #define rdpmcl(counter, val) ((val) = native_read_pmc(counter))
+  
+++<<<<<<< HEAD
+++=======
++ #endif	/* !CONFIG_PARAVIRT */
++ 
++ #define rdtscl(low)						\
++ 	((low) = (u32)native_read_tsc())
++ 
+++>>>>>>> 87be28aaf145 (x86/asm/tsc: Replace rdtscll() with native_read_tsc())
+  #define rdtscp(low, high, aux)					\
+  do {                                                            \
+  	unsigned long long _val = native_read_tscp(&(aux));     \
+diff --cc arch/x86/kernel/apic/apic.c
+index 17b1e00dfdd2,51af1ed1ae2e..000000000000
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@@ -1294,10 -1206,10 +1294,10 @@@ void setup_local_APIC(void
+  	unsigned int value, queued;
+  	int i, j, acked = 0;
+  	unsigned long long tsc = 0, ntsc;
+ -	long long max_loops = cpu_khz ? cpu_khz : 1000000;
+ +	long long max_loops = cpu_khz;
+  
+  	if (cpu_has_tsc)
+- 		rdtscll(tsc);
++ 		tsc = native_read_tsc();
+  
+  	if (disable_apic) {
+  		disable_ioapic_support();
+@@@ -1391,8 -1292,8 +1391,13 @@@
+  			break;
+  		}
+  		if (queued) {
+++<<<<<<< HEAD
+ +			if (cpu_has_tsc) {
+ +				rdtscll(ntsc);
+++=======
++ 			if (cpu_has_tsc && cpu_khz) {
++ 				ntsc = native_read_tsc();
+++>>>>>>> 87be28aaf145 (x86/asm/tsc: Replace rdtscll() with native_read_tsc())
+  				max_loops = (cpu_khz << 10) - (ntsc - tsc);
+  			} else
+  				max_loops--;
+diff --cc arch/x86/kernel/tsc.c
+index 629006c0f4fe,e66f5dcaeb63..000000000000
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@@ -41,6 -41,234 +41,237 @@@ static int __read_mostly tsc_disabled 
+  static struct static_key __use_tsc = STATIC_KEY_INIT;
+  
+  int tsc_clocksource_reliable;
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Use a ring-buffer like data structure, where a writer advances the head by
++  * writing a new data entry and a reader advances the tail when it observes a
++  * new entry.
++  *
++  * Writers are made to wait on readers until there's space to write a new
++  * entry.
++  *
++  * This means that we can always use an {offset, mul} pair to compute a ns
++  * value that is 'roughly' in the right direction, even if we're writing a new
++  * {offset, mul} pair during the clock read.
++  *
++  * The down-side is that we can no longer guarantee strict monotonicity anymore
++  * (assuming the TSC was that to begin with), because while we compute the
++  * intersection point of the two clock slopes and make sure the time is
++  * continuous at the point of switching; we can no longer guarantee a reader is
++  * strictly before or after the switch point.
++  *
++  * It does mean a reader no longer needs to disable IRQs in order to avoid
++  * CPU-Freq updates messing with his times, and similarly an NMI reader will
++  * no longer run the risk of hitting half-written state.
++  */
++ 
++ struct cyc2ns {
++ 	struct cyc2ns_data data[2];	/*  0 + 2*24 = 48 */
++ 	struct cyc2ns_data *head;	/* 48 + 8    = 56 */
++ 	struct cyc2ns_data *tail;	/* 56 + 8    = 64 */
++ }; /* exactly fits one cacheline */
++ 
++ static DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
++ 
++ struct cyc2ns_data *cyc2ns_read_begin(void)
++ {
++ 	struct cyc2ns_data *head;
++ 
++ 	preempt_disable();
++ 
++ 	head = this_cpu_read(cyc2ns.head);
++ 	/*
++ 	 * Ensure we observe the entry when we observe the pointer to it.
++ 	 * matches the wmb from cyc2ns_write_end().
++ 	 */
++ 	smp_read_barrier_depends();
++ 	head->__count++;
++ 	barrier();
++ 
++ 	return head;
++ }
++ 
++ void cyc2ns_read_end(struct cyc2ns_data *head)
++ {
++ 	barrier();
++ 	/*
++ 	 * If we're the outer most nested read; update the tail pointer
++ 	 * when we're done. This notifies possible pending writers
++ 	 * that we've observed the head pointer and that the other
++ 	 * entry is now free.
++ 	 */
++ 	if (!--head->__count) {
++ 		/*
++ 		 * x86-TSO does not reorder writes with older reads;
++ 		 * therefore once this write becomes visible to another
++ 		 * cpu, we must be finished reading the cyc2ns_data.
++ 		 *
++ 		 * matches with cyc2ns_write_begin().
++ 		 */
++ 		this_cpu_write(cyc2ns.tail, head);
++ 	}
++ 	preempt_enable();
++ }
++ 
++ /*
++  * Begin writing a new @data entry for @cpu.
++  *
++  * Assumes some sort of write side lock; currently 'provided' by the assumption
++  * that cpufreq will call its notifiers sequentially.
++  */
++ static struct cyc2ns_data *cyc2ns_write_begin(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 	struct cyc2ns_data *data = c2n->data;
++ 
++ 	if (data == c2n->head)
++ 		data++;
++ 
++ 	/* XXX send an IPI to @cpu in order to guarantee a read? */
++ 
++ 	/*
++ 	 * When we observe the tail write from cyc2ns_read_end(),
++ 	 * the cpu must be done with that entry and its safe
++ 	 * to start writing to it.
++ 	 */
++ 	while (c2n->tail == data)
++ 		cpu_relax();
++ 
++ 	return data;
++ }
++ 
++ static void cyc2ns_write_end(int cpu, struct cyc2ns_data *data)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	/*
++ 	 * Ensure the @data writes are visible before we publish the
++ 	 * entry. Matches the data-depencency in cyc2ns_read_begin().
++ 	 */
++ 	smp_wmb();
++ 
++ 	ACCESS_ONCE(c2n->head) = data;
++ }
++ 
++ /*
++  * Accelerators for sched_clock()
++  * convert from cycles(64bits) => nanoseconds (64bits)
++  *  basic equation:
++  *              ns = cycles / (freq / ns_per_sec)
++  *              ns = cycles * (ns_per_sec / freq)
++  *              ns = cycles * (10^9 / (cpu_khz * 10^3))
++  *              ns = cycles * (10^6 / cpu_khz)
++  *
++  *      Then we use scaling math (suggested by george@mvista.com) to get:
++  *              ns = cycles * (10^6 * SC / cpu_khz) / SC
++  *              ns = cycles * cyc2ns_scale / SC
++  *
++  *      And since SC is a constant power of two, we can convert the div
++  *  into a shift.
++  *
++  *  We can use khz divisor instead of mhz to keep a better precision, since
++  *  cyc2ns_scale is limited to 10^6 * 2^10, which fits in 32 bits.
++  *  (mathieu.desnoyers@polymtl.ca)
++  *
++  *                      -johnstul@us.ibm.com "math is hard, lets go shopping!"
++  */
++ 
++ #define CYC2NS_SCALE_FACTOR 10 /* 2^10, carefully chosen */
++ 
++ static void cyc2ns_data_init(struct cyc2ns_data *data)
++ {
++ 	data->cyc2ns_mul = 0;
++ 	data->cyc2ns_shift = CYC2NS_SCALE_FACTOR;
++ 	data->cyc2ns_offset = 0;
++ 	data->__count = 0;
++ }
++ 
++ static void cyc2ns_init(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	cyc2ns_data_init(&c2n->data[0]);
++ 	cyc2ns_data_init(&c2n->data[1]);
++ 
++ 	c2n->head = c2n->data;
++ 	c2n->tail = c2n->data;
++ }
++ 
++ static inline unsigned long long cycles_2_ns(unsigned long long cyc)
++ {
++ 	struct cyc2ns_data *data, *tail;
++ 	unsigned long long ns;
++ 
++ 	/*
++ 	 * See cyc2ns_read_*() for details; replicated in order to avoid
++ 	 * an extra few instructions that came with the abstraction.
++ 	 * Notable, it allows us to only do the __count and tail update
++ 	 * dance when its actually needed.
++ 	 */
++ 
++ 	preempt_disable_notrace();
++ 	data = this_cpu_read(cyc2ns.head);
++ 	tail = this_cpu_read(cyc2ns.tail);
++ 
++ 	if (likely(data == tail)) {
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, CYC2NS_SCALE_FACTOR);
++ 	} else {
++ 		data->__count++;
++ 
++ 		barrier();
++ 
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, CYC2NS_SCALE_FACTOR);
++ 
++ 		barrier();
++ 
++ 		if (!--data->__count)
++ 			this_cpu_write(cyc2ns.tail, data);
++ 	}
++ 	preempt_enable_notrace();
++ 
++ 	return ns;
++ }
++ 
++ static void set_cyc2ns_scale(unsigned long cpu_khz, int cpu)
++ {
++ 	unsigned long long tsc_now, ns_now;
++ 	struct cyc2ns_data *data;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	sched_clock_idle_sleep_event();
++ 
++ 	if (!cpu_khz)
++ 		goto done;
++ 
++ 	data = cyc2ns_write_begin(cpu);
++ 
++ 	tsc_now = native_read_tsc();
++ 	ns_now = cycles_2_ns(tsc_now);
++ 
++ 	/*
++ 	 * Compute a new multiplier as per the above comment and ensure our
++ 	 * time function is continuous; see the comment near struct
++ 	 * cyc2ns_data.
++ 	 */
++ 	data->cyc2ns_mul =
++ 		DIV_ROUND_CLOSEST(NSEC_PER_MSEC << CYC2NS_SCALE_FACTOR,
++ 				  cpu_khz);
++ 	data->cyc2ns_shift = CYC2NS_SCALE_FACTOR;
++ 	data->cyc2ns_offset = ns_now -
++ 		mul_u64_u32_shr(tsc_now, data->cyc2ns_mul, CYC2NS_SCALE_FACTOR);
++ 
++ 	cyc2ns_write_end(cpu, data);
++ 
++ done:
++ 	sched_clock_idle_wakeup_event(0);
++ 	local_irq_restore(flags);
++ }
+++>>>>>>> 87be28aaf145 (x86/asm/tsc: Replace rdtscll() with native_read_tsc())
+  /*
+   * Scheduler clock - returns current time in nanosec units.
+   */
+@@@ -62,10 -290,10 +293,14 @@@ u64 native_sched_clock(void
+  	}
+  
+  	/* read the Time Stamp Counter: */
+++<<<<<<< HEAD
+ +	rdtscll(this_offset);
+++=======
++ 	tsc_now = native_read_tsc();
+++>>>>>>> 87be28aaf145 (x86/asm/tsc: Replace rdtscll() with native_read_tsc())
+  
+  	/* return the value in ns */
+ -	return cycles_2_ns(tsc_now);
+ +	return __cycles_2_ns(this_offset);
+  }
+  
+  /* We need to define a real function for sched_clock, to override the
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/kernel/espfix_64.c
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/include/asm/msr.h
+diff --git a/arch/x86/include/asm/tsc.h b/arch/x86/include/asm/tsc.h
+index 235be70d5bb4..389963569086 100644
+--- a/arch/x86/include/asm/tsc.h
++++ b/arch/x86/include/asm/tsc.h
+@@ -21,15 +21,12 @@ extern void disable_TSC(void);
+ 
+ static inline cycles_t get_cycles(void)
+ {
+-	unsigned long long ret = 0;
+-
+ #ifndef CONFIG_X86_TSC
+ 	if (!cpu_has_tsc)
+ 		return 0;
+ #endif
+-	rdtscll(ret);
+ 
+-	return ret;
++	return native_read_tsc();
+ }
+ 
+ static __always_inline cycles_t vget_cycles(void)
+diff --git a/arch/x86/kernel/apb_timer.c b/arch/x86/kernel/apb_timer.c
+index c9876efecafb..c4094f3f3e33 100644
+--- a/arch/x86/kernel/apb_timer.c
++++ b/arch/x86/kernel/apb_timer.c
+@@ -277,7 +277,7 @@ static int apbt_clocksource_register(void)
+ 
+ 	/* Verify whether apbt counter works */
+ 	t1 = dw_apb_clocksource_read(clocksource_apbt);
+-	rdtscll(start);
++	start = native_read_tsc();
+ 
+ 	/*
+ 	 * We don't know the TSC frequency yet, but waiting for
+@@ -287,7 +287,7 @@ static int apbt_clocksource_register(void)
+ 	 */
+ 	do {
+ 		rep_nop();
+-		rdtscll(now);
++		now = native_read_tsc();
+ 	} while ((now - start) < 200000UL);
+ 
+ 	/* APBT is the only always on clocksource, it has to work! */
+* Unmerged path arch/x86/kernel/apic/apic.c
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index cedd2739979e..fb0411e654c4 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -123,7 +123,7 @@ void mce_setup(struct mce *m)
+ {
+ 	memset(m, 0, sizeof(struct mce));
+ 	m->cpu = m->extcpu = smp_processor_id();
+-	rdtscll(m->tsc);
++	m->tsc = native_read_tsc();
+ 	/* We hope get_seconds stays lockless */
+ 	m->time = get_seconds();
+ 	m->cpuvendor = boot_cpu_data.x86_vendor;
+@@ -1785,7 +1785,7 @@ static void collect_tscs(void *data)
+ {
+ 	unsigned long *cpu_tsc = (unsigned long *)data;
+ 
+-	rdtscll(cpu_tsc[smp_processor_id()]);
++	cpu_tsc[smp_processor_id()] = native_read_tsc();
+ }
+ 
+ static int mce_apei_read_done;
+* Unmerged path arch/x86/kernel/espfix_64.c
+diff --git a/arch/x86/kernel/hpet.c b/arch/x86/kernel/hpet.c
+index e706fc6d00ba..9f45a0bc9e0b 100644
+--- a/arch/x86/kernel/hpet.c
++++ b/arch/x86/kernel/hpet.c
+@@ -766,7 +766,7 @@ static int hpet_clocksource_register(void)
+ 
+ 	/* Verify whether hpet counter works */
+ 	t1 = hpet_readl(HPET_COUNTER);
+-	rdtscll(start);
++	start = native_read_tsc();
+ 
+ 	/*
+ 	 * We don't know the TSC frequency yet, but waiting for
+@@ -776,7 +776,7 @@ static int hpet_clocksource_register(void)
+ 	 */
+ 	do {
+ 		rep_nop();
+-		rdtscll(now);
++		now = native_read_tsc();
+ 	} while ((now - start) < 200000UL);
+ 
+ 	if (t1 == hpet_readl(HPET_COUNTER)) {
+diff --git a/arch/x86/kernel/trace_clock.c b/arch/x86/kernel/trace_clock.c
+index 25b993729f9b..bd8f4d41bd56 100644
+--- a/arch/x86/kernel/trace_clock.c
++++ b/arch/x86/kernel/trace_clock.c
+@@ -15,7 +15,7 @@ u64 notrace trace_clock_x86_tsc(void)
+ 	u64 ret;
+ 
+ 	rdtsc_barrier();
+-	rdtscll(ret);
++	ret = native_read_tsc();
+ 
+ 	return ret;
+ }
+* Unmerged path arch/x86/kernel/tsc.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 5298e39bc414..f1c0facfbc77 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2166,7 +2166,7 @@ static u64 guest_read_tsc(void)
+ {
+ 	u64 host_tsc, tsc_offset;
+ 
+-	rdtscll(host_tsc);
++	host_tsc = native_read_tsc();
+ 	tsc_offset = vmcs_read64(TSC_OFFSET);
+ 	return host_tsc + tsc_offset;
+ }
+diff --git a/arch/x86/lib/delay.c b/arch/x86/lib/delay.c
+index 39d6a3db0b96..9a52ad0c0758 100644
+--- a/arch/x86/lib/delay.c
++++ b/arch/x86/lib/delay.c
+@@ -100,7 +100,7 @@ void use_tsc_delay(void)
+ int read_current_timer(unsigned long *timer_val)
+ {
+ 	if (delay_fn == delay_tsc) {
+-		rdtscll(*timer_val);
++		*timer_val = native_read_tsc();
+ 		return 0;
+ 	}
+ 	return -1;
+diff --git a/drivers/thermal/intel_powerclamp.c b/drivers/thermal/intel_powerclamp.c
+index fcd5313e35bd..7517f31e3a1d 100644
+--- a/drivers/thermal/intel_powerclamp.c
++++ b/drivers/thermal/intel_powerclamp.c
+@@ -340,7 +340,7 @@ static bool powerclamp_adjust_controls(unsigned int target_ratio,
+ 
+ 	/* check result for the last window */
+ 	msr_now = pkg_state_counter();
+-	rdtscll(tsc_now);
++	tsc_now = native_read_tsc();
+ 
+ 	/* calculate pkg cstate vs tsc ratio */
+ 	if (!msr_last || !tsc_last)
+@@ -482,7 +482,7 @@ static void poll_pkg_cstate(struct work_struct *dummy)
+ 	u64 val64;
+ 
+ 	msr_now = pkg_state_counter();
+-	rdtscll(tsc_now);
++	tsc_now = native_read_tsc();
+ 	jiffies_now = jiffies;
+ 
+ 	/* calculate pkg cstate vs tsc ratio */
+diff --git a/tools/power/cpupower/debug/kernel/cpufreq-test_tsc.c b/tools/power/cpupower/debug/kernel/cpufreq-test_tsc.c
+index 34bdeb11cbd8..0af65d7425d1 100644
+--- a/tools/power/cpupower/debug/kernel/cpufreq-test_tsc.c
++++ b/tools/power/cpupower/debug/kernel/cpufreq-test_tsc.c
+@@ -84,11 +84,11 @@ static int __init cpufreq_test_tsc(void)
+ 
+ 	printk(KERN_DEBUG "start--> \n");
+ 	then = read_pmtmr();
+-        rdtscll(then_tsc);
++	then_tsc = native_read_tsc();
+ 	for (i=0;i<20;i++) {
+ 		mdelay(100);
+ 		now = read_pmtmr();
+-		rdtscll(now_tsc);
++		now_tsc = native_read_tsc();
+ 		diff = (now - then) & 0xFFFFFF;
+ 		diff_tsc = now_tsc - then_tsc;
+ 		printk(KERN_DEBUG "t1: %08u t2: %08u diff_pmtmr: %08u diff_tsc: %016llu\n", then, now, diff, diff_tsc);
