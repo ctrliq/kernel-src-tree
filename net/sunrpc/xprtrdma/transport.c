@@ -577,7 +577,7 @@ xprt_rdma_free(void *buffer)
 	for (i = 0; req->rl_nchunks;) {
 		--req->rl_nchunks;
 		i += rpcrdma_deregister_external(
-			&req->rl_segments[i], r_xprt, NULL);
+			&req->rl_segments[i], r_xprt);
 	}
 
 	if (rep && wait_event_interruptible(rep->rr_unbind, !rep->rr_func)) {
