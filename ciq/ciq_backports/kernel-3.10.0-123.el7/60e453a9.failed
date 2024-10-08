@@ -1,0 +1,103 @@
+USBNET: fix handling padding packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Ming Lei <ming.lei@canonical.com>
+commit 60e453a940ac678565b6641d65f8c18541bb9f28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/60e453a9.failed
+
+Commit 638c5115a7949(USBNET: support DMA SG) introduces DMA SG
+if the usb host controller is capable of building packet from
+discontinuous buffers, but missed handling padding packet when
+building DMA SG.
+
+This patch attachs the pre-allocated padding packet at the
+end of the sg list, so padding packet can be sent to device
+if drivers require that.
+
+	Reported-by: David Laight <David.Laight@aculab.com>
+	Acked-by: Oliver Neukum <oliver@neukum.org>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 60e453a940ac678565b6641d65f8c18541bb9f28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/usbnet.c
+diff --cc drivers/net/usb/usbnet.c
+index d74de074a438,bf94e10a37c8..000000000000
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@@ -1223,6 -1232,39 +1223,42 @@@ EXPORT_SYMBOL_GPL(usbnet_tx_timeout)
+  
+  /*-------------------------------------------------------------------------*/
+  
+++<<<<<<< HEAD
+++=======
++ static int build_dma_sg(const struct sk_buff *skb, struct urb *urb)
++ {
++ 	unsigned num_sgs, total_len = 0;
++ 	int i, s = 0;
++ 
++ 	num_sgs = skb_shinfo(skb)->nr_frags + 1;
++ 	if (num_sgs == 1)
++ 		return 0;
++ 
++ 	/* reserve one for zero packet */
++ 	urb->sg = kmalloc((num_sgs + 1) * sizeof(struct scatterlist),
++ 			  GFP_ATOMIC);
++ 	if (!urb->sg)
++ 		return -ENOMEM;
++ 
++ 	urb->num_sgs = num_sgs;
++ 	sg_init_table(urb->sg, urb->num_sgs);
++ 
++ 	sg_set_buf(&urb->sg[s++], skb->data, skb_headlen(skb));
++ 	total_len += skb_headlen(skb);
++ 
++ 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
++ 		struct skb_frag_struct *f = &skb_shinfo(skb)->frags[i];
++ 
++ 		total_len += skb_frag_size(f);
++ 		sg_set_page(&urb->sg[i + s], f->page.p, f->size,
++ 				f->page_offset);
++ 	}
++ 	urb->transfer_buffer_length = total_len;
++ 
++ 	return 1;
++ }
++ 
+++>>>>>>> 60e453a940ac (USBNET: fix handling padding packet)
+  netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+  				     struct net_device *net)
+  {
+@@@ -1263,6 -1303,11 +1299,14 @@@
+  
+  	usb_fill_bulk_urb (urb, dev->udev, dev->out,
+  			skb->data, skb->len, tx_complete, skb);
+++<<<<<<< HEAD
+++=======
++ 	if (dev->can_dma_sg) {
++ 		if (build_dma_sg(skb, urb) < 0)
++ 			goto drop;
++ 	}
++ 	length = urb->transfer_buffer_length;
+++>>>>>>> 60e453a940ac (USBNET: fix handling padding packet)
+  
+  	/* don't assume the hardware handles USB_ZERO_PACKET
+  	 * NOTE:  strictly conforming cdc-ether devices should expect
+* Unmerged path drivers/net/usb/usbnet.c
+diff --git a/include/linux/usb/usbnet.h b/include/linux/usb/usbnet.h
+index 8fbc008e183e..d3e6a487b672 100644
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@ -41,6 +41,7 @@ struct usbnet {
+ 	struct usb_host_endpoint *status;
+ 	unsigned		maxpacket;
+ 	struct timer_list	delay;
++	const char		*padding_pkt;
+ 
+ 	/* protocol/interface state */
+ 	struct net_device	*net;
