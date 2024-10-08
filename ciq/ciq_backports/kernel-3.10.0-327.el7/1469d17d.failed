@@ -1,0 +1,202 @@
+PCI: pciehp: Handle invalid data when reading from non-existent devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [pci] pciehp: Handle invalid data when reading from non-existent devices (Jarod Wilson) [1108793 1172014]
+Rebuild_FUZZ: 96.35%
+commit-author Jarod Wilson <jarod@redhat.com>
+commit 1469d17dd341458267a08c8d8bb517cb986ec56d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1469d17d.failed
+
+It's platform-dependent, but an MMIO read to a non-existent PCI device
+generally returns data with all bits set.  This happens when the host
+bridge or Root Complex times out waiting for a response from the device and
+fabricates return data to complete the CPU's read.
+
+One example, reported in the bugzilla below, involved this hierarchy:
+
+  pci 0000:00:1c.0: PCI bridge to [bus 02-3a] Root Port
+  pci 0000:02:00.0: PCI bridge to [bus 03-0a] Upstream Port
+  pci 0000:03:03.0: PCI bridge to [bus 05-07] Downstream Port
+  pci 0000:05:00.0: PCI bridge to [bus 06-07] Thunderbolt Upstream Port
+  pci 0000:06:00.0: PCI bridge to [bus 07]    Thunderbolt Downstream Port
+  pci 0000:07:00.0: BCM57762 NIC
+
+Unplugging the Thunderbolt switch and the NIC below it resulted in this:
+
+  pciehp 0000:03:03.0: Surprise Removal
+  tg3 0000:07:00.0: tg3_abort_hw timed out, TX_MODE_ENABLE will not clear MAC_TX_MODE=ffffffff
+  pciehp 0000:06:00.0: unloading service driver pciehp
+  pciehp 0000:06:00.0: pcie_isr: intr_loc 11f
+  pciehp 0000:06:00.0: Switch interrupt received
+  pciehp 0000:06:00.0: Latch open on Slot
+  pciehp 0000:06:00.0: Attention button interrupt received
+  pciehp 0000:06:00.0: Button pressed on Slot
+  pciehp 0000:06:00.0: Presence/Notify input change
+  pciehp 0000:06:00.0: Card present on Slot
+  pciehp 0000:06:00.0: Power fault interrupt received
+  pciehp 0000:06:00.0: Data Link Layer State change
+  pciehp 0000:06:00.0: Link Up event
+
+The pciehp driver correctly noticed that the Thunderbolt switch (05:00.0
+and 06:00.0) and NIC (07:00.0) had been removed, and it called their driver
+remove methods.
+
+Since the NIC was already gone, tg3 received 0xffffffff when it tried to
+read from the device.  The resulting timeout is a tg3 issue and not of
+interest here.
+
+Similarly, since the 06:00.0 Thunderbolt switch was already gone,
+pcie_isr() received 0xffff when it tried to read PCI_EXP_SLTSTA, and pciehp
+thought that was valid status showing that many events had happened: the
+latch had been opened, the attention button had been pressed, a card was
+now present, and the link was now up.  These are all wrong, of course, but
+pciehp went on to try to power up and enumerate devices below the
+non-existent bridge:
+
+  pciehp 0000:06:00.0: PCI slot - powering on due to button press
+  pciehp 0000:06:00.0: Surprise Insertion
+  pci 0000:07:00.0 id reading try 50 times with interval 20 ms to get ffffffff
+
+[bhelgaas: changelog, also check in pcie_poll_cmd() & pcie_do_write_cmd()]
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=99841
+	Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Jarod Wilson <jarod@redhat.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 1469d17dd341458267a08c8d8bb517cb986ec56d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp_hpc.c
+diff --cc drivers/pci/hotplug/pciehp_hpc.c
+index 179da598c044,8f3d3cff3581..000000000000
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@@ -108,18 -108,15 +108,24 @@@ static int pcie_poll_cmd(struct control
+  {
+  	struct pci_dev *pdev = ctrl_dev(ctrl);
+  	u16 slot_status;
+ +	int timeout = 1000;
+  
+ -	while (true) {
+ +	pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
+ +	if (slot_status & PCI_EXP_SLTSTA_CC) {
+ +		pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+ +					   PCI_EXP_SLTSTA_CC);
+ +		return 1;
+ +	}
+ +	while (timeout > 0) {
+ +		msleep(10);
+ +		timeout -= 10;
+  		pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
++ 		if (slot_status == (u16) ~0) {
++ 			ctrl_info(ctrl, "%s: no response from device\n",
++ 				  __func__);
++ 			return 0;
++ 		}
++ 
+  		if (slot_status & PCI_EXP_SLTSTA_CC) {
+  			pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+  						   PCI_EXP_SLTSTA_CC);
+@@@ -129,18 -130,90 +135,62 @@@
+  	return 0;	/* timeout */
+  }
+  
+ -static void pcie_wait_cmd(struct controller *ctrl)
+ +static void pcie_wait_cmd(struct controller *ctrl, int poll)
+  {
+  	unsigned int msecs = pciehp_poll_mode ? 2500 : 1000;
+ -	unsigned long duration = msecs_to_jiffies(msecs);
+ -	unsigned long cmd_timeout = ctrl->cmd_started + duration;
+ -	unsigned long now, timeout;
+ +	unsigned long timeout = msecs_to_jiffies(msecs);
+  	int rc;
+  
+ -	/*
+ -	 * If the controller does not generate notifications for command
+ -	 * completions, we never need to wait between writes.
+ -	 */
+ -	if (NO_CMD_CMPL(ctrl))
+ -		return;
+ -
+ -	if (!ctrl->cmd_busy)
+ -		return;
+ -
+ -	/*
+ -	 * Even if the command has already timed out, we want to call
+ -	 * pcie_poll_cmd() so it can clear PCI_EXP_SLTSTA_CC.
+ -	 */
+ -	now = jiffies;
+ -	if (time_before_eq(cmd_timeout, now))
+ -		timeout = 1;
+ +	if (poll)
+ +		rc = pcie_poll_cmd(ctrl);
+  	else
+ -		timeout = cmd_timeout - now;
+ -
+ -	if (ctrl->slot_ctrl & PCI_EXP_SLTCTL_HPIE &&
+ -	    ctrl->slot_ctrl & PCI_EXP_SLTCTL_CCIE)
+  		rc = wait_event_timeout(ctrl->queue, !ctrl->cmd_busy, timeout);
+ -	else
+ -		rc = pcie_poll_cmd(ctrl, jiffies_to_msecs(timeout));
+ -
+ -	/*
+ -	 * Controllers with errata like Intel CF118 don't generate
+ -	 * completion notifications unless the power/indicator/interlock
+ -	 * control bits are changed.  On such controllers, we'll emit this
+ -	 * timeout message when we wait for completion of commands that
+ -	 * don't change those bits, e.g., commands that merely enable
+ -	 * interrupts.
+ -	 */
+  	if (!rc)
+++<<<<<<< HEAD
+ +		ctrl_dbg(ctrl, "Command not completed in 1000 msec\n");
+++=======
++ 		ctrl_info(ctrl, "Timeout on hotplug command %#06x (issued %u msec ago)\n",
++ 			  ctrl->slot_ctrl,
++ 			  jiffies_to_msecs(jiffies - ctrl->cmd_started));
++ }
++ 
++ static void pcie_do_write_cmd(struct controller *ctrl, u16 cmd,
++ 			      u16 mask, bool wait)
++ {
++ 	struct pci_dev *pdev = ctrl_dev(ctrl);
++ 	u16 slot_ctrl;
++ 
++ 	mutex_lock(&ctrl->ctrl_lock);
++ 
++ 	/*
++ 	 * Always wait for any previous command that might still be in progress
++ 	 */
++ 	pcie_wait_cmd(ctrl);
++ 
++ 	pcie_capability_read_word(pdev, PCI_EXP_SLTCTL, &slot_ctrl);
++ 	if (slot_ctrl == (u16) ~0) {
++ 		ctrl_info(ctrl, "%s: no response from device\n", __func__);
++ 		goto out;
++ 	}
++ 
++ 	slot_ctrl &= ~mask;
++ 	slot_ctrl |= (cmd & mask);
++ 	ctrl->cmd_busy = 1;
++ 	smp_mb();
++ 	pcie_capability_write_word(pdev, PCI_EXP_SLTCTL, slot_ctrl);
++ 	ctrl->cmd_started = jiffies;
++ 	ctrl->slot_ctrl = slot_ctrl;
++ 
++ 	/*
++ 	 * Optionally wait for the hardware to be ready for a new command,
++ 	 * indicating completion of the above issued command.
++ 	 */
++ 	if (wait)
++ 		pcie_wait_cmd(ctrl);
++ 
++ out:
++ 	mutex_unlock(&ctrl->ctrl_lock);
+++>>>>>>> 1469d17dd341 (PCI: pciehp: Handle invalid data when reading from non-existent devices)
+  }
+  
+  /**
+* Unmerged path drivers/pci/hotplug/pciehp_hpc.c
