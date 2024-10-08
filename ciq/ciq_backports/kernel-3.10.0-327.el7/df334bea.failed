@@ -1,0 +1,232 @@
+x86, irq: Introduce helper functions to release IOAPIC pin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq: Introduce helper functions to release IOAPIC pin (Steve Best) [1231358]
+Rebuild_FUZZ: 95.50%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit df334bead7e94772c41745af9f329383067d44ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/df334bea.failed
+
+Introduce function mp_unmap_irq() to release IOAPIC IRQ when IRQ is not
+used any more, which will typically called by pcibios_disabled_irq.
+
+And function mp_irqdomain_unmap() is a common implementation of
+irq_domain_ops.unmap for IOAPIC.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+Link: http://lkml.kernel.org/r/1402302011-23642-38-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit df334bead7e94772c41745af9f329383067d44ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/io_apic.h
+#	arch/x86/kernel/apic/io_apic.c
+diff --cc arch/x86/include/asm/io_apic.h
+index 7eb3755fee9a,0aeed5ca356e..000000000000
+--- a/arch/x86/include/asm/io_apic.h
++++ b/arch/x86/include/asm/io_apic.h
+@@@ -177,7 -186,14 +177,18 @@@ extern u32 gsi_top
+  extern int mp_find_ioapic(u32 gsi);
+  extern int mp_find_ioapic_pin(int ioapic, u32 gsi);
+  extern u32 mp_pin_to_gsi(int ioapic, int pin);
+++<<<<<<< HEAD
+ +extern void __init mp_register_ioapic(int id, u32 address, u32 gsi_base);
+++=======
++ extern int mp_map_gsi_to_irq(u32 gsi, unsigned int flags);
++ extern void mp_unmap_irq(int irq);
++ extern void __init mp_register_ioapic(int id, u32 address, u32 gsi_base,
++ 				      struct ioapic_domain_cfg *cfg);
++ extern int mp_irqdomain_map(struct irq_domain *domain, unsigned int virq,
++ 			    irq_hw_number_t hwirq);
++ extern void mp_irqdomain_unmap(struct irq_domain *domain, unsigned int virq);
++ extern int mp_set_gsi_attr(u32 gsi, int trigger, int polarity, int node);
+++>>>>>>> df334bead7e9 (x86, irq: Introduce helper functions to release IOAPIC pin)
+  extern void __init pre_init_apic_IRQ0(void);
+  
+  extern void mp_save_irq(struct mpc_intsrc *m);
+@@@ -219,10 -235,8 +230,15 @@@ static inline void ioapic_insert_resour
+  #define gsi_top (NR_IRQS_LEGACY)
+  static inline int mp_find_ioapic(u32 gsi) { return 0; }
+  static inline u32 mp_pin_to_gsi(int ioapic, int pin) { return UINT_MAX; }
+++<<<<<<< HEAD
+ +
+ +struct io_apic_irq_attr;
+ +static inline int io_apic_set_pci_routing(struct device *dev, int irq,
+ +		 struct io_apic_irq_attr *irq_attr) { return 0; }
+++=======
++ static inline int mp_map_gsi_to_irq(u32 gsi, unsigned int flags) { return gsi; }
++ static inline void mp_unmap_irq(int irq) { }
+++>>>>>>> df334bead7e9 (x86, irq: Introduce helper functions to release IOAPIC pin)
+  
+  static inline int save_ioapic_entries(void)
+  {
+diff --cc arch/x86/kernel/apic/io_apic.c
+index 07a33b81b46c,8d80a8f1d670..000000000000
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@@ -1026,9 -1115,50 +1041,34 @@@ static int pin_2_irq(int idx, int apic
+  	}
+  #endif
+  
+ -	return  mp_map_pin_to_irq(gsi, idx, ioapic, pin, flags);
+ -}
+ -
+ -int mp_map_gsi_to_irq(u32 gsi, unsigned int flags)
+ -{
+ -	int ioapic, pin, idx;
+ -
+ -	ioapic = mp_find_ioapic(gsi);
+ -	if (ioapic < 0)
+ -		return -1;
+ -
+ -	pin = mp_find_ioapic_pin(ioapic, gsi);
+ -	idx = find_irq_entry(ioapic, pin, mp_INT);
+ -	if ((flags & IOAPIC_MAP_CHECK) && idx < 0)
+ -		return -1;
+ -
+ -	return mp_map_pin_to_irq(gsi, idx, ioapic, pin, flags);
+ +	return irq;
+  }
+  
++ void mp_unmap_irq(int irq)
++ {
++ 	struct irq_data *data = irq_get_irq_data(irq);
++ 	struct mp_pin_info *info;
++ 	int ioapic, pin;
++ 
++ 	if (!data || !data->domain)
++ 		return;
++ 
++ 	ioapic = (int)(long)data->domain->host_data;
++ 	pin = (int)data->hwirq;
++ 	info = mp_pin_info(ioapic, pin);
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 	if (--info->count == 0) {
++ 		info->set = 0;
++ 		if (irq < nr_legacy_irqs() &&
++ 		    ioapics[ioapic].irqdomain_cfg.type == IOAPIC_DOMAIN_LEGACY)
++ 			mp_irqdomain_unmap(data->domain, irq);
++ 		else
++ 			irq_dispose_mapping(irq);
++ 	}
++ 	mutex_unlock(&ioapic_mutex);
++ }
++ 
+  /*
+   * Find a specific PCI IRQ entry.
+   * Not an __init, possibly needed by modules
+@@@ -3863,6 -3881,93 +3903,96 @@@ void __init mp_register_ioapic(int id, 
+  	nr_ioapics++;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mp_irqdomain_map(struct irq_domain *domain, unsigned int virq,
++ 		     irq_hw_number_t hwirq)
++ {
++ 	int ioapic = (int)(long)domain->host_data;
++ 	struct mp_pin_info *info = mp_pin_info(ioapic, hwirq);
++ 	struct io_apic_irq_attr attr;
++ 
++ 	/*
++ 	 * Skip the timer IRQ if there's a quirk handler installed and if it
++ 	 * returns 1:
++ 	 */
++ 	if (apic->multi_timer_check &&
++ 	    apic->multi_timer_check(ioapic, virq))
++ 		return 0;
++ 
++ 	/* Get default attribute if not set by caller yet */
++ 	if (!info->set) {
++ 		u32 gsi = mp_pin_to_gsi(ioapic, hwirq);
++ 
++ 		if (acpi_get_override_irq(gsi, &info->trigger,
++ 					  &info->polarity) < 0) {
++ 			/*
++ 			 * PCI interrupts are always polarity one level
++ 			 * triggered.
++ 			 */
++ 			info->trigger = 1;
++ 			info->polarity = 1;
++ 		}
++ 		info->node = NUMA_NO_NODE;
++ 		info->set = 1;
++ 	}
++ 	set_io_apic_irq_attr(&attr, ioapic, hwirq, info->trigger,
++ 			     info->polarity);
++ 
++ 	return io_apic_setup_irq_pin(virq, info->node, &attr);
++ }
++ 
++ void mp_irqdomain_unmap(struct irq_domain *domain, unsigned int virq)
++ {
++ 	struct irq_data *data = irq_get_irq_data(virq);
++ 	struct irq_cfg *cfg = irq_cfg(virq);
++ 	int ioapic = (int)(long)domain->host_data;
++ 	int pin = (int)data->hwirq;
++ 
++ 	/*
++ 	 * Skip the timer IRQ if there's a quirk handler installed and if it
++ 	 * returns 1:
++ 	 */
++ 	if (apic->multi_timer_check &&
++ 	    apic->multi_timer_check(ioapic, virq))
++ 		return;
++ 
++ 	ioapic_mask_entry(ioapic, pin);
++ 	__remove_pin_from_irq(cfg, ioapic, pin);
++ 	WARN_ON(cfg->irq_2_pin != NULL);
++ 	arch_teardown_hwirq(virq);
++ }
++ 
++ int mp_set_gsi_attr(u32 gsi, int trigger, int polarity, int node)
++ {
++ 	int ret = 0;
++ 	int ioapic, pin;
++ 	struct mp_pin_info *info;
++ 
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return -ENODEV;
++ 
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 	info = mp_pin_info(ioapic, pin);
++ 	trigger = trigger ? 1 : 0;
++ 	polarity = polarity ? 1 : 0;
++ 
++ 	mutex_lock(&ioapic_mutex);
++ 	if (!info->set) {
++ 		info->trigger = trigger;
++ 		info->polarity = polarity;
++ 		info->node = node;
++ 		info->set = 1;
++ 	} else if (info->trigger != trigger || info->polarity != polarity) {
++ 		ret = -EBUSY;
++ 	}
++ 	mutex_unlock(&ioapic_mutex);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> df334bead7e9 (x86, irq: Introduce helper functions to release IOAPIC pin)
+  /* Enable IOAPIC early just for system timer */
+  void __init pre_init_apic_IRQ0(void)
+  {
+* Unmerged path arch/x86/include/asm/io_apic.h
+* Unmerged path arch/x86/kernel/apic/io_apic.c
