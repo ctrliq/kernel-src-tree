@@ -1,0 +1,548 @@
+sched/numa: Add debugging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Ingo Molnar <mingo@kernel.org>
+commit b32e86b4301e345611f0446265f782a229faadf6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/b32e86b4.failed
+
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-53-git-send-email-mgorman@suse.de
+(cherry picked from commit b32e86b4301e345611f0446265f782a229faadf6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 98cee68da024,2876a37cdfc4..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -839,13 -879,362 +839,366 @@@ static unsigned int task_scan_max(struc
+  	return max(smin, smax);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Once a preferred node is selected the scheduler balancer will prefer moving
++  * a task to that node for sysctl_numa_balancing_settle_count number of PTE
++  * scans. This will give the process the chance to accumulate more faults on
++  * the preferred node but still allow the scheduler to move the task again if
++  * the nodes CPUs are overloaded.
++  */
++ unsigned int sysctl_numa_balancing_settle_count __read_mostly = 4;
++ 
++ struct numa_group {
++ 	atomic_t refcount;
++ 
++ 	spinlock_t lock; /* nr_tasks, tasks */
++ 	int nr_tasks;
++ 	pid_t gid;
++ 	struct list_head task_list;
++ 
++ 	struct rcu_head rcu;
++ 	atomic_long_t total_faults;
++ 	atomic_long_t faults[0];
++ };
++ 
++ pid_t task_numa_group_id(struct task_struct *p)
++ {
++ 	return p->numa_group ? p->numa_group->gid : 0;
++ }
++ 
++ static inline int task_faults_idx(int nid, int priv)
++ {
++ 	return 2 * nid + priv;
++ }
++ 
++ static inline unsigned long task_faults(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_faults)
++ 		return 0;
++ 
++ 	return p->numa_faults[task_faults_idx(nid, 0)] +
++ 		p->numa_faults[task_faults_idx(nid, 1)];
++ }
++ 
++ static inline unsigned long group_faults(struct task_struct *p, int nid)
++ {
++ 	if (!p->numa_group)
++ 		return 0;
++ 
++ 	return atomic_long_read(&p->numa_group->faults[2*nid]) +
++ 	       atomic_long_read(&p->numa_group->faults[2*nid+1]);
++ }
++ 
++ /*
++  * These return the fraction of accesses done by a particular task, or
++  * task group, on a particular numa node.  The group weight is given a
++  * larger multiplier, in order to group tasks together that are almost
++  * evenly spread out between numa nodes.
++  */
++ static inline unsigned long task_weight(struct task_struct *p, int nid)
++ {
++ 	unsigned long total_faults;
++ 
++ 	if (!p->numa_faults)
++ 		return 0;
++ 
++ 	total_faults = p->total_numa_faults;
++ 
++ 	if (!total_faults)
++ 		return 0;
++ 
++ 	return 1000 * task_faults(p, nid) / total_faults;
++ }
++ 
++ static inline unsigned long group_weight(struct task_struct *p, int nid)
++ {
++ 	unsigned long total_faults;
++ 
++ 	if (!p->numa_group)
++ 		return 0;
++ 
++ 	total_faults = atomic_long_read(&p->numa_group->total_faults);
++ 
++ 	if (!total_faults)
++ 		return 0;
++ 
++ 	return 1200 * group_faults(p, nid) / total_faults;
++ }
++ 
++ static unsigned long weighted_cpuload(const int cpu);
++ static unsigned long source_load(int cpu, int type);
++ static unsigned long target_load(int cpu, int type);
++ static unsigned long power_of(int cpu);
++ static long effective_load(struct task_group *tg, int cpu, long wl, long wg);
++ 
++ /* Cached statistics for all CPUs within a node */
++ struct numa_stats {
++ 	unsigned long nr_running;
++ 	unsigned long load;
++ 
++ 	/* Total compute capacity of CPUs on a node */
++ 	unsigned long power;
++ 
++ 	/* Approximate capacity in terms of runnable tasks on a node */
++ 	unsigned long capacity;
++ 	int has_capacity;
++ };
++ 
++ /*
++  * XXX borrowed from update_sg_lb_stats
++  */
++ static void update_numa_stats(struct numa_stats *ns, int nid)
++ {
++ 	int cpu;
++ 
++ 	memset(ns, 0, sizeof(*ns));
++ 	for_each_cpu(cpu, cpumask_of_node(nid)) {
++ 		struct rq *rq = cpu_rq(cpu);
++ 
++ 		ns->nr_running += rq->nr_running;
++ 		ns->load += weighted_cpuload(cpu);
++ 		ns->power += power_of(cpu);
++ 	}
++ 
++ 	ns->load = (ns->load * SCHED_POWER_SCALE) / ns->power;
++ 	ns->capacity = DIV_ROUND_CLOSEST(ns->power, SCHED_POWER_SCALE);
++ 	ns->has_capacity = (ns->nr_running < ns->capacity);
++ }
++ 
++ struct task_numa_env {
++ 	struct task_struct *p;
++ 
++ 	int src_cpu, src_nid;
++ 	int dst_cpu, dst_nid;
++ 
++ 	struct numa_stats src_stats, dst_stats;
++ 
++ 	int imbalance_pct, idx;
++ 
++ 	struct task_struct *best_task;
++ 	long best_imp;
++ 	int best_cpu;
++ };
++ 
++ static void task_numa_assign(struct task_numa_env *env,
++ 			     struct task_struct *p, long imp)
++ {
++ 	if (env->best_task)
++ 		put_task_struct(env->best_task);
++ 	if (p)
++ 		get_task_struct(p);
++ 
++ 	env->best_task = p;
++ 	env->best_imp = imp;
++ 	env->best_cpu = env->dst_cpu;
++ }
++ 
++ /*
++  * This checks if the overall compute and NUMA accesses of the system would
++  * be improved if the source tasks was migrated to the target dst_cpu taking
++  * into account that it might be best if task running on the dst_cpu should
++  * be exchanged with the source task
++  */
++ static void task_numa_compare(struct task_numa_env *env, long imp)
++ {
++ 	struct rq *src_rq = cpu_rq(env->src_cpu);
++ 	struct rq *dst_rq = cpu_rq(env->dst_cpu);
++ 	struct task_struct *cur;
++ 	long dst_load, src_load;
++ 	long load;
++ 
++ 	rcu_read_lock();
++ 	cur = ACCESS_ONCE(dst_rq->curr);
++ 	if (cur->pid == 0) /* idle */
++ 		cur = NULL;
++ 
++ 	/*
++ 	 * "imp" is the fault differential for the source task between the
++ 	 * source and destination node. Calculate the total differential for
++ 	 * the source task and potential destination task. The more negative
++ 	 * the value is, the more rmeote accesses that would be expected to
++ 	 * be incurred if the tasks were swapped.
++ 	 */
++ 	if (cur) {
++ 		/* Skip this swap candidate if cannot move to the source cpu */
++ 		if (!cpumask_test_cpu(env->src_cpu, tsk_cpus_allowed(cur)))
++ 			goto unlock;
++ 
++ 		imp += task_weight(cur, env->src_nid) +
++ 		       group_weight(cur, env->src_nid) -
++ 		       task_weight(cur, env->dst_nid) -
++ 		       group_weight(cur, env->dst_nid);
++ 	}
++ 
++ 	if (imp < env->best_imp)
++ 		goto unlock;
++ 
++ 	if (!cur) {
++ 		/* Is there capacity at our destination? */
++ 		if (env->src_stats.has_capacity &&
++ 		    !env->dst_stats.has_capacity)
++ 			goto unlock;
++ 
++ 		goto balance;
++ 	}
++ 
++ 	/* Balance doesn't matter much if we're running a task per cpu */
++ 	if (src_rq->nr_running == 1 && dst_rq->nr_running == 1)
++ 		goto assign;
++ 
++ 	/*
++ 	 * In the overloaded case, try and keep the load balanced.
++ 	 */
++ balance:
++ 	dst_load = env->dst_stats.load;
++ 	src_load = env->src_stats.load;
++ 
++ 	/* XXX missing power terms */
++ 	load = task_h_load(env->p);
++ 	dst_load += load;
++ 	src_load -= load;
++ 
++ 	if (cur) {
++ 		load = task_h_load(cur);
++ 		dst_load -= load;
++ 		src_load += load;
++ 	}
++ 
++ 	/* make src_load the smaller */
++ 	if (dst_load < src_load)
++ 		swap(dst_load, src_load);
++ 
++ 	if (src_load * env->imbalance_pct < dst_load * 100)
++ 		goto unlock;
++ 
++ assign:
++ 	task_numa_assign(env, cur, imp);
++ unlock:
++ 	rcu_read_unlock();
++ }
++ 
++ static void task_numa_find_cpu(struct task_numa_env *env, long imp)
++ {
++ 	int cpu;
++ 
++ 	for_each_cpu(cpu, cpumask_of_node(env->dst_nid)) {
++ 		/* Skip this CPU if the source task cannot migrate */
++ 		if (!cpumask_test_cpu(cpu, tsk_cpus_allowed(env->p)))
++ 			continue;
++ 
++ 		env->dst_cpu = cpu;
++ 		task_numa_compare(env, imp);
++ 	}
++ }
++ 
++ static int task_numa_migrate(struct task_struct *p)
++ {
++ 	struct task_numa_env env = {
++ 		.p = p,
++ 
++ 		.src_cpu = task_cpu(p),
++ 		.src_nid = task_node(p),
++ 
++ 		.imbalance_pct = 112,
++ 
++ 		.best_task = NULL,
++ 		.best_imp = 0,
++ 		.best_cpu = -1
++ 	};
++ 	struct sched_domain *sd;
++ 	unsigned long weight;
++ 	int nid, ret;
++ 	long imp;
++ 
++ 	/*
++ 	 * Pick the lowest SD_NUMA domain, as that would have the smallest
++ 	 * imbalance and would be the first to start moving tasks about.
++ 	 *
++ 	 * And we want to avoid any moving of tasks about, as that would create
++ 	 * random movement of tasks -- counter the numa conditions we're trying
++ 	 * to satisfy here.
++ 	 */
++ 	rcu_read_lock();
++ 	sd = rcu_dereference(per_cpu(sd_numa, env.src_cpu));
++ 	env.imbalance_pct = 100 + (sd->imbalance_pct - 100) / 2;
++ 	rcu_read_unlock();
++ 
++ 	weight = task_weight(p, env.src_nid) + group_weight(p, env.src_nid);
++ 	update_numa_stats(&env.src_stats, env.src_nid);
++ 	env.dst_nid = p->numa_preferred_nid;
++ 	imp = task_weight(p, env.dst_nid) + group_weight(p, env.dst_nid) - weight;
++ 	update_numa_stats(&env.dst_stats, env.dst_nid);
++ 
++ 	/* If the preferred nid has capacity, try to use it. */
++ 	if (env.dst_stats.has_capacity)
++ 		task_numa_find_cpu(&env, imp);
++ 
++ 	/* No space available on the preferred nid. Look elsewhere. */
++ 	if (env.best_cpu == -1) {
++ 		for_each_online_node(nid) {
++ 			if (nid == env.src_nid || nid == p->numa_preferred_nid)
++ 				continue;
++ 
++ 			/* Only consider nodes where both task and groups benefit */
++ 			imp = task_weight(p, nid) + group_weight(p, nid) - weight;
++ 			if (imp < 0)
++ 				continue;
++ 
++ 			env.dst_nid = nid;
++ 			update_numa_stats(&env.dst_stats, env.dst_nid);
++ 			task_numa_find_cpu(&env, imp);
++ 		}
++ 	}
++ 
++ 	/* No better CPU than the current one was found. */
++ 	if (env.best_cpu == -1)
++ 		return -EAGAIN;
++ 
++ 	if (env.best_task == NULL) {
++ 		int ret = migrate_task_to(p, env.best_cpu);
++ 		return ret;
++ 	}
++ 
++ 	ret = migrate_swap(p, env.best_task);
++ 	put_task_struct(env.best_task);
++ 	return ret;
++ }
++ 
++ /* Attempt to migrate a task to a CPU on the preferred node. */
++ static void numa_migrate_preferred(struct task_struct *p)
++ {
++ 	/* Success if task is already running on preferred CPU */
++ 	p->numa_migrate_retry = 0;
++ 	if (cpu_to_node(task_cpu(p)) == p->numa_preferred_nid) {
++ 		/*
++ 		 * If migration is temporarily disabled due to a task migration
++ 		 * then re-enable it now as the task is running on its
++ 		 * preferred node and memory should migrate locally
++ 		 */
++ 		if (!p->numa_migrate_seq)
++ 			p->numa_migrate_seq++;
++ 		return;
++ 	}
++ 
++ 	/* This task has no NUMA fault statistics yet */
++ 	if (unlikely(p->numa_preferred_nid == -1))
++ 		return;
++ 
++ 	/* Otherwise, try migrate to a CPU on the preferred node */
++ 	if (task_numa_migrate(p) != 0)
++ 		p->numa_migrate_retry = jiffies + HZ*5;
++ }
++ 
+++>>>>>>> b32e86b4301e (sched/numa: Add debugging)
+  static void task_numa_placement(struct task_struct *p)
+  {
+ -	int seq, nid, max_nid = -1, max_group_nid = -1;
+ -	unsigned long max_faults = 0, max_group_faults = 0;
+ -	spinlock_t *group_lock = NULL;
+ +	int seq, nid, max_nid = -1;
+ +	unsigned long max_faults = 0;
+  
+ +	if (!p->mm)	/* for example, ksmd faulting in a user's mm */
+ +		return;
+  	seq = ACCESS_ONCE(p->mm->numa_scan_seq);
+  	if (p->numa_scan_seq == seq)
+  		return;
+@@@ -911,7 -1511,14 +1264,18 @@@ void task_numa_fault(int node, int page
+  
+  	task_numa_placement(p);
+  
+++<<<<<<< HEAD
+ +	p->numa_faults_buffer[node] += pages;
+++=======
++ 	/* Retry task to preferred node migration if it previously failed */
++ 	if (p->numa_migrate_retry && time_after(jiffies, p->numa_migrate_retry))
++ 		numa_migrate_preferred(p);
++ 
++ 	if (migrated)
++ 		p->numa_pages_migrated += pages;
++ 
++ 	p->numa_faults_buffer[task_faults_idx(node, priv)] += pages;
+++>>>>>>> b32e86b4301e (sched/numa: Add debugging)
+  }
+  
+  static void reset_ptenuma_scan(struct task_struct *p)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 664a046b12fb..404766e948e7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1360,6 +1360,7 @@ struct task_struct {
+ 	unsigned long *numa_faults_buffer;
+ 
+ 	int numa_preferred_nid;
++	unsigned long numa_pages_migrated;
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+ 	struct rcu_head rcu;
+@@ -2567,6 +2568,11 @@ static inline unsigned int task_cpu(const struct task_struct *p)
+ 	return task_thread_info(p)->cpu;
+ }
+ 
++static inline int task_node(const struct task_struct *p)
++{
++	return cpu_to_node(task_cpu(p));
++}
++
+ extern void set_task_cpu(struct task_struct *p, unsigned int cpu);
+ 
+ #else
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 75024a673520..87596da6bce6 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -15,6 +15,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/kallsyms.h>
+ #include <linux/utsname.h>
++#include <linux/mempolicy.h>
+ 
+ #include "sched.h"
+ 
+@@ -137,6 +138,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
+ 	SEQ_printf(m, "%15Ld %15Ld %15Ld.%06ld %15Ld.%06ld %15Ld.%06ld",
+ 		0LL, 0LL, 0LL, 0L, 0LL, 0L, 0LL, 0L);
+ #endif
++#ifdef CONFIG_NUMA_BALANCING
++	SEQ_printf(m, " %d", cpu_to_node(task_cpu(p)));
++#endif
+ #ifdef CONFIG_CGROUP_SCHED
+ 	SEQ_printf(m, " %s", task_group_path(task_group(p)));
+ #endif
+@@ -159,7 +163,7 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
+ 	read_lock_irqsave(&tasklist_lock, flags);
+ 
+ 	do_each_thread(g, p) {
+-		if (!p->on_rq || task_cpu(p) != rq_cpu)
++		if (task_cpu(p) != rq_cpu)
+ 			continue;
+ 
+ 		print_task(m, rq, p);
+@@ -343,7 +347,7 @@ static void sched_debug_header(struct seq_file *m)
+ 	cpu_clk = local_clock();
+ 	local_irq_restore(flags);
+ 
+-	SEQ_printf(m, "Sched Debug Version: v0.10, %s %.*s\n",
++	SEQ_printf(m, "Sched Debug Version: v0.11, %s %.*s\n",
+ 		init_utsname()->release,
+ 		(int)strcspn(init_utsname()->version, " "),
+ 		init_utsname()->version);
+@@ -486,6 +490,56 @@ static int __init init_sched_debug_procfs(void)
+ 
+ __initcall(init_sched_debug_procfs);
+ 
++#define __P(F) \
++	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)F)
++#define P(F) \
++	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)p->F)
++#define __PN(F) \
++	SEQ_printf(m, "%-45s:%14Ld.%06ld\n", #F, SPLIT_NS((long long)F))
++#define PN(F) \
++	SEQ_printf(m, "%-45s:%14Ld.%06ld\n", #F, SPLIT_NS((long long)p->F))
++
++
++static void sched_show_numa(struct task_struct *p, struct seq_file *m)
++{
++#ifdef CONFIG_NUMA_BALANCING
++	struct mempolicy *pol;
++	int node, i;
++
++	if (p->mm)
++		P(mm->numa_scan_seq);
++
++	task_lock(p);
++	pol = p->mempolicy;
++	if (pol && !(pol->flags & MPOL_F_MORON))
++		pol = NULL;
++	mpol_get(pol);
++	task_unlock(p);
++
++	SEQ_printf(m, "numa_migrations, %ld\n", xchg(&p->numa_pages_migrated, 0));
++
++	for_each_online_node(node) {
++		for (i = 0; i < 2; i++) {
++			unsigned long nr_faults = -1;
++			int cpu_current, home_node;
++
++			if (p->numa_faults)
++				nr_faults = p->numa_faults[2*node + i];
++
++			cpu_current = !i ? (task_node(p) == node) :
++				(pol && node_isset(node, pol->v.nodes));
++
++			home_node = (p->numa_preferred_nid == node);
++
++			SEQ_printf(m, "numa_faults, %d, %d, %d, %d, %ld\n",
++				i, node, cpu_current, home_node, nr_faults);
++		}
++	}
++
++	mpol_put(pol);
++#endif
++}
++
+ void proc_sched_show_task(struct task_struct *p, struct seq_file *m)
+ {
+ 	unsigned long nr_switches;
+@@ -582,6 +636,8 @@ void proc_sched_show_task(struct task_struct *p, struct seq_file *m)
+ 		SEQ_printf(m, "%-35s:%21Ld\n",
+ 			   "clock-delta", (long long)(t1-t0));
+ 	}
++
++	sched_show_numa(p, m);
+ }
+ 
+ void proc_sched_set_task(struct task_struct *p)
+* Unmerged path kernel/sched/fair.c
