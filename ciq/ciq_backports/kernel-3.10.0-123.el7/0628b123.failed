@@ -1,0 +1,342 @@
+netfilter: nfnetlink: add batch support and use it from nf_tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 0628b123c96d126e617beb3b4fd63b874d0e4f17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0628b123.failed
+
+This patch adds a batch support to nfnetlink. Basically, it adds
+two new control messages:
+
+* NFNL_MSG_BATCH_BEGIN, that indicates the beginning of a batch,
+  the nfgenmsg->res_id indicates the nfnetlink subsystem ID.
+
+* NFNL_MSG_BATCH_END, that results in the invocation of the
+  ss->commit callback function. If not specified or an error
+  ocurred in the batch, the ss->abort function is invoked
+  instead.
+
+The end message represents the commit operation in nftables, the
+lack of end message results in an abort. This patch also adds the
+.call_batch function that is only called from the batch receival
+path.
+
+This patch adds atomic rule updates and dumps based on
+bitmask generations. This allows to atomically commit a set of
+rule-set updates incrementally without altering the internal
+state of existing nf_tables expressions/matches/targets.
+
+The idea consists of using a generation cursor of 1 bit and
+a bitmask of 2 bits per rule. Assuming the gencursor is 0,
+then the genmask (expressed as a bitmask) can be interpreted
+as:
+
+00 active in the present, will be active in the next generation.
+01 inactive in the present, will be active in the next generation.
+10 active in the present, will be deleted in the next generation.
+ ^
+ gencursor
+
+Once you invoke the transition to the next generation, the global
+gencursor is updated:
+
+00 active in the present, will be active in the next generation.
+01 active in the present, needs to zero its future, it becomes 00.
+10 inactive in the present, delete now.
+^
+gencursor
+
+If a dump is in progress and nf_tables enters a new generation,
+the dump will stop and return -EBUSY to let userspace know that
+it has to retry again. In order to invalidate dumps, a global
+genctr counter is increased everytime nf_tables enters a new
+generation.
+
+This new operation can be used from the user-space utility
+that controls the firewall, eg.
+
+nft -f restore
+
+The rule updates contained in `file' will be applied atomically.
+
+cat file
+-----
+add filter INPUT ip saddr 1.1.1.1 counter accept #1
+del filter INPUT ip daddr 2.2.2.2 counter drop   #2
+-EOF-
+
+Note that the rule 1 will be inactive until the transition to the
+next generation, the rule 2 will be evicted in the next generation.
+
+There is a penalty during the rule update due to the branch
+misprediction in the packet matching framework. But that should be
+quickly resolved once the iteration over the commit list that
+contain rules that require updates is finished.
+
+Event notification happens once the rule-set update has been
+committed. So we skip notifications is case the rule-set update
+is aborted, which can happen in case that the rule-set is tested
+to apply correctly.
+
+This patch squashed the following patches from Pablo:
+
+* nf_tables: atomic rule updates and dumps
+* nf_tables: get rid of per rule list_head for commits
+* nf_tables: use per netns commit list
+* nfnetlink: add batch support and use it from nf_tables
+* nf_tables: all rule updates are transactional
+* nf_tables: attach replacement rule after stale one
+* nf_tables: do not allow deletion/replacement of stale rules
+* nf_tables: remove unused NFTA_RULE_FLAGS
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 0628b123c96d126e617beb3b4fd63b874d0e4f17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	include/net/netns/nftables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nf_tables_core.c
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path include/net/netns/nftables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_core.c
+diff --git a/include/linux/netfilter/nfnetlink.h b/include/linux/netfilter/nfnetlink.h
+index cadb7402d7a7..683ebd4bf728 100644
+--- a/include/linux/netfilter/nfnetlink.h
++++ b/include/linux/netfilter/nfnetlink.h
+@@ -14,6 +14,9 @@ struct nfnl_callback {
+ 	int (*call_rcu)(struct sock *nl, struct sk_buff *skb, 
+ 		    const struct nlmsghdr *nlh,
+ 		    const struct nlattr * const cda[]);
++	int (*call_batch)(struct sock *nl, struct sk_buff *skb,
++			  const struct nlmsghdr *nlh,
++			  const struct nlattr * const cda[]);
+ 	const struct nla_policy *policy;	/* netlink attribute policy */
+ 	const u_int16_t attr_count;		/* number of nlattr's */
+ };
+@@ -23,6 +26,8 @@ struct nfnetlink_subsystem {
+ 	__u8 subsys_id;			/* nfnetlink subsystem ID */
+ 	__u8 cb_count;			/* number of callbacks */
+ 	const struct nfnl_callback *cb;	/* callback for individual types */
++	int (*commit)(struct sk_buff *skb);
++	int (*abort)(struct sk_buff *skb);
+ };
+ 
+ extern int nfnetlink_subsys_register(const struct nfnetlink_subsystem *n);
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path include/net/netns/nftables.h
+diff --git a/include/uapi/linux/netfilter/nfnetlink.h b/include/uapi/linux/netfilter/nfnetlink.h
+index 4a4efafad5f4..e292f3be0f64 100644
+--- a/include/uapi/linux/netfilter/nfnetlink.h
++++ b/include/uapi/linux/netfilter/nfnetlink.h
+@@ -53,4 +53,8 @@ struct nfgenmsg {
+ #define NFNL_SUBSYS_CTHELPER		9
+ #define NFNL_SUBSYS_COUNT		10
+ 
++/* Reserved control nfnetlink messages */
++#define NFNL_MSG_BATCH_BEGIN		NLMSG_MIN_TYPE
++#define NFNL_MSG_BATCH_END		NLMSG_MIN_TYPE+1
++
+ #endif /* _UAPI_NFNETLINK_H */
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_core.c
+diff --git a/net/netfilter/nfnetlink.c b/net/netfilter/nfnetlink.c
+index 572d87dc116f..027f16af51a0 100644
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@ -147,9 +147,6 @@ static int nfnetlink_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 	const struct nfnetlink_subsystem *ss;
+ 	int type, err;
+ 
+-	if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+-		return -EPERM;
+-
+ 	/* All the messages must at least contain nfgenmsg */
+ 	if (nlmsg_len(nlh) < sizeof(struct nfgenmsg))
+ 		return 0;
+@@ -217,9 +214,179 @@ replay:
+ 	}
+ }
+ 
++static void nfnetlink_rcv_batch(struct sk_buff *skb, struct nlmsghdr *nlh,
++				u_int16_t subsys_id)
++{
++	struct sk_buff *nskb, *oskb = skb;
++	struct net *net = sock_net(skb->sk);
++	const struct nfnetlink_subsystem *ss;
++	const struct nfnl_callback *nc;
++	bool success = true, done = false;
++	int err;
++
++	if (subsys_id >= NFNL_SUBSYS_COUNT)
++		return netlink_ack(skb, nlh, -EINVAL);
++replay:
++	nskb = netlink_skb_clone(oskb, GFP_KERNEL);
++	if (!nskb)
++		return netlink_ack(oskb, nlh, -ENOMEM);
++
++	nskb->sk = oskb->sk;
++	skb = nskb;
++
++	nfnl_lock(subsys_id);
++	ss = rcu_dereference_protected(table[subsys_id].subsys,
++				       lockdep_is_held(&table[subsys_id].mutex));
++	if (!ss) {
++#ifdef CONFIG_MODULES
++		nfnl_unlock(subsys_id);
++		request_module("nfnetlink-subsys-%d", subsys_id);
++		nfnl_lock(subsys_id);
++		ss = rcu_dereference_protected(table[subsys_id].subsys,
++					       lockdep_is_held(&table[subsys_id].mutex));
++		if (!ss)
++#endif
++		{
++			nfnl_unlock(subsys_id);
++			kfree_skb(nskb);
++			return netlink_ack(skb, nlh, -EOPNOTSUPP);
++		}
++	}
++
++	if (!ss->commit || !ss->abort) {
++		nfnl_unlock(subsys_id);
++		kfree_skb(nskb);
++		return netlink_ack(skb, nlh, -EOPNOTSUPP);
++	}
++
++	while (skb->len >= nlmsg_total_size(0)) {
++		int msglen, type;
++
++		nlh = nlmsg_hdr(skb);
++		err = 0;
++
++		if (nlh->nlmsg_len < NLMSG_HDRLEN) {
++			err = -EINVAL;
++			goto ack;
++		}
++
++		/* Only requests are handled by the kernel */
++		if (!(nlh->nlmsg_flags & NLM_F_REQUEST)) {
++			err = -EINVAL;
++			goto ack;
++		}
++
++		type = nlh->nlmsg_type;
++		if (type == NFNL_MSG_BATCH_BEGIN) {
++			/* Malformed: Batch begin twice */
++			success = false;
++			goto done;
++		} else if (type == NFNL_MSG_BATCH_END) {
++			done = true;
++			goto done;
++		} else if (type < NLMSG_MIN_TYPE) {
++			err = -EINVAL;
++			goto ack;
++		}
++
++		/* We only accept a batch with messages for the same
++		 * subsystem.
++		 */
++		if (NFNL_SUBSYS_ID(type) != subsys_id) {
++			err = -EINVAL;
++			goto ack;
++		}
++
++		nc = nfnetlink_find_client(type, ss);
++		if (!nc) {
++			err = -EINVAL;
++			goto ack;
++		}
++
++		{
++			int min_len = nlmsg_total_size(sizeof(struct nfgenmsg));
++			u_int8_t cb_id = NFNL_MSG_TYPE(nlh->nlmsg_type);
++			struct nlattr *cda[ss->cb[cb_id].attr_count + 1];
++			struct nlattr *attr = (void *)nlh + min_len;
++			int attrlen = nlh->nlmsg_len - min_len;
++
++			err = nla_parse(cda, ss->cb[cb_id].attr_count,
++					attr, attrlen, ss->cb[cb_id].policy);
++			if (err < 0)
++				goto ack;
++
++			if (nc->call_batch) {
++				err = nc->call_batch(net->nfnl, skb, nlh,
++						     (const struct nlattr **)cda);
++			}
++
++			/* The lock was released to autoload some module, we
++			 * have to abort and start from scratch using the
++			 * original skb.
++			 */
++			if (err == -EAGAIN) {
++				ss->abort(skb);
++				nfnl_unlock(subsys_id);
++				kfree_skb(nskb);
++				goto replay;
++			}
++		}
++ack:
++		if (nlh->nlmsg_flags & NLM_F_ACK || err) {
++			/* We don't stop processing the batch on errors, thus,
++			 * userspace gets all the errors that the batch
++			 * triggers.
++			 */
++			netlink_ack(skb, nlh, err);
++			if (err)
++				success = false;
++		}
++
++		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
++		if (msglen > skb->len)
++			msglen = skb->len;
++		skb_pull(skb, msglen);
++	}
++done:
++	if (success && done)
++		ss->commit(skb);
++	else
++		ss->abort(skb);
++
++	nfnl_unlock(subsys_id);
++	kfree_skb(nskb);
++}
++
+ static void nfnetlink_rcv(struct sk_buff *skb)
+ {
+-	netlink_rcv_skb(skb, &nfnetlink_rcv_msg);
++	struct nlmsghdr *nlh = nlmsg_hdr(skb);
++	struct net *net = sock_net(skb->sk);
++	int msglen;
++
++	if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
++		return netlink_ack(skb, nlh, -EPERM);
++
++	if (nlh->nlmsg_len < NLMSG_HDRLEN ||
++	    skb->len < nlh->nlmsg_len)
++		return;
++
++	if (nlh->nlmsg_type == NFNL_MSG_BATCH_BEGIN) {
++		struct nfgenmsg *nfgenmsg;
++
++		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
++		if (msglen > skb->len)
++			msglen = skb->len;
++
++		if (nlh->nlmsg_len < NLMSG_HDRLEN ||
++		    skb->len < NLMSG_HDRLEN + sizeof(struct nfgenmsg))
++			return;
++
++		nfgenmsg = nlmsg_data(nlh);
++		skb_pull(skb, msglen);
++		nfnetlink_rcv_batch(skb, nlh, nfgenmsg->res_id);
++	} else {
++		netlink_rcv_skb(skb, &nfnetlink_rcv_msg);
++	}
+ }
+ 
+ #ifdef CONFIG_MODULES
