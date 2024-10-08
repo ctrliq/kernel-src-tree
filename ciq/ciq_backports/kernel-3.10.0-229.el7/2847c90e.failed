@@ -1,0 +1,97 @@
+sched/fair: Care divide error in update_task_scan_period()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+commit 2847c90e1b3ae95379af24894fc4f98e7f2fd705
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2847c90e.failed
+
+While offling node by hot removing memory, the following divide error
+occurs:
+
+  divide error: 0000 [#1] SMP
+  [...]
+  Call Trace:
+   [...] handle_mm_fault
+   [...] ? try_to_wake_up
+   [...] ? wake_up_state
+   [...] __do_page_fault
+   [...] ? do_futex
+   [...] ? put_prev_entity
+   [...] ? __switch_to
+   [...] do_page_fault
+   [...] page_fault
+  [...]
+  RIP  [<ffffffff810a7081>] task_numa_fault
+   RSP <ffff88084eb2bcb0>
+
+The issue occurs as follows:
+  1. When page fault occurs and page is allocated from node 1,
+     task_struct->numa_faults_buffer_memory[] of node 1 is
+     incremented and p->numa_faults_locality[] is also incremented
+     as follows:
+
+     o numa_faults_buffer_memory[]       o numa_faults_locality[]
+              NR_NUMA_HINT_FAULT_TYPES
+             |      0     |     1     |
+     ----------------------------------  ----------------------
+      node 0 |      0     |     0     |   remote |      0     |
+      node 1 |      0     |     1     |   locale |      1     |
+     ----------------------------------  ----------------------
+
+  2. node 1 is offlined by hot removing memory.
+
+  3. When page fault occurs, fault_types[] is calculated by using
+     p->numa_faults_buffer_memory[] of all online nodes in
+     task_numa_placement(). But node 1 was offline by step 2. So
+     the fault_types[] is calculated by using only
+     p->numa_faults_buffer_memory[] of node 0. So both of fault_types[]
+     are set to 0.
+
+  4. The values(0) of fault_types[] pass to update_task_scan_period().
+
+  5. numa_faults_locality[1] is set to 1. So the following division is
+     calculated.
+
+        static void update_task_scan_period(struct task_struct *p,
+                                unsigned long shared, unsigned long private){
+        ...
+                ratio = DIV_ROUND_UP(private * NUMA_PERIOD_SLOTS, (private + shared));
+        }
+
+  6. But both of private and shared are set to 0. So divide error
+     occurs here.
+
+The divide error is rare case because the trigger is node offline.
+This patch always increments denominator for avoiding divide error.
+
+	Signed-off-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/54475703.8000505@jp.fujitsu.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2847c90e1b3ae95379af24894fc4f98e7f2fd705)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 32588e344590,e9abd4e4c5cb..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -1422,8 -1530,7 +1422,12 @@@ static void update_task_scan_period(str
+  		 * scanning faster if shared accesses dominate as it may
+  		 * simply bounce migrations uselessly
+  		 */
+++<<<<<<< HEAD
+ +		period_slot = DIV_ROUND_UP(diff, NUMA_PERIOD_SLOTS);
+ +		ratio = DIV_ROUND_UP(private * NUMA_PERIOD_SLOTS, (private + shared));
+++=======
++ 		ratio = DIV_ROUND_UP(private * NUMA_PERIOD_SLOTS, (private + shared + 1));
+++>>>>>>> 2847c90e1b3a (sched/fair: Care divide error in update_task_scan_period())
+  		diff = (diff * ratio) / NUMA_PERIOD_SLOTS;
+  	}
+  
+* Unmerged path kernel/sched/fair.c
