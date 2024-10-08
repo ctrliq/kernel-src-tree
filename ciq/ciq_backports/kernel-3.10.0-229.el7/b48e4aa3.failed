@@ -1,0 +1,118 @@
+ixgbe: Add timeout parameter to ixgbe_host_interface_command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Don Skidmore <donald.c.skidmore@intel.com>
+commit b48e4aa3e5ff6d2849f10f6619b591d8d1b0f2fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b48e4aa3.failed
+
+Since on X550 we use host interface commands to read,write and erase
+some commands require more time to complete. So this adds a timeout
+parameter to ixgbe_host_interface_command as wells as a return_data
+parameter allowing us to return with any data.
+
+	Signed-off-by: Don Skidmore <donald.c.skidmore@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit b48e4aa3e5ff6d2849f10f6619b591d8d1b0f2fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+index 67e475b3f1fc,7ed1e086c891..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+@@@ -3515,30 -3458,35 +3522,46 @@@ static u8 ixgbe_calculate_checksum(u8 *
+   *  else return IXGBE_ERR_HOST_INTERFACE_COMMAND.
+   **/
+  static s32 ixgbe_host_interface_command(struct ixgbe_hw *hw, u32 *buffer,
+- 					u32 length)
++ 					u32 length, u32 timeout,
++ 					bool return_data)
+  {
+- 	u32 hicr, i, bi;
++ 	u32 hicr, i, bi, fwsts;
+  	u32 hdr_size = sizeof(struct ixgbe_hic_hdr);
+- 	u8 buf_len, dword_len;
++ 	u16 buf_len, dword_len;
+  
+++<<<<<<< HEAD
+ +	s32 ret_val = 0;
+ +
+ +	if (length == 0 || length & 0x3 ||
+ +	    length > IXGBE_HI_MAX_BLOCK_BYTE_LENGTH) {
+ +		hw_dbg(hw, "Buffer length failure.\n");
+ +		ret_val = IXGBE_ERR_HOST_INTERFACE_COMMAND;
+ +		goto out;
+++=======
++ 	if (length == 0 || length > IXGBE_HI_MAX_BLOCK_BYTE_LENGTH) {
++ 		hw_dbg(hw, "Buffer length failure buffersize-%d.\n", length);
++ 		return IXGBE_ERR_HOST_INTERFACE_COMMAND;
+++>>>>>>> b48e4aa3e5ff (ixgbe: Add timeout parameter to ixgbe_host_interface_command)
+  	}
+  
++ 	/* Set bit 9 of FWSTS clearing FW reset indication */
++ 	fwsts = IXGBE_READ_REG(hw, IXGBE_FWSTS);
++ 	IXGBE_WRITE_REG(hw, IXGBE_FWSTS, fwsts | IXGBE_FWSTS_FWRI);
++ 
+  	/* Check that the host interface is enabled. */
+  	hicr = IXGBE_READ_REG(hw, IXGBE_HICR);
+  	if ((hicr & IXGBE_HICR_EN) == 0) {
+  		hw_dbg(hw, "IXGBE_HOST_EN bit disabled.\n");
+ -		return IXGBE_ERR_HOST_INTERFACE_COMMAND;
+ +		ret_val = IXGBE_ERR_HOST_INTERFACE_COMMAND;
+ +		goto out;
+  	}
+  
+- 	/* Calculate length in DWORDs */
++ 	/* Calculate length in DWORDs. We must be DWORD aligned */
++ 	if ((length % (sizeof(u32))) != 0) {
++ 		hw_dbg(hw, "Buffer length failure, not aligned to dword");
++ 		return IXGBE_ERR_INVALID_ARGUMENT;
++ 	}
++ 
+  	dword_len = length >> 2;
+  
+  	/*
+@@@ -3560,13 -3508,15 +3583,16 @@@
+  	}
+  
+  	/* Check command successful completion. */
+- 	if (i == IXGBE_HI_COMMAND_TIMEOUT ||
++ 	if ((timeout != 0 && i == timeout) ||
+  	    (!(IXGBE_READ_REG(hw, IXGBE_HICR) & IXGBE_HICR_SV))) {
+  		hw_dbg(hw, "Command has failed with no status valid.\n");
+ -		return IXGBE_ERR_HOST_INTERFACE_COMMAND;
+ +		ret_val = IXGBE_ERR_HOST_INTERFACE_COMMAND;
+ +		goto out;
+  	}
+  
++ 	if (!return_data)
++ 		return 0;
++ 
+  	/* Calculate length in DWORDs */
+  	dword_len = hdr_size >> 2;
+  
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+index 1a3e7f63308b..186c277a1a95 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -2264,9 +2264,12 @@ enum ixgbe_fdir_pballoc_type {
+ #define IXGBE_FDIR_DROP_QUEUE                   127
+ 
+ /* Manageablility Host Interface defines */
+-#define IXGBE_HI_MAX_BLOCK_BYTE_LENGTH       1792 /* Num of bytes in range */
+-#define IXGBE_HI_MAX_BLOCK_DWORD_LENGTH      448 /* Num of dwords in range */
+-#define IXGBE_HI_COMMAND_TIMEOUT             500 /* Process HI command limit */
++#define IXGBE_HI_MAX_BLOCK_BYTE_LENGTH	1792 /* Num of bytes in range */
++#define IXGBE_HI_MAX_BLOCK_DWORD_LENGTH	448 /* Num of dwords in range */
++#define IXGBE_HI_COMMAND_TIMEOUT	500 /* Process HI command limit */
++#define IXGBE_HI_FLASH_ERASE_TIMEOUT	1000 /* Process Erase command limit */
++#define IXGBE_HI_FLASH_UPDATE_TIMEOUT	5000 /* Process Update command limit */
++#define IXGBE_HI_FLASH_APPLY_TIMEOUT	0 /* Process Apply command limit */
+ 
+ /* CEM Support */
+ #define FW_CEM_HDR_LEN                0x4
