@@ -1,0 +1,173 @@
+fsnotify: Allocate overflow events with proper type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit ff57cd5863cf3014c1c5ed62ce2715294f065b17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ff57cd58.failed
+
+Commit 7053aee26a35 "fsnotify: do not share events between notification
+groups" used overflow event statically allocated in a group with the
+size of the generic notification event. This causes problems because
+some code looks at type specific parts of event structure and gets
+confused by a random data it sees there and causes crashes.
+
+Fix the problem by allocating overflow event with type corresponding to
+the group type so code cannot get confused.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit ff57cd5863cf3014c1c5ed62ce2715294f065b17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify_user.c
+#	fs/notify/notification.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/fanotify/fanotify_user.c
+index 8ef1b0f829ee,287a22c04149..000000000000
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@@ -706,10 -731,20 +707,25 @@@ SYSCALL_DEFINE2(fanotify_init, unsigne
+  	group->fanotify_data.user = user;
+  	atomic_inc(&user->fanotify_listeners);
+  
+++<<<<<<< HEAD
+ +	if (force_o_largefile())
+ +		event_f_flags |= O_LARGEFILE;
+++=======
++ 	oevent = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (unlikely(!oevent)) {
++ 		fd = -ENOMEM;
++ 		goto out_destroy_group;
++ 	}
++ 	group->overflow_event = &oevent->fse;
++ 	fsnotify_init_event(group->overflow_event, NULL, FS_Q_OVERFLOW);
++ 	oevent->tgid = get_pid(task_tgid(current));
++ 	oevent->path.mnt = NULL;
++ 	oevent->path.dentry = NULL;
++ 
+++>>>>>>> ff57cd5863cf (fsnotify: Allocate overflow events with proper type)
+  	group->fanotify_data.f_flags = event_f_flags;
+  #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	oevent->response = 0;
+  	mutex_init(&group->fanotify_data.access_mutex);
+  	init_waitqueue_head(&group->fanotify_data.access_waitq);
+  	INIT_LIST_HEAD(&group->fanotify_data.access_list);
+diff --cc fs/notify/notification.c
+index a03904d119e4,1e58402171a5..000000000000
+--- a/fs/notify/notification.c
++++ b/fs/notify/notification.c
+@@@ -166,30 -96,14 +166,41 @@@ alloc_holder
+  	mutex_lock(&group->notification_mutex);
+  
+  	if (group->q_len >= group->max_events) {
+++<<<<<<< HEAD
+ +		struct fsnotify_event_holder *last_holder;
+ +
+ +		last_holder = list_entry(list->prev, struct fsnotify_event_holder, event_list);
+ +
+ +		/* overflow event already last?  Don't add another */
+ +		if (last_holder->event == q_overflow_event) {
+ +			if (holder != &q_overflow_event->holder)
+ +				fsnotify_destroy_event_holder(holder);
+ +			fsnotify_get_event(q_overflow_event);
+++=======
++ 		ret = 2;
++ 		/* Queue overflow event only if it isn't already queued */
++ 		if (!list_empty(&group->overflow_event->list)) {
+++>>>>>>> ff57cd5863cf (fsnotify: Allocate overflow events with proper type)
+  			mutex_unlock(&group->notification_mutex);
+ -			return ret;
+ +			return q_overflow_event;
+  		}
+++<<<<<<< HEAD
+ +
+ +		event = q_overflow_event;
+ +
+ +		/*
+ +		 * we need to return the overflow event
+ +		 * which means we need a ref
+ +		 */
+ +		fsnotify_get_event(event);
+ +		return_event = event;
+ +
+ +		/* sorry, no private data on the overflow event */
+ +		priv = NULL;
+++=======
++ 		event = group->overflow_event;
++ 		goto queue;
+++>>>>>>> ff57cd5863cf (fsnotify: Allocate overflow events with proper type)
+  	}
+  
+  	if (!list_empty(list) && merge) {
+diff --cc include/linux/fsnotify_backend.h
+index 4b2ee8d12f5e,64cf3ef50696..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -148,7 -158,11 +148,15 @@@ struct fsnotify_group 
+  					 * a group */
+  	struct list_head marks_list;	/* all inode marks for this group */
+  
+++<<<<<<< HEAD
+ +	struct fasync_struct    *fsn_fa;    /* async notification */
+++=======
++ 	struct fasync_struct *fsn_fa;    /* async notification */
++ 
++ 	struct fsnotify_event *overflow_event;	/* Event we queue when the
++ 						 * notification list is too
++ 						 * full */
+++>>>>>>> ff57cd5863cf (fsnotify: Allocate overflow events with proper type)
+  
+  	/* groups can define private fields here or use the void *private */
+  	union {
+* Unmerged path fs/notify/fanotify/fanotify_user.c
+diff --git a/fs/notify/group.c b/fs/notify/group.c
+index bd2625bd88b4..ad1995980456 100644
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@ -55,6 +55,13 @@ void fsnotify_destroy_group(struct fsnotify_group *group)
+ 	/* clear the notification queue of all events */
+ 	fsnotify_flush_notify(group);
+ 
++	/*
++	 * Destroy overflow event (we cannot use fsnotify_destroy_event() as
++	 * that deliberately ignores overflow events.
++	 */
++	if (group->overflow_event)
++		group->ops->free_event(group->overflow_event);
++
+ 	fsnotify_put_group(group);
+ }
+ 
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 5fc2bfa3a6c1..464dff39c202 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -681,11 +681,23 @@ retry:
+ static struct fsnotify_group *inotify_new_group(unsigned int max_events)
+ {
+ 	struct fsnotify_group *group;
++	struct inotify_event_info *oevent;
+ 
+ 	group = fsnotify_alloc_group(&inotify_fsnotify_ops);
+ 	if (IS_ERR(group))
+ 		return group;
+ 
++	oevent = kmalloc(sizeof(struct inotify_event_info), GFP_KERNEL);
++	if (unlikely(!oevent)) {
++		fsnotify_destroy_group(group);
++		return ERR_PTR(-ENOMEM);
++	}
++	group->overflow_event = &oevent->fse;
++	fsnotify_init_event(group->overflow_event, NULL, FS_Q_OVERFLOW);
++	oevent->wd = -1;
++	oevent->sync_cookie = 0;
++	oevent->name_len = 0;
++
+ 	group->max_events = max_events;
+ 
+ 	spin_lock_init(&group->inotify_data.idr_lock);
+* Unmerged path fs/notify/notification.c
+* Unmerged path include/linux/fsnotify_backend.h
