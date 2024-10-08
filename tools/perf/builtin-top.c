@@ -188,8 +188,6 @@ static void perf_top__record_precise_ip(struct perf_top *top,
 	if (pthread_mutex_trylock(&notes->lock))
 		return;
 
-	ip = he->ms.map->map_ip(he->ms.map, ip);
-
 	if (ui__has_annotation())
 		err = hist_entry__inc_addr_samples(he, counter, ip);
 
@@ -686,14 +684,8 @@ static int hist_iter__top_callback(struct hist_entry_iter *iter,
 	struct hist_entry *he = iter->he;
 	struct perf_evsel *evsel = iter->evsel;
 
-	if (sort__has_sym && single) {
-		u64 ip = al->addr;
-
-		if (al->map)
-			ip = al->map->unmap_ip(al->map, ip);
-
-		perf_top__record_precise_ip(top, he, evsel->idx, ip);
-	}
+	if (sort__has_sym && single)
+		perf_top__record_precise_ip(top, he, evsel->idx, al->addr);
 
 	return 0;
 }
