@@ -1,0 +1,898 @@
+move d_rcu from overlapping d_child to overlapping d_alias
+
+jira LE-1907
+cve CVE-2014-8559
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] dcache: move d_rcu from overlapping d_child to overlapping d_alias (Denys Vlasenko) [1173813] {CVE-2014-8559}
+Rebuild_FUZZ: 93.55%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 946e51f2bf37f1656916eb75bd0742ba33983c28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/946e51f2.failed
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 946e51f2bf37f1656916eb75bd0742ba33983c28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/lustre/lustre/llite/dcache.c
+#	drivers/staging/lustre/lustre/llite/llite_lib.c
+#	drivers/staging/lustre/lustre/llite/namei.c
+#	fs/dcache.c
+#	fs/debugfs/inode.c
+#	fs/libfs.c
+#	fs/ncpfs/dir.c
+#	fs/ncpfs/ncplib_kernel.h
+diff --cc fs/dcache.c
+index 3af919733a87,8b4c45e40834..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -218,22 -252,31 +218,48 @@@ static void __d_free(struct rcu_head *h
+  {
+  	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+  
+++<<<<<<< HEAD
+ +	WARN_ON(!hlist_unhashed(&dentry->d_alias));
+ +	if (dname_external(dentry))
+ +		kfree(dentry->d_name.name);
+++=======
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  	kmem_cache_free(dentry_cache, dentry); 
+  }
+  
+ -static void __d_free_external(struct rcu_head *head)
+ +/*
+ + * no locks, please.
+ + */
+ +static void d_free(struct dentry *dentry)
+  {
+++<<<<<<< HEAD
+ +	BUG_ON((int)dentry->d_lockref.count > 0);
+ +	this_cpu_dec(nr_dentry);
+ +	if (dentry->d_op && dentry->d_op->d_release)
+ +		dentry->d_op->d_release(dentry);
+ +
+++=======
++ 	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
++ 	kfree(external_name(dentry));
++ 	kmem_cache_free(dentry_cache, dentry); 
++ }
++ 
++ static inline int dname_external(const struct dentry *dentry)
++ {
++ 	return dentry->d_name.name != dentry->d_iname;
++ }
++ 
++ static void dentry_free(struct dentry *dentry)
++ {
++ 	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
++ 	if (unlikely(dname_external(dentry))) {
++ 		struct external_name *p = external_name(dentry);
++ 		if (likely(atomic_dec_and_test(&p->u.count))) {
++ 			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
++ 			return;
++ 		}
++ 	}
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  	/* if dentry was never visible to RCU, immediate free is OK */
+  	if (!(dentry->d_flags & DCACHE_RCUACCESS))
+  		__d_free(&dentry->d_u.d_rcu);
+@@@ -478,13 -486,108 +504,109 @@@ relock
+  	 * inform the fs via d_prune that this dentry is about to be
+  	 * unhashed and destroyed.
+  	 */
+ -	if (dentry->d_flags & DCACHE_OP_PRUNE)
+ +	if ((dentry->d_flags & DCACHE_OP_PRUNE) && !d_unhashed(dentry))
+  		dentry->d_op->d_prune(dentry);
+  
+ -	if (dentry->d_flags & DCACHE_LRU_LIST) {
+ -		if (!(dentry->d_flags & DCACHE_SHRINK_LIST))
+ -			d_lru_del(dentry);
+ -	}
+ +	dentry_lru_del(dentry);
+  	/* if it was on the hash then remove it */
+  	__d_drop(dentry);
+++<<<<<<< HEAD
+ +	return d_kill(dentry, parent);
+++=======
++ 	list_del(&dentry->d_child);
++ 	/*
++ 	 * Inform d_walk() that we are no longer attached to the
++ 	 * dentry tree
++ 	 */
++ 	dentry->d_flags |= DCACHE_DENTRY_KILLED;
++ 	if (parent)
++ 		spin_unlock(&parent->d_lock);
++ 	dentry_iput(dentry);
++ 	/*
++ 	 * dentry_iput drops the locks, at which point nobody (except
++ 	 * transient RCU lookups) can reach this dentry.
++ 	 */
++ 	BUG_ON((int)dentry->d_lockref.count > 0);
++ 	this_cpu_dec(nr_dentry);
++ 	if (dentry->d_op && dentry->d_op->d_release)
++ 		dentry->d_op->d_release(dentry);
++ 
++ 	spin_lock(&dentry->d_lock);
++ 	if (dentry->d_flags & DCACHE_SHRINK_LIST) {
++ 		dentry->d_flags |= DCACHE_MAY_FREE;
++ 		can_free = false;
++ 	}
++ 	spin_unlock(&dentry->d_lock);
++ 	if (likely(can_free))
++ 		dentry_free(dentry);
++ }
++ 
++ /*
++  * Finish off a dentry we've decided to kill.
++  * dentry->d_lock must be held, returns with it unlocked.
++  * If ref is non-zero, then decrement the refcount too.
++  * Returns dentry requiring refcount drop, or NULL if we're done.
++  */
++ static struct dentry *dentry_kill(struct dentry *dentry)
++ 	__releases(dentry->d_lock)
++ {
++ 	struct inode *inode = dentry->d_inode;
++ 	struct dentry *parent = NULL;
++ 
++ 	if (inode && unlikely(!spin_trylock(&inode->i_lock)))
++ 		goto failed;
++ 
++ 	if (!IS_ROOT(dentry)) {
++ 		parent = dentry->d_parent;
++ 		if (unlikely(!spin_trylock(&parent->d_lock))) {
++ 			if (inode)
++ 				spin_unlock(&inode->i_lock);
++ 			goto failed;
++ 		}
++ 	}
++ 
++ 	__dentry_kill(dentry);
++ 	return parent;
++ 
++ failed:
++ 	spin_unlock(&dentry->d_lock);
++ 	cpu_relax();
++ 	return dentry; /* try again with same dentry */
++ }
++ 
++ static inline struct dentry *lock_parent(struct dentry *dentry)
++ {
++ 	struct dentry *parent = dentry->d_parent;
++ 	if (IS_ROOT(dentry))
++ 		return NULL;
++ 	if (unlikely((int)dentry->d_lockref.count < 0))
++ 		return NULL;
++ 	if (likely(spin_trylock(&parent->d_lock)))
++ 		return parent;
++ 	rcu_read_lock();
++ 	spin_unlock(&dentry->d_lock);
++ again:
++ 	parent = ACCESS_ONCE(dentry->d_parent);
++ 	spin_lock(&parent->d_lock);
++ 	/*
++ 	 * We can't blindly lock dentry until we are sure
++ 	 * that we won't violate the locking order.
++ 	 * Any changes of dentry->d_parent must have
++ 	 * been done with parent->d_lock held, so
++ 	 * spin_lock() above is enough of a barrier
++ 	 * for checking if it's still our child.
++ 	 */
++ 	if (unlikely(parent != dentry->d_parent)) {
++ 		spin_unlock(&parent->d_lock);
++ 		goto again;
++ 	}
++ 	rcu_read_unlock();
++ 	if (parent != dentry)
++ 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
++ 	else
++ 		parent = NULL;
++ 	return parent;
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  }
+  
+  /* 
+@@@ -728,23 -771,16 +850,23 @@@ void d_prune_aliases(struct inode *inod
+  	struct dentry *dentry;
+  restart:
+  	spin_lock(&inode->i_lock);
+- 	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++ 	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+  		spin_lock(&dentry->d_lock);
+  		if (!dentry->d_lockref.count) {
+ -			struct dentry *parent = lock_parent(dentry);
+ -			if (likely(!dentry->d_lockref.count)) {
+ -				__dentry_kill(dentry);
+ -				goto restart;
+ -			}
+ -			if (parent)
+ -				spin_unlock(&parent->d_lock);
+ +			/*
+ +			 * inform the fs via d_prune that this dentry
+ +			 * is about to be unhashed and destroyed.
+ +			 */
+ +			if ((dentry->d_flags & DCACHE_OP_PRUNE) &&
+ +			    !d_unhashed(dentry))
+ +				dentry->d_op->d_prune(dentry);
+ +
+ +			__dget_dlock(dentry);
+ +			__d_drop(dentry);
+ +			spin_unlock(&dentry->d_lock);
+ +			spin_unlock(&inode->i_lock);
+ +			dput(dentry);
+ +			goto restart;
+  		}
+  		spin_unlock(&dentry->d_lock);
+  	}
+@@@ -1123,10 -1083,25 +1245,16 @@@ resume
+  	 */
+  	if (this_parent != parent) {
+  		struct dentry *child = this_parent;
+ -		this_parent = child->d_parent;
+ -
+ -		rcu_read_lock();
+ -		spin_unlock(&child->d_lock);
+ -		spin_lock(&this_parent->d_lock);
+ -
+ -		/*
+ -		 * might go back up the wrong parent if we have had a rename
+ -		 * or deletion
+ -		 */
+ -		if (this_parent != child->d_parent ||
+ -			 (child->d_flags & DCACHE_DENTRY_KILLED) ||
+ -			 need_seqretry(&rename_lock, seq)) {
+ -			spin_unlock(&this_parent->d_lock);
+ -			rcu_read_unlock();
+ +		this_parent = try_to_ascend(this_parent, seq);
+ +		if (!this_parent)
+  			goto rename_retry;
+++<<<<<<< HEAD
+ +		next = child->d_u.d_child.next;
+++=======
++ 		}
++ 		rcu_read_unlock();
++ 		next = child->d_child.next;
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  		goto resume;
+  	}
+  	if (need_seqretry(&rename_lock, seq)) {
+@@@ -1646,6 -1686,33 +1774,36 @@@ struct dentry *d_instantiate_unique(str
+  
+  EXPORT_SYMBOL(d_instantiate_unique);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * d_instantiate_no_diralias - instantiate a non-aliased dentry
++  * @entry: dentry to complete
++  * @inode: inode to attach to this dentry
++  *
++  * Fill in inode information in the entry.  If a directory alias is found, then
++  * return an error (and drop inode).  Together with d_materialise_unique() this
++  * guarantees that a directory inode may never have more than one alias.
++  */
++ int d_instantiate_no_diralias(struct dentry *entry, struct inode *inode)
++ {
++ 	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
++ 
++ 	spin_lock(&inode->i_lock);
++ 	if (S_ISDIR(inode->i_mode) && !hlist_empty(&inode->i_dentry)) {
++ 		spin_unlock(&inode->i_lock);
++ 		iput(inode);
++ 		return -EBUSY;
++ 	}
++ 	__d_instantiate(entry, inode);
++ 	spin_unlock(&inode->i_lock);
++ 	security_d_instantiate(entry, inode);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(d_instantiate_no_diralias);
++ 
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  struct dentry *d_make_root(struct inode *root_inode)
+  {
+  	struct dentry *res = NULL;
+@@@ -2447,27 -2513,29 +2605,40 @@@ static void __d_move(struct dentry *den
+  			   d_hash(dentry->d_parent, dentry->d_name.hash));
+  	}
+  
+ +	list_del(&dentry->d_u.d_child);
+ +	list_del(&target->d_u.d_child);
+ +
+  	/* Switch the names.. */
+ -	if (exchange)
+ -		swap_names(dentry, target);
+ -	else
+ -		copy_name(dentry, target);
+ +	switch_names(dentry, target);
+ +	swap(dentry->d_name.hash, target->d_name.hash);
+  
+ -	/* ... and switch them in the tree */
+ +	/* ... and switch the parents */
+  	if (IS_ROOT(dentry)) {
+ -		/* splicing a tree */
+  		dentry->d_parent = target->d_parent;
+  		target->d_parent = target;
+++<<<<<<< HEAD
+ +		INIT_LIST_HEAD(&target->d_u.d_child);
+++=======
++ 		list_del_init(&target->d_child);
++ 		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  	} else {
+ -		/* swapping two dentries */
+  		swap(dentry->d_parent, target->d_parent);
+++<<<<<<< HEAD
+ +
+ +		/* And add them back to the (new) parent lists */
+ +		list_add(&target->d_u.d_child, &target->d_parent->d_subdirs);
+++=======
++ 		list_move(&target->d_child, &target->d_parent->d_subdirs);
++ 		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
++ 		if (exchange)
++ 			fsnotify_d_move(target);
++ 		fsnotify_d_move(dentry);
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  	}
+  
+ +	list_add(&dentry->d_u.d_child, &dentry->d_parent->d_subdirs);
+ +
+  	write_seqcount_end(&target->d_seq);
+  	write_seqcount_end(&dentry->d_seq);
+  
+@@@ -3187,34 -3315,21 +3358,48 @@@ void d_genocide(struct dentry *parent
+  	d_walk(parent, parent, d_genocide_kill, NULL);
+  }
+  
+ -void d_tmpfile(struct dentry *dentry, struct inode *inode)
+ +/**
+ + * find_inode_number - check for dentry with name
+ + * @dir: directory to check
+ + * @name: Name to find.
+ + *
+ + * Check whether a dentry already exists for the given name,
+ + * and return the inode number if it has an inode. Otherwise
+ + * 0 is returned.
+ + *
+ + * This routine is used to post-process directory listings for
+ + * filesystems using synthetic inode numbers, and is necessary
+ + * to keep getcwd() working.
+ + */
+ + 
+ +ino_t find_inode_number(struct dentry *dir, struct qstr *name)
+  {
+++<<<<<<< HEAD
+ +	struct dentry * dentry;
+ +	ino_t ino = 0;
+ +
+ +	dentry = d_hash_and_lookup(dir, name);
+ +	if (!IS_ERR_OR_NULL(dentry)) {
+ +		if (dentry->d_inode)
+ +			ino = dentry->d_inode->i_ino;
+ +		dput(dentry);
+ +	}
+ +	return ino;
+++=======
++ 	inode_dec_link_count(inode);
++ 	BUG_ON(dentry->d_name.name != dentry->d_iname ||
++ 		!hlist_unhashed(&dentry->d_u.d_alias) ||
++ 		!d_unlinked(dentry));
++ 	spin_lock(&dentry->d_parent->d_lock);
++ 	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
++ 	dentry->d_name.len = sprintf(dentry->d_iname, "#%llu",
++ 				(unsigned long long)inode->i_ino);
++ 	spin_unlock(&dentry->d_lock);
++ 	spin_unlock(&dentry->d_parent->d_lock);
++ 	d_instantiate(dentry, inode);
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  }
+ -EXPORT_SYMBOL(d_tmpfile);
+ +EXPORT_SYMBOL(find_inode_number);
+  
+  static __initdata unsigned long dhash_entries;
+  static int __init set_dhash_entries(char *str)
+diff --cc fs/debugfs/inode.c
+index c7c83ff0f752,05f2960ed7c3..000000000000
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@@ -545,7 -546,14 +545,18 @@@ void debugfs_remove_recursive(struct de
+  	parent = dentry;
+   down:
+  	mutex_lock(&parent->d_inode->i_mutex);
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(child, next, &parent->d_subdirs, d_u.d_child) {
+++=======
++  loop:
++ 	/*
++ 	 * The parent->d_subdirs is protected by the d_lock. Outside that
++ 	 * lock, the child can be unlinked and set to be freed which can
++ 	 * use the d_u.d_child as the rcu head and corrupt this list.
++ 	 */
++ 	spin_lock(&parent->d_lock);
++ 	list_for_each_entry(child, &parent->d_subdirs, d_child) {
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  		if (!debugfs_positive(child))
+  			continue;
+  
+diff --cc fs/libfs.c
+index 0431513baf08,005843ce5dbd..000000000000
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@@ -143,60 -146,40 +143,76 @@@ static inline unsigned char dt_type(str
+   * both impossible due to the lock on directory.
+   */
+  
+ -int dcache_readdir(struct file *file, struct dir_context *ctx)
+ +int dcache_readdir(struct file * filp, void * dirent, filldir_t filldir)
+  {
+++<<<<<<< HEAD
+ +	struct dentry *dentry = filp->f_path.dentry;
+ +	struct dentry *cursor = filp->private_data;
+ +	struct list_head *p, *q = &cursor->d_u.d_child;
+ +	ino_t ino;
+ +	int i = filp->f_pos;
+++=======
++ 	struct dentry *dentry = file->f_path.dentry;
++ 	struct dentry *cursor = file->private_data;
++ 	struct list_head *p, *q = &cursor->d_child;
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  
+ -	if (!dir_emit_dots(file, ctx))
+ -		return 0;
+ -	spin_lock(&dentry->d_lock);
+ -	if (ctx->pos == 2)
+ -		list_move(q, &dentry->d_subdirs);
+ +	switch (i) {
+ +		case 0:
+ +			ino = dentry->d_inode->i_ino;
+ +			if (filldir(dirent, ".", 1, i, ino, DT_DIR) < 0)
+ +				break;
+ +			filp->f_pos++;
+ +			i++;
+ +			/* fallthrough */
+ +		case 1:
+ +			ino = parent_ino(dentry);
+ +			if (filldir(dirent, "..", 2, i, ino, DT_DIR) < 0)
+ +				break;
+ +			filp->f_pos++;
+ +			i++;
+ +			/* fallthrough */
+ +		default:
+ +			spin_lock(&dentry->d_lock);
+ +			if (filp->f_pos == 2)
+ +				list_move(q, &dentry->d_subdirs);
+  
+++<<<<<<< HEAD
+ +			for (p=q->next; p != &dentry->d_subdirs; p=p->next) {
+ +				struct dentry *next;
+ +				next = list_entry(p, struct dentry, d_u.d_child);
+ +				spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
+ +				if (!simple_positive(next)) {
+ +					spin_unlock(&next->d_lock);
+ +					continue;
+ +				}
+++=======
++ 	for (p = q->next; p != &dentry->d_subdirs; p = p->next) {
++ 		struct dentry *next = list_entry(p, struct dentry, d_child);
++ 		spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
++ 		if (!simple_positive(next)) {
++ 			spin_unlock(&next->d_lock);
++ 			continue;
++ 		}
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  
+ -		spin_unlock(&next->d_lock);
+ -		spin_unlock(&dentry->d_lock);
+ -		if (!dir_emit(ctx, next->d_name.name, next->d_name.len,
+ -			      next->d_inode->i_ino, dt_type(next->d_inode)))
+ -			return 0;
+ -		spin_lock(&dentry->d_lock);
+ -		spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
+ -		/* next is still alive */
+ -		list_move(q, p);
+ -		spin_unlock(&next->d_lock);
+ -		p = q;
+ -		ctx->pos++;
+ +				spin_unlock(&next->d_lock);
+ +				spin_unlock(&dentry->d_lock);
+ +				if (filldir(dirent, next->d_name.name, 
+ +					    next->d_name.len, filp->f_pos, 
+ +					    next->d_inode->i_ino, 
+ +					    dt_type(next->d_inode)) < 0)
+ +					return 0;
+ +				spin_lock(&dentry->d_lock);
+ +				spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
+ +				/* next is still alive */
+ +				list_move(q, p);
+ +				spin_unlock(&next->d_lock);
+ +				p = q;
+ +				filp->f_pos++;
+ +			}
+ +			spin_unlock(&dentry->d_lock);
+  	}
+ -	spin_unlock(&dentry->d_lock);
+  	return 0;
+  }
+  EXPORT_SYMBOL(dcache_readdir);
+diff --cc fs/ncpfs/dir.c
+index 6642f8b600ac,865d578704c8..000000000000
+--- a/fs/ncpfs/dir.c
++++ b/fs/ncpfs/dir.c
+@@@ -405,9 -403,7 +405,13 @@@ ncp_dget_fpos(struct dentry *dentry, st
+  
+  	/* If a pointer is invalid, we search the dentry. */
+  	spin_lock(&parent->d_lock);
+++<<<<<<< HEAD
+ +	next = parent->d_subdirs.next;
+ +	while (next != &parent->d_subdirs) {
+ +		dent = list_entry(next, struct dentry, d_u.d_child);
+++=======
++ 	list_for_each_entry(dent, &parent->d_subdirs, d_child) {
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  		if ((unsigned long)dent->d_fsdata == fpos) {
+  			if (dent->d_inode)
+  				dget(dent);
+diff --cc fs/ncpfs/ncplib_kernel.h
+index 32c06587351a,b785f74bfe3c..000000000000
+--- a/fs/ncpfs/ncplib_kernel.h
++++ b/fs/ncpfs/ncplib_kernel.h
+@@@ -192,10 -191,7 +192,14 @@@ ncp_renew_dentries(struct dentry *paren
+  	struct dentry *dentry;
+  
+  	spin_lock(&parent->d_lock);
+++<<<<<<< HEAD
+ +	next = parent->d_subdirs.next;
+ +	while (next != &parent->d_subdirs) {
+ +		dentry = list_entry(next, struct dentry, d_u.d_child);
+ +
+++=======
++ 	list_for_each_entry(dentry, &parent->d_subdirs, d_child) {
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  		if (dentry->d_fsdata == NULL)
+  			ncp_age_dentry(server, dentry);
+  		else
+@@@ -214,12 -207,9 +218,16 @@@ ncp_invalidate_dircache_entries(struct 
+  	struct dentry *dentry;
+  
+  	spin_lock(&parent->d_lock);
+++<<<<<<< HEAD
+ +	next = parent->d_subdirs.next;
+ +	while (next != &parent->d_subdirs) {
+ +		dentry = list_entry(next, struct dentry, d_u.d_child);
+++=======
++ 	list_for_each_entry(dentry, &parent->d_subdirs, d_child) {
+++>>>>>>> 946e51f2bf37 (move d_rcu from overlapping d_child to overlapping d_alias)
+  		dentry->d_fsdata = NULL;
+  		ncp_age_dentry(server, dentry);
+ +		next = next->next;
+  	}
+  	spin_unlock(&parent->d_lock);
+  }
+* Unmerged path drivers/staging/lustre/lustre/llite/dcache.c
+* Unmerged path drivers/staging/lustre/lustre/llite/llite_lib.c
+* Unmerged path drivers/staging/lustre/lustre/llite/namei.c
+diff --git a/arch/powerpc/platforms/cell/spufs/inode.c b/arch/powerpc/platforms/cell/spufs/inode.c
+index 35f77a42bedf..c5c5788e8a13 100644
+--- a/arch/powerpc/platforms/cell/spufs/inode.c
++++ b/arch/powerpc/platforms/cell/spufs/inode.c
+@@ -164,7 +164,7 @@ static void spufs_prune_dir(struct dentry *dir)
+ 	struct dentry *dentry, *tmp;
+ 
+ 	mutex_lock(&dir->d_inode->i_mutex);
+-	list_for_each_entry_safe(dentry, tmp, &dir->d_subdirs, d_u.d_child) {
++	list_for_each_entry_safe(dentry, tmp, &dir->d_subdirs, d_child) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (!(d_unhashed(dentry)) && dentry->d_inode) {
+ 			dget_dlock(dentry);
+* Unmerged path drivers/staging/lustre/lustre/llite/dcache.c
+* Unmerged path drivers/staging/lustre/lustre/llite/llite_lib.c
+* Unmerged path drivers/staging/lustre/lustre/llite/namei.c
+diff --git a/fs/affs/amigaffs.c b/fs/affs/amigaffs.c
+index d9a43674cb94..9cca0ea4e479 100644
+--- a/fs/affs/amigaffs.c
++++ b/fs/affs/amigaffs.c
+@@ -126,7 +126,7 @@ affs_fix_dcache(struct inode *inode, u32 entry_ino)
+ {
+ 	struct dentry *dentry;
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		if (entry_ino == (u32)(long)dentry->d_fsdata) {
+ 			dentry->d_fsdata = (void *)inode->i_ino;
+ 			break;
+diff --git a/fs/autofs4/expire.c b/fs/autofs4/expire.c
+index 394e90b02c5e..edb46e67d5ca 100644
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@ -91,7 +91,7 @@ static struct dentry *get_next_positive_subdir(struct dentry *prev,
+ 	spin_lock(&root->d_lock);
+ 
+ 	if (prev)
+-		next = prev->d_u.d_child.next;
++		next = prev->d_child.next;
+ 	else {
+ 		prev = dget_dlock(root);
+ 		next = prev->d_subdirs.next;
+@@ -105,13 +105,13 @@ cont:
+ 		return NULL;
+ 	}
+ 
+-	q = list_entry(next, struct dentry, d_u.d_child);
++	q = list_entry(next, struct dentry, d_child);
+ 
+ 	spin_lock_nested(&q->d_lock, DENTRY_D_LOCK_NESTED);
+ 	/* Already gone or negative dentry (under construction) - try next */
+ 	if (!d_count(q) || !simple_positive(q)) {
+ 		spin_unlock(&q->d_lock);
+-		next = q->d_u.d_child.next;
++		next = q->d_child.next;
+ 		goto cont;
+ 	}
+ 	dget_dlock(q);
+@@ -161,13 +161,13 @@ again:
+ 				goto relock;
+ 			}
+ 			spin_unlock(&p->d_lock);
+-			next = p->d_u.d_child.next;
++			next = p->d_child.next;
+ 			p = parent;
+ 			if (next != &parent->d_subdirs)
+ 				break;
+ 		}
+ 	}
+-	ret = list_entry(next, struct dentry, d_u.d_child);
++	ret = list_entry(next, struct dentry, d_child);
+ 
+ 	spin_lock_nested(&ret->d_lock, DENTRY_D_LOCK_NESTED);
+ 	/* Negative dentry - try next */
+@@ -461,7 +461,7 @@ found:
+ 	spin_lock(&sbi->lookup_lock);
+ 	spin_lock(&expired->d_parent->d_lock);
+ 	spin_lock_nested(&expired->d_lock, DENTRY_D_LOCK_NESTED);
+-	list_move(&expired->d_parent->d_subdirs, &expired->d_u.d_child);
++	list_move(&expired->d_parent->d_subdirs, &expired->d_child);
+ 	spin_unlock(&expired->d_lock);
+ 	spin_unlock(&expired->d_parent->d_lock);
+ 	spin_unlock(&sbi->lookup_lock);
+diff --git a/fs/autofs4/root.c b/fs/autofs4/root.c
+index 22bfeaf10e21..dc3c49c58267 100644
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -655,7 +655,7 @@ static void autofs_clear_leaf_automount_flags(struct dentry *dentry)
+ 	/* only consider parents below dentrys in the root */
+ 	if (IS_ROOT(parent->d_parent))
+ 		return;
+-	d_child = &dentry->d_u.d_child;
++	d_child = &dentry->d_child;
+ 	/* Set parent managed if it's becoming empty */
+ 	if (d_child->next == &parent->d_subdirs &&
+ 	    d_child->prev == &parent->d_subdirs)
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index 85c9f1dac476..deb6ec9a4694 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -109,7 +109,7 @@ static int fpos_cmp(loff_t l, loff_t r)
+ /*
+  * When possible, we try to satisfy a readdir by peeking at the
+  * dcache.  We make this work by carefully ordering dentries on
+- * d_u.d_child when we initially get results back from the MDS, and
++ * d_child when we initially get results back from the MDS, and
+  * falling back to a "normal" sync readdir if any dentries in the dir
+  * are dropped.
+  *
+@@ -146,11 +146,11 @@ static int __dcache_readdir(struct file *filp,
+ 		p = parent->d_subdirs.prev;
+ 		dout(" initial p %p/%p\n", p->prev, p->next);
+ 	} else {
+-		p = last->d_u.d_child.prev;
++		p = last->d_child.prev;
+ 	}
+ 
+ more:
+-	dentry = list_entry(p, struct dentry, d_u.d_child);
++	dentry = list_entry(p, struct dentry, d_child);
+ 	di = ceph_dentry(dentry);
+ 	while (1) {
+ 		dout(" p %p/%p %s d_subdirs %p/%p\n", p->prev, p->next,
+@@ -173,7 +173,7 @@ more:
+ 		     !dentry->d_inode ? " null" : "");
+ 		spin_unlock(&dentry->d_lock);
+ 		p = p->prev;
+-		dentry = list_entry(p, struct dentry, d_u.d_child);
++		dentry = list_entry(p, struct dentry, d_child);
+ 		di = ceph_dentry(dentry);
+ 	}
+ 
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 49f828439137..29056bcc0372 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1404,7 +1404,7 @@ retry_lookup:
+ 			/* reorder parent's d_subdirs */
+ 			spin_lock(&parent->d_lock);
+ 			spin_lock_nested(&dn->d_lock, DENTRY_D_LOCK_NESTED);
+-			list_move(&dn->d_u.d_child, &parent->d_subdirs);
++			list_move(&dn->d_child, &parent->d_subdirs);
+ 			spin_unlock(&dn->d_lock);
+ 			spin_unlock(&parent->d_lock);
+ 		}
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index 25a6255197b6..49356ea67757 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -888,7 +888,7 @@ inode_has_hashed_dentries(struct inode *inode)
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		if (!d_unhashed(dentry) || IS_ROOT(dentry)) {
+ 			spin_unlock(&inode->i_lock);
+ 			return true;
+diff --git a/fs/coda/cache.c b/fs/coda/cache.c
+index 1da168c61d35..9bc1147a6c5d 100644
+--- a/fs/coda/cache.c
++++ b/fs/coda/cache.c
+@@ -92,7 +92,7 @@ static void coda_flag_children(struct dentry *parent, int flag)
+ 	struct dentry *de;
+ 
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(de, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(de, &parent->d_subdirs, d_child) {
+ 		/* don't know what to do with negative dentries */
+ 		if (de->d_inode ) 
+ 			coda_flag_inode(de->d_inode, flag);
+* Unmerged path fs/dcache.c
+* Unmerged path fs/debugfs/inode.c
+diff --git a/fs/exportfs/expfs.c b/fs/exportfs/expfs.c
+index 262fc9940982..b4eec4c9a790 100644
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -50,7 +50,7 @@ find_acceptable_alias(struct dentry *result,
+ 
+ 	inode = result->d_inode;
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		dget(dentry);
+ 		spin_unlock(&inode->i_lock);
+ 		if (toput)
+* Unmerged path fs/libfs.c
+* Unmerged path fs/ncpfs/dir.c
+* Unmerged path fs/ncpfs/ncplib_kernel.h
+diff --git a/fs/nfs/getroot.c b/fs/nfs/getroot.c
+index b94f80420a58..40f36b421df9 100644
+--- a/fs/nfs/getroot.c
++++ b/fs/nfs/getroot.c
+@@ -58,7 +58,7 @@ static int nfs_superblock_set_dummy_root(struct super_block *sb, struct inode *i
+ 		 */
+ 		spin_lock(&sb->s_root->d_inode->i_lock);
+ 		spin_lock(&sb->s_root->d_lock);
+-		hlist_del_init(&sb->s_root->d_alias);
++		hlist_del_init(&sb->s_root->d_u.d_alias);
+ 		spin_unlock(&sb->s_root->d_lock);
+ 		spin_unlock(&sb->s_root->d_inode->i_lock);
+ 	}
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 4bb21d67d9b1..a3153e2d0f1f 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -63,14 +63,14 @@ void __fsnotify_update_child_dentry_flags(struct inode *inode)
+ 	spin_lock(&inode->i_lock);
+ 	/* run all of the dentries associated with this inode.  Since this is a
+ 	 * directory, there damn well better only be one item on this list */
+-	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+ 		struct dentry *child;
+ 
+ 		/* run all of the children of the original inode and fix their
+ 		 * d_flags to indicate parental interest (their parent is the
+ 		 * original inode) */
+ 		spin_lock(&alias->d_lock);
+-		list_for_each_entry(child, &alias->d_subdirs, d_u.d_child) {
++		list_for_each_entry(child, &alias->d_subdirs, d_child) {
+ 			if (!child->d_inode)
+ 				continue;
+ 
+diff --git a/fs/ocfs2/dcache.c b/fs/ocfs2/dcache.c
+index ef999729e274..ce37013b4a59 100644
+--- a/fs/ocfs2/dcache.c
++++ b/fs/ocfs2/dcache.c
+@@ -172,7 +172,7 @@ struct dentry *ocfs2_find_local_alias(struct inode *inode,
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (ocfs2_match_dentry(dentry, parent_blkno, skip_unhashed)) {
+ 			trace_ocfs2_find_local_alias(dentry->d_name.len,
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 5888528c0fa0..d58db4386eb5 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -122,15 +122,15 @@ struct dentry {
+ 	void *d_fsdata;			/* fs-specific data */
+ 
+ 	struct list_head d_lru;		/* LRU list */
++	struct list_head d_child;	/* child of parent list */
++	struct list_head d_subdirs;	/* our children */
+ 	/*
+-	 * d_child and d_rcu can share memory
++	 * d_alias and d_rcu can share memory
+ 	 */
+ 	union {
+-		struct list_head d_child;	/* child of parent list */
++		struct hlist_node d_alias;	/* inode alias list */
+ 	 	struct rcu_head d_rcu;
+ 	} d_u;
+-	struct list_head d_subdirs;	/* our children */
+-	struct hlist_node d_alias;	/* inode alias list */
+ };
+ 
+ /*
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index e49ab3b63742..84bc94d20e02 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -6043,7 +6043,7 @@ static int instance_mkdir (struct inode *inode, struct dentry *dentry, umode_t m
+ 	int ret;
+ 
+ 	/* Paranoid: Make sure the parent is the "instances" directory */
+-	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
++	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+ 	if (WARN_ON_ONCE(parent != trace_instance_dir))
+ 		return -ENOENT;
+ 
+@@ -6070,7 +6070,7 @@ static int instance_rmdir(struct inode *inode, struct dentry *dentry)
+ 	int ret;
+ 
+ 	/* Paranoid: Make sure the parent is the "instances" directory */
+-	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
++	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+ 	if (WARN_ON_ONCE(parent != trace_instance_dir))
+ 		return -ENOENT;
+ 
+diff --git a/kernel/trace/trace_events.c b/kernel/trace/trace_events.c
+index 3d18aadef493..6c540fbbb558 100644
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -431,7 +431,7 @@ static void remove_event_file_dir(struct ftrace_event_file *file)
+ 
+ 	if (dir) {
+ 		spin_lock(&dir->d_lock);	/* probably unneeded */
+-		list_for_each_entry(child, &dir->d_subdirs, d_u.d_child) {
++		list_for_each_entry(child, &dir->d_subdirs, d_child) {
+ 			if (child->d_inode)	/* probably unneeded */
+ 				child->d_inode->i_private = NULL;
+ 		}
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index ff427733c290..86f969437f5d 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -1190,7 +1190,7 @@ static void sel_remove_entries(struct dentry *de)
+ 	spin_lock(&de->d_lock);
+ 	node = de->d_subdirs.next;
+ 	while (node != &de->d_subdirs) {
+-		struct dentry *d = list_entry(node, struct dentry, d_u.d_child);
++		struct dentry *d = list_entry(node, struct dentry, d_child);
+ 
+ 		spin_lock_nested(&d->d_lock, DENTRY_D_LOCK_NESTED);
+ 		list_del_init(node);
+@@ -1664,12 +1664,12 @@ static void sel_remove_classes(void)
+ 
+ 	list_for_each(class_node, &class_dir->d_subdirs) {
+ 		struct dentry *class_subdir = list_entry(class_node,
+-					struct dentry, d_u.d_child);
++					struct dentry, d_child);
+ 		struct list_head *class_subdir_node;
+ 
+ 		list_for_each(class_subdir_node, &class_subdir->d_subdirs) {
+ 			struct dentry *d = list_entry(class_subdir_node,
+-						struct dentry, d_u.d_child);
++						struct dentry, d_child);
+ 
+ 			if (d->d_inode)
+ 				if (d->d_inode->i_mode & S_IFDIR)
