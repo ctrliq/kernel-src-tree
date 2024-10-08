@@ -1,0 +1,94 @@
+fs: export __block_write_full_page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] export __block_write_full_page (Benjamin Marzinski) [1221210]
+Rebuild_FUZZ: 93.75%
+commit-author Benjamin Marzinski <bmarzins@redhat.com>
+commit b4bba38909c21689de21355e84259cb7b38f25ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b4bba389.failed
+
+gfs2 needs to be able to skip the check to see if a page is outside of
+the file size when writing it out. gfs2 can get into a situation where
+it needs to flush its in-memory log to disk while a truncate is in
+progress. If the file being trucated has data journaling enabled, it is
+possible that there are data blocks in the log that are past the end of
+the file. gfs can't finish the log flush without either writing these
+blocks out or revoking them. Otherwise, if the node crashed, it could
+overwrite subsequent changes made by other nodes in the cluster when
+it's journal was replayed.
+
+Unfortunately, there is no way to add log entries to the log during a
+flush. So gfs2 simply writes out the page instead. This situation can
+only occur when the truncate code still has the file locked exclusively,
+and hasn't marked this block as free in the metadata (which happens
+later in truc_dealloc).  After gfs2 writes this page out, the truncation
+code will shortly invalidate it and write out any revokes if necessary.
+
+In order to make this work, gfs2 needs to be able to skip the check for
+writes outside the file size. Since the check exists in
+block_write_full_page, this patch exports __block_write_full_page, which
+doesn't have the check.
+
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit b4bba38909c21689de21355e84259cb7b38f25ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/buffer_head.h
+diff --cc include/linux/buffer_head.h
+index 7a002c1c49a9,7e14e545c4b6..000000000000
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@@ -201,16 -204,16 +201,22 @@@ extern int buffer_heads_over_limit
+   * Generic address_space_operations implementations for buffer_head-backed
+   * address_spaces.
+   */
+ -void block_invalidatepage(struct page *page, unsigned int offset,
+ -			  unsigned int length);
+ +void block_invalidatepage(struct page *page, unsigned long offset);
+ +void block_invalidatepage_range(struct page *page, unsigned int offset,
+ +				unsigned int length);
+  int block_write_full_page(struct page *page, get_block_t *get_block,
+  				struct writeback_control *wbc);
+++<<<<<<< HEAD
+ +int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+ +			struct writeback_control *wbc, bh_end_io_t *handler);
+++=======
++ int __block_write_full_page(struct inode *inode, struct page *page,
++ 			get_block_t *get_block, struct writeback_control *wbc,
++ 			bh_end_io_t *handler);
+++>>>>>>> b4bba38909c2 (fs: export __block_write_full_page)
+  int block_read_full_page(struct page*, get_block_t*);
+ -int block_is_partially_uptodate(struct page *page, unsigned long from,
+ -				unsigned long count);
+ +int block_is_partially_uptodate(struct page *page, read_descriptor_t *desc,
+ +				unsigned long from);
+  int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
+  		unsigned flags, struct page **pagep, get_block_t *get_block);
+  int __block_write_begin(struct page *page, loff_t pos, unsigned len,
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 58d670e9b7cf..84c26b7dfe74 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -1665,7 +1665,7 @@ static struct buffer_head *create_page_buffers(struct page *page, struct inode *
+  * WB_SYNC_ALL, the writes are posted using WRITE_SYNC; this
+  * causes the writes to be flagged as synchronous writes.
+  */
+-static int __block_write_full_page(struct inode *inode, struct page *page,
++int __block_write_full_page(struct inode *inode, struct page *page,
+ 			get_block_t *get_block, struct writeback_control *wbc,
+ 			bh_end_io_t *handler)
+ {
+@@ -1827,6 +1827,7 @@ recover:
+ 	unlock_page(page);
+ 	goto done;
+ }
++EXPORT_SYMBOL(__block_write_full_page);
+ 
+ /*
+  * If a page has any new buffers, zero them out here, and mark them uptodate
+* Unmerged path include/linux/buffer_head.h
