@@ -1,0 +1,360 @@
+powerpc/book3s: Add basic infrastructure to handle HMI in Linux.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] book3s: Add basic infrastructure to handle HMI in Linux (Gustavo Duarte) [1221091]
+Rebuild_FUZZ: 92.44%
+commit-author Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+commit 0869b6fd209bda402576a9a559120ddd4f61198e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0869b6fd.failed
+
+Handle Hypervisor Maintenance Interrupt (HMI) in Linux. This patch implements
+basic infrastructure to handle HMI in Linux host. The design is to invoke
+opal handle hmi in real mode for recovery and set irq_pending when we hit HMI.
+During check_irq_replay pull opal hmi event and print hmi info on console.
+
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 0869b6fd209bda402576a9a559120ddd4f61198e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a2df577911e2,0de9309b9a55..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -175,6 -181,9 +177,12 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  
+  13:	b	machine_check_fwnmi
+  
+++<<<<<<< HEAD
+++=======
++ 14:	mtspr	SPRN_HSRR0, r8
++ 	mtspr	SPRN_HSRR1, r7
++ 	b	hmi_exception_after_realmode
+++>>>>>>> 0869b6fd209b (powerpc/book3s: Add basic infrastructure to handle HMI in Linux.)
+  
+  kvmppc_primary_no_guest:
+  	/* We handle this much like a ceded vcpu */
+diff --git a/arch/powerpc/include/asm/exception-64s.h b/arch/powerpc/include/asm/exception-64s.h
+index 8f35cd7d59cc..f99ea33c3f33 100644
+--- a/arch/powerpc/include/asm/exception-64s.h
++++ b/arch/powerpc/include/asm/exception-64s.h
+@@ -425,6 +425,8 @@ label##_relon_hv:						\
+ #define SOFTEN_VALUE_0xa00	PACA_IRQ_DBELL
+ #define SOFTEN_VALUE_0xe80	PACA_IRQ_DBELL
+ #define SOFTEN_VALUE_0xe82	PACA_IRQ_DBELL
++#define SOFTEN_VALUE_0xe60	PACA_IRQ_HMI
++#define SOFTEN_VALUE_0xe62	PACA_IRQ_HMI
+ 
+ #define __SOFTEN_TEST(h, vec)						\
+ 	lbz	r10,PACASOFTIRQEN(r13);					\
+diff --git a/arch/powerpc/include/asm/hardirq.h b/arch/powerpc/include/asm/hardirq.h
+index d5821b782b64..e26521ff3b16 100644
+--- a/arch/powerpc/include/asm/hardirq.h
++++ b/arch/powerpc/include/asm/hardirq.h
+@@ -12,6 +12,7 @@ typedef struct {
+ 	unsigned int pmu_irqs;
+ 	unsigned int mce_exceptions;
+ 	unsigned int spurious_irqs;
++	unsigned int hmi_exceptions;
+ #ifdef CONFIG_PPC_DOORBELL
+ 	unsigned int doorbell_irqs;
+ #endif
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 10be1dd01c6b..b59ac27a6b7d 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -25,6 +25,7 @@
+ #define PACA_IRQ_EE		0x04
+ #define PACA_IRQ_DEC		0x08 /* Or FIT */
+ #define PACA_IRQ_EE_EDGE	0x10 /* BookE only */
++#define PACA_IRQ_HMI		0x20
+ 
+ #endif /* CONFIG_PPC64 */
+ 
+diff --git a/arch/powerpc/include/asm/kvm_asm.h b/arch/powerpc/include/asm/kvm_asm.h
+index ab0490fe390b..0c505a2c5793 100644
+--- a/arch/powerpc/include/asm/kvm_asm.h
++++ b/arch/powerpc/include/asm/kvm_asm.h
+@@ -97,6 +97,7 @@
+ #define BOOK3S_INTERRUPT_H_DATA_STORAGE	0xe00
+ #define BOOK3S_INTERRUPT_H_INST_STORAGE	0xe20
+ #define BOOK3S_INTERRUPT_H_EMUL_ASSIST	0xe40
++#define BOOK3S_INTERRUPT_HMI		0xe60
+ #define BOOK3S_INTERRUPT_H_DOORBELL	0xe80
+ #define BOOK3S_INTERRUPT_PERFMON	0xf00
+ #define BOOK3S_INTERRUPT_ALTIVEC	0xf20
+diff --git a/arch/powerpc/include/asm/machdep.h b/arch/powerpc/include/asm/machdep.h
+index 9f35b2435997..49dd394bce30 100644
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -162,6 +162,10 @@ struct machdep_calls {
+ 	/* Exception handlers */
+ 	int		(*system_reset_exception)(struct pt_regs *regs);
+ 	int 		(*machine_check_exception)(struct pt_regs *regs);
++	int		(*handle_hmi_exception)(struct pt_regs *regs);
++
++	/* Early exception handlers called in realmode */
++	int		(*hmi_exception_early)(struct pt_regs *regs);
+ 
+ 	/* Called during machine check exception to retrive fixup address. */
+ 	bool		(*mce_check_early_recovery)(struct pt_regs *regs);
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 5683e9a3a478..9df7b8b69284 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -910,6 +910,8 @@ extern void opal_msglog_init(void);
+ 
+ extern int opal_machine_check(struct pt_regs *regs);
+ extern bool opal_mce_check_early_recovery(struct pt_regs *regs);
++extern int opal_hmi_exception_early(struct pt_regs *regs);
++extern int opal_handle_hmi_exception(struct pt_regs *regs);
+ 
+ extern void opal_shutdown(void);
+ extern int opal_resync_timebase(void);
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 5ed698a00d56..6af4ab30ca79 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -906,6 +906,11 @@ restore_check_irq_replay:
+ 	addi	r3,r1,STACK_FRAME_OVERHEAD;
+  	bl	do_IRQ
+ 	b	ret_from_except
++1:	cmpwi	cr0,r3,0xe60
++	bne	1f
++	addi	r3,r1,STACK_FRAME_OVERHEAD;
++	bl	handle_hmi_exception
++	b	ret_from_except
+ 1:	cmpwi	cr0,r3,0x900
+ 	bne	1f
+ 	addi	r3,r1,STACK_FRAME_OVERHEAD;
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index d587cf01fac4..cda8cc0549cc 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -341,7 +341,7 @@ emulation_assist_trampoline:
+ hv_exception_trampoline:
+ 	SET_SCRATCH0(r13)
+ 	EXCEPTION_PROLOG_0(PACA_EXGEN)
+-	b	hmi_exception_hv
++	b	hmi_exception_early
+ 
+ 	. = 0xe80
+ hv_doorbell_trampoline:
+@@ -623,8 +623,64 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+ 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe22)
+ 	STD_EXCEPTION_HV_OOL(0xe42, emulation_assist)
+ 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe42)
+-	STD_EXCEPTION_HV_OOL(0xe62, hmi_exception) /* need to flush cache ? */
++	MASKABLE_EXCEPTION_HV_OOL(0xe62, hmi_exception)
+ 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe62)
++
++	.globl hmi_exception_early
++hmi_exception_early:
++	EXCEPTION_PROLOG_1(PACA_EXGEN, NOTEST, 0xe60)
++	mr	r10,r1			/* Save r1			*/
++	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
++	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
++	std	r9,_CCR(r1)		/* save CR in stackframe	*/
++	mfspr	r11,SPRN_HSRR0		/* Save HSRR0 */
++	std	r11,_NIP(r1)		/* save HSRR0 in stackframe	*/
++	mfspr	r12,SPRN_HSRR1		/* Save SRR1 */
++	std	r12,_MSR(r1)		/* save SRR1 in stackframe	*/
++	std	r10,0(r1)		/* make stack chain pointer	*/
++	std	r0,GPR0(r1)		/* save r0 in stackframe	*/
++	std	r10,GPR1(r1)		/* save r1 in stackframe	*/
++	EXCEPTION_PROLOG_COMMON_2(PACA_EXGEN)
++	EXCEPTION_PROLOG_COMMON_3(0xe60)
++	addi	r3,r1,STACK_FRAME_OVERHEAD
++	bl	hmi_exception_realmode
++	/* Windup the stack. */
++	/* Clear MSR_RI before setting SRR0 and SRR1. */
++	li	r0,MSR_RI
++	mfmsr	r9			/* get MSR value */
++	andc	r9,r9,r0
++	mtmsrd	r9,1			/* Clear MSR_RI */
++	/* Move original HSRR0 and HSRR1 into the respective regs */
++	ld	r9,_MSR(r1)
++	mtspr	SPRN_HSRR1,r9
++	ld	r3,_NIP(r1)
++	mtspr	SPRN_HSRR0,r3
++	ld	r9,_CTR(r1)
++	mtctr	r9
++	ld	r9,_XER(r1)
++	mtxer	r9
++	ld	r9,_LINK(r1)
++	mtlr	r9
++	REST_GPR(0, r1)
++	REST_8GPRS(2, r1)
++	REST_GPR(10, r1)
++	ld	r11,_CCR(r1)
++	mtcr	r11
++	REST_GPR(11, r1)
++	REST_2GPRS(12, r1)
++	/* restore original r1. */
++	ld	r1,GPR1(r1)
++
++	/*
++	 * Go to virtual mode and pull the HMI event information from
++	 * firmware.
++	 */
++	.globl hmi_exception_after_realmode
++hmi_exception_after_realmode:
++	SET_SCRATCH0(r13)
++	EXCEPTION_PROLOG_0(PACA_EXGEN)
++	b	hmi_exception_hv
++
+ 	MASKABLE_EXCEPTION_HV_OOL(0xe82, h_doorbell)
+ 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe82)
+ 
+@@ -645,6 +701,8 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+  * - If it was a decrementer interrupt, we bump the dec to max and and return.
+  * - If it was a doorbell we return immediately since doorbells are edge
+  *   triggered and won't automatically refire.
++ * - If it was a HMI we return immediately since we handled it in realmode
++ *   and it won't refire.
+  * - else we hard disable and return.
+  * This is called with r10 containing the value to OR to the paca field.
+  */
+@@ -661,6 +719,8 @@ masked_##_H##interrupt:					\
+ 	mtspr	SPRN_DEC,r10;				\
+ 	b	2f;					\
+ 1:	cmpwi	r10,PACA_IRQ_DBELL;			\
++	beq	2f;					\
++	cmpwi	r10,PACA_IRQ_HMI;			\
+ 	beq	2f;					\
+ 	mfspr	r10,SPRN_##_H##SRR1;			\
+ 	rldicl	r10,r10,48,1; /* clear MSR_EE */	\
+@@ -801,7 +861,7 @@ kvmppc_skip_Hinterrupt:
+ 	STD_EXCEPTION_COMMON(0xd00, single_step, single_step_exception)
+ 	STD_EXCEPTION_COMMON(0xe00, trap_0e, unknown_exception)
+ 	STD_EXCEPTION_COMMON(0xe40, emulation_assist, emulation_assist_interrupt)
+-	STD_EXCEPTION_COMMON(0xe60, hmi_exception, unknown_exception)
++	STD_EXCEPTION_COMMON_ASYNC(0xe60, hmi_exception, handle_hmi_exception)
+ #ifdef CONFIG_PPC_DOORBELL
+ 	STD_EXCEPTION_COMMON_ASYNC(0xe80, h_doorbell, doorbell_exception)
+ #else
+diff --git a/arch/powerpc/kernel/irq.c b/arch/powerpc/kernel/irq.c
+index c1fdaa4acfd5..3df43527d09a 100644
+--- a/arch/powerpc/kernel/irq.c
++++ b/arch/powerpc/kernel/irq.c
+@@ -189,6 +189,11 @@ notrace unsigned int __check_irq_replay(void)
+ 	}
+ #endif /* CONFIG_PPC_BOOK3E */
+ 
++	/* Check if an hypervisor Maintenance interrupt happened */
++	local_paca->irq_happened &= ~PACA_IRQ_HMI;
++	if (happened & PACA_IRQ_HMI)
++		return 0xe60;
++
+ 	/* There should be nothing left ! */
+ 	BUG_ON(local_paca->irq_happened != 0);
+ 
+@@ -377,6 +382,14 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 		seq_printf(p, "%10u ", per_cpu(irq_stat, j).mce_exceptions);
+ 	seq_printf(p, "  Machine check exceptions\n");
+ 
++	if (cpu_has_feature(CPU_FTR_HVMODE)) {
++		seq_printf(p, "%*s: ", prec, "HMI");
++		for_each_online_cpu(j)
++			seq_printf(p, "%10u ",
++					per_cpu(irq_stat, j).hmi_exceptions);
++		seq_printf(p, "  Hypervisor Maintenance Interrupts\n");
++	}
++
+ #ifdef CONFIG_PPC_DOORBELL
+ 	if (cpu_has_feature(CPU_FTR_DBELL)) {
+ 		seq_printf(p, "%*s: ", prec, "DBL");
+@@ -400,6 +413,7 @@ u64 arch_irq_stat_cpu(unsigned int cpu)
+ 	sum += per_cpu(irq_stat, cpu).mce_exceptions;
+ 	sum += per_cpu(irq_stat, cpu).spurious_irqs;
+ 	sum += per_cpu(irq_stat, cpu).timer_irqs_others;
++	sum += per_cpu(irq_stat, cpu).hmi_exceptions;
+ #ifdef CONFIG_PPC_DOORBELL
+ 	sum += per_cpu(irq_stat, cpu).doorbell_irqs;
+ #endif
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index f12dc6502672..051fd4944a8b 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -301,6 +301,16 @@ long machine_check_early(struct pt_regs *regs)
+ 	return handled;
+ }
+ 
++long hmi_exception_realmode(struct pt_regs *regs)
++{
++	__get_cpu_var(irq_stat).hmi_exceptions++;
++
++	if (ppc_md.hmi_exception_early)
++		ppc_md.hmi_exception_early(regs);
++
++	return 0;
++}
++
+ #endif
+ 
+ /*
+@@ -735,6 +745,20 @@ void SMIException(struct pt_regs *regs)
+ 	die("System Management Interrupt", regs, SIGABRT);
+ }
+ 
++void handle_hmi_exception(struct pt_regs *regs)
++{
++	struct pt_regs *old_regs;
++
++	old_regs = set_irq_regs(regs);
++	irq_enter();
++
++	if (ppc_md.handle_hmi_exception)
++		ppc_md.handle_hmi_exception(regs);
++
++	irq_exit();
++	set_irq_regs(old_regs);
++}
++
+ void unknown_exception(struct pt_regs *regs)
+ {
+ 	enum ctx_state prev_state = exception_enter();
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 2542700371c7..ac6438aae06e 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -517,6 +517,20 @@ int opal_machine_check(struct pt_regs *regs)
+ 	return 0;
+ }
+ 
++/* Early hmi handler called in real mode. */
++int opal_hmi_exception_early(struct pt_regs *regs)
++{
++	/* TODO: Call opal hmi handler. */
++	return 0;
++}
++
++/* HMI exception handler called in virtual mode during check_irq_replay. */
++int opal_handle_hmi_exception(struct pt_regs *regs)
++{
++	/* TODO: Retrive and print HMI event from OPAL. */
++	return 0;
++}
++
+ static uint64_t find_recovery_address(uint64_t nip)
+ {
+ 	int i;
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index d9b88fa7c5a3..5a0e2dc6de5f 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -264,6 +264,8 @@ static void __init pnv_setup_machdep_opal(void)
+ 	ppc_md.halt = pnv_halt;
+ 	ppc_md.machine_check_exception = opal_machine_check;
+ 	ppc_md.mce_check_early_recovery = opal_mce_check_early_recovery;
++	ppc_md.hmi_exception_early = opal_hmi_exception_early;
++	ppc_md.handle_hmi_exception = opal_handle_hmi_exception;
+ }
+ 
+ #ifdef CONFIG_PPC_POWERNV_RTAS
