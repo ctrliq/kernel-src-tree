@@ -1,0 +1,187 @@
+md: protect ->pers changes with mddev->lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] protect ->pers changes with mddev->lock (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 95.12%
+commit-author NeilBrown <neilb@suse.de>
+commit 36d091f4759d194c99f0705d412afe208622b45a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/36d091f4.failed
+
+->pers is already protected by ->reconfig_mutex, and
+cannot possibly change when there are threads running or
+outstanding IO.
+
+However there are some places where we access ->pers
+not in a thread or IO context, and where ->reconfig_mutex
+is unnecessarily heavy-weight:  level_show and md_seq_show().
+
+So protect all changes, and those accesses, with ->lock.
+This is a step toward taking those accesses out from under
+reconfig_mutex.
+
+[Fixed missing "mddev->pers" -> "pers" conversion, thanks to
+ Dan Carpenter <dan.carpenter@oracle.com>]
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 36d091f4759d194c99f0705d412afe208622b45a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 0227d221c67b,4db4e4146a35..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -3524,25 -3378,23 +3529,43 @@@ level_store(struct mddev *mddev, const 
+  
+  	/* Looks like we have a winner */
+  	mddev_suspend(mddev);
+++<<<<<<< HEAD
+ +	mddev->pers->stop(mddev);
+ +	
+ +	if (mddev->pers->sync_request == NULL &&
+ +	    pers->sync_request != NULL) {
+ +		/* need to add the md_redundancy_group */
+ +		if (sysfs_create_group(&mddev->kobj, &md_redundancy_group))
+ +			printk(KERN_WARNING
+ +			       "md: cannot register extra attributes for %s\n",
+ +			       mdname(mddev));
+ +		mddev->sysfs_action = sysfs_get_dirent(mddev->kobj.sd, NULL, "sync_action");
+ +	}		
+ +	if (mddev->pers->sync_request != NULL &&
+ +	    pers->sync_request == NULL) {
+ +		/* need to remove the md_redundancy_group */
+ +		if (mddev->to_remove == NULL)
+ +			mddev->to_remove = &md_redundancy_group;
+ +	}
+++=======
++ 	mddev_detach(mddev);
++ 
++ 	spin_lock(&mddev->lock);
++ 	oldpers = mddev->pers;
++ 	oldpriv = mddev->private;
++ 	mddev->pers = pers;
++ 	mddev->private = priv;
++ 	strlcpy(mddev->clevel, pers->name, sizeof(mddev->clevel));
++ 	mddev->level = mddev->new_level;
++ 	mddev->layout = mddev->new_layout;
++ 	mddev->chunk_sectors = mddev->new_chunk_sectors;
++ 	mddev->delta_disks = 0;
++ 	mddev->reshape_backwards = 0;
++ 	mddev->degraded = 0;
++ 	spin_unlock(&mddev->lock);
+++>>>>>>> 36d091f4759d (md: protect ->pers changes with mddev->lock)
+  
+ -	if (oldpers->sync_request == NULL &&
+ +	if (mddev->pers->sync_request == NULL &&
+  	    mddev->external) {
+  		/* We are converting from a no-redundancy array
+  		 * to a redundancy array and metadata is managed
+@@@ -5084,22 -4936,20 +5105,28 @@@ int md_run(struct mddev *mddev
+  		printk(KERN_ERR
+  		       "md: invalid array_size %llu > default size %llu\n",
+  		       (unsigned long long)mddev->array_sectors / 2,
+- 		       (unsigned long long)mddev->pers->size(mddev, 0, 0) / 2);
++ 		       (unsigned long long)pers->size(mddev, 0, 0) / 2);
+  		err = -EINVAL;
+ +		mddev->pers->stop(mddev);
+  	}
+- 	if (err == 0 && mddev->pers->sync_request &&
++ 	if (err == 0 && pers->sync_request &&
+  	    (mddev->bitmap_info.file || mddev->bitmap_info.offset)) {
+  		err = bitmap_create(mddev);
+ -		if (err)
+ +		if (err) {
+  			printk(KERN_ERR "%s: failed to create bitmap (%d)\n",
+  			       mdname(mddev), err);
+ +			mddev->pers->stop(mddev);
+ +		}
+  	}
+  	if (err) {
+++<<<<<<< HEAD
+ +		module_put(mddev->pers->owner);
+ +		mddev->pers = NULL;
+++=======
++ 		mddev_detach(mddev);
++ 		pers->free(mddev, mddev->private);
++ 		module_put(pers->owner);
+++>>>>>>> 36d091f4759d (md: protect ->pers changes with mddev->lock)
+  		bitmap_destroy(mddev);
+  		return err;
+  	}
+@@@ -5270,14 -5123,38 +5300,48 @@@ void md_stop_writes(struct mddev *mddev
+  }
+  EXPORT_SYMBOL_GPL(md_stop_writes);
+  
+++<<<<<<< HEAD
+ +static void __md_stop(struct mddev *mddev)
+ +{
+ +	mddev->ready = 0;
+ +	mddev->pers->stop(mddev);
+ +	if (mddev->pers->sync_request && mddev->to_remove == NULL)
+ +		mddev->to_remove = &md_redundancy_group;
+ +	module_put(mddev->pers->owner);
+++=======
++ static void mddev_detach(struct mddev *mddev)
++ {
++ 	struct bitmap *bitmap = mddev->bitmap;
++ 	/* wait for behind writes to complete */
++ 	if (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
++ 		printk(KERN_INFO "md:%s: behind writes in progress - waiting to stop.\n",
++ 		       mdname(mddev));
++ 		/* need to kick something here to make sure I/O goes? */
++ 		wait_event(bitmap->behind_wait,
++ 			   atomic_read(&bitmap->behind_writes) == 0);
++ 	}
++ 	if (mddev->pers && mddev->pers->quiesce) {
++ 		mddev->pers->quiesce(mddev, 1);
++ 		mddev->pers->quiesce(mddev, 0);
++ 	}
++ 	md_unregister_thread(&mddev->thread);
++ 	if (mddev->queue)
++ 		blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
++ }
++ 
++ static void __md_stop(struct mddev *mddev)
++ {
++ 	struct md_personality *pers = mddev->pers;
++ 	mddev_detach(mddev);
++ 	spin_lock(&mddev->lock);
++ 	mddev->ready = 0;
+++>>>>>>> 36d091f4759d (md: protect ->pers changes with mddev->lock)
+  	mddev->pers = NULL;
++ 	spin_unlock(&mddev->lock);
++ 	pers->free(mddev, mddev->private);
++ 	if (pers->sync_request && mddev->to_remove == NULL)
++ 		mddev->to_remove = &md_redundancy_group;
++ 	module_put(pers->owner);
+  	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+  }
+  
+@@@ -7155,8 -7024,9 +7220,9 @@@ static int md_seq_show(struct seq_file 
+  
+  		seq_printf(seq, "\n");
+  	}
++ 	spin_unlock(&mddev->lock);
+  	mddev_unlock(mddev);
+ -
+ +	
+  	return 0;
+  }
+  
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 8c92b269b12b..bbc9d3ae09e6 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -391,6 +391,7 @@ struct mddev {
+ 	 *   rdev superblocks, events
+ 	 *   clearing MD_CHANGE_*
+ 	 *   in_sync - and related safemode and MD_CHANGE changes
++	 *   pers (also protected by reconfig_mutex and pending IO).
+ 	 */
+ 	spinlock_t			lock;
+ 	wait_queue_head_t		sb_wait;	/* for waiting on superblock updates */
