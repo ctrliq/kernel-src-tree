@@ -1,0 +1,269 @@
+xfs: remove xfs_filestream_associate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3b8d90766a85e079fefaee74ca9dde43ce75edea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3b8d9076.failed
+
+There is no good reason to create a filestream when a directory entry
+is created.  Delay it until the first allocation happens to simply
+the code and reduce the amount of mru cache lookups we do.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 3b8d90766a85e079fefaee74ca9dde43ce75edea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_filestream.c
+#	fs/xfs/xfs_filestream.h
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_filestream.c
+index 12b6e7701985,c8a8840e5027..000000000000
+--- a/fs/xfs/xfs_filestream.c
++++ b/fs/xfs/xfs_filestream.c
+@@@ -530,92 -325,28 +532,115 @@@ xfs_filestream_unmount
+   */
+  xfs_agnumber_t
+  xfs_filestream_lookup_ag(
+ -	struct xfs_inode	*ip)
+ +	xfs_inode_t	*ip)
+  {
+++<<<<<<< HEAD
+ +	xfs_mru_cache_t	*cache;
+ +	fstrm_item_t	*item;
+ +	xfs_agnumber_t	ag;
+ +	int		ref;
+++=======
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_inode	*pip = NULL;
++ 	xfs_agnumber_t		startag, ag = NULLAGNUMBER;
++ 	int			ref = 0;
++ 	struct xfs_mru_cache_elem *mru;
+++>>>>>>> 3b8d90766a85 (xfs: remove xfs_filestream_associate)
+ +
+ +	if (!S_ISREG(ip->i_d.di_mode) && !S_ISDIR(ip->i_d.di_mode)) {
+ +		ASSERT(0);
+ +		return NULLAGNUMBER;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	cache = ip->i_mount->m_filestream;
+ +	item = xfs_mru_cache_lookup(cache, ip->i_ino);
+ +	if (!item) {
+ +		TRACE_LOOKUP(ip->i_mount, ip, NULL, NULLAGNUMBER, 0);
+ +		return NULLAGNUMBER;
+ +	}
+ +
+ +	ASSERT(ip == item->ip);
+ +	ag = item->ag;
+ +	ref = xfs_filestream_peek_ag(ip->i_mount, ag);
+ +	xfs_mru_cache_done(cache);
+ +
+ +	TRACE_LOOKUP(ip->i_mount, ip, item->pip, ag, ref);
+ +	return ag;
+ +}
+  
+ +/*
+ + * xfs_filestream_associate() should only be called to associate a regular file
+ + * with its parent directory.  Calling it with a child directory isn't
+ + * appropriate because filestreams don't apply to entire directory hierarchies.
+ + * Creating a file in a child directory of an existing filestream directory
+ + * starts a new filestream with its own allocation group association.
+ + *
+ + * Returns < 0 on error, 0 if successful association occurred, > 0 if
+ + * we failed to get an association because of locking issues.
+ + */
+ +int
+ +xfs_filestream_associate(
+ +	xfs_inode_t	*pip,
+ +	xfs_inode_t	*ip)
+ +{
+ +	xfs_mount_t	*mp;
+ +	xfs_mru_cache_t	*cache;
+ +	fstrm_item_t	*item;
+ +	xfs_agnumber_t	ag, rotorstep, startag;
+ +	int		err = 0;
+ +
+ +	ASSERT(S_ISDIR(pip->i_d.di_mode));
+  	ASSERT(S_ISREG(ip->i_d.di_mode));
+ +	if (!S_ISDIR(pip->i_d.di_mode) || !S_ISREG(ip->i_d.di_mode))
+ +		return -EINVAL;
+ +
+ +	mp = pip->i_mount;
+ +	cache = mp->m_filestream;
+ +
+ +	/*
+ +	 * We have a problem, Houston.
+ +	 *
+ +	 * Taking the iolock here violates inode locking order - we already
+ +	 * hold the ilock. Hence if we block getting this lock we may never
+ +	 * wake. Unfortunately, that means if we can't get the lock, we're
+ +	 * screwed in terms of getting a stream association - we can't spin
+ +	 * waiting for the lock because someone else is waiting on the lock we
+ +	 * hold and we cannot drop that as we are in a transaction here.
+ +	 *
+ +	 * Lucky for us, this inversion is not a problem because it's a
+ +	 * directory inode that we are trying to lock here.
+ +	 *
+ +	 * So, if we can't get the iolock without sleeping then just give up
+ +	 */
+ +	if (!xfs_ilock_nowait(pip, XFS_IOLOCK_EXCL))
+ +		return 1;
+ +
+ +	/* If the parent directory is already in the cache, use its AG. */
+ +	item = xfs_mru_cache_lookup(cache, pip->i_ino);
+ +	if (item) {
+ +		ASSERT(item->ip == pip);
+ +		ag = item->ag;
+ +		xfs_mru_cache_done(cache);
+ +
+ +		TRACE_LOOKUP(mp, pip, pip, ag, xfs_filestream_peek_ag(mp, ag));
+ +		err = _xfs_filestream_update_ag(ip, pip, ag);
+  
+ +		goto exit;
+++=======
++ 	pip = xfs_filestream_get_parent(ip);
++ 	if (!pip)
++ 		goto out;
++ 
++ 	mru = xfs_mru_cache_lookup(mp->m_filestream, pip->i_ino);
++ 	if (mru) {
++ 		ag = container_of(mru, struct xfs_fstrm_item, mru)->ag;
++ 		xfs_mru_cache_done(mp->m_filestream);
++ 
++ 		ref = xfs_filestream_peek_ag(ip->i_mount, ag);
++ 		TRACE_LOOKUP(mp, ip, pip, ag, ref);
++ 		goto out;
+++>>>>>>> 3b8d90766a85 (xfs: remove xfs_filestream_associate)
+  	}
+  
+  	/*
+@@@ -630,35 -361,11 +655,43 @@@
+  	} else
+  		startag = XFS_INO_TO_AGNO(mp, pip->i_ino);
+  
+++<<<<<<< HEAD
+ +	/* Pick a new AG for the parent inode starting at startag. */
+ +	err = _xfs_filestream_pick_ag(mp, startag, &ag, 0, 0);
+ +	if (err || ag == NULLAGNUMBER)
+ +		goto exit_did_pick;
+ +
+ +	/* Associate the parent inode with the AG. */
+ +	err = _xfs_filestream_update_ag(pip, NULL, ag);
+ +	if (err)
+ +		goto exit_did_pick;
+ +
+ +	/* Associate the file inode with the AG. */
+ +	err = _xfs_filestream_update_ag(ip, pip, ag);
+ +	if (err)
+ +		goto exit_did_pick;
+ +
+ +	TRACE_ASSOCIATE(mp, ip, pip, ag, xfs_filestream_peek_ag(mp, ag));
+ +
+ +exit_did_pick:
+ +	/*
+ +	 * If _xfs_filestream_pick_ag() returned a valid AG, remove the
+ +	 * reference it took on it, since the file and directory will have taken
+ +	 * their own now if they were successfully cached.
+ +	 */
+ +	if (ag != NULLAGNUMBER)
+ +		xfs_filestream_put_ag(mp, ag);
+ +
+ +exit:
+ +	xfs_iunlock(pip, XFS_IOLOCK_EXCL);
+ +	return -err;
+++=======
++ 	if (xfs_filestream_pick_ag(pip, startag, &ag, 0, 0))
++ 		ag = NULLAGNUMBER;
++ out:
++ 	IRELE(pip);
++ 	return ag;
+++>>>>>>> 3b8d90766a85 (xfs: remove xfs_filestream_associate)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_filestream.h
+index 6d61dbee8564,2de853e03bf1..000000000000
+--- a/fs/xfs/xfs_filestream.h
++++ b/fs/xfs/xfs_filestream.h
+@@@ -20,44 -20,14 +20,47 @@@
+  
+  struct xfs_mount;
+  struct xfs_inode;
+ +struct xfs_perag;
+  struct xfs_bmalloca;
+  
+ +#ifdef XFS_FILESTREAMS_TRACE
+ +#define XFS_FSTRM_KTRACE_INFO		1
+ +#define XFS_FSTRM_KTRACE_AGSCAN		2
+ +#define XFS_FSTRM_KTRACE_AGPICK1	3
+ +#define XFS_FSTRM_KTRACE_AGPICK2	4
+ +#define XFS_FSTRM_KTRACE_UPDATE		5
+ +#define XFS_FSTRM_KTRACE_FREE		6
+ +#define	XFS_FSTRM_KTRACE_ITEM_LOOKUP	7
+ +#define	XFS_FSTRM_KTRACE_ASSOCIATE	8
+ +#define	XFS_FSTRM_KTRACE_MOVEAG		9
+ +#define	XFS_FSTRM_KTRACE_ORPHAN		10
+ +
+ +#define XFS_FSTRM_KTRACE_SIZE	16384
+ +extern ktrace_t *xfs_filestreams_trace_buf;
+ +
+ +#endif
+ +
+ +/* allocation selection flags */
+ +typedef enum xfs_fstrm_alloc {
+ +	XFS_PICK_USERDATA = 1,
+ +	XFS_PICK_LOWSPACE = 2,
+ +} xfs_fstrm_alloc_t;
+ +
+ +/* prototypes for filestream.c */
+ +int xfs_filestream_init(void);
+ +void xfs_filestream_uninit(void);
+  int xfs_filestream_mount(struct xfs_mount *mp);
+  void xfs_filestream_unmount(struct xfs_mount *mp);
+ -void xfs_filestream_deassociate(struct xfs_inode *ip);
+  xfs_agnumber_t xfs_filestream_lookup_ag(struct xfs_inode *ip);
+++<<<<<<< HEAD
+ +int xfs_filestream_associate(struct xfs_inode *dip, struct xfs_inode *ip);
+ +void xfs_filestream_deassociate(struct xfs_inode *ip);
+++=======
+++>>>>>>> 3b8d90766a85 (xfs: remove xfs_filestream_associate)
+  int xfs_filestream_new_ag(struct xfs_bmalloca *ap, xfs_agnumber_t *agp);
+  
+ +
+ +/* filestreams for the inode? */
+  static inline int
+  xfs_inode_is_filestream(
+  	struct xfs_inode	*ip)
+diff --cc fs/xfs/xfs_inode.c
+index 5be5ff7bf7b6,cec18e9ba1da..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -842,15 -836,6 +834,18 @@@ xfs_ialloc
+  	/* now that we have an i_mode we can setup inode ops and unlock */
+  	xfs_setup_inode(ip);
+  
+++<<<<<<< HEAD
+ +	/* now we have set up the vfs inode we can associate the filestream */
+ +	if (filestreams) {
+ +		error = xfs_filestream_associate(pip, ip);
+ +		if (error < 0)
+ +			return -error;
+ +		if (!error)
+ +			xfs_iflags_set(ip, XFS_IFILESTREAM);
+ +	}
+ +
+++=======
+++>>>>>>> 3b8d90766a85 (xfs: remove xfs_filestream_associate)
+  	*ipp = ip;
+  	return 0;
+  }
+* Unmerged path fs/xfs/xfs_filestream.c
+* Unmerged path fs/xfs/xfs_filestream.h
+* Unmerged path fs/xfs/xfs_inode.c
