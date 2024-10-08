@@ -293,27 +293,31 @@ system_call_pSeries:
 	 * out of line to handle them
 	 */
 	. = 0xe00
-hv_exception_trampoline:
+hv_data_storage_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	h_data_storage_hv
 
 	. = 0xe20
+hv_instr_storage_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	h_instr_storage_hv
 
 	. = 0xe40
+emulation_assist_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	emulation_assist_hv
 
 	. = 0xe60
+hv_exception_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	hmi_exception_hv
 
 	. = 0xe80
+hv_doorbell_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	h_doorbell_hv
@@ -813,6 +817,7 @@ system_call_relon_pSeries:
 	b	h_instr_storage_relon_hv
 
 	. = 0x4e40
+emulation_assist_relon_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	emulation_assist_relon_hv
@@ -823,6 +828,7 @@ system_call_relon_pSeries:
 	b	hmi_exception_relon_hv
 
 	. = 0x4e80
+h_doorbell_relon_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
 	b	h_doorbell_relon_hv
