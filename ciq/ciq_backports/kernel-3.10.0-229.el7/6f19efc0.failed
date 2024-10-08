@@ -1,0 +1,454 @@
+cpufreq: Add boost frequency support in core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Add boost frequency support in core (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 88.61%
+commit-author Lukasz Majewski <l.majewski@samsung.com>
+commit 6f19efc0a1ca08bc61841b971d8b85ab505d95c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6f19efc0.failed
+
+This commit adds boost frequency support in cpufreq core (Hardware &
+Software). Some SoCs (like Exynos4 - e.g. 4x12) allow setting frequency
+above its normal operation limits. Such mode shall be only used for a
+short time.
+
+Overclocking (boost) support is essentially provided by platform
+dependent cpufreq driver.
+
+This commit unifies support for SW and HW (Intel) overclocking solutions
+in the core cpufreq driver. Previously the "boost" sysfs attribute was
+defined in the ACPI processor driver code. By default boost is disabled.
+One global attribute is available at: /sys/devices/system/cpu/cpufreq/boost.
+
+It only shows up when cpufreq driver supports overclocking.
+Under the hood frequencies dedicated for boosting are marked with a
+special flag (CPUFREQ_BOOST_FREQ) at driver's frequency table.
+It is the user's concern to enable/disable overclocking with a proper call
+to sysfs.
+
+The cpufreq_boost_trigger_state() function is defined non static on purpose.
+It is used later with thermal subsystem to provide automatic enable/disable
+of the BOOST feature.
+
+	Signed-off-by: Lukasz Majewski <l.majewski@samsung.com>
+	Signed-off-by: Myungjoo Ham <myungjoo.ham@samsung.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 6f19efc0a1ca08bc61841b971d8b85ab505d95c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/freq_table.c
+#	include/linux/cpufreq.h
+diff --cc drivers/cpufreq/freq_table.c
+index 8962d53f6e56,8e54f97899ba..000000000000
+--- a/drivers/cpufreq/freq_table.c
++++ b/drivers/cpufreq/freq_table.c
+@@@ -213,14 -246,43 +232,46 @@@ static ssize_t show_available_freqs(str
+  
+  }
+  
+- struct freq_attr cpufreq_freq_attr_scaling_available_freqs = {
+- 	.attr = { .name = "scaling_available_frequencies",
+- 		  .mode = 0444,
+- 		},
+- 	.show = show_available_freqs,
+- };
++ #define cpufreq_attr_available_freq(_name)	  \
++ struct freq_attr cpufreq_freq_attr_##_name##_freqs =     \
++ __ATTR_RO(_name##_frequencies)
++ 
++ /**
++  * show_scaling_available_frequencies - show available normal frequencies for
++  * the specified CPU
++  */
++ static ssize_t scaling_available_frequencies_show(struct cpufreq_policy *policy,
++ 						  char *buf)
++ {
++ 	return show_available_freqs(policy, buf, false);
++ }
++ cpufreq_attr_available_freq(scaling_available);
+  EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_available_freqs);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * show_available_boost_freqs - show available boost frequencies for
++  * the specified CPU
++  */
++ static ssize_t scaling_boost_frequencies_show(struct cpufreq_policy *policy,
++ 					      char *buf)
++ {
++ 	return show_available_freqs(policy, buf, true);
++ }
++ cpufreq_attr_available_freq(scaling_boost);
++ EXPORT_SYMBOL_GPL(cpufreq_freq_attr_scaling_boost_freqs);
++ 
++ struct freq_attr *cpufreq_generic_attr[] = {
++ 	&cpufreq_freq_attr_scaling_available_freqs,
++ #ifdef CONFIG_CPU_FREQ_BOOST_SW
++ 	&cpufreq_freq_attr_scaling_boost_freqs,
++ #endif
++ 	NULL,
++ };
++ EXPORT_SYMBOL_GPL(cpufreq_generic_attr);
++ 
+++>>>>>>> 6f19efc0a1ca (cpufreq: Add boost frequency support in core)
+  /*
+   * if you use these, you must assure that the frequency table is valid
+   * all the time between get_attr and put_attr!
+diff --cc include/linux/cpufreq.h
+index 4d87da0ff71a,4d89e0e6f9cc..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -331,26 -200,136 +331,100 @@@ __ATTR(_name, 0444, show_##_name, NULL
+  static struct global_attr _name =		\
+  __ATTR(_name, 0644, show_##_name, store_##_name)
+  
+++<<<<<<< HEAD
+ +struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu);
+ +void cpufreq_cpu_put(struct cpufreq_policy *data);
+++=======
++ 
++ struct cpufreq_driver {
++ 	char			name[CPUFREQ_NAME_LEN];
++ 	u8			flags;
++ 
++ 	/* needed by all drivers */
++ 	int	(*init)		(struct cpufreq_policy *policy);
++ 	int	(*verify)	(struct cpufreq_policy *policy);
++ 
++ 	/* define one out of two */
++ 	int	(*setpolicy)	(struct cpufreq_policy *policy);
++ 	int	(*target)	(struct cpufreq_policy *policy,	/* Deprecated */
++ 				 unsigned int target_freq,
++ 				 unsigned int relation);
++ 	int	(*target_index)	(struct cpufreq_policy *policy,
++ 				 unsigned int index);
++ 
++ 	/* should be defined, if possible */
++ 	unsigned int	(*get)	(unsigned int cpu);
++ 
++ 	/* optional */
++ 	int	(*bios_limit)	(int cpu, unsigned int *limit);
++ 
++ 	int	(*exit)		(struct cpufreq_policy *policy);
++ 	int	(*suspend)	(struct cpufreq_policy *policy);
++ 	int	(*resume)	(struct cpufreq_policy *policy);
++ 	struct freq_attr	**attr;
++ 
++ 	/* platform specific boost support code */
++ 	bool                    boost_supported;
++ 	bool                    boost_enabled;
++ 	int     (*set_boost)    (int state);
++ };
++ 
++ /* flags */
++ #define CPUFREQ_STICKY		(1 << 0)	/* driver isn't removed even if
++ 						   all ->init() calls failed */
++ #define CPUFREQ_CONST_LOOPS	(1 << 1)	/* loops_per_jiffy or other
++ 						   kernel "constants" aren't
++ 						   affected by frequency
++ 						   transitions */
++ #define CPUFREQ_PM_NO_WARN	(1 << 2)	/* don't warn on suspend/resume
++ 						   speed mismatches */
++ 
++ /*
++  * This should be set by platforms having multiple clock-domains, i.e.
++  * supporting multiple policies. With this sysfs directories of governor would
++  * be created in cpu/cpu<num>/cpufreq/ directory and so they can use the same
++  * governor with different tunables for different clusters.
++  */
++ #define CPUFREQ_HAVE_GOVERNOR_PER_POLICY (1 << 3)
++ 
++ /*
++  * Driver will do POSTCHANGE notifications from outside of their ->target()
++  * routine and so must set cpufreq_driver->flags with this flag, so that core
++  * can handle them specially.
++  */
++ #define CPUFREQ_ASYNC_NOTIFICATION  (1 << 4)
++ 
++ /*
++  * Set by drivers which want cpufreq core to check if CPU is running at a
++  * frequency present in freq-table exposed by the driver. For these drivers if
++  * CPU is found running at an out of table freq, we will try to set it to a freq
++  * from the table. And if that fails, we will stop further boot process by
++  * issuing a BUG_ON().
++  */
++ #define CPUFREQ_NEED_INITIAL_FREQ_CHECK	(1 << 5)
++ 
++ int cpufreq_register_driver(struct cpufreq_driver *driver_data);
++ int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
++ 
+++>>>>>>> 6f19efc0a1ca (cpufreq: Add boost frequency support in core)
+  const char *cpufreq_get_current_driver(void);
+  
+ -static inline void cpufreq_verify_within_limits(struct cpufreq_policy *policy,
+ -		unsigned int min, unsigned int max)
+ -{
+ -	if (policy->min < min)
+ -		policy->min = min;
+ -	if (policy->max < min)
+ -		policy->max = min;
+ -	if (policy->min > max)
+ -		policy->min = max;
+ -	if (policy->max > max)
+ -		policy->max = max;
+ -	if (policy->min > policy->max)
+ -		policy->min = policy->max;
+ -	return;
+ -}
+ -
+ -static inline void
+ -cpufreq_verify_within_cpu_limits(struct cpufreq_policy *policy)
+ -{
+ -	cpufreq_verify_within_limits(policy, policy->cpuinfo.min_freq,
+ -			policy->cpuinfo.max_freq);
+ -}
+ -
+  /*********************************************************************
+ - *                     CPUFREQ NOTIFIER INTERFACE                    *
+ + *                        CPUFREQ 2.6. INTERFACE                     *
+   *********************************************************************/
+ -
+ -#define CPUFREQ_TRANSITION_NOTIFIER	(0)
+ -#define CPUFREQ_POLICY_NOTIFIER		(1)
+ -
+ -/* Transition notifiers */
+ -#define CPUFREQ_PRECHANGE		(0)
+ -#define CPUFREQ_POSTCHANGE		(1)
+ -#define CPUFREQ_RESUMECHANGE		(8)
+ -#define CPUFREQ_SUSPENDCHANGE		(9)
+ -
+ -/* Policy Notifiers  */
+ -#define CPUFREQ_ADJUST			(0)
+ -#define CPUFREQ_INCOMPATIBLE		(1)
+ -#define CPUFREQ_NOTIFY			(2)
+ -#define CPUFREQ_START			(3)
+ -#define CPUFREQ_UPDATE_POLICY_CPU	(4)
+ -#define CPUFREQ_CREATE_POLICY		(5)
+ -#define CPUFREQ_REMOVE_POLICY		(6)
+ +u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
+ +int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
+ +int cpufreq_update_policy(unsigned int cpu);
+ +bool have_governor_per_policy(void);
+ +struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+  
+  #ifdef CONFIG_CPU_FREQ
+ -int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list);
+ -int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list);
+ -
+ -void cpufreq_notify_transition(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs, unsigned int state);
+ -void cpufreq_notify_post_transition(struct cpufreq_policy *policy,
+ -		struct cpufreq_freqs *freqs, int transition_failed);
+ -
+ -#else /* CONFIG_CPU_FREQ */
+ -static inline int cpufreq_register_notifier(struct notifier_block *nb,
+ -						unsigned int list)
+ +/*
+ + * query the current CPU frequency (in kHz). If zero, cpufreq couldn't detect it
+ + */
+ +unsigned int cpufreq_get(unsigned int cpu);
+ +#else
+ +static inline unsigned int cpufreq_get(unsigned int cpu)
+  {
+  	return 0;
+  }
+@@@ -427,7 -463,28 +502,32 @@@ int cpufreq_frequency_table_target(stru
+  int cpufreq_frequency_table_get_index(struct cpufreq_policy *policy,
+  		unsigned int freq);
+  
+++<<<<<<< HEAD
+ +/* the following 3 funtions are for cpufreq core use only */
+++=======
++ void cpufreq_frequency_table_update_policy_cpu(struct cpufreq_policy *policy);
++ ssize_t cpufreq_show_cpus(const struct cpumask *mask, char *buf);
++ 
++ #ifdef CONFIG_CPU_FREQ
++ int cpufreq_boost_trigger_state(int state);
++ int cpufreq_boost_supported(void);
++ int cpufreq_boost_enabled(void);
++ #else
++ static inline int cpufreq_boost_trigger_state(int state)
++ {
++ 	return 0;
++ }
++ static inline int cpufreq_boost_supported(void)
++ {
++ 	return 0;
++ }
++ static inline int cpufreq_boost_enabled(void)
++ {
++ 	return 0;
++ }
++ #endif
++ /* the following funtion is for cpufreq core use only */
+++>>>>>>> 6f19efc0a1ca (cpufreq: Add boost frequency support in core)
+  struct cpufreq_frequency_table *cpufreq_frequency_get_table(unsigned int cpu);
+  
+  /* the following are really really optional */
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index c8bc717e8458..ec21cd9c11e8 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -343,6 +343,33 @@ EXPORT_SYMBOL_GPL(cpufreq_notify_transition);
+ /*********************************************************************
+  *                          SYSFS INTERFACE                          *
+  *********************************************************************/
++ssize_t show_boost(struct kobject *kobj,
++				 struct attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", cpufreq_driver->boost_enabled);
++}
++
++static ssize_t store_boost(struct kobject *kobj, struct attribute *attr,
++				  const char *buf, size_t count)
++{
++	int ret, enable;
++
++	ret = sscanf(buf, "%d", &enable);
++	if (ret != 1 || enable < 0 || enable > 1)
++		return -EINVAL;
++
++	if (cpufreq_boost_trigger_state(enable)) {
++		pr_err("%s: Cannot %s BOOST!\n", __func__,
++		       enable ? "enable" : "disable");
++		return -EINVAL;
++	}
++
++	pr_debug("%s: cpufreq BOOST %s\n", __func__,
++		 enable ? "enabled" : "disabled");
++
++	return count;
++}
++define_one_global_rw(boost);
+ 
+ static struct cpufreq_governor *__find_governor(const char *str_governor)
+ {
+@@ -1990,6 +2017,73 @@ static struct notifier_block __refdata cpufreq_cpu_notifier = {
+ 	.notifier_call = cpufreq_cpu_callback,
+ };
+ 
++/*********************************************************************
++ *               BOOST						     *
++ *********************************************************************/
++static int cpufreq_boost_set_sw(int state)
++{
++	struct cpufreq_frequency_table *freq_table;
++	struct cpufreq_policy *policy;
++	int ret = -EINVAL;
++
++	list_for_each_entry(policy, &cpufreq_policy_list, policy_list) {
++		freq_table = cpufreq_frequency_get_table(policy->cpu);
++		if (freq_table) {
++			ret = cpufreq_frequency_table_cpuinfo(policy,
++							freq_table);
++			if (ret) {
++				pr_err("%s: Policy frequency update failed\n",
++				       __func__);
++				break;
++			}
++			policy->user_policy.max = policy->max;
++			__cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
++		}
++	}
++
++	return ret;
++}
++
++int cpufreq_boost_trigger_state(int state)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (cpufreq_driver->boost_enabled == state)
++		return 0;
++
++	write_lock_irqsave(&cpufreq_driver_lock, flags);
++	cpufreq_driver->boost_enabled = state;
++	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++
++	ret = cpufreq_driver->set_boost(state);
++	if (ret) {
++		write_lock_irqsave(&cpufreq_driver_lock, flags);
++		cpufreq_driver->boost_enabled = !state;
++		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++
++		pr_err("%s: Cannot %s BOOST\n", __func__,
++		       state ? "enable" : "disable");
++	}
++
++	return ret;
++}
++
++int cpufreq_boost_supported(void)
++{
++	if (likely(cpufreq_driver))
++		return cpufreq_driver->boost_supported;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cpufreq_boost_supported);
++
++int cpufreq_boost_enabled(void)
++{
++	return cpufreq_driver->boost_enabled;
++}
++EXPORT_SYMBOL_GPL(cpufreq_boost_enabled);
++
+ /*********************************************************************
+  *               REGISTER / UNREGISTER CPUFREQ DRIVER                *
+  *********************************************************************/
+@@ -2029,9 +2123,25 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
+ 	cpufreq_driver = driver_data;
+ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ 
++	if (cpufreq_boost_supported()) {
++		/*
++		 * Check if driver provides function to enable boost -
++		 * if not, use cpufreq_boost_set_sw as default
++		 */
++		if (!cpufreq_driver->set_boost)
++			cpufreq_driver->set_boost = cpufreq_boost_set_sw;
++
++		ret = cpufreq_sysfs_create_file(&boost.attr);
++		if (ret) {
++			pr_err("%s: cannot register global BOOST sysfs file\n",
++				__func__);
++			goto err_null_driver;
++		}
++	}
++
+ 	ret = subsys_interface_register(&cpufreq_interface);
+ 	if (ret)
+-		goto err_null_driver;
++		goto err_boost_unreg;
+ 
+ 	if (!(cpufreq_driver->flags & CPUFREQ_STICKY)) {
+ 		int i;
+@@ -2058,6 +2168,9 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
+ 	return 0;
+ err_if_unreg:
+ 	subsys_interface_unregister(&cpufreq_interface);
++err_boost_unreg:
++	if (cpufreq_boost_supported())
++		cpufreq_sysfs_remove_file(&boost.attr);
+ err_null_driver:
+ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ 	cpufreq_driver = NULL;
+@@ -2084,6 +2197,9 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
+ 	pr_debug("unregistering driver %s\n", driver->name);
+ 
+ 	subsys_interface_unregister(&cpufreq_interface);
++	if (cpufreq_boost_supported())
++		cpufreq_sysfs_remove_file(&boost.attr);
++
+ 	unregister_hotcpu_notifier(&cpufreq_cpu_notifier);
+ 
+ 	down_write(&cpufreq_rwsem);
+* Unmerged path drivers/cpufreq/freq_table.c
+* Unmerged path include/linux/cpufreq.h
