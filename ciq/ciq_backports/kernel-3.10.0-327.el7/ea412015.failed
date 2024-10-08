@@ -1,0 +1,147 @@
+ixgbe: adds x550 specific FCoE offloads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Vasu Dev <vasu.dev@intel.com>
+commit ea412015a2e72faf066e90765bdd1dc4e4ecea41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ea412015.failed
+
+Adds x550 specific FCoE offloads for DDP context programming and
+increased DDP exchanges.
+
+	Signed-off-by: Vasu Dev <vasu.dev@intel.com>
+	Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit ea412015a2e72faf066e90765bdd1dc4e4ecea41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+index 25a3dfef33e8,631c603fc966..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+@@@ -83,17 -84,40 +84,40 @@@ int ixgbe_fcoe_ddp_put(struct net_devic
+  	fcoe = &adapter->fcoe;
+  	ddp = &fcoe->ddp[xid];
+  	if (!ddp->udl)
+ -		return 0;
+ +		goto out_ddp_put;
+  
++ 	hw = &adapter->hw;
+  	len = ddp->len;
+- 	/* if there an error, force to invalidate ddp context */
+- 	if (ddp->err) {
++ 	/* if no error then skip ddp context invalidation */
++ 	if (!ddp->err)
++ 		goto skip_ddpinv;
++ 
++ 	if (hw->mac.type == ixgbe_mac_X550) {
++ 		/* X550 does not require DDP FCoE lock */
++ 
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDFC(0, xid), 0);
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDFC(3, xid),
++ 				(xid | IXGBE_FCFLTRW_WE));
++ 
++ 		/* program FCBUFF */
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDDC(2, xid), 0);
++ 
++ 		/* program FCDMARW */
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDDC(3, xid),
++ 				(xid | IXGBE_FCDMARW_WE));
++ 
++ 		/* read FCBUFF to check context invalidated */
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDDC(3, xid),
++ 				(xid | IXGBE_FCDMARW_RE));
++ 		fcbuff = IXGBE_READ_REG(hw, IXGBE_FCDDC(2, xid));
++ 	} else {
++ 		/* other hardware requires DDP FCoE lock */
+  		spin_lock_bh(&fcoe->lock);
+- 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_FCFLT, 0);
+- 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_FCFLTRW,
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCFLT, 0);
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCFLTRW,
+  				(xid | IXGBE_FCFLTRW_WE));
+- 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_FCBUFF, 0);
+- 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_FCDMARW,
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCBUFF, 0);
++ 		IXGBE_WRITE_REG(hw, IXGBE_FCDMARW,
+  				(xid | IXGBE_FCDMARW_WE));
+  
+  		/* guaranteed to be invalidated after 100us */
+@@@ -393,8 -436,12 +437,17 @@@ int ixgbe_fcoe_ddp(struct ixgbe_adapte
+  	else
+  		xid =  be16_to_cpu(fh->fh_rx_id);
+  
+++<<<<<<< HEAD
+ +	if (xid >= IXGBE_FCOE_DDP_MAX)
+ +		goto ddp_out;
+++=======
++ 	ddp_max = IXGBE_FCOE_DDP_MAX;
++ 	/* X550 has different DDP Max limit */
++ 	if (adapter->hw.mac.type == ixgbe_mac_X550)
++ 		ddp_max = IXGBE_FCOE_DDP_MAX_X550;
++ 	if (xid >= ddp_max)
++ 		return -EINVAL;
+++>>>>>>> ea412015a2e7 (ixgbe: adds x550 specific FCoE offloads)
+  
+  	fcoe = &adapter->fcoe;
+  	ddp = &fcoe->ddp[xid];
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.h
+index 0772b7730fce..38385876effb 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.h
+@@ -46,6 +46,7 @@
+ #define IXGBE_FCBUFF_MAX	65536	/* 64KB max */
+ #define IXGBE_FCBUFF_MIN	4096	/* 4KB min */
+ #define IXGBE_FCOE_DDP_MAX	512	/* 9 bits xid */
++#define IXGBE_FCOE_DDP_MAX_X550	2048	/* 11 bits xid */
+ 
+ /* Default traffic class to use for FCoE */
+ #define IXGBE_FCOE_DEFTC	3
+@@ -77,7 +78,7 @@ struct ixgbe_fcoe {
+ 	struct ixgbe_fcoe_ddp_pool __percpu *ddp_pool;
+ 	atomic_t refcnt;
+ 	spinlock_t lock;
+-	struct ixgbe_fcoe_ddp ddp[IXGBE_FCOE_DDP_MAX];
++	struct ixgbe_fcoe_ddp ddp[IXGBE_FCOE_DDP_MAX_X550];
+ 	void *extra_ddp_buffer;
+ 	dma_addr_t extra_ddp_buffer_dma;
+ 	unsigned long mode;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+index 3e23c5923c0e..f4114bd5c11d 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -601,6 +601,8 @@ struct ixgbe_thermal_sensor_data {
+ 	(IXGBE_RTTBCNRC_RF_DEC_MASK << IXGBE_RTTBCNRC_RF_INT_SHIFT)
+ #define IXGBE_RTTBCNRM    0x04980
+ 
++/* FCoE Direct DMA Context */
++#define IXGBE_FCDDC(_i, _j)	(0x20000 + ((_i) * 0x4) + ((_j) * 0x10))
+ /* FCoE DMA Context Registers */
+ #define IXGBE_FCPTRL    0x02410 /* FC User Desc. PTR Low */
+ #define IXGBE_FCPTRH    0x02414 /* FC USer Desc. PTR High */
+@@ -627,6 +629,9 @@ struct ixgbe_thermal_sensor_data {
+ #define IXGBE_TSOFF     0x04A98 /* Tx FC SOF */
+ #define IXGBE_REOFF     0x05158 /* Rx FC EOF */
+ #define IXGBE_RSOFF     0x051F8 /* Rx FC SOF */
++/* FCoE Direct Filter Context */
++#define IXGBE_FCDFC(_i, _j)	(0x28000 + ((_i) * 0x4) + ((_j) * 0x10))
++#define IXGBE_FCDFCD(_i)	(0x30000 + ((_i) * 0x4))
+ /* FCoE Filter Context Registers */
+ #define IXGBE_FCFLT     0x05108 /* FC FLT Context */
+ #define IXGBE_FCFLTRW   0x05110 /* FC Filter RW Control */
+@@ -657,6 +662,10 @@ struct ixgbe_thermal_sensor_data {
+ #define IXGBE_FCRECTL_ENA       0x1        /* FCoE Redir Table Enable */
+ #define IXGBE_FCRETA_SIZE       8          /* Max entries in FCRETA */
+ #define IXGBE_FCRETA_ENTRY_MASK 0x0000007f /* 7 bits for the queue index */
++#define IXGBE_FCRETA_SIZE_X550	32 /* Max entries in FCRETA */
++/* Higher 7 bits for the queue index */
++#define IXGBE_FCRETA_ENTRY_HIGH_MASK	0x007F0000
++#define IXGBE_FCRETA_ENTRY_HIGH_SHIFT	16
+ 
+ /* Stats registers */
+ #define IXGBE_CRCERRS   0x04000
