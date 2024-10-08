@@ -1,0 +1,163 @@
+rhashtable: involve rhashtable_lookup_insert routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ying Xue <ying.xue@windriver.com>
+commit db30485408326a6f466a843b291b23535f63eda0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/db304854.failed
+
+Involve a new function called rhashtable_lookup_insert() which makes
+lookup and insertion atomic under bucket lock protection, helping us
+avoid to introduce an extra lock when we search and insert an object
+into hash table.
+
+	Signed-off-by: Ying Xue <ying.xue@windriver.com>
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit db30485408326a6f466a843b291b23535f63eda0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index be20e9720492,4430233c4e11..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -316,8 -475,56 +316,59 @@@ int rhashtable_shrink(struct rhashtabl
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_shrink);
+  
+++<<<<<<< HEAD
+++=======
++ static void rht_deferred_worker(struct work_struct *work)
++ {
++ 	struct rhashtable *ht;
++ 	struct bucket_table *tbl;
++ 
++ 	ht = container_of(work, struct rhashtable, run_work.work);
++ 	mutex_lock(&ht->mutex);
++ 	tbl = rht_dereference(ht->tbl, ht);
++ 
++ 	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
++ 		rhashtable_expand(ht);
++ 	else if (ht->p.shrink_decision && ht->p.shrink_decision(ht, tbl->size))
++ 		rhashtable_shrink(ht);
++ 
++ 	mutex_unlock(&ht->mutex);
++ }
++ 
++ static void rhashtable_wakeup_worker(struct rhashtable *ht)
++ {
++ 	struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 	struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	size_t size = tbl->size;
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl &&
++ 	    ((ht->p.grow_decision && ht->p.grow_decision(ht, size)) ||
++ 	     (ht->p.shrink_decision && ht->p.shrink_decision(ht, size))))
++ 		schedule_delayed_work(&ht->run_work, 0);
++ }
++ 
++ static void __rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj,
++ 				struct bucket_table *tbl, u32 hash)
++ {
++ 	struct rhash_head *head = rht_dereference_bucket(tbl->buckets[hash],
++ 							 tbl, hash);
++ 
++ 	if (rht_is_a_nulls(head))
++ 		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
++ 	else
++ 		RCU_INIT_POINTER(obj->next, head);
++ 
++ 	rcu_assign_pointer(tbl->buckets[hash], obj);
++ 
++ 	atomic_inc(&ht->nelems);
++ 
++ 	rhashtable_wakeup_worker(ht);
++ }
++ 
+++>>>>>>> db3048540832 (rhashtable: involve rhashtable_lookup_insert routine)
+  /**
+-  * rhashtable_insert - insert object into hash hash table
++  * rhashtable_insert - insert object into hash table
+   * @ht:		hash table
+   * @obj:	pointer to hash head inside object
+   *
+@@@ -329,18 -540,21 +380,34 @@@
+   */
+  void rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj)
+  {
+++<<<<<<< HEAD
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+ +	u32 hash;
+++=======
++ 	struct bucket_table *tbl;
++ 	spinlock_t *lock;
++ 	unsigned hash;
+++>>>>>>> db3048540832 (rhashtable: involve rhashtable_lookup_insert routine)
+  
+ -	rcu_read_lock();
+ +	ASSERT_RHT_MUTEX(ht);
+  
+ -	tbl = rht_dereference_rcu(ht->future_tbl, ht);
+  	hash = head_hashfn(ht, tbl, obj);
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(obj->next, tbl->buckets[hash]);
+ +	rcu_assign_pointer(tbl->buckets[hash], obj);
+ +	ht->nelems++;
+ +
+ +	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
+ +		rhashtable_expand(ht);
+++=======
++ 	lock = bucket_lock(tbl, hash);
++ 
++ 	spin_lock_bh(lock);
++ 	__rhashtable_insert(ht, obj, tbl, hash);
++ 	spin_unlock_bh(lock);
++ 
++ 	rcu_read_unlock();
+++>>>>>>> db3048540832 (rhashtable: involve rhashtable_lookup_insert routine)
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_insert);
+  
+@@@ -400,16 -648,16 +467,16 @@@ EXPORT_SYMBOL_GPL(rhashtable_remove)
+   * for a entry with an identical key. The first matching entry is returned.
+   *
+   * This lookup function may only be used for fixed key hash table (key_len
+-  * paramter set). It will BUG() if used inappropriately.
++  * parameter set). It will BUG() if used inappropriately.
+   *
+ - * Lookups may occur in parallel with hashtable mutations and resizing.
+ + * Lookups may occur in parallel with hash mutations as long as the lookup is
+ + * guarded by rcu_read_lock(). The caller must take care of this.
+   */
+ -void *rhashtable_lookup(struct rhashtable *ht, const void *key)
+ +void *rhashtable_lookup(const struct rhashtable *ht, const void *key)
+  {
+ -	struct rhashtable_compare_arg arg = {
+ -		.ht = ht,
+ -		.key = key,
+ -	};
+ +	const struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
+ +	struct rhash_head *he;
+ +	u32 h;
+  
+  	BUG_ON(!ht->p.key_len);
+  
+diff --git a/include/linux/rhashtable.h b/include/linux/rhashtable.h
+index 0839d7b8cd60..7a622e0acc46 100644
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@ -112,6 +112,7 @@ int rhashtable_shrink(struct rhashtable *ht);
+ void *rhashtable_lookup(const struct rhashtable *ht, const void *key);
+ void *rhashtable_lookup_compare(const struct rhashtable *ht, const void *key,
+ 				bool (*compare)(void *, void *), void *arg);
++bool rhashtable_lookup_insert(struct rhashtable *ht, struct rhash_head *obj);
+ 
+ void rhashtable_destroy(const struct rhashtable *ht);
+ 
+* Unmerged path lib/rhashtable.c
