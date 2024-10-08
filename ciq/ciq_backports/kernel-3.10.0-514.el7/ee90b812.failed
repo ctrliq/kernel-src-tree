@@ -1,0 +1,171 @@
+hv_netvsc: Fix the packet free when it is in skb headroom
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit ee90b81203a91d4e5385622811ee7872b5bcfe76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ee90b812.failed
+
+In the two places changed, we now use netvsc_xmit_completion() which properly
+frees hv_netvsc_packet in or not in skb headroom.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee90b81203a91d4e5385622811ee7872b5bcfe76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 3362765215d6,f0b8b3e0ed7c..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -185,7 -187,8 +185,12 @@@ int netvsc_device_remove(struct hv_devi
+  int netvsc_send(struct hv_device *device,
+  		struct hv_netvsc_packet *packet);
+  void netvsc_linkstatus_callback(struct hv_device *device_obj,
+++<<<<<<< HEAD
+ +				unsigned int status);
+++=======
++ 				struct rndis_message *resp);
++ void netvsc_xmit_completion(void *context);
+++>>>>>>> ee90b81203a9 (hv_netvsc: Fix the packet free when it is in skb headroom)
+  int netvsc_recv_callback(struct hv_device *device_obj,
+  			struct hv_netvsc_packet *packet,
+  			struct ndis_tcp_ip_checksum_info *csum_info);
+diff --cc drivers/net/hyperv/netvsc.c
+index f6702b01e754,4d4d497d5762..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -810,6 -808,109 +810,112 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct sk_buff *skb = NULL;
++ 	unsigned long flag;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 	if (!out_channel) {
++ 		out_channel = device->channel;
++ 		q_idx = 0;
++ 		packet->q_idx = 0;
++ 	}
++ 	packet->channel = out_channel;
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	spin_lock_irqsave(&msdp->lock, flag);
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	if (packet->is_data_pkt && msd_len > 0 &&
++ 	    msdp->count < net_device->max_pkt &&
++ 	    msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (packet->is_data_pkt && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet);
++ 		if (!packet->part_of_skb) {
++ 			skb = (struct sk_buff *)
++ 				(unsigned long)
++ 				packet->send_completion_tid;
++ 
++ 			packet->send_completion_tid = 0;
++ 		}
++ 
++ 		packet->page_buf_cnt = 0;
++ 		packet->send_buf_index = section_index;
++ 		packet->total_data_buflen += msd_len;
++ 
++ 		if (msdp->pkt)
++ 			netvsc_xmit_completion(msdp->pkt);
++ 
++ 		if (packet->xmit_more) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&msdp->lock, flag);
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			netvsc_xmit_completion(msd_send);
++ 		}
++ 	}
++ 
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device);
++ 
+++>>>>>>> ee90b81203a9 (hv_netvsc: Fix the packet free when it is in skb headroom)
+  	if (ret != 0) {
+  		if (section_index != NETVSC_INVALID_INDEX)
+  			netvsc_free_send_slot(net_device, section_index);
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972..5a1b4b2a53c3 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -229,7 +229,7 @@ static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb)
+ 	return q_idx;
+ }
+ 
+-static void netvsc_xmit_completion(void *context)
++void netvsc_xmit_completion(void *context)
+ {
+ 	struct hv_netvsc_packet *packet = (struct hv_netvsc_packet *)context;
+ 	struct sk_buff *skb = (struct sk_buff *)
