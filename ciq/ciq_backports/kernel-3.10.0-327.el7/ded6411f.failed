@@ -1,0 +1,103 @@
+qla2xxx: Fix virtual port configuration, when switch port is disabled/enabled.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Fix virtual port configuration, when switch port is disabled/enabled (Chad Dupuis) [1187302]
+Rebuild_FUZZ: 99.35%
+commit-author Sawan Chandak <sawan.chandak@qlogic.com>
+commit ded6411fd88267510dcee6d6c29cfd0bd82d4f0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ded6411f.failed
+
+On some vendor switches, when switch port is toggled (down /up),
+then in some condition driver tries to configure virtual port,
+before FW is actually in ready state to process any commands on wire.
+At this time, configuring virtual port can fail. Add fix in driver
+to make driver wait, for FW to be ready state before
+
+	Signed-off-by: Sawan Chandak <sawan.chandak@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit ded6411fd88267510dcee6d6c29cfd0bd82d4f0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_isr.c
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 213c09acbead,72dfbc162856..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -721,6 -753,17 +721,20 @@@ skip_rio
+  		if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+  			atomic_set(&vha->loop_state, LOOP_DOWN);
+  			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+++<<<<<<< HEAD
+++=======
++ 			/*
++ 			 * In case of loop down, restore WWPN from
++ 			 * NVRAM in case of FA-WWPN capable ISP
++ 			 */
++ 			if (ha->flags.fawwpn_enabled) {
++ 				void *wwpn = ha->init_cb->port_name;
++ 
++ 				memcpy(vha->port_name, wwpn, WWN_SIZE);
++ 			}
++ 
++ 			clear_bit(VP_CONFIG_OK, &vha->vp_flags);
+++>>>>>>> ded6411fd882 (qla2xxx: Fix virtual port configuration, when switch port is disabled/enabled.)
+  			vha->device_flags |= DFLG_NO_CABLE;
+  			qla2x00_mark_all_devices_lost(vha, 1);
+  		}
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 801d423a8d81..863b35eb1700 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3416,6 +3416,7 @@ typedef struct scsi_qla_host {
+ #define VP_BIND_NEEDED		2
+ #define VP_DELETE_NEEDED	3
+ #define VP_SCR_NEEDED		4	/* State Change Request registration */
++#define VP_CONFIG_OK		5	/* Flag to cfg VP, if FW is ready */
+ 	atomic_t 		vp_state;
+ #define VP_OFFLINE		0
+ #define VP_ACTIVE		1
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+diff --git a/drivers/scsi/qla2xxx/qla_mid.c b/drivers/scsi/qla2xxx/qla_mid.c
+index d1d3a38e3abe..3177d086ba4e 100644
+--- a/drivers/scsi/qla2xxx/qla_mid.c
++++ b/drivers/scsi/qla2xxx/qla_mid.c
+@@ -306,19 +306,25 @@ qla2x00_vp_abort_isp(scsi_qla_host_t *vha)
+ static int
+ qla2x00_do_dpc_vp(scsi_qla_host_t *vha)
+ {
++	struct qla_hw_data *ha = vha->hw;
++	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
++
+ 	ql_dbg(ql_dbg_dpc + ql_dbg_verbose, vha, 0x4012,
+ 	    "Entering %s vp_flags: 0x%lx.\n", __func__, vha->vp_flags);
+ 
+ 	qla2x00_do_work(vha);
+ 
+-	if (test_and_clear_bit(VP_IDX_ACQUIRED, &vha->vp_flags)) {
+-		/* VP acquired. complete port configuration */
+-		ql_dbg(ql_dbg_dpc, vha, 0x4014,
+-		    "Configure VP scheduled.\n");
+-		qla24xx_configure_vp(vha);
+-		ql_dbg(ql_dbg_dpc, vha, 0x4015,
+-		    "Configure VP end.\n");
+-		return 0;
++	/* Check if Fw is ready to configure VP first */
++	if (test_bit(VP_CONFIG_OK, &base_vha->vp_flags)) {
++		if (test_and_clear_bit(VP_IDX_ACQUIRED, &vha->vp_flags)) {
++			/* VP acquired. complete port configuration */
++			ql_dbg(ql_dbg_dpc, vha, 0x4014,
++			    "Configure VP scheduled.\n");
++			qla24xx_configure_vp(vha);
++			ql_dbg(ql_dbg_dpc, vha, 0x4015,
++			    "Configure VP end.\n");
++			return 0;
++		}
+ 	}
+ 
+ 	if (test_bit(FCPORT_UPDATE_NEEDED, &vha->dpc_flags)) {
