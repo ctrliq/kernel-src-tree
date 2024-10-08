@@ -1,0 +1,555 @@
+netfilter: bridge: move br_netfilter out of the core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 34666d467cbf1e2e3c7bb15a63eccfb582cdd71f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34666d46.failed
+
+Jesper reported that br_netfilter always registers the hooks since
+this is part of the bridge core. This harms performance for people that
+don't need this.
+
+This patch modularizes br_netfilter so it can be rmmod'ed, thus,
+the hooks can be unregistered. I think the bridge netfilter should have
+been a separated module since the beginning, Patrick agreed on that.
+
+Note that this is breaking compatibility for users that expect that
+bridge netfilter is going to be available after explicitly 'modprobe
+bridge' or via automatic load through brctl.
+
+However, the damage can be easily undone by modprobing br_netfilter.
+The bridge core also spots a message to provide a clue to people that
+didn't notice that this has been deprecated.
+
+On top of that, the plan is that nftables will not rely on this software
+layer, but integrate the connection tracking into the bridge layer to
+enable stateful filtering and NAT, which is was bridge netfilter users
+seem to require.
+
+This patch still keeps the fake_dst_ops in the bridge core, since this
+is required by when the bridge port is initialized. So we can safely
+modprobe/rmmod br_netfilter anytime.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Acked-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 34666d467cbf1e2e3c7bb15a63eccfb582cdd71f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/Makefile
+#	net/bridge/br_netfilter.c
+#	net/bridge/br_private.h
+#	net/bridge/br_sysfs_br.c
+diff --cc net/bridge/Makefile
+index be68796fdffd,5e3eac5dc8b9..000000000000
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@@ -5,8 -5,9 +5,14 @@@
+  obj-$(CONFIG_BRIDGE) += bridge.o
+  
+  bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
+++<<<<<<< HEAD
+ +			br_ioctl.o br_notify.o br_stp.o br_stp_bpdu.o \
+ +			br_stp_if.o br_stp_timer.o br_netlink.o
+++=======
++ 			br_ioctl.o br_stp.o br_stp_bpdu.o \
++ 			br_stp_if.o br_stp_timer.o br_netlink.o \
++ 			br_nf_core.o
+++>>>>>>> 34666d467cbf (netfilter: bridge: move br_netfilter out of the core)
+  
+  bridge-$(CONFIG_SYSFS) += br_sysfs_if.o br_sysfs_br.o
+  
+diff --cc net/bridge/br_netfilter.c
+index 3c042af33e2b,97e43937aaca..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -111,66 -111,6 +111,69 @@@ static inline __be16 pppoe_proto(const 
+  	 pppoe_proto(skb) == htons(PPP_IPV6) && \
+  	 brnf_filter_pppoe_tagged)
+  
+++<<<<<<< HEAD
+ +static void fake_update_pmtu(struct dst_entry *dst, struct sock *sk,
+ +			     struct sk_buff *skb, u32 mtu)
+ +{
+ +}
+ +
+ +static void fake_redirect(struct dst_entry *dst, struct sock *sk,
+ +			  struct sk_buff *skb)
+ +{
+ +}
+ +
+ +static u32 *fake_cow_metrics(struct dst_entry *dst, unsigned long old)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static struct neighbour *fake_neigh_lookup(const struct dst_entry *dst,
+ +					   struct sk_buff *skb,
+ +					   const void *daddr)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static unsigned int fake_mtu(const struct dst_entry *dst)
+ +{
+ +	return dst->dev->mtu;
+ +}
+ +
+ +static struct dst_ops fake_dst_ops = {
+ +	.family =		AF_INET,
+ +	.protocol =		cpu_to_be16(ETH_P_IP),
+ +	.update_pmtu =		fake_update_pmtu,
+ +	.redirect =		fake_redirect,
+ +	.cow_metrics =		fake_cow_metrics,
+ +	.neigh_lookup =		fake_neigh_lookup,
+ +	.mtu =			fake_mtu,
+ +};
+ +
+ +/*
+ + * Initialize bogus route table used to keep netfilter happy.
+ + * Currently, we fill in the PMTU entry because netfilter
+ + * refragmentation needs it, and the rt_flags entry because
+ + * ipt_REJECT needs it.  Future netfilter modules might
+ + * require us to fill additional fields.
+ + */
+ +static const u32 br_dst_default_metrics[RTAX_MAX] = {
+ +	[RTAX_MTU - 1] = 1500,
+ +};
+ +
+ +void br_netfilter_rtable_init(struct net_bridge *br)
+ +{
+ +	struct rtable *rt = &br->fake_rtable;
+ +
+ +	atomic_set(&rt->dst.__refcnt, 1);
+ +	rt->dst.dev = br->dev;
+ +	rt->dst.path = &rt->dst;
+ +	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
+ +	rt->dst.flags	= DST_NOXFRM | DST_NOPEER | DST_FAKE_RTABLE;
+ +	rt->dst.ops = &fake_dst_ops;
+ +}
+ +
+++=======
+++>>>>>>> 34666d467cbf (netfilter: bridge: move br_netfilter out of the core)
+  static inline struct rtable *bridge_parent_rtable(const struct net_device *dev)
+  {
+  	struct net_bridge_port *port;
+diff --cc net/bridge/br_private.h
+index 42f63e0bc8cf,d304d752c091..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -201,10 -218,10 +201,10 @@@ struct net_bridg
+  	struct list_head		port_list;
+  	struct net_device		*dev;
+  
+ -	struct pcpu_sw_netstats		__percpu *stats;
+ +	RH_KABI_REPLACE(struct br_cpu_netstats __percpu *stats, struct pcpu_sw_netstats		__percpu *stats)
+  	spinlock_t			hash_lock;
+  	struct hlist_head		hash[BR_HASH_SIZE];
+- #ifdef CONFIG_BRIDGE_NETFILTER
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+  	struct rtable 			fake_rtable;
+  	bool				nf_call_iptables;
+  	bool				nf_call_ip6tables;
+@@@ -744,13 -751,13 +744,18 @@@ static inline int br_vlan_enabled(struc
+  #endif
+  
+  /* br_netfilter.c */
+- #ifdef CONFIG_BRIDGE_NETFILTER
+- int br_netfilter_init(void);
+- void br_netfilter_fini(void);
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ int br_nf_core_init(void);
++ void br_nf_core_fini(void);
+  void br_netfilter_rtable_init(struct net_bridge *);
+  #else
+++<<<<<<< HEAD
+ +#define br_netfilter_init()	(0)
+ +#define br_netfilter_fini()	do { } while(0)
+++=======
++ static inline int br_nf_core_init(void) { return 0; }
++ static inline void br_nf_core_fini(void) {}
+++>>>>>>> 34666d467cbf (netfilter: bridge: move br_netfilter out of the core)
+  #define br_netfilter_rtable_init(x)
+  #endif
+  
+diff --cc net/bridge/br_sysfs_br.c
+index d74c3ed8b926,cb431c6016ee..000000000000
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@@ -620,12 -627,10 +620,17 @@@ static ssize_t store_multicast_startup_
+  {
+  	return store_bridge_parm(d, buf, len, set_startup_query_interval);
+  }
+ -static DEVICE_ATTR_RW(multicast_startup_query_interval);
+ +static DEVICE_ATTR(multicast_startup_query_interval, S_IRUGO | S_IWUSR,
+ +		   show_multicast_startup_query_interval,
+ +		   store_multicast_startup_query_interval);
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +static ssize_t show_nf_call_iptables(
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ static ssize_t nf_call_iptables_show(
+++>>>>>>> 34666d467cbf (netfilter: bridge: move br_netfilter out of the core)
+  	struct device *d, struct device_attribute *attr, char *buf)
+  {
+  	struct net_bridge *br = to_bridge(d);
+diff --git a/include/linux/netfilter_bridge.h b/include/linux/netfilter_bridge.h
+index 754600083b7e..169e23d57e09 100644
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@ -15,7 +15,7 @@ enum nf_br_hook_priorities {
+ 	NF_BR_PRI_LAST = INT_MAX,
+ };
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 
+ #define BRNF_PKT_TYPE			0x01
+ #define BRNF_BRIDGED_DNAT		0x02
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 2e271768b46a..ca08062bd4cf 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -163,7 +163,7 @@ struct nf_conntrack {
+ };
+ #endif
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ struct nf_bridge_info {
+ 	atomic_t		use;
+ 	unsigned int		mask;
+@@ -570,7 +570,7 @@ struct sk_buff {
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ 	struct nf_conntrack	*nfct;
+ #endif
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	struct nf_bridge_info	*nf_bridge;
+ #endif
+ 
+@@ -3147,7 +3147,7 @@ static inline void nf_conntrack_get(struct nf_conntrack *nfct)
+ 		atomic_inc(&nfct->use);
+ }
+ #endif
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ static inline void nf_bridge_put(struct nf_bridge_info *nf_bridge)
+ {
+ 	if (nf_bridge && atomic_dec_and_test(&nf_bridge->use))
+@@ -3165,7 +3165,7 @@ static inline void nf_reset(struct sk_buff *skb)
+ 	nf_conntrack_put(skb->nfct);
+ 	skb->nfct = NULL;
+ #endif
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	nf_bridge_put(skb->nf_bridge);
+ 	skb->nf_bridge = NULL;
+ #endif
+@@ -3186,7 +3186,7 @@ static inline void __nf_copy(struct sk_buff *dst, const struct sk_buff *src)
+ 	nf_conntrack_get(src->nfct);
+ 	dst->nfctinfo = src->nfctinfo;
+ #endif
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	dst->nf_bridge  = src->nf_bridge;
+ 	nf_bridge_get(src->nf_bridge);
+ #endif
+@@ -3197,7 +3197,7 @@ static inline void nf_copy(struct sk_buff *dst, const struct sk_buff *src)
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ 	nf_conntrack_put(dst->nfct);
+ #endif
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	nf_bridge_put(dst->nf_bridge);
+ #endif
+ 	__nf_copy(dst, src);
+diff --git a/include/net/neighbour.h b/include/net/neighbour.h
+index e70ffb911499..de04ff3ccd01 100644
+--- a/include/net/neighbour.h
++++ b/include/net/neighbour.h
+@@ -365,7 +365,7 @@ static inline int neigh_event_send(struct neighbour *neigh, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ static inline int neigh_hh_bridge(struct hh_cache *hh, struct sk_buff *skb)
+ {
+ 	unsigned int seq, hh_alen;
+diff --git a/include/net/netfilter/ipv4/nf_reject.h b/include/net/netfilter/ipv4/nf_reject.h
+index 00e9cef81939..8ce06385a552 100644
+--- a/include/net/netfilter/ipv4/nf_reject.h
++++ b/include/net/netfilter/ipv4/nf_reject.h
+@@ -99,7 +99,7 @@ static void nf_send_reset(struct sk_buff *oldskb, int hook)
+ 
+ 	nf_ct_attach(nskb, oldskb);
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	/* If we use ip_local_out for bridged traffic, the MAC source on
+ 	 * the RST will be ours, instead of the destination's.  This confuses
+ 	 * some routers/firewalls, and they drop the packet.  So we need to
+diff --git a/include/net/netfilter/ipv6/nf_reject.h b/include/net/netfilter/ipv6/nf_reject.h
+index 710d17ed70b4..7a10cfcd8e33 100644
+--- a/include/net/netfilter/ipv6/nf_reject.h
++++ b/include/net/netfilter/ipv6/nf_reject.h
+@@ -147,7 +147,7 @@ static void nf_send_reset6(struct net *net, struct sk_buff *oldskb, int hook)
+ 
+ 	nf_ct_attach(nskb, oldskb);
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	/* If we use ip6_local_out for bridged traffic, the MAC source on
+ 	 * the RST will be ours, instead of the destination's.  This confuses
+ 	 * some routers/firewalls, and they drop the packet.  So we need to
+diff --git a/net/Kconfig b/net/Kconfig
+index dfcf6d3459d0..7c63e3667128 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -171,10 +171,11 @@ config NETFILTER_ADVANCED
+ 	  If unsure, say Y.
+ 
+ config BRIDGE_NETFILTER
+-	bool "Bridged IP/ARP packets filtering"
+-	depends on BRIDGE && NETFILTER && INET
++	tristate "Bridged IP/ARP packets filtering"
++	depends on (BRIDGE || BRIDGE=n)
++	depends on NETFILTER && INET
+ 	depends on NETFILTER_ADVANCED
+-	default y
++	default m
+ 	---help---
+ 	  Enabling this option will let arptables resp. iptables see bridged
+ 	  ARP resp. IP traffic. If you want a bridging firewall, you probably
+* Unmerged path net/bridge/Makefile
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+index ba780cc8e515..31c1facba89c 100644
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -48,7 +48,7 @@ static int __init br_init(void)
+ 	if (err)
+ 		goto err_out1;
+ 
+-	err = br_netfilter_init();
++	err = br_nf_core_init();
+ 	if (err)
+ 		goto err_out2;
+ 
+@@ -66,11 +66,16 @@ static int __init br_init(void)
+ 	br_fdb_test_addr_hook = br_fdb_test_addr;
+ #endif
+ 
++	pr_info("bridge: automatic filtering via arp/ip/ip6tables has been "
++		"deprecated. Update your scripts to load br_netfilter if you "
++		"need this.\n");
++
+ 	return 0;
++
+ err_out4:
+ 	unregister_netdevice_notifier(&br_device_notifier);
+ err_out3:
+-	br_netfilter_fini();
++	br_nf_core_fini();
+ err_out2:
+ 	unregister_pernet_subsys(&br_net_ops);
+ err_out1:
+@@ -83,20 +88,17 @@ err_out:
+ static void __exit br_deinit(void)
+ {
+ 	stp_proto_unregister(&br_stp_proto);
+-
+ 	br_netlink_fini();
+ 	unregister_netdevice_notifier(&br_device_notifier);
+ 	brioctl_set(NULL);
+-
+ 	unregister_pernet_subsys(&br_net_ops);
+ 
+ 	rcu_barrier(); /* Wait for completion of call_rcu()'s */
+ 
+-	br_netfilter_fini();
++	br_nf_core_fini();
+ #if IS_ENABLED(CONFIG_ATM_LANE)
+ 	br_fdb_test_addr_hook = NULL;
+ #endif
+-
+ 	br_fdb_fini();
+ }
+ 
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 5e3347b02745..6e80e1b2b077 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -36,7 +36,7 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	u16 vid = 0;
+ 
+ 	rcu_read_lock();
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
+ 		br_nf_pre_routing_finish_bridge_slow(skb);
+ 		rcu_read_unlock();
+@@ -172,7 +172,7 @@ static int br_change_mtu(struct net_device *dev, int new_mtu)
+ 
+ 	dev->mtu = new_mtu;
+ 
+-#ifdef CONFIG_BRIDGE_NETFILTER
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	/* remember the MTU in the rtable for PMTU */
+ 	dst_metric_set(&br->fake_rtable.dst, RTAX_MTU, new_mtu);
+ #endif
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index 7040bea232a3..799075fcfc31 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -54,6 +54,7 @@ int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(br_dev_queue_push_xmit);
+ 
+ int br_forward_finish(struct sock *sk, struct sk_buff *skb)
+ {
+@@ -62,6 +63,7 @@ int br_forward_finish(struct sock *sk, struct sk_buff *skb)
+ 		       br_dev_queue_push_xmit);
+ 
+ }
++EXPORT_SYMBOL_GPL(br_forward_finish);
+ 
+ static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
+ {
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index af13f4d9f7ee..bef001b316a2 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -141,6 +141,7 @@ drop:
+ 	kfree_skb(skb);
+ 	goto out;
+ }
++EXPORT_SYMBOL_GPL(br_handle_frame_finish);
+ 
+ /* note: already called with rcu_read_lock */
+ static int br_handle_local_finish(struct sock *sk, struct sk_buff *skb)
+* Unmerged path net/bridge/br_netfilter.c
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 01e11131d326..5ebd490e2924 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -639,7 +639,7 @@ out:
+ 	return err;
+ }
+ 
+-void __exit br_netlink_fini(void)
++void br_netlink_fini(void)
+ {
+ 	br_mdb_uninit();
+ 	rtnl_af_unregister(&br_af_ops);
+diff --git a/net/bridge/br_nf_core.c b/net/bridge/br_nf_core.c
+new file mode 100644
+index 000000000000..387cb3bd017c
+--- /dev/null
++++ b/net/bridge/br_nf_core.c
+@@ -0,0 +1,96 @@
++/*
++ *	Handle firewalling core
++ *	Linux ethernet bridge
++ *
++ *	Authors:
++ *	Lennert Buytenhek		<buytenh@gnu.org>
++ *	Bart De Schuymer		<bdschuym@pandora.be>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ *
++ *	Lennert dedicates this file to Kerstin Wurdinger.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/in_route.h>
++#include <linux/inetdevice.h>
++#include <net/route.h>
++
++#include "br_private.h"
++#ifdef CONFIG_SYSCTL
++#include <linux/sysctl.h>
++#endif
++
++static void fake_update_pmtu(struct dst_entry *dst, struct sock *sk,
++			     struct sk_buff *skb, u32 mtu)
++{
++}
++
++static void fake_redirect(struct dst_entry *dst, struct sock *sk,
++			  struct sk_buff *skb)
++{
++}
++
++static u32 *fake_cow_metrics(struct dst_entry *dst, unsigned long old)
++{
++	return NULL;
++}
++
++static struct neighbour *fake_neigh_lookup(const struct dst_entry *dst,
++					   struct sk_buff *skb,
++					   const void *daddr)
++{
++	return NULL;
++}
++
++static unsigned int fake_mtu(const struct dst_entry *dst)
++{
++	return dst->dev->mtu;
++}
++
++static struct dst_ops fake_dst_ops = {
++	.family		= AF_INET,
++	.protocol	= cpu_to_be16(ETH_P_IP),
++	.update_pmtu	= fake_update_pmtu,
++	.redirect	= fake_redirect,
++	.cow_metrics	= fake_cow_metrics,
++	.neigh_lookup	= fake_neigh_lookup,
++	.mtu		= fake_mtu,
++};
++
++/*
++ * Initialize bogus route table used to keep netfilter happy.
++ * Currently, we fill in the PMTU entry because netfilter
++ * refragmentation needs it, and the rt_flags entry because
++ * ipt_REJECT needs it.  Future netfilter modules might
++ * require us to fill additional fields.
++ */
++static const u32 br_dst_default_metrics[RTAX_MAX] = {
++	[RTAX_MTU - 1] = 1500,
++};
++
++void br_netfilter_rtable_init(struct net_bridge *br)
++{
++	struct rtable *rt = &br->fake_rtable;
++
++	atomic_set(&rt->dst.__refcnt, 1);
++	rt->dst.dev = br->dev;
++	rt->dst.path = &rt->dst;
++	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
++	rt->dst.flags	= DST_NOXFRM | DST_FAKE_RTABLE;
++	rt->dst.ops = &fake_dst_ops;
++}
++
++int __init br_nf_core_init(void)
++{
++	return dst_entries_init(&fake_dst_ops);
++}
++
++void br_nf_core_fini(void)
++{
++	dst_entries_destroy(&fake_dst_ops);
++}
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_sysfs_br.c
