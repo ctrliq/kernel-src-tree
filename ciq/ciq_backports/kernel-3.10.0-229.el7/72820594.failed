@@ -1,0 +1,196 @@
+ACPI / hotplug / PCI: Relax the checking of _STA return values
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Relax the checking of _STA return values (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 92.17%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 7282059489868e0ed1b0d79765730c6b233a8399
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/72820594.failed
+
+The ACPI specification (ACPI 5.0A, Section 6.3.7) says:
+
+ _STA may return bit 0 clear (not present) with bit 3 set (device is
+ functional). This case is used to indicate a valid device for which
+ no device driver should be loaded (for example, a bridge device.)
+ Children of this device may be present and valid. OSPM should
+ continue enumeration below a device whose _STA returns this bit
+ combination.
+
+Evidently, some BIOSes follow that and return 0x0A from _STA, which
+causes problems to happen when they trigger bus check or device check
+notifications for those devices too.  Namely, ACPIPHP thinks that they
+are gone and may drop them, for example, if such a notification is
+triggered during a resume from system suspend.
+
+To fix that, modify ACPICA to regard devies as present and
+functioning if _STA returns both the ACPI_STA_DEVICE_ENABLED
+and ACPI_STA_DEVICE_FUNCTIONING bits set for them.
+
+Reported-and-tested-by: Peter Wu <lekensteyn@gmail.com>
+	Cc: 3.12+ <stable@vger.kernel.org> # 3.12+
+[rjw: Subject and changelog, minor code modifications]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 7282059489868e0ed1b0d79765730c6b233a8399)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 0f3f960473bc,7c7a388c85ab..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -832,35 -730,55 +832,72 @@@ static unsigned int get_slot_status(str
+  	return (unsigned int)sta;
+  }
+  
++ static inline bool device_status_valid(unsigned int sta)
++ {
++ 	/*
++ 	 * ACPI spec says that _STA may return bit 0 clear with bit 3 set
++ 	 * if the device is valid but does not require a device driver to be
++ 	 * loaded (Section 6.3.7 of ACPI 5.0A).
++ 	 */
++ 	unsigned int mask = ACPI_STA_DEVICE_ENABLED | ACPI_STA_DEVICE_FUNCTIONING;
++ 	return (sta & mask) == mask;
++ }
++ 
+  /**
+ - * trim_stale_devices - remove PCI devices that are not responding.
+ - * @dev: PCI device to start walking the hierarchy from.
+ + * acpiphp_eject_slot - physically eject the slot
+ + * @slot: ACPI PHP slot
+   */
+ -static void trim_stale_devices(struct pci_dev *dev)
+ +int acpiphp_eject_slot(struct acpiphp_slot *slot)
+  {
+ -	acpi_handle handle = ACPI_HANDLE(&dev->dev);
+ -	struct pci_bus *bus = dev->subordinate;
+ -	bool alive = false;
+ -
+ -	if (handle) {
+ -		acpi_status status;
+ -		unsigned long long sta;
+ +	acpi_status status;
+ +	struct acpiphp_func *func;
+ +	struct acpi_object_list arg_list;
+ +	union acpi_object arg;
+  
+ +	list_for_each_entry(func, &slot->funcs, sibling) {
+ +		/* We don't want to call _EJ0 on non-existing functions. */
+ +		if ((func->flags & FUNC_HAS_EJ0)) {
+ +			/* _EJ0 method take one argument */
+ +			arg_list.count = 1;
+ +			arg_list.pointer = &arg;
+ +			arg.type = ACPI_TYPE_INTEGER;
+ +			arg.integer.value = 1;
+ +
+++<<<<<<< HEAD
+ +			status = acpi_evaluate_object(func->handle, "_EJ0", &arg_list, NULL);
+ +			if (ACPI_FAILURE(status)) {
+ +				pr_warn("%s: _EJ0 failed\n", __func__);
+ +				return -1;
+ +			} else
+ +				break;
+ +		}
+++=======
++ 		status = acpi_evaluate_integer(handle, "_STA", NULL, &sta);
++ 		alive = (ACPI_SUCCESS(status) && device_status_valid(sta))
++ 			|| acpiphp_no_hotplug(handle);
++ 	}
++ 	if (!alive) {
++ 		u32 v;
++ 
++ 		/* Check if the device responds. */
++ 		alive = pci_bus_read_dev_vendor_id(dev->bus, dev->devfn, &v, 0);
++ 	}
++ 	if (!alive) {
++ 		pci_stop_and_remove_bus_device(dev);
++ 		if (handle)
++ 			acpiphp_bus_trim(handle);
++ 	} else if (bus) {
++ 		struct pci_dev *child, *tmp;
++ 
++ 		/* The device is a bridge. so check the bus below it. */
++ 		pm_runtime_get_sync(&dev->dev);
++ 		list_for_each_entry_safe_reverse(child, tmp, &bus->devices, bus_list)
++ 			trim_stale_devices(child);
++ 
++ 		pm_runtime_put(&dev->dev);
+++>>>>>>> 728205948986 (ACPI / hotplug / PCI: Relax the checking of _STA return values)
+  	}
+ +	return 0;
+  }
+  
+  /**
+@@@ -870,43 -788,35 +907,61 @@@
+   * Iterate over all slots under this bridge and make sure that if a
+   * card is present they are enabled, and if not they are disabled.
+   */
+ -static void acpiphp_check_bridge(struct acpiphp_bridge *bridge)
+ +static int acpiphp_check_bridge(struct acpiphp_bridge *bridge)
+  {
+  	struct acpiphp_slot *slot;
+ +	int retval = 0;
+ +	int enabled, disabled;
+  
+ -	/* Bail out if the bridge is going away. */
+ -	if (bridge->is_going_away)
+ -		return;
+ +	enabled = disabled = 0;
+  
+  	list_for_each_entry(slot, &bridge->slots, node) {
+++<<<<<<< HEAD
+ +		unsigned int status = get_slot_status(slot);
+ +		if (slot->flags & SLOT_ENABLED) {
+ +			if (status == ACPI_STA_ALL)
+ +				continue;
+ +			retval = acpiphp_disable_slot(slot);
+ +			if (retval) {
+ +				pr_err("Error occurred in disabling\n");
+ +				goto err_exit;
+ +			} else {
+ +				acpiphp_eject_slot(slot);
+ +			}
+ +			disabled++;
+++=======
++ 		struct pci_bus *bus = slot->bus;
++ 		struct pci_dev *dev, *tmp;
++ 
++ 		mutex_lock(&slot->crit_sect);
++ 		if (slot_no_hotplug(slot)) {
++ 			; /* do nothing */
++ 		} else if (device_status_valid(get_slot_status(slot))) {
++ 			/* remove stale devices if any */
++ 			list_for_each_entry_safe_reverse(dev, tmp,
++ 							 &bus->devices, bus_list)
++ 				if (PCI_SLOT(dev->devfn) == slot->device)
++ 					trim_stale_devices(dev);
++ 
++ 			/* configure all functions */
++ 			enable_slot(slot);
+++>>>>>>> 728205948986 (ACPI / hotplug / PCI: Relax the checking of _STA return values)
+  		} else {
+ -			disable_slot(slot);
+ +			if (status != ACPI_STA_ALL)
+ +				continue;
+ +			retval = acpiphp_enable_slot(slot);
+ +			if (retval) {
+ +				pr_err("Error occurred in enabling\n");
+ +				goto err_exit;
+ +			}
+ +			enabled++;
+  		}
+ -		mutex_unlock(&slot->crit_sect);
+  	}
+ +
+ +	pr_debug("%s: %d enabled, %d disabled\n", __func__, enabled, disabled);
+ +
+ + err_exit:
+ +	return retval;
+  }
+  
+  static void acpiphp_set_hpp_values(struct pci_bus *bus)
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
