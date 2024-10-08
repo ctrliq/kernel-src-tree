@@ -1,0 +1,110 @@
+macvlan: Fix leak and NULL dereference on error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit e676f197a7a9aae9c75b0d9acc97e07de07dd1f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e676f197.failed
+
+The recent patch that moved broadcasts to process context added
+a couple of bugs on the error path where we may dereference NULL
+or leak an skb.  This patch fixes them.
+
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e676f197a7a9aae9c75b0d9acc97e07de07dd1f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvlan.c
+diff --cc drivers/net/macvlan.c
+index 6af48508e014,cfb27c865417..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -180,6 -192,79 +180,82 @@@ static void macvlan_broadcast(struct sk
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void macvlan_process_broadcast(struct work_struct *w)
++ {
++ 	struct macvlan_port *port = container_of(w, struct macvlan_port,
++ 						 bc_work);
++ 	struct sk_buff *skb;
++ 	struct sk_buff_head list;
++ 
++ 	skb_queue_head_init(&list);
++ 
++ 	spin_lock_bh(&port->bc_queue.lock);
++ 	skb_queue_splice_tail_init(&port->bc_queue, &list);
++ 	spin_unlock_bh(&port->bc_queue.lock);
++ 
++ 	while ((skb = __skb_dequeue(&list))) {
++ 		const struct macvlan_dev *src = MACVLAN_SKB_CB(skb)->src;
++ 
++ 		rcu_read_lock();
++ 
++ 		if (!src)
++ 			/* frame comes from an external address */
++ 			macvlan_broadcast(skb, port, NULL,
++ 					  MACVLAN_MODE_PRIVATE |
++ 					  MACVLAN_MODE_VEPA    |
++ 					  MACVLAN_MODE_PASSTHRU|
++ 					  MACVLAN_MODE_BRIDGE);
++ 		else if (src->mode == MACVLAN_MODE_VEPA)
++ 			/* flood to everyone except source */
++ 			macvlan_broadcast(skb, port, src->dev,
++ 					  MACVLAN_MODE_VEPA |
++ 					  MACVLAN_MODE_BRIDGE);
++ 		else
++ 			/*
++ 			 * flood only to VEPA ports, bridge ports
++ 			 * already saw the frame on the way out.
++ 			 */
++ 			macvlan_broadcast(skb, port, src->dev,
++ 					  MACVLAN_MODE_VEPA);
++ 
++ 		rcu_read_unlock();
++ 
++ 		kfree_skb(skb);
++ 	}
++ }
++ 
++ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
++ 				      struct sk_buff *skb)
++ {
++ 	struct sk_buff *nskb;
++ 	int err = -ENOMEM;
++ 
++ 	nskb = skb_clone(skb, GFP_ATOMIC);
++ 	if (!nskb)
++ 		goto err;
++ 
++ 	spin_lock(&port->bc_queue.lock);
++ 	if (skb_queue_len(&port->bc_queue) < skb->dev->tx_queue_len) {
++ 		__skb_queue_tail(&port->bc_queue, nskb);
++ 		err = 0;
++ 	}
++ 	spin_unlock(&port->bc_queue.lock);
++ 
++ 	if (err)
++ 		goto free_nskb;
++ 
++ 	schedule_work(&port->bc_work);
++ 	return;
++ 
++ free_nskb:
++ 	kfree_skb(nskb);
++ err:
++ 	atomic_long_inc(&skb->dev->rx_dropped);
++ }
++ 
+++>>>>>>> e676f197a7a9 (macvlan: Fix leak and NULL dereference on error path)
+  /* called under rcu_read_lock() from netif_receive_skb */
+  static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
+  {
+* Unmerged path drivers/net/macvlan.c
