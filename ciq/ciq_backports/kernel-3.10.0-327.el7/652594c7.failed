@@ -1,0 +1,133 @@
+hv: run non-blocking message handlers in the dispatch tasklet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] run non-blocking message handlers in the dispatch tasklet (Vitaly Kuznetsov) [1203682]
+Rebuild_FUZZ: 96.61%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 652594c7dfd9bf6392e3a727bc69d89a2562d953
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/652594c7.failed
+
+A work item in vmbus_connection.work_queue can sleep, waiting for a new
+host message (usually it is some kind of "completion" message). Currently
+the new message will be handled in the same workqueue, but since work items
+in the workqueue is serialized, we actually have no chance to handle
+the new message if the current work item is sleeping -- as as result, the
+current work item will hang forever.
+
+K. Y. has posted the below fix to resolve the issue:
+Drivers: hv: vmbus: Perform device register in the per-channel work element
+
+Actually we can simplify the fix by directly running non-blocking message
+handlers in the dispatch tasklet (inspired by K. Y.).
+
+This patch is the fundamental change. The following 2 patches will simplify
+the message offering and rescind-offering handling a lot.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 652594c7dfd9bf6392e3a727bc69d89a2562d953)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel_mgmt.c
+diff --cc drivers/hv/channel_mgmt.c
+index f9943186ea53,287f07b1bef6..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -32,11 -33,10 +32,18 @@@
+  
+  #include "hyperv_vmbus.h"
+  
+++<<<<<<< HEAD
+ +struct vmbus_channel_message_table_entry {
+ +	enum vmbus_channel_message_type message_type;
+ +	void (*message_handler)(struct vmbus_channel_message_header *msg);
+ +};
+ +
+++=======
++ struct vmbus_rescind_work {
++ 	struct work_struct work;
++ 	struct vmbus_channel *channel;
++ };
+++>>>>>>> 652594c7dfd9 (hv: run non-blocking message handlers in the dispatch tasklet)
+  
+  /**
+   * vmbus_prep_negotiate_resp() - Create default response for Hyper-V Negotiate message
+* Unmerged path drivers/hv/channel_mgmt.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index b5e790856f6e..814a99b522e8 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -640,6 +640,23 @@ struct vmbus_msginfo {
+ 
+ extern struct vmbus_connection vmbus_connection;
+ 
++enum vmbus_message_handler_type {
++	/* The related handler can sleep. */
++	VMHT_BLOCKING = 0,
++
++	/* The related handler must NOT sleep. */
++	VMHT_NON_BLOCKING = 1,
++};
++
++struct vmbus_channel_message_table_entry {
++	enum vmbus_channel_message_type message_type;
++	enum vmbus_message_handler_type handler_type;
++	void (*message_handler)(struct vmbus_channel_message_header *msg);
++};
++
++extern struct vmbus_channel_message_table_entry
++	channel_message_table[CHANNELMSG_COUNT];
++
+ /* General vmbus interface */
+ 
+ struct hv_device *vmbus_device_create(uuid_le *type,
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 143d8f6191ee..02977233b587 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -457,21 +457,36 @@ static void vmbus_on_msg_dpc(unsigned long data)
+ 	void *page_addr = hv_context.synic_message_page[cpu];
+ 	struct hv_message *msg = (struct hv_message *)page_addr +
+ 				  VMBUS_MESSAGE_SINT;
++	struct vmbus_channel_message_header *hdr;
++	struct vmbus_channel_message_table_entry *entry;
+ 	struct onmessage_work_context *ctx;
+ 
+ 	while (1) {
+-		if (msg->header.message_type == HVMSG_NONE) {
++		if (msg->header.message_type == HVMSG_NONE)
+ 			/* no msg */
+ 			break;
+-		} else {
++
++		hdr = (struct vmbus_channel_message_header *)msg->u.payload;
++
++		if (hdr->msgtype >= CHANNELMSG_COUNT) {
++			WARN_ONCE(1, "unknown msgtype=%d\n", hdr->msgtype);
++			goto msg_handled;
++		}
++
++		entry = &channel_message_table[hdr->msgtype];
++		if (entry->handler_type	== VMHT_BLOCKING) {
+ 			ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+ 			if (ctx == NULL)
+ 				continue;
++
+ 			INIT_WORK(&ctx->work, vmbus_onmessage_work);
+ 			memcpy(&ctx->msg, msg, sizeof(*msg));
++
+ 			queue_work(vmbus_connection.work_queue, &ctx->work);
+-		}
++		} else
++			entry->message_handler(hdr);
+ 
++msg_handled:
+ 		msg->header.message_type = HVMSG_NONE;
+ 
+ 		/*
