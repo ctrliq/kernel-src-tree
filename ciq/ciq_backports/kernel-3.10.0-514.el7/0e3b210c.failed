@@ -1,0 +1,168 @@
+dax: use pfn_mkwrite to update c/mtime + freeze protection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Boaz Harrosh <boaz@plexistor.com>
+commit 0e3b210ce1722168227cb3bc7746256d0c0afece
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0e3b210c.failed
+
+From: Yigal Korman <yigal@plexistor.com>
+
+[v1]
+Without this patch, c/mtime is not updated correctly when mmap'ed page is
+first read from and then written to.
+
+A new xfstest is submitted for testing this (generic/080)
+
+[v2]
+Jan Kara has pointed out that if we add the
+sb_start/end_pagefault pair in the new pfn_mkwrite we
+are then fixing another bug where: A user could start
+writing to the page while filesystem is frozen.
+
+	Signed-off-by: Yigal Korman <yigal@plexistor.com>
+	Signed-off-by: Boaz Harrosh <boaz@plexistor.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0e3b210ce1722168227cb3bc7746256d0c0afece)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext2/file.c
+#	fs/ext4/file.c
+#	include/linux/fs.h
+diff --cc fs/ext2/file.c
+index a5b3a5db3120,866a3ce3f864..000000000000
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@@ -25,6 -25,37 +25,40 @@@
+  #include "xattr.h"
+  #include "acl.h"
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static int ext2_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext2_get_block);
++ }
++ 
++ static int ext2_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext2_get_block);
++ }
++ 
++ static const struct vm_operations_struct ext2_dax_vm_ops = {
++ 	.fault		= ext2_dax_fault,
++ 	.page_mkwrite	= ext2_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ 
++ static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	if (!IS_DAX(file_inode(file)))
++ 		return generic_file_mmap(file, vma);
++ 
++ 	file_accessed(file);
++ 	vma->vm_ops = &ext2_dax_vm_ops;
++ 	vma->vm_flags |= VM_MIXEDMAP;
++ 	return 0;
++ }
++ #else
++ #define ext2_file_mmap	generic_file_mmap
++ #endif
++ 
+++>>>>>>> 0e3b210ce172 (dax: use pfn_mkwrite to update c/mtime + freeze protection)
+  /*
+   * Called when filp is released. This happens when all file descriptors
+   * for a single struct file are closed. Note that different open() calls
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,aa78c70553f4..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -200,10 -188,34 +200,34 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext4_get_block);
++ 					/* Is this the right get_block? */
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext4_get_block);
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ 	.pfn_mkwrite	= dax_pfn_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
+++>>>>>>> 0e3b210ce172 (dax: use pfn_mkwrite to update c/mtime + freeze protection)
+  static const struct vm_operations_struct ext4_file_vm_ops = {
+  	.fault		= filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --cc include/linux/fs.h
+index 37d4ac39152e,0f696328f218..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2706,19 -2614,14 +2706,30 @@@ extern loff_t fixed_size_llseek(struct 
+  extern int generic_file_open(struct inode * inode, struct file * filp);
+  extern int nonseekable_open(struct inode * inode, struct file * filp);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FS_XIP
+ +extern ssize_t xip_file_read(struct file *filp, char __user *buf, size_t len,
+ +			     loff_t *ppos);
+ +extern int xip_file_mmap(struct file * file, struct vm_area_struct * vma);
+ +extern ssize_t xip_file_write(struct file *filp, const char __user *buf,
+ +			      size_t len, loff_t *ppos);
+ +extern int xip_truncate_page(struct address_space *mapping, loff_t from);
+ +#else
+ +static inline int xip_truncate_page(struct address_space *mapping, loff_t from)
+ +{
+ +	return 0;
+ +}
+ +#endif
+++=======
++ ssize_t dax_do_io(int rw, struct kiocb *, struct inode *, struct iov_iter *,
++ 		loff_t, get_block_t, dio_iodone_t, int flags);
++ int dax_clear_blocks(struct inode *, sector_t block, long size);
++ int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
++ int dax_truncate_page(struct inode *, loff_t from, get_block_t);
++ int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
++ int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
++ #define dax_mkwrite(vma, vmf, gb)	dax_fault(vma, vmf, gb)
+++>>>>>>> 0e3b210ce172 (dax: use pfn_mkwrite to update c/mtime + freeze protection)
+  
+  #ifdef CONFIG_BLOCK
+  typedef void (dio_submit_t)(int rw, struct bio *bio, struct inode *inode,
+* Unmerged path fs/dax.c
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext2/file.c
+* Unmerged path fs/ext4/file.c
+* Unmerged path include/linux/fs.h
