@@ -386,6 +386,9 @@ static void tracepoint_error(struct parse_events_error *error, int err,
 {
 	char help[BUFSIZ];
 
+	if (!e)
+		return;
+
 	/*
 	 * We get error directly from syscall errno ( > 0),
 	 * or from encoded pointer's error ( < 0).
