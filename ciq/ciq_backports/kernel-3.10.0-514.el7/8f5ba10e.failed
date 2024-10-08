@@ -1,0 +1,163 @@
+IB core: Fix ib_sg_to_pages()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 8f5ba10ed40a9d3ffe84854984227d011a7428bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8f5ba10e.failed
+
+On 12/03/2015 01:18 AM, Christoph Hellwig wrote:
+> The patch looks good to me, but while we touch this area, how about
+> throwing in a few cosmetic fixes as well?
+
+How about the patch below ? In that version of the ib_sg_to_pages() fix
+these concerns have been addressed and additionally to more bugs have been fixed.
+
+------------
+
+[PATCH] IB core: Fix ib_sg_to_pages()
+
+Fix the code for detecting gaps. A gap occurs not only if the
+second or later scatterlist element is not aligned but also if
+any scatterlist element other than the last does not end at a
+page boundary.
+
+In the code for coalescing contiguous elements, ensure that
+mr->length is correct and that last_page_addr is up-to-date.
+
+Ensure that this function returns a negative
+error code instead of zero if the first set_page() call fails.
+
+Fixes: commit 4c67e2bfc8b7 ("IB/core: Introduce new fast registration API")
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8f5ba10ed40a9d3ffe84854984227d011a7428bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index e3c132146f9b,545906dec26d..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1469,3 -1471,111 +1469,114 @@@ int ib_check_mr_status(struct ib_mr *mr
+  		mr->device->check_mr_status(mr, check_mask, mr_status) : -ENOSYS;
+  }
+  EXPORT_SYMBOL(ib_check_mr_status);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * ib_map_mr_sg() - Map the largest prefix of a dma mapped SG list
++  *     and set it the memory region.
++  * @mr:            memory region
++  * @sg:            dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @page_size:     page vector desired page size
++  *
++  * Constraints:
++  * - The first sg element is allowed to have an offset.
++  * - Each sg element must be aligned to page_size (or physically
++  *   contiguous to the previous element). In case an sg element has a
++  *   non contiguous offset, the mapping prefix will not include it.
++  * - The last sg element is allowed to have length less than page_size.
++  * - If sg_nents total byte length exceeds the mr max_num_sge * page_size
++  *   then only max_num_sg entries will be mapped.
++  *
++  * Returns the number of sg elements that were mapped to the memory region.
++  *
++  * After this completes successfully, the  memory region
++  * is ready for registration.
++  */
++ int ib_map_mr_sg(struct ib_mr *mr,
++ 		 struct scatterlist *sg,
++ 		 int sg_nents,
++ 		 unsigned int page_size)
++ {
++ 	if (unlikely(!mr->device->map_mr_sg))
++ 		return -ENOSYS;
++ 
++ 	mr->page_size = page_size;
++ 
++ 	return mr->device->map_mr_sg(mr, sg, sg_nents);
++ }
++ EXPORT_SYMBOL(ib_map_mr_sg);
++ 
++ /**
++  * ib_sg_to_pages() - Convert the largest prefix of a sg list
++  *     to a page vector
++  * @mr:            memory region
++  * @sgl:           dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @set_page:      driver page assignment function pointer
++  *
++  * Core service helper for drivers to convert the largest
++  * prefix of given sg list to a page vector. The sg list
++  * prefix converted is the prefix that meet the requirements
++  * of ib_map_mr_sg.
++  *
++  * Returns the number of sg elements that were assigned to
++  * a page vector.
++  */
++ int ib_sg_to_pages(struct ib_mr *mr,
++ 		   struct scatterlist *sgl,
++ 		   int sg_nents,
++ 		   int (*set_page)(struct ib_mr *, u64))
++ {
++ 	struct scatterlist *sg;
++ 	u64 last_end_dma_addr = 0, last_page_addr = 0;
++ 	unsigned int last_page_off = 0;
++ 	u64 page_mask = ~((u64)mr->page_size - 1);
++ 	int i, ret;
++ 
++ 	mr->iova = sg_dma_address(&sgl[0]);
++ 	mr->length = 0;
++ 
++ 	for_each_sg(sgl, sg, sg_nents, i) {
++ 		u64 dma_addr = sg_dma_address(sg);
++ 		unsigned int dma_len = sg_dma_len(sg);
++ 		u64 end_dma_addr = dma_addr + dma_len;
++ 		u64 page_addr = dma_addr & page_mask;
++ 
++ 		/*
++ 		 * For the second and later elements, check whether either the
++ 		 * end of element i-1 or the start of element i is not aligned
++ 		 * on a page boundary.
++ 		 */
++ 		if (i && (last_page_off != 0 || page_addr != dma_addr)) {
++ 			/* Stop mapping if there is a gap. */
++ 			if (last_end_dma_addr != dma_addr)
++ 				break;
++ 
++ 			/*
++ 			 * Coalesce this element with the last. If it is small
++ 			 * enough just update mr->length. Otherwise start
++ 			 * mapping from the next page.
++ 			 */
++ 			goto next_page;
++ 		}
++ 
++ 		do {
++ 			ret = set_page(mr, page_addr);
++ 			if (unlikely(ret < 0))
++ 				return i ? : ret;
++ next_page:
++ 			page_addr += mr->page_size;
++ 		} while (page_addr < end_dma_addr);
++ 
++ 		mr->length += dma_len;
++ 		last_end_dma_addr = end_dma_addr;
++ 		last_page_addr = end_dma_addr & page_mask;
++ 		last_page_off = end_dma_addr & ~page_mask;
++ 	}
++ 
++ 	return i;
++ }
++ EXPORT_SYMBOL(ib_sg_to_pages);
+++>>>>>>> 8f5ba10ed40a (IB core: Fix ib_sg_to_pages())
+* Unmerged path drivers/infiniband/core/verbs.c
