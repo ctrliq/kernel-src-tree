@@ -1,0 +1,155 @@
+kexec: Fix race between panic() and crash_kexec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+commit 7bbee5ca3896f69f09c68be549cb8997abe6bca6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7bbee5ca.failed
+
+Currently, panic() and crash_kexec() can be called at the same time.
+For example (x86 case):
+
+CPU 0:
+  oops_end()
+    crash_kexec()
+      mutex_trylock() // acquired
+        nmi_shootdown_cpus() // stop other CPUs
+
+CPU 1:
+  panic()
+    crash_kexec()
+      mutex_trylock() // failed to acquire
+    smp_send_stop() // stop other CPUs
+    infinite loop
+
+If CPU 1 calls smp_send_stop() before nmi_shootdown_cpus(), kdump
+fails.
+
+In another case:
+
+CPU 0:
+  oops_end()
+    crash_kexec()
+      mutex_trylock() // acquired
+        <NMI>
+        io_check_error()
+          panic()
+            crash_kexec()
+              mutex_trylock() // failed to acquire
+            infinite loop
+
+Clearly, this is an undesirable result.
+
+To fix this problem, this patch changes crash_kexec() to exclude others
+by using the panic_cpu atomic.
+
+	Signed-off-by: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: HATAYAMA Daisuke <d.hatayama@jp.fujitsu.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: kexec@lists.infradead.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Minfei Huang <mnfhuang@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Seth Jennings <sjenning@redhat.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: http://lkml.kernel.org/r/20151210014630.25437.94161.stgit@softrs
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 7bbee5ca3896f69f09c68be549cb8997abe6bca6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kexec_core.c
+#	kernel/panic.c
+diff --cc kernel/panic.c
+index 77e119fb43e1,b333380c6bb2..000000000000
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@@ -113,9 -134,13 +113,19 @@@ void panic(const char *fmt, ...
+  	/*
+  	 * If we have crashed and we have a crash kernel loaded let it handle
+  	 * everything else.
+++<<<<<<< HEAD
+ +	 * Do we want to call this before we try to display a message?
+ +	 */
+ +	crash_kexec(NULL);
+++=======
++ 	 * If we want to run this after calling panic_notifiers, pass
++ 	 * the "crash_kexec_post_notifiers" option to the kernel.
++ 	 *
++ 	 * Bypass the panic_cpu check and call __crash_kexec directly.
++ 	 */
++ 	if (!crash_kexec_post_notifiers)
++ 		__crash_kexec(NULL);
+++>>>>>>> 7bbee5ca3896 (kexec: Fix race between panic() and crash_kexec())
+  
+  	/*
+  	 * Note smp_send_stop is the usual smp shutdown function, which
+@@@ -124,9 -149,25 +134,23 @@@
+  	 */
+  	smp_send_stop();
+  
+ -	/*
+ -	 * Run any panic handlers, including those that might need to
+ -	 * add information to the kmsg dump output.
+ -	 */
+ -	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
+ -
+  	kmsg_dump(KMSG_DUMP_PANIC);
+  
+++<<<<<<< HEAD
+ +	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
+++=======
++ 	/*
++ 	 * If you doubt kdump always works fine in any situation,
++ 	 * "crash_kexec_post_notifiers" offers you a chance to run
++ 	 * panic_notifiers and dumping kmsg before kdump.
++ 	 * Note: since some panic_notifiers can make crashed kernel
++ 	 * more unstable, it can increase risks of the kdump failure too.
++ 	 *
++ 	 * Bypass the panic_cpu check and call __crash_kexec directly.
++ 	 */
++ 	if (crash_kexec_post_notifiers)
++ 		__crash_kexec(NULL);
+++>>>>>>> 7bbee5ca3896 (kexec: Fix race between panic() and crash_kexec())
+  
+  	bust_spinlocks(0);
+  
+* Unmerged path kernel/kexec_core.c
+diff --git a/include/linux/kexec.h b/include/linux/kexec.h
+index 4b2a0e11cc5b..fcfc4dcb1918 100644
+--- a/include/linux/kexec.h
++++ b/include/linux/kexec.h
+@@ -225,6 +225,7 @@ extern int kexec_purgatory_get_set_symbol(struct kimage *image,
+ 					  unsigned int size, bool get_value);
+ extern void *kexec_purgatory_get_symbol_addr(struct kimage *image,
+ 					     const char *name);
++extern void __crash_kexec(struct pt_regs *);
+ extern void crash_kexec(struct pt_regs *);
+ int kexec_should_crash(struct task_struct *);
+ void crash_save_cpu(struct pt_regs *regs, int cpu);
+@@ -309,6 +310,7 @@ void crash_free_reserved_phys_range(unsigned long begin, unsigned long end);
+ #else /* !CONFIG_KEXEC */
+ struct pt_regs;
+ struct task_struct;
++static inline void __crash_kexec(struct pt_regs *regs) { }
+ static inline void crash_kexec(struct pt_regs *regs) { }
+ static inline int kexec_should_crash(struct task_struct *p) { return 0; }
+ #endif /* CONFIG_KEXEC */
+* Unmerged path kernel/kexec_core.c
+* Unmerged path kernel/panic.c
