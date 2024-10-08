@@ -1,0 +1,358 @@
+kvm: add halt_poll_ns module parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] add halt_poll_ns module parameter (Bandan Das) [1198205 1209995]
+Rebuild_FUZZ: 92.96%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit f7819512996361280b86259222456fcf15aad926
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f7819512.failed
+
+This patch introduces a new module parameter for the KVM module; when it
+is present, KVM attempts a bit of polling on every HLT before scheduling
+itself out via kvm_vcpu_block.
+
+This parameter helps a lot for latency-bound workloads---in particular
+I tested it with O_DSYNC writes with a battery-backed disk in the host.
+In this case, writes are fast (because the data doesn't have to go all
+the way to the platters) but they cannot be merged by either the host or
+the guest.  KVM's performance here is usually around 30% of bare metal,
+or 50% if you use cache=directsync or cache=writethrough (these
+parameters avoid that the guest sends pointless flush requests, and
+at the same time they are not slow because of the battery-backed cache).
+The bad performance happens because on every halt the host CPU decides
+to halt itself too.  When the interrupt comes, the vCPU thread is then
+migrated to a new physical CPU, and in general the latency is horrible
+because the vCPU thread has to be scheduled back in.
+
+With this patch performance reaches 60-65% of bare metal and, more
+important, 99% of what you get if you use idle=poll in the guest.  This
+means that the tunable gets rid of this particular bottleneck, and more
+work can be done to improve performance in the kernel or QEMU.
+
+Of course there is some price to pay; every time an otherwise idle vCPUs
+is interrupted by an interrupt, it will poll unnecessarily and thus
+impose a little load on the host.  The above results were obtained with
+a mostly random value of the parameter (500000), and the load was around
+1.5-2.5% CPU usage on one of the host's core for each idle guest vCPU.
+
+The patch also adds a new stat, /sys/kernel/debug/kvm/halt_successful_poll,
+that can be used to tune the parameter.  It counts how many HLT
+instructions received an interrupt during the polling period; each
+successful poll avoids that Linux schedules the VCPU thread out and back
+in, and may also avoid a likely trip to C1 and back for the physical CPU.
+
+While the VM is idle, a Linux 4 VCPU VM halts around 10 times per second.
+Of these halts, almost all are failed polls.  During the benchmark,
+instead, basically all halts end within the polling period, except a more
+or less constant stream of 50 per second coming from vCPUs that are not
+running the benchmark.  The wasted time is thus very low.  Things may
+be slightly different for Windows VMs, which have a ~10 ms timer tick.
+
+The effect is also visible on Marcelo's recently-introduced latency
+test for the TSC deadline timer.  Though of course a non-RT kernel has
+awful latency bounds, the latency of the timer is around 8000-10000 clock
+cycles compared to 20000-120000 without setting halt_poll_ns.  For the TSC
+deadline timer, thus, the effect is both a smaller average latency and
+a smaller variance.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f7819512996361280b86259222456fcf15aad926)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/mips/kvm/kvm_mips.c
+#	arch/s390/include/asm/kvm_host.h
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/mips/kvm/kvm_mips.c
+index 329f169fd18c,c9eccf5df912..000000000000
+--- a/arch/mips/kvm/kvm_mips.c
++++ b/arch/mips/kvm/kvm_mips.c
+@@@ -31,23 -33,24 +31,42 @@@
+  #define VECTORSPACING 0x100	/* for EI/VI mode */
+  #endif
+  
+ -#define VCPU_STAT(x) offsetof(struct kvm_vcpu, stat.x)
+ +#define VCPU_STAT(x) offsetof(struct kvm_vcpu, stat.x), KVM_STAT_VCPU
+  struct kvm_stats_debugfs_item debugfs_entries[] = {
+++<<<<<<< HEAD:arch/mips/kvm/kvm_mips.c
+ +	{ "wait", VCPU_STAT(wait_exits) },
+ +	{ "cache", VCPU_STAT(cache_exits) },
+ +	{ "signal", VCPU_STAT(signal_exits) },
+ +	{ "interrupt", VCPU_STAT(int_exits) },
+ +	{ "cop_unsuable", VCPU_STAT(cop_unusable_exits) },
+ +	{ "tlbmod", VCPU_STAT(tlbmod_exits) },
+ +	{ "tlbmiss_ld", VCPU_STAT(tlbmiss_ld_exits) },
+ +	{ "tlbmiss_st", VCPU_STAT(tlbmiss_st_exits) },
+ +	{ "addrerr_st", VCPU_STAT(addrerr_st_exits) },
+ +	{ "addrerr_ld", VCPU_STAT(addrerr_ld_exits) },
+ +	{ "syscall", VCPU_STAT(syscall_exits) },
+ +	{ "resvd_inst", VCPU_STAT(resvd_inst_exits) },
+ +	{ "break_inst", VCPU_STAT(break_inst_exits) },
+ +	{ "flush_dcache", VCPU_STAT(flush_dcache_exits) },
+ +	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+++=======
++ 	{ "wait",	  VCPU_STAT(wait_exits),	 KVM_STAT_VCPU },
++ 	{ "cache",	  VCPU_STAT(cache_exits),	 KVM_STAT_VCPU },
++ 	{ "signal",	  VCPU_STAT(signal_exits),	 KVM_STAT_VCPU },
++ 	{ "interrupt",	  VCPU_STAT(int_exits),		 KVM_STAT_VCPU },
++ 	{ "cop_unsuable", VCPU_STAT(cop_unusable_exits), KVM_STAT_VCPU },
++ 	{ "tlbmod",	  VCPU_STAT(tlbmod_exits),	 KVM_STAT_VCPU },
++ 	{ "tlbmiss_ld",	  VCPU_STAT(tlbmiss_ld_exits),	 KVM_STAT_VCPU },
++ 	{ "tlbmiss_st",	  VCPU_STAT(tlbmiss_st_exits),	 KVM_STAT_VCPU },
++ 	{ "addrerr_st",	  VCPU_STAT(addrerr_st_exits),	 KVM_STAT_VCPU },
++ 	{ "addrerr_ld",	  VCPU_STAT(addrerr_ld_exits),	 KVM_STAT_VCPU },
++ 	{ "syscall",	  VCPU_STAT(syscall_exits),	 KVM_STAT_VCPU },
++ 	{ "resvd_inst",	  VCPU_STAT(resvd_inst_exits),	 KVM_STAT_VCPU },
++ 	{ "break_inst",	  VCPU_STAT(break_inst_exits),	 KVM_STAT_VCPU },
++ 	{ "flush_dcache", VCPU_STAT(flush_dcache_exits), KVM_STAT_VCPU },
++ 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), KVM_STAT_VCPU },
++ 	{ "halt_wakeup",  VCPU_STAT(halt_wakeup),	 KVM_STAT_VCPU },
+++>>>>>>> f78195129963 (kvm: add halt_poll_ns module parameter):arch/mips/kvm/mips.c
+  	{NULL}
+  };
+  
+diff --cc arch/s390/include/asm/kvm_host.h
+index e87ecaa2c569,f79058e3fd98..000000000000
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@@ -124,8 -196,12 +124,13 @@@ struct kvm_vcpu_stat 
+  	u32 exit_stop_request;
+  	u32 exit_validity;
+  	u32 exit_instruction;
+++<<<<<<< HEAD
+++=======
++ 	u32 halt_successful_poll;
++ 	u32 halt_wakeup;
+++>>>>>>> f78195129963 (kvm: add halt_poll_ns module parameter)
+  	u32 instruction_lctl;
+  	u32 instruction_lctlg;
+ -	u32 instruction_stctl;
+ -	u32 instruction_stctg;
+  	u32 exit_program_interruption;
+  	u32 exit_instr_and_program;
+  	u32 deliver_external_call;
+diff --cc arch/s390/kvm/kvm-s390.c
+index 9247ec7dc605,1dbab2340a66..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -49,8 -51,12 +49,13 @@@ struct kvm_stats_debugfs_item debugfs_e
+  	{ "exit_instruction", VCPU_STAT(exit_instruction) },
+  	{ "exit_program_interruption", VCPU_STAT(exit_program_interruption) },
+  	{ "exit_instr_and_program_int", VCPU_STAT(exit_instr_and_program) },
+++<<<<<<< HEAD
+++=======
++ 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
++ 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+++>>>>>>> f78195129963 (kvm: add halt_poll_ns module parameter)
+  	{ "instruction_lctlg", VCPU_STAT(instruction_lctlg) },
+  	{ "instruction_lctl", VCPU_STAT(instruction_lctl) },
+ -	{ "instruction_stctl", VCPU_STAT(instruction_stctl) },
+ -	{ "instruction_stctg", VCPU_STAT(instruction_stctg) },
+  	{ "deliver_emergency_signal", VCPU_STAT(deliver_emergency_signal) },
+  	{ "deliver_external_call", VCPU_STAT(deliver_external_call) },
+  	{ "deliver_service_signal", VCPU_STAT(deliver_service_signal) },
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index 9ead7f53be2e..06cffe52df54 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -143,6 +143,7 @@ struct kvm_vm_stat {
+ };
+ 
+ struct kvm_vcpu_stat {
++	u32 halt_successful_poll;
+ 	u32 halt_wakeup;
+ };
+ 
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/mips/include/asm/kvm_host.h b/arch/mips/include/asm/kvm_host.h
+index 4d6fa0bf1305..7f1e15f2b0b4 100644
+--- a/arch/mips/include/asm/kvm_host.h
++++ b/arch/mips/include/asm/kvm_host.h
+@@ -100,6 +100,7 @@ struct kvm_vcpu_stat {
+ 	u32 resvd_inst_exits;
+ 	u32 break_inst_exits;
+ 	u32 flush_dcache_exits;
++	u32 halt_successful_poll;
+ 	u32 halt_wakeup;
+ };
+ 
+* Unmerged path arch/mips/kvm/kvm_mips.c
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index c71536d27831..221935737157 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -116,6 +116,7 @@ struct kvm_vcpu_stat {
+ 	u32 emulated_inst_exits;
+ 	u32 dec_exits;
+ 	u32 ext_intr_exits;
++	u32 halt_successful_poll;
+ 	u32 halt_wakeup;
+ 	u32 dbell_exits;
+ 	u32 gdbell_exits;
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index c14aa96517c5..753bd47a1738 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -52,6 +52,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	{ "dec",         VCPU_STAT(dec_exits) },
+ 	{ "ext_intr",    VCPU_STAT(ext_intr_exits) },
+ 	{ "queue_intr",  VCPU_STAT(queue_intr) },
++	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), },
+ 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+ 	{ "pf_storage",  VCPU_STAT(pf_storage) },
+ 	{ "sp_storage",  VCPU_STAT(sp_storage) },
+diff --git a/arch/powerpc/kvm/booke.c b/arch/powerpc/kvm/booke.c
+index b1424f6d200c..9004c32bb42b 100644
+--- a/arch/powerpc/kvm/booke.c
++++ b/arch/powerpc/kvm/booke.c
+@@ -61,6 +61,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	{ "inst_emu",   VCPU_STAT(emulated_inst_exits) },
+ 	{ "dec",        VCPU_STAT(dec_exits) },
+ 	{ "ext_intr",   VCPU_STAT(ext_intr_exits) },
++	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
+ 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+ 	{ "doorbell", VCPU_STAT(dbell_exits) },
+ 	{ "guest doorbell", VCPU_STAT(gdbell_exits) },
+* Unmerged path arch/s390/include/asm/kvm_host.h
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 85892f251941..566494fee34b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -648,6 +648,7 @@ struct kvm_vcpu_stat {
+ 	u32 irq_window_exits;
+ 	u32 nmi_window_exits;
+ 	u32 halt_exits;
++	u32 halt_successful_poll;
+ 	u32 halt_wakeup;
+ 	u32 request_irq_exits;
+ 	u32 irq_exits;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7b812805de5a..a3d1a833692c 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -141,6 +141,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	{ "irq_window", VCPU_STAT(irq_window_exits) },
+ 	{ "nmi_window", VCPU_STAT(nmi_window_exits) },
+ 	{ "halt_exits", VCPU_STAT(halt_exits) },
++	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
+ 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+ 	{ "hypercalls", VCPU_STAT(hypercalls) },
+ 	{ "request_irq", VCPU_STAT(request_irq_exits) },
+diff --git a/include/trace/events/kvm.h b/include/trace/events/kvm.h
+index 6edf1f2028cd..6bfe7eec1c2c 100644
+--- a/include/trace/events/kvm.h
++++ b/include/trace/events/kvm.h
+@@ -37,6 +37,25 @@ TRACE_EVENT(kvm_userspace_exit,
+ 		  __entry->errno < 0 ? -__entry->errno : __entry->reason)
+ );
+ 
++TRACE_EVENT(kvm_vcpu_wakeup,
++	    TP_PROTO(__u64 ns, bool waited),
++	    TP_ARGS(ns, waited),
++
++	TP_STRUCT__entry(
++		__field(	__u64,		ns		)
++		__field(	bool,		waited		)
++	),
++
++	TP_fast_assign(
++		__entry->ns		= ns;
++		__entry->waited		= waited;
++	),
++
++	TP_printk("%s time %lld ns",
++		  __entry->waited ? "wait" : "poll",
++		  __entry->ns)
++);
++
+ #if defined(CONFIG_HAVE_KVM_IRQFD)
+ TRACE_EVENT(kvm_set_irq,
+ 	TP_PROTO(unsigned int gsi, int level, int irq_source_id),
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 85e30f60e9b6..e5c149b70291 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -65,6 +65,9 @@
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
++unsigned int halt_poll_ns = 0;
++module_param(halt_poll_ns, uint, S_IRUGO | S_IWUSR);
++
+ /*
+  * Ordering of locks:
+  *
+@@ -1770,29 +1773,60 @@ void mark_page_dirty(struct kvm *kvm, gfn_t gfn)
+ }
+ EXPORT_SYMBOL_GPL(mark_page_dirty);
+ 
++static int kvm_vcpu_check_block(struct kvm_vcpu *vcpu)
++{
++	if (kvm_arch_vcpu_runnable(vcpu)) {
++		kvm_make_request(KVM_REQ_UNHALT, vcpu);
++		return -EINTR;
++	}
++	if (kvm_cpu_has_pending_timer(vcpu))
++		return -EINTR;
++	if (signal_pending(current))
++		return -EINTR;
++
++	return 0;
++}
++
+ /*
+  * The vCPU has executed a HLT instruction with in-kernel mode enabled.
+  */
+ void kvm_vcpu_block(struct kvm_vcpu *vcpu)
+ {
++	ktime_t start, cur;
+ 	DEFINE_WAIT(wait);
++	bool waited = false;
++
++	start = cur = ktime_get();
++	if (halt_poll_ns) {
++		ktime_t stop = ktime_add_ns(ktime_get(), halt_poll_ns);
++		do {
++			/*
++			 * This sets KVM_REQ_UNHALT if an interrupt
++			 * arrives.
++			 */
++			if (kvm_vcpu_check_block(vcpu) < 0) {
++				++vcpu->stat.halt_successful_poll;
++				goto out;
++			}
++			cur = ktime_get();
++		} while (single_task_running() && ktime_before(cur, stop));
++	}
+ 
+ 	for (;;) {
+ 		prepare_to_wait(&vcpu->wq, &wait, TASK_INTERRUPTIBLE);
+ 
+-		if (kvm_arch_vcpu_runnable(vcpu)) {
+-			kvm_make_request(KVM_REQ_UNHALT, vcpu);
+-			break;
+-		}
+-		if (kvm_cpu_has_pending_timer(vcpu))
+-			break;
+-		if (signal_pending(current))
++		if (kvm_vcpu_check_block(vcpu) < 0)
+ 			break;
+ 
++		waited = true;
+ 		schedule();
+ 	}
+ 
+ 	finish_wait(&vcpu->wq, &wait);
++	cur = ktime_get();
++
++out:
++	trace_kvm_vcpu_wakeup(ktime_to_ns(cur) - ktime_to_ns(start), waited);
+ }
+ EXPORT_SYMBOL_GPL(kvm_vcpu_block);
+ 
