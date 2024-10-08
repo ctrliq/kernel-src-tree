@@ -1,0 +1,235 @@
+ALSA: hda - Introduce pin_cvt_fixup() ops to hdmi parser
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 4846a67eb5a1d7cac76e1b22f66e88a8cbbdff3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4846a67e.failed
+
+For reducing the splat of is_haswell_plus() or such macros, this patch
+introduces pin_cvt_fixup() ops to hdmi_spec.  For HSW+ and VLV+
+codecs, set this ops so that the driver can call the Intel-specific
+workarounds appropriately.
+
+A gratis bonus that we can remove the mux_id argument from
+hdmi_choose_cvt(), too, since the fixup function always refers the
+mux_idx from the given per_pin object.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 4846a67eb5a1d7cac76e1b22f66e88a8cbbdff3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/patch_hdmi.c
+diff --cc sound/pci/hda/patch_hdmi.c
+index 0392c2d96924,3481b43476dc..000000000000
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@@ -2236,92 -2289,123 +2237,176 @@@ static void intel_pin_eld_notify(void *
+  	check_presence_and_report(codec, pin_nid);
+  }
+  
+++<<<<<<< HEAD
+ +static int patch_generic_hdmi(struct hda_codec *codec)
+++=======
++ /* register i915 component pin_eld_notify callback */
++ static void register_i915_notifier(struct hda_codec *codec)
++ {
++ 	struct hdmi_spec *spec = codec->spec;
++ 
++ 	spec->use_acomp_notifier = true;
++ 	spec->i915_audio_ops.audio_ptr = codec;
++ 	/* intel_audio_codec_enable() or intel_audio_codec_disable()
++ 	 * will call pin_eld_notify with using audio_ptr pointer
++ 	 * We need make sure audio_ptr is really setup
++ 	 */
++ 	wmb();
++ 	spec->i915_audio_ops.pin_eld_notify = intel_pin_eld_notify;
++ 	snd_hdac_i915_register_notifier(&spec->i915_audio_ops);
++ }
++ 
++ /* setup_stream ops override for HSW+ */
++ static int i915_hsw_setup_stream(struct hda_codec *codec, hda_nid_t cvt_nid,
++ 				 hda_nid_t pin_nid, u32 stream_tag, int format)
++ {
++ 	haswell_verify_D0(codec, cvt_nid, pin_nid);
++ 	return hdmi_setup_stream(codec, cvt_nid, pin_nid, stream_tag, format);
++ }
++ 
++ /* pin_cvt_fixup ops override for HSW+ and VLV+ */
++ static void i915_pin_cvt_fixup(struct hda_codec *codec,
++ 			       struct hdmi_spec_per_pin *per_pin,
++ 			       hda_nid_t cvt_nid)
++ {
++ 	if (per_pin) {
++ 		intel_verify_pin_cvt_connect(codec, per_pin);
++ 		intel_not_share_assigned_cvt(codec, per_pin->pin_nid,
++ 					     per_pin->mux_idx);
++ 	} else {
++ 		intel_not_share_assigned_cvt_nid(codec, 0, cvt_nid);
++ 	}
++ }
++ 
++ /* Intel Haswell and onwards; audio component with eld notifier */
++ static int patch_i915_hsw_hdmi(struct hda_codec *codec)
+++>>>>>>> 4846a67eb5a1 (ALSA: hda - Introduce pin_cvt_fixup() ops to hdmi parser)
+  {
+  	struct hdmi_spec *spec;
+ -	int err;
+  
+ -	/* HSW+ requires i915 binding */
+ -	if (!codec->bus->core.audio_component) {
+ -		codec_info(codec, "No i915 binding for Intel HDMI/DP codec\n");
+ -		return -ENODEV;
+ +	spec = kzalloc(sizeof(*spec), GFP_KERNEL);
+ +	if (spec == NULL)
+ +		return -ENOMEM;
+ +
+ +	spec->ops = generic_standard_hdmi_ops;
+ +	mutex_init(&spec->pcm_lock);
+ +	snd_hdac_register_chmap_ops(&codec->core, &spec->chmap);
+ +
+ +	spec->chmap.ops.get_chmap = hdmi_get_chmap;
+ +	spec->chmap.ops.set_chmap = hdmi_set_chmap;
+ +	spec->chmap.ops.is_pcm_attached = is_hdmi_pcm_attached;
+ +
+ +	codec->spec = spec;
+ +	hdmi_array_init(spec, 4);
+ +
+ +#ifdef CONFIG_SND_HDA_I915
+ +	/* Try to bind with i915 for Intel HSW+ codecs (if not done yet) */
+ +	if ((codec->core.vendor_id >> 16) == 0x8086 &&
+ +	    is_haswell_plus(codec)) {
+ +#if 0
+ +		/* on-demand binding leads to an unbalanced refcount when
+ +		 * both i915 and hda drivers are probed concurrently;
+ +		 * disabled temporarily for now
+ +		 */
+ +		if (!codec->bus->core.audio_component)
+ +			if (!snd_hdac_i915_init(&codec->bus->core))
+ +				spec->i915_bound = true;
+ +#endif
+ +		/* use i915 audio component notifier for hotplug */
+ +		if (codec->bus->core.audio_component)
+ +			spec->use_acomp_notifier = true;
+  	}
+ +#endif
+  
+++<<<<<<< HEAD
+ +	if (is_haswell_plus(codec)) {
+ +		intel_haswell_enable_all_pins(codec, true);
+ +		intel_haswell_fixup_enable_dp12(codec);
+++=======
++ 	err = alloc_generic_hdmi(codec);
++ 	if (err < 0)
++ 		return err;
++ 	spec = codec->spec;
++ 
++ 	intel_haswell_enable_all_pins(codec, true);
++ 	intel_haswell_fixup_enable_dp12(codec);
++ 
++ 	/* For Haswell/Broadwell, the controller is also in the power well and
++ 	 * can cover the codec power request, and so need not set this flag.
++ 	 */
++ 	if (!is_haswell(codec) && !is_broadwell(codec))
++ 		codec->core.link_power_control = 1;
++ 
++ 	codec->patch_ops.set_power_state = haswell_set_power_state;
++ 	codec->dp_mst = true;
++ 	codec->depop_delay = 0;
++ 	codec->auto_runtime_pm = 1;
++ 
++ 	spec->ops.setup_stream = i915_hsw_setup_stream;
++ 	spec->ops.pin_cvt_fixup = i915_pin_cvt_fixup;
++ 
++ 	err = hdmi_parse_codec(codec);
++ 	if (err < 0) {
++ 		generic_spec_free(codec);
++ 		return err;
+++>>>>>>> 4846a67eb5a1 (ALSA: hda - Introduce pin_cvt_fixup() ops to hdmi parser)
+  	}
+  
+ -	generic_hdmi_init_per_pins(codec);
+ -	register_i915_notifier(codec);
+ -	return 0;
+ -}
+ -
+ -/* Intel Baytrail and Braswell; without get_eld notifier */
+ -static int patch_i915_byt_hdmi(struct hda_codec *codec)
+ -{
+ -	struct hdmi_spec *spec;
+ -	int err;
+ -
+ -	/* requires i915 binding */
+ -	if (!codec->bus->core.audio_component) {
+ -		codec_info(codec, "No i915 binding for Intel HDMI/DP codec\n");
+ -		return -ENODEV;
+ -	}
+ -
+ -	err = alloc_generic_hdmi(codec);
+ -	if (err < 0)
+ -		return err;
+ -	spec = codec->spec;
+ -
+  	/* For Valleyview/Cherryview, only the display codec is in the display
+  	 * power well and can use link_power ops to request/release the power.
+ +	 * For Haswell/Broadwell, the controller is also in the power well and
+ +	 * can cover the codec power request, and so need not set this flag.
+ +	 * For previous platforms, there is no such power well feature.
+  	 */
+ -	codec->core.link_power_control = 1;
+ +	if (is_valleyview_plus(codec) || is_skylake(codec) ||
+ +			is_broxton(codec))
+ +		codec->core.link_power_control = 1;
+  
+++<<<<<<< HEAD
+ +	if (codec_has_acomp(codec)) {
+ +		codec->depop_delay = 0;
+ +		spec->i915_audio_ops.audio_ptr = codec;
+ +		/* intel_audio_codec_enable() or intel_audio_codec_disable()
+ +		 * will call pin_eld_notify with using audio_ptr pointer
+ +		 * We need make sure audio_ptr is really setup
+ +		 */
+ +		wmb();
+ +		spec->i915_audio_ops.pin_eld_notify = intel_pin_eld_notify;
+ +		snd_hdac_i915_register_notifier(&spec->i915_audio_ops);
+++=======
++ 	codec->depop_delay = 0;
++ 	codec->auto_runtime_pm = 1;
++ 
++ 	spec->ops.pin_cvt_fixup = i915_pin_cvt_fixup;
++ 
++ 	err = hdmi_parse_codec(codec);
++ 	if (err < 0) {
++ 		generic_spec_free(codec);
++ 		return err;
+++>>>>>>> 4846a67eb5a1 (ALSA: hda - Introduce pin_cvt_fixup() ops to hdmi parser)
+  	}
+  
+ +	if (hdmi_parse_codec(codec) < 0) {
+ +		if (spec->i915_bound)
+ +			snd_hdac_i915_exit(&codec->bus->core);
+ +		codec->spec = NULL;
+ +		kfree(spec);
+ +		return -EINVAL;
+ +	}
+ +	codec->patch_ops = generic_hdmi_patch_ops;
+ +	if (is_haswell_plus(codec)) {
+ +		codec->patch_ops.set_power_state = haswell_set_power_state;
+ +		codec->dp_mst = true;
+ +	}
+ +
+ +	/* Enable runtime pm for HDMI audio codec of HSW/BDW/SKL/BYT/BSW */
+ +	if (is_haswell_plus(codec) || is_valleyview_plus(codec))
+ +		codec->auto_runtime_pm = 1;
+ +
+  	generic_hdmi_init_per_pins(codec);
+ +
+ +
+ +	WARN_ON(spec->dyn_pcm_assign && !codec_has_acomp(codec));
+  	return 0;
+  }
+  
+* Unmerged path sound/pci/hda/patch_hdmi.c
