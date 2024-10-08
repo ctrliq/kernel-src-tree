@@ -1,0 +1,106 @@
+vlan: Fix untag operations of stacked vlans with REORDER_HEADER off
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vlad Yasevich <vyasevich@gmail.com>
+commit a6e18ff111701b4ff6947605bfbe9594ec42a6e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6e18ff1.failed
+
+When we have multiple stacked vlan devices all of which have
+turned off REORDER_HEADER flag, the untag operation does not
+locate the ethernet addresses correctly for nested vlans.
+The reason is that in case of REORDER_HEADER flag being off,
+the outer vlan headers are put back and the mac_len is adjusted
+to account for the presense of the header.  Then, the subsequent
+untag operation, for the next level vlan, always use VLAN_ETH_HLEN
+to locate the begining of the ethernet header and that ends up
+being a multiple of 4 bytes short of the actuall beginning
+of the mac header (the multiple depending on the how many vlan
+encapsulations ethere are).
+
+As a reslult, if there are multiple levles of vlan devices
+with REODER_HEADER being off, the recevied packets end up
+being dropped.
+
+To solve this, we use skb->mac_len as the offset.  The value
+is always set on receive path and starts out as a ETH_HLEN.
+The value is also updated when the vlan header manupations occur
+so we know it will be correct.
+
+	Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6e18ff111701b4ff6947605bfbe9594ec42a6e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 4b9a3369cb53,152b9c70e252..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3865,6 -4261,59 +3865,62 @@@ unsigned int skb_gso_transport_seglen(c
+  }
+  EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *skb_reorder_vlan_header(struct sk_buff *skb)
++ {
++ 	if (skb_cow(skb, skb_headroom(skb)) < 0) {
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	}
++ 
++ 	memmove(skb->data - ETH_HLEN, skb->data - skb->mac_len,
++ 		2 * ETH_ALEN);
++ 	skb->mac_header += VLAN_HLEN;
++ 	return skb;
++ }
++ 
++ struct sk_buff *skb_vlan_untag(struct sk_buff *skb)
++ {
++ 	struct vlan_hdr *vhdr;
++ 	u16 vlan_tci;
++ 
++ 	if (unlikely(skb_vlan_tag_present(skb))) {
++ 		/* vlan_tci is already set-up so leave this for another time */
++ 		return skb;
++ 	}
++ 
++ 	skb = skb_share_check(skb, GFP_ATOMIC);
++ 	if (unlikely(!skb))
++ 		goto err_free;
++ 
++ 	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN)))
++ 		goto err_free;
++ 
++ 	vhdr = (struct vlan_hdr *)skb->data;
++ 	vlan_tci = ntohs(vhdr->h_vlan_TCI);
++ 	__vlan_hwaccel_put_tag(skb, skb->protocol, vlan_tci);
++ 
++ 	skb_pull_rcsum(skb, VLAN_HLEN);
++ 	vlan_set_encap_proto(skb, vhdr);
++ 
++ 	skb = skb_reorder_vlan_header(skb);
++ 	if (unlikely(!skb))
++ 		goto err_free;
++ 
++ 	skb_reset_network_header(skb);
++ 	skb_reset_transport_header(skb);
++ 	skb_reset_mac_len(skb);
++ 
++ 	return skb;
++ 
++ err_free:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(skb_vlan_untag);
++ 
+++>>>>>>> a6e18ff11170 (vlan: Fix untag operations of stacked vlans with REORDER_HEADER off)
+  int skb_ensure_writable(struct sk_buff *skb, int write_len)
+  {
+  	if (!pskb_may_pull(skb, write_len))
+* Unmerged path net/core/skbuff.c
