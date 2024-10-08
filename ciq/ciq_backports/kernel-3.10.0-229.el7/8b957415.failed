@@ -1,0 +1,125 @@
+blk-mq: use blk_mq_start_hw_queues() when running requeue work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 8b95741569eabc5eb17da71d1d3668cdb0bef86c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8b957415.failed
+
+When requests are retried due to hw or sw resource shortages,
+we often stop the associated hardware queue. So ensure that we
+restart the queues when running the requeue work, otherwise the
+queue run will be a no-op.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 8b95741569eabc5eb17da71d1d3668cdb0bef86c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 6fcf1deefe8d,c88e6089746d..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -380,6 -442,95 +380,98 @@@ static void blk_mq_requeue_request(stru
+  		rq->nr_phys_segments--;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_requeue_request(struct request *rq)
++ {
++ 	__blk_mq_requeue_request(rq);
++ 	blk_clear_rq_complete(rq);
++ 
++ 	BUG_ON(blk_queued_rq(rq));
++ 	blk_mq_add_to_requeue_list(rq, true);
++ }
++ EXPORT_SYMBOL(blk_mq_requeue_request);
++ 
++ static void blk_mq_requeue_work(struct work_struct *work)
++ {
++ 	struct request_queue *q =
++ 		container_of(work, struct request_queue, requeue_work);
++ 	LIST_HEAD(rq_list);
++ 	struct request *rq, *next;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	list_splice_init(&q->requeue_list, &rq_list);
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ 
++ 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
++ 		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
++ 			continue;
++ 
++ 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, true, false, false);
++ 	}
++ 
++ 	while (!list_empty(&rq_list)) {
++ 		rq = list_entry(rq_list.next, struct request, queuelist);
++ 		list_del_init(&rq->queuelist);
++ 		blk_mq_insert_request(rq, false, false, false);
++ 	}
++ 
++ 	/*
++ 	 * Use the start variant of queue running here, so that running
++ 	 * the requeue work will kick stopped queues.
++ 	 */
++ 	blk_mq_start_hw_queues(q);
++ }
++ 
++ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
++ {
++ 	struct request_queue *q = rq->q;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We abuse this flag that is otherwise used by the I/O scheduler to
++ 	 * request head insertation from the workqueue.
++ 	 */
++ 	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
++ 
++ 	spin_lock_irqsave(&q->requeue_lock, flags);
++ 	if (at_head) {
++ 		rq->cmd_flags |= REQ_SOFTBARRIER;
++ 		list_add(&rq->queuelist, &q->requeue_list);
++ 	} else {
++ 		list_add_tail(&rq->queuelist, &q->requeue_list);
++ 	}
++ 	spin_unlock_irqrestore(&q->requeue_lock, flags);
++ }
++ EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
++ 
++ void blk_mq_kick_requeue_list(struct request_queue *q)
++ {
++ 	kblockd_schedule_work(&q->requeue_work);
++ }
++ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
++ 
++ static inline bool is_flush_request(struct request *rq, unsigned int tag)
++ {
++ 	return ((rq->cmd_flags & REQ_FLUSH_SEQ) &&
++ 			rq->q->flush_rq->tag == tag);
++ }
++ 
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
++ {
++ 	struct request *rq = tags->rqs[tag];
++ 
++ 	if (!is_flush_request(rq, tag))
++ 		return rq;
++ 
++ 	return rq->q->flush_rq;
++ }
++ EXPORT_SYMBOL(blk_mq_tag_to_rq);
++ 
+++>>>>>>> 8b95741569ea (blk-mq: use blk_mq_start_hw_queues() when running requeue work)
+  struct blk_mq_timeout_data {
+  	struct blk_mq_hw_ctx *hctx;
+  	unsigned long *next;
+* Unmerged path block/blk-mq.c
