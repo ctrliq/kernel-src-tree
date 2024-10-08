@@ -1,0 +1,747 @@
+vxlan: Group Policy extension
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit 3511494ce2f3d3b77544c79b87511a4ddb61dc89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3511494c.failed
+
+Implements supports for the Group Policy VXLAN extension [0] to provide
+a lightweight and simple security label mechanism across network peers
+based on VXLAN. The security context and associated metadata is mapped
+to/from skb->mark. This allows further mapping to a SELinux context
+using SECMARK, to implement ACLs directly with nftables, iptables, OVS,
+tc, etc.
+
+The group membership is defined by the lower 16 bits of skb->mark, the
+upper 16 bits are used for flags.
+
+SELinux allows to manage label to secure local resources. However,
+distributed applications require ACLs to implemented across hosts. This
+is typically achieved by matching on L2-L4 fields to identify the
+original sending host and process on the receiver. On top of that,
+netlabel and specifically CIPSO [1] allow to map security contexts to
+universal labels.  However, netlabel and CIPSO are relatively complex.
+This patch provides a lightweight alternative for overlay network
+environments with a trusted underlay. No additional control protocol
+is required.
+
+           Host 1:                       Host 2:
+
+      Group A        Group B        Group B     Group A
+      +-----+   +-------------+    +-------+   +-----+
+      | lxc |   | SELinux CTX |    | httpd |   | VM  |
+      +--+--+   +--+----------+    +---+---+   +--+--+
+	  \---+---/                     \----+---/
+	      |                              |
+	  +---+---+                      +---+---+
+	  | vxlan |                      | vxlan |
+	  +---+---+                      +---+---+
+	      +------------------------------+
+
+Backwards compatibility:
+A VXLAN-GBP socket can receive standard VXLAN frames and will assign
+the default group 0x0000 to such frames. A Linux VXLAN socket will
+drop VXLAN-GBP  frames. The extension is therefore disabled by default
+and needs to be specifically enabled:
+
+   ip link add [...] type vxlan [...] gbp
+
+In a mixed environment with VXLAN and VXLAN-GBP sockets, the GBP socket
+must run on a separate port number.
+
+Examples:
+ iptables:
+  host1# iptables -I OUTPUT -m owner --uid-owner 101 -j MARK --set-mark 0x200
+  host2# iptables -I INPUT -m mark --mark 0x200 -j DROP
+
+ OVS:
+  # ovs-ofctl add-flow br0 'in_port=1,actions=load:0x200->NXM_NX_TUN_GBP_ID[],NORMAL'
+  # ovs-ofctl add-flow br0 'in_port=2,tun_gbp_id=0x200,actions=drop'
+
+[0] https://tools.ietf.org/html/draft-smith-vxlan-group-policy
+[1] http://lwn.net/Articles/204905/
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3511494ce2f3d3b77544c79b87511a4ddb61dc89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+#	include/uapi/linux/if_link.h
+#	net/openvswitch/vport-vxlan.c
+diff --cc drivers/net/vxlan.c
+index 3440d933b3ec,6dbf8e041922..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1099,6 -1183,8 +1100,11 @@@ static int vxlan_udp_encap_recv(struct 
+  {
+  	struct vxlan_sock *vs;
+  	struct vxlanhdr *vxh;
+++<<<<<<< HEAD
+++=======
++ 	u32 flags, vni;
++ 	struct vxlan_metadata md = {0};
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+  	/* Need Vxlan and inner Ethernet header to be present */
+  	if (!pskb_may_pull(skb, VXLAN_HLEN))
+@@@ -1120,7 -1209,48 +1126,52 @@@
+  	if (!vs)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	vs->rcv(vs, skb, vxh->vx_vni);
+++=======
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni);
++ 		if (!vxh)
++ 			goto drop;
++ 
++ 		flags &= ~VXLAN_HF_RCO;
++ 		vni &= VXLAN_VID_MASK;
++ 	}
++ 
++ 	/* For backwards compatibility, only allow reserved fields to be
++ 	 * used by VXLAN extensions if explicitly requested.
++ 	 */
++ 	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
++ 		struct vxlanhdr_gbp *gbp;
++ 
++ 		gbp = (struct vxlanhdr_gbp *)vxh;
++ 		md.gbp = ntohs(gbp->policy_id);
++ 
++ 		if (gbp->dont_learn)
++ 			md.gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 		if (gbp->policy_applied)
++ 			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 		flags &= ~VXLAN_GBP_USED_BITS;
++ 	}
++ 
++ 	if (flags || (vni & ~VXLAN_VID_MASK)) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatbility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 
++ 		goto bad_flags;
++ 	}
++ 
++ 	md.vni = vxh->vx_vni;
++ 	vs->rcv(vs, skb, &md);
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  	return 0;
+  
+  drop:
+@@@ -1529,11 -1663,21 +1581,29 @@@ static bool route_shortcircuit(struct n
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct sk_buff *vxlan_handle_offloads(struct sk_buff *skb,
+ +						    bool udp_csum)
+ +{
+ +	int type = udp_csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ +	return iptunnel_handle_offloads(skb, udp_csum, type);
+++=======
++ static void vxlan_build_gbp_hdr(struct vxlanhdr *vxh, struct vxlan_sock *vs,
++ 				struct vxlan_metadata *md)
++ {
++ 	struct vxlanhdr_gbp *gbp;
++ 
++ 	gbp = (struct vxlanhdr_gbp *)vxh;
++ 	vxh->vx_flags |= htonl(VXLAN_HF_GBP);
++ 
++ 	if (md->gbp & VXLAN_GBP_DONT_LEARN)
++ 		gbp->dont_learn = 1;
++ 
++ 	if (md->gbp & VXLAN_GBP_POLICY_APPLIED)
++ 		gbp->policy_applied = 1;
++ 
++ 	gbp->policy_id = htons(md->gbp & VXLAN_GBP_ID_MASK);
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+@@@ -1541,17 -1685,36 +1611,22 @@@ static int vxlan6_xmit_skb(struct net *
+  			   struct dst_entry *dst, struct sk_buff *skb,
+  			   struct net_device *dev, struct in6_addr *saddr,
+  			   struct in6_addr *daddr, __u8 prio, __u8 ttl,
+++<<<<<<< HEAD
+ +			   __be16 src_port, __be16 dst_port, __be32 vni)
+++=======
++ 			   __be16 src_port, __be16 dst_port,
++ 			   struct vxlan_metadata *md, bool xnet)
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  {
+ +	struct ipv6hdr *ip6h;
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !udp_get_no_check6_tx(vs->sock->sk);
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+ -
+ -	if ((vs->flags & VXLAN_F_REMCSUM_TX) &&
+ -	    skb->ip_summed == CHECKSUM_PARTIAL) {
+ -		int csum_start = skb_checksum_start_offset(skb);
+ -
+ -		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
+ -		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
+ -		    (skb->csum_offset == offsetof(struct udphdr, check) ||
+ -		     skb->csum_offset == offsetof(struct tcphdr, check))) {
+ -			udp_sum = false;
+ -			type |= SKB_GSO_TUNNEL_REMCSUM;
+ -		}
+ -	}
+ -
+ -	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+ -	if (IS_ERR(skb)) {
+ -		err = -EINVAL;
+ -		goto err;
+ -	}
+  
+ -	skb_scrub_packet(skb, xnet);
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+  
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+@@@ -1572,59 -1734,68 +1647,76 @@@
+  	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+++<<<<<<< HEAD
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+++=======
++ 	vxh->vx_flags = htonl(VXLAN_HF_VNI);
++ 	vxh->vx_vni = md->vni;
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->len = htons(skb->len);
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+  
+++<<<<<<< HEAD
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+++=======
++ 	if (vs->flags & VXLAN_F_GBP)
++ 		vxlan_build_gbp_hdr(vxh, vs, md);
++ 
++ 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+ -	udp_tunnel6_xmit_skb(vs->sock, dst, skb, dev, saddr, daddr, prio,
+ -			     ttl, src_port, dst_port);
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	ip6tunnel_xmit(skb, dev);
+  	return 0;
+ -err:
+ -	dst_release(dst);
+ -	return err;
+  }
+  #endif
+  
+ -int vxlan_xmit_skb(struct vxlan_sock *vs,
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+  		   struct rtable *rt, struct sk_buff *skb,
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+++<<<<<<< HEAD
+ +		   __be16 src_port, __be16 dst_port, __be32 vni)
+++=======
++ 		   __be16 src_port, __be16 dst_port,
++ 		   struct vxlan_metadata *md, bool xnet)
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  {
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !vs->sock->sk->sk_no_check_tx;
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+ -
+ -	if ((vs->flags & VXLAN_F_REMCSUM_TX) &&
+ -	    skb->ip_summed == CHECKSUM_PARTIAL) {
+ -		int csum_start = skb_checksum_start_offset(skb);
+ -
+ -		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
+ -		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
+ -		    (skb->csum_offset == offsetof(struct udphdr, check) ||
+ -		     skb->csum_offset == offsetof(struct tcphdr, check))) {
+ -			udp_sum = false;
+ -			type |= SKB_GSO_TUNNEL_REMCSUM;
+ -		}
+ -	}
+  
+ -	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+ +	skb = vxlan_handle_offloads(skb, !vs->sock->sk->sk_no_check_tx);
+  	if (IS_ERR(skb))
+ -		return PTR_ERR(skb);
+ +		return -EINVAL;
+  
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@@ -1632,36 -1803,42 +1724,51 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ +	if (unlikely(err))
+  		return err;
+ -	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+++<<<<<<< HEAD
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+++=======
++ 	vxh->vx_flags = htonl(VXLAN_HF_VNI);
++ 	vxh->vx_vni = md->vni;
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->len = htons(skb->len);
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+  
+++<<<<<<< HEAD
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+++=======
++ 	if (vs->flags & VXLAN_F_GBP)
++ 		vxlan_build_gbp_hdr(vxh, vs, md);
++ 
++ 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
++ 
++ 	return udp_tunnel_xmit_skb(vs->sock, rt, skb, src, dst, tos,
++ 				   ttl, df, src_port, dst_port, xnet);
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+@@@ -1787,14 -1966,19 +1895,26 @@@ static void vxlan_xmit_one(struct sk_bu
+  
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
++ 		md.vni = htonl(vni << 8);
++ 		md.gbp = skb->mark;
+  
+ -		err = vxlan_xmit_skb(vxlan->vn_sock, rt, skb,
+ +		err = vxlan_xmit_skb(dev_net(dev), vxlan->vn_sock, rt, skb,
+  				     fl4.saddr, dst->sin.sin_addr.s_addr,
+++<<<<<<< HEAD
+ +				     tos, ttl, df, src_port, dst_port,
+ +				     htonl(vni << 8));
+++=======
++ 				     tos, ttl, df, src_port, dst_port, &md,
++ 				     !net_eq(vxlan->net, dev_net(vxlan->dev)));
++ 		if (err < 0) {
++ 			/* skb is already freed. */
++ 			skb = NULL;
++ 			goto rt_tx_error;
++ 		}
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+ +		if (err < 0)
+ +			goto rt_tx_error;
+  		iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+@@@ -1840,10 -2024,13 +1960,17 @@@
+  		}
+  
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
++ 		md.vni = htonl(vni << 8);
++ 		md.gbp = skb->mark;
+  
+ -		err = vxlan6_xmit_skb(vxlan->vn_sock, ndst, skb,
+ +		err = vxlan6_xmit_skb(dev_net(dev), vxlan->vn_sock, ndst, skb,
+  				      dev, &fl6.saddr, &fl6.daddr, 0, ttl,
+++<<<<<<< HEAD
+ +				      src_port, dst_port, htonl(vni << 8));
+++=======
++ 				      src_port, dst_port, &md,
++ 				      !net_eq(vxlan->net, dev_net(vxlan->dev)));
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  #endif
+  	}
+  
+@@@ -2243,6 -2430,9 +2370,12 @@@ static const struct nla_policy vxlan_po
+  	[IFLA_VXLAN_UDP_CSUM]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]	= { .type = NLA_U8 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_VXLAN_REMCSUM_TX]	= { .type = NLA_U8 },
++ 	[IFLA_VXLAN_REMCSUM_RX]	= { .type = NLA_U8 },
++ 	[IFLA_VXLAN_GBP]	= { .type = NLA_FLAG, },
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  };
+  
+  static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
+@@@ -2566,6 -2749,17 +2699,20 @@@ static int vxlan_newlink(struct net *ne
+  	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
+  		vxlan->flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (data[IFLA_VXLAN_REMCSUM_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 		vxlan->flags |= VXLAN_F_REMCSUM_TX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 		vxlan->flags |= VXLAN_F_REMCSUM_RX;
++ 
++ 	if (data[IFLA_VXLAN_GBP])
++ 		vxlan->flags |= VXLAN_F_GBP;
++ 
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  	if (vxlan_find_vni(net, vni, use_ipv6 ? AF_INET6 : AF_INET,
+  			   vxlan->dst_port)) {
+  		pr_info("duplicate VNI %u\n", vni);
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,f4a3583171bd..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -8,8 -11,96 +8,99 @@@
+  #define VNI_HASH_BITS	10
+  #define VNI_HASH_SIZE	(1<<VNI_HASH_BITS)
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * VXLAN Group Based Policy Extension:
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |1|-|-|-|1|-|-|-|R|D|R|R|A|R|R|R|        Group Policy ID        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |                VXLAN Network Identifier (VNI) |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * D = Don't Learn bit. When set, this bit indicates that the egress
++  *     VTEP MUST NOT learn the source address of the encapsulated frame.
++  *
++  * A = Indicates that the group policy has already been applied to
++  *     this packet. Policies MUST NOT be applied by devices when the
++  *     A bit is set.
++  *
++  * [0] https://tools.ietf.org/html/draft-smith-vxlan-group-policy
++  */
++ struct vxlanhdr_gbp {
++ 	__u8	vx_flags;
++ #ifdef __LITTLE_ENDIAN_BITFIELD
++ 	__u8	reserved_flags1:3,
++ 		policy_applied:1,
++ 		reserved_flags2:2,
++ 		dont_learn:1,
++ 		reserved_flags3:1;
++ #elif defined(__BIG_ENDIAN_BITFIELD)
++ 	__u8	reserved_flags1:1,
++ 		dont_learn:1,
++ 		reserved_flags2:2,
++ 		policy_applied:1,
++ 		reserved_flags3:3;
++ #else
++ #error	"Please fix <asm/byteorder.h>"
++ #endif
++ 	__be16	policy_id;
++ 	__be32	vx_vni;
++ };
++ 
++ #define VXLAN_GBP_USED_BITS (VXLAN_HF_GBP | 0xFFFFFF)
++ 
++ /* skb->mark mapping
++  *
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |R|R|R|R|R|R|R|R|R|D|R|R|A|R|R|R|        Group Policy ID        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  */
++ #define VXLAN_GBP_DONT_LEARN		(BIT(6) << 16)
++ #define VXLAN_GBP_POLICY_APPLIED	(BIT(3) << 16)
++ #define VXLAN_GBP_ID_MASK		(0xFFFF)
++ 
++ /* VXLAN protocol header:
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |G|R|R|R|I|R|R|C|               Reserved                        |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |                VXLAN Network Identifier (VNI) |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * G = 1	Group Policy (VXLAN-GBP)
++  * I = 1	VXLAN Network Identifier (VNI) present
++  * C = 1	Remote checksum offload (RCO)
++  */
++ struct vxlanhdr {
++ 	__be32 vx_flags;
++ 	__be32 vx_vni;
++ };
++ 
++ /* VXLAN header flags. */
++ #define VXLAN_HF_RCO BIT(24)
++ #define VXLAN_HF_VNI BIT(27)
++ #define VXLAN_HF_GBP BIT(31)
++ 
++ /* Remote checksum offload header option */
++ #define VXLAN_RCO_MASK  0x7f    /* Last byte of vni field */
++ #define VXLAN_RCO_UDP   0x80    /* Indicate UDP RCO (TCP when not set *) */
++ #define VXLAN_RCO_SHIFT 1       /* Left shift of start */
++ #define VXLAN_RCO_SHIFT_MASK ((1 << VXLAN_RCO_SHIFT) - 1)
++ #define VXLAN_MAX_REMCSUM_START (VXLAN_RCO_MASK << VXLAN_RCO_SHIFT)
++ 
++ #define VXLAN_N_VID     (1u << 24)
++ #define VXLAN_VID_MASK  (VXLAN_N_VID - 1)
++ #define VXLAN_HLEN (sizeof(struct udphdr) + sizeof(struct vxlanhdr))
++ 
++ struct vxlan_metadata {
++ 	__be32		vni;
++ 	u32		gbp;
++ };
++ 
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  struct vxlan_sock;
+- typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb, __be32 key);
++ typedef void (vxlan_rcv_t)(struct vxlan_sock *vh, struct sk_buff *skb,
++ 			   struct vxlan_metadata *md);
+  
+  /* per UDP socket information */
+  struct vxlan_sock {
+@@@ -33,6 -125,9 +124,12 @@@
+  #define VXLAN_F_UDP_CSUM		0x40
+  #define VXLAN_F_UDP_ZERO_CSUM6_TX	0x80
+  #define VXLAN_F_UDP_ZERO_CSUM6_RX	0x100
+++<<<<<<< HEAD
+++=======
++ #define VXLAN_F_REMCSUM_TX		0x200
++ #define VXLAN_F_REMCSUM_RX		0x400
++ #define VXLAN_F_GBP			0x800
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+  struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
+  				  vxlan_rcv_t *rcv, void *data,
+@@@ -40,10 -135,40 +137,44 @@@
+  
+  void vxlan_sock_release(struct vxlan_sock *vs);
+  
+ -int vxlan_xmit_skb(struct vxlan_sock *vs,
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+  		   struct rtable *rt, struct sk_buff *skb,
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+++<<<<<<< HEAD
+ +		   __be16 src_port, __be16 dst_port, __be32 vni);
+++=======
++ 		   __be16 src_port, __be16 dst_port, struct vxlan_metadata *md,
++ 		   bool xnet);
++ 
++ static inline netdev_features_t vxlan_features_check(struct sk_buff *skb,
++ 						     netdev_features_t features)
++ {
++ 	u8 l4_hdr = 0;
++ 
++ 	if (!skb->encapsulation)
++ 		return features;
++ 
++ 	switch (vlan_get_protocol(skb)) {
++ 	case htons(ETH_P_IP):
++ 		l4_hdr = ip_hdr(skb)->protocol;
++ 		break;
++ 	case htons(ETH_P_IPV6):
++ 		l4_hdr = ipv6_hdr(skb)->nexthdr;
++ 		break;
++ 	default:
++ 		return features;;
++ 	}
++ 
++ 	if ((l4_hdr == IPPROTO_UDP) &&
++ 	    (skb->inner_protocol_type != ENCAP_TYPE_ETHER ||
++ 	     skb->inner_protocol != htons(ETH_P_TEB) ||
++ 	     (skb_inner_mac_header(skb) - skb_transport_header(skb) !=
++ 	      sizeof(struct udphdr) + sizeof(struct vxlanhdr))))
++ 		return features & ~(NETIF_F_ALL_CSUM | NETIF_F_GSO_MASK);
++ 
++ 	return features;
++ }
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+  /* IP header + UDP + VXLAN + Ethernet header */
+  #define VXLAN_HEADROOM (20 + 8 + 8 + 14)
+diff --cc include/uapi/linux/if_link.h
+index 4efe6bcb6e67,2a8380edbb7e..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -325,6 -370,9 +325,12 @@@ enum 
+  	IFLA_VXLAN_UDP_CSUM,
+  	IFLA_VXLAN_UDP_ZERO_CSUM6_TX,
+  	IFLA_VXLAN_UDP_ZERO_CSUM6_RX,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_VXLAN_REMCSUM_TX,
++ 	IFLA_VXLAN_REMCSUM_RX,
++ 	IFLA_VXLAN_GBP,
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  	__IFLA_VXLAN_MAX
+  };
+  #define IFLA_VXLAN_MAX	(__IFLA_VXLAN_MAX - 1)
+diff --cc net/openvswitch/vport-vxlan.c
+index 64e0d2e57017,9919d71c52c3..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -56,19 -59,22 +56,27 @@@ static inline struct vxlan_port *vxlan_
+  }
+  
+  /* Called with rcu_read_lock and BH disabled. */
+- static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb, __be32 vx_vni)
++ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
++ 		      struct vxlan_metadata *md)
+  {
+ -	struct ovs_tunnel_info tun_info;
+ +	struct ovs_key_ipv4_tunnel tun_key;
+  	struct vport *vport = vs->data;
+  	struct iphdr *iph;
+  	__be64 key;
+  
+  	/* Save outer tunnel values */
+  	iph = ip_hdr(skb);
+++<<<<<<< HEAD
+ +	key = cpu_to_be64(ntohl(vx_vni) >> 8);
+ +	ovs_flow_tun_key_init(&tun_key, iph, key, TUNNEL_KEY);
+++=======
++ 	key = cpu_to_be64(ntohl(md->vni) >> 8);
++ 	ovs_flow_tun_info_init(&tun_info, iph,
++ 			       udp_hdr(skb)->source, udp_hdr(skb)->dest,
++ 			       key, TUNNEL_KEY, NULL, 0);
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  
+ -	ovs_vport_receive(vport, skb, &tun_info);
+ +	ovs_vport_receive(vport, skb, &tun_key);
+  }
+  
+  static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
+@@@ -140,7 -146,8 +148,12 @@@ static int vxlan_tnl_send(struct vport 
+  	struct net *net = ovs_dp_get_net(vport->dp);
+  	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+  	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+++<<<<<<< HEAD
+ +	struct ovs_key_ipv4_tunnel *tun_key;
+++=======
++ 	const struct ovs_key_ipv4_tunnel *tun_key;
++ 	struct vxlan_metadata md = {0};
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  	struct rtable *rt;
+  	struct flowi4 fl;
+  	__be16 src_port;
+@@@ -170,18 -169,22 +183,24 @@@
+  	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ?
+  		htons(IP_DF) : 0;
+  
+ -	skb->ignore_df = 1;
+ +	skb->local_df = 1;
+  
+  	src_port = udp_flow_src_port(net, skb, 0, 0, true);
++ 	md.vni = htonl(be64_to_cpu(tun_key->tun_id) << 8);
+  
+ -	err = vxlan_xmit_skb(vxlan_port->vs, rt, skb,
+ +	err = vxlan_xmit_skb(net, vxlan_port->vs, rt, skb,
+  			     fl.saddr, tun_key->ipv4_dst,
+  			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df,
+  			     src_port, dst_port,
+++<<<<<<< HEAD
+ +			     htonl(be64_to_cpu(tun_key->tun_id) << 8));
+++=======
++ 			     &md,
++ 			     false);
+++>>>>>>> 3511494ce2f3 (vxlan: Group Policy extension)
+  	if (err < 0)
+  		ip_rt_put(rt);
+ -	return err;
+  error:
+ -	kfree_skb(skb);
+  	return err;
+  }
+  
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/openvswitch/vport-vxlan.c
