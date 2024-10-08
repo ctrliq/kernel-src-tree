@@ -1,0 +1,235 @@
+powerpc: Book 3S MMU little endian support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] Book 3S MMU little endian support (Steve Best) [1051192]
+Rebuild_FUZZ: 88.00%
+commit-author Anton Blanchard <anton@samba.org>
+commit 12f04f2be80dd8d9da24534828f3ab3189ca5af2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/12f04f2b.failed
+
+	Signed-off-by: Anton Blanchard <anton@samba.org>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 12f04f2be80dd8d9da24534828f3ab3189ca5af2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/hash_native_64.c
+diff --cc arch/powerpc/mm/hash_native_64.c
+index 6e860250de35,3ea26c25590b..000000000000
+--- a/arch/powerpc/mm/hash_native_64.c
++++ b/arch/powerpc/mm/hash_native_64.c
+@@@ -413,6 -418,78 +418,81 @@@ static void native_hpte_invalidate(unsi
+  	local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void native_hugepage_invalidate(struct mm_struct *mm,
++ 				       unsigned char *hpte_slot_array,
++ 				       unsigned long addr, int psize)
++ {
++ 	int ssize = 0, i;
++ 	int lock_tlbie;
++ 	struct hash_pte *hptep;
++ 	int actual_psize = MMU_PAGE_16M;
++ 	unsigned int max_hpte_count, valid;
++ 	unsigned long flags, s_addr = addr;
++ 	unsigned long hpte_v, want_v, shift;
++ 	unsigned long hidx, vpn = 0, vsid, hash, slot;
++ 
++ 	shift = mmu_psize_defs[psize].shift;
++ 	max_hpte_count = 1U << (PMD_SHIFT - shift);
++ 
++ 	local_irq_save(flags);
++ 	for (i = 0; i < max_hpte_count; i++) {
++ 		valid = hpte_valid(hpte_slot_array, i);
++ 		if (!valid)
++ 			continue;
++ 		hidx =  hpte_hash_index(hpte_slot_array, i);
++ 
++ 		/* get the vpn */
++ 		addr = s_addr + (i * (1ul << shift));
++ 		if (!is_kernel_addr(addr)) {
++ 			ssize = user_segment_size(addr);
++ 			vsid = get_vsid(mm->context.id, addr, ssize);
++ 			WARN_ON(vsid == 0);
++ 		} else {
++ 			vsid = get_kernel_vsid(addr, mmu_kernel_ssize);
++ 			ssize = mmu_kernel_ssize;
++ 		}
++ 
++ 		vpn = hpt_vpn(addr, vsid, ssize);
++ 		hash = hpt_hash(vpn, shift, ssize);
++ 		if (hidx & _PTEIDX_SECONDARY)
++ 			hash = ~hash;
++ 
++ 		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
++ 		slot += hidx & _PTEIDX_GROUP_IX;
++ 
++ 		hptep = htab_address + slot;
++ 		want_v = hpte_encode_avpn(vpn, psize, ssize);
++ 		native_lock_hpte(hptep);
++ 		hpte_v = be64_to_cpu(hptep->v);
++ 
++ 		/* Even if we miss, we need to invalidate the TLB */
++ 		if (!HPTE_V_COMPARE(hpte_v, want_v) || !(hpte_v & HPTE_V_VALID))
++ 			native_unlock_hpte(hptep);
++ 		else
++ 			/* Invalidate the hpte. NOTE: this also unlocks it */
++ 			hptep->v = 0;
++ 	}
++ 	/*
++ 	 * Since this is a hugepage, we just need a single tlbie.
++ 	 * use the last vpn.
++ 	 */
++ 	lock_tlbie = !mmu_has_feature(MMU_FTR_LOCKLESS_TLBIE);
++ 	if (lock_tlbie)
++ 		raw_spin_lock(&native_tlbie_lock);
++ 
++ 	asm volatile("ptesync":::"memory");
++ 	__tlbie(vpn, psize, actual_psize, ssize);
++ 	asm volatile("eieio; tlbsync; ptesync":::"memory");
++ 
++ 	if (lock_tlbie)
++ 		raw_spin_unlock(&native_tlbie_lock);
++ 
++ 	local_irq_restore(flags);
++ }
++ 
+++>>>>>>> 12f04f2be80d (powerpc: Book 3S MMU little endian support)
+  static inline int __hpte_actual_psize(unsigned int lp, int psize)
+  {
+  	int i, shift;
+diff --git a/arch/powerpc/include/asm/mmu-hash64.h b/arch/powerpc/include/asm/mmu-hash64.h
+index c4cf01197273..807014dde821 100644
+--- a/arch/powerpc/include/asm/mmu-hash64.h
++++ b/arch/powerpc/include/asm/mmu-hash64.h
+@@ -135,8 +135,8 @@ extern char initial_stab[];
+ #ifndef __ASSEMBLY__
+ 
+ struct hash_pte {
+-	unsigned long v;
+-	unsigned long r;
++	__be64 v;
++	__be64 r;
+ };
+ 
+ extern struct hash_pte *htab_address;
+* Unmerged path arch/powerpc/mm/hash_native_64.c
+diff --git a/arch/powerpc/mm/hash_utils_64.c b/arch/powerpc/mm/hash_utils_64.c
+index 90f33a1da259..94dbc6a0761d 100644
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@ -265,19 +265,18 @@ static int __init htab_dt_scan_seg_sizes(unsigned long node,
+ 					 void *data)
+ {
+ 	char *type = of_get_flat_dt_prop(node, "device_type", NULL);
+-	u32 *prop;
++	__be32 *prop;
+ 	unsigned long size = 0;
+ 
+ 	/* We are scanning "cpu" nodes only */
+ 	if (type == NULL || strcmp(type, "cpu") != 0)
+ 		return 0;
+ 
+-	prop = (u32 *)of_get_flat_dt_prop(node, "ibm,processor-segment-sizes",
+-					  &size);
++	prop = of_get_flat_dt_prop(node, "ibm,processor-segment-sizes", &size);
+ 	if (prop == NULL)
+ 		return 0;
+ 	for (; size >= 4; size -= 4, ++prop) {
+-		if (prop[0] == 40) {
++		if (be32_to_cpu(prop[0]) == 40) {
+ 			DBG("1T segment support detected\n");
+ 			cur_cpu_spec->mmu_features |= MMU_FTR_1T_SEGMENT;
+ 			return 1;
+@@ -321,23 +320,22 @@ static int __init htab_dt_scan_page_sizes(unsigned long node,
+ 					  void *data)
+ {
+ 	char *type = of_get_flat_dt_prop(node, "device_type", NULL);
+-	u32 *prop;
++	__be32 *prop;
+ 	unsigned long size = 0;
+ 
+ 	/* We are scanning "cpu" nodes only */
+ 	if (type == NULL || strcmp(type, "cpu") != 0)
+ 		return 0;
+ 
+-	prop = (u32 *)of_get_flat_dt_prop(node,
+-					  "ibm,segment-page-sizes", &size);
++	prop = of_get_flat_dt_prop(node, "ibm,segment-page-sizes", &size);
+ 	if (prop != NULL) {
+ 		pr_info("Page sizes from device-tree:\n");
+ 		size /= 4;
+ 		cur_cpu_spec->mmu_features &= ~(MMU_FTR_16M_PAGE);
+ 		while(size > 0) {
+-			unsigned int base_shift = prop[0];
+-			unsigned int slbenc = prop[1];
+-			unsigned int lpnum = prop[2];
++			unsigned int base_shift = be32_to_cpu(prop[0]);
++			unsigned int slbenc = be32_to_cpu(prop[1]);
++			unsigned int lpnum = be32_to_cpu(prop[2]);
+ 			struct mmu_psize_def *def;
+ 			int idx, base_idx;
+ 
+@@ -370,8 +368,8 @@ static int __init htab_dt_scan_page_sizes(unsigned long node,
+ 				def->tlbiel = 0;
+ 
+ 			while (size > 0 && lpnum) {
+-				unsigned int shift = prop[0];
+-				int penc  = prop[1];
++				unsigned int shift = be32_to_cpu(prop[0]);
++				int penc  = be32_to_cpu(prop[1]);
+ 
+ 				prop += 2; size -= 2;
+ 				lpnum--;
+@@ -404,8 +402,8 @@ static int __init htab_dt_scan_hugepage_blocks(unsigned long node,
+ 					const char *uname, int depth,
+ 					void *data) {
+ 	char *type = of_get_flat_dt_prop(node, "device_type", NULL);
+-	unsigned long *addr_prop;
+-	u32 *page_count_prop;
++	__be64 *addr_prop;
++	__be32 *page_count_prop;
+ 	unsigned int expected_pages;
+ 	long unsigned int phys_addr;
+ 	long unsigned int block_size;
+@@ -419,12 +417,12 @@ static int __init htab_dt_scan_hugepage_blocks(unsigned long node,
+ 	page_count_prop = of_get_flat_dt_prop(node, "ibm,expected#pages", NULL);
+ 	if (page_count_prop == NULL)
+ 		return 0;
+-	expected_pages = (1 << page_count_prop[0]);
++	expected_pages = (1 << be32_to_cpu(page_count_prop[0]));
+ 	addr_prop = of_get_flat_dt_prop(node, "reg", NULL);
+ 	if (addr_prop == NULL)
+ 		return 0;
+-	phys_addr = addr_prop[0];
+-	block_size = addr_prop[1];
++	phys_addr = be64_to_cpu(addr_prop[0]);
++	block_size = be64_to_cpu(addr_prop[1]);
+ 	if (block_size != (16 * GB))
+ 		return 0;
+ 	printk(KERN_INFO "Huge page(16GB) memory: "
+@@ -548,16 +546,16 @@ static int __init htab_dt_scan_pftsize(unsigned long node,
+ 				       void *data)
+ {
+ 	char *type = of_get_flat_dt_prop(node, "device_type", NULL);
+-	u32 *prop;
++	__be32 *prop;
+ 
+ 	/* We are scanning "cpu" nodes only */
+ 	if (type == NULL || strcmp(type, "cpu") != 0)
+ 		return 0;
+ 
+-	prop = (u32 *)of_get_flat_dt_prop(node, "ibm,pft-size", NULL);
++	prop = of_get_flat_dt_prop(node, "ibm,pft-size", NULL);
+ 	if (prop != NULL) {
+ 		/* pft_size[0] is the NUMA CEC cookie */
+-		ppc64_pft_size = prop[1];
++		ppc64_pft_size = be32_to_cpu(prop[1]);
+ 		return 1;
+ 	}
+ 	return 0;
