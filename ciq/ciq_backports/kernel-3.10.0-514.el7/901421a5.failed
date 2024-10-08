@@ -1,0 +1,219 @@
+perf tools: Remove subcmd dependencies on strbuf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 901421a5bdf605d24c278825cdd032cd6038bcb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/901421a5.failed
+
+Introduce and use new astrcat() and astrcatf() functions which replace
+the strbuf functionality for subcmd.
+
+For now they duplicate strbuf's die-on-allocation-error policy.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/957d207e1254406fa11fc2e405e75a7e405aad8f.1450193761.git.jpoimboe@redhat.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 901421a5bdf605d24c278825cdd032cd6038bcb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/parse-options.c
+diff --cc tools/perf/util/parse-options.c
+index 19b422d0d57f,c1da2a53ed4e..000000000000
+--- a/tools/perf/util/parse-options.c
++++ b/tools/perf/util/parse-options.c
+@@@ -768,7 -842,23 +766,27 @@@ static int usage_with_options_internal(
+  void usage_with_options(const char * const *usagestr,
+  			const struct option *opts)
+  {
+++<<<<<<< HEAD
+ +	exit_browser(false);
+++=======
++ 	usage_with_options_internal(usagestr, opts, 0, NULL);
++ 	exit(129);
++ }
++ 
++ void usage_with_options_msg(const char * const *usagestr,
++ 			    const struct option *opts, const char *fmt, ...)
++ {
++ 	va_list ap;
++ 	char *tmp = error_buf;
++ 
++ 	va_start(ap, fmt);
++ 	if (vasprintf(&error_buf, fmt, ap) == -1)
++ 		die("vasprintf failed");
++ 	va_end(ap);
++ 
++ 	free(tmp);
++ 
+++>>>>>>> 901421a5bdf6 (perf tools: Remove subcmd dependencies on strbuf)
+  	usage_with_options_internal(usagestr, opts, 0, NULL);
+  	exit(129);
+  }
+diff --git a/tools/perf/util/exec_cmd.c b/tools/perf/util/exec_cmd.c
+index b935e4ce62a2..65d86dcaa984 100644
+--- a/tools/perf/util/exec_cmd.c
++++ b/tools/perf/util/exec_cmd.c
+@@ -4,6 +4,7 @@
+ #include "subcmd-config.h"
+ 
+ #include <string.h>
++#include "subcmd-util.h"
+ 
+ #define MAX_ARGS	32
+ 
+@@ -21,14 +22,14 @@ void exec_cmd_init(const char *exec_name, const char *prefix,
+ 
+ char *system_path(const char *path)
+ {
+-	struct strbuf d = STRBUF_INIT;
++	char *buf = NULL;
+ 
+ 	if (is_absolute_path(path))
+ 		return strdup(path);
+ 
+-	strbuf_addf(&d, "%s/%s", subcmd_config.prefix, path);
+-	path = strbuf_detach(&d, NULL);
+-	return (char *)path;
++	astrcatf(&buf, "%s/%s", subcmd_config.prefix, path);
++
++	return buf;
+ }
+ 
+ const char *perf_extract_argv0_path(const char *argv0)
+@@ -75,22 +76,22 @@ char *perf_exec_path(void)
+ 	return system_path(subcmd_config.exec_path);
+ }
+ 
+-static void add_path(struct strbuf *out, const char *path)
++static void add_path(char **out, const char *path)
+ {
+ 	if (path && *path) {
+ 		if (is_absolute_path(path))
+-			strbuf_addstr(out, path);
++			astrcat(out, path);
+ 		else
+-			strbuf_addstr(out, make_nonrelative_path(path));
++			astrcat(out, make_nonrelative_path(path));
+ 
+-		strbuf_addch(out, PATH_SEP);
++		astrcat(out, ":");
+ 	}
+ }
+ 
+ void setup_path(void)
+ {
+ 	const char *old_path = getenv("PATH");
+-	struct strbuf new_path = STRBUF_INIT;
++	char *new_path = NULL;
+ 	char *tmp = perf_exec_path();
+ 
+ 	add_path(&new_path, tmp);
+@@ -98,13 +99,13 @@ void setup_path(void)
+ 	free(tmp);
+ 
+ 	if (old_path)
+-		strbuf_addstr(&new_path, old_path);
++		astrcat(&new_path, old_path);
+ 	else
+-		strbuf_addstr(&new_path, "/usr/local/bin:/usr/bin:/bin");
++		astrcat(&new_path, "/usr/local/bin:/usr/bin:/bin");
+ 
+-	setenv("PATH", new_path.buf, 1);
++	setenv("PATH", new_path, 1);
+ 
+-	strbuf_release(&new_path);
++	free(new_path);
+ }
+ 
+ static const char **prepare_perf_cmd(const char **argv)
+diff --git a/tools/perf/util/help.c b/tools/perf/util/help.c
+index 8d74f7d05674..8e5e0ce3870e 100644
+--- a/tools/perf/util/help.c
++++ b/tools/perf/util/help.c
+@@ -2,6 +2,7 @@
+ #include "../builtin.h"
+ #include "exec_cmd.h"
+ #include "help.h"
++#include "subcmd-util.h"
+ 
+ void add_cmdname(struct cmdnames *cmds, const char *name, size_t len)
+ {
+@@ -119,8 +120,7 @@ static void list_commands_in_dir(struct cmdnames *cmds,
+ 	int prefix_len;
+ 	DIR *dir = opendir(path);
+ 	struct dirent *de;
+-	struct strbuf buf = STRBUF_INIT;
+-	int len;
++	char *buf = NULL;
+ 
+ 	if (!dir)
+ 		return;
+@@ -128,8 +128,7 @@ static void list_commands_in_dir(struct cmdnames *cmds,
+ 		prefix = "perf-";
+ 	prefix_len = strlen(prefix);
+ 
+-	strbuf_addf(&buf, "%s/", path);
+-	len = buf.len;
++	astrcatf(&buf, "%s/", path);
+ 
+ 	while ((de = readdir(dir)) != NULL) {
+ 		int entlen;
+@@ -137,9 +136,8 @@ static void list_commands_in_dir(struct cmdnames *cmds,
+ 		if (prefixcmp(de->d_name, prefix))
+ 			continue;
+ 
+-		strbuf_setlen(&buf, len);
+-		strbuf_addstr(&buf, de->d_name);
+-		if (!is_executable(buf.buf))
++		astrcat(&buf, de->d_name);
++		if (!is_executable(buf))
+ 			continue;
+ 
+ 		entlen = strlen(de->d_name) - prefix_len;
+@@ -149,7 +147,7 @@ static void list_commands_in_dir(struct cmdnames *cmds,
+ 		add_cmdname(cmds, de->d_name + prefix_len, entlen);
+ 	}
+ 	closedir(dir);
+-	strbuf_release(&buf);
++	free(buf);
+ }
+ 
+ void load_command_list(const char *prefix,
+* Unmerged path tools/perf/util/parse-options.c
+diff --git a/tools/perf/util/subcmd-util.h b/tools/perf/util/subcmd-util.h
+new file mode 100644
+index 000000000000..98fb9f9270eb
+--- /dev/null
++++ b/tools/perf/util/subcmd-util.h
+@@ -0,0 +1,24 @@
++#ifndef __PERF_SUBCMD_UTIL_H
++#define __PERF_SUBCMD_UTIL_H
++
++#include <stdio.h>
++
++#define astrcatf(out, fmt, ...)						\
++({									\
++	char *tmp = *(out);						\
++	if (asprintf((out), "%s" fmt, tmp ?: "", ## __VA_ARGS__) == -1)	\
++		die("asprintf failed");					\
++	free(tmp);							\
++})
++
++static inline void astrcat(char **out, const char *add)
++{
++	char *tmp = *out;
++
++	if (asprintf(out, "%s%s", tmp ?: "", add) == -1)
++		die("asprintf failed");
++
++	free(tmp);
++}
++
++#endif /* __PERF_SUBCMD_UTIL_H */
