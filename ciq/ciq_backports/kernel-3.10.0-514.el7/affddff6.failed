@@ -1,0 +1,203 @@
+powerpc/powernv: Add a kmsg_dumper that flushes console output on panic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Add a kmsg_dumper that flushes console output on panic (Gustavo Duarte) [1313758]
+Rebuild_FUZZ: 94.03%
+commit-author Russell Currey <ruscur@russell.cc>
+commit affddff69c55eb68969448f35f59054a370bc7c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/affddff6.failed
+
+On BMC machines, console output is controlled by the OPAL firmware and is
+only flushed when its pollers are called.  When the kernel is in a panic
+state, it no longer calls these pollers and thus console output does not
+completely flush, causing some output from the panic to be lost.
+
+Output is only actually lost when the kernel is configured to not power off
+or reboot after panic (i.e. CONFIG_PANIC_TIMEOUT is set to 0) since OPAL
+flushes the console buffer as part of its power down routines.  Before this
+patch, however, only partial output would be printed during the timeout wait.
+
+This patch adds a new kmsg_dumper which gets called at panic time to ensure
+panic output is not lost.  It accomplishes this by calling OPAL_CONSOLE_FLUSH
+in the OPAL API, and if that is not available, the pollers are called enough
+times to (hopefully) completely flush the buffer.
+
+The flushing mechanism will only affect output printed at and before the
+kmsg_dump call in kernel/panic.c:panic().  As such, the "end Kernel panic"
+message may still be truncated as follows:
+
+>Call Trace:
+>[c000000f1f603b00] [c0000000008e9458] dump_stack+0x90/0xbc (unreliable)
+>[c000000f1f603b30] [c0000000008e7e78] panic+0xf8/0x2c4
+>[c000000f1f603bc0] [c000000000be4860] mount_block_root+0x288/0x33c
+>[c000000f1f603c80] [c000000000be4d14] prepare_namespace+0x1f4/0x254
+>[c000000f1f603d00] [c000000000be43e8] kernel_init_freeable+0x318/0x350
+>[c000000f1f603dc0] [c00000000000bd74] kernel_init+0x24/0x130
+>[c000000f1f603e30] [c0000000000095b0] ret_from_kernel_thread+0x5c/0xac
+>---[ end Kernel panic - not
+
+This functionality is implemented as a kmsg_dumper as it seems to be the
+most sensible way to introduce platform-specific functionality to the
+panic function.
+
+	Signed-off-by: Russell Currey <ruscur@russell.cc>
+	Reviewed-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit affddff69c55eb68969448f35f59054a370bc7c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/opal-api.h
+#	arch/powerpc/include/asm/opal.h
+#	arch/powerpc/platforms/powernv/Makefile
+#	arch/powerpc/platforms/powernv/opal-wrappers.S
+diff --cc arch/powerpc/include/asm/opal.h
+index a1898bbf2f84,a5fd407213b6..000000000000
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@@ -1231,6 -263,10 +1232,13 @@@ extern int opal_resync_timebase(void)
+  
+  extern void opal_lpc_init(void);
+  
+++<<<<<<< HEAD
+++=======
++ extern void opal_kmsg_init(void);
++ 
++ extern int opal_event_request(unsigned int opal_event_nr);
++ 
+++>>>>>>> affddff69c55 (powerpc/powernv: Add a kmsg_dumper that flushes console output on panic)
+  struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
+  					     unsigned long vmalloc_size);
+  void opal_free_sg_list(struct opal_sg_list *sg);
+diff --cc arch/powerpc/platforms/powernv/Makefile
+index c8bb9620191b,f1516b5ecec9..000000000000
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@@ -1,10 -1,11 +1,15 @@@
+ -obj-y			+= setup.o opal-wrappers.o opal.o opal-async.o idle.o
+ +obj-y			+= setup.o opal-wrappers.o opal.o opal-async.o
+  obj-y			+= opal-rtc.o opal-nvram.o opal-lpc.o opal-flash.o
+  obj-y			+= rng.o opal-elog.o opal-dump.o opal-sysparam.o opal-sensor.o
+++<<<<<<< HEAD
+ +obj-y			+= opal-msglog.o opal-hmi.o opal-power.o
+++=======
++ obj-y			+= opal-msglog.o opal-hmi.o opal-power.o opal-irqchip.o
++ obj-y			+= opal-kmsg.o
+++>>>>>>> affddff69c55 (powerpc/powernv: Add a kmsg_dumper that flushes console output on panic)
+  
+  obj-$(CONFIG_SMP)	+= smp.o subcore.o subcore-asm.o
+ -obj-$(CONFIG_PCI)	+= pci.o pci-p5ioc2.o pci-ioda.o npu-dma.o
+ +obj-$(CONFIG_PCI)	+= pci.o pci-p5ioc2.o pci-ioda.o
+  obj-$(CONFIG_EEH)	+= eeh-powernv.o
+  obj-$(CONFIG_PPC_SCOM)	+= opal-xscom.o
+  obj-$(CONFIG_MEMORY_FAILURE)	+= opal-memory-errors.o
+diff --cc arch/powerpc/platforms/powernv/opal-wrappers.S
+index 12f5627f0480,e45b88a5d7e0..000000000000
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@@ -202,3 -299,6 +202,9 @@@ OPAL_CALL(opal_flash_read,			OPAL_FLASH
+  OPAL_CALL(opal_flash_write,			OPAL_FLASH_WRITE);
+  OPAL_CALL(opal_flash_erase,			OPAL_FLASH_ERASE);
+  OPAL_CALL(opal_prd_msg,				OPAL_PRD_MSG);
+++<<<<<<< HEAD
+++=======
++ OPAL_CALL(opal_leds_get_ind,			OPAL_LEDS_GET_INDICATOR);
++ OPAL_CALL(opal_leds_set_ind,			OPAL_LEDS_SET_INDICATOR);
++ OPAL_CALL(opal_console_flush,			OPAL_CONSOLE_FLUSH);
+++>>>>>>> affddff69c55 (powerpc/powernv: Add a kmsg_dumper that flushes console output on panic)
+* Unmerged path arch/powerpc/include/asm/opal-api.h
+* Unmerged path arch/powerpc/include/asm/opal-api.h
+* Unmerged path arch/powerpc/include/asm/opal.h
+* Unmerged path arch/powerpc/platforms/powernv/Makefile
+diff --git a/arch/powerpc/platforms/powernv/opal-kmsg.c b/arch/powerpc/platforms/powernv/opal-kmsg.c
+new file mode 100644
+index 000000000000..bd3b2ee1ba1d
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/opal-kmsg.c
+@@ -0,0 +1,68 @@
++/*
++ * kmsg dumper that ensures the OPAL console fully flushes panic messages
++ *
++ * Author: Russell Currey <ruscur@russell.cc>
++ *
++ * Copyright 2015 IBM Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kmsg_dump.h>
++
++#include <asm/opal.h>
++#include <asm/opal-api.h>
++
++/*
++ * Console output is controlled by OPAL firmware.  The kernel regularly calls
++ * OPAL_POLL_EVENTS, which flushes some console output.  In a panic state,
++ * however, the kernel no longer calls OPAL_POLL_EVENTS and the panic message
++ * may not be completely printed.  This function does not actually dump the
++ * message, it just ensures that OPAL completely flushes the console buffer.
++ */
++static void force_opal_console_flush(struct kmsg_dumper *dumper,
++				     enum kmsg_dump_reason reason)
++{
++	int i;
++
++	/*
++	 * Outside of a panic context the pollers will continue to run,
++	 * so we don't need to do any special flushing.
++	 */
++	if (reason != KMSG_DUMP_PANIC)
++		return;
++
++	if (opal_check_token(OPAL_CONSOLE_FLUSH)) {
++		opal_console_flush();
++	} else {
++		/*
++		 * If OPAL_CONSOLE_FLUSH is not implemented in the firmware,
++		 * the console can still be flushed by calling the polling
++		 * function enough times to flush the buffer.  We don't know
++		 * how much output still needs to be flushed, but we can be
++		 * generous since the kernel is in panic and doesn't need
++		 * to do much else.
++		 */
++		printk(KERN_NOTICE "opal: OPAL_CONSOLE_FLUSH missing.\n");
++		for (i = 0; i < 1024; i++) {
++			opal_poll_events(NULL);
++		}
++	}
++}
++
++static struct kmsg_dumper opal_kmsg_dumper = {
++	.dump = force_opal_console_flush
++};
++
++void __init opal_kmsg_init(void)
++{
++	int rc;
++
++	/* Add our dumper to the list */
++	rc = kmsg_dump_register(&opal_kmsg_dumper);
++	if (rc != 0)
++		pr_err("opal: kmsg_dump_register failed; returned %d\n", rc);
++}
+* Unmerged path arch/powerpc/platforms/powernv/opal-wrappers.S
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index b7338f9a006c..694039c85266 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -834,6 +834,9 @@ static int __init opal_init(void)
+ 	opal_pdev_init(opal_node, "ibm,opal-flash");
+ 	opal_pdev_init(opal_node, "ibm,opal-prd");
+ 
++	/* Initialise OPAL kmsg dumper for flushing console on panic */
++	opal_kmsg_init();
++
+ 	return 0;
+ }
+ machine_subsys_initcall(powernv, opal_init);
