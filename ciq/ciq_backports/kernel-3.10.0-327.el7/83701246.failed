@@ -1,0 +1,130 @@
+ceph: sync read inline data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 83701246aee8f83b4b42483051b439fbe96ed47d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/83701246.failed
+
+we can't use getattr to fetch inline data while holding Fr cap,
+because it can cause deadlock. If we need to sync read inline data,
+drop cap refs first, then use getattr to fetch inline data.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 83701246aee8f83b4b42483051b439fbe96ed47d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/file.c
+diff --cc fs/ceph/addr.c
+index 84f36c0f4941,13413d7440d6..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -179,11 -189,29 +179,32 @@@ static int readpage_nounlock(struct fil
+  {
+  	struct inode *inode = file_inode(filp);
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+ -	struct ceph_osd_client *osdc =
+ +	struct ceph_osd_client *osdc = 
+  		&ceph_inode_to_client(inode)->client->osdc;
+  	int err = 0;
++ 	u64 off = page_offset(page);
+  	u64 len = PAGE_CACHE_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (off >= i_size_read(inode)) {
++ 		zero_user_segment(page, err, PAGE_CACHE_SIZE);
++ 		SetPageUptodate(page);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Uptodate inline data should have been added into page cache
++ 	 * while getting Fcr caps.
++ 	 */
++ 	if (ci->i_inline_version != CEPH_INLINE_NONE)
++ 		return -EINVAL;
++ 
++ 	err = ceph_readpage_from_fscache(inode, page);
++ 	if (err == 0)
++ 		goto out;
++ 
+++>>>>>>> 83701246aee8 (ceph: sync read inline data)
+  	dout("readpage inode %p file %p page %p index %lu\n",
+  	     inode, filp, page, page->index);
+  	err = ceph_osdc_readpages(osdc, ceph_vino(inode), &ci->i_layout,
+@@@ -365,6 -397,15 +386,18 @@@ static int ceph_readpages(struct file *
+  	int rc = 0;
+  	int max = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ceph_inode(inode)->i_inline_version != CEPH_INLINE_NONE)
++ 		return -EINVAL;
++ 
++ 	rc = ceph_readpages_from_fscache(mapping->host, mapping, page_list,
++ 					 &nr_pages);
++ 
++ 	if (rc == 0)
++ 		goto out;
++ 
+++>>>>>>> 83701246aee8 (ceph: sync read inline data)
+  	if (fsc->mount_options->rsize >= PAGE_CACHE_SIZE)
+  		max = (fsc->mount_options->rsize + PAGE_CACHE_SIZE - 1)
+  			>> PAGE_SHIFT;
+diff --cc fs/ceph/file.c
+index 0b8caea5eae6,5b092bda9284..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -815,34 -835,19 +820,43 @@@ again
+  		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
+  		     ceph_cap_string(got));
+  
+++<<<<<<< HEAD
+ +		if (!read) {
+ +			ret = generic_segment_checks(iov, &nr_segs,
+ +							&len, VERIFY_WRITE);
+ +			if (ret)
+ +				goto out;
+ +		}
+ +
+ +		iov_iter_init(&i, iov, nr_segs, len, read);
+ +
+ +		/* hmm, this isn't really async... */
+ +		ret = ceph_sync_read(iocb, &i, &checkeof);
+++=======
++ 		if (ci->i_inline_version == CEPH_INLINE_NONE) {
++ 			/* hmm, this isn't really async... */
++ 			ret = ceph_sync_read(iocb, to, &retry_op);
++ 		} else {
++ 			retry_op = READ_INLINE;
++ 		}
+++>>>>>>> 83701246aee8 (ceph: sync read inline data)
+  	} else {
+ +		/*
+ +		 * We can't modify the content of iov,
+ +		 * so we only read from beginning.
+ +		 */
+ +		if (read) {
+ +			iocb->ki_pos = pos;
+ +			len = iocb->ki_nbytes;
+ +			read = 0;
+ +		}
+  		dout("aio_read %p %llx.%llx %llu~%u got cap refs on %s\n",
+ -		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
+ +		     inode, ceph_vinop(inode), pos, (unsigned)len,
+  		     ceph_cap_string(got));
+  
+ -		ret = generic_file_read_iter(iocb, to);
+ +		ret = generic_file_aio_read(iocb, iov, nr_segs, pos);
+  	}
+ +out:
+  	dout("aio_read %p %llx.%llx dropping cap refs on %s = %d\n",
+  	     inode, ceph_vinop(inode), ceph_cap_string(got), (int)ret);
+  	if (pinned_page) {
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/file.c
