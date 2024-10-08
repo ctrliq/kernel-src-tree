@@ -1892,8 +1892,6 @@ static int __setup_output_field(void)
 	if (field_order == NULL)
 		return 0;
 
-	reset_dimensions();
-
 	strp = str = strdup(field_order);
 	if (str == NULL) {
 		error("Not enough memory to setup output fields");
