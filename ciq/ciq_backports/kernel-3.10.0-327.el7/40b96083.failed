@@ -1,0 +1,154 @@
+PCI: pciehp: Compute timeout from hotplug command start time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [pci] pciehp: Compute timeout from hotplug command start time (Myron Stowe) [1223472]
+Rebuild_FUZZ: 95.65%
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 40b960831cfa8ee34d4b1035ddd7074bc5b01ecf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/40b96083.failed
+
+If we issue a hotplug command, go do something else, then come back and
+wait for the command to complete, we don't have to wait the whole timeout
+period, because some of it elapsed while we were doing something else.
+
+Keep track of the time we issued the command, and wait only until the
+timeout period from that point has elapsed.
+
+For controllers with errata like Intel CF118, we previously timed out
+before issuing the second hotplug command:
+
+  At time T1 (during boot):
+    - Write DLLSCE, ABPE, PDCE, etc. to Slot Control
+  At time T2 (hotplug event):
+    - Wait for command completion (CC) in Slot Status
+    - Timeout at T2 + 1 second because CC is never set in Slot Status
+    - Write PCC, PIC, etc. to Slot Control
+
+With this change, we wait until T1 + 1 second instead of T2 + 1 second.
+If the hotplug event is more than 1 second after the boot-time
+initialization, we won't wait for the timeout at all.
+
+We still emit a "Timeout on hotplug command" message if it timed out; we
+should see this on the first hotplug event on every controller with this
+erratum, as well as on real errors on controllers without the erratum.
+
+Link: http://www.intel.com/content/www/us/en/processors/xeon/xeon-e7-v2-spec-update.html
+	Tested-by: Rajat Jain <rajatxjain@gmail.com>	(IDT 807a controller)
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: Yinghai Lu <yinghai@kernel.org>
+(cherry picked from commit 40b960831cfa8ee34d4b1035ddd7074bc5b01ecf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp_hpc.c
+diff --cc drivers/pci/hotplug/pciehp_hpc.c
+index f253bb808636,720dfe5fc48a..000000000000
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@@ -129,18 -128,52 +128,59 @@@ static int pcie_poll_cmd(struct control
+  	return 0;	/* timeout */
+  }
+  
+ -static void pcie_wait_cmd(struct controller *ctrl)
+ +static void pcie_wait_cmd(struct controller *ctrl, int poll)
+  {
+  	unsigned int msecs = pciehp_poll_mode ? 2500 : 1000;
+- 	unsigned long timeout = msecs_to_jiffies(msecs);
++ 	unsigned long duration = msecs_to_jiffies(msecs);
++ 	unsigned long cmd_timeout = ctrl->cmd_started + duration;
++ 	unsigned long now, timeout;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (poll)
+ +		rc = pcie_poll_cmd(ctrl);
+ +	else
+ +		rc = wait_event_timeout(ctrl->queue, !ctrl->cmd_busy, timeout);
+++=======
++ 	/*
++ 	 * If the controller does not generate notifications for command
++ 	 * completions, we never need to wait between writes.
++ 	 */
++ 	if (ctrl->no_cmd_complete)
++ 		return;
++ 
++ 	if (!ctrl->cmd_busy)
++ 		return;
++ 
++ 	/*
++ 	 * Even if the command has already timed out, we want to call
++ 	 * pcie_poll_cmd() so it can clear PCI_EXP_SLTSTA_CC.
++ 	 */
++ 	now = jiffies;
++ 	if (time_before_eq(cmd_timeout, now))
++ 		timeout = 1;
++ 	else
++ 		timeout = cmd_timeout - now;
++ 
++ 	if (ctrl->slot_ctrl & PCI_EXP_SLTCTL_HPIE &&
++ 	    ctrl->slot_ctrl & PCI_EXP_SLTCTL_CCIE)
++ 		rc = wait_event_timeout(ctrl->queue, !ctrl->cmd_busy, timeout);
++ 	else
++ 		rc = pcie_poll_cmd(ctrl, timeout);
++ 
++ 	/*
++ 	 * Controllers with errata like Intel CF118 don't generate
++ 	 * completion notifications unless the power/indicator/interlock
++ 	 * control bits are changed.  On such controllers, we'll emit this
++ 	 * timeout message when we wait for completion of commands that
++ 	 * don't change those bits, e.g., commands that merely enable
++ 	 * interrupts.
++ 	 */
+++>>>>>>> 40b960831cfa (PCI: pciehp: Compute timeout from hotplug command start time)
+  	if (!rc)
+- 		ctrl_dbg(ctrl, "Command not completed in 1000 msec\n");
++ 		ctrl_info(ctrl, "Timeout on hotplug command %#010x (issued %u msec ago)\n",
++ 			  ctrl->slot_ctrl,
++ 			  jiffies_to_msecs(now - ctrl->cmd_started));
+  }
+  
+  /**
+@@@ -189,22 -223,9 +229,27 @@@ static void pcie_write_cmd(struct contr
+  	ctrl->cmd_busy = 1;
+  	smp_mb();
+  	pcie_capability_write_word(pdev, PCI_EXP_SLTCTL, slot_ctrl);
+++<<<<<<< HEAD
+++=======
++ 	ctrl->cmd_started = jiffies;
++ 	ctrl->slot_ctrl = slot_ctrl;
+++>>>>>>> 40b960831cfa (PCI: pciehp: Compute timeout from hotplug command start time)
+  
+ +	/*
+ +	 * Wait for command completion.
+ +	 */
+ +	if (!ctrl->no_cmd_complete) {
+ +		int poll = 0;
+ +		/*
+ +		 * if hotplug interrupt is not enabled or command
+ +		 * completed interrupt is not enabled, we need to poll
+ +		 * command completed event.
+ +		 */
+ +		if (!(slot_ctrl & PCI_EXP_SLTCTL_HPIE) ||
+ +		    !(slot_ctrl & PCI_EXP_SLTCTL_CCIE))
+ +			poll = 1;
+ +                pcie_wait_cmd(ctrl, poll);
+ +	}
+  	mutex_unlock(&ctrl->ctrl_lock);
+  }
+  
+diff --git a/drivers/pci/hotplug/pciehp.h b/drivers/pci/hotplug/pciehp.h
+index 7bae08bc1a61..21ac0c1b911d 100644
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@ -93,6 +93,7 @@ struct controller {
+ 	wait_queue_head_t queue;	/* sleep & wake process */
+ 	u32 slot_cap;
+ 	struct timer_list poll_timer;
++	unsigned long cmd_started;	/* jiffies */
+ 	unsigned int cmd_busy:1;
+ 	unsigned int no_cmd_complete:1;
+ 	unsigned int link_active_reporting:1;
+* Unmerged path drivers/pci/hotplug/pciehp_hpc.c
