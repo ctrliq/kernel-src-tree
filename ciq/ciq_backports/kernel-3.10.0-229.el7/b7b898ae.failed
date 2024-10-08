@@ -1,0 +1,547 @@
+x86/efi: Make efi virtual runtime map passing more robust
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [x86] efi: Make efi virtual runtime map passing more robust (Dave Young) [1080109]
+Rebuild_FUZZ: 96.36%
+commit-author Borislav Petkov <bp@suse.de>
+commit b7b898ae0c0a82489511a1ce1b35f26215e6beb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b7b898ae.failed
+
+Currently, running SetVirtualAddressMap() and passing the physical
+address of the virtual map array was working only by a lucky coincidence
+because the memory was present in the EFI page table too. Until Toshi
+went and booted this on a big HP box - the krealloc() manner of resizing
+the memmap we're doing did allocate from such physical addresses which
+were not mapped anymore and boom:
+
+http://lkml.kernel.org/r/1386806463.1791.295.camel@misato.fc.hp.com
+
+One way to take care of that issue is to reimplement the krealloc thing
+but with pages. We start with contiguous pages of order 1, i.e. 2 pages,
+and when we deplete that memory (shouldn't happen all that often but you
+know firmware) we realloc the next power-of-two pages.
+
+Having the pages, it is much more handy and easy to map them into the
+EFI page table with the already existing mapping code which we're using
+for building the virtual mappings.
+
+Thanks to Toshi Kani and Matt for the great debugging help.
+
+	Reported-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit b7b898ae0c0a82489511a1ce1b35f26215e6beb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/platform/efi/efi.c
+#	arch/x86/platform/efi/efi_32.c
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/include/asm/efi.h
+index 0062a0125041,e985d6bf7d3a..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -101,6 -126,25 +101,28 @@@ extern void efi_call_phys_prelog(void)
+  extern void efi_call_phys_epilog(void);
+  extern void efi_unmap_memmap(void);
+  extern void efi_memory_uc(u64 addr, unsigned long size);
+++<<<<<<< HEAD
+++=======
++ extern void __init efi_map_region(efi_memory_desc_t *md);
++ extern void __init efi_map_region_fixed(efi_memory_desc_t *md);
++ extern void efi_sync_low_kernel_mappings(void);
++ extern int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages);
++ extern void efi_cleanup_page_tables(unsigned long pa_memmap, unsigned num_pages);
++ extern void __init old_map_region(efi_memory_desc_t *md);
++ extern void __init runtime_code_page_mkexec(void);
++ extern void __init efi_runtime_mkexec(void);
++ extern void __init efi_dump_pagetable(void);
++ 
++ struct efi_setup_data {
++ 	u64 fw_vendor;
++ 	u64 runtime;
++ 	u64 tables;
++ 	u64 smbios;
++ 	u64 reserved[8];
++ };
++ 
++ extern u64 efi_setup;
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  
+  #ifdef CONFIG_EFI
+  
+diff --cc arch/x86/platform/efi/efi.c
+index 4ba4bd5dfe10,576bb126593a..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -804,6 -863,99 +804,102 @@@ void __init efi_enter_virtual_mode(void
+  		}
+  		prev_md = md;
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void __init get_systab_virt_addr(efi_memory_desc_t *md)
++ {
++ 	unsigned long size;
++ 	u64 end, systab;
++ 
++ 	size = md->num_pages << EFI_PAGE_SHIFT;
++ 	end = md->phys_addr + size;
++ 	systab = (u64)(unsigned long)efi_phys.systab;
++ 	if (md->phys_addr <= systab && systab < end) {
++ 		systab += md->virt_addr - md->phys_addr;
++ 		efi.systab = (efi_system_table_t *)(unsigned long)systab;
++ 	}
++ }
++ 
++ static int __init save_runtime_map(void)
++ {
++ 	efi_memory_desc_t *md;
++ 	void *tmp, *p, *q = NULL;
++ 	int count = 0;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RUNTIME) ||
++ 		    (md->type == EFI_BOOT_SERVICES_CODE) ||
++ 		    (md->type == EFI_BOOT_SERVICES_DATA))
++ 			continue;
++ 		tmp = krealloc(q, (count + 1) * memmap.desc_size, GFP_KERNEL);
++ 		if (!tmp)
++ 			goto out;
++ 		q = tmp;
++ 
++ 		memcpy(q + count * memmap.desc_size, md, memmap.desc_size);
++ 		count++;
++ 	}
++ 
++ 	efi_runtime_map_setup(q, count, memmap.desc_size);
++ 
++ 	return 0;
++ out:
++ 	kfree(q);
++ 	return -ENOMEM;
++ }
++ 
++ /*
++  * Map efi regions which were passed via setup_data. The virt_addr is a fixed
++  * addr which was used in first kernel of a kexec boot.
++  */
++ static void __init efi_map_regions_fixed(void)
++ {
++ 	void *p;
++ 	efi_memory_desc_t *md;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 		efi_map_region_fixed(md); /* FIXME: add error handling */
++ 		get_systab_virt_addr(md);
++ 	}
++ 
++ }
++ 
++ static void *realloc_pages(void *old_memmap, int old_shift)
++ {
++ 	void *ret;
++ 
++ 	ret = (void *)__get_free_pages(GFP_KERNEL, old_shift + 1);
++ 	if (!ret)
++ 		goto out;
++ 
++ 	/*
++ 	 * A first-time allocation doesn't have anything to copy.
++ 	 */
++ 	if (!old_memmap)
++ 		return ret;
++ 
++ 	memcpy(ret, old_memmap, PAGE_SIZE << old_shift);
++ 
++ out:
++ 	free_pages((unsigned long)old_memmap, old_shift);
++ 	return ret;
++ }
++ 
++ /*
++  * Map the efi memory ranges of the runtime services and update new_mmap with
++  * virtual addresses.
++  */
++ static void * __init efi_map_regions(int *count, int *pg_shift)
++ {
++ 	void *p, *new_memmap = NULL;
++ 	unsigned long left = 0;
++ 	efi_memory_desc_t *md;
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  
+  	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+  		md = p;
+@@@ -815,56 -967,103 +911,139 @@@
+  				continue;
+  		}
+  
+ -		efi_map_region(md);
+ -		get_systab_virt_addr(md);
+ +		size = md->num_pages << EFI_PAGE_SHIFT;
+ +		end = md->phys_addr + size;
+ +
+++<<<<<<< HEAD
+ +		start_pfn = PFN_DOWN(md->phys_addr);
+ +		end_pfn = PFN_UP(end);
+ +		if (pfn_range_is_mapped(start_pfn, end_pfn)) {
+ +			va = __va(md->phys_addr);
+  
+ +			if (!(md->attribute & EFI_MEMORY_WB))
+ +				efi_memory_uc((u64)(unsigned long)va, size);
+ +		} else
+ +			va = efi_ioremap(md->phys_addr, size,
+ +					 md->type, md->attribute);
+ +
+ +		md->virt_addr = (u64) (unsigned long) va;
+ +
+ +		if (!va) {
+ +			pr_err("ioremap of 0x%llX failed!\n",
+ +			       (unsigned long long)md->phys_addr);
+ +			continue;
+ +		}
+ +
+ +		systab = (u64) (unsigned long) efi_phys.systab;
+ +		if (md->phys_addr <= systab && systab < end) {
+ +			systab += md->virt_addr - md->phys_addr;
+ +			efi.systab = (efi_system_table_t *) (unsigned long) systab;
+ +		}
+ +		new_memmap = krealloc(new_memmap,
+ +				      (count + 1) * memmap.desc_size,
+ +				      GFP_KERNEL);
+ +		if (!new_memmap)
+ +			goto err_out;
+ +
+ +		memcpy(new_memmap + (count * memmap.desc_size), md,
+ +		       memmap.desc_size);
+ +		count++;
+++=======
++ 		if (left < memmap.desc_size) {
++ 			new_memmap = realloc_pages(new_memmap, *pg_shift);
++ 			if (!new_memmap)
++ 				return NULL;
++ 
++ 			left += PAGE_SIZE << *pg_shift;
++ 			(*pg_shift)++;
++ 		}
++ 
++ 		memcpy(new_memmap + (*count * memmap.desc_size), md,
++ 		       memmap.desc_size);
++ 
++ 		left -= memmap.desc_size;
++ 		(*count)++;
++ 	}
++ 
++ 	return new_memmap;
++ }
++ 
++ /*
++  * This function will switch the EFI runtime services to virtual mode.
++  * Essentially, we look through the EFI memmap and map every region that
++  * has the runtime attribute bit set in its memory descriptor into the
++  * ->trampoline_pgd page table using a top-down VA allocation scheme.
++  *
++  * The old method which used to update that memory descriptor with the
++  * virtual address obtained from ioremap() is still supported when the
++  * kernel is booted with efi=old_map on its command line. Same old
++  * method enabled the runtime services to be called without having to
++  * thunk back into physical mode for every invocation.
++  *
++  * The new method does a pagetable switch in a preemption-safe manner
++  * so that we're in a different address space when calling a runtime
++  * function. For function arguments passing we do copy the PGDs of the
++  * kernel page table into ->trampoline_pgd prior to each call.
++  *
++  * Specially for kexec boot, efi runtime maps in previous kernel should
++  * be passed in via setup_data. In that case runtime ranges will be mapped
++  * to the same virtual addresses as the first kernel.
++  */
++ void __init efi_enter_virtual_mode(void)
++ {
++ 	int err, count = 0, pg_shift = 0;
++ 	void *new_memmap = NULL;
++ 	efi_status_t status;
++ 
++ 	efi.systab = NULL;
++ 
++ 	/*
++ 	 * We don't do virtual mode, since we don't do runtime services, on
++ 	 * non-native EFI
++ 	 */
++ 	if (!efi_is_native()) {
++ 		efi_unmap_memmap();
++ 		return;
++ 	}
++ 
++ 	if (efi_setup) {
++ 		efi_map_regions_fixed();
++ 	} else {
++ 		efi_merge_regions();
++ 		new_memmap = efi_map_regions(&count, &pg_shift);
++ 		if (!new_memmap) {
++ 			pr_err("Error reallocating memory, EFI runtime non-functional!\n");
++ 			return;
++ 		}
++ 
++ 		err = save_runtime_map();
++ 		if (err)
++ 			pr_err("Error saving runtime map, efi runtime on kexec non-functional!!\n");
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  	}
+  
+  	BUG_ON(!efi.systab);
+  
+++<<<<<<< HEAD
+ +	status = phys_efi_set_virtual_address_map(
+ +		memmap.desc_size * count,
+ +		memmap.desc_size,
+ +		memmap.desc_version,
+ +		(efi_memory_desc_t *)__pa(new_memmap));
+++=======
++ 	if (!efi_setup) {
++ 		if (efi_setup_page_tables(__pa(new_memmap), 1 << pg_shift))
++ 			return;
++ 	}
++ 
++ 	efi_sync_low_kernel_mappings();
++ 	efi_dump_pagetable();
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  
+ -	if (!efi_setup) {
+ -		status = phys_efi_set_virtual_address_map(
+ -			memmap.desc_size * count,
+ -			memmap.desc_size,
+ -			memmap.desc_version,
+ -			(efi_memory_desc_t *)__pa(new_memmap));
+ -
+ -		if (status != EFI_SUCCESS) {
+ -			pr_alert("Unable to switch EFI into virtual mode (status=%lx)!\n",
+ -				 status);
+ -			panic("EFI call to SetVirtualAddressMap() failed!");
+ -		}
+ +	if (status != EFI_SUCCESS) {
+ +		pr_alert("Unable to switch EFI into virtual mode "
+ +			 "(status=%lx)!\n", status);
+ +		panic("EFI call to SetVirtualAddressMap() failed!");
+  	}
+  
+  	/*
+@@@ -887,10 -1086,38 +1066,38 @@@
+  	efi.query_variable_info = virt_efi_query_variable_info;
+  	efi.update_capsule = virt_efi_update_capsule;
+  	efi.query_capsule_caps = virt_efi_query_capsule_caps;
+ -
+ -	efi_runtime_mkexec();
+ +	if (__supported_pte_mask & _PAGE_NX)
+ +		runtime_code_page_mkexec();
+  
+- 	kfree(new_memmap);
++ 
++ 	/*
++ 	 * We mapped the descriptor array into the EFI pagetable above but we're
++ 	 * not unmapping it here. Here's why:
++ 	 *
++ 	 * We're copying select PGDs from the kernel page table to the EFI page
++ 	 * table and when we do so and make changes to those PGDs like unmapping
++ 	 * stuff from them, those changes appear in the kernel page table and we
++ 	 * go boom.
++ 	 *
++ 	 * From setup_real_mode():
++ 	 *
++ 	 * ...
++ 	 * trampoline_pgd[0] = init_level4_pgt[pgd_index(__PAGE_OFFSET)].pgd;
++ 	 *
++ 	 * In this particular case, our allocation is in PGD 0 of the EFI page
++ 	 * table but we've copied that PGD from PGD[272] of the EFI page table:
++ 	 *
++ 	 *	pgd_index(__PAGE_OFFSET = 0xffff880000000000) = 272
++ 	 *
++ 	 * where the direct memory mapping in kernel space is.
++ 	 *
++ 	 * new_memmap's VA comes from that direct mapping and thus clearing it,
++ 	 * it would get cleared in the kernel page table too.
++ 	 *
++ 	 * efi_cleanup_page_tables(__pa(new_memmap), 1 << pg_shift);
++ 	 */
++ 	if (!efi_setup)
++ 		free_pages((unsigned long)new_memmap, pg_shift);
+  
+  	/* clean DUMMY object */
+  	efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
+diff --cc arch/x86/platform/efi/efi_32.c
+index 40e446941dd7,9ee3491e31fb..000000000000
+--- a/arch/x86/platform/efi/efi_32.c
++++ b/arch/x86/platform/efi/efi_32.c
+@@@ -37,9 -37,24 +37,28 @@@
+   * claim EFI runtime service handler exclusively and to duplicate a memory in
+   * low memory space say 0 - 3G.
+   */
+ +
+  static unsigned long efi_rt_eflags;
+  
+++<<<<<<< HEAD
+++=======
++ void efi_sync_low_kernel_mappings(void) {}
++ void __init efi_dump_pagetable(void) {}
++ int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
++ {
++ 	return 0;
++ }
++ void efi_cleanup_page_tables(unsigned long pa_memmap, unsigned num_pages) {}
++ 
++ void __init efi_map_region(efi_memory_desc_t *md)
++ {
++ 	old_map_region(md);
++ }
++ 
++ void __init efi_map_region_fixed(efi_memory_desc_t *md) {}
++ void __init parse_efi_setup(u64 phys_addr, u32 data_len) {}
++ 
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  void efi_call_phys_prelog(void)
+  {
+  	struct desc_ptr gdt_descr;
+diff --cc arch/x86/platform/efi/efi_64.c
+index 39a0e7f1f0a3,19280900ec25..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -94,6 -119,122 +94,125 @@@ void __init efi_call_phys_epilog(void
+  	early_code_mapping_set_exec(0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Add low kernel mappings for passing arguments to EFI functions.
++  */
++ void efi_sync_low_kernel_mappings(void)
++ {
++ 	unsigned num_pgds;
++ 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP))
++ 		return;
++ 
++ 	num_pgds = pgd_index(MODULES_END - 1) - pgd_index(PAGE_OFFSET);
++ 
++ 	memcpy(pgd + pgd_index(PAGE_OFFSET),
++ 		init_mm.pgd + pgd_index(PAGE_OFFSET),
++ 		sizeof(pgd_t) * num_pgds);
++ }
++ 
++ int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
++ {
++ 	pgd_t *pgd;
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP))
++ 		return 0;
++ 
++ 	efi_scratch.efi_pgt = (pgd_t *)(unsigned long)real_mode_header->trampoline_pgd;
++ 	pgd = __va(efi_scratch.efi_pgt);
++ 
++ 	/*
++ 	 * It can happen that the physical address of new_memmap lands in memory
++ 	 * which is not mapped in the EFI page table. Therefore we need to go
++ 	 * and ident-map those pages containing the map before calling
++ 	 * phys_efi_set_virtual_address_map().
++ 	 */
++ 	if (kernel_map_pages_in_pgd(pgd, pa_memmap, pa_memmap, num_pages, _PAGE_NX)) {
++ 		pr_err("Error ident-mapping new memmap (0x%lx)!\n", pa_memmap);
++ 		return 1;
++ 	}
++ 
++ 	efi_scratch.use_pgd = true;
++ 
++ 
++ 	return 0;
++ }
++ 
++ void efi_cleanup_page_tables(unsigned long pa_memmap, unsigned num_pages)
++ {
++ 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
++ 
++ 	kernel_unmap_pages_in_pgd(pgd, pa_memmap, num_pages);
++ }
++ 
++ static void __init __map_region(efi_memory_desc_t *md, u64 va)
++ {
++ 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
++ 	unsigned long pf = 0;
++ 
++ 	if (!(md->attribute & EFI_MEMORY_WB))
++ 		pf |= _PAGE_PCD;
++ 
++ 	if (kernel_map_pages_in_pgd(pgd, md->phys_addr, va, md->num_pages, pf))
++ 		pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
++ 			   md->phys_addr, va);
++ }
++ 
++ void __init efi_map_region(efi_memory_desc_t *md)
++ {
++ 	unsigned long size = md->num_pages << PAGE_SHIFT;
++ 	u64 pa = md->phys_addr;
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP))
++ 		return old_map_region(md);
++ 
++ 	/*
++ 	 * Make sure the 1:1 mappings are present as a catch-all for b0rked
++ 	 * firmware which doesn't update all internal pointers after switching
++ 	 * to virtual mode and would otherwise crap on us.
++ 	 */
++ 	__map_region(md, md->phys_addr);
++ 
++ 	efi_va -= size;
++ 
++ 	/* Is PA 2M-aligned? */
++ 	if (!(pa & (PMD_SIZE - 1))) {
++ 		efi_va &= PMD_MASK;
++ 	} else {
++ 		u64 pa_offset = pa & (PMD_SIZE - 1);
++ 		u64 prev_va = efi_va;
++ 
++ 		/* get us the same offset within this 2M page */
++ 		efi_va = (efi_va & PMD_MASK) + pa_offset;
++ 
++ 		if (efi_va > prev_va)
++ 			efi_va -= PMD_SIZE;
++ 	}
++ 
++ 	if (efi_va < EFI_VA_END) {
++ 		pr_warn(FW_WARN "VA address range overflow!\n");
++ 		return;
++ 	}
++ 
++ 	/* Do the VA map */
++ 	__map_region(md, efi_va);
++ 	md->virt_addr = efi_va;
++ }
++ 
++ /*
++  * kexec kernel will use efi_map_region_fixed to map efi runtime memory ranges.
++  * md->virt_addr is the original virtual address which had been mapped in kexec
++  * 1st kernel.
++  */
++ void __init efi_map_region_fixed(efi_memory_desc_t *md)
++ {
++ 	__map_region(md, md->virt_addr);
++ }
++ 
+++>>>>>>> b7b898ae0c0a (x86/efi: Make efi virtual runtime map passing more robust)
+  void __iomem *__init efi_ioremap(unsigned long phys_addr, unsigned long size,
+  				 u32 type, u64 attribute)
+  {
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path arch/x86/platform/efi/efi.c
+* Unmerged path arch/x86/platform/efi/efi_32.c
+* Unmerged path arch/x86/platform/efi/efi_64.c
