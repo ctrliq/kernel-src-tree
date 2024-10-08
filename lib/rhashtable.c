@@ -98,14 +98,14 @@ static struct rhash_head __rcu **bucket_tail(struct bucket_table *tbl, u32 n)
 
 static struct bucket_table *bucket_table_alloc(size_t nbuckets)
 {
-	struct bucket_table *tbl;
+	struct bucket_table *tbl = NULL;
 	size_t size;
 
 	size = sizeof(*tbl) + nbuckets * sizeof(tbl->buckets[0]);
-	tbl = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+	if (size <= (PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER))
+		tbl = kzalloc(size, GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY);
 	if (tbl == NULL)
 		tbl = vzalloc(size);
-
 	if (tbl == NULL)
 		return NULL;
 
