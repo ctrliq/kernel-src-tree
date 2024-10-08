@@ -25,6 +25,7 @@
 #include <linux/module.h>
 #include <asm/kvm_emulate.h>
 #include <linux/stringify.h>
+#include <asm/debugreg.h>
 
 #include "x86.h"
 #include "tss.h"
@@ -2798,7 +2799,7 @@ static int emulator_do_task_switch(struct x86_emulate_ctxt *ctxt,
 	ulong old_tss_base =
 		ops->get_cached_segment_base(ctxt, VCPU_SREG_TR);
 	u32 desc_limit;
-	ulong desc_addr;
+	ulong desc_addr, dr7;
 
 	/* FIXME: old_tss_base == ~0 ? */
 
@@ -2882,6 +2883,9 @@ static int emulator_do_task_switch(struct x86_emulate_ctxt *ctxt,
 		ctxt->src.val = (unsigned long) error_code;
 		ret = em_push(ctxt);
 	}
+
+	ops->get_dr(ctxt, 7, &dr7);
+	ops->set_dr(ctxt, 7, dr7 & ~(DR_LOCAL_ENABLE_MASK | DR_LOCAL_SLOWDOWN));
 
 	return ret;
 }
