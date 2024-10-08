@@ -1,0 +1,134 @@
+packet: fix packet_direct_xmit for BQL enabled drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit 8e2f1a63f2217365223026422a2f8ba5967051d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8e2f1a63.failed
+
+Currently, in packet_direct_xmit() we test the assigned netdevice queue
+for netif_xmit_frozen_or_stopped() before doing an ndo_start_xmit().
+
+This can have the side-effect that BQL enabled drivers which make use
+of netdev_tx_sent_queue() internally, set __QUEUE_STATE_STACK_XOFF from
+within the stack and would not fully fill the device's TX ring from
+packet sockets with PACKET_QDISC_BYPASS enabled.
+
+Instead, use a test without BQL bit so that bursts can be absorbed
+into the NICs TX ring. Fix and code suggested by Eric Dumazet, thanks!
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8e2f1a63f2217365223026422a2f8ba5967051d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 4450cf82adc9,72e0c71fb01d..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -237,6 -237,49 +237,52 @@@ struct packet_skb_cb 
+  static void __fanout_unlink(struct sock *sk, struct packet_sock *po);
+  static void __fanout_link(struct sock *sk, struct packet_sock *po);
+  
+++<<<<<<< HEAD
+++=======
++ static int packet_direct_xmit(struct sk_buff *skb)
++ {
++ 	struct net_device *dev = skb->dev;
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	netdev_features_t features;
++ 	struct netdev_queue *txq;
++ 	int ret = NETDEV_TX_BUSY;
++ 	u16 queue_map;
++ 
++ 	if (unlikely(!netif_running(dev) ||
++ 		     !netif_carrier_ok(dev)))
++ 		goto drop;
++ 
++ 	features = netif_skb_features(skb);
++ 	if (skb_needs_linearize(skb, features) &&
++ 	    __skb_linearize(skb))
++ 		goto drop;
++ 
++ 	queue_map = skb_get_queue_mapping(skb);
++ 	txq = netdev_get_tx_queue(dev, queue_map);
++ 
++ 	local_bh_disable();
++ 
++ 	HARD_TX_LOCK(dev, txq, smp_processor_id());
++ 	if (!netif_xmit_frozen_or_drv_stopped(txq)) {
++ 		ret = ops->ndo_start_xmit(skb, dev);
++ 		if (ret == NETDEV_TX_OK)
++ 			txq_trans_update(txq);
++ 	}
++ 	HARD_TX_UNLOCK(dev, txq);
++ 
++ 	local_bh_enable();
++ 
++ 	if (!dev_xmit_complete(ret))
++ 		kfree_skb(skb);
++ 
++ 	return ret;
++ drop:
++ 	atomic_long_inc(&dev->tx_dropped);
++ 	kfree_skb(skb);
++ 	return NET_XMIT_DROP;
++ }
++ 
+++>>>>>>> 8e2f1a63f221 (packet: fix packet_direct_xmit for BQL enabled drivers)
+  static struct net_device *packet_cached_dev_get(struct packet_sock *po)
+  {
+  	struct net_device *dev;
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index dba59a041ff6..f30f871a4215 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -527,11 +527,18 @@ enum netdev_queue_state_t {
+ 	__QUEUE_STATE_DRV_XOFF,
+ 	__QUEUE_STATE_STACK_XOFF,
+ 	__QUEUE_STATE_FROZEN,
+-#define QUEUE_STATE_ANY_XOFF ((1 << __QUEUE_STATE_DRV_XOFF)		| \
+-			      (1 << __QUEUE_STATE_STACK_XOFF))
+-#define QUEUE_STATE_ANY_XOFF_OR_FROZEN (QUEUE_STATE_ANY_XOFF		| \
+-					(1 << __QUEUE_STATE_FROZEN))
+ };
++
++#define QUEUE_STATE_DRV_XOFF	(1 << __QUEUE_STATE_DRV_XOFF)
++#define QUEUE_STATE_STACK_XOFF	(1 << __QUEUE_STATE_STACK_XOFF)
++#define QUEUE_STATE_FROZEN	(1 << __QUEUE_STATE_FROZEN)
++
++#define QUEUE_STATE_ANY_XOFF	(QUEUE_STATE_DRV_XOFF | QUEUE_STATE_STACK_XOFF)
++#define QUEUE_STATE_ANY_XOFF_OR_FROZEN (QUEUE_STATE_ANY_XOFF | \
++					QUEUE_STATE_FROZEN)
++#define QUEUE_STATE_DRV_XOFF_OR_FROZEN (QUEUE_STATE_DRV_XOFF | \
++					QUEUE_STATE_FROZEN)
++
+ /*
+  * __QUEUE_STATE_DRV_XOFF is used by drivers to stop the transmit queue.  The
+  * netif_tx_* functions below are used to manipulate this flag.  The
+@@ -2210,11 +2217,18 @@ static inline bool netif_xmit_stopped(const struct netdev_queue *dev_queue)
+ 	return dev_queue->state & QUEUE_STATE_ANY_XOFF;
+ }
+ 
+-static inline bool netif_xmit_frozen_or_stopped(const struct netdev_queue *dev_queue)
++static inline bool
++netif_xmit_frozen_or_stopped(const struct netdev_queue *dev_queue)
+ {
+ 	return dev_queue->state & QUEUE_STATE_ANY_XOFF_OR_FROZEN;
+ }
+ 
++static inline bool
++netif_xmit_frozen_or_drv_stopped(const struct netdev_queue *dev_queue)
++{
++	return dev_queue->state & QUEUE_STATE_DRV_XOFF_OR_FROZEN;
++}
++
+ static inline void netdev_tx_sent_queue(struct netdev_queue *dev_queue,
+ 					unsigned int bytes)
+ {
+* Unmerged path net/packet/af_packet.c
