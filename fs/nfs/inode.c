@@ -48,7 +48,6 @@
 #include "iostat.h"
 #include "internal.h"
 #include "fscache.h"
-#include "dns_resolve.h"
 #include "pnfs.h"
 #include "nfs.h"
 #include "netns.h"
@@ -1674,12 +1673,11 @@ EXPORT_SYMBOL_GPL(nfs_net_id);
 static int nfs_net_init(struct net *net)
 {
 	nfs_clients_init(net);
-	return nfs_dns_resolver_cache_init(net);
+	return 0;
 }
 
 static void nfs_net_exit(struct net *net)
 {
-	nfs_dns_resolver_cache_destroy(net);
 	nfs_cleanup_cb_ident_idr(net);
 }
 
@@ -1696,10 +1694,6 @@ static struct pernet_operations nfs_net_ops = {
 static int __init init_nfs_fs(void)
 {
 	int err;
-
-	err = nfs_dns_resolver_init();
-	if (err < 0)
-		goto out10;;
 
 	err = register_pernet_subsys(&nfs_net_ops);
 	if (err < 0)
@@ -1766,8 +1760,6 @@ out7:
 out8:
 	unregister_pernet_subsys(&nfs_net_ops);
 out9:
-	nfs_dns_resolver_destroy();
-out10:
 	return err;
 }
 
@@ -1780,7 +1772,6 @@ static void __exit exit_nfs_fs(void)
 	nfs_destroy_nfspagecache();
 	nfs_fscache_unregister();
 	unregister_pernet_subsys(&nfs_net_ops);
-	nfs_dns_resolver_destroy();
 #ifdef CONFIG_PROC_FS
 	rpc_proc_unregister(&init_net, "nfs");
 #endif
