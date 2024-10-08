@@ -1,0 +1,595 @@
+perf/x86: Improve HT workaround GP counter constraint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] x86: Improve HT workaround GP counter constraint (Jiri Olsa) [1210494]
+Rebuild_FUZZ: 95.05%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit cc1790cf541553263bda024295d7600c7cd7c45d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cc1790cf.failed
+
+The (SNB/IVB/HSW) HT bug only affects events that can be programmed
+onto GP counters, therefore we should only limit the number of GP
+counters that can be used per cpu -- iow we should not constrain the
+FP counters.
+
+Furthermore, we should only enfore such a limit when there are in fact
+exclusive events being scheduled on either sibling.
+
+	Reported-by: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+[ Fixed build fail for the !CONFIG_CPU_SUP_INTEL case. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit cc1790cf541553263bda024295d7600c7cd7c45d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event.c
+#	arch/x86/kernel/cpu/perf_event.h
+#	arch/x86/kernel/cpu/perf_event_intel.c
+#	arch/x86/kernel/cpu/perf_event_intel_uncore.c
+diff --cc arch/x86/kernel/cpu/perf_event.c
+index 49042895daee,2eca19422454..000000000000
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@@ -570,27 -621,29 +571,42 @@@ struct sched_state 
+  struct perf_sched {
+  	int			max_weight;
+  	int			max_events;
+++<<<<<<< HEAD
+ +	struct perf_event	**events;
+- 	struct sched_state	state;
+++=======
++ 	int			max_gp;
+  	int			saved_states;
++ 	struct event_constraint	**constraints;
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
++ 	struct sched_state	state;
+  	struct sched_state	saved[SCHED_STATES_MAX];
+  };
+  
+  /*
+   * Initialize interator that runs through all events and counters.
+   */
+++<<<<<<< HEAD
+ +static void perf_sched_init(struct perf_sched *sched, struct perf_event **events,
+ +			    int num, int wmin, int wmax)
+++=======
++ static void perf_sched_init(struct perf_sched *sched, struct event_constraint **constraints,
++ 			    int num, int wmin, int wmax, int gpmax)
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  {
+  	int idx;
+  
+  	memset(sched, 0, sizeof(*sched));
+  	sched->max_events	= num;
+  	sched->max_weight	= wmax;
+++<<<<<<< HEAD
+ +	sched->events		= events;
+++=======
++ 	sched->max_gp		= gpmax;
++ 	sched->constraints	= constraints;
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  	for (idx = 0; idx < num; idx++) {
+ -		if (constraints[idx]->weight == wmin)
+ +		if (events[idx]->hw.constraint->weight == wmin)
+  			break;
+  	}
+  
+@@@ -706,12 -764,12 +727,21 @@@ static bool perf_sched_next_event(struc
+  /*
+   * Assign a counter for each event.
+   */
+++<<<<<<< HEAD
+ +int perf_assign_events(struct perf_event **events, int n,
+ +			int wmin, int wmax, int *assign)
+ +{
+ +	struct perf_sched sched;
+ +
+ +	perf_sched_init(&sched, events, n, wmin, wmax);
+++=======
++ int perf_assign_events(struct event_constraint **constraints, int n,
++ 			int wmin, int wmax, int gpmax, int *assign)
++ {
++ 	struct perf_sched sched;
++ 
++ 	perf_sched_init(&sched, constraints, n, wmin, wmax, gpmax);
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  	do {
+  		if (!perf_sched_find_counter(&sched))
+@@@ -771,15 -829,38 +801,38 @@@ int x86_schedule_events(struct cpu_hw_e
+  	}
+  
+  	/* slow path */
+++<<<<<<< HEAD
+ +	if (i != n)
+ +		num = perf_assign_events(cpuc->event_list, n, wmin,
+ +					 wmax, assign);
+++=======
++ 	if (i != n) {
++ 		int gpmax = x86_pmu.num_counters;
++ 
++ 		/*
++ 		 * Do not allow scheduling of more than half the available
++ 		 * generic counters.
++ 		 *
++ 		 * This helps avoid counter starvation of sibling thread by
++ 		 * ensuring at most half the counters cannot be in exclusive
++ 		 * mode. There is no designated counters for the limits. Any
++ 		 * N/2 counters can be used. This helps with events with
++ 		 * specific counter constraints.
++ 		 */
++ 		if (is_ht_workaround_enabled() && !cpuc->is_fake &&
++ 		    READ_ONCE(cpuc->excl_cntrs->exclusive_present))
++ 			gpmax /= 2;
++ 
++ 		unsched = perf_assign_events(cpuc->event_constraint, n, wmin,
++ 					     wmax, gpmax, assign);
++ 	}
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  	/*
+ -	 * In case of success (unsched = 0), mark events as committed,
+ -	 * so we do not put_constraint() in case new events are added
+ -	 * and fail to be scheduled
+ -	 *
+ -	 * We invoke the lower level commit callback to lock the resource
+ -	 *
+ -	 * We do not need to do all of this in case we are called to
+ -	 * validate an event group (assign == NULL)
+ +	 * Mark the event as committed, so we do not put_constraint()
+ +	 * in case new events are added and fail scheduling.
+  	 */
+ -	if (!unsched && assign) {
+ +	if (!num && assign) {
+  		for (i = 0; i < n; i++) {
+  			e = cpuc->event_list[i];
+  			e->hw.flags |= PERF_X86_EVENT_COMMITTED;
+diff --cc arch/x86/kernel/cpu/perf_event.h
+index aaa12c2a8b1e,ef78516850fb..000000000000
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@@ -65,12 -65,17 +65,26 @@@ struct event_constraint 
+  /*
+   * struct hw_perf_event.flags flags
+   */
+++<<<<<<< HEAD
+ +#define PERF_X86_EVENT_PEBS_LDLAT	0x1 /* ld+ldlat data address sampling */
+ +#define PERF_X86_EVENT_PEBS_ST		0x2 /* st data address sampling */
+ +#define PERF_X86_EVENT_PEBS_ST_HSW	0x4 /* haswell style datala, store */
+ +#define PERF_X86_EVENT_COMMITTED	0x8 /* event passed commit_txn */
+ +#define PERF_X86_EVENT_PEBS_LD_HSW	0x10 /* haswell style datala, load */
+ +#define PERF_X86_EVENT_PEBS_NA_HSW	0x20 /* haswell style datala, unknown */
+++=======
++ #define PERF_X86_EVENT_PEBS_LDLAT	0x0001 /* ld+ldlat data address sampling */
++ #define PERF_X86_EVENT_PEBS_ST		0x0002 /* st data address sampling */
++ #define PERF_X86_EVENT_PEBS_ST_HSW	0x0004 /* haswell style datala, store */
++ #define PERF_X86_EVENT_COMMITTED	0x0008 /* event passed commit_txn */
++ #define PERF_X86_EVENT_PEBS_LD_HSW	0x0010 /* haswell style datala, load */
++ #define PERF_X86_EVENT_PEBS_NA_HSW	0x0020 /* haswell style datala, unknown */
++ #define PERF_X86_EVENT_EXCL		0x0040 /* HT exclusivity on counter */
++ #define PERF_X86_EVENT_DYNAMIC		0x0080 /* dynamic alloc'd constraint */
++ #define PERF_X86_EVENT_RDPMC_ALLOWED	0x0100 /* grant rdpmc permission */
++ #define PERF_X86_EVENT_EXCL_ACCT	0x0200 /* accounted EXCL event */
++ 
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  struct amd_nb {
+  	int nb_id;  /* NorthBridge id */
+@@@ -121,6 -126,32 +135,35 @@@ struct intel_shared_regs 
+  	unsigned                core_id;	/* per-core: core id */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum intel_excl_state_type {
++ 	INTEL_EXCL_UNUSED    = 0, /* counter is unused */
++ 	INTEL_EXCL_SHARED    = 1, /* counter can be used by both threads */
++ 	INTEL_EXCL_EXCLUSIVE = 2, /* counter can be used by one thread only */
++ };
++ 
++ struct intel_excl_states {
++ 	enum intel_excl_state_type init_state[X86_PMC_IDX_MAX];
++ 	enum intel_excl_state_type state[X86_PMC_IDX_MAX];
++ 	bool sched_started; /* true if scheduling has started */
++ };
++ 
++ struct intel_excl_cntrs {
++ 	raw_spinlock_t	lock;
++ 
++ 	struct intel_excl_states states[2];
++ 
++ 	union {
++ 		u16	has_exclusive[2];
++ 		u32	exclusive_present;
++ 	};
++ 
++ 	int		refcnt;		/* per-core: #HT threads */
++ 	unsigned	core_id;	/* per-core: core id */
++ };
++ 
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  #define MAX_LBR_ENTRIES		16
+  
+  enum {
+@@@ -145,7 -176,11 +188,13 @@@ struct cpu_hw_events 
+  					     added in the current transaction */
+  	int			assign[X86_PMC_IDX_MAX]; /* event to counter assignment */
+  	u64			tags[X86_PMC_IDX_MAX];
+ -
+  	struct perf_event	*event_list[X86_PMC_IDX_MAX]; /* in enabled order */
+++<<<<<<< HEAD
+++=======
++ 	struct event_constraint	*event_constraint[X86_PMC_IDX_MAX];
++ 
++ 	int			n_excl; /* the number of exclusive events */
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  	unsigned int		group_flag;
+  	int			is_fake;
+@@@ -638,8 -723,8 +687,13 @@@ static inline void __x86_pmu_enable_eve
+  
+  void x86_pmu_enable_all(int added);
+  
+++<<<<<<< HEAD
+ +int perf_assign_events(struct perf_event **events, int n,
+ +			int wmin, int wmax, int *assign);
+++=======
++ int perf_assign_events(struct event_constraint **constraints, int n,
++ 			int wmin, int wmax, int gpmax, int *assign);
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign);
+  
+  void x86_pmu_stop(struct perf_event *event, int flags);
+diff --cc arch/x86/kernel/cpu/perf_event_intel.c
+index 1f4ce4305bd9,a1e35c9f06b9..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@@ -1795,6 -1900,274 +1795,277 @@@ intel_get_event_constraints(struct cpu_
+  }
+  
+  static void
+++<<<<<<< HEAD
+++=======
++ intel_start_scheduling(struct cpu_hw_events *cpuc)
++ {
++ 	struct intel_excl_cntrs *excl_cntrs = cpuc->excl_cntrs;
++ 	struct intel_excl_states *xl, *xlo;
++ 	int tid = cpuc->excl_thread_id;
++ 	int o_tid = 1 - tid; /* sibling thread */
++ 
++ 	/*
++ 	 * nothing needed if in group validation mode
++ 	 */
++ 	if (cpuc->is_fake || !is_ht_workaround_enabled())
++ 		return;
++ 
++ 	/*
++ 	 * no exclusion needed
++ 	 */
++ 	if (!excl_cntrs)
++ 		return;
++ 
++ 	xlo = &excl_cntrs->states[o_tid];
++ 	xl = &excl_cntrs->states[tid];
++ 
++ 	xl->sched_started = true;
++ 	/*
++ 	 * lock shared state until we are done scheduling
++ 	 * in stop_event_scheduling()
++ 	 * makes scheduling appear as a transaction
++ 	 */
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 	raw_spin_lock(&excl_cntrs->lock);
++ 
++ 	/*
++ 	 * save initial state of sibling thread
++ 	 */
++ 	memcpy(xlo->init_state, xlo->state, sizeof(xlo->init_state));
++ }
++ 
++ static void
++ intel_stop_scheduling(struct cpu_hw_events *cpuc)
++ {
++ 	struct intel_excl_cntrs *excl_cntrs = cpuc->excl_cntrs;
++ 	struct intel_excl_states *xl, *xlo;
++ 	int tid = cpuc->excl_thread_id;
++ 	int o_tid = 1 - tid; /* sibling thread */
++ 
++ 	/*
++ 	 * nothing needed if in group validation mode
++ 	 */
++ 	if (cpuc->is_fake || !is_ht_workaround_enabled())
++ 		return;
++ 	/*
++ 	 * no exclusion needed
++ 	 */
++ 	if (!excl_cntrs)
++ 		return;
++ 
++ 	xlo = &excl_cntrs->states[o_tid];
++ 	xl = &excl_cntrs->states[tid];
++ 
++ 	/*
++ 	 * make new sibling thread state visible
++ 	 */
++ 	memcpy(xlo->state, xlo->init_state, sizeof(xlo->state));
++ 
++ 	xl->sched_started = false;
++ 	/*
++ 	 * release shared state lock (acquired in intel_start_scheduling())
++ 	 */
++ 	raw_spin_unlock(&excl_cntrs->lock);
++ }
++ 
++ static struct event_constraint *
++ intel_get_excl_constraints(struct cpu_hw_events *cpuc, struct perf_event *event,
++ 			   int idx, struct event_constraint *c)
++ {
++ 	struct event_constraint *cx;
++ 	struct intel_excl_cntrs *excl_cntrs = cpuc->excl_cntrs;
++ 	struct intel_excl_states *xl, *xlo;
++ 	int is_excl, i;
++ 	int tid = cpuc->excl_thread_id;
++ 	int o_tid = 1 - tid; /* alternate */
++ 
++ 	/*
++ 	 * validating a group does not require
++ 	 * enforcing cross-thread  exclusion
++ 	 */
++ 	if (cpuc->is_fake || !is_ht_workaround_enabled())
++ 		return c;
++ 
++ 	/*
++ 	 * no exclusion needed
++ 	 */
++ 	if (!excl_cntrs)
++ 		return c;
++ 	/*
++ 	 * event requires exclusive counter access
++ 	 * across HT threads
++ 	 */
++ 	is_excl = c->flags & PERF_X86_EVENT_EXCL;
++ 	if (is_excl && !(event->hw.flags & PERF_X86_EVENT_EXCL_ACCT)) {
++ 		event->hw.flags |= PERF_X86_EVENT_EXCL_ACCT;
++ 		if (!cpuc->n_excl++)
++ 			WRITE_ONCE(excl_cntrs->has_exclusive[tid], 1);
++ 	}
++ 
++ 	/*
++ 	 * xl = state of current HT
++ 	 * xlo = state of sibling HT
++ 	 */
++ 	xl = &excl_cntrs->states[tid];
++ 	xlo = &excl_cntrs->states[o_tid];
++ 
++ 	cx = c;
++ 
++ 	/*
++ 	 * because we modify the constraint, we need
++ 	 * to make a copy. Static constraints come
++ 	 * from static const tables.
++ 	 *
++ 	 * only needed when constraint has not yet
++ 	 * been cloned (marked dynamic)
++ 	 */
++ 	if (!(c->flags & PERF_X86_EVENT_DYNAMIC)) {
++ 
++ 		/* sanity check */
++ 		if (idx < 0)
++ 			return &emptyconstraint;
++ 
++ 		/*
++ 		 * grab pre-allocated constraint entry
++ 		 */
++ 		cx = &cpuc->constraint_list[idx];
++ 
++ 		/*
++ 		 * initialize dynamic constraint
++ 		 * with static constraint
++ 		 */
++ 		memcpy(cx, c, sizeof(*cx));
++ 
++ 		/*
++ 		 * mark constraint as dynamic, so we
++ 		 * can free it later on
++ 		 */
++ 		cx->flags |= PERF_X86_EVENT_DYNAMIC;
++ 	}
++ 
++ 	/*
++ 	 * From here on, the constraint is dynamic.
++ 	 * Either it was just allocated above, or it
++ 	 * was allocated during a earlier invocation
++ 	 * of this function
++ 	 */
++ 
++ 	/*
++ 	 * Modify static constraint with current dynamic
++ 	 * state of thread
++ 	 *
++ 	 * EXCLUSIVE: sibling counter measuring exclusive event
++ 	 * SHARED   : sibling counter measuring non-exclusive event
++ 	 * UNUSED   : sibling counter unused
++ 	 */
++ 	for_each_set_bit(i, cx->idxmsk, X86_PMC_IDX_MAX) {
++ 		/*
++ 		 * exclusive event in sibling counter
++ 		 * our corresponding counter cannot be used
++ 		 * regardless of our event
++ 		 */
++ 		if (xl->state[i] == INTEL_EXCL_EXCLUSIVE)
++ 			__clear_bit(i, cx->idxmsk);
++ 		/*
++ 		 * if measuring an exclusive event, sibling
++ 		 * measuring non-exclusive, then counter cannot
++ 		 * be used
++ 		 */
++ 		if (is_excl && xl->state[i] == INTEL_EXCL_SHARED)
++ 			__clear_bit(i, cx->idxmsk);
++ 	}
++ 
++ 	/*
++ 	 * recompute actual bit weight for scheduling algorithm
++ 	 */
++ 	cx->weight = hweight64(cx->idxmsk64);
++ 
++ 	/*
++ 	 * if we return an empty mask, then switch
++ 	 * back to static empty constraint to avoid
++ 	 * the cost of freeing later on
++ 	 */
++ 	if (cx->weight == 0)
++ 		cx = &emptyconstraint;
++ 
++ 	return cx;
++ }
++ 
++ static struct event_constraint *
++ intel_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
++ 			    struct perf_event *event)
++ {
++ 	struct event_constraint *c1 = cpuc->event_constraint[idx];
++ 	struct event_constraint *c2;
++ 
++ 	/*
++ 	 * first time only
++ 	 * - static constraint: no change across incremental scheduling calls
++ 	 * - dynamic constraint: handled by intel_get_excl_constraints()
++ 	 */
++ 	c2 = __intel_get_event_constraints(cpuc, idx, event);
++ 	if (c1 && (c1->flags & PERF_X86_EVENT_DYNAMIC)) {
++ 		bitmap_copy(c1->idxmsk, c2->idxmsk, X86_PMC_IDX_MAX);
++ 		c1->weight = c2->weight;
++ 		c2 = c1;
++ 	}
++ 
++ 	if (cpuc->excl_cntrs)
++ 		return intel_get_excl_constraints(cpuc, event, idx, c2);
++ 
++ 	return c2;
++ }
++ 
++ static void intel_put_excl_constraints(struct cpu_hw_events *cpuc,
++ 		struct perf_event *event)
++ {
++ 	struct hw_perf_event *hwc = &event->hw;
++ 	struct intel_excl_cntrs *excl_cntrs = cpuc->excl_cntrs;
++ 	struct intel_excl_states *xlo, *xl;
++ 	unsigned long flags = 0; /* keep compiler happy */
++ 	int tid = cpuc->excl_thread_id;
++ 	int o_tid = 1 - tid;
++ 
++ 	/*
++ 	 * nothing needed if in group validation mode
++ 	 */
++ 	if (cpuc->is_fake)
++ 		return;
++ 
++ 	WARN_ON_ONCE(!excl_cntrs);
++ 
++ 	if (!excl_cntrs)
++ 		return;
++ 
++ 	xl = &excl_cntrs->states[tid];
++ 	xlo = &excl_cntrs->states[o_tid];
++ 	if (hwc->flags & PERF_X86_EVENT_EXCL_ACCT) {
++ 		hwc->flags &= ~PERF_X86_EVENT_EXCL_ACCT;
++ 		if (!--cpuc->n_excl)
++ 			WRITE_ONCE(excl_cntrs->has_exclusive[tid], 0);
++ 	}
++ 
++ 	/*
++ 	 * put_constraint may be called from x86_schedule_events()
++ 	 * which already has the lock held so here make locking
++ 	 * conditional
++ 	 */
++ 	if (!xl->sched_started)
++ 		raw_spin_lock_irqsave(&excl_cntrs->lock, flags);
++ 
++ 	/*
++ 	 * if event was actually assigned, then mark the
++ 	 * counter state as unused now
++ 	 */
++ 	if (hwc->idx >= 0)
++ 		xlo->state[hwc->idx] = INTEL_EXCL_UNUSED;
++ 
++ 	if (!xl->sched_started)
++ 		raw_spin_unlock_irqrestore(&excl_cntrs->lock, flags);
++ }
++ 
++ static void
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  intel_put_shared_regs_event_constraints(struct cpu_hw_events *cpuc,
+  					struct perf_event *event)
+  {
+@@@ -2156,6 -2627,37 +2427,40 @@@ static void intel_pmu_cpu_starting(int 
+  
+  	if (x86_pmu.lbr_sel_map)
+  		cpuc->lbr_sel = &cpuc->shared_regs->regs[EXTRA_REG_LBR];
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (x86_pmu.flags & PMU_FL_EXCL_CNTRS) {
++ 		for_each_cpu(i, topology_thread_cpumask(cpu)) {
++ 			struct intel_excl_cntrs *c;
++ 
++ 			c = per_cpu(cpu_hw_events, i).excl_cntrs;
++ 			if (c && c->core_id == core_id) {
++ 				cpuc->kfree_on_online[1] = cpuc->excl_cntrs;
++ 				cpuc->excl_cntrs = c;
++ 				cpuc->excl_thread_id = 1;
++ 				break;
++ 			}
++ 		}
++ 		cpuc->excl_cntrs->core_id = core_id;
++ 		cpuc->excl_cntrs->refcnt++;
++ 	}
++ }
++ 
++ static void free_excl_cntrs(int cpu)
++ {
++ 	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
++ 	struct intel_excl_cntrs *c;
++ 
++ 	c = cpuc->excl_cntrs;
++ 	if (c) {
++ 		if (c->core_id == -1 || --c->refcnt == 0)
++ 			kfree(c);
++ 		cpuc->excl_cntrs = NULL;
++ 		kfree(cpuc->constraint_list);
++ 		cpuc->constraint_list = NULL;
++ 	}
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  }
+  
+  static void intel_pmu_cpu_dying(int cpu)
+diff --cc arch/x86/kernel/cpu/perf_event_intel_uncore.c
+index 744d4cdcf319,dd319e59246b..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel_uncore.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_uncore.c
+@@@ -3353,8 -394,8 +3353,13 @@@ static int uncore_assign_events(struct 
+  	}
+  	/* slow path */
+  	if (i != n)
+++<<<<<<< HEAD
+ +		ret = perf_assign_events(box->event_list, n,
+ +					 wmin, wmax, assign);
+++=======
++ 		ret = perf_assign_events(box->event_constraint, n,
++ 					 wmin, wmax, n, assign);
+++>>>>>>> cc1790cf5415 (perf/x86: Improve HT workaround GP counter constraint)
+  
+  	if (!assign || ret) {
+  		for (i = 0; i < n; i++)
+* Unmerged path arch/x86/kernel/cpu/perf_event.c
+* Unmerged path arch/x86/kernel/cpu/perf_event.h
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel.c
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel_uncore.c
