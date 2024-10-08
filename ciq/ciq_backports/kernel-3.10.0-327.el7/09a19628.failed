@@ -1,0 +1,104 @@
+Drivers: hv: vmbus: teardown hv_vmbus_con workqueue and vmbus_connection pages on shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: teardown hv_vmbus_con workqueue and vmbus_connection pages on shutdown (Vitaly Kuznetsov) [1201889]
+Rebuild_FUZZ: 92.22%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 09a196288ec4617a920e051af6651ce03968c8b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/09a19628.failed
+
+We need to destroy hv_vmbus_con on module shutdown, otherwise the following
+crash is sometimes observed:
+
+[   76.569845] hv_vmbus: Hyper-V Host Build:9600-6.3-17-0.17039; Vmbus version:3.0
+[   82.598859] BUG: unable to handle kernel paging request at ffffffffa0003480
+[   82.599287] IP: [<ffffffffa0003480>] 0xffffffffa0003480
+[   82.599287] PGD 1f34067 PUD 1f35063 PMD 3f72d067 PTE 0
+[   82.599287] Oops: 0010 [#1] SMP
+[   82.599287] Modules linked in: [last unloaded: hv_vmbus]
+[   82.599287] CPU: 0 PID: 26 Comm: kworker/0:1 Not tainted 3.19.0-rc5_bug923184+ #488
+[   82.599287] Hardware name: Microsoft Corporation Virtual Machine/Virtual Machine, BIOS Hyper-V UEFI Release v1.0 11/26/2012
+[   82.599287] Workqueue: hv_vmbus_con 0xffffffffa0003480
+[   82.599287] task: ffff88007b6ddfa0 ti: ffff88007f8f8000 task.ti: ffff88007f8f8000
+[   82.599287] RIP: 0010:[<ffffffffa0003480>]  [<ffffffffa0003480>] 0xffffffffa0003480
+[   82.599287] RSP: 0018:ffff88007f8fbe00  EFLAGS: 00010202
+...
+
+To avoid memory leaks we need to free monitor_pages and int_page for
+vmbus_connection. Implement vmbus_disconnect() function by separating cleanup
+path from vmbus_connect().
+
+As we use hv_vmbus_con to release channels (see free_channel() in channel_mgmt.c)
+we need to make sure the work was done before we remove the queue, do that with
+drain_workqueue(). We also need to avoid handling messages  which can (potentially)
+create new channels, so set vmbus_connection.conn_state = DISCONNECTED at the very
+beginning of vmbus_exit() and check for that in vmbus_onmessage_work().
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 09a196288ec4617a920e051af6651ce03968c8b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/connection.c
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/connection.c
+index cad8295c2bdf,c4acd1ce7c0c..000000000000
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@@ -225,14 -237,10 +236,21 @@@ void vmbus_disconnect(void
+  		vmbus_connection.int_page = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vmbus_connection.monitor_pages) {
+ +		free_pages((unsigned long)vmbus_connection.monitor_pages, 1);
+ +		vmbus_connection.monitor_pages = NULL;
+ +	}
+ +
+ +	kfree(msginfo);
+ +
+ +	return ret;
+++=======
++ 	free_pages((unsigned long)vmbus_connection.monitor_pages[0], 0);
++ 	free_pages((unsigned long)vmbus_connection.monitor_pages[1], 0);
++ 	vmbus_connection.monitor_pages[0] = NULL;
++ 	vmbus_connection.monitor_pages[1] = NULL;
+++>>>>>>> 09a196288ec4 (Drivers: hv: vmbus: teardown hv_vmbus_con workqueue and vmbus_connection pages on shutdown)
+  }
+  
+  /*
+diff --cc drivers/hv/vmbus_drv.c
+index 143d8f6191ee,76db97de09fd..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -837,6 -1035,8 +842,11 @@@ static void __exit vmbus_exit(void
+  	bus_unregister(&hv_bus);
+  	hv_cleanup();
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+++<<<<<<< HEAD
+++=======
++ 	hv_cpu_hotplug_quirk(false);
++ 	vmbus_disconnect();
+++>>>>>>> 09a196288ec4 (Drivers: hv: vmbus: teardown hv_vmbus_con workqueue and vmbus_connection pages on shutdown)
+  }
+  
+  
+* Unmerged path drivers/hv/connection.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index b5e790856f6e..178fe42070be 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -660,6 +660,7 @@ void vmbus_free_channels(void);
+ /* Connection interface */
+ 
+ int vmbus_connect(void);
++void vmbus_disconnect(void);
+ 
+ int vmbus_post_msg(void *buffer, size_t buflen);
+ 
+* Unmerged path drivers/hv/vmbus_drv.c
