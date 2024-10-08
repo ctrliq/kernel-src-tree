@@ -1567,9 +1567,6 @@ static int handle_ioaccel_mode2_error(struct ctlr_info *h,
 		case IOACCEL2_STATUS_SR_TASK_COMP_GOOD:
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_CHK_COND:
-			dev_warn(&h->pdev->dev,
-				"%s: task complete with check condition.\n",
-				"HP SSD Smart Path");
 			cmd->result |= SAM_STAT_CHECK_CONDITION;
 			if (c2->error_data.data_present !=
 					IOACCEL2_SENSE_DATA_PRESENT) {
@@ -1589,30 +1586,18 @@ static int handle_ioaccel_mode2_error(struct ctlr_info *h,
 			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_BUSY:
-			dev_warn(&h->pdev->dev,
-				"%s: task complete with BUSY status.\n",
-				"HP SSD Smart Path");
 			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_RES_CON:
-			dev_warn(&h->pdev->dev,
-				"%s: task complete with reservation conflict.\n",
-				"HP SSD Smart Path");
 			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_SET_FULL:
 			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_ABORTED:
-			dev_warn(&h->pdev->dev,
-				"%s: task complete with aborted status.\n",
-				"HP SSD Smart Path");
 			retry = 1;
 			break;
 		default:
-			dev_warn(&h->pdev->dev,
-				"%s: task complete with unrecognized status: 0x%02x\n",
-				"HP SSD Smart Path", c2->error_data.status);
 			retry = 1;
 			break;
 		}
@@ -1639,9 +1624,6 @@ static int handle_ioaccel_mode2_error(struct ctlr_info *h,
 			break;
 		default:
 			retry = 1;
-			dev_warn(&h->pdev->dev,
-				"unexpected delivery or target failure, status = 0x%02x\n",
-				c2->error_data.status);
 		}
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_COMPLETE:
@@ -1649,17 +1631,11 @@ static int handle_ioaccel_mode2_error(struct ctlr_info *h,
 	case IOACCEL2_SERV_RESPONSE_TMF_SUCCESS:
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_REJECTED:
-		dev_warn(&h->pdev->dev, "task management function rejected.\n");
 		retry = 1;
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_WRONG_LUN:
-		dev_warn(&h->pdev->dev, "task management function invalid LUN\n");
 		break;
 	default:
-		dev_warn(&h->pdev->dev,
-			"%s: Unrecognized server response: 0x%02x\n",
-			"HP SSD Smart Path",
-			c2->error_data.serv_response);
 		retry = 1;
 		break;
 	}
