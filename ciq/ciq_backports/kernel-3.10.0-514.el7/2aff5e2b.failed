@@ -1,0 +1,126 @@
+tty: Change tty lock order to master->slave
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [tty] Change tty lock order to master->slave ("Herton R. Krzesinski") [1327403]
+Rebuild_FUZZ: 93.83%
+commit-author Peter Hurley <peter@hurleysoftware.com>
+commit 2aff5e2bc62db43e05c814461a08aff0fc2b7fe5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2aff5e2b.failed
+
+When releasing the master pty, the slave pty also needs to be locked
+to prevent concurrent tty count changes for the slave pty and to
+ensure that only one parallel master and slave release observe the
+final close, and proceed to destruct the pty pair. Conversely, when
+releasing the slave pty, locking the master pty is not necessary
+(since the master's state can be inferred by the slave tty count).
+
+Introduce tty_lock_slave()/tty_unlock_slave() which acquires/releases
+the tty lock of the slave pty. Remove tty_lock_pair()/tty_unlock_pair().
+
+Dropping the tty_lock is no longer required to re-establish a stable
+lock order.
+
+	Reviewed-by: Alan Cox <alan@linux.intel.com>
+	Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2aff5e2bc62db43e05c814461a08aff0fc2b7fe5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/tty_io.c
+diff --cc drivers/tty/tty_io.c
+index 0a6b0d03b356,4ecee2856ece..000000000000
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@@ -1826,8 -1879,10 +1826,15 @@@ int tty_release(struct inode *inode, st
+  	/* check whether both sides are closing ... */
+  	final = !tty->count && !(o_tty && o_tty->count);
+  
+++<<<<<<< HEAD
+ +	tty_unlock_pair(tty, o_tty);
+ +	/* At this point the TTY_CLOSING flag should ensure a dead tty
+++=======
++ 	tty_unlock_slave(o_tty);
++ 	tty_unlock(tty);
++ 
++ 	/* At this point, the tty->count == 0 should ensure a dead tty
+++>>>>>>> 2aff5e2bc62d (tty: Change tty lock order to master->slave)
+  	   cannot be re-opened by a racing opener */
+  
+  	if (!final)
+* Unmerged path drivers/tty/tty_io.c
+diff --git a/drivers/tty/tty_mutex.c b/drivers/tty/tty_mutex.c
+index 2e41abebbcba..f43e995c7a0f 100644
+--- a/drivers/tty/tty_mutex.c
++++ b/drivers/tty/tty_mutex.c
+@@ -4,6 +4,11 @@
+ #include <linux/semaphore.h>
+ #include <linux/sched.h>
+ 
++/*
++ * Nested tty locks are necessary for releasing pty pairs.
++ * The stable lock order is master pty first, then slave pty.
++ */
++
+ /* Legacy tty mutex glue */
+ 
+ enum {
+@@ -45,29 +50,18 @@ void __lockfunc tty_unlock(struct tty_struct *tty)
+ }
+ EXPORT_SYMBOL(tty_unlock);
+ 
+-/*
+- * Getting the big tty mutex for a pair of ttys with lock ordering
+- * On a non pty/tty pair tty2 can be NULL which is just fine.
+- */
+-void __lockfunc tty_lock_pair(struct tty_struct *tty,
+-					struct tty_struct *tty2)
++void __lockfunc tty_lock_slave(struct tty_struct *tty)
+ {
+-	if (tty < tty2) {
+-		tty_lock(tty);
+-		tty_lock_nested(tty2, TTY_MUTEX_NESTED);
+-	} else {
+-		if (tty2 && tty2 != tty)
+-			tty_lock(tty2);
++	if (tty && tty != tty->link) {
++		WARN_ON(!mutex_is_locked(&tty->link->legacy_mutex) ||
++			!tty->driver->type == TTY_DRIVER_TYPE_PTY ||
++			!tty->driver->type == PTY_TYPE_SLAVE);
+ 		tty_lock_nested(tty, TTY_MUTEX_NESTED);
+ 	}
+ }
+-EXPORT_SYMBOL(tty_lock_pair);
+ 
+-void __lockfunc tty_unlock_pair(struct tty_struct *tty,
+-						struct tty_struct *tty2)
++void __lockfunc tty_unlock_slave(struct tty_struct *tty)
+ {
+-	tty_unlock(tty);
+-	if (tty2 && tty2 != tty)
+-		tty_unlock(tty2);
++	if (tty && tty != tty->link)
++		tty_unlock(tty);
+ }
+-EXPORT_SYMBOL(tty_unlock_pair);
+diff --git a/include/linux/tty.h b/include/linux/tty.h
+index 47ea59da6369..d6337df847c3 100644
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -624,11 +624,8 @@ extern long vt_compat_ioctl(struct tty_struct *tty,
+ /* functions for preparation of BKL removal */
+ extern void __lockfunc tty_lock(struct tty_struct *tty);
+ extern void __lockfunc tty_unlock(struct tty_struct *tty);
+-extern void __lockfunc tty_lock_pair(struct tty_struct *tty,
+-				struct tty_struct *tty2);
+-extern void __lockfunc tty_unlock_pair(struct tty_struct *tty,
+-				struct tty_struct *tty2);
+-
++extern void __lockfunc tty_lock_slave(struct tty_struct *tty);
++extern void __lockfunc tty_unlock_slave(struct tty_struct *tty);
+ /*
+  * this shall be called only from where BTM is held (like close)
+  *
