@@ -6042,6 +6042,12 @@ static int handle_vmclear(struct kvm_vcpu *vcpu)
 		return 1;
 	}
 
+	if (vmptr == vmx->nested.vmxon_ptr) {
+		nested_vmx_failValid(vcpu, VMXERR_VMCLEAR_VMXON_POINTER);
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
+
 	if (vmptr == vmx->nested.current_vmptr) {
 		nested_release_vmcs12(vmx);
 		vmx->nested.current_vmptr = -1ull;
@@ -6381,6 +6387,12 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
 
 	if (!IS_ALIGNED(vmptr, PAGE_SIZE)) {
 		nested_vmx_failValid(vcpu, VMXERR_VMPTRLD_INVALID_ADDRESS);
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
+
+	if (vmptr == vmx->nested.vmxon_ptr) {
+		nested_vmx_failValid(vcpu, VMXERR_VMCLEAR_VMXON_POINTER);
 		skip_emulated_instruction(vcpu);
 		return 1;
 	}
