@@ -1,0 +1,284 @@
+KEYS: Fix keyring content gc scanner
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 62fe318256befbd1b4a6765e71d9c997f768fe79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/62fe3182.failed
+
+Key pointers stored in the keyring are marked in bit 1 to indicate if they
+point to a keyring.  We need to strip off this bit before using the pointer
+when iterating over the keyring for the purpose of looking for links to garbage
+collect.
+
+This means that expirable keyrings aren't correctly expiring because the
+checker is seeing their key pointer with 2 added to it.
+
+Since the fix for this involves knowing about the internals of the keyring,
+key_gc_keyring() is moved to keyring.c and merged into keyring_gc().
+
+This can be tested by:
+
+	echo 2 >/proc/sys/kernel/keys/gc_delay
+	keyctl timeout `keyctl add keyring qwerty "" @s` 2
+	cat /proc/keys
+	sleep 5; cat /proc/keys
+
+which should see a keyring called "qwerty" appear in the session keyring and
+then disappear after it expires, and:
+
+	echo 2 >/proc/sys/kernel/keys/gc_delay
+	a=`keyctl get_persistent @s`
+	b=`keyctl add keyring 0 "" $a`
+	keyctl add user a a $b
+	keyctl timeout $b 2
+	cat /proc/keys
+	sleep 5; cat /proc/keys
+
+which should see a keyring called "0" with a key called "a" in it appear in the
+user's persistent keyring (which will be attached to the session keyring) and
+then both the "0" keyring and the "a" key should disappear when the "0" keyring
+expires.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Acked-by: Simo Sorce <simo@redhat.com>
+(cherry picked from commit 62fe318256befbd1b4a6765e71d9c997f768fe79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/keys/gc.c
+#	security/keys/keyring.c
+diff --cc security/keys/gc.c
+index d67c97bb1025,d3222b6d7d59..000000000000
+--- a/security/keys/gc.c
++++ b/security/keys/gc.c
+@@@ -130,50 -130,6 +130,53 @@@ void key_gc_keytype(struct key_type *kt
+  	kleave("");
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Garbage collect pointers from a keyring.
+ + *
+ + * Not called with any locks held.  The keyring's key struct will not be
+ + * deallocated under us as only our caller may deallocate it.
+ + */
+ +static void key_gc_keyring(struct key *keyring, time_t limit)
+ +{
+ +	struct keyring_list *klist;
+ +	int loop;
+ +
+ +	kenter("%x", key_serial(keyring));
+ +
+ +	if (keyring->flags & ((1 << KEY_FLAG_INVALIDATED) |
+ +			      (1 << KEY_FLAG_REVOKED)))
+ +		goto dont_gc;
+ +
+ +	/* scan the keyring looking for dead keys */
+ +	rcu_read_lock();
+ +	klist = rcu_dereference(keyring->payload.subscriptions);
+ +	if (!klist)
+ +		goto unlock_dont_gc;
+ +
+ +	loop = klist->nkeys;
+ +	smp_rmb();
+ +	for (loop--; loop >= 0; loop--) {
+ +		struct key *key = rcu_dereference(klist->keys[loop]);
+ +		if (key_is_dead(key, limit))
+ +			goto do_gc;
+ +	}
+ +
+ +unlock_dont_gc:
+ +	rcu_read_unlock();
+ +dont_gc:
+ +	kleave(" [no gc]");
+ +	return;
+ +
+ +do_gc:
+ +	rcu_read_unlock();
+ +
+ +	keyring_gc(keyring, limit);
+ +	kleave(" [gc]");
+ +}
+ +
+++=======
+++>>>>>>> 62fe318256be (KEYS: Fix keyring content gc scanner)
+  /*
+   * Garbage collect a list of unreferenced, detached keys
+   */
+@@@ -392,8 -348,7 +395,12 @@@ found_unreferenced_key
+  	 */
+  found_keyring:
+  	spin_unlock(&key_serial_lock);
+++<<<<<<< HEAD
+ +	kdebug("scan keyring %d", key->serial);
+ +	key_gc_keyring(key, limit);
+++=======
++ 	keyring_gc(key, limit);
+++>>>>>>> 62fe318256be (KEYS: Fix keyring content gc scanner)
+  	goto maybe_resched;
+  
+  	/* We found a dead key that is still referenced.  Reset its type and
+diff --cc security/keys/keyring.c
+index eeef1a073db4,69f0cb7bab7e..000000000000
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@@ -1181,98 -1304,58 +1181,149 @@@ static void keyring_revoke(struct key *
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool keyring_gc_select_iterator(void *object, void *iterator_data)
++ {
++ 	struct key *key = keyring_ptr_to_key(object);
++ 	time_t *limit = iterator_data;
++ 
++ 	if (key_is_dead(key, *limit))
++ 		return false;
++ 	key_get(key);
++ 	return true;
++ }
++ 
++ static int keyring_gc_check_iterator(const void *object, void *iterator_data)
++ {
++ 	const struct key *key = keyring_ptr_to_key(object);
++ 	time_t *limit = iterator_data;
++ 
++ 	key_check(key);
++ 	return key_is_dead(key, *limit);
++ }
++ 
+++>>>>>>> 62fe318256be (KEYS: Fix keyring content gc scanner)
+  /*
+-  * Collect garbage from the contents of a keyring, replacing the old list with
+-  * a new one with the pointers all shuffled down.
++  * Garbage collect pointers from a keyring.
+   *
+-  * Dead keys are classed as oned that are flagged as being dead or are revoked,
+-  * expired or negative keys that were revoked or expired before the specified
+-  * limit.
++  * Not called with any locks held.  The keyring's key struct will not be
++  * deallocated under us as only our caller may deallocate it.
+   */
+  void keyring_gc(struct key *keyring, time_t limit)
+  {
+++<<<<<<< HEAD
+ +	struct keyring_list *klist, *new;
+ +	struct key *key;
+ +	int loop, keep, max;
+ +
+ +	kenter("{%x,%s}", key_serial(keyring), keyring->description);
+++=======
++ 	int result;
+++>>>>>>> 62fe318256be (KEYS: Fix keyring content gc scanner)
+  
++ 	kenter("%x{%s}", keyring->serial, keyring->description ?: "");
++ 
++ 	if (keyring->flags & ((1 << KEY_FLAG_INVALIDATED) |
++ 			      (1 << KEY_FLAG_REVOKED)))
++ 		goto dont_gc;
++ 
++ 	/* scan the keyring looking for dead keys */
++ 	rcu_read_lock();
++ 	result = assoc_array_iterate(&keyring->keys,
++ 				     keyring_gc_check_iterator, &limit);
++ 	rcu_read_unlock();
++ 	if (result == true)
++ 		goto do_gc;
++ 
++ dont_gc:
++ 	kleave(" [no gc]");
++ 	return;
++ 
++ do_gc:
+  	down_write(&keyring->sem);
+++<<<<<<< HEAD
+ +
+ +	klist = rcu_dereference_locked_keyring(keyring);
+ +	if (!klist)
+ +		goto no_klist;
+ +
+ +	/* work out how many subscriptions we're keeping */
+ +	keep = 0;
+ +	for (loop = klist->nkeys - 1; loop >= 0; loop--)
+ +		if (!key_is_dead(rcu_deref_link_locked(klist, loop, keyring),
+ +				 limit))
+ +			keep++;
+ +
+ +	if (keep == klist->nkeys)
+ +		goto just_return;
+ +
+ +	/* allocate a new keyring payload */
+ +	max = roundup(keep, 4);
+ +	new = kmalloc(sizeof(struct keyring_list) + max * sizeof(struct key *),
+ +		      GFP_KERNEL);
+ +	if (!new)
+ +		goto nomem;
+ +	new->maxkeys = max;
+ +	new->nkeys = 0;
+ +	new->delkey = 0;
+ +
+ +	/* install the live keys
+ +	 * - must take care as expired keys may be updated back to life
+ +	 */
+ +	keep = 0;
+ +	for (loop = klist->nkeys - 1; loop >= 0; loop--) {
+ +		key = rcu_deref_link_locked(klist, loop, keyring);
+ +		if (!key_is_dead(key, limit)) {
+ +			if (keep >= max)
+ +				goto discard_new;
+ +			RCU_INIT_POINTER(new->keys[keep++], key_get(key));
+ +		}
+ +	}
+ +	new->nkeys = keep;
+ +
+ +	/* adjust the quota */
+ +	key_payload_reserve(keyring,
+ +			    sizeof(struct keyring_list) +
+ +			    KEYQUOTA_LINK_BYTES * keep);
+ +
+ +	if (keep == 0) {
+ +		rcu_assign_pointer(keyring->payload.subscriptions, NULL);
+ +		kfree(new);
+ +	} else {
+ +		rcu_assign_pointer(keyring->payload.subscriptions, new);
+ +	}
+ +
+ +	up_write(&keyring->sem);
+ +
+ +	call_rcu(&klist->rcu, keyring_clear_rcu_disposal);
+ +	kleave(" [yes]");
+ +	return;
+ +
+ +discard_new:
+ +	new->nkeys = keep;
+ +	keyring_clear_rcu_disposal(&new->rcu);
+ +	up_write(&keyring->sem);
+ +	kleave(" [discard]");
+ +	return;
+ +
+ +just_return:
+ +	up_write(&keyring->sem);
+ +	kleave(" [no dead]");
+ +	return;
+ +
+ +no_klist:
+ +	up_write(&keyring->sem);
+ +	kleave(" [no_klist]");
+ +	return;
+ +
+ +nomem:
+ +	up_write(&keyring->sem);
+ +	kleave(" [oom]");
+++=======
++ 	assoc_array_gc(&keyring->keys, &keyring_assoc_array_ops,
++ 		       keyring_gc_select_iterator, &limit);
++ 	up_write(&keyring->sem);
++ 	kleave(" [gc]");
+++>>>>>>> 62fe318256be (KEYS: Fix keyring content gc scanner)
+  }
+* Unmerged path security/keys/gc.c
+* Unmerged path security/keys/keyring.c
