@@ -889,6 +889,7 @@ static void xs_reset_transport(struct sock_xprt *transport)
 	sk->sk_user_data = NULL;
 
 	xs_restore_old_callbacks(transport, sk);
+	xprt_clear_connected(xprt);
 	write_unlock_bh(&sk->sk_callback_lock);
 
 	trace_rpc_socket_close(&transport->xprt, sock);
