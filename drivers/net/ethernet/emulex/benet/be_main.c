@@ -122,7 +122,6 @@ static const char * const ue_status_hi_desc[] = {
 	"Unknown"
 };
 
-
 static void be_queue_free(struct be_adapter *adapter, struct be_queue_info *q)
 {
 	struct be_dma_mem *mem = &q->dma_mem;
@@ -1442,7 +1441,6 @@ static void be_eqd_update(struct be_adapter *adapter)
 			start = u64_stats_fetch_begin_bh(&txo->stats.sync);
 			tx_pkts = txo->stats.tx_reqs;
 		} while (u64_stats_fetch_retry_bh(&txo->stats.sync, start));
-
 
 		/* Skip, if wrapped around or first calculation */
 		now = jiffies;
