@@ -114,7 +114,8 @@ static void build_data_key(struct dm_thin_device *td,
 {
 	key->virtual = 0;
 	key->dev = dm_thin_dev_id(td);
-	key->block = b;
+	key->block_begin = b;
+	key->block_end = b + 1ULL;
 }
 
 static void build_virtual_key(struct dm_thin_device *td, dm_block_t b,
@@ -122,7 +123,8 @@ static void build_virtual_key(struct dm_thin_device *td, dm_block_t b,
 {
 	key->virtual = 1;
 	key->dev = dm_thin_dev_id(td);
-	key->block = b;
+	key->block_begin = b;
+	key->block_end = b + 1ULL;
 }
 
 /*----------------------------------------------------------------*/
