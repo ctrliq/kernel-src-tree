@@ -1,0 +1,204 @@
+Drivers: hv: vmbus: Perform device register in the per-channel work element
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: Perform device register in the per-channel work element (Vitaly Kuznetsov) [1203682]
+Rebuild_FUZZ: 90.51%
+commit-author K. Y. Srinivasan <kys@microsoft.com>
+commit fde25d25dbd997067058f7d4c2ff31600157e6f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fde25d25.failed
+
+This patch is a continuation of the rescind handling cleanup work. We cannot
+block in the global message handling work context especially if we are blocking
+waiting for the host to wake us up. I would like to thank
+Dexuan Cui <decui@microsoft.com> for observing this problem.
+
+The current char-next branch is broken and this patch fixes
+the bug.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit fde25d25dbd997067058f7d4c2ff31600157e6f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel_mgmt.c
+diff --cc drivers/hv/channel_mgmt.c
+index f9943186ea53,5f8e47bf5ccc..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -134,6 -139,20 +139,23 @@@ fw_error
+  
+  EXPORT_SYMBOL_GPL(vmbus_prep_negotiate_resp);
+  
+++<<<<<<< HEAD
+++=======
++ static void vmbus_sc_creation_cb(struct work_struct *work)
++ {
++ 	struct vmbus_channel *newchannel = container_of(work,
++ 							struct vmbus_channel,
++ 							work);
++ 	struct vmbus_channel *primary_channel = newchannel->primary_channel;
++ 
++ 	/*
++ 	 * On entry sc_creation_callback has been already verified to
++ 	 * be non-NULL.
++ 	 */
++ 	primary_channel->sc_creation_callback(newchannel);
++ }
++ 
+++>>>>>>> fde25d25dbd9 (Drivers: hv: vmbus: Perform device register in the per-channel work element)
+  /*
+   * alloc_channel - Allocate and initialize a vmbus channel object
+   */
+@@@ -276,12 -356,8 +372,11 @@@ static void vmbus_process_offer(struct 
+  	struct vmbus_channel *channel;
+  	bool fnew = true;
+  	bool enq = false;
+- 	int ret;
+  	unsigned long flags;
+  
+ +	/* The next possible work is rescind handling */
+ +	INIT_WORK(&newchannel->work, vmbus_process_rescind_offer);
+ +
+  	/* Make sure this is a new offer */
+  	spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+  
+@@@ -370,20 -457,29 +465,29 @@@
+  	 * Add the new device to the bus. This will kick off device-driver
+  	 * binding which eventually invokes the device driver's AddDevice()
+  	 * method.
++ 	 * Invoke this call on the per-channel work context.
++ 	 * Until we return from this function, rescind offer message
++ 	 * cannot be processed as we are running on the global message
++ 	 * handling work.
+  	 */
+++<<<<<<< HEAD
+ +	ret = vmbus_device_register(newchannel->device_obj);
+ +	if (ret != 0) {
+ +		pr_err("unable to add child device object (relid %d)\n",
+ +			   newchannel->offermsg.child_relid);
+ +
+ +		spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+ +		list_del(&newchannel->listentry);
+ +		spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ +		kfree(newchannel->device_obj);
+ +		goto err_free_chan;
+ +	}
+ +out:
+++=======
++ 	INIT_WORK(&newchannel->work, vmbus_do_device_register);
++ 	queue_work(newchannel->controlwq, &newchannel->work);
+++>>>>>>> fde25d25dbd9 (Drivers: hv: vmbus: Perform device register in the per-channel work element)
+  	return;
+ -
+ -err_deq_chan:
+ -	spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+ -	list_del(&newchannel->listentry);
+ -	spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ -
+ -	if (newchannel->target_cpu != get_cpu()) {
+ -		put_cpu();
+ -		smp_call_function_single(newchannel->target_cpu,
+ -					 percpu_channel_deq, newchannel, true);
+ -	} else {
+ -		percpu_channel_deq(newchannel);
+ -		put_cpu();
+ -	}
+ -
+  err_free_chan:
+  	free_channel(newchannel);
+  }
+@@@ -520,19 -617,31 +624,41 @@@ static void vmbus_onoffer_rescind(struc
+  {
+  	struct vmbus_channel_rescind_offer *rescind;
+  	struct vmbus_channel *channel;
+++<<<<<<< HEAD
+++=======
++ 	struct vmbus_rescind_work *rc_work;
+++>>>>>>> fde25d25dbd9 (Drivers: hv: vmbus: Perform device register in the per-channel work element)
+  
+  	rescind = (struct vmbus_channel_rescind_offer *)hdr;
+- 	channel = relid2channel(rescind->child_relid);
++ 	channel = relid2channel(rescind->child_relid, true);
+  
+ -	if (channel == NULL) {
+ -		hv_process_channel_removal(NULL, rescind->child_relid);
+ +	if (channel == NULL)
+ +		/* Just return here, no channel found */
+  		return;
+ -	}
+  
+++<<<<<<< HEAD
+ +	channel->rescind = true;
+ +
+ +	/* work is initialized for vmbus_process_rescind_offer() from
+ +	 * vmbus_process_offer() where the channel got created */
+ +	queue_work(channel->controlwq, &channel->work);
+++=======
++ 	/*
++ 	 * We have acquired a reference on the channel and have posted
++ 	 * the rescind state. Perform further cleanup in a work context
++ 	 * that is different from the global work context in which
++ 	 * we process messages from the host (we are currently executing
++ 	 * on that global context.
++ 	 */
++ 	rc_work = kzalloc(sizeof(struct vmbus_rescind_work), GFP_KERNEL);
++ 	if (!rc_work) {
++ 		pr_err("Unable to allocate memory for rescind processing ");
++ 		return;
++ 	}
++ 	rc_work->channel = channel;
++ 	INIT_WORK(&rc_work->work, process_rescind_fn);
++ 	schedule_work(&rc_work->work);
+++>>>>>>> fde25d25dbd9 (Drivers: hv: vmbus: Perform device register in the per-channel work element)
+  }
+  
+  /*
+* Unmerged path drivers/hv/channel_mgmt.c
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index cad8295c2bdf..f0b4283c7cbb 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -262,7 +262,7 @@ static struct vmbus_channel *pcpu_relid2channel(u32 relid)
+  * relid2channel - Get the channel object given its
+  * child relative id (ie channel id)
+  */
+-struct vmbus_channel *relid2channel(u32 relid)
++struct vmbus_channel *relid2channel(u32 relid, bool rescind)
+ {
+ 	struct vmbus_channel *channel;
+ 	struct vmbus_channel *found_channel  = NULL;
+@@ -274,6 +274,8 @@ struct vmbus_channel *relid2channel(u32 relid)
+ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
+ 		if (channel->offermsg.child_relid == relid) {
+ 			found_channel = channel;
++			if (rescind)
++				found_channel->rescind = true;
+ 			break;
+ 		} else if (!list_empty(&channel->sc_list)) {
+ 			/*
+@@ -284,6 +286,8 @@ struct vmbus_channel *relid2channel(u32 relid)
+ 							sc_list);
+ 				if (cur_sc->offermsg.child_relid == relid) {
+ 					found_channel = cur_sc;
++					if (rescind)
++						found_channel->rescind = true;
+ 					break;
+ 				}
+ 			}
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index b5e790856f6e..570048870fa7 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -653,7 +653,7 @@ void vmbus_device_unregister(struct hv_device *device_obj);
+ /* VmbusChildDeviceDestroy( */
+ /* struct hv_device *); */
+ 
+-struct vmbus_channel *relid2channel(u32 relid);
++struct vmbus_channel *relid2channel(u32 relid, bool rescind);
+ 
+ void vmbus_free_channels(void);
+ 
