@@ -1,0 +1,120 @@
+NFS41: make close wait for layoutreturn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit 500d701f336b2771d34e46da7875a4782515a652
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/500d701f.failed
+
+If we send a layoutreturn asynchronously before close, the close
+might reach server first and layoutreturn would fail with BADSTATEID
+because there is nothing keeping the layout stateid alive.
+
+Also do not pretend sending layoutreturn if we are not.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 500d701f336b2771d34e46da7875a4782515a652)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index 10a72bf50e44,8abe27165ad0..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1081,10 -1104,17 +1081,24 @@@ bool pnfs_roc(struct inode *ino
+  			mark_lseg_invalid(lseg, &tmp_list);
+  			found = true;
+  		}
+++<<<<<<< HEAD
+ +	if (!found)
+ +		goto out_nolayout;
+ +	lo->plh_block_lgets++;
+ +	pnfs_get_layout_hdr(lo); /* matched in pnfs_roc_release */
+++=======
++ 	/* ROC in two conditions:
++ 	 * 1. there are ROC lsegs
++ 	 * 2. we don't send layoutreturn
++ 	 */
++ 	if (found && !layoutreturn) {
++ 		/* lo ref dropped in pnfs_roc_release() */
++ 		pnfs_get_layout_hdr(lo);
++ 		roc = true;
++ 	}
++ 
++ out_noroc:
+++>>>>>>> 500d701f336b (NFS41: make close wait for layoutreturn)
+  	spin_unlock(&ino->i_lock);
+  	pnfs_free_lseg_list(&tmp_list);
+  	pnfs_layoutcommit_inode(ino, true);
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 2009ca8465d0..fc4cbef1b483 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2660,6 +2660,15 @@ out:
+ 	return err;
+ }
+ 
++static bool
++nfs4_wait_on_layoutreturn(struct inode *inode, struct rpc_task *task)
++{
++	if (inode == NULL || !nfs_have_layout(inode))
++		return false;
++
++	return pnfs_wait_on_layoutreturn(inode, task);
++}
++
+ struct nfs4_closedata {
+ 	struct inode *inode;
+ 	struct nfs4_state *state;
+@@ -2778,6 +2787,11 @@ static void nfs4_close_prepare(struct rpc_task *task, void *data)
+ 		goto out_no_action;
+ 	}
+ 
++	if (nfs4_wait_on_layoutreturn(inode, task)) {
++		nfs_release_seqid(calldata->arg.seqid);
++		goto out_wait;
++	}
++
+ 	if (calldata->arg.fmode == 0)
+ 		task->tk_msg.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_CLOSE];
+ 	if (calldata->roc)
+@@ -5292,6 +5306,9 @@ static void nfs4_delegreturn_prepare(struct rpc_task *task, void *data)
+ 
+ 	d_data = (struct nfs4_delegreturndata *)data;
+ 
++	if (nfs4_wait_on_layoutreturn(d_data->inode, task))
++		return;
++
+ 	if (d_data->roc)
+ 		pnfs_roc_get_barrier(d_data->inode, &d_data->roc_barrier);
+ 
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 36a0c1c82c9e..4c62c961f026 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -269,6 +269,7 @@ bool pnfs_roc(struct inode *ino);
+ void pnfs_roc_release(struct inode *ino);
+ void pnfs_roc_set_barrier(struct inode *ino, u32 barrier);
+ void pnfs_roc_get_barrier(struct inode *ino, u32 *barrier);
++bool pnfs_wait_on_layoutreturn(struct inode *ino, struct rpc_task *task);
+ void pnfs_set_layoutcommit(struct inode *, struct pnfs_layout_segment *, loff_t);
+ void pnfs_cleanup_layoutcommit(struct nfs4_layoutcommit_data *data);
+ int pnfs_layoutcommit_inode(struct inode *inode, bool sync);
+@@ -610,6 +611,12 @@ pnfs_roc_get_barrier(struct inode *ino, u32 *barrier)
+ {
+ }
+ 
++static inline bool
++pnfs_wait_on_layoutreturn(struct inode *ino, struct rpc_task *task)
++{
++	return false;
++}
++
+ static inline void set_pnfs_layoutdriver(struct nfs_server *s,
+ 					 const struct nfs_fh *mntfh, u32 id)
+ {
