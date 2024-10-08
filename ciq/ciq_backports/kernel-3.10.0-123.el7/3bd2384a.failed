@@ -1,0 +1,236 @@
+NFS: NFSv4.0 transport blocking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3bd2384a77e7b277c1fd8dd4ebb071162e2d85b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/3bd2384a.failed
+
+Plumb in a mechanism for plugging an NFSv4.0 mount, using the
+same infrastructure as NFSv4.1 sessions.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit 3bd2384a77e7b277c1fd8dd4ebb071162e2d85b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 4a607cc0bde4,e9e58cc34c61..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -401,6 -469,82 +401,85 @@@ struct nfs4_call_sync_data 
+  	struct nfs4_sequence_res *seq_res;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void nfs4_init_sequence(struct nfs4_sequence_args *args,
++ 			       struct nfs4_sequence_res *res, int cache_reply)
++ {
++ 	args->sa_slot = NULL;
++ 	args->sa_cache_this = cache_reply;
++ 	args->sa_privileged = 0;
++ 
++ 	res->sr_slot = NULL;
++ }
++ 
++ static void nfs4_set_sequence_privileged(struct nfs4_sequence_args *args)
++ {
++ 	args->sa_privileged = 1;
++ }
++ 
++ static int nfs40_setup_sequence(const struct nfs_server *server,
++ 				struct nfs4_sequence_args *args,
++ 				struct nfs4_sequence_res *res,
++ 				struct rpc_task *task)
++ {
++ 	struct nfs4_slot_table *tbl = server->nfs_client->cl_slot_tbl;
++ 	struct nfs4_slot *slot;
++ 
++ 	/* slot already allocated? */
++ 	if (res->sr_slot != NULL)
++ 		goto out_start;
++ 
++ 	spin_lock(&tbl->slot_tbl_lock);
++ 	if (nfs4_slot_tbl_draining(tbl) && !args->sa_privileged)
++ 		goto out_sleep;
++ 
++ 	slot = nfs4_alloc_slot(tbl);
++ 	if (IS_ERR(slot)) {
++ 		if (slot == ERR_PTR(-ENOMEM))
++ 			task->tk_timeout = HZ >> 2;
++ 		goto out_sleep;
++ 	}
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 
++ 	args->sa_slot = slot;
++ 	res->sr_slot = slot;
++ 
++ out_start:
++ 	rpc_call_start(task);
++ 	return 0;
++ 
++ out_sleep:
++ 	if (args->sa_privileged)
++ 		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
++ 				NULL, RPC_PRIORITY_PRIVILEGED);
++ 	else
++ 		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 	return -EAGAIN;
++ }
++ 
++ static int nfs40_sequence_done(struct rpc_task *task,
++ 			       struct nfs4_sequence_res *res)
++ {
++ 	struct nfs4_slot *slot = res->sr_slot;
++ 	struct nfs4_slot_table *tbl;
++ 
++ 	if (!RPC_WAS_SENT(task))
++ 		goto out;
++ 
++ 	tbl = slot->table;
++ 	spin_lock(&tbl->slot_tbl_lock);
++ 	if (!nfs41_wake_and_assign_slot(tbl, slot))
++ 		nfs4_free_slot(tbl, slot);
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 
++ 	res->sr_slot = NULL;
++ out:
++ 	return 1;
++ }
++ 
+++>>>>>>> 3bd2384a77e7 (NFS: NFSv4.0 transport blocking)
+  #if defined(CONFIG_NFS_V4_1)
+  
+  static void nfs41_sequence_free_slot(struct nfs4_sequence_res *res)
+@@@ -674,6 -802,42 +753,7 @@@ static const struct rpc_call_ops nfs41_
+  	.rpc_call_done = nfs41_call_sync_done,
+  };
+  
+ -#else	/* !CONFIG_NFS_V4_1 */
+ -
+ -static int nfs4_setup_sequence(const struct nfs_server *server,
+ -			       struct nfs4_sequence_args *args,
+ -			       struct nfs4_sequence_res *res,
+ -			       struct rpc_task *task)
+ -{
+ -	return nfs40_setup_sequence(server, args, res, task);
+ -}
+ -
+ -static int nfs4_sequence_done(struct rpc_task *task,
+ -			       struct nfs4_sequence_res *res)
+ -{
+ -	return nfs40_sequence_done(task, res);
+ -}
+ -
+ -#endif	/* !CONFIG_NFS_V4_1 */
+ -
+ -static void nfs40_call_sync_prepare(struct rpc_task *task, void *calldata)
+ -{
+ -	struct nfs4_call_sync_data *data = calldata;
+ -	nfs4_setup_sequence(data->seq_server,
+ -				data->seq_args, data->seq_res, task);
+ -}
+ -
+ -static void nfs40_call_sync_done(struct rpc_task *task, void *calldata)
+ -{
+ -	struct nfs4_call_sync_data *data = calldata;
+ -	nfs4_sequence_done(task, data->seq_res);
+ -}
+ -
+ -static const struct rpc_call_ops nfs40_call_sync_ops = {
+ -	.rpc_call_prepare = nfs40_call_sync_prepare,
+ -	.rpc_call_done = nfs40_call_sync_done,
+ -};
+ -
+++<<<<<<< HEAD
+  static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
+  				   struct nfs_server *server,
+  				   struct rpc_message *msg,
+@@@ -704,33 -869,6 +784,36 @@@
+  	return ret;
+  }
+  
+ +#else
+ +static
+ +void nfs41_init_sequence(struct nfs4_sequence_args *args,
+ +		struct nfs4_sequence_res *res, int cache_reply)
+ +{
+ +}
+ +
+ +static void nfs4_set_sequence_privileged(struct nfs4_sequence_args *args)
+ +{
+ +}
+++=======
+++#else	/* !CONFIG_NFS_V4_1 */
+++>>>>>>> 3bd2384a77e7 (NFS: NFSv4.0 transport blocking)
+ +
+ +static int nfs4_setup_sequence(const struct nfs_server *server,
+ +			       struct nfs4_sequence_args *args,
+ +			       struct nfs4_sequence_res *res,
+ +			       struct rpc_task *task)
+ +{
+- 	rpc_call_start(task);
+- 	return 0;
+++	return nfs40_setup_sequence(server, args, res, task);
+ +}
+ +
+ +static int nfs4_sequence_done(struct rpc_task *task,
+ +			       struct nfs4_sequence_res *res)
+ +{
+- 	return 1;
+++	return nfs40_sequence_done(task, res);
+ +}
+- #endif /* CONFIG_NFS_V4_1 */
+++
+++#endif	/* !CONFIG_NFS_V4_1 */
+ +
+  static
+  int nfs4_call_sync(struct rpc_clnt *clnt,
+  		   struct nfs_server *server,
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index 3e61ca343e00..594e69db47ae 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -1848,11 +1848,10 @@ static void encode_sequence(struct xdr_stream *xdr,
+ 	struct nfs4_slot *slot = args->sa_slot;
+ 	__be32 *p;
+ 
+-	if (slot == NULL)
+-		return;
+-
+ 	tp = slot->table;
+ 	session = tp->session;
++	if (!session)
++		return;
+ 
+ 	encode_op_hdr(xdr, OP_SEQUENCE, decode_sequence_maxsz, hdr);
+ 
+@@ -2033,9 +2032,9 @@ static void encode_free_stateid(struct xdr_stream *xdr,
+ static u32 nfs4_xdr_minorversion(const struct nfs4_sequence_args *args)
+ {
+ #if defined(CONFIG_NFS_V4_1)
+-
+-	if (args->sa_slot)
+-		return args->sa_slot->table->session->clp->cl_mvops->minor_version;
++	struct nfs4_session *session = args->sa_slot->table->session;
++	if (session)
++		return session->clp->cl_mvops->minor_version;
+ #endif /* CONFIG_NFS_V4_1 */
+ 	return 0;
+ }
+@@ -5521,6 +5520,8 @@ static int decode_sequence(struct xdr_stream *xdr,
+ 
+ 	if (res->sr_slot == NULL)
+ 		return 0;
++	if (!res->sr_slot->table->session)
++		return 0;
+ 
+ 	status = decode_op_hdr(xdr, OP_SEQUENCE);
+ 	if (!status)
