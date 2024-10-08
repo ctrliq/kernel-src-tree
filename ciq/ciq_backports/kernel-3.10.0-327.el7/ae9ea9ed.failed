@@ -1,0 +1,455 @@
+iser-target: Split some logic in isert_connect_request to routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [iser-target] Split some logic in isert_connect_request to routines (Andy Grover) [1136558 1185396]
+Rebuild_FUZZ: 89.08%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit ae9ea9ed38c9c8f6cf19c669d7b032cab3dadede
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ae9ea9ed.failed
+
+Move login buffer alloc/free code to dedicated
+routines and introduce isert_conn_init which
+initializes the connection lists and locks.
+
+Simplifies and cleans up the code a little bit.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit ae9ea9ed38c9c8f6cf19c669d7b032cab3dadede)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 6b6eb8b033b8,4fddc08f4ae5..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -389,14 -465,264 +389,267 @@@ isert_device_find_by_ib_dev(struct rdma
+  	return device;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ isert_conn_free_fastreg_pool(struct isert_conn *isert_conn)
++ {
++ 	struct fast_reg_descriptor *fr_desc, *tmp;
++ 	int i = 0;
++ 
++ 	if (list_empty(&isert_conn->conn_fr_pool))
++ 		return;
++ 
++ 	isert_info("Freeing conn %p fastreg pool", isert_conn);
++ 
++ 	list_for_each_entry_safe(fr_desc, tmp,
++ 				 &isert_conn->conn_fr_pool, list) {
++ 		list_del(&fr_desc->list);
++ 		ib_free_fast_reg_page_list(fr_desc->data_frpl);
++ 		ib_dereg_mr(fr_desc->data_mr);
++ 		if (fr_desc->pi_ctx) {
++ 			ib_free_fast_reg_page_list(fr_desc->pi_ctx->prot_frpl);
++ 			ib_dereg_mr(fr_desc->pi_ctx->prot_mr);
++ 			ib_destroy_mr(fr_desc->pi_ctx->sig_mr);
++ 			kfree(fr_desc->pi_ctx);
++ 		}
++ 		kfree(fr_desc);
++ 		++i;
++ 	}
++ 
++ 	if (i < isert_conn->conn_fr_pool_size)
++ 		isert_warn("Pool still has %d regions registered\n",
++ 			isert_conn->conn_fr_pool_size - i);
++ }
++ 
++ static int
++ isert_create_pi_ctx(struct fast_reg_descriptor *desc,
++ 		    struct ib_device *device,
++ 		    struct ib_pd *pd)
++ {
++ 	struct ib_mr_init_attr mr_init_attr;
++ 	struct pi_context *pi_ctx;
++ 	int ret;
++ 
++ 	pi_ctx = kzalloc(sizeof(*desc->pi_ctx), GFP_KERNEL);
++ 	if (!pi_ctx) {
++ 		isert_err("Failed to allocate pi context\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	pi_ctx->prot_frpl = ib_alloc_fast_reg_page_list(device,
++ 					    ISCSI_ISER_SG_TABLESIZE);
++ 	if (IS_ERR(pi_ctx->prot_frpl)) {
++ 		isert_err("Failed to allocate prot frpl err=%ld\n",
++ 			  PTR_ERR(pi_ctx->prot_frpl));
++ 		ret = PTR_ERR(pi_ctx->prot_frpl);
++ 		goto err_pi_ctx;
++ 	}
++ 
++ 	pi_ctx->prot_mr = ib_alloc_fast_reg_mr(pd, ISCSI_ISER_SG_TABLESIZE);
++ 	if (IS_ERR(pi_ctx->prot_mr)) {
++ 		isert_err("Failed to allocate prot frmr err=%ld\n",
++ 			  PTR_ERR(pi_ctx->prot_mr));
++ 		ret = PTR_ERR(pi_ctx->prot_mr);
++ 		goto err_prot_frpl;
++ 	}
++ 	desc->ind |= ISERT_PROT_KEY_VALID;
++ 
++ 	memset(&mr_init_attr, 0, sizeof(mr_init_attr));
++ 	mr_init_attr.max_reg_descriptors = 2;
++ 	mr_init_attr.flags |= IB_MR_SIGNATURE_EN;
++ 	pi_ctx->sig_mr = ib_create_mr(pd, &mr_init_attr);
++ 	if (IS_ERR(pi_ctx->sig_mr)) {
++ 		isert_err("Failed to allocate signature enabled mr err=%ld\n",
++ 			  PTR_ERR(pi_ctx->sig_mr));
++ 		ret = PTR_ERR(pi_ctx->sig_mr);
++ 		goto err_prot_mr;
++ 	}
++ 
++ 	desc->pi_ctx = pi_ctx;
++ 	desc->ind |= ISERT_SIG_KEY_VALID;
++ 	desc->ind &= ~ISERT_PROTECTED;
++ 
++ 	return 0;
++ 
++ err_prot_mr:
++ 	ib_dereg_mr(desc->pi_ctx->prot_mr);
++ err_prot_frpl:
++ 	ib_free_fast_reg_page_list(desc->pi_ctx->prot_frpl);
++ err_pi_ctx:
++ 	kfree(desc->pi_ctx);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ isert_create_fr_desc(struct ib_device *ib_device, struct ib_pd *pd,
++ 		     struct fast_reg_descriptor *fr_desc)
++ {
++ 	int ret;
++ 
++ 	fr_desc->data_frpl = ib_alloc_fast_reg_page_list(ib_device,
++ 							 ISCSI_ISER_SG_TABLESIZE);
++ 	if (IS_ERR(fr_desc->data_frpl)) {
++ 		isert_err("Failed to allocate data frpl err=%ld\n",
++ 			  PTR_ERR(fr_desc->data_frpl));
++ 		return PTR_ERR(fr_desc->data_frpl);
++ 	}
++ 
++ 	fr_desc->data_mr = ib_alloc_fast_reg_mr(pd, ISCSI_ISER_SG_TABLESIZE);
++ 	if (IS_ERR(fr_desc->data_mr)) {
++ 		isert_err("Failed to allocate data frmr err=%ld\n",
++ 			  PTR_ERR(fr_desc->data_mr));
++ 		ret = PTR_ERR(fr_desc->data_mr);
++ 		goto err_data_frpl;
++ 	}
++ 	fr_desc->ind |= ISERT_DATA_KEY_VALID;
++ 
++ 	isert_dbg("Created fr_desc %p\n", fr_desc);
++ 
++ 	return 0;
++ 
++ err_data_frpl:
++ 	ib_free_fast_reg_page_list(fr_desc->data_frpl);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ isert_conn_create_fastreg_pool(struct isert_conn *isert_conn)
++ {
++ 	struct fast_reg_descriptor *fr_desc;
++ 	struct isert_device *device = isert_conn->conn_device;
++ 	struct se_session *se_sess = isert_conn->conn->sess->se_sess;
++ 	struct se_node_acl *se_nacl = se_sess->se_node_acl;
++ 	int i, ret, tag_num;
++ 	/*
++ 	 * Setup the number of FRMRs based upon the number of tags
++ 	 * available to session in iscsi_target_locate_portal().
++ 	 */
++ 	tag_num = max_t(u32, ISCSIT_MIN_TAGS, se_nacl->queue_depth);
++ 	tag_num = (tag_num * 2) + ISCSIT_EXTRA_TAGS;
++ 
++ 	isert_conn->conn_fr_pool_size = 0;
++ 	for (i = 0; i < tag_num; i++) {
++ 		fr_desc = kzalloc(sizeof(*fr_desc), GFP_KERNEL);
++ 		if (!fr_desc) {
++ 			isert_err("Failed to allocate fast_reg descriptor\n");
++ 			ret = -ENOMEM;
++ 			goto err;
++ 		}
++ 
++ 		ret = isert_create_fr_desc(device->ib_device,
++ 					   device->pd, fr_desc);
++ 		if (ret) {
++ 			isert_err("Failed to create fastreg descriptor err=%d\n",
++ 			       ret);
++ 			kfree(fr_desc);
++ 			goto err;
++ 		}
++ 
++ 		list_add_tail(&fr_desc->list, &isert_conn->conn_fr_pool);
++ 		isert_conn->conn_fr_pool_size++;
++ 	}
++ 
++ 	isert_dbg("Creating conn %p fastreg pool size=%d",
++ 		 isert_conn, isert_conn->conn_fr_pool_size);
++ 
++ 	return 0;
++ 
++ err:
++ 	isert_conn_free_fastreg_pool(isert_conn);
++ 	return ret;
++ }
++ 
++ static void
++ isert_init_conn(struct isert_conn *isert_conn)
++ {
++ 	isert_conn->state = ISER_CONN_INIT;
++ 	INIT_LIST_HEAD(&isert_conn->conn_accept_node);
++ 	init_completion(&isert_conn->conn_login_comp);
++ 	init_completion(&isert_conn->login_req_comp);
++ 	init_completion(&isert_conn->conn_wait);
++ 	kref_init(&isert_conn->conn_kref);
++ 	mutex_init(&isert_conn->conn_mutex);
++ 	spin_lock_init(&isert_conn->conn_lock);
++ 	INIT_LIST_HEAD(&isert_conn->conn_fr_pool);
++ }
++ 
++ static void
++ isert_free_login_buf(struct isert_conn *isert_conn)
++ {
++ 	struct ib_device *ib_dev = isert_conn->conn_device->ib_device;
++ 
++ 	ib_dma_unmap_single(ib_dev, isert_conn->login_rsp_dma,
++ 			    ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
++ 	ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
++ 			    ISCSI_DEF_MAX_RECV_SEG_LEN,
++ 			    DMA_FROM_DEVICE);
++ 	kfree(isert_conn->login_buf);
++ }
++ 
++ static int
++ isert_alloc_login_buf(struct isert_conn *isert_conn,
++ 		      struct ib_device *ib_dev)
++ {
++ 	int ret;
++ 
++ 	isert_conn->login_buf = kzalloc(ISCSI_DEF_MAX_RECV_SEG_LEN +
++ 					ISER_RX_LOGIN_SIZE, GFP_KERNEL);
++ 	if (!isert_conn->login_buf) {
++ 		isert_err("Unable to allocate isert_conn->login_buf\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	isert_conn->login_req_buf = isert_conn->login_buf;
++ 	isert_conn->login_rsp_buf = isert_conn->login_buf +
++ 				    ISCSI_DEF_MAX_RECV_SEG_LEN;
++ 
++ 	isert_dbg("Set login_buf: %p login_req_buf: %p login_rsp_buf: %p\n",
++ 		 isert_conn->login_buf, isert_conn->login_req_buf,
++ 		 isert_conn->login_rsp_buf);
++ 
++ 	isert_conn->login_req_dma = ib_dma_map_single(ib_dev,
++ 				(void *)isert_conn->login_req_buf,
++ 				ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
++ 
++ 	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_req_dma);
++ 	if (ret) {
++ 		isert_err("login_req_dma mapping error: %d\n", ret);
++ 		isert_conn->login_req_dma = 0;
++ 		goto out_login_buf;
++ 	}
++ 
++ 	isert_conn->login_rsp_dma = ib_dma_map_single(ib_dev,
++ 					(void *)isert_conn->login_rsp_buf,
++ 					ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
++ 
++ 	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_rsp_dma);
++ 	if (ret) {
++ 		isert_err("login_rsp_dma mapping error: %d\n", ret);
++ 		isert_conn->login_rsp_dma = 0;
++ 		goto out_req_dma_map;
++ 	}
++ 
++ 	return 0;
++ 
++ out_req_dma_map:
++ 	ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
++ 			    ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
++ out_login_buf:
++ 	kfree(isert_conn->login_buf);
++ 	return ret;
++ }
++ 
+++>>>>>>> ae9ea9ed38c9 (iser-target: Split some logic in isert_connect_request to routines)
+  static int
+  isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+  {
+ -	struct isert_np *isert_np = cma_id->context;
+ -	struct iscsi_np *np = isert_np->np;
+ +	struct iscsi_np *np = cma_id->context;
+ +	struct isert_np *isert_np = np->np_context;
+  	struct isert_conn *isert_conn;
+  	struct isert_device *device;
+- 	struct ib_device *ib_dev = cma_id->device;
+  	int ret = 0;
+  
+  	spin_lock_bh(&np->np_thread_lock);
+@@@ -411,66 -737,17 +664,79 @@@
+  		 cma_id, cma_id->context);
+  
+  	isert_conn = kzalloc(sizeof(struct isert_conn), GFP_KERNEL);
+++<<<<<<< HEAD
+ +	if (!isert_conn) {
+ +		pr_err("Unable to allocate isert_conn\n");
+ +		return -ENOMEM;
+ +	}
+ +	isert_conn->state = ISER_CONN_INIT;
+ +	INIT_LIST_HEAD(&isert_conn->conn_accept_node);
+ +	init_completion(&isert_conn->conn_login_comp);
+ +	init_completion(&isert_conn->conn_wait);
+ +	init_completion(&isert_conn->conn_wait_comp_err);
+ +	kref_init(&isert_conn->conn_kref);
+ +	kref_get(&isert_conn->conn_kref);
+ +	mutex_init(&isert_conn->conn_mutex);
+ +
+ +	cma_id->context = isert_conn;
+++=======
++ 	if (!isert_conn)
++ 		return -ENOMEM;
++ 
++ 	isert_init_conn(isert_conn);
+++>>>>>>> ae9ea9ed38c9 (iser-target: Split some logic in isert_connect_request to routines)
+  	isert_conn->conn_cm_id = cma_id;
+ +	isert_conn->responder_resources = event->param.conn.responder_resources;
+ +	isert_conn->initiator_depth = event->param.conn.initiator_depth;
+ +	pr_debug("Using responder_resources: %u initiator_depth: %u\n",
+ +		 isert_conn->responder_resources, isert_conn->initiator_depth);
+ +
+++<<<<<<< HEAD
+ +	isert_conn->login_buf = kzalloc(ISCSI_DEF_MAX_RECV_SEG_LEN +
+ +					ISER_RX_LOGIN_SIZE, GFP_KERNEL);
+ +	if (!isert_conn->login_buf) {
+ +		pr_err("Unable to allocate isert_conn->login_buf\n");
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	isert_conn->login_req_buf = isert_conn->login_buf;
+ +	isert_conn->login_rsp_buf = isert_conn->login_buf +
+ +				    ISCSI_DEF_MAX_RECV_SEG_LEN;
+ +	pr_debug("Set login_buf: %p login_req_buf: %p login_rsp_buf: %p\n",
+ +		 isert_conn->login_buf, isert_conn->login_req_buf,
+ +		 isert_conn->login_rsp_buf);
+  
+ +	isert_conn->login_req_dma = ib_dma_map_single(ib_dev,
+ +				(void *)isert_conn->login_req_buf,
+ +				ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
+ +
+ +	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_req_dma);
+ +	if (ret) {
+ +		pr_err("ib_dma_mapping_error failed for login_req_dma: %d\n",
+ +		       ret);
+ +		isert_conn->login_req_dma = 0;
+ +		goto out_login_buf;
+ +	}
+ +
+ +	isert_conn->login_rsp_dma = ib_dma_map_single(ib_dev,
+ +					(void *)isert_conn->login_rsp_buf,
+ +					ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
+ +
+ +	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_rsp_dma);
+ +	if (ret) {
+ +		pr_err("ib_dma_mapping_error failed for login_rsp_dma: %d\n",
+ +		       ret);
+ +		isert_conn->login_rsp_dma = 0;
+ +		goto out_req_dma_map;
+ +	}
+++=======
++ 	ret = isert_alloc_login_buf(isert_conn, cma_id->device);
++ 	if (ret)
++ 		goto out;
+++>>>>>>> ae9ea9ed38c9 (iser-target: Split some logic in isert_connect_request to routines)
+  
+ -	device = isert_device_get(cma_id);
+ +	device = isert_device_find_by_ib_dev(cma_id);
+  	if (IS_ERR(device)) {
+  		ret = PTR_ERR(device);
+  		goto out_rsp_dma_map;
+@@@ -493,49 -781,39 +759,52 @@@
+  	return 0;
+  
+  out_conn_dev:
+ -	isert_device_put(device);
+ +	isert_device_try_release(device);
+  out_rsp_dma_map:
+- 	ib_dma_unmap_single(ib_dev, isert_conn->login_rsp_dma,
+- 			    ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
+- out_req_dma_map:
+- 	ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
+- 			    ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
+- out_login_buf:
+- 	kfree(isert_conn->login_buf);
++ 	isert_free_login_buf(isert_conn);
+  out:
+  	kfree(isert_conn);
+ -	rdma_reject(cma_id, NULL, 0);
+  	return ret;
+  }
+  
+  static void
+  isert_connect_release(struct isert_conn *isert_conn)
+  {
+ +	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
+  	struct isert_device *device = isert_conn->conn_device;
+++<<<<<<< HEAD
+ +	int cq_index;
+++=======
+++>>>>>>> ae9ea9ed38c9 (iser-target: Split some logic in isert_connect_request to routines)
+  
+ -	isert_dbg("conn %p\n", isert_conn);
+ -
+ -	if (device && device->use_fastreg)
+ -		isert_conn_free_fastreg_pool(isert_conn);
+ -
+ -	isert_free_rx_descriptors(isert_conn);
+ -	if (isert_conn->conn_cm_id)
+ -		rdma_destroy_id(isert_conn->conn_cm_id);
+ +	pr_debug("Entering isert_connect_release(): >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
+  
+  	if (isert_conn->conn_qp) {
+ -		struct isert_comp *comp = isert_conn->conn_qp->recv_cq->cq_context;
+ +		cq_index = ((struct isert_cq_desc *)
+ +			isert_conn->conn_qp->recv_cq->cq_context)->cq_index;
+ +		pr_debug("isert_connect_release: cq_index: %d\n", cq_index);
+ +		isert_conn->conn_device->cq_active_qps[cq_index]--;
+  
+ -		isert_comp_put(comp);
+ -		ib_destroy_qp(isert_conn->conn_qp);
+ +		rdma_destroy_qp(isert_conn->conn_cm_id);
+  	}
+  
+++<<<<<<< HEAD
+ +	isert_free_rx_descriptors(isert_conn);
+ +	rdma_destroy_id(isert_conn->conn_cm_id);
+ +
+ +	if (isert_conn->login_buf) {
+ +		ib_dma_unmap_single(ib_dev, isert_conn->login_rsp_dma,
+ +				    ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
+ +		ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
+ +				    ISCSI_DEF_MAX_RECV_SEG_LEN,
+ +				    DMA_FROM_DEVICE);
+ +		kfree(isert_conn->login_buf);
+ +	}
+++=======
++ 	if (isert_conn->login_buf)
++ 		isert_free_login_buf(isert_conn);
++ 
+++>>>>>>> ae9ea9ed38c9 (iser-target: Split some logic in isert_connect_request to routines)
+  	kfree(isert_conn);
+  
+  	if (device)
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
