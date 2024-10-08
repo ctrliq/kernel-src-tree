@@ -2893,7 +2893,7 @@ static int team_device_event(struct notifier_block *unused,
 	case NETDEV_FEAT_CHANGE:
 		team_compute_features(port->team);
 		break;
-	case NETDEV_CHANGEMTU:
+	case NETDEV_PRECHANGEMTU:
 		/* Forbid to change mtu of underlaying device */
 		if (!port->team->port_mtu_change_allowed)
 			return NOTIFY_BAD;
