@@ -1,0 +1,118 @@
+mm/vmstat: fix overflow in mod_zone_page_state()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] vmstat: fix overflow in mod_zone_page_state() (Hendrik Brueckner) [1334242]
+Rebuild_FUZZ: 96.77%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 6cdb18ad98a49f7e9b95d538a0614cde827404b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6cdb18ad.failed
+
+mod_zone_page_state() takes a "delta" integer argument.  delta contains
+the number of pages that should be added or subtracted from a struct
+zone's vm_stat field.
+
+If a zone is larger than 8TB this will cause overflows.  E.g.  for a
+zone with a size slightly larger than 8TB the line
+
+    mod_zone_page_state(zone, NR_ALLOC_BATCH, zone->managed_pages);
+
+in mm/page_alloc.c:free_area_init_core() will result in a negative
+result for the NR_ALLOC_BATCH entry within the zone's vm_stat, since 8TB
+contain 0x8xxxxxxx pages which will be sign extended to a negative
+value.
+
+Fix this by changing the delta argument to long type.
+
+This could fix an early boot problem seen on s390, where we have a 9TB
+system with only one node.  ZONE_DMA contains 2GB and ZONE_NORMAL the
+rest.  The system is trying to allocate a GFP_DMA page but ZONE_DMA is
+completely empty, so it tries to reclaim pages in an endless loop.
+
+This was seen on a heavily patched 3.10 kernel.  One possible
+explaination seem to be the overflows caused by mod_zone_page_state().
+Unfortunately I did not have the chance to verify that this patch
+actually fixes the problem, since I don't have access to the system
+right now.  However the overflow problem does exist anyway.
+
+Given the description that a system with slightly less than 8TB does
+work, this seems to be a candidate for the observed problem.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6cdb18ad98a49f7e9b95d538a0614cde827404b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/vmstat.h
+diff --cc include/linux/vmstat.h
+index 789f8d45fef2,3e5d9075960f..000000000000
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@@ -204,6 -200,16 +204,19 @@@ void set_pgdat_percpu_threshold(pg_data
+  				int (*calculate_pressure)(struct zone *));
+  #else /* CONFIG_SMP */
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * We do not maintain differentials in a single processor configuration.
++  * The functions directly modify the zone and global counters.
++  */
++ static inline void __mod_zone_page_state(struct zone *zone,
++ 			enum zone_stat_item item, long delta)
++ {
++ 	zone_page_state_add(delta, zone, item);
++ }
++ 
+++>>>>>>> 6cdb18ad98a4 (mm/vmstat: fix overflow in mod_zone_page_state())
+  static inline void __inc_zone_state(struct zone *zone, enum zone_stat_item item)
+  {
+  	atomic_long_inc(&zone->vm_stat[item]);
+* Unmerged path include/linux/vmstat.h
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index f08f371beef8..c29b80de960d 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -209,7 +209,7 @@ void set_pgdat_percpu_threshold(pg_data_t *pgdat,
+  * For use when we know that interrupts are disabled.
+  */
+ void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+-				int delta)
++			   long delta)
+ {
+ 	struct per_cpu_pageset __percpu *pcp = zone->pageset;
+ 	s8 __percpu *p = pcp->vm_stat_diff + item;
+@@ -308,8 +308,8 @@ EXPORT_SYMBOL(__dec_zone_page_state);
+  *     1       Overstepping half of threshold
+  *     -1      Overstepping minus half of threshold
+ */
+-static inline void mod_state(struct zone *zone,
+-       enum zone_stat_item item, int delta, int overstep_mode)
++static inline void mod_state(struct zone *zone, enum zone_stat_item item,
++			     long delta, int overstep_mode)
+ {
+ 	struct per_cpu_pageset __percpu *pcp = zone->pageset;
+ 	s8 __percpu *p = pcp->vm_stat_diff + item;
+@@ -347,7 +347,7 @@ static inline void mod_state(struct zone *zone,
+ }
+ 
+ void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+-					int delta)
++			 long delta)
+ {
+ 	mod_state(zone, item, delta, 0);
+ }
+@@ -374,7 +374,7 @@ EXPORT_SYMBOL(dec_zone_page_state);
+  * Use interrupt disable to serialize counter updates
+  */
+ void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+-					int delta)
++			 long delta)
+ {
+ 	unsigned long flags;
+ 
