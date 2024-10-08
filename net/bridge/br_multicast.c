@@ -1015,6 +1015,16 @@ static int br_ip6_multicast_mld2_report(struct net_bridge *br,
 }
 #endif
 
+static void br_multicast_update_querier_timer(struct net_bridge *br,
+					      unsigned long max_delay)
+{
+	if (!timer_pending(&br->multicast_querier_timer))
+		br->multicast_querier_delay_time = jiffies + max_delay;
+
+	mod_timer(&br->multicast_querier_timer,
+		  jiffies + br->multicast_querier_interval);
+}
+
 /*
  * Add port to rotuer_list
  *  list is maintained ordered by pointer value
@@ -1065,11 +1075,11 @@ timer:
 
 static void br_multicast_query_received(struct net_bridge *br,
 					struct net_bridge_port *port,
-					int saddr)
+					int saddr,
+					unsigned long max_delay)
 {
 	if (saddr)
-		mod_timer(&br->multicast_querier_timer,
-			  jiffies + br->multicast_querier_interval);
+		br_multicast_update_querier_timer(br, max_delay);
 	else if (timer_pending(&br->multicast_querier_timer))
 		return;
 
@@ -1097,8 +1107,6 @@ static int br_ip4_multicast_query(struct net_bridge *br,
 	    (port && port->state == BR_STATE_DISABLED))
 		goto out;
 
-	br_multicast_query_received(br, port, !!iph->saddr);
-
 	group = ih->group;
 
 	if (skb->len == sizeof(*ih)) {
@@ -1121,6 +1129,8 @@ static int br_ip4_multicast_query(struct net_bridge *br,
 		max_delay = ih3->code ?
 			    IGMPV3_MRC(ih3->code) * (HZ / IGMP_TIMER_SCALE) : 1;
 	}
+
+	br_multicast_query_received(br, port, !!iph->saddr, max_delay);
 
 	if (!group)
 		goto out;
@@ -1174,8 +1184,6 @@ static int br_ip6_multicast_query(struct net_bridge *br,
 	    (port && port->state == BR_STATE_DISABLED))
 		goto out;
 
-	br_multicast_query_received(br, port, !ipv6_addr_any(&ip6h->saddr));
-
 	if (skb->len == sizeof(*mld)) {
 		if (!pskb_may_pull(skb, sizeof(*mld))) {
 			err = -EINVAL;
@@ -1195,6 +1203,9 @@ static int br_ip6_multicast_query(struct net_bridge *br,
 			group = &mld2q->mld2q_mca;
 		max_delay = mld2q->mld2q_mrc ? MLDV2_MRC(ntohs(mld2q->mld2q_mrc)) : 1;
 	}
+
+	br_multicast_query_received(br, port, !ipv6_addr_any(&ip6h->saddr),
+				    max_delay);
 
 	if (!group)
 		goto out;
@@ -1629,6 +1640,8 @@ void br_multicast_init(struct net_bridge *br)
 	br->multicast_querier_interval = 255 * HZ;
 	br->multicast_membership_interval = 260 * HZ;
 
+	br->multicast_querier_delay_time = 0;
+
 	spin_lock_init(&br->multicast_lock);
 	setup_timer(&br->multicast_router_timer,
 		    br_multicast_local_router_expired, 0);
@@ -1816,6 +1829,8 @@ unlock:
 
 int br_multicast_set_querier(struct net_bridge *br, unsigned long val)
 {
+	unsigned long max_delay;
+
 	val = !!val;
 
 	spin_lock_bh(&br->multicast_lock);
@@ -1823,8 +1838,14 @@ int br_multicast_set_querier(struct net_bridge *br, unsigned long val)
 		goto unlock;
 
 	br->multicast_querier = val;
-	if (val)
-		br_multicast_start_querier(br);
+	if (!val)
+		goto unlock;
+
+	max_delay = br->multicast_query_response_interval;
+	if (!timer_pending(&br->multicast_querier_timer))
+		br->multicast_querier_delay_time = jiffies + max_delay;
+
+	br_multicast_start_querier(br);
 
 unlock:
 	spin_unlock_bh(&br->multicast_lock);
