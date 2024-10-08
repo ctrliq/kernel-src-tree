@@ -1,0 +1,308 @@
+iwlwifi: fix RFkill while calibrating
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+commit 31b8b343e019e0a0c57ca9c13520a87f9cab884b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/31b8b343.failed
+
+If the RFkill interrupt fires while we calibrate, it would
+make the firmware fail and the driver wasn't able to recover.
+Change the flow so that the driver will kill the firmware
+in that case.
+
+Since we have now two flows that are calling
+trans_stop_device (the RFkill interrupt and the
+op_mode_mvm_start function) - we need to better sync this.
+Use the STATUS_DEVICE_ENABLED in the pcie transport in an
+atomic way to achieve this.
+
+This fixes: https://bugzilla.kernel.org/show_bug.cgi?id=86231
+
+CC: <stable@vger.kernel.org> [3.10+]
+	Reviewed-by: Johannes Berg <johannes.berg@intel.com>
+	Reviewed-by: Luciano Coelho <luciano.coelho@intel.com>
+	Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+(cherry picked from commit 31b8b343e019e0a0c57ca9c13520a87f9cab884b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/iwlwifi/mvm/fw.c
+#	drivers/net/wireless/iwlwifi/mvm/mac80211.c
+#	drivers/net/wireless/iwlwifi/mvm/mvm.h
+#	drivers/net/wireless/iwlwifi/mvm/ops.c
+#	drivers/net/wireless/iwlwifi/pcie/trans.c
+diff --cc drivers/net/wireless/iwlwifi/mvm/fw.c
+index e18c92dd60ec,eb03943f8463..000000000000
+--- a/drivers/net/wireless/iwlwifi/mvm/fw.c
++++ b/drivers/net/wireless/iwlwifi/mvm/fw.c
+@@@ -293,7 -284,7 +293,11 @@@ int iwl_run_init_mvm_ucode(struct iwl_m
+  
+  	lockdep_assert_held(&mvm->mutex);
+  
+++<<<<<<< HEAD
+ +	if (mvm->init_ucode_run)
+++=======
++ 	if (WARN_ON_ONCE(mvm->init_ucode_complete || mvm->calibrating))
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  		return 0;
+  
+  	iwl_init_notification_wait(&mvm->notif_wait,
+@@@ -326,13 -318,26 +330,30 @@@
+  	ret = iwl_nvm_check_version(mvm->nvm_data, mvm->trans);
+  	WARN_ON(ret);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * abort after reading the nvm in case RF Kill is on, we will complete
++ 	 * the init seq later when RF kill will switch to off
++ 	 */
++ 	if (iwl_mvm_is_radio_killed(mvm)) {
++ 		IWL_DEBUG_RF_KILL(mvm,
++ 				  "jump over all phy activities due to RF kill\n");
++ 		iwl_remove_notification(&mvm->notif_wait, &calib_wait);
++ 		ret = 1;
++ 		goto out;
++ 	}
++ 
++ 	mvm->calibrating = true;
++ 
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  	/* Send TX valid antennas before triggering calibrations */
+ -	ret = iwl_send_tx_ant_cfg(mvm, mvm->fw->valid_tx_ant);
+ +	ret = iwl_send_tx_ant_cfg(mvm, iwl_fw_valid_tx_ant(mvm->fw));
+ +	if (ret)
+ +		goto error;
+ +
+ +	/* need to set default values */
+ +	ret = iwl_set_default_calibrations(mvm);
+  	if (ret)
+  		goto error;
+  
+@@@ -354,15 -359,19 +375,29 @@@
+  	ret = iwl_wait_notification(&mvm->notif_wait, &calib_wait,
+  			MVM_UCODE_CALIB_TIMEOUT);
+  	if (!ret)
+++<<<<<<< HEAD
+ +		mvm->init_ucode_run = true;
+++=======
++ 		mvm->init_ucode_complete = true;
++ 
++ 	if (ret && iwl_mvm_is_radio_killed(mvm)) {
++ 		IWL_DEBUG_RF_KILL(mvm, "RFKILL while calibrating.\n");
++ 		ret = 1;
++ 	}
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  	goto out;
+  
+  error:
+  	iwl_remove_notification(&mvm->notif_wait, &calib_wait);
+  out:
+++<<<<<<< HEAD
+ +	if (!iwlmvm_mod_params.init_dbg) {
+ +		iwl_trans_stop_device(mvm->trans);
+ +	} else if (!mvm->nvm_data) {
+++=======
++ 	mvm->calibrating = false;
++ 	if (iwlmvm_mod_params.init_dbg && !mvm->nvm_data) {
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  		/* we want to debug INIT and we have no NVM - fake */
+  		mvm->nvm_data = kzalloc(sizeof(struct iwl_nvm_data) +
+  					sizeof(struct ieee80211_channel) +
+diff --cc drivers/net/wireless/iwlwifi/mvm/mac80211.c
+index a7b2d8059bea,b62405865b25..000000000000
+--- a/drivers/net/wireless/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/iwlwifi/mvm/mac80211.c
+@@@ -321,10 -781,14 +321,15 @@@ static void iwl_mvm_cleanup_iterator(vo
+  
+  static void iwl_mvm_restart_cleanup(struct iwl_mvm *mvm)
+  {
+ -	iwl_mvm_fw_error_dump(mvm);
+ -
+  	iwl_trans_stop_device(mvm->trans);
+ +	iwl_trans_stop_hw(mvm->trans, false);
+  
+  	mvm->scan_status = IWL_MVM_SCAN_NONE;
+++<<<<<<< HEAD
+++=======
++ 	mvm->ps_disabled = false;
++ 	mvm->calibrating = false;
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  
+  	/* just in case one was running */
+  	ieee80211_remain_on_channel_expired(mvm->hw);
+diff --cc drivers/net/wireless/iwlwifi/mvm/mvm.h
+index 80862319c42a,845429c88cf4..000000000000
+--- a/drivers/net/wireless/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/iwlwifi/mvm/mvm.h
+@@@ -267,11 -539,21 +267,16 @@@ struct iwl_mvm 
+  
+  	unsigned long status;
+  
+ -	/*
+ -	 * for beacon filtering -
+ -	 * currently only one interface can be supported
+ -	 */
+ -	struct iwl_mvm_vif *bf_allowed_vif;
+ -
+  	enum iwl_ucode_type cur_ucode;
+  	bool ucode_loaded;
+++<<<<<<< HEAD
+ +	bool init_ucode_run;
+++=======
++ 	bool init_ucode_complete;
++ 	bool calibrating;
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  	u32 error_event_table;
+  	u32 log_event_table;
+ -	u32 umac_error_event_table;
+ -	bool support_umac_log;
+ -	struct iwl_sf_region sf_space;
+  
+  	u32 ampdu_ref;
+  
+diff --cc drivers/net/wireless/iwlwifi/mvm/ops.c
+index b29c31a41594,5b719ee8e789..000000000000
+--- a/drivers/net/wireless/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/iwlwifi/mvm/ops.c
+@@@ -584,21 -737,40 +584,36 @@@ static void iwl_mvm_wake_sw_queue(struc
+  		return;
+  	}
+  
+ -	ieee80211_wake_queue(mvm->hw, mq);
+ -}
+ +	clear_bit(mq, &mvm->transport_queue_stop);
+  
+ -void iwl_mvm_set_hw_ctkill_state(struct iwl_mvm *mvm, bool state)
+ -{
+ -	if (state)
+ -		set_bit(IWL_MVM_STATUS_HW_CTKILL, &mvm->status);
+ -	else
+ -		clear_bit(IWL_MVM_STATUS_HW_CTKILL, &mvm->status);
+ -
+ -	wiphy_rfkill_set_hw_state(mvm->hw->wiphy, iwl_mvm_is_radio_killed(mvm));
+ +	ieee80211_wake_queue(mvm->hw, mq);
+  }
+  
+ -static bool iwl_mvm_set_hw_rfkill_state(struct iwl_op_mode *op_mode, bool state)
+ +static void iwl_mvm_set_hw_rfkill_state(struct iwl_op_mode *op_mode, bool state)
+  {
+  	struct iwl_mvm *mvm = IWL_OP_MODE_GET_MVM(op_mode);
++ 	bool calibrating = ACCESS_ONCE(mvm->calibrating);
+  
+  	if (state)
+  		set_bit(IWL_MVM_STATUS_HW_RFKILL, &mvm->status);
+  	else
+  		clear_bit(IWL_MVM_STATUS_HW_RFKILL, &mvm->status);
+  
+++<<<<<<< HEAD
+ +	wiphy_rfkill_set_hw_state(mvm->hw->wiphy, state);
+++=======
++ 	wiphy_rfkill_set_hw_state(mvm->hw->wiphy, iwl_mvm_is_radio_killed(mvm));
++ 
++ 	/* iwl_run_init_mvm_ucode is waiting for results, abort it */
++ 	if (calibrating)
++ 		iwl_abort_notification_waits(&mvm->notif_wait);
++ 
++ 	/*
++ 	 * Stop the device if we run OPERATIONAL firmware or if we are in the
++ 	 * middle of the calibrations.
++ 	 */
++ 	return state && (mvm->cur_ucode != IWL_UCODE_INIT || calibrating);
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  }
+  
+  static void iwl_mvm_free_skb(struct iwl_op_mode *op_mode, struct sk_buff *skb)
+diff --cc drivers/net/wireless/iwlwifi/pcie/trans.c
+index aeb70e13137a,160c3ebc48d0..000000000000
+--- a/drivers/net/wireless/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/iwlwifi/pcie/trans.c
+@@@ -534,7 -915,8 +534,12 @@@ static void iwl_trans_pcie_stop_device(
+  	 * restart. So don't process again if the device is
+  	 * already dead.
+  	 */
+++<<<<<<< HEAD
+ +	if (test_bit(STATUS_DEVICE_ENABLED, &trans_pcie->status)) {
+++=======
++ 	if (test_and_clear_bit(STATUS_DEVICE_ENABLED, &trans->status)) {
++ 		IWL_DEBUG_INFO(trans, "DEVICE_ENABLED bit was set and is now cleared\n");
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  		iwl_pcie_tx_stop(trans);
+  		iwl_pcie_rx_stop(trans);
+  
+@@@ -564,20 -944,55 +569,53 @@@
+  	iwl_write32(trans, CSR_RESET, CSR_RESET_REG_FLAG_NEVO_RESET);
+  
+  	/* clear all status bits */
+++<<<<<<< HEAD
+ +	clear_bit(STATUS_HCMD_ACTIVE, &trans_pcie->status);
+ +	clear_bit(STATUS_INT_ENABLED, &trans_pcie->status);
+ +	clear_bit(STATUS_DEVICE_ENABLED, &trans_pcie->status);
+ +	clear_bit(STATUS_TPOWER_PMI, &trans_pcie->status);
+ +	clear_bit(STATUS_RFKILL, &trans_pcie->status);
+++=======
++ 	clear_bit(STATUS_SYNC_HCMD_ACTIVE, &trans->status);
++ 	clear_bit(STATUS_INT_ENABLED, &trans->status);
++ 	clear_bit(STATUS_TPOWER_PMI, &trans->status);
++ 	clear_bit(STATUS_RFKILL, &trans->status);
++ 
++ 	/*
++ 	 * Even if we stop the HW, we still want the RF kill
++ 	 * interrupt
++ 	 */
++ 	iwl_enable_rfkill_int(trans);
++ 
++ 	/*
++ 	 * Check again since the RF kill state may have changed while
++ 	 * all the interrupts were disabled, in this case we couldn't
++ 	 * receive the RF kill interrupt and update the state in the
++ 	 * op_mode.
++ 	 * Don't call the op_mode if the rkfill state hasn't changed.
++ 	 * This allows the op_mode to call stop_device from the rfkill
++ 	 * notification without endless recursion. Under very rare
++ 	 * circumstances, we might have a small recursion if the rfkill
++ 	 * state changed exactly now while we were called from stop_device.
++ 	 * This is very unlikely but can happen and is supported.
++ 	 */
++ 	hw_rfkill = iwl_is_rfkill_set(trans);
++ 	if (hw_rfkill)
++ 		set_bit(STATUS_RFKILL, &trans->status);
++ 	else
++ 		clear_bit(STATUS_RFKILL, &trans->status);
++ 	if (hw_rfkill != was_hw_rfkill)
++ 		iwl_trans_pcie_rf_kill(trans, hw_rfkill);
+++>>>>>>> 31b8b343e019 (iwlwifi: fix RFkill while calibrating)
+  }
+  
+ -void iwl_trans_pcie_rf_kill(struct iwl_trans *trans, bool state)
+ +static void iwl_trans_pcie_d3_suspend(struct iwl_trans *trans)
+  {
+ -	if (iwl_op_mode_hw_rf_kill(trans->op_mode, state))
+ -		iwl_trans_pcie_stop_device(trans);
+ -}
+ +	/* let the ucode operate on its own */
+ +	iwl_write32(trans, CSR_UCODE_DRV_GP1_SET,
+ +		    CSR_UCODE_DRV_GP1_BIT_D3_CFG_COMPLETE);
+  
+ -static void iwl_trans_pcie_d3_suspend(struct iwl_trans *trans, bool test)
+ -{
+  	iwl_disable_interrupts(trans);
+ -
+ -	/*
+ -	 * in testing mode, the host stays awake and the
+ -	 * hardware won't be reset (not even partially)
+ -	 */
+ -	if (test)
+ -		return;
+ -
+  	iwl_pcie_disable_ict(trans);
+  
+  	iwl_clear_bit(trans, CSR_GP_CNTRL,
+* Unmerged path drivers/net/wireless/iwlwifi/mvm/fw.c
+* Unmerged path drivers/net/wireless/iwlwifi/mvm/mac80211.c
+* Unmerged path drivers/net/wireless/iwlwifi/mvm/mvm.h
+* Unmerged path drivers/net/wireless/iwlwifi/mvm/ops.c
+* Unmerged path drivers/net/wireless/iwlwifi/pcie/trans.c
