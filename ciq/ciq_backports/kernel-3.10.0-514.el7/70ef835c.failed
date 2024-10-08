@@ -1,0 +1,414 @@
+mei: support for dynamic clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 70ef835c84b3b88e274a53bf80a70940ae178a91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/70ef835c.failed
+
+HBM version 2.0 and above allows ME clients in the system to
+register/unregister after the system is fully initialized.
+Clients may be added or removed after enum_resp message was
+received
+
+1. To preserve backward compatibility the driver can opt-in to receive
+client add messages by setting allow_add field in enum_req
+
+2. A new client is added upon reception of MEI_HBM_ADD_CLIENT_REQ_CMD
+
+3. A client is removed in a lazy manner when connection request
+respond with MEI_HBMS_CLIENT_NOT_FOUND status
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 70ef835c84b3b88e274a53bf80a70940ae178a91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/hbm.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,d4dba639db37..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -288,6 -312,96 +289,64 @@@ static int mei_hbm_enum_clients_req(str
+  	return 0;
+  }
+  
+ -/*
+ - * mei_hbm_me_cl_add - add new me client to the list
+ - *
+ - * @dev: the device structure
+ - * @res: hbm property response
+ - *
+ - * Return: 0 on success and -ENOMEM on allocation failure
+ - */
+ -
+ -static int mei_hbm_me_cl_add(struct mei_device *dev,
+ -			     struct hbm_props_response *res)
+ -{
+ -	struct mei_me_client *me_cl;
+ -	const uuid_le *uuid = &res->client_properties.protocol_name;
+ -
+ -	mei_me_cl_rm_by_uuid(dev, uuid);
+ -
+ -	me_cl = kzalloc(sizeof(struct mei_me_client), GFP_KERNEL);
+ -	if (!me_cl)
+ -		return -ENOMEM;
+ -
+ -	mei_me_cl_init(me_cl);
+ -
+ -	me_cl->props = res->client_properties;
+ -	me_cl->client_id = res->me_addr;
+ -	me_cl->mei_flow_ctrl_creds = 0;
+ -
+ -	mei_me_cl_add(dev, me_cl);
+ -
+ -	return 0;
+ -}
+ -
++ /**
++  * mei_hbm_add_cl_resp - send response to fw on client add request
++  *
++  * @dev: the device structure
++  * @addr: me address
++  * @status: response status
++  *
++  * Return: 0 on success and < 0 on failure
++  */
++ static int mei_hbm_add_cl_resp(struct mei_device *dev, u8 addr, u8 status)
++ {
++ 	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
++ 	struct hbm_add_client_response *resp;
++ 	const size_t len = sizeof(struct hbm_add_client_response);
++ 	int ret;
++ 
++ 	dev_dbg(dev->dev, "adding client response\n");
++ 
++ 	resp = (struct hbm_add_client_response *)dev->wr_msg.data;
++ 
++ 	mei_hbm_hdr(mei_hdr, len);
++ 	memset(resp, 0, sizeof(struct hbm_add_client_response));
++ 
++ 	resp->hbm_cmd = MEI_HBM_ADD_CLIENT_RES_CMD;
++ 	resp->me_addr = addr;
++ 	resp->status  = status;
++ 
++ 	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++ 	if (ret)
++ 		dev_err(dev->dev, "add client response write failed: ret = %d\n",
++ 			ret);
++ 	return ret;
++ }
++ 
++ /**
++  * mei_hbm_fw_add_cl_req - request from the fw to add a client
++  *
++  * @dev: the device structure
++  * @req: add client request
++  *
++  * Return: 0 on success and < 0 on failure
++  */
++ static int mei_hbm_fw_add_cl_req(struct mei_device *dev,
++ 			      struct hbm_add_client_request *req)
++ {
++ 	int ret;
++ 	u8 status = MEI_HBMS_SUCCESS;
++ 
++ 	BUILD_BUG_ON(sizeof(struct hbm_add_client_request) !=
++ 			sizeof(struct hbm_props_response));
++ 
++ 	ret = mei_hbm_me_cl_add(dev, (struct hbm_props_response *)req);
++ 	if (ret)
++ 		status = !MEI_HBMS_SUCCESS;
++ 
++ 	return mei_hbm_add_cl_resp(dev, req->me_addr, status);
++ }
++ 
+  /**
+   * mei_hbm_prop_req - request property for a single client
+   *
+@@@ -563,8 -669,11 +622,16 @@@ static void mei_hbm_cl_connect_res(stru
+  
+  	if (rs->status == MEI_CL_CONN_SUCCESS)
+  		cl->state = MEI_FILE_CONNECTED;
+++<<<<<<< HEAD
+ +	else
+ +		cl->state = MEI_FILE_DISCONNECTED;
+++=======
++ 	else {
++ 		cl->state = MEI_FILE_DISCONNECT_REPLY;
++ 		if (rs->status == MEI_CL_CONN_NOT_FOUND)
++ 			mei_me_cl_del(dev, cl->me_cl);
++ 	}
+++>>>>>>> 70ef835c84b3 (mei: support for dynamic clients)
+  	cl->status = mei_cl_conn_status_to_errno(rs->status);
+  }
+  
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,33823f4a1cf2..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -382,55 -366,96 +382,130 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported : hbm feature pgi protocol
++  * @hbm_f_dc_supported : hbm feature dynamic clients
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @allow_fixed_address: allow user space to connect a fixed client
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  * @cl_bus_lock : client bus list lock
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
+++>>>>>>> 70ef835c84b3 (mei: support for dynamic clients)
+   */
+  struct mei_device {
+ -	struct device *dev;
+ -	struct cdev cdev;
+ -	int minor;
+ -
+ -	struct mei_cl_cb write_list;
+ -	struct mei_cl_cb write_waiting_list;
+ -	struct mei_cl_cb ctrl_wr_list;
+ -	struct mei_cl_cb ctrl_rd_list;
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+@@@ -477,14 -502,16 +552,15 @@@
+  
+  	struct hbm_version version;
+  	unsigned int hbm_f_pg_supported:1;
++ 	unsigned int hbm_f_dc_supported:1;
+  
+ -	struct rw_semaphore me_clients_rwsem;
+ -	struct list_head me_clients;
+ +	struct mei_me_client *me_clients; /* Note: memory has to be allocated */
+  	DECLARE_BITMAP(me_clients_map, MEI_CLIENTS_MAX);
+  	DECLARE_BITMAP(host_clients_map, MEI_CLIENTS_MAX);
+ +	unsigned long me_clients_num;
+ +	unsigned long me_client_presentation_num;
+  	unsigned long me_client_index;
+  
+ -	u32 allow_fixed_address;
+ -
+  	struct mei_cl wd_cl;
+  	enum mei_wd_states wd_state;
+  	bool wd_pending;
+diff --git a/drivers/misc/mei/debugfs.c b/drivers/misc/mei/debugfs.c
+index 15554a224d0c..36d96a2e490f 100644
+--- a/drivers/misc/mei/debugfs.c
++++ b/drivers/misc/mei/debugfs.c
+@@ -144,6 +144,8 @@ static ssize_t mei_dbgfs_read_devstate(struct file *fp, char __user *ubuf,
+ 		pos += scnprintf(buf + pos, bufsz - pos, "hbm features:\n");
+ 		pos += scnprintf(buf + pos, bufsz - pos, "\tPG: %01d\n",
+ 				 dev->hbm_f_pg_supported);
++		pos += scnprintf(buf + pos, bufsz - pos, "\tDC: %01d\n",
++				 dev->hbm_f_dc_supported);
+ 	}
+ 
+ 	pos += scnprintf(buf + pos, bufsz - pos, "pg:  %s, %s\n",
+* Unmerged path drivers/misc/mei/hbm.c
+diff --git a/drivers/misc/mei/hw.h b/drivers/misc/mei/hw.h
+index 50526f92f092..8e07d2d52f29 100644
+--- a/drivers/misc/mei/hw.h
++++ b/drivers/misc/mei/hw.h
+@@ -46,6 +46,12 @@
+ #define HBM_MINOR_VERSION_PGI               1
+ #define HBM_MAJOR_VERSION_PGI               1
+ 
++/*
++ * MEI version with Dynamic clients support
++ */
++#define HBM_MINOR_VERSION_DC               0
++#define HBM_MAJOR_VERSION_DC               2
++
+ /* Host bus message command opcode */
+ #define MEI_HBM_CMD_OP_MSK                  0x7f
+ /* Host bus message command RESPONSE */
+@@ -81,6 +87,8 @@
+ #define MEI_PG_ISOLATION_EXIT_REQ_CMD       0x0b
+ #define MEI_PG_ISOLATION_EXIT_RES_CMD       0x8b
+ 
++#define MEI_HBM_ADD_CLIENT_REQ_CMD          0x0f
++#define MEI_HBM_ADD_CLIENT_RES_CMD          0x8f
+ /*
+  * MEI Stop Reason
+  * used by hbm_host_stop_request.reason
+@@ -184,9 +192,17 @@ struct hbm_me_stop_request {
+ 	u8 reserved[2];
+ } __packed;
+ 
++/**
++ * struct hbm_host_enum_request -  enumeration request from host to fw
++ *
++ * @hbm_cmd: bus message command header
++ * @allow_add: allow dynamic clients add HBM version >= 2.0
++ * @reserved: reserved
++ */
+ struct hbm_host_enum_request {
+ 	u8 hbm_cmd;
+-	u8 reserved[3];
++	u8 allow_add;
++	u8 reserved[2];
+ } __packed;
+ 
+ struct hbm_host_enum_response {
+@@ -218,6 +234,38 @@ struct hbm_props_response {
+ 	struct mei_client_properties client_properties;
+ } __packed;
+ 
++/**
++ * struct hbm_add_client_request - request to add a client
++ *     might be sent by fw after enumeration has already completed
++ *
++ * @hbm_cmd: bus message command header
++ * @me_addr: address of the client in ME
++ * @reserved: reserved
++ * @client_properties: client properties
++ */
++struct hbm_add_client_request {
++	u8 hbm_cmd;
++	u8 me_addr;
++	u8 reserved[2];
++	struct mei_client_properties client_properties;
++} __packed;
++
++/**
++ * struct hbm_add_client_response - response to add a client
++ *     sent by the host to report client addition status to fw
++ *
++ * @hbm_cmd: bus message command header
++ * @me_addr: address of the client in ME
++ * @status: if HBMS_SUCCESS then the client can now accept connections.
++ * @reserved: reserved
++ */
++struct hbm_add_client_response {
++	u8 hbm_cmd;
++	u8 me_addr;
++	u8 status;
++	u8 reserved[1];
++} __packed;
++
+ /**
+  * struct hbm_power_gate - power gate request/response
+  *
+* Unmerged path drivers/misc/mei/mei_dev.h
