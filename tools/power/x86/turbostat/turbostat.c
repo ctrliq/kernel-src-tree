@@ -61,8 +61,8 @@ unsigned int has_epb;
 unsigned int units = 1000000;	/* MHz etc */
 unsigned int genuine_intel;
 unsigned int has_invariant_tsc;
-unsigned int do_nehalem_platform_info;
-unsigned int do_nehalem_turbo_ratio_limit;
+unsigned int do_nhm_platform_info;
+unsigned int do_nhm_turbo_ratio_limit;
 unsigned int do_ivt_turbo_ratio_limit;
 unsigned int extra_msr_offset32;
 unsigned int extra_msr_offset64;
@@ -281,7 +281,7 @@ void print_header(void)
 		outp += sprintf(outp, "     CPU");
 	if (has_aperf)
 		outp += sprintf(outp, " Avg_MHz");
-	if (do_nhm_cstates)
+	if (has_aperf)
 		outp += sprintf(outp, "   %%Busy");
 	if (has_aperf)
 		outp += sprintf(outp, " Bzy_MHz");
@@ -337,7 +337,7 @@ void print_header(void)
 			outp += sprintf(outp, "   PKG_%%");
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
 			outp += sprintf(outp, "   RAM_%%");
-	} else {
+	} else if (do_rapl && rapl_joules) {
 		if (do_rapl & RAPL_PKG)
 			outp += sprintf(outp, "   Pkg_J");
 		if (do_rapl & RAPL_CORES)
@@ -457,25 +457,25 @@ int format_counters(struct thread_data *t, struct core_data *c,
 			outp += sprintf(outp, "%8d", t->cpu_id);
 	}
 
-	/* AvgMHz */
+	/* Avg_MHz */
 	if (has_aperf)
 		outp += sprintf(outp, "%8.0f",
 			1.0 / units * t->aperf / interval_float);
 
-	/* %c0 */
-	if (do_nhm_cstates) {
+	/* %Busy */
+	if (has_aperf) {
 		if (!skip_c0)
 			outp += sprintf(outp, "%8.2f", 100.0 * t->mperf/t->tsc);
 		else
 			outp += sprintf(outp, "********");
 	}
 
-	/* BzyMHz */
+	/* Bzy_MHz */
 	if (has_aperf)
 		outp += sprintf(outp, "%8.0f",
 			1.0 * t->tsc / units * t->aperf / t->mperf / interval_float);
 
-	/* TSC */
+	/* TSC_MHz */
 	outp += sprintf(outp, "%8.0f", 1.0 * t->tsc/units/interval_float);
 
 	/* SMI */
@@ -561,7 +561,7 @@ int format_counters(struct thread_data *t, struct core_data *c,
 			outp += sprintf(outp, fmt8, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
 			outp += sprintf(outp, fmt8, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
-	} else {
+	} else if (do_rapl && rapl_joules) {
 		if (do_rapl & RAPL_PKG)
 			outp += sprintf(outp, fmt8,
 					p->energy_pkg * rapl_energy_units);
@@ -578,8 +578,8 @@ int format_counters(struct thread_data *t, struct core_data *c,
 			outp += sprintf(outp, fmt8, 100.0 * p->rapl_pkg_perf_status * rapl_time_units / interval_float);
 		if (do_rapl & RAPL_DRAM_PERF_STATUS)
 			outp += sprintf(outp, fmt8, 100.0 * p->rapl_dram_perf_status * rapl_time_units / interval_float);
-	outp += sprintf(outp, fmt8, interval_float);
 
+		outp += sprintf(outp, fmt8, interval_float);
 	}
 done:
 	outp += sprintf(outp, "\n");
@@ -1019,7 +1019,7 @@ void print_verbose_header(void)
 	unsigned long long msr;
 	unsigned int ratio;
 
-	if (!do_nehalem_platform_info)
+	if (!do_nhm_platform_info)
 		return;
 
 	get_msr(0, MSR_NHM_PLATFORM_INFO, &msr);
@@ -1132,7 +1132,7 @@ print_nhm_turbo_ratio_limits:
 	}
 	fprintf(stderr, ")\n");
 
-	if (!do_nehalem_turbo_ratio_limit)
+	if (!do_nhm_turbo_ratio_limit)
 		return;
 
 	get_msr(0, MSR_NHM_TURBO_RATIO_LIMIT, &msr);
@@ -1458,8 +1458,7 @@ void check_dev_msr()
 	struct stat sb;
 
 	if (stat("/dev/cpu/0/msr", &sb))
-		err(-5, "no /dev/cpu/0/msr\n"
-		    "Try \"# modprobe msr\"");
+		err(-5, "no /dev/cpu/0/msr, Try \"# modprobe msr\" ");
 }
 
 void check_permissions()
@@ -1492,13 +1491,27 @@ void check_permissions()
 	/* if all else fails, thell them to be root */
 	if (do_exit)
 		if (getuid() != 0)
-			warnx("Or simply run as root");
+			warnx("... or simply run as root");
 
 	if (do_exit)
 		exit(-6);
 }
 
-int has_nehalem_turbo_ratio_limit(unsigned int family, unsigned int model)
+/*
+ * NHM adds support for additional MSRs:
+ *
+ * MSR_SMI_COUNT                   0x00000034
+ *
+ * MSR_NHM_PLATFORM_INFO           0x000000ce
+ * MSR_NHM_SNB_PKG_CST_CFG_CTL     0x000000e2
+ *
+ * MSR_PKG_C3_RESIDENCY            0x000003f8
+ * MSR_PKG_C6_RESIDENCY            0x000003f9
+ * MSR_CORE_C3_RESIDENCY           0x000003fc
+ * MSR_CORE_C6_RESIDENCY           0x000003fd
+ *
+ */
+int has_nhm_msrs(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
 		return 0;
@@ -1525,11 +1538,25 @@ int has_nehalem_turbo_ratio_limit(unsigned int family, unsigned int model)
 	case 0x3D:	/* BDW */
 	case 0x4F:	/* BDX */
 	case 0x56:	/* BDX-DE */
-		return 1;
 	case 0x2E:	/* Nehalem-EX Xeon - Beckton */
 	case 0x2F:	/* Westmere-EX Xeon - Eagleton */
+		return 1;
 	default:
 		return 0;
+	}
+}
+int has_nhm_turbo_ratio_limit(unsigned int family, unsigned int model)
+{
+	if (!has_nhm_msrs(family, model))
+		return 0;
+
+	switch (model) {
+	/* Nehalem compatible, but do not include turbo-ratio limit support */
+	case 0x2E:	/* Nehalem-EX Xeon - Beckton */
+	case 0x2F:	/* Westmere-EX Xeon - Eagleton */
+		return 0;
+	default:
+		return 1;
 	}
 }
 int has_ivt_turbo_ratio_limit(unsigned int family, unsigned int model)
@@ -1872,8 +1899,15 @@ int print_rapl(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 	return 0;
 }
 
+/*
+ * SNB adds support for additional MSRs:
+ *
+ * MSR_PKG_C7_RESIDENCY            0x000003fa
+ * MSR_CORE_C7_RESIDENCY           0x000003fe
+ * MSR_PKG_C2_RESIDENCY            0x0000060d
+ */
 
-int is_snb(unsigned int family, unsigned int model)
+int has_snb_msrs(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
 		return 0;
@@ -1895,7 +1929,14 @@ int is_snb(unsigned int family, unsigned int model)
 	return 0;
 }
 
-int has_c8_c9_c10(unsigned int family, unsigned int model)
+/*
+ * HSW adds support for additional MSRs:
+ *
+ * MSR_PKG_C8_RESIDENCY            0x00000630
+ * MSR_PKG_C9_RESIDENCY            0x00000631
+ * MSR_PKG_C10_RESIDENCY           0x00000632
+ */
+int has_hsw_msrs(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
 		return 0;
@@ -1947,7 +1988,7 @@ double slm_bclk(void)
 
 double discover_bclk(unsigned int family, unsigned int model)
 {
-	if (is_snb(family, model))
+	if (has_snb_msrs(family, model))
 		return 100.00;
 	else if (is_slm(family, model))
 		return slm_bclk();
@@ -1995,7 +2036,7 @@ int set_temperature_target(struct thread_data *t, struct core_data *c, struct pk
 	}
 
 	/* Temperature Target MSR is Nehalem and newer only */
-	if (!do_nehalem_platform_info)
+	if (!do_nhm_platform_info)
 		goto guess;
 
 	if (get_msr(0, MSR_IA32_TEMPERATURE_TARGET, &msr))
@@ -2059,18 +2100,15 @@ void check_cpuid()
 	ebx = ecx = edx = 0;
 	__get_cpuid(0x80000000, &max_level, &ebx, &ecx, &edx);
 
-	if (max_level < 0x80000007)
-		errx(1, "CPUID: no invariant TSC (max_level 0x%x)", max_level);
+	if (max_level >= 0x80000007) {
 
-	/*
-	 * Non-Stop TSC is advertised by CPUID.EAX=0x80000007: EDX.bit8
-	 * this check is valid for both Intel and AMD
-	 */
-	__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx);
-	has_invariant_tsc = edx & (1 << 8);
-
-	if (!has_invariant_tsc)
-		errx(1, "No invariant TSC");
+		/*
+		 * Non-Stop TSC is advertised by CPUID.EAX=0x80000007: EDX.bit8
+		 * this check is valid for both Intel and AMD
+		 */
+		__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx);
+		has_invariant_tsc = edx & (1 << 8);
+	}
 
 	/*
 	 * APERF/MPERF is advertised by CPUID.EAX=0x6: ECX.bit0
@@ -2093,15 +2131,13 @@ void check_cpuid()
 	if (!has_aperf)
 		errx(-1, "No APERF");
 
-	do_nehalem_platform_info = genuine_intel && has_invariant_tsc;
-	do_nhm_cstates = genuine_intel;	/* all Intel w/ non-stop TSC have NHM counters */
-	do_smi = do_nhm_cstates;
-	do_snb_cstates = is_snb(family, model);
-	do_c8_c9_c10 = has_c8_c9_c10(family, model);
+	do_nhm_platform_info = do_nhm_cstates = do_smi = has_nhm_msrs(family, model);
+	do_snb_cstates = has_snb_msrs(family, model);
+	do_c8_c9_c10 = has_hsw_msrs(family, model);
 	do_slm_cstates = is_slm(family, model);
 	bclk = discover_bclk(family, model);
 
-	do_nehalem_turbo_ratio_limit = has_nehalem_turbo_ratio_limit(family, model);
+	do_nhm_turbo_ratio_limit = has_nhm_turbo_ratio_limit(family, model);
 	do_ivt_turbo_ratio_limit = has_ivt_turbo_ratio_limit(family, model);
 	rapl_probe(family, model);
 
