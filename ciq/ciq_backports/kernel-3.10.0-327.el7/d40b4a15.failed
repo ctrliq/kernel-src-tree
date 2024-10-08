@@ -1,0 +1,171 @@
+perf tools: Flush ordered events in case of allocation failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [tools] perf: Flush ordered events in case of allocation failure (Jiri Olsa) [1169436]
+Rebuild_FUZZ: 94.92%
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit d40b4a15ab2bfcfa7d946b69ca1f12c93b22d169
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d40b4a15.failed
+
+In previous patches we added a limit for ordered events queue allocation
+size. If we reach this size we need to flush (part of) the queue to get
+some free buffers.
+
+The current functionality is not affected, because the limit is hard
+coded to (u64) -1. The configuration code for size will come in
+following patches.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jean Pihet <jean.pihet@linaro.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/n/tip-ggcas0xdq847fi85bz73do2e@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d40b4a15ab2bfcfa7d946b69ca1f12c93b22d169)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/session.c
+diff --cc tools/perf/util/session.c
+index 8f2eedc2c5c3,bd2483b6b446..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -600,59 -717,11 +619,60 @@@ static int process_finished_round(struc
+  	return ordered_events__flush(session, tool, OE_FLUSH__ROUND);
+  }
+  
+ +/* The queue is ordered by time */
+ +static void __queue_event(struct ordered_event *new, struct perf_session *s)
+ +{
+ +	struct ordered_events *oe = &s->ordered_events;
+ +	struct ordered_event *last = oe->last;
+ +	u64 timestamp = new->timestamp;
+ +	struct list_head *p;
+ +
+ +	++oe->nr_events;
+ +	oe->last = new;
+ +
+ +	if (!last) {
+ +		list_add(&new->list, &oe->events);
+ +		oe->max_timestamp = timestamp;
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * last event might point to some random place in the list as it's
+ +	 * the last queued event. We expect that the new event is close to
+ +	 * this.
+ +	 */
+ +	if (last->timestamp <= timestamp) {
+ +		while (last->timestamp <= timestamp) {
+ +			p = last->list.next;
+ +			if (p == &oe->events) {
+ +				list_add_tail(&new->list, &oe->events);
+ +				oe->max_timestamp = timestamp;
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add_tail(&new->list, &last->list);
+ +	} else {
+ +		while (last->timestamp > timestamp) {
+ +			p = last->list.prev;
+ +			if (p == &oe->events) {
+ +				list_add(&new->list, &oe->events);
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add(&new->list, &last->list);
+ +	}
+ +}
+ +
+ +#define MAX_SAMPLE_BUFFER	(64 * 1024 / sizeof(struct ordered_event))
+ +
+  int perf_session_queue_event(struct perf_session *s, union perf_event *event,
+- 				    struct perf_sample *sample, u64 file_offset)
++ 			     struct perf_tool *tool, struct perf_sample *sample,
++ 			     u64 file_offset)
+  {
+  	struct ordered_events *oe = &s->ordered_events;
+ +	struct list_head *cache = &oe->cache;
+  	u64 timestamp = sample->time;
+  	struct ordered_event *new;
+  
+@@@ -664,28 -733,17 +684,39 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(cache)) {
+ +		new = list_entry(cache->next, struct ordered_event, list);
+ +		list_del(&new->list);
+ +	} else if (oe->buffer) {
+ +		new = oe->buffer + oe->buffer_idx;
+ +		if (++oe->buffer_idx == MAX_SAMPLE_BUFFER)
+ +			oe->buffer = NULL;
+ +	} else {
+ +		oe->buffer = malloc(MAX_SAMPLE_BUFFER * sizeof(*new));
+ +		if (!oe->buffer)
+ +			return -ENOMEM;
+ +		list_add(&oe->buffer->list, &oe->to_free);
+ +		oe->buffer_idx = 2;
+ +		new = oe->buffer + 1;
+ +	}
+++=======
++ 	new = ordered_events__new(oe, timestamp);
++ 	if (!new) {
++ 		ordered_events__flush(s, tool, OE_FLUSH__HALF);
++ 		new = ordered_events__new(oe, timestamp);
++ 	}
++ 
++ 	if (!new)
++ 		return -ENOMEM;
+++>>>>>>> d40b4a15ab2b (perf tools: Flush ordered events in case of allocation failure)
+  
+ +	new->timestamp = timestamp;
+  	new->file_offset = file_offset;
+  	new->event = event;
+ +
+ +	__queue_event(new, s);
+ +
+  	return 0;
+  }
+  
+diff --git a/tools/perf/builtin-kvm.c b/tools/perf/builtin-kvm.c
+index 976ac93ad8e2..23acba231849 100644
+--- a/tools/perf/builtin-kvm.c
++++ b/tools/perf/builtin-kvm.c
+@@ -691,7 +691,7 @@ static s64 perf_kvm__mmap_read_idx(struct perf_kvm_stat *kvm, int idx,
+ 			return -1;
+ 		}
+ 
+-		err = perf_session_queue_event(kvm->session, event, &sample, 0);
++		err = perf_session_queue_event(kvm->session, event, &kvm->tool, &sample, 0);
+ 		/*
+ 		 * FIXME: Here we can't consume the event, as perf_session_queue_event will
+ 		 *        point to it, and it'll get possibly overwritten by the kernel.
+* Unmerged path tools/perf/util/session.c
+diff --git a/tools/perf/util/session.h b/tools/perf/util/session.h
+index 419eb50e1cd3..a19045b56556 100644
+--- a/tools/perf/util/session.h
++++ b/tools/perf/util/session.h
+@@ -65,7 +65,8 @@ int perf_session__process_events(struct perf_session *session,
+ 				 struct perf_tool *tool);
+ 
+ int perf_session_queue_event(struct perf_session *s, union perf_event *event,
+-			     struct perf_sample *sample, u64 file_offset);
++			     struct perf_tool *tool, struct perf_sample *sample,
++			     u64 file_offset);
+ 
+ void perf_tool__fill_defaults(struct perf_tool *tool);
+ 
