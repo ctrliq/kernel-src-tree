@@ -1,0 +1,212 @@
+drivers:hv: Separate out frame buffer logic when picking MMIO range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] Separate out frame buffer logic when picking MMIO range (Vitaly Kuznetsov) [1302147]
+Rebuild_FUZZ: 90.16%
+commit-author Jake Oshins <jakeo@microsoft.com>
+commit ea37a6b8a0b9fbe3f85b4b9da3206c28f1de6f8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ea37a6b8.failed
+
+Simplify the logic that picks MMIO ranges by pulling out the
+logic related to trying to lay frame buffer claim on top of where
+the firmware placed the frame buffer.
+
+	Signed-off-by: Jake Oshins <jakeo@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ea37a6b8a0b9fbe3f85b4b9da3206c28f1de6f8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 7882a259dbd0,a29a6c0abc01..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -1045,6 -1088,179 +1045,182 @@@ static acpi_status vmbus_walk_resources
+  	return AE_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vmbus_acpi_remove(struct acpi_device *device)
++ {
++ 	struct resource *cur_res;
++ 	struct resource *next_res;
++ 
++ 	if (hyperv_mmio) {
++ 		if (fb_mmio) {
++ 			__release_region(hyperv_mmio, fb_mmio->start,
++ 					 resource_size(fb_mmio));
++ 			fb_mmio = NULL;
++ 		}
++ 
++ 		for (cur_res = hyperv_mmio; cur_res; cur_res = next_res) {
++ 			next_res = cur_res->sibling;
++ 			kfree(cur_res);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void vmbus_reserve_fb(void)
++ {
++ 	int size;
++ 	/*
++ 	 * Make a claim for the frame buffer in the resource tree under the
++ 	 * first node, which will be the one below 4GB.  The length seems to
++ 	 * be underreported, particularly in a Generation 1 VM.  So start out
++ 	 * reserving a larger area and make it smaller until it succeeds.
++ 	 */
++ 
++ 	if (screen_info.lfb_base) {
++ 		if (efi_enabled(EFI_BOOT))
++ 			size = max_t(__u32, screen_info.lfb_size, 0x800000);
++ 		else
++ 			size = max_t(__u32, screen_info.lfb_size, 0x4000000);
++ 
++ 		for (; !fb_mmio && (size >= 0x100000); size >>= 1) {
++ 			fb_mmio = __request_region(hyperv_mmio,
++ 						   screen_info.lfb_base, size,
++ 						   fb_mmio_name, 0);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * vmbus_allocate_mmio() - Pick a memory-mapped I/O range.
++  * @new:		If successful, supplied a pointer to the
++  *			allocated MMIO space.
++  * @device_obj:		Identifies the caller
++  * @min:		Minimum guest physical address of the
++  *			allocation
++  * @max:		Maximum guest physical address
++  * @size:		Size of the range to be allocated
++  * @align:		Alignment of the range to be allocated
++  * @fb_overlap_ok:	Whether this allocation can be allowed
++  *			to overlap the video frame buffer.
++  *
++  * This function walks the resources granted to VMBus by the
++  * _CRS object in the ACPI namespace underneath the parent
++  * "bridge" whether that's a root PCI bus in the Generation 1
++  * case or a Module Device in the Generation 2 case.  It then
++  * attempts to allocate from the global MMIO pool in a way that
++  * matches the constraints supplied in these parameters and by
++  * that _CRS.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ int vmbus_allocate_mmio(struct resource **new, struct hv_device *device_obj,
++ 			resource_size_t min, resource_size_t max,
++ 			resource_size_t size, resource_size_t align,
++ 			bool fb_overlap_ok)
++ {
++ 	struct resource *iter, *shadow;
++ 	resource_size_t range_min, range_max, start;
++ 	const char *dev_n = dev_name(&device_obj->device);
++ 	int retval;
++ 
++ 	retval = -ENXIO;
++ 	down(&hyperv_mmio_lock);
++ 
++ 	/*
++ 	 * If overlaps with frame buffers are allowed, then first attempt to
++ 	 * make the allocation from within the reserved region.  Because it
++ 	 * is already reserved, no shadow allocation is necessary.
++ 	 */
++ 	if (fb_overlap_ok && fb_mmio && !(min > fb_mmio->end) &&
++ 	    !(max < fb_mmio->start)) {
++ 
++ 		range_min = fb_mmio->start;
++ 		range_max = fb_mmio->end;
++ 		start = (range_min + align - 1) & ~(align - 1);
++ 		for (; start + size - 1 <= range_max; start += align) {
++ 			*new = request_mem_region_exclusive(start, size, dev_n);
++ 			if (*new) {
++ 				retval = 0;
++ 				goto exit;
++ 			}
++ 		}
++ 	}
++ 
++ 	for (iter = hyperv_mmio; iter; iter = iter->sibling) {
++ 		if ((iter->start >= max) || (iter->end <= min))
++ 			continue;
++ 
++ 		range_min = iter->start;
++ 		range_max = iter->end;
++ 		start = (range_min + align - 1) & ~(align - 1);
++ 		for (; start + size - 1 <= range_max; start += align) {
++ 			shadow = __request_region(iter, start, size, NULL,
++ 						  IORESOURCE_BUSY);
++ 			if (!shadow)
++ 				continue;
++ 
++ 			*new = request_mem_region_exclusive(start, size, dev_n);
++ 			if (*new) {
++ 				shadow->name = (char *)*new;
++ 				retval = 0;
++ 				goto exit;
++ 			}
++ 
++ 			__release_region(iter, start, size);
++ 		}
++ 	}
++ 
++ exit:
++ 	up(&hyperv_mmio_lock);
++ 	return retval;
++ }
++ EXPORT_SYMBOL_GPL(vmbus_allocate_mmio);
++ 
++ /**
++  * vmbus_free_mmio() - Free a memory-mapped I/O range.
++  * @start:		Base address of region to release.
++  * @size:		Size of the range to be allocated
++  *
++  * This function releases anything requested by
++  * vmbus_mmio_allocate().
++  */
++ void vmbus_free_mmio(resource_size_t start, resource_size_t size)
++ {
++ 	struct resource *iter;
++ 
++ 	down(&hyperv_mmio_lock);
++ 	for (iter = hyperv_mmio; iter; iter = iter->sibling) {
++ 		if ((iter->start >= start + size) || (iter->end <= start))
++ 			continue;
++ 
++ 		__release_region(iter, start, size);
++ 	}
++ 	release_mem_region(start, size);
++ 	up(&hyperv_mmio_lock);
++ 
++ }
++ EXPORT_SYMBOL_GPL(vmbus_free_mmio);
++ 
++ /**
++  * vmbus_cpu_number_to_vp_number() - Map CPU to VP.
++  * @cpu_number: CPU number in Linux terms
++  *
++  * This function returns the mapping between the Linux processor
++  * number and the hypervisor's virtual processor number, useful
++  * in making hypercalls and such that talk about specific
++  * processors.
++  *
++  * Return: Virtual processor number in Hyper-V terms
++  */
++ int vmbus_cpu_number_to_vp_number(int cpu_number)
++ {
++ 	return hv_context.vp_index[cpu_number];
++ }
++ EXPORT_SYMBOL_GPL(vmbus_cpu_number_to_vp_number);
++ 
+++>>>>>>> ea37a6b8a0b9 (drivers:hv: Separate out frame buffer logic when picking MMIO range)
+  static int vmbus_acpi_add(struct acpi_device *device)
+  {
+  	acpi_status result;
+* Unmerged path drivers/hv/vmbus_drv.c
