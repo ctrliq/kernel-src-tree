@@ -1,0 +1,1222 @@
+ALSA: line6: Reorganize card resource handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] line6: Reorganize card resource handling (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 93.02%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 85a9339becf0af4d547ceb6bb16d1893b05fbce4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/85a9339b.failed
+
+This is a fairly big rewrite regarding the card resource management in
+line6 drivers:
+
+- The card creation is moved into line6_probe().  This adds the global
+  destructor to private_free, so that each driver doesn't have to call
+  it any longer.
+
+- The USB disconnect callback handles the card release, thus each
+  driver needs to concentrate on only its own resources.  No need to
+  snd_card_*() call in the destructor.
+
+- Fix the potential stall in disconnection by removing
+  snd_card_free().   It's replaced with snd_card_free_when_closed()
+  for asynchronous release.
+
+- The only remaining operation for the card in each driver is the call
+  of snd_card_register().  All the rest are dealt in the common module
+  by itself.
+
+- These ended up with removal of audio.[ch] as a result of a reduction
+  of one layer.  Each driver just needs to call line6_probe().
+
+	Tested-by: Chris Rorvick <chris@rorvick.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 85a9339becf0af4d547ceb6bb16d1893b05fbce4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/line6/audio.c
+#	drivers/staging/line6/audio.h
+#	drivers/staging/line6/driver.c
+#	drivers/staging/line6/pod.c
+#	drivers/staging/line6/podhd.c
+#	drivers/staging/line6/toneport.c
+#	drivers/staging/line6/variax.c
+#	sound/usb/line6/Makefile
+diff --cc drivers/staging/line6/driver.c
+index bd624c90f1ad,8b6a658a8a58..000000000000
+--- a/drivers/staging/line6/driver.c
++++ b/drivers/staging/line6/driver.c
+@@@ -565,28 -480,19 +567,27 @@@ ssize_t line6_nop_read(struct device *d
+  {
+  	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(line6_nop_read);
+ +
+ +/*
+ +	No operation (i.e., unsupported).
+ +*/
+ +ssize_t line6_nop_write(struct device *dev, struct device_attribute *attr,
+ +			const char *buf, size_t count)
+ +{
+ +	return count;
+ +}
+  
+  /*
+- 	Generic destructor.
++ 	Card destructor.
+  */
+- static void line6_destruct(struct usb_interface *interface)
++ static void line6_destruct(struct snd_card *card)
+  {
+- 	struct usb_line6 *line6;
++ 	struct usb_line6 *line6 = card->private_data;
++ 	struct usb_device *usbdev;
+  
+- 	if (interface == NULL)
+- 		return;
+- 	line6 = usb_get_intfdata(interface);
+- 	if (line6 == NULL)
++ 	if (!line6)
+  		return;
++ 	usbdev = line6->usbdev;
+  
+  	/* free buffer memory first: */
+  	kfree(line6->buffer_message);
+@@@ -595,37 -501,32 +596,50 @@@
+  	/* then free URBs: */
+  	usb_free_urb(line6->urb_listen);
+  
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +	/* make sure the device isn't destructed twice: */
+ +	usb_set_intfdata(interface, NULL);
+ +
+ +	/* free interface data: */
+ +	kfree(line6);
+++=======
++ 	/* free interface data: */
++ 	kfree(line6);
++ 
++ 	/* decrement reference counters: */
++ 	usb_put_dev(usbdev);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  }
+  
+  /*
+  	Probe USB device.
+  */
+ -int line6_probe(struct usb_interface *interface,
+ -		struct usb_line6 *line6,
+ -		const struct line6_properties *properties,
+ -		int (*private_init)(struct usb_interface *, struct usb_line6 *))
+ +static int line6_probe(struct usb_interface *interface,
+ +		       const struct usb_device_id *id)
+  {
+ +	int devtype;
+  	struct usb_device *usbdev;
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +	struct usb_line6 *line6;
+ +	const struct line6_properties *properties;
+ +	int interface_number, alternate = 0;
+ +	int product;
+ +	int size = 0;
+ +	int ep_read = 0, ep_write = 0;
+++=======
++ 	struct snd_card *card;
++ 	int interface_number;
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  	int ret;
+  
+ -	if (!interface) {
+ -		ret = -ENODEV;
+ -		goto err_put;
+ -	}
+ +	if (interface == NULL)
+ +		return -ENODEV;
+  	usbdev = interface_to_usbdev(interface);
+ -	if (!usbdev) {
+ +	if (usbdev == NULL)
+ +		return -ENODEV;
+ +
+ +	/* we don't handle multiple configurations */
+ +	if (usbdev->descriptor.bNumConfigurations != 1) {
+  		ret = -ENODEV;
+  		goto err_put;
+  	}
+@@@ -855,9 -574,27 +869,31 @@@
+  		}
+  	}
+  
++ 	ret = snd_card_new(line6->ifcdev,
++ 			   SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
++ 			   THIS_MODULE, 0, &card);
++ 	if (ret < 0)
++ 		goto err_put;
++ 
++ 	line6->card = card;
++ 	strcpy(card->id, line6->properties->id);
++ 	strcpy(card->driver, DRIVER_NAME);
++ 	strcpy(card->shortname, line6->properties->name);
++ 	sprintf(card->longname, "Line6 %s at USB %s", line6->properties->name,
++ 		dev_name(line6->ifcdev));
++ 	card->private_data = line6;
++ 	card->private_free = line6_destruct;
++ 
+  	usb_set_intfdata(interface, line6);
+  
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +	if (properties->capabilities & LINE6_BIT_CONTROL) {
+++=======
++ 	/* increment reference counters: */
++ 	usb_get_dev(usbdev);
++ 
++ 	if (properties->capabilities & LINE6_CAP_CONTROL) {
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  		/* initialize USB buffers: */
+  		line6->buffer_listen =
+  		    kmalloc(LINE6_BUFSIZE_LISTEN, GFP_KERNEL);
+@@@ -963,25 -635,14 +999,28 @@@
+  	dev_info(&interface->dev, "Line6 %s now attached\n",
+  		 line6->properties->name);
+  
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +	switch (product) {
+ +	case LINE6_DEVID_PODX3:
+ +	case LINE6_DEVID_PODX3LIVE:
+ +		dev_info(&interface->dev,
+ +			 "NOTE: the Line6 %s is detected, but not yet supported\n",
+ +			 line6->properties->name);
+ +	}
+ +
+ +	/* increment reference counters: */
+ +	usb_get_intf(interface);
+ +	usb_get_dev(usbdev);
+ +
+++=======
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  	return 0;
+  
+- err_destruct:
+- 	line6_destruct(interface);
+- err_put:
++  err_destruct:
++ 	snd_card_free(card);
++  err_put:
+  	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(line6_probe);
+  
+  /*
+  	Line6 device disconnected.
+@@@ -1000,73 -661,28 +1039,83 @@@ static void line6_disconnect(struct usb
+  
+  	interface_number = interface->cur_altsetting->desc.bInterfaceNumber;
+  	line6 = usb_get_intfdata(interface);
++ 	if (!line6)
++ 		return;
+  
+- 	if (line6 != NULL) {
+- 		if (line6->urb_listen != NULL)
+- 			line6_stop_listen(line6);
++ 	if (line6->urb_listen != NULL)
++ 		line6_stop_listen(line6);
+  
+- 		if (usbdev != line6->usbdev)
+- 			dev_err(line6->ifcdev,
+- 				"driver bug: inconsistent usb device\n");
++ 	if (usbdev != line6->usbdev)
++ 		dev_err(line6->ifcdev, "driver bug: inconsistent usb device\n");
+  
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +		switch (line6->usbdev->descriptor.idProduct) {
+ +		case LINE6_DEVID_BASSPODXT:
+ +		case LINE6_DEVID_BASSPODXTLIVE:
+ +		case LINE6_DEVID_BASSPODXTPRO:
+ +		case LINE6_DEVID_POCKETPOD:
+ +		case LINE6_DEVID_PODX3:
+ +		case LINE6_DEVID_PODX3LIVE:
+ +		case LINE6_DEVID_PODXT:
+ +		case LINE6_DEVID_PODXTPRO:
+ +			line6_pod_disconnect(interface);
+ +			break;
+ +
+ +		case LINE6_DEVID_PODHD300:
+ +		case LINE6_DEVID_PODHD500:
+ +			line6_podhd_disconnect(interface);
+ +			break;
+ +
+ +		case LINE6_DEVID_PODXTLIVE:
+ +			switch (interface_number) {
+ +			case PODXTLIVE_INTERFACE_POD:
+ +				line6_pod_disconnect(interface);
+ +				break;
+ +
+ +			case PODXTLIVE_INTERFACE_VARIAX:
+ +				line6_variax_disconnect(interface);
+ +				break;
+ +			}
+ +
+ +			break;
+ +
+ +		case LINE6_DEVID_VARIAX:
+ +			line6_variax_disconnect(interface);
+ +			break;
+ +
+ +		case LINE6_DEVID_PODSTUDIO_GX:
+ +		case LINE6_DEVID_PODSTUDIO_UX1:
+ +		case LINE6_DEVID_PODSTUDIO_UX2:
+ +		case LINE6_DEVID_TONEPORT_GX:
+ +		case LINE6_DEVID_TONEPORT_UX1:
+ +		case LINE6_DEVID_TONEPORT_UX2:
+ +		case LINE6_DEVID_GUITARPORT:
+ +			line6_toneport_disconnect(interface);
+ +			break;
+ +
+ +		default:
+ +			MISSING_CASE;
+ +		}
+++=======
++ 	snd_card_disconnect(line6->card);
++ 	if (line6->disconnect)
++ 		line6->disconnect(interface);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  
+- 		dev_info(&interface->dev, "Line6 %s now disconnected\n",
+- 			 line6->properties->name);
+- 	}
++ 	dev_info(&interface->dev, "Line6 %s now disconnected\n",
++ 		 line6->properties->name);
+  
+- 	line6_destruct(interface);
++ 	/* make sure the device isn't destructed twice: */
++ 	usb_set_intfdata(interface, NULL);
+  
+++<<<<<<< HEAD:drivers/staging/line6/driver.c
+ +	/* decrement reference counters: */
+ +	usb_put_intf(interface);
+ +	usb_put_dev(usbdev);
+++=======
++ 	snd_card_free_when_closed(line6->card);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/driver.c
+  }
+ -EXPORT_SYMBOL_GPL(line6_disconnect);
+  
+  #ifdef CONFIG_PM
+  
+diff --cc drivers/staging/line6/pod.c
+index 711d2c74641b,6b30deb6b157..000000000000
+--- a/drivers/staging/line6/pod.c
++++ b/drivers/staging/line6/pod.c
+@@@ -11,9 -11,13 +11,8 @@@
+  
+  #include <linux/slab.h>
+  #include <linux/wait.h>
+ -#include <linux/interrupt.h>
+ -#include <linux/module.h>
+ -#include <linux/usb.h>
+ -
+ -#include <sound/core.h>
+  #include <sound/control.h>
+  
+- #include "audio.h"
+  #include "capture.h"
+  #include "driver.h"
+  #include "playback.h"
+@@@ -323,18 -397,29 +322,44 @@@ static struct snd_kcontrol_new pod_cont
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/staging/line6/pod.c
+ +	POD destructor.
+ +*/
+ +static void pod_destruct(struct usb_interface *interface)
+ +{
+ +	struct usb_line6_pod *pod = usb_get_intfdata(interface);
+ +
+ +	if (pod == NULL)
+ +		return;
+ +	line6_cleanup_audio(&pod->line6);
+ +
+ +	del_timer(&pod->startup_timer);
+ +	cancel_work_sync(&pod->startup_work);
+++=======
++ 	POD device disconnected.
++ */
++ static void line6_pod_disconnect(struct usb_interface *interface)
++ {
++ 	struct usb_line6_pod *pod;
++ 
++ 	if (interface == NULL)
++ 		return;
++ 	pod = usb_get_intfdata(interface);
++ 
++ 	if (pod != NULL) {
++ 		struct device *dev = &interface->dev;
++ 
++ 		if (dev != NULL) {
++ 			/* remove sysfs entries: */
++ 			device_remove_file(dev, &dev_attr_device_id);
++ 			device_remove_file(dev, &dev_attr_firmware_version);
++ 			device_remove_file(dev, &dev_attr_serial_number);
++ 		}
++ 
++ 		del_timer_sync(&pod->startup_timer);
++ 		cancel_work_sync(&pod->startup_work);
++ 	}
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/pod.c
+  }
+  
+  /*
+@@@ -353,11 -438,14 +378,16 @@@ static int pod_create_files2(struct dev
+  /*
+  	 Try to init POD device.
+  */
+++<<<<<<< HEAD:drivers/staging/line6/pod.c
+ +static int pod_try_init(struct usb_interface *interface,
+ +			struct usb_line6_pod *pod)
+++=======
++ static int pod_init(struct usb_interface *interface,
++ 		    struct usb_line6 *line6)
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/pod.c
+  {
+  	int err;
+ -	struct usb_line6_pod *pod = (struct usb_line6_pod *) line6;
+ -
+ -	line6->process_message = line6_pod_process_message;
+ -	line6->disconnect = line6_pod_disconnect;
+ +	struct usb_line6 *line6 = &pod->line6;
+  
+  	init_timer(&pod->startup_timer);
+  	INIT_WORK(&pod->startup_work, pod_startup4);
+@@@ -407,44 -490,136 +432,156 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/line6/pod.c
+ +/*
+ +	 Init POD device (and clean up in case of failure).
+ +*/
+ +int line6_pod_init(struct usb_interface *interface, struct usb_line6_pod *pod)
+ +{
+ +	int err = pod_try_init(interface, pod);
+ +
+ +	if (err < 0)
+ +		pod_destruct(interface);
+ +
+ +	return err;
+ +}
+++=======
++ #define LINE6_DEVICE(prod) USB_DEVICE(0x0e41, prod)
++ #define LINE6_IF_NUM(prod, n) USB_DEVICE_INTERFACE_NUMBER(0x0e41, prod, n)
++ 
++ /* table of devices that work with this driver */
++ static const struct usb_device_id pod_id_table[] = {
++ 	{ LINE6_DEVICE(0x4250),    .driver_info = LINE6_BASSPODXT },
++ 	{ LINE6_DEVICE(0x4642),    .driver_info = LINE6_BASSPODXTLIVE },
++ 	{ LINE6_DEVICE(0x4252),    .driver_info = LINE6_BASSPODXTPRO },
++ 	{ LINE6_IF_NUM(0x5051, 1), .driver_info = LINE6_POCKETPOD },
++ 	{ LINE6_DEVICE(0x5044),    .driver_info = LINE6_PODXT },
++ 	{ LINE6_IF_NUM(0x4650, 0), .driver_info = LINE6_PODXTLIVE_POD },
++ 	{ LINE6_DEVICE(0x5050),    .driver_info = LINE6_PODXTPRO },
++ 	{}
++ };
++ 
++ MODULE_DEVICE_TABLE(usb, pod_id_table);
++ 
++ static const struct line6_properties pod_properties_table[] = {
++ 	[LINE6_BASSPODXT] = {
++ 		.id = "BassPODxt",
++ 		.name = "BassPODxt",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 5,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_BASSPODXTLIVE] = {
++ 		.id = "BassPODxtLive",
++ 		.name = "BassPODxt Live",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 1,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_BASSPODXTPRO] = {
++ 		.id = "BassPODxtPro",
++ 		.name = "BassPODxt Pro",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 5,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_POCKETPOD] = {
++ 		.id = "PocketPOD",
++ 		.name = "Pocket POD",
++ 		.capabilities	= LINE6_CAP_CONTROL,
++ 		.altsetting = 0,
++ 		.ep_ctrl_r = 0x82,
++ 		.ep_ctrl_w = 0x02,
++ 		/* no audio channel */
++ 	},
++ 	[LINE6_PODXT] = {
++ 		.id = "PODxt",
++ 		.name = "PODxt",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 5,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_PODXTLIVE_POD] = {
++ 		.id = "PODxtLive",
++ 		.name = "PODxt Live",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 1,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_PODXTPRO] = {
++ 		.id = "PODxtPro",
++ 		.name = "PODxt Pro",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 5,
++ 		.ep_ctrl_r = 0x84,
++ 		.ep_ctrl_w = 0x03,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ };
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/pod.c
+  
+  /*
+ -	Probe USB device.
+ +	POD device disconnected.
+  */
+ -static int pod_probe(struct usb_interface *interface,
+ -		     const struct usb_device_id *id)
+ +void line6_pod_disconnect(struct usb_interface *interface)
+  {
+  	struct usb_line6_pod *pod;
+  
+++<<<<<<< HEAD:drivers/staging/line6/pod.c
+ +	if (interface == NULL)
+ +		return;
+ +	pod = usb_get_intfdata(interface);
+ +
+ +	if (pod != NULL) {
+ +		struct snd_line6_pcm *line6pcm = pod->line6.line6pcm;
+ +		struct device *dev = &interface->dev;
+ +
+ +		if (line6pcm != NULL)
+ +			line6_pcm_disconnect(line6pcm);
+ +
+ +		if (dev != NULL) {
+ +			/* remove sysfs entries: */
+ +			device_remove_file(dev, &dev_attr_device_id);
+ +			device_remove_file(dev, &dev_attr_firmware_version);
+ +			device_remove_file(dev, &dev_attr_serial_number);
+ +		}
+ +	}
+ +
+ +	pod_destruct(interface);
+++=======
++ 	pod = kzalloc(sizeof(*pod), GFP_KERNEL);
++ 	if (!pod)
++ 		return -ENODEV;
++ 	return line6_probe(interface, &pod->line6,
++ 			   &pod_properties_table[id->driver_info],
++ 			   pod_init);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/pod.c
+  }
+ -
+ -static struct usb_driver pod_driver = {
+ -	.name = KBUILD_MODNAME,
+ -	.probe = pod_probe,
+ -	.disconnect = line6_disconnect,
+ -#ifdef CONFIG_PM
+ -	.suspend = line6_suspend,
+ -	.resume = line6_resume,
+ -	.reset_resume = line6_resume,
+ -#endif
+ -	.id_table = pod_id_table,
+ -};
+ -
+ -module_usb_driver(pod_driver);
+ -
+ -MODULE_DESCRIPTION("Line6 POD USB driver");
+ -MODULE_LICENSE("GPL");
+diff --cc drivers/staging/line6/podhd.c
+index 62080212084f,1d11185780e3..000000000000
+--- a/drivers/staging/line6/podhd.c
++++ b/drivers/staging/line6/podhd.c
+@@@ -12,10 -12,26 +12,9 @@@
+  #include <sound/core.h>
+  #include <sound/pcm.h>
+  
+- #include "audio.h"
+  #include "driver.h"
+  #include "pcm.h"
+ -#include "usbdefs.h"
+ -
+ -enum {
+ -	LINE6_PODHD300,
+ -	LINE6_PODHD400,
+ -	LINE6_PODHD500_0,
+ -	LINE6_PODHD500_1,
+ -};
+ -
+ -struct usb_line6_podhd {
+ -	/**
+ -		Generic Line6 USB data.
+ -	*/
+ -	struct usb_line6 line6;
+ -};
+ +#include "podhd.h"
+  
+  #define PODHD_BYTES_PER_FRAME 6	/* 24bit audio (stereo) */
+  
+@@@ -69,34 -85,17 +68,40 @@@ static struct line6_pcm_properties podh
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/staging/line6/podhd.c
+ +	POD HD destructor.
+ +*/
+ +static void podhd_destruct(struct usb_interface *interface)
+ +{
+ +	struct usb_line6_podhd *podhd = usb_get_intfdata(interface);
+ +
+ +	if (podhd == NULL)
+ +		return;
+ +	line6_cleanup_audio(&podhd->line6);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/podhd.c
+  	Try to init POD HD device.
+  */
+- static int podhd_try_init(struct usb_interface *interface,
+- 			  struct usb_line6_podhd *podhd)
++ static int podhd_init(struct usb_interface *interface,
++ 		      struct usb_line6 *line6)
+  {
++ 	struct usb_line6_podhd *podhd = (struct usb_line6_podhd *) line6;
+  	int err;
+- 	struct usb_line6 *line6 = &podhd->line6;
+  
+  	if ((interface == NULL) || (podhd == NULL))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD:drivers/staging/line6/podhd.c
+ +	/* initialize audio system: */
+ +	err = line6_init_audio(line6);
+ +	if (err < 0)
+ +		return err;
+ +
+++=======
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/podhd.c
+  	/* initialize MIDI subsystem: */
+  	err = line6_init_midi(line6);
+  	if (err < 0)
+@@@ -108,41 -107,103 +113,53 @@@
+  		return err;
+  
+  	/* register USB audio system: */
+- 	err = line6_register_audio(line6);
+- 	return err;
++ 	return snd_card_register(line6->card);
+  }
+  
+ -#define LINE6_DEVICE(prod) USB_DEVICE(0x0e41, prod)
+ -#define LINE6_IF_NUM(prod, n) USB_DEVICE_INTERFACE_NUMBER(0x0e41, prod, n)
+ +/*
+++<<<<<<< HEAD:drivers/staging/line6/podhd.c
+ +	Init POD HD device (and clean up in case of failure).
+ +*/
+ +int line6_podhd_init(struct usb_interface *interface,
+ +		     struct usb_line6_podhd *podhd)
+ +{
+ +	int err = podhd_try_init(interface, podhd);
+  
+ -/* table of devices that work with this driver */
+ -static const struct usb_device_id podhd_id_table[] = {
+ -	{ LINE6_DEVICE(0x5057),    .driver_info = LINE6_PODHD300 },
+ -	{ LINE6_DEVICE(0x5058),    .driver_info = LINE6_PODHD400 },
+ -	{ LINE6_IF_NUM(0x414D, 0), .driver_info = LINE6_PODHD500_0 },
+ -	{ LINE6_IF_NUM(0x414D, 1), .driver_info = LINE6_PODHD500_1 },
+ -	{}
+ -};
+ +	if (err < 0)
+ +		podhd_destruct(interface);
+  
+ -MODULE_DEVICE_TABLE(usb, podhd_id_table);
+ -
+ -static const struct line6_properties podhd_properties_table[] = {
+ -	[LINE6_PODHD300] = {
+ -		.id = "PODHD300",
+ -		.name = "POD HD300",
+ -		.capabilities	= LINE6_CAP_CONTROL
+ -				| LINE6_CAP_PCM
+ -				| LINE6_CAP_HWMON,
+ -		.altsetting = 5,
+ -		.ep_ctrl_r = 0x84,
+ -		.ep_ctrl_w = 0x03,
+ -		.ep_audio_r = 0x82,
+ -		.ep_audio_w = 0x01,
+ -	},
+ -	[LINE6_PODHD400] = {
+ -		.id = "PODHD400",
+ -		.name = "POD HD400",
+ -		.capabilities	= LINE6_CAP_CONTROL
+ -				| LINE6_CAP_PCM
+ -				| LINE6_CAP_HWMON,
+ -		.altsetting = 5,
+ -		.ep_ctrl_r = 0x84,
+ -		.ep_ctrl_w = 0x03,
+ -		.ep_audio_r = 0x82,
+ -		.ep_audio_w = 0x01,
+ -	},
+ -	[LINE6_PODHD500_0] = {
+ -		.id = "PODHD500",
+ -		.name = "POD HD500",
+ -		.capabilities	= LINE6_CAP_CONTROL
+ -				| LINE6_CAP_PCM
+ -				| LINE6_CAP_HWMON,
+ -		.altsetting = 1,
+ -		.ep_ctrl_r = 0x81,
+ -		.ep_ctrl_w = 0x01,
+ -		.ep_audio_r = 0x86,
+ -		.ep_audio_w = 0x02,
+ -	},
+ -	[LINE6_PODHD500_1] = {
+ -		.id = "PODHD500",
+ -		.name = "POD HD500",
+ -		.capabilities	= LINE6_CAP_CONTROL
+ -				| LINE6_CAP_PCM
+ -				| LINE6_CAP_HWMON,
+ -		.altsetting = 1,
+ -		.ep_ctrl_r = 0x81,
+ -		.ep_ctrl_w = 0x01,
+ -		.ep_audio_r = 0x86,
+ -		.ep_audio_w = 0x02,
+ -	},
+ -};
+ +	return err;
+ +}
+  
+  /*
+ +	POD HD device disconnected.
+++=======
++ 	Probe USB device.
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/podhd.c
+  */
+ -static int podhd_probe(struct usb_interface *interface,
+ -		       const struct usb_device_id *id)
+ +void line6_podhd_disconnect(struct usb_interface *interface)
+  {
+  	struct usb_line6_podhd *podhd;
+  
+++<<<<<<< HEAD:drivers/staging/line6/podhd.c
+ +	if (interface == NULL)
+ +		return;
+ +	podhd = usb_get_intfdata(interface);
+ +
+ +	if (podhd != NULL) {
+ +		struct snd_line6_pcm *line6pcm = podhd->line6.line6pcm;
+ +
+ +		if (line6pcm != NULL)
+ +			line6_pcm_disconnect(line6pcm);
+ +	}
+ +
+ +	podhd_destruct(interface);
+++=======
++ 	podhd = kzalloc(sizeof(*podhd), GFP_KERNEL);
++ 	if (!podhd)
++ 		return -ENODEV;
++ 	return line6_probe(interface, &podhd->line6,
++ 			   &podhd_properties_table[id->driver_info],
++ 			   podhd_init);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/podhd.c
+  }
+ -
+ -static struct usb_driver podhd_driver = {
+ -	.name = KBUILD_MODNAME,
+ -	.probe = podhd_probe,
+ -	.disconnect = line6_disconnect,
+ -#ifdef CONFIG_PM
+ -	.suspend = line6_suspend,
+ -	.resume = line6_resume,
+ -	.reset_resume = line6_resume,
+ -#endif
+ -	.id_table = podhd_id_table,
+ -};
+ -
+ -module_usb_driver(podhd_driver);
+ -
+ -MODULE_DESCRIPTION("Line6 PODHD USB driver");
+ -MODULE_LICENSE("GPL");
+diff --cc drivers/staging/line6/toneport.c
+index 4f8fc09cde1e,3097a75a9bec..000000000000
+--- a/drivers/staging/line6/toneport.c
++++ b/drivers/staging/line6/toneport.c
+@@@ -11,9 -11,12 +11,8 @@@
+   */
+  
+  #include <linux/wait.h>
+ -#include <linux/usb.h>
+ -#include <linux/slab.h>
+ -#include <linux/module.h>
+ -#include <sound/core.h>
+  #include <sound/control.h>
+  
+- #include "audio.h"
+  #include "capture.h"
+  #include "driver.h"
+  #include "playback.h"
+@@@ -321,22 -363,40 +308,55 @@@ static void toneport_setup(struct usb_l
+  }
+  
+  /*
+++<<<<<<< HEAD:drivers/staging/line6/toneport.c
+ +	 Try to init Toneport device.
+ +*/
+ +static int toneport_try_init(struct usb_interface *interface,
+ +			     struct usb_line6_toneport *toneport)
+++=======
++ 	Toneport device disconnected.
++ */
++ static void line6_toneport_disconnect(struct usb_interface *interface)
++ {
++ 	struct usb_line6_toneport *toneport;
++ 	u16 idProduct;
++ 
++ 	if (interface == NULL)
++ 		return;
++ 
++ 	toneport = usb_get_intfdata(interface);
++ 	del_timer_sync(&toneport->timer);
++ 	idProduct = le16_to_cpu(toneport->line6.usbdev->descriptor.idProduct);
++ 
++ 	if (toneport_has_led(idProduct)) {
++ 		device_remove_file(&interface->dev, &dev_attr_led_red);
++ 		device_remove_file(&interface->dev, &dev_attr_led_green);
++ 	}
++ }
++ 
++ 
++ /*
++ 	 Try to init Toneport device.
++ */
++ static int toneport_init(struct usb_interface *interface,
++ 			 struct usb_line6 *line6)
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/toneport.c
+  {
+  	int err;
+ -	struct usb_line6_toneport *toneport =  (struct usb_line6_toneport *) line6;
+ +	struct usb_line6 *line6 = &toneport->line6;
+ +	struct usb_device *usbdev = line6->usbdev;
+  
+  	if ((interface == NULL) || (toneport == NULL))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD:drivers/staging/line6/toneport.c
+ +	/* initialize audio system: */
+ +	err = line6_init_audio(line6);
+ +	if (err < 0)
+ +		return err;
+++=======
++ 	line6->disconnect = line6_toneport_disconnect;
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/toneport.c
+  
+  	/* initialize PCM subsystem: */
+  	err = line6_init_pcm(line6, &toneport_pcm_properties);
+@@@ -362,13 -422,11 +382,8 @@@
+  					     line6->line6pcm));
+  		if (err < 0)
+  			return err;
+ -
+ -	default:
+ -		break;
+  	}
+  
+- 	/* register audio system: */
+- 	err = line6_register_audio(line6);
+- 	if (err < 0)
+- 		return err;
+- 
+  	line6_read_serial_number(line6, &toneport->serial_number);
+  	line6_read_data(line6, 0x80c2, &toneport->firmware_version, 1);
+  
+@@@ -385,23 -443,11 +400,28 @@@
+  		    (unsigned long)toneport);
+  	mod_timer(&toneport->timer, jiffies + TONEPORT_PCM_DELAY * HZ);
+  
+++<<<<<<< HEAD:drivers/staging/line6/toneport.c
+ +	return 0;
+ +}
+ +
+ +/*
+ +	 Init Toneport device (and clean up in case of failure).
+ +*/
+ +int line6_toneport_init(struct usb_interface *interface,
+ +			struct usb_line6_toneport *toneport)
+ +{
+ +	int err = toneport_try_init(interface, toneport);
+ +
+ +	if (err < 0)
+ +		toneport_destruct(interface);
+ +
+ +	return err;
+++=======
++ 	/* register audio system: */
++ 	return snd_card_register(line6->card);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/toneport.c
+  }
+  
+ -#ifdef CONFIG_PM
+  /*
+  	Resume Toneport device after reset.
+  */
+@@@ -417,25 -549,28 +437,35 @@@ void line6_toneport_disconnect(struct u
+  {
+  	struct usb_line6_toneport *toneport;
+  
+++<<<<<<< HEAD:drivers/staging/line6/toneport.c
+ +	if (interface == NULL)
+ +		return;
+ +
+ +	toneport = usb_get_intfdata(interface);
+ +	del_timer_sync(&toneport->timer);
+ +
+ +	if (toneport_has_led(toneport->line6.usbdev->descriptor.idProduct)) {
+ +		device_remove_file(&interface->dev, &dev_attr_led_red);
+ +		device_remove_file(&interface->dev, &dev_attr_led_green);
+ +	}
+ +
+ +	if (toneport != NULL) {
+ +		struct snd_line6_pcm *line6pcm = toneport->line6.line6pcm;
+ +
+ +		if (line6pcm != NULL) {
+ +			line6_pcm_release(line6pcm, LINE6_BITS_PCM_MONITOR);
+ +			line6_pcm_disconnect(line6pcm);
+ +		}
+ +	}
+ +
+ +	toneport_destruct(interface);
+++=======
++ 	toneport = kzalloc(sizeof(*toneport), GFP_KERNEL);
++ 	if (!toneport)
++ 		return -ENODEV;
++ 	toneport->type = id->driver_info;
++ 	return line6_probe(interface, &toneport->line6,
++ 			   &toneport_properties_table[id->driver_info],
++ 			   toneport_init);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/toneport.c
+  }
+ -
+ -static struct usb_driver toneport_driver = {
+ -	.name = KBUILD_MODNAME,
+ -	.probe = toneport_probe,
+ -	.disconnect = line6_disconnect,
+ -#ifdef CONFIG_PM
+ -	.suspend = line6_suspend,
+ -	.resume = line6_resume,
+ -	.reset_resume = toneport_reset_resume,
+ -#endif
+ -	.id_table = toneport_id_table,
+ -};
+ -
+ -module_usb_driver(toneport_driver);
+ -
+ -MODULE_DESCRIPTION("TonePort USB driver");
+ -MODULE_LICENSE("GPL");
+diff --cc drivers/staging/line6/variax.c
+index bd0f694fa8d8,a591c2c5794f..000000000000
+--- a/drivers/staging/line6/variax.c
++++ b/drivers/staging/line6/variax.c
+@@@ -10,10 -10,64 +10,9 @@@
+   */
+  
+  #include <linux/slab.h>
+ -#include <linux/spinlock.h>
+ -#include <linux/usb.h>
+ -#include <linux/wait.h>
+ -#include <linux/module.h>
+ -#include <sound/core.h>
+  
+- #include "audio.h"
+  #include "driver.h"
+ -#include "usbdefs.h"
+ -
+ -#define VARIAX_STARTUP_DELAY1 1000
+ -#define VARIAX_STARTUP_DELAY3 100
+ -#define VARIAX_STARTUP_DELAY4 100
+ -
+ -/*
+ -	Stages of Variax startup procedure
+ -*/
+ -enum {
+ -	VARIAX_STARTUP_INIT = 1,
+ -	VARIAX_STARTUP_VERSIONREQ,
+ -	VARIAX_STARTUP_WAIT,
+ -	VARIAX_STARTUP_ACTIVATE,
+ -	VARIAX_STARTUP_WORKQUEUE,
+ -	VARIAX_STARTUP_SETUP,
+ -	VARIAX_STARTUP_LAST = VARIAX_STARTUP_SETUP - 1
+ -};
+ -
+ -enum {
+ -	LINE6_PODXTLIVE_VARIAX,
+ -	LINE6_VARIAX
+ -};
+ -
+ -struct usb_line6_variax {
+ -	/**
+ -		Generic Line6 USB data.
+ -	*/
+ -	struct usb_line6 line6;
+ -
+ -	/**
+ -		Buffer for activation code.
+ -	*/
+ -	unsigned char *buffer_activate;
+ -
+ -	/**
+ -		Handler for device initializaton.
+ -	*/
+ -	struct work_struct startup_work;
+ -
+ -	/**
+ -		Timers for device initializaton.
+ -	*/
+ -	struct timer_list startup_timer1;
+ -	struct timer_list startup_timer2;
+ -
+ -	/**
+ -		Current progress in startup procedure.
+ -	*/
+ -	int startup_progress;
+ -};
+ +#include "variax.h"
+  
+  #define VARIAX_OFFSET_ACTIVATE 7
+  
+@@@ -171,11 -231,15 +173,16 @@@ static void line6_variax_disconnect(str
+  /*
+  	 Try to init workbench device.
+  */
+++<<<<<<< HEAD:drivers/staging/line6/variax.c
+ +static int variax_try_init(struct usb_interface *interface,
+ +			   struct usb_line6_variax *variax)
+++=======
++ static int variax_init(struct usb_interface *interface,
++ 		       struct usb_line6 *line6)
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/variax.c
+  {
+ -	struct usb_line6_variax *variax = (struct usb_line6_variax *) line6;
+  	int err;
+  
+ -	line6->process_message = line6_variax_process_message;
+ -	line6->disconnect = line6_variax_disconnect;
+ -
+  	init_timer(&variax->startup_timer1);
+  	init_timer(&variax->startup_timer2);
+  	INIT_WORK(&variax->startup_work, variax_startup6);
+@@@ -187,16 -251,9 +194,11 @@@
+  	variax->buffer_activate = kmemdup(variax_activate,
+  					  sizeof(variax_activate), GFP_KERNEL);
+  
+ -	if (variax->buffer_activate == NULL)
+ +	if (variax->buffer_activate == NULL) {
+ +		dev_err(&interface->dev, "Out of memory\n");
+  		return -ENOMEM;
+ +	}
+  
+- 	/* initialize audio system: */
+- 	err = line6_init_audio(&variax->line6);
+- 	if (err < 0)
+- 		return err;
+- 
+  	/* initialize MIDI subsystem: */
+  	err = line6_init_midi(&variax->line6);
+  	if (err < 0)
+@@@ -207,27 -264,71 +209,76 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/line6/variax.c
+ +/*
+ +	 Init workbench device (and clean up in case of failure).
+ +*/
+ +int line6_variax_init(struct usb_interface *interface,
+ +		      struct usb_line6_variax *variax)
+ +{
+ +	int err = variax_try_init(interface, variax);
+ +
+ +	if (err < 0)
+ +		variax_destruct(interface);
+ +
+ +	return err;
+ +}
+++=======
++ #define LINE6_DEVICE(prod) USB_DEVICE(0x0e41, prod)
++ #define LINE6_IF_NUM(prod, n) USB_DEVICE_INTERFACE_NUMBER(0x0e41, prod, n)
++ 
++ /* table of devices that work with this driver */
++ static const struct usb_device_id variax_id_table[] = {
++ 	{ LINE6_IF_NUM(0x4650, 1), .driver_info = LINE6_PODXTLIVE_VARIAX },
++ 	{ LINE6_DEVICE(0x534d),    .driver_info = LINE6_VARIAX },
++ 	{}
++ };
++ 
++ MODULE_DEVICE_TABLE(usb, variax_id_table);
++ 
++ static const struct line6_properties variax_properties_table[] = {
++ 	[LINE6_PODXTLIVE_VARIAX] = {
++ 		.id = "PODxtLive",
++ 		.name = "PODxt Live",
++ 		.capabilities	= LINE6_CAP_CONTROL
++ 				| LINE6_CAP_PCM
++ 				| LINE6_CAP_HWMON,
++ 		.altsetting = 1,
++ 		.ep_ctrl_r = 0x86,
++ 		.ep_ctrl_w = 0x05,
++ 		.ep_audio_r = 0x82,
++ 		.ep_audio_w = 0x01,
++ 	},
++ 	[LINE6_VARIAX] = {
++ 		.id = "Variax",
++ 		.name = "Variax Workbench",
++ 		.capabilities	= LINE6_CAP_CONTROL,
++ 		.altsetting = 1,
++ 		.ep_ctrl_r = 0x82,
++ 		.ep_ctrl_w = 0x01,
++ 		/* no audio channel */
++ 	}
++ };
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/variax.c
+  
+  /*
+ -	Probe USB device.
+ +	Workbench device disconnected.
+  */
+ -static int variax_probe(struct usb_interface *interface,
+ -			const struct usb_device_id *id)
+ +void line6_variax_disconnect(struct usb_interface *interface)
+  {
+++<<<<<<< HEAD:drivers/staging/line6/variax.c
+ +	if (interface == NULL)
+ +		return;
+ +
+ +	variax_destruct(interface);
+++=======
++ 	struct usb_line6_variax *variax;
++ 
++ 	variax = kzalloc(sizeof(*variax), GFP_KERNEL);
++ 	if (!variax)
++ 		return -ENODEV;
++ 	return line6_probe(interface, &variax->line6,
++ 			   &variax_properties_table[id->driver_info],
++ 			   variax_init);
+++>>>>>>> 85a9339becf0 (ALSA: line6: Reorganize card resource handling):sound/usb/line6/variax.c
+  }
+ -
+ -static struct usb_driver variax_driver = {
+ -	.name = KBUILD_MODNAME,
+ -	.probe = variax_probe,
+ -	.disconnect = line6_disconnect,
+ -#ifdef CONFIG_PM
+ -	.suspend = line6_suspend,
+ -	.resume = line6_resume,
+ -	.reset_resume = line6_resume,
+ -#endif
+ -	.id_table = variax_id_table,
+ -};
+ -
+ -module_usb_driver(variax_driver);
+ -
+ -MODULE_DESCRIPTION("Vairax Workbench USB driver");
+ -MODULE_LICENSE("GPL");
+* Unmerged path drivers/staging/line6/audio.c
+* Unmerged path drivers/staging/line6/audio.h
+* Unmerged path sound/usb/line6/Makefile
+* Unmerged path drivers/staging/line6/audio.c
+* Unmerged path drivers/staging/line6/audio.h
+diff --git a/drivers/staging/line6/capture.c b/drivers/staging/line6/capture.c
+index 93bd813139f8..ff145bbb57ba 100644
+--- a/drivers/staging/line6/capture.c
++++ b/drivers/staging/line6/capture.c
+@@ -14,7 +14,6 @@
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ 
+-#include "audio.h"
+ #include "capture.h"
+ #include "driver.h"
+ #include "pcm.h"
+* Unmerged path drivers/staging/line6/driver.c
+diff --git a/drivers/staging/line6/midi.c b/drivers/staging/line6/midi.c
+index e3f9a53dbd96..3b543d295adb 100644
+--- a/drivers/staging/line6/midi.c
++++ b/drivers/staging/line6/midi.c
+@@ -14,7 +14,6 @@
+ #include <sound/core.h>
+ #include <sound/rawmidi.h>
+ 
+-#include "audio.h"
+ #include "driver.h"
+ #include "midi.h"
+ #include "pod.h"
+diff --git a/drivers/staging/line6/pcm.c b/drivers/staging/line6/pcm.c
+index a62f229f286a..6e741477d795 100644
+--- a/drivers/staging/line6/pcm.c
++++ b/drivers/staging/line6/pcm.c
+@@ -15,7 +15,6 @@
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ 
+-#include "audio.h"
+ #include "capture.h"
+ #include "driver.h"
+ #include "playback.h"
+diff --git a/drivers/staging/line6/playback.c b/drivers/staging/line6/playback.c
+index feb51c49e316..20e536ea33b7 100644
+--- a/drivers/staging/line6/playback.c
++++ b/drivers/staging/line6/playback.c
+@@ -14,7 +14,6 @@
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ 
+-#include "audio.h"
+ #include "capture.h"
+ #include "driver.h"
+ #include "pcm.h"
+* Unmerged path drivers/staging/line6/pod.c
+* Unmerged path drivers/staging/line6/podhd.c
+* Unmerged path drivers/staging/line6/toneport.c
+* Unmerged path drivers/staging/line6/variax.c
+* Unmerged path sound/usb/line6/Makefile
