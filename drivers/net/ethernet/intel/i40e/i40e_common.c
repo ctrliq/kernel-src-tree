@@ -3068,6 +3068,9 @@ static void i40e_parse_discover_capabilities(struct i40e_hw *hw, void *buff,
 			break;
 		case I40E_DEV_FUNC_CAP_MSIX:
 			p->num_msix_vectors = number;
+			i40e_debug(hw, I40E_DEBUG_INIT,
+				   "HW Capability: MSIX vector count = %d\n",
+				   p->num_msix_vectors);
 			break;
 		case I40E_DEV_FUNC_CAP_MSIX_VF:
 			p->num_msix_vectors_vf = number;
