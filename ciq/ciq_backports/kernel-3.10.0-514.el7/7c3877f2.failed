@@ -1,0 +1,133 @@
+hv_netvsc: Implement batching in send buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit 7c3877f275ee6b479fa828947811c76d431501ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7c3877f2.failed
+
+With this patch, we can send out multiple RNDIS data packets in one send buffer
+slot and one VMBus message. It reduces the overhead associated with VMBus messages.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7c3877f275ee6b479fa828947811c76d431501ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 48afb9d964ab,b81bd37d3afb..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -686,14 -691,25 +692,31 @@@ static u32 netvsc_get_next_send_section
+  	return ret_val;
+  }
+  
+++<<<<<<< HEAD
+ +u32 netvsc_copy_to_send_buf(struct netvsc_device *net_device,
+ +			    unsigned int section_index,
+ +			    struct hv_netvsc_packet *packet)
+++=======
++ static u32 netvsc_copy_to_send_buf(struct netvsc_device *net_device,
++ 				   unsigned int section_index,
++ 				   u32 pend_size,
++ 				   struct hv_netvsc_packet *packet)
+++>>>>>>> 7c3877f275ee (hv_netvsc: Implement batching in send buffer)
+  {
+  	char *start = net_device->send_buf;
+- 	char *dest = (start + (section_index * net_device->send_section_size));
++ 	char *dest = start + (section_index * net_device->send_section_size)
++ 		     + pend_size;
+  	int i;
+  	u32 msg_size = 0;
++ 	u32 padding = 0;
++ 	u32 remain = packet->total_data_buflen % net_device->pkt_align;
++ 
++ 	/* Add padding */
++ 	if (packet->is_data_pkt && packet->xmit_more && remain) {
++ 		padding = net_device->pkt_align - remain;
++ 		packet->rndis_msg->msg_len += padding;
++ 		packet->total_data_buflen += padding;
++ 	}
+  
+  	for (i = 0; i < packet->page_buf_cnt; i++) {
+  		char *src = phys_to_virt(packet->page_buf[i].pfn << PAGE_SHIFT);
+diff --cc drivers/net/hyperv/rndis_filter.c
+index caa0b2699e5c,a2b185a58075..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -868,7 -854,9 +869,13 @@@ static int rndis_filter_init_device(str
+  	struct rndis_initialize_request *init;
+  	struct rndis_initialize_complete *init_complete;
+  	u32 status;
+++<<<<<<< HEAD
+ +	int ret, t;
+++=======
++ 	int ret;
++ 	unsigned long t;
++ 	struct netvsc_device *nvdev = dev->net_dev;
+++>>>>>>> 7c3877f275ee (hv_netvsc: Implement batching in send buffer)
+  
+  	request = get_rndis_request(dev, RNDIS_MSG_INIT,
+  			RNDIS_MESSAGE_SIZE(struct rndis_initialize_request));
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index 4aebfc3f3dc3..fbbbfeeec020 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -132,6 +132,7 @@ struct hv_netvsc_packet {
+ 
+ 	struct hv_device *device;
+ 	bool is_data_pkt;
++	bool xmit_more; /* from skb */
+ 	u16 vlan_tci;
+ 
+ 	u16 q_idx;
+@@ -596,7 +597,16 @@ struct nvsp_message {
+ 
+ #define VRSS_SEND_TAB_SIZE 16
+ 
+-/* Per netvsc channel-specific */
++#define RNDIS_MAX_PKT_DEFAULT 8
++#define RNDIS_PKT_ALIGN_DEFAULT 8
++
++struct multi_send_data {
++	spinlock_t lock; /* protect struct multi_send_data */
++	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++	u32 count; /* counter of batched packets */
++};
++
++/* Per netvsc device */
+ struct netvsc_device {
+ 	struct hv_device *dev;
+ 
+@@ -647,6 +657,10 @@ struct netvsc_device {
+ 	unsigned char *cb_buffer;
+ 	/* The sub channel callback buffer */
+ 	unsigned char *sub_cb_buf;
++
++	struct multi_send_data msd[NR_CPUS];
++	u32 max_pkt; /* max number of pkt in one send, e.g. 8 */
++	u32 pkt_align; /* alignment bytes, e.g. 8 */
+ };
+ 
+ /* NdisInitialize message */
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972..c981adf21a27 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -413,6 +413,8 @@ static int netvsc_start_xmit(struct sk_buff *skb, struct net_device *net)
+ 		return NETDEV_TX_OK;
+ 	}
+ 
++	packet->xmit_more = skb->xmit_more;
++
+ 	packet->vlan_tci = skb->vlan_tci;
+ 
+ 	packet->q_idx = skb_get_queue_mapping(skb);
+* Unmerged path drivers/net/hyperv/rndis_filter.c
