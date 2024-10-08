@@ -1,0 +1,178 @@
+bonding: alb: remove curr_slave_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 62c5f5185397f4bd8e5defe6fcb86420deeb2b38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/62c5f518.failed
+
+First in rlb_teach_disabled_mac_on_primary() it's okay to remove
+curr_slave_lock as all callers except bond_alb_monitor() already hold
+RTNL, and in case bond_alb_monitor() is executing we can at most have a
+period with bad throughput (very unlikely though).
+In bond_alb_monitor() it's okay to remove the read_lock as the slave
+list is walked with RCU and the worst that could happen is another
+transmitter at the same time and thus for a period which currently is 10
+seconds (bond_alb.h: BOND_ALB_LP_TICKS).
+And bond_alb_handle_active_change() is okay because it's always called
+with RTNL. Removed the ASSERT_RTNL() because it'll be inserted in the
+parent function in a following patch.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 62c5f5185397f4bd8e5defe6fcb86420deeb2b38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,cf4ede8594ff..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -471,12 -512,8 +471,14 @@@ static void rlb_clear_slave(struct bond
+  
+  	_unlock_rx_hashtbl_bh(bond);
+  
+++<<<<<<< HEAD
+ +	write_lock_bh(&bond->curr_slave_lock);
+ +
+ +	if (slave != bond->curr_active_slave)
+++=======
++ 	if (slave != bond_deref_active_protected(bond))
+++>>>>>>> 62c5f5185397 (bonding: alb: remove curr_slave_lock)
+  		rlb_teach_disabled_mac_on_primary(bond, slave->dev->dev_addr);
+- 
+- 	write_unlock_bh(&bond->curr_slave_lock);
+  }
+  
+  static void rlb_update_client(struct rlb_client_info *client_info)
+@@@ -1472,30 -1589,27 +1474,46 @@@ void bond_alb_monitor(struct work_struc
+  
+  	/* send learning packets */
+  	if (bond_info->lp_counter >= BOND_ALB_LP_TICKS(bond)) {
+++<<<<<<< HEAD
+ +		/* change of curr_active_slave involves swapping of mac addresses.
+ +		 * in order to avoid this swapping from happening while
+ +		 * sending the learning packets, the curr_slave_lock must be held for
+ +		 * read.
+ +		 */
+ +		read_lock(&bond->curr_slave_lock);
+ +
+ +		bond_for_each_slave(bond, slave, i) {
+ +			alb_send_learning_packets(slave, slave->dev->dev_addr);
+++=======
++ 		bool strict_match;
++ 
++ 		bond_for_each_slave_rcu(bond, slave, iter) {
++ 			/* If updating current_active, use all currently
++ 			 * user mac addreses (!strict_match).  Otherwise, only
++ 			 * use mac of the slave device.
++ 			 * In RLB mode, we always use strict matches.
++ 			 */
++ 			strict_match = (slave != rcu_access_pointer(bond->curr_active_slave) ||
++ 					bond_info->rlb_enabled);
++ 			alb_send_learning_packets(slave, slave->dev->dev_addr,
++ 						  strict_match);
+++>>>>>>> 62c5f5185397 (bonding: alb: remove curr_slave_lock)
+  		}
+- 
+- 		read_unlock(&bond->curr_slave_lock);
+- 
+  		bond_info->lp_counter = 0;
+  	}
+  
+  	/* rebalance tx traffic */
+  	if (bond_info->tx_rebalance_counter >= BOND_TLB_REBALANCE_TICKS) {
+++<<<<<<< HEAD
+ +
+ +		read_lock(&bond->curr_slave_lock);
+ +
+ +		bond_for_each_slave(bond, slave, i) {
+++=======
++ 		bond_for_each_slave_rcu(bond, slave, iter) {
+++>>>>>>> 62c5f5185397 (bonding: alb: remove curr_slave_lock)
+  			tlb_clear_slave(bond, slave, 1);
+ -			if (slave == rcu_access_pointer(bond->curr_active_slave)) {
+ +			if (slave == bond->curr_active_slave) {
+  				SLAVE_TLB_INFO(slave).load =
+  					bond_info->unbalanced_load /
+  						BOND_TLB_REBALANCE_INTERVAL;
+@@@ -1629,24 -1755,19 +1644,31 @@@ void bond_alb_handle_link_change(struc
+   * Set the bond->curr_active_slave to @new_slave and handle
+   * mac address swapping and promiscuity changes as needed.
+   *
+++<<<<<<< HEAD
+ + * If new_slave is NULL, caller must hold curr_slave_lock or
+ + * bond->lock for write.
+ + *
+ + * If new_slave is not NULL, caller must hold RTNL, curr_slave_lock
+ + * for write.  Processing here may sleep, so no other locks may be held.
+++=======
++  * Caller must hold RTNL
+++>>>>>>> 62c5f5185397 (bonding: alb: remove curr_slave_lock)
+   */
+  void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave)
+- 	__releases(&bond->curr_slave_lock)
+- 	__acquires(&bond->curr_slave_lock)
+  {
+  	struct slave *swap_slave;
+ -	struct slave *curr_active;
+  
+++<<<<<<< HEAD
+ +	if (bond->curr_active_slave == new_slave) {
+++=======
++ 	curr_active = rtnl_dereference(bond->curr_active_slave);
++ 	if (curr_active == new_slave)
+++>>>>>>> 62c5f5185397 (bonding: alb: remove curr_slave_lock)
+  		return;
+ +	}
+  
+ -	if (curr_active && bond->alb_info.primary_is_promisc) {
+ -		dev_set_promiscuity(curr_active->dev, -1);
+ +	if (bond->curr_active_slave && bond->alb_info.primary_is_promisc) {
+ +		dev_set_promiscuity(bond->curr_active_slave->dev, -1);
+  		bond->alb_info.primary_is_promisc = 0;
+  		bond->alb_info.rlb_promisc_timeout_counter = 0;
+  	}
+@@@ -1669,15 -1789,10 +1691,11 @@@
+  	 * ignored so we can mess with their MAC addresses without
+  	 * fear of interference from transmit activity.
+  	 */
+ -	if (swap_slave)
+ +	if (swap_slave) {
+  		tlb_clear_slave(bond, swap_slave, 1);
+ +	}
+  	tlb_clear_slave(bond, new_slave, 1);
+  
+- 	write_unlock_bh(&bond->curr_slave_lock);
+- 
+- 	ASSERT_RTNL();
+- 
+  	/* in TLB mode, the slave might flip down/up with the old dev_addr,
+  	 * and thus filter bond->dev_addr's packets, so force bond's mac
+  	 */
+@@@ -1703,18 -1818,13 +1721,16 @@@
+  	} else {
+  		/* set the new_slave to the bond mac address */
+  		alb_set_slave_mac_addr(new_slave, bond->dev->dev_addr);
+ -		alb_send_learning_packets(new_slave, bond->dev->dev_addr,
+ -					  false);
+ +		alb_send_learning_packets(new_slave, bond->dev->dev_addr);
+  	}
+- 
+- 	write_lock_bh(&bond->curr_slave_lock);
+  }
+  
+ -/* Called with RTNL */
+ +/*
+ + * Called with RTNL
+ + */
+  int bond_alb_set_mac_address(struct net_device *bond_dev, void *addr)
+ +	__acquires(&bond->lock)
+ +	__releases(&bond->lock)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+  	struct sockaddr *sa = addr;
+* Unmerged path drivers/net/bonding/bond_alb.c
