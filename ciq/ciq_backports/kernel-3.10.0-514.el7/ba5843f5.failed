@@ -1,0 +1,334 @@
+ext4: use pre-zeroed blocks for DAX page faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.com>
+commit ba5843f51d468644b094674c0317c9ab95632caa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ba5843f5.failed
+
+Make DAX fault path use pre-zeroed blocks to avoid races with extent
+conversion and zeroing when two page faults to the same block happen.
+
+	Signed-off-by: Jan Kara <jack@suse.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit ba5843f51d468644b094674c0317c9ab95632caa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/ext4.h
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+diff --cc fs/ext4/ext4.h
+index 5dda1d21c88f,1e20fa94fcf6..000000000000
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@@ -2084,12 -2447,13 +2084,17 @@@ extern int ext4_group_add_blocks(handle
+  extern int ext4_trim_fs(struct super_block *, struct fstrim_range *);
+  
+  /* inode.c */
+ -int ext4_inode_is_fast_symlink(struct inode *inode);
+ -struct buffer_head *ext4_getblk(handle_t *, struct inode *, ext4_lblk_t, int);
+ -struct buffer_head *ext4_bread(handle_t *, struct inode *, ext4_lblk_t, int);
+ +struct buffer_head *ext4_getblk(handle_t *, struct inode *,
+ +						ext4_lblk_t, int, int *);
+ +struct buffer_head *ext4_bread(handle_t *, struct inode *,
+ +						ext4_lblk_t, int, int *);
+  int ext4_get_block_write(struct inode *inode, sector_t iblock,
+  			 struct buffer_head *bh_result, int create);
+++<<<<<<< HEAD
+++=======
++ int ext4_dax_mmap_get_block(struct inode *inode, sector_t iblock,
++ 			    struct buffer_head *bh_result, int create);
+++>>>>>>> ba5843f51d46 (ext4: use pre-zeroed blocks for DAX page faults)
+  int ext4_get_block(struct inode *inode, sector_t iblock,
+  				struct buffer_head *bh_result, int create);
+  int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,749b222e6498..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -191,11 -168,140 +191,148 @@@ ext4_file_write(struct kiocb *iocb, con
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	iocb->private = &overwrite; /* RHEL7 only - prevent DIO race */
+ +	if (unlikely(iocb->ki_filp->f_flags & O_DIRECT))
+ +		ret = ext4_file_dio_write(iocb, iov, nr_segs, pos);
+ +	else
+ +		ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
+++=======
++ 	ret = __generic_file_write_iter(iocb, from);
++ 	mutex_unlock(&inode->i_mutex);
++ 
++ 	if (ret > 0) {
++ 		ssize_t err;
++ 
++ 		err = generic_write_sync(file, iocb->ki_pos - ret, ret);
++ 		if (err < 0)
++ 			ret = err;
++ 	}
++ 	if (o_direct)
++ 		blk_finish_plug(&plug);
++ 
++ 	if (aio_mutex)
++ 		mutex_unlock(aio_mutex);
++ 	return ret;
++ 
++ out:
++ 	mutex_unlock(&inode->i_mutex);
++ 	if (aio_mutex)
++ 		mutex_unlock(aio_mutex);
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_FS_DAX
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 						EXT4_DATA_TRANS_BLOCKS(sb));
++ 	} else
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_fault(vma, vmf, ext4_dax_mmap_get_block, NULL);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 						pmd_t *pmd, unsigned int flags)
++ {
++ 	int result;
++ 	handle_t *handle = NULL;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	bool write = flags & FAULT_FLAG_WRITE;
++ 
++ 	if (write) {
++ 		sb_start_pagefault(sb);
++ 		file_update_time(vma->vm_file);
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 		handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
++ 				ext4_chunk_trans_blocks(inode,
++ 							PMD_SIZE / PAGE_SIZE));
++ 	} else
++ 		down_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	if (IS_ERR(handle))
++ 		result = VM_FAULT_SIGBUS;
++ 	else
++ 		result = __dax_pmd_fault(vma, addr, pmd, flags,
++ 				ext4_dax_mmap_get_block, NULL);
++ 
++ 	if (write) {
++ 		if (!IS_ERR(handle))
++ 			ext4_journal_stop(handle);
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 		sb_end_pagefault(sb);
++ 	} else
++ 		up_read(&EXT4_I(inode)->i_mmap_sem);
++ 
++ 	return result;
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	int err;
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	err = __dax_mkwrite(vma, vmf, ext4_dax_mmap_get_block, NULL);
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Handle write fault for VM_MIXEDMAP mappings. Similarly to ext4_dax_mkwrite()
++  * handler we check for races agaist truncate. Note that since we cycle through
++  * i_mmap_sem, we are sure that also any hole punching that began before we
++  * were called is finished by now and so if it included part of the file we
++  * are working on, our pte will get unmapped and the check for pte_same() in
++  * wp_pfn_shared() fails. Thus fault gets retried and things work out as
++  * desired.
++  */
++ static int ext4_dax_pfn_mkwrite(struct vm_area_struct *vma,
++ 				struct vm_fault *vmf)
++ {
++ 	struct inode *inode = file_inode(vma->vm_file);
++ 	struct super_block *sb = inode->i_sb;
++ 	int ret = VM_FAULT_NOPAGE;
++ 	loff_t size;
++ 
++ 	sb_start_pagefault(sb);
++ 	file_update_time(vma->vm_file);
++ 	down_read(&EXT4_I(inode)->i_mmap_sem);
++ 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	if (vmf->pgoff >= size)
++ 		ret = VM_FAULT_SIGBUS;
++ 	up_read(&EXT4_I(inode)->i_mmap_sem);
++ 	sb_end_pagefault(sb);
+++>>>>>>> ba5843f51d46 (ext4: use pre-zeroed blocks for DAX page faults)
+  
+  	return ret;
+  }
+diff --cc fs/ext4/inode.c
+index 235a73f02c8d,ff2f3cd38522..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -702,8 -719,12 +702,13 @@@ static int _ext4_get_block(struct inod
+  
+  	ret = ext4_map_blocks(handle, inode, &map, flags);
+  	if (ret > 0) {
+ -		ext4_io_end_t *io_end = ext4_inode_aio(inode);
+ -
+  		map_bh(bh, inode->i_sb, map.m_pblk);
+  		bh->b_state = (bh->b_state & ~EXT4_MAP_FLAGS) | map.m_flags;
+++<<<<<<< HEAD
+++=======
++ 		if (io_end && io_end->flag & EXT4_IO_END_UNWRITTEN)
++ 			set_buffer_defer_completion(bh);
+++>>>>>>> ba5843f51d46 (ext4: use pre-zeroed blocks for DAX page faults)
+  		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
+  		ret = 0;
+  	}
+@@@ -2924,20 -3070,100 +2929,105 @@@ int ext4_get_block_write(struct inode *
+  			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+  }
+  
+ -static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
+  		   struct buffer_head *bh_result, int create)
+  {
+ -	int ret;
+ -
+ -	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +	ext4_debug("ext4_get_block_write_nolock: inode %lu, create flag %d\n",
+  		   inode->i_ino, create);
+++<<<<<<< HEAD
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_NO_LOCK);
+++=======
++ 	ret = _ext4_get_block(inode, iblock, bh_result, 0);
++ 	/*
++ 	 * Blocks should have been preallocated! ext4_file_write_iter() checks
++ 	 * that.
++ 	 */
++ 	WARN_ON_ONCE(!buffer_mapped(bh_result));
++ 
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_FS_DAX
++ int ext4_dax_mmap_get_block(struct inode *inode, sector_t iblock,
++ 			    struct buffer_head *bh_result, int create)
++ {
++ 	int ret, err;
++ 	int credits;
++ 	struct ext4_map_blocks map;
++ 	handle_t *handle = NULL;
++ 	int flags = 0;
++ 
++ 	ext4_debug("ext4_dax_mmap_get_block: inode %lu, create flag %d\n",
++ 		   inode->i_ino, create);
++ 	map.m_lblk = iblock;
++ 	map.m_len = bh_result->b_size >> inode->i_blkbits;
++ 	credits = ext4_chunk_trans_blocks(inode, map.m_len);
++ 	if (create) {
++ 		flags |= EXT4_GET_BLOCKS_PRE_IO | EXT4_GET_BLOCKS_CREATE_ZERO;
++ 		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
++ 		if (IS_ERR(handle)) {
++ 			ret = PTR_ERR(handle);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	ret = ext4_map_blocks(handle, inode, &map, flags);
++ 	if (create) {
++ 		err = ext4_journal_stop(handle);
++ 		if (ret >= 0 && err < 0)
++ 			ret = err;
++ 	}
++ 	if (ret <= 0)
++ 		goto out;
++ 	if (map.m_flags & EXT4_MAP_UNWRITTEN) {
++ 		int err2;
++ 
++ 		/*
++ 		 * We are protected by i_mmap_sem so we know block cannot go
++ 		 * away from under us even though we dropped i_data_sem.
++ 		 * Convert extent to written and write zeros there.
++ 		 *
++ 		 * Note: We may get here even when create == 0.
++ 		 */
++ 		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
++ 		if (IS_ERR(handle)) {
++ 			ret = PTR_ERR(handle);
++ 			goto out;
++ 		}
++ 
++ 		err = ext4_map_blocks(handle, inode, &map,
++ 		      EXT4_GET_BLOCKS_CONVERT | EXT4_GET_BLOCKS_CREATE_ZERO);
++ 		if (err < 0)
++ 			ret = err;
++ 		err2 = ext4_journal_stop(handle);
++ 		if (err2 < 0 && ret > 0)
++ 			ret = err2;
++ 	}
++ out:
++ 	WARN_ON_ONCE(ret == 0 && create);
++ 	if (ret > 0) {
++ 		map_bh(bh_result, inode->i_sb, map.m_pblk);
++ 		bh_result->b_state = (bh_result->b_state & ~EXT4_MAP_FLAGS) |
++ 					map.m_flags;
++ 		/*
++ 		 * At least for now we have to clear BH_New so that DAX code
++ 		 * doesn't attempt to zero blocks again in a racy way.
++ 		 */
++ 		bh_result->b_state &= ~(1 << BH_New);
++ 		bh_result->b_size = map.m_len << inode->i_blkbits;
++ 		ret = 0;
++ 	}
++ 	return ret;
+++>>>>>>> ba5843f51d46 (ext4: use pre-zeroed blocks for DAX page faults)
+  }
++ #endif
+  
+  static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+ -			    ssize_t size, void *private)
+ +			    ssize_t size, void *private, int ret,
+ +			    bool is_async)
+  {
+ +	struct inode *inode = file_inode(iocb->ki_filp);
+          ext4_io_end_t *io_end = iocb->private;
+  
+  	/* if not async direct IO just return */
+* Unmerged path fs/ext4/ext4.h
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
