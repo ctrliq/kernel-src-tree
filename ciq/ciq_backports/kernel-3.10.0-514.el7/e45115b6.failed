@@ -1,0 +1,222 @@
+KVM: x86: use physical LAPIC array for logical x2APIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] kvm: use physical LAPIC array for logical x2APIC (Radim Krcmar) [1273718]
+Rebuild_FUZZ: 95.05%
+commit-author Radim Krčmář <rkrcmar@redhat.com>
+commit e45115b62f9abb143a03036dbde05faf5864aa01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e45115b6.failed
+
+Logical x2APIC IDs map injectively to physical x2APIC IDs, so we can
+reuse the physical array for them.  This allows us to save space by
+sizing the logical maps according to the needs of xAPIC.
+
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e45115b62f9abb143a03036dbde05faf5864aa01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index 2330983674b9,9880d03f533d..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -128,31 -115,36 +128,51 @@@ static inline int apic_enabled(struct k
+  	(LVT_MASK | APIC_MODE_MASK | APIC_INPUT_POLARITY | \
+  	 APIC_LVT_REMOTE_IRR | APIC_LVT_LEVEL_TRIGGER)
+  
+++<<<<<<< HEAD
+ +static inline int kvm_apic_id(struct kvm_lapic *apic)
+ +{
+ +	return (kvm_apic_get_reg(apic, APIC_ID) >> 24) & 0xff;
+ +}
+ +
+ +/* The logical map is definitely wrong if we have multiple
+ + * modes at the same time.  (Physical map is always right.)
+ + */
+ +static inline bool kvm_apic_logical_map_valid(struct kvm_apic_map *map)
+ +{
+ +	return !(map->mode & (map->mode - 1));
+ +}
+++=======
++ static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
++ 		u32 dest_id, struct kvm_lapic ***cluster, u16 *mask) {
++ 	switch (map->mode) {
++ 	case KVM_APIC_MODE_X2APIC: {
++ 		u32 offset = (dest_id >> 16) * 16;
++ 		u32 max_apic_id = ARRAY_SIZE(map->phys_map) - 1;
+++>>>>>>> e45115b62f9a (KVM: x86: use physical LAPIC array for logical x2APIC)
++ 
++ 		if (offset <= max_apic_id) {
++ 			u8 cluster_size = min(max_apic_id - offset + 1, 16U);
++ 
++ 			*cluster = &map->phys_map[offset];
++ 			*mask = dest_id & (0xffff >> (16 - cluster_size));
++ 		} else {
++ 			*mask = 0;
++ 		}
+  
+- static inline void
+- apic_logical_id(struct kvm_apic_map *map, u32 dest_id, u16 *cid, u16 *lid)
+- {
+- 	unsigned lid_bits;
+- 
+- 	BUILD_BUG_ON(KVM_APIC_MODE_XAPIC_CLUSTER !=  4);
+- 	BUILD_BUG_ON(KVM_APIC_MODE_XAPIC_FLAT    !=  8);
+- 	BUILD_BUG_ON(KVM_APIC_MODE_X2APIC        != 16);
+- 	lid_bits = map->mode;
+- 
+- 	*cid = dest_id >> lid_bits;
+- 	*lid = dest_id & ((1 << lid_bits) - 1);
++ 		return true;
++ 		}
++ 	case KVM_APIC_MODE_XAPIC_FLAT:
++ 		*cluster = map->xapic_flat_map;
++ 		*mask = dest_id & 0xff;
++ 		return true;
++ 	case KVM_APIC_MODE_XAPIC_CLUSTER:
++ 		*cluster = map->xapic_cluster_map[dest_id >> 4];
++ 		*mask = dest_id & 0xf;
++ 		return true;
++ 	default:
++ 		/* Not optimized. */
++ 		return false;
++ 	}
+  }
+  
+  static void recalculate_apic_map(struct kvm *kvm)
+@@@ -673,6 -653,109 +692,112 @@@ bool kvm_apic_match_dest(struct kvm_vcp
+  		return false;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(kvm_apic_match_dest);
++ 
++ int kvm_vector_to_index(u32 vector, u32 dest_vcpus,
++ 		       const unsigned long *bitmap, u32 bitmap_size)
++ {
++ 	u32 mod;
++ 	int i, idx = -1;
++ 
++ 	mod = vector % dest_vcpus;
++ 
++ 	for (i = 0; i <= mod; i++) {
++ 		idx = find_next_bit(bitmap, bitmap_size, idx + 1);
++ 		BUG_ON(idx == bitmap_size);
++ 	}
++ 
++ 	return idx;
++ }
++ 
++ static void kvm_apic_disabled_lapic_found(struct kvm *kvm)
++ {
++ 	if (!kvm->arch.disabled_lapic_found) {
++ 		kvm->arch.disabled_lapic_found = true;
++ 		printk(KERN_INFO
++ 		       "Disabled LAPIC found during irq injection\n");
++ 	}
++ }
++ 
++ /* Return true if the interrupt can be handled by using *bitmap as index mask
++  * for valid destinations in *dst array.
++  * Return false if kvm_apic_map_get_dest_lapic did nothing useful.
++  * Note: we may have zero kvm_lapic destinations when we return true, which
++  * means that the interrupt should be dropped.  In this case, *bitmap would be
++  * zero and *dst undefined.
++  */
++ static inline bool kvm_apic_map_get_dest_lapic(struct kvm *kvm,
++ 		struct kvm_lapic **src, struct kvm_lapic_irq *irq,
++ 		struct kvm_apic_map *map, struct kvm_lapic ***dst,
++ 		unsigned long *bitmap)
++ {
++ 	int i, lowest;
++ 	bool x2apic_ipi;
++ 
++ 	if (irq->shorthand == APIC_DEST_SELF && src) {
++ 		*dst = src;
++ 		*bitmap = 1;
++ 		return true;
++ 	} else if (irq->shorthand)
++ 		return false;
++ 
++ 	x2apic_ipi = src && *src && apic_x2apic_mode(*src);
++ 	if (irq->dest_id == (x2apic_ipi ? X2APIC_BROADCAST : APIC_BROADCAST))
++ 		return false;
++ 
++ 	if (!map)
++ 		return false;
++ 
++ 	if (irq->dest_mode == APIC_DEST_PHYSICAL) {
++ 		if (irq->dest_id >= ARRAY_SIZE(map->phys_map)) {
++ 			*bitmap = 0;
++ 		} else {
++ 			*dst = &map->phys_map[irq->dest_id];
++ 			*bitmap = 1;
++ 		}
++ 		return true;
++ 	}
++ 
++ 	*bitmap = 0;
++ 	if (!kvm_apic_map_get_logical_dest(map, irq->dest_id, dst,
++ 				(u16 *)bitmap))
++ 		return false;
++ 
++ 	if (!kvm_lowest_prio_delivery(irq))
++ 		return true;
++ 
++ 	if (!kvm_vector_hashing_enabled()) {
++ 		lowest = -1;
++ 		for_each_set_bit(i, bitmap, 16) {
++ 			if (!(*dst)[i])
++ 				continue;
++ 			if (lowest < 0)
++ 				lowest = i;
++ 			else if (kvm_apic_compare_prio((*dst)[i]->vcpu,
++ 						(*dst)[lowest]->vcpu) < 0)
++ 				lowest = i;
++ 		}
++ 	} else {
++ 		if (!*bitmap)
++ 			return true;
++ 
++ 		lowest = kvm_vector_to_index(irq->vector, hweight16(*bitmap),
++ 				bitmap, 16);
++ 
++ 		if (!(*dst)[lowest]) {
++ 			kvm_apic_disabled_lapic_found(kvm);
++ 			*bitmap = 0;
++ 			return true;
++ 		}
++ 	}
++ 
++ 	*bitmap = (lowest >= 0) ? 1 << lowest : 0;
++ 
++ 	return true;
++ }
+++>>>>>>> e45115b62f9a (KVM: x86: use physical LAPIC array for logical x2APIC)
+  
+  bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+  		struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5d383a89c9d4..2625b9e331f4 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -581,8 +581,10 @@ struct kvm_apic_map {
+ 	struct rcu_head rcu;
+ 	u8 mode;
+ 	struct kvm_lapic *phys_map[256];
+-	/* first index is cluster id second is cpu id in a cluster */
+-	struct kvm_lapic *logical_map[16][16];
++	union {
++		struct kvm_lapic *xapic_flat_map[8];
++		struct kvm_lapic *xapic_cluster_map[16][4];
++	};
+ };
+ 
+ struct kvm_arch {
+* Unmerged path arch/x86/kvm/lapic.c
