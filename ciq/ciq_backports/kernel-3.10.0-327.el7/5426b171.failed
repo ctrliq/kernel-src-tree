@@ -1,0 +1,106 @@
+IB/iser: Collapse cleanup and disconnect handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Collapse cleanup and disconnect handlers (Amir Vadai) [1164539]
+Rebuild_FUZZ: 96.84%
+commit-author Ariel Nahum <arieln@mellanox.com>
+commit 5426b1711fd006cb0574a2a24bf738cc38d5220d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5426b171.failed
+
+No real need to wait for TIMEWAIT_EXIT before we destroy the RDMA
+resources (also TIMEAWAIT_EXIT is not guarenteed to always arrive).  As
+for the cma_id, only destroy it if the state is not DOWN where in this
+case, conn_release is already running and we don't want to compete.
+
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 5426b1711fd006cb0574a2a24bf738cc38d5220d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index fbf2a1e0f2e2,6a2a91c7cdb7..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -616,26 -620,27 +616,41 @@@ void iser_release_work(struct work_stru
+  /**
+   * Frees all conn objects and deallocs conn descriptor
+   */
+ -void iser_conn_release(struct iser_conn *iser_conn)
+ +void iser_conn_release(struct iser_conn *ib_conn)
+  {
+ -	struct ib_conn *ib_conn = &iser_conn->ib_conn;
+ +	struct iser_device  *device = ib_conn->device;
+  
+  	mutex_lock(&ig.connlist_mutex);
+ -	list_del(&iser_conn->conn_list);
+ +	list_del(&ib_conn->conn_list);
+  	mutex_unlock(&ig.connlist_mutex);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ib_conn->state_mutex);
+ +	BUG_ON(ib_conn->state != ISER_CONN_DOWN);
+++=======
++ 	mutex_lock(&iser_conn->state_mutex);
++ 	if (iser_conn->state != ISER_CONN_DOWN) {
++ 		iser_warn("iser conn %p state %d, expected state down.\n",
++ 			  iser_conn, iser_conn->state);
++ 		iser_conn->state = ISER_CONN_DOWN;
++ 	}
++ 	/*
++ 	 * In case we never got to bind stage, we still need to
++ 	 * release IB resources (which is safe to call more than once).
++ 	 */
++ 	iser_free_ib_conn_res(iser_conn, true);
++ 	mutex_unlock(&iser_conn->state_mutex);
+++>>>>>>> 5426b1711fd0 (IB/iser: Collapse cleanup and disconnect handlers)
+  
+ +	iser_free_rx_descriptors(ib_conn);
+ +	iser_free_ib_conn_res(ib_conn);
+ +	ib_conn->device = NULL;
+ +	/* on EVENT_ADDR_ERROR there's no device yet for this conn */
+ +	if (device != NULL)
+ +		iser_device_try_release(device);
+ +	mutex_unlock(&ib_conn->state_mutex);
+ +
+ +	/* if cma handler context, the caller actually destroy the id */
+  	if (ib_conn->cma_id != NULL) {
+  		rdma_destroy_id(ib_conn->cma_id);
+  		ib_conn->cma_id = NULL;
+@@@ -830,10 -868,22 +845,29 @@@ static int iser_cma_handler(struct rdma
+  		iser_connect_error(cma_id);
+  		break;
+  	case RDMA_CM_EVENT_DISCONNECTED:
+++<<<<<<< HEAD
+ +	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+ +	case RDMA_CM_EVENT_ADDR_CHANGE:
+ +	case RDMA_CM_EVENT_TIMEWAIT_EXIT:
+ +		iser_disconnected_handler(cma_id);
+++=======
++ 	case RDMA_CM_EVENT_ADDR_CHANGE:
++ 	case RDMA_CM_EVENT_TIMEWAIT_EXIT:
++ 		iser_cleanup_handler(cma_id, false);
++ 		break;
++ 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
++ 		/*
++ 		 * we *must* destroy the device as we cannot rely
++ 		 * on iscsid to be around to initiate error handling.
++ 		 * also if we are not in state DOWN implicitly destroy
++ 		 * the cma_id.
++ 		 */
++ 		iser_cleanup_handler(cma_id, true);
++ 		if (iser_conn->state != ISER_CONN_DOWN) {
++ 			iser_conn->ib_conn.cma_id = NULL;
++ 			ret = 1;
++ 		}
+++>>>>>>> 5426b1711fd0 (IB/iser: Collapse cleanup and disconnect handlers)
+  		break;
+  	default:
+  		iser_err("Unexpected RDMA CM event (%d)\n", event->event);
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
