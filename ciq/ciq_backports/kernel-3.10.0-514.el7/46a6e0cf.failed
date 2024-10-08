@@ -1,0 +1,231 @@
+x86/mpx: Clean up the code by not passing a task pointer around when unnecessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mpx: Clean up the code by not passing a task pointer around when unnecessary (Rui Wang) [1138650]
+Rebuild_FUZZ: 97.44%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 46a6e0cf1c6665a8e867d8f7798d7a3538633f03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/46a6e0cf.failed
+
+The MPX code can only work on the current task.  You can not,
+for instance, enable MPX management in another process or
+thread. You can also not handle a fault for another process or
+thread.
+
+Despite this, we pass a task_struct around prolifically.  This
+patch removes all of the task struct passing for code paths
+where the code can not deal with another task (which turns out
+to be all of them).
+
+This has no functional changes.  It's just a cleanup.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: bp@alien8.de
+Link: http://lkml.kernel.org/r/20150607183702.6A81DA2C@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 46a6e0cf1c6665a8e867d8f7798d7a3538633f03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mpx.h
+#	arch/x86/include/asm/processor.h
+#	arch/x86/kernel/traps.c
+#	arch/x86/mm/mpx.c
+#	kernel/sys.c
+diff --cc arch/x86/include/asm/processor.h
+index ddad3b312de4,53dbd2b4f1d8..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -950,6 -801,24 +950,27 @@@ extern void start_thread(struct pt_reg
+  extern int get_tsc_mode(unsigned long adr);
+  extern int set_tsc_mode(unsigned int val);
+  
+++<<<<<<< HEAD
+++=======
++ /* Register/unregister a process' MPX related resource */
++ #define MPX_ENABLE_MANAGEMENT()	mpx_enable_management()
++ #define MPX_DISABLE_MANAGEMENT()	mpx_disable_management()
++ 
++ #ifdef CONFIG_X86_INTEL_MPX
++ extern int mpx_enable_management(void);
++ extern int mpx_disable_management(void);
++ #else
++ static inline int mpx_enable_management(void)
++ {
++ 	return -EINVAL;
++ }
++ static inline int mpx_disable_management(void)
++ {
++ 	return -EINVAL;
++ }
++ #endif /* CONFIG_X86_INTEL_MPX */
++ 
+++>>>>>>> 46a6e0cf1c66 (x86/mpx: Clean up the code by not passing a task pointer around when unnecessary)
+  extern u16 amd_get_nb_id(int cpu);
+  
+  static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
+diff --cc arch/x86/kernel/traps.c
+index 9823443df079,cffff669be3f..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -247,7 -369,87 +247,91 @@@ dotraplinkage void do_double_fault(stru
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +dotraplinkage void __kprobes
+++=======
++ dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
++ {
++ 	enum ctx_state prev_state;
++ 	const struct bndcsr *bndcsr;
++ 	siginfo_t *info;
++ 
++ 	prev_state = exception_enter();
++ 	if (notify_die(DIE_TRAP, "bounds", regs, error_code,
++ 			X86_TRAP_BR, SIGSEGV) == NOTIFY_STOP)
++ 		goto exit;
++ 	conditional_sti(regs);
++ 
++ 	if (!user_mode(regs))
++ 		die("bounds", regs, error_code);
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_MPX)) {
++ 		/* The exception is not from Intel MPX */
++ 		goto exit_trap;
++ 	}
++ 
++ 	/*
++ 	 * We need to look at BNDSTATUS to resolve this exception.
++ 	 * A NULL here might mean that it is in its 'init state',
++ 	 * which is all zeros which indicates MPX was not
++ 	 * responsible for the exception.
++ 	 */
++ 	bndcsr = get_xsave_field_ptr(XSTATE_BNDCSR);
++ 	if (!bndcsr)
++ 		goto exit_trap;
++ 
++ 	/*
++ 	 * The error code field of the BNDSTATUS register communicates status
++ 	 * information of a bound range exception #BR or operation involving
++ 	 * bound directory.
++ 	 */
++ 	switch (bndcsr->bndstatus & MPX_BNDSTA_ERROR_CODE) {
++ 	case 2:	/* Bound directory has invalid entry. */
++ 		if (mpx_handle_bd_fault())
++ 			goto exit_trap;
++ 		break; /* Success, it was handled */
++ 	case 1: /* Bound violation. */
++ 		info = mpx_generate_siginfo(regs);
++ 		if (IS_ERR(info)) {
++ 			/*
++ 			 * We failed to decode the MPX instruction.  Act as if
++ 			 * the exception was not caused by MPX.
++ 			 */
++ 			goto exit_trap;
++ 		}
++ 		/*
++ 		 * Success, we decoded the instruction and retrieved
++ 		 * an 'info' containing the address being accessed
++ 		 * which caused the exception.  This information
++ 		 * allows and application to possibly handle the
++ 		 * #BR exception itself.
++ 		 */
++ 		do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, info);
++ 		kfree(info);
++ 		break;
++ 	case 0: /* No exception caused by Intel MPX operations. */
++ 		goto exit_trap;
++ 	default:
++ 		die("bounds", regs, error_code);
++ 	}
++ 
++ exit:
++ 	exception_exit(prev_state);
++ 	return;
++ exit_trap:
++ 	/*
++ 	 * This path out is for all the cases where we could not
++ 	 * handle the exception in some way (like allocating a
++ 	 * table or telling userspace about it.  We will also end
++ 	 * up here if the kernel has MPX turned off at compile
++ 	 * time..
++ 	 */
++ 	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, NULL);
++ 	exception_exit(prev_state);
++ }
++ 
++ dotraplinkage void
+++>>>>>>> 46a6e0cf1c66 (x86/mpx: Clean up the code by not passing a task pointer around when unnecessary)
+  do_general_protection(struct pt_regs *regs, long error_code)
+  {
+  	struct task_struct *tsk;
+diff --cc kernel/sys.c
+index 5149ddb9041c,8571296b7ddb..000000000000
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@@ -92,6 -91,18 +92,21 @@@
+  #ifndef SET_TSC_CTL
+  # define SET_TSC_CTL(a)		(-EINVAL)
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifndef MPX_ENABLE_MANAGEMENT
++ # define MPX_ENABLE_MANAGEMENT()	(-EINVAL)
++ #endif
++ #ifndef MPX_DISABLE_MANAGEMENT
++ # define MPX_DISABLE_MANAGEMENT()	(-EINVAL)
++ #endif
++ #ifndef GET_FP_MODE
++ # define GET_FP_MODE(a)		(-EINVAL)
++ #endif
++ #ifndef SET_FP_MODE
++ # define SET_FP_MODE(a,b)	(-EINVAL)
++ #endif
+++>>>>>>> 46a6e0cf1c66 (x86/mpx: Clean up the code by not passing a task pointer around when unnecessary)
+  
+  /*
+   * this is where the system-wide overflow UID and GID are defined, for
+@@@ -2464,6 -2227,22 +2479,25 @@@ SYSCALL_DEFINE5(prctl, int, option, uns
+  			me->mm->def_flags &= ~VM_NOHUGEPAGE;
+  		up_write(&me->mm->mmap_sem);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case PR_MPX_ENABLE_MANAGEMENT:
++ 		if (arg2 || arg3 || arg4 || arg5)
++ 			return -EINVAL;
++ 		error = MPX_ENABLE_MANAGEMENT();
++ 		break;
++ 	case PR_MPX_DISABLE_MANAGEMENT:
++ 		if (arg2 || arg3 || arg4 || arg5)
++ 			return -EINVAL;
++ 		error = MPX_DISABLE_MANAGEMENT();
++ 		break;
++ 	case PR_SET_FP_MODE:
++ 		error = SET_FP_MODE(me, arg2);
++ 		break;
++ 	case PR_GET_FP_MODE:
++ 		error = GET_FP_MODE(me);
++ 		break;
+++>>>>>>> 46a6e0cf1c66 (x86/mpx: Clean up the code by not passing a task pointer around when unnecessary)
+  	default:
+  		error = -EINVAL;
+  		break;
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/mm/mpx.c
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/include/asm/processor.h
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path arch/x86/mm/mpx.c
+* Unmerged path kernel/sys.c
