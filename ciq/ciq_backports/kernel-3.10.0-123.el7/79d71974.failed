@@ -1,0 +1,169 @@
+device_cgroup: rework device access check and exception checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [security] device_cgroup: rework device access check and rule checking (Aristeu Rozanski) [1086057]
+Rebuild_FUZZ: 91.06%
+commit-author Aristeu Rozanski <aris@redhat.com>
+commit 79d719749d23234e9b725098aa49133f3ef7299d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/79d71974.failed
+
+Whenever a device file is opened and checked against current device
+cgroup rules, it uses the same function (may_access()) as when a new
+exception rule is added by writing devices.{allow,deny}. And in both
+cases, the algorithm is the same, doesn't matter the behavior.
+
+First problem is having device access to be considered the same as rule
+checking. Consider the following structure:
+
+	A	(default behavior: allow, exceptions disallow access)
+	 \
+	  B	(default behavior: allow, exceptions disallow access)
+
+A new exception is added to B by writing devices.deny:
+
+	c 12:34 rw
+
+When checking if that exception is allowed in may_access():
+
+	if (dev_cgroup->behavior == DEVCG_DEFAULT_ALLOW) {
+		if (behavior == DEVCG_DEFAULT_ALLOW) {
+			/* the exception will deny access to certain devices */
+			return true;
+
+Which is ok, since B is not getting more privileges than A, it doesn't
+matter and the rule is accepted
+
+Now, consider it's a device file open check and the process belongs to
+cgroup B. The access will be generated as:
+
+	behavior: allow
+	exception: c 12:34 rw
+
+The very same chunk of code will allow it, even if there's an explicit
+exception telling to do otherwise.
+
+A simple test case:
+
+	# mkdir new_group
+	# cd new_group
+	# echo $$ >tasks
+	# echo "c 1:3 w" >devices.deny
+	# echo >/dev/null
+	# echo $?
+	0
+
+This is a serious bug and was introduced on
+
+	c39a2a3018f8 devcg: prepare may_access() for hierarchy support
+
+To solve this problem, the device file open function was split from the
+new exception check.
+
+Second problem is how exceptions are processed by may_access(). The
+first part of the said function tries to match fully with an existing
+exception:
+
+	list_for_each_entry_rcu(ex, &dev_cgroup->exceptions, list) {
+		if ((refex->type & DEV_BLOCK) && !(ex->type & DEV_BLOCK))
+			continue;
+		if ((refex->type & DEV_CHAR) && !(ex->type & DEV_CHAR))
+			continue;
+		if (ex->major != ~0 && ex->major != refex->major)
+			continue;
+		if (ex->minor != ~0 && ex->minor != refex->minor)
+			continue;
+		if (refex->access & (~ex->access))
+			continue;
+		match = true;
+		break;
+	}
+
+That means the new exception should be contained into an existing one to
+be considered a match:
+
+	New exception		Existing	match?	notes
+	b 12:34 rwm		b 12:34 rwm	yes
+	b 12:34 r		b *:34 rw	yes
+	b 12:34 rw		b 12:34 w	no	extra "r"
+	b *:34 rw		b 12:34 rw	no	too broad "*"
+	b *:34 rw		b *:34 rwm	yes
+
+Which is fine in some cases. Consider:
+
+	A	(default behavior: deny, exceptions allow access)
+	 \
+	  B	(default behavior: deny, exceptions allow access)
+
+In this case the full match makes sense, the new exception cannot add
+more access than the parent allows
+
+But this doesn't always work, consider:
+
+	A	(default behavior: allow, exceptions disallow access)
+	 \
+	  B	(default behavior: deny, exceptions allow access)
+
+In this case, a new exception in B shouldn't match any of the exceptions
+in A, after all you can't allow something that was forbidden by A. But
+consider this scenario:
+
+	New exception	Existing in A	match?	outcome
+	b 12:34 rw	b 12:34 r	no	exception is accepted
+
+Because the new exception has "w" as extra, it doesn't match, so it'll
+be added to B's exception list.
+
+The same problem can happen during a file access check. Consider a
+cgroup with allow as default behavior:
+
+	Access		Exception	match?
+	b 12:34 rw	b 12:34 r	no
+
+In this case, the access didn't match any of the exceptions in the
+cgroup, which is required since exceptions will disallow access.
+
+To solve this problem, two new functions were created to match an
+exception either fully or partially. In the example above, a partial
+check will be performed and it'll produce a match since at least
+"b 12:34 r" from "b 12:34 rw" access matches.
+
+	Cc: cgroups@vger.kernel.org
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Serge Hallyn <serge.hallyn@canonical.com>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Aristeu Rozanski <arozansk@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 79d719749d23234e9b725098aa49133f3ef7299d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/device_cgroup.c
+diff --cc security/device_cgroup.c
+index dd0dc574d78d,b9048dc46b1a..000000000000
+--- a/security/device_cgroup.c
++++ b/security/device_cgroup.c
+@@@ -397,13 -456,11 +479,17 @@@ static bool verify_new_ex(struct dev_cg
+  static int parent_has_perm(struct dev_cgroup *childcg,
+  				  struct dev_exception_item *ex)
+  {
+ -	struct dev_cgroup *parent = css_to_devcgroup(css_parent(&childcg->css));
+ +	struct cgroup *pcg = childcg->css.cgroup->parent;
+ +	struct dev_cgroup *parent;
+  
+ -	if (!parent)
+ +	if (!pcg)
+  		return 1;
+++<<<<<<< HEAD
+ +	parent = cgroup_to_devcgroup(pcg);
+ +	return may_access(parent, ex, childcg->behavior);
+++=======
++ 	return verify_new_ex(parent, ex, childcg->behavior);
+++>>>>>>> 79d719749d23 (device_cgroup: rework device access check and exception checking)
+  }
+  
+  /**
+* Unmerged path security/device_cgroup.c
