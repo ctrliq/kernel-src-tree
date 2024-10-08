@@ -1,0 +1,164 @@
+x86/efi: Wire up CONFIG_EFI_MIXED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] efi: Wire up CONFIG_EFI_MIXED (Lenny Szubowicz) [1310154]
+Rebuild_FUZZ: 93.55%
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 7d453eee36ae4cf30fc2f2faae54f634c4f863b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7d453eee.failed
+
+Add the Kconfig option and bump the kernel header version so that boot
+loaders can check whether the handover code is available if they want.
+
+The xloadflags field in the bzImage header is also updated to reflect
+that the kernel supports both entry points by setting both of
+XLF_EFI_HANDOVER_32 and XLF_EFI_HANDOVER_64 when CONFIG_EFI_MIXED=y.
+XLF_CAN_BE_LOADED_ABOVE_4G is disabled so that the kernel text is
+guaranteed to be addressable with 32-bits.
+
+Note that no boot loaders should be using the bits set in xloadflags to
+decide which entry point to jump to. The entire scheme is based on the
+concept that 32-bit bootloaders always jump to ->handover_offset and
+64-bit loaders always jump to ->handover_offset + 512. We set both bits
+merely to inform the boot loader that it's safe to use the native
+handover offset even if the machine type in the PE/COFF header claims
+otherwise.
+
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 7d453eee36ae4cf30fc2f2faae54f634c4f863b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/setup.c
+diff --cc arch/x86/kernel/setup.c
+index fb4a3b838d7f,ff9b3a62a05c..000000000000
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@@ -1329,11 -1239,15 +1329,22 @@@ void __init setup_arch(char **cmdline_p
+  	register_refined_jiffies(CLOCK_TICK_RATE);
+  
+  #ifdef CONFIG_EFI
+++<<<<<<< HEAD
+ +	if (efi_enabled(EFI_BOOT))
+ +		efi_apply_memmap_quirks();
+++=======
++ 	/* Once setup is done above, unmap the EFI memory map on
++ 	 * mismatched firmware/kernel archtectures since there is no
++ 	 * support for runtime services.
++ 	 */
++ 	if (efi_enabled(EFI_BOOT) && !efi_runtime_supported()) {
++ 		pr_info("efi: Setup done, disabling due to 32/64-bit mismatch\n");
++ 		efi_unmap_memmap();
++ 	}
+++>>>>>>> 7d453eee36ae (x86/efi: Wire up CONFIG_EFI_MIXED)
+  #endif
+ +
+ +	rh_check_supported();
+  }
+  
+  #ifdef CONFIG_X86_32
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index eca69935277c..6368e4f85530 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1608,6 +1608,20 @@ config EFI_SECURE_BOOT_SECURELEVEL
+ 	  Say Y here to automatically enable securelevel enforcement
+ 	  when a system boots with UEFI Secure Boot enabled.
+ 
++config EFI_MIXED
++	bool "EFI mixed-mode support"
++	depends on EFI_STUB && X86_64
++	---help---
++	   Enabling this feature allows a 64-bit kernel to be booted
++	   on a 32-bit firmware, provided that your CPU supports 64-bit
++	   mode.
++
++	   Note that it is not possible to boot a mixed-mode enabled
++	   kernel via the EFI boot stub - a bootloader that supports
++	   the EFI handover protocol must be used.
++
++	   If unsure, say N.
++
+ config SECCOMP
+ 	def_bool y
+ 	prompt "Enable seccomp to safely compute untrusted bytecode"
+diff --git a/arch/x86/boot/header.S b/arch/x86/boot/header.S
+index d69d96653325..256388260c88 100644
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@ -283,7 +283,7 @@ _start:
+ 	# Part 2 of the header, from the old setup.S
+ 
+ 		.ascii	"HdrS"		# header signature
+-		.word	0x020c		# header version number (>= 0x0105)
++		.word	0x020d		# header version number (>= 0x0105)
+ 					# or else old loadlin-1.5 will fail)
+ 		.globl realmode_swtch
+ realmode_swtch:	.word	0, 0		# default_switch, SETUPSEG
+@@ -375,7 +375,8 @@ xloadflags:
+ # define XLF0 0
+ #endif
+ 
+-#if defined(CONFIG_RELOCATABLE) && defined(CONFIG_X86_64)
++#if defined(CONFIG_RELOCATABLE) && defined(CONFIG_X86_64) && \
++	!defined(CONFIG_EFI_MIXED)
+    /* kernel/boot_param/ramdisk could be loaded above 4g */
+ # define XLF1 XLF_CAN_BE_LOADED_ABOVE_4G
+ #else
+@@ -383,10 +384,14 @@ xloadflags:
+ #endif
+ 
+ #ifdef CONFIG_EFI_STUB
+-# ifdef CONFIG_X86_64
+-#  define XLF23 XLF_EFI_HANDOVER_64		/* 64-bit EFI handover ok */
++# ifdef CONFIG_EFI_MIXED
++#  define XLF23 (XLF_EFI_HANDOVER_32|XLF_EFI_HANDOVER_64)
+ # else
+-#  define XLF23 XLF_EFI_HANDOVER_32		/* 32-bit EFI handover ok */
++#  ifdef CONFIG_X86_64
++#   define XLF23 XLF_EFI_HANDOVER_64		/* 64-bit EFI handover ok */
++#  else
++#   define XLF23 XLF_EFI_HANDOVER_32		/* 32-bit EFI handover ok */
++#  endif
+ # endif
+ #else
+ # define XLF23 0
+diff --git a/arch/x86/include/asm/efi.h b/arch/x86/include/asm/efi.h
+index 46e39ba1f72c..5050795a91d1 100644
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -153,6 +153,17 @@ static inline bool efi_is_native(void)
+ 	return IS_ENABLED(CONFIG_X86_64) == efi_enabled(EFI_64BIT);
+ }
+ 
++static inline bool efi_runtime_supported(void)
++{
++	if (efi_is_native())
++		return true;
++
++	if (IS_ENABLED(CONFIG_EFI_MIXED) && !efi_enabled(EFI_OLD_MEMMAP))
++		return true;
++
++	return false;
++}
++
+ extern struct console early_efi_console;
+ 
+ extern void parse_efi_setup(u64 phys_addr, u32 data_len);
+* Unmerged path arch/x86/kernel/setup.c
+diff --git a/arch/x86/platform/efi/efi.c b/arch/x86/platform/efi/efi.c
+index 4374bb91ee4e..dbff5ec18044 100644
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@ -775,7 +775,7 @@ void __init efi_init(void)
+ 	 * that doesn't match the kernel 32/64-bit mode.
+ 	 */
+ 
+-	if (!efi_is_native())
++	if (!efi_runtime_supported())
+ 		pr_info("No EFI runtime due to 32/64-bit mismatch with kernel\n");
+ 	else {
+ 		if (disable_runtime || efi_runtime_init())
