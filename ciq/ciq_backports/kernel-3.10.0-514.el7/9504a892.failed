@@ -1,0 +1,191 @@
+drm/i915/vlv: Reset the ADPA in vlv_display_power_well_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915/vlv: Reset the ADPA in vlv_display_power_well_init() (Lyude Paul) [1277863]
+Rebuild_FUZZ: 96.61%
+commit-author Lyude <cpaul@redhat.com>
+commit 9504a89247595b6c066c68aea0c34af1fc78d021
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9504a892.failed
+
+While VGA hotplugging worked(ish) before, it looks like that was mainly
+because we'd unintentionally enable it in
+valleyview_crt_detect_hotplug() when we did a force trigger. This
+doesn't work reliably enough because whenever the display powerwell on
+vlv gets disabled, the values set in VLV_ADPA get cleared and
+consequently VGA hotplugging gets disabled. This causes bugs such as one
+we found on an Intel NUC, where doing the following sequence of
+hotplugs:
+
+      - Disconnect all monitors
+      - Connect VGA
+      - Disconnect VGA
+      - Connect HDMI
+
+Would result in VGA hotplugging becoming disabled, due to the powerwells
+getting toggled in the process of connecting HDMI.
+
+Changes since v3:
+ - Expose intel_crt_reset() through intel_drv.h and call that in
+   vlv_display_power_well_init() instead of
+   encoder->base.funcs->reset(&encoder->base);
+
+Changes since v2:
+ - Use intel_encoder structs instead of drm_encoder structs
+
+Changes since v1:
+ - Instead of handling the register writes ourself, we just reuse
+   intel_crt_detect()
+ - Instead of resetting the ADPA during display IRQ installation, we now
+   reset them in vlv_display_power_well_init()
+
+	Cc: stable@vger.kernel.org
+	Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+[danvet: Rebase over dev_priv/drm_device embedding.]
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 9504a89247595b6c066c68aea0c34af1fc78d021)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_crt.c
+#	drivers/gpu/drm/i915/intel_runtime_pm.c
+diff --cc drivers/gpu/drm/i915/intel_crt.c
+index 515d7123785d,d172930ac1e7..000000000000
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@@ -763,11 -717,11 +763,15 @@@ static int intel_crt_set_property(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void intel_crt_reset(struct drm_connector *connector)
+++=======
++ void intel_crt_reset(struct drm_encoder *encoder)
+++>>>>>>> 9504a8924759 (drm/i915/vlv: Reset the ADPA in vlv_display_power_well_init())
+  {
+ -	struct drm_device *dev = encoder->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct intel_crt *crt = intel_encoder_to_crt(to_intel_encoder(encoder));
+ +	struct drm_device *dev = connector->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_crt *crt = intel_attached_crt(connector);
+  
+  	if (INTEL_INFO(dev)->gen >= 5) {
+  		u32 adpa;
+diff --cc drivers/gpu/drm/i915/intel_runtime_pm.c
+index ce00e6994eeb,b089ec89363d..000000000000
+--- a/drivers/gpu/drm/i915/intel_runtime_pm.c
++++ b/drivers/gpu/drm/i915/intel_runtime_pm.c
+@@@ -552,12 -1060,46 +552,51 @@@ static bool vlv_power_well_enabled(stru
+  	return enabled;
+  }
+  
+ -static void vlv_init_display_clock_gating(struct drm_i915_private *dev_priv)
+ +static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
+ +					  struct i915_power_well *power_well)
+  {
+ -	I915_WRITE(DSPCLK_GATE_D, VRHUNIT_CLOCK_GATE_DISABLE);
+ +	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
+  
+++<<<<<<< HEAD
+ +	vlv_set_power_well(dev_priv, power_well, true);
+++=======
++ 	/*
++ 	 * Disable trickle feed and enable pnd deadline calculation
++ 	 */
++ 	I915_WRITE(MI_ARB_VLV, MI_ARB_DISPLAY_TRICKLE_FEED_DISABLE);
++ 	I915_WRITE(CBR1_VLV, 0);
++ 
++ 	WARN_ON(dev_priv->rawclk_freq == 0);
++ 
++ 	I915_WRITE(RAWCLK_FREQ_VLV,
++ 		   DIV_ROUND_CLOSEST(dev_priv->rawclk_freq, 1000));
++ }
++ 
++ static void vlv_display_power_well_init(struct drm_i915_private *dev_priv)
++ {
++ 	struct intel_encoder *encoder;
++ 	enum pipe pipe;
++ 
++ 	/*
++ 	 * Enable the CRI clock source so we can get at the
++ 	 * display and the reference clock for VGA
++ 	 * hotplug / manual detection. Supposedly DSI also
++ 	 * needs the ref clock up and running.
++ 	 *
++ 	 * CHV DPLL B/C have some issues if VGA mode is enabled.
++ 	 */
++ 	for_each_pipe(&dev_priv->drm, pipe) {
++ 		u32 val = I915_READ(DPLL(pipe));
++ 
++ 		val |= DPLL_REF_CLK_ENABLE_VLV | DPLL_VGA_MODE_DIS;
++ 		if (pipe != PIPE_A)
++ 			val |= DPLL_INTEGRATED_CRI_CLK_VLV;
++ 
++ 		I915_WRITE(DPLL(pipe), val);
++ 	}
++ 
++ 	vlv_init_display_clock_gating(dev_priv);
+++>>>>>>> 9504a8924759 (drm/i915/vlv: Reset the ADPA in vlv_display_power_well_init())
+  
+  	spin_lock_irq(&dev_priv->irq_lock);
+  	valleyview_enable_display_irqs(dev_priv);
+@@@ -572,7 -1114,35 +611,39 @@@
+  
+  	intel_hpd_init(dev_priv);
+  
+++<<<<<<< HEAD
+ +	i915_redisable_vga_power_on(dev_priv->dev);
+++=======
++ 	/* Re-enable the ADPA, if we have one */
++ 	for_each_intel_encoder(&dev_priv->drm, encoder) {
++ 		if (encoder->type == INTEL_OUTPUT_ANALOG)
++ 			intel_crt_reset(&encoder->base);
++ 	}
++ 
++ 	i915_redisable_vga_power_on(&dev_priv->drm);
++ }
++ 
++ static void vlv_display_power_well_deinit(struct drm_i915_private *dev_priv)
++ {
++ 	spin_lock_irq(&dev_priv->irq_lock);
++ 	valleyview_disable_display_irqs(dev_priv);
++ 	spin_unlock_irq(&dev_priv->irq_lock);
++ 
++ 	/* make sure we're done processing display irqs */
++ 	synchronize_irq(dev_priv->drm.irq);
++ 
++ 	intel_power_sequencer_reset(dev_priv);
++ }
++ 
++ static void vlv_display_power_well_enable(struct drm_i915_private *dev_priv,
++ 					  struct i915_power_well *power_well)
++ {
++ 	WARN_ON_ONCE(power_well->data != PUNIT_POWER_WELL_DISP2D);
++ 
++ 	vlv_set_power_well(dev_priv, power_well, true);
++ 
++ 	vlv_display_power_well_init(dev_priv);
+++>>>>>>> 9504a8924759 (drm/i915/vlv: Reset the ADPA in vlv_display_power_well_init())
+  }
+  
+  static void vlv_display_power_well_disable(struct drm_i915_private *dev_priv,
+* Unmerged path drivers/gpu/drm/i915/intel_crt.c
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09..ea05007f5f22 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -845,7 +845,7 @@ void gen8_irq_power_well_post_enable(struct drm_i915_private *dev_priv,
+ 
+ /* intel_crt.c */
+ void intel_crt_init(struct drm_device *dev);
+-
++void intel_crt_reset(struct drm_encoder *encoder);
+ 
+ /* intel_ddi.c */
+ void intel_prepare_ddi(struct drm_device *dev);
+* Unmerged path drivers/gpu/drm/i915/intel_runtime_pm.c
