@@ -1,0 +1,192 @@
+hyperv: Enable sendbuf mechanism on the send path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit c25aaf814a63f9d9c4e45416f13d70ef0aa0be2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c25aaf81.failed
+
+We send packets using a copy-free mechanism (this is the Guest to Host transport
+via VMBUS). While this is obviously optimal for large packets,
+it may not be optimal for small packets. Hyper-V host supports
+a second mechanism for sending packets that is "copy based". We implement that
+mechanism in this patch.
+
+In this version of the patch I have addressed a comment from David Miller.
+
+With this patch (and all of the other offload and VRSS patches), we are now able
+to almost saturate a 10G interface between Linux VMs on Hyper-V
+on different hosts - close to  9 Gbps as measured via iperf.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c25aaf814a63f9d9c4e45416f13d70ef0aa0be2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 9cc0753cff9d,c041f63a6d30..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -445,17 -574,21 +579,29 @@@ static inline u32 hv_ringbuf_avail_perc
+  	return avail_write * 100 / ring_info->ring_datasize;
+  }
+  
+++<<<<<<< HEAD
+ +static void netvsc_send_completion(struct hv_device *device,
+++=======
++ static inline void netvsc_free_send_slot(struct netvsc_device *net_device,
++ 					 u32 index)
++ {
++ 	sync_change_bit(index, net_device->send_section_map);
++ }
++ 
++ static void netvsc_send_completion(struct netvsc_device *net_device,
++ 				   struct hv_device *device,
+++>>>>>>> c25aaf814a63 (hyperv: Enable sendbuf mechanism on the send path)
+  				   struct vmpacket_descriptor *packet)
+  {
+ +	struct netvsc_device *net_device;
+  	struct nvsp_message *nvsp_packet;
+  	struct hv_netvsc_packet *nvsc_packet;
+  	struct net_device *ndev;
++ 	u32 send_index;
+  
+ +	net_device = get_inbound_net_device(device);
+ +	if (!net_device)
+ +		return;
+  	ndev = net_device->ndev;
+  
+  	nvsp_packet = (struct nvsp_message *)((unsigned long)packet +
+@@@ -479,10 -617,15 +625,22 @@@
+  			packet->trans_id;
+  
+  		/* Notify the layer above us */
+++<<<<<<< HEAD
+ +		if (nvsc_packet)
+ +			nvsc_packet->completion.send.send_completion(
+ +				nvsc_packet->completion.send.
+ +				send_completion_ctx);
+++=======
++ 		if (nvsc_packet) {
++ 			send_index = nvsc_packet->send_buf_index;
++ 			if (send_index != NETVSC_INVALID_INDEX)
++ 				netvsc_free_send_slot(net_device, send_index);
++ 			q_idx = nvsc_packet->q_idx;
++ 			channel = nvsc_packet->channel;
++ 			nvsc_packet->send_completion(nvsc_packet->
++ 						     send_completion_ctx);
++ 		}
+++>>>>>>> c25aaf814a63 (hyperv: Enable sendbuf mechanism on the send path)
+  
+  		num_outstanding_sends =
+  			atomic_dec_return(&net_device->num_outstanding_sends);
+@@@ -509,7 -701,12 +713,11 @@@ int netvsc_send(struct hv_device *devic
+  	int ret = 0;
+  	struct nvsp_message sendMessage;
+  	struct net_device *ndev;
+ -	struct vmbus_channel *out_channel = NULL;
+  	u64 req_id;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	u32 msg_size = 0;
++ 	struct sk_buff *skb;
++ 
+  
+  	net_device = get_outbound_net_device(device);
+  	if (!net_device)
+@@@ -525,12 -722,28 +733,28 @@@
+  		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+  	}
+  
+- 	/* Not using send buffer section */
++ 	/* Attempt to send via sendbuf */
++ 	if (packet->total_data_buflen < net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 			msg_size = netvsc_copy_to_send_buf(net_device,
++ 							   section_index,
++ 							   packet);
++ 			skb = (struct sk_buff *)
++ 			      (unsigned long)packet->send_completion_tid;
++ 			if (skb)
++ 				dev_kfree_skb_any(skb);
++ 			packet->page_buf_cnt = 0;
++ 		}
++ 	}
++ 	packet->send_buf_index = section_index;
++ 
++ 
+  	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+- 		0xFFFFFFFF;
+- 	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_size = 0;
++ 		section_index;
++ 	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_size = msg_size;
+  
+ -	if (packet->send_completion)
+ +	if (packet->completion.send.send_completion)
+  		req_id = (ulong)packet;
+  	else
+  		req_id = 0;
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 854b31f1a85a,939e3af60ec4..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -133,7 -235,8 +133,12 @@@ static void netvsc_xmit_completion(voi
+  {
+  	struct hv_netvsc_packet *packet = (struct hv_netvsc_packet *)context;
+  	struct sk_buff *skb = (struct sk_buff *)
+++<<<<<<< HEAD
+ +		(unsigned long)packet->completion.send.send_completion_tid;
+++=======
++ 		(unsigned long)packet->send_completion_tid;
++ 	u32 index = packet->send_buf_index;
+++>>>>>>> c25aaf814a63 (hyperv: Enable sendbuf mechanism on the send path)
+  
+  	kfree(packet);
+  
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index a2561fea6d21..62739c6f0ae1 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -73,6 +73,8 @@ struct hv_netvsc_packet {
+ 		} send;
+ 	} completion;
+ 
++	u32 send_buf_index;
++
+ 	/* This points to the memory after page_buf */
+ 	void *extension;
+ 
+@@ -518,6 +520,9 @@ struct nvsp_message {
+ 
+ #define NETVSC_RECEIVE_BUFFER_SIZE		(1024*1024*16)	/* 16MB */
+ #define NETVSC_RECEIVE_BUFFER_SIZE_LEGACY	(1024*1024*15)  /* 15MB */
++#define NETVSC_SEND_BUFFER_SIZE			(1024 * 1024)   /* 1MB */
++#define NETVSC_INVALID_INDEX			-1
++
+ 
+ #define NETVSC_RECEIVE_BUFFER_ID		0xcafe
+ 
+@@ -550,6 +555,15 @@ struct netvsc_device {
+ 	u32 recv_section_cnt;
+ 	struct nvsp_1_receive_buffer_section *recv_section;
+ 
++	/* Send buffer allocated by us */
++	void *send_buf;
++	u32 send_buf_size;
++	u32 send_buf_gpadl_handle;
++	u32 send_section_cnt;
++	u32 send_section_size;
++	unsigned long *send_section_map;
++	int map_words;
++
+ 	/* Used for NetVSP initialization protocol */
+ 	struct completion channel_init_wait;
+ 	struct nvsp_message channel_init_pkt;
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
