@@ -1,0 +1,134 @@
+perf: Clean up sync_child_event()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 8ba289b8d4e4dbd1f971fbf0d2085e4776a4ba25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8ba289b8.failed
+
+sync_child_event() has outgrown its purpose, it does far too much.
+Bring it back to its named purpose.
+
+Rename __perf_event_exit_task() to perf_event_exit_event() to better
+reflect what it does and move the event->state assignment under the
+ctx->lock, like state changes ought to be.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8ba289b8d4e4dbd1f971fbf0d2085e4776a4ba25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e086d60d319b,8c3d95195f05..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -8130,36 -8742,53 +8128,55 @@@ perf_event_exit_event(struct perf_even
+  
+  static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+  {
+ -	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+  	struct perf_event *child_event, *next;
+ +	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+  
+ -	WARN_ON_ONCE(child != current);
+ -
+ -	child_ctx = perf_pin_task_context(child, ctxn);
+ -	if (!child_ctx)
+ +	if (likely(!child->perf_event_ctxp[ctxn]))
+  		return;
+  
+ +	local_irq_disable();
+ +	WARN_ON_ONCE(child != current);
+  	/*
+++<<<<<<< HEAD
+ +	 * We can't reschedule here because interrupts are disabled,
+ +	 * and child must be current.
+++=======
++ 	 * In order to reduce the amount of tricky in ctx tear-down, we hold
++ 	 * ctx::mutex over the entire thing. This serializes against almost
++ 	 * everything that wants to access the ctx.
++ 	 *
++ 	 * The exception is sys_perf_event_open() /
++ 	 * perf_event_create_kernel_count() which does find_get_context()
++ 	 * without ctx::mutex (it cannot because of the move_group double mutex
++ 	 * lock thing). See the comments in perf_install_in_context().
++ 	 *
++ 	 * We can recurse on the same lock type through:
++ 	 *
++ 	 *   perf_event_exit_event()
++ 	 *     put_event()
++ 	 *       mutex_lock(&ctx->mutex)
++ 	 *
++ 	 * But since its the parent context it won't be the same instance.
+++>>>>>>> 8ba289b8d4e4 (perf: Clean up sync_child_event())
+  	 */
+ -	mutex_lock(&child_ctx->mutex);
+ +	child_ctx = rcu_dereference_raw(child->perf_event_ctxp[ctxn]);
+  
+  	/*
+ -	 * In a single ctx::lock section, de-schedule the events and detach the
+ -	 * context from the task such that we cannot ever get it scheduled back
+ -	 * in.
+ +	 * Take the context lock here so that if find_get_context is
+ +	 * reading child->perf_event_ctxp, we wait until it has
+ +	 * incremented the context's refcount before we do put_ctx below.
+  	 */
+ -	raw_spin_lock_irq(&child_ctx->lock);
+ -	task_ctx_sched_out(__get_cpu_context(child_ctx), child_ctx);
+ +	raw_spin_lock(&child_ctx->lock);
+ +	task_ctx_sched_out(child_ctx);
+ +	child->perf_event_ctxp[ctxn] = NULL;
+  
+  	/*
+ -	 * Now that the context is inactive, destroy the task <-> ctx relation
+ -	 * and mark the context dead.
+ +	 * If this context is a clone; unclone it so it can't get
+ +	 * swapped to another process while we're removing all
+ +	 * the events from it.
+  	 */
+ -	RCU_INIT_POINTER(child->perf_event_ctxp[ctxn], NULL);
+ -	put_ctx(child_ctx); /* cannot be last */
+ -	WRITE_ONCE(child_ctx->task, TASK_TOMBSTONE);
+ -	put_task_struct(current); /* cannot be last */
+ -
+  	clone_ctx = unclone_ctx(child_ctx);
+ +	update_context_time(child_ctx);
+  	raw_spin_unlock_irq(&child_ctx->lock);
+  
+  	if (clone_ctx)
+@@@ -8172,20 -8801,8 +8189,20 @@@
+  	 */
+  	perf_event_task(child, child_ctx, 0);
+  
+ +	/*
+ +	 * We can recurse on the same lock type through:
+ +	 *
+ +	 *   __perf_event_exit_task()
+ +	 *     sync_child_event()
+ +	 *       put_event()
+ +	 *         mutex_lock(&ctx->mutex)
+ +	 *
+ +	 * But since its the parent context it won't be the same instance.
+ +	 */
+ +	mutex_lock(&child_ctx->mutex);
+ +
+  	list_for_each_entry_safe(child_event, next, &child_ctx->event_list, event_entry)
+- 		__perf_event_exit_task(child_event, child_ctx, child);
++ 		perf_event_exit_event(child_event, child_ctx, child);
+  
+  	mutex_unlock(&child_ctx->mutex);
+  
+* Unmerged path kernel/events/core.c
