@@ -1,0 +1,86 @@
+vfs: reorganize dput() memory accesses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 8aab6a27332bbf2abfcb35224738394e784d940b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/8aab6a27.failed
+
+This is me being a bit OCD after all the dentry optimization work this
+merge window: profiles end up showing 'dput()' as a rather expensive
+operation, and there were two unrelated bad reasons for that.
+
+The first reason was reading d_lockref.count for debugging purposes,
+which touches the lockref cacheline (for reads) before really need to.
+More importantly, the debugging test in question is _wrong_, and has
+hidden bugs.  It's true that we can only sleep when the count goes down
+to zero, but the test as-is hides the much more subtle bug that happens
+if we race with somebody else deleting the file.
+
+Anyway we _will_ touch that cacheline, but let's do it for a write and
+in the right routine (ie in "lockref_put_or_lock()") which annotates the
+costs better.  So remove the misleading debug code.
+
+The other was an unnecessary access to the cacheline that contains the
+d_lru list, just to check whether we already were on the LRU list or
+not.  This is exactly what we have d_flags for, so that we can avoid
+touching extra cache lines for the common case.  So just add another bit
+for "is this dentry on the LRU".
+
+Finally, mark the tests properly likely/unlikely, so that the common
+fast-paths are dense in the instruction stream.
+
+This makes the profiles look much saner.
+
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8aab6a27332bbf2abfcb35224738394e784d940b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index c1d239fbff60,bf3c4f9569eb..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -513,17 -515,14 +515,25 @@@ void dput(struct dentry *dentry
+  		return;
+  
+  repeat:
+++<<<<<<< HEAD
+ +	if (dentry->d_count == 1)
+ +		might_sleep();
+ +	spin_lock(&dentry->d_lock);
+ +	BUG_ON(!dentry->d_count);
+ +	if (dentry->d_count > 1) {
+ +		dentry->d_count--;
+ +		spin_unlock(&dentry->d_lock);
+++=======
++ 	if (lockref_put_or_lock(&dentry->d_lockref))
+++>>>>>>> 8aab6a27332b (vfs: reorganize dput() memory accesses)
+  		return;
+ +	}
+  
+- 	if (dentry->d_flags & DCACHE_OP_DELETE) {
++ 	/* Unreachable? Get rid of it */
++ 	if (unlikely(d_unhashed(dentry)))
++ 		goto kill_it;
++ 
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE)) {
+  		if (dentry->d_op->d_delete(dentry))
+  			goto kill_it;
+  	}
+* Unmerged path fs/dcache.c
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 4c0560aed145..ec0f0c7a3dd8 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -206,6 +206,7 @@ struct dentry_operations {
+ #define DCACHE_MANAGED_DENTRY \
+ 	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
+ 
++#define DCACHE_LRU_LIST		0x80000
+ #define DCACHE_DENTRY_KILLED	0x100000
+ 
+ extern seqlock_t rename_lock;
