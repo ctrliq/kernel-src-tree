@@ -1,0 +1,1743 @@
+IB/qib: Remove qp and mr functionality from qib
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit 7c2e11fe2dbe69ba78c7a363f83474ad2c11ede7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7c2e11fe.failed
+
+Remove qp and mr support from qib and use rdmavt. These two changes
+cannot be reasonably be split apart into separate patches because they
+depend on each other in mulitple places. This paves the way to remove
+even more functions in subsequent patches.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 7c2e11fe2dbe69ba78c7a363f83474ad2c11ede7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_keys.c
+#	drivers/infiniband/hw/qib/qib_mr.c
+#	drivers/infiniband/hw/qib/qib_ruc.c
+#	drivers/infiniband/hw/qib/qib_verbs.c
+#	drivers/infiniband/hw/qib/qib_verbs.h
+diff --cc drivers/infiniband/hw/qib/qib_keys.c
+index eabe54738be6,2c3c93572c17..000000000000
+--- a/drivers/infiniband/hw/qib/qib_keys.c
++++ b/drivers/infiniband/hw/qib/qib_keys.c
+@@@ -126,10 -126,10 +126,15 @@@ void qib_free_lkey(struct rvt_mregion *
+  	if (!mr->lkey_published)
+  		goto out;
+  	if (lkey == 0)
+ -		RCU_INIT_POINTER(dev->dma_mr, NULL);
+ +		rcu_assign_pointer(dev->dma_mr, NULL);
+  	else {
+++<<<<<<< HEAD
+ +		r = lkey >> (32 - ib_qib_lkey_table_size);
+ +		rcu_assign_pointer(rkt->table[r], NULL);
+++=======
++ 		r = lkey >> (32 - ib_rvt_lkey_table_size);
++ 		RCU_INIT_POINTER(rkt->table[r], NULL);
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  	}
+  	qib_put_mr(mr);
+  	mr->lkey_published = 0;
+@@@ -138,105 -138,6 +143,108 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * qib_lkey_ok - check IB SGE for validity and initialize
+ + * @rkt: table containing lkey to check SGE against
+ + * @pd: protection domain
+ + * @isge: outgoing internal SGE
+ + * @sge: SGE to check
+ + * @acc: access flags
+ + *
+ + * Return 1 if valid and successful, otherwise returns 0.
+ + *
+ + * increments the reference count upon success
+ + *
+ + * Check the IB SGE for validity and initialize our internal version
+ + * of it.
+ + */
+ +int qib_lkey_ok(struct qib_lkey_table *rkt, struct qib_pd *pd,
+ +		struct qib_sge *isge, struct ib_sge *sge, int acc)
+ +{
+ +	struct qib_mregion *mr;
+ +	unsigned n, m;
+ +	size_t off;
+ +
+ +	/*
+ +	 * We use LKEY == zero for kernel virtual addresses
+ +	 * (see qib_get_dma_mr and qib_dma.c).
+ +	 */
+ +	rcu_read_lock();
+ +	if (sge->lkey == 0) {
+ +		struct qib_ibdev *dev = to_idev(pd->ibpd.device);
+ +
+ +		if (pd->user)
+ +			goto bail;
+ +		mr = rcu_dereference(dev->dma_mr);
+ +		if (!mr)
+ +			goto bail;
+ +		if (unlikely(!atomic_inc_not_zero(&mr->refcount)))
+ +			goto bail;
+ +		rcu_read_unlock();
+ +
+ +		isge->mr = mr;
+ +		isge->vaddr = (void *) sge->addr;
+ +		isge->length = sge->length;
+ +		isge->sge_length = sge->length;
+ +		isge->m = 0;
+ +		isge->n = 0;
+ +		goto ok;
+ +	}
+ +	mr = rcu_dereference(
+ +		rkt->table[(sge->lkey >> (32 - ib_qib_lkey_table_size))]);
+ +	if (unlikely(!mr || mr->lkey != sge->lkey || mr->pd != &pd->ibpd))
+ +		goto bail;
+ +
+ +	off = sge->addr - mr->user_base;
+ +	if (unlikely(sge->addr < mr->user_base ||
+ +		     off + sge->length > mr->length ||
+ +		     (mr->access_flags & acc) != acc))
+ +		goto bail;
+ +	if (unlikely(!atomic_inc_not_zero(&mr->refcount)))
+ +		goto bail;
+ +	rcu_read_unlock();
+ +
+ +	off += mr->offset;
+ +	if (mr->page_shift) {
+ +		/*
+ +		page sizes are uniform power of 2 so no loop is necessary
+ +		entries_spanned_by_off is the number of times the loop below
+ +		would have executed.
+ +		*/
+ +		size_t entries_spanned_by_off;
+ +
+ +		entries_spanned_by_off = off >> mr->page_shift;
+ +		off -= (entries_spanned_by_off << mr->page_shift);
+ +		m = entries_spanned_by_off/QIB_SEGSZ;
+ +		n = entries_spanned_by_off%QIB_SEGSZ;
+ +	} else {
+ +		m = 0;
+ +		n = 0;
+ +		while (off >= mr->map[m]->segs[n].length) {
+ +			off -= mr->map[m]->segs[n].length;
+ +			n++;
+ +			if (n >= QIB_SEGSZ) {
+ +				m++;
+ +				n = 0;
+ +			}
+ +		}
+ +	}
+ +	isge->mr = mr;
+ +	isge->vaddr = mr->map[m]->segs[n].vaddr + off;
+ +	isge->length = mr->map[m]->segs[n].length - off;
+ +	isge->sge_length = sge->length;
+ +	isge->m = m;
+ +	isge->n = n;
+ +ok:
+ +	return 1;
+ +bail:
+ +	rcu_read_unlock();
+ +	return 0;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+   * qib_rkey_ok - check the IB virtual address, length, and RKEY
+   * @qp: qp for validation
+   * @sge: SGE state
+@@@ -335,57 -236,3 +343,60 @@@ bail
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Initialize the memory region specified by the work reqeust.
+ + */
+ +int qib_fast_reg_mr(struct qib_qp *qp, struct ib_send_wr *wr)
+ +{
+ +	struct qib_lkey_table *rkt = &to_idev(qp->ibqp.device)->lk_table;
+ +	struct qib_pd *pd = to_ipd(qp->ibqp.pd);
+ +	struct qib_mregion *mr;
+ +	u32 rkey = wr->wr.fast_reg.rkey;
+ +	unsigned i, n, m;
+ +	int ret = -EINVAL;
+ +	unsigned long flags;
+ +	u64 *page_list;
+ +	size_t ps;
+ +
+ +	spin_lock_irqsave(&rkt->lock, flags);
+ +	if (pd->user || rkey == 0)
+ +		goto bail;
+ +
+ +	mr = rcu_dereference_protected(
+ +		rkt->table[(rkey >> (32 - ib_qib_lkey_table_size))],
+ +		lockdep_is_held(&rkt->lock));
+ +	if (unlikely(mr == NULL || qp->ibqp.pd != mr->pd))
+ +		goto bail;
+ +
+ +	if (wr->wr.fast_reg.page_list_len > mr->max_segs)
+ +		goto bail;
+ +
+ +	ps = 1UL << wr->wr.fast_reg.page_shift;
+ +	if (wr->wr.fast_reg.length > ps * wr->wr.fast_reg.page_list_len)
+ +		goto bail;
+ +
+ +	mr->user_base = wr->wr.fast_reg.iova_start;
+ +	mr->iova = wr->wr.fast_reg.iova_start;
+ +	mr->lkey = rkey;
+ +	mr->length = wr->wr.fast_reg.length;
+ +	mr->access_flags = wr->wr.fast_reg.access_flags;
+ +	page_list = wr->wr.fast_reg.page_list->page_list;
+ +	m = 0;
+ +	n = 0;
+ +	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
+ +		mr->map[m]->segs[n].vaddr = (void *) page_list[i];
+ +		mr->map[m]->segs[n].length = ps;
+ +		if (++n == QIB_SEGSZ) {
+ +			m++;
+ +			n = 0;
+ +		}
+ +	}
+ +
+ +	ret = 0;
+ +bail:
+ +	spin_unlock_irqrestore(&rkt->lock, flags);
+ +	return ret;
+ +}
+++=======
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+diff --cc drivers/infiniband/hw/qib/qib_ruc.c
+index e9132f7a68b0,02e79a867ac5..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@@ -83,12 -83,12 +83,21 @@@ static int qib_init_sge(struct rvt_qp *
+  {
+  	int i, j, ret;
+  	struct ib_wc wc;
+++<<<<<<< HEAD
+ +	struct qib_lkey_table *rkt;
+ +	struct qib_pd *pd;
+ +	struct qib_sge_state *ss;
+ +
+ +	rkt = &to_idev(qp->ibqp.device)->lk_table;
+ +	pd = to_ipd(qp->ibqp.srq ? qp->ibqp.srq->pd : qp->ibqp.pd);
+++=======
++ 	struct rvt_lkey_table *rkt;
++ 	struct rvt_pd *pd;
++ 	struct rvt_sge_state *ss;
++ 
++ 	rkt = &to_idev(qp->ibqp.device)->rdi.lkey_table;
++ 	pd = ibpd_to_rvtpd(qp->ibqp.srq ? qp->ibqp.srq->pd : qp->ibqp.pd);
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  	ss = &qp->r_sge;
+  	ss->sg_list = qp->r_sg_list;
+  	qp->r_len = 0;
+@@@ -458,9 -458,9 +467,15 @@@ again
+  			goto inv_err;
+  		if (wqe->length == 0)
+  			break;
+++<<<<<<< HEAD
+ +		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
+ +					  wqe->wr.wr.rdma.remote_addr,
+ +					  wqe->wr.wr.rdma.rkey,
+++=======
++ 		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
++ 					  wqe->rdma_wr.remote_addr,
++ 					  wqe->rdma_wr.rkey,
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  					  IB_ACCESS_REMOTE_WRITE)))
+  			goto acc_err;
+  		qp->r_sge.sg_list = NULL;
+@@@ -471,9 -471,9 +486,15 @@@
+  	case IB_WR_RDMA_READ:
+  		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+  			goto inv_err;
+++<<<<<<< HEAD
+ +		if (unlikely(!qib_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+ +					  wqe->wr.wr.rdma.remote_addr,
+ +					  wqe->wr.wr.rdma.rkey,
+++=======
++ 		if (unlikely(!rvt_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
++ 					  wqe->rdma_wr.remote_addr,
++ 					  wqe->rdma_wr.rkey,
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  					  IB_ACCESS_REMOTE_READ)))
+  			goto acc_err;
+  		release = 0;
+@@@ -489,20 -489,20 +510,31 @@@
+  	case IB_WR_ATOMIC_FETCH_AND_ADD:
+  		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+  			goto inv_err;
+++<<<<<<< HEAD
+ +		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+ +					  wqe->wr.wr.atomic.remote_addr,
+ +					  wqe->wr.wr.atomic.rkey,
+++=======
++ 		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
++ 					  wqe->atomic_wr.remote_addr,
++ 					  wqe->atomic_wr.rkey,
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  					  IB_ACCESS_REMOTE_ATOMIC)))
+  			goto acc_err;
+  		/* Perform atomic OP and save result. */
+  		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+ -		sdata = wqe->atomic_wr.compare_add;
+ +		sdata = wqe->wr.wr.atomic.compare_add;
+  		*(u64 *) sqp->s_sge.sge.vaddr =
+ -			(wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ +			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+  			(u64) atomic64_add_return(sdata, maddr) - sdata :
+  			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+++<<<<<<< HEAD
+ +				      sdata, wqe->wr.wr.atomic.swap);
+ +		qib_put_mr(qp->r_sge.sge.mr);
+++=======
++ 				      sdata, wqe->atomic_wr.swap);
++ 		rvt_put_mr(qp->r_sge.sge.mr);
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  		qp->r_sge.num_sge = 0;
+  		goto send_comp;
+  
+diff --cc drivers/infiniband/hw/qib/qib_verbs.c
+index c4417a1f33be,5c0e76cf897e..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@@ -345,8 -345,9 +345,14 @@@ static int qib_post_one_send(struct rvt
+  	int acc;
+  	int ret;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	struct qib_lkey_table *rkt;
+ +	struct qib_pd *pd;
+++=======
++ 	struct rvt_lkey_table *rkt;
++ 	struct rvt_pd *pd;
++ 	int avoid_schedule = 0;
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  
+  	spin_lock_irqsave(&qp->s_lock, flags);
+  
+@@@ -363,10 -364,7 +369,14 @@@
+  	 * undefined operations.
+  	 * Make sure buffer is large enough to hold the result for atomics.
+  	 */
+++<<<<<<< HEAD
+ +	if (wr->opcode == IB_WR_FAST_REG_MR) {
+ +		if (qib_fast_reg_mr(qp, wr))
+ +			goto bail_inval;
+ +	} else if (qp->ibqp.qp_type == IB_QPT_UC) {
+++=======
++ 	if (qp->ibqp.qp_type == IB_QPT_UC) {
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  		if ((unsigned) wr->opcode >= IB_WR_RDMA_READ)
+  			goto bail_inval;
+  	} else if (qp->ibqp.qp_type != IB_QPT_RC) {
+@@@ -395,10 -393,26 +405,15 @@@
+  		goto bail;
+  	}
+  
+++<<<<<<< HEAD
+ +	rkt = &to_idev(qp->ibqp.device)->lk_table;
+ +	pd = to_ipd(qp->ibqp.pd);
+++=======
++ 	rkt = &to_idev(qp->ibqp.device)->rdi.lkey_table;
++ 	pd = ibpd_to_rvtpd(qp->ibqp.pd);
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  	wqe = get_swqe_ptr(qp, qp->s_head);
+ -
+ -	if (qp->ibqp.qp_type != IB_QPT_UC &&
+ -	    qp->ibqp.qp_type != IB_QPT_RC)
+ -		memcpy(&wqe->ud_wr, ud_wr(wr), sizeof(wqe->ud_wr));
+ -	else if (wr->opcode == IB_WR_REG_MR)
+ -		memcpy(&wqe->reg_wr, reg_wr(wr),
+ -			sizeof(wqe->reg_wr));
+ -	else if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
+ -		 wr->opcode == IB_WR_RDMA_WRITE ||
+ -		 wr->opcode == IB_WR_RDMA_READ)
+ -		memcpy(&wqe->rdma_wr, rdma_wr(wr), sizeof(wqe->rdma_wr));
+ -	else if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+ -		 wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
+ -		memcpy(&wqe->atomic_wr, atomic_wr(wr), sizeof(wqe->atomic_wr));
+ -	else
+ -		memcpy(&wqe->wr, wr, sizeof(wqe->wr));
+ -
+ +	wqe->wr = *wr;
+  	wqe->length = 0;
+  	j = 0;
+  	if (wr->num_sge) {
+@@@ -1596,10 -1614,10 +1611,10 @@@ static int qib_query_device(struct ib_d
+  	props->max_cq = ib_qib_max_cqs;
+  	props->max_ah = ib_qib_max_ahs;
+  	props->max_cqe = ib_qib_max_cqes;
+- 	props->max_mr = dev->lk_table.max;
+- 	props->max_fmr = dev->lk_table.max;
++ 	props->max_mr = dev->rdi.lkey_table.max;
++ 	props->max_fmr = dev->rdi.lkey_table.max;
+  	props->max_map_per_fmr = 32767;
+ -	props->max_pd = dev->rdi.dparms.props.max_pd;
+ +	props->max_pd = ib_qib_max_pds;
+  	props->max_qp_rd_atom = QIB_MAX_RDMA_ATOMIC;
+  	props->max_qp_init_rd_atom = 255;
+  	/* props->max_res_rd_atom */
+@@@ -2256,17 -2195,15 +2248,29 @@@ int qib_register_ib_device(struct qib_d
+  	ibdev->resize_cq = qib_resize_cq;
+  	ibdev->poll_cq = qib_poll_cq;
+  	ibdev->req_notify_cq = qib_req_notify_cq;
+++<<<<<<< HEAD
+ +	ibdev->get_dma_mr = qib_get_dma_mr;
+ +	ibdev->reg_phys_mr = qib_reg_phys_mr;
+ +	ibdev->reg_user_mr = qib_reg_user_mr;
+ +	ibdev->dereg_mr = qib_dereg_mr;
+ +	ibdev->alloc_mr = qib_alloc_mr;
+ +	ibdev->alloc_fast_reg_page_list = qib_alloc_fast_reg_page_list;
+ +	ibdev->free_fast_reg_page_list = qib_free_fast_reg_page_list;
+ +	ibdev->alloc_fmr = qib_alloc_fmr;
+ +	ibdev->map_phys_fmr = qib_map_phys_fmr;
+ +	ibdev->unmap_fmr = qib_unmap_fmr;
+ +	ibdev->dealloc_fmr = qib_dealloc_fmr;
+++=======
++ 	ibdev->get_dma_mr = NULL;
++ 	ibdev->reg_user_mr = NULL;
++ 	ibdev->dereg_mr = NULL;
++ 	ibdev->alloc_mr = NULL;
++ 	ibdev->map_mr_sg = NULL;
++ 	ibdev->alloc_fmr = NULL;
++ 	ibdev->map_phys_fmr = NULL;
++ 	ibdev->unmap_fmr = NULL;
++ 	ibdev->dealloc_fmr = NULL;
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  	ibdev->attach_mcast = qib_multicast_attach;
+  	ibdev->detach_mcast = qib_multicast_detach;
+  	ibdev->process_mad = qib_process_mad;
+diff --cc drivers/infiniband/hw/qib/qib_verbs.h
+index ca366073af4f,c7399ff90173..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@@ -275,109 -255,7 +261,113 @@@ struct qib_cq 
+  	u8 notify;
+  	u8 triggered;
+  	struct qib_cq_wc *queue;
+++<<<<<<< HEAD
+ +	struct qib_mmap_info *ip;
+ +};
+ +
+ +/*
+ + * A segment is a linear region of low physical memory.
+ + * XXX Maybe we should use phys addr here and kmap()/kunmap().
+ + * Used by the verbs layer.
+ + */
+ +struct qib_seg {
+ +	void *vaddr;
+ +	size_t length;
+ +};
+ +
+ +/* The number of qib_segs that fit in a page. */
+ +#define QIB_SEGSZ     (PAGE_SIZE / sizeof(struct qib_seg))
+ +
+ +struct qib_segarray {
+ +	struct qib_seg segs[QIB_SEGSZ];
+ +};
+ +
+ +struct qib_mregion {
+ +	struct ib_pd *pd;       /* shares refcnt of ibmr.pd */
+ +	u64 user_base;          /* User's address for this region */
+ +	u64 iova;               /* IB start address of this region */
+ +	size_t length;
+ +	u32 lkey;
+ +	u32 offset;             /* offset (bytes) to start of region */
+ +	int access_flags;
+ +	u32 max_segs;           /* number of qib_segs in all the arrays */
+ +	u32 mapsz;              /* size of the map array */
+ +	u8  page_shift;         /* 0 - non unform/non powerof2 sizes */
+ +	u8  lkey_published;     /* in global table */
+ +	struct completion comp; /* complete when refcount goes to zero */
+ +	struct rcu_head list;
+ +	atomic_t refcount;
+ +	struct qib_segarray *map[0];    /* the segments */
+ +};
+ +
+ +/*
+ + * These keep track of the copy progress within a memory region.
+ + * Used by the verbs layer.
+ + */
+ +struct qib_sge {
+ +	struct qib_mregion *mr;
+ +	void *vaddr;            /* kernel virtual address of segment */
+ +	u32 sge_length;         /* length of the SGE */
+ +	u32 length;             /* remaining length of the segment */
+ +	u16 m;                  /* current index: mr->map[m] */
+ +	u16 n;                  /* current index: mr->map[m]->segs[n] */
+ +};
+ +
+ +/* Memory region */
+ +struct qib_mr {
+ +	struct ib_mr ibmr;
+ +	struct ib_umem *umem;
+ +	struct qib_mregion mr;  /* must be last */
+ +};
+ +
+ +/*
+ + * Send work request queue entry.
+ + * The size of the sg_list is determined when the QP is created and stored
+ + * in qp->s_max_sge.
+ + */
+ +struct qib_swqe {
+ +	struct ib_send_wr wr;   /* don't use wr.sg_list */
+ +	u32 psn;                /* first packet sequence number */
+ +	u32 lpsn;               /* last packet sequence number */
+ +	u32 ssn;                /* send sequence number */
+ +	u32 length;             /* total length of data in sg_list */
+ +	struct qib_sge sg_list[0];
+ +};
+ +
+ +/*
+ + * Receive work request queue entry.
+ + * The size of the sg_list is determined when the QP (or SRQ) is created
+ + * and stored in qp->r_rq.max_sge (or srq->rq.max_sge).
+ + */
+ +struct qib_rwqe {
+ +	u64 wr_id;
+ +	u8 num_sge;
+ +	struct ib_sge sg_list[0];
+ +};
+ +
+ +/*
+ + * This structure is used to contain the head pointer, tail pointer,
+ + * and receive work queue entries as a single memory allocation so
+ + * it can be mmap'ed into user space.
+ + * Note that the wq array elements are variable size so you can't
+ + * just index into the array to get the N'th element;
+ + * use get_rwqe_ptr() instead.
+ + */
+ +struct qib_rwq {
+ +	u32 head;               /* new work requests posted to the head */
+ +	u32 tail;               /* receives pull requests from here. */
+ +	struct qib_rwqe wq[0];
+ +};
+ +
+ +struct qib_rq {
+ +	struct qib_rwq *wq;
+ +	u32 size;               /* size of RWQE array */
+ +	u8 max_sge;
+ +	spinlock_t lock /* protect changes in this struct */
+ +		____cacheline_aligned_in_smp;
+++=======
++ 	struct rvt_mmap_info *ip;
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  };
+  
+  struct qib_srq {
+@@@ -816,16 -545,6 +657,19 @@@ struct qib_verbs_counters 
+  	u32 vl15_dropped;
+  };
+  
+++<<<<<<< HEAD
+ +static inline struct qib_mr *to_imr(struct ib_mr *ibmr)
+ +{
+ +	return container_of(ibmr, struct qib_mr, ibmr);
+ +}
+ +
+ +static inline struct qib_pd *to_ipd(struct ib_pd *ibpd)
+ +{
+ +	return container_of(ibpd, struct qib_pd, ibpd);
+ +}
+ +
+++=======
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  static inline struct qib_ah *to_iah(struct ib_ah *ibah)
+  {
+  	return container_of(ibah, struct qib_ah, ibah);
+@@@ -983,24 -702,14 +827,28 @@@ struct ib_ah *qib_create_qp0_ah(struct 
+  
+  void qib_rc_rnr_retry(unsigned long arg);
+  
+- void qib_rc_send_complete(struct qib_qp *qp, struct qib_ib_header *hdr);
++ void qib_rc_send_complete(struct rvt_qp *qp, struct qib_ib_header *hdr);
+  
+- void qib_rc_error(struct qib_qp *qp, enum ib_wc_status err);
++ void qib_rc_error(struct rvt_qp *qp, enum ib_wc_status err);
+  
+- int qib_post_ud_send(struct qib_qp *qp, struct ib_send_wr *wr);
++ int qib_post_ud_send(struct rvt_qp *qp, struct ib_send_wr *wr);
+  
+  void qib_ud_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
+++<<<<<<< HEAD
+ +		int has_grh, void *data, u32 tlen, struct qib_qp *qp);
+ +
+ +int qib_alloc_lkey(struct qib_mregion *mr, int dma_region);
+ +
+ +void qib_free_lkey(struct qib_mregion *mr);
+ +
+ +int qib_lkey_ok(struct qib_lkey_table *rkt, struct qib_pd *pd,
+ +		struct qib_sge *isge, struct ib_sge *sge, int acc);
+ +
+ +int qib_rkey_ok(struct qib_qp *qp, struct qib_sge *sge,
+ +		u32 len, u64 vaddr, u32 rkey, int acc);
+++=======
++ 		int has_grh, void *data, u32 tlen, struct rvt_qp *qp);
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  
+  int qib_post_srq_receive(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+  			 struct ib_recv_wr **bad_wr);
+@@@ -1036,56 -745,12 +884,53 @@@ int qib_req_notify_cq(struct ib_cq *ibc
+  
+  int qib_resize_cq(struct ib_cq *ibcq, int cqe, struct ib_udata *udata);
+  
+++<<<<<<< HEAD
+ +struct ib_mr *qib_get_dma_mr(struct ib_pd *pd, int acc);
+ +
+ +struct ib_mr *qib_reg_phys_mr(struct ib_pd *pd,
+ +			      struct ib_phys_buf *buffer_list,
+ +			      int num_phys_buf, int acc, u64 *iova_start);
+ +
+ +struct ib_mr *qib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ +			      u64 virt_addr, int mr_access_flags,
+ +			      struct ib_udata *udata);
+ +
+ +int qib_dereg_mr(struct ib_mr *ibmr);
+ +
+ +struct ib_mr *qib_alloc_mr(struct ib_pd *pd,
+ +			   enum ib_mr_type mr_type,
+ +			   u32 max_entries);
+ +
+ +struct ib_fast_reg_page_list *qib_alloc_fast_reg_page_list(
+ +				struct ib_device *ibdev, int page_list_len);
+ +
+ +void qib_free_fast_reg_page_list(struct ib_fast_reg_page_list *pl);
+ +
+ +int qib_fast_reg_mr(struct qib_qp *qp, struct ib_send_wr *wr);
+ +
+ +struct ib_fmr *qib_alloc_fmr(struct ib_pd *pd, int mr_access_flags,
+ +			     struct ib_fmr_attr *fmr_attr);
+ +
+ +int qib_map_phys_fmr(struct ib_fmr *ibfmr, u64 *page_list,
+ +		     int list_len, u64 iova);
+ +
+ +int qib_unmap_fmr(struct list_head *fmr_list);
+ +
+ +int qib_dealloc_fmr(struct ib_fmr *ibfmr);
+ +
+ +static inline void qib_get_mr(struct qib_mregion *mr)
+ +{
+ +	atomic_inc(&mr->refcount);
+ +}
+ +
+++=======
+++>>>>>>> 7c2e11fe2dbe (IB/qib: Remove qp and mr functionality from qib)
+  void mr_rcu_callback(struct rcu_head *list);
+  
+- static inline void qib_put_mr(struct qib_mregion *mr)
+- {
+- 	if (unlikely(atomic_dec_and_test(&mr->refcount)))
+- 		call_rcu(&mr->list, mr_rcu_callback);
+- }
+- 
+- static inline void qib_put_ss(struct qib_sge_state *ss)
++ static inline void qib_put_ss(struct rvt_sge_state *ss)
+  {
+  	while (ss->num_sge) {
+- 		qib_put_mr(ss->sge.mr);
++ 		rvt_put_mr(ss->sge.mr);
+  		if (--ss->num_sge)
+  			ss->sge = *ss->sg_list++;
+  	}
+* Unmerged path drivers/infiniband/hw/qib/qib_mr.c
+diff --git a/drivers/infiniband/hw/qib/Makefile b/drivers/infiniband/hw/qib/Makefile
+index 8a8f892de7df..75140f5eb0b7 100644
+--- a/drivers/infiniband/hw/qib/Makefile
++++ b/drivers/infiniband/hw/qib/Makefile
+@@ -1,8 +1,8 @@
+ obj-$(CONFIG_INFINIBAND_QIB) += ib_qib.o
+ 
+ ib_qib-y := qib_cq.o qib_diag.o qib_driver.o qib_eeprom.o \
+-	qib_file_ops.o qib_fs.o qib_init.o qib_intr.o qib_keys.o \
+-	qib_mad.o qib_mmap.o qib_mr.o qib_pcie.o qib_pio_copy.o \
++	qib_file_ops.o qib_fs.o qib_init.o qib_intr.o \
++	qib_mad.o qib_mmap.o qib_pcie.o qib_pio_copy.o \
+ 	qib_qp.o qib_qsfp.o qib_rc.o qib_ruc.o qib_sdma.o qib_srq.o \
+ 	qib_sysfs.o qib_twsi.o qib_tx.o qib_uc.o qib_ud.o \
+ 	qib_user_pages.o qib_user_sdma.o qib_verbs_mcast.o qib_iba7220.o \
+diff --git a/drivers/infiniband/hw/qib/qib.h b/drivers/infiniband/hw/qib/qib.h
+index 2c9672d7da79..9a858ad3224f 100644
+--- a/drivers/infiniband/hw/qib/qib.h
++++ b/drivers/infiniband/hw/qib/qib.h
+@@ -231,7 +231,7 @@ struct qib_ctxtdata {
+ 	/* ctxt rcvhdrq head offset */
+ 	u32 head;
+ 	/* lookaside fields */
+-	struct qib_qp *lookaside_qp;
++	struct rvt_qp *lookaside_qp;
+ 	u32 lookaside_qpn;
+ 	/* QPs waiting for context processing */
+ 	struct list_head qp_wait_list;
+@@ -241,7 +241,7 @@ struct qib_ctxtdata {
+ #endif
+ };
+ 
+-struct qib_sge_state;
++struct rvt_sge_state;
+ 
+ struct qib_sdma_txreq {
+ 	int                 flags;
+@@ -259,14 +259,14 @@ struct qib_sdma_desc {
+ 
+ struct qib_verbs_txreq {
+ 	struct qib_sdma_txreq   txreq;
+-	struct qib_qp           *qp;
+-	struct qib_swqe         *wqe;
++	struct rvt_qp           *qp;
++	struct rvt_swqe         *wqe;
+ 	u32                     dwords;
+ 	u16                     hdr_dwords;
+ 	u16                     hdr_inx;
+ 	struct qib_pio_header	*align_buf;
+-	struct qib_mregion	*mr;
+-	struct qib_sge_state    *ss;
++	struct rvt_mregion	*mr;
++	struct rvt_sge_state    *ss;
+ };
+ 
+ #define QIB_SDMA_TXREQ_F_USELARGEBUF  0x1
+@@ -1325,7 +1325,7 @@ void __qib_sdma_intr(struct qib_pportdata *);
+ void qib_sdma_intr(struct qib_pportdata *);
+ void qib_user_sdma_send_desc(struct qib_pportdata *dd,
+ 			struct list_head *pktlist);
+-int qib_sdma_verbs_send(struct qib_pportdata *, struct qib_sge_state *,
++int qib_sdma_verbs_send(struct qib_pportdata *, struct rvt_sge_state *,
+ 			u32, struct qib_verbs_txreq *);
+ /* ppd->sdma_lock should be locked before calling this. */
+ int qib_sdma_make_progress(struct qib_pportdata *dd);
+diff --git a/drivers/infiniband/hw/qib/qib_cq.c b/drivers/infiniband/hw/qib/qib_cq.c
+index 2b45d0b02300..c1ea21ecf4ff 100644
+--- a/drivers/infiniband/hw/qib/qib_cq.c
++++ b/drivers/infiniband/hw/qib/qib_cq.c
+@@ -466,7 +466,7 @@ int qib_resize_cq(struct ib_cq *ibcq, int cqe, struct ib_udata *udata)
+ 
+ 	if (cq->ip) {
+ 		struct qib_ibdev *dev = to_idev(ibcq->device);
+-		struct qib_mmap_info *ip = cq->ip;
++		struct rvt_mmap_info *ip = cq->ip;
+ 
+ 		qib_update_mmap_info(dev, ip, sz, wc);
+ 
+diff --git a/drivers/infiniband/hw/qib/qib_driver.c b/drivers/infiniband/hw/qib/qib_driver.c
+index 323352f4bb60..ef91abf8a5fc 100644
+--- a/drivers/infiniband/hw/qib/qib_driver.c
++++ b/drivers/infiniband/hw/qib/qib_driver.c
+@@ -322,7 +322,7 @@ static u32 qib_rcv_hdrerr(struct qib_ctxtdata *rcd, struct qib_pportdata *ppd,
+ 		struct qib_ib_header *hdr = (struct qib_ib_header *) rhdr;
+ 		struct qib_other_headers *ohdr = NULL;
+ 		struct qib_ibport *ibp = &ppd->ibport_data;
+-		struct qib_qp *qp = NULL;
++		struct rvt_qp *qp = NULL;
+ 		u32 tlen = qib_hdrget_length_in_bytes(rhf_addr);
+ 		u16 lid  = be16_to_cpu(hdr->lrh[1]);
+ 		int lnh = be16_to_cpu(hdr->lrh[0]) & 3;
+@@ -472,7 +472,7 @@ u32 qib_kreceive(struct qib_ctxtdata *rcd, u32 *llic, u32 *npkts)
+ 	u32 eflags, etype, tlen, i = 0, updegr = 0, crcs = 0;
+ 	int last;
+ 	u64 lval;
+-	struct qib_qp *qp, *nqp;
++	struct rvt_qp *qp, *nqp;
+ 
+ 	l = rcd->head;
+ 	rhf_addr = (__le32 *) rcd->rcvhdrq + l + dd->rhf_offset;
+* Unmerged path drivers/infiniband/hw/qib/qib_keys.c
+diff --git a/drivers/infiniband/hw/qib/qib_mmap.c b/drivers/infiniband/hw/qib/qib_mmap.c
+index 146cf29a2e1d..016dde54cac5 100644
+--- a/drivers/infiniband/hw/qib/qib_mmap.c
++++ b/drivers/infiniband/hw/qib/qib_mmap.c
+@@ -41,12 +41,12 @@
+ 
+ /**
+  * qib_release_mmap_info - free mmap info structure
+- * @ref: a pointer to the kref within struct qib_mmap_info
++ * @ref: a pointer to the kref within struct rvt_mmap_info
+  */
+ void qib_release_mmap_info(struct kref *ref)
+ {
+-	struct qib_mmap_info *ip =
+-		container_of(ref, struct qib_mmap_info, ref);
++	struct rvt_mmap_info *ip =
++		container_of(ref, struct rvt_mmap_info, ref);
+ 	struct qib_ibdev *dev = to_idev(ip->context->device);
+ 
+ 	spin_lock_irq(&dev->pending_lock);
+@@ -63,14 +63,14 @@ void qib_release_mmap_info(struct kref *ref)
+  */
+ static void qib_vma_open(struct vm_area_struct *vma)
+ {
+-	struct qib_mmap_info *ip = vma->vm_private_data;
++	struct rvt_mmap_info *ip = vma->vm_private_data;
+ 
+ 	kref_get(&ip->ref);
+ }
+ 
+ static void qib_vma_close(struct vm_area_struct *vma)
+ {
+-	struct qib_mmap_info *ip = vma->vm_private_data;
++	struct rvt_mmap_info *ip = vma->vm_private_data;
+ 
+ 	kref_put(&ip->ref, qib_release_mmap_info);
+ }
+@@ -91,7 +91,7 @@ int qib_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ 	struct qib_ibdev *dev = to_idev(context->device);
+ 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+-	struct qib_mmap_info *ip, *pp;
++	struct rvt_mmap_info *ip, *pp;
+ 	int ret = -EINVAL;
+ 
+ 	/*
+@@ -128,11 +128,11 @@ done:
+ /*
+  * Allocate information for qib_mmap
+  */
+-struct qib_mmap_info *qib_create_mmap_info(struct qib_ibdev *dev,
++struct rvt_mmap_info *qib_create_mmap_info(struct qib_ibdev *dev,
+ 					   u32 size,
+ 					   struct ib_ucontext *context,
+ 					   void *obj) {
+-	struct qib_mmap_info *ip;
++	struct rvt_mmap_info *ip;
+ 
+ 	ip = kmalloc(sizeof(*ip), GFP_KERNEL);
+ 	if (!ip)
+@@ -157,7 +157,7 @@ bail:
+ 	return ip;
+ }
+ 
+-void qib_update_mmap_info(struct qib_ibdev *dev, struct qib_mmap_info *ip,
++void qib_update_mmap_info(struct qib_ibdev *dev, struct rvt_mmap_info *ip,
+ 			  u32 size, void *obj)
+ {
+ 	size = PAGE_ALIGN(size);
+* Unmerged path drivers/infiniband/hw/qib/qib_mr.c
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index cf1dd6e9d434..cab3aa9aae19 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -221,7 +221,7 @@ static inline unsigned qpn_hash(struct qib_ibdev *dev, u32 qpn)
+  * Put the QP into the hash table.
+  * The hash table holds a reference to the QP.
+  */
+-static void insert_qp(struct qib_ibdev *dev, struct qib_qp *qp)
++static void insert_qp(struct qib_ibdev *dev, struct rvt_qp *qp)
+ {
+ 	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	unsigned long flags;
+@@ -246,7 +246,7 @@ static void insert_qp(struct qib_ibdev *dev, struct qib_qp *qp)
+  * Remove the QP from the table so it can't be found asynchronously by
+  * the receive interrupt routine.
+  */
+-static void remove_qp(struct qib_ibdev *dev, struct qib_qp *qp)
++static void remove_qp(struct qib_ibdev *dev, struct rvt_qp *qp)
+ {
+ 	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	unsigned n = qpn_hash(dev, qp->ibqp.qp_num);
+@@ -262,8 +262,8 @@ static void remove_qp(struct qib_ibdev *dev, struct qib_qp *qp)
+ 			lockdep_is_held(&dev->qpt_lock)) == qp) {
+ 		rcu_assign_pointer(ibp->qp1, NULL);
+ 	} else {
+-		struct qib_qp *q;
+-		struct qib_qp __rcu **qpp;
++		struct rvt_qp *q;
++		struct rvt_qp __rcu **qpp;
+ 
+ 		removed = 0;
+ 		qpp = &dev->qp_table[n];
+@@ -297,7 +297,7 @@ unsigned qib_free_all_qps(struct qib_devdata *dd)
+ {
+ 	struct qib_ibdev *dev = &dd->verbs_dev;
+ 	unsigned long flags;
+-	struct qib_qp *qp;
++	struct rvt_qp *qp;
+ 	unsigned n, qp_inuse = 0;
+ 
+ 	for (n = 0; n < dd->num_pports; n++) {
+@@ -337,9 +337,9 @@ unsigned qib_free_all_qps(struct qib_devdata *dd)
+  * The caller is responsible for decrementing the QP reference count
+  * when done.
+  */
+-struct qib_qp *qib_lookup_qpn(struct qib_ibport *ibp, u32 qpn)
++struct rvt_qp *qib_lookup_qpn(struct qib_ibport *ibp, u32 qpn)
+ {
+-	struct qib_qp *qp = NULL;
++	struct rvt_qp *qp = NULL;
+ 
+ 	rcu_read_lock();
+ 	if (unlikely(qpn <= 1)) {
+@@ -369,7 +369,7 @@ struct qib_qp *qib_lookup_qpn(struct qib_ibport *ibp, u32 qpn)
+  * @qp: the QP to reset
+  * @type: the QP type
+  */
+-static void qib_reset_qp(struct qib_qp *qp, enum ib_qp_type type)
++static void qib_reset_qp(struct rvt_qp *qp, enum ib_qp_type type)
+ {
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	qp->remote_qpn = 0;
+@@ -417,7 +417,7 @@ static void qib_reset_qp(struct qib_qp *qp, enum ib_qp_type type)
+ 	qp->r_sge.num_sge = 0;
+ }
+ 
+-static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
++static void clear_mr_refs(struct rvt_qp *qp, int clr_sends)
+ {
+ 	unsigned n;
+ 
+@@ -428,13 +428,13 @@ static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+ 
+ 	if (clr_sends) {
+ 		while (qp->s_last != qp->s_head) {
+-			struct qib_swqe *wqe = get_swqe_ptr(qp, qp->s_last);
++			struct rvt_swqe *wqe = get_swqe_ptr(qp, qp->s_last);
+ 			unsigned i;
+ 
+ 			for (i = 0; i < wqe->wr.num_sge; i++) {
+-				struct qib_sge *sge = &wqe->sg_list[i];
++				struct rvt_sge *sge = &wqe->sg_list[i];
+ 
+-				qib_put_mr(sge->mr);
++				rvt_put_mr(sge->mr);
+ 			}
+ 			if (qp->ibqp.qp_type == IB_QPT_UD ||
+ 			    qp->ibqp.qp_type == IB_QPT_SMI ||
+@@ -444,7 +444,7 @@ static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+ 				qp->s_last = 0;
+ 		}
+ 		if (qp->s_rdma_mr) {
+-			qib_put_mr(qp->s_rdma_mr);
++			rvt_put_mr(qp->s_rdma_mr);
+ 			qp->s_rdma_mr = NULL;
+ 		}
+ 	}
+@@ -453,11 +453,11 @@ static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+ 		return;
+ 
+ 	for (n = 0; n < ARRAY_SIZE(qp->s_ack_queue); n++) {
+-		struct qib_ack_entry *e = &qp->s_ack_queue[n];
++		struct rvt_ack_entry *e = &qp->s_ack_queue[n];
+ 
+ 		if (e->opcode == IB_OPCODE_RC_RDMA_READ_REQUEST &&
+ 		    e->rdma_sge.mr) {
+-			qib_put_mr(e->rdma_sge.mr);
++			rvt_put_mr(e->rdma_sge.mr);
+ 			e->rdma_sge.mr = NULL;
+ 		}
+ 	}
+@@ -473,7 +473,7 @@ static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+  * The QP r_lock and s_lock should be held and interrupts disabled.
+  * If we are already in error state, just return.
+  */
+-int qib_error_qp(struct qib_qp *qp, enum ib_wc_status err)
++int qib_error_qp(struct rvt_qp *qp, enum ib_wc_status err)
+ {
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	struct qib_ibdev *dev = to_idev(qp->ibqp.device);
+@@ -503,7 +503,7 @@ int qib_error_qp(struct qib_qp *qp, enum ib_wc_status err)
+ 	if (!(qp->s_flags & QIB_S_BUSY)) {
+ 		qp->s_hdrwords = 0;
+ 		if (qp->s_rdma_mr) {
+-			qib_put_mr(qp->s_rdma_mr);
++			rvt_put_mr(qp->s_rdma_mr);
+ 			qp->s_rdma_mr = NULL;
+ 		}
+ 		if (priv->s_tx) {
+@@ -530,7 +530,7 @@ int qib_error_qp(struct qib_qp *qp, enum ib_wc_status err)
+ 	wc.status = IB_WC_WR_FLUSH_ERR;
+ 
+ 	if (qp->r_rq.wq) {
+-		struct qib_rwq *wq;
++		struct rvt_rwq *wq;
+ 		u32 head;
+ 		u32 tail;
+ 
+@@ -573,7 +573,7 @@ int qib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		  int attr_mask, struct ib_udata *udata)
+ {
+ 	struct qib_ibdev *dev = to_idev(ibqp->device);
+-	struct qib_qp *qp = to_iqp(ibqp);
++	struct rvt_qp *qp = to_iqp(ibqp);
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	enum ib_qp_state cur_state, new_state;
+ 	struct ib_event ev;
+@@ -860,7 +860,7 @@ bail:
+ int qib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		 int attr_mask, struct ib_qp_init_attr *init_attr)
+ {
+-	struct qib_qp *qp = to_iqp(ibqp);
++	struct rvt_qp *qp = to_iqp(ibqp);
+ 
+ 	attr->qp_state = qp->state;
+ 	attr->cur_qp_state = attr->qp_state;
+@@ -913,7 +913,7 @@ int qib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+  *
+  * Returns the AETH.
+  */
+-__be32 qib_compute_aeth(struct qib_qp *qp)
++__be32 qib_compute_aeth(struct rvt_qp *qp)
+ {
+ 	u32 aeth = qp->r_msn & QIB_MSN_MASK;
+ 
+@@ -926,7 +926,7 @@ __be32 qib_compute_aeth(struct qib_qp *qp)
+ 	} else {
+ 		u32 min, max, x;
+ 		u32 credits;
+-		struct qib_rwq *wq = qp->r_rq.wq;
++		struct rvt_rwq *wq = qp->r_rq.wq;
+ 		u32 head;
+ 		u32 tail;
+ 
+@@ -981,9 +981,9 @@ struct ib_qp *qib_create_qp(struct ib_pd *ibpd,
+ 			    struct ib_qp_init_attr *init_attr,
+ 			    struct ib_udata *udata)
+ {
+-	struct qib_qp *qp;
++	struct rvt_qp *qp;
+ 	int err;
+-	struct qib_swqe *swq = NULL;
++	struct rvt_swqe *swq = NULL;
+ 	struct qib_ibdev *dev;
+ 	struct qib_devdata *dd;
+ 	size_t sz;
+@@ -1032,9 +1032,9 @@ struct ib_qp *qib_create_qp(struct ib_pd *ibpd,
+ 	case IB_QPT_UC:
+ 	case IB_QPT_RC:
+ 	case IB_QPT_UD:
+-		sz = sizeof(struct qib_sge) *
++		sz = sizeof(struct rvt_sge) *
+ 			init_attr->cap.max_send_sge +
+-			sizeof(struct qib_swqe);
++			sizeof(struct rvt_swqe);
+ 		swq = __vmalloc((init_attr->cap.max_send_wr + 1) * sz,
+ 				gfp, PAGE_KERNEL);
+ 		if (swq == NULL) {
+@@ -1079,14 +1079,14 @@ struct ib_qp *qib_create_qp(struct ib_pd *ibpd,
+ 			qp->r_rq.size = init_attr->cap.max_recv_wr + 1;
+ 			qp->r_rq.max_sge = init_attr->cap.max_recv_sge;
+ 			sz = (sizeof(struct ib_sge) * qp->r_rq.max_sge) +
+-				sizeof(struct qib_rwqe);
++				sizeof(struct rvt_rwqe);
+ 			if (gfp != GFP_NOIO)
+ 				qp->r_rq.wq = vmalloc_user(
+-						sizeof(struct qib_rwq) +
++						sizeof(struct rvt_rwq) +
+ 						qp->r_rq.size * sz);
+ 			else
+ 				qp->r_rq.wq = __vmalloc(
+-						sizeof(struct qib_rwq) +
++						sizeof(struct rvt_rwq) +
+ 						qp->r_rq.size * sz,
+ 						gfp, PAGE_KERNEL);
+ 
+@@ -1154,7 +1154,7 @@ struct ib_qp *qib_create_qp(struct ib_pd *ibpd,
+ 				goto bail_ip;
+ 			}
+ 		} else {
+-			u32 s = sizeof(struct qib_rwq) + qp->r_rq.size * sz;
++			u32 s = sizeof(struct rvt_rwq) + qp->r_rq.size * sz;
+ 
+ 			qp->ip = qib_create_mmap_info(dev, s,
+ 						      ibpd->uobject->context,
+@@ -1220,7 +1220,7 @@ bail:
+  */
+ int qib_destroy_qp(struct ib_qp *ibqp)
+ {
+-	struct qib_qp *qp = to_iqp(ibqp);
++	struct rvt_qp *qp = to_iqp(ibqp);
+ 	struct qib_ibdev *dev = to_idev(ibqp->device);
+ 	struct qib_qp_priv *priv = qp->priv;
+ 
+@@ -1296,7 +1296,7 @@ void qib_free_qpn_table(struct qib_qpn_table *qpt)
+  *
+  * The QP s_lock should be held.
+  */
+-void qib_get_credit(struct qib_qp *qp, u32 aeth)
++void qib_get_credit(struct rvt_qp *qp, u32 aeth)
+ {
+ 	u32 credit = (aeth >> QIB_AETH_CREDIT_SHIFT) & QIB_AETH_CREDIT_MASK;
+ 
+@@ -1330,7 +1330,7 @@ void qib_get_credit(struct qib_qp *qp, u32 aeth)
+ 
+ struct qib_qp_iter {
+ 	struct qib_ibdev *dev;
+-	struct qib_qp *qp;
++	struct rvt_qp *qp;
+ 	int n;
+ };
+ 
+@@ -1356,8 +1356,8 @@ int qib_qp_iter_next(struct qib_qp_iter *iter)
+ 	struct qib_ibdev *dev = iter->dev;
+ 	int n = iter->n;
+ 	int ret = 1;
+-	struct qib_qp *pqp = iter->qp;
+-	struct qib_qp *qp;
++	struct rvt_qp *pqp = iter->qp;
++	struct rvt_qp *qp;
+ 
+ 	for (; n < dev->qp_table_size; n++) {
+ 		if (pqp)
+@@ -1380,8 +1380,8 @@ static const char * const qp_type_str[] = {
+ 
+ void qib_qp_iter_print(struct seq_file *s, struct qib_qp_iter *iter)
+ {
+-	struct qib_swqe *wqe;
+-	struct qib_qp *qp = iter->qp;
++	struct rvt_swqe *wqe;
++	struct rvt_qp *qp = iter->qp;
+ 	struct qib_qp_priv *priv = qp->priv;
+ 
+ 	wqe = get_swqe_ptr(qp, qp->s_last);
+diff --git a/drivers/infiniband/hw/qib/qib_rc.c b/drivers/infiniband/hw/qib/qib_rc.c
+index c23ede5294da..3e2ddb1faa7a 100644
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@ -40,7 +40,7 @@
+ 
+ static void rc_timeout(unsigned long arg);
+ 
+-static u32 restart_sge(struct qib_sge_state *ss, struct qib_swqe *wqe,
++static u32 restart_sge(struct rvt_sge_state *ss, struct rvt_swqe *wqe,
+ 		       u32 psn, u32 pmtu)
+ {
+ 	u32 len;
+@@ -54,7 +54,7 @@ static u32 restart_sge(struct qib_sge_state *ss, struct qib_swqe *wqe,
+ 	return wqe->length - len;
+ }
+ 
+-static void start_timer(struct qib_qp *qp)
++static void start_timer(struct rvt_qp *qp)
+ {
+ 	qp->s_flags |= QIB_S_TIMER;
+ 	qp->s_timer.function = rc_timeout;
+@@ -74,10 +74,10 @@ static void start_timer(struct qib_qp *qp)
+  * Note that we are in the responder's side of the QP context.
+  * Note the QP s_lock must be held.
+  */
+-static int qib_make_rc_ack(struct qib_ibdev *dev, struct qib_qp *qp,
++static int qib_make_rc_ack(struct qib_ibdev *dev, struct rvt_qp *qp,
+ 			   struct qib_other_headers *ohdr, u32 pmtu)
+ {
+-	struct qib_ack_entry *e;
++	struct rvt_ack_entry *e;
+ 	u32 hwords;
+ 	u32 len;
+ 	u32 bth0;
+@@ -95,7 +95,7 @@ static int qib_make_rc_ack(struct qib_ibdev *dev, struct qib_qp *qp,
+ 	case OP(RDMA_READ_RESPONSE_ONLY):
+ 		e = &qp->s_ack_queue[qp->s_tail_ack_queue];
+ 		if (e->rdma_sge.mr) {
+-			qib_put_mr(e->rdma_sge.mr);
++			rvt_put_mr(e->rdma_sge.mr);
+ 			e->rdma_sge.mr = NULL;
+ 		}
+ 		/* FALLTHROUGH */
+@@ -133,7 +133,7 @@ static int qib_make_rc_ack(struct qib_ibdev *dev, struct qib_qp *qp,
+ 			/* Copy SGE state in case we need to resend */
+ 			qp->s_rdma_mr = e->rdma_sge.mr;
+ 			if (qp->s_rdma_mr)
+-				qib_get_mr(qp->s_rdma_mr);
++				rvt_get_mr(qp->s_rdma_mr);
+ 			qp->s_ack_rdma_sge.sge = e->rdma_sge;
+ 			qp->s_ack_rdma_sge.num_sge = 1;
+ 			qp->s_cur_sge = &qp->s_ack_rdma_sge;
+@@ -172,7 +172,7 @@ static int qib_make_rc_ack(struct qib_ibdev *dev, struct qib_qp *qp,
+ 		qp->s_cur_sge = &qp->s_ack_rdma_sge;
+ 		qp->s_rdma_mr = qp->s_ack_rdma_sge.sge.mr;
+ 		if (qp->s_rdma_mr)
+-			qib_get_mr(qp->s_rdma_mr);
++			rvt_get_mr(qp->s_rdma_mr);
+ 		len = qp->s_ack_rdma_sge.sge.sge_length;
+ 		if (len > pmtu)
+ 			len = pmtu;
+@@ -228,13 +228,13 @@ bail:
+  *
+  * Return 1 if constructed; otherwise, return 0.
+  */
+-int qib_make_rc_req(struct qib_qp *qp)
++int qib_make_rc_req(struct rvt_qp *qp)
+ {
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	struct qib_ibdev *dev = to_idev(qp->ibqp.device);
+ 	struct qib_other_headers *ohdr;
+-	struct qib_sge_state *ss;
+-	struct qib_swqe *wqe;
++	struct rvt_sge_state *ss;
++	struct rvt_swqe *wqe;
+ 	u32 hwords;
+ 	u32 len;
+ 	u32 bth0;
+@@ -646,7 +646,7 @@ unlock:
+  * Note that RDMA reads and atomics are handled in the
+  * send side QP state and tasklet.
+  */
+-void qib_send_rc_ack(struct qib_qp *qp)
++void qib_send_rc_ack(struct rvt_qp *qp)
+ {
+ 	struct qib_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+ 	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+@@ -781,10 +781,10 @@ done:
+  * for the given QP.
+  * Called at interrupt level with the QP s_lock held.
+  */
+-static void reset_psn(struct qib_qp *qp, u32 psn)
++static void reset_psn(struct rvt_qp *qp, u32 psn)
+ {
+ 	u32 n = qp->s_acked;
+-	struct qib_swqe *wqe = get_swqe_ptr(qp, n);
++	struct rvt_swqe *wqe = get_swqe_ptr(qp, n);
+ 	u32 opcode;
+ 
+ 	qp->s_cur = n;
+@@ -866,9 +866,9 @@ done:
+  * Back up requester to resend the last un-ACKed request.
+  * The QP r_lock and s_lock should be held and interrupts disabled.
+  */
+-static void qib_restart_rc(struct qib_qp *qp, u32 psn, int wait)
++static void qib_restart_rc(struct rvt_qp *qp, u32 psn, int wait)
+ {
+-	struct qib_swqe *wqe = get_swqe_ptr(qp, qp->s_acked);
++	struct rvt_swqe *wqe = get_swqe_ptr(qp, qp->s_acked);
+ 	struct qib_ibport *ibp;
+ 
+ 	if (qp->s_retry == 0) {
+@@ -903,7 +903,7 @@ static void qib_restart_rc(struct qib_qp *qp, u32 psn, int wait)
+  */
+ static void rc_timeout(unsigned long arg)
+ {
+-	struct qib_qp *qp = (struct qib_qp *)arg;
++	struct rvt_qp *qp = (struct rvt_qp *)arg;
+ 	struct qib_ibport *ibp;
+ 	unsigned long flags;
+ 
+@@ -926,7 +926,7 @@ static void rc_timeout(unsigned long arg)
+  */
+ void qib_rc_rnr_retry(unsigned long arg)
+ {
+-	struct qib_qp *qp = (struct qib_qp *)arg;
++	struct rvt_qp *qp = (struct rvt_qp *)arg;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&qp->s_lock, flags);
+@@ -942,9 +942,9 @@ void qib_rc_rnr_retry(unsigned long arg)
+  * Set qp->s_sending_psn to the next PSN after the given one.
+  * This would be psn+1 except when RDMA reads are present.
+  */
+-static void reset_sending_psn(struct qib_qp *qp, u32 psn)
++static void reset_sending_psn(struct rvt_qp *qp, u32 psn)
+ {
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	u32 n = qp->s_last;
+ 
+ 	/* Find the work request corresponding to the given PSN. */
+@@ -967,10 +967,10 @@ static void reset_sending_psn(struct qib_qp *qp, u32 psn)
+ /*
+  * This should be called with the QP s_lock held and interrupts disabled.
+  */
+-void qib_rc_send_complete(struct qib_qp *qp, struct qib_ib_header *hdr)
++void qib_rc_send_complete(struct rvt_qp *qp, struct qib_ib_header *hdr)
+ {
+ 	struct qib_other_headers *ohdr;
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	struct ib_wc wc;
+ 	unsigned i;
+ 	u32 opcode;
+@@ -1011,9 +1011,9 @@ void qib_rc_send_complete(struct qib_qp *qp, struct qib_ib_header *hdr)
+ 		    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) <= 0)
+ 			break;
+ 		for (i = 0; i < wqe->wr.num_sge; i++) {
+-			struct qib_sge *sge = &wqe->sg_list[i];
++			struct rvt_sge *sge = &wqe->sg_list[i];
+ 
+-			qib_put_mr(sge->mr);
++			rvt_put_mr(sge->mr);
+ 		}
+ 		/* Post a send completion queue entry if requested. */
+ 		if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+@@ -1042,7 +1042,7 @@ void qib_rc_send_complete(struct qib_qp *qp, struct qib_ib_header *hdr)
+ 	}
+ }
+ 
+-static inline void update_last_psn(struct qib_qp *qp, u32 psn)
++static inline void update_last_psn(struct rvt_qp *qp, u32 psn)
+ {
+ 	qp->s_last_psn = psn;
+ }
+@@ -1052,8 +1052,8 @@ static inline void update_last_psn(struct qib_qp *qp, u32 psn)
+  * This is similar to qib_send_complete but has to check to be sure
+  * that the SGEs are not being referenced if the SWQE is being resent.
+  */
+-static struct qib_swqe *do_rc_completion(struct qib_qp *qp,
+-					 struct qib_swqe *wqe,
++static struct rvt_swqe *do_rc_completion(struct rvt_qp *qp,
++					 struct rvt_swqe *wqe,
+ 					 struct qib_ibport *ibp)
+ {
+ 	struct ib_wc wc;
+@@ -1067,9 +1067,9 @@ static struct qib_swqe *do_rc_completion(struct qib_qp *qp,
+ 	if (qib_cmp24(wqe->lpsn, qp->s_sending_psn) < 0 ||
+ 	    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) > 0) {
+ 		for (i = 0; i < wqe->wr.num_sge; i++) {
+-			struct qib_sge *sge = &wqe->sg_list[i];
++			struct rvt_sge *sge = &wqe->sg_list[i];
+ 
+-			qib_put_mr(sge->mr);
++			rvt_put_mr(sge->mr);
+ 		}
+ 		/* Post a send completion queue entry if requested. */
+ 		if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+@@ -1125,12 +1125,12 @@ static struct qib_swqe *do_rc_completion(struct qib_qp *qp,
+  * Called at interrupt level with the QP s_lock held.
+  * Returns 1 if OK, 0 if current operation should be aborted (NAK).
+  */
+-static int do_rc_ack(struct qib_qp *qp, u32 aeth, u32 psn, int opcode,
++static int do_rc_ack(struct rvt_qp *qp, u32 aeth, u32 psn, int opcode,
+ 		     u64 val, struct qib_ctxtdata *rcd)
+ {
+ 	struct qib_ibport *ibp;
+ 	enum ib_wc_status status;
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	int ret = 0;
+ 	u32 ack_psn;
+ 	int diff;
+@@ -1348,10 +1348,10 @@ bail:
+  * We have seen an out of sequence RDMA read middle or last packet.
+  * This ACKs SENDs and RDMA writes up to the first RDMA read or atomic SWQE.
+  */
+-static void rdma_seq_err(struct qib_qp *qp, struct qib_ibport *ibp, u32 psn,
++static void rdma_seq_err(struct rvt_qp *qp, struct qib_ibport *ibp, u32 psn,
+ 			 struct qib_ctxtdata *rcd)
+ {
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 
+ 	/* Remove QP from retry timer */
+ 	if (qp->s_flags & (QIB_S_TIMER | QIB_S_WAIT_RNR)) {
+@@ -1398,12 +1398,12 @@ static void rdma_seq_err(struct qib_qp *qp, struct qib_ibport *ibp, u32 psn,
+ static void qib_rc_rcv_resp(struct qib_ibport *ibp,
+ 			    struct qib_other_headers *ohdr,
+ 			    void *data, u32 tlen,
+-			    struct qib_qp *qp,
++			    struct rvt_qp *qp,
+ 			    u32 opcode,
+ 			    u32 psn, u32 hdrsize, u32 pmtu,
+ 			    struct qib_ctxtdata *rcd)
+ {
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+ 	enum ib_wc_status status;
+ 	unsigned long flags;
+@@ -1622,14 +1622,14 @@ bail:
+  */
+ static int qib_rc_rcv_error(struct qib_other_headers *ohdr,
+ 			    void *data,
+-			    struct qib_qp *qp,
++			    struct rvt_qp *qp,
+ 			    u32 opcode,
+ 			    u32 psn,
+ 			    int diff,
+ 			    struct qib_ctxtdata *rcd)
+ {
+ 	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+-	struct qib_ack_entry *e;
++	struct rvt_ack_entry *e;
+ 	unsigned long flags;
+ 	u8 i, prev;
+ 	int old_req;
+@@ -1731,7 +1731,7 @@ static int qib_rc_rcv_error(struct qib_other_headers *ohdr,
+ 		if (unlikely(offset + len != e->rdma_sge.sge_length))
+ 			goto unlock_done;
+ 		if (e->rdma_sge.mr) {
+-			qib_put_mr(e->rdma_sge.mr);
++			rvt_put_mr(e->rdma_sge.mr);
+ 			e->rdma_sge.mr = NULL;
+ 		}
+ 		if (len != 0) {
+@@ -1739,7 +1739,7 @@ static int qib_rc_rcv_error(struct qib_other_headers *ohdr,
+ 			u64 vaddr = be64_to_cpu(reth->vaddr);
+ 			int ok;
+ 
+-			ok = qib_rkey_ok(qp, &e->rdma_sge, len, vaddr, rkey,
++			ok = rvt_rkey_ok(qp, &e->rdma_sge, len, vaddr, rkey,
+ 					 IB_ACCESS_REMOTE_READ);
+ 			if (unlikely(!ok))
+ 				goto unlock_done;
+@@ -1817,7 +1817,7 @@ send_ack:
+ 	return 0;
+ }
+ 
+-void qib_rc_error(struct qib_qp *qp, enum ib_wc_status err)
++void qib_rc_error(struct rvt_qp *qp, enum ib_wc_status err)
+ {
+ 	unsigned long flags;
+ 	int lastwqe;
+@@ -1836,7 +1836,7 @@ void qib_rc_error(struct qib_qp *qp, enum ib_wc_status err)
+ 	}
+ }
+ 
+-static inline void qib_update_ack_queue(struct qib_qp *qp, unsigned n)
++static inline void qib_update_ack_queue(struct rvt_qp *qp, unsigned n)
+ {
+ 	unsigned next;
+ 
+@@ -1861,7 +1861,7 @@ static inline void qib_update_ack_queue(struct qib_qp *qp, unsigned n)
+  * Called at interrupt level.
+  */
+ void qib_rc_rcv(struct qib_ctxtdata *rcd, struct qib_ib_header *hdr,
+-		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
++		int has_grh, void *data, u32 tlen, struct rvt_qp *qp)
+ {
+ 	struct qib_ibport *ibp = &rcd->ppd->ibport_data;
+ 	struct qib_other_headers *ohdr;
+@@ -2068,7 +2068,7 @@ send_last:
+ 			int ok;
+ 
+ 			/* Check rkey & NAK */
+-			ok = qib_rkey_ok(qp, &qp->r_sge.sge, qp->r_len, vaddr,
++			ok = rvt_rkey_ok(qp, &qp->r_sge.sge, qp->r_len, vaddr,
+ 					 rkey, IB_ACCESS_REMOTE_WRITE);
+ 			if (unlikely(!ok))
+ 				goto nack_acc;
+@@ -2095,7 +2095,7 @@ send_last:
+ 		goto send_last;
+ 
+ 	case OP(RDMA_READ_REQUEST): {
+-		struct qib_ack_entry *e;
++		struct rvt_ack_entry *e;
+ 		u32 len;
+ 		u8 next;
+ 
+@@ -2113,7 +2113,7 @@ send_last:
+ 		}
+ 		e = &qp->s_ack_queue[qp->r_head_ack_queue];
+ 		if (e->opcode == OP(RDMA_READ_REQUEST) && e->rdma_sge.mr) {
+-			qib_put_mr(e->rdma_sge.mr);
++			rvt_put_mr(e->rdma_sge.mr);
+ 			e->rdma_sge.mr = NULL;
+ 		}
+ 		reth = &ohdr->u.rc.reth;
+@@ -2124,7 +2124,7 @@ send_last:
+ 			int ok;
+ 
+ 			/* Check rkey & NAK */
+-			ok = qib_rkey_ok(qp, &e->rdma_sge, len, vaddr,
++			ok = rvt_rkey_ok(qp, &e->rdma_sge, len, vaddr,
+ 					 rkey, IB_ACCESS_REMOTE_READ);
+ 			if (unlikely(!ok))
+ 				goto nack_acc_unlck;
+@@ -2165,7 +2165,7 @@ send_last:
+ 	case OP(COMPARE_SWAP):
+ 	case OP(FETCH_ADD): {
+ 		struct ib_atomic_eth *ateth;
+-		struct qib_ack_entry *e;
++		struct rvt_ack_entry *e;
+ 		u64 vaddr;
+ 		atomic64_t *maddr;
+ 		u64 sdata;
+@@ -2185,7 +2185,7 @@ send_last:
+ 		}
+ 		e = &qp->s_ack_queue[qp->r_head_ack_queue];
+ 		if (e->opcode == OP(RDMA_READ_REQUEST) && e->rdma_sge.mr) {
+-			qib_put_mr(e->rdma_sge.mr);
++			rvt_put_mr(e->rdma_sge.mr);
+ 			e->rdma_sge.mr = NULL;
+ 		}
+ 		ateth = &ohdr->u.atomic_eth;
+@@ -2195,7 +2195,7 @@ send_last:
+ 			goto nack_inv_unlck;
+ 		rkey = be32_to_cpu(ateth->rkey);
+ 		/* Check rkey & NAK */
+-		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
++		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+ 					  vaddr, rkey,
+ 					  IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto nack_acc_unlck;
+@@ -2207,7 +2207,7 @@ send_last:
+ 			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+ 				      be64_to_cpu(ateth->compare_data),
+ 				      sdata);
+-		qib_put_mr(qp->r_sge.sge.mr);
++		rvt_put_mr(qp->r_sge.sge.mr);
+ 		qp->r_sge.num_sge = 0;
+ 		e->opcode = opcode;
+ 		e->sent = 0;
+* Unmerged path drivers/infiniband/hw/qib/qib_ruc.c
+diff --git a/drivers/infiniband/hw/qib/qib_sdma.c b/drivers/infiniband/hw/qib/qib_sdma.c
+index ac4fcad97505..1395ed0c811e 100644
+--- a/drivers/infiniband/hw/qib/qib_sdma.c
++++ b/drivers/infiniband/hw/qib/qib_sdma.c
+@@ -533,12 +533,12 @@ static void complete_sdma_err_req(struct qib_pportdata *ppd,
+  * 3) The SGE addresses are suitable for passing to dma_map_single().
+  */
+ int qib_sdma_verbs_send(struct qib_pportdata *ppd,
+-			struct qib_sge_state *ss, u32 dwords,
++			struct rvt_sge_state *ss, u32 dwords,
+ 			struct qib_verbs_txreq *tx)
+ {
+ 	unsigned long flags;
+-	struct qib_sge *sge;
+-	struct qib_qp *qp;
++	struct rvt_sge *sge;
++	struct rvt_qp *qp;
+ 	int ret = 0;
+ 	u16 tail;
+ 	__le64 *descqp;
+@@ -624,7 +624,7 @@ retry:
+ 			if (--ss->num_sge)
+ 				*sge = *ss->sg_list++;
+ 		} else if (sge->length == 0 && sge->mr->lkey) {
+-			if (++sge->n >= QIB_SEGSZ) {
++			if (++sge->n >= RVT_SEGSZ) {
+ 				if (++sge->m >= sge->mr->mapsz)
+ 					break;
+ 				sge->n = 0;
+diff --git a/drivers/infiniband/hw/qib/qib_srq.c b/drivers/infiniband/hw/qib/qib_srq.c
+index d6235931a1ba..85472636ced3 100644
+--- a/drivers/infiniband/hw/qib/qib_srq.c
++++ b/drivers/infiniband/hw/qib/qib_srq.c
+@@ -49,12 +49,12 @@ int qib_post_srq_receive(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+ 			 struct ib_recv_wr **bad_wr)
+ {
+ 	struct qib_srq *srq = to_isrq(ibsrq);
+-	struct qib_rwq *wq;
++	struct rvt_rwq *wq;
+ 	unsigned long flags;
+ 	int ret;
+ 
+ 	for (; wr; wr = wr->next) {
+-		struct qib_rwqe *wqe;
++		struct rvt_rwqe *wqe;
+ 		u32 next;
+ 		int i;
+ 
+@@ -132,8 +132,8 @@ struct ib_srq *qib_create_srq(struct ib_pd *ibpd,
+ 	srq->rq.size = srq_init_attr->attr.max_wr + 1;
+ 	srq->rq.max_sge = srq_init_attr->attr.max_sge;
+ 	sz = sizeof(struct ib_sge) * srq->rq.max_sge +
+-		sizeof(struct qib_rwqe);
+-	srq->rq.wq = vmalloc_user(sizeof(struct qib_rwq) + srq->rq.size * sz);
++		sizeof(struct rvt_rwqe);
++	srq->rq.wq = vmalloc_user(sizeof(struct rvt_rwq) + srq->rq.size * sz);
+ 	if (!srq->rq.wq) {
+ 		ret = ERR_PTR(-ENOMEM);
+ 		goto bail_srq;
+@@ -145,7 +145,7 @@ struct ib_srq *qib_create_srq(struct ib_pd *ibpd,
+ 	 */
+ 	if (udata && udata->outlen >= sizeof(__u64)) {
+ 		int err;
+-		u32 s = sizeof(struct qib_rwq) + srq->rq.size * sz;
++		u32 s = sizeof(struct rvt_rwq) + srq->rq.size * sz;
+ 
+ 		srq->ip =
+ 		    qib_create_mmap_info(dev, s, ibpd->uobject->context,
+@@ -213,12 +213,12 @@ int qib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		   struct ib_udata *udata)
+ {
+ 	struct qib_srq *srq = to_isrq(ibsrq);
+-	struct qib_rwq *wq;
++	struct rvt_rwq *wq;
+ 	int ret = 0;
+ 
+ 	if (attr_mask & IB_SRQ_MAX_WR) {
+-		struct qib_rwq *owq;
+-		struct qib_rwqe *p;
++		struct rvt_rwq *owq;
++		struct rvt_rwqe *p;
+ 		u32 sz, size, n, head, tail;
+ 
+ 		/* Check that the requested sizes are below the limits. */
+@@ -229,10 +229,10 @@ int qib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 			goto bail;
+ 		}
+ 
+-		sz = sizeof(struct qib_rwqe) +
++		sz = sizeof(struct rvt_rwqe) +
+ 			srq->rq.max_sge * sizeof(struct ib_sge);
+ 		size = attr->max_wr + 1;
+-		wq = vmalloc_user(sizeof(struct qib_rwq) + size * sz);
++		wq = vmalloc_user(sizeof(struct rvt_rwq) + size * sz);
+ 		if (!wq) {
+ 			ret = -ENOMEM;
+ 			goto bail;
+@@ -279,7 +279,7 @@ int qib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		n = 0;
+ 		p = wq->wq;
+ 		while (tail != head) {
+-			struct qib_rwqe *wqe;
++			struct rvt_rwqe *wqe;
+ 			int i;
+ 
+ 			wqe = get_rwqe_ptr(&srq->rq, tail);
+@@ -288,7 +288,7 @@ int qib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 			for (i = 0; i < wqe->num_sge; i++)
+ 				p->sg_list[i] = wqe->sg_list[i];
+ 			n++;
+-			p = (struct qib_rwqe *)((char *) p + sz);
++			p = (struct rvt_rwqe *)((char *)p + sz);
+ 			if (++tail >= srq->rq.size)
+ 				tail = 0;
+ 		}
+@@ -303,9 +303,9 @@ int qib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		vfree(owq);
+ 
+ 		if (srq->ip) {
+-			struct qib_mmap_info *ip = srq->ip;
++			struct rvt_mmap_info *ip = srq->ip;
+ 			struct qib_ibdev *dev = to_idev(srq->ibsrq.device);
+-			u32 s = sizeof(struct qib_rwq) + size * sz;
++			u32 s = sizeof(struct rvt_rwq) + size * sz;
+ 
+ 			qib_update_mmap_info(dev, ip, s, wq);
+ 
+diff --git a/drivers/infiniband/hw/qib/qib_uc.c b/drivers/infiniband/hw/qib/qib_uc.c
+index bab9aeb5dd9e..1ed6bd4249a3 100644
+--- a/drivers/infiniband/hw/qib/qib_uc.c
++++ b/drivers/infiniband/hw/qib/qib_uc.c
+@@ -43,11 +43,11 @@
+  *
+  * Return 1 if constructed; otherwise, return 0.
+  */
+-int qib_make_uc_req(struct qib_qp *qp)
++int qib_make_uc_req(struct rvt_qp *qp)
+ {
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	struct qib_other_headers *ohdr;
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	unsigned long flags;
+ 	u32 hwords;
+ 	u32 bth0;
+@@ -241,7 +241,7 @@ unlock:
+  * Called at interrupt level.
+  */
+ void qib_uc_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
+-		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
++		int has_grh, void *data, u32 tlen, struct rvt_qp *qp)
+ {
+ 	struct qib_other_headers *ohdr;
+ 	u32 opcode;
+@@ -439,7 +439,7 @@ rdma_first:
+ 			int ok;
+ 
+ 			/* Check rkey */
+-			ok = qib_rkey_ok(qp, &qp->r_sge.sge, qp->r_len,
++			ok = rvt_rkey_ok(qp, &qp->r_sge.sge, qp->r_len,
+ 					 vaddr, rkey, IB_ACCESS_REMOTE_WRITE);
+ 			if (unlikely(!ok))
+ 				goto drop;
+diff --git a/drivers/infiniband/hw/qib/qib_ud.c b/drivers/infiniband/hw/qib/qib_ud.c
+index 75faa5bd8dd6..7d9f0fd4db3e 100644
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@ -46,15 +46,15 @@
+  * Note that the receive interrupt handler may be calling qib_ud_rcv()
+  * while this is being called.
+  */
+-static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
++static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ {
+ 	struct qib_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+ 	struct qib_pportdata *ppd;
+-	struct qib_qp *qp;
++	struct rvt_qp *qp;
+ 	struct ib_ah_attr *ah_attr;
+ 	unsigned long flags;
+-	struct qib_sge_state ssge;
+-	struct qib_sge *sge;
++	struct rvt_sge_state ssge;
++	struct rvt_sge *sge;
+ 	struct ib_wc wc;
+ 	u32 length;
+ 	enum ib_qp_type sqptype, dqptype;
+@@ -189,7 +189,7 @@ static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+ 			if (--ssge.num_sge)
+ 				*sge = *ssge.sg_list++;
+ 		} else if (sge->length == 0 && sge->mr->lkey) {
+-			if (++sge->n >= QIB_SEGSZ) {
++			if (++sge->n >= RVT_SEGSZ) {
+ 				if (++sge->m >= sge->mr->mapsz)
+ 					break;
+ 				sge->n = 0;
+@@ -232,14 +232,14 @@ drop:
+  *
+  * Return 1 if constructed; otherwise, return 0.
+  */
+-int qib_make_ud_req(struct qib_qp *qp)
++int qib_make_ud_req(struct rvt_qp *qp)
+ {
+ 	struct qib_qp_priv *priv = qp->priv;
+ 	struct qib_other_headers *ohdr;
+ 	struct ib_ah_attr *ah_attr;
+ 	struct qib_pportdata *ppd;
+ 	struct qib_ibport *ibp;
+-	struct qib_swqe *wqe;
++	struct rvt_swqe *wqe;
+ 	unsigned long flags;
+ 	u32 nwords;
+ 	u32 extra_bytes;
+@@ -428,7 +428,7 @@ static unsigned qib_lookup_pkey(struct qib_ibport *ibp, u16 pkey)
+  * Called at interrupt level.
+  */
+ void qib_ud_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
+-		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
++		int has_grh, void *data, u32 tlen, struct rvt_qp *qp)
+ {
+ 	struct qib_other_headers *ohdr;
+ 	int opcode;
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.c
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.h
+diff --git a/drivers/infiniband/hw/qib/qib_verbs_mcast.c b/drivers/infiniband/hw/qib/qib_verbs_mcast.c
+index b2fb5286dbd9..1c7af034bdae 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs_mcast.c
++++ b/drivers/infiniband/hw/qib/qib_verbs_mcast.c
+@@ -39,7 +39,7 @@
+  * qib_mcast_qp_alloc - alloc a struct to link a QP to mcast GID struct
+  * @qp: the QP to link
+  */
+-static struct qib_mcast_qp *qib_mcast_qp_alloc(struct qib_qp *qp)
++static struct qib_mcast_qp *qib_mcast_qp_alloc(struct rvt_qp *qp)
+ {
+ 	struct qib_mcast_qp *mqp;
+ 
+@@ -56,7 +56,7 @@ bail:
+ 
+ static void qib_mcast_qp_free(struct qib_mcast_qp *mqp)
+ {
+-	struct qib_qp *qp = mqp->qp;
++	struct rvt_qp *qp = mqp->qp;
+ 
+ 	/* Notify qib_destroy_qp() if it is waiting. */
+ 	if (atomic_dec_and_test(&qp->refcount))
+@@ -224,7 +224,7 @@ bail:
+ 
+ int qib_multicast_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+ {
+-	struct qib_qp *qp = to_iqp(ibqp);
++	struct rvt_qp *qp = to_iqp(ibqp);
+ 	struct qib_ibdev *dev = to_idev(ibqp->device);
+ 	struct qib_ibport *ibp;
+ 	struct qib_mcast *mcast;
+@@ -282,7 +282,7 @@ bail:
+ 
+ int qib_multicast_detach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+ {
+-	struct qib_qp *qp = to_iqp(ibqp);
++	struct rvt_qp *qp = to_iqp(ibqp);
+ 	struct qib_ibdev *dev = to_idev(ibqp->device);
+ 	struct qib_ibport *ibp = to_iport(ibqp->device, qp->port_num);
+ 	struct qib_mcast *mcast = NULL;
