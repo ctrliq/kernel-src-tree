@@ -1,0 +1,189 @@
+ftrace: Have function graph only trace based on global_ops filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit 23a8e8441a0a74dd612edf81dc89d1600bc0a3d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/23a8e844.failed
+
+Doing some different tests, I discovered that function graph tracing, when
+filtered via the set_ftrace_filter and set_ftrace_notrace files, does
+not always keep with them if another function ftrace_ops is registered
+to trace functions.
+
+The reason is that function graph just happens to trace all functions
+that the function tracer enables. When there was only one user of
+function tracing, the function graph tracer did not need to worry about
+being called by functions that it did not want to trace. But now that there
+are other users, this becomes a problem.
+
+For example, one just needs to do the following:
+
+ # cd /sys/kernel/debug/tracing
+ # echo schedule > set_ftrace_filter
+ # echo function_graph > current_tracer
+ # cat trace
+[..]
+ 0)               |  schedule() {
+ ------------------------------------------
+ 0)    <idle>-0    =>   rcu_pre-7
+ ------------------------------------------
+
+ 0) ! 2980.314 us |  }
+ 0)               |  schedule() {
+ ------------------------------------------
+ 0)   rcu_pre-7    =>    <idle>-0
+ ------------------------------------------
+
+ 0) + 20.701 us   |  }
+
+ # echo 1 > /proc/sys/kernel/stack_tracer_enabled
+ # cat trace
+[..]
+ 1) + 20.825 us   |      }
+ 1) + 21.651 us   |    }
+ 1) + 30.924 us   |  } /* SyS_ioctl */
+ 1)               |  do_page_fault() {
+ 1)               |    __do_page_fault() {
+ 1)   0.274 us    |      down_read_trylock();
+ 1)   0.098 us    |      find_vma();
+ 1)               |      handle_mm_fault() {
+ 1)               |        _raw_spin_lock() {
+ 1)   0.102 us    |          preempt_count_add();
+ 1)   0.097 us    |          do_raw_spin_lock();
+ 1)   2.173 us    |        }
+ 1)               |        do_wp_page() {
+ 1)   0.079 us    |          vm_normal_page();
+ 1)   0.086 us    |          reuse_swap_page();
+ 1)   0.076 us    |          page_move_anon_rmap();
+ 1)               |          unlock_page() {
+ 1)   0.082 us    |            page_waitqueue();
+ 1)   0.086 us    |            __wake_up_bit();
+ 1)   1.801 us    |          }
+ 1)   0.075 us    |          ptep_set_access_flags();
+ 1)               |          _raw_spin_unlock() {
+ 1)   0.098 us    |            do_raw_spin_unlock();
+ 1)   0.105 us    |            preempt_count_sub();
+ 1)   1.884 us    |          }
+ 1)   9.149 us    |        }
+ 1) + 13.083 us   |      }
+ 1)   0.146 us    |      up_read();
+
+When the stack tracer was enabled, it enabled all functions to be traced, which
+now the function graph tracer also traces. This is a side effect that should
+not occur.
+
+To fix this a test is added when the function tracing is changed, as well as when
+the graph tracer is enabled, to see if anything other than the ftrace global_ops
+function tracer is enabled. If so, then the graph tracer calls a test trampoline
+that will look at the function that is being traced and compare it with the
+filters defined by the global_ops.
+
+As an optimization, if there's no other function tracers registered, or if
+the only registered function tracers also use the global ops, the function
+graph infrastructure will call the registered function graph callback directly
+and not go through the test trampoline.
+
+	Cc: stable@vger.kernel.org # 3.3+
+Fixes: d2d45c7a03a2 "tracing: Have stack_tracer use a separate list of functions"
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit 23a8e8441a0a74dd612edf81dc89d1600bc0a3d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/ftrace.c
+diff --cc kernel/trace/ftrace.c
+index 979b7eac7331,7f21b06648e9..000000000000
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@@ -275,6 -280,29 +275,32 @@@ static void update_global_ops(void
+  	global_ops.func = func;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ftrace_sync(struct work_struct *work)
++ {
++ 	/*
++ 	 * This function is just a stub to implement a hard force
++ 	 * of synchronize_sched(). This requires synchronizing
++ 	 * tasks even in userspace and idle.
++ 	 *
++ 	 * Yes, function tracing is rude.
++ 	 */
++ }
++ 
++ static void ftrace_sync_ipi(void *data)
++ {
++ 	/* Probably not needed, but do it anyway */
++ 	smp_rmb();
++ }
++ 
++ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
++ static void update_function_graph_func(void);
++ #else
++ static inline void update_function_graph_func(void) { }
++ #endif
++ 
+++>>>>>>> 23a8e8441a0a (ftrace: Have function graph only trace based on global_ops filters)
+  static void update_ftrace_function(void)
+  {
+  	ftrace_func_t func;
+@@@ -303,6 -331,51 +329,54 @@@
+  		func = ftrace_ops_list_func;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If there's no change, then do nothing more here */
++ 	if (ftrace_trace_function == func)
++ 		return;
++ 
++ 	update_function_graph_func();
++ 
++ 	/*
++ 	 * If we are using the list function, it doesn't care
++ 	 * about the function_trace_ops.
++ 	 */
++ 	if (func == ftrace_ops_list_func) {
++ 		ftrace_trace_function = func;
++ 		/*
++ 		 * Don't even bother setting function_trace_ops,
++ 		 * it would be racy to do so anyway.
++ 		 */
++ 		return;
++ 	}
++ 
++ #ifndef CONFIG_DYNAMIC_FTRACE
++ 	/*
++ 	 * For static tracing, we need to be a bit more careful.
++ 	 * The function change takes affect immediately. Thus,
++ 	 * we need to coorditate the setting of the function_trace_ops
++ 	 * with the setting of the ftrace_trace_function.
++ 	 *
++ 	 * Set the function to the list ops, which will call the
++ 	 * function we want, albeit indirectly, but it handles the
++ 	 * ftrace_ops and doesn't depend on function_trace_op.
++ 	 */
++ 	ftrace_trace_function = ftrace_ops_list_func;
++ 	/*
++ 	 * Make sure all CPUs see this. Yes this is slow, but static
++ 	 * tracing is slow and nasty to have enabled.
++ 	 */
++ 	schedule_on_each_cpu(ftrace_sync);
++ 	/* Now all cpus are using the list ops. */
++ 	function_trace_op = set_function_trace_op;
++ 	/* Make sure the function_trace_op is visible on all CPUs */
++ 	smp_wmb();
++ 	/* Nasty way to force a rmb on all cpus */
++ 	smp_call_function(ftrace_sync_ipi, NULL, 1);
++ 	/* OK, we are all set to update the ftrace_trace_function now! */
++ #endif /* !CONFIG_DYNAMIC_FTRACE */
++ 
+++>>>>>>> 23a8e8441a0a (ftrace: Have function graph only trace based on global_ops filters)
+  	ftrace_trace_function = func;
+  }
+  
+* Unmerged path kernel/trace/ftrace.c
