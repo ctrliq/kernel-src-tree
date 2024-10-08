@@ -1,0 +1,72 @@
+bonding: rebuild the lock use for bond_mii_monitor()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit 4cb4f97b7e361745281e843499ba58691112d2f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4cb4f97b.failed
+
+The bond_mii_monitor() still use bond lock to protect bond slave list,
+it is no effect, I have 2 way to fix the problem, move the RTNL to the
+top of the function, or add RCU to protect the bond slave list,
+according to the Jay Vosburgh's opinion, 10 times one second is a
+truely big performance loss if use RTNL to protect the whole monitor,
+so I would take the advice and use RCU to protect the bond slave list.
+
+The bond_has_slave() will not protect by anything, there will no things
+happen if the slave list is be changed, unless the bond was free, but
+it will not happened before the monitor, the bond will closed before
+be freed.
+
+The peers notify for the bond will calling curr_active_slave, so
+derefence the slave to make sure we will accessing the same slave
+if the curr_active_slave changed, as the rcu dereference need in
+read-side critical sector and bond_change_active_slave() will call
+it with no RCU hold,  so add peer notify in rcu_read_lock which
+will be nested in monitor.
+
+	Suggested-by: Jay Vosburgh <fubar@us.ibm.com>
+	Suggested-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4cb4f97b7e361745281e843499ba58691112d2f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index b9b7314b42bb,b34634a96710..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2185,7 -1923,7 +2189,11 @@@ static int bond_miimon_inspect(struct b
+  
+  	ignore_updelay = !bond->curr_active_slave ? true : false;
+  
+++<<<<<<< HEAD
+ +	bond_for_each_slave(bond, slave, i) {
+++=======
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
+++>>>>>>> 4cb4f97b7e36 (bonding: rebuild the lock use for bond_mii_monitor())
+  		slave->new_link = BOND_LINK_NOCHANGE;
+  
+  		link_state = bond_check_dev_link(bond, slave->dev, 0);
+@@@ -2383,13 -2121,13 +2391,13 @@@ void bond_mii_monitor(struct work_struc
+  	bool should_notify_peers = false;
+  	unsigned long delay;
+  
+- 	read_lock(&bond->lock);
+- 
+  	delay = msecs_to_jiffies(bond->params.miimon);
+  
+ -	if (!bond_has_slaves(bond))
+ +	if (bond->slave_cnt == 0)
+  		goto re_arm;
+  
++ 	rcu_read_lock();
++ 
+  	should_notify_peers = bond_should_notify_peers(bond);
+  
+  	if (bond_miimon_inspect(bond)) {
+* Unmerged path drivers/net/bonding/bond_main.c
