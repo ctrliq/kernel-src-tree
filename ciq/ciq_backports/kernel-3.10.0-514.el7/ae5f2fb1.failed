@@ -1,0 +1,120 @@
+openvswitch: Zero flows on allocation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] openvswitch: Zero flows on allocation (Eric Garver) [1297476]
+Rebuild_FUZZ: 98.67%
+commit-author Jesse Gross <jesse@nicira.com>
+commit ae5f2fb1d51fa128a460bcfbe3c56d7ab8bf6a43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ae5f2fb1.failed
+
+When support for megaflows was introduced, OVS needed to start
+installing flows with a mask applied to them. Since masking is an
+expensive operation, OVS also had an optimization that would only
+take the parts of the flow keys that were covered by a non-zero
+mask. The values stored in the remaining pieces should not matter
+because they are masked out.
+
+While this works fine for the purposes of matching (which must always
+look at the mask), serialization to netlink can be problematic. Since
+the flow and the mask are serialized separately, the uninitialized
+portions of the flow can be encoded with whatever values happen to be
+present.
+
+In terms of functionality, this has little effect since these fields
+will be masked out by definition. However, it leaks kernel memory to
+userspace, which is a potential security vulnerability. It is also
+possible that other code paths could look at the masked key and get
+uninitialized data, although this does not currently appear to be an
+issue in practice.
+
+This removes the mask optimization for flows that are being installed.
+This was always intended to be the case as the mask optimizations were
+really targetting per-packet flow operations.
+
+Fixes: 03f0d916 ("openvswitch: Mega flow implementation")
+	Signed-off-by: Jesse Gross <jesse@nicira.com>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ae5f2fb1d51fa128a460bcfbe3c56d7ab8bf6a43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/datapath.c
+diff --cc net/openvswitch/datapath.c
+index bad26f1b1a5b,b816ff871528..000000000000
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@@ -1044,8 -1080,8 +1044,13 @@@ static struct sw_flow_actions *get_flow
+  	struct sw_flow_key masked_key;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	ovs_flow_mask_key(&masked_key, key, mask);
+ +	error = ovs_nla_copy_actions(a, &masked_key, &acts, log);
+++=======
++ 	ovs_flow_mask_key(&masked_key, key, true, mask);
++ 	error = ovs_nla_copy_actions(net, a, &masked_key, &acts, log);
+++>>>>>>> ae5f2fb1d51f (openvswitch: Zero flows on allocation.)
+  	if (error) {
+  		OVS_NLERR(log,
+  			  "Actions may not be safe on all matching packets");
+* Unmerged path net/openvswitch/datapath.c
+diff --git a/net/openvswitch/flow_table.c b/net/openvswitch/flow_table.c
+index dc57bf58b4c5..4a974d90e9b7 100644
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@ -57,20 +57,21 @@ static u16 range_n_bytes(const struct sw_flow_key_range *range)
+ }
+ 
+ void ovs_flow_mask_key(struct sw_flow_key *dst, const struct sw_flow_key *src,
+-		       const struct sw_flow_mask *mask)
++		       bool full, const struct sw_flow_mask *mask)
+ {
+-	const long *m = (const long *)((const u8 *)&mask->key +
+-				mask->range.start);
+-	const long *s = (const long *)((const u8 *)src +
+-				mask->range.start);
+-	long *d = (long *)((u8 *)dst + mask->range.start);
++	int start = full ? 0 : mask->range.start;
++	int len = full ? sizeof *dst : range_n_bytes(&mask->range);
++	const long *m = (const long *)((const u8 *)&mask->key + start);
++	const long *s = (const long *)((const u8 *)src + start);
++	long *d = (long *)((u8 *)dst + start);
+ 	int i;
+ 
+-	/* The memory outside of the 'mask->range' are not set since
+-	 * further operations on 'dst' only uses contents within
+-	 * 'mask->range'.
++	/* If 'full' is true then all of 'dst' is fully initialized. Otherwise,
++	 * if 'full' is false the memory outside of the 'mask->range' is left
++	 * uninitialized. This can be used as an optimization when further
++	 * operations on 'dst' only use contents within 'mask->range'.
+ 	 */
+-	for (i = 0; i < range_n_bytes(&mask->range); i += sizeof(long))
++	for (i = 0; i < len; i += sizeof(long))
+ 		*d++ = *s++ & *m++;
+ }
+ 
+@@ -476,7 +477,7 @@ static struct sw_flow *masked_flow_lookup(struct table_instance *ti,
+ 	u32 hash;
+ 	struct sw_flow_key masked_key;
+ 
+-	ovs_flow_mask_key(&masked_key, unmasked, mask);
++	ovs_flow_mask_key(&masked_key, unmasked, false, mask);
+ 	hash = flow_hash(&masked_key, &mask->range);
+ 	head = find_bucket(ti, hash);
+ 	hlist_for_each_entry_rcu(flow, head, flow_table.node[ti->node_ver]) {
+diff --git a/net/openvswitch/flow_table.h b/net/openvswitch/flow_table.h
+index 616eda10d955..2dd9900f533d 100644
+--- a/net/openvswitch/flow_table.h
++++ b/net/openvswitch/flow_table.h
+@@ -86,5 +86,5 @@ struct sw_flow *ovs_flow_tbl_lookup_ufid(struct flow_table *,
+ bool ovs_flow_cmp(const struct sw_flow *, const struct sw_flow_match *);
+ 
+ void ovs_flow_mask_key(struct sw_flow_key *dst, const struct sw_flow_key *src,
+-		       const struct sw_flow_mask *mask);
++		       bool full, const struct sw_flow_mask *mask);
+ #endif /* flow_table.h */
