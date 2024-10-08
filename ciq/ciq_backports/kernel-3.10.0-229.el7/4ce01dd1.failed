@@ -1,0 +1,121 @@
+blk-mq: merge blk_mq_alloc_reserved_request into blk_mq_alloc_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4ce01dd1a07d9cf3eaf44fbf4ea9a61b11badccc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4ce01dd1.failed
+
+Instead of having two almost identical copies of the same code just let
+the callers pass in the reserved flag directly.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 4ce01dd1a07d9cf3eaf44fbf4ea9a61b11badccc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 2ab20aca2fd8,63d581d72a70..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -235,33 -307,8 +236,36 @@@ struct request *blk_mq_alloc_request(st
+  		blk_mq_put_ctx(rq->mq_ctx);
+  	return rq;
+  }
+ -EXPORT_SYMBOL(blk_mq_alloc_request);
+  
+++<<<<<<< HEAD
+ +struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw,
+ +					      gfp_t gfp)
+ +{
+ +	struct request *rq;
+ +
+ +	if (blk_mq_queue_enter(q))
+ +		return NULL;
+ +
+ +	rq = blk_mq_alloc_request_pinned(q, rw, gfp, true);
+ +	if (rq)
+ +		blk_mq_put_ctx(rq->mq_ctx);
+ +	return rq;
+ +}
+ +EXPORT_SYMBOL(blk_mq_alloc_reserved_request);
+ +
+ +/*
+ + * Re-init and set pdu, if we have it
+ + */
+ +void blk_mq_rq_init(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ +{
+ +	blk_rq_init(hctx->queue, rq);
+ +
+ +	if (hctx->cmd_size)
+ +		rq->special = blk_mq_rq_to_pdu(rq);
+ +}
+ +
+++=======
+++>>>>>>> 4ce01dd1a07d (blk-mq: merge blk_mq_alloc_reserved_request into blk_mq_alloc_request)
+  static void __blk_mq_free_request(struct blk_mq_hw_ctx *hctx,
+  				  struct blk_mq_ctx *ctx, struct request *rq)
+  {
+diff --cc include/linux/blk-mq.h
+index 0f2259d5e784,2bd82f399128..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -125,26 -160,20 +125,32 @@@ void blk_mq_insert_request(struct reque
+  void blk_mq_run_queues(struct request_queue *q, bool async);
+  void blk_mq_free_request(struct request *rq);
+  bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+++<<<<<<< HEAD
+ +struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, gfp_t gfp);
+ +struct request *blk_mq_rq_from_tag(struct request_queue *q, unsigned int tag);
+++=======
++ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
++ 		gfp_t gfp, bool reserved);
++ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+++>>>>>>> 4ce01dd1a07d (blk-mq: merge blk_mq_alloc_reserved_request into blk_mq_alloc_request)
+  
+  struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ -struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+  void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+  
+ -void blk_mq_end_io(struct request *rq, int error);
+ -void __blk_mq_end_io(struct request *rq, int error);
+ +bool blk_mq_end_io_partial(struct request *rq, int error,
+ +		unsigned int nr_bytes);
+ +static inline void blk_mq_end_io(struct request *rq, int error)
+ +{
+ +	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
+ +	BUG_ON(!done);
+ +}
+  
+ -void blk_mq_requeue_request(struct request *rq);
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head);
+ -void blk_mq_kick_requeue_list(struct request_queue *q);
+ +/*
+ + * Complete request through potential IPI for right placement. Driver must
+ + * have defined a mq_ops->complete() hook for this.
+ + */
+  void blk_mq_complete_request(struct request *rq);
+  
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index f1dcd9e7e9cb..669adc95c8c4 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1134,7 +1134,7 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
+ struct request *blk_get_request(struct request_queue *q, int rw, gfp_t gfp_mask)
+ {
+ 	if (q->mq_ops)
+-		return blk_mq_alloc_request(q, rw, gfp_mask);
++		return blk_mq_alloc_request(q, rw, gfp_mask, false);
+ 	else
+ 		return blk_old_get_request(q, rw, gfp_mask);
+ }
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
