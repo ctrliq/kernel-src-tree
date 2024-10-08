@@ -1,0 +1,490 @@
+IB/hfi1: Remove write(), use ioctl() for user cmds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit 380fb942888e7afc3420ce195a5188ff73b5a782
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/380fb942.failed
+
+Remove the write() handler for user space commands now that ioctl
+handling is available. User apps will need to change to use ioctl from
+this point forward.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 380fb942888e7afc3420ce195a5188ff73b5a782)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/file_ops.c
+#	include/uapi/rdma/hfi/hfi1_user.h
+diff --cc drivers/staging/hfi1/file_ops.c
+index 89c4fc4847ca,c46eadadf3bf..000000000000
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@@ -81,10 -72,7 +81,14 @@@
+   */
+  static int hfi1_file_open(struct inode *, struct file *);
+  static int hfi1_file_close(struct inode *, struct file *);
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +static ssize_t hfi1_file_write(struct file *, const char __user *,
+ +			       size_t, loff_t *);
+ +static ssize_t hfi1_aio_write(struct kiocb *, const struct iovec *,
+ +			      unsigned long, loff_t);
+++=======
++ static ssize_t hfi1_write_iter(struct kiocb *, struct iov_iter *);
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  static unsigned int hfi1_poll(struct file *, struct poll_table_struct *);
+  static int hfi1_file_mmap(struct file *, struct vm_area_struct *);
+  
+@@@ -112,10 -99,10 +116,14 @@@ static void unlock_exp_tids(struct hfi1
+  
+  static const struct file_operations hfi1_file_ops = {
+  	.owner = THIS_MODULE,
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	.write = hfi1_file_write,
+ +	.aio_write = hfi1_aio_write,
+++=======
++ 	.write_iter = hfi1_write_iter,
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  	.open = hfi1_file_open,
+  	.release = hfi1_file_close,
+ -	.unlocked_ioctl = hfi1_file_ioctl,
+  	.poll = hfi1_poll,
+  	.mmap = hfi1_file_mmap,
+  	.llseek = noop_llseek,
+@@@ -201,162 -175,142 +209,295 @@@ static int hfi1_file_open(struct inode 
+  	return fp->private_data ? 0 : -ENOMEM;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +static ssize_t hfi1_file_write(struct file *fp, const char __user *data,
+ +			       size_t count, loff_t *offset)
+ +{
+ +	const struct hfi1_cmd __user *ucmd;
+ +	struct hfi1_filedata *fd = fp->private_data;
+ +	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ +	struct hfi1_cmd cmd;
+ +	struct hfi1_user_info uinfo;
+ +	struct hfi1_tid_info tinfo;
+ +	ssize_t consumed = 0, copy = 0, ret = 0;
+ +	void *dest = NULL;
+ +	__u64 user_val = 0;
+ +	int uctxt_required = 1;
+ +	int must_be_root = 0;
+ +
+ +	if (count < sizeof(cmd)) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	ucmd = (const struct hfi1_cmd __user *)data;
+ +	if (copy_from_user(&cmd, ucmd, sizeof(cmd))) {
+ +		ret = -EFAULT;
+ +		goto bail;
+ +	}
+ +
+ +	consumed = sizeof(cmd);
+ +
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		copy = sizeof(uinfo);
+ +		dest = &uinfo;
+ +		break;
+ +	case HFI1_CMD_CREDIT_UPD:
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_UPDATE:
+ +	case HFI1_CMD_TID_FREE:
+ +		copy = sizeof(tinfo);
+ +		dest = &tinfo;
+ +		break;
+ +	case HFI1_CMD_USER_INFO:
+ +	case HFI1_CMD_RECV_CTRL:
+ +	case HFI1_CMD_POLL_TYPE:
+ +	case HFI1_CMD_ACK_EVENT:
+ +	case HFI1_CMD_CTXT_INFO:
+ +	case HFI1_CMD_SET_PKEY:
+ +	case HFI1_CMD_CTXT_RESET:
+ +		copy = 0;
+ +		user_val = cmd.addr;
+ +		break;
+ +	case HFI1_CMD_EP_INFO:
+ +	case HFI1_CMD_EP_ERASE_CHIP:
+ +	case HFI1_CMD_EP_ERASE_RANGE:
+ +	case HFI1_CMD_EP_READ_RANGE:
+ +	case HFI1_CMD_EP_WRITE_RANGE:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		must_be_root = 1;	/* validate user */
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_INVAL_READ:
+ +	default:
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	/* If the command comes with user data, copy it. */
+ +	if (copy) {
+ +		if (copy_from_user(dest, (void __user *)cmd.addr, copy)) {
+ +			ret = -EFAULT;
+ +			goto bail;
+ +		}
+ +		consumed += copy;
+ +	}
+ +
+ +	/*
+ +	 * Make sure there is a uctxt when needed.
+ +	 */
+ +	if (uctxt_required && !uctxt) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	/* only root can do these operations */
+ +	if (must_be_root && !capable(CAP_SYS_ADMIN)) {
+ +		ret = -EPERM;
+ +		goto bail;
+ +	}
+ +
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+ +		ret = assign_ctxt(fp, &uinfo);
+ +		if (ret < 0)
+ +			goto bail;
+ +		ret = setup_ctxt(fp);
+ +		if (ret)
+ +			goto bail;
+ +		ret = user_init(fp);
+ +		break;
+ +	case HFI1_CMD_CTXT_INFO:
+ +		ret = get_ctxt_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+ +		break;
+ +	case HFI1_CMD_USER_INFO:
+ +		ret = get_base_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+ +		break;
+ +	case HFI1_CMD_CREDIT_UPD:
+ +		if (uctxt && uctxt->sc)
+ +			sc_return_credits(uctxt->sc);
+ +		break;
+ +	case HFI1_CMD_TID_UPDATE:
+ +		ret = exp_tid_setup(fp, &tinfo);
+ +		if (!ret) {
+ +			unsigned long addr;
+++=======
++ static long hfi1_file_ioctl(struct file *fp, unsigned int cmd,
++ 			    unsigned long arg)
++ {
++ 	struct hfi1_filedata *fd = fp->private_data;
++ 	struct hfi1_ctxtdata *uctxt = fd->uctxt;
++ 	struct hfi1_user_info uinfo;
++ 	struct hfi1_tid_info tinfo;
++ 	int ret = 0;
++ 	unsigned long addr;
++ 	int uval = 0;
++ 	unsigned long ul_uval = 0;
++ 	u16 uval16 = 0;
++ 
++ 	if (cmd != HFI1_IOCTL_ASSIGN_CTXT &&
++ 	    cmd != HFI1_IOCTL_GET_VERS &&
++ 	    !uctxt)
++ 		return -EINVAL;
++ 
++ 	switch (cmd) {
++ 	case HFI1_IOCTL_ASSIGN_CTXT:
++ 		if (copy_from_user(&uinfo,
++ 				   (struct hfi1_user_info __user *)arg,
++ 				   sizeof(uinfo)))
++ 			return -EFAULT;
++ 
++ 		ret = assign_ctxt(fp, &uinfo);
++ 		if (ret < 0)
++ 			return ret;
++ 		setup_ctxt(fp);
++ 		if (ret)
++ 			return ret;
++ 		ret = user_init(fp);
++ 		break;
++ 	case HFI1_IOCTL_CTXT_INFO:
++ 		ret = get_ctxt_info(fp, (void __user *)(unsigned long)arg,
++ 				    sizeof(struct hfi1_ctxt_info));
++ 		break;
++ 	case HFI1_IOCTL_USER_INFO:
++ 		ret = get_base_info(fp, (void __user *)(unsigned long)arg,
++ 				    sizeof(struct hfi1_base_info));
++ 		break;
++ 	case HFI1_IOCTL_CREDIT_UPD:
++ 		if (uctxt && uctxt->sc)
++ 			sc_return_credits(uctxt->sc);
++ 		break;
++ 
++ 	case HFI1_IOCTL_TID_UPDATE:
++ 		if (copy_from_user(&tinfo,
++ 				   (struct hfi11_tid_info __user *)arg,
++ 				   sizeof(tinfo)))
++ 			return -EFAULT;
++ 
++ 		ret = hfi1_user_exp_rcv_setup(fp, &tinfo);
++ 		if (!ret) {
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  			/*
+  			 * Copy the number of tidlist entries we used
+  			 * and the length of the buffer we registered.
+  			 * These fields are adjacent in the structure so
+  			 * we can copy them at the same time.
+  			 */
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +			addr = (unsigned long)cmd.addr +
+ +				offsetof(struct hfi1_tid_info, tidcnt);
+++=======
++ 			addr = arg + offsetof(struct hfi1_tid_info, tidcnt);
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  			if (copy_to_user((void __user *)addr, &tinfo.tidcnt,
+  					 sizeof(tinfo.tidcnt) +
+  					 sizeof(tinfo.length)))
+  				ret = -EFAULT;
+  		}
+  		break;
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	case HFI1_CMD_TID_FREE:
+ +		ret = exp_tid_free(fp, &tinfo);
+ +		break;
+ +	case HFI1_CMD_RECV_CTRL:
+ +		ret = manage_rcvq(uctxt, fd->subctxt, (int)user_val);
+ +		break;
+ +	case HFI1_CMD_POLL_TYPE:
+ +		uctxt->poll_type = (typeof(uctxt->poll_type))user_val;
+ +		break;
+ +	case HFI1_CMD_ACK_EVENT:
+ +		ret = user_event_ack(uctxt, fd->subctxt, user_val);
+ +		break;
+ +	case HFI1_CMD_SET_PKEY:
+ +		if (HFI1_CAP_IS_USET(PKEY_CHECK))
+ +			ret = set_ctxt_pkey(uctxt, fd->subctxt, user_val);
+ +		else
+ +			ret = -EPERM;
+ +		break;
+ +	case HFI1_CMD_CTXT_RESET: {
+ +		struct send_context *sc;
+ +		struct hfi1_devdata *dd;
+ +
+ +		if (!uctxt || !uctxt->dd || !uctxt->sc) {
+ +			ret = -EINVAL;
+ +			break;
+ +		}
+++=======
++ 
++ 	case HFI1_IOCTL_TID_FREE:
++ 		if (copy_from_user(&tinfo,
++ 				   (struct hfi11_tid_info __user *)arg,
++ 				   sizeof(tinfo)))
++ 			return -EFAULT;
++ 
++ 		ret = hfi1_user_exp_rcv_clear(fp, &tinfo);
++ 		if (ret)
++ 			break;
++ 		addr = arg + offsetof(struct hfi1_tid_info, tidcnt);
++ 		if (copy_to_user((void __user *)addr, &tinfo.tidcnt,
++ 				 sizeof(tinfo.tidcnt)))
++ 			ret = -EFAULT;
++ 		break;
++ 
++ 	case HFI1_IOCTL_TID_INVAL_READ:
++ 		if (copy_from_user(&tinfo,
++ 				   (struct hfi11_tid_info __user *)arg,
++ 				   sizeof(tinfo)))
++ 			return -EFAULT;
++ 
++ 		ret = hfi1_user_exp_rcv_invalid(fp, &tinfo);
++ 		if (ret)
++ 			break;
++ 		addr = arg + offsetof(struct hfi1_tid_info, tidcnt);
++ 		if (copy_to_user((void __user *)addr, &tinfo.tidcnt,
++ 				 sizeof(tinfo.tidcnt)))
++ 			ret = -EFAULT;
++ 		break;
++ 
++ 	case HFI1_IOCTL_RECV_CTRL:
++ 		ret = get_user(uval, (int __user *)arg);
++ 		if (ret != 0)
++ 			return -EFAULT;
++ 		ret = manage_rcvq(uctxt, fd->subctxt, uval);
++ 		break;
++ 
++ 	case HFI1_IOCTL_POLL_TYPE:
++ 		ret = get_user(uval, (int __user *)arg);
++ 		if (ret != 0)
++ 			return -EFAULT;
++ 		uctxt->poll_type = (typeof(uctxt->poll_type))uval;
++ 		break;
++ 
++ 	case HFI1_IOCTL_ACK_EVENT:
++ 		ret = get_user(ul_uval, (unsigned long __user *)arg);
++ 		if (ret != 0)
++ 			return -EFAULT;
++ 		ret = user_event_ack(uctxt, fd->subctxt, ul_uval);
++ 		break;
++ 
++ 	case HFI1_IOCTL_SET_PKEY:
++ 		ret = get_user(uval16, (u16 __user *)arg);
++ 		if (ret != 0)
++ 			return -EFAULT;
++ 		if (HFI1_CAP_IS_USET(PKEY_CHECK))
++ 			ret = set_ctxt_pkey(uctxt, fd->subctxt, uval16);
++ 		else
++ 			return -EPERM;
++ 		break;
++ 
++ 	case HFI1_IOCTL_CTXT_RESET: {
++ 		struct send_context *sc;
++ 		struct hfi1_devdata *dd;
++ 
++ 		if (!uctxt || !uctxt->dd || !uctxt->sc)
++ 			return -EINVAL;
++ 
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  		/*
+  		 * There is no protection here. User level has to
+  		 * guarantee that no one will be writing to the send
+@@@ -374,10 -328,9 +515,16 @@@
+  		wait_event_interruptible_timeout(
+  			sc->halt_wait, (sc->flags & SCF_HALTED),
+  			msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +		if (!(sc->flags & SCF_HALTED)) {
+ +			ret = -ENOLCK;
+ +			break;
+ +		}
+++=======
++ 		if (!(sc->flags & SCF_HALTED))
++ 			return -ENOLCK;
++ 
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  		/*
+  		 * If the send context was halted due to a Freeze,
+  		 * wait until the device has been "unfrozen" before
+@@@ -388,43 -341,42 +535,80 @@@
+  				dd->event_queue,
+  				!(ACCESS_ONCE(dd->flags) & HFI1_FROZEN),
+  				msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +			if (dd->flags & HFI1_FROZEN) {
+ +				ret = -ENOLCK;
+ +				break;
+ +			}
+ +			if (dd->flags & HFI1_FORCED_FREEZE) {
+ +				/* Don't allow context reset if we are into
+ +				 * forced freeze */
+ +				ret = -ENODEV;
+ +				break;
+ +			}
+++=======
++ 			if (dd->flags & HFI1_FROZEN)
++ 				return -ENOLCK;
++ 
++ 			if (dd->flags & HFI1_FORCED_FREEZE)
++ 				/*
++ 				 * Don't allow context reset if we are into
++ 				 * forced freeze
++ 				 */
++ 				return -ENODEV;
++ 
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  			sc_disable(sc);
+  			ret = sc_enable(sc);
+  			hfi1_rcvctrl(dd, HFI1_RCVCTRL_CTXT_ENB,
+  				     uctxt->ctxt);
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +		} else
+ +			ret = sc_restart(sc);
+++=======
++ 		} else {
++ 			ret = sc_restart(sc);
++ 		}
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  		if (!ret)
+  			sc_return_credits(sc);
+  		break;
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+ +	case HFI1_CMD_EP_INFO:
+ +	case HFI1_CMD_EP_ERASE_CHIP:
+ +	case HFI1_CMD_EP_ERASE_RANGE:
+ +	case HFI1_CMD_EP_READ_RANGE:
+ +	case HFI1_CMD_EP_WRITE_RANGE:
+ +		ret = handle_eprom_command(fp, &cmd);
+ +		break;
+ +	}
+ +
+ +	if (ret >= 0)
+ +		ret = consumed;
+ +bail:
+ +	return ret;
+ +}
+ +
+ +static ssize_t hfi1_aio_write(struct kiocb *kiocb, const struct iovec *iovec,
+ +			      unsigned long dim, loff_t offset)
+++=======
++ 
++ 	case HFI1_IOCTL_GET_VERS:
++ 		uval = HFI1_USER_SWVERSION;
++ 		if (put_user(uval, (int __user *)arg))
++ 			return -EFAULT;
++ 		break;
++ 
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t hfi1_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds):drivers/staging/rdma/hfi1/file_ops.c
+  {
+  	struct hfi1_filedata *fd = kiocb->ki_filp->private_data;
+  	struct hfi1_user_sdma_pkt_q *pq = fd->pq;
+diff --cc include/uapi/rdma/hfi/hfi1_user.h
+index ebb5bb6e47df,98bebf8bef55..000000000000
+--- a/include/uapi/rdma/hfi/hfi1_user.h
++++ b/include/uapi/rdma/hfi/hfi1_user.h
+@@@ -66,7 -66,7 +66,11 @@@
+   * The major version changes when data structures change in an incompatible
+   * way. The driver must be the same for initialization to succeed.
+   */
+++<<<<<<< HEAD
+ +#define HFI1_USER_SWMAJOR 4
+++=======
++ #define HFI1_USER_SWMAJOR 6
+++>>>>>>> 380fb942888e (IB/hfi1: Remove write(), use ioctl() for user cmds)
+  
+  /*
+   * Minor version differences are always compatible
+@@@ -225,19 -263,8 +229,13 @@@ struct hfi1_tid_info 
+  	__u32 tidcnt;
+  	/* length of transfer buffer programmed by this request */
+  	__u32 length;
+ +	/*
+ +	 * pointer to bitmap of TIDs used for this call;
+ +	 * checked for being large enough at open
+ +	 */
+ +	__u64 tidmap;
+  };
+  
+- struct hfi1_cmd {
+- 	__u32 type;        /* command type */
+- 	__u32 len;         /* length of struct pointed to by add */
+- 	__u64 addr;        /* pointer to user structure */
+- };
+- 
+  enum hfi1_sdma_comp_state {
+  	FREE = 0,
+  	QUEUED,
+* Unmerged path drivers/staging/hfi1/file_ops.c
+* Unmerged path include/uapi/rdma/hfi/hfi1_user.h
