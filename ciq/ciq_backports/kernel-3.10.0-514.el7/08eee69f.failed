@@ -1,0 +1,284 @@
+zram: remove init_lock in zram_make_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Minchan Kim <minchan@kernel.org>
+commit 08eee69fcf6baea543a2b4d2a2fcba0e61aa3160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/08eee69f.failed
+
+Admin could reset zram during I/O operation going on so we have used
+zram->init_lock as read-side lock in I/O path to prevent sudden zram
+meta freeing.
+
+However, the init_lock is really troublesome.  We can't do call
+zram_meta_alloc under init_lock due to lockdep splat because
+zram_rw_page is one of the function under reclaim path and hold it as
+read_lock while other places in process context hold it as write_lock.
+So, we have used allocation out of the lock to avoid lockdep warn but
+it's not good for readability and fainally, I met another lockdep splat
+between init_lock and cpu_hotplug from kmem_cache_destroy during working
+zsmalloc compaction.  :(
+
+Yes, the ideal is to remove horrible init_lock of zram in rw path.  This
+patch removes it in rw path and instead, add atomic refcount for meta
+lifetime management and completion to free meta in process context.
+It's important to free meta in process context because some of resource
+destruction needs mutex lock, which could be held if we releases the
+resource in reclaim context so it's deadlock, again.
+
+As a bonus, we could remove init_done check in rw path because
+zram_meta_get will do a role for it, instead.
+
+	Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Minchan Kim <minchan@kernel.org>
+	Cc: Nitin Gupta <ngupta@vflare.org>
+	Cc: Jerome Marchand <jmarchan@redhat.com>
+	Cc: Ganesh Mahendran <opensource.ganesh@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 08eee69fcf6baea543a2b4d2a2fcba0e61aa3160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index 55d1b1aee8ba,db94572b35c4..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -655,8 -688,51 +667,12 @@@ static int zram_bvec_rw(struct zram *zr
+  	return ret;
+  }
+  
+ -/*
+ - * zram_bio_discard - handler on discard request
+ - * @index: physical block index in PAGE_SIZE units
+ - * @offset: byte offset within physical block
+ - */
+ -static void zram_bio_discard(struct zram *zram, u32 index,
+ -			     int offset, struct bio *bio)
+ -{
+ -	size_t n = bio->bi_iter.bi_size;
+ -	struct zram_meta *meta = zram->meta;
+ -
+ -	/*
+ -	 * zram manages data in physical block size units. Because logical block
+ -	 * size isn't identical with physical block size on some arch, we
+ -	 * could get a discard request pointing to a specific offset within a
+ -	 * certain physical block.  Although we can handle this request by
+ -	 * reading that physiclal block and decompressing and partially zeroing
+ -	 * and re-compressing and then re-storing it, this isn't reasonable
+ -	 * because our intent with a discard request is to save memory.  So
+ -	 * skipping this logical block is appropriate here.
+ -	 */
+ -	if (offset) {
+ -		if (n <= (PAGE_SIZE - offset))
+ -			return;
+ -
+ -		n -= (PAGE_SIZE - offset);
+ -		index++;
+ -	}
+ -
+ -	while (n >= PAGE_SIZE) {
+ -		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
+ -		zram_free_page(zram, index);
+ -		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+ -		atomic64_inc(&zram->stats.notify_free);
+ -		index++;
+ -		n -= PAGE_SIZE;
+ -	}
+ -}
+ -
+ -static void zram_reset_device(struct zram *zram)
+ +static void zram_reset_device(struct zram *zram, bool reset_capacity)
+  {
++ 	struct zram_meta *meta;
++ 	struct zcomp *comp;
++ 	u64 disksize;
++ 
+  	down_write(&zram->init_lock);
+  
+  	zram->limit_pages = 0;
+@@@ -666,26 -742,31 +682,47 @@@
+  		return;
+  	}
+  
+- 	zcomp_destroy(zram->comp);
+- 	zram->max_comp_streams = 1;
+- 	zram_meta_free(zram->meta, zram->disksize);
+- 	zram->meta = NULL;
++ 	meta = zram->meta;
++ 	comp = zram->comp;
++ 	disksize = zram->disksize;
++ 	/*
++ 	 * Refcount will go down to 0 eventually and r/w handler
++ 	 * cannot handle further I/O so it will bail out by
++ 	 * check zram_meta_get.
++ 	 */
++ 	zram_meta_put(zram);
++ 	/*
++ 	 * We want to free zram_meta in process context to avoid
++ 	 * deadlock between reclaim path and any other locks.
++ 	 */
++ 	wait_event(zram->io_done, atomic_read(&zram->refcount) == 0);
++ 
+  	/* Reset stats */
+  	memset(&zram->stats, 0, sizeof(zram->stats));
+ +
+  	zram->disksize = 0;
+++<<<<<<< HEAD
+ +	if (reset_capacity)
+ +		set_capacity(zram->disk, 0);
+ +
+ +	up_write(&zram->init_lock);
+ +
+ +	/*
+ +	 * Revalidate disk out of the init_lock to avoid lockdep splat.
+ +	 * It's okay because disk's capacity is protected by init_lock
+ +	 * so that revalidate_disk always sees up-to-date capacity.
+ +	 */
+ +	if (reset_capacity)
+ +		revalidate_disk(zram->disk);
+++=======
++ 	zram->max_comp_streams = 1;
++ 	set_capacity(zram->disk, 0);
++ 
++ 	up_write(&zram->init_lock);
++ 	/* I/O operation under all of CPU are done so let's free */
++ 	zram_meta_free(meta, disksize);
++ 	zcomp_destroy(comp);
+++>>>>>>> 08eee69fcf6b (zram: remove init_lock in zram_make_request)
+  }
+  
+  static ssize_t disksize_store(struct device *dev,
+@@@ -847,22 -934,21 +886,26 @@@ static void zram_make_request(struct re
+  {
+  	struct zram *zram = queue->queuedata;
+  
+- 	down_read(&zram->init_lock);
+- 	if (unlikely(!init_done(zram)))
++ 	if (unlikely(!zram_meta_get(zram)))
+  		goto error;
+  
+ -	if (!valid_io_request(zram, bio->bi_iter.bi_sector,
+ -					bio->bi_iter.bi_size)) {
+ +	if (!valid_io_request(zram, bio)) {
+  		atomic64_inc(&zram->stats.invalid_io);
+- 		goto error;
++ 		goto put_zram;
+  	}
+  
+++<<<<<<< HEAD
+ +	__zram_make_request(zram, bio, bio_data_dir(bio));
+ +	up_read(&zram->init_lock);
+ +
+++=======
++ 	__zram_make_request(zram, bio);
++ 	zram_meta_put(zram);
+++>>>>>>> 08eee69fcf6b (zram: remove init_lock in zram_make_request)
+  	return;
+- 
++ put_zram:
++ 	zram_meta_put(zram);
+  error:
+- 	up_read(&zram->init_lock);
+  	bio_io_error(bio);
+  }
+  
+@@@ -881,8 -967,51 +924,53 @@@ static void zram_slot_free_notify(struc
+  	atomic64_inc(&zram->stats.notify_free);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int zram_rw_page(struct block_device *bdev, sector_t sector,
++ 		       struct page *page, int rw)
++ {
++ 	int offset, err = -EIO;
++ 	u32 index;
++ 	struct zram *zram;
++ 	struct bio_vec bv;
++ 
++ 	zram = bdev->bd_disk->private_data;
++ 	if (unlikely(!zram_meta_get(zram)))
++ 		goto out;
++ 
++ 	if (!valid_io_request(zram, sector, PAGE_SIZE)) {
++ 		atomic64_inc(&zram->stats.invalid_io);
++ 		err = -EINVAL;
++ 		goto put_zram;
++ 	}
++ 
++ 	index = sector >> SECTORS_PER_PAGE_SHIFT;
++ 	offset = sector & (SECTORS_PER_PAGE - 1) << SECTOR_SHIFT;
++ 
++ 	bv.bv_page = page;
++ 	bv.bv_len = PAGE_SIZE;
++ 	bv.bv_offset = 0;
++ 
++ 	err = zram_bvec_rw(zram, &bv, index, offset, rw);
++ put_zram:
++ 	zram_meta_put(zram);
++ out:
++ 	/*
++ 	 * If I/O fails, just return error(ie, non-zero) without
++ 	 * calling page_endio.
++ 	 * It causes resubmit the I/O with bio request by upper functions
++ 	 * of rw_page(e.g., swap_readpage, __swap_writepage) and
++ 	 * bio->bi_end_io does things to handle the error
++ 	 * (e.g., SetPageError, set_page_dirty and extra works).
++ 	 */
++ 	if (err == 0)
++ 		page_endio(page, rw, 0);
++ 	return err;
++ }
++ 
+++>>>>>>> 08eee69fcf6b (zram: remove init_lock in zram_make_request)
+  static const struct block_device_operations zram_devops = {
+  	.swap_slot_free_notify = zram_slot_free_notify,
+ -	.rw_page = zram_rw_page,
+  	.owner = THIS_MODULE
+  };
+  
+* Unmerged path drivers/block/zram/zram_drv.c
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index 7d655c176e09..abba8df6d886 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -88,24 +88,26 @@ struct zram_meta {
+ 
+ struct zram {
+ 	struct zram_meta *meta;
++	struct zcomp *comp;
+ 	struct request_queue *queue;
+ 	struct gendisk *disk;
+-	struct zcomp *comp;
+-
+-	/* Prevent concurrent execution of device init, reset and R/W request */
++	/* Prevent concurrent execution of device init */
+ 	struct rw_semaphore init_lock;
+ 	/*
+-	 * This is the limit on amount of *uncompressed* worth of data
+-	 * we can store in a disk.
++	 * the number of pages zram can consume for storing compressed data
+ 	 */
+-	u64 disksize;	/* bytes */
++	unsigned long limit_pages;
+ 	int max_comp_streams;
++
+ 	struct zram_stats stats;
++	atomic_t refcount; /* refcount for zram_meta */
++	/* wait all IO under all of cpu are done */
++	wait_queue_head_t io_done;
+ 	/*
+-	 * the number of pages zram can consume for storing compressed data
++	 * This is the limit on amount of *uncompressed* worth of data
++	 * we can store in a disk.
+ 	 */
+-	unsigned long limit_pages;
+-
++	u64 disksize;	/* bytes */
+ 	char compressor[10];
+ };
+ #endif
