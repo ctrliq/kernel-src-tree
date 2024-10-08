@@ -1,0 +1,121 @@
+ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 0b95227a7ba7e69f795757cd7c839eff0615f2d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0b95227a.failed
+
+This option has the same semantic as IP_PMTUDISC_OMIT for IPv4 which
+got recently introduced. It doesn't honor the path mtu discovered by the
+host but in contrary to IPV6_PMTUDISC_INTERFACE allows the generation of
+fragments if the packet size exceeds the MTU of the outgoing interface
+MTU.
+
+Fixes: 93b36cf3425b9b ("ipv6: support IPV6_PMTU_INTERFACE on sockets")
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0b95227a7ba7e69f795757cd7c839eff0615f2d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_route.h
+#	include/uapi/linux/in6.h
+#	net/ipv6/ipv6_sockglue.c
+diff --cc include/net/ip6_route.h
+index 2b786b7e3585,00e3f12cb2f9..000000000000
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@@ -194,6 -169,18 +194,21 @@@ static inline int ip6_skb_dst_mtu(struc
+  	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool ip6_sk_accept_pmtu(const struct sock *sk)
++ {
++ 	return inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_INTERFACE &&
++ 	       inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_OMIT;
++ }
++ 
++ static inline bool ip6_sk_local_df(const struct sock *sk)
++ {
++ 	return inet6_sk(sk)->pmtudisc < IPV6_PMTUDISC_DO ||
++ 	       inet6_sk(sk)->pmtudisc == IPV6_PMTUDISC_OMIT;
++ }
++ 
+++>>>>>>> 0b95227a7ba7 (ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT)
+  static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt)
+  {
+  	return &rt->rt6i_gateway;
+diff --cc include/uapi/linux/in6.h
+index 53b1d56a6e7f,0d8e0f0342dc..000000000000
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@@ -166,6 -181,14 +166,17 @@@ struct in6_flowlabel_req 
+  #define IPV6_PMTUDISC_WANT		1
+  #define IPV6_PMTUDISC_DO		2
+  #define IPV6_PMTUDISC_PROBE		3
+++<<<<<<< HEAD
+++=======
++ /* same as IPV6_PMTUDISC_PROBE, provided for symetry with IPv4
++  * also see comments on IP_PMTUDISC_INTERFACE
++  */
++ #define IPV6_PMTUDISC_INTERFACE		4
++ /* weaker version of IPV6_PMTUDISC_INTERFACE, which allows packets to
++  * get fragmented if they exceed the interface mtu
++  */
++ #define IPV6_PMTUDISC_OMIT		5
+++>>>>>>> 0b95227a7ba7 (ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT)
+  
+  /* Flowlabel */
+  #define IPV6_FLOWLABEL_MGR	32
+diff --cc net/ipv6/ipv6_sockglue.c
+index 4919a8e6063e,edb58aff4ae7..000000000000
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@@ -722,7 -722,7 +722,11 @@@ done
+  	case IPV6_MTU_DISCOVER:
+  		if (optlen < sizeof(int))
+  			goto e_inval;
+++<<<<<<< HEAD
+ +		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_PROBE)
+++=======
++ 		if (val < IPV6_PMTUDISC_DONT || val > IPV6_PMTUDISC_OMIT)
+++>>>>>>> 0b95227a7ba7 (ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT)
+  			goto e_inval;
+  		np->pmtudisc = val;
+  		retv = 0;
+* Unmerged path include/net/ip6_route.h
+* Unmerged path include/uapi/linux/in6.h
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 67265a1c5199..75cf4daa62d0 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1219,8 +1219,10 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
+ 			      sizeof(struct frag_hdr) : 0) +
+ 			     rt->rt6i_nfheader_len;
+ 
+-		maxnonfragsize = (np->pmtudisc >= IPV6_PMTUDISC_DO) ?
+-				 mtu : sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
++		if (ip6_sk_local_df(sk))
++			maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
++		else
++			maxnonfragsize = mtu;
+ 
+ 		/* dontfrag active */
+ 		if ((cork->length + length > mtu - headersize) && dontfrag &&
+@@ -1526,8 +1528,7 @@ int ip6_push_pending_frames(struct sock *sk)
+ 	}
+ 
+ 	/* Allow local fragmentation. */
+-	if (np->pmtudisc < IPV6_PMTUDISC_DO)
+-		skb->local_df = 1;
++	skb->local_df = ip6_sk_local_df(sk);
+ 
+ 	*final_dst = fl6->daddr;
+ 	__skb_pull(skb, skb_network_header_len(skb));
+* Unmerged path net/ipv6/ipv6_sockglue.c
