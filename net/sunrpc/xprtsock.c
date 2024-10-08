@@ -600,6 +600,7 @@ static int xs_local_send_request(struct rpc_task *task)
 
 	switch (status) {
 	case -ENOBUFS:
+		break;
 	case -EAGAIN:
 		status = xs_nospace(task);
 		break;
@@ -771,7 +772,6 @@ static int xs_tcp_send_request(struct rpc_task *task)
 		status = -ENOTCONN;
 		/* Should we call xs_close() here? */
 		break;
-	case -ENOBUFS:
 	case -EAGAIN:
 		status = xs_nospace(task);
 		break;
@@ -783,6 +783,7 @@ static int xs_tcp_send_request(struct rpc_task *task)
 	case -ECONNREFUSED:
 	case -ENOTCONN:
 	case -EADDRINUSE:
+	case -ENOBUFS:
 	case -EPIPE:
 		clear_bit(SOCK_ASYNC_NOSPACE, &transport->sock->flags);
 	}
