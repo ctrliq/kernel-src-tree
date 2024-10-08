@@ -308,7 +308,7 @@ static void pl2303_encode_baudrate(struct tty_struct *tty,
 
 	/* type_0, type_1 only support up to 1228800 baud */
 	if (spriv->type != HX)
-		baud = max_t(int, baud, 1228800);
+		baud = min_t(int, baud, 1228800);
 
 	if (spriv->type != HX || baud <= 115200) {
 		/* Direct (standard) baud rate encoding method */
