@@ -929,7 +929,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
 	mtspr	SPRN_CTRLT,r6
 4:
 	ld	r6, VCPU_CTR(r4)
-	lwz	r7, VCPU_XER(r4)
+	ld	r7, VCPU_XER(r4)
 
 	mtctr	r6
 	mtxer	r7
@@ -1128,7 +1128,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
 	mfctr	r3
 	mfxer	r4
 	std	r3, VCPU_CTR(r9)
-	stw	r4, VCPU_XER(r9)
+	std	r4, VCPU_XER(r9)
 
 BEGIN_FTR_SECTION
 	/* If this is a page table miss then see if it's theirs or ours */
@@ -1837,7 +1837,7 @@ kvmppc_hdsi:
 	bl	kvmppc_msr_interrupt
 fast_interrupt_c_return:
 6:	ld	r7, VCPU_CTR(r9)
-	lwz	r8, VCPU_XER(r9)
+	ld	r8, VCPU_XER(r9)
 	mtctr	r7
 	mtxer	r8
 	mr	r4, r9
