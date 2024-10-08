@@ -1,0 +1,179 @@
+powerpc/eeh: Freeze PE before PE reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Freeze PE before PE reset (Laurent Vivier) [1213675]
+Rebuild_FUZZ: 88.24%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 0d5ee5205e62908172bf5e1a5fd171ba262fdb75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0d5ee520.failed
+
+The patch adds one more option (EEH_OPT_FREEZE_PE) to set_option()
+method to proactively freeze PE, which will be issued before resetting
+pass-throughed PE to drop MMIO access during reset because it's
+always contributing to recursive EEH error.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 0d5ee5205e62908172bf5e1a5fd171ba262fdb75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index e8c90cc3885e,1d8f37b93457..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -187,10 -187,11 +187,16 @@@ static int ioda_eeh_post_init(struct pc
+   */
+  static int ioda_eeh_set_option(struct eeh_pe *pe, int option)
+  {
+ +	s64 ret;
+ +	u32 pe_no;
+  	struct pci_controller *hose = pe->phb;
+  	struct pnv_phb *phb = hose->private_data;
+++<<<<<<< HEAD
+++=======
++ 	bool freeze_pe = false;
++ 	int enable, ret = 0;
++ 	s64 rc;
+++>>>>>>> 0d5ee5205e62 (powerpc/eeh: Freeze PE before PE reset)
+  
+  	/* Check on PE number */
+  	if (pe->addr < 0 || pe->addr >= phb->ioda.total_pe) {
+@@@ -201,41 -202,60 +207,81 @@@
+  		return -EINVAL;
+  	}
+  
+ +	pe_no = pe->addr;
+  	switch (option) {
+  	case EEH_OPT_DISABLE:
+ -		return -EPERM;
+ +		ret = -EEXIST;
+ +		break;
+  	case EEH_OPT_ENABLE:
+ -		return 0;
+ +		ret = 0;
+ +		break;
+  	case EEH_OPT_THAW_MMIO:
+ -		enable = OPAL_EEH_ACTION_CLEAR_FREEZE_MMIO;
+ +		ret = opal_pci_eeh_freeze_clear(phb->opal_id, pe_no,
+ +				OPAL_EEH_ACTION_CLEAR_FREEZE_MMIO);
+ +		if (ret) {
+ +			pr_warning("%s: Failed to enable MMIO for "
+ +				   "PHB#%x-PE#%x, err=%lld\n",
+ +				__func__, hose->global_number, pe_no, ret);
+ +			return -EIO;
+ +		}
+ +
+  		break;
+  	case EEH_OPT_THAW_DMA:
+ -		enable = OPAL_EEH_ACTION_CLEAR_FREEZE_DMA;
+ +		ret = opal_pci_eeh_freeze_clear(phb->opal_id, pe_no,
+ +				OPAL_EEH_ACTION_CLEAR_FREEZE_DMA);
+ +		if (ret) {
+ +			pr_warning("%s: Failed to enable DMA for "
+ +				   "PHB#%x-PE#%x, err=%lld\n",
+ +				__func__, hose->global_number, pe_no, ret);
+ +			return -EIO;
+ +		}
+ +
++ 		break;
++ 	case EEH_OPT_FREEZE_PE:
++ 		freeze_pe = true;
++ 		enable = OPAL_EEH_ACTION_SET_FREEZE_ALL;
+  		break;
+  	default:
+ -		pr_warn("%s: Invalid option %d\n",
+ -			__func__, option);
+ +		pr_warning("%s: Invalid option %d\n", __func__, option);
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If PHB supports compound PE, to handle it */
++ 	if (freeze_pe) {
++ 		if (phb->freeze_pe) {
++ 			phb->freeze_pe(phb, pe->addr);
++ 		} else {
++ 			rc = opal_pci_eeh_freeze_set(phb->opal_id,
++ 						     pe->addr,
++ 						     enable);
++ 			if (rc != OPAL_SUCCESS) {
++ 				pr_warn("%s: Failure %lld freezing "
++ 					"PHB#%x-PE#%x\n",
++ 					__func__, rc,
++ 					phb->hose->global_number, pe->addr);
++ 				ret = -EIO;
++ 			}
++ 		}
++ 	} else {
++ 		if (phb->unfreeze_pe) {
++ 			ret = phb->unfreeze_pe(phb, pe->addr, enable);
++ 		} else {
++ 			rc = opal_pci_eeh_freeze_clear(phb->opal_id,
++ 						       pe->addr,
++ 						       enable);
++ 			if (rc != OPAL_SUCCESS) {
++ 				pr_warn("%s: Failure %lld enable %d "
++ 					"for PHB#%x-PE#%x\n",
++ 					__func__, rc, option,
++ 					phb->hose->global_number, pe->addr);
++ 				ret = -EIO;
++ 			}
++ 		}
++ 	}
++ 
+++>>>>>>> 0d5ee5205e62 (powerpc/eeh: Freeze PE before PE reset)
+  	return ret;
+  }
+  
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 0090ca637a60..1a23c858959f 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -179,6 +179,7 @@ enum {
+ #define EEH_OPT_ENABLE		1	/* EEH enable	*/
+ #define EEH_OPT_THAW_MMIO	2	/* MMIO enable	*/
+ #define EEH_OPT_THAW_DMA	3	/* DMA enable	*/
++#define EEH_OPT_FREEZE_PE	4	/* Freeze PE	*/
+ #define EEH_STATE_UNAVAILABLE	(1 << 0)	/* State unavailable	*/
+ #define EEH_STATE_NOT_SUPPORT	(1 << 1)	/* EEH not supported	*/
+ #define EEH_STATE_RESET_ACTIVE	(1 << 2)	/* Active reset		*/
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 7c5ea393a765..adb4e88d08b8 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -1378,6 +1378,13 @@ int eeh_pe_reset(struct eeh_pe *pe, int option)
+ 		break;
+ 	case EEH_RESET_HOT:
+ 	case EEH_RESET_FUNDAMENTAL:
++		/*
++		 * Proactively freeze the PE to drop all MMIO access
++		 * during reset, which should be banned as it's always
++		 * cause recursive EEH error.
++		 */
++		eeh_ops->set_option(pe, EEH_OPT_FREEZE_PE);
++
+ 		ret = eeh_ops->reset(pe, option);
+ 		break;
+ 	default:
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --git a/arch/powerpc/platforms/pseries/eeh_pseries.c b/arch/powerpc/platforms/pseries/eeh_pseries.c
+index a919da0f7fca..7505b66acbec 100644
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@ -334,7 +334,9 @@ static int pseries_eeh_set_option(struct eeh_pe *pe, int option)
+ 		if (pe->addr)
+ 			config_addr = pe->addr;
+ 		break;
+-
++	case EEH_OPT_FREEZE_PE:
++		/* Not support */
++		return 0;
+ 	default:
+ 		pr_err("%s: Invalid option %d\n",
+ 			__func__, option);
