@@ -1,0 +1,231 @@
+ip_tunnel(ipv4): fix tunnels with "local any remote $remote_ip"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] ip_tunnel: fix tunnels with "local any remote $remote_ip" (Marcelo Leitner) [1206570]
+Rebuild_FUZZ: 95.00%
+commit-author Dmitry Popov <ixaphire@qrator.net>
+commit 95cb5745983c222867cc9ac593aebb2ad67d72c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/95cb5745.failed
+
+Ipv4 tunnels created with "local any remote $ip" didn't work properly since
+7d442fab0 (ipv4: Cache dst in tunnels). 99% of packets sent via those tunnels
+had src addr = 0.0.0.0. That was because only dst_entry was cached, although
+fl4.saddr has to be cached too. Every time ip_tunnel_xmit used cached dst_entry
+(tunnel_rtable_get returned non-NULL), fl4.saddr was initialized with
+tnl_params->saddr (= 0 in our case), and wasn't changed until iptunnel_xmit().
+
+This patch adds saddr to ip_tunnel->dst_cache, fixing this issue.
+
+	Reported-by: Sergey Popov <pinkbyte@gentoo.org>
+	Signed-off-by: Dmitry Popov <ixaphire@qrator.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 95cb5745983c222867cc9ac593aebb2ad67d72c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_tunnels.h
+#	net/ipv4/ip_tunnel.c
+diff --cc include/net/ip_tunnels.h
+index 8d95b01ba42b,8dd8cab88b87..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -40,6 -38,11 +40,14 @@@ struct ip_tunnel_prl_entry 
+  	struct rcu_head			rcu_head;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct ip_tunnel_dst {
++ 	struct dst_entry __rcu 		*dst;
++ 	__be32				 saddr;
++ };
++ 
+++>>>>>>> 95cb5745983c (ip_tunnel(ipv4): fix tunnels with "local any remote $remote_ip")
+  struct ip_tunnel {
+  	struct ip_tunnel __rcu	*next;
+  	struct hlist_node hash_node;
+diff --cc net/ipv4/ip_tunnel.c
+index 9d86734859b5,45920d928341..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,50 -68,60 +68,103 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+ +/* Often modified stats are per cpu, other are shared (netdev->stats) */
+ +struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+ +						struct rtnl_link_stats64 *tot)
+ +{
+ +	int i;
+ +
+ +	for_each_possible_cpu(i) {
+ +		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+ +		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+ +		unsigned int start;
+ +
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&tstats->syncp);
+ +			rx_packets = tstats->rx_packets;
+ +			tx_packets = tstats->tx_packets;
+ +			rx_bytes = tstats->rx_bytes;
+ +			tx_bytes = tstats->tx_bytes;
+ +		} while (u64_stats_fetch_retry_bh(&tstats->syncp, start));
+ +
+ +		tot->rx_packets += rx_packets;
+ +		tot->tx_packets += tx_packets;
+ +		tot->rx_bytes   += rx_bytes;
+ +		tot->tx_bytes   += tx_bytes;
+++=======
++ static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 			     struct dst_entry *dst, __be32 saddr)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	dst_clone(dst);
++ 	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
++ 	dst_release(old_dst);
++ 	idst->saddr = saddr;
++ }
++ 
++ static void tunnel_dst_set(struct ip_tunnel *t,
++ 			   struct dst_entry *dst, __be32 saddr)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst, saddr);
++ }
++ 
++ static void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL, 0);
++ }
++ 
++ void ip_tunnel_dst_reset_all(struct ip_tunnel *t)
++ {
++ 	int i;
++ 
++ 	for_each_possible_cpu(i)
++ 		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL, 0);
++ }
++ EXPORT_SYMBOL(ip_tunnel_dst_reset_all);
++ 
++ static struct rtable *tunnel_rtable_get(struct ip_tunnel *t,
++ 					u32 cookie, __be32 *saddr)
++ {
++ 	struct ip_tunnel_dst *idst;
++ 	struct dst_entry *dst;
++ 
++ 	rcu_read_lock();
++ 	idst = this_cpu_ptr(t->dst_cache);
++ 	dst = rcu_dereference(idst->dst);
++ 	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++ 		dst = NULL;
++ 	if (dst) {
++ 		if (!dst->obsolete || dst->ops->check(dst, cookie)) {
++ 			*saddr = idst->saddr;
++ 		} else {
++ 			tunnel_dst_reset(t);
++ 			dst_release(dst);
++ 			dst = NULL;
++ 		}
+++>>>>>>> 95cb5745983c (ip_tunnel(ipv4): fix tunnels with "local any remote $remote_ip")
+  	}
+ -	rcu_read_unlock();
+ -	return (struct rtable *)dst;
+ +
+ +	tot->multicast = dev->stats.multicast;
+ +
+ +	tot->rx_crc_errors = dev->stats.rx_crc_errors;
+ +	tot->rx_fifo_errors = dev->stats.rx_fifo_errors;
+ +	tot->rx_length_errors = dev->stats.rx_length_errors;
+ +	tot->rx_frame_errors = dev->stats.rx_frame_errors;
+ +	tot->rx_errors = dev->stats.rx_errors;
+ +
+ +	tot->tx_fifo_errors = dev->stats.tx_fifo_errors;
+ +	tot->tx_carrier_errors = dev->stats.tx_carrier_errors;
+ +	tot->tx_dropped = dev->stats.tx_dropped;
+ +	tot->tx_aborted_errors = dev->stats.tx_aborted_errors;
+ +	tot->tx_errors = dev->stats.tx_errors;
+ +
+ +	tot->collisions  = dev->stats.collisions;
+ +
+ +	return tot;
+  }
+ +EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+  
+  static bool ip_tunnel_key_match(const struct ip_tunnel_parm *p,
+  				__be16 flags, __be32 key)
+@@@ -358,14 -367,14 +411,18 @@@ static int ip_tunnel_bind_dev(struct ne
+  		struct flowi4 fl4;
+  		struct rtable *rt;
+  
+ -		init_tunnel_flow(&fl4, iph->protocol, iph->daddr,
+ -				 iph->saddr, tunnel->parms.o_key,
+ -				 RT_TOS(iph->tos), tunnel->parms.link);
+ -		rt = ip_route_output_key(tunnel->net, &fl4);
+ -
+ +		rt = ip_route_output_tunnel(tunnel->net, &fl4,
+ +					    tunnel->parms.iph.protocol,
+ +					    iph->daddr, iph->saddr,
+ +					    tunnel->parms.o_key,
+ +					    RT_TOS(iph->tos),
+ +					    tunnel->parms.link);
+  		if (!IS_ERR(rt)) {
+  			tdev = rt->dst.dev;
+++<<<<<<< HEAD
+++=======
++ 			tunnel_dst_set(tunnel, &rt->dst, fl4.saddr);
+++>>>>>>> 95cb5745983c (ip_tunnel(ipv4): fix tunnels with "local any remote $remote_ip")
+  			ip_rt_put(rt);
+  		}
+  		if (dev->type != ARPHRD_ETHER)
+@@@ -593,22 -605,31 +650,39 @@@ void ip_tunnel_xmit(struct sk_buff *skb
+  	tos = tnl_params->tos;
+  	if (tos & 0x1) {
+  		tos &= ~0x1;
+ -		if (skb->protocol == htons(ETH_P_IP)) {
+ +		if (skb->protocol == htons(ETH_P_IP))
+  			tos = inner_iph->tos;
+ -			connected = false;
+ -		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+ +		else if (skb->protocol == htons(ETH_P_IPV6))
+  			tos = ipv6_get_dsfield((const struct ipv6hdr *)inner_iph);
+ -			connected = false;
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	rt = ip_route_output_tunnel(tunnel->net, &fl4,
+ +				    protocol,
+ +				    dst, tnl_params->saddr,
+ +				    tunnel->parms.o_key,
+ +				    RT_TOS(tos),
+ +				    tunnel->parms.link);
+ +	if (IS_ERR(rt)) {
+ +		dev->stats.tx_carrier_errors++;
+ +		goto tx_error;
+++=======
++ 	init_tunnel_flow(&fl4, protocol, dst, tnl_params->saddr,
++ 			 tunnel->parms.o_key, RT_TOS(tos), tunnel->parms.link);
++ 
++ 	rt = connected ? tunnel_rtable_get(tunnel, 0, &fl4.saddr) : NULL;
++ 
++ 	if (!rt) {
++ 		rt = ip_route_output_key(tunnel->net, &fl4);
++ 
++ 		if (IS_ERR(rt)) {
++ 			dev->stats.tx_carrier_errors++;
++ 			goto tx_error;
++ 		}
++ 		if (connected)
++ 			tunnel_dst_set(tunnel, &rt->dst, fl4.saddr);
+++>>>>>>> 95cb5745983c (ip_tunnel(ipv4): fix tunnels with "local any remote $remote_ip")
+  	}
+ -
+  	if (rt->dst.dev == dev) {
+  		ip_rt_put(rt);
+  		dev->stats.collisions++;
+* Unmerged path include/net/ip_tunnels.h
+* Unmerged path net/ipv4/ip_tunnel.c
