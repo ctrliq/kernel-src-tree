@@ -12835,8 +12835,7 @@ static void __bnx2x_remove(struct pci_dev *pdev,
 		unregister_netdev(dev);
 	} else {
 		rtnl_lock();
-		if (netif_running(dev))
-			bnx2x_close(dev);
+		dev_close(dev);
 		rtnl_unlock();
 	}
 
