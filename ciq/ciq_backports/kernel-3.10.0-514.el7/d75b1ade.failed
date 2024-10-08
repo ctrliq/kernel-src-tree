@@ -1,0 +1,151 @@
+net: less interrupt masking in NAPI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] less interrupt masking in NAPI (Ivan Vecera) [1334372]
+Rebuild_FUZZ: 92.31%
+commit-author Eric Dumazet <edumazet@google.com>
+commit d75b1ade567ffab085e8adbbdacf0092d10cd09c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d75b1ade.failed
+
+net_rx_action() can mask irqs a single time to transfert sd->poll_list
+into a private list, for a very short duration.
+
+Then, napi_complete() can avoid masking irqs again,
+and net_rx_action() only needs to mask irq again in slow path.
+
+This patch removes 2 couples of irq mask/unmask per typical NAPI run,
+more if multiple napi were triggered.
+
+Note this also allows to give control back to caller (do_softirq())
+more often, so that other softirq handlers can be called a bit earlier,
+or ksoftirqd can be wakeup earlier under pressure.
+
+This was developed while testing an alternative to RX interrupt
+mitigation to reduce latencies while keeping or improving GRO
+aggregation on fast NIC.
+
+Idea is to test napi->gro_list at the end of a napi->poll() and
+reschedule one NAPI poll, but after servicing a full round of
+softirqs (timers, TX, rcu, ...). This will be allowed only if softirq
+is currently serviced by idle task or ksoftirqd, and resched not needed.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d75b1ade567ffab085e8adbbdacf0092d10cd09c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index ce5758e98847,40be481268de..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4155,18 -4337,15 +4163,18 @@@ static int process_backlog(struct napi_
+  		local_irq_disable();
+  		net_rps_action_and_irq_enable(sd);
+  	}
+- #endif
++ 
+  	napi->weight = weight_p;
+  	local_irq_disable();
+ -	while (1) {
+ +	while (work < quota) {
+  		struct sk_buff *skb;
+ +		unsigned int qlen;
+  
+  		while ((skb = __skb_dequeue(&sd->process_queue))) {
+ +			rcu_read_lock();
+  			local_irq_enable();
+  			__netif_receive_skb(skb);
+ +			rcu_read_unlock();
+  			local_irq_disable();
+  			input_queue_head_incr(sd);
+  			if (++work >= quota) {
+@@@ -4185,15 -4359,19 +4193,14 @@@
+  			/*
+  			 * Inline a custom version of __napi_complete().
+  			 * only current cpu owns and manipulates this napi,
+ -			 * and NAPI_STATE_SCHED is the only possible flag set
+ -			 * on backlog.
+ -			 * We can use a plain write instead of clear_bit(),
+ +			 * and NAPI_STATE_SCHED is the only possible flag set on backlog.
+ +			 * we can use a plain write instead of clear_bit(),
+  			 * and we dont need an smp_mb() memory barrier.
+  			 */
+- 			list_del(&napi->poll_list);
+  			napi->state = 0;
+ -			rps_unlock(sd);
+  
+ -			break;
+ +			quota = work + qlen;
+  		}
+ -
+ -		skb_queue_splice_tail_init(&sd->input_pkt_queue,
+ -					   &sd->process_queue);
+  		rps_unlock(sd);
+  	}
+  	local_irq_enable();
+@@@ -4233,9 -4411,10 +4240,14 @@@ EXPORT_SYMBOL(__napi_schedule_irqoff)
+  void __napi_complete(struct napi_struct *n)
+  {
+  	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
+ -	BUG_ON(n->gro_list);
+  
+++<<<<<<< HEAD
+ +	list_del(&n->poll_list);
+ +	smp_mb__before_clear_bit();
+++=======
++ 	list_del_init(&n->poll_list);
++ 	smp_mb__before_atomic();
+++>>>>>>> d75b1ade567f (net: less interrupt masking in NAPI)
+  	clear_bit(NAPI_STATE_SCHED, &n->state);
+  }
+  EXPORT_SYMBOL(__napi_complete);
+@@@ -4251,29 -4430,16 +4263,42 @@@ void napi_complete_done(struct napi_str
+  	if (unlikely(test_bit(NAPI_STATE_NPSVC, &n->state)))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (n->gro_list) {
+ +		unsigned long timeout = 0;
+ +
+ +		if (work_done)
+ +			timeout = n->dev->gro_flush_timeout;
+ +
+ +		if (timeout && NAPI_STRUCT_HAS(n, timer))
+ +			hrtimer_start(&n->timer, ns_to_ktime(timeout),
+ +				      HRTIMER_MODE_REL_PINNED);
+ +		else
+ +			napi_gro_flush(n, false);
+ +	}
+ +	local_irq_save(flags);
+ +	__napi_complete(n);
+ +	local_irq_restore(flags);
+++=======
++ 	napi_gro_flush(n, false);
++ 
++ 	if (likely(list_empty(&n->poll_list))) {
++ 		WARN_ON_ONCE(!test_and_clear_bit(NAPI_STATE_SCHED, &n->state));
++ 	} else {
++ 		/* If n->poll_list is not empty, we need to mask irqs */
++ 		local_irq_save(flags);
++ 		__napi_complete(n);
++ 		local_irq_restore(flags);
++ 	}
+++>>>>>>> d75b1ade567f (net: less interrupt masking in NAPI)
+ +}
+ +EXPORT_SYMBOL(napi_complete_done);
+ +
+ +/* This is a version for old binary modules compiled against older kernels. */
+ +#undef napi_complete
+ +void napi_complete(struct napi_struct *n)
+ +{
+ +	return napi_complete_done(n, 0);
+  }
+  EXPORT_SYMBOL(napi_complete);
+  
+* Unmerged path net/core/dev.c
