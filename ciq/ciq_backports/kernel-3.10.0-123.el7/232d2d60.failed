@@ -1,0 +1,104 @@
+dcache: Translating dentry into pathname without taking rename_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Waiman Long <Waiman.Long@hp.com>
+commit 232d2d60aa5469bb097f55728f65146bd49c1d25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/232d2d60.failed
+
+When running the AIM7's short workload, Linus' lockref patch eliminated
+most of the spinlock contention. However, there were still some left:
+
+     8.46%     reaim  [kernel.kallsyms]     [k] _raw_spin_lock
+                 |--42.21%-- d_path
+                 |          proc_pid_readlink
+                 |          SyS_readlinkat
+                 |          SyS_readlink
+                 |          system_call
+                 |          __GI___readlink
+                 |
+                 |--40.97%-- sys_getcwd
+                 |          system_call
+                 |          __getcwd
+
+The big one here is the rename_lock (seqlock) contention in d_path()
+and the getcwd system call. This patch will eliminate the need to take
+the rename_lock while translating dentries into the full pathnames.
+
+The need to take the rename_lock is to make sure that no rename
+operation can be ongoing while the translation is in progress. However,
+only one thread can take the rename_lock thus blocking all the other
+threads that need it even though the translation process won't make
+any change to the dentries.
+
+This patch will replace the writer's write_seqlock/write_sequnlock
+sequence of the rename_lock of the callers of the prepend_path() and
+__dentry_path() functions with the reader's read_seqbegin/read_seqretry
+sequence within these 2 functions. As a result, the code will have to
+retry if one or more rename operations had been performed. In addition,
+RCU read lock will be taken during the translation process to make sure
+that no dentries will go away. To prevent live-lock from happening,
+the code will switch back to take the rename_lock if read_seqretry()
+fails for three times.
+
+To further reduce spinlock contention, this patch does not take the
+dentry's d_lock when copying the filename from the dentries. Instead,
+it treats the name pointer and length as unreliable and just copy
+the string byte-by-byte over until it hits a null byte or the end of
+string as specified by the length. This should avoid stepping into
+invalid memory address. The error cases are left to be handled by
+the sequence number check.
+
+The following code re-factoring are also made:
+1. Move prepend('/') into prepend_name() to remove one conditional
+   check.
+2. Move the global root check in prepend_path() back to the top of
+   the while loop.
+
+With this patch, the _raw_spin_lock will now account for only 1.2%
+of the total CPU cycles for the short workload. This patch also has
+the effect of reducing the effect of running perf on its profile
+since the perf command itself can be a heavy user of the d_path()
+function depending on the complexity of the workload.
+
+When taking the perf profile of the high-systime workload, the amount
+of spinlock contention contributed by running perf without this patch
+was about 16%. With this patch, the spinlock contention caused by
+the running of perf will go away and we will have a more accurate
+perf profile.
+
+	Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 232d2d60aa5469bb097f55728f65146bd49c1d25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index c1d239fbff60,38b1b0989a16..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -2830,6 -2937,17 +2905,20 @@@ char *dynamic_dname(struct dentry *dent
+  	return memcpy(buffer, temp, sz);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ char *simple_dname(struct dentry *dentry, char *buffer, int buflen)
++ {
++ 	char *end = buffer + buflen;
++ 	/* these dentries are never renamed, so d_lock is not needed */
++ 	if (prepend(&end, &buflen, " (deleted)", 11) ||
++ 	    prepend(&end, &buflen, dentry->d_name.name, dentry->d_name.len) ||
++ 	    prepend(&end, &buflen, "/", 1))  
++ 		end = ERR_PTR(-ENAMETOOLONG);
++ 	return end;
++ }
++ 
+++>>>>>>> 232d2d60aa54 (dcache: Translating dentry into pathname without taking rename_lock)
+  /*
+   * Write full pathname from the root of the filesystem into the buffer.
+   */
+* Unmerged path fs/dcache.c
