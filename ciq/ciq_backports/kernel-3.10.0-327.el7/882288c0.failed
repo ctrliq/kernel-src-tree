@@ -1,0 +1,230 @@
+FOU: Fix no return statement warning for !CONFIG_NET_FOU_IP_TUNNELS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit 882288c05ede954e797baa623062f5ea06663ae1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/882288c0.failed
+
+net/ipv4/fou.c: In function ‘ip_tunnel_encap_del_fou_ops’:
+net/ipv4/fou.c:861:1: warning: no return statement in function returning non-void [-Wreturn-type]
+
+Fixes: a8c5f90fb5 ("ip_tunnel: Ops registration for secondary encap (fou, gue)")
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 882288c05ede954e797baa623062f5ea06663ae1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fou.c
+diff --cc net/ipv4/fou.c
+index 606c520ffd5a,b0b436b0692c..000000000000
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@@ -489,6 -668,200 +489,203 @@@ static const struct genl_ops fou_nl_ops
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ size_t fou_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	return sizeof(struct udphdr);
++ }
++ EXPORT_SYMBOL(fou_encap_hlen);
++ 
++ size_t gue_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	size_t len;
++ 	bool need_priv = false;
++ 
++ 	len = sizeof(struct udphdr) + sizeof(struct guehdr);
++ 
++ 	if (e->flags & TUNNEL_ENCAP_FLAG_REMCSUM) {
++ 		len += GUE_PLEN_REMCSUM;
++ 		need_priv = true;
++ 	}
++ 
++ 	len += need_priv ? GUE_LEN_PRIV : 0;
++ 
++ 	return len;
++ }
++ EXPORT_SYMBOL(gue_encap_hlen);
++ 
++ static void fou_build_udp(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 			  struct flowi4 *fl4, u8 *protocol, __be16 sport)
++ {
++ 	struct udphdr *uh;
++ 
++ 	skb_push(skb, sizeof(struct udphdr));
++ 	skb_reset_transport_header(skb);
++ 
++ 	uh = udp_hdr(skb);
++ 
++ 	uh->dest = e->dport;
++ 	uh->source = sport;
++ 	uh->len = htons(skb->len);
++ 	uh->check = 0;
++ 	udp_set_csum(!(e->flags & TUNNEL_ENCAP_FLAG_CSUM), skb,
++ 		     fl4->saddr, fl4->daddr, skb->len);
++ 
++ 	*protocol = IPPROTO_UDP;
++ }
++ 
++ int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	__be16 sport;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(fou_build_header);
++ 
++ int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	struct guehdr *guehdr;
++ 	size_t hdrlen, optlen = 0;
++ 	__be16 sport;
++ 	void *data;
++ 	bool need_priv = false;
++ 
++ 	if ((e->flags & TUNNEL_ENCAP_FLAG_REMCSUM) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		csum = false;
++ 		optlen += GUE_PLEN_REMCSUM;
++ 		type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		need_priv = true;
++ 	}
++ 
++ 	optlen += need_priv ? GUE_LEN_PRIV : 0;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	/* Get source port (based on flow hash) before skb_push */
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 
++ 	hdrlen = sizeof(struct guehdr) + optlen;
++ 
++ 	skb_push(skb, hdrlen);
++ 
++ 	guehdr = (struct guehdr *)skb->data;
++ 
++ 	guehdr->control = 0;
++ 	guehdr->version = 0;
++ 	guehdr->hlen = optlen >> 2;
++ 	guehdr->flags = 0;
++ 	guehdr->proto_ctype = *protocol;
++ 
++ 	data = &guehdr[1];
++ 
++ 	if (need_priv) {
++ 		__be32 *flags = data;
++ 
++ 		guehdr->flags |= GUE_FLAG_PRIV;
++ 		*flags = 0;
++ 		data += GUE_LEN_PRIV;
++ 
++ 		if (type & SKB_GSO_TUNNEL_REMCSUM) {
++ 			u16 csum_start = skb_checksum_start_offset(skb);
++ 			__be16 *pd = data;
++ 
++ 			if (csum_start < hdrlen)
++ 				return -EINVAL;
++ 
++ 			csum_start -= hdrlen;
++ 			pd[0] = htons(csum_start);
++ 			pd[1] = htons(csum_start + skb->csum_offset);
++ 
++ 			if (!skb_is_gso(skb)) {
++ 				skb->ip_summed = CHECKSUM_NONE;
++ 				skb->encapsulation = 0;
++ 			}
++ 
++ 			*flags |= GUE_PFLAG_REMCSUM;
++ 			data += GUE_PLEN_REMCSUM;
++ 		}
++ 
++ 	}
++ 
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(gue_build_header);
++ 
++ #ifdef CONFIG_NET_FOU_IP_TUNNELS
++ 
++ static const struct ip_tunnel_encap_ops __read_mostly fou_iptun_ops = {
++ 	.encap_hlen = fou_encap_hlen,
++ 	.build_header = fou_build_header,
++ };
++ 
++ static const struct ip_tunnel_encap_ops __read_mostly gue_iptun_ops = {
++ 	.encap_hlen = gue_encap_hlen,
++ 	.build_header = gue_build_header,
++ };
++ 
++ static int ip_tunnel_encap_add_fou_ops(void)
++ {
++ 	int ret;
++ 
++ 	ret = ip_tunnel_encap_add_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 	if (ret < 0) {
++ 		pr_err("can't add fou ops\n");
++ 		return ret;
++ 	}
++ 
++ 	ret = ip_tunnel_encap_add_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
++ 	if (ret < 0) {
++ 		pr_err("can't add gue ops\n");
++ 		ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ip_tunnel_encap_del_fou_ops(void)
++ {
++ 	ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 	ip_tunnel_encap_del_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
++ }
++ 
++ #else
++ 
++ static int ip_tunnel_encap_add_fou_ops(void)
++ {
++ 	return 0;
++ }
++ 
++ static void ip_tunnel_encap_del_fou_ops(void)
++ {
++ }
++ 
++ #endif
++ 
+++>>>>>>> 882288c05ede (FOU: Fix no return statement warning for !CONFIG_NET_FOU_IP_TUNNELS)
+  static int __init fou_init(void)
+  {
+  	int ret;
+* Unmerged path net/ipv4/fou.c
