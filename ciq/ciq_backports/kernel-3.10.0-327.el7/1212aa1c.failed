@@ -1,0 +1,233 @@
+cxl: Enable CAPP recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ryan Grimm <grimm@linux.vnet.ibm.com>
+commit 1212aa1c8c9ca34642f7737e1edaa96c9ce3d7dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1212aa1c.failed
+
+Turning snoops on is the last step in CAPP recovery. Sapphire is expected to
+have reinitialized the PHB and done the previous recovery steps.
+
+Add mode argument to opal call to do this. Driver can turn snoops off although
+it does not currently.
+
+	Signed-off-by: Ryan Grimm <grimm@linux.vnet.ibm.com>
+	Acked-by: Ian Munsie <imunsie@au1.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 1212aa1c8c9ca34642f7737e1edaa96c9ce3d7dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/pnv-pci.h
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index 2f4bac41fe49,5d52d6f274f8..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -991,6 -1458,157 +991,160 @@@ static void set_msi_irq_chip(struct pnv
+  	irq_set_chip(virq, &phb->ioda.irq_chip);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CXL_BASE
++ 
++ struct device_node *pnv_pci_to_phb_node(struct pci_dev *dev)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 
++ 	return hose->dn;
++ }
++ EXPORT_SYMBOL(pnv_pci_to_phb_node);
++ 
++ int pnv_phb_to_cxl_mode(struct pci_dev *dev, uint64_t mode)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 	struct pnv_ioda_pe *pe;
++ 	int rc;
++ 
++ 	pe = pnv_ioda_get_pe(dev);
++ 	if (!pe)
++ 		return -ENODEV;
++ 
++ 	pe_info(pe, "Switching PHB to CXL\n");
++ 
++ 	rc = opal_pci_set_phb_cxl_mode(phb->opal_id, mode, pe->pe_number);
++ 	if (rc)
++ 		dev_err(&dev->dev, "opal_pci_set_phb_cxl_mode failed: %i\n", rc);
++ 
++ 	return rc;
++ }
++ EXPORT_SYMBOL(pnv_phb_to_cxl_mode);
++ 
++ /* Find PHB for cxl dev and allocate MSI hwirqs?
++  * Returns the absolute hardware IRQ number
++  */
++ int pnv_cxl_alloc_hwirqs(struct pci_dev *dev, int num)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 	int hwirq = msi_bitmap_alloc_hwirqs(&phb->msi_bmp, num);
++ 
++ 	if (hwirq < 0) {
++ 		dev_warn(&dev->dev, "Failed to find a free MSI\n");
++ 		return -ENOSPC;
++ 	}
++ 
++ 	return phb->msi_base + hwirq;
++ }
++ EXPORT_SYMBOL(pnv_cxl_alloc_hwirqs);
++ 
++ void pnv_cxl_release_hwirqs(struct pci_dev *dev, int hwirq, int num)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 
++ 	msi_bitmap_free_hwirqs(&phb->msi_bmp, hwirq - phb->msi_base, num);
++ }
++ EXPORT_SYMBOL(pnv_cxl_release_hwirqs);
++ 
++ void pnv_cxl_release_hwirq_ranges(struct cxl_irq_ranges *irqs,
++ 				  struct pci_dev *dev)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 	int i, hwirq;
++ 
++ 	for (i = 1; i < CXL_IRQ_RANGES; i++) {
++ 		if (!irqs->range[i])
++ 			continue;
++ 		pr_devel("cxl release irq range 0x%x: offset: 0x%lx  limit: %ld\n",
++ 			 i, irqs->offset[i],
++ 			 irqs->range[i]);
++ 		hwirq = irqs->offset[i] - phb->msi_base;
++ 		msi_bitmap_free_hwirqs(&phb->msi_bmp, hwirq,
++ 				       irqs->range[i]);
++ 	}
++ }
++ EXPORT_SYMBOL(pnv_cxl_release_hwirq_ranges);
++ 
++ int pnv_cxl_alloc_hwirq_ranges(struct cxl_irq_ranges *irqs,
++ 			       struct pci_dev *dev, int num)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 	int i, hwirq, try;
++ 
++ 	memset(irqs, 0, sizeof(struct cxl_irq_ranges));
++ 
++ 	/* 0 is reserved for the multiplexed PSL DSI interrupt */
++ 	for (i = 1; i < CXL_IRQ_RANGES && num; i++) {
++ 		try = num;
++ 		while (try) {
++ 			hwirq = msi_bitmap_alloc_hwirqs(&phb->msi_bmp, try);
++ 			if (hwirq >= 0)
++ 				break;
++ 			try /= 2;
++ 		}
++ 		if (!try)
++ 			goto fail;
++ 
++ 		irqs->offset[i] = phb->msi_base + hwirq;
++ 		irqs->range[i] = try;
++ 		pr_devel("cxl alloc irq range 0x%x: offset: 0x%lx  limit: %li\n",
++ 			 i, irqs->offset[i], irqs->range[i]);
++ 		num -= try;
++ 	}
++ 	if (num)
++ 		goto fail;
++ 
++ 	return 0;
++ fail:
++ 	pnv_cxl_release_hwirq_ranges(irqs, dev);
++ 	return -ENOSPC;
++ }
++ EXPORT_SYMBOL(pnv_cxl_alloc_hwirq_ranges);
++ 
++ int pnv_cxl_get_irq_count(struct pci_dev *dev)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 
++ 	return phb->msi_bmp.irq_count;
++ }
++ EXPORT_SYMBOL(pnv_cxl_get_irq_count);
++ 
++ int pnv_cxl_ioda_msi_setup(struct pci_dev *dev, unsigned int hwirq,
++ 			   unsigned int virq)
++ {
++ 	struct pci_controller *hose = pci_bus_to_host(dev->bus);
++ 	struct pnv_phb *phb = hose->private_data;
++ 	unsigned int xive_num = hwirq - phb->msi_base;
++ 	struct pnv_ioda_pe *pe;
++ 	int rc;
++ 
++ 	if (!(pe = pnv_ioda_get_pe(dev)))
++ 		return -ENODEV;
++ 
++ 	/* Assign XIVE to PE */
++ 	rc = opal_pci_set_xive_pe(phb->opal_id, pe->pe_number, xive_num);
++ 	if (rc) {
++ 		pe_warn(pe, "%s: OPAL error %d setting msi_base 0x%x "
++ 			"hwirq 0x%x XIVE 0x%x PE\n",
++ 			pci_name(dev), rc, phb->msi_base, hwirq, xive_num);
++ 		return -EIO;
++ 	}
++ 	set_msi_irq_chip(phb, virq);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(pnv_cxl_ioda_msi_setup);
++ #endif
++ 
+++>>>>>>> 1212aa1c8c9c (cxl: Enable CAPP recovery)
+  static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
+  				  unsigned int hwirq, unsigned int virq,
+  				  unsigned int is_64, struct msi_msg *msg)
+* Unmerged path arch/powerpc/include/asm/pnv-pci.h
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 486c0bb0f0bb..d5747df9309b 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -573,6 +573,14 @@ enum {
+ 	OPAL_PHB3_NUM_PEST_REGS = 256
+ };
+ 
++/* CAPI modes for PHB */
++enum {
++	OPAL_PHB_CAPI_MODE_PCIE         = 0,
++	OPAL_PHB_CAPI_MODE_CAPI         = 1,
++	OPAL_PHB_CAPI_MODE_SNOOP_OFF    = 2,
++	OPAL_PHB_CAPI_MODE_SNOOP_ON     = 3,
++};
++
+ struct OpalIoPhbErrorCommon {
+ 	__be32 version;
+ 	__be32 ioType;
+* Unmerged path arch/powerpc/include/asm/pnv-pci.h
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+diff --git a/drivers/misc/cxl/pci.c b/drivers/misc/cxl/pci.c
+index 9a7d25b37444..cb2b2afcd632 100644
+--- a/drivers/misc/cxl/pci.c
++++ b/drivers/misc/cxl/pci.c
+@@ -995,9 +995,15 @@ static struct cxl *cxl_init_adapter(struct pci_dev *dev)
+ 	if ((rc = init_implementation_adapter_regs(adapter, dev)))
+ 		goto err3;
+ 
+-	if ((rc = pnv_phb_to_cxl(dev)))
++	if ((rc = pnv_phb_to_cxl_mode(dev, OPAL_PHB_CAPI_MODE_CAPI)))
+ 		goto err3;
+ 
++	/* If recovery happened, the last step is to turn on snooping.
++	 * In the non-recovery case this has no effect */
++	if ((rc = pnv_phb_to_cxl_mode(dev, OPAL_PHB_CAPI_MODE_SNOOP_ON))) {
++		goto err3;
++	}
++
+ 	if ((rc = cxl_register_psl_err_irq(adapter)))
+ 		goto err3;
+ 
