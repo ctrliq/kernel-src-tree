@@ -1,0 +1,308 @@
+KEYS: Separate the kernel signature checking keyring from module signing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [kernel] modsign: Separate the kernel signature checking keyring from module signing (Lenny Szubowicz) [903815]
+Rebuild_FUZZ: 93.88%
+commit-author David Howells <dhowells@redhat.com>
+commit b56e5a17b6b9acd16997960504b9940d0d7984e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/b56e5a17.failed
+
+Separate the kernel signature checking keyring from module signing so that it
+can be used by code other than the module-signing code.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+(cherry picked from commit b56e5a17b6b9acd16997960504b9940d0d7984e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/modsign_pubkey.c
+* Unmerged path kernel/modsign_pubkey.c
+diff --git a/include/keys/system_keyring.h b/include/keys/system_keyring.h
+new file mode 100644
+index 000000000000..8dabc399bd1d
+--- /dev/null
++++ b/include/keys/system_keyring.h
+@@ -0,0 +1,23 @@
++/* System keyring containing trusted public keys.
++ *
++ * Copyright (C) 2013 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#ifndef _KEYS_SYSTEM_KEYRING_H
++#define _KEYS_SYSTEM_KEYRING_H
++
++#ifdef CONFIG_SYSTEM_TRUSTED_KEYRING
++
++#include <linux/key.h>
++
++extern struct key *system_trusted_keyring;
++
++#endif
++
++#endif /* _KEYS_SYSTEM_KEYRING_H */
+diff --git a/init/Kconfig b/init/Kconfig
+index 6d52b02460f8..349e07be43c1 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1616,6 +1616,18 @@ config BASE_SMALL
+ 	default 0 if BASE_FULL
+ 	default 1 if !BASE_FULL
+ 
++config SYSTEM_TRUSTED_KEYRING
++	bool "Provide system-wide ring of trusted keys"
++	depends on KEYS
++	help
++	  Provide a system keyring to which trusted keys can be added.  Keys in
++	  the keyring are considered to be trusted.  Keys may be added at will
++	  by the kernel from compiled-in data and from hardware key stores, but
++	  userspace may only add extra keys if those keys can be verified by
++	  keys already in the keyring.
++
++	  Keys in this keyring are used by module signature checking.
++
+ menuconfig MODULES
+ 	bool "Enable loadable module support"
+ 	help
+@@ -1688,6 +1700,7 @@ config MODULE_SRCVERSION_ALL
+ config MODULE_SIG
+ 	bool "Module signature verification"
+ 	depends on MODULES
++	select SYSTEM_TRUSTED_KEYRING
+ 	select KEYS
+ 	select CRYPTO
+ 	select ASYMMETRIC_KEY_TYPE
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 3e5624f1fd3f..984bc58f76e6 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -52,8 +52,9 @@ obj-$(CONFIG_SMP) += spinlock.o
+ obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
+ obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+ obj-$(CONFIG_UID16) += uid16.o
++obj-$(CONFIG_SYSTEM_TRUSTED_KEYRING) += system_keyring.o system_certificates.o
+ obj-$(CONFIG_MODULES) += module.o
+-obj-$(CONFIG_MODULE_SIG) += module_signing.o modsign_pubkey.o modsign_certificate.o
++obj-$(CONFIG_MODULE_SIG) += module_signing.o
+ obj-$(CONFIG_KALLSYMS) += kallsyms.o
+ obj-$(CONFIG_BSD_PROCESS_ACCT) += acct.o
+ obj-$(CONFIG_KEXEC) += kexec.o
+@@ -140,11 +141,11 @@ targets += timeconst.h
+ $(obj)/timeconst.h: $(obj)/hz.bc $(src)/timeconst.bc FORCE
+ 	$(call if_changed,bc)
+ 
+-ifeq ($(CONFIG_MODULE_SIG),y)
+ ###############################################################################
+ #
+ # Roll all the X.509 certificates that we can find together and pull them into
+-# the kernel.
++# the kernel so that they get loaded into the system trusted keyring during
++# boot.
+ #
+ # We look in the source root and the build root for all files whose name ends
+ # in ".x509".  Unfortunately, this will generate duplicate filenames, so we
+@@ -152,6 +153,7 @@ ifeq ($(CONFIG_MODULE_SIG),y)
+ # duplicates.
+ #
+ ###############################################################################
++ifeq ($(CONFIG_SYSTEM_TRUSTED_KEYRING),y)
+ X509_CERTIFICATES-y := $(wildcard *.x509) $(wildcard $(srctree)/*.x509)
+ X509_CERTIFICATES-$(CONFIG_MODULE_SIG) += signing_key.x509
+ X509_CERTIFICATES := $(sort $(foreach CERT,$(X509_CERTIFICATES-y), \
+@@ -168,10 +170,11 @@ $(shell rm $(obj)/.x509.list)
+ endif
+ endif
+ 
+-kernel/modsign_certificate.o: $(obj)/x509_certificate_list
++kernel/system_certificates.o: $(obj)/x509_certificate_list
+ 
+ quiet_cmd_x509certs  = CERTS   $@
+-      cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null >$@
++      cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null >$@ $(foreach X509,$(X509_CERTIFICATES),; echo "  - Including cert $(X509)")
++
+ targets += $(obj)/x509_certificate_list
+ $(obj)/x509_certificate_list: $(X509_CERTIFICATES) $(obj)/.x509.list
+ 	$(call if_changed,x509certs)
+@@ -181,7 +184,9 @@ $(obj)/.x509.list:
+ 	@echo $(X509_CERTIFICATES) >$@
+ 
+ clean-files := x509_certificate_list .x509.list
++endif
+ 
++ifeq ($(CONFIG_MODULE_SIG),y)
+ ###############################################################################
+ #
+ # If module signing is requested, say by allyesconfig, but a key has not been
+* Unmerged path kernel/modsign_pubkey.c
+diff --git a/kernel/module-internal.h b/kernel/module-internal.h
+index 24f9247b7d02..915e123a430f 100644
+--- a/kernel/module-internal.h
++++ b/kernel/module-internal.h
+@@ -9,6 +9,4 @@
+  * 2 of the Licence, or (at your option) any later version.
+  */
+ 
+-extern struct key *modsign_keyring;
+-
+ extern int mod_verify_sig(const void *mod, unsigned long *_modlen);
+diff --git a/kernel/module_signing.c b/kernel/module_signing.c
+index ee476404167b..0b6b870dc5e4 100644
+--- a/kernel/module_signing.c
++++ b/kernel/module_signing.c
+@@ -14,6 +14,7 @@
+ #include <crypto/public_key.h>
+ #include <crypto/hash.h>
+ #include <keys/asymmetric-type.h>
++#include <keys/system_keyring.h>
+ #include "module-internal.h"
+ 
+ /*
+@@ -157,7 +158,7 @@ static struct key *request_asymmetric_key(const char *signer, size_t signer_len,
+ 
+ 	pr_debug("Look up: \"%s\"\n", id);
+ 
+-	key = keyring_search(make_key_ref(modsign_keyring, 1),
++	key = keyring_search(make_key_ref(system_trusted_keyring, 1),
+ 			     &key_type_asymmetric, id);
+ 	if (IS_ERR(key))
+ 		pr_warn("Request for unknown module key '%s' err %ld\n",
+diff --git a/kernel/modsign_certificate.S b/kernel/system_certificates.S
+similarity index 58%
+rename from kernel/modsign_certificate.S
+rename to kernel/system_certificates.S
+index 6fe03c7ffe72..552d47b2d463 100644
+--- a/kernel/modsign_certificate.S
++++ b/kernel/system_certificates.S
+@@ -1,11 +1,12 @@
+ #include <linux/export.h>
++#include <linux/init.h>
+ 
+ #define GLOBAL(name)	\
+ 	.globl VMLINUX_SYMBOL(name);	\
+ 	VMLINUX_SYMBOL(name):
+ 
+-	.section ".init.data","aw"
++	__INITRODATA
+ 
+-GLOBAL(modsign_certificate_list)
++GLOBAL(system_certificate_list)
+ 	.incbin "kernel/x509_certificate_list"
+-GLOBAL(modsign_certificate_list_end)
++GLOBAL(system_certificate_list_end)
+diff --git a/kernel/system_keyring.c b/kernel/system_keyring.c
+new file mode 100644
+index 000000000000..51c35141a13a
+--- /dev/null
++++ b/kernel/system_keyring.c
+@@ -0,0 +1,103 @@
++/* System trusted keyring for trusted public keys
++ *
++ * Copyright (C) 2012 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/err.h>
++#include <keys/asymmetric-type.h>
++#include <keys/system_keyring.h>
++#include "module-internal.h"
++
++struct key *system_trusted_keyring;
++EXPORT_SYMBOL_GPL(system_trusted_keyring);
++
++extern __initconst const u8 system_certificate_list[];
++extern __initconst const u8 system_certificate_list_end[];
++
++/*
++ * Load the compiled-in keys
++ */
++static __init int system_trusted_keyring_init(void)
++{
++	pr_notice("Initialise system trusted keyring\n");
++
++	system_trusted_keyring =
++		keyring_alloc(".system_keyring",
++			      KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
++			      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
++			       KEY_USR_VIEW | KEY_USR_READ),
++			      KEY_ALLOC_NOT_IN_QUOTA, NULL);
++	if (IS_ERR(system_trusted_keyring))
++		panic("Can't allocate system trusted keyring\n");
++
++	return 0;
++}
++
++/*
++ * Must be initialised before we try and load the keys into the keyring.
++ */
++device_initcall(system_trusted_keyring_init);
++
++/*
++ * Load the compiled-in list of X.509 certificates.
++ */
++static __init int load_system_certificate_list(void)
++{
++	key_ref_t key;
++	const u8 *p, *end;
++	size_t plen;
++
++	pr_notice("Loading compiled-in X.509 certificates\n");
++
++	end = system_certificate_list_end;
++	p = system_certificate_list;
++	while (p < end) {
++		/* Each cert begins with an ASN.1 SEQUENCE tag and must be more
++		 * than 256 bytes in size.
++		 */
++		if (end - p < 4)
++			goto dodgy_cert;
++		if (p[0] != 0x30 &&
++		    p[1] != 0x82)
++			goto dodgy_cert;
++		plen = (p[2] << 8) | p[3];
++		plen += 4;
++		if (plen > end - p)
++			goto dodgy_cert;
++
++		key = key_create_or_update(make_key_ref(system_trusted_keyring, 1),
++					   "asymmetric",
++					   NULL,
++					   p,
++					   plen,
++					   (KEY_POS_ALL & ~KEY_POS_SETATTR) |
++					   KEY_USR_VIEW,
++					   KEY_ALLOC_NOT_IN_QUOTA);
++		if (IS_ERR(key)) {
++			pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
++			       PTR_ERR(key));
++		} else {
++			pr_notice("Loaded X.509 cert '%s'\n",
++				  key_ref_to_ptr(key)->description);
++			key_ref_put(key);
++		}
++		p += plen;
++	}
++
++	return 0;
++
++dodgy_cert:
++	pr_err("Problem parsing in-kernel X.509 certificate list\n");
++	return 0;
++}
++late_initcall(load_system_certificate_list);
