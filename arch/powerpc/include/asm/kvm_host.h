@@ -295,8 +295,6 @@ struct kvmppc_vcore {
 	int n_busy;
 	int num_threads;
 	int entry_exit_count;
-	int n_woken;
-	int nap_count;
 	int napping_threads;
 	int first_vcpuid;
 	u16 pcpu;
