@@ -1,0 +1,338 @@
+hv_netvsc: Eliminate the channel field in hv_netvsc_packet structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit 25b85ee890530f70de850f15660ed41abbee1172
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/25b85ee8.failed
+
+Eliminate the channel field in hv_netvsc_packet structure.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 25b85ee890530f70de850f15660ed41abbee1172)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,6bb1acd2a81c..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -128,13 -127,23 +128,21 @@@ struct ndis_tcp_ip_checksum_info
+   */
+  struct hv_netvsc_packet {
+  	/* Bookkeeping stuff */
+ -	u8 status;
+ -	u8 is_data_pkt;
+ -	u8 xmit_more; /* from skb */
+ -	u8 cp_partial; /* partial copy into send buffer */
+ -
+ -	u8 rmsg_size; /* RNDIS header and PPI size */
+ -	u8 rmsg_pgcnt; /* page count of RNDIS header and PPI */
+ -	u8 page_buf_cnt;
+ -	u8 pad0;
+ +	u32 status;
+  
+ +	bool is_data_pkt;
+  	u16 vlan_tci;
+ +
+  	u16 q_idx;
+++<<<<<<< HEAD
+ +	struct vmbus_channel *channel;
+++=======
++ 	u32 send_buf_index;
++ 
++ 	u32 total_data_buflen;
++ 	u32 pad1;
++ 
+++>>>>>>> 25b85ee89053 (hv_netvsc: Eliminate the channel field in hv_netvsc_packet structure)
+  
+  	u64 send_completion_tid;
+  	void *send_completion_ctx;
+@@@ -185,10 -193,12 +193,11 @@@ int netvsc_device_remove(struct hv_devi
+  int netvsc_send(struct hv_device *device,
+  		struct hv_netvsc_packet *packet);
+  void netvsc_linkstatus_callback(struct hv_device *device_obj,
+ -				struct rndis_message *resp);
+ -void netvsc_xmit_completion(void *context);
+ +				unsigned int status);
+  int netvsc_recv_callback(struct hv_device *device_obj,
+  			struct hv_netvsc_packet *packet,
+- 			struct ndis_tcp_ip_checksum_info *csum_info);
++ 			struct ndis_tcp_ip_checksum_info *csum_info,
++ 			struct vmbus_channel *channel);
+  void netvsc_channel_cb(void *context);
+  int rndis_filter_open(struct hv_device *dev);
+  int rndis_filter_close(struct hv_device *dev);
+diff --cc drivers/net/hyperv/netvsc.c
+index 74ee1b57e623,52533edbd2b0..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -714,53 -738,41 +715,60 @@@ u32 netvsc_copy_to_send_buf(struct netv
+  	return msg_size;
+  }
+  
+ -static inline int netvsc_send_pkt(
+ -	struct hv_netvsc_packet *packet,
+ -	struct netvsc_device *net_device)
+ +int netvsc_send(struct hv_device *device,
+ +			struct hv_netvsc_packet *packet)
+  {
+++<<<<<<< HEAD
+ +	struct netvsc_device *net_device;
+ +	int ret = 0;
+ +	struct nvsp_message sendMessage;
+ +	struct net_device *ndev;
+ +	struct vmbus_channel *out_channel = NULL;
+++=======
++ 	struct nvsp_message nvmsg;
++ 	struct vmbus_channel *out_channel = get_channel(packet, net_device);
++ 	u16 q_idx = packet->q_idx;
++ 	struct net_device *ndev = net_device->ndev;
+++>>>>>>> 25b85ee89053 (hv_netvsc: Eliminate the channel field in hv_netvsc_packet structure)
+  	u64 req_id;
+ -	int ret;
+ -	struct hv_page_buffer *pgbuf;
+ -	u32 ring_avail = hv_ringbuf_avail_percent(&out_channel->outbound);
+ +	unsigned int section_index = NETVSC_INVALID_INDEX;
+ +	u32 msg_size = 0;
+ +	struct sk_buff *skb = NULL;
+ +	u16 q_idx = packet->q_idx;
+ +
+ +
+ +	net_device = get_outbound_net_device(device);
+ +	if (!net_device)
+ +		return -ENODEV;
+ +	ndev = net_device->ndev;
+  
+ -	nvmsg.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+ +	sendMessage.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+  	if (packet->is_data_pkt) {
+  		/* 0 is RMC_DATA; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+  	} else {
+  		/* 1 is RMC_CONTROL; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+  	}
+  
+ -	nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ -		packet->send_buf_index;
+ -	if (packet->send_buf_index == NETVSC_INVALID_INDEX)
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size = 0;
+ -	else
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size =
+ -			packet->total_data_buflen;
+ +	/* Attempt to send via sendbuf */
+ +	if (packet->total_data_buflen < net_device->send_section_size) {
+ +		section_index = netvsc_get_next_send_section(net_device);
+ +		if (section_index != NETVSC_INVALID_INDEX) {
+ +			msg_size = netvsc_copy_to_send_buf(net_device,
+ +							   section_index,
+ +							   packet);
+ +			skb = (struct sk_buff *)
+ +			      (unsigned long)packet->send_completion_tid;
+ +			packet->page_buf_cnt = 0;
+ +		}
+ +	}
+ +	packet->send_buf_index = section_index;
+ +
+ +
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ +		section_index;
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_size = msg_size;
+  
+  	if (packet->send_completion)
+  		req_id = (ulong)packet;
+@@@ -817,12 -837,113 +825,122 @@@
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		if (section_index != NETVSC_INVALID_INDEX)
+ +			netvsc_free_send_slot(net_device, section_index);
+ +	} else if (skb) {
+ +		dev_kfree_skb_any(skb);
+ +	}
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	unsigned long flag;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 	bool try_batch;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = get_channel(packet, net_device);
++ 	q_idx = packet->q_idx;
++ 
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 	packet->cp_partial = false;
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	spin_lock_irqsave(&msdp->lock, flag);
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	try_batch = packet->is_data_pkt && msd_len > 0 && msdp->count <
++ 		    net_device->max_pkt;
++ 
++ 	if (try_batch && msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (try_batch && msd_len + packet->rmsg_size <
++ 		   net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 		packet->cp_partial = true;
++ 
++ 	} else if (packet->is_data_pkt && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet);
++ 
++ 		packet->send_buf_index = section_index;
++ 
++ 		if (packet->cp_partial) {
++ 			packet->page_buf_cnt -= packet->rmsg_pgcnt;
++ 			packet->total_data_buflen = msd_len + packet->rmsg_size;
++ 		} else {
++ 			packet->page_buf_cnt = 0;
++ 			packet->total_data_buflen += msd_len;
++ 		}
++ 
++ 		if (msdp->pkt)
++ 			netvsc_xmit_completion(msdp->pkt);
++ 
++ 		if (packet->xmit_more && !packet->cp_partial) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&msdp->lock, flag);
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			netvsc_xmit_completion(msd_send);
++ 		}
++ 	}
++ 
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device);
++ 
++ 	if (ret != 0 && section_index != NETVSC_INVALID_INDEX)
++ 		netvsc_free_send_slot(net_device, section_index);
+++>>>>>>> 25b85ee89053 (hv_netvsc: Eliminate the channel field in hv_netvsc_packet structure)
+  
+  	return ret;
+  }
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 56b76b7b9a27..9e3c7635714a 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -650,7 +650,8 @@ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+  */
+ int netvsc_recv_callback(struct hv_device *device_obj,
+ 				struct hv_netvsc_packet *packet,
+-				struct ndis_tcp_ip_checksum_info *csum_info)
++				struct ndis_tcp_ip_checksum_info *csum_info,
++				struct vmbus_channel *channel)
+ {
+ 	struct net_device *net;
+ 	struct sk_buff *skb;
+@@ -692,7 +693,7 @@ int netvsc_recv_callback(struct hv_device *device_obj,
+ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+ 				       packet->vlan_tci);
+ 
+-	skb_record_rx_queue(skb, packet->channel->
++	skb_record_rx_queue(skb, channel->
+ 			    offermsg.offer.sub_channel_index);
+ 
+ 	net->stats.rx_packets++;
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index 4f78abd49222..5727ea47e65f 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -366,7 +366,8 @@ static inline void *rndis_get_ppi(struct rndis_packet *rpkt, u32 type)
+ 
+ static void rndis_filter_receive_data(struct rndis_device *dev,
+ 				   struct rndis_message *msg,
+-				   struct hv_netvsc_packet *pkt)
++				   struct hv_netvsc_packet *pkt,
++				   struct vmbus_channel *channel)
+ {
+ 	struct rndis_packet *rndis_pkt;
+ 	u32 data_offset;
+@@ -409,11 +410,12 @@ static void rndis_filter_receive_data(struct rndis_device *dev,
+ 	}
+ 
+ 	csum_info = rndis_get_ppi(rndis_pkt, TCPIP_CHKSUM_PKTINFO);
+-	netvsc_recv_callback(dev->net_dev->dev, pkt, csum_info);
++	netvsc_recv_callback(dev->net_dev->dev, pkt, csum_info, channel);
+ }
+ 
+ int rndis_filter_receive(struct hv_device *dev,
+-				struct hv_netvsc_packet	*pkt)
++				struct hv_netvsc_packet	*pkt,
++				struct vmbus_channel *channel)
+ {
+ 	struct netvsc_device *net_dev = hv_get_drvdata(dev);
+ 	struct rndis_device *rndis_dev;
+@@ -451,7 +453,7 @@ int rndis_filter_receive(struct hv_device *dev,
+ 	switch (rndis_msg->ndis_msg_type) {
+ 	case RNDIS_MSG_PACKET:
+ 		/* data msg */
+-		rndis_filter_receive_data(rndis_dev, rndis_msg, pkt);
++		rndis_filter_receive_data(rndis_dev, rndis_msg, pkt, channel);
+ 		break;
+ 
+ 	case RNDIS_MSG_INIT_C:
