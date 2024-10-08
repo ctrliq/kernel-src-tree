@@ -1,0 +1,169 @@
+cpufreq: Preserve policy structure across suspend/resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Preserve policy structure across suspend/resume (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 91.26%
+commit-author Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+commit 8414809c6a1e8479e331e09254adb58b33a36d25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8414809c.failed
+
+To perform light-weight cpu-init and teardown in the cpufreq subsystem
+during suspend/resume, we need to separate out the 2 main functionalities
+of the cpufreq CPU hotplug callbacks, as outlined below:
+
+1. Init/tear-down of core cpufreq and CPU-specific components, which are
+   critical to the correct functioning of the cpufreq subsystem.
+
+2. Init/tear-down of cpufreq sysfs files during suspend/resume.
+
+The first part requires accurate updates to the policy structure such as
+its ->cpus and ->related_cpus masks, whereas the second part requires that
+the policy->kobj structure is not released or re-initialized during
+suspend/resume.
+
+To handle both these requirements, we need to allow updates to the policy
+structure throughout suspend/resume, but prevent the structure from getting
+freed up. Also, we must have a mechanism by which the cpu-up callbacks can
+restore the policy structure, without allocating things afresh. (That also
+helps avoid memory leaks).
+
+To achieve this, we use 2 schemes:
+a. Use a fallback per-cpu storage area for preserving the policy structures
+   during suspend, so that they can be restored during resume appropriately.
+
+b. Use the 'frozen' flag to determine when to free or allocate the policy
+   structure vs when to restore the policy from the saved fallback storage.
+   Thus we can successfully preserve the structure across suspend/resume.
+
+Effectively, this helps us complete the separation of the 'light-weight'
+and the 'full' init/tear-down sequences in the cpufreq subsystem, so that
+this can be made use of in the suspend/resume scenario.
+
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 8414809c6a1e8479e331e09254adb58b33a36d25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 04f364d37cba,e0ace3d9382c..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -911,16 -947,53 +912,66 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> 8414809c6a1e (cpufreq: Preserve policy structure across suspend/resume)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -964,7 -1033,17 +1015,21 @@@
+  #endif
+  #endif
+  
+++<<<<<<< HEAD
+ +	policy = kzalloc(sizeof(struct cpufreq_policy), GFP_KERNEL);
+++=======
++ 	if (!try_module_get(cpufreq_driver->owner)) {
++ 		ret = -EINVAL;
++ 		goto module_out;
++ 	}
++ 
++ 	if (frozen)
++ 		/* Restore the saved policy when doing light-weight init */
++ 		policy = cpufreq_policy_restore(cpu);
++ 	else
++ 		policy = cpufreq_policy_alloc();
++ 
+++>>>>>>> 8414809c6a1e (cpufreq: Preserve policy structure across suspend/resume)
+  	if (!policy)
+  		goto nomem_out;
+  
+@@@ -1188,14 -1298,15 +1269,22 @@@ static int __cpufreq_remove_dev(struct 
+  		if (cpufreq_driver->exit)
+  			cpufreq_driver->exit(data);
+  
+++<<<<<<< HEAD
+ +		free_cpumask_var(data->related_cpus);
+ +		free_cpumask_var(data->cpus);
+ +		kfree(data);
+ +	} else {
+++=======
++ 		if (!frozen)
++ 			cpufreq_policy_free(data);
++ 	} else {
++ 
++ 		if (!frozen) {
++ 			pr_debug("%s: removing link, cpu: %d\n", __func__, cpu);
++ 			cpufreq_cpu_put(data);
++ 		}
++ 
+++>>>>>>> 8414809c6a1e (cpufreq: Preserve policy structure across suspend/resume)
+  		if (cpufreq_driver->target) {
+  			__cpufreq_governor(data, CPUFREQ_GOV_START);
+  			__cpufreq_governor(data, CPUFREQ_GOV_LIMITS);
+* Unmerged path drivers/cpufreq/cpufreq.c
