@@ -1,0 +1,291 @@
+split read_seqretry_or_unlock(), convert d_walk() to resulting primitives
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 48f5ec21d9c67e881ff35343988e290ef5cf933f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/48f5ec21.failed
+
+Separate "check if we need to retry" from "unlock if we are done and
+had seq_writelock"; that allows to use these guys in d_walk(), where
+we need to recheck every time we ascend back to parent, but do *not*
+want to unlock until the very end.  Lift rcu_read_lock/rcu_read_unlock
+out into callers.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 48f5ec21d9c67e881ff35343988e290ef5cf933f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index c1d239fbff60,b9caf47d5389..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -88,6 -88,35 +88,38 @@@ EXPORT_SYMBOL(rename_lock)
+  
+  static struct kmem_cache *dentry_cache __read_mostly;
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * read_seqbegin_or_lock - begin a sequence number check or locking block
++  * lock: sequence lock
++  * seq : sequence number to be checked
++  *
++  * First try it once optimistically without taking the lock. If that fails,
++  * take the lock. The sequence number is also used as a marker for deciding
++  * whether to be a reader (even) or writer (odd).
++  * N.B. seq must be initialized to an even number to begin with.
++  */
++ static inline void read_seqbegin_or_lock(seqlock_t *lock, int *seq)
++ {
++ 	if (!(*seq & 1))	/* Even */
++ 		*seq = read_seqbegin(lock);
++ 	else			/* Odd */
++ 		write_seqlock(lock);
++ }
++ 
++ static inline int need_seqretry(seqlock_t *lock, int seq)
++ {
++ 	return !(seq & 1) && read_seqretry(lock, seq);
++ }
++ 
++ static inline void done_seqretry(seqlock_t *lock, int seq)
++ {
++ 	if (seq & 1)
++ 		write_sequnlock(lock);
++ }
++ 
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  /*
+   * This is the single most critical data structure when it comes
+   * to the dcache: the hashtable for lookups. Somebody should try
+@@@ -1051,16 -1089,26 +1083,22 @@@ int have_submounts(struct dentry *paren
+  {
+  	struct dentry *this_parent;
+  	struct list_head *next;
+++<<<<<<< HEAD
+ +	unsigned seq;
+ +	int locked = 0;
+++=======
++ 	unsigned seq = 0;
++ 	enum d_walk_ret ret;
++ 	bool retry = true;
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  
+- 	seq = read_seqbegin(&rename_lock);
+  again:
++ 	read_seqbegin_or_lock(&rename_lock, &seq);
+  	this_parent = parent;
+ -	spin_lock(&this_parent->d_lock);
+  
+ -	ret = enter(data, this_parent);
+ -	switch (ret) {
+ -	case D_WALK_CONTINUE:
+ -		break;
+ -	case D_WALK_QUIT:
+ -	case D_WALK_SKIP:
+ -		goto out_unlock;
+ -	case D_WALK_NORETRY:
+ -		retry = false;
+ -		break;
+ -	}
+ +	if (d_mountpoint(parent))
+ +		goto positive;
+ +	spin_lock(&this_parent->d_lock);
+  repeat:
+  	next = this_parent->d_subdirs.next;
+  resume:
+@@@ -1096,26 -1154,57 +1134,45 @@@
+  		next = child->d_u.d_child.next;
+  		goto resume;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&this_parent->d_lock);
+ +	if (!locked && read_seqretry(&rename_lock, seq))
+ +		goto rename_retry;
+ +	if (locked)
+ +		write_sequnlock(&rename_lock);
+ +	return 0; /* No mount points found in tree */
+ +positive:
+ +	if (!locked && read_seqretry(&rename_lock, seq))
+ +		goto rename_retry;
+ +	if (locked)
+ +		write_sequnlock(&rename_lock);
+ +	return 1;
+ +
+ +rename_retry:
+ +	if (locked)
+ +		goto again;
+ +	locked = 1;
+ +	write_seqlock(&rename_lock);
+++=======
++ 	if (need_seqretry(&rename_lock, seq)) {
++ 		spin_unlock(&this_parent->d_lock);
++ 		goto rename_retry;
++ 	}
++ 	if (finish)
++ 		finish(data);
++ 
++ out_unlock:
++ 	spin_unlock(&this_parent->d_lock);
++ 	done_seqretry(&rename_lock, seq);
++ 	return;
++ 
++ rename_retry:
++ 	if (!retry)
++ 		return;
++ 	seq = 1;
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  	goto again;
+  }
+ -
+ -/*
+ - * Search for at least 1 mount point in the dentry's subdirs.
+ - * We descend to the next level whenever the d_subdirs
+ - * list is non-empty and continue searching.
+ - */
+ -
+ -/**
+ - * have_submounts - check for mounts over a dentry
+ - * @parent: dentry to check.
+ - *
+ - * Return true if the parent or its subdirectories contain
+ - * a mount point
+ - */
+ -
+ -static enum d_walk_ret check_mount(void *data, struct dentry *dentry)
+ -{
+ -	int *ret = data;
+ -	if (d_mountpoint(dentry)) {
+ -		*ret = 1;
+ -		return D_WALK_QUIT;
+ -	}
+ -	return D_WALK_CONTINUE;
+ -}
+ -
+ -int have_submounts(struct dentry *parent)
+ -{
+ -	int ret = 0;
+ -
+ -	d_walk(parent, &ret, check_mount, NULL);
+ -
+ -	return ret;
+ -}
+  EXPORT_SYMBOL(have_submounts);
+  
+  /*
+@@@ -2633,9 -2726,16 +2690,17 @@@ static int prepend_path(const struct pa
+  	struct dentry *dentry = path->dentry;
+  	struct vfsmount *vfsmnt = path->mnt;
+  	struct mount *mnt = real_mount(vfsmnt);
+ +	bool slash = false;
+  	int error = 0;
+ -	unsigned seq = 0;
+ -	char *bptr;
+ -	int blen;
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ restart:
++ 	bptr = *buffer;
++ 	blen = *buflen;
++ 	read_seqbegin_or_lock(&rename_lock, &seq);
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  	while (dentry != root->dentry || vfsmnt != root->mnt) {
+  		struct dentry * parent;
+  
+@@@ -2658,29 -2768,24 +2723,39 @@@
+  		if (error)
+  			break;
+  
+ +		slash = true;
+  		dentry = parent;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (!(seq & 1))
++ 		rcu_read_unlock();
++ 	if (need_seqretry(&rename_lock, seq)) {
++ 		seq = 1;
++ 		goto restart;
++ 	}
++ 	done_seqretry(&rename_lock, seq);
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  
+ -	if (error >= 0 && bptr == *buffer) {
+ -		if (--blen < 0)
+ -			error = -ENAMETOOLONG;
+ -		else
+ -			*--bptr = '/';
+ -	}
+ -	*buffer = bptr;
+ -	*buflen = blen;
+ +	if (!error && !slash)
+ +		error = prepend(buffer, buflen, "/", 1);
+ +
+ +	return error;
+ +
+ +global_root:
+ +	/*
+ +	 * Filesystems needing to implement special "root names"
+ +	 * should do so with ->d_dname()
+ +	 */
+ +	if (IS_ROOT(dentry) &&
+ +	    (dentry->d_name.len != 1 || dentry->d_name.name[0] != '/')) {
+ +		WARN(1, "Root dentry has weird name <%.*s>\n",
+ +		     (int) dentry->d_name.len, dentry->d_name.name);
+ +	}
+ +	if (!slash)
+ +		error = prepend(buffer, buflen, "/", 1);
+ +	if (!error)
+ +		error = is_mounted(vfsmnt) ? 1 : 2;
+  	return error;
+  }
+  
+@@@ -2835,10 -2945,15 +2910,18 @@@ char *dynamic_dname(struct dentry *dent
+   */
+  static char *__dentry_path(struct dentry *dentry, char *buf, int buflen)
+  {
+ -	char *end, *retval;
+ -	int len, seq = 0;
+ -	int error = 0;
+ +	char *end = buf + buflen;
+ +	char *retval;
+  
+++<<<<<<< HEAD
+ +	prepend(&end, &buflen, "\0", 1);
+++=======
++ 	rcu_read_lock();
++ restart:
++ 	end = buf + buflen;
++ 	len = buflen;
++ 	prepend(&end, &len, "\0", 1);
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  	if (buflen < 1)
+  		goto Elong;
+  	/* Get '/' right */
+@@@ -2859,6 -2972,15 +2942,18 @@@
+  		retval = end;
+  		dentry = parent;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (!(seq & 1))
++ 		rcu_read_unlock();
++ 	if (need_seqretry(&rename_lock, seq)) {
++ 		seq = 1;
++ 		goto restart;
++ 	}
++ 	done_seqretry(&rename_lock, seq);
++ 	if (error)
++ 		goto Elong;
+++>>>>>>> 48f5ec21d9c6 (split read_seqretry_or_unlock(), convert d_walk() to resulting primitives)
+  	return retval;
+  Elong:
+  	return ERR_PTR(-ENAMETOOLONG);
+* Unmerged path fs/dcache.c
