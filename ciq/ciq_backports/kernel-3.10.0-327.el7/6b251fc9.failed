@@ -1,0 +1,226 @@
+userfaultfd: call handle_userfault() for userfaultfd_missing() faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 6b251fc96cf2cdf1ce4b5db055547e2a5679bc77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b251fc9.failed
+
+This is where the page faults must be modified to call
+handle_userfault() if userfaultfd_missing() is true (so if the
+vma->vm_flags had VM_UFFD_MISSING set).
+
+handle_userfault() then takes care of blocking the page fault and
+delivering it to userland.
+
+The fault flags must also be passed as parameter so the "read|write"
+kind of fault can be passed to userland.
+
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Acked-by: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Sanidhya Kashyap <sanidhya.gatech@gmail.com>
+	Cc: zhang.zhanghailiang@huawei.com
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Andres Lagar-Cavilla <andreslc@google.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Peter Feiner <pfeiner@google.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: "Huangpeng (Peter)" <peter.huangpeng@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6b251fc96cf2cdf1ce4b5db055547e2a5679bc77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+#	mm/memory.c
+diff --cc mm/huge_memory.c
+index bff17a8147f4,7735f99931fa..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -702,15 -718,27 +703,34 @@@ static inline pmd_t mk_huge_pmd(struct 
+  static int __do_huge_pmd_anonymous_page(struct mm_struct *mm,
+  					struct vm_area_struct *vma,
+  					unsigned long haddr, pmd_t *pmd,
+++<<<<<<< HEAD
+ +					struct page *page)
+++=======
++ 					struct page *page, gfp_t gfp,
++ 					unsigned int flags)
+++>>>>>>> 6b251fc96cf2 (userfaultfd: call handle_userfault() for userfaultfd_missing() faults)
+  {
+ -	struct mem_cgroup *memcg;
+  	pgtable_t pgtable;
+  	spinlock_t *ptl;
+  
+  	VM_BUG_ON_PAGE(!PageCompound(page), page);
+++<<<<<<< HEAD
+ +	pgtable = pte_alloc_one(mm, haddr);
+ +	if (unlikely(!pgtable))
+++=======
++ 
++ 	if (mem_cgroup_try_charge(page, mm, gfp, &memcg)) {
++ 		put_page(page);
++ 		count_vm_event(THP_FAULT_FALLBACK);
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 
++ 	pgtable = pte_alloc_one(mm, haddr);
++ 	if (unlikely(!pgtable)) {
++ 		mem_cgroup_cancel_charge(page, memcg);
++ 		put_page(page);
+++>>>>>>> 6b251fc96cf2 (userfaultfd: call handle_userfault() for userfaultfd_missing() faults)
+  		return VM_FAULT_OOM;
+ -	}
+  
+  	clear_huge_page(page, haddr, HPAGE_PMD_NR);
+  	/*
+@@@ -728,8 -756,26 +748,28 @@@
+  		pte_free(mm, pgtable);
+  	} else {
+  		pmd_t entry;
+++<<<<<<< HEAD
+ +		entry = mk_huge_pmd(page, vma);
+++=======
++ 
++ 		/* Deliver the page fault to userland */
++ 		if (userfaultfd_missing(vma)) {
++ 			int ret;
++ 
++ 			spin_unlock(ptl);
++ 			mem_cgroup_cancel_charge(page, memcg);
++ 			put_page(page);
++ 			pte_free(mm, pgtable);
++ 			ret = handle_userfault(vma, haddr, flags,
++ 					       VM_UFFD_MISSING);
++ 			VM_BUG_ON(ret & VM_FAULT_FALLBACK);
++ 			return ret;
++ 		}
++ 
++ 		entry = mk_huge_pmd(page, vma->vm_page_prot);
++ 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+++>>>>>>> 6b251fc96cf2 (userfaultfd: call handle_userfault() for userfaultfd_missing() faults)
+  		page_add_new_anon_rmap(page, vma, haddr);
+ -		mem_cgroup_commit_charge(page, memcg, false);
+ -		lru_cache_add_active_or_unevictable(page, vma);
+  		pgtable_trans_huge_deposit(mm, pmd, pgtable);
+  		set_pmd_at(mm, haddr, pmd, entry);
+  		add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR);
+@@@ -745,33 -792,13 +786,31 @@@ static inline gfp_t alloc_hugepage_gfpm
+  	return (GFP_TRANSHUGE & ~(defrag ? 0 : __GFP_WAIT)) | extra_gfp;
+  }
+  
+ +static inline struct page *alloc_hugepage_vma(int defrag,
+ +					      struct vm_area_struct *vma,
+ +					      unsigned long haddr, int nd,
+ +					      gfp_t extra_gfp)
+ +{
+ +	return alloc_pages_vma(alloc_hugepage_gfpmask(defrag, extra_gfp),
+ +			       HPAGE_PMD_ORDER, vma, haddr, nd);
+ +}
+ +
+ +#ifndef CONFIG_NUMA
+ +static inline struct page *alloc_hugepage(int defrag)
+ +{
+ +	return alloc_pages(alloc_hugepage_gfpmask(defrag, 0),
+ +			   HPAGE_PMD_ORDER);
+ +}
+ +#endif
+ +
+  /* Caller must hold page table lock. */
+- static bool set_huge_zero_page(pgtable_t pgtable, struct mm_struct *mm,
++ static void set_huge_zero_page(pgtable_t pgtable, struct mm_struct *mm,
+  		struct vm_area_struct *vma, unsigned long haddr, pmd_t *pmd,
+  		struct page *zero_page)
+  {
+  	pmd_t entry;
+- 	if (!pmd_none(*pmd))
+- 		return false;
+  	entry = mk_pmd(zero_page, vma->vm_page_prot);
+ +	entry = pmd_wrprotect(entry);
+  	entry = pmd_mkhuge(entry);
+  	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+  	set_pmd_at(mm, haddr, pmd, entry);
+@@@ -815,28 -857,15 +868,32 @@@ int do_huge_pmd_anonymous_page(struct m
+  			pte_free(mm, pgtable);
+  			put_huge_zero_page();
+  		}
+- 		return 0;
++ 		return ret;
+  	}
+ -	gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
+ -	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+ +	page = alloc_hugepage_vma(transparent_hugepage_defrag(vma),
+ +			vma, haddr, numa_node_id(), 0);
+  	if (unlikely(!page)) {
+  		count_vm_event(THP_FAULT_FALLBACK);
+  		return VM_FAULT_FALLBACK;
+  	}
+++<<<<<<< HEAD
+ +	if (unlikely(mem_cgroup_newpage_charge(page, mm, GFP_KERNEL))) {
+ +		put_page(page);
+ +		count_vm_event(THP_FAULT_FALLBACK);
+ +		return VM_FAULT_FALLBACK;
+ +	}
+ +	if (unlikely(__do_huge_pmd_anonymous_page(mm, vma, haddr, pmd, page))) {
+ +		mem_cgroup_uncharge_page(page);
+ +		put_page(page);
+ +		count_vm_event(THP_FAULT_FALLBACK);
+ +		return VM_FAULT_FALLBACK;
+ +	}
+ +
+ +	count_vm_event(THP_FAULT_ALLOC);
+ +	return 0;
+++=======
++ 	return __do_huge_pmd_anonymous_page(mm, vma, haddr, pmd, page, gfp, flags);
+++>>>>>>> 6b251fc96cf2 (userfaultfd: call handle_userfault() for userfaultfd_missing() faults)
+  }
+  
+  int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+diff --cc mm/memory.c
+index d43b8992ad86,2961fb654369..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -59,6 -59,9 +59,12 @@@
+  #include <linux/gfp.h>
+  #include <linux/migrate.h>
+  #include <linux/string.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/dma-debug.h>
++ #include <linux/debugfs.h>
++ #include <linux/userfaultfd_k.h>
+++>>>>>>> 6b251fc96cf2 (userfaultfd: call handle_userfault() for userfaultfd_missing() faults)
+  
+  #include <asm/io.h>
+  #include <asm/pgalloc.h>
+@@@ -3273,8 -2720,19 +3285,17 @@@ static int do_anonymous_page(struct mm_
+  	if (!pte_none(*page_table))
+  		goto release;
+  
++ 	/* Deliver the page fault to userland, check inside PT lock */
++ 	if (userfaultfd_missing(vma)) {
++ 		pte_unmap_unlock(page_table, ptl);
++ 		mem_cgroup_cancel_charge(page, memcg);
++ 		page_cache_release(page);
++ 		return handle_userfault(vma, address, flags,
++ 					VM_UFFD_MISSING);
++ 	}
++ 
+  	inc_mm_counter_fast(mm, MM_ANONPAGES);
+  	page_add_new_anon_rmap(page, vma, address);
+ -	mem_cgroup_commit_charge(page, memcg, false);
+ -	lru_cache_add_active_or_unevictable(page, vma);
+  setpte:
+  	set_pte_at(mm, address, page_table, entry);
+  
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/memory.c
