@@ -1,0 +1,210 @@
+vxlan: consolidate rx handling to a single function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit f2d1968ec85e85def98fdea0cf325851433bb60a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f2d1968e.failed
+
+Now when both vxlan_udp_encap_recv and vxlan_rcv are much shorter, combine
+them into a single function.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f2d1968ec85e85def98fdea0cf325851433bb60a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,cfd6deb9f090..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1133,34 -1144,120 +1133,123 @@@ static struct vxlanhdr *vxlan_remcsum(s
+  {
+  	size_t start, offset, plen;
+  
+ -	if (!(unparsed->vx_flags & VXLAN_HF_RCO) || skb->remcsum_offload)
+ -		goto out;
+ +	if (skb->remcsum_offload)
+ +		return vh;
+  
+ -	start = vxlan_rco_start(unparsed->vx_vni);
+ -	offset = start + vxlan_rco_offset(unparsed->vx_vni);
+ +	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
+ +	offset = start + ((data & VXLAN_RCO_UDP) ?
+ +			  offsetof(struct udphdr, check) :
+ +			  offsetof(struct tcphdr, check));
+  
+ -	plen = sizeof(struct vxlanhdr) + offset + sizeof(u16);
+ +	plen = hdrlen + offset + sizeof(u16);
+  
+  	if (!pskb_may_pull(skb, plen))
+ -		return false;
+ +		return NULL;
+  
+ -	skb_remcsum_process(skb, (void *)(vxlan_hdr(skb) + 1), start, offset,
+ -			    !!(vxflags & VXLAN_F_REMCSUM_NOPARTIAL));
+ -out:
+ -	unparsed->vx_flags &= ~VXLAN_HF_RCO;
+ -	unparsed->vx_vni &= VXLAN_VNI_MASK;
+ -	return true;
+ -}
+ +	vh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
+  
+ -static void vxlan_parse_gbp_hdr(struct vxlanhdr *unparsed,
+ -				struct sk_buff *skb, u32 vxflags,
+ -				struct vxlan_metadata *md,
+ -				struct metadata_dst *tun_dst)
+ -{
+ -	struct vxlanhdr_gbp *gbp = (struct vxlanhdr_gbp *)unparsed;
+ +	skb_remcsum_process(skb, (void *)vh + hdrlen, start, offset,
+ +			    nopartial);
+  
+++<<<<<<< HEAD
+ +	return vh;
+++=======
++ 	if (!(unparsed->vx_flags & VXLAN_HF_GBP))
++ 		goto out;
++ 
++ 	md->gbp = ntohs(gbp->policy_id);
++ 
++ 	if (tun_dst)
++ 		tun_dst->u.tun_info.key.tun_flags |= TUNNEL_VXLAN_OPT;
++ 
++ 	if (gbp->dont_learn)
++ 		md->gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 	if (gbp->policy_applied)
++ 		md->gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 	/* In flow-based mode, GBP is carried in dst_metadata */
++ 	if (!(vxflags & VXLAN_F_COLLECT_METADATA))
++ 		skb->mark = md->gbp;
++ out:
++ 	unparsed->vx_flags &= ~VXLAN_GBP_USED_BITS;
++ }
++ 
++ static bool vxlan_set_mac(struct vxlan_dev *vxlan,
++ 			  struct vxlan_sock *vs,
++ 			  struct sk_buff *skb)
++ {
++ 	union vxlan_addr saddr;
++ 
++ 	skb_reset_mac_header(skb);
++ 	skb->protocol = eth_type_trans(skb, vxlan->dev);
++ 	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
++ 
++ 	/* Ignore packet loops (and multicast echo) */
++ 	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
++ 		return false;
++ 
++ 	/* Get address from the outer IP header */
++ 	if (vxlan_get_sk_family(vs) == AF_INET) {
++ 		saddr.sin.sin_addr.s_addr = ip_hdr(skb)->saddr;
++ 		saddr.sa.sa_family = AF_INET;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		saddr.sin6.sin6_addr = ipv6_hdr(skb)->saddr;
++ 		saddr.sa.sa_family = AF_INET6;
++ #endif
++ 	}
++ 
++ 	if ((vxlan->flags & VXLAN_F_LEARN) &&
++ 	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool vxlan_ecn_decapsulate(struct vxlan_sock *vs, void *oiph,
++ 				  struct sk_buff *skb)
++ {
++ 	int err = 0;
++ 
++ 	if (vxlan_get_sk_family(vs) == AF_INET)
++ 		err = IP_ECN_decapsulate(oiph, skb);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else
++ 		err = IP6_ECN_decapsulate(oiph, skb);
++ #endif
++ 
++ 	if (unlikely(err) && log_ecn_error) {
++ 		if (vxlan_get_sk_family(vs) == AF_INET)
++ 			net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
++ 					     &((struct iphdr *)oiph)->saddr,
++ 					     ((struct iphdr *)oiph)->tos);
++ 		else
++ 			net_info_ratelimited("non-ECT from %pI6\n",
++ 					     &((struct ipv6hdr *)oiph)->saddr);
++ 	}
++ 	return err <= 1;
+++>>>>>>> f2d1968ec85e (vxlan: consolidate rx handling to a single function)
+  }
+  
+  /* Callback from net/ipv4/udp.c to receive packets */
+- static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
++ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	struct vxlan_sock *vs;
+ +	struct vxlanhdr *vxh;
+ +	u32 flags, vni;
+ +	struct vxlan_metadata md = {0};
+++=======
++ 	struct metadata_dst *tun_dst = NULL;
++ 	struct pcpu_sw_netstats *stats;
++ 	struct vxlan_dev *vxlan;
++ 	struct vxlan_sock *vs;
++ 	struct vxlanhdr unparsed;
++ 	struct vxlan_metadata _md;
++ 	struct vxlan_metadata *md = &_md;
++ 	void *oiph;
+++>>>>>>> f2d1968ec85e (vxlan: consolidate rx handling to a single function)
+  
+  	/* Need Vxlan and inner Ethernet header to be present */
+  	if (!pskb_may_pull(skb, VXLAN_HLEN))
+@@@ -1222,12 -1319,33 +1311,39 @@@
+  		 * is more robust and provides a little more security in
+  		 * adding extensions to VXLAN.
+  		 */
+ -		goto drop;
+ +
+ +		goto bad_flags;
+  	}
+  
+++<<<<<<< HEAD
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+++=======
++ 	if (!vxlan_set_mac(vxlan, vs, skb))
++ 		goto drop;
++ 
++ 	if (tun_dst) {
++ 		skb_dst_set(skb, (struct dst_entry *)tun_dst);
++ 		tun_dst = NULL;
++ 	}
++ 
++ 	oiph = skb_network_header(skb);
++ 	skb_reset_network_header(skb);
++ 
++ 	if (!vxlan_ecn_decapsulate(vs, oiph, skb)) {
++ 		++vxlan->dev->stats.rx_frame_errors;
++ 		++vxlan->dev->stats.rx_errors;
++ 		goto drop;
++ 	}
++ 
++ 	stats = this_cpu_ptr(vxlan->dev->tstats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->rx_packets++;
++ 	stats->rx_bytes += skb->len;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	gro_cells_receive(&vxlan->gro_cells, skb);
+++>>>>>>> f2d1968ec85e (vxlan: consolidate rx handling to a single function)
+  	return 0;
+  
+  drop:
+* Unmerged path drivers/net/vxlan.c
