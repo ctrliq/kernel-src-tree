@@ -1,0 +1,142 @@
+mm: numa: return the number of base pages altered by protection changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] numa: return the number of base pages altered by protection changes (Rik van Riel) [1040200]
+Rebuild_FUZZ: 97.10%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 72403b4a0fbdf433c1fe0127e49864658f6f6468
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/72403b4a.failed
+
+Commit 0255d4918480 ("mm: Account for a THP NUMA hinting update as one
+PTE update") was added to account for the number of PTE updates when
+marking pages prot_numa.  task_numa_work was using the old return value
+to track how much address space had been updated.  Altering the return
+value causes the scanner to do more work than it is configured or
+documented to in a single unit of work.
+
+This patch reverts that commit and accounts for the number of THP
+updates separately in vmstat.  It is up to the administrator to
+interpret the pair of values correctly.  This is a straight-forward
+operation and likely to only be of interest when actively debugging NUMA
+balancing problems.
+
+The impact of this patch is that the NUMA PTE scanner will scan slower
+when THP is enabled and workloads may converge slower as a result.  On
+the flip size system CPU usage should be lower than recent tests
+reported.  This is an illustrative example of a short single JVM specjbb
+test
+
+specjbb
+                       3.12.0                3.12.0
+                      vanilla      acctupdates
+TPut 1      26143.00 (  0.00%)     25747.00 ( -1.51%)
+TPut 7     185257.00 (  0.00%)    183202.00 ( -1.11%)
+TPut 13    329760.00 (  0.00%)    346577.00 (  5.10%)
+TPut 19    442502.00 (  0.00%)    460146.00 (  3.99%)
+TPut 25    540634.00 (  0.00%)    549053.00 (  1.56%)
+TPut 31    512098.00 (  0.00%)    519611.00 (  1.47%)
+TPut 37    461276.00 (  0.00%)    474973.00 (  2.97%)
+TPut 43    403089.00 (  0.00%)    414172.00 (  2.75%)
+
+              3.12.0      3.12.0
+             vanillaacctupdates
+User         5169.64     5184.14
+System        100.45       80.02
+Elapsed       252.75      251.85
+
+Performance is similar but note the reduction in system CPU time.  While
+this showed a performance gain, it will not be universal but at least
+it'll be behaving as documented.  The vmstats are obviously different but
+here is an obvious interpretation of them from mmtests.
+
+                                3.12.0      3.12.0
+                               vanillaacctupdates
+NUMA page range updates        1408326    11043064
+NUMA huge PMD updates                0       21040
+NUMA PTE updates               1408326      291624
+
+"NUMA page range updates" == nr_pte_updates and is the value returned to
+the NUMA pte scanner.  NUMA huge PMD updates were the number of THP
+updates which in combination can be used to calculate how many ptes were
+updated from userspace.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reported-by: Alex Thorlton <athorlton@sgi.com>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 72403b4a0fbdf433c1fe0127e49864658f6f6468)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mprotect.c
+diff --cc mm/mprotect.c
+index 41e02923fcd9,26667971c824..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -134,7 -112,7 +134,11 @@@ static inline unsigned long change_pmd_
+  	pmd_t *pmd;
+  	unsigned long next;
+  	unsigned long pages = 0;
+++<<<<<<< HEAD
+ +	bool all_same_node;
+++=======
++ 	unsigned long nr_huge_updates = 0;
+++>>>>>>> 72403b4a0fbd (mm: numa: return the number of base pages altered by protection changes)
+  
+  	pmd = pmd_offset(pud, addr);
+  	do {
+@@@ -157,19 -138,13 +162,21 @@@
+  		}
+  		if (pmd_none_or_clear_bad(pmd))
+  			continue;
+ -		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
+ -				 dirty_accountable, prot_numa);
+ -		pages += this_pages;
+ +		pages += change_pte_range(vma, pmd, addr, next, newprot,
+ +				 dirty_accountable, prot_numa, &all_same_node);
+ +
+ +		/*
+ +		 * If we are changing protections for NUMA hinting faults then
+ +		 * set pmd_numa if the examined pages were all on the same
+ +		 * node. This allows a regular PMD to be handled as one fault
+ +		 * and effectively batches the taking of the PTL
+ +		 */
+ +		if (prot_numa && all_same_node)
+ +			change_pmd_protnuma(vma->vm_mm, addr, pmd);
+  	} while (pmd++, addr = next, addr != end);
+  
++ 	if (nr_huge_updates)
++ 		count_vm_numa_events(NUMA_HUGE_PTE_UPDATES, nr_huge_updates);
+  	return pages;
+  }
+  
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index bd6cf61142be..8c0f6cb2a603 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -39,6 +39,7 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		PAGEOUTRUN, ALLOCSTALL, PGROTATED,
+ #ifdef CONFIG_NUMA_BALANCING
+ 		NUMA_PTE_UPDATES,
++		NUMA_HUGE_PTE_UPDATES,
+ 		NUMA_HINT_FAULTS,
+ 		NUMA_HINT_FAULTS_LOCAL,
+ 		NUMA_PAGE_MIGRATE,
+* Unmerged path mm/mprotect.c
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index f42745e65780..10bbb5427a6d 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -779,6 +779,7 @@ const char * const vmstat_text[] = {
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+ 	"numa_pte_updates",
++	"numa_huge_pte_updates",
+ 	"numa_hint_faults",
+ 	"numa_hint_faults_local",
+ 	"numa_pages_migrated",
