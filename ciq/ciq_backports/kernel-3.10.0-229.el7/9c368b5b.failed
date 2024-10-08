@@ -1,0 +1,86 @@
+sched, time: Fix lock inversion in thread_group_cputime()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] sched/time: fix lock inversion in thread_group_cputime (Rik van Riel) [1120307]
+Rebuild_FUZZ: 95.50%
+commit-author Rik van Riel <riel@redhat.com>
+commit 9c368b5b6eccce1cbd7f68142106b3b4ddb1c5b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9c368b5b.failed
+
+The sig->stats_lock nests inside the tasklist_lock and the
+sighand->siglock in __exit_signal and wait_task_zombie.
+
+However, both of those locks can be taken from irq context,
+which means we need to use the interrupt safe variant of
+read_seqbegin_or_lock. This blocks interrupts when the "lock"
+branch is taken (seq is odd), preventing the lock inversion.
+
+On the first (lockless) pass through the loop, irqs are not
+blocked.
+
+	Reported-by: Stanislaw Gruszka <sgruszka@redhat.com>
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: prarit@redhat.com
+	Cc: oleg@redhat.com
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1410527535-9814-3-git-send-email-riel@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 9c368b5b6eccce1cbd7f68142106b3b4ddb1c5b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/cputime.c
+diff --cc kernel/sched/cputime.c
+index 6d23daaa88cf,64492dff8a81..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -288,18 -288,29 +288,44 @@@ void thread_group_cputime(struct task_s
+  	struct signal_struct *sig = tsk->signal;
+  	cputime_t utime, stime;
+  	struct task_struct *t;
+++<<<<<<< HEAD
+ +
+ +	times->utime = sig->utime;
+ +	times->stime = sig->stime;
+ +	times->sum_exec_runtime = sig->sum_sched_runtime;
+ +
+ +	rcu_read_lock();
+ +	for_each_thread(tsk, t) {
+ +		task_cputime(t, &utime, &stime);
+ +		times->utime += utime;
+ +		times->stime += stime;
+ +		times->sum_exec_runtime += task_sched_runtime(t);
+ +	}
+++=======
++ 	unsigned int seq, nextseq;
++ 	unsigned long flags;
++ 
++ 	rcu_read_lock();
++ 	/* Attempt a lockless read on the first round. */
++ 	nextseq = 0;
++ 	do {
++ 		seq = nextseq;
++ 		flags = read_seqbegin_or_lock_irqsave(&sig->stats_lock, &seq);
++ 		times->utime = sig->utime;
++ 		times->stime = sig->stime;
++ 		times->sum_exec_runtime = sig->sum_sched_runtime;
++ 
++ 		for_each_thread(tsk, t) {
++ 			task_cputime(t, &utime, &stime);
++ 			times->utime += utime;
++ 			times->stime += stime;
++ 			times->sum_exec_runtime += task_sched_runtime(t);
++ 		}
++ 		/* If lockless access failed, take the lock. */
++ 		nextseq = 1;
++ 	} while (need_seqretry(&sig->stats_lock, seq));
++ 	done_seqretry_irqrestore(&sig->stats_lock, seq, flags);
+++>>>>>>> 9c368b5b6ecc (sched, time: Fix lock inversion in thread_group_cputime())
+  	rcu_read_unlock();
+  }
+  
+* Unmerged path kernel/sched/cputime.c
