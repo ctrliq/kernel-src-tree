@@ -522,6 +522,8 @@ static int aac_slave_configure(struct scsi_device *sdev)
 	} else
 		scsi_adjust_queue_depth(sdev, 0, 1);
 
+		sdev->tagged_supported = 1;
+
 	return 0;
 }
 
