@@ -1,0 +1,232 @@
+context_tracking: Rename context symbols to prepare for transition state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit c467ea763fd5d8795b7d1b5a78eb94b6ad8f66ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c467ea76.failed
+
+Current context tracking symbols are designed to express living state.
+As such they are prefixed with "IN_": IN_USER, IN_KERNEL.
+
+Now we are going to use these symbols to also express state transitions
+such as context_tracking_enter(IN_USER) or context_tracking_exit(IN_USER).
+But while the "IN_" prefix works well to express entering a context, it's
+confusing to depict a context exit: context_tracking_exit(IN_USER)
+could mean two things:
+	1) We are exiting the current context to enter user context.
+	2) We are exiting the user context
+We want 2) but the reviewer may be confused and understand 1)
+
+So lets disambiguate these symbols and rename them to CONTEXT_USER and
+CONTEXT_KERNEL.
+
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Will deacon <will.deacon@arm.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Luiz Capitulino <lcapitulino@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+(cherry picked from commit c467ea763fd5d8795b7d1b5a78eb94b6ad8f66ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 9823443df079,756f74eed35d..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -102,10 -105,92 +102,96 @@@ static inline void preempt_conditional_
+  {
+  	if (regs->flags & X86_EFLAGS_IF)
+  		local_irq_disable();
+ -	preempt_count_dec();
+ +	dec_preempt_count();
+  }
+  
+++<<<<<<< HEAD
+ +static int __kprobes
+++=======
++ enum ctx_state ist_enter(struct pt_regs *regs)
++ {
++ 	enum ctx_state prev_state;
++ 
++ 	if (user_mode_vm(regs)) {
++ 		/* Other than that, we're just an exception. */
++ 		prev_state = exception_enter();
++ 	} else {
++ 		/*
++ 		 * We might have interrupted pretty much anything.  In
++ 		 * fact, if we're a machine check, we can even interrupt
++ 		 * NMI processing.  We don't want in_nmi() to return true,
++ 		 * but we need to notify RCU.
++ 		 */
++ 		rcu_nmi_enter();
++ 		prev_state = CONTEXT_KERNEL;  /* the value is irrelevant. */
++ 	}
++ 
++ 	/*
++ 	 * We are atomic because we're on the IST stack (or we're on x86_32,
++ 	 * in which case we still shouldn't schedule).
++ 	 *
++ 	 * This must be after exception_enter(), because exception_enter()
++ 	 * won't do anything if in_interrupt() returns true.
++ 	 */
++ 	preempt_count_add(HARDIRQ_OFFSET);
++ 
++ 	/* This code is a bit fragile.  Test it. */
++ 	rcu_lockdep_assert(rcu_is_watching(), "ist_enter didn't work");
++ 
++ 	return prev_state;
++ }
++ 
++ void ist_exit(struct pt_regs *regs, enum ctx_state prev_state)
++ {
++ 	/* Must be before exception_exit. */
++ 	preempt_count_sub(HARDIRQ_OFFSET);
++ 
++ 	if (user_mode_vm(regs))
++ 		return exception_exit(prev_state);
++ 	else
++ 		rcu_nmi_exit();
++ }
++ 
++ /**
++  * ist_begin_non_atomic() - begin a non-atomic section in an IST exception
++  * @regs:	regs passed to the IST exception handler
++  *
++  * IST exception handlers normally cannot schedule.  As a special
++  * exception, if the exception interrupted userspace code (i.e.
++  * user_mode_vm(regs) would return true) and the exception was not
++  * a double fault, it can be safe to schedule.  ist_begin_non_atomic()
++  * begins a non-atomic section within an ist_enter()/ist_exit() region.
++  * Callers are responsible for enabling interrupts themselves inside
++  * the non-atomic section, and callers must call is_end_non_atomic()
++  * before ist_exit().
++  */
++ void ist_begin_non_atomic(struct pt_regs *regs)
++ {
++ 	BUG_ON(!user_mode_vm(regs));
++ 
++ 	/*
++ 	 * Sanity check: we need to be on the normal thread stack.  This
++ 	 * will catch asm bugs and any attempt to use ist_preempt_enable
++ 	 * from double_fault.
++ 	 */
++ 	BUG_ON(((current_stack_pointer() ^ this_cpu_read_stable(kernel_stack))
++ 		& ~(THREAD_SIZE - 1)) != 0);
++ 
++ 	preempt_count_sub(HARDIRQ_OFFSET);
++ }
++ 
++ /**
++  * ist_end_non_atomic() - begin a non-atomic section in an IST exception
++  *
++  * Ends a non-atomic section started with ist_begin_non_atomic().
++  */
++ void ist_end_non_atomic(void)
++ {
++ 	preempt_count_add(HARDIRQ_OFFSET);
++ }
++ 
++ static nokprobe_inline int
+++>>>>>>> c467ea763fd5 (context_tracking: Rename context symbols to prepare for transition state)
+  do_trap_no_signal(struct task_struct *tsk, int trapnr, char *str,
+  		  struct pt_regs *regs,	long error_code)
+  {
+* Unmerged path arch/x86/kernel/traps.c
+diff --git a/include/linux/context_tracking.h b/include/linux/context_tracking.h
+index 37b81bd51ec0..427b056dfd3d 100644
+--- a/include/linux/context_tracking.h
++++ b/include/linux/context_tracking.h
+@@ -43,7 +43,7 @@ static inline enum ctx_state exception_enter(void)
+ static inline void exception_exit(enum ctx_state prev_ctx)
+ {
+ 	if (context_tracking_is_enabled()) {
+-		if (prev_ctx == IN_USER)
++		if (prev_ctx == CONTEXT_USER)
+ 			context_tracking_user_enter();
+ 	}
+ }
+diff --git a/include/linux/context_tracking_state.h b/include/linux/context_tracking_state.h
+index 97a81225d037..8076f875c324 100644
+--- a/include/linux/context_tracking_state.h
++++ b/include/linux/context_tracking_state.h
+@@ -13,8 +13,8 @@ struct context_tracking {
+ 	 */
+ 	bool active;
+ 	enum ctx_state {
+-		IN_KERNEL = 0,
+-		IN_USER,
++		CONTEXT_KERNEL = 0,
++		CONTEXT_USER,
+ 	} state;
+ };
+ 
+@@ -34,7 +34,7 @@ static inline bool context_tracking_cpu_is_enabled(void)
+ 
+ static inline bool context_tracking_in_user(void)
+ {
+-	return __this_cpu_read(context_tracking.state) == IN_USER;
++	return __this_cpu_read(context_tracking.state) == CONTEXT_USER;
+ }
+ #else
+ static inline bool context_tracking_in_user(void) { return false; }
+diff --git a/kernel/context_tracking.c b/kernel/context_tracking.c
+index 11048177d17e..c5315fca21be 100644
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@ -74,7 +74,7 @@ void context_tracking_user_enter(void)
+ 	WARN_ON_ONCE(!current->mm);
+ 
+ 	local_irq_save(flags);
+-	if ( __this_cpu_read(context_tracking.state) != IN_USER) {
++	if ( __this_cpu_read(context_tracking.state) != CONTEXT_USER) {
+ 		if (__this_cpu_read(context_tracking.active)) {
+ 			trace_user_enter(0);
+ 			/*
+@@ -100,7 +100,7 @@ void context_tracking_user_enter(void)
+ 		 * OTOH we can spare the calls to vtime and RCU when context_tracking.active
+ 		 * is false because we know that CPU is not tickless.
+ 		 */
+-		__this_cpu_write(context_tracking.state, IN_USER);
++		__this_cpu_write(context_tracking.state, CONTEXT_USER);
+ 	}
+ 	local_irq_restore(flags);
+ }
+@@ -167,7 +167,7 @@ void context_tracking_user_exit(void)
+ 		return;
+ 
+ 	local_irq_save(flags);
+-	if (__this_cpu_read(context_tracking.state) == IN_USER) {
++	if (__this_cpu_read(context_tracking.state) == CONTEXT_USER) {
+ 		if (__this_cpu_read(context_tracking.active)) {
+ 			/*
+ 			 * We are going to run code that may use RCU. Inform
+@@ -177,7 +177,7 @@ void context_tracking_user_exit(void)
+ 			vtime_user_exit(current);
+ 			trace_user_exit(0);
+ 		}
+-		__this_cpu_write(context_tracking.state, IN_KERNEL);
++		__this_cpu_write(context_tracking.state, CONTEXT_KERNEL);
+ 	}
+ 	local_irq_restore(flags);
+ }
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 104ddc5bd4aa..4c4160ec0fcf 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3268,7 +3268,7 @@ asmlinkage void __sched schedule_user(void)
+ 	 * we find a better solution.
+ 	 *
+ 	 * NB: There are buggy callers of this function.  Ideally we
+-	 * should warn if prev_state != IN_USER, but that will trigger
++	 * should warn if prev_state != CONTEXT_USER, but that will trigger
+ 	 * too frequently to make sense yet.
+ 	 */
+ 	enum ctx_state prev_state = exception_enter();
