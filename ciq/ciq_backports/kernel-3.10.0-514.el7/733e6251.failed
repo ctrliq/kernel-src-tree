@@ -1,0 +1,206 @@
+ACPI: Allow drivers to match using Device Tree compatible property
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 733e625139fe455b4d910ac63c18c90f7cbe2d6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/733e6251.failed
+
+We have lots of existing Device Tree enabled drivers and allocating
+separate _HID for each is not feasible. Instead we allocate special _HID
+"PRP0001" that means that the match should be done using Device Tree
+compatible property using driver's .of_match_table instead if the driver
+is missing .acpi_match_table.
+
+If there is a need to distinguish from where the device is enumerated
+(DT/ACPI) driver can check dev->of_node or ACPI_COMPATION(dev).
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Grant Likely <grant.likely@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 733e625139fe455b4d910ac63c18c90f7cbe2d6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/scan.c
+#	include/linux/acpi.h
+diff --cc drivers/acpi/scan.c
+index b64d638cf134,3a8f66444532..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -126,17 -124,56 +126,67 @@@ static int create_modalias(struct acpi_
+  	if (list_empty(&acpi_dev->pnp.ids))
+  		return 0;
+  
+- 	len = snprintf(modalias, size, "acpi:");
+- 	size -= len;
++ 	/*
++ 	 * If the device has PRP0001 we expose DT compatible modalias
++ 	 * instead in form of of:NnameTCcompatible.
++ 	 */
++ 	if (acpi_dev->data.of_compatible) {
++ 		struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
++ 		const union acpi_object *of_compatible, *obj;
++ 		int i, nval;
++ 		char *c;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(id, &acpi_dev->pnp.ids, list) {
+ +		count = snprintf(&modalias[len], size, "%s:", id->id);
+ +		if (count < 0)
+ +			return EINVAL;
+ +		if (count >= size)
+ +			return -ENOMEM;
+ +		len += count;
+ +		size -= count;
+++=======
++ 		acpi_get_name(acpi_dev->handle, ACPI_SINGLE_NAME, &buf);
++ 		/* DT strings are all in lower case */
++ 		for (c = buf.pointer; *c != '\0'; c++)
++ 			*c = tolower(*c);
++ 
++ 		len = snprintf(modalias, size, "of:N%sT", (char *)buf.pointer);
++ 		ACPI_FREE(buf.pointer);
++ 
++ 		of_compatible = acpi_dev->data.of_compatible;
++ 		if (of_compatible->type == ACPI_TYPE_PACKAGE) {
++ 			nval = of_compatible->package.count;
++ 			obj = of_compatible->package.elements;
++ 		} else { /* Must be ACPI_TYPE_STRING. */
++ 			nval = 1;
++ 			obj = of_compatible;
++ 		}
++ 		for (i = 0; i < nval; i++, obj++) {
++ 			count = snprintf(&modalias[len], size, "C%s",
++ 					 obj->string.pointer);
++ 			if (count < 0)
++ 				return -EINVAL;
++ 			if (count >= size)
++ 				return -ENOMEM;
++ 
++ 			len += count;
++ 			size -= count;
++ 		}
++ 	} else {
++ 		len = snprintf(modalias, size, "acpi:");
++ 		size -= len;
++ 
++ 		list_for_each_entry(id, &acpi_dev->pnp.ids, list) {
++ 			count = snprintf(&modalias[len], size, "%s:", id->id);
++ 			if (count < 0)
++ 				return -EINVAL;
++ 			if (count >= size)
++ 				return -ENOMEM;
++ 			len += count;
++ 			size -= count;
++ 		}
+++>>>>>>> 733e625139fe (ACPI: Allow drivers to match using Device Tree compatible property)
+  	}
+  
+  	modalias[len] = '\0';
+diff --cc include/linux/acpi.h
+index 364918faf44f,38296d686c55..000000000000
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@@ -410,12 -424,12 +410,21 @@@ extern int acpi_nvs_for_each_region(in
+  const struct acpi_device_id *acpi_match_device(const struct acpi_device_id *ids,
+  					       const struct device *dev);
+  
+++<<<<<<< HEAD
+ +static inline bool acpi_driver_match_device(struct device *dev,
+ +					    const struct device_driver *drv)
+ +{
+ +	return !!acpi_match_device(drv->acpi_match_table, dev);
+ +}
+ +
+++=======
++ extern bool acpi_driver_match_device(struct device *dev,
++ 				     const struct device_driver *drv);
++ int acpi_device_uevent_modalias(struct device *, struct kobj_uevent_env *);
++ int acpi_device_modalias(struct device *, char *, int);
++ 
++ struct platform_device *acpi_create_platform_device(struct acpi_device *);
+++>>>>>>> 733e625139fe (ACPI: Allow drivers to match using Device Tree compatible property)
+  #define ACPI_PTR(_ptr)	(_ptr)
+  
+  #else	/* !CONFIG_ACPI */
+diff --git a/drivers/acpi/property.c b/drivers/acpi/property.c
+index 2541b1fd1fa5..27add91bc270 100644
+--- a/drivers/acpi/property.c
++++ b/drivers/acpi/property.c
+@@ -76,6 +76,42 @@ static bool acpi_properties_format_valid(const union acpi_object *properties)
+ 	return true;
+ }
+ 
++static void acpi_init_of_compatible(struct acpi_device *adev)
++{
++	const union acpi_object *of_compatible;
++	struct acpi_hardware_id *hwid;
++	bool acpi_of = false;
++	int ret;
++
++	/*
++	 * Check if the special PRP0001 ACPI ID is present and in that
++	 * case we fill in Device Tree compatible properties for this
++	 * device.
++	 */
++	list_for_each_entry(hwid, &adev->pnp.ids, list) {
++		if (!strcmp(hwid->id, "PRP0001")) {
++			acpi_of = true;
++			break;
++		}
++	}
++
++	if (!acpi_of)
++		return;
++
++	ret = acpi_dev_get_property_array(adev, "compatible", ACPI_TYPE_STRING,
++					  &of_compatible);
++	if (ret) {
++		ret = acpi_dev_get_property(adev, "compatible",
++					    ACPI_TYPE_STRING, &of_compatible);
++		if (ret) {
++			acpi_handle_warn(adev->handle,
++					 "PRP0001 requires compatible property\n");
++			return;
++		}
++	}
++	adev->data.of_compatible = of_compatible;
++}
++
+ void acpi_init_properties(struct acpi_device *adev)
+ {
+ 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
+@@ -119,6 +155,8 @@ void acpi_init_properties(struct acpi_device *adev)
+ 
+ 		adev->data.pointer = buf.pointer;
+ 		adev->data.properties = properties;
++
++		acpi_init_of_compatible(adev);
+ 		return;
+ 	}
+ 
+@@ -130,6 +168,7 @@ void acpi_init_properties(struct acpi_device *adev)
+ void acpi_free_properties(struct acpi_device *adev)
+ {
+ 	ACPI_FREE((void *)adev->data.pointer);
++	adev->data.of_compatible = NULL;
+ 	adev->data.pointer = NULL;
+ 	adev->data.properties = NULL;
+ }
+* Unmerged path drivers/acpi/scan.c
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 8bcd3caab412..3d859b4d1052 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -333,6 +333,7 @@ struct acpi_device_physical_node {
+ struct acpi_device_data {
+ 	const union acpi_object *pointer;
+ 	const union acpi_object *properties;
++	const union acpi_object *of_compatible;
+ };
+ 
+ /* Device */
+* Unmerged path include/linux/acpi.h
