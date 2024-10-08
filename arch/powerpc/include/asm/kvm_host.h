@@ -617,7 +617,7 @@ struct kvm_vcpu_arch {
 	gva_t vaddr_accessed;
 
 	u8 io_gpr; /* GPR used as IO source/target */
-	u8 mmio_is_bigendian;
+	u8 mmio_host_swabbed;
 	u8 mmio_sign_extend;
 	u8 dcr_needed;
 	u8 dcr_is_write;
