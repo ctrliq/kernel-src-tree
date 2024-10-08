@@ -1,0 +1,140 @@
+GFS2: journal data writepages update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 774016b2d455017935b3e318b6cc4e055e9dd47f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/774016b2.failed
+
+GFS2 has carried what is more or less a copy of the
+write_cache_pages() for some time. It seems that this
+copy has slipped behind the core code over time. This
+patch brings it back uptodate, and in addition adds the
+tracepoint which would otherwise be missing.
+
+We could go further, and eliminate some or all of the
+code duplication here. The issue is that if we do that,
+then the function we need to split out from the existing
+write_cache_pages(), which will look a lot like
+gfs2_jdata_write_pagevec(), would land up putting quite a
+lot of extra variables on the stack. I know that has been
+a problem in the past in the writeback code path, which
+is why I've hesitated to do it here.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit 774016b2d455017935b3e318b6cc4e055e9dd47f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/aops.c
+diff --cc fs/gfs2/aops.c
+index 08349007eaf9,ce62dcac90b6..000000000000
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@@ -282,32 -273,57 +300,66 @@@ continue_unlock
+  			continue;
+  		}
+  
+- 		if (!wbc->range_cyclic && page->index > end) {
+- 			ret = 1;
+- 			unlock_page(page);
+- 			continue;
++ 		if (!PageDirty(page)) {
++ 			/* someone wrote it for us */
++ 			goto continue_unlock;
+  		}
+  
+- 		if (wbc->sync_mode != WB_SYNC_NONE)
+- 			wait_on_page_writeback(page);
+- 
+- 		if (PageWriteback(page) ||
+- 		    !clear_page_dirty_for_io(page)) {
+- 			unlock_page(page);
+- 			continue;
++ 		if (PageWriteback(page)) {
++ 			if (wbc->sync_mode != WB_SYNC_NONE)
++ 				wait_on_page_writeback(page);
++ 			else
++ 				goto continue_unlock;
+  		}
+  
+++<<<<<<< HEAD
+ +		/* Is the page fully outside i_size? (truncate in progress) */
+ +		if (page->index > end_index || (page->index == end_index && !offset)) {
+ +			page->mapping->a_ops->invalidatepage(page, 0);
+ +			unlock_page(page);
+ +			continue;
+ +		}
+++=======
++ 		BUG_ON(PageWriteback(page));
++ 		if (!clear_page_dirty_for_io(page))
++ 			goto continue_unlock;
++ 
++ 		trace_wbc_writepage(wbc, mapping->backing_dev_info);
+++>>>>>>> 774016b2d455 (GFS2: journal data writepages update)
+  
+  		ret = __gfs2_jdata_writepage(page, wbc);
++ 		if (unlikely(ret)) {
++ 			if (ret == AOP_WRITEPAGE_ACTIVATE) {
++ 				unlock_page(page);
++ 				ret = 0;
++ 			} else {
++ 
++ 				/*
++ 				 * done_index is set past this page,
++ 				 * so media errors will not choke
++ 				 * background writeout for the entire
++ 				 * file. This has consequences for
++ 				 * range_cyclic semantics (ie. it may
++ 				 * not be suitable for data integrity
++ 				 * writeout).
++ 				 */
++ 				*done_index = page->index + 1;
++ 				ret = 1;
++ 				break;
++ 			}
++ 		}
+  
+- 		if (ret || (--(wbc->nr_to_write) <= 0))
++ 		/*
++ 		 * We stop writing back only if we are not doing
++ 		 * integrity sync. In case of integrity sync we have to
++ 		 * keep going until we have written all the pages
++ 		 * we tagged for writeback prior to entering this loop.
++ 		 */
++ 		if (--wbc->nr_to_write <= 0 && wbc->sync_mode == WB_SYNC_NONE) {
+  			ret = 1;
++ 			break;
++ 		}
++ 
+  	}
+  	gfs2_trans_end(sdp);
+  	return ret;
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index af736d937980..2f9da45b99e5 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -93,6 +93,8 @@ static inline struct inode *wb_inode(struct list_head *head)
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/writeback.h>
+ 
++EXPORT_TRACEPOINT_SYMBOL_GPL(wbc_writepage);
++
+ static void bdi_queue_work(struct backing_dev_info *bdi,
+ 			   struct wb_writeback_work *work)
+ {
+* Unmerged path fs/gfs2/aops.c
+diff --git a/include/trace/events/writeback.h b/include/trace/events/writeback.h
+index c7bbbe794e65..309a086e2a0b 100644
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@ -4,6 +4,7 @@
+ #if !defined(_TRACE_WRITEBACK_H) || defined(TRACE_HEADER_MULTI_READ)
+ #define _TRACE_WRITEBACK_H
+ 
++#include <linux/tracepoint.h>
+ #include <linux/backing-dev.h>
+ #include <linux/writeback.h>
+ 
