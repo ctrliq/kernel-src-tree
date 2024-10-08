@@ -1,0 +1,205 @@
+KVM: x86: replace vm_has_apicv hook with cpu_uses_apicv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit d50ab6c1a2b24e12d3012d7beb343eba5b94a6ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d50ab6c1.failed
+
+This will avoid an unnecessary trip to ->kvm and from there to the VPIC.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d50ab6c1a2b24e12d3012d7beb343eba5b94a6ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 843549a0fe2a,b8a90c4f676f..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -811,6 -808,9 +811,12 @@@ static u64 construct_eptp(unsigned lon
+  static void kvm_cpu_vmxon(u64 addr);
+  static void kvm_cpu_vmxoff(void);
+  static bool vmx_mpx_supported(void);
+++<<<<<<< HEAD
+++=======
++ static bool vmx_xsaves_supported(void);
++ static int vmx_vm_has_apicv(struct kvm *kvm);
++ static int vmx_cpu_uses_apicv(struct kvm_vcpu *vcpu);
+++>>>>>>> d50ab6c1a2b2 (KVM: x86: replace vm_has_apicv hook with cpu_uses_apicv)
+  static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr);
+  static void vmx_set_segment(struct kvm_vcpu *vcpu,
+  			    struct kvm_segment *var, int seg);
+@@@ -4236,6 -4338,79 +4242,82 @@@ static int vmx_vm_has_apicv(struct kvm 
+  	return enable_apicv && irqchip_in_kernel(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vmx_cpu_uses_apicv(struct kvm_vcpu *vcpu)
++ {
++ 	return vmx_vm_has_apicv(vcpu->kvm);
++ }
++ 
++ static int vmx_complete_nested_posted_interrupt(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	int max_irr;
++ 	void *vapic_page;
++ 	u16 status;
++ 
++ 	if (vmx->nested.pi_desc &&
++ 	    vmx->nested.pi_pending) {
++ 		vmx->nested.pi_pending = false;
++ 		if (!pi_test_and_clear_on(vmx->nested.pi_desc))
++ 			return 0;
++ 
++ 		max_irr = find_last_bit(
++ 			(unsigned long *)vmx->nested.pi_desc->pir, 256);
++ 
++ 		if (max_irr == 256)
++ 			return 0;
++ 
++ 		vapic_page = kmap(vmx->nested.virtual_apic_page);
++ 		if (!vapic_page) {
++ 			WARN_ON(1);
++ 			return -ENOMEM;
++ 		}
++ 		__kvm_apic_update_irr(vmx->nested.pi_desc->pir, vapic_page);
++ 		kunmap(vmx->nested.virtual_apic_page);
++ 
++ 		status = vmcs_read16(GUEST_INTR_STATUS);
++ 		if ((u8)max_irr > ((u8)status & 0xff)) {
++ 			status &= ~0xff;
++ 			status |= (u8)max_irr;
++ 			vmcs_write16(GUEST_INTR_STATUS, status);
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu)
++ {
++ #ifdef CONFIG_SMP
++ 	if (vcpu->mode == IN_GUEST_MODE) {
++ 		apic->send_IPI_mask(get_cpu_mask(vcpu->cpu),
++ 				POSTED_INTR_VECTOR);
++ 		return true;
++ 	}
++ #endif
++ 	return false;
++ }
++ 
++ static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
++ 						int vector)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (is_guest_mode(vcpu) &&
++ 	    vector == vmx->nested.posted_intr_nv) {
++ 		/* the PIR and ON have been set by L1. */
++ 		kvm_vcpu_trigger_posted_interrupt(vcpu);
++ 		/*
++ 		 * If a posted intr is not recognized by hardware,
++ 		 * we will accomplish it in the next vmentry.
++ 		 */
++ 		vmx->nested.pi_pending = true;
++ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
++ 		return 0;
++ 	}
++ 	return -1;
++ }
+++>>>>>>> d50ab6c1a2b2 (KVM: x86: replace vm_has_apicv hook with cpu_uses_apicv)
+  /*
+   * Send interrupt to vcpu via posted interrupt way.
+   * 1. If target vcpu is running(non-root mode), send posted interrupt
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5d383a89c9d4..8553165d1731 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -792,7 +792,7 @@ struct kvm_x86_ops {
+ 	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+ 	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
+ 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
+-	int (*vm_has_apicv)(struct kvm *kvm);
++	int (*cpu_uses_apicv)(struct kvm_vcpu *vcpu);
+ 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+ 	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
+ 	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index a1ec6a50a05a..c0dad893dc59 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -63,7 +63,7 @@ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
+ 	if (kvm_cpu_has_extint(v))
+ 		return 1;
+ 
+-	if (kvm_apic_vid_enabled(v->kvm))
++	if (kvm_vcpu_apic_vid_enabled(v))
+ 		return 0;
+ 
+ 	return kvm_apic_has_interrupt(v) != -1; /* LAPIC */
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1ea3691b454e..035f53f5cedb 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -385,7 +385,7 @@ static inline void apic_clear_irr(int vec, struct kvm_lapic *apic)
+ 
+ 	vcpu = apic->vcpu;
+ 
+-	if (unlikely(kvm_apic_vid_enabled(vcpu->kvm))) {
++	if (unlikely(kvm_vcpu_apic_vid_enabled(vcpu))) {
+ 		/* try to update RVI */
+ 		apic_clear_vector(vec, apic->regs + APIC_IRR);
+ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+@@ -1709,7 +1709,7 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu)
+ 		apic_set_reg(apic, APIC_ISR + 0x10 * i, 0);
+ 		apic_set_reg(apic, APIC_TMR + 0x10 * i, 0);
+ 	}
+-	apic->irr_pending = kvm_apic_vid_enabled(vcpu->kvm);
++	apic->irr_pending = kvm_vcpu_apic_vid_enabled(vcpu);
+ 	apic->isr_count = kvm_x86_ops->hwapic_isr_update ? 1 : 0;
+ 	apic->highest_isr_cache = -1;
+ 	update_divide_count(apic);
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index e5b0fff82952..ed032c0b85a6 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -143,9 +143,9 @@ static inline int apic_x2apic_mode(struct kvm_lapic *apic)
+ 	return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
+ }
+ 
+-static inline bool kvm_apic_vid_enabled(struct kvm *kvm)
++static inline bool kvm_vcpu_apic_vid_enabled(struct kvm_vcpu *vcpu)
+ {
+-	return kvm_x86_ops->vm_has_apicv(kvm);
++	return kvm_x86_ops->cpu_uses_apicv(vcpu);
+ }
+ 
+ static inline bool kvm_apic_has_events(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index f4d872b9eba6..125e9a9f38a7 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3650,7 +3650,7 @@ static void svm_set_virtual_x2apic_mode(struct kvm_vcpu *vcpu, bool set)
+ 	return;
+ }
+ 
+-static int svm_vm_has_apicv(struct kvm *kvm)
++static int svm_cpu_uses_apicv(struct kvm_vcpu *vcpu)
+ {
+ 	return 0;
+ }
+@@ -4411,7 +4411,7 @@ static struct kvm_x86_ops svm_x86_ops = {
+ 	.enable_irq_window = enable_irq_window,
+ 	.update_cr8_intercept = update_cr8_intercept,
+ 	.set_virtual_x2apic_mode = svm_set_virtual_x2apic_mode,
+-	.vm_has_apicv = svm_vm_has_apicv,
++	.cpu_uses_apicv = svm_cpu_uses_apicv,
+ 	.load_eoi_exitmap = svm_load_eoi_exitmap,
+ 	.sync_pir_to_irr = svm_sync_pir_to_irr,
+ 
+* Unmerged path arch/x86/kvm/vmx.c
