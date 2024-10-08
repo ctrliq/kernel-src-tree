@@ -1,0 +1,381 @@
+ovl: do operations on underlying file system in mounter's context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 1175b6b8d96331676f1d436b089b965807f23b4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1175b6b8.failed
+
+Given we are now doing checks both on overlay inode as well underlying
+inode, we should be able to do checks and operations on underlying file
+system using mounter's context.
+
+So modify all operations to do checks/operations on underlying dentry/inode
+in the context of mounter.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 1175b6b8d96331676f1d436b089b965807f23b4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index cec7c3f64b1e,5becbaf1cec7..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -44,19 -41,61 +44,43 @@@ int ovl_setattr(struct dentry *dentry, 
+  {
+  	int err;
+  	struct dentry *upperdentry;
++ 	const struct cred *old_cred;
+  
+ -	/*
+ -	 * Check for permissions before trying to copy-up.  This is redundant
+ -	 * since it will be rechecked later by ->setattr() on upper dentry.  But
+ -	 * without this, copy-up can be triggered by just about anybody.
+ -	 *
+ -	 * We don't initialize inode->size, which just means that
+ -	 * inode_newsize_ok() will always check against MAX_LFS_FILESIZE and not
+ -	 * check for a swapfile (which this won't be anyway).
+ -	 */
+ -	err = inode_change_ok(dentry->d_inode, attr);
+ -	if (err)
+ -		return err;
+ -
+  	err = ovl_want_write(dentry);
+  	if (err)
+  		goto out;
+  
+ -	if (attr->ia_valid & ATTR_SIZE) {
+ -		struct inode *realinode = d_inode(ovl_dentry_real(dentry));
+ -
+ -		err = -ETXTBSY;
+ -		if (atomic_read(&realinode->i_writecount) < 0)
+ -			goto out_drop_write;
+ -	}
+ -
+  	err = ovl_copy_up(dentry);
+  	if (!err) {
+ -		struct inode *winode = NULL;
+ -
+  		upperdentry = ovl_dentry_upper(dentry);
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&upperdentry->d_inode->i_mutex);
+ +		err = notify_change(upperdentry, attr, NULL);
+ +		mutex_unlock(&upperdentry->d_inode->i_mutex);
+++=======
++ 		if (attr->ia_valid & ATTR_SIZE) {
++ 			winode = d_inode(upperdentry);
++ 			err = get_write_access(winode);
++ 			if (err)
++ 				goto out_drop_write;
++ 		}
++ 
++ 		if (attr->ia_valid & (ATTR_KILL_SUID|ATTR_KILL_SGID))
++ 			attr->ia_valid &= ~ATTR_MODE;
++ 
++ 		inode_lock(upperdentry->d_inode);
++ 		old_cred = ovl_override_creds(dentry->d_sb);
++ 		err = notify_change(upperdentry, attr, NULL);
++ 		revert_creds(old_cred);
++ 		if (!err)
++ 			ovl_copyattr(upperdentry->d_inode, dentry->d_inode);
++ 		inode_unlock(upperdentry->d_inode);
++ 
++ 		if (winode)
++ 			put_write_access(winode);
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  	}
+ -out_drop_write:
+  	ovl_drop_write(dentry);
+  out:
+  	return err;
+@@@ -159,55 -190,28 +188,70 @@@ out_dput
+  	return err;
+  }
+  
+ -static const char *ovl_get_link(struct dentry *dentry,
+ -				struct inode *inode,
+ -				struct delayed_call *done)
+ +
+ +struct ovl_link_data {
+ +	struct dentry *realdentry;
+ +	void *cookie;
+ +};
+ +
+ +static void *ovl_follow_link(struct dentry *dentry, struct nameidata *nd)
+  {
+ +	void *ret;
+  	struct dentry *realdentry;
+  	struct inode *realinode;
+++<<<<<<< HEAD
+ +	struct ovl_link_data *data = NULL;
+++=======
++ 	const struct cred *old_cred;
++ 	const char *p;
++ 
++ 	if (!dentry)
++ 		return ERR_PTR(-ECHILD);
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  
+  	realdentry = ovl_dentry_real(dentry);
+  	realinode = realdentry->d_inode;
+  
+ -	if (WARN_ON(!realinode->i_op->get_link))
+ +	if (WARN_ON(!realinode->i_op->follow_link))
+  		return ERR_PTR(-EPERM);
+  
+++<<<<<<< HEAD
+ +	if (realinode->i_op->put_link) {
+ +		data = kmalloc(sizeof(struct ovl_link_data), GFP_KERNEL);
+ +		if (!data)
+ +			return ERR_PTR(-ENOMEM);
+ +		data->realdentry = realdentry;
+ +	}
+ +
+ +	ret = realinode->i_op->follow_link(realdentry, nd);
+ +	if (IS_ERR(ret)) {
+ +		kfree(data);
+ +		return ret;
+ +	}
+ +
+ +	if (data)
+ +		data->cookie = ret;
+ +
+ +	return data;
+ +}
+ +
+ +static void ovl_put_link(struct dentry *dentry, struct nameidata *nd, void *c)
+ +{
+ +	struct inode *realinode;
+ +	struct ovl_link_data *data = c;
+ +
+ +	if (!data)
+ +		return;
+ +
+ +	realinode = data->realdentry->d_inode;
+ +	realinode->i_op->put_link(data->realdentry, nd, data->cookie);
+ +	kfree(data);
+++=======
++ 	old_cred = ovl_override_creds(dentry->d_sb);
++ 	p = realinode->i_op->get_link(realdentry, realinode, done);
++ 	revert_creds(old_cred);
++ 	return p;
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  }
+  
+  static int ovl_readlink(struct dentry *dentry, char __user *buf, int bufsiz)
+@@@ -259,35 -271,32 +310,55 @@@ out
+  	return err;
+  }
+  
+ -ssize_t ovl_getxattr(struct dentry *dentry, struct inode *inode,
+ -		     const char *name, void *value, size_t size)
+ +static bool ovl_need_xattr_filter(struct dentry *dentry,
+ +				  enum ovl_path_type type)
+  {
+++<<<<<<< HEAD
+ +	if ((type & (__OVL_PATH_PURE | __OVL_PATH_UPPER)) == __OVL_PATH_UPPER)
+ +		return S_ISDIR(dentry->d_inode->i_mode);
+ +	else
+ +		return false;
+ +}
+++=======
++ 	struct dentry *realdentry = ovl_dentry_real(dentry);
++ 	ssize_t res;
++ 	const struct cred *old_cred;
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  
+ -	if (ovl_is_private_xattr(name))
+ +ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+ +		     void *value, size_t size)
+ +{
+ +	struct path realpath;
+ +	enum ovl_path_type type = ovl_path_real(dentry, &realpath);
+ +
+ +	if (ovl_need_xattr_filter(dentry, type) && ovl_is_private_xattr(name))
+  		return -ENODATA;
+  
+++<<<<<<< HEAD
+ +	return vfs_getxattr(realpath.dentry, name, value, size);
+++=======
++ 	old_cred = ovl_override_creds(dentry->d_sb);
++ 	res = vfs_getxattr(realdentry, name, value, size);
++ 	revert_creds(old_cred);
++ 	return res;
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  }
+  
+  ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size)
+  {
+ -	struct dentry *realdentry = ovl_dentry_real(dentry);
+ +	struct path realpath;
+ +	enum ovl_path_type type = ovl_path_real(dentry, &realpath);
+  	ssize_t res;
+  	int off;
++ 	const struct cred *old_cred;
+  
+++<<<<<<< HEAD
+ +	res = vfs_listxattr(realpath.dentry, list, size);
+++=======
++ 	old_cred = ovl_override_creds(dentry->d_sb);
++ 	res = vfs_listxattr(realdentry, list, size);
++ 	revert_creds(old_cred);
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  	if (res <= 0 || size == 0)
+  		return res;
+  
+@@@ -345,6 -354,25 +419,28 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct posix_acl *ovl_get_acl(struct inode *inode, int type)
++ {
++ 	struct inode *realinode = ovl_inode_real(inode);
++ 	const struct cred *old_cred;
++ 	struct posix_acl *acl;
++ 
++ 	if (!IS_POSIXACL(realinode))
++ 		return NULL;
++ 
++ 	if (!realinode->i_op->get_acl)
++ 		return NULL;
++ 
++ 	old_cred = ovl_override_creds(inode->i_sb);
++ 	acl = realinode->i_op->get_acl(realinode, type);
++ 	revert_creds(old_cred);
++ 
++ 	return acl;
++ }
++ 
+++>>>>>>> 1175b6b8d963 (ovl: do operations on underlying file system in mounter's context)
+  static bool ovl_open_need_copy_up(int flags, enum ovl_path_type type,
+  				  struct dentry *realdentry)
+  {
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index a1caf19083f8..f05bc9e3a623 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -138,9 +138,12 @@ static int ovl_dir_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ 	int err;
+ 	enum ovl_path_type type;
+ 	struct path realpath;
++	const struct cred *old_cred;
+ 
+ 	type = ovl_path_real(dentry, &realpath);
++	old_cred = ovl_override_creds(dentry->d_sb);
+ 	err = vfs_getattr(&realpath, stat);
++	revert_creds(old_cred);
+ 	if (err)
+ 		return err;
+ 
+@@ -391,6 +394,8 @@ static int ovl_create_or_link(struct dentry *dentry, int mode, dev_t rdev,
+ {
+ 	int err;
+ 	struct inode *inode;
++	const struct cred *old_cred;
++	struct cred *override_cred;
+ 	struct kstat stat = {
+ 		.mode = mode,
+ 		.rdev = rdev,
+@@ -405,28 +410,23 @@ static int ovl_create_or_link(struct dentry *dentry, int mode, dev_t rdev,
+ 	if (err)
+ 		goto out_iput;
+ 
+-	if (!ovl_dentry_is_opaque(dentry)) {
+-		err = ovl_create_upper(dentry, inode, &stat, link, hardlink);
+-	} else {
+-		const struct cred *old_cred;
+-		struct cred *override_cred;
+-
+-		old_cred = ovl_override_creds(dentry->d_sb);
+-
+-		err = -ENOMEM;
+-		override_cred = prepare_creds();
+-		if (override_cred) {
+-			override_cred->fsuid = old_cred->fsuid;
+-			override_cred->fsgid = old_cred->fsgid;
+-			put_cred(override_creds(override_cred));
+-			put_cred(override_cred);
+-
++	old_cred = ovl_override_creds(dentry->d_sb);
++	err = -ENOMEM;
++	override_cred = prepare_creds();
++	if (override_cred) {
++		override_cred->fsuid = old_cred->fsuid;
++		override_cred->fsgid = old_cred->fsgid;
++		put_cred(override_creds(override_cred));
++		put_cred(override_cred);
++
++		if (!ovl_dentry_is_opaque(dentry))
++			err = ovl_create_upper(dentry, inode, &stat, link,
++						hardlink);
++		else
+ 			err = ovl_create_over_whiteout(dentry, inode, &stat,
+-						       link, hardlink);
+-		}
+-		revert_creds(old_cred);
++							link, hardlink);
+ 	}
+-
++	revert_creds(old_cred);
+ 	if (!err)
+ 		inode = NULL;
+ out_iput:
+@@ -631,6 +631,8 @@ static int ovl_do_remove(struct dentry *dentry, bool is_dir)
+ {
+ 	enum ovl_path_type type;
+ 	int err;
++	const struct cred *old_cred;
++
+ 
+ 	err = ovl_check_sticky(dentry);
+ 	if (err)
+@@ -645,15 +647,13 @@ static int ovl_do_remove(struct dentry *dentry, bool is_dir)
+ 		goto out_drop_write;
+ 
+ 	type = ovl_path_type(dentry);
+-	if (OVL_TYPE_PURE_UPPER(type)) {
+-		err = ovl_remove_upper(dentry, is_dir);
+-	} else {
+-		const struct cred *old_cred = ovl_override_creds(dentry->d_sb);
+ 
++	old_cred = ovl_override_creds(dentry->d_sb);
++	if (OVL_TYPE_PURE_UPPER(type))
++		err = ovl_remove_upper(dentry, is_dir);
++	else
+ 		err = ovl_remove_and_whiteout(dentry, is_dir);
+-
+-		revert_creds(old_cred);
+-	}
++	revert_creds(old_cred);
+ out_drop_write:
+ 	ovl_drop_write(dentry);
+ out:
+@@ -759,8 +759,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
+ 	old_opaque = !OVL_TYPE_PURE_UPPER(old_type);
+ 	new_opaque = !OVL_TYPE_PURE_UPPER(new_type);
+ 
+-	if (old_opaque || new_opaque)
+-		old_cred = ovl_override_creds(old->d_sb);
++	old_cred = ovl_override_creds(old->d_sb);
+ 
+ 	if (overwrite && OVL_TYPE_MERGE_OR_LOWER(new_type) && new_is_dir) {
+ 		opaquedir = ovl_check_empty_and_clear(new);
+@@ -879,8 +878,7 @@ out_dput:
+ out_unlock:
+ 	unlock_rename(new_upperdir, old_upperdir);
+ out_revert_creds:
+-	if (old_opaque || new_opaque)
+-		revert_creds(old_cred);
++	revert_creds(old_cred);
+ out_drop_write:
+ 	ovl_drop_write(old);
+ out:
+* Unmerged path fs/overlayfs/inode.c
