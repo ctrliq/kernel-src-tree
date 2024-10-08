@@ -1,0 +1,265 @@
+xfs: bulkstat chunk formatting cursor is broken
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit bf4a5af20d25ecc8876978ad34b8db83b4235f3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bf4a5af2.failed
+
+The xfs_bulkstat_agichunk formatting cursor takes buffer values from
+the main loop and passes them via the structure to the chunk
+formatter, and the writes the changed values back into the main loop
+local variables. Unfortunately, this complex dance is full of corner
+cases that aren't handled correctly.
+
+The biggest problem is that it is double handling the information in
+both the main loop and the chunk formatting function, leading to
+inconsistent updates and endless loops where progress is not made.
+
+To fix this, push the struct xfs_bulkstat_agichunk outwards to be
+the primary holder of user buffer information. this removes the
+double handling in the main loop.
+
+Also, pass the last inode processed by the chunk formatter as a
+separate parameter as it purely an output variable and is not
+related to the user buffer consumption cursor.
+
+Finally, the chunk formatting code is not shared by anyone, so make
+it local to xfs_itable.c.
+
+cc: <stable@vger.kernel.org> # 3.17
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit bf4a5af20d25ecc8876978ad34b8db83b4235f3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_itable.c
+diff --cc fs/xfs/xfs_itable.c
+index 00889cf40587,50a3e5995dd9..000000000000
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@@ -262,7 -262,85 +262,88 @@@ xfs_bulkstat_grab_ichunk
+  
+  #define XFS_BULKSTAT_UBLEFT(ubleft)	((ubleft) >= statstruct_size)
+  
++ struct xfs_bulkstat_agichunk {
++ 	char		__user **ac_ubuffer;/* pointer into user's buffer */
++ 	int		ac_ubleft;	/* bytes left in user's buffer */
++ 	int		ac_ubelem;	/* spaces used in user's buffer */
++ };
++ 
++ /*
+++<<<<<<< HEAD
+++=======
++  * Process inodes in chunk with a pointer to a formatter function
++  * that will iget the inode and fill in the appropriate structure.
++  */
++ static int
++ xfs_bulkstat_ag_ichunk(
++ 	struct xfs_mount		*mp,
++ 	xfs_agnumber_t			agno,
++ 	struct xfs_inobt_rec_incore	*irbp,
++ 	bulkstat_one_pf			formatter,
++ 	size_t				statstruct_size,
++ 	struct xfs_bulkstat_agichunk	*acp,
++ 	xfs_ino_t			*lastino)
++ {
++ 	char				__user **ubufp = acp->ac_ubuffer;
++ 	int				ubleft = acp->ac_ubleft;
++ 	int				ubelem = acp->ac_ubelem;
++ 	int				chunkidx, clustidx;
++ 	int				error = 0;
++ 	xfs_agino_t			agino;
++ 
++ 	for (agino = irbp->ir_startino, chunkidx = clustidx = 0;
++ 	     XFS_BULKSTAT_UBLEFT(ubleft) &&
++ 	     irbp->ir_freecount < XFS_INODES_PER_CHUNK;
++ 	     chunkidx++, clustidx++, agino++) {
++ 		int		fmterror;	/* bulkstat formatter result */
++ 		int		ubused;
++ 		xfs_ino_t	ino = XFS_AGINO_TO_INO(mp, agno, agino);
++ 
++ 		ASSERT(chunkidx < XFS_INODES_PER_CHUNK);
++ 
++ 		/* Skip if this inode is free */
++ 		if (XFS_INOBT_MASK(chunkidx) & irbp->ir_free) {
++ 			*lastino = ino;
++ 			continue;
++ 		}
++ 
++ 		/*
++ 		 * Count used inodes as free so we can tell when the
++ 		 * chunk is used up.
++ 		 */
++ 		irbp->ir_freecount++;
++ 
++ 		/* Get the inode and fill in a single buffer */
++ 		ubused = statstruct_size;
++ 		error = formatter(mp, ino, *ubufp, ubleft, &ubused, &fmterror);
++ 		if (fmterror == BULKSTAT_RV_NOTHING) {
++ 			if (error && error != -ENOENT && error != -EINVAL) {
++ 				ubleft = 0;
++ 				break;
++ 			}
++ 			*lastino = ino;
++ 			continue;
++ 		}
++ 		if (fmterror == BULKSTAT_RV_GIVEUP) {
++ 			ubleft = 0;
++ 			ASSERT(error);
++ 			break;
++ 		}
++ 		if (*ubufp)
++ 			*ubufp += ubused;
++ 		ubleft -= ubused;
++ 		ubelem++;
++ 		*lastino = ino;
++ 	}
++ 
++ 	acp->ac_ubleft = ubleft;
++ 	acp->ac_ubelem = ubelem;
++ 
++ 	return error;
++ }
++ 
+  /*
+++>>>>>>> bf4a5af20d25 (xfs: bulkstat chunk formatting cursor is broken)
+   * Return stat information in bulk (by-inode) for the filesystem.
+   */
+  int					/* error status */
+@@@ -284,8 -360,6 +365,11 @@@ xfs_bulkstat
+  	xfs_btree_cur_t		*cur;	/* btree cursor for ialloc btree */
+  	int			end_of_ag; /* set if we've seen the ag end */
+  	int			error;	/* error code */
+++<<<<<<< HEAD
+ +	int                     fmterror;/* bulkstat formatter result */
+ +	int			i;	/* loop index */
+++=======
+++>>>>>>> bf4a5af20d25 (xfs: bulkstat chunk formatting cursor is broken)
+  	int			icount;	/* count of inodes good in irbuf */
+  	size_t			irbsize; /* size of irec buffer in bytes */
+  	xfs_ino_t		ino;	/* inode number (filesystem) */
+@@@ -295,12 -369,9 +379,17 @@@
+  	xfs_ino_t		lastino; /* last inode number returned */
+  	int			nirbuf;	/* size of irbuf */
+  	int			rval;	/* return value error code */
+ +	int			tmp;	/* result value from btree calls */
+  	int			ubcount; /* size of user's buffer */
+++<<<<<<< HEAD
+ +	int			ubleft;	/* bytes left in user's buffer */
+ +	char			__user *ubufp;	/* pointer into user's buffer */
+ +	int			ubelem;	/* spaces used in user's buffer */
+ +	int			ubused;	/* bytes used by formatter */
+++=======
++ 	int			stat;
++ 	struct xfs_bulkstat_agichunk ac;
+++>>>>>>> bf4a5af20d25 (xfs: bulkstat chunk formatting cursor is broken)
+  
+  	/*
+  	 * Get the last inode value, see if there's nothing to do.
+@@@ -315,18 -386,18 +404,20 @@@
+  		*ubcountp = 0;
+  		return 0;
+  	}
+ -
+ +	if (!ubcountp || *ubcountp <= 0) {
+ +		return EINVAL;
+ +	}
+  	ubcount = *ubcountp; /* statstruct's */
+- 	ubleft = ubcount * statstruct_size; /* bytes */
+- 	*ubcountp = ubelem = 0;
++ 	ac.ac_ubuffer = &ubuffer;
++ 	ac.ac_ubleft = ubcount * statstruct_size; /* bytes */;
++ 	ac.ac_ubelem = 0;
++ 
++ 	*ubcountp = 0;
+  	*done = 0;
+- 	fmterror = 0;
+- 	ubufp = ubuffer;
++ 
+  	irbuf = kmem_zalloc_greedy(&irbsize, PAGE_SIZE, PAGE_SIZE * 4);
+  	if (!irbuf)
+ -		return -ENOMEM;
+ +		return ENOMEM;
+  
+  	nirbuf = irbsize / sizeof(*irbuf);
+  
+@@@ -428,61 -501,17 +519,73 @@@ del_cursor
+  		 */
+  		irbufend = irbp;
+  		for (irbp = irbuf;
+++<<<<<<< HEAD
+ +		     irbp < irbufend && XFS_BULKSTAT_UBLEFT(ubleft); irbp++) {
+ +			/*
+ +			 * Now process this chunk of inodes.
+ +			 */
+ +			for (agino = irbp->ir_startino, chunkidx = clustidx = 0;
+ +			     XFS_BULKSTAT_UBLEFT(ubleft) &&
+ +				irbp->ir_freecount < XFS_INODES_PER_CHUNK;
+ +			     chunkidx++, clustidx++, agino++) {
+ +				ASSERT(chunkidx < XFS_INODES_PER_CHUNK);
+ +
+ +				ino = XFS_AGINO_TO_INO(mp, agno, agino);
+ +				/*
+ +				 * Skip if this inode is free.
+ +				 */
+ +				if (XFS_INOBT_MASK(chunkidx) & irbp->ir_free) {
+ +					lastino = ino;
+ +					continue;
+ +				}
+ +				/*
+ +				 * Count used inodes as free so we can tell
+ +				 * when the chunk is used up.
+ +				 */
+ +				irbp->ir_freecount++;
+ +
+ +				/*
+ +				 * Get the inode and fill in a single buffer.
+ +				 */
+ +				ubused = statstruct_size;
+ +				error = formatter(mp, ino, ubufp, ubleft,
+ +						  &ubused, &fmterror);
+ +				if (fmterror == BULKSTAT_RV_NOTHING) {
+ +					if (error && error != ENOENT &&
+ +						error != EINVAL) {
+ +						ubleft = 0;
+ +						rval = error;
+ +						break;
+ +					}
+ +					lastino = ino;
+ +					continue;
+ +				}
+ +				if (fmterror == BULKSTAT_RV_GIVEUP) {
+ +					ubleft = 0;
+ +					ASSERT(error);
+ +					rval = error;
+ +					break;
+ +				}
+ +				if (ubufp)
+ +					ubufp += ubused;
+ +				ubleft -= ubused;
+ +				ubelem++;
+ +				lastino = ino;
+ +			}
+ +
+++=======
++ 		     irbp < irbufend && XFS_BULKSTAT_UBLEFT(ac.ac_ubleft);
++ 		     irbp++) {
++ 			error = xfs_bulkstat_ag_ichunk(mp, agno, irbp,
++ 					formatter, statstruct_size, &ac,
++ 					&lastino);
++ 			if (error)
++ 				rval = error;
++ 
+++>>>>>>> bf4a5af20d25 (xfs: bulkstat chunk formatting cursor is broken)
+  			cond_resched();
+  		}
++ 
+  		/*
+  		 * Set up for the next loop iteration.
+  		 */
+* Unmerged path fs/xfs/xfs_itable.c
