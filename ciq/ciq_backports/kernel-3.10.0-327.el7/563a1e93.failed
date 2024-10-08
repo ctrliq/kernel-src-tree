@@ -1,0 +1,128 @@
+KVM: PPC: Book3S HV: Fix preempted vcore stolen time calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s_hv: Fix preempted vcore stolen time calculation (Laurent Vivier) [1242757]
+Rebuild_FUZZ: 94.31%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 563a1e93afac4d2c135072461fbab418b9dff43f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/563a1e93.failed
+
+Whenever a vcore state is VCORE_PREEMPT we need to be counting stolen
+time for it.  This currently isn't the case when we have a vcore that
+no longer has any runnable threads in it but still has a runner task,
+so we do an explicit call to kvmppc_core_start_stolen() in that case.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 563a1e93afac4d2c135072461fbab418b9dff43f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903,fad52f226c12..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1695,6 -2212,95 +1695,98 @@@ static void prepare_threads(struct kvmp
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void collect_piggybacks(struct core_info *cip, int target_threads)
++ {
++ 	struct preempted_vcore_list *lp = this_cpu_ptr(&preempted_vcores);
++ 	struct kvmppc_vcore *pvc, *vcnext;
++ 
++ 	spin_lock(&lp->lock);
++ 	list_for_each_entry_safe(pvc, vcnext, &lp->list, preempt_list) {
++ 		if (!spin_trylock(&pvc->lock))
++ 			continue;
++ 		prepare_threads(pvc);
++ 		if (!pvc->n_runnable) {
++ 			list_del_init(&pvc->preempt_list);
++ 			if (pvc->runner == NULL) {
++ 				pvc->vcore_state = VCORE_INACTIVE;
++ 				kvmppc_core_end_stolen(pvc);
++ 			}
++ 			spin_unlock(&pvc->lock);
++ 			continue;
++ 		}
++ 		if (!can_piggyback(pvc, cip, target_threads)) {
++ 			spin_unlock(&pvc->lock);
++ 			continue;
++ 		}
++ 		kvmppc_core_end_stolen(pvc);
++ 		pvc->vcore_state = VCORE_PIGGYBACK;
++ 		if (cip->total_threads >= target_threads)
++ 			break;
++ 	}
++ 	spin_unlock(&lp->lock);
++ }
++ 
++ static void post_guest_process(struct kvmppc_vcore *vc, bool is_master)
++ {
++ 	int still_running = 0;
++ 	u64 now;
++ 	long ret;
++ 	struct kvm_vcpu *vcpu, *vnext;
++ 
++ 	spin_lock(&vc->lock);
++ 	now = get_tb();
++ 	list_for_each_entry_safe(vcpu, vnext, &vc->runnable_threads,
++ 				 arch.run_list) {
++ 		/* cancel pending dec exception if dec is positive */
++ 		if (now < vcpu->arch.dec_expires &&
++ 		    kvmppc_core_pending_dec(vcpu))
++ 			kvmppc_core_dequeue_dec(vcpu);
++ 
++ 		trace_kvm_guest_exit(vcpu);
++ 
++ 		ret = RESUME_GUEST;
++ 		if (vcpu->arch.trap)
++ 			ret = kvmppc_handle_exit_hv(vcpu->arch.kvm_run, vcpu,
++ 						    vcpu->arch.run_task);
++ 
++ 		vcpu->arch.ret = ret;
++ 		vcpu->arch.trap = 0;
++ 
++ 		if (is_kvmppc_resume_guest(vcpu->arch.ret)) {
++ 			if (vcpu->arch.pending_exceptions)
++ 				kvmppc_core_prepare_to_enter(vcpu);
++ 			if (vcpu->arch.ceded)
++ 				kvmppc_set_timer(vcpu);
++ 			else
++ 				++still_running;
++ 		} else {
++ 			kvmppc_remove_runnable(vc, vcpu);
++ 			wake_up(&vcpu->arch.cpu_run);
++ 		}
++ 	}
++ 	list_del_init(&vc->preempt_list);
++ 	if (!is_master) {
++ 		if (still_running > 0) {
++ 			kvmppc_vcore_preempt(vc);
++ 		} else if (vc->runner) {
++ 			vc->vcore_state = VCORE_PREEMPT;
++ 			kvmppc_core_start_stolen(vc);
++ 		} else {
++ 			vc->vcore_state = VCORE_INACTIVE;
++ 		}
++ 		if (vc->n_runnable > 0 && vc->runner == NULL) {
++ 			/* make sure there's a candidate runner awake */
++ 			vcpu = list_first_entry(&vc->runnable_threads,
++ 						struct kvm_vcpu, arch.run_list);
++ 			wake_up(&vcpu->arch.cpu_run);
++ 		}
++ 	}
++ 	spin_unlock(&vc->lock);
++ }
++ 
+++>>>>>>> 563a1e93afac (KVM: PPC: Book3S HV: Fix preempted vcore stolen time calculation)
+  /*
+   * Run a set of guest threads on a physical core.
+   * Called with vc->lock held.
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
