@@ -1,0 +1,305 @@
+tunnels: harmonize cleanup done on skb on xmit path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 963a88b31ddbbe99f38502239b1a46601773d217
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/963a88b3.failed
+
+The goal of this patch is to harmonize cleanup done on a skbuff on xmit path.
+Before this patch, behaviors were different depending of the tunnel type.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 963a88b31ddbbe99f38502239b1a46601773d217)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/ipv4/ip_tunnel.c
+#	net/ipv4/ip_tunnel_core.c
+#	net/ipv6/ip6_gre.c
+#	net/ipv6/sit.c
+#	net/openvswitch/vport-gre.c
+diff --cc drivers/net/vxlan.c
+index 64bf7960a2bd,ebda3a1c2f31..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1571,10 -1392,13 +1571,12 @@@ static int vxlan6_xmit_skb(struct net *
+  	int min_headroom;
+  	int err;
+  
+ -	if (!skb->encapsulation) {
+ -		skb_reset_inner_headers(skb);
+ -		skb->encapsulation = 1;
+ -	}
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+  
++ 	skb_scrub_packet(skb, false);
++ 
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+  			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0);
+@@@ -1609,11 -1434,22 +1611,10 @@@
+  	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+  	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+  			      IPSKB_REROUTED);
+- 	skb_dst_drop(skb);
+  	skb_dst_set(skb, dst);
+  
+ -	if (!skb_is_gso(skb) && !(dst->dev->features & NETIF_F_IPV6_CSUM)) {
+ -		__wsum csum = skb_checksum(skb, 0, skb->len, 0);
+ -		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ -		uh->check = csum_ipv6_magic(saddr, daddr, skb->len,
+ -					    IPPROTO_UDP, csum);
+ -		if (uh->check == 0)
+ -			uh->check = CSUM_MANGLED_0;
+ -	} else {
+ -		skb->ip_summed = CHECKSUM_PARTIAL;
+ -		skb->csum_start = skb_transport_header(skb) - skb->head;
+ -		skb->csum_offset = offsetof(struct udphdr, check);
+ -		uh->check = ~csum_ipv6_magic(saddr, daddr,
+ -					     skb->len, IPPROTO_UDP, 0);
+ -	}
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+  
+  	__skb_push(skb, sizeof(*ip6h));
+  	skb_reset_network_header(skb);
+@@@ -1678,12 -1521,16 +1679,21 @@@ int vxlan_xmit_skb(struct net *net, str
+  	uh->source = src_port;
+  
+  	uh->len = htons(skb->len);
+ -	uh->check = 0;
+  
+ -	vxlan_set_owner(vs->sock->sk, skb);
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+  
+++<<<<<<< HEAD
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+++=======
++ 	err = handle_offloads(skb);
++ 	if (err)
++ 		return err;
++ 
++ 	return iptunnel_xmit(rt, skb, src, dst, IPPROTO_UDP, tos, ttl, df,
++ 			     false);
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,88d7d7d1eccb..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -616,9 -614,6 +616,12 @@@ void ip_tunnel_xmit(struct sk_buff *skb
+  		goto tx_error;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (tunnel->net != dev_net(dev))
+ +		skb_scrub_packet(skb, true);
+ +
+++=======
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  	if (tunnel->err_count > 0) {
+  		if (time_before(jiffies,
+  				tunnel->err_time + IPTUNNEL_ERR_TIMEO)) {
+@@@ -648,18 -642,18 +651,24 @@@
+  
+  	max_headroom = LL_RESERVED_SPACE(rt->dst.dev) + sizeof(struct iphdr)
+  			+ rt->dst.header_len;
+ -	if (max_headroom > dev->needed_headroom) {
+ +	if (max_headroom > dev->needed_headroom)
+  		dev->needed_headroom = max_headroom;
+ -		if (skb_cow_head(skb, dev->needed_headroom)) {
+ -			dev->stats.tx_dropped++;
+ -			dev_kfree_skb(skb);
+ -			return;
+ -		}
+ +
+ +	if (skb_cow_head(skb, dev->needed_headroom)) {
+ +		ip_rt_put(rt);
+ +		dev->stats.tx_dropped++;
+ +		kfree_skb(skb);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iptunnel_xmit(skb->sk, rt, skb, fl4.saddr, fl4.daddr, protocol,
+ +			    ip_tunnel_ecn_encap(tos, inner_iph, skb), ttl, df);
+++=======
++ 	err = iptunnel_xmit(rt, skb, fl4.saddr, fl4.daddr, protocol,
++ 			    ip_tunnel_ecn_encap(tos, inner_iph, skb), ttl, df,
++ 			    !net_eq(tunnel->net, dev_net(dev)));
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  
+  	return;
+diff --cc net/ipv4/ip_tunnel_core.c
+index 0782eb93380a,d6c856b17fd4..000000000000
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@@ -46,19 -46,17 +46,25 @@@
+  #include <net/netns/generic.h>
+  #include <net/rtnetlink.h>
+  
+ -int iptunnel_xmit(struct rtable *rt, struct sk_buff *skb,
+ +int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+  		  __be32 src, __be32 dst, __u8 proto,
+- 		  __u8 tos, __u8 ttl, __be16 df)
++ 		  __u8 tos, __u8 ttl, __be16 df, bool xnet)
+  {
+  	int pkt_len = skb->len;
+  	struct iphdr *iph;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	nf_reset(skb);
+ +	secpath_reset(skb);
+ +	skb_clear_hash(skb);
+ +	skb_dst_drop(skb);
+ +
+++=======
++ 	skb_scrub_packet(skb, xnet);
++ 
++ 	skb->rxhash = 0;
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  	skb_dst_set(skb, &rt->dst);
+  	memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
+  
+diff --cc net/ipv6/ip6_gre.c
+index dcb80bd7826a,f179ff1f56ec..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -687,7 -694,9 +687,13 @@@ static netdev_tx_t ip6gre_xmit2(struct 
+  			tunnel->err_count = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	max_headroom += LL_RESERVED_SPACE(tdev) + gre_hlen + dst->header_len;
+++=======
++ 	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(dev)));
++ 
++ 	max_headroom = LL_RESERVED_SPACE(tdev) + gre_hlen + dst->header_len;
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  
+  	if (skb_headroom(skb) < max_headroom || skb_shared(skb) ||
+  	    (skb_cloned(skb) && !skb_clone_writable(skb, 0))) {
+diff --cc net/ipv6/sit.c
+index 04b859234833,82b425b9b7d2..000000000000
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@@ -858,9 -860,6 +858,12 @@@ static netdev_tx_t ipip6_tunnel_xmit(st
+  			tunnel->err_count = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (tunnel->net != dev_net(dev))
+ +		skb_scrub_packet(skb, true);
+ +
+++=======
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  	/*
+  	 * Okay, now see if we can stuff it in the buffer as-is.
+  	 */
+@@@ -886,14 -885,8 +889,19 @@@
+  		ttl = iph6->hop_limit;
+  	tos = INET_ECN_encapsulate(tos, ipv6_get_dsfield(iph6));
+  
+++<<<<<<< HEAD
+ +	skb = iptunnel_handle_offloads(skb, false, SKB_GSO_SIT);
+ +	if (IS_ERR(skb)) {
+ +		ip_rt_put(rt);
+ +		goto out;
+ +	}
+ +
+ +	err = iptunnel_xmit(skb->sk, rt, skb, fl4.saddr, fl4.daddr,
+ +			    IPPROTO_IPV6, tos, ttl, df);
+++=======
++ 	err = iptunnel_xmit(rt, skb, fl4.saddr, fl4.daddr, IPPROTO_IPV6, tos,
++ 			    ttl, df, !net_eq(tunnel->net, dev_net(dev)));
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  	return NETDEV_TX_OK;
+  
+diff --cc net/openvswitch/vport-gre.c
+index 4d7d657439f7,c99dea543d64..000000000000
+--- a/net/openvswitch/vport-gre.c
++++ b/net/openvswitch/vport-gre.c
+@@@ -193,9 -176,10 +193,16 @@@ static int gre_tnl_send(struct vport *v
+  
+  	skb->local_df = 1;
+  
+++<<<<<<< HEAD
+ +	return iptunnel_xmit(skb->sk, rt, skb, fl.saddr,
+ +			     tun_key->ipv4_dst, IPPROTO_GRE,
+ +			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df);
+++=======
++ 	return iptunnel_xmit(rt, skb, fl.saddr,
++ 			     OVS_CB(skb)->tun_key->ipv4_dst, IPPROTO_GRE,
++ 			     OVS_CB(skb)->tun_key->ipv4_tos,
++ 			     OVS_CB(skb)->tun_key->ipv4_ttl, df, false);
+++>>>>>>> 963a88b31ddb (tunnels: harmonize cleanup done on skb on xmit path)
+  err_free_rt:
+  	ip_rt_put(rt);
+  error:
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
+index 2265b0bf97e5..6d1549c4893c 100644
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@ -75,7 +75,6 @@ static inline void ip6tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct net_device_stats *stats = &dev->stats;
+ 	int pkt_len, err;
+ 
+-	nf_reset(skb);
+ 	pkt_len = skb->len;
+ 	err = ip6_local_out(skb);
+ 
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 8d95b01ba42b..176cc7ed380a 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -160,7 +160,7 @@ static inline u8 ip_tunnel_ecn_encap(u8 tos, const struct iphdr *iph,
+ int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto);
+ int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ 		  __be32 src, __be32 dst, __u8 proto,
+-		  __u8 tos, __u8 ttl, __be16 df);
++		  __u8 tos, __u8 ttl, __be16 df, bool xnet);
+ 
+ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, bool gre_csum,
+ 					 int gso_type_mask);
+* Unmerged path net/ipv4/ip_tunnel.c
+* Unmerged path net/ipv4/ip_tunnel_core.c
+* Unmerged path net/ipv6/ip6_gre.c
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index 21168e121a52..36d68c0f4046 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1005,8 +1005,7 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
+ 		goto tx_err_dst_release;
+ 	}
+ 
+-	if (!net_eq(t->net, dev_net(dev)))
+-		skb_scrub_packet(skb, true);
++	skb_scrub_packet(skb, !net_eq(t->net, dev_net(dev)));
+ 
+ 	/*
+ 	 * Okay, now see if we can stuff it in the buffer as-is.
+@@ -1025,7 +1024,6 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
+ 		consume_skb(skb);
+ 		skb = new_skb;
+ 	}
+-	skb_dst_drop(skb);
+ 	if (fl6->flowi6_mark) {
+ 		skb_dst_set(skb, dst);
+ 		ndst = NULL;
+* Unmerged path net/ipv6/sit.c
+* Unmerged path net/openvswitch/vport-gre.c
