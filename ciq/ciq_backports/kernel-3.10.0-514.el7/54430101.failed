@@ -1,0 +1,247 @@
+perf hists: Introduce hist_entry__filter()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 54430101d2af260dba2d129cc9d9b7c7e60087b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/54430101.failed
+
+The hist_entry__filter() function is to filter hist entries using sort
+key related info.  This is needed to support hierarchy mode since each
+hist entry will be associated with a hpp fmt which has a sort key.  So
+each entry should compare to only matching type of filters.
+
+To do that, add the ->se_filter callback field to struct sort_entry.
+This callback takes 'type' argument which determines whether it's
+matching sort key or not.  It returns -1 for non-matching type, 0 for
+filtered entry and 1 for not filtered entries.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456326830-30456-6-git-send-email-namhyung@kernel.org
+[ 'socket' is reserved in sys/socket.h, so replace it with 'sk' ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 54430101d2af260dba2d129cc9d9b7c7e60087b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.h
+#	tools/perf/util/sort.c
+diff --cc tools/perf/util/hist.h
+index 2e5b433c74ba,480d2eb26001..000000000000
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@@ -271,16 -293,31 +271,23 @@@ enum 
+  void perf_hpp__init(void);
+  void perf_hpp__column_unregister(struct perf_hpp_fmt *format);
+  void perf_hpp__cancel_cumulate(void);
+ -void perf_hpp__setup_output_field(struct perf_hpp_list *list);
+ -void perf_hpp__reset_output_field(struct perf_hpp_list *list);
+ -void perf_hpp__append_sort_keys(struct perf_hpp_list *list);
+ -
+ +void perf_hpp__setup_output_field(void);
+ +void perf_hpp__reset_output_field(void);
+ +void perf_hpp__append_sort_keys(void);
+  
+  bool perf_hpp__is_sort_entry(struct perf_hpp_fmt *format);
+ -bool perf_hpp__is_dynamic_entry(struct perf_hpp_fmt *format);
+ -bool perf_hpp__defined_dynamic_entry(struct perf_hpp_fmt *fmt, struct hists *hists);
+ -bool perf_hpp__is_trace_entry(struct perf_hpp_fmt *fmt);
+ -bool perf_hpp__is_srcline_entry(struct perf_hpp_fmt *fmt);
+ -bool perf_hpp__is_srcfile_entry(struct perf_hpp_fmt *fmt);
+ +bool perf_hpp__same_sort_entry(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b);
+  
+++<<<<<<< HEAD
+ +static inline bool perf_hpp__should_skip(struct perf_hpp_fmt *format)
+++=======
++ int hist_entry__filter(struct hist_entry *he, int type, const void *arg);
++ 
++ static inline bool perf_hpp__should_skip(struct perf_hpp_fmt *format,
++ 					 struct hists *hists)
+++>>>>>>> 54430101d2af (perf hists: Introduce hist_entry__filter())
+  {
+ -	if (format->elide)
+ -		return true;
+ -
+ -	if (perf_hpp__is_dynamic_entry(format) &&
+ -	    !perf_hpp__defined_dynamic_entry(format, hists))
+ -		return true;
+ -
+ -	return false;
+ +	return format->elide;
+  }
+  
+  void perf_hpp__reset_width(struct perf_hpp_fmt *fmt, struct hists *hists);
+diff --cc tools/perf/util/sort.c
+index 8f36c1d6fd38,6bee8bdfb91b..000000000000
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@@ -430,6 -460,99 +464,102 @@@ struct sort_entry sort_cpu = 
+  	.se_width_idx	= HISTC_CPU,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* --sort socket */
++ 
++ static int64_t
++ sort__socket_cmp(struct hist_entry *left, struct hist_entry *right)
++ {
++ 	return right->socket - left->socket;
++ }
++ 
++ static int hist_entry__socket_snprintf(struct hist_entry *he, char *bf,
++ 				    size_t size, unsigned int width)
++ {
++ 	return repsep_snprintf(bf, size, "%*.*d", width, width-3, he->socket);
++ }
++ 
++ static int hist_entry__socket_filter(struct hist_entry *he, int type, const void *arg)
++ {
++ 	int sk = *(const int *)arg;
++ 
++ 	if (type != HIST_FILTER__SOCKET)
++ 		return -1;
++ 
++ 	return sk >= 0 && he->socket != sk;
++ }
++ 
++ struct sort_entry sort_socket = {
++ 	.se_header      = "Socket",
++ 	.se_cmp	        = sort__socket_cmp,
++ 	.se_snprintf    = hist_entry__socket_snprintf,
++ 	.se_filter      = hist_entry__socket_filter,
++ 	.se_width_idx	= HISTC_SOCKET,
++ };
++ 
++ /* --sort trace */
++ 
++ static char *get_trace_output(struct hist_entry *he)
++ {
++ 	struct trace_seq seq;
++ 	struct perf_evsel *evsel;
++ 	struct pevent_record rec = {
++ 		.data = he->raw_data,
++ 		.size = he->raw_size,
++ 	};
++ 
++ 	evsel = hists_to_evsel(he->hists);
++ 
++ 	trace_seq_init(&seq);
++ 	if (symbol_conf.raw_trace) {
++ 		pevent_print_fields(&seq, he->raw_data, he->raw_size,
++ 				    evsel->tp_format);
++ 	} else {
++ 		pevent_event_info(&seq, evsel->tp_format, &rec);
++ 	}
++ 	return seq.buffer;
++ }
++ 
++ static int64_t
++ sort__trace_cmp(struct hist_entry *left, struct hist_entry *right)
++ {
++ 	struct perf_evsel *evsel;
++ 
++ 	evsel = hists_to_evsel(left->hists);
++ 	if (evsel->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return 0;
++ 
++ 	if (left->trace_output == NULL)
++ 		left->trace_output = get_trace_output(left);
++ 	if (right->trace_output == NULL)
++ 		right->trace_output = get_trace_output(right);
++ 
++ 	return strcmp(right->trace_output, left->trace_output);
++ }
++ 
++ static int hist_entry__trace_snprintf(struct hist_entry *he, char *bf,
++ 				    size_t size, unsigned int width)
++ {
++ 	struct perf_evsel *evsel;
++ 
++ 	evsel = hists_to_evsel(he->hists);
++ 	if (evsel->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return scnprintf(bf, size, "%-.*s", width, "N/A");
++ 
++ 	if (he->trace_output == NULL)
++ 		he->trace_output = get_trace_output(he);
++ 	return repsep_snprintf(bf, size, "%-.*s", width, he->trace_output);
++ }
++ 
++ struct sort_entry sort_trace = {
++ 	.se_header      = "Trace output",
++ 	.se_cmp	        = sort__trace_cmp,
++ 	.se_snprintf    = hist_entry__trace_snprintf,
++ 	.se_width_idx	= HISTC_TRACE,
++ };
++ 
+++>>>>>>> 54430101d2af (perf hists: Introduce hist_entry__filter())
+  /* sort keys for branch stacks */
+  
+  static int64_t
+@@@ -1479,11 -1576,41 +1661,27 @@@ __sort_dimension__alloc_hpp(struct sort
+  	return hse;
+  }
+  
+ -static void hpp_free(struct perf_hpp_fmt *fmt)
+ -{
+ -	free(fmt);
+ -}
+ -
+ -static struct perf_hpp_fmt *__hpp_dimension__alloc_hpp(struct hpp_dimension *hd)
+ +bool perf_hpp__is_sort_entry(struct perf_hpp_fmt *format)
+  {
+ -	struct perf_hpp_fmt *fmt;
+ -
+ -	fmt = memdup(hd->fmt, sizeof(*fmt));
+ -	if (fmt) {
+ -		INIT_LIST_HEAD(&fmt->list);
+ -		INIT_LIST_HEAD(&fmt->sort_list);
+ -		fmt->free = hpp_free;
+ -	}
+ -
+ -	return fmt;
+ +	return format->header == __sort__hpp_header;
+  }
+  
++ int hist_entry__filter(struct hist_entry *he, int type, const void *arg)
++ {
++ 	struct perf_hpp_fmt *fmt;
++ 	struct hpp_sort_entry *hse;
++ 
++ 	fmt = he->fmt;
++ 	if (fmt == NULL || !perf_hpp__is_sort_entry(fmt))
++ 		return -1;
++ 
++ 	hse = container_of(fmt, struct hpp_sort_entry, hpp);
++ 	if (hse->se->se_filter == NULL)
++ 		return -1;
++ 
++ 	return hse->se->se_filter(he, type, arg);
++ }
++ 
+  static int __sort_dimension__add_hpp_sort(struct sort_dimension *sd)
+  {
+  	struct hpp_sort_entry *hse = __sort_dimension__alloc_hpp(sd);
+* Unmerged path tools/perf/util/hist.h
+* Unmerged path tools/perf/util/sort.c
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index cb167fb3da85..37ae485ed870 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -229,6 +229,7 @@ struct sort_entry {
+ 	int64_t	(*se_sort)(struct hist_entry *, struct hist_entry *);
+ 	int	(*se_snprintf)(struct hist_entry *he, char *bf, size_t size,
+ 			       unsigned int width);
++	int	(*se_filter)(struct hist_entry *he, int type, const void *arg);
+ 	u8	se_width_idx;
+ };
+ 
