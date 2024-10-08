@@ -1,0 +1,183 @@
+vfio/pci: Fix racy vfio_device_get_from_dev() call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [vfio] pci: Fix racy vfio_device_get_from_dev() call (Alex Williamson) [1230362]
+Rebuild_FUZZ: 94.74%
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 20f300175a1e150dae231e21dfa1fc4c6fcf4db6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/20f30017.failed
+
+Testing the driver for a PCI device is racy, it can be all but
+complete in the release path and still report the driver as ours.
+Therefore we can't trust drvdata to be valid.  This race can sometimes
+be seen when one port of a multifunction device is being unbound from
+the vfio-pci driver while another function is being released by the
+user and attempting a bus reset.  The device in the remove path is
+found as a dependent device for the bus reset of the release path
+device, the driver is still set to vfio-pci, but the drvdata has
+already been cleared, resulting in a null pointer dereference.
+
+To resolve this, fix vfio_device_get_from_dev() to not take the
+dev_get_drvdata() shortcut and instead traverse through the
+iommu_group, vfio_group, vfio_device path to get a reference we
+can trust.  Once we have that reference, we know the device isn't
+in transition and we can test to make sure the driver is still what
+we expect, so that we don't interfere with devices we don't own.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 20f300175a1e150dae231e21dfa1fc4c6fcf4db6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci.c
+diff --cc drivers/vfio/pci/vfio_pci.c
+index 932fa520281f,964ad572aaee..000000000000
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@@ -926,6 -1047,97 +926,100 @@@ static struct pci_driver vfio_pci_drive
+  	.err_handler	= &vfio_err_handlers,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_devices {
++ 	struct vfio_device **devices;
++ 	int cur_index;
++ 	int max_index;
++ };
++ 
++ static int vfio_pci_get_devs(struct pci_dev *pdev, void *data)
++ {
++ 	struct vfio_devices *devs = data;
++ 	struct vfio_device *device;
++ 
++ 	if (devs->cur_index == devs->max_index)
++ 		return -ENOSPC;
++ 
++ 	device = vfio_device_get_from_dev(&pdev->dev);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (pci_dev_driver(pdev) != &vfio_pci_driver) {
++ 		vfio_device_put(device);
++ 		return -EBUSY;
++ 	}
++ 
++ 	devs->devices[devs->cur_index++] = device;
++ 	return 0;
++ }
++ 
++ /*
++  * Attempt to do a bus/slot reset if there are devices affected by a reset for
++  * this device that are needs_reset and all of the affected devices are unused
++  * (!refcnt).  Callers are required to hold driver_lock when calling this to
++  * prevent device opens and concurrent bus reset attempts.  We prevent device
++  * unbinds by acquiring and holding a reference to the vfio_device.
++  *
++  * NB: vfio-core considers a group to be viable even if some devices are
++  * bound to drivers like pci-stub or pcieport.  Here we require all devices
++  * to be bound to vfio_pci since that's the only way we can be sure they
++  * stay put.
++  */
++ static void vfio_pci_try_bus_reset(struct vfio_pci_device *vdev)
++ {
++ 	struct vfio_devices devs = { .cur_index = 0 };
++ 	int i = 0, ret = -EINVAL;
++ 	bool needs_reset = false, slot = false;
++ 	struct vfio_pci_device *tmp;
++ 
++ 	if (!pci_probe_reset_slot(vdev->pdev->slot))
++ 		slot = true;
++ 	else if (pci_probe_reset_bus(vdev->pdev->bus))
++ 		return;
++ 
++ 	if (vfio_pci_for_each_slot_or_bus(vdev->pdev, vfio_pci_count_devs,
++ 					  &i, slot) || !i)
++ 		return;
++ 
++ 	devs.max_index = i;
++ 	devs.devices = kcalloc(i, sizeof(struct vfio_device *), GFP_KERNEL);
++ 	if (!devs.devices)
++ 		return;
++ 
++ 	if (vfio_pci_for_each_slot_or_bus(vdev->pdev,
++ 					  vfio_pci_get_devs, &devs, slot))
++ 		goto put_devs;
++ 
++ 	for (i = 0; i < devs.cur_index; i++) {
++ 		tmp = vfio_device_data(devs.devices[i]);
++ 		if (tmp->needs_reset)
++ 			needs_reset = true;
++ 		if (tmp->refcnt)
++ 			goto put_devs;
++ 	}
++ 
++ 	if (needs_reset)
++ 		ret = slot ? pci_try_reset_slot(vdev->pdev->slot) :
++ 			     pci_try_reset_bus(vdev->pdev->bus);
++ 
++ put_devs:
++ 	for (i = 0; i < devs.cur_index; i++) {
++ 		tmp = vfio_device_data(devs.devices[i]);
++ 		if (!ret)
++ 			tmp->needs_reset = false;
++ 
++ 		if (!tmp->refcnt && !disable_idle_d3)
++ 			pci_set_power_state(tmp->pdev, PCI_D3hot);
++ 
++ 		vfio_device_put(devs.devices[i]);
++ 	}
++ 
++ 	kfree(devs.devices);
++ }
++ 
+++>>>>>>> 20f300175a1e (vfio/pci: Fix racy vfio_device_get_from_dev() call)
+  static void __exit vfio_pci_cleanup(void)
+  {
+  	pci_unregister_driver(&vfio_pci_driver);
+* Unmerged path drivers/vfio/pci/vfio_pci.c
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index e984b31f7bf6..86dfca3bb3e2 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -668,18 +668,29 @@ int vfio_add_group_dev(struct device *dev,
+ EXPORT_SYMBOL_GPL(vfio_add_group_dev);
+ 
+ /**
+- * Get a reference to the vfio_device for a device that is known to
+- * be bound to a vfio driver.  The driver implicitly holds a
+- * vfio_device reference between vfio_add_group_dev and
+- * vfio_del_group_dev.  We can therefore use drvdata to increment
+- * that reference from the struct device.  This additional
+- * reference must be released by calling vfio_device_put.
++ * Get a reference to the vfio_device for a device.  Even if the
++ * caller thinks they own the device, they could be racing with a
++ * release call path, so we can't trust drvdata for the shortcut.
++ * Go the long way around, from the iommu_group to the vfio_group
++ * to the vfio_device.
+  */
+ struct vfio_device *vfio_device_get_from_dev(struct device *dev)
+ {
+-	struct vfio_device *device = dev_get_drvdata(dev);
++	struct iommu_group *iommu_group;
++	struct vfio_group *group;
++	struct vfio_device *device;
++
++	iommu_group = iommu_group_get(dev);
++	if (!iommu_group)
++		return NULL;
+ 
+-	vfio_device_get(device);
++	group = vfio_group_get_from_iommu(iommu_group);
++	iommu_group_put(iommu_group);
++	if (!group)
++		return NULL;
++
++	device = vfio_group_get_device(group, dev);
++	vfio_group_put(group);
+ 
+ 	return device;
+ }
