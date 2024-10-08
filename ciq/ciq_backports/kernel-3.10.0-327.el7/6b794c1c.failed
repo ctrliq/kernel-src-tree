@@ -1,0 +1,253 @@
+bonding: Do not try to send packets over dead link in TLB mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] bonding: Do not try to send packets over dead link in TLB mode (Nikolay Aleksandrov) [1166647]
+Rebuild_FUZZ: 99.20%
+commit-author Mahesh Bandewar <maheshb@google.com>
+commit 6b794c1cd8e0e693621e846166f6a25b38bcb862
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b794c1c.failed
+
+In TLB mode if tlb_dynamic_lb is NOT set, slaves from the bond
+group are selected based on the hash distribution. This does not
+exclude dead links which are part of the bond. Also if there is a
+temporary link event which brings down the interface, packets
+hashed on that interface would be dropped too.
+
+This patch fixes these issues and distributes flows across the
+UP links only. Also the array construction of links which are
+capable of sending packets happen in the control path leaving
+only link-selection during the data-path.
+
+One possible side effect of this is - at a link event; all
+flows will be shuffled to get good distribution. But impact of
+this should be minimum with the assumption that a member or
+members of the bond group are not available is a very temporary
+situation.
+
+	Signed-off-by: Mahesh Bandewar <maheshb@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b794c1cd8e0e693621e846166f6a25b38bcb862)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,d3c6801f101e..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -1313,9 -1368,109 +1318,99 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+ -}
+ -
+ -static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
+ -		struct slave *tx_slave)
+ -{
+ -	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ -	struct ethhdr *eth_data = eth_hdr(skb);
+ -
+ -	if (!tx_slave) {
+ -		/* unbalanced or unassigned, send through primary */
+ -		tx_slave = rcu_dereference(bond->curr_active_slave);
+ -		if (bond->params.tlb_dynamic_lb)
+ -			bond_info->unbalanced_load += skb->len;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (tx_slave && bond_slave_can_tx(tx_slave)) {
++ 		if (tx_slave != rcu_dereference(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		_lock_tx_hashtbl(bond);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		_unlock_tx_hashtbl(bond);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static int bond_tlb_update_slave_arr(struct bonding *bond,
++ 				     struct slave *skipslave)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct slave *tx_slave;
++ 	struct list_head *iter;
++ 	struct tlb_up_slave *new_arr, *old_arr;
++ 
++ 	new_arr = kzalloc(offsetof(struct tlb_up_slave, arr[bond->slave_cnt]),
++ 			  GFP_ATOMIC);
++ 	if (!new_arr)
++ 		return -ENOMEM;
++ 
++ 	bond_for_each_slave(bond, tx_slave, iter) {
++ 		if (!bond_slave_can_tx(tx_slave))
++ 			continue;
++ 		if (skipslave == tx_slave)
++ 			continue;
++ 		new_arr->arr[new_arr->count++] = tx_slave;
++ 	}
++ 
++ 	old_arr = rtnl_dereference(bond_info->slave_arr);
++ 	rcu_assign_pointer(bond_info->slave_arr, new_arr);
++ 	if (old_arr)
++ 		kfree_rcu(old_arr, rcu);
++ 
++ 	return 0;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct tlb_up_slave *slaves;
++ 
++ 				slaves = rcu_dereference(bond_info->slave_arr);
++ 				if (slaves && slaves->count)
++ 					tx_slave = slaves->arr[hash_index %
++ 							       slaves->count];
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> 6b794c1cd8e0 (bonding: Do not try to send packets over dead link in TLB mode.)
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+@@@ -1592,9 -1727,14 +1687,14 @@@ void bond_alb_deinit_slave(struct bondi
+  	tlb_clear_slave(bond, slave, 0);
+  
+  	if (bond->alb_info.rlb_enabled) {
+ -		bond->alb_info.rx_slave = NULL;
+ +		bond->alb_info.next_rx_slave = NULL;
+  		rlb_clear_slave(bond, slave);
+  	}
++ 
++ 	if (bond_is_nondyn_tlb(bond))
++ 		if (bond_tlb_update_slave_arr(bond, slave))
++ 			pr_err("Failed to build slave-array for TLB mode.\n");
++ 
+  }
+  
+  /* Caller must hold bond lock for read */
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,a85ca51eabf5..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -283,10 -257,44 +283,43 @@@ static inline struct bonding *bond_get_
+  	return slave->bond;
+  }
+  
+ -static inline bool bond_should_override_tx_queue(struct bonding *bond)
+ -{
+ -	return BOND_MODE(bond) == BOND_MODE_ACTIVEBACKUP ||
+ -	       BOND_MODE(bond) == BOND_MODE_ROUNDROBIN;
+ -}
+ -
+  static inline bool bond_is_lb(const struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	return (bond->params.mode == BOND_MODE_TLB ||
+ +		bond->params.mode == BOND_MODE_ALB);
+++=======
++ 	return BOND_MODE(bond) == BOND_MODE_TLB ||
++ 	       BOND_MODE(bond) == BOND_MODE_ALB;
++ }
++ 
++ static inline bool bond_is_nondyn_tlb(const struct bonding *bond)
++ {
++ 	return (BOND_MODE(bond) == BOND_MODE_TLB)  &&
++ 	       (bond->params.tlb_dynamic_lb == 0);
++ }
++ 
++ static inline bool bond_mode_uses_arp(int mode)
++ {
++ 	return mode != BOND_MODE_8023AD && mode != BOND_MODE_TLB &&
++ 	       mode != BOND_MODE_ALB;
++ }
++ 
++ static inline bool bond_mode_uses_primary(int mode)
++ {
++ 	return mode == BOND_MODE_ACTIVEBACKUP || mode == BOND_MODE_TLB ||
++ 	       mode == BOND_MODE_ALB;
++ }
++ 
++ static inline bool bond_uses_primary(struct bonding *bond)
++ {
++ 	return bond_mode_uses_primary(BOND_MODE(bond));
++ }
++ 
++ static inline bool bond_slave_is_up(struct slave *slave)
++ {
++ 	return netif_running(slave->dev) && netif_carrier_ok(slave->dev);
+++>>>>>>> 6b794c1cd8e0 (bonding: Do not try to send packets over dead link in TLB mode.)
+  }
+  
+  static inline void bond_set_active_slave(struct slave *slave)
+* Unmerged path drivers/net/bonding/bond_alb.c
+diff --git a/drivers/net/bonding/bond_alb.h b/drivers/net/bonding/bond_alb.h
+index 1dfbe69caad3..609c3c2f6163 100644
+--- a/drivers/net/bonding/bond_alb.h
++++ b/drivers/net/bonding/bond_alb.h
+@@ -140,12 +140,20 @@ struct tlb_slave_info {
+ 			 */
+ };
+ 
++struct tlb_up_slave {
++	unsigned int	count;
++	struct rcu_head rcu;
++	struct slave	*arr[0];
++};
++
+ struct alb_bond_info {
+ 	struct tlb_client_info	*tx_hashtbl; /* Dynamically allocated */
+ 	spinlock_t		tx_hashtbl_lock;
+ 	u32			unbalanced_load;
+ 	int			tx_rebalance_counter;
+ 	int			lp_counter;
++	/* -------- non-dynamic tlb mode only ---------*/
++	struct tlb_up_slave __rcu *slave_arr;	  /* Up slaves */
+ 	/* -------- rlb parameters -------- */
+ 	int rlb_enabled;
+ 	struct rlb_client_info	*rx_hashtbl;	/* Receive hash table */
+* Unmerged path drivers/net/bonding/bonding.h
