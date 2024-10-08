@@ -1,0 +1,209 @@
+cxgb4: Add support for devlog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 49aa284ffe64c4c13d63d315aa374e0f4bdd4b7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/49aa284f.failed
+
+Add support for device log entry in debugfs
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 49aa284ffe64c4c13d63d315aa374e0f4bdd4b7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 067eaa5ac000..2e6b052bebbf 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -290,11 +290,19 @@ enum chip_type {
+ 	T5_LAST_REV	= T5_A1,
+ };
+ 
++struct devlog_params {
++	u32 memtype;                    /* which memory (EDC0, EDC1, MC) */
++	u32 start;                      /* start of log in firmware memory */
++	u32 size;                       /* size of log */
++};
++
+ struct adapter_params {
+ 	struct sge_params sge;
+ 	struct tp_params  tp;
+ 	struct vpd_params vpd;
+ 	struct pci_params pci;
++	struct devlog_params devlog;
++	enum pcie_memwin drv_memwin;
+ 
+ 	unsigned int sf_size;             /* serial flash size in bytes */
+ 	unsigned int sf_nsec;             /* # of flash sectors */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index eacea363ec4e..3a81d01709f9 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -5530,6 +5530,8 @@ static int adap_init0(struct adapter *adap)
+ 	enum dev_state state;
+ 	u32 params[7], val[7];
+ 	struct fw_caps_config_cmd caps_cmd;
++	struct fw_devlog_cmd devlog_cmd;
++	u32 devlog_meminfo;
+ 	int reset = 1;
+ 
+ 	/* Contact FW, advertising Master capability */
+@@ -5610,6 +5612,30 @@ static int adap_init0(struct adapter *adap)
+ 	if (ret < 0)
+ 		goto bye;
+ 
++	/* Read firmware device log parameters.  We really need to find a way
++	 * to get these parameters initialized with some default values (which
++	 * are likely to be correct) for the case where we either don't
++	 * attache to the firmware or it's crashed when we probe the adapter.
++	 * That way we'll still be able to perform early firmware startup
++	 * debugging ...  If the request to get the Firmware's Device Log
++	 * parameters fails, we'll live so we don't make that a fatal error.
++	 */
++	memset(&devlog_cmd, 0, sizeof(devlog_cmd));
++	devlog_cmd.op_to_write = htonl(FW_CMD_OP_V(FW_DEVLOG_CMD) |
++				       FW_CMD_REQUEST_F | FW_CMD_READ_F);
++	devlog_cmd.retval_len16 = htonl(FW_LEN16(devlog_cmd));
++	ret = t4_wr_mbox(adap, adap->mbox, &devlog_cmd, sizeof(devlog_cmd),
++			 &devlog_cmd);
++	if (ret == 0) {
++		devlog_meminfo =
++			ntohl(devlog_cmd.memtype_devlog_memaddr16_devlog);
++		adap->params.devlog.memtype =
++			FW_DEVLOG_CMD_MEMTYPE_DEVLOG_G(devlog_meminfo);
++		adap->params.devlog.start =
++			FW_DEVLOG_CMD_MEMADDR16_DEVLOG_G(devlog_meminfo) << 4;
++		adap->params.devlog.size = ntohl(devlog_cmd.memsize_devlog);
++	}
++
+ 	/*
+ 	 * Find out what ports are available to us.  Note that we need to do
+ 	 * this before calling adap_init0_no_config() since it needs nports
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+index c19a90e7f7d1..5e5eee6c6b5e 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+@@ -110,6 +110,18 @@ enum {
+ 	SGE_INGPADBOUNDARY_SHIFT = 5,/* ingress queue pad boundary */
+ };
+ 
++/* PCI-e memory window access */
++enum pcie_memwin {
++	MEMWIN_NIC      = 0,
++	MEMWIN_RSVD1    = 1,
++	MEMWIN_RSVD2    = 2,
++	MEMWIN_RDMA     = 3,
++	MEMWIN_RSVD4    = 4,
++	MEMWIN_FOISCSI  = 5,
++	MEMWIN_CSIOSTOR = 6,
++	MEMWIN_RSVD7    = 7,
++};
++
+ struct sge_qstat {                /* data written to SGE queue status entries */
+ 	__be32 qid;
+ 	__be16 cidx;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+index 6e8a06e7cea8..2a961e3f5d22 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+@@ -619,6 +619,7 @@ enum fw_cmd_opcodes {
+ 	FW_RSS_IND_TBL_CMD             = 0x20,
+ 	FW_RSS_GLB_CONFIG_CMD          = 0x22,
+ 	FW_RSS_VI_CONFIG_CMD           = 0x23,
++	FW_DEVLOG_CMD                  = 0x25,
+ 	FW_CLIP_CMD                    = 0x28,
+ 	FW_LASTC2E_CMD                 = 0x40,
+ 	FW_ERROR_CMD                   = 0x80,
+@@ -2271,4 +2272,84 @@ enum fw_hdr_flags {
+ 	FW_HDR_FLAGS_RESET_HALT = 0x00000001,
+ };
+ 
++/* length of the formatting string  */
++#define FW_DEVLOG_FMT_LEN	192
++
++/* maximum number of the formatting string parameters */
++#define FW_DEVLOG_FMT_PARAMS_NUM 8
++
++/* priority levels */
++enum fw_devlog_level {
++	FW_DEVLOG_LEVEL_EMERG	= 0x0,
++	FW_DEVLOG_LEVEL_CRIT	= 0x1,
++	FW_DEVLOG_LEVEL_ERR	= 0x2,
++	FW_DEVLOG_LEVEL_NOTICE	= 0x3,
++	FW_DEVLOG_LEVEL_INFO	= 0x4,
++	FW_DEVLOG_LEVEL_DEBUG	= 0x5,
++	FW_DEVLOG_LEVEL_MAX	= 0x5,
++};
++
++/* facilities that may send a log message */
++enum fw_devlog_facility {
++	FW_DEVLOG_FACILITY_CORE		= 0x00,
++	FW_DEVLOG_FACILITY_CF		= 0x01,
++	FW_DEVLOG_FACILITY_SCHED	= 0x02,
++	FW_DEVLOG_FACILITY_TIMER	= 0x04,
++	FW_DEVLOG_FACILITY_RES		= 0x06,
++	FW_DEVLOG_FACILITY_HW		= 0x08,
++	FW_DEVLOG_FACILITY_FLR		= 0x10,
++	FW_DEVLOG_FACILITY_DMAQ		= 0x12,
++	FW_DEVLOG_FACILITY_PHY		= 0x14,
++	FW_DEVLOG_FACILITY_MAC		= 0x16,
++	FW_DEVLOG_FACILITY_PORT		= 0x18,
++	FW_DEVLOG_FACILITY_VI		= 0x1A,
++	FW_DEVLOG_FACILITY_FILTER	= 0x1C,
++	FW_DEVLOG_FACILITY_ACL		= 0x1E,
++	FW_DEVLOG_FACILITY_TM		= 0x20,
++	FW_DEVLOG_FACILITY_QFC		= 0x22,
++	FW_DEVLOG_FACILITY_DCB		= 0x24,
++	FW_DEVLOG_FACILITY_ETH		= 0x26,
++	FW_DEVLOG_FACILITY_OFLD		= 0x28,
++	FW_DEVLOG_FACILITY_RI		= 0x2A,
++	FW_DEVLOG_FACILITY_ISCSI	= 0x2C,
++	FW_DEVLOG_FACILITY_FCOE		= 0x2E,
++	FW_DEVLOG_FACILITY_FOISCSI	= 0x30,
++	FW_DEVLOG_FACILITY_FOFCOE	= 0x32,
++	FW_DEVLOG_FACILITY_MAX		= 0x32,
++};
++
++/* log message format */
++struct fw_devlog_e {
++	__be64	timestamp;
++	__be32	seqno;
++	__be16	reserved1;
++	__u8	level;
++	__u8	facility;
++	__u8	fmt[FW_DEVLOG_FMT_LEN];
++	__be32	params[FW_DEVLOG_FMT_PARAMS_NUM];
++	__be32	reserved3[4];
++};
++
++struct fw_devlog_cmd {
++	__be32 op_to_write;
++	__be32 retval_len16;
++	__u8   level;
++	__u8   r2[7];
++	__be32 memtype_devlog_memaddr16_devlog;
++	__be32 memsize_devlog;
++	__be32 r3[2];
++};
++
++#define FW_DEVLOG_CMD_MEMTYPE_DEVLOG_S		28
++#define FW_DEVLOG_CMD_MEMTYPE_DEVLOG_M		0xf
++#define FW_DEVLOG_CMD_MEMTYPE_DEVLOG_G(x)	\
++	(((x) >> FW_DEVLOG_CMD_MEMTYPE_DEVLOG_S) & \
++	 FW_DEVLOG_CMD_MEMTYPE_DEVLOG_M)
++
++#define FW_DEVLOG_CMD_MEMADDR16_DEVLOG_S	0
++#define FW_DEVLOG_CMD_MEMADDR16_DEVLOG_M	0xfffffff
++#define FW_DEVLOG_CMD_MEMADDR16_DEVLOG_G(x)	\
++	(((x) >> FW_DEVLOG_CMD_MEMADDR16_DEVLOG_S) & \
++	 FW_DEVLOG_CMD_MEMADDR16_DEVLOG_M)
++
+ #endif /* _T4FW_INTERFACE_H_ */
