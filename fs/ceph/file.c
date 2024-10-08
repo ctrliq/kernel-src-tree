@@ -595,7 +595,7 @@ ceph_sync_direct_write(struct kiocb *iocb, const struct iovec *iov,
 			break;
 		}
 
-		osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
+		osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
 
 		num_pages = calc_pages_for(page_align, len);
 		pages = ceph_get_direct_page_vector(data, num_pages, false);
