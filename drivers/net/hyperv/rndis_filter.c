@@ -490,7 +490,7 @@ static int rndis_filter_query_device(struct rndis_device *dev, u32 oid,
 	struct rndis_query_request *query;
 	struct rndis_query_complete *query_complete;
 	int ret = 0;
-	int t;
+	unsigned long t;
 
 	if (!result)
 		return -EINVAL;
@@ -580,7 +580,8 @@ int rndis_filter_set_device_mac(struct hv_device *hdev, char *mac)
 	char macstr[2*ETH_ALEN+1];
 	u32 extlen = sizeof(struct rndis_config_parameter_info) +
 		2*NWADR_STRLEN + 4*ETH_ALEN;
-	int ret, t;
+	int ret;
+	unsigned long t;
 
 	request = get_rndis_request(rdev, RNDIS_MSG_SET,
 		RNDIS_MESSAGE_SIZE(struct rndis_set_request) + extlen);
@@ -655,7 +656,8 @@ rndis_filter_set_offload_params(struct hv_device *hdev,
 	struct ndis_offload_params *offload_params;
 	struct rndis_set_complete *set_complete;
 	u32 extlen = sizeof(struct ndis_offload_params);
-	int ret, t;
+	int ret;
+	unsigned long t;
 	u32 vsp_version = nvdev->nvsp_version;
 
 	if (vsp_version <= NVSP_PROTOCOL_VERSION_4) {
@@ -729,7 +731,8 @@ static int rndis_filter_set_rss_param(struct rndis_device *rdev, int num_queue)
 	struct ndis_recv_scale_param *rssp;
 	u32 *itab;
 	u8 *keyp;
-	int i, t, ret;
+	int i, ret;
+	unsigned long t;
 
 	request = get_rndis_request(
 			rdev, RNDIS_MSG_SET,
@@ -813,7 +816,8 @@ int rndis_filter_set_packet_filter(struct rndis_device *dev, u32 new_filter)
 	struct rndis_set_request *set;
 	struct rndis_set_complete *set_complete;
 	u32 status;
-	int ret, t;
+	int ret;
+	unsigned long t;
 	struct net_device *ndev;
 
 	ndev = dev->net_dev->ndev;
@@ -869,7 +873,8 @@ static int rndis_filter_init_device(struct rndis_device *dev)
 	struct rndis_initialize_request *init;
 	struct rndis_initialize_complete *init_complete;
 	u32 status;
-	int ret, t;
+	int ret;
+	unsigned long t;
 
 	request = get_rndis_request(dev, RNDIS_MSG_INIT,
 			RNDIS_MESSAGE_SIZE(struct rndis_initialize_request));
@@ -1019,7 +1024,7 @@ int rndis_filter_device_add(struct hv_device *dev,
 	struct netvsc_device_info *device_info = additional_info;
 	struct ndis_offload_params offloads;
 	struct nvsp_message *init_packet;
-	int t;
+	unsigned long t;
 	struct ndis_recv_scale_cap rsscap;
 	u32 rsscap_size = sizeof(struct ndis_recv_scale_cap);
 	u32 mtu, size;
