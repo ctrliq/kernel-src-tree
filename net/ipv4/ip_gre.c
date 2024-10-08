@@ -240,6 +240,8 @@ static void __gre_xmit(struct sk_buff *skb, struct net_device *dev,
 	/* Push GRE header. */
 	gre_build_header(skb, &tpi, tunnel->hlen);
 
+	skb_set_inner_protocol(skb, tpi.proto);
+
 	ip_tunnel_xmit(skb, dev, tnl_params, tnl_params->protocol);
 }
 
