@@ -1,0 +1,159 @@
+perf hists browser: Implement hierarchy output
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit d0506edbec7d04dcca632fddfc162faa78d5527a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d0506edb.failed
+
+Implement hierarchy mode in TUI.  The output is look like stdio but it
+also supports to fold/unfold children dynamically.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1456326830-30456-14-git-send-email-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d0506edbec7d04dcca632fddfc162faa78d5527a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/ui/browsers/hists.c
+diff --cc tools/perf/ui/browsers/hists.c
+index 0489502d0db6,2bccf68ce5f1..000000000000
+--- a/tools/perf/ui/browsers/hists.c
++++ b/tools/perf/ui/browsers/hists.c
+@@@ -1513,12 -1732,71 +1685,70 @@@ static int hist_browser__fprintf_entry(
+  			first = false;
+  
+  		ret = fmt->entry(fmt, &hpp, he);
+ -		ret = hist_entry__snprintf_alignment(he, &hpp, fmt, ret);
+  		advance_hpp(&hpp, ret);
+  	}
+ -	printed += fprintf(fp, "%s\n", s);
+ +	printed += fprintf(fp, "%s\n", rtrim(s));
+  
+  	if (folded_sign == '-')
+- 		printed += hist_browser__fprintf_callchain(browser, he, fp);
++ 		printed += hist_browser__fprintf_callchain(browser, he, fp, 1);
++ 
++ 	return printed;
++ }
++ 
++ 
++ static int hist_browser__fprintf_hierarchy_entry(struct hist_browser *browser,
++ 						 struct hist_entry *he,
++ 						 FILE *fp, int level,
++ 						 int nr_sort_keys)
++ {
++ 	char s[8192];
++ 	int printed = 0;
++ 	char folded_sign = ' ';
++ 	struct perf_hpp hpp = {
++ 		.buf = s,
++ 		.size = sizeof(s),
++ 	};
++ 	struct perf_hpp_fmt *fmt;
++ 	bool first = true;
++ 	int ret;
++ 	int hierarchy_indent = (nr_sort_keys + 1) * HIERARCHY_INDENT;
++ 
++ 	printed = fprintf(fp, "%*s", level * HIERARCHY_INDENT, "");
++ 
++ 	folded_sign = hist_entry__folded(he);
++ 	printed += fprintf(fp, "%c", folded_sign);
++ 
++ 	hists__for_each_format(he->hists, fmt) {
++ 		if (perf_hpp__should_skip(fmt, he->hists))
++ 			continue;
++ 
++ 		if (perf_hpp__is_sort_entry(fmt) ||
++ 		    perf_hpp__is_dynamic_entry(fmt))
++ 			break;
++ 
++ 		if (!first) {
++ 			ret = scnprintf(hpp.buf, hpp.size, "  ");
++ 			advance_hpp(&hpp, ret);
++ 		} else
++ 			first = false;
++ 
++ 		ret = fmt->entry(fmt, &hpp, he);
++ 		advance_hpp(&hpp, ret);
++ 	}
++ 
++ 	ret = scnprintf(hpp.buf, hpp.size, "%*s", hierarchy_indent, "");
++ 	advance_hpp(&hpp, ret);
++ 
++ 	fmt = he->fmt;
++ 	ret = fmt->entry(fmt, &hpp, he);
++ 	advance_hpp(&hpp, ret);
++ 
++ 	printed += fprintf(fp, "%s\n", rtrim(s));
++ 
++ 	if (he->leaf && folded_sign == '-') {
++ 		printed += hist_browser__fprintf_callchain(browser, he, fp,
++ 							   he->depth + 1);
++ 	}
+  
+  	return printed;
+  }
+@@@ -2047,6 -2379,48 +2287,51 @@@ static void hist_browser__update_nr_ent
+  	hb->nr_hierarchy_entries = nr_entries;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hist_browser__update_percent_limit(struct hist_browser *hb,
++ 					       double percent)
++ {
++ 	struct hist_entry *he;
++ 	struct rb_node *nd = rb_first(&hb->hists->entries);
++ 	u64 total = hists__total_period(hb->hists);
++ 	u64 min_callchain_hits = total * (percent / 100);
++ 
++ 	hb->min_pcnt = callchain_param.min_percent = percent;
++ 
++ 	while ((nd = hists__filter_entries(nd, hb->min_pcnt)) != NULL) {
++ 		he = rb_entry(nd, struct hist_entry, rb_node);
++ 
++ 		if (!he->leaf || !symbol_conf.use_callchain)
++ 			goto next;
++ 
++ 		if (callchain_param.mode == CHAIN_GRAPH_REL) {
++ 			total = he->stat.period;
++ 
++ 			if (symbol_conf.cumulate_callchain)
++ 				total = he->stat_acc->period;
++ 
++ 			min_callchain_hits = total * (percent / 100);
++ 		}
++ 
++ 		callchain_param.sort(&he->sorted_chain, he->callchain,
++ 				     min_callchain_hits, &callchain_param);
++ 
++ next:
++ 		/*
++ 		 * Tentatively set unfolded so that the rb_hierarchy_next()
++ 		 * can toggle children of folded entries too.
++ 		 */
++ 		he->unfolded = he->has_children;
++ 		nd = rb_hierarchy_next(nd);
++ 
++ 		/* force to re-evaluate folding state of callchains */
++ 		he->init_have_children = false;
++ 		hist_entry__set_folding(he, hb, false);
++ 	}
++ }
++ 
+++>>>>>>> d0506edbec7d (perf hists browser: Implement hierarchy output)
+  static int perf_evsel__hists_browse(struct perf_evsel *evsel, int nr_events,
+  				    const char *helpline,
+  				    bool left_exits,
+* Unmerged path tools/perf/ui/browsers/hists.c
