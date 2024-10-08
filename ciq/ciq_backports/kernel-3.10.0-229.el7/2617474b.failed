@@ -1,0 +1,585 @@
+cifs: remove unused variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author zhengbin <zhengbin13@huawei.com>
+commit 2617474bfa33ab6c47c515e57dfbe754f8970640
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2617474b.failed
+
+In smb3_punch_hole, variable cifsi set but not used, remove it.
+In cifs_lock, variable netfid set but not used, remove it.
+
+	Reported-by: Hulk Robot <hulkci@huawei.com>
+	Signed-off-by: zhengbin <zhengbin13@huawei.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 2617474bfa33ab6c47c515e57dfbe754f8970640)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/file.c
+index a6da087c94b5,ab07ae882e62..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -1577,9 -1709,7 +1576,13 @@@ int cifs_lock(struct file *file, int cm
+  
+  	cifs_read_flock(flock, &type, &lock, &unlock, &wait_flag,
+  			tcon->ses->server);
+++<<<<<<< HEAD
+ +
+ +	cifs_sb = CIFS_SB(file->f_path.dentry->d_sb);
+ +	netfid = cfile->fid.netfid;
+++=======
++ 	cifs_sb = CIFS_FILE_SB(file);
+++>>>>>>> 2617474bfa33 (cifs: remove unused variable)
+  	cinode = CIFS_I(file_inode(file));
+  
+  	if (cap_unix(tcon->ses) &&
+diff --cc fs/cifs/smb2ops.c
+index 35ddc3ed119d,070d0b7b21dc..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -904,6 -2725,541 +904,538 @@@ smb2_query_symlink(const unsigned int x
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct cifs_ntsd *
++ get_smb2_acl_by_fid(struct cifs_sb_info *cifs_sb,
++ 		const struct cifs_fid *cifsfid, u32 *pacllen)
++ {
++ 	struct cifs_ntsd *pntsd = NULL;
++ 	unsigned int xid;
++ 	int rc = -EOPNOTSUPP;
++ 	struct tcon_link *tlink = cifs_sb_tlink(cifs_sb);
++ 
++ 	if (IS_ERR(tlink))
++ 		return ERR_CAST(tlink);
++ 
++ 	xid = get_xid();
++ 	cifs_dbg(FYI, "trying to get acl\n");
++ 
++ 	rc = SMB2_query_acl(xid, tlink_tcon(tlink), cifsfid->persistent_fid,
++ 			    cifsfid->volatile_fid, (void **)&pntsd, pacllen);
++ 	free_xid(xid);
++ 
++ 	cifs_put_tlink(tlink);
++ 
++ 	cifs_dbg(FYI, "%s: rc = %d ACL len %d\n", __func__, rc, *pacllen);
++ 	if (rc)
++ 		return ERR_PTR(rc);
++ 	return pntsd;
++ 
++ }
++ 
++ static struct cifs_ntsd *
++ get_smb2_acl_by_path(struct cifs_sb_info *cifs_sb,
++ 		const char *path, u32 *pacllen)
++ {
++ 	struct cifs_ntsd *pntsd = NULL;
++ 	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
++ 	unsigned int xid;
++ 	int rc;
++ 	struct cifs_tcon *tcon;
++ 	struct tcon_link *tlink = cifs_sb_tlink(cifs_sb);
++ 	struct cifs_fid fid;
++ 	struct cifs_open_parms oparms;
++ 	__le16 *utf16_path;
++ 
++ 	cifs_dbg(FYI, "get smb3 acl for path %s\n", path);
++ 	if (IS_ERR(tlink))
++ 		return ERR_CAST(tlink);
++ 
++ 	tcon = tlink_tcon(tlink);
++ 	xid = get_xid();
++ 
++ 	if (backup_cred(cifs_sb))
++ 		oparms.create_options = CREATE_OPEN_BACKUP_INTENT;
++ 	else
++ 		oparms.create_options = 0;
++ 
++ 	utf16_path = cifs_convert_path_to_utf16(path, cifs_sb);
++ 	if (!utf16_path) {
++ 		rc = -ENOMEM;
++ 		free_xid(xid);
++ 		return ERR_PTR(rc);
++ 	}
++ 
++ 	oparms.tcon = tcon;
++ 	oparms.desired_access = READ_CONTROL;
++ 	oparms.disposition = FILE_OPEN;
++ 	oparms.fid = &fid;
++ 	oparms.reconnect = false;
++ 
++ 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
++ 	kfree(utf16_path);
++ 	if (!rc) {
++ 		rc = SMB2_query_acl(xid, tlink_tcon(tlink), fid.persistent_fid,
++ 			    fid.volatile_fid, (void **)&pntsd, pacllen);
++ 		SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
++ 	}
++ 
++ 	cifs_put_tlink(tlink);
++ 	free_xid(xid);
++ 
++ 	cifs_dbg(FYI, "%s: rc = %d ACL len %d\n", __func__, rc, *pacllen);
++ 	if (rc)
++ 		return ERR_PTR(rc);
++ 	return pntsd;
++ }
++ 
++ static int
++ set_smb2_acl(struct cifs_ntsd *pnntsd, __u32 acllen,
++ 		struct inode *inode, const char *path, int aclflag)
++ {
++ 	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
++ 	unsigned int xid;
++ 	int rc, access_flags = 0;
++ 	struct cifs_tcon *tcon;
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++ 	struct tcon_link *tlink = cifs_sb_tlink(cifs_sb);
++ 	struct cifs_fid fid;
++ 	struct cifs_open_parms oparms;
++ 	__le16 *utf16_path;
++ 
++ 	cifs_dbg(FYI, "set smb3 acl for path %s\n", path);
++ 	if (IS_ERR(tlink))
++ 		return PTR_ERR(tlink);
++ 
++ 	tcon = tlink_tcon(tlink);
++ 	xid = get_xid();
++ 
++ 	if (backup_cred(cifs_sb))
++ 		oparms.create_options = CREATE_OPEN_BACKUP_INTENT;
++ 	else
++ 		oparms.create_options = 0;
++ 
++ 	if (aclflag == CIFS_ACL_OWNER || aclflag == CIFS_ACL_GROUP)
++ 		access_flags = WRITE_OWNER;
++ 	else
++ 		access_flags = WRITE_DAC;
++ 
++ 	utf16_path = cifs_convert_path_to_utf16(path, cifs_sb);
++ 	if (!utf16_path) {
++ 		rc = -ENOMEM;
++ 		free_xid(xid);
++ 		return rc;
++ 	}
++ 
++ 	oparms.tcon = tcon;
++ 	oparms.desired_access = access_flags;
++ 	oparms.disposition = FILE_OPEN;
++ 	oparms.path = path;
++ 	oparms.fid = &fid;
++ 	oparms.reconnect = false;
++ 
++ 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
++ 	kfree(utf16_path);
++ 	if (!rc) {
++ 		rc = SMB2_set_acl(xid, tlink_tcon(tlink), fid.persistent_fid,
++ 			    fid.volatile_fid, pnntsd, acllen, aclflag);
++ 		SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
++ 	}
++ 
++ 	cifs_put_tlink(tlink);
++ 	free_xid(xid);
++ 	return rc;
++ }
++ 
++ /* Retrieve an ACL from the server */
++ static struct cifs_ntsd *
++ get_smb2_acl(struct cifs_sb_info *cifs_sb,
++ 				      struct inode *inode, const char *path,
++ 				      u32 *pacllen)
++ {
++ 	struct cifs_ntsd *pntsd = NULL;
++ 	struct cifsFileInfo *open_file = NULL;
++ 
++ 	if (inode)
++ 		open_file = find_readable_file(CIFS_I(inode), true);
++ 	if (!open_file)
++ 		return get_smb2_acl_by_path(cifs_sb, path, pacllen);
++ 
++ 	pntsd = get_smb2_acl_by_fid(cifs_sb, &open_file->fid, pacllen);
++ 	cifsFileInfo_put(open_file);
++ 	return pntsd;
++ }
++ 
++ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
++ 			    loff_t offset, loff_t len, bool keep_size)
++ {
++ 	struct cifs_ses *ses = tcon->ses;
++ 	struct inode *inode;
++ 	struct cifsInodeInfo *cifsi;
++ 	struct cifsFileInfo *cfile = file->private_data;
++ 	struct file_zero_data_information fsctl_buf;
++ 	long rc;
++ 	unsigned int xid;
++ 	__le64 eof;
++ 
++ 	xid = get_xid();
++ 
++ 	inode = d_inode(cfile->dentry);
++ 	cifsi = CIFS_I(inode);
++ 
++ 	trace_smb3_zero_enter(xid, cfile->fid.persistent_fid, tcon->tid,
++ 			      ses->Suid, offset, len);
++ 
++ 
++ 	/* if file not oplocked can't be sure whether asking to extend size */
++ 	if (!CIFS_CACHE_READ(cifsi))
++ 		if (keep_size == false) {
++ 			rc = -EOPNOTSUPP;
++ 			trace_smb3_zero_err(xid, cfile->fid.persistent_fid,
++ 				tcon->tid, ses->Suid, offset, len, rc);
++ 			free_xid(xid);
++ 			return rc;
++ 		}
++ 
++ 	cifs_dbg(FYI, "Offset %lld len %lld\n", offset, len);
++ 
++ 	fsctl_buf.FileOffset = cpu_to_le64(offset);
++ 	fsctl_buf.BeyondFinalZero = cpu_to_le64(offset + len);
++ 
++ 	rc = SMB2_ioctl(xid, tcon, cfile->fid.persistent_fid,
++ 			cfile->fid.volatile_fid, FSCTL_SET_ZERO_DATA, true,
++ 			(char *)&fsctl_buf,
++ 			sizeof(struct file_zero_data_information),
++ 			0, NULL, NULL);
++ 	if (rc)
++ 		goto zero_range_exit;
++ 
++ 	/*
++ 	 * do we also need to change the size of the file?
++ 	 */
++ 	if (keep_size == false && i_size_read(inode) < offset + len) {
++ 		eof = cpu_to_le64(offset + len);
++ 		rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
++ 				  cfile->fid.volatile_fid, cfile->pid, &eof);
++ 	}
++ 
++  zero_range_exit:
++ 	free_xid(xid);
++ 	if (rc)
++ 		trace_smb3_zero_err(xid, cfile->fid.persistent_fid, tcon->tid,
++ 			      ses->Suid, offset, len, rc);
++ 	else
++ 		trace_smb3_zero_done(xid, cfile->fid.persistent_fid, tcon->tid,
++ 			      ses->Suid, offset, len);
++ 	return rc;
++ }
++ 
++ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
++ 			    loff_t offset, loff_t len)
++ {
++ 	struct inode *inode;
++ 	struct cifsFileInfo *cfile = file->private_data;
++ 	struct file_zero_data_information fsctl_buf;
++ 	long rc;
++ 	unsigned int xid;
++ 	__u8 set_sparse = 1;
++ 
++ 	xid = get_xid();
++ 
++ 	inode = d_inode(cfile->dentry);
++ 
++ 	/* Need to make file sparse, if not already, before freeing range. */
++ 	/* Consider adding equivalent for compressed since it could also work */
++ 	if (!smb2_set_sparse(xid, tcon, cfile, inode, set_sparse)) {
++ 		rc = -EOPNOTSUPP;
++ 		free_xid(xid);
++ 		return rc;
++ 	}
++ 
++ 	cifs_dbg(FYI, "Offset %lld len %lld\n", offset, len);
++ 
++ 	fsctl_buf.FileOffset = cpu_to_le64(offset);
++ 	fsctl_buf.BeyondFinalZero = cpu_to_le64(offset + len);
++ 
++ 	rc = SMB2_ioctl(xid, tcon, cfile->fid.persistent_fid,
++ 			cfile->fid.volatile_fid, FSCTL_SET_ZERO_DATA,
++ 			true /* is_fctl */, (char *)&fsctl_buf,
++ 			sizeof(struct file_zero_data_information),
++ 			CIFSMaxBufSize, NULL, NULL);
++ 	free_xid(xid);
++ 	return rc;
++ }
++ 
++ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
++ 			    loff_t off, loff_t len, bool keep_size)
++ {
++ 	struct inode *inode;
++ 	struct cifsInodeInfo *cifsi;
++ 	struct cifsFileInfo *cfile = file->private_data;
++ 	long rc = -EOPNOTSUPP;
++ 	unsigned int xid;
++ 	__le64 eof;
++ 
++ 	xid = get_xid();
++ 
++ 	inode = d_inode(cfile->dentry);
++ 	cifsi = CIFS_I(inode);
++ 
++ 	trace_smb3_falloc_enter(xid, cfile->fid.persistent_fid, tcon->tid,
++ 				tcon->ses->Suid, off, len);
++ 	/* if file not oplocked can't be sure whether asking to extend size */
++ 	if (!CIFS_CACHE_READ(cifsi))
++ 		if (keep_size == false) {
++ 			trace_smb3_falloc_err(xid, cfile->fid.persistent_fid,
++ 				tcon->tid, tcon->ses->Suid, off, len, rc);
++ 			free_xid(xid);
++ 			return rc;
++ 		}
++ 
++ 	/*
++ 	 * Files are non-sparse by default so falloc may be a no-op
++ 	 * Must check if file sparse. If not sparse, and not extending
++ 	 * then no need to do anything since file already allocated
++ 	 */
++ 	if ((cifsi->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE) == 0) {
++ 		if (keep_size == true)
++ 			rc = 0;
++ 		/* check if extending file */
++ 		else if (i_size_read(inode) >= off + len)
++ 			/* not extending file and already not sparse */
++ 			rc = 0;
++ 		/* BB: in future add else clause to extend file */
++ 		else
++ 			rc = -EOPNOTSUPP;
++ 		if (rc)
++ 			trace_smb3_falloc_err(xid, cfile->fid.persistent_fid,
++ 				tcon->tid, tcon->ses->Suid, off, len, rc);
++ 		else
++ 			trace_smb3_falloc_done(xid, cfile->fid.persistent_fid,
++ 				tcon->tid, tcon->ses->Suid, off, len);
++ 		free_xid(xid);
++ 		return rc;
++ 	}
++ 
++ 	if ((keep_size == true) || (i_size_read(inode) >= off + len)) {
++ 		/*
++ 		 * Check if falloc starts within first few pages of file
++ 		 * and ends within a few pages of the end of file to
++ 		 * ensure that most of file is being forced to be
++ 		 * fallocated now. If so then setting whole file sparse
++ 		 * ie potentially making a few extra pages at the beginning
++ 		 * or end of the file non-sparse via set_sparse is harmless.
++ 		 */
++ 		if ((off > 8192) || (off + len + 8192 < i_size_read(inode))) {
++ 			rc = -EOPNOTSUPP;
++ 			trace_smb3_falloc_err(xid, cfile->fid.persistent_fid,
++ 				tcon->tid, tcon->ses->Suid, off, len, rc);
++ 			free_xid(xid);
++ 			return rc;
++ 		}
++ 
++ 		smb2_set_sparse(xid, tcon, cfile, inode, false);
++ 		rc = 0;
++ 	} else {
++ 		smb2_set_sparse(xid, tcon, cfile, inode, false);
++ 		rc = 0;
++ 		if (i_size_read(inode) < off + len) {
++ 			eof = cpu_to_le64(off + len);
++ 			rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
++ 					  cfile->fid.volatile_fid, cfile->pid,
++ 					  &eof);
++ 		}
++ 	}
++ 
++ 	if (rc)
++ 		trace_smb3_falloc_err(xid, cfile->fid.persistent_fid, tcon->tid,
++ 				tcon->ses->Suid, off, len, rc);
++ 	else
++ 		trace_smb3_falloc_done(xid, cfile->fid.persistent_fid, tcon->tid,
++ 				tcon->ses->Suid, off, len);
++ 
++ 	free_xid(xid);
++ 	return rc;
++ }
++ 
++ static loff_t smb3_llseek(struct file *file, struct cifs_tcon *tcon, loff_t offset, int whence)
++ {
++ 	struct cifsFileInfo *wrcfile, *cfile = file->private_data;
++ 	struct cifsInodeInfo *cifsi;
++ 	struct inode *inode;
++ 	int rc = 0;
++ 	struct file_allocated_range_buffer in_data, *out_data = NULL;
++ 	u32 out_data_len;
++ 	unsigned int xid;
++ 
++ 	if (whence != SEEK_HOLE && whence != SEEK_DATA)
++ 		return generic_file_llseek(file, offset, whence);
++ 
++ 	inode = d_inode(cfile->dentry);
++ 	cifsi = CIFS_I(inode);
++ 
++ 	if (offset < 0 || offset >= i_size_read(inode))
++ 		return -ENXIO;
++ 
++ 	xid = get_xid();
++ 	/*
++ 	 * We need to be sure that all dirty pages are written as they
++ 	 * might fill holes on the server.
++ 	 * Note that we also MUST flush any written pages since at least
++ 	 * some servers (Windows2016) will not reflect recent writes in
++ 	 * QUERY_ALLOCATED_RANGES until SMB2_flush is called.
++ 	 */
++ 	wrcfile = find_writable_file(cifsi, false);
++ 	if (wrcfile) {
++ 		filemap_write_and_wait(inode->i_mapping);
++ 		smb2_flush_file(xid, tcon, &wrcfile->fid);
++ 		cifsFileInfo_put(wrcfile);
++ 	}
++ 
++ 	if (!(cifsi->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE)) {
++ 		if (whence == SEEK_HOLE)
++ 			offset = i_size_read(inode);
++ 		goto lseek_exit;
++ 	}
++ 
++ 	in_data.file_offset = cpu_to_le64(offset);
++ 	in_data.length = cpu_to_le64(i_size_read(inode));
++ 
++ 	rc = SMB2_ioctl(xid, tcon, cfile->fid.persistent_fid,
++ 			cfile->fid.volatile_fid,
++ 			FSCTL_QUERY_ALLOCATED_RANGES, true,
++ 			(char *)&in_data, sizeof(in_data),
++ 			sizeof(struct file_allocated_range_buffer),
++ 			(char **)&out_data, &out_data_len);
++ 	if (rc == -E2BIG)
++ 		rc = 0;
++ 	if (rc)
++ 		goto lseek_exit;
++ 
++ 	if (whence == SEEK_HOLE && out_data_len == 0)
++ 		goto lseek_exit;
++ 
++ 	if (whence == SEEK_DATA && out_data_len == 0) {
++ 		rc = -ENXIO;
++ 		goto lseek_exit;
++ 	}
++ 
++ 	if (out_data_len < sizeof(struct file_allocated_range_buffer)) {
++ 		rc = -EINVAL;
++ 		goto lseek_exit;
++ 	}
++ 	if (whence == SEEK_DATA) {
++ 		offset = le64_to_cpu(out_data->file_offset);
++ 		goto lseek_exit;
++ 	}
++ 	if (offset < le64_to_cpu(out_data->file_offset))
++ 		goto lseek_exit;
++ 
++ 	offset = le64_to_cpu(out_data->file_offset) + le64_to_cpu(out_data->length);
++ 
++  lseek_exit:
++ 	free_xid(xid);
++ 	kfree(out_data);
++ 	if (!rc)
++ 		return vfs_setpos(file, offset, inode->i_sb->s_maxbytes);
++ 	else
++ 		return rc;
++ }
++ 
++ static int smb3_fiemap(struct cifs_tcon *tcon,
++ 		       struct cifsFileInfo *cfile,
++ 		       struct fiemap_extent_info *fei, u64 start, u64 len)
++ {
++ 	unsigned int xid;
++ 	struct file_allocated_range_buffer in_data, *out_data;
++ 	u32 out_data_len;
++ 	int i, num, rc, flags, last_blob;
++ 	u64 next;
++ 
++ 	if (fiemap_check_flags(fei, FIEMAP_FLAG_SYNC))
++ 		return -EBADR;
++ 
++ 	xid = get_xid();
++  again:
++ 	in_data.file_offset = cpu_to_le64(start);
++ 	in_data.length = cpu_to_le64(len);
++ 
++ 	rc = SMB2_ioctl(xid, tcon, cfile->fid.persistent_fid,
++ 			cfile->fid.volatile_fid,
++ 			FSCTL_QUERY_ALLOCATED_RANGES, true,
++ 			(char *)&in_data, sizeof(in_data),
++ 			1024 * sizeof(struct file_allocated_range_buffer),
++ 			(char **)&out_data, &out_data_len);
++ 	if (rc == -E2BIG) {
++ 		last_blob = 0;
++ 		rc = 0;
++ 	} else
++ 		last_blob = 1;
++ 	if (rc)
++ 		goto out;
++ 
++ 	if (out_data_len < sizeof(struct file_allocated_range_buffer)) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
++ 	if (out_data_len % sizeof(struct file_allocated_range_buffer)) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	num = out_data_len / sizeof(struct file_allocated_range_buffer);
++ 	for (i = 0; i < num; i++) {
++ 		flags = 0;
++ 		if (i == num - 1 && last_blob)
++ 			flags |= FIEMAP_EXTENT_LAST;
++ 
++ 		rc = fiemap_fill_next_extent(fei,
++ 				le64_to_cpu(out_data[i].file_offset),
++ 				le64_to_cpu(out_data[i].file_offset),
++ 				le64_to_cpu(out_data[i].length),
++ 				flags);
++ 		if (rc < 0)
++ 			goto out;
++ 		if (rc == 1) {
++ 			rc = 0;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	if (!last_blob) {
++ 		next = le64_to_cpu(out_data[num - 1].file_offset) +
++ 		  le64_to_cpu(out_data[num - 1].length);
++ 		len = len - (next - start);
++ 		start = next;
++ 		goto again;
++ 	}
++ 
++  out:
++ 	free_xid(xid);
++ 	kfree(out_data);
++ 	return rc;
++ }
++ 
++ static long smb3_fallocate(struct file *file, struct cifs_tcon *tcon, int mode,
++ 			   loff_t off, loff_t len)
++ {
++ 	/* KEEP_SIZE already checked for by do_fallocate */
++ 	if (mode & FALLOC_FL_PUNCH_HOLE)
++ 		return smb3_punch_hole(file, tcon, off, len);
++ 	else if (mode & FALLOC_FL_ZERO_RANGE) {
++ 		if (mode & FALLOC_FL_KEEP_SIZE)
++ 			return smb3_zero_range(file, tcon, off, len, true);
++ 		return smb3_zero_range(file, tcon, off, len, false);
++ 	} else if (mode == FALLOC_FL_KEEP_SIZE)
++ 		return smb3_simple_falloc(file, tcon, off, len, true);
++ 	else if (mode == 0)
++ 		return smb3_simple_falloc(file, tcon, off, len, false);
++ 
++ 	return -EOPNOTSUPP;
++ }
++ 
+++>>>>>>> 2617474bfa33 (cifs: remove unused variable)
+  static void
+  smb2_downgrade_oplock(struct TCP_Server_Info *server,
+  			struct cifsInodeInfo *cinode, bool set_level2)
+* Unmerged path fs/cifs/file.c
+* Unmerged path fs/cifs/smb2ops.c
