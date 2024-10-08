@@ -1,0 +1,141 @@
+rhashtable: introduce rhashtable_wakeup_worker helper function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ying Xue <ying.xue@windriver.com>
+commit 54c5b7d311c8e1801f9dcce9f388a7420a25fa90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/54c5b7d3.failed
+
+Introduce rhashtable_wakeup_worker() helper function to reduce
+duplicated code where to wake up worker.
+
+By the way, as long as the both "future_tbl" and "tbl" bucket table
+pointers point to the same bucket array, we should try to wake up
+the resizing worker thread, otherwise, it indicates the work of
+resizing hash table is not finished yet. However, currently we will
+wake up the worker thread only when the two pointers point to
+different bucket array. Obviously this is wrong. So, the issue is
+also fixed as well in the patch.
+
+	Signed-off-by: Ying Xue <ying.xue@windriver.com>
+	Cc: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 54c5b7d311c8e1801f9dcce9f388a7420a25fa90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index be20e9720492,20006854fce0..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -316,6 -475,36 +316,39 @@@ int rhashtable_shrink(struct rhashtabl
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_shrink);
+  
+++<<<<<<< HEAD
+++=======
++ static void rht_deferred_worker(struct work_struct *work)
++ {
++ 	struct rhashtable *ht;
++ 	struct bucket_table *tbl;
++ 
++ 	ht = container_of(work, struct rhashtable, run_work.work);
++ 	mutex_lock(&ht->mutex);
++ 	tbl = rht_dereference(ht->tbl, ht);
++ 
++ 	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
++ 		rhashtable_expand(ht);
++ 	else if (ht->p.shrink_decision && ht->p.shrink_decision(ht, tbl->size))
++ 		rhashtable_shrink(ht);
++ 
++ 	mutex_unlock(&ht->mutex);
++ }
++ 
++ static void rhashtable_wakeup_worker(struct rhashtable *ht)
++ {
++ 	struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 	struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	size_t size = tbl->size;
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl &&
++ 	    ((ht->p.grow_decision && ht->p.grow_decision(ht, size)) ||
++ 	     (ht->p.shrink_decision && ht->p.shrink_decision(ht, size))))
++ 		schedule_delayed_work(&ht->run_work, 0);
++ }
++ 
+++>>>>>>> 54c5b7d311c8 (rhashtable: introduce rhashtable_wakeup_worker helper function)
+  /**
+   * rhashtable_insert - insert object into hash hash table
+   * @ht:		hash table
+@@@ -329,18 -522,32 +362,26 @@@
+   */
+  void rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj)
+  {
+ -	struct bucket_table *tbl;
+ -	struct rhash_head *head;
+ -	spinlock_t *lock;
+ -	unsigned hash;
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+ +	u32 hash;
+  
+ -	rcu_read_lock();
+ +	ASSERT_RHT_MUTEX(ht);
+  
+ -	tbl = rht_dereference_rcu(ht->future_tbl, ht);
+  	hash = head_hashfn(ht, tbl, obj);
+ -	lock = bucket_lock(tbl, hash);
+ -
+ -	spin_lock_bh(lock);
+ -	head = rht_dereference_bucket(tbl->buckets[hash], tbl, hash);
+ -	if (rht_is_a_nulls(head))
+ -		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
+ -	else
+ -		RCU_INIT_POINTER(obj->next, head);
+ -
+ +	RCU_INIT_POINTER(obj->next, tbl->buckets[hash]);
+  	rcu_assign_pointer(tbl->buckets[hash], obj);
+ -	spin_unlock_bh(lock);
+ +	ht->nelems++;
+  
+++<<<<<<< HEAD
+ +	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
+ +		rhashtable_expand(ht);
+++=======
++ 	atomic_inc(&ht->nelems);
++ 
++ 	rhashtable_wakeup_worker(ht);
++ 
++ 	rcu_read_unlock();
+++>>>>>>> 54c5b7d311c8 (rhashtable: introduce rhashtable_wakeup_worker helper function)
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_insert);
+  
+@@@ -377,12 -589,14 +418,20 @@@ bool rhashtable_remove(struct rhashtabl
+  			continue;
+  		}
+  
+ -		rcu_assign_pointer(*pprev, obj->next);
+ -		atomic_dec(&ht->nelems);
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+  
+++<<<<<<< HEAD
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+++=======
++ 		spin_unlock_bh(lock);
++ 
++ 		rhashtable_wakeup_worker(ht);
++ 
++ 		rcu_read_unlock();
+++>>>>>>> 54c5b7d311c8 (rhashtable: introduce rhashtable_wakeup_worker helper function)
+  
+  		return true;
+  	}
+* Unmerged path lib/rhashtable.c
