@@ -1,0 +1,210 @@
+perf: Remove/simplify lockdep annotation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5fa7c8ec57f70a7b5c6fe269fa9c51b9e465989c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5fa7c8ec.failed
+
+Now that the perf_event_ctx_lock_nested() call has moved from
+put_event() into perf_event_release_kernel() the first reason is no
+longer valid as that can no longer happen.
+
+The second reason seems to have been invalidated when Al Viro made fput()
+unconditionally async in the following commit:
+
+  4a9d4b024a31 ("switch fput to task_work_add")
+
+such that munmap()->fput()->release()->perf_release() would no longer happen.
+
+Therefore, remove the annotation. This should increase the efficiency
+of lockdep coverage of perf locking.
+
+	Suggested-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5fa7c8ec57f70a7b5c6fe269fa9c51b9e465989c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e086d60d319b,f1e53e8d4ae2..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -3599,28 -3745,92 +3599,16 @@@ static void put_event(struct perf_even
+  	if (!is_kernel_event(event))
+  		perf_remove_from_owner(event);
+  
+- 	/*
+- 	 * There are two ways this annotation is useful:
+- 	 *
+- 	 *  1) there is a lock recursion from perf_event_exit_task
+- 	 *     see the comment there.
+- 	 *
+- 	 *  2) there is a lock-inversion with mmap_sem through
+- 	 *     perf_read_group(), which takes faults while
+- 	 *     holding ctx->mutex, however this is called after
+- 	 *     the last filedesc died, so there is no possibility
+- 	 *     to trigger the AB-BA case.
+- 	 */
+- 	ctx = perf_event_ctx_lock_nested(event, SINGLE_DEPTH_NESTING);
++ 	ctx = perf_event_ctx_lock(event);
+  	WARN_ON_ONCE(ctx->parent_ctx);
+ -	perf_remove_from_context(event, DETACH_GROUP | DETACH_STATE);
+ +	perf_remove_from_context(event, true);
+  	perf_event_ctx_unlock(event, ctx);
+  
+ -	/*
+ -	 * At this point we must have event->state == PERF_EVENT_STATE_EXIT,
+ -	 * either from the above perf_remove_from_context() or through
+ -	 * perf_event_exit_event().
+ -	 *
+ -	 * Therefore, anybody acquiring event->child_mutex after the below
+ -	 * loop _must_ also see this, most importantly inherit_event() which
+ -	 * will avoid placing more children on the list.
+ -	 *
+ -	 * Thus this guarantees that we will in fact observe and kill _ALL_
+ -	 * child events.
+ -	 */
+ -	WARN_ON_ONCE(event->state != PERF_EVENT_STATE_EXIT);
+ -
+ -again:
+ -	mutex_lock(&event->child_mutex);
+ -	list_for_each_entry(child, &event->child_list, child_list) {
+ -
+ -		/*
+ -		 * Cannot change, child events are not migrated, see the
+ -		 * comment with perf_event_ctx_lock_nested().
+ -		 */
+ -		ctx = lockless_dereference(child->ctx);
+ -		/*
+ -		 * Since child_mutex nests inside ctx::mutex, we must jump
+ -		 * through hoops. We start by grabbing a reference on the ctx.
+ -		 *
+ -		 * Since the event cannot get freed while we hold the
+ -		 * child_mutex, the context must also exist and have a !0
+ -		 * reference count.
+ -		 */
+ -		get_ctx(ctx);
+ -
+ -		/*
+ -		 * Now that we have a ctx ref, we can drop child_mutex, and
+ -		 * acquire ctx::mutex without fear of it going away. Then we
+ -		 * can re-acquire child_mutex.
+ -		 */
+ -		mutex_unlock(&event->child_mutex);
+ -		mutex_lock(&ctx->mutex);
+ -		mutex_lock(&event->child_mutex);
+ -
+ -		/*
+ -		 * Now that we hold ctx::mutex and child_mutex, revalidate our
+ -		 * state, if child is still the first entry, it didn't get freed
+ -		 * and we can continue doing so.
+ -		 */
+ -		tmp = list_first_entry_or_null(&event->child_list,
+ -					       struct perf_event, child_list);
+ -		if (tmp == child) {
+ -			perf_remove_from_context(child, DETACH_GROUP);
+ -			list_del(&child->child_list);
+ -			free_event(child);
+ -			/*
+ -			 * This matches the refcount bump in inherit_event();
+ -			 * this can't be the last reference.
+ -			 */
+ -			put_event(event);
+ -		}
+ -
+ -		mutex_unlock(&event->child_mutex);
+ -		mutex_unlock(&ctx->mutex);
+ -		put_ctx(ctx);
+ -		goto again;
+ -	}
+ -	mutex_unlock(&event->child_mutex);
+ +	_free_event(event);
+ +}
+  
+ -	/* Must be the last reference */
+ +int perf_event_release_kernel(struct perf_event *event)
+ +{
+  	put_event(event);
+  	return 0;
+  }
+@@@ -8130,36 -8729,45 +8118,47 @@@ __perf_event_exit_task(struct perf_even
+  
+  static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+  {
+ -	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+  	struct perf_event *child_event, *next;
+ +	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+  
+ -	WARN_ON_ONCE(child != current);
+ -
+ -	child_ctx = perf_pin_task_context(child, ctxn);
+ -	if (!child_ctx)
+ +	if (likely(!child->perf_event_ctxp[ctxn]))
+  		return;
+  
+ +	local_irq_disable();
+ +	WARN_ON_ONCE(child != current);
+  	/*
+++<<<<<<< HEAD
+ +	 * We can't reschedule here because interrupts are disabled,
+ +	 * and child must be current.
+++=======
++ 	 * In order to reduce the amount of tricky in ctx tear-down, we hold
++ 	 * ctx::mutex over the entire thing. This serializes against almost
++ 	 * everything that wants to access the ctx.
++ 	 *
++ 	 * The exception is sys_perf_event_open() /
++ 	 * perf_event_create_kernel_count() which does find_get_context()
++ 	 * without ctx::mutex (it cannot because of the move_group double mutex
++ 	 * lock thing). See the comments in perf_install_in_context().
+++>>>>>>> 5fa7c8ec57f7 (perf: Remove/simplify lockdep annotation)
+  	 */
+ -	mutex_lock(&child_ctx->mutex);
+ +	child_ctx = rcu_dereference_raw(child->perf_event_ctxp[ctxn]);
+  
+  	/*
+ -	 * In a single ctx::lock section, de-schedule the events and detach the
+ -	 * context from the task such that we cannot ever get it scheduled back
+ -	 * in.
+ +	 * Take the context lock here so that if find_get_context is
+ +	 * reading child->perf_event_ctxp, we wait until it has
+ +	 * incremented the context's refcount before we do put_ctx below.
+  	 */
+ -	raw_spin_lock_irq(&child_ctx->lock);
+ -	task_ctx_sched_out(__get_cpu_context(child_ctx), child_ctx);
+ +	raw_spin_lock(&child_ctx->lock);
+ +	task_ctx_sched_out(child_ctx);
+ +	child->perf_event_ctxp[ctxn] = NULL;
+  
+  	/*
+ -	 * Now that the context is inactive, destroy the task <-> ctx relation
+ -	 * and mark the context dead.
+ +	 * If this context is a clone; unclone it so it can't get
+ +	 * swapped to another process while we're removing all
+ +	 * the events from it.
+  	 */
+ -	RCU_INIT_POINTER(child->perf_event_ctxp[ctxn], NULL);
+ -	put_ctx(child_ctx); /* cannot be last */
+ -	WRITE_ONCE(child_ctx->task, TASK_TOMBSTONE);
+ -	put_task_struct(current); /* cannot be last */
+ -
+  	clone_ctx = unclone_ctx(child_ctx);
+ +	update_context_time(child_ctx);
+  	raw_spin_unlock_irq(&child_ctx->lock);
+  
+  	if (clone_ctx)
+* Unmerged path kernel/events/core.c
