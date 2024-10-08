@@ -1,0 +1,681 @@
+direct-io: Implement generic deferred AIO completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 7b7a8665edd8db733980389b098530f9e4f630b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7b7a8665.failed
+
+Add support to the core direct-io code to defer AIO completions to user
+context using a workqueue.  This replaces opencoded and less efficient
+code in XFS and ext4 (we save a memory allocation for each direct IO)
+and will be needed to properly support O_(D)SYNC for AIO.
+
+The communication between the filesystem and the direct I/O code requires
+a new buffer head flag, which is a bit ugly but not avoidable until the
+direct I/O code stops abusing the buffer_head structure for communicating
+with the filesystems.
+
+Currently this creates a per-superblock unbound workqueue for these
+completions, which is taken from an earlier patch by Jan Kara.  I'm
+not really convinced about this use and would prefer a "normal" global
+workqueue with a high concurrency limit, but this needs further discussion.
+
+JK: Fixed ext4 part, dynamic allocation of the workqueue.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 7b7a8665edd8db733980389b098530f9e4f630b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/direct-io.c
+#	fs/super.c
+diff --cc fs/direct-io.c
+index 50921773621f,8b31b9f449f4..000000000000
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@@ -258,19 -262,14 +262,29 @@@ static ssize_t dio_complete(struct dio 
+  	if (ret == 0)
+  		ret = transferred;
+  
+++<<<<<<< HEAD
+ +	if (dio->end_io && dio->result) {
+ +		dio->end_io(dio->iocb, offset, transferred,
+ +			    dio->private, ret, is_async);
+ +	} else {
+ +		if (dio->flags & DIO_IGNORE_TRUNCATE)
+ +			__inode_dio_done(dio->inode);
+ +		else
+ +			inode_dio_done(dio->inode);
+ +
+ +		if (is_async)
+ +			aio_complete(dio->iocb, ret, 0);
+ +	}
+++=======
++ 	if (dio->end_io && dio->result)
++ 		dio->end_io(dio->iocb, offset, transferred, dio->private);
+++>>>>>>> 7b7a8665edd8 (direct-io: Implement generic deferred AIO completions)
+  
++ 	inode_dio_done(dio->inode);
++ 	if (is_async)
++ 		aio_complete(dio->iocb, ret, 0);
++ 
++ 	kmem_cache_free(dio_cache, dio);
+  	return ret;
+  }
+  
+diff --cc fs/super.c
+index 321384206d8d,5536a95186e2..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -134,70 -148,103 +134,100 @@@ static void destroy_super(struct super_
+   */
+  static struct super_block *alloc_super(struct file_system_type *type, int flags)
+  {
+ -	struct super_block *s = kzalloc(sizeof(struct super_block),  GFP_USER);
+ +	struct super_block *s = kzalloc(sizeof(struct super_block_wrapper),  GFP_USER);
+  	static const struct super_operations default_op;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	if (!s)
+ +		return NULL;
+++=======
++ 	if (s) {
++ 		if (security_sb_alloc(s))
++ 			goto out_free_sb;
++ 
++ #ifdef CONFIG_SMP
++ 		s->s_files = alloc_percpu(struct list_head);
++ 		if (!s->s_files)
++ 			goto err_out;
++ 		else {
++ 			int i;
+++>>>>>>> 7b7a8665edd8 (direct-io: Implement generic deferred AIO completions)
+  
+ -			for_each_possible_cpu(i)
+ -				INIT_LIST_HEAD(per_cpu_ptr(s->s_files, i));
+ -		}
+ -#else
+ -		INIT_LIST_HEAD(&s->s_files);
+ -#endif
+ -		if (init_sb_writers(s, type))
+ -			goto err_out;
+ -		s->s_flags = flags;
+ -		s->s_bdi = &default_backing_dev_info;
+ -		INIT_HLIST_NODE(&s->s_instances);
+ -		INIT_HLIST_BL_HEAD(&s->s_anon);
+ -		INIT_LIST_HEAD(&s->s_inodes);
+ -		INIT_LIST_HEAD(&s->s_dentry_lru);
+ -		INIT_LIST_HEAD(&s->s_inode_lru);
+ -		spin_lock_init(&s->s_inode_lru_lock);
+ -		INIT_LIST_HEAD(&s->s_mounts);
+ -		init_rwsem(&s->s_umount);
+ -		lockdep_set_class(&s->s_umount, &type->s_umount_key);
+ -		/*
+ -		 * sget() can have s_umount recursion.
+ -		 *
+ -		 * When it cannot find a suitable sb, it allocates a new
+ -		 * one (this one), and tries again to find a suitable old
+ -		 * one.
+ -		 *
+ -		 * In case that succeeds, it will acquire the s_umount
+ -		 * lock of the old one. Since these are clearly distrinct
+ -		 * locks, and this object isn't exposed yet, there's no
+ -		 * risk of deadlocks.
+ -		 *
+ -		 * Annotate this by putting this lock in a different
+ -		 * subclass.
+ -		 */
+ -		down_write_nested(&s->s_umount, SINGLE_DEPTH_NESTING);
+ -		s->s_count = 1;
+ -		atomic_set(&s->s_active, 1);
+ -		mutex_init(&s->s_vfs_rename_mutex);
+ -		lockdep_set_class(&s->s_vfs_rename_mutex, &type->s_vfs_rename_key);
+ -		mutex_init(&s->s_dquot.dqio_mutex);
+ -		mutex_init(&s->s_dquot.dqonoff_mutex);
+ -		init_rwsem(&s->s_dquot.dqptr_sem);
+ -		s->s_maxbytes = MAX_NON_LFS;
+ -		s->s_op = &default_op;
+ -		s->s_time_gran = 1000000000;
+ -		s->cleancache_poolid = -1;
+ -
+ -		s->s_shrink.seeks = DEFAULT_SEEKS;
+ -		s->s_shrink.shrink = prune_super;
+ -		s->s_shrink.batch = 1024;
+ +	if (security_sb_alloc(s))
+ +		goto fail;
+ +	for (i = 0; i < SB_FREEZE_LEVELS; i++) {
+ +		if (percpu_counter_init(&s->s_writers.counter[i], 0,
+ +					GFP_KERNEL) < 0)
+ +			goto fail;
+ +		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
+ +				 &type->s_writers_key[i], 0);
+  	}
+++<<<<<<< HEAD
+ +	init_waitqueue_head(&s->s_writers.wait);
+ +	init_waitqueue_head(&s->s_writers.wait_unfrozen);
+ +	s->s_flags = flags;
+ +	s->s_bdi = &default_backing_dev_info;
+ +	INIT_HLIST_NODE(&s->s_instances);
+ +	INIT_HLIST_BL_HEAD(&s->s_anon);
+ +	INIT_LIST_HEAD(&s->s_inodes);
+ +	INIT_LIST_HEAD(&s->s_dentry_lru);
+ +	INIT_LIST_HEAD(&s->s_inode_lru);
+ +	spin_lock_init(&s->s_inode_lru_lock);
+ +	INIT_LIST_HEAD(&s->s_mounts);
+ +	init_rwsem(&s->s_umount);
+ +	lockdep_set_class(&s->s_umount, &type->s_umount_key);
+ +	/*
+ +	 * sget() can have s_umount recursion.
+ +	 *
+ +	 * When it cannot find a suitable sb, it allocates a new
+ +	 * one (this one), and tries again to find a suitable old
+ +	 * one.
+ +	 *
+ +	 * In case that succeeds, it will acquire the s_umount
+ +	 * lock of the old one. Since these are clearly distrinct
+ +	 * locks, and this object isn't exposed yet, there's no
+ +	 * risk of deadlocks.
+ +	 *
+ +	 * Annotate this by putting this lock in a different
+ +	 * subclass.
+ +	 */
+ +	down_write_nested(&s->s_umount, SINGLE_DEPTH_NESTING);
+ +	s->s_count = 1;
+ +	atomic_set(&s->s_active, 1);
+ +	mutex_init(&s->s_vfs_rename_mutex);
+ +	lockdep_set_class(&s->s_vfs_rename_mutex, &type->s_vfs_rename_key);
+ +	mutex_init(&s->s_dquot.dqio_mutex);
+ +	mutex_init(&s->s_dquot.dqonoff_mutex);
+ +	init_rwsem(&s->s_dquot.dqptr_sem);
+ +	s->s_maxbytes = MAX_NON_LFS;
+ +	s->s_op = &default_op;
+ +	s->s_time_gran = 1000000000;
+ +	s->cleancache_poolid = -1;
+++=======
++ out:
++ 	return s;
++ err_out:
++ 	security_sb_free(s);
++ #ifdef CONFIG_SMP
++ 	if (s->s_files)
++ 		free_percpu(s->s_files);
++ #endif
++ 	destroy_sb_writers(s);
++ out_free_sb:
++ 	kfree(s);
++ 	s = NULL;
++ 	goto out;
++ }
+++>>>>>>> 7b7a8665edd8 (direct-io: Implement generic deferred AIO completions)
+  
+ -/**
+ - *	destroy_super	-	frees a superblock
+ - *	@s: superblock to free
+ - *
+ - *	Frees a superblock.
+ - */
+ -static inline void destroy_super(struct super_block *s)
+ -{
+ -#ifdef CONFIG_SMP
+ -	free_percpu(s->s_files);
+ -#endif
+ -	destroy_sb_writers(s);
+ -	security_sb_free(s);
+ -	WARN_ON(!list_empty(&s->s_mounts));
+ -	kfree(s->s_subtype);
+ -	kfree(s->s_options);
+ -	kfree(s);
+ +	s->s_shrink.seeks = DEFAULT_SEEKS;
+ +	s->s_shrink.shrink = prune_super;
+ +	s->s_shrink.batch = 1024;
+ +	return s;
+ +fail:
+ +	destroy_super(s);
+ +	return NULL;
+  }
+  
+  /* Superblock refcounting  */
+* Unmerged path fs/direct-io.c
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 5dda1d21c88f..baa22cd73730 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -172,7 +172,6 @@ struct ext4_map_blocks {
+  * Flags for ext4_io_end->flags
+  */
+ #define	EXT4_IO_END_UNWRITTEN	0x0001
+-#define EXT4_IO_END_DIRECT	0x0002
+ 
+ /*
+  * For converting unwritten extents on a work queue. 'handle' is used for
+@@ -188,8 +187,6 @@ typedef struct ext4_io_end {
+ 	unsigned int		flag;		/* unwritten or not */
+ 	loff_t			offset;		/* offset in the file */
+ 	ssize_t			size;		/* size of the extent */
+-	struct kiocb		*iocb;		/* iocb struct for AIO */
+-	int			result;		/* error value for AIO */
+ 	atomic_t		count;		/* reference counter */
+ } ext4_io_end_t;
+ 
+@@ -919,11 +916,9 @@ struct ext4_inode_info {
+ 	 * Completed IOs that need unwritten extents handling and don't have
+ 	 * transaction reserved
+ 	 */
+-	struct list_head i_unrsv_conversion_list;
+ 	atomic_t i_ioend_count;	/* Number of outstanding io_end structs */
+ 	atomic_t i_unwritten; /* Nr. of inflight conversions pending */
+ 	struct work_struct i_rsv_conversion_work;
+-	struct work_struct i_unrsv_conversion_work;
+ 
+ 	spinlock_t i_block_reservation_lock;
+ 
+@@ -1298,8 +1293,6 @@ struct ext4_sb_info {
+ 	struct flex_groups *s_flex_groups;
+ 	ext4_group_t s_flex_groups_allocated;
+ 
+-	/* workqueue for unreserved extent convertions (dio) */
+-	struct workqueue_struct *unrsv_conversion_wq;
+ 	/* workqueue for reserved extent conversions (buffered io) */
+ 	struct workqueue_struct *rsv_conversion_wq;
+ 
+@@ -1367,9 +1360,6 @@ static inline void ext4_set_io_unwritten_flag(struct inode *inode,
+ 					      struct ext4_io_end *io_end)
+ {
+ 	if (!(io_end->flag & EXT4_IO_END_UNWRITTEN)) {
+-		/* Writeback has to have coversion transaction reserved */
+-		WARN_ON(EXT4_SB(inode->i_sb)->s_journal && !io_end->handle &&
+-			!(io_end->flag & EXT4_IO_END_DIRECT));
+ 		io_end->flag |= EXT4_IO_END_UNWRITTEN;
+ 		atomic_inc(&EXT4_I(inode)->i_unwritten);
+ 	}
+@@ -2776,7 +2766,6 @@ extern void ext4_put_io_end_defer(ext4_io_end_t *io_end);
+ extern void ext4_io_submit_init(struct ext4_io_submit *io,
+ 				struct writeback_control *wbc);
+ extern void ext4_end_io_rsv_work(struct work_struct *work);
+-extern void ext4_end_io_unrsv_work(struct work_struct *work);
+ extern void ext4_io_submit(struct ext4_io_submit *io);
+ extern int ext4_bio_write_page(struct ext4_io_submit *io,
+ 			       struct page *page,
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 7e00e3fcc247..a5439a19c2a1 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -702,8 +702,12 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
+ 
+ 	ret = ext4_map_blocks(handle, inode, &map, flags);
+ 	if (ret > 0) {
++		ext4_io_end_t *io_end = ext4_inode_aio(inode);
++
+ 		map_bh(bh, inode->i_sb, map.m_pblk);
+ 		bh->b_state = (bh->b_state & ~EXT4_MAP_FLAGS) | map.m_flags;
++		if (io_end && io_end->flag & EXT4_IO_END_UNWRITTEN)
++			set_buffer_defer_completion(bh);
+ 		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
+ 		ret = 0;
+ 	}
+@@ -2925,19 +2929,13 @@ static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
+ }
+ 
+ static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+-			    ssize_t size, void *private, int ret,
+-			    bool is_async)
++			    ssize_t size, void *private)
+ {
+-	struct inode *inode = file_inode(iocb->ki_filp);
+         ext4_io_end_t *io_end = iocb->private;
+ 
+ 	/* if not async direct IO just return */
+-	if (!io_end) {
+-		inode_dio_done(inode);
+-		if (is_async)
+-			aio_complete(iocb, ret, 0);
++	if (!io_end)
+ 		return;
+-	}
+ 
+ 	ext_debug("ext4_end_io_dio(): io_end 0x%p "
+ 		  "for inode %lu, iocb 0x%p, offset %llu, size %zd\n",
+@@ -2947,11 +2945,7 @@ static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+ 	iocb->private = NULL;
+ 	io_end->offset = offset;
+ 	io_end->size = size;
+-	if (is_async) {
+-		io_end->iocb = iocb;
+-		io_end->result = ret;
+-	}
+-	ext4_put_io_end_defer(io_end);
++	ext4_put_io_end(io_end);
+ }
+ 
+ /*
+@@ -3036,7 +3030,6 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
+ 			ret = -ENOMEM;
+ 			goto retake_lock;
+ 		}
+-		io_end->flag |= EXT4_IO_END_DIRECT;
+ 		/*
+ 		 * Grab reference for DIO. Will be dropped in ext4_end_io_dio()
+ 		 */
+@@ -3081,13 +3074,6 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
+ 		if (ret <= 0 && ret != -EIOCBQUEUED && iocb->private) {
+ 			WARN_ON(iocb->private != io_end);
+ 			WARN_ON(io_end->flag & EXT4_IO_END_UNWRITTEN);
+-			WARN_ON(io_end->iocb);
+-			/*
+-			 * Generic code already did inode_dio_done() so we
+-			 * have to clear EXT4_IO_END_DIRECT to not do it for
+-			 * the second time.
+-			 */
+-			io_end->flag = 0;
+ 			ext4_put_io_end(io_end);
+ 			iocb->private = NULL;
+ 		}
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 7d6335f93656..81a484e1a5ef 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -123,10 +123,6 @@ static void ext4_release_io_end(ext4_io_end_t *io_end)
+ 		ext4_finish_bio(bio);
+ 		bio_put(bio);
+ 	}
+-	if (io_end->flag & EXT4_IO_END_DIRECT)
+-		inode_dio_done(io_end->inode);
+-	if (io_end->iocb)
+-		aio_complete(io_end->iocb, io_end->result, 0);
+ 	kmem_cache_free(io_end_cachep, io_end);
+ }
+ 
+@@ -204,19 +200,14 @@ static void ext4_add_complete_io(ext4_io_end_t *io_end)
+ 	struct workqueue_struct *wq;
+ 	unsigned long flags;
+ 
+-	BUG_ON(!(io_end->flag & EXT4_IO_END_UNWRITTEN));
++	/* Only reserved conversions from writeback should enter here */
++	WARN_ON(!(io_end->flag & EXT4_IO_END_UNWRITTEN));
++	WARN_ON(!io_end->handle);
+ 	spin_lock_irqsave(&ei->i_completed_io_lock, flags);
+-	if (io_end->handle) {
+-		wq = EXT4_SB(io_end->inode->i_sb)->rsv_conversion_wq;
+-		if (list_empty(&ei->i_rsv_conversion_list))
+-			queue_work(wq, &ei->i_rsv_conversion_work);
+-		list_add_tail(&io_end->list, &ei->i_rsv_conversion_list);
+-	} else {
+-		wq = EXT4_SB(io_end->inode->i_sb)->unrsv_conversion_wq;
+-		if (list_empty(&ei->i_unrsv_conversion_list))
+-			queue_work(wq, &ei->i_unrsv_conversion_work);
+-		list_add_tail(&io_end->list, &ei->i_unrsv_conversion_list);
+-	}
++	wq = EXT4_SB(io_end->inode->i_sb)->rsv_conversion_wq;
++	if (list_empty(&ei->i_rsv_conversion_list))
++		queue_work(wq, &ei->i_rsv_conversion_work);
++	list_add_tail(&io_end->list, &ei->i_rsv_conversion_list);
+ 	spin_unlock_irqrestore(&ei->i_completed_io_lock, flags);
+ }
+ 
+@@ -256,13 +247,6 @@ void ext4_end_io_rsv_work(struct work_struct *work)
+ 	ext4_do_flush_completed_IO(&ei->vfs_inode, &ei->i_rsv_conversion_list);
+ }
+ 
+-void ext4_end_io_unrsv_work(struct work_struct *work)
+-{
+-	struct ext4_inode_info *ei = container_of(work, struct ext4_inode_info,
+-						  i_unrsv_conversion_work);
+-	ext4_do_flush_completed_IO(&ei->vfs_inode, &ei->i_unrsv_conversion_list);
+-}
+-
+ ext4_io_end_t *ext4_init_io_end(struct inode *inode, gfp_t flags)
+ {
+ 	ext4_io_end_t *io = kmem_cache_zalloc(io_end_cachep, flags);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 31618f12ab5f..03f2bce35305 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -779,9 +779,7 @@ static void ext4_put_super(struct super_block *sb)
+ 	ext4_unregister_li_request(sb);
+ 	dquot_disable(sb, -1, DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);
+ 
+-	flush_workqueue(sbi->unrsv_conversion_wq);
+ 	flush_workqueue(sbi->rsv_conversion_wq);
+-	destroy_workqueue(sbi->unrsv_conversion_wq);
+ 	destroy_workqueue(sbi->rsv_conversion_wq);
+ 
+ 	if (sbi->s_journal) {
+@@ -893,14 +891,12 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
+ #endif
+ 	ei->jinode = NULL;
+ 	INIT_LIST_HEAD(&ei->i_rsv_conversion_list);
+-	INIT_LIST_HEAD(&ei->i_unrsv_conversion_list);
+ 	spin_lock_init(&ei->i_completed_io_lock);
+ 	ei->i_sync_tid = 0;
+ 	ei->i_datasync_tid = 0;
+ 	atomic_set(&ei->i_ioend_count, 0);
+ 	atomic_set(&ei->i_unwritten, 0);
+ 	INIT_WORK(&ei->i_rsv_conversion_work, ext4_end_io_rsv_work);
+-	INIT_WORK(&ei->i_unrsv_conversion_work, ext4_end_io_unrsv_work);
+ 
+ 	return &ei->vfs_inode;
+ }
+@@ -4074,14 +4070,6 @@ no_journal:
+ 		goto failed_mount4;
+ 	}
+ 
+-	EXT4_SB(sb)->unrsv_conversion_wq =
+-		alloc_workqueue("ext4-unrsv-conversion", WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+-	if (!EXT4_SB(sb)->unrsv_conversion_wq) {
+-		printk(KERN_ERR "EXT4-fs: failed to create workqueue\n");
+-		ret = -ENOMEM;
+-		goto failed_mount4;
+-	}
+-
+ 	/*
+ 	 * The jbd2_journal_load will have done any necessary log recovery,
+ 	 * so we can safely mount the rest of the filesystem now.
+@@ -4276,8 +4264,6 @@ failed_mount4:
+ 	ext4_msg(sb, KERN_ERR, "mount failed");
+ 	if (EXT4_SB(sb)->rsv_conversion_wq)
+ 		destroy_workqueue(EXT4_SB(sb)->rsv_conversion_wq);
+-	if (EXT4_SB(sb)->unrsv_conversion_wq)
+-		destroy_workqueue(EXT4_SB(sb)->unrsv_conversion_wq);
+ failed_mount_wq:
+ 	if (sbi->s_journal) {
+ 		jbd2_journal_destroy(sbi->s_journal);
+@@ -4730,7 +4716,6 @@ static int ext4_sync_fs(struct super_block *sb, int wait)
+ 
+ 	trace_ext4_sync_fs(sb, wait);
+ 	flush_workqueue(sbi->rsv_conversion_wq);
+-	flush_workqueue(sbi->unrsv_conversion_wq);
+ 	/*
+ 	 * Writeback quota in non-journalled quota case - journalled quota has
+ 	 * no dirty dquots
+@@ -4766,7 +4751,6 @@ static int ext4_sync_fs_nojournal(struct super_block *sb, int wait)
+ 
+ 	trace_ext4_sync_fs(sb, wait);
+ 	flush_workqueue(EXT4_SB(sb)->rsv_conversion_wq);
+-	flush_workqueue(EXT4_SB(sb)->unrsv_conversion_wq);
+ 	dquot_writeback_dquots(sb, -1);
+ 	if (wait && test_opt(sb, BARRIER))
+ 		ret = blkdev_issue_flush(sb->s_bdev, GFP_KERNEL, NULL);
+diff --git a/fs/ocfs2/aops.c b/fs/ocfs2/aops.c
+index 7fee7b2e1225..3ef23295dff2 100644
+--- a/fs/ocfs2/aops.c
++++ b/fs/ocfs2/aops.c
+@@ -565,9 +565,7 @@ bail:
+ static void ocfs2_dio_end_io(struct kiocb *iocb,
+ 			     loff_t offset,
+ 			     ssize_t bytes,
+-			     void *private,
+-			     int ret,
+-			     bool is_async)
++			     void *private)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 	int level;
+@@ -592,10 +590,6 @@ static void ocfs2_dio_end_io(struct kiocb *iocb,
+ 
+ 	level = ocfs2_iocb_rw_locked_level(iocb);
+ 	ocfs2_rw_unlock(inode, level);
+-
+-	inode_dio_done(inode);
+-	if (is_async)
+-		aio_complete(iocb, ret, 0);
+ }
+ 
+ /*
+* Unmerged path fs/super.c
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index bb6024910e57..90f8befc0945 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -86,14 +86,6 @@ xfs_destroy_ioend(
+ 		bh->b_end_io(bh, !ioend->io_error);
+ 	}
+ 
+-	if (ioend->io_iocb) {
+-		inode_dio_done(ioend->io_inode);
+-		if (ioend->io_isasync) {
+-			aio_complete(ioend->io_iocb, ioend->io_error ?
+-					ioend->io_error : ioend->io_result, 0);
+-		}
+-	}
+-
+ 	mempool_free(ioend, xfs_ioend_pool);
+ }
+ 
+@@ -281,7 +273,6 @@ xfs_alloc_ioend(
+ 	 * all the I/O from calling the completion routine too early.
+ 	 */
+ 	atomic_set(&ioend->io_remaining, 1);
+-	ioend->io_isasync = 0;
+ 	ioend->io_isdirect = 0;
+ 	ioend->io_error = 0;
+ 	ioend->io_list = NULL;
+@@ -291,8 +282,6 @@ xfs_alloc_ioend(
+ 	ioend->io_buffer_tail = NULL;
+ 	ioend->io_offset = 0;
+ 	ioend->io_size = 0;
+-	ioend->io_iocb = NULL;
+-	ioend->io_result = 0;
+ 	ioend->io_append_trans = NULL;
+ 
+ 	INIT_WORK(&ioend->io_work, xfs_end_io);
+@@ -1367,8 +1356,10 @@ __xfs_get_blocks(
+ 		if (create || !ISUNWRITTEN(&imap))
+ 			xfs_map_buffer(inode, bh_result, &imap, offset);
+ 		if (create && ISUNWRITTEN(&imap)) {
+-			if (direct)
++			if (direct) {
+ 				bh_result->b_private = inode;
++				set_buffer_defer_completion(bh_result);
++			}
+ 			set_buffer_unwritten(bh_result);
+ 		}
+ 	}
+@@ -1479,9 +1470,7 @@ xfs_end_io_direct_write(
+ 	struct kiocb		*iocb,
+ 	loff_t			offset,
+ 	ssize_t			size,
+-	void			*private,
+-	int			ret,
+-	bool			is_async)
++	void			*private)
+ {
+ 	struct xfs_ioend	*ioend = iocb->private;
+ 	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+@@ -1512,17 +1501,10 @@ xfs_end_io_direct_write(
+ 
+ 	ioend->io_offset = offset;
+ 	ioend->io_size = size;
+-	ioend->io_iocb = iocb;
+-	ioend->io_result = ret;
+ 	if (private && size > 0)
+ 		ioend->io_type = XFS_IO_UNWRITTEN;
+ 
+-	if (is_async) {
+-		ioend->io_isasync = 1;
+-		xfs_finish_ioend(ioend);
+-	} else {
+-		xfs_finish_ioend_sync(ioend);
+-	}
++	xfs_finish_ioend_sync(ioend);
+ }
+ 
+ STATIC ssize_t
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index c325abb8d61a..f94dd459dff9 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -45,7 +45,6 @@ typedef struct xfs_ioend {
+ 	unsigned int		io_type;	/* delalloc / unwritten */
+ 	int			io_error;	/* I/O error code */
+ 	atomic_t		io_remaining;	/* hold count */
+-	unsigned int		io_isasync : 1;	/* needs aio_complete */
+ 	unsigned int		io_isdirect : 1;/* direct I/O */
+ 	struct inode		*io_inode;	/* file being written to */
+ 	struct buffer_head	*io_buffer_head;/* buffer linked list head */
+@@ -54,8 +53,6 @@ typedef struct xfs_ioend {
+ 	xfs_off_t		io_offset;	/* offset in the file */
+ 	struct work_struct	io_work;	/* xfsdatad work queue */
+ 	struct xfs_trans	*io_append_trans;/* xact. for size update */
+-	struct kiocb		*io_iocb;
+-	int			io_result;
+ } xfs_ioend_t;
+ 
+ extern const struct address_space_operations xfs_address_space_operations;
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index 7a002c1c49a9..4730de690b9d 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -36,6 +36,7 @@ enum bh_state_bits {
+ 	BH_Quiet,	/* Buffer Error Prinks to be quiet */
+ 	BH_Meta,	/* Buffer contains metadata */
+ 	BH_Prio,	/* Buffer should be submitted with REQ_PRIO */
++	BH_Defer_Completion, /* Defer AIO completion to workqueue */
+ 
+ 	BH_PrivateStart,/* not a state bit, but the first bit available
+ 			 * for private allocation by other entities
+@@ -128,6 +129,7 @@ BUFFER_FNS(Write_EIO, write_io_error)
+ BUFFER_FNS(Unwritten, unwritten)
+ BUFFER_FNS(Meta, meta)
+ BUFFER_FNS(Prio, prio)
++BUFFER_FNS(Defer_Completion, defer_completion)
+ 
+ #define bh_offset(bh)		((unsigned long)(bh)->b_data & ~PAGE_MASK)
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 9a3e0574615b..53b05dfba49d 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -46,6 +46,7 @@ struct vfsmount;
+ struct cred;
+ struct swap_info_struct;
+ struct seq_file;
++struct workqueue_struct;
+ 
+ extern void __init inode_init(void);
+ extern void __init inode_init_early(void);
+@@ -63,8 +64,7 @@ struct buffer_head;
+ typedef int (get_block_t)(struct inode *inode, sector_t iblock,
+ 			struct buffer_head *bh_result, int create);
+ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+-			ssize_t bytes, void *private, int ret,
+-			bool is_async);
++			ssize_t bytes, void *private);
+ 
+ #define MAY_EXEC		0x00000001
+ #define MAY_WRITE		0x00000002
+@@ -1392,6 +1392,9 @@ struct super_block {
+ 
+ 	/* Being remounted read-only */
+ 	int s_readonly_remount;
++
++	/* AIO completions deferred from interrupt context */
++	struct workqueue_struct *s_dio_done_wq;
+ };
+ 
+ extern const unsigned super_block_wrapper_version;
