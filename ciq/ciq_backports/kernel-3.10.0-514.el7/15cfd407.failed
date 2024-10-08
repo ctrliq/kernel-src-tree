@@ -1,0 +1,106 @@
+hv_netvsc: Fix the list processing for network change event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit 15cfd40771e18a4e9b788c64c9db2606f958b93d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/15cfd407.failed
+
+RNDIS_STATUS_NETWORK_CHANGE event is handled as two "half events" --
+media disconnect & connect. The second half should be added to the list
+head, not to the tail. So all events are processed in normal order.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 15cfd40771e18a4e9b788c64c9db2606f958b93d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 822e657fcee7,ba3f3f3d48ef..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -845,12 -1068,68 +845,77 @@@ static void netvsc_link_change(struct w
+  	rdev = net_device->extension;
+  	net = net_device->ndev;
+  
+++<<<<<<< HEAD
+ +	if (rdev->link_state) {
+ +		netif_carrier_off(net);
+ +		notify = false;
+ +	} else {
+ +		netif_carrier_on(net);
+ +		notify = true;
+++=======
++ 	next_reconfig = ndev_ctx->last_reconfig + LINKCHANGE_INT;
++ 	if (time_is_after_jiffies(next_reconfig)) {
++ 		/* link_watch only sends one notification with current state
++ 		 * per second, avoid doing reconfig more frequently. Handle
++ 		 * wrap around.
++ 		 */
++ 		delay = next_reconfig - jiffies;
++ 		delay = delay < LINKCHANGE_INT ? delay : LINKCHANGE_INT;
++ 		schedule_delayed_work(&ndev_ctx->dwork, delay);
++ 		return;
++ 	}
++ 	ndev_ctx->last_reconfig = jiffies;
++ 
++ 	spin_lock_irqsave(&ndev_ctx->lock, flags);
++ 	if (!list_empty(&ndev_ctx->reconfig_events)) {
++ 		event = list_first_entry(&ndev_ctx->reconfig_events,
++ 					 struct netvsc_reconfig, list);
++ 		list_del(&event->list);
++ 		reschedule = !list_empty(&ndev_ctx->reconfig_events);
++ 	}
++ 	spin_unlock_irqrestore(&ndev_ctx->lock, flags);
++ 
++ 	if (!event)
++ 		return;
++ 
++ 	rtnl_lock();
++ 
++ 	switch (event->event) {
++ 		/* Only the following events are possible due to the check in
++ 		 * netvsc_linkstatus_callback()
++ 		 */
++ 	case RNDIS_STATUS_MEDIA_CONNECT:
++ 		if (rdev->link_state) {
++ 			rdev->link_state = false;
++ 			netif_carrier_on(net);
++ 			netif_tx_wake_all_queues(net);
++ 		} else {
++ 			notify = true;
++ 		}
++ 		kfree(event);
++ 		break;
++ 	case RNDIS_STATUS_MEDIA_DISCONNECT:
++ 		if (!rdev->link_state) {
++ 			rdev->link_state = true;
++ 			netif_carrier_off(net);
++ 			netif_tx_stop_all_queues(net);
++ 		}
++ 		kfree(event);
++ 		break;
++ 	case RNDIS_STATUS_NETWORK_CHANGE:
++ 		/* Only makes sense if carrier is present */
++ 		if (!rdev->link_state) {
++ 			rdev->link_state = true;
++ 			netif_carrier_off(net);
++ 			netif_tx_stop_all_queues(net);
++ 			event->event = RNDIS_STATUS_MEDIA_CONNECT;
++ 			spin_lock_irqsave(&ndev_ctx->lock, flags);
++ 			list_add(&event->list, &ndev_ctx->reconfig_events);
++ 			spin_unlock_irqrestore(&ndev_ctx->lock, flags);
++ 			reschedule = true;
++ 		}
++ 		break;
+++>>>>>>> 15cfd40771e1 (hv_netvsc: Fix the list processing for network change event)
+  	}
+  
+  	rtnl_unlock();
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
