@@ -3667,7 +3667,7 @@ static inline void init_iommu_pm_ops(void) {}
 #endif	/* CONFIG_PM */
 
 
-int __init dmar_parse_one_rmrr(struct acpi_dmar_header *header)
+int __init dmar_parse_one_rmrr(struct acpi_dmar_header *header, void *arg)
 {
 	struct acpi_dmar_reserved_memory *rmrr;
 	struct dmar_rmrr_unit *rmrru;
@@ -3693,7 +3693,7 @@ int __init dmar_parse_one_rmrr(struct acpi_dmar_header *header)
 	return 0;
 }
 
-int __init dmar_parse_one_atsr(struct acpi_dmar_header *hdr)
+int __init dmar_parse_one_atsr(struct acpi_dmar_header *hdr, void *arg)
 {
 	struct acpi_dmar_atsr *atsr;
 	struct dmar_atsr_unit *atsru;
