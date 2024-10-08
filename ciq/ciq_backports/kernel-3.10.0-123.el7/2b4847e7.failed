@@ -1,0 +1,141 @@
+mm: numa: serialise parallel get_user_page against THP migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] numa: Serialise parallel get_user_page against THP migration (Rik van Riel) [1040200]
+Rebuild_FUZZ: 96.77%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 2b4847e73004c10ae6666c2e27b5c5430aed8698
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/2b4847e7.failed
+
+Base pages are unmapped and flushed from cache and TLB during normal
+page migration and replaced with a migration entry that causes any
+parallel NUMA hinting fault or gup to block until migration completes.
+
+THP does not unmap pages due to a lack of support for migration entries
+at a PMD level.  This allows races with get_user_pages and
+get_user_pages_fast which commit 3f926ab945b6 ("mm: Close races between
+THP migration and PMD numa clearing") made worse by introducing a
+pmd_clear_flush().
+
+This patch forces get_user_page (fast and normal) on a pmd_numa page to
+go through the slow get_user_page path where it will serialise against
+THP migration and properly account for the NUMA hinting fault.  On the
+migration side the page table lock is taken for each PTE update.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Alex Thorlton <athorlton@sgi.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2b4847e73004c10ae6666c2e27b5c5430aed8698)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+#	mm/migrate.c
+diff --cc mm/huge_memory.c
+index ba9f65152a91,51f069303ab9..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1319,23 -1327,27 +1323,42 @@@ int do_huge_pmd_numa_page(struct mm_str
+  		/* If the page was locked, there are no parallel migrations */
+  		if (page_locked)
+  			goto clear_pmdnuma;
++ 	}
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * Otherwise wait for potential migrations and retry. We do
+ +		 * relock and check_same as the page may no longer be mapped.
+ +		 * As the fault is being retried, do not account for it.
+ +		 */
+ +		spin_unlock(&mm->page_table_lock);
+++=======
++ 	/*
++ 	 * If there are potential migrations, wait for completion and retry. We
++ 	 * do not relock and check_same as the page may no longer be mapped.
++ 	 * Furtermore, even if the page is currently misplaced, there is no
++ 	 * guarantee it is still misplaced after the migration completes.
++ 	 */
++ 	if (!page_locked) {
++ 		spin_unlock(ptl);
+++>>>>>>> 2b4847e73004 (mm: numa: serialise parallel get_user_page against THP migration)
+  		wait_on_page_locked(page);
+  		page_nid = -1;
+  		goto out;
+  	}
+  
+- 	/* Page is misplaced, serialise migrations and parallel THP splits */
++ 	/*
++ 	 * Page is misplaced. Page lock serialises migrations. Acquire anon_vma
++ 	 * to serialises splits
++ 	 */
+  	get_page(page);
+++<<<<<<< HEAD
+ +	spin_unlock(&mm->page_table_lock);
+ +	if (!page_locked)
+ +		lock_page(page);
+++=======
++ 	spin_unlock(ptl);
+++>>>>>>> 2b4847e73004 (mm: numa: serialise parallel get_user_page against THP migration)
+  	anon_vma = page_lock_anon_vma_read(page);
+  
+  	/* Confirm the PMD did not change while page_table_lock was released */
+diff --cc mm/migrate.c
+index feecd7fd3496,2cabbd5fa5bf..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1700,9 -1756,10 +1701,16 @@@ int migrate_misplaced_transhuge_page(st
+  	WARN_ON(PageLRU(new_page));
+  
+  	/* Recheck the target PMD */
+++<<<<<<< HEAD
+ +	spin_lock(&mm->page_table_lock);
+ +	if (unlikely(!pmd_same(*pmd, entry))) {
+ +		spin_unlock(&mm->page_table_lock);
+++=======
++ 	ptl = pmd_lock(mm, pmd);
++ 	if (unlikely(!pmd_same(*pmd, entry) || page_count(page) != 2)) {
++ fail_putback:
++ 		spin_unlock(ptl);
+++>>>>>>> 2b4847e73004 (mm: numa: serialise parallel get_user_page against THP migration)
+  
+  		/* Reverse changes made by migrate_page_copy() */
+  		if (TestClearPageActive(new_page))
+diff --git a/arch/x86/mm/gup.c b/arch/x86/mm/gup.c
+index dd74e46828c0..0596e8e0cc19 100644
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@ -83,6 +83,12 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
+ 		pte_t pte = gup_get_pte(ptep);
+ 		struct page *page;
+ 
++		/* Similar to the PMD case, NUMA hinting must take slow path */
++		if (pte_numa(pte)) {
++			pte_unmap(ptep);
++			return 0;
++		}
++
+ 		if ((pte_flags(pte) & (mask | _PAGE_SPECIAL)) != mask) {
+ 			pte_unmap(ptep);
+ 			return 0;
+@@ -167,6 +173,13 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
+ 		if (pmd_none(pmd) || pmd_trans_splitting(pmd))
+ 			return 0;
+ 		if (unlikely(pmd_large(pmd))) {
++			/*
++			 * NUMA hinting faults need to be handled in the GUP
++			 * slowpath for accounting purposes and so that they
++			 * can be serialised against THP migration.
++			 */
++			if (pmd_numa(pmd))
++				return 0;
+ 			if (!gup_huge_pmd(pmd, addr, next, write, pages, nr))
+ 				return 0;
+ 		} else {
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/migrate.c
