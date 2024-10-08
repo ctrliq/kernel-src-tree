@@ -1,0 +1,94 @@
+xfs: allow linkat() on O_TMPFILE files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Zhi Yong Wu <wuzhy@linux.vnet.ibm.com>
+commit ab29743117f9f4c22ac44c13c1647fb24fb2bafe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ab297431.failed
+
+The VFS allows an anonymous temporary file to be named at a later
+time via a linkat() syscall. The inodes for O_TMPFILE files are
+are marked with a special flag I_LINKABLE and have a zero link count.
+
+To support this in XFS, xfs_link() detects if this flag I_LINKABLE
+is set and behaves appropriately when detected. So in this case,
+its transaciton reservation takes into account the additional
+overhead of removing the inode from the unlinked list. Then the
+inode is removed from the unlinked list and the directory entry
+is added. Finally its link count is bumped accordingly.
+
+	Signed-off-by: Zhi Yong Wu <wuzhy@linux.vnet.ibm.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de> 
+	Signed-off-by: Ben Myers <bpm@sgi.com>
+
+(cherry picked from commit ab29743117f9f4c22ac44c13c1647fb24fb2bafe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_trans_resv.c
+diff --cc fs/xfs/libxfs/xfs_trans_resv.c
+index 8d6ab48deb5a,76f9a02bc36b..000000000000
+--- a/fs/xfs/libxfs/xfs_trans_resv.c
++++ b/fs/xfs/libxfs/xfs_trans_resv.c
+@@@ -464,15 -425,14 +479,19 @@@ xfs_calc_ifree_reservation
+  {
+  	return XFS_DQUOT_LOGRES(mp) +
+  		xfs_calc_inode_res(mp, 1) +
+- 		xfs_calc_buf_res(2, mp->m_sb.sb_sectsize) +
++ 		xfs_calc_buf_res(1, mp->m_sb.sb_sectsize) +
+  		xfs_calc_buf_res(1, XFS_FSB_TO_B(mp, 1)) +
+++<<<<<<< HEAD:fs/xfs/libxfs/xfs_trans_resv.c
+ +		max_t(uint, XFS_FSB_TO_B(mp, 1), mp->m_inode_cluster_size) +
+++=======
++ 		xfs_calc_iunlink_remove_reservation(mp) +
+++>>>>>>> ab29743117f9 (xfs: allow linkat() on O_TMPFILE files):fs/xfs/xfs_trans_resv.c
+  		xfs_calc_buf_res(1, 0) +
+ -		xfs_calc_buf_res(2 + XFS_IALLOC_BLOCKS(mp) +
+ +		xfs_calc_buf_res(2 + mp->m_ialloc_blks +
+  				 mp->m_in_maxlevels, 0) +
+  		xfs_calc_buf_res(XFS_ALLOCFREE_LOG_COUNT(mp, 1),
+ -				 XFS_FSB_TO_B(mp, 1));
+ +				 XFS_FSB_TO_B(mp, 1)) +
+ +		xfs_calc_finobt_res(mp, 0, 1);
+  }
+  
+  /*
+* Unmerged path fs/xfs/libxfs/xfs_trans_resv.c
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 4baa8b342af2..0152eaad5489 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -61,6 +61,8 @@ kmem_zone_t *xfs_inode_zone;
+ 
+ STATIC int xfs_iflush_int(xfs_inode_t *, xfs_buf_t *);
+ 
++STATIC int xfs_iunlink_remove(xfs_trans_t *, xfs_inode_t *);
++
+ /*
+  * helper function to extract extent size hint from inode
+  */
+@@ -1114,7 +1116,7 @@ xfs_bumplink(
+ {
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+ 
+-	ASSERT(ip->i_d.di_nlink > 0);
++	ASSERT(ip->i_d.di_nlink > 0 || (VFS_I(ip)->i_state & I_LINKABLE));
+ 	ip->i_d.di_nlink++;
+ 	inc_nlink(VFS_I(ip));
+ 	if ((ip->i_d.di_version == 1) &&
+@@ -1505,6 +1507,12 @@ xfs_link(
+ 
+ 	xfs_bmap_init(&free_list, &first_block);
+ 
++	if (sip->i_d.di_nlink == 0) {
++		error = xfs_iunlink_remove(tp, sip);
++		if (error)
++			goto abort_return;
++	}
++
+ 	error = xfs_dir_createname(tp, tdp, target_name, sip->i_ino,
+ 					&first_block, &free_list, resblks);
+ 	if (error)
