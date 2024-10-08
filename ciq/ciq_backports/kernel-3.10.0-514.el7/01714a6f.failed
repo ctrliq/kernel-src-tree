@@ -1,0 +1,142 @@
+HID: i2c-hid: Fix suspend/resume when already runtime suspended
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hid] i2c-hid: Fix suspend/resume when already runtime suspended (David Arcari) [1361625]
+Rebuild_FUZZ: 95.87%
+commit-author Doug Anderson <dianders@chromium.org>
+commit 01714a6f5fa59a313d8f44dcf017911dfcb25831
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/01714a6f.failed
+
+On ACPI-based systems ACPI power domain code runtime resumes device before
+calling suspend method, which ensures that i2c-hid suspend code starts with
+device not in low-power state and with interrupts enabled.
+
+On other systems, especially if device is not a part of any power domain,
+we may end up calling driver's system-level suspend routine while the
+device is runtime-suspended (with controller in presumably low power state
+and interrupts disabled). This will result in interrupts being essentially
+disabled twice, and we will only re-enable them after both system resume
+and runtime resume methods complete. Unfortunately i2c_hid_resume() calls
+i2c_hid_hwreset() and that only works properly if interrupts are enabled.
+
+Also if device is runtime-suspended driver's suspend code may fail if it
+tries to issue I/O requests.
+
+Let's fix it by runtime-resuming the device if we need to run HID driver's
+suspend code and also disabling interrupts only if device is not already
+runtime-suspended. Also on resume we mark the device as running at full
+power (since that is what resetting will do to it).
+
+	Reviewed-by: Benson Leung <bleung@chromium.org>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Doug Anderson <dianders@chromium.org>
+	Signed-off-by: Dmitry Torokhov <dtor@chromium.org>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 01714a6f5fa59a313d8f44dcf017911dfcb25831)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/i2c-hid/i2c-hid.c
+diff --cc drivers/hid/i2c-hid/i2c-hid.c
+index 9c64e1db9067,5b10a5d6e2d1..000000000000
+--- a/drivers/hid/i2c-hid/i2c-hid.c
++++ b/drivers/hid/i2c-hid/i2c-hid.c
+@@@ -1057,19 -1108,40 +1057,55 @@@ static int i2c_hid_suspend(struct devic
+  	struct i2c_client *client = to_i2c_client(dev);
+  	struct i2c_hid *ihid = i2c_get_clientdata(client);
+  	struct hid_device *hid = ihid->hid;
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +
+ +	disable_irq(client->irq);
+ +	if (device_may_wakeup(&client->dev))
+ +		enable_irq_wake(client->irq);
+++=======
++ 	int ret;
++ 	int wake_status;
+++>>>>>>> 01714a6f5fa5 (HID: i2c-hid: Fix suspend/resume when already runtime suspended)
++ 
++ 	if (hid->driver && hid->driver->suspend) {
++ 		/*
++ 		 * Wake up the device so that IO issues in
++ 		 * HID driver's suspend code can succeed.
++ 		 */
++ 		ret = pm_runtime_resume(dev);
++ 		if (ret < 0)
++ 			return ret;
+  
+- 	if (hid->driver && hid->driver->suspend)
+  		ret = hid->driver->suspend(hid, PMSG_SUSPEND);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (!pm_runtime_suspended(dev)) {
++ 		/* Save some power */
++ 		i2c_hid_set_power(client, I2C_HID_PWR_SLEEP);
++ 
++ 		disable_irq(ihid->irq);
++ 	}
+  
+++<<<<<<< HEAD
+ +	/* Save some power */
+ +	i2c_hid_set_power(client, I2C_HID_PWR_SLEEP);
+ +
+ +	return ret;
+++=======
++ 	if (device_may_wakeup(&client->dev)) {
++ 		wake_status = enable_irq_wake(ihid->irq);
++ 		if (!wake_status)
++ 			ihid->irq_wake_enabled = true;
++ 		else
++ 			hid_warn(hid, "Failed to enable irq wake: %d\n",
++ 				wake_status);
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 01714a6f5fa5 (HID: i2c-hid: Fix suspend/resume when already runtime suspended)
+  }
+  
+  static int i2c_hid_resume(struct device *dev)
+@@@ -1078,14 -1150,26 +1114,35 @@@
+  	struct i2c_client *client = to_i2c_client(dev);
+  	struct i2c_hid *ihid = i2c_get_clientdata(client);
+  	struct hid_device *hid = ihid->hid;
+ -	int wake_status;
+  
+++<<<<<<< HEAD
+ +	enable_irq(client->irq);
+ +	ret = i2c_hid_hwreset(client);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (device_may_wakeup(&client->dev))
+ +		disable_irq_wake(client->irq);
+++=======
++ 	if (device_may_wakeup(&client->dev) && ihid->irq_wake_enabled) {
++ 		wake_status = disable_irq_wake(ihid->irq);
++ 		if (!wake_status)
++ 			ihid->irq_wake_enabled = false;
++ 		else
++ 			hid_warn(hid, "Failed to disable irq wake: %d\n",
++ 				wake_status);
++ 	}
+++>>>>>>> 01714a6f5fa5 (HID: i2c-hid: Fix suspend/resume when already runtime suspended)
++ 
++ 	/* We'll resume to full power */
++ 	pm_runtime_disable(dev);
++ 	pm_runtime_set_active(dev);
++ 	pm_runtime_enable(dev);
++ 
++ 	enable_irq(ihid->irq);
++ 	ret = i2c_hid_hwreset(client);
++ 	if (ret)
++ 		return ret;
+  
+  	if (hid->driver && hid->driver->reset_resume) {
+  		ret = hid->driver->reset_resume(hid);
+* Unmerged path drivers/hid/i2c-hid/i2c-hid.c
