@@ -2647,7 +2647,7 @@ more:
 		if (ret <= 0) {
 			switch (ret) {
 			case -EBADMSG:
-				con->error_msg = "bad crc";
+				con->error_msg = "bad crc/signature";
 				/* fall through */
 			case -EBADE:
 				ret = -EIO;
