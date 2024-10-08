@@ -1,0 +1,272 @@
+net: use skb_postpush_rcsum instead of own implementations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] use skb_postpush_rcsum instead of own implementations (Aaron Conole) [1328847]
+Rebuild_FUZZ: 95.50%
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 6b83d28a55a891a9d70fc61ccb1c138e47dcbe74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6b83d28a.failed
+
+Replace individual implementations with the recently introduced
+skb_postpush_rcsum() helper.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Tom Herbert <tom@herbertland.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b83d28a55a891a9d70fc61ccb1c138e47dcbe74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/actions.c
+#	net/openvswitch/vport-netdev.c
+#	net/openvswitch/vport.h
+diff --cc net/openvswitch/actions.c
+index 327766f7c945,e9dd47b2a85b..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -603,7 -618,123 +601,127 @@@ static int set_sctp(struct sk_buff *skb
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port)
+++=======
++ static int ovs_vport_output(struct net *net, struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct ovs_frag_data *data = this_cpu_ptr(&ovs_frag_data_storage);
++ 	struct vport *vport = data->vport;
++ 
++ 	if (skb_cow_head(skb, data->l2_len) < 0) {
++ 		kfree_skb(skb);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	__skb_dst_copy(skb, data->dst);
++ 	*OVS_CB(skb) = data->cb;
++ 	skb->inner_protocol = data->inner_protocol;
++ 	skb->vlan_tci = data->vlan_tci;
++ 	skb->vlan_proto = data->vlan_proto;
++ 
++ 	/* Reconstruct the MAC header.  */
++ 	skb_push(skb, data->l2_len);
++ 	memcpy(skb->data, &data->l2_data, data->l2_len);
++ 	skb_postpush_rcsum(skb, skb->data, data->l2_len);
++ 	skb_reset_mac_header(skb);
++ 
++ 	ovs_vport_send(vport, skb);
++ 	return 0;
++ }
++ 
++ static unsigned int
++ ovs_dst_get_mtu(const struct dst_entry *dst)
++ {
++ 	return dst->dev->mtu;
++ }
++ 
++ static struct dst_ops ovs_dst_ops = {
++ 	.family = AF_UNSPEC,
++ 	.mtu = ovs_dst_get_mtu,
++ };
++ 
++ /* prepare_frag() is called once per (larger-than-MTU) frame; its inverse is
++  * ovs_vport_output(), which is called once per fragmented packet.
++  */
++ static void prepare_frag(struct vport *vport, struct sk_buff *skb)
++ {
++ 	unsigned int hlen = skb_network_offset(skb);
++ 	struct ovs_frag_data *data;
++ 
++ 	data = this_cpu_ptr(&ovs_frag_data_storage);
++ 	data->dst = skb->_skb_refdst;
++ 	data->vport = vport;
++ 	data->cb = *OVS_CB(skb);
++ 	data->inner_protocol = skb->inner_protocol;
++ 	data->vlan_tci = skb->vlan_tci;
++ 	data->vlan_proto = skb->vlan_proto;
++ 	data->l2_len = hlen;
++ 	memcpy(&data->l2_data, skb->data, hlen);
++ 
++ 	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
++ 	skb_pull(skb, hlen);
++ }
++ 
++ static void ovs_fragment(struct net *net, struct vport *vport,
++ 			 struct sk_buff *skb, u16 mru, __be16 ethertype)
++ {
++ 	if (skb_network_offset(skb) > MAX_L2_LEN) {
++ 		OVS_NLERR(1, "L2 header too long to fragment");
++ 		goto err;
++ 	}
++ 
++ 	if (ethertype == htons(ETH_P_IP)) {
++ 		struct dst_entry ovs_dst;
++ 		unsigned long orig_dst;
++ 
++ 		prepare_frag(vport, skb);
++ 		dst_init(&ovs_dst, &ovs_dst_ops, NULL, 1,
++ 			 DST_OBSOLETE_NONE, DST_NOCOUNT);
++ 		ovs_dst.dev = vport->dev;
++ 
++ 		orig_dst = skb->_skb_refdst;
++ 		skb_dst_set_noref(skb, &ovs_dst);
++ 		IPCB(skb)->frag_max_size = mru;
++ 
++ 		ip_do_fragment(net, skb->sk, skb, ovs_vport_output);
++ 		refdst_drop(orig_dst);
++ 	} else if (ethertype == htons(ETH_P_IPV6)) {
++ 		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
++ 		unsigned long orig_dst;
++ 		struct rt6_info ovs_rt;
++ 
++ 		if (!v6ops) {
++ 			goto err;
++ 		}
++ 
++ 		prepare_frag(vport, skb);
++ 		memset(&ovs_rt, 0, sizeof(ovs_rt));
++ 		dst_init(&ovs_rt.dst, &ovs_dst_ops, NULL, 1,
++ 			 DST_OBSOLETE_NONE, DST_NOCOUNT);
++ 		ovs_rt.dst.dev = vport->dev;
++ 
++ 		orig_dst = skb->_skb_refdst;
++ 		skb_dst_set_noref(skb, &ovs_rt.dst);
++ 		IP6CB(skb)->frag_max_size = mru;
++ 
++ 		v6ops->fragment(net, skb->sk, skb, ovs_vport_output);
++ 		refdst_drop(orig_dst);
++ 	} else {
++ 		WARN_ONCE(1, "Failed fragment ->%s: eth=%04x, MRU=%d, MTU=%d.",
++ 			  ovs_vport_name(vport), ntohs(ethertype), mru,
++ 			  vport->dev->mtu);
++ 		goto err;
++ 	}
++ 
++ 	return;
++ err:
++ 	kfree_skb(skb);
++ }
++ 
++ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
++ 		      struct sw_flow_key *key)
+++>>>>>>> 6b83d28a55a8 (net: use skb_postpush_rcsum instead of own implementations)
+  {
+  	struct vport *vport = ovs_vport_rcu(dp, out_port);
+  
+diff --cc net/openvswitch/vport-netdev.c
+index 6c7a9d49beb5,4e3972344aa6..000000000000
+--- a/net/openvswitch/vport-netdev.c
++++ b/net/openvswitch/vport-netdev.c
+@@@ -52,11 -58,9 +52,16 @@@ static void netdev_port_receive(struct 
+  		return;
+  
+  	skb_push(skb, ETH_HLEN);
+++<<<<<<< HEAD
+ +	ovs_skb_postpush_rcsum(skb, skb->data, ETH_HLEN);
+ +
+ +	ovs_vport_receive(vport, skb, skb_tunnel_info(skb, AF_INET));
+++=======
++ 	skb_postpush_rcsum(skb, skb->data, ETH_HLEN);
++ 	ovs_vport_receive(vport, skb, skb_tunnel_info(skb));
+++>>>>>>> 6b83d28a55a8 (net: use skb_postpush_rcsum instead of own implementations)
+  	return;
+ +
+  error:
+  	kfree_skb(skb);
+  }
+diff --cc net/openvswitch/vport.h
+index 266cb00d5dc1,f01f28a567ad..000000000000
+--- a/net/openvswitch/vport.h
++++ b/net/openvswitch/vport.h
+@@@ -226,35 -182,22 +226,50 @@@ static inline struct vport *vport_from_
+  	return (struct vport *)((u8 *)priv - ALIGN(sizeof(struct vport), VPORT_ALIGN));
+  }
+  
+ -int ovs_vport_receive(struct vport *, struct sk_buff *,
+ -		      const struct ip_tunnel_info *);
+ +void ovs_vport_receive(struct vport *, struct sk_buff *,
+ +		       const struct ip_tunnel_info *);
+ +
+++<<<<<<< HEAD
+ +static inline void ovs_skb_postpush_rcsum(struct sk_buff *skb,
+ +				      const void *start, unsigned int len)
+ +{
+ +	if (skb->ip_summed == CHECKSUM_COMPLETE)
+ +		skb->csum = csum_add(skb->csum, csum_partial(start, len, 0));
+ +}
+  
+ +int ovs_vport_ops_register(struct vport_ops *ops);
+++=======
++ static inline const char *ovs_vport_name(struct vport *vport)
++ {
++ 	return vport->dev->name;
++ }
++ 
++ int __ovs_vport_ops_register(struct vport_ops *ops);
++ #define ovs_vport_ops_register(ops)		\
++ 	({					\
++ 		(ops)->owner = THIS_MODULE;	\
++ 		__ovs_vport_ops_register(ops);	\
++ 	})
++ 
+++>>>>>>> 6b83d28a55a8 (net: use skb_postpush_rcsum instead of own implementations)
+  void ovs_vport_ops_unregister(struct vport_ops *ops);
+ -void ovs_vport_send(struct vport *vport, struct sk_buff *skb);
+  
+ +static inline struct rtable *ovs_tunnel_route_lookup(struct net *net,
+ +						     const struct ip_tunnel_key *key,
+ +						     u32 mark,
+ +						     struct flowi4 *fl,
+ +						     u8 protocol)
+ +{
+ +	struct rtable *rt;
+ +
+ +	memset(fl, 0, sizeof(*fl));
+ +	fl->daddr = key->ipv4_dst;
+ +	fl->saddr = key->ipv4_src;
+ +	fl->flowi4_tos = RT_TOS(key->ipv4_tos);
+ +	fl->flowi4_mark = mark;
+ +	fl->flowi4_proto = protocol;
+ +
+ +	rt = ip_route_output_key(net, fl);
+ +	return rt;
+ +}
+  #endif /* vport.h */
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index fc02ef9734c7..5564bc7d7d12 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4022,9 +4022,7 @@ int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci)
+ 		skb->mac_len += VLAN_HLEN;
+ 		__skb_pull(skb, offset);
+ 
+-		if (skb->ip_summed == CHECKSUM_COMPLETE)
+-			skb->csum = csum_add(skb->csum, csum_partial(skb->data
+-					+ (2 * ETH_ALEN), VLAN_HLEN, 0));
++		skb_postpush_rcsum(skb, skb->data + (2 * ETH_ALEN), VLAN_HLEN);
+ 	}
+ 	__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
+ 	return 0;
+diff --git a/net/ipv6/reassembly.c b/net/ipv6/reassembly.c
+index cc85a9ba5010..5fa6b7a9699c 100644
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@ -493,10 +493,8 @@ static int ip6_frag_reasm(struct frag_queue *fq, struct sk_buff *prev,
+ 	IP6CB(head)->flags |= IP6SKB_FRAGMENTED;
+ 
+ 	/* Yes, and fold redundant checksum back. 8) */
+-	if (head->ip_summed == CHECKSUM_COMPLETE)
+-		head->csum = csum_partial(skb_network_header(head),
+-					  skb_network_header_len(head),
+-					  head->csum);
++	skb_postpush_rcsum(head, skb_network_header(head),
++			   skb_network_header_len(head));
+ 
+ 	rcu_read_lock();
+ 	IP6_INC_STATS_BH(net, __in6_dev_get(dev), IPSTATS_MIB_REASMOKS);
+* Unmerged path net/openvswitch/actions.c
+* Unmerged path net/openvswitch/vport-netdev.c
+* Unmerged path net/openvswitch/vport.h
