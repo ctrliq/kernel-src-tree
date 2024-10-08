@@ -1,0 +1,218 @@
+ceph: fix snap context leak in error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit db6aed70235b35a113e1b0e81cb293fd2e92de0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/db6aed70.failed
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit db6aed70235b35a113e1b0e81cb293fd2e92de0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,eb9028e8cfc5..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -491,6 -547,193 +491,196 @@@ static ssize_t ceph_sync_read(struct ki
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct ceph_aio_request {
++ 	struct kiocb *iocb;
++ 	size_t total_len;
++ 	int write;
++ 	int error;
++ 	struct list_head osd_reqs;
++ 	unsigned num_reqs;
++ 	atomic_t pending_reqs;
++ 	struct timespec mtime;
++ 	struct ceph_cap_flush *prealloc_cf;
++ };
++ 
++ struct ceph_aio_work {
++ 	struct work_struct work;
++ 	struct ceph_osd_request *req;
++ };
++ 
++ static void ceph_aio_retry_work(struct work_struct *work);
++ 
++ static void ceph_aio_complete(struct inode *inode,
++ 			      struct ceph_aio_request *aio_req)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	int ret;
++ 
++ 	if (!atomic_dec_and_test(&aio_req->pending_reqs))
++ 		return;
++ 
++ 	ret = aio_req->error;
++ 	if (!ret)
++ 		ret = aio_req->total_len;
++ 
++ 	dout("ceph_aio_complete %p rc %d\n", inode, ret);
++ 
++ 	if (ret >= 0 && aio_req->write) {
++ 		int dirty;
++ 
++ 		loff_t endoff = aio_req->iocb->ki_pos + aio_req->total_len;
++ 		if (endoff > i_size_read(inode)) {
++ 			if (ceph_inode_set_size(inode, endoff))
++ 				ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
++ 		}
++ 
++ 		spin_lock(&ci->i_ceph_lock);
++ 		ci->i_inline_version = CEPH_INLINE_NONE;
++ 		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_FILE_WR,
++ 					       &aio_req->prealloc_cf);
++ 		spin_unlock(&ci->i_ceph_lock);
++ 		if (dirty)
++ 			__mark_inode_dirty(inode, dirty);
++ 
++ 	}
++ 
++ 	ceph_put_cap_refs(ci, (aio_req->write ? CEPH_CAP_FILE_WR :
++ 						CEPH_CAP_FILE_RD));
++ 
++ 	aio_req->iocb->ki_complete(aio_req->iocb, ret, 0);
++ 
++ 	ceph_free_cap_flush(aio_req->prealloc_cf);
++ 	kfree(aio_req);
++ }
++ 
++ static void ceph_aio_complete_req(struct ceph_osd_request *req,
++ 				  struct ceph_msg *msg)
++ {
++ 	int rc = req->r_result;
++ 	struct inode *inode = req->r_inode;
++ 	struct ceph_aio_request *aio_req = req->r_priv;
++ 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
++ 	int num_pages = calc_pages_for((u64)osd_data->alignment,
++ 				       osd_data->length);
++ 
++ 	dout("ceph_aio_complete_req %p rc %d bytes %llu\n",
++ 	     inode, rc, osd_data->length);
++ 
++ 	if (rc == -EOLDSNAPC) {
++ 		struct ceph_aio_work *aio_work;
++ 		BUG_ON(!aio_req->write);
++ 
++ 		aio_work = kmalloc(sizeof(*aio_work), GFP_NOFS);
++ 		if (aio_work) {
++ 			INIT_WORK(&aio_work->work, ceph_aio_retry_work);
++ 			aio_work->req = req;
++ 			queue_work(ceph_inode_to_client(inode)->wb_wq,
++ 				   &aio_work->work);
++ 			return;
++ 		}
++ 		rc = -ENOMEM;
++ 	} else if (!aio_req->write) {
++ 		if (rc == -ENOENT)
++ 			rc = 0;
++ 		if (rc >= 0 && osd_data->length > rc) {
++ 			int zoff = osd_data->alignment + rc;
++ 			int zlen = osd_data->length - rc;
++ 			/*
++ 			 * If read is satisfied by single OSD request,
++ 			 * it can pass EOF. Otherwise read is within
++ 			 * i_size.
++ 			 */
++ 			if (aio_req->num_reqs == 1) {
++ 				loff_t i_size = i_size_read(inode);
++ 				loff_t endoff = aio_req->iocb->ki_pos + rc;
++ 				if (endoff < i_size)
++ 					zlen = min_t(size_t, zlen,
++ 						     i_size - endoff);
++ 				aio_req->total_len = rc + zlen;
++ 			}
++ 
++ 			if (zlen > 0)
++ 				ceph_zero_page_vector_range(zoff, zlen,
++ 							    osd_data->pages);
++ 		}
++ 	}
++ 
++ 	ceph_put_page_vector(osd_data->pages, num_pages, false);
++ 	ceph_osdc_put_request(req);
++ 
++ 	if (rc < 0)
++ 		cmpxchg(&aio_req->error, 0, rc);
++ 
++ 	ceph_aio_complete(inode, aio_req);
++ 	return;
++ }
++ 
++ static void ceph_aio_retry_work(struct work_struct *work)
++ {
++ 	struct ceph_aio_work *aio_work =
++ 		container_of(work, struct ceph_aio_work, work);
++ 	struct ceph_osd_request *orig_req = aio_work->req;
++ 	struct ceph_aio_request *aio_req = orig_req->r_priv;
++ 	struct inode *inode = orig_req->r_inode;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_snap_context *snapc;
++ 	struct ceph_osd_request *req;
++ 	int ret;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if (__ceph_have_pending_cap_snap(ci)) {
++ 		struct ceph_cap_snap *capsnap =
++ 			list_last_entry(&ci->i_cap_snaps,
++ 					struct ceph_cap_snap,
++ 					ci_item);
++ 		snapc = ceph_get_snap_context(capsnap->context);
++ 	} else {
++ 		BUG_ON(!ci->i_head_snapc);
++ 		snapc = ceph_get_snap_context(ci->i_head_snapc);
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 
++ 	req = ceph_osdc_alloc_request(orig_req->r_osdc, snapc, 2,
++ 			false, GFP_NOFS);
++ 	if (!req) {
++ 		ret = -ENOMEM;
++ 		req = orig_req;
++ 		goto out;
++ 	}
++ 
++ 	req->r_flags =	CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	req->r_base_oloc = orig_req->r_base_oloc;
++ 	req->r_base_oid = orig_req->r_base_oid;
++ 
++ 	req->r_ops[0] = orig_req->r_ops[0];
++ 	osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 
++ 	ceph_osdc_build_request(req, req->r_ops[0].extent.offset,
++ 				snapc, CEPH_NOSNAP, &aio_req->mtime);
++ 
++ 	ceph_osdc_put_request(orig_req);
++ 
++ 	req->r_callback = ceph_aio_complete_req;
++ 	req->r_inode = inode;
++ 	req->r_priv = aio_req;
++ 
++ 	ret = ceph_osdc_start_request(req->r_osdc, req, false);
++ out:
++ 	if (ret < 0) {
++ 		BUG_ON(ret == -EOLDSNAPC);
++ 		req->r_result = ret;
++ 		ceph_aio_complete_req(req, NULL);
++ 	}
++ 
++ 	ceph_put_snap_context(snapc);
++ 	kfree(aio_work);
++ }
++ 
+++>>>>>>> db6aed70235b (ceph: fix snap context leak in error path)
+  /*
+   * Write commit request unsafe callback, called to tell us when a
+   * request is unsafe (that is, in flight--has been handed to the
+* Unmerged path fs/ceph/file.c
