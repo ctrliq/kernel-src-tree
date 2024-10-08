@@ -1,0 +1,330 @@
+hv_netvsc: move start_remove flag to net_device_context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit f580aec4bfd7babe51f086e599400027def08ed8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f580aec4.failed
+
+struct netvsc_device is destroyed on mtu change so keeping the
+protection flag there is not a good idea. Move it to struct
+net_device_context which is preserved.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f580aec4bfd7babe51f086e599400027def08ed8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,18e9cc8ea47b..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -595,8 -621,63 +595,66 @@@ struct nvsp_message 
+  #define NETVSC_PACKET_SIZE                      4096
+  
+  #define VRSS_SEND_TAB_SIZE 16
+ -#define VRSS_CHANNEL_MAX 64
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	struct sk_buff *skb; /* skb containing the pkt */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync syncp;
++ };
++ 
++ struct netvsc_reconfig {
++ 	struct list_head list;
++ 	u32 event;
++ };
++ 
++ struct garp_wrk {
++ 	struct work_struct dwrk;
++ 	struct net_device *netdev;
++ 	struct netvsc_device *netvsc_dev;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	/* reconfigure work */
++ 	struct delayed_work dwork;
++ 	/* last reconfig time */
++ 	unsigned long last_reconfig;
++ 	/* reconfig events */
++ 	struct list_head reconfig_events;
++ 	/* list protection */
++ 	spinlock_t lock;
++ 
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 	struct garp_wrk gwrk;
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ 
++ 	/* Ethtool settings */
++ 	u8 duplex;
++ 	u32 speed;
++ 
++ 	/* the device is going away */
++ 	bool start_remove;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> f580aec4bfd7 (hv_netvsc: move start_remove flag to net_device_context)
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 822e657fcee7,b3fa2cdcb3f6..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -728,6 -752,157 +728,160 @@@ static void netvsc_get_channels(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int netvsc_set_channels(struct net_device *net,
++ 			       struct ethtool_channels *channels)
++ {
++ 	struct net_device_context *net_device_ctx = netdev_priv(net);
++ 	struct hv_device *dev = net_device_ctx->device_ctx;
++ 	struct netvsc_device *nvdev = hv_get_drvdata(dev);
++ 	struct netvsc_device_info device_info;
++ 	u32 num_chn;
++ 	u32 max_chn;
++ 	int ret = 0;
++ 	bool recovering = false;
++ 
++ 	if (!nvdev || nvdev->destroy)
++ 		return -ENODEV;
++ 
++ 	num_chn = nvdev->num_chn;
++ 	max_chn = min_t(u32, nvdev->max_chn, num_online_cpus());
++ 
++ 	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5) {
++ 		pr_info("vRSS unsupported before NVSP Version 5\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* We do not support rx, tx, or other */
++ 	if (!channels ||
++ 	    channels->rx_count ||
++ 	    channels->tx_count ||
++ 	    channels->other_count ||
++ 	    (channels->combined_count < 1))
++ 		return -EINVAL;
++ 
++ 	if (channels->combined_count > max_chn) {
++ 		pr_info("combined channels too high, using %d\n", max_chn);
++ 		channels->combined_count = max_chn;
++ 	}
++ 
++ 	ret = netvsc_close(net);
++ 	if (ret)
++ 		goto out;
++ 
++  do_set:
++ 	net_device_ctx->start_remove = true;
++ 	rndis_filter_device_remove(dev);
++ 
++ 	nvdev->num_chn = channels->combined_count;
++ 
++ 	net_device_ctx->device_ctx = dev;
++ 	hv_set_drvdata(dev, net);
++ 
++ 	memset(&device_info, 0, sizeof(device_info));
++ 	device_info.num_chn = nvdev->num_chn; /* passed to RNDIS */
++ 	device_info.ring_size = ring_size;
++ 	device_info.max_num_vrss_chns = max_num_vrss_chns;
++ 
++ 	ret = rndis_filter_device_add(dev, &device_info);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "unable to add netvsc device (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++ 	nvdev = hv_get_drvdata(dev);
++ 
++ 	ret = netif_set_real_num_tx_queues(net, nvdev->num_chn);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "could not set tx queue count (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++ 	ret = netif_set_real_num_rx_queues(net, nvdev->num_chn);
++ 	if (ret) {
++ 		if (recovering) {
++ 			netdev_err(net, "could not set rx queue count (ret %d)\n", ret);
++ 			return ret;
++ 		}
++ 		goto recover;
++ 	}
++ 
++  out:
++ 	netvsc_open(net);
++ 	net_device_ctx->start_remove = false;
++ 
++ 	return ret;
++ 
++  recover:
++ 	/* If the above failed, we attempt to recover through the same
++ 	 * process but with the original number of channels.
++ 	 */
++ 	netdev_err(net, "could not set channels, recovering\n");
++ 	recovering = true;
++ 	channels->combined_count = num_chn;
++ 	goto do_set;
++ }
++ 
++ static bool netvsc_validate_ethtool_ss_cmd(const struct ethtool_cmd *cmd)
++ {
++ 	struct ethtool_cmd diff1 = *cmd;
++ 	struct ethtool_cmd diff2 = {};
++ 
++ 	ethtool_cmd_speed_set(&diff1, 0);
++ 	diff1.duplex = 0;
++ 	/* advertising and cmd are usually set */
++ 	diff1.advertising = 0;
++ 	diff1.cmd = 0;
++ 	/* We set port to PORT_OTHER */
++ 	diff2.port = PORT_OTHER;
++ 
++ 	return !memcmp(&diff1, &diff2, sizeof(diff1));
++ }
++ 
++ static void netvsc_init_settings(struct net_device *dev)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 
++ 	ndc->speed = SPEED_UNKNOWN;
++ 	ndc->duplex = DUPLEX_UNKNOWN;
++ }
++ 
++ static int netvsc_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 
++ 	ethtool_cmd_speed_set(cmd, ndc->speed);
++ 	cmd->duplex = ndc->duplex;
++ 	cmd->port = PORT_OTHER;
++ 
++ 	return 0;
++ }
++ 
++ static int netvsc_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
++ {
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 	u32 speed;
++ 
++ 	speed = ethtool_cmd_speed(cmd);
++ 	if (!ethtool_validate_speed(speed) ||
++ 	    !ethtool_validate_duplex(cmd->duplex) ||
++ 	    !netvsc_validate_ethtool_ss_cmd(cmd))
++ 		return -EINVAL;
++ 
++ 	ndc->speed = speed;
++ 	ndc->duplex = cmd->duplex;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f580aec4bfd7 (hv_netvsc: move start_remove flag to net_device_context)
+  static int netvsc_change_mtu(struct net_device *ndev, int mtu)
+  {
+  	struct net_device_context *ndevctx = netdev_priv(ndev);
+@@@ -750,7 -926,9 +904,13 @@@
+  	if (ret)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	nvdev->start_remove = true;
+++=======
++ 	num_chn = nvdev->num_chn;
++ 
++ 	ndevctx->start_remove = true;
+++>>>>>>> f580aec4bfd7 (hv_netvsc: move start_remove flag to net_device_context)
+  	rndis_filter_device_remove(hdev);
+  
+  	ndev->mtu = mtu;
+@@@ -878,9 -1342,33 +1039,12 @@@ static int netvsc_probe(struct hv_devic
+  
+  	net_device_ctx = netdev_priv(net);
+  	net_device_ctx->device_ctx = dev;
+ -	net_device_ctx->msg_enable = netif_msg_init(debug, default_msg);
+ -	if (netif_msg_probe(net_device_ctx))
+ -		netdev_dbg(net, "netvsc msg_enable: %d\n",
+ -			   net_device_ctx->msg_enable);
+ -
+ -	net_device_ctx->tx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ -	if (!net_device_ctx->tx_stats) {
+ -		free_netdev(net);
+ -		return -ENOMEM;
+ -	}
+ -	net_device_ctx->rx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ -	if (!net_device_ctx->rx_stats) {
+ -		free_percpu(net_device_ctx->tx_stats);
+ -		free_netdev(net);
+ -		return -ENOMEM;
+ -	}
+ -
+  	hv_set_drvdata(dev, net);
++ 
++ 	net_device_ctx->start_remove = false;
++ 
+  	INIT_DELAYED_WORK(&net_device_ctx->dwork, netvsc_link_change);
+  	INIT_WORK(&net_device_ctx->work, do_set_multicast);
+ -	INIT_WORK(&net_device_ctx->gwrk.dwrk, netvsc_notify_peers);
+ -
+ -	spin_lock_init(&net_device_ctx->lock);
+ -	INIT_LIST_HEAD(&net_device_ctx->reconfig_events);
+  
+  	net->netdev_ops = &device_ops;
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 74ee1b57e623..402ddb16010c 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -50,7 +50,6 @@ static struct netvsc_device *alloc_net_device(struct hv_device *device)
+ 	}
+ 
+ 	init_waitqueue_head(&net_device->wait_drain);
+-	net_device->start_remove = false;
+ 	net_device->destroy = false;
+ 	net_device->dev = device;
+ 	net_device->ndev = ndev;
+@@ -656,7 +655,7 @@ static void netvsc_send_completion(struct netvsc_device *net_device,
+ 			wake_up(&net_device->wait_drain);
+ 
+ 		if (netif_tx_queue_stopped(netdev_get_tx_queue(ndev, q_idx)) &&
+-		    !net_device->start_remove &&
++		    !net_device->nd_ctx->start_remove &&
+ 		    (hv_ringbuf_avail_percent(&channel->outbound) >
+ 		     RING_AVAIL_PERCENT_HIWATER || queue_sends < 1))
+ 				netif_tx_wake_queue(netdev_get_tx_queue(
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
