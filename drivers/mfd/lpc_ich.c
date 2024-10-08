@@ -500,6 +500,7 @@ struct lpc_ich_info lpc_chipset_info[] = {
 	[LPC_AVN] = {
 		.name = "Avoton SoC",
 		.iTCO_version = 1,
+		.gpio_version = AVOTON_GPIO,
 	},
 	[LPC_COLETO] = {
 		.name = "Coleto Creek",
