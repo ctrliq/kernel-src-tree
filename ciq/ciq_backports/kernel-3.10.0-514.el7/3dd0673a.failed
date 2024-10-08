@@ -1,0 +1,257 @@
+netfilter: nf_tables: prepare set element accounting for async updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 3dd0673ac3cd7d05cde103396ec7ec410a901de2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3dd0673a.failed
+
+Use atomic operations for the element count to avoid races with async
+updates.
+
+To properly handle the transactional semantics during netlink updates,
+deleted but not yet committed elements are accounted for seperately and
+are treated as being already removed. This means for the duration of
+a netlink transaction, the limit might be exceeded by the amount of
+elements deleted. Set implementations must be prepared to handle this.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 3dd0673ac3cd7d05cde103396ec7ec410a901de2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_hash.c
+diff --cc net/netfilter/nf_tables_api.c
+index 0a324ef31a6a,27d1bf55a581..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3151,15 -3227,17 +3151,12 @@@ static int nft_add_set_elem(struct nft_
+  {
+  	struct nlattr *nla[NFTA_SET_ELEM_MAX + 1];
+  	struct nft_data_desc d1, d2;
+ -	struct nft_set_ext_tmpl tmpl;
+ -	struct nft_set_ext *ext;
+  	struct nft_set_elem elem;
+  	struct nft_set_binding *binding;
+ -	struct nft_data data;
+  	enum nft_registers dreg;
+  	struct nft_trans *trans;
+ -	u64 timeout;
+ -	u32 flags;
+  	int err;
+  
+- 	if (set->size && set->nelems == set->size)
+- 		return -ENFILE;
+- 
+  	err = nla_parse_nested(nla, NFTA_SET_ELEM_MAX, attr,
+  			       nft_set_elem_policy);
+  	if (err < 0)
+@@@ -3684,13 -3809,10 +3685,18 @@@ static int nf_tables_commit(struct sk_b
+  			nf_tables_setelem_notify(&trans->ctx, te->set,
+  						 &te->elem,
+  						 NFT_MSG_DELSETELEM, 0);
+ +			te->set->ops->get(te->set, &te->elem);
+ +			nft_data_uninit(&te->elem.key, NFT_DATA_VALUE);
+ +			if (te->set->flags & NFT_SET_MAP &&
+ +			    !(te->elem.flags & NFT_SET_ELEM_INTERVAL_END))
+ +				nft_data_uninit(&te->elem.data, te->set->dtype);
+  			te->set->ops->remove(te->set, &te->elem);
+++<<<<<<< HEAD
+ +			nft_trans_destroy(trans);
+++=======
++ 			atomic_dec(&te->set->nelems);
++ 			te->set->ndeact--;
+++>>>>>>> 3dd0673ac3cd (netfilter: nf_tables: prepare set element accounting for async updates)
+  			break;
+  		}
+  	}
+@@@ -3791,18 -3916,17 +3797,28 @@@ static int nf_tables_abort(struct sk_bu
+  			nft_trans_destroy(trans);
+  			break;
+  		case NFT_MSG_NEWSETELEM:
+- 			nft_trans_elem_set(trans)->nelems--;
+  			te = (struct nft_trans_elem *)trans->data;
+ -
+ +			te->set->ops->get(te->set, &te->elem);
+ +			nft_data_uninit(&te->elem.key, NFT_DATA_VALUE);
+ +			if (te->set->flags & NFT_SET_MAP &&
+ +			    !(te->elem.flags & NFT_SET_ELEM_INTERVAL_END))
+ +				nft_data_uninit(&te->elem.data, te->set->dtype);
+  			te->set->ops->remove(te->set, &te->elem);
+++<<<<<<< HEAD
+ +			nft_trans_destroy(trans);
+ +			break;
+ +		case NFT_MSG_DELSETELEM:
+ +			nft_trans_elem_set(trans)->nelems++;
+++=======
++ 			atomic_dec(&te->set->nelems);
++ 			break;
++ 		case NFT_MSG_DELSETELEM:
++ 			te = (struct nft_trans_elem *)trans->data;
++ 
++ 			te->set->ops->activate(te->set, &te->elem);
++ 			te->set->ndeact--;
++ 
+++>>>>>>> 3dd0673ac3cd (netfilter: nf_tables: prepare set element accounting for async updates)
+  			nft_trans_destroy(trans);
+  			break;
+  		}
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,c74e2bf1a1e4..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -129,32 -150,104 +129,81 @@@ static int nft_hash_get(const struct nf
+  static void nft_hash_walk(const struct nft_ctx *ctx, const struct nft_set *set,
+  			  struct nft_set_iter *iter)
+  {
+ -	struct nft_hash *priv = nft_set_priv(set);
+ -	struct nft_hash_elem *he;
+ -	struct rhashtable_iter hti;
+ +	const struct rhashtable *priv = nft_set_priv(set);
+ +	const struct bucket_table *tbl;
+ +	const struct nft_hash_elem *he;
+  	struct nft_set_elem elem;
+ -	u8 genmask = nft_genmask_cur(read_pnet(&set->pnet));
+ -	int err;
+ -
+ -	err = rhashtable_walk_init(&priv->ht, &hti);
+ -	iter->err = err;
+ -	if (err)
+ -		return;
+ -
+ -	err = rhashtable_walk_start(&hti);
+ -	if (err && err != -EAGAIN) {
+ -		iter->err = err;
+ -		goto out;
+ -	}
+ -
+ -	while ((he = rhashtable_walk_next(&hti))) {
+ -		if (IS_ERR(he)) {
+ -			err = PTR_ERR(he);
+ -			if (err != -EAGAIN) {
+ -				iter->err = err;
+ -				goto out;
+ -			}
+ +	unsigned int i;
+  
+ -			continue;
+ -		}
+ +	tbl = rht_dereference_rcu(priv->tbl, priv);
+ +	for (i = 0; i < tbl->size; i++) {
+ +		struct rhash_head *pos;
+  
+ -		if (iter->count < iter->skip)
+ -			goto cont;
+ -		if (nft_set_elem_expired(&he->ext))
+ -			goto cont;
+ -		if (!nft_set_elem_active(&he->ext, genmask))
+ -			goto cont;
+ +		rht_for_each_entry_rcu(he, pos, tbl, i, node) {
+ +			if (iter->count < iter->skip)
+ +				goto cont;
+  
+ -		elem.priv = he;
+ -
+ -		iter->err = iter->fn(ctx, set, iter, &elem);
+ -		if (iter->err < 0)
+ -			goto out;
+ +			memcpy(&elem.key, &he->key, sizeof(elem.key));
+ +			if (set->flags & NFT_SET_MAP)
+ +				memcpy(&elem.data, he->data, sizeof(elem.data));
+ +			elem.flags = 0;
+  
+ +			iter->err = iter->fn(ctx, set, iter, &elem);
+ +			if (iter->err < 0)
+ +				return;
+  cont:
+++<<<<<<< HEAD
+ +			iter->count++;
+ +		}
+++=======
++ 		iter->count++;
++ 	}
++ 
++ out:
++ 	rhashtable_walk_stop(&hti);
++ 	rhashtable_walk_exit(&hti);
++ }
++ 
++ static void nft_hash_gc(struct work_struct *work)
++ {
++ 	struct nft_set *set;
++ 	struct nft_hash_elem *he;
++ 	struct nft_hash *priv;
++ 	struct nft_set_gc_batch *gcb = NULL;
++ 	struct rhashtable_iter hti;
++ 	int err;
++ 
++ 	priv = container_of(work, struct nft_hash, gc_work.work);
++ 	set  = nft_set_container_of(priv);
++ 
++ 	err = rhashtable_walk_init(&priv->ht, &hti);
++ 	if (err)
++ 		goto schedule;
++ 
++ 	err = rhashtable_walk_start(&hti);
++ 	if (err && err != -EAGAIN)
++ 		goto out;
++ 
++ 	while ((he = rhashtable_walk_next(&hti))) {
++ 		if (IS_ERR(he)) {
++ 			if (PTR_ERR(he) != -EAGAIN)
++ 				goto out;
++ 			continue;
++ 		}
++ 
++ 		if (!nft_set_elem_expired(&he->ext))
++ 			continue;
++ 		if (nft_set_elem_mark_busy(&he->ext))
++ 			continue;
++ 
++ 		gcb = nft_set_gc_batch_check(set, gcb, GFP_ATOMIC);
++ 		if (gcb == NULL)
++ 			goto out;
++ 		rhashtable_remove_fast(&priv->ht, &he->node, nft_hash_params);
++ 		atomic_dec(&set->nelems);
++ 		nft_set_gc_batch_add(gcb, he);
+++>>>>>>> 3dd0673ac3cd (netfilter: nf_tables: prepare set element accounting for async updates)
+  	}
+ -out:
+ -	rhashtable_walk_stop(&hti);
+ -	rhashtable_walk_exit(&hti);
+ -
+ -	nft_set_gc_batch_complete(gcb);
+ -schedule:
+ -	queue_delayed_work(system_power_efficient_wq, &priv->gc_work,
+ -			   nft_set_gc_interval(set));
+  }
+  
+  static unsigned int nft_hash_privsize(const struct nlattr * const nla[])
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index e78033d80cd2..90555dd954dc 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -256,6 +256,7 @@ void nft_unregister_set(struct nft_set_ops *ops);
+  * 	@dtype: data type (verdict or numeric type defined by userspace)
+  * 	@size: maximum set size
+  * 	@nelems: number of elements
++ * 	@ndeact: number of deactivated elements queued for removal
+  * 	@timeout: default timeout value in msecs
+  * 	@gc_int: garbage collection interval in msecs
+  *	@policy: set parameterization (see enum nft_set_policies)
+@@ -272,7 +273,8 @@ struct nft_set {
+ 	u32				ktype;
+ 	u32				dtype;
+ 	u32				size;
+-	u32				nelems;
++	atomic_t			nelems;
++	u32				ndeact;
+ 	u64				timeout;
+ 	u32				gc_int;
+ 	u16				policy;
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_hash.c
