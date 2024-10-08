@@ -1,0 +1,206 @@
+net: avoid dependency of net_get_random_once on nop patching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] avoid dependency of net_get_random_once on nop patching (Ivan Vecera) [1200759]
+Rebuild_FUZZ: 95.65%
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 3d4405226d27b3a215e4d03cfa51f536244e5de7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3d440522.failed
+
+net_get_random_once depends on the static keys infrastructure to patch up
+the branch to the slow path during boot. This was realized by abusing the
+static keys api and defining a new initializer to not enable the call
+site while still indicating that the branch point should get patched
+up. This was needed to have the fast path considered likely by gcc.
+
+The static key initialization during boot up normally walks through all
+the registered keys and either patches in ideal nops or enables the jump
+site but omitted that step on x86 if ideal nops where already placed at
+static_key branch points. Thus net_get_random_once branches not always
+became active.
+
+This patch switches net_get_random_once to the ordinary static_key
+api and thus places the kernel fast path in the - by gcc considered -
+unlikely path.  Microbenchmarks on Intel and AMD x86-64 showed that
+the unlikely path actually beats the likely path in terms of cycle cost
+and that different nop patterns did not make much difference, thus this
+switch should not be noticeable.
+
+Fixes: a48e42920ff38b ("net: introduce new macro net_get_random_once")
+	Reported-by: Tuomas Räsänen <tuomasjjrasanen@tjjr.fi>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3d4405226d27b3a215e4d03cfa51f536244e5de7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/net.h
+#	net/core/utils.c
+diff --cc include/linux/net.h
+index 6822d99f6b2e,17d83393afcc..000000000000
+--- a/include/linux/net.h
++++ b/include/linux/net.h
+@@@ -252,35 -245,45 +252,74 @@@ do {								
+  #define net_dbg_ratelimited(fmt, ...)				\
+  	net_ratelimited_function(pr_debug, fmt, ##__VA_ARGS__)
+  
+ -bool __net_get_random_once(void *buf, int nbytes, bool *done,
+ -			   struct static_key *done_key);
+ +#define net_random()		prandom_u32()
+ +#define net_srandom(seed)	prandom_seed((__force u32)(seed))
+ +
+++<<<<<<< HEAD
+ +extern int   	     kernel_sendmsg(struct socket *sock, struct msghdr *msg,
+ +				    struct kvec *vec, size_t num, size_t len);
+ +extern int   	     kernel_recvmsg(struct socket *sock, struct msghdr *msg,
+ +				    struct kvec *vec, size_t num,
+ +				    size_t len, int flags);
+  
+ +extern int kernel_bind(struct socket *sock, struct sockaddr *addr,
+ +		       int addrlen);
+ +extern int kernel_listen(struct socket *sock, int backlog);
+ +extern int kernel_accept(struct socket *sock, struct socket **newsock,
+ +			 int flags);
+ +extern int kernel_connect(struct socket *sock, struct sockaddr *addr,
+ +			  int addrlen, int flags);
+ +extern int kernel_getsockname(struct socket *sock, struct sockaddr *addr,
+ +			      int *addrlen);
+ +extern int kernel_getpeername(struct socket *sock, struct sockaddr *addr,
+ +			      int *addrlen);
+ +extern int kernel_getsockopt(struct socket *sock, int level, int optname,
+ +			     char *optval, int *optlen);
+ +extern int kernel_setsockopt(struct socket *sock, int level, int optname,
+ +			     char *optval, unsigned int optlen);
+ +extern int kernel_sendpage(struct socket *sock, struct page *page, int offset,
+ +			   size_t size, int flags);
+ +extern int kernel_sock_ioctl(struct socket *sock, int cmd, unsigned long arg);
+ +extern int kernel_sock_shutdown(struct socket *sock,
+ +				enum sock_shutdown_cmd how);
+++=======
++ #define net_get_random_once(buf, nbytes)				\
++ 	({								\
++ 		bool ___ret = false;					\
++ 		static bool ___done = false;				\
++ 		static struct static_key ___once_key =			\
++ 			STATIC_KEY_INIT_TRUE;				\
++ 		if (static_key_true(&___once_key))			\
++ 			___ret = __net_get_random_once(buf,		\
++ 						       nbytes,		\
++ 						       &___done,	\
++ 						       &___once_key);	\
++ 		___ret;							\
++ 	})
++ 
++ int kernel_sendmsg(struct socket *sock, struct msghdr *msg, struct kvec *vec,
++ 		   size_t num, size_t len);
++ int kernel_recvmsg(struct socket *sock, struct msghdr *msg, struct kvec *vec,
++ 		   size_t num, size_t len, int flags);
++ 
++ int kernel_bind(struct socket *sock, struct sockaddr *addr, int addrlen);
++ int kernel_listen(struct socket *sock, int backlog);
++ int kernel_accept(struct socket *sock, struct socket **newsock, int flags);
++ int kernel_connect(struct socket *sock, struct sockaddr *addr, int addrlen,
++ 		   int flags);
++ int kernel_getsockname(struct socket *sock, struct sockaddr *addr,
++ 		       int *addrlen);
++ int kernel_getpeername(struct socket *sock, struct sockaddr *addr,
++ 		       int *addrlen);
++ int kernel_getsockopt(struct socket *sock, int level, int optname, char *optval,
++ 		      int *optlen);
++ int kernel_setsockopt(struct socket *sock, int level, int optname, char *optval,
++ 		      unsigned int optlen);
++ int kernel_sendpage(struct socket *sock, struct page *page, int offset,
++ 		    size_t size, int flags);
++ int kernel_sock_ioctl(struct socket *sock, int cmd, unsigned long arg);
++ int kernel_sock_shutdown(struct socket *sock, enum sock_shutdown_cmd how);
+++>>>>>>> 3d4405226d27 (net: avoid dependency of net_get_random_once on nop patching)
+  
+  #define MODULE_ALIAS_NETPROTO(proto) \
+  	MODULE_ALIAS("net-pf-" __stringify(proto))
+diff --cc net/core/utils.c
+index 3c7f5b51b979,eed34338736c..000000000000
+--- a/net/core/utils.c
++++ b/net/core/utils.c
+@@@ -339,24 -339,51 +339,64 @@@ void inet_proto_csum_replace16(__sum16 
+  }
+  EXPORT_SYMBOL(inet_proto_csum_replace16);
+  
+ -struct __net_random_once_work {
+ -	struct work_struct work;
+ -	struct static_key *key;
+ -};
+ -
+ -static void __net_random_once_deferred(struct work_struct *w)
+ +int mac_pton(const char *s, u8 *mac)
+  {
+++<<<<<<< HEAD
+ +	int i;
+++=======
++ 	struct __net_random_once_work *work =
++ 		container_of(w, struct __net_random_once_work, work);
++ 	BUG_ON(!static_key_enabled(work->key));
++ 	static_key_slow_dec(work->key);
++ 	kfree(work);
++ }
+ -
+ -static void __net_random_once_disable_jump(struct static_key *key)
+ -{
+ -	struct __net_random_once_work *w;
+ -
+++>>>>>>> 3d4405226d27 (net: avoid dependency of net_get_random_once on nop patching)
+ +
+ +	/* XX:XX:XX:XX:XX:XX */
+ +	if (strlen(s) < 3 * ETH_ALEN - 1)
+ +		return 0;
+ +
+++<<<<<<< HEAD
+ +	/* Don't dirty result unless string is valid MAC. */
+ +	for (i = 0; i < ETH_ALEN; i++) {
+ +		if (!isxdigit(s[i * 3]) || !isxdigit(s[i * 3 + 1]))
+ +			return 0;
+ +		if (i != ETH_ALEN - 1 && s[i * 3 + 2] != ':')
+ +			return 0;
+ +	}
+ +	for (i = 0; i < ETH_ALEN; i++) {
+ +		mac[i] = (hex_to_bin(s[i * 3]) << 4) | hex_to_bin(s[i * 3 + 1]);
+ +	}
+ +	return 1;
+++=======
++ 	w = kmalloc(sizeof(*w), GFP_ATOMIC);
++ 	if (!w)
++ 		return;
++ 
++ 	INIT_WORK(&w->work, __net_random_once_deferred);
++ 	w->key = key;
++ 	schedule_work(&w->work);
++ }
++ 
++ bool __net_get_random_once(void *buf, int nbytes, bool *done,
++ 			   struct static_key *once_key)
++ {
++ 	static DEFINE_SPINLOCK(lock);
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&lock, flags);
++ 	if (*done) {
++ 		spin_unlock_irqrestore(&lock, flags);
++ 		return false;
++ 	}
++ 
++ 	get_random_bytes(buf, nbytes);
++ 	*done = true;
++ 	spin_unlock_irqrestore(&lock, flags);
++ 
++ 	__net_random_once_disable_jump(once_key);
++ 
++ 	return true;
+++>>>>>>> 3d4405226d27 (net: avoid dependency of net_get_random_once on nop patching)
+  }
+ -EXPORT_SYMBOL(__net_get_random_once);
+ +EXPORT_SYMBOL(mac_pton);
+* Unmerged path include/linux/net.h
+* Unmerged path net/core/utils.c
