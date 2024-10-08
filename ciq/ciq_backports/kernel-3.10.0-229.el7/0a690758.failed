@@ -1,0 +1,87 @@
+IB/iser: Seperate iser_conn and iscsi_endpoint storage space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] iser: Seperate iser_conn and iscsi_endpoint storage space (Amir Vadai) [1107622]
+Rebuild_FUZZ: 97.44%
+commit-author Ariel Nahum <arieln@mellanox.com>
+commit 0a6907588a8b9bf1aa9ee84b809a1d49caea594a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0a690758.failed
+
+iser connection needs asynchronous cleanup completions which are
+triggered in ep_disconnect.  As a result we are keeping the
+corresponding iscsi_endpoint structure hanging for no good reason. In
+order to avoid that, we seperate iser_conn from iscsi_endpoint storage
+space to have their destruction being independent.
+
+iscsi_endpoint will be destroyed at ep_disconnect stage, while the
+iser connection will wait for asynchronous completions to be released
+in an orderly fashion.
+
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 0a6907588a8b9bf1aa9ee84b809a1d49caea594a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.c
+index ed0eb50fd5e9,d7acd4b62d6e..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@@ -660,19 -653,21 +669,34 @@@ iscsi_iser_ep_disconnect(struct iscsi_e
+  	struct iser_conn *ib_conn;
+  
+  	ib_conn = ep->dd_data;
+ -	iser_info("ep %p ib conn %p state %d\n", ep, ib_conn, ib_conn->state);
+ +	if (ib_conn->iser_conn)
+ +		/*
+ +		 * Must suspend xmit path if the ep is bound to the
+ +		 * iscsi_conn, so we know we are not accessing the ib_conn
+ +		 * when we free it.
+ +		 *
+ +		 * This may not be bound if the ep poll failed.
+ +		 */
+ +		iscsi_suspend_tx(ib_conn->iser_conn->iscsi_conn);
+ +
+++<<<<<<< HEAD
+ +
+ +	iser_info("ib conn %p state %d\n", ib_conn, ib_conn->state);
+  	iser_conn_terminate(ib_conn);
+ -
+++=======
++ 	/*
++ 	 * if iser_conn and iscsi_conn are bound, we must wait iscsi_conn_stop
++ 	 * call and ISER_CONN_DOWN state before freeing the iser resources.
++ 	 * otherwise we are safe to free resources immediately.
++ 	 */
++ 	if (ib_conn->iscsi_conn) {
++ 		INIT_WORK(&ib_conn->release_work, iser_release_work);
++ 		queue_work(release_wq, &ib_conn->release_work);
++ 	} else {
++ 		iser_conn_release(ib_conn);
++ 	}
++ 	iscsi_destroy_endpoint(ep);
+++>>>>>>> 0a6907588a8b (IB/iser: Seperate iser_conn and iscsi_endpoint storage space)
+  }
+  
+  static umode_t iser_attr_is_visible(int param_type, int param)
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.c
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index f17d86cab64e..9b1fc4611507 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -604,7 +604,7 @@ static void iser_conn_release(struct iser_conn *ib_conn, int can_destroy_id)
+ 		rdma_destroy_id(ib_conn->cma_id);
+ 		ib_conn->cma_id = NULL;
+ 	}
+-	iscsi_destroy_endpoint(ib_conn->ep);
++	kfree(ib_conn);
+ }
+ 
+ void iser_conn_get(struct iser_conn *ib_conn)
