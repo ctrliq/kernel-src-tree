@@ -166,11 +166,13 @@ int snd_hdac_power_up(struct hdac_device *codec);
 int snd_hdac_power_down(struct hdac_device *codec);
 int snd_hdac_power_up_pm(struct hdac_device *codec);
 int snd_hdac_power_down_pm(struct hdac_device *codec);
+int snd_hdac_keep_power_up(struct hdac_device *codec);
 #else
 static inline int snd_hdac_power_up(struct hdac_device *codec) { return 0; }
 static inline int snd_hdac_power_down(struct hdac_device *codec) { return 0; }
 static inline int snd_hdac_power_up_pm(struct hdac_device *codec) { return 0; }
 static inline int snd_hdac_power_down_pm(struct hdac_device *codec) { return 0; }
+static inline int snd_hdac_keep_power_up(struct hdac_device *codec) { return 0; }
 #endif
 
 /*
