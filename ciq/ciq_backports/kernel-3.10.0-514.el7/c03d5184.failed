@@ -1,0 +1,157 @@
+perf machine: Adjust dso->long_name for offline module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit c03d5184f0e92fa696e4b57f54ffc3b19a92f704
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c03d5184.failed
+
+Something unexpected may happen if copy statically linked perf to a
+production environment:
+
+  # ./perf probe -m ./mymodule.ko my_func
+  [mymodule] with build id 326ab42550ef3d24944f53c817533728367effeb not found, continuing without symbols
+  Failed to find symbol my_func in /home/wangnan/kmodule/mymodule.ko
+    Error: Failed to add events.
+  # ./perf buildid-cache -a ./mymodule.ko
+  # ./perf probe -m ./mymodule.ko my_func
+  Added new event:
+    probe:my_func        (on my_func in /home/wangnan/kmodule/mymodule.ko)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe:my_func -aR sleep 1
+
+Where:
+
+  # ldd ./perf
+ 	not a dynamic executable
+  # strace -e open ./perf probe -m ./mymodule.ko my_func
+  ...
+  open("/home/wangnan/kmodule/mymodule.ko", O_RDONLY) = 3
+  open("/home/wangnan/kmodule/../lib64/elfutils/libebl_x86_64.so", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+  ...
+  open("/lib64/tls/libebl_x86_64.so", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+  open("/lib64/libebl_x86_64.so", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+  open("/usr/lib64/tls/libebl_x86_64.so", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+  open("/usr/lib64/libebl_x86_64.so", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+  open("[mymodule]", O_RDONLY)            = -1 ENOENT (No such file or directory)
+  open("/home/wangnan/.debug/.build-id/32/6ab42550ef3d24944f53c817533728367effeb", O_RDONLY) = -1 ENOENT (No such file or directory)
+  open("[mymodule]", O_RDONLY)            = -1 ENOENT (No such file or directory)
+
+In the above example, probe fails before we put the module into
+buildid-cache. However, user would expect it success in both case
+because perf is able to find probe points actually.
+
+The reason is because perf won't utilize module's full path if it failed
+to open debuginfo. In:
+
+     convert_to_probe_trace_events ->
+        find_probe_trace_events_from_map ->
+            get_target_map ->
+                kernel_get_module_map ->
+                    machine__findnew_module_map ->
+                        map_groups__find_by_name
+
+map_groups__find_by_name() is able to find the map of that module, but
+this information is found from /proc/module before it knows the real
+path of the offline module. Therefore, the map->dso->long_name is set to
+something like '[mymodule]', which prevent dso__load() find the real
+path of the module file.
+
+In another aspect, if dso__load() can get the offline module through
+buildid cache, it can read symble table from that ko. Even if debuginfo
+is not available, 'perf probe' can success if the '.symtab' can be
+found.
+
+This patch improves machine__findnew_module_map(): when dso->long_name
+is leading with '[' (doesn't find path of module when parsing
+/proc/modules), fixes it by dso__set_long_name(), so following
+dso__load() is possible to find the symbol table.
+
+This patch won't interfere with buildid matching. Here is the test
+result:
+
+  # ./perf probe -m ./mymodule.ko my_func
+  Added new event:
+    probe:my_func        (on my_func in /home/wangnan/kmodule/mymodule.ko)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe:my_func -aR sleep 1
+
+  # ./perf probe -d '*'
+  Removed event: probe:my_func
+  # mv ./mymodule.{ko,.bak}
+  # mv ./moduleb.ko mymodule.ko
+  # ./perf probe -m ./mymodule.ko my_func
+  /home/wangnan/kmodule/mymodule.ko with build id 326ab42550ef3d24944f53c817533728367effeb not found, continuing without symbols
+  Failed to find symbol my_func in /home/wangnan/kmodule/mymodule.ko
+    Error: Failed to add events.
+
+  # ./perf probe -v -m ./mymodule.ko my_func
+  probe-definition(0): my_func
+  symbol:my_func file:(null) line:0 offset:0 return:0 lazy:(null)
+  0 arguments
+  Could not open debuginfo. Try to use symbols.
+  symsrc__init: build id mismatch for /home/wangnan/kmodule/mymodule.ko.
+  /home/wangnan/kmodule/mymodule.ko with build id 326ab42550ef3d24944f53c817533728367effeb not found, continuing without symbols
+  Failed to find symbol my_func in /home/wangnan/kmodule/mymodule.ko
+    Error: Failed to add events. Reason: No such file or directory (Code: -2)
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1448510397-187965-1-git-send-email-wangnan0@huawei.com
+[ Renamed adjust_dso_long_name() do dso__adjust_kmod_long_name() ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c03d5184f0e92fa696e4b57f54ffc3b19a92f704)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/machine.c
+diff --cc tools/perf/util/machine.c
+index 3b242a076016,95a7f6087346..000000000000
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@@ -553,6 -553,32 +553,35 @@@ int machine__process_itrace_start_event
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int machine__process_switch_event(struct machine *machine __maybe_unused,
++ 				  union perf_event *event)
++ {
++ 	if (dump_trace)
++ 		perf_event__fprintf_switch(event, stdout);
++ 	return 0;
++ }
++ 
++ static void dso__adjust_kmod_long_name(struct dso *dso, const char *filename)
++ {
++ 	const char *dup_filename;
++ 
++ 	if (!filename || !dso || !dso->long_name)
++ 		return;
++ 	if (dso->long_name[0] != '[')
++ 		return;
++ 	if (!strchr(filename, '/'))
++ 		return;
++ 
++ 	dup_filename = strdup(filename);
++ 	if (!dup_filename)
++ 		return;
++ 
++ 	dso__set_long_name(dso, filename, true);
++ }
++ 
+++>>>>>>> c03d5184f0e9 (perf machine: Adjust dso->long_name for offline module)
+  struct map *machine__findnew_module_map(struct machine *machine, u64 start,
+  					const char *filename)
+  {
+* Unmerged path tools/perf/util/machine.c
