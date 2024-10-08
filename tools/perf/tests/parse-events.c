@@ -5,6 +5,7 @@
 #include <api/fs/fs.h>
 #include "tests.h"
 #include "debug.h"
+#include "util.h"
 #include <linux/hw_breakpoint.h>
 #include <api/fs/fs.h>
 
@@ -1745,6 +1746,17 @@ static int test_pmu_events(void)
 	return ret;
 }
 
+static void debug_warn(const char *warn, va_list params)
+{
+	char msg[1024];
+
+	if (!verbose)
+		return;
+
+	vsnprintf(msg, sizeof(msg), warn, params);
+	fprintf(stderr, " Warning: %s\n", msg);
+}
+
 int test__parse_events(void)
 {
 	int ret1, ret2 = 0;
@@ -1755,6 +1767,8 @@ do {							\
 	if (!ret2)					\
 		ret2 = ret1;				\
 } while (0)
+
+	set_warning_routine(debug_warn);
 
 	TEST_EVENTS(test__events);
 
