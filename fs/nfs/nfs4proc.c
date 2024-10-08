@@ -52,7 +52,6 @@
 #include <linux/namei.h>
 #include <linux/mount.h>
 #include <linux/module.h>
-#include <linux/nfs_idmap.h>
 #include <linux/xattr.h>
 #include <linux/utsname.h>
 #include <linux/freezer.h>
@@ -64,6 +63,7 @@
 #include "callback.h"
 #include "pnfs.h"
 #include "netns.h"
+#include "nfs4idmap.h"
 #include "nfs4session.h"
 #include "fscache.h"
 
