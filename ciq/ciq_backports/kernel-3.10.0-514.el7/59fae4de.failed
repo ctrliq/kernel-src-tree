@@ -1,0 +1,249 @@
+IB/srpt: chain RDMA READ/WRITE requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 59fae4deaad388351c690422b88787e6fd5f45ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/59fae4de.failed
+
+Remove struct rdma_iu and instead allocate the struct ib_rdma_wr array
+early and fill out directly.  This allows us to chain the WRs, and thus
+archives both less lock contention on the HCA workqueue as well as much
+simpler error handling.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+(cherry picked from commit 59fae4deaad388351c690422b88787e6fd5f45ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 6df2d90f10ad,8068affe25b5..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -93,9 -91,10 +93,11 @@@ MODULE_PARM_DESC(srpt_service_guid
+  		 " instead of using the node_guid of the first HCA.");
+  
+  static struct ib_client srpt_client;
+ +static struct target_fabric_configfs *srpt_target;
+  static void srpt_release_channel(struct srpt_rdma_ch *ch);
+  static int srpt_queue_status(struct se_cmd *cmd);
++ static void srpt_recv_done(struct ib_cq *cq, struct ib_wc *wc);
++ static void srpt_send_done(struct ib_cq *cq, struct ib_wc *wc);
+  
+  /**
+   * opposite_dma_dir() - Swap DMA_TO_DEVICE and DMA_FROM_DEVICE.
+@@@ -2823,12 -2673,8 +2675,12 @@@ static int srpt_cm_handler(struct ib_cm
+  static int srpt_perform_rdmas(struct srpt_rdma_ch *ch,
+  			      struct srpt_send_ioctx *ioctx)
+  {
+++<<<<<<< HEAD
+ +	struct ib_send_wr wr;
+++=======
+++>>>>>>> 59fae4deaad3 (IB/srpt: chain RDMA READ/WRITE requests)
+  	struct ib_send_wr *bad_wr;
+- 	struct rdma_iu *riu;
+- 	int i;
+- 	int ret;
+- 	int sq_wr_avail;
++ 	int sq_wr_avail, ret, i;
+  	enum dma_data_direction dir;
+  	const int n_rdma = ioctx->n_rdma;
+  
+@@@ -2844,59 -2690,32 +2696,81 @@@
+  		}
+  	}
+  
+- 	ioctx->rdma_aborted = false;
+- 	ret = 0;
+- 	riu = ioctx->rdma_ius;
+- 	memset(&wr, 0, sizeof wr);
++ 	for (i = 0; i < n_rdma; i++) {
++ 		struct ib_send_wr *wr = &ioctx->rdma_wrs[i].wr;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < n_rdma; ++i, ++riu) {
+ +		if (dir == DMA_FROM_DEVICE) {
+ +			wr.opcode = IB_WR_RDMA_WRITE;
+ +			wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
+ +						SRPT_RDMA_WRITE_LAST :
+ +						SRPT_RDMA_MID,
+ +						ioctx->ioctx.index);
+ +		} else {
+ +			wr.opcode = IB_WR_RDMA_READ;
+ +			wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
+ +						SRPT_RDMA_READ_LAST :
+ +						SRPT_RDMA_MID,
+ +						ioctx->ioctx.index);
+ +		}
+ +		wr.next = NULL;
+ +		wr.wr.rdma.remote_addr = riu->raddr;
+ +		wr.wr.rdma.rkey = riu->rkey;
+ +		wr.num_sge = riu->sge_cnt;
+ +		wr.sg_list = riu->sge;
+ +
+ +		/* only get completion event for the last rdma write */
+ +		if (i == (n_rdma - 1) && dir == DMA_TO_DEVICE)
+ +			wr.send_flags = IB_SEND_SIGNALED;
+ +
+ +		ret = ib_post_send(ch->qp, &wr, &bad_wr);
+ +		if (ret)
+ +			break;
+++=======
++ 		wr->opcode = (dir == DMA_FROM_DEVICE) ?
++ 				IB_WR_RDMA_WRITE : IB_WR_RDMA_READ;
++ 
++ 		if (i == n_rdma - 1) {
++ 			/* only get completion event for the last rdma read */
++ 			if (dir == DMA_TO_DEVICE) {
++ 				wr->send_flags = IB_SEND_SIGNALED;
++ 				ioctx->rdma_cqe.done = srpt_rdma_read_done;
++ 			} else {
++ 				ioctx->rdma_cqe.done = srpt_rdma_write_done;
++ 			}
++ 			wr->wr_cqe = &ioctx->rdma_cqe;
++ 			wr->next = NULL;
++ 		} else {
++ 			wr->wr_cqe = NULL;
++ 			wr->next = &ioctx->rdma_wrs[i + 1].wr;
++ 		}
+++>>>>>>> 59fae4deaad3 (IB/srpt: chain RDMA READ/WRITE requests)
+  	}
+  
++ 	ret = ib_post_send(ch->qp, &ioctx->rdma_wrs->wr, &bad_wr);
+  	if (ret)
+  		pr_err("%s[%d]: ib_post_send() returned %d for %d/%d\n",
+  				 __func__, __LINE__, ret, i, n_rdma);
+++<<<<<<< HEAD
+ +	if (ret && i > 0) {
+ +		wr.num_sge = 0;
+ +		wr.wr_id = encode_wr_id(SRPT_RDMA_ABORT, ioctx->ioctx.index);
+ +		wr.send_flags = IB_SEND_SIGNALED;
+ +		while (ch->state == CH_LIVE &&
+ +			ib_post_send(ch->qp, &wr, &bad_wr) != 0) {
+ +			pr_info("Trying to abort failed RDMA transfer [%d]\n",
+ +				ioctx->ioctx.index);
+ +			msleep(1000);
+ +		}
+ +		while (ch->state != CH_RELEASING && !ioctx->rdma_aborted) {
+ +			pr_info("Waiting until RDMA abort finished [%d]\n",
+ +				ioctx->ioctx.index);
+ +			msleep(1000);
+ +		}
+ +	}
+++=======
+++>>>>>>> 59fae4deaad3 (IB/srpt: chain RDMA READ/WRITE requests)
+  out:
+  	if (unlikely(dir == DMA_TO_DEVICE && ret < 0))
+  		atomic_add(n_rdma, &ch->sq_wr_avail);
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.h b/drivers/infiniband/ulp/srpt/ib_srpt.h
+index e030242461ac..d7105e3ab6e5 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@ -128,36 +128,6 @@ enum {
+ 	DEFAULT_MAX_RDMA_SIZE = 65536,
+ };
+ 
+-enum srpt_opcode {
+-	SRPT_RECV,
+-	SRPT_SEND,
+-	SRPT_RDMA_MID,
+-	SRPT_RDMA_ABORT,
+-	SRPT_RDMA_READ_LAST,
+-	SRPT_RDMA_WRITE_LAST,
+-};
+-
+-static inline u64 encode_wr_id(u8 opcode, u32 idx)
+-{
+-	return ((u64)opcode << 32) | idx;
+-}
+-static inline enum srpt_opcode opcode_from_wr_id(u64 wr_id)
+-{
+-	return wr_id >> 32;
+-}
+-static inline u32 idx_from_wr_id(u64 wr_id)
+-{
+-	return (u32)wr_id;
+-}
+-
+-struct rdma_iu {
+-	u64		raddr;
+-	u32		rkey;
+-	struct ib_sge	*sge;
+-	u32		sge_cnt;
+-	int		mem_id;
+-};
+-
+ /**
+  * enum srpt_command_state - SCSI command state managed by SRPT.
+  * @SRPT_STATE_NEW:           New command arrived and is being processed.
+@@ -189,6 +159,7 @@ enum srpt_command_state {
+  * @index: Index of the I/O context in its ioctx_ring array.
+  */
+ struct srpt_ioctx {
++	struct ib_cqe		cqe;
+ 	void			*buf;
+ 	dma_addr_t		dma;
+ 	uint32_t		index;
+@@ -215,33 +186,31 @@ struct srpt_recv_ioctx {
+  * @sg:          Pointer to sg-list associated with this I/O context.
+  * @sg_cnt:      SG-list size.
+  * @mapped_sg_count: ib_dma_map_sg() return value.
+- * @n_rdma_ius:  Number of elements in the rdma_ius array.
+- * @rdma_ius:    Array with information about the RDMA mapping.
++ * @n_rdma_wrs:  Number of elements in the rdma_wrs array.
++ * @rdma_wrs:    Array with information about the RDMA mapping.
+  * @tag:         Tag of the received SRP information unit.
+  * @spinlock:    Protects 'state'.
+  * @state:       I/O context state.
+- * @rdma_aborted: If initiating a multipart RDMA transfer failed, whether
+- * 		 the already initiated transfers have finished.
+  * @cmd:         Target core command data structure.
+  * @sense_data:  SCSI sense data.
+  */
+ struct srpt_send_ioctx {
+ 	struct srpt_ioctx	ioctx;
+ 	struct srpt_rdma_ch	*ch;
+-	struct rdma_iu		*rdma_ius;
++	struct ib_rdma_wr	*rdma_wrs;
++	struct ib_cqe		rdma_cqe;
+ 	struct srp_direct_buf	*rbufs;
+ 	struct srp_direct_buf	single_rbuf;
+ 	struct scatterlist	*sg;
+ 	struct list_head	free_list;
+ 	spinlock_t		spinlock;
+ 	enum srpt_command_state	state;
+-	bool			rdma_aborted;
+ 	struct se_cmd		cmd;
+ 	struct completion	tx_done;
+ 	u64			tag;
+ 	int			sg_cnt;
+ 	int			mapped_sg_count;
+-	u16			n_rdma_ius;
++	u16			n_rdma_wrs;
+ 	u8			n_rdma;
+ 	u8			n_rbuf;
+ 	bool			queue_status_only;
+@@ -268,9 +237,6 @@ enum rdma_ch_state {
+ 
+ /**
+  * struct srpt_rdma_ch - RDMA channel.
+- * @wait_queue:    Allows the kernel thread to wait for more work.
+- * @thread:        Kernel thread that processes the IB queues associated with
+- *                 the channel.
+  * @cm_id:         IB CM ID associated with the channel.
+  * @qp:            IB queue pair used for communicating over this channel.
+  * @cq:            IB completion queue for this channel.
+@@ -300,8 +266,6 @@ enum rdma_ch_state {
+  * @release_done:  Enables waiting for srpt_release_channel() completion.
+  */
+ struct srpt_rdma_ch {
+-	wait_queue_head_t	wait_queue;
+-	struct task_struct	*thread;
+ 	struct ib_cm_id		*cm_id;
+ 	struct ib_qp		*qp;
+ 	struct ib_cq		*cq;
