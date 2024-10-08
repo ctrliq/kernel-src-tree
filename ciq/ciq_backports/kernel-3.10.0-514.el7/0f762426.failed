@@ -1,0 +1,115 @@
+mmc: core: Report firmware version for eMMC 5.0 devices.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] mmc: core: Report firmware version for eMMC 5.0 devices (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 99.10%
+commit-author Gwendal Grignou <gwendal@chromium.org>
+commit 0f762426769a517d5b278e4e5d579fcea6801734
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0f762426.failed
+
+For eMMC 5.0 compliant device, firmware version is stored in ext_csd.
+Report firmware as a 64bit hexa decimal. Vendor can use hexa or ascii
+string to report firmware version.
+Also add FFU related EXT_CSD register and note if the device is FFU capable.
+
+	Signed-off-by: Gwendal Grignou <gwendal@chromium.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 0f762426769a517d5b278e4e5d579fcea6801734)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmc/mmc.h
+diff --cc include/linux/mmc/mmc.h
+index 07b3cc9d7d7b,49ad7a943638..000000000000
+--- a/include/linux/mmc/mmc.h
++++ b/include/linux/mmc/mmc.h
+@@@ -326,6 -332,9 +327,12 @@@ struct _mmc_csd 
+  #define EXT_CSD_POWER_OFF_LONG_TIME	247	/* RO */
+  #define EXT_CSD_GENERIC_CMD6_TIME	248	/* RO */
+  #define EXT_CSD_CACHE_SIZE		249	/* RO, 4 bytes */
+++<<<<<<< HEAD
+++=======
++ #define EXT_CSD_PWR_CL_DDR_200_360	253	/* RO */
++ #define EXT_CSD_FIRMWARE_VERSION	254	/* RO, 8 bytes */
++ #define EXT_CSD_SUPPORTED_MODE		493	/* RO */
+++>>>>>>> 0f762426769a (mmc: core: Report firmware version for eMMC 5.0 devices.)
+  #define EXT_CSD_TAG_UNIT_SIZE		498	/* RO */
+  #define EXT_CSD_DATA_TAG_SUPPORT	499	/* RO */
+  #define EXT_CSD_MAX_PACKED_WRITES	500	/* RO */
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index b5e112ab86f3..14326a36f0f4 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -597,6 +597,14 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
+ 		card->ext_csd.data_sector_size = 512;
+ 	}
+ 
++	/* eMMC v5 or later */
++	if (card->ext_csd.rev >= 7) {
++		memcpy(card->ext_csd.fwrev, &ext_csd[EXT_CSD_FIRMWARE_VERSION],
++		       MMC_FIRMWARE_LEN);
++		card->ext_csd.ffu_capable =
++			(ext_csd[EXT_CSD_SUPPORTED_MODE] & 0x1) &&
++			!(ext_csd[EXT_CSD_FW_CONFIG] & 0x1);
++	}
+ out:
+ 	return err;
+ }
+@@ -688,7 +696,7 @@ MMC_DEV_ATTR(csd, "%08x%08x%08x%08x\n", card->raw_csd[0], card->raw_csd[1],
+ MMC_DEV_ATTR(date, "%02d/%04d\n", card->cid.month, card->cid.year);
+ MMC_DEV_ATTR(erase_size, "%u\n", card->erase_size << 9);
+ MMC_DEV_ATTR(preferred_erase_size, "%u\n", card->pref_erase << 9);
+-MMC_DEV_ATTR(fwrev, "0x%x\n", card->cid.fwrev);
++MMC_DEV_ATTR(ffu_capable, "%d\n", card->ext_csd.ffu_capable);
+ MMC_DEV_ATTR(hwrev, "0x%x\n", card->cid.hwrev);
+ MMC_DEV_ATTR(manfid, "0x%06x\n", card->cid.manfid);
+ MMC_DEV_ATTR(name, "%s\n", card->cid.prod_name);
+@@ -701,6 +709,22 @@ MMC_DEV_ATTR(enhanced_area_size, "%u\n", card->ext_csd.enhanced_area_size);
+ MMC_DEV_ATTR(raw_rpmb_size_mult, "%#x\n", card->ext_csd.raw_rpmb_size_mult);
+ MMC_DEV_ATTR(rel_sectors, "%#x\n", card->ext_csd.rel_sectors);
+ 
++static ssize_t mmc_fwrev_show(struct device *dev,
++			      struct device_attribute *attr,
++			      char *buf)
++{
++	struct mmc_card *card = mmc_dev_to_card(dev);
++
++	if (card->ext_csd.rev < 7) {
++		return sprintf(buf, "0x%x\n", card->cid.fwrev);
++	} else {
++		return sprintf(buf, "0x%*phN\n", MMC_FIRMWARE_LEN,
++			       card->ext_csd.fwrev);
++	}
++}
++
++static DEVICE_ATTR(fwrev, S_IRUGO, mmc_fwrev_show, NULL);
++
+ static struct attribute *mmc_std_attrs[] = {
+ 	&dev_attr_cid.attr,
+ 	&dev_attr_csd.attr,
+@@ -708,6 +732,7 @@ static struct attribute *mmc_std_attrs[] = {
+ 	&dev_attr_erase_size.attr,
+ 	&dev_attr_preferred_erase_size.attr,
+ 	&dev_attr_fwrev.attr,
++	&dev_attr_ffu_capable.attr,
+ 	&dev_attr_hwrev.attr,
+ 	&dev_attr_manfid.attr,
+ 	&dev_attr_name.attr,
+diff --git a/include/linux/mmc/card.h b/include/linux/mmc/card.h
+index b951fb4258a9..fbc24adc5060 100644
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@ -88,6 +88,9 @@ struct mmc_ext_csd {
+ 	unsigned int            data_tag_unit_size;     /* DATA TAG UNIT size */
+ 	unsigned int		boot_ro_lock;		/* ro lock support */
+ 	bool			boot_ro_lockable;
++	bool			ffu_capable;	/* Firmware upgrade support */
++#define MMC_FIRMWARE_LEN 8
++	u8			fwrev[MMC_FIRMWARE_LEN];  /* FW version */
+ 	u8			raw_exception_status;	/* 54 */
+ 	u8			raw_partition_support;	/* 160 */
+ 	u8			raw_rpmb_size_mult;	/* 168 */
+* Unmerged path include/linux/mmc/mmc.h
