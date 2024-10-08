@@ -1,0 +1,182 @@
+KVM: PPC: BOOK3S: Remove open coded make_dsisr in alignment handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s - Remove open coded make_dsisr in alignment handler (David Gibson) [1123145 1123133 1123367]
+Rebuild_FUZZ: 95.52%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit ddca156ae6bafc0c6af61805bfe4b37440448a4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ddca156a.failed
+
+Use make_dsisr instead of open coding it. This also have
+the added benefit of handling alignment interrupt on additional
+instructions.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit ddca156ae6bafc0c6af61805bfe4b37440448a4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/disassemble.h
+diff --cc arch/powerpc/include/asm/disassemble.h
+index 9b198d1b3b2b,6330a61b875a..000000000000
+--- a/arch/powerpc/include/asm/disassemble.h
++++ b/arch/powerpc/include/asm/disassemble.h
+@@@ -77,4 -77,42 +77,45 @@@ static inline unsigned int get_d(u32 in
+  	return inst & 0xffff;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned int get_oc(u32 inst)
++ {
++ 	return (inst >> 11) & 0x7fff;
++ }
++ 
++ #define IS_XFORM(inst)	(get_op(inst)  == 31)
++ #define IS_DSFORM(inst)	(get_op(inst) >= 56)
++ 
++ /*
++  * Create a DSISR value from the instruction
++  */
++ static inline unsigned make_dsisr(unsigned instr)
++ {
++ 	unsigned dsisr;
++ 
++ 
++ 	/* bits  6:15 --> 22:31 */
++ 	dsisr = (instr & 0x03ff0000) >> 16;
++ 
++ 	if (IS_XFORM(instr)) {
++ 		/* bits 29:30 --> 15:16 */
++ 		dsisr |= (instr & 0x00000006) << 14;
++ 		/* bit     25 -->    17 */
++ 		dsisr |= (instr & 0x00000040) << 8;
++ 		/* bits 21:24 --> 18:21 */
++ 		dsisr |= (instr & 0x00000780) << 3;
++ 	} else {
++ 		/* bit      5 -->    17 */
++ 		dsisr |= (instr & 0x04000000) >> 12;
++ 		/* bits  1: 4 --> 18:21 */
++ 		dsisr |= (instr & 0x78000000) >> 17;
++ 		/* bits 30:31 --> 12:13 */
++ 		if (IS_DSFORM(instr))
++ 			dsisr |= (instr & 0x00000003) << 18;
++ 	}
++ 
++ 	return dsisr;
++ }
+++>>>>>>> ddca156ae6ba (KVM: PPC: BOOK3S: Remove open coded make_dsisr in alignment handler)
+  #endif /* __ASM_PPC_DISASSEMBLE_H__ */
+* Unmerged path arch/powerpc/include/asm/disassemble.h
+diff --git a/arch/powerpc/kernel/align.c b/arch/powerpc/kernel/align.c
+index de91f3ae631e..111d93ec7f34 100644
+--- a/arch/powerpc/kernel/align.c
++++ b/arch/powerpc/kernel/align.c
+@@ -25,14 +25,13 @@
+ #include <asm/cputable.h>
+ #include <asm/emulated_ops.h>
+ #include <asm/switch_to.h>
++#include <asm/disassemble.h>
+ 
+ struct aligninfo {
+ 	unsigned char len;
+ 	unsigned char flags;
+ };
+ 
+-#define IS_XFORM(inst)	(((inst) >> 26) == 31)
+-#define IS_DSFORM(inst)	(((inst) >> 26) >= 56)
+ 
+ #define INVALID	{ 0, 0 }
+ 
+@@ -191,37 +190,6 @@ static struct aligninfo aligninfo[128] = {
+ 	INVALID,		/* 11 1 1111 */
+ };
+ 
+-/*
+- * Create a DSISR value from the instruction
+- */
+-static inline unsigned make_dsisr(unsigned instr)
+-{
+-	unsigned dsisr;
+-
+-
+-	/* bits  6:15 --> 22:31 */
+-	dsisr = (instr & 0x03ff0000) >> 16;
+-
+-	if (IS_XFORM(instr)) {
+-		/* bits 29:30 --> 15:16 */
+-		dsisr |= (instr & 0x00000006) << 14;
+-		/* bit     25 -->    17 */
+-		dsisr |= (instr & 0x00000040) << 8;
+-		/* bits 21:24 --> 18:21 */
+-		dsisr |= (instr & 0x00000780) << 3;
+-	} else {
+-		/* bit      5 -->    17 */
+-		dsisr |= (instr & 0x04000000) >> 12;
+-		/* bits  1: 4 --> 18:21 */
+-		dsisr |= (instr & 0x78000000) >> 17;
+-		/* bits 30:31 --> 12:13 */
+-		if (IS_DSFORM(instr))
+-			dsisr |= (instr & 0x00000003) << 18;
+-	}
+-
+-	return dsisr;
+-}
+-
+ /*
+  * The dcbz (data cache block zero) instruction
+  * gives an alignment fault if used on non-cacheable
+diff --git a/arch/powerpc/kvm/book3s_emulate.c b/arch/powerpc/kvm/book3s_emulate.c
+index 88eff248d889..d5d1694f18d3 100644
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@ -584,44 +584,7 @@ unprivileged:
+ 
+ u32 kvmppc_alignment_dsisr(struct kvm_vcpu *vcpu, unsigned int inst)
+ {
+-	u32 dsisr = 0;
+-
+-	/*
+-	 * This is what the spec says about DSISR bits (not mentioned = 0):
+-	 *
+-	 * 12:13		[DS]	Set to bits 30:31
+-	 * 15:16		[X]	Set to bits 29:30
+-	 * 17			[X]	Set to bit 25
+-	 *			[D/DS]	Set to bit 5
+-	 * 18:21		[X]	Set to bits 21:24
+-	 *			[D/DS]	Set to bits 1:4
+-	 * 22:26			Set to bits 6:10 (RT/RS/FRT/FRS)
+-	 * 27:31			Set to bits 11:15 (RA)
+-	 */
+-
+-	switch (get_op(inst)) {
+-	/* D-form */
+-	case OP_LFS:
+-	case OP_LFD:
+-	case OP_STFD:
+-	case OP_STFS:
+-		dsisr |= (inst >> 12) & 0x4000;	/* bit 17 */
+-		dsisr |= (inst >> 17) & 0x3c00; /* bits 18:21 */
+-		break;
+-	/* X-form */
+-	case 31:
+-		dsisr |= (inst << 14) & 0x18000; /* bits 15:16 */
+-		dsisr |= (inst << 8)  & 0x04000; /* bit 17 */
+-		dsisr |= (inst << 3)  & 0x03c00; /* bits 18:21 */
+-		break;
+-	default:
+-		printk(KERN_INFO "KVM: Unaligned instruction 0x%x\n", inst);
+-		break;
+-	}
+-
+-	dsisr |= (inst >> 16) & 0x03ff; /* bits 22:31 */
+-
+-	return dsisr;
++	return make_dsisr(inst);
+ }
+ 
+ ulong kvmppc_alignment_dar(struct kvm_vcpu *vcpu, unsigned int inst)
