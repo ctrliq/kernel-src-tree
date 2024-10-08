@@ -395,12 +395,6 @@ struct azx {
 	struct dev_pm_domain hdmi_pm_domain;
 };
 
-#ifdef CONFIG_SND_VERBOSE_PRINTK
-#define SFX	/* nop */
-#else
-#define SFX	"hda-intel "
-#endif
-
 #ifdef CONFIG_X86
 #define azx_snoop(chip)		((chip)->snoop)
 #else
