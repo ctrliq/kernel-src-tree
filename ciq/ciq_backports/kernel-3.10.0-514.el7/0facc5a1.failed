@@ -1,0 +1,224 @@
+staging/rdma/hfi1: Remove multicast verbs functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Remove multicast verbs functions (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 91.49%
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit 0facc5a1635252a45ab2fdb119309a3c24e9be82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0facc5a1.failed
+
+Multicast is now supported by rdmavt. Remove the verbs multicast functions
+and use that.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 0facc5a1635252a45ab2fdb119309a3c24e9be82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/Makefile
+#	drivers/staging/hfi1/qp.c
+#	drivers/staging/hfi1/verbs.c
+#	drivers/staging/hfi1/verbs_mcast.c
+#	drivers/staging/rdma/hfi1/verbs.h
+diff --cc drivers/staging/hfi1/Makefile
+index 2e5daa6cdcc2,0069796add25..000000000000
+--- a/drivers/staging/hfi1/Makefile
++++ b/drivers/staging/hfi1/Makefile
+@@@ -7,10 -7,10 +7,14 @@@
+  #
+  obj-$(CONFIG_INFINIBAND_HFI1) += hfi1.o
+  
+ -hfi1-y := chip.o device.o diag.o driver.o efivar.o eprom.o file_ops.o firmware.o \
+ -	init.o intr.o mad.o pcie.o pio.o pio_copy.o \
+ +hfi1-y := chip.o cq.o device.o diag.o dma.o driver.o eprom.o file_ops.o firmware.o \
+ +	init.o intr.o keys.o mad.o mmap.o mr.o pcie.o pio.o pio_copy.o \
+  	qp.o qsfp.o rc.o ruc.o sdma.o srq.o sysfs.o trace.o twsi.o \
+++<<<<<<< HEAD:drivers/staging/hfi1/Makefile
+ +	uc.o ud.o user_pages.o user_sdma.o verbs_mcast.o verbs.o
+++=======
++ 	uc.o ud.o user_exp_rcv.o user_pages.o user_sdma.o verbs.o
+++>>>>>>> 0facc5a16352 (staging/rdma/hfi1: Remove multicast verbs functions):drivers/staging/rdma/hfi1/Makefile
+  hfi1-$(CONFIG_DEBUG_FS) += debugfs.o
+  
+  CFLAGS_trace.o = -I$(src)
+diff --cc drivers/staging/hfi1/qp.c
+index 9ffed6e14d8e,748a3a739859..000000000000
+--- a/drivers/staging/hfi1/qp.c
++++ b/drivers/staging/hfi1/qp.c
+@@@ -1721,6 -1163,73 +1721,76 @@@ void qp_comm_est(struct hfi1_qp *qp
+  	}
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qp.c
+++=======
++ void *qp_priv_alloc(struct rvt_dev_info *rdi, struct rvt_qp *qp,
++ 		    gfp_t gfp)
++ {
++ 	struct hfi1_qp_priv *priv;
++ 
++ 	priv = kzalloc(sizeof(*priv), gfp);
++ 	if (!priv)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	priv->owner = qp;
++ 
++ 	priv->s_hdr = kzalloc(sizeof(*priv->s_hdr), gfp);
++ 	if (!priv->s_hdr) {
++ 		kfree(priv);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	return priv;
++ }
++ 
++ void qp_priv_free(struct rvt_dev_info *rdi, struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	kfree(priv->s_hdr);
++ 	kfree(priv);
++ }
++ 
++ unsigned free_all_qps(struct rvt_dev_info *rdi)
++ {
++ 	struct hfi1_ibdev *verbs_dev = container_of(rdi,
++ 						    struct hfi1_ibdev,
++ 						    rdi);
++ 	struct hfi1_devdata *dd = container_of(verbs_dev,
++ 					       struct hfi1_devdata,
++ 					       verbs_dev);
++ 	int n;
++ 	unsigned qp_inuse = 0;
++ 
++ 	for (n = 0; n < dd->num_pports; n++) {
++ 		struct hfi1_ibport *ibp = &dd->pport[n].ibport_data;
++ 
++ 		rcu_read_lock();
++ 		if (rcu_dereference(ibp->rvp.qp[0]))
++ 			qp_inuse++;
++ 		if (rcu_dereference(ibp->rvp.qp[1]))
++ 			qp_inuse++;
++ 		rcu_read_unlock();
++ 	}
++ 
++ 	return qp_inuse;
++ }
++ 
++ void notify_qp_reset(struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	iowait_init(
++ 		&priv->s_iowait,
++ 		1,
++ 		_hfi1_do_send,
++ 		iowait_sleep,
++ 		iowait_wakeup);
++ 	priv->r_adefered = 0;
++ 	clear_ahg(qp);
++ }
++ 
+++>>>>>>> 0facc5a16352 (staging/rdma/hfi1: Remove multicast verbs functions):drivers/staging/rdma/hfi1/qp.c
+  /*
+   * Switch to alternate path.
+   * The QP s_lock should be held and interrupts disabled.
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,2fed28487c89..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -634,10 -449,10 +634,17 @@@ void hfi1_ib_rcv(struct hfi1_packet *pa
+  	/* Get the destination QP number. */
+  	qp_num = be32_to_cpu(packet->ohdr->bth[1]) & HFI1_QPN_MASK;
+  	lid = be16_to_cpu(hdr->lrh[1]);
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	if (unlikely((lid >= HFI1_MULTICAST_LID_BASE) &&
+ +	    (lid != HFI1_PERMISSIVE_LID))) {
+ +		struct hfi1_mcast *mcast;
+ +		struct hfi1_mcast_qp *p;
+++=======
++ 	if (unlikely((lid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
++ 		     (lid != be16_to_cpu(IB_LID_PERMISSIVE)))) {
++ 		struct rvt_mcast *mcast;
++ 		struct rvt_mcast_qp *p;
+++>>>>>>> 0facc5a16352 (staging/rdma/hfi1: Remove multicast verbs functions):drivers/staging/rdma/hfi1/verbs.c
+  
+  		if (lnh != HFI1_LRH_GRH)
+  			goto drop;
+@@@ -1849,11 -1534,8 +1856,10 @@@ int hfi1_register_ib_device(struct hfi1
+  
+  	/* Only need to initialize non-zero fields. */
+  
+ +	spin_lock_init(&dev->n_ahs_lock);
+ +	spin_lock_init(&dev->n_cqs_lock);
+  	spin_lock_init(&dev->n_qps_lock);
+  	spin_lock_init(&dev->n_srqs_lock);
+- 	spin_lock_init(&dev->n_mcast_grps_lock);
+  	init_timer(&dev->mem_timer);
+  	dev->mem_timer.function = mem_timer;
+  	dev->mem_timer.data = (unsigned long) dev;
+@@@ -1971,30 -1626,28 +1977,49 @@@
+  	ibdev->modify_qp = hfi1_modify_qp;
+  	ibdev->query_qp = hfi1_query_qp;
+  	ibdev->destroy_qp = hfi1_destroy_qp;
+ -	ibdev->post_send = NULL;
+ +	ibdev->post_send = post_send;
+  	ibdev->post_recv = post_receive;
+  	ibdev->post_srq_recv = hfi1_post_srq_receive;
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	ibdev->create_cq = hfi1_create_cq;
+ +	ibdev->destroy_cq = hfi1_destroy_cq;
+ +	ibdev->resize_cq = hfi1_resize_cq;
+ +	ibdev->poll_cq = hfi1_poll_cq;
+ +	ibdev->req_notify_cq = hfi1_req_notify_cq;
+ +	ibdev->get_dma_mr = hfi1_get_dma_mr;
+ +	ibdev->reg_phys_mr = hfi1_reg_phys_mr;
+ +	ibdev->reg_user_mr = hfi1_reg_user_mr;
+ +	ibdev->dereg_mr = hfi1_dereg_mr;
+ +	ibdev->alloc_mr = hfi1_alloc_mr;
+ +	ibdev->alloc_fast_reg_page_list = hfi1_alloc_fast_reg_page_list;
+ +	ibdev->free_fast_reg_page_list = hfi1_free_fast_reg_page_list;
+ +	ibdev->alloc_fmr = hfi1_alloc_fmr;
+ +	ibdev->map_phys_fmr = hfi1_map_phys_fmr;
+ +	ibdev->unmap_fmr = hfi1_unmap_fmr;
+ +	ibdev->dealloc_fmr = hfi1_dealloc_fmr;
+ +	ibdev->attach_mcast = hfi1_multicast_attach;
+ +	ibdev->detach_mcast = hfi1_multicast_detach;
+++=======
++ 	ibdev->create_cq = NULL;
++ 	ibdev->destroy_cq = NULL;
++ 	ibdev->resize_cq = NULL;
++ 	ibdev->poll_cq = NULL;
++ 	ibdev->req_notify_cq = NULL;
++ 	ibdev->get_dma_mr = NULL;
++ 	ibdev->reg_user_mr = NULL;
++ 	ibdev->dereg_mr = NULL;
++ 	ibdev->alloc_mr = NULL;
++ 	ibdev->map_mr_sg = NULL;
++ 	ibdev->alloc_fmr = NULL;
++ 	ibdev->map_phys_fmr = NULL;
++ 	ibdev->unmap_fmr = NULL;
++ 	ibdev->dealloc_fmr = NULL;
++ 	ibdev->attach_mcast = NULL;
++ 	ibdev->detach_mcast = NULL;
+++>>>>>>> 0facc5a16352 (staging/rdma/hfi1: Remove multicast verbs functions):drivers/staging/rdma/hfi1/verbs.c
+  	ibdev->process_mad = hfi1_process_mad;
+ -	ibdev->mmap = NULL;
+ -	ibdev->dma_ops = NULL;
+ +	ibdev->mmap = hfi1_mmap;
+ +	ibdev->dma_ops = &hfi1_dma_mapping_ops;
+  	ibdev->get_port_immutable = port_immutable;
+  
+  	strncpy(ibdev->node_desc, init_utsname()->nodename,
+* Unmerged path drivers/staging/hfi1/verbs_mcast.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+* Unmerged path drivers/staging/hfi1/Makefile
+* Unmerged path drivers/staging/hfi1/qp.c
+* Unmerged path drivers/staging/hfi1/verbs.c
+* Unmerged path drivers/staging/hfi1/verbs_mcast.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
