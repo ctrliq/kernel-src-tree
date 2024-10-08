@@ -1,0 +1,165 @@
+ceph: use i_size_{read,write} to get/set i_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] ceph: use i_size_{read, write} to get/set i_size (Ilya Dryomov) [1344930]
+Rebuild_FUZZ: 98.95%
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 99c88e6900fb05d267ae9f6d5e15dc7192ba6f8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/99c88e69.failed
+
+Cap message from MDS can update i_size. In that case, we don't
+hold i_mutex. So it's unsafe to directly access inode->i_size
+while holding i_mutex.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 99c88e6900fb05d267ae9f6d5e15dc7192ba6f8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/cache.c
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,d37efdd8533d..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -321,11 -417,10 +321,17 @@@ static int striped_read(struct inode *i
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	u64 pos, this_len, left;
+++<<<<<<< HEAD
+ +	int io_align, page_align;
+ +	int pages_left;
+ +	int read;
+++=======
++ 	loff_t i_size;
++ 	int page_align, pages_left;
++ 	int read, ret;
+++>>>>>>> 99c88e6900fb (ceph: use i_size_{read,write} to get/set i_size)
+  	struct page **page_pos;
+ +	int ret;
+  	bool hit_stripe, was_short;
+  
+  	/*
+@@@ -356,13 -447,12 +362,20 @@@ more
+  	dout("striped_read %llu~%llu (read %u) got %d%s%s\n", pos, left, read,
+  	     ret, hit_stripe ? " HITSTRIPE" : "", was_short ? " SHORT" : "");
+  
++ 	i_size = i_size_read(inode);
+  	if (ret >= 0) {
+  		int didpages;
+++<<<<<<< HEAD
+ +		if (was_short && (pos + ret < inode->i_size)) {
+ +			int zlen = min(this_len - ret,
+ +				       inode->i_size - pos - ret);
+ +			int zoff = (o_direct ? buf_align : io_align) +
+ +				    read + ret;
+++=======
++ 		if (was_short && (pos + ret < i_size)) {
++ 			int zlen = min(this_len - ret, i_size - pos - ret);
++ 			int zoff = (off & ~PAGE_MASK) + read + ret;
+++>>>>>>> 99c88e6900fb (ceph: use i_size_{read,write} to get/set i_size)
+  			dout(" zero gap %llu to %llu\n",
+  				pos + ret, pos + ret + zlen);
+  			ceph_zero_page_vector_range(zoff, zlen, pages);
+@@@ -1061,7 -1341,11 +1073,11 @@@ retry_snap
+  			mutex_lock(&inode->i_mutex);
+  			goto retry_snap;
+  		}
+ -		if (written > 0)
+ -			iov_iter_advance(from, written);
+ -		ceph_put_snap_context(snapc);
+  	} else {
+++<<<<<<< HEAD
+++=======
++ 		loff_t old_size = i_size_read(inode);
+++>>>>>>> 99c88e6900fb (ceph: use i_size_{read,write} to get/set i_size)
+  		/*
+  		 * No need to acquire the i_truncate_mutex. Because
+  		 * the MDS revokes Fwb caps before sending truncate
+@@@ -1069,9 -1353,11 +1085,17 @@@
+  		 * are pending vmtruncate. So write and vmtruncate
+  		 * can not run at the same time
+  		 */
+++<<<<<<< HEAD
+ +		written = generic_file_buffered_write(iocb, iov, nr_segs,
+ +						      pos, &iocb->ki_pos,
+ +						      count, 0);
+++=======
++ 		written = generic_perform_write(file, from, pos);
++ 		if (likely(written >= 0))
++ 			iocb->ki_pos = pos + written;
++ 		if (i_size_read(inode) > old_size)
++ 			ceph_fscache_update_objectsize(inode);
+++>>>>>>> 99c88e6900fb (ceph: use i_size_{read,write} to get/set i_size)
+  		mutex_unlock(&inode->i_mutex);
+  	}
+  
+* Unmerged path fs/ceph/cache.c
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index 1a2e94e3c4e1..5968adaa0f3f 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -1083,7 +1083,7 @@ retry_locked:
+ 		return 0;
+ 
+ 	/* past end of file? */
+-	i_size = inode->i_size;   /* caller holds i_mutex */
++	i_size = i_size_read(inode);
+ 
+ 	if (page_off >= i_size ||
+ 	    (pos_in_page == 0 && (pos+len) >= i_size &&
+@@ -1162,8 +1162,7 @@ static int ceph_write_end(struct file *file, struct address_space *mapping,
+ 		zero_user_segment(page, from+copied, len);
+ 
+ 	/* did file size increase? */
+-	/* (no need for i_size_read(); we caller holds i_mutex */
+-	if (pos+copied > inode->i_size)
++	if (pos+copied > i_size_read(inode))
+ 		check_cap = ceph_inode_set_size(inode, pos+copied);
+ 
+ 	if (!PageUptodate(page))
+* Unmerged path fs/ceph/cache.c
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index a649a586cda7..4f1fd17a3bf1 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -538,7 +538,7 @@ int ceph_fill_file_size(struct inode *inode, int issued,
+ 	if (ceph_seq_cmp(truncate_seq, ci->i_truncate_seq) > 0 ||
+ 	    (truncate_seq == ci->i_truncate_seq && size > inode->i_size)) {
+ 		dout("size %lld -> %llu\n", inode->i_size, size);
+-		inode->i_size = size;
++		i_size_write(inode, size);
+ 		inode->i_blocks = (size + (1<<9) - 1) >> 9;
+ 		ci->i_reported_size = size;
+ 		if (truncate_seq != ci->i_truncate_seq) {
+@@ -792,7 +792,7 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
+ 			spin_unlock(&ci->i_ceph_lock);
+ 
+ 			err = -EINVAL;
+-			if (WARN_ON(symlen != inode->i_size))
++			if (WARN_ON(symlen != i_size_read(inode)))
+ 				goto out;
+ 
+ 			err = -ENOMEM;
+@@ -1475,7 +1475,7 @@ int ceph_inode_set_size(struct inode *inode, loff_t size)
+ 
+ 	spin_lock(&ci->i_ceph_lock);
+ 	dout("set_size %p %llu -> %llu\n", inode, inode->i_size, size);
+-	inode->i_size = size;
++	i_size_write(inode, size);
+ 	inode->i_blocks = (size + (1 << 9) - 1) >> 9;
+ 
+ 	/* tell the MDS if we are approaching max_size */
+@@ -1836,7 +1836,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+ 		     inode->i_size, attr->ia_size);
+ 		if ((issued & CEPH_CAP_FILE_EXCL) &&
+ 		    attr->ia_size > inode->i_size) {
+-			inode->i_size = attr->ia_size;
++			i_size_write(inode, attr->ia_size);
+ 			inode->i_blocks =
+ 				(attr->ia_size + (1 << 9) - 1) >> 9;
+ 			inode->i_ctime = attr->ia_ctime;
