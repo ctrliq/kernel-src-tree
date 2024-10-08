@@ -1,0 +1,94 @@
+nfs: only remove page from mapping if launder_page fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit d6c843b96e1cb5199147e3281a724e3c0b69a9ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d6c843b9.failed
+
+Instead of dropping pages when write fails, only do it when
+we get fatal failure in launder_page write back.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit d6c843b96e1cb5199147e3281a724e3c0b69a9ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+diff --cc fs/nfs/write.c
+index 7614d127a554,4d254232d728..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -567,8 -577,21 +568,25 @@@ static int nfs_page_async_flush(struct 
+  
+  	ret = 0;
+  	if (!nfs_pageio_add_request(pgio, req)) {
+ +		nfs_redirty_request(req);
+  		ret = pgio->pg_error;
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Remove the problematic req upon fatal errors
++ 		 * in launder case, while other dirty pages can
++ 		 * still be around until they get flushed.
++ 		 */
++ 		if (nfs_error_is_fatal(ret)) {
++ 			nfs_context_set_write_error(req->wb_context, ret);
++ 			if (launder) {
++ 				nfs_write_error_remove_page(req);
++ 				goto out;
++ 			}
++ 		}
++ 		nfs_redirty_request(req);
++ 		ret = -EAGAIN;
+++>>>>>>> d6c843b96e1c (nfs: only remove page from mapping if launder_page fails)
+  	} else
+  		nfs_add_stats(page_file_mapping(page)->host,
+  				NFSIOS_WRITEPAGES, 1);
+diff --git a/fs/nfs/file.c b/fs/nfs/file.c
+index e4ae47c7657e..0147ec5be263 100644
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -553,7 +553,7 @@ static int nfs_launder_page(struct page *page)
+ 		inode->i_ino, (long long)page_offset(page));
+ 
+ 	nfs_fscache_wait_on_page_write(nfsi, page);
+-	return nfs_wb_page(inode, page);
++	return nfs_wb_launder_page(inode, page);
+ }
+ 
+ static int nfs_swap_activate(struct swap_info_struct *sis, struct file *file,
+* Unmerged path fs/nfs/write.c
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index e9b579a50d10..d6be470f9e20 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -522,12 +522,24 @@ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned
+  */
+ extern int nfs_sync_inode(struct inode *inode);
+ extern int nfs_wb_all(struct inode *inode);
+-extern int nfs_wb_page(struct inode *inode, struct page* page);
++extern int nfs_wb_single_page(struct inode *inode, struct page *page, bool launder);
+ extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
+ extern int  nfs_commit_inode(struct inode *, int);
+ extern struct nfs_commit_data *nfs_commitdata_alloc(void);
+ extern void nfs_commit_free(struct nfs_commit_data *data);
+ 
++static inline int
++nfs_wb_launder_page(struct inode *inode, struct page *page)
++{
++	return nfs_wb_single_page(inode, page, true);
++}
++
++static inline int
++nfs_wb_page(struct inode *inode, struct page *page)
++{
++	return nfs_wb_single_page(inode, page, false);
++}
++
+ static inline int
+ nfs_have_writebacks(struct inode *inode)
+ {
