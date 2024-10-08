@@ -1,0 +1,289 @@
+pnfs/blocklayout: allocate separate pages for the layoutcommit payload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 34dc93c2fc04da0d01acf8a1660b4ab276208af7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/34dc93c2.failed
+
+Instead of overflowing the XDR send buffer with our extent list allocate
+pages and pre-encode the layoutupdate payload into them.  We optimistically
+allocate a single page use alloc_page and only switch to vmalloc when we
+have more extents outstanding.  Currently there is only a single testcase
+(xfstests generic/113) which can reproduce large enough extent lists for
+this to occur.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 34dc93c2fc04da0d01acf8a1660b4ab276208af7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/blocklayout/blocklayout.c
+#	fs/nfs/blocklayout/blocklayout.h
+#	fs/nfs/blocklayout/extent_tree.c
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index 5b7b41d3b0f9,cf10a6e291e4..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -1048,102 -500,16 +1048,109 @@@ bl_return_range(struct pnfs_layout_hdr 
+  	err = ext_tree_remove(bl, range->iomode & IOMODE_RW, offset, end);
+  }
+  
+- static void
+- bl_encode_layoutcommit(struct pnfs_layout_hdr *lo, struct xdr_stream *xdr,
+- 		       const struct nfs4_layoutcommit_args *arg)
++ static int
++ bl_prepare_layoutcommit(struct nfs4_layoutcommit_args *arg)
+  {
+++<<<<<<< HEAD
+ +	dprintk("%s enter\n", __func__);
+ +	encode_pnfs_block_layoutupdate(BLK_LO2EXT(lo), xdr, arg);
+++=======
++ 	return ext_tree_prepare_commit(arg);
+++>>>>>>> 34dc93c2fc04 (pnfs/blocklayout: allocate separate pages for the layoutcommit payload)
+  }
+  
+  static void
+  bl_cleanup_layoutcommit(struct nfs4_layoutcommit_data *lcdata)
+  {
+++<<<<<<< HEAD
+ +	struct pnfs_layout_hdr *lo = NFS_I(lcdata->args.inode)->layout;
+ +
+ +	dprintk("%s enter\n", __func__);
+ +	clean_pnfs_block_layoutupdate(BLK_LO2EXT(lo), &lcdata->args, lcdata->res.status);
+ +}
+ +
+ +static void free_blk_mountid(struct block_mount_id *mid)
+ +{
+ +	if (mid) {
+ +		struct pnfs_block_dev *dev, *tmp;
+ +
+ +		/* No need to take bm_lock as we are last user freeing bm_devlist */
+ +		list_for_each_entry_safe(dev, tmp, &mid->bm_devlist, bm_node) {
+ +			list_del(&dev->bm_node);
+ +			bl_free_block_dev(dev);
+ +		}
+ +		kfree(mid);
+ +	}
+ +}
+ +
+ +/* This is mostly copied from the filelayout_get_device_info function.
+ + * It seems much of this should be at the generic pnfs level.
+ + */
+ +static struct pnfs_block_dev *
+ +nfs4_blk_get_deviceinfo(struct nfs_server *server, const struct nfs_fh *fh,
+ +			struct nfs4_deviceid *d_id)
+ +{
+ +	struct pnfs_device *dev;
+ +	struct pnfs_block_dev *rv;
+ +	u32 max_resp_sz;
+ +	int max_pages;
+ +	struct page **pages = NULL;
+ +	int i, rc;
+ +
+ +	/*
+ +	 * Use the session max response size as the basis for setting
+ +	 * GETDEVICEINFO's maxcount
+ +	 */
+ +	max_resp_sz = server->nfs_client->cl_session->fc_attrs.max_resp_sz;
+ +	max_pages = nfs_page_array_len(0, max_resp_sz);
+ +	dprintk("%s max_resp_sz %u max_pages %d\n",
+ +		__func__, max_resp_sz, max_pages);
+ +
+ +	dev = kmalloc(sizeof(*dev), GFP_NOFS);
+ +	if (!dev) {
+ +		dprintk("%s kmalloc failed\n", __func__);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +
+ +	pages = kcalloc(max_pages, sizeof(struct page *), GFP_NOFS);
+ +	if (pages == NULL) {
+ +		kfree(dev);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +	for (i = 0; i < max_pages; i++) {
+ +		pages[i] = alloc_page(GFP_NOFS);
+ +		if (!pages[i]) {
+ +			rv = ERR_PTR(-ENOMEM);
+ +			goto out_free;
+ +		}
+ +	}
+ +
+ +	memcpy(&dev->dev_id, d_id, sizeof(*d_id));
+ +	dev->layout_type = LAYOUT_BLOCK_VOLUME;
+ +	dev->pages = pages;
+ +	dev->pgbase = 0;
+ +	dev->pglen = PAGE_SIZE * max_pages;
+ +	dev->mincount = 0;
+ +	dev->maxcount = max_resp_sz - nfs41_maxgetdevinfo_overhead;
+ +
+ +	dprintk("%s: dev_id: %s\n", __func__, dev->dev_id.data);
+ +	rc = nfs4_proc_getdeviceinfo(server, dev, NULL);
+ +	dprintk("%s getdevice info returns %d\n", __func__, rc);
+ +	if (rc) {
+ +		rv = ERR_PTR(rc);
+ +		goto out_free;
+ +	}
+ +
+ +	rv = nfs4_blk_decode_device(server, dev);
+ + out_free:
+ +	for (i = 0; i < max_pages; i++)
+ +		__free_page(pages[i]);
+ +	kfree(pages);
+ +	kfree(dev);
+ +	return rv;
+++=======
++ 	ext_tree_mark_committed(&lcdata->args, lcdata->res.status);
+++>>>>>>> 34dc93c2fc04 (pnfs/blocklayout: allocate separate pages for the layoutcommit payload)
+  }
+  
+  static int
+@@@ -1334,10 -665,11 +1341,10 @@@ static struct pnfs_layoutdriver_type bl
+  	.alloc_lseg			= bl_alloc_lseg,
+  	.free_lseg			= bl_free_lseg,
+  	.return_range			= bl_return_range,
+- 	.encode_layoutcommit		= bl_encode_layoutcommit,
++ 	.prepare_layoutcommit		= bl_prepare_layoutcommit,
+  	.cleanup_layoutcommit		= bl_cleanup_layoutcommit,
+  	.set_layoutdriver		= bl_set_layoutdriver,
+ -	.alloc_deviceid_node		= bl_alloc_deviceid_node,
+ -	.free_deviceid_node		= bl_free_deviceid_node,
+ +	.clear_layoutdriver		= bl_clear_layoutdriver,
+  	.pg_read_ops			= &bl_pg_read_ops,
+  	.pg_write_ops			= &bl_pg_write_ops,
+  };
+diff --cc fs/nfs/blocklayout/blocklayout.h
+index 9838fb020473,9757f3eabdd2..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.h
++++ b/fs/nfs/blocklayout/blocklayout.h
+@@@ -93,56 -67,21 +93,67 @@@ struct pnfs_block_extent 
+  	sector_t	be_length;	/* the size of the extent */
+  	sector_t	be_v_offset;	/* the starting offset in the volume */
+  	enum exstate4	be_state;	/* the state of this extent */
+ -#define EXTENT_WRITTEN		1
+ -#define EXTENT_COMMITTING	2
+ -	unsigned int	be_tag;
+ +	struct pnfs_inval_markings *be_inval; /* tracks INVAL->RW transition */
+  };
+  
+++<<<<<<< HEAD
+ +/* Shortened extent used by LAYOUTCOMMIT */
+ +struct pnfs_block_short_extent {
+ +	struct list_head bse_node;
+ +	struct nfs4_deviceid bse_devid;
+ +	struct block_device *bse_mdev;
+ +	sector_t	bse_f_offset;	/* the starting offset in the file */
+ +	sector_t	bse_length;	/* the size of the extent */
+++=======
++ /* on the wire size of the extent */
++ #define BL_EXTENT_SIZE	(7 * sizeof(__be32) + NFS4_DEVICEID4_SIZE)
++ 
++ struct pnfs_block_layout {
++ 	struct pnfs_layout_hdr	bl_layout;
++ 	struct rb_root		bl_ext_rw;
++ 	struct rb_root		bl_ext_ro;
++ 	spinlock_t		bl_ext_lock;   /* Protects list manipulation */
+++>>>>>>> 34dc93c2fc04 (pnfs/blocklayout: allocate separate pages for the layoutcommit payload)
+ +};
+ +
+ +static inline void
+ +BL_INIT_INVAL_MARKS(struct pnfs_inval_markings *marks, sector_t blocksize)
+ +{
+ +	spin_lock_init(&marks->im_lock);
+ +	INIT_LIST_HEAD(&marks->im_tree.mtt_stub);
+ +	INIT_LIST_HEAD(&marks->im_extents);
+ +	marks->im_block_size = blocksize;
+ +	marks->im_tree.mtt_step_size = min((sector_t)PAGE_CACHE_SECTORS,
+ +					   blocksize);
+ +}
+ +
+ +enum extentclass4 {
+ +	RW_EXTENT       = 0, /* READWRTE and INVAL */
+ +	RO_EXTENT       = 1, /* READ and NONE */
+ +	EXTENT_LISTS    = 2,
+ +};
+ +
+ +static inline int bl_choose_list(enum exstate4 state)
+ +{
+ +	if (state == PNFS_BLOCK_READ_DATA || state == PNFS_BLOCK_NONE_DATA)
+ +		return RO_EXTENT;
+ +	else
+ +		return RW_EXTENT;
+ +}
+ +
+ +struct pnfs_block_layout {
+ +	struct pnfs_layout_hdr bl_layout;
+ +	struct pnfs_inval_markings bl_inval; /* tracks INVAL->RW transition */
+ +	spinlock_t		bl_ext_lock;   /* Protects list manipulation */
+ +	struct list_head	bl_extents[EXTENT_LISTS]; /* R and RW extents */
+ +	struct list_head	bl_commit;	/* Needs layout commit */
+ +	struct list_head	bl_committing;	/* Layout committing */
+ +	unsigned int		bl_count;	/* entries in bl_commit */
+ +	sector_t		bl_blocksize;  /* Server blocksize in sectors */
+  };
+  
+ +#define BLK_ID(lo) ((struct block_mount_id *)(NFS_SERVER(lo->plh_inode)->pnfs_ld_data))
+ +
+  static inline struct pnfs_block_layout *
+  BLK_LO2EXT(struct pnfs_layout_hdr *lo)
+  {
+@@@ -180,32 -116,23 +191,46 @@@ struct pnfs_block_dev *nfs4_blk_decode_
+  int nfs4_blk_process_layoutget(struct pnfs_layout_hdr *lo,
+  				struct nfs4_layoutget_res *lgr, gfp_t gfp_flags);
+  
+ -struct nfs4_deviceid_node *bl_alloc_deviceid_node(struct nfs_server *server,
+ -		struct pnfs_device *pdev, gfp_t gfp_mask);
+ -void bl_free_deviceid_node(struct nfs4_deviceid_node *d);
+ -
+  /* blocklayoutdm.c */
+ -void bl_dm_remove(struct net *net, dev_t dev);
+ -
+ +void bl_free_block_dev(struct pnfs_block_dev *bdev);
+ +
+++<<<<<<< HEAD
+ +/* extents.c */
+ +struct pnfs_block_extent *
+ +bl_find_get_extent(struct pnfs_block_layout *bl, sector_t isect,
+ +		struct pnfs_block_extent **cow_read);
+ +int bl_mark_sectors_init(struct pnfs_inval_markings *marks,
+ +			     sector_t offset, sector_t length);
+ +void bl_put_extent(struct pnfs_block_extent *be);
+ +struct pnfs_block_extent *bl_alloc_extent(void);
+ +int bl_is_sector_init(struct pnfs_inval_markings *marks, sector_t isect);
+ +int encode_pnfs_block_layoutupdate(struct pnfs_block_layout *bl,
+ +				   struct xdr_stream *xdr,
+ +				   const struct nfs4_layoutcommit_args *arg);
+ +void clean_pnfs_block_layoutupdate(struct pnfs_block_layout *bl,
+ +				   const struct nfs4_layoutcommit_args *arg,
+ +				   int status);
+ +int bl_add_merge_extent(struct pnfs_block_layout *bl,
+ +			 struct pnfs_block_extent *new);
+ +int bl_mark_for_commit(struct pnfs_block_extent *be,
+ +			sector_t offset, sector_t length,
+ +			struct pnfs_block_short_extent *new);
+ +int bl_push_one_short_extent(struct pnfs_inval_markings *marks);
+ +struct pnfs_block_short_extent *
+ +bl_pop_one_short_extent(struct pnfs_inval_markings *marks);
+ +void bl_free_short_extents(struct pnfs_inval_markings *marks, int num_to_free);
+++=======
++ /* extent_tree.c */
++ int ext_tree_insert(struct pnfs_block_layout *bl,
++ 		struct pnfs_block_extent *new);
++ int ext_tree_remove(struct pnfs_block_layout *bl, bool rw, sector_t start,
++ 		sector_t end);
++ int ext_tree_mark_written(struct pnfs_block_layout *bl, sector_t start,
++ 		sector_t len);
++ bool ext_tree_lookup(struct pnfs_block_layout *bl, sector_t isect,
++ 		struct pnfs_block_extent *ret, bool rw);
++ int ext_tree_prepare_commit(struct nfs4_layoutcommit_args *arg);
++ void ext_tree_mark_committed(struct nfs4_layoutcommit_args *arg, int status);
+++>>>>>>> 34dc93c2fc04 (pnfs/blocklayout: allocate separate pages for the layoutcommit payload)
+  
+  #endif /* FS_NFS_NFS4BLOCKLAYOUT_H */
+* Unmerged path fs/nfs/blocklayout/extent_tree.c
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
+* Unmerged path fs/nfs/blocklayout/blocklayout.h
+* Unmerged path fs/nfs/blocklayout/extent_tree.c
