@@ -64,6 +64,7 @@ struct xt_mtchk_param {
 	void *matchinfo;
 	unsigned int hook_mask;
 	u_int8_t family;
+	bool nft_compat;
 };
 
 /**
@@ -94,6 +95,7 @@ struct xt_tgchk_param {
 	void *targinfo;
 	unsigned int hook_mask;
 	u_int8_t family;
+	bool nft_compat;
 };
 
 /* Target destructor parameters */
