@@ -1,0 +1,147 @@
+perf: Fix ctx time tracking by introducing EVENT_TIME
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 3cbaa59069677920186dcf502632ca1df4329f80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3cbaa590.failed
+
+Currently any ctx_sched_in() call will re-start the ctx time tracking,
+this means that calls like:
+
+	ctx_sched_in(.event_type = EVENT_PINNED);
+	ctx_sched_in(.event_type = EVENT_FLEXIBLE);
+
+will have a hole in their ctx time tracking. This is likely harmless
+but can confuse things a little. By adding EVENT_TIME, we can have the
+first ctx_sched_in() (is_active: 0 -> !0) start the time and any
+further ctx_sched_in() will leave the timestamps alone.
+
+Secondly, this allows for an early disable like:
+
+	ctx_sched_out(.event_type = EVENT_TIME);
+
+which would update the ctx time (if the ctx is active) and any further
+calls to ctx_sched_out() would not further modify the ctx time.
+
+For ctx_sched_in() any 0 -> !0 transition will automatically include
+EVENT_TIME.
+
+For ctx_sched_out(), any transition that clears EVENT_ALL will
+automatically clear EVENT_TIME.
+
+These two rules ensure that under normal circumstances we need not
+bother with EVENT_TIME and get natural ctx time behaviour.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dvyukov@google.com
+	Cc: eranian@google.com
+	Cc: oleg@redhat.com
+	Cc: panand@redhat.com
+	Cc: sasha.levin@oracle.com
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20160224174948.100446561@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 3cbaa59069677920186dcf502632ca1df4329f80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 4091a178da37,75bde93eb76f..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -2292,19 -2341,35 +2295,34 @@@ static void ctx_sched_out(struct perf_e
+  
+  	lockdep_assert_held(&ctx->lock);
+  
+ -	if (likely(!ctx->nr_events)) {
+ -		/*
+ -		 * See __perf_remove_from_context().
+ -		 */
+ -		WARN_ON_ONCE(ctx->is_active);
+ -		if (ctx->task)
+ -			WARN_ON_ONCE(cpuctx->task_ctx);
+ -		return;
+ -	}
+ -
+  	ctx->is_active &= ~event_type;
++ 	if (!(ctx->is_active & EVENT_ALL))
++ 		ctx->is_active = 0;
++ 
+  	if (ctx->task) {
+  		WARN_ON_ONCE(cpuctx->task_ctx != ctx);
+  		if (!ctx->is_active)
+  			cpuctx->task_ctx = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (likely(!ctx->nr_events))
+ +		return;
+ +
+ +	update_context_time(ctx);
+ +	update_cgrp_time_from_cpuctx(cpuctx);
+ +	if (!ctx->nr_active)
+++=======
++ 	is_active ^= ctx->is_active; /* changed bits */
++ 
++ 	if (is_active & EVENT_TIME) {
++ 		/* update (and stop) ctx time */
++ 		update_context_time(ctx);
++ 		update_cgrp_time_from_cpuctx(cpuctx);
++ 	}
++ 
++ 	if (!ctx->nr_active || !(is_active & EVENT_ALL))
+++>>>>>>> 3cbaa5906967 (perf: Fix ctx time tracking by introducing EVENT_TIME)
+  		return;
+  
+  	perf_pmu_disable(ctx->pmu);
+@@@ -2675,7 -2749,10 +2693,14 @@@ ctx_sched_in(struct perf_event_context 
+  
+  	lockdep_assert_held(&ctx->lock);
+  
+++<<<<<<< HEAD
+ +	ctx->is_active |= event_type;
+++=======
++ 	if (likely(!ctx->nr_events))
++ 		return;
++ 
++ 	ctx->is_active |= (event_type | EVENT_TIME);
+++>>>>>>> 3cbaa5906967 (perf: Fix ctx time tracking by introducing EVENT_TIME)
+  	if (ctx->task) {
+  		if (!is_active)
+  			cpuctx->task_ctx = ctx;
+@@@ -2683,12 -2760,15 +2708,24 @@@
+  			WARN_ON_ONCE(cpuctx->task_ctx != ctx);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (likely(!ctx->nr_events))
+ +		return;
+ +
+ +	now = perf_clock();
+ +	ctx->timestamp = now;
+ +	perf_cgroup_set_timestamp(task, ctx);
+++=======
++ 	is_active ^= ctx->is_active; /* changed bits */
++ 
++ 	if (is_active & EVENT_TIME) {
++ 		/* start ctx time */
++ 		now = perf_clock();
++ 		ctx->timestamp = now;
++ 		perf_cgroup_set_timestamp(task, ctx);
++ 	}
++ 
+++>>>>>>> 3cbaa5906967 (perf: Fix ctx time tracking by introducing EVENT_TIME)
+  	/*
+  	 * First go through the list and put on any pinned groups
+  	 * in order to give them the best chance of going on.
+* Unmerged path kernel/events/core.c
