@@ -1,0 +1,298 @@
+be2net: set interrupt moderation for Skyhawk-R using EQ-DB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Padmanabh Ratnakar <padmanabh.ratnakar@avagotech.com>
+commit 209477704187472d6055e83bbd0fd9b51b79fa15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/20947770.failed
+
+Currently adaptive interrupt moderation is set by calculating
+and configuring an EQ-delay every second. This is done via
+a FW-cmd. But, on Skyhawk-R a "re-arm to interrupt" delay
+can be set while ringing the EQ-DB. This patch uses this
+facility to calculate and set the interrupt delay every 1ms.
+This helps moderating interrupts better when the traffic
+is bursty.
+
+	Signed-off-by: Padmanabh Ratnakar <padmanabh.ratnakar@avagotech.com>
+	Signed-off-by: Sathya Perla <sathya.perla@avagotech.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 209477704187472d6055e83bbd0fd9b51b79fa15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index 3c82c87ccc52,a120be0334b0..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -1600,47 -1790,8 +1690,52 @@@ void be_eqd_update(struct be_adapter *a
+  
+  	for_all_evt_queues(adapter, eqo, i) {
+  		aic = &adapter->aic_obj[eqo->idx];
+++<<<<<<< HEAD
+ +		if (!aic->enable) {
+ +			if (aic->jiffies)
+ +				aic->jiffies = 0;
+ +			eqd = aic->et_eqd;
+ +			goto modify_eqd;
+ +		}
+ +
+ +		rxo = &adapter->rx_obj[eqo->idx];
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&rxo->stats.sync);
+ +			rx_pkts = rxo->stats.rx_pkts;
+ +		} while (u64_stats_fetch_retry_bh(&rxo->stats.sync, start));
+ +
+ +		txo = &adapter->tx_obj[eqo->idx];
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&txo->stats.sync);
+ +			tx_pkts = txo->stats.tx_reqs;
+ +		} while (u64_stats_fetch_retry_bh(&txo->stats.sync, start));
+ +
+ +		/* Skip, if wrapped around or first calculation */
+ +		now = jiffies;
+ +		if (!aic->jiffies || time_before(now, aic->jiffies) ||
+ +		    rx_pkts < aic->rx_pkts_prev ||
+ +		    tx_pkts < aic->tx_reqs_prev) {
+ +			be_aic_update(aic, rx_pkts, tx_pkts, now);
+ +			continue;
+ +		}
+ +
+ +		delta = jiffies_to_msecs(now - aic->jiffies);
+ +		pps = (((u32)(rx_pkts - aic->rx_pkts_prev) * 1000) / delta) +
+ +			(((u32)(tx_pkts - aic->tx_reqs_prev) * 1000) / delta);
+ +		eqd = (pps / 15000) << 2;
+ +
+ +		if (eqd < 8)
+ +			eqd = 0;
+ +		eqd = min_t(u32, eqd, aic->max_eqd);
+ +		eqd = max_t(u32, eqd, aic->min_eqd);
+ +
+ +		be_aic_update(aic, rx_pkts, tx_pkts, now);
+ +modify_eqd:
+ +		if (eqd != aic->prev_eqd) {
+++=======
++ 		eqd = be_get_new_eqd(eqo);
++ 		if (force_update || eqd != aic->prev_eqd) {
+++>>>>>>> 209477704187 (be2net: set interrupt moderation for Skyhawk-R using EQ-DB)
+  			set_eqd[num].delay_multiplier = (eqd * 65)/100;
+  			set_eqd[num].eq_id = eqo->q.id;
+  			aic->prev_eqd = eqd;
+@@@ -4983,156 -5489,6 +5087,158 @@@ static void be_remove(struct pci_dev *p
+  	free_netdev(adapter->netdev);
+  }
+  
+ +static int be_get_initial_config(struct be_adapter *adapter)
+ +{
+ +	int status, level;
+ +
+ +	status = be_cmd_get_cntl_attributes(adapter);
+ +	if (status)
+ +		return status;
+ +
+ +	/* Must be a power of 2 or else MODULO will BUG_ON */
+ +	adapter->be_get_temp_freq = 64;
+ +
+ +	if (BEx_chip(adapter)) {
+ +		level = be_cmd_get_fw_log_level(adapter);
+ +		adapter->msg_enable =
+ +			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+ +	}
+ +
+ +	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
+ +	return 0;
+ +}
+ +
+ +static int lancer_recover_func(struct be_adapter *adapter)
+ +{
+ +	struct device *dev = &adapter->pdev->dev;
+ +	int status;
+ +
+ +	status = lancer_test_and_set_rdy_state(adapter);
+ +	if (status)
+ +		goto err;
+ +
+ +	if (netif_running(adapter->netdev))
+ +		be_close(adapter->netdev);
+ +
+ +	be_clear(adapter);
+ +
+ +	be_clear_all_error(adapter);
+ +
+ +	status = be_setup(adapter);
+ +	if (status)
+ +		goto err;
+ +
+ +	if (netif_running(adapter->netdev)) {
+ +		status = be_open(adapter->netdev);
+ +		if (status)
+ +			goto err;
+ +	}
+ +
+ +	dev_err(dev, "Adapter recovery successful\n");
+ +	return 0;
+ +err:
+ +	if (status == -EAGAIN)
+ +		dev_err(dev, "Waiting for resource provisioning\n");
+ +	else
+ +		dev_err(dev, "Adapter recovery failed\n");
+ +
+ +	return status;
+ +}
+ +
+ +static void be_func_recovery_task(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+ +		container_of(work, struct be_adapter,  func_recovery_work.work);
+ +	int status = 0;
+ +
+ +	be_detect_error(adapter);
+ +
+ +	if (adapter->hw_error && lancer_chip(adapter)) {
+ +		rtnl_lock();
+ +		netif_device_detach(adapter->netdev);
+ +		rtnl_unlock();
+ +
+ +		status = lancer_recover_func(adapter);
+ +		if (!status)
+ +			netif_device_attach(adapter->netdev);
+ +	}
+ +
+ +	/* In Lancer, for all errors other than provisioning error (-EAGAIN),
+ +	 * no need to attempt further recovery.
+ +	 */
+ +	if (!status || status == -EAGAIN)
+ +		schedule_delayed_work(&adapter->func_recovery_work,
+ +				      msecs_to_jiffies(1000));
+ +}
+ +
+ +static void be_log_sfp_info(struct be_adapter *adapter)
+ +{
+ +	int status;
+ +
+ +	status = be_cmd_query_sfp_info(adapter);
+ +	if (!status) {
+ +		dev_err(&adapter->pdev->dev,
+ +			"Unqualified SFP+ detected on %c from %s part no: %s",
+ +			adapter->port_name, adapter->phy.vendor_name,
+ +			adapter->phy.vendor_pn);
+ +	}
+ +	adapter->flags &= ~BE_FLAGS_EVT_INCOMPATIBLE_SFP;
+ +}
+ +
+ +static void be_worker(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+ +		container_of(work, struct be_adapter, work.work);
+ +	struct be_rx_obj *rxo;
+ +	int i;
+ +
+ +	/* when interrupts are not yet enabled, just reap any pending
+ +	* mcc completions */
+ +	if (!netif_running(adapter->netdev)) {
+ +		local_bh_disable();
+ +		be_process_mcc(adapter);
+ +		local_bh_enable();
+ +		goto reschedule;
+ +	}
+ +
+ +	if (!adapter->stats_cmd_sent) {
+ +		if (lancer_chip(adapter))
+ +			lancer_cmd_get_pport_stats(adapter,
+ +						   &adapter->stats_cmd);
+ +		else
+ +			be_cmd_get_stats(adapter, &adapter->stats_cmd);
+ +	}
+ +
+ +	if (be_physfn(adapter) &&
+ +	    MODULO(adapter->work_counter, adapter->be_get_temp_freq) == 0)
+ +		be_cmd_get_die_temperature(adapter);
+ +
+ +	for_all_rx_queues(adapter, rxo, i) {
+ +		/* Replenish RX-queues starved due to memory
+ +		 * allocation failures.
+ +		 */
+ +		if (rxo->rx_post_starved)
+ +			be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+ +	}
+ +
+- 	be_eqd_update(adapter);
+++	/* EQ-delay update for Skyhawk is done while notifying EQ */
+++	if (!skyhawk_chip(adapter))
+++		be_eqd_update(adapter, false);
+ +
+ +	if (adapter->flags & BE_FLAGS_EVT_INCOMPATIBLE_SFP)
+ +		be_log_sfp_info(adapter);
+ +
+ +reschedule:
+ +	adapter->work_counter++;
+ +	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+ +}
+ +
+ +/* If any VFs are already enabled don't FLR the PF */
+ +static bool be_reset_required(struct be_adapter *adapter)
+ +{
+ +	return pci_num_vf(adapter->pdev) ? false : true;
+ +}
+ +
+  static char *mc_name(struct be_adapter *adapter)
+  {
+  	char *str = "";	/* default */
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index ba7b494b4420..85f7ae151ee3 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -936,6 +936,7 @@ bool be_pause_supported(struct be_adapter *adapter);
+ u32 be_get_fw_log_level(struct be_adapter *adapter);
+ int be_update_queues(struct be_adapter *adapter);
+ int be_poll(struct napi_struct *napi, int budget);
++void be_eqd_update(struct be_adapter *adapter, bool force_update);
+ 
+ /*
+  * internal function to initialize-cleanup roce device.
+diff --git a/drivers/net/ethernet/emulex/benet/be_ethtool.c b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+index 21702b07c4d3..b04e82458f51 100644
+--- a/drivers/net/ethernet/emulex/benet/be_ethtool.c
++++ b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+@@ -368,6 +368,14 @@ static int be_set_coalesce(struct net_device *netdev,
+ 		aic++;
+ 	}
+ 
++	/* For Skyhawk, the EQD setting happens via EQ_DB when AIC is enabled.
++	 * When AIC is disabled, persistently force set EQD value via the
++	 * FW cmd, so that we don't have to calculate the delay multiplier
++	 * encode value each time EQ_DB is rung
++	 */
++	if (!et->use_adaptive_rx_coalesce && skyhawk_chip(adapter))
++		be_eqd_update(adapter, true);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/emulex/benet/be_hw.h b/drivers/net/ethernet/emulex/benet/be_hw.h
+index 48840889db62..ca074ba6dd54 100644
+--- a/drivers/net/ethernet/emulex/benet/be_hw.h
++++ b/drivers/net/ethernet/emulex/benet/be_hw.h
+@@ -132,6 +132,18 @@
+ #define DB_EQ_NUM_POPPED_SHIFT		(16)	/* bits 16 - 28 */
+ /* Rearm bit */
+ #define DB_EQ_REARM_SHIFT		(29)	/* bit 29 */
++/* Rearm to interrupt delay encoding */
++#define DB_EQ_R2I_DLY_SHIFT		(30)    /* bits 30 - 31 */
++
++/* Rearm to interrupt (R2I) delay multiplier encoding represents 3 different
++ * values configured in CEV_REARM2IRPT_DLY_MULT_CSR register. This value is
++ * programmed by host driver while ringing an EQ doorbell(EQ_DB) if a delay
++ * between rearming the EQ and next interrupt on this EQ is desired.
++ */
++#define	R2I_DLY_ENC_0			0	/* No delay */
++#define	R2I_DLY_ENC_1			1	/* maps to 160us EQ delay */
++#define	R2I_DLY_ENC_2			2	/* maps to 96us EQ delay */
++#define	R2I_DLY_ENC_3			3	/* maps to 48us EQ delay */
+ 
+ /********* Compl Q door bell *************/
+ #define DB_CQ_OFFSET 			0x120
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
