@@ -1,0 +1,139 @@
+hv_netvsc: use per_cpu stats to calculate TX/RX data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author sixiao@microsoft.com <sixiao@microsoft.com>
+commit 7eafd9b4005643cfc24f1daf78f4dd56ff71f559
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7eafd9b4.failed
+
+Current code does not lock anything when calculating the TX and RX stats.
+As a result, the RX and TX data reported by ifconfig are not accuracy in a
+system with high network throughput and multiple CPUs (in my test,
+RX/TX = 83% between 2 HyperV VM nodes which have 8 vCPUs and 40G Ethernet).
+
+This patch fixed the above issue by using per_cpu stats.
+netvsc_get_stats64() summarizes TX and RX data by iterating over all CPUs
+to get their respective stats.
+
+This v2 patch addressed David's comments on the cleanup path when
+netdev_alloc_pcpu_stats() failed.
+
+	Signed-off-by: Simon Xiao <sixiao@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7eafd9b4005643cfc24f1daf78f4dd56ff71f559)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 3362765215d6,5a92b36daed6..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -595,7 -602,34 +595,38 @@@ struct nvsp_message 
+  
+  #define VRSS_SEND_TAB_SIZE 16
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	spinlock_t lock; /* protect struct multi_send_data */
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync s_sync;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	struct delayed_work dwork;
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> 7eafd9b40056 (hv_netvsc: use per_cpu stats to calculate TX/RX data)
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972,0c8587240ff3..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -383,8 -388,10 +383,15 @@@ static int netvsc_start_xmit(struct sk_
+  	int  hdr_offset;
+  	u32 net_trans_info;
+  	u32 hash;
+++<<<<<<< HEAD
+ +	u32 skb_length = skb->len;
+ +
+++=======
++ 	u32 skb_length;
++ 	u32 pkt_sz;
++ 	struct hv_page_buffer page_buf[MAX_PAGE_BUFFER_COUNT];
++ 	struct netvsc_stats *tx_stats = this_cpu_ptr(net_device_ctx->tx_stats);
+++>>>>>>> 7eafd9b40056 (hv_netvsc: use per_cpu stats to calculate TX/RX data)
+  
+  	/* We will atmost need two pages to describe the rndis
+  	 * header. We can only transmit MAX_PAGE_BUFFER_COUNT number
+@@@ -560,10 -580,11 +567,12 @@@ do_send
+  
+  drop:
+  	if (ret == 0) {
+- 		net->stats.tx_bytes += skb_length;
+- 		net->stats.tx_packets++;
++ 		u64_stats_update_begin(&tx_stats->s_sync);
++ 		tx_stats->packets++;
++ 		tx_stats->bytes += skb_length;
++ 		u64_stats_update_end(&tx_stats->s_sync);
+  	} else {
+ +		kfree(packet);
+  		if (ret != -EAGAIN) {
+  			dev_kfree_skb_any(skb);
+  			net->stats.tx_dropped++;
+@@@ -833,6 -935,23 +897,26 @@@ static int netvsc_probe(struct hv_devic
+  
+  	net_device_ctx = netdev_priv(net);
+  	net_device_ctx->device_ctx = dev;
+++<<<<<<< HEAD
+++=======
++ 	net_device_ctx->msg_enable = netif_msg_init(debug, default_msg);
++ 	if (netif_msg_probe(net_device_ctx))
++ 		netdev_dbg(net, "netvsc msg_enable: %d\n",
++ 			   net_device_ctx->msg_enable);
++ 
++ 	net_device_ctx->tx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
++ 	if (!net_device_ctx->tx_stats) {
++ 		free_netdev(net);
++ 		return -ENOMEM;
++ 	}
++ 	net_device_ctx->rx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
++ 	if (!net_device_ctx->rx_stats) {
++ 		free_percpu(net_device_ctx->tx_stats);
++ 		free_netdev(net);
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> 7eafd9b40056 (hv_netvsc: use per_cpu stats to calculate TX/RX data)
+  	hv_set_drvdata(dev, net);
+  	INIT_DELAYED_WORK(&net_device_ctx->dwork, netvsc_link_change);
+  	INIT_WORK(&net_device_ctx->work, do_set_multicast);
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
