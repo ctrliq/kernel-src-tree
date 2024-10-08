@@ -1,0 +1,160 @@
+ipmi: Handle BMCs that don't allow clearing the rcv irq bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit 1e7d6a45f6b10bc48a1453bca3d829e210546571
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1e7d6a45.failed
+
+Some BMCs don't let you clear the receive irq bit in the global
+enables.  This is kind of silly, but they give an error if you
+try to clear it.  Compensate for this by detecting the situation
+and working around it.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+	Tested-by: Thomas D <whissi@whissi.de>
+	Reviewed-by: Thomas D <whissi@whissi.de>
+(cherry picked from commit 1e7d6a45f6b10bc48a1453bca3d829e210546571)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si_intf.c
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index 871f1e755604,518585c1ce94..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -257,8 -255,18 +257,13 @@@ struct smi_info 
+  	 * memory.  Once that situation clears up, it will re-enable
+  	 * interrupts.
+  	 */
+ -	bool interrupt_disabled;
+ -
+ -	/*
+ -	 * Does the BMC support events?
+ -	 */
+ -	bool supports_event_msg_buff;
+ +	int interrupt_disabled;
+  
++ 	/*
++ 	 * Can we clear the global enables receive irq bit?
++ 	 */
++ 	bool cannot_clear_recv_irq_bit;
++ 
+  	/*
+  	 * Did we get an attention that we did not handle?
+  	 */
+@@@ -445,23 -466,49 +450,26 @@@ static void smi_mod_timer(struct smi_in
+   * allocate messages, we just leave them in the BMC and run the system
+   * polled until we can allocate some memory.  Once we have some
+   * memory, we will re-enable the interrupt.
++  *
++  * Note that we cannot just use disable_irq(), since the interrupt may
++  * be shared.
+   */
+ -static inline bool disable_si_irq(struct smi_info *smi_info)
+ +static inline void disable_si_irq(struct smi_info *smi_info)
+  {
+  	if ((smi_info->irq) && (!smi_info->interrupt_disabled)) {
+ -		smi_info->interrupt_disabled = true;
+ -		start_check_enables(smi_info);
+ -		return true;
+ +		start_disable_irq(smi_info);
+ +		smi_info->interrupt_disabled = 1;
+ +		if (!atomic_read(&smi_info->stop_operation))
+ +			smi_mod_timer(smi_info, jiffies + SI_TIMEOUT_JIFFIES);
+  	}
+ -	return false;
+  }
+  
+ -static inline bool enable_si_irq(struct smi_info *smi_info)
+ +static inline void enable_si_irq(struct smi_info *smi_info)
+  {
+  	if ((smi_info->irq) && (smi_info->interrupt_disabled)) {
+ -		smi_info->interrupt_disabled = false;
+ -		start_check_enables(smi_info);
+ -		return true;
+ -	}
+ -	return false;
+ -}
+ -
+ -/*
+ - * Allocate a message.  If unable to allocate, start the interrupt
+ - * disable process and return NULL.  If able to allocate but
+ - * interrupts are disabled, free the message and return NULL after
+ - * starting the interrupt enable process.
+ - */
+ -static struct ipmi_smi_msg *alloc_msg_handle_irq(struct smi_info *smi_info)
+ -{
+ -	struct ipmi_smi_msg *msg;
+ -
+ -	msg = ipmi_alloc_smi_msg();
+ -	if (!msg) {
+ -		if (!disable_si_irq(smi_info))
+ -			smi_info->si_state = SI_NORMAL;
+ -	} else if (enable_si_irq(smi_info)) {
+ -		ipmi_free_smi_msg(msg);
+ -		msg = NULL;
+ +		start_enable_irq(smi_info);
+ +		smi_info->interrupt_disabled = 0;
+  	}
+ -	return msg;
+  }
+  
+  static void handle_flags(struct smi_info *smi_info)
+@@@ -520,6 -544,50 +528,53 @@@
+  		smi_info->si_state = SI_NORMAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Global enables we care about.
++  */
++ #define GLOBAL_ENABLES_MASK (IPMI_BMC_EVT_MSG_BUFF | IPMI_BMC_RCV_MSG_INTR | \
++ 			     IPMI_BMC_EVT_MSG_INTR)
++ 
++ static u8 current_global_enables(struct smi_info *smi_info, u8 base,
++ 				 bool *irq_on)
++ {
++ 	u8 enables = 0;
++ 
++ 	if (smi_info->supports_event_msg_buff)
++ 		enables |= IPMI_BMC_EVT_MSG_BUFF;
++ 
++ 	if ((smi_info->irq && !smi_info->interrupt_disabled) ||
++ 	    smi_info->cannot_clear_recv_irq_bit)
++ 		enables |= IPMI_BMC_RCV_MSG_INTR;
++ 
++ 	if (smi_info->supports_event_msg_buff &&
++ 	    smi_info->irq && !smi_info->interrupt_disabled)
++ 
++ 		enables |= IPMI_BMC_EVT_MSG_INTR;
++ 
++ 	*irq_on = enables & (IPMI_BMC_EVT_MSG_INTR | IPMI_BMC_RCV_MSG_INTR);
++ 
++ 	return enables;
++ }
++ 
++ static void check_bt_irq(struct smi_info *smi_info, bool irq_on)
++ {
++ 	u8 irqstate = smi_info->io.inputb(&smi_info->io, IPMI_BT_INTMASK_REG);
++ 
++ 	irqstate &= IPMI_BT_INTMASK_ENABLE_IRQ_BIT;
++ 
++ 	if ((bool)irqstate == irq_on)
++ 		return;
++ 
++ 	if (irq_on)
++ 		smi_info->io.outputb(&smi_info->io, IPMI_BT_INTMASK_REG,
++ 				     IPMI_BT_INTMASK_ENABLE_IRQ_BIT);
++ 	else
++ 		smi_info->io.outputb(&smi_info->io, IPMI_BT_INTMASK_REG, 0);
++ }
++ 
+++>>>>>>> 1e7d6a45f6b1 (ipmi: Handle BMCs that don't allow clearing the rcv irq bit)
+  static void handle_transaction_done(struct smi_info *smi_info)
+  {
+  	struct ipmi_smi_msg *msg;
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
