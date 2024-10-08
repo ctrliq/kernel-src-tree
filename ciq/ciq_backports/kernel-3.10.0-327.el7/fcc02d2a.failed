@@ -1,0 +1,137 @@
+ceph: fix reading inline data when i_size > PAGE_SIZE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit fcc02d2a03fc629b82d1ca1006fbd06570385264
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fcc02d2a.failed
+
+when inode has inline data but its size > PAGE_SIZE (it was truncated
+to larger size), previous direct read code return -EIO. This patch adds
+code to return zeros for data whose offset > PAGE_SIZE.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit fcc02d2a03fc629b82d1ca1006fbd06570385264)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/file.c
+diff --cc fs/ceph/addr.c
+index 75152b56fe32,7d05e37874d4..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -179,11 -189,34 +179,36 @@@ static int readpage_nounlock(struct fil
+  {
+  	struct inode *inode = file_inode(filp);
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+ -	struct ceph_osd_client *osdc =
+ +	struct ceph_osd_client *osdc = 
+  		&ceph_inode_to_client(inode)->client->osdc;
+  	int err = 0;
+ -	u64 off = page_offset(page);
+  	u64 len = PAGE_CACHE_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (off >= i_size_read(inode)) {
++ 		zero_user_segment(page, 0, PAGE_CACHE_SIZE);
++ 		SetPageUptodate(page);
++ 		return 0;
++ 	}
++ 
++ 	if (ci->i_inline_version != CEPH_INLINE_NONE) {
++ 		/*
++ 		 * Uptodate inline data should have been added
++ 		 * into page cache while getting Fcr caps.
++ 		 */
++ 		if (off == 0)
++ 			return -EINVAL;
++ 		zero_user_segment(page, 0, PAGE_CACHE_SIZE);
++ 		SetPageUptodate(page);
++ 		return 0;
++ 	}
++ 
++ 	err = ceph_readpage_from_fscache(inode, page);
++ 	if (err == 0)
++ 		goto out;
++ 
+++>>>>>>> fcc02d2a03fc (ceph: fix reading inline data when i_size > PAGE_SIZE)
+  	dout("readpage inode %p file %p page %p index %lu\n",
+  	     inode, filp, page, page->index);
+  	err = ceph_osdc_readpages(osdc, ceph_vino(inode), &ci->i_layout,
+diff --cc fs/ceph/file.c
+index 9ae8f888b5a4,c407abb52b7b..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -851,13 -856,57 +851,57 @@@ out
+  		pinned_page = NULL;
+  	}
+  	ceph_put_cap_refs(ci, got);
+ -	if (retry_op && ret >= 0) {
+ -		int statret;
+ -		struct page *page = NULL;
+ -		loff_t i_size;
+ -		if (retry_op == READ_INLINE) {
+ -			page = __page_cache_alloc(GFP_NOFS);
+ -			if (!page)
+ -				return -ENOMEM;
+ -		}
+  
+++<<<<<<< HEAD
+ +	if (checkeof && ret >= 0) {
+ +		int statret = ceph_do_getattr(inode, CEPH_STAT_CAP_SIZE, false);
+ +
+ +		/* hit EOF or hole? */
+ +		if (statret == 0 && iocb->ki_pos < inode->i_size &&
+ +			ret < len) {
+++=======
++ 		statret = __ceph_do_getattr(inode, page,
++ 					    CEPH_STAT_CAP_INLINE_DATA, !!page);
++ 		if (statret < 0) {
++ 			 __free_page(page);
++ 			if (statret == -ENODATA) {
++ 				BUG_ON(retry_op != READ_INLINE);
++ 				goto again;
++ 			}
++ 			return statret;
++ 		}
++ 
++ 		i_size = i_size_read(inode);
++ 		if (retry_op == READ_INLINE) {
++ 			BUG_ON(ret > 0 || read > 0);
++ 			if (iocb->ki_pos < i_size &&
++ 			    iocb->ki_pos < PAGE_CACHE_SIZE) {
++ 				loff_t end = min_t(loff_t, i_size,
++ 						   iocb->ki_pos + len);
++ 				end = min_t(loff_t, end, PAGE_CACHE_SIZE);
++ 				if (statret < end)
++ 					zero_user_segment(page, statret, end);
++ 				ret = copy_page_to_iter(page,
++ 						iocb->ki_pos & ~PAGE_MASK,
++ 						end - iocb->ki_pos, to);
++ 				iocb->ki_pos += ret;
++ 				read += ret;
++ 			}
++ 			if (iocb->ki_pos < i_size && read < len) {
++ 				size_t zlen = min_t(size_t, len - read,
++ 						    i_size - iocb->ki_pos);
++ 				ret = iov_iter_zero(zlen, to);
++ 				iocb->ki_pos += ret;
++ 				read += ret;
++ 			}
++ 			__free_pages(page, 0);
++ 			return read;
++ 		}
++ 
++ 		/* hit EOF or hole? */
++ 		if (retry_op == CHECK_EOF && iocb->ki_pos < i_size &&
++ 		    ret < len) {
+++>>>>>>> fcc02d2a03fc (ceph: fix reading inline data when i_size > PAGE_SIZE)
+  			dout("sync_read hit hole, ppos %lld < size %lld"
+  			     ", reading more\n", iocb->ki_pos,
+  			     inode->i_size);
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/file.c
