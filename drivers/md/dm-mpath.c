@@ -1469,7 +1469,7 @@ static int multipath_message(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	if (argc != 2) {
-		DMWARN("Unrecognised multipath message received.");
+		DMWARN("Invalid multipath message arguments. Expected 2 arguments, got %d.", argc);
 		goto out;
 	}
 
@@ -1487,7 +1487,7 @@ static int multipath_message(struct dm_target *ti, unsigned argc, char **argv)
 	else if (!strcasecmp(argv[0], "fail_path"))
 		action = fail_path;
 	else {
-		DMWARN("Unrecognised multipath message received.");
+		DMWARN("Unrecognised multipath message received: %s", argv[0]);
 		goto out;
 	}
 
