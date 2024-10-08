@@ -197,6 +197,11 @@ struct sk_buff;
 #define MAX_SKB_FRAGS (65536/PAGE_SIZE + 1)
 #endif
 
+/* Set skb_shinfo(skb)->gso_size to this in case you want skb_segment to
+ * segment using its current segmentation instead.
+ */
+#define GSO_BY_FRAGS	0xFFFF
+
 typedef struct skb_frag_struct skb_frag_t;
 
 struct skb_frag_struct {
