@@ -1024,7 +1024,6 @@ static ssize_t debug_output(struct file *file, char __user *user_buf,
 
 out:
 	return ret;
-
 }
 
 static int debug_close(struct inode *inode, struct file *file)
