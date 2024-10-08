@@ -1,0 +1,183 @@
+context_tracking: Generalize context tracking APIs to support user and guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Rik van Riel <riel@redhat.com>
+commit 3aab4f50bff89bdea5066a05d4f3c5fa25bc37c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3aab4f50.failed
+
+Generalize the context tracking APIs to support various nature of
+contexts. This is performed by splitting out the mechanism from
+context_tracking_user_enter and context_tracking_user_exit into
+context_tracking_enter and context_tracking_exit.
+
+The nature of the context we track is now detailed in a ctx_state
+parameter pushed to these APIs, allowing the same functions to not just
+track kernel <> user space switching, but also kernel <> guest transitions.
+
+But leave the old functions in order to avoid breaking ARM, which calls
+these functions from assembler code, and cannot easily use C enum
+parameters.
+
+	Reviewed-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Will deacon <will.deacon@arm.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Luiz Capitulino <lcapitulino@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+(cherry picked from commit 3aab4f50bff89bdea5066a05d4f3c5fa25bc37c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/context_tracking.h
+#	kernel/context_tracking.c
+diff --cc include/linux/context_tracking.h
+index 37b81bd51ec0,7f1810a3b5a4..000000000000
+--- a/include/linux/context_tracking.h
++++ b/include/linux/context_tracking.h
+@@@ -43,8 -46,8 +46,13 @@@ static inline enum ctx_state exception_
+  static inline void exception_exit(enum ctx_state prev_ctx)
+  {
+  	if (context_tracking_is_enabled()) {
+++<<<<<<< HEAD
+ +		if (prev_ctx == IN_USER)
+ +			context_tracking_user_enter();
+++=======
++ 		if (prev_ctx != CONTEXT_KERNEL)
++ 			context_tracking_enter(prev_ctx);
+++>>>>>>> 3aab4f50bff8 (context_tracking: Generalize context tracking APIs to support user and guest)
+  	}
+  }
+  
+diff --cc kernel/context_tracking.c
+index 11048177d17e,17715d811b71..000000000000
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@@ -74,7 -75,7 +74,11 @@@ void context_tracking_enter(enum ctx_st
+  	WARN_ON_ONCE(!current->mm);
+  
+  	local_irq_save(flags);
+++<<<<<<< HEAD
+ +	if ( __this_cpu_read(context_tracking.state) != IN_USER) {
+++=======
++ 	if ( __this_cpu_read(context_tracking.state) != state) {
+++>>>>>>> 3aab4f50bff8 (context_tracking: Generalize context tracking APIs to support user and guest)
+  		if (__this_cpu_read(context_tracking.active)) {
+  			trace_user_enter(0);
+  			/*
+@@@ -100,58 -101,26 +104,73 @@@
+  		 * OTOH we can spare the calls to vtime and RCU when context_tracking.active
+  		 * is false because we know that CPU is not tickless.
+  		 */
+++<<<<<<< HEAD
+ +		__this_cpu_write(context_tracking.state, IN_USER);
+ +	}
+ +	local_irq_restore(flags);
+ +}
+ +
+ +#ifdef CONFIG_PREEMPT
+ +/**
+ + * preempt_schedule_context - preempt_schedule called by tracing
+ + *
+ + * The tracing infrastructure uses preempt_enable_notrace to prevent
+ + * recursion and tracing preempt enabling caused by the tracing
+ + * infrastructure itself. But as tracing can happen in areas coming
+ + * from userspace or just about to enter userspace, a preempt enable
+ + * can occur before user_exit() is called. This will cause the scheduler
+ + * to be called when the system is still in usermode.
+ + *
+ + * To prevent this, the preempt_enable_notrace will use this function
+ + * instead of preempt_schedule() to exit user context if needed before
+ + * calling the scheduler.
+ + */
+ +void __sched notrace preempt_schedule_context(void)
+ +{
+ +	enum ctx_state prev_ctx;
+ +
+ +	if (likely(!preemptible()))
+ +		return;
+ +
+ +	/*
+ +	 * Need to disable preemption in case user_exit() is traced
+ +	 * and the tracer calls preempt_enable_notrace() causing
+ +	 * an infinite recursion.
+ +	 */
+ +	preempt_disable_notrace();
+ +	prev_ctx = exception_enter();
+ +	preempt_enable_no_resched_notrace();
+ +
+ +	preempt_schedule();
+ +
+ +	preempt_disable_notrace();
+ +	exception_exit(prev_ctx);
+ +	preempt_enable_notrace();
+ +}
+ +EXPORT_SYMBOL_GPL(preempt_schedule_context);
+ +#endif /* CONFIG_PREEMPT */
+++=======
++ 		__this_cpu_write(context_tracking.state, state);
++ 	}
++ 	local_irq_restore(flags);
++ }
++ NOKPROBE_SYMBOL(context_tracking_enter);
++ 
++ void context_tracking_user_enter(void)
++ {
++ 	context_tracking_enter(CONTEXT_USER);
++ }
++ NOKPROBE_SYMBOL(context_tracking_user_enter);
+++>>>>>>> 3aab4f50bff8 (context_tracking: Generalize context tracking APIs to support user and guest)
+  
+  /**
+-  * context_tracking_user_exit - Inform the context tracking that the CPU is
+-  *                              exiting userspace mode and entering the kernel.
++  * context_tracking_exit - Inform the context tracking that the CPU is
++  *                         exiting user or guest mode and entering the kernel.
+   *
+-  * This function must be called after we entered the kernel from userspace
+-  * before any use of RCU read side critical section. This potentially include
+-  * any high level kernel code like syscalls, exceptions, signal handling, etc...
++  * This function must be called after we entered the kernel from user or
++  * guest space before any use of RCU read side critical section. This
++  * potentially include any high level kernel code like syscalls, exceptions,
++  * signal handling, etc...
+   *
+   * This call supports re-entrancy. This way it can be called from any exception
+   * handler without needing to know if we came from userspace or not.
+@@@ -167,7 -136,7 +186,11 @@@ void context_tracking_exit(enum ctx_sta
+  		return;
+  
+  	local_irq_save(flags);
+++<<<<<<< HEAD
+ +	if (__this_cpu_read(context_tracking.state) == IN_USER) {
+++=======
++ 	if (__this_cpu_read(context_tracking.state) == state) {
+++>>>>>>> 3aab4f50bff8 (context_tracking: Generalize context tracking APIs to support user and guest)
+  		if (__this_cpu_read(context_tracking.active)) {
+  			/*
+  			 * We are going to run code that may use RCU. Inform
+@@@ -181,6 -150,13 +204,16 @@@
+  	}
+  	local_irq_restore(flags);
+  }
+++<<<<<<< HEAD
+++=======
++ NOKPROBE_SYMBOL(context_tracking_exit);
++ 
++ void context_tracking_user_exit(void)
++ {
++ 	context_tracking_exit(CONTEXT_USER);
++ }
++ NOKPROBE_SYMBOL(context_tracking_user_exit);
+++>>>>>>> 3aab4f50bff8 (context_tracking: Generalize context tracking APIs to support user and guest)
+  
+  /**
+   * __context_tracking_task_switch - context switch the syscall callbacks
+* Unmerged path include/linux/context_tracking.h
+* Unmerged path kernel/context_tracking.c
