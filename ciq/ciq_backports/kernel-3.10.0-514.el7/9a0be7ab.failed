@@ -1,0 +1,150 @@
+nvme: refactor set_queue_count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 9a0be7abb62ff2a7dc3360ab45c31f29b3faf642
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9a0be7ab.failed
+
+Split out a helper that just issues the Set Features and interprets the
+result which can go to common code, and document why we are ignoring
+non-timeout error returns in the PCIe driver.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 9a0be7abb62ff2a7dc3360ab45c31f29b3faf642)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,a64d0baacc58..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -2196,26 -1553,62 +2196,79 @@@ static void nvme_create_io_queues(struc
+  			break;
+  
+  	for (i = dev->online_queues; i <= dev->queue_count - 1; i++)
+ -		if (nvme_create_queue(dev->queues[i], i)) {
+ -			nvme_free_queues(dev, i);
+ +		if (nvme_create_queue(dev->queues[i], i))
+  			break;
+ -		}
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static int set_queue_count(struct nvme_dev *dev, int count)
+ +{
+ +	int status;
+ +	u32 result;
+ +	u32 q_count = (count - 1) | ((count - 1) << 16);
+ +
+ +	status = nvme_set_features(dev, NVME_FEAT_NUM_QUEUES, q_count, 0,
+ +								&result);
+ +	if (status < 0)
+ +		return status;
+ +	if (status > 0) {
+ +		dev_err(&dev->pci_dev->dev, "Could not set queue count (%d)\n",
+ +									status);
+ +		return 0;
+ +	}
+ +	return min(result & 0xffff, result >> 16) + 1;
+++=======
++ static void __iomem *nvme_map_cmb(struct nvme_dev *dev)
++ {
++ 	u64 szu, size, offset;
++ 	u32 cmbloc;
++ 	resource_size_t bar_size;
++ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
++ 	void __iomem *cmb;
++ 	dma_addr_t dma_addr;
++ 
++ 	if (!use_cmb_sqes)
++ 		return NULL;
++ 
++ 	dev->cmbsz = readl(dev->bar + NVME_REG_CMBSZ);
++ 	if (!(NVME_CMB_SZ(dev->cmbsz)))
++ 		return NULL;
++ 
++ 	cmbloc = readl(dev->bar + NVME_REG_CMBLOC);
++ 
++ 	szu = (u64)1 << (12 + 4 * NVME_CMB_SZU(dev->cmbsz));
++ 	size = szu * NVME_CMB_SZ(dev->cmbsz);
++ 	offset = szu * NVME_CMB_OFST(cmbloc);
++ 	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(cmbloc));
++ 
++ 	if (offset > bar_size)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Controllers may support a CMB size larger than their BAR,
++ 	 * for example, due to being behind a bridge. Reduce the CMB to
++ 	 * the reported size of the BAR
++ 	 */
++ 	if (size > bar_size - offset)
++ 		size = bar_size - offset;
++ 
++ 	dma_addr = pci_resource_start(pdev, NVME_CMB_BIR(cmbloc)) + offset;
++ 	cmb = ioremap_wc(dma_addr, size);
++ 	if (!cmb)
++ 		return NULL;
++ 
++ 	dev->cmb_dma_addr = dma_addr;
++ 	dev->cmb_size = size;
++ 	return cmb;
++ }
++ 
++ static inline void nvme_release_cmb(struct nvme_dev *dev)
++ {
++ 	if (dev->cmb) {
++ 		iounmap(dev->cmb);
++ 		dev->cmb = NULL;
++ 	}
+++>>>>>>> 9a0be7abb62f (nvme: refactor set_queue_count):drivers/nvme/host/pci.c
+  }
+  
+  static size_t db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
+@@@ -2230,12 -1623,30 +2283,21 @@@ static int nvme_setup_io_queues(struct 
+  	int result, i, vecs, nr_io_queues, size;
+  
+  	nr_io_queues = num_possible_cpus();
+- 	result = set_queue_count(dev, nr_io_queues);
+- 	if (result <= 0)
++ 	result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
++ 	if (result < 0)
+  		return result;
+- 	if (result < nr_io_queues)
+- 		nr_io_queues = result;
++ 
++ 	/*
++ 	 * Degraded controllers might return an error when setting the queue
++ 	 * count.  We still want to be able to bring them online and offer
++ 	 * access to the admin queue, as that might be only way to fix them up.
++ 	 */
++ 	if (result > 0) {
++ 		dev_err(dev->dev, "Could not set queue count (%d)\n", result);
++ 		nr_io_queues = 0;
++ 		result = 0;
++ 	}
+  
+ -	if (dev->cmb && NVME_CMB_SQS(dev->cmbsz)) {
+ -		result = nvme_cmb_qdepth(dev, nr_io_queues,
+ -				sizeof(struct nvme_command));
+ -		if (result > 0)
+ -			dev->q_depth = result;
+ -		else
+ -			nvme_release_cmb(dev);
+ -	}
+ -
+  	size = db_bar_size(dev, nr_io_queues);
+  	if (size > 8192) {
+  		iounmap(dev->bar);
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
