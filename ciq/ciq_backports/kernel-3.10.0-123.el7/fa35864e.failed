@@ -1,0 +1,100 @@
+tuntap: Fix for a race in accessing numqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dominic Curran <dominic.curran@citrix.com>
+commit fa35864e0bb7f7c13b9c6d6751ddac9b42d4810f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fa35864e.failed
+
+A patch for fixing a race between queue selection and changing queues
+was introduced in commit 92bb73ea2("tuntap: fix a possible race between
+queue selection and changing queues").
+
+The fix was to prevent the driver from re-reading the tun->numqueues
+more than once within tun_select_queue() using ACCESS_ONCE().
+
+We have been experiancing 'Divide-by-zero' errors in tun_net_xmit()
+since we moved from 3.6 to 3.10, and believe that they come from a
+simular source where the value of tun->numqueues changes to zero
+between the first and a subsequent read of tun->numqueues.
+
+The fix is a simular use of ACCESS_ONCE(), as well as a multiply
+instead of a divide in the if statement.
+
+	Signed-off-by: Dominic Curran <dominic.curran@citrix.com>
+	Cc: Jason Wang <jasowang@redhat.com>
+	Cc: Maxim Krasnyansky <maxk@qti.qualcomm.com>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Max Krasnyansky <maxk@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fa35864e0bb7f7c13b9c6d6751ddac9b42d4810f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index c98cc4681da6,bcf01af4b879..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -713,11 -742,28 +714,31 @@@ static netdev_tx_t tun_net_xmit(struct 
+  
+  	rcu_read_lock();
+  	tfile = rcu_dereference(tun->tfiles[txq]);
++ 	numqueues = ACCESS_ONCE(tun->numqueues);
+  
+  	/* Drop packet if interface is not attached */
+- 	if (txq >= tun->numqueues)
++ 	if (txq >= numqueues)
+  		goto drop;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (numqueues == 1) {
++ 		/* Select queue was not called for the skbuff, so we extract the
++ 		 * RPS hash and save it into the flow_table here.
++ 		 */
++ 		__u32 rxhash;
++ 
++ 		rxhash = skb_get_hash(skb);
++ 		if (rxhash) {
++ 			struct tun_flow_entry *e;
++ 			e = tun_flow_find(&tun->flows[tun_hashfn(rxhash)],
++ 					rxhash);
++ 			if (e)
++ 				tun_flow_save_rps_rxhash(e, rxhash);
++ 		}
++ 	}
++ 
+++>>>>>>> fa35864e0bb7 (tuntap: Fix for a race in accessing numqueues)
+  	tun_debug(KERN_INFO, tun, "tun_net_xmit %d\n", skb->len);
+  
+  	BUG_ON(!tfile);
+@@@ -735,14 -781,21 +756,14 @@@
+  	/* Limit the number of packets queued by dividing txq length with the
+  	 * number of queues.
+  	 */
+- 	if (skb_queue_len(&tfile->socket.sk->sk_receive_queue)
+- 			  >= dev->tx_queue_len / tun->numqueues)
++ 	if (skb_queue_len(&tfile->socket.sk->sk_receive_queue) * numqueues
++ 			  >= dev->tx_queue_len)
+  		goto drop;
+  
+ +	/* Orphan the skb - required as we might hang on to it
+ +	 * for indefinite time. */
+  	if (unlikely(skb_orphan_frags(skb, GFP_ATOMIC)))
+  		goto drop;
+ -
+ -	if (skb->sk) {
+ -		sock_tx_timestamp(skb->sk, &skb_shinfo(skb)->tx_flags);
+ -		sw_tx_timestamp(skb);
+ -	}
+ -
+ -	/* Orphan the skb - required as we might hang on to it
+ -	 * for indefinite time.
+ -	 */
+  	skb_orphan(skb);
+  
+  	nf_reset(skb);
+* Unmerged path drivers/net/tun.c
