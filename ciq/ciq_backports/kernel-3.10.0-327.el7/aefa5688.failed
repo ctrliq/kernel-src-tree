@@ -1,0 +1,712 @@
+powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] mm: don't do tlbie for updatepp request with NO HPTE fault (Gustavo Duarte) [1223004]
+Rebuild_FUZZ: 93.55%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit aefa5688c070727b8729de1aef85cad7b9933fc7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/aefa5688.failed
+
+upatepp can get called for a nohpte fault when we find from the linux
+page table that the translation was hashed before. In that case
+we are sure that there is no existing translation, hence we could
+avoid doing tlbie.
+
+We could possibly race with a parallel fault filling the TLB. But
+that should be ok because updatepp is only ever relaxing permissions.
+We also look at linux pte permission bits when filling hash pte
+permission bits. We also hold the linux pte busy bits while
+inserting/updating a hashpte entry, hence a paralle update of
+linux pte is not possible. On the other hand mprotect involves
+ptep_modify_prot_start which cause a hpte invalidate and not updatepp.
+
+Performance number:
+We use randbox_access_bench written by Anton.
+
+Kernel with THP disabled and smaller hash page table size.
+
+    86.60%  random_access_b  [kernel.kallsyms]                [k] .native_hpte_updatepp
+     2.10%  random_access_b  random_access_bench              [.] doit
+     1.99%  random_access_b  [kernel.kallsyms]                [k] .do_raw_spin_lock
+     1.85%  random_access_b  [kernel.kallsyms]                [k] .native_hpte_insert
+     1.26%  random_access_b  [kernel.kallsyms]                [k] .native_flush_hash_range
+     1.18%  random_access_b  [kernel.kallsyms]                [k] .__delay
+     0.69%  random_access_b  [kernel.kallsyms]                [k] .native_hpte_remove
+     0.37%  random_access_b  [kernel.kallsyms]                [k] .clear_user_page
+     0.34%  random_access_b  [kernel.kallsyms]                [k] .__hash_page_64K
+     0.32%  random_access_b  [kernel.kallsyms]                [k] fast_exception_return
+     0.30%  random_access_b  [kernel.kallsyms]                [k] .hash_page_mm
+
+With Fix:
+
+    27.54%  random_access_b  random_access_bench              [.] doit
+    22.90%  random_access_b  [kernel.kallsyms]                [k] .native_hpte_insert
+     5.76%  random_access_b  [kernel.kallsyms]                [k] .native_hpte_remove
+     5.20%  random_access_b  [kernel.kallsyms]                [k] fast_exception_return
+     5.12%  random_access_b  [kernel.kallsyms]                [k] .__hash_page_64K
+     4.80%  random_access_b  [kernel.kallsyms]                [k] .hash_page_mm
+     3.31%  random_access_b  [kernel.kallsyms]                [k] data_access_common
+     1.84%  random_access_b  [kernel.kallsyms]                [k] .trace_hardirqs_on_caller
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit aefa5688c070727b8729de1aef85cad7b9933fc7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/mmu-hash64.h
+#	arch/powerpc/include/asm/tlbflush.h
+#	arch/powerpc/mm/hash_native_64.c
+#	arch/powerpc/mm/hash_utils_64.c
+#	arch/powerpc/mm/hugepage-hash64.c
+#	arch/powerpc/mm/pgtable_64.c
+diff --cc arch/powerpc/include/asm/mmu-hash64.h
+index e25351a5c9ca,4f13c3ed7acf..000000000000
+--- a/arch/powerpc/include/asm/mmu-hash64.h
++++ b/arch/powerpc/include/asm/mmu-hash64.h
+@@@ -338,18 -316,25 +338,29 @@@ static inline unsigned long hpt_hash(un
+  	return hash & 0x7fffffffffUL;
+  }
+  
++ #define HPTE_LOCAL_UPDATE	0x1
++ #define HPTE_NOHPTE_UPDATE	0x2
++ 
+  extern int __hash_page_4K(unsigned long ea, unsigned long access,
+  			  unsigned long vsid, pte_t *ptep, unsigned long trap,
+- 			  unsigned int local, int ssize, int subpage_prot);
++ 			  unsigned long flags, int ssize, int subpage_prot);
+  extern int __hash_page_64K(unsigned long ea, unsigned long access,
+  			   unsigned long vsid, pte_t *ptep, unsigned long trap,
+- 			   unsigned int local, int ssize);
++ 			   unsigned long flags, int ssize);
+  struct mm_struct;
+  unsigned int hash_page_do_lazy_icache(unsigned int pp, pte_t pte, int trap);
+++<<<<<<< HEAD
+ +extern int hash_page(unsigned long ea, unsigned long access, unsigned long trap);
+++=======
++ extern int hash_page_mm(struct mm_struct *mm, unsigned long ea,
++ 			unsigned long access, unsigned long trap,
++ 			unsigned long flags);
++ extern int hash_page(unsigned long ea, unsigned long access, unsigned long trap,
++ 		     unsigned long dsisr);
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  int __hash_page_huge(unsigned long ea, unsigned long access, unsigned long vsid,
+- 		     pte_t *ptep, unsigned long trap, int local, int ssize,
+- 		     unsigned int shift, unsigned int mmu_psize);
++ 		     pte_t *ptep, unsigned long trap, unsigned long flags,
++ 		     int ssize, unsigned int shift, unsigned int mmu_psize);
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+  extern int __hash_page_thp(unsigned long ea, unsigned long access,
+  			   unsigned long vsid, pmd_t *pmdp, unsigned long trap,
+diff --cc arch/powerpc/include/asm/tlbflush.h
+index 2def01ed0cb2,23d351ca0303..000000000000
+--- a/arch/powerpc/include/asm/tlbflush.h
++++ b/arch/powerpc/include/asm/tlbflush.h
+@@@ -125,9 -125,11 +125,15 @@@ static inline void arch_leave_lazy_mmu_
+  
+  
+  extern void flush_hash_page(unsigned long vpn, real_pte_t pte, int psize,
+- 			    int ssize, int local);
++ 			    int ssize, unsigned long flags);
+  extern void flush_hash_range(unsigned long number, int local);
+++<<<<<<< HEAD
+ +
+++=======
++ extern void flush_hash_hugepage(unsigned long vsid, unsigned long addr,
++ 				pmd_t *pmdp, unsigned int psize, int ssize,
++ 				unsigned long flags);
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  
+  static inline void local_flush_tlb_mm(struct mm_struct *mm)
+  {
+diff --cc arch/powerpc/mm/hash_native_64.c
+index fb89d7695a9a,9c4880ddecd6..000000000000
+--- a/arch/powerpc/mm/hash_native_64.c
++++ b/arch/powerpc/mm/hash_native_64.c
+@@@ -304,15 -306,30 +304,26 @@@ static long native_hpte_updatepp(unsign
+  		DBG_LOW(" -> miss\n");
+  		ret = -1;
+  	} else {
+ -		native_lock_hpte(hptep);
+ -		/* recheck with locks held */
+ -		hpte_v = be64_to_cpu(hptep->v);
+ -		if (unlikely(!HPTE_V_COMPARE(hpte_v, want_v) ||
+ -			     !(hpte_v & HPTE_V_VALID))) {
+ -			ret = -1;
+ -		} else {
+ -			DBG_LOW(" -> hit\n");
+ -			/* Update the HPTE */
+ -			hptep->r = cpu_to_be64((be64_to_cpu(hptep->r) &
+ -						~(HPTE_R_PP | HPTE_R_N)) |
+ -					       (newpp & (HPTE_R_PP | HPTE_R_N |
+ -							 HPTE_R_C)));
+ -		}
+ -		native_unlock_hpte(hptep);
+ +		DBG_LOW(" -> hit\n");
+ +		/* Update the HPTE */
+ +		hptep->r = cpu_to_be64((be64_to_cpu(hptep->r) & ~(HPTE_R_PP | HPTE_R_N)) |
+ +			(newpp & (HPTE_R_PP | HPTE_R_N | HPTE_R_C)));
+  	}
+++<<<<<<< HEAD
+ +	native_unlock_hpte(hptep);
+ +
+ +	/* Ensure it is out of the tlb too. */
+ +	tlbie(vpn, bpsize, apsize, ssize, local);
+++=======
++ 
++ 	if (flags & HPTE_LOCAL_UPDATE)
++ 		local = 1;
++ 	/*
++ 	 * Ensure it is out of the tlb too if it is not a nohpte fault
++ 	 */
++ 	if (!(flags & HPTE_NOHPTE_UPDATE))
++ 		tlbie(vpn, bpsize, apsize, ssize, local);
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  
+  	return ret;
+  }
+diff --cc arch/powerpc/mm/hash_utils_64.c
+index fac435cd37ea,e56a307bc676..000000000000
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@@ -1002,7 -989,9 +1002,13 @@@ static void check_paca_psize(unsigned l
+   * -1 - critical hash insertion error
+   * -2 - access not permitted by subpage protection mechanism
+   */
+++<<<<<<< HEAD
+ +int hash_page(unsigned long ea, unsigned long access, unsigned long trap)
+++=======
++ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
++ 		 unsigned long access, unsigned long trap,
++ 		 unsigned long flags)
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  {
+  	enum ctx_state prev_state = exception_enter();
+  	pgd_t *pgdir;
+@@@ -1195,6 -1182,22 +1202,25 @@@ bail
+  	exception_exit(prev_state);
+  	return rc;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(hash_page_mm);
++ 
++ int hash_page(unsigned long ea, unsigned long access, unsigned long trap,
++ 	      unsigned long dsisr)
++ {
++ 	unsigned long flags = 0;
++ 	struct mm_struct *mm = current->mm;
++ 
++ 	if (REGION_ID(ea) == VMALLOC_REGION_ID)
++ 		mm = &init_mm;
++ 
++ 	if (dsisr & DSISR_NOHPTE)
++ 		flags |= HPTE_NOHPTE_UPDATE;
++ 
++ 	return hash_page_mm(mm, ea, access, trap, flags);
++ }
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  EXPORT_SYMBOL_GPL(hash_page);
+  
+  void hash_preload(struct mm_struct *mm, unsigned long ea,
+@@@ -1320,6 -1325,78 +1348,81 @@@ void flush_hash_page(unsigned long vpn
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ void flush_hash_hugepage(unsigned long vsid, unsigned long addr,
++ 			 pmd_t *pmdp, unsigned int psize, int ssize,
++ 			 unsigned long flags)
++ {
++ 	int i, max_hpte_count, valid;
++ 	unsigned long s_addr;
++ 	unsigned char *hpte_slot_array;
++ 	unsigned long hidx, shift, vpn, hash, slot;
++ 	int local = flags & HPTE_LOCAL_UPDATE;
++ 
++ 	s_addr = addr & HPAGE_PMD_MASK;
++ 	hpte_slot_array = get_hpte_slot_array(pmdp);
++ 	/*
++ 	 * IF we try to do a HUGE PTE update after a withdraw is done.
++ 	 * we will find the below NULL. This happens when we do
++ 	 * split_huge_page_pmd
++ 	 */
++ 	if (!hpte_slot_array)
++ 		return;
++ 
++ 	if (ppc_md.hugepage_invalidate) {
++ 		ppc_md.hugepage_invalidate(vsid, s_addr, hpte_slot_array,
++ 					   psize, ssize, local);
++ 		goto tm_abort;
++ 	}
++ 	/*
++ 	 * No bluk hpte removal support, invalidate each entry
++ 	 */
++ 	shift = mmu_psize_defs[psize].shift;
++ 	max_hpte_count = HPAGE_PMD_SIZE >> shift;
++ 	for (i = 0; i < max_hpte_count; i++) {
++ 		/*
++ 		 * 8 bits per each hpte entries
++ 		 * 000| [ secondary group (one bit) | hidx (3 bits) | valid bit]
++ 		 */
++ 		valid = hpte_valid(hpte_slot_array, i);
++ 		if (!valid)
++ 			continue;
++ 		hidx =  hpte_hash_index(hpte_slot_array, i);
++ 
++ 		/* get the vpn */
++ 		addr = s_addr + (i * (1ul << shift));
++ 		vpn = hpt_vpn(addr, vsid, ssize);
++ 		hash = hpt_hash(vpn, shift, ssize);
++ 		if (hidx & _PTEIDX_SECONDARY)
++ 			hash = ~hash;
++ 
++ 		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
++ 		slot += hidx & _PTEIDX_GROUP_IX;
++ 		ppc_md.hpte_invalidate(slot, vpn, psize,
++ 				       MMU_PAGE_16M, ssize, local);
++ 	}
++ tm_abort:
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ 	/* Transactions are not aborted by tlbiel, only tlbie.
++ 	 * Without, syncing a page back to a block device w/ PIO could pick up
++ 	 * transactional data (bad!) so we force an abort here.  Before the
++ 	 * sync the page will be made read-only, which will flush_hash_page.
++ 	 * BIG ISSUE here: if the kernel uses a page from userspace without
++ 	 * unmapping it first, it may see the speculated version.
++ 	 */
++ 	if (local && cpu_has_feature(CPU_FTR_TM) &&
++ 	    current->thread.regs &&
++ 	    MSR_TM_ACTIVE(current->thread.regs->msr)) {
++ 		tm_enable();
++ 		tm_abort(TM_CAUSE_TLBI);
++ 	}
++ #endif
++ }
++ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++ 
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  void flush_hash_range(unsigned long number, int local)
+  {
+  	if (ppc_md.flush_hash_range)
+diff --cc arch/powerpc/mm/hugepage-hash64.c
+index 1fb609dcc49b,86686514ae13..000000000000
+--- a/arch/powerpc/mm/hugepage-hash64.c
++++ b/arch/powerpc/mm/hugepage-hash64.c
+@@@ -18,60 -18,9 +18,60 @@@
+  #include <linux/mm.h>
+  #include <asm/machdep.h>
+  
+ +static void invalidate_old_hpte(unsigned long vsid, unsigned long addr,
+ +				pmd_t *pmdp, unsigned int psize, int ssize)
+ +{
+ +	int i, max_hpte_count, valid;
+ +	unsigned long s_addr;
+ +	unsigned char *hpte_slot_array;
+ +	unsigned long hidx, shift, vpn, hash, slot;
+ +
+ +	s_addr = addr & HPAGE_PMD_MASK;
+ +	hpte_slot_array = get_hpte_slot_array(pmdp);
+ +	/*
+ +	 * IF we try to do a HUGE PTE update after a withdraw is done.
+ +	 * we will find the below NULL. This happens when we do
+ +	 * split_huge_page_pmd
+ +	 */
+ +	if (!hpte_slot_array)
+ +		return;
+ +
+ +	if (ppc_md.hugepage_invalidate)
+ +		return ppc_md.hugepage_invalidate(vsid, s_addr, hpte_slot_array,
+ +						  psize, ssize);
+ +	/*
+ +	 * No bluk hpte removal support, invalidate each entry
+ +	 */
+ +	shift = mmu_psize_defs[psize].shift;
+ +	max_hpte_count = HPAGE_PMD_SIZE >> shift;
+ +	for (i = 0; i < max_hpte_count; i++) {
+ +		/*
+ +		 * 8 bits per each hpte entries
+ +		 * 000| [ secondary group (one bit) | hidx (3 bits) | valid bit]
+ +		 */
+ +		valid = hpte_valid(hpte_slot_array, i);
+ +		if (!valid)
+ +			continue;
+ +		hidx =  hpte_hash_index(hpte_slot_array, i);
+ +
+ +		/* get the vpn */
+ +		addr = s_addr + (i * (1ul << shift));
+ +		vpn = hpt_vpn(addr, vsid, ssize);
+ +		hash = hpt_hash(vpn, shift, ssize);
+ +		if (hidx & _PTEIDX_SECONDARY)
+ +			hash = ~hash;
+ +
+ +		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
+ +		slot += hidx & _PTEIDX_GROUP_IX;
+ +		ppc_md.hpte_invalidate(slot, vpn, psize,
+ +				       MMU_PAGE_16M, ssize, 0);
+ +	}
+ +}
+ +
+ +
+  int __hash_page_thp(unsigned long ea, unsigned long access, unsigned long vsid,
+- 		    pmd_t *pmdp, unsigned long trap, int local, int ssize,
+- 		    unsigned int psize)
++ 		    pmd_t *pmdp, unsigned long trap, unsigned long flags,
++ 		    int ssize, unsigned int psize)
+  {
+  	unsigned int index, valid;
+  	unsigned char *hpte_slot_array;
+@@@ -143,7 -94,8 +143,12 @@@
+  		 * hash page table entries.
+  		 */
+  		if ((old_pmd & _PAGE_HASHPTE) && !(old_pmd & _PAGE_COMBO))
+++<<<<<<< HEAD
+ +			invalidate_old_hpte(vsid, ea, pmdp, MMU_PAGE_64K, ssize);
+++=======
++ 			flush_hash_hugepage(vsid, ea, pmdp, MMU_PAGE_64K,
++ 					    ssize, flags);
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  	}
+  
+  	valid = hpte_valid(hpte_slot_array, index);
+diff --cc arch/powerpc/mm/pgtable_64.c
+index d2b269061e72,4fe5f64cc179..000000000000
+--- a/arch/powerpc/mm/pgtable_64.c
++++ b/arch/powerpc/mm/pgtable_64.c
+@@@ -729,70 -737,38 +729,86 @@@ void pmdp_invalidate(struct vm_area_str
+   * neesd to be flushed.
+   */
+  void hpte_do_hugepage_flush(struct mm_struct *mm, unsigned long addr,
+ -			    pmd_t *pmdp, unsigned long old_pmd)
+ +			    pmd_t *pmdp)
+  {
+++<<<<<<< HEAD
+ +	int ssize, i;
+ +	unsigned long s_addr;
+ +	int max_hpte_count;
+ +	unsigned int psize, valid;
+ +	unsigned char *hpte_slot_array;
+ +	unsigned long hidx, vpn, vsid, hash, shift, slot;
+ +
+ +	/*
+ +	 * Flush all the hptes mapping this hugepage
+ +	 */
+ +	s_addr = addr & HPAGE_PMD_MASK;
+ +	hpte_slot_array = get_hpte_slot_array(pmdp);
+ +	/*
+ +	 * IF we try to do a HUGE PTE update after a withdraw is done.
+ +	 * we will find the below NULL. This happens when we do
+ +	 * split_huge_page_pmd
+ +	 */
+ +	if (!hpte_slot_array)
+ +		return;
+++=======
++ 	int ssize;
++ 	unsigned int psize;
++ 	unsigned long vsid;
++ 	unsigned long flags = 0;
++ 	const struct cpumask *tmp;
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  
+  	/* get the base page size,vsid and segment size */
+ -#ifdef CONFIG_DEBUG_VM
+ -	psize = get_slice_psize(mm, addr);
+ -	BUG_ON(psize == MMU_PAGE_16M);
+ -#endif
+ -	if (old_pmd & _PAGE_COMBO)
+ -		psize = MMU_PAGE_4K;
+ -	else
+ -		psize = MMU_PAGE_64K;
+ -
+ -	if (!is_kernel_addr(addr)) {
+ -		ssize = user_segment_size(addr);
+ -		vsid = get_vsid(mm->context.id, addr, ssize);
+ +	psize = get_slice_psize(mm, s_addr);
+ +	if (!is_kernel_addr(s_addr)) {
+ +		ssize = user_segment_size(s_addr);
+ +		vsid = get_vsid(mm->context.id, s_addr, ssize);
+  		WARN_ON(vsid == 0);
+  	} else {
+ -		vsid = get_kernel_vsid(addr, mmu_kernel_ssize);
+ +		vsid = get_kernel_vsid(s_addr, mmu_kernel_ssize);
+  		ssize = mmu_kernel_ssize;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ppc_md.hugepage_invalidate)
+ +		return ppc_md.hugepage_invalidate(vsid, s_addr,
+ +						  hpte_slot_array,
+ +						  psize, ssize);
+ +	/*
+ +	 * No bluk hpte removal support, invalidate each entry
+ +	 */
+ +	shift = mmu_psize_defs[psize].shift;
+ +	max_hpte_count = HPAGE_PMD_SIZE >> shift;
+ +	for (i = 0; i < max_hpte_count; i++) {
+ +		/*
+ +		 * 8 bits per each hpte entries
+ +		 * 000| [ secondary group (one bit) | hidx (3 bits) | valid bit]
+ +		 */
+ +		valid = hpte_valid(hpte_slot_array, i);
+ +		if (!valid)
+ +			continue;
+ +		hidx =  hpte_hash_index(hpte_slot_array, i);
+ +
+ +		/* get the vpn */
+ +		addr = s_addr + (i * (1ul << shift));
+ +		vpn = hpt_vpn(addr, vsid, ssize);
+ +		hash = hpt_hash(vpn, shift, ssize);
+ +		if (hidx & _PTEIDX_SECONDARY)
+ +			hash = ~hash;
+ +
+ +		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
+ +		slot += hidx & _PTEIDX_GROUP_IX;
+ +		ppc_md.hpte_invalidate(slot, vpn, psize,
+ +				       MMU_PAGE_16M, ssize, 0);
+ +	}
+++=======
++ 	tmp = cpumask_of(smp_processor_id());
++ 	if (cpumask_equal(mm_cpumask(mm), tmp))
++ 		flags |= HPTE_LOCAL_UPDATE;
++ 
++ 	return flush_hash_hugepage(vsid, addr, pmdp, psize, ssize, flags);
+++>>>>>>> aefa5688c070 (powerpc/mm: don't do tlbie for updatepp request with NO HPTE fault)
+  }
+  
+  static pmd_t pmd_set_protbits(pmd_t pmd, pgprot_t pgprot)
+diff --git a/arch/powerpc/include/asm/machdep.h b/arch/powerpc/include/asm/machdep.h
+index be90e671e0f6..485eda264ac5 100644
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -42,7 +42,7 @@ struct machdep_calls {
+ 					 unsigned long newpp, 
+ 					 unsigned long vpn,
+ 					 int bpsize, int apsize,
+-					 int ssize, int local);
++					 int ssize, unsigned long flags);
+ 	void            (*hpte_updateboltedpp)(unsigned long newpp, 
+ 					       unsigned long ea,
+ 					       int psize, int ssize);
+* Unmerged path arch/powerpc/include/asm/mmu-hash64.h
+* Unmerged path arch/powerpc/include/asm/tlbflush.h
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index d587cf01fac4..0c11a8160b22 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -1622,9 +1622,11 @@ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_SLB)
+ 	 * r3 contains the faulting address
+ 	 * r4 contains the required access permissions
+ 	 * r5 contains the trap number
++	 * r6 contains dsisr
+ 	 *
+ 	 * at return r3 = 0 for success, 1 for page fault, negative for error
+ 	 */
++	ld      r6,_DSISR(r1)
+ 	bl	hash_page		/* build HPTE if possible */
+ 	cmpdi	r3,0			/* see if hash_page succeeded */
+ 
+diff --git a/arch/powerpc/mm/hash_low_64.S b/arch/powerpc/mm/hash_low_64.S
+index 057cbbb4c576..fc5ce0926204 100644
+--- a/arch/powerpc/mm/hash_low_64.S
++++ b/arch/powerpc/mm/hash_low_64.S
+@@ -46,7 +46,8 @@
+ 
+ /*
+  * _hash_page_4K(unsigned long ea, unsigned long access, unsigned long vsid,
+- *		 pte_t *ptep, unsigned long trap, int local, int ssize)
++ *		 pte_t *ptep, unsigned long trap, unsigned long flags,
++ *		 int ssize)
+  *
+  * Adds a 4K page to the hash table in a segment of 4K pages only
+  */
+@@ -298,7 +299,7 @@ htab_modify_pte:
+ 	li	r6,MMU_PAGE_4K		/* base page size */
+ 	li	r7,MMU_PAGE_4K		/* actual page size */
+ 	ld	r8,STK_PARAM(R9)(r1)	/* segment size */
+-	ld	r9,STK_PARAM(R8)(r1)	/* get "local" param */
++	ld	r9,STK_PARAM(R8)(r1)	/* get "flags" param */
+ .globl htab_call_hpte_updatepp
+ htab_call_hpte_updatepp:
+ 	bl	.			/* Patched by htab_finish_init() */
+@@ -338,8 +339,8 @@ htab_pte_insert_failure:
+  *****************************************************************************/
+ 
+ /* _hash_page_4K(unsigned long ea, unsigned long access, unsigned long vsid,
+- *		 pte_t *ptep, unsigned long trap, int local, int ssize,
+- *		 int subpg_prot)
++ *		 pte_t *ptep, unsigned long trap, unsigned local flags,
++ *		 int ssize, int subpg_prot)
+  */
+ 
+ /*
+@@ -594,7 +595,7 @@ htab_inval_old_hpte:
+ 	li	r5,0			/* PTE.hidx */
+ 	li	r6,MMU_PAGE_64K		/* psize */
+ 	ld	r7,STK_PARAM(R9)(r1)	/* ssize */
+-	ld	r8,STK_PARAM(R8)(r1)	/* local */
++	ld	r8,STK_PARAM(R8)(r1)	/* flags */
+ 	bl	flush_hash_page
+ 	/* Clear out _PAGE_HPTE_SUB bits in the new linux PTE */
+ 	lis	r0,_PAGE_HPTE_SUB@h
+@@ -666,7 +667,7 @@ htab_modify_pte:
+ 	li	r6,MMU_PAGE_4K		/* base page size */
+ 	li	r7,MMU_PAGE_4K		/* actual page size */
+ 	ld	r8,STK_PARAM(R9)(r1)	/* segment size */
+-	ld	r9,STK_PARAM(R8)(r1)	/* get "local" param */
++	ld	r9,STK_PARAM(R8)(r1)	/* get "flags" param */
+ .globl htab_call_hpte_updatepp
+ htab_call_hpte_updatepp:
+ 	bl	.			/* patched by htab_finish_init() */
+@@ -962,7 +963,7 @@ ht64_modify_pte:
+ 	li	r6,MMU_PAGE_64K		/* base page size */
+ 	li	r7,MMU_PAGE_64K		/* actual page size */
+ 	ld	r8,STK_PARAM(R9)(r1)	/* segment size */
+-	ld	r9,STK_PARAM(R8)(r1)	/* get "local" param */
++	ld	r9,STK_PARAM(R8)(r1)	/* get "flags" param */
+ .globl ht64_call_hpte_updatepp
+ ht64_call_hpte_updatepp:
+ 	bl	.			/* patched by htab_finish_init() */
+* Unmerged path arch/powerpc/mm/hash_native_64.c
+* Unmerged path arch/powerpc/mm/hash_utils_64.c
+* Unmerged path arch/powerpc/mm/hugepage-hash64.c
+diff --git a/arch/powerpc/mm/hugetlbpage-hash64.c b/arch/powerpc/mm/hugetlbpage-hash64.c
+index a5bcf9301196..d94b1af53a93 100644
+--- a/arch/powerpc/mm/hugetlbpage-hash64.c
++++ b/arch/powerpc/mm/hugetlbpage-hash64.c
+@@ -19,8 +19,8 @@ extern long hpte_insert_repeating(unsigned long hash, unsigned long vpn,
+ 				  unsigned long vflags, int psize, int ssize);
+ 
+ int __hash_page_huge(unsigned long ea, unsigned long access, unsigned long vsid,
+-		     pte_t *ptep, unsigned long trap, int local, int ssize,
+-		     unsigned int shift, unsigned int mmu_psize)
++		     pte_t *ptep, unsigned long trap, unsigned long flags,
++		     int ssize, unsigned int shift, unsigned int mmu_psize)
+ {
+ 	unsigned long vpn;
+ 	unsigned long old_pte, new_pte;
+@@ -81,7 +81,7 @@ int __hash_page_huge(unsigned long ea, unsigned long access, unsigned long vsid,
+ 		slot += (old_pte & _PAGE_F_GIX) >> 12;
+ 
+ 		if (ppc_md.hpte_updatepp(slot, rflags, vpn, mmu_psize,
+-					 mmu_psize, ssize, local) == -1)
++					 mmu_psize, ssize, flags) == -1)
+ 			old_pte &= ~_PAGE_HPTEFLAGS;
+ 	}
+ 
+* Unmerged path arch/powerpc/mm/pgtable_64.c
+diff --git a/arch/powerpc/platforms/cell/beat_htab.c b/arch/powerpc/platforms/cell/beat_htab.c
+index d4d245c0d787..bee9232fe619 100644
+--- a/arch/powerpc/platforms/cell/beat_htab.c
++++ b/arch/powerpc/platforms/cell/beat_htab.c
+@@ -186,7 +186,7 @@ static long beat_lpar_hpte_updatepp(unsigned long slot,
+ 				    unsigned long newpp,
+ 				    unsigned long vpn,
+ 				    int psize, int apsize,
+-				    int ssize, int local)
++				    int ssize, unsigned long flags)
+ {
+ 	unsigned long lpar_rc;
+ 	u64 dummy0, dummy1;
+@@ -369,7 +369,7 @@ static long beat_lpar_hpte_updatepp_v3(unsigned long slot,
+ 				       unsigned long newpp,
+ 				       unsigned long vpn,
+ 				       int psize, int apsize,
+-				       int ssize, int local)
++				       int ssize, unsigned long flags)
+ {
+ 	unsigned long lpar_rc;
+ 	unsigned long want_v;
+diff --git a/arch/powerpc/platforms/cell/spu_base.c b/arch/powerpc/platforms/cell/spu_base.c
+index 3af1e7f8cb26..626f5359a38e 100644
+--- a/arch/powerpc/platforms/cell/spu_base.c
++++ b/arch/powerpc/platforms/cell/spu_base.c
+@@ -181,7 +181,8 @@ static int __spu_trap_data_seg(struct spu *spu, unsigned long ea)
+ 	return 0;
+ }
+ 
+-extern int hash_page(unsigned long ea, unsigned long access, unsigned long trap); //XXX
++extern int hash_page(unsigned long ea, unsigned long access,
++		     unsigned long trap, unsigned long dsisr); //XXX
+ static int __spu_trap_data_map(struct spu *spu, unsigned long ea, u64 dsisr)
+ {
+ 	int ret;
+@@ -196,7 +197,7 @@ static int __spu_trap_data_map(struct spu *spu, unsigned long ea, u64 dsisr)
+ 	    (REGION_ID(ea) != USER_REGION_ID)) {
+ 
+ 		spin_unlock(&spu->register_lock);
+-		ret = hash_page(ea, _PAGE_PRESENT, 0x300);
++		ret = hash_page(ea, _PAGE_PRESENT, 0x300, dsisr);
+ 		spin_lock(&spu->register_lock);
+ 
+ 		if (!ret) {
+diff --git a/arch/powerpc/platforms/cell/spufs/fault.c b/arch/powerpc/platforms/cell/spufs/fault.c
+index e45894a08118..d98f845ac777 100644
+--- a/arch/powerpc/platforms/cell/spufs/fault.c
++++ b/arch/powerpc/platforms/cell/spufs/fault.c
+@@ -144,7 +144,7 @@ int spufs_handle_class1(struct spu_context *ctx)
+ 	access = (_PAGE_PRESENT | _PAGE_USER);
+ 	access |= (dsisr & MFC_DSISR_ACCESS_PUT) ? _PAGE_RW : 0UL;
+ 	local_irq_save(flags);
+-	ret = hash_page(ea, access, 0x300);
++	ret = hash_page(ea, access, 0x300, dsisr);
+ 	local_irq_restore(flags);
+ 
+ 	/* hashing failed, so try the actual fault handler */
+diff --git a/arch/powerpc/platforms/ps3/htab.c b/arch/powerpc/platforms/ps3/htab.c
+index 3e270e3412ae..2f95d33cf34a 100644
+--- a/arch/powerpc/platforms/ps3/htab.c
++++ b/arch/powerpc/platforms/ps3/htab.c
+@@ -110,7 +110,7 @@ static long ps3_hpte_remove(unsigned long hpte_group)
+ 
+ static long ps3_hpte_updatepp(unsigned long slot, unsigned long newpp,
+ 			      unsigned long vpn, int psize, int apsize,
+-			      int ssize, int local)
++			      int ssize, unsigned long inv_flags)
+ {
+ 	int result;
+ 	u64 hpte_v, want_v, hpte_rs;
+diff --git a/arch/powerpc/platforms/pseries/lpar.c b/arch/powerpc/platforms/pseries/lpar.c
+index faa7f93698fd..eb1c530e37aa 100644
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@ -291,7 +291,7 @@ static long pSeries_lpar_hpte_updatepp(unsigned long slot,
+ 				       unsigned long newpp,
+ 				       unsigned long vpn,
+ 				       int psize, int apsize,
+-				       int ssize, int local)
++				       int ssize, unsigned long inv_flags)
+ {
+ 	unsigned long lpar_rc;
+ 	unsigned long flags = (newpp & 7) | H_AVPN;
+diff --git a/drivers/misc/cxl/fault.c b/drivers/misc/cxl/fault.c
+index c99e896604ee..f8684bca2d79 100644
+--- a/drivers/misc/cxl/fault.c
++++ b/drivers/misc/cxl/fault.c
+@@ -133,7 +133,7 @@ static void cxl_handle_page_fault(struct cxl_context *ctx,
+ {
+ 	unsigned flt = 0;
+ 	int result;
+-	unsigned long access, flags;
++	unsigned long access, flags, inv_flags = 0;
+ 
+ 	if ((result = copro_handle_mm_fault(mm, dar, dsisr, &flt))) {
+ 		pr_devel("copro_handle_mm_fault failed: %#x\n", result);
+@@ -149,8 +149,12 @@ static void cxl_handle_page_fault(struct cxl_context *ctx,
+ 		access |= _PAGE_RW;
+ 	if ((!ctx->kernel) || ~(dar & (1ULL << 63)))
+ 		access |= _PAGE_USER;
++
++	if (dsisr & DSISR_NOHPTE)
++		inv_flags |= HPTE_NOHPTE_UPDATE;
++
+ 	local_irq_save(flags);
+-	hash_page_mm(mm, dar, access, 0x300);
++	hash_page_mm(mm, dar, access, 0x300, inv_flags);
+ 	local_irq_restore(flags);
+ 
+ 	pr_devel("Page fault successfully handled for pe: %i!\n", ctx->pe);
