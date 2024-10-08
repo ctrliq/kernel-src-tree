@@ -1,0 +1,127 @@
+powerpc/eeh: Block PCI config access upon frozen PE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Block PCI config access upon frozen PE (Laurent Vivier) [1213675]
+Rebuild_FUZZ: 91.49%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit b6541db1395298b326ae1bf59fae6fbb2c6e8f77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b6541db1.failed
+
+The problem was found when I tried to inject PCI config error by
+PHB3 PAPR error injection registers into Broadcom Austin 4-ports
+NIC adapter. The frozen PE was reported successfully and EEH core
+started to recover it. However, I run into fenced PHB when dumping
+PCI config space as EEH logs. I was told that PCI config requests
+should not be progagated to the adapter until PE reset is done
+successfully. Otherise, we would run out of PHB internal credits
+and trigger PCT (PCIE Completion Timeout), which leads to the
+fenced PHB.
+
+The patch introduces another PE flag EEH_PE_CFG_RESTRICTED, which
+is set during PE initialization time if the PE includes the specific
+PCI devices that need block PCI config access until PE reset is done.
+When the PE becomes frozen for the first time, EEH_PE_CFG_BLOCKED is
+set if the PE has flag EEH_PE_CFG_RESTRICTED. Then the PCI config
+access to the PE will be dropped by platform PCI accessors until
+PE reset is done successfully. The mechanism is shared by PowerNV
+platform owned PE or userland owned ones. It's not used on pSeries
+platform yet.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit b6541db1395298b326ae1bf59fae6fbb2c6e8f77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-powernv.c
+diff --cc arch/powerpc/platforms/powernv/eeh-powernv.c
+index d9afbdd8c6cc,443ce965a5b0..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@@ -143,7 -161,40 +143,44 @@@ static int powernv_eeh_dev_probe(struc
+  	edev->pe_config_addr	= phb->bdfn_to_pe(phb, dev->bus, dev->devfn & 0xff);
+  
+  	/* Create PE */
+++<<<<<<< HEAD
+ +	eeh_add_to_parent_pe(edev);
+++=======
++ 	ret = eeh_add_to_parent_pe(edev);
++ 	if (ret) {
++ 		pr_warn("%s: Can't add PCI dev %s to parent PE (%d)\n",
++ 			__func__, pci_name(dev), ret);
++ 		return ret;
++ 	}
++ 
++ 	/*
++ 	 * If the PE contains any one of following adapters, the
++ 	 * PCI config space can't be accessed when dumping EEH log.
++ 	 * Otherwise, we will run into fenced PHB caused by shortage
++ 	 * of outbound credits in the adapter. The PCI config access
++ 	 * should be blocked until PE reset. MMIO access is dropped
++ 	 * by hardware certainly. In order to drop PCI config requests,
++ 	 * one more flag (EEH_PE_CFG_RESTRICTED) is introduced, which
++ 	 * will be checked in the backend for PE state retrival. If
++ 	 * the PE becomes frozen for the first time and the flag has
++ 	 * been set for the PE, we will set EEH_PE_CFG_BLOCKED for
++ 	 * that PE to block its config space.
++ 	 *
++ 	 * Broadcom Austin 4-ports NICs (14e4:1657)
++ 	 */
++ 	if (dev->vendor == PCI_VENDOR_ID_BROADCOM &&
++ 	    dev->device == 0x1657)
++ 		edev->pe->state |= EEH_PE_CFG_RESTRICTED;
++ 
++ 	/*
++ 	 * Cache the PE primary bus, which can't be fetched when
++ 	 * full hotplug is in progress. In that case, all child
++ 	 * PCI devices of the PE are expected to be removed prior
++ 	 * to PE reset.
++ 	 */
++ 	if (!edev->pe->bus)
++ 		edev->pe->bus = dev->bus;
+++>>>>>>> b6541db13952 (powerpc/eeh: Block PCI config access upon frozen PE)
+  
+  	/*
+  	 * Enable EEH explicitly so that we will do EEH check
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 52bd2259c082..a9ec16bdc335 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -75,6 +75,7 @@ struct device_node;
+ #define EEH_PE_RESET		(1 << 2)	/* PE reset in progress	*/
+ 
+ #define EEH_PE_KEEP		(1 << 8)	/* Keep PE on hotplug	*/
++#define EEH_PE_CFG_RESTRICTED	(1 << 9)	/* Block config on error */
+ 
+ struct eeh_pe {
+ 	int type;			/* PE type: PHB/Bus/Device	*/
+diff --git a/arch/powerpc/kernel/eeh_pe.c b/arch/powerpc/kernel/eeh_pe.c
+index 66d3a4ade05e..0f255abaf69e 100644
+--- a/arch/powerpc/kernel/eeh_pe.c
++++ b/arch/powerpc/kernel/eeh_pe.c
+@@ -520,6 +520,10 @@ static void *__eeh_pe_state_mark(void *data, void *flag)
+ 			pdev->error_state = pci_channel_io_frozen;
+ 	}
+ 
++	/* Block PCI config access if required */
++	if (pe->state & EEH_PE_CFG_RESTRICTED)
++		pe->state |= EEH_PE_CFG_BLOCKED;
++
+ 	return NULL;
+ }
+ 
+@@ -597,6 +601,10 @@ static void *__eeh_pe_state_clear(void *data, void *flag)
+ 		pdev->error_state = pci_channel_io_normal;
+ 	}
+ 
++	/* Unblock PCI config access if required */
++	if (pe->state & EEH_PE_CFG_RESTRICTED)
++		pe->state &= ~EEH_PE_CFG_BLOCKED;
++
+ 	return NULL;
+ }
+ 
+* Unmerged path arch/powerpc/platforms/powernv/eeh-powernv.c
