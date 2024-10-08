@@ -5752,6 +5752,7 @@ static int btrfs_mknod(struct inode *dir, struct dentry *dentry,
 	}
 out_unlock:
 	btrfs_end_transaction(trans, root);
+	btrfs_balance_delayed_items(root);
 	btrfs_btree_balance_dirty(root);
 	if (drop_inode) {
 		inode_dec_link_count(inode);
@@ -5825,6 +5826,7 @@ out_unlock:
 		inode_dec_link_count(inode);
 		iput(inode);
 	}
+	btrfs_balance_delayed_items(root);
 	btrfs_btree_balance_dirty(root);
 	return err;
 }
@@ -5883,6 +5885,7 @@ static int btrfs_link(struct dentry *old_dentry, struct inode *dir,
 	}
 
 	btrfs_end_transaction(trans, root);
+	btrfs_balance_delayed_items(root);
 fail:
 	if (drop_inode) {
 		inode_dec_link_count(inode);
@@ -5949,6 +5952,7 @@ out_fail:
 	btrfs_end_transaction(trans, root);
 	if (drop_on_err)
 		iput(inode);
+	btrfs_balance_delayed_items(root);
 	btrfs_btree_balance_dirty(root);
 	return err;
 }
