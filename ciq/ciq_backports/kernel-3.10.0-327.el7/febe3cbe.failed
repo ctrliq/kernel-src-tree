@@ -1,0 +1,284 @@
+xfs: bulkstat error handling is broken
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit febe3cbe38b0bc0a925906dc90e8d59048851f87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/febe3cbe.failed
+
+The error propagation is a horror - xfs_bulkstat() returns
+a rval variable which is only set if there are formatter errors. Any
+sort of btree walk error or corruption will cause the bulkstat walk
+to terminate but will not pass an error back to userspace. Worse
+is the fact that formatter errors will also be ignored if any inodes
+were correctly formatted into the user buffer.
+
+Hence bulkstat can fail badly yet still report success to userspace.
+This causes significant issues with xfsdump not dumping everything
+in the filesystem yet reporting success. It's not until a restore
+fails that there is any indication that the dump was bad and tha
+bulkstat failed. This patch now triggers xfsdump to fail with
+bulkstat errors rather than silently missing files in the dump.
+
+This now causes bulkstat to fail when the lastino cookie does not
+fall inside an existing inode chunk. The pre-3.17 code tolerated
+that error by allowing the code to move to the next inode chunk
+as the agino target is guaranteed to fall into the next btree
+record.
+
+With the fixes up to this point in the series, xfsdump now passes on
+the troublesome filesystem image that exposes all these bugs.
+
+cc: <stable@vger.kernel.org>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit febe3cbe38b0bc0a925906dc90e8d59048851f87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_itable.c
+diff --cc fs/xfs/xfs_itable.c
+index 00889cf40587,ff3f431671b9..000000000000
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@@ -279,28 -349,14 +281,31 @@@ xfs_bulkstat
+  	xfs_agi_t		*agi;	/* agi header data */
+  	xfs_agino_t		agino;	/* inode # in allocation group */
+  	xfs_agnumber_t		agno;	/* allocation group number */
+ +	int			chunkidx; /* current index into inode chunk */
+ +	int			clustidx; /* current index into inode cluster */
+  	xfs_btree_cur_t		*cur;	/* btree cursor for ialloc btree */
+ +	int			end_of_ag; /* set if we've seen the ag end */
+ +	int			error;	/* error code */
+ +	int                     fmterror;/* bulkstat formatter result */
+ +	int			i;	/* loop index */
+ +	int			icount;	/* count of inodes good in irbuf */
+  	size_t			irbsize; /* size of irec buffer in bytes */
+ +	xfs_ino_t		ino;	/* inode number (filesystem) */
+ +	xfs_inobt_rec_incore_t	*irbp;	/* current irec buffer pointer */
+  	xfs_inobt_rec_incore_t	*irbuf;	/* start of irec buffer */
+ +	xfs_inobt_rec_incore_t	*irbufend; /* end of good irec buffer entries */
+  	xfs_ino_t		lastino; /* last inode number returned */
+  	int			nirbuf;	/* size of irbuf */
+++<<<<<<< HEAD
+ +	int			rval;	/* return value error code */
+ +	int			tmp;	/* result value from btree calls */
+++=======
+++>>>>>>> febe3cbe38b0 (xfs: bulkstat error handling is broken)
+  	int			ubcount; /* size of user's buffer */
+ -	struct xfs_bulkstat_agichunk ac;
+ -	int			error = 0;
+ +	int			ubleft;	/* bytes left in user's buffer */
+ +	char			__user *ubufp;	/* pointer into user's buffer */
+ +	int			ubelem;	/* spaces used in user's buffer */
+ +	int			ubused;	/* bytes used by formatter */
+  
+  	/*
+  	 * Get the last inode value, see if there's nothing to do.
+@@@ -334,9 -389,13 +339,19 @@@
+  	 * Loop over the allocation groups, starting from the last
+  	 * inode returned; 0 means start of the allocation group.
+  	 */
+++<<<<<<< HEAD
+ +	rval = 0;
+ +	while (XFS_BULKSTAT_UBLEFT(ubleft) && agno < mp->m_sb.sb_agcount) {
+ +		cond_resched();
+++=======
++ 	while (agno < mp->m_sb.sb_agcount) {
++ 		struct xfs_inobt_rec_incore	*irbp = irbuf;
++ 		struct xfs_inobt_rec_incore	*irbufend = irbuf + nirbuf;
++ 		bool				end_of_ag = false;
++ 		int				icount = 0;
++ 		int				stat;
++ 
+++>>>>>>> febe3cbe38b0 (xfs: bulkstat error handling is broken)
+  		error = xfs_ialloc_read_agi(mp, NULL, agno, &agbp);
+  		if (error)
+  			break;
+@@@ -428,83 -485,46 +443,122 @@@ del_cursor
+  		 */
+  		irbufend = irbp;
+  		for (irbp = irbuf;
+++<<<<<<< HEAD
+ +		     irbp < irbufend && XFS_BULKSTAT_UBLEFT(ubleft); irbp++) {
+ +			/*
+ +			 * Now process this chunk of inodes.
+ +			 */
+ +			for (agino = irbp->ir_startino, chunkidx = clustidx = 0;
+ +			     XFS_BULKSTAT_UBLEFT(ubleft) &&
+ +				irbp->ir_freecount < XFS_INODES_PER_CHUNK;
+ +			     chunkidx++, clustidx++, agino++) {
+ +				ASSERT(chunkidx < XFS_INODES_PER_CHUNK);
+ +
+ +				ino = XFS_AGINO_TO_INO(mp, agno, agino);
+ +				/*
+ +				 * Skip if this inode is free.
+ +				 */
+ +				if (XFS_INOBT_MASK(chunkidx) & irbp->ir_free) {
+ +					lastino = ino;
+ +					continue;
+ +				}
+ +				/*
+ +				 * Count used inodes as free so we can tell
+ +				 * when the chunk is used up.
+ +				 */
+ +				irbp->ir_freecount++;
+ +
+ +				/*
+ +				 * Get the inode and fill in a single buffer.
+ +				 */
+ +				ubused = statstruct_size;
+ +				error = formatter(mp, ino, ubufp, ubleft,
+ +						  &ubused, &fmterror);
+ +				if (fmterror == BULKSTAT_RV_NOTHING) {
+ +					if (error && error != ENOENT &&
+ +						error != EINVAL) {
+ +						ubleft = 0;
+ +						rval = error;
+ +						break;
+ +					}
+ +					lastino = ino;
+ +					continue;
+ +				}
+ +				if (fmterror == BULKSTAT_RV_GIVEUP) {
+ +					ubleft = 0;
+ +					ASSERT(error);
+ +					rval = error;
+ +					break;
+ +				}
+ +				if (ubufp)
+ +					ubufp += ubused;
+ +				ubleft -= ubused;
+ +				ubelem++;
+ +				lastino = ino;
+ +			}
+ +
+ +			cond_resched();
+ +		}
+ +		/*
+ +		 * Set up for the next loop iteration.
+ +		 */
+ +		if (XFS_BULKSTAT_UBLEFT(ubleft)) {
+ +			if (end_of_ag) {
+ +				agno++;
+ +				agino = 0;
+ +			} else
+ +				agino = XFS_INO_TO_AGINO(mp, lastino);
+++=======
++ 		     irbp < irbufend && ac.ac_ubleft >= statstruct_size;
++ 		     irbp++) {
++ 			error = xfs_bulkstat_ag_ichunk(mp, agno, irbp,
++ 					formatter, statstruct_size, &ac,
++ 					&lastino);
++ 			if (error)
++ 				break;
++ 
++ 			cond_resched();
++ 		}
++ 
++ 		/*
++ 		 * If we've run out of space or had a formatting error, we
++ 		 * are now done
++ 		 */
++ 		if (ac.ac_ubleft < statstruct_size || error)
++ 			break;
++ 
++ 		if (end_of_ag) {
++ 			agno++;
++ 			agino = 0;
+++>>>>>>> febe3cbe38b0 (xfs: bulkstat error handling is broken)
+  		} else
+ -			agino = XFS_INO_TO_AGINO(mp, lastino);
+ +			break;
+  	}
+  	/*
+  	 * Done, we're either out of filesystem or space to put the data.
+  	 */
+  	kmem_free(irbuf);
+++<<<<<<< HEAD
+ +	*ubcountp = ubelem;
+++=======
++ 	*ubcountp = ac.ac_ubelem;
++ 
+++>>>>>>> febe3cbe38b0 (xfs: bulkstat error handling is broken)
+  	/*
+- 	 * Found some inodes, return them now and return the error next time.
++ 	 * We found some inodes, so clear the error status and return them.
++ 	 * The lastino pointer will point directly at the inode that triggered
++ 	 * any error that occurred, so on the next call the error will be
++ 	 * triggered again and propagated to userspace as there will be no
++ 	 * formatted inodes in the buffer.
+  	 */
+++<<<<<<< HEAD
+ +	if (ubelem)
+ +		rval = 0;
+++=======
++ 	if (ac.ac_ubelem)
++ 		error = 0;
++ 
+++>>>>>>> febe3cbe38b0 (xfs: bulkstat error handling is broken)
+  	if (agno >= mp->m_sb.sb_agcount) {
+  		/*
+  		 * If we ran out of filesystem, mark lastino as off
+@@@ -516,57 -536,9 +570,57 @@@
+  	} else
+  		*lastinop = (xfs_ino_t)lastino;
+  
+- 	return rval;
++ 	return error;
+  }
+  
+ +/*
+ + * Return stat information in bulk (by-inode) for the filesystem.
+ + * Special case for non-sequential one inode bulkstat.
+ + */
+ +int					/* error status */
+ +xfs_bulkstat_single(
+ +	xfs_mount_t		*mp,	/* mount point for filesystem */
+ +	xfs_ino_t		*lastinop, /* inode to return */
+ +	char			__user *buffer, /* buffer with inode stats */
+ +	int			*done)	/* 1 if there are more stats to get */
+ +{
+ +	int			count;	/* count value for bulkstat call */
+ +	int			error;	/* return value */
+ +	xfs_ino_t		ino;	/* filesystem inode number */
+ +	int			res;	/* result from bs1 */
+ +
+ +	/*
+ +	 * note that requesting valid inode numbers which are not allocated
+ +	 * to inodes will most likely cause xfs_imap_to_bp to generate warning
+ +	 * messages about bad magic numbers. This is ok. The fact that
+ +	 * the inode isn't actually an inode is handled by the
+ +	 * error check below. Done this way to make the usual case faster
+ +	 * at the expense of the error case.
+ +	 */
+ +
+ +	ino = *lastinop;
+ +	error = xfs_bulkstat_one(mp, ino, buffer, sizeof(xfs_bstat_t),
+ +				 NULL, &res);
+ +	if (error) {
+ +		/*
+ +		 * Special case way failed, do it the "long" way
+ +		 * to see if that works.
+ +		 */
+ +		(*lastinop)--;
+ +		count = 1;
+ +		if (xfs_bulkstat(mp, lastinop, &count, xfs_bulkstat_one,
+ +				sizeof(xfs_bstat_t), buffer, done))
+ +			return error;
+ +		if (count == 0 || (xfs_ino_t)*lastinop != ino)
+ +			return error == EFSCORRUPTED ?
+ +				XFS_ERROR(EINVAL) : error;
+ +		else
+ +			return 0;
+ +	}
+ +	*done = 0;
+ +	return 0;
+ +}
+ +
+  int
+  xfs_inumbers_fmt(
+  	void			__user *ubuffer, /* buffer to write to */
+* Unmerged path fs/xfs/xfs_itable.c
