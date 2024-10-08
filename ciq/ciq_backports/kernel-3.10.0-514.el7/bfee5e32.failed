@@ -1,0 +1,233 @@
+IB/rdmavt, staging/rdma/hfi1: use qps to dynamically scale timeout value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] ib/rdmavt, rdma/hfi1: use qps to dynamically scale timeout value (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 94.12%
+commit-author Vennila Megavannan <vennila.megavannan@intel.com>
+commit bfee5e32e701b98634b380a9eef8b5820feb7488
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bfee5e32.failed
+
+A busy_jiffies variable is maintained and updated when rc qps are
+created and deleted. busy_jiffies is a scaled value of the number
+of rc qps in the device. busy_jiffies is incremented every rc qp
+scaling interval. busy_jiffies is added to the rc timeout
+in add_retry_timer and mod_retry_timer. The rc qp scaling interval
+is selected based on extensive performance evaluation of targeted
+workloads.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Vennila Megavannan <vennila.megavannan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit bfee5e32e701b98634b380a9eef8b5820feb7488)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/rc.c
+diff --cc drivers/staging/hfi1/rc.c
+index dd57d65aa9b2,a4a44d33d857..000000000000
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@@ -58,9 -60,128 +58,134 @@@
+  /* cut down ridiculously long IB macro names */
+  #define OP(x) IB_OPCODE_RC_##x
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +static void rc_timeout(unsigned long arg);
+ +
+ +static u32 restart_sge(struct hfi1_sge_state *ss, struct hfi1_swqe *wqe,
+++=======
++ /**
++  * hfi1_add_retry_timer - add/start a retry timer
++  * @qp - the QP
++  *
++  * add a retry timer on the QP
++  */
++ static inline void hfi1_add_retry_timer(struct rvt_qp *qp)
++ {
++ 	struct ib_qp *ibqp = &qp->ibqp;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(ibqp->device);
++ 
++ 	qp->s_flags |= RVT_S_TIMER;
++ 	/* 4.096 usec. * (1 << qp->timeout) */
++ 	qp->s_timer.expires = jiffies + qp->timeout_jiffies +
++ 			      rdi->busy_jiffies;
++ 	add_timer(&qp->s_timer);
++ }
++ 
++ /**
++  * hfi1_add_rnr_timer - add/start an rnr timer
++  * @qp - the QP
++  * @to - timeout in usecs
++  *
++  * add an rnr timer on the QP
++  */
++ void hfi1_add_rnr_timer(struct rvt_qp *qp, u32 to)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	qp->s_flags |= RVT_S_WAIT_RNR;
++ 	qp->s_timer.expires = jiffies + usecs_to_jiffies(to);
++ 	add_timer(&priv->s_rnr_timer);
++ }
++ 
++ /**
++  * hfi1_mod_retry_timer - mod a retry timer
++  * @qp - the QP
++  *
++  * Modify a potentially already running retry
++  * timer
++  */
++ static inline void hfi1_mod_retry_timer(struct rvt_qp *qp)
++ {
++ 	struct ib_qp *ibqp = &qp->ibqp;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(ibqp->device);
++ 
++ 	qp->s_flags |= RVT_S_TIMER;
++ 	/* 4.096 usec. * (1 << qp->timeout) */
++ 	mod_timer(&qp->s_timer, jiffies + qp->timeout_jiffies +
++ 		  rdi->busy_jiffies);
++ }
++ 
++ /**
++  * hfi1_stop_retry_timer - stop a retry timer
++  * @qp - the QP
++  *
++  * stop a retry timer and return if the timer
++  * had been pending.
++  */
++ static inline int hfi1_stop_retry_timer(struct rvt_qp *qp)
++ {
++ 	int rval = 0;
++ 
++ 	/* Remove QP from retry */
++ 	if (qp->s_flags & RVT_S_TIMER) {
++ 		qp->s_flags &= ~RVT_S_TIMER;
++ 		rval = del_timer(&qp->s_timer);
++ 	}
++ 	return rval;
++ }
++ 
++ /**
++  * hfi1_stop_rc_timers - stop all timers
++  * @qp - the QP
++  *
++  * stop any pending timers
++  */
++ void hfi1_stop_rc_timers(struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	/* Remove QP from all timers */
++ 	if (qp->s_flags & (RVT_S_TIMER | RVT_S_WAIT_RNR)) {
++ 		qp->s_flags &= ~(RVT_S_TIMER | RVT_S_WAIT_RNR);
++ 		del_timer(&qp->s_timer);
++ 		del_timer(&priv->s_rnr_timer);
++ 	}
++ }
++ 
++ /**
++  * hfi1_stop_rnr_timer - stop an rnr timer
++  * @qp - the QP
++  *
++  * stop an rnr timer and return if the timer
++  * had been pending.
++  */
++ static inline int hfi1_stop_rnr_timer(struct rvt_qp *qp)
++ {
++ 	int rval = 0;
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	/* Remove QP from rnr timer */
++ 	if (qp->s_flags & RVT_S_WAIT_RNR) {
++ 		qp->s_flags &= ~RVT_S_WAIT_RNR;
++ 		rval = del_timer(&priv->s_rnr_timer);
++ 	}
++ 	return rval;
++ }
++ 
++ /**
++  * hfi1_del_timers_sync - wait for any timeout routines to exit
++  * @qp - the QP
++  */
++ void hfi1_del_timers_sync(struct rvt_qp *qp)
++ {
++ 	struct hfi1_qp_priv *priv = qp->priv;
++ 
++ 	del_timer_sync(&qp->s_timer);
++ 	del_timer_sync(&priv->s_rnr_timer);
++ }
++ 
++ static u32 restart_sge(struct rvt_sge_state *ss, struct rvt_swqe *wqe,
+++>>>>>>> bfee5e32e701 (IB/rdmavt, staging/rdma/hfi1: use qps to dynamically scale timeout value):drivers/staging/rdma/hfi1/rc.c
+  		       u32 psn, u32 pmtu)
+  {
+  	u32 len;
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index e8d0da89ea8e..52faa694537c 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -686,6 +686,19 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 	}
+ 
+ 	rdi->n_qps_allocated++;
++	/*
++	 * Maintain a busy_jiffies variable that will be added to the timeout
++	 * period in mod_retry_timer and add_retry_timer. This busy jiffies
++	 * is scaled by the number of rc qps created for the device to reduce
++	 * the number of timeouts occurring when there is a large number of
++	 * qps. busy_jiffies is incremented every rc qp scaling interval.
++	 * The scaling interval is selected based on extensive performance
++	 * evaluation of targeted workloads.
++	 */
++	if (init_attr->qp_type == IB_QPT_RC) {
++		rdi->n_rc_qps++;
++		rdi->busy_jiffies = rdi->n_rc_qps / RC_QP_SCALING_INTERVAL;
++	}
+ 	spin_unlock(&rdi->n_qps_lock);
+ 
+ 	if (qp->ip) {
+@@ -1231,6 +1244,10 @@ int rvt_destroy_qp(struct ib_qp *ibqp)
+ 
+ 	spin_lock(&rdi->n_qps_lock);
+ 	rdi->n_qps_allocated--;
++	if (qp->ibqp.qp_type == IB_QPT_RC) {
++		rdi->n_rc_qps--;
++		rdi->busy_jiffies = rdi->n_rc_qps / RC_QP_SCALING_INTERVAL;
++	}
+ 	spin_unlock(&rdi->n_qps_lock);
+ 
+ 	if (qp->ip)
+* Unmerged path drivers/staging/hfi1/rc.c
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index 4242fea9cf4e..5ccf683b28f1 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -318,7 +318,9 @@ struct rvt_dev_info {
+ 	/* QP */
+ 	struct rvt_qp_ibdev *qp_dev;
+ 	u32 n_qps_allocated;    /* number of QPs allocated for device */
+-	spinlock_t n_qps_lock; /* keep track of number of qps */
++	u32 n_rc_qps;		/* number of RC QPs allocated for device */
++	u32 busy_jiffies;	/* timeout scaling based on RC QP count */
++	spinlock_t n_qps_lock;	/* protect qps, rc qps and busy jiffy counts */
+ 
+ 	/* memory maps */
+ 	struct list_head pending_mmaps;
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index aed13e13591c..b3ea74579316 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -225,6 +225,8 @@ struct rvt_ack_entry {
+ 	};
+ };
+ 
++#define	RC_QP_SCALING_INTERVAL	5
++
+ /*
+  * Variables prefixed with s_ are for the requester (sender).
+  * Variables prefixed with r_ are for the responder (receiver).
