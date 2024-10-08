@@ -1,0 +1,136 @@
+powerpc/eeh: Fix missed PE#0 on P7IOC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Fix missed PE#0 on P7IOC (Laurent Vivier) [1213675]
+Rebuild_FUZZ: 87.88%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 2aa5cf9e48f2f39cc255f8e29964df3ff9ca017b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2aa5cf9e.failed
+
+PE#0 should be regarded as valid for P7IOC, while it's invalid for
+PHB3. The patch adds flag EEH_VALID_PE_ZERO to differentiate those
+two cases. Without the patch, we possibly see frozen PE#0 state is
+cleared without EEH recovery taken on P7IOC as following kernel logs
+indicate:
+
+[root@ltcfbl8eb ~]# dmesg
+       :
+pci 0000:00     : [PE# 000] Secondary bus 0 associated with PE#0
+pci 0000:01     : [PE# 001] Secondary bus 1 associated with PE#1
+pci 0001:00     : [PE# 000] Secondary bus 0 associated with PE#0
+pci 0001:01     : [PE# 001] Secondary bus 1 associated with PE#1
+pci 0002:00     : [PE# 000] Secondary bus 0 associated with PE#0
+pci 0002:01     : [PE# 001] Secondary bus 1 associated with PE#1
+pci 0003:00     : [PE# 000] Secondary bus 0 associated with PE#0
+pci 0003:01     : [PE# 001] Secondary bus 1 associated with PE#1
+pci 0003:20     : [PE# 002] Secondary bus 32..63 associated with PE#2
+       :
+EEH: Clear non-existing PHB#3-PE#0
+EEH: PHB location: U78AE.001.WZS00M9-P1-002
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 2aa5cf9e48f2f39cc255f8e29964df3ff9ca017b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/eeh.h
+#	arch/powerpc/platforms/powernv/eeh-powernv.c
+diff --cc arch/powerpc/include/asm/eeh.h
+index 52bd2259c082,9c11d1ed6a36..000000000000
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@@ -36,10 -34,13 +36,20 @@@ struct device_node
+  #ifdef CONFIG_EEH
+  
+  /* EEH subsystem flags */
+++<<<<<<< HEAD
+ +#define EEH_ENABLED		0x1	/* EEH enabled		*/
+ +#define EEH_FORCE_DISABLED	0x2	/* EEH disabled		*/
+ +#define EEH_PROBE_MODE_DEV	0x4	/* From PCI device	*/
+ +#define EEH_PROBE_MODE_DEVTREE	0x8	/* From device tree	*/
+++=======
++ #define EEH_ENABLED		0x01	/* EEH enabled		*/
++ #define EEH_FORCE_DISABLED	0x02	/* EEH disabled		*/
++ #define EEH_PROBE_MODE_DEV	0x04	/* From PCI device	*/
++ #define EEH_PROBE_MODE_DEVTREE	0x08	/* From device tree	*/
++ #define EEH_VALID_PE_ZERO	0x10	/* PE#0 is valid	*/
++ #define EEH_ENABLE_IO_FOR_LOG	0x20	/* Enable IO for log	*/
++ #define EEH_EARLY_DUMP_LOG	0x40	/* Dump log immediately	*/
+++>>>>>>> 2aa5cf9e48f2 (powerpc/eeh: Fix missed PE#0 on P7IOC)
+  
+  /*
+   * Delay for PE reset, all in ms
+diff --cc arch/powerpc/platforms/powernv/eeh-powernv.c
+index d9afbdd8c6cc,e261869adc86..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@@ -51,8 -55,32 +51,37 @@@ static int powernv_eeh_init(void
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Set EEH probe mode */
+ +	eeh_probe_mode_set(EEH_PROBE_MODE_DEV);
+++=======
++ 	/* Set probe mode */
++ 	eeh_add_flag(EEH_PROBE_MODE_DEV);
++ 
++ 	/*
++ 	 * P7IOC blocks PCI config access to frozen PE, but PHB3
++ 	 * doesn't do that. So we have to selectively enable I/O
++ 	 * prior to collecting error log.
++ 	 */
++ 	list_for_each_entry(hose, &hose_list, list_node) {
++ 		phb = hose->private_data;
++ 
++ 		if (phb->model == PNV_PHB_MODEL_P7IOC)
++ 			eeh_add_flag(EEH_ENABLE_IO_FOR_LOG);
++ 
++ 		/*
++ 		 * PE#0 should be regarded as valid by EEH core
++ 		 * if it's not the reserved one. Currently, we
++ 		 * have the reserved PE#0 and PE#127 for PHB3
++ 		 * and P7IOC separately. So we should regard
++ 		 * PE#0 as valid for P7IOC.
++ 		 */
++ 		if (phb->ioda.reserved_pe != 0)
++ 			eeh_add_flag(EEH_VALID_PE_ZERO);
++ 
++ 		break;
++ 	}
+++>>>>>>> 2aa5cf9e48f2 (powerpc/eeh: Fix missed PE#0 on P7IOC)
+  
+  	return 0;
+  }
+* Unmerged path arch/powerpc/include/asm/eeh.h
+diff --git a/arch/powerpc/kernel/eeh_pe.c b/arch/powerpc/kernel/eeh_pe.c
+index 66d3a4ade05e..ec25c03a54f6 100644
+--- a/arch/powerpc/kernel/eeh_pe.c
++++ b/arch/powerpc/kernel/eeh_pe.c
+@@ -214,10 +214,18 @@ static void *__eeh_pe_get(void *data, void *flag)
+ 	if (pe->type & EEH_PE_PHB)
+ 		return NULL;
+ 
+-	/* We prefer PE address */
+-	if (edev->pe_config_addr &&
+-	   (edev->pe_config_addr == pe->addr))
++	/*
++	 * We prefer PE address. For most cases, we should
++	 * have non-zero PE address
++	 */
++	if (eeh_has_flag(EEH_VALID_PE_ZERO)) {
++		if (edev->pe_config_addr == pe->addr)
++			return pe;
++	} else {
++		if (edev->pe_config_addr &&
++		    (edev->pe_config_addr == pe->addr))
+ 		return pe;
++	}
+ 
+ 	/* Try BDF address */
+ 	if (edev->config_addr &&
+* Unmerged path arch/powerpc/platforms/powernv/eeh-powernv.c
