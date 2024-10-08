@@ -1239,7 +1239,6 @@ enum btrfs_disk_cache_state {
 	BTRFS_DC_ERROR		= 1,
 	BTRFS_DC_CLEAR		= 2,
 	BTRFS_DC_SETUP		= 3,
-	BTRFS_DC_NEED_WRITE	= 4,
 };
 
 struct btrfs_caching_control {
@@ -1277,7 +1276,6 @@ struct btrfs_block_group_cache {
 	unsigned long full_stripe_len;
 
 	unsigned int ro:1;
-	unsigned int dirty:1;
 	unsigned int iref:1;
 	unsigned int has_caching_ctl:1;
 	unsigned int removed:1;
@@ -1315,6 +1313,9 @@ struct btrfs_block_group_cache {
 	struct list_head ro_list;
 
 	atomic_t trimming;
+
+	/* For dirty block groups */
+	struct list_head dirty_list;
 };
 
 /* delayed seq elem */
