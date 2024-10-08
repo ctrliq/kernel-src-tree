@@ -1,0 +1,209 @@
+sched/deadline: Ensure that updates to exclusive cpusets don't break AC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@arm.com>
+commit f82f80426f7afcf55953924e71555984a4bd6ce6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f82f8042.failed
+
+How we deal with updates to exclusive cpusets is currently broken.
+As an example, suppose we have an exclusive cpuset composed of
+two cpus: A[cpu0,cpu1]. We can assign SCHED_DEADLINE task to it
+up to the allowed bandwidth. If we want now to modify cpusetA's
+cpumask, we have to check that removing a cpu's amount of
+bandwidth doesn't break AC guarantees. This thing isn't checked
+in the current code.
+
+This patch fixes the problem above, denying an update if the
+new cpumask won't have enough bandwidth for SCHED_DEADLINE tasks
+that are currently active.
+
+	Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: cgroups@vger.kernel.org
+Link: http://lkml.kernel.org/r/5433E6AF.5080105@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f82f80426f7afcf55953924e71555984a4bd6ce6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+diff --cc include/linux/sched.h
+index e57aba91f593,320a9779f1b4..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1964,6 -2052,10 +1964,13 @@@ static inline void tsk_restore_flags(st
+  	task->flags |= orig_flags & flags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern int cpuset_cpumask_can_shrink(const struct cpumask *cur,
++ 				     const struct cpumask *trial);
++ extern int task_can_attach(struct task_struct *p,
++ 			   const struct cpumask *cs_cpus_allowed);
+++>>>>>>> f82f80426f7a (sched/deadline: Ensure that updates to exclusive cpusets don't break AC)
+  #ifdef CONFIG_SMP
+  extern void do_set_cpus_allowed(struct task_struct *p,
+  			       const struct cpumask *new_mask);
+diff --cc kernel/sched/core.c
+index f8654b1100de,0456a55fc27f..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -5062,7 -4650,104 +5062,48 @@@ void init_idle(struct task_struct *idle
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int cpuset_cpumask_can_shrink(const struct cpumask *cur,
++ 			      const struct cpumask *trial)
++ {
++ 	int ret = 1, trial_cpus;
++ 	struct dl_bw *cur_dl_b;
++ 	unsigned long flags;
++ 
++ 	cur_dl_b = dl_bw_of(cpumask_any(cur));
++ 	trial_cpus = cpumask_weight(trial);
++ 
++ 	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
++ 	if (cur_dl_b->bw != -1 &&
++ 	    cur_dl_b->bw * trial_cpus < cur_dl_b->total_bw)
++ 		ret = 0;
+ -	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
+ -
+ -	return ret;
+ -}
+ -
+ -int task_can_attach(struct task_struct *p,
+ -		    const struct cpumask *cs_cpus_allowed)
+ -{
+ -	int ret = 0;
+ -
+ -	/*
+ -	 * Kthreads which disallow setaffinity shouldn't be moved
+ -	 * to a new cpuset; we don't want to change their cpu
+ -	 * affinity and isolating such threads by their set of
+ -	 * allowed nodes is unnecessary.  Thus, cpusets are not
+ -	 * applicable for such threads.  This prevents checking for
+ -	 * success of set_cpus_allowed_ptr() on all attached tasks
+ -	 * before cpus_allowed may be changed.
+ -	 */
+ -	if (p->flags & PF_NO_SETAFFINITY) {
+ -		ret = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -#ifdef CONFIG_SMP
+ -	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
+ -					      cs_cpus_allowed)) {
+ -		unsigned int dest_cpu = cpumask_any_and(cpu_active_mask,
+ -							cs_cpus_allowed);
+ -		struct dl_bw *dl_b = dl_bw_of(dest_cpu);
+ -		bool overflow;
+ -		int cpus;
+ -		unsigned long flags;
+ -
+ -		raw_spin_lock_irqsave(&dl_b->lock, flags);
+ -		cpus = dl_bw_cpus(dest_cpu);
+ -		overflow = __dl_overflow(dl_b, cpus, 0, p->dl.dl_bw);
+ -		if (overflow)
+ -			ret = -EBUSY;
+ -		else {
+ -			/*
+ -			 * We reserve space for this task in the destination
+ -			 * root_domain, as we can't fail after this point.
+ -			 * We will free resources in the source root_domain
+ -			 * later on (see set_cpus_allowed_dl()).
+ -			 */
+ -			__dl_add(dl_b, p->dl.dl_bw);
+ -		}
+ -		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
+ -
+ -	}
+ -#endif
+ -out:
+ -	return ret;
+ -}
+ -
+ -#ifdef CONFIG_SMP
+ -/*
+ - * move_queued_task - move a queued task to new rq.
+ - *
+ - * Returns (locked) new rq. Old rq's lock is released.
+ - */
+ -static struct rq *move_queued_task(struct task_struct *p, int new_cpu)
+ -{
+ -	struct rq *rq = task_rq(p);
+ -
+ -	lockdep_assert_held(&rq->lock);
+ -
+ -	dequeue_task(rq, p, 0);
+ -	p->on_rq = TASK_ON_RQ_MIGRATING;
+ -	set_task_cpu(p, new_cpu);
+ -	raw_spin_unlock(&rq->lock);
+++	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
++ 
+ -	rq = cpu_rq(new_cpu);
+++	return ret;
+++}
++ 
+ -	raw_spin_lock(&rq->lock);
+ -	BUG_ON(task_cpu(p) != new_cpu);
+ -	p->on_rq = TASK_ON_RQ_QUEUED;
+ -	enqueue_task(rq, p, 0);
+ -	check_preempt_curr(rq, p, 0);
+++int task_can_attach(struct task_struct *p,
+++		    const struct cpumask *cs_cpus_allowed)
+++{
+++	int ret = 0;
++ 
+ -	return rq;
+ -}
+++	/*
+++	 * Kthreads which disallow setaffinity shouldn't be moved
+++	 * to a new cpuset; we don't want to change their cpu
+++	 * affinity and isolating such threads by their set of
+++	 * allowed nodes is unnecessary.  Thus, cpusets are not
+++	 * applicable for such threads.  This prevents checking for
+++	 * success of set_cpus_allowed_ptr() on all attached tasks
+++	 * before cpus_allowed may be changed.
+++	 */
+++	if (p->flags & PF_NO_SETAFFINITY) {
+++		ret = -EINVAL;
+++		goto out;
+++	}
++ 
+++>>>>>>> f82f80426f7a (sched/deadline: Ensure that updates to exclusive cpusets don't break AC)
+ +#ifdef CONFIG_SMP
+  void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  {
+  	if (p->sched_class && p->sched_class->set_cpus_allowed)
+* Unmerged path include/linux/sched.h
+diff --git a/kernel/cpuset.c b/kernel/cpuset.c
+index 7e3a1129e077..283464cacb31 100644
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@ -490,6 +490,16 @@ static int validate_change(const struct cpuset *cur, const struct cpuset *trial)
+ 	     nodes_empty(trial->mems_allowed)))
+ 		goto out;
+ 
++	/*
++	 * We can't shrink if we won't have enough room for SCHED_DEADLINE
++	 * tasks.
++	 */
++	ret = -EBUSY;
++	if (is_cpu_exclusive(cur) &&
++	    !cpuset_cpumask_can_shrink(cur->cpus_allowed,
++				       trial->cpus_allowed))
++		goto out;
++
+ 	ret = 0;
+ out:
+ 	rcu_read_unlock();
+* Unmerged path kernel/sched/core.c
