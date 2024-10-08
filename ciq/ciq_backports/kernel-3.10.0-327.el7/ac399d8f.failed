@@ -1,0 +1,328 @@
+virtio_pci: add module param to force legacy mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [virtio] virtio-pci: add module param to force legacy mode (Jason Wang) [1227339]
+Rebuild_FUZZ: 97.96%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit ac399d8f39a860655961660efa5c67e7f3c47912
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ac399d8f.failed
+
+If set, try legacy interface first, modern one if that fails.  Useful to
+work around device/driver bugs, and for compatibility testing.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit ac399d8f39a860655961660efa5c67e7f3c47912)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio_pci.c
+diff --cc drivers/virtio/virtio_pci.c
+index 1d068f12b104,e894eb278d83..000000000000
+--- a/drivers/virtio/virtio_pci.c
++++ b/drivers/virtio/virtio_pci.c
+@@@ -14,178 -17,18 +14,186 @@@
+   *
+   */
+  
+ -#include "virtio_pci_common.h"
+ +#include <linux/module.h>
+ +#include <linux/list.h>
+ +#include <linux/pci.h>
+ +#include <linux/slab.h>
+ +#include <linux/interrupt.h>
+ +#include <linux/virtio.h>
+ +#include <linux/virtio_config.h>
+ +#include <linux/virtio_ring.h>
+ +#include <linux/virtio_pci.h>
+ +#include <linux/highmem.h>
+ +#include <linux/spinlock.h>
+ +
+ +MODULE_AUTHOR("Anthony Liguori <aliguori@us.ibm.com>");
+ +MODULE_DESCRIPTION("virtio-pci");
+ +MODULE_LICENSE("GPL");
+ +MODULE_VERSION("1");
+ +
+ +struct virtio_pci_vq_info {
+ +	/* the actual virtqueue */
+ +	struct virtqueue *vq;
+ +
+ +	/* the number of entries in the queue */
+ +	int num;
+ +
+ +	/* the virtual address of the ring queue */
+ +	void *queue;
+ +
+ +	/* the list node for the virtqueues list */
+ +	struct list_head node;
+ +
+ +	/* MSI-X vector (or none) */
+ +	unsigned msix_vector;
+ +};
+ +
+ +/* Our device structure */
+ +struct virtio_pci_device {
+ +	struct virtio_device vdev;
+ +	struct pci_dev *pci_dev;
+ +
+ +	/* the IO mapping for the PCI config space */
+ +	void __iomem *ioaddr;
+ +
+ +	/* the IO mapping for ISR operation */
+ +	void __iomem *isr;
+ +
+ +	/* a list of queues so we can dispatch IRQs */
+ +	spinlock_t lock;
+ +	struct list_head virtqueues;
+ +
+ +	/* array of all queues for house-keeping */
+ +	struct virtio_pci_vq_info **vqs;
+ +
+ +	/* MSI-X support */
+ +	int msix_enabled;
+ +	int intx_enabled;
+ +	struct msix_entry *msix_entries;
+ +	cpumask_var_t *msix_affinity_masks;
+ +	/* Name strings for interrupts. This size should be enough,
+ +	 * and I'm too lazy to allocate each name separately. */
+ +	char (*msix_names)[256];
+ +	/* Number of available vectors */
+ +	unsigned msix_vectors;
+ +	/* Vectors allocated, excluding per-vq vectors if any */
+ +	unsigned msix_used_vectors;
+ +
+ +	/* Status saved during hibernate/restore */
+ +	u8 saved_status;
+ +
+ +	/* Whether we have vector per vq */
+ +	bool per_vq_vectors;
+ +
+ +	struct virtqueue *(*setup_vq)(struct virtio_pci_device *vp_dev,
+ +				      struct virtio_pci_vq_info *info,
+ +				      unsigned idx,
+ +				      void (*callback)(struct virtqueue *vq),
+ +				      const char *name,
+ +				      u16 msix_vec);
+ +	void (*del_vq)(struct virtio_pci_vq_info *info);
+ +	u16 (*config_vector)(struct virtio_pci_device *vp_dev, u16 vector);
+ +};
+ +
+ +/* Constants for MSI-X */
+ +/* Use first vector for configuration changes, second and the rest for
+ + * virtqueues Thus, we need at least 2 vectors for MSI. */
+ +enum {
+ +	VP_MSIX_CONFIG_VECTOR = 0,
+ +	VP_MSIX_VQ_VECTOR = 1,
+ +};
+ +
+ +/* Qumranet donated their vendor ID for devices 0x1000 thru 0x10FF. */
+ +static DEFINE_PCI_DEVICE_TABLE(virtio_pci_id_table) = {
+ +	{ PCI_DEVICE(0x1af4, PCI_ANY_ID) },
+ +	{ 0 }
+ +};
+ +
+ +MODULE_DEVICE_TABLE(pci, virtio_pci_id_table);
+ +
+ +/* Convert a generic virtio device to our structure */
+ +static struct virtio_pci_device *to_vp_device(struct virtio_device *vdev)
+ +{
+ +	return container_of(vdev, struct virtio_pci_device, vdev);
+ +}
+ +
+ +/* virtio config->get_features() implementation */
+ +static u32 vp_get_features(struct virtio_device *vdev)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +
+ +	/* When someone needs more than 32 feature bits, we'll need to
+ +	 * steal a bit to indicate that the rest are somewhere else. */
+ +	return ioread32(vp_dev->ioaddr + VIRTIO_PCI_HOST_FEATURES);
+ +}
+ +
+ +/* virtio config->finalize_features() implementation */
+ +static void vp_finalize_features(struct virtio_device *vdev)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +
+ +	/* Give virtio_ring a chance to accept features. */
+ +	vring_transport_features(vdev);
+ +
+ +	/* We only support 32 feature bits. */
+ +	BUILD_BUG_ON(ARRAY_SIZE(vdev->features) != 1);
+ +	iowrite32(vdev->features[0], vp_dev->ioaddr+VIRTIO_PCI_GUEST_FEATURES);
+ +}
+ +
+ +/* virtio config->get() implementation */
+ +static void vp_get(struct virtio_device *vdev, unsigned offset,
+ +		   void *buf, unsigned len)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +	void __iomem *ioaddr = vp_dev->ioaddr +
+ +				VIRTIO_PCI_CONFIG(vp_dev) + offset;
+ +	u8 *ptr = buf;
+ +	int i;
+ +
+ +	for (i = 0; i < len; i++)
+ +		ptr[i] = ioread8(ioaddr + i);
+ +}
+ +
+ +/* the config->set() implementation.  it's symmetric to the config->get()
+ + * implementation */
+ +static void vp_set(struct virtio_device *vdev, unsigned offset,
+ +		   const void *buf, unsigned len)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +	void __iomem *ioaddr = vp_dev->ioaddr +
+ +				VIRTIO_PCI_CONFIG(vp_dev) + offset;
+ +	const u8 *ptr = buf;
+ +	int i;
+ +
+ +	for (i = 0; i < len; i++)
+ +		iowrite8(ptr[i], ioaddr + i);
+ +}
+ +
+ +/* config->{get,set}_status() implementations */
+ +static u8 vp_get_status(struct virtio_device *vdev)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +	return ioread8(vp_dev->ioaddr + VIRTIO_PCI_STATUS);
+ +}
+ +
+ +static void vp_set_status(struct virtio_device *vdev, u8 status)
+ +{
+ +	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+ +	/* We should never be setting status to 0. */
+ +	BUG_ON(status == 0);
+ +	iowrite8(status, vp_dev->ioaddr + VIRTIO_PCI_STATUS);
+ +}
+  
++ static bool force_legacy = false;
++ 
++ #if IS_ENABLED(CONFIG_VIRTIO_PCI_LEGACY)
++ module_param(force_legacy, bool, 0444);
++ MODULE_PARM_DESC(force_legacy,
++ 		 "Force legacy mode for transitional virtio 1 devices");
++ #endif
++ 
+  /* wait for pending irq handlers */
+ -void vp_synchronize_vectors(struct virtio_device *vdev)
+ +static void vp_synchronize_vectors(struct virtio_device *vdev)
+  {
+  	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+  	int i;
+@@@ -896,6 -463,108 +904,111 @@@ static const struct dev_pm_ops virtio_p
+  };
+  #endif
+  
+++<<<<<<< HEAD:drivers/virtio/virtio_pci.c
+++=======
++ 
++ /* Qumranet donated their vendor ID for devices 0x1000 thru 0x10FF. */
++ static const struct pci_device_id virtio_pci_id_table[] = {
++ 	{ PCI_DEVICE(0x1af4, PCI_ANY_ID) },
++ 	{ 0 }
++ };
++ 
++ MODULE_DEVICE_TABLE(pci, virtio_pci_id_table);
++ 
++ static void virtio_pci_release_dev(struct device *_d)
++ {
++ 	struct virtio_device *vdev = dev_to_virtio(_d);
++ 	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++ 
++ 	/* As struct device is a kobject, it's not safe to
++ 	 * free the memory (including the reference counter itself)
++ 	 * until it's release callback. */
++ 	kfree(vp_dev);
++ }
++ 
++ static int virtio_pci_probe(struct pci_dev *pci_dev,
++ 			    const struct pci_device_id *id)
++ {
++ 	struct virtio_pci_device *vp_dev;
++ 	int rc;
++ 
++ 	/* allocate our structure and fill it out */
++ 	vp_dev = kzalloc(sizeof(struct virtio_pci_device), GFP_KERNEL);
++ 	if (!vp_dev)
++ 		return -ENOMEM;
++ 
++ 	pci_set_drvdata(pci_dev, vp_dev);
++ 	vp_dev->vdev.dev.parent = &pci_dev->dev;
++ 	vp_dev->vdev.dev.release = virtio_pci_release_dev;
++ 	vp_dev->pci_dev = pci_dev;
++ 	INIT_LIST_HEAD(&vp_dev->virtqueues);
++ 	spin_lock_init(&vp_dev->lock);
++ 
++ 	/* Disable MSI/MSIX to bring device to a known good state. */
++ 	pci_msi_off(pci_dev);
++ 
++ 	/* enable the device */
++ 	rc = pci_enable_device(pci_dev);
++ 	if (rc)
++ 		goto err_enable_device;
++ 
++ 	rc = pci_request_regions(pci_dev, "virtio-pci");
++ 	if (rc)
++ 		goto err_request_regions;
++ 
++ 	if (force_legacy) {
++ 		rc = virtio_pci_legacy_probe(vp_dev);
++ 		/* Also try modern mode if we can't map BAR0 (no IO space). */
++ 		if (rc == -ENODEV || rc == -ENOMEM)
++ 			rc = virtio_pci_modern_probe(vp_dev);
++ 		if (rc)
++ 			goto err_probe;
++ 	} else {
++ 		rc = virtio_pci_modern_probe(vp_dev);
++ 		if (rc == -ENODEV)
++ 			rc = virtio_pci_legacy_probe(vp_dev);
++ 		if (rc)
++ 			goto err_probe;
++ 	}
++ 
++ 	pci_set_master(pci_dev);
++ 
++ 	rc = register_virtio_device(&vp_dev->vdev);
++ 	if (rc)
++ 		goto err_register;
++ 
++ 	return 0;
++ 
++ err_register:
++ 	if (vp_dev->ioaddr)
++ 	     virtio_pci_legacy_remove(vp_dev);
++ 	else
++ 	     virtio_pci_modern_remove(vp_dev);
++ err_probe:
++ 	pci_release_regions(pci_dev);
++ err_request_regions:
++ 	pci_disable_device(pci_dev);
++ err_enable_device:
++ 	kfree(vp_dev);
++ 	return rc;
++ }
++ 
++ static void virtio_pci_remove(struct pci_dev *pci_dev)
++ {
++ 	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++ 
++ 	unregister_virtio_device(&vp_dev->vdev);
++ 
++ 	if (vp_dev->ioaddr)
++ 		virtio_pci_legacy_remove(vp_dev);
++ 	else
++ 		virtio_pci_modern_remove(vp_dev);
++ 
++ 	pci_release_regions(pci_dev);
++ 	pci_disable_device(pci_dev);
++ }
++ 
+++>>>>>>> ac399d8f39a8 (virtio_pci: add module param to force legacy mode):drivers/virtio/virtio_pci_common.c
+  static struct pci_driver virtio_pci_driver = {
+  	.name		= "virtio-pci",
+  	.id_table	= virtio_pci_id_table,
+* Unmerged path drivers/virtio/virtio_pci.c
