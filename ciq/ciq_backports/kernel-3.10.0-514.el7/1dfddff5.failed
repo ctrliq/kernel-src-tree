@@ -1,0 +1,182 @@
+net: cdc_ncm: avoid changing RX/TX buffers on MTU changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bjørn Mork <bjorn@mork.no>
+commit 1dfddff5fcd869fcab0c52fafae099dfa435a935
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1dfddff5.failed
+
+NCM buffer sizes are negotiated with the device independently of
+the network device MTU.  The RX buffers are allocated by the
+usbnet framework based on the rx_urb_size value set by cdc_ncm. A
+single RX buffer can hold a number of MTU sized packets.
+
+The default usbnet change_mtu ndo only modifies rx_urb_size if it
+is equal to hard_mtu.  And the cdc_ncm driver will set rx_urb_size
+and hard_mtu independently of each other, based on dwNtbInMaxSize
+and dwNtbOutMaxSize respectively. It was therefore assumed that
+usbnet_change_mtu() would never touch rx_urb_size.  This failed to
+consider the case where dwNtbInMaxSize and dwNtbOutMaxSize happens
+to be equal.
+
+Fix by implementing an NCM specific change_mtu ndo, modifying the
+netdev MTU without touching the buffer size settings.
+
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1dfddff5fcd869fcab0c52fafae099dfa435a935)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/cdc_ncm.c
+#	include/linux/usb/cdc_ncm.h
+diff --cc drivers/net/usb/cdc_ncm.c
+index 75c3661d70a1,e8a1144c5a8b..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -39,9 -39,9 +39,10 @@@
+   */
+  
+  #include <linux/module.h>
+ +#include <linux/init.h>
+  #include <linux/netdevice.h>
+  #include <linux/ctype.h>
++ #include <linux/etherdevice.h>
+  #include <linux/ethtool.h>
+  #include <linux/workqueue.h>
+  #include <linux/mii.h>
+@@@ -338,19 -688,37 +339,50 @@@ static void cdc_ncm_free(struct cdc_ncm
+  	kfree(ctx);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct ethtool_ops cdc_ncm_ethtool_ops = {
+ +	.get_drvinfo = cdc_ncm_get_drvinfo,
+ +	.get_link = usbnet_get_link,
+ +	.get_msglevel = usbnet_get_msglevel,
+ +	.set_msglevel = usbnet_set_msglevel,
+ +	.get_settings = usbnet_get_settings,
+ +	.set_settings = usbnet_set_settings,
+ +	.nway_reset = usbnet_nway_reset,
+ +};
+ +
+ +int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting)
+++=======
++ /* we need to override the usbnet change_mtu ndo for two reasons:
++  *  - respect the negotiated maximum datagram size
++  *  - avoid unwanted changes to rx and tx buffers
++  */
++ int cdc_ncm_change_mtu(struct net_device *net, int new_mtu)
++ {
++ 	struct usbnet *dev = netdev_priv(net);
++ 	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
++ 	int maxmtu = ctx->max_datagram_size - cdc_ncm_eth_hlen(dev);
++ 
++ 	if (new_mtu <= 0 || new_mtu > maxmtu)
++ 		return -EINVAL;
++ 	net->mtu = new_mtu;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(cdc_ncm_change_mtu);
++ 
++ static const struct net_device_ops cdc_ncm_netdev_ops = {
++ 	.ndo_open	     = usbnet_open,
++ 	.ndo_stop	     = usbnet_stop,
++ 	.ndo_start_xmit	     = usbnet_start_xmit,
++ 	.ndo_tx_timeout	     = usbnet_tx_timeout,
++ 	.ndo_change_mtu	     = cdc_ncm_change_mtu,
++ 	.ndo_set_mac_address = eth_mac_addr,
++ 	.ndo_validate_addr   = eth_validate_addr,
++ };
++ 
++ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting, int drvflags)
+++>>>>>>> 1dfddff5fcd8 (net: cdc_ncm: avoid changing RX/TX buffers on MTU changes)
+  {
+ +	const struct usb_cdc_union_desc *union_desc = NULL;
+  	struct cdc_ncm_ctx *ctx;
+  	struct usb_driver *driver;
+  	u8 *buf;
+@@@ -485,24 -824,36 +517,27 @@@ advance
+  
+  	if (ctx->ether_desc) {
+  		temp = usbnet_get_ethernet_addr(dev, ctx->ether_desc->iMACAddress);
+ -		if (temp) {
+ -			dev_dbg(&intf->dev, "failed to get mac address\n");
+ +		if (temp)
+  			goto error2;
+ -		}
+ -		dev_info(&intf->dev, "MAC-Address: %pM\n", dev->net->dev_addr);
+ +		dev_info(&dev->udev->dev, "MAC-Address: %pM\n", dev->net->dev_addr);
+  	}
+  
+ -	/* finish setting up the device specific data */
+ -	cdc_ncm_setup(dev);
+ -
+ -	/* Device-specific flags */
+ -	ctx->drvflags = drvflags;
+ -
+ -	/* Allocate the delayed NDP if needed. */
+ -	if (ctx->drvflags & CDC_NCM_FLAG_NDP_TO_END) {
+ -		ctx->delayed_ndp16 = kzalloc(ctx->max_ndp_size, GFP_KERNEL);
+ -		if (!ctx->delayed_ndp16)
+ -			goto error2;
+ -		dev_info(&intf->dev, "NDP will be placed at end of frame for this device.");
+ -	}
+ -
+ -	/* override ethtool_ops */
+ -	dev->net->ethtool_ops = &cdc_ncm_ethtool_ops;
+ +	/* usbnet use these values for sizing tx/rx queues */
+ +	dev->hard_mtu = ctx->tx_max;
+ +	dev->rx_urb_size = ctx->rx_max;
+  
+ -	/* add our sysfs attrs */
+ -	dev->net->sysfs_groups[0] = &cdc_ncm_sysfs_attr_group;
+ +	/* cdc_ncm_setup will override dwNtbOutMaxSize if it is
+ +	 * outside the sane range. Adding a pad byte here if necessary
+ +	 * simplifies the handling in cdc_ncm_fill_tx_frame, making
+ +	 * tx_max always represent the real skb max size.
+ +	 */
+ +	if (ctx->tx_max != le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize) &&
+ +	    ctx->tx_max % usb_maxpacket(dev->udev, dev->out, 1) == 0)
+ +		ctx->tx_max++;
+  
++ 	/* must handle MTU changes */
++ 	dev->net->netdev_ops = &cdc_ncm_netdev_ops;
++ 
+  	return 0;
+  
+  error2:
+diff --cc include/linux/usb/cdc_ncm.h
+index 55b6feead93b,3a375d07d0dc..000000000000
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@@ -122,7 -138,8 +122,12 @@@ struct cdc_ncm_ctx 
+  };
+  
+  u8 cdc_ncm_select_altsetting(struct usb_interface *intf);
+++<<<<<<< HEAD
+ +int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting);
+++=======
++ int cdc_ncm_change_mtu(struct net_device *net, int new_mtu);
++ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting, int drvflags);
+++>>>>>>> 1dfddff5fcd8 (net: cdc_ncm: avoid changing RX/TX buffers on MTU changes)
+  void cdc_ncm_unbind(struct usbnet *dev, struct usb_interface *intf);
+  struct sk_buff *cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign);
+  int cdc_ncm_rx_verify_nth16(struct cdc_ncm_ctx *ctx, struct sk_buff *skb_in);
+diff --git a/drivers/net/usb/cdc_mbim.c b/drivers/net/usb/cdc_mbim.c
+index a164dab06678..8e5f3fb7331d 100644
+--- a/drivers/net/usb/cdc_mbim.c
++++ b/drivers/net/usb/cdc_mbim.c
+@@ -100,7 +100,7 @@ static const struct net_device_ops cdc_mbim_netdev_ops = {
+ 	.ndo_stop             = usbnet_stop,
+ 	.ndo_start_xmit       = usbnet_start_xmit,
+ 	.ndo_tx_timeout       = usbnet_tx_timeout,
+-	.ndo_change_mtu       = usbnet_change_mtu,
++	.ndo_change_mtu       = cdc_ncm_change_mtu,
+ 	.ndo_set_mac_address  = eth_mac_addr,
+ 	.ndo_validate_addr    = eth_validate_addr,
+ 	.ndo_vlan_rx_add_vid  = cdc_mbim_rx_add_vid,
+* Unmerged path drivers/net/usb/cdc_ncm.c
+* Unmerged path include/linux/usb/cdc_ncm.h
