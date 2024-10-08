@@ -1,0 +1,374 @@
+perf tools: Merge all perf_event_attr print functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] tools: Merge all perf_event_attr print functions (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 95.05%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 2c5e8c52c6354f77c4019357be8231bcc34456f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2c5e8c52.failed
+
+Currently there's 3 (that I found) different and incomplete
+implementations of printing perf_event_attr.
+
+This is quite silly. Merge the lot.
+
+While this patch does not retain the exact form all printing that I
+found is debug output and thus it should not be critical.
+
+Also, I cannot find a single print_event_desc() caller.
+
+Pre:
+
+ $ perf record -vv -e cycles -- sleep 1
+ ------------------------------------------------------------
+ perf_event_attr:
+  type                0
+  size                104
+  config              0
+  sample_period       4000
+  sample_freq         4000
+  sample_type         0x107
+  read_format         0
+  disabled            1    inherit             1
+  pinned              0    exclusive           0
+  exclude_user        0    exclude_kernel      0
+  exclude_hv          0    exclude_idle        0
+  mmap                1    comm                1
+  mmap2               1    comm_exec           1
+  freq                1    inherit_stat        0
+  enable_on_exec      1    task                1
+  watermark           0    precise_ip          0
+  mmap_data           0    sample_id_all       1
+  exclude_host        0    exclude_guest       1
+  excl.callchain_kern 0    excl.callchain_user 0
+  wakeup_events       0
+  wakeup_watermark    0
+  bp_type             0
+  bp_addr             0
+  config1             0
+  bp_len              0
+  config2             0
+  branch_sample_type  0
+  sample_regs_user    0
+  sample_stack_user   0
+  sample_regs_intr    0
+ ------------------------------------------------------------
+
+ $ perf evlist  -vv
+ cycles: sample_freq=4000, size: 104, sample_type: IP|TID|TIME|PERIOD,
+ disabled: 1, inherit: 1, mmap: 1, mmap2: 1, comm: 1, comm_exec: 1,
+ freq: 1, enable_on_exec: 1, task: 1, sample_id_all: 1, exclude_guest: 1
+
+ Post:
+
+ $ ./perf record -vv -e cycles -- sleep 1
+ ------------------------------------------------------------
+ perf_event_attr:
+  size                             112
+  { sample_period, sample_freq }   4000
+  sample_type                      IP|TID|TIME|PERIOD
+  disabled                         1
+  inherit                          1
+  mmap                             1
+  comm                             1
+  freq                             1
+  enable_on_exec                   1
+  task                             1
+  sample_id_all                    1
+  exclude_guest                    1
+  mmap2                            1
+  comm_exec                        1
+------------------------------------------------------------
+
+ $ ./perf evlist  -vv
+ cycles: size: 112, { sample_period, sample_freq }: 4000, sample_type:
+ IP|TID|TIME|PERIOD, disabled: 1, inherit: 1, mmap: 1, comm: 1, freq:
+ 1, enable_on_exec: 1, task: 1, sample_id_all: 1, exclude_guest: 1,
+ mmap2: 1, comm_exec: 1
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20150407091150.644238729@infradead.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 2c5e8c52c6354f77c4019357be8231bcc34456f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+#	tools/perf/util/header.c
+diff --cc tools/perf/util/evsel.c
+index 358e5954baa8,33e3fd8c2e68..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -1001,63 -1011,116 +1001,144 @@@ static int get_group_fd(struct perf_evs
+  	return fd;
+  }
+  
+- #define __PRINT_ATTR(fmt, cast, field)  \
+- 	fprintf(fp, "  %-19s "fmt"\n", #field, cast attr->field)
+- 
+- #define PRINT_ATTR_U32(field)  __PRINT_ATTR("%u" , , field)
+- #define PRINT_ATTR_X32(field)  __PRINT_ATTR("%#x", , field)
+- #define PRINT_ATTR_U64(field)  __PRINT_ATTR("%" PRIu64, (uint64_t), field)
+- #define PRINT_ATTR_X64(field)  __PRINT_ATTR("%#"PRIx64, (uint64_t), field)
+- 
+- #define PRINT_ATTR2N(name1, field1, name2, field2)	\
+- 	fprintf(fp, "  %-19s %u    %-19s %u\n",		\
+- 	name1, attr->field1, name2, attr->field2)
+- 
+- #define PRINT_ATTR2(field1, field2) \
+- 	PRINT_ATTR2N(#field1, field1, #field2, field2)
++ struct bit_names {
++ 	int bit;
++ 	const char *name;
++ };
+  
+- static size_t perf_event_attr__fprintf(struct perf_event_attr *attr, FILE *fp)
++ static void __p_bits(char *buf, size_t size, u64 value, struct bit_names *bits)
+  {
+- 	size_t ret = 0;
++ 	bool first_bit = true;
++ 	int i = 0;
+  
+- 	ret += fprintf(fp, "%.60s\n", graph_dotted_line);
+- 	ret += fprintf(fp, "perf_event_attr:\n");
++ 	do {
++ 		if (value & bits[i].bit) {
++ 			buf += scnprintf(buf, size, "%s%s", first_bit ? "" : "|", bits[i].name);
++ 			first_bit = false;
++ 		}
++ 	} while (bits[++i].name != NULL);
++ }
+  
+- 	ret += PRINT_ATTR_U32(type);
+- 	ret += PRINT_ATTR_U32(size);
+- 	ret += PRINT_ATTR_X64(config);
+- 	ret += PRINT_ATTR_U64(sample_period);
+- 	ret += PRINT_ATTR_U64(sample_freq);
+- 	ret += PRINT_ATTR_X64(sample_type);
+- 	ret += PRINT_ATTR_X64(read_format);
++ static void __p_sample_type(char *buf, size_t size, u64 value)
++ {
++ #define bit_name(n) { PERF_SAMPLE_##n, #n }
++ 	struct bit_names bits[] = {
++ 		bit_name(IP), bit_name(TID), bit_name(TIME), bit_name(ADDR),
++ 		bit_name(READ), bit_name(CALLCHAIN), bit_name(ID), bit_name(CPU),
++ 		bit_name(PERIOD), bit_name(STREAM_ID), bit_name(RAW),
++ 		bit_name(BRANCH_STACK), bit_name(REGS_USER), bit_name(STACK_USER),
++ 		bit_name(IDENTIFIER), bit_name(REGS_INTR),
++ 		{ .name = NULL, }
++ 	};
++ #undef bit_name
++ 	__p_bits(buf, size, value, bits);
++ }
+  
+++<<<<<<< HEAD
+ +	ret += PRINT_ATTR2(disabled, inherit);
+ +	ret += PRINT_ATTR2(pinned, exclusive);
+ +	ret += PRINT_ATTR2(exclude_user, exclude_kernel);
+ +	ret += PRINT_ATTR2(exclude_hv, exclude_idle);
+ +	ret += PRINT_ATTR2(mmap, comm);
+ +	ret += PRINT_ATTR2(mmap2, comm_exec);
+ +	ret += PRINT_ATTR2(freq, inherit_stat);
+ +	ret += PRINT_ATTR2(enable_on_exec, task);
+ +	ret += PRINT_ATTR2(watermark, precise_ip);
+ +	ret += PRINT_ATTR2(mmap_data, sample_id_all);
+ +	ret += PRINT_ATTR2(exclude_host, exclude_guest);
+ +	ret += PRINT_ATTR2N("excl.callchain_kern", exclude_callchain_kernel,
+ +			    "excl.callchain_user", exclude_callchain_user);
+ +
+ +	ret += PRINT_ATTR_U32(wakeup_events);
+ +	ret += PRINT_ATTR_U32(wakeup_watermark);
+ +	ret += PRINT_ATTR_X32(bp_type);
+ +	ret += PRINT_ATTR_X64(bp_addr);
+ +	ret += PRINT_ATTR_X64(config1);
+ +	ret += PRINT_ATTR_U64(bp_len);
+ +	ret += PRINT_ATTR_X64(config2);
+ +	ret += PRINT_ATTR_X64(branch_sample_type);
+ +	ret += PRINT_ATTR_X64(sample_regs_user);
+ +	ret += PRINT_ATTR_U32(sample_stack_user);
+ +	ret += PRINT_ATTR_X64(sample_regs_intr);
+++=======
++ static void __p_read_format(char *buf, size_t size, u64 value)
++ {
++ #define bit_name(n) { PERF_FORMAT_##n, #n }
++ 	struct bit_names bits[] = {
++ 		bit_name(TOTAL_TIME_ENABLED), bit_name(TOTAL_TIME_RUNNING),
++ 		bit_name(ID), bit_name(GROUP),
++ 		{ .name = NULL, }
++ 	};
++ #undef bit_name
++ 	__p_bits(buf, size, value, bits);
++ }
++ 
++ #define BUF_SIZE		1024
++ 
++ #define p_hex(val)		snprintf(buf, BUF_SIZE, "%"PRIx64, (uint64_t)(val))
++ #define p_unsigned(val)		snprintf(buf, BUF_SIZE, "%"PRIu64, (uint64_t)(val))
++ #define p_signed(val)		snprintf(buf, BUF_SIZE, "%"PRId64, (int64_t)(val))
++ #define p_sample_type(val)	__p_sample_type(buf, BUF_SIZE, val)
++ #define p_read_format(val)	__p_read_format(buf, BUF_SIZE, val)
+++>>>>>>> 2c5e8c52c635 (perf tools: Merge all perf_event_attr print functions)
+  
+- 	ret += fprintf(fp, "%.60s\n", graph_dotted_line);
++ #define PRINT_ATTRn(_n, _f, _p)				\
++ do {							\
++ 	if (attr->_f) {					\
++ 		_p(attr->_f);				\
++ 		ret += attr__fprintf(fp, _n, buf, priv);\
++ 	}						\
++ } while (0)
++ 
++ #define PRINT_ATTRf(_f, _p)	PRINT_ATTRn(#_f, _f, _p)
++ 
++ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
++ 			     attr__fprintf_f attr__fprintf, void *priv)
++ {
++ 	char buf[BUF_SIZE];
++ 	int ret = 0;
++ 
++ 	PRINT_ATTRf(type, p_unsigned);
++ 	PRINT_ATTRf(size, p_unsigned);
++ 	PRINT_ATTRf(config, p_hex);
++ 	PRINT_ATTRn("{ sample_period, sample_freq }", sample_period, p_unsigned);
++ 	PRINT_ATTRf(sample_type, p_sample_type);
++ 	PRINT_ATTRf(read_format, p_read_format);
++ 
++ 	PRINT_ATTRf(disabled, p_unsigned);
++ 	PRINT_ATTRf(inherit, p_unsigned);
++ 	PRINT_ATTRf(pinned, p_unsigned);
++ 	PRINT_ATTRf(exclusive, p_unsigned);
++ 	PRINT_ATTRf(exclude_user, p_unsigned);
++ 	PRINT_ATTRf(exclude_kernel, p_unsigned);
++ 	PRINT_ATTRf(exclude_hv, p_unsigned);
++ 	PRINT_ATTRf(exclude_idle, p_unsigned);
++ 	PRINT_ATTRf(mmap, p_unsigned);
++ 	PRINT_ATTRf(comm, p_unsigned);
++ 	PRINT_ATTRf(freq, p_unsigned);
++ 	PRINT_ATTRf(inherit_stat, p_unsigned);
++ 	PRINT_ATTRf(enable_on_exec, p_unsigned);
++ 	PRINT_ATTRf(task, p_unsigned);
++ 	PRINT_ATTRf(watermark, p_unsigned);
++ 	PRINT_ATTRf(precise_ip, p_unsigned);
++ 	PRINT_ATTRf(mmap_data, p_unsigned);
++ 	PRINT_ATTRf(sample_id_all, p_unsigned);
++ 	PRINT_ATTRf(exclude_host, p_unsigned);
++ 	PRINT_ATTRf(exclude_guest, p_unsigned);
++ 	PRINT_ATTRf(exclude_callchain_kernel, p_unsigned);
++ 	PRINT_ATTRf(exclude_callchain_user, p_unsigned);
++ 	PRINT_ATTRf(mmap2, p_unsigned);
++ 	PRINT_ATTRf(comm_exec, p_unsigned);
++ 	PRINT_ATTRf(use_clockid, p_unsigned);
++ 
++ 	PRINT_ATTRn("{ wakeup_events, wakeup_watermark }", wakeup_events, p_unsigned);
++ 	PRINT_ATTRf(bp_type, p_unsigned);
++ 	PRINT_ATTRn("{ bp_addr, config1 }", bp_addr, p_hex);
++ 	PRINT_ATTRn("{ bp_len, config2 }", bp_len, p_hex);
++ 	PRINT_ATTRf(sample_regs_user, p_hex);
++ 	PRINT_ATTRf(sample_stack_user, p_unsigned);
++ 	PRINT_ATTRf(clockid, p_signed);
++ 	PRINT_ATTRf(sample_regs_intr, p_hex);
+  
+  	return ret;
+  }
+@@@ -2044,43 -2094,6 +2085,46 @@@ int perf_evsel__fprintf(struct perf_evs
+  		printed += comma_fprintf(fp, &first, " sample_freq=%" PRIu64,
+  					 (u64)evsel->attr.sample_freq);
+  	}
+++<<<<<<< HEAD
+ +
+ +	if (details->verbose) {
+ +		if_print(type);
+ +		if_print(config);
+ +		if_print(config1);
+ +		if_print(config2);
+ +		if_print(size);
+ +		printed += sample_type__fprintf(fp, &first, evsel->attr.sample_type);
+ +		if (evsel->attr.read_format)
+ +			printed += read_format__fprintf(fp, &first, evsel->attr.read_format);
+ +		if_print(disabled);
+ +		if_print(inherit);
+ +		if_print(pinned);
+ +		if_print(exclusive);
+ +		if_print(exclude_user);
+ +		if_print(exclude_kernel);
+ +		if_print(exclude_hv);
+ +		if_print(exclude_idle);
+ +		if_print(mmap);
+ +		if_print(mmap2);
+ +		if_print(comm);
+ +		if_print(comm_exec);
+ +		if_print(freq);
+ +		if_print(inherit_stat);
+ +		if_print(enable_on_exec);
+ +		if_print(task);
+ +		if_print(watermark);
+ +		if_print(precise_ip);
+ +		if_print(mmap_data);
+ +		if_print(sample_id_all);
+ +		if_print(exclude_host);
+ +		if_print(exclude_guest);
+ +		if_print(__reserved_1);
+ +		if_print(wakeup_events);
+ +		if_print(bp_type);
+ +		if_print(branch_sample_type);
+ +	}
+++=======
+++>>>>>>> 2c5e8c52c635 (perf tools: Merge all perf_event_attr print functions)
+  out:
+  	fputc('\n', fp);
+  	return ++printed;
+diff --cc tools/perf/util/evsel.h
+index 0247c7471536,e486151b0308..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -356,4 -356,14 +356,17 @@@ for ((_evsel) = list_entry((_leader)->n
+       (_evsel) && (_evsel)->leader == (_leader);					\
+       (_evsel) = list_entry((_evsel)->node.next, struct perf_evsel, node))
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool has_branch_callstack(struct perf_evsel *evsel)
++ {
++ 	return evsel->attr.branch_sample_type & PERF_SAMPLE_BRANCH_CALL_STACK;
++ }
++ 
++ typedef int (*attr__fprintf_f)(FILE *, const char *, const char *, void *);
++ 
++ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
++ 			     attr__fprintf_f attr__fprintf, void *priv);
++ 
+++>>>>>>> 2c5e8c52c635 (perf tools: Merge all perf_event_attr print functions)
+  #endif /* __PERF_EVSEL_H */
+diff --cc tools/perf/util/header.c
+index fb432153e2aa,fff3b2a455ae..000000000000
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@@ -1098,6 -1084,8 +1084,11 @@@ static void print_event_desc(struct per
+  			}
+  			fprintf(fp, " }");
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		perf_event_attr__fprintf(fp, &evsel->attr, __desc_attr__fprintf, NULL);
+++>>>>>>> 2c5e8c52c635 (perf tools: Merge all perf_event_attr print functions)
+  
+  		fputc('\n', fp);
+  	}
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/header.c
