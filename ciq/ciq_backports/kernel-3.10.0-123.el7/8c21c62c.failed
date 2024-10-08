@@ -1,0 +1,187 @@
+nfs4.1: Add SP4_MACH_CRED write and commit support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [fs] nfs: Add SP4_MACH_CRED write and commit support (Jeff Layton) [1009119]
+Rebuild_FUZZ: 96.91%
+commit-author Weston Andros Adamson <dros@netapp.com>
+commit 8c21c62c4452f4e66c3dac9b3f6b74474fad3e08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/8c21c62c.failed
+
+WRITE and COMMIT can use the machine credential.
+
+If WRITE is supported and COMMIT is not, make all (mach cred) writes FILE_SYNC4.
+
+	Signed-off-by: Weston Andros Adamson <dros@netapp.com>
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit 8c21c62c4452f4e66c3dac9b3f6b74474fad3e08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+#	include/linux/nfs_fs_sb.h
+diff --cc fs/nfs/nfs4proc.c
+index 74bc306dedb0,e3cdfe346ebc..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -5719,6 -6211,28 +5719,31 @@@ static int nfs4_sp4_select_mode(struct 
+  			dfprintk(MOUNT, "  cleanup mode enabled\n");
+  			set_bit(NFS_SP4_MACH_CRED_CLEANUP, &clp->cl_sp4_flags);
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (test_bit(OP_SECINFO, sp->allow.u.longs) &&
++ 		    test_bit(OP_SECINFO_NO_NAME, sp->allow.u.longs)) {
++ 			dfprintk(MOUNT, "  secinfo mode enabled\n");
++ 			set_bit(NFS_SP4_MACH_CRED_SECINFO, &clp->cl_sp4_flags);
++ 		}
++ 
++ 		if (test_bit(OP_TEST_STATEID, sp->allow.u.longs) &&
++ 		    test_bit(OP_FREE_STATEID, sp->allow.u.longs)) {
++ 			dfprintk(MOUNT, "  stateid mode enabled\n");
++ 			set_bit(NFS_SP4_MACH_CRED_STATEID, &clp->cl_sp4_flags);
++ 		}
++ 
++ 		if (test_bit(OP_WRITE, sp->allow.u.longs)) {
++ 			dfprintk(MOUNT, "  write mode enabled\n");
++ 			set_bit(NFS_SP4_MACH_CRED_WRITE, &clp->cl_sp4_flags);
++ 		}
++ 
++ 		if (test_bit(OP_COMMIT, sp->allow.u.longs)) {
++ 			dfprintk(MOUNT, "  commit mode enabled\n");
++ 			set_bit(NFS_SP4_MACH_CRED_COMMIT, &clp->cl_sp4_flags);
++ 		}
+++>>>>>>> 8c21c62c4452 (nfs4.1: Add SP4_MACH_CRED write and commit support)
+  	}
+  
+  	return 0;
+diff --cc include/linux/nfs_fs_sb.h
+index a52a00575751,e8ff178c3d33..000000000000
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@@ -95,6 -95,10 +95,13 @@@ struct nfs_client 
+  #define NFS_SP4_MACH_CRED_MINIMAL  1	/* Minimal sp4_mach_cred - state ops
+  					 * must use machine cred */
+  #define NFS_SP4_MACH_CRED_CLEANUP  2	/* CLOSE and LOCKU */
+++<<<<<<< HEAD
+++=======
++ #define NFS_SP4_MACH_CRED_SECINFO  3	/* SECINFO and SECINFO_NO_NAME */
++ #define NFS_SP4_MACH_CRED_STATEID  4	/* TEST_STATEID and FREE_STATEID */
++ #define NFS_SP4_MACH_CRED_WRITE    5	/* WRITE */
++ #define NFS_SP4_MACH_CRED_COMMIT   6	/* COMMIT */
+++>>>>>>> 8c21c62c4452 (nfs4.1: Add SP4_MACH_CRED write and commit support)
+  #endif /* CONFIG_NFS_V4 */
+  
+  #ifdef CONFIG_NFS_FSCACHE
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index da33ae4c7714..7c88b62ae89d 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -268,15 +268,9 @@ is_ds_client(struct nfs_client *clp)
+ 	return clp->cl_exchange_flags & EXCHGID4_FLAG_USE_PNFS_DS;
+ }
+ 
+-/*
+- * Function responsible for determining if an rpc_message should use the
+- * machine cred under SP4_MACH_CRED and if so switching the credential and
+- * authflavor (using the nfs_client's rpc_clnt which will be krb5i/p).
+- * Should be called before rpc_call_sync/rpc_call_async.
+- */
+-static inline void
+-nfs4_state_protect(struct nfs_client *clp, unsigned long sp4_mode,
+-		   struct rpc_clnt **clntp, struct rpc_message *msg)
++static inline bool
++_nfs4_state_protect(struct nfs_client *clp, unsigned long sp4_mode,
++		    struct rpc_clnt **clntp, struct rpc_message *msg)
+ {
+ 	struct rpc_cred *newcred = NULL;
+ 	rpc_authflavor_t flavor;
+@@ -294,7 +288,37 @@ nfs4_state_protect(struct nfs_client *clp, unsigned long sp4_mode,
+ 		WARN_ON(flavor != RPC_AUTH_GSS_KRB5I &&
+ 			flavor != RPC_AUTH_GSS_KRB5P);
+ 		*clntp = clp->cl_rpcclient;
++
++		return true;
+ 	}
++	return false;
++}
++
++/*
++ * Function responsible for determining if an rpc_message should use the
++ * machine cred under SP4_MACH_CRED and if so switching the credential and
++ * authflavor (using the nfs_client's rpc_clnt which will be krb5i/p).
++ * Should be called before rpc_call_sync/rpc_call_async.
++ */
++static inline void
++nfs4_state_protect(struct nfs_client *clp, unsigned long sp4_mode,
++		   struct rpc_clnt **clntp, struct rpc_message *msg)
++{
++	_nfs4_state_protect(clp, sp4_mode, clntp, msg);
++}
++
++/*
++ * Special wrapper to nfs4_state_protect for write.
++ * If WRITE can use machine cred but COMMIT cannot, make sure all writes
++ * that use machine cred use NFS_FILE_SYNC.
++ */
++static inline void
++nfs4_state_protect_write(struct nfs_client *clp, struct rpc_clnt **clntp,
++			 struct rpc_message *msg, struct nfs_write_data *wdata)
++{
++	if (_nfs4_state_protect(clp, NFS_SP4_MACH_CRED_WRITE, clntp, msg) &&
++	    !test_bit(NFS_SP4_MACH_CRED_COMMIT, &clp->cl_sp4_flags))
++		wdata->args.stable = NFS_FILE_SYNC;
+ }
+ #else /* CONFIG_NFS_v4_1 */
+ static inline struct nfs4_session *nfs4_get_session(const struct nfs_server *server)
+@@ -319,6 +343,12 @@ nfs4_state_protect(struct nfs_client *clp, unsigned long sp4_flags,
+ 		   struct rpc_clnt **clntp, struct rpc_message *msg)
+ {
+ }
++
++static inline void
++nfs4_state_protect_write(struct nfs_client *clp, struct rpc_clnt **clntp,
++			 struct rpc_message *msg, struct nfs_write_data *wdata)
++{
++}
+ #endif /* CONFIG_NFS_V4_1 */
+ 
+ extern const struct nfs4_minor_version_ops *nfs_v4_minor_ops[];
+@@ -454,6 +484,8 @@ static inline bool nfs4_valid_open_stateid(const struct nfs4_state *state)
+ 
+ #define nfs4_close_state(a, b) do { } while (0)
+ #define nfs4_close_sync(a, b) do { } while (0)
++#define nfs4_state_protect(a, b, c, d) do { } while (0)
++#define nfs4_state_protect_write(a, b, c, d) do { } while (0)
+ 
+ #endif /* CONFIG_NFS_V4 */
+ #endif /* __LINUX_FS_NFS_NFS4_FS.H */
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 9fb5d7c9756a..ac1dc331ba31 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1022,6 +1022,9 @@ int nfs_initiate_write(struct rpc_clnt *clnt,
+ 		data->args.count,
+ 		(unsigned long long)data->args.offset);
+ 
++	nfs4_state_protect_write(NFS_SERVER(inode)->nfs_client,
++				 &task_setup_data.rpc_client, &msg, data);
++
+ 	task = rpc_run_task(&task_setup_data);
+ 	if (IS_ERR(task)) {
+ 		ret = PTR_ERR(task);
+@@ -1488,6 +1491,9 @@ int nfs_initiate_commit(struct rpc_clnt *clnt, struct nfs_commit_data *data,
+ 
+ 	dprintk("NFS: %5u initiated commit call\n", data->task.tk_pid);
+ 
++	nfs4_state_protect(NFS_SERVER(data->inode)->nfs_client,
++		NFS_SP4_MACH_CRED_COMMIT, &task_setup_data.rpc_client, &msg);
++
+ 	task = rpc_run_task(&task_setup_data);
+ 	if (IS_ERR(task))
+ 		return PTR_ERR(task);
+* Unmerged path include/linux/nfs_fs_sb.h
