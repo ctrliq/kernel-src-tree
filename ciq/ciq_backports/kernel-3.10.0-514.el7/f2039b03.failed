@@ -1,0 +1,138 @@
+hpsa: correct check for non-disk devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Don Brace <don.brace@pmcs.com>
+commit f2039b03290b3b1e0556b85b7018273e116d17c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f2039b03.failed
+
+The driver is using two MACROs which seemingly are looking in
+the wrong location for the device_flags returned from
+CISS_REPORT_PHYS. Both MACROs, NON_DISK_PHYS_DEV and
+PHYS_IOACCEL, are using the pointer returned from figure_lunaddrbytes
+which is the address of the LUN.lunid element in
+the extended CISS_REPORT_PHYS.  But the MACROS are using offsets
+beyond the range of the element (offset 17 of an 8 byte element).
+
+These MACROs actually are looking at the correct location but
+they fail static checker analysis. It also will not work
+if any new elements are added to the extended LUN structure.
+
+Change the code to use the structure elements directly
+since this MACRO is only used in one location.
+
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Justin Lindley <justin.lindley@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f2039b03290b3b1e0556b85b7018273e116d17c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 87d36e066305,9cf551b1fa9a..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -3671,7 -3705,33 +3670,37 @@@ static void hpsa_get_ioaccel_drive_info
+  		dev->queue_depth = DRIVE_QUEUE_DEPTH; /* conservative */
+  }
+  
+++<<<<<<< HEAD
+ +static void hpsa_update_scsi_devices(struct ctlr_info *h, int hostno)
+++=======
++ static void hpsa_get_path_info(struct hpsa_scsi_dev_t *this_device,
++ 	struct ReportExtendedLUNdata *rlep, int rle_index,
++ 	struct bmic_identify_physical_device *id_phys)
++ {
++ 	struct ext_report_lun_entry *rle = &rlep->LUN[rle_index];
++ 
++ 	if ((rle->device_flags & 0x08) && this_device->ioaccel_handle)
++ 		this_device->hba_ioaccel_enabled = 1;
++ 
++ 	memcpy(&this_device->active_path_index,
++ 		&id_phys->active_path_number,
++ 		sizeof(this_device->active_path_index));
++ 	memcpy(&this_device->path_map,
++ 		&id_phys->redundant_path_present_map,
++ 		sizeof(this_device->path_map));
++ 	memcpy(&this_device->box,
++ 		&id_phys->alternate_paths_phys_box_on_port,
++ 		sizeof(this_device->box));
++ 	memcpy(&this_device->phys_connector,
++ 		&id_phys->alternate_paths_phys_connector,
++ 		sizeof(this_device->phys_connector));
++ 	memcpy(&this_device->bay,
++ 		&id_phys->phys_bay_in_box,
++ 		sizeof(this_device->bay));
++ }
++ 
++ static void hpsa_update_scsi_devices(struct ctlr_info *h)
+++>>>>>>> f2039b03290b (hpsa: correct check for non-disk devices)
+  {
+  	/* the idea here is we could get notified
+  	 * that some devices have changed, so we do a report
+@@@ -3757,6 -3810,8 +3786,11 @@@
+  	n_ext_target_devs = 0;
+  	for (i = 0; i < nphysicals + nlogicals + 1; i++) {
+  		u8 *lunaddrbytes, is_OBDR = 0;
+++<<<<<<< HEAD
+++=======
++ 		int rc = 0;
++ 		int phys_dev_index = i - (raid_ctlr_position == 0);
+++>>>>>>> f2039b03290b (hpsa: correct check for non-disk devices)
+  
+  		/* Figure out where the LUN ID info is coming from */
+  		lunaddrbytes = figure_lunaddrbytes(h, raid_ctlr_position,
+@@@ -3817,20 -3881,15 +3852,31 @@@
+  				ncurrent++;
+  			break;
+  		case TYPE_DISK:
+++<<<<<<< HEAD
+ +			if (i >= nphysicals) {
+ +				ncurrent++;
+ +				break;
+++=======
++ 			if (i < nphysicals + (raid_ctlr_position == 0)) {
++ 				/* The disk is in HBA mode. */
++ 				/* Never use RAID mapper in HBA mode. */
++ 				this_device->offload_enabled = 0;
++ 				hpsa_get_ioaccel_drive_info(h, this_device,
++ 					physdev_list, phys_dev_index, id_phys);
++ 				hpsa_get_path_info(this_device,
++ 					physdev_list, phys_dev_index, id_phys);
+++>>>>>>> f2039b03290b (hpsa: correct check for non-disk devices)
+  			}
+ +
+ +			if (h->hba_mode_enabled)
+ +				/* never use raid mapper in HBA mode */
+ +				this_device->offload_enabled = 0;
+ +			else if (!(h->transMethod & CFGTBL_Trans_io_accel1 ||
+ +				h->transMethod & CFGTBL_Trans_io_accel2))
+ +				break;
+ +			hpsa_get_ioaccel_drive_info(h, this_device,
+ +						lunaddrbytes, id_phys);
+ +			atomic_set(&this_device->ioaccel_cmds_out, 0);
+  			ncurrent++;
+  			break;
+  		case TYPE_TAPE:
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index 47c756ba8dce..c2c07373dcd8 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -260,8 +260,6 @@ struct ext_report_lun_entry {
+ 	u8 wwid[8];
+ 	u8 device_type;
+ 	u8 device_flags;
+-#define NON_DISK_PHYS_DEV(x) ((x)[17] & 0x01)
+-#define PHYS_IOACCEL(x) ((x)[17] & 0x08)
+ 	u8 lun_count; /* multi-lun device, how many luns */
+ 	u8 redundant_paths;
+ 	u32 ioaccel_handle; /* ioaccel1 only uses lower 16 bits */
