@@ -1,0 +1,126 @@
+staging/rdma/hfi1: Tune for unknown channel if configuration file is absent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Tune for unknown channel if configuration file is absent (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 94.37%
+commit-author Easwar Hariharan <easwar.hariharan@intel.com>
+commit 97167e8134150eb5104e19fd7208e3ac3525f48b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/97167e81.failed
+
+Currently, the driver fails to tune the SerDes and therefore prevents
+link up if the configuration file is missing or fails parsing or
+validation. This patch adds a fallback option so that the 8051 is asked
+to tune for an unknown channel and possibly get the link up if tuning
+succeeds. It also adds a user-friendly message to update the
+configuration file if it is out-of-date.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 97167e8134150eb5104e19fd7208e3ac3525f48b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/firmware.c
+#	drivers/staging/rdma/hfi1/platform.c
+diff --cc drivers/staging/hfi1/firmware.c
+index 0b23e3eaf574,35084b754b7c..000000000000
+--- a/drivers/staging/hfi1/firmware.c
++++ b/drivers/staging/hfi1/firmware.c
+@@@ -690,8 -701,12 +690,15 @@@ static int obtain_firmware(struct hfi1_
+  		platform_config = NULL;
+  		err = request_firmware(&platform_config, platform_config_name,
+  						&dd->pcidev->dev);
+ -		if (err) {
+ +		if (err)
+  			platform_config = NULL;
+++<<<<<<< HEAD:drivers/staging/hfi1/firmware.c
+++=======
++ 			goto done;
++ 		}
++ 		dd->platform_config.data = platform_config->data;
++ 		dd->platform_config.size = platform_config->size;
+++>>>>>>> 97167e813415 (staging/rdma/hfi1: Tune for unknown channel if configuration file is absent):drivers/staging/rdma/hfi1/firmware.c
+  	}
+  
+  done:
+@@@ -1457,10 -1510,11 +1502,11 @@@ int parse_platform_config(struct hfi1_d
+  {
+  	struct platform_config_cache *pcfgcache = &dd->pcfg_cache;
+  	u32 *ptr = NULL;
+ -	u32 header1 = 0, header2 = 0, magic_num = 0, crc = 0, file_length = 0;
+ +	u32 header1 = 0, header2 = 0, magic_num = 0, crc = 0;
+  	u32 record_idx = 0, table_type = 0, table_length_dwords = 0;
++ 	int ret = -EINVAL; /* assume failure */
+  
+ -	if (!dd->platform_config.data) {
+ +	if (platform_config == NULL) {
+  		dd_dev_info(dd, "%s: Missing config file\n", __func__);
+  		goto bail;
+  	}
+@@@ -1473,7 -1527,26 +1519,30 @@@
+  		goto bail;
+  	}
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/firmware.c
+ +	while (ptr < (u32 *)(platform_config->data + platform_config->size)) {
+++=======
++ 	/* Field is file size in DWORDs */
++ 	file_length = (*ptr) * 4;
++ 	ptr++;
++ 
++ 	if (file_length > dd->platform_config.size) {
++ 		dd_dev_info(dd, "%s:File claims to be larger than read size\n",
++ 			    __func__);
++ 		goto bail;
++ 	} else if (file_length < dd->platform_config.size) {
++ 		dd_dev_info(dd,
++ 			    "%s:File claims to be smaller than read size, continuing\n",
++ 			    __func__);
++ 	}
++ 	/* exactly equal, perfection */
++ 
++ 	/*
++ 	 * In both cases where we proceed, using the self-reported file length
++ 	 * is the safer option
++ 	 */
++ 	while (ptr < (u32 *)(dd->platform_config.data + file_length)) {
+++>>>>>>> 97167e813415 (staging/rdma/hfi1: Tune for unknown channel if configuration file is absent):drivers/staging/rdma/hfi1/firmware.c
+  		header1 = *ptr;
+  		header2 = *(ptr + 1);
+  		if (header1 != ~header2) {
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
+diff --git a/drivers/staging/hfi1/chip.h b/drivers/staging/hfi1/chip.h
+index e9dd145941a9..27bb8b648612 100644
+--- a/drivers/staging/hfi1/chip.h
++++ b/drivers/staging/hfi1/chip.h
+@@ -387,6 +387,10 @@
+ #define LINK_QUALITY_INFO            0x14
+ #define REMOTE_DEVICE_ID	     0x15
+ 
++/* 8051 lane specific register field IDs */
++#define TX_EQ_SETTINGS		0x00
++#define CHANNEL_LOSS_SETTINGS	0x05
++
+ /* Lane ID for general configuration registers */
+ #define GENERAL_CONFIG 4
+ 
+* Unmerged path drivers/staging/hfi1/firmware.c
+diff --git a/drivers/staging/hfi1/qsfp.c b/drivers/staging/hfi1/qsfp.c
+index c9d1e64ef681..42e5be494fca 100644
+--- a/drivers/staging/hfi1/qsfp.c
++++ b/drivers/staging/hfi1/qsfp.c
+@@ -344,7 +344,6 @@ int refresh_qsfp_cache(struct hfi1_pportdata *ppd, struct qsfp_data *cp)
+ 	ppd->qsfp_info.cache_valid = 0;
+ 	spin_unlock_irqrestore(&ppd->qsfp_info.qsfp_lock, flags);
+ 
+-	dd_dev_info(ppd->dd, "%s called\n", __func__);
+ 	if (!qsfp_mod_present(ppd)) {
+ 		ret = -ENODEV;
+ 		goto bail;
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
