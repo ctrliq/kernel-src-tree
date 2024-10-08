@@ -1,0 +1,223 @@
+openvswitch: Allow each vport to have an array of 'port_id's.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] openvswitch: Allow each vport to have an array of 'port_id's (Jiri Benc) [1110384]
+Rebuild_FUZZ: 99.17%
+commit-author Alex Wang <alexw@nicira.com>
+commit 5cd667b0a4567048bb555927d6ee564f4e5620a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5cd667b0.failed
+
+In order to allow handlers directly read upcalls from datapath,
+we need to support per-handler netlink socket for each vport in
+datapath.  This commit makes this happen.  Also, it is guaranteed
+to be backward compatible with previous branch.
+
+	Signed-off-by: Alex Wang <alexw@nicira.com>
+	Acked-by: Thomas Graf <tgraf@redhat.com>
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+(cherry picked from commit 5cd667b0a4567048bb555927d6ee564f4e5620a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport.c
+diff --cc net/openvswitch/vport.c
+index 6f65dbe13812,702fb21bfe15..000000000000
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@@ -134,8 -137,10 +134,14 @@@ struct vport *ovs_vport_alloc(int priv_
+  	vport->ops = ops;
+  	INIT_HLIST_NODE(&vport->dp_hash_node);
+  
+++<<<<<<< HEAD
+ +	vport->percpu_stats = alloc_percpu(struct pcpu_tstats);
+++=======
++ 	if (ovs_vport_set_upcall_portids(vport, parms->upcall_portids))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	vport->percpu_stats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+++>>>>>>> 5cd667b0a456 (openvswitch: Allow each vport to have an array of 'port_id's.)
+  	if (!vport->percpu_stats) {
+  		kfree(vport);
+  		return ERR_PTR(-ENOMEM);
+diff --git a/include/uapi/linux/openvswitch.h b/include/uapi/linux/openvswitch.h
+index fe980edbaed3..52734003a44e 100644
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@ -118,6 +118,9 @@ struct ovs_vport_stats {
+ /* Allow last Netlink attribute to be unaligned */
+ #define OVS_DP_F_UNALIGNED	(1 << 0)
+ 
++/* Allow datapath to associate multiple Netlink PIDs to each vport */
++#define OVS_DP_F_VPORT_PIDS	(1 << 1)
++
+ /* Fixed logical ports. */
+ #define OVSP_LOCAL      ((__u32)0)
+ 
+@@ -203,9 +206,10 @@ enum ovs_vport_type {
+  * this is the name of the network device.  Maximum length %IFNAMSIZ-1 bytes
+  * plus a null terminator.
+  * @OVS_VPORT_ATTR_OPTIONS: Vport-specific configuration information.
+- * @OVS_VPORT_ATTR_UPCALL_PID: The Netlink socket in userspace that
+- * OVS_PACKET_CMD_MISS upcalls will be directed to for packets received on
+- * this port.  A value of zero indicates that upcalls should not be sent.
++ * @OVS_VPORT_ATTR_UPCALL_PID: The array of Netlink socket pids in userspace
++ * among which OVS_PACKET_CMD_MISS upcalls will be distributed for packets
++ * received on this port.  If this is a single-element array of value 0,
++ * upcalls should not be sent.
+  * @OVS_VPORT_ATTR_STATS: A &struct ovs_vport_stats giving statistics for
+  * packets sent or received through the vport.
+  *
+@@ -229,7 +233,8 @@ enum ovs_vport_attr {
+ 	OVS_VPORT_ATTR_TYPE,	/* u32 OVS_VPORT_TYPE_* constant. */
+ 	OVS_VPORT_ATTR_NAME,	/* string name, up to IFNAMSIZ bytes long */
+ 	OVS_VPORT_ATTR_OPTIONS, /* nested attributes, varies by vport type */
+-	OVS_VPORT_ATTR_UPCALL_PID, /* u32 Netlink PID to receive upcalls */
++	OVS_VPORT_ATTR_UPCALL_PID, /* array of u32 Netlink socket PIDs for */
++				/* receiving upcalls */
+ 	OVS_VPORT_ATTR_STATS,	/* struct ovs_vport_stats */
+ 	__OVS_VPORT_ATTR_MAX
+ };
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 18b658c8c6ae..c12c1f6cecab 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -241,7 +241,7 @@ void ovs_dp_process_received_packet(struct vport *p, struct sk_buff *skb)
+ 		upcall.cmd = OVS_PACKET_CMD_MISS;
+ 		upcall.key = &key;
+ 		upcall.userdata = NULL;
+-		upcall.portid = p->upcall_portid;
++		upcall.portid = ovs_vport_find_upcall_portid(p, skb);
+ 		ovs_dp_upcall(dp, skb, &upcall);
+ 		consume_skb(skb);
+ 		stats_counter = &stats->n_missed;
+@@ -1239,7 +1239,7 @@ static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	parms.options = NULL;
+ 	parms.dp = dp;
+ 	parms.port_no = OVSP_LOCAL;
+-	parms.upcall_portid = nla_get_u32(a[OVS_DP_ATTR_UPCALL_PID]);
++	parms.upcall_portids = a[OVS_DP_ATTR_UPCALL_PID];
+ 
+ 	ovs_dp_change(dp, a);
+ 
+@@ -1492,8 +1492,8 @@ static int ovs_vport_cmd_fill_info(struct vport *vport, struct sk_buff *skb,
+ 
+ 	if (nla_put_u32(skb, OVS_VPORT_ATTR_PORT_NO, vport->port_no) ||
+ 	    nla_put_u32(skb, OVS_VPORT_ATTR_TYPE, vport->ops->type) ||
+-	    nla_put_string(skb, OVS_VPORT_ATTR_NAME, vport->ops->get_name(vport)) ||
+-	    nla_put_u32(skb, OVS_VPORT_ATTR_UPCALL_PID, vport->upcall_portid))
++	    nla_put_string(skb, OVS_VPORT_ATTR_NAME,
++			   vport->ops->get_name(vport)))
+ 		goto nla_put_failure;
+ 
+ 	ovs_vport_get_stats(vport, &vport_stats);
+@@ -1501,6 +1501,9 @@ static int ovs_vport_cmd_fill_info(struct vport *vport, struct sk_buff *skb,
+ 		    &vport_stats))
+ 		goto nla_put_failure;
+ 
++	if (ovs_vport_get_upcall_portids(vport, skb))
++		goto nla_put_failure;
++
+ 	err = ovs_vport_get_options(vport, skb);
+ 	if (err == -EMSGSIZE)
+ 		goto error;
+@@ -1615,7 +1618,7 @@ static int ovs_vport_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	parms.options = a[OVS_VPORT_ATTR_OPTIONS];
+ 	parms.dp = dp;
+ 	parms.port_no = port_no;
+-	parms.upcall_portid = nla_get_u32(a[OVS_VPORT_ATTR_UPCALL_PID]);
++	parms.upcall_portids = a[OVS_VPORT_ATTR_UPCALL_PID];
+ 
+ 	vport = new_vport(&parms);
+ 	err = PTR_ERR(vport);
+@@ -1670,8 +1673,14 @@ static int ovs_vport_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 			goto exit_free;
+ 	}
+ 
+-	if (a[OVS_VPORT_ATTR_UPCALL_PID])
+-		vport->upcall_portid = nla_get_u32(a[OVS_VPORT_ATTR_UPCALL_PID]);
++
++	if (a[OVS_VPORT_ATTR_UPCALL_PID]) {
++		struct nlattr *ids = a[OVS_VPORT_ATTR_UPCALL_PID];
++
++		err = ovs_vport_set_upcall_portids(vport, ids);
++		if (err)
++			goto exit_unlock_free;
++	}
+ 
+ 	err = ovs_vport_cmd_fill_info(vport, reply, info->snd_portid,
+ 				      info->snd_seq, 0, OVS_VPORT_CMD_NEW);
+* Unmerged path net/openvswitch/vport.c
+diff --git a/net/openvswitch/vport.h b/net/openvswitch/vport.h
+index d846ea3148ce..f5a70deba066 100644
+--- a/net/openvswitch/vport.h
++++ b/net/openvswitch/vport.h
+@@ -23,6 +23,7 @@
+ #include <linux/list.h>
+ #include <linux/netlink.h>
+ #include <linux/openvswitch.h>
++#include <linux/reciprocal_div.h>
+ #include <linux/skbuff.h>
+ #include <linux/spinlock.h>
+ #include <linux/u64_stats_sync.h>
+@@ -52,6 +53,10 @@ void ovs_vport_get_stats(struct vport *, struct ovs_vport_stats *);
+ int ovs_vport_set_options(struct vport *, struct nlattr *options);
+ int ovs_vport_get_options(const struct vport *, struct sk_buff *);
+ 
++int ovs_vport_set_upcall_portids(struct vport *, struct nlattr *pids);
++int ovs_vport_get_upcall_portids(const struct vport *, struct sk_buff *);
++u32 ovs_vport_find_upcall_portid(const struct vport *, struct sk_buff *);
++
+ int ovs_vport_send(struct vport *, struct sk_buff *);
+ 
+ /* The following definitions are for implementers of vport devices: */
+@@ -62,13 +67,27 @@ struct vport_err_stats {
+ 	u64 tx_dropped;
+ 	u64 tx_errors;
+ };
++/**
++ * struct vport_portids - array of netlink portids of a vport.
++ *                        must be protected by rcu.
++ * @rn_ids: The reciprocal value of @n_ids.
++ * @rcu: RCU callback head for deferred destruction.
++ * @n_ids: Size of @ids array.
++ * @ids: Array storing the Netlink socket pids to be used for packets received
++ * on this port that miss the flow table.
++ */
++struct vport_portids {
++	struct reciprocal_value rn_ids;
++	struct rcu_head rcu;
++	u32 n_ids;
++	u32 ids[];
++};
+ 
+ /**
+  * struct vport - one port within a datapath
+  * @rcu: RCU callback head for deferred destruction.
+  * @dp: Datapath to which this port belongs.
+- * @upcall_portid: The Netlink port to use for packets received on this port that
+- * miss the flow table.
++ * @upcall_portids: RCU protected 'struct vport_portids'.
+  * @port_no: Index into @dp's @ports array.
+  * @hash_node: Element in @dev_table hash table in vport.c.
+  * @dp_hash_node: Element in @datapath->ports hash table in datapath.c.
+@@ -80,7 +99,7 @@ struct vport_err_stats {
+ struct vport {
+ 	struct rcu_head rcu;
+ 	struct datapath	*dp;
+-	u32 upcall_portid;
++	struct vport_portids __rcu *upcall_portids;
+ 	u16 port_no;
+ 
+ 	struct hlist_node hash_node;
+@@ -111,7 +130,7 @@ struct vport_parms {
+ 	/* For ovs_vport_alloc(). */
+ 	struct datapath *dp;
+ 	u16 port_no;
+-	u32 upcall_portid;
++	struct nlattr *upcall_portids;
+ };
+ 
+ /**
