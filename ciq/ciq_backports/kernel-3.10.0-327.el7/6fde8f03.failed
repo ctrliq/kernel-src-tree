@@ -1,0 +1,170 @@
+bonding: fix locking in bond_loadbalance_arp_mon()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ding Tianhong <dingtianhong@huawei.com>
+commit 6fde8f037e604e05df1529e4689041715d6d55d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6fde8f03.failed
+
+The commit 1d3ee88ae0d605629bf369
+(bonding: add netlink attributes to slave link dev)
+has add rtmsg_ifinfo() in bond_set_active_slave() and
+bond_set_backup_slave(), so the two function need to
+called in RTNL lock, but bond_loadbalance_arp_mon()
+only calling these functions in RCU, warning message
+will occurs.
+
+fix this by add a new function bond_slave_state_change(),
+which will reset the slave's state after slave link check,
+so remove the bond_set_xxx_slave() from the cycle and only
+record the slave_state_changed, this will call the new
+function to set all slaves to new state in RTNL later.
+
+	Cc: Jay Vosburgh <fubar@us.ibm.com>
+	Cc: Veaceslav Falico <vfalico@redhat.com>
+	Cc: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6fde8f037e604e05df1529e4689041715d6d55d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 102682489f45,4c08018d7333..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2647,19 -2345,15 +2647,24 @@@ void bond_loadbalance_arp_mon(struct wo
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    arp_work.work);
+  	struct slave *slave, *oldcurrent;
+++<<<<<<< HEAD
+ +	int do_failover = 0;
+ +	int delta_in_ticks, extra_ticks;
+ +	int i;
+++=======
++ 	struct list_head *iter;
++ 	int do_failover = 0, slave_state_changed = 0;
+++>>>>>>> 6fde8f037e60 (bonding: fix locking in bond_loadbalance_arp_mon())
+  
+ -	if (!bond_has_slaves(bond))
+ -		goto re_arm;
+ +	read_lock(&bond->lock);
+  
+ -	rcu_read_lock();
+ +	delta_in_ticks = msecs_to_jiffies(bond->params.arp_interval);
+ +	extra_ticks = delta_in_ticks / 2;
+  
+ -	oldcurrent = ACCESS_ONCE(bond->curr_active_slave);
+ +	if (bond->slave_cnt == 0)
+ +		goto re_arm;
+ +
+ +	oldcurrent = bond->curr_active_slave;
+  	/* see if any of the previous devices are up now (i.e. they have
+  	 * xmt and rcv traffic). the curr_active_slave does not come into
+  	 * the picture unless it is null. also, slave->jiffies is not needed
+@@@ -2672,15 -2366,11 +2677,15 @@@
+  		unsigned long trans_start = dev_trans_start(slave->dev);
+  
+  		if (slave->link != BOND_LINK_UP) {
+ -			if (bond_time_in_interval(bond, trans_start, 1) &&
+ -			    bond_time_in_interval(bond, slave->dev->last_rx, 1)) {
+ +			if (time_in_range(jiffies,
+ +				trans_start - delta_in_ticks,
+ +				trans_start + delta_in_ticks + extra_ticks) &&
+ +			    time_in_range(jiffies,
+ +				slave->dev->last_rx - delta_in_ticks,
+ +				slave->dev->last_rx + delta_in_ticks + extra_ticks)) {
+  
+  				slave->link  = BOND_LINK_UP;
+- 				bond_set_active_slave(slave);
++ 				slave_state_changed = 1;
+  
+  				/* primary_slave has no meaning in round-robin
+  				 * mode. the window of a slave being up and
+@@@ -2705,15 -2395,11 +2710,15 @@@
+  			 * when the source ip is 0, so don't take the link down
+  			 * if we don't know our ip yet
+  			 */
+ -			if (!bond_time_in_interval(bond, trans_start, 2) ||
+ -			    !bond_time_in_interval(bond, slave->dev->last_rx, 2)) {
+ +			if (!time_in_range(jiffies,
+ +				trans_start - delta_in_ticks,
+ +				trans_start + 2 * delta_in_ticks + extra_ticks) ||
+ +			    !time_in_range(jiffies,
+ +				slave->dev->last_rx - delta_in_ticks,
+ +				slave->dev->last_rx + 2 * delta_in_ticks + extra_ticks)) {
+  
+  				slave->link  = BOND_LINK_DOWN;
+- 				bond_set_backup_slave(slave);
++ 				slave_state_changed = 1;
+  
+  				if (slave->link_failure_count < UINT_MAX)
+  					slave->link_failure_count++;
+@@@ -2738,14 -2424,27 +2743,38 @@@
+  			bond_arp_send_all(bond, slave);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (do_failover) {
+ +		block_netpoll_tx();
+ +		write_lock_bh(&bond->curr_slave_lock);
+++=======
++ 	rcu_read_unlock();
+  
+- 		bond_select_active_slave(bond);
++ 	if (do_failover || slave_state_changed) {
++ 		if (!rtnl_trylock())
++ 			goto re_arm;
+++>>>>>>> 6fde8f037e60 (bonding: fix locking in bond_loadbalance_arp_mon())
+  
++ 		if (slave_state_changed) {
++ 			bond_slave_state_change(bond);
++ 		} else if (do_failover) {
++ 			/* the bond_select_active_slave must hold RTNL
++ 			 * and curr_slave_lock for write.
++ 			 */
++ 			block_netpoll_tx();
++ 			write_lock_bh(&bond->curr_slave_lock);
++ 
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		unblock_netpoll_tx();
+++=======
++ 			bond_select_active_slave(bond);
++ 
++ 			write_unlock_bh(&bond->curr_slave_lock);
++ 			unblock_netpoll_tx();
++ 		}
++ 		rtnl_unlock();
+++>>>>>>> 6fde8f037e60 (bonding: fix locking in bond_loadbalance_arp_mon())
+  	}
+  
+  re_arm:
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 6097f0c04b95..5c4bc1fdf018 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -301,6 +301,19 @@ static inline void bond_set_backup_slave(struct slave *slave)
+ 	slave->backup = 1;
+ }
+ 
++static inline void bond_slave_state_change(struct bonding *bond)
++{
++	struct list_head *iter;
++	struct slave *tmp;
++
++	bond_for_each_slave(bond, tmp, iter) {
++		if (tmp->link == BOND_LINK_UP)
++			bond_set_active_slave(tmp);
++		else if (tmp->link == BOND_LINK_DOWN)
++			bond_set_backup_slave(tmp);
++	}
++}
++
+ static inline int bond_slave_state(struct slave *slave)
+ {
+ 	return slave->backup;
