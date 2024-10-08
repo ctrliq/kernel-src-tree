@@ -1,0 +1,251 @@
+IB/hfi1: Fix pio map initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jubin John <jubin.john@intel.com>
+commit f158486527ebfb4c1fe4dcb69b12479090d66b72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f1584865.failed
+
+The pio map initialization function is off by 1 causing the last
+kernel send context that is allocated to not get mapped into the
+pio map which leads to the last kernel send context not being used
+by any of the qps.
+
+The send context reserved for VL15 is taken care of by setting the
+scontext variable that is used as the index into the kernel send
+context array to 1 and does not need to be accounted for in the
+kernel send context counting loop as it is currently done.
+
+Fix the kernel send context counting loop to account for all the
+allocated send contexts and map all of them to the different VLs.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Jianxin Xiong <jianxin.xiong@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f158486527ebfb4c1fe4dcb69b12479090d66b72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/pio.c
+diff --cc drivers/staging/hfi1/pio.c
+index d2fa2da3517d,d5edb1afbb8f..000000000000
+--- a/drivers/staging/hfi1/pio.c
++++ b/drivers/staging/hfi1/pio.c
+@@@ -1688,6 -1718,209 +1688,212 @@@ done
+  	spin_unlock(&dd->sc_lock);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/pio.c
+++=======
++ /*
++  * pio_select_send_context_vl() - select send context
++  * @dd: devdata
++  * @selector: a spreading factor
++  * @vl: this vl
++  *
++  * This function returns a send context based on the selector and a vl.
++  * The mapping fields are protected by RCU
++  */
++ struct send_context *pio_select_send_context_vl(struct hfi1_devdata *dd,
++ 						u32 selector, u8 vl)
++ {
++ 	struct pio_vl_map *m;
++ 	struct pio_map_elem *e;
++ 	struct send_context *rval;
++ 
++ 	/*
++ 	 * NOTE This should only happen if SC->VL changed after the initial
++ 	 * checks on the QP/AH
++ 	 * Default will return VL0's send context below
++ 	 */
++ 	if (unlikely(vl >= num_vls)) {
++ 		rval = NULL;
++ 		goto done;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	m = rcu_dereference(dd->pio_map);
++ 	if (unlikely(!m)) {
++ 		rcu_read_unlock();
++ 		return dd->vld[0].sc;
++ 	}
++ 	e = m->map[vl & m->mask];
++ 	rval = e->ksc[selector & e->mask];
++ 	rcu_read_unlock();
++ 
++ done:
++ 	rval = !rval ? dd->vld[0].sc : rval;
++ 	return rval;
++ }
++ 
++ /*
++  * pio_select_send_context_sc() - select send context
++  * @dd: devdata
++  * @selector: a spreading factor
++  * @sc5: the 5 bit sc
++  *
++  * This function returns an send context based on the selector and an sc
++  */
++ struct send_context *pio_select_send_context_sc(struct hfi1_devdata *dd,
++ 						u32 selector, u8 sc5)
++ {
++ 	u8 vl = sc_to_vlt(dd, sc5);
++ 
++ 	return pio_select_send_context_vl(dd, selector, vl);
++ }
++ 
++ /*
++  * Free the indicated map struct
++  */
++ static void pio_map_free(struct pio_vl_map *m)
++ {
++ 	int i;
++ 
++ 	for (i = 0; m && i < m->actual_vls; i++)
++ 		kfree(m->map[i]);
++ 	kfree(m);
++ }
++ 
++ /*
++  * Handle RCU callback
++  */
++ static void pio_map_rcu_callback(struct rcu_head *list)
++ {
++ 	struct pio_vl_map *m = container_of(list, struct pio_vl_map, list);
++ 
++ 	pio_map_free(m);
++ }
++ 
++ /*
++  * pio_map_init - called when #vls change
++  * @dd: hfi1_devdata
++  * @port: port number
++  * @num_vls: number of vls
++  * @vl_scontexts: per vl send context mapping (optional)
++  *
++  * This routine changes the mapping based on the number of vls.
++  *
++  * vl_scontexts is used to specify a non-uniform vl/send context
++  * loading. NULL implies auto computing the loading and giving each
++  * VL an uniform distribution of send contexts per VL.
++  *
++  * The auto algorithm computers the sc_per_vl and the number of extra
++  * send contexts. Any extra send contexts are added from the last VL
++  * on down
++  *
++  * rcu locking is used here to control access to the mapping fields.
++  *
++  * If either the num_vls or num_send_contexts are non-power of 2, the
++  * array sizes in the struct pio_vl_map and the struct pio_map_elem are
++  * rounded up to the next highest power of 2 and the first entry is
++  * reused in a round robin fashion.
++  *
++  * If an error occurs the map change is not done and the mapping is not
++  * chaged.
++  *
++  */
++ int pio_map_init(struct hfi1_devdata *dd, u8 port, u8 num_vls, u8 *vl_scontexts)
++ {
++ 	int i, j;
++ 	int extra, sc_per_vl;
++ 	int scontext = 1;
++ 	int num_kernel_send_contexts = 0;
++ 	u8 lvl_scontexts[OPA_MAX_VLS];
++ 	struct pio_vl_map *oldmap, *newmap;
++ 
++ 	if (!vl_scontexts) {
++ 		for (i = 0; i < dd->num_send_contexts; i++)
++ 			if (dd->send_contexts[i].type == SC_KERNEL)
++ 				num_kernel_send_contexts++;
++ 		/* truncate divide */
++ 		sc_per_vl = num_kernel_send_contexts / num_vls;
++ 		/* extras */
++ 		extra = num_kernel_send_contexts % num_vls;
++ 		vl_scontexts = lvl_scontexts;
++ 		/* add extras from last vl down */
++ 		for (i = num_vls - 1; i >= 0; i--, extra--)
++ 			vl_scontexts[i] = sc_per_vl + (extra > 0 ? 1 : 0);
++ 	}
++ 	/* build new map */
++ 	newmap = kzalloc(sizeof(*newmap) +
++ 			 roundup_pow_of_two(num_vls) *
++ 			 sizeof(struct pio_map_elem *),
++ 			 GFP_KERNEL);
++ 	if (!newmap)
++ 		goto bail;
++ 	newmap->actual_vls = num_vls;
++ 	newmap->vls = roundup_pow_of_two(num_vls);
++ 	newmap->mask = (1 << ilog2(newmap->vls)) - 1;
++ 	for (i = 0; i < newmap->vls; i++) {
++ 		/* save for wrap around */
++ 		int first_scontext = scontext;
++ 
++ 		if (i < newmap->actual_vls) {
++ 			int sz = roundup_pow_of_two(vl_scontexts[i]);
++ 
++ 			/* only allocate once */
++ 			newmap->map[i] = kzalloc(sizeof(*newmap->map[i]) +
++ 						 sz * sizeof(struct
++ 							     send_context *),
++ 						 GFP_KERNEL);
++ 			if (!newmap->map[i])
++ 				goto bail;
++ 			newmap->map[i]->mask = (1 << ilog2(sz)) - 1;
++ 			/* assign send contexts */
++ 			for (j = 0; j < sz; j++) {
++ 				if (dd->kernel_send_context[scontext])
++ 					newmap->map[i]->ksc[j] =
++ 					dd->kernel_send_context[scontext];
++ 				if (++scontext >= first_scontext +
++ 						  vl_scontexts[i])
++ 					/* wrap back to first send context */
++ 					scontext = first_scontext;
++ 			}
++ 		} else {
++ 			/* just re-use entry without allocating */
++ 			newmap->map[i] = newmap->map[i % num_vls];
++ 		}
++ 		scontext = first_scontext + vl_scontexts[i];
++ 	}
++ 	/* newmap in hand, save old map */
++ 	spin_lock_irq(&dd->pio_map_lock);
++ 	oldmap = rcu_dereference_protected(dd->pio_map,
++ 					   lockdep_is_held(&dd->pio_map_lock));
++ 
++ 	/* publish newmap */
++ 	rcu_assign_pointer(dd->pio_map, newmap);
++ 
++ 	spin_unlock_irq(&dd->pio_map_lock);
++ 	/* success, free any old map after grace period */
++ 	if (oldmap)
++ 		call_rcu(&oldmap->list, pio_map_rcu_callback);
++ 	return 0;
++ bail:
++ 	/* free any partial allocation */
++ 	pio_map_free(newmap);
++ 	return -ENOMEM;
++ }
++ 
++ void free_pio_map(struct hfi1_devdata *dd)
++ {
++ 	/* Free PIO map if allocated */
++ 	if (rcu_access_pointer(dd->pio_map)) {
++ 		spin_lock_irq(&dd->pio_map_lock);
++ 		pio_map_free(rcu_access_pointer(dd->pio_map));
++ 		RCU_INIT_POINTER(dd->pio_map, NULL);
++ 		spin_unlock_irq(&dd->pio_map_lock);
++ 		synchronize_rcu();
++ 	}
++ 	kfree(dd->kernel_send_context);
++ 	dd->kernel_send_context = NULL;
++ }
++ 
+++>>>>>>> f158486527eb (IB/hfi1: Fix pio map initialization):drivers/infiniband/hw/hfi1/pio.c
+  int init_pervl_scs(struct hfi1_devdata *dd)
+  {
+  	int i;
+* Unmerged path drivers/staging/hfi1/pio.c
