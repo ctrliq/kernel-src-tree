@@ -1,0 +1,257 @@
+KVM: MMU: use slot_handle_level and its helper to clean up the code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] mmu: use slot_handle_level and its helper to clean up the code (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 96.12%
+commit-author Xiao Guangrong <guangrong.xiao@linux.intel.com>
+commit d77aa73c7072c598a6d1f3a781c0e4fae067df76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d77aa73c.failed
+
+slot_handle_level and its helper functions are ready now, use them to
+clean up the code
+
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d77aa73c7072c598a6d1f3a781c0e4fae067df76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 10d8f908481b,ed239c696056..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4318,36 -4454,88 +4318,121 @@@ void kvm_mmu_setup(struct kvm_vcpu *vcp
+  	init_kvm_mmu(vcpu);
+  }
+  
+++<<<<<<< HEAD
+ +void kvm_mmu_slot_remove_write_access(struct kvm *kvm, int slot)
+ +{
+ +	struct kvm_memory_slot *memslot;
+ +	gfn_t last_gfn;
+ +	int i;
+ +	bool flush = false;
+ +
+ +	memslot = id_to_memslot(kvm->memslots, slot);
+ +	last_gfn = memslot->base_gfn + memslot->npages - 1;
+ +
+ +	spin_lock(&kvm->mmu_lock);
+ +
+ +	for (i = PT_PAGE_TABLE_LEVEL;
+ +	     i < PT_PAGE_TABLE_LEVEL + KVM_NR_PAGE_SIZES; ++i) {
+ +		unsigned long *rmapp;
+ +		unsigned long last_index, index;
+ +
+ +		rmapp = memslot->arch.rmap[i - PT_PAGE_TABLE_LEVEL];
+ +		last_index = gfn_to_index(last_gfn, memslot->base_gfn, i);
+ +
+ +		for (index = 0; index <= last_index; ++index, ++rmapp) {
+ +			if (*rmapp)
+ +				flush |= __rmap_write_protect(kvm, rmapp,
+ +						false);
+ +
+ +			if (need_resched() || spin_needbreak(&kvm->mmu_lock))
+ +				cond_resched_lock(&kvm->mmu_lock);
+ +		}
+ +	}
+ +
+++=======
++ /* The return value indicates if tlb flush on all vcpus is needed. */
++ typedef bool (*slot_level_handler) (struct kvm *kvm, unsigned long *rmap);
++ 
++ /* The caller should hold mmu-lock before calling this function. */
++ static bool
++ slot_handle_level_range(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 			slot_level_handler fn, int start_level, int end_level,
++ 			gfn_t start_gfn, gfn_t end_gfn, bool lock_flush_tlb)
++ {
++ 	struct slot_rmap_walk_iterator iterator;
++ 	bool flush = false;
++ 
++ 	for_each_slot_rmap_range(memslot, start_level, end_level, start_gfn,
++ 			end_gfn, &iterator) {
++ 		if (iterator.rmap)
++ 			flush |= fn(kvm, iterator.rmap);
++ 
++ 		if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++ 			if (flush && lock_flush_tlb) {
++ 				kvm_flush_remote_tlbs(kvm);
++ 				flush = false;
++ 			}
++ 			cond_resched_lock(&kvm->mmu_lock);
++ 		}
++ 	}
++ 
++ 	if (flush && lock_flush_tlb) {
++ 		kvm_flush_remote_tlbs(kvm);
++ 		flush = false;
++ 	}
++ 
++ 	return flush;
++ }
++ 
++ static bool
++ slot_handle_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		  slot_level_handler fn, int start_level, int end_level,
++ 		  bool lock_flush_tlb)
++ {
++ 	return slot_handle_level_range(kvm, memslot, fn, start_level,
++ 			end_level, memslot->base_gfn,
++ 			memslot->base_gfn + memslot->npages - 1,
++ 			lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_all_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		      slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_large_level(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 			slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL + 1,
++ 				 PT_MAX_HUGEPAGE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool
++ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 		 slot_level_handler fn, bool lock_flush_tlb)
++ {
++ 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
++ 				 PT_PAGE_TABLE_LEVEL, lock_flush_tlb);
++ }
++ 
++ static bool slot_rmap_write_protect(struct kvm *kvm, unsigned long *rmapp)
++ {
++ 	return __rmap_write_protect(kvm, rmapp, false);
++ }
++ 
++ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
++ 				      struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_all_level(kvm, memslot, slot_rmap_write_protect,
++ 				      false);
+++>>>>>>> d77aa73c7072 (KVM: MMU: use slot_handle_level and its helper to clean up the code)
+  	spin_unlock(&kvm->mmu_lock);
+  
+  	/*
+@@@ -4372,6 -4560,104 +4457,107 @@@
+  		kvm_flush_remote_tlbs(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
++ 		unsigned long *rmapp)
++ {
++ 	u64 *sptep;
++ 	struct rmap_iterator iter;
++ 	int need_tlb_flush = 0;
++ 	pfn_t pfn;
++ 	struct kvm_mmu_page *sp;
++ 
++ restart:
++ 	for_each_rmap_spte(rmapp, &iter, sptep) {
++ 		sp = page_header(__pa(sptep));
++ 		pfn = spte_to_pfn(*sptep);
++ 
++ 		/*
++ 		 * We cannot do huge page mapping for indirect shadow pages,
++ 		 * which are found on the last rmap (level = 1) when not using
++ 		 * tdp; such shadow pages are synced with the page table in
++ 		 * the guest, and the guest page table is using 4K page size
++ 		 * mapping if the indirect sp has level = 1.
++ 		 */
++ 		if (sp->role.direct &&
++ 			!kvm_is_reserved_pfn(pfn) &&
++ 			PageTransCompound(pfn_to_page(pfn))) {
++ 			drop_spte(kvm, sptep);
++ 			need_tlb_flush = 1;
++ 			goto restart;
++ 		}
++ 	}
++ 
++ 	return need_tlb_flush;
++ }
++ 
++ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
++ 			struct kvm_memory_slot *memslot)
++ {
++ 	spin_lock(&kvm->mmu_lock);
++ 	slot_handle_leaf(kvm, memslot, kvm_mmu_zap_collapsible_spte, true);
++ 	spin_unlock(&kvm->mmu_lock);
++ }
++ 
++ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
++ 				   struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/*
++ 	 * It's also safe to flush TLBs out of mmu lock here as currently this
++ 	 * function is only used for dirty logging, in which case flushing TLB
++ 	 * out of mmu lock also guarantees no dirty pages will be lost in
++ 	 * dirty_bitmap.
++ 	 */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_leaf_clear_dirty);
++ 
++ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
++ 					struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_large_level(kvm, memslot, slot_rmap_write_protect,
++ 					false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	/* see kvm_mmu_slot_remove_write_access */
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_largepage_remove_write_access);
++ 
++ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
++ 			    struct kvm_memory_slot *memslot)
++ {
++ 	bool flush;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	flush = slot_handle_all_level(kvm, memslot, __rmap_set_dirty, false);
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	lockdep_assert_held(&kvm->slots_lock);
++ 
++ 	/* see kvm_mmu_slot_leaf_clear_dirty */
++ 	if (flush)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_slot_set_dirty);
++ 
+++>>>>>>> d77aa73c7072 (KVM: MMU: use slot_handle_level and its helper to clean up the code)
+  #define BATCH_ZAP_PAGES	10
+  static void kvm_zap_obsolete_pages(struct kvm *kvm)
+  {
+* Unmerged path arch/x86/kvm/mmu.c
