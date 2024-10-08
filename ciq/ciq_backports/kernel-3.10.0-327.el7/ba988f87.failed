@@ -1,0 +1,162 @@
+libceph: tcp_nodelay support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Chaitanya Huilgol <chaitanya.huilgol@gmail.com>
+commit ba988f87f532cd2b8c4740aa8ec49056521ae833
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ba988f87.failed
+
+TCP_NODELAY socket option set on connection sockets,
+disables Nagle’s algorithm and improves latency characteristics.
+tcp_nodelay(default)/notcp_nodelay option flags provided to
+enable/disable setting the socket option.
+
+	Signed-off-by: Chaitanya Huilgol <chaitanya.huilgol@sandisk.com>
+[idryomov@redhat.com: NO_TCP_NODELAY -> TCP_NODELAY, minor adjustments]
+	Signed-off-by: Ilya Dryomov <idryomov@redhat.com>
+(cherry picked from commit ba988f87f532cd2b8c4740aa8ec49056521ae833)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/libceph.h
+#	net/ceph/ceph_common.c
+diff --cc include/linux/ceph/libceph.h
+index 696c7fd7f49c,16fff9608848..000000000000
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@@ -29,8 -29,10 +29,13 @@@
+  #define CEPH_OPT_NOSHARE          (1<<1) /* don't share client with other sbs */
+  #define CEPH_OPT_MYIP             (1<<2) /* specified my ip */
+  #define CEPH_OPT_NOCRC            (1<<3) /* no data crc on writes */
+++<<<<<<< HEAD
+++=======
++ #define CEPH_OPT_NOMSGAUTH	  (1<<4) /* not require cephx message signature */
++ #define CEPH_OPT_TCP_NODELAY	  (1<<5) /* TCP_NODELAY on TCP sockets */
+++>>>>>>> ba988f87f532 (libceph: tcp_nodelay support)
+  
+- #define CEPH_OPT_DEFAULT   (0)
++ #define CEPH_OPT_DEFAULT   (CEPH_OPT_TCP_NODELAY)
+  
+  #define ceph_set_opt(client, opt) \
+  	(client)->options->flags |= CEPH_OPT_##opt;
+diff --cc net/ceph/ceph_common.c
+index 58fbfe134f93,ec565508e904..000000000000
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@@ -245,6 -237,10 +245,13 @@@ enum 
+  	Opt_noshare,
+  	Opt_crc,
+  	Opt_nocrc,
+++<<<<<<< HEAD
+++=======
++ 	Opt_cephx_require_signatures,
++ 	Opt_nocephx_require_signatures,
++ 	Opt_tcp_nodelay,
++ 	Opt_notcp_nodelay,
+++>>>>>>> ba988f87f532 (libceph: tcp_nodelay support)
+  };
+  
+  static match_table_t opt_tokens = {
+@@@ -263,6 -259,10 +270,13 @@@
+  	{Opt_noshare, "noshare"},
+  	{Opt_crc, "crc"},
+  	{Opt_nocrc, "nocrc"},
+++<<<<<<< HEAD
+++=======
++ 	{Opt_cephx_require_signatures, "cephx_require_signatures"},
++ 	{Opt_nocephx_require_signatures, "nocephx_require_signatures"},
++ 	{Opt_tcp_nodelay, "tcp_nodelay"},
++ 	{Opt_notcp_nodelay, "notcp_nodelay"},
+++>>>>>>> ba988f87f532 (libceph: tcp_nodelay support)
+  	{-1, NULL}
+  };
+  
+@@@ -461,6 -461,20 +475,23 @@@ ceph_parse_options(char *options, cons
+  		case Opt_nocrc:
+  			opt->flags |= CEPH_OPT_NOCRC;
+  			break;
+++<<<<<<< HEAD
+++=======
++ 
++ 		case Opt_cephx_require_signatures:
++ 			opt->flags &= ~CEPH_OPT_NOMSGAUTH;
++ 			break;
++ 		case Opt_nocephx_require_signatures:
++ 			opt->flags |= CEPH_OPT_NOMSGAUTH;
++ 			break;
+++>>>>>>> ba988f87f532 (libceph: tcp_nodelay support)
++ 
++ 		case Opt_tcp_nodelay:
++ 			opt->flags |= CEPH_OPT_TCP_NODELAY;
++ 			break;
++ 		case Opt_notcp_nodelay:
++ 			opt->flags &= ~CEPH_OPT_TCP_NODELAY;
++ 			break;
+  
+  		default:
+  			BUG_ON(token);
+* Unmerged path include/linux/ceph/libceph.h
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index 08840502c99e..27a33858369e 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -52,6 +52,7 @@ struct ceph_messenger {
+ 
+ 	atomic_t stopping;
+ 	bool nocrc;
++	bool tcp_nodelay;
+ 
+ 	/*
+ 	 * the global_seq counts connections i (attempt to) initiate
+@@ -257,7 +258,8 @@ extern void ceph_messenger_init(struct ceph_messenger *msgr,
+ 			struct ceph_entity_addr *myaddr,
+ 			u64 supported_features,
+ 			u64 required_features,
+-			bool nocrc);
++			bool nocrc,
++			bool tcp_nodelay);
+ 
+ extern void ceph_con_init(struct ceph_connection *con, void *private,
+ 			const struct ceph_connection_operations *ops,
+* Unmerged path net/ceph/ceph_common.c
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index ccc54158a220..224e46e1055a 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -507,6 +507,16 @@ static int ceph_tcp_connect(struct ceph_connection *con)
+ 		return ret;
+ 	}
+ 
++	if (con->msgr->tcp_nodelay) {
++		int optval = 1;
++
++		ret = kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY,
++					(char *)&optval, sizeof(optval));
++		if (ret)
++			pr_err("kernel_setsockopt(TCP_NODELAY) failed: %d",
++			       ret);
++	}
++
+ 	sk_set_memalloc(sock->sk);
+ 
+ 	con->sock = sock;
+@@ -2898,7 +2908,8 @@ void ceph_messenger_init(struct ceph_messenger *msgr,
+ 			struct ceph_entity_addr *myaddr,
+ 			u64 supported_features,
+ 			u64 required_features,
+-			bool nocrc)
++			bool nocrc,
++			bool tcp_nodelay)
+ {
+ 	msgr->supported_features = supported_features;
+ 	msgr->required_features = required_features;
+@@ -2913,6 +2924,7 @@ void ceph_messenger_init(struct ceph_messenger *msgr,
+ 	get_random_bytes(&msgr->inst.addr.nonce, sizeof(msgr->inst.addr.nonce));
+ 	encode_my_addr(msgr);
+ 	msgr->nocrc = nocrc;
++	msgr->tcp_nodelay = tcp_nodelay;
+ 
+ 	atomic_set(&msgr->stopping, 0);
+ 
