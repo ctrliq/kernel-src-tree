@@ -1,0 +1,335 @@
+tools/power turbostat: enable turbostat to support Knights Landing (KNL)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [tools] power turbostat: enable turbostat to support Knights Landing (KNL) (Steve Best) [1214141]
+Rebuild_FUZZ: 95.65%
+commit-author Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+commit fb5d432722e186c656285ccc088e35dbe24f6fd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fb5d4327.failed
+
+Changes mainly to account for minor differences in Knights Landing(KNL):
+1. KNL supports C1 and C6 core states.
+2. KNL supports PC2, PC3 and PC6 package states.
+3. KNL has a different encoding of the TURBO_RATIO_LIMIT MSR
+
+	Signed-off-by: Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+	Signed-off-by: Len Brown <len.brown@intel.com>
+(cherry picked from commit fb5d432722e186c656285ccc088e35dbe24f6fd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/power/x86/turbostat/turbostat.c
+diff --cc tools/power/x86/turbostat/turbostat.c
+index 2cde6f87104d,256a5e1de381..000000000000
+--- a/tools/power/x86/turbostat/turbostat.c
++++ b/tools/power/x86/turbostat/turbostat.c
+@@@ -53,7 -52,13 +53,15 @@@ unsigned int skip_c0
+  unsigned int skip_c1;
+  unsigned int do_nhm_cstates;
+  unsigned int do_snb_cstates;
+++<<<<<<< HEAD
+++=======
++ unsigned int do_knl_cstates;
++ unsigned int do_pc2;
++ unsigned int do_pc3;
++ unsigned int do_pc6;
++ unsigned int do_pc7;
+++>>>>>>> fb5d432722e1 (tools/power turbostat: enable turbostat to support Knights Landing (KNL))
+  unsigned int do_c8_c9_c10;
+ -unsigned int do_skl_residency;
+  unsigned int do_slm_cstates;
+  unsigned int use_c1_residency_msr;
+  unsigned int has_aperf;
+@@@ -297,9 -308,16 +305,9 @@@ void print_header(void
+  		outp += sprintf(outp, "   MSR 0x%03X", extra_msr_offset32);
+  	if (extra_msr_offset64)
+  		outp += sprintf(outp, "           MSR 0x%03X", extra_msr_offset64);
+ -
+ -	if (!debug)
+ -		goto done;
+ -
+ -	if (do_smi)
+ -		outp += sprintf(outp, "     SMI");
+ -
+  	if (do_nhm_cstates)
+  		outp += sprintf(outp, "  CPU%%c1");
+- 	if (do_nhm_cstates && !do_slm_cstates)
++ 	if (do_nhm_cstates && !do_slm_cstates && !do_knl_cstates)
+  		outp += sprintf(outp, "  CPU%%c3");
+  	if (do_nhm_cstates)
+  		outp += sprintf(outp, "  CPU%%c6");
+@@@ -1179,6 -1296,91 +1190,94 @@@ print_nhm_turbo_ratio_limits
+  	if (ratio)
+  		fprintf(stderr, "%d * %.0f = %.0f MHz max turbo 1 active cores\n",
+  			ratio, bclk, ratio * bclk);
+++<<<<<<< HEAD
+++=======
++ 	return;
++ }
++ 
++ static void
++ dump_knl_turbo_ratio_limits(void)
++ {
++ 	int cores;
++ 	unsigned int ratio;
++ 	unsigned long long msr;
++ 	int delta_cores;
++ 	int delta_ratio;
++ 	int i;
++ 
++ 	get_msr(0, MSR_NHM_TURBO_RATIO_LIMIT, &msr);
++ 
++ 	fprintf(stderr, "cpu0: MSR_NHM_TURBO_RATIO_LIMIT: 0x%08llx\n",
++ 	msr);
++ 
++ 	/**
++ 	 * Turbo encoding in KNL is as follows:
++ 	 * [7:0] -- Base value of number of active cores of bucket 1.
++ 	 * [15:8] -- Base value of freq ratio of bucket 1.
++ 	 * [20:16] -- +ve delta of number of active cores of bucket 2.
++ 	 * i.e. active cores of bucket 2 =
++ 	 * active cores of bucket 1 + delta
++ 	 * [23:21] -- Negative delta of freq ratio of bucket 2.
++ 	 * i.e. freq ratio of bucket 2 =
++ 	 * freq ratio of bucket 1 - delta
++ 	 * [28:24]-- +ve delta of number of active cores of bucket 3.
++ 	 * [31:29]-- -ve delta of freq ratio of bucket 3.
++ 	 * [36:32]-- +ve delta of number of active cores of bucket 4.
++ 	 * [39:37]-- -ve delta of freq ratio of bucket 4.
++ 	 * [44:40]-- +ve delta of number of active cores of bucket 5.
++ 	 * [47:45]-- -ve delta of freq ratio of bucket 5.
++ 	 * [52:48]-- +ve delta of number of active cores of bucket 6.
++ 	 * [55:53]-- -ve delta of freq ratio of bucket 6.
++ 	 * [60:56]-- +ve delta of number of active cores of bucket 7.
++ 	 * [63:61]-- -ve delta of freq ratio of bucket 7.
++ 	 */
++ 	cores = msr & 0xFF;
++ 	ratio = (msr >> 8) && 0xFF;
++ 	if (ratio > 0)
++ 		fprintf(stderr,
++ 			"%d * %.0f = %.0f MHz max turbo %d active cores\n",
++ 			ratio, bclk, ratio * bclk, cores);
++ 
++ 	for (i = 16; i < 64; i = i + 8) {
++ 		delta_cores = (msr >> i) & 0x1F;
++ 		delta_ratio = (msr >> (i + 5)) && 0x7;
++ 		if (!delta_cores || !delta_ratio)
++ 			return;
++ 		cores = cores + delta_cores;
++ 		ratio = ratio - delta_ratio;
++ 
++ 		/** -ve ratios will make successive ratio calculations
++ 		 * negative. Hence return instead of carrying on.
++ 		 */
++ 		if (ratio > 0)
++ 			fprintf(stderr,
++ 				"%d * %.0f = %.0f MHz max turbo %d active cores\n",
++ 				ratio, bclk, ratio * bclk, cores);
++ 	}
++ }
++ 
++ static void
++ dump_nhm_cst_cfg(void)
++ {
++ 	unsigned long long msr;
++ 
++ 	get_msr(0, MSR_NHM_SNB_PKG_CST_CFG_CTL, &msr);
++ 
++ #define SNB_C1_AUTO_UNDEMOTE              (1UL << 27)
++ #define SNB_C3_AUTO_UNDEMOTE              (1UL << 28)
++ 
++ 	fprintf(stderr, "cpu0: MSR_NHM_SNB_PKG_CST_CFG_CTL: 0x%08llx", msr);
++ 
++ 	fprintf(stderr, " (%s%s%s%s%slocked: pkg-cstate-limit=%d: %s)\n",
++ 		(msr & SNB_C3_AUTO_UNDEMOTE) ? "UNdemote-C3, " : "",
++ 		(msr & SNB_C1_AUTO_UNDEMOTE) ? "UNdemote-C1, " : "",
++ 		(msr & NHM_C3_AUTO_DEMOTE) ? "demote-C3, " : "",
++ 		(msr & NHM_C1_AUTO_DEMOTE) ? "demote-C1, " : "",
++ 		(msr & (1 << 15)) ? "" : "UN",
++ 		(unsigned int)msr & 7,
++ 		pkg_cstate_limit_strings[pkg_cstate_limit]);
++ 	return;
+++>>>>>>> fb5d432722e1 (tools/power turbostat: enable turbostat to support Knights Landing (KNL))
+  }
+  
+  void free_all_buffers(void)
+@@@ -1610,6 -1837,60 +1709,63 @@@ int has_ivt_turbo_ratio_limit(unsigned 
+  		return 0;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ int has_hsw_turbo_ratio_limit(unsigned int family, unsigned int model)
++ {
++ 	if (!genuine_intel)
++ 		return 0;
++ 
++ 	if (family != 6)
++ 		return 0;
++ 
++ 	switch (model) {
++ 	case 0x3F:	/* HSW Xeon */
++ 		return 1;
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
++ int has_knl_turbo_ratio_limit(unsigned int family, unsigned int model)
++ {
++ 	if (!genuine_intel)
++ 		return 0;
++ 
++ 	if (family != 6)
++ 		return 0;
++ 
++ 	switch (model) {
++ 	case 0x57:	/* Knights Landing */
++ 		return 1;
++ 	default:
++ 		return 0;
++ 	}
++ }
++ static void
++ dump_cstate_pstate_config_info(family, model)
++ {
++ 	if (!do_nhm_platform_info)
++ 		return;
++ 
++ 	dump_nhm_platform_info();
++ 
++ 	if (has_hsw_turbo_ratio_limit(family, model))
++ 		dump_hsw_turbo_ratio_limits();
++ 
++ 	if (has_ivt_turbo_ratio_limit(family, model))
++ 		dump_ivt_turbo_ratio_limits();
++ 
++ 	if (has_nhm_turbo_ratio_limit(family, model))
++ 		dump_nhm_turbo_ratio_limits();
++ 
++ 	if (has_knl_turbo_ratio_limit(family, model))
++ 		dump_knl_turbo_ratio_limits();
++ 
++ 	dump_nhm_cst_cfg();
++ }
++ 
+++>>>>>>> fb5d432722e1 (tools/power turbostat: enable turbostat to support Knights Landing (KNL))
+  
+  /*
+   * print_epb()
+@@@ -1721,10 -2100,18 +1878,17 @@@ void rapl_probe(unsigned int family, un
+  	case 0x45:	/* HSW */
+  	case 0x46:	/* HSW */
+  	case 0x3D:	/* BDW */
+ -	case 0x47:	/* BDW */
+  		do_rapl = RAPL_PKG | RAPL_CORES | RAPL_CORE_POLICY | RAPL_GFX | RAPL_PKG_POWER_INFO;
+  		break;
+ -	case 0x4E:	/* SKL */
+ -	case 0x5E:	/* SKL */
+ -		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
+ -		break;
+  	case 0x3F:	/* HSX */
+++<<<<<<< HEAD
+ +		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
+++=======
++ 	case 0x4F:	/* BDX */
++ 	case 0x56:	/* BDX-DE */
++ 	case 0x57:	/* KNL */
++ 		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_POWER_INFO | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
+++>>>>>>> fb5d432722e1 (tools/power turbostat: enable turbostat to support Knights Landing (KNL))
+  		break;
+  	case 0x2D:
+  	case 0x3E:
+@@@ -2178,25 -2621,65 +2353,26 @@@ void check_cpuid(
+  	do_ptm = eax & (1 << 6);
+  	has_epb = ecx & (1 << 3);
+  
+ -	if (debug)
+ -		fprintf(stderr, "CPUID(6): %sAPERF, %sDTS, %sPTM, %sEPB\n",
+ -			has_aperf ? "" : "No ",
+ -			do_dts ? "" : "No ",
+ -			do_ptm ? "" : "No ",
+ -			has_epb ? "" : "No ");
+ +	if (verbose)
+ +		fprintf(stderr, "CPUID(6): %s%s%s%s\n",
+ +			has_aperf ? "APERF" : "No APERF!",
+ +			do_dts ? ", DTS" : "",
+ +			do_ptm ? ", PTM": "",
+ +			has_epb ? ", EPB": "");
+  
+ -	if (max_level > 0x15) {
+ -		unsigned int eax_crystal;
+ -		unsigned int ebx_tsc;
+ +	if (!has_aperf)
+ +		errx(-1, "No APERF");
+  
+ -		/*
+ -		 * CPUID 15H TSC/Crystal ratio, possibly Crystal Hz
+ -		 */
+ -		eax_crystal = ebx_tsc = crystal_hz = edx = 0;
+ -		__get_cpuid(0x15, &eax_crystal, &ebx_tsc, &crystal_hz, &edx);
+ -
+ -		if (ebx_tsc != 0) {
+ -
+ -			if (debug && (ebx != 0))
+ -				fprintf(stderr, "CPUID(0x15): eax_crystal: %d ebx_tsc: %d ecx_crystal_hz: %d\n",
+ -					eax_crystal, ebx_tsc, crystal_hz);
+ -
+ -			if (crystal_hz == 0)
+ -				switch(model) {
+ -				case 0x4E:	/* SKL */
+ -				case 0x5E:	/* SKL */
+ -					crystal_hz = 24000000;	/* 24 MHz */
+ -					break;
+ -				default:
+ -					crystal_hz = 0;
+ -			}
+ -
+ -			if (crystal_hz) {
+ -				tsc_hz =  (unsigned long long) crystal_hz * ebx_tsc / eax_crystal;
+ -				if (debug)
+ -					fprintf(stderr, "TSC: %lld MHz (%d Hz * %d / %d / 1000000)\n",
+ -						tsc_hz / 1000000, crystal_hz, ebx_tsc,  eax_crystal);
+ -			}
+ -		}
+ -	}
+ -
+ -	do_nhm_platform_info = do_nhm_cstates = do_smi = probe_nhm_msrs(family, model);
+ +	do_nhm_platform_info = do_nhm_cstates = do_smi = has_nhm_msrs(family, model);
+  	do_snb_cstates = has_snb_msrs(family, model);
+ -	do_pc2 = do_snb_cstates && (pkg_cstate_limit >= PCL__2);
+ -	do_pc3 = (pkg_cstate_limit >= PCL__3);
+ -	do_pc6 = (pkg_cstate_limit >= PCL__6);
+ -	do_pc7 = do_snb_cstates && (pkg_cstate_limit >= PCL__7);
+  	do_c8_c9_c10 = has_hsw_msrs(family, model);
+ -	do_skl_residency = has_skl_msrs(family, model);
+  	do_slm_cstates = is_slm(family, model);
++ 	do_knl_cstates  = is_knl(family, model);
+  	bclk = discover_bclk(family, model);
+  
+ +	do_nhm_turbo_ratio_limit = has_nhm_turbo_ratio_limit(family, model);
+ +	do_ivt_turbo_ratio_limit = has_ivt_turbo_ratio_limit(family, model);
+  	rapl_probe(family, model);
+ -	perf_limit_reasons_probe(family, model);
+ -
+ -	if (debug)
+ -		dump_cstate_pstate_config_info();
+  
+  	return;
+  }
+diff --git a/arch/x86/include/uapi/asm/msr-index.h b/arch/x86/include/uapi/asm/msr-index.h
+index f65b439cb0f7..708886cfa360 100644
+--- a/arch/x86/include/uapi/asm/msr-index.h
++++ b/arch/x86/include/uapi/asm/msr-index.h
+@@ -122,6 +122,7 @@
+ #define MSR_CORE_C3_RESIDENCY		0x000003fc
+ #define MSR_CORE_C6_RESIDENCY		0x000003fd
+ #define MSR_CORE_C7_RESIDENCY		0x000003fe
++#define MSR_KNL_CORE_C6_RESIDENCY	0x000003ff
+ #define MSR_PKG_C2_RESIDENCY		0x0000060d
+ #define MSR_PKG_C8_RESIDENCY		0x00000630
+ #define MSR_PKG_C9_RESIDENCY		0x00000631
+* Unmerged path tools/power/x86/turbostat/turbostat.c
