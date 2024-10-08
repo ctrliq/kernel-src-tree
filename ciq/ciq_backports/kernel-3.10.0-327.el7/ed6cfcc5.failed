@@ -1,0 +1,171 @@
+Drivers: hv: vmbus: Introduce a function to remove a rescinded offer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: Introduce a function to remove a rescinded offer (Vitaly Kuznetsov) [1203682]
+Rebuild_FUZZ: 89.43%
+commit-author K. Y. Srinivasan <kys@microsoft.com>
+commit ed6cfcc5fdf2ebca320b6f74c836e555e18216e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ed6cfcc5.failed
+
+In response to a rescind message, we need to remove the channel and the
+corresponding device. Cleanup this code path by factoring out the code
+to remove a channel.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ed6cfcc5fdf2ebca320b6f74c836e555e18216e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 143d8f6191ee,2b7b51d264f1..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -378,14 -508,26 +378,34 @@@ static int vmbus_probe(struct device *c
+   */
+  static int vmbus_remove(struct device *child_device)
+  {
+ -	struct hv_driver *drv;
+ +	struct hv_driver *drv = drv_to_hv_drv(child_device->driver);
+  	struct hv_device *dev = device_to_hv_device(child_device);
++ 	u32 relid = dev->channel->offermsg.child_relid;
+  
+++<<<<<<< HEAD
+ +	if (drv->remove)
+ +		drv->remove(dev);
+ +	else
+ +		pr_err("remove not set for driver %s\n",
+ +			dev_name(child_device));
+++=======
++ 	if (child_device->driver) {
++ 		drv = drv_to_hv_drv(child_device->driver);
++ 		if (drv->remove)
++ 			drv->remove(dev);
++ 		else {
++ 			hv_process_channel_removal(dev->channel, relid);
++ 			pr_err("remove not set for driver %s\n",
++ 				dev_name(child_device));
++ 		}
++ 	} else {
++ 		/*
++ 		 * We don't have a driver for this device; deal with the
++ 		 * rescind message by removing the channel.
++ 		 */
++ 		hv_process_channel_removal(dev->channel, relid);
++ 	}
+++>>>>>>> ed6cfcc5fdf2 (Drivers: hv: vmbus: Introduce a function to remove a rescinded offer)
+  
+  	return 0;
+  }
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index 45ad7011d110..a8b6d563fe89 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -530,6 +530,15 @@ static void vmbus_close_internal(struct vmbus_channel *channel)
+ 		put_cpu();
+ 	}
+ 
++	/*
++	 * If the channel has been rescinded; process device removal.
++	 */
++	if (channel->rescind) {
++		hv_process_channel_removal(channel,
++					   channel->offermsg.child_relid);
++		return 0;
++	}
++
+ 	/* Send a closing message */
+ 
+ 	msg = &channel->close_msg.msg;
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index f9943186ea53..0f8f25da9743 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -204,33 +204,21 @@ static void percpu_channel_deq(void *arg)
+ 	list_del(&channel->percpu_list);
+ }
+ 
+-/*
+- * vmbus_process_rescind_offer -
+- * Rescind the offer by initiating a device removal
+- */
+-static void vmbus_process_rescind_offer(struct work_struct *work)
++
++void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
+ {
+-	struct vmbus_channel *channel = container_of(work,
+-						     struct vmbus_channel,
+-						     work);
++	struct vmbus_channel_relid_released msg;
+ 	unsigned long flags;
+ 	struct vmbus_channel *primary_channel;
+-	struct vmbus_channel_relid_released msg;
+-	struct device *dev;
+-
+-	if (channel->device_obj) {
+-		dev = get_device(&channel->device_obj->device);
+-		if (dev) {
+-			vmbus_device_unregister(channel->device_obj);
+-			put_device(dev);
+-		}
+-	}
+ 
+ 	memset(&msg, 0, sizeof(struct vmbus_channel_relid_released));
+-	msg.child_relid = channel->offermsg.child_relid;
++	msg.child_relid = relid;
+ 	msg.header.msgtype = CHANNELMSG_RELID_RELEASED;
+ 	vmbus_post_msg(&msg, sizeof(struct vmbus_channel_relid_released));
+ 
++	if (channel == NULL)
++		return;
++
+ 	if (channel->target_cpu != get_cpu()) {
+ 		put_cpu();
+ 		smp_call_function_single(channel->target_cpu,
+@@ -253,6 +241,29 @@ static void vmbus_process_rescind_offer(struct work_struct *work)
+ 	free_channel(channel);
+ }
+ 
++/*
++ * vmbus_process_rescind_offer -
++ * Rescind the offer by initiating a device removal
++ */
++static void vmbus_process_rescind_offer(struct work_struct *work)
++{
++	struct vmbus_channel *channel = container_of(work,
++						     struct vmbus_channel,
++						     work);
++	struct device *dev;
++
++	if (channel->device_obj) {
++		dev = get_device(&channel->device_obj->device);
++		if (dev) {
++			vmbus_device_unregister(channel->device_obj);
++			put_device(dev);
++		}
++	} else {
++		hv_process_channel_removal(channel,
++					   channel->offermsg.child_relid);
++	}
++}
++
+ void vmbus_free_channels(void)
+ {
+ 	struct vmbus_channel *channel;
+* Unmerged path drivers/hv/vmbus_drv.c
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 55d525dc7600..63db4c140193 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -1209,6 +1209,7 @@ void hv_kvp_onchannelcallback(void *);
+ int hv_vss_init(struct hv_util_service *);
+ void hv_vss_deinit(void);
+ void hv_vss_onchannelcallback(void *);
++void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid);
+ 
+ extern struct resource hyperv_mmio;
+ 
