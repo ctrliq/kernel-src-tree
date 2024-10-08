@@ -1,0 +1,183 @@
+openvswitch: Minimize dp and vport critical sections.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] openvswitch: Minimize dp and vport critical sections (Jiri Benc) [1110384]
+Rebuild_FUZZ: 99.05%
+commit-author Jarno Rajahalme <jrajahalme@nicira.com>
+commit 6093ae9abac18871afd0bbc5cf093dff53112fcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/6093ae9a.failed
+
+Move most memory allocations away from the ovs_mutex critical
+sections.  vport allocations still happen while the lock is taken, as
+changing that would require major refactoring. Also, vports are
+created very rarely so it should not matter.
+
+Change ovs_dp_cmd_get() now only takes the rcu_read_lock(), rather
+than ovs_lock(), as nothing need to be changed.  This was done by
+ovs_vport_cmd_get() already.
+
+	Signed-off-by: Jarno Rajahalme <jrajahalme@nicira.com>
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+(cherry picked from commit 6093ae9abac18871afd0bbc5cf093dff53112fcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/datapath.c
+diff --cc net/openvswitch/datapath.c
+index d01b30b9528a,f3bcdac80bda..000000000000
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@@ -1271,12 -1291,11 +1261,11 @@@ static int ovs_dp_cmd_new(struct sk_buf
+  
+  	ovs_unlock();
+  
+ -	ovs_notify(&dp_datapath_genl_family, reply, info);
+ +	ovs_notify(reply, info, &ovs_dp_datapath_multicast_group);
+  	return 0;
+  
+- err_destroy_local_port:
+- 	ovs_dp_detach_port(ovs_vport_ovsl(dp, OVSP_LOCAL));
+  err_destroy_ports_array:
++ 	ovs_unlock();
+  	kfree(dp->ports);
+  err_destroy_percpu:
+  	free_percpu(dp->stats_percpu);
+@@@ -1338,11 -1360,13 +1330,13 @@@ static int ovs_dp_cmd_del(struct sk_buf
+  	__dp_destroy(dp);
+  	ovs_unlock();
+  
+ -	ovs_notify(&dp_datapath_genl_family, reply, info);
+ +	ovs_notify(reply, info, &ovs_dp_datapath_multicast_group);
+  
+  	return 0;
+- unlock:
++ 
++ err_unlock_free:
+  	ovs_unlock();
++ 	kfree_skb(reply);
+  	return err;
+  }
+  
+@@@ -1360,21 -1388,18 +1358,29 @@@ static int ovs_dp_cmd_set(struct sk_buf
+  
+  	ovs_dp_change(dp, info->attrs);
+  
+++<<<<<<< HEAD
+ +	reply = ovs_dp_cmd_build_info(dp, info, OVS_DP_CMD_NEW);
+ +	if (IS_ERR(reply)) {
+ +		err = PTR_ERR(reply);
+ +		genl_set_err(sock_net(skb->sk), 0,
+ +			     ovs_dp_datapath_multicast_group.id, err);
+ +		err = 0;
+ +		goto unlock;
+ +	}
+++=======
++ 	err = ovs_dp_cmd_fill_info(dp, reply, info->snd_portid,
++ 				   info->snd_seq, 0, OVS_DP_CMD_NEW);
++ 	BUG_ON(err < 0);
+++>>>>>>> 6093ae9abac1 (openvswitch: Minimize dp and vport critical sections.)
+  
+  	ovs_unlock();
+ -	ovs_notify(&dp_datapath_genl_family, reply, info);
+ +	ovs_notify(reply, info, &ovs_dp_datapath_multicast_group);
+  
+  	return 0;
+- unlock:
++ 
++ err_unlock_free:
+  	ovs_unlock();
++ 	kfree_skb(reply);
+  	return err;
+  }
+  
+@@@ -1620,22 -1654,19 +1635,23 @@@ static int ovs_vport_cmd_new(struct sk_
+  	vport = new_vport(&parms);
+  	err = PTR_ERR(vport);
+  	if (IS_ERR(vport))
+- 		goto exit_unlock;
++ 		goto exit_unlock_free;
+  
+- 	err = 0;
+- 	reply = ovs_vport_cmd_build_info(vport, info->snd_portid, info->snd_seq,
+- 					 OVS_VPORT_CMD_NEW);
+- 	if (IS_ERR(reply)) {
+- 		err = PTR_ERR(reply);
+- 		ovs_dp_detach_port(vport);
+- 		goto exit_unlock;
+- 	}
++ 	err = ovs_vport_cmd_fill_info(vport, reply, info->snd_portid,
++ 				      info->snd_seq, 0, OVS_VPORT_CMD_NEW);
++ 	BUG_ON(err < 0);
++ 	ovs_unlock();
+  
+++<<<<<<< HEAD
+ +	ovs_notify(reply, info, &ovs_dp_vport_multicast_group);
+++=======
++ 	ovs_notify(&dp_vport_genl_family, reply, info);
++ 	return 0;
+++>>>>>>> 6093ae9abac1 (openvswitch: Minimize dp and vport critical sections.)
+  
+- exit_unlock:
++ exit_unlock_free:
+  	ovs_unlock();
+- exit:
++ 	kfree_skb(reply);
+  	return err;
+  }
+  
+@@@ -1678,13 -1707,12 +1692,12 @@@ static int ovs_vport_cmd_set(struct sk_
+  	BUG_ON(err < 0);
+  
+  	ovs_unlock();
+ -	ovs_notify(&dp_vport_genl_family, reply, info);
+ +	ovs_notify(reply, info, &ovs_dp_vport_multicast_group);
+  	return 0;
+  
+- exit_free:
+- 	kfree_skb(reply);
+- exit_unlock:
++ exit_unlock_free:
+  	ovs_unlock();
++ 	kfree_skb(reply);
+  	return err;
+  }
+  
+@@@ -1703,22 -1735,21 +1720,25 @@@ static int ovs_vport_cmd_del(struct sk_
+  
+  	if (vport->port_no == OVSP_LOCAL) {
+  		err = -EINVAL;
+- 		goto exit_unlock;
++ 		goto exit_unlock_free;
+  	}
+  
+- 	reply = ovs_vport_cmd_build_info(vport, info->snd_portid,
+- 					 info->snd_seq, OVS_VPORT_CMD_DEL);
+- 	err = PTR_ERR(reply);
+- 	if (IS_ERR(reply))
+- 		goto exit_unlock;
+- 
+- 	err = 0;
++ 	err = ovs_vport_cmd_fill_info(vport, reply, info->snd_portid,
++ 				      info->snd_seq, 0, OVS_VPORT_CMD_DEL);
++ 	BUG_ON(err < 0);
+  	ovs_dp_detach_port(vport);
++ 	ovs_unlock();
+  
+++<<<<<<< HEAD
+ +	ovs_notify(reply, info, &ovs_dp_vport_multicast_group);
+++=======
++ 	ovs_notify(&dp_vport_genl_family, reply, info);
++ 	return 0;
+++>>>>>>> 6093ae9abac1 (openvswitch: Minimize dp and vport critical sections.)
+  
+- exit_unlock:
++ exit_unlock_free:
+  	ovs_unlock();
++ 	kfree_skb(reply);
+  	return err;
+  }
+  
+* Unmerged path net/openvswitch/datapath.c
