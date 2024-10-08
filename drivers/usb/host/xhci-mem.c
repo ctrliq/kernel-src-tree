@@ -27,6 +27,7 @@
 #include <linux/dma-mapping.h>
 
 #include "xhci.h"
+#include "xhci-trace.h"
 
 /*
  * Allocates a generic ring segment from the ring pool, sets the dma address,
@@ -658,7 +659,8 @@ void xhci_setup_streams_ep_input_ctx(struct xhci_hcd *xhci,
 	 * fls(0) = 0, fls(0x1) = 1, fls(0x10) = 2, fls(0x100) = 3, etc.
 	 */
 	max_primary_streams = fls(stream_info->num_stream_ctxs) - 2;
-	xhci_dbg(xhci, "Setting number of stream ctx array entries to %u\n",
+	xhci_dbg_trace(xhci,  trace_xhci_dbg_context_change,
+			"Setting number of stream ctx array entries to %u",
 			1 << (max_primary_streams + 1));
 	ep_ctx->ep_info &= cpu_to_le32(~EP_MAXPSTREAMS_MASK);
 	ep_ctx->ep_info |= cpu_to_le32(EP_MAXPSTREAMS(max_primary_streams)
