@@ -1,0 +1,258 @@
+x86/microcode: Consolidate family,model, ... code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] microcode: Consolidate family, model, ... code (Prarit Bhargava) [1253762]
+Rebuild_FUZZ: 94.74%
+commit-author Borislav Petkov <bp@suse.de>
+commit 58ce8d6d3a7616014dc70fd8d8f945176d74957c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/58ce8d6d.failed
+
+... to the header. Split the family acquiring function into a
+main one, doing CPUID and a helper which computes the extended
+family and is used in multiple places. Get rid of the locally-grown
+get_x86_{family,model}().
+
+While at it, rename local variables to something more descriptive and
+vertically align assignments for better readability.
+
+There should be no functionality change resulting from this patch.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 58ce8d6d3a7616014dc70fd8d8f945176d74957c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/core_early.c
+diff --cc arch/x86/kernel/cpu/microcode/core_early.c
+index 2c017f242a78,a413a69cbd74..000000000000
+--- a/arch/x86/kernel/cpu/microcode/core_early.c
++++ b/arch/x86/kernel/cpu/microcode/core_early.c
+@@@ -176,3 -125,24 +125,27 @@@ int __init save_microcode_in_initrd(voi
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void reload_early_microcode(void)
++ {
++ 	int vendor, family;
++ 
++ 	vendor = x86_vendor();
++ 	family = x86_family();
++ 
++ 	switch (vendor) {
++ 	case X86_VENDOR_INTEL:
++ 		if (family >= 6)
++ 			reload_ucode_intel();
++ 		break;
++ 	case X86_VENDOR_AMD:
++ 		if (family >= 0x10)
++ 			reload_ucode_amd();
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ }
+++>>>>>>> 58ce8d6d3a76 (x86/microcode: Consolidate family,model, ... code)
+diff --git a/arch/x86/include/asm/microcode.h b/arch/x86/include/asm/microcode.h
+index 64dc362506b7..a54b28798e85 100644
+--- a/arch/x86/include/asm/microcode.h
++++ b/arch/x86/include/asm/microcode.h
+@@ -75,6 +75,79 @@ static inline void __exit exit_amd_microcode(void) {}
+ 
+ #ifdef CONFIG_MICROCODE_EARLY
+ #define MAX_UCODE_COUNT 128
++
++#define QCHAR(a, b, c, d) ((a) + ((b) << 8) + ((c) << 16) + ((d) << 24))
++#define CPUID_INTEL1 QCHAR('G', 'e', 'n', 'u')
++#define CPUID_INTEL2 QCHAR('i', 'n', 'e', 'I')
++#define CPUID_INTEL3 QCHAR('n', 't', 'e', 'l')
++#define CPUID_AMD1 QCHAR('A', 'u', 't', 'h')
++#define CPUID_AMD2 QCHAR('e', 'n', 't', 'i')
++#define CPUID_AMD3 QCHAR('c', 'A', 'M', 'D')
++
++#define CPUID_IS(a, b, c, ebx, ecx, edx)	\
++		(!((ebx ^ (a))|(edx ^ (b))|(ecx ^ (c))))
++
++/*
++ * In early loading microcode phase on BSP, boot_cpu_data is not set up yet.
++ * x86_vendor() gets vendor id for BSP.
++ *
++ * In 32 bit AP case, accessing boot_cpu_data needs linear address. To simplify
++ * coding, we still use x86_vendor() to get vendor id for AP.
++ *
++ * x86_vendor() gets vendor information directly from CPUID.
++ */
++static inline int x86_vendor(void)
++{
++	u32 eax = 0x00000000;
++	u32 ebx, ecx = 0, edx;
++
++	native_cpuid(&eax, &ebx, &ecx, &edx);
++
++	if (CPUID_IS(CPUID_INTEL1, CPUID_INTEL2, CPUID_INTEL3, ebx, ecx, edx))
++		return X86_VENDOR_INTEL;
++
++	if (CPUID_IS(CPUID_AMD1, CPUID_AMD2, CPUID_AMD3, ebx, ecx, edx))
++		return X86_VENDOR_AMD;
++
++	return X86_VENDOR_UNKNOWN;
++}
++
++static inline unsigned int __x86_family(unsigned int sig)
++{
++	unsigned int x86;
++
++	x86 = (sig >> 8) & 0xf;
++
++	if (x86 == 0xf)
++		x86 += (sig >> 20) & 0xff;
++
++	return x86;
++}
++
++static inline unsigned int x86_family(void)
++{
++	u32 eax = 0x00000001;
++	u32 ebx, ecx = 0, edx;
++
++	native_cpuid(&eax, &ebx, &ecx, &edx);
++
++	return __x86_family(eax);
++}
++
++static inline unsigned int x86_model(unsigned int sig)
++{
++	unsigned int x86, model;
++
++	x86 = __x86_family(sig);
++
++	model = (sig >> 4) & 0xf;
++
++	if (x86 == 0x6 || x86 == 0xf)
++		model += ((sig >> 16) & 0xf) << 4;
++
++	return model;
++}
++
+ extern void __init load_ucode_bsp(void);
+ extern void load_ucode_ap(void);
+ extern int __init save_microcode_in_initrd(void);
+* Unmerged path arch/x86/kernel/cpu/microcode/core_early.c
+diff --git a/arch/x86/kernel/cpu/microcode/intel_early.c b/arch/x86/kernel/cpu/microcode/intel_early.c
+index e82c44063360..d761ab58643a 100644
+--- a/arch/x86/kernel/cpu/microcode/intel_early.c
++++ b/arch/x86/kernel/cpu/microcode/intel_early.c
+@@ -126,31 +126,6 @@ load_microcode(struct mc_saved_data *mc_saved_data,
+ 	}
+ }
+ 
+-static u8 get_x86_family(unsigned long sig)
+-{
+-	u8 x86;
+-
+-	x86 = (sig >> 8) & 0xf;
+-
+-	if (x86 == 0xf)
+-		x86 += (sig >> 20) & 0xff;
+-
+-	return x86;
+-}
+-
+-static u8 get_x86_model(unsigned long sig)
+-{
+-	u8 x86, x86_model;
+-
+-	x86 = get_x86_family(sig);
+-	x86_model = (sig >> 4) & 0xf;
+-
+-	if (x86 == 0x6 || x86 == 0xf)
+-		x86_model += ((sig >> 16) & 0xf) << 4;
+-
+-	return x86_model;
+-}
+-
+ /*
+  * Given CPU signature and a microcode patch, this function finds if the
+  * microcode patch has matching family and model with the CPU.
+@@ -159,41 +134,40 @@ static enum ucode_state
+ matching_model_microcode(struct microcode_header_intel *mc_header,
+ 			unsigned long sig)
+ {
+-	u8 x86, x86_model;
+-	u8 x86_ucode, x86_model_ucode;
++	unsigned int fam, model;
++	unsigned int fam_ucode, model_ucode;
+ 	struct extended_sigtable *ext_header;
+ 	unsigned long total_size = get_totalsize(mc_header);
+ 	unsigned long data_size = get_datasize(mc_header);
+ 	int ext_sigcount, i;
+ 	struct extended_signature *ext_sig;
+ 
+-	x86 = get_x86_family(sig);
+-	x86_model = get_x86_model(sig);
++	fam   = __x86_family(sig);
++	model = x86_model(sig);
+ 
+-	x86_ucode = get_x86_family(mc_header->sig);
+-	x86_model_ucode = get_x86_model(mc_header->sig);
++	fam_ucode   = __x86_family(mc_header->sig);
++	model_ucode = x86_model(mc_header->sig);
+ 
+-	if (x86 == x86_ucode && x86_model == x86_model_ucode)
++	if (fam == fam_ucode && model == model_ucode)
+ 		return UCODE_OK;
+ 
+ 	/* Look for ext. headers: */
+ 	if (total_size <= data_size + MC_HEADER_SIZE)
+ 		return UCODE_NFOUND;
+ 
+-	ext_header = (void *) mc_header + data_size + MC_HEADER_SIZE;
++	ext_header   = (void *) mc_header + data_size + MC_HEADER_SIZE;
++	ext_sig      = (void *)ext_header + EXT_HEADER_SIZE;
+ 	ext_sigcount = ext_header->count;
+-	ext_sig = (void *)ext_header + EXT_HEADER_SIZE;
+ 
+ 	for (i = 0; i < ext_sigcount; i++) {
+-		x86_ucode = get_x86_family(ext_sig->sig);
+-		x86_model_ucode = get_x86_model(ext_sig->sig);
++		fam_ucode   = __x86_family(ext_sig->sig);
++		model_ucode = x86_model(ext_sig->sig);
+ 
+-		if (x86 == x86_ucode && x86_model == x86_model_ucode)
++		if (fam == fam_ucode && model == model_ucode)
+ 			return UCODE_OK;
+ 
+ 		ext_sig++;
+ 	}
+-
+ 	return UCODE_NFOUND;
+ }
+ 
+@@ -374,7 +348,7 @@ out:
+ static int collect_cpu_info_early(struct ucode_cpu_info *uci)
+ {
+ 	unsigned int val[2];
+-	u8 x86, x86_model;
++	unsigned int family, model;
+ 	struct cpu_signature csig;
+ 	unsigned int eax, ebx, ecx, edx;
+ 
+@@ -389,10 +363,10 @@ static int collect_cpu_info_early(struct ucode_cpu_info *uci)
+ 	native_cpuid(&eax, &ebx, &ecx, &edx);
+ 	csig.sig = eax;
+ 
+-	x86 = get_x86_family(csig.sig);
+-	x86_model = get_x86_model(csig.sig);
++	family = __x86_family(csig.sig);
++	model  = x86_model(csig.sig);
+ 
+-	if ((x86_model >= 5) || (x86 > 6)) {
++	if ((model >= 5) || (family > 6)) {
+ 		/* get processor flags from MSR 0x17 */
+ 		native_rdmsr(MSR_IA32_PLATFORM_ID, val[0], val[1]);
+ 		csig.pf = 1 << ((val[1] >> 18) & 7);
