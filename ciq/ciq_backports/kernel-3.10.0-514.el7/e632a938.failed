@@ -1,0 +1,97 @@
+mm: migrate: add hugepage migration code to move_pages()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] migrate: add hugepage migration code to move_pages() (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 96.30%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit e632a938d914d271bec26e570d36c755a1e35e4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e632a938.failed
+
+Extend move_pages() to handle vma with VM_HUGETLB set.  We will be able to
+migrate hugepage with move_pages(2) after applying the enablement patch
+which comes later in this series.
+
+We avoid getting refcount on tail pages of hugepage, because unlike thp,
+hugepage is not split and we need not care about races with splitting.
+
+And migration of larger (1GB for x86_64) hugepage are not enabled.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Reviewed-by: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Cc: Hillf Danton <dhillf@gmail.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e632a938d914d271bec26e570d36c755a1e35e4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index c1313d07c550,d3137375fa80..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1152,8 -1092,12 +1152,17 @@@ static struct page *new_page_node(struc
+  
+  	*result = &pm->status;
+  
+++<<<<<<< HEAD
+ +	return alloc_pages_exact_node(pm->node,
+ +				GFP_HIGHUSER_MOVABLE | __GFP_THISNODE, 0);
+++=======
++ 	if (PageHuge(p))
++ 		return alloc_huge_page_node(page_hstate(compound_head(p)),
++ 					pm->node);
++ 	else
++ 		return alloc_pages_exact_node(pm->node,
++ 				GFP_HIGHUSER_MOVABLE | GFP_THISNODE, 0);
+++>>>>>>> e632a938d914 (mm: migrate: add hugepage migration code to move_pages())
+  }
+  
+  /*
+diff --git a/mm/memory.c b/mm/memory.c
+index fce51319197b..540a61759e13 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1523,7 +1523,8 @@ struct page *follow_page_mask(struct vm_area_struct *vma,
+ 	if (pud_none(*pud))
+ 		goto no_page_table;
+ 	if (pud_huge(*pud) && vma->vm_flags & VM_HUGETLB) {
+-		BUG_ON(flags & FOLL_GET);
++		if (flags & FOLL_GET)
++			goto out;
+ 		page = follow_huge_pud(mm, address, pud, flags & FOLL_WRITE);
+ 		goto out;
+ 	}
+@@ -1534,8 +1535,20 @@ struct page *follow_page_mask(struct vm_area_struct *vma,
+ 	if (pmd_none(*pmd))
+ 		goto no_page_table;
+ 	if (pmd_huge(*pmd) && vma->vm_flags & VM_HUGETLB) {
+-		BUG_ON(flags & FOLL_GET);
+ 		page = follow_huge_pmd(mm, address, pmd, flags & FOLL_WRITE);
++		if (flags & FOLL_GET) {
++			/*
++			 * Refcount on tail pages are not well-defined and
++			 * shouldn't be taken. The caller should handle a NULL
++			 * return when trying to follow tail pages.
++			 */
++			if (PageHead(page))
++				get_page(page);
++			else {
++				page = NULL;
++				goto out;
++			}
++		}
+ 		goto out;
+ 	}
+ 	if ((flags & FOLL_NUMA) && pmd_numa(*pmd))
+* Unmerged path mm/migrate.c
