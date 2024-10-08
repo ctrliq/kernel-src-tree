@@ -1,0 +1,141 @@
+x86, mpx: Cleanup unused bound tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mpx: Cleanup unused bound tables (Rui Wang) [1138650]
+Rebuild_FUZZ: 92.75%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 1de4fa14ee25a8edf287855513b61c3945c8878a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1de4fa14.failed
+
+The previous patch allocates bounds tables on-demand.  As noted in
+an earlier description, these can add up to *HUGE* amounts of
+memory.  This has caused OOMs in practice when running tests.
+
+This patch adds support for freeing bounds tables when they are no
+longer in use.
+
+There are two types of mappings in play when unmapping tables:
+ 1. The mapping with the actual data, which userspace is
+    munmap()ing or brk()ing away, etc...
+ 2. The mapping for the bounds table *backing* the data
+    (is tagged with VM_MPX, see the patch "add MPX specific
+    mmap interface").
+
+If userspace use the prctl() indroduced earlier in this patchset
+to enable the management of bounds tables in kernel, when it
+unmaps the first type of mapping with the actual data, the kernel
+needs to free the mapping for the bounds table backing the data.
+This patch hooks in at the very end of do_unmap() to do so.
+We look at the addresses being unmapped and find the bounds
+directory entries and tables which cover those addresses.  If
+an entire table is unused, we clear associated directory entry
+and free the table.
+
+Once we unmap the bounds table, we would have a bounds directory
+entry pointing at empty address space. That address space might
+now be allocated for some other (random) use, and the MPX
+hardware might now try to walk it as if it were a bounds table.
+That would be bad.  So any unmapping of an enture bounds table
+has to be accompanied by a corresponding write to the bounds
+directory entry to invalidate it.  That write to the bounds
+directory can fault, which causes the following problem:
+
+Since we are doing the freeing from munmap() (and other paths
+like it), we hold mmap_sem for write. If we fault, the page
+fault handler will attempt to acquire mmap_sem for read and
+we will deadlock.  To avoid the deadlock, we pagefault_disable()
+when touching the bounds directory entry and use a
+get_user_pages() to resolve the fault.
+
+The unmapping of bounds tables happends under vm_munmap().  We
+also (indirectly) call vm_munmap() to _do_ the unmapping of the
+bounds tables.  We avoid unbounded recursion by disallowing
+freeing of bounds tables *for* bounds tables.  This would not
+occur normally, so should not have any practical impact.  Being
+strict about it here helps ensure that we do not have an
+exploitable stack overflow.
+
+Based-on-patch-by: Qiaowei Ren <qiaowei.ren@intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: linux-mm@kvack.org
+	Cc: linux-mips@linux-mips.org
+	Cc: Dave Hansen <dave@sr71.net>
+Link: http://lkml.kernel.org/r/20141114151831.E4531C4A@viggo.jf.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 1de4fa14ee25a8edf287855513b61c3945c8878a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mmu_context.h
+#	arch/x86/include/asm/mpx.h
+#	arch/x86/mm/mpx.c
+#	include/asm-generic/mmu_context.h
+diff --cc arch/x86/include/asm/mmu_context.h
+index be12c534fd59,00d4575d5409..000000000000
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@@ -96,4 -103,16 +96,19 @@@ do {						
+  } while (0)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline void arch_bprm_mm_init(struct mm_struct *mm,
++ 		struct vm_area_struct *vma)
++ {
++ 	mpx_mm_init(mm);
++ }
++ 
++ static inline void arch_unmap(struct mm_struct *mm, struct vm_area_struct *vma,
++ 			      unsigned long start, unsigned long end)
++ {
++ 	mpx_notify_unmap(mm, vma, start, end);
++ }
++ 
+++>>>>>>> 1de4fa14ee25 (x86, mpx: Cleanup unused bound tables)
+  #endif /* _ASM_X86_MMU_CONTEXT_H */
+diff --cc include/asm-generic/mmu_context.h
+index a7eec910ba6c,aa2d8ba35b20..000000000000
+--- a/include/asm-generic/mmu_context.h
++++ b/include/asm-generic/mmu_context.h
+@@@ -42,4 -42,15 +42,18 @@@ static inline void activate_mm(struct m
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void arch_bprm_mm_init(struct mm_struct *mm,
++ 			struct vm_area_struct *vma)
++ {
++ }
++ 
++ static inline void arch_unmap(struct mm_struct *mm,
++ 			struct vm_area_struct *vma,
++ 			unsigned long start, unsigned long end)
++ {
++ }
++ 
+++>>>>>>> 1de4fa14ee25 (x86, mpx: Cleanup unused bound tables)
+  #endif /* __ASM_GENERIC_MMU_CONTEXT_H */
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/mm/mpx.c
+* Unmerged path arch/x86/include/asm/mmu_context.h
+* Unmerged path arch/x86/include/asm/mpx.h
+* Unmerged path arch/x86/mm/mpx.c
+* Unmerged path include/asm-generic/mmu_context.h
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 572586dfa6c2..497f415e79c8 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2579,6 +2579,8 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
+ 	detach_vmas_to_be_unmapped(mm, vma, prev, end);
+ 	unmap_region(mm, vma, prev, start, end);
+ 
++	arch_unmap(mm, vma, start, end);
++
+ 	/* Fix up all other VM information */
+ 	remove_vma_list(mm, vma);
+ 
