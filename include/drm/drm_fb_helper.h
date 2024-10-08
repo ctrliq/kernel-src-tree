@@ -86,6 +86,7 @@ struct drm_fb_helper {
 	int crtc_count;
 	struct drm_fb_helper_crtc *crtc_info;
 	int connector_count;
+	int connector_info_alloc_count;
 	struct drm_fb_helper_connector **connector_info;
 	struct drm_fb_helper_funcs *funcs;
 	struct fb_info *fbdev;
@@ -122,4 +123,7 @@ int drm_fb_helper_single_add_all_connectors(struct drm_fb_helper *fb_helper);
 int drm_fb_helper_debug_enter(struct fb_info *info);
 int drm_fb_helper_debug_leave(struct fb_info *info);
 
+int drm_fb_helper_add_one_connector(struct drm_fb_helper *fb_helper, struct drm_connector *connector);
+int drm_fb_helper_remove_one_connector(struct drm_fb_helper *fb_helper,
+				       struct drm_connector *connector);
 #endif
