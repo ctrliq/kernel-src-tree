@@ -1,0 +1,243 @@
+sched/numa: Skip some page migrations after a shared fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Rik van Riel <riel@redhat.com>
+commit de1c9ce6f07fec0381a39a9d0b379ea35aa1167f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/de1c9ce6.failed
+
+Shared faults can lead to lots of unnecessary page migrations,
+slowing down the system, and causing private faults to hit the
+per-pgdat migration ratelimit.
+
+This patch adds sysctl numa_balancing_migrate_deferred, which specifies
+how many shared page migrations to skip unconditionally, after each page
+migration that is skipped because it is a shared fault.
+
+This reduces the number of page migrations back and forth in
+shared fault situations. It also gives a strong preference to
+the tasks that are already running where most of the memory is,
+and to moving the other tasks to near the memory.
+
+Testing this with a much higher scan rate than the default
+still seems to result in fewer page migrations than before.
+
+Memory seems to be somewhat better consolidated than previously,
+with multi-instance specjbb runs on a 4 node system.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1381141781-10992-62-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit de1c9ce6f07fec0381a39a9d0b379ea35aa1167f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/kernel.txt
+#	include/linux/sched.h
+#	kernel/sysctl.c
+#	mm/mempolicy.c
+diff --cc Documentation/sysctl/kernel.txt
+index 77932153d642,4273b2d71a27..000000000000
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@@ -373,8 -374,9 +373,14 @@@ guarantee. If the target workload is al
+  feature should be disabled. Otherwise, if the system overhead from the
+  feature is too high then the rate the kernel samples for NUMA hinting
+  faults may be controlled by the numa_balancing_scan_period_min_ms,
+++<<<<<<< HEAD
+ +numa_balancing_scan_delay_ms, numa_balancing_scan_period_reset,
+ +numa_balancing_scan_period_max_ms and numa_balancing_scan_size_mb sysctls.
+++=======
++ numa_balancing_scan_delay_ms, numa_balancing_scan_period_max_ms,
++ numa_balancing_scan_size_mb, numa_balancing_settle_count sysctls and
++ numa_balancing_migrate_deferred.
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  
+  ==============================================================
+  
+@@@ -416,9 -417,18 +422,16 @@@ rate for each task
+  numa_balancing_scan_size_mb is how many megabytes worth of pages are
+  scanned for a given scan.
+  
+ -numa_balancing_settle_count is how many scan periods must complete before
+ -the schedule balancer stops pushing the task towards a preferred node. This
+ -gives the scheduler a chance to place the task on an alternative node if the
+ -preferred node is overloaded.
+ +numa_balancing_scan_period_reset is a blunt instrument that controls how
+ +often a tasks scan delay is reset to detect sudden changes in task behaviour.
+  
++ numa_balancing_migrate_deferred is how many page migrations get skipped
++ unconditionally, after a page migration is skipped because a page is shared
++ with other tasks. This reduces page migration overhead, and determines
++ how much stronger the "move task near its memory" policy scheduler becomes,
++ versus the "move memory near its task" memory management policy, for workloads
++ with shared memory.
++ 
+  ==============================================================
+  
+  osrelease, ostype & version:
+diff --cc include/linux/sched.h
+index 664a046b12fb,833eed55cf43..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1339,9 -1340,11 +1339,15 @@@ struct task_struct 
+  #endif
+  #ifdef CONFIG_NUMA_BALANCING
+  	int numa_scan_seq;
+ +	int numa_migrate_seq;
+  	unsigned int numa_scan_period;
+  	unsigned int numa_scan_period_max;
+++<<<<<<< HEAD
+++=======
++ 	int numa_preferred_nid;
++ 	int numa_migrate_deferred;
++ 	unsigned long numa_migrate_retry;
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  	u64 node_stamp;			/* migration stamp  */
+  	struct callback_head numa_work;
+  
+@@@ -1359,7 -1366,15 +1365,19 @@@
+  	 */
+  	unsigned long *numa_faults_buffer;
+  
+++<<<<<<< HEAD
+ +	int numa_preferred_nid;
+++=======
++ 	/*
++ 	 * numa_faults_locality tracks if faults recorded during the last
++ 	 * scan window were remote/local. The task scan period is adapted
++ 	 * based on the locality of the faults with different weights
++ 	 * depending on whether they were shared or private faults
++ 	 */
++ 	unsigned long numa_faults_locality[2];
++ 
++ 	unsigned long numa_pages_migrated;
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  #endif /* CONFIG_NUMA_BALANCING */
+  
+  	struct rcu_head rcu;
+@@@ -1441,12 -1460,26 +1459,18 @@@
+  /* Future-safe accessor for struct task_struct's cpus_allowed. */
+  #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+  
+ -#define TNF_MIGRATED	0x01
+ -#define TNF_NO_GROUP	0x02
+ -#define TNF_SHARED	0x04
+ -#define TNF_FAULT_LOCAL	0x08
+ -
+  #ifdef CONFIG_NUMA_BALANCING
+ -extern void task_numa_fault(int last_node, int node, int pages, int flags);
+ -extern pid_t task_numa_group_id(struct task_struct *p);
+ +extern void task_numa_fault(int node, int pages, bool migrated);
+  extern void set_numabalancing_state(bool enabled);
+++<<<<<<< HEAD
+++=======
++ extern void task_numa_free(struct task_struct *p);
++ 
++ extern unsigned int sysctl_numa_balancing_migrate_deferred;
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  #else
+ -static inline void task_numa_fault(int last_node, int node, int pages,
+ -				   int flags)
+ -{
+ -}
+ -static inline pid_t task_numa_group_id(struct task_struct *p)
+ +static inline void task_numa_fault(int node, int pages, bool migrated)
+  {
+ -	return 0;
+  }
+  static inline void set_numabalancing_state(bool enabled)
+  {
+diff --cc kernel/sysctl.c
+index d93ad6b7164b,a159e1fd2013..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -392,6 -384,20 +392,23 @@@ static struct ctl_table kern_table[] = 
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.procname       = "numa_balancing_settle_count",
++ 		.data           = &sysctl_numa_balancing_settle_count,
++ 		.maxlen         = sizeof(unsigned int),
++ 		.mode           = 0644,
++ 		.proc_handler   = proc_dointvec,
++ 	},
++ 	{
++ 		.procname       = "numa_balancing_migrate_deferred",
++ 		.data           = &sysctl_numa_balancing_migrate_deferred,
++ 		.maxlen         = sizeof(unsigned int),
++ 		.mode           = 0644,
++ 		.proc_handler   = proc_dointvec,
++ 	},
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  #endif /* CONFIG_NUMA_BALANCING */
+  #endif /* CONFIG_SCHED_DEBUG */
+  	{
+diff --cc mm/mempolicy.c
+index f05aa4c2c73c,71cb253368cb..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -2337,8 -2430,25 +2366,30 @@@ int mpol_misplaced(struct page *page, s
+  		 * it less likely we act on an unlikely task<->page
+  		 * relation.
+  		 */
+++<<<<<<< HEAD
+ +		last_nid = page_nid_xchg_last(page, polnid);
+ +		if (last_nid != polnid)
+++=======
++ 		last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
++ 		if (!cpupid_pid_unset(last_cpupid) && cpupid_to_nid(last_cpupid) != thisnid) {
++ 
++ 			/* See sysctl_numa_balancing_migrate_deferred comment */
++ 			if (!cpupid_match_pid(current, last_cpupid))
++ 				defer_numa_migrate(current);
++ 
++ 			goto out;
++ 		}
++ 
++ 		/*
++ 		 * The quadratic filter above reduces extraneous migration
++ 		 * of shared pages somewhat. This code reduces it even more,
++ 		 * reducing the overhead of page migrations of shared pages.
++ 		 * This makes workloads with shared pages rely more on
++ 		 * "move task near its memory", and less on "move memory
++ 		 * towards its task", which is exactly what we want.
++ 		 */
++ 		if (numa_migrate_deferred(current, last_cpupid))
+++>>>>>>> de1c9ce6f07f (sched/numa: Skip some page migrations after a shared fault)
+  			goto out;
+  	}
+  
+* Unmerged path Documentation/sysctl/kernel.txt
+* Unmerged path include/linux/sched.h
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 98cee68da024..9b80f7aac49b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -794,6 +794,14 @@ unsigned int sysctl_numa_balancing_scan_size = 256;
+ /* Scan @scan_size MB every @scan_period after an initial @scan_delay in ms */
+ unsigned int sysctl_numa_balancing_scan_delay = 1000;
+ 
++/*
++ * After skipping a page migration on a shared page, skip N more numa page
++ * migrations unconditionally. This reduces the number of NUMA migrations
++ * in shared memory workloads, and has the effect of pulling tasks towards
++ * where their memory lives, over pulling the memory towards the task.
++ */
++unsigned int sysctl_numa_balancing_migrate_deferred = 16;
++
+ static unsigned int task_nr_scan_windows(struct task_struct *p)
+ {
+ 	unsigned long rss = 0;
+* Unmerged path kernel/sysctl.c
+* Unmerged path mm/mempolicy.c
