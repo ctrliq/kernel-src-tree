@@ -1,0 +1,162 @@
+epoll: do not take global 'epmutex' for simple topologies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jason Baron <jbaron@akamai.com>
+commit 67347fe4e6326338ee217d7eb826bedf30b2e155
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/67347fe4.failed
+
+When calling EPOLL_CTL_ADD for an epoll file descriptor that is attached
+directly to a wakeup source, we do not need to take the global 'epmutex',
+unless the epoll file descriptor is nested.  The purpose of taking the
+'epmutex' on add is to prevent complex topologies such as loops and deep
+wakeup paths from forming in parallel through multiple EPOLL_CTL_ADD
+operations.  However, for the simple case of an epoll file descriptor
+attached directly to a wakeup source (with no nesting), we do not need to
+hold the 'epmutex'.
+
+This patch along with 'epoll: optimize EPOLL_CTL_DEL using rcu' improves
+scalability on larger systems.  Quoting Nathan Zimmer's mail on SPECjbb
+performance:
+
+"On the 16 socket run the performance went from 35k jOPS to 125k jOPS.  In
+addition the benchmark when from scaling well on 10 sockets to scaling
+well on just over 40 sockets.
+
+...
+
+Currently the benchmark stops scaling at around 40-44 sockets but it seems like
+I found a second unrelated bottleneck."
+
+[akpm@linux-foundation.org: use `bool' for boolean variables, remove unneeded/undesirable cast of void*, add missed ep_scan_ready_list() kerneldoc]
+	Signed-off-by: Jason Baron <jbaron@akamai.com>
+	Tested-by: Nathan Zimmer <nzimmer@sgi.com>
+	Cc: Eric Wong <normalperson@yhbt.net>
+	Cc: Nelson Elhage <nelhage@nelhage.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Davide Libenzi <davidel@xmailserver.org>
+	Cc: "Paul E. McKenney" <paulmck@us.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 67347fe4e6326338ee217d7eb826bedf30b2e155)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/eventpoll.c
+diff --cc fs/eventpoll.c
+index 4ff595d6eb53,f7fe7e3ce664..000000000000
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@@ -1793,8 -1824,8 +1815,13 @@@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, i
+  		struct epoll_event __user *, event)
+  {
+  	int error;
+++<<<<<<< HEAD
+ +	int did_lock_epmutex = 0;
+ +	struct file *file, *tfile;
+++=======
++ 	int full_check = 0;
++ 	struct fd f, tf;
+++>>>>>>> 67347fe4e632 (epoll: do not take global 'epmutex' for simple topologies)
+  	struct eventpoll *ep;
+  	struct epitem *epi;
+  	struct epoll_event epds;
+@@@ -1847,26 -1878,40 +1875,62 @@@
+  	 * and hang them on the tfile_check_list, so we can check that we
+  	 * haven't created too many possible wakeup paths.
+  	 *
+++<<<<<<< HEAD
+ +	 * We need to hold the epmutex across both ep_insert and ep_remove
+ +	 * b/c we want to make sure we are looking at a coherent view of
+ +	 * epoll network.
+ +	 */
+ +	if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL) {
+ +		mutex_lock(&epmutex);
+ +		did_lock_epmutex = 1;
+ +	}
+ +	if (op == EPOLL_CTL_ADD) {
+ +		if (is_file_epoll(tfile)) {
+ +			error = -ELOOP;
+ +			if (ep_loop_check(ep, tfile) != 0) {
+ +				clear_tfile_check_list();
+ +				goto error_tgt_fput;
+ +			}
+ +		} else
+ +			list_add(&tfile->f_tfile_llink, &tfile_check_list);
+ +	}
+ +
+++=======
++ 	 * We do not need to take the global 'epumutex' on EPOLL_CTL_ADD when
++ 	 * the epoll file descriptor is attaching directly to a wakeup source,
++ 	 * unless the epoll file descriptor is nested. The purpose of taking the
++ 	 * 'epmutex' on add is to prevent complex toplogies such as loops and
++ 	 * deep wakeup paths from forming in parallel through multiple
++ 	 * EPOLL_CTL_ADD operations.
++ 	 */
+++>>>>>>> 67347fe4e632 (epoll: do not take global 'epmutex' for simple topologies)
+  	mutex_lock_nested(&ep->mtx, 0);
++ 	if (op == EPOLL_CTL_ADD) {
++ 		if (!list_empty(&f.file->f_ep_links) ||
++ 						is_file_epoll(tf.file)) {
++ 			full_check = 1;
++ 			mutex_unlock(&ep->mtx);
++ 			mutex_lock(&epmutex);
++ 			if (is_file_epoll(tf.file)) {
++ 				error = -ELOOP;
++ 				if (ep_loop_check(ep, tf.file) != 0) {
++ 					clear_tfile_check_list();
++ 					goto error_tgt_fput;
++ 				}
++ 			} else
++ 				list_add(&tf.file->f_tfile_llink,
++ 							&tfile_check_list);
++ 			mutex_lock_nested(&ep->mtx, 0);
++ 			if (is_file_epoll(tf.file)) {
++ 				tep = tf.file->private_data;
++ 				mutex_lock_nested(&tep->mtx, 1);
++ 			}
++ 		}
++ 	}
++ 	if (op == EPOLL_CTL_DEL && is_file_epoll(tf.file)) {
++ 		tep = tf.file->private_data;
++ 		mutex_lock_nested(&tep->mtx, 1);
++ 	}
+  
+  	/*
+  	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
+@@@ -1880,10 -1925,11 +1944,15 @@@
+  	case EPOLL_CTL_ADD:
+  		if (!epi) {
+  			epds.events |= POLLERR | POLLHUP;
+++<<<<<<< HEAD
+ +			error = ep_insert(ep, &epds, tfile, fd);
+++=======
++ 			error = ep_insert(ep, &epds, tf.file, fd, full_check);
+++>>>>>>> 67347fe4e632 (epoll: do not take global 'epmutex' for simple topologies)
+  		} else
+  			error = -EEXIST;
+- 		clear_tfile_check_list();
++ 		if (full_check)
++ 			clear_tfile_check_list();
+  		break;
+  	case EPOLL_CTL_DEL:
+  		if (epi)
+@@@ -1902,12 -1950,12 +1973,12 @@@
+  	mutex_unlock(&ep->mtx);
+  
+  error_tgt_fput:
+- 	if (did_lock_epmutex)
++ 	if (full_check)
+  		mutex_unlock(&epmutex);
+  
+ -	fdput(tf);
+ +	fput(tfile);
+  error_fput:
+ -	fdput(f);
+ +	fput(file);
+  error_return:
+  
+  	return error;
+* Unmerged path fs/eventpoll.c
