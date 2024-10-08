@@ -1,0 +1,428 @@
+gpio: add flags argument to gpiod_get*() functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [sound] alsa: gpio: add flags argument to gpiod_get*() functions (Jaroslav Kysela) [1220299]
+Rebuild_FUZZ: 94.34%
+commit-author Alexandre Courbot <acourbot@nvidia.com>
+commit 39b2bbe3d715cf5013b5c48695ccdd25bd3bf120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/39b2bbe3.failed
+
+The huge majority of GPIOs have their direction and initial value set
+right after being obtained by one of the gpiod_get() functions. The
+integer GPIO API had gpio_request_one() that took a convenience flags
+parameter allowing to specify an direction and value applied to the
+returned GPIO. This feature greatly simplifies client code and ensures
+errors are always handled properly.
+
+A similar feature has been requested for the gpiod API. Since setting
+the direction of a GPIO is so often the very next action done after
+obtaining its descriptor, we prefer to extend the existing functions
+instead of introducing new functions that would raise the
+number of gpiod getters to 16 (!).
+
+The drawback of this approach is that all gpiod clients need to be
+updated. To limit the pain, temporary macros are introduced that allow
+gpiod_get*() to be called with or without the extra flags argument. They
+will be removed once all consumer code has been updated.
+
+	Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+	Reviewed-by: Mark Brown <broonie@linaro.org>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 39b2bbe3d715cf5013b5c48695ccdd25bd3bf120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/devres.c
+#	drivers/gpio/gpiolib.c
+#	include/linux/gpio/consumer.h
+diff --cc drivers/gpio/devres.c
+index 307464fd015f,41b2f40578d5..000000000000
+--- a/drivers/gpio/devres.c
++++ b/drivers/gpio/devres.c
+@@@ -44,14 -45,33 +45,36 @@@ static int devm_gpiod_match(struct devi
+   * automatically disposed on driver detach. See gpiod_get() for detailed
+   * information about behavior and return values.
+   */
+- struct gpio_desc *__must_check devm_gpiod_get(struct device *dev,
+- 					      const char *con_id)
++ struct gpio_desc *__must_check __devm_gpiod_get(struct device *dev,
++ 					      const char *con_id,
++ 					      enum gpiod_flags flags)
+  {
+- 	return devm_gpiod_get_index(dev, con_id, 0);
++ 	return devm_gpiod_get_index(dev, con_id, 0, flags);
+  }
+- EXPORT_SYMBOL(devm_gpiod_get);
++ EXPORT_SYMBOL(__devm_gpiod_get);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * devm_gpiod_get_optional - Resource-managed gpiod_get_optional()
++  * @dev: GPIO consumer
++  * @con_id: function within the GPIO consumer
++  * @flags: optional GPIO initialization flags
++  *
++  * Managed gpiod_get_optional(). GPIO descriptors returned from this function
++  * are automatically disposed on driver detach. See gpiod_get_optional() for
++  * detailed information about behavior and return values.
++  */
++ struct gpio_desc *__must_check __devm_gpiod_get_optional(struct device *dev,
++ 						       const char *con_id,
++ 						       enum gpiod_flags flags)
++ {
++ 	return devm_gpiod_get_index_optional(dev, con_id, 0, flags);
++ }
++ EXPORT_SYMBOL(__devm_gpiod_get_optional);
++ 
++ /**
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+   * devm_gpiod_get_index - Resource-managed gpiod_get_index()
+   * @dev:	GPIO consumer
+   * @con_id:	function within the GPIO consumer
+@@@ -84,9 -106,38 +109,41 @@@ struct gpio_desc *__must_check __devm_g
+  
+  	return desc;
+  }
+- EXPORT_SYMBOL(devm_gpiod_get_index);
++ EXPORT_SYMBOL(__devm_gpiod_get_index);
++ 
++ /**
+++<<<<<<< HEAD
+++=======
++  * devm_gpiod_get_index_optional - Resource-managed gpiod_get_index_optional()
++  * @dev: GPIO consumer
++  * @con_id: function within the GPIO consumer
++  * @index: index of the GPIO to obtain in the consumer
++  * @flags: optional GPIO initialization flags
++  *
++  * Managed gpiod_get_index_optional(). GPIO descriptors returned from this
++  * function are automatically disposed on driver detach. See
++  * gpiod_get_index_optional() for detailed information about behavior and
++  * return values.
++  */
++ struct gpio_desc *__must_check __devm_gpiod_get_index_optional(struct device *dev,
++ 							     const char *con_id,
++ 							     unsigned int index,
++ 							 enum gpiod_flags flags)
++ {
++ 	struct gpio_desc *desc;
++ 
++ 	desc = devm_gpiod_get_index(dev, con_id, index, flags);
++ 	if (IS_ERR(desc)) {
++ 		if (PTR_ERR(desc) == -ENOENT)
++ 			return NULL;
++ 	}
++ 
++ 	return desc;
++ }
++ EXPORT_SYMBOL(__devm_gpiod_get_index_optional);
+  
+  /**
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+   * devm_gpiod_put - Resource-managed gpiod_put()
+   * @desc:	GPIO descriptor to dispose of
+   *
+diff --cc drivers/gpio/gpiolib.c
+index 9b50ed619d38,15cc0bb65dda..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -2395,21 -1579,41 +2395,44 @@@ static struct gpio_desc *gpiod_find(str
+  }
+  
+  /**
+ - * gpiod_get - obtain a GPIO for a given GPIO function
+ + * gpio_get - obtain a GPIO for a given GPIO function
+   * @dev:	GPIO consumer, can be NULL for system-global GPIOs
+   * @con_id:	function within the GPIO consumer
++  * @flags:	optional GPIO initialization flags
+   *
+   * Return the GPIO descriptor corresponding to the function con_id of device
+   * dev, -ENOENT if no GPIO has been assigned to the requested function, or
+   * another IS_ERR() code if an error occured while trying to acquire the GPIO.
+   */
+- struct gpio_desc *__must_check gpiod_get(struct device *dev, const char *con_id)
++ struct gpio_desc *__must_check __gpiod_get(struct device *dev, const char *con_id,
++ 					 enum gpiod_flags flags)
+  {
+- 	return gpiod_get_index(dev, con_id, 0);
++ 	return gpiod_get_index(dev, con_id, 0, flags);
+  }
+- EXPORT_SYMBOL_GPL(gpiod_get);
++ EXPORT_SYMBOL_GPL(__gpiod_get);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * gpiod_get_optional - obtain an optional GPIO for a given GPIO function
++  * @dev: GPIO consumer, can be NULL for system-global GPIOs
++  * @con_id: function within the GPIO consumer
++  * @flags: optional GPIO initialization flags
++  *
++  * This is equivalent to gpiod_get(), except that when no GPIO was assigned to
++  * the requested function it will return NULL. This is convenient for drivers
++  * that need to handle optional GPIOs.
++  */
++ struct gpio_desc *__must_check __gpiod_get_optional(struct device *dev,
++ 						  const char *con_id,
++ 						  enum gpiod_flags flags)
++ {
++ 	return gpiod_get_index_optional(dev, con_id, 0, flags);
++ }
++ EXPORT_SYMBOL_GPL(__gpiod_get_optional);
++ 
++ /**
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+   * gpiod_get_index - obtain a GPIO from a multi-index GPIO function
+   * @dev:	GPIO consumer, can be NULL for system-global GPIOs
+   * @con_id:	function within the GPIO consumer
+@@@ -2428,7 -1634,7 +2453,11 @@@ struct gpio_desc *__must_check __gpiod_
+  {
+  	struct gpio_desc *desc = NULL;
+  	int status;
+++<<<<<<< HEAD
+ +	unsigned long flags = 0;
+++=======
++ 	enum gpio_lookup_flags lookupflags = 0;
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+  
+  	dev_dbg(dev, "GPIO lookup for consumer %s\n", con_id);
+  
+@@@ -2460,14 -1666,64 +2489,72 @@@
+  	if (status < 0)
+  		return ERR_PTR(status);
+  
+++<<<<<<< HEAD
+ +	if (flags & GPIOF_ACTIVE_LOW)
+ +		set_bit(FLAG_ACTIVE_LOW, &desc->flags);
+++=======
++ 	if (lookupflags & GPIO_ACTIVE_LOW)
++ 		set_bit(FLAG_ACTIVE_LOW, &desc->flags);
++ 	if (lookupflags & GPIO_OPEN_DRAIN)
++ 		set_bit(FLAG_OPEN_DRAIN, &desc->flags);
++ 	if (lookupflags & GPIO_OPEN_SOURCE)
++ 		set_bit(FLAG_OPEN_SOURCE, &desc->flags);
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
++ 
++ 	/* No particular flag request, return here... */
++ 	if (flags & GPIOD_FLAGS_BIT_DIR_SET)
++ 		return desc;
++ 
++ 	/* Process flags */
++ 	if (flags & GPIOD_FLAGS_BIT_DIR_OUT)
++ 		status = gpiod_direction_output(desc,
++ 					      flags & GPIOD_FLAGS_BIT_DIR_VAL);
++ 	else
++ 		status = gpiod_direction_input(desc);
++ 
++ 	if (status < 0) {
++ 		dev_dbg(dev, "setup of GPIO %s failed\n", con_id);
++ 		gpiod_put(desc);
++ 		return ERR_PTR(status);
++ 	}
++ 
++ 	return desc;
++ }
++ EXPORT_SYMBOL_GPL(__gpiod_get_index);
++ 
++ /**
+++<<<<<<< HEAD
+++=======
++  * gpiod_get_index_optional - obtain an optional GPIO from a multi-index GPIO
++  *                            function
++  * @dev: GPIO consumer, can be NULL for system-global GPIOs
++  * @con_id: function within the GPIO consumer
++  * @index: index of the GPIO to obtain in the consumer
++  * @flags: optional GPIO initialization flags
++  *
++  * This is equivalent to gpiod_get_index(), except that when no GPIO with the
++  * specified index was assigned to the requested function it will return NULL.
++  * This is convenient for drivers that need to handle optional GPIOs.
++  */
++ struct gpio_desc *__must_check __gpiod_get_index_optional(struct device *dev,
++ 							const char *con_id,
++ 							unsigned int index,
++ 							enum gpiod_flags flags)
++ {
++ 	struct gpio_desc *desc;
++ 
++ 	desc = gpiod_get_index(dev, con_id, index, flags);
++ 	if (IS_ERR(desc)) {
++ 		if (PTR_ERR(desc) == -ENOENT)
++ 			return NULL;
++ 	}
+  
+  	return desc;
+  }
+- EXPORT_SYMBOL_GPL(gpiod_get_index);
++ EXPORT_SYMBOL_GPL(__gpiod_get_index_optional);
+  
+  /**
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+   * gpiod_put - dispose of a GPIO descriptor
+   * @desc:	GPIO descriptor to dispose of
+   *
+diff --cc include/linux/gpio/consumer.h
+index 7a8144fef406,b7ce0c64c6f3..000000000000
+--- a/include/linux/gpio/consumer.h
++++ b/include/linux/gpio/consumer.h
+@@@ -18,19 -18,80 +18,88 @@@ struct gpio_desc
+  
+  #ifdef CONFIG_GPIOLIB
+  
++ #define GPIOD_FLAGS_BIT_DIR_SET		BIT(0)
++ #define GPIOD_FLAGS_BIT_DIR_OUT		BIT(1)
++ #define GPIOD_FLAGS_BIT_DIR_VAL		BIT(2)
++ 
++ /**
++  * Optional flags that can be passed to one of gpiod_* to configure direction
++  * and output value. These values cannot be OR'd.
++  */
++ enum gpiod_flags {
++ 	GPIOD_ASIS	= 0,
++ 	GPIOD_IN	= GPIOD_FLAGS_BIT_DIR_SET,
++ 	GPIOD_OUT_LOW	= GPIOD_FLAGS_BIT_DIR_SET | GPIOD_FLAGS_BIT_DIR_OUT,
++ 	GPIOD_OUT_HIGH	= GPIOD_FLAGS_BIT_DIR_SET | GPIOD_FLAGS_BIT_DIR_OUT |
++ 			  GPIOD_FLAGS_BIT_DIR_VAL,
++ };
++ 
+  /* Acquire and dispose GPIOs */
+- struct gpio_desc *__must_check gpiod_get(struct device *dev,
+- 					 const char *con_id);
+- struct gpio_desc *__must_check gpiod_get_index(struct device *dev,
++ struct gpio_desc *__must_check __gpiod_get(struct device *dev,
++ 					 const char *con_id,
++ 					 enum gpiod_flags flags);
++ #define __gpiod_get(dev, con_id, flags, ...) __gpiod_get(dev, con_id, flags)
++ #define gpiod_get(varargs...) __gpiod_get(varargs, 0)
++ struct gpio_desc *__must_check __gpiod_get_index(struct device *dev,
+  					       const char *con_id,
+++<<<<<<< HEAD
+ +					       unsigned int idx);
+++=======
++ 					       unsigned int idx,
++ 					       enum gpiod_flags flags);
++ #define __gpiod_get_index(dev, con_id, index, flags, ...)		\
++ 	__gpiod_get_index(dev, con_id, index, flags)
++ #define gpiod_get_index(varargs...) __gpiod_get_index(varargs, 0)
++ struct gpio_desc *__must_check __gpiod_get_optional(struct device *dev,
++ 						  const char *con_id,
++ 						  enum gpiod_flags flags);
++ #define __gpiod_get_optional(dev, con_id, flags, ...)			\
++ 	__gpiod_get_optional(dev, con_id, flags)
++ #define gpiod_get_optional(varargs...) __gpiod_get_optional(varargs, 0)
++ struct gpio_desc *__must_check __gpiod_get_index_optional(struct device *dev,
++ 							const char *con_id,
++ 							unsigned int index,
++ 							enum gpiod_flags flags);
++ #define __gpiod_get_index_optional(dev, con_id, index, flags, ...)	\
++ 	__gpiod_get_index_optional(dev, con_id, index, flags)
++ #define gpiod_get_index_optional(varargs...)				\
++ 	__gpiod_get_index_optional(varargs, 0)
++ 
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+  void gpiod_put(struct gpio_desc *desc);
+  
+- struct gpio_desc *__must_check devm_gpiod_get(struct device *dev,
+- 					      const char *con_id);
+- struct gpio_desc *__must_check devm_gpiod_get_index(struct device *dev,
++ struct gpio_desc *__must_check __devm_gpiod_get(struct device *dev,
++ 					      const char *con_id,
++ 					      enum gpiod_flags flags);
++ #define __devm_gpiod_get(dev, con_id, flags, ...)			\
++ 	__devm_gpiod_get(dev, con_id, flags)
++ #define devm_gpiod_get(varargs...) __devm_gpiod_get(varargs, 0)
++ struct gpio_desc *__must_check __devm_gpiod_get_index(struct device *dev,
+  						    const char *con_id,
+++<<<<<<< HEAD
+ +						    unsigned int idx);
+++=======
++ 						    unsigned int idx,
++ 						    enum gpiod_flags flags);
++ #define __devm_gpiod_get_index(dev, con_id, index, flags, ...)		\
++ 	__devm_gpiod_get_index(dev, con_id, index, flags)
++ #define devm_gpiod_get_index(varargs...) __devm_gpiod_get_index(varargs, 0)
++ struct gpio_desc *__must_check __devm_gpiod_get_optional(struct device *dev,
++ 						       const char *con_id,
++ 						       enum gpiod_flags flags);
++ #define __devm_gpiod_get_optional(dev, con_id, flags, ...)		\
++ 	__devm_gpiod_get_optional(dev, con_id, flags)
++ #define devm_gpiod_get_optional(varargs...)				\
++ 	__devm_gpiod_get_optional(varargs, 0)
++ struct gpio_desc *__must_check
++ __devm_gpiod_get_index_optional(struct device *dev, const char *con_id,
++ 			      unsigned int index, enum gpiod_flags flags);
++ #define __devm_gpiod_get_index_optional(dev, con_id, index, flags, ...)	\
++ 	__devm_gpiod_get_index_optional(dev, con_id, index, flags)
++ #define devm_gpiod_get_index_optional(varargs...)			\
++ 	__devm_gpiod_get_index_optional(varargs, 0)
++ 
+++>>>>>>> 39b2bbe3d715 (gpio: add flags argument to gpiod_get*() functions)
+  void devm_gpiod_put(struct device *dev, struct gpio_desc *desc);
+  
+  int gpiod_get_direction(const struct gpio_desc *desc);
+diff --git a/Documentation/gpio/consumer.txt b/Documentation/gpio/consumer.txt
+index e42f77d8d4ca..c5718afa2b0a 100644
+--- a/Documentation/gpio/consumer.txt
++++ b/Documentation/gpio/consumer.txt
+@@ -29,13 +29,24 @@ gpiod_get() functions. Like many other kernel subsystems, gpiod_get() takes the
+ device that will use the GPIO and the function the requested GPIO is supposed to
+ fulfill:
+ 
+-	struct gpio_desc *gpiod_get(struct device *dev, const char *con_id)
++	struct gpio_desc *gpiod_get(struct device *dev, const char *con_id,
++				    enum gpiod_flags flags)
+ 
+ If a function is implemented by using several GPIOs together (e.g. a simple LED
+ device that displays digits), an additional index argument can be specified:
+ 
+ 	struct gpio_desc *gpiod_get_index(struct device *dev,
+-					  const char *con_id, unsigned int idx)
++					  const char *con_id, unsigned int idx,
++					  enum gpiod_flags flags)
++
++The flags parameter is used to optionally specify a direction and initial value
++for the GPIO. Values can be:
++
++* GPIOD_ASIS or 0 to not initialize the GPIO at all. The direction must be set
++  later with one of the dedicated functions.
++* GPIOD_IN to initialize the GPIO as input.
++* GPIOD_OUT_LOW to initialize the GPIO as output with a value of 0.
++* GPIOD_OUT_HIGH to initialize the GPIO as output with a value of 1.
+ 
+ Both functions return either a valid GPIO descriptor, or an error code checkable
+ with IS_ERR() (they will never return a NULL pointer). -ENOENT will be returned
+@@ -46,11 +57,13 @@ errors and an absence of GPIO for optional GPIO parameters.
+ 
+ Device-managed variants of these functions are also defined:
+ 
+-	struct gpio_desc *devm_gpiod_get(struct device *dev, const char *con_id)
++	struct gpio_desc *devm_gpiod_get(struct device *dev, const char *con_id,
++					 enum gpiod_flags flags)
+ 
+ 	struct gpio_desc *devm_gpiod_get_index(struct device *dev,
+ 					       const char *con_id,
+-					       unsigned int idx)
++					       unsigned int idx,
++					       enum gpiod_flags flags)
+ 
+ A GPIO descriptor can be disposed of using the gpiod_put() function:
+ 
+@@ -67,8 +80,9 @@ Using GPIOs
+ 
+ Setting Direction
+ -----------------
+-The first thing a driver must do with a GPIO is setting its direction. This is
+-done by invoking one of the gpiod_direction_*() functions:
++The first thing a driver must do with a GPIO is setting its direction. If no
++direction-setting flags have been given to gpiod_get*(), this is done by
++invoking one of the gpiod_direction_*() functions:
+ 
+ 	int gpiod_direction_input(struct gpio_desc *desc)
+ 	int gpiod_direction_output(struct gpio_desc *desc, int value)
+* Unmerged path drivers/gpio/devres.c
+* Unmerged path drivers/gpio/gpiolib.c
+* Unmerged path include/linux/gpio/consumer.h
