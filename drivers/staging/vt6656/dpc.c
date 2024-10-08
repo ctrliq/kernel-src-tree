@@ -136,9 +136,9 @@ static void s_vProcessRxMACHeader(struct vnt_private *pDevice,
     };
 
     pbyRxBuffer = (u8 *) (pbyRxBufferAddr + cbHeaderSize);
-    if (!compare_ether_addr(pbyRxBuffer, &pDevice->abySNAP_Bridgetunnel[0])) {
+    if (ether_addr_equal(pbyRxBuffer, pDevice->abySNAP_Bridgetunnel)) {
         cbHeaderSize += 6;
-    } else if (!compare_ether_addr(pbyRxBuffer, &pDevice->abySNAP_RFC1042[0])) {
+    } else if (ether_addr_equal(pbyRxBuffer, pDevice->abySNAP_RFC1042)) {
         cbHeaderSize += 6;
         pwType = (u16 *) (pbyRxBufferAddr + cbHeaderSize);
 	if ((*pwType == cpu_to_be16(ETH_P_IPX)) ||
@@ -362,7 +362,7 @@ int RXbBulkInProcessData(struct vnt_private *pDevice, PRCB pRCB,
     if ((pMgmt->eCurrMode == WMAC_MODE_STANDBY) ||
         (pMgmt->eCurrMode == WMAC_MODE_ESS_STA)) {
        if (pMgmt->sNodeDBTable[0].bActive) {
-	 if (!compare_ether_addr(pMgmt->abyCurrBSSID, pMACHeader->addr2)) {
+	 if (ether_addr_equal(pMgmt->abyCurrBSSID, pMACHeader->addr2)) {
 	    if (pMgmt->sNodeDBTable[0].uInActiveCount != 0)
                   pMgmt->sNodeDBTable[0].uInActiveCount = 0;
            }
@@ -375,8 +375,7 @@ int RXbBulkInProcessData(struct vnt_private *pDevice, PRCB pRCB,
             return false;
         }
 
-	if (compare_ether_addr(pDevice->abyCurrentNetAddr,
-			       pMACHeader->addr1)) {
+	if (!ether_addr_equal(pDevice->abyCurrentNetAddr, pMACHeader->addr1)) {
 		return false;
         }
     }
@@ -384,8 +383,8 @@ int RXbBulkInProcessData(struct vnt_private *pDevice, PRCB pRCB,
     // Use for TKIP MIC
     s_vGetDASA(pbyFrame, &cbHeaderSize, &pDevice->sRxEthHeader);
 
-    if (!compare_ether_addr((u8 *)&(pDevice->sRxEthHeader.h_source[0]),
-			    pDevice->abyCurrentNetAddr))
+    if (ether_addr_equal((u8 *)pDevice->sRxEthHeader.h_source,
+			 pDevice->abyCurrentNetAddr))
         return false;
 
     if ((pMgmt->eCurrMode == WMAC_MODE_ESS_AP) || (pMgmt->eCurrMode == WMAC_MODE_IBSS_STA)) {
