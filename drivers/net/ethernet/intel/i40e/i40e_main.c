@@ -4799,11 +4799,7 @@ exit:
  *
  * Returns 0 on success, negative value on failure
  **/
-#ifdef I40E_FCOE
 int i40e_open(struct net_device *netdev)
-#else
-static int i40e_open(struct net_device *netdev)
-#endif
 {
 	struct i40e_netdev_priv *np = netdev_priv(netdev);
 	struct i40e_vsi *vsi = np->vsi;
@@ -7713,7 +7709,7 @@ static int i40e_ndo_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 	return err;
 }
 
-static const struct net_device_ops i40e_netdev_ops = {
+const struct net_device_ops i40e_netdev_ops = {
 	.ndo_open		= i40e_open,
 	.ndo_stop		= i40e_close,
 	.ndo_start_xmit		= i40e_lan_xmit_frame,
@@ -9904,6 +9900,10 @@ static int __init i40e_init_module(void)
 	pr_info("%s: %s - version %s\n", i40e_driver_name,
 		i40e_driver_string, i40e_driver_version_str);
 	pr_info("%s: %s\n", i40e_driver_name, i40e_copyright);
+
+#if IS_ENABLED(CONFIG_CONFIGFS_FS)
+	i40e_configfs_init();
+#endif /* CONFIG_CONFIGFS_FS */
 	i40e_dbg_init();
 	return pci_register_driver(&i40e_driver);
 }
@@ -9919,5 +9919,8 @@ static void __exit i40e_exit_module(void)
 {
 	pci_unregister_driver(&i40e_driver);
 	i40e_dbg_exit();
+#if IS_ENABLED(CONFIG_CONFIGFS_FS)
+	i40e_configfs_exit();
+#endif /* CONFIG_CONFIGFS_FS */
 }
 module_exit(i40e_exit_module);
