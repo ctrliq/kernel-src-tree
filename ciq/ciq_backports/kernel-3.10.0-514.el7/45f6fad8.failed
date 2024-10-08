@@ -1,0 +1,542 @@
+ipv6: add complete rcu protection around np->opt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 45f6fad84cc305103b28d73482b344d7f5b76f39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/45f6fad8.failed
+
+This patch addresses multiple problems :
+
+UDP/RAW sendmsg() need to get a stable struct ipv6_txoptions
+while socket is not locked : Other threads can change np->opt
+concurrently. Dmitry posted a syzkaller
+(http://github.com/google/syzkaller) program desmonstrating
+use-after-free.
+
+Starting with TCP/DCCP lockless listeners, tcp_v6_syn_recv_sock()
+and dccp_v6_request_recv_sock() also need to use RCU protection
+to dereference np->opt once (before calling ipv6_dup_options())
+
+This patch adds full RCU protection to np->opt
+
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 45f6fad84cc305103b28d73482b344d7f5b76f39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/dccp/ipv6.c
+#	net/ipv6/af_inet6.c
+#	net/ipv6/ipv6_sockglue.c
+#	net/ipv6/raw.c
+#	net/ipv6/tcp_ipv6.c
+#	net/ipv6/udp.c
+diff --cc net/dccp/ipv6.c
+index 7ee29ac72fcc,e7e0b9bc2a43..000000000000
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@@ -443,13 -382,17 +448,19 @@@ drop
+  	return -1;
+  }
+  
+ -static struct sock *dccp_v6_request_recv_sock(const struct sock *sk,
+ +static struct sock *dccp_v6_request_recv_sock(struct sock *sk,
+  					      struct sk_buff *skb,
+  					      struct request_sock *req,
+ -					      struct dst_entry *dst,
+ -					      struct request_sock *req_unhash,
+ -					      bool *own_req)
+ +					      struct dst_entry *dst)
+  {
+  	struct inet_request_sock *ireq = inet_rsk(req);
+++<<<<<<< HEAD
+ +	struct ipv6_pinfo *newnp, *np = inet6_sk(sk);
+++=======
++ 	struct ipv6_pinfo *newnp;
++ 	const struct ipv6_pinfo *np = inet6_sk(sk);
++ 	struct ipv6_txoptions *opt;
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	struct inet_sock *newinet;
+  	struct dccp6_sock *newdp6;
+  	struct sock *newsk;
+diff --cc net/ipv6/af_inet6.c
+index f6f52bfe535a,38d66ddfb937..000000000000
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@@ -424,9 -428,11 +424,17 @@@ void inet6_destroy_sock(struct sock *sk
+  
+  	/* Free tx options */
+  
+++<<<<<<< HEAD
+ +	opt = xchg(&np->opt, NULL);
+ +	if (opt != NULL)
+ +		sock_kfree_s(sk, opt, opt->tot_len);
+++=======
++ 	opt = xchg((__force struct ipv6_txoptions **)&np->opt, NULL);
++ 	if (opt) {
++ 		atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
++ 		txopt_put(opt);
++ 	}
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  }
+  EXPORT_SYMBOL_GPL(inet6_destroy_sock);
+  
+diff --cc net/ipv6/ipv6_sockglue.c
+index 4b42ed621112,4449ad1f8114..000000000000
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@@ -110,12 -110,9 +110,17 @@@ struct ipv6_txoptions *ipv6_update_opti
+  			icsk->icsk_ext_hdr_len = opt->opt_flen + opt->opt_nflen;
+  			icsk->icsk_sync_mss(sk, icsk->icsk_pmtu_cookie);
+  		}
+ +		opt = xchg(&inet6_sk(sk)->opt, opt);
+ +	} else {
+ +		spin_lock(&sk->sk_dst_lock);
+ +		opt = xchg(&inet6_sk(sk)->opt, opt);
+ +		spin_unlock(&sk->sk_dst_lock);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	opt = xchg((__force struct ipv6_txoptions **)&inet6_sk(sk)->opt,
++ 		   opt);
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	sk_dst_reset(sk);
+  
+  	return opt;
+diff --cc net/ipv6/raw.c
+index 146ca12277f1,99140986e887..000000000000
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@@ -661,72 -673,69 +661,73 @@@ error
+  	return err;
+  }
+  
+ -struct raw6_frag_vec {
+ -	struct msghdr *msg;
+ -	int hlen;
+ -	char c[4];
+ -};
+ -
+ -static int rawv6_probe_proto_opt(struct raw6_frag_vec *rfv, struct flowi6 *fl6)
+ +static int rawv6_probe_proto_opt(struct flowi6 *fl6, struct msghdr *msg)
+  {
+ -	int err = 0;
+ -	switch (fl6->flowi6_proto) {
+ -	case IPPROTO_ICMPV6:
+ -		rfv->hlen = 2;
+ -		err = memcpy_from_msg(rfv->c, rfv->msg, rfv->hlen);
+ -		if (!err) {
+ -			fl6->fl6_icmp_type = rfv->c[0];
+ -			fl6->fl6_icmp_code = rfv->c[1];
+ -		}
+ -		break;
+ -	case IPPROTO_MH:
+ -		rfv->hlen = 4;
+ -		err = memcpy_from_msg(rfv->c, rfv->msg, rfv->hlen);
+ -		if (!err)
+ -			fl6->fl6_mh_type = rfv->c[2];
+ -	}
+ -	return err;
+ -}
+ +	struct iovec *iov;
+ +	u8 __user *type = NULL;
+ +	u8 __user *code = NULL;
+ +	u8 len = 0;
+ +	int probed = 0;
+ +	int i;
+ +
+ +	if (!msg->msg_iov)
+ +		return 0;
+  
+ -static int raw6_getfrag(void *from, char *to, int offset, int len, int odd,
+ -		       struct sk_buff *skb)
+ -{
+ -	struct raw6_frag_vec *rfv = from;
+ +	for (i = 0; i < msg->msg_iovlen; i++) {
+ +		iov = &msg->msg_iov[i];
+ +		if (!iov)
+ +			continue;
+  
+ -	if (offset < rfv->hlen) {
+ -		int copy = min(rfv->hlen - offset, len);
+ +		switch (fl6->flowi6_proto) {
+ +		case IPPROTO_ICMPV6:
+ +			/* check if one-byte field is readable or not. */
+ +			if (iov->iov_base && iov->iov_len < 1)
+ +				break;
+ +
+ +			if (!type) {
+ +				type = iov->iov_base;
+ +				/* check if code field is readable or not. */
+ +				if (iov->iov_len > 1)
+ +					code = type + 1;
+ +			} else if (!code)
+ +				code = iov->iov_base;
+ +
+ +			if (type && code) {
+ +				if (get_user(fl6->fl6_icmp_type, type) ||
+ +				    get_user(fl6->fl6_icmp_code, code))
+ +					return -EFAULT;
+ +				probed = 1;
+ +			}
+ +			break;
+ +		case IPPROTO_MH:
+ +			if (iov->iov_base && iov->iov_len < 1)
+ +				break;
+ +			/* check if type field is readable or not. */
+ +			if (iov->iov_len > 2 - len) {
+ +				u8 __user *p = iov->iov_base;
+ +				if (get_user(fl6->fl6_mh_type, &p[2 - len]))
+ +					return -EFAULT;
+ +				probed = 1;
+ +			} else
+ +				len += iov->iov_len;
+  
+ -		if (skb->ip_summed == CHECKSUM_PARTIAL)
+ -			memcpy(to, rfv->c + offset, copy);
+ -		else
+ -			skb->csum = csum_block_add(
+ -				skb->csum,
+ -				csum_partial_copy_nocheck(rfv->c + offset,
+ -							  to, copy, 0),
+ -				odd);
+ -
+ -		odd = 0;
+ -		offset += copy;
+ -		to += copy;
+ -		len -= copy;
+ -
+ -		if (!len)
+ -			return 0;
+ +			break;
+ +		default:
+ +			probed = 1;
+ +			break;
+ +		}
+ +		if (probed)
+ +			break;
+  	}
+ -
+ -	offset -= rfv->hlen;
+ -
+ -	return ip_generic_getfrag(rfv->msg, to, offset, len, odd, skb);
+ +	return 0;
+  }
+  
+ -static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ +static int rawv6_sendmsg(struct kiocb *iocb, struct sock *sk,
+ +		   struct msghdr *msg, size_t len)
+  {
++ 	struct ipv6_txoptions *opt_to_free = NULL;
+  	struct ipv6_txoptions opt_space;
+ -	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin6, msg->msg_name);
+ +	struct sockaddr_in6 * sin6 = (struct sockaddr_in6 *) msg->msg_name;
+  	struct in6_addr *daddr, *final_p, final;
+  	struct inet_sock *inet = inet_sk(sk);
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+@@@ -831,8 -840,10 +832,15 @@@
+  		if (!(opt->opt_nflen|opt->opt_flen))
+  			opt = NULL;
+  	}
+++<<<<<<< HEAD
+ +	if (opt == NULL)
+ +		opt = np->opt;
+++=======
++ 	if (!opt) {
++ 		opt = txopt_get(np);
++ 		opt_to_free = opt;
++ 		}
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	if (flowlabel)
+  		opt = fl6_merge_options(&opt_space, flowlabel, opt);
+  	opt = ipv6_fixup_options(&opt_space, opt);
+@@@ -899,7 -909,8 +907,12 @@@ done
+  	dst_release(dst);
+  out:
+  	fl6_sock_release(flowlabel);
+++<<<<<<< HEAD
+ +	return err<0?err:len;
+++=======
++ 	txopt_put(opt_to_free);
++ 	return err < 0 ? err : len;
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  do_confirm:
+  	dst_confirm(dst);
+  	if (!(msg->msg_flags & MSG_PROBE) || len)
+diff --cc net/ipv6/tcp_ipv6.c
+index 2ab7bcc949ac,6a50bb4a0dae..000000000000
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@@ -133,7 -120,7 +133,11 @@@ static int tcp_v6_connect(struct sock *
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+  	struct tcp_sock *tp = tcp_sk(sk);
+  	struct in6_addr *saddr = NULL, *final_p, final;
+++<<<<<<< HEAD
+ +	struct rt6_info *rt;
+++=======
++ 	struct ipv6_txoptions *opt;
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	struct flowi6 fl6;
+  	struct dst_entry *dst;
+  	int addr_type;
+@@@ -496,8 -460,11 +501,16 @@@ static int tcp_v6_send_synack(struct so
+  				    &ireq->ir_v6_rmt_addr);
+  
+  		fl6->daddr = ireq->ir_v6_rmt_addr;
+++<<<<<<< HEAD
+ +		skb_set_queue_mapping(skb, queue_mapping);
+ +		err = ip6_xmit(sk, skb, fl6, np->opt, np->tclass);
+++=======
++ 		if (np->repflow && ireq->pktopts)
++ 			fl6->flowlabel = ip6_flowlabel(ipv6_hdr(ireq->pktopts));
++ 
++ 		err = ip6_xmit(sk, skb, fl6, rcu_dereference(np->opt),
++ 			       np->tclass);
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  		err = net_xmit_eval(err);
+  	}
+  
+@@@ -1037,12 -966,16 +1050,18 @@@ drop
+  	return 0; /* don't send reset */
+  }
+  
+ -static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
+ +static struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+  					 struct request_sock *req,
+ -					 struct dst_entry *dst,
+ -					 struct request_sock *req_unhash,
+ -					 bool *own_req)
+ +					 struct dst_entry *dst)
+  {
+  	struct inet_request_sock *ireq;
+++<<<<<<< HEAD
+ +	struct ipv6_pinfo *newnp, *np = inet6_sk(sk);
+++=======
++ 	struct ipv6_pinfo *newnp;
++ 	const struct ipv6_pinfo *np = inet6_sk(sk);
++ 	struct ipv6_txoptions *opt;
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	struct tcp6_sock *newtcp6sk;
+  	struct inet_sock *newinet;
+  	struct tcp_sock *newtp;
+diff --cc net/ipv6/udp.c
+index ed48f377d6aa,9da3287a3923..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -1092,9 -1107,10 +1092,10 @@@ int udpv6_sendmsg(struct kiocb *iocb, s
+  	struct udp_sock *up = udp_sk(sk);
+  	struct inet_sock *inet = inet_sk(sk);
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+ -	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin6, msg->msg_name);
+ +	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) msg->msg_name;
+  	struct in6_addr *daddr, *final_p, final;
+  	struct ipv6_txoptions *opt = NULL;
++ 	struct ipv6_txoptions *opt_to_free = NULL;
+  	struct ip6_flowlabel *flowlabel = NULL;
+  	struct flowi6 fl6;
+  	struct dst_entry *dst;
+@@@ -1249,8 -1264,10 +1250,15 @@@ do_udp_sendmsg
+  			opt = NULL;
+  		connected = 0;
+  	}
+++<<<<<<< HEAD
+ +	if (opt == NULL)
+ +		opt = np->opt;
+++=======
++ 	if (!opt) {
++ 		opt = txopt_get(np);
++ 		opt_to_free = opt;
++ 	}
+++>>>>>>> 45f6fad84cc3 (ipv6: add complete rcu protection around np->opt)
+  	if (flowlabel)
+  		opt = fl6_merge_options(&opt_space, flowlabel, opt);
+  	opt = ipv6_fixup_options(&opt_space, opt);
+diff --git a/include/linux/ipv6.h b/include/linux/ipv6.h
+index d6569dac97a5..5e190a7ba2c6 100644
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -213,7 +213,7 @@ struct ipv6_pinfo {
+ 	struct ipv6_ac_socklist	*ipv6_ac_list;
+ 	struct ipv6_fl_socklist __rcu *ipv6_fl_list;
+ 
+-	struct ipv6_txoptions	*opt;
++	struct ipv6_txoptions __rcu	*opt;
+ 	struct sk_buff		*pktoptions;
+ 	struct sk_buff		*rxpmtu;
+ 	struct inet6_cork	cork;
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index 746418990199..65470127316e 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -203,6 +203,7 @@ extern rwlock_t ip6_ra_lock;
+  */
+ 
+ struct ipv6_txoptions {
++	atomic_t		refcnt;
+ 	/* Length of this structure */
+ 	int			tot_len;
+ 
+@@ -215,7 +216,7 @@ struct ipv6_txoptions {
+ 	struct ipv6_opt_hdr	*dst0opt;
+ 	struct ipv6_rt_hdr	*srcrt;	/* Routing Header */
+ 	struct ipv6_opt_hdr	*dst1opt;
+-
++	struct rcu_head		rcu;
+ 	/* Option buffer, as read by IPV6_PKTOPTIONS, starts here. */
+ };
+ 
+@@ -247,6 +248,24 @@ struct ipv6_fl_socklist {
+ 	struct rcu_head			rcu;
+ };
+ 
++static inline struct ipv6_txoptions *txopt_get(const struct ipv6_pinfo *np)
++{
++	struct ipv6_txoptions *opt;
++
++	rcu_read_lock();
++	opt = rcu_dereference(np->opt);
++	if (opt && !atomic_inc_not_zero(&opt->refcnt))
++		opt = NULL;
++	rcu_read_unlock();
++	return opt;
++}
++
++static inline void txopt_put(struct ipv6_txoptions *opt)
++{
++	if (opt && atomic_dec_and_test(&opt->refcnt))
++		kfree_rcu(opt, rcu);
++}
++
+ struct ip6_flowlabel *fl6_sock_lookup(struct sock *sk, __be32 label);
+ struct ipv6_txoptions *fl6_merge_options(struct ipv6_txoptions *opt_space,
+ 					 struct ip6_flowlabel *fl,
+* Unmerged path net/dccp/ipv6.c
+* Unmerged path net/ipv6/af_inet6.c
+diff --git a/net/ipv6/datagram.c b/net/ipv6/datagram.c
+index 8cbab378bf90..e5e5b215a851 100644
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@ -168,8 +168,10 @@ ipv4_connected:
+ 
+ 	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
+ 
+-	opt = flowlabel ? flowlabel->opt : np->opt;
++	rcu_read_lock();
++	opt = flowlabel ? flowlabel->opt : rcu_dereference(np->opt);
+ 	final_p = fl6_update_dst(&fl6, opt, &final);
++	rcu_read_unlock();
+ 
+ 	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+ 	err = 0;
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index 8d67900aa003..33dbd6c1a00d 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -727,6 +727,7 @@ ipv6_dup_options(struct sock *sk, struct ipv6_txoptions *opt)
+ 			*((char **)&opt2->dst1opt) += dif;
+ 		if (opt2->srcrt)
+ 			*((char **)&opt2->srcrt) += dif;
++		atomic_set(&opt2->refcnt, 1);
+ 	}
+ 	return opt2;
+ }
+@@ -790,7 +791,7 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+ 		return ERR_PTR(-ENOBUFS);
+ 
+ 	memset(opt2, 0, tot_len);
+-
++	atomic_set(&opt2->refcnt, 1);
+ 	opt2->tot_len = tot_len;
+ 	p = (char *)(opt2 + 1);
+ 
+diff --git a/net/ipv6/inet6_connection_sock.c b/net/ipv6/inet6_connection_sock.c
+index c9138189415a..0e08e1b447ee 100644
+--- a/net/ipv6/inet6_connection_sock.c
++++ b/net/ipv6/inet6_connection_sock.c
+@@ -78,7 +78,9 @@ struct dst_entry *inet6_csk_route_req(struct sock *sk,
+ 	memset(fl6, 0, sizeof(*fl6));
+ 	fl6->flowi6_proto = IPPROTO_TCP;
+ 	fl6->daddr = ireq->ir_v6_rmt_addr;
+-	final_p = fl6_update_dst(fl6, np->opt, &final);
++	rcu_read_lock();
++	final_p = fl6_update_dst(fl6, rcu_dereference(np->opt), &final);
++	rcu_read_unlock();
+ 	fl6->saddr = ireq->ir_v6_loc_addr;
+ 	fl6->flowi6_oif = ireq->ir_iif;
+ 	fl6->flowi6_mark = sk->sk_mark;
+@@ -212,7 +214,9 @@ static struct dst_entry *inet6_csk_route_socket(struct sock *sk,
+ 	fl6->fl6_dport = inet->inet_dport;
+ 	security_sk_classify_flow(sk, flowi6_to_flowi(fl6));
+ 
+-	final_p = fl6_update_dst(fl6, np->opt, &final);
++	rcu_read_lock();
++	final_p = fl6_update_dst(fl6, rcu_dereference(np->opt), &final);
++	rcu_read_unlock();
+ 
+ 	dst = __inet6_csk_dst_check(sk, np->dst_cookie);
+ 	if (!dst) {
+@@ -246,7 +250,8 @@ int inet6_csk_xmit(struct sk_buff *skb, struct flowi *fl_unused)
+ 	/* Restore final destination back after routing done */
+ 	fl6.daddr = sk->sk_v6_daddr;
+ 
+-	res = ip6_xmit(sk, skb, &fl6, np->opt, np->tclass);
++	res = ip6_xmit(sk, skb, &fl6, rcu_dereference(np->opt),
++		       np->tclass);
+ 	rcu_read_unlock();
+ 	return res;
+ }
+* Unmerged path net/ipv6/ipv6_sockglue.c
+* Unmerged path net/ipv6/raw.c
+diff --git a/net/ipv6/syncookies.c b/net/ipv6/syncookies.c
+index 47e5432f7b07..917ede0b5cbd 100644
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@ -237,7 +237,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
+ 		memset(&fl6, 0, sizeof(fl6));
+ 		fl6.flowi6_proto = IPPROTO_TCP;
+ 		fl6.daddr = ireq->ir_v6_rmt_addr;
+-		final_p = fl6_update_dst(&fl6, np->opt, &final);
++		final_p = fl6_update_dst(&fl6, rcu_dereference(np->opt), &final);
+ 		fl6.saddr = ireq->ir_v6_loc_addr;
+ 		fl6.flowi6_oif = sk->sk_bound_dev_if;
+ 		fl6.flowi6_mark = sk->sk_mark;
+* Unmerged path net/ipv6/tcp_ipv6.c
+* Unmerged path net/ipv6/udp.c
+diff --git a/net/l2tp/l2tp_ip6.c b/net/l2tp/l2tp_ip6.c
+index d1a4edfc3b9c..413ebef9dab8 100644
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@ -485,6 +485,7 @@ static int l2tp_ip6_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 		(struct sockaddr_l2tpip6 *) msg->msg_name;
+ 	struct in6_addr *daddr, *final_p, final;
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
++	struct ipv6_txoptions *opt_to_free = NULL;
+ 	struct ipv6_txoptions *opt = NULL;
+ 	struct ip6_flowlabel *flowlabel = NULL;
+ 	struct dst_entry *dst = NULL;
+@@ -575,8 +576,10 @@ static int l2tp_ip6_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 			opt = NULL;
+ 	}
+ 
+-	if (opt == NULL)
+-		opt = np->opt;
++	if (!opt) {
++		opt = txopt_get(np);
++		opt_to_free = opt;
++	}
+ 	if (flowlabel)
+ 		opt = fl6_merge_options(&opt_space, flowlabel, opt);
+ 	opt = ipv6_fixup_options(&opt_space, opt);
+@@ -637,6 +640,7 @@ done:
+ 	dst_release(dst);
+ out:
+ 	fl6_sock_release(flowlabel);
++	txopt_put(opt_to_free);
+ 
+ 	return err < 0 ? err : len;
+ 
