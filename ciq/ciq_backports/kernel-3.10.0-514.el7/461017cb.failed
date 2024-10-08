@@ -1,0 +1,553 @@
+net/mlx5e: Support RX multi-packet WQE (Striding RQ)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] mlx5e: Support RX multi-packet WQE (Striding RQ) (kamal heib) [1275159 1296272 1296405 1298421 1298422 1298423 1298424 1298425]
+Rebuild_FUZZ: 96.00%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 461017cb006aa1b39b0f647ae0ee2d9d84eef05b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/461017cb.failed
+
+Introduce the feature of multi-packet WQE (RX Work Queue Element)
+referred to as (MPWQE or Striding RQ), in which WQEs are larger
+and serve multiple packets each.
+
+Every WQE consists of many strides of the same size, every received
+packet is aligned to a beginning of a stride and is written to
+consecutive strides within a WQE.
+
+In the regular approach, each regular WQE is big enough to be capable
+of serving one received packet of any size up to MTU or 64K in case of
+device LRO is enabled, making it very wasteful when dealing with
+small packets or device LRO is enabled.
+
+For its flexibility, MPWQE allows a better memory utilization
+(implying improvements in CPU utilization and packet rate) as packets
+consume strides according to their size, preserving the rest of
+the WQE to be available for other packets.
+
+MPWQE default configuration:
+	Num of WQEs	= 16
+	Strides Per WQE = 2048
+	Stride Size	= 64 byte
+
+The default WQEs memory footprint went from 1024*mtu (~1.5MB) to
+16 * 2048 * 64 = 2MB per ring.
+However, HW LRO can now be supported at no additional cost in memory
+footprint, and hence we turn it on by default and get an even better
+performance.
+
+Performance tested on ConnectX4-Lx 50G.
+To isolate the feature under test, the numbers below were measured with
+HW LRO turned off. We verified that the performance just improves when
+LRO is turned back on.
+
+* Netperf single TCP stream:
+- BW raised by 10-15% for representative packet sizes:
+  default, 64B, 1024B, 1478B, 65536B.
+
+* Netperf multi TCP stream:
+- No degradation, line rate reached.
+
+* Pktgen: packet rate raised by 2-10% for traffic of different message
+sizes: 64B, 128B, 256B, 1024B, and 1500B.
+
+* Pktgen: packet loss in bursts of small messages (64byte),
+single stream:
+- | num packets | packets loss before | packets loss after
+  |     2K      |       ~ 1K          |       0
+  |     8K      |       ~ 6K          |       0
+  |     16K     |       ~13K          |       0
+  |     32K     |       ~28K          |       0
+  |     64K     |       ~57K          |     ~24K
+
+As expected as the driver can receive as many small packets (<=64B) as
+the number of total strides in the ring (default = 2048 * 16) vs. 1024
+(default ring size regardless of packets size) before this feature.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Achiad Shochat <achiad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 461017cb006aa1b39b0f647ae0ee2d9d84eef05b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	include/linux/mlx5/device.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index b2b207af1d60,f519148d7dcc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -68,6 -90,54 +86,57 @@@
+  #define MLX5E_SQ_BF_BUDGET             16
+  
+  #define MLX5E_NUM_MAIN_GROUPS 9
+++<<<<<<< HEAD
+++=======
++ #define MLX5E_NET_IP_ALIGN 2
++ 
++ static inline u16 mlx5_min_rx_wqes(int wq_type, u32 wq_size)
++ {
++ 	switch (wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return min_t(u16, MLX5E_PARAMS_DEFAULT_MIN_RX_WQES_MPW,
++ 			     wq_size / 2);
++ 	default:
++ 		return min_t(u16, MLX5E_PARAMS_DEFAULT_MIN_RX_WQES,
++ 			     wq_size / 2);
++ 	}
++ }
++ 
++ static inline int mlx5_min_log_rq_size(int wq_type)
++ {
++ 	switch (wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW;
++ 	default:
++ 		return MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE;
++ 	}
++ }
++ 
++ static inline int mlx5_max_log_rq_size(int wq_type)
++ {
++ 	switch (wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE_MPW;
++ 	default:
++ 		return MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE;
++ 	}
++ }
++ 
++ struct mlx5e_tx_wqe {
++ 	struct mlx5_wqe_ctrl_seg ctrl;
++ 	struct mlx5_wqe_eth_seg  eth;
++ };
++ 
++ struct mlx5e_rx_wqe {
++ 	struct mlx5_wqe_srq_next_seg  next;
++ 	struct mlx5_wqe_data_seg      data;
++ };
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ #define MLX5E_MAX_BW_ALLOC 100 /* Max percentage of BW allocation */
++ #define MLX5E_MIN_BW_ALLOC 1   /* Min percentage of BW allocation */
++ #endif
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  
+  static const char vport_strings[][ETH_GSTRING_LEN] = {
+  	/* vport statistics */
+@@@ -143,8 -220,9 +213,13 @@@ struct mlx5e_vport_stats 
+  	u64 tx_queue_wake;
+  	u64 tx_queue_dropped;
+  	u64 rx_wqe_err;
++ 	u64 rx_mpwqe_filler;
+  
+++<<<<<<< HEAD
+ +#define NUM_VPORT_COUNTERS     32
+++=======
++ #define NUM_VPORT_COUNTERS     36
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  };
+  
+  static const char pport_strings[][ETH_GSTRING_LEN] = {
+@@@ -237,7 -327,8 +313,12 @@@ struct mlx5e_rq_stats 
+  	u64 lro_packets;
+  	u64 lro_bytes;
+  	u64 wqe_err;
+++<<<<<<< HEAD
+ +#define NUM_RQ_STATS 6
+++=======
++ 	u64 mpwqe_filler;
++ #define NUM_RQ_STATS 8
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  };
+  
+  static const char sq_stats_strings[][ETH_GSTRING_LEN] = {
+@@@ -270,9 -372,9 +351,10 @@@ struct mlx5e_stats 
+  
+  struct mlx5e_params {
+  	u8  log_sq_size;
++ 	u8  rq_wq_type;
+  	u8  log_rq_size;
+  	u16 num_channels;
+ +	u8  default_vlan_prio;
+  	u8  num_tc;
+  	u16 rx_cq_moderation_usec;
+  	u16 rx_cq_moderation_pkts;
+@@@ -305,6 -423,23 +387,26 @@@ struct mlx5e_cq 
+  	struct mlx5_wq_ctrl        wq_ctrl;
+  } ____cacheline_aligned_in_smp;
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5e_rq;
++ typedef void (*mlx5e_fp_handle_rx_cqe)(struct mlx5e_rq *rq,
++ 				       struct mlx5_cqe64 *cqe);
++ typedef int (*mlx5e_fp_alloc_wqe)(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe,
++ 				  u16 ix);
++ 
++ struct mlx5e_dma_info {
++ 	struct page	*page;
++ 	dma_addr_t	addr;
++ };
++ 
++ struct mlx5e_mpw_info {
++ 	struct mlx5e_dma_info dma_info;
++ 	u16 consumed_strides;
++ 	u16 skbs_frags[MLX5_MPWRQ_PAGES_PER_WQE];
++ };
++ 
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  struct mlx5e_rq {
+  	/* data path */
+  	struct mlx5_wq_ll      wq;
+@@@ -564,9 -715,14 +668,18 @@@ netdev_tx_t mlx5e_xmit(struct sk_buff *
+  void mlx5e_completion_event(struct mlx5_core_cq *mcq);
+  void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event);
+  int mlx5e_napi_poll(struct napi_struct *napi, int budget);
+ -bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget);
+ +bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq);
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
+++<<<<<<< HEAD
+++bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq);
+++=======
++ 
++ void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
++ void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+  bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq);
++ int mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe, u16 ix);
++ int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe, u16 ix);
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  struct mlx5_cqe64 *mlx5e_get_cqe(struct mlx5e_cq *cq);
+  
+  void mlx5e_update_stats(struct mlx5e_priv *priv);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 23ff9e4eac90,871f3af204dd..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -333,15 -375,15 +358,17 @@@ static int mlx5e_create_rq(struct mlx5e
+  
+  	for (i = 0; i < wq_sz; i++) {
+  		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(&rq->wq, i);
+- 		u32 byte_count = rq->wqe_sz - MLX5E_NET_IP_ALIGN;
+  
+  		wqe->data.lkey       = c->mkey_be;
+- 		wqe->data.byte_count =
+- 			cpu_to_be32(byte_count | MLX5_HW_START_PADDING);
++ 		wqe->data.byte_count = cpu_to_be32(byte_count);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	rq->wq_type = priv->params.rq_wq_type;
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  	rq->pdev    = c->pdev;
+  	rq->netdev  = c->netdev;
+ -	rq->tstamp  = &priv->tstamp;
+  	rq->channel = c;
+  	rq->ix      = c->ix;
+  	rq->priv    = c->priv;
+@@@ -2089,10 -2403,7 +2159,8 @@@ static void mlx5e_build_netdev_priv(str
+  	priv->params.tx_cq_moderation_pkts =
+  		MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_PKTS;
+  	priv->params.tx_max_inline         = mlx5e_get_max_inline_cap(mdev);
+- 	priv->params.min_rx_wqes           =
+- 		MLX5E_PARAMS_DEFAULT_MIN_RX_WQES;
+  	priv->params.num_tc                = 1;
+ +	priv->params.default_vlan_prio     = 0;
+  	priv->params.rss_hfunc             = ETH_RSS_HASH_XOR;
+  
+  	netdev_rss_key_fill(priv->params.toeplitz_hash_key,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 2dc1f9b26b65,71f3a5d244ff..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -190,14 -232,12 +227,16 @@@ static inline void mlx5e_build_rx_skb(s
+  				      struct sk_buff *skb)
+  {
+  	struct net_device *netdev = rq->netdev;
+++<<<<<<< HEAD
+ +	u32 cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++=======
++ 	struct mlx5e_tstamp *tstamp = rq->tstamp;
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  	int lro_num_seg;
+  
+- 	skb_put(skb, cqe_bcnt);
+- 
+  	lro_num_seg = be32_to_cpu(cqe->srqn) >> 24;
+  	if (lro_num_seg > 1) {
+- 		mlx5e_lro_update_hdr(skb, cqe);
++ 		mlx5e_lro_update_hdr(skb, cqe, cqe_bcnt);
+  		skb_shinfo(skb)->gso_size = DIV_ROUND_UP(cqe_bcnt, lro_num_seg);
+  		rq->stats.lro_packets++;
+  		rq->stats.lro_bytes += cqe_bcnt;
+@@@ -215,6 -258,142 +254,145 @@@
+  	if (cqe_has_vlan(cqe))
+  		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+  				       be16_to_cpu(cqe->vlan_info));
+++<<<<<<< HEAD
+++=======
++ 
++ 	skb->mark = be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK;
++ }
++ 
++ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
++ 					 struct mlx5_cqe64 *cqe,
++ 					 u32 cqe_bcnt,
++ 					 struct sk_buff *skb)
++ {
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += cqe_bcnt;
++ 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ }
++ 
++ void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_rx_wqe *wqe;
++ 	struct sk_buff *skb;
++ 	__be16 wqe_counter_be;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	skb            = rq->skb[wqe_counter];
++ 	prefetch(skb->data);
++ 	rq->skb[wqe_counter] = NULL;
++ 
++ 	dma_unmap_single(rq->pdev,
++ 			 *((dma_addr_t *)skb->cb),
++ 			 rq->wqe_sz,
++ 			 DMA_FROM_DEVICE);
++ 
++ 	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
++ 		rq->stats.wqe_err++;
++ 		dev_kfree_skb(skb);
++ 		goto wq_ll_pop;
++ 	}
++ 
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
++ 	skb_put(skb, cqe_bcnt);
++ 
++ 	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 
++ wq_ll_pop:
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
++ }
++ 
++ void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	u16 cstrides       = mpwrq_get_cqe_consumed_strides(cqe);
++ 	u16 stride_ix      = mpwrq_get_cqe_stride_index(cqe);
++ 	u16 wqe_id         = be16_to_cpu(cqe->wqe_id);
++ 	struct mlx5e_mpw_info *wi = &rq->wqe_info[wqe_id];
++ 	struct mlx5e_rx_wqe  *wqe = mlx5_wq_ll_get_wqe(&rq->wq, wqe_id);
++ 	struct sk_buff *skb;
++ 	u32 consumed_bytes;
++ 	u32 head_offset;
++ 	u32 frag_offset;
++ 	u32 wqe_offset;
++ 	u32 page_idx;
++ 	u16 byte_cnt;
++ 	u16 cqe_bcnt;
++ 	u16 headlen;
++ 	int i;
++ 
++ 	wi->consumed_strides += cstrides;
++ 
++ 	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
++ 		rq->stats.wqe_err++;
++ 		goto mpwrq_cqe_out;
++ 	}
++ 
++ 	if (unlikely(mpwrq_is_filler_cqe(cqe))) {
++ 		rq->stats.mpwqe_filler++;
++ 		goto mpwrq_cqe_out;
++ 	}
++ 
++ 	skb = netdev_alloc_skb(rq->netdev,
++ 			       ALIGN(MLX5_MPWRQ_SMALL_PACKET_THRESHOLD,
++ 				     sizeof(long)));
++ 	if (unlikely(!skb))
++ 		goto mpwrq_cqe_out;
++ 
++ 	prefetch(skb->data);
++ 	wqe_offset = stride_ix * MLX5_MPWRQ_STRIDE_SIZE;
++ 	consumed_bytes = cstrides * MLX5_MPWRQ_STRIDE_SIZE;
++ 	dma_sync_single_for_cpu(rq->pdev, wi->dma_info.addr + wqe_offset,
++ 				consumed_bytes, DMA_FROM_DEVICE);
++ 
++ 	head_offset    = wqe_offset & (PAGE_SIZE - 1);
++ 	page_idx       = wqe_offset >> PAGE_SHIFT;
++ 	cqe_bcnt = mpwrq_get_cqe_byte_cnt(cqe);
++ 	headlen = min_t(u16, MLX5_MPWRQ_SMALL_PACKET_THRESHOLD, cqe_bcnt);
++ 	frag_offset = head_offset + headlen;
++ 
++ 	byte_cnt = cqe_bcnt - headlen;
++ 	while (byte_cnt) {
++ 		u32 pg_consumed_bytes =
++ 			min_t(u32, PAGE_SIZE - frag_offset, byte_cnt);
++ 		unsigned int truesize =
++ 			ALIGN(pg_consumed_bytes, MLX5_MPWRQ_STRIDE_SIZE);
++ 
++ 		wi->skbs_frags[page_idx]++;
++ 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 				&wi->dma_info.page[page_idx], frag_offset,
++ 				pg_consumed_bytes, truesize);
++ 		byte_cnt -= pg_consumed_bytes;
++ 		frag_offset = 0;
++ 		page_idx++;
++ 	}
++ 
++ 	skb_copy_to_linear_data(skb,
++ 				page_address(wi->dma_info.page) + wqe_offset,
++ 				ALIGN(headlen, sizeof(long)));
++ 	/* skb linear part was allocated with headlen and aligned to long */
++ 	skb->tail += headlen;
++ 	skb->len  += headlen;
++ 
++ 	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 
++ mpwrq_cqe_out:
++ 	if (likely(wi->consumed_strides < MLX5_MPWRQ_NUM_STRIDES))
++ 		return;
++ 
++ 	dma_unmap_page(rq->pdev, wi->dma_info.addr, rq->wqe_sz,
++ 		       PCI_DMA_FROMDEVICE);
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++) {
++ 		atomic_sub(MLX5_MPWRQ_STRIDES_PER_PAGE - wi->skbs_frags[i],
++ 			   &wi->dma_info.page[i]._count);
++ 		put_page(&wi->dma_info.page[i]);
++ 	}
++ 	mlx5_wq_ll_pop(&rq->wq, cqe->wqe_id, &wqe->next.next_wqe_index);
+  }
+  
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+diff --cc include/linux/mlx5/device.h
+index ca924da2b9a5,03f8d719b680..000000000000
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@@ -690,6 -687,52 +691,55 @@@ static inline int cqe_has_vlan(struct m
+  	return !!(cqe->l4_hdr_type_etc & 0x1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 get_cqe_ts(struct mlx5_cqe64 *cqe)
++ {
++ 	u32 hi, lo;
++ 
++ 	hi = be32_to_cpu(cqe->timestamp_h);
++ 	lo = be32_to_cpu(cqe->timestamp_l);
++ 
++ 	return (u64)lo | ((u64)hi << 32);
++ }
++ 
++ struct mpwrq_cqe_bc {
++ 	__be16	filler_consumed_strides;
++ 	__be16	byte_cnt;
++ };
++ 
++ static inline u16 mpwrq_get_cqe_byte_cnt(struct mlx5_cqe64 *cqe)
++ {
++ 	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
++ 
++ 	return be16_to_cpu(bc->byte_cnt);
++ }
++ 
++ static inline u16 mpwrq_get_cqe_bc_consumed_strides(struct mpwrq_cqe_bc *bc)
++ {
++ 	return 0x7fff & be16_to_cpu(bc->filler_consumed_strides);
++ }
++ 
++ static inline u16 mpwrq_get_cqe_consumed_strides(struct mlx5_cqe64 *cqe)
++ {
++ 	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
++ 
++ 	return mpwrq_get_cqe_bc_consumed_strides(bc);
++ }
++ 
++ static inline bool mpwrq_is_filler_cqe(struct mlx5_cqe64 *cqe)
++ {
++ 	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
++ 
++ 	return 0x8000 & be16_to_cpu(bc->filler_consumed_strides);
++ }
++ 
++ static inline u16 mpwrq_get_cqe_stride_index(struct mlx5_cqe64 *cqe)
++ {
++ 	return be16_to_cpu(cqe->wqe_counter);
++ }
++ 
+++>>>>>>> 461017cb006a (net/mlx5e: Support RX multi-packet WQE (Striding RQ))
+  enum {
+  	CQE_L4_HDR_TYPE_NONE			= 0x0,
+  	CQE_L4_HDR_TYPE_TCP_NO_ACK		= 0x1,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 72a2892f3570..7ab455642559 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -262,8 +262,9 @@ static void mlx5e_get_ringparam(struct net_device *dev,
+ 				struct ethtool_ringparam *param)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
++	int rq_wq_type = priv->params.rq_wq_type;
+ 
+-	param->rx_max_pending = 1 << MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE;
++	param->rx_max_pending = 1 << mlx5_max_log_rq_size(rq_wq_type);
+ 	param->tx_max_pending = 1 << MLX5E_PARAMS_MAXIMUM_LOG_SQ_SIZE;
+ 	param->rx_pending     = 1 << priv->params.log_rq_size;
+ 	param->tx_pending     = 1 << priv->params.log_sq_size;
+@@ -274,6 +275,7 @@ static int mlx5e_set_ringparam(struct net_device *dev,
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 	bool was_opened;
++	int rq_wq_type = priv->params.rq_wq_type;
+ 	u16 min_rx_wqes;
+ 	u8 log_rq_size;
+ 	u8 log_sq_size;
+@@ -289,16 +291,16 @@ static int mlx5e_set_ringparam(struct net_device *dev,
+ 			    __func__);
+ 		return -EINVAL;
+ 	}
+-	if (param->rx_pending < (1 << MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE)) {
++	if (param->rx_pending < (1 << mlx5_min_log_rq_size(rq_wq_type))) {
+ 		netdev_info(dev, "%s: rx_pending (%d) < min (%d)\n",
+ 			    __func__, param->rx_pending,
+-			    1 << MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE);
++			    1 << mlx5_min_log_rq_size(rq_wq_type));
+ 		return -EINVAL;
+ 	}
+-	if (param->rx_pending > (1 << MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE)) {
++	if (param->rx_pending > (1 << mlx5_max_log_rq_size(rq_wq_type))) {
+ 		netdev_info(dev, "%s: rx_pending (%d) > max (%d)\n",
+ 			    __func__, param->rx_pending,
+-			    1 << MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE);
++			    1 << mlx5_max_log_rq_size(rq_wq_type));
+ 		return -EINVAL;
+ 	}
+ 	if (param->tx_pending < (1 << MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)) {
+@@ -316,8 +318,7 @@ static int mlx5e_set_ringparam(struct net_device *dev,
+ 
+ 	log_rq_size = order_base_2(param->rx_pending);
+ 	log_sq_size = order_base_2(param->tx_pending);
+-	min_rx_wqes = min_t(u16, param->rx_pending - 1,
+-			    MLX5E_PARAMS_DEFAULT_MIN_RX_WQES);
++	min_rx_wqes = mlx5_min_rx_wqes(rq_wq_type, param->rx_pending);
+ 
+ 	if (log_rq_size == priv->params.log_rq_size &&
+ 	    log_sq_size == priv->params.log_sq_size &&
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path include/linux/mlx5/device.h
