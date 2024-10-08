@@ -1,0 +1,174 @@
+xfs: replace global xfslogd wq with per-mount wq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 78c931b8be75456562b55ed4e27878f1519e1367
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/78c931b8.failed
+
+The xfslogd workqueue is a global, single-job workqueue for buffer ioend
+processing. This means we allow for a single work item at a time for all
+possible XFS mounts on a system. fsstress testing in loopback XFS over
+XFS configurations has reproduced xfslogd deadlocks due to the single
+threaded nature of the queue and dependencies introduced between the
+separate XFS instances by online discard (-o discard).
+
+Discard over a loopback device converts the discard request to a hole
+punch (fallocate) on the underlying file. Online discard requests are
+issued synchronously and from xfslogd context in XFS, hence the xfslogd
+workqueue is blocked in the upper fs waiting on a hole punch request to
+be servied in the lower fs. If the lower fs issues I/O that depends on
+xfslogd to complete, both filesystems end up hung indefinitely. This is
+reproduced reliabily by generic/013 on XFS->loop->XFS test devices with
+the '-o discard' mount option.
+
+Further, docker implementations appear to use this kind of configuration
+for container instance filesystems by default (container fs->dm->
+loop->base fs) and therefore are subject to this deadlock when running
+on XFS.
+
+Replace the global xfslogd workqueue with a per-mount variant. This
+guarantees each mount access to a single worker and prevents deadlocks
+due to inter-fs dependencies introduced by discard. Since the queue is
+only responsible for buffer iodone processing at this point in time,
+rename xfslogd to xfs-buf.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 78c931b8be75456562b55ed4e27878f1519e1367)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index f1adf6d0b7ae,c06d790a3000..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1038,35 -1032,26 +1036,40 @@@ xfs_buf_iodone_work
+  		(*(bp->b_iodone))(bp);
+  	else if (bp->b_flags & XBF_ASYNC)
+  		xfs_buf_relse(bp);
+ -	else
+ +	else {
+ +		ASSERT(read && bp->b_ops);
+  		complete(&bp->b_iowait);
+ +	}
+  }
+  
+ -static void
+ -xfs_buf_ioend_work(
+ -	struct work_struct	*work)
+ +void
+ +xfs_buf_ioend(
+ +	struct xfs_buf	*bp,
+ +	int		schedule)
+  {
+ -	struct xfs_buf		*bp =
+ -		container_of(work, xfs_buf_t, b_iodone_work);
+++<<<<<<< HEAD
+ +	bool		read = !!(bp->b_flags & XBF_READ);
+  
+ -	xfs_buf_ioend(bp);
+ -}
+ +	trace_xfs_buf_iodone(bp, _RET_IP_);
+  
+ -void
+ -xfs_buf_ioend_async(
+ -	struct xfs_buf	*bp)
+ -{
+ +	if (bp->b_error == 0)
+ +		bp->b_flags |= XBF_DONE;
+ +
+ +	if (bp->b_iodone || (read && bp->b_ops) || (bp->b_flags & XBF_ASYNC)) {
+ +		if (schedule) {
+ +			INIT_WORK(&bp->b_iodone_work, xfs_buf_iodone_work);
+ +			queue_work(xfslogd_workqueue, &bp->b_iodone_work);
+ +		} else {
+ +			xfs_buf_iodone_work(&bp->b_iodone_work);
+ +		}
+ +	} else {
+ +		bp->b_flags &= ~(XBF_READ | XBF_WRITE | XBF_READ_AHEAD);
+ +		complete(&bp->b_iowait);
+ +	}
+++=======
++ 	INIT_WORK(&bp->b_iodone_work, xfs_buf_ioend_work);
++ 	queue_work(bp->b_target->bt_mount->m_buf_workqueue, &bp->b_iodone_work);
+++>>>>>>> 78c931b8be75 (xfs: replace global xfslogd wq with per-mount wq)
+  }
+  
+  void
+@@@ -1850,15 -1880,8 +1853,16 @@@ xfs_buf_init(void
+  	if (!xfs_buf_zone)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	xfslogd_workqueue = alloc_workqueue("xfslogd",
+ +					WQ_MEM_RECLAIM | WQ_HIGHPRI, 1);
+ +	if (!xfslogd_workqueue)
+ +		goto out_free_buf_zone;
+ +
+++=======
+++>>>>>>> 78c931b8be75 (xfs: replace global xfslogd wq with per-mount wq)
+  	return 0;
+  
+-  out_free_buf_zone:
+- 	kmem_zone_destroy(xfs_buf_zone);
+   out:
+  	return -ENOMEM;
+  }
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index a466c5e5826e..42da9edfd418 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -173,6 +173,7 @@ typedef struct xfs_mount {
+ 	int64_t			m_low_space[XFS_LOWSP_MAX];
+ 						/* low free space thresholds */
+ 
++	struct workqueue_struct *m_buf_workqueue;
+ 	struct workqueue_struct	*m_data_workqueue;
+ 	struct workqueue_struct	*m_unwritten_workqueue;
+ 	struct workqueue_struct	*m_cil_workqueue;
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 4fa2281561ea..bd3958b719a8 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -847,10 +847,16 @@ STATIC int
+ xfs_init_mount_workqueues(
+ 	struct xfs_mount	*mp)
+ {
++	mp->m_buf_workqueue = alloc_workqueue("xfs-buf/%s",
++			WQ_MEM_RECLAIM|WQ_HIGHPRI|WQ_FREEZABLE, 1,
++			mp->m_fsname);
++	if (!mp->m_buf_workqueue)
++		goto out;
++
+ 	mp->m_data_workqueue = alloc_workqueue("xfs-data/%s",
+ 			WQ_MEM_RECLAIM, 0, mp->m_fsname);
+ 	if (!mp->m_data_workqueue)
+-		goto out;
++		goto out_destroy_buf;
+ 
+ 	mp->m_unwritten_workqueue = alloc_workqueue("xfs-conv/%s",
+ 			WQ_MEM_RECLAIM, 0, mp->m_fsname);
+@@ -889,6 +895,8 @@ out_destroy_unwritten:
+ 	destroy_workqueue(mp->m_unwritten_workqueue);
+ out_destroy_data_iodone_queue:
+ 	destroy_workqueue(mp->m_data_workqueue);
++out_destroy_buf:
++	destroy_workqueue(mp->m_buf_workqueue);
+ out:
+ 	return -ENOMEM;
+ }
+@@ -903,6 +911,7 @@ xfs_destroy_mount_workqueues(
+ 	destroy_workqueue(mp->m_cil_workqueue);
+ 	destroy_workqueue(mp->m_data_workqueue);
+ 	destroy_workqueue(mp->m_unwritten_workqueue);
++	destroy_workqueue(mp->m_buf_workqueue);
+ }
+ 
+ /*
