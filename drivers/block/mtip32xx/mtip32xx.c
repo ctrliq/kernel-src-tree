@@ -3865,7 +3865,8 @@ static int mtip_block_initialize(struct driver_data *dd)
 
 	dd->disk->driverfs_dev	= &dd->pdev->dev;
 	dd->disk->major		= dd->major;
-	dd->disk->first_minor	= dd->instance * MTIP_MAX_MINORS;
+	dd->disk->first_minor	= index * MTIP_MAX_MINORS;
+	dd->disk->minors 	= MTIP_MAX_MINORS;
 	dd->disk->fops		= &mtip_block_ops;
 	dd->disk->private_data	= dd;
 	dd->index		= index;
