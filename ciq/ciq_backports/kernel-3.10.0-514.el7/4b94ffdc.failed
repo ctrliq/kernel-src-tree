@@ -1,0 +1,608 @@
+x86, mm: introduce vmem_altmap to augment vmemmap_populate()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 4b94ffdc4163bae1ec73b6e977ffb7a7da3d06d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4b94ffdc.failed
+
+In support of providing struct page for large persistent memory
+capacities, use struct vmem_altmap to change the default policy for
+allocating memory for the memmap array.  The default vmemmap_populate()
+allocates page table storage area from the page allocator.  Given
+persistent memory capacities relative to DRAM it may not be feasible to
+store the memmap in 'System Memory'.  Instead vmem_altmap represents
+pre-allocated "device pages" to satisfy vmemmap_alloc_block_buf()
+requests.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4b94ffdc4163bae1ec73b6e977ffb7a7da3d06d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+#	include/linux/memory_hotplug.h
+#	include/linux/memremap.h
+#	kernel/memremap.c
+#	mm/memory_hotplug.c
+#	mm/page_alloc.c
+diff --cc include/linux/memory_hotplug.h
+index ebe3e1dfae11,43405992d027..000000000000
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@@ -263,9 -274,9 +263,15 @@@ extern int arch_add_memory(int nid, u6
+  extern int offline_pages(unsigned long start_pfn, unsigned long nr_pages);
+  extern bool is_memblock_offlined(struct memory_block *mem);
+  extern void remove_memory(int nid, u64 start, u64 size);
+++<<<<<<< HEAD
+ +extern int sparse_add_one_section(struct zone *zone, unsigned long start_pfn,
+ +								int nr_pages);
+ +extern void sparse_remove_one_section(struct zone *zone, struct mem_section *ms);
+++=======
++ extern int sparse_add_one_section(struct zone *zone, unsigned long start_pfn);
++ extern void sparse_remove_one_section(struct zone *zone, struct mem_section *ms,
++ 		unsigned long map_offset);
+++>>>>>>> 4b94ffdc4163 (x86, mm: introduce vmem_altmap to augment vmemmap_populate())
+  extern struct page *sparse_decode_mem_map(unsigned long coded_mem_map,
+  					  unsigned long pnum);
+  
+diff --cc kernel/memremap.c
+index 26717809cbd2,562f6471fe90..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -144,3 -149,196 +144,199 @@@ void devm_memunmap(struct device *dev, 
+  				devm_memremap_match, addr));
+  }
+  EXPORT_SYMBOL(devm_memunmap);
+++<<<<<<< HEAD
+++=======
++ 
++ pfn_t phys_to_pfn_t(dma_addr_t addr, unsigned long flags)
++ {
++ 	return __pfn_to_pfn_t(addr >> PAGE_SHIFT, flags);
++ }
++ EXPORT_SYMBOL(phys_to_pfn_t);
++ 
++ #ifdef CONFIG_ZONE_DEVICE
++ static DEFINE_MUTEX(pgmap_lock);
++ static RADIX_TREE(pgmap_radix, GFP_KERNEL);
++ #define SECTION_MASK ~((1UL << PA_SECTION_SHIFT) - 1)
++ #define SECTION_SIZE (1UL << PA_SECTION_SHIFT)
++ 
++ struct page_map {
++ 	struct resource res;
++ 	struct percpu_ref *ref;
++ 	struct dev_pagemap pgmap;
++ 	struct vmem_altmap altmap;
++ };
++ 
++ static void pgmap_radix_release(struct resource *res)
++ {
++ 	resource_size_t key;
++ 
++ 	mutex_lock(&pgmap_lock);
++ 	for (key = res->start; key <= res->end; key += SECTION_SIZE)
++ 		radix_tree_delete(&pgmap_radix, key >> PA_SECTION_SHIFT);
++ 	mutex_unlock(&pgmap_lock);
++ }
++ 
++ static void devm_memremap_pages_release(struct device *dev, void *data)
++ {
++ 	struct page_map *page_map = data;
++ 	struct resource *res = &page_map->res;
++ 	resource_size_t align_start, align_size;
++ 	struct dev_pagemap *pgmap = &page_map->pgmap;
++ 
++ 	pgmap_radix_release(res);
++ 
++ 	/* pages are dead and unused, undo the arch mapping */
++ 	align_start = res->start & ~(SECTION_SIZE - 1);
++ 	align_size = ALIGN(resource_size(res), SECTION_SIZE);
++ 	arch_remove_memory(align_start, align_size);
++ 	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
++ 			"%s: failed to free all reserved pages\n", __func__);
++ }
++ 
++ /* assumes rcu_read_lock() held at entry */
++ struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
++ {
++ 	struct page_map *page_map;
++ 
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	page_map = radix_tree_lookup(&pgmap_radix, phys >> PA_SECTION_SHIFT);
++ 	return page_map ? &page_map->pgmap : NULL;
++ }
++ 
++ /**
++  * devm_memremap_pages - remap and provide memmap backing for the given resource
++  * @dev: hosting device for @res
++  * @res: "host memory" address range
++  * @altmap: optional descriptor for allocating the memmap from @res
++  *
++  * Note, the expectation is that @res is a host memory range that could
++  * feasibly be treated as a "System RAM" range, i.e. not a device mmio
++  * range, but this is not enforced.
++  */
++ void *devm_memremap_pages(struct device *dev, struct resource *res,
++ 		struct vmem_altmap *altmap)
++ {
++ 	int is_ram = region_intersects(res->start, resource_size(res),
++ 			"System RAM");
++ 	resource_size_t key, align_start, align_size;
++ 	struct dev_pagemap *pgmap;
++ 	struct page_map *page_map;
++ 	int error, nid;
++ 
++ 	if (is_ram == REGION_MIXED) {
++ 		WARN_ONCE(1, "%s attempted on mixed region %pr\n",
++ 				__func__, res);
++ 		return ERR_PTR(-ENXIO);
++ 	}
++ 
++ 	if (is_ram == REGION_INTERSECTS)
++ 		return __va(res->start);
++ 
++ 	if (altmap && !IS_ENABLED(CONFIG_SPARSEMEM_VMEMMAP)) {
++ 		dev_err(dev, "%s: altmap requires CONFIG_SPARSEMEM_VMEMMAP=y\n",
++ 				__func__);
++ 		return ERR_PTR(-ENXIO);
++ 	}
++ 
++ 	page_map = devres_alloc_node(devm_memremap_pages_release,
++ 			sizeof(*page_map), GFP_KERNEL, dev_to_node(dev));
++ 	if (!page_map)
++ 		return ERR_PTR(-ENOMEM);
++ 	pgmap = &page_map->pgmap;
++ 
++ 	memcpy(&page_map->res, res, sizeof(*res));
++ 
++ 	pgmap->dev = dev;
++ 	if (altmap) {
++ 		memcpy(&page_map->altmap, altmap, sizeof(*altmap));
++ 		pgmap->altmap = &page_map->altmap;
++ 	}
++ 	pgmap->res = &page_map->res;
++ 
++ 	mutex_lock(&pgmap_lock);
++ 	error = 0;
++ 	for (key = res->start; key <= res->end; key += SECTION_SIZE) {
++ 		struct dev_pagemap *dup;
++ 
++ 		rcu_read_lock();
++ 		dup = find_dev_pagemap(key);
++ 		rcu_read_unlock();
++ 		if (dup) {
++ 			dev_err(dev, "%s: %pr collides with mapping for %s\n",
++ 					__func__, res, dev_name(dup->dev));
++ 			error = -EBUSY;
++ 			break;
++ 		}
++ 		error = radix_tree_insert(&pgmap_radix, key >> PA_SECTION_SHIFT,
++ 				page_map);
++ 		if (error) {
++ 			dev_err(dev, "%s: failed: %d\n", __func__, error);
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&pgmap_lock);
++ 	if (error)
++ 		goto err_radix;
++ 
++ 	nid = dev_to_node(dev);
++ 	if (nid < 0)
++ 		nid = numa_mem_id();
++ 
++ 	align_start = res->start & ~(SECTION_SIZE - 1);
++ 	align_size = ALIGN(resource_size(res), SECTION_SIZE);
++ 	error = arch_add_memory(nid, align_start, align_size, true);
++ 	if (error)
++ 		goto err_add_memory;
++ 
++ 	devres_add(dev, page_map);
++ 	return __va(res->start);
++ 
++  err_add_memory:
++  err_radix:
++ 	pgmap_radix_release(res);
++ 	devres_free(page_map);
++ 	return ERR_PTR(error);
++ }
++ EXPORT_SYMBOL(devm_memremap_pages);
++ 
++ unsigned long vmem_altmap_offset(struct vmem_altmap *altmap)
++ {
++ 	/* number of pfns from base where pfn_to_page() is valid */
++ 	return altmap->reserve + altmap->free;
++ }
++ 
++ void vmem_altmap_free(struct vmem_altmap *altmap, unsigned long nr_pfns)
++ {
++ 	altmap->alloc -= nr_pfns;
++ }
++ 
++ #ifdef CONFIG_SPARSEMEM_VMEMMAP
++ struct vmem_altmap *to_vmem_altmap(unsigned long memmap_start)
++ {
++ 	/*
++ 	 * 'memmap_start' is the virtual address for the first "struct
++ 	 * page" in this range of the vmemmap array.  In the case of
++ 	 * CONFIG_SPARSE_VMEMMAP a page_to_pfn conversion is simple
++ 	 * pointer arithmetic, so we can perform this to_vmem_altmap()
++ 	 * conversion without concern for the initialization state of
++ 	 * the struct page fields.
++ 	 */
++ 	struct page *page = (struct page *) memmap_start;
++ 	struct dev_pagemap *pgmap;
++ 
++ 	/*
++ 	 * Uncoditionally retrieve a dev_pagemap associated with the
++ 	 * given physical address, this is only for use in the
++ 	 * arch_{add|remove}_memory() for setting up and tearing down
++ 	 * the memmap.
++ 	 */
++ 	rcu_read_lock();
++ 	pgmap = find_dev_pagemap(__pfn_to_phys(page_to_pfn(page)));
++ 	rcu_read_unlock();
++ 
++ 	return pgmap ? pgmap->altmap : NULL;
++ }
++ #endif /* CONFIG_SPARSEMEM_VMEMMAP */
++ #endif /* CONFIG_ZONE_DEVICE */
+++>>>>>>> 4b94ffdc4163 (x86, mm: introduce vmem_altmap to augment vmemmap_populate())
+diff --cc mm/memory_hotplug.c
+index e7bfdf837815,4af58a3a8ffa..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -446,8 -513,21 +449,21 @@@ int __ref __add_pages(int nid, struct z
+  	start_sec = pfn_to_section_nr(phys_start_pfn);
+  	end_sec = pfn_to_section_nr(phys_start_pfn + nr_pages - 1);
+  
++ 	altmap = to_vmem_altmap((unsigned long) pfn_to_page(phys_start_pfn));
++ 	if (altmap) {
++ 		/*
++ 		 * Validate altmap is within bounds of the total request
++ 		 */
++ 		if (altmap->base_pfn != phys_start_pfn
++ 				|| vmem_altmap_offset(altmap) > nr_pages) {
++ 			pr_warn_once("memory add fail, invalid altmap\n");
++ 			return -EINVAL;
++ 		}
++ 		altmap->alloc = 0;
++ 	}
++ 
+  	for (i = start_sec; i <= end_sec; i++) {
+ -		err = __add_section(nid, zone, section_nr_to_pfn(i));
+ +		err = __add_section(nid, zone, i << PFN_SECTION_SHIFT);
+  
+  		/*
+  		 * EEXIST is finally dealt with by ioresource collision
+@@@ -711,16 -817,6 +751,19 @@@ int __remove_pages(struct zone *zone, u
+  	BUG_ON(phys_start_pfn & ~PAGE_SECTION_MASK);
+  	BUG_ON(nr_pages % PAGES_PER_SECTION);
+  
+++<<<<<<< HEAD
+ +	start = phys_start_pfn << PAGE_SHIFT;
+ +	size = nr_pages * PAGE_SIZE;
+ +	ret = release_mem_region_adjustable(&iomem_resource, start, size);
+ +	if (ret) {
+ +		resource_size_t endres = start + size - 1;
+ +
+ +		pr_warn("Unable to release resource <%pa-%pa> (%d)\n",
+ +				&start, &endres, ret);
+ +	}
+ +
+++=======
+++>>>>>>> 4b94ffdc4163 (x86, mm: introduce vmem_altmap to augment vmemmap_populate())
+  	sections_to_remove = nr_pages / PAGES_PER_SECTION;
+  	for (i = 0; i < sections_to_remove; i++) {
+  		unsigned long pfn = phys_start_pfn + i*PAGES_PER_SECTION;
+diff --cc mm/page_alloc.c
+index 2873ec149f9f,7ca3fe6ef92d..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -4049,15 -4486,24 +4050,31 @@@ static void setup_zone_migrate_reserve(
+  void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+  		unsigned long start_pfn, enum memmap_context context)
+  {
+++<<<<<<< HEAD
+ +	struct page *page;
+++=======
++ 	struct vmem_altmap *altmap = to_vmem_altmap(__pfn_to_phys(start_pfn));
+++>>>>>>> 4b94ffdc4163 (x86, mm: introduce vmem_altmap to augment vmemmap_populate())
+  	unsigned long end_pfn = start_pfn + size;
++ 	pg_data_t *pgdat = NODE_DATA(nid);
+  	unsigned long pfn;
+  	struct zone *z;
+ -	unsigned long nr_initialised = 0;
+  
+  	if (highest_memmap_pfn < end_pfn - 1)
+  		highest_memmap_pfn = end_pfn - 1;
+  
+++<<<<<<< HEAD
+ +	z = &NODE_DATA(nid)->node_zones[zone];
+++=======
++ 	/*
++ 	 * Honor reservation requested by the driver for this ZONE_DEVICE
++ 	 * memory
++ 	 */
++ 	if (altmap && start_pfn == altmap->base_pfn)
++ 		start_pfn += altmap->reserve;
++ 
++ 	z = &pgdat->node_zones[zone];
+++>>>>>>> 4b94ffdc4163 (x86, mm: introduce vmem_altmap to augment vmemmap_populate())
+  	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
+  		/*
+  		 * There can be holes in boot-time mem_map[]s
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/memremap.h
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 91f048b04b05..b516a0ba6118 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -30,6 +30,7 @@
+ #include <linux/module.h>
+ #include <linux/memory.h>
+ #include <linux/memory_hotplug.h>
++#include <linux/memremap.h>
+ #include <linux/nmi.h>
+ #include <linux/gfp.h>
+ #include <linux/kcore.h>
+@@ -725,6 +726,12 @@ static void __meminit free_pagetable(struct page *page, int order)
+ {
+ 	unsigned long magic;
+ 	unsigned int nr_pages = 1 << order;
++	struct vmem_altmap *altmap = to_vmem_altmap((unsigned long) page);
++
++	if (altmap) {
++		vmem_altmap_free(altmap, nr_pages);
++		return;
++	}
+ 
+ 	/* bootmem page has reserved flag */
+ 	if (PageReserved(page)) {
+@@ -1029,13 +1036,19 @@ int __ref arch_remove_memory(u64 start, u64 size)
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
++	struct page *page = pfn_to_page(start_pfn);
++	struct vmem_altmap *altmap;
+ 	struct zone *zone;
+ 	int ret;
+ 
+-	zone = page_zone(pfn_to_page(start_pfn));
+-	kernel_physical_mapping_remove(start, start + size);
++	/* With altmap the first mapped page is offset from @start */
++	altmap = to_vmem_altmap((unsigned long) page);
++	if (altmap)
++		page += vmem_altmap_offset(altmap);
++	zone = page_zone(page);
+ 	ret = __remove_pages(zone, start_pfn, nr_pages);
+ 	WARN_ON_ONCE(ret);
++	kernel_physical_mapping_remove(start, start + size);
+ 
+ 	return ret;
+ }
+@@ -1281,7 +1294,7 @@ static void __meminitdata *p_start, *p_end;
+ static int __meminitdata node_start;
+ 
+ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+-						unsigned long end, int node)
++		unsigned long end, int node, struct vmem_altmap *altmap)
+ {
+ 	unsigned long addr;
+ 	unsigned long next;
+@@ -1304,7 +1317,7 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 		if (pmd_none(*pmd)) {
+ 			void *p;
+ 
+-			p = vmemmap_alloc_block_buf(PMD_SIZE, node);
++			p = __vmemmap_alloc_block_buf(PMD_SIZE, node, altmap);
+ 			if (p) {
+ 				pte_t entry;
+ 
+@@ -1325,7 +1338,8 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 				addr_end = addr + PMD_SIZE;
+ 				p_end = p + PMD_SIZE;
+ 				continue;
+-			}
++			} else if (altmap)
++				return -ENOMEM; /* no fallback */
+ 		} else if (pmd_large(*pmd)) {
+ 			vmemmap_verify((pte_t *)pmd, node, addr, next);
+ 			continue;
+@@ -1339,11 +1353,16 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 
+ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+ {
++	struct vmem_altmap *altmap = to_vmem_altmap(start);
+ 	int err;
+ 
+ 	if (cpu_has_pse)
+-		err = vmemmap_populate_hugepages(start, end, node);
+-	else
++		err = vmemmap_populate_hugepages(start, end, node, altmap);
++	else if (altmap) {
++		pr_err_once("%s: no cpu support for altmap allocations\n",
++				__func__);
++		err = -ENOMEM;
++	} else
+ 		err = vmemmap_populate_basepages(start, end, node);
+ 	if (!err)
+ 		sync_global_pgds(start, end - 1, 0);
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/memory_hotplug.h
+* Unmerged path include/linux/memremap.h
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 449f02cd1f7b..9f7bfff25385 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2067,7 +2067,14 @@ pud_t *vmemmap_pud_populate(pgd_t *pgd, unsigned long addr, int node);
+ pmd_t *vmemmap_pmd_populate(pud_t *pud, unsigned long addr, int node);
+ pte_t *vmemmap_pte_populate(pmd_t *pmd, unsigned long addr, int node);
+ void *vmemmap_alloc_block(unsigned long size, int node);
+-void *vmemmap_alloc_block_buf(unsigned long size, int node);
++struct vmem_altmap;
++void *__vmemmap_alloc_block_buf(unsigned long size, int node,
++		struct vmem_altmap *altmap);
++static inline void *vmemmap_alloc_block_buf(unsigned long size, int node)
++{
++	return __vmemmap_alloc_block_buf(size, node, NULL);
++}
++
+ void vmemmap_verify(pte_t *, int, unsigned long, unsigned long);
+ int vmemmap_populate_basepages(unsigned long start, unsigned long end,
+ 			       int node);
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/page_alloc.c
+diff --git a/mm/sparse-vmemmap.c b/mm/sparse-vmemmap.c
+index 27eeab3be757..1f74216f8ab6 100644
+--- a/mm/sparse-vmemmap.c
++++ b/mm/sparse-vmemmap.c
+@@ -20,6 +20,7 @@
+ #include <linux/mm.h>
+ #include <linux/mmzone.h>
+ #include <linux/bootmem.h>
++#include <linux/memremap.h>
+ #include <linux/highmem.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+@@ -69,7 +70,7 @@ void * __meminit vmemmap_alloc_block(unsigned long size, int node)
+ }
+ 
+ /* need to make sure size is all the same during early stage */
+-void * __meminit vmemmap_alloc_block_buf(unsigned long size, int node)
++static void * __meminit alloc_block_buf(unsigned long size, int node)
+ {
+ 	void *ptr;
+ 
+@@ -86,6 +87,77 @@ void * __meminit vmemmap_alloc_block_buf(unsigned long size, int node)
+ 	return ptr;
+ }
+ 
++static unsigned long __meminit vmem_altmap_next_pfn(struct vmem_altmap *altmap)
++{
++	return altmap->base_pfn + altmap->reserve + altmap->alloc
++		+ altmap->align;
++}
++
++static unsigned long __meminit vmem_altmap_nr_free(struct vmem_altmap *altmap)
++{
++	unsigned long allocated = altmap->alloc + altmap->align;
++
++	if (altmap->free > allocated)
++		return altmap->free - allocated;
++	return 0;
++}
++
++/**
++ * vmem_altmap_alloc - allocate pages from the vmem_altmap reservation
++ * @altmap - reserved page pool for the allocation
++ * @nr_pfns - size (in pages) of the allocation
++ *
++ * Allocations are aligned to the size of the request
++ */
++static unsigned long __meminit vmem_altmap_alloc(struct vmem_altmap *altmap,
++		unsigned long nr_pfns)
++{
++	unsigned long pfn = vmem_altmap_next_pfn(altmap);
++	unsigned long nr_align;
++
++	nr_align = 1UL << find_first_bit(&nr_pfns, BITS_PER_LONG);
++	nr_align = ALIGN(pfn, nr_align) - pfn;
++
++	if (nr_pfns + nr_align > vmem_altmap_nr_free(altmap))
++		return ULONG_MAX;
++	altmap->alloc += nr_pfns;
++	altmap->align += nr_align;
++	return pfn + nr_align;
++}
++
++static void * __meminit altmap_alloc_block_buf(unsigned long size,
++		struct vmem_altmap *altmap)
++{
++	unsigned long pfn, nr_pfns;
++	void *ptr;
++
++	if (size & ~PAGE_MASK) {
++		pr_warn_once("%s: allocations must be multiple of PAGE_SIZE (%ld)\n",
++				__func__, size);
++		return NULL;
++	}
++
++	nr_pfns = size >> PAGE_SHIFT;
++	pfn = vmem_altmap_alloc(altmap, nr_pfns);
++	if (pfn < ULONG_MAX)
++		ptr = __va(__pfn_to_phys(pfn));
++	else
++		ptr = NULL;
++	pr_debug("%s: pfn: %#lx alloc: %ld align: %ld nr: %#lx\n",
++			__func__, pfn, altmap->alloc, altmap->align, nr_pfns);
++
++	return ptr;
++}
++
++/* need to make sure size is all the same during early stage */
++void * __meminit __vmemmap_alloc_block_buf(unsigned long size, int node,
++		struct vmem_altmap *altmap)
++{
++	if (altmap)
++		return altmap_alloc_block_buf(size, altmap);
++	return alloc_block_buf(size, node);
++}
++
+ void __meminit vmemmap_verify(pte_t *pte, int node,
+ 				unsigned long start, unsigned long end)
+ {
+@@ -102,7 +174,7 @@ pte_t * __meminit vmemmap_pte_populate(pmd_t *pmd, unsigned long addr, int node)
+ 	pte_t *pte = pte_offset_kernel(pmd, addr);
+ 	if (pte_none(*pte)) {
+ 		pte_t entry;
+-		void *p = vmemmap_alloc_block_buf(PAGE_SIZE, node);
++		void *p = alloc_block_buf(PAGE_SIZE, node);
+ 		if (!p)
+ 			return NULL;
+ 		entry = pfn_pte(__pa(p) >> PAGE_SHIFT, PAGE_KERNEL);
+diff --git a/mm/sparse.c b/mm/sparse.c
+index 1c91f0d3f6ab..84e88b4d5d95 100644
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@ -759,7 +759,7 @@ static void clear_hwpoisoned_pages(struct page *memmap, int nr_pages)
+ 	if (!memmap)
+ 		return;
+ 
+-	for (i = 0; i < PAGES_PER_SECTION; i++) {
++	for (i = 0; i < nr_pages; i++) {
+ 		if (PageHWPoison(&memmap[i])) {
+ 			atomic_long_sub(1, &num_poisoned_pages);
+ 			ClearPageHWPoison(&memmap[i]);
+@@ -805,7 +805,8 @@ static void free_section_usemap(struct page *memmap, unsigned long *usemap)
+ 	}
+ }
+ 
+-void sparse_remove_one_section(struct zone *zone, struct mem_section *ms)
++void sparse_remove_one_section(struct zone *zone, struct mem_section *ms,
++		unsigned long map_offset)
+ {
+ 	struct page *memmap = NULL;
+ 	unsigned long *usemap = NULL, flags;
+@@ -821,7 +822,8 @@ void sparse_remove_one_section(struct zone *zone, struct mem_section *ms)
+ 	}
+ 	pgdat_resize_unlock(pgdat, &flags);
+ 
+-	clear_hwpoisoned_pages(memmap, PAGES_PER_SECTION);
++	clear_hwpoisoned_pages(memmap + map_offset,
++			PAGES_PER_SECTION - map_offset);
+ 	free_section_usemap(memmap, usemap);
+ }
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
