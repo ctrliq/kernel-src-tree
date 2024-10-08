@@ -1,0 +1,271 @@
+s390/pci: remove pdev pointer from arch data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [s390] pci: remove pdev pointer from arch data (Hendrik Brueckner) [1330099]
+Rebuild_FUZZ: 93.98%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 9a99649f2a89fdfc9dde5d5401675561567bf99a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9a99649f.failed
+
+For each PCI function we need to maintain arch specific data in
+struct zpci_dev which also contains a pointer to struct pci_dev.
+
+When a function is registered or deregistered (which is triggered by PCI
+common code) we need to adjust that pointer which could interfere with
+the machine check handler (triggered by FW) using zpci_dev->pdev.
+
+Since multiple instances of the same pdev could exist at a time this can't
+be solved with locking.
+
+Fix that by ditching the pdev pointer and use a bus walk to reach
+struct pci_dev (only one instance of a pdev can be registered at the bus
+at a time).
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 9a99649f2a89fdfc9dde5d5401675561567bf99a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_dma.c
+#	arch/s390/pci/pci_event.c
+diff --cc arch/s390/pci/pci.c
+index 2654ac28ffc0,f76d01e69fb8..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -752,13 -637,11 +752,15 @@@ static void zpci_cleanup_bus_resources(
+  
+  int pcibios_add_device(struct pci_dev *pdev)
+  {
+++<<<<<<< HEAD
+ +	struct zpci_dev *zdev = get_zdev(pdev);
+++=======
+++>>>>>>> 9a99649f2a89 (s390/pci: remove pdev pointer from arch data)
+  	struct resource *res;
+  	int i;
+  
+- 	zdev->pdev = pdev;
+  	pdev->dev.groups = zpci_attr_groups;
+ -	zpci_map_resources(pdev);
+ +	zpci_map_resources(zdev);
+  
+  	for (i = 0; i < PCI_BAR_COUNT; i++) {
+  		res = &pdev->resource[i];
+@@@ -770,26 -653,27 +772,24 @@@
+  	return 0;
+  }
+  
+ -void pcibios_release_device(struct pci_dev *pdev)
+ -{
+ -	zpci_unmap_resources(pdev);
+ -}
+ -
+  int pcibios_enable_device(struct pci_dev *pdev, int mask)
+  {
+ -	struct zpci_dev *zdev = to_zpci(pdev);
+ +	struct zpci_dev *zdev = get_zdev(pdev);
+  
+- 	zdev->pdev = pdev;
+- 	zpci_debug_init_device(zdev);
++ 	zpci_debug_init_device(zdev, dev_name(&pdev->dev));
+  	zpci_fmb_enable_device(zdev);
+ +	zpci_map_resources(zdev);
+  
+  	return pci_enable_resources(pdev, mask);
+  }
+  
+  void pcibios_disable_device(struct pci_dev *pdev)
+  {
+ -	struct zpci_dev *zdev = to_zpci(pdev);
+ +	struct zpci_dev *zdev = get_zdev(pdev);
+  
+ +	zpci_unmap_resources(zdev);
+  	zpci_fmb_disable_device(zdev);
+  	zpci_debug_exit_device(zdev);
+- 	zdev->pdev = NULL;
+  }
+  
+  #ifdef CONFIG_HIBERNATE_CALLBACKS
+diff --cc arch/s390/pci/pci_dma.c
+index 66b7fc6591c4,a06ce8037cec..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -206,15 -215,15 +206,16 @@@ static void dma_cleanup_tables(struct z
+  			dma_free_seg_table(table[rtx]);
+  
+  	dma_free_cpu_table(table);
+ +	zdev->dma_table = NULL;
+  }
+  
+- static unsigned long __dma_alloc_iommu(struct zpci_dev *zdev,
++ static unsigned long __dma_alloc_iommu(struct device *dev,
+  				       unsigned long start, int size)
+  {
++ 	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
+  	unsigned long boundary_size;
+  
+- 	boundary_size = ALIGN(dma_get_seg_boundary(&zdev->pdev->dev) + 1,
++ 	boundary_size = ALIGN(dma_get_seg_boundary(dev) + 1,
+  			      PAGE_SIZE) >> PAGE_SHIFT;
+  	return iommu_area_alloc(zdev->iommu_bitmap, zdev->iommu_pages,
+  				start, size, 0, boundary_size, 0);
+@@@ -284,9 -295,12 +287,15 @@@ static dma_addr_t s390_dma_map_pages(st
+  
+  	/* This rounds up number of pages based on size and offset */
+  	nr_pages = iommu_num_pages(pa, size, PAGE_SIZE);
+++<<<<<<< HEAD
+ +	iommu_page_index = dma_alloc_iommu(zdev, nr_pages);
+ +	if (iommu_page_index == -1)
+++=======
++ 	iommu_page_index = dma_alloc_iommu(dev, nr_pages);
++ 	if (iommu_page_index == -1) {
++ 		ret = -ENOSPC;
+++>>>>>>> 9a99649f2a89 (s390/pci: remove pdev pointer from arch data)
+  		goto out_err;
+ -	}
+  
+  	/* Use rounded up size */
+  	size = nr_pages * PAGE_SIZE;
+@@@ -298,16 -314,18 +307,16 @@@
+  	if (direction == DMA_NONE || direction == DMA_TO_DEVICE)
+  		flags |= ZPCI_TABLE_PROTECTED;
+  
+ -	ret = dma_update_trans(zdev, pa, dma_addr, size, flags);
+ -	if (ret)
+ -		goto out_free;
+ -
+ -	atomic64_add(nr_pages, &zdev->mapped_pages);
+ -	return dma_addr + (offset & ~PAGE_MASK);
+ +	if (!dma_update_trans(zdev, pa, dma_addr, size, flags)) {
+ +		atomic64_add(nr_pages, &zdev->fmb->mapped_pages);
+ +		return dma_addr + (offset & ~PAGE_MASK);
+ +	}
+  
+  out_free:
+- 	dma_free_iommu(zdev, iommu_page_index, nr_pages);
++ 	dma_free_iommu(dev, iommu_page_index, nr_pages);
+  out_err:
+  	zpci_err("map error:\n");
+ -	zpci_err_dma(ret, pa);
+ +	zpci_err_hex(&pa, sizeof(pa));
+  	return DMA_ERROR_CODE;
+  }
+  
+@@@ -321,15 -339,17 +330,15 @@@ static void s390_dma_unmap_pages(struc
+  
+  	npages = iommu_num_pages(dma_addr, size, PAGE_SIZE);
+  	dma_addr = dma_addr & PAGE_MASK;
+ -	ret = dma_update_trans(zdev, 0, dma_addr, npages * PAGE_SIZE,
+ -			       ZPCI_PTE_INVALID);
+ -	if (ret) {
+ +	if (dma_update_trans(zdev, 0, dma_addr, npages * PAGE_SIZE,
+ +			     ZPCI_PTE_INVALID)) {
+  		zpci_err("unmap error:\n");
+ -		zpci_err_dma(ret, dma_addr);
+ -		return;
+ +		zpci_err_hex(&dma_addr, sizeof(dma_addr));
+  	}
+  
+ -	atomic64_add(npages, &zdev->unmapped_pages);
+ +	atomic64_add(npages, &zdev->fmb->unmapped_pages);
+  	iommu_page_index = (dma_addr - zdev->start_dma) >> PAGE_SHIFT;
+- 	dma_free_iommu(zdev, iommu_page_index, npages);
++ 	dma_free_iommu(dev, iommu_page_index, npages);
+  }
+  
+  static void *s390_dma_alloc(struct device *dev, size_t size,
+diff --cc arch/s390/pci/pci_event.c
+index c34a612201b3,fb2a9a560fdc..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -51,8 -51,17 +51,20 @@@ static void __zpci_event_error(struct z
+  	zpci_err("error CCDF:\n");
+  	zpci_err_hex(ccdf, sizeof(*ccdf));
+  
++ 	if (zdev)
++ 		pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
++ 
+  	pr_err("%s: Event 0x%x reports an error for PCI function 0x%x\n",
+  	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (!pdev)
++ 		return;
++ 
++ 	pdev->error_state = pci_channel_io_perm_failure;
++ 	pci_dev_put(pdev);
+++>>>>>>> 9a99649f2a89 (s390/pci: remove pdev pointer from arch data)
+  }
+  
+  void zpci_event_error(void *data)
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index f7a6712797b2..bd37877da2ca 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -77,7 +77,6 @@ struct zpci_bar_struct {
+ 
+ /* Private data per function */
+ struct zpci_dev {
+-	struct pci_dev	*pdev;
+ 	struct pci_bus	*bus;
+ 	struct list_head entry;		/* list of all zpci_devices, needed for hotplug, etc. */
+ 
+@@ -195,7 +194,7 @@ int zpci_fmb_disable_device(struct zpci_dev *);
+ /* Debug */
+ int zpci_debug_init(void);
+ void zpci_debug_exit(void);
+-void zpci_debug_init_device(struct zpci_dev *);
++void zpci_debug_init_device(struct zpci_dev *, const char *);
+ void zpci_debug_exit_device(struct zpci_dev *);
+ void zpci_debug_info(struct zpci_dev *, struct seq_file *);
+ 
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_debug.c b/arch/s390/pci/pci_debug.c
+index 75c69b402e05..d2391edd0fca 100644
+--- a/arch/s390/pci/pci_debug.c
++++ b/arch/s390/pci/pci_debug.c
+@@ -115,10 +115,9 @@ static const struct file_operations debugfs_pci_perf_fops = {
+ 	.release = single_release,
+ };
+ 
+-void zpci_debug_init_device(struct zpci_dev *zdev)
++void zpci_debug_init_device(struct zpci_dev *zdev, const char *name)
+ {
+-	zdev->debugfs_dev = debugfs_create_dir(dev_name(&zdev->pdev->dev),
+-					       debugfs_root);
++	zdev->debugfs_dev = debugfs_create_dir(name, debugfs_root);
+ 	if (IS_ERR(zdev->debugfs_dev))
+ 		zdev->debugfs_dev = NULL;
+ 
+* Unmerged path arch/s390/pci/pci_dma.c
+* Unmerged path arch/s390/pci/pci_event.c
+diff --git a/drivers/pci/hotplug/s390_pci_hpc.c b/drivers/pci/hotplug/s390_pci_hpc.c
+index d1332d2f8730..f73fec9ba805 100644
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -93,13 +93,17 @@ out_deconfigure:
+ static int disable_slot(struct hotplug_slot *hotplug_slot)
+ {
+ 	struct slot *slot = hotplug_slot->private;
++	struct pci_dev *pdev;
+ 	int rc;
+ 
+ 	if (!zpci_fn_configured(slot->zdev->state))
+ 		return -EIO;
+ 
+-	if (slot->zdev->pdev)
+-		pci_stop_and_remove_bus_device_locked(slot->zdev->pdev);
++	pdev = pci_get_slot(slot->zdev->bus, ZPCI_DEVFN);
++	if (pdev) {
++		pci_stop_and_remove_bus_device_locked(pdev);
++		pci_dev_put(pdev);
++	}
+ 
+ 	rc = zpci_disable_device(slot->zdev);
+ 	if (rc)
