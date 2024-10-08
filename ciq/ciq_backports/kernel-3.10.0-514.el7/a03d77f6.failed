@@ -1,0 +1,206 @@
+mei: fix flow control for single buffer clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit a03d77f6ed7dc74d6244e4d8681ba669d7c414aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a03d77f6.failed
+
+For ME clients that use single receiving buffer
+the driver tracks credentials on mei_me_clients structure
+for all connections. The driver needs to book keep the shared
+resource correctly and track the connections, particularly
+the credit has to be cleaned when there is no active connection
+to a particular me client. This solves issue when subsequent
+connection will not get an ill impression that it can write.
+
+We add active connection counter the particular ME client and
+when the counter reach zero, we clear the credits.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a03d77f6ed7dc74d6244e4d8681ba669d7c414aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,98335b435b75..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -448,6 -730,112 +448,115 @@@ bool mei_hbuf_acquire(struct mei_devic
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * mei_cl_set_disconnected - set disconnected state and clear
++  *   associated states and resources
++  *
++  * @cl: host client
++  */
++ void mei_cl_set_disconnected(struct mei_cl *cl)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 
++ 	if (cl->state == MEI_FILE_DISCONNECTED ||
++ 	    cl->state == MEI_FILE_INITIALIZING)
++ 		return;
++ 
++ 	cl->state = MEI_FILE_DISCONNECTED;
++ 	mei_io_list_flush(&dev->ctrl_rd_list, cl);
++ 	mei_io_list_flush(&dev->ctrl_wr_list, cl);
++ 	cl->mei_flow_ctrl_creds = 0;
++ 	cl->timer_count = 0;
++ 
++ 	if (!cl->me_cl)
++ 		return;
++ 
++ 	if (!WARN_ON(cl->me_cl->connect_count == 0))
++ 		cl->me_cl->connect_count--;
++ 
++ 	if (cl->me_cl->connect_count == 0)
++ 		cl->me_cl->mei_flow_ctrl_creds = 0;
++ 
++ 	mei_me_cl_put(cl->me_cl);
++ 	cl->me_cl = NULL;
++ }
++ 
++ static int mei_cl_set_connecting(struct mei_cl *cl, struct mei_me_client *me_cl)
++ {
++ 	cl->me_cl = mei_me_cl_get(me_cl);
++ 	if (!cl->me_cl)
++ 		return -ENOENT;
++ 
++ 	cl->state = MEI_FILE_CONNECTING;
++ 	cl->me_cl->connect_count++;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * mei_cl_send_disconnect - send disconnect request
++  *
++  * @cl: host client
++  * @cb: callback block
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ static int mei_cl_send_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb)
++ {
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev = cl->dev;
++ 
++ 	ret = mei_hbm_cl_disconnect_req(dev, cl);
++ 	cl->status = ret;
++ 	if (ret) {
++ 		cl->state = MEI_FILE_DISCONNECT_REPLY;
++ 		return ret;
++ 	}
++ 
++ 	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
++ 	cl->timer_count = MEI_CONNECT_TIMEOUT;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * mei_cl_irq_disconnect - processes close related operation from
++  *	interrupt thread context - send disconnect request
++  *
++  * @cl: client
++  * @cb: callback block.
++  * @cmpl_list: complete list.
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
++ 			    struct mei_cl_cb *cmpl_list)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 	u32 msg_slots;
++ 	int slots;
++ 	int ret;
++ 
++ 	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
++ 	slots = mei_hbuf_empty_slots(dev);
++ 
++ 	if (slots < msg_slots)
++ 		return -EMSGSIZE;
++ 
++ 	ret = mei_cl_send_disconnect(cl, cb);
++ 	if (ret)
++ 		list_move_tail(&cb->list, &cmpl_list->list);
++ 
++ 	return ret;
++ }
++ 
++ 
++ 
++ /**
+++>>>>>>> a03d77f6ed7d (mei: fix flow control for single buffer clients)
+   * mei_cl_disconnect - disconnect host client from the me one
+   *
+   * @cl: host client
+@@@ -585,13 -1025,15 +694,25 @@@ int mei_cl_connect(struct mei_cl *cl, s
+  		return rets;
+  	}
+  
+++<<<<<<< HEAD
+ +	cb = mei_io_cb_init(cl, file);
+ +	if (!cb) {
+ +		rets = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	cb->fop_type = MEI_FOP_CONNECT;
+++=======
++ 	cb = mei_io_cb_init(cl, MEI_FOP_CONNECT, file);
++ 	rets = cb ? 0 : -ENOMEM;
++ 	if (rets)
++ 		goto out;
++ 
++ 	rets = mei_cl_set_connecting(cl, me_cl);
++ 	if (rets)
++ 		goto out;
++ 	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+++>>>>>>> a03d77f6ed7d (mei: fix flow control for single buffer clients)
+  
+  	/* run hbuf acquire last so we don't have to undo */
+  	if (!mei_cl_is_other_connecting(cl) && mei_hbuf_acquire(dev)) {
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,96c0290da5fb..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -173,11 -172,17 +173,21 @@@ struct mei_fw_status 
+  /**
+   * struct mei_me_client - representation of me (fw) client
+   *
+++<<<<<<< HEAD
+ + * @props  - client properties
+ + * @client_id - me client id
+ + * @mei_flow_ctrl_creds - flow control credits
+++=======
++  * @list: link in me client list
++  * @refcnt: struct reference count
++  * @props: client properties
++  * @client_id: me client id
++  * @mei_flow_ctrl_creds: flow control credits
++  * @connect_count: number connections to this client
++  * @reserved: reserved
+++>>>>>>> a03d77f6ed7d (mei: fix flow control for single buffer clients)
+   */
+  struct mei_me_client {
+ -	struct list_head list;
+ -	struct kref refcnt;
+  	struct mei_client_properties props;
+  	u8 client_id;
+  	u8 mei_flow_ctrl_creds;
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/mei_dev.h
