@@ -216,8 +216,8 @@ static const struct acpi_device_id sdhci_acpi_ids[] = {
 };
 MODULE_DEVICE_TABLE(acpi, sdhci_acpi_ids);
 
-static const struct sdhci_acpi_slot *sdhci_acpi_get_slot_by_ids(const char *hid,
-								const char *uid)
+static const struct sdhci_acpi_slot *sdhci_acpi_get_slot(const char *hid,
+							 const char *uid)
 {
 	const struct sdhci_acpi_uid_slot *u;
 
@@ -232,24 +232,6 @@ static const struct sdhci_acpi_slot *sdhci_acpi_get_slot_by_ids(const char *hid,
 	return NULL;
 }
 
-static const struct sdhci_acpi_slot *sdhci_acpi_get_slot(acpi_handle handle,
-							 const char *hid)
-{
-	const struct sdhci_acpi_slot *slot;
-	struct acpi_device_info *info;
-	const char *uid = NULL;
-	acpi_status status;
-
-	status = acpi_get_object_info(handle, &info);
-	if (!ACPI_FAILURE(status) && (info->valid & ACPI_VALID_UID))
-		uid = info->unique_id.string;
-
-	slot = sdhci_acpi_get_slot_by_ids(hid, uid);
-
-	kfree(info);
-	return slot;
-}
-
 static int sdhci_acpi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -260,6 +242,7 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
 	struct resource *iomem;
 	resource_size_t len;
 	const char *hid;
+	const char *uid;
 	int err;
 
 	if (acpi_bus_get_device(handle, &device))
@@ -269,6 +252,7 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	hid = acpi_device_hid(device);
+	uid = device->pnp.unique_id;
 
 	iomem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!iomem)
@@ -287,7 +271,7 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
 
 	c = sdhci_priv(host);
 	c->host = host;
-	c->slot = sdhci_acpi_get_slot(handle, hid);
+	c->slot = sdhci_acpi_get_slot(hid, uid);
 	c->pdev = pdev;
 	c->use_runtime_pm = sdhci_acpi_flag(c, SDHCI_ACPI_RUNTIME_PM);
 
