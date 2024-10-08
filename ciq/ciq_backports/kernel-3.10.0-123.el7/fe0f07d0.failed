@@ -1,0 +1,621 @@
+direct-io: only inc/dec inode->i_dio_count for file systems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [fs] direct-io: only inc_dec inode->i_dio_count for file systems (Mike Snitzer) [960150]
+Rebuild_FUZZ: 98.31%
+commit-author Jens Axboe <axboe@fb.com>
+commit fe0f07d08ee35fb13d2cb048970072fe4f71ad14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fe0f07d0.failed
+
+do_blockdev_direct_IO() increments and decrements the inode
+->i_dio_count for each IO operation. It does this to protect against
+truncate of a file. Block devices don't need this sort of protection.
+
+For a capable multiqueue setup, this atomic int is the only shared
+state between applications accessing the device for O_DIRECT, and it
+presents a scaling wall for that. In my testing, as much as 30% of
+system time is spent incrementing and decrementing this value. A mixed
+read/write workload improved from ~2.5M IOPS to ~9.6M IOPS, with
+better latencies too. Before:
+
+clat percentiles (usec):
+ |  1.00th=[   33],  5.00th=[   34], 10.00th=[   34], 20.00th=[   34],
+ | 30.00th=[   34], 40.00th=[   34], 50.00th=[   35], 60.00th=[   35],
+ | 70.00th=[   35], 80.00th=[   35], 90.00th=[   37], 95.00th=[   80],
+ | 99.00th=[   98], 99.50th=[  151], 99.90th=[  155], 99.95th=[  155],
+ | 99.99th=[  165]
+
+After:
+
+clat percentiles (usec):
+ |  1.00th=[   95],  5.00th=[  108], 10.00th=[  129], 20.00th=[  149],
+ | 30.00th=[  155], 40.00th=[  161], 50.00th=[  167], 60.00th=[  171],
+ | 70.00th=[  177], 80.00th=[  185], 90.00th=[  201], 95.00th=[  270],
+ | 99.00th=[  390], 99.50th=[  398], 99.90th=[  418], 99.95th=[  422],
+ | 99.99th=[  438]
+
+In other setups, Robert Elliott reported seeing good performance
+improvements:
+
+https://lkml.org/lkml/2015/4/3/557
+
+The more applications accessing the device, the worse it gets.
+
+Add a new direct-io flags, DIO_SKIP_DIO_COUNT, which tells
+do_blockdev_direct_IO() that it need not worry about incrementing
+or decrementing the inode i_dio_count for this caller.
+
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Cc: Elliott, Robert (Server Storage) <elliott@hp.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit fe0f07d08ee35fb13d2cb048970072fe4f71ad14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	fs/btrfs/inode.c
+#	fs/dax.c
+#	fs/direct-io.c
+#	fs/ext4/indirect.c
+#	fs/ext4/inode.c
+#	fs/inode.c
+#	fs/nfs/direct.c
+#	include/linux/fs.h
+diff --cc fs/block_dev.c
+index 2091db8cdd78,c7e4163ede87..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -164,8 -151,9 +164,14 @@@ blkdev_direct_IO(int rw, struct kiocb *
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file->f_mapping->host;
+  
+++<<<<<<< HEAD
+ +	return __blockdev_direct_IO(rw, iocb, inode, I_BDEV(inode), iov, offset,
+ +				    nr_segs, blkdev_get_block, NULL, NULL, 0);
+++=======
++ 	return __blockdev_direct_IO(iocb, inode, I_BDEV(inode), iter, offset,
++ 				    blkdev_get_block, NULL, NULL,
++ 				    DIO_SKIP_DIO_COUNT);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  }
+  
+  int __sync_blockdev(struct block_device *bdev, int wait)
+diff --cc fs/btrfs/inode.c
+index 17f3064b4a3e,9b774a0c9ca6..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -7383,15 -8126,25 +7383,20 @@@ static ssize_t btrfs_direct_IO(int rw, 
+  	bool relock = false;
+  	ssize_t ret;
+  
+ -	if (check_direct_IO(BTRFS_I(inode)->root, iocb, iter, offset))
+ +	if (check_direct_IO(BTRFS_I(inode)->root, rw, iocb, iov,
+ +			    offset, nr_segs))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	atomic_inc(&inode->i_dio_count);
+ +	smp_mb__after_atomic_inc();
+++=======
++ 	inode_dio_begin(inode);
++ 	smp_mb__after_atomic();
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  
+ -	/*
+ -	 * The generic stuff only does filemap_write_and_wait_range, which
+ -	 * isn't enough if we've written compressed pages to this area, so
+ -	 * we need to flush the dirty pages again to make absolutely sure
+ -	 * that any outstanding dirty pages are on disk.
+ -	 */
+ -	count = iov_iter_count(iter);
+ -	if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+ -		     &BTRFS_I(inode)->runtime_flags))
+ -		filemap_fdatawrite_range(inode->i_mapping, offset,
+ -					 offset + count - 1);
+ -
+ -	if (iov_iter_rw(iter) == WRITE) {
+ +	if (rw & WRITE) {
+ +		count = iov_length(iov, nr_segs);
+  		/*
+  		 * If the write DIO is beyond the EOF, we need update
+  		 * the isize, but it is protected by i_mutex. So we can
+@@@ -7404,9 -8157,19 +7409,25 @@@
+  		ret = btrfs_delalloc_reserve_space(inode, count);
+  		if (ret)
+  			goto out;
+++<<<<<<< HEAD
+ +	} else if (unlikely(test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
+ +				     &BTRFS_I(inode)->runtime_flags))) {
+ +		inode_dio_done(inode);
+++=======
++ 		outstanding_extents = div64_u64(count +
++ 						BTRFS_MAX_EXTENT_SIZE - 1,
++ 						BTRFS_MAX_EXTENT_SIZE);
++ 
++ 		/*
++ 		 * We need to know how many extents we reserved so that we can
++ 		 * do the accounting properly if we go over the number we
++ 		 * originally calculated.  Abuse current->journal_info for this.
++ 		 */
++ 		current->journal_info = &outstanding_extents;
++ 	} else if (test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
++ 				     &BTRFS_I(inode)->runtime_flags)) {
++ 		inode_dio_end(inode);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  		flags = DIO_LOCKING | DIO_SKIP_HOLES;
+  		wakeup = false;
+  	}
+diff --cc fs/direct-io.c
+index 7ab90f5081ee,745d2342651a..000000000000
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@@ -258,15 -250,26 +258,35 @@@ static ssize_t dio_complete(struct dio 
+  	if (ret == 0)
+  		ret = transferred;
+  
+++<<<<<<< HEAD
+ +	if (dio->end_io && dio->result) {
+ +		dio->end_io(dio->iocb, offset, transferred,
+ +			    dio->private, ret, is_async);
+ +	} else {
+ +		inode_dio_done(dio->inode);
+ +		if (is_async)
+ +			aio_complete(dio->iocb, ret, 0);
+++=======
++ 	if (dio->end_io && dio->result)
++ 		dio->end_io(dio->iocb, offset, transferred, dio->private);
++ 
++ 	if (!(dio->flags & DIO_SKIP_DIO_COUNT))
++ 		inode_dio_end(dio->inode);
++ 
++ 	if (is_async) {
++ 		if (dio->rw & WRITE) {
++ 			int err;
++ 
++ 			err = generic_write_sync(dio->iocb->ki_filp, offset,
++ 						 transferred);
++ 			if (err < 0 && ret > 0)
++ 				ret = err;
++ 		}
++ 
++ 		dio->iocb->ki_complete(dio->iocb, ret, 0);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  	}
+  
+ -	kmem_cache_free(dio_cache, dio);
+  	return ret;
+  }
+  
+@@@ -1131,21 -1162,45 +1151,22 @@@ do_blockdev_direct_IO(int rw, struct ki
+  	/*
+  	 * Will be decremented at I/O completion time.
+  	 */
+- 	atomic_inc(&inode->i_dio_count);
++ 	if (!(dio->flags & DIO_SKIP_DIO_COUNT))
++ 		inode_dio_begin(inode);
+  
+ +	/*
+ +	 * For file extending writes updating i_size before data
+ +	 * writeouts complete can expose uninitialized blocks. So
+ +	 * even for AIO, we need to wait for i/o to complete before
+ +	 * returning in this case.
+ +	 */
+ +	dio->is_async = !is_sync_kiocb(iocb) && !((rw & WRITE) &&
+ +		(end > i_size_read(inode)));
+ +
+  	retval = 0;
+ +
+ +	dio->inode = inode;
+ +	dio->rw = rw;
+  	sdio.blkbits = blkbits;
+  	sdio.blkfactor = i_blkbits - blkbits;
+  	sdio.block_in_file = offset >> blkbits;
+diff --cc fs/ext4/indirect.c
+index b8d5d351e24f,958824019509..000000000000
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@@ -689,22 -686,30 +689,34 @@@ retry
+  		smp_mb();
+  		if (unlikely(ext4_test_inode_state(inode,
+  						    EXT4_STATE_DIOREAD_LOCK))) {
+- 			inode_dio_done(inode);
++ 			inode_dio_end(inode);
+  			goto locked;
+  		}
+++<<<<<<< HEAD
+ +		ret = __blockdev_direct_IO(rw, iocb, inode,
+ +				 inode->i_sb->s_bdev, iov,
+ +				 offset, nr_segs,
+ +				 ext4_get_block, NULL, NULL, 0);
+ +		inode_dio_done(inode);
+++=======
++ 		if (IS_DAX(inode))
++ 			ret = dax_do_io(iocb, inode, iter, offset,
++ 					ext4_get_block, NULL, 0);
++ 		else
++ 			ret = __blockdev_direct_IO(iocb, inode,
++ 						   inode->i_sb->s_bdev, iter,
++ 						   offset, ext4_get_block, NULL,
++ 						   NULL, 0);
++ 		inode_dio_end(inode);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  	} else {
+  locked:
+ -		if (IS_DAX(inode))
+ -			ret = dax_do_io(iocb, inode, iter, offset,
+ -					ext4_get_block, NULL, DIO_LOCKING);
+ -		else
+ -			ret = blockdev_direct_IO(iocb, inode, iter, offset,
+ -						 ext4_get_block);
+ +		ret = blockdev_direct_IO(rw, iocb, inode, iov,
+ +				 offset, nr_segs, ext4_get_block);
+  
+ -		if (unlikely(iov_iter_rw(iter) == WRITE && ret < 0)) {
+ +		if (unlikely((rw & WRITE) && ret < 0)) {
+  			loff_t isize = i_size_read(inode);
+ -			loff_t end = offset + count;
+ +			loff_t end = offset + iov_length(iov, nr_segs);
+  
+  			if (end > isize)
+  				ext4_truncate_failed_write(inode);
+diff --cc fs/ext4/inode.c
+index d6382b89ecbd,bccec41fb94b..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3136,6 -2971,14 +3136,17 @@@ static ssize_t ext4_ext_direct_IO(int r
+  
+  	BUG_ON(iocb->private == NULL);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Make all waiters for direct IO properly wait also for extent
++ 	 * conversion. This also disallows race between truncate() and
++ 	 * overwrite DIO as i_dio_count needs to be incremented under i_mutex.
++ 	 */
++ 	if (iov_iter_rw(iter) == WRITE)
++ 		inode_dio_begin(inode);
++ 
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  	/* If we do a overwrite dio, i_mutex locking can be released */
+  	overwrite = *((int *)iocb->private);
+  
+@@@ -3231,9 -3078,10 +3242,14 @@@
+  	}
+  
+  retake_lock:
+++<<<<<<< HEAD
+++=======
++ 	if (iov_iter_rw(iter) == WRITE)
++ 		inode_dio_end(inode);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  	/* take i_mutex locking again if we do a ovewrite dio */
+  	if (overwrite) {
+ +		inode_dio_done(inode);
+  		up_read(&EXT4_I(inode)->i_data_sem);
+  		mutex_lock(&inode->i_mutex);
+  	}
+diff --cc fs/inode.c
+index 00d5fc3b86e1,ea37cd17b53f..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -1884,15 -1946,32 +1884,47 @@@ void inode_dio_wait(struct inode *inode
+  EXPORT_SYMBOL(inode_dio_wait);
+  
+  /*
+++<<<<<<< HEAD
+ + * inode_dio_done - signal finish of a direct I/O requests
+ + * @inode: inode the direct I/O happens on
+ + *
+ + * This is called once we've finished processing a direct I/O request,
+ + * and is used to wake up callers waiting for direct I/O to be quiesced.
+ + */
+ +void inode_dio_done(struct inode *inode)
+ +{
+ +	if (atomic_dec_and_test(&inode->i_dio_count))
+ +		wake_up_bit(&inode->i_state, __I_DIO_WAKEUP);
+ +}
+ +EXPORT_SYMBOL(inode_dio_done);
+++=======
++  * inode_set_flags - atomically set some inode flags
++  *
++  * Note: the caller should be holding i_mutex, or else be sure that
++  * they have exclusive access to the inode structure (i.e., while the
++  * inode is being instantiated).  The reason for the cmpxchg() loop
++  * --- which wouldn't be necessary if all code paths which modify
++  * i_flags actually followed this rule, is that there is at least one
++  * code path which doesn't today --- for example,
++  * __generic_file_aio_write() calls file_remove_suid() without holding
++  * i_mutex --- so we use cmpxchg() out of an abundance of caution.
++  *
++  * In the long run, i_mutex is overkill, and we should probably look
++  * at using the i_lock spinlock to protect i_flags, and then make sure
++  * it is so documented in include/linux/fs.h and that all code follows
++  * the locking convention!!
++  */
++ void inode_set_flags(struct inode *inode, unsigned int flags,
++ 		     unsigned int mask)
++ {
++ 	unsigned int old_flags, new_flags;
++ 
++ 	WARN_ON_ONCE(flags & ~mask);
++ 	do {
++ 		old_flags = ACCESS_ONCE(inode->i_flags);
++ 		new_flags = (old_flags & ~mask) | flags;
++ 	} while (unlikely(cmpxchg(&inode->i_flags, old_flags,
++ 				  new_flags) != old_flags));
++ }
++ EXPORT_SYMBOL(inode_set_flags);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+diff --cc fs/nfs/direct.c
+index 0bd7a55a5f07,b2cbc3a6cdd9..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -224,8 -370,24 +224,27 @@@ out
+   * Synchronous I/O uses a stack-allocated iocb.  Thus we can't trust
+   * the iocb is still valid here if this is a synchronous request.
+   */
+ -static void nfs_direct_complete(struct nfs_direct_req *dreq, bool write)
+ +static void nfs_direct_complete(struct nfs_direct_req *dreq)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct inode *inode = dreq->inode;
++ 
++ 	if (dreq->iocb && write) {
++ 		loff_t pos = dreq->iocb->ki_pos + dreq->count;
++ 
++ 		spin_lock(&inode->i_lock);
++ 		if (i_size_read(inode) < pos)
++ 			i_size_write(inode, pos);
++ 		spin_unlock(&inode->i_lock);
++ 	}
++ 
++ 	if (write)
++ 		nfs_zap_mapping(inode, inode->i_mapping);
++ 
++ 	inode_dio_end(inode);
++ 
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  	if (dreq->iocb) {
+  		long res = (long) dreq->error;
+  		if (!res)
+@@@ -307,60 -471,37 +326,71 @@@ static const struct nfs_pgio_completion
+   * handled automatically by nfs_direct_read_result().  Otherwise, if
+   * no requests have been sent, just return an error.
+   */
+ -
+ -static ssize_t nfs_direct_read_schedule_iovec(struct nfs_direct_req *dreq,
+ -					      struct iov_iter *iter,
+ -					      loff_t pos)
+ +static ssize_t nfs_direct_read_schedule_segment(struct nfs_pageio_descriptor *desc,
+ +						const struct iovec *iov,
+ +						loff_t pos, bool uio)
+  {
+ -	struct nfs_pageio_descriptor desc;
+ -	struct inode *inode = dreq->inode;
+ -	ssize_t result = -EINVAL;
+ -	size_t requested_bytes = 0;
+ -	size_t rsize = max_t(size_t, NFS_SERVER(inode)->rsize, PAGE_SIZE);
+ -
+ +	struct nfs_direct_req *dreq = desc->pg_dreq;
+ +	struct nfs_open_context *ctx = dreq->ctx;
+ +	struct inode *inode = ctx->dentry->d_inode;
+ +	unsigned long user_addr = (unsigned long)iov->iov_base;
+ +	size_t count = iov->iov_len;
+ +	size_t rsize = NFS_SERVER(inode)->rsize;
+ +	unsigned int pgbase;
+ +	int result;
+ +	ssize_t started = 0;
+ +	struct page **pagevec = NULL;
+ +	unsigned int npages;
+ +
+++<<<<<<< HEAD
+ +	do {
+++=======
++ 	nfs_pageio_init_read(&desc, dreq->inode, false,
++ 			     &nfs_direct_read_completion_ops);
++ 	get_dreq(dreq);
++ 	desc.pg_dreq = dreq;
++ 	inode_dio_begin(inode);
++ 
++ 	while (iov_iter_count(iter)) {
++ 		struct page **pagevec;
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  		size_t bytes;
+ -		size_t pgbase;
+ -		unsigned npages, i;
+ +		int i;
+  
+ -		result = iov_iter_get_pages_alloc(iter, &pagevec, 
+ -						  rsize, &pgbase);
+ -		if (result < 0)
+ +		pgbase = user_addr & ~PAGE_MASK;
+ +		bytes = min(max_t(size_t, rsize, PAGE_SIZE), count);
+ +
+ +		result = -ENOMEM;
+ +		npages = nfs_page_array_len(pgbase, bytes);
+ +		if (!pagevec)
+ +			pagevec = kmalloc(npages * sizeof(struct page *),
+ +					  GFP_KERNEL);
+ +		if (!pagevec)
+  			break;
+ -	
+ -		bytes = result;
+ -		iov_iter_advance(iter, bytes);
+ -		npages = (result + pgbase + PAGE_SIZE - 1) / PAGE_SIZE;
+ +		if (uio) {
+ +			down_read(&current->mm->mmap_sem);
+ +			result = get_user_pages(current, current->mm, user_addr,
+ +					npages, 1, 0, pagevec, NULL);
+ +			up_read(&current->mm->mmap_sem);
+ +			if (result < 0)
+ +				break;
+ +		} else {
+ +			WARN_ON(npages != 1);
+ +			result = get_kernel_page(user_addr, 1, pagevec);
+ +			if (WARN_ON(result != 1))
+ +				break;
+ +		}
+ +
+ +		if ((unsigned)result < npages) {
+ +			bytes = result * PAGE_SIZE;
+ +			if (bytes <= pgbase) {
+ +				nfs_direct_release_pages(pagevec, result);
+ +				break;
+ +			}
+ +			bytes -= pgbase;
+ +			npages = result;
+ +		}
+ +
+  		for (i = 0; i < npages; i++) {
+  			struct nfs_page *req;
+  			unsigned int req_len = min_t(size_t, bytes, PAGE_SIZE - pgbase);
+@@@ -431,6 -538,7 +461,10 @@@ static ssize_t nfs_direct_read_schedule
+  	 * generic layer handle the completion.
+  	 */
+  	if (requested_bytes == 0) {
+++<<<<<<< HEAD
+++=======
++ 		inode_dio_end(inode);
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  		nfs_direct_req_release(dreq);
+  		return result < 0 ? result : -EIO;
+  	}
+@@@ -814,18 -872,54 +848,18 @@@ static ssize_t nfs_direct_write_schedul
+  			      &nfs_direct_write_completion_ops);
+  	desc.pg_dreq = dreq;
+  	get_dreq(dreq);
+- 	atomic_inc(&inode->i_dio_count);
++ 	inode_dio_begin(inode);
+  
+ -	NFS_I(inode)->write_io += iov_iter_count(iter);
+ -	while (iov_iter_count(iter)) {
+ -		struct page **pagevec;
+ -		size_t bytes;
+ -		size_t pgbase;
+ -		unsigned npages, i;
+ -
+ -		result = iov_iter_get_pages_alloc(iter, &pagevec, 
+ -						  wsize, &pgbase);
+ +	NFS_I(dreq->inode)->write_io += iov_length(iov, nr_segs);
+ +	for (seg = 0; seg < nr_segs; seg++) {
+ +		const struct iovec *vec = &iov[seg];
+ +		result = nfs_direct_write_schedule_segment(&desc, vec, pos, uio);
+  		if (result < 0)
+  			break;
+ -
+ -		bytes = result;
+ -		iov_iter_advance(iter, bytes);
+ -		npages = (result + pgbase + PAGE_SIZE - 1) / PAGE_SIZE;
+ -		for (i = 0; i < npages; i++) {
+ -			struct nfs_page *req;
+ -			unsigned int req_len = min_t(size_t, bytes, PAGE_SIZE - pgbase);
+ -
+ -			req = nfs_create_request(dreq->ctx, pagevec[i], NULL,
+ -						 pgbase, req_len);
+ -			if (IS_ERR(req)) {
+ -				result = PTR_ERR(req);
+ -				break;
+ -			}
+ -
+ -			nfs_direct_setup_mirroring(dreq, &desc, req);
+ -
+ -			nfs_lock_request(req);
+ -			req->wb_index = pos >> PAGE_SHIFT;
+ -			req->wb_offset = pos & ~PAGE_MASK;
+ -			if (!nfs_pageio_add_request(&desc, req)) {
+ -				result = desc.pg_error;
+ -				nfs_unlock_and_release_request(req);
+ -				break;
+ -			}
+ -			pgbase = 0;
+ -			bytes -= req_len;
+ -			requested_bytes += req_len;
+ -			pos += req_len;
+ -			dreq->bytes_left -= req_len;
+ -		}
+ -		nfs_direct_release_pages(pagevec, npages);
+ -		kvfree(pagevec);
+ -		if (result < 0)
+ +		requested_bytes += result;
+ +		if ((size_t)result < vec->iov_len)
+  			break;
+ +		pos += vec->iov_len;
+  	}
+  	nfs_pageio_complete(&desc);
+  
+diff --cc include/linux/fs.h
+index b91d8e3379b9,9055eefa92c7..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2452,6 -2632,12 +2452,15 @@@ enum 
+  
+  	/* filesystem does not support filling holes */
+  	DIO_SKIP_HOLES	= 0x02,
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* filesystem can handle aio writes beyond i_size */
++ 	DIO_ASYNC_EXTEND = 0x04,
++ 
++ 	/* inode/fs/bdev does not need truncate protection */
++ 	DIO_SKIP_DIO_COUNT = 0x08,
+++>>>>>>> fe0f07d08ee3 (direct-io: only inc/dec inode->i_dio_count for file systems)
+  };
+  
+  void dio_end_io(struct bio *bio, int error);
+@@@ -2472,8 -2660,35 +2481,32 @@@ static inline ssize_t blockdev_direct_I
+  #endif
+  
+  void inode_dio_wait(struct inode *inode);
+- void inode_dio_done(struct inode *inode);
++ 
++ /*
++  * inode_dio_begin - signal start of a direct I/O requests
++  * @inode: inode the direct I/O happens on
++  *
++  * This is called once we've finished processing a direct I/O request,
++  * and is used to wake up callers waiting for direct I/O to be quiesced.
++  */
++ static inline void inode_dio_begin(struct inode *inode)
++ {
++ 	atomic_inc(&inode->i_dio_count);
++ }
++ 
++ /*
++  * inode_dio_end - signal finish of a direct I/O requests
++  * @inode: inode the direct I/O happens on
++  *
++  * This is called once we've finished processing a direct I/O request,
++  * and is used to wake up callers waiting for direct I/O to be quiesced.
++  */
++ static inline void inode_dio_end(struct inode *inode)
++ {
++ 	if (atomic_dec_and_test(&inode->i_dio_count))
++ 		wake_up_bit(&inode->i_state, __I_DIO_WAKEUP);
++ }
+  
+ -extern void inode_set_flags(struct inode *inode, unsigned int flags,
+ -			    unsigned int mask);
+ -
+  extern const struct file_operations generic_ro_fops;
+  
+  #define special_file(m) (S_ISCHR(m)||S_ISBLK(m)||S_ISFIFO(m)||S_ISSOCK(m))
+* Unmerged path fs/dax.c
+* Unmerged path fs/block_dev.c
+* Unmerged path fs/btrfs/inode.c
+* Unmerged path fs/dax.c
+* Unmerged path fs/direct-io.c
+* Unmerged path fs/ext4/indirect.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/inode.c
+* Unmerged path fs/nfs/direct.c
+* Unmerged path include/linux/fs.h
