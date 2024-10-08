@@ -1,0 +1,165 @@
+blk-mq: merge blk_mq_insert_request and blk_mq_run_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit feb71dae1f9e0aeb056f7f639a21e620d327fc66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/feb71dae.failed
+
+It's almost identical to blk_mq_insert_request, so fold the two into one
+slightly more generic function by making the flush special case a bit
+smarted.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit feb71dae1f9e0aeb056f7f639a21e620d327fc66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.h
+diff --cc block/blk-mq.h
+index 539b3f438eca,72beba1f9d55..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -22,9 -22,7 +22,13 @@@ struct blk_mq_ctx 
+  	struct kobject		kobj;
+  };
+  
+++<<<<<<< HEAD
+ +void __blk_mq_end_io(struct request *rq, int error);
+ +void blk_mq_complete_request(struct request *rq, int error);
+ +void blk_mq_run_request(struct request *rq, bool run_queue, bool async);
+++=======
++ void __blk_mq_complete_request(struct request *rq);
+++>>>>>>> feb71dae1f9e (blk-mq: merge blk_mq_insert_request and blk_mq_run_request)
+  void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+  void blk_mq_init_flush(struct request_queue *q);
+  void blk_mq_drain_queue(struct request_queue *q);
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index 0c5b1c930ccb..9ba796a2e052 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -66,7 +66,7 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
+ 	 * be resued after dying flag is set
+ 	 */
+ 	if (q->mq_ops) {
+-		blk_mq_insert_request(q, rq, at_head, true);
++		blk_mq_insert_request(rq, at_head, true, false);
+ 		return;
+ 	}
+ 
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 475cd07a0a10..b4e0d0239134 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -137,7 +137,7 @@ static void mq_flush_run(struct work_struct *work)
+ 	rq = container_of(work, struct request, mq_flush_work);
+ 
+ 	memset(&rq->csd, 0, sizeof(rq->csd));
+-	blk_mq_run_request(rq, true, false);
++	blk_mq_insert_request(rq, false, true, false);
+ }
+ 
+ static bool blk_flush_queue_rq(struct request *rq)
+@@ -411,7 +411,7 @@ void blk_insert_flush(struct request *rq)
+ 	if ((policy & REQ_FSEQ_DATA) &&
+ 	    !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
+ 		if (q->mq_ops) {
+-			blk_mq_run_request(rq, false, true);
++			blk_mq_insert_request(rq, false, false, true);
+ 		} else
+ 			list_add_tail(&rq->queuelist, &q->queue_head);
+ 		return;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 93c74da63cd4..803f689639d9 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -758,61 +758,28 @@ static void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx,
+ 	blk_mq_add_timer(rq);
+ }
+ 
+-void blk_mq_insert_request(struct request_queue *q, struct request *rq,
+-			   bool at_head, bool run_queue)
++void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
++		bool async)
+ {
++	struct request_queue *q = rq->q;
+ 	struct blk_mq_hw_ctx *hctx;
+-	struct blk_mq_ctx *ctx, *current_ctx;
++	struct blk_mq_ctx *ctx = rq->mq_ctx, *current_ctx;
++
++	current_ctx = blk_mq_get_ctx(q);
++	if (!cpu_online(ctx->cpu))
++		rq->mq_ctx = ctx = current_ctx;
+ 
+-	ctx = rq->mq_ctx;
+ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ 
+-	if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA)) {
++	if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA) &&
++	    !(rq->cmd_flags & (REQ_FLUSH_SEQ))) {
+ 		blk_insert_flush(rq);
+ 	} else {
+-		current_ctx = blk_mq_get_ctx(q);
+-
+-		if (!cpu_online(ctx->cpu)) {
+-			ctx = current_ctx;
+-			hctx = q->mq_ops->map_queue(q, ctx->cpu);
+-			rq->mq_ctx = ctx;
+-		}
+ 		spin_lock(&ctx->lock);
+ 		__blk_mq_insert_request(hctx, rq, at_head);
+ 		spin_unlock(&ctx->lock);
+-
+-		blk_mq_put_ctx(current_ctx);
+ 	}
+ 
+-	if (run_queue)
+-		__blk_mq_run_hw_queue(hctx);
+-}
+-EXPORT_SYMBOL(blk_mq_insert_request);
+-
+-/*
+- * This is a special version of blk_mq_insert_request to bypass FLUSH request
+- * check. Should only be used internally.
+- */
+-void blk_mq_run_request(struct request *rq, bool run_queue, bool async)
+-{
+-	struct request_queue *q = rq->q;
+-	struct blk_mq_hw_ctx *hctx;
+-	struct blk_mq_ctx *ctx, *current_ctx;
+-
+-	current_ctx = blk_mq_get_ctx(q);
+-
+-	ctx = rq->mq_ctx;
+-	if (!cpu_online(ctx->cpu)) {
+-		ctx = current_ctx;
+-		rq->mq_ctx = ctx;
+-	}
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+-
+-	/* ctx->cpu might be offline */
+-	spin_lock(&ctx->lock);
+-	__blk_mq_insert_request(hctx, rq, false);
+-	spin_unlock(&ctx->lock);
+-
+ 	blk_mq_put_ctx(current_ctx);
+ 
+ 	if (run_queue)
+* Unmerged path block/blk-mq.h
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 47900d911b7f..7a084c92421d 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -119,8 +119,7 @@ void blk_mq_init_commands(struct request_queue *, void (*init)(void *data, struc
+ 
+ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule);
+ 
+-void blk_mq_insert_request(struct request_queue *, struct request *,
+-		bool, bool);
++void blk_mq_insert_request(struct request *, bool, bool, bool);
+ void blk_mq_run_queues(struct request_queue *q, bool async);
+ void blk_mq_free_request(struct request *rq);
+ bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
