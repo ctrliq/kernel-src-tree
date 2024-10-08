@@ -1,0 +1,178 @@
+xprtrdma: Allocate each struct rpcrdma_mw separately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 2e84522c2e0323a090fe1f7eeed6d5b6a68efe5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2e84522c.failed
+
+Currently rpcrdma_buffer_create() allocates struct rpcrdma_mw's as
+a single contiguous area of memory. It amounts to quite a bit of
+memory, and there's no requirement for these to be carved from a
+single piece of contiguous memory.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Tested-by: Shirley Ma <shirley.ma@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@emulex.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 2e84522c2e0323a090fe1f7eeed6d5b6a68efe5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 499e0d7e7773,31c4fd36d62c..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1008,27 -1112,7 +1088,28 @@@ rpcrdma_buffer_create(struct rpcrdma_bu
+  	len = buf->rb_max_requests *
+  		(sizeof(struct rpcrdma_req *) + sizeof(struct rpcrdma_rep *));
+  	len += cdata->padding;
+++<<<<<<< HEAD
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +		len += buf->rb_max_requests * RPCRDMA_MAX_SEGS *
+ +				sizeof(struct rpcrdma_mw);
+ +		break;
+ +	case RPCRDMA_MTHCAFMR:
+ +		/* TBD we are perhaps overallocating here */
+ +		len += (buf->rb_max_requests + 1) * RPCRDMA_MAX_SEGS *
+ +				sizeof(struct rpcrdma_mw);
+ +		break;
+ +	case RPCRDMA_MEMWINDOWS_ASYNC:
+ +	case RPCRDMA_MEMWINDOWS:
+ +		len += (buf->rb_max_requests + 1) * RPCRDMA_MAX_SEGS *
+ +				sizeof(struct rpcrdma_mw);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+++=======
+++>>>>>>> 2e84522c2e03 (xprtrdma: Allocate each struct rpcrdma_mw separately)
+  
+- 	/* allocate 1, 4 and 5 in one shot */
+  	p = kzalloc(len, GFP_KERNEL);
+  	if (p == NULL) {
+  		dprintk("RPC:       %s: req_t/rep_t/pad kzalloc(%zd) failed\n",
+@@@ -1054,70 -1138,18 +1135,84 @@@
+  	}
+  	p += cdata->padding;
+  
+ +	/*
+ +	 * Allocate the fmr's, or mw's for mw_bind chunk registration.
+ +	 * We "cycle" the mw's in order to minimize rkey reuse,
+ +	 * and also reduce unbind-to-bind collision.
+ +	 */
+  	INIT_LIST_HEAD(&buf->rb_mws);
+++<<<<<<< HEAD
+ +	r = (struct rpcrdma_mw *)p;
+ +	switch (ia->ri_memreg_strategy) {
+ +	case RPCRDMA_FRMR:
+ +		for (i = buf->rb_max_requests * RPCRDMA_MAX_SEGS; i; i--) {
+ +			r->r.frmr.fr_mr = ib_alloc_fast_reg_mr(ia->ri_pd,
+ +						ia->ri_max_frmr_depth);
+ +			if (IS_ERR(r->r.frmr.fr_mr)) {
+ +				rc = PTR_ERR(r->r.frmr.fr_mr);
+ +				dprintk("RPC:       %s: ib_alloc_fast_reg_mr"
+ +					" failed %i\n", __func__, rc);
+ +				goto out;
+ +			}
+ +			r->r.frmr.fr_pgl = ib_alloc_fast_reg_page_list(
+ +						ia->ri_id->device,
+ +						ia->ri_max_frmr_depth);
+ +			if (IS_ERR(r->r.frmr.fr_pgl)) {
+ +				rc = PTR_ERR(r->r.frmr.fr_pgl);
+ +				dprintk("RPC:       %s: "
+ +					"ib_alloc_fast_reg_page_list "
+ +					"failed %i\n", __func__, rc);
+ +				goto out;
+ +			}
+ +			list_add(&r->mw_list, &buf->rb_mws);
+ +			++r;
+ +		}
+ +		break;
+ +	case RPCRDMA_MTHCAFMR:
+ +		/* TBD we are perhaps overallocating here */
+ +		for (i = (buf->rb_max_requests+1) * RPCRDMA_MAX_SEGS; i; i--) {
+ +			static struct ib_fmr_attr fa =
+ +				{ RPCRDMA_MAX_DATA_SEGS, 1, PAGE_SHIFT };
+ +			r->r.fmr = ib_alloc_fmr(ia->ri_pd,
+ +				IB_ACCESS_REMOTE_WRITE | IB_ACCESS_REMOTE_READ,
+ +				&fa);
+ +			if (IS_ERR(r->r.fmr)) {
+ +				rc = PTR_ERR(r->r.fmr);
+ +				dprintk("RPC:       %s: ib_alloc_fmr"
+ +					" failed %i\n", __func__, rc);
+ +				goto out;
+ +			}
+ +			list_add(&r->mw_list, &buf->rb_mws);
+ +			++r;
+ +		}
+ +		break;
+ +	case RPCRDMA_MEMWINDOWS_ASYNC:
+ +	case RPCRDMA_MEMWINDOWS:
+ +		/* Allocate one extra request's worth, for full cycling */
+ +		for (i = (buf->rb_max_requests+1) * RPCRDMA_MAX_SEGS; i; i--) {
+ +			r->r.mw = ib_alloc_mw(ia->ri_pd, IB_MW_TYPE_1);
+ +			if (IS_ERR(r->r.mw)) {
+ +				rc = PTR_ERR(r->r.mw);
+ +				dprintk("RPC:       %s: ib_alloc_mw"
+ +					" failed %i\n", __func__, rc);
+ +				goto out;
+ +			}
+ +			list_add(&r->mw_list, &buf->rb_mws);
+ +			++r;
+ +		}
+++=======
++ 	INIT_LIST_HEAD(&buf->rb_all);
++ 	switch (ia->ri_memreg_strategy) {
++ 	case RPCRDMA_FRMR:
++ 		rc = rpcrdma_init_frmrs(ia, buf);
++ 		if (rc)
++ 			goto out;
++ 		break;
++ 	case RPCRDMA_MTHCAFMR:
++ 		rc = rpcrdma_init_fmrs(ia, buf);
++ 		if (rc)
++ 			goto out;
+++>>>>>>> 2e84522c2e03 (xprtrdma: Allocate each struct rpcrdma_mw separately)
+  		break;
+  	default:
+  		break;
+@@@ -1201,10 -1266,8 +1330,9 @@@ rpcrdma_buffer_destroy(struct rpcrdma_b
+  
+  	/* clean up in reverse order from create
+  	 *   1.  recv mr memory (mr free, then kfree)
+ +	 *   1a. bind mw memory
+  	 *   2.  send mr memory (mr free, then kfree)
+- 	 *   3.  padding (if any) [moved to rpcrdma_ep_destroy]
+- 	 *   4.  arrays
++ 	 *   3.  MWs
+  	 */
+  	dprintk("RPC:       %s: entering\n", __func__);
+  
+@@@ -1258,6 -1286,17 +1386,20 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	switch (ia->ri_memreg_strategy) {
++ 	case RPCRDMA_FRMR:
++ 		rpcrdma_destroy_frmrs(buf);
++ 		break;
++ 	case RPCRDMA_MTHCAFMR:
++ 		rpcrdma_destroy_fmrs(buf);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
+++>>>>>>> 2e84522c2e03 (xprtrdma: Allocate each struct rpcrdma_mw separately)
+  	kfree(buf->rb_pool);
+  }
+  
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
