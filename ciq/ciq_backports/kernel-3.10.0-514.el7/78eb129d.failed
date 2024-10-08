@@ -1,0 +1,140 @@
+IB/hfi1: Add shared ASIC structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit 78eb129d47f553e6f0607c393ebf4e9851edd73e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/78eb129d.failed
+
+Create a shared structure to exist between devices that share the
+same ASIC.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 78eb129d47f553e6f0607c393ebf4e9851edd73e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/hfi.h
+diff --cc drivers/staging/hfi1/hfi.h
+index 6438dccf5749,e71a1c2fbfac..000000000000
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@@ -862,6 -886,8 +868,11 @@@ struct hfi1_devdata 
+  	wait_queue_head_t		  sdma_unfreeze_wq;
+  	atomic_t			  sdma_unfreeze_count;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+++=======
++ 	/* common data between shared ASIC HFIs in this OS */
++ 	struct hfi1_asic_data *asic_data;
+++>>>>>>> 78eb129d47f5 (IB/hfi1: Add shared ASIC structure):drivers/staging/rdma/hfi1/hfi.h
+  
+  	/* hfi1_pportdata, points to array of (physical) port-specific
+  	 * data structs, indexed by pidx (0..n-1)
+diff --git a/drivers/staging/hfi1/chip.c b/drivers/staging/hfi1/chip.c
+index dc9bec960023..a14c19fbf864 100644
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@ -13878,15 +13878,20 @@ void hfi1_start_cleanup(struct hfi1_devdata *dd)
+ 	((dev)->base_guid & ~(1ULL << GUID_HFI_INDEX_SHIFT))
+ 
+ /*
++ * Information can be shared between the two HFIs on the same ASIC
++ * in the same OS.  This function finds the peer device and sets
++ * up a shared structure.
++ *
+  * Certain chip functions need to be initialized only once per asic
+  * instead of per-device. This function finds the peer device and
+  * checks whether that chip initialization needs to be done by this
+  * device.
+  */
+-static void asic_should_init(struct hfi1_devdata *dd)
++static int init_asic_data(struct hfi1_devdata *dd)
+ {
+ 	unsigned long flags;
+ 	struct hfi1_devdata *tmp, *peer = NULL;
++	int ret = 0;
+ 
+ 	spin_lock_irqsave(&hfi1_devs_lock, flags);
+ 	/* Find our peer device */
+@@ -13904,7 +13909,22 @@ static void asic_should_init(struct hfi1_devdata *dd)
+ 	 */
+ 	if (!peer || !(peer->flags & HFI1_DO_INIT_ASIC))
+ 		dd->flags |= HFI1_DO_INIT_ASIC;
++
++	if (peer) {
++		dd->asic_data = peer->asic_data;
++	} else {
++		dd->asic_data = kzalloc(sizeof(*dd->asic_data), GFP_KERNEL);
++		if (!dd->asic_data) {
++			ret = -ENOMEM;
++			goto done;
++		}
++		mutex_init(&dd->asic_data->asic_resource_mutex);
++	}
++	dd->asic_data->dds[dd->hfi1_id] = dd; /* self back-pointer */
++
++done:
+ 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	return ret;
+ }
+ 
+ /**
+@@ -14070,8 +14090,10 @@ struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+ 	/* needs to be done before we look for the peer device */
+ 	read_guid(dd);
+ 
+-	/* should this device init the ASIC block? */
+-	asic_should_init(dd);
++	/* set up shared ASIC data with peer device */
++	ret = init_asic_data(dd);
++	if (ret)
++		goto bail_cleanup;
+ 
+ 	/* obtain chip sizes, reset chip CSRs */
+ 	init_chip(dd);
+* Unmerged path drivers/staging/hfi1/hfi.h
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index 9c4bb834cbe9..cf9cc3de3e00 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -977,6 +977,25 @@ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
+ 	kfree(rcd);
+ }
+ 
++/*
++ * Release our hold on the shared asic data.  If we are the last one,
++ * free the structure.  Must be holding hfi1_devs_lock.
++ */
++static void release_asic_data(struct hfi1_devdata *dd)
++{
++	int other;
++
++	if (!dd->asic_data)
++		return;
++	dd->asic_data->dds[dd->hfi1_id] = NULL;
++	other = dd->hfi1_id ? 0 : 1;
++	if (!dd->asic_data->dds[other]) {
++		/* we are the last holder, free it */
++		kfree(dd->asic_data);
++	}
++	dd->asic_data = NULL;
++}
++
+ void hfi1_free_devdata(struct hfi1_devdata *dd)
+ {
+ 	unsigned long flags;
+@@ -984,6 +1003,7 @@ void hfi1_free_devdata(struct hfi1_devdata *dd)
+ 	spin_lock_irqsave(&hfi1_devs_lock, flags);
+ 	idr_remove(&hfi1_unit_table, dd->unit);
+ 	list_del(&dd->list);
++	release_asic_data(dd);
+ 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+ 	hfi1_dbg_ibdev_exit(&dd->verbs_dev);
+ 	rcu_barrier(); /* wait for rcu callbacks to complete */
