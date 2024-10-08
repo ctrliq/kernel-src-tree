@@ -1,0 +1,176 @@
+x86/PCI: Refine the way to release PCI IRQ resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] pci: Refine the way to release PCI IRQ resources (Steve Best) [1231358 1238216]
+Rebuild_FUZZ: 96.00%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit b4b55cda587442477a3a9f0669e26bba4b7800c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b4b55cda.failed
+
+Some PCI device drivers assume that pci_dev->irq won't change after
+calling pci_disable_device() and pci_enable_device() during suspend and
+resume.
+
+Commit c03b3b0738a5 ("x86, irq, mpparse: Release IOAPIC pin when
+PCI device is disabled") frees PCI IRQ resources when pci_disable_device()
+is called and reallocate IRQ resources when pci_enable_device() is
+called again. This breaks above assumption. So commit 3eec595235c1
+("x86, irq, PCI: Keep IRQ assignment for PCI devices during
+suspend/hibernation") and 9eabc99a635a ("x86, irq, PCI: Keep IRQ
+assignment for runtime power management") fix the issue by avoiding
+freeing/reallocating IRQ resources during PCI device suspend/resume.
+They achieve this by checking dev.power.is_prepared and
+dev.power.runtime_status.  PM maintainer, Rafael, then pointed out that
+it's really an ugly fix which leaking PM internal state information to
+IRQ subsystem.
+
+Recently David Vrabel <david.vrabel@citrix.com> also reports an
+regression in pciback driver caused by commit cffe0a2b5a34 ("x86, irq:
+Keep balance of IOAPIC pin reference count"). Please refer to:
+http://lkml.org/lkml/2015/1/14/546
+
+So this patch refine the way to release PCI IRQ resources. Instead of
+releasing PCI IRQ resources in pci_disable_device()/
+pcibios_disable_device(), we now release it at driver unbinding
+notification BUS_NOTIFY_UNBOUND_DRIVER. In other word, we only release
+PCI IRQ resources when there's no driver bound to the PCI device, and
+it keeps the assumption that pci_dev->irq won't through multiple
+invocation of pci_enable_device()/pci_disable_device().
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit b4b55cda587442477a3a9f0669e26bba4b7800c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/irq.c
+#	arch/x86/pci/mrst.c
+#	drivers/acpi/pci_irq.c
+diff --cc arch/x86/pci/irq.c
+index 84112f55dd7a,e71b3dbd87b8..000000000000
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@@ -1254,3 -1255,12 +1254,15 @@@ static int pirq_enable_irq(struct pci_d
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void pirq_disable_irq(struct pci_dev *dev)
++ {
++ 	if (io_apic_assign_pci_irqs && dev->irq_managed && dev->irq) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq = 0;
++ 		dev->irq_managed = 0;
++ 	}
++ }
+++>>>>>>> b4b55cda5874 (x86/PCI: Refine the way to release PCI IRQ resources)
+diff --cc arch/x86/pci/mrst.c
+index 903fded50786,95c2471f6819..000000000000
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@@ -225,7 -232,16 +225,20 @@@ static int mrst_pci_irq_enable(struct p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +struct pci_ops pci_mrst_ops = {
+++=======
++ static void intel_mid_pci_irq_disable(struct pci_dev *dev)
++ {
++ 	if (dev->irq_managed && dev->irq > 0) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq_managed = 0;
++ 		dev->irq = 0;
++ 	}
++ }
++ 
++ struct pci_ops intel_mid_pci_ops = {
+++>>>>>>> b4b55cda5874 (x86/PCI: Refine the way to release PCI IRQ resources):arch/x86/pci/intel_mid_pci.c
+  	.read = pci_read,
+  	.write = pci_write,
+  };
+diff --cc drivers/acpi/pci_irq.c
+index d8cd9b655f87,e7f718d6918a..000000000000
+--- a/drivers/acpi/pci_irq.c
++++ b/drivers/acpi/pci_irq.c
+@@@ -485,5 -502,9 +485,13 @@@ void acpi_pci_irq_disable(struct pci_de
+  	 */
+  
+  	dev_dbg(&dev->dev, "PCI INT %c disabled\n", pin_name(pin));
+++<<<<<<< HEAD
+ +	acpi_unregister_gsi(gsi);
+++=======
++ 	if (gsi >= 0) {
++ 		acpi_unregister_gsi(gsi);
++ 		dev->irq_managed = 0;
++ 		dev->irq = 0;
++ 	}
+++>>>>>>> b4b55cda5874 (x86/PCI: Refine the way to release PCI IRQ resources)
+  }
+diff --git a/arch/x86/pci/common.c b/arch/x86/pci/common.c
+index 62757e6b58bd..438a95197ee4 100644
+--- a/arch/x86/pci/common.c
++++ b/arch/x86/pci/common.c
+@@ -513,6 +513,31 @@ void __init pcibios_set_cache_line_size(void)
+ 	}
+ }
+ 
++/*
++ * Some device drivers assume dev->irq won't change after calling
++ * pci_disable_device(). So delay releasing of IRQ resource to driver
++ * unbinding time. Otherwise it will break PM subsystem and drivers
++ * like xen-pciback etc.
++ */
++static int pci_irq_notifier(struct notifier_block *nb, unsigned long action,
++			    void *data)
++{
++	struct pci_dev *dev = to_pci_dev(data);
++
++	if (action != BUS_NOTIFY_UNBOUND_DRIVER)
++		return NOTIFY_DONE;
++
++	if (pcibios_disable_irq)
++		pcibios_disable_irq(dev);
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block pci_irq_nb = {
++	.notifier_call = pci_irq_notifier,
++	.priority = INT_MIN,
++};
++
+ int __init pcibios_init(void)
+ {
+ 	if (!raw_pci_ops) {
+@@ -525,6 +550,9 @@ int __init pcibios_init(void)
+ 
+ 	if (pci_bf_sort >= pci_force_bf)
+ 		pci_sort_breadthfirst();
++
++	bus_register_notifier(&pci_bus_type, &pci_irq_nb);
++
+ 	return 0;
+ }
+ 
+@@ -686,12 +714,6 @@ int pcibios_enable_device(struct pci_dev *dev, int mask)
+ 	return 0;
+ }
+ 
+-void pcibios_disable_device (struct pci_dev *dev)
+-{
+-	if (!pci_dev_msi_enabled(dev) && pcibios_disable_irq)
+-		pcibios_disable_irq(dev);
+-}
+-
+ int pci_ext_cfg_avail(void)
+ {
+ 	if (raw_pci_ext_ops)
+* Unmerged path arch/x86/pci/irq.c
+* Unmerged path arch/x86/pci/mrst.c
+* Unmerged path drivers/acpi/pci_irq.c
