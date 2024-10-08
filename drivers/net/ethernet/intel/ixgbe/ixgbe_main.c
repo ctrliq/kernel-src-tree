@@ -3742,8 +3742,6 @@ static void ixgbe_setup_rdrxctl(struct ixgbe_adapter *adapter)
 	u32 rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
 
 	switch (hw->mac.type) {
-	case ixgbe_mac_X550:
-	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_82598EB:
 		/*
 		 * For VMDq support of different descriptor types or
@@ -3757,6 +3755,8 @@ static void ixgbe_setup_rdrxctl(struct ixgbe_adapter *adapter)
 		 */
 		rdrxctl |= IXGBE_RDRXCTL_MVMEN;
 		break;
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
 	case ixgbe_mac_82599EB:
 	case ixgbe_mac_X540:
 		/* Disable RSC for ACK packets */
