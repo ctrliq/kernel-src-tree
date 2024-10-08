@@ -1,0 +1,107 @@
+qla2xxx: Prevent probe and board_disable race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joe Lawrence <joe.lawrence@stratus.com>
+commit 6b3839790b16adffbbe2f5967e149562a5a603e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6b383979.failed
+
+The PCI register read checking introduced in commit fe1b806f4f71
+("qla2xxx: Disable adapter when we encounter a PCI disconnect") is
+active during driver probe. Hold off scheduling any board removal until
+the driver probe has completed. This ensures that the the board_disable
+work structure is initialized and more importantly, avoids racing
+qla2x00_probe_one.
+
+	Signed-off-by: Joe Lawrence <joe.lawrence@stratus.com>
+	Acked-by: Chad Dupuis <chad.dupuis@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 6b3839790b16adffbbe2f5967e149562a5a603e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 1322f35afaab,de5a9c471cf9..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3504,6 -3402,11 +3504,14 @@@ typedef struct scsi_qla_host 
+  #define FX00_CRITEMP_RECOVERY	25
+  #define FX00_HOST_INFO_RESEND	26
+  
+++<<<<<<< HEAD
+++=======
++ 	unsigned long	pci_flags;
++ #define PFLG_DISCONNECTED	0	/* PCI device removed */
++ #define PFLG_DRIVER_REMOVING	1	/* PCI driver .remove */
++ #define PFLG_DRIVER_PROBING	2	/* PCI driver .probe */
++ 
+++>>>>>>> 6b3839790b16 (qla2xxx: Prevent probe and board_disable race)
+  	uint32_t	device_flags;
+  #define SWITCH_FOUND		BIT_0
+  #define DFLG_NO_CABLE		BIT_1
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index f12cf90f18f9,a0992bfab7bf..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -110,6 -112,32 +110,35 @@@ qla2100_intr_handler(int irq, void *dev
+  	return (IRQ_HANDLED);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool
++ qla2x00_check_reg32_for_disconnect(scsi_qla_host_t *vha, uint32_t reg)
++ {
++ 	/* Check for PCI disconnection */
++ 	if (reg == 0xffffffff) {
++ 		if (!test_and_set_bit(PFLG_DISCONNECTED, &vha->pci_flags) &&
++ 		    !test_bit(PFLG_DRIVER_REMOVING, &vha->pci_flags) &&
++ 		    !test_bit(PFLG_DRIVER_PROBING, &vha->pci_flags)) {
++ 			/*
++ 			 * Schedule this (only once) on the default system
++ 			 * workqueue so that all the adapter workqueues and the
++ 			 * DPC thread can be shutdown cleanly.
++ 			 */
++ 			schedule_work(&vha->hw->board_disable);
++ 		}
++ 		return true;
++ 	} else
++ 		return false;
++ }
++ 
++ bool
++ qla2x00_check_reg16_for_disconnect(scsi_qla_host_t *vha, uint16_t reg)
++ {
++ 	return qla2x00_check_reg32_for_disconnect(vha, 0xffff0000 | reg);
++ }
++ 
+++>>>>>>> 6b3839790b16 (qla2xxx: Prevent probe and board_disable race)
+  /**
+   * qla2300_intr_handler() - Process interrupts for the ISP23xx and ISP63xx.
+   * @irq:
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index be94eef42519..71fec1a57307 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2631,6 +2631,7 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	}
+ 
+ 	pci_set_drvdata(pdev, base_vha);
++	set_bit(PFLG_DRIVER_PROBING, &base_vha->pci_flags);
+ 
+ 	host = base_vha->host;
+ 	base_vha->req = req;
+@@ -2926,6 +2927,7 @@ skip_dpc:
+ 
+ 	qlt_add_target(ha, base_vha);
+ 
++	clear_bit(PFLG_DRIVER_PROBING, &base_vha->pci_flags);
+ 	return 0;
+ 
+ probe_init_failed:
