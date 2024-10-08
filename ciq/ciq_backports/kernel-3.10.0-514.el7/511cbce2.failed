@@ -1,0 +1,1015 @@
+irq_poll: make blk-iopoll available outside the block layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [irq_poll] make blk-iopoll available outside the block layer (Jeff Moyer) [1336479]
+Rebuild_FUZZ: 90.74%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 511cbce2ff8b9d322077909ee90c5d4b67b29b75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/511cbce2.failed
+
+The new name is irq_poll as iopoll is already taken.  Better suggestions
+welcome.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+(cherry picked from commit 511cbce2ff8b9d322077909ee90c5d4b67b29b75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+#	include/linux/blk-iopoll.h
+#	include/trace/events/irq.h
+#	lib/irq_poll.c
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 29e4d80b9729,1d879ef406d8..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -910,31 -908,15 +910,38 @@@ static irqreturn_t be_isr_msix(int irq
+  
+  	phba = pbe_eq->phba;
+  	num_eq_processed = 0;
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +					& EQE_VALID_MASK) {
+ +			if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+ +				blk_iopoll_sched(&pbe_eq->iopoll);
+++=======
++ 	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++ 				& EQE_VALID_MASK) {
++ 		if (!irq_poll_sched_prep(&pbe_eq->iopoll))
++ 			irq_poll_sched(&pbe_eq->iopoll);
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  
+ -		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ -		queue_tail_inc(eq);
+ -		eqe = queue_tail_node(eq);
+ -		num_eq_processed++;
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +			num_eq_processed++;
+ +		}
+ +	} else {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +						& EQE_VALID_MASK) {
+ +			spin_lock_irqsave(&phba->isr_lock, flags);
+ +			pbe_eq->todo_cq = true;
+ +			spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +			num_eq_processed++;
+ +		}
+ +
+ +		if (pbe_eq->todo_cq)
+ +			queue_work(phba->wq, &pbe_eq->work_cqs);
+  	}
+  
+  	if (num_eq_processed)
+@@@ -981,72 -962,40 +988,87 @@@ static irqreturn_t be_isr(int irq, voi
+  
+  	num_ioeq_processed = 0;
+  	num_mcceq_processed = 0;
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +					& EQE_VALID_MASK) {
+ +			if (((eqe->dw[offsetof(struct amap_eq_entry,
+ +			     resource_id) / 32] &
+ +			     EQE_RESID_MASK) >> 16) == mcc->id) {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_mcc_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +				num_mcceq_processed++;
+ +			} else {
+ +				if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+ +					blk_iopoll_sched(&pbe_eq->iopoll);
+ +				num_ioeq_processed++;
+ +			}
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +		}
+ +		if (num_ioeq_processed || num_mcceq_processed) {
+ +			if (pbe_eq->todo_mcc_cq)
+ +				queue_work(phba->wq, &pbe_eq->work_cqs);
+ +
+ +			if ((num_mcceq_processed) && (!num_ioeq_processed))
+ +				hwi_ring_eq_db(phba, eq->id, 0,
+ +					      (num_ioeq_processed +
+ +					       num_mcceq_processed) , 1, 1);
+ +			else
+ +				hwi_ring_eq_db(phba, eq->id, 0,
+ +					       (num_ioeq_processed +
+ +						num_mcceq_processed), 0, 1);
+ +
+ +			return IRQ_HANDLED;
+ +		} else
+ +			return IRQ_NONE;
+ +	} else {
+ +		cq = &phwi_context->be_cq[0];
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +						& EQE_VALID_MASK) {
+ +
+ +			if (((eqe->dw[offsetof(struct amap_eq_entry,
+ +			     resource_id) / 32] &
+ +			     EQE_RESID_MASK) >> 16) != cq->id) {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_mcc_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			} else {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			}
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+++=======
++ 	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++ 				& EQE_VALID_MASK) {
++ 		if (((eqe->dw[offsetof(struct amap_eq_entry,
++ 		     resource_id) / 32] &
++ 		     EQE_RESID_MASK) >> 16) == mcc->id) {
++ 			spin_lock_irqsave(&phba->isr_lock, flags);
++ 			pbe_eq->todo_mcc_cq = true;
++ 			spin_unlock_irqrestore(&phba->isr_lock, flags);
++ 			num_mcceq_processed++;
++ 		} else {
++ 			if (!irq_poll_sched_prep(&pbe_eq->iopoll))
++ 				irq_poll_sched(&pbe_eq->iopoll);
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  			num_ioeq_processed++;
+  		}
+ -		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ -		queue_tail_inc(eq);
+ -		eqe = queue_tail_node(eq);
+ -	}
+ -	if (num_ioeq_processed || num_mcceq_processed) {
+ -		if (pbe_eq->todo_mcc_cq)
+ +		if (pbe_eq->todo_cq || pbe_eq->todo_mcc_cq)
+  			queue_work(phba->wq, &pbe_eq->work_cqs);
+  
+ -		if ((num_mcceq_processed) && (!num_ioeq_processed))
+ -			hwi_ring_eq_db(phba, eq->id, 0,
+ -				      (num_ioeq_processed +
+ -				       num_mcceq_processed) , 1, 1);
+ -		else
+ +		if (num_ioeq_processed) {
+  			hwi_ring_eq_db(phba, eq->id, 0,
+ -				       (num_ioeq_processed +
+ -					num_mcceq_processed), 0, 1);
+ -
+ -		return IRQ_HANDLED;
+ -	} else
+ -		return IRQ_NONE;
+ +				       num_ioeq_processed, 1, 1);
+ +			return IRQ_HANDLED;
+ +		} else
+ +			return IRQ_NONE;
+ +	}
+  }
+  
+  static int beiscsi_init_irqs(struct beiscsi_hba *phba)
+@@@ -5344,11 -5291,10 +5366,18 @@@ static void beiscsi_quiesce(struct beis
+  	pci_disable_msix(phba->pcidev);
+  	cancel_delayed_work_sync(&phba->beiscsi_hw_check_task);
+  
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled)
+ +		for (i = 0; i < phba->num_cpus; i++) {
+ +			pbe_eq = &phwi_context->be_eq[i];
+ +			blk_iopoll_disable(&pbe_eq->iopoll);
+ +		}
+++=======
++ 	for (i = 0; i < phba->num_cpus; i++) {
++ 		pbe_eq = &phwi_context->be_eq[i];
++ 		irq_poll_disable(&pbe_eq->iopoll);
++ 	}
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  
+  	if (unload_state == BEISCSI_CLEAN_UNLOAD) {
+  		destroy_workqueue(phba->wq);
+@@@ -5631,31 -5577,17 +5660,40 @@@ static void beiscsi_eeh_resume(struct p
+  	phwi_ctrlr = phba->phwi_ctrlr;
+  	phwi_context = phwi_ctrlr->phwi_ctxt;
+  
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		for (i = 0; i < phba->num_cpus; i++) {
+ +			pbe_eq = &phwi_context->be_eq[i];
+ +			blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
+ +					be_iopoll);
+ +			blk_iopoll_enable(&pbe_eq->iopoll);
+ +		}
+++=======
++ 	for (i = 0; i < phba->num_cpus; i++) {
++ 		pbe_eq = &phwi_context->be_eq[i];
++ 		irq_poll_init(&pbe_eq->iopoll, be_iopoll_budget,
++ 				be_iopoll);
++ 		irq_poll_enable(&pbe_eq->iopoll);
++ 	}
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  
+ -	i = (phba->msix_enabled) ? i : 0;
+ -	/* Work item for MCC handling */
+ -	pbe_eq = &phwi_context->be_eq[i];
+ -	INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+ +		i = (phba->msix_enabled) ? i : 0;
+ +		/* Work item for MCC handling */
+ +		pbe_eq = &phwi_context->be_eq[i];
+ +		INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+ +	} else {
+ +		if (phba->msix_enabled) {
+ +			for (i = 0; i <= phba->num_cpus; i++) {
+ +				pbe_eq = &phwi_context->be_eq[i];
+ +				INIT_WORK(&pbe_eq->work_cqs,
+ +					  beiscsi_process_all_cqs);
+ +			}
+ +		} else {
+ +			pbe_eq = &phwi_context->be_eq[0];
+ +			INIT_WORK(&pbe_eq->work_cqs,
+ +				  beiscsi_process_all_cqs);
+ +		}
+ +	}
+  
+  	ret = beiscsi_init_irqs(phba);
+  	if (ret < 0) {
+@@@ -5818,31 -5750,17 +5856,40 @@@ static int beiscsi_dev_probe(struct pci
+  	phwi_ctrlr = phba->phwi_ctrlr;
+  	phwi_context = phwi_ctrlr->phwi_ctxt;
+  
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		for (i = 0; i < phba->num_cpus; i++) {
+ +			pbe_eq = &phwi_context->be_eq[i];
+ +			blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
+ +					be_iopoll);
+ +			blk_iopoll_enable(&pbe_eq->iopoll);
+ +		}
+++=======
++ 	for (i = 0; i < phba->num_cpus; i++) {
++ 		pbe_eq = &phwi_context->be_eq[i];
++ 		irq_poll_init(&pbe_eq->iopoll, be_iopoll_budget,
++ 				be_iopoll);
++ 		irq_poll_enable(&pbe_eq->iopoll);
++ 	}
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  
+ -	i = (phba->msix_enabled) ? i : 0;
+ -	/* Work item for MCC handling */
+ -	pbe_eq = &phwi_context->be_eq[i];
+ -	INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+ +		i = (phba->msix_enabled) ? i : 0;
+ +		/* Work item for MCC handling */
+ +		pbe_eq = &phwi_context->be_eq[i];
+ +		INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+ +	} else {
+ +		if (phba->msix_enabled) {
+ +			for (i = 0; i <= phba->num_cpus; i++) {
+ +				pbe_eq = &phwi_context->be_eq[i];
+ +				INIT_WORK(&pbe_eq->work_cqs,
+ +					  beiscsi_process_all_cqs);
+ +			}
+ +		} else {
+ +				pbe_eq = &phwi_context->be_eq[0];
+ +				INIT_WORK(&pbe_eq->work_cqs,
+ +					  beiscsi_process_all_cqs);
+ +			}
+ +	}
+  
+  	ret = beiscsi_init_irqs(phba);
+  	if (ret < 0) {
+@@@ -5875,11 -5793,10 +5922,18 @@@
+  
+  free_blkenbld:
+  	destroy_workqueue(phba->wq);
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled)
+ +		for (i = 0; i < phba->num_cpus; i++) {
+ +			pbe_eq = &phwi_context->be_eq[i];
+ +			blk_iopoll_disable(&pbe_eq->iopoll);
+ +		}
+++=======
++ 	for (i = 0; i < phba->num_cpus; i++) {
++ 		pbe_eq = &phwi_context->be_eq[i];
++ 		irq_poll_disable(&pbe_eq->iopoll);
++ 	}
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  free_twq:
+  	beiscsi_clean_port(phba);
+  	beiscsi_free_mem(phba);
+diff --cc include/trace/events/irq.h
+index 1c09820df585,f95f25e786ef..000000000000
+--- a/include/trace/events/irq.h
++++ b/include/trace/events/irq.h
+@@@ -9,19 -9,34 +9,48 @@@
+  struct irqaction;
+  struct softirq_action;
+  
+++<<<<<<< HEAD
+ +#define softirq_name(sirq) { sirq##_SOFTIRQ, #sirq }
+++=======
++ #define SOFTIRQ_NAME_LIST				\
++ 			 softirq_name(HI)		\
++ 			 softirq_name(TIMER)		\
++ 			 softirq_name(NET_TX)		\
++ 			 softirq_name(NET_RX)		\
++ 			 softirq_name(BLOCK)		\
++ 			 softirq_name(IRQ_POLL)		\
++ 			 softirq_name(TASKLET)		\
++ 			 softirq_name(SCHED)		\
++ 			 softirq_name(HRTIMER)		\
++ 			 softirq_name_end(RCU)
++ 
++ #undef softirq_name
++ #undef softirq_name_end
++ 
++ #define softirq_name(sirq) TRACE_DEFINE_ENUM(sirq##_SOFTIRQ);
++ #define softirq_name_end(sirq)  TRACE_DEFINE_ENUM(sirq##_SOFTIRQ);
++ 
++ SOFTIRQ_NAME_LIST
++ 
++ #undef softirq_name
++ #undef softirq_name_end
++ 
++ #define softirq_name(sirq) { sirq##_SOFTIRQ, #sirq },
++ #define softirq_name_end(sirq) { sirq##_SOFTIRQ, #sirq }
++ 
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer)
+  #define show_softirq_name(val)				\
+ -	__print_symbolic(val, SOFTIRQ_NAME_LIST)
+ +	__print_symbolic(val,				\
+ +			 softirq_name(HI),		\
+ +			 softirq_name(TIMER),		\
+ +			 softirq_name(NET_TX),		\
+ +			 softirq_name(NET_RX),		\
+ +			 softirq_name(BLOCK),		\
+ +			 softirq_name(BLOCK_IOPOLL),	\
+ +			 softirq_name(TASKLET),		\
+ +			 softirq_name(SCHED),		\
+ +			 softirq_name(HRTIMER),		\
+ +			 softirq_name(RCU))
+  
+  /**
+   * irq_handler_entry - called immediately before the irq action handler
+diff --cc lib/irq_poll.c
+index aaadab9ccfea,e6fd1dc0908b..000000000000
+--- a/lib/irq_poll.c
++++ b/lib/irq_poll.c
+@@@ -6,18 -6,12 +6,21 @@@
+  #include <linux/module.h>
+  #include <linux/init.h>
+  #include <linux/bio.h>
+- #include <linux/blkdev.h>
+  #include <linux/interrupt.h>
+  #include <linux/cpu.h>
+- #include <linux/blk-iopoll.h>
++ #include <linux/irq_poll.h>
+  #include <linux/delay.h>
+  
+++<<<<<<< HEAD:block/blk-iopoll.c
+ +#include "blk.h"
+ +
+ +int blk_iopoll_enabled = 1;
+ +EXPORT_SYMBOL(blk_iopoll_enabled);
+ +
+ +static unsigned int blk_iopoll_budget __read_mostly = 256;
+++=======
++ static unsigned int irq_poll_budget __read_mostly = 256;
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer):lib/irq_poll.c
+  
+  static DEFINE_PER_CPU(struct list_head, blk_cpu_iopoll);
+  
+@@@ -46,19 -40,19 +49,24 @@@ EXPORT_SYMBOL(irq_poll_sched)
+   * @iop:      The parent iopoll structure
+   *
+   * Description:
+-  *     See blk_iopoll_complete(). This function must be called with interrupts
++  *     See irq_poll_complete(). This function must be called with interrupts
+   *     disabled.
+   **/
+- void __blk_iopoll_complete(struct blk_iopoll *iop)
++ void __irq_poll_complete(struct irq_poll *iop)
+  {
+  	list_del(&iop->list);
+++<<<<<<< HEAD:block/blk-iopoll.c
+ +	smp_mb__before_clear_bit();
+ +	clear_bit_unlock(IOPOLL_F_SCHED, &iop->state);
+++=======
++ 	smp_mb__before_atomic();
++ 	clear_bit_unlock(IRQ_POLL_F_SCHED, &iop->state);
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer):lib/irq_poll.c
+  }
+- EXPORT_SYMBOL(__blk_iopoll_complete);
++ EXPORT_SYMBOL(__irq_poll_complete);
+  
+  /**
+-  * blk_iopoll_complete - Mark this @iop as un-polled again
++  * irq_poll_complete - Mark this @iop as un-polled again
+   * @iop:      The parent iopoll structure
+   *
+   * Description:
+@@@ -161,16 -155,16 +169,22 @@@ EXPORT_SYMBOL(irq_poll_disable)
+   *     Enable iopoll on this @iop. Note that the handler run will not be
+   *     scheduled, it will only mark it as active.
+   **/
+- void blk_iopoll_enable(struct blk_iopoll *iop)
++ void irq_poll_enable(struct irq_poll *iop)
+  {
+++<<<<<<< HEAD:block/blk-iopoll.c
+ +	BUG_ON(!test_bit(IOPOLL_F_SCHED, &iop->state));
+ +	smp_mb__before_clear_bit();
+ +	clear_bit_unlock(IOPOLL_F_SCHED, &iop->state);
+++=======
++ 	BUG_ON(!test_bit(IRQ_POLL_F_SCHED, &iop->state));
++ 	smp_mb__before_atomic();
++ 	clear_bit_unlock(IRQ_POLL_F_SCHED, &iop->state);
+++>>>>>>> 511cbce2ff8b (irq_poll: make blk-iopoll available outside the block layer):lib/irq_poll.c
+  }
+- EXPORT_SYMBOL(blk_iopoll_enable);
++ EXPORT_SYMBOL(irq_poll_enable);
+  
+  /**
+-  * blk_iopoll_init - Initialize this @iop
++  * irq_poll_init - Initialize this @iop
+   * @iop:      The parent iopoll structure
+   * @weight:   The default weight (or command completion budget)
+   * @poll_fn:  The handler to invoke
+* Unmerged path include/linux/blk-iopoll.h
+diff --git a/Documentation/kernel-per-CPU-kthreads.txt b/Documentation/kernel-per-CPU-kthreads.txt
+index cbf7ae412da4..3d9c6b01f198 100644
+--- a/Documentation/kernel-per-CPU-kthreads.txt
++++ b/Documentation/kernel-per-CPU-kthreads.txt
+@@ -90,7 +90,7 @@ BLOCK_SOFTIRQ:  Do all of the following:
+ 	from being initiated from tasks that might run on the CPU to
+ 	be de-jittered.  (It is OK to force this CPU offline and then
+ 	bring it back online before you start your application.)
+-BLOCK_IOPOLL_SOFTIRQ:  Do all of the following:
++IRQ_POLL_SOFTIRQ:  Do all of the following:
+ 1.	Force block-device interrupts onto some other CPU.
+ 2.	Initiate any block I/O and block-I/O polling on other CPUs.
+ 3.	Once your application has started, prevent CPU-hotplug operations
+diff --git a/block/Makefile b/block/Makefile
+index 21f461846d46..ddb963656bb0 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -5,7 +5,7 @@
+ obj-$(CONFIG_BLOCK) := elevator.o blk-core.o blk-tag.o blk-sysfs.o \
+ 			blk-flush.o blk-settings.o blk-ioc.o blk-map.o \
+ 			blk-exec.o blk-merge.o blk-softirq.o blk-timeout.o \
+-			blk-iopoll.o blk-lib.o blk-mq.o blk-mq-tag.o \
++			blk-lib.o blk-mq.o blk-mq-tag.o \
+ 			blk-mq-sysfs.o blk-mq-cpu.o blk-mq-cpumap.o ioctl.o \
+ 			genhd.o scsi_ioctl.o partition-generic.o partitions/
+ 
+diff --git a/block/blk-iopoll.c b/block/blk-iopoll.c
+deleted file mode 100644
+index aaadab9ccfea..000000000000
+--- a/block/blk-iopoll.c
++++ /dev/null
+@@ -1,227 +0,0 @@
+-/*
+- * Functions related to interrupt-poll handling in the block layer. This
+- * is similar to NAPI for network devices.
+- */
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/bio.h>
+-#include <linux/blkdev.h>
+-#include <linux/interrupt.h>
+-#include <linux/cpu.h>
+-#include <linux/blk-iopoll.h>
+-#include <linux/delay.h>
+-
+-#include "blk.h"
+-
+-int blk_iopoll_enabled = 1;
+-EXPORT_SYMBOL(blk_iopoll_enabled);
+-
+-static unsigned int blk_iopoll_budget __read_mostly = 256;
+-
+-static DEFINE_PER_CPU(struct list_head, blk_cpu_iopoll);
+-
+-/**
+- * blk_iopoll_sched - Schedule a run of the iopoll handler
+- * @iop:      The parent iopoll structure
+- *
+- * Description:
+- *     Add this blk_iopoll structure to the pending poll list and trigger the
+- *     raise of the blk iopoll softirq. The driver must already have gotten a
+- *     successful return from blk_iopoll_sched_prep() before calling this.
+- **/
+-void blk_iopoll_sched(struct blk_iopoll *iop)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	list_add_tail(&iop->list, this_cpu_ptr(&blk_cpu_iopoll));
+-	__raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ);
+-	local_irq_restore(flags);
+-}
+-EXPORT_SYMBOL(blk_iopoll_sched);
+-
+-/**
+- * __blk_iopoll_complete - Mark this @iop as un-polled again
+- * @iop:      The parent iopoll structure
+- *
+- * Description:
+- *     See blk_iopoll_complete(). This function must be called with interrupts
+- *     disabled.
+- **/
+-void __blk_iopoll_complete(struct blk_iopoll *iop)
+-{
+-	list_del(&iop->list);
+-	smp_mb__before_clear_bit();
+-	clear_bit_unlock(IOPOLL_F_SCHED, &iop->state);
+-}
+-EXPORT_SYMBOL(__blk_iopoll_complete);
+-
+-/**
+- * blk_iopoll_complete - Mark this @iop as un-polled again
+- * @iop:      The parent iopoll structure
+- *
+- * Description:
+- *     If a driver consumes less than the assigned budget in its run of the
+- *     iopoll handler, it'll end the polled mode by calling this function. The
+- *     iopoll handler will not be invoked again before blk_iopoll_sched_prep()
+- *     is called.
+- **/
+-void blk_iopoll_complete(struct blk_iopoll *iop)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	__blk_iopoll_complete(iop);
+-	local_irq_restore(flags);
+-}
+-EXPORT_SYMBOL(blk_iopoll_complete);
+-
+-static void blk_iopoll_softirq(struct softirq_action *h)
+-{
+-	struct list_head *list = this_cpu_ptr(&blk_cpu_iopoll);
+-	int rearm = 0, budget = blk_iopoll_budget;
+-	unsigned long start_time = jiffies;
+-
+-	local_irq_disable();
+-
+-	while (!list_empty(list)) {
+-		struct blk_iopoll *iop;
+-		int work, weight;
+-
+-		/*
+-		 * If softirq window is exhausted then punt.
+-		 */
+-		if (budget <= 0 || time_after(jiffies, start_time)) {
+-			rearm = 1;
+-			break;
+-		}
+-
+-		local_irq_enable();
+-
+-		/* Even though interrupts have been re-enabled, this
+-		 * access is safe because interrupts can only add new
+-		 * entries to the tail of this list, and only ->poll()
+-		 * calls can remove this head entry from the list.
+-		 */
+-		iop = list_entry(list->next, struct blk_iopoll, list);
+-
+-		weight = iop->weight;
+-		work = 0;
+-		if (test_bit(IOPOLL_F_SCHED, &iop->state))
+-			work = iop->poll(iop, weight);
+-
+-		budget -= work;
+-
+-		local_irq_disable();
+-
+-		/*
+-		 * Drivers must not modify the iopoll state, if they
+-		 * consume their assigned weight (or more, some drivers can't
+-		 * easily just stop processing, they have to complete an
+-		 * entire mask of commands).In such cases this code
+-		 * still "owns" the iopoll instance and therefore can
+-		 * move the instance around on the list at-will.
+-		 */
+-		if (work >= weight) {
+-			if (blk_iopoll_disable_pending(iop))
+-				__blk_iopoll_complete(iop);
+-			else
+-				list_move_tail(&iop->list, list);
+-		}
+-	}
+-
+-	if (rearm)
+-		__raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ);
+-
+-	local_irq_enable();
+-}
+-
+-/**
+- * blk_iopoll_disable - Disable iopoll on this @iop
+- * @iop:      The parent iopoll structure
+- *
+- * Description:
+- *     Disable io polling and wait for any pending callbacks to have completed.
+- **/
+-void blk_iopoll_disable(struct blk_iopoll *iop)
+-{
+-	set_bit(IOPOLL_F_DISABLE, &iop->state);
+-	while (test_and_set_bit(IOPOLL_F_SCHED, &iop->state))
+-		msleep(1);
+-	clear_bit(IOPOLL_F_DISABLE, &iop->state);
+-}
+-EXPORT_SYMBOL(blk_iopoll_disable);
+-
+-/**
+- * blk_iopoll_enable - Enable iopoll on this @iop
+- * @iop:      The parent iopoll structure
+- *
+- * Description:
+- *     Enable iopoll on this @iop. Note that the handler run will not be
+- *     scheduled, it will only mark it as active.
+- **/
+-void blk_iopoll_enable(struct blk_iopoll *iop)
+-{
+-	BUG_ON(!test_bit(IOPOLL_F_SCHED, &iop->state));
+-	smp_mb__before_clear_bit();
+-	clear_bit_unlock(IOPOLL_F_SCHED, &iop->state);
+-}
+-EXPORT_SYMBOL(blk_iopoll_enable);
+-
+-/**
+- * blk_iopoll_init - Initialize this @iop
+- * @iop:      The parent iopoll structure
+- * @weight:   The default weight (or command completion budget)
+- * @poll_fn:  The handler to invoke
+- *
+- * Description:
+- *     Initialize this blk_iopoll structure. Before being actively used, the
+- *     driver must call blk_iopoll_enable().
+- **/
+-void blk_iopoll_init(struct blk_iopoll *iop, int weight, blk_iopoll_fn *poll_fn)
+-{
+-	memset(iop, 0, sizeof(*iop));
+-	INIT_LIST_HEAD(&iop->list);
+-	iop->weight = weight;
+-	iop->poll = poll_fn;
+-	set_bit(IOPOLL_F_SCHED, &iop->state);
+-}
+-EXPORT_SYMBOL(blk_iopoll_init);
+-
+-static int blk_iopoll_cpu_notify(struct notifier_block *self,
+-				 unsigned long action, void *hcpu)
+-{
+-	/*
+-	 * If a CPU goes away, splice its entries to the current CPU
+-	 * and trigger a run of the softirq
+-	 */
+-	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN) {
+-		int cpu = (unsigned long) hcpu;
+-
+-		local_irq_disable();
+-		list_splice_init(&per_cpu(blk_cpu_iopoll, cpu),
+-				 this_cpu_ptr(&blk_cpu_iopoll));
+-		__raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ);
+-		local_irq_enable();
+-	}
+-
+-	return NOTIFY_OK;
+-}
+-
+-static struct notifier_block blk_iopoll_cpu_notifier = {
+-	.notifier_call	= blk_iopoll_cpu_notify,
+-};
+-
+-static __init int blk_iopoll_setup(void)
+-{
+-	int i;
+-
+-	for_each_possible_cpu(i)
+-		INIT_LIST_HEAD(&per_cpu(blk_cpu_iopoll, i));
+-
+-	open_softirq(BLOCK_IOPOLL_SOFTIRQ, blk_iopoll_softirq);
+-	register_hotcpu_notifier(&blk_iopoll_cpu_notifier);
+-	return 0;
+-}
+-subsys_initcall(blk_iopoll_setup);
+diff --git a/drivers/scsi/Kconfig b/drivers/scsi/Kconfig
+index ef421295e1f4..a9acbb022cd0 100644
+--- a/drivers/scsi/Kconfig
++++ b/drivers/scsi/Kconfig
+@@ -1152,6 +1152,7 @@ config SCSI_IPR
+ 	tristate "IBM Power Linux RAID adapter support"
+ 	depends on PCI && SCSI && ATA
+ 	select FW_LOADER
++	select IRQ_POLL
+ 	---help---
+ 	  This driver supports the IBM Power Linux family RAID adapters.
+ 	  This includes IBM pSeries 5712, 5703, 5709, and 570A, as well
+diff --git a/drivers/scsi/be2iscsi/Kconfig b/drivers/scsi/be2iscsi/Kconfig
+index ceaca32e788d..256160b2ea24 100644
+--- a/drivers/scsi/be2iscsi/Kconfig
++++ b/drivers/scsi/be2iscsi/Kconfig
+@@ -3,6 +3,7 @@ config BE2ISCSI
+ 	depends on PCI && SCSI && NET
+ 	select SCSI_ISCSI_ATTRS
+ 	select ISCSI_BOOT_SYSFS
++	select IRQ_POLL
+ 
+ 	help
+ 	This driver implements the iSCSI functionality for ServerEngines'
+diff --git a/drivers/scsi/be2iscsi/be.h b/drivers/scsi/be2iscsi/be.h
+index 290d4305c708..906f51c304f2 100644
+--- a/drivers/scsi/be2iscsi/be.h
++++ b/drivers/scsi/be2iscsi/be.h
+@@ -20,7 +20,7 @@
+ 
+ #include <linux/pci.h>
+ #include <linux/if_vlan.h>
+-#include <linux/blk-iopoll.h>
++#include <linux/irq_poll.h>
+ #define FW_VER_LEN	32
+ #define MCC_Q_LEN	128
+ #define MCC_CQ_LEN	256
+@@ -101,7 +101,7 @@ struct be_eq_obj {
+ 	struct beiscsi_hba *phba;
+ 	struct be_queue_info *cq;
+ 	struct work_struct work_cqs; /* Work Item */
+-	struct blk_iopoll	iopoll;
++	struct irq_poll	iopoll;
+ };
+ 
+ struct be_mcc_obj {
+diff --git a/drivers/scsi/be2iscsi/be_iscsi.c b/drivers/scsi/be2iscsi/be_iscsi.c
+index 61bc8e14d5bc..0a7d36f7d1f4 100644
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@ -1294,9 +1294,9 @@ static void beiscsi_flush_cq(struct beiscsi_hba *phba)
+ 
+ 	for (i = 0; i < phba->num_cpus; i++) {
+ 		pbe_eq = &phwi_context->be_eq[i];
+-		blk_iopoll_disable(&pbe_eq->iopoll);
++		irq_poll_disable(&pbe_eq->iopoll);
+ 		beiscsi_process_cq(pbe_eq);
+-		blk_iopoll_enable(&pbe_eq->iopoll);
++		irq_poll_enable(&pbe_eq->iopoll);
+ 	}
+ }
+ 
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+diff --git a/drivers/scsi/ipr.c b/drivers/scsi/ipr.c
+index 3131cefaf4a9..f3f2591f986e 100644
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@ -3638,7 +3638,7 @@ static struct device_attribute ipr_ioa_reset_attr = {
+ 	.store = ipr_store_reset_adapter
+ };
+ 
+-static int ipr_iopoll(struct blk_iopoll *iop, int budget);
++static int ipr_iopoll(struct irq_poll *iop, int budget);
+  /**
+  * ipr_show_iopoll_weight - Show ipr polling mode
+  * @dev:	class device struct
+@@ -3681,26 +3681,26 @@ static ssize_t ipr_store_iopoll_weight(struct device *dev,
+ 	int i;
+ 
+ 	if (!ioa_cfg->sis64) {
+-		dev_info(&ioa_cfg->pdev->dev, "blk-iopoll not supported on this adapter\n");
++		dev_info(&ioa_cfg->pdev->dev, "irq_poll not supported on this adapter\n");
+ 		return -EINVAL;
+ 	}
+ 	if (kstrtoul(buf, 10, &user_iopoll_weight))
+ 		return -EINVAL;
+ 
+ 	if (user_iopoll_weight > 256) {
+-		dev_info(&ioa_cfg->pdev->dev, "Invalid blk-iopoll weight. It must be less than 256\n");
++		dev_info(&ioa_cfg->pdev->dev, "Invalid irq_poll weight. It must be less than 256\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (user_iopoll_weight == ioa_cfg->iopoll_weight) {
+-		dev_info(&ioa_cfg->pdev->dev, "Current blk-iopoll weight has the same weight\n");
++		dev_info(&ioa_cfg->pdev->dev, "Current irq_poll weight has the same weight\n");
+ 		return strlen(buf);
+ 	}
+ 
+ 	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+ 			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
+-			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
++			irq_poll_disable(&ioa_cfg->hrrq[i].iopoll);
+ 	}
+ 
+ 	spin_lock_irqsave(shost->host_lock, lock_flags);
+@@ -3708,9 +3708,9 @@ static ssize_t ipr_store_iopoll_weight(struct device *dev,
+ 	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+ 			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
+-			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
++			irq_poll_init(&ioa_cfg->hrrq[i].iopoll,
+ 					ioa_cfg->iopoll_weight, ipr_iopoll);
+-			blk_iopoll_enable(&ioa_cfg->hrrq[i].iopoll);
++			irq_poll_enable(&ioa_cfg->hrrq[i].iopoll);
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(shost->host_lock, lock_flags);
+@@ -5612,7 +5612,7 @@ static int ipr_process_hrrq(struct ipr_hrr_queue *hrr_queue, int budget,
+ 	return num_hrrq;
+ }
+ 
+-static int ipr_iopoll(struct blk_iopoll *iop, int budget)
++static int ipr_iopoll(struct irq_poll *iop, int budget)
+ {
+ 	struct ipr_ioa_cfg *ioa_cfg;
+ 	struct ipr_hrr_queue *hrrq;
+@@ -5628,7 +5628,7 @@ static int ipr_iopoll(struct blk_iopoll *iop, int budget)
+ 	completed_ops = ipr_process_hrrq(hrrq, budget, &doneq);
+ 
+ 	if (completed_ops < budget)
+-		blk_iopoll_complete(iop);
++		irq_poll_complete(iop);
+ 	spin_unlock_irqrestore(hrrq->lock, hrrq_flags);
+ 
+ 	list_for_each_entry_safe(ipr_cmd, temp, &doneq, queue) {
+@@ -5737,8 +5737,8 @@ static irqreturn_t ipr_isr_mhrrq(int irq, void *devp)
+ 			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		if ((be32_to_cpu(*hrrq->hrrq_curr) & IPR_HRRQ_TOGGLE_BIT) ==
+ 		       hrrq->toggle_bit) {
+-			if (!blk_iopoll_sched_prep(&hrrq->iopoll))
+-				blk_iopoll_sched(&hrrq->iopoll);
++			if (!irq_poll_sched_prep(&hrrq->iopoll))
++				irq_poll_sched(&hrrq->iopoll);
+ 			spin_unlock_irqrestore(hrrq->lock, hrrq_flags);
+ 			return IRQ_HANDLED;
+ 		}
+@@ -10360,9 +10360,9 @@ static int ipr_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
+ 	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+ 			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
+-			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
++			irq_poll_init(&ioa_cfg->hrrq[i].iopoll,
+ 					ioa_cfg->iopoll_weight, ipr_iopoll);
+-			blk_iopoll_enable(&ioa_cfg->hrrq[i].iopoll);
++			irq_poll_enable(&ioa_cfg->hrrq[i].iopoll);
+ 		}
+ 	}
+ 
+@@ -10392,7 +10392,7 @@ static void ipr_shutdown(struct pci_dev *pdev)
+ 			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		ioa_cfg->iopoll_weight = 0;
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
+-			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
++			irq_poll_disable(&ioa_cfg->hrrq[i].iopoll);
+ 	}
+ 
+ 	while (ioa_cfg->in_reset_reload) {
+diff --git a/drivers/scsi/ipr.h b/drivers/scsi/ipr.h
+index 9c41b113e804..940712d3e065 100644
+--- a/drivers/scsi/ipr.h
++++ b/drivers/scsi/ipr.h
+@@ -32,7 +32,7 @@
+ #include <linux/libata.h>
+ #include <linux/list.h>
+ #include <linux/kref.h>
+-#include <linux/blk-iopoll.h>
++#include <linux/irq_poll.h>
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+ 
+@@ -510,7 +510,7 @@ struct ipr_hrr_queue {
+ 	u8 allow_cmds:1;
+ 	u8 removing_ioa:1;
+ 
+-	struct blk_iopoll iopoll;
++	struct irq_poll iopoll;
+ };
+ 
+ /* Command packet structure */
+* Unmerged path include/linux/blk-iopoll.h
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index 26e5d41e6ab0..775c38a0baff 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -447,7 +447,7 @@ enum
+ 	NET_TX_SOFTIRQ,
+ 	NET_RX_SOFTIRQ,
+ 	BLOCK_SOFTIRQ,
+-	BLOCK_IOPOLL_SOFTIRQ,
++	IRQ_POLL_SOFTIRQ,
+ 	TASKLET_SOFTIRQ,
+ 	SCHED_SOFTIRQ,
+ 	HRTIMER_SOFTIRQ, /* Unused, but kept as tools rely on the
+diff --git a/include/linux/irq_poll.h b/include/linux/irq_poll.h
+new file mode 100644
+index 000000000000..50c39dcd2cba
+--- /dev/null
++++ b/include/linux/irq_poll.h
+@@ -0,0 +1,46 @@
++#ifndef IRQ_POLL_H
++#define IRQ_POLL_H
++
++struct irq_poll;
++typedef int (irq_poll_fn)(struct irq_poll *, int);
++
++struct irq_poll {
++	struct list_head list;
++	unsigned long state;
++	unsigned long data;
++	int weight;
++	int max;
++	irq_poll_fn *poll;
++};
++
++enum {
++	IRQ_POLL_F_SCHED	= 0,
++	IRQ_POLL_F_DISABLE	= 1,
++};
++
++/*
++ * Returns 0 if we successfully set the IRQ_POLL_F_SCHED bit, indicating
++ * that we were the first to acquire this iop for scheduling. If this iop
++ * is currently disabled, return "failure".
++ */
++static inline int irq_poll_sched_prep(struct irq_poll *iop)
++{
++	if (!test_bit(IRQ_POLL_F_DISABLE, &iop->state))
++		return test_and_set_bit(IRQ_POLL_F_SCHED, &iop->state);
++
++	return 1;
++}
++
++static inline int irq_poll_disable_pending(struct irq_poll *iop)
++{
++	return test_bit(IRQ_POLL_F_DISABLE, &iop->state);
++}
++
++extern void irq_poll_sched(struct irq_poll *);
++extern void irq_poll_init(struct irq_poll *, int, irq_poll_fn *);
++extern void irq_poll_complete(struct irq_poll *);
++extern void __irq_poll_complete(struct irq_poll *);
++extern void irq_poll_enable(struct irq_poll *);
++extern void irq_poll_disable(struct irq_poll *);
++
++#endif
+* Unmerged path include/trace/events/irq.h
+diff --git a/lib/Kconfig b/lib/Kconfig
+index 59a911fd065e..5709284be02a 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -429,6 +429,11 @@ config DDR
+ 	  information. This data is useful for drivers handling
+ 	  DDR SDRAM controllers.
+ 
++config IRQ_POLL
++	bool "IRQ polling library"
++	help
++	  Helper library to poll interrupt mitigation using polling.
++
+ config MPILIB
+ 	tristate
+ 	select CLZ_TAB
+diff --git a/lib/Makefile b/lib/Makefile
+index d25b4f7d5137..42672a83a822 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -144,6 +144,7 @@ obj-$(CONFIG_GENERIC_STRNCPY_FROM_USER) += strncpy_from_user.o
+ obj-$(CONFIG_GENERIC_STRNLEN_USER) += strnlen_user.o
+ 
+ obj-$(CONFIG_STMP_DEVICE) += stmp_device.o
++obj-$(CONFIG_IRQ_POLL) += irq_poll.o
+ 
+ libfdt_files = fdt.o fdt_ro.o fdt_wip.o fdt_rw.o fdt_sw.o fdt_strerror.o
+ $(foreach file, $(libfdt_files), \
+* Unmerged path lib/irq_poll.c
+diff --git a/tools/lib/traceevent/event-parse.c b/tools/lib/traceevent/event-parse.c
+index 95c406bf030a..ff966255bac9 100644
+--- a/tools/lib/traceevent/event-parse.c
++++ b/tools/lib/traceevent/event-parse.c
+@@ -3759,7 +3759,7 @@ static const struct flag flags[] = {
+ 	{ "NET_TX_SOFTIRQ", 2 },
+ 	{ "NET_RX_SOFTIRQ", 3 },
+ 	{ "BLOCK_SOFTIRQ", 4 },
+-	{ "BLOCK_IOPOLL_SOFTIRQ", 5 },
++	{ "IRQ_POLL_SOFTIRQ", 5 },
+ 	{ "TASKLET_SOFTIRQ", 6 },
+ 	{ "SCHED_SOFTIRQ", 7 },
+ 	{ "HRTIMER_SOFTIRQ", 8 },
+diff --git a/tools/perf/util/trace-event-parse.c b/tools/perf/util/trace-event-parse.c
+index 8ff7d620d942..33b52eaa39db 100644
+--- a/tools/perf/util/trace-event-parse.c
++++ b/tools/perf/util/trace-event-parse.c
+@@ -209,7 +209,7 @@ static const struct flag flags[] = {
+ 	{ "NET_TX_SOFTIRQ", 2 },
+ 	{ "NET_RX_SOFTIRQ", 3 },
+ 	{ "BLOCK_SOFTIRQ", 4 },
+-	{ "BLOCK_IOPOLL_SOFTIRQ", 5 },
++	{ "IRQ_POLL_SOFTIRQ", 5 },
+ 	{ "TASKLET_SOFTIRQ", 6 },
+ 	{ "SCHED_SOFTIRQ", 7 },
+ 	{ "HRTIMER_SOFTIRQ", 8 },
