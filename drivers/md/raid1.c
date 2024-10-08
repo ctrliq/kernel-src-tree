@@ -2709,7 +2709,6 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr, int *skipp
 			    !conf->fullsync &&
 			    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
 				break;
-			BUG_ON(sync_blocks < (PAGE_SIZE>>9));
 			if ((len >> 9) > sync_blocks)
 				len = sync_blocks<<9;
 		}
