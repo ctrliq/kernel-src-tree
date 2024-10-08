@@ -1532,9 +1532,8 @@ static noinline int link_to_fixup_dir(struct btrfs_trans_handle *trans,
  */
 static noinline int insert_one_name(struct btrfs_trans_handle *trans,
 				    struct btrfs_root *root,
-				    struct btrfs_path *path,
 				    u64 dirid, u64 index,
-				    char *name, int name_len, u8 type,
+				    char *name, int name_len,
 				    struct btrfs_key *location)
 {
 	struct inode *inode;
@@ -1708,8 +1707,8 @@ insert:
 		goto out;
 	}
 	btrfs_release_path(path);
-	ret = insert_one_name(trans, root, path, key->objectid, key->offset,
-			      name, name_len, log_type, &log_key);
+	ret = insert_one_name(trans, root, key->objectid, key->offset,
+			      name, name_len, &log_key);
 	if (ret && ret != -ENOENT && ret != -EEXIST)
 		goto out;
 	if (!ret)
@@ -2574,8 +2573,7 @@ static int update_log_root(struct btrfs_trans_handle *trans,
 	return ret;
 }
 
-static void wait_log_commit(struct btrfs_trans_handle *trans,
-			    struct btrfs_root *root, int transid)
+static void wait_log_commit(struct btrfs_root *root, int transid)
 {
 	DEFINE_WAIT(wait);
 	int index = transid % 2;
@@ -2600,8 +2598,7 @@ static void wait_log_commit(struct btrfs_trans_handle *trans,
 		 atomic_read(&root->log_commit[index]));
 }
 
-static void wait_for_writer(struct btrfs_trans_handle *trans,
-			    struct btrfs_root *root)
+static void wait_for_writer(struct btrfs_root *root)
 {
 	DEFINE_WAIT(wait);
 
@@ -2681,7 +2678,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 
 	index1 = log_transid % 2;
 	if (atomic_read(&root->log_commit[index1])) {
-		wait_log_commit(trans, root, log_transid);
+		wait_log_commit(root, log_transid);
 		mutex_unlock(&root->log_mutex);
 		return ctx->log_ret;
 	}
@@ -2690,7 +2687,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 
 	/* wait for previous tree log sync to complete */
 	if (atomic_read(&root->log_commit[(index1 + 1) % 2]))
-		wait_log_commit(trans, root, log_transid - 1);
+		wait_log_commit(root, log_transid - 1);
 
 	while (1) {
 		int batch = atomic_read(&root->log_batch);
@@ -2701,7 +2698,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 			schedule_timeout_uninterruptible(1);
 			mutex_lock(&root->log_mutex);
 		}
-		wait_for_writer(trans, root);
+		wait_for_writer(root);
 		if (batch == atomic_read(&root->log_batch))
 			break;
 	}
@@ -2798,7 +2795,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 		ret = btrfs_wait_marked_extents(log, &log->dirty_log_pages,
 						mark);
 		btrfs_wait_logged_extents(trans, log, log_transid);
-		wait_log_commit(trans, log_root_tree,
+		wait_log_commit(log_root_tree,
 				root_log_ctx.log_transid);
 		mutex_unlock(&log_root_tree->log_mutex);
 		if (!ret)
@@ -2809,11 +2806,11 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 	atomic_set(&log_root_tree->log_commit[index2], 1);
 
 	if (atomic_read(&log_root_tree->log_commit[(index2 + 1) % 2])) {
-		wait_log_commit(trans, log_root_tree,
+		wait_log_commit(log_root_tree,
 				root_log_ctx.log_transid - 1);
 	}
 
-	wait_for_writer(trans, log_root_tree);
+	wait_for_writer(log_root_tree);
 
 	/*
 	 * now that we've moved on to the tree of log tree roots,
