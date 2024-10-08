@@ -1,0 +1,140 @@
+net/mlx4_core: Set device configuration data to be persistent across reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_core: Set device configuration data to be persistent across reset (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 97.22%
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit dd0eefe3abbf47442db296bf68f27eb2860c1cdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dd0eefe3.failed
+
+When an HCA enters an internal error state, this is detected by the driver.
+The driver then should reset the HCA and restart the software stack.
+
+Keep ports information and some SRIOV configuration in a persistent area
+to have it valid across reset.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dd0eefe3abbf47442db296bf68f27eb2860c1cdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mlx4/device.h
+diff --cc include/linux/mlx4/device.h
+index 04d2bbb20a34,8c3837ac1a2d..000000000000
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@@ -728,8 -744,17 +728,20 @@@ struct mlx4_vf_dev 
+  	u8			n_ports;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx4_dev_persistent {
++ 	struct pci_dev	       *pdev;
++ 	struct mlx4_dev	       *dev;
++ 	int                     nvfs[MLX4_MAX_PORTS + 1];
++ 	int			num_vfs;
++ 	enum mlx4_port_type curr_port_type[MLX4_MAX_PORTS + 1];
++ 	enum mlx4_port_type curr_port_poss_type[MLX4_MAX_PORTS + 1];
++ };
++ 
+++>>>>>>> dd0eefe3abbf (net/mlx4_core: Set device configuration data to be persistent across reset)
+  struct mlx4_dev {
+ -	struct mlx4_dev_persistent *persist;
+ +	struct pci_dev	       *pdev;
+  	unsigned long		flags;
+  	unsigned long		num_slaves;
+  	struct mlx4_caps	caps;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/main.c b/drivers/net/ethernet/mellanox/mlx4/main.c
+index e21046536e8b..7b9eed593529 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -2843,17 +2843,33 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return ret;
+ }
+ 
++static void mlx4_clean_dev(struct mlx4_dev *dev)
++{
++	struct mlx4_dev_persistent *persist = dev->persist;
++	struct mlx4_priv *priv = mlx4_priv(dev);
++
++	memset(priv, 0, sizeof(*priv));
++	priv->dev.persist = persist;
++}
++
+ static void mlx4_unload_one(struct pci_dev *pdev)
+ {
+ 	struct mlx4_dev  *dev  = pci_get_drvdata(pdev);
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+ 	int               pci_dev_data;
+-	int p;
++	int p, i;
+ 	int active_vfs = 0;
+ 
+ 	if (priv->removed)
+ 		return;
+ 
++	/* saving current ports type for further use */
++	for (i = 0; i < dev->caps.num_ports; i++) {
++		dev->persist->curr_port_type[i] = dev->caps.port_type[i + 1];
++		dev->persist->curr_port_poss_type[i] = dev->caps.
++						       possible_type[i + 1];
++	}
++
+ 	pci_dev_data = priv->pci_dev_data;
+ 
+ 	/* Disabling SR-IOV is not allowed while there are active vf's */
+@@ -2924,7 +2940,7 @@ static void mlx4_unload_one(struct pci_dev *pdev)
+ 	kfree(dev->caps.qp1_proxy);
+ 	kfree(dev->dev_vfs);
+ 
+-	memset(priv, 0, sizeof(*priv));
++	mlx4_clean_dev(dev);
+ 	priv->pci_dev_data = pci_dev_data;
+ 	priv->removed = 1;
+ }
+@@ -2941,6 +2957,25 @@ static void mlx4_remove_one(struct pci_dev *pdev)
+ 	pci_set_drvdata(pdev, NULL);
+ }
+ 
++static int restore_current_port_types(struct mlx4_dev *dev,
++				      enum mlx4_port_type *types,
++				      enum mlx4_port_type *poss_types)
++{
++	struct mlx4_priv *priv = mlx4_priv(dev);
++	int err, i;
++
++	mlx4_stop_sense(dev);
++
++	mutex_lock(&priv->port_mutex);
++	for (i = 0; i < dev->caps.num_ports; i++)
++		dev->caps.possible_type[i + 1] = poss_types[i];
++	err = mlx4_change_port_types(dev, types);
++	mlx4_start_sense(dev);
++	mutex_unlock(&priv->port_mutex);
++
++	return err;
++}
++
+ int mlx4_restart_one(struct pci_dev *pdev)
+ {
+ 	struct mlx4_dev	 *dev  = pci_get_drvdata(pdev);
+@@ -2960,6 +2995,12 @@ int mlx4_restart_one(struct pci_dev *pdev)
+ 		return err;
+ 	}
+ 
++	err = restore_current_port_types(dev, dev->persist->curr_port_type,
++					 dev->persist->curr_port_poss_type);
++	if (err)
++		mlx4_err(dev, "could not restore original port types (%d)\n",
++			 err);
++
+ 	return err;
+ }
+ 
+* Unmerged path include/linux/mlx4/device.h
