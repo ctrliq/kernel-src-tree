@@ -1,0 +1,93 @@
+ext4: Fix fsync error handling after filesystem abort
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dmitry Monakhov <dmonakhov@openvz.org>
+commit 4418e14112e3ca85e8492a4489a3552b0cc526a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4418e141.failed
+
+If filesystem was aborted after inode's write back is complete
+but before its metadata was updated we may return success
+results in data loss.
+In order to handle fs abort correctly we have to check
+fs state once we discover that it is in MS_RDONLY state
+
+Test case: http://patchwork.ozlabs.org/patch/244297
+
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dmitry Monakhov <dmonakhov@openvz.org>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit 4418e14112e3ca85e8492a4489a3552b0cc526a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/fsync.c
+diff --cc fs/ext4/fsync.c
+index e0ba8a408def,a8bc47f75fa0..000000000000
+--- a/fs/ext4/fsync.c
++++ b/fs/ext4/fsync.c
+@@@ -124,20 -98,16 +124,29 @@@ int ext4_sync_file(struct file *file, l
+  
+  	trace_ext4_sync_file_enter(file, datasync);
+  
+++<<<<<<< HEAD
+ +	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+ +	if (ret)
+ +		return ret;
+ +	mutex_lock(&inode->i_mutex);
+ +
+ +	if (inode->i_sb->s_flags & MS_RDONLY)
+++=======
++ 	if (inode->i_sb->s_flags & MS_RDONLY) {
++ 		/* Make sure that we read updated s_mount_flags value */
++ 		smp_rmb();
++ 		if (EXT4_SB(inode->i_sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
++ 			ret = -EROFS;
+++>>>>>>> 4418e14112e3 (ext4: Fix fsync error handling after filesystem abort)
+  		goto out;
++ 	}
+  
+ +	ret = ext4_flush_unwritten_io(inode);
+ +	if (ret < 0)
+ +		goto out;
+ +
+  	if (!journal) {
+ -		ret = generic_file_fsync(file, start, end, datasync);
+ +		ret = __sync_inode(inode, datasync);
+  		if (!ret && !hlist_empty(&inode->i_dentry))
+  			ret = ext4_sync_parent(inode);
+  		goto out;
+* Unmerged path fs/ext4/fsync.c
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 94cc84db7c9a..be3391fe0473 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -398,6 +398,11 @@ static void ext4_handle_error(struct super_block *sb)
+ 	}
+ 	if (test_opt(sb, ERRORS_RO)) {
+ 		ext4_msg(sb, KERN_CRIT, "Remounting filesystem read-only");
++		/*
++		 * Make sure updated value of ->s_mount_flags will be visible
++		 * before ->s_flags update
++		 */
++		smp_wmb();
+ 		sb->s_flags |= MS_RDONLY;
+ 	}
+ 	if (test_opt(sb, ERRORS_PANIC))
+@@ -570,8 +575,13 @@ void __ext4_abort(struct super_block *sb, const char *function,
+ 
+ 	if ((sb->s_flags & MS_RDONLY) == 0) {
+ 		ext4_msg(sb, KERN_CRIT, "Remounting filesystem read-only");
+-		sb->s_flags |= MS_RDONLY;
+ 		EXT4_SB(sb)->s_mount_flags |= EXT4_MF_FS_ABORTED;
++		/*
++		 * Make sure updated value of ->s_mount_flags will be visible
++		 * before ->s_flags update
++		 */
++		smp_wmb();
++		sb->s_flags |= MS_RDONLY;
+ 		if (EXT4_SB(sb)->s_journal)
+ 			jbd2_journal_abort(EXT4_SB(sb)->s_journal, -EIO);
+ 		save_error_info(sb, function, line);
