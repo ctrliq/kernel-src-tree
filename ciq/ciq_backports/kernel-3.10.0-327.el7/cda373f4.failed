@@ -1,0 +1,105 @@
+net/mlx4_en: Enable TX rate limit per VF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Enable TX rate limit per VF (Amir Vadai) [1164527 1164530 1164531 1164536 1164537]
+Rebuild_FUZZ: 94.74%
+commit-author Ido Shamay <idos@mellanox.com>
+commit cda373f4849d5dd6fedceb4aeba35682a0e1a833
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cda373f4.failed
+
+Support granular QoS per VF, by implementing the ndo_set_vf_rate.
+
+Enforce a rate limit per VF when called, and enabled only for VFs in
+VST mode with user priority supported by the device.
+
+We don't enforce VFs to be in VST mode at the moment of configuration,
+but rather save the given rate limit and enforce it when the VF is
+moved to VST with user priority which is supported (currently 0).
+
+VST<->VGT or VST qos value state changes are disallowed when a rate
+limit is configured. Minimum BW share is not supported yet.
+
+	Signed-off-by: Ido Shamay <idos@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cda373f4849d5dd6fedceb4aeba35682a0e1a833)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/cmd.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/cmd.c
+index 50870bc73db8,bc6e4c9b6bb5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@@ -2677,11 -3079,17 +2847,25 @@@ int mlx4_get_vf_config(struct mlx4_dev 
+  	ivf->mac[4] = ((s_info->mac >> (1*8)) & 0xff);
+  	ivf->mac[5] = ((s_info->mac)  & 0xff);
+  
+++<<<<<<< HEAD
+ +	ivf->vlan	= s_info->default_vlan;
+ +	ivf->qos	= s_info->default_qos;
+ +	ivf->tx_rate	= s_info->tx_rate;
+ +	ivf->spoofchk	= s_info->spoofchk;
+ +	ivf->linkstate	= s_info->link_state;
+++=======
++ 	ivf->vlan		= s_info->default_vlan;
++ 	ivf->qos		= s_info->default_qos;
++ 
++ 	if (mlx4_is_vf_vst_and_prio_qos(dev, port, s_info))
++ 		ivf->max_tx_rate = s_info->tx_rate;
++ 	else
++ 		ivf->max_tx_rate = 0;
++ 
++ 	ivf->min_tx_rate	= 0;
++ 	ivf->spoofchk		= s_info->spoofchk;
++ 	ivf->linkstate		= s_info->link_state;
+++>>>>>>> cda373f4849d (net/mlx4_en: Enable TX rate limit per VF)
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/cmd.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 9a988b45c844..188f9e44c35a 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -2240,6 +2240,16 @@ static int mlx4_en_set_vf_vlan(struct net_device *dev, int vf, u16 vlan, u8 qos)
+ 	return mlx4_set_vf_vlan(mdev->dev, en_priv->port, vf, vlan, qos);
+ }
+ 
++static int mlx4_en_set_vf_rate(struct net_device *dev, int vf, int min_tx_rate,
++			       int max_tx_rate)
++{
++	struct mlx4_en_priv *en_priv = netdev_priv(dev);
++	struct mlx4_en_dev *mdev = en_priv->mdev;
++
++	return mlx4_set_vf_rate(mdev->dev, en_priv->port, vf, min_tx_rate,
++				max_tx_rate);
++}
++
+ static int mlx4_en_set_vf_spoofchk(struct net_device *dev, int vf, bool setting)
+ {
+ 	struct mlx4_en_priv *en_priv = netdev_priv(dev);
+@@ -2427,6 +2437,7 @@ static const struct net_device_ops mlx4_netdev_ops_master = {
+ 	.ndo_vlan_rx_kill_vid	= mlx4_en_vlan_rx_kill_vid,
+ 	.ndo_set_vf_mac		= mlx4_en_set_vf_mac,
+ 	.ndo_set_vf_vlan	= mlx4_en_set_vf_vlan,
++	.ndo_set_vf_rate	= mlx4_en_set_vf_rate,
+ 	.ndo_set_vf_spoofchk	= mlx4_en_set_vf_spoofchk,
+ 	.ndo_set_vf_link_state	= mlx4_en_set_vf_link_state,
+ 	.ndo_get_vf_config	= mlx4_en_get_vf_config,
+diff --git a/include/linux/mlx4/cmd.h b/include/linux/mlx4/cmd.h
+index 0aa19a3dabb9..3e98f46546cf 100644
+--- a/include/linux/mlx4/cmd.h
++++ b/include/linux/mlx4/cmd.h
+@@ -282,6 +282,8 @@ void mlx4_free_cmd_mailbox(struct mlx4_dev *dev, struct mlx4_cmd_mailbox *mailbo
+ u32 mlx4_comm_get_version(void);
+ int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac);
+ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos);
++int mlx4_set_vf_rate(struct mlx4_dev *dev, int port, int vf, int min_tx_rate,
++		     int max_tx_rate);
+ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting);
+ int mlx4_get_vf_config(struct mlx4_dev *dev, int port, int vf, struct ifla_vf_info *ivf);
+ int mlx4_set_vf_link_state(struct mlx4_dev *dev, int port, int vf, int link_state);
