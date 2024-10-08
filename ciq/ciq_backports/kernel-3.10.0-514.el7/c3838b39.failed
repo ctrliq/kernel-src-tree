@@ -1,0 +1,254 @@
+staging/rdma/hfi1: Fetch platform configuration data from EFI variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Fetch platform configuration data from EFI variable (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 93.94%
+commit-author Easwar Hariharan <easwar.hariharan@intel.com>
+commit c3838b396b425b4242bfe627bfabefc4c1af56f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c3838b39.failed
+
+The platform configuration data has been moved into the EFI variable
+store where it is populated by the HFI1 option ROM. This patch pulls
+the configuration data from the new location, retaining a fallback to
+request_firmware.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c3838b396b425b4242bfe627bfabefc4c1af56f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/platform_config.h
+#	drivers/staging/rdma/hfi1/platform.c
+diff --cc drivers/staging/hfi1/platform_config.h
+index 8a94a8342052,cc280cca9b9c..000000000000
+--- a/drivers/staging/hfi1/platform_config.h
++++ b/drivers/staging/hfi1/platform_config.h
+@@@ -283,4 -292,16 +288,20 @@@ enum platform_config_local_max_timeout_
+  	LOCAL_MAX_TIMEOUT_1000_S
+  };
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/platform_config.h
+ +#endif			/*__PLATFORM_CONFIG_H*/
+++=======
++ enum link_tuning_encoding {
++ 	OPA_PASSIVE_TUNING,
++ 	OPA_ACTIVE_TUNING,
++ 	OPA_UNKNOWN_TUNING
++ };
++ 
++ /* platform.c */
++ void get_platform_config(struct hfi1_devdata *dd);
++ void free_platform_config(struct hfi1_devdata *dd);
++ int set_qsfp_tx(struct hfi1_pportdata *ppd, int on);
++ void tune_serdes(struct hfi1_pportdata *ppd);
++ 
++ #endif			/*__PLATFORM_H*/
+++>>>>>>> c3838b396b42 (staging/rdma/hfi1: Fetch platform configuration data from EFI variable):drivers/staging/rdma/hfi1/platform.h
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
+diff --git a/drivers/staging/hfi1/chip.c b/drivers/staging/hfi1/chip.c
+index d32acbf2c0fb..51e42b5f5576 100644
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@ -14151,6 +14151,9 @@ struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto bail_cleanup;
+ 
++	/* Needs to be called before hfi1_firmware_init */
++	get_platform_config(dd);
++
+ 	/* read in firmware */
+ 	ret = hfi1_firmware_init(dd);
+ 	if (ret)
+diff --git a/drivers/staging/hfi1/chip.h b/drivers/staging/hfi1/chip.h
+index e9dd145941a9..c0da5c20b329 100644
+--- a/drivers/staging/hfi1/chip.h
++++ b/drivers/staging/hfi1/chip.h
+@@ -614,6 +614,8 @@ u64 create_pbc(struct hfi1_pportdata *ppd, u64, int, u32, u32);
+ #define NUM_PCIE_SERDES 16	/* number of PCIe serdes on the SBus */
+ extern const u8 pcie_serdes_broadcast[];
+ extern const u8 pcie_pcs_addrs[2][NUM_PCIE_SERDES];
++extern uint platform_config_load;
++
+ /* SBus commands */
+ #define RESET_SBUS_RECEIVER 0x20
+ #define WRITE_SBUS_RECEIVER 0x21
+diff --git a/drivers/staging/hfi1/firmware.c b/drivers/staging/hfi1/firmware.c
+index 0b23e3eaf574..d2ec6c5f18ac 100644
+--- a/drivers/staging/hfi1/firmware.c
++++ b/drivers/staging/hfi1/firmware.c
+@@ -77,7 +77,13 @@ static uint fw_8051_load = 1;
+ static uint fw_fabric_serdes_load = 1;
+ static uint fw_pcie_serdes_load = 1;
+ static uint fw_sbus_load = 1;
+-static uint platform_config_load = 1;
++
++/*
++ * Access required in platform.c
++ * Maintains state of whether the platform config was fetched via the
++ * fallback option
++ */
++uint platform_config_load;
+ 
+ /* Firmware file names get set in hfi1_firmware_init() based on the above */
+ static char *fw_8051_name;
+@@ -677,10 +683,15 @@ static int obtain_firmware(struct hfi1_devdata *dd)
+ 	}
+ 	/* not in FW_TRY state */
+ 
+-	if (fw_state == FW_FINAL)
++	if (fw_state == FW_FINAL) {
++		if (platform_config) {
++			dd->platform_config.data = platform_config->data;
++			dd->platform_config.size = platform_config->size;
++		}
+ 		goto done;	/* already acquired */
+-	else if (fw_state == FW_ERR)
++	} else if (fw_state == FW_ERR) {
+ 		goto done;	/* already tried and failed */
++	}
+ 	/* fw_state is FW_EMPTY */
+ 
+ 	/* set fw_state to FW_TRY, FW_FINAL, or FW_ERR, and fw_err */
+@@ -690,8 +701,14 @@ static int obtain_firmware(struct hfi1_devdata *dd)
+ 		platform_config = NULL;
+ 		err = request_firmware(&platform_config, platform_config_name,
+ 						&dd->pcidev->dev);
+-		if (err)
++		if (err) {
+ 			platform_config = NULL;
++			fw_state = FW_ERR;
++			fw_err = -ENOENT;
++			goto done;
++		}
++		dd->platform_config.data = platform_config->data;
++		dd->platform_config.size = platform_config->size;
+ 	}
+ 
+ done:
+@@ -1457,14 +1474,14 @@ int parse_platform_config(struct hfi1_devdata *dd)
+ {
+ 	struct platform_config_cache *pcfgcache = &dd->pcfg_cache;
+ 	u32 *ptr = NULL;
+-	u32 header1 = 0, header2 = 0, magic_num = 0, crc = 0;
++	u32 header1 = 0, header2 = 0, magic_num = 0, crc = 0, file_length = 0;
+ 	u32 record_idx = 0, table_type = 0, table_length_dwords = 0;
+ 
+-	if (platform_config == NULL) {
++	if (!dd->platform_config.data) {
+ 		dd_dev_info(dd, "%s: Missing config file\n", __func__);
+ 		goto bail;
+ 	}
+-	ptr = (u32 *)platform_config->data;
++	ptr = (u32 *)dd->platform_config.data;
+ 
+ 	magic_num = *ptr;
+ 	ptr++;
+@@ -1473,12 +1490,31 @@ int parse_platform_config(struct hfi1_devdata *dd)
+ 		goto bail;
+ 	}
+ 
+-	while (ptr < (u32 *)(platform_config->data + platform_config->size)) {
++	/* Field is file size in DWORDs */
++	file_length = (*ptr) * 4;
++	ptr++;
++
++	if (file_length > dd->platform_config.size) {
++		dd_dev_info(dd, "%s:File claims to be larger than read size\n",
++			    __func__);
++		goto bail;
++	} else if (file_length < dd->platform_config.size) {
++		dd_dev_info(dd, "%s:File claims to be smaller than read size\n",
++			    __func__);
++	}
++	/* exactly equal, perfection */
++
++	/*
++	 * In both cases where we proceed, using the self-reported file length
++	 * is the safer option
++	 */
++	while (ptr < (u32 *)(dd->platform_config.data + file_length)) {
+ 		header1 = *ptr;
+ 		header2 = *(ptr + 1);
+ 		if (header1 != ~header2) {
+ 			dd_dev_info(dd, "%s: Failed validation at offset %ld\n",
+-				__func__, (ptr - (u32 *)platform_config->data));
++				__func__, (ptr -
++					   (u32 *)dd->platform_config.data));
+ 			goto bail;
+ 		}
+ 
+@@ -1520,7 +1556,7 @@ int parse_platform_config(struct hfi1_devdata *dd)
+ 				dd_dev_info(dd,
+ 				      "%s: Unknown data table %d, offset %ld\n",
+ 					__func__, table_type,
+-				       (ptr - (u32 *)platform_config->data));
++				       (ptr - (u32 *)dd->platform_config.data));
+ 				goto bail; /* We don't trust this file now */
+ 			}
+ 			pcfgcache->config_tables[table_type].table = ptr;
+@@ -1541,9 +1577,10 @@ int parse_platform_config(struct hfi1_devdata *dd)
+ 				break;
+ 			default:
+ 				dd_dev_info(dd,
+-				  "%s: Unknown metadata table %d, offset %ld\n",
+-				  __func__, table_type,
+-				  (ptr - (u32 *)platform_config->data));
++					    "%s: Unknown meta table %d, offset %ld\n",
++					    __func__, table_type,
++					    (ptr -
++					     (u32 *)dd->platform_config.data));
+ 				goto bail; /* We don't trust this file now */
+ 			}
+ 			pcfgcache->config_tables[table_type].table_metadata =
+@@ -1559,7 +1596,9 @@ int parse_platform_config(struct hfi1_devdata *dd)
+ 		ptr += table_length_dwords;
+ 		if (crc != *ptr) {
+ 			dd_dev_info(dd, "%s: Failed CRC check at offset %ld\n",
+-				__func__, (ptr - (u32 *)platform_config->data));
++				    __func__, (ptr -
++					       (u32 *)
++					       dd->platform_config.data));
+ 			goto bail;
+ 		}
+ 		/* Jump the CRC DWORD */
+@@ -1675,7 +1714,7 @@ int get_platform_config_field(struct hfi1_devdata *dd,
+ 		}
+ 		break;
+ 	case PLATFORM_CONFIG_PORT_TABLE:
+-		/* Port table is 4 DWORDS in META_VERSION 0 */
++		/* Port table is 4 DWORDS */
+ 		src_ptr = dd->hfi1_id ?
+ 			pcfgcache->config_tables[table_type].table + 4 :
+ 			pcfgcache->config_tables[table_type].table;
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 5b1e71911aff..9a8bd8d4246c 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -1016,6 +1016,7 @@ struct hfi1_devdata {
+ 	u16 irev;	/* implementation revision */
+ 	u16 dc8051_ver; /* 8051 firmware version */
+ 
++	struct platform_config platform_config;
+ 	struct platform_config_cache pcfg_cache;
+ 	/* control high-level access to qsfp */
+ 	struct mutex qsfp_i2c_mutex;
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index c64c8dd680db..a8f92581ac5e 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -986,6 +986,7 @@ void hfi1_free_devdata(struct hfi1_devdata *dd)
+ 	idr_remove(&hfi1_unit_table, dd->unit);
+ 	list_del(&dd->list);
+ 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	free_platform_config(dd);
+ 	hfi1_dbg_ibdev_exit(&dd->verbs_dev);
+ 	rcu_barrier(); /* wait for rcu callbacks to complete */
+ 	free_percpu(dd->int_counter);
+* Unmerged path drivers/staging/hfi1/platform_config.h
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
