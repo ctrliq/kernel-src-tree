@@ -1466,7 +1466,9 @@ static int btrfs_remount(struct super_block *sb, int *flags, char *data)
 			goto restore;
 
 		/* recover relocation */
+		mutex_lock(&fs_info->cleaner_mutex);
 		ret = btrfs_recover_relocation(root);
+		mutex_unlock(&fs_info->cleaner_mutex);
 		if (ret)
 			goto restore;
 
