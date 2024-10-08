@@ -1,0 +1,200 @@
+xfs: factor out a xfs_update_prealloc_flags() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8add71ca3fd67c5f222622711f95cfd6cec2a996
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8add71ca.failed
+
+This logic is duplicated in xfs_file_fallocate and xfs_ioc_space, and
+we'll need another copy of it for pNFS block support.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 8add71ca3fd67c5f222622711f95cfd6cec2a996)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,712d312d8e3e..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -864,7 -835,31 +900,9 @@@ xfs_file_fallocate
+  		error = xfs_free_file_space(ip, offset, len);
+  		if (error)
+  			goto out_unlock;
+ -	} else if (mode & FALLOC_FL_COLLAPSE_RANGE) {
+ -		unsigned blksize_mask = (1 << inode->i_blkbits) - 1;
+ -
+ -		if (offset & blksize_mask || len & blksize_mask) {
+ -			error = -EINVAL;
+ -			goto out_unlock;
+ -		}
+ -
+ -		/*
+ -		 * There is no need to overlap collapse range with EOF,
+ -		 * in which case it is effectively a truncate operation
+ -		 */
+ -		if (offset + len >= i_size_read(inode)) {
+ -			error = -EINVAL;
+ -			goto out_unlock;
+ -		}
+ -
+ -		new_size = i_size_read(inode) - len;
+ -
+ -		error = xfs_collapse_file_space(ip, offset, len);
+ -		if (error)
+ -			goto out_unlock;
+  	} else {
++ 		flags |= XFS_PREALLOC_SET;
++ 
+  		if (!(mode & FALLOC_FL_KEEP_SIZE) &&
+  		    offset + len > i_size_read(inode)) {
+  			new_size = offset + len;
+@@@ -879,28 -877,10 +917,32 @@@
+  			goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	tp = xfs_trans_alloc(ip->i_mount, XFS_TRANS_WRITEID);
+ +	error = xfs_trans_reserve(tp, &M_RES(ip->i_mount)->tr_writeid, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		goto out_unlock;
+ +	}
+ +
+ +	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ +	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+ +	ip->i_d.di_mode &= ~S_ISUID;
+ +	if (ip->i_d.di_mode & S_IXGRP)
+ +		ip->i_d.di_mode &= ~S_ISGID;
+ +
+ +	if (!(mode & FALLOC_FL_PUNCH_HOLE))
+ +		ip->i_d.di_flags |= XFS_DIFLAG_PREALLOC;
+ +
+ +	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ +	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ +
+++=======
+++>>>>>>> 8add71ca3fd6 (xfs: factor out a xfs_update_prealloc_flags() helper)
+  	if (file->f_flags & O_DSYNC)
+- 		xfs_trans_set_sync(tp);
+- 	error = xfs_trans_commit(tp, 0);
++ 		flags |= XFS_PREALLOC_SYNC;
++ 
++ 	error = xfs_update_prealloc_flags(ip, flags);
+  	if (error)
+  		goto out_unlock;
+  
+diff --cc fs/xfs/xfs_ioctl.c
+index c6e180d60c21,d58bcd28f5f8..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -651,17 -616,22 +648,22 @@@ xfs_ioc_space
+  	 */
+  	if (!xfs_sb_version_hasextflgbit(&ip->i_mount->m_sb) &&
+  	    !capable(CAP_SYS_ADMIN))
+ -		return -EPERM;
+ +		return -XFS_ERROR(EPERM);
+  
+  	if (inode->i_flags & (S_IMMUTABLE|S_APPEND))
+ -		return -EPERM;
+ +		return -XFS_ERROR(EPERM);
+  
+  	if (!(filp->f_mode & FMODE_WRITE))
+ -		return -EBADF;
+ +		return -XFS_ERROR(EBADF);
+  
+  	if (!S_ISREG(inode->i_mode))
+ -		return -EINVAL;
+ +		return -XFS_ERROR(EINVAL);
+  
++ 	if (filp->f_flags & O_DSYNC)
++ 		flags |= XFS_PREALLOC_SYNC;
++ 	if (ioflags & XFS_IO_INVIS)	
++ 		flags |= XFS_PREALLOC_INVISIBLE;
++ 
+  	error = mnt_want_write_file(filp);
+  	if (error)
+  		return error;
+@@@ -705,10 -675,10 +707,15 @@@
+  	}
+  
+  	if (bf->l_start < 0 ||
+- 	    bf->l_start > mp->m_super->s_maxbytes ||
++ 	    bf->l_start > inode->i_sb->s_maxbytes ||
+  	    bf->l_start + bf->l_len < 0 ||
+++<<<<<<< HEAD
+ +	    bf->l_start + bf->l_len >= mp->m_super->s_maxbytes) {
+ +		error = XFS_ERROR(EINVAL);
+++=======
++ 	    bf->l_start + bf->l_len >= inode->i_sb->s_maxbytes) {
++ 		error = -EINVAL;
+++>>>>>>> 8add71ca3fd6 (xfs: factor out a xfs_update_prealloc_flags() helper)
+  		goto out_unlock;
+  	}
+  
+@@@ -755,32 -722,7 +759,36 @@@
+  	if (error)
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +	tp = xfs_trans_alloc(mp, XFS_TRANS_WRITEID);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_writeid, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		goto out_unlock;
+ +	}
+ +
+ +	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ +	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+ +
+ +	if (!(ioflags & IO_INVIS)) {
+ +		ip->i_d.di_mode &= ~S_ISUID;
+ +		if (ip->i_d.di_mode & S_IXGRP)
+ +			ip->i_d.di_mode &= ~S_ISGID;
+ +		xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ +	}
+ +
+ +	if (setprealloc)
+ +		ip->i_d.di_flags |= XFS_DIFLAG_PREALLOC;
+ +	else if (clrprealloc)
+ +		ip->i_d.di_flags &= ~XFS_DIFLAG_PREALLOC;
+ +
+ +	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ +	if (filp->f_flags & O_DSYNC)
+ +		xfs_trans_set_sync(tp);
+ +	error = xfs_trans_commit(tp, 0);
+++=======
++ 	error = xfs_update_prealloc_flags(ip, flags);
+++>>>>>>> 8add71ca3fd6 (xfs: factor out a xfs_update_prealloc_flags() helper)
+  
+  out_unlock:
+  	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 85531c2ab2b9..e646162f219a 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -382,6 +382,15 @@ int		xfs_bumplink(struct xfs_trans *, struct xfs_inode *);
+ void		xfs_bump_ino_vers2(struct xfs_trans *, struct xfs_inode *);
+ 
+ /* from xfs_file.c */
++enum xfs_prealloc_flags {
++	XFS_PREALLOC_SET	= (1 << 1),
++	XFS_PREALLOC_CLEAR	= (1 << 2),
++	XFS_PREALLOC_SYNC	= (1 << 3),
++	XFS_PREALLOC_INVISIBLE	= (1 << 4),
++};
++
++int		xfs_update_prealloc_flags(struct xfs_inode *,
++			enum xfs_prealloc_flags);
+ int		xfs_zero_eof(struct xfs_inode *, xfs_off_t, xfs_fsize_t);
+ int		xfs_iozero(struct xfs_inode *, loff_t, size_t);
+ 
+* Unmerged path fs/xfs/xfs_ioctl.c
