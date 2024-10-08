@@ -1,0 +1,122 @@
+nfs: take i_mutex during direct I/O reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit d0b9875d65c1abcc9d405d648660dfb919353959
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/d0b9875d.failed
+
+We'll need the i_mutex to prevent i_dio_count from incrementing while
+truncate is waiting for it to reach zero, and protects against having
+the pagecache repopulated after we flushed it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit d0b9875d65c1abcc9d405d648660dfb919353959)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+diff --cc fs/nfs/direct.c
+index bc6242aaa3e0,85e4e4be401a..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -460,17 -458,59 +460,38 @@@ static ssize_t nfs_direct_read_schedule
+  	return 0;
+  }
+  
+ -/**
+ - * nfs_file_direct_read - file direct read operation for NFS files
+ - * @iocb: target I/O control block
+ - * @iov: vector of user buffers into which to read data
+ - * @nr_segs: size of iov vector
+ - * @pos: byte offset in file where reading starts
+ - *
+ - * We use this function for direct reads instead of calling
+ - * generic_file_aio_read() in order to avoid gfar's check to see if
+ - * the request starts before the end of the file.  For that check
+ - * to work, we must generate a GETATTR before each direct read, and
+ - * even then there is a window between the GETATTR and the subsequent
+ - * READ where the file size could change.  Our preference is simply
+ - * to do all reads the application wants, and the server will take
+ - * care of managing the end of file boundary.
+ - *
+ - * This function also eliminates unnecessarily updating the file's
+ - * atime locally, as the NFS server sets the file's atime, and this
+ - * client must read the updated atime from the server back into its
+ - * cache.
+ - */
+ -ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
+ -				unsigned long nr_segs, loff_t pos, bool uio)
+ +static ssize_t nfs_direct_read(struct kiocb *iocb, const struct iovec *iov,
+ +			       unsigned long nr_segs, loff_t pos, bool uio)
+  {
+ -	struct file *file = iocb->ki_filp;
+ -	struct address_space *mapping = file->f_mapping;
+ -	struct inode *inode = mapping->host;
+ +	ssize_t result = -ENOMEM;
+ +	struct inode *inode = iocb->ki_filp->f_mapping->host;
+  	struct nfs_direct_req *dreq;
+  	struct nfs_lock_context *l_ctx;
+ -	ssize_t result = -EINVAL;
+ -	size_t count;
+  
+++<<<<<<< HEAD
+++=======
++ 	count = iov_length(iov, nr_segs);
++ 	nfs_add_stats(mapping->host, NFSIOS_DIRECTREADBYTES, count);
++ 
++ 	dfprintk(FILE, "NFS: direct read(%pD2, %zd@%Ld)\n",
++ 		file, count, (long long) pos);
++ 
++ 	result = 0;
++ 	if (!count)
++ 		goto out;
++ 
++ 	mutex_lock(&inode->i_mutex);
++ 	result = nfs_sync_mapping(mapping);
++ 	if (result)
++ 		goto out_unlock;
++ 
++ 	task_io_account_read(count);
++ 
++ 	result = -ENOMEM;
+++>>>>>>> d0b9875d65c1 (nfs: take i_mutex during direct I/O reads)
+  	dreq = nfs_direct_req_alloc();
+  	if (dreq == NULL)
+- 		goto out;
++ 		goto out_unlock;
+  
+  	dreq->inode = inode;
+  	dreq->bytes_left = iov_length(iov, nr_segs);
+@@@ -486,10 -526,22 +507,27 @@@
+  
+  	NFS_I(inode)->read_io += iov_length(iov, nr_segs);
+  	result = nfs_direct_read_schedule_iovec(dreq, iov, nr_segs, pos, uio);
+++<<<<<<< HEAD
+ +	if (!result)
+ +		result = nfs_direct_wait(dreq);
+++=======
++ 
++ 	mutex_unlock(&inode->i_mutex);
++ 
++ 	if (!result) {
++ 		result = nfs_direct_wait(dreq);
++ 		if (result > 0)
++ 			iocb->ki_pos = pos + result;
++ 	}
++ 
++ 	nfs_direct_req_release(dreq);
++ 	return result;
++ 
+++>>>>>>> d0b9875d65c1 (nfs: take i_mutex during direct I/O reads)
+  out_release:
+  	nfs_direct_req_release(dreq);
++ out_unlock:
++ 	mutex_unlock(&inode->i_mutex);
+  out:
+  	return result;
+  }
+* Unmerged path fs/nfs/direct.c
