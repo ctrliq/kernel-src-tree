@@ -1,0 +1,161 @@
+kvm hypervisor : Add a hypercall to KVM hypervisor to support pv-ticketlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [virt] kvm: Add a hypercall to KVM hypervisor to support pv-ticketlocks (Andrew Jones) [981581]
+Rebuild_FUZZ: 91.43%
+commit-author Srivatsa Vaddagiri <vatsa@linux.vnet.ibm.com>
+commit 6aef266c6e17b798a1740cf70cd34f90664740b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6aef266c.failed
+
+kvm_hc_kick_cpu allows the calling vcpu to kick another vcpu out of halt state.
+the presence of these hypercalls is indicated to guest via
+kvm_feature_pv_unhalt.
+
+Fold pv_unhalt flag into GET_MP_STATE ioctl to aid migration
+During migration, any vcpu that got kicked but did not become runnable
+(still in halted state) should be runnable after migration.
+
+	Signed-off-by: Srivatsa Vaddagiri <vatsa@linux.vnet.ibm.com>
+	Signed-off-by: Suzuki Poulose <suzuki@in.ibm.com>
+[Raghu: Apic related changes, folding pvunhalted into vcpu_runnable
+ Added flags for future use (suggested by Gleb)]
+[ Raghu: fold pv_unhalt flag as suggested by Eric Northup]
+	Signed-off-by: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Acked-by: Gleb Natapov <gleb@redhat.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Signed-off-by: Gleb Natapov <gleb@redhat.com>
+(cherry picked from commit 6aef266c6e17b798a1740cf70cd34f90664740b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 280e3271b027,c76ff74a98f2..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -511,6 -513,14 +511,17 @@@ struct kvm_vcpu_arch 
+  	 * instruction.
+  	 */
+  	bool write_fault_to_shadow_pgtable;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* set at EPT violation at this point */
++ 	unsigned long exit_qualification;
++ 
++ 	/* pv related host specific info */
++ 	struct {
++ 		bool pv_unhalted;
++ 	} pv;
+++>>>>>>> 6aef266c6e17 (kvm hypervisor : Add a hypercall to KVM hypervisor to support pv-ticketlocks)
+  };
+  
+  struct kvm_lpage_info {
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index a20ecb5b6cbf..b110fe6c03d4 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -413,7 +413,8 @@ static int do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
+ 			     (1 << KVM_FEATURE_CLOCKSOURCE2) |
+ 			     (1 << KVM_FEATURE_ASYNC_PF) |
+ 			     (1 << KVM_FEATURE_PV_EOI) |
+-			     (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT);
++			     (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) |
++			     (1 << KVM_FEATURE_PV_UNHALT);
+ 
+ 		if (sched_info_on())
+ 			entry->eax |= (1 << KVM_FEATURE_STEAL_TIME);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 851c9688d2c6..a3e9daf18796 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5519,6 +5519,36 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++/*
++ * kvm_pv_kick_cpu_op:  Kick a vcpu.
++ *
++ * @apicid - apicid of vcpu to be kicked.
++ */
++static void kvm_pv_kick_cpu_op(struct kvm *kvm, unsigned long flags, int apicid)
++{
++	struct kvm_vcpu *vcpu = NULL;
++	int i;
++
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		if (!kvm_apic_present(vcpu))
++			continue;
++
++		if (kvm_apic_match_dest(vcpu, 0, 0, apicid, 0))
++			break;
++	}
++	if (vcpu) {
++		/*
++		 * Setting unhalt flag here can result in spurious runnable
++		 * state when unhalt reset does not happen in vcpu_block.
++		 * But that is harmless since that should soon result in halt.
++		 */
++		vcpu->arch.pv.pv_unhalted = true;
++		/* We need everybody see unhalt before vcpu unblocks */
++		smp_wmb();
++		kvm_vcpu_kick(vcpu);
++	}
++}
++
+ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long nr, a0, a1, a2, a3, ret;
+@@ -5552,6 +5582,10 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 	case KVM_HC_VAPIC_POLL_IRQ:
+ 		ret = 0;
+ 		break;
++	case KVM_HC_KICK_CPU:
++		kvm_pv_kick_cpu_op(vcpu->kvm, a0, a1);
++		ret = 0;
++		break;
+ 	default:
+ 		ret = -KVM_ENOSYS;
+ 		break;
+@@ -5951,6 +5985,7 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 				kvm_apic_accept_events(vcpu);
+ 				switch(vcpu->arch.mp_state) {
+ 				case KVM_MP_STATE_HALTED:
++					vcpu->arch.pv.pv_unhalted = false;
+ 					vcpu->arch.mp_state =
+ 						KVM_MP_STATE_RUNNABLE;
+ 				case KVM_MP_STATE_RUNNABLE:
+@@ -6250,7 +6285,12 @@ int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
+ 				    struct kvm_mp_state *mp_state)
+ {
+ 	kvm_apic_accept_events(vcpu);
+-	mp_state->mp_state = vcpu->arch.mp_state;
++	if (vcpu->arch.mp_state == KVM_MP_STATE_HALTED &&
++					vcpu->arch.pv.pv_unhalted)
++		mp_state->mp_state = KVM_MP_STATE_RUNNABLE;
++	else
++		mp_state->mp_state = vcpu->arch.mp_state;
++
+ 	return 0;
+ }
+ 
+@@ -6771,6 +6811,7 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ 	BUG_ON(vcpu->kvm == NULL);
+ 	kvm = vcpu->kvm;
+ 
++	vcpu->arch.pv.pv_unhalted = false;
+ 	vcpu->arch.emulate_ctxt.ops = &emulate_ops;
+ 	if (!irqchip_in_kernel(kvm) || kvm_vcpu_is_bsp(vcpu))
+ 		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+@@ -7104,6 +7145,7 @@ int kvm_arch_vcpu_runnable(struct kvm_vcpu *vcpu)
+ 		!vcpu->arch.apf.halted)
+ 		|| !list_empty_careful(&vcpu->async_pf.done)
+ 		|| kvm_apic_has_events(vcpu)
++		|| vcpu->arch.pv.pv_unhalted
+ 		|| atomic_read(&vcpu->arch.nmi_queued) ||
+ 		(kvm_arch_interrupt_allowed(vcpu) &&
+ 		 kvm_cpu_has_interrupt(vcpu));
