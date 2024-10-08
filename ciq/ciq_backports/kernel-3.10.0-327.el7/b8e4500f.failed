@@ -1,0 +1,118 @@
+bonding: fix curr_active_slave/carrier with loadbalance arp monitoring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit b8e4500f42fe4464a33a887579147050bed8fcef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b8e4500f.failed
+
+Since commit 6fde8f037e60 ("bonding: fix locking in
+bond_loadbalance_arp_mon()") we can have a stale bond carrier state and
+stale curr_active_slave when using arp monitoring in loadbalance modes. The
+reason is that in bond_loadbalance_arp_mon() we can't have
+do_failover == true but slave_state_changed == false, whenever do_failover
+is true then slave_state_changed is also true. Then the following piece
+from bond_loadbalance_arp_mon():
+                if (slave_state_changed) {
+                        bond_slave_state_change(bond);
+                        if (BOND_MODE(bond) == BOND_MODE_XOR)
+                                bond_update_slave_arr(bond, NULL);
+                } else if (do_failover) {
+                        block_netpoll_tx();
+                        bond_select_active_slave(bond);
+                        unblock_netpoll_tx();
+                }
+
+will execute only the first branch, always and regardless of do_failover.
+Since these two events aren't related in such way, we need to decouple and
+consider them separately.
+
+For example this issue could lead to the following result:
+Bonding Mode: load balancing (round-robin)
+*MII Status: down*
+MII Polling Interval (ms): 0
+Up Delay (ms): 0
+Down Delay (ms): 0
+ARP Polling Interval (ms): 100
+ARP IP target/s (n.n.n.n form): 192.168.9.2
+
+Slave Interface: ens12
+*MII Status: up*
+Speed: 10000 Mbps
+Duplex: full
+Link Failure Count: 2
+Permanent HW addr: 00:0f:53:01:42:2c
+Slave queue ID: 0
+
+Slave Interface: eth1
+*MII Status: up*
+Speed: Unknown
+Duplex: Unknown
+Link Failure Count: 70
+Permanent HW addr: 52:54:00:2f:0f:8e
+Slave queue ID: 0
+
+Since some interfaces are up, then the status of the bond should also be
+up, but it will never change unless something invokes bond_set_carrier()
+(i.e. enslave, bond_select_active_slave etc). Now, if I force the
+calling of bond_select_active_slave via for example changing
+primary_reselect (it can change in any mode), then the MII status goes to
+"up" because it calls bond_select_active_slave() which should've been done
+from bond_loadbalance_arp_mon() itself.
+
+CC: Veaceslav Falico <vfalico@gmail.com>
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+CC: Ding Tianhong <dingtianhong@huawei.com>
+
+Fixes: 6fde8f037e60 ("bonding: fix locking in bond_loadbalance_arp_mon()")
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Acked-by: Veaceslav Falico <vfalico@gmail.com>
+	Acked-by: Andy Gospodarek <gospo@cumulusnetworks.com>
+	Acked-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b8e4500f42fe4464a33a887579147050bed8fcef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 723c3d160745,a5115fb7cf33..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2735,14 -2461,23 +2735,28 @@@ void bond_loadbalance_arp_mon(struct wo
+  			bond_arp_send_all(bond, slave);
+  	}
+  
+ -	rcu_read_unlock();
+ +	if (do_failover) {
+ +		block_netpoll_tx();
+ +		write_lock_bh(&bond->curr_slave_lock);
+  
+ -	if (do_failover || slave_state_changed) {
+ -		if (!rtnl_trylock())
+ -			goto re_arm;
+ +		bond_select_active_slave(bond);
+  
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		unblock_netpoll_tx();
+++=======
++ 		if (slave_state_changed) {
++ 			bond_slave_state_change(bond);
++ 			if (BOND_MODE(bond) == BOND_MODE_XOR)
++ 				bond_update_slave_arr(bond, NULL);
++ 		}
++ 		if (do_failover) {
++ 			block_netpoll_tx();
++ 			bond_select_active_slave(bond);
++ 			unblock_netpoll_tx();
++ 		}
++ 		rtnl_unlock();
+++>>>>>>> b8e4500f42fe (bonding: fix curr_active_slave/carrier with loadbalance arp monitoring)
+  	}
+  
+  re_arm:
+* Unmerged path drivers/net/bonding/bond_main.c
