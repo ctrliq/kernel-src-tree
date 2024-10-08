@@ -1,0 +1,510 @@
+mm: soft-dirty bits for user memory changes tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] soft-dirty bits for user memory changes tracking (Oleg Nesterov) [1269561]
+Rebuild_FUZZ: 96.00%
+commit-author Pavel Emelyanov <xemul@parallels.com>
+commit 0f8975ec4db2c8b5bd111b211292ca9be0feb6b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0f8975ec.failed
+
+The soft-dirty is a bit on a PTE which helps to track which pages a task
+writes to.  In order to do this tracking one should
+
+  1. Clear soft-dirty bits from PTEs ("echo 4 > /proc/PID/clear_refs)
+  2. Wait some time.
+  3. Read soft-dirty bits (55'th in /proc/PID/pagemap2 entries)
+
+To do this tracking, the writable bit is cleared from PTEs when the
+soft-dirty bit is.  Thus, after this, when the task tries to modify a
+page at some virtual address the #PF occurs and the kernel sets the
+soft-dirty bit on the respective PTE.
+
+Note, that although all the task's address space is marked as r/o after
+the soft-dirty bits clear, the #PF-s that occur after that are processed
+fast.  This is so, since the pages are still mapped to physical memory,
+and thus all the kernel does is finds this fact out and puts back
+writable, dirty and soft-dirty bits on the PTE.
+
+Another thing to note, is that when mremap moves PTEs they are marked
+with soft-dirty as well, since from the user perspective mremap modifies
+the virtual memory at mremap's new address.
+
+	Signed-off-by: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Matt Mackall <mpm@selenic.com>
+	Cc: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+	Cc: Glauber Costa <glommer@parallels.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@gmail.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0f8975ec4db2c8b5bd111b211292ca9be0feb6b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	fs/proc/task_mmu.c
+#	mm/Kconfig
+#	mm/huge_memory.c
+diff --cc arch/x86/Kconfig
+index 3fae2a63357c,10764a3d62cc..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -103,9 -102,10 +103,14 @@@ config X8
+  	select HAVE_ARCH_SECCOMP_FILTER
+  	select BUILDTIME_EXTABLE_SORT
+  	select GENERIC_CMOS_UPDATE
+++<<<<<<< HEAD
+++=======
++ 	select HAVE_ARCH_SOFT_DIRTY
++ 	select CLOCKSOURCE_WATCHDOG
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  	select GENERIC_CLOCKEVENTS
+  	select ARCH_CLOCKSOURCE_DATA if X86_64
+ +	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
+  	select GENERIC_CLOCKEVENTS_BROADCAST if X86_64 || (X86_32 && X86_LOCAL_APIC)
+  	select GENERIC_TIME_VSYSCALL if X86_64
+  	select KTIME_SCALAR if X86_32
+diff --cc fs/proc/task_mmu.c
+index 452c618feb42,a18e065c1c3e..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -826,10 -851,13 +856,11 @@@ struct pagemapread 
+  #define PM_PSHIFT_BITS      6
+  #define PM_PSHIFT_OFFSET    (PM_STATUS_OFFSET - PM_PSHIFT_BITS)
+  #define PM_PSHIFT_MASK      (((1LL << PM_PSHIFT_BITS) - 1) << PM_PSHIFT_OFFSET)
+ -#define __PM_PSHIFT(x)      (((u64) (x) << PM_PSHIFT_OFFSET) & PM_PSHIFT_MASK)
+ +#define PM_PSHIFT(x)        (((u64) (x) << PM_PSHIFT_OFFSET) & PM_PSHIFT_MASK)
+  #define PM_PFRAME_MASK      ((1LL << PM_PSHIFT_OFFSET) - 1)
+  #define PM_PFRAME(x)        ((x) & PM_PFRAME_MASK)
+ -/* in "new" pagemap pshift bits are occupied with more status bits */
+ -#define PM_STATUS2(v2, x)   (__PM_PSHIFT(v2 ? x : PAGE_SHIFT))
+  
++ #define __PM_SOFT_DIRTY      (1LL)
+  #define PM_PRESENT          PM_STATUS(4LL)
+  #define PM_SWAP             PM_STATUS(2LL)
+  #define PM_FILE             PM_STATUS(1LL)
+@@@ -891,13 -920,15 +923,24 @@@ static void pte_to_pagemap_entry(pagema
+  
+  	if (page && !PageAnon(page))
+  		flags |= PM_FILE;
++ 	if (pte_soft_dirty(pte))
++ 		flags2 |= __PM_SOFT_DIRTY;
+  
+++<<<<<<< HEAD
+ +	*pme = make_pme(PM_PFRAME(frame) | PM_PSHIFT(PAGE_SHIFT) | flags);
+ +}
+ +
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +static void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme,
+ +					pmd_t pmd, int offset)
+++=======
++ 	*pme = make_pme(PM_PFRAME(frame) | PM_STATUS2(pm->v2, flags2) | flags);
++ }
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ static void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
++ 		pmd_t pmd, int offset, int pmd_flags2)
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  {
+  	/*
+  	 * Currently pmd for thp is always present because thp can not be
+@@@ -906,13 -937,13 +949,22 @@@
+  	 */
+  	if (pmd_present(pmd))
+  		*pme = make_pme(PM_PFRAME(pmd_pfn(pmd) + offset)
+++<<<<<<< HEAD
+ +				| PM_PSHIFT(PAGE_SHIFT) | PM_PRESENT);
+++=======
++ 				| PM_STATUS2(pm->v2, pmd_flags2) | PM_PRESENT);
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  	else
+ -		*pme = make_pme(PM_NOT_PRESENT(pm->v2));
+ +		*pme = make_pme(PM_NOT_PRESENT);
+  }
+  #else
+++<<<<<<< HEAD
+ +static inline void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme,
+ +						pmd_t pmd, int offset)
+++=======
++ static inline void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
++ 		pmd_t pmd, int offset, int pmd_flags2)
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  {
+  }
+  #endif
+@@@ -929,13 -959,16 +981,24 @@@ static int pagemap_pte_range(pmd_t *pmd
+  
+  	/* find the first VMA at or above 'addr' */
+  	vma = find_vma(walk->mm, addr);
+++<<<<<<< HEAD
+ +	if (vma && pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+++=======
++ 	if (vma && pmd_trans_huge_lock(pmd, vma) == 1) {
++ 		int pmd_flags2;
++ 
++ 		pmd_flags2 = (pmd_soft_dirty(*pmd) ? __PM_SOFT_DIRTY : 0);
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  		for (; addr != end; addr += PAGE_SIZE) {
+  			unsigned long offset;
+  
+  			offset = (addr & ~PAGEMAP_WALK_MASK) >>
+  					PAGE_SHIFT;
+++<<<<<<< HEAD
+ +			thp_pmd_to_pagemap_entry(&pme, *pmd, offset);
+++=======
++ 			thp_pmd_to_pagemap_entry(&pme, pm, *pmd, offset, pmd_flags2);
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  			err = add_to_pagemap(addr, &pme, pm);
+  			if (err)
+  				break;
+diff --cc mm/Kconfig
+index 88ac087b6ee9,7e28ecfa8aa4..000000000000
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@@ -487,88 -478,14 +487,102 @@@ config FRONTSWA
+  
+  	  If unsure, say Y to enable frontswap.
+  
+++<<<<<<< HEAD
+ +config CMA
+ +	bool "Contiguous Memory Allocator"
+ +	depends on HAVE_MEMBLOCK
+ +	select MIGRATION
+ +	select MEMORY_ISOLATION
+ +	help
+ +	  This enables the Contiguous Memory Allocator which allows other
+ +	  subsystems to allocate big physically-contiguous blocks of memory.
+ +	  CMA reserves a region of memory and allows only movable pages to
+ +	  be allocated from it. This way, the kernel can use the memory for
+ +	  pagecache and when a subsystem requests for contiguous area, the
+ +	  allocated pages are migrated away to serve the contiguous request.
+ +
+ +	  If unsure, say "n".
+ +
+ +config CMA_DEBUG
+ +	bool "CMA debug messages (DEVELOPMENT)"
+ +	depends on DEBUG_KERNEL && CMA
+ +	help
+ +	  Turns on debug messages in CMA.  This produces KERN_DEBUG
+ +	  messages for every CMA call as well as various messages while
+ +	  processing calls such as dma_alloc_from_contiguous().
+ +	  This option does not affect warning and error messages.
+ +
+ +config ZSWAP
+ +	bool "Compressed cache for swap pages (EXPERIMENTAL)"
+ +	depends on FRONTSWAP && CRYPTO=y
+ +	select CRYPTO_LZO
+ +	select ZPOOL
+ +	default n
+ +	help
+ +	  A lightweight compressed cache for swap pages.  It takes
+ +	  pages that are in the process of being swapped out and attempts to
+ +	  compress them into a dynamically allocated RAM-based memory pool.
+ +	  This can result in a significant I/O reduction on swap device and,
+ +	  in the case where decompressing from RAM is faster that swap device
+ +	  reads, can also improve workload performance.
+ +
+ +	  This is marked experimental because it is a new feature (as of
+ +	  v3.11) that interacts heavily with memory reclaim.  While these
+ +	  interactions don't cause any known issues on simple memory setups,
+ +	  they have not be fully explored on the large set of potential
+ +	  configurations and workloads that exist.
+ +
+ +config ZPOOL
+ +	tristate "Common API for compressed memory storage"
+ +	default n
+ +	help
+ +	  Compressed memory storage API.  This allows using either zbud or
+ +	  zsmalloc.
+ +
+ +config ZBUD
+ +	tristate "Low density storage for compressed pages"
+ +	default n
+ +	help
+ +	  A special purpose allocator for storing compressed pages.
+ +	  It is designed to store up to two compressed pages per physical
+ +	  page.  While this design limits storage density, it has simple and
+ +	  deterministic reclaim properties that make it preferable to a higher
+ +	  density approach when reclaim will be used.
+ +
+ +config ZSMALLOC
+ +	tristate "Memory allocator for compressed pages"
+ +	depends on MMU
+ +	default n
+ +	help
+ +	  zsmalloc is a slab-based memory allocator designed to store
+ +	  compressed RAM pages.  zsmalloc uses virtual memory mapping
+ +	  in order to reduce fragmentation.  However, this results in a
+ +	  non-standard allocator interface where a handle, not a pointer, is
+ +	  returned by an alloc().  This handle must be mapped in order to
+ +	  access the allocated space.
+ +
+ +config PGTABLE_MAPPING
+ +	bool "Use page table mapping to access object in zsmalloc"
+ +	depends on ZSMALLOC
+ +	help
+ +	  By default, zsmalloc uses a copy-based object mapping method to
+ +	  access allocations that span two pages. However, if a particular
+ +	  architecture (ex, ARM) performs VM mapping faster than copying,
+ +	  then you should select this. This causes zsmalloc to use page table
+ +	  mapping rather than copying for object mapping.
+ +
+ +	  You can check speed with zsmalloc benchmark:
+ +	  https://github.com/spartacus06/zsmapbench
+++=======
++ config MEM_SOFT_DIRTY
++ 	bool "Track memory changes"
++ 	depends on CHECKPOINT_RESTORE && HAVE_ARCH_SOFT_DIRTY
++ 	select PROC_PAGE_MONITOR
++ 	help
++ 	  This option enables memory changes tracking by introducing a
++ 	  soft-dirty bit on pte-s. This bit it set when someone writes
++ 	  into a page just as regular dirty bit, but unlike the latter
++ 	  it can be cleared by hands.
++ 
++ 	  See Documentation/vm/soft-dirty.txt for more details.
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+diff --cc mm/huge_memory.c
+index 2a21259fd617,d8b3b850150c..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1521,26 -1425,12 +1521,31 @@@ int move_huge_pmd(struct vm_area_struc
+  		goto out;
+  	}
+  
+ -	ret = __pmd_trans_huge_lock(old_pmd, vma);
+ +	/*
+ +	 * We don't have to worry about the ordering of src and dst
+ +	 * ptlocks because exclusive mmap_sem prevents deadlock.
+ +	 */
+ +	ret = __pmd_trans_huge_lock(old_pmd, vma, &old_ptl);
+  	if (ret == 1) {
+ +		new_ptl = pmd_lockptr(mm, new_pmd);
+ +		if (new_ptl != old_ptl)
+ +			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
+  		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+  		VM_BUG_ON(!pmd_none(*new_pmd));
+++<<<<<<< HEAD
+ +		if (pmd_move_must_withdraw(new_ptl, old_ptl)) {
+ +			pgtable_t pgtable;
+ +			pgtable = pgtable_trans_huge_withdraw(mm, old_pmd);
+ +			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
+ +		}
+ +		set_pmd_at(mm, new_addr, new_pmd, pmd);
+ +		if (new_ptl != old_ptl)
+ +			spin_unlock(new_ptl);
+ +		spin_unlock(old_ptl);
+++=======
++ 		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
++ 		spin_unlock(&mm->page_table_lock);
+++>>>>>>> 0f8975ec4db2 (mm: soft-dirty bits for user memory changes tracking)
+  	}
+  out:
+  	return ret;
+diff --git a/Documentation/filesystems/proc.txt b/Documentation/filesystems/proc.txt
+index e28c50a10fbc..639debf2565a 100644
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -475,7 +475,8 @@ This file is only present if the CONFIG_MMU kernel configuration option is
+ enabled.
+ 
+ The /proc/PID/clear_refs is used to reset the PG_Referenced and ACCESSED/YOUNG
+-bits on both physical and virtual pages associated with a process.
++bits on both physical and virtual pages associated with a process, and the
++soft-dirty bit on pte (see Documentation/vm/soft-dirty.txt for details).
+ To clear the bits for all the pages associated with the process
+     > echo 1 > /proc/PID/clear_refs
+ 
+@@ -484,6 +485,10 @@ To clear the bits for the anonymous pages associated with the process
+ 
+ To clear the bits for the file mapped pages associated with the process
+     > echo 3 > /proc/PID/clear_refs
++
++To clear the soft-dirty bit
++    > echo 4 > /proc/PID/clear_refs
++
+ Any other value written to /proc/PID/clear_refs will have no effect.
+ 
+ The /proc/pid/pagemap gives the PFN, which can be used to find the pageflags
+diff --git a/Documentation/vm/soft-dirty.txt b/Documentation/vm/soft-dirty.txt
+new file mode 100644
+index 000000000000..9a12a5956bc0
+--- /dev/null
++++ b/Documentation/vm/soft-dirty.txt
+@@ -0,0 +1,36 @@
++                            SOFT-DIRTY PTEs
++
++  The soft-dirty is a bit on a PTE which helps to track which pages a task
++writes to. In order to do this tracking one should
++
++  1. Clear soft-dirty bits from the task's PTEs.
++
++     This is done by writing "4" into the /proc/PID/clear_refs file of the
++     task in question.
++
++  2. Wait some time.
++
++  3. Read soft-dirty bits from the PTEs.
++
++     This is done by reading from the /proc/PID/pagemap. The bit 55 of the
++     64-bit qword is the soft-dirty one. If set, the respective PTE was
++     written to since step 1.
++
++
++  Internally, to do this tracking, the writable bit is cleared from PTEs
++when the soft-dirty bit is cleared. So, after this, when the task tries to
++modify a page at some virtual address the #PF occurs and the kernel sets
++the soft-dirty bit on the respective PTE.
++
++  Note, that although all the task's address space is marked as r/o after the
++soft-dirty bits clear, the #PF-s that occur after that are processed fast.
++This is so, since the pages are still mapped to physical memory, and thus all
++the kernel does is finds this fact out and puts both writable and soft-dirty
++bits on the PTE.
++
++
++  This feature is actively used by the checkpoint-restore project. You
++can find more details about it on http://criu.org
++
++
++-- Pavel Emelyanov, Apr 9, 2013
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 96ad1995a47a..b53cc4765c2f 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -429,6 +429,9 @@ config HAVE_IRQ_TIME_ACCOUNTING
+ config HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	bool
+ 
++config HAVE_ARCH_SOFT_DIRTY
++	bool
++
+ config HAVE_MOD_ARCH_SPECIFIC
+ 	bool
+ 	help
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index baa6c1dd0ecb..a367aa2b3908 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -208,7 +208,7 @@ static inline pte_t pte_mkexec(pte_t pte)
+ 
+ static inline pte_t pte_mkdirty(pte_t pte)
+ {
+-	return pte_set_flags(pte, _PAGE_DIRTY);
++	return pte_set_flags(pte, _PAGE_DIRTY | _PAGE_SOFT_DIRTY);
+ }
+ 
+ static inline pte_t pte_mkyoung(pte_t pte)
+@@ -272,7 +272,7 @@ static inline pmd_t pmd_wrprotect(pmd_t pmd)
+ 
+ static inline pmd_t pmd_mkdirty(pmd_t pmd)
+ {
+-	return pmd_set_flags(pmd, _PAGE_DIRTY);
++	return pmd_set_flags(pmd, _PAGE_DIRTY | _PAGE_SOFT_DIRTY);
+ }
+ 
+ static inline pmd_t pmd_mkhuge(pmd_t pmd)
+@@ -295,6 +295,26 @@ static inline pmd_t pmd_mknotpresent(pmd_t pmd)
+ 	return pmd_clear_flags(pmd, _PAGE_PRESENT);
+ }
+ 
++static inline int pte_soft_dirty(pte_t pte)
++{
++	return pte_flags(pte) & _PAGE_SOFT_DIRTY;
++}
++
++static inline int pmd_soft_dirty(pmd_t pmd)
++{
++	return pmd_flags(pmd) & _PAGE_SOFT_DIRTY;
++}
++
++static inline pte_t pte_mksoft_dirty(pte_t pte)
++{
++	return pte_set_flags(pte, _PAGE_SOFT_DIRTY);
++}
++
++static inline pmd_t pmd_mksoft_dirty(pmd_t pmd)
++{
++	return pmd_set_flags(pmd, _PAGE_SOFT_DIRTY);
++}
++
+ /*
+  * Mask out unsupported bits in a present pgprot.  Non-present pgprots
+  * can use those bits for other purposes, so leave them be.
+diff --git a/arch/x86/include/asm/pgtable_types.h b/arch/x86/include/asm/pgtable_types.h
+index 35216aeb100f..67ca1351638b 100644
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@ -57,6 +57,18 @@
+ #define _PAGE_HIDDEN	(_AT(pteval_t, 0))
+ #endif
+ 
++/*
++ * The same hidden bit is used by kmemcheck, but since kmemcheck
++ * works on kernel pages while soft-dirty engine on user space,
++ * they do not conflict with each other.
++ */
++
++#ifdef CONFIG_MEM_SOFT_DIRTY
++#define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_HIDDEN)
++#else
++#define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 0))
++#endif
++
+ #if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+ #define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
+ #else
+* Unmerged path fs/proc/task_mmu.c
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index 34b45521969b..bbac829da399 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -393,6 +393,28 @@ static inline void ptep_modify_prot_commit(struct mm_struct *mm,
+ #define arch_start_context_switch(prev)	do {} while (0)
+ #endif
+ 
++#ifndef CONFIG_HAVE_ARCH_SOFT_DIRTY
++static inline int pte_soft_dirty(pte_t pte)
++{
++	return 0;
++}
++
++static inline int pmd_soft_dirty(pmd_t pmd)
++{
++	return 0;
++}
++
++static inline pte_t pte_mksoft_dirty(pte_t pte)
++{
++	return pte;
++}
++
++static inline pmd_t pmd_mksoft_dirty(pmd_t pmd)
++{
++	return pmd;
++}
++#endif
++
+ #ifndef __HAVE_PFNMAP_TRACKING
+ /*
+  * Interfaces that can be used by architecture code to keep track of
+* Unmerged path mm/Kconfig
+* Unmerged path mm/huge_memory.c
+diff --git a/mm/mremap.c b/mm/mremap.c
+index ee435797a2ae..cc2889d268c5 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -126,7 +126,7 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+ 			continue;
+ 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
+ 		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
+-		set_pte_at(mm, new_addr, new_pte, pte);
++		set_pte_at(mm, new_addr, new_pte, pte_mksoft_dirty(pte));
+ 	}
+ 
+ 	arch_leave_lazy_mmu_mode();
