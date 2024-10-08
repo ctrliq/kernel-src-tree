@@ -1,0 +1,210 @@
+iommu/vt-d: Mark copied context entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Mark copied context entries (Myron Stowe) [1050021]
+Rebuild_FUZZ: 91.67%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit cf484d0e6939ce287e65880ffe48860165fe5cb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cf484d0e.failed
+
+Mark the context entries we copied over from the old kernel,
+so that we don't detect them as present in other code paths.
+This makes sure we safely overwrite old context entries when
+a new domain is assigned.
+
+	Tested-by: ZhenHua Li <zhen-hual@hp.com>
+	Tested-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit cf484d0e6939ce287e65880ffe48860165fe5cb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 2dab075cf283,e5a03f84d2f5..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2758,6 -2831,176 +2788,179 @@@ static void intel_iommu_init_qi(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int copy_context_table(struct intel_iommu *iommu,
++ 			      struct root_entry *old_re,
++ 			      struct context_entry **tbl,
++ 			      int bus, bool ext)
++ {
++ 	struct context_entry *old_ce = NULL, *new_ce = NULL, ce;
++ 	int tbl_idx, pos = 0, idx, devfn, ret = 0, did;
++ 	phys_addr_t old_ce_phys;
++ 
++ 	tbl_idx = ext ? bus * 2 : bus;
++ 
++ 	for (devfn = 0; devfn < 256; devfn++) {
++ 		/* First calculate the correct index */
++ 		idx = (ext ? devfn * 2 : devfn) % 256;
++ 
++ 		if (idx == 0) {
++ 			/* First save what we may have and clean up */
++ 			if (new_ce) {
++ 				tbl[tbl_idx] = new_ce;
++ 				__iommu_flush_cache(iommu, new_ce,
++ 						    VTD_PAGE_SIZE);
++ 				pos = 1;
++ 			}
++ 
++ 			if (old_ce)
++ 				iounmap(old_ce);
++ 
++ 			ret = 0;
++ 			if (devfn < 0x80)
++ 				old_ce_phys = root_entry_lctp(old_re);
++ 			else
++ 				old_ce_phys = root_entry_uctp(old_re);
++ 
++ 			if (!old_ce_phys) {
++ 				if (ext && devfn == 0) {
++ 					/* No LCTP, try UCTP */
++ 					devfn = 0x7f;
++ 					continue;
++ 				} else {
++ 					goto out;
++ 				}
++ 			}
++ 
++ 			ret = -ENOMEM;
++ 			old_ce = ioremap_cache(old_ce_phys, PAGE_SIZE);
++ 			if (!old_ce)
++ 				goto out;
++ 
++ 			new_ce = alloc_pgtable_page(iommu->node);
++ 			if (!new_ce)
++ 				goto out_unmap;
++ 
++ 			ret = 0;
++ 		}
++ 
++ 		/* Now copy the context entry */
++ 		ce = old_ce[idx];
++ 
++ 		if (!__context_present(&ce))
++ 			continue;
++ 
++ 		did = context_domain_id(&ce);
++ 		if (did >= 0 && did < cap_ndoms(iommu->cap))
++ 			set_bit(did, iommu->domain_ids);
++ 
++ 		/*
++ 		 * We need a marker for copied context entries. This
++ 		 * marker needs to work for the old format as well as
++ 		 * for extended context entries.
++ 		 *
++ 		 * Bit 67 of the context entry is used. In the old
++ 		 * format this bit is available to software, in the
++ 		 * extended format it is the PGE bit, but PGE is ignored
++ 		 * by HW if PASIDs are disabled (and thus still
++ 		 * available).
++ 		 *
++ 		 * So disable PASIDs first and then mark the entry
++ 		 * copied. This means that we don't copy PASID
++ 		 * translations from the old kernel, but this is fine as
++ 		 * faults there are not fatal.
++ 		 */
++ 		context_clear_pasid_enable(&ce);
++ 		context_set_copied(&ce);
++ 
++ 		new_ce[idx] = ce;
++ 	}
++ 
++ 	tbl[tbl_idx + pos] = new_ce;
++ 
++ 	__iommu_flush_cache(iommu, new_ce, VTD_PAGE_SIZE);
++ 
++ out_unmap:
++ 	iounmap(old_ce);
++ 
++ out:
++ 	return ret;
++ }
++ 
++ static int copy_translation_tables(struct intel_iommu *iommu)
++ {
++ 	struct context_entry **ctxt_tbls;
++ 	struct root_entry *old_rt;
++ 	phys_addr_t old_rt_phys;
++ 	int ctxt_table_entries;
++ 	unsigned long flags;
++ 	u64 rtaddr_reg;
++ 	int bus, ret;
++ 	bool ext;
++ 
++ 	rtaddr_reg = dmar_readq(iommu->reg + DMAR_RTADDR_REG);
++ 	ext        = !!(rtaddr_reg & DMA_RTADDR_RTT);
++ 
++ 	old_rt_phys = rtaddr_reg & VTD_PAGE_MASK;
++ 	if (!old_rt_phys)
++ 		return -EINVAL;
++ 
++ 	old_rt = ioremap_cache(old_rt_phys, PAGE_SIZE);
++ 	if (!old_rt)
++ 		return -ENOMEM;
++ 
++ 	/* This is too big for the stack - allocate it from slab */
++ 	ctxt_table_entries = ext ? 512 : 256;
++ 	ret = -ENOMEM;
++ 	ctxt_tbls = kzalloc(ctxt_table_entries * sizeof(void *), GFP_KERNEL);
++ 	if (!ctxt_tbls)
++ 		goto out_unmap;
++ 
++ 	for (bus = 0; bus < 256; bus++) {
++ 		ret = copy_context_table(iommu, &old_rt[bus],
++ 					 ctxt_tbls, bus, ext);
++ 		if (ret) {
++ 			pr_err("%s: Failed to copy context table for bus %d\n",
++ 				iommu->name, bus);
++ 			continue;
++ 		}
++ 	}
++ 
++ 	spin_lock_irqsave(&iommu->lock, flags);
++ 
++ 	/* Context tables are copied, now write them to the root_entry table */
++ 	for (bus = 0; bus < 256; bus++) {
++ 		int idx = ext ? bus * 2 : bus;
++ 		u64 val;
++ 
++ 		if (ctxt_tbls[idx]) {
++ 			val = virt_to_phys(ctxt_tbls[idx]) | 1;
++ 			iommu->root_entry[bus].lo = val;
++ 		}
++ 
++ 		if (!ext || !ctxt_tbls[idx + 1])
++ 			continue;
++ 
++ 		val = virt_to_phys(ctxt_tbls[idx + 1]) | 1;
++ 		iommu->root_entry[bus].hi = val;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&iommu->lock, flags);
++ 
++ 	kfree(ctxt_tbls);
++ 
++ 	__iommu_flush_cache(iommu, iommu->root_entry, PAGE_SIZE);
++ 
++ 	ret = 0;
++ 
++ out_unmap:
++ 	iounmap(old_rt);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> cf484d0e6939 (iommu/vt-d: Mark copied context entries)
+  static int __init init_dmars(void)
+  {
+  	struct dmar_drhd_unit *drhd;
+* Unmerged path drivers/iommu/intel-iommu.c
