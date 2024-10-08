@@ -1,0 +1,178 @@
+KVM: PPC: Book3S HV: Add helpers for lock/unlock hpte
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s_hv: Add helpers for lock/unlock hpte (David Gibson) [1273692]
+Rebuild_FUZZ: 93.07%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit a4bd6eb07ca72d21a7a34499ad34cfef6f527d4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a4bd6eb0.failed
+
+This adds helper routines for locking and unlocking HPTEs, and uses
+them in the rest of the code.  We don't change any locking rules in
+this patch.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit a4bd6eb07ca72d21a7a34499ad34cfef6f527d4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_mmu.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index a2ab27702b4d,f6bf0b1de6d7..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@@ -138,10 -131,23 +138,30 @@@ static void remove_revmap_chain(struct 
+  	unlock_rmap(rmap);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void unlock_hpte(__be64 *hpte, unsigned long hpte_v)
+ +{
+ +	asm volatile(PPC_RELEASE_BARRIER "" : : : "memory");
+ +	hpte[0] = cpu_to_be64(hpte_v);
+++=======
++ static pte_t lookup_linux_pte_and_update(pgd_t *pgdir, unsigned long hva,
++ 			      int writing, unsigned long *pte_sizep)
++ {
++ 	pte_t *ptep;
++ 	unsigned long ps = *pte_sizep;
++ 	unsigned int hugepage_shift;
++ 
++ 	ptep = find_linux_pte_or_hugepte(pgdir, hva, &hugepage_shift);
++ 	if (!ptep)
++ 		return __pte(0);
++ 	if (hugepage_shift)
++ 		*pte_sizep = 1ul << hugepage_shift;
++ 	else
++ 		*pte_sizep = PAGE_SIZE;
++ 	if (ps > *pte_sizep)
++ 		return __pte(0);
++ 	return kvmppc_read_update_linux_pte(ptep, writing, hugepage_shift);
+++>>>>>>> a4bd6eb07ca7 (KVM: PPC: Book3S HV: Add helpers for lock/unlock hpte)
+  }
+  
+  long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index 73896e8148e1..3b56c4c16512 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -86,6 +86,20 @@ static inline long try_lock_hpte(__be64 *hpte, unsigned long bits)
+ 	return old == 0;
+ }
+ 
++static inline void unlock_hpte(__be64 *hpte, unsigned long hpte_v)
++{
++	hpte_v &= ~HPTE_V_HVLOCK;
++	asm volatile(PPC_RELEASE_BARRIER "" : : : "memory");
++	hpte[0] = cpu_to_be64(hpte_v);
++}
++
++/* Without barrier */
++static inline void __unlock_hpte(__be64 *hpte, unsigned long hpte_v)
++{
++	hpte_v &= ~HPTE_V_HVLOCK;
++	hpte[0] = cpu_to_be64(hpte_v);
++}
++
+ static inline int __hpte_actual_psize(unsigned int lp, int psize)
+ {
+ 	int i, shift;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 8afd9d68ffc0..e0fcd8f556ae 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -478,9 +478,7 @@ static int kvmppc_mmu_book3s_64_hv_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 	v = be64_to_cpu(hptep[0]) & ~HPTE_V_HVLOCK;
+ 	gr = kvm->arch.revmap[index].guest_rpte;
+ 
+-	/* Unlock the HPTE */
+-	asm volatile("lwsync" : : : "memory");
+-	hptep[0] = cpu_to_be64(v);
++	unlock_hpte(hptep, v);
+ 	preempt_enable();
+ 
+ 	gpte->eaddr = eaddr;
+@@ -609,8 +607,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	hpte[0] = be64_to_cpu(hptep[0]) & ~HPTE_V_HVLOCK;
+ 	hpte[1] = be64_to_cpu(hptep[1]);
+ 	hpte[2] = r = rev->guest_rpte;
+-	asm volatile("lwsync" : : : "memory");
+-	hptep[0] = cpu_to_be64(hpte[0]);
++	unlock_hpte(hptep, hpte[0]);
+ 	preempt_enable();
+ 
+ 	if (hpte[0] != vcpu->arch.pgfault_hpte[0] ||
+@@ -762,7 +759,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+ 	hptep[1] = cpu_to_be64(r);
+ 	eieio();
+-	hptep[0] = cpu_to_be64(hpte[0]);
++	__unlock_hpte(hptep, hpte[0]);
+ 	asm volatile("ptesync" : : : "memory");
+ 	preempt_enable();
+ 	if (page && hpte_is_writable(r))
+@@ -783,7 +780,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	return ret;
+ 
+  out_unlock:
+-	hptep[0] &= ~cpu_to_be64(HPTE_V_HVLOCK);
++	__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+ 	preempt_enable();
+ 	goto out_put;
+ }
+@@ -913,7 +910,7 @@ static int kvm_unmap_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 			}
+ 		}
+ 		unlock_rmap(rmapp);
+-		hptep[0] &= ~cpu_to_be64(HPTE_V_HVLOCK);
++		__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+ 	}
+ 	return 0;
+ }
+@@ -1001,7 +998,7 @@ static int kvm_age_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ 			}
+ 			ret = 1;
+ 		}
+-		hptep[0] &= ~cpu_to_be64(HPTE_V_HVLOCK);
++		__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+ 	} while ((i = j) != head);
+ 
+ 	unlock_rmap(rmapp);
+@@ -1124,8 +1121,7 @@ static int kvm_test_clear_dirty_npages(struct kvm *kvm, unsigned long *rmapp)
+ 
+ 		/* Now check and modify the HPTE */
+ 		if (!(hptep[0] & cpu_to_be64(HPTE_V_VALID))) {
+-			/* unlock and continue */
+-			hptep[0] &= ~cpu_to_be64(HPTE_V_HVLOCK);
++			__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+ 			continue;
+ 		}
+ 
+@@ -1146,9 +1142,9 @@ static int kvm_test_clear_dirty_npages(struct kvm *kvm, unsigned long *rmapp)
+ 				npages_dirty = n;
+ 			eieio();
+ 		}
+-		v &= ~(HPTE_V_ABSENT | HPTE_V_HVLOCK);
++		v &= ~HPTE_V_ABSENT;
+ 		v |= HPTE_V_VALID;
+-		hptep[0] = cpu_to_be64(v);
++		__unlock_hpte(hptep, v);
+ 	} while ((i = j) != head);
+ 
+ 	unlock_rmap(rmapp);
+@@ -1386,8 +1382,7 @@ static long record_hpte(unsigned long flags, __be64 *hptp,
+ 			r &= ~HPTE_GR_MODIFIED;
+ 			revp->guest_rpte = r;
+ 		}
+-		asm volatile(PPC_RELEASE_BARRIER "" : : : "memory");
+-		hptp[0] &= ~cpu_to_be64(HPTE_V_HVLOCK);
++		unlock_hpte(hptp, be64_to_cpu(hptp[0]));
+ 		preempt_enable();
+ 		if (!(valid == want_valid && (first_pass || dirty)))
+ 			ok = 0;
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_mmu.c
