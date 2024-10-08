@@ -1,0 +1,668 @@
+udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] geneve: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb() (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 90.08%
+commit-author David Miller <davem@davemloft.net>
+commit 79b16aadea32cce077acbe9e229fcb58a7801687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/79b16aad.failed
+
+That was we can make sure the output path of ipv4/ipv6 operate on
+the UDP socket rather than whatever random thing happens to be in
+skb->sk.
+
+Based upon a patch by Jiri Pirko.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+(cherry picked from commit 79b16aadea32cce077acbe9e229fcb58a7801687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/ipv6.h
+#	include/net/udp_tunnel.h
+#	include/net/vxlan.h
+#	net/ipv4/geneve.c
+#	net/ipv4/ip_tunnel.c
+#	net/ipv4/udp_tunnel.c
+#	net/ipv6/ip6_udp_tunnel.c
+#	net/ipv6/output_core.c
+#	net/openvswitch/vport-vxlan.c
+#	net/tipc/udp_media.c
+diff --cc drivers/net/vxlan.c
+index f88e71fe097a,51baac725a48..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1540,21 -1672,40 +1540,26 @@@ static inline struct sk_buff *vxlan_han
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +static int vxlan6_xmit_skb(struct net *net, struct vxlan_sock *vs,
+ +			   struct dst_entry *dst, struct sk_buff *skb,
+++=======
++ static int vxlan6_xmit_skb(struct dst_entry *dst, struct sock *sk,
++ 			   struct sk_buff *skb,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  			   struct net_device *dev, struct in6_addr *saddr,
+  			   struct in6_addr *daddr, __u8 prio, __u8 ttl,
+ -			   __be16 src_port, __be16 dst_port,
+ -			   struct vxlan_metadata *md, bool xnet, u32 vxflags)
+ +			   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+ +	struct ipv6hdr *ip6h;
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+ -
+ -	if ((vxflags & VXLAN_F_REMCSUM_TX) &&
+ -	    skb->ip_summed == CHECKSUM_PARTIAL) {
+ -		int csum_start = skb_checksum_start_offset(skb);
+ -
+ -		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
+ -		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
+ -		    (skb->csum_offset == offsetof(struct udphdr, check) ||
+ -		     skb->csum_offset == offsetof(struct tcphdr, check))) {
+ -			udp_sum = false;
+ -			type |= SKB_GSO_TUNNEL_REMCSUM;
+ -		}
+ -	}
+  
+ -	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+ -	if (IS_ERR(skb)) {
+ -		err = -EINVAL;
+ -		goto err;
+ -	}
+ -
+ -	skb_scrub_packet(skb, xnet);
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+  
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+@@@ -1575,59 -1725,68 +1580,69 @@@
+  	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ -	vxh->vx_vni = md->vni;
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+  
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->len = htons(skb->len);
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+  
+ -	if (vxflags & VXLAN_F_GBP)
+ -		vxlan_build_gbp_hdr(vxh, vxflags, md);
+ -
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+  
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+++<<<<<<< HEAD
+ +	ip6tunnel_xmit(skb, dev);
+++=======
++ 	udp_tunnel6_xmit_skb(dst, sk, skb, dev, saddr, daddr, prio,
++ 			     ttl, src_port, dst_port,
++ 			     !!(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX));
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  	return 0;
+ -err:
+ -	dst_release(dst);
+ -	return err;
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+ +		   struct rtable *rt, struct sk_buff *skb,
+++=======
++ int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ -		   __be16 src_port, __be16 dst_port,
+ -		   struct vxlan_metadata *md, bool xnet, u32 vxflags)
+ +		   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !!(vxflags & VXLAN_F_UDP_CSUM);
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+ -
+ -	if ((vxflags & VXLAN_F_REMCSUM_TX) &&
+ -	    skb->ip_summed == CHECKSUM_PARTIAL) {
+ -		int csum_start = skb_checksum_start_offset(skb);
+ -
+ -		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
+ -		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
+ -		    (skb->csum_offset == offsetof(struct udphdr, check) ||
+ -		     skb->csum_offset == offsetof(struct tcphdr, check))) {
+ -			udp_sum = false;
+ -			type |= SKB_GSO_TUNNEL_REMCSUM;
+ -		}
+ -	}
+  
+ -	skb = iptunnel_handle_offloads(skb, udp_sum, type);
+ +	skb = vxlan_handle_offloads(skb, !vs->sock->sk->sk_no_check_tx);
+  	if (IS_ERR(skb))
+ -		return PTR_ERR(skb);
+ +		return -EINVAL;
+  
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@@ -1635,36 -1794,43 +1650,47 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ +	if (unlikely(err))
+  		return err;
+ -	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ -	vxh->vx_vni = md->vni;
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+  
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->len = htons(skb->len);
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+  
+++<<<<<<< HEAD
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+++=======
++ 	if (vxflags & VXLAN_F_GBP)
++ 		vxlan_build_gbp_hdr(vxh, vxflags, md);
++ 
++ 	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
++ 
++ 	return udp_tunnel_xmit_skb(rt, sk, skb, src, dst, tos,
++ 				   ttl, df, src_port, dst_port, xnet,
++ 				   !(vxflags & VXLAN_F_UDP_CSUM));
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+@@@ -1790,14 -1960,20 +1817,25 @@@ static void vxlan_xmit_one(struct sk_bu
+  
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ -		md.vni = htonl(vni << 8);
+ -		md.gbp = skb->mark;
+  
+++<<<<<<< HEAD
+ +		err = vxlan_xmit_skb(dev_net(dev), vxlan->vn_sock, rt, skb,
+ +				     fl4.saddr, dst->sin.sin_addr.s_addr,
+ +				     tos, ttl, df, src_port, dst_port,
+ +				     htonl(vni << 8));
+ +
+ +		if (err < 0)
+++=======
++ 		err = vxlan_xmit_skb(rt, sk, skb, fl4.saddr,
++ 				     dst->sin.sin_addr.s_addr, tos, ttl, df,
++ 				     src_port, dst_port, &md,
++ 				     !net_eq(vxlan->net, dev_net(vxlan->dev)),
++ 				     vxlan->flags);
++ 		if (err < 0) {
++ 			/* skb is already freed. */
++ 			skb = NULL;
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  			goto rt_tx_error;
+ -		}
+ -
+  		iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+@@@ -1842,10 -2020,13 +1880,17 @@@
+  		}
+  
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+ -		md.vni = htonl(vni << 8);
+ -		md.gbp = skb->mark;
+  
+++<<<<<<< HEAD
+ +		err = vxlan6_xmit_skb(dev_net(dev), vxlan->vn_sock, ndst, skb,
+ +				      dev, &fl6.saddr, &fl6.daddr, 0, ttl,
+ +				      src_port, dst_port, htonl(vni << 8));
+++=======
++ 		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
++ 				      0, ttl, src_port, dst_port, &md,
++ 				      !net_eq(vxlan->net, dev_net(vxlan->dev)),
++ 				      vxlan->flags);
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  #endif
+  	}
+  
+diff --cc include/net/ipv6.h
+index a8cae4809670,27470cd1d5f8..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -736,13 -821,14 +736,19 @@@ extern struct dst_entry *	ip6_blackhole
+   *	skb processing functions
+   */
+  
+ -int ip6_output(struct sock *sk, struct sk_buff *skb);
+ -int ip6_forward(struct sk_buff *skb);
+ -int ip6_input(struct sk_buff *skb);
+ -int ip6_mc_input(struct sk_buff *skb);
+ +extern int			ip6_output(struct sock *sk, struct sk_buff *skb);
+ +extern int			ip6_forward(struct sk_buff *skb);
+ +extern int			ip6_input(struct sk_buff *skb);
+ +extern int			ip6_mc_input(struct sk_buff *skb);
+  
+++<<<<<<< HEAD
+ +extern int			__ip6_local_out(struct sk_buff *skb);
+ +extern int			ip6_local_out(struct sk_buff *skb);
+++=======
++ int __ip6_local_out(struct sk_buff *skb);
++ int ip6_local_out_sk(struct sock *sk, struct sk_buff *skb);
++ int ip6_local_out(struct sk_buff *skb);
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  
+  /*
+   *	Extension header (options) processing
+diff --cc include/net/udp_tunnel.h
+index 2a50a70ef587,c491c1221606..000000000000
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@@ -77,17 -77,18 +77,30 @@@ void setup_udp_tunnel_sock(struct net *
+  			   struct udp_tunnel_sock_cfg *sock_cfg);
+  
+  /* Transmit the skb using UDP encapsulation. */
+++<<<<<<< HEAD
+ +int udp_tunnel_xmit_skb(struct socket *sock, struct rtable *rt,
+ +			struct sk_buff *skb, __be32 src, __be32 dst,
+ +			__u8 tos, __u8 ttl, __be16 df, __be16 src_port,
+ +			__be16 dst_port, bool xnet);
+ +
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +int udp_tunnel6_xmit_skb(struct socket *sock, struct dst_entry *dst,
+ +			 struct sk_buff *skb, struct net_device *dev,
+ +			 struct in6_addr *saddr, struct in6_addr *daddr,
+++=======
++ int udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
++ 			__be32 src, __be32 dst, __u8 tos, __u8 ttl,
++ 			__be16 df, __be16 src_port, __be16 dst_port,
++ 			bool xnet, bool nocheck);
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ int udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
++ 			 struct sk_buff *skb,
++ 			 struct net_device *dev, struct in6_addr *saddr,
++ 			 struct in6_addr *daddr,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  			 __u8 prio, __u8 ttl, __be16 src_port,
+ -			 __be16 dst_port, bool nocheck);
+ +			 __be16 dst_port);
+  #endif
+  
+  void udp_tunnel_sock_release(struct socket *sock);
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,0082b5d33d7d..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -40,10 -145,39 +40,14 @@@ struct vxlan_sock *vxlan_sock_add(struc
+  
+  void vxlan_sock_release(struct vxlan_sock *vs);
+  
+++<<<<<<< HEAD
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+ +		   struct rtable *rt, struct sk_buff *skb,
+++=======
++ int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ -		   __be16 src_port, __be16 dst_port, struct vxlan_metadata *md,
+ -		   bool xnet, u32 vxflags);
+ -
+ -static inline netdev_features_t vxlan_features_check(struct sk_buff *skb,
+ -						     netdev_features_t features)
+ -{
+ -	u8 l4_hdr = 0;
+ -
+ -	if (!skb->encapsulation)
+ -		return features;
+ -
+ -	switch (vlan_get_protocol(skb)) {
+ -	case htons(ETH_P_IP):
+ -		l4_hdr = ip_hdr(skb)->protocol;
+ -		break;
+ -	case htons(ETH_P_IPV6):
+ -		l4_hdr = ipv6_hdr(skb)->nexthdr;
+ -		break;
+ -	default:
+ -		return features;;
+ -	}
+ -
+ -	if ((l4_hdr == IPPROTO_UDP) &&
+ -	    (skb->inner_protocol_type != ENCAP_TYPE_ETHER ||
+ -	     skb->inner_protocol != htons(ETH_P_TEB) ||
+ -	     (skb_inner_mac_header(skb) - skb_transport_header(skb) !=
+ -	      sizeof(struct udphdr) + sizeof(struct vxlanhdr))))
+ -		return features & ~(NETIF_F_ALL_CSUM | NETIF_F_GSO_MASK);
+ -
+ -	return features;
+ -}
+ +		   __be16 src_port, __be16 dst_port, __be32 vni);
+  
+  /* IP header + UDP + VXLAN + Ethernet header */
+  #define VXLAN_HEADROOM (20 + 8 + 8 + 14)
+diff --cc net/ipv4/geneve.c
+index 6c1d8cbeb11d,b77f5e84c623..000000000000
+--- a/net/ipv4/geneve.c
++++ b/net/ipv4/geneve.c
+@@@ -138,8 -136,9 +138,14 @@@ int geneve_xmit_skb(struct geneve_sock 
+  
+  	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+  
+++<<<<<<< HEAD
+ +	return udp_tunnel_xmit_skb(gs->sock, rt, skb, src, dst,
+ +				   tos, ttl, df, src_port, dst_port, xnet);
+++=======
++ 	return udp_tunnel_xmit_skb(rt, gs->sock->sk, skb, src, dst,
++ 				   tos, ttl, df, src_port, dst_port, xnet,
++ 				   !csum);
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  }
+  EXPORT_SYMBOL_GPL(geneve_xmit_skb);
+  
+diff --cc net/ipv4/ip_tunnel.c
+index 1129aec53c2c,4c2c3ba4ba65..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -662,8 -782,8 +662,13 @@@ void ip_tunnel_xmit(struct sk_buff *skb
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iptunnel_xmit(skb->sk, rt, skb, fl4.saddr, fl4.daddr, protocol,
+ +			    ip_tunnel_ecn_encap(tos, inner_iph, skb), ttl, df);
+++=======
++ 	err = iptunnel_xmit(NULL, rt, skb, fl4.saddr, fl4.daddr, protocol,
++ 			    tos, ttl, df, !net_eq(tunnel->net, dev_net(dev)));
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+  
+  	return;
+diff --cc net/ipv4/udp_tunnel.c
+index 9996e63ed304,6bb98cc193c9..000000000000
+--- a/net/ipv4/udp_tunnel.c
++++ b/net/ipv4/udp_tunnel.c
+@@@ -75,10 -75,10 +75,17 @@@ void setup_udp_tunnel_sock(struct net *
+  }
+  EXPORT_SYMBOL_GPL(setup_udp_tunnel_sock);
+  
+++<<<<<<< HEAD
+ +int udp_tunnel_xmit_skb(struct socket *sock, struct rtable *rt,
+ +			struct sk_buff *skb, __be32 src, __be32 dst,
+ +			__u8 tos, __u8 ttl, __be16 df, __be16 src_port,
+ +			__be16 dst_port, bool xnet)
+++=======
++ int udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
++ 			__be32 src, __be32 dst, __u8 tos, __u8 ttl,
++ 			__be16 df, __be16 src_port, __be16 dst_port,
++ 			bool xnet, bool nocheck)
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  {
+  	struct udphdr *uh;
+  
+@@@ -90,9 -90,9 +97,13 @@@
+  	uh->source = src_port;
+  	uh->len = htons(skb->len);
+  
+ -	udp_set_csum(nocheck, skb, src, dst, skb->len);
+ +	udp_set_csum(sock->sk->sk_no_check_tx, skb, src, dst, skb->len);
+  
+++<<<<<<< HEAD
+ +	return iptunnel_xmit(sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+++=======
++ 	return iptunnel_xmit(sk, rt, skb, src, dst, IPPROTO_UDP,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  			     tos, ttl, df, xnet);
+  }
+  EXPORT_SYMBOL_GPL(udp_tunnel_xmit_skb);
+diff --cc net/ipv6/ip6_udp_tunnel.c
+index 8db6c98fe218,bba8903e871f..000000000000
+--- a/net/ipv6/ip6_udp_tunnel.c
++++ b/net/ipv6/ip6_udp_tunnel.c
+@@@ -62,10 -62,12 +62,19 @@@ error
+  }
+  EXPORT_SYMBOL_GPL(udp_sock_create6);
+  
+++<<<<<<< HEAD
+ +int udp_tunnel6_xmit_skb(struct socket *sock, struct dst_entry *dst,
+ +			 struct sk_buff *skb, struct net_device *dev,
+ +			 struct in6_addr *saddr, struct in6_addr *daddr,
+ +			 __u8 prio, __u8 ttl, __be16 src_port, __be16 dst_port)
+++=======
++ int udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
++ 			 struct sk_buff *skb,
++ 			 struct net_device *dev, struct in6_addr *saddr,
++ 			 struct in6_addr *daddr,
++ 			 __u8 prio, __u8 ttl, __be16 src_port,
++ 			 __be16 dst_port, bool nocheck)
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  {
+  	struct udphdr *uh;
+  	struct ipv6hdr *ip6h;
+diff --cc net/ipv6/output_core.c
+index 827f795209cf,85892af57364..000000000000
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@@ -106,9 -144,15 +106,19 @@@ static int __ip6_local_out_sk(struct so
+  	if (len > IPV6_MAXPLEN)
+  		len = 0;
+  	ipv6_hdr(skb)->payload_len = htons(len);
+ -	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+  
+++<<<<<<< HEAD
+ +	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, skb, NULL,
+ +		       skb_dst(skb)->dev, dst_output);
+++=======
++ 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, sk, skb,
++ 		       NULL, skb_dst(skb)->dev, dst_output_sk);
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
++ }
++ 
++ int __ip6_local_out(struct sk_buff *skb)
++ {
++ 	return __ip6_local_out_sk(skb->sk, skb);
+  }
+  EXPORT_SYMBOL_GPL(__ip6_local_out);
+  
+diff --cc net/openvswitch/vport-vxlan.c
+index 64e0d2e57017,6d39766e7828..000000000000
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@@ -139,8 -222,10 +139,15 @@@ static int vxlan_tnl_send(struct vport 
+  {
+  	struct net *net = ovs_dp_get_net(vport->dp);
+  	struct vxlan_port *vxlan_port = vxlan_vport(vport);
+++<<<<<<< HEAD
+ +	__be16 dst_port = inet_sk(vxlan_port->vs->sock->sk)->inet_sport;
+ +	struct ovs_key_ipv4_tunnel *tun_key;
+++=======
++ 	struct sock *sk = vxlan_port->vs->sock->sk;
++ 	__be16 dst_port = inet_sk(sk)->inet_sport;
++ 	const struct ovs_key_ipv4_tunnel *tun_key;
++ 	struct vxlan_metadata md = {0};
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  	struct rtable *rt;
+  	struct flowi4 fl;
+  	__be16 src_port;
+@@@ -170,18 -248,23 +177,22 @@@
+  	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ?
+  		htons(IP_DF) : 0;
+  
+ -	skb->ignore_df = 1;
+ +	skb->local_df = 1;
+  
+  	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+ -	md.vni = htonl(be64_to_cpu(tun_key->tun_id) << 8);
+ -	md.gbp = vxlan_ext_gbp(skb);
+ -	vxflags = vxlan_port->exts |
+ -		      (tun_key->tun_flags & TUNNEL_CSUM ? VXLAN_F_UDP_CSUM : 0);
+  
+++<<<<<<< HEAD
+ +	err = vxlan_xmit_skb(net, vxlan_port->vs, rt, skb,
+ +			     fl.saddr, tun_key->ipv4_dst,
+++=======
++ 	err = vxlan_xmit_skb(rt, sk, skb, fl.saddr, tun_key->ipv4_dst,
+++>>>>>>> 79b16aadea32 (udp_tunnel: Pass UDP socket down through udp_tunnel{, 6}_xmit_skb().)
+  			     tun_key->ipv4_tos, tun_key->ipv4_ttl, df,
+  			     src_port, dst_port,
+ -			     &md, false, vxflags);
+ +			     htonl(be64_to_cpu(tun_key->tun_id) << 8));
+  	if (err < 0)
+  		ip_rt_put(rt);
+ -	return err;
+  error:
+ -	kfree_skb(skb);
+  	return err;
+  }
+  
+* Unmerged path net/tipc/udp_media.c
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
+index 2265b0bf97e5..beb09becc3f3 100644
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@ -70,14 +70,15 @@ __u16 ip6_tnl_parse_tlv_enc_lim(struct sk_buff *skb, __u8 *raw);
+ __u32 ip6_tnl_get_cap(struct ip6_tnl *t, const struct in6_addr *laddr,
+ 			     const struct in6_addr *raddr);
+ 
+-static inline void ip6tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
++static inline void ip6tunnel_xmit(struct sock *sk, struct sk_buff *skb,
++				  struct net_device *dev)
+ {
+ 	struct net_device_stats *stats = &dev->stats;
+ 	int pkt_len, err;
+ 
+ 	nf_reset(skb);
+ 	pkt_len = skb->len;
+-	err = ip6_local_out(skb);
++	err = ip6_local_out_sk(sk, skb);
+ 
+ 	if (net_xmit_eval(err) == 0) {
+ 		struct pcpu_tstats *tstats = this_cpu_ptr(dev->tstats);
+* Unmerged path include/net/ipv6.h
+* Unmerged path include/net/udp_tunnel.h
+* Unmerged path include/net/vxlan.h
+* Unmerged path net/ipv4/geneve.c
+* Unmerged path net/ipv4/ip_tunnel.c
+* Unmerged path net/ipv4/udp_tunnel.c
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index c654b9cb7513..5c3298bd4afe 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -763,7 +763,7 @@ static netdev_tx_t ip6gre_xmit2(struct sk_buff *skb,
+ 
+ 	skb_set_inner_protocol(skb, protocol);
+ 
+-	ip6tunnel_xmit(skb, dev);
++	ip6tunnel_xmit(NULL, skb, dev);
+ 	if (ndst)
+ 		ip6_tnl_dst_store(tunnel, ndst);
+ 	return 0;
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index c515e393bc7d..4e9c683358cb 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1103,7 +1103,7 @@ static int ip6_tnl_xmit2(struct sk_buff *skb,
+ 	ipv6h->nexthdr = proto;
+ 	ipv6h->saddr = fl6->saddr;
+ 	ipv6h->daddr = fl6->daddr;
+-	ip6tunnel_xmit(skb, dev);
++	ip6tunnel_xmit(NULL, skb, dev);
+ 	if (ndst)
+ 		ip6_tnl_dst_store(t, ndst);
+ 	return 0;
+* Unmerged path net/ipv6/ip6_udp_tunnel.c
+* Unmerged path net/ipv6/output_core.c
+* Unmerged path net/openvswitch/vport-vxlan.c
+* Unmerged path net/tipc/udp_media.c
