@@ -1,0 +1,104 @@
+HID: usbhid: prevent unwanted events to be sent when re-opening the device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hid] usbhid: prevent unwanted events to be sent when re-opening the device (Don Zickus) [914682]
+Rebuild_FUZZ: 96.50%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit b905811a49bcd6e6726ce5bbb591f57aaddfd3be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b905811a.failed
+
+When events occurs while no one is listening to the node (hid->open == 0
+and usb_kill_urb() called) some events are still stacked somewhere in
+the USB (kernel or device?) stack. When the node gets reopened, these
+events are drained, and this results in spurious touch down/up, or mouse
+button clicks.
+
+The problem was spotted with touchscreens in fdo bug #81781 [1], but it
+actually occurs with any mouse using hid-generic or touchscreen.
+
+A way to reproduce it is to call:
+
+$ xinput disable 9 ; sleep 5 ; xinput enable 9
+
+With 9 being the device ID for the touchscreen/mouse. During the "sleep",
+produce some touch events or click events. When "xinput enable" is called,
+at least one click is generated.
+
+This patch tries to fix this by draining the queue for 50 msec and
+during this time frame, not forwarding these old events to the hid layer.
+
+Hans completed the explanation:
+"""
+Devices like mice (basically any hid device) will have a fifo
+on the device side, when we stop submitting urbs to get hid reports from
+it, that fifo will fill up, and when we resume we will get whatever
+is there in that fifo.
+"""
+
+[1] https://bugs.freedesktop.org/show_bug.cgi?id=81781
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit b905811a49bcd6e6726ce5bbb591f57aaddfd3be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/usbhid/hid-core.c
+diff --cc drivers/hid/usbhid/hid-core.c
+index ada164e1b3a1,04e34b917045..000000000000
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@@ -292,18 -276,22 +292,37 @@@ static void hid_irq_in(struct urb *urb
+  	case 0:			/* success */
+  		usbhid_mark_busy(usbhid);
+  		usbhid->retry_delay = 0;
+++<<<<<<< HEAD
+ +		hid_input_report(urb->context, HID_INPUT_REPORT,
+ +				 urb->transfer_buffer,
+ +				 urb->actual_length, 1);
+ +		/*
+ +		 * autosuspend refused while keys are pressed
+ +		 * because most keyboards don't wake up when
+ +		 * a key is released
+ +		 */
+ +		if (hid_check_keys_pressed(hid))
+ +			set_bit(HID_KEYS_PRESSED, &usbhid->iofl);
+ +		else
+ +			clear_bit(HID_KEYS_PRESSED, &usbhid->iofl);
+++=======
++ 		if ((hid->quirks & HID_QUIRK_ALWAYS_POLL) && !hid->open)
++ 			break;
++ 		if (!test_bit(HID_RESUME_RUNNING, &usbhid->iofl)) {
++ 			hid_input_report(urb->context, HID_INPUT_REPORT,
++ 					 urb->transfer_buffer,
++ 					 urb->actual_length, 1);
++ 			/*
++ 			 * autosuspend refused while keys are pressed
++ 			 * because most keyboards don't wake up when
++ 			 * a key is released
++ 			 */
++ 			if (hid_check_keys_pressed(hid))
++ 				set_bit(HID_KEYS_PRESSED, &usbhid->iofl);
++ 			else
++ 				clear_bit(HID_KEYS_PRESSED, &usbhid->iofl);
++ 		}
+++>>>>>>> b905811a49bc (HID: usbhid: prevent unwanted events to be sent when re-opening the device)
+  		break;
+  	case -EPIPE:		/* stall */
+  		usbhid_mark_busy(usbhid);
+* Unmerged path drivers/hid/usbhid/hid-core.c
+diff --git a/drivers/hid/usbhid/usbhid.h b/drivers/hid/usbhid/usbhid.h
+index dbb6af699135..2492fefb7adf 100644
+--- a/drivers/hid/usbhid/usbhid.h
++++ b/drivers/hid/usbhid/usbhid.h
+@@ -52,6 +52,7 @@ struct usb_interface *usbhid_find_interface(int minor);
+ #define HID_STARTED		8
+ #define HID_KEYS_PRESSED	10
+ #define HID_NO_BANDWIDTH	11
++#define HID_RESUME_RUNNING	12
+ 
+ /*
+  * USB-specific HID struct, to be pointed to
