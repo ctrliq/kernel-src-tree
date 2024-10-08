@@ -1,0 +1,247 @@
+staging/rdma/hfi1: Consolidate CPU/IRQ affinity support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Consolidate CPU/IRQ affinity support (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 92.16%
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit 957558c9668f06b04530b7ddbfd2dbea86630496
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/957558c9.failed
+
+This patch unifies the affinity support for CPU and IRQ allocations into
+a single code base. The goal is to allow the driver to make intelligent
+placement decision based on an overall view of processes and IRQs across
+as much of the driver as possible.
+
+Pulling all the scattered affinity code into a single code base lays the
+ground work for accomplishing the above goal.  For example, previous
+implementations made user process placement decision solely based on
+other user processes.  This algorithm is limited as it did not take into
+account IRQ placement and could result in overloading certain CPUs.
+
+A single code base also provides a much easier way to maintain and debug
+any performance issues related to affinity.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 957558c9668f06b04530b7ddbfd2dbea86630496)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/affinity.c
+#	drivers/staging/hfi1/affinity.h
+#	drivers/staging/hfi1/chip.c
+#	drivers/staging/hfi1/hfi.h
+#	drivers/staging/hfi1/init.c
+#	drivers/staging/rdma/hfi1/Makefile
+diff --cc drivers/staging/hfi1/chip.c
+index 10123147fb89,6045c9154a1f..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -12449,51 -12447,6 +12440,54 @@@ static int request_msix_irqs(struct hfi
+  	last_rx = first_rx + dd->n_krcv_queues;
+  
+  	/*
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +	 * Interrupt affinity.
+ +	 *
+ +	 * non-rcv avail gets a default mask that
+ +	 * starts as possible cpus with threads reset
+ +	 * and each rcv avail reset.
+ +	 *
+ +	 * rcv avail gets node relative 1 wrapping back
+ +	 * to the node relative 1 as necessary.
+ +	 *
+ +	 */
+ +	local_mask = cpumask_of_pcibus(dd->pcidev->bus);
+ +	/* if first cpu is invalid, use NUMA 0 */
+ +	if (cpumask_first(local_mask) >= nr_cpu_ids)
+ +		local_mask = topology_core_cpumask(0);
+ +
+ +	def_ret = zalloc_cpumask_var(&def, GFP_KERNEL);
+ +	rcv_ret = zalloc_cpumask_var(&rcv, GFP_KERNEL);
+ +	if (!def_ret || !rcv_ret)
+ +		goto bail;
+ +	/* use local mask as default */
+ +	cpumask_copy(def, local_mask);
+ +	possible = cpumask_weight(def);
+ +	/* disarm threads from default */
+ +	ht = cpumask_weight(cpu_sibling_mask(cpumask_first(local_mask)));
+ +	for (i = possible/ht; i < possible; i++)
+ +		cpumask_clear_cpu(i, def);
+ +	/* def now has full cores on chosen node*/
+ +	first_cpu = cpumask_first(def);
+ +	if (nr_cpu_ids >= first_cpu)
+ +		first_cpu++;
+ +	curr_cpu = first_cpu;
+ +
+ +	/*  One context is reserved as control context */
+ +	for (i = first_cpu; i < dd->n_krcv_queues + first_cpu - 1; i++) {
+ +		cpumask_clear_cpu(curr_cpu, def);
+ +		cpumask_set_cpu(curr_cpu, rcv);
+ +		curr_cpu = cpumask_next(curr_cpu, def);
+ +		if (curr_cpu >= nr_cpu_ids)
+ +			break;
+ +	}
+ +	/* def mask has non-rcv, rcv has recv mask */
+ +	rcv_cpu = cpumask_first(rcv);
+ +	sdma_cpu = cpumask_first(def);
+ +
+ +	/*
+++=======
+++>>>>>>> 957558c9668f (staging/rdma/hfi1: Consolidate CPU/IRQ affinity support):drivers/staging/rdma/hfi1/chip.c
+  	 * Sanity check - the code expects all SDMA chip source
+  	 * interrupts to be in the same CSR, starting at bit 0.  Verify
+  	 * that this is true by checking the bit location of the start.
+diff --cc drivers/staging/hfi1/hfi.h
+index 8c6839cc9104,571e7b10cd11..000000000000
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@@ -73,7 -74,8 +73,12 @@@
+  #include "chip.h"
+  #include "mad.h"
+  #include "qsfp.h"
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+ +#include "platform_config.h"
+++=======
++ #include "platform.h"
++ #include "affinity.h"
+++>>>>>>> 957558c9668f (staging/rdma/hfi1: Consolidate CPU/IRQ affinity support):drivers/staging/rdma/hfi1/hfi.h
+  
+  /* bumped 1 from s/w major version of TrueScale */
+  #define HFI1_CHIP_VERS_MAJ 3U
+@@@ -1131,6 -1139,15 +1137,18 @@@ struct hfi1_devdata 
+  	/* receive context tail dummy address */
+  	__le64 *rcvhdrtail_dummy_kvaddr;
+  	dma_addr_t rcvhdrtail_dummy_physaddr;
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+++=======
++ 
++ 	bool aspm_supported;	/* Does HW support ASPM */
++ 	bool aspm_enabled;	/* ASPM state: enabled/disabled */
++ 	/* Serialize ASPM enable/disable between multiple verbs contexts */
++ 	spinlock_t aspm_lock;
++ 	/* Number of verbs contexts which have disabled ASPM */
++ 	atomic_t aspm_disabled_cnt;
++ 
++ 	struct hfi1_affinity *affinity;
+++>>>>>>> 957558c9668f (staging/rdma/hfi1: Consolidate CPU/IRQ affinity support):drivers/staging/rdma/hfi1/hfi.h
+  };
+  
+  /* 8051 firmware version helper */
+diff --cc drivers/staging/hfi1/init.c
+index a3dd5b341034,98b3fc145660..000000000000
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@@ -224,10 -228,10 +225,10 @@@ struct hfi1_ctxtdata *hfi1_create_ctxtd
+  		rcd->cnt = 1;
+  		rcd->ctxt = ctxt;
+  		dd->rcd[ctxt] = rcd;
+- 		rcd->numa_id = numa_node_id();
++ 		rcd->numa_id = numa;
+  		rcd->rcv_array_groups = dd->rcv_entries.ngroups;
+  
+ -		mutex_init(&rcd->exp_lock);
+ +		spin_lock_init(&rcd->exp_lock);
+  
+  		/*
+  		 * Calculate the context's RcvArray entry starting point.
+@@@ -987,7 -983,8 +988,12 @@@ void hfi1_free_devdata(struct hfi1_devd
+  	rcu_barrier(); /* wait for rcu callbacks to complete */
+  	free_percpu(dd->int_counter);
+  	free_percpu(dd->rcv_limit);
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +	ib_dealloc_device(&dd->verbs_dev.ibdev);
+++=======
++ 	hfi1_dev_affinity_free(dd);
++ 	ib_dealloc_device(&dd->verbs_dev.rdi.ibdev);
+++>>>>>>> 957558c9668f (staging/rdma/hfi1: Consolidate CPU/IRQ affinity support):drivers/staging/rdma/hfi1/init.c
+  }
+  
+  /*
+* Unmerged path drivers/staging/hfi1/affinity.c
+* Unmerged path drivers/staging/hfi1/affinity.h
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
+* Unmerged path drivers/staging/hfi1/affinity.c
+* Unmerged path drivers/staging/hfi1/affinity.h
+* Unmerged path drivers/staging/hfi1/chip.c
+diff --git a/drivers/staging/hfi1/file_ops.c b/drivers/staging/hfi1/file_ops.c
+index 1f753f5a4830..882726eee00f 100644
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@ -757,6 +757,9 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ 	/* drain user sdma queue */
+ 	hfi1_user_sdma_free_queues(fdata);
+ 
++	/* release the cpu */
++	hfi1_put_proc_affinity(dd, fdata->rec_cpu_num);
++
+ 	/*
+ 	 * Clear any left over, unhandled events so the next process that
+ 	 * gets this context doesn't get confused.
+@@ -852,8 +855,16 @@ static int assign_ctxt(struct file *fp, struct hfi1_user_info *uinfo)
+ 
+ 	mutex_lock(&hfi1_mutex);
+ 	/* First, lets check if we need to setup a shared context? */
+-	if (uinfo->subctxt_cnt)
++	if (uinfo->subctxt_cnt) {
++		struct hfi1_filedata *fd = fp->private_data;
++
+ 		ret = find_shared_ctxt(fp, uinfo);
++		if (ret < 0)
++			goto done_unlock;
++		if (ret)
++			fd->rec_cpu_num = hfi1_get_proc_affinity(
++				fd->uctxt->dd, fd->uctxt->numa_id);
++	}
+ 
+ 	/*
+ 	 * We execute the following block if we couldn't find a
+@@ -863,6 +874,7 @@ static int assign_ctxt(struct file *fp, struct hfi1_user_info *uinfo)
+ 		i_minor = iminor(file_inode(fp)) - HFI1_USER_MINOR_BASE;
+ 		ret = get_user_context(fp, uinfo, i_minor - 1, alg);
+ 	}
++done_unlock:
+ 	mutex_unlock(&hfi1_mutex);
+ done:
+ 	return ret;
+@@ -988,7 +1000,7 @@ static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+ 	struct hfi1_filedata *fd = fp->private_data;
+ 	struct hfi1_ctxtdata *uctxt;
+ 	unsigned ctxt;
+-	int ret;
++	int ret, numa;
+ 
+ 	if (dd->flags & HFI1_FROZEN) {
+ 		/*
+@@ -1008,12 +1020,21 @@ static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+ 	if (ctxt == dd->num_rcv_contexts)
+ 		return -EBUSY;
+ 
+-	uctxt = hfi1_create_ctxtdata(dd->pport, ctxt);
++	fd->rec_cpu_num = hfi1_get_proc_affinity(dd, -1);
++	if (fd->rec_cpu_num != -1)
++		numa = cpu_to_node(fd->rec_cpu_num);
++	else
++		numa = numa_node_id();
++	uctxt = hfi1_create_ctxtdata(dd->pport, ctxt, numa);
+ 	if (!uctxt) {
+ 		dd_dev_err(dd,
+ 			   "Unable to allocate ctxtdata memory, failing open\n");
+ 		return -ENOMEM;
+ 	}
++	hfi1_cdbg(PROC, "[%u:%u] pid %u assigned to CPU %d (NUMA %u)",
++		  uctxt->ctxt, fd->subctxt, current->pid, fd->rec_cpu_num,
++		  uctxt->numa_id);
++
+ 	/*
+ 	 * Allocate and enable a PIO send context.
+ 	 */
+* Unmerged path drivers/staging/hfi1/hfi.h
+* Unmerged path drivers/staging/hfi1/init.c
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
