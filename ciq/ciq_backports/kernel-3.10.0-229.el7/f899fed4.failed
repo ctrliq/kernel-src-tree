@@ -1,0 +1,201 @@
+blk-mq: fix regression from commit 624dbe475416
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit f899fed4421d6b098ed6a9d69303c70e590bf2c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f899fed4.failed
+
+When the code was collapsed to avoid duplication, the recent patch
+for ensuring that a queue is idled before free was dropped, which was
+added by commit 19c5d84f14d2.
+
+Add back the blk_mq_tag_idle(), to ensure we don't leak a reference
+to an active queue when it is freed.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f899fed4421d6b098ed6a9d69303c70e590bf2c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index f1f3d27fe9e1,4e8e8cf00815..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1027,128 -1513,67 +1027,135 @@@ static int blk_mq_hctx_notify(void *dat
+  	return NOTIFY_OK;
+  }
+  
+ -static int blk_mq_hctx_cpu_online(struct blk_mq_hw_ctx *hctx, int cpu)
+ +static void blk_mq_init_hw_commands(struct blk_mq_hw_ctx *hctx,
+ +				    void (*init)(void *, struct blk_mq_hw_ctx *,
+ +					struct request *, unsigned int),
+ +				    void *data)
+  {
+ -	struct request_queue *q = hctx->queue;
+ -	struct blk_mq_tag_set *set = q->tag_set;
+ +	unsigned int i;
+  
+ -	if (set->tags[hctx->queue_num])
+ -		return NOTIFY_OK;
+ +	for (i = 0; i < hctx->queue_depth; i++) {
+ +		struct request *rq = hctx->rqs[i];
+  
+ -	set->tags[hctx->queue_num] = blk_mq_init_rq_map(set, hctx->queue_num);
+ -	if (!set->tags[hctx->queue_num])
+ -		return NOTIFY_STOP;
+ +		init(data, hctx, rq, i);
+ +	}
+ +}
+  
+ -	hctx->tags = set->tags[hctx->queue_num];
+ -	return NOTIFY_OK;
+ +void blk_mq_init_commands(struct request_queue *q,
+ +			  void (*init)(void *, struct blk_mq_hw_ctx *,
+ +					struct request *, unsigned int),
+ +			  void *data)
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned int i;
+ +
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_init_hw_commands(hctx, init, data);
+  }
+ +EXPORT_SYMBOL(blk_mq_init_commands);
+  
+ -static int blk_mq_hctx_notify(void *data, unsigned long action,
+ -			      unsigned int cpu)
+ +static void blk_mq_free_rq_map(struct blk_mq_hw_ctx *hctx)
+  {
+ -	struct blk_mq_hw_ctx *hctx = data;
+ +	struct page *page;
+  
+ -	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN)
+ -		return blk_mq_hctx_cpu_offline(hctx, cpu);
+ -	else if (action == CPU_ONLINE || action == CPU_ONLINE_FROZEN)
+ -		return blk_mq_hctx_cpu_online(hctx, cpu);
+ +	while (!list_empty(&hctx->page_list)) {
+ +		page = list_first_entry(&hctx->page_list, struct page, lru);
+ +		list_del_init(&page->lru);
+ +		__free_pages(page, page->private);
+ +	}
+  
+ -	return NOTIFY_OK;
+ +	kfree(hctx->rqs);
+ +
+ +	if (hctx->tags)
+ +		blk_mq_free_tags(hctx->tags);
+  }
+  
+ -static void blk_mq_exit_hw_queues(struct request_queue *q,
+ -		struct blk_mq_tag_set *set, int nr_queue)
+ +static size_t order_to_size(unsigned int order)
+  {
+ -	struct blk_mq_hw_ctx *hctx;
+ -	unsigned int i;
+ +	return (size_t)PAGE_SIZE << order;
+ +}
+  
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		if (i == nr_queue)
+ +static int blk_mq_init_rq_map(struct blk_mq_hw_ctx *hctx,
+ +			      unsigned int reserved_tags, int node)
+ +{
+ +	unsigned int i, j, entries_per_page, max_order = 4;
+ +	size_t rq_size, left;
+ +
+ +	INIT_LIST_HEAD(&hctx->page_list);
+ +
+ +	hctx->rqs = kmalloc_node(hctx->queue_depth * sizeof(struct request *),
+ +					GFP_KERNEL, node);
+ +	if (!hctx->rqs)
+ +		return -ENOMEM;
+ +
+ +	/*
+ +	 * rq_size is the size of the request plus driver payload, rounded
+ +	 * to the cacheline size
+ +	 */
+ +	rq_size = round_up(sizeof(struct request) + hctx->cmd_size,
+ +				cache_line_size());
+ +	left = rq_size * hctx->queue_depth;
+ +
+ +	for (i = 0; i < hctx->queue_depth;) {
+ +		int this_order = max_order;
+ +		struct page *page;
+ +		int to_do;
+ +		void *p;
+ +
+ +		while (left < order_to_size(this_order - 1) && this_order)
+ +			this_order--;
+ +
+ +		do {
+ +			page = alloc_pages_node(node, GFP_KERNEL, this_order);
+ +			if (page)
+ +				break;
+ +			if (!this_order--)
+ +				break;
+ +			if (order_to_size(this_order) < rq_size)
+ +				break;
+ +		} while (1);
+ +
+ +		if (!page)
+  			break;
+  
+++<<<<<<< HEAD
+ +		page->private = this_order;
+ +		list_add_tail(&page->lru, &hctx->page_list);
+++=======
++ 		blk_mq_tag_idle(hctx);
++ 
++ 		if (set->ops->exit_hctx)
++ 			set->ops->exit_hctx(hctx, i);
+++>>>>>>> f899fed4421d (blk-mq: fix regression from commit 624dbe475416)
+  
+ -		blk_mq_unregister_cpu_notifier(&hctx->cpu_notifier);
+ -		kfree(hctx->ctxs);
+ -		blk_mq_free_bitmap(&hctx->ctx_map);
+ +		p = page_address(page);
+ +		entries_per_page = order_to_size(this_order) / rq_size;
+ +		to_do = min(entries_per_page, hctx->queue_depth - i);
+ +		left -= to_do * rq_size;
+ +		for (j = 0; j < to_do; j++) {
+ +			hctx->rqs[i] = p;
+ +			blk_mq_rq_init(hctx, hctx->rqs[i]);
+ +			p += rq_size;
+ +			i++;
+ +		}
+  	}
+  
+ -}
+ -
+ -static void blk_mq_free_hw_queues(struct request_queue *q,
+ -		struct blk_mq_tag_set *set)
+ -{
+ -	struct blk_mq_hw_ctx *hctx;
+ -	unsigned int i;
+ +	if (i < (reserved_tags + BLK_MQ_TAG_MIN))
+ +		goto err_rq_map;
+ +	else if (i != hctx->queue_depth) {
+ +		hctx->queue_depth = i;
+ +		pr_warn("%s: queue depth set to %u because of low memory\n",
+ +					__func__, i);
+ +	}
+  
+ -	queue_for_each_hw_ctx(q, hctx, i) {
+ -		free_cpumask_var(hctx->cpumask);
+ -		kfree(hctx);
+ +	hctx->tags = blk_mq_init_tags(hctx->queue_depth, reserved_tags, node);
+ +	if (!hctx->tags) {
+ +err_rq_map:
+ +		blk_mq_free_rq_map(hctx);
+ +		return -ENOMEM;
+  	}
+ +
+ +	return 0;
+  }
+  
+  static int blk_mq_init_hw_queues(struct request_queue *q,
+* Unmerged path block/blk-mq.c
