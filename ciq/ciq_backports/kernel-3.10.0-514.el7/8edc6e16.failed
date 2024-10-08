@@ -1,0 +1,191 @@
+fanotify: fix notification of groups with inode & mount marks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 8edc6e1688fc8f02c8c1f53a2ec4928cb1055f4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8edc6e16.failed
+
+fsnotify() needs to merge inode and mount marks lists when notifying
+groups about events so that ignore masks from inode marks are reflected
+in mount mark notifications and groups are notified in proper order
+(according to priorities).
+
+Currently the sorting of the lists done by fsnotify_add_inode_mark() /
+fsnotify_add_vfsmount_mark() and fsnotify() differed which resulted
+ignore masks not being used in some cases.
+
+Fix the problem by always using the same comparison function when
+sorting / merging the mark lists.
+
+Thanks to Heinrich Schuchardt for improvements of my patch.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=87721
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reported-by: Heinrich Schuchardt <xypron.glpk@gmx.de>
+	Tested-by: Heinrich Schuchardt <xypron.glpk@gmx.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8edc6e1688fc8f02c8c1f53a2ec4928cb1055f4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.c
+diff --cc fs/notify/fsnotify.c
+index 4bb21d67d9b1,89326acd4561..000000000000
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@@ -256,21 -252,19 +264,36 @@@ int fsnotify(struct inode *to_tell, __u
+  			vfsmount_group = vfsmount_mark->group;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (inode_group > vfsmount_group) {
+ +			/* handle inode */
+ +			ret = send_to_group(to_tell, inode_mark, NULL, mask, data,
+ +					    data_is, cookie, file_name, &event);
+ +			/* we didn't use the vfsmount_mark */
+ +			vfsmount_group = NULL;
+ +		} else if (vfsmount_group > inode_group) {
+ +			ret = send_to_group(to_tell, NULL, vfsmount_mark, mask, data,
+ +					    data_is, cookie, file_name, &event);
+ +			inode_group = NULL;
+ +		} else {
+ +			ret = send_to_group(to_tell, inode_mark, vfsmount_mark,
+ +					    mask, data, data_is, cookie, file_name,
+ +					    &event);
+++=======
++ 		if (inode_group && vfsmount_group) {
++ 			int cmp = fsnotify_compare_groups(inode_group,
++ 							  vfsmount_group);
++ 			if (cmp > 0) {
++ 				inode_group = NULL;
++ 				inode_mark = NULL;
++ 			} else if (cmp < 0) {
++ 				vfsmount_group = NULL;
++ 				vfsmount_mark = NULL;
++ 			}
+++>>>>>>> 8edc6e1688fc (fanotify: fix notification of groups with inode & mount marks)
+  		}
++ 		ret = send_to_group(to_tell, inode_mark, vfsmount_mark, mask,
++ 				    data, data_is, cookie, file_name);
+  
+  		if (ret && (mask & ALL_FSNOTIFY_PERM_EVENTS))
+  			goto out;
+* Unmerged path fs/notify/fsnotify.c
+diff --git a/fs/notify/fsnotify.h b/fs/notify/fsnotify.h
+index 85e7d2b431d9..d038624c9cdf 100644
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@ -12,6 +12,10 @@ extern void fsnotify_flush_notify(struct fsnotify_group *group);
+ /* protects reads of inode and vfsmount marks list */
+ extern struct srcu_struct fsnotify_mark_srcu;
+ 
++/* compare two groups for sorting of marks lists */
++extern int fsnotify_compare_groups(struct fsnotify_group *a,
++				   struct fsnotify_group *b);
++
+ extern void fsnotify_set_inode_mark_mask_locked(struct fsnotify_mark *fsn_mark,
+ 						__u32 mask);
+ /* add a mark to an inode */
+diff --git a/fs/notify/inode_mark.c b/fs/notify/inode_mark.c
+index fbb9dfb7b1d2..77838b0a60de 100644
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@ -194,6 +194,7 @@ int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ {
+ 	struct fsnotify_mark *lmark, *last = NULL;
+ 	int ret = 0;
++	int cmp;
+ 
+ 	mark->flags |= FSNOTIFY_MARK_FLAG_INODE;
+ 
+@@ -219,11 +220,8 @@ int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ 			goto out;
+ 		}
+ 
+-		if (mark->group->priority < lmark->group->priority)
+-			continue;
+-
+-		if ((mark->group->priority == lmark->group->priority) &&
+-		    (mark->group < lmark->group))
++		cmp = fsnotify_compare_groups(lmark->group, mark->group);
++		if (cmp < 0)
+ 			continue;
+ 
+ 		hlist_add_before_rcu(&mark->i.i_list, &lmark->i.i_list);
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index f08b3b729d3d..de1f57281d9c 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -215,6 +215,42 @@ void fsnotify_set_mark_ignored_mask_locked(struct fsnotify_mark *mark, __u32 mas
+ 	mark->ignored_mask = mask;
+ }
+ 
++/*
++ * Sorting function for lists of fsnotify marks.
++ *
++ * Fanotify supports different notification classes (reflected as priority of
++ * notification group). Events shall be passed to notification groups in
++ * decreasing priority order. To achieve this marks in notification lists for
++ * inodes and vfsmounts are sorted so that priorities of corresponding groups
++ * are descending.
++ *
++ * Furthermore correct handling of the ignore mask requires processing inode
++ * and vfsmount marks of each group together. Using the group address as
++ * further sort criterion provides a unique sorting order and thus we can
++ * merge inode and vfsmount lists of marks in linear time and find groups
++ * present in both lists.
++ *
++ * A return value of 1 signifies that b has priority over a.
++ * A return value of 0 signifies that the two marks have to be handled together.
++ * A return value of -1 signifies that a has priority over b.
++ */
++int fsnotify_compare_groups(struct fsnotify_group *a, struct fsnotify_group *b)
++{
++	if (a == b)
++		return 0;
++	if (!a)
++		return 1;
++	if (!b)
++		return -1;
++	if (a->priority < b->priority)
++		return 1;
++	if (a->priority > b->priority)
++		return -1;
++	if (a < b)
++		return 1;
++	return -1;
++}
++
+ /*
+  * Attach an initialized mark to a given group and fs object.
+  * These marks may be used for the fsnotify backend to determine which
+diff --git a/fs/notify/vfsmount_mark.c b/fs/notify/vfsmount_mark.c
+index 68ca5a8704b5..03bc12158105 100644
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@ -153,6 +153,7 @@ int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ 	struct mount *m = real_mount(mnt);
+ 	struct fsnotify_mark *lmark, *last = NULL;
+ 	int ret = 0;
++	int cmp;
+ 
+ 	mark->flags |= FSNOTIFY_MARK_FLAG_VFSMOUNT;
+ 
+@@ -178,11 +179,8 @@ int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ 			goto out;
+ 		}
+ 
+-		if (mark->group->priority < lmark->group->priority)
+-			continue;
+-
+-		if ((mark->group->priority == lmark->group->priority) &&
+-		    (mark->group < lmark->group))
++		cmp = fsnotify_compare_groups(lmark->group, mark->group);
++		if (cmp < 0)
+ 			continue;
+ 
+ 		hlist_add_before_rcu(&mark->m.m_list, &lmark->m.m_list);
