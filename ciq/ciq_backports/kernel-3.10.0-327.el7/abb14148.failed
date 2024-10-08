@@ -1,0 +1,1020 @@
+fnic: fnic Control Path Trace Utility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hiral Shah <hishah@cisco.com>
+commit abb14148c0f850e7201efc3e7aea1762f993606b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/abb14148.failed
+
+Fnic Ctlr Path Trace utility is a tracing functionality built directly into fnic
+driver to trace the control path frames like discovery, FLOGI request/reply,
+PLOGI request/reply, link event etc.  It will be one trace file for all fnics.
+It will help us to debug and resolve the discovery and initialization related
+issues in more convenient way. This trace information includes time stamp,
+Host Number, Frame type, Frame Length and Frame. By default,64 pages are
+allocated but we can change the number of allocated pages by module parameter
+fnic_fc_trace_max_page. Each entry is of 256 byte and available entries are
+depends on allocated number of pages. We can turn on or off the fnic control
+path trace functionality by module paramter fc_trace_enable and/or reset the
+trace contain by module paramter fc_trace_clear.
+
+	Signed-off-by: Hiral Shah <hishah@cisco.com>
+	Signed-off-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit abb14148c0f850e7201efc3e7aea1762f993606b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic.h
+diff --cc drivers/scsi/fnic/fnic.h
+index a547c3fee2f5,1d3521e13d77..000000000000
+--- a/drivers/scsi/fnic/fnic.h
++++ b/drivers/scsi/fnic/fnic.h
+@@@ -39,7 -39,7 +39,11 @@@
+  
+  #define DRV_NAME		"fnic"
+  #define DRV_DESCRIPTION		"Cisco FCoE HBA Driver"
+++<<<<<<< HEAD
+ +#define DRV_VERSION		"1.5.0.45a"
+++=======
++ #define DRV_VERSION		"1.6.0.10"
+++>>>>>>> abb14148c0f8 (fnic: fnic Control Path Trace Utility)
+  #define PFX			DRV_NAME ": "
+  #define DFX                     DRV_NAME "%d: "
+  
+* Unmerged path drivers/scsi/fnic/fnic.h
+diff --git a/drivers/scsi/fnic/fnic_debugfs.c b/drivers/scsi/fnic/fnic_debugfs.c
+index b6073f875761..2c613bdea78f 100644
+--- a/drivers/scsi/fnic/fnic_debugfs.c
++++ b/drivers/scsi/fnic/fnic_debugfs.c
+@@ -25,6 +25,21 @@ static struct dentry *fnic_trace_debugfs_file;
+ static struct dentry *fnic_trace_enable;
+ static struct dentry *fnic_stats_debugfs_root;
+ 
++static struct dentry *fnic_fc_trace_debugfs_file;
++static struct dentry *fnic_fc_rdata_trace_debugfs_file;
++static struct dentry *fnic_fc_trace_enable;
++static struct dentry *fnic_fc_trace_clear;
++
++struct fc_trace_flag_type {
++	u8 fc_row_file;
++	u8 fc_normal_file;
++	u8 fnic_trace;
++	u8 fc_trace;
++	u8 fc_clear;
++};
++
++static struct fc_trace_flag_type *fc_trc_flag;
++
+ /*
+  * fnic_debugfs_init - Initialize debugfs for fnic debug logging
+  *
+@@ -56,6 +71,18 @@ int fnic_debugfs_init(void)
+ 		return rc;
+ 	}
+ 
++	/* Allocate memory to structure */
++	fc_trc_flag = (struct fc_trace_flag_type *)
++		vmalloc(sizeof(struct fc_trace_flag_type));
++
++	if (fc_trc_flag) {
++		fc_trc_flag->fc_row_file = 0;
++		fc_trc_flag->fc_normal_file = 1;
++		fc_trc_flag->fnic_trace = 2;
++		fc_trc_flag->fc_trace = 3;
++		fc_trc_flag->fc_clear = 4;
++	}
++
+ 	rc = 0;
+ 	return rc;
+ }
+@@ -74,15 +101,19 @@ void fnic_debugfs_terminate(void)
+ 
+ 	debugfs_remove(fnic_trace_debugfs_root);
+ 	fnic_trace_debugfs_root = NULL;
++
++	if (fc_trc_flag)
++		vfree(fc_trc_flag);
+ }
+ 
+ /*
+- * fnic_trace_ctrl_open - Open the trace_enable file
++ * fnic_trace_ctrl_open - Open the trace_enable file for fnic_trace
++ *               Or Open fc_trace_enable file for fc_trace
+  * @inode: The inode pointer.
+  * @file: The file pointer to attach the trace enable/disable flag.
+  *
+  * Description:
+- * This routine opens a debugsfs file trace_enable.
++ * This routine opens a debugsfs file trace_enable or fc_trace_enable.
+  *
+  * Returns:
+  * This function returns zero if successful.
+@@ -94,15 +125,19 @@ static int fnic_trace_ctrl_open(struct inode *inode, struct file *filp)
+ }
+ 
+ /*
+- * fnic_trace_ctrl_read - Read a trace_enable debugfs file
++ * fnic_trace_ctrl_read -
++ *          Read  trace_enable ,fc_trace_enable
++ *              or fc_trace_clear debugfs file
+  * @filp: The file pointer to read from.
+  * @ubuf: The buffer to copy the data to.
+  * @cnt: The number of bytes to read.
+  * @ppos: The position in the file to start reading from.
+  *
+  * Description:
+- * This routine reads value of variable fnic_tracing_enabled
+- * and stores into local @buf. It will start reading file at @ppos and
++ * This routine reads value of variable fnic_tracing_enabled or
++ * fnic_fc_tracing_enabled or fnic_fc_trace_cleared
++ * and stores into local @buf.
++ * It will start reading file at @ppos and
+  * copy up to @cnt of data to @ubuf from @buf.
+  *
+  * Returns:
+@@ -114,13 +149,25 @@ static ssize_t fnic_trace_ctrl_read(struct file *filp,
+ {
+ 	char buf[64];
+ 	int len;
+-	len = sprintf(buf, "%u\n", fnic_tracing_enabled);
++	u8 *trace_type;
++	len = 0;
++	trace_type = (u8 *)filp->private_data;
++	if (*trace_type == fc_trc_flag->fnic_trace)
++		len = sprintf(buf, "%u\n", fnic_tracing_enabled);
++	else if (*trace_type == fc_trc_flag->fc_trace)
++		len = sprintf(buf, "%u\n", fnic_fc_tracing_enabled);
++	else if (*trace_type == fc_trc_flag->fc_clear)
++		len = sprintf(buf, "%u\n", fnic_fc_trace_cleared);
++	else
++		pr_err("fnic: Cannot read to any debugfs file\n");
+ 
+ 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, len);
+ }
+ 
+ /*
+- * fnic_trace_ctrl_write - Write to trace_enable debugfs file
++ * fnic_trace_ctrl_write -
++ * Write to trace_enable, fc_trace_enable or
++ *         fc_trace_clear debugfs file
+  * @filp: The file pointer to write from.
+  * @ubuf: The buffer to copy the data from.
+  * @cnt: The number of bytes to write.
+@@ -128,7 +175,8 @@ static ssize_t fnic_trace_ctrl_read(struct file *filp,
+  *
+  * Description:
+  * This routine writes data from user buffer @ubuf to buffer @buf and
+- * sets fnic_tracing_enabled value as per user input.
++ * sets fc_trace_enable ,tracing_enable or fnic_fc_trace_cleared
++ * value as per user input.
+  *
+  * Returns:
+  * This function returns the amount of data that was written.
+@@ -140,6 +188,8 @@ static ssize_t fnic_trace_ctrl_write(struct file *filp,
+ 	char buf[64];
+ 	unsigned long val;
+ 	int ret;
++	u8 *trace_type;
++	trace_type = (u8 *)filp->private_data;
+ 
+ 	if (cnt >= sizeof(buf))
+ 		return -EINVAL;
+@@ -153,12 +203,27 @@ static ssize_t fnic_trace_ctrl_write(struct file *filp,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	fnic_tracing_enabled = val;
++	if (*trace_type == fc_trc_flag->fnic_trace)
++		fnic_tracing_enabled = val;
++	else if (*trace_type == fc_trc_flag->fc_trace)
++		fnic_fc_tracing_enabled = val;
++	else if (*trace_type == fc_trc_flag->fc_clear)
++		fnic_fc_trace_cleared = val;
++	else
++		pr_err("fnic: cannot write to any debufs file\n");
++
+ 	(*ppos)++;
+ 
+ 	return cnt;
+ }
+ 
++static const struct file_operations fnic_trace_ctrl_fops = {
++	.owner = THIS_MODULE,
++	.open = fnic_trace_ctrl_open,
++	.read = fnic_trace_ctrl_read,
++	.write = fnic_trace_ctrl_write,
++};
++
+ /*
+  * fnic_trace_debugfs_open - Open the fnic trace log
+  * @inode: The inode pointer
+@@ -178,19 +243,36 @@ static int fnic_trace_debugfs_open(struct inode *inode,
+ 				  struct file *file)
+ {
+ 	fnic_dbgfs_t *fnic_dbg_prt;
++	u8 *rdata_ptr;
++	rdata_ptr = (u8 *)inode->i_private;
+ 	fnic_dbg_prt = kzalloc(sizeof(fnic_dbgfs_t), GFP_KERNEL);
+ 	if (!fnic_dbg_prt)
+ 		return -ENOMEM;
+ 
+-	fnic_dbg_prt->buffer = vmalloc((3*(trace_max_pages * PAGE_SIZE)));
+-	if (!fnic_dbg_prt->buffer) {
+-		kfree(fnic_dbg_prt);
+-		return -ENOMEM;
++	if (*rdata_ptr == fc_trc_flag->fnic_trace) {
++		fnic_dbg_prt->buffer = vmalloc(3 *
++					(trace_max_pages * PAGE_SIZE));
++		if (!fnic_dbg_prt->buffer) {
++			kfree(fnic_dbg_prt);
++			return -ENOMEM;
++		}
++		memset((void *)fnic_dbg_prt->buffer, 0,
++		3 * (trace_max_pages * PAGE_SIZE));
++		fnic_dbg_prt->buffer_len = fnic_get_trace_data(fnic_dbg_prt);
++	} else {
++		fnic_dbg_prt->buffer =
++			vmalloc(3 * (fnic_fc_trace_max_pages * PAGE_SIZE));
++		if (!fnic_dbg_prt->buffer) {
++			kfree(fnic_dbg_prt);
++			return -ENOMEM;
++		}
++		memset((void *)fnic_dbg_prt->buffer, 0,
++			3 * (fnic_fc_trace_max_pages * PAGE_SIZE));
++		fnic_dbg_prt->buffer_len =
++			fnic_fc_trace_get_data(fnic_dbg_prt, *rdata_ptr);
+ 	}
+-	memset((void *)fnic_dbg_prt->buffer, 0,
+-			  (3*(trace_max_pages * PAGE_SIZE)));
+-	fnic_dbg_prt->buffer_len = fnic_get_trace_data(fnic_dbg_prt);
+ 	file->private_data = fnic_dbg_prt;
++
+ 	return 0;
+ }
+ 
+@@ -272,13 +354,6 @@ static int fnic_trace_debugfs_release(struct inode *inode,
+ 	return 0;
+ }
+ 
+-static const struct file_operations fnic_trace_ctrl_fops = {
+-	.owner = THIS_MODULE,
+-	.open = fnic_trace_ctrl_open,
+-	.read = fnic_trace_ctrl_read,
+-	.write = fnic_trace_ctrl_write,
+-};
+-
+ static const struct file_operations fnic_trace_debugfs_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = fnic_trace_debugfs_open,
+@@ -306,9 +381,10 @@ int fnic_trace_debugfs_init(void)
+ 		return rc;
+ 	}
+ 	fnic_trace_enable = debugfs_create_file("tracing_enable",
+-					  S_IFREG|S_IRUGO|S_IWUSR,
+-					  fnic_trace_debugfs_root,
+-					  NULL, &fnic_trace_ctrl_fops);
++					S_IFREG|S_IRUGO|S_IWUSR,
++					fnic_trace_debugfs_root,
++					&(fc_trc_flag->fnic_trace),
++					&fnic_trace_ctrl_fops);
+ 
+ 	if (!fnic_trace_enable) {
+ 		printk(KERN_DEBUG
+@@ -317,10 +393,10 @@ int fnic_trace_debugfs_init(void)
+ 	}
+ 
+ 	fnic_trace_debugfs_file = debugfs_create_file("trace",
+-						  S_IFREG|S_IRUGO|S_IWUSR,
+-						  fnic_trace_debugfs_root,
+-						  NULL,
+-						  &fnic_trace_debugfs_fops);
++					S_IFREG|S_IRUGO|S_IWUSR,
++					fnic_trace_debugfs_root,
++					&(fc_trc_flag->fnic_trace),
++					&fnic_trace_debugfs_fops);
+ 
+ 	if (!fnic_trace_debugfs_file) {
+ 		printk(KERN_DEBUG
+@@ -340,14 +416,104 @@ int fnic_trace_debugfs_init(void)
+  */
+ void fnic_trace_debugfs_terminate(void)
+ {
+-	if (fnic_trace_debugfs_file) {
+-		debugfs_remove(fnic_trace_debugfs_file);
+-		fnic_trace_debugfs_file = NULL;
++	debugfs_remove(fnic_trace_debugfs_file);
++	fnic_trace_debugfs_file = NULL;
++
++	debugfs_remove(fnic_trace_enable);
++	fnic_trace_enable = NULL;
++}
++
++/*
++ * fnic_fc_trace_debugfs_init -
++ * Initialize debugfs for fnic control frame trace logging
++ *
++ * Description:
++ * When Debugfs is configured this routine sets up the fnic_fc debugfs
++ * file system. If not already created, this routine will create the
++ * create file trace to log fnic fc trace buffer output into debugfs and
++ * it will also create file fc_trace_enable to control enable/disable of
++ * trace logging into trace buffer.
++ */
++
++int fnic_fc_trace_debugfs_init(void)
++{
++	int rc = -1;
++
++	if (!fnic_trace_debugfs_root) {
++		pr_err("fnic:Debugfs root directory doesn't exist\n");
++		return rc;
++	}
++
++	fnic_fc_trace_enable = debugfs_create_file("fc_trace_enable",
++					S_IFREG|S_IRUGO|S_IWUSR,
++					fnic_trace_debugfs_root,
++					&(fc_trc_flag->fc_trace),
++					&fnic_trace_ctrl_fops);
++
++	if (!fnic_fc_trace_enable) {
++		pr_err("fnic: Failed create fc_trace_enable file\n");
++		return rc;
++	}
++
++	fnic_fc_trace_clear = debugfs_create_file("fc_trace_clear",
++					S_IFREG|S_IRUGO|S_IWUSR,
++					fnic_trace_debugfs_root,
++					&(fc_trc_flag->fc_clear),
++					&fnic_trace_ctrl_fops);
++
++	if (!fnic_fc_trace_clear) {
++		pr_err("fnic: Failed to create fc_trace_enable file\n");
++		return rc;
++	}
++
++	fnic_fc_rdata_trace_debugfs_file =
++		debugfs_create_file("fc_trace_rdata",
++				    S_IFREG|S_IRUGO|S_IWUSR,
++				    fnic_trace_debugfs_root,
++				    &(fc_trc_flag->fc_normal_file),
++				    &fnic_trace_debugfs_fops);
++
++	if (!fnic_fc_rdata_trace_debugfs_file) {
++		pr_err("fnic: Failed create fc_rdata_trace file\n");
++		return rc;
+ 	}
+-	if (fnic_trace_enable) {
+-		debugfs_remove(fnic_trace_enable);
+-		fnic_trace_enable = NULL;
++
++	fnic_fc_trace_debugfs_file =
++		debugfs_create_file("fc_trace",
++				    S_IFREG|S_IRUGO|S_IWUSR,
++				    fnic_trace_debugfs_root,
++				    &(fc_trc_flag->fc_row_file),
++				    &fnic_trace_debugfs_fops);
++
++	if (!fnic_fc_trace_debugfs_file) {
++		pr_err("fnic: Failed to create fc_trace file\n");
++		return rc;
+ 	}
++	rc = 0;
++	return rc;
++}
++
++/*
++ * fnic_fc_trace_debugfs_terminate - Tear down debugfs infrastructure
++ *
++ * Description:
++ * When Debugfs is configured this routine removes debugfs file system
++ * elements that are specific to fnic_fc trace logging.
++ */
++
++void fnic_fc_trace_debugfs_terminate(void)
++{
++	debugfs_remove(fnic_fc_trace_debugfs_file);
++	fnic_fc_trace_debugfs_file = NULL;
++
++	debugfs_remove(fnic_fc_rdata_trace_debugfs_file);
++	fnic_fc_rdata_trace_debugfs_file = NULL;
++
++	debugfs_remove(fnic_fc_trace_enable);
++	fnic_fc_trace_enable = NULL;
++
++	debugfs_remove(fnic_fc_trace_clear);
++	fnic_fc_trace_clear = NULL;
+ }
+ 
+ /*
+diff --git a/drivers/scsi/fnic/fnic_fcs.c b/drivers/scsi/fnic/fnic_fcs.c
+index e4f005760a36..40d814f396b3 100644
+--- a/drivers/scsi/fnic/fnic_fcs.c
++++ b/drivers/scsi/fnic/fnic_fcs.c
+@@ -66,19 +66,35 @@ void fnic_handle_link(struct work_struct *work)
+ 	fnic->link_down_cnt = vnic_dev_link_down_cnt(fnic->vdev);
+ 
+ 	if (old_link_status == fnic->link_status) {
+-		if (!fnic->link_status)
++		if (!fnic->link_status) {
+ 			/* DOWN -> DOWN */
+ 			spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+-		else {
++			fnic_fc_trace_set_data(fnic->lport->host->host_no,
++				FNIC_FC_LE, "Link Status: DOWN->DOWN",
++				strlen("Link Status: DOWN->DOWN"));
++		} else {
+ 			if (old_link_down_cnt != fnic->link_down_cnt) {
+ 				/* UP -> DOWN -> UP */
+ 				fnic->lport->host_stats.link_failure_count++;
+ 				spin_unlock_irqrestore(&fnic->fnic_lock, flags);
++				fnic_fc_trace_set_data(
++					fnic->lport->host->host_no,
++					FNIC_FC_LE,
++					"Link Status:UP_DOWN_UP",
++					strlen("Link_Status:UP_DOWN_UP")
++					);
+ 				FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host,
+ 					     "link down\n");
+ 				fcoe_ctlr_link_down(&fnic->ctlr);
+ 				if (fnic->config.flags & VFCF_FIP_CAPABLE) {
+ 					/* start FCoE VLAN discovery */
++					fnic_fc_trace_set_data(
++						fnic->lport->host->host_no,
++						FNIC_FC_LE,
++						"Link Status: UP_DOWN_UP_VLAN",
++						strlen(
++						"Link Status: UP_DOWN_UP_VLAN")
++						);
+ 					fnic_fcoe_send_vlan_req(fnic);
+ 					return;
+ 				}
+@@ -88,22 +104,36 @@ void fnic_handle_link(struct work_struct *work)
+ 			} else
+ 				/* UP -> UP */
+ 				spin_unlock_irqrestore(&fnic->fnic_lock, flags);
++				fnic_fc_trace_set_data(
++					fnic->lport->host->host_no, FNIC_FC_LE,
++					"Link Status: UP_UP",
++					strlen("Link Status: UP_UP"));
+ 		}
+ 	} else if (fnic->link_status) {
+ 		/* DOWN -> UP */
+ 		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ 		if (fnic->config.flags & VFCF_FIP_CAPABLE) {
+ 			/* start FCoE VLAN discovery */
++				fnic_fc_trace_set_data(
++				fnic->lport->host->host_no,
++				FNIC_FC_LE, "Link Status: DOWN_UP_VLAN",
++				strlen("Link Status: DOWN_UP_VLAN"));
+ 			fnic_fcoe_send_vlan_req(fnic);
+ 			return;
+ 		}
+ 		FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host, "link up\n");
++		fnic_fc_trace_set_data(fnic->lport->host->host_no, FNIC_FC_LE,
++			"Link Status: DOWN_UP", strlen("Link Status: DOWN_UP"));
+ 		fcoe_ctlr_link_up(&fnic->ctlr);
+ 	} else {
+ 		/* UP -> DOWN */
+ 		fnic->lport->host_stats.link_failure_count++;
+ 		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ 		FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host, "link down\n");
++		fnic_fc_trace_set_data(
++			fnic->lport->host->host_no, FNIC_FC_LE,
++			"Link Status: UP_DOWN",
++			strlen("Link Status: UP_DOWN"));
+ 		fcoe_ctlr_link_down(&fnic->ctlr);
+ 	}
+ 
+@@ -616,6 +646,10 @@ static inline int fnic_import_rq_eth_pkt(struct fnic *fnic, struct sk_buff *skb)
+ 					"using UCSM\n");
+ 			goto drop;
+ 		}
++		if ((fnic_fc_trace_set_data(fnic->lport->host->host_no,
++			FNIC_FC_RECV|0x80, (char *)skb->data, skb->len)) != 0) {
++			printk(KERN_ERR "fnic ctlr frame trace error!!!");
++		}
+ 		skb_queue_tail(&fnic->fip_frame_queue, skb);
+ 		queue_work(fnic_fip_queue, &fnic->fip_frame_work);
+ 		return 1;		/* let caller know packet was used */
+@@ -844,6 +878,10 @@ static void fnic_rq_cmpl_frame_recv(struct vnic_rq *rq, struct cq_desc
+ 	}
+ 	fr_dev(fp) = fnic->lport;
+ 	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
++	if ((fnic_fc_trace_set_data(fnic->lport->host->host_no, FNIC_FC_RECV,
++					(char *)skb->data, skb->len)) != 0) {
++		printk(KERN_ERR "fnic ctlr frame trace error!!!");
++	}
+ 
+ 	skb_queue_tail(&fnic->frame_queue, skb);
+ 	queue_work(fnic_event_queue, &fnic->frame_work);
+@@ -951,6 +989,15 @@ void fnic_eth_send(struct fcoe_ctlr *fip, struct sk_buff *skb)
+ 		vlan_hdr->h_vlan_proto = htons(ETH_P_8021Q);
+ 		vlan_hdr->h_vlan_encapsulated_proto = eth_hdr->h_proto;
+ 		vlan_hdr->h_vlan_TCI = htons(fnic->vlan_id);
++		if ((fnic_fc_trace_set_data(fnic->lport->host->host_no,
++			FNIC_FC_SEND|0x80, (char *)eth_hdr, skb->len)) != 0) {
++			printk(KERN_ERR "fnic ctlr frame trace error!!!");
++		}
++	} else {
++		if ((fnic_fc_trace_set_data(fnic->lport->host->host_no,
++			FNIC_FC_SEND|0x80, (char *)skb->data, skb->len)) != 0) {
++			printk(KERN_ERR "fnic ctlr frame trace error!!!");
++		}
+ 	}
+ 
+ 	pa = pci_map_single(fnic->pdev, skb->data, skb->len, PCI_DMA_TODEVICE);
+@@ -1023,6 +1070,11 @@ static int fnic_send_frame(struct fnic *fnic, struct fc_frame *fp)
+ 
+ 	pa = pci_map_single(fnic->pdev, eth_hdr, tot_len, PCI_DMA_TODEVICE);
+ 
++	if ((fnic_fc_trace_set_data(fnic->lport->host->host_no, FNIC_FC_SEND,
++				(char *)eth_hdr, tot_len)) != 0) {
++		printk(KERN_ERR "fnic ctlr frame trace error!!!");
++	}
++
+ 	spin_lock_irqsave(&fnic->wq_lock[0], flags);
+ 
+ 	if (!vnic_wq_desc_avail(wq)) {
+diff --git a/drivers/scsi/fnic/fnic_main.c b/drivers/scsi/fnic/fnic_main.c
+index 33e4ec2bfe73..3fcb50b212dd 100644
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@ -74,6 +74,11 @@ module_param(fnic_trace_max_pages, uint, S_IRUGO|S_IWUSR);
+ MODULE_PARM_DESC(fnic_trace_max_pages, "Total allocated memory pages "
+ 					"for fnic trace buffer");
+ 
++unsigned int fnic_fc_trace_max_pages = 64;
++module_param(fnic_fc_trace_max_pages, uint, S_IRUGO|S_IWUSR);
++MODULE_PARM_DESC(fnic_fc_trace_max_pages,
++		 "Total allocated memory pages for fc trace buffer");
++
+ static unsigned int fnic_max_qdepth = FNIC_DFLT_QUEUE_DEPTH;
+ module_param(fnic_max_qdepth, uint, S_IRUGO|S_IWUSR);
+ MODULE_PARM_DESC(fnic_max_qdepth, "Queue depth to report for each LUN");
+@@ -1033,11 +1038,20 @@ static int __init fnic_init_module(void)
+ 	/* Allocate memory for trace buffer */
+ 	err = fnic_trace_buf_init();
+ 	if (err < 0) {
+-		printk(KERN_ERR PFX "Trace buffer initialization Failed "
+-				  "Fnic Tracing utility is disabled\n");
++		printk(KERN_ERR PFX
++		       "Trace buffer initialization Failed. "
++		       "Fnic Tracing utility is disabled\n");
+ 		fnic_trace_free();
+ 	}
+ 
++    /* Allocate memory for fc trace buffer */
++	err = fnic_fc_trace_init();
++	if (err < 0) {
++		printk(KERN_ERR PFX "FC trace buffer initialization Failed "
++		       "FC frame tracing utility is disabled\n");
++		fnic_fc_trace_free();
++	}
++
+ 	/* Create a cache for allocation of default size sgls */
+ 	len = sizeof(struct fnic_dflt_sgl_list);
+ 	fnic_sgl_cache[FNIC_SGL_CACHE_DFLT] = kmem_cache_create
+@@ -1118,6 +1132,7 @@ err_create_fnic_sgl_slab_max:
+ 	kmem_cache_destroy(fnic_sgl_cache[FNIC_SGL_CACHE_DFLT]);
+ err_create_fnic_sgl_slab_dflt:
+ 	fnic_trace_free();
++	fnic_fc_trace_free();
+ 	fnic_debugfs_terminate();
+ 	return err;
+ }
+@@ -1135,6 +1150,7 @@ static void __exit fnic_cleanup_module(void)
+ 	kmem_cache_destroy(fnic_io_req_cache);
+ 	fc_release_transport(fnic_fc_transport);
+ 	fnic_trace_free();
++	fnic_fc_trace_free();
+ 	fnic_debugfs_terminate();
+ }
+ 
+diff --git a/drivers/scsi/fnic/fnic_trace.c b/drivers/scsi/fnic/fnic_trace.c
+index e002e7187dc0..c77285926827 100644
+--- a/drivers/scsi/fnic/fnic_trace.c
++++ b/drivers/scsi/fnic/fnic_trace.c
+@@ -20,6 +20,7 @@
+ #include <linux/errno.h>
+ #include <linux/spinlock.h>
+ #include <linux/kallsyms.h>
++#include <linux/time.h>
+ #include "fnic_io.h"
+ #include "fnic.h"
+ 
+@@ -32,6 +33,16 @@ static DEFINE_SPINLOCK(fnic_trace_lock);
+ static fnic_trace_dbg_t fnic_trace_entries;
+ int fnic_tracing_enabled = 1;
+ 
++/* static char *fnic_fc_ctlr_trace_buf_p; */
++
++static int fc_trace_max_entries;
++static unsigned long fnic_fc_ctlr_trace_buf_p;
++static fnic_trace_dbg_t fc_trace_entries;
++int fnic_fc_tracing_enabled = 1;
++int fnic_fc_trace_cleared = 1;
++static DEFINE_SPINLOCK(fnic_fc_trace_lock);
++
++
+ /*
+  * fnic_trace_get_buf - Give buffer pointer to user to fill up trace information
+  *
+@@ -428,10 +439,10 @@ int fnic_trace_buf_init(void)
+ 	}
+ 	err = fnic_trace_debugfs_init();
+ 	if (err < 0) {
+-		printk(KERN_ERR PFX "Failed to initialize debugfs for tracing\n");
++		pr_err("fnic: Failed to initialize debugfs for tracing\n");
+ 		goto err_fnic_trace_debugfs_init;
+ 	}
+-	printk(KERN_INFO PFX "Successfully Initialized Trace Buffer\n");
++	pr_info("fnic: Successfully Initialized Trace Buffer\n");
+ 	return err;
+ err_fnic_trace_debugfs_init:
+ 	fnic_trace_free();
+@@ -456,3 +467,314 @@ void fnic_trace_free(void)
+ 	}
+ 	printk(KERN_INFO PFX "Successfully Freed Trace Buffer\n");
+ }
++
++/*
++ * fnic_fc_ctlr_trace_buf_init -
++ * Initialize trace buffer to log fnic control frames
++ * Description:
++ * Initialize trace buffer data structure by allocating
++ * required memory for trace data as well as for Indexes.
++ * Frame size is 256 bytes and
++ * memory is allocated for 1024 entries of 256 bytes.
++ * Page_offset(Index) is set to the address of trace entry
++ * and page_offset is initialized by adding frame size
++ * to the previous page_offset entry.
++ */
++
++int fnic_fc_trace_init(void)
++{
++	unsigned long fc_trace_buf_head;
++	int err = 0;
++	int i;
++
++	fc_trace_max_entries = (fnic_fc_trace_max_pages * PAGE_SIZE)/
++				FC_TRC_SIZE_BYTES;
++	fnic_fc_ctlr_trace_buf_p = (unsigned long)vmalloc(
++					fnic_fc_trace_max_pages * PAGE_SIZE);
++	if (!fnic_fc_ctlr_trace_buf_p) {
++		pr_err("fnic: Failed to allocate memory for "
++		       "FC Control Trace Buf\n");
++		err = -ENOMEM;
++		goto err_fnic_fc_ctlr_trace_buf_init;
++	}
++
++	memset((void *)fnic_fc_ctlr_trace_buf_p, 0,
++			fnic_fc_trace_max_pages * PAGE_SIZE);
++
++	/* Allocate memory for page offset */
++	fc_trace_entries.page_offset = vmalloc(fc_trace_max_entries *
++						sizeof(unsigned long));
++	if (!fc_trace_entries.page_offset) {
++		pr_err("fnic:Failed to allocate memory for page_offset\n");
++		if (fnic_fc_ctlr_trace_buf_p) {
++			pr_err("fnic: Freeing FC Control Trace Buf\n");
++			vfree((void *)fnic_fc_ctlr_trace_buf_p);
++			fnic_fc_ctlr_trace_buf_p = 0;
++		}
++		err = -ENOMEM;
++		goto err_fnic_fc_ctlr_trace_buf_init;
++	}
++	memset((void *)fc_trace_entries.page_offset, 0,
++	       (fc_trace_max_entries * sizeof(unsigned long)));
++
++	fc_trace_entries.rd_idx = fc_trace_entries.wr_idx = 0;
++	fc_trace_buf_head = fnic_fc_ctlr_trace_buf_p;
++
++	/*
++	* Set up fc_trace_entries.page_offset field with memory location
++	* for every trace entry
++	*/
++	for (i = 0; i < fc_trace_max_entries; i++) {
++		fc_trace_entries.page_offset[i] = fc_trace_buf_head;
++		fc_trace_buf_head += FC_TRC_SIZE_BYTES;
++	}
++	err = fnic_fc_trace_debugfs_init();
++	if (err < 0) {
++		pr_err("fnic: Failed to initialize FC_CTLR tracing.\n");
++		goto err_fnic_fc_ctlr_trace_debugfs_init;
++	}
++	pr_info("fnic: Successfully Initialized FC_CTLR Trace Buffer\n");
++	return err;
++
++err_fnic_fc_ctlr_trace_debugfs_init:
++	fnic_fc_trace_free();
++err_fnic_fc_ctlr_trace_buf_init:
++	return err;
++}
++
++/*
++ * Fnic_fc_ctlr_trace_free - Free memory of fnic_fc_ctlr trace data structures.
++ */
++void fnic_fc_trace_free(void)
++{
++	fnic_fc_tracing_enabled = 0;
++	fnic_fc_trace_debugfs_terminate();
++	if (fc_trace_entries.page_offset) {
++		vfree((void *)fc_trace_entries.page_offset);
++		fc_trace_entries.page_offset = NULL;
++	}
++	if (fnic_fc_ctlr_trace_buf_p) {
++		vfree((void *)fnic_fc_ctlr_trace_buf_p);
++		fnic_fc_ctlr_trace_buf_p = 0;
++	}
++	pr_info("fnic:Successfully FC_CTLR Freed Trace Buffer\n");
++}
++
++/*
++ * fnic_fc_ctlr_set_trace_data:
++ *       Maintain rd & wr idx accordingly and set data
++ * Passed parameters:
++ *       host_no: host number accociated with fnic
++ *       frame_type: send_frame, rece_frame or link event
++ *       fc_frame: pointer to fc_frame
++ *       frame_len: Length of the fc_frame
++ * Description:
++ *   This routine will get next available wr_idx and
++ *   copy all passed trace data to the buffer pointed by wr_idx
++ *   and increment wr_idx. It will also make sure that we dont
++ *   overwrite the entry which we are reading and also
++ *   wrap around if we reach the maximum entries.
++ * Returned Value:
++ *   It will return 0 for success or -1 for failure
++ */
++int fnic_fc_trace_set_data(u32 host_no, u8 frame_type,
++				char *frame, u32 fc_trc_frame_len)
++{
++	unsigned long flags;
++	struct fc_trace_hdr *fc_buf;
++	unsigned long eth_fcoe_hdr_len;
++	char *fc_trace;
++
++	if (fnic_fc_tracing_enabled == 0)
++		return 0;
++
++	spin_lock_irqsave(&fnic_fc_trace_lock, flags);
++
++	if (fnic_fc_trace_cleared == 1) {
++		fc_trace_entries.rd_idx = fc_trace_entries.wr_idx = 0;
++		pr_info("fnic: Reseting the read idx\n");
++		memset((void *)fnic_fc_ctlr_trace_buf_p, 0,
++				fnic_fc_trace_max_pages * PAGE_SIZE);
++		fnic_fc_trace_cleared = 0;
++	}
++
++	fc_buf = (struct fc_trace_hdr *)
++		fc_trace_entries.page_offset[fc_trace_entries.wr_idx];
++
++	fc_trace_entries.wr_idx++;
++
++	if (fc_trace_entries.wr_idx >= fc_trace_max_entries)
++		fc_trace_entries.wr_idx = 0;
++
++	if (fc_trace_entries.wr_idx == fc_trace_entries.rd_idx) {
++		fc_trace_entries.rd_idx++;
++		if (fc_trace_entries.rd_idx >= fc_trace_max_entries)
++			fc_trace_entries.rd_idx = 0;
++	}
++
++	fc_buf->time_stamp = CURRENT_TIME;
++	fc_buf->host_no = host_no;
++	fc_buf->frame_type = frame_type;
++
++	fc_trace = (char *)FC_TRACE_ADDRESS(fc_buf);
++
++	/* During the receive path, we do not have eth hdr as well as fcoe hdr
++	 * at trace entry point so we will stuff 0xff just to make it generic.
++	 */
++	if (frame_type == FNIC_FC_RECV) {
++		eth_fcoe_hdr_len = sizeof(struct ethhdr) +
++					sizeof(struct fcoe_hdr);
++		fc_trc_frame_len = fc_trc_frame_len + eth_fcoe_hdr_len;
++		memset((char *)fc_trace, 0xff, eth_fcoe_hdr_len);
++		/* Copy the rest of data frame */
++		memcpy((char *)(fc_trace + eth_fcoe_hdr_len), (void *)frame,
++		min_t(u8, fc_trc_frame_len,
++			(u8)(FC_TRC_SIZE_BYTES - FC_TRC_HEADER_SIZE)));
++	} else {
++		memcpy((char *)fc_trace, (void *)frame,
++		min_t(u8, fc_trc_frame_len,
++			(u8)(FC_TRC_SIZE_BYTES - FC_TRC_HEADER_SIZE)));
++	}
++
++	/* Store the actual received length */
++	fc_buf->frame_len = fc_trc_frame_len;
++
++	spin_unlock_irqrestore(&fnic_fc_trace_lock, flags);
++	return 0;
++}
++
++/*
++ * fnic_fc_ctlr_get_trace_data: Copy trace buffer to a memory file
++ * Passed parameter:
++ *       @fnic_dbgfs_t: pointer to debugfs trace buffer
++ *       rdata_flag: 1 => Unformated file
++ *                   0 => formated file
++ * Description:
++ *       This routine will copy the trace data to memory file with
++ *       proper formatting and also copy to another memory
++ *       file without formatting for further procesing.
++ * Retrun Value:
++ *       Number of bytes that were dumped into fnic_dbgfs_t
++ */
++
++int fnic_fc_trace_get_data(fnic_dbgfs_t *fnic_dbgfs_prt, u8 rdata_flag)
++{
++	int rd_idx, wr_idx;
++	unsigned long flags;
++	int len = 0, j;
++	struct fc_trace_hdr *tdata;
++	char *fc_trace;
++
++	spin_lock_irqsave(&fnic_fc_trace_lock, flags);
++	if (fc_trace_entries.wr_idx == fc_trace_entries.rd_idx) {
++		spin_unlock_irqrestore(&fnic_fc_trace_lock, flags);
++		pr_info("fnic: Buffer is empty\n");
++		return 0;
++	}
++	rd_idx = fc_trace_entries.rd_idx;
++	wr_idx = fc_trace_entries.wr_idx;
++	if (rdata_flag == 0) {
++		len += snprintf(fnic_dbgfs_prt->buffer + len,
++			(fnic_fc_trace_max_pages * PAGE_SIZE * 3) - len,
++			"Time Stamp (UTC)\t\t"
++			"Host No:   F Type:  len:     FCoE_FRAME:\n");
++	}
++
++	while (rd_idx != wr_idx) {
++		tdata = (struct fc_trace_hdr *)
++			fc_trace_entries.page_offset[rd_idx];
++		if (!tdata) {
++			pr_info("fnic: Rd data is NULL\n");
++			spin_unlock_irqrestore(&fnic_fc_trace_lock, flags);
++			return 0;
++		}
++		if (rdata_flag == 0) {
++			copy_and_format_trace_data(tdata,
++				fnic_dbgfs_prt, &len, rdata_flag);
++		} else {
++			fc_trace = (char *)tdata;
++			for (j = 0; j < FC_TRC_SIZE_BYTES; j++) {
++				len += snprintf(fnic_dbgfs_prt->buffer + len,
++				(fnic_fc_trace_max_pages * PAGE_SIZE * 3)
++				- len, "%02x", fc_trace[j] & 0xff);
++			} /* for loop */
++			len += snprintf(fnic_dbgfs_prt->buffer + len,
++				(fnic_fc_trace_max_pages * PAGE_SIZE * 3) - len,
++				"\n");
++		}
++		rd_idx++;
++		if (rd_idx > (fc_trace_max_entries - 1))
++			rd_idx = 0;
++	}
++
++	spin_unlock_irqrestore(&fnic_fc_trace_lock, flags);
++	return len;
++}
++
++/*
++ * copy_and_format_trace_data: Copy formatted data to char * buffer
++ * Passed Parameter:
++ *      @fc_trace_hdr_t: pointer to trace data
++ *      @fnic_dbgfs_t: pointer to debugfs trace buffer
++ *      @orig_len: pointer to len
++ *      rdata_flag: 0 => Formated file, 1 => Unformated file
++ * Description:
++ *      This routine will format and copy the passed trace data
++ *      for formated file or unformated file accordingly.
++ */
++
++void copy_and_format_trace_data(struct fc_trace_hdr *tdata,
++				fnic_dbgfs_t *fnic_dbgfs_prt, int *orig_len,
++				u8 rdata_flag)
++{
++	struct tm tm;
++	int j, i = 1, len;
++	char *fc_trace, *fmt;
++	int ethhdr_len = sizeof(struct ethhdr) - 1;
++	int fcoehdr_len = sizeof(struct fcoe_hdr);
++	int fchdr_len = sizeof(struct fc_frame_header);
++	int max_size = fnic_fc_trace_max_pages * PAGE_SIZE * 3;
++
++	tdata->frame_type = tdata->frame_type & 0x7F;
++
++	len = *orig_len;
++
++	time_to_tm(tdata->time_stamp.tv_sec, 0, &tm);
++
++	fmt = "%02d:%02d:%04ld %02d:%02d:%02d.%09lu ns%8x       %c%8x\t";
++	len += snprintf(fnic_dbgfs_prt->buffer + len,
++		(fnic_fc_trace_max_pages * PAGE_SIZE * 3) - len,
++		fmt,
++		tm.tm_mon + 1, tm.tm_mday, tm.tm_year + 1900,
++		tm.tm_hour, tm.tm_min, tm.tm_sec,
++		tdata->time_stamp.tv_nsec, tdata->host_no,
++		tdata->frame_type, tdata->frame_len);
++
++	fc_trace = (char *)FC_TRACE_ADDRESS(tdata);
++
++	for (j = 0; j < min_t(u8, tdata->frame_len,
++		(u8)(FC_TRC_SIZE_BYTES - FC_TRC_HEADER_SIZE)); j++) {
++		if (tdata->frame_type == FNIC_FC_LE) {
++			len += snprintf(fnic_dbgfs_prt->buffer + len,
++				max_size - len, "%c", fc_trace[j]);
++		} else {
++			len += snprintf(fnic_dbgfs_prt->buffer + len,
++				max_size - len, "%02x", fc_trace[j] & 0xff);
++			len += snprintf(fnic_dbgfs_prt->buffer + len,
++				max_size - len, " ");
++			if (j == ethhdr_len ||
++				j == ethhdr_len + fcoehdr_len ||
++				j == ethhdr_len + fcoehdr_len + fchdr_len ||
++				(i > 3 && j%fchdr_len == 0)) {
++				len += snprintf(fnic_dbgfs_prt->buffer
++					+ len, (fnic_fc_trace_max_pages
++					* PAGE_SIZE * 3) - len,
++					"\n\t\t\t\t\t\t\t\t");
++				i++;
++			}
++		} /* end of else*/
++	} /* End of for loop*/
++	len += snprintf(fnic_dbgfs_prt->buffer + len,
++		max_size - len, "\n");
++	*orig_len = len;
++}
+diff --git a/drivers/scsi/fnic/fnic_trace.h b/drivers/scsi/fnic/fnic_trace.h
+index d412f2ee3c4f..a8aa0578fcb0 100644
+--- a/drivers/scsi/fnic/fnic_trace.h
++++ b/drivers/scsi/fnic/fnic_trace.h
+@@ -19,6 +19,17 @@
+ #define __FNIC_TRACE_H__
+ 
+ #define FNIC_ENTRY_SIZE_BYTES 64
++#define FC_TRC_SIZE_BYTES 256
++#define FC_TRC_HEADER_SIZE sizeof(struct fc_trace_hdr)
++
++/*
++ * Fisrt bit of FNIC_FC_RECV and FNIC_FC_SEND is used to represent the type
++ * of frame 1 => Eth frame, 0=> FC frame
++ */
++
++#define FNIC_FC_RECV 0x52 /* Character R */
++#define FNIC_FC_SEND 0x54 /* Character T */
++#define FNIC_FC_LE 0x4C /* Character L */
+ 
+ extern ssize_t simple_read_from_buffer(void __user *to,
+ 					  size_t count,
+@@ -30,6 +41,10 @@ extern unsigned int fnic_trace_max_pages;
+ extern int fnic_tracing_enabled;
+ extern unsigned int trace_max_pages;
+ 
++extern unsigned int fnic_fc_trace_max_pages;
++extern int fnic_fc_tracing_enabled;
++extern int fnic_fc_trace_cleared;
++
+ typedef struct fnic_trace_dbg {
+ 	int wr_idx;
+ 	int rd_idx;
+@@ -56,6 +71,16 @@ struct fnic_trace_data {
+ 
+ typedef struct fnic_trace_data fnic_trace_data_t;
+ 
++struct fc_trace_hdr {
++	struct timespec time_stamp;
++	u32 host_no;
++	u8 frame_type;
++	u8 frame_len;
++} __attribute__((__packed__));
++
++#define FC_TRACE_ADDRESS(a) \
++	((unsigned long)(a) + sizeof(struct fc_trace_hdr))
++
+ #define FNIC_TRACE_ENTRY_SIZE \
+ 		  (FNIC_ENTRY_SIZE_BYTES - sizeof(fnic_trace_data_t))
+ 
+@@ -88,4 +113,17 @@ int fnic_debugfs_init(void);
+ void fnic_debugfs_terminate(void);
+ int fnic_trace_debugfs_init(void);
+ void fnic_trace_debugfs_terminate(void);
++
++/* Fnic FC CTLR Trace releated function */
++int fnic_fc_trace_init(void);
++void fnic_fc_trace_free(void);
++int fnic_fc_trace_set_data(u32 host_no, u8 frame_type,
++				char *frame, u32 fc_frame_len);
++int fnic_fc_trace_get_data(fnic_dbgfs_t *fnic_dbgfs_prt, u8 rdata_flag);
++void copy_and_format_trace_data(struct fc_trace_hdr *tdata,
++				fnic_dbgfs_t *fnic_dbgfs_prt,
++				int *len, u8 rdata_flag);
++int fnic_fc_trace_debugfs_init(void);
++void fnic_fc_trace_debugfs_terminate(void);
++
+ #endif
