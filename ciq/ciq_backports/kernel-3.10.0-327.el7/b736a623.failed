@@ -1,0 +1,327 @@
+udptunnels: Call handle_offloads after inserting vlan tag.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] udptunnels: Call handle_offloads after inserting vlan tag (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 99.13%
+commit-author Jesse Gross <jesse@nicira.com>
+commit b736a623bd099cdf5521ca9bd03559f3bc7fa31c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b736a623.failed
+
+handle_offloads() calls skb_reset_inner_headers() to store
+the layer pointers to the encapsulated packet. However, we
+currently push the vlag tag (if there is one) onto the packet
+afterwards. This changes the MAC header for the encapsulated
+packet but it is not reflected in skb->inner_mac_header, which
+breaks GSO and drivers which attempt to use this for encapsulation
+offloads.
+
+Fixes: 1eaa8178 ("vxlan: Add tx-vlan offload support.")
+	Signed-off-by: Jesse Gross <jesse@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b736a623bd099cdf5521ca9bd03559f3bc7fa31c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/ipv4/geneve.c
+diff --cc drivers/net/vxlan.c
+index f88e71fe097a,fceb637efd6b..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1540,21 -1687,33 +1540,38 @@@ static inline struct sk_buff *vxlan_han
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+ -static int vxlan6_xmit_skb(struct dst_entry *dst, struct sk_buff *skb,
+ +static int vxlan6_xmit_skb(struct net *net, struct vxlan_sock *vs,
+ +			   struct dst_entry *dst, struct sk_buff *skb,
+  			   struct net_device *dev, struct in6_addr *saddr,
+  			   struct in6_addr *daddr, __u8 prio, __u8 ttl,
+ -			   __be16 src_port, __be16 dst_port,
+ -			   struct vxlan_metadata *md, bool xnet, u32 vxflags)
+ +			   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+ +	struct ipv6hdr *ip6h;
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+  
+++<<<<<<< HEAD
+ +	skb = vxlan_handle_offloads(skb, !udp_get_no_check6_tx(vs->sock->sk));
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+++=======
++ 	if ((vxflags & VXLAN_F_REMCSUM_TX) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		int csum_start = skb_checksum_start_offset(skb);
++ 
++ 		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
++ 		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
++ 		    (skb->csum_offset == offsetof(struct udphdr, check) ||
++ 		     skb->csum_offset == offsetof(struct tcphdr, check))) {
++ 			udp_sum = false;
++ 			type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		}
++ 	}
++ 
++ 	skb_scrub_packet(skb, xnet);
+++>>>>>>> b736a623bd09 (udptunnels: Call handle_offloads after inserting vlan tag.)
+  
+  	min_headroom = LL_RESERVED_SPACE(dst->dev) + dst->header_len
+  			+ VXLAN_HLEN + sizeof(struct ipv6hdr)
+@@@ -1562,72 -1721,82 +1579,93 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ -		goto err;
+ -	}
+ +	if (unlikely(err))
+ +		return err;
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb)) {
+ -		err = -ENOMEM;
+ -		goto err;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+  	}
+  
++ 	skb = iptunnel_handle_offloads(skb, udp_sum, type);
++ 	if (IS_ERR(skb)) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
++ 
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ -	vxh->vx_vni = md->vni;
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+  
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->len = htons(skb->len);
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ +	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ +			      IPSKB_REROUTED);
+ +	skb_dst_drop(skb);
+ +	skb_dst_set(skb, dst);
+  
+ -	if (vxflags & VXLAN_F_GBP)
+ -		vxlan_build_gbp_hdr(vxh, vxflags, md);
+ +	udp6_set_csum(udp_get_no_check6_tx(vs->sock->sk), skb,
+ +		      saddr, daddr, skb->len);
+  
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ -
+ -	udp_tunnel6_xmit_skb(dst, skb, dev, saddr, daddr, prio,
+ -			     ttl, src_port, dst_port,
+ -			     !!(vxflags & VXLAN_F_UDP_ZERO_CSUM6_TX));
+ +	__skb_push(skb, sizeof(*ip6h));
+ +	skb_reset_network_header(skb);
+ +	ip6h		  = ipv6_hdr(skb);
+ +	ip6h->version	  = 6;
+ +	ip6h->priority	  = prio;
+ +	ip6h->flow_lbl[0] = 0;
+ +	ip6h->flow_lbl[1] = 0;
+ +	ip6h->flow_lbl[2] = 0;
+ +	ip6h->payload_len = htons(skb->len);
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	ip6tunnel_xmit(skb, dev);
+  	return 0;
+ -err:
+ -	dst_release(dst);
+ -	return err;
+  }
+  #endif
+  
+ -int vxlan_xmit_skb(struct rtable *rt, struct sk_buff *skb,
+ +int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+ +		   struct rtable *rt, struct sk_buff *skb,
+  		   __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+ -		   __be16 src_port, __be16 dst_port,
+ -		   struct vxlan_metadata *md, bool xnet, u32 vxflags)
+ +		   __be16 src_port, __be16 dst_port, __be32 vni)
+  {
+  	struct vxlanhdr *vxh;
+ +	struct udphdr *uh;
+  	int min_headroom;
+  	int err;
+ -	bool udp_sum = !!(vxflags & VXLAN_F_UDP_CSUM);
+ -	int type = udp_sum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ -	u16 hdrlen = sizeof(struct vxlanhdr);
+  
+++<<<<<<< HEAD
+ +	skb = vxlan_handle_offloads(skb, !vs->sock->sk->sk_no_check_tx);
+ +	if (IS_ERR(skb))
+ +		return -EINVAL;
+++=======
++ 	if ((vxflags & VXLAN_F_REMCSUM_TX) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		int csum_start = skb_checksum_start_offset(skb);
++ 
++ 		if (csum_start <= VXLAN_MAX_REMCSUM_START &&
++ 		    !(csum_start & VXLAN_RCO_SHIFT_MASK) &&
++ 		    (skb->csum_offset == offsetof(struct udphdr, check) ||
++ 		     skb->csum_offset == offsetof(struct tcphdr, check))) {
++ 			udp_sum = false;
++ 			type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		}
++ 	}
+++>>>>>>> b736a623bd09 (udptunnels: Call handle_offloads after inserting vlan tag.)
+  
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@@ -1635,36 -1804,47 +1673,40 @@@
+  
+  	/* Need space for new headers (invalidates iph ptr) */
+  	err = skb_cow_head(skb, min_headroom);
+ -	if (unlikely(err)) {
+ -		kfree_skb(skb);
+ +	if (unlikely(err))
+  		return err;
+ -	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (WARN_ON(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+  
++ 	skb = iptunnel_handle_offloads(skb, udp_sum, type);
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+ -	vxh->vx_flags = htonl(VXLAN_HF_VNI);
+ -	vxh->vx_vni = md->vni;
+ -
+ -	if (type & SKB_GSO_TUNNEL_REMCSUM) {
+ -		u32 data = (skb_checksum_start_offset(skb) - hdrlen) >>
+ -			   VXLAN_RCO_SHIFT;
+ +	vxh->vx_flags = htonl(VXLAN_FLAGS);
+ +	vxh->vx_vni = vni;
+  
+ -		if (skb->csum_offset == offsetof(struct udphdr, check))
+ -			data |= VXLAN_RCO_UDP;
+ +	__skb_push(skb, sizeof(*uh));
+ +	skb_reset_transport_header(skb);
+ +	uh = udp_hdr(skb);
+  
+ -		vxh->vx_vni |= htonl(data);
+ -		vxh->vx_flags |= htonl(VXLAN_HF_RCO);
+ +	uh->dest = dst_port;
+ +	uh->source = src_port;
+  
+ -		if (!skb_is_gso(skb)) {
+ -			skb->ip_summed = CHECKSUM_NONE;
+ -			skb->encapsulation = 0;
+ -		}
+ -	}
+ +	uh->len = htons(skb->len);
+  
+ -	if (vxflags & VXLAN_F_GBP)
+ -		vxlan_build_gbp_hdr(vxh, vxflags, md);
+ +	udp_set_csum(vs->sock->sk->sk_no_check_tx, skb,
+ +		     src, dst, skb->len);
+  
+ -	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ -
+ -	return udp_tunnel_xmit_skb(rt, skb, src, dst, tos,
+ -				   ttl, df, src_port, dst_port, xnet,
+ -				   !(vxflags & VXLAN_F_UDP_CSUM));
+ +	return iptunnel_xmit(vs->sock->sk, rt, skb, src, dst, IPPROTO_UDP,
+ +			     tos, ttl, df);
+  }
+  EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+  
+diff --cc net/ipv4/geneve.c
+index b59373119987,a566a2e4715b..000000000000
+--- a/net/ipv4/geneve.c
++++ b/net/ipv4/geneve.c
+@@@ -113,13 -113,9 +113,16 @@@ int geneve_xmit_skb(struct geneve_sock 
+  	int min_headroom;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	skb = udp_tunnel_handle_offloads(skb, !gs->sock->sk->sk_no_check_tx);
+ +	if (IS_ERR(skb))
+ +		return PTR_ERR(skb);
+ +
+++=======
+++>>>>>>> b736a623bd09 (udptunnels: Call handle_offloads after inserting vlan tag.)
+  	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+  			+ GENEVE_BASE_HLEN + opt_len + sizeof(struct iphdr)
+ -			+ (skb_vlan_tag_present(skb) ? VLAN_HLEN : 0);
+ +			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0);
+  
+  	err = skb_cow_head(skb, min_headroom);
+  	if (unlikely(err)) {
+@@@ -127,16 -123,14 +130,20 @@@
+  		return err;
+  	}
+  
+ -	skb = vlan_hwaccel_push_inside(skb);
+ -	if (unlikely(!skb))
+ -		return -ENOMEM;
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (unlikely(!__vlan_put_tag(skb,
+ +					     skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb)))) {
+ +			err = -ENOMEM;
+ +			return err;
+ +		}
+ +		skb->vlan_tci = 0;
+ +	}
+  
++ 	skb = udp_tunnel_handle_offloads(skb, csum);
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
+  	gnvh = (struct genevehdr *)__skb_push(skb, sizeof(*gnvh) + opt_len);
+  	geneve_build_header(gnvh, tun_flags, vni, opt_len, opt);
+  
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path net/ipv4/geneve.c
