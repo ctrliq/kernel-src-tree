@@ -728,6 +728,7 @@ int mmc_sd_get_cid(struct mmc_host *host, u32 ocr, u32 *cid, u32 *rocr)
 	int err;
 	u32 max_current;
 	int retries = 10;
+	u32 pocr = ocr;
 
 try_again:
 	if (!retries) {
@@ -781,7 +782,7 @@ try_again:
 	if (!mmc_host_is_spi(host) && rocr &&
 	   ((*rocr & 0x41000000) == 0x41000000)) {
 		err = mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_180,
-					host->ocr);
+					pocr);
 		if (err == -EAGAIN) {
 			retries--;
 			goto try_again;
@@ -943,6 +944,7 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 		if (IS_ERR(card))
 			return PTR_ERR(card);
 
+		card->ocr = ocr;
 		card->type = MMC_TYPE_SD;
 		memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
 	}
@@ -1107,9 +1109,9 @@ static int mmc_sd_resume(struct mmc_host *host)
 	BUG_ON(!host->card);
 
 	mmc_claim_host(host);
-	mmc_power_up(host, host->ocr);
-	mmc_select_voltage(host, host->ocr);
-	err = mmc_sd_init_card(host, host->ocr, host->card);
+	mmc_power_up(host, host->card->ocr);
+	mmc_select_voltage(host, host->card->ocr);
+	err = mmc_sd_init_card(host, host->card->ocr, host->card);
 	mmc_release_host(host);
 
 	return err;
@@ -1152,7 +1154,7 @@ static int mmc_sd_runtime_resume(struct mmc_host *host)
 
 	mmc_claim_host(host);
 
-	mmc_power_up(host, host->ocr);
+	mmc_power_up(host, host->card->ocr);
 	err = mmc_sd_resume(host);
 	if (err)
 		pr_err("%s: error %d doing aggessive resume\n",
@@ -1168,7 +1170,7 @@ static int mmc_sd_power_restore(struct mmc_host *host)
 
 	host->card->state &= ~MMC_STATE_HIGHSPEED;
 	mmc_claim_host(host);
-	ret = mmc_sd_init_card(host, host->ocr, host->card);
+	ret = mmc_sd_init_card(host, host->card->ocr, host->card);
 	mmc_release_host(host);
 
 	return ret;
@@ -1192,7 +1194,7 @@ static const struct mmc_bus_ops mmc_sd_ops = {
 int mmc_attach_sd(struct mmc_host *host)
 {
 	int err;
-	u32 ocr;
+	u32 ocr, rocr;
 
 	BUG_ON(!host);
 	WARN_ON(!host->claimed);
@@ -1235,12 +1237,12 @@ int mmc_attach_sd(struct mmc_host *host)
 		ocr &= ~MMC_VDD_165_195;
 	}
 
-	host->ocr = mmc_select_voltage(host, ocr);
+	rocr = mmc_select_voltage(host, ocr);
 
 	/*
 	 * Can we support the voltage(s) of the card(s)?
 	 */
-	if (!host->ocr) {
+	if (!rocr) {
 		err = -EINVAL;
 		goto err;
 	}
@@ -1248,7 +1250,7 @@ int mmc_attach_sd(struct mmc_host *host)
 	/*
 	 * Detect and init the card.
 	 */
-	err = mmc_sd_init_card(host, host->ocr, NULL);
+	err = mmc_sd_init_card(host, rocr, NULL);
 	if (err)
 		goto err;
 
