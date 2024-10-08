@@ -1,0 +1,173 @@
+iommu/vt-d: Make device_to_iommu() cope with non-PCI devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Make device_to_iommu() cope with non-PCI devices (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 94.74%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit 156baca8d31e1aced2c8a14262637aef1ab416b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/156baca8.failed
+
+Pass the struct device to it, and also make it return the bus/devfn to use,
+since that is also stored in the DMAR table.
+
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 156baca8d31e1aced2c8a14262637aef1ab416b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 144c54a1b81e,cfc5eef81b82..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -686,34 -664,56 +686,82 @@@ static void domain_update_iommu_cap(str
+  	domain_update_iommu_superpage(domain);
+  }
+  
+- static struct intel_iommu *device_to_iommu(int segment, u8 bus, u8 devfn)
++ static struct intel_iommu *device_to_iommu(struct device *dev, u8 *bus, u8 *devfn)
+  {
+  	struct dmar_drhd_unit *drhd = NULL;
+++<<<<<<< HEAD
+ +	int i;
+ +
+ +	for_each_drhd_unit(drhd) {
+ +		if (drhd->ignored)
+ +			continue;
+ +		if (segment != drhd->segment)
+ +			continue;
+ +
+ +		for (i = 0; i < drhd->devices_cnt; i++) {
+ +			if (drhd->devices[i] &&
+ +			    drhd->devices[i]->bus->number == bus &&
+ +			    drhd->devices[i]->devfn == devfn)
+ +				return drhd->iommu;
+ +			if (drhd->devices[i] &&
+ +			    drhd->devices[i]->subordinate &&
+ +			    drhd->devices[i]->subordinate->number <= bus &&
+ +			    drhd->devices[i]->subordinate->busn_res.end >= bus)
+ +				return drhd->iommu;
+ +		}
+ +
+ +		if (drhd->include_all)
+ +			return drhd->iommu;
+ +	}
+++=======
++ 	struct intel_iommu *iommu;
++ 	struct device *tmp;
++ 	struct pci_dev *ptmp, *pdev = NULL;
++ 	u16 segment;
++ 	int i;
++ 
++ 	if (dev_is_pci(dev)) {
++ 		pdev = to_pci_dev(dev);
++ 		segment = pci_domain_nr(pdev->bus);
++ 	} else if (ACPI_COMPANION(dev))
++ 		dev = &ACPI_COMPANION(dev)->dev;
++ 
++ 	rcu_read_lock();
++ 	for_each_active_iommu(iommu, drhd) {
++ 		if (pdev && segment != drhd->segment)
++ 			continue;
++ 
++ 		for_each_active_dev_scope(drhd->devices,
++ 					  drhd->devices_cnt, i, tmp) {
++ 			if (tmp == dev) {
++ 				*bus = drhd->devices[i].bus;
++ 				*devfn = drhd->devices[i].devfn;
++ 				goto out;
++ 			}
++ 
++ 			if (!pdev || !dev_is_pci(tmp))
++ 				continue;
++ 
++ 			ptmp = to_pci_dev(tmp);
++ 			if (ptmp->subordinate &&
++ 			    ptmp->subordinate->number <= pdev->bus->number &&
++ 			    ptmp->subordinate->busn_res.end >= pdev->bus->number)
++ 				goto got_pdev;
++ 		}
++ 
++ 		if (pdev && drhd->include_all) {
++ 		got_pdev:
++ 			*bus = pdev->bus->number;
++ 			*devfn = pdev->devfn;
++ 			goto out;
++ 		}
++ 	}
++ 	iommu = NULL;
++  out:
++ 	rcu_read_unlock();
+++>>>>>>> 156baca8d31e (iommu/vt-d: Make device_to_iommu() cope with non-PCI devices)
+  
+ -	return iommu;
+ +	return NULL;
+  }
+  
+  static void domain_flush_cache(struct dmar_domain *domain,
+@@@ -1738,9 -1845,14 +1786,20 @@@ domain_context_mapping(struct dmar_doma
+  {
+  	int ret;
+  	struct pci_dev *tmp, *parent;
+++<<<<<<< HEAD
+ +
+ +	ret = domain_context_mapping_one(domain, pci_domain_nr(pdev->bus),
+ +					 pdev->bus->number, pdev->devfn,
+++=======
++ 	struct intel_iommu *iommu;
++ 	u8 bus, devfn;
++ 
++ 	iommu = device_to_iommu(&pdev->dev, &bus, &devfn);
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	ret = domain_context_mapping_one(domain, iommu, bus, devfn,
+++>>>>>>> 156baca8d31e (iommu/vt-d: Make device_to_iommu() cope with non-PCI devices)
+  					 translation);
+  	if (ret)
+  		return ret;
+@@@ -2343,25 -2472,18 +2402,40 @@@ static int domain_add_dev_info(struct d
+  			       struct pci_dev *pdev,
+  			       int translation)
+  {
+++<<<<<<< HEAD
+ +	struct device_domain_info *info;
+ +	unsigned long flags;
+ +	int ret;
+ +
+ +	info = alloc_devinfo_mem();
+ +	if (!info)
+ +		return -ENOMEM;
+ +
+ +	info->segment = pci_domain_nr(pdev->bus);
+ +	info->bus = pdev->bus->number;
+ +	info->devfn = pdev->devfn;
+ +	info->dev = pdev;
+ +	info->domain = domain;
+ +
+ +	spin_lock_irqsave(&device_domain_lock, flags);
+ +	list_add(&info->link, &domain->devices);
+ +	list_add(&info->global, &device_domain_list);
+ +	pdev->dev.archdata.iommu = info;
+ +	spin_unlock_irqrestore(&device_domain_lock, flags);
+++=======
++ 	struct dmar_domain *ndomain;
++ 	struct intel_iommu *iommu;
++ 	u8 bus, devfn;
++ 	int ret;
++ 
++ 	iommu = device_to_iommu(&pdev->dev, &bus, &devfn);
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	ndomain = dmar_insert_dev_info(iommu, bus, devfn, &pdev->dev, domain);
++ 	if (ndomain != domain)
++ 		return -EBUSY;
+++>>>>>>> 156baca8d31e (iommu/vt-d: Make device_to_iommu() cope with non-PCI devices)
+  
+  	ret = domain_context_mapping(domain, pdev, translation);
+  	if (ret) {
+* Unmerged path drivers/iommu/intel-iommu.c
