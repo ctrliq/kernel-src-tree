@@ -1377,6 +1377,7 @@ int nfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	struct dentry *res;
 	struct iattr attr = { .ia_valid = ATTR_OPEN };
 	struct inode *inode;
+	unsigned int lookup_flags = 0;
 	int err;
 
 	/* Expect a negative dentry */
@@ -1399,6 +1400,7 @@ int nfs_atomic_open(struct inode *dir, struct dentry *dentry,
 			 */
 			return -ENOENT;
 		}
+		lookup_flags = LOOKUP_OPEN|LOOKUP_DIRECTORY;
 		goto no_open;
 	}
 
@@ -1449,7 +1451,7 @@ out:
 	return err;
 
 no_open:
-	res = nfs_lookup(dir, dentry, 0);
+	res = nfs_lookup(dir, dentry, lookup_flags);
 	err = PTR_ERR(res);
 	if (IS_ERR(res))
 		goto out;
