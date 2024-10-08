@@ -1162,7 +1162,7 @@ void __init setup_arch(char **cmdline_p)
 
 	cleanup_highmap();
 
-	memblock.current_limit = ISA_END_ADDRESS;
+	memblock_set_current_limit(ISA_END_ADDRESS);
 	memblock_x86_fill();
 
 	/*
@@ -1195,7 +1195,7 @@ void __init setup_arch(char **cmdline_p)
 
 	setup_real_mode();
 
-	memblock.current_limit = get_max_mapped();
+	memblock_set_current_limit(get_max_mapped());
 	dma_contiguous_reserve(0);
 
 	/*
