@@ -1,0 +1,267 @@
+qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shahed Shaikh <shahed.shaikh@qlogic.com>
+commit 7f1f6056f2f7293d5108eda905af42df58b78370
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7f1f6056.failed
+
+Commit 2b3d7b758c687("qlcnic: Add VXLAN Rx offload support") uses
+vxlan_get_rx_port() which caused build failure when VXLAN=m.
+
+This patch fixes the build failure by adding dependency on VXLAN
+in Kconfig of qlcnic module and use vxlan_get_rx_port() and support
+code accordingly.
+
+	Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f1f6056f2f7293d5108eda905af42df58b78370)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 9c809069393f,f31bb5e9d8a9..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@@ -963,6 -1010,12 +963,15 @@@ struct qlcnic_ipaddr 
+  #define QLCNIC_TX_INTR_SHARED		0x10000
+  #define QLCNIC_APP_CHANGED_FLAGS	0x20000
+  #define QLCNIC_HAS_PHYS_PORT_ID		0x40000
+++<<<<<<< HEAD
+++=======
++ #define QLCNIC_TSS_RSS			0x80000
++ 
++ #ifdef CONFIG_QLCNIC_VXLAN
++ #define QLCNIC_ADD_VXLAN_PORT		0x100000
++ #define QLCNIC_DEL_VXLAN_PORT		0x200000
++ #endif
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  
+  #define QLCNIC_IS_MSI_FAMILY(adapter) \
+  	((adapter)->flags & (QLCNIC_MSI_ENABLED | QLCNIC_MSIX_ENABLED))
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+index b96df5e6484f,b48737dcd3c5..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+@@@ -1017,10 -1020,99 +1017,105 @@@ static int qlcnic_83xx_idc_check_state_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_QLCNIC_VXLAN
++ #define QLC_83XX_ENCAP_TYPE_VXLAN	BIT_1
++ #define QLC_83XX_MATCH_ENCAP_ID		BIT_2
++ #define QLC_83XX_SET_VXLAN_UDP_DPORT	BIT_3
++ #define QLC_83XX_VXLAN_UDP_DPORT(PORT)	((PORT & 0xffff) << 16)
++ 
++ #define QLCNIC_ENABLE_INGRESS_ENCAP_PARSING 1
++ #define QLCNIC_DISABLE_INGRESS_ENCAP_PARSING 0
++ 
++ static int qlcnic_set_vxlan_port(struct qlcnic_adapter *adapter)
++ {
++ 	u16 port = adapter->ahw->vxlan_port;
++ 	struct qlcnic_cmd_args cmd;
++ 	int ret = 0;
++ 
++ 	memset(&cmd, 0, sizeof(cmd));
++ 
++ 	ret = qlcnic_alloc_mbx_args(&cmd, adapter,
++ 				    QLCNIC_CMD_INIT_NIC_FUNC);
++ 	if (ret)
++ 		return ret;
++ 
++ 	cmd.req.arg[1] = QLC_83XX_MULTI_TENANCY_INFO;
++ 	cmd.req.arg[2] = QLC_83XX_ENCAP_TYPE_VXLAN |
++ 			 QLC_83XX_SET_VXLAN_UDP_DPORT |
++ 			 QLC_83XX_VXLAN_UDP_DPORT(port);
++ 
++ 	ret = qlcnic_issue_cmd(adapter, &cmd);
++ 	if (ret)
++ 		netdev_err(adapter->netdev,
++ 			   "Failed to set VXLAN port %d in adapter\n",
++ 			   port);
++ 
++ 	qlcnic_free_mbx_args(&cmd);
++ 
++ 	return ret;
++ }
++ 
++ static int qlcnic_set_vxlan_parsing(struct qlcnic_adapter *adapter,
++ 				    bool state)
++ {
++ 	u16 vxlan_port = adapter->ahw->vxlan_port;
++ 	struct qlcnic_cmd_args cmd;
++ 	int ret = 0;
++ 
++ 	memset(&cmd, 0, sizeof(cmd));
++ 
++ 	ret = qlcnic_alloc_mbx_args(&cmd, adapter,
++ 				    QLCNIC_CMD_SET_INGRESS_ENCAP);
++ 	if (ret)
++ 		return ret;
++ 
++ 	cmd.req.arg[1] = state ? QLCNIC_ENABLE_INGRESS_ENCAP_PARSING :
++ 				 QLCNIC_DISABLE_INGRESS_ENCAP_PARSING;
++ 
++ 	ret = qlcnic_issue_cmd(adapter, &cmd);
++ 	if (ret)
++ 		netdev_err(adapter->netdev,
++ 			   "Failed to %s VXLAN parsing for port %d\n",
++ 			   state ? "enable" : "disable", vxlan_port);
++ 	else
++ 		netdev_info(adapter->netdev,
++ 			    "%s VXLAN parsing for port %d\n",
++ 			    state ? "Enabled" : "Disabled", vxlan_port);
++ 
++ 	qlcnic_free_mbx_args(&cmd);
++ 
++ 	return ret;
++ }
++ #endif
++ 
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  static void qlcnic_83xx_periodic_tasks(struct qlcnic_adapter *adapter)
+  {
+  	if (adapter->fhash.fnum)
+  		qlcnic_prune_lb_filters(adapter);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_QLCNIC_VXLAN
++ 	if (adapter->flags & QLCNIC_ADD_VXLAN_PORT) {
++ 		if (qlcnic_set_vxlan_port(adapter))
++ 			return;
++ 
++ 		if (qlcnic_set_vxlan_parsing(adapter, true))
++ 			return;
++ 
++ 		adapter->flags &= ~QLCNIC_ADD_VXLAN_PORT;
++ 	} else if (adapter->flags & QLCNIC_DEL_VXLAN_PORT) {
++ 		if (qlcnic_set_vxlan_parsing(adapter, false))
++ 			return;
++ 
++ 		adapter->ahw->vxlan_port = 0;
++ 		adapter->flags &= ~QLCNIC_DEL_VXLAN_PORT;
++ 	}
++ #endif
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 3b17c83155ba,309d05640883..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@@ -21,6 -21,9 +21,12 @@@
+  #include <linux/aer.h>
+  #include <linux/log2.h>
+  #include <linux/pci.h>
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_QLCNIC_VXLAN
++ #include <net/vxlan.h>
++ #endif
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  
+  MODULE_DESCRIPTION("QLogic 1/10 GbE Converged/Intelligent Ethernet Driver");
+  MODULE_LICENSE("GPL");
+@@@ -452,6 -464,37 +458,40 @@@ static int qlcnic_get_phys_port_id(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_QLCNIC_VXLAN
++ static void qlcnic_add_vxlan_port(struct net_device *netdev,
++ 				  sa_family_t sa_family, __be16 port)
++ {
++ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++ 	struct qlcnic_hardware_context *ahw = adapter->ahw;
++ 
++ 	/* Adapter supports only one VXLAN port. Use very first port
++ 	 * for enabling offload
++ 	 */
++ 	if (!qlcnic_encap_rx_offload(adapter) || ahw->vxlan_port)
++ 		return;
++ 
++ 	ahw->vxlan_port = ntohs(port);
++ 	adapter->flags |= QLCNIC_ADD_VXLAN_PORT;
++ }
++ 
++ static void qlcnic_del_vxlan_port(struct net_device *netdev,
++ 				  sa_family_t sa_family, __be16 port)
++ {
++ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++ 	struct qlcnic_hardware_context *ahw = adapter->ahw;
++ 
++ 	if (!qlcnic_encap_rx_offload(adapter) || !ahw->vxlan_port ||
++ 	    (ahw->vxlan_port != ntohs(port)))
++ 		return;
++ 
++ 	adapter->flags |= QLCNIC_DEL_VXLAN_PORT;
++ }
++ #endif
++ 
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  static const struct net_device_ops qlcnic_netdev_ops = {
+  	.ndo_open	   = qlcnic_open,
+  	.ndo_stop	   = qlcnic_close,
+@@@ -470,6 -513,10 +510,13 @@@
+  	.ndo_fdb_del		= qlcnic_fdb_del,
+  	.ndo_fdb_dump		= qlcnic_fdb_dump,
+  	.ndo_get_phys_port_id	= qlcnic_get_phys_port_id,
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_QLCNIC_VXLAN
++ 	.ndo_add_vxlan_port	= qlcnic_add_vxlan_port,
++ 	.ndo_del_vxlan_port	= qlcnic_del_vxlan_port,
++ #endif
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller = qlcnic_poll_controller,
+  #endif
+@@@ -1791,6 -1981,11 +1838,14 @@@ qlcnic_attach(struct qlcnic_adapter *ad
+  
+  	qlcnic_create_sysfs_entries(adapter);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_QLCNIC_VXLAN
++ 	if (qlcnic_encap_rx_offload(adapter))
++ 		vxlan_get_rx_port(netdev);
++ #endif
++ 
+++>>>>>>> 7f1f6056f2f7 (qlcnic: Fix build failure due to undefined reference to `vxlan_get_rx_port')
+  	adapter->is_up = QLCNIC_ADAPTER_UP_MAGIC;
+  	return 0;
+  
+diff --git a/drivers/net/ethernet/qlogic/Kconfig b/drivers/net/ethernet/qlogic/Kconfig
+index f59e6be4a66e..c14bd3116e45 100644
+--- a/drivers/net/ethernet/qlogic/Kconfig
++++ b/drivers/net/ethernet/qlogic/Kconfig
+@@ -56,6 +56,16 @@ config QLCNIC_DCB
+ 	  mode of DCB is supported. PG and PFC values are related only
+ 	  to Tx.
+ 
++config QLCNIC_VXLAN
++	bool "Virtual eXtensible Local Area Network (VXLAN) offload support"
++	default n
++	depends on QLCNIC && VXLAN && !(QLCNIC=y && VXLAN=m)
++	---help---
++	  This enables hardware offload support for VXLAN protocol over QLogic's
++	  84XX series adapters.
++	  Say Y here if you want to enable hardware offload support for
++	  Virtual eXtensible Local Area Network (VXLAN) in the driver.
++
+ config QLGE
+ 	tristate "QLogic QLGE 10Gb Ethernet Driver Support"
+ 	depends on PCI
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
