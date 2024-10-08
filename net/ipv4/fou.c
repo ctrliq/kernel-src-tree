@@ -105,7 +105,8 @@ drop:
 }
 
 static struct sk_buff **fou_gro_receive(struct sk_buff **head,
-					struct sk_buff *skb)
+					struct sk_buff *skb,
+					struct udp_offload *uoff)
 {
 	const struct net_offload *ops;
 	struct sk_buff **pp = NULL;
@@ -126,7 +127,8 @@ out_unlock:
 	return pp;
 }
 
-static int fou_gro_complete(struct sk_buff *skb, int nhoff)
+static int fou_gro_complete(struct sk_buff *skb, int nhoff,
+			    struct udp_offload *uoff)
 {
 	const struct net_offload *ops;
 	u8 proto = NAPI_GRO_CB(skb)->proto;
@@ -150,7 +152,8 @@ out_unlock:
 }
 
 static struct sk_buff **gue_gro_receive(struct sk_buff **head,
-					struct sk_buff *skb)
+					struct sk_buff *skb,
+					struct udp_offload *uoff)
 {
 	const struct net_offload **offloads;
 	const struct net_offload *ops;
@@ -229,7 +232,8 @@ out:
 	return pp;
 }
 
-static int gue_gro_complete(struct sk_buff *skb, int nhoff)
+static int gue_gro_complete(struct sk_buff *skb, int nhoff,
+			    struct udp_offload *uoff)
 {
 	const struct net_offload **offloads;
 	struct guehdr *guehdr = (struct guehdr *)(skb->data + nhoff);
