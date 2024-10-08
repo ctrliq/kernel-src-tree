@@ -1,0 +1,124 @@
+can: fix loss of CAN frames in raw_rcv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Oliver Hartkopp <socketcan@hartkopp.net>
+commit 36c01245eb8046c16eee6431e7dbfbb302635fa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/36c01245.failed
+
+As reported by Manfred Schlaegl here
+
+   http://marc.info/?l=linux-netdev&m=143482089824232&w=2
+
+commit 514ac99c64b "can: fix multiple delivery of a single CAN frame for
+overlapping CAN filters" requires the skb->tstamp to be set to check for
+identical CAN skbs.
+
+As net timestamping is influenced by several players (netstamp_needed and
+netdev_tstamp_prequeue) Manfred missed a proper timestamp which leads to
+CAN frame loss.
+
+As skb timestamping became now mandatory for CAN related skbs this patch
+makes sure that received CAN skbs always have a proper timestamp set.
+Maybe there's a better solution in the future but this patch fixes the
+CAN frame loss so far.
+
+	Reported-by: Manfred Schlaegl <manfred.schlaegl@gmx.at>
+	Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+	Cc: linux-stable <stable@vger.kernel.org>
+	Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+(cherry picked from commit 36c01245eb8046c16eee6431e7dbfbb302635fa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/can/dev.c
+diff --cc drivers/net/can/dev.c
+index 02930a57e002,e9b1810d319f..000000000000
+--- a/drivers/net/can/dev.c
++++ b/drivers/net/can/dev.c
+@@@ -526,6 -597,35 +530,38 @@@ struct sk_buff *alloc_can_skb(struct ne
+  }
+  EXPORT_SYMBOL_GPL(alloc_can_skb);
+  
+++<<<<<<< HEAD
+++=======
++ struct sk_buff *alloc_canfd_skb(struct net_device *dev,
++ 				struct canfd_frame **cfd)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	skb = netdev_alloc_skb(dev, sizeof(struct can_skb_priv) +
++ 			       sizeof(struct canfd_frame));
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	__net_timestamp(skb);
++ 	skb->protocol = htons(ETH_P_CANFD);
++ 	skb->pkt_type = PACKET_BROADCAST;
++ 	skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 
++ 	skb_reset_mac_header(skb);
++ 	skb_reset_network_header(skb);
++ 	skb_reset_transport_header(skb);
++ 
++ 	can_skb_reserve(skb);
++ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++ 
++ 	*cfd = (struct canfd_frame *)skb_put(skb, sizeof(struct canfd_frame));
++ 	memset(*cfd, 0, sizeof(struct canfd_frame));
++ 
++ 	return skb;
++ }
++ EXPORT_SYMBOL_GPL(alloc_canfd_skb);
++ 
+++>>>>>>> 36c01245eb80 (can: fix loss of CAN frames in raw_rcv)
+  struct sk_buff *alloc_can_err_skb(struct net_device *dev, struct can_frame **cf)
+  {
+  	struct sk_buff *skb;
+* Unmerged path drivers/net/can/dev.c
+diff --git a/drivers/net/can/slcan.c b/drivers/net/can/slcan.c
+index bfd7d3e89a38..ad8a69fa9479 100644
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@ -190,6 +190,7 @@ static void slc_bump(struct slcan *sl)
+ 	if (!skb)
+ 		return;
+ 
++	__net_timestamp(skb);
+ 	skb->dev = sl->dev;
+ 	skb->protocol = htons(ETH_P_CAN);
+ 	skb->pkt_type = PACKET_BROADCAST;
+diff --git a/drivers/net/can/vcan.c b/drivers/net/can/vcan.c
+index 0a2a5ee79a17..2001f0cd447b 100644
+--- a/drivers/net/can/vcan.c
++++ b/drivers/net/can/vcan.c
+@@ -80,6 +80,9 @@ static void vcan_rx(struct sk_buff *skb, struct net_device *dev)
+ 	skb->dev       = dev;
+ 	skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
++	if (!(skb->tstamp.tv64))
++		__net_timestamp(skb);
++
+ 	netif_rx_ni(skb);
+ }
+ 
+diff --git a/net/can/af_can.c b/net/can/af_can.c
+index 55e18c10e4df..aab750d3e0cb 100644
+--- a/net/can/af_can.c
++++ b/net/can/af_can.c
+@@ -309,8 +309,12 @@ int can_send(struct sk_buff *skb, int loop)
+ 		return err;
+ 	}
+ 
+-	if (newskb)
++	if (newskb) {
++		if (!(newskb->tstamp.tv64))
++			__net_timestamp(newskb);
++
+ 		netif_rx_ni(newskb);
++	}
+ 
+ 	/* update statistics */
+ 	can_stats.tx_frames++;
