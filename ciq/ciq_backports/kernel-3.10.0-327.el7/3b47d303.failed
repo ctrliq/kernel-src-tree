@@ -1,0 +1,224 @@
+net: gro: add a per device gro flush timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] gro: add a per device gro flush timer (Ivan Vecera) [1200759]
+Rebuild_FUZZ: 93.67%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 3b47d30396bae4f0bd1ff0dbcd7c4f5077e7df4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3b47d303.failed
+
+Tuning coalescing parameters on NIC can be really hard.
+
+Servers can handle both bulk and RPC like traffic, with conflicting
+goals : bulk flows want as big GRO packets as possible, RPC want minimal
+latencies.
+
+To reach big GRO packets on 10Gbe NIC, one can use :
+
+ethtool -C eth0 rx-usecs 4 rx-frames 44
+
+But this penalizes rpc sessions, with an increase of latencies, up to
+50% in some cases, as NICs generally do not force an interrupt when
+a packet with TCP Push flag is received.
+
+Some NICs do not have an absolute timer, only a timer rearmed for every
+incoming packet.
+
+This patch uses a different strategy : Let GRO stack decides what do do,
+based on traffic pattern.
+
+Packets with Push flag wont be delayed.
+Packets without Push flag might be held in GRO engine, if we keep
+receiving data.
+
+This new mechanism is off by default, and shall be enabled by setting
+/sys/class/net/ethX/gro_flush_timeout to a value in nanosecond.
+
+To fully enable this mechanism, drivers should use napi_complete_done()
+instead of napi_complete().
+
+Tested:
+ Ran 200 netperf TCP_STREAM from A to B (10Gbe mlx4 link, 8 RX queues)
+
+Without this feature, we send back about 305,000 ACK per second.
+
+GRO aggregation ratio is low (811/305 = 2.65 segments per GRO packet)
+
+Setting a timer of 2000 nsec is enough to increase GRO packet sizes
+and reduce number of ACK packets. (811/19.2 = 42)
+
+Receiver performs less calls to upper stacks, less wakes up.
+This also reduces cpu usage on the sender, as it receives less ACK
+packets.
+
+Note that reducing number of wakes up increases cpu efficiency, but can
+decrease QPS, as applications wont have the chance to warmup cpu caches
+doing a partial read of RPC requests/answers if they fit in one skb.
+
+B:~# sar -n DEV 1 10 | grep eth0 | tail -1
+Average:         eth0 811269.80 305732.30 1199462.57  19705.72      0.00
+0.00      0.50
+
+B:~# echo 2000 >/sys/class/net/eth0/gro_flush_timeout
+
+B:~# sar -n DEV 1 10 | grep eth0 | tail -1
+Average:         eth0 811577.30  19230.80 1199916.51   1239.80      0.00
+0.00      0.50
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b47d30396bae4f0bd1ff0dbcd7c4f5077e7df4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index d77c2cff9dff,888d5513fa4a..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -446,9 -451,12 +449,17 @@@ void napi_complete_done(struct napi_str
+   *	@n: napi context
+   *
+   * Mark NAPI processing as complete.
++  * Consider using napi_complete_done() instead.
+   */
+++<<<<<<< HEAD
+ +extern void __napi_complete(struct napi_struct *n);
+ +extern void napi_complete(struct napi_struct *n);
+++=======
++ static inline void napi_complete(struct napi_struct *n)
++ {
++ 	return napi_complete_done(n, 0);
++ }
+++>>>>>>> 3b47d30396ba (net: gro: add a per device gro flush timer)
+  
+  /**
+   *	napi_by_id - lookup a NAPI by napi_id
+@@@ -483,13 -491,7 +494,17 @@@ extern void napi_hash_del(struct napi_s
+   * Stop NAPI from being scheduled on this context.
+   * Waits till any outstanding processing completes.
+   */
+++<<<<<<< HEAD
+ +static inline void napi_disable(struct napi_struct *n)
+ +{
+ +	set_bit(NAPI_STATE_DISABLE, &n->state);
+ +	while (test_and_set_bit(NAPI_STATE_SCHED, &n->state))
+ +		msleep(1);
+ +	clear_bit(NAPI_STATE_DISABLE, &n->state);
+ +}
+++=======
++ void napi_disable(struct napi_struct *n);
+++>>>>>>> 3b47d30396ba (net: gro: add a per device gro flush timer)
+  
+  /**
+   *	napi_enable - enable NAPI scheduling
+diff --cc net/core/dev.c
+index 883bfd5aec6c,bb09b0364619..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -130,6 -131,10 +130,13 @@@
+  #include <linux/cpu_rmap.h>
+  #include <linux/static_key.h>
+  #include <linux/hashtable.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/vmalloc.h>
++ #include <linux/if_macvlan.h>
++ #include <linux/errqueue.h>
++ #include <linux/hrtimer.h>
+++>>>>>>> 3b47d30396ba (net: gro: add a per device gro flush timer)
+  
+  #include "net-sysfs.h"
+  
+@@@ -4177,10 -4401,21 +4184,9 @@@ EXPORT_SYMBOL(__napi_schedule)
+  void __napi_complete(struct napi_struct *n)
+  {
+  	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
+- 	BUG_ON(n->gro_list);
+  
+ -	list_del_init(&n->poll_list);
+ -	smp_mb__before_atomic();
+ +	list_del(&n->poll_list);
+ +	smp_mb__before_clear_bit();
+  	clear_bit(NAPI_STATE_SCHED, &n->state);
+  }
+  EXPORT_SYMBOL(__napi_complete);
+@@@ -4196,12 -4431,28 +4202,35 @@@ void napi_complete_done(struct napi_str
+  	if (unlikely(test_bit(NAPI_STATE_NPSVC, &n->state)))
+  		return;
+  
+++<<<<<<< HEAD
+ +	napi_gro_flush(n, false);
+ +	local_irq_save(flags);
+ +	__napi_complete(n);
+ +	local_irq_restore(flags);
+++=======
++ 	if (n->gro_list) {
++ 		unsigned long timeout = 0;
++ 
++ 		if (work_done)
++ 			timeout = n->dev->gro_flush_timeout;
++ 
++ 		if (timeout)
++ 			hrtimer_start(&n->timer, ns_to_ktime(timeout),
++ 				      HRTIMER_MODE_REL_PINNED);
++ 		else
++ 			napi_gro_flush(n, false);
++ 	}
++ 	if (likely(list_empty(&n->poll_list))) {
++ 		WARN_ON_ONCE(!test_and_clear_bit(NAPI_STATE_SCHED, &n->state));
++ 	} else {
++ 		/* If n->poll_list is not empty, we need to mask irqs */
++ 		local_irq_save(flags);
++ 		__napi_complete(n);
++ 		local_irq_restore(flags);
++ 	}
+++>>>>>>> 3b47d30396ba (net: gro: add a per device gro flush timer)
+  }
+- EXPORT_SYMBOL(napi_complete);
++ EXPORT_SYMBOL(napi_complete_done);
+  
+  /* must be called under rcu_read_lock(), as we dont take a reference */
+  struct napi_struct *napi_by_id(unsigned int napi_id)
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index 62086f24a037..e12f1a7e2f0e 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -296,6 +296,23 @@ static ssize_t tx_queue_len_store(struct device *dev,
+ }
+ NETDEVICE_SHOW_RW(tx_queue_len, fmt_ulong);
+ 
++static int change_gro_flush_timeout(struct net_device *dev, unsigned long val)
++{
++	dev->gro_flush_timeout = val;
++	return 0;
++}
++
++static ssize_t gro_flush_timeout_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t len)
++{
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	return netdev_store(dev, attr, buf, len, change_gro_flush_timeout);
++}
++NETDEVICE_SHOW_RW(gro_flush_timeout, fmt_ulong);
++
+ static ssize_t ifalias_store(struct device *dev, struct device_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+@@ -391,6 +408,7 @@ static struct attribute *net_class_attrs[] = {
+ 	&dev_attr_mtu.attr,
+ 	&dev_attr_flags.attr,
+ 	&dev_attr_tx_queue_len.attr,
++	&dev_attr_gro_flush_timeout.attr,
+ 	&dev_attr_phys_port_id.attr,
+ 	NULL,
+ };
