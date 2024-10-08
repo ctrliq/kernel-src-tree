@@ -1,0 +1,140 @@
+printk: enable interrupts before calling console_trylock_for_printk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 939f04bec1a4ef6ba4370b0f34b01decc844b1b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/939f04be.failed
+
+We need interrupts disabled when calling console_trylock_for_printk()
+only so that cpu id we pass to can_use_console() remains valid (for
+other things console_sem provides all the exclusion we need and
+deadlocks on console_sem due to interrupts are impossible because we use
+down_trylock()).  However if we are rescheduled, we are guaranteed to
+run on an online cpu so we can easily just get the cpu id in
+can_use_console().
+
+We can lose a bit of performance when we enable interrupts in
+vprintk_emit() and then disable them again in console_unlock() but OTOH
+it can somewhat reduce interrupt latency caused by console_unlock()
+especially since later in the patch series we will want to spin on
+console_sem in console_trylock_for_printk().
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 939f04bec1a4ef6ba4370b0f34b01decc844b1b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk.c
+diff --cc kernel/printk.c
+index 6881a4f0352d,4e22230f1f6c..000000000000
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@@ -1355,36 -1432,24 +1354,54 @@@ static inline int can_use_console(unsig
+   * messages from a 'printk'. Return true (and with the
+   * console_lock held, and 'console_locked' set) if it
+   * is successful, false otherwise.
+ + *
+ + * This gets called with the 'logbuf_lock' spinlock held and
+ + * interrupts disabled. It should return with 'lockbuf_lock'
+ + * released but interrupts still disabled.
+   */
+++<<<<<<< HEAD:kernel/printk.c
+ +static int console_trylock_for_printk(unsigned int cpu)
+ +	__releases(&logbuf_lock)
+ +{
+ +	int retval = 0, wake = 0;
+ +
+ +	if (console_trylock()) {
+ +		retval = 1;
+ +
+ +		/*
+ +		 * If we can't use the console, we need to release
+ +		 * the console semaphore by hand to avoid flushing
+ +		 * the buffer. We need to hold the console semaphore
+ +		 * in order to do this test safely.
+ +		 */
+ +		if (!can_use_console(cpu)) {
+ +			console_locked = 0;
+ +			wake = 1;
+ +			retval = 0;
+ +		}
+++=======
++ static int console_trylock_for_printk(void)
++ {
++ 	unsigned int cpu = smp_processor_id();
++ 
++ 	if (!console_trylock())
++ 		return 0;
++ 	/*
++ 	 * If we can't use the console, we need to release the console
++ 	 * semaphore by hand to avoid flushing the buffer. We need to hold the
++ 	 * console semaphore in order to do this test safely.
++ 	 */
++ 	if (!can_use_console(cpu)) {
++ 		console_locked = 0;
++ 		up_console_sem();
++ 		return 0;
+++>>>>>>> 939f04bec1a4 (printk: enable interrupts before calling console_trylock_for_printk()):kernel/printk/printk.c
+  	}
+ -	return 1;
+ +	logbuf_cpu = UINT_MAX;
+ +	raw_spin_unlock(&logbuf_lock);
+ +	if (wake)
+ +		up(&console_sem);
+ +	return retval;
+  }
+  
+  int printk_delay_msec __read_mostly;
+@@@ -1623,26 -1701,31 +1641,36 @@@ asmlinkage int vprintk_emit(int facilit
+  			cont_flush(LOG_NEWLINE);
+  		}
+  
+ -		if (stored)
+ -			printed_len += text_len;
+ -		else
+ -			printed_len += log_store(facility, level, lflags, 0,
+ -						 dict, dictlen, text, text_len);
+ +		if (!stored)
+ +			log_store(facility, level, lflags, 0,
+ +				  dict, dictlen, text, text_len);
+  	}
+ +	printed_len += text_len;
+  
+++<<<<<<< HEAD:kernel/printk.c
+++=======
++ 	logbuf_cpu = UINT_MAX;
++ 	raw_spin_unlock(&logbuf_lock);
++ 	lockdep_on();
++ 	local_irq_restore(flags);
++ 
++ 	/*
++ 	 * Disable preemption to avoid being preempted while holding
++ 	 * console_sem which would prevent anyone from printing to console
++ 	 */
++ 	preempt_disable();
+++>>>>>>> 939f04bec1a4 (printk: enable interrupts before calling console_trylock_for_printk()):kernel/printk/printk.c
+  	/*
+  	 * Try to acquire and then immediately release the console semaphore.
+  	 * The release will print out buffers and wake up /dev/kmsg and syslog()
+  	 * users.
+ +	 *
+ +	 * The console_trylock_for_printk() function will release 'logbuf_lock'
+ +	 * regardless of whether it actually gets the console semaphore or not.
+  	 */
+- 	if (console_trylock_for_printk(this_cpu))
++ 	if (console_trylock_for_printk())
+  		console_unlock();
+- 
+- 	lockdep_on();
+- out_restore_irqs:
+- 	local_irq_restore(flags);
++ 	preempt_enable();
+  
+  	return printed_len;
+  }
+* Unmerged path kernel/printk.c
