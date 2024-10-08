@@ -1,0 +1,259 @@
+rhashtable: Add more lock verification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit 7cd10db8de2b6a32ccabef2e0e01c7444faa49d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7cd10db8.failed
+
+Catch hash miscalculations which result in hard to track down race
+conditions.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7cd10db8de2b6a32ccabef2e0e01c7444faa49d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index 91429a30ff68,ef0816b6be82..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -182,7 -340,20 +182,24 @@@ static void hashtable_chain_unzip(cons
+  	/* Set p's next pointer to that subsequent node pointer,
+  	 * bypassing the nodes which do not hash to p's bucket
+  	 */
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(p->next, next);
+++=======
++ 	rcu_assign_pointer(p->next, next);
++ 
++ 	p = rht_dereference_bucket(old_tbl->buckets[old_hash], old_tbl,
++ 				   old_hash);
++ 
++ 	return !rht_is_a_nulls(p);
++ }
++ 
++ static void link_old_to_new(struct rhashtable *ht, struct bucket_table *new_tbl,
++ 			    unsigned int new_hash, struct rhash_head *entry)
++ {
++ 	ASSERT_BUCKET_LOCK(ht, new_tbl, new_hash);
++ 
++ 	rcu_assign_pointer(*bucket_tail(new_tbl, new_hash), entry);
+++>>>>>>> 7cd10db8de2b (rhashtable: Add more lock verification)
+  }
+  
+  /**
+@@@ -214,21 -385,30 +231,41 @@@ int rhashtable_expand(struct rhashtabl
+  	if (new_tbl == NULL)
+  		return -ENOMEM;
+  
+ -	atomic_inc(&ht->shift);
+ +	ht->shift++;
+  
+ -	/* Make insertions go into the new, empty table right away. Deletions
+ -	 * and lookups will be attempted in both tables until we synchronize.
+ -	 * The synchronize_rcu() guarantees for the new table to be picked up
+ -	 * so no new additions go into the old table while we relink.
+ +	/* For each new bucket, search the corresponding old bucket
+ +	 * for the first entry that hashes to the new bucket, and
+ +	 * link the new bucket to that entry. Since all the entries
+ +	 * which will end up in the new bucket appear in the same
+ +	 * old bucket, this constructs an entirely valid new hash
+ +	 * table, but with multiple buckets "zipped" together into a
+ +	 * single imprecise chain.
+  	 */
+++<<<<<<< HEAD
+ +	for (i = 0; i < new_tbl->size; i++) {
+ +		h = rht_bucket_index(old_tbl, i);
+ +		rht_for_each(he, old_tbl, h) {
+ +			if (head_hashfn(ht, new_tbl, he) == i) {
+ +				RCU_INIT_POINTER(new_tbl->buckets[i], he);
+++=======
++ 	rcu_assign_pointer(ht->future_tbl, new_tbl);
++ 	synchronize_rcu();
++ 
++ 	/* For each new bucket, search the corresponding old bucket for the
++ 	 * first entry that hashes to the new bucket, and link the end of
++ 	 * newly formed bucket chain (containing entries added to future
++ 	 * table) to that entry. Since all the entries which will end up in
++ 	 * the new bucket appear in the same old bucket, this constructs an
++ 	 * entirely valid new hash table, but with multiple buckets
++ 	 * "zipped" together into a single imprecise chain.
++ 	 */
++ 	for (new_hash = 0; new_hash < new_tbl->size; new_hash++) {
++ 		old_hash = rht_bucket_index(old_tbl, new_hash);
++ 		lock_buckets(new_tbl, old_tbl, new_hash);
++ 		rht_for_each(he, old_tbl, old_hash) {
++ 			if (head_hashfn(ht, new_tbl, he) == new_hash) {
++ 				link_old_to_new(ht, new_tbl, new_hash, he);
+++>>>>>>> 7cd10db8de2b (rhashtable: Add more lock verification)
+  				break;
+  			}
+  		}
+@@@ -284,24 -475,30 +321,34 @@@ int rhashtable_shrink(struct rhashtabl
+  
+  	ASSERT_RHT_MUTEX(ht);
+  
+ -	new_tbl = bucket_table_alloc(ht, tbl->size / 2);
+ -	if (new_tbl == NULL)
+ +	if (ht->shift <= ht->p.min_shift)
+ +		return 0;
+ +
+ +	ntbl = bucket_table_alloc(tbl->size / 2);
+ +	if (ntbl == NULL)
+  		return -ENOMEM;
+  
+ -	rcu_assign_pointer(ht->future_tbl, new_tbl);
+ -	synchronize_rcu();
+ +	ht->shift--;
+  
+ -	/* Link the first entry in the old bucket to the end of the
+ -	 * bucket in the new table. As entries are concurrently being
+ -	 * added to the new table, lock down the new bucket. As we
+ -	 * always divide the size in half when shrinking, each bucket
+ -	 * in the new table maps to exactly two buckets in the old
+ -	 * table.
+ +	/* Link each bucket in the new table to the first bucket
+ +	 * in the old table that contains entries which will hash
+ +	 * to the new bucket.
+  	 */
+ -	for (new_hash = 0; new_hash < new_tbl->size; new_hash++) {
+ -		lock_buckets(new_tbl, tbl, new_hash);
+ +	for (i = 0; i < ntbl->size; i++) {
+ +		ntbl->buckets[i] = tbl->buckets[i];
+ +		RCU_INIT_POINTER(*bucket_tail(ntbl, i),
+ +				 tbl->buckets[i + ntbl->size]);
+  
+++<<<<<<< HEAD
+++=======
++ 		rcu_assign_pointer(*bucket_tail(new_tbl, new_hash),
++ 				   tbl->buckets[new_hash]);
++ 		ASSERT_BUCKET_LOCK(ht, tbl, new_hash + new_tbl->size);
++ 		rcu_assign_pointer(*bucket_tail(new_tbl, new_hash),
++ 				   tbl->buckets[new_hash + new_tbl->size]);
++ 
++ 		unlock_buckets(new_tbl, tbl, new_hash);
+++>>>>>>> 7cd10db8de2b (rhashtable: Add more lock verification)
+  	}
+  
+  	/* Publish the new, valid hash table */
+@@@ -318,8 -516,66 +365,69 @@@
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_shrink);
+  
+++<<<<<<< HEAD
+++=======
++ static void rht_deferred_worker(struct work_struct *work)
++ {
++ 	struct rhashtable *ht;
++ 	struct bucket_table *tbl;
++ 	struct rhashtable_walker *walker;
++ 
++ 	ht = container_of(work, struct rhashtable, run_work);
++ 	mutex_lock(&ht->mutex);
++ 	if (ht->being_destroyed)
++ 		goto unlock;
++ 
++ 	tbl = rht_dereference(ht->tbl, ht);
++ 
++ 	list_for_each_entry(walker, &ht->walkers, list)
++ 		walker->resize = true;
++ 
++ 	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
++ 		rhashtable_expand(ht);
++ 	else if (ht->p.shrink_decision && ht->p.shrink_decision(ht, tbl->size))
++ 		rhashtable_shrink(ht);
++ 
++ unlock:
++ 	mutex_unlock(&ht->mutex);
++ }
++ 
++ static void rhashtable_wakeup_worker(struct rhashtable *ht)
++ {
++ 	struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 	struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	size_t size = tbl->size;
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl &&
++ 	    ((ht->p.grow_decision && ht->p.grow_decision(ht, size)) ||
++ 	     (ht->p.shrink_decision && ht->p.shrink_decision(ht, size))))
++ 		schedule_work(&ht->run_work);
++ }
++ 
++ static void __rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj,
++ 				struct bucket_table *tbl, u32 hash)
++ {
++ 	struct rhash_head *head = rht_dereference_bucket(tbl->buckets[hash],
++ 							 tbl, hash);
++ 
++ 	ASSERT_BUCKET_LOCK(ht, tbl, hash);
++ 
++ 	if (rht_is_a_nulls(head))
++ 		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
++ 	else
++ 		RCU_INIT_POINTER(obj->next, head);
++ 
++ 	rcu_assign_pointer(tbl->buckets[hash], obj);
++ 
++ 	atomic_inc(&ht->nelems);
++ 
++ 	rhashtable_wakeup_worker(ht);
++ }
++ 
+++>>>>>>> 7cd10db8de2b (rhashtable: Add more lock verification)
+  /**
+ - * rhashtable_insert - insert object into hash table
+ + * rhashtable_insert - insert object into hash hash table
+   * @ht:		hash table
+   * @obj:	pointer to hash head inside object
+   *
+@@@ -379,17 -646,33 +487,22 @@@ bool rhashtable_remove(struct rhashtabl
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+++=======
++ 		ASSERT_BUCKET_LOCK(ht, tbl, hash);
++ 		rcu_assign_pointer(*pprev, obj->next);
+++>>>>>>> 7cd10db8de2b (rhashtable: Add more lock verification)
+  
+ -		ret = true;
+ -		break;
+ -	}
+ -
+ -	/* The entry may be linked in either 'tbl', 'future_tbl', or both.
+ -	 * 'future_tbl' only exists for a short period of time during
+ -	 * resizing. Thus traversing both is fine and the added cost is
+ -	 * very rare.
+ -	 */
+ -	if (tbl != new_tbl) {
+ -		tbl = new_tbl;
+ -		goto restart;
+ -	}
+ -
+ -	unlock_buckets(new_tbl, old_tbl, new_hash);
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+  
+ -	if (ret) {
+ -		atomic_dec(&ht->nelems);
+ -		rhashtable_wakeup_worker(ht);
+ +		return true;
+  	}
+  
+ -	rcu_read_unlock();
+ -
+ -	return ret;
+ +	return false;
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_remove);
+  
+* Unmerged path lib/rhashtable.c
