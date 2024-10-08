@@ -1,0 +1,207 @@
+PCI/MSI: Check kmalloc() return value, fix leak of name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [pci] msi: Check kmalloc() return value, fix leak of name (Myron Stowe) [1110895]
+Rebuild_FUZZ: 96.23%
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit b3bac8e57c82e8d3e05f4abcb18c4f0a40656655
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b3bac8e5.failed
+
+Coverity reported that I forgot to check the return value of kmalloc() when
+creating the MSI attribute name, so fix that up and properly free it if
+there is an error when allocating the msi_dev_attr variable.
+
+Found by Coverity (CID 1163315 and 1163316).
+
+Fixes: 1c51b50c2995 ("PCI/MSI: Export MSI mode using attributes, not kobjects")
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit b3bac8e57c82e8d3e05f4abcb18c4f0a40656655)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/msi.c
+diff --cc drivers/pci/msi.c
+index 9a0fbc79b749,39dff3fe57af..000000000000
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@@ -493,94 -499,101 +493,114 @@@ void pci_restore_msi_state(struct pci_d
+  }
+  EXPORT_SYMBOL_GPL(pci_restore_msi_state);
+  
+ -static ssize_t msi_mode_show(struct device *dev, struct device_attribute *attr,
+ +
+ +#define to_msi_attr(obj) container_of(obj, struct msi_attribute, attr)
+ +#define to_msi_desc(obj) container_of(obj, struct msi_desc, kobj)
+ +
+ +struct msi_attribute {
+ +	struct attribute        attr;
+ +	ssize_t (*show)(struct msi_desc *entry, struct msi_attribute *attr,
+ +			char *buf);
+ +	ssize_t (*store)(struct msi_desc *entry, struct msi_attribute *attr,
+ +			 const char *buf, size_t count);
+ +};
+ +
+ +static ssize_t show_msi_mode(struct msi_desc *entry, struct msi_attribute *atr,
+  			     char *buf)
+  {
+ -	struct pci_dev *pdev = to_pci_dev(dev);
+ -	struct msi_desc *entry;
+ -	unsigned long irq;
+ -	int retval;
+ +	return sprintf(buf, "%s\n", entry->msi_attrib.is_msix ? "msix" : "msi");
+ +}
+  
+ -	retval = kstrtoul(attr->attr.name, 10, &irq);
+ -	if (retval)
+ -		return retval;
+ +static ssize_t msi_irq_attr_show(struct kobject *kobj,
+ +				 struct attribute *attr, char *buf)
+ +{
+ +	struct msi_attribute *attribute = to_msi_attr(attr);
+ +	struct msi_desc *entry = to_msi_desc(kobj);
+  
+ -	list_for_each_entry(entry, &pdev->msi_list, list) {
+ -		if (entry->irq == irq) {
+ -			return sprintf(buf, "%s\n",
+ -				       entry->msi_attrib.is_msix ? "msix" : "msi");
+ -		}
+ -	}
+ -	return -ENODEV;
+ +	if (!attribute->show)
+ +		return -EIO;
+ +
+ +	return attribute->show(entry, attribute, buf);
+ +}
+ +
+ +static const struct sysfs_ops msi_irq_sysfs_ops = {
+ +	.show = msi_irq_attr_show,
+ +};
+ +
+ +static struct msi_attribute mode_attribute =
+ +	__ATTR(mode, S_IRUGO, show_msi_mode, NULL);
+ +
+ +
+ +static struct attribute *msi_irq_default_attrs[] = {
+ +	&mode_attribute.attr,
+ +	NULL
+ +};
+ +
+ +static void msi_kobj_release(struct kobject *kobj)
+ +{
+ +	struct msi_desc *entry = to_msi_desc(kobj);
+ +
+ +	pci_dev_put(entry->dev);
+  }
+  
+ +static struct kobj_type msi_irq_ktype = {
+ +	.release = msi_kobj_release,
+ +	.sysfs_ops = &msi_irq_sysfs_ops,
+ +	.default_attrs = msi_irq_default_attrs,
+ +};
+ +
+  static int populate_msi_sysfs(struct pci_dev *pdev)
+  {
+ -	struct attribute **msi_attrs;
+ -	struct attribute *msi_attr;
+ -	struct device_attribute *msi_dev_attr;
+ -	struct attribute_group *msi_irq_group;
+ -	const struct attribute_group **msi_irq_groups;
+  	struct msi_desc *entry;
+ -	int ret = -ENOMEM;
+ -	int num_msi = 0;
+ +	struct kobject *kobj;
+ +	int ret;
+  	int count = 0;
+  
+ -	/* Determine how many msi entries we have */
+ -	list_for_each_entry(entry, &pdev->msi_list, list) {
+ -		++num_msi;
+ -	}
+ -	if (!num_msi)
+ -		return 0;
+ -
+ -	/* Dynamically create the MSI attributes for the PCI device */
+ -	msi_attrs = kzalloc(sizeof(void *) * (num_msi + 1), GFP_KERNEL);
+ -	if (!msi_attrs)
+ +	pdev->msi_kset = kset_create_and_add("msi_irqs", NULL, &pdev->dev.kobj);
+ +	if (!pdev->msi_kset)
+  		return -ENOMEM;
+ +
+  	list_for_each_entry(entry, &pdev->msi_list, list) {
+++<<<<<<< HEAD
+ +		kobj = &entry->kobj;
+ +		kobj->kset = pdev->msi_kset;
+ +		pci_dev_get(pdev);
+ +		ret = kobject_init_and_add(kobj, &msi_irq_ktype, NULL,
+ +				     "%u", entry->irq);
+ +		if (ret)
+ +			goto out_unroll;
+ +
+ +		count++;
+++=======
++ 		char *name = kmalloc(20, GFP_KERNEL);
++ 		if (!name)
++ 			goto error_attrs;
++ 
++ 		msi_dev_attr = kzalloc(sizeof(*msi_dev_attr), GFP_KERNEL);
++ 		if (!msi_dev_attr) {
++ 			kfree(name);
++ 			goto error_attrs;
++ 		}
++ 
++ 		sprintf(name, "%d", entry->irq);
++ 		sysfs_attr_init(&msi_dev_attr->attr);
++ 		msi_dev_attr->attr.name = name;
++ 		msi_dev_attr->attr.mode = S_IRUGO;
++ 		msi_dev_attr->show = msi_mode_show;
++ 		msi_attrs[count] = &msi_dev_attr->attr;
++ 		++count;
+++>>>>>>> b3bac8e57c82 (PCI/MSI: Check kmalloc() return value, fix leak of name)
+  	}
+  
+ -	msi_irq_group = kzalloc(sizeof(*msi_irq_group), GFP_KERNEL);
+ -	if (!msi_irq_group)
+ -		goto error_attrs;
+ -	msi_irq_group->name = "msi_irqs";
+ -	msi_irq_group->attrs = msi_attrs;
+ -
+ -	msi_irq_groups = kzalloc(sizeof(void *) * 2, GFP_KERNEL);
+ -	if (!msi_irq_groups)
+ -		goto error_irq_group;
+ -	msi_irq_groups[0] = msi_irq_group;
+ -
+ -	ret = sysfs_create_groups(&pdev->dev.kobj, msi_irq_groups);
+ -	if (ret)
+ -		goto error_irq_groups;
+ -	pdev->msi_irq_groups = msi_irq_groups;
+ -
+  	return 0;
+  
+ -error_irq_groups:
+ -	kfree(msi_irq_groups);
+ -error_irq_group:
+ -	kfree(msi_irq_group);
+ -error_attrs:
+ -	count = 0;
+ -	msi_attr = msi_attrs[count];
+ -	while (msi_attr) {
+ -		msi_dev_attr = container_of(msi_attr, struct device_attribute, attr);
+ -		kfree(msi_attr->name);
+ -		kfree(msi_dev_attr);
+ -		++count;
+ -		msi_attr = msi_attrs[count];
+ +out_unroll:
+ +	list_for_each_entry(entry, &pdev->msi_list, list) {
+ +		if (!count)
+ +			break;
+ +		kobject_del(&entry->kobj);
+ +		kobject_put(&entry->kobj);
+ +		count--;
+  	}
+  	return ret;
+  }
+* Unmerged path drivers/pci/msi.c
