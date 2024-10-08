@@ -1,0 +1,283 @@
+xfs: fix NULL pointer dereference in xfs_filestream_lookup_ag()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Sandeen <sandeen@sandeen.net>
+commit b26384dc52edba2f5fcc2b38eccc98e1f44bb379
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b26384dc.failed
+
+If xfs_filestream_get_parent() fails, we have a null pip,
+goto out, and attempt to IRELE(NULL).  This causes a null
+pointer dereference and BUG().
+
+Fix this by directly returning NULLAGNUMBER in this case.
+
+	Reported-by: Adrien Nader <adrien@notk.org>
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit b26384dc52edba2f5fcc2b38eccc98e1f44bb379)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_filestream.c
+diff --cc fs/xfs/xfs_filestream.c
+index 12b6e7701985,8f9f854376c6..000000000000
+--- a/fs/xfs/xfs_filestream.c
++++ b/fs/xfs/xfs_filestream.c
+@@@ -318,197 -250,57 +318,219 @@@ next_ag
+  		return 0;
+  	}
+  
+ -	trace_xfs_filestream_pick(ip, *agp, free, nscan);
+ +	TRACE_AG_PICK2(mp, startag, *agp, streams, free, nscan, flags);
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Set the allocation group number for a file or a directory, updating inode
+ + * references and per-AG references as appropriate.
+ + */
+ +static int
+ +_xfs_filestream_update_ag(
+ +	xfs_inode_t	*ip,
+ +	xfs_inode_t	*pip,
+ +	xfs_agnumber_t	ag)
+ +{
+++<<<<<<< HEAD
+ +	int		err = 0;
+ +	xfs_mount_t	*mp;
+ +	xfs_mru_cache_t	*cache;
+ +	fstrm_item_t	*item;
+ +	xfs_agnumber_t	old_ag;
+ +	xfs_inode_t	*old_pip;
+++=======
+++	struct xfs_mount	*mp = ip->i_mount;
+++	struct xfs_inode	*pip = NULL;
+++	xfs_agnumber_t		startag, ag = NULLAGNUMBER;
+++	struct xfs_mru_cache_elem *mru;
+++
+++	ASSERT(S_ISREG(ip->i_d.di_mode));
+++
+++	pip = xfs_filestream_get_parent(ip);
+++	if (!pip)
+++		return NULLAGNUMBER;
+++
+++	mru = xfs_mru_cache_lookup(mp->m_filestream, pip->i_ino);
+++	if (mru) {
+++		ag = container_of(mru, struct xfs_fstrm_item, mru)->ag;
+++		xfs_mru_cache_done(mp->m_filestream);
+++
+++		trace_xfs_filestream_lookup(ip, ag);
+++		goto out;
+++	}
+++>>>>>>> b26384dc52ed (xfs: fix NULL pointer dereference in xfs_filestream_lookup_ag())
+ +
+ +	/*
+ +	 * Either ip is a regular file and pip is a directory, or ip is a
+ +	 * directory and pip is NULL.
+ +	 */
+ +	ASSERT(ip && ((S_ISREG(ip->i_d.di_mode) && pip &&
+ +	               S_ISDIR(pip->i_d.di_mode)) ||
+ +	              (S_ISDIR(ip->i_d.di_mode) && !pip)));
+ +
+ +	mp = ip->i_mount;
+ +	cache = mp->m_filestream;
+ +
+ +	item = xfs_mru_cache_lookup(cache, ip->i_ino);
+ +	if (item) {
+ +		ASSERT(item->ip == ip);
+ +		old_ag = item->ag;
+ +		item->ag = ag;
+ +		old_pip = item->pip;
+ +		item->pip = pip;
+ +		xfs_mru_cache_done(cache);
+  
+ -	if (*agp == NULLAGNUMBER)
+ +		/*
+ +		 * If the AG has changed, drop the old ref and take a new one,
+ +		 * effectively transferring the reference from old to new AG.
+ +		 */
+ +		if (ag != old_ag) {
+ +			xfs_filestream_put_ag(mp, old_ag);
+ +			xfs_filestream_get_ag(mp, ag);
+ +		}
+ +
+ +		/*
+ +		 * If ip is a file and its pip has changed, drop the old ref and
+ +		 * take a new one.
+ +		 */
+ +		if (pip && pip != old_pip) {
+ +			IRELE(old_pip);
+ +			IHOLD(pip);
+ +		}
+ +
+ +		TRACE_UPDATE(mp, ip, old_ag, xfs_filestream_peek_ag(mp, old_ag),
+ +				ag, xfs_filestream_peek_ag(mp, ag));
+  		return 0;
+ +	}
+  
+ -	err = -ENOMEM;
+ -	item = kmem_alloc(sizeof(*item), KM_MAYFAIL);
+ +	item = kmem_zone_zalloc(item_zone, KM_MAYFAIL);
+  	if (!item)
+ -		goto out_put_ag;
+ +		return ENOMEM;
+  
+ -	item->ag = *agp;
+ +	item->ag = ag;
+  	item->ip = ip;
+ +	item->pip = pip;
+  
+ -	err = xfs_mru_cache_insert(mp->m_filestream, ip->i_ino, &item->mru);
+ +	err = xfs_mru_cache_insert(cache, ip->i_ino, item);
+  	if (err) {
+ -		if (err == -EEXIST)
+ -			err = 0;
+ -		goto out_free_item;
+ +		kmem_zone_free(item_zone, item);
+ +		return err;
+  	}
+  
+ +	/* Take a reference on the AG. */
+ +	xfs_filestream_get_ag(mp, ag);
+ +
+ +	/*
+ +	 * Take a reference on the inode itself regardless of whether it's a
+ +	 * regular file or a directory.
+ +	 */
+ +	IHOLD(ip);
+ +
+ +	/*
+ +	 * In the case of a regular file, take a reference on the parent inode
+ +	 * as well to ensure it remains in-core.
+ +	 */
+ +	if (pip)
+ +		IHOLD(pip);
+ +
+ +	TRACE_UPDATE(mp, ip, ag, xfs_filestream_peek_ag(mp, ag),
+ +			ag, xfs_filestream_peek_ag(mp, ag));
+ +
+  	return 0;
+ +}
+  
+ -out_free_item:
+ -	kmem_free(item);
+ -out_put_ag:
+ -	xfs_filestream_put_ag(mp, *agp);
+ -	return err;
+ +/* xfs_fstrm_free_func(): callback for freeing cached stream items. */
+ +STATIC void
+ +xfs_fstrm_free_func(
+ +	unsigned long	ino,
+ +	void		*data)
+ +{
+ +	fstrm_item_t	*item  = (fstrm_item_t *)data;
+ +	xfs_inode_t	*ip = item->ip;
+ +
+ +	ASSERT(ip->i_ino == ino);
+ +
+ +	xfs_iflags_clear(ip, XFS_IFILESTREAM);
+ +
+ +	/* Drop the reference taken on the AG when the item was added. */
+ +	xfs_filestream_put_ag(ip->i_mount, item->ag);
+ +
+ +	TRACE_FREE(ip->i_mount, ip, item->pip, item->ag,
+ +		xfs_filestream_peek_ag(ip->i_mount, item->ag));
+ +
+ +	/*
+ +	 * _xfs_filestream_update_ag() always takes a reference on the inode
+ +	 * itself, whether it's a file or a directory.  Release it here.
+ +	 * This can result in the inode being freed and so we must
+ +	 * not hold any inode locks when freeing filesstreams objects
+ +	 * otherwise we can deadlock here.
+ +	 */
+ +	IRELE(ip);
+ +
+ +	/*
+ +	 * In the case of a regular file, _xfs_filestream_update_ag() also
+ +	 * takes a ref on the parent inode to keep it in-core.  Release that
+ +	 * too.
+ +	 */
+ +	if (item->pip)
+ +		IRELE(item->pip);
+ +
+ +	/* Finally, free the memory allocated for the item. */
+ +	kmem_zone_free(item_zone, item);
+  }
+  
+ -static struct xfs_inode *
+ -xfs_filestream_get_parent(
+ -	struct xfs_inode	*ip)
+ +/*
+ + * xfs_filestream_init() is called at xfs initialisation time to set up the
+ + * memory zone that will be used for filestream data structure allocation.
+ + */
+ +int
+ +xfs_filestream_init(void)
+  {
+ -	struct inode		*inode = VFS_I(ip), *dir = NULL;
+ -	struct dentry		*dentry, *parent;
+ +	item_zone = kmem_zone_init(sizeof(fstrm_item_t), "fstrm_item");
+ +	if (!item_zone)
+ +		return -ENOMEM;
+  
+ -	dentry = d_find_alias(inode);
+ -	if (!dentry)
+ -		goto out;
+ +	return 0;
+ +}
+  
+ -	parent = dget_parent(dentry);
+ -	if (!parent)
+ -		goto out_dput;
+ +/*
+ + * xfs_filestream_uninit() is called at xfs termination time to destroy the
+ + * memory zone that was used for filestream data structure allocation.
+ + */
+ +void
+ +xfs_filestream_uninit(void)
+ +{
+ +	kmem_zone_destroy(item_zone);
+ +}
+  
+ -	dir = igrab(parent->d_inode);
+ -	dput(parent);
+ +/*
+ + * xfs_filestream_mount() is called when a file system is mounted with the
+ + * filestream option.  It is responsible for allocating the data structures
+ + * needed to track the new file system's file streams.
+ + */
+ +int
+ +xfs_filestream_mount(
+ +	xfs_mount_t	*mp)
+ +{
+ +	int		err;
+ +	unsigned int	lifetime, grp_count;
+  
+ -out_dput:
+ -	dput(dentry);
+ -out:
+ -	return dir ? XFS_I(dir) : NULL;
+ +	/*
+ +	 * The filestream timer tunable is currently fixed within the range of
+ +	 * one second to four minutes, with five seconds being the default.  The
+ +	 * group count is somewhat arbitrary, but it'd be nice to adhere to the
+ +	 * timer tunable to within about 10 percent.  This requires at least 10
+ +	 * groups.
+ +	 */
+ +	lifetime  = xfs_fstrm_centisecs * 10;
+ +	grp_count = 10;
+ +
+ +	err = xfs_mru_cache_create(&mp->m_filestream, lifetime, grp_count,
+ +	                     xfs_fstrm_free_func);
+ +
+ +	return err;
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_filestream.c
