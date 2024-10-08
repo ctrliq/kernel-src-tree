@@ -1,0 +1,571 @@
+fs: Drop unlikely before IS_ERR(_OR_NULL)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit a1c83681d52704c766d576bea2d7f2f99e8dde23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a1c83681.failed
+
+IS_ERR(_OR_NULL) already contain an 'unlikely' compiler flag and there
+is no need to do that again from its callers. Drop it.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Jeff Layton <jlayton@poochiereds.net>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Reviewed-by: Steve French <smfrench@gmail.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit a1c83681d52704c766d576bea2d7f2f99e8dde23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+#	fs/ext4/namei.c
+#	fs/namei.c
+diff --cc fs/ext4/extents.c
+index 4da1ab9dd6f1,799f01714767..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -5498,3 -5575,367 +5498,370 @@@ out_mutex
+  	mutex_unlock(&inode->i_mutex);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * ext4_insert_range:
++  * This function implements the FALLOC_FL_INSERT_RANGE flag of fallocate.
++  * The data blocks starting from @offset to the EOF are shifted by @len
++  * towards right to create a hole in the @inode. Inode size is increased
++  * by len bytes.
++  * Returns 0 on success, error otherwise.
++  */
++ int ext4_insert_range(struct inode *inode, loff_t offset, loff_t len)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	handle_t *handle;
++ 	struct ext4_ext_path *path;
++ 	struct ext4_extent *extent;
++ 	ext4_lblk_t offset_lblk, len_lblk, ee_start_lblk = 0;
++ 	unsigned int credits, ee_len;
++ 	int ret = 0, depth, split_flag = 0;
++ 	loff_t ioffset;
++ 
++ 	/*
++ 	 * We need to test this early because xfstests assumes that an
++ 	 * insert range of (0, 1) will return EOPNOTSUPP if the file
++ 	 * system does not support insert range.
++ 	 */
++ 	if (!ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Insert range works only on fs block size aligned offsets. */
++ 	if (offset & (EXT4_CLUSTER_SIZE(sb) - 1) ||
++ 			len & (EXT4_CLUSTER_SIZE(sb) - 1))
++ 		return -EINVAL;
++ 
++ 	if (!S_ISREG(inode->i_mode))
++ 		return -EOPNOTSUPP;
++ 
++ 	trace_ext4_insert_range(inode, offset, len);
++ 
++ 	offset_lblk = offset >> EXT4_BLOCK_SIZE_BITS(sb);
++ 	len_lblk = len >> EXT4_BLOCK_SIZE_BITS(sb);
++ 
++ 	/* Call ext4_force_commit to flush all data in case of data=journal */
++ 	if (ext4_should_journal_data(inode)) {
++ 		ret = ext4_force_commit(inode->i_sb);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * Need to round down to align start offset to page size boundary
++ 	 * for page size > block size.
++ 	 */
++ 	ioffset = round_down(offset, PAGE_SIZE);
++ 
++ 	/* Write out all dirty pages */
++ 	ret = filemap_write_and_wait_range(inode->i_mapping, ioffset,
++ 			LLONG_MAX);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Take mutex lock */
++ 	mutex_lock(&inode->i_mutex);
++ 
++ 	/* Currently just for extent based files */
++ 	if (!ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out_mutex;
++ 	}
++ 
++ 	/* Check for wrap through zero */
++ 	if (inode->i_size + len > inode->i_sb->s_maxbytes) {
++ 		ret = -EFBIG;
++ 		goto out_mutex;
++ 	}
++ 
++ 	/* Offset should be less than i_size */
++ 	if (offset >= i_size_read(inode)) {
++ 		ret = -EINVAL;
++ 		goto out_mutex;
++ 	}
++ 
++ 	truncate_pagecache(inode, ioffset);
++ 
++ 	/* Wait for existing dio to complete */
++ 	ext4_inode_block_unlocked_dio(inode);
++ 	inode_dio_wait(inode);
++ 
++ 	credits = ext4_writepage_trans_blocks(inode);
++ 	handle = ext4_journal_start(inode, EXT4_HT_TRUNCATE, credits);
++ 	if (IS_ERR(handle)) {
++ 		ret = PTR_ERR(handle);
++ 		goto out_dio;
++ 	}
++ 
++ 	/* Expand file to avoid data loss if there is error while shifting */
++ 	inode->i_size += len;
++ 	EXT4_I(inode)->i_disksize += len;
++ 	inode->i_mtime = inode->i_ctime = ext4_current_time(inode);
++ 	ret = ext4_mark_inode_dirty(handle, inode);
++ 	if (ret)
++ 		goto out_stop;
++ 
++ 	down_write(&EXT4_I(inode)->i_data_sem);
++ 	ext4_discard_preallocations(inode);
++ 
++ 	path = ext4_find_extent(inode, offset_lblk, NULL, 0);
++ 	if (IS_ERR(path)) {
++ 		up_write(&EXT4_I(inode)->i_data_sem);
++ 		goto out_stop;
++ 	}
++ 
++ 	depth = ext_depth(inode);
++ 	extent = path[depth].p_ext;
++ 	if (extent) {
++ 		ee_start_lblk = le32_to_cpu(extent->ee_block);
++ 		ee_len = ext4_ext_get_actual_len(extent);
++ 
++ 		/*
++ 		 * If offset_lblk is not the starting block of extent, split
++ 		 * the extent @offset_lblk
++ 		 */
++ 		if ((offset_lblk > ee_start_lblk) &&
++ 				(offset_lblk < (ee_start_lblk + ee_len))) {
++ 			if (ext4_ext_is_unwritten(extent))
++ 				split_flag = EXT4_EXT_MARK_UNWRIT1 |
++ 					EXT4_EXT_MARK_UNWRIT2;
++ 			ret = ext4_split_extent_at(handle, inode, &path,
++ 					offset_lblk, split_flag,
++ 					EXT4_EX_NOCACHE |
++ 					EXT4_GET_BLOCKS_PRE_IO |
++ 					EXT4_GET_BLOCKS_METADATA_NOFAIL);
++ 		}
++ 
++ 		ext4_ext_drop_refs(path);
++ 		kfree(path);
++ 		if (ret < 0) {
++ 			up_write(&EXT4_I(inode)->i_data_sem);
++ 			goto out_stop;
++ 		}
++ 	}
++ 
++ 	ret = ext4_es_remove_extent(inode, offset_lblk,
++ 			EXT_MAX_BLOCKS - offset_lblk);
++ 	if (ret) {
++ 		up_write(&EXT4_I(inode)->i_data_sem);
++ 		goto out_stop;
++ 	}
++ 
++ 	/*
++ 	 * if offset_lblk lies in a hole which is at start of file, use
++ 	 * ee_start_lblk to shift extents
++ 	 */
++ 	ret = ext4_ext_shift_extents(inode, handle,
++ 		ee_start_lblk > offset_lblk ? ee_start_lblk : offset_lblk,
++ 		len_lblk, SHIFT_RIGHT);
++ 
++ 	up_write(&EXT4_I(inode)->i_data_sem);
++ 	if (IS_SYNC(inode))
++ 		ext4_handle_sync(handle);
++ 
++ out_stop:
++ 	ext4_journal_stop(handle);
++ out_dio:
++ 	ext4_inode_resume_unlocked_dio(inode);
++ out_mutex:
++ 	mutex_unlock(&inode->i_mutex);
++ 	return ret;
++ }
++ 
++ /**
++  * ext4_swap_extents - Swap extents between two inodes
++  *
++  * @inode1:	First inode
++  * @inode2:	Second inode
++  * @lblk1:	Start block for first inode
++  * @lblk2:	Start block for second inode
++  * @count:	Number of blocks to swap
++  * @mark_unwritten: Mark second inode's extents as unwritten after swap
++  * @erp:	Pointer to save error value
++  *
++  * This helper routine does exactly what is promise "swap extents". All other
++  * stuff such as page-cache locking consistency, bh mapping consistency or
++  * extent's data copying must be performed by caller.
++  * Locking:
++  * 		i_mutex is held for both inodes
++  * 		i_data_sem is locked for write for both inodes
++  * Assumptions:
++  *		All pages from requested range are locked for both inodes
++  */
++ int
++ ext4_swap_extents(handle_t *handle, struct inode *inode1,
++ 		     struct inode *inode2, ext4_lblk_t lblk1, ext4_lblk_t lblk2,
++ 		  ext4_lblk_t count, int unwritten, int *erp)
++ {
++ 	struct ext4_ext_path *path1 = NULL;
++ 	struct ext4_ext_path *path2 = NULL;
++ 	int replaced_count = 0;
++ 
++ 	BUG_ON(!rwsem_is_locked(&EXT4_I(inode1)->i_data_sem));
++ 	BUG_ON(!rwsem_is_locked(&EXT4_I(inode2)->i_data_sem));
++ 	BUG_ON(!mutex_is_locked(&inode1->i_mutex));
++ 	BUG_ON(!mutex_is_locked(&inode2->i_mutex));
++ 
++ 	*erp = ext4_es_remove_extent(inode1, lblk1, count);
++ 	if (unlikely(*erp))
++ 		return 0;
++ 	*erp = ext4_es_remove_extent(inode2, lblk2, count);
++ 	if (unlikely(*erp))
++ 		return 0;
++ 
++ 	while (count) {
++ 		struct ext4_extent *ex1, *ex2, tmp_ex;
++ 		ext4_lblk_t e1_blk, e2_blk;
++ 		int e1_len, e2_len, len;
++ 		int split = 0;
++ 
++ 		path1 = ext4_find_extent(inode1, lblk1, NULL, EXT4_EX_NOCACHE);
++ 		if (IS_ERR(path1)) {
++ 			*erp = PTR_ERR(path1);
++ 			path1 = NULL;
++ 		finish:
++ 			count = 0;
++ 			goto repeat;
++ 		}
++ 		path2 = ext4_find_extent(inode2, lblk2, NULL, EXT4_EX_NOCACHE);
++ 		if (IS_ERR(path2)) {
++ 			*erp = PTR_ERR(path2);
++ 			path2 = NULL;
++ 			goto finish;
++ 		}
++ 		ex1 = path1[path1->p_depth].p_ext;
++ 		ex2 = path2[path2->p_depth].p_ext;
++ 		/* Do we have somthing to swap ? */
++ 		if (unlikely(!ex2 || !ex1))
++ 			goto finish;
++ 
++ 		e1_blk = le32_to_cpu(ex1->ee_block);
++ 		e2_blk = le32_to_cpu(ex2->ee_block);
++ 		e1_len = ext4_ext_get_actual_len(ex1);
++ 		e2_len = ext4_ext_get_actual_len(ex2);
++ 
++ 		/* Hole handling */
++ 		if (!in_range(lblk1, e1_blk, e1_len) ||
++ 		    !in_range(lblk2, e2_blk, e2_len)) {
++ 			ext4_lblk_t next1, next2;
++ 
++ 			/* if hole after extent, then go to next extent */
++ 			next1 = ext4_ext_next_allocated_block(path1);
++ 			next2 = ext4_ext_next_allocated_block(path2);
++ 			/* If hole before extent, then shift to that extent */
++ 			if (e1_blk > lblk1)
++ 				next1 = e1_blk;
++ 			if (e2_blk > lblk2)
++ 				next2 = e1_blk;
++ 			/* Do we have something to swap */
++ 			if (next1 == EXT_MAX_BLOCKS || next2 == EXT_MAX_BLOCKS)
++ 				goto finish;
++ 			/* Move to the rightest boundary */
++ 			len = next1 - lblk1;
++ 			if (len < next2 - lblk2)
++ 				len = next2 - lblk2;
++ 			if (len > count)
++ 				len = count;
++ 			lblk1 += len;
++ 			lblk2 += len;
++ 			count -= len;
++ 			goto repeat;
++ 		}
++ 
++ 		/* Prepare left boundary */
++ 		if (e1_blk < lblk1) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode1,
++ 						&path1, lblk1, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		if (e2_blk < lblk2) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode2,
++ 						&path2,  lblk2, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		/* ext4_split_extent_at() may result in leaf extent split,
++ 		 * path must to be revalidated. */
++ 		if (split)
++ 			goto repeat;
++ 
++ 		/* Prepare right boundary */
++ 		len = count;
++ 		if (len > e1_blk + e1_len - lblk1)
++ 			len = e1_blk + e1_len - lblk1;
++ 		if (len > e2_blk + e2_len - lblk2)
++ 			len = e2_blk + e2_len - lblk2;
++ 
++ 		if (len != e1_len) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode1,
++ 						&path1, lblk1 + len, 0);
++ 			if (unlikely(*erp))
++ 				goto finish;
++ 		}
++ 		if (len != e2_len) {
++ 			split = 1;
++ 			*erp = ext4_force_split_extent_at(handle, inode2,
++ 						&path2, lblk2 + len, 0);
++ 			if (*erp)
++ 				goto finish;
++ 		}
++ 		/* ext4_split_extent_at() may result in leaf extent split,
++ 		 * path must to be revalidated. */
++ 		if (split)
++ 			goto repeat;
++ 
++ 		BUG_ON(e2_len != e1_len);
++ 		*erp = ext4_ext_get_access(handle, inode1, path1 + path1->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		*erp = ext4_ext_get_access(handle, inode2, path2 + path2->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 
++ 		/* Both extents are fully inside boundaries. Swap it now */
++ 		tmp_ex = *ex1;
++ 		ext4_ext_store_pblock(ex1, ext4_ext_pblock(ex2));
++ 		ext4_ext_store_pblock(ex2, ext4_ext_pblock(&tmp_ex));
++ 		ex1->ee_len = cpu_to_le16(e2_len);
++ 		ex2->ee_len = cpu_to_le16(e1_len);
++ 		if (unwritten)
++ 			ext4_ext_mark_unwritten(ex2);
++ 		if (ext4_ext_is_unwritten(&tmp_ex))
++ 			ext4_ext_mark_unwritten(ex1);
++ 
++ 		ext4_ext_try_to_merge(handle, inode2, path2, ex2);
++ 		ext4_ext_try_to_merge(handle, inode1, path1, ex1);
++ 		*erp = ext4_ext_dirty(handle, inode2, path2 +
++ 				      path2->p_depth);
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		*erp = ext4_ext_dirty(handle, inode1, path1 +
++ 				      path1->p_depth);
++ 		/*
++ 		 * Looks scarry ah..? second inode already points to new blocks,
++ 		 * and it was successfully dirtied. But luckily error may happen
++ 		 * only due to journal error, so full transaction will be
++ 		 * aborted anyway.
++ 		 */
++ 		if (unlikely(*erp))
++ 			goto finish;
++ 		lblk1 += len;
++ 		lblk2 += len;
++ 		replaced_count += len;
++ 		count -= len;
++ 
++ 	repeat:
++ 		ext4_ext_drop_refs(path1);
++ 		kfree(path1);
++ 		ext4_ext_drop_refs(path2);
++ 		kfree(path2);
++ 		path1 = path2 = NULL;
++ 	}
++ 	return replaced_count;
++ }
+++>>>>>>> a1c83681d527 (fs: Drop unlikely before IS_ERR(_OR_NULL))
+diff --cc fs/ext4/namei.c
+index 06be148622f8,0554e4be1fb8..000000000000
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@@ -1291,10 -1428,12 +1291,19 @@@ restart
+  					break;
+  				}
+  				num++;
+++<<<<<<< HEAD
+ +				bh = ext4_getblk(NULL, dir, b++, 0, &err);
+ +				if (unlikely(err)) {
+ +					if (ra_max == 0)
+ +						return ERR_PTR(err);
+++=======
++ 				bh = ext4_getblk(NULL, dir, b++, 0);
++ 				if (IS_ERR(bh)) {
++ 					if (ra_max == 0) {
++ 						ret = bh;
++ 						goto cleanup_and_exit;
++ 					}
+++>>>>>>> a1c83681d527 (fs: Drop unlikely before IS_ERR(_OR_NULL))
+  					break;
+  				}
+  				bh_use[ra_max] = bh;
+diff --cc fs/namei.c
+index aff3e3ec968b,d3f84069a9aa..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -1873,27 -1940,39 +1873,43 @@@ static int link_path_walk(const char *n
+  			return err;
+  
+  		if (err) {
+++<<<<<<< HEAD
+ +			err = nested_symlink(&next, nd);
+ +			if (err)
+ +				return err;
+++=======
++ 			const char *s = get_link(nd);
++ 
++ 			if (IS_ERR(s))
++ 				return PTR_ERR(s);
++ 			err = 0;
++ 			if (unlikely(!s)) {
++ 				/* jumped */
++ 				put_link(nd);
++ 			} else {
++ 				nd->stack[nd->depth - 1].name = name;
++ 				name = s;
++ 				continue;
++ 			}
+++>>>>>>> a1c83681d527 (fs: Drop unlikely before IS_ERR(_OR_NULL))
+  		}
+ -		if (unlikely(!d_can_lookup(nd->path.dentry))) {
+ -			if (nd->flags & LOOKUP_RCU) {
+ -				if (unlazy_walk(nd, NULL, 0))
+ -					return -ECHILD;
+ -			}
+ -			return -ENOTDIR;
+ +		if (!d_can_lookup(nd->path.dentry)) {
+ +			err = -ENOTDIR; 
+ +			break;
+  		}
+  	}
+ +	terminate_walk(nd);
+ +	return err;
+  }
+  
+ -static const char *path_init(struct nameidata *nd, unsigned flags)
+ +static int path_init(int dfd, const char *name, unsigned int flags,
+ +		     struct nameidata *nd, struct file **fp)
+  {
+  	int retval = 0;
+ -	const char *s = nd->name->name;
+  
+  	nd->last_type = LAST_ROOT; /* if there are only slashes... */
+ -	nd->flags = flags | LOOKUP_JUMPED | LOOKUP_PARENT;
+ +	nd->flags = flags | LOOKUP_JUMPED;
+  	nd->depth = 0;
+ -	nd->total_link_count = 0;
+  	if (flags & LOOKUP_ROOT) {
+  		struct dentry *root = nd->root.dentry;
+  		struct inode *inode = root->d_inode;
+@@@ -3291,14 -3356,16 +3307,14 @@@ struct file *do_file_open_root(struct d
+  		return ERR_PTR(-ELOOP);
+  
+  	filename = getname_kernel(name);
+- 	if (unlikely(IS_ERR(filename)))
++ 	if (IS_ERR(filename))
+  		return ERR_CAST(filename);
+  
+ -	set_nameidata(&nd, -1, filename);
+ -	file = path_openat(&nd, op, flags | LOOKUP_RCU);
+ +	file = path_openat(-1, filename, &nd, op, flags | LOOKUP_RCU);
+  	if (unlikely(file == ERR_PTR(-ECHILD)))
+ -		file = path_openat(&nd, op, flags);
+ +		file = path_openat(-1, filename, &nd, op, flags);
+  	if (unlikely(file == ERR_PTR(-ESTALE)))
+ -		file = path_openat(&nd, op, flags | LOOKUP_REVAL);
+ -	restore_nameidata();
+ +		file = path_openat(-1, filename, &nd, op, flags | LOOKUP_REVAL);
+  	putname(filename);
+  	return file;
+  }
+diff --git a/fs/cifs/readdir.c b/fs/cifs/readdir.c
+index 8e0548dbcdd4..72bdba9776f8 100644
+--- a/fs/cifs/readdir.c
++++ b/fs/cifs/readdir.c
+@@ -84,7 +84,7 @@ cifs_prime_dcache(struct dentry *parent, struct qstr *name,
+ 	cifs_dbg(FYI, "%s: for %s\n", __func__, name->name);
+ 
+ 	dentry = d_hash_and_lookup(parent, name);
+-	if (unlikely(IS_ERR(dentry)))
++	if (IS_ERR(dentry))
+ 		return;
+ 
+ 	if (dentry) {
+diff --git a/fs/ecryptfs/inode.c b/fs/ecryptfs/inode.c
+index fef4763df8be..1648908cf236 100644
+--- a/fs/ecryptfs/inode.c
++++ b/fs/ecryptfs/inode.c
+@@ -281,7 +281,7 @@ ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
+ 
+ 	ecryptfs_inode = ecryptfs_do_create(directory_inode, ecryptfs_dentry,
+ 					    mode);
+-	if (unlikely(IS_ERR(ecryptfs_inode))) {
++	if (IS_ERR(ecryptfs_inode)) {
+ 		ecryptfs_printk(KERN_WARNING, "Failed to create file in"
+ 				"lower filesystem\n");
+ 		rc = PTR_ERR(ecryptfs_inode);
+* Unmerged path fs/ext4/extents.c
+* Unmerged path fs/ext4/namei.c
+* Unmerged path fs/namei.c
+diff --git a/fs/ncpfs/dir.c b/fs/ncpfs/dir.c
+index 6642f8b600ac..dd8190ae891c 100644
+--- a/fs/ncpfs/dir.c
++++ b/fs/ncpfs/dir.c
+@@ -611,7 +611,7 @@ ncp_fill_cache(struct file *filp, void *dirent, filldir_t filldir,
+ 	qname.name = __name;
+ 
+ 	newdent = d_hash_and_lookup(dentry, &qname);
+-	if (unlikely(IS_ERR(newdent)))
++	if (IS_ERR(newdent))
+ 		goto end_advance;
+ 	if (!newdent) {
+ 		newdent = d_alloc(dentry, &qname);
+diff --git a/fs/nfs/objlayout/objio_osd.c b/fs/nfs/objlayout/objio_osd.c
+index cf8e5acc26bd..24f9843d9adc 100644
+--- a/fs/nfs/objlayout/objio_osd.c
++++ b/fs/nfs/objlayout/objio_osd.c
+@@ -124,7 +124,7 @@ objio_alloc_deviceid_node(struct nfs_server *server, struct pnfs_device *pdev,
+ 
+ retry_lookup:
+ 	od = osduld_info_lookup(&odi);
+-	if (unlikely(IS_ERR(od))) {
++	if (IS_ERR(od)) {
+ 		err = PTR_ERR(od);
+ 		dprintk("%s: osduld_info_lookup => %d\n", __func__, err);
+ 		if (err == -ENODEV && retry_flag) {
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index 50225d19bbce..890d5a094d69 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -928,7 +928,7 @@ static struct ctl_dir *get_subdir(struct ctl_dir *dir,
+ found:
+ 	subdir->header.nreg++;
+ failed:
+-	if (unlikely(IS_ERR(subdir))) {
++	if (IS_ERR(subdir)) {
+ 		pr_err("sysctl could not get directory: ");
+ 		sysctl_print_dir(dir);
+ 		pr_cont("/%*.*s %ld\n",
