@@ -1,0 +1,162 @@
+net: Add __dev_forward_skb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] core: Add __dev_forward_skb (Herbert Xu) [971693]
+Rebuild_FUZZ: 90.57%
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit a0265d28b3a5877b5b8edd14eb12a2ccb60ab1f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a0265d28.failed
+
+This patch adds the helper __dev_forward_skb which is identical to
+dev_forward_skb except that it doesn't actually inject the skb into
+the stack.  This is useful where we wish to have finer control over
+how the packet is injected, e.g., via netif_rx_ni or netif_receive_skb.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a0265d28b3a5877b5b8edd14eb12a2ccb60ab1f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index 80813de117ba,a803d792df1e..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2479,37 -2609,33 +2479,62 @@@ static inline void napi_free_frags(stru
+  	napi->skb = NULL;
+  }
+  
+ -int netdev_rx_handler_register(struct net_device *dev,
+ -			       rx_handler_func_t *rx_handler,
+ -			       void *rx_handler_data);
+ -void netdev_rx_handler_unregister(struct net_device *dev);
+ -
+ +extern int netdev_rx_handler_register(struct net_device *dev,
+ +				      rx_handler_func_t *rx_handler,
+ +				      void *rx_handler_data);
+ +extern void netdev_rx_handler_unregister(struct net_device *dev);
+ +
+++<<<<<<< HEAD
+ +extern bool		dev_valid_name(const char *name);
+ +extern int		dev_ioctl(struct net *net, unsigned int cmd, void __user *);
+ +extern int		dev_ethtool(struct net *net, struct ifreq *);
+ +extern unsigned int	dev_get_flags(const struct net_device *);
+ +extern int		__dev_change_flags(struct net_device *, unsigned int flags);
+ +extern int		dev_change_flags(struct net_device *, unsigned int);
+ +void			__dev_notify_flags(struct net_device *,
+ +					   unsigned int old_flags,
+ +					   unsigned int gchanges);
+ +extern int		dev_change_name(struct net_device *, const char *);
+ +extern int		dev_set_alias(struct net_device *, const char *, size_t);
+ +extern int		dev_change_net_namespace(struct net_device *,
+ +						 struct net *, const char *);
+ +extern int		dev_set_mtu(struct net_device *, int);
+ +extern void		dev_set_group(struct net_device *, int);
+ +extern int		dev_set_mac_address(struct net_device *,
+ +					    struct sockaddr *);
+ +extern int		dev_change_carrier(struct net_device *,
+ +					   bool new_carrier);
+ +extern int		dev_get_phys_port_id(struct net_device *dev,
+ +					     struct netdev_phys_port_id *ppid);
+ +extern int		dev_hard_start_xmit(struct sk_buff *skb,
+ +					    struct net_device *dev,
+ +					    struct netdev_queue *txq);
+ +extern int		dev_forward_skb(struct net_device *dev,
+ +					struct sk_buff *skb);
+++=======
++ bool dev_valid_name(const char *name);
++ int dev_ioctl(struct net *net, unsigned int cmd, void __user *);
++ int dev_ethtool(struct net *net, struct ifreq *);
++ unsigned int dev_get_flags(const struct net_device *);
++ int __dev_change_flags(struct net_device *, unsigned int flags);
++ int dev_change_flags(struct net_device *, unsigned int);
++ void __dev_notify_flags(struct net_device *, unsigned int old_flags,
++ 			unsigned int gchanges);
++ int dev_change_name(struct net_device *, const char *);
++ int dev_set_alias(struct net_device *, const char *, size_t);
++ int dev_change_net_namespace(struct net_device *, struct net *, const char *);
++ int dev_set_mtu(struct net_device *, int);
++ void dev_set_group(struct net_device *, int);
++ int dev_set_mac_address(struct net_device *, struct sockaddr *);
++ int dev_change_carrier(struct net_device *, bool new_carrier);
++ int dev_get_phys_port_id(struct net_device *dev,
++ 			 struct netdev_phys_port_id *ppid);
++ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
++ 			struct netdev_queue *txq);
++ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
++ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
++ bool is_skb_forwardable(struct net_device *dev, struct sk_buff *skb);
+++>>>>>>> a0265d28b3a5 (net: Add __dev_forward_skb)
+  
+  extern int		netdev_budget;
+  
+diff --cc net/core/dev.c
+index 1924c9647d47,11d70e3afefa..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -1631,7 -1659,31 +1631,30 @@@ static inline bool is_skb_forwardable(s
+  
+  	return false;
+  }
+ -EXPORT_SYMBOL_GPL(is_skb_forwardable);
+  
++ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
++ 		if (skb_copy_ubufs(skb, GFP_ATOMIC)) {
++ 			atomic_long_inc(&dev->rx_dropped);
++ 			kfree_skb(skb);
++ 			return NET_RX_DROP;
++ 		}
++ 	}
++ 
++ 	if (unlikely(!is_skb_forwardable(dev, skb))) {
++ 		atomic_long_inc(&dev->rx_dropped);
++ 		kfree_skb(skb);
++ 		return NET_RX_DROP;
++ 	}
++ 
++ 	skb_scrub_packet(skb, true);
++ 	skb->protocol = eth_type_trans(skb, dev);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(__dev_forward_skb);
++ 
+  /**
+   * dev_forward_skb - loopback an skb to another netif
+   *
+@@@ -1652,22 -1704,7 +1675,26 @@@
+   */
+  int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
+ +		if (skb_copy_ubufs(skb, GFP_ATOMIC)) {
+ +			atomic_long_inc(&dev->rx_dropped);
+ +			kfree_skb(skb);
+ +			return NET_RX_DROP;
+ +		}
+ +	}
+ +
+ +	if (unlikely(!is_skb_forwardable(dev, skb))) {
+ +		atomic_long_inc(&dev->rx_dropped);
+ +		kfree_skb(skb);
+ +		return NET_RX_DROP;
+ +	}
+ +	skb_scrub_packet(skb, true);
+ +	skb->protocol = eth_type_trans(skb, dev);
+ +	return netif_rx(skb);
+++=======
++ 	return __dev_forward_skb(dev, skb) ?: netif_rx_internal(skb);
+++>>>>>>> a0265d28b3a5 (net: Add __dev_forward_skb)
+  }
+  EXPORT_SYMBOL_GPL(dev_forward_skb);
+  
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
