@@ -1,0 +1,231 @@
+netfilter: bridge: add and use nf_bridge_info_get helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 383307838d41935841ba6b2e939b968326e2dea1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/38330783.failed
+
+Don't access skb->nf_bridge directly, this pointer will be removed soon.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 383307838d41935841ba6b2e939b968326e2dea1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,301f12b0a7cd..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -110,66 -111,24 +110,71 @@@ static inline __be16 pppoe_proto(const 
+  	 pppoe_proto(skb) == htons(PPP_IPV6) && \
+  	 brnf_filter_pppoe_tagged)
+  
+ -/* largest possible L2 header, see br_nf_dev_queue_xmit() */
+ -#define NF_BRIDGE_MAX_MAC_HEADER_LENGTH (PPPOE_SES_HLEN + ETH_HLEN)
+ +static void fake_update_pmtu(struct dst_entry *dst, struct sock *sk,
+ +			     struct sk_buff *skb, u32 mtu)
+ +{
+ +}
+ +
+ +static void fake_redirect(struct dst_entry *dst, struct sock *sk,
+ +			  struct sk_buff *skb)
+ +{
+ +}
+ +
+ +static u32 *fake_cow_metrics(struct dst_entry *dst, unsigned long old)
+ +{
+ +	return NULL;
+ +}
+  
+ -#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
+ -struct brnf_frag_data {
+ -	char mac[NF_BRIDGE_MAX_MAC_HEADER_LENGTH];
+ -	u8 encap_size;
+ -	u8 size;
+ +static struct neighbour *fake_neigh_lookup(const struct dst_entry *dst,
+ +					   struct sk_buff *skb,
+ +					   const void *daddr)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static unsigned int fake_mtu(const struct dst_entry *dst)
+ +{
+ +	return dst->dev->mtu;
+ +}
+ +
+ +static struct dst_ops fake_dst_ops = {
+ +	.family =		AF_INET,
+ +	.protocol =		cpu_to_be16(ETH_P_IP),
+ +	.update_pmtu =		fake_update_pmtu,
+ +	.redirect =		fake_redirect,
+ +	.cow_metrics =		fake_cow_metrics,
+ +	.neigh_lookup =		fake_neigh_lookup,
+ +	.mtu =			fake_mtu,
+  };
+  
+ -static DEFINE_PER_CPU(struct brnf_frag_data, brnf_frag_data_storage);
+ -#endif
+ +/*
+ + * Initialize bogus route table used to keep netfilter happy.
+ + * Currently, we fill in the PMTU entry because netfilter
+ + * refragmentation needs it, and the rt_flags entry because
+ + * ipt_REJECT needs it.  Future netfilter modules might
+ + * require us to fill additional fields.
+ + */
+ +static const u32 br_dst_default_metrics[RTAX_MAX] = {
+ +	[RTAX_MTU - 1] = 1500,
+ +};
+ +
+ +void br_netfilter_rtable_init(struct net_bridge *br)
+ +{
+ +	struct rtable *rt = &br->fake_rtable;
+ +
+ +	atomic_set(&rt->dst.__refcnt, 1);
+ +	rt->dst.dev = br->dev;
+ +	rt->dst.path = &rt->dst;
+ +	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
+ +	rt->dst.flags	= DST_NOXFRM | DST_NOPEER | DST_FAKE_RTABLE;
+ +	rt->dst.ops = &fake_dst_ops;
+ +}
+  
++ static struct nf_bridge_info *nf_bridge_info_get(const struct sk_buff *skb)
++ {
++ 	return skb->nf_bridge;
++ }
++ 
+  static inline struct rtable *bridge_parent_rtable(const struct net_device *dev)
+  {
+  	struct net_bridge_port *port;
+@@@ -300,9 -263,17 +305,9 @@@ drop
+  /* PF_BRIDGE/PRE_ROUTING *********************************************/
+  /* Undo the changes made for ip6tables PREROUTING and continue the
+   * bridge PRE_ROUTING hook. */
+ -static int br_nf_pre_routing_finish_ipv6(struct sk_buff *skb)
+ +static int br_nf_pre_routing_finish_ipv6(struct sock *sk, struct sk_buff *skb)
+  {
+- 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+  	struct rtable *rt;
+  
+  	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+@@@ -333,9 -303,8 +338,8 @@@
+   * don't, we use the neighbour framework to find out. In both cases, we make
+   * sure that br_handle_frame_finish() is called afterwards.
+   */
+ -static int br_nf_pre_routing_finish_bridge(struct sk_buff *skb)
+ +static int br_nf_pre_routing_finish_bridge(struct sock *sk, struct sk_buff *skb)
+  {
+- 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+  	struct neighbour *neigh;
+  	struct dst_entry *dst;
+  
+@@@ -430,9 -401,13 +435,9 @@@ static int br_nf_pre_routing_finish(str
+  {
+  	struct net_device *dev = skb->dev;
+  	struct iphdr *iph = ip_hdr(skb);
+- 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+  	struct rtable *rt;
+  	int err;
+ -	int frag_max_size;
+ -
+ -	frag_max_size = IPCB(skb)->frag_max_size;
+ -	BR_INPUT_SKB_CB(skb)->frag_max_size = frag_max_size;
+  
+  	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+  		skb->pkt_type = PACKET_OTHERHOST;
+@@@ -718,9 -690,9 +723,9 @@@ static unsigned int br_nf_local_in(cons
+  }
+  
+  /* PF_BRIDGE/FORWARD *************************************************/
+ -static int br_nf_forward_finish(struct sk_buff *skb)
+ +static int br_nf_forward_finish(struct sock *sk, struct sk_buff *skb)
+  {
+- 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+  	struct net_device *in;
+  
+  	if (!IS_ARP(skb) && !IS_VLAN_ARP(skb)) {
+@@@ -771,7 -743,11 +776,15 @@@ static unsigned int br_nf_forward_ip(co
+  	if (!nf_bridge_unshare(skb))
+  		return NF_DROP;
+  
+++<<<<<<< HEAD
+ +	parent = bridge_parent(state->out);
+++=======
++ 	nf_bridge = nf_bridge_info_get(skb);
++ 	if (!nf_bridge)
++ 		return NF_DROP;
++ 
++ 	parent = bridge_parent(out);
+++>>>>>>> 383307838d41 (netfilter: bridge: add and use nf_bridge_info_get helper)
+  	if (!parent)
+  		return NF_DROP;
+  
+@@@ -877,9 -892,9 +889,9 @@@ static unsigned int br_nf_post_routing(
+  				       struct sk_buff *skb,
+  				       const struct net_device *in,
+  				       const struct net_device *out,
+ -				       int (*okfn)(struct sk_buff *))
+ +				       const struct nf_hook_state *state)
+  {
+- 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+  	struct net_device *realoutdev = bridge_parent(skb->dev);
+  	u_int8_t pf;
+  
+@@@ -939,6 -952,44 +951,47 @@@ static unsigned int ip_sabotage_in(cons
+  	return NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This is called when br_netfilter has called into iptables/netfilter,
++  * and DNAT has taken place on a bridge-forwarded packet.
++  *
++  * neigh->output has created a new MAC header, with local br0 MAC
++  * as saddr.
++  *
++  * This restores the original MAC saddr of the bridged packet
++  * before invoking bridge forward logic to transmit the packet.
++  */
++ static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++ 
++ 	skb_pull(skb, ETH_HLEN);
++ 	nf_bridge->mask &= ~BRNF_BRIDGED_DNAT;
++ 
++ 	BUILD_BUG_ON(sizeof(nf_bridge->neigh_header) != (ETH_HLEN - ETH_ALEN));
++ 
++ 	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN - ETH_ALEN),
++ 				       nf_bridge->neigh_header,
++ 				       ETH_HLEN - ETH_ALEN);
++ 	skb->dev = nf_bridge->physindev;
++ 	br_handle_frame_finish(skb);
++ }
++ 
++ static int br_nf_dev_xmit(struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
++ 		br_nf_pre_routing_finish_bridge_slow(skb);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static const struct nf_br_ops br_ops = {
++ 	.br_dev_xmit_hook =	br_nf_dev_xmit,
++ };
++ 
+++>>>>>>> 383307838d41 (netfilter: bridge: add and use nf_bridge_info_get helper)
+  void br_netfilter_enable(void)
+  {
+  }
+* Unmerged path net/bridge/br_netfilter.c
