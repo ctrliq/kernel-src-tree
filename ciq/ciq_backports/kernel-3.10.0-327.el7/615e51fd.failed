@@ -1,0 +1,223 @@
+selinux: reduce the number of calls to synchronize_net() when flushing caches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Paul Moore <pmoore@redhat.com>
+commit 615e51fdda6f274e94b1e905fcaf6111e0d9aa20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/615e51fd.failed
+
+When flushing the AVC, such as during a policy load, the various
+network caches are also flushed, with each making a call to
+synchronize_net() which has shown to be expensive in some cases.
+This patch consolidates the network cache flushes into a single AVC
+callback which only calls synchronize_net() once for each AVC cache
+flush.
+
+	Reported-by: Jaejyn Shin <flagon22bass@gmail.com>
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+(cherry picked from commit 615e51fdda6f274e94b1e905fcaf6111e0d9aa20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/include/netif.h
+diff --cc security/selinux/include/netif.h
+index 6bbff19acc14,57c6eae81eac..000000000000
+--- a/security/selinux/include/netif.h
++++ b/security/selinux/include/netif.h
+@@@ -17,9 -17,9 +17,15 @@@
+  #ifndef _SELINUX_NETIF_H_
+  #define _SELINUX_NETIF_H_
+  
+++<<<<<<< HEAD
+ +#include <net/net_namespace.h>
+ +
+ +int sel_netif_sid(struct net *ns, int ifindex, u32 *sid);
+++=======
++ void sel_netif_flush(void);
++ 
++ int sel_netif_sid(int ifindex, u32 *sid);
+++>>>>>>> 615e51fdda6f (selinux: reduce the number of calls to synchronize_net() when flushing caches)
+  
+  #endif	/* _SELINUX_NETIF_H_ */
+  
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 860d1fe2974b..5ce3763d45dc 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -148,6 +148,17 @@ static int selinux_secmark_enabled(void)
+ 	return (atomic_read(&selinux_secmark_refcount) > 0);
+ }
+ 
++static int selinux_netcache_avc_callback(u32 event)
++{
++	if (event == AVC_CALLBACK_RESET) {
++		sel_netif_flush();
++		sel_netnode_flush();
++		sel_netport_flush();
++		synchronize_net();
++	}
++	return 0;
++}
++
+ /*
+  * initialise the security for the init task
+  */
+@@ -5952,6 +5963,9 @@ static __init int selinux_init(void)
+ 	if (register_security(&selinux_ops))
+ 		panic("SELinux: Unable to register with kernel.\n");
+ 
++	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
++		panic("SELinux: Unable to register AVC netcache callback\n");
++
+ 	if (selinux_enforcing)
+ 		printk(KERN_DEBUG "SELinux:  Starting in enforcing mode\n");
+ 	else
+* Unmerged path security/selinux/include/netif.h
+diff --git a/security/selinux/include/netnode.h b/security/selinux/include/netnode.h
+index df7a5ed6c694..937668dd3024 100644
+--- a/security/selinux/include/netnode.h
++++ b/security/selinux/include/netnode.h
+@@ -27,6 +27,8 @@
+ #ifndef _SELINUX_NETNODE_H
+ #define _SELINUX_NETNODE_H
+ 
++void sel_netnode_flush(void);
++
+ int sel_netnode_sid(void *addr, u16 family, u32 *sid);
+ 
+ #endif
+diff --git a/security/selinux/include/netport.h b/security/selinux/include/netport.h
+index 4d965b83d735..d1ce896b2cb0 100644
+--- a/security/selinux/include/netport.h
++++ b/security/selinux/include/netport.h
+@@ -26,6 +26,8 @@
+ #ifndef _SELINUX_NETPORT_H
+ #define _SELINUX_NETPORT_H
+ 
++void sel_netport_flush(void);
++
+ int sel_netport_sid(u8 protocol, u16 pnum, u32 *sid);
+ 
+ #endif
+diff --git a/security/selinux/netif.c b/security/selinux/netif.c
+index 0f35b50148e3..548651a73876 100644
+--- a/security/selinux/netif.c
++++ b/security/selinux/netif.c
+@@ -246,7 +246,7 @@ static void sel_netif_kill(const struct net *ns, int ifindex)
+  * Remove all entries from the network interface table.
+  *
+  */
+-static void sel_netif_flush(void)
++void sel_netif_flush(void)
+ {
+ 	int idx;
+ 	struct sel_netif *netif;
+@@ -258,15 +258,6 @@ static void sel_netif_flush(void)
+ 	spin_unlock_bh(&sel_netif_lock);
+ }
+ 
+-static int sel_netif_avc_callback(u32 event)
+-{
+-	if (event == AVC_CALLBACK_RESET) {
+-		sel_netif_flush();
+-		synchronize_net();
+-	}
+-	return 0;
+-}
+-
+ static int sel_netif_netdev_notifier_handler(struct notifier_block *this,
+ 					     unsigned long event, void *ptr)
+ {
+@@ -294,10 +285,6 @@ static __init int sel_netif_init(void)
+ 
+ 	register_netdevice_notifier(&sel_netif_netdev_notifier);
+ 
+-	err = avc_add_callback(sel_netif_avc_callback, AVC_CALLBACK_RESET);
+-	if (err)
+-		panic("avc_add_callback() failed, error %d\n", err);
+-
+ 	return err;
+ }
+ 
+diff --git a/security/selinux/netnode.c b/security/selinux/netnode.c
+index c5454c0477c3..bb8de9d9b429 100644
+--- a/security/selinux/netnode.c
++++ b/security/selinux/netnode.c
+@@ -281,7 +281,7 @@ int sel_netnode_sid(void *addr, u16 family, u32 *sid)
+  * Remove all entries from the network address table.
+  *
+  */
+-static void sel_netnode_flush(void)
++void sel_netnode_flush(void)
+ {
+ 	unsigned int idx;
+ 	struct sel_netnode *node, *node_tmp;
+@@ -298,15 +298,6 @@ static void sel_netnode_flush(void)
+ 	spin_unlock_bh(&sel_netnode_lock);
+ }
+ 
+-static int sel_netnode_avc_callback(u32 event)
+-{
+-	if (event == AVC_CALLBACK_RESET) {
+-		sel_netnode_flush();
+-		synchronize_net();
+-	}
+-	return 0;
+-}
+-
+ static __init int sel_netnode_init(void)
+ {
+ 	int iter;
+@@ -320,10 +311,6 @@ static __init int sel_netnode_init(void)
+ 		sel_netnode_hash[iter].size = 0;
+ 	}
+ 
+-	ret = avc_add_callback(sel_netnode_avc_callback, AVC_CALLBACK_RESET);
+-	if (ret != 0)
+-		panic("avc_add_callback() failed, error %d\n", ret);
+-
+ 	return ret;
+ }
+ 
+diff --git a/security/selinux/netport.c b/security/selinux/netport.c
+index d35379781c2c..73ac6784d091 100644
+--- a/security/selinux/netport.c
++++ b/security/selinux/netport.c
+@@ -217,7 +217,7 @@ int sel_netport_sid(u8 protocol, u16 pnum, u32 *sid)
+  * Remove all entries from the network address table.
+  *
+  */
+-static void sel_netport_flush(void)
++void sel_netport_flush(void)
+ {
+ 	unsigned int idx;
+ 	struct sel_netport *port, *port_tmp;
+@@ -234,15 +234,6 @@ static void sel_netport_flush(void)
+ 	spin_unlock_bh(&sel_netport_lock);
+ }
+ 
+-static int sel_netport_avc_callback(u32 event)
+-{
+-	if (event == AVC_CALLBACK_RESET) {
+-		sel_netport_flush();
+-		synchronize_net();
+-	}
+-	return 0;
+-}
+-
+ static __init int sel_netport_init(void)
+ {
+ 	int iter;
+@@ -256,10 +247,6 @@ static __init int sel_netport_init(void)
+ 		sel_netport_hash[iter].size = 0;
+ 	}
+ 
+-	ret = avc_add_callback(sel_netport_avc_callback, AVC_CALLBACK_RESET);
+-	if (ret != 0)
+-		panic("avc_add_callback() failed, error %d\n", ret);
+-
+ 	return ret;
+ }
+ 
