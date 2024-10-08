@@ -1,0 +1,173 @@
+tcp: fix recv with flags MSG_WAITALL | MSG_PEEK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit dfbafc995304ebb9a9b03f65083e6e9cea143b20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dfbafc99.failed
+
+Currently, tcp_recvmsg enters a busy loop in sk_wait_data if called
+with flags = MSG_WAITALL | MSG_PEEK.
+
+sk_wait_data waits for sk_receive_queue not empty, but in this case,
+the receive queue is not empty, but does not contain any skb that we
+can use.
+
+Add a "last skb seen on receive queue" argument to sk_wait_data, so
+that it sleeps until the receive queue has new skbs.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=99461
+Link: https://sourceware.org/bugzilla/show_bug.cgi?id=18493
+Link: https://bugzilla.redhat.com/show_bug.cgi?id=1205258
+	Reported-by: Enrico Scholz <rh-bugzilla@ensc.de>
+	Reported-by: Dan Searle <dan@censornet.com>
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dfbafc995304ebb9a9b03f65083e6e9cea143b20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+diff --cc include/net/sock.h
+index a7480947869a,f21f0708ec59..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -901,15 -894,15 +901,19 @@@ static inline void sock_rps_reset_rxhas
+  		__rc;							\
+  	})
+  
+ -int sk_stream_wait_connect(struct sock *sk, long *timeo_p);
+ -int sk_stream_wait_memory(struct sock *sk, long *timeo_p);
+ -void sk_stream_wait_close(struct sock *sk, long timeo_p);
+ -int sk_stream_error(struct sock *sk, int flags, int err);
+ -void sk_stream_kill_queues(struct sock *sk);
+ -void sk_set_memalloc(struct sock *sk);
+ -void sk_clear_memalloc(struct sock *sk);
+ -
+ +extern int sk_stream_wait_connect(struct sock *sk, long *timeo_p);
+ +extern int sk_stream_wait_memory(struct sock *sk, long *timeo_p);
+ +extern void sk_stream_wait_close(struct sock *sk, long timeo_p);
+ +extern int sk_stream_error(struct sock *sk, int flags, int err);
+ +extern void sk_stream_kill_queues(struct sock *sk);
+ +extern void sk_set_memalloc(struct sock *sk);
+ +extern void sk_clear_memalloc(struct sock *sk);
+ +
+++<<<<<<< HEAD
+ +extern int sk_wait_data(struct sock *sk, long *timeo);
+++=======
++ int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb);
+++>>>>>>> dfbafc995304 (tcp: fix recv with flags MSG_WAITALL | MSG_PEEK)
+  
+  struct request_sock_ops;
+  struct timewait_sock_ops;
+* Unmerged path include/net/sock.h
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 2705bfcdedd8..6993c8dcdae0 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1914,20 +1914,21 @@ static void __release_sock(struct sock *sk)
+  * sk_wait_data - wait for data to arrive at sk_receive_queue
+  * @sk:    sock to wait on
+  * @timeo: for how long
++ * @skb:   last skb seen on sk_receive_queue
+  *
+  * Now socket state including sk->sk_err is changed only under lock,
+  * hence we may omit checks after joining wait queue.
+  * We check receive queue before schedule() only as optimization;
+  * it is very likely that release_sock() added new data.
+  */
+-int sk_wait_data(struct sock *sk, long *timeo)
++int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb)
+ {
+ 	int rc;
+ 	DEFINE_WAIT(wait);
+ 
+ 	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+ 	set_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
+-	rc = sk_wait_event(sk, timeo, !skb_queue_empty(&sk->sk_receive_queue));
++	rc = sk_wait_event(sk, timeo, skb_peek_tail(&sk->sk_receive_queue) != skb);
+ 	clear_bit(SOCK_ASYNC_WAITDATA, &sk->sk_socket->flags);
+ 	finish_wait(sk_sleep(sk), &wait);
+ 	return rc;
+diff --git a/net/dccp/proto.c b/net/dccp/proto.c
+index e8407f2f600f..fcbd373705f4 100644
+--- a/net/dccp/proto.c
++++ b/net/dccp/proto.c
+@@ -888,7 +888,7 @@ verify_sock_status:
+ 			break;
+ 		}
+ 
+-		sk_wait_data(sk, &timeo);
++		sk_wait_data(sk, &timeo, NULL);
+ 		continue;
+ 	found_ok_skb:
+ 		if (len > skb->len)
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 3f9bf5a4d535..9e77869c71b2 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -762,7 +762,7 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
+ 				ret = -EAGAIN;
+ 				break;
+ 			}
+-			sk_wait_data(sk, &timeo);
++			sk_wait_data(sk, &timeo, NULL);
+ 			if (signal_pending(current)) {
+ 				ret = sock_intr_errno(timeo);
+ 				break;
+@@ -1577,7 +1577,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 	int target;		/* Read at least this many bytes */
+ 	long timeo;
+ 	struct task_struct *user_recv = NULL;
+-	struct sk_buff *skb;
++	struct sk_buff *skb, *last;
+ 	u32 urg_hole = 0;
+ 
+ 	if (sk_can_busy_loop(sk) && skb_queue_empty(&sk->sk_receive_queue) &&
+@@ -1634,7 +1634,9 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 
+ 		/* Next get a buffer. */
+ 
++		last = skb_peek_tail(&sk->sk_receive_queue);
+ 		skb_queue_walk(&sk->sk_receive_queue, skb) {
++			last = skb;
+ 			/* Now that we have two receive queues this
+ 			 * shouldn't happen.
+ 			 */
+@@ -1753,8 +1755,9 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 			/* Do not sleep, just process backlog. */
+ 			release_sock(sk);
+ 			lock_sock(sk);
+-		} else
+-			sk_wait_data(sk, &timeo);
++		} else {
++			sk_wait_data(sk, &timeo, last);
++		}
+ 
+ 		if (user_recv) {
+ 			int chunk;
+diff --git a/net/llc/af_llc.c b/net/llc/af_llc.c
+index 85d503cf947b..f883bc51dd62 100644
+--- a/net/llc/af_llc.c
++++ b/net/llc/af_llc.c
+@@ -613,7 +613,7 @@ static int llc_wait_data(struct sock *sk, long timeo)
+ 		if (signal_pending(current))
+ 			break;
+ 		rc = 0;
+-		if (sk_wait_data(sk, &timeo))
++		if (sk_wait_data(sk, &timeo, NULL))
+ 			break;
+ 	}
+ 	return rc;
+@@ -802,7 +802,7 @@ static int llc_ui_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 			release_sock(sk);
+ 			lock_sock(sk);
+ 		} else
+-			sk_wait_data(sk, &timeo);
++			sk_wait_data(sk, &timeo, NULL);
+ 
+ 		if ((flags & MSG_PEEK) && peek_seq != llc->copied_seq) {
+ 			net_dbg_ratelimited("LLC(%s:%d): Application bug, race in MSG_PEEK\n",
