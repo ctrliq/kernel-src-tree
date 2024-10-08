@@ -190,6 +190,7 @@ struct addr_location {
 	u8	      filtered;
 	u8	      cpumode;
 	s32	      cpu;
+	s32	      socket;
 };
 
 struct symsrc {
