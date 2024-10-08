@@ -1,0 +1,189 @@
+ipv6: router reachability probing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 7e9805696428113e34625a65a30dbc62cb78acc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/7e980569.failed
+
+RFC 4191 states in 3.5:
+
+   When a host avoids using any non-reachable router X and instead sends
+   a data packet to another router Y, and the host would have used
+   router X if router X were reachable, then the host SHOULD probe each
+   such router X's reachability by sending a single Neighbor
+   Solicitation to that router's address.  A host MUST NOT probe a
+   router's reachability in the absence of useful traffic that the host
+   would have sent to the router if it were reachable.  In any case,
+   these probes MUST be rate-limited to no more than one per minute per
+   router.
+
+Currently, when the neighbour corresponding to a router falls into
+NUD_FAILED, it's never considered again. Introduce a new rt6_nud_state
+value, RT6_NUD_FAIL_PROBE, which suggests the route should not be used but
+should be probed with a single NS. The probe is ratelimited by the existing
+code. To better distinguish meanings of the failure values, rename
+RT6_NUD_FAIL_SOFT to RT6_NUD_FAIL_DO_RR.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7e9805696428113e34625a65a30dbc62cb78acc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/route.c
+diff --cc net/ipv6/route.c
+index 27feaa9e6ca7,a1a57523b158..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -65,6 -65,13 +65,16 @@@
+  #include <linux/sysctl.h>
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ enum rt6_nud_state {
++ 	RT6_NUD_FAIL_HARD = -3,
++ 	RT6_NUD_FAIL_PROBE = -2,
++ 	RT6_NUD_FAIL_DO_RR = -1,
++ 	RT6_NUD_SUCCEED = 1
++ };
++ 
+++>>>>>>> 7e9805696428 (ipv6: router reachability probing)
+  static struct rt6_info *ip6_rt_copy(struct rt6_info *ort,
+  				    const struct in6_addr *dest);
+  static struct dst_entry	*ip6_dst_check(struct dst_entry *dst, u32 cookie);
+@@@ -490,17 -517,23 +500,26 @@@ static void rt6_probe(struct rt6_info *
+  
+  	if (!neigh ||
+  	    time_after(jiffies, neigh->updated + rt->rt6i_idev->cnf.rtr_probe_interval)) {
+ -		struct __rt6_probe_work *work;
+ +		struct in6_addr mcaddr;
+ +		struct in6_addr *target;
+  
+++<<<<<<< HEAD
+ +		if (neigh) {
+ +			neigh->updated = jiffies;
+++=======
++ 		work = kmalloc(sizeof(*work), GFP_ATOMIC);
++ 
++ 		if (neigh && work)
++ 			__neigh_set_probe_once(neigh);
++ 
++ 		if (neigh)
+++>>>>>>> 7e9805696428 (ipv6: router reachability probing)
+  			write_unlock(&neigh->lock);
+ -
+ -		if (work) {
+ -			INIT_WORK(&work->work, rt6_probe_deferred);
+ -			work->target = rt->rt6i_gateway;
+ -			dev_hold(rt->dst.dev);
+ -			work->dev = rt->dst.dev;
+ -			schedule_work(&work->work);
+  		}
+ +
+ +		target = (struct in6_addr *)&rt->rt6i_gateway;
+ +		addrconf_addr_solict_mult(target, &mcaddr);
+ +		ndisc_send_ns(rt->dst.dev, NULL, target, &mcaddr, NULL);
+  	} else {
+  out:
+  		write_unlock(&neigh->lock);
+@@@ -541,12 -574,17 +560,23 @@@ static inline bool rt6_check_neigh(stru
+  	if (neigh) {
+  		read_lock(&neigh->lock);
+  		if (neigh->nud_state & NUD_VALID)
+ -			ret = RT6_NUD_SUCCEED;
+ +			ret = true;
+  #ifdef CONFIG_IPV6_ROUTER_PREF
+  		else if (!(neigh->nud_state & NUD_FAILED))
+++<<<<<<< HEAD
+ +			ret = true;
+ +#endif
+ +		read_unlock(&neigh->lock);
+++=======
++ 			ret = RT6_NUD_SUCCEED;
++ 		else
++ 			ret = RT6_NUD_FAIL_PROBE;
++ #endif
++ 		read_unlock(&neigh->lock);
++ 	} else {
++ 		ret = IS_ENABLED(CONFIG_IPV6_ROUTER_PREF) ?
++ 		      RT6_NUD_SUCCEED : RT6_NUD_FAIL_DO_RR;
+++>>>>>>> 7e9805696428 (ipv6: router reachability probing)
+  	}
+  	rcu_read_unlock_bh();
+  
+@@@ -578,18 -621,22 +608,26 @@@ static struct rt6_info *find_match(stru
+  		goto out;
+  
+  	m = rt6_score_route(rt, oif, strict);
+++<<<<<<< HEAD
+ +	if (m < 0)
+++=======
++ 	if (m == RT6_NUD_FAIL_DO_RR) {
++ 		match_do_rr = true;
++ 		m = 0; /* lowest valid score */
++ 	} else if (m == RT6_NUD_FAIL_HARD) {
+++>>>>>>> 7e9805696428 (ipv6: router reachability probing)
+  		goto out;
+ -	}
+ -
+ -	if (strict & RT6_LOOKUP_F_REACHABLE)
+ -		rt6_probe(rt);
+  
++ 	/* note that m can be RT6_NUD_FAIL_PROBE at this point */
+  	if (m > *mpri) {
+ -		*do_rr = match_do_rr;
+ +		if (strict & RT6_LOOKUP_F_REACHABLE)
+ +			rt6_probe(match);
+  		*mpri = m;
+  		match = rt;
+ +	} else if (strict & RT6_LOOKUP_F_REACHABLE) {
+ +		rt6_probe(rt);
+  	}
+ +
+  out:
+  	return match;
+  }
+diff --git a/include/net/neighbour.h b/include/net/neighbour.h
+index 536501a3e58d..5c84ea66a7f8 100644
+--- a/include/net/neighbour.h
++++ b/include/net/neighbour.h
+@@ -212,6 +212,7 @@ static inline struct neighbour *neigh_create(struct neigh_table *tbl,
+ void neigh_destroy(struct neighbour *neigh);
+ int __neigh_event_send(struct neighbour *neigh, struct sk_buff *skb);
+ int neigh_update(struct neighbour *neigh, const u8 *lladdr, u8 new, u32 flags);
++void __neigh_set_probe_once(struct neighbour *neigh);
+ void neigh_changeaddr(struct neigh_table *tbl, struct net_device *dev);
+ int neigh_ifdown(struct neigh_table *tbl, struct net_device *dev);
+ int neigh_resolve_output(struct neighbour *neigh, struct sk_buff *skb);
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index 05242ae7bdcf..ca4932be9ea6 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -1228,6 +1228,21 @@ out:
+ }
+ EXPORT_SYMBOL(neigh_update);
+ 
++/* Update the neigh to listen temporarily for probe responses, even if it is
++ * in a NUD_FAILED state. The caller has to hold neigh->lock for writing.
++ */
++void __neigh_set_probe_once(struct neighbour *neigh)
++{
++	neigh->updated = jiffies;
++	if (!(neigh->nud_state & NUD_FAILED))
++		return;
++	neigh->nud_state = NUD_PROBE;
++	atomic_set(&neigh->probes, NEIGH_VAR(neigh->parms, UCAST_PROBES));
++	neigh_add_timer(neigh,
++			jiffies + NEIGH_VAR(neigh->parms, RETRANS_TIME));
++}
++EXPORT_SYMBOL(__neigh_set_probe_once);
++
+ struct neighbour *neigh_event_ns(struct neigh_table *tbl,
+ 				 u8 *lladdr, void *saddr,
+ 				 struct net_device *dev)
+* Unmerged path net/ipv6/route.c
