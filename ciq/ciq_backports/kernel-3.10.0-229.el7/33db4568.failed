@@ -1,0 +1,181 @@
+perf top: Add --percentage option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf/top: Add --percentage option (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 96.97%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 33db4568e1f41efe6d0e4695483f968fc1135bf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/33db4568.failed
+
+The --percentage option is for controlling overhead percentage
+displayed.  It can only receive either of "relative" or "absolute".
+Move the parser callback function into a common location since it's
+used by multiple commands now.
+
+For more information, please see previous commit same thing done to
+"perf report".
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1397145720-8063-4-git-send-email-namhyung@kernel.org
+	Signed-off-by: Jiri Olsa <jolsa@redhat.com>
+(cherry picked from commit 33db4568e1f41efe6d0e4695483f968fc1135bf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/hist.h
+diff --cc tools/perf/util/hist.h
+index a496262fcc29,a4ec336ae3fe..000000000000
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@@ -258,20 -253,10 +258,29 @@@ static inline int script_browse(const c
+  #define K_SWITCH_INPUT_DATA -3000
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef GTK2_SUPPORT
+ +int perf_evlist__gtk_browse_hists(struct perf_evlist *evlist, const char *help,
+ +				  struct hist_browser_timer *hbt __maybe_unused,
+ +				  float min_pcnt);
+ +#else
+ +static inline
+ +int perf_evlist__gtk_browse_hists(struct perf_evlist *evlist __maybe_unused,
+ +				  const char *help __maybe_unused,
+ +				  struct hist_browser_timer *hbt __maybe_unused,
+ +				  float min_pcnt __maybe_unused)
+ +{
+ +	return 0;
+ +}
+ +#endif
+ +
+ +unsigned int hists__sort_list_width(struct hists *self);
+++=======
++ unsigned int hists__sort_list_width(struct hists *hists);
++ 
++ struct option;
++ int parse_filter_percentage(const struct option *opt __maybe_unused,
++ 			    const char *arg, int unset __maybe_unused);
++ 
+++>>>>>>> 33db4568e1f4 (perf top: Add --percentage option)
+  #endif	/* __PERF_HIST_H */
+diff --git a/tools/perf/Documentation/perf-top.txt b/tools/perf/Documentation/perf-top.txt
+index 000acac2f248..b76c28755813 100644
+--- a/tools/perf/Documentation/perf-top.txt
++++ b/tools/perf/Documentation/perf-top.txt
+@@ -123,13 +123,16 @@ Default is to monitor all CPUS.
+ 	Show a column with the sum of periods.
+ 
+ --dsos::
+-	Only consider symbols in these dsos.
++	Only consider symbols in these dsos.  This option will affect the
++	percentage of the overhead column.  See --percentage for more info.
+ 
+ --comms::
+-	Only consider symbols in these comms.
++	Only consider symbols in these comms.  This option will affect the
++	percentage of the overhead column.  See --percentage for more info.
+ 
+ --symbols::
+-	Only consider these symbols.
++	Only consider these symbols.  This option will affect the
++	percentage of the overhead column.  See --percentage for more info.
+ 
+ -M::
+ --disassembler-style=:: Set disassembler style for objdump.
+@@ -157,6 +160,15 @@ Default is to monitor all CPUS.
+ 	Do not show entries which have an overhead under that percent.
+ 	(Default: 0).
+ 
++--percentage::
++	Determine how to display the overhead percentage of filtered entries.
++	Filters can be applied by --comms, --dsos and/or --symbols options and
++	Zoom operations on the TUI (thread, dso, etc).
++
++	"relative" means it's relative to filtered entries only so that the
++	sum of shown entries will be always 100%. "absolute" means it retains
++	the original value before and after the filter is applied.
++
+ INTERACTIVE PROMPTING KEYS
+ --------------------------
+ 
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 38f80cc0d981..ee9cf46f4996 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -685,20 +685,6 @@ parse_percent_limit(const struct option *opt, const char *str,
+ 	return 0;
+ }
+ 
+-static int
+-parse_percentage(const struct option *opt __maybe_unused, const char *str,
+-		 int unset __maybe_unused)
+-{
+-	if (!strcmp(str, "relative"))
+-		symbol_conf.filter_relative = true;
+-	else if (!strcmp(str, "absolute"))
+-		symbol_conf.filter_relative = false;
+-	else
+-		return -1;
+-
+-	return 0;
+-}
+-
+ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ {
+ 	struct perf_session *session;
+@@ -822,7 +808,7 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	OPT_CALLBACK(0, "percent-limit", &report, "percent",
+ 		     "Don't show entries under that percent", parse_percent_limit),
+ 	OPT_CALLBACK(0, "percentage", NULL, "relative|absolute",
+-		     "how to display percentage of filtered entries", parse_percentage),
++		     "how to display percentage of filtered entries", parse_filter_percentage),
+ 	OPT_END()
+ 	};
+ 	struct perf_data_file file = {
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index fff8203e4ef8..eba283950a88 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -695,8 +695,7 @@ static void perf_event__process_sample(struct perf_tool *tool,
+ 	if (event->header.misc & PERF_RECORD_MISC_EXACT_IP)
+ 		top->exact_samples++;
+ 
+-	if (perf_event__preprocess_sample(event, machine, &al, sample) < 0 ||
+-	    al.filtered)
++	if (perf_event__preprocess_sample(event, machine, &al, sample) < 0)
+ 		return;
+ 
+ 	if (!top->kptr_restrict_warned &&
+@@ -1121,6 +1120,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	OPT_STRING('u', "uid", &target->uid_str, "user", "user to profile"),
+ 	OPT_CALLBACK(0, "percent-limit", &top, "percent",
+ 		     "Don't show entries under that percent", parse_percent_limit),
++	OPT_CALLBACK(0, "percentage", NULL, "relative|absolute",
++		     "How to display percentage of filtered entries", parse_filter_percentage),
+ 	OPT_END()
+ 	};
+ 	const char * const top_usage[] = {
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index dac7beaabd9c..9bde7eec5a5e 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -951,3 +951,16 @@ u64 hists__total_period(struct hists *hists)
+ 	return symbol_conf.filter_relative ? hists->stats.total_non_filtered_period :
+ 		hists->stats.total_period;
+ }
++
++int parse_filter_percentage(const struct option *opt __maybe_unused,
++			    const char *arg, int unset __maybe_unused)
++{
++	if (!strcmp(arg, "relative"))
++		symbol_conf.filter_relative = true;
++	else if (!strcmp(arg, "absolute"))
++		symbol_conf.filter_relative = false;
++	else
++		return -1;
++
++	return 0;
++}
+* Unmerged path tools/perf/util/hist.h
