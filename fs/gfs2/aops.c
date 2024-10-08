@@ -141,32 +141,6 @@ static int gfs2_writeback_writepage(struct page *page,
 	return nobh_writepage(page, gfs2_get_block_noalloc, wbc);
 }
 
-/* This is the same as calling block_write_full_page, but it also
- * writes pages outside of i_size
- */
-int gfs2_write_full_page(struct page *page, get_block_t *get_block,
-			 struct writeback_control *wbc)
-{
-	struct inode * const inode = page->mapping->host;
-	loff_t i_size = i_size_read(inode);
-	const pgoff_t end_index = i_size >> PAGE_SHIFT;
-	unsigned offset;
-
-	/*
-	 * The page straddles i_size.  It must be zeroed out on each and every
-	 * writepage invocation because it may be mmapped.  "A file is mapped
-	 * in multiples of the page size.  For a file that is not a multiple of
-	 * the  page size, the remaining memory is zeroed when mapped, and
-	 * writes to that region are not written out to the file."
-	 */
-	offset = i_size & (PAGE_SIZE-1);
-	if (page->index == end_index && offset)
-		zero_user_segment(page, offset, PAGE_SIZE);
-
-	return __block_write_full_page(inode, page, get_block, wbc,
-				       end_buffer_async_write);
-}
-
 /**
  * gfs2_ordered_writepage - Write page for ordered data files
  * @page: The page to write
@@ -191,6 +165,32 @@ static int gfs2_ordered_writepage(struct page *page,
 	}
 	gfs2_page_add_databufs(ip, page, 0, inode->i_sb->s_blocksize-1);
 	return block_write_full_page(page, gfs2_get_block_noalloc, wbc);
+}
+
+/* This is the same as calling block_write_full_page, but it also
+ * writes pages outside of i_size
+ */
+int gfs2_write_full_page(struct page *page, get_block_t *get_block,
+			 struct writeback_control *wbc)
+{
+	struct inode * const inode = page->mapping->host;
+	loff_t i_size = i_size_read(inode);
+	const pgoff_t end_index = i_size >> PAGE_SHIFT;
+	unsigned offset;
+
+	/*
+	 * The page straddles i_size.  It must be zeroed out on each and every
+	 * writepage invocation because it may be mmapped.  "A file is mapped
+	 * in multiples of the page size.  For a file that is not a multiple of
+	 * the  page size, the remaining memory is zeroed when mapped, and
+	 * writes to that region are not written out to the file."
+	 */
+	offset = i_size & (PAGE_SIZE-1);
+	if (page->index == end_index && offset)
+		zero_user_segment(page, offset, PAGE_SIZE);
+
+	return __block_write_full_page(inode, page, get_block, wbc,
+				       end_buffer_async_write);
 }
 
 /**
@@ -957,7 +957,7 @@ static int gfs2_write_end(struct file *file, struct address_space *mapping,
 failed:
 	gfs2_trans_end(sdp);
 	gfs2_inplace_release(ip);
-	if (ip->i_res->rs_qa_qd_num)
+	if (ip->i_qadata && ip->i_qadata->qa_qd_num)
 		gfs2_quota_unlock(ip);
 	if (inode == sdp->sd_rindex) {
 		gfs2_glock_dq(&m_ip->i_gh);
@@ -1121,7 +1121,7 @@ static ssize_t gfs2_direct_IO(int rw, struct kiocb *iocb,
 	 * the first place, mapping->nr_pages will always be zero.
 	 */
 	if (mapping->nrpages) {
-		loff_t lstart = offset & (PAGE_CACHE_SIZE - 1);
+		loff_t lstart = offset & ~(PAGE_CACHE_SIZE - 1);
 		loff_t len = iov_length(iov, nr_segs);
 		loff_t end = PAGE_ALIGN(offset + len) - 1;
 

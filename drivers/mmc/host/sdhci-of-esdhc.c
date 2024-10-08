@@ -262,7 +262,7 @@ static const struct sdhci_pltfm_data sdhci_esdhc_pdata = {
 
 static int sdhci_esdhc_probe(struct platform_device *pdev)
 {
-	return sdhci_pltfm_register(pdev, &sdhci_esdhc_pdata, 0);
+	return sdhci_pltfm_register(pdev, &sdhci_esdhc_pdata);
 }
 
 static int sdhci_esdhc_remove(struct platform_device *pdev)

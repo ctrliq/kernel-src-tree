@@ -239,7 +239,7 @@ static void tdi_reset (struct ehci_hcd *ehci)
  * Reset a non-running (STS_HALT == 1) controller.
  * Must be called with interrupts enabled and the lock not held.
  */
-static int ehci_reset (struct ehci_hcd *ehci)
+int ehci_reset(struct ehci_hcd *ehci)
 {
 	int	retval;
 	u32	command = ehci_readl(ehci, &ehci->regs->command);
@@ -275,6 +275,7 @@ static int ehci_reset (struct ehci_hcd *ehci)
 			ehci->resuming_ports = 0;
 	return retval;
 }
+EXPORT_SYMBOL_GPL(ehci_reset);
 
 /*
  * Idle the controller (turn off the schedules).
@@ -308,7 +309,6 @@ static void ehci_quiesce (struct ehci_hcd *ehci)
 static void end_iaa_cycle(struct ehci_hcd *ehci);
 static void end_unlink_async(struct ehci_hcd *ehci);
 static void unlink_empty_async(struct ehci_hcd *ehci);
-static void unlink_empty_async_suspended(struct ehci_hcd *ehci);
 static void ehci_work(struct ehci_hcd *ehci);
 static void start_unlink_intr(struct ehci_hcd *ehci, struct ehci_qh *qh);
 static void end_unlink_intr(struct ehci_hcd *ehci, struct ehci_qh *qh);
@@ -1119,7 +1119,7 @@ int ehci_suspend(struct usb_hcd *hcd, bool do_wakeup)
 EXPORT_SYMBOL_GPL(ehci_suspend);
 
 /* Returns 0 if power was preserved, 1 if power was lost */
-int ehci_resume(struct usb_hcd *hcd, bool hibernated)
+int ehci_resume(struct usb_hcd *hcd, bool force_reset)
 {
 	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
 
@@ -1133,12 +1133,12 @@ int ehci_resume(struct usb_hcd *hcd, bool hibernated)
 		return 0;		/* Controller is dead */
 
 	/*
-	 * If CF is still set and we aren't resuming from hibernation
+	 * If CF is still set and reset isn't forced
 	 * then we maintained suspend power.
 	 * Just undo the effect of ehci_suspend().
 	 */
 	if (ehci_readl(ehci, &ehci->regs->configured_flag) == FLAG_CF &&
-			!hibernated) {
+			!force_reset) {
 		int	mask = INTR_MASK;
 
 		ehci_prepare_ports_for_controller_resume(ehci);
@@ -1259,11 +1259,6 @@ MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_AUTHOR (DRIVER_AUTHOR);
 MODULE_LICENSE ("GPL");
 
-#ifdef CONFIG_USB_EHCI_FSL
-#include "ehci-fsl.c"
-#define	PLATFORM_DRIVER		ehci_fsl_driver
-#endif
-
 #ifdef CONFIG_USB_EHCI_SH
 #include "ehci-sh.c"
 #define PLATFORM_DRIVER		ehci_hcd_sh_driver
@@ -1284,16 +1279,6 @@ MODULE_LICENSE ("GPL");
 #define XILINX_OF_PLATFORM_DRIVER	ehci_hcd_xilinx_of_driver
 #endif
 
-#ifdef CONFIG_USB_W90X900_EHCI
-#include "ehci-w90x900.c"
-#define	PLATFORM_DRIVER		ehci_hcd_w90x900_driver
-#endif
-
-#ifdef CONFIG_USB_OCTEON_EHCI
-#include "ehci-octeon.c"
-#define PLATFORM_DRIVER		ehci_octeon_driver
-#endif
-
 #ifdef CONFIG_TILE_USB
 #include "ehci-tilegx.c"
 #define	PLATFORM_DRIVER		ehci_hcd_tilegx_driver
@@ -1302,11 +1287,6 @@ MODULE_LICENSE ("GPL");
 #ifdef CONFIG_USB_EHCI_HCD_PMC_MSP
 #include "ehci-pmcmsp.c"
 #define	PLATFORM_DRIVER		ehci_hcd_msp_driver
-#endif
-
-#ifdef CONFIG_USB_EHCI_TEGRA
-#include "ehci-tegra.c"
-#define PLATFORM_DRIVER		tegra_ehci_driver
 #endif
 
 #ifdef CONFIG_SPARC_LEON

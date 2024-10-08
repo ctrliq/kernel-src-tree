@@ -273,6 +273,8 @@ static int rx8581_probe(struct i2c_client *client,
 
 	dev_dbg(&client->dev, "%s\n", __func__);
 
+	mark_tech_preview(rx8581_driver.driver.name, THIS_MODULE);
+
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA)
 		&& !i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_I2C_BLOCK))
 		return -EIO;
@@ -306,11 +308,6 @@ static int rx8581_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int rx8581_remove(struct i2c_client *client)
-{
-	return 0;
-}
-
 static const struct i2c_device_id rx8581_id[] = {
 	{ "rx8581", 0 },
 	{ }
@@ -323,7 +320,6 @@ static struct i2c_driver rx8581_driver = {
 		.owner	= THIS_MODULE,
 	},
 	.probe		= rx8581_probe,
-	.remove		= rx8581_remove,
 	.id_table	= rx8581_id,
 };
 

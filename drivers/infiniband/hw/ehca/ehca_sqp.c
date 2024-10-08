@@ -173,7 +173,7 @@ static int ehca_process_perf(struct ib_device *ibdev, u8 port_num,
 		memset(poi, 0, sizeof(*poi));
 		poi->base_version = 1;
 		poi->class_version = 1;
-		poi->resp_time_value = 18;
+		ib_set_cpi_resp_time(poi, 18);
 
 		/* copy local routing information from WC where applicable */
 		tcslfl->sl         = in_wc->sl;

@@ -37,7 +37,6 @@ static inline void svcpu_put(struct kvmppc_book3s_shadow_vcpu *svcpu)
 
 #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
 #define KVM_DEFAULT_HPT_ORDER	24	/* 16MB HPT by default */
-extern unsigned long kvm_rma_pages;
 #endif
 
 #define VRMA_VSID	0x1ffffffUL	/* 1TB VSID reserved for VRMA */
@@ -84,6 +83,20 @@ static inline long try_lock_hpte(__be64 *hpte, unsigned long bits)
 		     : "r" (hpte), "r" (be_bits), "r" (be_lockbit)
 		     : "cc", "memory");
 	return old == 0;
+}
+
+static inline void unlock_hpte(__be64 *hpte, unsigned long hpte_v)
+{
+	hpte_v &= ~HPTE_V_HVLOCK;
+	asm volatile(PPC_RELEASE_BARRIER "" : : : "memory");
+	hpte[0] = cpu_to_be64(hpte_v);
+}
+
+/* Without barrier */
+static inline void __unlock_hpte(__be64 *hpte, unsigned long hpte_v)
+{
+	hpte_v &= ~HPTE_V_HVLOCK;
+	hpte[0] = cpu_to_be64(hpte_v);
 }
 
 static inline int __hpte_actual_psize(unsigned int lp, int psize)
@@ -289,7 +302,10 @@ static inline pte_t kvmppc_read_update_linux_pte(pte_t *ptep, int writing)
 	pte_t old_pte, new_pte = __pte(0);
 
 	while (1) {
-		old_pte = *ptep;
+		/*
+		 * Make sure we don't reload from ptep
+		 */
+		old_pte = READ_ONCE(*ptep);
 		/*
 		 * wait until _PAGE_BUSY is clear then set it atomically
 		 */
@@ -418,6 +434,7 @@ static inline struct kvm_memslots *kvm_memslots_raw(struct kvm *kvm)
 }
 
 extern void kvmhv_rm_send_ipi(int cpu);
+extern void kvmppc_mmu_debugfs_init(struct kvm *kvm);
 
 #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
 

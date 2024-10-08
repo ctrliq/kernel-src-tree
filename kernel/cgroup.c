@@ -107,9 +107,11 @@ static struct workqueue_struct *cgroup_destroy_wq;
  */
 #define SUBSYS(_x) [_x ## _subsys_id] = &_x ## _subsys,
 #define IS_SUBSYS_ENABLED(option) IS_BUILTIN(option)
+#define ENABLE_NETPRIO_NOW
 static struct cgroup_subsys *subsys[CGROUP_SUBSYS_COUNT] = {
 #include <linux/cgroup_subsys.h>
 };
+#undef ENABLE_NETPRIO_NOW
 
 /*
  * The "rootnode" hierarchy is the "dummy hierarchy", reserved for the
@@ -1099,11 +1101,12 @@ static int cgroup_show_options(struct seq_file *seq, struct dentry *dentry)
 	if (root->flags & CGRP_ROOT_XATTR)
 		seq_puts(seq, ",xattr");
 	if (strlen(root->release_agent_path))
-		seq_printf(seq, ",release_agent=%s", root->release_agent_path);
+		seq_show_option(seq, "release_agent",
+				root->release_agent_path);
 	if (test_bit(CGRP_CPUSET_CLONE_CHILDREN, &root->top_cgroup.flags))
 		seq_puts(seq, ",clone_children");
 	if (strlen(root->name))
-		seq_printf(seq, ",name=%s", root->name);
+		seq_show_option(seq, "name", root->name);
 	mutex_unlock(&cgroup_root_mutex);
 	return 0;
 }
@@ -4816,6 +4819,20 @@ static const struct file_operations proc_cgroupstats_operations = {
 	.release = single_release,
 };
 
+static void **subsys_canfork_priv_p(void *ss_priv[CGROUP_CANFORK_COUNT], int i)
+{
+	if (CGROUP_CANFORK_START <= i && i < CGROUP_CANFORK_END)
+		return &ss_priv[i - CGROUP_CANFORK_START];
+	return NULL;
+}
+
+static void *subsys_canfork_priv(void *ss_priv[CGROUP_CANFORK_COUNT], int i)
+{
+	void **private = subsys_canfork_priv_p(ss_priv, i);
+	return private ? *private : NULL;
+}
+
+
 /**
  * cgroup_fork - attach newly forked task to its parents cgroup.
  * @child: pointer to task_struct of forking parent process.
@@ -4842,6 +4859,64 @@ void cgroup_fork(struct task_struct *child)
 }
 
 /**
+ * cgroup_can_fork - called on a new task before the process is exposed
+ * @child: the task in question.
+ *
+ * This calls the subsystem can_fork() callbacks. If the can_fork() callback
+ * returns an error, the fork aborts with that error code. This allows for
+ * a cgroup subsystem to conditionally allow or deny new forks.
+ */
+int cgroup_can_fork(struct task_struct *child,
+		    void *ss_priv[CGROUP_CANFORK_COUNT])
+{
+	struct cgroup_subsys *ss;
+	int i, j, ret;
+
+	for (i = 0; i < CGROUP_BUILTIN_SUBSYS_COUNT; i++) {
+		ss = subsys[i];
+		if (!ss->can_fork)
+			continue;
+		ret = ss->can_fork(child, subsys_canfork_priv_p(ss_priv, i));
+		if (ret)
+			goto out_revert;
+	}
+
+	return 0;
+
+out_revert:
+	for (j = 0; j < CGROUP_BUILTIN_SUBSYS_COUNT; j++) {
+		ss = subsys[j];
+		if (j >= i)
+			break;
+		if (ss->cancel_fork)
+			ss->cancel_fork(child, subsys_canfork_priv(ss_priv, j));
+	}
+
+	return ret;
+}
+
+/**
+ * cgroup_cancel_fork - called if a fork failed after cgroup_can_fork()
+ * @child: the task in question
+ *
+ * This calls the cancel_fork() callbacks if a fork failed *after*
+ * cgroup_can_fork() succeded.
+ */
+void cgroup_cancel_fork(struct task_struct *child,
+			void *ss_priv[CGROUP_CANFORK_COUNT])
+{
+	struct cgroup_subsys *ss;
+	int i;
+
+	for (i = 0; i < CGROUP_BUILTIN_SUBSYS_COUNT; i++) {
+		ss = subsys[i];
+		if (ss->cancel_fork)
+			ss->cancel_fork(child, subsys_canfork_priv(ss_priv, i));
+	}
+}
+
+
+/**
  * cgroup_post_fork - called on a new task after adding it to the task list
  * @child: the task in question
  *
@@ -4851,7 +4926,8 @@ void cgroup_fork(struct task_struct *child)
  * cgroup_iter_start() - to guarantee that the new task ends up on its
  * list.
  */
-void cgroup_post_fork(struct task_struct *child)
+void cgroup_post_fork(struct task_struct *child,
+		      void *old_ss_priv[CGROUP_CANFORK_COUNT])
 {
 	int i;
 
@@ -4893,7 +4969,7 @@ void cgroup_post_fork(struct task_struct *child)
 			struct cgroup_subsys *ss = subsys[i];
 
 			if (ss->fork)
-				ss->fork(child);
+				ss->fork(child, subsys_canfork_priv(old_ss_priv, i));
 		}
 	}
 }

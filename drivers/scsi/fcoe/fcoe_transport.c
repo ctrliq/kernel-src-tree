@@ -614,7 +614,7 @@ static int fcoe_transport_show(char *buffer, const struct kernel_param *kp)
 
 static int __init fcoe_transport_init(void)
 {
-	register_netdevice_notifier(&libfcoe_notifier);
+	register_netdevice_notifier_rh(&libfcoe_notifier);
 	return 0;
 }
 
@@ -622,7 +622,7 @@ static int fcoe_transport_exit(void)
 {
 	struct fcoe_transport *ft;
 
-	unregister_netdevice_notifier(&libfcoe_notifier);
+	unregister_netdevice_notifier_rh(&libfcoe_notifier);
 	mutex_lock(&ft_mutex);
 	list_for_each_entry(ft, &fcoe_transports, list)
 		printk(KERN_ERR "FCoE transport %s is still attached!\n",
@@ -731,7 +731,7 @@ static struct net_device *fcoe_if_to_netdev(const char *buffer)
 static int libfcoe_device_notification(struct notifier_block *notifier,
 				    ulong event, void *ptr)
 {
-	struct net_device *netdev = ptr;
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
 
 	switch (event) {
 	case NETDEV_UNREGISTER:

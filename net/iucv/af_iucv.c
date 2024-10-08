@@ -2303,7 +2303,7 @@ out_unlock:
 static int afiucv_netdev_event(struct notifier_block *this,
 			       unsigned long event, void *ptr)
 {
-	struct net_device *event_dev = (struct net_device *)ptr;
+	struct net_device *event_dev = netdev_notifier_info_to_dev(ptr);
 	struct sock *sk;
 	struct iucv_sock *iucv;
 
@@ -2433,7 +2433,7 @@ static int __init afiucv_init(void)
 		if (err)
 			goto out_sock;
 	} else
-		register_netdevice_notifier(&afiucv_netdev_notifier);
+		register_netdevice_notifier_rh(&afiucv_netdev_notifier);
 	dev_add_pack(&iucv_packet_type);
 	return 0;
 
@@ -2455,7 +2455,7 @@ static void __exit afiucv_exit(void)
 		pr_iucv->iucv_unregister(&af_iucv_handler, 0);
 		symbol_put(iucv_if);
 	} else
-		unregister_netdevice_notifier(&afiucv_netdev_notifier);
+		unregister_netdevice_notifier_rh(&afiucv_netdev_notifier);
 	dev_remove_pack(&iucv_packet_type);
 	sock_unregister(PF_IUCV);
 	proto_unregister(&iucv_proto);

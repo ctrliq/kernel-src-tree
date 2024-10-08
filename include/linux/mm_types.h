@@ -24,6 +24,7 @@
 #define AT_VECTOR_SIZE (2*(AT_VECTOR_SIZE_ARCH + AT_VECTOR_SIZE_BASE + 1))
 
 struct address_space;
+struct hmm;
 
 #define USE_SPLIT_PTE_PTLOCKS	(NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS)
 #define USE_SPLIT_PMD_PTLOCKS	(USE_SPLIT_PTE_PTLOCKS && \
@@ -58,7 +59,8 @@ struct page {
 		union {
 			pgoff_t index;		/* Our offset within mapping. */
 			void *freelist;		/* slub/slob first free object */
-			bool pfmemalloc;	/* If set by the page allocator,
+			RH_KABI_DEPRECATE(bool, pfmemalloc)
+						/* If set by the page allocator,
 						 * ALLOC_NO_WATERMARKS was set
 						 * and the low watermark was not
 						 * met implying that the system
@@ -67,6 +69,9 @@ struct page {
 						 * this page is only used to
 						 * free other pages.
 						 */
+#ifndef __GENKSYMS__ /* kABI bypass, the size of the union didn't change */
+			atomic_t thp_mmu_gather; /* in first tailpage of THP */
+#endif
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && USE_SPLIT_PMD_PTLOCKS
 		pgtable_t pmd_huge_pte; /* protected by page->ptl */
 #endif
@@ -124,6 +129,13 @@ struct page {
 		struct list_head lru;	/* Pageout list, eg. active_list
 					 * protected by zone->lru_lock !
 					 */
+#ifndef __GENKSYMS__
+		struct dev_pagemap *pgmap; /* ZONE_DEVICE pages are never on an
+					    * lru or handled by a slab
+					    * allocator, this points to the
+					    * hosting device page map.
+					    */
+#endif
 		struct {		/* slub per cpu partial pages */
 			struct page *next;	/* Next partial slab */
 #ifdef CONFIG_64BIT
@@ -207,6 +219,24 @@ struct page_frag {
 	__u16 offset;
 	__u16 size;
 #endif
+};
+
+#define PAGE_FRAG_CACHE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)
+#define PAGE_FRAG_CACHE_MAX_ORDER	get_order(PAGE_FRAG_CACHE_MAX_SIZE)
+
+struct page_frag_cache {
+	void * va;
+#if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+	__u16 offset;
+	__u16 size;
+#else
+	__u32 offset;
+#endif
+	/* we maintain a pagecount bias, so that we dont dirty cache line
+	 * containing page->_count every time we allocate a fragment.
+	 */
+	unsigned int		pagecnt_bias;
+	bool pfmemalloc;
 };
 
 typedef unsigned long __nocast vm_flags_t;
@@ -315,7 +345,7 @@ struct vm_area_struct {
 
 	/* reserved for Red Hat */
 	RH_KABI_USE(1, struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(2, unsigned long vm_flags2) /* Flags, see mm.h. */
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
@@ -332,11 +362,25 @@ struct core_state {
 };
 
 enum {
-	MM_FILEPAGES,
-	MM_ANONPAGES,
-	MM_SWAPENTS,
-	NR_MM_COUNTERS
+	MM_FILEPAGES,	/* Resident file mapping pages */
+	MM_ANONPAGES,	/* Resident anonymous pages */
+	MM_SWAPENTS,	/* Anonymous swap entries */
+	NR_MM_COUNTERS,
+	/*
+	 * Resident shared memory pages
+	 *
+	 * We can't expand *_rss_stat without breaking kABI
+	 * MM_SHMEMPAGES need to be set apart
+	 */
+	MM_SHMEMPAGES = NR_MM_COUNTERS
 };
+
+/*
+ * While *_rss_stat does not contain MM_SHMEMPAGES, we still do some
+ * operations on all counters. We use the NR_MM_COUNTERS_EXTENDED
+ * constant for that.
+ */
+#define NR_MM_COUNTERS_EXTENDED (NR_MM_COUNTERS + 1)
 
 #if USE_SPLIT_PTE_PTLOCKS && defined(CONFIG_MMU)
 #define SPLIT_RSS_COUNTING
@@ -433,7 +477,7 @@ struct mm_struct {
 #endif
 
 	/* store ref to file /proc/<pid>/exe symlink points to */
-	struct file *exe_file;
+	struct file __rcu *exe_file;
 #ifdef CONFIG_MMU_NOTIFIER
 	struct mmu_notifier_mm *mmu_notifier_mm;
 #endif
@@ -477,9 +521,23 @@ struct mm_struct {
 #else
 	struct list_head iommu_group_mem_list;
 #endif
+
+#ifdef CONFIG_X86_INTEL_MPX
+	RH_KABI_USE(3, void __user *bd_addr)
+#else
+	/* RHEL7: consumed by x86, avoid re-use by other arches */
 	RH_KABI_RESERVE(3)
-	RH_KABI_RESERVE(4)
+#endif
+	/* This would be in rss_stat[MM_SHMEMPAGES] if not for kABI */
+	RH_KABI_USE(4, atomic_long_t mm_shmempages)
+
+#if IS_ENABLED(CONFIG_HMM)
+	/* HMM need to track few things per mm */
+	RH_KABI_USE(5, struct hmm *hmm)
+#else
 	RH_KABI_RESERVE(5)
+#endif
+
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)

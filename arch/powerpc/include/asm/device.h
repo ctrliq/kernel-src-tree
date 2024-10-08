@@ -46,7 +46,7 @@ struct dev_archdata {
 	int fail_iommu;
 #endif
 #ifdef CONFIG_CXL_BASE
-	struct cxl_context	*cxl_ctx;
+	RH_KABI_EXTEND(struct cxl_context       *cxl_ctx)
 #endif
 };
 

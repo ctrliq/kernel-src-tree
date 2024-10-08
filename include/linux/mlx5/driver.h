@@ -41,9 +41,14 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/radix-tree.h>
+#include <linux/interrupt.h>
 
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/doorbell.h>
+
+enum {
+	MLX5_RQ_BITMASK_VSD = 1 << 1,
+};
 
 enum {
 	MLX5_BOARD_ID_LEN = 64,
@@ -99,6 +104,8 @@ enum {
 };
 
 enum {
+	MLX5_REG_QETCR		 = 0x4005,
+	MLX5_REG_QTCT		 = 0x400a,
 	MLX5_REG_PCAP		 = 0x5001,
 	MLX5_REG_PMTU		 = 0x5003,
 	MLX5_REG_PTYS		 = 0x5004,
@@ -110,9 +117,12 @@ enum {
 	MLX5_REG_PMPE		 = 0x5010,
 	MLX5_REG_PELC		 = 0x500e,
 	MLX5_REG_PVLC		 = 0x500f,
-	MLX5_REG_PMLP		 = 0, /* TBD */
+	MLX5_REG_PCMR		 = 0x5041,
+	MLX5_REG_PMLP		 = 0x5002,
 	MLX5_REG_NODE_DESC	 = 0x6001,
 	MLX5_REG_HOST_ENDIANNESS = 0x7004,
+	MLX5_REG_MCIA		 = 0x9014,
+	MLX5_REG_MLCR		 = 0x902b,
 };
 
 enum {
@@ -302,6 +312,14 @@ struct mlx5_buf {
 	u8			page_shift;
 };
 
+struct mlx5_eq_tasklet {
+	struct list_head list;
+	struct list_head process_list;
+	struct tasklet_struct task;
+	/* lock on completion tasklet list */
+	spinlock_t lock;
+};
+
 struct mlx5_eq {
 	struct mlx5_core_dev   *dev;
 	__be32 __iomem	       *doorbell;
@@ -315,6 +333,7 @@ struct mlx5_eq {
 	struct list_head	list;
 	int			index;
 	struct mlx5_rsc_debug	*dbg;
+	struct mlx5_eq_tasklet	tasklet_ctx;
 };
 
 struct mlx5_core_psv {
@@ -338,7 +357,7 @@ struct mlx5_core_sig_ctx {
 	u32			sigerr_count;
 };
 
-struct mlx5_core_mr {
+struct mlx5_core_mkey {
 	u64			iova;
 	u64			size;
 	u32			key;
@@ -426,7 +445,7 @@ struct mlx5_srq_table {
 	struct radix_tree_root	tree;
 };
 
-struct mlx5_mr_table {
+struct mlx5_mkey_table {
 	/* protect radix tree
 	 */
 	rwlock_t		lock;
@@ -458,8 +477,6 @@ struct mlx5_priv {
 	struct mlx5_uuar_info	uuari;
 	MLX5_DECLARE_DOORBELL_LOCK(cq_uar_lock);
 
-	struct io_mapping	*bf_mapping;
-
 	/* pages stuff */
 	struct workqueue_struct *pg_wq;
 	struct rb_root		page_root;
@@ -484,9 +501,9 @@ struct mlx5_priv {
 	struct mlx5_cq_table	cq_table;
 	/* end: cq staff */
 
-	/* start: mr staff */
-	struct mlx5_mr_table	mr_table;
-	/* end: mr staff */
+	/* start: mkey staff */
+	struct mlx5_mkey_table	mkey_table;
+	/* end: mkey staff */
 
 	/* start: alloc staff */
 	/* protect buffer alocation according to numa node */
@@ -519,8 +536,9 @@ enum mlx5_device_state {
 };
 
 enum mlx5_interface_state {
-	MLX5_INTERFACE_STATE_DOWN,
-	MLX5_INTERFACE_STATE_UP,
+	MLX5_INTERFACE_STATE_DOWN = BIT(0),
+	MLX5_INTERFACE_STATE_UP = BIT(1),
+	MLX5_INTERFACE_STATE_SHUTDOWN = BIT(2),
 };
 
 enum mlx5_pci_status {
@@ -544,7 +562,7 @@ struct mlx5_core_dev {
 	enum mlx5_device_state	state;
 	/* sync interface state */
 	struct mutex		intf_state_mutex;
-	enum mlx5_interface_state interface_state;
+	unsigned long		intf_state;
 	void			(*event) (struct mlx5_core_dev *dev,
 					  enum mlx5_dev_event event,
 					  unsigned long param);
@@ -613,7 +631,10 @@ struct mlx5_pas {
 };
 
 enum port_state_policy {
-	MLX5_AAA_000
+	MLX5_POLICY_DOWN	= 0,
+	MLX5_POLICY_UP		= 1,
+	MLX5_POLICY_FOLLOW	= 2,
+	MLX5_POLICY_INVALID	= 0xffffffff
 };
 
 enum phy_port_state {
@@ -716,7 +737,8 @@ int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn);
 int mlx5_cmd_free_uar(struct mlx5_core_dev *dev, u32 uarn);
 int mlx5_alloc_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari);
 int mlx5_free_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari);
-int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar);
+int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar,
+		       bool map_wc);
 void mlx5_unmap_free_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar);
 void mlx5_health_cleanup(struct mlx5_core_dev *dev);
 int mlx5_health_init(struct mlx5_core_dev *dev);
@@ -738,16 +760,18 @@ int mlx5_core_query_srq(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
 			struct mlx5_query_srq_mbox_out *out);
 int mlx5_core_arm_srq(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
 		      u16 lwm, int is_srq);
-void mlx5_init_mr_table(struct mlx5_core_dev *dev);
-void mlx5_cleanup_mr_table(struct mlx5_core_dev *dev);
-int mlx5_core_create_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+void mlx5_init_mkey_table(struct mlx5_core_dev *dev);
+void mlx5_cleanup_mkey_table(struct mlx5_core_dev *dev);
+int mlx5_core_create_mkey(struct mlx5_core_dev *dev,
+			  struct mlx5_core_mkey *mkey,
 			  struct mlx5_create_mkey_mbox_in *in, int inlen,
 			  mlx5_cmd_cbk_t callback, void *context,
 			  struct mlx5_create_mkey_mbox_out *out);
-int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr);
-int mlx5_core_query_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev,
+			   struct mlx5_core_mkey *mkey);
+int mlx5_core_query_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mkey *mkey,
 			 struct mlx5_query_mkey_mbox_out *out, int outlen);
-int mlx5_core_dump_fill_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+int mlx5_core_dump_fill_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mkey *_mkey,
 			     u32 *mkey);
 int mlx5_core_alloc_pd(struct mlx5_core_dev *dev, u32 *pdn);
 int mlx5_core_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn);

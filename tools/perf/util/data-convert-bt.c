@@ -632,7 +632,7 @@ static bool is_flush_needed(struct ctf_stream *cs)
 }
 
 static int process_sample_event(struct perf_tool *tool,
-				union perf_event *_event __maybe_unused,
+				union perf_event *_event,
 				struct perf_sample *sample,
 				struct perf_evsel *evsel,
 				struct machine *machine __maybe_unused)
@@ -1233,7 +1233,7 @@ static int convert__config(const char *var, const char *value, void *cb)
 		return 0;
 	}
 
-	return perf_default_config(var, value, cb);
+	return 0;
 }
 
 int bt_convert__perf2ctf(const char *input, const char *path, bool force)

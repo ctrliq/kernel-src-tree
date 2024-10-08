@@ -7,8 +7,7 @@
 #include <linux/pr.h>
 
 #include <linux/nfsd/debug.h>
-#include <scsi/scsi_proto.h>
-#include <scsi/scsi_common.h>
+#include <scsi/scsi.h>
 
 #include "blocklayoutxdr.h"
 #include "pnfs.h"

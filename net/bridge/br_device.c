@@ -25,6 +25,9 @@
 #define COMMON_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HIGHDMA | \
 			 NETIF_F_GSO_MASK | NETIF_F_HW_CSUM)
 
+const struct nf_br_ops __rcu *nf_br_ops __read_mostly;
+EXPORT_SYMBOL_GPL(nf_br_ops);
+
 /* net device transmit always called with BH disabled */
 netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -33,16 +36,15 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct net_bridge_fdb_entry *dst;
 	struct net_bridge_mdb_entry *mdst;
 	struct pcpu_sw_netstats *brstats = this_cpu_ptr(br->stats);
+	const struct nf_br_ops *nf_ops;
 	u16 vid = 0;
 
 	rcu_read_lock();
-#ifdef CONFIG_BRIDGE_NETFILTER
-	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
-		br_nf_pre_routing_finish_bridge_slow(skb);
+	nf_ops = rcu_dereference(nf_br_ops);
+	if (nf_ops && nf_ops->br_dev_xmit_hook(skb)) {
 		rcu_read_unlock();
 		return NETDEV_TX_OK;
 	}
-#endif
 
 	u64_stats_update_begin(&brstats->syncp);
 	brstats->tx_packets++;
@@ -172,7 +174,7 @@ static int br_change_mtu(struct net_device *dev, int new_mtu)
 
 	dev->mtu = new_mtu;
 
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	/* remember the MTU in the rtable for PMTU */
 	dst_metric_set(&br->fake_rtable.dst, RTAX_MTU, new_mtu);
 #endif
@@ -191,7 +193,6 @@ static int br_set_mac_address(struct net_device *dev, void *p)
 
 	spin_lock_bh(&br->lock);
 	if (!ether_addr_equal(dev->dev_addr, addr->sa_data)) {
-		br_fdb_change_mac_address(br, addr->sa_data);
 		/* Mac address will be changed in br_stp_change_bridge_id(). */
 		br_stp_change_bridge_id(br, addr->sa_data);
 	}
@@ -310,6 +311,7 @@ static const struct ethtool_ops br_ethtool_ops = {
 };
 
 static const struct net_device_ops br_netdev_ops = {
+	.ndo_size		 = sizeof(struct net_device_ops),
 	.ndo_open		 = br_dev_open,
 	.ndo_stop		 = br_dev_stop,
 	.ndo_init		 = br_dev_init,
@@ -330,7 +332,7 @@ static const struct net_device_ops br_netdev_ops = {
 	.ndo_fix_features        = br_fix_features,
 	.ndo_fdb_add		 = br_fdb_add,
 	.ndo_fdb_del		 = br_fdb_delete,
-	.ndo_fdb_dump		 = br_fdb_dump,
+	.extended.ndo_fdb_dump	 = br_fdb_dump,
 	.ndo_bridge_getlink	 = br_getlink,
 	.ndo_bridge_setlink	 = br_setlink,
 	.ndo_bridge_dellink	 = br_dellink,

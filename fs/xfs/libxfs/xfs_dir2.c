@@ -271,7 +271,7 @@ xfs_dir_createname(
 		rval = xfs_dir_ino_validate(tp->t_mountp, inum);
 		if (rval)
 			return rval;
-		XFS_STATS_INC(xs_dir_create);
+		XFS_STATS_INC(dp->i_mount, xs_dir_create);
 	}
 
 	args = kmem_zalloc(sizeof(*args), KM_SLEEP | KM_NOFS);
@@ -362,9 +362,10 @@ xfs_dir_lookup(
 	struct xfs_da_args *args;
 	int		rval;
 	int		v;		/* type-checking value */
+	int		lock_mode;
 
 	ASSERT(S_ISDIR(dp->i_d.di_mode));
-	XFS_STATS_INC(xs_dir_lookup);
+	XFS_STATS_INC(dp->i_mount, xs_dir_lookup);
 
 	/*
 	 * We need to use KM_NOFS here so that lockdep will not throw false
@@ -387,6 +388,7 @@ xfs_dir_lookup(
 	if (ci_name)
 		args->op_flags |= XFS_DA_OP_CILOOKUP;
 
+	lock_mode = xfs_ilock_data_map_shared(dp);
 	if (dp->i_d.di_format == XFS_DINODE_FMT_LOCAL) {
 		rval = xfs_dir2_sf_lookup(args);
 		goto out_check_rval;
@@ -419,6 +421,7 @@ out_check_rval:
 		}
 	}
 out_free:
+	xfs_iunlock(dp, lock_mode);
 	kmem_free(args);
 	return rval;
 }
@@ -441,7 +444,7 @@ xfs_dir_removename(
 	int		v;		/* type-checking value */
 
 	ASSERT(S_ISDIR(dp->i_d.di_mode));
-	XFS_STATS_INC(xs_dir_remove);
+	XFS_STATS_INC(dp->i_mount, xs_dir_remove);
 
 	args = kmem_zalloc(sizeof(*args), KM_SLEEP | KM_NOFS);
 	if (!args)

@@ -29,6 +29,7 @@
 #include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/resource_ext.h>
 #include <uapi/linux/pci.h>
 
 #include <linux/pci_ids.h>
@@ -173,8 +174,6 @@ enum pci_dev_flags {
 	PCI_DEV_FLAGS_ASSIGNED = (__force pci_dev_flags_t) (1 << 2),
 	/* Flag for quirk use to store if quirk-specific ACS is enabled */
 	PCI_DEV_FLAGS_ACS_ENABLED_QUIRK = (__force pci_dev_flags_t) (1 << 3),
-	/* Flag to indicate the device uses dma_alias_devfn */
-	PCI_DEV_FLAGS_DMA_ALIAS_DEVFN = (__force pci_dev_flags_t) (1 << 4),
 	/* Use a PCIe-to-PCI bridge alias even if !pci_is_pcie */
 	PCI_DEV_FLAG_PCIE_BRIDGE_ALIAS = (__force pci_dev_flags_t) (1 << 5),
 	/* Do not use bus resets for device */
@@ -347,7 +346,6 @@ struct pci_dev {
 	unsigned int	msi_enabled:1;
 	unsigned int	msix_enabled:1;
 	unsigned int	ari_enabled:1;	/* ARI forwarding */
-	unsigned int	ats_enabled:1;	/* Address Translation Service */
 	unsigned int	is_managed:1;
 	unsigned int    needs_freset:1; /* Dev requires fundamental reset */
 	unsigned int	state_saved:1;
@@ -361,6 +359,8 @@ struct pci_dev {
 	unsigned int	io_window_1k:1;	/* Intel P2P bridge 1K I/O windows */
 	RH_KABI_FILL_HOLE(unsigned int no_64bit_msi:1) /* device may only use 32-bit MSIs */
 	RH_KABI_FILL_HOLE(unsigned int irq_managed:1)
+	RH_KABI_FILL_HOLE(unsigned int has_secondary_link:1)
+	RH_KABI_FILL_HOLE(unsigned int non_compliant_bars:1) /* broken BARs; ignore them */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -381,9 +381,7 @@ struct pci_dev {
 		struct pci_sriov *sriov;	/* SR-IOV capability related */
 		struct pci_dev *physfn;	/* the PF this VF is associated with */
 	};
-	u16		ats_cap;	/* ATS Capability offset */
-	u8		ats_stu;	/* ATS Smallest Translation Unit */
-	atomic_t	ats_ref_cnt;	/* number of VFs with ATS enabled */
+	struct pci_ats	*ats;		/* Depricated - DO NOT USE */
 #endif
 	phys_addr_t rom; /* Physical address of ROM if it's not from the BAR */
 	size_t romlen; /* Length of ROM if it's not from the BAR */
@@ -399,10 +397,16 @@ struct pci_dev {
  * going forward.  This structure will never be under KABI restrictions.
  */
 struct pci_dev_rh {
-	RH_KABI_EXTEND(u8   dma_alias_devfn) /* devfn of DMA alias, if any */
+	RH_KABI_EXTEND(unsigned long *dma_alias_mask) /* mask of enabled devfn aliases */
 	RH_KABI_EXTEND(char *driver_override) /* Driver name to force a match */
 #ifdef CONFIG_PPC64
 	RH_KABI_EXTEND(struct pci_dn *pci_data) /* PCI device node*/
+#endif
+	RH_KABI_EXTEND(unsigned int ats_enabled:1) /* Address Translation Svc */
+#ifdef CONFIG_PCI_ATS
+	RH_KABI_EXTEND(u16 ats_cap)	/* ATS Capability offset */
+	RH_KABI_EXTEND(u8 ats_stu)	/* ATS Smallest Translation Unit */
+	RH_KABI_EXTEND(atomic_t ats_ref_cnt)  /* num of VFs with ATS enabled */
 #endif
 };
 
@@ -425,18 +429,13 @@ static inline int pci_channel_offline(struct pci_dev *pdev)
 	return (pdev->error_state != pci_channel_io_normal);
 }
 
-struct pci_host_bridge_window {
-	struct list_head list;
-	struct resource *res;		/* host bridge aperture (CPU address) */
-	resource_size_t offset;		/* bus address + offset = CPU address */
-};
-
 struct pci_host_bridge {
 	struct device dev;
 	struct pci_bus *bus;		/* root bus */
-	struct list_head windows;	/* pci_host_bridge_windows */
+	struct list_head windows;	/* resource_entry */
 	void (*release_fn)(struct pci_host_bridge *);
 	void *release_data;
+	unsigned int ignore_reset_delay:1;	/* for entire hierarchy */
 };
 
 #define	to_pci_host_bridge(n) container_of(n, struct pci_host_bridge, dev)
@@ -1032,6 +1031,7 @@ int __must_check pci_assign_resource(struct pci_dev *dev, int i);
 int __must_check pci_reassign_resource(struct pci_dev *dev, int i, resource_size_t add_size, resource_size_t align);
 int pci_select_bars(struct pci_dev *dev, unsigned long flags);
 bool pci_device_is_present(struct pci_dev *pdev);
+void pci_ignore_hotplug(struct pci_dev *dev);
 
 /* ROM control related routines */
 int pci_enable_rom(struct pci_dev *pdev);
@@ -1068,11 +1068,6 @@ int pci_back_from_sleep(struct pci_dev *dev);
 bool pci_dev_run_wake(struct pci_dev *dev);
 bool pci_check_pme_status(struct pci_dev *dev);
 void pci_pme_wakeup_bus(struct pci_bus *bus);
-
-static inline void pci_ignore_hotplug(struct pci_dev *dev)
-{
-	dev->ignore_hotplug = 1;
-}
 
 int pci_enable_wake(struct pci_dev *dev, pci_power_t state, bool enable);
 
@@ -1223,15 +1218,6 @@ int pci_set_vga_state(struct pci_dev *pdev, bool decode,
 #define	pci_pool_destroy(pool) dma_pool_destroy(pool)
 #define	pci_pool_alloc(pool, flags, handle) dma_pool_alloc(pool, flags, handle)
 #define	pci_pool_free(pool, vaddr, addr) dma_pool_free(pool, vaddr, addr)
-
-enum pci_dma_burst_strategy {
-	PCI_DMA_BURST_INFINITY,	/* make bursts as large as possible,
-				   strategy_parameter is N/A */
-	PCI_DMA_BURST_BOUNDARY, /* disconnect at every strategy_parameter
-				   byte boundaries */
-	PCI_DMA_BURST_MULTIPLE, /* disconnect at some multiple of
-				   strategy_parameter byte boundaries */
-};
 
 struct msix_entry {
 	u32	vector;	/* kernel uses to write allocated vector */
@@ -1469,8 +1455,6 @@ static inline int pci_enable_wake(struct pci_dev *dev, pci_power_t state,
 static inline int pci_request_regions(struct pci_dev *dev, const char *res_name)
 { return -EIO; }
 static inline void pci_release_regions(struct pci_dev *dev) { }
-
-#define pci_dma_burst_advice(pdev, strat, strategy_parameter) do { } while (0)
 
 static inline void pci_block_cfg_access(struct pci_dev *dev) { }
 static inline int pci_block_cfg_access_in_atomic(struct pci_dev *dev)
@@ -1911,20 +1895,25 @@ static inline struct eeh_dev *pci_dev_to_eeh_dev(struct pci_dev *pdev)
 }
 #endif
 
+void pci_add_dma_alias(struct pci_dev *dev, u8 devfn);
+bool pci_devs_are_dma_aliases(struct pci_dev *dev1, struct pci_dev *dev2);
 int pci_for_each_dma_alias(struct pci_dev *pdev,
 			   int (*fn)(struct pci_dev *pdev,
 				     u16 alias, void *data), void *data);
 
-/**
- * pci_find_upstream_pcie_bridge - find upstream PCIe-to-PCI bridge of a device
- * @pdev: the PCI device
- *
- * if the device is PCIE, return NULL
- * if the device isn't connected to a PCIe bridge (that is its parent is a
- * legacy PCI bridge and the bridge is directly connected to bus 0), return its
- * parent
- */
-struct pci_dev *pci_find_upstream_pcie_bridge(struct pci_dev *pdev);
+/* helper functions for operation of device flag */
+static inline void pci_set_dev_assigned(struct pci_dev *pdev)
+{
+	pdev->dev_flags |= PCI_DEV_FLAGS_ASSIGNED;
+}
+static inline void pci_clear_dev_assigned(struct pci_dev *pdev)
+{
+	pdev->dev_flags &= ~PCI_DEV_FLAGS_ASSIGNED;
+}
+static inline bool pci_is_dev_assigned(struct pci_dev *pdev)
+{
+	return (pdev->dev_flags & PCI_DEV_FLAGS_ASSIGNED) == PCI_DEV_FLAGS_ASSIGNED;
+}
 
 /**
  * pci_ari_enabled - query ARI forwarding status

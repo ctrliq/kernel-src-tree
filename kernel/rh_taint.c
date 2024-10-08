@@ -12,6 +12,12 @@ void mark_hardware_unsupported(const char *msg)
 }
 EXPORT_SYMBOL(mark_hardware_unsupported);
 
+void mark_hardware_deprecated(const char *msg)
+{
+	pr_crit("Warning: %s - this hardware is not recommended for new deployments. It continues to be supported in this RHEL release, but it is likely to be removed in the next major release. Driver updates and fixes for this device will be limited to critical issues. Please contact Red Hat Support or your device's hardware vendor for additional information.\n", msg);
+}
+EXPORT_SYMBOL(mark_hardware_deprecated);
+
 /* Mark parts of the kernel as 'Tech Preview', to make it clear to our
  * support organization and customers what we do not fully support yet.
  * NOTE: this will TAINT the kernel to signify the machine is running

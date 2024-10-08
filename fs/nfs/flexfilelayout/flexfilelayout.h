@@ -68,16 +68,16 @@ struct nfs4_ff_layoutstat {
 };
 
 struct nfs4_ff_layout_mirror {
-	struct pnfs_layout_segment	*lseg; /* back pointer */
+	struct pnfs_layout_hdr		*layout;
+	struct list_head		mirrors;
 	u32				ds_count;
 	u32				efficiency;
 	struct nfs4_ff_layout_ds	*mirror_ds;
 	u32				fh_versions_cnt;
 	struct nfs_fh			*fh_versions;
 	nfs4_stateid			stateid;
-	u32				uid;
-	u32				gid;
-	struct rpc_cred			*cred;
+	struct rpc_cred	__rcu		*ro_cred;
+	struct rpc_cred	__rcu		*rw_cred;
 	atomic_t			ref;
 	spinlock_t			lock;
 	struct nfs4_ff_layoutstat	read_stat;
@@ -97,6 +97,7 @@ struct nfs4_ff_layout_segment {
 struct nfs4_flexfile_layout {
 	struct pnfs_layout_hdr generic_hdr;
 	struct pnfs_ds_commit_info commit_info;
+	struct list_head	mirrors;
 	struct list_head	error_list; /* nfs4_ff_layout_ds_err */
 };
 

@@ -60,6 +60,8 @@
 #define TA_CACHE_CORE_NPS		0
 /* T10 protection information disabled by default */
 #define TA_DEFAULT_T10_PI		0
+/* TPG status needs to be enabled to return sendtargets discovery endpoint info */
+#define TA_DEFAULT_TPG_ENABLED_SENDTARGETS 1
 
 #define ISCSI_IOV_DATA_BUFFER		5
 
@@ -70,6 +72,7 @@ enum iscsit_transport_type {
 	ISCSI_IWARP_TCP				= 3,
 	ISCSI_IWARP_SCTP			= 4,
 	ISCSI_INFINIBAND			= 5,
+	ISCSI_CXGBIT			= 6,
 };
 
 /* RFC-3720 7.1.4  Standard Connection State Diagram for a Target */
@@ -534,9 +537,8 @@ struct iscsi_conn {
 	u32			of_marker;
 	/* Used for calculating OFMarker offset to next PDU */
 	u32			of_marker_offset;
-#define IPV6_ADDRESS_SPACE				48
-	unsigned char		login_ip[IPV6_ADDRESS_SPACE];
-	struct __kernel_sockaddr_storage local_sockaddr;
+	struct sockaddr_storage login_sockaddr;
+	struct sockaddr_storage local_sockaddr;
 	int			conn_usage_count;
 	int			conn_waiting_on_uc;
 	atomic_t		check_immediate_queue;
@@ -577,8 +579,8 @@ struct iscsi_conn {
 	spinlock_t		response_queue_lock;
 	spinlock_t		state_lock;
 	/* libcrypto RX and TX contexts for crc32c */
-	struct hash_desc	conn_rx_hash;
-	struct hash_desc	conn_tx_hash;
+	struct ahash_request	*conn_rx_hash;
+	struct ahash_request	*conn_tx_hash;
 	/* Used for scheduling TX and RX connection kthreads */
 	cpumask_var_t		conn_cpumask;
 	unsigned int		conn_rx_reset_cpumask:1;
@@ -604,6 +606,7 @@ struct iscsi_conn {
 	int			bitmap_id;
 	int			rx_thread_active;
 	struct task_struct	*rx_thread;
+	struct completion	rx_login_comp;
 	int			tx_thread_active;
 	struct task_struct	*tx_thread;
 	/* list_head for session connection list */
@@ -771,6 +774,7 @@ struct iscsi_tpg_attrib {
 	u32			demo_mode_discovery;
 	u32			default_erl;
 	u8			t10_pi;
+	u32			tpg_enabled_sendtargets;
 	struct iscsi_portal_group *tpg;
 };
 
@@ -786,7 +790,7 @@ struct iscsi_np {
 	spinlock_t		np_thread_lock;
 	struct completion	np_restart_comp;
 	struct socket		*np_socket;
-	struct __kernel_sockaddr_storage np_sockaddr;
+	struct sockaddr_storage np_sockaddr;
 	struct task_struct	*np_thread;
 	struct timer_list	np_login_timer;
 	void			*np_context;

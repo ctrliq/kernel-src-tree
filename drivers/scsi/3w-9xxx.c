@@ -103,7 +103,7 @@
 #include "3w-9xxx.h"
 
 /* Globals */
-#define TW_DRIVER_VERSION "2.26.02.014"
+#define TW_DRIVER_VERSION "2.26.02.014.rh1"
 static DEFINE_MUTEX(twa_chrdev_mutex);
 static TW_Device_Extension *twa_device_extension_list[TW_MAX_SLOT];
 static unsigned int twa_device_extension_count;

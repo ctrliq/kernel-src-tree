@@ -41,7 +41,7 @@
 #include <net/tcp.h>
 #include <crypto/hash.h>
 /* get readq/writeq support for 32 bit kernels, use the low-first version */
-#include <linux/io-64-nonatomic-lo-hi.h>
+#include <asm-generic/io-64-nonatomic-lo-hi.h>
 
 #define STATS_TIMER_DELAY 1000
 

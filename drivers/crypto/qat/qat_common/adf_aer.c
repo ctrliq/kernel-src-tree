@@ -82,7 +82,7 @@ struct adf_reset_dev_data {
 	struct work_struct reset_work;
 };
 
-static void adf_dev_restore(struct adf_accel_dev *accel_dev)
+void adf_dev_restore(struct adf_accel_dev *accel_dev)
 {
 	struct pci_dev *pdev = accel_to_pci_dev(accel_dev);
 	struct pci_dev *parent = pdev->bus->self;
@@ -93,6 +93,9 @@ static void adf_dev_restore(struct adf_accel_dev *accel_dev)
 
 	dev_info(&GET_DEV(accel_dev), "Resetting device qat_dev%d\n",
 		 accel_dev->accel_id);
+
+	if (!parent)
+		parent = pdev;
 
 	if (!pci_wait_for_pending_transaction(pdev))
 		dev_info(&GET_DEV(accel_dev),

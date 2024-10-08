@@ -141,6 +141,7 @@ drop:
 	kfree_skb(skb);
 	goto out;
 }
+EXPORT_SYMBOL_GPL(br_handle_frame_finish);
 
 /* note: already called with rcu_read_lock */
 static int br_handle_local_finish(struct sock *sk, struct sk_buff *skb)

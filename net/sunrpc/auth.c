@@ -80,6 +80,10 @@ static struct kernel_param_ops param_ops_hashtbl_sz = {
 module_param_named(auth_hashtable_size, auth_hashbits, hashtbl_sz, 0644);
 MODULE_PARM_DESC(auth_hashtable_size, "RPC credential cache hashtable size");
 
+static unsigned long auth_max_cred_cachesize = ULONG_MAX;
+module_param(auth_max_cred_cachesize, ulong, 0644);
+MODULE_PARM_DESC(auth_max_cred_cachesize, "RPC credential maximum total cache size");
+
 static u32
 pseudoflavor_to_flavor(u32 flavor) {
 	if (flavor > RPC_AUTH_MAXFLAVOR)
@@ -479,14 +483,25 @@ rpcauth_prune_expired(struct list_head *free, int nr_to_scan)
 	return (number_cred_unused / 100) * sysctl_vfs_cache_pressure;
 }
 
+int rpcauth_cache_do_shrinker(int nr_to_scan)
+{
+	LIST_HEAD(free);
+	int freed;
+
+	spin_lock(&rpc_credcache_lock);
+	freed = rpcauth_prune_expired(&free, nr_to_scan);
+	spin_unlock(&rpc_credcache_lock);
+	rpcauth_destroy_credlist(&free);
+
+	return freed;
+}
+
 /*
  * Run memory cache shrinker.
  */
 static int
 rpcauth_cache_shrinker(struct shrinker *shrink, struct shrink_control *sc)
 {
-	LIST_HEAD(free);
-	int res;
 	int nr_to_scan = sc->nr_to_scan;
 	gfp_t gfp_mask = sc->gfp_mask;
 
@@ -494,11 +509,23 @@ rpcauth_cache_shrinker(struct shrinker *shrink, struct shrink_control *sc)
 		return (nr_to_scan == 0) ? 0 : -1;
 	if (list_empty(&cred_unused))
 		return 0;
-	spin_lock(&rpc_credcache_lock);
-	res = rpcauth_prune_expired(&free, nr_to_scan);
-	spin_unlock(&rpc_credcache_lock);
-	rpcauth_destroy_credlist(&free);
-	return res;
+
+	return rpcauth_cache_do_shrinker(nr_to_scan);
+}
+
+static void
+rpcauth_cache_enforce_limit(void)
+{
+	unsigned long diff;
+	unsigned int nr_to_scan;
+
+	if (number_cred_unused <= auth_max_cred_cachesize)
+		return;
+	diff = number_cred_unused - auth_max_cred_cachesize;
+	nr_to_scan = 100;
+	if (diff < nr_to_scan)
+		nr_to_scan = diff;
+	rpcauth_cache_do_shrinker(nr_to_scan);
 }
 
 /*
@@ -563,6 +590,7 @@ rpcauth_lookup_credcache(struct rpc_auth *auth, struct auth_cred * acred,
 	} else
 		list_add_tail(&new->cr_lru, &free);
 	spin_unlock(&cache->lock);
+	rpcauth_cache_enforce_limit();
 found:
 	if (test_bit(RPCAUTH_CRED_NEW, &cred->cr_flags) &&
 	    cred->cr_ops->cr_init != NULL &&

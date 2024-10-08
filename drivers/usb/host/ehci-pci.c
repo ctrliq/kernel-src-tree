@@ -323,7 +323,7 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 		}
 	}
 
-#ifdef	CONFIG_PM_RUNTIME
+#ifdef	CONFIG_PM
 	if (ehci->no_selective_suspend && device_can_wakeup(&pdev->dev))
 		ehci_warn(ehci, "selective suspend/wakeup unavailable\n");
 #endif
@@ -380,7 +380,7 @@ static int ehci_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 static void ehci_pci_remove(struct pci_dev *pdev)
 {
 	pci_clear_mwi(pdev);
-	usb_hcd_pci_remove(pdev);	
+	usb_hcd_pci_remove(pdev);
 }
 
 /* PCI driver selection metadata; PCI hotplugging uses this */

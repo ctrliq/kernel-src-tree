@@ -50,9 +50,6 @@ struct dcbnl_rtnl_ops {
 	int (*ieee_setets) (struct net_device *, struct ieee_ets *);
 	int (*ieee_getmaxrate) (struct net_device *, struct ieee_maxrate *);
 	int (*ieee_setmaxrate) (struct net_device *, struct ieee_maxrate *);
-	int (*ieee_getqcn) (struct net_device *, struct ieee_qcn *);
-	int (*ieee_setqcn) (struct net_device *, struct ieee_qcn *);
-	int (*ieee_getqcnstats) (struct net_device *, struct ieee_qcn_stats *);
 	int (*ieee_getpfc) (struct net_device *, struct ieee_pfc *);
 	int (*ieee_setpfc) (struct net_device *, struct ieee_pfc *);
 	int (*ieee_getapp) (struct net_device *, struct dcb_app *);
@@ -102,6 +99,17 @@ struct dcbnl_rtnl_ops {
 	/* CEE peer */
 	int (*cee_peer_getpg) (struct net_device *, struct cee_pg *);
 	int (*cee_peer_getpfc) (struct net_device *, struct cee_pfc *);
+};
+
+struct dcbnl_rtnl_ops_ext {
+	int (*ieee_getqcn) (struct net_device *, struct ieee_qcn *);
+	int (*ieee_setqcn) (struct net_device *, struct ieee_qcn *);
+	int (*ieee_getqcnstats) (struct net_device *, struct ieee_qcn_stats *);
+	RH_KABI_RESERVE_P(1)
+	RH_KABI_RESERVE_P(2)
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
+	RH_KABI_RESERVE_P(5)
 };
 
 #endif /* __NET_DCBNL_H__ */

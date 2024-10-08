@@ -78,6 +78,7 @@ struct inet_request_sock {
 #define ir_v6_rmt_addr		req.__req_common.skc_v6_daddr
 #define ir_v6_loc_addr		req.__req_common.skc_v6_rcv_saddr
 #define ir_iif			req.__req_common.skc_bound_dev_if
+#define ireq_family		req.__req_common.skc_family
 
 	kmemcheck_bitfield_begin(flags);
 	u16			snd_wscale : 4,

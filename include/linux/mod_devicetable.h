@@ -217,6 +217,14 @@ struct serio_device_id {
 	__u8 proto;
 };
 
+struct hda_device_id {
+	__u32 vendor_id;
+	__u32 rev_id;
+	__u8 api_version;
+	const char *name;
+	unsigned long driver_data;
+};
+
 /*
  * Struct used for matching a device
  */
@@ -398,7 +406,7 @@ struct virtio_device_id {
  * For Hyper-V devices we use the device guid as the id.
  */
 struct hv_vmbus_device_id {
-	__u8 guid[16];
+	uuid_le guid;
 	kernel_ulong_t driver_data;	/* Data private to the driver */
 };
 
@@ -573,10 +581,28 @@ struct ipack_device_id {
 
 #define MEI_CL_MODULE_PREFIX "mei:"
 #define MEI_CL_NAME_SIZE 32
+#define MEI_CL_VERSION_ANY 0xff
 
+/**
+ * struct mei_cl_device_id - MEI client device identifier
+ * @name: helper name
+ * @uuid: client uuid
+ * @version: client protocol version
+ * @driver_info: information used by the driver.
+ *
+ * identifies mei client device by uuid and name
+ */
 struct mei_cl_device_id {
 	char name[MEI_CL_NAME_SIZE];
+	uuid_le uuid;
+	__u8    version;
 	kernel_ulong_t driver_info;
+};
+
+struct ulpi_device_id {
+	__u16 vendor;
+	__u16 product;
+	kernel_ulong_t driver_data;
 };
 
 #endif /* LINUX_MOD_DEVICETABLE_H */

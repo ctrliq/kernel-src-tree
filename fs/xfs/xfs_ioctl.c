@@ -40,6 +40,7 @@
 #include "xfs_symlink.h"
 #include "xfs_trans.h"
 #include "xfs_pnfs.h"
+#include "xfs_acl.h"
 
 #include <linux/capability.h>
 #include <linux/dcache.h>
@@ -362,7 +363,7 @@ xfs_set_dmattrs(
 	tp = xfs_trans_alloc(mp, XFS_TRANS_SET_DMATTRS);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		return error;
 	}
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
@@ -372,7 +373,7 @@ xfs_set_dmattrs(
 	ip->i_d.di_dmstate  = state;
 
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	error = xfs_trans_commit(tp, 0);
+	error = xfs_trans_commit(tp);
 
 	return error;
 }
@@ -520,6 +521,8 @@ xfs_attrmulti_attr_set(
 		return PTR_ERR(kbuf);
 
 	error = xfs_attr_set(XFS_I(inode), name, kbuf, len, flags);
+	if (!error)
+		xfs_forget_acl(inode, name, flags);
 	kfree(kbuf);
 	return error;
 }
@@ -530,9 +533,14 @@ xfs_attrmulti_attr_remove(
 	unsigned char		*name,
 	__uint32_t		flags)
 {
+	int			error;
+
 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
 		return -EPERM;
-	return xfs_attr_remove(XFS_I(inode), name, flags);
+	error = xfs_attr_remove(XFS_I(inode), name, flags);
+	if (!error)
+		xfs_forget_acl(inode, name, flags);
+	return error;
 }
 
 STATIC int
@@ -963,6 +971,7 @@ xfs_set_diflags(
 	unsigned int		xflags)
 {
 	unsigned int		di_flags;
+	uint64_t		di_flags2;
 
 	/* can't set PREALLOC this way, just preserve it */
 	di_flags = (ip->i_d.di_flags & XFS_DIFLAG_PREALLOC);
@@ -995,8 +1004,18 @@ xfs_set_diflags(
 		if (xflags & XFS_XFLAG_EXTSIZE)
 			di_flags |= XFS_DIFLAG_EXTSIZE;
 	}
-
 	ip->i_d.di_flags = di_flags;
+
+	/* diflags2 only valid for v3 inodes. */
+	if (ip->i_d.di_version < 3)
+		return;
+
+	di_flags2 = 0;
+	if (xflags & XFS_XFLAG_DAX)
+		di_flags2 |= XFS_DIFLAG2_DAX;
+
+	ip->i_d.di_flags2 = di_flags2;
+
 }
 
 STATIC void
@@ -1022,6 +1041,11 @@ xfs_diflags_to_linux(
 		inode->i_flags |= S_NOATIME;
 	else
 		inode->i_flags &= ~S_NOATIME;
+	if (xflags & XFS_XFLAG_DAX)
+		inode->i_flags |= S_DAX;
+	else
+		inode->i_flags &= ~S_DAX;
+
 }
 
 static int
@@ -1057,7 +1081,7 @@ xfs_ioctl_setattr_xflags(
 	xfs_diflags_to_linux(ip);
 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	XFS_STATS_INC(xs_ig_attrchg);
+	XFS_STATS_INC(mp, xs_ig_attrchg);
 	return 0;
 }
 
@@ -1105,7 +1129,7 @@ xfs_ioctl_setattr_get_trans(
 	return tp;
 
 out_cancel:
-	xfs_trans_cancel(tp, 0);
+	xfs_trans_cancel(tp);
 	return ERR_PTR(error);
 }
 
@@ -1282,7 +1306,7 @@ xfs_ioctl_setattr(
 	else
 		ip->i_d.di_extsize = 0;
 
-	code = xfs_trans_commit(tp, 0);
+	code = xfs_trans_commit(tp);
 
 	/*
 	 * Release any dquot(s) the inode had kept before chown.
@@ -1294,7 +1318,7 @@ xfs_ioctl_setattr(
 	return code;
 
 error_trans_cancel:
-	xfs_trans_cancel(tp, 0);
+	xfs_trans_cancel(tp);
 error_free_dquots:
 	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(pdqp);
@@ -1367,11 +1391,11 @@ xfs_ioc_setxflags(
 
 	error = xfs_ioctl_setattr_xflags(tp, ip, &fa);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		goto out_drop_write;
 	}
 
-	error = xfs_trans_commit(tp, 0);
+	error = xfs_trans_commit(tp);
 out_drop_write:
 	mnt_drop_write_file(filp);
 	return error;

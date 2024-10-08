@@ -5659,6 +5659,7 @@ void ata_link_init(struct ata_port *ap, struct ata_link *link, int pmp)
 #ifdef CONFIG_ATA_ACPI
 		dev->gtf_filter = ata_acpi_gtf_filter;
 #endif
+		device_rh_alloc(&dev->tdev);
 		ata_dev_init(dev);
 	}
 }
@@ -5717,6 +5718,10 @@ struct ata_port *ata_port_alloc(struct ata_host *host)
 	ap = kzalloc(sizeof(*ap), GFP_KERNEL);
 	if (!ap)
 		return NULL;
+
+	/* allocate device_rh structs for embedded elements of ata_port */
+	device_rh_alloc(&ap->tdev);
+	device_rh_alloc(&ap->link.tdev);
 
 	ap->pflags |= ATA_PFLAG_INITIALIZING | ATA_PFLAG_FROZEN;
 	ap->lock = &host->lock;

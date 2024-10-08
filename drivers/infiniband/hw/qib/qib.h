@@ -230,9 +230,6 @@ struct qib_ctxtdata {
 	u8 redirect_seq_cnt;
 	/* ctxt rcvhdrq head offset */
 	u32 head;
-	/* lookaside fields */
-	struct qib_qp *lookaside_qp;
-	u32 lookaside_qpn;
 	/* QPs waiting for context processing */
 	struct list_head qp_wait_list;
 #ifdef CONFIG_DEBUG_FS
@@ -241,7 +238,7 @@ struct qib_ctxtdata {
 #endif
 };
 
-struct qib_sge_state;
+struct rvt_sge_state;
 
 struct qib_sdma_txreq {
 	int                 flags;
@@ -259,14 +256,14 @@ struct qib_sdma_desc {
 
 struct qib_verbs_txreq {
 	struct qib_sdma_txreq   txreq;
-	struct qib_qp           *qp;
-	struct qib_swqe         *wqe;
+	struct rvt_qp           *qp;
+	struct rvt_swqe         *wqe;
 	u32                     dwords;
 	u16                     hdr_dwords;
 	u16                     hdr_inx;
 	struct qib_pio_header	*align_buf;
-	struct qib_mregion	*mr;
-	struct qib_sge_state    *ss;
+	struct rvt_mregion	*mr;
+	struct rvt_sge_state    *ss;
 };
 
 #define QIB_SDMA_TXREQ_F_USELARGEBUF  0x1
@@ -1097,8 +1094,6 @@ struct qib_devdata {
 	u16 psxmitwait_check_rate;
 	/* high volume overflow errors defered to tasklet */
 	struct tasklet_struct error_tasklet;
-	/* per device cq worker */
-	struct kthread_worker *worker;
 
 	int assigned_node_id; /* NUMA node closest to HCA */
 };
@@ -1138,7 +1133,9 @@ extern u32 qib_cpulist_count;
 extern unsigned long *qib_cpulist;
 
 extern unsigned qib_wc_pat;
+extern u16 qpt_mask;
 extern unsigned qib_cc_table_size;
+
 int qib_init(struct qib_devdata *, int);
 int init_chip_wc_pat(struct qib_devdata *dd, u32);
 int qib_enable_wc(struct qib_devdata *dd);
@@ -1325,7 +1322,7 @@ void __qib_sdma_intr(struct qib_pportdata *);
 void qib_sdma_intr(struct qib_pportdata *);
 void qib_user_sdma_send_desc(struct qib_pportdata *dd,
 			struct list_head *pktlist);
-int qib_sdma_verbs_send(struct qib_pportdata *, struct qib_sge_state *,
+int qib_sdma_verbs_send(struct qib_pportdata *, struct rvt_sge_state *,
 			u32, struct qib_verbs_txreq *);
 /* ppd->sdma_lock should be locked before calling this. */
 int qib_sdma_make_progress(struct qib_pportdata *dd);
@@ -1544,4 +1541,14 @@ struct qib_hwerror_msgs {
 void qib_format_hwerrors(u64 hwerrs,
 			 const struct qib_hwerror_msgs *hwerrmsgs,
 			 size_t nhwerrmsgs, char *msg, size_t lmsg);
+
+void qib_stop_send_queue(struct rvt_qp *qp);
+void qib_quiesce_qp(struct rvt_qp *qp);
+void qib_flush_qp_waiters(struct rvt_qp *qp);
+int qib_mtu_to_path_mtu(u32 mtu);
+u32 qib_mtu_from_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp, u32 pmtu);
+void qib_notify_error_qp(struct rvt_qp *qp);
+int qib_get_pmtu_from_attr(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+			   struct ib_qp_attr *attr);
+
 #endif                          /* _QIB_KERNEL_H */

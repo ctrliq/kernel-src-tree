@@ -68,6 +68,7 @@
 #define EXIT_REASON_EPT_VIOLATION       48
 #define EXIT_REASON_EPT_MISCONFIG       49
 #define EXIT_REASON_INVEPT              50
+#define EXIT_REASON_RDTSCP              51
 #define EXIT_REASON_PREEMPTION_TIMER    52
 #define EXIT_REASON_INVVPID             53
 #define EXIT_REASON_WBINVD              54
@@ -75,6 +76,8 @@
 #define EXIT_REASON_APIC_WRITE          56
 #define EXIT_REASON_INVPCID             58
 #define EXIT_REASON_PML_FULL            62
+#define EXIT_REASON_XSAVES              63
+#define EXIT_REASON_XRSTORS             64
 
 #define VMX_EXIT_REASONS \
 	{ EXIT_REASON_EXCEPTION_NMI,         "EXCEPTION_NMI" }, \
@@ -112,6 +115,8 @@
 	{ EXIT_REASON_APIC_ACCESS,           "APIC_ACCESS" }, \
 	{ EXIT_REASON_EPT_VIOLATION,         "EPT_VIOLATION" }, \
 	{ EXIT_REASON_EPT_MISCONFIG,         "EPT_MISCONFIG" }, \
+	{ EXIT_REASON_INVEPT,                "INVEPT" }, \
+	{ EXIT_REASON_PREEMPTION_TIMER,      "PREEMPTION_TIMER" }, \
 	{ EXIT_REASON_WBINVD,                "WBINVD" }, \
 	{ EXIT_REASON_APIC_WRITE,            "APIC_WRITE" }, \
 	{ EXIT_REASON_EOI_INDUCED,           "EOI_INDUCED" }, \
@@ -120,7 +125,8 @@
 	{ EXIT_REASON_INVD,                  "INVD" }, \
 	{ EXIT_REASON_INVVPID,               "INVVPID" }, \
 	{ EXIT_REASON_INVPCID,               "INVPCID" }, \
-	{ EXIT_REASON_PREEMPTION_TIMER,      "PREEMPTION_TIMER" }
+	{ EXIT_REASON_XSAVES,                "XSAVES" }, \
+	{ EXIT_REASON_XRSTORS,               "XRSTORS" }
 
 #define VMX_ABORT_SAVE_GUEST_MSR_FAIL        1
 #define VMX_ABORT_LOAD_HOST_MSR_FAIL         4

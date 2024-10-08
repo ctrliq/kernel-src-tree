@@ -23,7 +23,7 @@ nft_do_chain_arp(const struct nf_hook_ops *ops,
 {
 	struct nft_pktinfo pkt;
 
-	nft_set_pktinfo(&pkt, ops, skb, state);
+	nft_set_pktinfo(&pkt, skb, state);
 
 	return nft_do_chain(&pkt, ops);
 }
@@ -59,7 +59,7 @@ err:
 
 static void nf_tables_arp_exit_net(struct net *net)
 {
-	nft_unregister_afinfo(net->nft.arp);
+	nft_unregister_afinfo(net, net->nft.arp);
 	kfree(net->nft.arp);
 }
 

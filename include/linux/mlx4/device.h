@@ -207,6 +207,7 @@ enum {
 	MLX4_DEV_CAP_FLAG2_FS_A0		= 1LL <<  19,
 	MLX4_DEV_CAP_FLAG2_RECOVERABLE_ERROR_EVENT = 1LL << 20,
 	MLX4_DEV_CAP_FLAG2_PORT_REMAP		= 1LL <<  21,
+	MLX4_DEV_CAP_FLAG2_QCN			= 1LL <<  22,
 	MLX4_DEV_CAP_FLAG2_QP_RATE_LIMIT	= 1LL <<  23,
 	MLX4_DEV_CAP_FLAG2_FLOWSTATS_EN         = 1LL <<  24,
 	MLX4_DEV_CAP_FLAG2_QOS_VPP		= 1LL <<  25,
@@ -1340,6 +1341,9 @@ enum {
 	VXLAN_STEER_BY_INNER_VLAN	= 1 << 4,
 };
 
+enum {
+	MLX4_OP_MOD_QUERY_TRANSPORT_CI_ERRORS = 0x2,
+};
 
 int mlx4_flow_steer_promisc_add(struct mlx4_dev *dev, u8 port, u32 qpn,
 				enum mlx4_net_trans_promisc_mode mode);

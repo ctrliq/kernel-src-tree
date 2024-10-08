@@ -2,7 +2,7 @@
 #include <linux/acpi.h>
 
 struct usb_hub_descriptor;
-struct dev_state;
+struct usb_dev_state;
 
 /* Functions local to drivers/usb/core/ */
 
@@ -59,12 +59,8 @@ extern int usb_match_device(struct usb_device *dev,
 extern void usb_forced_unbind_intf(struct usb_interface *intf);
 extern void usb_unbind_and_rebind_marked_interfaces(struct usb_device *udev);
 
-extern int usb_hub_claim_port(struct usb_device *hdev, unsigned port,
-		struct dev_state *owner);
-extern int usb_hub_release_port(struct usb_device *hdev, unsigned port,
-		struct dev_state *owner);
 extern void usb_hub_release_all_ports(struct usb_device *hdev,
-		struct dev_state *owner);
+		struct usb_dev_state *owner);
 extern bool usb_device_is_owned(struct usb_device *udev);
 
 extern int  usb_hub_init(void);
@@ -82,6 +78,14 @@ extern int usb_resume_complete(struct device *dev);
 extern int usb_port_suspend(struct usb_device *dev, pm_message_t msg);
 extern int usb_port_resume(struct usb_device *dev, pm_message_t msg);
 
+extern void usb_autosuspend_device(struct usb_device *udev);
+extern int usb_autoresume_device(struct usb_device *udev);
+extern int usb_remote_wakeup(struct usb_device *dev);
+extern int usb_runtime_suspend(struct device *dev);
+extern int usb_runtime_resume(struct device *dev);
+extern int usb_runtime_idle(struct device *dev);
+extern int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable);
+
 #else
 
 static inline int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
@@ -94,20 +98,6 @@ static inline int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 	return 0;
 }
 
-#endif
-
-#ifdef CONFIG_PM_RUNTIME
-
-extern void usb_autosuspend_device(struct usb_device *udev);
-extern int usb_autoresume_device(struct usb_device *udev);
-extern int usb_remote_wakeup(struct usb_device *dev);
-extern int usb_runtime_suspend(struct device *dev);
-extern int usb_runtime_resume(struct device *dev);
-extern int usb_runtime_idle(struct device *dev);
-extern int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable);
-
-#else
-
 #define usb_autosuspend_device(udev)		do {} while (0)
 static inline int usb_autoresume_device(struct usb_device *udev)
 {
@@ -118,6 +108,7 @@ static inline int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
 {
 	return 0;
 }
+
 #endif
 
 extern struct bus_type usb_bus_type;

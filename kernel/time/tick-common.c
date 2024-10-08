@@ -34,7 +34,6 @@ DEFINE_PER_CPU(struct tick_device, tick_cpu_device);
 ktime_t tick_next_period;
 ktime_t tick_period;
 int tick_do_timer_cpu __read_mostly = TICK_DO_TIMER_BOOT;
-static DEFINE_RAW_SPINLOCK(tick_device_lock);
 
 /*
  * Debugging: see timer_list.c
@@ -218,6 +217,17 @@ static void tick_setup_device(struct tick_device *td,
 		tick_setup_oneshot(newdev, handler, next_event);
 }
 
+void tick_install_replacement(struct clock_event_device *newdev)
+{
+	struct tick_device *td = &__get_cpu_var(tick_cpu_device);
+	int cpu = smp_processor_id();
+
+	clockevents_exchange_device(td->evtdev, newdev);
+	tick_setup_device(td, newdev, cpu, cpumask_of(cpu));
+	if (newdev->features & CLOCK_EVT_FEAT_ONESHOT)
+		tick_oneshot_notify();
+}
+
 static bool tick_check_percpu(struct clock_event_device *curdev,
 			      struct clock_event_device *newdev, int cpu)
 {
@@ -255,16 +265,27 @@ static bool tick_check_preferred(struct clock_event_device *curdev,
 }
 
 /*
- * Check, if the new registered device should be used.
+ * Check whether the new device is a better fit than curdev. curdev
+ * can be NULL !
+ */
+bool tick_check_replacement(struct clock_event_device *curdev,
+			    struct clock_event_device *newdev)
+{
+	if (!tick_check_percpu(curdev, newdev, smp_processor_id()))
+		return false;
+
+	return tick_check_preferred(curdev, newdev);
+}
+
+/*
+ * Check, if the new registered device should be used. Called with
+ * clockevents_lock held and interrupts disabled.
  */
 void tick_check_new_device(struct clock_event_device *newdev)
 {
 	struct clock_event_device *curdev;
 	struct tick_device *td;
 	int cpu;
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&tick_device_lock, flags);
 
 	cpu = smp_processor_id();
 	if (!cpumask_test_cpu(cpu, newdev->cpumask))
@@ -297,8 +318,6 @@ void tick_check_new_device(struct clock_event_device *newdev)
 	tick_setup_device(td, newdev, cpu, cpumask_of(cpu));
 	if (newdev->features & CLOCK_EVT_FEAT_ONESHOT)
 		tick_oneshot_notify();
-
-	raw_spin_unlock_irqrestore(&tick_device_lock, flags);
 	return;
 
 out_bc:
@@ -306,7 +325,6 @@ out_bc:
 	 * Can the new device be used as a broadcast device ?
 	 */
 	tick_install_broadcast_device(newdev);
-	raw_spin_unlock_irqrestore(&tick_device_lock, flags);
 }
 
 /*
@@ -314,7 +332,7 @@ out_bc:
  *
  * Called with interrupts disabled.
  */
-static void tick_handover_do_timer(int *cpup)
+void tick_handover_do_timer(int *cpup)
 {
 	if (*cpup == tick_do_timer_cpu) {
 		int cpu = cpumask_first(cpu_online_mask);
@@ -331,13 +349,11 @@ static void tick_handover_do_timer(int *cpup)
  * access the hardware device itself.
  * We just set the mode and remove it from the lists.
  */
-static void tick_shutdown(unsigned int *cpup)
+void tick_shutdown(unsigned int *cpup)
 {
 	struct tick_device *td = &per_cpu(tick_cpu_device, *cpup);
 	struct clock_event_device *dev = td->evtdev;
-	unsigned long flags;
 
-	raw_spin_lock_irqsave(&tick_device_lock, flags);
 	td->mode = TICKDEV_MODE_PERIODIC;
 	if (dev) {
 		/*
@@ -349,26 +365,20 @@ static void tick_shutdown(unsigned int *cpup)
 		dev->event_handler = clockevents_handle_noop;
 		td->evtdev = NULL;
 	}
-	raw_spin_unlock_irqrestore(&tick_device_lock, flags);
 }
 
-static void tick_suspend(void)
+void tick_suspend(void)
 {
 	struct tick_device *td = &__get_cpu_var(tick_cpu_device);
-	unsigned long flags;
 
-	raw_spin_lock_irqsave(&tick_device_lock, flags);
 	clockevents_shutdown(td->evtdev);
-	raw_spin_unlock_irqrestore(&tick_device_lock, flags);
 }
 
-static void tick_resume(void)
+void tick_resume(void)
 {
 	struct tick_device *td = &__get_cpu_var(tick_cpu_device);
-	unsigned long flags;
 	int broadcast = tick_resume_broadcast();
 
-	raw_spin_lock_irqsave(&tick_device_lock, flags);
 	clockevents_set_mode(td->evtdev, CLOCK_EVT_MODE_RESUME);
 
 	if (!broadcast) {
@@ -377,54 +387,6 @@ static void tick_resume(void)
 		else
 			tick_resume_oneshot();
 	}
-	raw_spin_unlock_irqrestore(&tick_device_lock, flags);
-}
-
-/*
- * tick_notify: notification about relevant events
- * Returns 0 on success, any other value on error
- */
-int tick_notify(unsigned long reason, void *dev)
-{
-	int ret = 0;
-
-	switch (reason) {
-
-	case CLOCK_EVT_NOTIFY_BROADCAST_ON:
-	case CLOCK_EVT_NOTIFY_BROADCAST_OFF:
-	case CLOCK_EVT_NOTIFY_BROADCAST_FORCE:
-		tick_broadcast_on_off(reason, dev);
-		break;
-
-	case CLOCK_EVT_NOTIFY_BROADCAST_ENTER:
-	case CLOCK_EVT_NOTIFY_BROADCAST_EXIT:
-		ret = tick_broadcast_oneshot_control(reason);
-		break;
-
-	case CLOCK_EVT_NOTIFY_CPU_DYING:
-		tick_handover_do_timer(dev);
-		break;
-
-	case CLOCK_EVT_NOTIFY_CPU_DEAD:
-		tick_shutdown_broadcast_oneshot(dev);
-		tick_shutdown_broadcast(dev);
-		tick_shutdown(dev);
-		break;
-
-	case CLOCK_EVT_NOTIFY_SUSPEND:
-		tick_suspend();
-		tick_suspend_broadcast();
-		break;
-
-	case CLOCK_EVT_NOTIFY_RESUME:
-		tick_resume();
-		break;
-
-	default:
-		break;
-	}
-
-	return ret;
 }
 
 /**

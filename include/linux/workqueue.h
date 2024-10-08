@@ -445,11 +445,12 @@ __alloc_workqueue_key(const char *fmt, unsigned int flags, int max_active,
 	alloc_workqueue(fmt, WQ_UNBOUND | __WQ_ORDERED | (flags), 1, ##args)
 
 #define create_workqueue(name)						\
-	alloc_workqueue((name), WQ_MEM_RECLAIM, 1)
+	alloc_workqueue("%s", WQ_MEM_RECLAIM, 1, (name))
 #define create_freezable_workqueue(name)				\
-	alloc_workqueue((name), WQ_FREEZABLE | WQ_UNBOUND | WQ_MEM_RECLAIM, 1)
+	alloc_workqueue("%s", WQ_FREEZABLE | WQ_UNBOUND | WQ_MEM_RECLAIM, \
+			1, (name))
 #define create_singlethread_workqueue(name)				\
-	alloc_ordered_workqueue((name), WQ_MEM_RECLAIM)
+	alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, (name))
 
 extern void destroy_workqueue(struct workqueue_struct *wq);
 
@@ -647,5 +648,11 @@ int workqueue_sysfs_register(struct workqueue_struct *wq);
 static inline int workqueue_sysfs_register(struct workqueue_struct *wq)
 { return 0; }
 #endif	/* CONFIG_SYSFS */
+
+#ifdef CONFIG_WQ_WATCHDOG
+void wq_watchdog_touch(int cpu);
+#else	/* CONFIG_WQ_WATCHDOG */
+static inline void wq_watchdog_touch(int cpu) { }
+#endif	/* CONFIG_WQ_WATCHDOG */
 
 #endif

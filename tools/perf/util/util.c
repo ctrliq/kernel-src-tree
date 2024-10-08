@@ -13,8 +13,10 @@
 #include <limits.h>
 #include <byteswap.h>
 #include <linux/kernel.h>
+#include <linux/log2.h>
 #include <unistd.h>
 #include "callchain.h"
+#include "strlist.h"
 
 struct callchain_param	callchain_param = {
 	.mode	= CHAIN_GRAPH_ABS,
@@ -584,4 +586,94 @@ bool find_process(const char *name)
 
 	closedir(dir);
 	return ret ? false : true;
+}
+
+const char *perf_tip(const char *dirpath)
+{
+	struct strlist *tips;
+	struct str_node *node;
+	char *tip = NULL;
+	struct strlist_config conf = {
+		.dirname = dirpath,
+		.file_only = true,
+	};
+
+	tips = strlist__new("tips.txt", &conf);
+	if (tips == NULL)
+		return errno == ENOENT ? NULL : "Tip: get more memory! ;-p";
+
+	if (strlist__nr_entries(tips) == 0)
+		goto out;
+
+	node = strlist__entry(tips, random() % strlist__nr_entries(tips));
+	if (asprintf(&tip, "Tip: %s", node->s) < 0)
+		tip = (char *)"Tip: get more memory! ;-)";
+
+out:
+	strlist__delete(tips);
+
+	return tip;
+}
+
+bool is_regular_file(const char *file)
+{
+	struct stat st;
+
+	if (stat(file, &st))
+		return false;
+
+	return S_ISREG(st.st_mode);
+}
+
+int fetch_current_timestamp(char *buf, size_t sz)
+{
+	struct timeval tv;
+	struct tm tm;
+	char dt[32];
+
+	if (gettimeofday(&tv, NULL) || !localtime_r(&tv.tv_sec, &tm))
+		return -1;
+
+	if (!strftime(dt, sizeof(dt), "%Y%m%d%H%M%S", &tm))
+		return -1;
+
+	scnprintf(buf, sz, "%s%02u", dt, (unsigned)tv.tv_usec / 10000);
+
+	return 0;
+}
+
+void print_binary(unsigned char *data, size_t len,
+		  size_t bytes_per_line, print_binary_t printer,
+		  void *extra)
+{
+	size_t i, j, mask;
+
+	if (!printer)
+		return;
+
+	bytes_per_line = roundup_pow_of_two(bytes_per_line);
+	mask = bytes_per_line - 1;
+
+	printer(BINARY_PRINT_DATA_BEGIN, 0, extra);
+	for (i = 0; i < len; i++) {
+		if ((i & mask) == 0) {
+			printer(BINARY_PRINT_LINE_BEGIN, -1, extra);
+			printer(BINARY_PRINT_ADDR, i, extra);
+		}
+
+		printer(BINARY_PRINT_NUM_DATA, data[i], extra);
+
+		if (((i & mask) == mask) || i == len - 1) {
+			for (j = 0; j < mask-(i & mask); j++)
+				printer(BINARY_PRINT_NUM_PAD, -1, extra);
+
+			printer(BINARY_PRINT_SEP, i, extra);
+			for (j = i & ~mask; j <= i; j++)
+				printer(BINARY_PRINT_CHAR_DATA, data[j], extra);
+			for (j = 0; j < mask-(i & mask); j++)
+				printer(BINARY_PRINT_CHAR_PAD, i, extra);
+			printer(BINARY_PRINT_LINE_END, -1, extra);
+		}
+	}
+	printer(BINARY_PRINT_DATA_END, -1, extra);
 }

@@ -319,6 +319,68 @@ struct nfs4_layoutreturn {
 	int rpc_status;
 };
 
+#define PNFS_LAYOUTSTATS_MAXSIZE 256
+
+struct nfs42_layoutstat_args;
+struct nfs42_layoutstat_devinfo;
+typedef	void (*layoutstats_encode_t)(struct xdr_stream *,
+		struct nfs42_layoutstat_args *,
+		struct nfs42_layoutstat_devinfo *);
+
+/* Per file per deviceid layoutstats */
+struct nfs42_layoutstat_devinfo {
+	struct nfs4_deviceid dev_id;
+	__u64 offset;
+	__u64 length;
+	__u64 read_count;
+	__u64 read_bytes;
+	__u64 write_count;
+	__u64 write_bytes;
+	__u32 layout_type;
+	layoutstats_encode_t layoutstats_encode;
+	void *layout_private;
+};
+
+struct nfs42_layoutstat_args {
+	struct nfs4_sequence_args seq_args;
+	struct nfs_fh *fh;
+	struct inode *inode;
+	nfs4_stateid stateid;
+	int num_dev;
+	struct nfs42_layoutstat_devinfo *devinfo;
+};
+
+struct nfs42_layoutstat_res {
+	struct nfs4_sequence_res seq_res;
+	int num_dev;
+	int rpc_status;
+};
+
+struct nfs42_layoutstat_data {
+	struct inode *inode;
+	struct nfs42_layoutstat_args args;
+	struct nfs42_layoutstat_res res;
+};
+
+struct nfs42_clone_args {
+	struct nfs4_sequence_args	seq_args;
+	struct nfs_fh			*src_fh;
+	struct nfs_fh			*dst_fh;
+	nfs4_stateid			src_stateid;
+	nfs4_stateid			dst_stateid;
+	__u64				src_offset;
+	__u64				dst_offset;
+	__u64				count;
+	const u32			*dst_bitmask;
+};
+
+struct nfs42_clone_res {
+	struct nfs4_sequence_res	seq_res;
+	unsigned int			rpc_status;
+	struct nfs_fattr		*dst_fattr;
+	const struct nfs_server		*server;
+};
+
 struct stateowner_id {
 	__u64	create_time;
 	__u32	uniquifier;
@@ -985,11 +1047,8 @@ struct nfs4_readlink_res {
 	struct nfs4_sequence_res	seq_res;
 };
 
-#define NFS4_SETCLIENTID_NAMELEN	(127)
 struct nfs4_setclientid {
 	const nfs4_verifier *		sc_verifier;
-	unsigned int			sc_name_len;
-	char				sc_name[NFS4_SETCLIENTID_NAMELEN + 1];
 	u32				sc_prog;
 	unsigned int			sc_netid_len;
 	char				sc_netid[RPCBIND_MAXNETIDLEN + 1];
@@ -1145,12 +1204,9 @@ struct nfs41_state_protection {
 	struct nfs4_op_map allow;
 };
 
-#define NFS4_EXCHANGE_ID_LEN	(127)
 struct nfs41_exchange_id_args {
 	struct nfs_client		*client;
 	nfs4_verifier			*verifier;
-	unsigned int 			id_len;
-	char 				id[NFS4_EXCHANGE_ID_LEN];
 	u32				flags;
 	struct nfs41_state_protection	state_protect;
 };

@@ -115,8 +115,8 @@ static int ib_device_check_mandatory(struct ib_device *device)
 
 	for (i = 0; i < ARRAY_SIZE(mandatory_table); ++i) {
 		if (!*(void **) ((void *) device + mandatory_table[i].offset)) {
-			printk(KERN_WARNING "Device %s is missing mandatory function %s\n",
-			       device->name, mandatory_table[i].name);
+			pr_warn("Device %s is missing mandatory function %s\n",
+				device->name, mandatory_table[i].name);
 			return -EINVAL;
 		}
 	}
@@ -255,8 +255,8 @@ static int add_client_context(struct ib_device *device, struct ib_client *client
 
 	context = kmalloc(sizeof *context, GFP_KERNEL);
 	if (!context) {
-		printk(KERN_WARNING "Couldn't allocate client context for %s/%s\n",
-		       device->name, client->name);
+		pr_warn("Couldn't allocate client context for %s/%s\n",
+			device->name, client->name);
 		return -ENOMEM;
 	}
 
@@ -343,29 +343,29 @@ int ib_register_device(struct ib_device *device,
 
 	ret = read_port_immutable(device);
 	if (ret) {
-		printk(KERN_WARNING "Couldn't create per port immutable data %s\n",
-		       device->name);
+		pr_warn("Couldn't create per port immutable data %s\n",
+			device->name);
 		goto out;
 	}
 
 	ret = ib_cache_setup_one(device);
 	if (ret) {
-		printk(KERN_WARNING "Couldn't set up InfiniBand P_Key/GID cache\n");
+		pr_warn("Couldn't set up InfiniBand P_Key/GID cache\n");
 		goto out;
 	}
 
 	memset(&device->attrs, 0, sizeof(device->attrs));
 	ret = device->query_device(device, &device->attrs, &uhw);
 	if (ret) {
-		printk(KERN_WARNING "Couldn't query the device attributes\n");
+		pr_warn("Couldn't query the device attributes\n");
 		ib_cache_cleanup_one(device);
 		goto out;
 	}
 
 	ret = ib_device_register_sysfs(device, port_callback);
 	if (ret) {
-		printk(KERN_WARNING "Couldn't register device %s with driver model\n",
-		       device->name);
+		pr_warn("Couldn't register device %s with driver model\n",
+			device->name);
 		ib_cache_cleanup_one(device);
 		goto out;
 	}
@@ -566,8 +566,8 @@ void ib_set_client_data(struct ib_device *device, struct ib_client *client,
 			goto out;
 		}
 
-	printk(KERN_WARNING "No client context found for %s/%s\n",
-	       device->name, client->name);
+	pr_warn("No client context found for %s/%s\n",
+		device->name, client->name);
 
 out:
 	spin_unlock_irqrestore(&device->client_data_lock, flags);
@@ -679,14 +679,20 @@ EXPORT_SYMBOL(ib_query_port);
  * @port_num:Port number to query
  * @index:GID table index to query
  * @gid:Returned GID
+ * @attr: Returned GID attributes related to this GID index (only in RoCE).
+ *   NULL means ignore.
  *
  * ib_query_gid() fetches the specified GID table entry.
  */
 int ib_query_gid(struct ib_device *device,
-		 u8 port_num, int index, union ib_gid *gid)
+		 u8 port_num, int index, union ib_gid *gid,
+		 struct ib_gid_attr *attr)
 {
 	if (rdma_cap_roce_gid_table(device, port_num))
-		return ib_get_cached_gid(device, port_num, index, gid);
+		return ib_get_cached_gid(device, port_num, index, gid, attr);
+
+	if (attr)
+		return -EINVAL;
 
 	return device->query_gid(device, port_num, index, gid);
 }
@@ -826,11 +832,14 @@ EXPORT_SYMBOL(ib_modify_port);
  *   a specified GID value occurs.
  * @device: The device to query.
  * @gid: The GID value to search for.
+ * @gid_type: Type of GID.
+ * @ndev: The ndev related to the GID to search for.
  * @port_num: The port number of the device where the GID value was found.
  * @index: The index into the GID table where the GID was found.  This
  *   parameter may be NULL.
  */
 int ib_find_gid(struct ib_device *device, union ib_gid *gid,
+		enum ib_gid_type gid_type, struct net_device *ndev,
 		u8 *port_num, u16 *index)
 {
 	union ib_gid tmp_gid;
@@ -838,15 +847,18 @@ int ib_find_gid(struct ib_device *device, union ib_gid *gid,
 
 	for (port = rdma_start_port(device); port <= rdma_end_port(device); ++port) {
 		if (rdma_cap_roce_gid_table(device, port)) {
-			if (!ib_cache_gid_find_by_port(device, gid, port,
-						       NULL, index)) {
+			if (!ib_find_cached_gid_by_port(device, gid, gid_type, port,
+							ndev, index)) {
 				*port_num = port;
 				return 0;
 			}
 		}
 
+		if (gid_type != IB_GID_TYPE_IB)
+			continue;
+
 		for (i = 0; i < device->port_immutable[port].gid_tbl_len; ++i) {
-			ret = ib_query_gid(device, port, i, &tmp_gid);
+			ret = ib_query_gid(device, port, i, &tmp_gid, NULL);
 			if (ret)
 				return ret;
 			if (!memcmp(&tmp_gid, gid, sizeof *gid)) {
@@ -946,6 +958,29 @@ struct net_device *ib_get_net_dev_by_params(struct ib_device *dev,
 }
 EXPORT_SYMBOL(ib_get_net_dev_by_params);
 
+static struct ibnl_client_cbs ibnl_ls_cb_table[] = {
+	[RDMA_NL_LS_OP_RESOLVE] = {
+		.dump = ib_nl_handle_resolve_resp,
+		.module = THIS_MODULE },
+	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
+		.dump = ib_nl_handle_set_timeout,
+		.module = THIS_MODULE },
+	[RDMA_NL_LS_OP_IP_RESOLVE] = {
+		.dump = ib_nl_handle_ip_res_resp,
+		.module = THIS_MODULE },
+};
+
+static int ib_add_ibnl_clients(void)
+{
+	return ibnl_add_client(RDMA_NL_LS, ARRAY_SIZE(ibnl_ls_cb_table),
+			       ibnl_ls_cb_table);
+}
+
+static void ib_remove_ibnl_clients(void)
+{
+	ibnl_remove_client(RDMA_NL_LS);
+}
+
 static int __init ib_core_init(void)
 {
 	int ret;
@@ -964,20 +999,51 @@ static int __init ib_core_init(void)
 
 	ret = class_register(&ib_class);
 	if (ret) {
-		printk(KERN_WARNING "Couldn't create InfiniBand device class\n");
+		pr_warn("Couldn't create InfiniBand device class\n");
 		goto err_comp;
 	}
 
 	ret = ibnl_init();
 	if (ret) {
-		printk(KERN_WARNING "Couldn't init IB netlink interface\n");
+		pr_warn("Couldn't init IB netlink interface\n");
 		goto err_sysfs;
+	}
+
+	ret = addr_init();
+	if (ret) {
+		pr_warn("Could't init IB address resolution\n");
+		goto err_ibnl;
+	}
+
+	ret = ib_mad_init();
+	if (ret) {
+		pr_warn("Couldn't init IB MAD\n");
+		goto err_addr;
+	}
+
+	ret = ib_sa_init();
+	if (ret) {
+		pr_warn("Couldn't init SA\n");
+		goto err_mad;
+	}
+
+	if (ib_add_ibnl_clients()) {
+		pr_warn("Couldn't register ibnl clients\n");
+		goto err_sa;
 	}
 
 	ib_cache_setup();
 
 	return 0;
 
+err_sa:
+	ib_sa_cleanup();
+err_mad:
+	ib_mad_cleanup();
+err_addr:
+	addr_cleanup();
+err_ibnl:
+	ibnl_cleanup();
 err_sysfs:
 	class_unregister(&ib_class);
 err_comp:
@@ -990,6 +1056,10 @@ err:
 static void __exit ib_core_cleanup(void)
 {
 	ib_cache_cleanup();
+	ib_remove_ibnl_clients();
+	ib_sa_cleanup();
+	ib_mad_cleanup();
+	addr_cleanup();
 	ibnl_cleanup();
 	class_unregister(&ib_class);
 	destroy_workqueue(ib_comp_wq);

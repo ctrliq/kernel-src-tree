@@ -133,15 +133,6 @@ static int usb_hcd_fsl_probe(const struct hc_driver *driver,
 	if (pdata->have_sysif_regs && pdata->controller_ver < FSL_USB_VER_1_6)
 		setbits32(hcd->regs + FSL_SOC_USB_CTRL, 0x4);
 
-	/*
-	 * Enable UTMI phy and program PTS field in UTMI mode before asserting
-	 * controller reset for USB Controller version 2.5
-	 */
-	if (pdata->has_fsl_erratum_a007792) {
-		writel_be(CTRL_UTMI_PHY_EN, hcd->regs + FSL_SOC_USB_CTRL);
-		writel(PORT_PTS_UTMI, hcd->regs + FSL_SOC_USB_PORTSC1);
-	}
-
 	/* Don't need to set host mode here. It will be done by tdi_reset() */
 
 	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
@@ -254,7 +245,6 @@ static int ehci_fsl_setup_phy(struct usb_hcd *hcd,
 		portsc |= PORT_PTS_PTW;
 		/* fall through */
 	case FSL_USB2_PHY_UTMI:
-	case FSL_USB2_PHY_UTMI_DUAL:
 		if (pdata->have_sysif_regs && pdata->controller_ver) {
 			/* controller version 1.6 or above */
 			setbits32(non_ehci + FSL_SOC_USB_CTRL, UTMI_PHY_EN);

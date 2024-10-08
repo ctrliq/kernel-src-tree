@@ -1163,7 +1163,7 @@ static int fjes_probe(struct platform_device *plat_dev)
 
 	err = -ENOMEM;
 	netdev = alloc_netdev_mq(sizeof(struct fjes_adapter), "es%d",
-				 NET_NAME_UNKNOWN, fjes_netdev_setup,
+				 fjes_netdev_setup,
 				 FJES_MAX_QUEUES);
 
 	if (!netdev)

@@ -26,7 +26,7 @@
 #include "../../util/evlist.h"
 #include "../../util/evsel.h"
 #include "../../util/cpumap.h"
-#include "../../util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "../../util/parse-events.h"
 #include "../../util/pmu.h"
 #include "../../util/debug.h"
@@ -529,10 +529,16 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 		return -EINVAL;
 	}
 
+	/*
+	 * RHEL7 we don't support use_clockid yet,
+	 * so ommiting following upstream hunk:
+
 	if (opts->use_clockid) {
 		pr_err("Cannot use clockid (-k option) with " INTEL_PT_PMU_NAME "\n");
 		return -EINVAL;
 	}
+
+	 */
 
 	if (!opts->full_auxtrace)
 		return 0;

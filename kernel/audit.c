@@ -385,7 +385,7 @@ static void audit_printk_skb(struct sk_buff *skb)
 		if (printk_ratelimit())
 			printk(KERN_NOTICE "type=%d %s\n", nlh->nlmsg_type, data);
 		else
-			audit_log_lost("printk limit exceeded\n");
+			audit_log_lost("printk limit exceeded");
 	}
 
 	audit_hold_skb(skb);
@@ -394,14 +394,33 @@ static void audit_printk_skb(struct sk_buff *skb)
 static void kauditd_send_skb(struct sk_buff *skb)
 {
 	int err;
+	int attempts = 0;
+#define AUDITD_RETRIES 5
+
+restart:
 	/* take a reference in case we can't send it and we want to hold it */
 	skb_get(skb);
 	err = netlink_unicast(audit_sock, skb, audit_nlk_portid, 0);
 	if (err < 0) {
-		BUG_ON(err != -ECONNREFUSED); /* Shouldn't happen */
-		printk(KERN_ERR "audit: *NO* daemon at audit_pid=%d\n", audit_pid);
-		audit_log_lost("auditd disappeared\n");
-		audit_pid = 0;
+		printk(KERN_ERR "audit: netlink_unicast sending to audit_pid=%d returned error: %d\n",
+		       audit_pid, err);
+		if (audit_pid) {
+			if (err == -ECONNREFUSED || err == -EPERM
+			    || ++attempts >= AUDITD_RETRIES) {
+				char s[32];
+
+				snprintf(s, sizeof(s), "audit_pid=%d reset", audit_pid);
+				audit_log_lost(s);
+				audit_pid = 0;
+			} else {
+				printk(KERN_WARNING "audit: re-scheduling(#%d) write to audit_pid=%d\n",
+					attempts, audit_pid);
+				set_current_state(TASK_INTERRUPTIBLE);
+				schedule();
+				__set_current_state(TASK_RUNNING);
+				goto restart;
+			}
+		}
 		/* we might get lucky and get this in the next auditd */
 		audit_hold_skb(skb);
 	} else
@@ -894,10 +913,11 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 			audit_log_end(ab);
 			return -EPERM;
 		}
-		/* fallthrough */
-	case AUDIT_LIST_RULES:
-		err = audit_receive_filter(msg_type, NETLINK_CB(skb).portid,
+		err = audit_rule_change(msg_type, NETLINK_CB(skb).portid,
 					   seq, data, nlmsg_len(nlh));
+		break;
+	case AUDIT_LIST_RULES:
+		err = audit_list_rules_send(NETLINK_CB(skb).portid, seq);
 		break;
 	case AUDIT_TRIM:
 		audit_trim_trees();

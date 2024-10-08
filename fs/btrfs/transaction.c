@@ -64,6 +64,9 @@ void btrfs_put_transaction(struct btrfs_transaction *transaction)
 	if (atomic_dec_and_test(&transaction->use_count)) {
 		BUG_ON(!list_empty(&transaction->list));
 		WARN_ON(!RB_EMPTY_ROOT(&transaction->delayed_refs.href_root));
+		if (transaction->delayed_refs.pending_csums)
+			printk(KERN_ERR "pending csums is %llu\n",
+			       transaction->delayed_refs.pending_csums);
 		while (!list_empty(&transaction->pending_chunks)) {
 			struct extent_map *em;
 
@@ -120,6 +123,18 @@ static noinline void switch_commit_roots(struct btrfs_transaction *trans,
 			btrfs_unpin_free_ino(root);
 		clear_btree_io_tree(&root->dirty_log_pages);
 	}
+
+	/* We can free old roots now. */
+	spin_lock(&trans->dropped_roots_lock);
+	while (!list_empty(&trans->dropped_roots)) {
+		root = list_first_entry(&trans->dropped_roots,
+					struct btrfs_root, root_list);
+		list_del_init(&root->root_list);
+		spin_unlock(&trans->dropped_roots_lock);
+		btrfs_drop_and_free_fs_root(fs_info, root);
+		spin_lock(&trans->dropped_roots_lock);
+	}
+	spin_unlock(&trans->dropped_roots_lock);
 	up_write(&fs_info->commit_root_sem);
 }
 
@@ -224,18 +239,15 @@ loop:
 	 * commit the transaction.
 	 */
 	atomic_set(&cur_trans->use_count, 2);
-	cur_trans->have_free_bgs = 0;
 	atomic_set(&cur_trans->pending_ordered, 0);
+	cur_trans->flags = 0;
 	cur_trans->start_time = get_seconds();
+
+	memset(&cur_trans->delayed_refs, 0, sizeof(cur_trans->delayed_refs));
 
 	cur_trans->delayed_refs.href_root = RB_ROOT;
 	cur_trans->delayed_refs.dirty_extent_root = RB_ROOT;
 	atomic_set(&cur_trans->delayed_refs.num_entries, 0);
-	cur_trans->delayed_refs.num_heads_ready = 0;
-	cur_trans->delayed_refs.num_heads = 0;
-	cur_trans->delayed_refs.flushing = 0;
-	cur_trans->delayed_refs.run_delayed_start = 0;
-	cur_trans->delayed_refs.qgroup_to_skip = 0;
 
 	/*
 	 * although the tree mod log is per file system and not per transaction,
@@ -256,9 +268,13 @@ loop:
 	INIT_LIST_HEAD(&cur_trans->pending_chunks);
 	INIT_LIST_HEAD(&cur_trans->switch_commits);
 	INIT_LIST_HEAD(&cur_trans->dirty_bgs);
+	INIT_LIST_HEAD(&cur_trans->io_bgs);
+	INIT_LIST_HEAD(&cur_trans->dropped_roots);
+	mutex_init(&cur_trans->cache_write_mutex);
+	cur_trans->num_dirty_bgs = 0;
 	spin_lock_init(&cur_trans->dirty_bgs_lock);
 	INIT_LIST_HEAD(&cur_trans->deleted_bgs);
-	spin_lock_init(&cur_trans->deleted_bgs_lock);
+	spin_lock_init(&cur_trans->dropped_roots_lock);
 	list_add_tail(&cur_trans->list, &fs_info->trans_list);
 	extent_io_tree_init(&cur_trans->dirty_pages,
 			     fs_info->btree_inode->i_mapping);
@@ -334,6 +350,24 @@ static int record_root_in_trans(struct btrfs_trans_handle *trans,
 	return 0;
 }
 
+
+void btrfs_add_dropped_root(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root)
+{
+	struct btrfs_transaction *cur_trans = trans->transaction;
+
+	/* Add ourselves to the transaction dropped list */
+	spin_lock(&cur_trans->dropped_roots_lock);
+	list_add_tail(&root->root_list, &cur_trans->dropped_roots);
+	spin_unlock(&cur_trans->dropped_roots_lock);
+
+	/* Make sure we don't try to update the root at commit time */
+	spin_lock(&root->fs_info->fs_roots_radix_lock);
+	radix_tree_tag_clear(&root->fs_info->fs_roots_radix,
+			     (unsigned long)root->root_key.objectid,
+			     BTRFS_ROOT_TRANS_TAG);
+	spin_unlock(&root->fs_info->fs_roots_radix_lock);
+}
 
 int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
 			       struct btrfs_root *root)
@@ -1072,6 +1106,7 @@ static noinline int commit_cowonly_roots(struct btrfs_trans_handle *trans,
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct list_head *dirty_bgs = &trans->transaction->dirty_bgs;
+	struct list_head *io_bgs = &trans->transaction->io_bgs;
 	struct list_head *next;
 	struct extent_buffer *eb;
 	int ret;
@@ -1125,7 +1160,7 @@ again:
 			return ret;
 	}
 
-	while (!list_empty(dirty_bgs)) {
+	while (!list_empty(dirty_bgs) || !list_empty(io_bgs)) {
 		ret = btrfs_write_dirty_block_groups(trans, root);
 		if (ret)
 			return ret;
@@ -1820,6 +1855,36 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 		return ret;
 	}
 
+	if (!test_bit(BTRFS_TRANS_DIRTY_BG_RUN, &cur_trans->flags)) {
+		int run_it = 0;
+
+		/* this mutex is also taken before trying to set
+		 * block groups readonly.  We need to make sure
+		 * that nobody has set a block group readonly
+		 * after a extents from that block group have been
+		 * allocated for cache files.  btrfs_set_block_group_ro
+		 * will wait for the transaction to commit if it
+		 * finds BTRFS_TRANS_DIRTY_BG_RUN set.
+		 *
+		 * The BTRFS_TRANS_DIRTY_BG_RUN flag is also used to make sure
+		 * only one process starts all the block group IO.  It wouldn't
+		 * hurt to have more than one go through, but there's no
+		 * real advantage to it either.
+		 */
+		mutex_lock(&root->fs_info->ro_block_group_mutex);
+		if (!test_and_set_bit(BTRFS_TRANS_DIRTY_BG_RUN,
+				      &cur_trans->flags))
+			run_it = 1;
+		mutex_unlock(&root->fs_info->ro_block_group_mutex);
+
+		if (run_it)
+			ret = btrfs_start_dirty_block_groups(trans, root);
+	}
+	if (ret) {
+		btrfs_end_transaction(trans, root);
+		return ret;
+	}
+
 	spin_lock(&root->fs_info->trans_lock);
 	if (cur_trans->state >= TRANS_STATE_COMMIT_START) {
 		spin_unlock(&root->fs_info->trans_lock);
@@ -2033,6 +2098,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 
 	assert_qgroups_uptodate(trans);
 	ASSERT(list_empty(&cur_trans->dirty_bgs));
+	ASSERT(list_empty(&cur_trans->io_bgs));
 	update_super_roots(root);
 
 	btrfs_set_super_log_root(root->fs_info->super_copy, 0);
@@ -2078,7 +2144,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 
 	btrfs_finish_extent_commit(trans, root);
 
-	if (cur_trans->have_free_bgs)
+	if (test_bit(BTRFS_TRANS_HAVE_FREE_BGS, &cur_trans->flags))
 		btrfs_clear_space_info_full(root->fs_info);
 
 	root->fs_info->last_trans_committed = cur_trans->transid;

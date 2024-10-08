@@ -51,6 +51,13 @@ void strbuf_grow(struct strbuf *sb, size_t extra)
 	ALLOC_GROW(sb->buf, sb->len + extra + 1, sb->alloc);
 }
 
+void strbuf_addch(struct strbuf *sb, int c)
+{
+	strbuf_grow(sb, 1);
+	sb->buf[sb->len++] = c;
+	sb->buf[sb->len] = '\0';
+}
+
 void strbuf_add(struct strbuf *sb, const void *data, size_t len)
 {
 	strbuf_grow(sb, len);
@@ -58,28 +65,36 @@ void strbuf_add(struct strbuf *sb, const void *data, size_t len)
 	strbuf_setlen(sb, sb->len + len);
 }
 
-void strbuf_addf(struct strbuf *sb, const char *fmt, ...)
+static void strbuf_addv(struct strbuf *sb, const char *fmt, va_list ap)
 {
 	int len;
-	va_list ap;
+	va_list ap_saved;
 
 	if (!strbuf_avail(sb))
 		strbuf_grow(sb, 64);
-	va_start(ap, fmt);
+
+	va_copy(ap_saved, ap);
 	len = vsnprintf(sb->buf + sb->len, sb->alloc - sb->len, fmt, ap);
-	va_end(ap);
 	if (len < 0)
 		die("your vsnprintf is broken");
 	if (len > strbuf_avail(sb)) {
 		strbuf_grow(sb, len);
-		va_start(ap, fmt);
-		len = vsnprintf(sb->buf + sb->len, sb->alloc - sb->len, fmt, ap);
-		va_end(ap);
+		len = vsnprintf(sb->buf + sb->len, sb->alloc - sb->len, fmt, ap_saved);
+		va_end(ap_saved);
 		if (len > strbuf_avail(sb)) {
 			die("this should not happen, your vsnprintf is broken");
 		}
 	}
 	strbuf_setlen(sb, sb->len + len);
+}
+
+void strbuf_addf(struct strbuf *sb, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	strbuf_addv(sb, fmt, ap);
+	va_end(ap);
 }
 
 ssize_t strbuf_read(struct strbuf *sb, int fd, ssize_t hint)

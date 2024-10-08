@@ -143,7 +143,7 @@ EXPORT_SYMBOL_GPL(nfs_file_llseek);
 /*
  * Flush all dirty pages, and check for write errors.
  */
-int
+static int
 nfs_file_flush(struct file *file, fl_owner_t id)
 {
 	struct inode	*inode = file_inode(file);
@@ -154,17 +154,9 @@ nfs_file_flush(struct file *file, fl_owner_t id)
 	if ((file->f_mode & FMODE_WRITE) == 0)
 		return 0;
 
-	/*
-	 * If we're holding a write delegation, then just start the i/o
-	 * but don't wait for completion (or send a commit).
-	 */
-	if (NFS_PROTO(inode)->have_delegation(inode, FMODE_WRITE))
-		return filemap_fdatawrite(file->f_mapping);
-
 	/* Flush writes to the server and return any errors */
 	return vfs_fsync(file, 0);
 }
-EXPORT_SYMBOL_GPL(nfs_file_flush);
 
 ssize_t
 nfs_file_read(struct kiocb *iocb, const struct iovec *iov,
@@ -371,8 +363,8 @@ start:
 	 * Prevent starvation issues if someone is doing a consistency
 	 * sync-to-disk
 	 */
-	ret = wait_on_bit(&NFS_I(mapping->host)->flags, NFS_INO_FLUSHING,
-			nfs_wait_bit_killable, TASK_KILLABLE);
+	ret = wait_on_bit_action(&NFS_I(mapping->host)->flags, NFS_INO_FLUSHING,
+				 nfs_wait_bit_killable, TASK_KILLABLE);
 	if (ret)
 		return ret;
 	/*
@@ -456,11 +448,13 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
  * - Called if either PG_private or PG_fscache is set on the page
  * - Caller holds page lock
  */
-static void nfs_invalidate_page(struct page *page, unsigned long offset)
+static void nfs_invalidate_page(struct page *page, unsigned int offset,
+				unsigned int length)
 {
-	dfprintk(PAGECACHE, "NFS: invalidate_page(%p, %lu)\n", page, offset);
+	dfprintk(PAGECACHE, "NFS: invalidate_page(%p, %u, %u)\n",
+		 page, offset, length);
 
-	if (offset != 0)
+	if (offset != 0 || length < PAGE_CACHE_SIZE)
 		return;
 	/* Cancel any unstarted writes on this page */
 	nfs_wb_page_cancel(page_file_mapping(page)->host, page);
@@ -553,7 +547,7 @@ static int nfs_launder_page(struct page *page)
 		inode->i_ino, (long long)page_offset(page));
 
 	nfs_fscache_wait_on_page_write(nfsi, page);
-	return nfs_wb_page(inode, page);
+	return nfs_wb_launder_page(inode, page);
 }
 
 static int nfs_swap_activate(struct swap_info_struct *sis, struct file *file,
@@ -581,7 +575,7 @@ const struct address_space_operations nfs_file_aops = {
 	.writepages = nfs_writepages,
 	.write_begin = nfs_write_begin,
 	.write_end = nfs_write_end,
-	.invalidatepage = nfs_invalidate_page,
+	.invalidatepage_range = nfs_invalidate_page,
 	.releasepage = nfs_release_page,
 	.direct_IO = nfs_direct_IO,
 	.migratepage = nfs_migrate_page,
@@ -731,7 +725,7 @@ ssize_t nfs_file_splice_write(struct pipe_inode_info *pipe,
 	if (ret > 0)
 		written = ret;
 
-	if (ret >= 0 && nfs_need_sync_write(filp, inode)) {
+	if (ret >= 0 && nfs_need_check_write(filp, inode)) {
 		int err = vfs_fsync(filp, 0);
 		if (err < 0)
 			ret = err;

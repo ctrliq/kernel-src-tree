@@ -169,6 +169,7 @@ xfs_get_acl(struct inode *inode, int type)
 			acl = NULL;
 			goto out_update_cache;
 		}
+		acl = ERR_PTR(error);
 		goto out;
 	}
 

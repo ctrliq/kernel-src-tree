@@ -923,16 +923,18 @@ static int get_mirror(struct mirror_set *ms, struct dm_target *ti,
 {
 	unsigned long long offset;
 	char dummy;
+	int ret;
 
 	if (sscanf(argv[1], "%llu%c", &offset, &dummy) != 1) {
 		ti->error = "Invalid offset";
 		return -EINVAL;
 	}
 
-	if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
-			  &ms->mirror[mirror].dev)) {
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
+			    &ms->mirror[mirror].dev);
+	if (ret) {
 		ti->error = "Device lookup failure";
-		return -ENXIO;
+		return ret;
 	}
 
 	ms->mirror[mirror].ms = ms;
@@ -1086,7 +1088,7 @@ static int mirror_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
-	ti->per_bio_data_size = sizeof(struct dm_raid1_bio_record);
+	ti->per_io_data_size = sizeof(struct dm_raid1_bio_record);
 	ti->discard_zeroes_data_unsupported = true;
 
 	ms->kmirrord_wq = alloc_workqueue("kmirrord", WQ_MEM_RECLAIM, 0);

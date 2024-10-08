@@ -33,6 +33,123 @@
 
 #include "hyperv_vmbus.h"
 
+static void init_vp_index(struct vmbus_channel *channel, u16 dev_type);
+
+static const struct vmbus_device vmbus_devs[] = {
+	/* IDE */
+	{ .dev_type = HV_IDE,
+	  HV_IDE_GUID,
+	  .perf_device = true,
+	},
+
+	/* SCSI */
+	{ .dev_type = HV_SCSI,
+	  HV_SCSI_GUID,
+	  .perf_device = true,
+	},
+
+	/* Fibre Channel */
+	{ .dev_type = HV_FC,
+	  HV_SYNTHFC_GUID,
+	  .perf_device = true,
+	},
+
+	/* Synthetic NIC */
+	{ .dev_type = HV_NIC,
+	  HV_NIC_GUID,
+	  .perf_device = true,
+	},
+
+	/* Network Direct */
+	{ .dev_type = HV_ND,
+	  HV_ND_GUID,
+	  .perf_device = true,
+	},
+
+	/* PCIE */
+	{ .dev_type = HV_PCIE,
+	  HV_PCIE_GUID,
+	  .perf_device = true,
+	},
+
+	/* Synthetic Frame Buffer */
+	{ .dev_type = HV_FB,
+	  HV_SYNTHVID_GUID,
+	  .perf_device = false,
+	},
+
+	/* Synthetic Keyboard */
+	{ .dev_type = HV_KBD,
+	  HV_KBD_GUID,
+	  .perf_device = false,
+	},
+
+	/* Synthetic MOUSE */
+	{ .dev_type = HV_MOUSE,
+	  HV_MOUSE_GUID,
+	  .perf_device = false,
+	},
+
+	/* KVP */
+	{ .dev_type = HV_KVP,
+	  HV_KVP_GUID,
+	  .perf_device = false,
+	},
+
+	/* Time Synch */
+	{ .dev_type = HV_TS,
+	  HV_TS_GUID,
+	  .perf_device = false,
+	},
+
+	/* Heartbeat */
+	{ .dev_type = HV_HB,
+	  HV_HEART_BEAT_GUID,
+	  .perf_device = false,
+	},
+
+	/* Shutdown */
+	{ .dev_type = HV_SHUTDOWN,
+	  HV_SHUTDOWN_GUID,
+	  .perf_device = false,
+	},
+
+	/* File copy */
+	{ .dev_type = HV_FCOPY,
+	  HV_FCOPY_GUID,
+	  .perf_device = false,
+	},
+
+	/* Backup */
+	{ .dev_type = HV_BACKUP,
+	  HV_VSS_GUID,
+	  .perf_device = false,
+	},
+
+	/* Dynamic Memory */
+	{ .dev_type = HV_DM,
+	  HV_DM_GUID,
+	  .perf_device = false,
+	},
+
+	/* Unknown GUID */
+	{ .dev_type = HV_UNKOWN,
+	  .perf_device = false,
+	},
+};
+
+static u16 hv_get_dev_type(const uuid_le *guid)
+{
+	u16 i;
+
+	for (i = HV_IDE; i < HV_UNKOWN; i++) {
+		if (!uuid_le_cmp(*guid, vmbus_devs[i].guid))
+			return i;
+	}
+	pr_info("Unknown GUID: %pUl\n", guid);
+	return i;
+}
+
 /**
  * vmbus_prep_negotiate_resp() - Create default response for Hyper-V Negotiate message
  * @icmsghdrp: Pointer to msg header structure
@@ -192,6 +309,8 @@ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
 
 	vmbus_release_relid(relid);
 
+	BUG_ON(!channel->rescind);
+
 	if (channel->target_cpu != get_cpu()) {
 		put_cpu();
 		smp_call_function_single(channel->target_cpu,
@@ -202,25 +321,39 @@ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
 	}
 
 	if (channel->primary_channel == NULL) {
-		spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+		mutex_lock(&vmbus_connection.channel_mutex);
 		list_del(&channel->listentry);
-		spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+		mutex_unlock(&vmbus_connection.channel_mutex);
+
+		primary_channel = channel;
 	} else {
 		primary_channel = channel->primary_channel;
 		spin_lock_irqsave(&primary_channel->lock, flags);
 		list_del(&channel->sc_list);
+		primary_channel->num_sc--;
 		spin_unlock_irqrestore(&primary_channel->lock, flags);
 	}
+
+	/*
+	 * We need to free the bit for init_vp_index() to work in the case
+	 * of sub-channel, when we reload drivers like hv_netvsc.
+	 */
+	cpumask_clear_cpu(channel->target_cpu,
+			  &primary_channel->alloced_cpus_in_node);
+
 	free_channel(channel);
 }
 
 void vmbus_free_channels(void)
 {
-	struct vmbus_channel *channel;
+	struct vmbus_channel *channel, *tmp;
 
-	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
+	list_for_each_entry_safe(channel, tmp, &vmbus_connection.chn_list,
+		listentry) {
+		/* hv_process_channel_removal() needs this */
+		channel->rescind = true;
+
 		vmbus_device_unregister(channel->device_obj);
-		free_channel(channel);
 	}
 }
 
@@ -232,11 +365,11 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 {
 	struct vmbus_channel *channel;
 	bool fnew = true;
-	bool enq = false;
 	unsigned long flags;
+	u16 dev_type;
 
 	/* Make sure this is a new offer */
-	spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+	mutex_lock(&vmbus_connection.channel_mutex);
 
 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
 		if (!uuid_le_cmp(channel->offermsg.offer.if_type,
@@ -248,25 +381,12 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 		}
 	}
 
-	if (fnew) {
+	if (fnew)
 		list_add_tail(&newchannel->listentry,
 			      &vmbus_connection.chn_list);
-		enq = true;
-	}
 
-	spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+	mutex_unlock(&vmbus_connection.channel_mutex);
 
-	if (enq) {
-		if (newchannel->target_cpu != get_cpu()) {
-			put_cpu();
-			smp_call_function_single(newchannel->target_cpu,
-						 percpu_channel_enq,
-						 newchannel, true);
-		} else {
-			percpu_channel_enq(newchannel);
-			put_cpu();
-		}
-	}
 	if (!fnew) {
 		/*
 		 * Check to see if this is a sub-channel.
@@ -278,26 +398,24 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 			newchannel->primary_channel = channel;
 			spin_lock_irqsave(&channel->lock, flags);
 			list_add_tail(&newchannel->sc_list, &channel->sc_list);
+			channel->num_sc++;
 			spin_unlock_irqrestore(&channel->lock, flags);
+		} else
+			goto err_free_chan;
+	}
 
-			if (newchannel->target_cpu != get_cpu()) {
-				put_cpu();
-				smp_call_function_single(newchannel->target_cpu,
-							 percpu_channel_enq,
-							 newchannel, true);
-			} else {
-				percpu_channel_enq(newchannel);
-				put_cpu();
-			}
+	dev_type = hv_get_dev_type(&newchannel->offermsg.offer.if_type);
 
-			newchannel->state = CHANNEL_OPEN_STATE;
-			if (channel->sc_creation_callback != NULL)
-				channel->sc_creation_callback(newchannel);
+	init_vp_index(newchannel, dev_type);
 
-			return;
-		}
-
-		goto err_free_chan;
+	if (newchannel->target_cpu != get_cpu()) {
+		put_cpu();
+		smp_call_function_single(newchannel->target_cpu,
+					 percpu_channel_enq,
+					 newchannel, true);
+	} else {
+		percpu_channel_enq(newchannel);
+		put_cpu();
 	}
 
 	/*
@@ -306,6 +424,12 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 	 * can cleanup properly
 	 */
 	newchannel->state = CHANNEL_OPEN_STATE;
+
+	if (!fnew) {
+		if (channel->sc_creation_callback != NULL)
+			channel->sc_creation_callback(newchannel);
+		return;
+	}
 
 	/*
 	 * Start the process of binding this offer to the driver
@@ -319,6 +443,7 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 	if (!newchannel->device_obj)
 		goto err_deq_chan;
 
+	newchannel->device_obj->device_id = dev_type;
 	/*
 	 * Add the new device to the bus. This will kick off device-driver
 	 * binding which eventually invokes the device driver's AddDevice()
@@ -335,9 +460,9 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 err_deq_chan:
 	vmbus_release_relid(newchannel->offermsg.child_relid);
 
-	spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+	mutex_lock(&vmbus_connection.channel_mutex);
 	list_del(&newchannel->listentry);
-	spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+	mutex_unlock(&vmbus_connection.channel_mutex);
 
 	if (newchannel->target_cpu != get_cpu()) {
 		put_cpu();
@@ -352,60 +477,31 @@ err_free_chan:
 	free_channel(newchannel);
 }
 
-enum {
-	IDE = 0,
-	SCSI,
-	FC,
-	NIC,
-	ND_NIC,
-	MAX_PERF_CHN,
-};
-
-/*
- * This is an array of device_ids (device types) that are performance critical.
- * We attempt to distribute the interrupt load for these devices across
- * all available CPUs.
- */
-static const struct hv_vmbus_device_id hp_devs[] = {
-	/* IDE */
-	{ HV_IDE_GUID, },
-	/* Storage - SCSI */
-	{ HV_SCSI_GUID, },
-	/* Storage - FC */
-	{ HV_SYNTHFC_GUID, },
-	/* Network */
-	{ HV_NIC_GUID, },
-};
-
-
 /*
  * We use this state to statically distribute the channel interrupt load.
  */
-static u32  next_vp;
+static int next_numa_node_id;
 
 /*
  * Starting with Win8, we can statically distribute the incoming
- * channel interrupt load by binding a channel to VCPU. We
- * implement here a simple round robin scheme for distributing
- * the interrupt load.
- * We will bind channels that are not performance critical to cpu 0 and
- * performance critical channels (IDE, SCSI and Network) will be uniformly
- * distributed across all available CPUs.
+ * channel interrupt load by binding a channel to VCPU.
+ * We do this in a hierarchical fashion:
+ * First distribute the primary channels across available NUMA nodes
+ * and then distribute the subchannels amongst the CPUs in the NUMA
+ * node assigned to the primary channel.
+ *
+ * For pre-win8 hosts or non-performance critical channels we assign the
+ * first CPU in the first NUMA node.
  */
-static void init_vp_index(struct vmbus_channel *channel, uuid_le *type_guid)
+static void init_vp_index(struct vmbus_channel *channel, u16 dev_type)
 {
 	u32 cur_cpu;
-	int i;
-	bool perf_chn = false;
-	u32 max_cpus = num_online_cpus();
+	bool perf_chn = vmbus_devs[dev_type].perf_device;
+	struct vmbus_channel *primary = channel->primary_channel;
+	int next_node;
+	struct cpumask available_mask;
+	struct cpumask *alloced_mask;
 
-	for (i = IDE; i < MAX_PERF_CHN; i++) {
-		if (!memcmp(type_guid->b, hp_devs[i].guid,
-				 sizeof(uuid_le))) {
-			perf_chn = true;
-			break;
-		}
-	}
 	if ((vmbus_proto_version == VERSION_WS2008) ||
 	    (vmbus_proto_version == VERSION_WIN7) || (!perf_chn)) {
 		/*
@@ -414,46 +510,137 @@ static void init_vp_index(struct vmbus_channel *channel, uuid_le *type_guid)
 		 * Also if the channel is not a performance critical
 		 * channel, bind it to cpu 0.
 		 */
+		channel->numa_node = 0;
 		channel->target_cpu = 0;
 		channel->target_vp = hv_context.vp_index[0];
 		return;
 	}
-	cur_cpu = (++next_vp % max_cpus);
+
+	/*
+	 * We distribute primary channels evenly across all the available
+	 * NUMA nodes and within the assigned NUMA node we will assign the
+	 * first available CPU to the primary channel.
+	 * The sub-channels will be assigned to the CPUs available in the
+	 * NUMA node evenly.
+	 */
+	if (!primary) {
+		while (true) {
+			next_node = next_numa_node_id++;
+			if (next_node == nr_node_ids)
+				next_node = next_numa_node_id = 0;
+			if (cpumask_empty(cpumask_of_node(next_node)))
+				continue;
+			break;
+		}
+		channel->numa_node = next_node;
+		primary = channel;
+	}
+	alloced_mask = &hv_context.hv_numa_map[primary->numa_node];
+
+	if (cpumask_weight(alloced_mask) ==
+	    cpumask_weight(cpumask_of_node(primary->numa_node))) {
+		/*
+		 * We have cycled through all the CPUs in the node;
+		 * reset the alloced map.
+		 */
+		cpumask_clear(alloced_mask);
+	}
+
+	cpumask_xor(&available_mask, alloced_mask,
+		    cpumask_of_node(primary->numa_node));
+
+	cur_cpu = -1;
+
+	/*
+	 * Normally Hyper-V host doesn't create more subchannels than there
+	 * are VCPUs on the node but it is possible when not all present VCPUs
+	 * on the node are initialized by guest. Clear the alloced_cpus_in_node
+	 * to start over.
+	 */
+	if (cpumask_equal(&primary->alloced_cpus_in_node,
+			  cpumask_of_node(primary->numa_node)))
+		cpumask_clear(&primary->alloced_cpus_in_node);
+
+	while (true) {
+		cur_cpu = cpumask_next(cur_cpu, &available_mask);
+		if (cur_cpu >= nr_cpu_ids) {
+			cur_cpu = -1;
+			cpumask_copy(&available_mask,
+				     cpumask_of_node(primary->numa_node));
+			continue;
+		}
+
+		/*
+		 * NOTE: in the case of sub-channel, we clear the sub-channel
+		 * related bit(s) in primary->alloced_cpus_in_node in
+		 * hv_process_channel_removal(), so when we reload drivers
+		 * like hv_netvsc in SMP guest, here we're able to re-allocate
+		 * bit from primary->alloced_cpus_in_node.
+		 */
+		if (!cpumask_test_cpu(cur_cpu,
+				&primary->alloced_cpus_in_node)) {
+			cpumask_set_cpu(cur_cpu,
+					&primary->alloced_cpus_in_node);
+			cpumask_set_cpu(cur_cpu, alloced_mask);
+			break;
+		}
+	}
+
 	channel->target_cpu = cur_cpu;
 	channel->target_vp = hv_context.vp_index[cur_cpu];
 }
 
 static void vmbus_wait_for_unload(void)
 {
-	int cpu = smp_processor_id();
-	void *page_addr = hv_context.synic_message_page[cpu];
-	struct hv_message *msg = (struct hv_message *)page_addr +
-				  VMBUS_MESSAGE_SINT;
+	int cpu;
+	void *page_addr;
+	struct hv_message *msg;
 	struct vmbus_channel_message_header *hdr;
-	bool unloaded = false;
+	u32 message_type;
 
+	/*
+	 * CHANNELMSG_UNLOAD_RESPONSE is always delivered to the CPU which was
+	 * used for initial contact or to CPU0 depending on host version. When
+	 * we're crashing on a different CPU let's hope that IRQ handler on
+	 * the cpu which receives CHANNELMSG_UNLOAD_RESPONSE is still
+	 * functional and vmbus_unload_response() will complete
+	 * vmbus_connection.unload_event. If not, the last thing we can do is
+	 * read message pages for all CPUs directly.
+	 */
 	while (1) {
-		if (READ_ONCE(msg->header.message_type) == HVMSG_NONE) {
-			mdelay(10);
-			continue;
+		if (completion_done(&vmbus_connection.unload_event))
+			break;
+
+		for_each_online_cpu(cpu) {
+			page_addr = hv_context.synic_message_page[cpu];
+			msg = (struct hv_message *)page_addr +
+				VMBUS_MESSAGE_SINT;
+
+			message_type = READ_ONCE(msg->header.message_type);
+			if (message_type == HVMSG_NONE)
+				continue;
+
+			hdr = (struct vmbus_channel_message_header *)
+				msg->u.payload;
+
+			if (hdr->msgtype == CHANNELMSG_UNLOAD_RESPONSE)
+				complete(&vmbus_connection.unload_event);
+
+			vmbus_signal_eom(msg, message_type);
 		}
 
-		hdr = (struct vmbus_channel_message_header *)msg->u.payload;
-		if (hdr->msgtype == CHANNELMSG_UNLOAD_RESPONSE)
-			unloaded = true;
+		mdelay(10);
+	}
 
+	/*
+	 * We're crashing and already got the UNLOAD_RESPONSE, cleanup all
+	 * maybe-pending messages on all CPUs to be able to receive new
+	 * messages after we reconnect.
+	 */
+	for_each_online_cpu(cpu) {
+		page_addr = hv_context.synic_message_page[cpu];
+		msg = (struct hv_message *)page_addr + VMBUS_MESSAGE_SINT;
 		msg->header.message_type = HVMSG_NONE;
-		/*
-		 * header.message_type needs to be written before we do
-		 * wrmsrl() below.
-		 */
-		mb();
-
-		if (msg->header.message_flags.msg_pending)
-			wrmsrl(HV_X64_MSR_EOM, 0);
-
-		if (unloaded)
-			break;
 	}
 }
 
@@ -469,7 +656,7 @@ static void vmbus_unload_response(struct vmbus_channel_message_header *hdr)
 	complete(&vmbus_connection.unload_event);
 }
 
-void vmbus_initiate_unload(void)
+void vmbus_initiate_unload(bool crash)
 {
 	struct vmbus_channel_message_header hdr;
 
@@ -486,7 +673,7 @@ void vmbus_initiate_unload(void)
 	 * vmbus_initiate_unload() is also called on crash and the crash can be
 	 * happening in an interrupt context, where scheduling is impossible.
 	 */
-	if (!in_interrupt())
+	if (!crash)
 		wait_for_completion(&vmbus_connection.unload_event);
 	else
 		vmbus_wait_for_unload();
@@ -536,8 +723,6 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
 		newchannel->sig_event->connectionid.u.id =
 				offer->connection_id;
 	}
-
-	init_vp_index(newchannel, &offer->offer.if_type);
 
 	memcpy(&newchannel->offermsg, offer,
 	       sizeof(struct vmbus_channel_offer_channel));
@@ -859,21 +1044,30 @@ cleanup:
 
 /*
  * Retrieve the (sub) channel on which to send an outgoing request.
- * When a primary channel has multiple sub-channels, we choose a
- * channel whose VCPU binding is closest to the VCPU on which
- * this call is being made.
+ * When a primary channel has multiple sub-channels, we try to
+ * distribute the load equally amongst all available channels.
  */
 struct vmbus_channel *vmbus_get_outgoing_channel(struct vmbus_channel *primary)
 {
 	struct list_head *cur, *tmp;
-	int cur_cpu = hv_context.vp_index[smp_processor_id()];
+	int cur_cpu;
 	struct vmbus_channel *cur_channel;
 	struct vmbus_channel *outgoing_channel = primary;
-	int cpu_distance, new_cpu_distance;
+	int next_channel;
+	int i = 1;
 
 	if (list_empty(&primary->sc_list))
 		return outgoing_channel;
 
+	next_channel = primary->next_oc++;
+
+	if (next_channel > (primary->num_sc)) {
+		primary->next_oc = 0;
+		return outgoing_channel;
+	}
+
+	cur_cpu = hv_context.vp_index[get_cpu()];
+	put_cpu();
 	list_for_each_safe(cur, tmp, &primary->sc_list) {
 		cur_channel = list_entry(cur, struct vmbus_channel, sc_list);
 		if (cur_channel->state != CHANNEL_OPENED_STATE)
@@ -882,18 +1076,10 @@ struct vmbus_channel *vmbus_get_outgoing_channel(struct vmbus_channel *primary)
 		if (cur_channel->target_vp == cur_cpu)
 			return cur_channel;
 
-		cpu_distance = ((outgoing_channel->target_vp > cur_cpu) ?
-				(outgoing_channel->target_vp - cur_cpu) :
-				(cur_cpu - outgoing_channel->target_vp));
+		if (i == next_channel)
+			return cur_channel;
 
-		new_cpu_distance = ((cur_channel->target_vp > cur_cpu) ?
-				(cur_channel->target_vp - cur_cpu) :
-				(cur_cpu - cur_channel->target_vp));
-
-		if (cpu_distance < new_cpu_distance)
-			continue;
-
-		outgoing_channel = cur_channel;
+		i++;
 	}
 
 	return outgoing_channel;

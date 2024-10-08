@@ -22,6 +22,9 @@ obj-$(CONFIG_NF_DEFRAG_IPV4) += nf_defrag_ipv4.o
 # logging
 obj-$(CONFIG_NF_LOG_IPV4) += nf_log_ipv4.o
 
+# reject
+obj-$(CONFIG_NF_REJECT_IPV4) += nf_reject_ipv4.o
+
 # NAT helpers (nf_conntrack)
 obj-$(CONFIG_NF_NAT_H323) += nf_nat_h323.o
 obj-$(CONFIG_NF_NAT_PPTP) += nf_nat_pptp.o
@@ -37,6 +40,7 @@ obj-$(CONFIG_NFT_CHAIN_NAT_IPV4) += nft_chain_nat_ipv4.o
 obj-$(CONFIG_NFT_REJECT_IPV4) += nft_reject_ipv4.o
 obj-$(CONFIG_NFT_MASQ_IPV4) += nft_masq_ipv4.o
 obj-$(CONFIG_NFT_REDIR_IPV4) += nft_redir_ipv4.o
+obj-$(CONFIG_NFT_DUP_IPV4) += nft_dup_ipv4.o
 obj-$(CONFIG_NF_TABLES_ARP) += nf_tables_arp.o
 
 # generic IP tables 
@@ -67,3 +71,5 @@ obj-$(CONFIG_IP_NF_ARP_MANGLE) += arpt_mangle.o
 
 # just filtering instance of ARP tables for now
 obj-$(CONFIG_IP_NF_ARPFILTER) += arptable_filter.o
+
+obj-$(CONFIG_NF_DUP_IPV4) += nf_dup_ipv4.o

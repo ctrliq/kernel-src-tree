@@ -530,13 +530,10 @@ void blk_cleanup_queue(struct request_queue *q)
 	 * Drain all requests queued before DYING marking. Set DEAD flag to
 	 * prevent that q->request_fn() gets invoked after draining finished.
 	 */
-	if (q->mq_ops) {
-		blk_mq_freeze_queue(q);
-		spin_lock_irq(lock);
-	} else {
-		spin_lock_irq(lock);
+	blk_freeze_queue(q);
+	spin_lock_irq(lock);
+	if (!q->mq_ops)
 		__blk_drain_queue(q, true);
-	}
 	queue_flag_set(QUEUE_FLAG_DEAD, q);
 	spin_unlock_irq(lock);
 
@@ -549,6 +546,7 @@ void blk_cleanup_queue(struct request_queue *q)
 
 	if (q->mq_ops)
 		blk_mq_free_queue(q);
+	percpu_ref_exit(&q->q_usage_counter);
 
 	spin_lock_irq(lock);
 	if (q->queue_lock != &q->__queue_lock)
@@ -593,9 +591,60 @@ struct request_queue *blk_alloc_queue(gfp_t gfp_mask)
 }
 EXPORT_SYMBOL(blk_alloc_queue);
 
+static void queue_limits_init_aux(struct request_queue *q, struct queue_limits_aux *limits_aux)
+{
+	if (!limits_aux)
+	    return;
+
+	memset(limits_aux, 0, sizeof(*limits_aux));
+	q->limits.limits_aux = limits_aux;
+}
+
+int blk_queue_enter(struct request_queue *q, gfp_t gfp)
+{
+	while (true) {
+		int ret;
+
+		if (percpu_ref_tryget_live(&q->q_usage_counter))
+			return 0;
+
+		if (!(gfp & __GFP_WAIT))
+			return -EBUSY;
+
+		ret = wait_event_interruptible(q->mq_freeze_wq,
+				!atomic_read(&q->mq_freeze_depth) ||
+				blk_queue_dying(q));
+		if (blk_queue_dying(q))
+			return -ENODEV;
+		if (ret)
+			return ret;
+	}
+}
+
+void blk_queue_exit(struct request_queue *q)
+{
+	percpu_ref_put(&q->q_usage_counter);
+}
+
+static void blk_queue_usage_counter_release(struct percpu_ref *ref)
+{
+	struct request_queue *q =
+		container_of(ref, struct request_queue, q_usage_counter);
+
+	wake_up_all(&q->mq_freeze_wq);
+}
+
+static void blk_rq_timed_out_timer(unsigned long data)
+{
+	struct request_queue *q = (struct request_queue *)data;
+
+	kblockd_schedule_work(&q->timeout_work);
+}
+
 struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 {
 	struct request_queue *q;
+	struct queue_limits_aux *limits_aux = NULL;
 	int err;
 
 	q = kmem_cache_alloc_node(blk_requestq_cachep,
@@ -613,6 +662,10 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	q->backing_dev_info.capabilities = BDI_CAP_MAP_COPY;
 	q->backing_dev_info.name = "block";
 	q->node = node_id;
+
+	/* Initialize auxillary shadow structure used to extend struct queue_limits */
+	limits_aux = (struct queue_limits_aux *)&q[1];
+	queue_limits_init_aux(q, limits_aux);
 
 	err = bdi_init(&q->backing_dev_info);
 	if (err)
@@ -651,11 +704,22 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 
 	init_waitqueue_head(&q->mq_freeze_wq);
 
-	if (blkcg_init_queue(q))
+	/*
+	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
+	 * See blk_register_queue() for details.
+	 */
+	if (percpu_ref_init(&q->q_usage_counter,
+				blk_queue_usage_counter_release,
+				PERCPU_REF_INIT_ATOMIC, GFP_KERNEL))
 		goto fail_bdi;
+
+	if (blkcg_init_queue(q))
+		goto fail_ref;
 
 	return q;
 
+fail_ref:
+	percpu_ref_exit(&q->q_usage_counter);
 fail_bdi:
 	bdi_destroy(&q->backing_dev_info);
 fail_id:
@@ -736,6 +800,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
 		goto fail;
 
+	INIT_WORK(&q->timeout_work, blk_timeout_work);
 	q->request_fn		= rfn;
 	q->prep_rq_fn		= NULL;
 	q->unprep_rq_fn		= NULL;
@@ -1945,9 +2010,19 @@ void generic_make_request(struct bio *bio)
 	do {
 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 
-		q->make_request_fn(q, bio);
+		if (likely(blk_queue_enter(q, __GFP_WAIT) == 0)) {
 
-		bio = bio_list_pop(current->bio_list);
+			q->make_request_fn(q, bio);
+
+			blk_queue_exit(q);
+
+			bio = bio_list_pop(current->bio_list);
+		} else {
+			struct bio *bio_next = bio_list_pop(current->bio_list);
+
+			bio_io_error(bio);
+			bio = bio_next;
+		}
 	} while (bio);
 	current->bio_list = NULL; /* deactivate */
 }
@@ -2002,7 +2077,8 @@ void submit_bio(int rw, struct bio *bio)
 EXPORT_SYMBOL(submit_bio);
 
 /**
- * blk_rq_check_limits - Helper function to check a request for the queue limit
+ * blk_cloned_rq_check_limits - Helper function to check a cloned request
+ *                              for new the queue limits
  * @q:  the queue
  * @rq: the request being checked
  *
@@ -2013,20 +2089,13 @@ EXPORT_SYMBOL(submit_bio);
  *    after it is inserted to @q, it should be checked against @q before
  *    the insertion using this generic function.
  *
- *    This function should also be useful for request stacking drivers
- *    in some cases below, so export this function.
  *    Request stacking drivers like request-based dm may change the queue
- *    limits while requests are in the queue (e.g. dm's table swapping).
- *    Such request stacking drivers should check those requests agaist
- *    the new queue limits again when they dispatch those requests,
- *    although such checkings are also done against the old queue limits
- *    when submitting requests.
+ *    limits when retrying requests on other queues. Those requests need
+ *    to be checked against the new queue limits again during dispatch.
  */
-int blk_rq_check_limits(struct request_queue *q, struct request *rq)
+static int blk_cloned_rq_check_limits(struct request_queue *q,
+				      struct request *rq)
 {
-	if (!rq_mergeable(rq))
-		return 0;
-
 	if (blk_rq_sectors(rq) > blk_queue_get_max_sectors(q, rq->cmd_flags)) {
 		printk(KERN_ERR "%s: over max size limit.\n", __func__);
 		return -EIO;
@@ -2046,7 +2115,6 @@ int blk_rq_check_limits(struct request_queue *q, struct request *rq)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(blk_rq_check_limits);
 
 /**
  * blk_insert_cloned_request - Helper for stacking drivers to submit a request
@@ -2058,7 +2126,7 @@ int blk_insert_cloned_request(struct request_queue *q, struct request *rq)
 	unsigned long flags;
 	int where = ELEVATOR_INSERT_BACK;
 
-	if (blk_rq_check_limits(q, rq))
+	if (blk_cloned_rq_check_limits(q, rq))
 		return -EIO;
 
 	if (rq->rq_disk &&
@@ -3365,7 +3433,8 @@ int __init blk_dev_init(void)
 			sizeof(struct request), 0, SLAB_PANIC, NULL);
 
 	blk_requestq_cachep = kmem_cache_create("blkdev_queue",
-			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
+						sizeof(struct request_queue) + sizeof(struct queue_limits_aux), 
+						0, SLAB_PANIC, NULL);
 
 	return 0;
 }

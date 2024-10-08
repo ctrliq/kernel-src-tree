@@ -39,6 +39,10 @@ DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
 
 typedef struct {
 	unsigned int irq_hv_callback_count;
+#ifdef CONFIG_X86_MCE_AMD
+	unsigned int irq_deferred_error_count;
+#endif
+	unsigned int kvm_posted_intr_wakeup_ipis;
 } ____cacheline_aligned rh_irq_cpustat_t;
 
 DECLARE_PER_CPU_SHARED_ALIGNED(rh_irq_cpustat_t, rh_irq_stat);

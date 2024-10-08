@@ -261,6 +261,25 @@ static void irqfd_update(struct kvm *kvm, struct kvm_kernel_irqfd *irqfd)
 	write_seqcount_end(&irqfd->irq_entry_sc);
 }
 
+#ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
+void __attribute__((weak)) kvm_arch_irq_bypass_stop(
+				struct irq_bypass_consumer *cons)
+{
+}
+
+void __attribute__((weak)) kvm_arch_irq_bypass_start(
+				struct irq_bypass_consumer *cons)
+{
+}
+
+int  __attribute__((weak)) kvm_arch_update_irqfd_routing(
+				struct kvm *kvm, unsigned int host_irq,
+				uint32_t guest_irq, bool set)
+{
+	return 0;
+}
+#endif
+
 static int
 kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 {
@@ -386,15 +405,17 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 	 */
 	fdput(f);
 #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
-	irqfd->consumer.token = (void *)irqfd->eventfd;
-	irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
-	irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
-	irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
-	irqfd->consumer.start = kvm_arch_irq_bypass_start;
-	ret = irq_bypass_register_consumer(&irqfd->consumer);
-	if (ret)
-		pr_info("irq bypass consumer (token %p) registration fails: %d\n",
+	if (kvm_arch_has_irq_bypass()) {
+		irqfd->consumer.token = (void *)irqfd->eventfd;
+		irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
+		irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
+		irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
+		irqfd->consumer.start = kvm_arch_irq_bypass_start;
+		ret = irq_bypass_register_consumer(&irqfd->consumer);
+		if (ret)
+			pr_info("irq bypass consumer (token %p) registration fails: %d\n",
 				irqfd->consumer.token, ret);
+	}
 #endif
 
 	return 0;
@@ -582,8 +603,18 @@ void kvm_irq_routing_update(struct kvm *kvm)
 
 	spin_lock_irq(&kvm->irqfds.lock);
 
-	list_for_each_entry(irqfd, &kvm->irqfds.items, list)
+	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
 		irqfd_update(kvm, irqfd);
+
+#ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
+		if (irqfd->producer) {
+			int ret = kvm_arch_update_irqfd_routing(
+					irqfd->kvm, irqfd->producer->irq,
+					irqfd->gsi, 1);
+			WARN_ON(ret);
+		}
+#endif
+	}
 
 	spin_unlock_irq(&kvm->irqfds.lock);
 }
@@ -888,9 +919,7 @@ kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 		return -EINVAL;
 
 	/* ioeventfd with no length can't be combined with DATAMATCH */
-	if (!args->len &&
-	    args->flags & (KVM_IOEVENTFD_FLAG_PIO |
-			   KVM_IOEVENTFD_FLAG_DATAMATCH))
+	if (!args->len && (args->flags & KVM_IOEVENTFD_FLAG_DATAMATCH))
 		return -EINVAL;
 
 	ret = kvm_assign_ioeventfd_idx(kvm, bus_idx, args);

@@ -105,7 +105,7 @@ static int ip6_finish_output2(struct sock *sk, struct sk_buff *skb)
 	}
 
 	rcu_read_lock_bh();
-	nexthop = rt6_nexthop((struct rt6_info *)dst);
+	nexthop = rt6_nexthop((struct rt6_info *)dst, &ipv6_hdr(skb)->daddr);
 	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
 	if (unlikely(!neigh))
 		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
@@ -333,7 +333,7 @@ static bool ip6_pkt_too_big(const struct sk_buff *skb, unsigned int mtu)
 	if (skb->ignore_df)
 		return false;
 
-	if (skb_is_gso(skb) && skb_gso_network_seglen(skb) <= mtu)
+	if (skb_is_gso(skb) && skb_gso_validate_mtu(skb, mtu))
 		return false;
 
 	return true;
@@ -437,7 +437,7 @@ int ip6_forward(struct sk_buff *skb)
 		else
 			target = &hdr->daddr;
 
-		peer = inet_getpeer_v6(net->ipv6.peers, &rt->rt6i_dst.addr, 1);
+		peer = inet_getpeer_v6(net->ipv6.peers, &hdr->daddr, 1);
 
 		/* Limit redirects both by destination (here)
 		   and by source (inside ndisc_send_redirect)
@@ -531,7 +531,7 @@ int ip6_fragment(struct sock *sk, struct sk_buff *skb,
 	struct frag_hdr *fh;
 	unsigned int mtu, hlen, left, len;
 	int hroom, troom;
-	__be32 frag_id = 0;
+	__be32 frag_id;
 	int ptr, offset = 0, err=0;
 	u8 *prevhdr, nexthdr = 0;
 	struct net *net = dev_net(skb_dst(skb)->dev);
@@ -563,6 +563,13 @@ int ip6_fragment(struct sock *sk, struct sk_buff *skb,
 			mtu = np->frag_size;
 	}
 	mtu -= hlen + sizeof(struct frag_hdr);
+
+	frag_id = ipv6_select_ident(net, &ipv6_hdr(skb)->daddr,
+				    &ipv6_hdr(skb)->saddr);
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+	    (err = skb_checksum_help(skb)))
+		goto fail;
 
 	if (skb_has_frag_list(skb)) {
 		int first_len = skb_pagelen(skb);
@@ -612,11 +619,10 @@ int ip6_fragment(struct sock *sk, struct sk_buff *skb,
 		skb_reset_network_header(skb);
 		memcpy(skb_network_header(skb), tmp_hdr, hlen);
 
-		ipv6_select_ident(fh, rt);
 		fh->nexthdr = nexthdr;
 		fh->reserved = 0;
 		fh->frag_off = htons(IP6_MF);
-		frag_id = fh->identification;
+		fh->identification = frag_id;
 
 		first_len = skb_pagelen(skb);
 		skb->data_len = first_len - skb_headlen(skb);
@@ -694,10 +700,6 @@ slow_path_clean:
 	}
 
 slow_path:
-	if ((skb->ip_summed == CHECKSUM_PARTIAL) &&
-	    skb_checksum_help(skb))
-		goto fail;
-
 	left = skb->len - hlen;		/* Space per frame */
 	ptr = hlen;			/* Where to start from */
 
@@ -764,11 +766,7 @@ slow_path:
 		 */
 		fh->nexthdr = nexthdr;
 		fh->reserved = 0;
-		if (!frag_id) {
-			ipv6_select_ident(fh, rt);
-			frag_id = fh->identification;
-		} else
-			fh->identification = frag_id;
+		fh->identification = frag_id;
 
 		/*
 		 *	Copy a block of the IP datagram.
@@ -862,10 +860,9 @@ out:
 	return dst;
 }
 
-static int ip6_dst_lookup_tail(struct sock *sk,
+static int ip6_dst_lookup_tail(struct net *net, struct sock *sk,
 			       struct dst_entry **dst, struct flowi6 *fl6)
 {
-	struct net *net = sock_net(sk);
 #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
 	struct neighbour *n;
 	struct rt6_info *rt;
@@ -898,7 +895,8 @@ static int ip6_dst_lookup_tail(struct sock *sk,
 	 */
 	rt = (struct rt6_info *) *dst;
 	rcu_read_lock_bh();
-	n = __ipv6_neigh_lookup_noref(rt->dst.dev, rt6_nexthop(rt));
+	n = __ipv6_neigh_lookup_noref(rt->dst.dev,
+				      rt6_nexthop(rt, &fl6->daddr));
 	err = n && !(n->nud_state & NUD_VALID) ? -EINVAL : 0;
 	rcu_read_unlock_bh();
 
@@ -949,10 +947,11 @@ out_err_release:
  *
  *	It returns zero on success, or a standard errno code on error.
  */
-int ip6_dst_lookup(struct sock *sk, struct dst_entry **dst, struct flowi6 *fl6)
+int ip6_dst_lookup(struct net *net, struct sock *sk, struct dst_entry **dst,
+		   struct flowi6 *fl6)
 {
 	*dst = NULL;
-	return ip6_dst_lookup_tail(sk, dst, fl6);
+	return ip6_dst_lookup_tail(net, sk, dst, fl6);
 }
 EXPORT_SYMBOL_GPL(ip6_dst_lookup);
 
@@ -973,7 +972,7 @@ struct dst_entry *ip6_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
 	struct dst_entry *dst = NULL;
 	int err;
 
-	err = ip6_dst_lookup_tail(sk, &dst, fl6);
+	err = ip6_dst_lookup_tail(sock_net(sk), sk, &dst, fl6);
 	if (err)
 		return ERR_PTR(err);
 	if (final_dst)
@@ -1003,17 +1002,12 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
 					 const struct in6_addr *final_dst)
 {
 	struct dst_entry *dst = sk_dst_check(sk, inet6_sk(sk)->dst_cookie);
-	int err;
 
 	dst = ip6_sk_dst_check(sk, dst, fl6);
+	if (!dst)
+		dst = ip6_dst_lookup_flow(sk, fl6, final_dst);
 
-	err = ip6_dst_lookup_tail(sk, &dst, fl6);
-	if (err)
-		return ERR_PTR(err);
-	if (final_dst)
-		fl6->daddr = *final_dst;
-
-	return xfrm_lookup_route(sock_net(sk), dst, flowi6_to_flowi(fl6), sk, 0);
+	return dst;
 }
 EXPORT_SYMBOL_GPL(ip6_sk_dst_lookup_flow);
 
@@ -1022,12 +1016,11 @@ static inline int ip6_ufo_append_data(struct sock *sk,
 			int getfrag(void *from, char *to, int offset, int len,
 			int odd, struct sk_buff *skb),
 			void *from, int length, int hh_len, int fragheaderlen,
-			int transhdrlen, int mtu,unsigned int flags,
-			struct rt6_info *rt)
+			int exthdrlen, int transhdrlen, int mtu,
+			unsigned int flags, const struct flowi6 *fl6)
 
 {
 	struct sk_buff *skb;
-	struct frag_hdr fhdr;
 	int err;
 
 	/* There is support for UDP large send offload by network
@@ -1049,7 +1042,7 @@ static inline int ip6_ufo_append_data(struct sock *sk,
 		skb_put(skb,fragheaderlen + transhdrlen);
 
 		/* initialize network header pointer */
-		skb_reset_network_header(skb);
+		skb_set_network_header(skb, exthdrlen);
 
 		/* initialize protocol header pointer */
 		skb->transport_header = skb->network_header + fragheaderlen;
@@ -1068,8 +1061,9 @@ static inline int ip6_ufo_append_data(struct sock *sk,
 	skb_shinfo(skb)->gso_size = (mtu - fragheaderlen -
 				     sizeof(struct frag_hdr)) & ~7;
 	skb_shinfo(skb)->gso_type = SKB_GSO_UDP;
-	ipv6_select_ident(&fhdr, rt);
-	skb_shinfo(skb)->ip6_frag_id = fhdr.identification;
+	skb_shinfo(skb)->ip6_frag_id = ipv6_select_ident(sock_net(sk),
+							 &fl6->daddr,
+							 &fl6->saddr);
 
 append:
 	return skb_append_datato_frags(sk, skb, getfrag, from,
@@ -1203,6 +1197,7 @@ static int __ip6_append_data(struct sock *sk,
 	struct rt6_info *rt = (struct rt6_info *)cork->dst;
 	struct ipv6_txoptions *opt = v6_cork->opt;
 	int csummode = CHECKSUM_NONE;
+	unsigned int maxnonfragsize, headersize;
 
 	skb = skb_peek_tail(queue);
 	if (!skb) {
@@ -1220,53 +1215,47 @@ static int __ip6_append_data(struct sock *sk,
 	maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen -
 		     sizeof(struct frag_hdr);
 
-	if (mtu <= sizeof(struct ipv6hdr) + IPV6_MAXPLEN) {
-		unsigned int maxnonfragsize, headersize;
+	headersize = sizeof(struct ipv6hdr) +
+		     (opt ? opt->opt_flen + opt->opt_nflen : 0) +
+		     (dst_allfrag(&rt->dst) ?
+		      sizeof(struct frag_hdr) : 0) +
+		     rt->rt6i_nfheader_len;
 
-		headersize = sizeof(struct ipv6hdr) +
-			     (opt ? opt->opt_flen + opt->opt_nflen : 0) +
-			     (dst_allfrag(&rt->dst) ?
-			      sizeof(struct frag_hdr) : 0) +
-			     rt->rt6i_nfheader_len;
-
-		if (ip6_sk_ignore_df(sk))
-			maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
-		else
-			maxnonfragsize = mtu;
-
-		/* dontfrag active */
-		if ((cork->length + length > mtu - headersize) && dontfrag &&
-		    (sk->sk_protocol == IPPROTO_UDP ||
-		     sk->sk_protocol == IPPROTO_RAW)) {
-			ipv6_local_rxpmtu(sk, fl6, mtu - headersize +
-						   sizeof(struct ipv6hdr));
-			goto emsgsize;
-		}
-
-		if (cork->length + length > maxnonfragsize - headersize) {
-emsgsize:
-			ipv6_local_error(sk, EMSGSIZE, fl6,
-					 mtu - headersize +
-					 sizeof(struct ipv6hdr));
-			return -EMSGSIZE;
-		}
+	if (cork->length + length > mtu - headersize && dontfrag &&
+	    (sk->sk_protocol == IPPROTO_UDP ||
+	     sk->sk_protocol == IPPROTO_RAW)) {
+		ipv6_local_rxpmtu(sk, fl6, mtu - headersize +
+				sizeof(struct ipv6hdr));
+		goto emsgsize;
 	}
+
+	if (ip6_sk_ignore_df(sk))
+		maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
+	else
+		maxnonfragsize = mtu;
+
+	if (cork->length + length > maxnonfragsize - headersize) {
+emsgsize:
+		ipv6_local_error(sk, EMSGSIZE, fl6,
+				 mtu - headersize +
+				 sizeof(struct ipv6hdr));
+		return -EMSGSIZE;
+	}
+
+	/* CHECKSUM_PARTIAL only with no extension headers and when
+	 * we are not going to fragment
+	 */
+	if (transhdrlen && sk->sk_protocol == IPPROTO_UDP &&
+	    headersize == sizeof(struct ipv6hdr) &&
+	    length < mtu - headersize &&
+	    !(flags & MSG_MORE) &&
+	    rt->dst.dev->features & (NETIF_F_IPV6_CSUM | NETIF_F_HW_CSUM))
+		csummode = CHECKSUM_PARTIAL;
 
 	/* For UDP, check if TX timestamp is enabled */
 	if (sk->sk_type == SOCK_DGRAM)
 		sock_tx_timestamp(sk, &tx_flags);
 
-	/* If this is the first and only packet and device
-	 * supports checksum offloading, let's use it.
-	 * Use transhdrlen, same as IPv4, because partial
-	 * sums only work when transhdrlen is set.
-	 */
-	if (transhdrlen && sk->sk_protocol == IPPROTO_UDP &&
-	    !(flags & MSG_MORE) &&
-	    length + fragheaderlen < mtu &&
-	    rt->dst.dev->features & NETIF_F_V6_CSUM &&
-	    !exthdrlen)
-		csummode = CHECKSUM_PARTIAL;
 	/*
 	 * Let's try using as much space as possible.
 	 * Use MTU if total length of the message fits into the MTU.
@@ -1289,8 +1278,8 @@ emsgsize:
 	    (sk->sk_protocol == IPPROTO_UDP) &&
 	    (rt->dst.dev->features & NETIF_F_UFO)) {
 		err = ip6_ufo_append_data(sk, queue, getfrag, from, length,
-					  hh_len, fragheaderlen,
-					  transhdrlen, mtu, flags, rt);
+					  hh_len, fragheaderlen, exthdrlen,
+					  transhdrlen, mtu, flags, fl6);
 		if (err)
 			goto error;
 		return 0;

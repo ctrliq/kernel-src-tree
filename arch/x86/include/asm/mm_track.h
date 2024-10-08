@@ -29,6 +29,7 @@ static inline void mm_track_pmd(pmd_t *pmdp)	{}
 static inline void mm_track_pud(pud_t *pudp)	{}
 static inline void mm_track_pgd(pgd_t *pgdp) 	{}
 static inline void mm_track_phys(void *physp)	{}
+static inline int harvest_user(void) { return 0; }
 
 #else
 
@@ -68,6 +69,7 @@ extern void do_mm_track_pmd(void *);
 extern void do_mm_track_pud(void *);
 extern void do_mm_track_pgd(void *);
 extern void do_mm_track_phys(void *);
+extern int harvest_user(void);
 
 /*
  * The mm_track routine is needed by macros in pgtable.h

@@ -24,6 +24,7 @@
 #include <linux/err.h>
 #include <linux/irqflags.h>
 #include <linux/context_tracking.h>
+#include <linux/irqbypass.h>
 #include <asm/signal.h>
 
 #include <linux/kvm.h>
@@ -69,7 +70,7 @@
  * error pfns indicate that the gfn is in slot but faild to
  * translate it to pfn on host.
  */
-static inline bool is_error_pfn(pfn_t pfn)
+static inline bool is_error_pfn(kvm_pfn_t pfn)
 {
 	return !!(pfn & KVM_PFN_ERR_MASK);
 }
@@ -79,13 +80,13 @@ static inline bool is_error_pfn(pfn_t pfn)
  * translated to pfn - it is not in slot or failed to
  * translate it to pfn.
  */
-static inline bool is_error_noslot_pfn(pfn_t pfn)
+static inline bool is_error_noslot_pfn(kvm_pfn_t pfn)
 {
 	return !!(pfn & KVM_PFN_ERR_NOSLOT_MASK);
 }
 
 /* noslot pfn indicates that the gfn is not in slot. */
-static inline bool is_noslot_pfn(pfn_t pfn)
+static inline bool is_noslot_pfn(kvm_pfn_t pfn)
 {
 	return pfn == KVM_PFN_NOSLOT;
 }
@@ -141,6 +142,7 @@ static inline bool is_error_page(struct page *page)
 #define KVM_REQ_GLOBAL_CLOCK_UPDATE 22
 #define KVM_REQ_APIC_PAGE_RELOAD  25
 #define KVM_REQ_SMI               26
+#define KVM_REQ_IOAPIC_EOI_EXIT   28
 
 #define KVM_USERSPACE_IRQ_SOURCE_ID		0
 #define KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID	1
@@ -232,6 +234,9 @@ struct kvm_vcpu {
 	unsigned long requests;
 	unsigned long guest_debug;
 
+	int pre_pcpu;
+	struct list_head blocked_vcpu_list;
+
 	struct mutex mutex;
 	struct kvm_run *run;
 
@@ -320,6 +325,18 @@ struct kvm_kernel_irq_routing_entry {
 	};
 	struct hlist_node link;
 };
+
+#ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
+struct kvm_irq_routing_table {
+	int chip[KVM_NR_IRQCHIPS][KVM_IRQCHIP_NUM_PINS];
+	u32 nr_rt_entries;
+	/*
+	 * Array indexed by gsi. Each entry contains list of irq chips
+	 * the gsi is connected to.
+	 */
+	struct hlist_head map[0];
+};
+#endif
 
 #ifndef KVM_PRIVATE_MEM_SLOTS
 #define KVM_PRIVATE_MEM_SLOTS 0
@@ -447,8 +464,12 @@ void vcpu_put(struct kvm_vcpu *vcpu);
 
 #ifdef __KVM_HAVE_IOAPIC
 void kvm_vcpu_request_scan_ioapic(struct kvm *kvm);
+void kvm_arch_irq_routing_update(struct kvm *kvm);
 #else
 static inline void kvm_vcpu_request_scan_ioapic(struct kvm *kvm)
+{
+}
+static inline void kvm_arch_irq_routing_update(struct kvm *kvm)
 {
 }
 #endif
@@ -561,19 +582,20 @@ void kvm_release_page_clean(struct page *page);
 void kvm_release_page_dirty(struct page *page);
 void kvm_set_page_accessed(struct page *page);
 
-pfn_t gfn_to_pfn_atomic(struct kvm *kvm, gfn_t gfn);
-pfn_t gfn_to_pfn(struct kvm *kvm, gfn_t gfn);
-pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
+kvm_pfn_t gfn_to_pfn_atomic(struct kvm *kvm, gfn_t gfn);
+kvm_pfn_t gfn_to_pfn(struct kvm *kvm, gfn_t gfn);
+kvm_pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
 		      bool *writable);
-pfn_t gfn_to_pfn_memslot(struct kvm_memory_slot *slot, gfn_t gfn);
-pfn_t gfn_to_pfn_memslot_atomic(struct kvm_memory_slot *slot, gfn_t gfn);
-pfn_t __gfn_to_pfn_memslot(struct kvm_memory_slot *slot, gfn_t gfn, bool atomic,
-			   bool *async, bool write_fault, bool *writable);
+kvm_pfn_t gfn_to_pfn_memslot(struct kvm_memory_slot *slot, gfn_t gfn);
+kvm_pfn_t gfn_to_pfn_memslot_atomic(struct kvm_memory_slot *slot, gfn_t gfn);
+kvm_pfn_t __gfn_to_pfn_memslot(struct kvm_memory_slot *slot, gfn_t gfn,
+			       bool atomic, bool *async, bool write_fault,
+			       bool *writable);
 
-void kvm_release_pfn_clean(pfn_t pfn);
-void kvm_set_pfn_dirty(pfn_t pfn);
-void kvm_set_pfn_accessed(pfn_t pfn);
-void kvm_get_pfn(pfn_t pfn);
+void kvm_release_pfn_clean(kvm_pfn_t pfn);
+void kvm_set_pfn_dirty(kvm_pfn_t pfn);
+void kvm_set_pfn_accessed(kvm_pfn_t pfn);
+void kvm_get_pfn(kvm_pfn_t pfn);
 
 int kvm_read_guest_page(struct kvm *kvm, gfn_t gfn, void *data, int offset,
 			int len);
@@ -599,8 +621,8 @@ void mark_page_dirty(struct kvm *kvm, gfn_t gfn);
 
 struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu);
 struct kvm_memory_slot *kvm_vcpu_gfn_to_memslot(struct kvm_vcpu *vcpu, gfn_t gfn);
-pfn_t kvm_vcpu_gfn_to_pfn_atomic(struct kvm_vcpu *vcpu, gfn_t gfn);
-pfn_t kvm_vcpu_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn);
+kvm_pfn_t kvm_vcpu_gfn_to_pfn_atomic(struct kvm_vcpu *vcpu, gfn_t gfn);
+kvm_pfn_t kvm_vcpu_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn);
 struct page *kvm_vcpu_gfn_to_page(struct kvm_vcpu *vcpu, gfn_t gfn);
 unsigned long kvm_vcpu_gfn_to_hva(struct kvm_vcpu *vcpu, gfn_t gfn);
 unsigned long kvm_vcpu_gfn_to_hva_prot(struct kvm_vcpu *vcpu, gfn_t gfn, bool *writable);
@@ -767,7 +789,7 @@ void kvm_arch_sync_events(struct kvm *kvm);
 int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu);
 void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
 
-bool kvm_is_reserved_pfn(pfn_t pfn);
+bool kvm_is_reserved_pfn(kvm_pfn_t pfn);
 
 struct kvm_irq_ack_notifier {
 	struct hlist_node link;
@@ -812,16 +834,10 @@ static inline void kvm_iommu_unmap_pages(struct kvm *kvm,
 }
 #endif
 
-static inline void kvm_guest_enter(void)
+/* must be called with irqs disabled */
+static inline void __kvm_guest_enter(void)
 {
-	unsigned long flags;
-
-	BUG_ON(preemptible());
-
-	local_irq_save(flags);
 	guest_enter();
-	local_irq_restore(flags);
-
 	/* KVM does not hold any references to rcu protected data when it
 	 * switches CPU into a guest mode. In fact switching to a guest mode
 	 * is very similar to exiting to userspace from rcu point of view. In
@@ -833,12 +849,27 @@ static inline void kvm_guest_enter(void)
 		rcu_virt_note_context_switch(smp_processor_id());
 }
 
+/* must be called with irqs disabled */
+static inline void __kvm_guest_exit(void)
+{
+	guest_exit();
+}
+
+static inline void kvm_guest_enter(void)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	__kvm_guest_enter();
+	local_irq_restore(flags);
+}
+
 static inline void kvm_guest_exit(void)
 {
 	unsigned long flags;
 
 	local_irq_save(flags);
-	guest_exit();
+	__kvm_guest_exit();
 	local_irq_restore(flags);
 }
 
@@ -912,7 +943,7 @@ static inline gfn_t gpa_to_gfn(gpa_t gpa)
 	return (gfn_t)(gpa >> PAGE_SHIFT);
 }
 
-static inline hpa_t pfn_to_hpa(pfn_t pfn)
+static inline hpa_t pfn_to_hpa(kvm_pfn_t pfn)
 {
 	return (hpa_t)pfn << PAGE_SHIFT;
 }
@@ -963,11 +994,13 @@ static inline int mmu_notifier_retry(struct kvm *kvm, unsigned long mmu_seq)
 #define KVM_MAX_IRQ_ROUTES 1024
 
 int kvm_setup_default_irq_routing(struct kvm *kvm);
+int kvm_setup_empty_irq_routing(struct kvm *kvm);
 int kvm_set_irq_routing(struct kvm *kvm,
 			const struct kvm_irq_routing_entry *entries,
 			unsigned nr,
 			unsigned flags);
-int kvm_set_routing_entry(struct kvm_kernel_irq_routing_entry *e,
+int kvm_set_routing_entry(struct kvm *kvm,
+			  struct kvm_kernel_irq_routing_entry *e,
 			  const struct kvm_irq_routing_entry *ue);
 void kvm_free_irq_routing(struct kvm *kvm);
 
@@ -1029,6 +1062,11 @@ static inline bool kvm_vcpu_compatible(struct kvm_vcpu *vcpu) { return true; }
 
 static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
 {
+	/*
+	 * Ensure the rest of the request is published to kvm_check_request's
+	 * caller.  Paired with the smp_mb__after_atomic in kvm_check_request.
+	 */
+	smp_wmb();
 	set_bit(req, &vcpu->requests);
 }
 
@@ -1036,6 +1074,12 @@ static inline bool kvm_check_request(int req, struct kvm_vcpu *vcpu)
 {
 	if (test_bit(req, &vcpu->requests)) {
 		clear_bit(req, &vcpu->requests);
+
+		/*
+		 * Ensure the rest of the request is visible to kvm_check_request's
+		 * caller.  Paired with the smp_wmb in kvm_make_request.
+		 */
+		smp_mb__after_atomic();
 		return true;
 	} else {
 		return false;
@@ -1103,5 +1147,17 @@ static inline void kvm_vcpu_set_dy_eligible(struct kvm_vcpu *vcpu, bool val)
 {
 }
 #endif /* CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT */
-#endif
 
+#ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
+bool kvm_arch_has_irq_bypass(void);
+int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *,
+			   struct irq_bypass_producer *);
+void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *,
+			   struct irq_bypass_producer *);
+void kvm_arch_irq_bypass_stop(struct irq_bypass_consumer *);
+void kvm_arch_irq_bypass_start(struct irq_bypass_consumer *);
+int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
+				  uint32_t guest_irq, bool set);
+#endif /* CONFIG_HAVE_KVM_IRQ_BYPASS */
+
+#endif

@@ -24,5 +24,6 @@ struct ifla_vf_info {
 	__u32 linkstate;
 	RH_KABI_EXTEND(__u32 min_tx_rate)
 	RH_KABI_EXTEND(__u32 rss_query_en)
+	RH_KABI_EXTEND(__u32 trusted)
 };
 #endif /* _LINUX_IF_LINK_H */

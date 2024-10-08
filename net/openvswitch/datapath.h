@@ -27,9 +27,9 @@
 #include <linux/u64_stats_sync.h>
 #include <net/ip_tunnels.h>
 
+#include "conntrack.h"
 #include "flow.h"
 #include "flow_table.h"
-#include "vport.h"
 
 #define DP_MAX_PORTS           USHRT_MAX
 #define DP_VPORT_HASH_BUCKETS  1024
@@ -68,6 +68,8 @@ struct dp_stats_percpu {
  * ovs_mutex and RCU.
  * @stats_percpu: Per-CPU datapath statistics.
  * @net: Reference to net namespace.
+ * @max_headroom: the maximum headroom of all vports in this datapath; it will
+ * be used by all the internal vports in this dp.
  *
  * Context: See the comment on locking at the top of datapath.c for additional
  * locking information.
@@ -89,18 +91,20 @@ struct datapath {
 	possible_net_t net;
 
 	u32 user_features;
+
+	u32 max_headroom;
 };
 
 /**
  * struct ovs_skb_cb - OVS data in skb CB
- * @egress_tun_key: Tunnel information about this packet on egress path.
- * NULL if the packet is not being tunneled.
  * @input_vport: The original vport packet came in on. This value is cached
  * when a packet is received by OVS.
+ * @mru: The maximum received fragement size; 0 if the packet is not
+ * fragmented.
  */
 struct ovs_skb_cb {
-	struct ip_tunnel_info  *egress_tun_info;
 	struct vport		*input_vport;
+	u16			mru;
 };
 #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
 
@@ -113,14 +117,16 @@ struct ovs_skb_cb {
  * then no packet is sent and the packet is accounted in the datapath's @n_lost
  * counter.
  * @egress_tun_info: If nonnull, becomes %OVS_PACKET_ATTR_EGRESS_TUN_KEY.
+ * @mru: If not zero, Maximum received IP fragment size.
  */
 struct dp_upcall_info {
-	const struct ip_tunnel_info *egress_tun_info;
+	struct ip_tunnel_info *egress_tun_info;
 	const struct nlattr *userdata;
 	const struct nlattr *actions;
 	int actions_len;
 	u32 portid;
 	u8 cmd;
+	u16 mru;
 };
 
 /**
@@ -131,7 +137,9 @@ struct dp_upcall_info {
 struct ovs_net {
 	struct list_head dps;
 	struct work_struct dp_notify_work;
-	struct vport_net vport_net;
+
+	/* Module reference for configuring conntrack. */
+	bool xt_label;
 };
 
 extern int ovs_net_id;

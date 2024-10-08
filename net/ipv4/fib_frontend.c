@@ -219,6 +219,7 @@ __be32 fib_compute_spec_dst(struct sk_buff *skb)
 		fl4.flowi4_tos = RT_TOS(ip_hdr(skb)->tos);
 		fl4.flowi4_scope = scope;
 		fl4.flowi4_mark = IN_DEV_SRC_VMARK(in_dev) ? skb->mark : 0;
+		flowi4_tun_id_set(&fl4, 0);
 		if (!fib_lookup(net, &fl4, &res))
 			return FIB_RES_PREFSRC(net, res);
 	} else {
@@ -252,6 +253,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	fl4.saddr = dst;
 	fl4.flowi4_tos = tos;
 	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	flowi4_tun_id_set(&fl4, 0);
 
 	no_addr = idev->ifa_list == NULL;
 
@@ -528,6 +530,8 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_METRICS]		= { .type = NLA_NESTED },
 	[RTA_MULTIPATH]		= { .len = sizeof(struct rtnexthop) },
 	[RTA_FLOW]		= { .type = NLA_U32 },
+	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
+	[RTA_ENCAP]		= { .type = NLA_NESTED },
 };
 
 static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
@@ -592,6 +596,12 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 			break;
 		case RTA_TABLE:
 			cfg->fc_table = nla_get_u32(attr);
+			break;
+		case RTA_ENCAP:
+			cfg->fc_encap = attr;
+			break;
+		case RTA_ENCAP_TYPE:
+			cfg->fc_encap_type = nla_get_u16(attr);
 			break;
 		}
 	}
@@ -799,7 +809,11 @@ void fib_del_ifaddr(struct in_ifaddr *ifa, struct in_ifaddr *iprim)
 	if (ifa->ifa_flags & IFA_F_SECONDARY) {
 		prim = inet_ifa_byprefix(in_dev, any, ifa->ifa_mask);
 		if (prim == NULL) {
-			pr_warn("%s: bug: prim == NULL\n", __func__);
+			/* if the device has been deleted, we don't perform
+			 * address promotion
+			 */
+			if (!in_dev->dead)
+				pr_warn("%s: bug: prim == NULL\n", __func__);
 			return;
 		}
 		if (iprim && iprim != prim) {
@@ -814,6 +828,9 @@ void fib_del_ifaddr(struct in_ifaddr *ifa, struct in_ifaddr *iprim)
 				  any, ifa->ifa_prefixlen, prim);
 		subnet = 1;
 	}
+
+	if (in_dev->dead)
+		goto no_promotions;
 
 	/* Deletion is more complicated than add.
 	 * We should take care of not to delete too much :-)
@@ -890,6 +907,7 @@ void fib_del_ifaddr(struct in_ifaddr *ifa, struct in_ifaddr *iprim)
 		}
 	}
 
+no_promotions:
 	if (!(ok & BRD_OK))
 		fib_magic(RTM_DELROUTE, RTN_BROADCAST, ifa->ifa_broadcast, 32, prim);
 	if (subnet && ifa->ifa_prefixlen < 31) {
@@ -1045,7 +1063,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, 
 
 static int fib_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct in_device *in_dev;
 	struct net *net = dev_net(dev);
 
@@ -1201,7 +1219,7 @@ void __init ip_fib_init(void)
 	rtnl_register(PF_INET, RTM_GETROUTE, NULL, inet_dump_fib, NULL);
 
 	register_pernet_subsys(&fib_net_ops);
-	register_netdevice_notifier(&fib_netdev_notifier);
+	register_netdevice_notifier_rh(&fib_netdev_notifier);
 	register_inetaddr_notifier(&fib_inetaddr_notifier);
 
 	fib_trie_init();

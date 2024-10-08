@@ -114,15 +114,21 @@ static int monc_show(struct seq_file *s, void *p)
 	struct ceph_mon_generic_request *req;
 	struct ceph_mon_client *monc = &client->monc;
 	struct rb_node *rp;
+	int i;
 
 	mutex_lock(&monc->mutex);
 
-	if (monc->have_mdsmap)
-		seq_printf(s, "have mdsmap %u\n", (unsigned int)monc->have_mdsmap);
-	if (monc->have_osdmap)
-		seq_printf(s, "have osdmap %u\n", (unsigned int)monc->have_osdmap);
-	if (monc->want_next_osdmap)
-		seq_printf(s, "want next osdmap\n");
+	for (i = 0; i < ARRAY_SIZE(monc->subs); i++) {
+		seq_printf(s, "have %s %u", ceph_sub_str[i],
+			   monc->subs[i].have);
+		if (monc->subs[i].want)
+			seq_printf(s, " want %llu%s",
+				   le64_to_cpu(monc->subs[i].item.start),
+				   (monc->subs[i].item.flags &
+					CEPH_SUBSCRIBE_ONETIME ?  "" : "+"));
+		seq_putc(s, '\n');
+	}
+	seq_printf(s, "fs_cluster_id %d\n", monc->fs_cluster_id);
 
 	for (rp = rb_first(&monc->generic_request_tree); rp; rp = rb_next(rp)) {
 		__u16 op;
@@ -140,43 +146,113 @@ static int monc_show(struct seq_file *s, void *p)
 	return 0;
 }
 
+static void dump_target(struct seq_file *s, struct ceph_osd_request_target *t)
+{
+	int i;
+
+	seq_printf(s, "osd%d\t%llu.%x\t[", t->osd, t->pgid.pool, t->pgid.seed);
+	for (i = 0; i < t->up.size; i++)
+		seq_printf(s, "%s%d", (!i ? "" : ","), t->up.osds[i]);
+	seq_printf(s, "]/%d\t[", t->up.primary);
+	for (i = 0; i < t->acting.size; i++)
+		seq_printf(s, "%s%d", (!i ? "" : ","), t->acting.osds[i]);
+	seq_printf(s, "]/%d\t%s\t0x%x", t->acting.primary, t->target_oid.name,
+		   t->flags);
+	if (t->paused)
+		seq_puts(s, "\tP");
+}
+
+static void dump_request(struct seq_file *s, struct ceph_osd_request *req)
+{
+	int i;
+
+	seq_printf(s, "%llu\t", req->r_tid);
+	dump_target(s, &req->r_t);
+
+	seq_printf(s, "\t%d\t%u'%llu", req->r_attempts,
+		   le32_to_cpu(req->r_replay_version.epoch),
+		   le64_to_cpu(req->r_replay_version.version));
+
+	for (i = 0; i < req->r_num_ops; i++) {
+		struct ceph_osd_req_op *op = &req->r_ops[i];
+
+		seq_printf(s, "%s%s", (i == 0 ? "\t" : ","),
+			   ceph_osd_op_name(op->op));
+		if (op->op == CEPH_OSD_OP_WATCH)
+			seq_printf(s, "-%s",
+				   ceph_osd_watch_op_name(op->watch.op));
+	}
+
+	seq_putc(s, '\n');
+}
+
+static void dump_requests(struct seq_file *s, struct ceph_osd *osd)
+{
+	struct rb_node *n;
+
+	mutex_lock(&osd->lock);
+	for (n = rb_first(&osd->o_requests); n; n = rb_next(n)) {
+		struct ceph_osd_request *req =
+		    rb_entry(n, struct ceph_osd_request, r_node);
+
+		dump_request(s, req);
+	}
+
+	mutex_unlock(&osd->lock);
+}
+
+static void dump_linger_request(struct seq_file *s,
+				struct ceph_osd_linger_request *lreq)
+{
+	seq_printf(s, "%llu\t", lreq->linger_id);
+	dump_target(s, &lreq->t);
+
+	seq_printf(s, "\t%u\t%s%s/%d\n", lreq->register_gen,
+		   lreq->is_watch ? "W" : "N", lreq->committed ? "C" : "",
+		   lreq->last_error);
+}
+
+static void dump_linger_requests(struct seq_file *s, struct ceph_osd *osd)
+{
+	struct rb_node *n;
+
+	mutex_lock(&osd->lock);
+	for (n = rb_first(&osd->o_linger_requests); n; n = rb_next(n)) {
+		struct ceph_osd_linger_request *lreq =
+		    rb_entry(n, struct ceph_osd_linger_request, node);
+
+		dump_linger_request(s, lreq);
+	}
+
+	mutex_unlock(&osd->lock);
+}
+
 static int osdc_show(struct seq_file *s, void *pp)
 {
 	struct ceph_client *client = s->private;
 	struct ceph_osd_client *osdc = &client->osdc;
-	struct rb_node *p;
+	struct rb_node *n;
 
-	mutex_lock(&osdc->request_mutex);
-	for (p = rb_first(&osdc->requests); p; p = rb_next(p)) {
-		struct ceph_osd_request *req;
-		unsigned int i;
-		int opcode;
+	down_read(&osdc->lock);
+	seq_printf(s, "REQUESTS %d homeless %d\n",
+		   atomic_read(&osdc->num_requests),
+		   atomic_read(&osdc->num_homeless));
+	for (n = rb_first(&osdc->osds); n; n = rb_next(n)) {
+		struct ceph_osd *osd = rb_entry(n, struct ceph_osd, o_node);
 
-		req = rb_entry(p, struct ceph_osd_request, r_node);
-
-		seq_printf(s, "%lld\tosd%d\t%lld.%x\t", req->r_tid,
-			   req->r_osd ? req->r_osd->o_osd : -1,
-			   req->r_pgid.pool, req->r_pgid.seed);
-
-		seq_printf(s, "%.*s", req->r_base_oid.name_len,
-			   req->r_base_oid.name);
-
-		if (req->r_reassert_version.epoch)
-			seq_printf(s, "\t%u'%llu",
-			   (unsigned int)le32_to_cpu(req->r_reassert_version.epoch),
-			   le64_to_cpu(req->r_reassert_version.version));
-		else
-			seq_printf(s, "\t");
-
-		for (i = 0; i < req->r_num_ops; i++) {
-			opcode = req->r_ops[i].op;
-			seq_printf(s, "%s%s", (i == 0 ? "\t" : ","),
-				   ceph_osd_op_name(opcode));
-		}
-
-		seq_printf(s, "\n");
+		dump_requests(s, osd);
 	}
-	mutex_unlock(&osdc->request_mutex);
+	dump_requests(s, &osdc->homeless_osd);
+
+	seq_puts(s, "LINGER REQUESTS\n");
+	for (n = rb_first(&osdc->osds); n; n = rb_next(n)) {
+		struct ceph_osd *osd = rb_entry(n, struct ceph_osd, o_node);
+
+		dump_linger_requests(s, osd);
+	}
+	dump_linger_requests(s, &osdc->homeless_osd);
+
+	up_read(&osdc->lock);
 	return 0;
 }
 

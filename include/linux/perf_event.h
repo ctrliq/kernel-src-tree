@@ -134,6 +134,9 @@ struct hw_perf_event {
 			struct list_head	cqm_groups_entry;
 			struct list_head	cqm_group_entry;
 		};
+		struct { /* itrace */
+			int			itrace_started;
+		};
 #endif /* __GENKSYMS__ */
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 		struct { /* breakpoint */
@@ -176,12 +179,17 @@ struct perf_event;
 /*
  * Common implementation detail of pmu::{start,commit,cancel}_txn
  */
-#define PERF_EVENT_TXN 0x1
+#define PERF_PMU_TXN_ADD  0x1		/* txn to add/schedule event on PMU */
+#define PERF_PMU_TXN_READ 0x2		/* txn to read event group from PMU */
 
 /**
  * pmu::capabilities flags
  */
 #define PERF_PMU_CAP_NO_INTERRUPT		0x01
+#define PERF_PMU_CAP_AUX_NO_SG			0x04
+#define PERF_PMU_CAP_AUX_SW_DOUBLEBUF		0x08
+#define PERF_PMU_CAP_EXCLUSIVE			0x10
+#define PERF_PMU_CAP_ITRACE			0x20
 
 /**
  * struct pmu - generic performance monitoring unit
@@ -243,20 +251,28 @@ struct pmu {
 	 *
 	 * Start the transaction, after this ->add() doesn't need to
 	 * do schedulability tests.
+	 *
+	 * Optional.
 	 */
-	void (*start_txn)		(struct pmu *pmu); /* optional */
+	RH_KABI_REPLACE(void (*start_txn)(struct pmu *pmu),
+			void (*start_txn)(struct pmu *pmu, unsigned int txn_flags))
+
 	/*
 	 * If ->start_txn() disabled the ->add() schedulability test
 	 * then ->commit_txn() is required to perform one. On success
 	 * the transaction is closed. On error the transaction is kept
 	 * open until ->cancel_txn() is called.
+	 *
+	 * Optional.
 	 */
-	int  (*commit_txn)		(struct pmu *pmu); /* optional */
+	int  (*commit_txn)		(struct pmu *pmu);
 	/*
 	 * Will cancel the transaction, assumes ->del() is called
 	 * for each successful ->add() during the transaction.
+	 *
+	 * Optional.
 	 */
-	void (*cancel_txn)		(struct pmu *pmu); /* optional */
+	void (*cancel_txn)		(struct pmu *pmu);
 
 	/*
 	 * Will return the value for perf_event_mmap_page::index for this event,
@@ -295,6 +311,19 @@ struct pmu {
 	 * Return the count value for a counter.
 	 */
 	RH_KABI_EXTEND(u64 (*count)			(struct perf_event *event)) /*optional*/
+
+	/*
+	 * Set up pmu-private data structures for an AUX area
+	 */
+	RH_KABI_EXTEND(void *(*setup_aux)		(int cpu, void **pages,
+					 int nr_pages, bool overwrite))
+					/* optional */
+
+	/*
+	 * Free pmu-private AUX data structures
+	 */
+	RH_KABI_EXTEND(void (*free_aux)		(void *aux)) /* optional */
+	RH_KABI_EXTEND(atomic_t			exclusive_cnt) /* < 0: cpu; > 0: tsk */
 };
 
 /**
@@ -302,6 +331,7 @@ struct pmu {
  */
 enum perf_event_active_state {
 #ifndef __GENKSYMS__
+	PERF_EVENT_STATE_DEAD		= -4,
 	PERF_EVENT_STATE_EXIT		= -3,
 #endif
 	PERF_EVENT_STATE_ERROR		= -2,
@@ -363,7 +393,6 @@ struct perf_event {
 	int				group_flags;
 	struct perf_event		*group_leader;
 	struct pmu			*pmu;
-	void				*pmu_private;
 
 	enum perf_event_active_state	state;
 	unsigned int			attach_state;
@@ -466,7 +495,7 @@ struct perf_event {
 #ifdef CONFIG_EVENT_TRACING
 	struct ftrace_event_call	*tp_event;
 	struct event_filter		*filter;
-#ifdef CONFIG_FUNCTION_TRACER
+#if defined(CONFIG_FUNCTION_TRACER) && !defined(CONFIG_S390)
 	struct ftrace_ops               ftrace_ops;
 #endif
 #endif
@@ -483,6 +512,10 @@ struct perf_event {
 	 */
 	RH_KABI_EXTEND(struct list_head		migrate_entry)
 	RH_KABI_EXTEND(struct list_head		active_entry)
+	RH_KABI_EXTEND(void			*pmu_private)
+#if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_S390)
+	RH_KABI_EXTEND(struct ftrace_ops	 ftrace_ops)
+#endif
 #endif /* CONFIG_PERF_EVENTS */
 };
 
@@ -540,9 +573,6 @@ struct perf_event_context {
 	int				nr_cgroups;	 /* cgroup evts */
 	RH_KABI_DEPRECATE(int, nr_branch_stack)
 	struct rcu_head			rcu_head;
-
-	RH_KABI_EXTEND(struct delayed_work	orphans_remove)
-	RH_KABI_EXTEND(bool			orphans_remove_sched)
 	RH_KABI_EXTEND(struct list_head		active_ctx_list)
 	RH_KABI_EXTEND(void			*task_ctx_data) /* pmu specific data */
 };
@@ -568,6 +598,9 @@ struct perf_cpu_context {
 
 	struct pmu			*unique_pmu;
 	struct perf_cgroup		*cgrp;
+
+	RH_KABI_EXTEND(raw_spinlock_t	hrtimer_lock)
+	RH_KABI_EXTEND(unsigned int	hrtimer_active)
 };
 
 struct perf_output_handle {
@@ -575,7 +608,10 @@ struct perf_output_handle {
 	struct ring_buffer		*rb;
 	unsigned long			wakeup;
 	unsigned long			size;
-	void				*addr;
+	union {
+		void			*addr;
+		unsigned long		head;
+	};
 	int				page;
 };
 
@@ -611,6 +647,14 @@ perf_cgroup_from_task(struct task_struct *task)
 #endif /* CONFIG_CGROUP_PERF */
 
 #ifdef CONFIG_PERF_EVENTS
+
+extern void *perf_aux_output_begin(struct perf_output_handle *handle,
+				   struct perf_event *event);
+extern void perf_aux_output_end(struct perf_output_handle *handle,
+				unsigned long size, bool truncated);
+extern int perf_aux_output_skip(struct perf_output_handle *handle,
+				unsigned long size);
+extern void *perf_get_aux(struct perf_output_handle *handle);
 
 extern int perf_pmu_register(struct pmu *pmu, const char *name, int type);
 extern void perf_pmu_unregister(struct pmu *pmu);
@@ -740,6 +784,9 @@ extern void
 perf_event__output_id_sample(struct perf_event *event,
 			     struct perf_output_handle *handle,
 			     struct perf_sample_data *sample);
+
+extern void
+perf_log_lost_samples(struct perf_event *event, u64 lost);
 
 static inline bool is_sampling_event(struct perf_event *event)
 {
@@ -900,6 +947,11 @@ static inline bool needs_branch_stack(struct perf_event *event)
 	return event->attr.branch_sample_type != 0;
 }
 
+static inline bool has_aux(struct perf_event *event)
+{
+	return event->pmu->setup_aux;
+}
+
 extern int perf_output_begin(struct perf_output_handle *handle,
 			     struct perf_event *event, unsigned int size);
 extern void perf_output_end(struct perf_output_handle *handle);
@@ -912,9 +964,20 @@ extern void perf_swevent_put_recursion_context(int rctx);
 extern u64 perf_swevent_set_period(struct perf_event *event);
 extern void perf_event_enable(struct perf_event *event);
 extern void perf_event_disable(struct perf_event *event);
-extern int __perf_event_disable(void *info);
+extern void perf_event_disable_local(struct perf_event *event);
 extern void perf_event_task_tick(void);
 #else /* !CONFIG_PERF_EVENTS: */
+static inline void *
+perf_aux_output_begin(struct perf_output_handle *handle,
+		      struct perf_event *event)				{ return NULL; }
+static inline void
+perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
+		    bool truncated)					{ }
+static inline int
+perf_aux_output_skip(struct perf_output_handle *handle,
+		     unsigned long size)				{ return -EINVAL; }
+static inline void *
+perf_get_aux(struct perf_output_handle *handle)				{ return NULL; }
 static inline void
 perf_event_task_sched_in(struct task_struct *prev,
 			 struct task_struct *task)			{ }

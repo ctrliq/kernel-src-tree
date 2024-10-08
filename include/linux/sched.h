@@ -16,6 +16,7 @@ struct sched_param {
 #include <linux/types.h>
 #include <linux/timex.h>
 #include <linux/jiffies.h>
+#include <linux/plist.h>
 #include <linux/rbtree.h>
 #include <linux/thread_info.h>
 #include <linux/cpumask.h>
@@ -54,6 +55,70 @@ struct sched_param {
 #include <linux/gfp.h>
 
 #include <asm/processor.h>
+
+#define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
+
+/*
+ * Extended scheduling parameters data structure.
+ *
+ * This is needed because the original struct sched_param can not be
+ * altered without introducing ABI issues with legacy applications
+ * (e.g., in sched_getparam()).
+ *
+ * However, the possibility of specifying more than just a priority for
+ * the tasks may be useful for a wide variety of application fields, e.g.,
+ * multimedia, streaming, automation and control, and many others.
+ *
+ * This variant (sched_attr) is meant at describing a so-called
+ * sporadic time-constrained task. In such model a task is specified by:
+ *  - the activation period or minimum instance inter-arrival time;
+ *  - the maximum (or average, depending on the actual scheduling
+ *    discipline) computation time of all instances, a.k.a. runtime;
+ *  - the deadline (relative to the actual activation time) of each
+ *    instance.
+ * Very briefly, a periodic (sporadic) task asks for the execution of
+ * some specific computation --which is typically called an instance--
+ * (at most) every period. Moreover, each instance typically lasts no more
+ * than the runtime and must be completed by time instant t equal to
+ * the instance activation time + the deadline.
+ *
+ * This is reflected by the actual fields of the sched_attr structure:
+ *
+ *  @size		size of the structure, for fwd/bwd compat.
+ *
+ *  @sched_policy	task's scheduling policy
+ *  @sched_flags	for customizing the scheduler behaviour
+ *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
+ *  @sched_priority	task's static priority (SCHED_FIFO/RR)
+ *  @sched_deadline	representative of the task's deadline
+ *  @sched_runtime	representative of the task's runtime
+ *  @sched_period	representative of the task's period
+ *
+ * Given this task model, there are a multiplicity of scheduling algorithms
+ * and policies, that can be used to ensure all the tasks will make their
+ * timing constraints.
+ *
+ * As of now, the SCHED_DEADLINE policy (sched_dl scheduling class) is the
+ * only user of this new interface. More information about the algorithm
+ * available in the scheduling class file or in Documentation/.
+ */
+struct sched_attr {
+	u32 size;
+
+	u32 sched_policy;
+	u64 sched_flags;
+
+	/* SCHED_NORMAL, SCHED_BATCH */
+	s32 sched_nice;
+
+	/* SCHED_FIFO, SCHED_RR */
+	u32 sched_priority;
+
+	/* SCHED_DEADLINE */
+	u64 sched_runtime;
+	u64 sched_deadline;
+	u64 sched_period;
+};
 
 struct exec_domain;
 struct futex_pi_state;
@@ -211,6 +276,9 @@ extern char ___assert_task_state[1 - 2*!!(
 extern rwlock_t tasklist_lock;
 extern spinlock_t mmlist_lock;
 
+extern void tasklist_write_lock_irq(void);
+extern void tasklist_read_lock(void);
+
 struct task_struct;
 
 #ifdef CONFIG_PROVE_RCU
@@ -266,6 +334,7 @@ extern void scheduler_tick(void);
 extern void sched_show_task(struct task_struct *p);
 
 #ifdef CONFIG_LOCKUP_DETECTOR
+extern void touch_softlockup_watchdog_sched(void);
 extern void touch_softlockup_watchdog(void);
 extern void touch_softlockup_watchdog_sync(void);
 extern void touch_all_softlockup_watchdogs(void);
@@ -276,6 +345,9 @@ extern unsigned int  softlockup_panic;
 extern unsigned int  hardlockup_panic;
 void lockup_detector_init(void);
 #else
+static inline void touch_softlockup_watchdog_sched(void)
+{
+}
 static inline void touch_softlockup_watchdog(void)
 {
 }
@@ -683,8 +755,6 @@ struct user_struct {
 	unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
 #endif
 	unsigned long locked_shm; /* How many pages of mlocked shm ? */
-	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
-	atomic_long_t pipe_bufs;  /* how many pages are allocated in pipe buffers */
 
 #ifdef CONFIG_KEYS
 	struct key *uid_keyring;	/* UID specific keyring */
@@ -698,6 +768,8 @@ struct user_struct {
 #ifdef CONFIG_PERF_EVENTS
 	atomic_long_t locked_vm;
 #endif
+	RH_KABI_EXTEND(unsigned long unix_inflight)	/* How many files in flight in unix sockets */
+	RH_KABI_EXTEND(atomic_long_t pipe_bufs)	/* how many pages are allocated in pipe buffers */
 };
 
 extern int uids_sysfs_init(void);
@@ -711,7 +783,7 @@ extern struct user_struct root_user;
 struct backing_dev_info;
 struct reclaim_state;
 
-#if defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT)
+#ifdef CONFIG_SCHED_INFO
 struct sched_info {
 	/* cumulative counters */
 	unsigned long pcount;	      /* # of times run on this cpu */
@@ -721,7 +793,7 @@ struct sched_info {
 	unsigned long long last_arrival,/* when we last ran on a cpu */
 			   last_queued;	/* when we were last queued to run */
 };
-#endif /* defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT) */
+#endif /* CONFIG_SCHED_INFO */
 
 #ifdef CONFIG_TASK_DELAY_ACCT
 struct task_delay_info {
@@ -768,6 +840,10 @@ static inline int sched_info_on(void)
 	return 0;
 #endif
 }
+
+#ifdef CONFIG_SCHEDSTATS
+void force_schedstat_enabled(void);
+#endif
 
 enum cpu_idle_type {
 	CPU_IDLE,
@@ -867,7 +943,26 @@ struct sched_domain {
 	u64 max_newidle_lb_cost;
 	unsigned long next_decay_max_lb_cost;
 
-#ifdef CONFIG_SCHEDSTATS
+#ifdef CONFIG_SCHED_DEBUG
+	char *name;
+#endif
+	union {
+		void *private;		/* used during construction */
+		struct rcu_head rcu;	/* used during destruction */
+	};
+
+	unsigned int span_weight;
+	/*
+	 * Span of all CPUs in this domain.
+	 *
+	 * NOTE: this field is variable length. (Allocated dynamically
+	 * by attaching extra space to the end of the structure,
+	 * depending on how many CPUs the kernel has booted up with)
+	 */
+	unsigned long span[0];
+
+#ifndef __GENKSYMS__
+	/* CONFIG_SCHEDSTATS */
 	/* load_balance() stats */
 	unsigned int lb_count[CPU_MAX_IDLE_TYPES];
 	unsigned int lb_failed[CPU_MAX_IDLE_TYPES];
@@ -897,24 +992,7 @@ struct sched_domain {
 	unsigned int ttwu_wake_remote;
 	unsigned int ttwu_move_affine;
 	unsigned int ttwu_move_balance;
-#endif
-#ifdef CONFIG_SCHED_DEBUG
-	char *name;
-#endif
-	union {
-		void *private;		/* used during construction */
-		struct rcu_head rcu;	/* used during destruction */
-	};
-
-	unsigned int span_weight;
-	/*
-	 * Span of all CPUs in this domain.
-	 *
-	 * NOTE: this field is variable length. (Allocated dynamically
-	 * by attaching extra space to the end of the structure,
-	 * depending on how many CPUs the kernel has booted up with)
-	 */
-	unsigned long span[0];
+#endif /* __GENKSYMS__ */
 };
 
 static inline struct cpumask *sched_domain_span(struct sched_domain *sd)
@@ -1061,10 +1139,6 @@ struct sched_entity {
 
 	u64			nr_migrations;
 
-#ifdef CONFIG_SCHEDSTATS
-	struct sched_statistics statistics;
-#endif
-
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	struct sched_entity	*parent;
 	/* rq on which this entity is (to be) queued: */
@@ -1083,8 +1157,9 @@ struct sched_entity {
 	struct sched_avg	avg;
 #endif
 
+	RH_KABI_USE(1, struct sched_statistics *statistics)
+
 	/* reserved for Red Hat */
-	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -1106,6 +1181,50 @@ struct sched_rt_entity {
 #endif
 };
 
+struct sched_dl_entity {
+	struct rb_node	rb_node;
+
+	/*
+	 * Original scheduling parameters. Copied here from sched_attr
+	 * during sched_setscheduler2(), they will remain the same until
+	 * the next sched_setscheduler2().
+	 */
+	u64 dl_runtime;		/* maximum runtime for each instance	*/
+	u64 dl_deadline;	/* relative deadline of each instance	*/
+	u64 dl_period;		/* separation of two instances (period) */
+	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
+
+	/*
+	 * Actual scheduling parameters. Initialized with the values above,
+	 * they are continously updated during task execution. Note that
+	 * the remaining runtime could be < 0 in case we are in overrun.
+	 */
+	s64 runtime;		/* remaining runtime for this instance	*/
+	u64 deadline;		/* absolute deadline for this instance	*/
+	unsigned int flags;	/* specifying the scheduler behaviour	*/
+
+	/*
+	 * Some bool flags:
+	 *
+	 * @dl_throttled tells if we exhausted the runtime. If so, the
+	 * task has to wait for a replenishment to be performed at the
+	 * next firing of dl_timer.
+	 *
+	 * @dl_boosted tells if we are boosted due to DI. If so we are
+	 * outside bandwidth enforcement mechanism (but only until we
+	 * exit the critical section);
+	 *
+	 * @dl_yielded tells if task gave up the cpu before consuming
+	 * all its available runtime during the last job.
+	 */
+	int dl_throttled, dl_boosted, dl_yielded;
+
+	/*
+	 * Bandwidth enforcement timer. Each -deadline task has its
+	 * own bandwidth to be enforced, thus we need one timer per task.
+	 */
+	struct hrtimer dl_timer;
+};
 
 struct rcu_node;
 
@@ -1114,6 +1233,25 @@ enum perf_event_task_context {
 	perf_hw_context = 0,
 	perf_sw_context,
 	perf_nr_task_contexts,
+};
+
+/* Track pages that require TLB flushes */
+struct tlbflush_unmap_batch {
+	/*
+	 * Each bit set is a CPU that potentially has a TLB entry for one of
+	 * the PFNs being flushed. See set_tlb_ubc_flush_pending().
+	 */
+	struct cpumask cpumask;
+
+	/* True if any bit in cpumask is set */
+	bool flush_required;
+
+	/*
+	 * If true then the PTE was dirty when unmapped. The entry must be
+	 * flushed before IO is initiated or a stale TLB entry potentially
+	 * allows an update without redirtying the page.
+	 */
+	bool writable;
 };
 
 struct task_struct {
@@ -1142,7 +1280,6 @@ struct task_struct {
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group *sched_task_group;
 #endif
-
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
 	struct hlist_head preempt_notifiers;
@@ -1177,7 +1314,7 @@ struct task_struct {
 	struct rt_mutex *rcu_boost_mutex;
 #endif /* #ifdef CONFIG_RCU_BOOST */
 
-#if defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT)
+#ifdef CONFIG_SCHED_INFO
 	struct sched_info sched_info;
 #endif
 
@@ -1332,7 +1469,12 @@ struct task_struct {
 
 #ifdef CONFIG_RT_MUTEXES
 	/* PI waiters blocked on a rt_mutex held by this task */
+#ifndef __GENKSYMS__
+	struct rb_root pi_waiters;
+	struct rb_node *pi_waiters_leftmost;
+#else
 	struct plist_head pi_waiters;
+#endif
 	/* Deadlock detection and priority inheritance handling */
 	struct rt_mutex_waiter *pi_blocked_on;
 #endif
@@ -1502,7 +1644,7 @@ struct task_struct {
 	unsigned long timer_slack_ns;
 	unsigned long default_timer_slack_ns;
 
-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+#if defined(CONFIG_FUNCTION_GRAPH_TRACER) && !defined(CONFIG_S390)
 	/* Index of current stored address in ret_stack */
 	int curr_ret_stack;
 	/* Stack of return addresses for return function tracing */
@@ -1555,7 +1697,8 @@ struct task_struct {
 #else
 	RH_KABI_RESERVE(3)
 #endif
-	RH_KABI_RESERVE(4)
+	/* This would be in rss_stat[MM_SHMEMPAGES] if not for kABI */
+	RH_KABI_USE(4, int mm_shmempages)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
@@ -1569,6 +1712,29 @@ struct task_struct {
 		unsigned int may_oom:1;
 	} memcg_oom;
 #endif
+#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+	struct tlbflush_unmap_batch tlb_ubc;
+#endif
+#if defined(CONFIG_FUNCTION_GRAPH_TRACER) && defined(CONFIG_S390)
+	/* Index of current stored address in ret_stack */
+	int curr_ret_stack;
+	/* Stack of return addresses for return function tracing */
+	struct ftrace_ret_stack	*ret_stack;
+	/* time stamp for last schedule */
+	unsigned long long ftrace_timestamp;
+	/*
+	 * Number of functions that haven't been traced
+	 * because of depth overrun.
+	 */
+	atomic_t trace_overrun;
+	/* Pause for the tracing */
+	atomic_t tracing_graph_pause;
+#endif
+	struct sched_dl_entity dl;
+	#ifdef CONFIG_SMP
+		struct rb_node pushable_dl_tasks;
+	#endif
+	struct sched_statistics statistics;
 #endif /* __GENKSYMS__ */
 };
 
@@ -1966,6 +2132,10 @@ static inline void tsk_restore_flags(struct task_struct *task,
 	task->flags |= orig_flags & flags;
 }
 
+extern int cpuset_cpumask_can_shrink(const struct cpumask *cur,
+				     const struct cpumask *trial);
+extern int task_can_attach(struct task_struct *p,
+			   const struct cpumask *cs_cpus_allowed);
 #ifdef CONFIG_SMP
 extern void do_set_cpus_allowed(struct task_struct *p,
 			       const struct cpumask *new_mask);
@@ -2121,6 +2291,8 @@ extern int sched_setscheduler(struct task_struct *, int,
 			      const struct sched_param *);
 extern int sched_setscheduler_nocheck(struct task_struct *, int,
 				      const struct sched_param *);
+extern int sched_setattr(struct task_struct *,
+			 const struct sched_attr *);
 extern struct task_struct *idle_task(int cpu);
 /**
  * is_idle_task - is the specified task an idle task?
@@ -2202,7 +2374,7 @@ extern void wake_up_new_task(struct task_struct *tsk);
 #else
  static inline void kick_process(struct task_struct *tsk) { }
 #endif
-extern void sched_fork(unsigned long clone_flags, struct task_struct *p);
+extern int sched_fork(unsigned long clone_flags, struct task_struct *p);
 extern void sched_dead(struct task_struct *p);
 
 extern void proc_caches_init(void);

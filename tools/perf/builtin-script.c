@@ -3,9 +3,9 @@
 #include "perf.h"
 #include "util/cache.h"
 #include "util/debug.h"
-#include "util/exec_cmd.h"
+#include <subcmd/exec-cmd.h>
 #include "util/header.h"
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/perf_regs.h"
 #include "util/session.h"
 #include "util/tool.h"
@@ -23,6 +23,7 @@
 #include "util/stat.h"
 #include <linux/bitmap.h>
 #include "asm/bug.h"
+#include "util/mem-events.h"
 
 static char const		*script_name;
 static char const		*generate_script_lang;
@@ -402,9 +403,7 @@ out:
 	return 0;
 }
 
-static void print_sample_iregs(union perf_event *event __maybe_unused,
-			  struct perf_sample *sample,
-			  struct thread *thread __maybe_unused,
+static void print_sample_iregs(struct perf_sample *sample,
 			  struct perf_event_attr *attr)
 {
 	struct regs_dump *regs = &sample->intr_regs;
@@ -473,10 +472,7 @@ mispred_str(struct branch_entry *br)
 	return br->flags.predicted ? 'P' : 'M';
 }
 
-static void print_sample_brstack(union perf_event *event __maybe_unused,
-			  struct perf_sample *sample,
-			  struct thread *thread __maybe_unused,
-			  struct perf_event_attr *attr __maybe_unused)
+static void print_sample_brstack(struct perf_sample *sample)
 {
 	struct branch_stack *br = sample->branch_stack;
 	u64 i;
@@ -495,10 +491,8 @@ static void print_sample_brstack(union perf_event *event __maybe_unused,
 	}
 }
 
-static void print_sample_brstacksym(union perf_event *event __maybe_unused,
-			  struct perf_sample *sample,
-			  struct thread *thread __maybe_unused,
-			  struct perf_event_attr *attr __maybe_unused)
+static void print_sample_brstacksym(struct perf_sample *sample,
+				    struct thread *thread)
 {
 	struct branch_stack *br = sample->branch_stack;
 	struct addr_location alf, alt;
@@ -534,8 +528,7 @@ static void print_sample_brstacksym(union perf_event *event __maybe_unused,
 }
 
 
-static void print_sample_addr(union perf_event *event __maybe_unused,
-			  struct perf_sample *sample,
+static void print_sample_addr(struct perf_sample *sample,
 			  struct thread *thread,
 			  struct perf_event_attr *attr)
 {
@@ -563,8 +556,7 @@ static void print_sample_addr(union perf_event *event __maybe_unused,
 	}
 }
 
-static void print_sample_bts(union perf_event *event,
-			     struct perf_sample *sample,
+static void print_sample_bts(struct perf_sample *sample,
 			     struct perf_evsel *evsel,
 			     struct thread *thread,
 			     struct addr_location *al)
@@ -594,7 +586,7 @@ static void print_sample_bts(union perf_event *event,
 	    ((evsel->attr.sample_type & PERF_SAMPLE_ADDR) &&
 	     !output[attr->type].user_set)) {
 		printf(" => ");
-		print_sample_addr(event, sample, thread, attr);
+		print_sample_addr(sample, thread, attr);
 	}
 
 	if (print_srcline_last)
@@ -648,7 +640,24 @@ static int perf_evlist__max_name_len(struct perf_evlist *evlist)
 	return max;
 }
 
-static void process_event(struct perf_script *script, union perf_event *event,
+static size_t data_src__printf(u64 data_src)
+{
+	struct mem_info mi = { .data_src.val = data_src };
+	char decode[100];
+	char out[100];
+	static int maxlen;
+	int len;
+
+	perf_script__meminfo_scnprintf(decode, 100, &mi);
+
+	len = scnprintf(out, 100, "%16" PRIx64 " %s", data_src, decode);
+	if (maxlen < len)
+		maxlen = len;
+
+	return printf("%-*s", maxlen, out);
+}
+
+static void process_event(struct perf_script *script,
 			  struct perf_sample *sample, struct perf_evsel *evsel,
 			  struct addr_location *al)
 {
@@ -677,7 +686,7 @@ static void process_event(struct perf_script *script, union perf_event *event,
 		print_sample_flags(sample->flags);
 
 	if (is_bts_event(attr)) {
-		print_sample_bts(event, sample, evsel, thread, al);
+		print_sample_bts(sample, evsel, thread, al);
 		return;
 	}
 
@@ -685,10 +694,10 @@ static void process_event(struct perf_script *script, union perf_event *event,
 		event_format__print(evsel->tp_format, sample->cpu,
 				    sample->raw_data, sample->raw_size);
 	if (PRINT_FIELD(ADDR))
-		print_sample_addr(event, sample, thread, attr);
+		print_sample_addr(sample, thread, attr);
 
 	if (PRINT_FIELD(DATA_SRC))
-		printf("%16" PRIx64, sample->data_src);
+		data_src__printf(sample->data_src);
 
 	if (PRINT_FIELD(WEIGHT))
 		printf("%16" PRIu64, sample->weight);
@@ -705,12 +714,12 @@ static void process_event(struct perf_script *script, union perf_event *event,
 	}
 
 	if (PRINT_FIELD(IREGS))
-		print_sample_iregs(event, sample, thread, attr);
+		print_sample_iregs(sample, attr);
 
 	if (PRINT_FIELD(BRSTACK))
-		print_sample_brstack(event, sample, thread, attr);
+		print_sample_brstack(sample);
 	else if (PRINT_FIELD(BRSTACKSYM))
-		print_sample_brstacksym(event, sample, thread, attr);
+		print_sample_brstacksym(sample, thread);
 
 	printf("\n");
 }
@@ -818,7 +827,7 @@ static int process_sample_event(struct perf_tool *tool,
 	if (scripting_ops)
 		scripting_ops->process_event(event, sample, evsel, &al);
 	else
-		process_event(scr, event, sample, evsel, &al);
+		process_event(scr, sample, evsel, &al);
 
 out_put:
 	addr_location__put(&al);
@@ -1490,7 +1499,7 @@ static int list_available_scripts(const struct option *opt __maybe_unused,
 	char first_half[BUFSIZ];
 	char *script_root;
 
-	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", perf_exec_path());
+	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", get_argv_exec_path());
 
 	scripts_dir = opendir(scripts_path);
 	if (!scripts_dir)
@@ -1611,7 +1620,7 @@ int find_scripts(char **scripts_array, char **scripts_path_array)
 	if (!session)
 		return -1;
 
-	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", perf_exec_path());
+	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", get_argv_exec_path());
 
 	scripts_dir = opendir(scripts_path);
 	if (!scripts_dir) {
@@ -1669,7 +1678,7 @@ static char *get_script_path(const char *script_root, const char *suffix)
 	char lang_path[MAXPATHLEN];
 	char *__script_root;
 
-	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", perf_exec_path());
+	snprintf(scripts_path, MAXPATHLEN, "%s/scripts", get_argv_exec_path());
 
 	scripts_dir = opendir(scripts_path);
 	if (!scripts_dir)
@@ -1991,7 +2000,7 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 		scripting_max_stack = itrace_synth_opts.callchain_sz;
 
 	/* make sure PERF_EXEC_PATH is set for scripts */
-	perf_set_argv_exec_path(perf_exec_path());
+	set_argv_exec_path(get_argv_exec_path());
 
 	if (argc && !script_name && !rec_script_path && !rep_script_path) {
 		int live_pipe[2];
@@ -2002,9 +2011,9 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 		rep_script_path = get_script_path(argv[0], REPORT_SUFFIX);
 
 		if (!rec_script_path && !rep_script_path) {
-			fprintf(stderr, " Couldn't find script %s\n\n See perf"
+			usage_with_options_msg(script_usage, options,
+				"Couldn't find script `%s'\n\n See perf"
 				" script -l for available scripts.\n", argv[0]);
-			usage_with_options(script_usage, options);
 		}
 
 		if (is_top_script(argv[0])) {
@@ -2015,10 +2024,10 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 			rep_args = has_required_arg(rep_script_path);
 			rec_args = (argc - 1) - rep_args;
 			if (rec_args < 0) {
-				fprintf(stderr, " %s script requires options."
+				usage_with_options_msg(script_usage, options,
+					"`%s' script requires options."
 					"\n\n See perf script -l for available "
 					"scripts and options.\n", argv[0]);
-				usage_with_options(script_usage, options);
 			}
 		}
 

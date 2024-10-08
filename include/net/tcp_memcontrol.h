@@ -4,7 +4,7 @@
 struct tcp_memcontrol {
 	struct cg_proto cg_proto;
 	/* per-cgroup tcp memory pressure knobs */
-	struct res_counter tcp_memory_allocated;
+	struct page_counter tcp_memory_allocated;
 	struct percpu_counter tcp_sockets_allocated;
 	/* those two are read-mostly, leave them at the end */
 	long tcp_prot_mem[3];

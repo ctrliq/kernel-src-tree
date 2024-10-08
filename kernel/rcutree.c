@@ -766,6 +766,12 @@ static int dyntick_save_progress_counter(struct rcu_data *rdp)
 }
 
 /*
+ * This function really isn't for public consumption, but RCU is special in
+ * that context switches can allow the state machine to make progress.
+ */
+extern void resched_cpu(int cpu);
+
+/*
  * Return true if the specified CPU has passed through a quiescent
  * state by virtue of being in or having passed through an dynticks
  * idle state since the last call to dyntick_save_progress_counter()
@@ -822,13 +828,34 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
 	 */
 	rcu_kick_nohz_cpu(rdp->cpu);
 
+	/*
+	 * Alternatively, the CPU might be running in the kernel
+	 * for an extended period of time without a quiescent state.
+	 * Attempt to force the CPU through the scheduler to gain the
+	 * needed quiescent state, but only if the grace period has gone
+	 * on for an uncommonly long time.  If there are many stuck CPUs,
+	 * we will beat on the first one until it gets unstuck, then move
+	 * to the next.  Only do this for the primary flavor of RCU.
+	 */
+	if (rdp->rsp == rcu_state &&
+	    ULONG_CMP_GE(ACCESS_ONCE(jiffies), rdp->rsp->jiffies_resched)) {
+		rdp->rsp->jiffies_resched += 5;
+		resched_cpu(rdp->cpu);
+	}
+
 	return 0;
 }
 
 static void record_gp_stall_check_time(struct rcu_state *rsp)
 {
-	rsp->gp_start = jiffies;
-	rsp->jiffies_stall = jiffies + rcu_jiffies_till_stall_check();
+	unsigned long j = ACCESS_ONCE(jiffies);
+	unsigned long j1;
+
+	rsp->gp_start = j;
+	smp_wmb(); /* Record start time before stall time. */
+	j1 = rcu_jiffies_till_stall_check();
+	ACCESS_ONCE(rsp->jiffies_stall) = j + j1;
+	rsp->jiffies_resched = j + j1 / 2;
 }
 
 /*
@@ -851,11 +878,13 @@ static void rcu_dump_cpu_stacks(struct rcu_state *rsp)
 	}
 }
 
-static void print_other_cpu_stall(struct rcu_state *rsp)
+static void print_other_cpu_stall(struct rcu_state *rsp, unsigned long gpnum)
 {
 	int cpu;
 	long delta;
 	unsigned long flags;
+	unsigned long gpa;
+	unsigned long j;
 	int ndetected = 0;
 	struct rcu_node *rnp = rcu_get_root(rsp);
 	long totqlen = 0;
@@ -863,12 +892,12 @@ static void print_other_cpu_stall(struct rcu_state *rsp)
 	/* Only let one CPU complain about others per time interval. */
 
 	raw_spin_lock_irqsave(&rnp->lock, flags);
-	delta = jiffies - rsp->jiffies_stall;
+	delta = jiffies - ACCESS_ONCE(rsp->jiffies_stall);
 	if (delta < RCU_STALL_RAT_DELAY || !rcu_gp_in_progress(rsp)) {
 		raw_spin_unlock_irqrestore(&rnp->lock, flags);
 		return;
 	}
-	rsp->jiffies_stall = jiffies + 3 * rcu_jiffies_till_stall_check() + 3;
+	ACCESS_ONCE(rsp->jiffies_stall) = jiffies + 3 * rcu_jiffies_till_stall_check() + 3;
 	raw_spin_unlock_irqrestore(&rnp->lock, flags);
 
 	/*
@@ -908,10 +937,22 @@ static void print_other_cpu_stall(struct rcu_state *rsp)
 	pr_cont("(detected by %d, t=%ld jiffies, g=%ld, c=%ld, q=%lu)\n",
 	       smp_processor_id(), (long)(jiffies - rsp->gp_start),
 	       (long)rsp->gpnum, (long)rsp->completed, totqlen);
-	if (ndetected == 0)
-		pr_err("INFO: Stall ended before state dump start\n");
-	else
+	if (ndetected) {
 		rcu_dump_cpu_stacks(rsp);
+	} else {
+		if (ACCESS_ONCE(rsp->gpnum) != gpnum ||
+		    ACCESS_ONCE(rsp->completed) == gpnum) {
+			pr_err("INFO: Stall ended before state dump start\n");
+		} else {
+			j = jiffies;
+			gpa = ACCESS_ONCE(rsp->gp_activity);
+			pr_err("All QSes seen, last %s kthread activity %ld (%ld-%ld), jiffies_till_next_fqs=%ld\n",
+			       rsp->name, j - gpa, j, gpa,
+			       jiffies_till_next_fqs);
+			/* In this case, the current CPU might be at fault. */
+			sched_show_task(current);
+		}
+	}
 
 	/* Complain about tasks blocking the grace period. */
 
@@ -944,8 +985,8 @@ static void print_cpu_stall(struct rcu_state *rsp)
 	rcu_dump_cpu_stacks(rsp);
 
 	raw_spin_lock_irqsave(&rnp->lock, flags);
-	if (ULONG_CMP_GE(jiffies, rsp->jiffies_stall))
-		rsp->jiffies_stall = jiffies +
+	if (ULONG_CMP_GE(jiffies, ACCESS_ONCE(rsp->jiffies_stall)))
+		ACCESS_ONCE(rsp->jiffies_stall) = jiffies +
 				     3 * rcu_jiffies_till_stall_check() + 3;
 	raw_spin_unlock_irqrestore(&rnp->lock, flags);
 
@@ -954,17 +995,48 @@ static void print_cpu_stall(struct rcu_state *rsp)
 
 static void check_cpu_stall(struct rcu_state *rsp, struct rcu_data *rdp)
 {
+	unsigned long completed;
+	unsigned long gpnum;
+	unsigned long gps;
 	unsigned long j;
 	unsigned long js;
 	struct rcu_node *rnp;
 
-	if (rcu_cpu_stall_suppress)
+	if (rcu_cpu_stall_suppress || !rcu_gp_in_progress(rsp))
 		return;
 	j = ACCESS_ONCE(jiffies);
+
+	/*
+	 * Lots of memory barriers to reject false positives.
+	 *
+	 * The idea is to pick up rsp->gpnum, then rsp->jiffies_stall,
+	 * then rsp->gp_start, and finally rsp->completed.  These values
+	 * are updated in the opposite order with memory barriers (or
+	 * equivalent) during grace-period initialization and cleanup.
+	 * Now, a false positive can occur if we get an new value of
+	 * rsp->gp_start and a old value of rsp->jiffies_stall.  But given
+	 * the memory barriers, the only way that this can happen is if one
+	 * grace period ends and another starts between these two fetches.
+	 * Detect this by comparing rsp->completed with the previous fetch
+	 * from rsp->gpnum.
+	 *
+	 * Given this check, comparisons of jiffies, rsp->jiffies_stall,
+	 * and rsp->gp_start suffice to forestall false positives.
+	 */
+	gpnum = ACCESS_ONCE(rsp->gpnum);
+	smp_rmb(); /* Pick up ->gpnum first... */
 	js = ACCESS_ONCE(rsp->jiffies_stall);
+	smp_rmb(); /* ...then ->jiffies_stall before the rest... */
+	gps = ACCESS_ONCE(rsp->gp_start);
+	smp_rmb(); /* ...and finally ->gp_start before ->completed. */
+	completed = ACCESS_ONCE(rsp->completed);
+	if (ULONG_CMP_GE(completed, gpnum) ||
+	    ULONG_CMP_LT(j, js) ||
+	    ULONG_CMP_GE(gps, js))
+		return; /* No stall or GP completed since entering function. */
 	rnp = rdp->mynode;
 	if (rcu_gp_in_progress(rsp) &&
-	    (ACCESS_ONCE(rnp->qsmask) & rdp->grpmask) && ULONG_CMP_GE(j, js)) {
+	    (ACCESS_ONCE(rnp->qsmask) & rdp->grpmask)) {
 
 		/* We haven't checked in, so go dump stack. */
 		print_cpu_stall(rsp);
@@ -973,7 +1045,7 @@ static void check_cpu_stall(struct rcu_state *rsp, struct rcu_data *rdp)
 		   ULONG_CMP_GE(j, js + RCU_STALL_RAT_DELAY)) {
 
 		/* They had a few time units to dump stack, so complain. */
-		print_other_cpu_stall(rsp);
+		print_other_cpu_stall(rsp, gpnum);
 	}
 }
 
@@ -991,7 +1063,7 @@ void rcu_cpu_stall_reset(void)
 	struct rcu_state *rsp;
 
 	for_each_rcu_flavor(rsp)
-		rsp->jiffies_stall = jiffies + ULONG_MAX / 2;
+		ACCESS_ONCE(rsp->jiffies_stall) = jiffies + ULONG_MAX / 2;
 }
 
 /*
@@ -1414,6 +1486,7 @@ static int rcu_gp_init(struct rcu_state *rsp)
 	struct rcu_data *rdp;
 	struct rcu_node *rnp = rcu_get_root(rsp);
 
+	ACCESS_ONCE(rsp->gp_activity) = jiffies;
 	raw_spin_lock_irq(&rnp->lock);
 	rsp->gp_flags = 0; /* Clear all flags: New grace period. */
 
@@ -1424,9 +1497,10 @@ static int rcu_gp_init(struct rcu_state *rsp)
 	}
 
 	/* Advance to a new grace period and initialize state. */
+	record_gp_stall_check_time(rsp);
+	smp_wmb(); /* Record GP times before starting GP. */
 	rsp->gpnum++;
 	trace_rcu_grace_period(rsp->name, rsp->gpnum, "start");
-	record_gp_stall_check_time(rsp);
 	raw_spin_unlock_irq(&rnp->lock);
 
 	/* Exclude any concurrent CPU-hotplug operations. */
@@ -1466,6 +1540,7 @@ static int rcu_gp_init(struct rcu_state *rsp)
 			udelay(200);
 #endif /* #ifdef CONFIG_PROVE_RCU_DELAY */
 		cond_resched();
+		ACCESS_ONCE(rsp->gp_activity) = jiffies;
 	}
 
 	mutex_unlock(&rsp->onoff_mutex);
@@ -1480,6 +1555,7 @@ int rcu_gp_fqs(struct rcu_state *rsp, int fqs_state_in)
 	int fqs_state = fqs_state_in;
 	struct rcu_node *rnp = rcu_get_root(rsp);
 
+	ACCESS_ONCE(rsp->gp_activity) = jiffies;
 	rsp->n_force_qs++;
 	if (fqs_state == RCU_SAVE_DYNTICK) {
 		/* Collect dyntick-idle snapshots. */
@@ -1508,6 +1584,7 @@ static void rcu_gp_cleanup(struct rcu_state *rsp)
 	struct rcu_data *rdp;
 	struct rcu_node *rnp = rcu_get_root(rsp);
 
+	ACCESS_ONCE(rsp->gp_activity) = jiffies;
 	raw_spin_lock_irq(&rnp->lock);
 	gp_duration = jiffies - rsp->gp_start;
 	if (gp_duration > rsp->gp_max)
@@ -1541,6 +1618,7 @@ static void rcu_gp_cleanup(struct rcu_state *rsp)
 		nocb += rcu_future_gp_cleanup(rsp, rnp);
 		raw_spin_unlock_irq(&rnp->lock);
 		cond_resched();
+		ACCESS_ONCE(rsp->gp_activity) = jiffies;
 	}
 	rnp = rcu_get_root(rsp);
 	raw_spin_lock_irq(&rnp->lock);
@@ -1578,6 +1656,7 @@ static int __noreturn rcu_gp_kthread(void *arg)
 			    rcu_gp_init(rsp))
 				break;
 			cond_resched();
+			ACCESS_ONCE(rsp->gp_activity) = jiffies;
 			flush_signals(current);
 		}
 
@@ -1603,9 +1682,11 @@ static int __noreturn rcu_gp_kthread(void *arg)
 			if (ret == 0 || (rsp->gp_flags & RCU_GP_FLAG_FQS)) {
 				fqs_state = rcu_gp_fqs(rsp, fqs_state);
 				cond_resched();
+				ACCESS_ONCE(rsp->gp_activity) = jiffies;
 			} else {
 				/* Deal with stray signal. */
 				cond_resched();
+				ACCESS_ONCE(rsp->gp_activity) = jiffies;
 				flush_signals(current);
 			}
 			j = jiffies_till_next_fqs;
@@ -2928,11 +3009,16 @@ static void _rcu_barrier(struct rcu_state *rsp)
 			continue;
 		rdp = per_cpu_ptr(rsp->rda, cpu);
 		if (rcu_is_nocb_cpu(cpu)) {
-			_rcu_barrier_trace(rsp, "OnlineNoCB", cpu,
-					   rsp->n_barrier_done);
-			atomic_inc(&rsp->barrier_cpu_count);
-			__call_rcu(&rdp->barrier_head, rcu_barrier_callback,
-				   rsp, cpu, 0);
+			if (!rcu_nocb_cpu_needs_barrier(rsp, cpu)) {
+				_rcu_barrier_trace(rsp, "OfflineNoCB", cpu,
+						   rsp->n_barrier_done);
+			} else {
+				_rcu_barrier_trace(rsp, "OnlineNoCB", cpu,
+						   rsp->n_barrier_done);
+				atomic_inc(&rsp->barrier_cpu_count);
+				__call_rcu(&rdp->barrier_head,
+					   rcu_barrier_callback, rsp, cpu, 0);
+			}
 		} else if (ACCESS_ONCE(rdp->qlen)) {
 			_rcu_barrier_trace(rsp, "OnlineQ", cpu,
 					   rsp->n_barrier_done);
@@ -3092,6 +3178,7 @@ static int rcu_cpu_notify(struct notifier_block *self,
 	case CPU_UP_PREPARE_FROZEN:
 		rcu_prepare_cpu(cpu);
 		rcu_prepare_kthreads(cpu);
+		rcu_spawn_all_nocb_kthreads(cpu);
 		break;
 	case CPU_ONLINE:
 	case CPU_DOWN_FAILED:
@@ -3137,8 +3224,8 @@ static int __init rcu_spawn_gp_kthread(void)
 		raw_spin_lock_irqsave(&rnp->lock, flags);
 		rsp->gp_kthread = t;
 		raw_spin_unlock_irqrestore(&rnp->lock, flags);
-		rcu_spawn_nocb_kthreads(rsp);
 	}
+	rcu_spawn_nocb_kthreads();
 	rcu_spawn_boost_kthreads();
 	return 0;
 }

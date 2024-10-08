@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/string.h>
+#include <linux/mm.h>
 
 struct linux_binprm;
 struct cred;

@@ -216,7 +216,9 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
 	if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages))
 		return -EINVAL;
 
-	nr_to_read = max_sane_readahead(nr_to_read);
+	nr_to_read = min(nr_to_read, (global_page_state(NR_INACTIVE_FILE) +
+				     (global_page_state(NR_FREE_PAGES)) / 2));
+
 	while (nr_to_read) {
 		int err;
 
@@ -235,16 +237,6 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
 		nr_to_read -= this_chunk;
 	}
 	return ret;
-}
-
-#define MAX_READAHEAD   ((512*4096)/PAGE_CACHE_SIZE)
-/*
- * Given a desired number of PAGE_CACHE_SIZE readahead pages, return a
- * sensible upper limit.
- */
-unsigned long max_sane_readahead(unsigned long nr)
-{
-	return min(nr, MAX_READAHEAD);
 }
 
 /*
@@ -400,7 +392,7 @@ ondemand_readahead(struct address_space *mapping,
 		   bool hit_readahead_marker, pgoff_t offset,
 		   unsigned long req_size)
 {
-	unsigned long max = max_sane_readahead(ra->ra_pages);
+	unsigned long max = ra->ra_pages;
 	pgoff_t prev_offset;
 
 	/*
@@ -516,6 +508,7 @@ void page_cache_sync_readahead(struct address_space *mapping,
 
 	/* be dumb */
 	if (filp && (filp->f_mode & FMODE_RANDOM)) {
+		req_size = min(req_size, inode_to_bdi(mapping->host)->ra_pages);
 		force_page_cache_readahead(mapping, filp, offset, req_size);
 		return;
 	}

@@ -82,8 +82,7 @@ static int mlx4_alloc_pages(struct mlx4_en_priv *priv,
 	/* Not doing get_page() for each frag is a big win
 	 * on asymetric workloads. Note we can not use atomic_set().
 	 */
-	atomic_add(page_alloc->page_size / frag_info->frag_stride - 1,
-		   &page->_count);
+	page_ref_add(page, page_alloc->page_size / frag_info->frag_stride - 1);
 	return 0;
 }
 
@@ -127,7 +126,9 @@ out:
 			dma_unmap_page(priv->ddev, page_alloc[i].dma,
 				page_alloc[i].page_size, PCI_DMA_FROMDEVICE);
 			page = page_alloc[i].page;
-			atomic_set(&page->_count, 1);
+			/* Revert changes done by mlx4_alloc_pages */
+			page_ref_sub(page, page_alloc[i].page_size /
+					   priv->frag_info[i].frag_stride - 1);
 			put_page(page);
 		}
 	}
@@ -164,7 +165,7 @@ static int mlx4_en_init_allocator(struct mlx4_en_priv *priv,
 
 		en_dbg(DRV, priv, "  frag %d allocator: - size:%d frags:%d\n",
 		       i, ring->page_alloc[i].page_size,
-		       atomic_read(&ring->page_alloc[i].page->_count));
+		       page_ref_count(ring->page_alloc[i].page));
 	}
 	return 0;
 
@@ -176,7 +177,9 @@ out:
 		dma_unmap_page(priv->ddev, page_alloc->dma,
 			       page_alloc->page_size, PCI_DMA_FROMDEVICE);
 		page = page_alloc->page;
-		atomic_set(&page->_count, 1);
+		/* Revert changes done by mlx4_alloc_pages */
+		page_ref_sub(page, page_alloc->page_size /
+				   priv->frag_info[i].frag_stride - 1);
 		put_page(page);
 		page_alloc->page = NULL;
 	}
@@ -912,7 +915,6 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 						PKT_HASH_TYPE_L3);
 
 			skb_record_rx_queue(gro_skb, cq->ring);
-			skb_mark_napi_id(gro_skb, &cq->napi);
 
 			if (ring->hwtstamp_rx_filter == HWTSTAMP_FILTER_ALL) {
 				timestamp = mlx4_en_get_cqe_ts(cqe);
@@ -975,8 +977,6 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 					       timestamp);
 		}
 
-		skb_mark_napi_id(skb, &cq->napi);
-
 		napi_gro_receive(&cq->napi, skb);
 next:
 		for (nr = 0; nr < priv->num_frags; nr++)
@@ -1022,6 +1022,10 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 	done = mlx4_en_process_rx_cq(dev, cq, budget);
 
 	/* If we used up all the quota - we're probably not done yet... */
+#ifndef CONFIG_GENERIC_HARDIRQS
+	cq->tot_rx += done;
+#endif
+
 	if (done == budget) {
 #ifdef CONFIG_GENERIC_HARDIRQS
 		int cpu_curr;
@@ -1042,6 +1046,14 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 		 * poll, and restart it on the right CPU
 		 */
 		done = 0;
+#else
+		if (cq->tot_rx < MLX4_EN_MIN_RX_ARM)
+			return budget;
+
+		cq->tot_rx = 0;
+		done = 0;
+	} else {
+		cq->tot_rx = 0;
 #endif
 	}
 	/* Done for now */

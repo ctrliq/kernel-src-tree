@@ -4,9 +4,10 @@
 #include <linux/udp.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <net/dst_metadata.h>
+#include <net/net_namespace.h>
 #include <net/udp.h>
 #include <net/udp_tunnel.h>
-#include <net/net_namespace.h>
 
 int udp_sock_create4(struct net *net, struct udp_port_cfg *cfg,
 		     struct socket **sockp)
@@ -77,10 +78,10 @@ void setup_udp_tunnel_sock(struct net *net, struct socket *sock,
 }
 EXPORT_SYMBOL_GPL(setup_udp_tunnel_sock);
 
-int udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
-			__be32 src, __be32 dst, __u8 tos, __u8 ttl,
-			__be16 df, __be16 src_port, __be16 dst_port,
-			bool xnet, bool nocheck)
+void udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+			 __be32 src, __be32 dst, __u8 tos, __u8 ttl,
+			 __be16 df, __be16 src_port, __be16 dst_port,
+			 bool xnet, bool nocheck)
 {
 	struct udphdr *uh;
 
@@ -94,8 +95,7 @@ int udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
 
 	udp_set_csum(nocheck, skb, src, dst, skb->len);
 
-	return iptunnel_xmit(sk, rt, skb, src, dst, IPPROTO_UDP,
-			     tos, ttl, df, xnet);
+	iptunnel_xmit(sk, rt, skb, src, dst, IPPROTO_UDP, tos, ttl, df, xnet);
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_xmit_skb);
 
@@ -106,5 +106,27 @@ void udp_tunnel_sock_release(struct socket *sock)
 	sk_release_kernel(sock->sk);
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_sock_release);
+
+struct metadata_dst *udp_tun_rx_dst(struct sk_buff *skb,  unsigned short family,
+				    __be16 flags, __be64 tunnel_id, int md_size)
+{
+	struct metadata_dst *tun_dst;
+	struct ip_tunnel_info *info;
+
+	if (family == AF_INET)
+		tun_dst = ip_tun_rx_dst(skb, flags, tunnel_id, md_size);
+	else
+		tun_dst = ipv6_tun_rx_dst(skb, flags, tunnel_id, md_size);
+	if (!tun_dst)
+		return NULL;
+
+	info = &tun_dst->u.tun_info;
+	info->key.tp_src = udp_hdr(skb)->source;
+	info->key.tp_dst = udp_hdr(skb)->dest;
+	if (udp_hdr(skb)->check)
+		info->key.tun_flags |= TUNNEL_CSUM;
+	return tun_dst;
+}
+EXPORT_SYMBOL_GPL(udp_tun_rx_dst);
 
 MODULE_LICENSE("GPL");

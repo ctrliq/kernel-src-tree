@@ -50,6 +50,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "exit_program_interruption", VCPU_STAT(exit_program_interruption) },
 	{ "exit_instr_and_program_int", VCPU_STAT(exit_instr_and_program) },
 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll) },
+	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll) },
 	{ "instruction_lctlg", VCPU_STAT(instruction_lctlg) },
 	{ "instruction_lctl", VCPU_STAT(instruction_lctl) },
 	{ "deliver_emergency_signal", VCPU_STAT(deliver_emergency_signal) },
@@ -424,7 +425,9 @@ int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 						    CPUSTAT_GED);
 	vcpu->arch.sie_block->ecb   = 6;
 	vcpu->arch.sie_block->ecb2  = 8;
-	vcpu->arch.sie_block->eca   = 0xC1002001U;
+	vcpu->arch.sie_block->eca   = 0xC1002000U;
+	if (sclp_has_siif())
+		vcpu->arch.sie_block->eca |= 1;
 	vcpu->arch.sie_block->fac   = (int) (long) vfacilities;
 	hrtimer_init(&vcpu->arch.ckc_timer, CLOCK_REALTIME, HRTIMER_MODE_ABS);
 	tasklet_init(&vcpu->arch.tasklet, kvm_s390_tasklet,
@@ -1168,6 +1171,12 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 static int __init kvm_s390_init(void)
 {
 	int ret;
+
+	if (!sclp_has_sief2()) {
+		pr_info("SIE not available\n");
+		return -ENODEV;
+	}
+
 	ret = kvm_init(NULL, sizeof(struct kvm_vcpu), 0, THIS_MODULE);
 	if (ret)
 		return ret;

@@ -445,9 +445,9 @@ static inline void cgw_unregister_filter(struct cgw_job *gwj)
 }
 
 static int cgw_notifier(struct notifier_block *nb,
-			unsigned long msg, void *data)
+			unsigned long msg, void *ptr)
 {
-	struct net_device *dev = (struct net_device *)data;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
@@ -564,7 +564,8 @@ static int cgw_put_job(struct sk_buff *skb, struct cgw_job *gwj, int type,
 			goto cancel;
 	}
 
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 cancel:
 	nlmsg_cancel(skb, nlh);
@@ -943,10 +944,10 @@ static __init int cgw_module_init(void)
 
 	/* set notifier */
 	notifier.notifier_call = cgw_notifier;
-	register_netdevice_notifier(&notifier);
+	register_netdevice_notifier_rh(&notifier);
 
 	if (__rtnl_register(PF_CAN, RTM_GETROUTE, NULL, cgw_dump_jobs, NULL)) {
-		unregister_netdevice_notifier(&notifier);
+		unregister_netdevice_notifier_rh(&notifier);
 		kmem_cache_destroy(cgw_cache);
 		return -ENOBUFS;
 	}
@@ -962,7 +963,7 @@ static __exit void cgw_module_exit(void)
 {
 	rtnl_unregister_all(PF_CAN);
 
-	unregister_netdevice_notifier(&notifier);
+	unregister_netdevice_notifier_rh(&notifier);
 
 	rtnl_lock();
 	cgw_remove_all_jobs();

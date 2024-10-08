@@ -250,8 +250,13 @@ static inline void free_swap_cache(struct page *page)
  */
 void free_page_and_swap_cache(struct page *page)
 {
-	free_swap_cache(page);
-	page_cache_release(page);
+	if (!is_trans_huge_page_release(page)) {
+		free_swap_cache(page);
+		page_cache_release(page);
+	} else {
+		/* page might have to be decoded */
+		release_pages(&page, 1, false);
+	}
 }
 
 /*
@@ -267,8 +272,15 @@ void free_pages_and_swap_cache(struct page **pages, int nr)
 		int todo = min(nr, PAGEVEC_SIZE);
 		int i;
 
-		for (i = 0; i < todo; i++)
-			free_swap_cache(pagep[i]);
+		for (i = 0; i < todo; i++) {
+			struct page *page = pagep[i];
+			/*
+			 * THP cannot be in swapcache and is also
+			 * still encoded.
+			 */
+			if (!is_trans_huge_page_release(page))
+				free_swap_cache(page);
+		}
 		release_pages(pagep, todo, false);
 		pagep += todo;
 		nr -= todo;

@@ -147,6 +147,13 @@ static inline int ap_test_bit(unsigned int *ptr, unsigned int nr)
 #define AP_INTR_ENABLED		1	/* AP interrupt enabled */
 #define AP_INTR_IN_PROGRESS	3	/* AP interrupt in progress */
 
+/*
+ * AP device registration states
+ */
+#define AP_DEV_UNREGISTERED		2 /* unregistered or orphaned device */
+#define AP_DEV_REGIST_IN_PROGRESS	1 /* device registration in progress */
+#define AP_DEV_REGISTERED		0 /* device fully registered */
+
 struct ap_device;
 struct ap_message;
 

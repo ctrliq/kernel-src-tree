@@ -280,8 +280,8 @@
 #define __NR_s390_runtime_instr 342
 #define __NR_kcmp		343
 #define __NR_finit_module	344
-/* Number 345 is reserved for sys_sched_setattr */
-/* Number 346 is reserved for sys_sched_getattr */
+#define __NR_sched_setattr 345
+#define __NR_sched_getattr 346
 /* Number 347 is reserved for sys_renameat2 */
 /* Number 348 is reserved for sys_seccomp */
 /* Number 349 is reserved for sys_getrandom */

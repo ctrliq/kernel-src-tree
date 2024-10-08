@@ -178,7 +178,7 @@ EXPORT_SYMBOL_GPL(usb_control_msg);
  *
  * Return:
  * If successful, 0. Otherwise a negative error number. The number of actual
- * bytes transferred will be stored in the @actual_length paramater.
+ * bytes transferred will be stored in the @actual_length parameter.
  */
 int usb_interrupt_msg(struct usb_device *usb_dev, unsigned int pipe,
 		      void *data, int len, int *actual_length, int timeout)
@@ -1941,6 +1941,7 @@ free_interfaces:
 	usb_autosuspend_device(dev);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(usb_set_configuration);
 
 static LIST_HEAD(set_config_list);
 static DEFINE_SPINLOCK(set_config_lock);

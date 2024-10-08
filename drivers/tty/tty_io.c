@@ -155,20 +155,6 @@ static int tty_fasync(int fd, struct file *filp, int on);
 static void release_tty(struct tty_struct *tty, int idx);
 
 /**
- *	alloc_tty_struct	-	allocate a tty object
- *
- *	Return a new empty tty structure. The data fields have not
- *	been initialized in any way but has been zeroed
- *
- *	Locking: none
- */
-
-struct tty_struct *alloc_tty_struct(void)
-{
-	return kzalloc(sizeof(struct tty_struct), GFP_KERNEL);
-}
-
-/**
  *	free_tty_struct		-	free a disused tty
  *	@tty: tty struct to free
  *
@@ -181,7 +167,8 @@ void free_tty_struct(struct tty_struct *tty)
 {
 	if (!tty)
 		return;
-	put_device(tty->dev);
+	if (tty->dev)
+		put_device(tty->dev);
 	kfree(tty->write_buf);
 	tty->magic = 0xDEADDEAD;
 	kfree(tty);
@@ -698,8 +685,10 @@ static void __tty_hangup(struct tty_struct *tty, int exit_session)
 
 	tty_lock(tty);
 
-	/* some functions below drop BTM, so we need this bit */
-	set_bit(TTY_HUPPING, &tty->flags);
+	if (test_bit(TTY_HUPPED, &tty->flags)) {
+		tty_unlock(tty);
+		return;
+	}
 
 	/* inuse_filps is protected by the single tty lock,
 	   this really needs to change if we want to flush the
@@ -725,10 +714,6 @@ static void __tty_hangup(struct tty_struct *tty, int exit_session)
 	while (refs--)
 		tty_kref_put(tty);
 
-	/*
-	 * it drops BTM and thus races with reopen
-	 * we protect the race by TTY_HUPPING
-	 */
 	tty_ldisc_hangup(tty);
 
 	spin_lock_irq(&tty->ctrl_lock);
@@ -761,8 +746,6 @@ static void __tty_hangup(struct tty_struct *tty, int exit_session)
 	 * can't yet guarantee all that.
 	 */
 	set_bit(TTY_HUPPED, &tty->flags);
-	clear_bit(TTY_HUPPING, &tty->flags);
-
 	tty_unlock(tty);
 
 	if (f)
@@ -1224,7 +1207,7 @@ void tty_write_message(struct tty_struct *tty, char *msg)
 	if (tty) {
 		mutex_lock(&tty->atomic_write_lock);
 		tty_lock(tty);
-		if (tty->ops->write && !test_bit(TTY_CLOSING, &tty->flags)) {
+		if (tty->ops->write && tty->count > 0) {
 			tty_unlock(tty);
 			tty->ops->write(tty, msg, strlen(msg));
 		} else
@@ -1455,13 +1438,12 @@ static int tty_reopen(struct tty_struct *tty)
 {
 	struct tty_driver *driver = tty->driver;
 
-	if (test_bit(TTY_CLOSING, &tty->flags) ||
-			test_bit(TTY_HUPPING, &tty->flags))
-		return -EIO;
-
 	if (driver->type == TTY_DRIVER_TYPE_PTY &&
 	    driver->subtype == PTY_TYPE_MASTER)
 		return -EIO;
+
+	if (!tty->count)
+		return -EAGAIN;
 
 	if (test_bit(TTY_EXCLUSIVE, &tty->flags) && !capable(CAP_SYS_ADMIN))
 		return -EBUSY;
@@ -1513,12 +1495,11 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
 	if (!try_module_get(driver->owner))
 		return ERR_PTR(-ENODEV);
 
-	tty = alloc_tty_struct();
+	tty = alloc_tty_struct(driver, idx);
 	if (!tty) {
 		retval = -ENOMEM;
 		goto err_module_put;
 	}
-	initialize_tty_struct(tty, driver, idx);
 
 	tty_lock(tty);
 	retval = tty_driver_install_tty(driver, tty);
@@ -1689,7 +1670,8 @@ static void release_tty(struct tty_struct *tty, int idx)
 		tty->link->port->itty = NULL;
 	cancel_work_sync(&tty->port->buf.work);
 
-	tty_kref_put(tty->link);
+	if (tty->link)
+		tty_kref_put(tty->link);
 	tty_kref_put(tty);
 }
 
@@ -1790,7 +1772,9 @@ int tty_release(struct inode *inode, struct file *filp)
 	if (tty->ops->close)
 		tty->ops->close(tty, filp);
 
-	tty_unlock(tty);
+	/* If tty is pty master, lock the slave pty (stable lock order) */
+	tty_lock_slave(o_tty);
+
 	/*
 	 * Sanity check: if tty->count is going to zero, there shouldn't be
 	 * any waiters on tty->read_wait or tty->write_wait.  We test the
@@ -1804,8 +1788,6 @@ int tty_release(struct inode *inode, struct file *filp)
 	 * Thus this test wouldn't be triggered at the time the slave closed,
 	 * so we do it now.
 	 */
-	tty_lock_pair(tty, o_tty);
-
 	while (1) {
 		do_sleep = 0;
 
@@ -1864,16 +1846,6 @@ int tty_release(struct inode *inode, struct file *filp)
 	/*
 	 * Perform some housekeeping before deciding whether to return.
 	 *
-	 * Set the TTY_CLOSING flag if this was the last open.  In the
-	 * case of a pty we may have to wait around for the other side
-	 * to close, and TTY_CLOSING makes sure we can't be reopened.
-	 */
-	if (tty_closing)
-		set_bit(TTY_CLOSING, &tty->flags);
-	if (o_tty_closing)
-		set_bit(TTY_CLOSING, &o_tty->flags);
-
-	/*
 	 * If _either_ side is closing, make sure there aren't any
 	 * processes that still think tty or o_tty is their controlling
 	 * tty.
@@ -1889,8 +1861,10 @@ int tty_release(struct inode *inode, struct file *filp)
 	/* check whether both sides are closing ... */
 	final = !tty->count && !(o_tty && o_tty->count);
 
-	tty_unlock_pair(tty, o_tty);
-	/* At this point the TTY_CLOSING flag should ensure a dead tty
+	tty_unlock_slave(o_tty);
+	tty_unlock(tty);
+
+	/* At this point, the tty->count == 0 should ensure a dead tty
 	   cannot be re-opened by a racing opener */
 
 	if (!final)
@@ -2093,7 +2067,11 @@ retry_open:
 
 	if (IS_ERR(tty)) {
 		retval = PTR_ERR(tty);
-		goto err_file;
+		if (retval != -EAGAIN || signal_pending(current))
+			goto err_file;
+		tty_free_file(filp);
+		schedule();
+		goto retry_open;
 	}
 
 	tty_add_file(tty, filp);
@@ -3049,19 +3027,21 @@ static struct device *tty_get_device(struct tty_struct *tty)
 
 
 /**
- *	initialize_tty_struct
- *	@tty: tty to initialize
+ *	alloc_tty_struct
  *
- *	This subroutine initializes a tty structure that has been newly
- *	allocated.
+ *	This subroutine allocates and initializes a tty structure.
  *
- *	Locking: none - tty in question must not be exposed at this point
+ *	Locking: none - tty in question is not exposed at this point
  */
 
-void initialize_tty_struct(struct tty_struct *tty,
-		struct tty_driver *driver, int idx)
+struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
 {
-	memset(tty, 0, sizeof(struct tty_struct));
+	struct tty_struct *tty;
+
+	tty = kzalloc(sizeof(*tty), GFP_KERNEL);
+	if (!tty)
+		return NULL;
+
 	kref_init(&tty->kref);
 	tty->magic = TTY_MAGIC;
 	tty_ldisc_init(tty);
@@ -3083,6 +3063,8 @@ void initialize_tty_struct(struct tty_struct *tty,
 	tty->index = idx;
 	tty_line_name(driver, idx, tty->name);
 	tty->dev = tty_get_device(tty);
+
+	return tty;
 }
 
 /**

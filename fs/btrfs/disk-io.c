@@ -873,20 +873,17 @@ int btrfs_wq_submit_bio(struct btrfs_fs_info *fs_info, struct inode *inode,
 
 static int btree_csum_one_bio(struct bio *bio)
 {
-	struct bio_vec *bvec = bio->bi_io_vec;
-	int bio_index = 0;
+	struct bio_vec *bvec;
 	struct btrfs_root *root;
-	int ret = 0;
+	int i, ret = 0;
 
-	WARN_ON(bio->bi_vcnt <= 0);
-	while (bio_index < bio->bi_vcnt) {
+	bio_for_each_segment_all(bvec, bio, i) {
 		root = BTRFS_I(bvec->bv_page->mapping->host)->root;
 		ret = csum_dirty_buffer(root->fs_info, bvec->bv_page);
 		if (ret)
 			break;
-		bio_index++;
-		bvec++;
 	}
+
 	return ret;
 }
 
@@ -1793,7 +1790,10 @@ static int cleaner_kthread(void *arg)
 			goto sleep;
 		}
 
+		mutex_lock(&root->fs_info->cleaner_delayed_iput_mutex);
 		btrfs_run_delayed_iputs(root);
+		mutex_unlock(&root->fs_info->cleaner_delayed_iput_mutex);
+
 		again = btrfs_clean_one_deleted_snapshot(root);
 		mutex_unlock(&root->fs_info->cleaner_mutex);
 
@@ -2554,8 +2554,8 @@ int open_ctree(struct super_block *sb,
 	mutex_init(&fs_info->delete_unused_bgs_mutex);
 	mutex_init(&fs_info->reloc_mutex);
 	mutex_init(&fs_info->delalloc_root_mutex);
+	mutex_init(&fs_info->cleaner_delayed_iput_mutex);
 	seqlock_init(&fs_info->profiles_lock);
-	init_rwsem(&fs_info->delayed_iput_sem);
 
 	INIT_LIST_HEAD(&fs_info->dirty_cowonly_roots);
 	INIT_LIST_HEAD(&fs_info->space_info);
@@ -2634,6 +2634,7 @@ int open_ctree(struct super_block *sb,
 	mutex_init(&fs_info->transaction_kthread_mutex);
 	mutex_init(&fs_info->cleaner_mutex);
 	mutex_init(&fs_info->volume_mutex);
+	mutex_init(&fs_info->ro_block_group_mutex);
 	init_rwsem(&fs_info->commit_root_sem);
 	init_rwsem(&fs_info->cleanup_work_sem);
 	init_rwsem(&fs_info->subvol_sem);

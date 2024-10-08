@@ -16,6 +16,12 @@ CFLAGS_REMOVE_ftrace.o = -pg
 CFLAGS_REMOVE_early_printk.o = -pg
 endif
 
+OBJECT_FILES_NON_STANDARD_head_$(BITS).o		:= y
+OBJECT_FILES_NON_STANDARD_relocate_kernel_$(BITS).o	:= y
+OBJECT_FILES_NON_STANDARD_mcount_$(BITS).o		:= y
+OBJECT_FILES_NON_STANDARD_test_nx.o			:= y
+OBJECT_FILES_NON_STANDARD_entry_$(BITS).o		:= y
+
 CFLAGS_irq.o := -I$(src)/../include/asm/trace
 
 obj-y			:= process_$(BITS).o signal.o entry_$(BITS).o
@@ -89,7 +95,7 @@ obj-$(CONFIG_KVM_GUEST)		+= kvm.o kvmclock.o
 obj-$(CONFIG_PARAVIRT)		+= paravirt.o paravirt_patch_$(BITS).o
 obj-$(CONFIG_PARAVIRT_SPINLOCKS)+= paravirt-spinlocks.o
 obj-$(CONFIG_PARAVIRT_CLOCK)	+= pvclock.o
-obj-$(CONFIG_X86_PMEM_LEGACY)	+= pmem.o
+obj-$(CONFIG_X86_PMEM_LEGACY_DEVICE) += pmem.o
 
 obj-$(CONFIG_PCSPKR_PLATFORM)	+= pcspeaker.o
 

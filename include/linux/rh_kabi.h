@@ -24,6 +24,8 @@
  * RH_KABI_REPLACE - simple replacement of _orig with a union of _orig and _new
  * RH_KABI_DEPRECATE - mark the element as deprecated and make it unusable
  *		       by modules while preserving kABI checksums
+ * RH_KABI_DEPRECATE_FN - mark the function pointer as deprecated and make it
+ * 			  unusable by modules while preserving kABI checksums
  *
  * RH_KABI_EXTEND - simple macro for adding a new element to a struct while
  *                  preserving the kabi agreement (by wrapping with GENKSYMS).
@@ -48,6 +50,7 @@
 # define _RH_KABI_REPLACE(_orig, _new)		_orig
 # define _RH_KABI_REPLACE_UNSAFE(_orig, _new)	_orig
 # define _RH_KABI_DEPRECATE(_type, _orig)	_type _orig
+# define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...)	_type (*_orig)(_args)
 
 # define RH_KABI_EXTEND(_new)
 # define RH_KABI_FILL_HOLE(_new)
@@ -79,6 +82,8 @@
 #define _RH_KABI_REPLACE_UNSAFE(_orig, _new)	_new
 
 # define _RH_KABI_DEPRECATE(_type, _orig)	_type rh_reserved_##_orig
+# define _RH_KABI_DEPRECATE_FN(_type, _orig, _args...) \
+	_type (* rh_reserved_##_orig)(_args)
 
 # define RH_KABI_EXTEND(_new)         		_new;
 
@@ -92,6 +97,8 @@
 #define RH_KABI_REPLACE(_orig, _new)		_RH_KABI_REPLACE(_orig, _new);
 #define RH_KABI_REPLACE_UNSAFE(_orig, _new)	_RH_KABI_REPLACE_UNSAFE(_orig, _new);
 #define RH_KABI_DEPRECATE(_type, _orig)		_RH_KABI_DEPRECATE(_type, _orig);
+#define RH_KABI_DEPRECATE_FN(_type, _orig, _args...) \
+	_RH_KABI_DEPRECATE_FN(_type, _orig, _args);
 
 /*
  * We tried to standardize on Red Hat reserved names.  These wrappers leverage

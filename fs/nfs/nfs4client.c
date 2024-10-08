@@ -228,6 +228,7 @@ static void nfs4_shutdown_client(struct nfs_client *clp)
 	kfree(clp->cl_serverowner);
 	kfree(clp->cl_serverscope);
 	kfree(clp->cl_implid);
+	kfree(clp->cl_owner_id);
 }
 
 void nfs4_free_client(struct nfs_client *clp)
@@ -503,8 +504,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
 			atomic_inc(&pos->cl_count);
 			spin_unlock(&nn->nfs_client_lock);
 
-			if (prev)
-				nfs_put_client(prev);
+			nfs_put_client(prev);
 			prev = pos;
 
 			status = nfs_wait_client_init_complete(pos);
@@ -525,8 +525,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
 		atomic_inc(&pos->cl_count);
 		spin_unlock(&nn->nfs_client_lock);
 
-		if (prev)
-			nfs_put_client(prev);
+		nfs_put_client(prev);
 		prev = pos;
 
 		status = nfs4_proc_setclientid_confirm(pos, &clid, cred);
@@ -557,8 +556,7 @@ int nfs40_walk_client_list(struct nfs_client *new,
 
 	/* No match found. The server lost our clientid */
 out:
-	if (prev)
-		nfs_put_client(prev);
+	nfs_put_client(prev);
 	dprintk("NFS: <-- %s status = %d\n", __func__, status);
 	return status;
 }
@@ -643,8 +641,7 @@ int nfs41_walk_client_list(struct nfs_client *new,
 			atomic_inc(&pos->cl_count);
 			spin_unlock(&nn->nfs_client_lock);
 
-			if (prev)
-				nfs_put_client(prev);
+			nfs_put_client(prev);
 			prev = pos;
 
 			status = nfs_wait_client_init_complete(pos);
@@ -684,8 +681,7 @@ found:
 
 	spin_unlock(&nn->nfs_client_lock);
 	dprintk("NFS: <-- %s status = %d\n", __func__, status);
-	if (prev)
-		nfs_put_client(prev);
+	nfs_put_client(prev);
 	return status;
 }
 #endif	/* CONFIG_NFS_V4_1 */

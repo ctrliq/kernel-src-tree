@@ -300,9 +300,9 @@ static int net_dm_cmd_trace(struct sk_buff *skb,
 }
 
 static int dropmon_net_event(struct notifier_block *ev_block,
-			unsigned long event, void *ptr)
+			     unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct dm_hw_stat_delta *new_stat = NULL;
 	struct dm_hw_stat_delta *tmp;
 
@@ -377,7 +377,7 @@ static int __init init_net_drop_monitor(void)
 	}
 	WARN_ON(net_drop_monitor_family.mcgrp_offset != NET_DM_GRP_ALERT);
 
-	rc = register_netdevice_notifier(&dropmon_net_notifier);
+	rc = register_netdevice_notifier_rh(&dropmon_net_notifier);
 	if (rc < 0) {
 		pr_crit("Failed to register netdevice notifier\n");
 		goto out_unreg;
@@ -409,7 +409,7 @@ static void exit_net_drop_monitor(void)
 	struct per_cpu_dm_data *data;
 	int cpu;
 
-	BUG_ON(unregister_netdevice_notifier(&dropmon_net_notifier));
+	BUG_ON(unregister_netdevice_notifier_rh(&dropmon_net_notifier));
 
 	/*
 	 * Because of the module_get/put we do in the trace state change path

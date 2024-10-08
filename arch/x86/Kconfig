@@ -22,6 +22,8 @@ config X86_64
 config X86
 	def_bool y
 	select ARCH_HAS_DEBUG_STRICT_USER_COPY_CHECKS
+	select ARCH_HAS_PMEM_API		if X86_64
+	select ARCH_HAS_MMIO_FLUSH
 	select HAVE_AOUT if X86_32
 	select HAVE_UNSTABLE_SCHED_CLOCK
 	select ARCH_SUPPORTS_NUMA_BALANCING
@@ -36,6 +38,8 @@ config X86
 	select HAVE_MEMBLOCK
 	select HAVE_MEMBLOCK_NODE_MAP
 	select ARCH_DISCARD_MEMBLOCK
+	select ARCH_SUPPORTS_DEFERRED_STRUCT_PAGE_INIT
+	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if SMP
 	select ARCH_WANT_OPTIONAL_GPIOLIB
 	select ARCH_WANT_FRAME_POINTERS
 	select HAVE_DMA_ATTRS
@@ -94,6 +98,7 @@ config X86
 	select USE_GENERIC_SMP_HELPERS if SMP
 	select HAVE_BPF_JIT if X86_64
 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+	select HAVE_ARCH_HUGE_VMAP if X86_64 || (X86_32 && X86_PAE)
 	select CLKEVT_I8253
 	select ARCH_HAVE_NMI_SAFE_CMPXCHG
 	select GENERIC_IOMAP
@@ -103,6 +108,7 @@ config X86
 	select HAVE_ARCH_SECCOMP_FILTER
 	select BUILDTIME_EXTABLE_SORT
 	select GENERIC_CMOS_UPDATE
+	select HAVE_ARCH_SOFT_DIRTY
 	select GENERIC_CLOCKEVENTS
 	select ARCH_CLOCKSOURCE_DATA if X86_64
 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
@@ -123,6 +129,7 @@ config X86
 	select COMPAT_OLD_SIGACTION if IA32_EMULATION
 	select RTC_LIB
 	select HAVE_CC_STACKPROTECTOR
+	select HAVE_STACK_VALIDATION if X86_64
 
 config INSTRUCTION_DECODER
 	def_bool y
@@ -209,6 +216,12 @@ config ARCH_HIBERNATION_POSSIBLE
 config ARCH_SUSPEND_POSSIBLE
 	def_bool y
 
+config ARCH_WANT_HUGE_PMD_SHARE
+	def_bool y
+
+config ARCH_WANT_GENERAL_HUGETLB
+	def_bool y
+
 config ZONE_DMA32
 	bool
 	default X86_64
@@ -226,6 +239,10 @@ config ARCH_SUPPORTS_DEBUG_PAGEALLOC
 config HAVE_INTEL_TXT
 	def_bool y
 	depends on INTEL_IOMMU && ACPI
+
+config X86_INTEL_MPX
+	def_bool y
+	depends on CPU_SUP_INTEL
 
 config X86_32_SMP
 	def_bool y
@@ -469,11 +486,12 @@ config X86_INTEL_LPSS
 	bool "Intel Low Power Subsystem Support"
 	depends on ACPI
 	select COMMON_CLK
+	select PINCTRL
 	---help---
 	  Select to build support for Intel Low Power Subsystem such as
 	  found on Intel Lynxpoint PCH. Selecting this option enables
-	  things like clock tree (common clock framework) which are needed
-	  by the LPSS peripheral drivers.
+	  things like clock tree (common clock framework) and pincontrol
+	  which are needed by the LPSS peripheral drivers.
 
 config X86_RDC321X
 	bool "RDC R-321x SoC"
@@ -1016,22 +1034,25 @@ config X86_REBOOTFIXUPS
 	  Say N otherwise.
 
 config MICROCODE
-	tristate "CPU microcode loading support"
+	bool "CPU microcode loading support"
+	default y
 	select FW_LOADER
 	---help---
-
 	  If you say Y here, you will be able to update the microcode on
-	  certain Intel and AMD processors. The Intel support is for the
-	  IA32 family, e.g. Pentium Pro, Pentium II, Pentium III, Pentium 4,
-	  Xeon etc. The AMD support is for families 0x10 and later. You will
-	  obviously need the actual microcode binary data itself which is not
-	  shipped with the Linux kernel.
+	  Intel and AMD processors. The Intel support is for the IA32 family,
+	  e.g. Pentium Pro, Pentium II, Pentium III, Pentium 4, Xeon etc. The
+	  AMD support is for families 0x10 and later. You will obviously need
+	  the actual microcode binary data itself which is not shipped with
+	  the Linux kernel.
 
-	  This option selects the general module only, you need to select
-	  at least one vendor specific module as well.
+	  The preferred method to load microcode from a detached initrd is described
+	  in Documentation/x86/early-microcode.txt. For that you need to enable
+	  CONFIG_BLK_DEV_INITRD in order for the loader to be able to scan the
+	  initrd for microcode blobs.
 
-	  To compile this driver as a module, choose M here: the module
-	  will be called microcode.
+	  In addition, you can build-in the microcode into the kernel. For that you
+	  need to enable FIRMWARE_IN_KERNEL and add the vendor-supplied microcode
+	  to the CONFIG_EXTRA_FIRMWARE config option.
 
 config MICROCODE_INTEL
 	bool "Intel microcode loading support"
@@ -1057,24 +1078,6 @@ config MICROCODE_AMD
 config MICROCODE_OLD_INTERFACE
 	def_bool y
 	depends on MICROCODE
-
-config MICROCODE_INTEL_EARLY
-	def_bool n
-
-config MICROCODE_AMD_EARLY
-	def_bool n
-
-config MICROCODE_EARLY
-	bool "Early load microcode"
-	depends on MICROCODE=y && BLK_DEV_INITRD
-	select MICROCODE_INTEL_EARLY if MICROCODE_INTEL
-	select MICROCODE_AMD_EARLY if MICROCODE_AMD
-	default y
-	help
-	  This option provides functionality to read additional microcode data
-	  at the beginning of initrd image. The data tells kernel to load
-	  microcode to CPU's as early as possible. No functional change if no
-	  microcode data is glued to the initrd, therefore it's safe to say Y.
 
 config X86_MSR
 	tristate "/dev/cpu/*/msr - Model-specific register support"
@@ -1359,10 +1362,14 @@ config ILLEGAL_POINTER_VALUE
 
 source "mm/Kconfig"
 
+config X86_PMEM_LEGACY_DEVICE
+	bool
+
 config X86_PMEM_LEGACY
-	bool "Support non-standard NVDIMMs and ADR protected memory"
+	tristate "Support non-standard NVDIMMs and ADR protected memory"
 	depends on PHYS_ADDR_T_64BIT
 	depends on BLK_DEV
+	select X86_PMEM_LEGACY_DEVICE
 	select LIBNVDIMM
 	help
 	  Treat memory marked using the non-standard e820 type of 12 as used
@@ -1607,6 +1614,20 @@ config EFI_SECURE_BOOT_SECURELEVEL
 	  mechanism that could insert untrusted code into the kernel.
 	  Say Y here to automatically enable securelevel enforcement
 	  when a system boots with UEFI Secure Boot enabled.
+
+config EFI_MIXED
+	bool "EFI mixed-mode support"
+	depends on EFI_STUB && X86_64
+	---help---
+	   Enabling this feature allows a 64-bit kernel to be booted
+	   on a 32-bit firmware, provided that your CPU supports 64-bit
+	   mode.
+
+	   Note that it is not possible to boot a mixed-mode enabled
+	   kernel via the EFI boot stub - a bootloader that supports
+	   the EFI handover protocol must be used.
+
+	   If unsure, say N.
 
 config SECCOMP
 	def_bool y
@@ -1924,6 +1945,10 @@ config USE_PERCPU_NUMA_NODE_ID
 config ARCH_ENABLE_SPLIT_PMD_PTLOCK
 	def_bool y
 	depends on X86_64 || X86_PAE
+
+config ARCH_ENABLE_HUGEPAGE_MIGRATION
+	def_bool y
+	depends on X86_64 && HUGETLB_PAGE && MIGRATION
 
 menu "Power management and ACPI options"
 
@@ -2410,6 +2435,19 @@ config IOSF_MBI
 	tristate
 	default m
 	depends on PCI
+
+config VMD
+	depends on PCI_MSI
+	tristate "Volume Management Device Driver"
+	default N
+	---help---
+	  Adds support for the Intel Volume Management Device (VMD). VMD is a
+	  secondary PCI host bridge that allows PCI Express root ports,
+	  and devices attached to them, to be removed from the default
+	  PCI domain and placed within the VMD domain. This provides
+	  more bus resources than are otherwise possible with a
+	  single domain. If you know your system provides one of these and
+	  has devices attached to it, say Y; if you are not sure, say N.
 
 source "net/Kconfig"
 

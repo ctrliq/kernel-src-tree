@@ -422,35 +422,6 @@ static inline __must_check bool ktime_to_timespec64_cond(const ktime_t kt,
 /* Get the monotonic time in timespec format: */
 extern void ktime_get_ts64(struct timespec64 *ts);
 
-#if BITS_PER_LONG == 64
-static inline void ktime_get_ts(struct timespec *ts)
-{
-	ktime_get_ts64(ts);
-}
-
-static inline void ktime_get_real_ts(struct timespec *ts)
-{
-	getnstimeofday64(ts);
-}
-
-#else
-static inline void ktime_get_ts(struct timespec *ts)
-{
-	struct timespec64 ts64;
-
-	ktime_get_ts64(&ts64);
-	*ts = timespec64_to_timespec(ts64);
-}
-
-static inline void ktime_get_real_ts(struct timespec *ts)
-{
-	struct timespec64 ts64;
-
-	getnstimeofday64(&ts64);
-	*ts = timespec64_to_timespec(ts64);
-}
-#endif
-
 /* Get the real (wall-) time in timespec format: */
 #define ktime_get_real_ts64(ts)	getnstimeofday64(ts)
 
@@ -467,5 +438,7 @@ static inline ktime_t ms_to_ktime(u64 ms)
 
 	return ktime_add_ms(ktime_zero, ms);
 }
+
+# include <linux/timekeeping.h>
 
 #endif

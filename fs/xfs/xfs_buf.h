@@ -23,6 +23,7 @@
 #include <linux/spinlock.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/dax.h>
 #include <linux/buffer_head.h>
 #include <linux/uio.h>
 
@@ -45,7 +46,7 @@ typedef enum {
 #define XBF_ASYNC	 (1 << 4) /* initiator will not wait for completion */
 #define XBF_DONE	 (1 << 5) /* all pages in the buffer uptodate */
 #define XBF_STALE	 (1 << 6) /* buffer has been staled, do not find it */
-#define XBF_WRITE_FAIL	 (1 << 24)/* async writes have failed on this buffer */
+#define XBF_WRITE_FAIL	 (1 << 25)/* async writes have failed on this buffer */
 
 /* I/O hints for the BIO layer */
 #define XBF_SYNCIO	 (1 << 10)/* treat this buffer as synchronous I/O */
@@ -61,7 +62,7 @@ typedef enum {
 #define _XBF_KMEM	 (1 << 21)/* backed by heap memory */
 #define _XBF_DELWRI_Q	 (1 << 22)/* buffer on a delwri queue */
 #define _XBF_COMPOUND	 (1 << 23)/* compound buffer */
-#define _XBF_LRU_DISPOSE (1 << 24)/* buffer being discarded */
+#define _XBF_IN_FLIGHT	 (1 << 26) /* I/O in flight, for accounting purposes */
 
 typedef unsigned int xfs_buf_flags_t;
 
@@ -82,8 +83,12 @@ typedef unsigned int xfs_buf_flags_t;
 	{ _XBF_KMEM,		"KMEM" }, \
 	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, \
 	{ _XBF_COMPOUND,	"COMPOUND" }, \
-	{ _XBF_LRU_DISPOSE,	"LRU_DISPOSE" }
+	{ _XBF_IN_FLIGHT,	"IN_FLIGHT" }
 
+/*
+ * Internal state flags.
+ */
+#define XFS_BSTATE_DISPOSE	(1 << 0)	/* buffer being discarded */
 
 /*
  * The xfs_buftarg contains 2 notions of "sector size" -
@@ -113,6 +118,8 @@ typedef struct xfs_buftarg {
 	struct list_head	bt_lru;
 	spinlock_t		bt_lru_lock;
 	unsigned int		bt_lru_nr;
+
+	struct percpu_counter	bt_io_count;
 } xfs_buftarg_t;
 
 struct xfs_buf;
@@ -156,8 +163,8 @@ typedef struct xfs_buf {
 	 * bt_lru_lock and not by b_sema
 	 */
 	struct list_head	b_lru;		/* lru list */
-	xfs_buf_flags_t		b_lru_flags;	/* internal lru status flags */
 	spinlock_t		b_lock;		/* internal state lock */
+	unsigned int		b_state;	/* internal state flags */
 	int			b_io_error;	/* internal IO error state */
 	wait_queue_head_t	b_waiters;	/* unpin waiters */
 	struct list_head	b_list;
@@ -181,6 +188,26 @@ typedef struct xfs_buf {
 	unsigned int		b_page_count;	/* size of page array */
 	unsigned int		b_offset;	/* page offset in first page */
 	int			b_error;	/* error code on I/O */
+
+	/*
+	 * async write failure retry count. Initialised to zero on the first
+	 * failure, then when it exceeds the maximum configured without a
+	 * success the write is considered to be failed permanently and the
+	 * iodone handler will take appropriate action.
+	 *
+	 * For retry timeouts, we record the jiffie of the first failure. This
+	 * means that we can change the retry timeout for buffers already under
+	 * I/O and thus avoid getting stuck in a retry loop with a long timeout.
+	 *
+	 * last_error is used to ensure that we are getting repeated errors, not
+	 * different errors. e.g. a block device might change ENOSPC to EIO when
+	 * a failure timeout occurs, so we want to re-initialise the error
+	 * retry behaviour appropriately when that happens.
+	 */
+	int			b_retries;
+	unsigned long		b_first_retry_time; /* in jiffies */
+	int			b_last_error;
+
 	const struct xfs_buf_ops	*b_ops;
 
 #ifdef XFS_BUF_LOCK_TRACKING

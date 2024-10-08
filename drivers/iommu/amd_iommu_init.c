@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2007-2010 Advanced Micro Devices, Inc.
- * Author: Joerg Roedel <joerg.roedel@amd.com>
+ * Author: Joerg Roedel <jroedel@suse.de>
  *         Leo Duran <leo.duran@amd.com>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -225,6 +225,7 @@ static enum iommu_init_state init_state = IOMMU_START_STATE;
 
 static int amd_iommu_enable_interrupts(void);
 static int __init iommu_go_to_state(enum iommu_init_state state);
+static void init_device_table_dma(void);
 
 static inline void update_last_devid(u16 devid)
 {
@@ -1345,9 +1346,25 @@ static int __init amd_iommu_init_pci(void)
 			break;
 	}
 
-	ret = amd_iommu_init_devices();
+	/*
+	 * Order is important here to make sure any unity map requirements are
+	 * fulfilled. The unity mappings are created and written to the device
+	 * table during the amd_iommu_init_api() call.
+	 *
+	 * After that we call init_device_table_dma() to make sure any
+	 * uninitialized DTE will block DMA, and in the end we flush the caches
+	 * of all IOMMUs to make sure the changes to the device table are
+	 * active.
+	 */
+	ret = amd_iommu_init_api();
 
-	print_iommu_info();
+	init_device_table_dma();
+
+	for_each_iommu(iommu)
+		iommu_flush_all_caches(iommu);
+
+	if (!ret)
+		print_iommu_info();
 
 	return ret;
 }
@@ -1785,8 +1802,6 @@ static bool __init check_ioapic_information(void)
 
 static void __init free_dma_resources(void)
 {
-	amd_iommu_uninit_devices();
-
 	free_pages((unsigned long)amd_iommu_pd_alloc_bitmap,
 		   get_order(MAX_DOMAIN_ID/8));
 
@@ -1977,31 +1992,6 @@ static bool detect_ivrs(void)
 	return true;
 }
 
-static int amd_iommu_init_dma(void)
-{
-	struct amd_iommu *iommu;
-	int ret;
-
-	if (iommu_pass_through)
-		ret = amd_iommu_init_passthrough();
-	else
-		ret = amd_iommu_init_dma_ops();
-
-	if (ret)
-		return ret;
-
-	init_device_table_dma();
-
-	for_each_iommu(iommu)
-		iommu_flush_all_caches(iommu);
-
-	amd_iommu_init_api();
-
-	amd_iommu_init_notifier();
-
-	return 0;
-}
-
 /****************************************************************************
  *
  * AMD IOMMU Initialization State Machine
@@ -2041,7 +2031,7 @@ static int __init state_next(void)
 		init_state = ret ? IOMMU_INIT_ERROR : IOMMU_INTERRUPTS_EN;
 		break;
 	case IOMMU_INTERRUPTS_EN:
-		ret = amd_iommu_init_dma();
+		ret = amd_iommu_init_dma_ops();
 		init_state = ret ? IOMMU_INIT_ERROR : IOMMU_DMA_OPS;
 		break;
 	case IOMMU_DMA_OPS:

@@ -412,7 +412,6 @@ struct bgmac {
 
 	/* Int */
 	u32 int_mask;
-	u32 int_status;
 
 	/* Speed-related */
 	int speed;

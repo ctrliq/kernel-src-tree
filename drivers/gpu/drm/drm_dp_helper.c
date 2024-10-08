@@ -28,6 +28,7 @@
 #include <linux/sched.h>
 #include <linux/i2c.h>
 #include <drm/drm_dp_helper.h>
+#include <drm/drm_dp_aux_dev.h>
 #include <drm/drmP.h>
 
 /**
@@ -159,6 +160,8 @@ int drm_dp_bw_code_to_link_rate(u8 link_bw)
 }
 EXPORT_SYMBOL(drm_dp_bw_code_to_link_rate);
 
+#define AUX_RETRY_INTERVAL 500 /* us */
+
 /**
  * DOC: dp helpers
  *
@@ -175,14 +178,16 @@ static int drm_dp_dpcd_access(struct drm_dp_aux *aux, u8 request,
 			      unsigned int offset, void *buffer, size_t size)
 {
 	struct drm_dp_aux_msg msg;
-	unsigned int retry;
-	int err;
+	unsigned int retry, native_reply;
+	int err = 0, ret = 0;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.address = offset;
 	msg.request = request;
 	msg.buffer = buffer;
 	msg.size = size;
+
+	mutex_lock(&aux->hw_mutex);
 
 	/*
 	 * The specification doesn't give any recommendation on how often to
@@ -191,35 +196,38 @@ static int drm_dp_dpcd_access(struct drm_dp_aux *aux, u8 request,
 	 * sufficient, bump to 32 which makes Dell 4k monitors happier.
 	 */
 	for (retry = 0; retry < 32; retry++) {
-
-		mutex_lock(&aux->hw_mutex);
-		err = aux->transfer(aux, &msg);
-		mutex_unlock(&aux->hw_mutex);
-		if (err < 0) {
-			if (err == -EBUSY)
-				continue;
-
-			return err;
+		if (ret != 0 && ret != -ETIMEDOUT) {
+			usleep_range(AUX_RETRY_INTERVAL,
+				     AUX_RETRY_INTERVAL + 100);
 		}
 
+		ret = aux->transfer(aux, &msg);
+		if (ret > 0) {
+			native_reply = msg.reply & DP_AUX_NATIVE_REPLY_MASK;
+			if (native_reply == DP_AUX_NATIVE_REPLY_ACK) {
+				if (ret == size)
+					goto unlock;
 
-		switch (msg.reply & DP_AUX_NATIVE_REPLY_MASK) {
-		case DP_AUX_NATIVE_REPLY_ACK:
-			if (err < size)
-				return -EPROTO;
-			return err;
-
-		case DP_AUX_NATIVE_REPLY_NACK:
-			return -EIO;
-
-		case DP_AUX_NATIVE_REPLY_DEFER:
-			usleep_range(400, 500);
-			break;
+				ret = -EPROTO;
+			} else
+				ret = -EIO;
 		}
+
+		/*
+		 * We want the error we return to be the error we received on
+		 * the first transaction, since we may get a different error the
+		 * next time we retry
+		 */
+		if (!err)
+			err = ret;
 	}
 
 	DRM_DEBUG_KMS("too many retries, giving up\n");
-	return -EIO;
+	ret = err;
+
+unlock:
+	mutex_unlock(&aux->hw_mutex);
+	return ret;
 }
 
 /**
@@ -242,16 +250,9 @@ ssize_t drm_dp_dpcd_read(struct drm_dp_aux *aux, unsigned int offset,
 	int ret;
 
 	/*
-	 * HP ZR24w corrupts the first DPCD access after entering power save
-	 * mode. Eg. on a read, the entire buffer will be filled with the same
-	 * byte. Do a throw away read to avoid corrupting anything we care
-	 * about. Afterwards things will work correctly until the monitor
-	 * gets woken up and subsequently re-enters power save mode.
-	 *
-	 * The user pressing any button on the monitor is enough to wake it
-	 * up, so there is no particularly good place to do the workaround.
-	 * We just have to do it before any DPCD access and hope that the
-	 * monitor doesn't power down exactly after the throw away read.
+	 * Sometimes we just get the same incorrect byte repeated over the
+	 * entire buffer. Doing one throw away read initially seems to "solve"
+	 * it.
 	 */
 	ret = drm_dp_dpcd_access(aux, DP_AUX_NATIVE_READ, DP_DPCD_REV, buffer,
 				 1);
@@ -441,6 +442,103 @@ static u32 drm_dp_i2c_functionality(struct i2c_adapter *adapter)
 	       I2C_FUNC_10BIT_ADDR;
 }
 
+static void drm_dp_i2c_msg_write_status_update(struct drm_dp_aux_msg *msg)
+{
+	/*
+	 * In case of i2c defer or short i2c ack reply to a write,
+	 * we need to switch to WRITE_STATUS_UPDATE to drain the
+	 * rest of the message
+	 */
+	if ((msg->request & ~DP_AUX_I2C_MOT) == DP_AUX_I2C_WRITE) {
+		msg->request &= DP_AUX_I2C_MOT;
+		msg->request |= DP_AUX_I2C_WRITE_STATUS_UPDATE;
+	}
+}
+
+#define AUX_PRECHARGE_LEN 10 /* 10 to 16 */
+#define AUX_SYNC_LEN (16 + 4) /* preamble + AUX_SYNC_END */
+#define AUX_STOP_LEN 4
+#define AUX_CMD_LEN 4
+#define AUX_ADDRESS_LEN 20
+#define AUX_REPLY_PAD_LEN 4
+#define AUX_LENGTH_LEN 8
+
+/*
+ * Calculate the duration of the AUX request/reply in usec. Gives the
+ * "best" case estimate, ie. successful while as short as possible.
+ */
+static int drm_dp_aux_req_duration(const struct drm_dp_aux_msg *msg)
+{
+	int len = AUX_PRECHARGE_LEN + AUX_SYNC_LEN + AUX_STOP_LEN +
+		AUX_CMD_LEN + AUX_ADDRESS_LEN + AUX_LENGTH_LEN;
+
+	if ((msg->request & DP_AUX_I2C_READ) == 0)
+		len += msg->size * 8;
+
+	return len;
+}
+
+static int drm_dp_aux_reply_duration(const struct drm_dp_aux_msg *msg)
+{
+	int len = AUX_PRECHARGE_LEN + AUX_SYNC_LEN + AUX_STOP_LEN +
+		AUX_CMD_LEN + AUX_REPLY_PAD_LEN;
+
+	/*
+	 * For read we expect what was asked. For writes there will
+	 * be 0 or 1 data bytes. Assume 0 for the "best" case.
+	 */
+	if (msg->request & DP_AUX_I2C_READ)
+		len += msg->size * 8;
+
+	return len;
+}
+
+#define I2C_START_LEN 1
+#define I2C_STOP_LEN 1
+#define I2C_ADDR_LEN 9 /* ADDRESS + R/W + ACK/NACK */
+#define I2C_DATA_LEN 9 /* DATA + ACK/NACK */
+
+/*
+ * Calculate the length of the i2c transfer in usec, assuming
+ * the i2c bus speed is as specified. Gives the the "worst"
+ * case estimate, ie. successful while as long as possible.
+ * Doesn't account the the "MOT" bit, and instead assumes each
+ * message includes a START, ADDRESS and STOP. Neither does it
+ * account for additional random variables such as clock stretching.
+ */
+static int drm_dp_i2c_msg_duration(const struct drm_dp_aux_msg *msg,
+				   int i2c_speed_khz)
+{
+	/* AUX bitrate is 1MHz, i2c bitrate as specified */
+	return DIV_ROUND_UP((I2C_START_LEN + I2C_ADDR_LEN +
+			     msg->size * I2C_DATA_LEN +
+			     I2C_STOP_LEN) * 1000, i2c_speed_khz);
+}
+
+/*
+ * Deterine how many retries should be attempted to successfully transfer
+ * the specified message, based on the estimated durations of the
+ * i2c and AUX transfers.
+ */
+static int drm_dp_i2c_retry_count(const struct drm_dp_aux_msg *msg,
+			      int i2c_speed_khz)
+{
+	int aux_time_us = drm_dp_aux_req_duration(msg) +
+		drm_dp_aux_reply_duration(msg);
+	int i2c_time_us = drm_dp_i2c_msg_duration(msg, i2c_speed_khz);
+
+	return DIV_ROUND_UP(i2c_time_us, aux_time_us + AUX_RETRY_INTERVAL);
+}
+
+/*
+ * FIXME currently assumes 10 kHz as some real world devices seem
+ * to require it. We should query/set the speed via DPCD if supported.
+ */
+static int dp_aux_i2c_speed_khz __read_mostly = 10;
+module_param_unsafe(dp_aux_i2c_speed_khz, int, 0644);
+MODULE_PARM_DESC(dp_aux_i2c_speed_khz,
+		 "Assumed speed of the i2c bus in kHz, (1-400, default 10)");
+
 /*
  * Transfer a single I2C-over-AUX message and handle various error conditions,
  * retrying the transaction as appropriate.  It is assumed that the
@@ -451,18 +549,19 @@ static u32 drm_dp_i2c_functionality(struct i2c_adapter *adapter)
  */
 static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 {
-	unsigned int retry;
+	unsigned int retry, defer_i2c;
 	int ret;
-
 	/*
 	 * DP1.2 sections 2.7.7.1.5.6.1 and 2.7.7.1.6.6.1: A DP Source device
 	 * is required to retry at least seven times upon receiving AUX_DEFER
 	 * before giving up the AUX transaction.
+	 *
+	 * We also try to account for the i2c bus speed.
 	 */
-	for (retry = 0; retry < 7; retry++) {
-		mutex_lock(&aux->hw_mutex);
+	int max_retries = max(7, drm_dp_i2c_retry_count(msg, dp_aux_i2c_speed_khz));
+
+	for (retry = 0, defer_i2c = 0; retry < (max_retries + defer_i2c); retry++) {
 		ret = aux->transfer(aux, msg);
-		mutex_unlock(&aux->hw_mutex);
 		if (ret < 0) {
 			if (ret == -EBUSY)
 				continue;
@@ -485,7 +584,7 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 			return -EREMOTEIO;
 
 		case DP_AUX_NATIVE_REPLY_DEFER:
-			DRM_DEBUG_KMS("native defer");
+			DRM_DEBUG_KMS("native defer\n");
 			/*
 			 * We could check for I2C bit rate capabilities and if
 			 * available adjust this interval. We could also be
@@ -495,7 +594,7 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 			 * For now just defer for long enough to hopefully be
 			 * safe for all use-cases.
 			 */
-			usleep_range(500, 600);
+			usleep_range(AUX_RETRY_INTERVAL, AUX_RETRY_INTERVAL + 100);
 			continue;
 
 		default:
@@ -509,6 +608,8 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 			 * Both native ACK and I2C ACK replies received. We
 			 * can assume the transfer was successful.
 			 */
+			if (ret != msg->size)
+				drm_dp_i2c_msg_write_status_update(msg);
 			return ret;
 
 		case DP_AUX_I2C_REPLY_NACK:
@@ -518,8 +619,16 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 
 		case DP_AUX_I2C_REPLY_DEFER:
 			DRM_DEBUG_KMS("I2C defer\n");
+			/* DP Compliance Test 4.2.2.5 Requirement:
+			 * Must have at least 7 retries for I2C defers on the
+			 * transaction to pass this test
+			 */
 			aux->i2c_defer_count++;
-			usleep_range(400, 500);
+			if (defer_i2c < 7)
+				defer_i2c++;
+			usleep_range(AUX_RETRY_INTERVAL, AUX_RETRY_INTERVAL + 100);
+			drm_dp_i2c_msg_write_status_update(msg);
+
 			continue;
 
 		default:
@@ -530,6 +639,14 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 
 	DRM_DEBUG_KMS("too many retries, giving up\n");
 	return -EREMOTEIO;
+}
+
+static void drm_dp_i2c_msg_set_request(struct drm_dp_aux_msg *msg,
+				       const struct i2c_msg *i2c_msg)
+{
+	msg->request = (i2c_msg->flags & I2C_M_RD) ?
+		DP_AUX_I2C_READ : DP_AUX_I2C_WRITE;
+	msg->request |= DP_AUX_I2C_MOT;
 }
 
 /*
@@ -566,7 +683,7 @@ static int drm_dp_i2c_drain_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *o
  * succeed. Hence the default is maximum.
  */
 static int dp_aux_i2c_transfer_size __read_mostly = DP_AUX_MAX_PAYLOAD_BYTES;
-module_param(dp_aux_i2c_transfer_size, int, 0644);
+module_param_unsafe(dp_aux_i2c_transfer_size, int, 0644);
 MODULE_PARM_DESC(dp_aux_i2c_transfer_size,
 		 "Number of bytes to transfer in a single I2C over DP AUX CH message, (1-16, default 16)");
 
@@ -583,12 +700,11 @@ static int drm_dp_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 
 	memset(&msg, 0, sizeof(msg));
 
+	mutex_lock(&aux->hw_mutex);
+
 	for (i = 0; i < num; i++) {
 		msg.address = msgs[i].addr;
-		msg.request = (msgs[i].flags & I2C_M_RD) ?
-			DP_AUX_I2C_READ :
-			DP_AUX_I2C_WRITE;
-		msg.request |= DP_AUX_I2C_MOT;
+		drm_dp_i2c_msg_set_request(&msg, &msgs[i]);
 		/* Send a bare address packet to start the transaction.
 		 * Zero sized messages specify an address only (bare
 		 * address) transaction.
@@ -596,6 +712,13 @@ static int drm_dp_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 		msg.buffer = NULL;
 		msg.size = 0;
 		err = drm_dp_i2c_do_msg(aux, &msg);
+
+		/*
+		 * Reset msg.request in case in case it got
+		 * changed into a WRITE_STATUS_UPDATE.
+		 */
+		drm_dp_i2c_msg_set_request(&msg, &msgs[i]);
+
 		if (err < 0)
 			break;
 		/* We want each transaction to be as large as possible, but
@@ -608,6 +731,13 @@ static int drm_dp_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 			msg.size = min(transfer_size, msgs[i].len - j);
 
 			err = drm_dp_i2c_drain_msg(aux, &msg);
+
+			/*
+			 * Reset msg.request in case in case it got
+			 * changed into a WRITE_STATUS_UPDATE.
+			 */
+			drm_dp_i2c_msg_set_request(&msg, &msgs[i]);
+
 			if (err < 0)
 				break;
 			transfer_size = err;
@@ -626,6 +756,8 @@ static int drm_dp_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 	msg.size = 0;
 	(void)drm_dp_i2c_do_msg(aux, &msg);
 
+	mutex_unlock(&aux->hw_mutex);
+
 	return err;
 }
 
@@ -642,6 +774,8 @@ static const struct i2c_algorithm drm_dp_i2c_algo = {
  */
 int drm_dp_aux_register(struct drm_dp_aux *aux)
 {
+	int ret;
+
 	mutex_init(&aux->hw_mutex);
 
 	aux->ddc.algo = &drm_dp_i2c_algo;
@@ -656,7 +790,17 @@ int drm_dp_aux_register(struct drm_dp_aux *aux)
 	strlcpy(aux->ddc.name, aux->name ? aux->name : dev_name(aux->dev),
 		sizeof(aux->ddc.name));
 
-	return i2c_add_adapter(&aux->ddc);
+	ret = drm_dp_aux_register_devnode(aux);
+	if (ret)
+		return ret;
+
+	ret = i2c_add_adapter(&aux->ddc);
+	if (ret) {
+		drm_dp_aux_unregister_devnode(aux);
+		return ret;
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL(drm_dp_aux_register);
 
@@ -666,6 +810,7 @@ EXPORT_SYMBOL(drm_dp_aux_register);
  */
 void drm_dp_aux_unregister(struct drm_dp_aux *aux)
 {
+	drm_dp_aux_unregister_devnode(aux);
 	i2c_del_adapter(&aux->ddc);
 }
 EXPORT_SYMBOL(drm_dp_aux_unregister);

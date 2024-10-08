@@ -304,7 +304,7 @@ static struct sock *unix_find_socket_byinode(struct inode *i)
 		    &unix_socket_table[i->i_ino & (UNIX_HASH_SIZE - 1)]) {
 		struct dentry *dentry = unix_sk(s)->path.dentry;
 
-		if (dentry && dentry->d_inode == i) {
+		if (dentry && d_real_inode(dentry) == i) {
 			sock_hold(s);
 			goto found;
 		}
@@ -313,6 +313,118 @@ static struct sock *unix_find_socket_byinode(struct inode *i)
 found:
 	spin_unlock(&unix_table_lock);
 	return s;
+}
+
+/* Support code for asymmetrically connected dgram sockets
+ *
+ * If a datagram socket is connected to a socket not itself connected
+ * to the first socket (eg, /dev/log), clients may only enqueue more
+ * messages if the present receive queue of the server socket is not
+ * "too large". This means there's a second writeability condition
+ * poll and sendmsg need to test. The dgram recv code will do a wake
+ * up on the peer_wait wait queue of a socket upon reception of a
+ * datagram which needs to be propagated to sleeping would-be writers
+ * since these might not have sent anything so far. This can't be
+ * accomplished via poll_wait because the lifetime of the server
+ * socket might be less than that of its clients if these break their
+ * association with it or if the server socket is closed while clients
+ * are still connected to it and there's no way to inform "a polling
+ * implementation" that it should let go of a certain wait queue
+ *
+ * In order to propagate a wake up, a wait_queue_t of the client
+ * socket is enqueued on the peer_wait queue of the server socket
+ * whose wake function does a wake_up on the ordinary client socket
+ * wait queue. This connection is established whenever a write (or
+ * poll for write) hit the flow control condition and broken when the
+ * association to the server socket is dissolved or after a wake up
+ * was relayed.
+ */
+
+static int unix_dgram_peer_wake_relay(wait_queue_t *q, unsigned mode, int flags,
+				      void *key)
+{
+	struct unix_sock *u;
+	wait_queue_head_t *u_sleep;
+
+	u = container_of(q, struct unix_sock, peer_wake);
+
+	__remove_wait_queue(&unix_sk(u->peer_wake.private)->peer_wait,
+			    q);
+	u->peer_wake.private = NULL;
+
+	/* relaying can only happen while the wq still exists */
+	u_sleep = sk_sleep(&u->sk);
+	if (u_sleep)
+		wake_up_interruptible_poll(u_sleep, key);
+
+	return 0;
+}
+
+static int unix_dgram_peer_wake_connect(struct sock *sk, struct sock *other)
+{
+	struct unix_sock *u, *u_other;
+	int rc;
+
+	u = unix_sk(sk);
+	u_other = unix_sk(other);
+	rc = 0;
+	spin_lock(&u_other->peer_wait.lock);
+
+	if (!u->peer_wake.private) {
+		u->peer_wake.private = other;
+		__add_wait_queue(&u_other->peer_wait, &u->peer_wake);
+
+		rc = 1;
+	}
+
+	spin_unlock(&u_other->peer_wait.lock);
+	return rc;
+}
+
+static void unix_dgram_peer_wake_disconnect(struct sock *sk,
+					    struct sock *other)
+{
+	struct unix_sock *u, *u_other;
+
+	u = unix_sk(sk);
+	u_other = unix_sk(other);
+	spin_lock(&u_other->peer_wait.lock);
+
+	if (u->peer_wake.private == other) {
+		__remove_wait_queue(&u_other->peer_wait, &u->peer_wake);
+		u->peer_wake.private = NULL;
+	}
+
+	spin_unlock(&u_other->peer_wait.lock);
+}
+
+static void unix_dgram_peer_wake_disconnect_wakeup(struct sock *sk,
+						   struct sock *other)
+{
+	unix_dgram_peer_wake_disconnect(sk, other);
+	wake_up_interruptible_poll(sk_sleep(sk),
+				   POLLOUT |
+				   POLLWRNORM |
+				   POLLWRBAND);
+}
+
+/* preconditions:
+ *	- unix_peer(sk) == other
+ *	- association is stable
+ */
+static int unix_dgram_peer_wake_me(struct sock *sk, struct sock *other)
+{
+	int connected;
+
+	connected = unix_dgram_peer_wake_connect(sk, other);
+
+	if (unix_recvq_full(other))
+		return 1;
+
+	if (connected)
+		unix_dgram_peer_wake_disconnect(sk, other);
+
+	return 0;
 }
 
 static inline int unix_writable(struct sock *sk)
@@ -419,6 +531,8 @@ static void unix_release_sock(struct sock *sk, int embrion)
 			skpair->sk_state_change(skpair);
 			sk_wake_async(skpair, SOCK_WAKE_WAITD, POLL_HUP);
 		}
+
+		unix_dgram_peer_wake_disconnect(sk, skpair);
 		sock_put(skpair); /* It may now die */
 		unix_peer(sk) = NULL;
 	}
@@ -659,6 +773,7 @@ static struct sock *unix_create1(struct net *net, struct socket *sock)
 	INIT_LIST_HEAD(&u->link);
 	mutex_init(&u->readlock); /* single task reading lock */
 	init_waitqueue_head(&u->peer_wait);
+	init_waitqueue_func_entry(&u->peer_wake, unix_dgram_peer_wake_relay);
 	unix_insert_socket(unix_sockets_unbound(sk), sk);
 out:
 	if (sk == NULL)
@@ -789,7 +904,7 @@ static struct sock *unix_find_other(struct net *net,
 		err = kern_path(sunname->sun_path, LOOKUP_FOLLOW, &path);
 		if (err)
 			goto fail;
-		inode = path.dentry->d_inode;
+		inode = d_real_inode(path.dentry);
 		err = inode_permission(inode, MAY_WRITE);
 		if (err)
 			goto put_fail;
@@ -916,7 +1031,7 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 			goto out_up;
 		}
 		addr->hash = UNIX_HASH_SIZE;
-		hash = path.dentry->d_inode->i_ino & (UNIX_HASH_SIZE-1);
+		hash = d_real_inode(path.dentry)->i_ino & (UNIX_HASH_SIZE-1);
 		spin_lock(&unix_table_lock);
 		u->path = path;
 		list = &unix_socket_table[hash];
@@ -1026,6 +1141,8 @@ restart:
 	if (unix_peer(sk)) {
 		struct sock *old_peer = unix_peer(sk);
 		unix_peer(sk) = other;
+		unix_dgram_peer_wake_disconnect_wakeup(sk, old_peer);
+
 		unix_state_double_unlock(sk, other);
 
 		if (other != old_peer)
@@ -1358,7 +1475,7 @@ static void unix_detach_fds(struct scm_cookie *scm, struct sk_buff *skb)
 	UNIXCB(skb).fp = NULL;
 
 	for (i = scm->fp->count-1; i >= 0; i--)
-		unix_notinflight(scm->fp->fp[i]);
+		unix_notinflight(scm->fp->user, scm->fp->fp[i]);
 }
 
 static void unix_destruct_scm(struct sk_buff *skb)
@@ -1423,7 +1540,7 @@ static int unix_attach_fds(struct scm_cookie *scm, struct sk_buff *skb)
 		return -ENOMEM;
 
 	for (i = scm->fp->count - 1; i >= 0; i--)
-		unix_inflight(scm->fp->fp[i]);
+		unix_inflight(scm->fp->user, scm->fp->fp[i]);
 	return max_level;
 }
 
@@ -1442,6 +1559,14 @@ static int unix_scm_to_skb(struct scm_cookie *scm, struct sk_buff *skb, bool sen
 	return err;
 }
 
+static bool unix_passcred_enabled(const struct socket *sock,
+				  const struct sock *other)
+{
+	return test_bit(SOCK_PASSCRED, &sock->flags) ||
+	       !other->sk_socket ||
+	       test_bit(SOCK_PASSCRED, &other->sk_socket->flags);
+}
+
 /*
  * Some apps rely on write() giving SCM_CREDENTIALS
  * We include credentials if source or destination socket
@@ -1452,12 +1577,38 @@ static void maybe_add_creds(struct sk_buff *skb, const struct socket *sock,
 {
 	if (UNIXCB(skb).pid)
 		return;
-	if (test_bit(SOCK_PASSCRED, &sock->flags) ||
-	    !other->sk_socket ||
-	    test_bit(SOCK_PASSCRED, &other->sk_socket->flags)) {
+	if (unix_passcred_enabled(sock, other)) {
 		UNIXCB(skb).pid  = get_pid(task_tgid(current));
 		current_uid_gid(&UNIXCB(skb).uid, &UNIXCB(skb).gid);
 	}
+}
+
+static int maybe_init_creds(struct scm_cookie *scm,
+			    struct socket *socket,
+			    const struct sock *other)
+{
+	int err;
+	struct msghdr msg = { .msg_controllen = 0 };
+
+	err = scm_send(socket, &msg, scm, false);
+	if (err)
+		return err;
+
+	if (unix_passcred_enabled(socket, other)) {
+		scm->pid = get_pid(task_tgid(current));
+		current_uid_gid(&scm->creds.uid, &scm->creds.gid);
+	}
+	return err;
+}
+
+static bool unix_skb_scm_eq(struct sk_buff *skb,
+			    struct scm_cookie *scm)
+{
+	const struct unix_skb_parms *u = &UNIXCB(skb);
+
+	return u->pid == scm->pid &&
+	       uid_eq(u->uid, scm->creds.uid) &&
+	       gid_eq(u->gid, scm->creds.gid);
 }
 
 /*
@@ -1481,6 +1632,7 @@ static int unix_dgram_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	struct scm_cookie tmp_scm;
 	int max_level;
 	int data_len = 0;
+	int sk_locked;
 
 	if (NULL == siocb->scm)
 		siocb->scm = &tmp_scm;
@@ -1562,12 +1714,14 @@ restart:
 		goto out_free;
 	}
 
+	sk_locked = 0;
 	unix_state_lock(other);
+restart_locked:
 	err = -EPERM;
 	if (!unix_may_send(sk, other))
 		goto out_unlock;
 
-	if (sock_flag(other, SOCK_DEAD)) {
+	if (unlikely(sock_flag(other, SOCK_DEAD))) {
 		/*
 		 *	Check with 1003.1g - what should
 		 *	datagram error
@@ -1575,10 +1729,14 @@ restart:
 		unix_state_unlock(other);
 		sock_put(other);
 
+		if (!sk_locked)
+			unix_state_lock(sk);
+
 		err = 0;
-		unix_state_lock(sk);
 		if (unix_peer(sk) == other) {
 			unix_peer(sk) = NULL;
+			unix_dgram_peer_wake_disconnect_wakeup(sk, other);
+
 			unix_state_unlock(sk);
 
 			unix_dgram_disconnected(sk, other);
@@ -1604,20 +1762,42 @@ restart:
 			goto out_unlock;
 	}
 
-	if (unix_peer(other) != sk && unix_recvq_full(other)) {
-		if (!timeo) {
+	/* other == sk && unix_peer(other) != sk if
+	 * - unix_peer(sk) == NULL, destination address bound to sk
+	 * - unix_peer(sk) == sk by time of get but disconnected before lock
+	 */
+	if (other != sk &&
+	    unlikely(unix_peer(other) != sk && unix_recvq_full(other))) {
+		if (timeo) {
+			timeo = unix_wait_for_peer(other, timeo);
+
+			err = sock_intr_errno(timeo);
+			if (signal_pending(current))
+				goto out_free;
+
+			goto restart;
+		}
+
+		if (!sk_locked) {
+			unix_state_unlock(other);
+			unix_state_double_lock(sk, other);
+		}
+
+		if (unix_peer(sk) != other ||
+		    unix_dgram_peer_wake_me(sk, other)) {
 			err = -EAGAIN;
+			sk_locked = 1;
 			goto out_unlock;
 		}
 
-		timeo = unix_wait_for_peer(other, timeo);
-
-		err = sock_intr_errno(timeo);
-		if (signal_pending(current))
-			goto out_free;
-
-		goto restart;
+		if (!sk_locked) {
+			sk_locked = 1;
+			goto restart_locked;
+		}
 	}
+
+	if (unlikely(sk_locked))
+		unix_state_unlock(sk);
 
 	if (sock_flag(other, SOCK_RCVTSTAMP))
 		__net_timestamp(skb);
@@ -1632,6 +1812,8 @@ restart:
 	return len;
 
 out_unlock:
+	if (sk_locked)
+		unix_state_unlock(sk);
 	unix_state_unlock(other);
 out_free:
 	kfree_skb(skb);
@@ -1759,8 +1941,10 @@ out_err:
 static ssize_t unix_stream_sendpage(struct socket *socket, struct page *page,
 				    int offset, size_t size, int flags)
 {
-	int err = 0;
-	bool send_sigpipe = true;
+	int err;
+	bool send_sigpipe = false;
+	bool init_scm = true;
+	struct scm_cookie scm;
 	struct sock *other, *sk = socket->sk;
 	struct sk_buff *skb, *newskb = NULL, *tail = NULL;
 
@@ -1778,7 +1962,7 @@ alloc_skb:
 		newskb = sock_alloc_send_pskb(sk, 0, 0, flags & MSG_DONTWAIT,
 					      &err, 0);
 		if (!newskb)
-			return err;
+			goto err;
 	}
 
 	/* we must acquire readlock as we modify already present
@@ -1787,12 +1971,12 @@ alloc_skb:
 	err = mutex_lock_interruptible(&unix_sk(other)->readlock);
 	if (err) {
 		err = flags & MSG_DONTWAIT ? -EAGAIN : -ERESTARTSYS;
-		send_sigpipe = false;
 		goto err;
 	}
 
 	if (sk->sk_shutdown & SEND_SHUTDOWN) {
 		err = -EPIPE;
+		send_sigpipe = true;
 		goto err_unlock;
 	}
 
@@ -1801,17 +1985,27 @@ alloc_skb:
 	if (sock_flag(other, SOCK_DEAD) ||
 	    other->sk_shutdown & RCV_SHUTDOWN) {
 		err = -EPIPE;
+		send_sigpipe = true;
 		goto err_state_unlock;
+	}
+
+	if (init_scm) {
+		err = maybe_init_creds(&scm, socket, other);
+		if (err)
+			goto err_state_unlock;
+		init_scm = false;
 	}
 
 	skb = skb_peek_tail(&other->sk_receive_queue);
 	if (tail && tail == skb) {
 		skb = newskb;
-	} else if (!skb) {
-		if (newskb)
+	} else if (!skb || !unix_skb_scm_eq(skb, &scm)) {
+		if (newskb) {
 			skb = newskb;
-		else
+		} else {
+			tail = skb;
 			goto alloc_skb;
+		}
 	} else if (newskb) {
 		/* this is fast path, we don't necessarily need to
 		 * call to kfree_skb even though with newskb == NULL
@@ -1832,6 +2026,9 @@ alloc_skb:
 	atomic_add(size, &sk->sk_wmem_alloc);
 
 	if (newskb) {
+		err = unix_scm_to_skb(&scm, skb, false);
+		if (err)
+			goto err_state_unlock;
 		spin_lock(&other->sk_receive_queue.lock);
 		__skb_queue_tail(&other->sk_receive_queue, newskb);
 		spin_unlock(&other->sk_receive_queue.lock);
@@ -1841,7 +2038,7 @@ alloc_skb:
 	mutex_unlock(&unix_sk(other)->readlock);
 
 	other->sk_data_ready(other, 0);
-
+	scm_destroy(&scm);
 	return size;
 
 err_state_unlock:
@@ -1852,6 +2049,8 @@ err:
 	kfree_skb(newskb);
 	if (send_sigpipe && !(flags & MSG_NOSIGNAL))
 		send_sig(SIGPIPE, current, 0);
+	if (!init_scm)
+		scm_destroy(&scm);
 	return err;
 }
 
@@ -2169,9 +2368,7 @@ unlock:
 
 		if (check_creds) {
 			/* Never glue messages from different writers */
-			if ((UNIXCB(skb).pid  != siocb->scm->pid) ||
-			    !uid_eq(UNIXCB(skb).uid, siocb->scm->creds.uid) ||
-			    !gid_eq(UNIXCB(skb).gid, siocb->scm->creds.gid))
+			if (!unix_skb_scm_eq(skb, siocb->scm))
 				break;
 		} else if (test_bit(SOCK_PASSCRED, &sock->flags)) {
 			/* Copy credentials */
@@ -2497,14 +2694,16 @@ static unsigned int unix_dgram_poll(struct file *file, struct socket *sock,
 		return mask;
 
 	writable = unix_writable(sk);
-	other = unix_peer_get(sk);
-	if (other) {
-		if (unix_peer(other) != sk) {
-			sock_poll_wait(file, &unix_sk(other)->peer_wait, wait);
-			if (unix_recvq_full(other))
-				writable = 0;
-		}
-		sock_put(other);
+	if (writable) {
+		unix_state_lock(sk);
+
+		other = unix_peer(sk);
+		if (other && unix_peer(other) != sk &&
+		    unix_recvq_full(other) &&
+		    unix_dgram_peer_wake_me(sk, other))
+			writable = 0;
+
+		unix_state_unlock(sk);
 	}
 
 	if (writable)

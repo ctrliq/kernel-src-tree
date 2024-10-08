@@ -354,7 +354,8 @@ static int qlcnic_set_mac(struct net_device *netdev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EINVAL;
 
-	if (!memcmp(adapter->mac_addr, addr->sa_data, ETH_ALEN))
+	if (!memcmp(adapter->mac_addr, addr->sa_data, ETH_ALEN) &&
+	    !memcmp(netdev->dev_addr, addr->sa_data, ETH_ALEN))
 		return 0;
 
 	if (test_bit(__QLCNIC_DEV_UP, &adapter->state)) {
@@ -375,13 +376,14 @@ static int qlcnic_set_mac(struct net_device *netdev, void *p)
 }
 
 static int qlcnic_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
-			struct net_device *netdev, const unsigned char *addr)
+			struct net_device *netdev,
+			const unsigned char *addr, u16 vid)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
 	int err = -EOPNOTSUPP;
 
 	if (!adapter->fdb_mac_learn)
-		return ndo_dflt_fdb_del(ndm, tb, netdev, addr);
+		return ndo_dflt_fdb_del(ndm, tb, netdev, addr, vid);
 
 	if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
 	    qlcnic_sriov_check(adapter)) {
@@ -400,13 +402,13 @@ static int qlcnic_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
 
 static int qlcnic_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 			struct net_device *netdev,
-			const unsigned char *addr, u16 flags)
+			const unsigned char *addr, u16 vid, u16 flags)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
 	int err = 0;
 
 	if (!adapter->fdb_mac_learn)
-		return ndo_dflt_fdb_add(ndm, tb, netdev, addr, flags);
+		return ndo_dflt_fdb_add(ndm, tb, netdev, addr, vid, flags);
 
 	if (!(adapter->flags & QLCNIC_ESWITCH_ENABLED) &&
 	    !qlcnic_sriov_check(adapter)) {
@@ -432,16 +434,17 @@ static int qlcnic_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 }
 
 static int qlcnic_fdb_dump(struct sk_buff *skb, struct netlink_callback *ncb,
-			struct net_device *netdev, int idx)
+			struct net_device *netdev,
+			struct net_device *filter_dev, int idx)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
 
 	if (!adapter->fdb_mac_learn)
-		return ndo_dflt_fdb_dump(skb, ncb, netdev, idx);
+		return ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
 
 	if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
 	    qlcnic_sriov_check(adapter))
-		idx = ndo_dflt_fdb_dump(skb, ncb, netdev, idx);
+		idx = ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
 
 	return idx;
 }
@@ -458,7 +461,7 @@ static void qlcnic_82xx_cancel_idc_work(struct qlcnic_adapter *adapter)
 }
 
 static int qlcnic_get_phys_port_id(struct net_device *netdev,
-				   struct netdev_phys_port_id *ppid)
+				   struct netdev_phys_item_id *ppid)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
 	struct qlcnic_hardware_context *ahw = adapter->ahw;
@@ -520,6 +523,7 @@ static netdev_features_t qlcnic_features_check(struct sk_buff *skb,
 #endif
 
 static const struct net_device_ops qlcnic_netdev_ops = {
+	.ndo_size	   = sizeof(struct net_device_ops),
 	.ndo_open	   = qlcnic_open,
 	.ndo_stop	   = qlcnic_close,
 	.ndo_start_xmit    = qlcnic_xmit_frame,
@@ -535,7 +539,7 @@ static const struct net_device_ops qlcnic_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= qlcnic_vlan_rx_del,
 	.ndo_fdb_add		= qlcnic_fdb_add,
 	.ndo_fdb_del		= qlcnic_fdb_del,
-	.ndo_fdb_dump		= qlcnic_fdb_dump,
+	.extended.ndo_fdb_dump	= qlcnic_fdb_dump,
 	.ndo_get_phys_port_id	= qlcnic_get_phys_port_id,
 #ifdef CONFIG_QLCNIC_VXLAN
 	.ndo_add_vxlan_port	= qlcnic_add_vxlan_port,
@@ -4205,7 +4209,7 @@ static int qlcnic_netdev_event(struct notifier_block *this,
 				 unsigned long event, void *ptr)
 {
 	struct qlcnic_adapter *adapter;
-	struct net_device *dev = (struct net_device *)ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 recheck:
 	if (dev == NULL)
@@ -4321,7 +4325,7 @@ static int __init qlcnic_init_module(void)
 	printk(KERN_INFO "%s\n", qlcnic_driver_string);
 
 #ifdef CONFIG_INET
-	register_netdevice_notifier(&qlcnic_netdev_cb);
+	register_netdevice_notifier_rh(&qlcnic_netdev_cb);
 	register_inetaddr_notifier(&qlcnic_inetaddr_cb);
 #endif
 
@@ -4329,7 +4333,7 @@ static int __init qlcnic_init_module(void)
 	if (ret) {
 #ifdef CONFIG_INET
 		unregister_inetaddr_notifier(&qlcnic_inetaddr_cb);
-		unregister_netdevice_notifier(&qlcnic_netdev_cb);
+		unregister_netdevice_notifier_rh(&qlcnic_netdev_cb);
 #endif
 	}
 
@@ -4344,7 +4348,7 @@ static void __exit qlcnic_exit_module(void)
 
 #ifdef CONFIG_INET
 	unregister_inetaddr_notifier(&qlcnic_inetaddr_cb);
-	unregister_netdevice_notifier(&qlcnic_netdev_cb);
+	unregister_netdevice_notifier_rh(&qlcnic_netdev_cb);
 #endif
 }
 

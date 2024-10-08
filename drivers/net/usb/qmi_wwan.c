@@ -147,6 +147,8 @@ static struct attribute_group qmi_wwan_sysfs_attr_group = {
 /* default ethernet address used by the modem */
 static const u8 default_modem_addr[ETH_ALEN] = {0x02, 0x50, 0xf3};
 
+static const u8 buggy_fw_addr[ETH_ALEN] = {0x00, 0xa0, 0xc6, 0x00, 0x00, 0x00};
+
 /* Make up an ethernet header if the packet doesn't have one.
  *
  * A firmware bug common among several devices cause them to send raw
@@ -209,7 +211,7 @@ static int qmi_wwan_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	skb_push(skb, ETH_HLEN);
 	skb_reset_mac_header(skb);
 	eth_hdr(skb)->h_proto = proto;
-	memset(eth_hdr(skb)->h_source, 0, ETH_ALEN);
+	eth_zero_addr(eth_hdr(skb)->h_source);
 fix_dest:
 	memcpy(eth_hdr(skb)->h_dest, dev->net->dev_addr, ETH_ALEN);
 	return 1;
@@ -324,6 +326,20 @@ err:
 	return rv;
 }
 
+/* Send CDC SetControlLineState request, setting or clearing the DTR.
+ * "Required for Autoconnect and 9x30 to wake up" according to the
+ * GobiNet driver. The requirement has been verified on an MDM9230
+ * based Sierra Wireless MC7455
+ */
+static int qmi_wwan_change_dtr(struct usbnet *dev, bool on)
+{
+	u8 intf = dev->intf->cur_altsetting->desc.bInterfaceNumber;
+
+	return usbnet_write_cmd(dev, USB_CDC_REQ_SET_CONTROL_LINE_STATE,
+				USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+				on ? 0x01 : 0x00, intf, NULL, 0);
+}
+
 static int qmi_wwan_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	int status = -1;
@@ -384,10 +400,30 @@ static int qmi_wwan_bind(struct usbnet *dev, struct usb_interface *intf)
 		usb_driver_release_interface(driver, info->data);
 	}
 
-	/* Never use the same address on both ends of the link, even
-	 * if the buggy firmware told us to.
+	/* disabling remote wakeup on MDM9x30 devices has the same
+	 * effect as clearing DTR. The device will not respond to QMI
+	 * requests until we set DTR again.  This is similar to a
+	 * QMI_CTL SYNC request, clearing a lot of firmware state
+	 * including the client ID allocations.
+	 *
+	 * Our usage model allows a session to span multiple
+	 * open/close events, so we must prevent the firmware from
+	 * clearing out state the clients might need.
+	 *
+	 * MDM9x30 is the first QMI chipset with USB3 support. Abuse
+	 * this fact to enable the quirk.
 	 */
-	if (!compare_ether_addr(dev->net->dev_addr, default_modem_addr))
+	if (le16_to_cpu(dev->udev->descriptor.bcdUSB) >= 0x0201) {
+		qmi_wwan_manage_power(dev, 1);
+		qmi_wwan_change_dtr(dev, true);
+	}
+
+	/* Never use the same address on both ends of the link, even if the
+	 * buggy firmware told us to. Or, if device is assigned the well-known
+	 * buggy firmware MAC address, replace it with a random address,
+	 */
+	if (ether_addr_equal(dev->net->dev_addr, default_modem_addr) ||
+	    ether_addr_equal(dev->net->dev_addr, buggy_fw_addr))
 		eth_hw_addr_random(dev->net);
 
 	/* make MAC addr easily distinguishable from an IP header */
@@ -409,6 +445,12 @@ static void qmi_wwan_unbind(struct usbnet *dev, struct usb_interface *intf)
 
 	if (info->subdriver && info->subdriver->disconnect)
 		info->subdriver->disconnect(info->control);
+
+	/* disable MDM9x30 quirk */
+	if (le16_to_cpu(dev->udev->descriptor.bcdUSB) >= 0x0201) {
+		qmi_wwan_change_dtr(dev, false);
+		qmi_wwan_manage_power(dev, 0);
+	}
 
 	/* allow user to unbind using either control or data */
 	if (intf == info->control)
@@ -587,6 +629,10 @@ static const struct usb_device_id products[] = {
 					      USB_CDC_SUBCLASS_ETHERNET,
 					      USB_CDC_PROTO_NONE),
 		.driver_info        = (unsigned long)&qmi_wwan_info,
+	},
+	{	/* HP lt4112 LTE/HSPA+ Gobi 4G Module (Huawei me906e) */
+		USB_DEVICE_AND_INTERFACE_INFO(0x03f0, 0x581d, USB_CLASS_VENDOR_SPEC, 1, 7),
+		.driver_info = (unsigned long)&qmi_wwan_info,
 	},
 
 	/* 3. Combined interface devices matching on interface number */
@@ -826,7 +872,29 @@ static const struct usb_device_id products[] = {
 	{QMI_FIXED_INTF(0x2357, 0x9000, 4)},	/* TP-LINK MA260 */
 	{QMI_FIXED_INTF(0x1bc7, 0x1200, 5)},	/* Telit LE920 */
 	{QMI_FIXED_INTF(0x1bc7, 0x1201, 2)},	/* Telit LE920 */
-	{QMI_FIXED_INTF(0x1e2d, 0x12d1, 4)},	/* Cinterion PLxx */
+	{QMI_FIXED_INTF(0x1c9e, 0x9b01, 3)},	/* XS Stick W100-2 from 4G Systems */
+	{QMI_FIXED_INTF(0x0b3c, 0xc000, 4)},	/* Olivetti Olicard 100 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc001, 4)},	/* Olivetti Olicard 120 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc002, 4)},	/* Olivetti Olicard 140 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc004, 6)},	/* Olivetti Olicard 155 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc005, 6)},	/* Olivetti Olicard 200 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc00a, 6)},	/* Olivetti Olicard 160 */
+	{QMI_FIXED_INTF(0x0b3c, 0xc00b, 4)},	/* Olivetti Olicard 500 */
+	{QMI_FIXED_INTF(0x1e2d, 0x0060, 4)},	/* Cinterion PLxx */
+	{QMI_FIXED_INTF(0x1e2d, 0x0053, 4)},	/* Cinterion PHxx,PXxx */
+	{QMI_FIXED_INTF(0x1e2d, 0x0082, 4)},	/* Cinterion PHxx,PXxx (2 RmNet) */
+	{QMI_FIXED_INTF(0x1e2d, 0x0082, 5)},	/* Cinterion PHxx,PXxx (2 RmNet) */
+	{QMI_FIXED_INTF(0x1e2d, 0x0083, 4)},	/* Cinterion PHxx,PXxx (1 RmNet + USB Audio)*/
+	{QMI_FIXED_INTF(0x413c, 0x81a2, 8)},	/* Dell Wireless 5806 Gobi(TM) 4G LTE Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81a3, 8)},	/* Dell Wireless 5570 HSPA+ (42Mbps) Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81a4, 8)},	/* Dell Wireless 5570e HSPA+ (42Mbps) Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81a8, 8)},	/* Dell Wireless 5808 Gobi(TM) 4G LTE Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81a9, 8)},	/* Dell Wireless 5808e Gobi(TM) 4G LTE Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81b1, 8)},	/* Dell Wireless 5809e Gobi(TM) 4G LTE Mobile Broadband Card */
+	{QMI_FIXED_INTF(0x413c, 0x81b3, 8)},	/* Dell Wireless 5809e Gobi(TM) 4G LTE Mobile Broadband Card (rev3) */
+	{QMI_FIXED_INTF(0x03f0, 0x4e1d, 8)},	/* HP lt4111 LTE/EV-DO/HSPA+ Gobi 4G Module */
+	{QMI_FIXED_INTF(0x22de, 0x9061, 3)},	/* WeTelecom WPD-600N */
+	{QMI_FIXED_INTF(0x1e0e, 0x9001, 5)},	/* SIMCom 7230E */
 
 	/* 4. Gobi 1000 devices */
 	{QMI_GOBI1K_DEVICE(0x05c6, 0x9212)},	/* Acer Gobi Modem Device */

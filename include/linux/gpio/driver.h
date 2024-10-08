@@ -1,21 +1,22 @@
 #ifndef __LINUX_GPIO_DRIVER_H
 #define __LINUX_GPIO_DRIVER_H
 
+#include <linux/device.h>
 #include <linux/types.h>
 #include <linux/module.h>
 
-struct device;
 struct gpio_desc;
 struct of_phandle_args;
 struct device_node;
 struct seq_file;
+struct gpio_device;
 
 /**
  * struct gpio_chip - abstract a GPIO controller
  * @label: for diagnostics
+ * @gpiodev: the internal state holder, opaque struct
  * @dev: optional device providing the GPIOs
  * @owner: helps prevent removal of modules exporting active GPIOs
- * @list: links gpio_chips together for traversal
  * @request: optional hook for chip-specific activation, such as
  *	enabling module power and clock; may sleep
  * @free: optional hook for chip-specific deactivation, such as
@@ -39,14 +40,15 @@ struct seq_file;
  * @ngpio: the number of GPIOs handled by this controller; the last GPIO
  *	handled is (base + ngpio - 1).
  * @desc: array of ngpio descriptors. Private.
- * @can_sleep: flag must be set iff get()/set() methods sleep, as they
- *	must while accessing GPIO expander chips over I2C or SPI
  * @names: if set, must be an array of strings to use as alternative
  *      names for the GPIOs in this chip. Any entry in the array
  *      may be NULL if there is no alias for the GPIO, however the
  *      array must be @ngpio entries long.  A name can include a single printk
  *      format specifier for an unsigned int.  It is substituted by the actual
  *      number of the gpio.
+ * @can_sleep: flag must be set iff get()/set() methods sleep, as they
+ *	must while accessing GPIO expander chips over I2C or SPI
+ * @exported: flags if the gpiochip is exported for use from sysfs. Private.
  *
  * A gpio_chip can help platforms abstract various sources of GPIOs so
  * they can all be accessed through a common programing interface.
@@ -60,9 +62,9 @@ struct seq_file;
  */
 struct gpio_chip {
 	const char		*label;
+	struct gpio_device	*gpiodev;
 	struct device		*dev;
 	struct module		*owner;
-	struct list_head        list;
 
 	int			(*request)(struct gpio_chip *chip,
 						unsigned offset);
@@ -91,8 +93,8 @@ struct gpio_chip {
 	u16			ngpio;
 	struct gpio_desc	*desc;
 	const char		*const *names;
-	unsigned		can_sleep:1;
-	unsigned		exported:1;
+	bool			can_sleep;
+	bool			exported;
 
 #if defined(CONFIG_OF_GPIO)
 	/*
@@ -128,31 +130,30 @@ extern struct gpio_chip *gpiochip_find(void *data,
 int gpiod_lock_as_irq(struct gpio_desc *desc);
 void gpiod_unlock_as_irq(struct gpio_desc *desc);
 
+enum gpio_lookup_flags {
+	GPIO_ACTIVE_HIGH = (0 << 0),
+	GPIO_ACTIVE_LOW = (1 << 0),
+	GPIO_OPEN_DRAIN = (1 << 1),
+	GPIO_OPEN_SOURCE = (1 << 2),
+};
+
 /**
- * Lookup table for associating GPIOs to specific devices and functions using
- * platform data.
+ * struct gpiod_lookup - lookup table
+ * @chip_label: name of the chip the GPIO belongs to
+ * @chip_hwnum: hardware number (i.e. relative to the chip) of the GPIO
+ * @con_id: name of the GPIO from the device's point of view
+ * @idx: index of the GPIO in case several GPIOs share the same name
+ * @flags: mask of GPIO_* values
+ *
+ * gpiod_lookup is a lookup table for associating GPIOs to specific devices and
+ * functions using platform data.
  */
 struct gpiod_lookup {
-	/*
-	 * name of the chip the GPIO belongs to
-	 */
 	const char *chip_label;
-	/*
-	 * hardware number (i.e. relative to the chip) of the GPIO
-	 */
 	u16 chip_hwnum;
-	/*
-	 * name of the GPIO from the device's point of view
-	 */
 	const char *con_id;
-	/*
-	 * index of the GPIO in case several GPIOs share the same name
-	 */
 	unsigned int idx;
-	/*
-	 * mask of GPIOF_* values
-	 */
-	unsigned long flags;
+	enum gpio_lookup_flags flags;
 };
 
 struct gpiod_lookup_table {

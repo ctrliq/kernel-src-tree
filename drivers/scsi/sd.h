@@ -67,8 +67,7 @@ struct scsi_disk {
 	struct device	dev;
 	struct gendisk	*disk;
 	atomic_t	openers;
-	sector_t	capacity;	/* size in 512-byte sectors */
-	u32		max_xfer_blocks;
+	sector_t	capacity;	/* size in logical blocks */
 	u32		max_ws_blocks;
 	u32		max_unmap_blocks;
 	u32		unmap_granularity;
@@ -103,8 +102,8 @@ struct scsi_disk {
 	 */
 	u32		xcopy_reserved;
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(1, u32 max_xfer_blocks)
+	RH_KABI_USE(2, u32 opt_xfer_blocks)
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
 
@@ -155,6 +154,16 @@ static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
 	}
 
 	return 0;
+}
+
+static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blocks)
+{
+	return blocks << (ilog2(sdev->sector_size) - 9);
+}
+
+static inline unsigned int logical_to_bytes(struct scsi_device *sdev, sector_t blocks)
+{
+	return blocks * sdev->sector_size;
 }
 
 /*

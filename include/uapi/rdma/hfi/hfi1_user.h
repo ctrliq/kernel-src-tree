@@ -66,7 +66,7 @@
  * The major version changes when data structures change in an incompatible
  * way. The driver must be the same for initialization to succeed.
  */
-#define HFI1_USER_SWMAJOR 4
+#define HFI1_USER_SWMAJOR 6
 
 /*
  * Minor version differences are always compatible
@@ -76,6 +76,11 @@
  * cares, or it must abort after initialization reports the difference.
  */
 #define HFI1_USER_SWMINOR 1
+
+/*
+ * We will encode the major/minor inside a single 32bit version number.
+ */
+#define HFI1_SWMAJOR_SHIFT 16
 
 /*
  * Set of HW and driver capability/feature bits.
@@ -121,13 +126,46 @@
 #define HFI1_CMD_SET_PKEY        11     /* set context's pkey */
 #define HFI1_CMD_CTXT_RESET      12     /* reset context's HW send context */
 #define HFI1_CMD_TID_INVAL_READ  13     /* read TID cache invalidations */
-/* separate EPROM commands from normal PSM commands */
-#define HFI1_CMD_EP_INFO         64      /* read EPROM device ID */
-#define HFI1_CMD_EP_ERASE_CHIP   65      /* erase whole EPROM */
-/* range 66-74 no longer used */
-#define HFI1_CMD_EP_ERASE_RANGE  75      /* erase EPROM range */
-#define HFI1_CMD_EP_READ_RANGE   76      /* read EPROM range */
-#define HFI1_CMD_EP_WRITE_RANGE  77      /* write EPROM range */
+#define HFI1_CMD_GET_VERS	 14	/* get the version of the user cdev */
+
+/*
+ * User IOCTLs can not go above 128 if they do then see common.h and change the
+ * base for the snoop ioctl
+ */
+#define IB_IOCTL_MAGIC 0x1b /* See Documentation/ioctl/ioctl-number.txt */
+
+/*
+ * Make the ioctls occupy the last 0xf0-0xff portion of the IB range
+ */
+#define __NUM(cmd) (HFI1_CMD_##cmd + 0xe0)
+
+struct hfi1_cmd;
+#define HFI1_IOCTL_ASSIGN_CTXT \
+	_IOWR(IB_IOCTL_MAGIC, __NUM(ASSIGN_CTXT), struct hfi1_user_info)
+#define HFI1_IOCTL_CTXT_INFO \
+	_IOW(IB_IOCTL_MAGIC, __NUM(CTXT_INFO), struct hfi1_ctxt_info)
+#define HFI1_IOCTL_USER_INFO \
+	_IOW(IB_IOCTL_MAGIC, __NUM(USER_INFO), struct hfi1_base_info)
+#define HFI1_IOCTL_TID_UPDATE \
+	_IOWR(IB_IOCTL_MAGIC, __NUM(TID_UPDATE), struct hfi1_tid_info)
+#define HFI1_IOCTL_TID_FREE \
+	_IOWR(IB_IOCTL_MAGIC, __NUM(TID_FREE), struct hfi1_tid_info)
+#define HFI1_IOCTL_CREDIT_UPD \
+	_IO(IB_IOCTL_MAGIC, __NUM(CREDIT_UPD))
+#define HFI1_IOCTL_RECV_CTRL \
+	_IOW(IB_IOCTL_MAGIC, __NUM(RECV_CTRL), int)
+#define HFI1_IOCTL_POLL_TYPE \
+	_IOW(IB_IOCTL_MAGIC, __NUM(POLL_TYPE), int)
+#define HFI1_IOCTL_ACK_EVENT \
+	_IOW(IB_IOCTL_MAGIC, __NUM(ACK_EVENT), unsigned long)
+#define HFI1_IOCTL_SET_PKEY \
+	_IOW(IB_IOCTL_MAGIC, __NUM(SET_PKEY), __u16)
+#define HFI1_IOCTL_CTXT_RESET \
+	_IO(IB_IOCTL_MAGIC, __NUM(CTXT_RESET))
+#define HFI1_IOCTL_TID_INVAL_READ \
+	_IOWR(IB_IOCTL_MAGIC, __NUM(TID_INVAL_READ), struct hfi1_tid_info)
+#define HFI1_IOCTL_GET_VERS \
+	_IOR(IB_IOCTL_MAGIC, __NUM(GET_VERS), int)
 
 #define _HFI1_EVENT_FROZEN_BIT         0
 #define _HFI1_EVENT_LINKDOWN_BIT       1
@@ -225,17 +263,6 @@ struct hfi1_tid_info {
 	__u32 tidcnt;
 	/* length of transfer buffer programmed by this request */
 	__u32 length;
-	/*
-	 * pointer to bitmap of TIDs used for this call;
-	 * checked for being large enough at open
-	 */
-	__u64 tidmap;
-};
-
-struct hfi1_cmd {
-	__u32 type;        /* command type */
-	__u32 len;         /* length of struct pointed to by add */
-	__u64 addr;        /* pointer to user structure */
 };
 
 enum hfi1_sdma_comp_state {

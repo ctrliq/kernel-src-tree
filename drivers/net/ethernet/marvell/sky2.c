@@ -4378,7 +4378,7 @@ static netdev_features_t sky2_fix_features(struct net_device *dev,
 	 */
 	if (dev->mtu > ETH_DATA_LEN && hw->chip_id == CHIP_ID_YUKON_EC_U) {
 		netdev_info(dev, "checksum offload not possible with jumbo frames\n");
-		features &= ~(NETIF_F_TSO|NETIF_F_SG|NETIF_F_ALL_CSUM);
+		features &= ~(NETIF_F_TSO | NETIF_F_SG | NETIF_F_CSUM_MASK);
 	}
 
 	/* Some hardware requires receive checksum for RSS to work. */
@@ -4642,7 +4642,7 @@ static const struct file_operations sky2_debug_fops = {
 static int sky2_device_event(struct notifier_block *unused,
 			     unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct sky2_port *sky2 = netdev_priv(dev);
 
 	if (dev->netdev_ops->ndo_open != sky2_open || !sky2_debug)
@@ -4689,13 +4689,13 @@ static __init void sky2_debug_init(void)
 		return;
 
 	sky2_debug = ent;
-	register_netdevice_notifier(&sky2_notifier);
+	register_netdevice_notifier_rh(&sky2_notifier);
 }
 
 static __exit void sky2_debug_cleanup(void)
 {
 	if (sky2_debug) {
-		unregister_netdevice_notifier(&sky2_notifier);
+		unregister_netdevice_notifier_rh(&sky2_notifier);
 		debugfs_remove(sky2_debug);
 		sky2_debug = NULL;
 	}

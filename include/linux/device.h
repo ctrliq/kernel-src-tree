@@ -40,6 +40,7 @@ struct class;
 struct subsys_private;
 struct bus_type;
 struct device_node;
+struct fwnode_handle;
 struct iommu_ops;
 struct iommu_group;
 
@@ -331,7 +332,7 @@ struct subsys_interface {
 	struct bus_type *subsys;
 	struct list_head node;
 	int (*add_dev)(struct device *dev, struct subsys_interface *sif);
-	int (*remove_dev)(struct device *dev, struct subsys_interface *sif);
+	void (*remove_dev)(struct device *dev, struct subsys_interface *sif);
 };
 
 int subsys_interface_register(struct subsys_interface *sif);
@@ -631,6 +632,10 @@ extern int devres_release_group(struct device *dev, void *id);
 
 /* managed devm_k.alloc/kfree for device drivers */
 extern void *devm_kmalloc(struct device *dev, size_t size, gfp_t gfp);
+extern char *devm_kvasprintf(struct device *dev, gfp_t gfp, const char *fmt,
+			     va_list ap);
+extern char *devm_kasprintf(struct device *dev, gfp_t gfp,
+			    const char *fmt, ...);
 static inline void *devm_kzalloc(struct device *dev, size_t size, gfp_t gfp)
 {
 	return devm_kmalloc(dev, size, gfp | __GFP_ZERO);
@@ -681,8 +686,7 @@ struct device_dma_parameters {
 	unsigned long segment_boundary_mask;
 };
 
-struct acpi_device;
-
+/* RHEL7: Do not use this struct.  It is only here for KABI purposes. */
 struct acpi_dev_node {
 #ifdef CONFIG_ACPI
 	RH_KABI_REPLACE(void	*handle,
@@ -733,7 +737,7 @@ struct acpi_dev_node {
  * @dma_mem:	Internal for coherent mem override.
  * @archdata:	For arch-specific additions.
  * @of_node:	Associated device tree node.
- * @acpi_node:	Associated ACPI device node.
+ * @fwnode:	Associated device node supplied by platform firmware.
  * @devt:	For creating the sysfs "dev".
  * @id:		device instance
  * @devres_lock: Spinlock to protect the resource of the device.
@@ -776,10 +780,6 @@ struct device {
 	struct dev_pm_info	power;
 	struct dev_pm_domain	*pm_domain;
 
-#ifdef CONFIG_PINCTRL
-	struct dev_pin_info	*pins;
-#endif
-
 #ifdef CONFIG_NUMA
 	int		numa_node;	/* NUMA node this device is close to */
 #endif
@@ -804,7 +804,12 @@ struct device {
 	struct dev_archdata	archdata;
 
 	struct device_node	*of_node; /* associated device tree node */
-	struct acpi_dev_node	acpi_node; /* associated ACPI device node */
+	/*
+	 * RHEL7: This appears safe to do.  struct acpi_dev_node was
+	 * previously safely modified with a KABI workaround so deprecating
+	 * it should also not be a problem.
+	 */
+	RH_KABI_DEPRECATE(struct acpi_dev_node, acpi_node)
 
 	dev_t			devt;	/* dev_t, creates the sysfs "dev" */
 	u32			id;	/* device instance */
@@ -833,7 +838,13 @@ struct device {
  */
 struct device_rh {
 	RH_KABI_EXTEND(struct dev_pm_info_rh power)
+#ifdef CONFIG_PINCTRL
+	RH_KABI_EXTEND(struct dev_pin_info *pins)
+#endif
+	RH_KABI_EXTEND(struct fwnode_handle *fwnode)
 };
+/* allocator for device_rh */
+extern void device_rh_alloc(struct device *dev);
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)
 {
@@ -928,6 +939,11 @@ static inline void device_lock(struct device *dev)
 	mutex_lock(&dev->mutex);
 }
 
+static inline int device_lock_interruptible(struct device *dev)
+{
+	return mutex_lock_interruptible(&dev->mutex);
+}
+
 static inline int device_trylock(struct device *dev)
 {
 	return mutex_trylock(&dev->mutex);
@@ -980,6 +996,9 @@ extern void unlock_device_hotplug(void);
 extern int lock_device_hotplug_sysfs(void);
 extern int device_offline(struct device *dev);
 extern int device_online(struct device *dev);
+extern void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
+extern void set_secondary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
+
 /*
  * Root device objects for grouping under /sys/devices
  */
@@ -1009,6 +1028,8 @@ extern void device_release_driver(struct device *dev);
 extern int  __must_check device_attach(struct device *dev);
 extern int __must_check driver_attach(struct device_driver *drv);
 extern int __must_check device_reprobe(struct device *dev);
+
+extern bool device_is_bound(struct device *dev);
 
 /*
  * Easy functions for dynamically creating devices on the fly

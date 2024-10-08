@@ -47,13 +47,12 @@ static struct xhci_segment *xhci_segment_alloc(struct xhci_hcd *xhci,
 	if (!seg)
 		return NULL;
 
-	seg->trbs = dma_pool_alloc(xhci->segment_pool, flags, &dma);
+	seg->trbs = dma_pool_zalloc(xhci->segment_pool, flags, &dma);
 	if (!seg->trbs) {
 		kfree(seg);
 		return NULL;
 	}
 
-	memset(seg->trbs, 0, TRB_SEGMENT_SIZE);
 	/* If the cycle state is 0, set the cycle bit to 1 for all the TRBs */
 	if (cycle_state == 0) {
 		for (i = 0; i < TRBS_PER_SEGMENT; i++)
@@ -517,12 +516,11 @@ static struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci
 	if (type == XHCI_CTX_TYPE_INPUT)
 		ctx->size += CTX_SIZE(xhci->hcc_params);
 
-	ctx->bytes = dma_pool_alloc(xhci->device_pool, flags, &ctx->dma);
+	ctx->bytes = dma_pool_zalloc(xhci->device_pool, flags, &ctx->dma);
 	if (!ctx->bytes) {
 		kfree(ctx);
 		return NULL;
 	}
-	memset(ctx->bytes, 0, ctx->size);
 	return ctx;
 }
 
@@ -2326,6 +2324,10 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
 	int i;
 
 	INIT_LIST_HEAD(&xhci->cmd_list);
+
+	/* init command timeout timer */
+	setup_timer(&xhci->cmd_timer, xhci_handle_command_timeout,
+		    (unsigned long)xhci);
 
 	/* init command timeout timer */
 	setup_timer(&xhci->cmd_timer, xhci_handle_command_timeout,

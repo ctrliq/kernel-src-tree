@@ -728,6 +728,7 @@ static void prb_close_block(struct tpacket_kbdq_core *pkc1,
 
 	struct tpacket3_hdr *last_pkt;
 	struct tpacket_hdr_v1 *h1 = &pbd1->hdr.bh1;
+	struct sock *sk = &po->sk;
 
 	if (po->stats.stats3.tp_drops)
 		status |= TP_STATUS_LOSING;
@@ -755,6 +756,8 @@ static void prb_close_block(struct tpacket_kbdq_core *pkc1,
 
 	/* Flush the block */
 	prb_flush_block(pkc1, pbd1, status);
+
+	sk->sk_data_ready(sk, 0);
 
 	pkc1->kactive_blk_num = GET_NEXT_PRB_BLK_NUM(pkc1);
 }
@@ -1974,12 +1977,12 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
 		smp_wmb();
 	}
 #endif
-	if (po->tp_version <= TPACKET_V2)
+	if (po->tp_version <= TPACKET_V2) {
 		__packet_set_status(po, h.raw, status);
-	else
+		sk->sk_data_ready(sk, 0);
+	} else {
 		prb_clear_blk_fill_status(&po->rx_ring);
-
-	sk->sk_data_ready(sk, 0);
+	}
 
 drop_n_restore:
 	if (skb_head != skb->data && skb_shared(skb)) {
@@ -3476,10 +3479,11 @@ static int packet_getsockopt(struct socket *sock, int level, int optname,
 }
 
 
-static int packet_notifier(struct notifier_block *this, unsigned long msg, void *data)
+static int packet_notifier(struct notifier_block *this,
+			   unsigned long msg, void *ptr)
 {
 	struct sock *sk;
-	struct net_device *dev = data;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
 
 	rcu_read_lock();
@@ -4067,7 +4071,7 @@ static struct pernet_operations packet_net_ops = {
 
 static void __exit packet_exit(void)
 {
-	unregister_netdevice_notifier(&packet_netdev_notifier);
+	unregister_netdevice_notifier_rh(&packet_netdev_notifier);
 	unregister_pernet_subsys(&packet_net_ops);
 	sock_unregister(PF_PACKET);
 	proto_unregister(&packet_proto);
@@ -4082,7 +4086,7 @@ static int __init packet_init(void)
 
 	sock_register(&packet_family_ops);
 	register_pernet_subsys(&packet_net_ops);
-	register_netdevice_notifier(&packet_netdev_notifier);
+	register_netdevice_notifier_rh(&packet_netdev_notifier);
 out:
 	return rc;
 }

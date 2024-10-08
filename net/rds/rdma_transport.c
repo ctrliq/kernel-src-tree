@@ -49,9 +49,7 @@ int rds_rdma_cm_event_handler(struct rdma_cm_id *cm_id,
 	rdsdebug("conn %p id %p handling event %u (%s)\n", conn, cm_id,
 		 event->event, rdma_event_msg(event->event));
 
-	if (cm_id->device->node_type == RDMA_NODE_RNIC)
-		trans = &rds_iw_transport;
-	else
+	if (cm_id->device->node_type == RDMA_NODE_IB_CA)
 		trans = &rds_ib_transport;
 
 	/* Prevent shutdown from tearing down the connection
@@ -150,8 +148,8 @@ static int rds_rdma_listen_init(void)
 	struct rdma_cm_id *cm_id;
 	int ret;
 
-	cm_id = rdma_create_id(rds_rdma_cm_event_handler, NULL, RDMA_PS_TCP,
-			       IB_QPT_RC);
+	cm_id = rdma_create_id(&init_net, rds_rdma_cm_event_handler, NULL,
+			       RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(cm_id)) {
 		ret = PTR_ERR(cm_id);
 		printk(KERN_ERR "RDS/RDMA: failed to setup listener, "
@@ -208,10 +206,6 @@ static int rds_rdma_init(void)
 	if (ret)
 		goto out;
 
-	ret = rds_iw_init();
-	if (ret)
-		goto err_iw_init;
-
 	ret = rds_ib_init();
 	if (ret)
 		goto err_ib_init;
@@ -219,8 +213,6 @@ static int rds_rdma_init(void)
 	goto out;
 
 err_ib_init:
-	rds_iw_exit();
-err_iw_init:
 	rds_rdma_listen_stop();
 out:
 	return ret;
@@ -232,11 +224,10 @@ static void rds_rdma_exit(void)
 	/* stop listening first to ensure no new connections are attempted */
 	rds_rdma_listen_stop();
 	rds_ib_exit();
-	rds_iw_exit();
 }
 module_exit(rds_rdma_exit);
 
 MODULE_AUTHOR("Oracle Corporation <rds-devel@oss.oracle.com>");
-MODULE_DESCRIPTION("RDS: IB/iWARP transport");
+MODULE_DESCRIPTION("RDS: IB transport");
 MODULE_LICENSE("Dual BSD/GPL");
 

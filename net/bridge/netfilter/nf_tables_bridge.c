@@ -16,6 +16,8 @@
 #include <net/netfilter/nf_tables_bridge.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <net/netfilter/nf_tables_ipv4.h>
+#include <net/netfilter/nf_tables_ipv6.h>
 
 int nft_bridge_iphdr_validate(struct sk_buff *skb)
 {
@@ -62,6 +64,28 @@ int nft_bridge_ip6hdr_validate(struct sk_buff *skb)
 }
 EXPORT_SYMBOL_GPL(nft_bridge_ip6hdr_validate);
 
+static inline void nft_bridge_set_pktinfo_ipv4(struct nft_pktinfo *pkt,
+					       struct sk_buff *skb,
+					       const struct nf_hook_state *state)
+{
+	if (nft_bridge_iphdr_validate(skb))
+		nft_set_pktinfo_ipv4(pkt, skb, state);
+	else
+		nft_set_pktinfo(pkt, skb, state);
+}
+
+static inline void nft_bridge_set_pktinfo_ipv6(struct nft_pktinfo *pkt,
+					      struct sk_buff *skb,
+					      const struct nf_hook_state *state)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	if (nft_bridge_ip6hdr_validate(skb) &&
+	    nft_set_pktinfo_ipv6(pkt, skb, state) == 0)
+		return;
+#endif
+	nft_set_pktinfo(pkt, skb, state);
+}
+
 static unsigned int
 nft_do_chain_bridge(const struct nf_hook_ops *ops,
 		    struct sk_buff *skb,
@@ -71,7 +95,17 @@ nft_do_chain_bridge(const struct nf_hook_ops *ops,
 {
 	struct nft_pktinfo pkt;
 
-	nft_set_pktinfo(&pkt, ops, skb, state);
+	switch (eth_hdr(skb)->h_proto) {
+	case htons(ETH_P_IP):
+		nft_bridge_set_pktinfo_ipv4(&pkt, skb, state);
+		break;
+	case htons(ETH_P_IPV6):
+		nft_bridge_set_pktinfo_ipv6(&pkt, skb, state);
+		break;
+	default:
+		nft_set_pktinfo(&pkt, skb, state);
+		break;
+	}
 
 	return nft_do_chain(&pkt, ops);
 }
@@ -109,7 +143,7 @@ err:
 
 static void nf_tables_bridge_exit_net(struct net *net)
 {
-	nft_unregister_afinfo(net->nft.bridge);
+	nft_unregister_afinfo(net, net->nft.bridge);
 	kfree(net->nft.bridge);
 }
 

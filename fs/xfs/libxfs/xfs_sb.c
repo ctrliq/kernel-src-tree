@@ -132,10 +132,11 @@ xfs_mount_validate_sb(
 		if (xfs_sb_has_compat_feature(sbp,
 					XFS_SB_FEAT_COMPAT_UNKNOWN)) {
 			xfs_warn(mp,
-"Superblock has unknown compatible features (0x%x) enabled.\n"
-"Using a more recent kernel is recommended.",
+"Superblock has unknown compatible features (0x%x) enabled.",
 				(sbp->sb_features_compat &
 						XFS_SB_FEAT_COMPAT_UNKNOWN));
+			xfs_warn(mp,
+"Using a more recent kernel is recommended.");
 		}
 
 		if (xfs_sb_has_ro_compat_feature(sbp,
@@ -146,18 +147,21 @@ xfs_mount_validate_sb(
 						XFS_SB_FEAT_RO_COMPAT_UNKNOWN));
 			if (!(mp->m_flags & XFS_MOUNT_RDONLY)) {
 				xfs_warn(mp,
-"Attempted to mount read-only compatible filesystem read-write.\n"
+"Attempted to mount read-only compatible filesystem read-write.");
+				xfs_warn(mp,
 "Filesystem can only be safely mounted read only.");
+
 				return -EINVAL;
 			}
 		}
 		if (xfs_sb_has_incompat_feature(sbp,
 					XFS_SB_FEAT_INCOMPAT_UNKNOWN)) {
 			xfs_warn(mp,
-"Superblock has unknown incompatible features (0x%x) enabled.\n"
-"Filesystem can not be safely mounted by this kernel.",
+"Superblock has unknown incompatible features (0x%x) enabled.",
 				(sbp->sb_features_incompat &
 						XFS_SB_FEAT_INCOMPAT_UNKNOWN));
+			xfs_warn(mp,
+"Filesystem can not be safely mounted by this kernel.");
 			return -EINVAL;
 		}
 	} else if (xfs_sb_version_hascrc(sbp)) {
@@ -191,9 +195,6 @@ xfs_mount_validate_sb(
 	 */
 	if (xfs_sb_version_hassparseinodes(sbp)) {
 		uint32_t	align;
-
-		xfs_alert(mp,
-	"EXPERIMENTAL sparse inode feature enabled. Use at your own risk!");
 
 		align = XFS_INODES_PER_CHUNK * sbp->sb_inodesize
 				>> sbp->sb_blocklog;
@@ -840,12 +841,12 @@ xfs_sync_sb(
 	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_CHANGE, KM_SLEEP);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		return error;
 	}
 
 	xfs_log_sb(tp);
 	if (wait)
 		xfs_trans_set_sync(tp);
-	return xfs_trans_commit(tp, 0);
+	return xfs_trans_commit(tp);
 }

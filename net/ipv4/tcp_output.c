@@ -1006,6 +1006,7 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 		TCP_ADD_STATS(sock_net(sk), TCP_MIB_OUTSEGS,
 			      tcp_skb_pcount(skb));
 
+	tp->segs_out += tcp_skb_pcount(skb);
 	/* Our usage of tstamp should remain private */
 	skb->tstamp.tv64 = 0;
 	err = icsk->icsk_af_ops->queue_xmit(skb, &inet->cork.fl);
@@ -2305,7 +2306,7 @@ u32 __tcp_select_window(struct sock *sk)
 	if (free_space < (full_space >> 1)) {
 		icsk->icsk_ack.quick = 0;
 
-		if (sk_under_memory_pressure(sk))
+		if (tcp_under_memory_pressure(sk))
 			tp->rcv_ssthresh = min(tp->rcv_ssthresh,
 					       4U * tp->advmss);
 
@@ -2723,6 +2724,23 @@ begin_fwd:
 						  inet_csk(sk)->icsk_rto,
 						  TCP_RTO_MAX);
 	}
+}
+
+/* We allow to exceed memory limits for FIN packets to expedite
+ * connection tear down and (memory) recovery.
+ * Otherwise tcp_send_fin() could loop forever.
+ * In general, we want to allow one skb per socket to avoid hangs
+ * with edge trigger epoll()
+ */
+void sk_forced_mem_schedule(struct sock *sk, int size)
+{
+	int amt, status;
+
+	if (size <= sk->sk_forward_alloc)
+		return;
+	amt = sk_mem_pages(size);
+	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
+	sk_memory_allocated_add(sk, amt, &status);
 }
 
 /* Send a fin.  The caller locks the socket for us.  This cannot be

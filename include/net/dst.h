@@ -60,6 +60,7 @@ struct dst_entry {
 #define DST_FAKE_RTABLE		0x0040
 #define DST_XFRM_TUNNEL		0x0080
 #define DST_XFRM_QUEUE		0x0100
+#define DST_METADATA		0x0200
 
 	unsigned short		pending_confirm;
 
@@ -114,8 +115,12 @@ struct dst_entry {
 	 * to replace reserved slots with required structure field
 	 * additions of your backport.
 	 */
+#ifdef __GENKSYMS__
 	u32			rh_reserved1;
 	u32			rh_reserved2;
+#else
+	struct lwtunnel_state   *lwtstate;
+#endif
 	u32			rh_reserved3;
 	u32			rh_reserved4;
 };
@@ -428,6 +433,9 @@ static inline int dst_discard(struct sk_buff *skb)
 extern void *dst_alloc(struct dst_ops *ops, struct net_device *dev,
 		       int initial_ref, int initial_obsolete,
 		       unsigned short flags);
+void dst_init(struct dst_entry *dst, struct dst_ops *ops,
+	      struct net_device *dev, int initial_ref, int initial_obsolete,
+	      unsigned short flags);
 extern void __dst_free(struct dst_entry *dst);
 extern struct dst_entry *dst_destroy(struct dst_entry *dst);
 
@@ -529,7 +537,7 @@ static inline struct dst_entry *dst_check(struct dst_entry *dst, u32 cookie)
 	return dst;
 }
 
-extern void		dst_init(void);
+void dst_subsys_init(void);
 
 /* Flags for xfrm_lookup flags argument. */
 enum {

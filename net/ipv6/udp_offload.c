@@ -36,22 +36,12 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 
 	if (skb_gso_ok(skb, features | NETIF_F_GSO_ROBUST)) {
 		/* Packet is from an untrusted source, reset gso_segs. */
-		int type = skb_shinfo(skb)->gso_type;
-
-		if (unlikely(type & ~(SKB_GSO_UDP |
-				      SKB_GSO_DODGY |
-				      SKB_GSO_UDP_TUNNEL |
-				      SKB_GSO_UDP_TUNNEL_CSUM |
-				      SKB_GSO_TUNNEL_REMCSUM |
-				      SKB_GSO_GRE |
-				      SKB_GSO_GRE_CSUM |
-				      SKB_GSO_IPIP |
-				      SKB_GSO_SIT |
-				      SKB_GSO_MPLS) ||
-			     !(type & (SKB_GSO_UDP))))
-			goto out;
 
 		skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(skb->len, mss);
+
+		/* Set the IPv6 fragment id if not set yet */
+		if (!skb_shinfo(skb)->ip6_frag_id)
+			ipv6_proxy_select_ident(dev_net(skb->dev), skb);
 
 		segs = NULL;
 		goto out;
@@ -109,6 +99,8 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
 		fptr = (struct frag_hdr *)(skb_network_header(skb) + unfrag_ip6hlen);
 		fptr->nexthdr = nexthdr;
 		fptr->reserved = 0;
+		if (!skb_shinfo(skb)->ip6_frag_id)
+			ipv6_proxy_select_ident(dev_net(skb->dev), skb);
 		fptr->identification = skb_shinfo(skb)->ip6_frag_id;
 
 		/* Fragment the skb. ipv6 header and the remaining fields of the
@@ -142,7 +134,7 @@ static struct sk_buff **udp6_gro_receive(struct sk_buff **head,
 
 skip:
 	NAPI_GRO_CB(skb)->is_ipv6 = 1;
-	return udp_gro_receive(head, skb, uh);
+	return udp_gro_receive(head, skb, uh, udp6_lib_lookup_skb);
 
 flush:
 	NAPI_GRO_CB(skb)->flush = 1;
@@ -162,7 +154,7 @@ int udp6_gro_complete(struct sk_buff *skb, int nhoff)
 		skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_TUNNEL;
 	}
 
-	return udp_gro_complete(skb, nhoff);
+	return udp_gro_complete(skb, nhoff, udp6_lib_lookup_skb);
 }
 
 static const struct net_offload udpv6_offload = {
@@ -173,7 +165,12 @@ static const struct net_offload udpv6_offload = {
 	},
 };
 
-int __init udp_offload_init(void)
+int udpv6_offload_init(void)
 {
 	return inet6_add_offload(&udpv6_offload, IPPROTO_UDP);
+}
+
+int udpv6_offload_exit(void)
+{
+	return inet6_del_offload(&udpv6_offload, IPPROTO_UDP);
 }

@@ -561,6 +561,32 @@ int machine__process_itrace_start_event(struct machine *machine __maybe_unused,
 	return 0;
 }
 
+int machine__process_switch_event(struct machine *machine __maybe_unused,
+				  union perf_event *event)
+{
+	if (dump_trace)
+		perf_event__fprintf_switch(event, stdout);
+	return 0;
+}
+
+static void dso__adjust_kmod_long_name(struct dso *dso, const char *filename)
+{
+	const char *dup_filename;
+
+	if (!filename || !dso || !dso->long_name)
+		return;
+	if (dso->long_name[0] != '[')
+		return;
+	if (!strchr(filename, '/'))
+		return;
+
+	dup_filename = strdup(filename);
+	if (!dup_filename)
+		return;
+
+	dso__set_long_name(dso, dup_filename, true);
+}
+
 struct map *machine__findnew_module_map(struct machine *machine, u64 start,
 					const char *filename)
 {
@@ -573,8 +599,15 @@ struct map *machine__findnew_module_map(struct machine *machine, u64 start,
 
 	map = map_groups__find_by_name(&machine->kmaps, MAP__FUNCTION,
 				       m.name);
-	if (map)
+	if (map) {
+		/*
+		 * If the map's dso is an offline module, give dso__load()
+		 * a chance to find the file path of that module by fixing
+		 * long_name.
+		 */
+		dso__adjust_kmod_long_name(map->dso, filename);
 		goto out;
+	}
 
 	dso = machine__findnew_module_dso(machine, &m, filename);
 	if (dso == NULL)
@@ -1487,6 +1520,9 @@ int machine__process_event(struct machine *machine, union perf_event *event,
 		ret = machine__process_itrace_start_event(machine, event); break;
 	case PERF_RECORD_LOST_SAMPLES:
 		ret = machine__process_lost_samples_event(machine, event, sample); break;
+	case PERF_RECORD_SWITCH:
+	case PERF_RECORD_SWITCH_CPU_WIDE:
+		ret = machine__process_switch_event(machine, event); break;
 	default:
 		ret = -1;
 		break;
@@ -1616,6 +1652,8 @@ static int add_callchain_ip(struct thread *thread,
 		}
 	}
 
+	if (symbol_conf.hide_unresolved && al.sym == NULL)
+		return 0;
 	return callchain_cursor_append(&callchain_cursor, al.addr, al.map, al.sym);
 }
 
@@ -1870,6 +1908,9 @@ check_calls:
 static int unwind_entry(struct unwind_entry *entry, void *arg)
 {
 	struct callchain_cursor *cursor = arg;
+
+	if (symbol_conf.hide_unresolved && entry->sym == NULL)
+		return 0;
 	return callchain_cursor_append(cursor, entry->ip,
 				       entry->map, entry->sym);
 }
@@ -1948,12 +1989,13 @@ int machines__for_each_thread(struct machines *machines,
 
 int __machine__synthesize_threads(struct machine *machine, struct perf_tool *tool,
 				  struct target *target, struct thread_map *threads,
-				  perf_event__handler_t process, bool data_mmap)
+				  perf_event__handler_t process, bool data_mmap,
+				  unsigned int proc_map_timeout)
 {
 	if (target__has_task(target))
-		return perf_event__synthesize_thread_map(tool, threads, process, machine, data_mmap);
+		return perf_event__synthesize_thread_map(tool, threads, process, machine, data_mmap, proc_map_timeout);
 	else if (target__has_cpu(target))
-		return perf_event__synthesize_threads(tool, process, machine, data_mmap);
+		return perf_event__synthesize_threads(tool, process, machine, data_mmap, proc_map_timeout);
 	/* command specified */
 	return 0;
 }

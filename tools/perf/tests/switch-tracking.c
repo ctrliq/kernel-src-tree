@@ -305,7 +305,7 @@ out_free_nodes:
  * evsel->system_wide and evsel->tracking flags (respectively) with other events
  * sometimes enabled or disabled.
  */
-int test__switch_tracking(void)
+int test__switch_tracking(int subtest __maybe_unused)
 {
 	const char *sched_switch = "sched:sched_switch";
 	struct switch_tracking switch_tracking = { .tids = NULL, };
@@ -366,7 +366,7 @@ int test__switch_tracking(void)
 
 	/* Third event */
 	if (!perf_evlist__can_select_event(evlist, sched_switch)) {
-		fprintf(stderr, " (no sched_switch)");
+		pr_debug("No sched_switch\n");
 		err = 0;
 		goto out;
 	}
@@ -442,7 +442,7 @@ int test__switch_tracking(void)
 	}
 
 	if (perf_evlist__open(evlist) < 0) {
-		fprintf(stderr, " (not supported)");
+		pr_debug("Not supported\n");
 		err = 0;
 		goto out;
 	}

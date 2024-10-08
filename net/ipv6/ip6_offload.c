@@ -67,23 +67,6 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
 	bool encap, udpfrag;
 	int nhoff;
 
-	if (unlikely(skb_shinfo(skb)->gso_type &
-		     ~(SKB_GSO_TCPV4 |
-		       SKB_GSO_UDP |
-		       SKB_GSO_DODGY |
-		       SKB_GSO_TCP_ECN |
-		       SKB_GSO_GRE |
-		       SKB_GSO_GRE_CSUM |
-		       SKB_GSO_IPIP |
-		       SKB_GSO_SIT |
-		       SKB_GSO_UDP_TUNNEL |
-		       SKB_GSO_UDP_TUNNEL_CSUM |
-		       SKB_GSO_TUNNEL_REMCSUM |
-		       SKB_GSO_MPLS |
-		       SKB_GSO_TCPV6 |
-		       0)))
-		goto out;
-
 	skb_reset_network_header(skb);
 	nhoff = skb_network_header(skb) - skb_mac_header(skb);
 	if (unlikely(!pskb_may_pull(skb, sizeof(*ipv6h))))
@@ -247,7 +230,7 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
 
 	skb_gro_postpull_rcsum(skb, iph, nlen);
 
-	pp = ops->callbacks.gro_receive(head, skb);
+	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
 
 out_unlock:
 	rcu_read_unlock();
@@ -263,6 +246,9 @@ static int ipv6_gro_complete(struct sk_buff *skb, int nhoff)
 	const struct net_offload *ops;
 	struct ipv6hdr *iph = (struct ipv6hdr *)(skb->data + nhoff);
 	int err = -ENOSYS;
+
+	if (skb->encapsulation)
+		skb_set_inner_network_header(skb, nhoff);
 
 	iph->payload_len = htons(skb->len - nhoff - sizeof(*iph));
 
@@ -300,8 +286,6 @@ static int __init ipv6_offload_init(void)
 
 	if (tcpv6_offload_init() < 0)
 		pr_crit("%s: Cannot add TCP protocol offload\n", __func__);
-	if (udp_offload_init() < 0)
-		pr_crit("%s: Cannot add UDP protocol offload\n", __func__);
 	if (ipv6_exthdrs_offload_init() < 0)
 		pr_crit("%s: Cannot add EXTHDRS protocol offload\n", __func__);
 

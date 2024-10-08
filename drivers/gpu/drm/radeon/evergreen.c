@@ -35,6 +35,75 @@
 #include "evergreen_blit_shaders.h"
 #include "radeon_ucode.h"
 
+/*
+ * Indirect registers accessor
+ */
+u32 eg_cg_rreg(struct radeon_device *rdev, u32 reg)
+{
+	unsigned long flags;
+	u32 r;
+
+	spin_lock_irqsave(&rdev->cg_idx_lock, flags);
+	WREG32(EVERGREEN_CG_IND_ADDR, ((reg) & 0xffff));
+	r = RREG32(EVERGREEN_CG_IND_DATA);
+	spin_unlock_irqrestore(&rdev->cg_idx_lock, flags);
+	return r;
+}
+
+void eg_cg_wreg(struct radeon_device *rdev, u32 reg, u32 v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->cg_idx_lock, flags);
+	WREG32(EVERGREEN_CG_IND_ADDR, ((reg) & 0xffff));
+	WREG32(EVERGREEN_CG_IND_DATA, (v));
+	spin_unlock_irqrestore(&rdev->cg_idx_lock, flags);
+}
+
+u32 eg_pif_phy0_rreg(struct radeon_device *rdev, u32 reg)
+{
+	unsigned long flags;
+	u32 r;
+
+	spin_lock_irqsave(&rdev->pif_idx_lock, flags);
+	WREG32(EVERGREEN_PIF_PHY0_INDEX, ((reg) & 0xffff));
+	r = RREG32(EVERGREEN_PIF_PHY0_DATA);
+	spin_unlock_irqrestore(&rdev->pif_idx_lock, flags);
+	return r;
+}
+
+void eg_pif_phy0_wreg(struct radeon_device *rdev, u32 reg, u32 v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->pif_idx_lock, flags);
+	WREG32(EVERGREEN_PIF_PHY0_INDEX, ((reg) & 0xffff));
+	WREG32(EVERGREEN_PIF_PHY0_DATA, (v));
+	spin_unlock_irqrestore(&rdev->pif_idx_lock, flags);
+}
+
+u32 eg_pif_phy1_rreg(struct radeon_device *rdev, u32 reg)
+{
+	unsigned long flags;
+	u32 r;
+
+	spin_lock_irqsave(&rdev->pif_idx_lock, flags);
+	WREG32(EVERGREEN_PIF_PHY1_INDEX, ((reg) & 0xffff));
+	r = RREG32(EVERGREEN_PIF_PHY1_DATA);
+	spin_unlock_irqrestore(&rdev->pif_idx_lock, flags);
+	return r;
+}
+
+void eg_pif_phy1_wreg(struct radeon_device *rdev, u32 reg, u32 v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->pif_idx_lock, flags);
+	WREG32(EVERGREEN_PIF_PHY1_INDEX, ((reg) & 0xffff));
+	WREG32(EVERGREEN_PIF_PHY1_DATA, (v));
+	spin_unlock_irqrestore(&rdev->pif_idx_lock, flags);
+}
+
 static const u32 crtc_offsets[6] =
 {
 	EVERGREEN_CRTC0_REGISTER_OFFSET,
@@ -1071,7 +1140,7 @@ static int sumo_set_uvd_clock(struct radeon_device *rdev, u32 clock,
 	int r, i;
 	struct atom_clock_dividers dividers;
 
-        r = radeon_atom_get_clock_dividers(rdev, COMPUTE_ENGINE_PLL_PARAM,
+	r = radeon_atom_get_clock_dividers(rdev, COMPUTE_ENGINE_PLL_PARAM,
 					   clock, false, &dividers);
 	if (r)
 		return r;
@@ -1335,44 +1404,20 @@ void dce4_wait_for_vblank(struct radeon_device *rdev, int crtc)
  * @crtc_id: crtc to cleanup pageflip on
  * @crtc_base: new address of the crtc (GPU MC address)
  *
- * Does the actual pageflip (evergreen+).
- * During vblank we take the crtc lock and wait for the update_pending
- * bit to go high, when it does, we release the lock, and allow the
- * double buffered update to take place.
- * Returns the current update pending status.
+ * Triggers the actual pageflip by updating the primary
+ * surface base address (evergreen+).
  */
 void evergreen_page_flip(struct radeon_device *rdev, int crtc_id, u64 crtc_base)
 {
 	struct radeon_crtc *radeon_crtc = rdev->mode_info.crtcs[crtc_id];
-	u32 tmp = RREG32(EVERGREEN_GRPH_UPDATE + radeon_crtc->crtc_offset);
-	int i;
-
-	/* Lock the graphics update lock */
-	tmp |= EVERGREEN_GRPH_UPDATE_LOCK;
-	WREG32(EVERGREEN_GRPH_UPDATE + radeon_crtc->crtc_offset, tmp);
 
 	/* update the scanout addresses */
-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + radeon_crtc->crtc_offset,
-	       upper_32_bits(crtc_base));
-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + radeon_crtc->crtc_offset,
-	       (u32)crtc_base);
-
 	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + radeon_crtc->crtc_offset,
 	       upper_32_bits(crtc_base));
 	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + radeon_crtc->crtc_offset,
 	       (u32)crtc_base);
-
-	/* Wait for update_pending to go high. */
-	for (i = 0; i < rdev->usec_timeout; i++) {
-		if (RREG32(EVERGREEN_GRPH_UPDATE + radeon_crtc->crtc_offset) & EVERGREEN_GRPH_SURFACE_UPDATE_PENDING)
-			break;
-		udelay(1);
-	}
-	DRM_DEBUG("Update pending now high. Unlocking vupdate_lock.\n");
-
-	/* Unlock the lock, so double-buffering can take place inside vblank */
-	tmp &= ~EVERGREEN_GRPH_UPDATE_LOCK;
-	WREG32(EVERGREEN_GRPH_UPDATE + radeon_crtc->crtc_offset, tmp);
+	/* post the write */
+	RREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + radeon_crtc->crtc_offset);
 }
 
 /**
@@ -2327,6 +2372,9 @@ static void evergreen_program_watermarks(struct radeon_device *rdev,
 		c.full = dfixed_div(c, a);
 		priority_b_mark = dfixed_trunc(c);
 		priority_b_cnt |= priority_b_mark & PRIORITY_MARK_MASK;
+
+		/* Save number of lines the linebuffer leads before the scanout */
+		radeon_crtc->lb_vblank_lead_lines = DIV_ROUND_UP(lb_size, mode->crtc_hdisplay);
 	}
 
 	/* select wm A */
@@ -2560,10 +2608,152 @@ static void evergreen_agp_enable(struct radeon_device *rdev)
 	WREG32(VM_CONTEXT1_CNTL, 0);
 }
 
+static const unsigned ni_dig_offsets[] =
+{
+	NI_DIG0_REGISTER_OFFSET,
+	NI_DIG1_REGISTER_OFFSET,
+	NI_DIG2_REGISTER_OFFSET,
+	NI_DIG3_REGISTER_OFFSET,
+	NI_DIG4_REGISTER_OFFSET,
+	NI_DIG5_REGISTER_OFFSET
+};
+
+static const unsigned ni_tx_offsets[] =
+{
+	NI_DCIO_UNIPHY0_UNIPHY_TX_CONTROL1,
+	NI_DCIO_UNIPHY1_UNIPHY_TX_CONTROL1,
+	NI_DCIO_UNIPHY2_UNIPHY_TX_CONTROL1,
+	NI_DCIO_UNIPHY3_UNIPHY_TX_CONTROL1,
+	NI_DCIO_UNIPHY4_UNIPHY_TX_CONTROL1,
+	NI_DCIO_UNIPHY5_UNIPHY_TX_CONTROL1
+};
+
+static const unsigned evergreen_dp_offsets[] =
+{
+	EVERGREEN_DP0_REGISTER_OFFSET,
+	EVERGREEN_DP1_REGISTER_OFFSET,
+	EVERGREEN_DP2_REGISTER_OFFSET,
+	EVERGREEN_DP3_REGISTER_OFFSET,
+	EVERGREEN_DP4_REGISTER_OFFSET,
+	EVERGREEN_DP5_REGISTER_OFFSET
+};
+
+
+/*
+ * Assumption is that EVERGREEN_CRTC_MASTER_EN enable for requested crtc
+ * We go from crtc to connector and it is not relible  since it
+ * should be an opposite direction .If crtc is enable then
+ * find the dig_fe which selects this crtc and insure that it enable.
+ * if such dig_fe is found then find dig_be which selects found dig_be and
+ * insure that it enable and in DP_SST mode.
+ * if UNIPHY_PLL_CONTROL1.enable then we should disconnect timing
+ * from dp symbols clocks .
+ */
+static bool evergreen_is_dp_sst_stream_enabled(struct radeon_device *rdev,
+					       unsigned crtc_id, unsigned *ret_dig_fe)
+{
+	unsigned i;
+	unsigned dig_fe;
+	unsigned dig_be;
+	unsigned dig_en_be;
+	unsigned uniphy_pll;
+	unsigned digs_fe_selected;
+	unsigned dig_be_mode;
+	unsigned dig_fe_mask;
+	bool is_enabled = false;
+	bool found_crtc = false;
+
+	/* loop through all running dig_fe to find selected crtc */
+	for (i = 0; i < ARRAY_SIZE(ni_dig_offsets); i++) {
+		dig_fe = RREG32(NI_DIG_FE_CNTL + ni_dig_offsets[i]);
+		if (dig_fe & NI_DIG_FE_CNTL_SYMCLK_FE_ON &&
+		    crtc_id == NI_DIG_FE_CNTL_SOURCE_SELECT(dig_fe)) {
+			/* found running pipe */
+			found_crtc = true;
+			dig_fe_mask = 1 << i;
+			dig_fe = i;
+			break;
+		}
+	}
+
+	if (found_crtc) {
+		/* loop through all running dig_be to find selected dig_fe */
+		for (i = 0; i < ARRAY_SIZE(ni_dig_offsets); i++) {
+			dig_be = RREG32(NI_DIG_BE_CNTL + ni_dig_offsets[i]);
+			/* if dig_fe_selected by dig_be? */
+			digs_fe_selected = NI_DIG_BE_CNTL_FE_SOURCE_SELECT(dig_be);
+			dig_be_mode = NI_DIG_FE_CNTL_MODE(dig_be);
+			if (dig_fe_mask &  digs_fe_selected &&
+			    /* if dig_be in sst mode? */
+			    dig_be_mode == NI_DIG_BE_DPSST) {
+				dig_en_be = RREG32(NI_DIG_BE_EN_CNTL +
+						   ni_dig_offsets[i]);
+				uniphy_pll = RREG32(NI_DCIO_UNIPHY0_PLL_CONTROL1 +
+						    ni_tx_offsets[i]);
+				/* dig_be enable and tx is running */
+				if (dig_en_be & NI_DIG_BE_EN_CNTL_ENABLE &&
+				    dig_en_be & NI_DIG_BE_EN_CNTL_SYMBCLK_ON &&
+				    uniphy_pll & NI_DCIO_UNIPHY0_PLL_CONTROL1_ENABLE) {
+					is_enabled = true;
+					*ret_dig_fe = dig_fe;
+					break;
+				}
+			}
+		}
+	}
+
+	return is_enabled;
+}
+
+/*
+ * Blank dig when in dp sst mode
+ * Dig ignores crtc timing
+ */
+static void evergreen_blank_dp_output(struct radeon_device *rdev,
+				      unsigned dig_fe)
+{
+	unsigned stream_ctrl;
+	unsigned fifo_ctrl;
+	unsigned counter = 0;
+
+	if (dig_fe >= ARRAY_SIZE(evergreen_dp_offsets)) {
+		DRM_ERROR("invalid dig_fe %d\n", dig_fe);
+		return;
+	}
+
+	stream_ctrl = RREG32(EVERGREEN_DP_VID_STREAM_CNTL +
+			     evergreen_dp_offsets[dig_fe]);
+	if (!(stream_ctrl & EVERGREEN_DP_VID_STREAM_CNTL_ENABLE)) {
+		DRM_ERROR("dig %d , should be enable\n", dig_fe);
+		return;
+	}
+
+	stream_ctrl &=~EVERGREEN_DP_VID_STREAM_CNTL_ENABLE;
+	WREG32(EVERGREEN_DP_VID_STREAM_CNTL +
+	       evergreen_dp_offsets[dig_fe], stream_ctrl);
+
+	stream_ctrl = RREG32(EVERGREEN_DP_VID_STREAM_CNTL +
+			     evergreen_dp_offsets[dig_fe]);
+	while (counter < 32 && stream_ctrl & EVERGREEN_DP_VID_STREAM_STATUS) {
+		msleep(1);
+		counter++;
+		stream_ctrl = RREG32(EVERGREEN_DP_VID_STREAM_CNTL +
+				     evergreen_dp_offsets[dig_fe]);
+	}
+	if (counter >= 32 )
+		DRM_ERROR("counter exceeds %d\n", counter);
+
+	fifo_ctrl = RREG32(EVERGREEN_DP_STEER_FIFO + evergreen_dp_offsets[dig_fe]);
+	fifo_ctrl |= EVERGREEN_DP_STEER_FIFO_RESET;
+	WREG32(EVERGREEN_DP_STEER_FIFO + evergreen_dp_offsets[dig_fe], fifo_ctrl);
+
+}
+
 void evergreen_mc_stop(struct radeon_device *rdev, struct evergreen_mc_save *save)
 {
 	u32 crtc_enabled, tmp, frame_count, blackout;
 	int i, j;
+	unsigned dig_fe;
 
 	if (!ASIC_IS_NODCE(rdev)) {
 		save->vga_render_control = RREG32(VGA_RENDER_CONTROL);
@@ -2603,7 +2793,17 @@ void evergreen_mc_stop(struct radeon_device *rdev, struct evergreen_mc_save *sav
 					break;
 				udelay(1);
 			}
-
+			/*we should disable dig if it drives dp sst*/
+			/*but we are in radeon_device_init and the topology is unknown*/
+			/*and it is available after radeon_modeset_init*/
+			/*the following method radeon_atom_encoder_dpms_dig*/
+			/*does the job if we initialize it properly*/
+			/*for now we do it this manually*/
+			/**/
+			if (ASIC_IS_DCE5(rdev) &&
+			    evergreen_is_dp_sst_stream_enabled(rdev, i ,&dig_fe))
+				evergreen_blank_dp_output(rdev, dig_fe);
+			/*we could remove 6 lines below*/
 			/* XXX this is a hack to avoid strange behavior with EFI on certain systems */
 			WREG32(EVERGREEN_CRTC_UPDATE_LOCK + crtc_offsets[i], 1);
 			tmp = RREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i]);
@@ -5304,7 +5504,7 @@ restart_ih:
 	if (queue_dp)
 		schedule_work(&rdev->dp_work);
 	if (queue_hotplug)
-		schedule_work(&rdev->hotplug_work);
+		schedule_delayed_work(&rdev->hotplug_work, 0);
 	if (queue_hdmi)
 		schedule_work(&rdev->audio_work);
 	if (queue_thermal && rdev->pm.dpm_enabled)

@@ -173,6 +173,9 @@ enum smb_version {
 	Smb_21,
 	Smb_30,
 	Smb_302,
+#ifdef CONFIG_CIFS_SMB311
+	Smb_311,
+#endif /* SMB311 */
 	Smb_version_err
 };
 
@@ -371,6 +374,8 @@ struct smb_version_operations {
 	void (*new_lease_key)(struct cifs_fid *);
 	int (*generate_signingkey)(struct cifs_ses *);
 	int (*calc_signature)(struct smb_rqst *, struct TCP_Server_Info *);
+	int (*set_integrity)(const unsigned int, struct cifs_tcon *tcon,
+			     struct cifsFileInfo *src_file);
 	int (*query_mf_symlink)(unsigned int, struct cifs_tcon *,
 				struct cifs_sb_info *, const unsigned char *,
 				char *, unsigned int *);
@@ -387,6 +392,9 @@ struct smb_version_operations {
 	/* parse lease context buffer and return oplock/epoch info */
 	__u8 (*parse_lease_buf)(void *, unsigned int *);
 	int (*clone_range)(const unsigned int, struct cifsFileInfo *src_file,
+			struct cifsFileInfo *target_file, u64 src_off, u64 len,
+			u64 dest_off);
+	int (*duplicate_extents)(const unsigned int, struct cifsFileInfo *src,
 			struct cifsFileInfo *target_file, u64 src_off, u64 len,
 			u64 dest_off);
 	int (*validate_negotiate)(const unsigned int, struct cifs_tcon *);
@@ -490,6 +498,7 @@ struct smb_vol {
 	bool nosharesock:1;
 	bool persistent:1;
 	bool nopersistent:1;
+	bool resilient:1; /* noresilient not required since not fored for CA */
 	unsigned int rsize;
 	unsigned int wsize;
 	bool sockopt_tcp_nodelay:1;
@@ -893,6 +902,8 @@ struct cifs_tcon {
 	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
 	bool broken_sparse_sup; /* if server or share does not support sparse */
 	bool need_reconnect:1; /* connection reset, tid now invalid */
+	bool use_resilient:1; /* use resilient instead of durable handles */
+	bool use_persistent:1; /* use persistent instead of durable handles */
 #ifdef CONFIG_CIFS_SMB2
 	bool print:1;		/* set if connection to printer share */
 	bool bad_network_name:1; /* set if ret status STATUS_BAD_NETWORK_NAME */
@@ -1625,4 +1636,8 @@ extern struct smb_version_values smb30_values;
 #define SMB302_VERSION_STRING	"3.02"
 /*extern struct smb_version_operations smb302_operations;*/ /* not needed yet */
 extern struct smb_version_values smb302_values;
+#define SMB311_VERSION_STRING	"3.1.1"
+#define ALT_SMB311_VERSION_STRING "3.11"
+extern struct smb_version_operations smb311_operations;
+extern struct smb_version_values smb311_values;
 #endif	/* _CIFS_GLOB_H */

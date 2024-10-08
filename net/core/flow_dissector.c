@@ -298,7 +298,7 @@ u16 __skb_tx_hash(const struct net_device *dev, struct sk_buff *skb,
 		qcount = dev->tc_to_txq[tc].count;
 	}
 
-	return (u16) (((u64)skb_get_hash(skb) * qcount) >> 32) + qoffset;
+	return (u16) reciprocal_scale(skb_get_hash(skb), qcount) + qoffset;
 }
 EXPORT_SYMBOL(__skb_tx_hash);
 
@@ -360,86 +360,4 @@ u32 skb_get_poff(const struct sk_buff *skb)
 		return 0;
 
 	return __skb_get_poff(skb, skb->data, &keys, skb_headlen(skb));
-}
-
-static inline u16 dev_cap_txqueue(struct net_device *dev, u16 queue_index)
-{
-	if (unlikely(queue_index >= dev->real_num_tx_queues)) {
-		net_warn_ratelimited("%s selects TX queue %d, but real number of TX queues is %d\n",
-				     dev->name, queue_index,
-				     dev->real_num_tx_queues);
-		return 0;
-	}
-	return queue_index;
-}
-
-static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
-{
-#ifdef CONFIG_XPS
-	struct xps_dev_maps *dev_maps;
-	struct xps_map *map;
-	int queue_index = -1;
-
-	rcu_read_lock();
-	dev_maps = rcu_dereference(dev->xps_maps);
-	if (dev_maps) {
-		map = rcu_dereference(
-		    dev_maps->cpu_map[raw_smp_processor_id()]);
-		if (map) {
-			if (map->len == 1)
-				queue_index = map->queues[0];
-			else
-				queue_index = map->queues[
-				    ((u64)skb_get_hash(skb) * map->len) >> 32];
-
-			if (unlikely(queue_index >= dev->real_num_tx_queues))
-				queue_index = -1;
-		}
-	}
-	rcu_read_unlock();
-
-	return queue_index;
-#else
-	return -1;
-#endif
-}
-
-u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb)
-{
-	struct sock *sk = skb->sk;
-	int queue_index = sk_tx_queue_get(sk);
-
-	if (queue_index < 0 || skb->ooo_okay ||
-	    queue_index >= dev->real_num_tx_queues) {
-		int new_index = get_xps_queue(dev, skb);
-		if (new_index < 0)
-			new_index = skb_tx_hash(dev, skb);
-
-		if (queue_index != new_index && sk &&
-		    rcu_access_pointer(sk->sk_dst_cache))
-			sk_tx_queue_set(sk, new_index);
-
-		queue_index = new_index;
-	}
-
-	return queue_index;
-}
-EXPORT_SYMBOL(__netdev_pick_tx);
-
-struct netdev_queue *netdev_pick_tx(struct net_device *dev,
-				    struct sk_buff *skb)
-{
-	int queue_index = 0;
-
-	if (dev->real_num_tx_queues != 1) {
-		const struct net_device_ops *ops = dev->netdev_ops;
-		if (ops->ndo_select_queue)
-			queue_index = ops->ndo_select_queue(dev, skb);
-		else
-			queue_index = __netdev_pick_tx(dev, skb);
-		queue_index = dev_cap_txqueue(dev, queue_index);
-	}
-
-	skb_set_queue_mapping(skb, queue_index);
-	return netdev_get_tx_queue(dev, queue_index);
 }

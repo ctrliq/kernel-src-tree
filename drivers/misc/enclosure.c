@@ -148,6 +148,7 @@ enclosure_register(struct device *dev, const char *name, int components,
 	for (i = 0; i < components; i++) {
 		edev->component[i].number = -1;
 		edev->component[i].slot = -1;
+		edev->component[i].power_status = 1;
 	}
 
 	mutex_lock(&container_list_lock);
@@ -435,8 +436,20 @@ static ssize_t enclosure_show_components(struct device *cdev,
 	return snprintf(buf, 40, "%d\n", edev->components);
 }
 
+static ssize_t id_show(struct device *cdev,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct enclosure_device *edev = to_enclosure_device(cdev);
+
+	if (edev->cb->show_id)
+		return edev->cb->show_id(edev, buf);
+	return -EINVAL;
+}
+
 static struct device_attribute enclosure_attrs[] = {
 	__ATTR(components, S_IRUGO, enclosure_show_components, NULL),
+	__ATTR(id, S_IRUGO, id_show, NULL),
 	__ATTR_NULL
 };
 
@@ -570,6 +583,40 @@ static ssize_t set_component_locate(struct device *cdev,
 	return count;
 }
 
+static ssize_t get_component_power_status(struct device *cdev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
+	struct enclosure_component *ecomp = to_enclosure_component(cdev);
+
+	if (edev->cb->get_power_status)
+		edev->cb->get_power_status(edev, ecomp);
+	return snprintf(buf, 40, "%s\n", ecomp->power_status ? "on" : "off");
+}
+
+static ssize_t set_component_power_status(struct device *cdev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct enclosure_device *edev = to_enclosure_device(cdev->parent);
+	struct enclosure_component *ecomp = to_enclosure_component(cdev);
+	int val;
+
+	if (strncmp(buf, "on", 2) == 0 &&
+	    (buf[2] == '\n' || buf[2] == '\0'))
+		val = 1;
+	else if (strncmp(buf, "off", 3) == 0 &&
+	    (buf[3] == '\n' || buf[3] == '\0'))
+		val = 0;
+	else
+		return -EINVAL;
+
+	if (edev->cb->set_power_status)
+		edev->cb->set_power_status(edev, ecomp, val);
+	return count;
+}
+
 static ssize_t get_component_type(struct device *cdev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -601,6 +648,8 @@ static DEVICE_ATTR(active, S_IRUGO | S_IWUSR, get_component_active,
 		   set_component_active);
 static DEVICE_ATTR(locate, S_IRUGO | S_IWUSR, get_component_locate,
 		   set_component_locate);
+static DEVICE_ATTR(power_status, S_IRUGO | S_IWUSR, get_component_power_status,
+		   set_component_power_status);
 static DEVICE_ATTR(type, S_IRUGO, get_component_type, NULL);
 static DEVICE_ATTR(slot, S_IRUGO, get_component_slot, NULL);
 
@@ -609,6 +658,7 @@ static struct attribute *enclosure_component_attrs[] = {
 	&dev_attr_status.attr,
 	&dev_attr_active.attr,
 	&dev_attr_locate.attr,
+	&dev_attr_power_status.attr,
 	&dev_attr_type.attr,
 	&dev_attr_slot.attr,
 	NULL

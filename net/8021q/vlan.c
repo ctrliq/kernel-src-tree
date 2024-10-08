@@ -343,7 +343,7 @@ static void __vlan_device_event(struct net_device *dev, unsigned long event)
 static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 			     void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct vlan_group *grp;
 	struct vlan_info *vlan_info;
 	int i, flgs;
@@ -640,7 +640,7 @@ static struct sk_buff **vlan_gro_receive(struct sk_buff **head,
 
 	skb_gro_pull(skb, sizeof(*vhdr));
 	skb_gro_postpull_rcsum(skb, vhdr, sizeof(*vhdr));
-	pp = ptype->callbacks.gro_receive(head, skb);
+	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
 
 out_unlock:
 	rcu_read_unlock();
@@ -720,7 +720,7 @@ static int __init vlan_proto_init(void)
 	if (err < 0)
 		goto err0;
 
-	err = register_netdevice_notifier(&vlan_notifier_block);
+	err = register_netdevice_notifier_rh(&vlan_notifier_block);
 	if (err < 0)
 		goto err2;
 
@@ -747,7 +747,7 @@ err5:
 err4:
 	vlan_gvrp_uninit();
 err3:
-	unregister_netdevice_notifier(&vlan_notifier_block);
+	unregister_netdevice_notifier_rh(&vlan_notifier_block);
 err2:
 	unregister_pernet_subsys(&vlan_net_ops);
 err0:
@@ -765,7 +765,7 @@ static void __exit vlan_cleanup_module(void)
 
 	vlan_netlink_fini();
 
-	unregister_netdevice_notifier(&vlan_notifier_block);
+	unregister_netdevice_notifier_rh(&vlan_notifier_block);
 
 	unregister_pernet_subsys(&vlan_net_ops);
 	rcu_barrier(); /* Wait for completion of call_rcu()'s */

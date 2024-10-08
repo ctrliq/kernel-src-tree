@@ -118,14 +118,12 @@ static void iot_io_end(struct io_tracker *iot, sector_t len)
  */
 struct dm_hook_info {
 	bio_end_io_t *bi_end_io;
-	void *bi_private;
 };
 
 static void dm_hook_bio(struct dm_hook_info *h, struct bio *bio,
 			bio_end_io_t *bi_end_io, void *bi_private)
 {
 	h->bi_end_io = bio->bi_end_io;
-	h->bi_private = bio->bi_private;
 
 	bio->bi_end_io = bi_end_io;
 	bio->bi_private = bi_private;
@@ -134,7 +132,6 @@ static void dm_hook_bio(struct dm_hook_info *h, struct bio *bio,
 static void dm_unhook_bio(struct dm_hook_info *h, struct bio *bio)
 {
 	bio->bi_end_io = h->bi_end_io;
-	bio->bi_private = h->bi_private;
 }
 
 /*----------------------------------------------------------------*/
@@ -2312,8 +2309,7 @@ static void destroy(struct cache *cache)
 {
 	unsigned i;
 
-	if (cache->migration_pool)
-		mempool_destroy(cache->migration_pool);
+	mempool_destroy(cache->migration_pool);
 
 	if (cache->all_io_ds)
 		dm_deferred_set_destroy(cache->all_io_ds);
@@ -2778,7 +2774,7 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 	ti->split_discard_bios = false;
 
 	cache->features = ca->features;
-	ti->per_bio_data_size = get_per_bio_data_size(cache);
+	ti->per_io_data_size = get_per_bio_data_size(cache);
 
 	cache->callbacks.congested_fn = cache_is_congested;
 	dm_table_add_target_callbacks(ti->table, &cache->callbacks);

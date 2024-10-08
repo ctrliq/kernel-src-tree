@@ -27,6 +27,8 @@
 #include <linux/namei.h>
 #include <linux/log2.h>
 #include <linux/cleancache.h>
+#include <linux/dax.h>
+#include <linux/badblocks.h>
 #include <linux/aio.h>
 #include <asm/uaccess.h>
 #include "internal.h"
@@ -49,6 +51,18 @@ inline struct block_device *I_BDEV(struct inode *inode)
 }
 EXPORT_SYMBOL(I_BDEV);
 
+void __vfs_msg(struct super_block *sb, const char *prefix, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+	printk_ratelimited("%sVFS (%s): %pV\n", prefix, sb->s_id, &vaf);
+	va_end(args);
+}
+
 /*
  * Move the inode from its current bdi to a new bdi.  Make sure the inode
  * is clean before moving so that it doesn't linger on the old bdi.
@@ -56,6 +70,8 @@ EXPORT_SYMBOL(I_BDEV);
 static void bdev_inode_switch_bdi(struct inode *inode,
 			struct backing_dev_info *dst)
 {
+	int ret;
+
 	while (true) {
 		spin_lock(&inode->i_lock);
 		if (!(inode->i_state & I_DIRTY)) {
@@ -64,7 +80,13 @@ static void bdev_inode_switch_bdi(struct inode *inode,
 			return;
 		}
 		spin_unlock(&inode->i_lock);
-		WARN_ON_ONCE(write_inode_now(inode, true));
+		ret = write_inode_now(inode, true);
+		if (ret) {
+			char name[BDEVNAME_SIZE];
+			pr_warn_ratelimited("VFS: Dirty inode writeback failed "
+					    "for block device %s (err=%d).\n",
+					    bdevname(I_BDEV(inode), name), ret);
+		}
 	}
 }
 
@@ -73,7 +95,7 @@ void kill_bdev(struct block_device *bdev)
 {
 	struct address_space *mapping = bdev->bd_inode->i_mapping;
 
-	if (mapping->nrpages == 0 && mapping->nrshadows == 0)
+	if (mapping->nrpages == 0 && mapping->nrexceptional == 0)
 		return;
 
 	invalidate_bh_lrus();
@@ -154,16 +176,24 @@ blkdev_get_block(struct inode *inode, sector_t iblock,
 	return 0;
 }
 
+static struct inode *bdev_file_inode(struct file *file)
+{
+	return file->f_mapping->host;
+}
+
 static ssize_t
 blkdev_direct_IO(int rw, struct kiocb *iocb, const struct iovec *iov,
 			loff_t offset, unsigned long nr_segs)
 {
 	struct file *file = iocb->ki_filp;
-	struct inode *inode = file->f_mapping->host;
+	struct inode *inode = bdev_file_inode(file);
 
+	if (IS_DAX(inode))
+		return dax_do_io(rw, iocb, inode, iov, offset, nr_segs,
+				 blkdev_get_block, NULL, DIO_SKIP_DIO_COUNT);
 	return __blockdev_direct_IO(rw, iocb, inode, I_BDEV(inode), iov, offset,
 				    nr_segs, blkdev_get_block, NULL, NULL,
-				    DIO_IGNORE_TRUNCATE);
+				    DIO_SKIP_DIO_COUNT);
 }
 
 int __sync_blockdev(struct block_device *bdev, int wait)
@@ -321,6 +351,51 @@ static int blkdev_write_end(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
+/**
+ * bdev_direct_access() - Get the address for directly-accessibly memory
+ * @bdev: The device containing the memory
+ * @dax: control and output parameters for ->direct_access
+ *
+ * If a block device is made up of directly addressable memory, this function
+ * will tell the caller the PFN and the address of the memory.  The address
+ * may be directly dereferenced within the kernel without the need to call
+ * ioremap(), kmap() or similar.  The PFN is suitable for inserting into
+ * page tables.
+ *
+ * Return: negative errno if an error occurs, otherwise the number of bytes
+ * accessible at this address.
+ */
+long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
+{
+	sector_t sector = dax->sector;
+	long avail, size = dax->size;
+	const struct block_device_operations *ops = bdev->bd_disk->fops;
+
+	/*
+	 * The device driver is allowed to sleep, in order to make the
+	 * memory directly accessible.
+	 */
+	might_sleep();
+
+	if (size < 0)
+		return size;
+	if (!ops->direct_access)
+		return -EOPNOTSUPP;
+	if ((sector + DIV_ROUND_UP(size, 512)) >
+					part_nr_sects_read(bdev->bd_part))
+		return -ERANGE;
+	sector += get_start_sect(bdev);
+	if (sector % (PAGE_SIZE / 512))
+		return -EINVAL;
+	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn);
+	if (!avail)
+		return -ERANGE;
+	if (avail > 0 && avail & ~PAGE_MASK)
+		return -ENXIO;
+	return min(avail, size);
+}
+EXPORT_SYMBOL_GPL(bdev_direct_access);
+
 /*
  * private llseek:
  * for a block special file file_inode(file)->i_size is zero
@@ -328,7 +403,7 @@ static int blkdev_write_end(struct file *file, struct address_space *mapping,
  */
 static loff_t block_llseek(struct file *file, loff_t offset, int whence)
 {
-	struct inode *bd_inode = file->f_mapping->host;
+	struct inode *bd_inode = bdev_file_inode(file);
 	loff_t size;
 	loff_t retval;
 
@@ -360,7 +435,7 @@ out:
 	
 int blkdev_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 {
-	struct inode *bd_inode = filp->f_mapping->host;
+	struct inode *bd_inode = bdev_file_inode(filp);
 	struct block_device *bdev = I_BDEV(bd_inode);
 	int error;
 	
@@ -401,9 +476,17 @@ int bdev_read_page(struct block_device *bdev, sector_t sector,
 			struct page *page)
 {
 	const struct block_device_operations *ops = bdev->bd_disk->fops;
+	int result = -EOPNOTSUPP;
+
 	if (!ops->rw_page || bdev_get_integrity(bdev))
-		return -EOPNOTSUPP;
-	return ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
+		return result;
+
+	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
+	if (result)
+		return result;
+	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
+	blk_queue_exit(bdev->bd_queue);
+	return result;
 }
 EXPORT_SYMBOL_GPL(bdev_read_page);
 
@@ -432,63 +515,73 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
 	int result;
 	int rw = (wbc->sync_mode == WB_SYNC_ALL) ? WRITE_SYNC : WRITE;
 	const struct block_device_operations *ops = bdev->bd_disk->fops;
+
 	if (!ops->rw_page || bdev_get_integrity(bdev))
 		return -EOPNOTSUPP;
+	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
+	if (result)
+		return result;
+
 	set_page_writeback(page);
 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, rw);
 	if (result)
 		end_page_writeback(page);
 	else
 		unlock_page(page);
+	blk_queue_exit(bdev->bd_queue);
 	return result;
 }
 EXPORT_SYMBOL_GPL(bdev_write_page);
 
 /**
- * bdev_direct_access() - Get the address for directly-accessibly memory
- * @bdev: The device containing the memory
- * @sector: The offset within the device
- * @addr: Where to put the address of the memory
- * @pfn: The Page Frame Number for the memory
- * @size: The number of bytes requested
+ * bdev_dax_supported() - Check if the device supports dax for filesystem
+ * @sb: The superblock of the device
+ * @blocksize: The block size of the device
  *
- * If a block device is made up of directly addressable memory, this function
- * will tell the caller the PFN and the address of the memory.  The address
- * may be directly dereferenced within the kernel without the need to call
- * ioremap(), kmap() or similar.  The PFN is suitable for inserting into
- * page tables.
+ * This is a library function for filesystems to check if the block device
+ * can be mounted with dax option.
  *
- * Return: negative errno if an error occurs, otherwise the number of bytes
- * accessible at this address.
+ * Return: negative errno if unsupported, 0 if supported.
  */
-long bdev_direct_access(struct block_device *bdev, sector_t sector,
-			void **addr, unsigned long *pfn, long size)
+int bdev_dax_supported(struct super_block *sb, int blocksize)
 {
-	long avail;
-	const struct block_device_operations *ops = bdev->bd_disk->fops;
+	struct blk_dax_ctl dax = {
+		.sector = 0,
+		.size = PAGE_SIZE,
+	};
+	int err;
 
-	/*
-	 * The device driver is allowed to sleep, in order to make the
-	 * memory directly accessible.
-	 */
-	might_sleep();
-
-	if (size < 0)
-		return size;
-	if (!ops->direct_access)
-		return -EOPNOTSUPP;
-	if ((sector + DIV_ROUND_UP(size, 512)) >
-					part_nr_sects_read(bdev->bd_part))
-		return -ERANGE;
-	sector += get_start_sect(bdev);
-	if (sector % (PAGE_SIZE / 512))
+	if (blocksize != PAGE_SIZE) {
+		vfs_msg(sb, KERN_ERR, "error: unsupported blocksize for dax");
 		return -EINVAL;
-	avail = ops->direct_access(bdev, sector, addr, pfn, size);
-	if (!avail)
-		return -ERANGE;
-	return min(avail, size);
+	}
+
+	if (sb->s_bdev->bd_disk->bb && sb->s_bdev->bd_disk->bb->count) {
+		vfs_msg(sb, KERN_ERR, "error: media errors detected");
+		return -EINVAL;
+	}
+
+	err = bdev_direct_access(sb->s_bdev, &dax);
+	if (err < 0) {
+		switch (err) {
+		case -EOPNOTSUPP:
+			vfs_msg(sb, KERN_ERR,
+				"error: device does not support dax");
+			break;
+		case -EINVAL:
+			vfs_msg(sb, KERN_ERR,
+				"error: unaligned partition for dax");
+			break;
+		default:
+			vfs_msg(sb, KERN_ERR,
+				"error: dax access failed (%d)", err);
+		}
+		return err;
+	}
+
+	return 0;
 }
-EXPORT_SYMBOL_GPL(bdev_direct_access);
+EXPORT_SYMBOL_GPL(bdev_dax_supported);
 
 /*
  * pseudo-fs
@@ -1205,6 +1298,11 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
 		bdev->bd_disk = disk;
 		bdev->bd_queue = disk->queue;
 		bdev->bd_contains = bdev;
+		if (IS_ENABLED(CONFIG_BLK_DEV_DAX) && disk->fops->direct_access)
+			bdev->bd_inode->i_flags = S_DAX;
+		else
+			bdev->bd_inode->i_flags = 0;
+
 		if (!partno) {
 			struct backing_dev_info *bdi;
 
@@ -1604,14 +1702,14 @@ EXPORT_SYMBOL(blkdev_put);
 
 static int blkdev_close(struct inode * inode, struct file * filp)
 {
-	struct block_device *bdev = I_BDEV(filp->f_mapping->host);
+	struct block_device *bdev = I_BDEV(bdev_file_inode(filp));
 	blkdev_put(bdev, filp->f_mode);
 	return 0;
 }
 
 static long block_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 {
-	struct block_device *bdev = I_BDEV(file->f_mapping->host);
+	struct block_device *bdev = I_BDEV(bdev_file_inode(file));
 	fmode_t mode = file->f_mode;
 
 	/*
@@ -1644,7 +1742,7 @@ ssize_t blkdev_aio_write(struct kiocb *iocb, const struct iovec *iov,
 
 	blk_start_plug(&plug);
 	ret = __generic_file_aio_write(iocb, iov, nr_segs, &iocb->ki_pos);
-	if (ret > 0 || ret == -EIOCBQUEUED) {
+	if (ret > 0) {
 		ssize_t err;
 
 		err = generic_write_sync(file, pos, ret);
@@ -1660,7 +1758,7 @@ ssize_t blkdev_aio_read(struct kiocb *iocb, const struct iovec *iov,
 			unsigned long nr_segs, loff_t pos)
 {
 	struct file *file = iocb->ki_filp;
-	struct inode *bd_inode = file->f_mapping->host;
+	struct inode *bd_inode = bdev_file_inode(file);
 	loff_t size = i_size_read(bd_inode);
 
 	if (pos >= size)
@@ -1687,13 +1785,24 @@ static int blkdev_releasepage(struct page *page, gfp_t wait)
 	return try_to_free_buffers(page);
 }
 
+static int blkdev_writepages(struct address_space *mapping,
+			     struct writeback_control *wbc)
+{
+	if (dax_mapping(mapping)) {
+		struct block_device *bdev = I_BDEV(mapping->host);
+
+		return dax_writeback_mapping_range(mapping, bdev, wbc);
+	}
+	return generic_writepages(mapping, wbc);
+}
+
 static const struct address_space_operations def_blk_aops = {
 	.readpage	= blkdev_readpage,
 	.readpages	= blkdev_readpages,
 	.writepage	= blkdev_writepage,
 	.write_begin	= blkdev_write_begin,
 	.write_end	= blkdev_write_end,
-	.writepages	= generic_writepages,
+	.writepages	= blkdev_writepages,
 	.releasepage	= blkdev_releasepage,
 	.direct_IO	= blkdev_direct_IO,
 	.is_dirty_writeback = buffer_check_dirty_writeback,

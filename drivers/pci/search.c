@@ -40,12 +40,14 @@ int pci_for_each_dma_alias(struct pci_dev *pdev,
 	 * If the device is broken and uses an alias requester ID for
 	 * DMA, iterate over that too.
 	 */
-	if (unlikely(pdev->dev_flags & PCI_DEV_FLAGS_DMA_ALIAS_DEVFN)) {
-		ret = fn(pdev, PCI_DEVID(pdev->bus->number,
-					 pdev->pci_dev_rh->dma_alias_devfn),
-					 data);
-		if (ret)
-			return ret;
+	if (unlikely(pdev->pci_dev_rh->dma_alias_mask)) {
+		u8 devfn;
+
+		for_each_set_bit(devfn, pdev->pci_dev_rh->dma_alias_mask, U8_MAX) {
+			ret = fn(pdev, PCI_DEVID(pdev->bus->number, devfn), data);
+			if (ret)
+				return ret;
+		}
 	}
 
 	for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
@@ -102,40 +104,6 @@ int pci_for_each_dma_alias(struct pci_dev *pdev,
 	}
 
 	return ret;
-}
-
-/*
- * find the upstream PCIe-to-PCI bridge of a PCI device
- * if the device is PCIE, return NULL
- * if the device isn't connected to a PCIe bridge (that is its parent is a
- * legacy PCI bridge and the bridge is directly connected to bus 0), return its
- * parent
- */
-struct pci_dev *pci_find_upstream_pcie_bridge(struct pci_dev *pdev)
-{
-	struct pci_dev *tmp = NULL;
-
-	if (pci_is_pcie(pdev))
-		return NULL;
-	while (1) {
-		if (pci_is_root_bus(pdev->bus))
-			break;
-		pdev = pdev->bus->self;
-		/* a p2p bridge */
-		if (!pci_is_pcie(pdev)) {
-			tmp = pdev;
-			continue;
-		}
-		/* PCI device should connect to a PCIe bridge */
-		if (pci_pcie_type(pdev) != PCI_EXP_TYPE_PCI_BRIDGE) {
-			/* Busted hardware? */
-			WARN_ON_ONCE(1);
-			return NULL;
-		}
-		return pdev;
-	}
-
-	return tmp;
 }
 
 static struct pci_bus *pci_do_find_bus(struct pci_bus *bus, unsigned char busnr)
@@ -312,8 +280,7 @@ static struct pci_dev *pci_get_dev_by_id(const struct pci_device_id *id,
 			      match_pci_dev_by_id);
 	if (dev)
 		pdev = to_pci_dev(dev);
-	if (from)
-		pci_dev_put(from);
+	pci_dev_put(from);
 	return pdev;
 }
 

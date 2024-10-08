@@ -55,7 +55,7 @@ void func(const struct xfs_mount *mp, const char *fmt, ...)	\
 	va_end(args);						\
 								\
 	if (!kstrtoint(kern_level, 0, &level) &&		\
-	    level <= LOGLEVEL_ERR &&				\
+	    level <= 3 /* LOGLEVEL_ERR */ &&			\
 	    xfs_error_level >= XFS_ERRLEVEL_HIGH)		\
 		xfs_stack_trace();				\
 }								\

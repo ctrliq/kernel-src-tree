@@ -145,10 +145,18 @@ struct mlx5_ib_create_qp {
 	__u32	flags;
 	__u32	uidx;
 	__u32	reserved0;
+	__u64	sq_buf_addr;
 };
 
 struct mlx5_ib_create_qp_resp {
 	__u32	uuar_index;
+};
+
+struct mlx5_ib_alloc_mw {
+	__u32	comp_mask;
+	__u8	num_klms;
+	__u8	reserved1;
+	__u16	reserved2;
 };
 
 static inline int get_qp_user_index(struct mlx5_ib_ucontext *ucontext,

@@ -223,6 +223,7 @@ struct nfs_inode {
 #define NFS_INO_COMMIT		(7)		/* inode is committing unstable writes */
 #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
 #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
+#define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
 
 static inline struct nfs_inode *NFS_I(const struct inode *inode)
 {
@@ -522,11 +523,23 @@ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned 
  */
 extern int nfs_sync_inode(struct inode *inode);
 extern int nfs_wb_all(struct inode *inode);
-extern int nfs_wb_page(struct inode *inode, struct page* page);
+extern int nfs_wb_single_page(struct inode *inode, struct page *page, bool launder);
 extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
 extern int  nfs_commit_inode(struct inode *, int);
 extern struct nfs_commit_data *nfs_commitdata_alloc(void);
 extern void nfs_commit_free(struct nfs_commit_data *data);
+
+static inline int
+nfs_wb_launder_page(struct inode *inode, struct page *page)
+{
+	return nfs_wb_single_page(inode, page, true);
+}
+
+static inline int
+nfs_wb_page(struct inode *inode, struct page *page)
+{
+	return nfs_wb_single_page(inode, page, false);
+}
 
 static inline int
 nfs_have_writebacks(struct inode *inode)

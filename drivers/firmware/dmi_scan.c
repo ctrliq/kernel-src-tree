@@ -386,6 +386,8 @@ void __init dmi_memdev_walk(void)
 	}
 }
 
+int dmi_socket_count = 0; /* used by rh_check_supported() */
+
 /*
  *	Process a DMI table entry. Right now all we care about are the BIOS
  *	and machine entries. For 2.5 we should pull the smbus controller info
@@ -419,6 +421,9 @@ static void __init dmi_decode(const struct dmi_header *dm, void *dummy)
 		dmi_save_ident(dm, DMI_CHASSIS_VERSION, 6);
 		dmi_save_ident(dm, DMI_CHASSIS_SERIAL, 7);
 		dmi_save_ident(dm, DMI_CHASSIS_ASSET_TAG, 8);
+		break;
+	case 4:		/* Processor Information */
+		dmi_socket_count++;
 		break;
 	case 10:	/* Onboard Devices Information */
 		dmi_save_devices(dm);

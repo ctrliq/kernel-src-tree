@@ -114,6 +114,8 @@ static struct xfs_kobj xfs_dbg_kobj;	/* global debug sysfs attrs */
 #define MNTOPT_DISCARD	   "discard"	/* Discard unused blocks */
 #define MNTOPT_NODISCARD   "nodiscard"	/* Do not discard unused blocks */
 
+#define MNTOPT_DAX	"dax"		/* Enable direct access to bdev pages */
+
 /*
  * Table driven mount option parser.
  *
@@ -363,6 +365,10 @@ xfs_parseargs(
 			mp->m_flags |= XFS_MOUNT_DISCARD;
 		} else if (!strcmp(this_char, MNTOPT_NODISCARD)) {
 			mp->m_flags &= ~XFS_MOUNT_DISCARD;
+#ifdef CONFIG_FS_DAX
+		} else if (!strcmp(this_char, MNTOPT_DAX)) {
+			mp->m_flags |= XFS_MOUNT_DAX;
+#endif
 		} else if (!strcmp(this_char, "ihashsize")) {
 			xfs_warn(mp,
 	"ihashsize no longer used, option is deprecated.");
@@ -464,8 +470,8 @@ done:
 }
 
 struct proc_xfs_info {
-	int	flag;
-	char	*str;
+	uint64_t	flag;
+	char		*str;
 };
 
 STATIC int
@@ -486,6 +492,7 @@ xfs_showargs(
 		{ XFS_MOUNT_GRPID,		"," MNTOPT_GRPID },
 		{ XFS_MOUNT_DISCARD,		"," MNTOPT_DISCARD },
 		{ XFS_MOUNT_SMALL_INUMS,	"," MNTOPT_32BITINODE },
+		{ XFS_MOUNT_DAX,		"," MNTOPT_DAX },
 		{ 0, NULL }
 	};
 	static struct proc_xfs_info xfs_info_unset[] = {
@@ -516,9 +523,9 @@ xfs_showargs(
 		seq_printf(m, "," MNTOPT_LOGBSIZE "=%dk", mp->m_logbsize >> 10);
 
 	if (mp->m_logname)
-		seq_printf(m, "," MNTOPT_LOGDEV "=%s", mp->m_logname);
+		seq_show_option(m, MNTOPT_LOGDEV, mp->m_logname);
 	if (mp->m_rtname)
-		seq_printf(m, "," MNTOPT_RTDEV "=%s", mp->m_rtname);
+		seq_show_option(m, MNTOPT_RTDEV, mp->m_rtname);
 
 	if (mp->m_dalign > 0)
 		seq_printf(m, "," MNTOPT_SUNIT "=%d",
@@ -851,18 +858,20 @@ xfs_init_mount_workqueues(
 		goto out_destroy_unwritten;
 
 	mp->m_reclaim_workqueue = alloc_workqueue("xfs-reclaim/%s",
-			WQ_NON_REENTRANT|WQ_FREEZABLE, 0, mp->m_fsname);
+			WQ_MEM_RECLAIM|WQ_NON_REENTRANT|WQ_FREEZABLE, 0,
+			mp->m_fsname);
 	if (!mp->m_reclaim_workqueue)
 		goto out_destroy_cil;
 
 	mp->m_log_workqueue = alloc_workqueue("xfs-log/%s",
-			WQ_NON_REENTRANT|WQ_FREEZABLE|WQ_HIGHPRI, 0,
-			mp->m_fsname);
+			WQ_MEM_RECLAIM|WQ_NON_REENTRANT|WQ_FREEZABLE|WQ_HIGHPRI,
+			0, mp->m_fsname);
 	if (!mp->m_log_workqueue)
 		goto out_destroy_reclaim;
 
 	mp->m_eofblocks_workqueue = alloc_workqueue("xfs-eofblocks/%s",
-			WQ_NON_REENTRANT|WQ_FREEZABLE, 0, mp->m_fsname);
+			WQ_MEM_RECLAIM|WQ_NON_REENTRANT|WQ_FREEZABLE, 0,
+			mp->m_fsname);
 	if (!mp->m_eofblocks_workqueue)
 		goto out_destroy_log;
 
@@ -936,7 +945,7 @@ xfs_fs_destroy_inode(
 
 	trace_xfs_destroy_inode(ip);
 
-	XFS_STATS_INC(vn_reclaim);
+	XFS_STATS_INC(ip->i_mount, vn_reclaim);
 
 	ASSERT(XFS_FORCED_SHUTDOWN(ip->i_mount) || ip->i_delayed_blks == 0);
 
@@ -998,8 +1007,8 @@ xfs_fs_evict_inode(
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	XFS_STATS_INC(vn_rele);
-	XFS_STATS_INC(vn_remove);
+	XFS_STATS_INC(ip->i_mount, vn_rele);
+	XFS_STATS_INC(ip->i_mount, vn_remove);
 
 	xfs_inactive(ip);
 }
@@ -1148,7 +1157,7 @@ xfs_restore_resvblks(struct xfs_mount *mp)
  * Note: xfs_log_quiesce() stops background log work - the callers must ensure
  * it is started again when appropriate.
  */
-static void
+void
 xfs_quiesce_attr(
 	struct xfs_mount	*mp)
 {
@@ -1544,6 +1553,29 @@ xfs_fs_fill_super(
 	if (XFS_SB_VERSION_NUM(&mp->m_sb) == XFS_SB_VERSION_5)
 		sb->s_flags |= MS_I_VERSION;
 
+	if (xfs_sb_version_hassparseinodes(&mp->m_sb))
+		xfs_alert(mp,
+	"EXPERIMENTAL sparse inode feature enabled. Use at your own risk!");
+
+	if (mp->m_flags & XFS_MOUNT_DAX) {
+		static bool printed = false;
+
+		xfs_warn(mp,
+		"DAX enabled. Warning: EXPERIMENTAL, use at your own risk");
+
+		error = bdev_dax_supported(sb, sb->s_blocksize);
+		if (error) {
+			xfs_alert(mp,
+			"DAX unsupported by block device. Turning off DAX.");
+			mp->m_flags &= ~XFS_MOUNT_DAX;
+		}
+
+		if (!printed) {
+			mark_tech_preview("xfs direct access (dax)", NULL);
+			printed = true;
+		}
+	}
+
 	error = xfs_mountfs(mp);
 	if (error)
 		goto out_filestream_unmount;
@@ -1651,7 +1683,8 @@ static struct file_system_type xfs_fs_type = {
 	.mount			= xfs_fs_mount,
 	.kill_sb		= kill_block_super,
 	.fs_flags		= FS_REQUIRES_DEV | FS_HAS_RM_XQUOTA |
-				  FS_HAS_INVALIDATE_RANGE,
+				  FS_HAS_INVALIDATE_RANGE | FS_HAS_DIO_IODONE2 |
+				  FS_HAS_NEXTDQBLK,
 };
 MODULE_ALIAS_FS("xfs");
 

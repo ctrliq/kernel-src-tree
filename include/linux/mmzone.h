@@ -311,7 +311,22 @@ enum zone_type {
 	ZONE_HIGHMEM,
 #endif
 	ZONE_MOVABLE,
+
+	/*
+	 * RHEL: we cannot grow MAX_NR_ZONES (see below) and need to
+	 * encode ZONE_DEVICE another way.
+	 */
 	__MAX_NR_ZONES
+
+#ifndef __GENKSYMS__
+	,
+#ifdef CONFIG_ZONE_DEVICE
+	ZONE_DEVICE = __MAX_NR_ZONES,
+	REAL_MAX_ZONES,
+#else
+	REAL_MAX_ZONES = __MAX_NR_ZONES,
+#endif
+#endif
 };
 
 #ifndef __GENERATING_BOUNDS_H
@@ -791,12 +806,25 @@ typedef struct pglist_data {
 	unsigned long numabalancing_migrate_nr_pages;
 #endif
 
-	/* reserved for Red Hat */
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+	/*
+	 * If memory initialisation on large machines is deferred then this
+	 * is the first PFN that needs to be initialised.
+	 */
+	RH_KABI_USE(1, unsigned long first_deferred_pfn)
+#else
 	RH_KABI_RESERVE(1)
+#endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+
+#ifdef CONFIG_ZONE_DEVICE
+	RH_KABI_USE(2, struct zone *zone_device)
+#else
 	RH_KABI_RESERVE(2)
+#endif
+
+	/* reserved for Red Hat */
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
-
 } pg_data_t;
 
 #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
@@ -820,6 +848,28 @@ static inline bool pgdat_is_empty(pg_data_t *pgdat)
 {
 	return !pgdat->node_start_pfn && !pgdat->node_spanned_pages;
 }
+
+static inline int zone_id(const struct zone *zone)
+{
+	struct pglist_data *pgdat = zone->zone_pgdat;
+#ifdef CONFIG_ZONE_DEVICE
+	if (zone == pgdat->zone_device)
+		return ZONE_DEVICE;
+#endif
+	return zone - pgdat->node_zones;
+}
+
+#ifdef CONFIG_ZONE_DEVICE
+static inline bool is_dev_zone(const struct zone *zone)
+{
+	return zone_id(zone) == ZONE_DEVICE;
+}
+#else
+static inline bool is_dev_zone(const struct zone *zone)
+{
+	return false;
+}
+#endif
 
 #include <linux/memory_hotplug.h>
 
@@ -868,7 +918,12 @@ unsigned long __init node_memmap_size_bytes(int, unsigned long, unsigned long);
 /*
  * zone_idx() returns 0 for the ZONE_DMA zone, 1 for the ZONE_NORMAL zone, etc.
  */
+#ifdef CONFIG_ZONE_DEVICE
+#define zone_idx(zone)		(is_dev_zone(zone) ? ZONE_DEVICE : \
+				 (zone) - (zone)->zone_pgdat->node_zones)
+#else
 #define zone_idx(zone)		((zone) - (zone)->zone_pgdat->node_zones)
+#endif
 
 static inline int populated_zone(struct zone *zone)
 {
@@ -1272,11 +1327,16 @@ void sparse_init(void);
 #define sparse_index_init(_sec, _nid)  do {} while (0)
 #endif /* CONFIG_SPARSEMEM */
 
-#ifdef CONFIG_NODES_SPAN_OTHER_NODES
-bool early_pfn_in_nid(unsigned long pfn, int nid);
-#else
-#define early_pfn_in_nid(pfn, nid)	(1)
-#endif
+/*
+ * During memory init memblocks map pfns to nids. The search is expensive and
+ * this caches recent lookups. The implementation of __early_pfn_to_nid
+ * may treat start/end as pfns or sections.
+ */
+struct mminit_pfnnid_cache {
+	unsigned long last_start;
+	unsigned long last_end;
+	int last_nid;
+};
 
 #ifndef early_pfn_valid
 #define early_pfn_valid(pfn)	(1)

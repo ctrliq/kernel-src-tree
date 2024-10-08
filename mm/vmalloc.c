@@ -28,6 +28,7 @@
 #include <linux/kmemleak.h>
 #include <linux/atomic.h>
 #include <linux/llist.h>
+#include <linux/bitops.h>
 #include <asm/uaccess.h>
 #include <asm/tlbflush.h>
 #include <asm/shmparam.h>
@@ -1342,7 +1343,7 @@ static struct vm_struct *__get_vm_area_node(unsigned long size,
 
 	BUG_ON(in_interrupt());
 	if (flags & VM_IOREMAP) {
-		int bit = fls(size);
+		unsigned int bit = fls_long(size);
 
 		if (bit > IOREMAP_MAX_ORDER)
 			bit = IOREMAP_MAX_ORDER;

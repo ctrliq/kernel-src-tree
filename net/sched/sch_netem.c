@@ -411,7 +411,7 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	struct netem_skb_cb *cb;
 	struct sk_buff *skb2;
 	struct sk_buff *segs = NULL;
-	unsigned int len = 0, last_len, prev_len = qdisc_pkt_len(skb);
+	unsigned int len = 0, last_len;
 	int nb = 0;
 	int count = 1;
 	int rc = NET_XMIT_SUCCESS;
@@ -557,7 +557,7 @@ finish_segs:
 		}
 		sch->q.qlen += nb;
 		if (nb > 1)
-			qdisc_tree_reduce_backlog(sch, 1 - nb, prev_len - len);
+			qdisc_tree_decrease_qlen(sch, 1 - nb);
 	}
 	return NET_XMIT_SUCCESS;
 }

@@ -517,7 +517,7 @@ static inline void auxtrace__free(struct perf_session *session)
 
 static inline struct auxtrace_record *
 auxtrace_record__init(struct perf_evlist *evlist __maybe_unused,
-		      int *err __maybe_unused)
+		      int *err)
 {
 	*err = 0;
 	return NULL;
@@ -568,6 +568,17 @@ int itrace_parse_synth_opts(const struct option *opt __maybe_unused,
 			    const char *str __maybe_unused,
 			    int unset __maybe_unused)
 {
+	pr_err("AUX area tracing not supported\n");
+	return -EINVAL;
+}
+
+static inline
+int auxtrace_parse_snapshot_options(struct auxtrace_record *itr __maybe_unused,
+				    struct record_opts *opts __maybe_unused,
+				    const char *str)
+{
+	if (!str)
+		return 0;
 	pr_err("AUX area tracing not supported\n");
 	return -EINVAL;
 }

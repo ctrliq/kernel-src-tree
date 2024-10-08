@@ -515,6 +515,7 @@ void iscsit_add_cmd_to_immediate_queue(
 
 	wake_up(&conn->queues_wq);
 }
+EXPORT_SYMBOL(iscsit_add_cmd_to_immediate_queue);
 
 struct iscsi_queue_req *iscsit_get_cmd_from_immediate_queue(struct iscsi_conn *conn)
 {
@@ -726,6 +727,9 @@ void __iscsit_free_cmd(struct iscsi_cmd *cmd, bool scsi_cmd,
 		iscsit_remove_cmd_from_immediate_queue(cmd, conn);
 		iscsit_remove_cmd_from_response_queue(cmd, conn);
 	}
+
+	if (conn && conn->conn_transport->iscsit_release_cmd)
+		conn->conn_transport->iscsit_release_cmd(conn, cmd);
 }
 
 void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
@@ -747,7 +751,7 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
 		rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
 		if (!rc && shutdown && se_cmd && se_cmd->se_sess) {
 			__iscsit_free_cmd(cmd, true, shutdown);
-			target_put_sess_cmd(se_cmd->se_sess, se_cmd);
+			target_put_sess_cmd(se_cmd);
 		}
 		break;
 	case ISCSI_OP_REJECT:
@@ -763,7 +767,7 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
 			rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
 			if (!rc && shutdown && se_cmd->se_sess) {
 				__iscsit_free_cmd(cmd, true, shutdown);
-				target_put_sess_cmd(se_cmd->se_sess, se_cmd);
+				target_put_sess_cmd(se_cmd);
 			}
 			break;
 		}
@@ -774,6 +778,7 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
 		break;
 	}
 }
+EXPORT_SYMBOL(iscsit_free_cmd);
 
 int iscsit_check_session_usage_count(struct iscsi_session *sess)
 {
@@ -1423,6 +1428,33 @@ int tx_data(
 	return iscsit_do_tx_data(conn, &c);
 }
 
+static bool sockaddr_equal(struct sockaddr_storage *x, struct sockaddr_storage *y)
+{
+	switch (x->ss_family) {
+	case AF_INET: {
+		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
+		struct sockaddr_in *siny = (struct sockaddr_in *)y;
+		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
+			return false;
+		if (sinx->sin_port != siny->sin_port)
+			return false;
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
+		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
+		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
+			return false;
+		if (sinx->sin6_port != siny->sin6_port)
+			return false;
+		break;
+	}
+	default:
+		return false;
+	}
+	return true;
+}
+
 void iscsit_collect_login_stats(
 	struct iscsi_conn *conn,
 	u8 status_class,
@@ -1439,7 +1471,7 @@ void iscsit_collect_login_stats(
 	ls = &tiqn->login_stats;
 
 	spin_lock(&ls->lock);
-	if (!strcmp(conn->login_ip, ls->last_intr_fail_ip_addr) &&
+	if (sockaddr_equal(&conn->login_sockaddr, &ls->last_intr_fail_sockaddr) &&
 	    ((get_jiffies_64() - ls->last_fail_time) < 10)) {
 		/* We already have the failure info for this login */
 		spin_unlock(&ls->lock);
@@ -1479,8 +1511,7 @@ void iscsit_collect_login_stats(
 
 		ls->last_intr_fail_ip_family = conn->login_family;
 
-		snprintf(ls->last_intr_fail_ip_addr, IPV6_ADDRESS_SPACE,
-				"%s", conn->login_ip);
+		ls->last_intr_fail_sockaddr = conn->login_sockaddr;
 		ls->last_fail_time = get_jiffies_64();
 	}
 

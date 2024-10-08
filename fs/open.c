@@ -51,8 +51,10 @@ int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
 		newattrs.ia_valid |= ATTR_FILE;
 	}
 
-	/* Remove suid/sgid on truncate too */
-	ret = should_remove_suid(dentry);
+	/* Remove suid, sgid, and file capabilities on truncate too */
+	ret = dentry_needs_remove_privs(dentry);
+	if (ret < 0)
+		return ret;
 	if (ret)
 		newattrs.ia_valid |= ret | ATTR_FORCE;
 
@@ -689,21 +691,18 @@ int open_check_o_direct(struct file *f)
 {
 	/* NB: we're sure to have correct a_ops only after f_op->open */
 	if (f->f_flags & O_DIRECT) {
-		if (!f->f_mapping->a_ops ||
-		    ((!f->f_mapping->a_ops->direct_IO) &&
-		    (!f->f_mapping->a_ops->get_xip_mem))) {
+		if (!f->f_mapping->a_ops || !f->f_mapping->a_ops->direct_IO)
 			return -EINVAL;
-		}
 	}
 	return 0;
 }
 
 static int do_dentry_open(struct file *f,
+			  struct inode *inode,
 			  int (*open)(struct inode *, struct file *),
 			  const struct cred *cred)
 {
 	static const struct file_operations empty_fops = {};
-	struct inode *inode;
 	int error;
 
 	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
@@ -713,7 +712,7 @@ static int do_dentry_open(struct file *f,
 		f->f_mode = FMODE_PATH;
 
 	path_get(&f->f_path);
-	inode = f->f_inode = f->f_path.dentry->d_inode;
+	f->f_inode = inode;
 	if (f->f_mode & FMODE_WRITE) {
 		error = __get_file_write_access(inode, f->f_path.mnt);
 		if (error)
@@ -811,7 +810,8 @@ int finish_open(struct file *file, struct dentry *dentry,
 	BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
 
 	file->f_path.dentry = dentry;
-	error = do_dentry_open(file, open, current_cred());
+	error = do_dentry_open(file, dentry->d_inode, open,
+			       current_cred());
 	if (!error)
 		*opened |= FILE_OPENED;
 
@@ -886,8 +886,13 @@ int vfs_open(const struct path *path, struct file *filp,
 	if (dentry_open)
 		return dentry_open(path->dentry, filp, cred);
 	else {
+		struct dentry *dentry = d_real(path->dentry, NULL, filp->f_flags);
+
+		if (IS_ERR(dentry))
+			return PTR_ERR(dentry);
+
 		filp->f_path = *path;
-		return do_dentry_open(filp, NULL, cred);
+		return do_dentry_open(filp, dentry->d_inode, NULL, cred);
 	}
 }
 EXPORT_SYMBOL(vfs_open);

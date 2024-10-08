@@ -238,6 +238,7 @@ struct iscsi_cls_session {
 	struct work_struct unblock_work;
 	struct work_struct scan_work;
 	struct work_struct unbind_work;
+	struct mutex mutex;
 
 	/* recovery fields */
 	int recovery_tmo;
@@ -272,7 +273,6 @@ struct iscsi_cls_session {
 
 struct iscsi_cls_host {
 	atomic_t nr_scans;
-	struct mutex mutex;
 	struct request_queue *bsg_q;
 	uint32_t port_speed;
 	uint32_t port_state;

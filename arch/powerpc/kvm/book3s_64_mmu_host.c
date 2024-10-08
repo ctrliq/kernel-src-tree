@@ -28,6 +28,7 @@
 #include <asm/mmu_context.h>
 #include <asm/hw_irq.h>
 #include "trace_pr.h"
+#include "book3s.h"
 
 #define PTE_SIZE 12
 
@@ -82,7 +83,7 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte,
 			bool iswrite)
 {
 	unsigned long vpn;
-	pfn_t hpaddr;
+	kvm_pfn_t hpaddr;
 	ulong hash, hpteg;
 	u64 vsid;
 	int ret;

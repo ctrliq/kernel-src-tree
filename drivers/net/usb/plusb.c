@@ -20,7 +20,6 @@
 // #define	VERBOSE			// more; success messages
 
 #include <linux/module.h>
-#include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -39,7 +38,7 @@
  * HEADS UP:  this handshaking isn't all that robust.  This driver
  * gets confused easily if you unplug one end of the cable then
  * try to connect it again; you'll need to restart both ends. The
- * "naplink" software (used by some PlayStation/2 deveopers) does
+ * "naplink" software (used by some PlayStation/2 developers) does
  * the handshaking much better!   Also, sometimes this hardware
  * seems to get wedged under load.  Prolific docs are weak, and
  * don't identify differences between PL2301 and PL2302, much less

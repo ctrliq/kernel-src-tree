@@ -65,6 +65,10 @@ struct posix_acl *gfs2_get_acl(struct inode *inode, int type)
 
 	acl = posix_acl_from_xattr(&init_user_ns, data, len);
 	kfree(data);
+
+	if (!IS_ERR(acl))
+		set_cached_acl(inode, type, acl);
+
 	return acl;
 }
 

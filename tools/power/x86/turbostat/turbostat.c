@@ -115,9 +115,8 @@ double discover_bclk(unsigned int family, unsigned int model);
 #define RAPL_DRAM_POWER_INFO	(1 << 5)
 					/* 0x61c MSR_DRAM_POWER_INFO */
 
-#define RAPL_CORES		(1 << 6)
+#define RAPL_CORES_POWER_LIMIT	(1 << 6)
 					/* 0x638 MSR_PP0_POWER_LIMIT */
-					/* 0x639 MSR_PP0_ENERGY_STATUS */
 #define RAPL_CORE_POLICY	(1 << 7)
 					/* 0x63a MSR_PP0_POLICY */
 
@@ -125,6 +124,10 @@ double discover_bclk(unsigned int family, unsigned int model);
 					/* 0x640 MSR_PP1_POWER_LIMIT */
 					/* 0x641 MSR_PP1_ENERGY_STATUS */
 					/* 0x642 MSR_PP1_POLICY */
+
+#define RAPL_CORES_ENERGY_STATUS	(1 << 9)
+					/* 0x639 MSR_PP0_ENERGY_STATUS */
+#define RAPL_CORES (RAPL_CORES_ENERGY_STATUS | RAPL_CORES_POWER_LIMIT)
 #define	TJMAX_DEFAULT	100
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -356,7 +359,7 @@ void print_header(void)
 	if (do_rapl && !rapl_joules) {
 		if (do_rapl & RAPL_PKG)
 			outp += sprintf(outp, " PkgWatt");
-		if (do_rapl & RAPL_CORES)
+		if (do_rapl & RAPL_CORES_ENERGY_STATUS)
 			outp += sprintf(outp, " CorWatt");
 		if (do_rapl & RAPL_GFX)
 			outp += sprintf(outp, " GFXWatt");
@@ -369,7 +372,7 @@ void print_header(void)
 	} else if (do_rapl && rapl_joules) {
 		if (do_rapl & RAPL_PKG)
 			outp += sprintf(outp, "   Pkg_J");
-		if (do_rapl & RAPL_CORES)
+		if (do_rapl & RAPL_CORES_ENERGY_STATUS)
 			outp += sprintf(outp, "   Cor_J");
 		if (do_rapl & RAPL_GFX)
 			outp += sprintf(outp, "   GFX_J");
@@ -602,7 +605,7 @@ int format_counters(struct thread_data *t, struct core_data *c,
 	if (do_rapl && !rapl_joules) {
 		if (do_rapl & RAPL_PKG)
 			outp += sprintf(outp, fmt8, p->energy_pkg * rapl_energy_units / interval_float);
-		if (do_rapl & RAPL_CORES)
+		if (do_rapl & RAPL_CORES_ENERGY_STATUS)
 			outp += sprintf(outp, fmt8, p->energy_cores * rapl_energy_units / interval_float);
 		if (do_rapl & RAPL_GFX)
 			outp += sprintf(outp, fmt8, p->energy_gfx * rapl_energy_units / interval_float);
@@ -1087,7 +1090,7 @@ int get_counters(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 			return -13;
 		p->energy_pkg = msr & 0xFFFFFFFF;
 	}
-	if (do_rapl & RAPL_CORES) {
+	if (do_rapl & RAPL_CORES_ENERGY_STATUS) {
 		if (get_msr(cpu, MSR_PP0_ENERGY_STATUS, &msr))
 			return -14;
 		p->energy_cores = msr & 0xFFFFFFFF;
@@ -1850,6 +1853,9 @@ int probe_nhm_msrs(unsigned int family, unsigned int model)
 	case 0x56:	/* BDX-DE */
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
+	case 0x55:	/* SKX */
 		pkg_cstate_limits = hsw_pkg_cstate_limits;
 		break;
 	case 0x37:	/* BYT */
@@ -1958,6 +1964,9 @@ int has_config_tdp(unsigned int family, unsigned int model)
 	case 0x56:	/* BDX-DE */
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
+	case 0x55:	/* SKX */
 
 	case 0x57:	/* Knights Landing */
 		return 1;
@@ -2209,6 +2218,8 @@ void rapl_probe(unsigned int family, unsigned int model)
 		break;
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
 		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
 		break;
 	case 0x3F:	/* HSX */
@@ -2218,12 +2229,13 @@ void rapl_probe(unsigned int family, unsigned int model)
 	case 0x3E:
 	case 0x4F:	/* BDX */
 	case 0x56:	/* BDX-DE */
+	case 0x55:	/* SKX */
 	case 0x57:	/* KNL */
 		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_POWER_INFO | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO;
 		break;
 	case 0x37:	/* BYT */
 	case 0x4D:	/* AVN */
-		do_rapl = RAPL_PKG | RAPL_CORES ;
+		do_rapl = RAPL_PKG | RAPL_CORES;
 		break;
 	case 0x5f:	/* DNV */
 		do_rapl = RAPL_PKG | RAPL_DRAM | RAPL_DRAM_POWER_INFO | RAPL_DRAM_PERF_STATUS | RAPL_PKG_PERF_STATUS | RAPL_PKG_POWER_INFO | RAPL_CORES_ENERGY_STATUS;
@@ -2441,9 +2453,8 @@ int print_rapl(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 			fprintf(stderr, "cpu%d: MSR_PP0_POLICY: %lld\n", cpu, msr & 0xF);
 		}
 	}
-	if (do_rapl & RAPL_CORES) {
+	if (do_rapl & RAPL_CORES_POWER_LIMIT) {
 		if (debug) {
-
 			if (get_msr(cpu, MSR_PP0_POWER_LIMIT, &msr))
 				return -9;
 			fprintf(stderr, "cpu%d: MSR_PP0_POWER_LIMIT: 0x%08llx (%slocked)\n",
@@ -2496,6 +2507,9 @@ int has_snb_msrs(unsigned int family, unsigned int model)
 	case 0x56:	/* BDX-DE */
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
+	case 0x55:	/* SKX */
 	case 0x5C:	/* BXT */
 		return 1;
 	}
@@ -2519,6 +2533,8 @@ int has_hsw_msrs(unsigned int family, unsigned int model)
 	case 0x3D:	/* BDW */
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
 	case 0x5C:	/* BXT */
 		return 1;
 	}
@@ -2541,6 +2557,8 @@ int has_skl_msrs(unsigned int family, unsigned int model)
 	switch (model) {
 	case 0x4E:	/* SKL */
 	case 0x5E:	/* SKL */
+	case 0x8E:	/* KBL */
+	case 0x9E:	/* KBL */
 		return 1;
 	}
 	return 0;
@@ -2764,7 +2782,12 @@ void process_cpuid()
 				switch(model) {
 				case 0x4E:	/* SKL */
 				case 0x5E:	/* SKL */
+				case 0x8E:	/* KBL */
+				case 0x9E:	/* KBL */
 					crystal_hz = 24000000;	/* 24.0 MHz */
+					break;
+				case 0x55:	/* SKX */
+					crystal_hz = 25000000;	/* 25.0 MHz */
 					break;
 				case 0x5C:	/* BXT */
 				case 0x5F:	/* DNV */
@@ -3134,7 +3157,7 @@ int get_and_dump_counters(void)
 }
 
 void print_version() {
-	fprintf(stderr, "turbostat version 4.8 26-Sep, 2015"
+	fprintf(stderr, "turbostat version 4.12 5 Apr 2016"
 		" - Len Brown <lenb@kernel.org>\n");
 }
 
@@ -3163,7 +3186,7 @@ void cmdline(int argc, char **argv)
 
 	progname = argv[0];
 
-	while ((opt = getopt_long_only(argc, argv, "C:c:Ddvhi:JM:m:PpST:V",
+	while ((opt = getopt_long_only(argc, argv, "+C:c:Ddvhi:JM:m:PpST:V",
 				long_options, &option_index)) != -1) {
 		switch (opt) {
 		case 'C':

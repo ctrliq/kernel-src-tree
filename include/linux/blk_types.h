@@ -205,6 +205,11 @@ enum rq_flag_bits {
 	__REQ_END,		/* OBSOLETE */
 	__REQ_HASHED,		/* on IO scheduler merge hash */
 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
+#ifdef __GENKSYMS__
+	__REQ_NO_TIMEOUT,	/* requests may never expire */
+#else
+	rh_reserved__REQ_NO_TIMEOUT_orig,
+#endif
 	__REQ_NR_BITS,		/* stops here */
 };
 

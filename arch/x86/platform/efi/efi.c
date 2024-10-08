@@ -121,7 +121,7 @@ static efi_status_t virt_efi_get_time(efi_time_t *tm, efi_time_cap_t *tc)
 	efi_status_t status;
 
 	spin_lock_irqsave(&rtc_lock, flags);
-	status = efi_call_virt2(get_time, tm, tc);
+	status = efi_call_virt(get_time, tm, tc);
 	spin_unlock_irqrestore(&rtc_lock, flags);
 	return status;
 }
@@ -132,7 +132,7 @@ static efi_status_t virt_efi_set_time(efi_time_t *tm)
 	efi_status_t status;
 
 	spin_lock_irqsave(&rtc_lock, flags);
-	status = efi_call_virt1(set_time, tm);
+	status = efi_call_virt(set_time, tm);
 	spin_unlock_irqrestore(&rtc_lock, flags);
 	return status;
 }
@@ -145,8 +145,7 @@ static efi_status_t virt_efi_get_wakeup_time(efi_bool_t *enabled,
 	efi_status_t status;
 
 	spin_lock_irqsave(&rtc_lock, flags);
-	status = efi_call_virt3(get_wakeup_time,
-				enabled, pending, tm);
+	status = efi_call_virt(get_wakeup_time, enabled, pending, tm);
 	spin_unlock_irqrestore(&rtc_lock, flags);
 	return status;
 }
@@ -157,8 +156,7 @@ static efi_status_t virt_efi_set_wakeup_time(efi_bool_t enabled, efi_time_t *tm)
 	efi_status_t status;
 
 	spin_lock_irqsave(&rtc_lock, flags);
-	status = efi_call_virt2(set_wakeup_time,
-				enabled, tm);
+	status = efi_call_virt(set_wakeup_time, enabled, tm);
 	spin_unlock_irqrestore(&rtc_lock, flags);
 	return status;
 }
@@ -169,17 +167,17 @@ static efi_status_t virt_efi_get_variable(efi_char16_t *name,
 					  unsigned long *data_size,
 					  void *data)
 {
-	return efi_call_virt5(get_variable,
-			      name, vendor, attr,
-			      data_size, data);
+	return efi_call_virt(get_variable,
+			     name, vendor, attr,
+			     data_size, data);
 }
 
 static efi_status_t virt_efi_get_next_variable(unsigned long *name_size,
 					       efi_char16_t *name,
 					       efi_guid_t *vendor)
 {
-	return efi_call_virt3(get_next_variable,
-			      name_size, name, vendor);
+	return efi_call_virt(get_next_variable,
+			     name_size, name, vendor);
 }
 
 static efi_status_t virt_efi_set_variable(efi_char16_t *name,
@@ -188,9 +186,9 @@ static efi_status_t virt_efi_set_variable(efi_char16_t *name,
 					  unsigned long data_size,
 					  void *data)
 {
-	return efi_call_virt5(set_variable,
-			      name, vendor, attr,
-			      data_size, data);
+	return efi_call_virt(set_variable,
+			     name, vendor, attr,
+			     data_size, data);
 }
 
 static efi_status_t virt_efi_query_variable_info(u32 attr,
@@ -201,13 +199,13 @@ static efi_status_t virt_efi_query_variable_info(u32 attr,
 	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
 		return EFI_UNSUPPORTED;
 
-	return efi_call_virt4(query_variable_info, attr, storage_space,
-			      remaining_space, max_variable_size);
+	return efi_call_virt(query_variable_info, attr, storage_space,
+			     remaining_space, max_variable_size);
 }
 
 static efi_status_t virt_efi_get_next_high_mono_count(u32 *count)
 {
-	return efi_call_virt1(get_next_high_mono_count, count);
+	return efi_call_virt(get_next_high_mono_count, count);
 }
 
 static void virt_efi_reset_system(int reset_type,
@@ -215,8 +213,8 @@ static void virt_efi_reset_system(int reset_type,
 				  unsigned long data_size,
 				  efi_char16_t *data)
 {
-	efi_call_virt4(reset_system, reset_type, status,
-		       data_size, data);
+	__efi_call_virt(reset_system, reset_type, status,
+			data_size, data);
 }
 
 static efi_status_t virt_efi_update_capsule(efi_capsule_header_t **capsules,
@@ -226,7 +224,7 @@ static efi_status_t virt_efi_update_capsule(efi_capsule_header_t **capsules,
 	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
 		return EFI_UNSUPPORTED;
 
-	return efi_call_virt3(update_capsule, capsules, count, sg_list);
+	return efi_call_virt(update_capsule, capsules, count, sg_list);
 }
 
 static efi_status_t virt_efi_query_capsule_caps(efi_capsule_header_t **capsules,
@@ -237,8 +235,8 @@ static efi_status_t virt_efi_query_capsule_caps(efi_capsule_header_t **capsules,
 	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
 		return EFI_UNSUPPORTED;
 
-	return efi_call_virt4(query_capsule_caps, capsules, count, max_size,
-			      reset_type);
+	return efi_call_virt(query_capsule_caps, capsules, count, max_size,
+			     reset_type);
 }
 
 static efi_status_t __init phys_efi_set_virtual_address_map(
@@ -250,25 +248,10 @@ static efi_status_t __init phys_efi_set_virtual_address_map(
 	efi_status_t status;
 
 	efi_call_phys_prelog();
-	status = efi_call_phys4(efi_phys.set_virtual_address_map,
-				memory_map_size, descriptor_size,
-				descriptor_version, virtual_map);
+	status = efi_call_phys(efi_phys.set_virtual_address_map,
+			       memory_map_size, descriptor_size,
+			       descriptor_version, virtual_map);
 	efi_call_phys_epilog();
-	return status;
-}
-
-static efi_status_t __init phys_efi_get_time(efi_time_t *tm,
-					     efi_time_cap_t *tc)
-{
-	unsigned long flags;
-	efi_status_t status;
-
-	spin_lock_irqsave(&rtc_lock, flags);
-	efi_call_phys_prelog();
-	status = efi_call_phys2(efi_phys.get_time, virt_to_phys(tm),
-				virt_to_phys(tc));
-	efi_call_phys_epilog();
-	spin_unlock_irqrestore(&rtc_lock, flags);
 	return status;
 }
 
@@ -380,6 +363,9 @@ static void __init do_add_efi_memmap(void)
 		case EFI_UNUSABLE_MEMORY:
 			e820_type = E820_UNUSABLE;
 			break;
+		case EFI_PERSISTENT_MEMORY:
+			e820_type = E820_PMEM;
+			break;
 		default:
 			/*
 			 * EFI_RESERVED_TYPE EFI_RUNTIME_SERVICES_CODE
@@ -484,9 +470,6 @@ void __init efi_unmap_memmap(void)
 void __init efi_free_boot_services(void)
 {
 	void *p;
-
-	if (!efi_is_native())
-		return;
 
 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
 		efi_memory_desc_t *md = p;
@@ -609,9 +592,57 @@ static int __init efi_systab_init(void *phys)
 	return 0;
 }
 
+static int __init efi_runtime_init32(void)
+{
+	efi_runtime_services_32_t *runtime;
+
+	runtime = early_ioremap((unsigned long)efi.systab->runtime,
+			sizeof(efi_runtime_services_32_t));
+	if (!runtime) {
+		pr_err("Could not map the runtime service table!\n");
+		return -ENOMEM;
+	}
+
+	/*
+	 * We will only need *early* access to the following two
+	 * EFI runtime services before set_virtual_address_map
+	 * is invoked.
+	 */
+	efi_phys.set_virtual_address_map =
+			(efi_set_virtual_address_map_t *)
+			(unsigned long)runtime->set_virtual_address_map;
+	early_iounmap(runtime, sizeof(efi_runtime_services_32_t));
+
+	return 0;
+}
+
+static int __init efi_runtime_init64(void)
+{
+	efi_runtime_services_64_t *runtime;
+
+	runtime = early_ioremap((unsigned long)efi.systab->runtime,
+			sizeof(efi_runtime_services_64_t));
+	if (!runtime) {
+		pr_err("Could not map the runtime service table!\n");
+		return -ENOMEM;
+	}
+
+	/*
+	 * We will only need *early* access to the following two
+	 * EFI runtime services before set_virtual_address_map
+	 * is invoked.
+	 */
+	efi_phys.set_virtual_address_map =
+			(efi_set_virtual_address_map_t *)
+			(unsigned long)runtime->set_virtual_address_map;
+	early_iounmap(runtime, sizeof(efi_runtime_services_64_t));
+
+	return 0;
+}
+
 static int __init efi_runtime_init(void)
 {
-	efi_runtime_services_t *runtime;
+	int rv;
 
 	/*
 	 * Check out the runtime services table. We need to map
@@ -619,27 +650,13 @@ static int __init efi_runtime_init(void)
 	 * address of several of the EFI runtime functions, needed to
 	 * set the firmware into virtual mode.
 	 */
-	runtime = early_ioremap((unsigned long)efi.systab->runtime,
-				sizeof(efi_runtime_services_t));
-	if (!runtime) {
-		pr_err("Could not map the runtime service table!\n");
-		return -ENOMEM;
-	}
-	/*
-	 * We will only need *early* access to the following
-	 * two EFI runtime services before set_virtual_address_map
-	 * is invoked.
-	 */
-	efi_phys.get_time = (efi_get_time_t *)runtime->get_time;
-	efi_phys.set_virtual_address_map =
-		(efi_set_virtual_address_map_t *)
-		runtime->set_virtual_address_map;
-	/*
-	 * Make efi_get_time can be called before entering
-	 * virtual mode.
-	 */
-	efi.get_time = phys_efi_get_time;
-	early_iounmap(runtime, sizeof(efi_runtime_services_t));
+	if (efi_enabled(EFI_64BIT))
+		rv = efi_runtime_init64();
+	else
+		rv = efi_runtime_init32();
+
+	if (rv)
+		return rv;
 
 	return 0;
 }
@@ -775,7 +792,7 @@ void __init efi_init(void)
 	 * that doesn't match the kernel 32/64-bit mode.
 	 */
 
-	if (!efi_is_native())
+	if (!efi_runtime_supported())
 		pr_info("No EFI runtime due to 32/64-bit mismatch with kernel\n");
 	else {
 		if (disable_runtime || efi_runtime_init())
@@ -867,6 +884,22 @@ void __init old_map_region(efi_memory_desc_t *md)
 	if (!va)
 		pr_err("ioremap of 0x%llX failed!\n",
 		       (unsigned long long)md->phys_addr);
+}
+
+static void native_runtime_setup(void)
+{
+	efi.get_time = virt_efi_get_time;
+	efi.set_time = virt_efi_set_time;
+	efi.get_wakeup_time = virt_efi_get_wakeup_time;
+	efi.set_wakeup_time = virt_efi_set_wakeup_time;
+	efi.get_variable = virt_efi_get_variable;
+	efi.get_next_variable = virt_efi_get_next_variable;
+	efi.set_variable = virt_efi_set_variable;
+	efi.get_next_high_mono_count = virt_efi_get_next_high_mono_count;
+	efi.reset_system = virt_efi_reset_system;
+	efi.query_variable_info = virt_efi_query_variable_info;
+	efi.update_capsule = virt_efi_update_capsule;
+	efi.query_capsule_caps = virt_efi_query_capsule_caps;
 }
 
 /* Merge contiguous regions of the same type and attribute */
@@ -1110,15 +1143,6 @@ static void __init __efi_enter_virtual_mode(void)
 
 	efi.systab = NULL;
 
-	/*
-	 * We don't do virtual mode, since we don't do runtime services, on
-	 * non-native EFI
-	 */
-	if (!efi_is_native()) {
-		efi_unmap_memmap();
-		return;
-	}
-
 	efi_merge_regions();
 	new_memmap = efi_map_regions(&count, &pg_shift);
 	if (!new_memmap) {
@@ -1136,11 +1160,20 @@ static void __init __efi_enter_virtual_mode(void)
 	efi_sync_low_kernel_mappings();
 	efi_dump_pagetable();
 
-	status = phys_efi_set_virtual_address_map(
-			memmap.desc_size * count,
-			memmap.desc_size,
-			memmap.desc_version,
-			(efi_memory_desc_t *)__pa(new_memmap));
+	if (efi_is_native()) {
+		status = phys_efi_set_virtual_address_map(
+				memmap.desc_size * count,
+				memmap.desc_size,
+				memmap.desc_version,
+				(efi_memory_desc_t *)__pa(new_memmap));
+	} else {
+		status = efi_thunk_set_virtual_address_map(
+				efi_phys.set_virtual_address_map,
+				memmap.desc_size * count,
+				memmap.desc_size,
+				memmap.desc_version,
+				(efi_memory_desc_t *)__pa(new_memmap));
+	}
 
 	if (status != EFI_SUCCESS) {
 		pr_alert("Unable to switch EFI into virtual mode (status=%lx)!\n",
@@ -1155,19 +1188,13 @@ static void __init __efi_enter_virtual_mode(void)
 	 * Call EFI services through wrapper functions.
 	 */
 	efi.runtime_version = efi_systab.hdr.revision;
-	efi.get_time = virt_efi_get_time;
-	efi.set_time = virt_efi_set_time;
-	efi.get_wakeup_time = virt_efi_get_wakeup_time;
-	efi.set_wakeup_time = virt_efi_set_wakeup_time;
-	efi.get_variable = virt_efi_get_variable;
-	efi.get_next_variable = virt_efi_get_next_variable;
-	efi.set_variable = virt_efi_set_variable;
-	efi.get_next_high_mono_count = virt_efi_get_next_high_mono_count;
-	efi.reset_system = virt_efi_reset_system;
+
+	if (efi_is_native())
+		native_runtime_setup();
+	else
+		efi_thunk_runtime_setup();
+
 	efi.set_virtual_address_map = NULL;
-	efi.query_variable_info = virt_efi_query_variable_info;
-	efi.update_capsule = virt_efi_update_capsule;
-	efi.query_capsule_caps = virt_efi_query_capsule_caps;
 
 	if (efi_enabled(EFI_OLD_MEMMAP) && (__supported_pte_mask & _PAGE_NX))
 		runtime_code_page_mkexec();
@@ -1353,7 +1380,7 @@ void __init efi_apply_memmap_quirks(void)
 	 * firmware/kernel architectures since there is no support for runtime
 	 * services.
 	 */
-	if (!efi_is_native()) {
+	if (!efi_runtime_supported()) {
 		pr_info("efi: Setup done, disabling due to 32/64-bit mismatch\n");
 		efi_unmap_memmap();
 	}

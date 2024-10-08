@@ -3,6 +3,15 @@
 
 #include <linux/pci.h>
 
+/* Address Translation Service */
+struct pci_ats {        /* Depricated - DO NOT USE */
+	int pos;        /* capability position */
+	int stu;        /* Smallest Translation Unit */
+	int qdep;       /* Invalidate Queue Depth */
+	atomic_t ref_cnt; /* number of VFs with ATS enabled */
+	unsigned int is_enabled:1;      /* Enable bit is set */
+};
+
 #ifdef CONFIG_PCI_PRI
 
 int pci_enable_pri(struct pci_dev *pdev, u32 reqs);

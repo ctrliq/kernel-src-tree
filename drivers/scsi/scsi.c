@@ -964,10 +964,11 @@ void scsi_attach_vpd(struct scsi_device *sdev)
 	int vpd_len = SCSI_VPD_PG_LEN;
 	int pg80_supported = 0;
 	int pg83_supported = 0;
-	unsigned char *vpd_buf;
+	unsigned char __rcu *vpd_buf, *orig_vpd_buf = NULL;
 
-	if (sdev->skip_vpd_pages)
+	if (!scsi_device_supports_vpd(sdev))
 		return;
+
 retry_pg0:
 	vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
 	if (!vpd_buf)
@@ -1010,8 +1011,16 @@ retry_pg80:
 			kfree(vpd_buf);
 			goto retry_pg80;
 		}
+		spin_lock(&sdev->inquiry_lock);
+		orig_vpd_buf = sdev->vpd_pg80;
 		sdev->vpd_pg80_len = result;
-		sdev->vpd_pg80 = vpd_buf;
+		rcu_assign_pointer(sdev->vpd_pg80, vpd_buf);
+		spin_unlock(&sdev->inquiry_lock);
+		synchronize_rcu();
+		if (orig_vpd_buf) {
+			kfree(orig_vpd_buf);
+			orig_vpd_buf = NULL;
+		}
 		vpd_len = SCSI_VPD_PG_LEN;
 	}
 
@@ -1031,8 +1040,14 @@ retry_pg83:
 			kfree(vpd_buf);
 			goto retry_pg83;
 		}
+		spin_lock(&sdev->inquiry_lock);
+		orig_vpd_buf = sdev->vpd_pg83;
 		sdev->vpd_pg83_len = result;
-		sdev->vpd_pg83 = vpd_buf;
+		rcu_assign_pointer(sdev->vpd_pg83, vpd_buf);
+		spin_unlock(&sdev->inquiry_lock);
+		synchronize_rcu();
+		if (orig_vpd_buf)
+			kfree(orig_vpd_buf);
 	}
 }
 

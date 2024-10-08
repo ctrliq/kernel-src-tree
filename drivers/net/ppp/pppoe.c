@@ -338,7 +338,7 @@ static void pppoe_flush_dev(struct net_device *dev)
 static int pppoe_device_event(struct notifier_block *this,
 			      unsigned long event, void *ptr)
 {
-	struct net_device *dev = (struct net_device *)ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	/* Only look at sockets that are using this specific device. */
 	switch (event) {
@@ -1190,7 +1190,7 @@ static int __init pppoe_init(void)
 
 	dev_add_pack(&pppoes_ptype);
 	dev_add_pack(&pppoed_ptype);
-	register_netdevice_notifier(&pppoe_notifier);
+	register_netdevice_notifier_rh(&pppoe_notifier);
 
 	return 0;
 
@@ -1204,7 +1204,7 @@ out:
 
 static void __exit pppoe_exit(void)
 {
-	unregister_netdevice_notifier(&pppoe_notifier);
+	unregister_netdevice_notifier_rh(&pppoe_notifier);
 	dev_remove_pack(&pppoed_ptype);
 	dev_remove_pack(&pppoes_ptype);
 	unregister_pppox_proto(PX_PROTO_OE);

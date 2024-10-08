@@ -277,7 +277,13 @@ struct ipath_mr {
  * in qp->s_max_sge.
  */
 struct ipath_swqe {
-	struct ib_send_wr wr;	/* don't use wr.sg_list */
+	union {
+		struct ib_send_wr wr;   /* don't use wr.sg_list */
+		struct ib_ud_wr ud_wr;
+		struct ib_rdma_wr rdma_wr;
+		struct ib_atomic_wr atomic_wr;
+	};
+
 	u32 psn;		/* first packet sequence number */
 	u32 lpsn;		/* last packet sequence number */
 	u32 ssn;		/* send sequence number */
@@ -821,10 +827,6 @@ int ipath_req_notify_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags notify_flags
 int ipath_resize_cq(struct ib_cq *ibcq, int cqe, struct ib_udata *udata);
 
 struct ib_mr *ipath_get_dma_mr(struct ib_pd *pd, int acc);
-
-struct ib_mr *ipath_reg_phys_mr(struct ib_pd *pd,
-				struct ib_phys_buf *buffer_list,
-				int num_phys_buf, int acc, u64 *iova_start);
 
 struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 				u64 virt_addr, int mr_access_flags,

@@ -374,11 +374,12 @@ static int do_mmu_notifier_register(struct mmu_notifier *mn,
 	if (mn) {
 		hlist_add_head(&mn->hlist, &mm->mmu_notifier_mm->list);
 	} else {
-		mmu_notifier_mm = container_of(mm->mmu_notifier_mm,
-					       struct mmu_notifier_mm_rhel7,
-					       b);
-		hlist_add_head(&mn_rhel7->hlist,
-			       &mmu_notifier_mm->list_rhel7);
+		struct mmu_notifier_mm_rhel7 *tmp;
+
+		tmp = container_of(mm->mmu_notifier_mm,
+				   struct mmu_notifier_mm_rhel7,
+				   b);
+		hlist_add_head(&mn_rhel7->hlist, &tmp->list_rhel7);
 	}
 	spin_unlock(&mm->mmu_notifier_mm->lock);
 
@@ -563,4 +564,5 @@ static int __init mmu_notifier_init(void)
 {
 	return init_srcu_struct(&srcu);
 }
-subsys_initcall(mmu_notifier_init);
+
+module_init(mmu_notifier_init);

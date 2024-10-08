@@ -25,7 +25,7 @@ void pci_ats_init(struct pci_dev *dev)
 	if (!pos)
 		return;
 
-	dev->ats_cap = pos;
+	dev->pci_dev_rh->ats_cap = pos;
 }
 
 /**
@@ -40,10 +40,10 @@ int pci_enable_ats(struct pci_dev *dev, int ps)
 	u16 ctrl;
 	struct pci_dev *pdev;
 
-	if (!dev->ats_cap)
+	if (!dev->pci_dev_rh->ats_cap)
 		return -EINVAL;
 
-	if (WARN_ON(dev->ats_enabled))
+	if (WARN_ON(dev->pci_dev_rh->ats_enabled))
 		return -EBUSY;
 
 	if (ps < PCI_ATS_MIN_STU)
@@ -56,17 +56,17 @@ int pci_enable_ats(struct pci_dev *dev, int ps)
 	ctrl = PCI_ATS_CTRL_ENABLE;
 	if (dev->is_virtfn) {
 		pdev = pci_physfn(dev);
-		if (pdev->ats_stu != ps)
+		if (pdev->pci_dev_rh->ats_stu != ps)
 			return -EINVAL;
 
-		atomic_inc(&pdev->ats_ref_cnt);  /* count enabled VFs */
+		atomic_inc(&pdev->pci_dev_rh->ats_ref_cnt);  /* count enabled VFs */
 	} else {
-		dev->ats_stu = ps;
-		ctrl |= PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
+		dev->pci_dev_rh->ats_stu = ps;
+		ctrl |= PCI_ATS_CTRL_STU(dev->pci_dev_rh->ats_stu - PCI_ATS_MIN_STU);
 	}
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+	pci_write_config_word(dev, dev->pci_dev_rh->ats_cap + PCI_ATS_CTRL, ctrl);
 
-	dev->ats_enabled = 1;
+	dev->pci_dev_rh->ats_enabled = 1;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(pci_enable_ats);
@@ -80,22 +80,22 @@ void pci_disable_ats(struct pci_dev *dev)
 	struct pci_dev *pdev;
 	u16 ctrl;
 
-	if (WARN_ON(!dev->ats_enabled))
+	if (WARN_ON(!dev->pci_dev_rh->ats_enabled))
 		return;
 
-	if (atomic_read(&dev->ats_ref_cnt))
+	if (atomic_read(&dev->pci_dev_rh->ats_ref_cnt))
 		return;		/* VFs still enabled */
 
 	if (dev->is_virtfn) {
 		pdev = pci_physfn(dev);
-		atomic_dec(&pdev->ats_ref_cnt);
+		atomic_dec(&pdev->pci_dev_rh->ats_ref_cnt);
 	}
 
-	pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, &ctrl);
+	pci_read_config_word(dev, dev->pci_dev_rh->ats_cap + PCI_ATS_CTRL, &ctrl);
 	ctrl &= ~PCI_ATS_CTRL_ENABLE;
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+	pci_write_config_word(dev, dev->pci_dev_rh->ats_cap + PCI_ATS_CTRL, ctrl);
 
-	dev->ats_enabled = 0;
+	dev->pci_dev_rh->ats_enabled = 0;
 }
 EXPORT_SYMBOL_GPL(pci_disable_ats);
 
@@ -103,13 +103,13 @@ void pci_restore_ats_state(struct pci_dev *dev)
 {
 	u16 ctrl;
 
-	if (!dev->ats_enabled)
+	if (!dev->pci_dev_rh->ats_enabled)
 		return;
 
 	ctrl = PCI_ATS_CTRL_ENABLE;
 	if (!dev->is_virtfn)
-		ctrl |= PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
-	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
+		ctrl |= PCI_ATS_CTRL_STU(dev->pci_dev_rh->ats_stu - PCI_ATS_MIN_STU);
+	pci_write_config_word(dev, dev->pci_dev_rh->ats_cap + PCI_ATS_CTRL, ctrl);
 }
 EXPORT_SYMBOL_GPL(pci_restore_ats_state);
 
@@ -129,13 +129,13 @@ int pci_ats_queue_depth(struct pci_dev *dev)
 {
 	u16 cap;
 
-	if (!dev->ats_cap)
+	if (!dev->pci_dev_rh->ats_cap)
 		return -EINVAL;
 
 	if (dev->is_virtfn)
 		return 0;
 
-	pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CAP, &cap);
+	pci_read_config_word(dev, dev->pci_dev_rh->ats_cap + PCI_ATS_CAP, &cap);
 	return PCI_ATS_CAP_QDEP(cap) ? PCI_ATS_CAP_QDEP(cap) : PCI_ATS_MAX_QDEP;
 }
 EXPORT_SYMBOL_GPL(pci_ats_queue_depth);

@@ -557,6 +557,19 @@ int mlx5_core_disable_hca(struct mlx5_core_dev *dev, u16 func_id)
 	return mlx5_cmd_status_to_err_v2(out);
 }
 
+cycle_t mlx5_read_internal_timer(struct mlx5_core_dev *dev)
+{
+	u32 timer_h, timer_h1, timer_l;
+
+	timer_h = ioread32be(&dev->iseg->internal_timer_h);
+	timer_l = ioread32be(&dev->iseg->internal_timer_l);
+	timer_h1 = ioread32be(&dev->iseg->internal_timer_h);
+	if (timer_h != timer_h1) /* wrap around */
+		timer_l = ioread32be(&dev->iseg->internal_timer_l);
+
+	return (cycle_t)timer_l | (cycle_t)timer_h1 << 32;
+}
+
 static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
 {
 	struct mlx5_priv *priv  = &mdev->priv;
@@ -646,6 +659,23 @@ int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
 	return err;
 }
 EXPORT_SYMBOL(mlx5_vector2eqn);
+
+struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn)
+{
+	struct mlx5_eq_table *table = &dev->priv.eq_table;
+	struct mlx5_eq *eq;
+
+	spin_lock(&table->lock);
+	list_for_each_entry(eq, &table->comp_eqs_list, list)
+		if (eq->eqn == eqn) {
+			spin_unlock(&table->lock);
+			return eq;
+		}
+
+	spin_unlock(&table->lock);
+
+	return ERR_PTR(-ENOENT);
+}
 
 static void free_comp_eqs(struct mlx5_core_dev *dev)
 {
@@ -758,22 +788,6 @@ static int mlx5_core_set_issi(struct mlx5_core_dev *dev)
 	}
 
 	return -ENOTSUPP;
-}
-
-static int map_bf_area(struct mlx5_core_dev *dev)
-{
-	resource_size_t bf_start = pci_resource_start(dev->pdev, 0);
-	resource_size_t bf_len = pci_resource_len(dev->pdev, 0);
-
-	dev->priv.bf_mapping = io_mapping_create_wc(bf_start, bf_len);
-
-	return dev->priv.bf_mapping ? 0 : -ENOMEM;
-}
-
-static void unmap_bf_area(struct mlx5_core_dev *dev)
-{
-	if (dev->priv.bf_mapping)
-		io_mapping_free(dev->priv.bf_mapping);
 }
 
 static void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
@@ -969,7 +983,7 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	int err;
 
 	mutex_lock(&dev->intf_state_mutex);
-	if (dev->interface_state == MLX5_INTERFACE_STATE_UP) {
+	if (test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state)) {
 		dev_warn(&dev->pdev->dev, "%s: interface is up, NOP\n",
 			 __func__);
 		goto out;
@@ -1096,21 +1110,16 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 		goto err_stop_eqs;
 	}
 
-	if (map_bf_area(dev))
-		dev_err(&pdev->dev, "Failed to map blue flame area\n");
-
 	err = mlx5_irq_set_affinity_hints(dev);
-	if (err) {
+	if (err)
 		dev_err(&pdev->dev, "Failed to alloc affinity hint cpumask\n");
-		goto err_unmap_bf_area;
-	}
 
 	MLX5_INIT_DOORBELL_LOCK(&priv->cq_uar_lock);
 
 	mlx5_init_cq_table(dev);
 	mlx5_init_qp_table(dev);
 	mlx5_init_srq_table(dev);
-	mlx5_init_mr_table(dev);
+	mlx5_init_mkey_table(dev);
 
 	err = mlx5_init_fs(dev);
 	if (err) {
@@ -1141,7 +1150,8 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	if (err)
 		pr_info("failed request module on %s\n", MLX5_IB_MOD);
 
-	dev->interface_state = MLX5_INTERFACE_STATE_UP;
+	clear_bit(MLX5_INTERFACE_STATE_DOWN, &dev->intf_state);
+	set_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state);
 out:
 	mutex_unlock(&dev->intf_state_mutex);
 
@@ -1157,15 +1167,11 @@ err_sriov:
 err_reg_dev:
 	mlx5_cleanup_fs(dev);
 err_fs:
-	mlx5_cleanup_mr_table(dev);
+	mlx5_cleanup_mkey_table(dev);
 	mlx5_cleanup_srq_table(dev);
 	mlx5_cleanup_qp_table(dev);
 	mlx5_cleanup_cq_table(dev);
 	mlx5_irq_clear_affinity_hints(dev);
-
-err_unmap_bf_area:
-	unmap_bf_area(dev);
-
 	free_comp_eqs(dev);
 
 err_stop_eqs:
@@ -1219,7 +1225,7 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	}
 
 	mutex_lock(&dev->intf_state_mutex);
-	if (dev->interface_state == MLX5_INTERFACE_STATE_DOWN) {
+	if (test_bit(MLX5_INTERFACE_STATE_DOWN, &dev->intf_state)) {
 		dev_warn(&dev->pdev->dev, "%s: interface is down, NOP\n",
 			 __func__);
 		goto out;
@@ -1230,12 +1236,11 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 #endif
 
 	mlx5_cleanup_fs(dev);
-	mlx5_cleanup_mr_table(dev);
+	mlx5_cleanup_mkey_table(dev);
 	mlx5_cleanup_srq_table(dev);
 	mlx5_cleanup_qp_table(dev);
 	mlx5_cleanup_cq_table(dev);
 	mlx5_irq_clear_affinity_hints(dev);
-	unmap_bf_area(dev);
 	free_comp_eqs(dev);
 	mlx5_stop_eqs(dev);
 	mlx5_free_uuars(dev, &priv->uuari);
@@ -1254,7 +1259,8 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	mlx5_cmd_cleanup(dev);
 
 out:
-	dev->interface_state = MLX5_INTERFACE_STATE_DOWN;
+	clear_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state);
+	set_bit(MLX5_INTERFACE_STATE_DOWN, &dev->intf_state);
 	mutex_unlock(&dev->intf_state_mutex);
 	return err;
 }
@@ -1465,6 +1471,18 @@ static const struct pci_error_handlers mlx5_err_handler = {
 	.resume		= mlx5_pci_resume
 };
 
+static void shutdown(struct pci_dev *pdev)
+{
+	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
+	struct mlx5_priv *priv = &dev->priv;
+
+	dev_info(&pdev->dev, "Shutdown was called\n");
+	/* Notify mlx5 clients that the kernel is being shut down */
+	set_bit(MLX5_INTERFACE_STATE_SHUTDOWN, &dev->intf_state);
+	mlx5_unload_one(dev, priv);
+	mlx5_pci_disable_device(dev);
+}
+
 static const struct pci_device_id mlx5_core_pci_table[] = {
 	{ PCI_VDEVICE(MELLANOX, 0x1011) },			/* Connect-IB */
 	{ PCI_VDEVICE(MELLANOX, 0x1012), MLX5_PCI_DEV_IS_VF},	/* Connect-IB VF */
@@ -1484,6 +1502,7 @@ static struct pci_driver mlx5_core_driver = {
 	.id_table       = mlx5_core_pci_table,
 	.probe          = init_one,
 	.remove         = remove_one,
+	.shutdown	= shutdown,
 	.err_handler	= &mlx5_err_handler,
 	.sriov_configure   = mlx5_core_sriov_configure,
 };

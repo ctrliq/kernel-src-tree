@@ -3644,7 +3644,7 @@ static struct device_attribute ipr_ioa_reset_attr = {
 	.store = ipr_store_reset_adapter
 };
 
-static int ipr_iopoll(struct blk_iopoll *iop, int budget);
+static int ipr_iopoll(struct irq_poll *iop, int budget);
  /**
  * ipr_show_iopoll_weight - Show ipr polling mode
  * @dev:	class device struct
@@ -3687,36 +3687,33 @@ static ssize_t ipr_store_iopoll_weight(struct device *dev,
 	int i;
 
 	if (!ioa_cfg->sis64) {
-		dev_info(&ioa_cfg->pdev->dev, "blk-iopoll not supported on this adapter\n");
+		dev_info(&ioa_cfg->pdev->dev, "irq_poll not supported on this adapter\n");
 		return -EINVAL;
 	}
 	if (kstrtoul(buf, 10, &user_iopoll_weight))
 		return -EINVAL;
 
 	if (user_iopoll_weight > 256) {
-		dev_info(&ioa_cfg->pdev->dev, "Invalid blk-iopoll weight. It must be less than 256\n");
+		dev_info(&ioa_cfg->pdev->dev, "Invalid irq_poll weight. It must be less than 256\n");
 		return -EINVAL;
 	}
 
 	if (user_iopoll_weight == ioa_cfg->iopoll_weight) {
-		dev_info(&ioa_cfg->pdev->dev, "Current blk-iopoll weight has the same weight\n");
+		dev_info(&ioa_cfg->pdev->dev, "Current irq_poll weight has the same weight\n");
 		return strlen(buf);
 	}
 
-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
-			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
+			irq_poll_disable(&ioa_cfg->hrrq[i].iopoll);
 	}
 
 	spin_lock_irqsave(shost->host_lock, lock_flags);
 	ioa_cfg->iopoll_weight = user_iopoll_weight;
-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
-			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
+			irq_poll_init(&ioa_cfg->hrrq[i].iopoll,
 					ioa_cfg->iopoll_weight, ipr_iopoll);
-			blk_iopoll_enable(&ioa_cfg->hrrq[i].iopoll);
 		}
 	}
 	spin_unlock_irqrestore(shost->host_lock, lock_flags);
@@ -5622,7 +5619,7 @@ static int ipr_process_hrrq(struct ipr_hrr_queue *hrr_queue, int budget,
 	return num_hrrq;
 }
 
-static int ipr_iopoll(struct blk_iopoll *iop, int budget)
+static int ipr_iopoll(struct irq_poll *iop, int budget)
 {
 	struct ipr_ioa_cfg *ioa_cfg;
 	struct ipr_hrr_queue *hrrq;
@@ -5638,7 +5635,7 @@ static int ipr_iopoll(struct blk_iopoll *iop, int budget)
 	completed_ops = ipr_process_hrrq(hrrq, budget, &doneq);
 
 	if (completed_ops < budget)
-		blk_iopoll_complete(iop);
+		irq_poll_complete(iop);
 	spin_unlock_irqrestore(hrrq->lock, hrrq_flags);
 
 	list_for_each_entry_safe(ipr_cmd, temp, &doneq, queue) {
@@ -5743,12 +5740,10 @@ static irqreturn_t ipr_isr_mhrrq(int irq, void *devp)
 		return IRQ_NONE;
 	}
 
-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
 		if ((be32_to_cpu(*hrrq->hrrq_curr) & IPR_HRRQ_TOGGLE_BIT) ==
 		       hrrq->toggle_bit) {
-			if (!blk_iopoll_sched_prep(&hrrq->iopoll))
-				blk_iopoll_sched(&hrrq->iopoll);
+			irq_poll_sched(&hrrq->iopoll);
 			spin_unlock_irqrestore(hrrq->lock, hrrq_flags);
 			return IRQ_HANDLED;
 		}
@@ -9873,51 +9868,40 @@ static void ipr_wait_for_pci_err_recovery(struct ipr_ioa_cfg *ioa_cfg)
 static int ipr_enable_msix(struct ipr_ioa_cfg *ioa_cfg)
 {
 	struct msix_entry entries[IPR_MAX_MSIX_VECTORS];
-	int i, err, vectors;
+	int i, vectors;
 
 	for (i = 0; i < ARRAY_SIZE(entries); ++i)
 		entries[i].entry = i;
 
-	vectors = ipr_number_of_msix;
-
-	while ((err = pci_enable_msix(ioa_cfg->pdev, entries, vectors)) > 0)
-			vectors = err;
-
-	if (err < 0) {
+	vectors = pci_enable_msix_range(ioa_cfg->pdev,
+					entries, 1, ipr_number_of_msix);
+	if (vectors < 0) {
 		ipr_wait_for_pci_err_recovery(ioa_cfg);
-		return err;
+		return vectors;
 	}
 
-	if (!err) {
-		for (i = 0; i < vectors; i++)
-			ioa_cfg->vectors_info[i].vec = entries[i].vector;
-		ioa_cfg->nvectors = vectors;
-	}
+	for (i = 0; i < vectors; i++)
+		ioa_cfg->vectors_info[i].vec = entries[i].vector;
+	ioa_cfg->nvectors = vectors;
 
-	return err;
+	return 0;
 }
 
 static int ipr_enable_msi(struct ipr_ioa_cfg *ioa_cfg)
 {
-	int i, err, vectors;
+	int i, vectors;
 
-	vectors = ipr_number_of_msix;
-
-	while ((err = pci_enable_msi_block(ioa_cfg->pdev, vectors)) > 0)
-			vectors = err;
-
-	if (err < 0) {
+	vectors = pci_enable_msi_range(ioa_cfg->pdev, 1, ipr_number_of_msix);
+	if (vectors < 0) {
 		ipr_wait_for_pci_err_recovery(ioa_cfg);
-		return err;
+		return vectors;
 	}
 
-	if (!err) {
-		for (i = 0; i < vectors; i++)
-			ioa_cfg->vectors_info[i].vec = ioa_cfg->pdev->irq + i;
-		ioa_cfg->nvectors = vectors;
-	}
+	for (i = 0; i < vectors; i++)
+		ioa_cfg->vectors_info[i].vec = ioa_cfg->pdev->irq + i;
+	ioa_cfg->nvectors = vectors;
 
-	return err;
+	return 0;
 }
 
 static void name_msi_vectors(struct ipr_ioa_cfg *ioa_cfg)
@@ -9982,7 +9966,7 @@ static irqreturn_t ipr_test_intr(int irq, void *devp)
  * ipr_test_msi - Test for Message Signaled Interrupt (MSI) support.
  * @pdev:		PCI device struct
  *
- * Description: The return value from pci_enable_msi() can not always be
+ * Description: The return value from pci_enable_msi_range() can not always be
  * trusted.  This routine sets up and initiates a test interrupt to determine
  * if the interrupt is received via the ipr_test_intr() service routine.
  * If the tests fails, the driver will fall back to LSI.
@@ -10498,12 +10482,10 @@ static int ipr_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
 
 	ioa_cfg->iopoll_weight = ioa_cfg->chip_cfg->iopoll_weight;
 
-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
-			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
+			irq_poll_init(&ioa_cfg->hrrq[i].iopoll,
 					ioa_cfg->iopoll_weight, ipr_iopoll);
-			blk_iopoll_enable(&ioa_cfg->hrrq[i].iopoll);
 		}
 	}
 
@@ -10530,11 +10512,10 @@ static void ipr_shutdown(struct pci_dev *pdev)
 	int i;
 
 	spin_lock_irqsave(ioa_cfg->host->host_lock, lock_flags);
-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
 		ioa_cfg->iopoll_weight = 0;
 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
-			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
+			irq_poll_disable(&ioa_cfg->hrrq[i].iopoll);
 	}
 
 	while (ioa_cfg->in_reset_reload) {

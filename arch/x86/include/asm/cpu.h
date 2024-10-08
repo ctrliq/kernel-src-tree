@@ -38,4 +38,7 @@ DECLARE_PER_CPU(int, cpu_state);
 
 int mwait_usable(const struct cpuinfo_x86 *);
 
+unsigned int x86_family(unsigned int sig);
+unsigned int x86_model(unsigned int sig);
+unsigned int x86_stepping(unsigned int sig);
 #endif /* _ASM_X86_CPU_H */

@@ -268,7 +268,7 @@ xlog_grant_head_wait(
 		__set_current_state(TASK_UNINTERRUPTIBLE);
 		spin_unlock(&head->lock);
 
-		XFS_STATS_INC(xs_sleep_logspace);
+		XFS_STATS_INC(log->l_mp, xs_sleep_logspace);
 
 		trace_xfs_log_grant_sleep(log, tic);
 		schedule();
@@ -379,7 +379,7 @@ xfs_log_regrant(
 	if (XLOG_FORCED_SHUTDOWN(log))
 		return -EIO;
 
-	XFS_STATS_INC(xs_try_logspace);
+	XFS_STATS_INC(mp, xs_try_logspace);
 
 	/*
 	 * This is a new transaction on the ticket, so we need to change the
@@ -448,7 +448,7 @@ xfs_log_reserve(
 	if (XLOG_FORCED_SHUTDOWN(log))
 		return -EIO;
 
-	XFS_STATS_INC(xs_try_logspace);
+	XFS_STATS_INC(mp, xs_try_logspace);
 
 	ASSERT(*ticp == NULL);
 	tic = xlog_ticket_alloc(log, unit_bytes, cnt, client, permanent,
@@ -513,7 +513,7 @@ xfs_log_done(
 	struct xfs_mount	*mp,
 	struct xlog_ticket	*ticket,
 	struct xlog_in_core	**iclog,
-	uint			flags)
+	bool			regrant)
 {
 	struct xlog		*log = mp->m_log;
 	xfs_lsn_t		lsn = 0;
@@ -526,14 +526,11 @@ xfs_log_done(
 	    (((ticket->t_flags & XLOG_TIC_INITED) == 0) &&
 	     (xlog_commit_record(log, ticket, iclog, &lsn)))) {
 		lsn = (xfs_lsn_t) -1;
-		if (ticket->t_flags & XLOG_TIC_PERM_RESERV) {
-			flags |= XFS_LOG_REL_PERM_RESERV;
-		}
+		regrant = false;
 	}
 
 
-	if ((ticket->t_flags & XLOG_TIC_PERM_RESERV) == 0 ||
-	    (flags & XFS_LOG_REL_PERM_RESERV)) {
+	if (!regrant) {
 		trace_xfs_log_done_nonperm(log, ticket);
 
 		/*
@@ -541,7 +538,6 @@ xfs_log_done(
 		 * request has been made to release a permanent reservation.
 		 */
 		xlog_ungrant_log_space(log, ticket);
-		xfs_log_ticket_put(ticket);
 	} else {
 		trace_xfs_log_done_perm(log, ticket);
 
@@ -553,6 +549,7 @@ xfs_log_done(
 		ticket->t_flags |= XLOG_TIC_INITED;
 	}
 
+	xfs_log_ticket_put(ticket);
 	return lsn;
 }
 
@@ -671,9 +668,9 @@ xfs_log_mount(
 			ASSERT(0);
 			goto out_free_log;
 		}
+		xfs_crit(mp, "Log size out of supported range.");
 		xfs_crit(mp,
-"Log size out of supported range. Continuing onwards, but if log hangs are\n"
-"experienced then please report this message in the bug report.");
+"Continuing onwards, but if log hangs are experienced then please report this message in the bug report.");
 	}
 
 	/*
@@ -1163,11 +1160,13 @@ xlog_space_left(
 		 * In this case we just want to return the size of the
 		 * log as the amount of space left.
 		 */
+		xfs_alert(log->l_mp, "xlog_space_left: head behind tail");
 		xfs_alert(log->l_mp,
-			"xlog_space_left: head behind tail\n"
-			"  tail_cycle = %d, tail_bytes = %d\n"
-			"  GH   cycle = %d, GH   bytes = %d",
-			tail_cycle, tail_bytes, head_cycle, head_bytes);
+			  "  tail_cycle = %d, tail_bytes = %d",
+			  tail_cycle, tail_bytes);
+		xfs_alert(log->l_mp,
+			  "  GH   cycle = %d, GH   bytes = %d",
+			  head_cycle, head_bytes);
 		ASSERT(0);
 		free_bytes = log->l_logsize;
 	}
@@ -1627,7 +1626,7 @@ xlog_pack_data(
 	int			i, j, k;
 	int			size = iclog->ic_offset + roundoff;
 	__be32			cycle_lsn;
-	xfs_caddr_t		dp;
+	char			*dp;
 
 	cycle_lsn = CYCLE_LSN_DISK(iclog->ic_header.h_lsn);
 
@@ -1776,7 +1775,7 @@ xlog_sync(
 	int		v2 = xfs_sb_version_haslogv2(&log->l_mp->m_sb);
 	int		size;
 
-	XFS_STATS_INC(xs_log_writes);
+	XFS_STATS_INC(log->l_mp, xs_log_writes);
 	ASSERT(atomic_read(&iclog->ic_refcnt) == 0);
 
 	/* Add for LR header */
@@ -1813,7 +1812,7 @@ xlog_sync(
 	bp = iclog->ic_bp;
 	XFS_BUF_SET_ADDR(bp, BLOCK_LSN(be64_to_cpu(iclog->ic_header.h_lsn)));
 
-	XFS_STATS_ADD(xs_log_blocks, BTOBB(count));
+	XFS_STATS_ADD(log->l_mp, xs_log_blocks, BTOBB(count));
 
 	/* Do we need to split this write into 2 parts? */
 	if (XFS_BUF_ADDR(bp) + BTOBB(count) > log->l_logBBsize) {
@@ -2080,26 +2079,24 @@ xlog_print_tic_res(
 	    "CREATE_TMPFILE"
 	};
 
-	xfs_warn(mp,
-		"xlog_write: reservation summary:\n"
-		"  trans type  = %s (%u)\n"
-		"  unit res    = %d bytes\n"
-		"  current res = %d bytes\n"
-		"  total reg   = %u bytes (o/flow = %u bytes)\n"
-		"  ophdrs      = %u (ophdr space = %u bytes)\n"
-		"  ophdr + reg = %u bytes\n"
-		"  num regions = %u",
-		((ticket->t_trans_type <= 0 ||
-		  ticket->t_trans_type > XFS_TRANS_TYPE_MAX) ?
+	xfs_warn(mp, "xlog_write: reservation summary:");
+	xfs_warn(mp, "  trans type  = %s (%u)",
+		 ((ticket->t_trans_type <= 0 ||
+		   ticket->t_trans_type > XFS_TRANS_TYPE_MAX) ?
 		  "bad-trans-type" : trans_type_str[ticket->t_trans_type-1]),
-		ticket->t_trans_type,
-		ticket->t_unit_res,
-		ticket->t_curr_res,
-		ticket->t_res_arr_sum, ticket->t_res_o_flow,
-		ticket->t_res_num_ophdrs, ophdr_spc,
-		ticket->t_res_arr_sum +
-		ticket->t_res_o_flow + ophdr_spc,
-		ticket->t_res_num);
+		 ticket->t_trans_type);
+	xfs_warn(mp, "  unit res    = %d bytes",
+		 ticket->t_unit_res);
+	xfs_warn(mp, "  current res = %d bytes",
+		 ticket->t_curr_res);
+	xfs_warn(mp, "  total reg   = %u bytes (o/flow = %u bytes)",
+		 ticket->t_res_arr_sum, ticket->t_res_o_flow);
+	xfs_warn(mp, "  ophdrs      = %u (ophdr space = %u bytes)",
+		 ticket->t_res_num_ophdrs, ophdr_spc);
+	xfs_warn(mp, "  ophdr + reg = %u bytes",
+		 ticket->t_res_arr_sum + ticket->t_res_o_flow + ophdr_spc);
+	xfs_warn(mp, "  num regions = %u",
+		 ticket->t_res_num);
 
 	for (i = 0; i < ticket->t_res_num; i++) {
 		uint r_type = ticket->t_res_arr[i].r_type;
@@ -2959,7 +2956,7 @@ restart:
 
 	iclog = log->l_iclog;
 	if (iclog->ic_state != XLOG_STATE_ACTIVE) {
-		XFS_STATS_INC(xs_log_noiclogs);
+		XFS_STATS_INC(log->l_mp, xs_log_noiclogs);
 
 		/* Wait for log writes to have flushed */
 		xlog_wait(&log->l_flush_wait, &log->l_icloglock);
@@ -3266,7 +3263,7 @@ _xfs_log_force(
 	struct xlog_in_core	*iclog;
 	xfs_lsn_t		lsn;
 
-	XFS_STATS_INC(xs_log_force);
+	XFS_STATS_INC(mp, xs_log_force);
 
 	xlog_cil_force(log);
 
@@ -3351,7 +3348,7 @@ maybe_sleep:
 			spin_unlock(&log->l_icloglock);
 			return -EIO;
 		}
-		XFS_STATS_INC(xs_log_force_sleep);
+		XFS_STATS_INC(mp, xs_log_force_sleep);
 		xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
 		/*
 		 * No need to grab the log lock here since we're
@@ -3416,7 +3413,7 @@ _xfs_log_force_lsn(
 
 	ASSERT(lsn != 0);
 
-	XFS_STATS_INC(xs_log_force);
+	XFS_STATS_INC(mp, xs_log_force);
 
 	lsn = xlog_cil_force_lsn(log, lsn);
 	if (lsn == NULLCOMMITLSN)
@@ -3465,7 +3462,7 @@ try_again:
 			     (XLOG_STATE_WANT_SYNC | XLOG_STATE_SYNCING))) {
 				ASSERT(!(iclog->ic_state & XLOG_STATE_IOERROR));
 
-				XFS_STATS_INC(xs_log_force_sleep);
+				XFS_STATS_INC(mp, xs_log_force_sleep);
 
 				xlog_wait(&iclog->ic_prev->ic_write_wait,
 							&log->l_icloglock);
@@ -3495,7 +3492,7 @@ try_again:
 				spin_unlock(&log->l_icloglock);
 				return -EIO;
 			}
-			XFS_STATS_INC(xs_log_force_sleep);
+			XFS_STATS_INC(mp, xs_log_force_sleep);
 			xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
 			/*
 			 * No need to grab the log lock here since we're
@@ -3883,7 +3880,7 @@ xlog_verify_iclog(
 		if (!syncing || (field_offset & 0x1ff)) {
 			clientid = ophead->oh_clientid;
 		} else {
-			idx = BTOBBT((xfs_caddr_t)&(ophead->oh_clientid) - iclog->ic_datap);
+			idx = BTOBBT((char *)&ophead->oh_clientid - iclog->ic_datap);
 			if (idx >= (XLOG_HEADER_CYCLE_SIZE / BBSIZE)) {
 				j = idx / (XLOG_HEADER_CYCLE_SIZE / BBSIZE);
 				k = idx % (XLOG_HEADER_CYCLE_SIZE / BBSIZE);

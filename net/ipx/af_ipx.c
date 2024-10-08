@@ -330,7 +330,7 @@ static __inline__ void __ipxitf_put(struct ipx_interface *intrfc)
 static int ipxitf_device_event(struct notifier_block *notifier,
 				unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct ipx_interface *i, *tmp;
 
 	if (!net_eq(dev_net(dev), &init_net))
@@ -2029,7 +2029,7 @@ static int __init ipx_init(void)
 	if (!pSNAP_datalink)
 		printk(ipx_snap_err_msg);
 
-	register_netdevice_notifier(&ipx_dev_notifier);
+	register_netdevice_notifier_rh(&ipx_dev_notifier);
 	ipx_register_sysctl();
 	ipx_proc_init();
 out:
@@ -2041,7 +2041,7 @@ static void __exit ipx_proto_finito(void)
 	ipx_proc_exit();
 	ipx_unregister_sysctl();
 
-	unregister_netdevice_notifier(&ipx_dev_notifier);
+	unregister_netdevice_notifier_rh(&ipx_dev_notifier);
 
 	ipxitf_cleanup();
 

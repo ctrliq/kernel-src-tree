@@ -41,6 +41,7 @@
 #include <linux/vmalloc.h>
 #include <linux/tcp.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/moduleparam.h>
 
 #include "mlx4_en.h"
@@ -66,7 +67,6 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
 	ring->size = size;
 	ring->size_mask = size - 1;
 	ring->stride = stride;
-	ring->inline_thold = priv->prof->inline_thold;
 	ring->full_size = ring->size - HEADROOM - MAX_DESC_TXBBS;
 
 	tmp = size * sizeof(struct mlx4_en_tx_info);
@@ -678,7 +678,8 @@ static void build_inline_wqe(struct mlx4_en_tx_desc *tx_desc,
 	}
 }
 
-u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb)
+u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 void *accel_priv, select_queue_fallback_t fallback)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	u16 rings_p_up = priv->num_tx_rings_p_up;
@@ -690,7 +691,7 @@ u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb)
 	if (skb_vlan_tag_present(skb))
 		up = skb_vlan_tag_get(skb) >> VLAN_PRIO_SHIFT;
 
-	return __netdev_pick_tx(dev, skb) % rings_p_up + up * rings_p_up;
+	return fallback(dev, skb) % rings_p_up + up * rings_p_up;
 }
 
 static void mlx4_bf_copy(void __iomem *dst, const void *src,
@@ -910,8 +911,18 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
 				 tx_ind, fragptr);
 
 	if (skb->encapsulation) {
-		struct iphdr *ipv4 = (struct iphdr *)skb_inner_network_header(skb);
-		if (ipv4->protocol == IPPROTO_TCP || ipv4->protocol == IPPROTO_UDP)
+		union {
+			struct iphdr *v4;
+			struct ipv6hdr *v6;
+			unsigned char *hdr;
+		} ip;
+		u8 proto;
+
+		ip.hdr = skb_inner_network_header(skb);
+		proto = (ip.v4->version == 4) ? ip.v4->protocol :
+						ip.v6->nexthdr;
+
+		if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
 			op_own |= cpu_to_be32(MLX4_WQE_CTRL_IIP | MLX4_WQE_CTRL_ILP);
 		else
 			op_own |= cpu_to_be32(MLX4_WQE_CTRL_IIP);

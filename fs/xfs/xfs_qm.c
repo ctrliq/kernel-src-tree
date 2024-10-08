@@ -185,7 +185,7 @@ xfs_qm_dqpurge(
 	ASSERT(!list_empty(&dqp->q_lru));
 	list_del_init(&dqp->q_lru);
 	qi->qi_lru_count--;
-	XFS_STATS_DEC(xs_qm_dquot_unused);
+	XFS_STATS_DEC(mp, xs_qm_dquot_unused);
 	mutex_unlock(&qi->qi_lru_lock);
 
 	xfs_qm_dqdestroy(dqp);
@@ -424,6 +424,37 @@ xfs_qm_dqdetach(
 	}
 }
 
+STATIC void
+xfs_qm_set_defquota(
+	xfs_mount_t	*mp,
+	uint		type,
+	xfs_quotainfo_t	*qinf)
+{
+	xfs_dquot_t		*dqp;
+	struct xfs_def_quota    *defq;
+	int			error;
+
+	error = xfs_qm_dqread(mp, 0, type, XFS_QMOPT_DOWARN, &dqp);
+
+	if (!error) {
+		xfs_disk_dquot_t        *ddqp = &dqp->q_core;
+
+		defq = xfs_get_defquota(dqp, qinf);
+
+		/*
+		 * Timers and warnings have been already set, let's just set the
+		 * default limits for this quota type
+		 */
+		defq->bhardlimit = be64_to_cpu(ddqp->d_blk_hardlimit);
+		defq->bsoftlimit = be64_to_cpu(ddqp->d_blk_softlimit);
+		defq->ihardlimit = be64_to_cpu(ddqp->d_ino_hardlimit);
+		defq->isoftlimit = be64_to_cpu(ddqp->d_ino_softlimit);
+		defq->rtbhardlimit = be64_to_cpu(ddqp->d_rtb_hardlimit);
+		defq->rtbsoftlimit = be64_to_cpu(ddqp->d_rtb_softlimit);
+		xfs_qm_dqdestroy(dqp);
+	}
+}
+
 /*
  * This initializes all the quota information that's kept in the
  * mount structure
@@ -472,19 +503,19 @@ xfs_qm_init_quotainfo(
 	 * We try to get the limits from the superuser's limits fields.
 	 * This is quite hacky, but it is standard quota practice.
 	 *
-	 * We look at the USR dquot with id == 0 first, but if user quotas
-	 * are not enabled we goto the GRP dquot with id == 0.
-	 * We don't really care to keep separate default limits for user
-	 * and group quotas, at least not at this point.
-	 *
 	 * Since we may not have done a quotacheck by this point, just read
 	 * the dquot without attaching it to any hashtables or lists.
+	 *
+	 * Timers and warnings are globally set by the first timer found in
+	 * user/group/proj quota types, otherwise a default value is used.
+	 * This should be split into different fields per quota type.
 	 */
 	error = xfs_qm_dqread(mp, 0,
 			XFS_IS_UQUOTA_RUNNING(mp) ? XFS_DQ_USER :
 			 (XFS_IS_GQUOTA_RUNNING(mp) ? XFS_DQ_GROUP :
 			  XFS_DQ_PROJ),
 			XFS_QMOPT_DOWARN, &dqp);
+
 	if (!error) {
 		xfs_disk_dquot_t	*ddqp = &dqp->q_core;
 
@@ -505,12 +536,6 @@ xfs_qm_init_quotainfo(
 			be16_to_cpu(ddqp->d_iwarns) : XFS_QM_IWARNLIMIT;
 		qinf->qi_rtbwarnlimit = ddqp->d_rtbwarns ?
 			be16_to_cpu(ddqp->d_rtbwarns) : XFS_QM_RTBWARNLIMIT;
-		qinf->qi_bhardlimit = be64_to_cpu(ddqp->d_blk_hardlimit);
-		qinf->qi_bsoftlimit = be64_to_cpu(ddqp->d_blk_softlimit);
-		qinf->qi_ihardlimit = be64_to_cpu(ddqp->d_ino_hardlimit);
-		qinf->qi_isoftlimit = be64_to_cpu(ddqp->d_ino_softlimit);
-		qinf->qi_rtbhardlimit = be64_to_cpu(ddqp->d_rtb_hardlimit);
-		qinf->qi_rtbsoftlimit = be64_to_cpu(ddqp->d_rtb_softlimit);
  
 		xfs_qm_dqdestroy(dqp);
 	} else {
@@ -521,6 +546,13 @@ xfs_qm_init_quotainfo(
 		qinf->qi_iwarnlimit = XFS_QM_IWARNLIMIT;
 		qinf->qi_rtbwarnlimit = XFS_QM_RTBWARNLIMIT;
 	}
+
+	if (XFS_IS_UQUOTA_RUNNING(mp))
+		xfs_qm_set_defquota(mp, XFS_DQ_USER, qinf);
+	if (XFS_IS_GQUOTA_RUNNING(mp))
+		xfs_qm_set_defquota(mp, XFS_DQ_GROUP, qinf);
+	if (XFS_IS_PQUOTA_RUNNING(mp))
+		xfs_qm_set_defquota(mp, XFS_DQ_PROJ, qinf);
 
 	qinf->qi_shrinker.shrink = xfs_qm_shake;
 	qinf->qi_shrinker.seeks = DEFAULT_SEEKS;
@@ -612,7 +644,7 @@ xfs_qm_qino_alloc(
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_create,
 				  XFS_QM_QINOCREATE_SPACE_RES(mp), 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		return error;
 	}
 
@@ -620,8 +652,7 @@ xfs_qm_qino_alloc(
 		error = xfs_dir_ialloc(&tp, NULL, S_IFREG, 1, 0, 0, 1, ip,
 								&committed);
 		if (error) {
-			xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES |
-					 XFS_TRANS_ABORT);
+			xfs_trans_cancel(tp);
 			return error;
 		}
 	}
@@ -652,7 +683,7 @@ xfs_qm_qino_alloc(
 	spin_unlock(&mp->m_sb_lock);
 	xfs_log_sb(tp);
 
-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+	error = xfs_trans_commit(tp);
 	if (error) {
 		ASSERT(XFS_FORCED_SHUTDOWN(mp));
 		xfs_alert(mp, "%s failed (error %d)!", __func__, error);
@@ -1461,11 +1492,11 @@ xfs_qm_dqreclaim_one(
 		xfs_dqunlock(dqp);
 
 		trace_xfs_dqreclaim_want(dqp);
-		XFS_STATS_INC(xs_qm_dqwants);
+		XFS_STATS_INC(mp, xs_qm_dqwants);
 
 		list_del_init(&dqp->q_lru);
 		qi->qi_lru_count--;
-		XFS_STATS_DEC(xs_qm_dquot_unused);
+		XFS_STATS_DEC(mp, xs_qm_dquot_unused);
 		return;
 	}
 
@@ -1507,10 +1538,10 @@ xfs_qm_dqreclaim_one(
 	ASSERT(dqp->q_nrefs == 0);
 	list_move_tail(&dqp->q_lru, dispose_list);
 	qi->qi_lru_count--;
-	XFS_STATS_DEC(xs_qm_dquot_unused);
+	XFS_STATS_DEC(mp, xs_qm_dquot_unused);
 
 	trace_xfs_dqreclaim_done(dqp);
-	XFS_STATS_INC(xs_qm_dqreclaims);
+	XFS_STATS_INC(mp, xs_qm_dqreclaims);
 	return;
 
 	/*
@@ -1521,7 +1552,7 @@ out_unlock_move_tail:
 out_move_tail:
 	list_move_tail(&dqp->q_lru, &qi->qi_lru_list);
 	trace_xfs_dqreclaim_busy(dqp);
-	XFS_STATS_INC(xs_qm_dqreclaim_misses);
+	XFS_STATS_INC(mp, xs_qm_dqreclaim_misses);
 }
 
 STATIC int

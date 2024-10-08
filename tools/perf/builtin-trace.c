@@ -22,11 +22,11 @@
 #include "util/color.h"
 #include "util/debug.h"
 #include "util/evlist.h"
-#include "util/exec_cmd.h"
+#include <subcmd/exec-cmd.h>
 #include "util/machine.h"
 #include "util/session.h"
 #include "util/thread.h"
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/strlist.h"
 #include "util/intlist.h"
 #include "util/thread_map.h"
@@ -1642,7 +1642,8 @@ static int trace__symbols_init(struct trace *trace, struct perf_evlist *evlist)
 		return -errno;
 
 	err = __machine__synthesize_threads(trace->host, &trace->tool, &trace->opts.target,
-					    evlist->threads, trace__tool_process, false);
+					    evlist->threads, trace__tool_process, false,
+					    trace->opts.proc_map_timeout);
 	if (err)
 		symbol__exit();
 
@@ -3034,6 +3035,7 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 			.user_interval = ULLONG_MAX,
 			.no_buffering  = true,
 			.mmap_pages    = UINT_MAX,
+			.proc_map_timeout  = 500,
 		},
 		.output = stderr,
 		.show_comm = true,
@@ -3083,6 +3085,8 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		     "Trace pagefaults", parse_pagefaults, "maj"),
 	OPT_BOOLEAN(0, "syscalls", &trace.trace_syscalls, "Trace syscalls"),
 	OPT_BOOLEAN('f', "force", &trace.force, "don't complain, do it"),
+	OPT_UINTEGER(0, "proc-map-timeout", &trace.opts.proc_map_timeout,
+			"per thread proc mmap processing timeout in ms"),
 	OPT_END()
 	};
 	const char * const trace_subcommands[] = { "record", NULL };

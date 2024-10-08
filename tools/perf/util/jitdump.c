@@ -99,8 +99,16 @@ jit_close(struct jit_buf_desc *jd)
 }
 
 static int
-jit_validate_events(struct perf_session *session)
+jit_validate_events(struct perf_session *session __maybe_unused)
 {
+	/*
+	 * RHEL7 we don't support use_clockid yet,
+	 * making all pass and omiting following code.
+	 */
+
+	return 0;
+
+#if 0
 	struct perf_evsel *evsel;
 
 	/*
@@ -111,6 +119,7 @@ jit_validate_events(struct perf_session *session)
 			return -1;
 	}
 	return 0;
+#endif
 }
 
 static int

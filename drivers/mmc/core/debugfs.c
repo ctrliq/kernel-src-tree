@@ -145,7 +145,10 @@ static int mmc_ios_show(struct seq_file *s, void *data)
 		str = "mmc DDR52";
 		break;
 	case MMC_TIMING_MMC_HS200:
-		str = "mmc high-speed SDR200";
+		str = "mmc HS200";
+		break;
+	case MMC_TIMING_MMC_HS400:
+		str = "mmc HS400";
 		break;
 	default:
 		str = "invalid";
@@ -252,11 +255,6 @@ void mmc_add_host_debugfs(struct mmc_host *host)
 			&mmc_clock_fops))
 		goto err_node;
 
-#ifdef CONFIG_MMC_CLKGATE
-	if (!debugfs_create_u32("clk_delay", (S_IRUSR | S_IWUSR),
-				root, &host->clk_delay))
-		goto err_node;
-#endif
 #ifdef CONFIG_FAIL_MMC_REQUEST
 	if (fail_request)
 		setup_fault_attr(&fail_default_attr, fail_request);

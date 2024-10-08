@@ -233,9 +233,9 @@ static struct sctp_auth_bytes *sctp_auth_make_local_vector(
 				    gfp_t gfp)
 {
 	return sctp_auth_make_key_vector(
-				    (sctp_random_param_t*)asoc->c.auth_random,
-				    (sctp_chunks_param_t*)asoc->c.auth_chunks,
-				    (sctp_hmac_algo_param_t*)asoc->c.auth_hmacs,
+				    (sctp_random_param_t *)asoc->c.auth_random,
+				    (sctp_chunks_param_t *)asoc->c.auth_chunks,
+				    (sctp_hmac_algo_param_t *)asoc->c.auth_hmacs,
 				    gfp);
 }
 
@@ -665,15 +665,15 @@ static int __sctp_auth_cid(sctp_cid_t chunk, struct sctp_chunks_param *param)
 	 */
 	for (i = 0; !found && i < len; i++) {
 		switch (param->chunks[i]) {
-		    case SCTP_CID_INIT:
-		    case SCTP_CID_INIT_ACK:
-		    case SCTP_CID_SHUTDOWN_COMPLETE:
-		    case SCTP_CID_AUTH:
+		case SCTP_CID_INIT:
+		case SCTP_CID_INIT_ACK:
+		case SCTP_CID_SHUTDOWN_COMPLETE:
+		case SCTP_CID_AUTH:
 			break;
 
-		    default:
+		default:
 			if (param->chunks[i] == chunk)
-			    found = 1;
+				found = 1;
 			break;
 		}
 	}

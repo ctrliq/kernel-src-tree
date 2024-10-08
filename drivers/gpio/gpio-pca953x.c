@@ -354,7 +354,7 @@ static void pca953x_setup_gpio(struct pca953x_chip *chip, int gpios)
 	gc->direction_output = pca953x_gpio_direction_output;
 	gc->get = pca953x_gpio_get_value;
 	gc->set = pca953x_gpio_set_value;
-	gc->can_sleep = 1;
+	gc->can_sleep = true;
 
 	gc->base = chip->gpio_start;
 	gc->ngpio = gpios;
@@ -720,7 +720,7 @@ static int pca953x_probe(struct i2c_client *client,
 	if (chip == NULL)
 		return -ENOMEM;
 
-	pdata = client->dev.platform_data;
+	pdata = dev_get_platdata(&client->dev);
 	if (pdata) {
 		irq_base = pdata->irq_base;
 		chip->gpio_start = pdata->gpio_base;
@@ -774,7 +774,7 @@ static int pca953x_probe(struct i2c_client *client,
 
 static int pca953x_remove(struct i2c_client *client)
 {
-	struct pca953x_platform_data *pdata = client->dev.platform_data;
+	struct pca953x_platform_data *pdata = dev_get_platdata(&client->dev);
 	struct pca953x_chip *chip = i2c_get_clientdata(client);
 	int ret = 0;
 

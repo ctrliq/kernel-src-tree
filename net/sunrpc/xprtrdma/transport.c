@@ -48,7 +48,6 @@
  */
 
 #include <linux/module.h>
-#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/seq_file.h>
 #include <linux/sunrpc/addr.h>
@@ -59,17 +58,12 @@
 # define RPCDBG_FACILITY	RPCDBG_TRANS
 #endif
 
-MODULE_LICENSE("Dual BSD/GPL");
-
-MODULE_DESCRIPTION("RPC/RDMA Transport for Linux kernel NFS");
-MODULE_AUTHOR("Network Appliance, Inc.");
-
 /*
  * tunables
  */
 
 static unsigned int xprt_rdma_slot_table_entries = RPCRDMA_DEF_SLOT_TABLE;
-static unsigned int xprt_rdma_max_inline_read = RPCRDMA_DEF_INLINE;
+unsigned int xprt_rdma_max_inline_read = RPCRDMA_DEF_INLINE;
 static unsigned int xprt_rdma_max_inline_write = RPCRDMA_DEF_INLINE;
 static unsigned int xprt_rdma_inline_write_padding;
 static unsigned int xprt_rdma_memreg_strategy = RPCRDMA_FRMR;
@@ -149,12 +143,7 @@ static struct ctl_table sunrpc_table[] = {
 
 #endif
 
-#define RPCRDMA_BIND_TO		(60U * HZ)
-#define RPCRDMA_INIT_REEST_TO	(5U * HZ)
-#define RPCRDMA_MAX_REEST_TO	(30U * HZ)
-#define RPCRDMA_IDLE_DISC_TO	(5U * 60 * HZ)
-
-static struct rpc_xprt_ops xprt_rdma_procs;	/* forward reference */
+static struct rpc_xprt_ops xprt_rdma_procs;	/*forward reference */
 
 static void
 xprt_rdma_format_addresses4(struct rpc_xprt *xprt, struct sockaddr *sap)
@@ -180,7 +169,7 @@ xprt_rdma_format_addresses6(struct rpc_xprt *xprt, struct sockaddr *sap)
 	xprt->address_strings[RPC_DISPLAY_NETID] = RPCBIND_NETID_RDMA6;
 }
 
-static void
+void
 xprt_rdma_format_addresses(struct rpc_xprt *xprt, struct sockaddr *sap)
 {
 	char buf[128];
@@ -209,7 +198,7 @@ xprt_rdma_format_addresses(struct rpc_xprt *xprt, struct sockaddr *sap)
 	xprt->address_strings[RPC_DISPLAY_PROTO] = "rdma";
 }
 
-static void
+void
 xprt_rdma_free_addresses(struct rpc_xprt *xprt)
 {
 	unsigned int i;
@@ -276,8 +265,8 @@ xprt_rdma_destroy(struct rpc_xprt *xprt)
 
 	xprt_clear_connected(xprt);
 
-	rpcrdma_buffer_destroy(&r_xprt->rx_buf);
 	rpcrdma_ep_destroy(&r_xprt->rx_ep, &r_xprt->rx_ia);
+	rpcrdma_buffer_destroy(&r_xprt->rx_buf);
 	rpcrdma_ia_close(&r_xprt->rx_ia);
 
 	xprt_rdma_free_addresses(xprt);
@@ -505,7 +494,7 @@ xprt_rdma_allocate(struct rpc_task *task, size_t size)
 	if (req == NULL)
 		return NULL;
 
-	flags = GFP_NOIO | __GFP_NOWARN;
+	flags = RPCRDMA_DEF_GFP;
 	if (RPC_IS_SWAPPER(task))
 		flags = __GFP_MEMALLOC | GFP_NOWAIT | __GFP_NOWARN;
 
@@ -648,7 +637,7 @@ drop_connection:
 	return -ENOTCONN;	/* implies disconnect */
 }
 
-static void xprt_rdma_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
+void xprt_rdma_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
 {
 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
 	long idle_time = 0;
@@ -714,7 +703,13 @@ static struct rpc_xprt_ops xprt_rdma_procs = {
 	.print_stats		= xprt_rdma_print_stats,
 	.enable_swap		= xprt_rdma_enable_swap,
 	.disable_swap		= xprt_rdma_disable_swap,
-	.inject_disconnect	= xprt_rdma_inject_disconnect
+	.inject_disconnect	= xprt_rdma_inject_disconnect,
+#if defined(CONFIG_SUNRPC_BACKCHANNEL)
+	.bc_setup		= xprt_rdma_bc_setup,
+	.bc_up			= xprt_rdma_bc_up,
+	.bc_free_rqst		= xprt_rdma_bc_free_rqst,
+	.bc_destroy		= xprt_rdma_bc_destroy,
+#endif
 };
 
 static struct xprt_class xprt_rdma = {
@@ -725,7 +720,7 @@ static struct xprt_class xprt_rdma = {
 	.setup			= xprt_setup_rdma,
 };
 
-static void __exit xprt_rdma_cleanup(void)
+void xprt_rdma_cleanup(void)
 {
 	int rc;
 
@@ -741,10 +736,16 @@ static void __exit xprt_rdma_cleanup(void)
 		dprintk("RPC:       %s: xprt_unregister returned %i\n",
 			__func__, rc);
 
+	rpcrdma_destroy_wq();
 	frwr_destroy_recovery_wq();
+
+	rc = xprt_unregister_transport(&xprt_rdma_bc);
+	if (rc)
+		dprintk("RPC:       %s: xprt_unregister(bc) returned %i\n",
+			__func__, rc);
 }
 
-static int __init xprt_rdma_init(void)
+int xprt_rdma_init(void)
 {
 	int rc;
 
@@ -752,8 +753,23 @@ static int __init xprt_rdma_init(void)
 	if (rc)
 		return rc;
 
+	rc = rpcrdma_alloc_wq();
+	if (rc) {
+		frwr_destroy_recovery_wq();
+		return rc;
+	}
+
 	rc = xprt_register_transport(&xprt_rdma);
 	if (rc) {
+		rpcrdma_destroy_wq();
+		frwr_destroy_recovery_wq();
+		return rc;
+	}
+
+	rc = xprt_register_transport(&xprt_rdma_bc);
+	if (rc) {
+		xprt_unregister_transport(&xprt_rdma);
+		rpcrdma_destroy_wq();
 		frwr_destroy_recovery_wq();
 		return rc;
 	}
@@ -774,6 +790,3 @@ static int __init xprt_rdma_init(void)
 #endif
 	return 0;
 }
-
-module_init(xprt_rdma_init);
-module_exit(xprt_rdma_cleanup);

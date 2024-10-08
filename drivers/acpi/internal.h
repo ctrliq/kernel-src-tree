@@ -31,6 +31,7 @@ void acpi_pci_link_init(void);
 void acpi_processor_init(void);
 void acpi_platform_init(void);
 void acpi_pnp_init(void);
+void acpi_int340x_thermal_init(void);
 int acpi_sysfs_init(void);
 #ifdef CONFIG_ACPI_CONTAINER
 void acpi_container_init(void);
@@ -86,16 +87,35 @@ bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent);
 #define ACPI_STA_DEFAULT (ACPI_STA_DEVICE_PRESENT | ACPI_STA_DEVICE_ENABLED | \
 			  ACPI_STA_DEVICE_UI | ACPI_STA_DEVICE_FUNCTIONING)
 
+extern struct list_head acpi_bus_id_list;
+
+struct acpi_device_bus_id{
+	char bus_id[15];
+	unsigned int instance_no;
+	struct list_head node;
+};
+
 int acpi_device_add(struct acpi_device *device,
 		    void (*release)(struct device *));
 void acpi_init_device_object(struct acpi_device *device, acpi_handle handle,
 			     int type, unsigned long long sta);
+int acpi_device_setup_files(struct acpi_device *dev);
+void acpi_device_remove_files(struct acpi_device *dev);
 void acpi_device_add_finalize(struct acpi_device *device);
 void acpi_free_pnp_ids(struct acpi_device_pnp *pnp);
 int acpi_bind_one(struct device *dev, struct acpi_device *adev);
 int acpi_unbind_one(struct device *dev);
 bool acpi_device_is_present(struct acpi_device *adev);
 bool acpi_device_is_battery(acpi_handle handle);
+bool acpi_device_is_first_physical_node(struct acpi_device *adev,
+					const struct device *dev);
+
+/* --------------------------------------------------------------------------
+                     Device Matching and Notification
+   -------------------------------------------------------------------------- */
+struct acpi_device *acpi_companion_match(const struct device *dev);
+int __acpi_device_uevent_modalias(struct acpi_device *adev,
+				  struct kobj_uevent_env *env);
 
 /* --------------------------------------------------------------------------
                                   Power Resource
@@ -168,13 +188,6 @@ static inline void suspend_nvs_restore(void) {}
 #endif
 
 /*--------------------------------------------------------------------------
-				Platform bus support
-  -------------------------------------------------------------------------- */
-struct platform_device;
-
-struct platform_device *acpi_create_platform_device(struct acpi_device *adev);
-
-/*--------------------------------------------------------------------------
 					Video
   -------------------------------------------------------------------------- */
 #if defined(CONFIG_ACPI_VIDEO) || defined(CONFIG_ACPI_VIDEO_MODULE)
@@ -184,6 +197,8 @@ bool acpi_osi_is_win8(void);
 /*--------------------------------------------------------------------------
 				Device properties
   -------------------------------------------------------------------------- */
+#define ACPI_DT_NAMESPACE_HID	"PRP0001"
+
 void acpi_init_properties(struct acpi_device *adev);
 void acpi_free_properties(struct acpi_device *adev);
 

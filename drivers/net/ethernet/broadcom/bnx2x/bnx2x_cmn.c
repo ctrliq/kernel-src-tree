@@ -46,7 +46,6 @@ static void bnx2x_add_all_napi_cnic(struct bnx2x *bp)
 	for_each_rx_queue_cnic(bp, i) {
 		netif_napi_add(bp->dev, &bnx2x_fp(bp, i, napi),
 			       bnx2x_poll, NAPI_POLL_WEIGHT);
-		napi_hash_add(&bnx2x_fp(bp, i, napi));
 	}
 }
 
@@ -58,7 +57,6 @@ static void bnx2x_add_all_napi(struct bnx2x *bp)
 	for_each_eth_queue(bp, i) {
 		netif_napi_add(bp->dev, &bnx2x_fp(bp, i, napi),
 			       bnx2x_poll, NAPI_POLL_WEIGHT);
-		napi_hash_add(&bnx2x_fp(bp, i, napi));
 	}
 }
 
@@ -1092,8 +1090,6 @@ reuse_rx:
 			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
 					       le16_to_cpu(cqe_fp->vlan_tag));
 
-		skb_mark_napi_id(skb, &fp->napi);
-
 		napi_gro_receive(&fp->napi, skb);
 next_rx:
 		rx_buf->data = NULL;
@@ -1912,7 +1908,8 @@ void bnx2x_netif_stop(struct bnx2x *bp, int disable_hw)
 		bnx2x_napi_disable_cnic(bp);
 }
 
-u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb)
+u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb,
+		       void *accel_priv, select_queue_fallback_t fallback)
 {
 	struct bnx2x *bp = netdev_priv(dev);
 
@@ -1934,7 +1931,7 @@ u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb)
 	}
 
 	/* select a non-FCoE queue */
-	return __netdev_pick_tx(dev, skb) % BNX2X_NUM_ETH_QUEUES(bp);
+	return fallback(dev, skb) % BNX2X_NUM_ETH_QUEUES(bp);
 }
 
 void bnx2x_set_num_queues(struct bnx2x *bp)
@@ -2854,7 +2851,7 @@ int bnx2x_nic_load(struct bnx2x *bp, int load_mode)
 
 	case LOAD_OPEN:
 		netif_tx_start_all_queues(bp->dev);
-		smp_mb__after_clear_bit();
+		smp_mb__after_atomic();
 		break;
 
 	case LOAD_DIAG:
@@ -4279,6 +4276,14 @@ int bnx2x_setup_tc(struct net_device *dev, u8 num_tc)
 	return 0;
 }
 
+int __bnx2x_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+		     struct tc_to_netdev *tc)
+{
+	if (tc->type != TC_SETUP_MQPRIO)
+		return -EINVAL;
+	return bnx2x_setup_tc(dev, tc->tc);
+}
+
 /* called with rtnl_lock */
 int bnx2x_change_mac_addr(struct net_device *dev, void *p)
 {
@@ -5086,9 +5091,9 @@ void bnx2x_update_coalesce_sb_index(struct bnx2x *bp, u8 fw_sb_id,
 void bnx2x_schedule_sp_rtnl(struct bnx2x *bp, enum sp_rtnl_flag flag,
 			    u32 verbose)
 {
-	smp_mb__before_clear_bit();
+	smp_mb__before_atomic();
 	set_bit(flag, &bp->sp_rtnl_state);
-	smp_mb__after_clear_bit();
+	smp_mb__after_atomic();
 	DP((BNX2X_MSG_SP | verbose), "Scheduling sp_rtnl task [Flag: %d]\n",
 	   flag);
 	schedule_delayed_work(&bp->sp_rtnl_task, 0);

@@ -67,17 +67,53 @@ struct netdev_event_work {
 	struct netdev_event_work_cmd	cmds[ROCE_NETDEV_CALLBACK_SZ];
 };
 
+static const struct {
+	bool (*is_supported)(const struct ib_device *device, u8 port_num);
+	enum ib_gid_type gid_type;
+} PORT_CAP_TO_GID_TYPE[] = {
+	{rdma_protocol_roce_eth_encap, IB_GID_TYPE_ROCE},
+	{rdma_protocol_roce_udp_encap, IB_GID_TYPE_ROCE_UDP_ENCAP},
+};
+
+#define CAP_TO_GID_TABLE_SIZE	ARRAY_SIZE(PORT_CAP_TO_GID_TYPE)
+
+unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port)
+{
+	int i;
+	unsigned int ret_flags = 0;
+
+	if (!rdma_protocol_roce(ib_dev, port))
+		return 1UL << IB_GID_TYPE_IB;
+
+	for (i = 0; i < CAP_TO_GID_TABLE_SIZE; i++)
+		if (PORT_CAP_TO_GID_TYPE[i].is_supported(ib_dev, port))
+			ret_flags |= 1UL << PORT_CAP_TO_GID_TYPE[i].gid_type;
+
+	return ret_flags;
+}
+EXPORT_SYMBOL(roce_gid_type_mask_support);
+
 static void update_gid(enum gid_op_type gid_op, struct ib_device *ib_dev,
 		       u8 port, union ib_gid *gid,
 		       struct ib_gid_attr *gid_attr)
 {
-	switch (gid_op) {
-	case GID_ADD:
-		ib_cache_gid_add(ib_dev, port, gid, gid_attr);
-		break;
-	case GID_DEL:
-		ib_cache_gid_del(ib_dev, port, gid, gid_attr);
-		break;
+	int i;
+	unsigned long gid_type_mask = roce_gid_type_mask_support(ib_dev, port);
+
+	for (i = 0; i < IB_GID_TYPE_SIZE; i++) {
+		if ((1UL << i) & gid_type_mask) {
+			gid_attr->gid_type = i;
+			switch (gid_op) {
+			case GID_ADD:
+				ib_cache_gid_add(ib_dev, port,
+						 gid, gid_attr);
+				break;
+			case GID_DEL:
+				ib_cache_gid_del(ib_dev, port,
+						 gid, gid_attr);
+				break;
+			}
+		}
 	}
 }
 
@@ -191,6 +227,8 @@ static void enum_netdev_default_gids(struct ib_device *ib_dev,
 				     u8 port, struct net_device *event_ndev,
 				     struct net_device *rdma_ndev)
 {
+	unsigned long gid_type_mask;
+
 	rcu_read_lock();
 	if (!rdma_ndev ||
 	    ((rdma_ndev != event_ndev &&
@@ -203,7 +241,9 @@ static void enum_netdev_default_gids(struct ib_device *ib_dev,
 	}
 	rcu_read_unlock();
 
-	ib_cache_gid_set_default_gid(ib_dev, port, rdma_ndev,
+	gid_type_mask = roce_gid_type_mask_support(ib_dev, port);
+
+	ib_cache_gid_set_default_gid(ib_dev, port, rdma_ndev, gid_type_mask,
 				     IB_CACHE_GID_DEFAULT_MODE_SET);
 }
 
@@ -225,9 +265,14 @@ static void bond_delete_netdev_default_gids(struct ib_device *ib_dev,
 	if (rdma_is_upper_dev_rcu(rdma_ndev, event_ndev) &&
 	    is_eth_active_slave_of_bonding_rcu(rdma_ndev, real_dev) ==
 	    BONDING_SLAVE_STATE_INACTIVE) {
+		unsigned long gid_type_mask;
+
 		rcu_read_unlock();
 
+		gid_type_mask = roce_gid_type_mask_support(ib_dev, port);
+
 		ib_cache_gid_set_default_gid(ib_dev, port, rdma_ndev,
+					     gid_type_mask,
 					     IB_CACHE_GID_DEFAULT_MODE_DELETE);
 	} else {
 		rcu_read_unlock();
@@ -536,7 +581,7 @@ static const struct netdev_event_work_cmd add_cmd = {
 static const struct netdev_event_work_cmd add_cmd_upper_ips = {
 	.cb = add_netdev_upper_ips, .filter = is_eth_port_of_netdev};
 
-static void netdevice_event_changeupper(struct netdev_changeupper_info *changeupper_info,
+static void netdevice_event_changeupper(struct netdev_notifier_changeupper_info *changeupper_info,
 					struct netdev_event_work_cmd *cmds)
 {
 	static const struct netdev_event_work_cmd upper_ips_del_cmd = {
@@ -544,18 +589,16 @@ static void netdevice_event_changeupper(struct netdev_changeupper_info *changeup
 	static const struct netdev_event_work_cmd bonding_default_del_cmd = {
 		.cb = del_netdev_default_ips, .filter = is_eth_port_inactive_slave};
 
-	if (changeupper_info->event ==
-	    NETDEV_CHANGEUPPER_UNLINK) {
+	if (changeupper_info->linking == false) {
 		cmds[0] = upper_ips_del_cmd;
-		cmds[0].ndev = changeupper_info->upper;
+		cmds[0].ndev = changeupper_info->upper_dev;
 		cmds[1] = add_cmd;
-	} else if (changeupper_info->event ==
-		   NETDEV_CHANGEUPPER_LINK) {
+	} else {
 		cmds[0] = bonding_default_del_cmd;
-		cmds[0].ndev = changeupper_info->upper;
+		cmds[0].ndev = changeupper_info->upper_dev;
 		cmds[1] = add_cmd_upper_ips;
-		cmds[1].ndev = changeupper_info->upper;
-		cmds[1].filter_ndev = changeupper_info->upper;
+		cmds[1].ndev = changeupper_info->upper_dev;
+		cmds[1].filter_ndev = changeupper_info->upper_dev;
 	}
 }
 
@@ -597,7 +640,7 @@ static int netdevice_event(struct notifier_block *this, unsigned long event,
 
 	case NETDEV_CHANGEUPPER:
 		netdevice_event_changeupper(
-			container_of(ptr, struct netdev_changeupper_info, info),
+			container_of(ptr, struct netdev_notifier_changeupper_info, info),
 			cmds);
 		break;
 
@@ -718,7 +761,7 @@ int __init roce_gid_mgmt_init(void)
 	 * last to make sure we will not miss any IP add/del
 	 * callbacks.
 	 */
-	register_netdevice_notifier(&nb_netdevice);
+	register_netdevice_notifier_rh(&nb_netdevice);
 
 	return 0;
 }
@@ -728,7 +771,7 @@ void __exit roce_gid_mgmt_cleanup(void)
 	if (IS_ENABLED(CONFIG_IPV6))
 		unregister_inet6addr_notifier(&nb_inet6addr);
 	unregister_inetaddr_notifier(&nb_inetaddr);
-	unregister_netdevice_notifier(&nb_netdevice);
+	unregister_netdevice_notifier_rh(&nb_netdevice);
 	/* Ensure all gid deletion tasks complete before we go down,
 	 * to avoid any reference to free'd memory. By the time
 	 * ib-core is removed, all physical devices have been removed,

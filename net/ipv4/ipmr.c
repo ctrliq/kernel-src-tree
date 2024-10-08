@@ -233,7 +233,6 @@ static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
 	.match		= ipmr_rule_match,
 	.configure	= ipmr_rule_configure,
 	.compare	= ipmr_rule_compare,
-	.default_pref	= fib_default_rule_pref,
 	.fill		= ipmr_rule_fill,
 	.nlgroup	= RTNLGRP_IPV4_RULE,
 	.policy		= ipmr_rule_policy,
@@ -1622,7 +1621,7 @@ int ipmr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 
 static int ipmr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
 	struct mr_table *mrt;
 	struct vif_device *v;
@@ -1652,7 +1651,8 @@ static struct notifier_block ip_mr_notifier = {
  *	important for multicast video.
  */
 
-static void ip_encap(struct sk_buff *skb, __be32 saddr, __be32 daddr)
+static void ip_encap(struct net *net, struct sk_buff *skb,
+		     __be32 saddr, __be32 daddr)
 {
 	struct iphdr *iph;
 	const struct iphdr *old_iph = ip_hdr(skb);
@@ -1671,7 +1671,7 @@ static void ip_encap(struct sk_buff *skb, __be32 saddr, __be32 daddr)
 	iph->protocol	=	IPPROTO_IPIP;
 	iph->ihl	=	5;
 	iph->tot_len	=	htons(skb->len);
-	ip_select_ident(skb, skb_dst(skb), NULL);
+	ip_select_ident(net, skb, NULL);
 	ip_send_check(iph);
 
 	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
@@ -1768,7 +1768,7 @@ static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
 	 * What do we do with netfilter? -- RR
 	 */
 	if (vif->flags & VIFF_TUNNEL) {
-		ip_encap(skb, vif->local, vif->remote);
+		ip_encap(net, skb, vif->local, vif->remote);
 		/* FIXME: extra output firewall step used to be here. --RR */
 		vif->dev->stats.tx_packets++;
 		vif->dev->stats.tx_bytes += skb->len;
@@ -2299,7 +2299,8 @@ static int ipmr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
 	if (err < 0 && err != -ENOENT)
 		goto nla_put_failure;
 
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 nla_put_failure:
 	nlmsg_cancel(skb, nlh);
@@ -2762,7 +2763,7 @@ int __init ip_mr_init(void)
 	if (err)
 		goto reg_pernet_fail;
 
-	err = register_netdevice_notifier(&ip_mr_notifier);
+	err = register_netdevice_notifier_rh(&ip_mr_notifier);
 	if (err)
 		goto reg_notif_fail;
 #ifdef CONFIG_IP_PIMSM_V2
@@ -2778,7 +2779,7 @@ int __init ip_mr_init(void)
 
 #ifdef CONFIG_IP_PIMSM_V2
 add_proto_fail:
-	unregister_netdevice_notifier(&ip_mr_notifier);
+	unregister_netdevice_notifier_rh(&ip_mr_notifier);
 #endif
 reg_notif_fail:
 	unregister_pernet_subsys(&ipmr_net_ops);

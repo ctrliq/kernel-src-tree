@@ -762,7 +762,7 @@ int efx_ef10_sriov_get_vf_config(struct efx_nic *efx, int vf_i,
 }
 
 int efx_ef10_sriov_get_phys_port_id(struct efx_nic *efx,
-				    struct netdev_phys_port_id *ppid)
+				    struct netdev_phys_item_id *ppid)
 {
 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
 

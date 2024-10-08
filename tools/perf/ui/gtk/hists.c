@@ -55,7 +55,7 @@ static u64 he_get_acc_##_field(struct hist_entry *he)				\
 	return he->stat_acc->_field;						\
 }										\
 										\
-static int perf_gtk__hpp_color_##_type(struct perf_hpp_fmt *fmt __maybe_unused,	\
+static int perf_gtk__hpp_color_##_type(struct perf_hpp_fmt *fmt,		\
 				       struct perf_hpp *hpp,			\
 				       struct hist_entry *he)			\
 {										\
@@ -306,7 +306,7 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 
 	nr_cols = 0;
 
-	perf_hpp__for_each_format(fmt)
+	hists__for_each_format(hists, fmt)
 		col_types[nr_cols++] = G_TYPE_STRING;
 
 	store = gtk_tree_store_newv(nr_cols, col_types);
@@ -317,8 +317,8 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 
 	col_idx = 0;
 
-	perf_hpp__for_each_format(fmt) {
-		if (perf_hpp__should_skip(fmt))
+	hists__for_each_format(hists, fmt) {
+		if (perf_hpp__should_skip(fmt, hists))
 			continue;
 
 		/*
@@ -367,8 +367,8 @@ static void perf_gtk__show_hists(GtkWidget *window, struct hists *hists,
 
 		col_idx = 0;
 
-		perf_hpp__for_each_format(fmt) {
-			if (perf_hpp__should_skip(fmt))
+		hists__for_each_format(hists, fmt) {
+			if (perf_hpp__should_skip(fmt, h->hists))
 				continue;
 
 			if (fmt->color)
@@ -407,11 +407,14 @@ static void perf_gtk__add_hierarchy_entries(struct hists *hists,
 	struct rb_node *node;
 	struct hist_entry *he;
 	struct perf_hpp_fmt *fmt;
+	struct perf_hpp_list_node *fmt_node;
 	u64 total = hists__total_period(hists);
+	int size;
 
 	for (node = rb_first(root); node; node = rb_next(node)) {
 		GtkTreeIter iter;
 		float percent;
+		char *bf;
 
 		he = rb_entry(node, struct hist_entry, rb_node);
 		if (he->filtered)
@@ -424,11 +427,11 @@ static void perf_gtk__add_hierarchy_entries(struct hists *hists,
 		gtk_tree_store_append(store, &iter, parent);
 
 		col_idx = 0;
-		hists__for_each_format(hists, fmt) {
-			if (perf_hpp__is_sort_entry(fmt) ||
-			    perf_hpp__is_dynamic_entry(fmt))
-				break;
 
+		/* the first hpp_list_node is for overhead columns */
+		fmt_node = list_first_entry(&hists->hpp_formats,
+					    struct perf_hpp_list_node, list);
+		perf_hpp_list__for_each_format(&fmt_node->hpp, fmt) {
 			if (fmt->color)
 				fmt->color(fmt, hpp, he);
 			else
@@ -437,15 +440,26 @@ static void perf_gtk__add_hierarchy_entries(struct hists *hists,
 			gtk_tree_store_set(store, &iter, col_idx++, hpp->buf, -1);
 		}
 
-		fmt = he->fmt;
-		if (fmt->color)
-			fmt->color(fmt, hpp, he);
-		else
-			fmt->entry(fmt, hpp, he);
+		bf = hpp->buf;
+		size = hpp->size;
+		perf_hpp_list__for_each_format(he->hpp_list, fmt) {
+			int ret;
 
-		gtk_tree_store_set(store, &iter, col_idx, rtrim(hpp->buf), -1);
+			if (fmt->color)
+				ret = fmt->color(fmt, hpp, he);
+			else
+				ret = fmt->entry(fmt, hpp, he);
+
+			snprintf(hpp->buf + ret, hpp->size - ret, "  ");
+			advance_hpp(hpp, ret + 2);
+		}
+
+		gtk_tree_store_set(store, &iter, col_idx, ltrim(rtrim(bf)), -1);
 
 		if (!he->leaf) {
+			hpp->buf = bf;
+			hpp->size = size;
+
 			perf_gtk__add_hierarchy_entries(hists, &he->hroot_out,
 							store, &iter, hpp,
 							min_pcnt);
@@ -478,6 +492,7 @@ static void perf_gtk__show_hierarchy(GtkWidget *window, struct hists *hists,
 				     float min_pcnt)
 {
 	struct perf_hpp_fmt *fmt;
+	struct perf_hpp_list_node *fmt_node;
 	GType col_types[MAX_COLUMNS];
 	GtkCellRenderer *renderer;
 	GtkTreeStore *store;
@@ -486,7 +501,7 @@ static void perf_gtk__show_hierarchy(GtkWidget *window, struct hists *hists,
 	int nr_cols = 0;
 	char s[512];
 	char buf[512];
-	bool first = true;
+	bool first_node, first_col;
 	struct perf_hpp hpp = {
 		.buf		= s,
 		.size		= sizeof(s),
@@ -506,11 +521,11 @@ static void perf_gtk__show_hierarchy(GtkWidget *window, struct hists *hists,
 	renderer = gtk_cell_renderer_text_new();
 
 	col_idx = 0;
-	hists__for_each_format(hists, fmt) {
-		if (perf_hpp__is_sort_entry(fmt) ||
-		    perf_hpp__is_dynamic_entry(fmt))
-			break;
 
+	/* the first hpp_list_node is for overhead columns */
+	fmt_node = list_first_entry(&hists->hpp_formats,
+				    struct perf_hpp_list_node, list);
+	perf_hpp_list__for_each_format(&fmt_node->hpp, fmt) {
 		gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(view),
 							    -1, fmt->name,
 							    renderer, "markup",
@@ -519,20 +534,24 @@ static void perf_gtk__show_hierarchy(GtkWidget *window, struct hists *hists,
 
 	/* construct merged column header since sort keys share single column */
 	buf[0] = '\0';
-	hists__for_each_format(hists ,fmt) {
-		if (!perf_hpp__is_sort_entry(fmt) &&
-		    !perf_hpp__is_dynamic_entry(fmt))
-			continue;
-		if (perf_hpp__should_skip(fmt, hists))
-			continue;
-
-		if (first)
-			first = false;
-		else
+	first_node = true;
+	list_for_each_entry_continue(fmt_node, &hists->hpp_formats, list) {
+		if (!first_node)
 			strcat(buf, " / ");
+		first_node = false;
 
-		fmt->header(fmt, &hpp, hists_to_evsel(hists));
-		strcat(buf, rtrim(hpp.buf));
+		first_col = true;
+		perf_hpp_list__for_each_format(&fmt_node->hpp ,fmt) {
+			if (perf_hpp__should_skip(fmt, hists))
+				continue;
+
+			if (!first_col)
+				strcat(buf, "+");
+			first_col = false;
+
+			fmt->header(fmt, &hpp, hists_to_evsel(hists));
+			strcat(buf, ltrim(rtrim(hpp.buf)));
+		}
 	}
 
 	gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(view),

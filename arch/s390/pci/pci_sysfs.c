@@ -54,16 +54,19 @@ static void recover_callback(struct device *dev)
 	struct zpci_dev *zdev = get_zdev(pdev);
 	int ret;
 
+	pci_lock_rescan_remove();
 	pci_stop_and_remove_bus_device(pdev);
 	ret = zpci_disable_device(zdev);
 	if (ret)
-		return;
+		goto error;
 
 	ret = zpci_enable_device(zdev);
 	if (ret)
-		return;
+		goto error;
 
 	pci_rescan_bus(zdev->bus);
+error:
+	pci_unlock_rescan_remove();
 }
 
 static ssize_t store_recover(struct device *dev, struct device_attribute *attr,

@@ -31,6 +31,35 @@ struct perf_sample_id {
 
 struct cgroup_sel;
 
+/*
+ * The 'struct perf_evsel_config_term' is used to pass event
+ * specific configuration data to perf_evsel__config routine.
+ * It is allocated within event parsing and attached to
+ * perf_evsel::config_terms list head.
+*/
+enum {
+	PERF_EVSEL__CONFIG_TERM_PERIOD,
+	PERF_EVSEL__CONFIG_TERM_FREQ,
+	PERF_EVSEL__CONFIG_TERM_TIME,
+	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
+	PERF_EVSEL__CONFIG_TERM_STACK_USER,
+	PERF_EVSEL__CONFIG_TERM_INHERIT,
+	PERF_EVSEL__CONFIG_TERM_MAX,
+};
+
+struct perf_evsel_config_term {
+	struct list_head	list;
+	int	type;
+	union {
+		u64	period;
+		u64	freq;
+		bool	time;
+		char	*callgraph;
+		u64	stack_user;
+		bool	inherit;
+	} val;
+};
+
 /** struct perf_evsel - event selector
  *
  * @evlist - evlist this evsel is in, if it is in one.
@@ -82,6 +111,7 @@ struct perf_evsel {
 	bool			system_wide;
 	bool			tracking;
 	bool			per_pkg;
+	bool			precise_max;
 	/* parse modifier helper */
 	int			exclude_GH;
 	int			nr_members;
@@ -90,6 +120,7 @@ struct perf_evsel {
 	struct perf_evsel	*leader;
 	char			*group_name;
 	bool			cmdline_group_boundary;
+	struct list_head	config_terms;
 };
 
 union u64_swap {

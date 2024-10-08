@@ -171,6 +171,7 @@ struct kvm_pit_config {
 #define KVM_EXIT_WATCHDOG         21
 #define KVM_EXIT_S390_TSCH        22
 #define KVM_EXIT_EPR              23
+#define KVM_EXIT_IOAPIC_EOI       26
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -301,6 +302,10 @@ struct kvm_run {
 		struct {
 			__u32 epr;
 		} epr;
+		/* KVM_EXIT_IOAPIC_EOI */
+		struct {
+			__u8 vector;
+		} eoi;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -682,6 +687,11 @@ struct kvm_ppc_smmu_info {
 #define KVM_CAP_DISABLE_QUIRKS 116
 #define KVM_CAP_X86_SMM 117
 #define KVM_CAP_MULTI_ADDRESS_SPACE 118
+#define KVM_CAP_GUEST_DEBUG_HW_BPS 119
+#define KVM_CAP_GUEST_DEBUG_HW_WPS 120
+#define KVM_CAP_SPLIT_IRQCHIP 121
+#define KVM_CAP_IOEVENTFD_ANY_LENGTH 122
+#define KVM_CAP_X2APIC_API 129
 
 #ifdef KVM_CAP_IRQ_ROUTING
 
@@ -1105,5 +1115,8 @@ struct kvm_assigned_msix_entry {
 	__u16 entry; /* The index of entry in the MSI-X table */
 	__u16 padding[3];
 };
+
+#define KVM_X2APIC_API_USE_32BIT_IDS            (1ULL << 0)
+#define KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK  (1ULL << 1)
 
 #endif /* __LINUX_KVM_H */

@@ -569,27 +569,13 @@ void gfs2_free_clones(struct gfs2_rgrpd *rgd)
 }
 
 /**
- * gfs2_rs_alloc - make sure we have a reservation assigned to the inode
+ * gfs2_rsqa_alloc - make sure we have a reservation assigned to the inode
+ *                 plus a quota allocations data structure, if necessary
  * @ip: the inode for this reservation
  */
-int gfs2_rs_alloc(struct gfs2_inode *ip)
+int gfs2_rsqa_alloc(struct gfs2_inode *ip)
 {
-	int error = 0;
-
-	down_write(&ip->i_rw_mutex);
-	if (ip->i_res)
-		goto out;
-
-	ip->i_res = kmem_cache_zalloc(gfs2_rsrv_cachep, GFP_NOFS);
-	if (!ip->i_res) {
-		error = -ENOMEM;
-		goto out;
-	}
-
-	RB_CLEAR_NODE(&ip->i_res->rs_node);
-out:
-	up_write(&ip->i_rw_mutex);
-	return error;
+	return gfs2_qa_alloc(ip);
 }
 
 static void dump_rs(struct seq_file *seq, const struct gfs2_blkreserv *rs)
@@ -645,27 +631,24 @@ void gfs2_rs_deltree(struct gfs2_blkreserv *rs)
 	if (rgd) {
 		spin_lock(&rgd->rd_rsspin);
 		__rs_deltree(rs);
+		BUG_ON(rs->rs_free);
 		spin_unlock(&rgd->rd_rsspin);
 	}
 }
 
 /**
- * gfs2_rs_delete - delete a multi-block reservation
+ * gfs2_rsqa_delete - delete a multi-block reservation and quota allocation
  * @ip: The inode for this reservation
+ * @wcount: The inode's write count, or NULL
  *
  */
-void gfs2_rs_delete(struct gfs2_inode *ip)
+void gfs2_rsqa_delete(struct gfs2_inode *ip, atomic_t *wcount)
 {
-	struct inode *inode = &ip->i_inode;
-
 	down_write(&ip->i_rw_mutex);
-	if (ip->i_res && atomic_read(&inode->i_writecount) <= 1) {
-		gfs2_rs_deltree(ip->i_res);
-		BUG_ON(ip->i_res->rs_free);
-		kmem_cache_free(gfs2_rsrv_cachep, ip->i_res);
-		ip->i_res = NULL;
-	}
+	if ((wcount == NULL) || (atomic_read(wcount) <= 1))
+		gfs2_rs_deltree(&ip->i_res);
 	up_write(&ip->i_rw_mutex);
+	gfs2_qa_delete(ip, wcount);
 }
 
 /**
@@ -711,6 +694,7 @@ void gfs2_clear_rgrpd(struct gfs2_sbd *sdp)
 
 		gfs2_free_clones(rgd);
 		kfree(rgd->rd_bits);
+		rgd->rd_bits = NULL;
 		return_all_reservations(rgd);
 		kmem_cache_free(gfs2_rgrpd_cachep, rgd);
 	}
@@ -900,7 +884,6 @@ static int read_rindex_entry(struct gfs2_inode *ip)
 	if (error)
 		goto fail;
 
-	rgd->rd_gl->gl_object = rgd;
 	rgd->rd_rgl = (struct gfs2_rgrp_lvb *)rgd->rd_gl->gl_lksb.sb_lvbptr;
 	rgd->rd_flags &= ~(GFS2_RDF_UPTODATE | GFS2_RDF_PREFERRED);
 	if (rgd->rd_data > sdp->sd_max_rg_data)
@@ -908,14 +891,17 @@ static int read_rindex_entry(struct gfs2_inode *ip)
 	spin_lock(&sdp->sd_rindex_spin);
 	error = rgd_insert(rgd);
 	spin_unlock(&sdp->sd_rindex_spin);
-	if (!error)
+	if (!error) {
+		rgd->rd_gl->gl_object = rgd;
 		return 0;
+	}
 
 	error = 0; /* someone else read in the rgrp; free it and ignore it */
 	gfs2_glock_put(rgd->rd_gl);
 
 fail:
 	kfree(rgd->rd_bits);
+	rgd->rd_bits = NULL;
 	kmem_cache_free(gfs2_rgrpd_cachep, rgd);
 	return error;
 }
@@ -1123,7 +1109,7 @@ int gfs2_rgrp_bh_get(struct gfs2_rgrpd *rgd)
 
 	for (x = 0; x < length; x++) {
 		bi = rgd->rd_bits + x;
-		error = gfs2_meta_read(gl, rgd->rd_addr + x, 0, &bi->bi_bh);
+		error = gfs2_meta_read(gl, rgd->rd_addr + x, 0, 0, &bi->bi_bh);
 		if (error)
 			goto fail;
 	}
@@ -1419,7 +1405,7 @@ static void rs_insert(struct gfs2_inode *ip)
 {
 	struct rb_node **newn, *parent = NULL;
 	int rc;
-	struct gfs2_blkreserv *rs = ip->i_res;
+	struct gfs2_blkreserv *rs = &ip->i_res;
 	struct gfs2_rgrpd *rgd = rs->rs_rbm.rgd;
 	u64 fsblock = gfs2_rbm_to_block(&rs->rs_rbm);
 
@@ -1466,7 +1452,7 @@ static void rg_mblk_search(struct gfs2_rgrpd *rgd, struct gfs2_inode *ip,
 {
 	struct gfs2_rbm rbm = { .rgd = rgd, };
 	u64 goal;
-	struct gfs2_blkreserv *rs = ip->i_res;
+	struct gfs2_blkreserv *rs = &ip->i_res;
 	u32 extlen;
 	u32 free_blocks = rgd->rd_free_clone - rgd->rd_reserved;
 	int ret;
@@ -1537,7 +1523,7 @@ static u64 gfs2_next_unreserved_block(struct gfs2_rgrpd *rgd, u64 block,
 	}
 
 	if (n) {
-		while ((rs_cmp(block, length, rs) == 0) && (ip->i_res != rs)) {
+		while ((rs_cmp(block, length, rs) == 0) && (&ip->i_res != rs)) {
 			block = gfs2_rbm_to_block(&rs->rs_rbm) + rs->rs_free;
 			n = n->rb_right;
 			if (n == NULL)
@@ -1825,7 +1811,7 @@ static void try_rgrp_unlink(struct gfs2_rgrpd *rgd, u64 *last_unlinked, u64 skip
 static bool gfs2_rgrp_congested(const struct gfs2_rgrpd *rgd, int loops)
 {
 	const struct gfs2_glock *gl = rgd->rd_gl;
-	const struct gfs2_sbd *sdp = gl->gl_sbd;
+	const struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
 	struct gfs2_lkstats *st;
 	s64 r_dcount, l_dcount;
 	s64 l_srttb, a_srttb = 0;
@@ -1948,7 +1934,7 @@ int gfs2_inplace_reserve(struct gfs2_inode *ip, struct gfs2_alloc_parms *ap)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
 	struct gfs2_rgrpd *begin = NULL;
-	struct gfs2_blkreserv *rs = ip->i_res;
+	struct gfs2_blkreserv *rs = &ip->i_res;
 	int error = 0, rg_locked, flags = 0;
 	u64 last_unlinked = NO_BLOCK;
 	int loops = 0;
@@ -2079,9 +2065,9 @@ next_rgrp:
 
 void gfs2_inplace_release(struct gfs2_inode *ip)
 {
-	struct gfs2_blkreserv *rs = ip->i_res;
+	struct gfs2_blkreserv *rs = &ip->i_res;
 
-	if (rs->rs_rgd_gh.gh_gl)
+	if (gfs2_holder_initialized(&rs->rs_rgd_gh))
 		gfs2_glock_dq_uninit(&rs->rs_rgd_gh);
 }
 
@@ -2229,7 +2215,7 @@ static void gfs2_rgrp_error(struct gfs2_rgrpd *rgd)
 static void gfs2_adjust_reservation(struct gfs2_inode *ip,
 				    const struct gfs2_rbm *rbm, unsigned len)
 {
-	struct gfs2_blkreserv *rs = ip->i_res;
+	struct gfs2_blkreserv *rs = &ip->i_res;
 	struct gfs2_rgrpd *rgd = rbm->rgd;
 	unsigned rlen;
 	u64 block;
@@ -2278,8 +2264,8 @@ int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
 	u64 block; /* block, within the file system scope */
 	int error;
 
-	if (gfs2_rs_active(ip->i_res))
-		goal = gfs2_rbm_to_block(&ip->i_res->rs_rbm);
+	if (gfs2_rs_active(&ip->i_res))
+		goal = gfs2_rbm_to_block(&ip->i_res.rs_rbm);
 	else if (!dinode && rgrp_contains_block(rbm.rgd, ip->i_goal))
 		goal = ip->i_goal;
 	else
@@ -2306,7 +2292,7 @@ int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
 	gfs2_alloc_extent(&rbm, dinode, nblocks);
 	block = gfs2_rbm_to_block(&rbm);
 	rbm.rgd->rd_last_alloc = block - rbm.rgd->rd_data0;
-	if (gfs2_rs_active(ip->i_res))
+	if (gfs2_rs_active(&ip->i_res))
 		gfs2_adjust_reservation(ip, &rbm, *nblocks);
 	ndata = *nblocks;
 	if (dinode)
@@ -2557,7 +2543,7 @@ void gfs2_rlist_alloc(struct gfs2_rgrp_list *rlist, unsigned int state)
 {
 	unsigned int x;
 
-	rlist->rl_ghs = kcalloc(rlist->rl_rgrps, sizeof(struct gfs2_holder),
+	rlist->rl_ghs = kmalloc(rlist->rl_rgrps * sizeof(struct gfs2_holder),
 				GFP_NOFS | __GFP_NOFAIL);
 	for (x = 0; x < rlist->rl_rgrps; x++)
 		gfs2_holder_init(rlist->rl_rgd[x]->rd_gl,

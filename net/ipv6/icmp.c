@@ -197,7 +197,7 @@ static inline bool icmpv6_xrlim_allow(struct sock *sk, u8 type,
 		if (rt->rt6i_dst.plen < 128)
 			tmo >>= ((128 - rt->rt6i_dst.plen)>>5);
 
-		peer = inet_getpeer_v6(net->ipv6.peers, &rt->rt6i_dst.addr, 1);
+		peer = inet_getpeer_v6(net->ipv6.peers, &fl6->daddr, 1);
 		res = inet_peer_xrlim_allow(peer, tmo);
 		if (peer)
 			inet_putpeer(peer);
@@ -307,14 +307,16 @@ static void mip6_addr_swap(struct sk_buff *skb)
 static inline void mip6_addr_swap(struct sk_buff *skb) {}
 #endif
 
-static struct dst_entry *icmpv6_route_lookup(struct net *net, struct sk_buff *skb,
-					     struct sock *sk, struct flowi6 *fl6)
+static struct dst_entry *icmpv6_route_lookup(struct net *net,
+					     struct sk_buff *skb,
+					     struct sock *sk,
+					     struct flowi6 *fl6)
 {
 	struct dst_entry *dst, *dst2;
 	struct flowi6 fl2;
 	int err;
 
-	err = ip6_dst_lookup(sk, &dst, fl6);
+	err = ip6_dst_lookup(net, sk, &dst, fl6);
 	if (err)
 		return ERR_PTR(err);
 
@@ -322,7 +324,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net, struct sk_buff *sk
 	 * We won't send icmp if the destination is known
 	 * anycast.
 	 */
-	if (((struct rt6_info *)dst)->rt6i_flags & RTF_ANYCAST) {
+	if (ipv6_anycast_destination(dst, &fl6->daddr)) {
 		LIMIT_NETDEBUG(KERN_DEBUG "icmp6_send: acast source\n");
 		dst_release(dst);
 		return ERR_PTR(-EINVAL);
@@ -346,7 +348,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net, struct sk_buff *sk
 	if (err)
 		goto relookup_failed;
 
-	err = ip6_dst_lookup(sk, &dst2, &fl2);
+	err = ip6_dst_lookup(net, sk, &dst2, &fl2);
 	if (err)
 		goto relookup_failed;
 
@@ -546,7 +548,9 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 
 	saddr = &ipv6_hdr(skb)->daddr;
 
-	if (!ipv6_unicast_destination(skb))
+	if (!ipv6_unicast_destination(skb) &&
+	    !(net->ipv6_anycast_src_echo_reply &&
+	      ipv6_anycast_destination(skb_dst(skb), saddr)))
 		saddr = NULL;
 
 	memcpy(&tmp_hdr, icmph, sizeof(tmp_hdr));
@@ -571,7 +575,7 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 	else if (!fl6.flowi6_oif)
 		fl6.flowi6_oif = np->ucast_oif;
 
-	err = ip6_dst_lookup(sk, &dst, &fl6);
+	err = ip6_dst_lookup(net, sk, &dst, &fl6);
 	if (err)
 		goto out;
 	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
@@ -803,11 +807,6 @@ void icmpv6_flow_init(struct sock *sk, struct flowi6 *fl6,
 	security_sk_classify_flow(sk, flowi6_to_flowi(fl6));
 }
 
-/*
- * Special lock-class for __icmpv6_sk:
- */
-static struct lock_class_key icmpv6_socket_sk_dst_lock_key;
-
 static int __net_init icmpv6_sk_init(struct net *net)
 {
 	struct sock *sk;
@@ -828,15 +827,6 @@ static int __net_init icmpv6_sk_init(struct net *net)
 		}
 
 		net->ipv6.icmp_sk[i] = sk;
-
-		/*
-		 * Split off their lock-class, because sk->sk_dst_lock
-		 * gets used from softirqs, which is safe for
-		 * __icmpv6_sk (because those never get directly used
-		 * via userspace syscalls), but unsafe for normal sockets.
-		 */
-		lockdep_set_class(&sk->sk_dst_lock,
-				  &icmpv6_socket_sk_dst_lock_key);
 
 		/* Enough space for 2 64K ICMP packets, including
 		 * sk_buff struct overhead.
@@ -968,7 +958,7 @@ int icmpv6_err_convert(u8 type, u8 code, int *err)
 EXPORT_SYMBOL(icmpv6_err_convert);
 
 #ifdef CONFIG_SYSCTL
-struct ctl_table ipv6_icmp_table_template[] = {
+static struct ctl_table ipv6_icmp_table_template[] = {
 	{
 		.procname	= "ratelimit",
 		.data		= &init_net.ipv6.sysctl.icmpv6_time,

@@ -82,8 +82,12 @@ static int test__checkevent_symbolic_name_config(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong type", PERF_TYPE_HARDWARE == evsel->attr.type);
 	TEST_ASSERT_VAL("wrong config",
 			PERF_COUNT_HW_CPU_CYCLES == evsel->attr.config);
+	/*
+	 * The period value gets configured within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
 	TEST_ASSERT_VAL("wrong period",
-			100000 == evsel->attr.sample_period);
+			0 == evsel->attr.sample_period);
 	TEST_ASSERT_VAL("wrong config1",
 			0 == evsel->attr.config1);
 	TEST_ASSERT_VAL("wrong config2",
@@ -406,7 +410,11 @@ static int test__checkevent_pmu(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong config",    10 == evsel->attr.config);
 	TEST_ASSERT_VAL("wrong config1",    1 == evsel->attr.config1);
 	TEST_ASSERT_VAL("wrong config2",    3 == evsel->attr.config2);
-	TEST_ASSERT_VAL("wrong period",  1000 == evsel->attr.sample_period);
+	/*
+	 * The period value gets configured within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
+	TEST_ASSERT_VAL("wrong period",     0 == evsel->attr.sample_period);
 
 	return 0;
 }
@@ -1263,6 +1271,38 @@ static int test__checkevent_precise_max_modifier(struct perf_evlist *evlist)
 	return 0;
 }
 
+static int test__checkevent_config_symbol(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "insn") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_raw(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "rawpmu") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_num(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "numpmu") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_cache(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "cachepmu") == 0);
+	return 0;
+}
+
 static int count_tracepoints(void)
 {
 	struct dirent *events_ent;
@@ -1571,6 +1611,26 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_precise_max_modifier,
 		.id    = 47,
 	},
+	{
+		.name  = "instructions/name=insn/",
+		.check = test__checkevent_config_symbol,
+		.id    = 48,
+	},
+	{
+		.name  = "r1234/name=rawpmu/",
+		.check = test__checkevent_config_raw,
+		.id    = 49,
+	},
+	{
+		.name  = "4:0x6530160/name=numpmu/",
+		.check = test__checkevent_config_num,
+		.id    = 50,
+	},
+	{
+		.name  = "L1-dcache-misses/name=cachepmu/",
+		.check = test__checkevent_config_cache,
+		.id    = 51,
+	},
 };
 
 static struct evlist_test test__events_pmu[] = {
@@ -1757,7 +1817,7 @@ static void debug_warn(const char *warn, va_list params)
 	fprintf(stderr, " Warning: %s\n", msg);
 }
 
-int test__parse_events(void)
+int test__parse_events(int subtest __maybe_unused)
 {
 	int ret1, ret2 = 0;
 

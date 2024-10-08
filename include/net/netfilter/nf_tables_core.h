@@ -31,6 +31,9 @@ void nft_cmp_module_exit(void);
 int nft_lookup_module_init(void);
 void nft_lookup_module_exit(void);
 
+int nft_dynset_module_init(void);
+void nft_dynset_module_exit(void);
+
 int nft_bitwise_module_init(void);
 void nft_bitwise_module_exit(void);
 
@@ -54,6 +57,7 @@ struct nft_payload_set {
 };
 
 extern const struct nft_expr_ops nft_payload_fast_ops;
+extern struct static_key nft_trace_enabled;
 
 int nft_payload_module_init(void);
 void nft_payload_module_exit(void);

@@ -6,7 +6,9 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/pci.h>
+#ifndef __GENKSYMS__
 #include <linux/pci_hotplug.h>
+#endif
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/cpumask.h>
@@ -88,8 +90,7 @@ static void release_pcibus_dev(struct device *dev)
 {
 	struct pci_bus *pci_bus = to_pci_bus(dev);
 
-	if (pci_bus->bridge)
-		put_device(pci_bus->bridge);
+	put_device(pci_bus->bridge);
 	pci_bus_remove_resources(pci_bus);
 	pci_release_bus_of_node(pci_bus);
 	kfree(pci_bus->pci_bus_rh);
@@ -569,6 +570,7 @@ static struct pci_host_bridge *pci_alloc_host_bridge(struct pci_bus *b)
 	bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
 	if (!bridge)
 		return NULL;
+	device_rh_alloc(&bridge->dev);
 
 	INIT_LIST_HEAD(&bridge->windows);
 	bridge->bus = b;
@@ -1020,6 +1022,8 @@ void set_pcie_port_type(struct pci_dev *pdev)
 {
 	int pos;
 	u16 reg16;
+	int type;
+	struct pci_dev *parent;
 
 	pos = pci_find_capability(pdev, PCI_CAP_ID_EXP);
 	if (!pos)
@@ -1029,6 +1033,27 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pdev->pcie_flags_reg = reg16;
 	pci_read_config_word(pdev, pos + PCI_EXP_DEVCAP, &reg16);
 	pdev->pcie_mpss = reg16 & PCI_EXP_DEVCAP_PAYLOAD;
+
+	/*
+	 * A Root Port is always the upstream end of a Link.  No PCIe
+	 * component has two Links.  Two Links are connected by a Switch
+	 * that has a Port on each Link and internal logic to connect the
+	 * two Ports.
+	 */
+	type = pci_pcie_type(pdev);
+	if (type == PCI_EXP_TYPE_ROOT_PORT)
+		pdev->has_secondary_link = 1;
+	else if (type == PCI_EXP_TYPE_UPSTREAM ||
+		 type == PCI_EXP_TYPE_DOWNSTREAM) {
+		parent = pci_upstream_bridge(pdev);
+
+		/*
+		 * Usually there's an upstream device (Root Port or Switch
+		 * Downstream Port), but we can't assume one exists.
+		 */
+		if (parent && !parent->has_secondary_link)
+			pdev->has_secondary_link = 1;
+	}
 }
 
 void set_pcie_hotplug_bridge(struct pci_dev *pdev)
@@ -1161,6 +1186,7 @@ static void pci_msi_setup_pci_dev(struct pci_dev *dev)
 int pci_setup_device(struct pci_dev *dev)
 {
 	u32 class;
+	u16 cmd;
 	u8 hdr_type;
 	struct pci_slot *slot;
 	int pos = 0;
@@ -1207,6 +1233,16 @@ int pci_setup_device(struct pci_dev *dev)
 	pci_fixup_device(pci_fixup_early, dev);
 	/* device class may be changed after fixup */
 	class = dev->class >> 8;
+
+	if (dev->non_compliant_bars) {
+		pci_read_config_word(dev, PCI_COMMAND, &cmd);
+		if (cmd & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY)) {
+			dev_info(&dev->dev, "device has non-compliant BARs; disabling IO/MEM decoding\n");
+			cmd &= ~PCI_COMMAND_IO;
+			cmd &= ~PCI_COMMAND_MEMORY;
+			pci_write_config_word(dev, PCI_COMMAND, cmd);
+		}
+	}
 
 	switch (dev->hdr_type) {		    /* header type */
 	case PCI_HEADER_TYPE_NORMAL:		    /* standard header */
@@ -1497,6 +1533,7 @@ static void pci_release_dev(struct device *dev)
 	pcibios_release_device(pci_dev);
 	pci_bus_put(pci_dev->bus);
 	kfree(pci_dev->pci_dev_rh->driver_override);
+	kfree(pci_dev->pci_dev_rh->dma_alias_mask);
 	kfree(pci_dev->pci_dev_rh);
 	kfree(pci_dev);
 }
@@ -1998,7 +2035,7 @@ struct pci_bus *pci_create_root_bus(struct device *parent, int bus,
 	int error;
 	struct pci_host_bridge *bridge;
 	struct pci_bus *b, *b2;
-	struct pci_host_bridge_window *window, *n;
+	struct resource_entry *window, *n;
 	struct resource *res;
 	resource_size_t offset;
 	char bus_addr[64];
@@ -2062,8 +2099,8 @@ struct pci_bus *pci_create_root_bus(struct device *parent, int bus,
 		printk(KERN_INFO "PCI host bridge to bus %s\n", dev_name(&b->dev));
 
 	/* Add initial resources to the bus */
-	list_for_each_entry_safe(window, n, resources, list) {
-		list_move_tail(&window->list, &bridge->windows);
+	resource_list_for_each_entry_safe(window, n, resources) {
+		list_move_tail(&window->node, &bridge->windows);
 		res = window->res;
 		offset = window->offset;
 		if (res->flags & IORESOURCE_BUS)
@@ -2164,12 +2201,12 @@ void pci_bus_release_busn_res(struct pci_bus *b)
 struct pci_bus *pci_scan_root_bus(struct device *parent, int bus,
 		struct pci_ops *ops, void *sysdata, struct list_head *resources)
 {
-	struct pci_host_bridge_window *window;
+	struct resource_entry *window;
 	bool found = false;
 	struct pci_bus *b;
 	int max;
 
-	list_for_each_entry(window, resources, list)
+	resource_list_for_each_entry(window, resources)
 		if (window->res->flags & IORESOURCE_BUS) {
 			found = true;
 			break;
@@ -2191,7 +2228,6 @@ struct pci_bus *pci_scan_root_bus(struct device *parent, int bus,
 	if (!found)
 		pci_bus_update_busn_res_end(b, max);
 
-	pci_bus_add_devices(b);
 	return b;
 }
 EXPORT_SYMBOL(pci_scan_root_bus);
@@ -2208,7 +2244,6 @@ struct pci_bus *pci_scan_bus(int bus, struct pci_ops *ops,
 	b = pci_create_root_bus(NULL, bus, ops, sysdata, &resources);
 	if (b) {
 		pci_scan_child_bus(b);
-		pci_bus_add_devices(b);
 	} else {
 		pci_free_resource_list(&resources);
 	}

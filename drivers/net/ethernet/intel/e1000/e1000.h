@@ -36,7 +36,6 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <asm/byteorder.h>
-#include <linux/init.h>
 #include <linux/mm.h>
 #include <linux/errno.h>
 #include <linux/ioport.h>
@@ -161,9 +160,11 @@ struct e1000_tx_buffer {
 };
 
 struct e1000_rx_buffer {
-	struct sk_buff *skb;
+	union {
+		struct page *page; /* jumbo: alloc_page */
+		u8 *data; /* else, netdev_alloc_frag */
+	} rxbuf;
 	dma_addr_t dma;
-	struct page *page;
 };
 
 struct e1000_tx_ring {

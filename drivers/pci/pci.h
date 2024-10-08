@@ -87,18 +87,19 @@ static inline bool pci_has_subordinate(struct pci_dev *pci_dev)
 struct pci_vpd_ops {
 	ssize_t (*read)(struct pci_dev *dev, loff_t pos, size_t count, void *buf);
 	ssize_t (*write)(struct pci_dev *dev, loff_t pos, size_t count, const void *buf);
-	int (*set_size)(struct pci_dev *dev, size_t len);
+	RH_KABI_DEPRECATE_FN(void, release, struct pci_dev *dev)
+	RH_KABI_EXTEND(int (*set_size)(struct pci_dev *dev, size_t len))
 };
 
 struct pci_vpd {
+	unsigned int len;
 	const struct pci_vpd_ops *ops;
 	struct bin_attribute *attr; /* descriptor for sysfs VPD entry */
-	struct mutex	lock;
-	unsigned int	len;
-	u16		flag;
-	u8		cap;
-	u8		busy:1;
-	u8		valid:1;
+	RH_KABI_EXTEND(struct mutex	lock)
+	RH_KABI_EXTEND(u16		flag)
+	RH_KABI_EXTEND(u8		cap)
+	RH_KABI_EXTEND(u8		busy:1)
+	RH_KABI_EXTEND(u8		valid:1)
 };
 
 int pci_vpd_init(struct pci_dev *dev);
@@ -255,6 +256,7 @@ struct pci_sriov {
 	struct work_struct mtask; /* Obsolete as of RHEL7.1 */
 	u8 __iomem *mstate;	/* Obsolete as of RHEL7.1 */
 	RH_KABI_EXTEND(resource_size_t barsz[PCI_SRIOV_NUM_BARS])	/* VF BAR size */
+	RH_KABI_EXTEND(u8 max_VF_buses)	/* max buses consumed by VFs */
 };
 
 #ifdef CONFIG_PCI_ATS
@@ -328,5 +330,7 @@ static inline int pci_dev_specific_reset(struct pci_dev *dev, int probe)
 	return -ENOTTY;
 }
 #endif
+
+struct pci_host_bridge *pci_find_host_bridge(struct pci_bus *bus);
 
 #endif /* DRIVERS_PCI_H */

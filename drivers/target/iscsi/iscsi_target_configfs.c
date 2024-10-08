@@ -204,9 +204,94 @@ out:
 
 TF_NP_BASE_ATTR(lio_target, iser, S_IRUGO | S_IWUSR);
 
+static ssize_t lio_target_np_show_cxgbit(struct se_tpg_np *se_tpg_np,
+					 char *page)
+{
+	struct iscsi_tpg_np *tpg_np = container_of(se_tpg_np,
+				struct iscsi_tpg_np, se_tpg_np);
+	struct iscsi_tpg_np *tpg_np_cxgbit;
+	ssize_t rb;
+
+	tpg_np_cxgbit = iscsit_tpg_locate_child_np(tpg_np,
+						   ISCSI_CXGBIT);
+	if (tpg_np_cxgbit)
+		rb = sprintf(page, "1\n");
+	else
+		rb = sprintf(page, "0\n");
+
+	return rb;
+}
+
+static ssize_t lio_target_np_store_cxgbit(struct se_tpg_np *se_tpg_np,
+					  const char *page, size_t count)
+{
+	struct iscsi_np *np;
+	struct iscsi_portal_group *tpg;
+	struct iscsi_tpg_np *tpg_np = container_of(se_tpg_np,
+				struct iscsi_tpg_np, se_tpg_np);
+	struct iscsi_tpg_np *tpg_np_cxgbit = NULL;
+	u32 op;
+	int rc = 0;
+
+	rc = kstrtou32(page, 0, &op);
+	if (rc)
+		return rc;
+
+	if ((op != 1) && (op != 0)) {
+		pr_err("Illegal value for tpg_enable: %u\n", op);
+		return -EINVAL;
+	}
+
+	np = tpg_np->tpg_np;
+	if (!np) {
+		pr_err("Unable to locate struct iscsi_np from"
+		       " struct iscsi_tpg_np\n");
+		return -EINVAL;
+	}
+
+	tpg = tpg_np->tpg;
+	if (iscsit_get_tpg(tpg) < 0)
+		return -EINVAL;
+
+	if (op) {
+		rc = request_module("cxgbit");
+		if (rc != 0) {
+			pr_warn("Unable to request_module for cxgbit\n");
+			rc = 0;
+		}
+
+		tpg_np_cxgbit = iscsit_tpg_add_network_portal(tpg,
+				&np->np_sockaddr, tpg_np, ISCSI_CXGBIT);
+
+		if (IS_ERR(tpg_np_cxgbit)) {
+			rc = PTR_ERR(tpg_np_cxgbit);
+			goto out;
+		}
+	} else {
+		tpg_np_cxgbit = iscsit_tpg_locate_child_np(tpg_np,
+				ISCSI_CXGBIT);
+
+		if (tpg_np_cxgbit) {
+			rc = iscsit_tpg_del_network_portal(tpg,
+							   tpg_np_cxgbit);
+			if (rc < 0)
+				goto out;
+		}
+	}
+
+	iscsit_put_tpg(tpg);
+	return count;
+out:
+	iscsit_put_tpg(tpg);
+	return rc;
+}
+
+TF_NP_BASE_ATTR(lio_target, cxgbit, S_IRUGO | S_IWUSR);
+
 static struct configfs_attribute *lio_target_portal_attrs[] = {
 	&lio_target_np_sctp.attr,
 	&lio_target_np_iser.attr,
+	&lio_target_np_cxgbit.attr,
 	NULL,
 };
 
@@ -224,7 +309,7 @@ static struct se_tpg_np *lio_target_call_addnptotpg(
 	struct iscsi_portal_group *tpg;
 	struct iscsi_tpg_np *tpg_np;
 	char *str, *str2, *ip_str, *port_str;
-	struct __kernel_sockaddr_storage sockaddr;
+	struct sockaddr_storage sockaddr;
 	struct sockaddr_in *sock_in;
 	struct sockaddr_in6 *sock_in6;
 	unsigned long port;
@@ -239,7 +324,7 @@ static struct se_tpg_np *lio_target_call_addnptotpg(
 	memset(buf, 0, MAX_PORTAL_LEN + 1);
 	snprintf(buf, MAX_PORTAL_LEN + 1, "%s", name);
 
-	memset(&sockaddr, 0, sizeof(struct __kernel_sockaddr_storage));
+	memset(&sockaddr, 0, sizeof(struct sockaddr_storage));
 
 	str = strstr(buf, "[");
 	if (str) {
@@ -271,7 +356,7 @@ static struct se_tpg_np *lio_target_call_addnptotpg(
 		sock_in6 = (struct sockaddr_in6 *)&sockaddr;
 		sock_in6->sin6_family = AF_INET6;
 		sock_in6->sin6_port = htons((unsigned short)port);
-		ret = in6_pton(str, IPV6_ADDRESS_SPACE,
+		ret = in6_pton(str, -1,
 				(void *)&sock_in6->sin6_addr.in6_u, -1, &end);
 		if (ret <= 0) {
 			pr_err("in6_pton returned: %d\n", ret);
@@ -755,7 +840,7 @@ static ssize_t lio_target_nacl_show_info(
 				break;
 			}
 
-			rb += sprintf(page+rb, "   Address %s %s", conn->login_ip,
+			rb += sprintf(page+rb, "   Address %pISc %s", &conn->login_sockaddr,
 				(conn->network_transport == ISCSI_TCP) ?
 				"TCP" : "SCTP");
 			rb += sprintf(page+rb, "  StatSN: 0x%08x\n",
@@ -1052,6 +1137,11 @@ TPG_ATTR(default_erl, S_IRUGO | S_IWUSR);
  */
 DEF_TPG_ATTRIB(t10_pi);
 TPG_ATTR(t10_pi, S_IRUGO | S_IWUSR);
+/*
+ * Define iscsi_tpg_attrib_s_tpg_enabled_sendtargets
+ */
+DEF_TPG_ATTRIB(tpg_enabled_sendtargets);
+TPG_ATTR(tpg_enabled_sendtargets, S_IRUGO | S_IWUSR);
 
 static struct configfs_attribute *lio_target_tpg_attrib_attrs[] = {
 	&iscsi_tpg_attrib_authentication.attr,
@@ -1065,6 +1155,7 @@ static struct configfs_attribute *lio_target_tpg_attrib_attrs[] = {
 	&iscsi_tpg_attrib_demo_mode_discovery.attr,
 	&iscsi_tpg_attrib_default_erl.attr,
 	&iscsi_tpg_attrib_t10_pi.attr,
+	&iscsi_tpg_attrib_tpg_enabled_sendtargets.attr,
 	NULL,
 };
 
@@ -1942,7 +2033,7 @@ static void lio_set_default_node_attributes(struct se_node_acl *se_acl)
 
 static int lio_check_stop_free(struct se_cmd *se_cmd)
 {
-	return target_put_sess_cmd(se_cmd->se_sess, se_cmd);
+	return target_put_sess_cmd(se_cmd);
 }
 
 static void lio_release_cmd(struct se_cmd *se_cmd)

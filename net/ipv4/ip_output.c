@@ -83,6 +83,10 @@
 int sysctl_ip_default_ttl __read_mostly = IPDEFTTL;
 EXPORT_SYMBOL(sysctl_ip_default_ttl);
 
+static int ip_fragment(struct sock *sk, struct sk_buff *skb,
+		       unsigned int mtu,
+		       int (*output)(struct sock *, struct sk_buff *));
+
 /* Generate a checksum for an outgoing IP datagram. */
 void ip_send_check(struct iphdr *iph)
 {
@@ -153,7 +157,7 @@ int ip_build_and_send_pkt(struct sk_buff *skb, struct sock *sk,
 	iph->daddr    = (opt && opt->opt.srr ? opt->opt.faddr : daddr);
 	iph->saddr    = saddr;
 	iph->protocol = sk->sk_protocol;
-	ip_select_ident(skb, &rt->dst, sk);
+	ip_select_ident(sock_net(sk), skb, sk);
 
 	if (opt && opt->opt.optlen) {
 		iph->ihl += opt->opt.optlen>>2;
@@ -216,13 +220,16 @@ static inline int ip_finish_output2(struct sock *sk, struct sk_buff *skb)
 	return -EINVAL;
 }
 
-static int ip_finish_output_gso(struct sock *sk, struct sk_buff *skb)
+static int ip_finish_output_gso(struct sock *sk, struct sk_buff *skb,
+				unsigned int mtu)
 {
 	netdev_features_t features;
 	struct sk_buff *segs;
 	int ret = 0;
 
-	if (skb_gso_network_seglen(skb) <= ip_skb_dst_mtu(skb))
+	/* common case: locally created skb or seglen is <= mtu */
+	if (((IPCB(skb)->flags & IPSKB_FORWARDED) == 0) ||
+	      skb_gso_validate_mtu(skb, mtu))
 		return ip_finish_output2(sk, skb);
 
 	/* Slowpath -  GSO segment length is exceeding the dst MTU.
@@ -247,7 +254,7 @@ static int ip_finish_output_gso(struct sock *sk, struct sk_buff *skb)
 		int err;
 
 		segs->next = NULL;
-		err = ip_fragment(sk, segs, ip_finish_output2);
+		err = ip_fragment(sk, segs, mtu, ip_finish_output2);
 
 		if (err && ret == 0)
 			ret = err;
@@ -259,6 +266,8 @@ static int ip_finish_output_gso(struct sock *sk, struct sk_buff *skb)
 
 static int ip_finish_output(struct sock *sk, struct sk_buff *skb)
 {
+	unsigned int mtu;
+
 #if defined(CONFIG_NETFILTER) && defined(CONFIG_XFRM)
 	/* Policy lookup after SNAT yielded a new policy */
 	if (skb_dst(skb)->xfrm != NULL) {
@@ -266,11 +275,12 @@ static int ip_finish_output(struct sock *sk, struct sk_buff *skb)
 		return dst_output_sk(sk, skb);
 	}
 #endif
+	mtu = ip_skb_dst_mtu(skb);
 	if (skb_is_gso(skb))
-		return ip_finish_output_gso(sk, skb);
+		return ip_finish_output_gso(sk, skb, mtu);
 
-	if (skb->len > ip_skb_dst_mtu(skb))
-		return ip_fragment(sk, skb, ip_finish_output2);
+	if (skb->len > mtu || (IPCB(skb)->flags & IPSKB_FRAG_PMTU))
+		return ip_fragment(sk, skb, mtu, ip_finish_output2);
 
 	return ip_finish_output2(sk, skb);
 }
@@ -435,8 +445,8 @@ packet_routed:
 		ip_options_build(skb, &inet_opt->opt, inet->inet_daddr, rt, 0);
 	}
 
-	ip_select_ident_more(skb, &rt->dst, sk,
-			     (skb_shinfo(skb)->gso_segs ?: 1) - 1);
+	ip_select_ident_segs(sock_net(sk), skb, sk,
+			     skb_shinfo(skb)->gso_segs ?: 1);
 
 	skb->priority = sk->sk_priority;
 	skb->mark = sk->sk_mark;
@@ -480,6 +490,31 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
 	skb_copy_secmark(to, from);
 }
 
+static int ip_fragment(struct sock *sk, struct sk_buff *skb,
+		       unsigned int mtu,
+		       int (*output)(struct sock *, struct sk_buff *))
+{
+	struct iphdr *iph = ip_hdr(skb);
+
+	if ((iph->frag_off & htons(IP_DF)) == 0)
+		return ip_do_fragment(sk, skb, output);
+
+	if (unlikely(!skb->ignore_df ||
+		     (IPCB(skb)->frag_max_size &&
+		      IPCB(skb)->frag_max_size > mtu))) {
+		struct rtable *rt = skb_rtable(skb);
+		struct net_device *dev = rt->dst.dev;
+
+		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+			  htonl(mtu));
+		kfree_skb(skb);
+		return -EMSGSIZE;
+	}
+
+	return ip_do_fragment(sk, skb, output);
+}
+
 /*
  *	This IP datagram is too large to be sent in one piece.  Break it up into
  *	smaller pieces (each of size equal to IP header plus
@@ -487,8 +522,8 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
  *	single device frame, and queue such a frame for sending.
  */
 
-int ip_fragment(struct sock *sk, struct sk_buff *skb,
-		int (*output)(struct sock *, struct sk_buff *))
+int ip_do_fragment(struct sock *sk, struct sk_buff *skb,
+		   int (*output)(struct sock *, struct sk_buff *))
 {
 	struct iphdr *iph;
 	int ptr;
@@ -514,15 +549,8 @@ int ip_fragment(struct sock *sk, struct sk_buff *skb,
 	iph = ip_hdr(skb);
 
 	mtu = ip_skb_dst_mtu(skb);
-	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
-		     (IPCB(skb)->frag_max_size &&
-		      IPCB(skb)->frag_max_size > mtu))) {
-		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
-			  htonl(mtu));
-		kfree_skb(skb);
-		return -EMSGSIZE;
-	}
+	if (IPCB(skb)->frag_max_size && IPCB(skb)->frag_max_size < mtu)
+		mtu = IPCB(skb)->frag_max_size;
 
 	/*
 	 *	Setup starting values.
@@ -530,10 +558,6 @@ int ip_fragment(struct sock *sk, struct sk_buff *skb,
 
 	hlen = iph->ihl * 4;
 	mtu = mtu - hlen;	/* Size of data space */
-#ifdef CONFIG_BRIDGE_NETFILTER
-	if (skb->nf_bridge)
-		mtu -= nf_bridge_mtu_reduction(skb);
-#endif
 	IPCB(skb)->flags |= IPSKB_FRAG_COMPLETE;
 
 	/* When frag_list is given, use it. First, check its validity:
@@ -647,10 +671,7 @@ slow_path:
 	left = skb->len - hlen;		/* Space per frame */
 	ptr = hlen;		/* Where to start from */
 
-	/* for bridged IP traffic encapsulated inside f.e. a vlan header,
-	 * we need to make room for the encapsulating header
-	 */
-	ll_rs = LL_RESERVED_SPACE_EXTRA(rt->dst.dev, nf_bridge_pad(skb));
+	ll_rs = LL_RESERVED_SPACE(rt->dst.dev);
 
 	/*
 	 *	Fragment the datagram.
@@ -720,6 +741,9 @@ slow_path:
 		iph = ip_hdr(skb2);
 		iph->frag_off = htons((offset >> 3));
 
+		if (IPCB(skb)->flags & IPSKB_FRAG_PMTU)
+			iph->frag_off |= htons(IP_DF);
+
 		/* ANK: dirty, but effective trick. Upgrade options only if
 		 * the segment to be fragmented was THE FIRST (otherwise,
 		 * options are already fixed) and make it ONCE
@@ -760,7 +784,7 @@ fail:
 	IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
 	return err;
 }
-EXPORT_SYMBOL(ip_fragment);
+EXPORT_SYMBOL(ip_do_fragment);
 
 int
 ip_generic_getfrag(void *from, char *to, int offset, int len, int odd, struct sk_buff *skb)
@@ -890,7 +914,7 @@ static int __ip_append_data(struct sock *sk,
 	 */
 	if (transhdrlen &&
 	    length + fragheaderlen <= mtu &&
-	    rt->dst.dev->features & NETIF_F_V4_CSUM &&
+	    rt->dst.dev->features & (NETIF_F_HW_CSUM | NETIF_F_IP_CSUM) &&
 	    !(flags & MSG_MORE) &&
 	    !exthdrlen)
 		csummode = CHECKSUM_PARTIAL;
@@ -1385,7 +1409,7 @@ struct sk_buff *__ip_make_skb(struct sock *sk,
 	iph->ttl = ttl;
 	iph->protocol = sk->sk_protocol;
 	ip_copy_addrs(iph, fl4);
-	ip_select_ident(skb, &rt->dst, sk);
+	ip_select_ident(net, skb, sk);
 
 	if (opt) {
 		iph->ihl += opt->optlen>>2;

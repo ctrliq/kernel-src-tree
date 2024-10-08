@@ -49,7 +49,7 @@ static int find_comm(struct perf_evlist *evlist, const char *comm)
  * when an event is disabled but a dummy software event is not disabled.  If the
  * test passes %0 is returned, otherwise %-1 is returned.
  */
-int test__keep_tracking(void)
+int test__keep_tracking(int subtest __maybe_unused)
 {
 	struct record_opts opts = {
 		.mmap_pages	     = UINT_MAX,
@@ -89,8 +89,8 @@ int test__keep_tracking(void)
 	evsel->attr.enable_on_exec = 0;
 
 	if (perf_evlist__open(evlist) < 0) {
-		fprintf(stderr, " (not supported)");
-		err = 0;
+		pr_debug("Unable to open dummy and cycles event\n");
+		err = TEST_SKIP;
 		goto out_err;
 	}
 

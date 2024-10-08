@@ -4,6 +4,7 @@
 #include <asm/pgtable.h>
 #include <asm/tlb.h>
 #include <asm/fixmap.h>
+#include <asm/mtrr.h>
 
 #define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
 
@@ -476,3 +477,99 @@ void native_set_fixmap(enum fixed_addresses idx, phys_addr_t phys,
 {
 	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
 }
+
+#ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+/**
+ * pud_set_huge - setup kernel PUD mapping
+ *
+ * MTRRs can override PAT memory types with 4KiB granularity. Therefore, this
+ * function sets up a huge page only if any of the following conditions are met:
+ *
+ * - MTRRs are disabled, or
+ *
+ * - MTRRs are enabled and the range is completely covered by a single MTRR, or
+ *
+ * - MTRRs are enabled and the corresponding MTRR memory type is WB, which
+ *   has no effect on the requested PAT memory type.
+ *
+ * Callers should try to decrease page size (1GB -> 2MB -> 4K) if the bigger
+ * page mapping attempt fails.
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int pud_set_huge(pud_t *pud, phys_addr_t addr, pgprot_t prot)
+{
+	u8 mtrr, uniform;
+
+	mtrr = mtrr_type_lookup(addr, addr + PUD_SIZE, &uniform);
+	if ((mtrr != MTRR_TYPE_INVALID) && (!uniform) &&
+	    (mtrr != MTRR_TYPE_WRBACK))
+		return 0;
+
+	prot = pgprot_4k_2_large(prot);
+
+	set_pte((pte_t *)pud, pfn_pte(
+		(u64)addr >> PAGE_SHIFT,
+		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
+
+	return 1;
+}
+
+/**
+ * pmd_set_huge - setup kernel PMD mapping
+ *
+ * See text over pud_set_huge() above.
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int pmd_set_huge(pmd_t *pmd, phys_addr_t addr, pgprot_t prot)
+{
+	u8 mtrr, uniform;
+
+	mtrr = mtrr_type_lookup(addr, addr + PMD_SIZE, &uniform);
+	if ((mtrr != MTRR_TYPE_INVALID) && (!uniform) &&
+	    (mtrr != MTRR_TYPE_WRBACK)) {
+		pr_warn_once("%s: Cannot satisfy [mem %#010llx-%#010llx] with a huge-page mapping due to MTRR override.\n",
+			     __func__, addr, addr + PMD_SIZE);
+		return 0;
+	}
+
+	prot = pgprot_4k_2_large(prot);
+
+	set_pte((pte_t *)pmd, pfn_pte(
+		(u64)addr >> PAGE_SHIFT,
+		__pgprot(pgprot_val(prot) | _PAGE_PSE)));
+
+	return 1;
+}
+
+/**
+ * pud_clear_huge - clear kernel PUD mapping when it is set
+ *
+ * Returns 1 on success and 0 on failure (no PUD map is found).
+ */
+int pud_clear_huge(pud_t *pud)
+{
+	if (pud_large(*pud)) {
+		pud_clear(pud);
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * pmd_clear_huge - clear kernel PMD mapping when it is set
+ *
+ * Returns 1 on success and 0 on failure (no PMD map is found).
+ */
+int pmd_clear_huge(pmd_t *pmd)
+{
+	if (pmd_large(*pmd)) {
+		pmd_clear(pmd);
+		return 1;
+	}
+
+	return 0;
+}
+#endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */

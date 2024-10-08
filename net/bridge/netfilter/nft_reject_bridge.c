@@ -19,6 +19,7 @@
 #include <net/netfilter/ipv6/nf_reject.h>
 #include <linux/ip.h>
 #include <net/ip.h>
+#include <net/ip6_checksum.h>
 #include <linux/netfilter_bridge.h>
 #include <linux/netfilter_ipv6.h>
 #include "../br_private.h"
@@ -98,7 +99,7 @@ static void nft_reject_br_send_v4_unreach(struct sk_buff *oldskb,
 	if (!pskb_may_pull(oldskb, len))
 		return;
 
-	if (pskb_trim_rcsum(oldskb, htons(ip_hdr(oldskb)->tot_len)))
+	if (pskb_trim_rcsum(oldskb, ntohs(ip_hdr(oldskb)->tot_len)))
 		return;
 
 	if (ip_hdr(oldskb)->protocol == IPPROTO_TCP ||
@@ -256,8 +257,8 @@ static void nft_reject_br_send_v6_unreach(struct net *net,
 }
 
 static void nft_reject_bridge_eval(const struct nft_expr *expr,
-				 struct nft_data data[NFT_REG_MAX + 1],
-				 const struct nft_pktinfo *pkt)
+				   struct nft_regs *regs,
+				   const struct nft_pktinfo *pkt)
 {
 	struct nft_reject *priv = nft_expr_priv(expr);
 	struct net *net = dev_net((pkt->in != NULL) ? pkt->in : pkt->out);
@@ -272,16 +273,16 @@ static void nft_reject_bridge_eval(const struct nft_expr *expr,
 		switch (priv->type) {
 		case NFT_REJECT_ICMP_UNREACH:
 			nft_reject_br_send_v4_unreach(pkt->skb, pkt->in,
-						      pkt->ops->hooknum,
+						      pkt->hook,
 						      priv->icmp_code);
 			break;
 		case NFT_REJECT_TCP_RST:
 			nft_reject_br_send_v4_tcp_reset(pkt->skb, pkt->in,
-							pkt->ops->hooknum);
+							pkt->hook);
 			break;
 		case NFT_REJECT_ICMPX_UNREACH:
 			nft_reject_br_send_v4_unreach(pkt->skb, pkt->in,
-						      pkt->ops->hooknum,
+						      pkt->hook,
 						      nft_reject_icmp_code(priv->icmp_code));
 			break;
 		}
@@ -290,16 +291,16 @@ static void nft_reject_bridge_eval(const struct nft_expr *expr,
 		switch (priv->type) {
 		case NFT_REJECT_ICMP_UNREACH:
 			nft_reject_br_send_v6_unreach(net, pkt->skb, pkt->in,
-						      pkt->ops->hooknum,
+						      pkt->hook,
 						      priv->icmp_code);
 			break;
 		case NFT_REJECT_TCP_RST:
 			nft_reject_br_send_v6_tcp_reset(net, pkt->skb, pkt->in,
-							pkt->ops->hooknum);
+							pkt->hook);
 			break;
 		case NFT_REJECT_ICMPX_UNREACH:
 			nft_reject_br_send_v6_unreach(net, pkt->skb, pkt->in,
-						      pkt->ops->hooknum,
+						      pkt->hook,
 						      nft_reject_icmpv6_code(priv->icmp_code));
 			break;
 		}
@@ -309,7 +310,7 @@ static void nft_reject_bridge_eval(const struct nft_expr *expr,
 		break;
 	}
 out:
-	data[NFT_REG_VERDICT].verdict = NF_DROP;
+	regs->verdict.code = NF_DROP;
 }
 
 static int nft_reject_bridge_validate(const struct nft_ctx *ctx,

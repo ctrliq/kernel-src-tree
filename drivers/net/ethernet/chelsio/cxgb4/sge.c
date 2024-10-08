@@ -519,14 +519,13 @@ static void unmap_rx_buf(struct adapter *adap, struct sge_fl *q)
 
 static inline void ring_fl_db(struct adapter *adap, struct sge_fl *q)
 {
-	u32 val;
 	if (q->pend_cred >= 8) {
+		u32 val = adap->params.arch.sge_fl_db;
+
 		if (is_t4(adap->params.chip))
-			val = PIDX_V(q->pend_cred / 8);
+			val |= PIDX_V(q->pend_cred / 8);
 		else
-			val = PIDX_T5_V(q->pend_cred / 8) |
-				DBTYPE_F;
-		val |= DBPRIO_F;
+			val |= PIDX_T5_V(q->pend_cred / 8);
 
 		/* Make sure all memory writes to the Free List queue are
 		 * committed before we tell the hardware about them.
@@ -1058,7 +1057,7 @@ static void *inline_tx_skb_header(const struct sk_buff *skb,
  * Figure out what HW csum a packet wants and return the appropriate control
  * bits.
  */
-static u64 hwcsum(const struct sk_buff *skb)
+static u64 hwcsum(enum chip_type chip, const struct sk_buff *skb)
 {
 	int csum_type;
 	const struct iphdr *iph = ip_hdr(skb);
@@ -1089,11 +1088,16 @@ nocsum:			/*
 			goto nocsum;
 	}
 
-	if (likely(csum_type >= TX_CSUM_TCPIP))
-		return TXPKT_CSUM_TYPE_V(csum_type) |
-			TXPKT_IPHDR_LEN_V(skb_network_header_len(skb)) |
-			TXPKT_ETHHDR_LEN_V(skb_network_offset(skb) - ETH_HLEN);
-	else {
+	if (likely(csum_type >= TX_CSUM_TCPIP)) {
+		u64 hdr_len = TXPKT_IPHDR_LEN_V(skb_network_header_len(skb));
+		int eth_hdr_len = skb_network_offset(skb) - ETH_HLEN;
+
+		if (CHELSIO_CHIP_VERSION(chip) <= CHELSIO_T5)
+			hdr_len |= TXPKT_ETHHDR_LEN_V(eth_hdr_len);
+		else
+			hdr_len |= T6_TXPKT_ETHHDR_LEN_V(eth_hdr_len);
+		return TXPKT_CSUM_TYPE_V(csum_type) | hdr_len;
+	} else {
 		int start = skb_transport_offset(skb);
 
 		return TXPKT_CSUM_TYPE_V(csum_type) |
@@ -1150,7 +1154,7 @@ out_free:	dev_kfree_skb_any(skb);
 
 	/* Discard the packet if the length is greater than mtu */
 	max_pkt_len = ETH_HLEN + dev->mtu;
-	if (skb_vlan_tag_present(skb)) 
+	if (skb_vlan_tagged(skb)) 
 		max_pkt_len += VLAN_HLEN;
 	if (!skb_shinfo(skb)->gso_size && (unlikely(skb->len > max_pkt_len)))
 		goto out_free;
@@ -1219,9 +1223,15 @@ out_free:	dev_kfree_skb_any(skb);
 		else
 			lso->c.len = htonl(LSO_T5_XFER_SIZE_V(skb->len));
 		cpl = (void *)(lso + 1);
-		cntrl = TXPKT_CSUM_TYPE_V(v6 ? TX_CSUM_TCPIP6 : TX_CSUM_TCPIP) |
-			TXPKT_IPHDR_LEN_V(l3hdr_len) |
-			TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+
+		if (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5)
+			cntrl =	TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+		else
+			cntrl = T6_TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+
+		cntrl |= TXPKT_CSUM_TYPE_V(v6 ?
+					   TX_CSUM_TCPIP6 : TX_CSUM_TCPIP) |
+			 TXPKT_IPHDR_LEN_V(l3hdr_len);
 		q->tso++;
 		q->tx_cso += ssi->gso_segs;
 	} else {
@@ -1230,7 +1240,8 @@ out_free:	dev_kfree_skb_any(skb);
 				       FW_WR_IMMDLEN_V(len));
 		cpl = (void *)(wr + 1);
 		if (skb->ip_summed == CHECKSUM_PARTIAL) {
-			cntrl = hwcsum(skb) | TXPKT_IPCSUM_DIS_F;
+			cntrl = hwcsum(adap->params.chip, skb) |
+				TXPKT_IPCSUM_DIS_F;
 			q->tx_cso++;
 		} else
 			cntrl = TXPKT_L4CSUM_DIS_F | TXPKT_IPCSUM_DIS_F;
@@ -1391,18 +1402,17 @@ static void restart_ctrlq(unsigned long data)
 		struct fw_wr_hdr *wr;
 		unsigned int ndesc = skb->priority;     /* previously saved */
 
-		/*
-		 * Write descriptors and free skbs outside the lock to limit
+		written += ndesc;
+		/* Write descriptors and free skbs outside the lock to limit
 		 * wait times.  q->full is still set so new skbs will be queued.
 		 */
+		wr = (struct fw_wr_hdr *)&q->q.desc[q->q.pidx];
+		txq_advance(&q->q, ndesc);
 		spin_unlock(&q->sendq.lock);
 
-		wr = (struct fw_wr_hdr *)&q->q.desc[q->q.pidx];
 		inline_tx_skb(skb, &q->q, wr);
 		kfree_skb(skb);
 
-		written += ndesc;
-		txq_advance(&q->q, ndesc);
 		if (unlikely(txq_avail(&q->q) < TXQ_STOP_THRES)) {
 			unsigned long old = q->q.stops;
 
@@ -1857,11 +1867,34 @@ static noinline int handle_trace_pkt(struct adapter *adap,
 	return 0;
 }
 
+/**
+ * cxgb4_sgetim_to_hwtstamp - convert sge time stamp to hw time stamp
+ * @adap: the adapter
+ * @hwtstamps: time stamp structure to update
+ * @sgetstamp: 60bit iqe timestamp
+ *
+ * Every ingress queue entry has the 60-bit timestamp, convert that timestamp
+ * which is in Core Clock ticks into ktime_t and assign it
+ **/
+static void cxgb4_sgetim_to_hwtstamp(struct adapter *adap,
+				     struct skb_shared_hwtstamps *hwtstamps,
+				     u64 sgetstamp)
+{
+	u64 ns;
+	u64 tmp = (sgetstamp * 1000 * 1000 + adap->params.vpd.cclk / 2);
+
+	ns = div_u64(tmp, adap->params.vpd.cclk);
+
+	memset(hwtstamps, 0, sizeof(*hwtstamps));
+	hwtstamps->hwtstamp = ns_to_ktime(ns);
+}
+
 static void do_gro(struct sge_eth_rxq *rxq, const struct pkt_gl *gl,
 		   const struct cpl_rx_pkt *pkt)
 {
 	struct adapter *adapter = rxq->rspq.adap;
 	struct sge *s = &adapter->sge;
+	struct port_info *pi;
 	int ret;
 	struct sk_buff *skb;
 
@@ -1879,6 +1912,10 @@ static void do_gro(struct sge_eth_rxq *rxq, const struct pkt_gl *gl,
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb_record_rx_queue(skb, rxq->rspq.idx);
 	skb_mark_napi_id(skb, &rxq->rspq.napi);
+	pi = netdev_priv(skb->dev);
+	if (pi->rxtstamp)
+		cxgb4_sgetim_to_hwtstamp(adapter, skb_hwtstamps(skb),
+					 gl->sgetstamp);
 	if (rxq->rspq.netdev->features & NETIF_F_RXHASH)
 		skb_set_hash(skb, (__force u32)pkt->rsshdr.hash_val,
 			     PKT_HASH_TYPE_L3);
@@ -1914,6 +1951,7 @@ int t4_ethrx_handler(struct sge_rspq *q, const __be64 *rsp,
 	struct sge *s = &q->adap->sge;
 	int cpl_trace_pkt = is_t4(q->adap->params.chip) ?
 			    CPL_TRACE_PKT : CPL_TRACE_PKT_T5;
+	struct port_info *pi;
 
 	if (unlikely(*(u8 *)rsp == cpl_trace_pkt))
 		return handle_trace_pkt(q->adap, si);
@@ -1944,6 +1982,10 @@ int t4_ethrx_handler(struct sge_rspq *q, const __be64 *rsp,
 
 	rxq->stats.pkts++;
 
+	pi = netdev_priv(skb->dev);
+	if (pi->rxtstamp)
+		cxgb4_sgetim_to_hwtstamp(q->adap, skb_hwtstamps(skb),
+					 si->sgetstamp);
 	if (csum_ok && (pkt->l2info & htonl(RXF_UDP_F | RXF_TCP_F))) {
 		if (!pkt->ip_frag) {
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
@@ -2088,6 +2130,8 @@ static int process_responses(struct sge_rspq *q, int budget)
 				unmap_rx_buf(q->adap, &rxq->fl);
 			}
 
+			si.sgetstamp = SGE_TIMESTAMP_G(
+					be64_to_cpu(rc->last_flit));
 			/*
 			 * Last buffer remains mapped so explicitly make it
 			 * coherent for CPU access.
@@ -2427,7 +2471,7 @@ static void __iomem *bar2_address(struct adapter *adapter,
 	u64 bar2_qoffset;
 	int ret;
 
-	ret = t4_bar2_sge_qregs(adapter, qid, qtype,
+	ret = t4_bar2_sge_qregs(adapter, qid, qtype, 0,
 				&bar2_qoffset, pbar2_qid);
 	if (ret)
 		return NULL;
@@ -2478,6 +2522,8 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 		c.iqns_to_fl0congen = htonl(FW_IQ_CMD_IQFLINTCONGEN_F);
 
 	if (fl) {
+		enum chip_type chip = CHELSIO_CHIP_VERSION(adap->params.chip);
+
 		/* Allocate the ring for the hardware free list (with space
 		 * for its status page) along with the associated software
 		 * descriptor ring.  The free list size needs to be a multiple
@@ -2505,9 +2551,21 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 				htonl(FW_IQ_CMD_FL0CNGCHMAP_V(cong) |
 				      FW_IQ_CMD_FL0CONGCIF_F |
 				      FW_IQ_CMD_FL0CONGEN_F);
+		/* In T6, for egress queue type FL there is internal overhead
+		 * of 16B for header going into FLM module.  Hence the maximum
+		 * allowed burst size is 448 bytes.  For T4/T5, the hardware
+		 * doesn't coalesce fetch requests if more than 64 bytes of
+		 * Free List pointers are provided, so we use a 128-byte Fetch
+		 * Burst Minimum there (T6 implements coalescing so we can use
+		 * the smaller 64-byte value there).
+		 */
 		c.fl0dcaen_to_fl0cidxfthresh =
-			htons(FW_IQ_CMD_FL0FBMIN_V(FETCHBURSTMIN_64B_X) |
-			      FW_IQ_CMD_FL0FBMAX_V(FETCHBURSTMAX_512B_X));
+			htons(FW_IQ_CMD_FL0FBMIN_V(chip <= CHELSIO_T5 ?
+						   FETCHBURSTMIN_128B_X :
+						   FETCHBURSTMIN_64B_X) |
+			      FW_IQ_CMD_FL0FBMAX_V((chip <= CHELSIO_T5) ?
+						   FETCHBURSTMAX_512B_X :
+						   FETCHBURSTMAX_256B_X));
 		c.fl0size = htons(flsz);
 		c.fl0addr = cpu_to_be64(fl->addr);
 	}
@@ -2517,7 +2575,6 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 		goto err;
 
 	netif_napi_add(dev, &iq->napi, napi_rx_handler, 64);
-	napi_hash_add(&iq->napi);
 	iq->cur_desc = iq->desc;
 	iq->cidx = 0;
 	iq->gen = 1;
@@ -2567,8 +2624,9 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 	 * simple (and hopefully less wrong).
 	 */
 	if (!is_t4(adap->params.chip) && cong >= 0) {
-		u32 param, val;
+		u32 param, val, ch_map = 0;
 		int i;
+		u16 cng_ch_bits_log = adap->params.arch.cng_ch_bits_log;
 
 		param = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DMAQ) |
 			 FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DMAQ_CONM_CTXT) |
@@ -2580,9 +2638,9 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 			    CONMCTXT_CNGTPMODE_V(CONMCTXT_CNGTPMODE_CHANNEL_X);
 			for (i = 0; i < 4; i++) {
 				if (cong & (1 << i))
-					val |=
-					     CONMCTXT_CNGCHMAP_V(1 << (i << 2));
+					ch_map |= 1 << (i << cng_ch_bits_log);
 			}
+			val |= CONMCTXT_CNGCHMAP_V(ch_map);
 		}
 		ret = t4_set_params(adap, adap->mbox, adap->pf, 0, 1,
 				    &param, &val);

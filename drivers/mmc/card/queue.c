@@ -164,7 +164,7 @@ static void mmc_queue_setup_discard(struct request_queue *q,
 		return;
 
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
-	q->limits.max_discard_sectors = max_discard;
+	blk_queue_max_discard_sectors(q, max_discard);
 	if (card->erased_byte == 0 && !mmc_can_discard(card))
 		q->limits.discard_zeroes_data = 1;
 	q->limits.discard_granularity = card->pref_erase << 9;
@@ -227,17 +227,17 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 		if (bouncesz > 512) {
 			mqrq_cur->bounce_buf = kmalloc(bouncesz, GFP_KERNEL);
 			if (!mqrq_cur->bounce_buf) {
-				pr_warning("%s: unable to "
-					"allocate bounce cur buffer\n",
+				pr_warn("%s: unable to allocate bounce cur buffer\n",
 					mmc_card_name(card));
-			}
-			mqrq_prev->bounce_buf = kmalloc(bouncesz, GFP_KERNEL);
-			if (!mqrq_prev->bounce_buf) {
-				pr_warning("%s: unable to "
-					"allocate bounce prev buffer\n",
-					mmc_card_name(card));
-				kfree(mqrq_cur->bounce_buf);
-				mqrq_cur->bounce_buf = NULL;
+			} else {
+				mqrq_prev->bounce_buf =
+						kmalloc(bouncesz, GFP_KERNEL);
+				if (!mqrq_prev->bounce_buf) {
+					pr_warn("%s: unable to allocate bounce prev buffer\n",
+						mmc_card_name(card));
+					kfree(mqrq_cur->bounce_buf);
+					mqrq_cur->bounce_buf = NULL;
+				}
 			}
 		}
 

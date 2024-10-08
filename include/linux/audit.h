@@ -62,6 +62,7 @@ struct audit_krule {
 	struct audit_field	*inode_f; /* quick access to an inode field */
 	struct audit_watch	*watch;	/* associated watch */
 	struct audit_tree	*tree;	/* associated watched tree */
+	struct audit_fsnotify_mark	*exe;
 	struct list_head	rlist;	/* entry in audit_{watch,tree}.rules list */
 	struct list_head	list;	/* for AUDIT_LIST* purposes only */
 	u64			prio;
@@ -466,8 +467,10 @@ extern int		    audit_update_lsm_rules(void);
 				/* Private API (for audit.c only) */
 extern int audit_filter_user(int type);
 extern int audit_filter_type(int type);
-extern int  audit_receive_filter(int type, __u32 portid, int seq,
+extern int audit_rule_change(int type, __u32 portid, int seq,
 				void *data, size_t datasz);
+extern int audit_list_rules_send(__u32 portid, int seq);
+
 extern int audit_enabled;
 #else /* CONFIG_AUDIT */
 static inline __printf(4, 5)

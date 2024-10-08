@@ -31,6 +31,7 @@
 
 #include "xhci.h"
 #include "xhci-trace.h"
+#include "xhci-mtk.h"
 
 #define DRIVER_AUTHOR "Sarah Sharp"
 #define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
@@ -175,6 +176,16 @@ int xhci_reset(struct xhci_hcd *xhci)
 	command = readl(&xhci->op_regs->command);
 	command |= CMD_RESET;
 	writel(command, &xhci->op_regs->command);
+
+	/* Existing Intel xHCI controllers require a delay of 1 mS,
+	 * after setting the CMD_RESET bit, and before accessing any
+	 * HC registers. This allows the HC to complete the
+	 * reset operation and be ready for HC register access.
+	 * Without this delay, the subsequent HC register access,
+	 * may result in a system hang very rarely.
+	 */
+	if (xhci->quirks & XHCI_INTEL_HOST)
+		udelay(1000);
 
 	/* Existing Intel xHCI controllers require a delay of 1 mS,
 	 * after setting the CMD_RESET bit, and before accessing any
@@ -635,7 +646,11 @@ int xhci_run(struct usb_hcd *hcd)
 			"// Set the interrupt modulation register");
 	temp = readl(&xhci->ir_set->irq_control);
 	temp &= ~ER_IRQ_INTERVAL_MASK;
-	temp |= (u32) 160;
+	/*
+	 * the increment interval is 8 times as much as that defined
+	 * in xHCI spec on MTK's controller
+	 */
+	temp |= (u32) ((xhci->quirks & XHCI_MTK_HOST) ? 20 : 160);
 	writel(temp, &xhci->ir_set->irq_control);
 
 	/* Set the HCD state before we enable the irqs */
@@ -1704,6 +1719,9 @@ int xhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
 
 	xhci_endpoint_zero(xhci, xhci->devs[udev->slot_id], ep);
 
+	if (xhci->quirks & XHCI_MTK_HOST)
+		xhci_mtk_drop_ep_quirk(hcd, udev, ep);
+
 	xhci_dbg(xhci, "drop ep 0x%x, slot id %d, new drop flags = %#x, new add flags = %#x\n",
 			(unsigned int) ep->desc.bEndpointAddress,
 			udev->slot_id,
@@ -1797,6 +1815,15 @@ int xhci_add_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
 		dev_dbg(&udev->dev, "%s - could not initialize ep %#x\n",
 				__func__, ep->desc.bEndpointAddress);
 		return -ENOMEM;
+	}
+
+	if (xhci->quirks & XHCI_MTK_HOST) {
+		ret = xhci_mtk_add_ep_quirk(hcd, udev, ep);
+		if (ret < 0) {
+			xhci_free_or_cache_endpoint_ring(xhci,
+				virt_dev, ep_index);
+			return ret;
+		}
 	}
 
 	ctrl_ctx->add_flags |= cpu_to_le32(added_ctxs);
@@ -4069,7 +4096,7 @@ static int __maybe_unused xhci_change_max_exit_latency(struct xhci_hcd *xhci,
 	return ret;
 }
 
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 
 /* BESL to HIRD Encoding array for USB2 LPM */
 static int xhci_besl_encoding[16] = {125, 150, 200, 300, 400, 500, 1000, 2000,
@@ -4284,24 +4311,8 @@ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
 	return 0;
 }
 
-#else
-
-int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
-				struct usb_device *udev, int enable)
-{
-	return 0;
-}
-
-int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
-{
-	return 0;
-}
-
-#endif /* CONFIG_PM_RUNTIME */
-
 /*---------------------- USB 3.0 Link PM functions ------------------------*/
 
-#ifdef CONFIG_PM
 /* Service interval in nanoseconds = 2^(bInterval - 1) * 125us * 1000ns / 1us */
 static unsigned long long xhci_service_interval_to_ns(
 		struct usb_endpoint_descriptor *desc)
@@ -4728,6 +4739,17 @@ int xhci_disable_usb3_lpm_timeout(struct usb_hcd *hcd,
 }
 #else /* CONFIG_PM */
 
+int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
+				struct usb_device *udev, int enable)
+{
+	return 0;
+}
+
+int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	return 0;
+}
+
 int xhci_enable_usb3_lpm_timeout(struct usb_hcd *hcd,
 			struct usb_device *udev, enum usb3_link_state state)
 {
@@ -4940,6 +4962,16 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	if (retval)
 		return retval;
 	xhci_dbg(xhci, "Reset complete\n");
+
+	/*
+	 * On some xHCI controllers (e.g. R-Car SoCs), the AC64 bit (bit 0)
+	 * of HCCPARAMS1 is set to 1. However, the xHCs don't support 64-bit
+	 * address memory pointers actually. So, this driver clears the AC64
+	 * bit of xhci->hcc_params to call dma_set_coherent_mask(dev,
+	 * DMA_BIT_MASK(32)) in this xhci_gen_setup().
+	 */
+	if (xhci->quirks & XHCI_NO_64BIT_SUPPORT)
+		xhci->hcc_params &= ~BIT(0);
 
 	/* Set dma_mask and coherent_dma_mask to 64-bits,
 	 * if xHC supports 64-bit addressing */

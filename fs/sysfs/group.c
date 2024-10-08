@@ -343,43 +343,68 @@ EXPORT_SYMBOL_GPL(sysfs_remove_link_from_group);
 /**
  * __compat_only_sysfs_link_entry_to_kobj - add a symlink to a kobject pointing
  * to a group or an attribute
- * @kobj:		The kobject containing the group.
- * @target_kobj:	The target kobject.
+ * @kobj:		The kobject to add link to.
+ * @target_kobj:	The target kobject containing group to be linked.
  * @target_name:	The name of the target group or attribute.
  */
 int __compat_only_sysfs_link_entry_to_kobj(struct kobject *kobj,
 				      struct kobject *target_kobj,
 				      const char *target_name)
 {
-	struct kernfs_node *target;
-	struct kernfs_node *entry;
-	struct kernfs_node *link;
+	struct sysfs_dirent *target, *entry, *link;
+	struct sysfs_addrm_cxt acxt;
+	enum kobj_ns_type ns_type;
+	int rc;
 
 	/*
 	 * We don't own @target_kobj and it may be removed at any time.
-	 * Synchronize using sysfs_symlink_target_lock. See sysfs_remove_dir()
-	 * for details.
+	 * Synchronize using sysfs_assoc_lock.
 	 */
-	spin_lock(&sysfs_symlink_target_lock);
+	spin_lock(&sysfs_assoc_lock);
 	target = target_kobj->sd;
 	if (target)
-		kernfs_get(target);
-	spin_unlock(&sysfs_symlink_target_lock);
+		sysfs_get(target_kobj->sd);
+	spin_unlock(&sysfs_assoc_lock);
 	if (!target)
 		return -ENOENT;
 
-	entry = kernfs_find_and_get(target_kobj->sd, target_name);
+	entry = sysfs_get_dirent(target_kobj->sd, NULL, target_name);
 	if (!entry) {
-		kernfs_put(target);
+		sysfs_put(target);
 		return -ENOENT;
 	}
 
-	link = kernfs_create_link(kobj->sd, target_name, entry);
-	if (IS_ERR(link) && PTR_ERR(link) == -EEXIST)
-		sysfs_warn_dup(kobj->sd, target_name);
+	link = sysfs_new_dirent(target_name, S_IFLNK|S_IRWXUGO, SYSFS_KOBJ_LINK);
+	if (!link) {
+		sysfs_put(entry);
+		sysfs_put(target);
+		return -ENOMEM;
+	}
 
-	kernfs_put(entry);
-	kernfs_put(target);
-	return IS_ERR(link) ? PTR_ERR(link) : 0;
+	ns_type = sysfs_ns_type(kobj->sd);
+	if (ns_type)
+		link->s_ns = target_kobj->ktype->namespace(target_kobj);
+	link->s_symlink.target_sd = entry;
+
+	sysfs_addrm_start(&acxt, kobj->sd);
+	if (!ns_type ||
+	    (ns_type == sysfs_ns_type(link->s_symlink.target_sd->s_parent))) {
+		rc = sysfs_add_one(&acxt, link);
+	} else {
+		rc = -EINVAL;
+		WARN(1, KERN_WARNING
+		     "sysfs: symlink across ns_types %s/%s -> %s/%s\n",
+		     kobj->sd->s_name,
+		     link->s_name,
+		     link->s_symlink.target_sd->s_parent->s_name,
+		     link->s_symlink.target_sd->s_name);
+	}
+	sysfs_addrm_finish(&acxt);
+
+	if (rc)
+		sysfs_put(link);
+
+	sysfs_put(target);
+	return rc;
 }
 EXPORT_SYMBOL_GPL(__compat_only_sysfs_link_entry_to_kobj);

@@ -297,7 +297,7 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	memset(res_wr, 0, wr_len);
 	res_wr->op_nres = cpu_to_be32(
 			FW_WR_OP_V(FW_RI_RES_WR) |
-			V_FW_RI_RES_WR_NRES(2) |
+			FW_RI_RES_WR_NRES_V(2) |
 			FW_WR_COMPL_F);
 	res_wr->len16_pkd = cpu_to_be32(DIV_ROUND_UP(wr_len, 16));
 	res_wr->cookie = (uintptr_t)&wr_wait;
@@ -312,19 +312,19 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 		rdev->hw_queue.t4_eq_status_entries;
 
 	res->u.sqrq.fetchszm_to_iqid = cpu_to_be32(
-		V_FW_RI_RES_WR_HOSTFCMODE(0) |	/* no host cidx updates */
-		V_FW_RI_RES_WR_CPRIO(0) |	/* don't keep in chip cache */
-		V_FW_RI_RES_WR_PCIECHN(0) |	/* set by uP at ri_init time */
-		(t4_sq_onchip(&wq->sq) ? F_FW_RI_RES_WR_ONCHIP : 0) |
-		V_FW_RI_RES_WR_IQID(scq->cqid));
+		FW_RI_RES_WR_HOSTFCMODE_V(0) |	/* no host cidx updates */
+		FW_RI_RES_WR_CPRIO_V(0) |	/* don't keep in chip cache */
+		FW_RI_RES_WR_PCIECHN_V(0) |	/* set by uP at ri_init time */
+		(t4_sq_onchip(&wq->sq) ? FW_RI_RES_WR_ONCHIP_F : 0) |
+		FW_RI_RES_WR_IQID_V(scq->cqid));
 	res->u.sqrq.dcaen_to_eqsize = cpu_to_be32(
-		V_FW_RI_RES_WR_DCAEN(0) |
-		V_FW_RI_RES_WR_DCACPU(0) |
-		V_FW_RI_RES_WR_FBMIN(2) |
-		V_FW_RI_RES_WR_FBMAX(2) |
-		V_FW_RI_RES_WR_CIDXFTHRESHO(0) |
-		V_FW_RI_RES_WR_CIDXFTHRESH(0) |
-		V_FW_RI_RES_WR_EQSIZE(eqsize));
+		FW_RI_RES_WR_DCAEN_V(0) |
+		FW_RI_RES_WR_DCACPU_V(0) |
+		FW_RI_RES_WR_FBMIN_V(2) |
+		FW_RI_RES_WR_FBMAX_V(2) |
+		FW_RI_RES_WR_CIDXFTHRESHO_V(0) |
+		FW_RI_RES_WR_CIDXFTHRESH_V(0) |
+		FW_RI_RES_WR_EQSIZE_V(eqsize));
 	res->u.sqrq.eqid = cpu_to_be32(wq->sq.qid);
 	res->u.sqrq.eqaddr = cpu_to_be64(wq->sq.dma_addr);
 	res++;
@@ -337,18 +337,18 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	eqsize = wq->rq.size * T4_RQ_NUM_SLOTS +
 		rdev->hw_queue.t4_eq_status_entries;
 	res->u.sqrq.fetchszm_to_iqid = cpu_to_be32(
-		V_FW_RI_RES_WR_HOSTFCMODE(0) |	/* no host cidx updates */
-		V_FW_RI_RES_WR_CPRIO(0) |	/* don't keep in chip cache */
-		V_FW_RI_RES_WR_PCIECHN(0) |	/* set by uP at ri_init time */
-		V_FW_RI_RES_WR_IQID(rcq->cqid));
+		FW_RI_RES_WR_HOSTFCMODE_V(0) |	/* no host cidx updates */
+		FW_RI_RES_WR_CPRIO_V(0) |	/* don't keep in chip cache */
+		FW_RI_RES_WR_PCIECHN_V(0) |	/* set by uP at ri_init time */
+		FW_RI_RES_WR_IQID_V(rcq->cqid));
 	res->u.sqrq.dcaen_to_eqsize = cpu_to_be32(
-		V_FW_RI_RES_WR_DCAEN(0) |
-		V_FW_RI_RES_WR_DCACPU(0) |
-		V_FW_RI_RES_WR_FBMIN(2) |
-		V_FW_RI_RES_WR_FBMAX(2) |
-		V_FW_RI_RES_WR_CIDXFTHRESHO(0) |
-		V_FW_RI_RES_WR_CIDXFTHRESH(0) |
-		V_FW_RI_RES_WR_EQSIZE(eqsize));
+		FW_RI_RES_WR_DCAEN_V(0) |
+		FW_RI_RES_WR_DCACPU_V(0) |
+		FW_RI_RES_WR_FBMIN_V(2) |
+		FW_RI_RES_WR_FBMAX_V(2) |
+		FW_RI_RES_WR_CIDXFTHRESHO_V(0) |
+		FW_RI_RES_WR_CIDXFTHRESH_V(0) |
+		FW_RI_RES_WR_EQSIZE_V(eqsize));
 	res->u.sqrq.eqid = cpu_to_be32(wq->rq.qid);
 	res->u.sqrq.eqaddr = cpu_to_be64(wq->rq.dma_addr);
 
@@ -468,19 +468,19 @@ static int build_rdma_send(struct t4_sq *sq, union t4_wr *wqe,
 	case IB_WR_SEND:
 		if (wr->send_flags & IB_SEND_SOLICITED)
 			wqe->send.sendop_pkd = cpu_to_be32(
-				V_FW_RI_SEND_WR_SENDOP(FW_RI_SEND_WITH_SE));
+				FW_RI_SEND_WR_SENDOP_V(FW_RI_SEND_WITH_SE));
 		else
 			wqe->send.sendop_pkd = cpu_to_be32(
-				V_FW_RI_SEND_WR_SENDOP(FW_RI_SEND));
+				FW_RI_SEND_WR_SENDOP_V(FW_RI_SEND));
 		wqe->send.stag_inv = 0;
 		break;
 	case IB_WR_SEND_WITH_INV:
 		if (wr->send_flags & IB_SEND_SOLICITED)
 			wqe->send.sendop_pkd = cpu_to_be32(
-				V_FW_RI_SEND_WR_SENDOP(FW_RI_SEND_WITH_SE_INV));
+				FW_RI_SEND_WR_SENDOP_V(FW_RI_SEND_WITH_SE_INV));
 		else
 			wqe->send.sendop_pkd = cpu_to_be32(
-				V_FW_RI_SEND_WR_SENDOP(FW_RI_SEND_WITH_INV));
+				FW_RI_SEND_WR_SENDOP_V(FW_RI_SEND_WITH_INV));
 		wqe->send.stag_inv = cpu_to_be32(wr->ex.invalidate_rkey);
 		break;
 
@@ -532,8 +532,8 @@ static int build_rdma_write(struct t4_sq *sq, union t4_wr *wqe,
 	if (wr->num_sge > T4_MAX_SEND_SGE)
 		return -EINVAL;
 	wqe->write.r2 = 0;
-	wqe->write.stag_sink = cpu_to_be32(wr->wr.rdma.rkey);
-	wqe->write.to_sink = cpu_to_be64(wr->wr.rdma.remote_addr);
+	wqe->write.stag_sink = cpu_to_be32(rdma_wr(wr)->rkey);
+	wqe->write.to_sink = cpu_to_be64(rdma_wr(wr)->remote_addr);
 	if (wr->num_sge) {
 		if (wr->send_flags & IB_SEND_INLINE) {
 			ret = build_immd(sq, wqe->write.u.immd_src, wr,
@@ -570,10 +570,10 @@ static int build_rdma_read(union t4_wr *wqe, struct ib_send_wr *wr, u8 *len16)
 	if (wr->num_sge > 1)
 		return -EINVAL;
 	if (wr->num_sge) {
-		wqe->read.stag_src = cpu_to_be32(wr->wr.rdma.rkey);
-		wqe->read.to_src_hi = cpu_to_be32((u32)(wr->wr.rdma.remote_addr
+		wqe->read.stag_src = cpu_to_be32(rdma_wr(wr)->rkey);
+		wqe->read.to_src_hi = cpu_to_be32((u32)(rdma_wr(wr)->remote_addr
 							>> 32));
-		wqe->read.to_src_lo = cpu_to_be32((u32)wr->wr.rdma.remote_addr);
+		wqe->read.to_src_lo = cpu_to_be32((u32)rdma_wr(wr)->remote_addr);
 		wqe->read.stag_sink = cpu_to_be32(wr->sg_list[0].lkey);
 		wqe->read.plen = cpu_to_be32(wr->sg_list[0].length);
 		wqe->read.to_sink_hi = cpu_to_be32((u32)(wr->sg_list[0].addr
@@ -609,47 +609,41 @@ static int build_rdma_recv(struct c4iw_qp *qhp, union t4_recv_wr *wqe,
 	return 0;
 }
 
-static int build_fastreg(struct t4_sq *sq, union t4_wr *wqe,
-			 struct ib_send_wr *wr, u8 *len16, u8 t5dev)
+static int build_memreg(struct t4_sq *sq, union t4_wr *wqe,
+			struct ib_reg_wr *wr, u8 *len16, bool dsgl_supported)
 {
-
+	struct c4iw_mr *mhp = to_c4iw_mr(wr->mr);
 	struct fw_ri_immd *imdp;
 	__be64 *p;
 	int i;
-	int pbllen = roundup(wr->wr.fast_reg.page_list_len * sizeof(u64), 32);
+	int pbllen = roundup(mhp->mpl_len * sizeof(u64), 32);
 	int rem;
 
-	if (wr->wr.fast_reg.page_list_len >
-	    t4_max_fr_depth(use_dsgl))
+	if (mhp->mpl_len > t4_max_fr_depth(dsgl_supported && use_dsgl))
 		return -EINVAL;
 
 	wqe->fr.qpbinde_to_dcacpu = 0;
-	wqe->fr.pgsz_shift = wr->wr.fast_reg.page_shift - 12;
+	wqe->fr.pgsz_shift = ilog2(wr->mr->page_size) - 12;
 	wqe->fr.addr_type = FW_RI_VA_BASED_TO;
-	wqe->fr.mem_perms = c4iw_ib_to_tpt_access(wr->wr.fast_reg.access_flags);
+	wqe->fr.mem_perms = c4iw_ib_to_tpt_access(wr->access);
 	wqe->fr.len_hi = 0;
-	wqe->fr.len_lo = cpu_to_be32(wr->wr.fast_reg.length);
-	wqe->fr.stag = cpu_to_be32(wr->wr.fast_reg.rkey);
-	wqe->fr.va_hi = cpu_to_be32(wr->wr.fast_reg.iova_start >> 32);
-	wqe->fr.va_lo_fbo = cpu_to_be32(wr->wr.fast_reg.iova_start &
+	wqe->fr.len_lo = cpu_to_be32(mhp->ibmr.length);
+	wqe->fr.stag = cpu_to_be32(wr->key);
+	wqe->fr.va_hi = cpu_to_be32(mhp->ibmr.iova >> 32);
+	wqe->fr.va_lo_fbo = cpu_to_be32(mhp->ibmr.iova &
 					0xffffffff);
 
-	if (t5dev && use_dsgl && (pbllen > max_fr_immd)) {
-		struct c4iw_fr_page_list *c4pl =
-			to_c4iw_fr_page_list(wr->wr.fast_reg.page_list);
+	if (dsgl_supported && use_dsgl && (pbllen > max_fr_immd)) {
 		struct fw_ri_dsgl *sglp;
 
-		for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
-			wr->wr.fast_reg.page_list->page_list[i] = (__force u64)
-				cpu_to_be64((u64)
-				wr->wr.fast_reg.page_list->page_list[i]);
-		}
+		for (i = 0; i < mhp->mpl_len; i++)
+			mhp->mpl[i] = (__force u64)cpu_to_be64((u64)mhp->mpl[i]);
 
 		sglp = (struct fw_ri_dsgl *)(&wqe->fr + 1);
 		sglp->op = FW_RI_DATA_DSGL;
 		sglp->r1 = 0;
 		sglp->nsge = cpu_to_be16(1);
-		sglp->addr0 = cpu_to_be64(c4pl->dma_addr);
+		sglp->addr0 = cpu_to_be64(mhp->mpl_addr);
 		sglp->len0 = cpu_to_be32(pbllen);
 
 		*len16 = DIV_ROUND_UP(sizeof(wqe->fr) + sizeof(*sglp), 16);
@@ -661,9 +655,8 @@ static int build_fastreg(struct t4_sq *sq, union t4_wr *wqe,
 		imdp->immdlen = cpu_to_be32(pbllen);
 		p = (__be64 *)(imdp + 1);
 		rem = pbllen;
-		for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
-			*p = cpu_to_be64(
-				(u64)wr->wr.fast_reg.page_list->page_list[i]);
+		for (i = 0; i < mhp->mpl_len; i++) {
+			*p = cpu_to_be64((u64)mhp->mpl[i]);
 			rem -= sizeof(*p);
 			if (++p == (__be64 *)&sq->queue[sq->size])
 				p = (__be64 *)sq->queue;
@@ -716,8 +709,7 @@ static int ring_kernel_sq_db(struct c4iw_qp *qhp, u16 inc)
 	spin_lock_irqsave(&qhp->rhp->lock, flags);
 	spin_lock(&qhp->lock);
 	if (qhp->rhp->db_state == NORMAL)
-		t4_ring_sq_db(&qhp->wq, inc,
-			      is_t5(qhp->rhp->rdev.lldi.adapter_type), NULL);
+		t4_ring_sq_db(&qhp->wq, inc, NULL);
 	else {
 		add_to_fc_list(&qhp->rhp->db_fc_list, &qhp->db_fc_entry);
 		qhp->wq.sq.wq_pidx_inc += inc;
@@ -734,8 +726,7 @@ static int ring_kernel_rq_db(struct c4iw_qp *qhp, u16 inc)
 	spin_lock_irqsave(&qhp->rhp->lock, flags);
 	spin_lock(&qhp->lock);
 	if (qhp->rhp->db_state == NORMAL)
-		t4_ring_rq_db(&qhp->wq, inc,
-			      is_t5(qhp->rhp->rdev.lldi.adapter_type), NULL);
+		t4_ring_rq_db(&qhp->wq, inc, NULL);
 	else {
 		add_to_fc_list(&qhp->rhp->db_fc_list, &qhp->db_fc_entry);
 		qhp->wq.rq.wq_pidx_inc += inc;
@@ -817,13 +808,11 @@ int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 			if (!qhp->wq.sq.oldest_read)
 				qhp->wq.sq.oldest_read = swsqe;
 			break;
-		case IB_WR_FAST_REG_MR:
+		case IB_WR_REG_MR:
 			fw_opcode = FW_RI_FR_NSMR_WR;
 			swsqe->opcode = FW_RI_FAST_REGISTER;
-			err = build_fastreg(&qhp->wq.sq, wqe, wr, &len16,
-					    is_t5(
-					    qhp->rhp->rdev.lldi.adapter_type) ?
-					    1 : 0);
+			err = build_memreg(&qhp->wq.sq, wqe, reg_wr(wr), &len16,
+				qhp->rhp->rdev.lldi.ulptx_memwrite_dsgl);
 			break;
 		case IB_WR_LOCAL_INV:
 			if (wr->send_flags & IB_SEND_FENCE)
@@ -864,8 +853,7 @@ int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 		idx += DIV_ROUND_UP(len16*16, T4_EQ_ENTRY_SIZE);
 	}
 	if (!qhp->rhp->rdev.status_page->db_off) {
-		t4_ring_sq_db(&qhp->wq, idx,
-			      is_t5(qhp->rhp->rdev.lldi.adapter_type), wqe);
+		t4_ring_sq_db(&qhp->wq, idx, wqe);
 		spin_unlock_irqrestore(&qhp->lock, flag);
 	} else {
 		spin_unlock_irqrestore(&qhp->lock, flag);
@@ -938,19 +926,13 @@ int c4iw_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
 		num_wrs--;
 	}
 	if (!qhp->rhp->rdev.status_page->db_off) {
-		t4_ring_rq_db(&qhp->wq, idx,
-			      is_t5(qhp->rhp->rdev.lldi.adapter_type), wqe);
+		t4_ring_rq_db(&qhp->wq, idx, wqe);
 		spin_unlock_irqrestore(&qhp->lock, flag);
 	} else {
 		spin_unlock_irqrestore(&qhp->lock, flag);
 		ring_kernel_rq_db(qhp, idx);
 	}
 	return err;
-}
-
-int c4iw_bind_mw(struct ib_qp *qp, struct ib_mw *mw, struct ib_mw_bind *mw_bind)
-{
-	return -ENOSYS;
 }
 
 static inline void build_term_codes(struct t4_cqe *err_cqe, u8 *layer_type,
@@ -1307,8 +1289,8 @@ static int rdma_init(struct c4iw_dev *rhp, struct c4iw_qp *qhp)
 
 	wqe->u.init.type = FW_RI_TYPE_INIT;
 	wqe->u.init.mpareqbit_p2ptype =
-		V_FW_RI_WR_MPAREQBIT(qhp->attr.mpa_attr.initiator) |
-		V_FW_RI_WR_P2PTYPE(qhp->attr.mpa_attr.p2p_type);
+		FW_RI_WR_MPAREQBIT_V(qhp->attr.mpa_attr.initiator) |
+		FW_RI_WR_P2PTYPE_V(qhp->attr.mpa_attr.p2p_type);
 	wqe->u.init.mpa_attrs = FW_RI_MPA_IETF_ENABLE;
 	if (qhp->attr.mpa_attr.recv_marker_enabled)
 		wqe->u.init.mpa_attrs |= FW_RI_MPA_RX_MARKER_ENABLE;
@@ -1884,7 +1866,7 @@ int c4iw_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	attrs.rq_db_inc = attr->rq_psn;
 	mask |= (attr_mask & IB_QP_SQ_PSN) ? C4IW_QP_ATTR_SQ_DB : 0;
 	mask |= (attr_mask & IB_QP_RQ_PSN) ? C4IW_QP_ATTR_RQ_DB : 0;
-	if (is_t5(to_c4iw_qp(ibqp)->rhp->rdev.lldi.adapter_type) &&
+	if (!is_t4(to_c4iw_qp(ibqp)->rhp->rdev.lldi.adapter_type) &&
 	    (mask & (C4IW_QP_ATTR_SQ_DB|C4IW_QP_ATTR_RQ_DB)))
 		return -EINVAL;
 

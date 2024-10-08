@@ -473,7 +473,7 @@ is_valid_oplock_break(char *buffer, struct TCP_Server_Info *srv)
 					continue;
 
 				cifs_dbg(FYI, "file id match, oplock break\n");
-				pCifsInode = CIFS_I(netfile->dentry->d_inode);
+				pCifsInode = CIFS_I(d_inode(netfile->dentry));
 
 				set_bit(CIFS_INODE_PENDING_OPLOCK_BREAK,
 					&pCifsInode->flags);
@@ -556,7 +556,7 @@ int cifs_get_writer(struct cifsInodeInfo *cinode)
 
 start:
 	rc = wait_on_bit(&cinode->flags, CIFS_INODE_PENDING_OPLOCK_BREAK,
-				   cifs_oplock_break_wait, TASK_KILLABLE);
+			 TASK_KILLABLE);
 	if (rc)
 		return rc;
 

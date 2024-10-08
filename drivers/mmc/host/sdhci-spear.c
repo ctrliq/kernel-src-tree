@@ -56,6 +56,14 @@ static irqreturn_t sdhci_gpio_irq(int irq, void *dev_id)
 	gpio_irq_type = val ? IRQF_TRIGGER_LOW : IRQF_TRIGGER_HIGH;
 	irq_set_irq_type(irq, gpio_irq_type);
 
+	if (sdhci->data->card_power_gpio >= 0) {
+		if (!sdhci->data->power_always_enb) {
+			/* if card inserted, give power, otherwise remove it */
+			val = sdhci->data->power_active_high ? !val : val ;
+			gpio_set_value(sdhci->data->card_power_gpio, val);
+		}
+	}
+
 	/* inform sdhci driver about card insertion/removal */
 	tasklet_schedule(&host->card_tasklet);
 
@@ -196,6 +204,30 @@ static int sdhci_probe(struct platform_device *pdev)
 	if (!sdhci->data)
 		return 0;
 
+	if (sdhci->data->card_power_gpio >= 0) {
+		int val = 0;
+
+		ret = devm_gpio_request(&pdev->dev,
+				sdhci->data->card_power_gpio, "sdhci");
+		if (ret < 0) {
+			dev_dbg(&pdev->dev, "gpio request fail: %d\n",
+					sdhci->data->card_power_gpio);
+			goto set_drvdata;
+		}
+
+		if (sdhci->data->power_always_enb)
+			val = sdhci->data->power_active_high;
+		else
+			val = !sdhci->data->power_active_high;
+
+		ret = gpio_direction_output(sdhci->data->card_power_gpio, val);
+		if (ret) {
+			dev_dbg(&pdev->dev, "gpio set direction fail: %d\n",
+					sdhci->data->card_power_gpio);
+			goto set_drvdata;
+		}
+	}
+
 	if (sdhci->data->card_int_gpio >= 0) {
 		ret = devm_gpio_request(&pdev->dev, sdhci->data->card_int_gpio,
 				"sdhci");
@@ -226,6 +258,7 @@ static int sdhci_probe(struct platform_device *pdev)
 	return 0;
 
 set_drvdata:
+	platform_set_drvdata(pdev, NULL);
 	sdhci_remove_host(host, 1);
 free_host:
 	sdhci_free_host(host);
@@ -245,6 +278,7 @@ static int sdhci_remove(struct platform_device *pdev)
 	int dead = 0;
 	u32 scratch;
 
+	platform_set_drvdata(pdev, NULL);
 	scratch = readl(host->ioaddr + SDHCI_INT_STATUS);
 	if (scratch == (u32)-1)
 		dead = 1;

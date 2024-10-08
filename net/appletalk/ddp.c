@@ -644,7 +644,7 @@ static inline void atalk_dev_down(struct net_device *dev)
 static int ddp_device_event(struct notifier_block *this, unsigned long event,
 			    void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
@@ -1929,7 +1929,7 @@ static int __init atalk_init(void)
 	dev_add_pack(&ltalk_packet_type);
 	dev_add_pack(&ppptalk_packet_type);
 
-	register_netdevice_notifier(&ddp_notifier);
+	register_netdevice_notifier_rh(&ddp_notifier);
 	aarp_proto_init();
 	atalk_proc_init();
 	atalk_register_sysctl();
@@ -1954,7 +1954,7 @@ static void __exit atalk_exit(void)
 #endif /* CONFIG_SYSCTL */
 	atalk_proc_exit();
 	aarp_cleanup_module();	/* General aarp clean-up. */
-	unregister_netdevice_notifier(&ddp_notifier);
+	unregister_netdevice_notifier_rh(&ddp_notifier);
 	dev_remove_pack(&ltalk_packet_type);
 	dev_remove_pack(&ppptalk_packet_type);
 	unregister_snap_client(ddp_dl);

@@ -526,78 +526,6 @@ static void dw_mci_post_req(struct mmc_host *mmc,
 	data->host_cookie = 0;
 }
 
-static void dw_mci_adjust_fifoth(struct dw_mci *host, struct mmc_data *data)
-{
-#ifdef CONFIG_MMC_DW_IDMAC
-	unsigned int blksz = data->blksz;
-	const u32 mszs[] = {1, 4, 8, 16, 32, 64, 128, 256};
-	u32 fifo_width = 1 << host->data_shift;
-	u32 blksz_depth = blksz / fifo_width, fifoth_val;
-	u32 msize = 0, rx_wmark = 1, tx_wmark, tx_wmark_invers;
-	int idx = (sizeof(mszs) / sizeof(mszs[0])) - 1;
-
-	tx_wmark = (host->fifo_depth) / 2;
-	tx_wmark_invers = host->fifo_depth - tx_wmark;
-
-	/*
-	 * MSIZE is '1',
-	 * if blksz is not a multiple of the FIFO width
-	 */
-	if (blksz % fifo_width) {
-		msize = 0;
-		rx_wmark = 1;
-		goto done;
-	}
-
-	do {
-		if (!((blksz_depth % mszs[idx]) ||
-		     (tx_wmark_invers % mszs[idx]))) {
-			msize = idx;
-			rx_wmark = mszs[idx] - 1;
-			break;
-		}
-	} while (--idx > 0);
-	/*
-	 * If idx is '0', it won't be tried
-	 * Thus, initial values are uesed
-	 */
-done:
-	fifoth_val = SDMMC_SET_FIFOTH(msize, rx_wmark, tx_wmark);
-	mci_writel(host, FIFOTH, fifoth_val);
-#endif
-}
-
-static void dw_mci_ctrl_rd_thld(struct dw_mci *host, struct mmc_data *data)
-{
-	unsigned int blksz = data->blksz;
-	u32 blksz_depth, fifo_depth;
-	u16 thld_size;
-
-	WARN_ON(!(data->flags & MMC_DATA_READ));
-
-	if (host->timing != MMC_TIMING_MMC_HS200 &&
-	    host->timing != MMC_TIMING_UHS_SDR104)
-		goto disable;
-
-	blksz_depth = blksz / (1 << host->data_shift);
-	fifo_depth = host->fifo_depth;
-
-	if (blksz_depth > fifo_depth)
-		goto disable;
-
-	/*
-	 * If (blksz_depth) >= (fifo_depth >> 1), should be 'thld_size <= blksz'
-	 * If (blksz_depth) <  (fifo_depth >> 1), should be thld_size = blksz
-	 * Currently just choose blksz.
-	 */
-	thld_size = blksz;
-	mci_writel(host, CDTHRCTL, SDMMC_SET_RD_THLD(thld_size, 1));
-	return;
-
-disable:
-	mci_writel(host, CDTHRCTL, SDMMC_SET_RD_THLD(0, 0));
-}
-
 static int dw_mci_submit_data_dma(struct dw_mci *host, struct mmc_data *data)
 {
 	int sg_len;
@@ -621,14 +549,6 @@ static int dw_mci_submit_data_dma(struct dw_mci *host, struct mmc_data *data)
 		 "sd sg_cpu: %#lx sg_dma: %#lx sg_len: %d\n",
 		 (unsigned long)host->sg_cpu, (unsigned long)host->sg_dma,
 		 sg_len);
-
-	/*
-	 * Decide the MSIZE and RX/TX Watermark.
-	 * If current block size is same with previous size,
-	 * no need to update fifoth.
-	 */
-	if (host->prev_blksz != data->blksz)
-		dw_mci_adjust_fifoth(host, data);
 
 	/* Enable the DMA interface */
 	temp = mci_readl(host, CTRL);
@@ -655,12 +575,10 @@ static void dw_mci_submit_data(struct dw_mci *host, struct mmc_data *data)
 	host->sg = NULL;
 	host->data = data;
 
-	if (data->flags & MMC_DATA_READ) {
+	if (data->flags & MMC_DATA_READ)
 		host->dir_status = DW_MCI_RECV_STATUS;
-		dw_mci_ctrl_rd_thld(host, data);
-	} else {
+	else
 		host->dir_status = DW_MCI_SEND_STATUS;
-	}
 
 	if (dw_mci_submit_data_dma(host, data)) {
 		int flags = SG_MITER_ATOMIC;
@@ -682,21 +600,6 @@ static void dw_mci_submit_data(struct dw_mci *host, struct mmc_data *data)
 		temp = mci_readl(host, CTRL);
 		temp &= ~SDMMC_CTRL_DMA_ENABLE;
 		mci_writel(host, CTRL, temp);
-
-		/*
-		 * Use the initial fifoth_val for PIO mode.
-		 * If next issued data may be transfered by DMA mode,
-		 * prev_blksz should be invalidated.
-		 */
-		mci_writel(host, FIFOTH, host->fifoth_val);
-		host->prev_blksz = 0;
-	} else {
-		/*
-		 * Keep the current block size.
-		 * It will be used to decide whether to update
-		 * fifoth register next time.
-		 */
-		host->prev_blksz = data->blksz;
 	}
 }
 
@@ -897,7 +800,6 @@ static void dw_mci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		regs &= ~((0x1 << slot->id) << 16);
 
 	mci_writel(slot->host, UHS_REG, regs);
-	slot->host->timing = ios->timing;
 
 	if (ios->clock) {
 		/*
@@ -943,8 +845,7 @@ static int dw_mci_get_ro(struct mmc_host *mmc)
 	struct dw_mci_board *brd = slot->host->pdata;
 
 	/* Use platform get_ro function, else try on board write protect */
-	if ((slot->quirks & DW_MCI_SLOT_QUIRK_NO_WRITE_PROTECT) ||
-			(slot->host->quirks & DW_MCI_QUIRK_NO_WRITE_PROTECT))
+	if (slot->quirks & DW_MCI_SLOT_QUIRK_NO_WRITE_PROTECT)
 		read_only = 0;
 	else if (brd->get_ro)
 		read_only = brd->get_ro(slot->id);
@@ -1313,7 +1214,8 @@ static void dw_mci_push_data16(struct dw_mci *host, void *buf, int cnt)
 		buf += len;
 		cnt -= len;
 		if (host->part_buf_count == 2) {
-			mci_fifo_writew(host->fifo_reg, host->part_buf16);
+			mci_writew(host, DATA(host->data_offset),
+					host->part_buf16);
 			host->part_buf_count = 0;
 		}
 	}
@@ -1330,14 +1232,15 @@ static void dw_mci_push_data16(struct dw_mci *host, void *buf, int cnt)
 			cnt -= len;
 			/* push data from aligned buffer into fifo */
 			for (i = 0; i < items; ++i)
-				mci_fifo_writew(host->fifo_reg, aligned_buf[i]);
+				mci_writew(host, DATA(host->data_offset),
+						aligned_buf[i]);
 		}
 	} else
 #endif
 	{
 		u16 *pdata = buf;
 		for (; cnt >= 2; cnt -= 2)
-			mci_fifo_writew(host->fifo_reg, *pdata++);
+			mci_writew(host, DATA(host->data_offset), *pdata++);
 		buf = pdata;
 	}
 	/* put anything remaining in the part_buf */
@@ -1346,7 +1249,8 @@ static void dw_mci_push_data16(struct dw_mci *host, void *buf, int cnt)
 		 /* Push data if we have reached the expected data length */
 		if ((data->bytes_xfered + init_cnt) ==
 		    (data->blksz * data->blocks))
-			mci_fifo_writew(host->fifo_reg, host->part_buf16);
+			mci_writew(host, DATA(host->data_offset),
+				   host->part_buf16);
 	}
 }
 
@@ -1361,7 +1265,8 @@ static void dw_mci_pull_data16(struct dw_mci *host, void *buf, int cnt)
 			int items = len >> 1;
 			int i;
 			for (i = 0; i < items; ++i)
-				aligned_buf[i] = mci_fifo_readw(host->fifo_reg);
+				aligned_buf[i] = mci_readw(host,
+						DATA(host->data_offset));
 			/* memcpy from aligned buffer into output buffer */
 			memcpy(buf, aligned_buf, len);
 			buf += len;
@@ -1372,11 +1277,11 @@ static void dw_mci_pull_data16(struct dw_mci *host, void *buf, int cnt)
 	{
 		u16 *pdata = buf;
 		for (; cnt >= 2; cnt -= 2)
-			*pdata++ = mci_fifo_readw(host->fifo_reg);
+			*pdata++ = mci_readw(host, DATA(host->data_offset));
 		buf = pdata;
 	}
 	if (cnt) {
-		host->part_buf16 = mci_fifo_readw(host->fifo_reg);
+		host->part_buf16 = mci_readw(host, DATA(host->data_offset));
 		dw_mci_pull_final_bytes(host, buf, cnt);
 	}
 }
@@ -1392,7 +1297,8 @@ static void dw_mci_push_data32(struct dw_mci *host, void *buf, int cnt)
 		buf += len;
 		cnt -= len;
 		if (host->part_buf_count == 4) {
-			mci_fifo_writel(host->fifo_reg,	host->part_buf32);
+			mci_writel(host, DATA(host->data_offset),
+					host->part_buf32);
 			host->part_buf_count = 0;
 		}
 	}
@@ -1409,14 +1315,15 @@ static void dw_mci_push_data32(struct dw_mci *host, void *buf, int cnt)
 			cnt -= len;
 			/* push data from aligned buffer into fifo */
 			for (i = 0; i < items; ++i)
-				mci_fifo_writel(host->fifo_reg,	aligned_buf[i]);
+				mci_writel(host, DATA(host->data_offset),
+						aligned_buf[i]);
 		}
 	} else
 #endif
 	{
 		u32 *pdata = buf;
 		for (; cnt >= 4; cnt -= 4)
-			mci_fifo_writel(host->fifo_reg, *pdata++);
+			mci_writel(host, DATA(host->data_offset), *pdata++);
 		buf = pdata;
 	}
 	/* put anything remaining in the part_buf */
@@ -1425,7 +1332,8 @@ static void dw_mci_push_data32(struct dw_mci *host, void *buf, int cnt)
 		 /* Push data if we have reached the expected data length */
 		if ((data->bytes_xfered + init_cnt) ==
 		    (data->blksz * data->blocks))
-			mci_fifo_writel(host->fifo_reg, host->part_buf32);
+			mci_writel(host, DATA(host->data_offset),
+				   host->part_buf32);
 	}
 }
 
@@ -1440,7 +1348,8 @@ static void dw_mci_pull_data32(struct dw_mci *host, void *buf, int cnt)
 			int items = len >> 2;
 			int i;
 			for (i = 0; i < items; ++i)
-				aligned_buf[i] = mci_fifo_readl(host->fifo_reg);
+				aligned_buf[i] = mci_readl(host,
+						DATA(host->data_offset));
 			/* memcpy from aligned buffer into output buffer */
 			memcpy(buf, aligned_buf, len);
 			buf += len;
@@ -1451,11 +1360,11 @@ static void dw_mci_pull_data32(struct dw_mci *host, void *buf, int cnt)
 	{
 		u32 *pdata = buf;
 		for (; cnt >= 4; cnt -= 4)
-			*pdata++ = mci_fifo_readl(host->fifo_reg);
+			*pdata++ = mci_readl(host, DATA(host->data_offset));
 		buf = pdata;
 	}
 	if (cnt) {
-		host->part_buf32 = mci_fifo_readl(host->fifo_reg);
+		host->part_buf32 = mci_readl(host, DATA(host->data_offset));
 		dw_mci_pull_final_bytes(host, buf, cnt);
 	}
 }
@@ -1472,7 +1381,8 @@ static void dw_mci_push_data64(struct dw_mci *host, void *buf, int cnt)
 		cnt -= len;
 
 		if (host->part_buf_count == 8) {
-			mci_fifo_writeq(host->fifo_reg,	host->part_buf);
+			mci_writeq(host, DATA(host->data_offset),
+					host->part_buf);
 			host->part_buf_count = 0;
 		}
 	}
@@ -1489,14 +1399,15 @@ static void dw_mci_push_data64(struct dw_mci *host, void *buf, int cnt)
 			cnt -= len;
 			/* push data from aligned buffer into fifo */
 			for (i = 0; i < items; ++i)
-				mci_fifo_writeq(host->fifo_reg,	aligned_buf[i]);
+				mci_writeq(host, DATA(host->data_offset),
+						aligned_buf[i]);
 		}
 	} else
 #endif
 	{
 		u64 *pdata = buf;
 		for (; cnt >= 8; cnt -= 8)
-			mci_fifo_writeq(host->fifo_reg, *pdata++);
+			mci_writeq(host, DATA(host->data_offset), *pdata++);
 		buf = pdata;
 	}
 	/* put anything remaining in the part_buf */
@@ -1505,7 +1416,8 @@ static void dw_mci_push_data64(struct dw_mci *host, void *buf, int cnt)
 		/* Push data if we have reached the expected data length */
 		if ((data->bytes_xfered + init_cnt) ==
 		    (data->blksz * data->blocks))
-			mci_fifo_writeq(host->fifo_reg, host->part_buf);
+			mci_writeq(host, DATA(host->data_offset),
+				   host->part_buf);
 	}
 }
 
@@ -1520,8 +1432,8 @@ static void dw_mci_pull_data64(struct dw_mci *host, void *buf, int cnt)
 			int items = len >> 3;
 			int i;
 			for (i = 0; i < items; ++i)
-				aligned_buf[i] = mci_fifo_readq(host->fifo_reg);
-
+				aligned_buf[i] = mci_readq(host,
+						DATA(host->data_offset));
 			/* memcpy from aligned buffer into output buffer */
 			memcpy(buf, aligned_buf, len);
 			buf += len;
@@ -1532,11 +1444,11 @@ static void dw_mci_pull_data64(struct dw_mci *host, void *buf, int cnt)
 	{
 		u64 *pdata = buf;
 		for (; cnt >= 8; cnt -= 8)
-			*pdata++ = mci_fifo_readq(host->fifo_reg);
+			*pdata++ = mci_readq(host, DATA(host->data_offset));
 		buf = pdata;
 	}
 	if (cnt) {
-		host->part_buf = mci_fifo_readq(host->fifo_reg);
+		host->part_buf = mci_readq(host, DATA(host->data_offset));
 		dw_mci_pull_final_bytes(host, buf, cnt);
 	}
 }
@@ -1916,11 +1828,8 @@ static int dw_mci_of_get_slot_quirks(struct device *dev, u8 slot)
 
 	/* get quirks */
 	for (idx = 0; idx < ARRAY_SIZE(of_slot_quirks); idx++)
-		if (of_get_property(np, of_slot_quirks[idx].quirk, NULL)) {
-			dev_warn(dev, "Slot quirk %s is deprecated\n",
-					of_slot_quirks[idx].quirk);
+		if (of_get_property(np, of_slot_quirks[idx].quirk, NULL))
 			quirks |= of_slot_quirks[idx].id;
-		}
 
 	return quirks;
 }
@@ -2076,6 +1985,19 @@ static int dw_mci_init_slot(struct dw_mci *host, unsigned int id)
 #endif /* CONFIG_MMC_DW_IDMAC */
 	}
 
+	host->vmmc = devm_regulator_get(mmc_dev(mmc), "vmmc");
+	if (IS_ERR(host->vmmc)) {
+		pr_info("%s: no vmmc regulator found\n", mmc_hostname(mmc));
+		host->vmmc = NULL;
+	} else {
+		ret = regulator_enable(host->vmmc);
+		if (ret) {
+			dev_err(host->dev,
+				"failed to enable regulator: %d\n", ret);
+			goto err_setup_bus;
+		}
+	}
+
 	if (dw_mci_get_cd(mmc))
 		set_bit(DW_MMC_CARD_PRESENT, &slot->flags);
 	else
@@ -2192,9 +2114,6 @@ static struct dw_mci_of_quirks {
 	}, {
 		.quirk	= "broken-cd",
 		.id	= DW_MCI_QUIRK_BROKEN_CARD_DETECTION,
-	}, {
-		.quirk	= "disable-wp",
-		.id	= DW_MCI_QUIRK_NO_WRITE_PROTECT,
 	},
 };
 
@@ -2205,7 +2124,6 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
 	struct device_node *np = dev->of_node;
 	const struct dw_mci_drv_data *drv_data = host->drv_data;
 	int idx, ret;
-	u32 clock_frequency;
 
 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata) {
@@ -2231,9 +2149,6 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
 				"value of FIFOTH register as default\n");
 
 	of_property_read_u32(np, "card-detect-delay", &pdata->detect_delay_ms);
-
-	if (!of_property_read_u32(np, "clock-frequency", &clock_frequency))
-		pdata->bus_hz = clock_frequency;
 
 	if (drv_data && drv_data->parse_dt) {
 		ret = drv_data->parse_dt(host);
@@ -2292,23 +2207,18 @@ int dw_mci_probe(struct dw_mci *host)
 	host->ciu_clk = devm_clk_get(host->dev, "ciu");
 	if (IS_ERR(host->ciu_clk)) {
 		dev_dbg(host->dev, "ciu clock not available\n");
-		host->bus_hz = host->pdata->bus_hz;
 	} else {
 		ret = clk_prepare_enable(host->ciu_clk);
 		if (ret) {
 			dev_err(host->dev, "failed to enable ciu clock\n");
 			goto err_clk_biu;
 		}
-
-		if (host->pdata->bus_hz) {
-			ret = clk_set_rate(host->ciu_clk, host->pdata->bus_hz);
-			if (ret)
-				dev_warn(host->dev,
-					 "Unable to set bus rate to %ul\n",
-					 host->pdata->bus_hz);
-		}
-		host->bus_hz = clk_get_rate(host->ciu_clk);
 	}
+
+	if (IS_ERR(host->ciu_clk))
+		host->bus_hz = host->pdata->bus_hz;
+	else
+		host->bus_hz = clk_get_rate(host->ciu_clk);
 
 	if (drv_data && drv_data->setup_clock) {
 		ret = drv_data->setup_clock(host);
@@ -2319,29 +2229,11 @@ int dw_mci_probe(struct dw_mci *host)
 		}
 	}
 
-	host->vmmc = devm_regulator_get(host->dev, "vmmc");
-	if (IS_ERR(host->vmmc)) {
-		ret = PTR_ERR(host->vmmc);
-		if (ret == -EPROBE_DEFER)
-			goto err_clk_ciu;
-
-		dev_info(host->dev, "no vmmc regulator found: %d\n", ret);
-		host->vmmc = NULL;
-	} else {
-		ret = regulator_enable(host->vmmc);
-		if (ret) {
-			if (ret != -EPROBE_DEFER)
-				dev_err(host->dev,
-					"regulator_enable fail: %d\n", ret);
-			goto err_clk_ciu;
-		}
-	}
-
 	if (!host->bus_hz) {
 		dev_err(host->dev,
 			"Platform data must supply bus speed\n");
 		ret = -ENODEV;
-		goto err_regulator;
+		goto err_clk_ciu;
 	}
 
 	host->quirks = host->pdata->quirks;
@@ -2406,8 +2298,8 @@ int dw_mci_probe(struct dw_mci *host)
 		fifo_size = host->pdata->fifo_depth;
 	}
 	host->fifo_depth = fifo_size;
-	host->fifoth_val =
-		SDMMC_SET_FIFOTH(0x2, fifo_size / 2 - 1, fifo_size / 2);
+	host->fifoth_val = ((0x2 << 28) | ((fifo_size/2 - 1) << 16) |
+			((fifo_size/2) << 0));
 	mci_writel(host, FIFOTH, host->fifoth_val);
 
 	/* disable clock to CIU */
@@ -2422,9 +2314,9 @@ int dw_mci_probe(struct dw_mci *host)
 	dev_info(host->dev, "Version ID is %04x\n", host->verid);
 
 	if (host->verid < DW_MMC_240A)
-		host->fifo_reg = host->regs + DATA_OFFSET;
+		host->data_offset = DATA_OFFSET;
 	else
-		host->fifo_reg = host->regs + DATA_240A_OFFSET;
+		host->data_offset = DATA_240A_OFFSET;
 
 	tasklet_init(&host->tasklet, dw_mci_tasklet_func, (unsigned long)host);
 	host->card_workqueue = alloc_workqueue("dw-mci-card",
@@ -2486,7 +2378,6 @@ err_dmaunmap:
 	if (host->use_dma && host->dma_ops->exit)
 		host->dma_ops->exit(host);
 
-err_regulator:
 	if (host->vmmc)
 		regulator_disable(host->vmmc);
 
@@ -2588,12 +2479,8 @@ int dw_mci_resume(struct dw_mci *host)
 	if (host->use_dma && host->dma_ops->init)
 		host->dma_ops->init(host);
 
-	/*
-	 * Restore the initial value at FIFOTH register
-	 * And Invalidate the prev_blksz with zero
-	 */
+	/* Restore the old value at FIFOTH register */
 	mci_writel(host, FIFOTH, host->fifoth_val);
-	host->prev_blksz = 0;
 
 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
 	mci_writel(host, INTMASK, SDMMC_INT_CMD_DONE | SDMMC_INT_DATA_OVER |

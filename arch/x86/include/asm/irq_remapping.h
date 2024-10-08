@@ -60,6 +60,12 @@ extern bool setup_remapped_irq(int irq,
 			       struct irq_chip *chip);
 
 void irq_remap_modify_chip_defaults(struct irq_chip *chip);
+int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info);
+
+struct vcpu_data {
+	u64 pi_desc_addr;	/* Physical address of PI Descriptor */
+	u32 vector;		/* Guest vector of the interrupt */
+};
 
 #else  /* CONFIG_IRQ_REMAP */
 
@@ -103,6 +109,12 @@ static inline bool setup_remapped_irq(int irq,
 {
 	return false;
 }
+
+int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info)
+{
+	return -ENOSYS;
+}
+
 #endif /* CONFIG_IRQ_REMAP */
 
 #define dmar_alloc_hwirq()	irq_alloc_hwirq(-1)

@@ -11,6 +11,7 @@
 #include <linux/cpu.h>
 #include <linux/pm.h>
 #include <linux/io.h>
+#include <linux/dmi.h>
 
 #include <asm/fixmap.h>
 #include <asm/hpet.h>
@@ -766,7 +767,7 @@ static int hpet_clocksource_register(void)
 
 	/* Verify whether hpet counter works */
 	t1 = hpet_readl(HPET_COUNTER);
-	rdtscll(start);
+	start = rdtsc();
 
 	/*
 	 * We don't know the TSC frequency yet, but waiting for
@@ -776,7 +777,7 @@ static int hpet_clocksource_register(void)
 	 */
 	do {
 		rep_nop();
-		rdtscll(now);
+		now = rdtsc();
 	} while ((now - start) < 200000UL);
 
 	if (t1 == hpet_readl(HPET_COUNTER)) {
@@ -799,6 +800,9 @@ int __init hpet_enable(void)
 	u32 hpet_period, cfg, id;
 	u64 freq;
 	unsigned int i, last;
+
+	if (boot_cpu_data.x86_model == 85 && dmi_socket_count > 2)
+		boot_hpet_disable = 1;
 
 	if (!is_hpet_capable())
 		return 0;

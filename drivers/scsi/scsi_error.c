@@ -1739,7 +1739,7 @@ int scsi_noretry_cmd(struct scsi_cmnd *scmd)
 		return (scmd->request->cmd_flags & REQ_FAILFAST_DRIVER);
 	}
 
-	switch (status_byte(scmd->result) != CHECK_CONDITION)
+	if (status_byte(scmd->result) != CHECK_CONDITION)
 		return 0;
 
 check_type:

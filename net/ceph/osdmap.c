@@ -707,6 +707,23 @@ bad:
 /*
  * osd map
  */
+struct ceph_osdmap *ceph_osdmap_alloc(void)
+{
+	struct ceph_osdmap *map;
+
+	map = kzalloc(sizeof(*map), GFP_NOIO);
+	if (!map)
+		return NULL;
+
+	map->pg_pools = RB_ROOT;
+	map->pool_max = -1;
+	map->pg_temp = RB_ROOT;
+	map->primary_temp = RB_ROOT;
+	mutex_init(&map->crush_scratch_mutex);
+
+	return map;
+}
+
 void ceph_osdmap_destroy(struct ceph_osdmap *map)
 {
 	dout("osdmap_destroy %p\n", map);
@@ -1230,13 +1247,9 @@ struct ceph_osdmap *ceph_osdmap_decode(void **p, void *end)
 	struct ceph_osdmap *map;
 	int ret;
 
-	map = kzalloc(sizeof(*map), GFP_NOFS);
+	map = ceph_osdmap_alloc();
 	if (!map)
 		return ERR_PTR(-ENOMEM);
-
-	map->pg_temp = RB_ROOT;
-	map->primary_temp = RB_ROOT;
-	mutex_init(&map->crush_scratch_mutex);
 
 	ret = osdmap_decode(p, end, map);
 	if (ret) {
@@ -1497,8 +1510,125 @@ bad:
 	return ERR_PTR(err);
 }
 
+void ceph_oid_copy(struct ceph_object_id *dest,
+		   const struct ceph_object_id *src)
+{
+	WARN_ON(!ceph_oid_empty(dest));
 
+	if (src->name != src->inline_name) {
+		/* very rare, see ceph_object_id definition */
+		dest->name = kmalloc(src->name_len + 1,
+				     GFP_NOIO | __GFP_NOFAIL);
+	}
 
+	memcpy(dest->name, src->name, src->name_len + 1);
+	dest->name_len = src->name_len;
+}
+EXPORT_SYMBOL(ceph_oid_copy);
+
+static __printf(2, 0)
+int oid_printf_vargs(struct ceph_object_id *oid, const char *fmt, va_list ap)
+{
+	int len;
+
+	WARN_ON(!ceph_oid_empty(oid));
+
+	len = vsnprintf(oid->inline_name, sizeof(oid->inline_name), fmt, ap);
+	if (len >= sizeof(oid->inline_name))
+		return len;
+
+	oid->name_len = len;
+	return 0;
+}
+
+/*
+ * If oid doesn't fit into inline buffer, BUG.
+ */
+void ceph_oid_printf(struct ceph_object_id *oid, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	BUG_ON(oid_printf_vargs(oid, fmt, ap));
+	va_end(ap);
+}
+EXPORT_SYMBOL(ceph_oid_printf);
+
+static __printf(3, 0)
+int oid_aprintf_vargs(struct ceph_object_id *oid, gfp_t gfp,
+		      const char *fmt, va_list ap)
+{
+	va_list aq;
+	int len;
+
+	va_copy(aq, ap);
+	len = oid_printf_vargs(oid, fmt, aq);
+	va_end(aq);
+
+	if (len) {
+		char *external_name;
+
+		external_name = kmalloc(len + 1, gfp);
+		if (!external_name)
+			return -ENOMEM;
+
+		oid->name = external_name;
+		WARN_ON(vsnprintf(oid->name, len + 1, fmt, ap) != len);
+		oid->name_len = len;
+	}
+
+	return 0;
+}
+
+/*
+ * If oid doesn't fit into inline buffer, allocate.
+ */
+int ceph_oid_aprintf(struct ceph_object_id *oid, gfp_t gfp,
+		     const char *fmt, ...)
+{
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	ret = oid_aprintf_vargs(oid, gfp, fmt, ap);
+	va_end(ap);
+
+	return ret;
+}
+EXPORT_SYMBOL(ceph_oid_aprintf);
+
+void ceph_oid_destroy(struct ceph_object_id *oid)
+{
+	if (oid->name != oid->inline_name)
+		kfree(oid->name);
+}
+EXPORT_SYMBOL(ceph_oid_destroy);
+
+/*
+ * osds only
+ */
+static bool __osds_equal(const struct ceph_osds *lhs,
+			 const struct ceph_osds *rhs)
+{
+	if (lhs->size == rhs->size &&
+	    !memcmp(lhs->osds, rhs->osds, rhs->size * sizeof(rhs->osds[0])))
+		return true;
+
+	return false;
+}
+
+/*
+ * osds + primary
+ */
+static bool osds_equal(const struct ceph_osds *lhs,
+		       const struct ceph_osds *rhs)
+{
+	if (__osds_equal(lhs, rhs) &&
+	    lhs->primary == rhs->primary)
+		return true;
+
+	return false;
+}
 
 static bool osds_valid(const struct ceph_osds *set)
 {
@@ -1530,6 +1660,101 @@ void ceph_osds_copy(struct ceph_osds *dest, const struct ceph_osds *src)
 	memcpy(dest->osds, src->osds, src->size * sizeof(src->osds[0]));
 	dest->size = src->size;
 	dest->primary = src->primary;
+}
+
+static bool is_split(const struct ceph_pg *pgid,
+		     u32 old_pg_num,
+		     u32 new_pg_num)
+{
+	int old_bits = calc_bits_of(old_pg_num);
+	int old_mask = (1 << old_bits) - 1;
+	int n;
+
+	WARN_ON(pgid->seed >= old_pg_num);
+	if (new_pg_num <= old_pg_num)
+		return false;
+
+	for (n = 1; ; n++) {
+		int next_bit = n << (old_bits - 1);
+		u32 s = next_bit | pgid->seed;
+
+		if (s < old_pg_num || s == pgid->seed)
+			continue;
+		if (s >= new_pg_num)
+			break;
+
+		s = ceph_stable_mod(s, old_pg_num, old_mask);
+		if (s == pgid->seed)
+			return true;
+	}
+
+	return false;
+}
+
+bool ceph_is_new_interval(const struct ceph_osds *old_acting,
+			  const struct ceph_osds *new_acting,
+			  const struct ceph_osds *old_up,
+			  const struct ceph_osds *new_up,
+			  int old_size,
+			  int new_size,
+			  int old_min_size,
+			  int new_min_size,
+			  u32 old_pg_num,
+			  u32 new_pg_num,
+			  bool old_sort_bitwise,
+			  bool new_sort_bitwise,
+			  const struct ceph_pg *pgid)
+{
+	return !osds_equal(old_acting, new_acting) ||
+	       !osds_equal(old_up, new_up) ||
+	       old_size != new_size ||
+	       old_min_size != new_min_size ||
+	       is_split(pgid, old_pg_num, new_pg_num) ||
+	       old_sort_bitwise != new_sort_bitwise;
+}
+
+static int calc_pg_rank(int osd, const struct ceph_osds *acting)
+{
+	int i;
+
+	for (i = 0; i < acting->size; i++) {
+		if (acting->osds[i] == osd)
+			return i;
+	}
+
+	return -1;
+}
+
+static bool primary_changed(const struct ceph_osds *old_acting,
+			    const struct ceph_osds *new_acting)
+{
+	if (!old_acting->size && !new_acting->size)
+		return false; /* both still empty */
+
+	if (!old_acting->size ^ !new_acting->size)
+		return true; /* was empty, now not, or vice versa */
+
+	if (old_acting->primary != new_acting->primary)
+		return true; /* primary changed */
+
+	if (calc_pg_rank(old_acting->primary, old_acting) !=
+	    calc_pg_rank(new_acting->primary, new_acting))
+		return true;
+
+	return false; /* same primary (tho replicas may have changed) */
+}
+
+bool ceph_osds_changed(const struct ceph_osds *old_acting,
+		       const struct ceph_osds *new_acting,
+		       bool any_change)
+{
+	if (primary_changed(old_acting, new_acting))
+		return true;
+
+	if (any_change && !__osds_equal(old_acting, new_acting))
+		return true;
+
+	return false;
 }
 
 /*
@@ -1603,30 +1828,31 @@ invalid:
 EXPORT_SYMBOL(ceph_calc_file_object_mapping);
 
 /*
- * Calculate mapping of a (oloc, oid) pair to a PG.  Should only be
- * called with target's (oloc, oid), since tiering isn't taken into
- * account.
+ * Map an object into a PG.
+ *
+ * Should only be called with target_oid and target_oloc (as opposed to
+ * base_oid and base_oloc), since tiering isn't taken into account.
  */
-int ceph_oloc_oid_to_pg(struct ceph_osdmap *osdmap,
-			struct ceph_object_locator *oloc,
-			struct ceph_object_id *oid,
-			struct ceph_pg *pg_out)
+int ceph_object_locator_to_pg(struct ceph_osdmap *osdmap,
+			      struct ceph_object_id *oid,
+			      struct ceph_object_locator *oloc,
+			      struct ceph_pg *raw_pgid)
 {
 	struct ceph_pg_pool_info *pi;
 
-	pi = __lookup_pg_pool(&osdmap->pg_pools, oloc->pool);
+	pi = ceph_pg_pool_by_id(osdmap, oloc->pool);
 	if (!pi)
-		return -EIO;
+		return -ENOENT;
 
-	pg_out->pool = oloc->pool;
-	pg_out->seed = ceph_str_hash(pi->object_hash, oid->name,
-				     oid->name_len);
+	raw_pgid->pool = oloc->pool;
+	raw_pgid->seed = ceph_str_hash(pi->object_hash, oid->name,
+				       oid->name_len);
 
-	dout("%s '%.*s' pgid %llu.%x\n", __func__, oid->name_len, oid->name,
-	     pg_out->pool, pg_out->seed);
+	dout("%s %s -> raw_pgid %llu.%x\n", __func__, oid->name,
+	     raw_pgid->pool, raw_pgid->seed);
 	return 0;
 }
-EXPORT_SYMBOL(ceph_oloc_oid_to_pg);
+EXPORT_SYMBOL(ceph_object_locator_to_pg);
 
 /*
  * Map a raw PG (full precision ps) into an actual PG.

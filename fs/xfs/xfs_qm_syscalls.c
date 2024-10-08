@@ -241,7 +241,7 @@ xfs_qm_scall_trunc_qfile(
 	tp = xfs_trans_alloc(mp, XFS_TRANS_TRUNCATE_FILE);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
 		goto out_put;
 	}
@@ -254,15 +254,14 @@ xfs_qm_scall_trunc_qfile(
 
 	error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, 0);
 	if (error) {
-		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES |
-				     XFS_TRANS_ABORT);
+		xfs_trans_cancel(tp);
 		goto out_unlock;
 	}
 
 	ASSERT(ip->i_d.di_nextents == 0);
 
 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
-	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+	error = xfs_trans_commit(tp);
 
 out_unlock:
 	xfs_iunlock(ip, XFS_ILOCK_EXCL | XFS_IOLOCK_EXCL);
@@ -456,7 +455,7 @@ xfs_qm_scall_getqstat(
 			IRELE(gip);
 	}
 	if (pip) {
-		out->qs_gquota.qfs_ino = mp->m_sb.sb_gquotino;
+		out->qs_gquota.qfs_ino = mp->m_sb.sb_pquotino;
 		out->qs_gquota.qfs_nblks = pip->i_d.di_nblocks;
 		out->qs_gquota.qfs_nextents = pip->i_d.di_nextents;
 		if (temppqip)
@@ -560,6 +559,7 @@ xfs_qm_scall_setqlim(
 	struct xfs_disk_dquot	*ddq;
 	struct xfs_dquot	*dqp;
 	struct xfs_trans	*tp;
+	struct xfs_def_quota	*defq;
 	int			error;
 	xfs_qcnt_t		hard, soft;
 
@@ -587,12 +587,14 @@ xfs_qm_scall_setqlim(
 		ASSERT(error != -ENOENT);
 		goto out_unlock;
 	}
+
+	defq = xfs_get_defquota(dqp, q);
 	xfs_dqunlock(dqp);
 
 	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_SETQLIM);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_setqlim, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		goto out_rele;
 	}
 
@@ -614,8 +616,8 @@ xfs_qm_scall_setqlim(
 		ddq->d_blk_softlimit = cpu_to_be64(soft);
 		xfs_dquot_set_prealloc_limits(dqp);
 		if (id == 0) {
-			q->qi_bhardlimit = hard;
-			q->qi_bsoftlimit = soft;
+			defq->bhardlimit = hard;
+			defq->bsoftlimit = soft;
 		}
 	} else {
 		xfs_debug(mp, "blkhard %Ld < blksoft %Ld", hard, soft);
@@ -630,8 +632,8 @@ xfs_qm_scall_setqlim(
 		ddq->d_rtb_hardlimit = cpu_to_be64(hard);
 		ddq->d_rtb_softlimit = cpu_to_be64(soft);
 		if (id == 0) {
-			q->qi_rtbhardlimit = hard;
-			q->qi_rtbsoftlimit = soft;
+			defq->rtbhardlimit = hard;
+			defq->rtbsoftlimit = soft;
 		}
 	} else {
 		xfs_debug(mp, "rtbhard %Ld < rtbsoft %Ld", hard, soft);
@@ -647,8 +649,8 @@ xfs_qm_scall_setqlim(
 		ddq->d_ino_hardlimit = cpu_to_be64(hard);
 		ddq->d_ino_softlimit = cpu_to_be64(soft);
 		if (id == 0) {
-			q->qi_ihardlimit = hard;
-			q->qi_isoftlimit = soft;
+			defq->ihardlimit = hard;
+			defq->isoftlimit = soft;
 		}
 	} else {
 		xfs_debug(mp, "ihard %Ld < isoft %Ld", hard, soft);
@@ -703,7 +705,7 @@ xfs_qm_scall_setqlim(
 	dqp->dq_flags |= XFS_DQ_DIRTY;
 	xfs_trans_log_dquot(tp, dqp);
 
-	error = xfs_trans_commit(tp, 0);
+	error = xfs_trans_commit(tp);
 
 out_rele:
 	xfs_qm_dqrele(dqp);
@@ -726,7 +728,7 @@ xfs_qm_log_quotaoff_end(
 
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_equotaoff, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		return error;
 	}
 
@@ -740,8 +742,7 @@ xfs_qm_log_quotaoff_end(
 	 * We don't care about quotoff's performance.
 	 */
 	xfs_trans_set_sync(tp);
-	error = xfs_trans_commit(tp, 0);
-	return error;
+	return xfs_trans_commit(tp);
 }
 
 
@@ -760,7 +761,7 @@ xfs_qm_log_quotaoff(
 	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_QUOTAOFF);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_qm_quotaoff, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		goto out;
 	}
 
@@ -779,7 +780,7 @@ xfs_qm_log_quotaoff(
 	 * We don't care about quotoff's performance.
 	 */
 	xfs_trans_set_sync(tp);
-	error = xfs_trans_commit(tp, 0);
+	error = xfs_trans_commit(tp);
 	if (error)
 		goto out;
 
@@ -792,9 +793,10 @@ out:
 int
 xfs_qm_scall_getquota(
 	struct xfs_mount	*mp,
-	xfs_dqid_t		id,
+	xfs_dqid_t		*id,
 	uint			type,
-	struct fs_disk_quota	*dst)
+	struct fs_disk_quota	*dst,
+	uint			dqget_flags)
 {
 	struct xfs_dquot	*dqp;
 	int			error;
@@ -804,7 +806,7 @@ xfs_qm_scall_getquota(
 	 * we aren't passing the XFS_QMOPT_DOALLOC flag. If it doesn't
 	 * exist, we'll get ENOENT back.
 	 */
-	error = xfs_qm_dqget(mp, NULL, id, type, 0, &dqp);
+	error = xfs_qm_dqget(mp, NULL, *id, type, dqget_flags, &dqp);
 	if (error)
 		return error;
 
@@ -816,6 +818,9 @@ xfs_qm_scall_getquota(
 		error = -ENOENT;
 		goto out_put;
 	}
+
+	/* Fill in the ID we actually read from disk */
+	*id = be32_to_cpu(dqp->q_core.d_id);
 
 	memset(dst, 0, sizeof(*dst));
 	dst->d_version = FS_DQUOT_VERSION;
@@ -861,7 +866,7 @@ xfs_qm_scall_getquota(
 	if (((XFS_IS_UQUOTA_ENFORCED(mp) && dst->d_flags == FS_USER_QUOTA) ||
 	     (XFS_IS_GQUOTA_ENFORCED(mp) && dst->d_flags == FS_GROUP_QUOTA) ||
 	     (XFS_IS_PQUOTA_ENFORCED(mp) && dst->d_flags == FS_PROJ_QUOTA)) &&
-	    dst->d_id != 0) {
+	    *id != 0) {
 		if ((dst->d_bcount > dst->d_blk_softlimit) &&
 		    (dst->d_blk_softlimit > 0)) {
 			ASSERT(dst->d_btimer != 0);

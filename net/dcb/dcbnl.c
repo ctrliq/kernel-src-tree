@@ -1033,6 +1033,7 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
 	struct nlattr *ieee, *app;
 	struct dcb_app_type *itr;
 	const struct dcbnl_rtnl_ops *ops = netdev->dcbnl_ops;
+	const struct dcbnl_rtnl_ops_ext *eops = netdev->dcbnl_ops_ext;
 	int dcbx;
 	int err;
 
@@ -1064,11 +1065,11 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
 		}
 	}
 
-	if (ops->ieee_getqcn) {
+	if (eops && eops->ieee_getqcn) {
 		struct ieee_qcn qcn;
 
 		memset(&qcn, 0, sizeof(qcn));
-		err = ops->ieee_getqcn(netdev, &qcn);
+		err = eops->ieee_getqcn(netdev, &qcn);
 		if (!err) {
 			err = nla_put(skb, DCB_ATTR_IEEE_QCN,
 				      sizeof(qcn), &qcn);
@@ -1077,11 +1078,11 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
 		}
 	}
 
-	if (ops->ieee_getqcnstats) {
+	if (eops && eops->ieee_getqcnstats) {
 		struct ieee_qcn_stats qcn_stats;
 
 		memset(&qcn_stats, 0, sizeof(qcn_stats));
-		err = ops->ieee_getqcnstats(netdev, &qcn_stats);
+		err = eops->ieee_getqcnstats(netdev, &qcn_stats);
 		if (!err) {
 			err = nla_put(skb, DCB_ATTR_IEEE_QCN_STATS,
 				      sizeof(qcn_stats), &qcn_stats);
@@ -1412,6 +1413,7 @@ static int dcbnl_ieee_set(struct net_device *netdev, struct nlmsghdr *nlh,
 			  u32 seq, struct nlattr **tb, struct sk_buff *skb)
 {
 	const struct dcbnl_rtnl_ops *ops = netdev->dcbnl_ops;
+	const struct dcbnl_rtnl_ops_ext *eops = netdev->dcbnl_ops_ext;
 	struct nlattr *ieee[DCB_ATTR_IEEE_MAX + 1];
 	int err;
 
@@ -1441,11 +1443,11 @@ static int dcbnl_ieee_set(struct net_device *netdev, struct nlmsghdr *nlh,
 			goto err;
 	}
 
-	if (ieee[DCB_ATTR_IEEE_QCN] && ops->ieee_setqcn) {
+	if (ieee[DCB_ATTR_IEEE_QCN] && eops && eops->ieee_setqcn) {
 		struct ieee_qcn *qcn =
 			nla_data(ieee[DCB_ATTR_IEEE_QCN]);
 
-		err = ops->ieee_setqcn(netdev, qcn);
+		err = eops->ieee_setqcn(netdev, qcn);
 		if (err)
 			goto err;
 	}

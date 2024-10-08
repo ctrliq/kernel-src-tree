@@ -21,6 +21,8 @@ int irq_remap_broken;
 int disable_sourceid_checking;
 int no_x2apic_optout;
 
+int disable_irq_post = 1;
+
 static int disable_irq_remap;
 static struct irq_remap_ops *remap_ops;
 
@@ -342,6 +344,27 @@ int setup_hpet_msi_remapped(unsigned int irq, unsigned int id)
 
 	return default_setup_hpet_msi(irq, id);
 }
+
+/**
+ *	irq_set_vcpu_affinity - Set vcpu affinity for the interrupt
+ *	@irq: interrupt number to set affinity
+ *	@vcpu_info: vCPU specific data
+ *
+ *	This function uses the vCPU specific data to set the vCPU
+ *	affinity for an irq. The vCPU specific data is passed from
+ *	outside, such as KVM. One example code path is as below:
+ *	KVM -> IOMMU -> irq_set_vcpu_affinity().
+ */
+int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info)
+{
+	struct irq_cfg *cfg = irq_get_chip_data(irq);
+
+	if (!irq_remapped(cfg) || !remap_ops->irq_set_vcpu_affinity)
+		return -ENOSYS;
+
+	return remap_ops->irq_set_vcpu_affinity(irq, vcpu_info);
+}
+EXPORT_SYMBOL_GPL(irq_set_vcpu_affinity);
 
 void panic_if_irq_remap(const char *msg)
 {

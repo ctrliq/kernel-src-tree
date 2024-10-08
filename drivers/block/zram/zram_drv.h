@@ -20,12 +20,6 @@
 
 #include "zcomp.h"
 
-/*
- * Some arbitrary value. This is just to catch
- * invalid value for num_devices module parameter.
- */
-static const unsigned max_num_devices = 32;
-
 /*-- Configurable parameters */
 
 /*
@@ -50,10 +44,24 @@ static const size_t max_zpage_size = PAGE_SIZE / 4 * 3;
 #define ZRAM_SECTOR_PER_LOGICAL_BLOCK	\
 	(1 << (ZRAM_LOGICAL_BLOCK_SHIFT - SECTOR_SHIFT))
 
-/* Flags for zram pages (table[page_no].flags) */
+
+/*
+ * The lower ZRAM_FLAG_SHIFT bits of table.value is for
+ * object size (excluding header), the higher bits is for
+ * zram_pageflags.
+ *
+ * zram is mainly used for memory efficiency so we want to keep memory
+ * footprint small so we can squeeze size and flags into a field.
+ * The lower ZRAM_FLAG_SHIFT bits is for object size (excluding header),
+ * the higher bits is for zram_pageflags.
+ */
+#define ZRAM_FLAG_SHIFT 24
+
+/* Flags for zram pages (table[page_no].value) */
 enum zram_pageflags {
 	/* Page consists entirely of zeros */
-	ZRAM_ZERO,
+	ZRAM_ZERO = ZRAM_FLAG_SHIFT,
+	ZRAM_ACCESS,	/* page is now accessed */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -63,9 +71,8 @@ enum zram_pageflags {
 /* Allocated for each disk page */
 struct zram_table_entry {
 	unsigned long handle;
-	u16 size;	/* object size (excluding header) */
-	u8 flags;
-} __aligned(4);
+	unsigned long value;
+};
 
 struct zram_stats {
 	atomic64_t compr_data_size;	/* compressed size of pages stored */
@@ -81,31 +88,35 @@ struct zram_stats {
 };
 
 struct zram_meta {
-	rwlock_t tb_lock;	/* protect table */
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
 };
 
 struct zram {
 	struct zram_meta *meta;
-	struct request_queue *queue;
-	struct gendisk *disk;
 	struct zcomp *comp;
-
-	/* Prevent concurrent execution of device init, reset and R/W request */
+	struct gendisk *disk;
+	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
+	/*
+	 * the number of pages zram can consume for storing compressed data
+	 */
+	unsigned long limit_pages;
+	int max_comp_streams;
+
+	struct zram_stats stats;
+	atomic_t refcount; /* refcount for zram_meta */
+	/* wait all IO under all of cpu are done */
+	wait_queue_head_t io_done;
 	/*
 	 * This is the limit on amount of *uncompressed* worth of data
 	 * we can store in a disk.
 	 */
 	u64 disksize;	/* bytes */
-	int max_comp_streams;
-	struct zram_stats stats;
-	/*
-	 * the number of pages zram can consume for storing compressed data
-	 */
-	unsigned long limit_pages;
-
 	char compressor[10];
+	/*
+	 * zram is claimed so open request will be failed
+	 */
+	bool claim; /* Protected by bdev->bd_mutex */
 };
 #endif

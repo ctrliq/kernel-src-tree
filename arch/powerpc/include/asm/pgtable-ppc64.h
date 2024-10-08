@@ -426,9 +426,9 @@ static inline char *get_hpte_slot_array(pmd_t *pmdp)
 
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern void hpte_do_hugepage_flush(struct mm_struct *mm, unsigned long addr,
 				   pmd_t *pmdp, unsigned long old_pmd);
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern pmd_t pfn_pmd(unsigned long pfn, pgprot_t pgprot);
 extern pmd_t mk_pmd(struct page *page, pgprot_t pgprot);
 extern pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot);
@@ -463,6 +463,14 @@ static inline int pmd_trans_splitting(pmd_t pmd)
 }
 
 extern int has_transparent_hugepage(void);
+#else
+static inline void hpte_do_hugepage_flush(struct mm_struct *mm,
+					  unsigned long addr, pmd_t *pmdp,
+					  unsigned long old_pmd)
+{
+
+	WARN(1, "%s called with THP disabled\n", __func__);
+}
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static inline pte_t pmd_pte(pmd_t pmd)

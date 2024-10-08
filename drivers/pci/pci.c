@@ -4269,6 +4269,36 @@ int pci_set_vga_state(struct pci_dev *dev, bool decode,
 	return 0;
 }
 
+/**
+ * pci_add_dma_alias - Add a DMA devfn alias for a device
+ * @dev: the PCI device for which alias is added
+ * @devfn: alias slot and function
+ *
+ * This helper encodes 8-bit devfn as bit number in dma_alias_mask.
+ * It should be called early, preferably as PCI fixup header quirk.
+ */
+void pci_add_dma_alias(struct pci_dev *dev, u8 devfn)
+{
+	if (!dev->pci_dev_rh->dma_alias_mask)
+		dev->pci_dev_rh->dma_alias_mask = kcalloc(BITS_TO_LONGS(U8_MAX),
+							  sizeof(long), GFP_KERNEL);
+	if (!dev->pci_dev_rh->dma_alias_mask) {
+		dev_warn(&dev->dev, "Unable to allocate DMA alias mask\n");
+		return;
+	}
+	set_bit(devfn, dev->pci_dev_rh->dma_alias_mask);
+	dev_info(&dev->dev, "Enabling fixed DMA alias to %02x.%d\n",
+		 PCI_SLOT(devfn), PCI_FUNC(devfn));
+}
+
+bool pci_devs_are_dma_aliases(struct pci_dev *dev1, struct pci_dev *dev2)
+{
+	return (dev1->pci_dev_rh->dma_alias_mask &&
+		test_bit(dev2->devfn, dev1->pci_dev_rh->dma_alias_mask)) ||
+		(dev2->pci_dev_rh->dma_alias_mask &&
+		 test_bit(dev1->devfn, dev2->pci_dev_rh->dma_alias_mask));
+}
+
 bool pci_device_is_present(struct pci_dev *pdev)
 {
 	u32 v;
@@ -4276,6 +4306,17 @@ bool pci_device_is_present(struct pci_dev *pdev)
 	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v, 0);
 }
 EXPORT_SYMBOL_GPL(pci_device_is_present);
+
+void pci_ignore_hotplug(struct pci_dev *dev)
+{
+	struct pci_dev *bridge = dev->bus->self;
+
+	dev->ignore_hotplug = 1;
+	/* Propagate the "ignore hotplug" setting to the parent bridge. */
+	if (bridge)
+		bridge->ignore_hotplug = 1;
+}
+EXPORT_SYMBOL_GPL(pci_ignore_hotplug);
 
 #define RESOURCE_ALIGNMENT_PARAM_SIZE COMMAND_LINE_SIZE
 static char resource_alignment_param[RESOURCE_ALIGNMENT_PARAM_SIZE] = {0};

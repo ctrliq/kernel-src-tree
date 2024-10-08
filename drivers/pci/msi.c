@@ -56,16 +56,6 @@ void __weak arch_teardown_msi_irq(unsigned int irq)
 
 	chip->teardown_irq(chip, irq);
 }
-
-int __weak arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
-{
-	struct msi_chip *chip = dev->bus->msi;
-
-	if (!chip || !chip->check_device)
-		return 0;
-
-	return chip->check_device(chip, dev, nvec, type);
-}
 #else
 int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
 {
@@ -74,11 +64,6 @@ int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
 
 void __weak arch_teardown_msi_irq(unsigned int irq)
 {
-}
-
-int __weak arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
-{
-	return 0;
 }
 #endif /* CONFIG_GENERIC_HARDIRQS */
 
@@ -714,7 +699,6 @@ static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
 		entry->msi_attrib.is_64		= 1;
 		entry->msi_attrib.entry_nr	= entries[i].entry;
 		entry->msi_attrib.default_irq	= dev->irq;
-		entry->msi_attrib.pos		= dev->msix_cap;
 		entry->mask_base		= base;
 
 		list_add_tail(&entry->list, &dev->msi_list);
@@ -826,23 +810,24 @@ out_free:
 }
 
 /**
- * pci_msi_check_device - check whether MSI may be enabled on a device
+ * pci_msi_supported - check whether MSI may be enabled on a device
  * @dev: pointer to the pci_dev data structure of MSI device function
  * @nvec: how many MSIs have been requested ?
- * @type: are we checking for MSI or MSI-X ?
  *
  * Look at global flags, the device itself, and its parent buses
  * to determine if MSI/-X are supported for the device. If MSI/-X is
- * supported return 0, else return an error code.
+ * supported return 1, else return 0.
  **/
-static int pci_msi_check_device(struct pci_dev *dev, int nvec, int type)
+static int pci_msi_supported(struct pci_dev *dev, int nvec)
 {
 	struct pci_bus *bus;
-	int ret;
 
 	/* MSI must be globally enabled and supported by the device */
-	if (!pci_msi_enable || !dev || dev->no_msi)
-		return -EINVAL;
+	if (!pci_msi_enable)
+		return 0;
+
+	if (!dev || dev->no_msi || dev->current_state != PCI_D0)
+		return 0;
 
 	/*
 	 * You can't ask to have 0 or less MSIs configured.
@@ -850,7 +835,7 @@ static int pci_msi_check_device(struct pci_dev *dev, int nvec, int type)
 	 *  b) the list manipulation code assumes nvec >= 1.
 	 */
 	if (nvec < 1)
-		return -ERANGE;
+		return 0;
 
 	/*
 	 * Any bridge which does NOT route MSI transactions from its
@@ -861,13 +846,9 @@ static int pci_msi_check_device(struct pci_dev *dev, int nvec, int type)
 	 */
 	for (bus = dev->bus; bus; bus = bus->parent)
 		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
-			return -EINVAL;
+			return 0;
 
-	ret = arch_msi_check_device(dev, nvec, type);
-	if (ret)
-		return ret;
-
-	return 0;
+	return 1;
 }
 
 /**
@@ -921,9 +902,8 @@ int pci_enable_msi_block(struct pci_dev *dev, int nvec)
 	if (nvec > maxvec)
 		return maxvec;
 
-	status = pci_msi_check_device(dev, nvec, PCI_CAP_ID_MSI);
-	if (status)
-		return status;
+	if (!pci_msi_supported(dev, nvec))
+		return -EINVAL;
 
 	WARN_ON(!!dev->msi_enabled);
 
@@ -1013,12 +993,11 @@ int pci_enable_msix(struct pci_dev *dev, struct msix_entry *entries, int nvec)
 	int nr_entries;
 	int i, j;
 
-	if (!entries || !dev->msix_cap || dev->current_state != PCI_D0)
+	if (!pci_msi_supported(dev, nvec))
 		return -EINVAL;
 
-	status = pci_msi_check_device(dev, nvec, PCI_CAP_ID_MSIX);
-	if (status)
-		return status;
+	if (!entries)
+		return -EINVAL;
 
 	nr_entries = pci_msix_vec_count(dev);
 	if (nr_entries < 0)
@@ -1113,7 +1092,7 @@ int pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec)
 	int nvec;
 	int rc;
 
-	if (dev->current_state != PCI_D0)
+	if (!pci_msi_supported(dev, minvec))
 		return -EINVAL;
 
 	WARN_ON(!!dev->msi_enabled);
@@ -1135,17 +1114,6 @@ int pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec)
 		return -EINVAL;
 	else if (nvec > maxvec)
 		nvec = maxvec;
-
-	do {
-		rc = pci_msi_check_device(dev, nvec, PCI_CAP_ID_MSI);
-		if (rc < 0) {
-			return rc;
-		} else if (rc > 0) {
-			if (rc < minvec)
-				return -ENOSPC;
-			nvec = rc;
-		}
-	} while (rc);
 
 	do {
 		rc = msi_capability_init(dev, nvec);

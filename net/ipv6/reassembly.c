@@ -111,7 +111,10 @@ bool ip6_frag_match(struct inet_frag_queue *q, void *a)
 	return	fq->id == arg->id &&
 		fq->user == arg->user &&
 		ipv6_addr_equal(&fq->saddr, arg->src) &&
-		ipv6_addr_equal(&fq->daddr, arg->dst);
+		ipv6_addr_equal(&fq->daddr, arg->dst) &&
+		(arg->iif == fq->iif ||
+		 !(ipv6_addr_type(arg->dst) & (IPV6_ADDR_MULTICAST |
+					       IPV6_ADDR_LINKLOCAL)));
 }
 EXPORT_SYMBOL(ip6_frag_match);
 
@@ -180,7 +183,7 @@ static void ip6_frag_expire(unsigned long data)
 
 static __inline__ struct frag_queue *
 fq_find(struct net *net, __be32 id, const struct in6_addr *src,
-	const struct in6_addr *dst, u8 ecn)
+	const struct in6_addr *dst, int iif, u8 ecn)
 {
 	struct inet_frag_queue *q;
 	struct ip6_create_arg arg;
@@ -190,6 +193,7 @@ fq_find(struct net *net, __be32 id, const struct in6_addr *src,
 	arg.user = IP6_DEFRAG_LOCAL_DELIVER;
 	arg.src = src;
 	arg.dst = dst;
+	arg.iif = iif;
 	arg.ecn = ecn;
 
 	read_lock(&ip6_frags.lock);
@@ -493,10 +497,8 @@ static int ip6_frag_reasm(struct frag_queue *fq, struct sk_buff *prev,
 	IP6CB(head)->flags |= IP6SKB_FRAGMENTED;
 
 	/* Yes, and fold redundant checksum back. 8) */
-	if (head->ip_summed == CHECKSUM_COMPLETE)
-		head->csum = csum_partial(skb_network_header(head),
-					  skb_network_header_len(head),
-					  head->csum);
+	skb_postpush_rcsum(head, skb_network_header(head),
+			   skb_network_header_len(head));
 
 	rcu_read_lock();
 	IP6_INC_STATS_BH(net, __in6_dev_get(dev), IPSTATS_MIB_REASMOKS);
@@ -558,8 +560,8 @@ static int ipv6_frag_rcv(struct sk_buff *skb)
 				 IPSTATS_MIB_REASMFAILS, evicted);
 
 	fq = fq_find(net, fhdr->identification, &hdr->saddr, &hdr->daddr,
-		     ip6_frag_ecn(hdr));
-	if (fq != NULL) {
+		     skb->dev ? skb->dev->ifindex : 0, ip6_frag_ecn(hdr));
+	if (fq) {
 		int ret;
 
 		spin_lock(&fq->q.lock);

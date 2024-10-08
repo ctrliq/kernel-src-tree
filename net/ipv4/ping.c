@@ -252,6 +252,7 @@ static int ping_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
 	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
 	struct inet_sock *isk = inet_sk(sk);
+	struct net *net = sock_net(sk);
 	unsigned short snum;
 	int chk_addr_ret;
 	int err;
@@ -266,7 +267,7 @@ static int ping_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	if (addr->sin_addr.s_addr == htonl(INADDR_ANY))
 		chk_addr_ret = RTN_LOCAL;
 
-	if ((sysctl_ip_nonlocal_bind == 0 &&
+	if ((net->ipv4_sysctl_ip_nonlocal_bind == 0 &&
 	    isk->freebind == 0 && isk->transparent == 0 &&
 	     chk_addr_ret != RTN_LOCAL) ||
 	    chk_addr_ret == RTN_MULTICAST ||

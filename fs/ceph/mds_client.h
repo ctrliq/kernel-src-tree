@@ -44,6 +44,7 @@ struct ceph_mds_reply_info_in {
 	u64 inline_version;
 	u32 inline_len;
 	char *inline_data;
+	u32 pool_ns_len;
 };
 
 /*
@@ -227,7 +228,7 @@ struct ceph_mds_request {
 	int r_err;
 	bool r_aborted;
 
-	unsigned long r_timeout;  /* optional.  jiffies */
+	unsigned long r_timeout;  /* optional.  jiffies, 0 is "wait forever" */
 	unsigned long r_started;  /* start time to measure timeout against */
 	unsigned long r_request_started; /* start time for mds request only,
 					    used to measure lease durations */
@@ -235,6 +236,9 @@ struct ceph_mds_request {
 	/* link unsafe requests to parent directory, for fsync */
 	struct inode	*r_unsafe_dir;
 	struct list_head r_unsafe_dir_item;
+
+	/* unsafe requests that modify the target inode */
+	struct list_head r_unsafe_target_item;
 
 	struct ceph_mds_session *r_session;
 
@@ -253,10 +257,19 @@ struct ceph_mds_request {
 	bool		  r_got_unsafe, r_got_safe, r_got_result;
 
 	bool              r_did_prepopulate;
+	long long	  r_dir_release_cnt;
+	long long	  r_dir_ordered_cnt;
+	int		  r_readdir_cache_idx;
 	u32               r_readdir_offset;
 
 	struct ceph_cap_reservation r_caps_reservation;
 	int r_num_caps;
+};
+
+struct ceph_pool_perm {
+	struct rb_node node;
+	u32 pool;
+	int perm;
 };
 
 /*
@@ -331,6 +344,9 @@ struct ceph_mds_client {
 	spinlock_t	  dentry_lru_lock;
 	struct list_head  dentry_lru;
 	int		  num_dentry;
+
+	struct rw_semaphore     pool_perm_rwsem;
+	struct rb_root		pool_perm_tree;
 };
 
 extern const char *ceph_mds_op_name(int op);

@@ -15,6 +15,7 @@
 #include <linux/backing-dev.h>
 #include <linux/wait.h>
 #include <linux/mempool.h>
+#include <linux/pfn.h>
 #include <linux/bio.h>
 #include <linux/stringify.h>
 #include <linux/gfp.h>
@@ -39,6 +40,7 @@ struct sg_io_hdr;
 struct bsg_job;
 struct blkcg_gq;
 struct blk_flush_queue;
+struct pr_ops;
 
 #define BLKDEV_MIN_RQ	4
 #define BLKDEV_MAX_RQ	128	/* Default maximum */
@@ -81,7 +83,11 @@ enum rq_cmd_type_bits {
 	REQ_TYPE_PM_SUSPEND,		/* suspend request */
 	REQ_TYPE_PM_RESUME,		/* resume request */
 	REQ_TYPE_PM_SHUTDOWN,		/* shutdown request */
+#ifdef __GENKSYMS__
+	REQ_TYPE_SPECIAL,		/* driver defined type */
+#else
 	REQ_TYPE_DRV_PRIV,		/* driver defined type */
+#endif
 	/*
 	 * for ATA/ATAPI devices. this really doesn't belong here, ide should
 	 * use REQ_TYPE_DRV_PRIV and use rq->cmd[0] with the range of driver
@@ -292,6 +298,10 @@ struct blk_queue_tag {
 #define BLK_SCSI_MAX_CMDS	(256)
 #define BLK_SCSI_CMD_PER_LONG	(BLK_SCSI_MAX_CMDS / (sizeof(long) * 8))
 
+struct queue_limits_aux {
+	unsigned long virt_boundary_mask;
+};
+
 struct queue_limits {
 	unsigned long		bounce_pfn;
 	unsigned long		seg_boundary_mask;
@@ -324,8 +334,8 @@ struct queue_limits {
 	 */
 	unsigned int		xcopy_reserved;
 	RH_KABI_USE(1, unsigned int chunk_sectors)
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(2, unsigned int max_dev_sectors)
+	RH_KABI_USE(3, struct queue_limits_aux *limits_aux)
 };
 
 struct request_queue {
@@ -516,10 +526,11 @@ struct request_queue {
 	RH_KABI_EXTEND(struct list_head		requeue_list)
 	RH_KABI_EXTEND(spinlock_t			requeue_lock)
 	RH_KABI_EXTEND(struct work_struct		requeue_work)
-	RH_KABI_EXTEND(int				mq_freeze_depth)
+	RH_KABI_EXTEND(atomic_t				mq_freeze_depth)
 	RH_KABI_EXTEND(struct blk_flush_queue   *fq)
-	RH_KABI_EXTEND(struct percpu_ref	mq_usage_counter)
+	RH_KABI_EXTEND(struct percpu_ref	q_usage_counter)
 	RH_KABI_EXTEND(bool			mq_sysfs_init_done)
+	RH_KABI_EXTEND(struct work_struct	timeout_work)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
@@ -823,6 +834,17 @@ static inline void rq_flush_dcache_pages(struct request *rq)
 }
 #endif
 
+#ifdef CONFIG_PRINTK
+#define vfs_msg(sb, level, fmt, ...)				\
+	__vfs_msg(sb, level, fmt, ##__VA_ARGS__)
+#else
+#define vfs_msg(sb, level, fmt, ...)				\
+do {								\
+	no_printk(fmt, ##__VA_ARGS__);				\
+	__vfs_msg(sb, "", " ");					\
+} while (0)
+#endif
+
 extern int blk_register_queue(struct gendisk *disk);
 extern void blk_unregister_queue(struct gendisk *disk);
 extern void generic_make_request(struct bio *bio);
@@ -836,7 +858,6 @@ extern void blk_rq_set_block_pc(struct request *);
 extern void blk_requeue_request(struct request_queue *, struct request *);
 extern void blk_add_request_payload(struct request *rq, struct page *page,
 		unsigned int len);
-extern int blk_rq_check_limits(struct request_queue *q, struct request *rq);
 extern int blk_lld_busy(struct request_queue *q);
 extern int blk_rq_prep_clone(struct request *rq, struct request *rq_src,
 			     struct bio_set *bs, gfp_t gfp_mask,
@@ -876,6 +897,8 @@ static inline void blk_set_queue_congested(struct request_queue *q, int sync)
 	set_bdi_congested(&q->backing_dev_info, sync);
 }
 
+extern int blk_queue_enter(struct request_queue *q, gfp_t gfp);
+extern void blk_queue_exit(struct request_queue *q);
 extern void blk_start_queue(struct request_queue *q);
 extern void blk_stop_queue(struct request_queue *q);
 extern void blk_sync_queue(struct request_queue *q);
@@ -1070,6 +1093,7 @@ extern int blk_queue_dma_drain(struct request_queue *q,
 			       void *buf, unsigned int size);
 extern void blk_queue_lld_busy(struct request_queue *q, lld_busy_fn *fn);
 extern void blk_queue_segment_boundary(struct request_queue *, unsigned long);
+extern void blk_queue_virt_boundary(struct request_queue *, unsigned long);
 extern void blk_queue_prep_rq(struct request_queue *, prep_rq_fn *pfn);
 extern void blk_queue_unprep_rq(struct request_queue *, unprep_rq_fn *ufn);
 extern void blk_queue_merge_bvec(struct request_queue *, merge_bvec_fn *);
@@ -1242,6 +1266,14 @@ static inline unsigned long queue_bounce_pfn(struct request_queue *q)
 static inline unsigned long queue_segment_boundary(struct request_queue *q)
 {
 	return q->limits.seg_boundary_mask;
+}
+
+static inline unsigned long queue_virt_boundary(struct request_queue *q)
+{
+	if (q->limits.limits_aux)
+		return q->limits.limits_aux->virt_boundary_mask;
+
+	return 0;
 }
 
 static inline unsigned int queue_max_sectors(struct request_queue *q)
@@ -1444,6 +1476,19 @@ static inline void put_dev_sector(Sector p)
 	page_cache_release(p.v);
 }
 
+/*
+ * Check if adding a bio_vec after bprv with offset would create a gap in
+ * the SG list. Most drivers don't care about this, but some do.
+ */
+static inline bool bvec_gap_to_prev(struct request_queue *q,
+				struct bio_vec *bprv, unsigned int offset)
+{
+	if (!queue_virt_boundary(q))
+		return false;
+	return offset ||
+		((bprv->bv_offset + bprv->bv_len) & queue_virt_boundary(q));
+}
+
 struct work_struct;
 int kblockd_schedule_work(struct work_struct *work);
 int kblockd_schedule_delayed_work(struct delayed_work *dwork, unsigned long delay);
@@ -1643,14 +1688,29 @@ static inline bool blk_integrity_is_initialized(struct gendisk *g)
 
 #endif /* CONFIG_BLK_DEV_INTEGRITY */
 
+/**
+ * struct blk_dax_ctl - control and output parameters for ->direct_access
+ * @sector: (input) offset relative to a block_device
+ * @addr: (output) kernel virtual address for @sector populated by driver
+ * @pfn: (output) page frame number for @addr populated by driver
+ * @size: (input) number of bytes requested
+ */
+struct blk_dax_ctl {
+	sector_t sector;
+	void *addr;
+	long size;
+	pfn_t pfn;
+};
+
 struct block_device_operations {
 	int (*open) (struct block_device *, fmode_t);
 	void (*release) (struct gendisk *, fmode_t);
-	int (*rw_page)(struct block_device *, sector_t, struct page *, int rw);
 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
-	long (*direct_access)(struct block_device *, sector_t,
-					void **, unsigned long *pfn, long size);
+	RH_KABI_REPLACE(int (*direct_access) (struct block_device *, sector_t,
+						void **, unsigned long *),
+			long (*direct_access)(struct block_device *, sector_t,
+						void **, pfn_t *))
 	unsigned int (*check_events) (struct gendisk *disk,
 				      unsigned int clearing);
 	/* ->media_changed() is DEPRECATED, use ->check_events() instead */
@@ -1661,9 +1721,11 @@ struct block_device_operations {
 	/* this callback is with swap_lock and sometimes page table lock held */
 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 
+	RH_KABI_REPLACE(void *rh_reserved_ptrs1, const struct pr_ops *pr_ops)
+
 	/* future placeholders for nvdimm */
-	void *rh_reserved_ptrs1;
-	void *rh_reserved_ptrs2;
+	RH_KABI_REPLACE(void *rh_reserved_ptrs2,
+		int (*rw_page)(struct block_device *, sector_t, struct page *, int rw))
 	void *rh_reserved_ptrs3;
 	void *rh_reserved_ptrs4;
 	void *rh_reserved_ptrs5;
@@ -1676,8 +1738,8 @@ extern int __blkdev_driver_ioctl(struct block_device *, fmode_t, unsigned int,
 extern int bdev_read_page(struct block_device *, sector_t, struct page *);
 extern int bdev_write_page(struct block_device *, sector_t, struct page *,
 						struct writeback_control *);
-extern long bdev_direct_access(struct block_device *, sector_t, void **addr,
-						unsigned long *pfn, long size);
+extern long bdev_direct_access(struct block_device *, struct blk_dax_ctl *);
+extern int bdev_dax_supported(struct super_block *, int);
 #else /* CONFIG_BLOCK */
 /*
  * stubs for when the block layer is configured out

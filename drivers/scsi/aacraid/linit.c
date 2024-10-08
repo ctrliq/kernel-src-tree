@@ -457,6 +457,20 @@ static int aac_biosparm(struct scsi_device *sdev, struct block_device *bdev,
 	return 0;
 }
 
+static int aac_slave_alloc(struct scsi_device *sdev)
+{
+	sdev->tagged_supported = 1;
+	scsi_activate_tcq(sdev, sdev->host->can_queue);
+
+	return 0;
+}
+
+static void aac_slave_destroy(struct scsi_device *sdev)
+{
+	scsi_deactivate_tcq(sdev, 1);
+}
+
+
 /**
  *	aac_slave_configure		-	compute queue depths
  *	@sdev:	SCSI device we are considering
@@ -518,10 +532,11 @@ static int aac_slave_configure(struct scsi_device *sdev)
 		else if (depth < 2)
 			depth = 2;
 		scsi_adjust_queue_depth(sdev, MSG_ORDERED_TAG, depth);
-	} else
+	} else {
 		scsi_adjust_queue_depth(sdev, 0, 1);
 
 		sdev->tagged_supported = 1;
+	}
 
 	return 0;
 }
@@ -1118,6 +1133,8 @@ static struct scsi_host_template aac_driver_template = {
 	.queuecommand			= aac_queuecommand,
 	.bios_param			= aac_biosparm,
 	.shost_attrs			= aac_attrs,
+	.slave_alloc			= aac_slave_alloc,
+	.slave_destroy			= aac_slave_destroy,
 	.slave_configure		= aac_slave_configure,
 	.change_queue_depth		= aac_change_queue_depth,
 	.sdev_attrs			= aac_dev_attrs,
@@ -1209,6 +1226,12 @@ static int aac_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_hw_vendor_status(aac_unsupported, pdev);
 
+	/*
+	 * Only series 7 needs freset.
+	 */
+	 if (pdev->device == PMC_DEVICE_S7)
+		pdev->needs_freset = 1;
+
 	list_for_each_entry(aac, &aac_devices, entry) {
 		if (aac->id > unique_id)
 			break;
@@ -1246,6 +1269,7 @@ static int aac_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	shost->irq = pdev->irq;
 	shost->unique_id = unique_id;
 	shost->max_cmd_len = 16;
+	shost->use_cmd_list = 1;
 
 	if (aac_cfg_major == AAC_CHARDEV_NEEDS_REINIT)
 		aac_init_char();
@@ -1373,6 +1397,10 @@ static int aac_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	shost->max_lun = AAC_MAX_LUN;
 
 	pci_set_drvdata(pdev, shost);
+
+	error = scsi_init_shared_tag_map(shost, shost->can_queue);
+	if (error)
+		goto out_deinit;
 
 	error = scsi_add_host(shost, &pdev->dev);
 	if (error)
@@ -1545,6 +1573,11 @@ static int aac_resume(struct pci_dev *pdev)
 	pci_set_master(pdev);
 	if (aac_acquire_resources(aac))
 		goto fail_device;
+	/*
+	* reset this flag to unblock ioctl() as it was set at
+	* aac_send_shutdown() to block ioctls from upperlayer
+	*/
+	aac->adapter_shutdown = 0;
 	scsi_unblock_requests(shost);
 
 	return 0;

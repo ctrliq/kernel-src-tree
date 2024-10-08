@@ -34,6 +34,7 @@
 #include <linux/netdev_features.h>
 #include <linux/sched.h>
 #include <net/flow_keys.h>
+#include <linux/in6.h>
 
 #include <linux/rh_kabi.h>
 
@@ -163,14 +164,61 @@ struct nf_conntrack {
 };
 #endif
 
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 struct nf_bridge_info {
 	atomic_t		use;
+#ifdef __GENKSYMS__
 	unsigned int		mask;
+#else
+	enum {
+		BRNF_PROTO_UNCHANGED,
+		BRNF_PROTO_8021Q,
+		BRNF_PROTO_PPPOE
+	} orig_proto:8;
+	u8			pkt_otherhost:1;
+	u8			in_prerouting:1;
+	u8			bridged_dnat:1;
+	__u16			frag_max_size;
+#endif
 	struct net_device	*physindev;
+
+	/* always valid & non-NULL from FORWARD on, for physdev match */
 	struct net_device	*physoutdev;
+#ifdef __GENKSYMS__
 	unsigned long		data[32 / sizeof(unsigned long)];
+#else
+	union {
+		union {
+			/* prerouting: detect dnat in orig/reply direction */
+			__be32          ipv4_daddr;
+			struct in6_addr ipv6_daddr;
+
+			/* after prerouting + nat detected: store original source
+			 * mac since neigh resolution overwrites it, only used while
+			 * skb is out in neigh layer.
+			 */
+			char neigh_header[8];
+		};
+
+		/* KABI: keep size of nf_bridge_info constant */
+		unsigned long rh_unused[32 / sizeof(unsigned long)];
+	};
+#endif
 };
+
+/* KABI: ensure that the exposed fields of nf_bridge_info are not moved around */
+#ifndef __GENKSYMS__
+#ifdef CONFIG_64BIT
+#define OLD_PHYSOUTDEV_OFFSET 16
+#else
+#define OLD_PHYSOUTDEV_OFFSET 12
+#endif
+_Static_assert(offsetof(struct nf_bridge_info, physindev) == 8,
+	       "KABI breakage: physindev changed position");
+_Static_assert(offsetof(struct nf_bridge_info, physoutdev) == OLD_PHYSOUTDEV_OFFSET,
+	       "KABI breakage: physoutdev changed position");
+#endif
+
 #endif
 
 struct sk_buff_head {
@@ -384,11 +432,14 @@ enum {
 	SKB_GSO_UDP_TUNNEL_CSUM = 1 << 12,
 
 	SKB_GSO_TUNNEL_REMCSUM = 1 << 13,
+
+	SKB_GSO_SCTP = 1 << 14,
 };
 
 /* NETIF_F_GSO flags are no longer part of a single range */
 #define SKB_GSO1_MASK (SKB_GSO_GRE_CSUM - 1)
-#define SKB_GSO2_MASK (SKB_GSO_GRE_CSUM|SKB_GSO_UDP_TUNNEL_CSUM)
+#define SKB_GSO2_MASK (SKB_GSO_GRE_CSUM|SKB_GSO_UDP_TUNNEL_CSUM|\
+		       SKB_GSO_TUNNEL_REMCSUM|SKB_GSO_SCTP)
 
 #if BITS_PER_LONG > 32
 #define NET_SKBUFF_DATA_USES_OFFSET 1
@@ -575,9 +626,16 @@ struct sk_buff {
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	struct nf_conntrack	*nfct;
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	struct nf_bridge_info	*nf_bridge;
 #endif
+
+	/* fields enclosed in headers_start/headers_end are copied
+	 * using a single memcpy() in __copy_skb_header()
+	 */
+	/* private: */
+	RH_KABI_EXTEND(__u32	headers_start[0])
+	/* public: */
 
 	int			skb_iif;
 
@@ -617,9 +675,10 @@ struct sk_buff {
 	/* 0/2 bit hole (depending on ndisc_nodetype presence) */
 	kmemcheck_bitfield_end(flags2);
 
-#if defined CONFIG_NET_DMA_RH_KABI || defined CONFIG_NET_RX_BUSY_POLL
+#if defined CONFIG_NET_DMA_RH_KABI || defined CONFIG_NET_RX_BUSY_POLL || defined CONFIG_XPS
 	union {
 		unsigned int	napi_id;
+		RH_KABI_EXTEND(unsigned int	sender_cpu)
 		RH_KABI_DEPRECATE(dma_cookie_t,	dma_cookie)
 	};
 #endif
@@ -655,12 +714,17 @@ struct sk_buff {
 	/* 12 bit hole */
 	RH_KABI_EXTEND(kmemcheck_bitfield_end(flags3))
 
+	/* private: */
+	RH_KABI_EXTEND(__u32	headers_end[0])
+	/* public: */
+
 	/* RHEL SPECIFIC
 	 *
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserve ABI. Feel free
 	 * to replace reserved slots with required structure field
-	 * additions of your backport.
+	 * additions of your backport, eventually moving the replaced slot
+	 * before headers_end, if it need to be copied by __copy_skb_header()
 	 */
 	u32			rh_reserved1;
 	u32			rh_reserved2;
@@ -773,6 +837,7 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 
 struct sk_buff *__alloc_skb(unsigned int size, gfp_t priority, int flags,
 			    int node);
+struct sk_buff *__build_skb(void *data, unsigned int frag_size);
 struct sk_buff *build_skb(void *data, unsigned int frag_size);
 static inline struct sk_buff *alloc_skb(unsigned int size,
 					gfp_t priority)
@@ -907,6 +972,8 @@ skb_set_hash(struct sk_buff *skb, __u32 hash, enum pkt_hash_types type)
 	skb->l4_hash = (type == PKT_HASH_TYPE_L4);
 	skb->hash = hash;
 }
+
+#define skb_get_rxhash skb_get_hash
 
 void __skb_get_hash(struct sk_buff *skb);
 static inline __u32 skb_get_hash(struct sk_buff *skb)
@@ -1565,20 +1632,16 @@ static inline void __skb_fill_page_desc(struct sk_buff *skb, int i,
 	skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 	/*
-	 * Propagate page->pfmemalloc to the skb if we can. The problem is
-	 * that not all callers have unique ownership of the page. If
-	 * pfmemalloc is set, we check the mapping as a mapping implies
-	 * page->index is set (index and pfmemalloc share space).
-	 * If it's a valid mapping, we cannot use page->pfmemalloc but we
-	 * do not lose pfmemalloc information as the pages would not be
-	 * allocated using __GFP_MEMALLOC.
+	 * Propagate page pfmemalloc to the skb if we can. The problem is
+	 * that not all callers have unique ownership of the page but rely
+	 * on page_is_pfmemalloc doing the right thing(tm).
 	 */
 	frag->page.p		  = page;
 	frag->page_offset	  = off;
 	skb_frag_size_set(frag, size);
 
 	page = compound_head(page);
-	if (page->pfmemalloc && !page->mapping)
+	if (page_is_pfmemalloc(page))
 		skb->pfmemalloc	= true;
 }
 
@@ -2100,9 +2163,6 @@ static inline void __skb_queue_purge(struct sk_buff_head *list)
 		kfree_skb(skb);
 }
 
-#define NETDEV_FRAG_PAGE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)
-#define NETDEV_FRAG_PAGE_MAX_ORDER	get_order(NETDEV_FRAG_PAGE_MAX_SIZE)
-
 void *netdev_alloc_frag(unsigned int fragsz);
 
 struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int length,
@@ -2170,6 +2230,10 @@ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
 {
 	return __napi_alloc_skb(napi, length, GFP_ATOMIC);
 }
+void napi_consume_skb(struct sk_buff *skb, int budget);
+
+void __kfree_skb_flush(void);
+void __kfree_skb_defer(struct sk_buff *skb);
 
 /**
  * __dev_alloc_pages - allocate page for network Rx
@@ -2241,7 +2305,7 @@ static inline struct page *__skb_alloc_pages(gfp_t gfp_mask,
 		gfp_mask |= __GFP_MEMALLOC;
 
 	page = alloc_pages_node(NUMA_NO_NODE, gfp_mask, order);
-	if (skb && page && page->pfmemalloc)
+	if (skb && page && page_is_pfmemalloc(page))
 		skb->pfmemalloc = true;
 
 	return page;
@@ -2270,7 +2334,7 @@ static inline struct page *__skb_alloc_page(gfp_t gfp_mask,
 static inline void skb_propagate_pfmemalloc(struct page *page,
 					     struct sk_buff *skb)
 {
-	if (page && page->pfmemalloc)
+	if (page_is_pfmemalloc(page))
 		skb->pfmemalloc = true;
 }
 
@@ -2609,6 +2673,23 @@ static inline void skb_postpull_rcsum(struct sk_buff *skb,
 
 unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
 
+static inline void skb_postpush_rcsum(struct sk_buff *skb,
+				      const void *start, unsigned int len)
+{
+	/* For performing the reverse operation to skb_postpull_rcsum(),
+	 * we can instead of ...
+	 *
+	 *   skb->csum = csum_add(skb->csum, csum_partial(start, len, 0));
+	 *
+	 * ... just use this equivalent version here to save a few
+	 * instructions. Feeding csum of 0 in csum_partial() and later
+	 * on adding skb->csum is equivalent to feed skb->csum in the
+	 * first place.
+	 */
+	if (skb->ip_summed == CHECKSUM_COMPLETE)
+		skb->csum = csum_partial(start, len, skb->csum);
+}
+
 /**
  *	pskb_trim_rcsum - trim received skb and update checksum
  *	@skb: buffer to trim
@@ -2724,7 +2805,9 @@ void skb_split(struct sk_buff *skb, struct sk_buff *skb1, const u32 len);
 int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen);
 void skb_scrub_packet(struct sk_buff *skb, bool xnet);
 unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
+bool skb_gso_validate_mtu(const struct sk_buff *skb, unsigned int mtu);
 struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features);
+struct sk_buff *skb_vlan_untag(struct sk_buff *skb);
 int skb_ensure_writable(struct sk_buff *skb, int write_len);
 int skb_vlan_pop(struct sk_buff *skb);
 int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci);
@@ -3168,7 +3251,7 @@ static inline void nf_conntrack_get(struct nf_conntrack *nfct)
 		atomic_inc(&nfct->use);
 }
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 static inline void nf_bridge_put(struct nf_bridge_info *nf_bridge)
 {
 	if (nf_bridge && atomic_dec_and_test(&nf_bridge->use))
@@ -3186,7 +3269,7 @@ static inline void nf_reset(struct sk_buff *skb)
 	nf_conntrack_put(skb->nfct);
 	skb->nfct = NULL;
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	nf_bridge_put(skb->nf_bridge);
 	skb->nf_bridge = NULL;
 #endif
@@ -3207,7 +3290,7 @@ static inline void __nf_copy(struct sk_buff *dst, const struct sk_buff *src)
 	nf_conntrack_get(src->nfct);
 	dst->nfctinfo = src->nfctinfo;
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	dst->nf_bridge  = src->nf_bridge;
 	nf_bridge_get(src->nf_bridge);
 #endif
@@ -3218,7 +3301,7 @@ static inline void nf_copy(struct sk_buff *dst, const struct sk_buff *src)
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	nf_conntrack_put(dst->nfct);
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	nf_bridge_put(dst->nf_bridge);
 #endif
 	__nf_copy(dst, src);
@@ -3429,5 +3512,6 @@ static inline unsigned int skb_gso_network_seglen(const struct sk_buff *skb)
 			       skb_network_header(skb);
 	return hdr_len + skb_gso_transport_seglen(skb);
 }
+
 #endif	/* __KERNEL__ */
 #endif	/* _LINUX_SKBUFF_H */

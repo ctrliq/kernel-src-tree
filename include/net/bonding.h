@@ -53,23 +53,29 @@
 #define BOND_MODE(bond) ((bond)->params.mode)
 
 /* slave list primitives */
-#define bond_has_slaves(bond) !list_empty(&(bond)->dev->adj_list.lower)
+#define bond_slave_list(bond) (&(bond)->dev->adj_list.lower)
 
-#define bond_to_slave(ptr) list_entry(ptr, struct slave, list)
+#define bond_has_slaves(bond) !list_empty(bond_slave_list(bond))
 
 /* IMPORTANT: bond_first/last_slave can return NULL in case of an empty list */
 #define bond_first_slave(bond) \
-	list_first_entry_or_null(&(bond)->slave_list, struct slave, list)
+	(bond_has_slaves(bond) ? \
+		netdev_adjacent_get_private(bond_slave_list(bond)->next) : \
+		NULL)
 #define bond_last_slave(bond) \
-	(list_empty(&(bond)->slave_list) ? NULL : \
-					   bond_to_slave((bond)->slave_list.prev))
+	(bond_has_slaves(bond) ? \
+		netdev_adjacent_get_private(bond_slave_list(bond)->prev) : \
+		NULL)
 
 /* Caller must have rcu_read_lock */
 #define bond_first_slave_rcu(bond) \
-	list_first_entry_or_null(&(bond)->slave_list, struct slave, list)
+	netdev_lower_get_first_private_rcu(bond->dev)
 
-#define bond_is_first_slave(bond, pos) ((pos)->list.prev == &(bond)->slave_list)
-#define bond_is_last_slave(bond, pos) ((pos)->list.next == &(bond)->slave_list)
+#define bond_is_first_slave(bond, pos) (pos == bond_first_slave(bond))
+#define bond_is_last_slave(bond, pos) (pos == bond_last_slave(bond))
+
+/* Since bond_first/last_slave can return NULL, these can return NULL too */
+#define bond_next_slave(bond, pos) __bond_next_slave(bond, pos)
 
 /**
  * bond_for_each_slave - iterate over all slaves
@@ -79,12 +85,12 @@
  *
  * Caller must hold RTNL
  */
-#define bond_for_each_slave(bond, pos, iter) iter = &(bond)->slave_list; \
-	list_for_each_entry(pos, &(bond)->slave_list, list)
+#define bond_for_each_slave(bond, pos, iter) \
+	netdev_for_each_lower_private((bond)->dev, pos, iter)
 
 /* Caller must have rcu_read_lock */
-#define bond_for_each_slave_rcu(bond, pos, iter) iter = &(bond)->slave_list; \
-	list_for_each_entry_rcu(pos, &(bond)->slave_list, list)
+#define bond_for_each_slave_rcu(bond, pos, iter) \
+	netdev_for_each_lower_private_rcu((bond)->dev, pos, iter)
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
 extern atomic_t netpoll_block_tx;
@@ -156,7 +162,6 @@ struct netdev_notify_work {
 
 struct slave {
 	struct net_device *dev; /* first - useful for panic debug */
-	struct list_head list;
 	struct bonding *bond; /* our master */
 	int    delay;
 	/* all three in jiffies */
@@ -201,7 +206,6 @@ struct bond_up_slave {
  */
 struct bonding {
 	struct   net_device *dev; /* first - useful for panic debug */
-	struct   list_head slave_list;
 	struct   slave __rcu *curr_active_slave;
 	struct   slave __rcu *current_arp_slave;
 	struct   slave __rcu *primary_slave;
@@ -218,6 +222,7 @@ struct bonding {
 	 * ALB mode (6) - to sync the use and modifications of its hash table
 	 */
 	spinlock_t mode_lock;
+	spinlock_t stats_lock;
 	u8	 send_peer_notif;
 	u8       igmp_retrans;
 #ifdef CONFIG_PROC_FS
@@ -300,14 +305,7 @@ static inline struct slave *__bond_next_slave(struct bonding *bond,
 static inline struct slave *bond_get_slave_by_dev(struct bonding *bond,
 						  struct net_device *slave_dev)
 {
-	struct slave *slave = NULL;
-	struct list_head *iter;
-
-	bond_for_each_slave(bond, slave, iter)
-		if (slave->dev == slave_dev)
-			return slave;
-
-	return NULL;
+	return netdev_lower_dev_get_private(bond->dev, slave_dev);
 }
 
 static inline struct bonding *bond_get_bond_by_slave(struct slave *slave)
@@ -587,8 +585,6 @@ int bond_create(struct net *net, const char *name);
 int bond_create_sysfs(struct bond_net *net);
 void bond_destroy_sysfs(struct bond_net *net);
 void bond_prepare_sysfs_group(struct bonding *bond);
-int bond_create_slave_symlinks(struct net_device *master, struct net_device *slave);
-void bond_destroy_slave_symlinks(struct net_device *master, struct net_device *slave);
 int bond_sysfs_slave_add(struct slave *slave);
 void bond_sysfs_slave_del(struct slave *slave);
 int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev);

@@ -1464,7 +1464,12 @@ out:
 
 #endif /* CONFIG_KEXEC_FILE */
 
-void crash_kexec(struct pt_regs *regs)
+/*
+ * No panic_cpu check version of crash_kexec().  This function is called
+ * only when panic_cpu holds the current CPU number; this is the only CPU
+ * which processes crash_kexec routines.
+ */
+void __crash_kexec(struct pt_regs *regs)
 {
 	/* Take the kexec_mutex here to prevent sys_kexec_load
 	 * running on one cpu from replacing the crash kernel
@@ -1484,6 +1489,29 @@ void crash_kexec(struct pt_regs *regs)
 			machine_kexec(kexec_crash_image);
 		}
 		mutex_unlock(&kexec_mutex);
+	}
+}
+
+void crash_kexec(struct pt_regs *regs)
+{
+	int old_cpu, this_cpu;
+
+	/*
+	 * Only one CPU is allowed to execute the crash_kexec() code as with
+	 * panic().  Otherwise parallel calls of panic() and crash_kexec()
+	 * may stop each other.  To exclude them, we use panic_cpu here too.
+	 */
+	this_cpu = raw_smp_processor_id();
+	old_cpu = atomic_cmpxchg(&panic_cpu, PANIC_CPU_INVALID, this_cpu);
+	if (old_cpu == PANIC_CPU_INVALID) {
+		/* This is the 1st CPU which comes here, so go ahead. */
+		__crash_kexec(regs);
+
+		/*
+		 * Reset panic_cpu to allow another panic()/crash_kexec()
+		 * call.
+		 */
+		atomic_set(&panic_cpu, PANIC_CPU_INVALID);
 	}
 }
 
@@ -1614,14 +1642,35 @@ void crash_save_cpu(struct pt_regs *regs, int cpu)
 static int __init crash_notes_memory_init(void)
 {
 	/* Allocate memory for saving cpu registers. */
-	crash_notes = alloc_percpu(note_buf_t);
+	size_t size, align;
+
+	/*
+	 * crash_notes could be allocated across 2 vmalloc pages when percpu
+	 * is vmalloc based . vmalloc doesn't guarantee 2 continuous vmalloc
+	 * pages are also on 2 continuous physical pages. In this case the
+	 * 2nd part of crash_notes in 2nd page could be lost since only the
+	 * starting address and size of crash_notes are exported through sysfs.
+	 * Here round up the size of crash_notes to the nearest power of two
+	 * and pass it to __alloc_percpu as align value. This can make sure
+	 * crash_notes is allocated inside one physical page.
+	 */
+	size = sizeof(note_buf_t);
+	align = min(roundup_pow_of_two(sizeof(note_buf_t)), PAGE_SIZE);
+
+	/*
+	 * Break compile if size is bigger than PAGE_SIZE since crash_notes
+	 * definitely will be in 2 pages with that.
+	 */
+	BUILD_BUG_ON(size > PAGE_SIZE);
+
+	crash_notes = __alloc_percpu(size, align);
 	if (!crash_notes) {
 		pr_warn("Kexec: Memory allocation for saving cpu register states failed\n");
 		return -ENOMEM;
 	}
 	return 0;
 }
-module_init(crash_notes_memory_init)
+subsys_initcall(crash_notes_memory_init);
 
 
 /*
@@ -2748,7 +2797,7 @@ static int __init crash_save_vmcoreinfo_init(void)
 	return 0;
 }
 
-module_init(crash_save_vmcoreinfo_init)
+subsys_initcall(crash_save_vmcoreinfo_init);
 
 /*
  * Move into place and start executing a preloaded standalone

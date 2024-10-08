@@ -1149,6 +1149,7 @@ static int au1xmmc_remove(struct platform_device *pdev)
 		kfree(host->ioarea);
 
 		mmc_free_host(host->mmc);
+		platform_set_drvdata(pdev, NULL);
 	}
 	return 0;
 }

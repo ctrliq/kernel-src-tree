@@ -48,6 +48,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/bitops.h>
+#include <asm/pci-bridge.h>
 #include <net/checksum.h>
 
 #include "spider_net.h"

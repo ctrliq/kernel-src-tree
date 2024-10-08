@@ -163,6 +163,15 @@
 #define CLK_OF_TABLES()
 #endif
 
+#ifdef CONFIG_OF_IOMMU
+#define IOMMU_OF_TABLES() . = ALIGN(8);				\
+			  VMLINUX_SYMBOL(__iommu_of_table) = .;	\
+			  *(__iommu_of_table)			\
+			  *(__iommu_of_table_end)
+#else
+#define IOMMU_OF_TABLES()
+#endif
+
 #define KERNEL_DTB()							\
 	STRUCT_ALIGN();							\
 	VMLINUX_SYMBOL(__dtb_start) = .;				\
@@ -501,6 +510,7 @@
 	MEM_DISCARD(init.rodata)					\
 	CLK_OF_TABLES()							\
 	CLKSRC_OF_TABLES()						\
+	IOMMU_OF_TABLES()						\
 	KERNEL_DTB()							\
 	IRQCHIP_OF_MATCH_TABLE()
 

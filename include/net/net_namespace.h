@@ -88,9 +88,6 @@ struct net {
 #if IS_ENABLED(CONFIG_IPV6)
 	struct netns_ipv6	ipv6;
 #endif
-#if IS_ENABLED(CONFIG_IEEE802154_6LOWPAN)
-	struct netns_ieee802154_lowpan	ieee802154_lowpan;
-#endif
 #if defined(CONFIG_IP_SCTP) || defined(CONFIG_IP_SCTP_MODULE)
 	struct netns_sctp	sctp;
 #endif
@@ -148,7 +145,24 @@ struct net {
 	RH_KABI_EXTEND(struct work_struct flow_cache_gc_work)
 	RH_KABI_EXTEND(struct work_struct flow_cache_flush_work)
 	RH_KABI_EXTEND(struct mutex flow_flush_sem)
+	/* netns_xfrm */
+	RH_KABI_EXTEND(struct xfrm_policy_hash_ext policy_bydst[XFRM_POLICY_MAX * 2])
+	RH_KABI_EXTEND(struct xfrm_policy_hthresh policy_hthresh)
 #endif
+	RH_KABI_EXTEND(bool ip_local_ports_warned)
+	RH_KABI_EXTEND(int ipv4_sysctl_ip_nonlocal_bind)
+	RH_KABI_EXTEND(int ipv6_sysctl_ip_nonlocal_bind)
+	RH_KABI_EXTEND(int ipv6_anycast_src_echo_reply)
+	RH_KABI_EXTEND(struct sock *ipv4_mc_autojoin_sk)
+	RH_KABI_EXTEND(struct sock *ipv6_mc_autojoin_sk)
+	RH_KABI_EXTEND(struct netns_ieee802154_lowpan ieee802154_lowpan)
+	/*
+	 * Disable Potentially-Failed feature, the feature is enabled by default
+	 * pf_enable    -  0  : disable pf
+	 *		- >0  : enable pf
+	 */
+	RH_KABI_EXTEND(int sctp_pf_enable)
+	RH_KABI_EXTEND(struct list_head	nfct_timeout_list)
 };
 
 /*
@@ -357,6 +371,14 @@ static inline void rt_genid_bump_ipv6(struct net *net)
 	if (__fib6_flush_trees)
 		__fib6_flush_trees(net);
 }
+
+#if IS_ENABLED(CONFIG_IEEE802154_6LOWPAN)
+static inline struct netns_ieee802154_lowpan *
+net_ieee802154_lowpan(struct net *net)
+{
+	return &net->ieee802154_lowpan;
+}
+#endif
 
 /* For callers who don't really care about whether it's IPv4 or IPv6 */
 static inline void rt_genid_bump_all(struct net *net)

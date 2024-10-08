@@ -1276,7 +1276,12 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
 	up_write(&policy->rwsem);
 
 	kobject_uevent(&policy->kobj, KOBJ_ADD);
+
 	up_read(&cpufreq_rwsem);
+
+	/* Callback for handling stuff after policy is ready */
+	if (cpufreq_driver->ready)
+		cpufreq_driver->ready(policy);
 
 	pr_debug("initialization complete\n");
 
@@ -1463,20 +1468,18 @@ static int __cpufreq_remove_dev_finish(struct device *dev,
  *
  * Removes the cpufreq interface for a CPU device.
  */
-static int cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif)
+static void cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif)
 {
 	unsigned int cpu = dev->id;
 	int ret;
 
 	if (cpu_is_offline(cpu))
-		return 0;
+		return;
 
 	ret = __cpufreq_remove_dev_prepare(dev, sif);
 
 	if (!ret)
-		ret = __cpufreq_remove_dev_finish(dev, sif);
-
-	return ret;
+		__cpufreq_remove_dev_finish(dev, sif);
 }
 
 static void handle_update(struct work_struct *work)

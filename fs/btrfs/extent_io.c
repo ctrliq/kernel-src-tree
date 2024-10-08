@@ -2126,7 +2126,7 @@ int repair_io_failure(struct inode *inode, u64 start, u64 length, u64 logical,
 	sector = bbio->stripes[mirror_num-1].physical >> 9;
 	bio->bi_sector = sector;
 	dev = bbio->stripes[mirror_num-1].dev;
-	kfree(bbio);
+	btrfs_put_bbio(bbio);
 	if (!dev || !dev->bdev || !dev->writeable) {
 		bio_put(bio);
 		return -EIO;
@@ -2551,11 +2551,12 @@ int end_extent_writepage(struct page *page, int err, u64 start, u64 end)
  */
 static void end_bio_extent_writepage(struct bio *bio, int err)
 {
-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+	struct bio_vec *bvec;
 	u64 start;
 	u64 end;
+	int i;
 
-	do {
+	bio_for_each_segment_all(bvec, bio, i) {
 		struct page *page = bvec->bv_page;
 
 		/* We always issue full-page reads, but if some block
@@ -2578,14 +2579,11 @@ static void end_bio_extent_writepage(struct bio *bio, int err)
 		start = page_offset(page);
 		end = start + bvec->bv_offset + bvec->bv_len - 1;
 
-		if (--bvec >= bio->bi_io_vec)
-			prefetchw(&bvec->bv_page->flags);
-
 		if (end_extent_writepage(page, err, start, end))
 			continue;
 
 		end_page_writeback(page);
-	} while (bvec >= bio->bi_io_vec);
+	}
 
 	bio_put(bio);
 }
@@ -2615,9 +2613,8 @@ endio_readpage_release_extent(struct extent_io_tree *tree, u64 start, u64 len,
  */
 static void end_bio_extent_readpage(struct bio *bio, int err)
 {
+	struct bio_vec *bvec;
 	int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
-	struct bio_vec *bvec_end = bio->bi_io_vec + bio->bi_vcnt - 1;
-	struct bio_vec *bvec = bio->bi_io_vec;
 	struct btrfs_io_bio *io_bio = btrfs_io_bio(bio);
 	struct extent_io_tree *tree;
 	u64 offset = 0;
@@ -2628,11 +2625,12 @@ static void end_bio_extent_readpage(struct bio *bio, int err)
 	u64 extent_len = 0;
 	int mirror;
 	int ret;
+	int i;
 
 	if (err)
 		uptodate = 0;
 
-	do {
+	bio_for_each_segment_all(bvec, bio, i) {
 		struct page *page = bvec->bv_page;
 		struct inode *inode = page->mapping->host;
 
@@ -2661,9 +2659,6 @@ static void end_bio_extent_readpage(struct bio *bio, int err)
 		start = page_offset(page);
 		end = start + bvec->bv_offset + bvec->bv_len - 1;
 		len = bvec->bv_len;
-
-		if (++bvec <= bvec_end)
-			prefetchw(&bvec->bv_page->flags);
 
 		mirror = io_bio->mirror_num;
 		if (likely(uptodate && tree->ops &&
@@ -2746,7 +2741,7 @@ readpage_ok:
 			extent_start = start;
 			extent_len = end + 1 - start;
 		}
-	} while (bvec <= bvec_end);
+	}
 
 	if (extent_len)
 		endio_readpage_release_extent(tree, extent_start, extent_len,
@@ -2777,7 +2772,6 @@ btrfs_bio_alloc(struct block_device *bdev, u64 first_sector, int nr_vecs,
 	}
 
 	if (bio) {
-		bio->bi_size = 0;
 		bio->bi_bdev = bdev;
 		bio->bi_sector = first_sector;
 		btrfs_bio = btrfs_io_bio(bio);
@@ -3677,16 +3671,10 @@ done_unlocked:
 	return 0;
 }
 
-static int eb_wait(void *word)
-{
-	io_schedule();
-	return 0;
-}
-
 void wait_on_extent_buffer_writeback(struct extent_buffer *eb)
 {
-	wait_on_bit(&eb->bflags, EXTENT_BUFFER_WRITEBACK, eb_wait,
-		    TASK_UNINTERRUPTIBLE);
+	wait_on_bit_io(&eb->bflags, EXTENT_BUFFER_WRITEBACK,
+		       TASK_UNINTERRUPTIBLE);
 }
 
 static noinline_for_stack int
@@ -3831,20 +3819,18 @@ static void set_btree_ioerr(struct page *page)
 
 static void end_bio_extent_buffer_writepage(struct bio *bio, int err)
 {
-	int uptodate = err == 0;
-	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+	struct bio_vec *bvec;
 	struct extent_buffer *eb;
-	int done;
+	int i, done;
 
-	do {
+	bio_for_each_segment_all(bvec, bio, i) {
 		struct page *page = bvec->bv_page;
 
-		bvec--;
 		eb = (struct extent_buffer *)page->private;
 		BUG_ON(!eb);
 		done = atomic_dec_and_test(&eb->io_pages);
 
-		if (!uptodate || test_bit(EXTENT_BUFFER_WRITE_ERR, &eb->bflags)) {
+		if (err || test_bit(EXTENT_BUFFER_WRITE_ERR, &eb->bflags)) {
 			ClearPageUptodate(page);
 			set_btree_ioerr(page);
 		}
@@ -3855,10 +3841,9 @@ static void end_bio_extent_buffer_writepage(struct bio *bio, int err)
 			continue;
 
 		end_extent_buffer_writeback(eb);
-	} while (bvec >= bio->bi_io_vec);
+	}
 
 	bio_put(bio);
-
 }
 
 static noinline_for_stack int write_one_eb(struct extent_buffer *eb,
@@ -4909,6 +4894,25 @@ struct extent_buffer *find_extent_buffer(struct btrfs_fs_info *fs_info,
 			       start >> PAGE_CACHE_SHIFT);
 	if (eb && atomic_inc_not_zero(&eb->refs)) {
 		rcu_read_unlock();
+		/*
+		 * Lock our eb's refs_lock to avoid races with
+		 * free_extent_buffer. When we get our eb it might be flagged
+		 * with EXTENT_BUFFER_STALE and another task running
+		 * free_extent_buffer might have seen that flag set,
+		 * eb->refs == 2, that the buffer isn't under IO (dirty and
+		 * writeback flags not set) and it's still in the tree (flag
+		 * EXTENT_BUFFER_TREE_REF set), therefore being in the process
+		 * of decrementing the extent buffer's reference count twice.
+		 * So here we could race and increment the eb's reference count,
+		 * clear its stale flag, mark it as dirty and drop our reference
+		 * before the other task finishes executing free_extent_buffer,
+		 * which would later result in an attempt to free an extent
+		 * buffer that is dirty.
+		 */
+		if (test_bit(EXTENT_BUFFER_STALE, &eb->bflags)) {
+			spin_lock(&eb->refs_lock);
+			spin_unlock(&eb->refs_lock);
+		}
 		mark_extent_buffer_accessed(eb);
 		return eb;
 	}

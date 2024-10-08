@@ -21,6 +21,12 @@
 #include <linux/xattr.h>
 #include <linux/fs.h>
 
+#ifdef CONFIG_CGROUP_PIDS
+void cgroup_pids_release(struct task_struct *task);
+#else
+static inline void cgroup_pids_release(struct task_struct *task) {}
+#endif
+
 #ifdef CONFIG_CGROUPS
 
 struct cgroupfs_root;
@@ -30,24 +36,22 @@ struct cgroup;
 struct css_id;
 struct eventfd_ctx;
 
-extern int cgroup_init_early(void);
-extern int cgroup_init(void);
-extern void cgroup_fork(struct task_struct *p);
-extern void cgroup_post_fork(struct task_struct *p);
-extern void cgroup_exit(struct task_struct *p, int run_callbacks);
-extern int cgroupstats_build(struct cgroupstats *stats,
-				struct dentry *dentry);
-extern int cgroup_load_subsys(struct cgroup_subsys *ss);
-extern void cgroup_unload_subsys(struct cgroup_subsys *ss);
-
-extern int proc_cgroup_show(struct seq_file *, void *);
-
 /*
  * Define the enumeration of all cgroup subsystems.
  *
  * We define ids for builtin subsystems and then modular ones.
+ *
+ * NOTE: Theres some real hackery going on here.  Initially in RHEL7, the
+ * netprio cgroup was built as a module, but in 7.3 we had need to make it
+ * builtin.  The cgroup design caused this move to create LOTS of false positive
+ * ABI breaks.  AS such, we use this ENABLE_NETPRIO_NOW macro to direct where in
+ * the cgroup_subsys_id ennumeration the netprio subsys id is defined, thereby
+ * avoiding those false positives.  Please be very careful making further
+ * modifications to this ennumeration
  */
 #define SUBSYS(_x) _x ## _subsys_id,
+#define SUBSYS_TAG(_t) CGROUP_ ## _t, \
+	__unused_tag_ ## _t = CGROUP_ ## _t - 1,
 enum cgroup_subsys_id {
 #define IS_SUBSYS_ENABLED(option) IS_BUILTIN(option)
 #include <linux/cgroup_subsys.h>
@@ -56,12 +60,34 @@ enum cgroup_subsys_id {
 
 	__CGROUP_SUBSYS_TEMP_PLACEHOLDER = CGROUP_BUILTIN_SUBSYS_COUNT - 1,
 
+#undef SUBSYS_TAG
 #define IS_SUBSYS_ENABLED(option) IS_MODULE(option)
+#define ENABLE_NETPRIO_NOW
 #include <linux/cgroup_subsys.h>
+#undef ENABLE_NETPRIO_NOW
 #undef IS_SUBSYS_ENABLED
 	CGROUP_SUBSYS_COUNT,
 };
 #undef SUBSYS
+
+#define CGROUP_CANFORK_COUNT (CGROUP_CANFORK_END - CGROUP_CANFORK_START)
+
+extern int cgroup_init_early(void);
+extern int cgroup_init(void);
+extern void cgroup_fork(struct task_struct *p);
+extern int cgroup_can_fork(struct task_struct *p,
+			   void *ss_priv[CGROUP_CANFORK_COUNT]);
+extern void cgroup_cancel_fork(struct task_struct *p,
+			       void *ss_priv[CGROUP_CANFORK_COUNT]);
+extern void cgroup_post_fork(struct task_struct *p,
+			     void *old_ss_priv[CGROUP_CANFORK_COUNT]);
+extern void cgroup_exit(struct task_struct *p, int run_callbacks);
+extern int cgroupstats_build(struct cgroupstats *stats,
+				struct dentry *dentry);
+extern int cgroup_load_subsys(struct cgroup_subsys *ss);
+extern void cgroup_unload_subsys(struct cgroup_subsys *ss);
+
+extern int proc_cgroup_show(struct seq_file *, void *);
 
 /* Per-subsystem/per-cgroup state maintained by the system. */
 struct cgroup_subsys_state {
@@ -583,7 +609,8 @@ struct cgroup_subsys {
 	int (*can_attach)(struct cgroup *cgrp, struct cgroup_taskset *tset);
 	void (*cancel_attach)(struct cgroup *cgrp, struct cgroup_taskset *tset);
 	void (*attach)(struct cgroup *cgrp, struct cgroup_taskset *tset);
-	void (*fork)(struct task_struct *task);
+	RH_KABI_REPLACE(void (*fork)(struct task_struct *task),
+			void (*fork)(struct task_struct *task, void *priv))
 	void (*exit)(struct cgroup *cgrp, struct cgroup *old_cgrp,
 		     struct task_struct *task);
 	void (*bind)(struct cgroup *root);
@@ -634,11 +661,16 @@ struct cgroup_subsys {
 
 	/* should be defined only by modular subsystems */
 	struct module *module;
+
+	RH_KABI_EXTEND(int (*can_fork)(struct task_struct *task, void **priv_p))
+	RH_KABI_EXTEND(void (*cancel_fork)(struct task_struct *task, void *priv))
 };
 
 #define SUBSYS(_x) extern struct cgroup_subsys _x ## _subsys;
+#define ENABLE_NETPRIO_NOW
 #define IS_SUBSYS_ENABLED(option) IS_BUILTIN(option)
 #include <linux/cgroup_subsys.h>
+#undef ENABLE_NETPRIO_NOW
 #undef IS_SUBSYS_ENABLED
 #undef SUBSYS
 
@@ -712,6 +744,31 @@ static inline struct cgroup* task_cgroup(struct task_struct *task,
 					       int subsys_id)
 {
 	return task_subsys_state(task, subsys_id)->cgroup;
+}
+
+/**
+ * task_get_css - find and get the css for (task, subsys)
+ * @task: the target task
+ * @subsys_id: the target subsystem ID
+ *
+ * Find the css for the (@task, @subsys_id) combination, increment a
+ * reference on and return it.  This function is guaranteed to return a
+ * valid css.
+ */
+static inline struct cgroup_subsys_state *
+task_get_css(struct task_struct *task, int subsys_id)
+{
+	struct cgroup_subsys_state *css;
+
+	rcu_read_lock();
+	while (true) {
+		css = task_subsys_state(task, subsys_id);
+		if (likely(css_tryget(css)))
+			break;
+		cpu_relax();
+	}
+	rcu_read_unlock();
+	return css;
 }
 
 /**
@@ -872,10 +929,18 @@ struct cgroup_subsys_state *cgroup_css_from_dir(struct file *f, int id);
 
 #else /* !CONFIG_CGROUPS */
 
+#define CGROUP_CANFORK_COUNT	0
+
 static inline int cgroup_init_early(void) { return 0; }
 static inline int cgroup_init(void) { return 0; }
 static inline void cgroup_fork(struct task_struct *p) {}
-static inline void cgroup_post_fork(struct task_struct *p) {}
+static inline int cgroup_can_fork(struct task_struct *p,
+				  void *ss_priv[CGROUP_CANFORK_COUNT])
+{ return 0; }
+static inline void cgroup_cancel_fork(struct task_struct *p,
+				      void *ss_priv[CGROUP_CANFORK_COUNT]) {}
+static inline void cgroup_post_fork(struct task_struct *p,
+				    void *ss_priv[CGROUP_CANFORK_COUNT]) {}
 static inline void cgroup_exit(struct task_struct *p, int callbacks) {}
 
 static inline void cgroup_lock(void) {}

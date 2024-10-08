@@ -82,6 +82,8 @@ static int last_ftrace_enabled;
 
 /* Current function tracing op */
 struct ftrace_ops *function_trace_op __read_mostly = &ftrace_list_end;
+/* What to set function_trace_op to */
+static struct ftrace_ops *set_function_trace_op;
 
 /* List for set_ftrace_pid's pids. */
 LIST_HEAD(ftrace_pids);
@@ -275,6 +277,29 @@ static void update_global_ops(void)
 	global_ops.func = func;
 }
 
+static void ftrace_sync(struct work_struct *work)
+{
+	/*
+	 * This function is just a stub to implement a hard force
+	 * of synchronize_sched(). This requires synchronizing
+	 * tasks even in userspace and idle.
+	 *
+	 * Yes, function tracing is rude.
+	 */
+}
+
+static void ftrace_sync_ipi(void *data)
+{
+	/* Probably not needed, but do it anyway */
+	smp_rmb();
+}
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+static void update_function_graph_func(void);
+#else
+static inline void update_function_graph_func(void) { }
+#endif
+
 static void update_ftrace_function(void)
 {
 	ftrace_func_t func;
@@ -293,15 +318,60 @@ static void update_ftrace_function(void)
 	     !FTRACE_FORCE_LIST_FUNC)) {
 		/* Set the ftrace_ops that the arch callback uses */
 		if (ftrace_ops_list == &global_ops)
-			function_trace_op = ftrace_global_list;
+			set_function_trace_op = ftrace_global_list;
 		else
-			function_trace_op = ftrace_ops_list;
+			set_function_trace_op = ftrace_ops_list;
 		func = ftrace_ops_list->func;
 	} else {
 		/* Just use the default ftrace_ops */
-		function_trace_op = &ftrace_list_end;
+		set_function_trace_op = &ftrace_list_end;
 		func = ftrace_ops_list_func;
 	}
+
+	/* If there's no change, then do nothing more here */
+	if (ftrace_trace_function == func)
+		return;
+
+	update_function_graph_func();
+
+	/*
+	 * If we are using the list function, it doesn't care
+	 * about the function_trace_ops.
+	 */
+	if (func == ftrace_ops_list_func) {
+		ftrace_trace_function = func;
+		/*
+		 * Don't even bother setting function_trace_ops,
+		 * it would be racy to do so anyway.
+		 */
+		return;
+	}
+
+#ifndef CONFIG_DYNAMIC_FTRACE
+	/*
+	 * For static tracing, we need to be a bit more careful.
+	 * The function change takes affect immediately. Thus,
+	 * we need to coorditate the setting of the function_trace_ops
+	 * with the setting of the ftrace_trace_function.
+	 *
+	 * Set the function to the list ops, which will call the
+	 * function we want, albeit indirectly, but it handles the
+	 * ftrace_ops and doesn't depend on function_trace_op.
+	 */
+	ftrace_trace_function = ftrace_ops_list_func;
+	/*
+	 * Make sure all CPUs see this. Yes this is slow, but static
+	 * tracing is slow and nasty to have enabled.
+	 */
+	schedule_on_each_cpu(ftrace_sync);
+	/* Now all cpus are using the list ops. */
+	function_trace_op = set_function_trace_op;
+	/* Make sure the function_trace_op is visible on all CPUs */
+	smp_wmb();
+	/* Nasty way to force a rmb on all cpus */
+	smp_call_function(ftrace_sync_ipi, NULL, 1);
+	/* OK, we are all set to update the ftrace_trace_function now! */
+#endif /* !CONFIG_DYNAMIC_FTRACE */
 
 	ftrace_trace_function = func;
 }
@@ -425,16 +495,6 @@ static int __unregister_ftrace_function(struct ftrace_ops *ops)
 	} else if (ops->flags & FTRACE_OPS_FL_CONTROL) {
 		ret = remove_ftrace_list_ops(&ftrace_control_list,
 					     &control_ops, ops);
-		if (!ret) {
-			/*
-			 * The ftrace_ops is now removed from the list,
-			 * so there'll be no new users. We must ensure
-			 * all current users are done before we free
-			 * the control data.
-			 */
-			synchronize_sched();
-			control_ops_free(ops);
-		}
 	} else
 		ret = remove_ftrace_ops(&ftrace_ops_list, ops);
 
@@ -443,13 +503,6 @@ static int __unregister_ftrace_function(struct ftrace_ops *ops)
 
 	if (ftrace_enabled)
 		update_ftrace_function();
-
-	/*
-	 * Dynamic ops may be freed, we must make sure that all
-	 * callers are done before leaving this function.
-	 */
-	if (ops->flags & FTRACE_OPS_FL_DYNAMIC)
-		synchronize_sched();
 
 	return 0;
 }
@@ -1317,10 +1370,13 @@ alloc_and_copy_ftrace_hash(int size_bits, struct ftrace_hash *hash)
 	return NULL;
 }
 
-static void
+static bool
 ftrace_hash_rec_disable(struct ftrace_ops *ops, int filter_hash);
-static void
+static bool
 ftrace_hash_rec_enable(struct ftrace_ops *ops, int filter_hash);
+
+static int ftrace_hash_ipmodify_update(struct ftrace_ops *ops,
+				       struct ftrace_hash *new_hash);
 
 static int
 ftrace_hash_move(struct ftrace_ops *ops, int enable,
@@ -1333,7 +1389,12 @@ ftrace_hash_move(struct ftrace_ops *ops, int enable,
 	struct ftrace_hash *new_hash;
 	int size = src->count;
 	int bits = 0;
+	int ret;
 	int i;
+
+	/* Reject setting notrace hash on IPMODIFY ftrace_ops */
+	if (ops->flags & FTRACE_OPS_FL_IPMODIFY && !enable)
+		return -EINVAL;
 
 	/*
 	 * If the new source is empty, just free dst and assign it
@@ -1368,6 +1429,16 @@ ftrace_hash_move(struct ftrace_ops *ops, int enable,
 	}
 
 update:
+	/* Make sure this can be applied if it is IPMODIFY ftrace_ops */
+	if (enable) {
+		/* IPMODIFY should be updated only when filter_hash updating */
+		ret = ftrace_hash_ipmodify_update(ops, new_hash);
+		if (ret < 0) {
+			free_ftrace_hash(new_hash);
+			return ret;
+		}
+	}
+
 	/*
 	 * Remove the current set, update the hash and add
 	 * them back.
@@ -1510,7 +1581,7 @@ int ftrace_text_reserved(void *start, void *end)
 	return (int)!!ret;
 }
 
-static void __ftrace_hash_rec_update(struct ftrace_ops *ops,
+static bool __ftrace_hash_rec_update(struct ftrace_ops *ops,
 				     int filter_hash,
 				     bool inc)
 {
@@ -1518,12 +1589,13 @@ static void __ftrace_hash_rec_update(struct ftrace_ops *ops,
 	struct ftrace_hash *other_hash;
 	struct ftrace_page *pg;
 	struct dyn_ftrace *rec;
+	bool update = false;
 	int count = 0;
 	int all = 0;
 
 	/* Only update if the ops has been registered */
 	if (!(ops->flags & FTRACE_OPS_FL_ENABLED))
-		return;
+		return false;
 
 	/*
 	 * In the filter_hash case:
@@ -1550,7 +1622,7 @@ static void __ftrace_hash_rec_update(struct ftrace_ops *ops,
 		 * then there's nothing to do.
 		 */
 		if (ftrace_hash_empty(hash))
-			return;
+			return false;
 	}
 
 	do_for_each_ftrace_rec(pg, rec) {
@@ -1584,7 +1656,7 @@ static void __ftrace_hash_rec_update(struct ftrace_ops *ops,
 		if (inc) {
 			rec->flags++;
 			if (FTRACE_WARN_ON((rec->flags & ~FTRACE_FL_MASK) == FTRACE_REF_MAX))
-				return;
+				return false;
 			/*
 			 * If any ops wants regs saved for this function
 			 * then all ops will get saved regs.
@@ -1593,26 +1665,140 @@ static void __ftrace_hash_rec_update(struct ftrace_ops *ops,
 				rec->flags |= FTRACE_FL_REGS;
 		} else {
 			if (FTRACE_WARN_ON((rec->flags & ~FTRACE_FL_MASK) == 0))
-				return;
+				return false;
 			rec->flags--;
 		}
 		count++;
+
+		/* Must match FTRACE_UPDATE_CALLS in ftrace_modify_all_code() */
+		update |= ftrace_test_record(rec, 1) != FTRACE_UPDATE_IGNORE;
+
 		/* Shortcut, if we handled all records, we are done. */
 		if (!all && count == hash->count)
-			return;
+			return update;
 	} while_for_each_ftrace_rec();
+
+	return update;
 }
 
-static void ftrace_hash_rec_disable(struct ftrace_ops *ops,
+static bool ftrace_hash_rec_disable(struct ftrace_ops *ops,
 				    int filter_hash)
 {
-	__ftrace_hash_rec_update(ops, filter_hash, 0);
+	return __ftrace_hash_rec_update(ops, filter_hash, 0);
 }
 
-static void ftrace_hash_rec_enable(struct ftrace_ops *ops,
+static bool ftrace_hash_rec_enable(struct ftrace_ops *ops,
 				   int filter_hash)
 {
-	__ftrace_hash_rec_update(ops, filter_hash, 1);
+	return __ftrace_hash_rec_update(ops, filter_hash, 1);
+}
+
+/*
+ * Try to update IPMODIFY flag on each ftrace_rec. Return 0 if it is OK
+ * or no-needed to update, -EBUSY if it detects a conflict of the flag
+ * on a ftrace_rec, and -EINVAL if the new_hash tries to trace all recs.
+ * Note that old_hash and new_hash has below meanings
+ *  - If the hash is NULL, it hits all recs (if IPMODIFY is set, this is rejected)
+ *  - If the hash is EMPTY_HASH, it hits nothing
+ *  - Anything else hits the recs which match the hash entries.
+ */
+static int __ftrace_hash_update_ipmodify(struct ftrace_ops *ops,
+					 struct ftrace_hash *old_hash,
+					 struct ftrace_hash *new_hash)
+{
+	struct ftrace_page *pg;
+	struct dyn_ftrace *rec, *end = NULL;
+	int in_old, in_new;
+
+	/* Only update if the ops has been registered */
+	if (!(ops->flags & FTRACE_OPS_FL_ENABLED))
+		return 0;
+
+	if (!(ops->flags & FTRACE_OPS_FL_IPMODIFY))
+		return 0;
+
+	/*
+	 * Since the IPMODIFY is a very address sensitive action, we do not
+	 * allow ftrace_ops to set all functions to new hash.
+	 */
+	if (!new_hash || !old_hash)
+		return -EINVAL;
+
+	/* Update rec->flags */
+	do_for_each_ftrace_rec(pg, rec) {
+		/* We need to update only differences of filter_hash */
+		in_old = !!ftrace_lookup_ip(old_hash, rec->ip);
+		in_new = !!ftrace_lookup_ip(new_hash, rec->ip);
+		if (in_old == in_new)
+			continue;
+
+		if (in_new) {
+			/* New entries must ensure no others are using it */
+			if (rec->flags & FTRACE_FL_IPMODIFY)
+				goto rollback;
+			rec->flags |= FTRACE_FL_IPMODIFY;
+		} else /* Removed entry */
+			rec->flags &= ~FTRACE_FL_IPMODIFY;
+	} while_for_each_ftrace_rec();
+
+	return 0;
+
+rollback:
+	end = rec;
+
+	/* Roll back what we did above */
+	do_for_each_ftrace_rec(pg, rec) {
+		if (rec == end)
+			goto err_out;
+
+		in_old = !!ftrace_lookup_ip(old_hash, rec->ip);
+		in_new = !!ftrace_lookup_ip(new_hash, rec->ip);
+		if (in_old == in_new)
+			continue;
+
+		if (in_new)
+			rec->flags &= ~FTRACE_FL_IPMODIFY;
+		else
+			rec->flags |= FTRACE_FL_IPMODIFY;
+	} while_for_each_ftrace_rec();
+
+err_out:
+	return -EBUSY;
+}
+
+static int ftrace_hash_ipmodify_enable(struct ftrace_ops *ops)
+{
+	struct ftrace_hash *hash = ops->filter_hash;
+
+	if (ftrace_hash_empty(hash))
+		hash = NULL;
+
+	return __ftrace_hash_update_ipmodify(ops, EMPTY_HASH, hash);
+}
+
+/* Disabling always succeeds */
+static void ftrace_hash_ipmodify_disable(struct ftrace_ops *ops)
+{
+	struct ftrace_hash *hash = ops->filter_hash;
+
+	if (ftrace_hash_empty(hash))
+		hash = NULL;
+
+	__ftrace_hash_update_ipmodify(ops, hash, EMPTY_HASH);
+}
+
+static int ftrace_hash_ipmodify_update(struct ftrace_ops *ops,
+				       struct ftrace_hash *new_hash)
+{
+	struct ftrace_hash *old_hash = ops->filter_hash;
+
+	if (ftrace_hash_empty(old_hash))
+		old_hash = NULL;
+
+	if (ftrace_hash_empty(new_hash))
+		new_hash = NULL;
+
+	return __ftrace_hash_update_ipmodify(ops, old_hash, new_hash);
 }
 
 static void print_ip_ins(const char *fmt, unsigned char *p)
@@ -1938,8 +2124,14 @@ void ftrace_modify_all_code(int command)
 	else if (command & FTRACE_DISABLE_CALLS)
 		ftrace_replace_code(0);
 
-	if (command & FTRACE_UPDATE_TRACE_FUNC)
+	if (command & FTRACE_UPDATE_TRACE_FUNC) {
+		function_trace_op = set_function_trace_op;
+		smp_wmb();
+		/* If irqs are disabled, we are in stop machine */
+		if (!irqs_disabled())
+			smp_call_function(ftrace_sync_ipi, NULL, 1);
 		ftrace_update_ftrace_func(ftrace_trace_function);
+	}
 
 	if (command & FTRACE_START_FUNC_RET)
 		ftrace_enable_ftrace_graph_caller();
@@ -2031,7 +2223,6 @@ static int ftrace_startup(struct ftrace_ops *ops, int command)
 		return ret;
 
 	ftrace_start_up++;
-	command |= FTRACE_UPDATE_CALLS;
 
 	/* ops marked global share the filter hashes */
 	if (ops->flags & FTRACE_OPS_FL_GLOBAL) {
@@ -2043,8 +2234,18 @@ static int ftrace_startup(struct ftrace_ops *ops, int command)
 	}
 
 	ops->flags |= FTRACE_OPS_FL_ENABLED;
-	if (hash_enable)
-		ftrace_hash_rec_enable(ops, 1);
+
+	ret = ftrace_hash_ipmodify_enable(ops);
+	if (ret < 0) {
+		/* Rollback registration process */
+		__unregister_ftrace_function(ops);
+		ftrace_start_up--;
+		ops->flags &= ~FTRACE_OPS_FL_ENABLED;
+		return ret;
+	}
+
+	if (hash_enable && ftrace_hash_rec_enable(ops, 1))
+		command |= FTRACE_UPDATE_CALLS;
 
 	ftrace_startup_enable(command);
 
@@ -2082,23 +2283,55 @@ static int ftrace_shutdown(struct ftrace_ops *ops, int command)
 		}
 	}
 
-	if (hash_disable)
-		ftrace_hash_rec_disable(ops, 1);
+	/* Disabling ipmodify never fails */
+	ftrace_hash_ipmodify_disable(ops);
+
+	if (hash_disable && ftrace_hash_rec_disable(ops, 1))
+		command |= FTRACE_UPDATE_CALLS;
 
 	if (ops != &global_ops || !global_start_up)
 		ops->flags &= ~FTRACE_OPS_FL_ENABLED;
-
-	command |= FTRACE_UPDATE_CALLS;
 
 	if (saved_ftrace_func != ftrace_trace_function) {
 		saved_ftrace_func = ftrace_trace_function;
 		command |= FTRACE_UPDATE_TRACE_FUNC;
 	}
 
-	if (!command || !ftrace_enabled)
+	if (!command || !ftrace_enabled) {
+		/*
+		 * If these are control ops, they still need their
+		 * per_cpu field freed. Since, function tracing is
+		 * not currently active, we can just free them
+		 * without synchronizing all CPUs.
+		 */
+		if (ops->flags & FTRACE_OPS_FL_CONTROL)
+			control_ops_free(ops);
 		return 0;
+	}
 
 	ftrace_run_update_code(command);
+
+	/*
+	 * Dynamic ops may be freed, we must make sure that all
+	 * callers are done before leaving this function.
+	 * The same goes for freeing the per_cpu data of the control
+	 * ops.
+	 *
+	 * Again, normal synchronize_sched() is not good enough.
+	 * We need to do a hard force of sched synchronization.
+	 * This is because we use preempt_disable() to do RCU, but
+	 * the function tracers can be called where RCU is not watching
+	 * (like before user_exit()). We can not rely on the RCU
+	 * infrastructure to do the synchronization, thus we must do it
+	 * ourselves.
+	 */
+	if (ops->flags & (FTRACE_OPS_FL_DYNAMIC | FTRACE_OPS_FL_CONTROL)) {
+		schedule_on_each_cpu(ftrace_sync);
+
+		if (ops->flags & FTRACE_OPS_FL_CONTROL)
+			control_ops_free(ops);
+	}
+
 	return 0;
 }
 
@@ -2608,9 +2841,10 @@ static int t_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "%ps", (void *)rec->ip);
 	if (iter->flags & FTRACE_ITER_ENABLED)
-		seq_printf(m, " (%ld)%s",
+		seq_printf(m, " (%ld)%s%s",
 			   rec->flags & ~FTRACE_FL_MASK,
-			   rec->flags & FTRACE_FL_REGS ? " R" : "");
+			   rec->flags & FTRACE_FL_REGS ? " R" : " ",
+			   rec->flags & FTRACE_FL_IPMODIFY ? " I" : " ");
 	seq_printf(m, "\n");
 
 	return 0;
@@ -4121,9 +4355,21 @@ static void ftrace_init_module(struct module *mod,
 
 void ftrace_module_init(struct module *mod)
 {
+#ifdef CONFIG_S390
+	struct module_ext *mod_ext;
+
+	mutex_lock(&module_ext_mutex);
+	mod_ext = find_module_ext(mod);
+	mutex_unlock(&module_ext_mutex);
+
+	ftrace_init_module(mod, mod_ext->ftrace_callsites,
+			   mod_ext->ftrace_callsites +
+			   mod_ext->num_ftrace_callsites);
+#else
 	ftrace_init_module(mod, mod->ftrace_callsites,
 			   mod->ftrace_callsites +
 			   mod->num_ftrace_callsites);
+#endif
 }
 
 static int ftrace_module_notify_exit(struct notifier_block *self,
@@ -4702,6 +4948,7 @@ int ftrace_graph_entry_stub(struct ftrace_graph_ent *trace)
 trace_func_graph_ret_t ftrace_graph_return =
 			(trace_func_graph_ret_t)ftrace_stub;
 trace_func_graph_ent_t ftrace_graph_entry = ftrace_graph_entry_stub;
+static trace_func_graph_ent_t __ftrace_graph_entry = ftrace_graph_entry_stub;
 
 /* Try to assign a return stack array on FTRACE_RETSTACK_ALLOC_SIZE tasks. */
 static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
@@ -4843,6 +5090,30 @@ static struct ftrace_ops fgraph_ops __read_mostly = {
 				FTRACE_OPS_FL_RECURSION_SAFE,
 };
 
+static int ftrace_graph_entry_test(struct ftrace_graph_ent *trace)
+{
+	if (!ftrace_ops_test(&global_ops, trace->func, NULL))
+		return 0;
+	return __ftrace_graph_entry(trace);
+}
+
+/*
+ * The function graph tracer should only trace the functions defined
+ * by set_ftrace_filter and set_ftrace_notrace. If another function
+ * tracer ops is registered, the graph tracer requires testing the
+ * function against the global ops, and not just trace any function
+ * that any ftrace_ops registered.
+ */
+static void update_function_graph_func(void)
+{
+	if (ftrace_ops_list == &ftrace_list_end ||
+	    (ftrace_ops_list == &global_ops &&
+	     global_ops.next == &ftrace_list_end))
+		ftrace_graph_entry = __ftrace_graph_entry;
+	else
+		ftrace_graph_entry = ftrace_graph_entry_test;
+}
+
 int register_ftrace_graph(trace_func_graph_ret_t retfunc,
 			trace_func_graph_ent_t entryfunc)
 {
@@ -4867,7 +5138,16 @@ int register_ftrace_graph(trace_func_graph_ret_t retfunc,
 	}
 
 	ftrace_graph_return = retfunc;
-	ftrace_graph_entry = entryfunc;
+
+	/*
+	 * Update the indirect function to the entryfunc, and the
+	 * function that gets called to the entry_test first. Then
+	 * call the update fgraph entry function to determine if
+	 * the entryfunc should be called directly or not.
+	 */
+	__ftrace_graph_entry = entryfunc;
+	ftrace_graph_entry = ftrace_graph_entry_test;
+	update_function_graph_func();
 
 	ret = ftrace_startup(&fgraph_ops, FTRACE_START_FUNC_RET);
 
@@ -4886,6 +5166,7 @@ void unregister_ftrace_graph(void)
 	ftrace_graph_active--;
 	ftrace_graph_return = (trace_func_graph_ret_t)ftrace_stub;
 	ftrace_graph_entry = ftrace_graph_entry_stub;
+	__ftrace_graph_entry = ftrace_graph_entry_stub;
 	ftrace_shutdown(&fgraph_ops, FTRACE_STOP_FUNC_RET);
 	unregister_pm_notifier(&ftrace_suspend_notifier);
 	unregister_trace_sched_switch(ftrace_graph_probe_sched_switch, NULL);

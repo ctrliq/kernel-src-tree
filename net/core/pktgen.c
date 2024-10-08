@@ -1951,7 +1951,7 @@ static void pktgen_change_name(const struct pktgen_net *pn, struct net_device *d
 static int pktgen_device_event(struct notifier_block *unused,
 			       unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct pktgen_net *pn = net_generic(dev_net(dev), pg_net_id);
 
 	if (pn->pktgen_exiting)
@@ -3737,7 +3737,7 @@ static int __init pg_init(void)
 	ret = register_pernet_subsys(&pg_net_ops);
 	if (ret)
 		return ret;
-	ret = register_netdevice_notifier(&pktgen_notifier_block);
+	ret = register_netdevice_notifier_rh(&pktgen_notifier_block);
 	if (ret)
 		unregister_pernet_subsys(&pg_net_ops);
 
@@ -3746,7 +3746,7 @@ static int __init pg_init(void)
 
 static void __exit pg_cleanup(void)
 {
-	unregister_netdevice_notifier(&pktgen_notifier_block);
+	unregister_netdevice_notifier_rh(&pktgen_notifier_block);
 	unregister_pernet_subsys(&pg_net_ops);
 }
 

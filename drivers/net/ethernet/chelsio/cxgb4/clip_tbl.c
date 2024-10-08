@@ -154,9 +154,6 @@ void cxgb4_clip_release(const struct net_device *dev, const u32 *lip, u8 v6)
 	int hash;
 	int ret = -1;
 
-	if (!ctbl)
-		return;
-
 	hash = clip_addr_hash(ctbl, addr, v6);
 
 	read_lock_bh(&ctbl->lock);

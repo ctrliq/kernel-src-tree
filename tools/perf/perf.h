@@ -57,6 +57,9 @@ struct record_opts {
 	bool	     running_time;
 	bool	     full_auxtrace;
 	bool	     auxtrace_snapshot_mode;
+	bool	     record_switch_events;
+	bool	     all_kernel;
+	bool	     all_user;
 	unsigned int freq;
 	unsigned int mmap_pages;
 	unsigned int auxtrace_mmap_pages;
@@ -69,6 +72,7 @@ struct record_opts {
 	const char   *auxtrace_snapshot_opts;
 	bool	     sample_transaction;
 	unsigned     initial_delay;
+	unsigned int proc_map_timeout;
 };
 
 struct option;

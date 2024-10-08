@@ -1,3 +1,8 @@
+# Some of the tools (perf) use same make variables
+# as in kernel build.
+export srctree=
+export objtree=
+
 include scripts/Makefile.include
 
 help:
@@ -7,6 +12,7 @@ help:
 	@echo '  cpupower   - a tool for all things x86 CPU power'
 	@echo '  firewire   - the userspace part of nosy, an IEEE-1394 traffic sniffer'
 	@echo '  lguest     - a minimal 32-bit x86 hypervisor'
+	@echo '  objtool    - an ELF object analysis tool'
 	@echo '  perf       - Linux performance measurement and analysis tool'
 	@echo '  selftests  - various kernel selftests'
 	@echo '  turbostat  - Intel CPU idle stats and freq reporting tool'
@@ -36,14 +42,19 @@ help:
 cpupower: FORCE
 	$(call descend,power/$@)
 
-cgroup firewire guest usb virtio vm net: FORCE
+cgroup firewire guest usb virtio vm net objtool: FORCE
 	$(call descend,$@)
 
 libapikfs: FORCE
 	$(call descend,lib/api)
 
+# The perf build does not follow the descend function setup,
+# invoking it via it's own make rule.
+PERF_O   = $(if $(O),$(O)/tools/perf,)
+
 perf: libapikfs FORCE
-	$(call descend,$@)
+	$(Q)mkdir -p $(PERF_O) .
+	$(Q)$(MAKE) --no-print-directory -C perf O=$(PERF_O) subdir=
 
 selftests: FORCE
 	$(call descend,testing/$@)
@@ -57,7 +68,7 @@ tmon: FORCE
 cpupower_install:
 	$(call descend,power/$(@:_install=),install)
 
-cgroup_install firewire_install lguest_install perf_install usb_install virtio_install vm_install net_install:
+cgroup_install firewire_install lguest_install perf_install usb_install virtio_install vm_install net_install objtool_install:
 	$(call descend,$(@:_install=),install)
 
 selftests_install:
@@ -72,12 +83,12 @@ tmon_install:
 install: cgroup_install cpupower_install firewire_install lguest_install \
 		perf_install selftests_install turbostat_install usb_install \
 		virtio_install vm_install net_install x86_energy_perf_policy_install \
-	tmon
+		tmon_install objtool_install
 
 cpupower_clean:
 	$(call descend,power/cpupower,clean)
 
-cgroup_clean firewire_clean lguest_clean usb_clean virtio_clean vm_clean net_clean:
+cgroup_clean firewire_clean lguest_clean usb_clean virtio_clean vm_clean net_clean objtool_clean:
 	$(call descend,$(@:_clean=),clean)
 
 libapikfs_clean:
@@ -97,6 +108,7 @@ tmon_clean:
 
 clean: cgroup_clean cpupower_clean firewire_clean lguest_clean perf_clean \
 		selftests_clean turbostat_clean usb_clean virtio_clean \
-		vm_clean net_clean x86_energy_perf_policy_clean tmon_clean
+		vm_clean net_clean x86_energy_perf_policy_clean tmon_clean \
+		objtool_clean
 
 .PHONY: FORCE

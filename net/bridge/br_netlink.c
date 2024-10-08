@@ -262,7 +262,8 @@ static int br_fill_ifinfo(struct sk_buff *skb,
 	}
 
 done:
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 nla_put_failure:
 	nlmsg_cancel(skb, nlh);
@@ -308,7 +309,7 @@ errout:
  * Dump information about all ports, in response to GETLINK
  */
 int br_getlink(struct sk_buff *skb, u32 pid, u32 seq,
-	       struct net_device *dev, u32 filter_mask)
+	       struct net_device *dev, u32 filter_mask, int nlflags)
 {
 	struct net_bridge_port *port = br_port_get_rtnl(dev);
 
@@ -316,7 +317,7 @@ int br_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 	    !(filter_mask & RTEXT_FILTER_BRVLAN_COMPRESSED))
 		return 0;
 
-	return br_fill_ifinfo(skb, port, pid, seq, RTM_NEWLINK, NLM_F_MULTI,
+	return br_fill_ifinfo(skb, port, pid, seq, RTM_NEWLINK, nlflags,
 			      filter_mask, dev);
 }
 
@@ -493,7 +494,7 @@ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[])
 }
 
 /* Change state and parameters on port. */
-int br_setlink(struct net_device *dev, struct nlmsghdr *nlh)
+int br_setlink(struct net_device *dev, struct nlmsghdr *nlh, u16 flags)
 {
 	struct nlattr *protinfo;
 	struct nlattr *afspec;
@@ -549,7 +550,7 @@ out:
 }
 
 /* Delete port information */
-int br_dellink(struct net_device *dev, struct nlmsghdr *nlh)
+int br_dellink(struct net_device *dev, struct nlmsghdr *nlh, u16 flags)
 {
 	struct nlattr *afspec;
 	struct net_bridge_port *p;
@@ -582,6 +583,29 @@ static int br_validate(struct nlattr *tb[], struct nlattr *data[])
 		if (!is_valid_ether_addr(nla_data(tb[IFLA_ADDRESS])))
 			return -EADDRNOTAVAIL;
 	}
+
+	return 0;
+}
+
+static size_t br_get_size(const struct net_device *brdev)
+{
+	return nla_total_size(sizeof(u32)) +	/* IFLA_BR_FORWARD_DELAY  */
+	       nla_total_size(sizeof(u32)) +	/* IFLA_BR_HELLO_TIME */
+	       nla_total_size(sizeof(u32)) +	/* IFLA_BR_MAX_AGE */
+	       0;
+}
+
+static int br_fill_info(struct sk_buff *skb, const struct net_device *brdev)
+{
+	struct net_bridge *br = netdev_priv(brdev);
+	u32 forward_delay = jiffies_to_clock_t(br->forward_delay);
+	u32 hello_time = jiffies_to_clock_t(br->hello_time);
+	u32 age_time = jiffies_to_clock_t(br->max_age);
+
+	if (nla_put_u32(skb, IFLA_BR_FORWARD_DELAY, forward_delay) ||
+	    nla_put_u32(skb, IFLA_BR_HELLO_TIME, hello_time) ||
+	    nla_put_u32(skb, IFLA_BR_MAX_AGE, age_time))
+		return -EMSGSIZE;
 
 	return 0;
 }
@@ -630,6 +654,8 @@ struct rtnl_link_ops br_link_ops __read_mostly = {
 	.validate	= br_validate,
 	.newlink	= br_dev_newlink,
 	.dellink	= br_dev_delete,
+	.get_size	= br_get_size,
+	.fill_info	= br_fill_info,
 };
 
 int __init br_netlink_init(void)
@@ -654,7 +680,7 @@ out:
 	return err;
 }
 
-void __exit br_netlink_fini(void)
+void br_netlink_fini(void)
 {
 	br_mdb_uninit();
 	rtnl_af_unregister(&br_af_ops);

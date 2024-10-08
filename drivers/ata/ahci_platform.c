@@ -121,6 +121,8 @@ static int ahci_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+	hpriv->irq = irq;
+
 	hpriv->flags |= (unsigned long)pi.private_data;
 
 	hpriv->mmio = devm_ioremap(dev, mem->start, resource_size(mem));
@@ -210,7 +212,7 @@ static int ahci_probe(struct platform_device *pdev)
 	ahci_init_controller(host);
 	ahci_print_info(host, "platform");
 
-	rc = ahci_host_activate(host, irq, &ahci_platform_sht);
+	rc = ahci_host_activate(host, &ahci_platform_sht);
 	if (rc)
 		goto pdata_exit;
 

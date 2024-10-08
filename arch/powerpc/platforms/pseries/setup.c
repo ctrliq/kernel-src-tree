@@ -491,6 +491,7 @@ static void __init find_and_init_phbs(void)
 		rtas_setup_phb(phb);
 		pci_process_bridge_OF_ranges(phb, node, 0);
 		isa_bridge_find_early(phb);
+		phb->controller_ops = pseries_pci_controller_ops;
 	}
 
 	of_node_put(root);
@@ -854,6 +855,10 @@ static void pSeries_power_off(void)
 void pSeries_final_fixup(void) { }
 #endif
 
+struct pci_controller_ops pseries_pci_controller_ops = {
+	.probe_mode		= pSeries_pci_probe_mode,
+};
+
 define_machine(pseries) {
 	.name			= "pSeries",
 	.probe			= pSeries_probe,
@@ -862,7 +867,6 @@ define_machine(pseries) {
 	.show_cpuinfo		= pSeries_show_cpuinfo,
 	.log_error		= pSeries_log_error,
 	.pcibios_fixup		= pSeries_final_fixup,
-	.pci_probe_mode		= pSeries_pci_probe_mode,
 	.restart		= rtas_restart,
 	.power_off		= pSeries_power_off,
 	.halt			= rtas_halt,

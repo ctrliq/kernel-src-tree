@@ -660,6 +660,7 @@ static int ata_tdev_add(struct ata_device *ata_dev)
 	int error;
 
 	device_initialize(dev);
+	device_rh_alloc(dev);
 	dev->parent = get_device(&link->tdev);
 	dev->release = ata_tdev_release;
 	if (ata_is_host_link(link))

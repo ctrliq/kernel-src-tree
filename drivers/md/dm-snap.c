@@ -207,7 +207,6 @@ struct dm_snap_pending_exception {
 	 */
 	struct bio *full_bio;
 	bio_end_io_t *full_bio_end_io;
-	void *full_bio_private;
 };
 
 /*
@@ -1086,21 +1085,13 @@ static void start_merge(struct dm_snapshot *s)
 		snapshot_merge_next_chunks(s);
 }
 
-static int wait_schedule(void *ptr)
-{
-	schedule();
-
-	return 0;
-}
-
 /*
  * Stop the merging process and wait until it finishes.
  */
 static void stop_merge(struct dm_snapshot *s)
 {
 	set_bit(SHUTDOWN_MERGE, &s->state_bits);
-	wait_on_bit(&s->state_bits, RUNNING_MERGE, wait_schedule,
-		    TASK_UNINTERRUPTIBLE);
+	wait_on_bit(&s->state_bits, RUNNING_MERGE, TASK_UNINTERRUPTIBLE);
 	clear_bit(SHUTDOWN_MERGE, &s->state_bits);
 }
 
@@ -1218,7 +1209,7 @@ static int snapshot_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = s;
 	ti->num_flush_bios = num_flush_bios;
-	ti->per_bio_data_size = sizeof(struct dm_snap_tracked_chunk);
+	ti->per_io_data_size = sizeof(struct dm_snap_tracked_chunk);
 
 	/* Add snapshot to the list of snapshots for this origin */
 	/* Exceptions aren't triggered till snapshot_resume() is called */
@@ -1502,10 +1493,8 @@ out:
 	snapshot_bios = bio_list_get(&pe->snapshot_bios);
 	origin_bios = bio_list_get(&pe->origin_bios);
 	full_bio = pe->full_bio;
-	if (full_bio) {
+	if (full_bio)
 		full_bio->bi_end_io = pe->full_bio_end_io;
-		full_bio->bi_private = pe->full_bio_private;
-	}
 	increment_pending_exceptions_done_count();
 
 	up_write(&s->lock);
@@ -1611,7 +1600,6 @@ static void start_full_bio(struct dm_snap_pending_exception *pe,
 
 	pe->full_bio = bio;
 	pe->full_bio_end_io = bio->bi_end_io;
-	pe->full_bio_private = bio->bi_private;
 
 	callback_data = dm_kcopyd_prepare_callback(s->kcopyd_client,
 						   copy_callback, pe);

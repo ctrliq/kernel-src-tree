@@ -632,7 +632,8 @@ static int fdb_fill_info(struct sk_buff *skb, const struct net_bridge *br,
 	if (fdb->vlan_id && nla_put(skb, NDA_VLAN, sizeof(u16), &fdb->vlan_id))
 		goto nla_put_failure;
 
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 nla_put_failure:
 	nlmsg_cancel(skb, nlh);
@@ -677,6 +678,7 @@ errout:
 int br_fdb_dump(struct sk_buff *skb,
 		struct netlink_callback *cb,
 		struct net_device *dev,
+		struct net_device *filter_dev,
 		int idx)
 {
 	struct net_bridge *br = netdev_priv(dev);
@@ -689,15 +691,24 @@ int br_fdb_dump(struct sk_buff *skb,
 		struct net_bridge_fdb_entry *f;
 
 		hlist_for_each_entry_rcu(f, &br->hash[i], hlist) {
+			int err;
+
 			if (idx < cb->args[0])
 				goto skip;
 
-			if (fdb_fill_info(skb, br, f,
-					  NETLINK_CB(cb->skb).portid,
-					  cb->nlh->nlmsg_seq,
-					  RTM_NEWNEIGH,
-					  NLM_F_MULTI) < 0)
+			if (filter_dev && (!f->dst || !f->dst->dev ||
+					   f->dst->dev != filter_dev))
+				goto skip;
+
+			err = fdb_fill_info(skb, br, f,
+					    NETLINK_CB(cb->skb).portid,
+					    cb->nlh->nlmsg_seq,
+					    RTM_NEWNEIGH,
+					    NLM_F_MULTI);
+			if (err < 0) {
+				cb->args[1] = err;
 				break;
+			}
 skip:
 			++idx;
 		}
@@ -794,31 +805,20 @@ static int __br_fdb_add(struct ndmsg *ndm, struct net_bridge_port *p,
 /* Add new permanent fdb entry with RTM_NEWNEIGH */
 int br_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 	       struct net_device *dev,
-	       const unsigned char *addr, u16 nlh_flags)
+	       const unsigned char *addr, u16 vid, u16 nlh_flags)
 {
 	struct net_bridge_port *p;
 	int err = 0;
 	struct net_port_vlans *pv;
-	unsigned short vid = VLAN_N_VID;
 
 	if (!(ndm->ndm_state & (NUD_PERMANENT|NUD_NOARP|NUD_REACHABLE))) {
 		pr_info("bridge: RTM_NEWNEIGH with invalid state %#x\n", ndm->ndm_state);
 		return -EINVAL;
 	}
 
-	if (tb[NDA_VLAN]) {
-		if (nla_len(tb[NDA_VLAN]) != sizeof(unsigned short)) {
-			pr_info("bridge: RTM_NEWNEIGH with invalid vlan\n");
-			return -EINVAL;
-		}
-
-		vid = nla_get_u16(tb[NDA_VLAN]);
-
-		if (!vid || vid >= VLAN_VID_MASK) {
-			pr_info("bridge: RTM_NEWNEIGH with invalid vlan id %d\n",
-				vid);
-			return -EINVAL;
-		}
+	if (is_zero_ether_addr(addr)) {
+		pr_info("bridge: RTM_NEWNEIGH with invalid ether address\n");
+		return -EINVAL;
 	}
 
 	p = br_port_get_rtnl(dev);
@@ -829,7 +829,7 @@ int br_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 	}
 
 	pv = nbp_get_vlan_info(p);
-	if (vid != VLAN_N_VID) {
+	if (vid) {
 		if (!pv || !test_bit(vid, pv->vlan_bitmap)) {
 			pr_info("bridge: RTM_NEWNEIGH with unconfigured "
 				"vlan %d on port %s\n", vid, dev->name);
@@ -887,27 +887,12 @@ static int __br_fdb_delete(struct net_bridge_port *p,
 /* Remove neighbor entry with RTM_DELNEIGH */
 int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
 		  struct net_device *dev,
-		  const unsigned char *addr)
+		  const unsigned char *addr, u16 vid)
 {
 	struct net_bridge_port *p;
 	int err;
 	struct net_port_vlans *pv;
-	unsigned short vid = VLAN_N_VID;
 
-	if (tb[NDA_VLAN]) {
-		if (nla_len(tb[NDA_VLAN]) != sizeof(unsigned short)) {
-			pr_info("bridge: RTM_NEWNEIGH with invalid vlan\n");
-			return -EINVAL;
-		}
-
-		vid = nla_get_u16(tb[NDA_VLAN]);
-
-		if (!vid || vid >= VLAN_VID_MASK) {
-			pr_info("bridge: RTM_NEWNEIGH with invalid vlan id %d\n",
-				vid);
-			return -EINVAL;
-		}
-	}
 	p = br_port_get_rtnl(dev);
 	if (p == NULL) {
 		pr_info("bridge: RTM_DELNEIGH %s not a bridge port\n",
@@ -916,7 +901,7 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
 	}
 
 	pv = nbp_get_vlan_info(p);
-	if (vid != VLAN_N_VID) {
+	if (vid) {
 		if (!pv || !test_bit(vid, pv->vlan_bitmap)) {
 			pr_info("bridge: RTM_DELNEIGH with unconfigured "
 				"vlan %d on port %s\n", vid, dev->name);

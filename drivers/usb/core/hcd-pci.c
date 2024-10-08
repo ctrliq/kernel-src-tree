@@ -289,6 +289,7 @@ int usb_hcd_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 	if (retval != 0)
 		goto unmap_registers;
+	device_wakeup_enable(hcd->self.controller);
 
 	if (pci_dev_run_wake(dev))
 		pm_runtime_put_noidle(&dev->dev);
@@ -436,7 +437,6 @@ static int check_root_hub_suspended(struct device *dev)
 	return 0;
 }
 
-#if defined(CONFIG_PM_SLEEP) || defined(CONFIG_PM_RUNTIME)
 static int suspend_common(struct device *dev, bool do_wakeup)
 {
 	struct pci_dev		*pci_dev = to_pci_dev(dev);
@@ -535,7 +535,6 @@ static int resume_common(struct device *dev, int event)
 	}
 	return retval;
 }
-#endif	/* SLEEP || RUNTIME */
 
 #ifdef	CONFIG_PM_SLEEP
 
@@ -614,8 +613,6 @@ static int hcd_pci_restore(struct device *dev)
 
 #endif	/* CONFIG_PM_SLEEP */
 
-#ifdef	CONFIG_PM_RUNTIME
-
 static int hcd_pci_runtime_suspend(struct device *dev)
 {
 	int	retval;
@@ -636,13 +633,6 @@ static int hcd_pci_runtime_resume(struct device *dev)
 	dev_dbg(dev, "hcd_pci_runtime_resume: %d\n", retval);
 	return retval;
 }
-
-#else
-
-#define hcd_pci_runtime_suspend	NULL
-#define hcd_pci_runtime_resume	NULL
-
-#endif	/* CONFIG_PM_RUNTIME */
 
 const struct dev_pm_ops usb_hcd_pci_pm_ops = {
 	.suspend	= hcd_pci_suspend,

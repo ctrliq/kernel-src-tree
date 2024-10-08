@@ -179,14 +179,11 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
 	dev->ibdev.req_notify_cq = ocrdma_arm_cq;
 
 	dev->ibdev.get_dma_mr = ocrdma_get_dma_mr;
-	dev->ibdev.reg_phys_mr = ocrdma_reg_kernel_mr;
 	dev->ibdev.dereg_mr = ocrdma_dereg_mr;
 	dev->ibdev.reg_user_mr = ocrdma_reg_user_mr;
 
 	dev->ibdev.alloc_mr = ocrdma_alloc_mr;
 	dev->ibdev.map_mr_sg = ocrdma_map_mr_sg;
-	dev->ibdev.alloc_fast_reg_page_list = ocrdma_alloc_frmr_page_list;
-	dev->ibdev.free_fast_reg_page_list = ocrdma_free_frmr_page_list;
 
 	/* mandatory to support user space verbs consumer. */
 	dev->ibdev.alloc_ucontext = ocrdma_alloc_ucontext;
@@ -459,7 +456,9 @@ static struct ocrdma_driver ocrdma_drv = {
 static int __init ocrdma_init_module(void)
 {
 	int status;
+	const char tpmsg[] = "RoCE on OCE14xxx Adapters";
 
+	mark_tech_preview(tpmsg, THIS_MODULE);
 	ocrdma_init_debugfs();
 
 	status = be_roce_register_driver(&ocrdma_drv);

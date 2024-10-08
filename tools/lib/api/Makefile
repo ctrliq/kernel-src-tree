@@ -1,5 +1,5 @@
 include ../../scripts/Makefile.include
-include ../../perf/config/utilities.mak		# QUIET_CLEAN
+include ../../scripts/utilities.mak		# QUIET_CLEAN
 
 ifeq ($(srctree),)
 srctree := $(patsubst %/,%,$(dir $(shell pwd)))
@@ -22,12 +22,14 @@ CFLAGS += -I$(srctree)/tools/lib/api
 
 RM = rm -f
 
-build  := -f $(srctree)/tools/build/Makefile.build dir=. obj
 API_IN := $(OUTPUT)libapi-in.o
 
-export srctree OUTPUT CC LD CFLAGS V
+all:
 
-all: $(LIBFILE)
+export srctree OUTPUT CC LD CFLAGS V
+include $(srctree)/tools/build/Makefile.include
+
+all: fixdep $(LIBFILE)
 
 $(API_IN): FORCE
 	@$(MAKE) $(build)=libapi

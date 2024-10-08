@@ -44,7 +44,9 @@ struct fib_config {
 	u32			fc_flow;
 	u32			fc_nlflags;
 	struct nl_info		fc_nlinfo;
- };
+	struct nlattr		*fc_encap;
+	u16			fc_encap_type;
+};
 
 struct fib_info;
 struct rtable;
@@ -59,6 +61,7 @@ struct fib_nh_exception {
 	struct rtable __rcu		*fnhe_rth_input;
 	struct rtable __rcu		*fnhe_rth_output;
 	unsigned long			fnhe_stamp;
+	struct rcu_head			rcu;
 };
 
 struct fnhe_hash_bucket {
@@ -77,7 +80,7 @@ struct fib_nh {
 	unsigned char		nh_scope;
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	int			nh_weight;
-	int			nh_power;
+	atomic_t		nh_upper_bound;
 #endif
 #ifdef CONFIG_IP_ROUTE_CLASSID
 	__u32			nh_tclassid;
@@ -89,6 +92,7 @@ struct fib_nh {
 	struct rtable __rcu * __percpu *nh_pcpu_rth_output;
 	struct rtable __rcu	*nh_rth_input;
 	struct fnhe_hash_bucket	__rcu *nh_exceptions;
+	struct lwtunnel_state	*nh_lwtstate;
 };
 
 /*
@@ -115,7 +119,7 @@ struct fib_info {
 #define fib_advmss fib_metrics[RTAX_ADVMSS-1]
 	int			fib_nhs;
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	int			fib_power;
+	int			fib_weight;
 #endif
 	struct rcu_head		rcu;
 	struct fib_nh		fib_nh[0];
@@ -227,18 +231,24 @@ static inline int fib_lookup(struct net *net, const struct flowi4 *flp,
 			     struct fib_result *res)
 {
 	struct fib_table *tb;
-	int err;
+	int err = -ENETUNREACH;
 
 	rcu_read_lock();
 
-	for (err = 0; !err; err = -ENETUNREACH) {
-		tb = fib_get_table(net, RT_TABLE_LOCAL);
-		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
-			break;
-		tb = fib_get_table(net, RT_TABLE_MAIN);
-		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
-			break;
-	}
+	tb = fib_get_table(net, RT_TABLE_LOCAL);
+	if (tb)
+		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+
+	if (!err)
+		goto out;
+
+	tb = fib_get_table(net, RT_TABLE_MAIN);
+	if (tb)
+		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+
+out:
+	if (err == -EAGAIN)
+		err = -ENETUNREACH;
 
 	rcu_read_unlock();
 
@@ -258,7 +268,7 @@ static inline int fib_lookup(struct net *net, struct flowi4 *flp,
 			     struct fib_result *res)
 {
 	struct fib_table *tb;
-	int err;
+	int err = -ENETUNREACH;
 
 	if (net->ipv4.fib_has_custom_rules)
 		return __fib_lookup(net, flp, res);
@@ -267,19 +277,27 @@ static inline int fib_lookup(struct net *net, struct flowi4 *flp,
 
 	res->tclassid = 0;
 
-	for (err = 0; !err; err = -ENETUNREACH) {
-		tb = rcu_dereference_rtnl(net->ipv4.fib_local);
-		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
-			break;
+	tb = rcu_dereference_rtnl(net->ipv4.fib_local);
+	if (tb)
+		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
 
-		tb = rcu_dereference_rtnl(net->ipv4.fib_main);
-		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
-			break;
+	if (!err)
+		goto out;
 
-		tb = rcu_dereference_rtnl(net->ipv4.fib_default);
-		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
-			break;
-	}
+	tb = rcu_dereference_rtnl(net->ipv4.fib_main);
+	if (tb)
+		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+
+	if (!err)
+		goto out;
+
+	tb = rcu_dereference_rtnl(net->ipv4.fib_default);
+	if (tb)
+		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+
+out:
+	if (err == -EAGAIN)
+		err = -ENETUNREACH;
 
 	rcu_read_unlock();
 
@@ -313,7 +331,15 @@ int ip_fib_check_default(__be32 gw, struct net_device *dev);
 int fib_sync_down_dev(struct net_device *dev, int force);
 int fib_sync_down_addr(struct net *net, __be32 local);
 int fib_sync_up(struct net_device *dev);
-void fib_select_multipath(struct fib_result *res);
+
+extern u32 fib_multipath_secret __read_mostly;
+
+static inline int fib_multipath_hash(__be32 saddr, __be32 daddr)
+{
+	return jhash_2words(saddr, daddr, fib_multipath_secret) >> 1;
+}
+
+void fib_select_multipath(struct fib_result *res, int hash);
 
 /* Exported by fib_trie.c */
 void fib_trie_init(void);

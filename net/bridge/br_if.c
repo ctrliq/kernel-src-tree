@@ -529,6 +529,9 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 	else
 		netdev_set_rx_headroom(dev, br_hr);
 
+	if (br_fdb_insert(br, p, dev->dev_addr, 0))
+		netdev_err(dev, "failed insert local address bridge forwarding table\n");
+
 	spin_lock_bh(&br->lock);
 	changed_addr = br_stp_recalculate_bridge_id(br);
 
@@ -543,9 +546,6 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 		call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
 
 	dev_set_mtu(br->dev, br_min_mtu(br));
-
-	if (br_fdb_insert(br, p, dev->dev_addr, 0))
-		netdev_err(dev, "failed insert local address bridge forwarding table\n");
 
 	if (nbp_vlan_init(p))
 		netdev_err(dev, "failed to initialize vlan filtering on this port\n");

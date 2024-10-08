@@ -1317,10 +1317,10 @@ int
 qlafx00_configure_devices(scsi_qla_host_t *vha)
 {
 	int  rval;
-	unsigned long flags, save_flags;
+	unsigned long flags;
 	rval = QLA_SUCCESS;
 
-	save_flags = flags = vha->dpc_flags;
+	flags = vha->dpc_flags;
 
 	ql_dbg(ql_dbg_disc, vha, 0x2090,
 	    "Configure devices -- dpc flags =0x%lx\n", flags);
@@ -2280,7 +2280,6 @@ qlafx00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 	struct sts_entry_fx00 *sts;
 	__le16		comp_status;
 	__le16		scsi_status;
-	uint16_t	ox_id;
 	__le16		lscsi_status;
 	int32_t		resid;
 	uint32_t	sense_len, par_sense_len, rsp_info_len, resid_len,
@@ -2345,7 +2344,6 @@ qlafx00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 
 	fcport = sp->fcport;
 
-	ox_id = 0;
 	sense_len = par_sense_len = rsp_info_len = resid_len =
 		fw_resid_len = 0;
 	if (scsi_status & cpu_to_le16((uint16_t)SS_SENSE_LEN_VALID))
@@ -2927,8 +2925,9 @@ qlafx00_intr_handler(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	for (iter = 50; iter--; clr_intr = 0) {
 		stat = QLAFX00_RD_INTR_REG(ha);
-		intr_stat = stat & QLAFX00_HST_INT_STS_BITS;
-		if (!intr_stat)
+		if (qla2x00_check_reg32_for_disconnect(vha, stat))
+			break;
+		if ((stat & QLAFX00_HST_INT_STS_BITS) == 0)
 			break;
 
 		if (stat & QLAFX00_INTR_MB_CMPLT) {
@@ -3008,7 +3007,7 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
 
 	/* No data transfer */
 	if (!scsi_bufflen(cmd) || cmd->sc_data_direction == DMA_NONE) {
-		lcmd_pkt->byte_count = __constant_cpu_to_le32(0);
+		lcmd_pkt->byte_count = cpu_to_le32(0);
 		return;
 	}
 
@@ -3070,7 +3069,7 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
 int
 qlafx00_start_scsi(srb_t *sp)
 {
-	int		ret, nseg;
+	int		nseg;
 	unsigned long   flags;
 	uint32_t        index;
 	uint32_t	handle;
@@ -3088,8 +3087,6 @@ qlafx00_start_scsi(srb_t *sp)
 	char		tag[2];
 
 	/* Setup device pointers. */
-	ret = 0;
-
 	rsp = ha->rsp_q_map[0];
 	req = vha->req;
 

@@ -126,7 +126,13 @@ int sctp_rcv(struct sk_buff *skb)
 		       skb_transport_offset(skb))
 		goto discard_it;
 
-	if (!pskb_may_pull(skb, sizeof(struct sctphdr)))
+	/* If the packet is fragmented and we need to do crc checking,
+	 * it's better to just linearize it otherwise crc computing
+	 * takes longer.
+	 */
+	if ((!(skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) &&
+	     skb_linearize(skb)) ||
+	    !pskb_may_pull(skb, sizeof(struct sctphdr)))
 		goto discard_it;
 
 	/* Pull up the IP header. */
@@ -135,7 +141,9 @@ int sctp_rcv(struct sk_buff *skb)
 	skb->csum_valid = 0; /* Previous value not applicable */
 	if (skb_csum_unnecessary(skb))
 		__skb_decr_checksum_unnecessary(skb);
-	else if (!sctp_checksum_disable && sctp_rcv_checksum(net, skb) < 0)
+	else if (!sctp_checksum_disable &&
+		 !(skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) &&
+		 sctp_rcv_checksum(net, skb) < 0)
 		goto discard_it;
 	skb->csum_valid = 1;
 
@@ -215,7 +223,7 @@ int sctp_rcv(struct sk_buff *skb)
 		goto discard_release;
 
 	/* Create an SCTP packet structure. */
-	chunk = sctp_chunkify(skb, asoc, sk);
+	chunk = sctp_chunkify(skb, asoc, sk, GFP_ATOMIC);
 	if (!chunk)
 		goto discard_release;
 	SCTP_INPUT_CB(skb)->chunk = chunk;
@@ -236,7 +244,7 @@ int sctp_rcv(struct sk_buff *skb)
 	 * bottom halves on this lock, but a user may be in the lock too,
 	 * so check if it is busy.
 	 */
-	sctp_bh_lock_sock(sk);
+	bh_lock_sock(sk);
 
 	if (sk != rcvr->sk) {
 		/* Our cached sk is different from the rcvr->sk.  This is
@@ -246,14 +254,14 @@ int sctp_rcv(struct sk_buff *skb)
 		 * be doing something with the new socket.  Switch our veiw
 		 * of the current sk.
 		 */
-		sctp_bh_unlock_sock(sk);
+		bh_unlock_sock(sk);
 		sk = rcvr->sk;
-		sctp_bh_lock_sock(sk);
+		bh_lock_sock(sk);
 	}
 
 	if (sock_owned_by_user(sk)) {
 		if (sctp_add_backlog(sk, skb)) {
-			sctp_bh_unlock_sock(sk);
+			bh_unlock_sock(sk);
 			sctp_chunk_free(chunk);
 			skb = NULL; /* sctp_chunk_free already freed the skb */
 			goto discard_release;
@@ -264,7 +272,7 @@ int sctp_rcv(struct sk_buff *skb)
 		sctp_inq_push(&chunk->rcvr->inqueue, chunk);
 	}
 
-	sctp_bh_unlock_sock(sk);
+	bh_unlock_sock(sk);
 
 	/* Release the asoc/ep ref we took in the lookup calls. */
 	if (asoc)
@@ -325,7 +333,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 		 */
 
 		sk = rcvr->sk;
-		sctp_bh_lock_sock(sk);
+		bh_lock_sock(sk);
 
 		if (sock_owned_by_user(sk)) {
 			if (sk_add_backlog(sk, skb, sk->sk_rcvbuf))
@@ -335,7 +343,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 		} else
 			sctp_inq_push(inqueue, chunk);
 
-		sctp_bh_unlock_sock(sk);
+		bh_unlock_sock(sk);
 
 		/* If the chunk was backloged again, don't drop refs */
 		if (backloged)
@@ -436,8 +444,6 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 			   struct sctp_association *asoc,
 			   struct sctp_transport *t)
 {
-	SCTP_DEBUG_PRINTK("%s\n",  __func__);
-
 	if (sock_owned_by_user(sk)) {
 		if (timer_pending(&t->proto_unreach_timer))
 			return;
@@ -446,9 +452,11 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 						jiffies + (HZ/20)))
 				sctp_association_hold(asoc);
 		}
-			
 	} else {
 		struct net *net = sock_net(sk);
+
+		pr_debug("%s: unrecognized next header type "
+			 "encountered!\n", __func__);
 
 		if (del_timer(&t->proto_unreach_timer))
 			sctp_association_put(asoc);
@@ -520,7 +528,7 @@ struct sock *sctp_err_lookup(struct net *net, int family, struct sk_buff *skb,
 		goto out;
 	}
 
-	sctp_bh_lock_sock(sk);
+	bh_lock_sock(sk);
 
 	/* If too many ICMPs get dropped on busy
 	 * servers this needs to be solved differently.
@@ -540,7 +548,7 @@ out:
 /* Common cleanup code for icmp/icmpv6 error handler. */
 void sctp_err_finish(struct sock *sk, struct sctp_association *asoc)
 {
-	sctp_bh_unlock_sock(sk);
+	bh_unlock_sock(sk);
 	sctp_association_put(asoc);
 }
 
@@ -600,7 +608,8 @@ void sctp_v4_err(struct sk_buff *skb, __u32 info)
 
 		/* PMTU discovery (RFC1191) */
 		if (ICMP_FRAG_NEEDED == code) {
-			sctp_icmp_frag_needed(sk, asoc, transport, info);
+			sctp_icmp_frag_needed(sk, asoc, transport,
+					      WORD_TRUNC(info));
 			goto out_unlock;
 		} else {
 			if (ICMP_PROT_UNREACH == code) {
@@ -715,17 +724,17 @@ static void __sctp_hash_endpoint(struct sctp_endpoint *ep)
 	epb->hashent = sctp_ep_hashfn(net, epb->bind_addr.port);
 	head = &sctp_ep_hashtable[epb->hashent];
 
-	sctp_write_lock(&head->lock);
+	write_lock(&head->lock);
 	hlist_add_head(&epb->node, &head->chain);
-	sctp_write_unlock(&head->lock);
+	write_unlock(&head->lock);
 }
 
 /* Add an endpoint to the hash. Local BH-safe. */
 void sctp_hash_endpoint(struct sctp_endpoint *ep)
 {
-	sctp_local_bh_disable();
+	local_bh_disable();
 	__sctp_hash_endpoint(ep);
-	sctp_local_bh_enable();
+	local_bh_enable();
 }
 
 /* Remove endpoint from the hash table.  */
@@ -741,17 +750,17 @@ static void __sctp_unhash_endpoint(struct sctp_endpoint *ep)
 
 	head = &sctp_ep_hashtable[epb->hashent];
 
-	sctp_write_lock(&head->lock);
+	write_lock(&head->lock);
 	hlist_del_init(&epb->node);
-	sctp_write_unlock(&head->lock);
+	write_unlock(&head->lock);
 }
 
 /* Remove endpoint from the hash.  Local BH-safe. */
 void sctp_unhash_endpoint(struct sctp_endpoint *ep)
 {
-	sctp_local_bh_disable();
+	local_bh_disable();
 	__sctp_unhash_endpoint(ep);
-	sctp_local_bh_enable();
+	local_bh_enable();
 }
 
 /* Look up an endpoint. */
@@ -825,7 +834,7 @@ static inline u32 sctp_hash_obj(const void *data, u32 len, u32 seed)
 {
 	const struct sctp_transport *t = data;
 	const union sctp_addr *paddr = &t->ipaddr;
-	const struct net *net = sock_net(t->asoc->base.sk);
+	struct net *net = sock_net(t->asoc->base.sk);
 	u16 lport = htons(t->asoc->base.bind_addr.port);
 	u32 addr;
 
@@ -842,7 +851,7 @@ static inline u32 sctp_hash_key(const void *data, u32 len, u32 seed)
 {
 	const struct sctp_hash_cmp_arg *x = data;
 	const union sctp_addr *paddr = x->paddr;
-	const struct net *net = x->net;
+	struct net *net = (struct net *)x->net;
 	u16 lport;
 	u32 addr;
 
@@ -879,6 +888,9 @@ void sctp_hash_transport(struct sctp_transport *t)
 {
 	struct sctp_hash_cmp_arg arg;
 
+	if (t->asoc->temp)
+		return;
+
 	arg.ep = t->asoc->ep;
 	arg.paddr = &t->ipaddr;
 	arg.net   = sock_net(t->asoc->base.sk);
@@ -891,6 +903,9 @@ reinsert:
 
 void sctp_unhash_transport(struct sctp_transport *t)
 {
+	if (t->asoc->temp)
+		return;
+
 	rhashtable_remove_fast(&sctp_transport_hashtable, &t->node,
 			       sctp_hash_params);
 }
@@ -926,67 +941,6 @@ struct sctp_transport *sctp_epaddr_lookup_transport(
 				      sctp_hash_params);
 }
 
-/* Insert association into the hash table.  */
-static void __sctp_hash_established(struct sctp_association *asoc)
-{
-	struct net *net = sock_net(asoc->base.sk);
-	struct sctp_ep_common *epb;
-	struct sctp_hashbucket *head;
-
-	epb = &asoc->base;
-
-	/* Calculate which chain this entry will belong to. */
-	epb->hashent = sctp_assoc_hashfn(net, epb->bind_addr.port,
-					 asoc->peer.port);
-
-	head = &sctp_assoc_hashtable[epb->hashent];
-
-	sctp_write_lock(&head->lock);
-	hlist_add_head(&epb->node, &head->chain);
-	sctp_write_unlock(&head->lock);
-}
-
-/* Add an association to the hash. Local BH-safe. */
-void sctp_hash_established(struct sctp_association *asoc)
-{
-	if (asoc->temp)
-		return;
-
-	sctp_local_bh_disable();
-	__sctp_hash_established(asoc);
-	sctp_local_bh_enable();
-}
-
-/* Remove association from the hash table.  */
-static void __sctp_unhash_established(struct sctp_association *asoc)
-{
-	struct net *net = sock_net(asoc->base.sk);
-	struct sctp_hashbucket *head;
-	struct sctp_ep_common *epb;
-
-	epb = &asoc->base;
-
-	epb->hashent = sctp_assoc_hashfn(net, epb->bind_addr.port,
-					 asoc->peer.port);
-
-	head = &sctp_assoc_hashtable[epb->hashent];
-
-	sctp_write_lock(&head->lock);
-	hlist_del_init(&epb->node);
-	sctp_write_unlock(&head->lock);
-}
-
-/* Remove association from the hash table.  Local BH-safe. */
-void sctp_unhash_established(struct sctp_association *asoc)
-{
-	if (asoc->temp)
-		return;
-
-	sctp_local_bh_disable();
-	__sctp_unhash_established(asoc);
-	sctp_local_bh_enable();
-}
-
 /* Look up an association. */
 static struct sctp_association *__sctp_lookup_association(
 					struct net *net,
@@ -994,49 +948,35 @@ static struct sctp_association *__sctp_lookup_association(
 					const union sctp_addr *peer,
 					struct sctp_transport **pt)
 {
-	struct sctp_hashbucket *head;
-	struct sctp_ep_common *epb;
-	struct sctp_association *asoc;
-	struct sctp_transport *transport;
-	int hash;
+	struct sctp_transport *t;
+	struct sctp_association *asoc = NULL;
 
-	/* Optimize here for direct hit, only listening connections can
-	 * have wildcards anyways.
-	 */
-	hash = sctp_assoc_hashfn(net, ntohs(local->v4.sin_port),
-				 ntohs(peer->v4.sin_port));
-	head = &sctp_assoc_hashtable[hash];
-	read_lock(&head->lock);
-	sctp_for_each_hentry(epb, &head->chain) {
-		asoc = sctp_assoc(epb);
-		transport = sctp_assoc_is_match(asoc, net, local, peer);
-		if (transport)
-			goto hit;
-	}
+	t = sctp_addrs_lookup_transport(net, local, peer);
+	if (!t || !sctp_transport_hold(t))
+		goto out;
 
-	read_unlock(&head->lock);
-
-	return NULL;
-
-hit:
-	*pt = transport;
+	asoc = t->asoc;
 	sctp_association_hold(asoc);
-	read_unlock(&head->lock);
+	*pt = t;
+
+	sctp_transport_put(t);
+
+out:
 	return asoc;
 }
 
-/* Look up an association. BH-safe. */
-SCTP_STATIC
+/* Look up an association. protected by RCU read lock */
+static
 struct sctp_association *sctp_lookup_association(struct net *net,
 						 const union sctp_addr *laddr,
 						 const union sctp_addr *paddr,
-					    struct sctp_transport **transportp)
+						 struct sctp_transport **transportp)
 {
 	struct sctp_association *asoc;
 
-	sctp_local_bh_disable();
+	rcu_read_lock();
 	asoc = __sctp_lookup_association(net, laddr, paddr, transportp);
-	sctp_local_bh_enable();
+	rcu_read_unlock();
 
 	return asoc;
 }
@@ -1197,30 +1137,30 @@ static struct sctp_association *__sctp_rcv_walk_lookup(struct net *net,
 			break;
 
 		switch (ch->type) {
-		    case SCTP_CID_AUTH:
-			    have_auth = chunk_num;
-			    break;
+		case SCTP_CID_AUTH:
+			have_auth = chunk_num;
+			break;
 
-		    case SCTP_CID_COOKIE_ECHO:
-			    /* If a packet arrives containing an AUTH chunk as
-			     * a first chunk, a COOKIE-ECHO chunk as the second
-			     * chunk, and possibly more chunks after them, and
-			     * the receiver does not have an STCB for that
-			     * packet, then authentication is based on
-			     * the contents of the COOKIE- ECHO chunk.
-			     */
-			    if (have_auth == 1 && chunk_num == 2)
-				    return NULL;
-			    break;
+		case SCTP_CID_COOKIE_ECHO:
+			/* If a packet arrives containing an AUTH chunk as
+			 * a first chunk, a COOKIE-ECHO chunk as the second
+			 * chunk, and possibly more chunks after them, and
+			 * the receiver does not have an STCB for that
+			 * packet, then authentication is based on
+			 * the contents of the COOKIE- ECHO chunk.
+			 */
+			if (have_auth == 1 && chunk_num == 2)
+				return NULL;
+			break;
 
-		    case SCTP_CID_ASCONF:
-			    if (have_auth || net->sctp.addip_noauth)
-				    asoc = __sctp_rcv_asconf_lookup(
-							net, ch, laddr,
-							sctp_hdr(skb)->source,
-							transportp);
-		    default:
-			    break;
+		case SCTP_CID_ASCONF:
+			if (have_auth || net->sctp.addip_noauth)
+				asoc = __sctp_rcv_asconf_lookup(
+						net, ch, laddr,
+						sctp_hdr(skb)->source,
+						transportp);
+		default:
+			break;
 		}
 
 		if (asoc)
@@ -1246,7 +1186,12 @@ static struct sctp_association *__sctp_rcv_lookup_harder(struct net *net,
 {
 	sctp_chunkhdr_t *ch;
 
-	if (skb_linearize(skb))
+	/* We do not allow GSO frames here as we need to linearize and
+	 * then cannot guarantee frame boundaries. This shouldn't be an
+	 * issue as packets hitting this are mostly INIT or INIT-ACK and
+	 * those cannot be on GSO-style anyway.
+	 */
+	if ((skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP)
 		return NULL;
 
 	ch = (sctp_chunkhdr_t *) skb->data;

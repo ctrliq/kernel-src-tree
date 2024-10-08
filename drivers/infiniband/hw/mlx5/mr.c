@@ -40,6 +40,7 @@
 #include <rdma/ib_umem_odp.h>
 #include <rdma/ib_verbs.h>
 #include "mlx5_ib.h"
+#include "user.h"
 
 enum {
 	MAX_PENDING_REG_MR = 8,
@@ -57,7 +58,7 @@ static int clean_mr(struct mlx5_ib_mr *mr);
 
 static int destroy_mkey(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 {
-	int err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmr);
+	int err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmkey);
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
 	/* Wait until all page fault handlers using the mr complete. */
@@ -120,7 +121,7 @@ static void reg_mr_callback(int status, void *context)
 	struct mlx5_cache_ent *ent = &cache->ent[c];
 	u8 key;
 	unsigned long flags;
-	struct mlx5_mr_table *table = &dev->mdev->priv.mr_table;
+	struct mlx5_mkey_table *table = &dev->mdev->priv.mkey_table;
 	int err;
 
 	spin_lock_irqsave(&ent->lock, flags);
@@ -147,7 +148,7 @@ static void reg_mr_callback(int status, void *context)
 	spin_lock_irqsave(&dev->mdev->priv.mkey_lock, flags);
 	key = dev->mdev->priv.mkey_key++;
 	spin_unlock_irqrestore(&dev->mdev->priv.mkey_lock, flags);
-	mr->mmr.key = mlx5_idx_to_mkey(be32_to_cpu(mr->out.mkey) & 0xffffff) | key;
+	mr->mmkey.key = mlx5_idx_to_mkey(be32_to_cpu(mr->out.mkey) & 0xffffff) | key;
 
 	cache->last_add = jiffies;
 
@@ -158,10 +159,10 @@ static void reg_mr_callback(int status, void *context)
 	spin_unlock_irqrestore(&ent->lock, flags);
 
 	write_lock_irqsave(&table->lock, flags);
-	err = radix_tree_insert(&table->tree, mlx5_base_mkey(mr->mmr.key),
-				&mr->mmr);
+	err = radix_tree_insert(&table->tree, mlx5_base_mkey(mr->mmkey.key),
+				&mr->mmkey);
 	if (err)
-		pr_err("Error inserting to mr tree. 0x%x\n", -err);
+		pr_err("Error inserting to mkey tree. 0x%x\n", -err);
 	write_unlock_irqrestore(&table->lock, flags);
 }
 
@@ -202,7 +203,7 @@ static int add_keys(struct mlx5_ib_dev *dev, int c, int num)
 		spin_lock_irq(&ent->lock);
 		ent->pending++;
 		spin_unlock_irq(&ent->lock);
-		err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in,
+		err = mlx5_core_create_mkey(dev->mdev, &mr->mmkey, in,
 					    sizeof(*in), reg_mr_callback,
 					    mr, &mr->out);
 		if (err) {
@@ -691,14 +692,14 @@ struct ib_mr *mlx5_ib_get_dma_mr(struct ib_pd *pd, int acc)
 	seg->qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
 	seg->start_addr = 0;
 
-	err = mlx5_core_create_mkey(mdev, &mr->mmr, in, sizeof(*in), NULL, NULL,
+	err = mlx5_core_create_mkey(mdev, &mr->mmkey, in, sizeof(*in), NULL, NULL,
 				    NULL);
 	if (err)
 		goto err_in;
 
 	kfree(in);
-	mr->ibmr.lkey = mr->mmr.key;
-	mr->ibmr.rkey = mr->mmr.key;
+	mr->ibmr.lkey = mr->mmkey.key;
+	mr->ibmr.rkey = mr->mmkey.key;
 	mr->umem = NULL;
 
 	return &mr->ibmr;
@@ -763,7 +764,7 @@ static void prep_umr_wqe_common(struct ib_pd *pd, struct ib_send_wr *wr,
 				int page_shift)
 {
 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
+	struct mlx5_umr_wr *umrwr = umr_wr(wr);
 
 	sg->addr = dma;
 	sg->length = ALIGN(sizeof(u64) * n, 64);
@@ -803,7 +804,7 @@ static void prep_umr_reg_wqe(struct ib_pd *pd, struct ib_send_wr *wr,
 static void prep_umr_unreg_wqe(struct mlx5_ib_dev *dev,
 			       struct ib_send_wr *wr, u32 key)
 {
-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
+	struct mlx5_umr_wr *umrwr = umr_wr(wr);
 
 	wr->send_flags = MLX5_IB_SEND_UMR_UNREG | MLX5_IB_SEND_UMR_FAIL_IF_FREE;
 	wr->opcode = MLX5_IB_WR_UMR;
@@ -835,26 +836,20 @@ static struct ib_umem *mr_umem_get(struct ib_pd *pd, u64 start, u64 length,
 	return umem;
 }
 
-void mlx5_umr_cq_handler(struct ib_cq *cq, void *cq_context)
+static void mlx5_ib_umr_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-	struct mlx5_ib_umr_context *context;
-	struct ib_wc wc;
-	int err;
+	struct mlx5_ib_umr_context *context =
+		container_of(wc->wr_cqe, struct mlx5_ib_umr_context, cqe);
 
-	while (1) {
-		err = ib_poll_cq(cq, 1, &wc);
-		if (err < 0) {
-			pr_warn("poll cq error %d\n", err);
-			return;
-		}
-		if (err == 0)
-			break;
+	context->status = wc->status;
+	complete(&context->done);
+}
 
-		context = (struct mlx5_ib_umr_context *) (unsigned long) wc.wr_id;
-		context->status = wc.status;
-		complete(&context->done);
-	}
-	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+static inline void mlx5_ib_init_umr_context(struct mlx5_ib_umr_context *context)
+{
+	context->cqe.done = mlx5_ib_umr_done;
+	context->status = -1;
+	init_completion(&context->done);
 }
 
 static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
@@ -865,7 +860,8 @@ static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
 	struct device *ddev = dev->ib_dev.dma_device;
 	struct umr_common *umrc = &dev->umrc;
 	struct mlx5_ib_umr_context umr_context;
-	struct ib_send_wr wr, *bad;
+	struct mlx5_umr_wr umrwr = {};
+	struct ib_send_wr *bad;
 	struct mlx5_ib_mr *mr;
 	struct ib_sge sg;
 	int size;
@@ -894,14 +890,14 @@ static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
 	if (err)
 		goto free_mr;
 
-	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = (u64)(unsigned long)&umr_context;
-	prep_umr_reg_wqe(pd, &wr, &sg, dma, npages, mr->mmr.key, page_shift,
-			 virt_addr, len, access_flags);
-
 	mlx5_ib_init_umr_context(&umr_context);
+
+	umrwr.wr.wr_cqe = &umr_context.cqe;
+	prep_umr_reg_wqe(pd, &umrwr.wr, &sg, dma, npages, mr->mmkey.key,
+			 page_shift, virt_addr, len, access_flags);
+
 	down(&umrc->sem);
-	err = ib_post_send(umrc->qp, &wr, &bad);
+	err = ib_post_send(umrc->qp, &umrwr.wr, &bad);
 	if (err) {
 		mlx5_ib_warn(dev, "post send failed, err %d\n", err);
 		goto unmap_dma;
@@ -913,9 +909,9 @@ static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
 		}
 	}
 
-	mr->mmr.iova = virt_addr;
-	mr->mmr.size = len;
-	mr->mmr.pd = to_mpd(pd)->pdn;
+	mr->mmkey.iova = virt_addr;
+	mr->mmkey.size = len;
+	mr->mmkey.pd = to_mpd(pd)->pdn;
 
 	mr->live = 1;
 
@@ -946,8 +942,8 @@ int mlx5_ib_update_mtt(struct mlx5_ib_mr *mr, u64 start_page_index, int npages,
 	int size;
 	__be64 *pas;
 	dma_addr_t dma;
-	struct ib_send_wr wr, *bad;
-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr.wr.fast_reg;
+	struct ib_send_wr *bad;
+	struct mlx5_umr_wr wr;
 	struct ib_sge sg;
 	int err = 0;
 	const int page_index_alignment = MLX5_UMR_MTT_ALIGNMENT / sizeof(u64);
@@ -1011,27 +1007,28 @@ int mlx5_ib_update_mtt(struct mlx5_ib_mr *mr, u64 start_page_index, int npages,
 
 		dma_sync_single_for_device(ddev, dma, size, DMA_TO_DEVICE);
 
+		mlx5_ib_init_umr_context(&umr_context);
+
 		memset(&wr, 0, sizeof(wr));
-		wr.wr_id = (u64)(unsigned long)&umr_context;
+		wr.wr.wr_cqe = &umr_context.cqe;
 
 		sg.addr = dma;
 		sg.length = ALIGN(npages * sizeof(u64),
 				MLX5_UMR_MTT_ALIGNMENT);
 		sg.lkey = dev->umrc.pd->local_dma_lkey;
 
-		wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE |
+		wr.wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE |
 				MLX5_IB_SEND_UMR_UPDATE_MTT;
-		wr.sg_list = &sg;
-		wr.num_sge = 1;
-		wr.opcode = MLX5_IB_WR_UMR;
-		umrwr->npages = sg.length / sizeof(u64);
-		umrwr->page_shift = PAGE_SHIFT;
-		umrwr->mkey = mr->mmr.key;
-		umrwr->target.offset = start_page_index;
+		wr.wr.sg_list = &sg;
+		wr.wr.num_sge = 1;
+		wr.wr.opcode = MLX5_IB_WR_UMR;
+		wr.npages = sg.length / sizeof(u64);
+		wr.page_shift = PAGE_SHIFT;
+		wr.mkey = mr->mmkey.key;
+		wr.target.offset = start_page_index;
 
-		mlx5_ib_init_umr_context(&umr_context);
 		down(&umrc->sem);
-		err = ib_post_send(umrc->qp, &wr, &bad);
+		err = ib_post_send(umrc->qp, &wr.wr, &bad);
 		if (err) {
 			mlx5_ib_err(dev, "UMR post send failed, err %d\n", err);
 		} else {
@@ -1099,7 +1096,7 @@ static struct mlx5_ib_mr *reg_create(struct ib_mr *ibmr, struct ib_pd *pd,
 	in->seg.qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
 	in->xlat_oct_act_size = cpu_to_be32(get_octo_len(virt_addr, length,
 							 1 << page_shift));
-	err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, inlen, NULL,
+	err = mlx5_core_create_mkey(dev->mdev, &mr->mmkey, in, inlen, NULL,
 				    NULL, NULL);
 	if (err) {
 		mlx5_ib_warn(dev, "create mkey failed\n");
@@ -1110,7 +1107,7 @@ static struct mlx5_ib_mr *reg_create(struct ib_mr *ibmr, struct ib_pd *pd,
 	mr->live = 1;
 	kvfree(in);
 
-	mlx5_ib_dbg(dev, "mkey = 0x%x\n", mr->mmr.key);
+	mlx5_ib_dbg(dev, "mkey = 0x%x\n", mr->mmkey.key);
 
 	return mr;
 
@@ -1129,8 +1126,8 @@ static void set_mr_fileds(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr,
 {
 	mr->npages = npages;
 	atomic_add(npages, &dev->mdev->priv.reg_pages);
-	mr->ibmr.lkey = mr->mmr.key;
-	mr->ibmr.rkey = mr->mmr.key;
+	mr->ibmr.lkey = mr->mmkey.key;
+	mr->ibmr.rkey = mr->mmkey.key;
 	mr->ibmr.length = length;
 	mr->access_flags = access_flags;
 }
@@ -1178,7 +1175,7 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 		goto error;
 	}
 
-	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmr.key);
+	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmkey.key);
 
 	mr->umem = umem;
 	set_mr_fileds(dev, mr, npages, length, access_flags);
@@ -1198,16 +1195,17 @@ static int unreg_umr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 {
 	struct umr_common *umrc = &dev->umrc;
 	struct mlx5_ib_umr_context umr_context;
-	struct ib_send_wr wr, *bad;
+	struct mlx5_umr_wr umrwr = {};
+	struct ib_send_wr *bad;
 	int err;
 
-	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = (u64)(unsigned long)&umr_context;
-	prep_umr_unreg_wqe(dev, &wr, mr->mmr.key);
-
 	mlx5_ib_init_umr_context(&umr_context);
+
+	umrwr.wr.wr_cqe = &umr_context.cqe;
+	prep_umr_unreg_wqe(dev, &umrwr.wr, mr->mmkey.key);
+
 	down(&umrc->sem);
-	err = ib_post_send(umrc->qp, &wr, &bad);
+	err = ib_post_send(umrc->qp, &umrwr.wr, &bad);
 	if (err) {
 		up(&umrc->sem);
 		mlx5_ib_dbg(dev, "err %d\n", err);
@@ -1243,7 +1241,9 @@ static int rereg_umr(struct ib_pd *pd, struct mlx5_ib_mr *mr, u64 virt_addr,
 	int size;
 	int err;
 
-	umrwr.wr.wr_id = (u64)(unsigned long)&umr_context;
+	mlx5_ib_init_umr_context(&umr_context);
+
+	umrwr.wr.wr_cqe = &umr_context.cqe;
 	umrwr.wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE;
 
 	if (flags & IB_MR_REREG_TRANS) {
@@ -1257,7 +1257,7 @@ static int rereg_umr(struct ib_pd *pd, struct mlx5_ib_mr *mr, u64 virt_addr,
 		umrwr.wr.send_flags |= MLX5_IB_SEND_UMR_UPDATE_TRANSLATION;
 	}
 
-	prep_umr_wqe_common(pd, &umrwr.wr, &sg, dma, npages, mr->mmr.key,
+	prep_umr_wqe_common(pd, &umrwr.wr, &sg, dma, npages, mr->mmkey.key,
 			    page_shift);
 
 	if (flags & IB_MR_REREG_PD) {
@@ -1269,8 +1269,6 @@ static int rereg_umr(struct ib_pd *pd, struct mlx5_ib_mr *mr, u64 virt_addr,
 		umrwr.access_flags = access_flags;
 		umrwr.wr.send_flags |= MLX5_IB_SEND_UMR_UPDATE_ACCESS;
 	}
-
-	mlx5_ib_init_umr_context(&umr_context);
 
 	/* post send request to UMR QP */
 	down(&umrc->sem);
@@ -1369,7 +1367,7 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
 
 	if (flags & IB_MR_REREG_PD) {
 		ib_mr->pd = pd;
-		mr->mmr.pd = to_mpd(pd)->pdn;
+		mr->mmkey.pd = to_mpd(pd)->pdn;
 	}
 
 	if (flags & IB_MR_REREG_ACCESS)
@@ -1378,8 +1376,8 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
 	if (flags & IB_MR_REREG_TRANS) {
 		atomic_sub(mr->npages, &dev->mdev->priv.reg_pages);
 		set_mr_fileds(dev, mr, npages, len, access_flags);
-		mr->mmr.iova = addr;
-		mr->mmr.size = len;
+		mr->mmkey.iova = addr;
+		mr->mmkey.size = len;
 	}
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
 	update_odp_mr(mr);
@@ -1459,7 +1457,7 @@ static int clean_mr(struct mlx5_ib_mr *mr)
 		err = destroy_mkey(dev, mr);
 		if (err) {
 			mlx5_ib_warn(dev, "failed to destroy mkey 0x%x (%d)\n",
-				     mr->mmr.key, err);
+				     mr->mmkey.key, err);
 			return err;
 		}
 	} else {
@@ -1523,8 +1521,8 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
 	struct mlx5_create_mkey_mbox_in *in;
 	struct mlx5_ib_mr *mr;
-	int access_mode, err;
-	int ndescs = roundup(max_num_sg, 4);
+	int ndescs = ALIGN(max_num_sg, 4);
+	int err;
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
@@ -1542,7 +1540,7 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 	in->seg.flags_pd = cpu_to_be32(to_mpd(pd)->pdn);
 
 	if (mr_type == IB_MR_TYPE_MEM_REG) {
-		access_mode = MLX5_ACCESS_MODE_MTT;
+		mr->access_mode = MLX5_ACCESS_MODE_MTT;
 		in->seg.log2_page_size = PAGE_SHIFT;
 
 		err = mlx5_alloc_priv_descs(pd->device, mr,
@@ -1551,6 +1549,15 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 			goto err_free_in;
 
 		mr->desc_size = sizeof(u64);
+		mr->max_descs = ndescs;
+	} else if (mr_type == IB_MR_TYPE_SG_GAPS) {
+		mr->access_mode = MLX5_ACCESS_MODE_KLM;
+
+		err = mlx5_alloc_priv_descs(pd->device, mr,
+					    ndescs, sizeof(struct mlx5_klm));
+		if (err)
+			goto err_free_in;
+		mr->desc_size = sizeof(struct mlx5_klm);
 		mr->max_descs = ndescs;
 	} else if (mr_type == IB_MR_TYPE_SIGNATURE) {
 		u32 psv_index[2];
@@ -1570,7 +1577,7 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 		if (err)
 			goto err_free_sig;
 
-		access_mode = MLX5_ACCESS_MODE_KLM;
+		mr->access_mode = MLX5_ACCESS_MODE_KLM;
 		mr->sig->psv_memory.psv_idx = psv_index[0];
 		mr->sig->psv_wire.psv_idx = psv_index[1];
 
@@ -1584,14 +1591,14 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 		goto err_free_in;
 	}
 
-	in->seg.flags = MLX5_PERM_UMR_EN | access_mode;
-	err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, sizeof(*in),
+	in->seg.flags = MLX5_PERM_UMR_EN | mr->access_mode;
+	err = mlx5_core_create_mkey(dev->mdev, &mr->mmkey, in, sizeof(*in),
 				    NULL, NULL, NULL);
 	if (err)
 		goto err_destroy_psv;
 
-	mr->ibmr.lkey = mr->mmr.key;
-	mr->ibmr.rkey = mr->mmr.key;
+	mr->ibmr.lkey = mr->mmkey.key;
+	mr->ibmr.rkey = mr->mmkey.key;
 	mr->umem = NULL;
 	kfree(in);
 
@@ -1618,46 +1625,86 @@ err_free:
 	return ERR_PTR(err);
 }
 
-struct ib_fast_reg_page_list *mlx5_ib_alloc_fast_reg_page_list(struct ib_device *ibdev,
-							       int page_list_len)
+struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
+			       struct ib_udata *udata)
 {
-	struct mlx5_ib_fast_reg_page_list *mfrpl;
-	int size = page_list_len * sizeof(u64);
+	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+	struct mlx5_create_mkey_mbox_in *in = NULL;
+	struct mlx5_ib_mw *mw = NULL;
+	int ndescs;
+	int err;
+	struct mlx5_ib_alloc_mw req = {};
+	struct {
+		__u32	comp_mask;
+		__u32	response_length;
+	} resp = {};
 
-	mfrpl = kmalloc(sizeof(*mfrpl), GFP_KERNEL);
-	if (!mfrpl)
-		return ERR_PTR(-ENOMEM);
+	err = ib_copy_from_udata(&req, udata, min(udata->inlen, sizeof(req)));
+	if (err)
+		return ERR_PTR(err);
 
-	mfrpl->ibfrpl.page_list = kmalloc(size, GFP_KERNEL);
-	if (!mfrpl->ibfrpl.page_list)
-		goto err_free;
+	if (req.comp_mask || req.reserved1 || req.reserved2)
+		return ERR_PTR(-EOPNOTSUPP);
 
-	mfrpl->mapped_page_list = dma_alloc_coherent(ibdev->dma_device,
-						     size, &mfrpl->map,
-						     GFP_KERNEL);
-	if (!mfrpl->mapped_page_list)
-		goto err_free;
+	if (udata->inlen > sizeof(req) &&
+	    !ib_is_udata_cleared(udata, sizeof(req),
+				 udata->inlen - sizeof(req)))
+		return ERR_PTR(-EOPNOTSUPP);
 
-	WARN_ON(mfrpl->map & 0x3f);
+	ndescs = req.num_klms ? roundup(req.num_klms, 4) : roundup(1, 4);
 
-	return &mfrpl->ibfrpl;
+	mw = kzalloc(sizeof(*mw), GFP_KERNEL);
+	in = kzalloc(sizeof(*in), GFP_KERNEL);
+	if (!mw || !in) {
+		err = -ENOMEM;
+		goto free;
+	}
 
-err_free:
-	kfree(mfrpl->ibfrpl.page_list);
-	kfree(mfrpl);
-	return ERR_PTR(-ENOMEM);
+	in->seg.status = MLX5_MKEY_STATUS_FREE;
+	in->seg.xlt_oct_size = cpu_to_be32(ndescs);
+	in->seg.flags_pd = cpu_to_be32(to_mpd(pd)->pdn);
+	in->seg.flags = MLX5_PERM_UMR_EN | MLX5_ACCESS_MODE_KLM |
+		MLX5_PERM_LOCAL_READ;
+	if (type == IB_MW_TYPE_2)
+		in->seg.flags_pd |= cpu_to_be32(MLX5_MKEY_REMOTE_INVAL);
+	in->seg.qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
+
+	err = mlx5_core_create_mkey(dev->mdev, &mw->mmkey, in, sizeof(*in),
+				    NULL, NULL, NULL);
+	if (err)
+		goto free;
+
+	mw->ibmw.rkey = mw->mmkey.key;
+
+	resp.response_length = min(offsetof(typeof(resp), response_length) +
+				   sizeof(resp.response_length), udata->outlen);
+	if (resp.response_length) {
+		err = ib_copy_to_udata(udata, &resp, resp.response_length);
+		if (err) {
+			mlx5_core_destroy_mkey(dev->mdev, &mw->mmkey);
+			goto free;
+		}
+	}
+
+	kfree(in);
+	return &mw->ibmw;
+
+free:
+	kfree(mw);
+	kfree(in);
+	return ERR_PTR(err);
 }
 
-void mlx5_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list)
+int mlx5_ib_dealloc_mw(struct ib_mw *mw)
 {
-	struct mlx5_ib_fast_reg_page_list *mfrpl = to_mfrpl(page_list);
-	struct mlx5_ib_dev *dev = to_mdev(page_list->device);
-	int size = page_list->max_page_list_len * sizeof(u64);
+	struct mlx5_ib_mw *mmw = to_mmw(mw);
+	int err;
 
-	dma_free_coherent(&dev->mdev->pdev->dev, size, mfrpl->mapped_page_list,
-			  mfrpl->map);
-	kfree(mfrpl->ibfrpl.page_list);
-	kfree(mfrpl);
+	err =  mlx5_core_destroy_mkey((to_mdev(mw->device))->mdev,
+				      &mmw->mmkey);
+	if (!err)
+		kfree(mmw);
+	return err;
 }
 
 int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
@@ -1701,6 +1748,39 @@ done:
 	return ret;
 }
 
+static int
+mlx5_ib_sg_to_klms(struct mlx5_ib_mr *mr,
+		   struct scatterlist *sgl,
+		   unsigned short sg_nents,
+		   unsigned int *sg_offset_p)
+{
+	struct scatterlist *sg = sgl;
+	struct mlx5_klm *klms = mr->descs;
+	unsigned int sg_offset = sg_offset_p ? *sg_offset_p : 0;
+	u32 lkey = mr->ibmr.pd->local_dma_lkey;
+	int i;
+
+	mr->ibmr.iova = sg_dma_address(sg) + sg_offset;
+	mr->ibmr.length = 0;
+	mr->ndescs = sg_nents;
+
+	for_each_sg(sgl, sg, sg_nents, i) {
+		if (unlikely(i > mr->max_descs))
+			break;
+		klms[i].va = cpu_to_be64(sg_dma_address(sg) + sg_offset);
+		klms[i].bcount = cpu_to_be32(sg_dma_len(sg) - sg_offset);
+		klms[i].key = cpu_to_be32(lkey);
+		mr->ibmr.length += sg_dma_len(sg);
+
+		sg_offset = 0;
+	}
+
+	if (sg_offset_p)
+		*sg_offset_p = sg_offset;
+
+	return i;
+}
+
 static int mlx5_set_page(struct ib_mr *ibmr, u64 addr)
 {
 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
@@ -1715,9 +1795,8 @@ static int mlx5_set_page(struct ib_mr *ibmr, u64 addr)
 	return 0;
 }
 
-int mlx5_ib_map_mr_sg(struct ib_mr *ibmr,
-		      struct scatterlist *sg,
-		      int sg_nents)
+int mlx5_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
+		      unsigned int *sg_offset)
 {
 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
 	int n;
@@ -1728,7 +1807,11 @@ int mlx5_ib_map_mr_sg(struct ib_mr *ibmr,
 				   mr->desc_size * mr->max_descs,
 				   DMA_TO_DEVICE);
 
-	n = ib_sg_to_pages(ibmr, sg, sg_nents, mlx5_set_page);
+	if (mr->access_mode == MLX5_ACCESS_MODE_KLM)
+		n = mlx5_ib_sg_to_klms(mr, sg, sg_nents, sg_offset);
+	else
+		n = ib_sg_to_pages(ibmr, sg, sg_nents, sg_offset,
+				mlx5_set_page);
 
 	ib_dma_sync_single_for_device(ibmr->device, mr->desc_map,
 				      mr->desc_size * mr->max_descs,

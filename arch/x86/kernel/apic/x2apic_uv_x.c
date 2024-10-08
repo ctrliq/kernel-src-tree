@@ -64,6 +64,7 @@ unsigned int uv_apicid_hibits;
 EXPORT_SYMBOL_GPL(uv_apicid_hibits);
 
 static struct apic apic_x2apic_uv_x;
+static struct uv_hub_info_s uv_hub_info_node0;
 
 /* Set this to use hardware error handler instead of kernel panic */
 static int disable_uv_undefined_panic = 1;
@@ -222,6 +223,14 @@ static int __init uv_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 	if (strncmp(oem_id, "SGI", 3) != 0)
 		return 0;
 
+	if (numa_off) {
+		pr_err("UV: NUMA is off, disabling UV support\n");
+		return 0;
+	}
+
+	/* Setup early hub type field in uv_hub_info for Node 0 */
+	uv_cpu_info->p_uv_hub_info = &uv_hub_info_node0;
+
 	/*
 	 * Determine UV arch type.
 	 *   SGI: UV100/1000
@@ -285,26 +294,127 @@ int is_uv_system(void)
 }
 EXPORT_SYMBOL_GPL(is_uv_system);
 
-DEFINE_PER_CPU(struct uv_hub_info_s, __uv_hub_info);
-EXPORT_PER_CPU_SYMBOL_GPL(__uv_hub_info);
+void **__uv_hub_info_list;
+EXPORT_SYMBOL_GPL(__uv_hub_info_list);
 
 DEFINE_PER_CPU(struct uv_cpu_info_s, __uv_cpu_info);
 EXPORT_PER_CPU_SYMBOL_GPL(__uv_cpu_info);
-
-struct uv_blade_info *uv_blade_info;
-EXPORT_SYMBOL_GPL(uv_blade_info);
-
-short *uv_node_to_blade;
-EXPORT_SYMBOL_GPL(uv_node_to_blade);
-
-short *uv_cpu_to_blade;
-EXPORT_SYMBOL_GPL(uv_cpu_to_blade);
 
 short uv_possible_blades;
 EXPORT_SYMBOL_GPL(uv_possible_blades);
 
 unsigned long sn_rtc_cycles_per_second;
 EXPORT_SYMBOL(sn_rtc_cycles_per_second);
+
+/* the following values are used for the per node hub info struct */
+static __initdata unsigned short *_node_to_pnode;
+static __initdata unsigned short _min_socket, _max_socket;
+static __initdata unsigned short _min_pnode, _max_pnode, _gr_table_len;
+static __initdata struct uv_gam_range_entry *uv_gre_table;
+static __initdata struct uv_gam_parameters *uv_gp_table;
+static __initdata unsigned short *_socket_to_node;
+static __initdata unsigned short *_socket_to_pnode;
+static __initdata unsigned short *_pnode_to_socket;
+static __initdata struct uv_gam_range_s *_gr_table;
+#define	SOCK_EMPTY	((unsigned short)~0)
+
+extern int uv_hub_info_version(void)
+{
+	return UV_HUB_INFO_VERSION;
+}
+EXPORT_SYMBOL(uv_hub_info_version);
+
+/* Build GAM range lookup table */
+static __init void build_uv_gr_table(void)
+{
+	struct uv_gam_range_entry *gre = uv_gre_table;
+	struct uv_gam_range_s *grt;
+	unsigned long last_limit = 0, ram_limit = 0;
+	int bytes, i, sid, lsid = -1, indx = 0, lindx = -1;
+
+	if (!gre)
+		return;
+
+	bytes = _gr_table_len * sizeof(struct uv_gam_range_s);
+	grt = kzalloc(bytes, GFP_KERNEL);
+	BUG_ON(!grt);
+	_gr_table = grt;
+
+	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
+		if (gre->type == UV_GAM_RANGE_TYPE_HOLE) {
+			if (!ram_limit) {   /* mark hole between ram/non-ram */
+				ram_limit = last_limit;
+				last_limit = gre->limit;
+				lsid++;
+				continue;
+			}
+			last_limit = gre->limit;
+			pr_info("UV: extra hole in GAM RE table @%d\n",
+				(int)(gre - uv_gre_table));
+			continue;
+		}
+		if (_max_socket < gre->sockid) {
+			pr_err("UV: GAM table sockid(%d) too large(>%d) @%d\n",
+				gre->sockid, _max_socket,
+				(int)(gre - uv_gre_table));
+			continue;
+		}
+		sid = gre->sockid - _min_socket;
+		if (lsid < sid) {		/* new range */
+			grt = &_gr_table[indx];
+			grt->base = lindx;
+			grt->nasid = gre->nasid;
+			grt->limit = last_limit = gre->limit;
+			lsid = sid;
+			lindx = indx++;
+			continue;
+		}
+		if (lsid == sid && !ram_limit) {	/* update range */
+			if (grt->limit == last_limit) {	/* .. if contiguous */
+				grt->limit = last_limit = gre->limit;
+				continue;
+			}
+		}
+		if (!ram_limit) {		/* non-contiguous ram range */
+			grt++;
+			grt->base = lindx;
+			grt->nasid = gre->nasid;
+			grt->limit = last_limit = gre->limit;
+			continue;
+		}
+		grt++;				/* non-contiguous/non-ram */
+		grt->base = grt - _gr_table;	/* base is this entry */
+		grt->nasid = gre->nasid;
+		grt->limit = last_limit = gre->limit;
+		lsid++;
+	}
+
+	/* shorten table if possible */
+	grt++;
+	i = grt - _gr_table;
+	if (i < _gr_table_len) {
+		void *ret;
+
+		bytes = i * sizeof(struct uv_gam_range_s);
+		ret = krealloc(_gr_table, bytes, GFP_KERNEL);
+		if (ret) {
+			_gr_table = ret;
+			_gr_table_len = i;
+		}
+	}
+
+	/* display resultant gam range table */
+	for (i = 0, grt = _gr_table; i < _gr_table_len; i++, grt++) {
+		int gb = grt->base;
+		unsigned long start = gb < 0 ?  0 :
+			(unsigned long)_gr_table[gb].limit << UV_GAM_RANGE_SHFT;
+		unsigned long end =
+			(unsigned long)grt->limit << UV_GAM_RANGE_SHFT;
+
+		pr_info("UV: GAM Range %2d %04x 0x%013lx-0x%013lx (%d)\n",
+			i, grt->nasid, start, end, gb);
+	}
+}
 
 static int uv_wakeup_secondary(int phys_apicid, unsigned long start_rip)
 {
@@ -435,7 +545,6 @@ static unsigned long set_apic_id(unsigned int id)
 
 static unsigned int uv_read_apic_id(void)
 {
-
 	return x2apic_get_apic_id(apic_read(APIC_ID));
 }
 
@@ -516,19 +625,6 @@ static struct apic __refdata apic_x2apic_uv_x = {
 static void set_x2apic_extra_bits(int pnode)
 {
 	__this_cpu_write(x2apic_extra_bits, pnode << uvh_apicid.s.pnode_shift);
-}
-
-/*
- * Called on boot cpu.
- */
-static __init int boot_pnode_to_blade(int pnode)
-{
-	int blade;
-
-	for (blade = 0; blade < uv_num_possible_blades(); blade++)
-		if (pnode == uv_blade_info[blade].pnode)
-			return blade;
-	BUG();
 }
 
 #define	UVH_RH_GAM_ALIAS210_REDIRECT_CONFIG_LENGTH	3
@@ -946,10 +1042,10 @@ int uv_set_vga_state(struct pci_dev *pdev, bool decode,
 void uv_cpu_init(void)
 {
 	/* CPU 0 initilization will be done via uv_system_init. */
-	if (!uv_blade_info)
+	if (smp_processor_id() == 0)
 		return;
 
-	uv_blade_info[uv_numa_blade_id()].nr_online_cpus++;
+	uv_hub_info->nr_online_cpus++;
 
 	if (get_uv_system_type() == UV_NON_UNIQUE_APIC)
 		set_x2apic_extra_bits(uv_hub_info->pnode);
@@ -999,6 +1095,13 @@ void __init uv_init_hub_info(struct uv_hub_info_s *hub_info)
 
 	hub_info->hub_revision = uv_hub_info->hub_revision;
 	hub_info->pnode_mask = uv_cpuid.pnode_mask;
+	hub_info->min_pnode = _min_pnode;
+	hub_info->min_socket = _min_socket;
+	hub_info->pnode_to_socket = _pnode_to_socket;
+	hub_info->socket_to_node = _socket_to_node;
+	hub_info->socket_to_pnode = _socket_to_pnode;
+	hub_info->gr_table_len = _gr_table_len;
+	hub_info->gr_table = _gr_table;
 	hub_info->gpa_mask = mn.m_val ?
 		(1UL << (mn.m_val + mn.n_val)) - 1 :
 		(1UL << uv_cpuid.gpa_shift) - 1;
@@ -1010,9 +1113,19 @@ void __init uv_init_hub_info(struct uv_hub_info_s *hub_info)
 	hub_info->gnode_upper =
 		((unsigned long)hub_info->gnode_extra << mn.m_val);
 
-	hub_info->global_mmr_base =
-		uv_read_local_mmr(UVH_RH_GAM_MMR_OVERLAY_CONFIG_MMR) &
-				~UV_MMR_ENABLE;
+	if (uv_gp_table) {
+		hub_info->global_mmr_base = uv_gp_table->mmr_base;
+		hub_info->global_mmr_shift = uv_gp_table->mmr_shift;
+		hub_info->global_gru_base = uv_gp_table->gru_base;
+		hub_info->global_gru_shift = uv_gp_table->gru_shift;
+		hub_info->gpa_shift = uv_gp_table->gpa_shift;
+		hub_info->gpa_mask = (1UL << hub_info->gpa_shift) - 1;
+	} else {
+		hub_info->global_mmr_base =
+			uv_read_local_mmr(UVH_RH_GAM_MMR_OVERLAY_CONFIG_MMR) &
+					~UV_MMR_ENABLE;
+		hub_info->global_mmr_shift = _UV_GLOBAL_MMR64_PNODE_SHIFT;
+	}
 
 	get_lowmem_redirect(
 		&hub_info->lowmem_remap_base, &hub_info->lowmem_remap_top);
@@ -1024,22 +1137,261 @@ void __init uv_init_hub_info(struct uv_hub_info_s *hub_info)
 		hub_info->n_val, hub_info->m_val,
 		hub_info->m_shift, hub_info->n_lshift);
 
-	pr_info("UV: pnode_mask:0x%x gpa_mask:0x%lx apic_pns:%d\n",
-		hub_info->pnode_mask, hub_info->gpa_mask,
-		hub_info->apic_pnode_shift);
+	pr_info("UV: gpa_mask/shift:0x%lx/%d pnode_mask:0x%x apic_pns:%d\n",
+		hub_info->gpa_mask, hub_info->gpa_shift,
+		hub_info->pnode_mask, hub_info->apic_pnode_shift);
+
+	pr_info("UV: mmr_base/shift:0x%lx/%ld gru_base/shift:0x%lx/%ld\n",
+		hub_info->global_mmr_base, hub_info->global_mmr_shift,
+		hub_info->global_gru_base, hub_info->global_gru_shift);
 
 	pr_info("UV: gnode_upper:0x%lx gnode_extra:0x%x\n",
 		hub_info->gnode_upper, hub_info->gnode_extra);
+}
 
-	pr_info("UV: global MMR base 0x%lx\n", hub_info->global_mmr_base);
+static void __init decode_gam_params(unsigned long ptr)
+{
+	uv_gp_table = (struct uv_gam_parameters *)ptr;
 
+	pr_info("UV: GAM Params...\n");
+	pr_info("UV: mmr_base/shift:0x%llx/%d gru_base/shift:0x%llx/%d gpa_shift:%d\n",
+		uv_gp_table->mmr_base, uv_gp_table->mmr_shift,
+		uv_gp_table->gru_base, uv_gp_table->gru_shift,
+		uv_gp_table->gpa_shift);
+}
+
+static void __init decode_gam_rng_tbl(unsigned long ptr)
+{
+	struct uv_gam_range_entry *gre = (struct uv_gam_range_entry *)ptr;
+	unsigned long lgre = 0;
+	int index = 0;
+	int sock_min = 999999, pnode_min = 99999;
+	int sock_max = -1, pnode_max = -1;
+
+	uv_gre_table = gre;
+	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
+		if (!index) {
+			pr_info("UV: GAM Range Table...\n");
+			pr_info("UV:  # %20s %14s %5s %4s %5s %3s %2s\n",
+				"Range", "", "Size", "Type", "NASID",
+				"SID", "PN");
+		}
+		pr_info(
+		"UV: %2d: 0x%014lx-0x%014lx %5luG %3d   %04x  %02x %02x\n",
+			index++,
+			(unsigned long)lgre << UV_GAM_RANGE_SHFT,
+			(unsigned long)gre->limit << UV_GAM_RANGE_SHFT,
+			((unsigned long)(gre->limit - lgre)) >>
+				(30 - UV_GAM_RANGE_SHFT), /* 64M -> 1G */
+			gre->type, gre->nasid, gre->sockid, gre->pnode);
+
+		lgre = gre->limit;
+		if (sock_min > gre->sockid)
+			sock_min = gre->sockid;
+		if (sock_max < gre->sockid)
+			sock_max = gre->sockid;
+		if (pnode_min > gre->pnode)
+			pnode_min = gre->pnode;
+		if (pnode_max < gre->pnode)
+			pnode_max = gre->pnode;
+	}
+	_min_socket = sock_min;
+	_max_socket = sock_max;
+	_min_pnode = pnode_min;
+	_max_pnode = pnode_max;
+	_gr_table_len = index;
+	pr_info(
+	"UV: GRT: %d entries, sockets(min:%x,max:%x) pnodes(min:%x,max:%x)\n",
+		index, _min_socket, _max_socket, _min_pnode, _max_pnode);
+}
+
+static void __init decode_uv_systab(void)
+{
+	struct uv_systab *st;
+	int i;
+
+	st = uv_systab;
+	if ((!st || st->revision < UV_SYSTAB_VERSION_UV4) && !is_uv4_hub())
+		return;
+	if (st->revision != UV_SYSTAB_VERSION_UV4_LATEST) {
+		pr_crit(
+		"UV: BIOS UVsystab version(%x) mismatch, expecting(%x)\n",
+			st->revision, UV_SYSTAB_VERSION_UV4_LATEST);
+		BUG();
+	}
+
+	for (i = 0; st->entry[i].type != UV_SYSTAB_TYPE_UNUSED; i++) {
+		unsigned long ptr = st->entry[i].offset;
+
+		if (!ptr)
+			continue;
+
+		ptr = ptr + (unsigned long)st;
+
+		switch (st->entry[i].type) {
+		case UV_SYSTAB_TYPE_GAM_PARAMS:
+			decode_gam_params(ptr);
+			break;
+
+		case UV_SYSTAB_TYPE_GAM_RNG_TBL:
+			decode_gam_rng_tbl(ptr);
+			break;
+		}
+	}
+}
+
+/*
+ * Setup physical blade translations from UVH_NODE_PRESENT_TABLE
+ * .. NB: UVH_NODE_PRESENT_TABLE is going away,
+ * .. being replaced by GAM Range Table
+ */
+static __init void boot_init_possible_blades(struct uv_hub_info_s *hub_info)
+{
+	int i, uv_pb = 0;
+
+	pr_info("UV: NODE_PRESENT_DEPTH = %d\n", UVH_NODE_PRESENT_TABLE_DEPTH);
+	for (i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++) {
+		unsigned long np;
+
+		np = uv_read_local_mmr(UVH_NODE_PRESENT_TABLE + i * 8);
+		if (np)
+			pr_info("UV: NODE_PRESENT(%d) = 0x%016lx\n", i, np);
+
+		uv_pb += hweight64(np);
+	}
+	if (uv_possible_blades != uv_pb)
+		uv_possible_blades = uv_pb;
+}
+
+static void __init build_socket_tables(void)
+{
+	struct uv_gam_range_entry *gre = uv_gre_table;
+	int num, nump;
+	int cpu, i, lnid;
+	int minsock = _min_socket;
+	int maxsock = _max_socket;
+	int minpnode = _min_pnode;
+	int maxpnode = _max_pnode;
+	size_t bytes;
+
+	if (!gre) {
+		if (is_uv1_hub() || is_uv2_hub() || is_uv3_hub()) {
+			pr_info("UV: No UVsystab socket table, ignoring\n");
+			return;		/* not required */
+		}
+		pr_crit(
+		"UV: Error: UVsystab address translations not available!\n");
+		BUG();
+	}
+
+	/* build socket id -> node id, pnode */
+	num = maxsock - minsock + 1;
+	bytes = num * sizeof(_socket_to_node[0]);
+	_socket_to_node = kmalloc(bytes, GFP_KERNEL);
+	_socket_to_pnode = kmalloc(bytes, GFP_KERNEL);
+
+	nump = maxpnode - minpnode + 1;
+	bytes = nump * sizeof(_pnode_to_socket[0]);
+	_pnode_to_socket = kmalloc(bytes, GFP_KERNEL);
+	BUG_ON(!_socket_to_node || !_socket_to_pnode || !_pnode_to_socket);
+
+	for (i = 0; i < num; i++)
+		_socket_to_node[i] = _socket_to_pnode[i] = SOCK_EMPTY;
+
+	for (i = 0; i < nump; i++)
+		_pnode_to_socket[i] = SOCK_EMPTY;
+
+	/* fill in pnode/node/addr conversion list values */
+	pr_info("UV: GAM Building socket/pnode conversion tables\n");
+	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
+		if (gre->type == UV_GAM_RANGE_TYPE_HOLE)
+			continue;
+		i = gre->sockid - minsock;
+		if (_socket_to_pnode[i] != SOCK_EMPTY)
+			continue;	/* duplicate */
+		_socket_to_pnode[i] = gre->pnode;
+
+		i = gre->pnode - minpnode;
+		_pnode_to_socket[i] = gre->sockid;
+
+		pr_info(
+		"UV: sid:%02x type:%d nasid:%04x pn:%02x pn2s:%2x\n",
+			gre->sockid, gre->type, gre->nasid,
+			_socket_to_pnode[gre->sockid - minsock],
+			_pnode_to_socket[gre->pnode - minpnode]);
+	}
+
+	/* Set socket -> node values */
+	lnid = -1;
+	for_each_present_cpu(cpu) {
+		int nid = cpu_to_node(cpu);
+		int apicid, sockid;
+
+		if (lnid == nid)
+			continue;
+		lnid = nid;
+		apicid = per_cpu(x86_cpu_to_apicid, cpu);
+		sockid = apicid >> uv_cpuid.socketid_shift;
+		_socket_to_node[sockid - minsock] = nid;
+		pr_info("UV: sid:%02x: apicid:%04x node:%2d\n",
+			sockid, apicid, nid);
+	}
+
+	/* Setup physical blade to pnode translation from GAM Range Table */
+	bytes = num_possible_nodes() * sizeof(_node_to_pnode[0]);
+	_node_to_pnode = kmalloc(bytes, GFP_KERNEL);
+	BUG_ON(!_node_to_pnode);
+
+	for (lnid = 0; lnid < num_possible_nodes(); lnid++) {
+		unsigned short sockid;
+
+		for (sockid = minsock; sockid <= maxsock; sockid++) {
+			if (lnid == _socket_to_node[sockid - minsock]) {
+				_node_to_pnode[lnid] =
+					_socket_to_pnode[sockid - minsock];
+				break;
+			}
+		}
+		if (sockid > maxsock) {
+			pr_err("UV: socket for node %d not found!\n", lnid);
+			BUG();
+		}
+	}
+
+	/*
+	 * If socket id == pnode or socket id == node for all nodes,
+	 *   system runs faster by removing corresponding conversion table.
+	 */
+	pr_info("UV: Checking socket->node/pnode for identity maps\n");
+	if (minsock == 0) {
+		for (i = 0; i < num; i++)
+			if (_socket_to_node[i] == SOCK_EMPTY ||
+				i != _socket_to_node[i])
+				break;
+		if (i >= num) {
+			kfree(_socket_to_node);
+			_socket_to_node = NULL;
+			pr_info("UV: 1:1 socket_to_node table removed\n");
+		}
+	}
+	if (minsock == minpnode) {
+		for (i = 0; i < num; i++)
+			if (_socket_to_pnode[i] != SOCK_EMPTY &&
+				_socket_to_pnode[i] != i + minpnode)
+				break;
+		if (i >= num) {
+			kfree(_socket_to_pnode);
+			_socket_to_pnode = NULL;
+			pr_info("UV: 1:1 socket_to_pnode table removed\n");
+		}
+	}
 }
 
 void __init uv_system_init(void)
 {
 	struct uv_hub_info_s hub_info = {0};
-	int bytes, nid, cpu, pnode, blade, i, j;
-	int min_pnode = 999999, max_pnode = -1;
+	int bytes, cpu, nodeid;
+	unsigned short min_pnode = 9999, max_pnode = 0;
 	char *hub = is_uv4_hub() ? "UV400" :
 		    is_uv3_hub() ? "UV300" :
 		    is_uv2_hub() ? "UV2000/3000" :
@@ -1052,11 +1404,14 @@ void __init uv_system_init(void)
 	pr_info("UV: Found %s hub\n", hub);
 	map_low_mmrs();
 
+	uv_bios_init();			/* get uv_systab for decoding */
+	decode_uv_systab();
+	build_socket_tables();
+	build_uv_gr_table();
 	uv_init_hub_info(&hub_info);
-
-	for(i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++)
-		uv_possible_blades +=
-		  hweight64(uv_read_local_mmr( UVH_NODE_PRESENT_TABLE + i * 8));
+	uv_possible_blades = num_possible_nodes();
+	if (!_node_to_pnode)
+		boot_init_possible_blades(&hub_info);
 
 	/* uv_num_possible_blades() is really the hub count */
 	pr_info("UV: Found %d hubs, %d nodes, %d cpus\n",
@@ -1064,84 +1419,89 @@ void __init uv_system_init(void)
 			num_possible_nodes(),
 			num_possible_cpus());
 
-	bytes = sizeof(struct uv_blade_info) * uv_num_possible_blades();
-	uv_blade_info = kzalloc(bytes, GFP_KERNEL);
-	BUG_ON(!uv_blade_info);
-
-	for (blade = 0; blade < uv_num_possible_blades(); blade++)
-		uv_blade_info[blade].memory_nid = -1;
-
-
-	bytes = sizeof(uv_node_to_blade[0]) * num_possible_nodes();
-	uv_node_to_blade = kmalloc(bytes, GFP_KERNEL);
-	BUG_ON(!uv_node_to_blade);
-	memset(uv_node_to_blade, 255, bytes);
-
-	bytes = sizeof(uv_cpu_to_blade[0]) * num_possible_cpus();
-	uv_cpu_to_blade = kmalloc(bytes, GFP_KERNEL);
-	BUG_ON(!uv_cpu_to_blade);
-	memset(uv_cpu_to_blade, 255, bytes);
-
-	blade = 0;
-	for (i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++) {
-		unsigned long present =
-			uv_read_local_mmr(UVH_NODE_PRESENT_TABLE + i * 8);
-		for (j = 0; j < 64; j++) {
-			if (!test_bit(j, &present))
-				continue;
-			pnode = (i * 64 + j) & hub_info.pnode_mask;
-			uv_blade_info[blade].pnode = pnode;
-			uv_blade_info[blade].nr_possible_cpus = 0;
-			uv_blade_info[blade].nr_online_cpus = 0;
-			min_pnode = min(pnode, min_pnode);
-			max_pnode = max(pnode, max_pnode);
-			blade++;
-		}
-	}
-
-	uv_bios_init();
 	uv_bios_get_sn_info(0, &uv_type, &sn_partition_id, &sn_coherency_id,
 			    &sn_region_size, &system_serial_number);
 	hub_info.coherency_domain_number = sn_coherency_id;
 	uv_rtc_init();
 
-	for_each_present_cpu(cpu) {
+	bytes = sizeof(void *) * uv_num_possible_blades();
+	__uv_hub_info_list = kzalloc(bytes, GFP_KERNEL);
+	BUG_ON(!__uv_hub_info_list);
+
+	bytes = sizeof(struct uv_hub_info_s);
+	for_each_node(nodeid) {
+		struct uv_hub_info_s *new_hub;
+
+		if (__uv_hub_info_list[nodeid]) {
+			pr_err("UV: Node %d UV HUB already initialized!?\n",
+				nodeid);
+			BUG();
+		}
+
+		/* Allocate new per hub info list */
+		new_hub = (nodeid == 0) ?
+			&uv_hub_info_node0 :
+			kzalloc_node(bytes, GFP_KERNEL, nodeid);
+		BUG_ON(!new_hub);
+		__uv_hub_info_list[nodeid] = new_hub;
+		new_hub = uv_hub_info_list(nodeid);
+		BUG_ON(!new_hub);
+		*new_hub = hub_info;
+
+		/* Use information from GAM table if available */
+		if (_node_to_pnode)
+			new_hub->pnode = _node_to_pnode[nodeid];
+		else	/* Fill in during cpu loop */
+			new_hub->pnode = 0xffff;
+		new_hub->numa_blade_id = uv_node_to_blade_id(nodeid);
+		new_hub->memory_nid = -1;
+		new_hub->nr_possible_cpus = 0;
+		new_hub->nr_online_cpus = 0;
+	}
+
+	/* Initialize per cpu info */
+	for_each_possible_cpu(cpu) {
 		int apicid = per_cpu(x86_cpu_to_apicid, cpu);
-		int nodeid = cpu_to_node(cpu);
-		int lcpu;
+		int numa_node_id;
+		unsigned short pnode;
 
-		*uv_cpu_hub_info(cpu) = hub_info;	/* common hub values */
+		nodeid = cpu_to_node(cpu);
+		numa_node_id = numa_cpu_node(cpu);
 		pnode = uv_apicid_to_pnode(apicid);
-		blade = boot_pnode_to_blade(pnode);
-		lcpu = uv_blade_info[blade].nr_possible_cpus;
-		uv_blade_info[blade].nr_possible_cpus++;
 
-		/* Any node on the blade, else will contain -1. */
-		uv_blade_info[blade].memory_nid = nodeid;
-
-		uv_cpu_hub_info(cpu)->numa_blade_id = blade;
-		uv_cpu_hub_info(cpu)->pnode = pnode;
-		uv_node_to_blade[nodeid] = blade;
-		uv_cpu_to_blade[cpu] = blade;
-
-		/* Initialize per cpu info list */
-		uv_cpu_info_per(cpu)->p_uv_hub_info = uv_cpu_hub_info(cpu);
-		uv_cpu_info_per(cpu)->blade_cpu_id = lcpu;
-		uv_cpu_info_per(cpu)->scir.offset = uv_scir_offset(apicid);
+		uv_cpu_info_per(cpu)->p_uv_hub_info = uv_hub_info_list(nodeid);
+		uv_cpu_info_per(cpu)->blade_cpu_id =
+			uv_cpu_hub_info(cpu)->nr_possible_cpus++;
+		if (uv_cpu_hub_info(cpu)->memory_nid == -1)
+			uv_cpu_hub_info(cpu)->memory_nid = cpu_to_node(cpu);
+		if (nodeid != numa_node_id &&	/* init memoryless node */
+		    uv_hub_info_list(numa_node_id)->pnode == 0xffff)
+			uv_hub_info_list(numa_node_id)->pnode = pnode;
+		else if (uv_cpu_hub_info(cpu)->pnode == 0xffff)
+			uv_cpu_hub_info(cpu)->pnode = pnode;
+		uv_cpu_scir_info(cpu)->offset = uv_scir_offset(apicid);
 	}
 
-	/* Add blade/pnode info for nodes without cpus */
-	for_each_online_node(nid) {
-		unsigned long paddr;
+	for_each_node(nodeid) {
+		unsigned short pnode = uv_hub_info_list(nodeid)->pnode;
 
-		if (uv_node_to_blade[nid] >= 0)
-			continue;
-		paddr = node_start_pfn(nid) << PAGE_SHIFT;
-		pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
-		blade = boot_pnode_to_blade(pnode);
-		uv_node_to_blade[nid] = blade;
+		/* Add pnode info for pre-GAM list nodes without cpus */
+		if (pnode == 0xffff) {
+			unsigned long paddr;
+
+			paddr = node_start_pfn(nodeid) << PAGE_SHIFT;
+			pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
+			uv_hub_info_list(nodeid)->pnode = pnode;
+		}
+		min_pnode = min(pnode, min_pnode);
+		max_pnode = max(pnode, max_pnode);
+		pr_info("UV: UVHUB node:%2d pn:%02x nrcpus:%d\n",
+			nodeid,
+			uv_hub_info_list(nodeid)->pnode,
+			uv_hub_info_list(nodeid)->nr_possible_cpus);
 	}
 
+	pr_info("UV: min_pnode:%02x max_pnode:%02x\n", min_pnode, max_pnode);
 	map_gru_high(max_pnode);
 	map_mmr_high(max_pnode);
 	map_mmioh_high(min_pnode, max_pnode);

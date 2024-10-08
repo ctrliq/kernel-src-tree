@@ -66,7 +66,7 @@ static void sctp_datamsg_init(struct sctp_datamsg *msg)
 }
 
 /* Allocate and initialize datamsg. */
-SCTP_STATIC struct sctp_datamsg *sctp_datamsg_new(gfp_t gfp)
+static struct sctp_datamsg *sctp_datamsg_new(gfp_t gfp)
 {
 	struct sctp_datamsg *msg;
 	msg = kmalloc(sizeof(struct sctp_datamsg), gfp);
@@ -75,19 +75,6 @@ SCTP_STATIC struct sctp_datamsg *sctp_datamsg_new(gfp_t gfp)
 		SCTP_DBG_OBJCNT_INC(datamsg);
 	}
 	return msg;
-}
-
-void sctp_datamsg_free(struct sctp_datamsg *msg)
-{
-	struct sctp_chunk *chunk;
-
-	/* This doesn't have to be a _safe vairant because
-	 * sctp_chunk_free() only drops the refs.
-	 */
-	list_for_each_entry(chunk, &msg->chunks, frag_list)
-		sctp_chunk_free(chunk);
-
-	sctp_datamsg_put(msg);
 }
 
 /* Final destructruction of datamsg memory. */
@@ -193,8 +180,9 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 		msg->expires_at = jiffies +
 				    msecs_to_jiffies(sinfo->sinfo_timetolive);
 		msg->can_abandon = 1;
-		SCTP_DEBUG_PRINTK("%s: msg:%p expires_at: %ld jiffies:%ld\n",
-				  __func__, msg, msg->expires_at, jiffies);
+
+		pr_debug("%s: msg:%p expires_at:%ld jiffies:%ld\n", __func__,
+			 msg, msg->expires_at, jiffies);
 	}
 
 	/* This is the biggest possible DATA chunk that can fit into
@@ -278,7 +266,8 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 				frag |= SCTP_DATA_SACK_IMM;
 		}
 
-		chunk = sctp_make_datafrag_empty(asoc, sinfo, len, frag, 0);
+		chunk = sctp_make_datafrag_empty(asoc, sinfo, len, frag,
+						 0, GFP_KERNEL);
 
 		if (!chunk) {
 			err = -ENOMEM;
@@ -316,7 +305,8 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 		    (sinfo->sinfo_flags & SCTP_SACK_IMMEDIATELY))
 			frag |= SCTP_DATA_SACK_IMM;
 
-		chunk = sctp_make_datafrag_empty(asoc, sinfo, over, frag, 0);
+		chunk = sctp_make_datafrag_empty(asoc, sinfo, over, frag,
+						 0, GFP_KERNEL);
 
 		if (!chunk) {
 			err = -ENOMEM;
@@ -353,13 +343,32 @@ errout:
 /* Check whether this message has expired. */
 int sctp_chunk_abandoned(struct sctp_chunk *chunk)
 {
-	struct sctp_datamsg *msg = chunk->msg;
+	if (!chunk->asoc->prsctp_enable ||
+	    !SCTP_PR_POLICY(chunk->sinfo.sinfo_flags)) {
+		struct sctp_datamsg *msg = chunk->msg;
 
-	if (!msg->can_abandon)
+		if (!msg->can_abandon)
+			return 0;
+
+		if (time_after(jiffies, msg->expires_at))
+			return 1;
+
 		return 0;
+	}
 
-	if (time_after(jiffies, msg->expires_at))
+	if (SCTP_PR_TTL_ENABLED(chunk->sinfo.sinfo_flags) &&
+	    time_after(jiffies, chunk->prsctp_param)) {
+		if (chunk->sent_count)
+			chunk->asoc->abandoned_sent[SCTP_PR_INDEX(TTL)]++;
+		else
+			chunk->asoc->abandoned_unsent[SCTP_PR_INDEX(TTL)]++;
 		return 1;
+	} else if (SCTP_PR_RTX_ENABLED(chunk->sinfo.sinfo_flags) &&
+		   chunk->sent_count > chunk->prsctp_param) {
+		chunk->asoc->abandoned_sent[SCTP_PR_INDEX(RTX)]++;
+		return 1;
+	}
+	/* PRIO policy is processed by sendmsg, not here */
 
 	return 0;
 }

@@ -5679,7 +5679,7 @@ static void cnic_rcv_netevent(struct cnic_local *cp, unsigned long event,
 static int cnic_netdev_event(struct notifier_block *this, unsigned long event,
 							 void *ptr)
 {
-	struct net_device *netdev = ptr;
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
 	struct cnic_dev *dev;
 	int new_dev = 0;
 
@@ -5765,7 +5765,7 @@ static int __init cnic_init(void)
 
 	pr_info("%s", version);
 
-	rc = register_netdevice_notifier(&cnic_netdev_notifier);
+	rc = register_netdevice_notifier_rh(&cnic_netdev_notifier);
 	if (rc) {
 		cnic_release();
 		return rc;
@@ -5774,7 +5774,7 @@ static int __init cnic_init(void)
 	cnic_wq = create_singlethread_workqueue("cnic_wq");
 	if (!cnic_wq) {
 		cnic_release();
-		unregister_netdevice_notifier(&cnic_netdev_notifier);
+		unregister_netdevice_notifier_rh(&cnic_netdev_notifier);
 		return -ENOMEM;
 	}
 
@@ -5783,7 +5783,7 @@ static int __init cnic_init(void)
 
 static void __exit cnic_exit(void)
 {
-	unregister_netdevice_notifier(&cnic_netdev_notifier);
+	unregister_netdevice_notifier_rh(&cnic_netdev_notifier);
 	cnic_release();
 	destroy_workqueue(cnic_wq);
 }

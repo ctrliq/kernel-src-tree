@@ -804,12 +804,9 @@ static int __cxgb4_getapp(struct net_device *dev, u8 app_idtype, u16 app_id,
  */
 static u8 cxgb4_getapp(struct net_device *dev, u8 app_idtype, u16 app_id)
 {
-	int result = __cxgb4_getapp(dev, app_idtype, app_id, 0);
-
-	if (result < 0)
-		result = 0;
-
-	return result;
+	/* Convert app_idtype to firmware format before querying */
+	return __cxgb4_getapp(dev, app_idtype == DCB_APP_IDTYPE_ETHTYPE ?
+			      app_idtype : 3, app_id, 0);
 }
 
 /* Write a new Application User Priority Map for the specified Application ID.
@@ -1152,7 +1149,7 @@ static int cxgb4_getpeerapp_tbl(struct net_device *dev, struct dcb_app *table)
 		if (!pcmd.u.dcb.app_priority.protocolid)
 			break;
 
-		table[i].selector = pcmd.u.dcb.app_priority.sel_field;
+		table[i].selector = (pcmd.u.dcb.app_priority.sel_field + 1);
 		table[i].protocol =
 			be16_to_cpu(pcmd.u.dcb.app_priority.protocolid);
 		table[i].priority =

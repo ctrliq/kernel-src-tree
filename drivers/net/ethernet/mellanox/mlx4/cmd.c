@@ -1554,6 +1554,15 @@ static struct mlx4_cmd_info cmd_info[] = {
 		.verify = NULL,
 		.wrapper = mlx4_ACCESS_REG_wrapper,
 	},
+	{
+		.opcode = MLX4_CMD_CONGESTION_CTRL_OPCODE,
+		.has_inbox = false,
+		.has_outbox = false,
+		.out_is_imm = false,
+		.encode_slave_id = false,
+		.verify = NULL,
+		.wrapper = mlx4_CMD_EPERM_wrapper,
+	},
 	/* Native multicast commands are not available for guests */
 	{
 		.opcode = MLX4_CMD_QP_ATTACH,
@@ -1998,7 +2007,7 @@ static int mlx4_master_activate_admin_state(struct mlx4_priv *priv, int slave)
 			if (err) {
 				vp_oper->vlan_idx = NO_INDX;
 				mlx4_warn(&priv->dev,
-					  "No vlan resorces slave %d, port %d\n",
+					  "No vlan resources slave %d, port %d\n",
 					  slave, port);
 				return err;
 			}
@@ -2014,7 +2023,7 @@ static int mlx4_master_activate_admin_state(struct mlx4_priv *priv, int slave)
 				err = vp_oper->mac_idx;
 				vp_oper->mac_idx = NO_INDX;
 				mlx4_warn(&priv->dev,
-					  "No mac resorces slave %d, port %d\n",
+					  "No mac resources slave %d, port %d\n",
 					  slave, port);
 				return err;
 			}

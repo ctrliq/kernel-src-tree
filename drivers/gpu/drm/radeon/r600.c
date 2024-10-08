@@ -108,6 +108,53 @@ static void r600_pcie_gen2_enable(struct radeon_device *rdev);
 extern int evergreen_rlc_resume(struct radeon_device *rdev);
 extern void rv770_set_clk_bypass_mode(struct radeon_device *rdev);
 
+/*
+ * Indirect registers accessor
+ */
+u32 r600_rcu_rreg(struct radeon_device *rdev, u32 reg)
+{
+	unsigned long flags;
+	u32 r;
+
+	spin_lock_irqsave(&rdev->rcu_idx_lock, flags);
+	WREG32(R600_RCU_INDEX, ((reg) & 0x1fff));
+	r = RREG32(R600_RCU_DATA);
+	spin_unlock_irqrestore(&rdev->rcu_idx_lock, flags);
+	return r;
+}
+
+void r600_rcu_wreg(struct radeon_device *rdev, u32 reg, u32 v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->rcu_idx_lock, flags);
+	WREG32(R600_RCU_INDEX, ((reg) & 0x1fff));
+	WREG32(R600_RCU_DATA, (v));
+	spin_unlock_irqrestore(&rdev->rcu_idx_lock, flags);
+}
+
+u32 r600_uvd_ctx_rreg(struct radeon_device *rdev, u32 reg)
+{
+	unsigned long flags;
+	u32 r;
+
+	spin_lock_irqsave(&rdev->uvd_idx_lock, flags);
+	WREG32(R600_UVD_CTX_INDEX, ((reg) & 0x1ff));
+	r = RREG32(R600_UVD_CTX_DATA);
+	spin_unlock_irqrestore(&rdev->uvd_idx_lock, flags);
+	return r;
+}
+
+void r600_uvd_ctx_wreg(struct radeon_device *rdev, u32 reg, u32 v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->uvd_idx_lock, flags);
+	WREG32(R600_UVD_CTX_INDEX, ((reg) & 0x1ff));
+	WREG32(R600_UVD_CTX_DATA, (v));
+	spin_unlock_irqrestore(&rdev->uvd_idx_lock, flags);
+}
+
 /**
  * r600_get_allowed_info_register - fetch the register for the info ioctl
  *
@@ -188,8 +235,8 @@ int r600_set_uvd_clocks(struct radeon_device *rdev, u32 vclk, u32 dclk)
 		fb_div |= 1;
 
 	r = radeon_uvd_send_upll_ctlreq(rdev, CG_UPLL_FUNC_CNTL);
-        if (r)
-                return r;
+	if (r)
+		return r;
 
 	/* assert PLL_RESET */
 	WREG32_P(CG_UPLL_FUNC_CNTL, UPLL_RESET_MASK, ~UPLL_RESET_MASK);
@@ -1443,7 +1490,7 @@ static int r600_mc_init(struct radeon_device *rdev)
 					rdev->fastfb_working = true;
 				}
 			}
-  		}
+		}
 	}
 
 	radeon_update_bandwidth_info(rdev);
@@ -3339,11 +3386,17 @@ int r600_ib_test(struct radeon_device *rdev, struct radeon_ring *ring)
 		DRM_ERROR("radeon: failed to schedule ib (%d).\n", r);
 		goto free_ib;
 	}
-	r = radeon_fence_wait(ib.fence, false);
-	if (r) {
+	r = radeon_fence_wait_timeout(ib.fence, false, usecs_to_jiffies(
+		RADEON_USEC_IB_TEST_TIMEOUT));
+	if (r < 0) {
 		DRM_ERROR("radeon: fence wait failed (%d).\n", r);
 		goto free_ib;
+	} else if (r == 0) {
+		DRM_ERROR("radeon: fence wait timed out.\n");
+		r = -ETIMEDOUT;
+		goto free_ib;
 	}
+	r = 0;
 	for (i = 0; i < rdev->usec_timeout; i++) {
 		tmp = RREG32(scratch);
 		if (tmp == 0xDEADBEEF)
@@ -4234,7 +4287,7 @@ restart_ih:
 		WREG32(IH_RB_RPTR, rptr);
 	}
 	if (queue_hotplug)
-		schedule_work(&rdev->hotplug_work);
+		schedule_delayed_work(&rdev->hotplug_work, 0);
 	if (queue_hdmi)
 		schedule_work(&rdev->audio_work);
 	if (queue_thermal && rdev->pm.dpm_enabled)
@@ -4526,7 +4579,7 @@ uint64_t r600_get_gpu_clock_counter(struct radeon_device *rdev)
 	mutex_lock(&rdev->gpu_clock_mutex);
 	WREG32(RLC_CAPTURE_GPU_CLOCK_COUNT, 1);
 	clock = (uint64_t)RREG32(RLC_GPU_CLOCK_COUNT_LSB) |
-	        ((uint64_t)RREG32(RLC_GPU_CLOCK_COUNT_MSB) << 32ULL);
+		((uint64_t)RREG32(RLC_GPU_CLOCK_COUNT_MSB) << 32ULL);
 	mutex_unlock(&rdev->gpu_clock_mutex);
 	return clock;
 }

@@ -31,7 +31,6 @@
  * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
-#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -639,10 +638,10 @@ static void catc_set_multicast_list(struct net_device *netdev)
 {
 	struct catc *catc = netdev_priv(netdev);
 	struct netdev_hw_addr *ha;
-	u8 broadcast[6];
+	u8 broadcast[ETH_ALEN];
 	u8 rx = RxEnable | RxPolarity | RxMultiCast;
 
-	memset(broadcast, 0xff, 6);
+	eth_broadcast_addr(broadcast);
 	memset(catc->multicast, 0, 64);
 
 	catc_multicast(broadcast, catc->multicast);
@@ -777,7 +776,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_device *usbdev = interface_to_usbdev(intf);
 	struct net_device *netdev;
 	struct catc *catc;
-	u8 broadcast[6];
+	u8 broadcast[ETH_ALEN];
 	int i, pktsz;
 
 	if (usb_set_interface(usbdev,
@@ -794,7 +793,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 	netdev->netdev_ops = &catc_netdev_ops;
 	netdev->watchdog_timeo = TX_TIMEOUT;
-	SET_ETHTOOL_OPS(netdev, &ops);
+	netdev->ethtool_ops = &ops;
 
 	catc->usbdev = usbdev;
 	catc->netdev = netdev;
@@ -881,7 +880,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
 		
 		dev_dbg(dev, "Filling the multicast list.\n");
 	  
-		memset(broadcast, 0xff, 6);
+		eth_broadcast_addr(broadcast);
 		catc_multicast(broadcast, catc->multicast);
 		catc_multicast(netdev->dev_addr, catc->multicast);
 		catc_write_mem(catc, 0xfa80, catc->multicast, 64);

@@ -74,33 +74,41 @@
 
 #include "iscsi_iser.h"
 
-static struct scsi_host_template iscsi_iser_sht;
-static struct iscsi_transport iscsi_iser_transport;
-static struct scsi_transport_template *iscsi_iser_scsi_transport;
-
-static unsigned int iscsi_max_lun = 512;
-module_param_named(max_lun, iscsi_max_lun, uint, S_IRUGO);
-
-int iser_debug_level = 0;
-bool iser_pi_enable = false;
-int iser_pi_guard = 0;
-
 MODULE_DESCRIPTION("iSER (iSCSI Extensions for RDMA) Datamover");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Alex Nezhinsky, Dan Bar Dov, Or Gerlitz");
 MODULE_VERSION(DRV_VER);
 
-module_param_named(debug_level, iser_debug_level, int, 0644);
-MODULE_PARM_DESC(debug_level, "Enable debug tracing if > 0 (default:disabled)");
-
-module_param_named(pi_enable, iser_pi_enable, bool, 0644);
-MODULE_PARM_DESC(pi_enable, "Enable T10-PI offload support (default:disabled)");
-
-module_param_named(pi_guard, iser_pi_guard, int, 0644);
-MODULE_PARM_DESC(pi_guard, "T10-PI guard_type, 0:CRC|1:IP_CSUM (default:CRC)");
-
+static struct scsi_host_template iscsi_iser_sht;
+static struct iscsi_transport iscsi_iser_transport;
+static struct scsi_transport_template *iscsi_iser_scsi_transport;
 static struct workqueue_struct *release_wq;
 struct iser_global ig;
+
+int iser_debug_level = 0;
+module_param_named(debug_level, iser_debug_level, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(debug_level, "Enable debug tracing if > 0 (default:disabled)");
+
+static unsigned int iscsi_max_lun = 512;
+module_param_named(max_lun, iscsi_max_lun, uint, S_IRUGO);
+MODULE_PARM_DESC(max_lun, "Max LUNs to allow per session (default:512");
+
+unsigned int iser_max_sectors = ISER_DEF_MAX_SECTORS;
+module_param_named(max_sectors, iser_max_sectors, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(max_sectors, "Max number of sectors in a single scsi command (default:1024");
+
+bool iser_always_reg = true;
+module_param_named(always_register, iser_always_reg, bool, S_IRUGO);
+MODULE_PARM_DESC(always_register,
+		 "Always register memory, even for continuous memory regions (default:true)");
+
+bool iser_pi_enable = false;
+module_param_named(pi_enable, iser_pi_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(pi_enable, "Enable T10-PI offload support (default:disabled)");
+
+int iser_pi_guard;
+module_param_named(pi_guard, iser_pi_guard, int, S_IRUGO);
+MODULE_PARM_DESC(pi_guard, "T10-PI guard_type [deprecated]");
 
 /*
  * iscsi_iser_recv() - Process a successful recv completion
@@ -197,6 +205,7 @@ iser_initialize_task_headers(struct iscsi_task *task,
 		goto out;
 	}
 
+	tx_desc->wr_idx = 0;
 	tx_desc->mapped = true;
 	tx_desc->dma_addr = dma_addr;
 	tx_desc->tx_sg[0].addr   = tx_desc->dma_addr;
@@ -621,6 +630,8 @@ iscsi_iser_session_create(struct iscsi_endpoint *ep,
 	if (ep) {
 		iser_conn = ep->dd_data;
 		max_cmds = iser_conn->max_cmds;
+		shost->sg_tablesize = iser_conn->scsi_sg_tablesize;
+		shost->max_sectors = iser_conn->scsi_max_sectors;
 
 		mutex_lock(&iser_conn->state_mutex);
 		if (iser_conn->state != ISER_CONN_UP) {
@@ -632,7 +643,7 @@ iscsi_iser_session_create(struct iscsi_endpoint *ep,
 
 		ib_conn = &iser_conn->ib_conn;
 		if (ib_conn->pi_support) {
-			u32 sig_caps = ib_conn->device->dev_attr.sig_prot_cap;
+			u32 sig_caps = ib_conn->device->ib_device->attrs.sig_prot_cap;
 
 			scsi_host_set_prot(shost, iser_dif_prot_caps(sig_caps));
 			if (iser_pi_guard)
@@ -646,7 +657,7 @@ iscsi_iser_session_create(struct iscsi_endpoint *ep,
 		 * max fastreg page list length.
 		 */
 		shost->sg_tablesize = min_t(unsigned short, shost->sg_tablesize,
-			ib_conn->device->dev_attr.max_fast_reg_page_list_len);
+			ib_conn->device->ib_device->attrs.max_fast_reg_page_list_len);
 		shost->max_sectors = min_t(unsigned int,
 			1024, (shost->sg_tablesize * PAGE_SIZE) >> 9);
 
@@ -752,9 +763,7 @@ iscsi_iser_conn_get_stats(struct iscsi_cls_conn *cls_conn, struct iscsi_stats *s
 	stats->r2t_pdus = conn->r2t_pdus_cnt; /* always 0 */
 	stats->tmfcmd_pdus = conn->tmfcmd_pdus_cnt;
 	stats->tmfrsp_pdus = conn->tmfrsp_pdus_cnt;
-	stats->custom_length = 1;
-	strcpy(stats->custom[0].desc, "fmr_unalign_cnt");
-	stats->custom[0].value = conn->fmr_unalign_cnt;
+	stats->custom_length = 0;
 }
 
 static int iscsi_iser_get_ep_param(struct iscsi_endpoint *ep,
@@ -959,19 +968,31 @@ static umode_t iser_attr_is_visible(int param_type, int param)
 	return 0;
 }
 
+static int iscsi_iser_slave_alloc(struct scsi_device *sdev)
+{
+#ifdef includedinrhel7
+	blk_queue_virt_boundary(sdev->request_queue, ~MASK_4K);
+#else
+	queue_flag_set_unlocked(QUEUE_FLAG_SG_GAPS, sdev->request_queue);
+#endif
+
+	return 0;
+}
+
 static struct scsi_host_template iscsi_iser_sht = {
 	.module                 = THIS_MODULE,
 	.name                   = "iSCSI Initiator over iSER",
 	.queuecommand           = iscsi_queuecommand,
 	.change_queue_depth	= iscsi_change_queue_depth,
-	.sg_tablesize           = ISCSI_ISER_SG_TABLESIZE,
-	.max_sectors		= 1024,
+	.sg_tablesize           = ISCSI_ISER_DEF_SG_TABLESIZE,
+	.max_sectors            = ISER_DEF_MAX_SECTORS,
 	.cmd_per_lun            = ISER_DEF_CMD_PER_LUN,
 	.eh_abort_handler       = iscsi_eh_abort,
 	.eh_device_reset_handler= iscsi_eh_device_reset,
 	.eh_target_reset_handler = iscsi_eh_recover_target,
 	.target_alloc		= iscsi_target_alloc,
-	.use_clustering         = DISABLE_CLUSTERING,
+	.use_clustering         = ENABLE_CLUSTERING,
+	.slave_alloc            = iscsi_iser_slave_alloc,
 	.proc_name              = "iscsi_iser",
 	.this_id                = -1,
 };

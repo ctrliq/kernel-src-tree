@@ -15,7 +15,7 @@
 	case PIPE_BULK:		temp = "bulk"; break; \
 	case PIPE_INTERRUPT:	temp = "intr"; break; \
 	default:		temp = "isoc"; break; \
-	}; temp;})
+	} temp;})
 #define pipestring(pipe) edstring(usb_pipetype(pipe))
 
 

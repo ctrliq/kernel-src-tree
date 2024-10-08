@@ -42,6 +42,7 @@
 
 #include "nfsd.h"
 #include "vfs.h"
+#include "trace.h"
 
 #define NFSDDBG_FACILITY		NFSDDBG_FILEOP
 
@@ -217,10 +218,16 @@ nfsd_lookup_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		host_err = PTR_ERR(dentry);
 		if (IS_ERR(dentry))
 			goto out_nfserr;
-		/*
-		 * check if we have crossed a mount point ...
-		 */
 		if (nfsd_mountpoint(dentry, exp)) {
+			/*
+			 * We don't need the i_mutex after all.  It's
+			 * still possible we could open this (regular
+			 * files can be mountpoints too), but the
+			 * i_mutex is just there to prevent renames of
+			 * something that we might be about to delegate,
+			 * and a mountpoint won't be renamed:
+			 */
+			fh_unlock(fhp);
 			if ((host_err = nfsd_cross_mnt(rqstp, &dentry, &exp))) {
 				dput(dentry);
 				goto out_nfserr;
@@ -653,15 +660,10 @@ __be32 nfsd4_vfs_fallocate(struct svc_rqst *rqstp, struct svc_fh *fhp,
 			   struct file *file, loff_t offset, loff_t len,
 			   int flags)
 {
-	__be32 err;
 	int error;
 
 	if (!S_ISREG(file_inode(file)->i_mode))
 		return nfserr_inval;
-
-	err = nfsd_permission(rqstp, fhp->fh_export, fhp->fh_dentry, NFSD_MAY_WRITE);
-	if (err)
-		return err;
 
 	error = vfs_fallocate(file, flags, offset, len);
 	if (!error)
@@ -876,14 +878,12 @@ out:
 	return err;
 }
 
-/*
- * Obtain the readahead parameters for the file
- * specified by (dev, ino).
- */
-
-static inline struct raparms *
-nfsd_get_raparms(dev_t dev, ino_t ino)
+struct raparms *
+nfsd_init_raparms(struct file *file)
 {
+	struct inode *inode = file_inode(file);
+	dev_t dev = inode->i_sb->s_dev;
+	ino_t ino = inode->i_ino;
 	struct raparms	*ra, **rap, **frap = NULL;
 	int depth = 0;
 	unsigned int hash;
@@ -920,7 +920,21 @@ found:
 	ra->p_count++;
 	nfsdstats.ra_depth[depth*10/nfsdstats.ra_size]++;
 	spin_unlock(&rab->pb_lock);
+
+	if (ra->p_set)
+		file->f_ra = ra->p_ra;
 	return ra;
+}
+
+void nfsd_put_raparams(struct file *file, struct raparms *ra)
+{
+	struct raparm_hbucket *rab = &raparm_hash[ra->p_hindex];
+
+	spin_lock(&rab->pb_lock);
+	ra->p_ra = file->f_ra;
+	ra->p_set = 1;
+	ra->p_count--;
+	spin_unlock(&rab->pb_lock);
 }
 
 /*
@@ -1008,7 +1022,7 @@ static __be32
 nfsd_vfs_read(struct svc_rqst *rqstp, struct file *file,
 	      loff_t offset, struct kvec *vec, int vlen, unsigned long *count)
 {
-	if (file->f_op->splice_read && rqstp->rq_splice_ok)
+	if (file->f_op->splice_read && test_bit(RQ_SPLICE_OK, &rqstp->rq_flags))
 		return nfsd_splice_read(rqstp, file, offset, count);
 	else
 		return nfsd_readv(file, offset, vec, vlen, count);
@@ -1051,7 +1065,7 @@ static int wait_for_concurrent_writes(struct file *file)
 	return err;
 }
 
-static __be32
+__be32
 nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
 				loff_t offset, struct kvec *vec, int vlen,
 				unsigned long *cnt, int *stablep)
@@ -1067,7 +1081,7 @@ nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
 	loff_t			end = LLONG_MAX;
 	unsigned int		pflags = current->flags;
 
-	if (rqstp->rq_local)
+	if (test_bit(RQ_LOCAL, &rqstp->rq_flags))
 		/*
 		 * We want less throttling in balance_dirty_pages()
 		 * and shrink_inactive_list() so that nfs to
@@ -1110,43 +1124,9 @@ out_nfserr:
 		err = 0;
 	else
 		err = nfserrno(host_err);
-	if (rqstp->rq_local)
+	if (test_bit(RQ_LOCAL, &rqstp->rq_flags))
 		tsk_restore_flags(current, pflags, PF_LESS_THROTTLE);
 	return err;
-}
-
-__be32 nfsd_get_tmp_read_open(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		struct file **file, struct raparms **ra)
-{
-	struct inode *inode;
-	__be32 err;
-
-	err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_READ, file);
-	if (err)
-		return err;
-
-	inode = file_inode(*file);
-
-	/* Get readahead parameters */
-	*ra = nfsd_get_raparms(inode->i_sb->s_dev, inode->i_ino);
-
-	if (*ra && (*ra)->p_set)
-		(*file)->f_ra = (*ra)->p_ra;
-	return nfs_ok;
-}
-
-void nfsd_put_tmp_read_open(struct file *file, struct raparms *ra)
-{
-	/* Write back readahead params */
-	if (ra) {
-		struct raparm_hbucket *rab = &raparm_hash[ra->p_hindex];
-		spin_lock(&rab->pb_lock);
-		ra->p_ra = file->f_ra;
-		ra->p_set = 1;
-		ra->p_count--;
-		spin_unlock(&rab->pb_lock);
-	}
-	fput(file);
 }
 
 /*
@@ -1161,13 +1141,22 @@ __be32 nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	struct raparms	*ra;
 	__be32 err;
 
-	err = nfsd_get_tmp_read_open(rqstp, fhp, &file, &ra);
+	trace_read_start(rqstp, fhp, offset, vlen);
+	err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_READ, &file);
 	if (err)
 		return err;
 
-	err = nfsd_vfs_read(rqstp, file, offset, vec, vlen, count);
+	ra = nfsd_init_raparms(file);
 
-	nfsd_put_tmp_read_open(file, ra);
+	trace_read_opened(rqstp, fhp, offset, vlen);
+	err = nfsd_vfs_read(rqstp, file, offset, vec, vlen, count);
+	trace_read_io_done(rqstp, fhp, offset, vlen);
+
+	if (ra)
+		nfsd_put_raparams(file, ra);
+	fput(file);
+
+	trace_read_done(rqstp, fhp, offset, vlen);
 
 	return err;
 }
@@ -1184,24 +1173,31 @@ nfsd_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
 {
 	__be32			err = 0;
 
+	trace_write_start(rqstp, fhp, offset, vlen);
+
 	if (file) {
 		err = nfsd_permission(rqstp, fhp->fh_export, fhp->fh_dentry,
 				NFSD_MAY_WRITE|NFSD_MAY_OWNER_OVERRIDE);
 		if (err)
 			goto out;
+		trace_write_opened(rqstp, fhp, offset, vlen);
 		err = nfsd_vfs_write(rqstp, fhp, file, offset, vec, vlen, cnt,
 				stablep);
+		trace_write_io_done(rqstp, fhp, offset, vlen);
 	} else {
 		err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_WRITE, &file);
 		if (err)
 			goto out;
 
+		trace_write_opened(rqstp, fhp, offset, vlen);
 		if (cnt)
 			err = nfsd_vfs_write(rqstp, fhp, file, offset, vec, vlen,
 					     cnt, stablep);
+		trace_write_io_done(rqstp, fhp, offset, vlen);
 		fput(file);
 	}
 out:
+	trace_write_done(rqstp, fhp, offset, vlen);
 	return err;
 }
 
@@ -1807,7 +1803,7 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
 	/* cannot use fh_lock as we need deadlock protective ordering
 	 * so do it by hand */
 	trap = lock_rename(tdentry, fdentry);
-	ffhp->fh_locked = tfhp->fh_locked = 1;
+	ffhp->fh_locked = tfhp->fh_locked = true;
 	fill_pre_wcc(ffhp);
 	fill_pre_wcc(tfhp);
 
@@ -1857,7 +1853,7 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
 	fill_post_wcc(ffhp);
 	fill_post_wcc(tfhp);
 	unlock_rename(tdentry, fdentry);
-	ffhp->fh_locked = tfhp->fh_locked = 0;
+	ffhp->fh_locked = tfhp->fh_locked = false;
 	fh_drop_write(ffhp);
 
 out:
@@ -1980,7 +1976,6 @@ static __be32 nfsd_buffered_readdir(struct file *file, filldir_t func,
 	offset = *offsetp;
 
 	while (1) {
-		struct inode *dir_inode = file_inode(file);
 		unsigned int reclen;
 
 		cdp->err = nfserr_eof; /* will be cleared on successful read */
@@ -1999,15 +1994,6 @@ static __be32 nfsd_buffered_readdir(struct file *file, filldir_t func,
 		if (!size)
 			break;
 
-		/*
-		 * Various filldir functions may end up calling back into
-		 * lookup_one_len() and the file system's ->lookup() method.
-		 * These expect i_mutex to be held, as it would within readdir.
-		 */
-		host_err = mutex_lock_killable(&dir_inode->i_mutex);
-		if (host_err)
-			break;
-
 		de = (struct buffered_dirent *)buf.dirent;
 		while (size > 0) {
 			offset = de->offset;
@@ -2024,7 +2010,6 @@ static __be32 nfsd_buffered_readdir(struct file *file, filldir_t func,
 			size -= reclen;
 			de = (struct buffered_dirent *)((char *)de + reclen);
 		}
-		mutex_unlock(&dir_inode->i_mutex);
 		if (size > 0) /* We bailed out early */
 			break;
 

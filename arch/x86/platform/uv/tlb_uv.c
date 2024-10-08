@@ -37,7 +37,7 @@ static int timeout_base_ns[] = {
 };
 
 static int timeout_us;
-static int nobau;
+static bool nobau = true;
 static int nobau_perm;
 static cycles_t congested_cycles;
 
@@ -106,13 +106,28 @@ static char *stat_description[] = {
 	"enable:   number times use of the BAU was re-enabled"
 };
 
-static int __init
-setup_nobau(char *arg)
+static int __init setup_bau(char *arg)
 {
-	nobau = 1;
+	int result;
+
+	if (!arg)
+		return -EINVAL;
+
+	result = strtobool(arg, &nobau);
+	if (result)
+		return result;
+
+	/* we need to flip the logic here, so that bau=y sets nobau to false */
+	nobau = !nobau;
+
+	if (!nobau)
+		pr_info("UV BAU Enabled\n");
+	else
+		pr_info("UV BAU Disabled\n");
+
 	return 0;
 }
-early_param("nobau", setup_nobau);
+early_param("bau", setup_bau);
 
 /* base pnode in this partition */
 static int uv_base_pnode __read_mostly;
@@ -131,10 +146,10 @@ set_bau_on(void)
 		pr_info("BAU not initialized; cannot be turned on\n");
 		return;
 	}
-	nobau = 0;
+	nobau = false;
 	for_each_present_cpu(cpu) {
 		bcp = &per_cpu(bau_control, cpu);
-		bcp->nobau = 0;
+		bcp->nobau = false;
 	}
 	pr_info("BAU turned on\n");
 	return;
@@ -146,10 +161,10 @@ set_bau_off(void)
 	int cpu;
 	struct bau_control *bcp;
 
-	nobau = 1;
+	nobau = true;
 	for_each_present_cpu(cpu) {
 		bcp = &per_cpu(bau_control, cpu);
-		bcp->nobau = 1;
+		bcp->nobau = true;
 	}
 	pr_info("BAU turned off\n");
 	return;
@@ -433,15 +448,49 @@ static void reset_with_ipi(struct pnmask *distribution, struct bau_control *bcp)
 	return;
 }
 
+/*
+ * Not to be confused with cycles_2_ns() from tsc.c; this gives a relative
+ * number, not an absolute. It converts a duration in cycles to a duration in
+ * ns.
+ */
+static inline unsigned long long cycles_2_ns(unsigned long long cyc)
+{
+	struct cyc2ns_data *data = cyc2ns_read_begin();
+	unsigned long long ns;
+
+	ns = mul_u64_u32_shr(cyc, data->cyc2ns_mul, data->cyc2ns_shift);
+
+	cyc2ns_read_end(data);
+	return ns;
+}
+
+/*
+ * The reverse of the above; converts a duration in ns to a duration in cycles.
+ */ 
+static inline unsigned long long ns_2_cycles(unsigned long long ns)
+{
+	struct cyc2ns_data *data = cyc2ns_read_begin();
+	unsigned long long cyc;
+
+	cyc = (ns << data->cyc2ns_shift) / data->cyc2ns_mul;
+
+	cyc2ns_read_end(data);
+	return cyc;
+}
+
 static inline unsigned long cycles_2_us(unsigned long long cyc)
 {
-	unsigned long long ns;
-	unsigned long us;
-	int cpu = smp_processor_id();
+	return cycles_2_ns(cyc) / NSEC_PER_USEC;
+}
 
-	ns =  (cyc * per_cpu(cyc2ns, cpu)) >> CYC2NS_SCALE_FACTOR;
-	us = ns / 1000;
-	return us;
+static inline cycles_t sec_2_cycles(unsigned long sec)
+{
+	return ns_2_cycles(sec * NSEC_PER_SEC);
+}
+
+static inline unsigned long long usec_2_cycles(unsigned long usec)
+{
+	return ns_2_cycles(usec * NSEC_PER_USEC);
 }
 
 /*
@@ -661,16 +710,6 @@ static int wait_completion(struct bau_desc *bau_desc, struct bau_control *bcp, l
 		return uv1_wait_completion(bau_desc, mmr_offset, right_shift, bcp, try);
 	else
 		return uv2_3_wait_completion(bau_desc, mmr_offset, right_shift, bcp, try);
-}
-
-static inline cycles_t sec_2_cycles(unsigned long sec)
-{
-	unsigned long ns;
-	cycles_t cyc;
-
-	ns = sec * 1000000000;
-	cyc = (ns << CYC2NS_SCALE_FACTOR)/(per_cpu(cyc2ns, smp_processor_id()));
-	return cyc;
 }
 
 /*
@@ -1330,16 +1369,6 @@ static void ptc_seq_stop(struct seq_file *file, void *data)
 {
 }
 
-static inline unsigned long long usec_2_cycles(unsigned long microsec)
-{
-	unsigned long ns;
-	unsigned long long cyc;
-
-	ns = microsec * 1000;
-	cyc = (ns << CYC2NS_SCALE_FACTOR)/(per_cpu(cyc2ns, smp_processor_id()));
-	return cyc;
-}
-
 /*
  * Display the statistics thru /proc/sgi_uv/ptc_statistics
  * 'data' points to the cpu number
@@ -1874,7 +1903,7 @@ static void __init init_per_cpu_tunables(void)
 		bcp = &per_cpu(bau_control, cpu);
 		bcp->baudisabled		= 0;
 		if (nobau)
-			bcp->nobau		= 1;
+			bcp->nobau		= true;
 		bcp->statp			= &per_cpu(ptcstats, cpu);
 		/* time interval to catch a hardware stay-busy bug */
 		bcp->timeout_interval		= usec_2_cycles(2*timeout_us);

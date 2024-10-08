@@ -31,6 +31,7 @@
 #include <linux/tick.h>
 #include <linux/kthread.h>
 
+#include "tick-internal.h"
 #include "timekeeping_internal.h"
 
 /**
@@ -100,7 +101,6 @@ clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 maxsec)
 static struct clocksource *curr_clocksource;
 static LIST_HEAD(clocksource_list);
 static DEFINE_MUTEX(clocksource_mutex);
-#define CS_NAME_LEN		32
 static char override_name[CS_NAME_LEN];
 static int finished_booting;
 
@@ -850,7 +850,7 @@ sysfs_show_current_clocksources(struct device *dev,
 	return count;
 }
 
-static size_t clocksource_get_uname(const char *buf, char *dst, size_t cnt)
+size_t sysfs_get_uname(const char *buf, char *dst, size_t cnt)
 {
 	size_t ret = cnt;
 
@@ -885,7 +885,7 @@ static ssize_t sysfs_override_clocksource(struct device *dev,
 
 	mutex_lock(&clocksource_mutex);
 
-	ret = clocksource_get_uname(buf, override_name, count);
+	ret = sysfs_get_uname(buf, override_name, count);
 	if (ret >= 0)
 		clocksource_select();
 
@@ -911,7 +911,7 @@ static ssize_t sysfs_unbind_clocksource(struct device *dev,
 	char name[CS_NAME_LEN];
 	size_t ret;
 
-	ret = clocksource_get_uname(buf, name, count);
+	ret = sysfs_get_uname(buf, name, count);
 	if (ret < 0)
 		return ret;
 

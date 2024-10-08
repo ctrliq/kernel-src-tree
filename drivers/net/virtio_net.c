@@ -456,7 +456,7 @@ static void receive_buf(struct virtnet_info *vi, struct receive_queue *rq,
 		skb_shinfo(skb)->gso_segs = 0;
 	}
 
-	netif_receive_skb(skb);
+	napi_gro_receive(&rq->napi, skb);
 	return;
 
 frame_err:
@@ -646,7 +646,6 @@ static int virtnet_poll(struct napi_struct *napi, int budget)
 	void *buf;
 	unsigned int r, len, received = 0;
 
-again:
 	while (received < budget &&
 	       (buf = virtqueue_get_buf(rq->vq, &len)) != NULL) {
 		receive_buf(vi, rq, buf, len);
@@ -662,12 +661,11 @@ again:
 	/* Out of packets? */
 	if (received < budget) {
 		r = virtqueue_enable_cb_prepare(rq->vq);
-		napi_complete(napi);
+		napi_complete_done(napi, received);
 		if (unlikely(virtqueue_poll(rq->vq, r)) &&
 		    napi_schedule_prep(napi)) {
 			virtqueue_disable_cb(rq->vq);
 			__napi_schedule(napi);
-			goto again;
 		}
 	}
 
@@ -1272,7 +1270,8 @@ static int virtnet_change_mtu(struct net_device *dev, int new_mtu)
 /* To avoid contending a lock hold by a vcpu who would exit to host, select the
  * txq based on the processor id.
  */
-static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb)
+static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+			void *accel_priv, select_queue_fallback_t fallback)
 {
 	int txq;
 	struct virtnet_info *vi = netdev_priv(dev);

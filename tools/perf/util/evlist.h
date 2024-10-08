@@ -125,6 +125,8 @@ void perf_evlist__close(struct perf_evlist *evlist);
 
 void perf_evlist__set_id_pos(struct perf_evlist *evlist);
 bool perf_can_sample_identifier(void);
+bool perf_can_record_switch_events(void);
+bool perf_can_record_cpu_wide(void);
 void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts);
 int record_opts__config(struct record_opts *opts);
 
@@ -137,6 +139,7 @@ int perf_evlist__start_workload(struct perf_evlist *evlist);
 
 struct option;
 
+int __perf_evlist__parse_mmap_pages(unsigned int *mmap_pages, const char *str);
 int perf_evlist__parse_mmap_pages(const struct option *opt,
 				  const char *str,
 				  int unset);

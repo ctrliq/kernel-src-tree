@@ -59,6 +59,7 @@
 #define MLX5_FLD_SZ_BYTES(typ, fld) (__mlx5_bit_sz(typ, fld) / 8)
 #define MLX5_ST_SZ_BYTES(typ) (sizeof(struct mlx5_ifc_##typ##_bits) / 8)
 #define MLX5_ST_SZ_DW(typ) (sizeof(struct mlx5_ifc_##typ##_bits) / 32)
+#define MLX5_ST_SZ_QW(typ) (sizeof(struct mlx5_ifc_##typ##_bits) / 64)
 #define MLX5_UN_SZ_BYTES(typ) (sizeof(union mlx5_ifc_##typ##_bits) / 8)
 #define MLX5_UN_SZ_DW(typ) (sizeof(union mlx5_ifc_##typ##_bits) / 32)
 #define MLX5_BYTE_OFF(typ, fld) (__mlx5_bit_off(typ, fld) / 8)
@@ -374,6 +375,12 @@ enum {
 };
 
 enum {
+	MLX5_BW_NO_LIMIT   = 0,
+	MLX5_100_MBPS_UNIT = 3,
+	MLX5_GBPS_UNIT	   = 4,
+};
+
+enum {
 	MLX5_MAX_PAGE_SHIFT		= 31
 };
 
@@ -649,7 +656,9 @@ struct mlx5_err_cqe {
 };
 
 struct mlx5_cqe64 {
-	u8		rsvd0[4];
+	u8		outer_l3_tunneled;
+	u8		rsvd0;
+	__be16		wqe_id;
 	u8		lro_tcppsh_abort_dupack;
 	u8		lro_min_ttl;
 	__be16		lro_tcp_win;
@@ -662,13 +671,14 @@ struct mlx5_cqe64 {
 	__be16		slid;
 	__be32		flags_rqpn;
 	u8		hds_ip_ext;
-	u8		l4_hdr_type_etc;
+	u8		l4_l3_hdr_type;
 	__be16		vlan_info;
 	__be32		srqn; /* [31:24]: lro_num_seg, [23:0]: srqn */
 	__be32		imm_inval_pkey;
 	u8		rsvd40[4];
 	__be32		byte_cnt;
-	__be64		timestamp;
+	__be32		timestamp_h;
+	__be32		timestamp_l;
 	__be32		sop_drop_qpn;
 	__be16		wqe_counter;
 	u8		signature;
@@ -682,12 +692,68 @@ static inline int get_cqe_lro_tcppsh(struct mlx5_cqe64 *cqe)
 
 static inline u8 get_cqe_l4_hdr_type(struct mlx5_cqe64 *cqe)
 {
-	return (cqe->l4_hdr_type_etc >> 4) & 0x7;
+	return (cqe->l4_l3_hdr_type >> 4) & 0x7;
+}
+
+static inline u8 get_cqe_l3_hdr_type(struct mlx5_cqe64 *cqe)
+{
+	return (cqe->l4_l3_hdr_type >> 2) & 0x3;
+}
+
+static inline u8 cqe_is_tunneled(struct mlx5_cqe64 *cqe)
+{
+	return cqe->outer_l3_tunneled & 0x1;
 }
 
 static inline int cqe_has_vlan(struct mlx5_cqe64 *cqe)
 {
-	return !!(cqe->l4_hdr_type_etc & 0x1);
+	return !!(cqe->l4_l3_hdr_type & 0x1);
+}
+
+static inline u64 get_cqe_ts(struct mlx5_cqe64 *cqe)
+{
+	u32 hi, lo;
+
+	hi = be32_to_cpu(cqe->timestamp_h);
+	lo = be32_to_cpu(cqe->timestamp_l);
+
+	return (u64)lo | ((u64)hi << 32);
+}
+
+struct mpwrq_cqe_bc {
+	__be16	filler_consumed_strides;
+	__be16	byte_cnt;
+};
+
+static inline u16 mpwrq_get_cqe_byte_cnt(struct mlx5_cqe64 *cqe)
+{
+	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
+
+	return be16_to_cpu(bc->byte_cnt);
+}
+
+static inline u16 mpwrq_get_cqe_bc_consumed_strides(struct mpwrq_cqe_bc *bc)
+{
+	return 0x7fff & be16_to_cpu(bc->filler_consumed_strides);
+}
+
+static inline u16 mpwrq_get_cqe_consumed_strides(struct mlx5_cqe64 *cqe)
+{
+	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
+
+	return mpwrq_get_cqe_bc_consumed_strides(bc);
+}
+
+static inline bool mpwrq_is_filler_cqe(struct mlx5_cqe64 *cqe)
+{
+	struct mpwrq_cqe_bc *bc = (struct mpwrq_cqe_bc *)&cqe->byte_cnt;
+
+	return 0x8000 & be16_to_cpu(bc->filler_consumed_strides);
+}
+
+static inline u16 mpwrq_get_cqe_stride_index(struct mlx5_cqe64 *cqe)
+{
+	return be16_to_cpu(cqe->wqe_counter);
 }
 
 enum {
@@ -1200,6 +1266,17 @@ enum {
 	MLX5_RQC_RQ_TYPE_MEMORY_RQ_RPM    = 0x1,
 };
 
+enum mlx5_wol_mode {
+	MLX5_WOL_DISABLE        = 0,
+	MLX5_WOL_SECURED_MAGIC  = 1 << 1,
+	MLX5_WOL_MAGIC          = 1 << 2,
+	MLX5_WOL_ARP            = 1 << 3,
+	MLX5_WOL_BROADCAST      = 1 << 4,
+	MLX5_WOL_MULTICAST      = 1 << 5,
+	MLX5_WOL_UNICAST        = 1 << 6,
+	MLX5_WOL_PHY_ACTIVITY   = 1 << 7,
+};
+
 /* MLX5 DEV CAPs */
 
 /* TODO: EAT.ME */
@@ -1219,6 +1296,8 @@ enum mlx5_cap_type {
 	MLX5_CAP_FLOW_TABLE,
 	MLX5_CAP_ESWITCH_FLOW_TABLE,
 	MLX5_CAP_ESWITCH,
+	MLX5_CAP_RESERVED,
+	MLX5_CAP_VECTOR_CALC,
 	/* NUM OF CAP Types */
 	MLX5_CAP_NUM
 };
@@ -1281,6 +1360,10 @@ enum mlx5_cap_type {
 #define MLX5_CAP_ODP(mdev, cap)\
 	MLX5_GET(odp_cap, mdev->hca_caps_cur[MLX5_CAP_ODP], cap)
 
+#define MLX5_CAP_VECTOR_CALC(mdev, cap) \
+	MLX5_GET(vector_calc_cap, \
+		 mdev->hca_caps_cur[MLX5_CAP_VECTOR_CALC], cap)
+
 enum {
 	MLX5_CMD_STAT_OK			= 0x0,
 	MLX5_CMD_STAT_INT_ERR			= 0x1,
@@ -1308,6 +1391,7 @@ enum {
 	MLX5_ETHERNET_EXTENDED_COUNTERS_GROUP = 0x5,
 	MLX5_PER_PRIORITY_COUNTERS_GROUP      = 0x10,
 	MLX5_PER_TRAFFIC_CLASS_COUNTERS_GROUP = 0x11,
+	MLX5_PHYSICAL_LAYER_COUNTERS_GROUP    = 0x12,
 	MLX5_INFINIBAND_PORT_COUNTERS_GROUP   = 0x20,
 };
 

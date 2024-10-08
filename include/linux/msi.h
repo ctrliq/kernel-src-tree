@@ -28,7 +28,7 @@ struct msi_desc {
 		__u8	multiple: 3;	/* log2 num of messages allocated */
 		__u8	maskbit	: 1;	/* mask-pending bit supported ? */
 		__u8	is_64	: 1;	/* Address size: 0=32bit 1=64bit */
-		__u8	pos;		/* Location of the msi capability */
+		__u8	pos;		/* Deprecated - do not use */
 		__u16	entry_nr;	/* specific enabled entry */
 		unsigned default_irq;	/* default pre-assigned irq */
 	} msi_attrib;
@@ -50,6 +50,8 @@ struct msi_desc {
 
 	/* Last set MSI message */
 	struct msi_msg msg;
+
+	struct kobject kobj;	/* Deprecated - do not use */
 };
 
 /*
@@ -61,7 +63,6 @@ int arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc);
 void arch_teardown_msi_irq(unsigned int irq);
 int arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type);
 void arch_teardown_msi_irqs(struct pci_dev *dev);
-int arch_msi_check_device(struct pci_dev* dev, int nvec, int type);
 void arch_restore_msi_irqs(struct pci_dev *dev);
 
 void default_teardown_msi_irqs(struct pci_dev *dev);
@@ -79,7 +80,7 @@ struct msi_chip {
 			 struct msi_desc *desc);
 	void (*teardown_irq)(struct msi_chip *chip, unsigned int irq);
 	int (*check_device)(struct msi_chip *chip, struct pci_dev *dev,
-			    int nvec, int type);
+			    int nvec, int type);  /* Deprecated - do not use */
 };
 
 #endif /* LINUX_MSI_H */

@@ -549,8 +549,8 @@ EXPORT_SYMBOL_GPL(nfs4_pnfs_ds_add);
 static void nfs4_wait_ds_connect(struct nfs4_pnfs_ds *ds)
 {
 	might_sleep();
-	wait_on_bit(&ds->ds_state, NFS4DS_CONNECTING,
-			nfs_wait_bit_killable, TASK_KILLABLE);
+	wait_on_bit_action(&ds->ds_state, NFS4DS_CONNECTING,
+			   nfs_wait_bit_killable, TASK_KILLABLE);
 }
 
 static void nfs4_clear_ds_conn_bit(struct nfs4_pnfs_ds *ds)
@@ -882,9 +882,10 @@ pnfs_layout_mark_request_commit(struct nfs_page *req,
 	}
 	set_bit(PG_COMMIT_TO_DS, &req->wb_flags);
 	cinfo->ds->nwritten++;
-	spin_unlock(cinfo->lock);
 
-	nfs_request_add_commit_list(req, list, cinfo);
+	nfs_request_add_commit_list_locked(req, list, cinfo);
+	spin_unlock(cinfo->lock);
+	nfs_mark_page_unstable(req->wb_page, cinfo);
 }
 EXPORT_SYMBOL_GPL(pnfs_layout_mark_request_commit);
 

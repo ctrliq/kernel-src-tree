@@ -19,10 +19,13 @@
 #define _LINUX_IO_H
 
 #include <linux/types.h>
+#include <linux/bug.h>
+#include <linux/err.h>
 #include <asm/io.h>
 #include <asm/page.h>
 
 struct device;
+struct resource;
 
 void __iowrite32_copy(void __iomem *to, const void *from, size_t count);
 void __iowrite64_copy(void __iomem *to, const void *from, size_t count);
@@ -36,6 +39,14 @@ static inline int ioremap_page_range(unsigned long addr, unsigned long end,
 {
 	return 0;
 }
+#endif
+
+#ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+void __init ioremap_huge_init(void);
+int arch_ioremap_pud_supported(void);
+int arch_ioremap_pmd_supported(void);
+#else
+static inline void ioremap_huge_init(void) { }
 #endif
 
 /*
@@ -70,6 +81,8 @@ void devm_ioremap_release(struct device *dev, void *res);
 void *devm_memremap(struct device *dev, resource_size_t offset,
 		size_t size, unsigned long flags);
 void devm_memunmap(struct device *dev, void *addr);
+
+void *__devm_memremap_pages(struct device *dev, struct resource *res);
 
 /*
  * Some systems do not have legacy ISA devices.

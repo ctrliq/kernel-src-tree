@@ -1021,14 +1021,16 @@ static int perf_push_sample(struct perf_event *event, struct sf_raw_sample *sfr)
 		break;
 	}
 
-	/* The host-program-parameter (hpp) contains the sie control
-	 * block that is set by sie64a() in entry64.S.	Check if hpp
-	 * refers to a valid control block and set sde_regs flags
-	 * accordingly.  This would allow to use hpp values for other
-	 * purposes too.
-	 * For now, simply use a non-zero value as guest indicator.
+	/*
+	 * A non-zero guest program parameter indicates a guest
+	 * sample.
+	 * Note that some early samples or samples from guests without
+	 * lpp usage would be misaccounted to the host. We use the asn
+	 * value as a heuristic to detect most of these guest samples.
+	 * If the value differs from the host hpp value, we assume
+	 * it to be a KVM guest.
 	 */
-	if (sfr->basic.hpp)
+	if (sfr->basic.gpp || sfr->basic.prim_asn != (u16) sfr->basic.hpp)
 		sde_regs->in_guest = 1;
 
 	overflow = 0;

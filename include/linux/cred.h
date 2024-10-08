@@ -18,6 +18,7 @@
 #include <linux/selinux.h>
 #include <linux/atomic.h>
 #include <linux/uidgid.h>
+#include <linux/rh_kabi.h>
 
 struct user_struct;
 struct cred;
@@ -137,6 +138,8 @@ struct cred {
 	struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
 	struct group_info *group_info;	/* supplementary groups for euid/fsgid */
 	struct rcu_head	rcu;		/* RCU deletion hook */
+
+	RH_KABI_EXTEND(kernel_cap_t cap_ambient)  /* Ambient capability set */
 };
 
 extern void __put_cred(struct cred *);
@@ -196,6 +199,13 @@ static inline void validate_process_creds(void)
 {
 }
 #endif
+
+static inline bool cap_ambient_invariant_ok(const struct cred *cred)
+{
+	return cap_issubset(cred->cap_ambient,
+			    cap_intersect(cred->cap_permitted,
+					  cred->cap_inheritable));
+}
 
 /**
  * get_new_cred - Get a reference on a new set of credentials

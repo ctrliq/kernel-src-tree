@@ -859,7 +859,7 @@ next_slot:
 						disk_bytenr, num_bytes, 0,
 						root->root_key.objectid,
 						new_key.objectid,
-						start - extent_offset, 1);
+						start - extent_offset);
 				BUG_ON(ret); /* -ENOMEM */
 			}
 			key.offset = start;
@@ -937,7 +937,7 @@ delete_extent_item:
 						disk_bytenr, num_bytes, 0,
 						root->root_key.objectid,
 						key.objectid, key.offset -
-						extent_offset, 0);
+						extent_offset);
 				BUG_ON(ret); /* -ENOMEM */
 				inode_sub_bytes(inode,
 						extent_end - key.offset);
@@ -1216,7 +1216,7 @@ again:
 
 		ret = btrfs_inc_extent_ref(trans, root, bytenr, num_bytes, 0,
 					   root->root_key.objectid,
-					   ino, orig_offset, 1);
+					   ino, orig_offset);
 		BUG_ON(ret); /* -ENOMEM */
 
 		if (split == start) {
@@ -1243,7 +1243,7 @@ again:
 		del_nr++;
 		ret = btrfs_free_extent(trans, root, bytenr, num_bytes,
 					0, root->root_key.objectid,
-					ino, orig_offset, 0);
+					ino, orig_offset);
 		BUG_ON(ret); /* -ENOMEM */
 	}
 	other_start = 0;
@@ -1260,7 +1260,7 @@ again:
 		del_nr++;
 		ret = btrfs_free_extent(trans, root, bytenr, num_bytes,
 					0, root->root_key.objectid,
-					ino, orig_offset, 0);
+					ino, orig_offset);
 		BUG_ON(ret); /* -ENOMEM */
 	}
 	if (del_nr == 0) {
@@ -1795,7 +1795,7 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
 		goto out;
 	}
 
-	err = file_remove_suid(file);
+	err = file_remove_privs(file);
 	if (err) {
 		mutex_unlock(&inode->i_mutex);
 		goto out;
@@ -1855,8 +1855,10 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
 	 * otherwise subsequent syncs to a file that's been synced in this
 	 * transaction will appear to have already occured.
 	 */
-	BTRFS_I(inode)->last_sub_trans = root->log_transid;
-	if (num_written > 0 || num_written == -EIOCBQUEUED) {
+	spin_lock(&BTRFS_I(inode)->lock);
+ 	BTRFS_I(inode)->last_sub_trans = root->log_transid;
+	spin_unlock(&BTRFS_I(inode)->lock);
+	if (num_written > 0) {
 		err = generic_write_sync(file, pos, num_written);
 		if (err < 0 && num_written > 0)
 			num_written = err;
@@ -1909,7 +1911,7 @@ static int start_ordered_ops(struct inode *inode, loff_t start, loff_t end)
  */
 int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	struct dentry *dentry = file->f_path.dentry;
+	struct dentry *dentry = file_dentry(file);
 	struct inode *inode = dentry->d_inode;
 	struct btrfs_root *root = BTRFS_I(inode)->root;
 	struct btrfs_trans_handle *trans;

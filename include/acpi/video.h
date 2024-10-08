@@ -16,7 +16,7 @@ struct acpi_device;
 #define ACPI_VIDEO_DISPLAY_LEGACY_PANEL   0x0110
 #define ACPI_VIDEO_DISPLAY_LEGACY_TV      0x0200
 
-#if (defined CONFIG_ACPI_VIDEO || defined CONFIG_ACPI_VIDEO_MODULE)
+#if IS_ENABLED(CONFIG_ACPI_VIDEO)
 extern int acpi_video_register(void);
 extern void acpi_video_unregister(void);
 extern void acpi_video_unregister_backlight(void);

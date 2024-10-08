@@ -58,14 +58,18 @@ enum i40e_queue_ctrl {
 enum i40e_vf_states {
 	I40E_VF_STAT_INIT = 0,
 	I40E_VF_STAT_ACTIVE,
+	I40E_VF_STAT_IWARPENA,
 	I40E_VF_STAT_FCOEENA,
 	I40E_VF_STAT_DISABLED,
+	I40E_VF_STAT_MC_PROMISC,
+	I40E_VF_STAT_UC_PROMISC,
 };
 
 /* VF capabilities */
 enum i40e_vf_capabilities {
 	I40E_VIRTCHNL_VF_CAP_PRIVILEGE = 0,
 	I40E_VIRTCHNL_VF_CAP_L2,
+	I40E_VIRTCHNL_VF_CAP_IWARP,
 };
 
 /* VF information structure */
@@ -107,6 +111,11 @@ struct i40e_vf {
 	bool link_forced;
 	bool link_up;		/* only valid if VF link is forced */
 	bool spoofchk;
+	u16 num_mac;
+	u16 num_vlan;
+
+	/* RDMA Client */
+	struct i40e_virtchnl_iwarp_qvlist_info *qvlist_info;
 };
 
 void i40e_free_vfs(struct i40e_pf *pf);

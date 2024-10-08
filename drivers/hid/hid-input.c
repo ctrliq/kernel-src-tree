@@ -350,9 +350,9 @@ static int hidinput_get_battery_property(struct power_supply *psy,
 			ret = -ENOMEM;
 			break;
 		}
-		ret = dev->hid_get_raw_report(dev, dev->battery_report_id,
-					      buf, 2,
-					      dev->battery_report_type);
+		ret = hid_hw_raw_request(dev, dev->battery_report_id, buf, 2,
+					 dev->battery_report_type,
+					 HID_REQ_GET_REPORT);
 
 		if (ret != 2) {
 			if (ret >= 0)
@@ -1069,7 +1069,8 @@ void hidinput_hid_event(struct hid_device *hid, struct hid_field *field, struct 
 	}
 
 	/* report the usage code as scancode if the key status has changed */
-	if (usage->type == EV_KEY && (!test_bit(usage->code, input->key)) == value)
+	if (usage->type == EV_KEY &&
+	    (!test_bit(usage->code, input->key)) == value)
 		input_event(input, EV_MSC, MSC_SCAN, usage->hid);
 
 	input_event(input, usage->type, usage->code, value);
@@ -1155,7 +1156,7 @@ static void hidinput_led_worker(struct work_struct *work)
 					      led_work);
 	struct hid_field *field;
 	struct hid_report *report;
-	int len;
+	int len, ret;
 	__u8 *buf;
 
 	field = hidinput_get_led_field(hid);
@@ -1182,14 +1183,17 @@ static void hidinput_led_worker(struct work_struct *work)
 		return hid->ll_driver->request(hid, report, HID_REQ_SET_REPORT);
 
 	/* fall back to generic raw-output-report */
-	len = ((report->size - 1) >> 3) + 1 + (report->id > 0);
+	len = hid_report_len(report);
 	buf = hid_alloc_report_buf(report, GFP_KERNEL);
 	if (!buf)
 		return;
 
 	hid_output_report(report, buf);
 	/* synchronous output report */
-	hid->hid_output_raw_report(hid, buf, len, HID_OUTPUT_REPORT);
+	ret = hid_hw_output_report(hid, buf, len);
+	if (ret == -ENOSYS)
+		hid_hw_raw_request(hid, report->id, buf, len, HID_OUTPUT_REPORT,
+				HID_REQ_SET_REPORT);
 	kfree(buf);
 }
 
@@ -1268,8 +1272,7 @@ static struct hid_input *hidinput_allocate(struct hid_device *hid)
 	}
 
 	input_set_drvdata(input_dev, hid);
-	if (hid->ll_driver->request || hid->hid_output_raw_report)
-		input_dev->event = hidinput_input_event;
+	input_dev->event = hidinput_input_event;
 	input_dev->open = hidinput_open;
 	input_dev->close = hidinput_close;
 	input_dev->setkeycode = hidinput_setkeycode;
@@ -1413,8 +1416,9 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
 				 * UGCI) cram a lot of unrelated inputs into the
 				 * same interface. */
 				hidinput->report = report;
-				if (drv->input_configured)
-					drv->input_configured(hid, hidinput);
+				if (drv->input_configured &&
+				    drv->input_configured(hid, hidinput))
+					goto out_cleanup;
 				if (input_register_device(hidinput->input))
 					goto out_cleanup;
 				hidinput = NULL;
@@ -1435,8 +1439,9 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
 	}
 
 	if (hidinput) {
-		if (drv->input_configured)
-			drv->input_configured(hid, hidinput);
+		if (drv->input_configured &&
+		    drv->input_configured(hid, hidinput))
+			goto out_cleanup;
 		if (input_register_device(hidinput->input))
 			goto out_cleanup;
 	}

@@ -42,7 +42,7 @@ static inline struct fou *fou_from_sock(struct sock *sk)
 	return sk->sk_user_data;
 }
 
-static void fou_recv_pull(struct sk_buff *skb, size_t len)
+static int fou_recv_pull(struct sk_buff *skb, size_t len)
 {
 	struct iphdr *iph = ip_hdr(skb);
 
@@ -53,6 +53,7 @@ static void fou_recv_pull(struct sk_buff *skb, size_t len)
 	__skb_pull(skb, len);
 	skb_postpull_rcsum(skb, udp_hdr(skb), len);
 	skb_reset_transport_header(skb);
+	return iptunnel_pull_offloads(skb);
 }
 
 static int fou_udp_recv(struct sock *sk, struct sk_buff *skb)
@@ -62,9 +63,14 @@ static int fou_udp_recv(struct sock *sk, struct sk_buff *skb)
 	if (!fou)
 		return 1;
 
-	fou_recv_pull(skb, sizeof(struct udphdr));
+	if (fou_recv_pull(skb, sizeof(struct udphdr)))
+		goto drop;
 
 	return -fou->protocol;
+
+drop:
+	kfree_skb(skb);
+	return 0;
 }
 
 static struct guehdr *gue_remcsum(struct sk_buff *skb, struct guehdr *guehdr,
@@ -164,6 +170,9 @@ static int gue_udp_recv(struct sock *sk, struct sk_buff *skb)
 	__skb_pull(skb, sizeof(struct udphdr) + hdrlen);
 	skb_reset_transport_header(skb);
 
+	if (iptunnel_pull_offloads(skb))
+		goto drop;
+
 	return -guehdr->proto_ctype;
 
 drop:
@@ -186,7 +195,7 @@ static struct sk_buff **fou_gro_receive(struct sk_buff **head,
 	if (!ops || !ops->callbacks.gro_receive)
 		goto out_unlock;
 
-	pp = ops->callbacks.gro_receive(head, skb);
+	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
 
 out_unlock:
 	rcu_read_unlock();
@@ -343,7 +352,7 @@ static struct sk_buff **gue_gro_receive(struct sk_buff **head,
 	if (WARN_ON(!ops || !ops->callbacks.gro_receive))
 		goto out_unlock;
 
-	pp = ops->callbacks.gro_receive(head, skb);
+	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
 	flush = 0;
 
 out_unlock:

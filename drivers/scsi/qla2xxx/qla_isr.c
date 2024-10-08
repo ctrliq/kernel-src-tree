@@ -56,6 +56,8 @@ qla2100_intr_handler(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	for (iter = 50; iter--; ) {
 		hccr = RD_REG_WORD(&reg->hccr);
+		if (qla2x00_check_reg16_for_disconnect(vha, hccr))
+			break;
 		if (hccr & HCCR_RISC_PAUSE) {
 			if (pci_channel_offline(ha->pdev))
 				break;
@@ -110,6 +112,32 @@ qla2100_intr_handler(int irq, void *dev_id)
 	return (IRQ_HANDLED);
 }
 
+bool
+qla2x00_check_reg32_for_disconnect(scsi_qla_host_t *vha, uint32_t reg)
+{
+	/* Check for PCI disconnection */
+	if (reg == 0xffffffff && !pci_channel_offline(vha->hw->pdev)) {
+		if (!test_and_set_bit(PFLG_DISCONNECTED, &vha->pci_flags) &&
+		    !test_bit(PFLG_DRIVER_REMOVING, &vha->pci_flags) &&
+		    !test_bit(PFLG_DRIVER_PROBING, &vha->pci_flags)) {
+			/*
+			 * Schedule this (only once) on the default system
+			 * workqueue so that all the adapter workqueues and the
+			 * DPC thread can be shutdown cleanly.
+			 */
+			schedule_work(&vha->hw->board_disable);
+		}
+		return true;
+	} else
+		return false;
+}
+
+bool
+qla2x00_check_reg16_for_disconnect(scsi_qla_host_t *vha, uint16_t reg)
+{
+	return qla2x00_check_reg32_for_disconnect(vha, 0xffff0000 | reg);
+}
+
 /**
  * qla2300_intr_handler() - Process interrupts for the ISP23xx and ISP63xx.
  * @irq:
@@ -148,11 +176,14 @@ qla2300_intr_handler(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	for (iter = 50; iter--; ) {
 		stat = RD_REG_DWORD(&reg->u.isp2300.host_status);
+		if (qla2x00_check_reg32_for_disconnect(vha, stat))
+			break;
 		if (stat & HSR_RISC_PAUSED) {
 			if (unlikely(pci_channel_offline(ha->pdev)))
 				break;
 
 			hccr = RD_REG_WORD(&reg->hccr);
+
 			if (hccr & (BIT_15 | BIT_13 | BIT_11 | BIT_8))
 				ql_log(ql_log_warn, vha, 0x5026,
 				    "Parity error -- HCCR=%x, Dumping "
@@ -529,6 +560,17 @@ qla2x00_is_a_vp_did(scsi_qla_host_t *vha, uint32_t rscn_entry)
 	return ret;
 }
 
+static inline fc_port_t *
+qla2x00_find_fcport_by_loopid(scsi_qla_host_t *vha, uint16_t loop_id)
+{
+	fc_port_t *fcport;
+
+	list_for_each_entry(fcport, &vha->vp_fcports, list)
+		if (fcport->loop_id == loop_id)
+			return fcport;
+	return NULL;
+}
+
 /**
  * qla2x00_async_event() - Process aynchronous events.
  * @ha: SCSI driver HA context
@@ -544,7 +586,7 @@ qla2x00_async_event(scsi_qla_host_t *vha, struct rsp_que *rsp, uint16_t *mb)
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
 	struct device_reg_24xx __iomem *reg24 = &ha->iobase->isp24;
 	struct device_reg_82xx __iomem *reg82 = &ha->iobase->isp82;
-	uint32_t	rscn_entry, host_pid, tmp_pid;
+	uint32_t	rscn_entry, host_pid;
 	unsigned long	flags;
 	fc_port_t	*fcport = NULL;
 
@@ -866,14 +908,28 @@ skip_rio:
 			(mb[1] != 0xffff)) && vha->vp_idx != (mb[3] & 0xff))
 			break;
 
-		/* Global event -- port logout or port unavailable. */
-		if (mb[1] == 0xffff && mb[2] == 0x7) {
+		if (mb[2] == 0x7) {
 			ql_dbg(ql_dbg_async, vha, 0x5010,
-			    "Port unavailable %04x %04x %04x.\n",
+			    "Port %s %04x %04x %04x.\n",
+			    mb[1] == 0xffff ? "unavailable" : "logout",
 			    mb[1], mb[2], mb[3]);
-			ql_log(ql_log_warn, vha, 0x505e,
-			    "Link is offline.\n");
 
+			if (mb[1] == 0xffff)
+				goto global_port_update;
+
+			/* Port logout */
+			fcport = qla2x00_find_fcport_by_loopid(vha, mb[1]);
+			if (!fcport)
+				break;
+			if (atomic_read(&fcport->state) != FCS_ONLINE)
+				break;
+			ql_dbg(ql_dbg_async, vha, 0x508a,
+			    "Marking port lost loopid=%04x portid=%06x.\n",
+			    fcport->loop_id, fcport->d_id.b24);
+			qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
+			break;
+
+global_port_update:
 			if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
 				atomic_set(&vha->loop_state, LOOP_DOWN);
 				atomic_set(&vha->loop_down_timer,
@@ -967,7 +1023,6 @@ skip_rio:
 		list_for_each_entry(fcport, &vha->vp_fcports, list) {
 			if (atomic_read(&fcport->state) != FCS_ONLINE)
 				continue;
-			tmp_pid = fcport->d_id.b24;
 			if (fcport->d_id.b24 == rscn_entry) {
 				qla2x00_mark_device_lost(vha, fcport, 0, 0);
 				break;
@@ -1534,7 +1589,7 @@ qla24xx_tm_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
 		    "Async-%s error - hdl=%x entry-status(%x).\n",
 		    type, sp->handle, sts->entry_status);
 		iocb->u.tmf.data = QLA_FUNCTION_FAILED;
-	} else if (sts->comp_status != __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (sts->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		ql_log(ql_log_warn, fcport->vha, 0x5039,
 		    "Async-%s error - hdl=%x completion status(%x).\n",
 		    type, sp->handle, sts->comp_status);
@@ -1549,7 +1604,7 @@ qla24xx_tm_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
 			ql_log(ql_log_warn, fcport->vha, 0x503c,
 			    "Async-%s error - hdl=%x response(%x).\n",
 			    type, sp->handle, sts->data[3]);
-		iocb->u.tmf.data = QLA_FUNCTION_FAILED;
+			iocb->u.tmf.data = QLA_FUNCTION_FAILED;
 		}
 	}
 
@@ -1948,7 +2003,7 @@ qla25xx_process_bidir_status_iocb(scsi_qla_host_t *vha, void *pkt,
 		rval = EXT_STATUS_ERR;
 		break;
 	}
-		bsg_job->reply->reply_payload_rcv_len = 0;
+	bsg_job->reply->reply_payload_rcv_len = 0;
 
 done:
 	/* Return the vendor specific reply to API */
@@ -2653,6 +2708,8 @@ qla24xx_intr_handler(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	for (iter = 50; iter--; ) {
 		stat = RD_REG_DWORD(&reg->host_status);
+		if (qla2x00_check_reg32_for_disconnect(vha, stat))
+			break;
 		if (stat & HSRX_RISC_PAUSED) {
 			if (unlikely(pci_channel_offline(ha->pdev)))
 				break;
@@ -2722,6 +2779,7 @@ qla24xx_msix_rsp_q(int irq, void *dev_id)
 	struct device_reg_24xx __iomem *reg;
 	struct scsi_qla_host *vha;
 	unsigned long flags;
+	uint32_t stat = 0;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -2735,11 +2793,19 @@ qla24xx_msix_rsp_q(int irq, void *dev_id)
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 
 	vha = pci_get_drvdata(ha->pdev);
+	/*
+	 * Use host_status register to check to PCI disconnection before we
+	 * we process the response queue.
+	 */
+	stat = RD_REG_DWORD(&reg->host_status);
+	if (qla2x00_check_reg32_for_disconnect(vha, stat))
+		goto out;
 	qla24xx_process_response_queue(vha, rsp);
 	if (!ha->flags.disable_msix_handshake) {
 		WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
 		RD_REG_DWORD_RELAXED(&reg->hccr);
 	}
+out:
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
 	return IRQ_HANDLED;
@@ -2749,9 +2815,11 @@ static irqreturn_t
 qla25xx_msix_rsp_q(int irq, void *dev_id)
 {
 	struct qla_hw_data *ha;
+	scsi_qla_host_t *vha;
 	struct rsp_que *rsp;
 	struct device_reg_24xx __iomem *reg;
 	unsigned long flags;
+	uint32_t hccr = 0;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -2760,17 +2828,21 @@ qla25xx_msix_rsp_q(int irq, void *dev_id)
 		return IRQ_NONE;
 	}
 	ha = rsp->hw;
+	vha = pci_get_drvdata(ha->pdev);
 
 	/* Clear the interrupt, if enabled, for this response queue */
 	if (!ha->flags.disable_msix_handshake) {
 		reg = &ha->iobase->isp24;
 		spin_lock_irqsave(&ha->hardware_lock, flags);
 		WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
-		RD_REG_DWORD_RELAXED(&reg->hccr);
+		hccr = RD_REG_DWORD_RELAXED(&reg->hccr);
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
 	}
+	if (qla2x00_check_reg32_for_disconnect(vha, hccr))
+		goto out;
 	queue_work_on((int) (rsp->id - 1), ha->wq, &rsp->q_work);
 
+out:
 	return IRQ_HANDLED;
 }
 
@@ -2801,6 +2873,8 @@ qla24xx_msix_default(int irq, void *dev_id)
 	vha = pci_get_drvdata(ha->pdev);
 	do {
 		stat = RD_REG_DWORD(&reg->host_status);
+		if (qla2x00_check_reg32_for_disconnect(vha, stat))
+			break;
 		if (stat & HSRX_RISC_PAUSED) {
 			if (unlikely(pci_channel_offline(ha->pdev)))
 				break;

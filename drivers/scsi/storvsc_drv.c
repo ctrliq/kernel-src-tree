@@ -151,19 +151,17 @@ struct hv_fc_wwn_packet {
 
 /*
  * Sense buffer size changed in win8; have a run-time
- * variable to track the size we should use.
+ * variable to track the size we should use.  This value will
+ * likely change during protocol negotiation but it is valid
+ * to start by assuming pre-Win8.
  */
-static int sense_buffer_size;
+static int sense_buffer_size = PRE_WIN8_STORVSC_SENSE_BUFFER_SIZE;
 
 /*
- * The size of the vmscsi_request has changed in win8. The
- * additional size is because of new elements added to the
- * structure. These elements are valid only when we are talking
- * to a win8 host.
- * Track the correction to size we need to apply.
- */
-
-static int vmscsi_size_delta;
+ * The storage protocol version is determined during the
+ * initial exchange with the host.  It will indicate which
+ * storage functionality is available in the host.
+*/
 static int vmstor_proto_version;
 
 #define STORVSC_LOGGING_NONE	0
@@ -227,6 +225,17 @@ struct vmscsi_request {
 
 } __attribute((packed));
 
+
+/*
+ * The size of the vmscsi_request has changed in win8. The
+ * additional size is because of new elements added to the
+ * structure. These elements are valid only when we are talking
+ * to a win8 host.
+ * Track the correction to size we need to apply. This value
+ * will likely change during protocol negotiation but it is
+ * valid to start by assuming pre-Win8.
+ */
+static int vmscsi_size_delta = sizeof(struct vmscsi_win8_extension);
 
 /*
  * The list of storage protocols in order of preference.
@@ -373,16 +382,19 @@ enum storvsc_request_type {
  */
 
 static int storvsc_ringbuffer_size = (256 * PAGE_SIZE);
+static u32 max_outstanding_req_per_channel;
+
+static int storvsc_vcpus_per_sub_channel = 4;
 
 module_param(storvsc_ringbuffer_size, int, S_IRUGO);
 MODULE_PARM_DESC(storvsc_ringbuffer_size, "Ring buffer size (bytes)");
 
+module_param(storvsc_vcpus_per_sub_channel, int, S_IRUGO);
+MODULE_PARM_DESC(vcpus_per_sub_channel, "Ratio of VCPUs to subchannels");
 /*
  * Timeout in seconds for all devices managed by this driver.
  */
 static int storvsc_timeout = 180;
-
-#define STORVSC_MAX_IO_REQUESTS				200
 
 static void storvsc_on_channel_callback(void *context);
 
@@ -815,8 +827,7 @@ static int storvsc_channel_init(struct hv_device *device)
 	 * support multi-channel.
 	 */
 	max_chns = vstor_packet->storage_channel_properties.max_channel_cnt;
-	if ((vmbus_proto_version != VERSION_WIN7) &&
-	   (vmbus_proto_version != VERSION_WS2008))  {
+	if (vmstor_proto_version >= VMSTOR_PROTO_VERSION_WIN8) {
 		if (vstor_packet->storage_channel_properties.flags &
 		    STORAGE_CHANNEL_SUPPORTS_MULTI_CHANNEL)
 			process_sub_channels = true;
@@ -1244,8 +1255,6 @@ static int storvsc_do_io(struct hv_device *device,
 
 static int storvsc_device_configure(struct scsi_device *sdevice)
 {
-	scsi_adjust_queue_depth(sdevice, MSG_SIMPLE_TAG,
-				STORVSC_MAX_IO_REQUESTS);
 
 	blk_queue_max_segment_size(sdevice->request_queue, PAGE_SIZE);
 
@@ -1260,15 +1269,19 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
 
 	/*
 	 * If the host is WIN8 or WIN8 R2, claim conformance to SPC-3
-	 * if the device is a MSFT virtual device.
+	 * if the device is a MSFT virtual device.  If the host is
+	 * WIN10 or newer, allow write_same.
 	 */
 	if (!strncmp(sdevice->vendor, "Msft", 4)) {
-		switch (vmbus_proto_version) {
-		case VERSION_WIN8:
-		case VERSION_WIN8_1:
+		switch (vmstor_proto_version) {
+		case VMSTOR_PROTO_VERSION_WIN8:
+		case VMSTOR_PROTO_VERSION_WIN8_1:
 			sdevice->scsi_level = SCSI_SPC_3;
 			break;
 		}
+
+		if (vmstor_proto_version >= VMSTOR_PROTO_VERSION_WIN10)
+			sdevice->no_write_same = 0;
 	}
 
 	return 0;
@@ -1514,7 +1527,6 @@ static struct scsi_host_template scsi_driver = {
 	.eh_timed_out =		storvsc_eh_timed_out,
 	.slave_configure =	storvsc_device_configure,
 	.cmd_per_lun =		255,
-	.can_queue =		STORVSC_MAX_IO_REQUESTS*STORVSC_MAX_TARGETS,
 	.this_id =		-1,
 	.use_clustering =	ENABLE_CLUSTERING,
 	/* Make sure we dont get a sg segment crosses a page boundary */
@@ -1551,6 +1563,7 @@ static int storvsc_probe(struct hv_device *device,
 			const struct hv_vmbus_device_id *dev_id)
 {
 	int ret;
+	int num_cpus = num_online_cpus();
 	struct Scsi_Host *host;
 	struct hv_host_device *host_dev;
 	bool dev_is_ide = ((dev_id->driver_data == IDE_GUID) ? true : false);
@@ -1559,33 +1572,32 @@ static int storvsc_probe(struct hv_device *device,
 	int max_luns_per_target;
 	int max_targets;
 	int max_channels;
+	int max_sub_channels = 0;
 
 	/*
 	 * Based on the windows host we are running on,
 	 * set state to properly communicate with the host.
 	 */
 
-	switch (vmbus_proto_version) {
-	case VERSION_WS2008:
-	case VERSION_WIN7:
-		sense_buffer_size = PRE_WIN8_STORVSC_SENSE_BUFFER_SIZE;
-		vmscsi_size_delta = sizeof(struct vmscsi_win8_extension);
+	if (vmbus_proto_version < VERSION_WIN8) {
 		max_luns_per_target = STORVSC_IDE_MAX_LUNS_PER_TARGET;
 		max_targets = STORVSC_IDE_MAX_TARGETS;
 		max_channels = STORVSC_IDE_MAX_CHANNELS;
-		break;
-	default:
-		sense_buffer_size = POST_WIN7_STORVSC_SENSE_BUFFER_SIZE;
-		vmscsi_size_delta = 0;
+	} else {
 		max_luns_per_target = STORVSC_MAX_LUNS_PER_TARGET;
 		max_targets = STORVSC_MAX_TARGETS;
 		max_channels = STORVSC_MAX_CHANNELS;
-		break;
+		/*
+		 * On Windows8 and above, we support sub-channels for storage.
+		 * The number of sub-channels offerred is based on the number of
+		 * VCPUs in the guest.
+		 */
+		max_sub_channels = (num_cpus / storvsc_vcpus_per_sub_channel);
 	}
 
-	if (dev_id->driver_data == SFC_GUID)
-		scsi_driver.can_queue = (STORVSC_MAX_IO_REQUESTS *
-					 STORVSC_FC_MAX_TARGETS);
+	scsi_driver.can_queue = (max_outstanding_req_per_channel *
+				 (max_sub_channels + 1));
+
 	host = scsi_host_alloc(&scsi_driver,
 			       sizeof(struct hv_host_device));
 	if (!host)
@@ -1704,7 +1716,6 @@ static struct hv_driver storvsc_drv = {
 
 static int __init storvsc_drv_init(void)
 {
-	u32 max_outstanding_req_per_channel;
 
 	/*
 	 * Divide the ring buffer data size (which is 1 page less
@@ -1718,10 +1729,6 @@ static int __init storvsc_drv_init(void)
 		sizeof(struct vstor_packet) + sizeof(u64) -
 		vmscsi_size_delta,
 		sizeof(u64)));
-
-	if (max_outstanding_req_per_channel <
-	    STORVSC_MAX_IO_REQUESTS)
-		return -EINVAL;
 
 	return vmbus_driver_register(&storvsc_drv);
 }

@@ -113,7 +113,7 @@ ifdef PERF_HAVE_ARCH_REGS_QUERY_REGISTER_OFFSET
   CFLAGS += -DHAVE_ARCH_REGS_QUERY_REGISTER_OFFSET
 endif
 
-include $(src-perf)/config/utilities.mak
+include $(srctree)/tools/scripts/utilities.mak
 
 ifeq ($(call get-executable,$(FLEX)),)
   dummy := $(error Error: $(FLEX) is missing on this system, please install it)
@@ -178,7 +178,11 @@ LDFLAGS += -Wl,-z,noexecstack
 
 EXTLIBS = -lpthread -lrt -lm -ldl
 
+ifeq ($(FEATURES_DUMP),)
 include $(srctree)/tools/build/Makefile.feature
+else
+include $(FEATURES_DUMP)
+endif
 
 ifeq ($(feature-stackprotector-all), 1)
   CFLAGS += -fstack-protector-all
@@ -266,6 +270,12 @@ else
     ifneq ($(feature-dwarf), 1)
       msg := $(warning No libdw.h found or old libdw.h found or elfutils is older than 0.138, disables dwarf support. Please install new elfutils-devel/libdw-dev);
       NO_DWARF := 1
+    else
+      ifneq ($(feature-dwarf_getlocations), 1)
+        msg := $(warning Old libdw.h, finding variables at given 'perf probe' point will not work, install elfutils-devel/libdw-dev >= 0.157);
+      else
+        CFLAGS += -DHAVE_DWARF_GETLOCATIONS
+      endif # dwarf_getlocations
     endif # Dwarf support
   endif # libelf support
 endif # NO_LIBELF
@@ -306,6 +316,13 @@ ifndef NO_LIBELF
     endif # PERF_HAVE_DWARF_REGS
   endif # NO_DWARF
 endif # NO_LIBELF
+
+ifdef PERF_HAVE_JITDUMP
+  ifndef NO_DWARF
+    $(call detected,CONFIG_JITDUMP)
+    CFLAGS += -DHAVE_JITDUMP
+  endif
+endif
 
 ifeq ($(ARCH),powerpc)
   ifndef NO_DWARF
@@ -373,6 +390,17 @@ ifndef NO_LIBAUDIT
     CFLAGS += -DHAVE_LIBAUDIT_SUPPORT
     EXTLIBS += -laudit
     $(call detected,CONFIG_AUDIT)
+  endif
+endif
+
+ifndef NO_LIBCRYPTO
+  ifneq ($(feature-libcrypto), 1)
+    msg := $(warning No libcrypto.h found, disables jitted code injection, please install libssl-devel or libssl-dev);
+    NO_LIBCRYPTO := 1
+  else
+    CFLAGS += -DHAVE_LIBCRYPTO_SUPPORT
+    EXTLIBS += -lcrypto
+    $(call detected,CONFIG_CRYPTO)
   endif
 endif
 
@@ -626,8 +654,13 @@ ifdef LIBBABELTRACE
 endif
 
 ifndef NO_AUXTRACE
-  $(call detected,CONFIG_AUXTRACE)
-  CFLAGS += -DHAVE_AUXTRACE_SUPPORT
+  ifeq ($(feature-get_cpuid), 0)
+    msg := $(warning Your gcc lacks the __get_cpuid() builtin, disables support for auxtrace/Intel PT, please install a newer gcc);
+    NO_AUXTRACE := 1
+  else
+    $(call detected,CONFIG_AUXTRACE)
+    CFLAGS += -DHAVE_AUXTRACE_SUPPORT
+  endif
 endif
 
 # Among the variables below, these:
@@ -655,6 +688,8 @@ sharedir = $(prefix)/share
 template_dir = share/perf-core/templates
 STRACE_GROUPS_DIR = share/perf-core/strace/groups
 htmldir = share/doc/perf-doc
+tipdir = share/doc/perf-tip
+srcdir = $(srctree)/tools/perf
 ifeq ($(prefix),/usr)
 sysconfdir = /etc
 ETC_PERFCONFIG = $(sysconfdir)/perfconfig
@@ -681,19 +716,24 @@ infodir_SQ = $(subst ','\'',$(infodir))
 perfexecdir_SQ = $(subst ','\'',$(perfexecdir))
 template_dir_SQ = $(subst ','\'',$(template_dir))
 htmldir_SQ = $(subst ','\'',$(htmldir))
+tipdir_SQ = $(subst ','\'',$(tipdir))
 prefix_SQ = $(subst ','\'',$(prefix))
 sysconfdir_SQ = $(subst ','\'',$(sysconfdir))
 libdir_SQ = $(subst ','\'',$(libdir))
+srcdir_SQ = $(subst ','\'',$(srcdir))
 
 ifneq ($(filter /%,$(firstword $(perfexecdir))),)
 perfexec_instdir = $(perfexecdir)
 STRACE_GROUPS_INSTDIR = $(STRACE_GROUPS_DIR)
+tip_instdir = $(tipdir)
 else
 perfexec_instdir = $(prefix)/$(perfexecdir)
 STRACE_GROUPS_INSTDIR = $(prefix)/$(STRACE_GROUPS_DIR)
+tip_instdir = $(prefix)/$(tipdir)
 endif
 perfexec_instdir_SQ = $(subst ','\'',$(perfexec_instdir))
 STRACE_GROUPS_INSTDIR_SQ = $(subst ','\'',$(STRACE_GROUPS_INSTDIR))
+tip_instdir_SQ = $(subst ','\'',$(tip_instdir))
 
 # If we install to $(HOME) we keep the traceevent default:
 # $(HOME)/.traceevent/plugins
@@ -734,6 +774,8 @@ $(call detected_var,ETC_PERFCONFIG_SQ)
 $(call detected_var,STRACE_GROUPS_DIR_SQ)
 $(call detected_var,prefix_SQ)
 $(call detected_var,perfexecdir_SQ)
+$(call detected_var,tipdir_SQ)
+$(call detected_var,srcdir_SQ)
 $(call detected_var,LIBDIR)
 $(call detected_var,GTK_CFLAGS)
 $(call detected_var,PERL_EMBED_CCOPTS)

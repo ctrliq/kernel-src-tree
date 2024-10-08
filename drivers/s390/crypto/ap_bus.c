@@ -872,7 +872,7 @@ static int ap_bus_suspend(struct device *dev, pm_message_t state)
 	} while ((flags & 1) || (flags & 2));
 
 	spin_lock_bh(&ap_dev->lock);
-	ap_dev->unregistered = 1;
+	ap_dev->unregistered = AP_DEV_UNREGISTERED;
 	spin_unlock_bh(&ap_dev->lock);
 
 	return 0;
@@ -1468,9 +1468,10 @@ static void ap_scan_bus(struct work_struct *unused)
 		if (dev) {
 			ap_dev = to_ap_dev(dev);
 			spin_lock_bh(&ap_dev->lock);
-			if (rc == -ENODEV || ap_dev->unregistered) {
+			if (rc == -ENODEV ||
+			    ap_dev->unregistered == AP_DEV_UNREGISTERED) {
 				spin_unlock_bh(&ap_dev->lock);
-				if (ap_dev->unregistered)
+				if (ap_dev->unregistered == AP_DEV_UNREGISTERED)
 					i--;
 				device_unregister(dev);
 				put_device(dev);
@@ -1492,7 +1493,7 @@ static void ap_scan_bus(struct work_struct *unused)
 			continue;
 		}
 		ap_dev->queue_depth = queue_depth;
-		ap_dev->unregistered = 1;
+		ap_dev->unregistered = AP_DEV_REGIST_IN_PROGRESS;
 		spin_lock_init(&ap_dev->lock);
 		INIT_LIST_HEAD(&ap_dev->pendingq);
 		INIT_LIST_HEAD(&ap_dev->requestq);
@@ -1536,7 +1537,7 @@ static void ap_scan_bus(struct work_struct *unused)
 					&ap_dev_attr_group);
 		if (!rc) {
 			spin_lock_bh(&ap_dev->lock);
-			ap_dev->unregistered = 0;
+			ap_dev->unregistered = AP_DEV_REGISTERED;
 			spin_unlock_bh(&ap_dev->lock);
 		}
 		else
@@ -1783,10 +1784,13 @@ void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
 		if (!rc)
 			wake_up(&ap_poll_wait);
 		if (rc == -ENODEV)
-			ap_dev->unregistered = 1;
-	} else {
+			ap_dev->unregistered = AP_DEV_UNREGISTERED;
+	} else if (ap_dev->unregistered == AP_DEV_UNREGISTERED) {
 		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
 		rc = -ENODEV;
+	} else { /* device registration in progress */
+		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-EBUSY));
+		rc = -EBUSY;
 	}
 	spin_unlock_bh(&ap_dev->lock);
 	if (rc == -ENODEV)
@@ -1853,16 +1857,19 @@ static void ap_reset(struct ap_device *ap_dev, unsigned long *flags)
 	ap_dev->pendingq_count = 0;
 	rc = ap_init_queue(ap_dev);
 	if (rc == -ENODEV)
-		ap_dev->unregistered = 1;
+		ap_dev->unregistered = AP_DEV_UNREGISTERED;
 	else
 		*flags |= AP_POLL_AFTER_TIMEOUT;
 }
 
 static int __ap_poll_device(struct ap_device *ap_dev, unsigned long *flags)
 {
+	int rc;
+
 	if (!ap_dev->unregistered) {
-		if (ap_poll_queue(ap_dev, flags))
-			ap_dev->unregistered = 1;
+		rc = ap_poll_queue(ap_dev, flags);
+		if (rc == -ENODEV)
+			ap_dev->unregistered = AP_DEV_UNREGISTERED;
 		if (ap_dev->reset == AP_RESET_DO)
 			ap_reset(ap_dev, flags);
 	}

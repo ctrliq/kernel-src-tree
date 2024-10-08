@@ -1845,7 +1845,8 @@ bool i40iw_vf_clear_to_send(struct i40iw_sc_dev *dev)
 
 	iwdev = dev->back_dev;
 
-	if (!wq_has_sleeper(&dev->vf_reqs) &&
+	smp_mb();
+	if (!waitqueue_active(&dev->vf_reqs) &&
 	    (atomic_read(&iwdev->vchnl_msgs) == 0))
 		return true; /* virtual channel is clear */
 

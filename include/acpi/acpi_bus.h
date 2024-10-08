@@ -27,6 +27,7 @@
 #define __ACPI_BUS_H__
 
 #include <linux/device.h>
+#include <linux/property.h>
 
 #include <acpi/acpi.h>
 
@@ -91,6 +92,8 @@ acpi_evaluate_dsm_typed(acpi_handle handle, const u8 *uuid, u64 rev, u64 func,
 	  .package.count = (cnt),			\
 	  .package.elements = (eles)			\
 	}
+
+bool acpi_dev_found(const char *hid);
 
 #ifdef CONFIG_ACPI
 
@@ -209,7 +212,8 @@ struct acpi_device_flags {
 	u32 visited:1;
 	u32 hotplug_notify:1;
 	u32 is_dock_station:1;
-	u32 reserved:23;
+	u32 of_compatible_ok:1;
+	u32 reserved:22;
 };
 
 /* File System */
@@ -333,12 +337,15 @@ struct acpi_device_physical_node {
 struct acpi_device_data {
 	const union acpi_object *pointer;
 	const union acpi_object *properties;
+	const union acpi_object *of_compatible;
+	struct list_head subnodes;
 };
 
 /* Device */
 struct acpi_device {
 	int device_type;
 	acpi_handle handle;		/* no handle for fixed hardware */
+	struct fwnode_handle fwnode;
 	struct acpi_device *parent;
 	struct list_head children;
 	struct list_head node;
@@ -362,6 +369,50 @@ struct acpi_device {
 	struct mutex physical_node_lock;
 	void (*remove)(struct acpi_device *);
 };
+
+/* Non-device subnode */
+struct acpi_data_node {
+	const char *name;
+	acpi_handle handle;
+	struct fwnode_handle fwnode;
+	struct acpi_device_data data;
+	struct list_head sibling;
+	struct kobject kobj;
+	struct completion kobj_done;
+};
+
+static inline bool is_acpi_node(struct fwnode_handle *fwnode)
+{
+	return fwnode && (fwnode->type == FWNODE_ACPI
+		|| fwnode->type == FWNODE_ACPI_DATA);
+}
+
+static inline bool is_acpi_device_node(struct fwnode_handle *fwnode)
+{
+	return fwnode && fwnode->type == FWNODE_ACPI;
+}
+
+static inline struct acpi_device *to_acpi_device_node(struct fwnode_handle *fwnode)
+{
+	return is_acpi_device_node(fwnode) ?
+		container_of(fwnode, struct acpi_device, fwnode) : NULL;
+}
+
+static inline bool is_acpi_data_node(struct fwnode_handle *fwnode)
+{
+	return fwnode && fwnode->type == FWNODE_ACPI_DATA;
+}
+
+static inline struct acpi_data_node *to_acpi_data_node(struct fwnode_handle *fwnode)
+{
+	return is_acpi_data_node(fwnode) ?
+		container_of(fwnode, struct acpi_data_node, fwnode) : NULL;
+}
+
+static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)
+{
+	return &adev->fwnode;
+}
 
 static inline void *acpi_driver_data(struct acpi_device *d)
 {

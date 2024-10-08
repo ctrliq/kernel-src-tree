@@ -606,6 +606,7 @@ fail:
  */
 static void efx_start_datapath(struct efx_nic *efx)
 {
+	netdev_features_t old_features = efx->net_dev->features;
 	bool old_rx_scatter = efx->rx_scatter;
 	struct efx_tx_queue *tx_queue;
 	struct efx_rx_queue *rx_queue;
@@ -649,6 +650,15 @@ static void efx_start_datapath(struct efx_nic *efx)
 			  "RX buf len=%u step=%u bpp=%u; page batch=%u\n",
 			  efx->rx_dma_len, efx->rx_page_buf_step,
 			  efx->rx_bufs_per_page, efx->rx_pages_per_batch);
+
+	/* Restore previously fixed features in hw_features and remove
+	 * features which are fixed now
+	 */
+	efx->net_dev->hw_features |= efx->net_dev->features;
+	efx->net_dev->hw_features &= ~efx->fixed_features;
+	efx->net_dev->features |= efx->fixed_features;
+	if (efx->net_dev->features != old_features)
+		netdev_features_change(efx->net_dev);
 
 	/* RX filters may also have scatter-enabled flags */
 	if (efx->rx_scatter != old_rx_scatter)
@@ -1350,7 +1360,7 @@ static unsigned int efx_wanted_parallelism(struct efx_nic *efx)
 			if (!cpumask_test_cpu(cpu, thread_mask)) {
 				++count;
 				cpumask_or(thread_mask, thread_mask,
-					   topology_thread_cpumask(cpu));
+					   topology_sibling_cpumask(cpu));
 			}
 		}
 
@@ -2065,7 +2075,6 @@ static void efx_init_napi_channel(struct efx_channel *channel)
 	channel->napi_dev = efx->net_dev;
 	netif_napi_add(channel->napi_dev, &channel->napi_str,
 		       efx_poll, napi_weight);
-	napi_hash_add(&channel->napi_str);
 	efx_channel_busy_poll_init(channel);
 }
 
@@ -2391,7 +2400,7 @@ static void efx_update_name(struct efx_nic *efx)
 static int efx_netdev_event(struct notifier_block *this,
 			    unsigned long event, void *ptr)
 {
-	struct net_device *net_dev = ptr;
+	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
 
 	if ((net_dev->netdev_ops == &efx_netdev_ops) &&
 	    event == NETDEV_CHANGENAME)
@@ -3176,17 +3185,25 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 		return -ENOMEM;
 	efx = netdev_priv(net_dev);
 	efx->type = (const struct efx_nic_type *) entry->driver_data;
+	efx->fixed_features |= NETIF_F_HIGHDMA;
 	net_dev->features |= (efx->type->offload_features | NETIF_F_SG |
-			      NETIF_F_HIGHDMA | NETIF_F_TSO |
-			      NETIF_F_RXCSUM);
-	if (efx->type->offload_features & NETIF_F_V6_CSUM)
+			      NETIF_F_TSO | NETIF_F_RXCSUM);
+	if (efx->type->offload_features & (NETIF_F_IPV6_CSUM | NETIF_F_HW_CSUM))
 		net_dev->features |= NETIF_F_TSO6;
 	/* Mask for features that also apply to VLAN devices */
-	net_dev->vlan_features |= (NETIF_F_ALL_CSUM | NETIF_F_SG |
+	net_dev->vlan_features |= (NETIF_F_HW_CSUM | NETIF_F_SG |
 				   NETIF_F_HIGHDMA | NETIF_F_ALL_TSO |
 				   NETIF_F_RXCSUM);
-	/* All offloads can be toggled */
-	net_dev->hw_features = net_dev->features & ~NETIF_F_HIGHDMA;
+
+	net_dev->hw_features = net_dev->features & ~efx->fixed_features;
+
+	/* Disable VLAN filtering by default.  It may be enforced if
+	 * the feature is fixed (i.e. VLAN filters are required to
+	 * receive VLAN tagged packets due to vPort restrictions).
+	 */
+	net_dev->features &= ~NETIF_F_HW_VLAN_CTAG_FILTER;
+	net_dev->features |= efx->fixed_features;
+
 	pci_set_drvdata(pci_dev, efx);
 	SET_NETDEV_DEV(net_dev, &pci_dev->dev);
 	rc = efx_init_struct(efx, pci_dev, net_dev);
@@ -3513,7 +3530,7 @@ static int __init efx_init_module(void)
 
 	printk(KERN_INFO "Solarflare NET driver v" EFX_DRIVER_VERSION "\n");
 
-	rc = register_netdevice_notifier(&efx_netdev_notifier);
+	rc = register_netdevice_notifier_rh(&efx_netdev_notifier);
 	if (rc)
 		goto err_notifier;
 
@@ -3542,7 +3559,7 @@ static int __init efx_init_module(void)
 	efx_fini_sriov();
  err_sriov:
 #endif
-	unregister_netdevice_notifier(&efx_netdev_notifier);
+	unregister_netdevice_notifier_rh(&efx_netdev_notifier);
  err_notifier:
 	return rc;
 }
@@ -3556,7 +3573,7 @@ static void __exit efx_exit_module(void)
 #ifdef CONFIG_SFC_SRIOV
 	efx_fini_sriov();
 #endif
-	unregister_netdevice_notifier(&efx_netdev_notifier);
+	unregister_netdevice_notifier_rh(&efx_netdev_notifier);
 
 }
 

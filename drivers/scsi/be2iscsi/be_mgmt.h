@@ -7,10 +7,10 @@
  * as published by the Free Software Foundation.  The full GNU General
  * Public License is included in this distribution in the file called COPYING.
  *
- * Written by: Jayamohan Kallickal (jayamohan.kallickal@emulex.com)
+ * Written by: Jayamohan Kallickal (jayamohan.kallickal@avagotech.com)
  *
  * Contact Information:
- * linux-drivers@emulex.com
+ * linux-drivers@avagotech.com
  *
  * Emulex
  * 3333 Susan Street
@@ -268,6 +268,8 @@ struct beiscsi_endpoint {
 
 int mgmt_get_fw_config(struct be_ctrl_info *ctrl,
 				 struct beiscsi_hba *phba);
+int mgmt_get_port_name(struct be_ctrl_info *ctrl,
+		       struct beiscsi_hba *phba);
 
 unsigned int mgmt_invalidate_connection(struct beiscsi_hba *phba,
 					 struct beiscsi_endpoint *beiscsi_ep,

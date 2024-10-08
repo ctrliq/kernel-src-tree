@@ -14,7 +14,9 @@
 
 #include <linux/err.h>
 #include <linux/list.h>
+#ifndef __GENKSYMS__
 #include <linux/seq_file.h>
+#endif
 #include <linux/pinctrl/pinctrl-state.h>
 
 /* This struct is private to the core and should be regarded as a cookie */
@@ -109,6 +111,21 @@ static inline struct pinctrl * __must_check devm_pinctrl_get(struct device *dev)
 
 static inline void devm_pinctrl_put(struct pinctrl *p)
 {
+}
+
+static inline int pinctrl_pm_select_default_state(struct device *dev)
+{
+	return 0;
+}
+
+static inline int pinctrl_pm_select_sleep_state(struct device *dev)
+{
+	return 0;
+}
+
+static inline int pinctrl_pm_select_idle_state(struct device *dev)
+{
+	return 0;
 }
 
 #endif /* CONFIG_PINCTRL */
@@ -214,21 +231,6 @@ static inline int pin_config_group_get(const char *dev_name,
 static inline int pin_config_group_set(const char *dev_name,
 				       const char *pin_group,
 				       unsigned long config)
-{
-	return 0;
-}
-
-static inline int pinctrl_pm_select_default_state(struct device *dev)
-{
-	return 0;
-}
-
-static inline int pinctrl_pm_select_sleep_state(struct device *dev)
-{
-	return 0;
-}
-
-static inline int pinctrl_pm_select_idle_state(struct device *dev)
 {
 	return 0;
 }

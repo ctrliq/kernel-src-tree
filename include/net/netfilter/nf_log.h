@@ -63,6 +63,7 @@ void nf_log_unbind_pf(struct net *net, u_int8_t pf);
 
 int nf_logger_find_get(int pf, enum nf_log_type type);
 void nf_logger_put(int pf, enum nf_log_type type);
+void nf_logger_request_module(int pf, enum nf_log_type type);
 
 #define MODULE_ALIAS_NF_LOGGER(family, type) \
 	MODULE_ALIAS("nf-logger-" __stringify(family) "-" __stringify(type))
@@ -77,6 +78,16 @@ void nf_log_packet(struct net *net,
 		   const struct net_device *out,
 		   const struct nf_loginfo *li,
 		   const char *fmt, ...);
+
+__printf(8, 9)
+void nf_log_trace(struct net *net,
+		  u_int8_t pf,
+		  unsigned int hooknum,
+		  const struct sk_buff *skb,
+		  const struct net_device *in,
+		  const struct net_device *out,
+		  const struct nf_loginfo *li,
+		  const char *fmt, ...);
 
 struct nf_log_buf;
 

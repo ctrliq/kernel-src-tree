@@ -261,8 +261,6 @@ struct ext_report_lun_entry {
 	u8 wwid[8];
 	u8 device_type;
 	u8 device_flags;
-#define NON_DISK_PHYS_DEV(x) ((x)[17] & 0x01)
-#define PHYS_IOACCEL(x) ((x)[17] & 0x08)
 	u8 lun_count; /* multi-lun device, how many luns */
 	u8 redundant_paths;
 	u32 ioaccel_handle; /* ioaccel1 only uses lower 16 bits */
@@ -289,6 +287,12 @@ struct SenseSubsystem_info {
 #define BMIC_FLASH_FIRMWARE 0xF7
 #define BMIC_SENSE_CONTROLLER_PARAMETERS 0x64
 #define BMIC_IDENTIFY_PHYSICAL_DEVICE 0x15
+#define BMIC_IDENTIFY_CONTROLLER 0x11
+#define BMIC_SET_DIAG_OPTIONS 0xF4
+#define BMIC_SENSE_DIAG_OPTIONS 0xF5
+#define HPSA_DIAG_OPTS_DISABLE_RLD_CACHING 0x80000000
+#define BMIC_SENSE_SUBSYSTEM_INFORMATION 0x66
+#define BMIC_SENSE_STORAGE_BOX_PARAMS 0x65
 
 /* Command List Structure */
 union SCSI3Addr {
@@ -685,6 +689,16 @@ struct hpsa_pci_info {
 	u32		board_id;
 };
 
+struct bmic_identify_controller {
+	u8	configured_logical_drive_count;	/* offset 0 */
+	u8	pad1[153];
+	__le16	extended_logical_unit_count;	/* offset 154 */
+	u8	pad2[136];
+	u8	controller_mode;	/* offset 292 */
+	u8	pad3[32];
+};
+
+
 struct bmic_identify_physical_device {
 	u8    scsi_bus;          /* SCSI Bus number on controller */
 	u8    scsi_id;           /* SCSI ID on this bus */
@@ -815,6 +829,31 @@ struct bmic_identify_physical_device {
 	__le32 misc_drive_flags;
 	__le16 dek_index;
 	u8     padding[112];
+};
+
+struct bmic_sense_subsystem_info {
+	u8	primary_slot_number;
+	u8	reserved[3];
+	u8	chasis_serial_number[32];
+	u8	primary_world_wide_id[8];
+	u8	primary_array_serial_number[32]; /* NULL terminated */
+	u8	primary_cache_serial_number[32]; /* NULL terminated */
+	u8	reserved_2[8];
+	u8	secondary_array_serial_number[32];
+	u8	secondary_cache_serial_number[32];
+	u8	pad[332];
+};
+
+struct bmic_sense_storage_box_params {
+	u8	reserved[36];
+	u8	inquiry_valid;
+	u8	reserved_1[68];
+	u8	phys_box_on_port;
+	u8	reserved_2[22];
+	u16	connection_info;
+	u8	reserver_3[84];
+	u8	phys_connector[2];
+	u8	reserved_4[296];
 };
 
 #pragma pack()

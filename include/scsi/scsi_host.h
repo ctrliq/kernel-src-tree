@@ -492,6 +492,9 @@ struct scsi_host_template {
 	/* temporary flag to disable blk-mq I/O path */
 	RH_KABI_EXTEND(unsigned disable_blk_mq:1)
 
+	/* flag to enable the use of host-wide tags */
+	RH_KABI_EXTEND(unsigned use_host_wide_tags:1)
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */
@@ -724,6 +727,11 @@ struct Scsi_Host {
 	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
 	RH_KABI_FILL_HOLE(unsigned no_scsi2_lun_in_cdb:1)
 
+	/* Host responded with short (<36 bytes) INQUIRY result */
+	RH_KABI_FILL_HOLE(unsigned short_inquiry:1)
+
+	RH_KABI_FILL_HOLE(unsigned use_cmd_list:1)
+
 	/*
 	 * Optional work queue to be utilized by the transport
 	 */
@@ -801,7 +809,14 @@ struct Scsi_Host {
 	RH_KABI_RESERVE_P(5)
 	RH_KABI_RESERVE_P(6)
 
-	unsigned int scsi_mq_reserved1;
+	/*
+	 * In scsi-mq mode, the number of hardware queues supported by the LLD.
+	 *
+	 * Note: it is assumed that each hardware queue has a queue depth of
+	 * can_queue. In other words, the total queue depth per host
+	 * is nr_hw_queues * can_queue.
+	 */
+	RH_KABI_REPLACE(unsigned int scsi_mq_reserved1, unsigned nr_hw_queues)
 	unsigned int scsi_mq_reserved2;
 	void *scsi_mq_reserved3;
 	void *scsi_mq_reserved4;

@@ -29,6 +29,7 @@
 #include "vnic_stats.h"
 #include "vnic_nic.h"
 #include "vnic_rss.h"
+#include "enic_res.h"
 #include <linux/irq.h>
 
 #define DRV_NAME		"enic"
@@ -191,6 +192,29 @@ struct enic {
 	u32 rx_copybreak;
 	struct vnic_gen_stats gen_stats;
 };
+
+static inline struct net_device *vnic_get_netdev(struct vnic_dev *vdev)
+{
+	struct enic *enic = vdev->priv;
+
+	return enic->netdev;
+}
+
+/* wrappers function for kernel log
+ */
+#define vdev_err(vdev, fmt, ...)					\
+	dev_err(&(vdev)->pdev->dev, fmt, ##__VA_ARGS__)
+#define vdev_warn(vdev, fmt, ...)					\
+	dev_warn(&(vdev)->pdev->dev, fmt, ##__VA_ARGS__)
+#define vdev_info(vdev, fmt, ...)					\
+	dev_info(&(vdev)->pdev->dev, fmt, ##__VA_ARGS__)
+
+#define vdev_neterr(vdev, fmt, ...)					\
+	netdev_err(vnic_get_netdev(vdev), fmt, ##__VA_ARGS__)
+#define vdev_netwarn(vdev, fmt, ...)					\
+	netdev_warn(vnic_get_netdev(vdev), fmt, ##__VA_ARGS__)
+#define vdev_netinfo(vdev, fmt, ...)					\
+	netdev_info(vnic_get_netdev(vdev), fmt, ##__VA_ARGS__)
 
 static inline struct device *enic_get_dev(struct enic *enic)
 {

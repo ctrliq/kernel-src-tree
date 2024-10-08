@@ -174,6 +174,9 @@ static int acpi_processor_hotadd_init(struct acpi_processor *pr)
 	acpi_status status;
 	int ret;
 
+	if (pr->phys_id == -1)
+		return -ENODEV;
+
 	status = acpi_evaluate_integer(pr->handle, "_STA", NULL, &sta);
 	if (ACPI_FAILURE(status) || !(sta & ACPI_STA_DEVICE_PRESENT))
 		return -ENODEV;
@@ -265,10 +268,8 @@ static int acpi_processor_get_info(struct acpi_device *device)
 	}
 
 	phys_id = acpi_get_phys_id(pr->handle, device_declaration, pr->acpi_id);
-	if (phys_id < 0) {
+	if (phys_id < 0)
 		acpi_handle_debug(pr->handle, "failed to get CPU physical ID.\n");
-		return -ENODEV;
-	}
 	pr->phys_id = phys_id;
 
 	cpu_index = acpi_map_cpuid(pr->phys_id, pr->acpi_id);

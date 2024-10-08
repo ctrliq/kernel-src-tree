@@ -67,8 +67,7 @@
 #include <linux/spinlock.h>		/* For spin_lock/spin_unlock/... */
 #include <linux/uaccess.h>		/* For copy_to_user/put_user/... */
 #include <linux/io.h>			/* For inb/outb/... */
-#include <linux/mfd/core.h>
-#include <linux/mfd/lpc_ich.h>
+#include <linux/platform_data/itco_wdt.h>
 
 #include "iTCO_vendor.h"
 
@@ -425,9 +424,9 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 {
 	int ret = -ENODEV;
 	unsigned long val32;
-	struct lpc_ich_info *ich_info = dev->dev.platform_data;
+	struct itco_wdt_platform_data *pdata = dev->dev.platform_data;
 
-	if (!ich_info)
+	if (!pdata)
 		goto out;
 
 	spin_lock_init(&iTCO_wdt_private.io_lock);
@@ -442,7 +441,7 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 	if (!iTCO_wdt_private.smi_res)
 		goto out;
 
-	iTCO_wdt_private.iTCO_version = ich_info->iTCO_version;
+	iTCO_wdt_private.iTCO_version = pdata->version;
 	iTCO_wdt_private.dev = dev;
 	iTCO_wdt_private.pdev = to_pci_dev(dev->dev.parent);
 
@@ -508,7 +507,7 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 	}
 
 	pr_info("Found a %s TCO device (Version=%d, TCOBASE=0x%04llx)\n",
-		ich_info->name, ich_info->iTCO_version, (u64)TCOBASE);
+		pdata->name, pdata->version, (u64)TCOBASE);
 
 	/* Clear out the (probably old) status */
 	switch (iTCO_wdt_private.iTCO_version) {
@@ -531,7 +530,7 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 	iTCO_wdt_watchdog_dev.bootstatus = 0;
 	iTCO_wdt_watchdog_dev.timeout = WATCHDOG_TIMEOUT;
 	watchdog_set_nowayout(&iTCO_wdt_watchdog_dev, nowayout);
-	iTCO_wdt_watchdog_dev.parent = dev->dev.parent;
+	iTCO_wdt_watchdog_dev.parent = &dev->dev;
 
 	/* Make sure the watchdog is not running */
 	iTCO_wdt_stop(&iTCO_wdt_watchdog_dev);

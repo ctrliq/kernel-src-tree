@@ -162,40 +162,6 @@ static const struct class_attribute class_attr_bonding_masters = {
 	.namespace = bonding_namespace,
 };
 
-int bond_create_slave_symlinks(struct net_device *master,
-			       struct net_device *slave)
-{
-	char linkname[IFNAMSIZ+7];
-	int ret = 0;
-
-	/* first, create a link from the slave back to the master */
-	ret = sysfs_create_link(&(slave->dev.kobj), &(master->dev.kobj),
-				"master");
-	if (ret)
-		return ret;
-	/* next, create a link from the master to the slave */
-	sprintf(linkname, "slave_%s", slave->name);
-	ret = sysfs_create_link(&(master->dev.kobj), &(slave->dev.kobj),
-				linkname);
-
-	/* free the master link created earlier in case of error */
-	if (ret)
-		sysfs_remove_link(&(slave->dev.kobj), "master");
-
-	return ret;
-
-}
-
-void bond_destroy_slave_symlinks(struct net_device *master,
-				 struct net_device *slave)
-{
-	char linkname[IFNAMSIZ+7];
-
-	sysfs_remove_link(&(slave->dev.kobj), "master");
-	sprintf(linkname, "slave_%s", slave->name);
-	sysfs_remove_link(&(master->dev.kobj), linkname);
-}
-
 /* Generic "store" method for bonding sysfs option setting */
 static ssize_t bonding_sysfs_store_option(struct device *d,
 					  struct device_attribute *attr,

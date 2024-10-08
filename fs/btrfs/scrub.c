@@ -66,7 +66,6 @@ struct scrub_ctx;
 struct scrub_recover {
 	atomic_t		refs;
 	struct btrfs_bio	*bbio;
-	u64			*raid_map;
 	u64			map_length;
 };
 
@@ -246,10 +245,7 @@ static void scrub_pending_bio_dec(struct scrub_ctx *sctx);
 static void scrub_pending_trans_workers_inc(struct scrub_ctx *sctx);
 static void scrub_pending_trans_workers_dec(struct scrub_ctx *sctx);
 static int scrub_handle_errored_block(struct scrub_block *sblock_to_check);
-static int scrub_setup_recheck_block(struct scrub_ctx *sctx,
-				     struct btrfs_fs_info *fs_info,
-				     struct scrub_block *original_sblock,
-				     u64 length, u64 logical,
+static int scrub_setup_recheck_block(struct scrub_block *original_sblock,
 				     struct scrub_block *sblocks_for_recheck);
 static void scrub_recheck_block(struct btrfs_fs_info *fs_info,
 				struct scrub_block *sblock,
@@ -592,9 +588,9 @@ static int scrub_print_warning_inode(u64 inum, u64 offset, u64 root,
 	 * hold all of the paths here
 	 */
 	for (i = 0; i < ipath->fspath->elem_cnt; ++i)
-		printk_in_rcu(KERN_WARNING "BTRFS: %s at logical %llu on dev "
+		btrfs_warn_in_rcu(fs_info, "%s at logical %llu on dev "
 			"%s, sector %llu, root %llu, inode %llu, offset %llu, "
-			"length %llu, links %u (path: %s)\n", swarn->errstr,
+			"length %llu, links %u (path: %s)", swarn->errstr,
 			swarn->logical, rcu_str_deref(swarn->dev->name),
 			(unsigned long long)swarn->sector, root, inum, offset,
 			min(isize - offset, (u64)PAGE_SIZE), nlink,
@@ -604,9 +600,9 @@ static int scrub_print_warning_inode(u64 inum, u64 offset, u64 root,
 	return 0;
 
 err:
-	printk_in_rcu(KERN_WARNING "BTRFS: %s at logical %llu on dev "
+	btrfs_warn_in_rcu(fs_info, "%s at logical %llu on dev "
 		"%s, sector %llu, root %llu, inode %llu, offset %llu: path "
-		"resolving failed with ret=%d\n", swarn->errstr,
+		"resolving failed with ret=%d", swarn->errstr,
 		swarn->logical, rcu_str_deref(swarn->dev->name),
 		(unsigned long long)swarn->sector, root, inum, offset, ret);
 
@@ -661,10 +657,10 @@ static void scrub_print_warning(const char *errstr, struct scrub_block *sblock)
 			ret = tree_backref_for_extent(&ptr, eb, &found_key, ei,
 						      item_size, &ref_root,
 						      &ref_level);
-			printk_in_rcu(KERN_WARNING
-				"BTRFS: %s at logical %llu on dev %s, "
+			btrfs_warn_in_rcu(fs_info,
+				"%s at logical %llu on dev %s, "
 				"sector %llu: metadata %s (level %d) in tree "
-				"%llu\n", errstr, swarn.logical,
+				"%llu", errstr, swarn.logical,
 				rcu_str_deref(dev->name),
 				(unsigned long long)swarn.sector,
 				ref_level ? "node" : "leaf",
@@ -881,8 +877,7 @@ static inline void scrub_get_recover(struct scrub_recover *recover)
 static inline void scrub_put_recover(struct scrub_recover *recover)
 {
 	if (atomic_dec_and_test(&recover->refs)) {
-		kfree(recover->bbio);
-		kfree(recover->raid_map);
+		btrfs_put_bbio(recover->bbio);
 		kfree(recover);
 	}
 }
@@ -983,8 +978,7 @@ static int scrub_handle_errored_block(struct scrub_block *sblock_to_check)
 	}
 
 	/* setup the context, map the logical blocks and alloc the pages */
-	ret = scrub_setup_recheck_block(sctx, fs_info, sblock_to_check, length,
-					logical, sblocks_for_recheck);
+	ret = scrub_setup_recheck_block(sblock_to_check, sblocks_for_recheck);
 	if (ret) {
 		spin_lock(&sctx->stat_lock);
 		sctx->stat.read_errors++;
@@ -1276,21 +1270,18 @@ out:
 	return 0;
 }
 
-static inline int scrub_nr_raid_mirrors(struct btrfs_bio *bbio, u64 *raid_map)
+static inline int scrub_nr_raid_mirrors(struct btrfs_bio *bbio)
 {
-	if (raid_map) {
-		int real_stripes = bbio->num_stripes - bbio->num_tgtdevs;
-
-		if (raid_map[real_stripes - 1] == RAID6_Q_STRIPE)
-			return 3;
-		else
-			return 2;
-	} else {
+	if (bbio->map_type & BTRFS_BLOCK_GROUP_RAID5)
+		return 2;
+	else if (bbio->map_type & BTRFS_BLOCK_GROUP_RAID6)
+		return 3;
+	else
 		return (int)bbio->num_stripes;
-	}
 }
 
-static inline void scrub_stripe_index_and_offset(u64 logical, u64 *raid_map,
+static inline void scrub_stripe_index_and_offset(u64 logical, u64 map_type,
+						 u64 *raid_map,
 						 u64 mapped_length,
 						 int nstripes, int mirror,
 						 int *stripe_index,
@@ -1298,7 +1289,7 @@ static inline void scrub_stripe_index_and_offset(u64 logical, u64 *raid_map,
 {
 	int i;
 
-	if (raid_map) {
+	if (map_type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 		/* RAID5/6 */
 		for (i = 0; i < nstripes; i++) {
 			if (raid_map[i] == RAID6_Q_STRIPE ||
@@ -1319,20 +1310,23 @@ static inline void scrub_stripe_index_and_offset(u64 logical, u64 *raid_map,
 	}
 }
 
-static int scrub_setup_recheck_block(struct scrub_ctx *sctx,
-				     struct btrfs_fs_info *fs_info,
-				     struct scrub_block *original_sblock,
-				     u64 length, u64 logical,
+static int scrub_setup_recheck_block(struct scrub_block *original_sblock,
 				     struct scrub_block *sblocks_for_recheck)
 {
+	struct scrub_ctx *sctx = original_sblock->sctx;
+	struct btrfs_fs_info *fs_info = sctx->dev_root->fs_info;
+	u64 length = original_sblock->page_count * PAGE_SIZE;
+	u64 logical = original_sblock->pagev[0]->logical;
+	u64 generation = original_sblock->pagev[0]->generation;
+	u64 flags = original_sblock->pagev[0]->flags;
+	u64 have_csum = original_sblock->pagev[0]->have_csum;
 	struct scrub_recover *recover;
 	struct btrfs_bio *bbio;
-	u64 *raid_map;
 	u64 sublen;
 	u64 mapped_length;
 	u64 stripe_offset;
 	int stripe_index;
-	int page_index;
+	int page_index = 0;
 	int mirror_index;
 	int nmirrors;
 	int ret;
@@ -1343,50 +1337,44 @@ static int scrub_setup_recheck_block(struct scrub_ctx *sctx,
 	 * the recheck procedure
 	 */
 
-	page_index = 0;
 	while (length > 0) {
 		sublen = min_t(u64, length, PAGE_SIZE);
 		mapped_length = sublen;
 		bbio = NULL;
-		raid_map = NULL;
 
 		/*
 		 * with a length of PAGE_SIZE, each returned stripe
 		 * represents one mirror
 		 */
 		ret = btrfs_map_sblock(fs_info, REQ_GET_READ_MIRRORS, logical,
-				       &mapped_length, &bbio, 0, &raid_map);
+				       &mapped_length, &bbio, 0, 1);
 		if (ret || !bbio || mapped_length < sublen) {
-			kfree(bbio);
-			kfree(raid_map);
+			btrfs_put_bbio(bbio);
 			return -EIO;
 		}
 
 		recover = kzalloc(sizeof(struct scrub_recover), GFP_NOFS);
 		if (!recover) {
-			kfree(bbio);
-			kfree(raid_map);
+			btrfs_put_bbio(bbio);
 			return -ENOMEM;
 		}
 
 		atomic_set(&recover->refs, 1);
 		recover->bbio = bbio;
-		recover->raid_map = raid_map;
 		recover->map_length = mapped_length;
 
 		BUG_ON(page_index >= SCRUB_PAGES_PER_RD_BIO);
 
-		nmirrors = scrub_nr_raid_mirrors(bbio, raid_map);
+		nmirrors = min(scrub_nr_raid_mirrors(bbio), BTRFS_MAX_MIRRORS);
+
 		for (mirror_index = 0; mirror_index < nmirrors;
 		     mirror_index++) {
 			struct scrub_block *sblock;
 			struct scrub_page *page;
 
-			if (mirror_index >= BTRFS_MAX_MIRRORS)
-				break;
-
 			sblock = sblocks_for_recheck + mirror_index;
 			sblock->sctx = sctx;
+
 			page = kzalloc(sizeof(*page), GFP_NOFS);
 			if (!page) {
 leave_nomem:
@@ -1398,9 +1386,19 @@ leave_nomem:
 			}
 			scrub_page_get(page);
 			sblock->pagev[page_index] = page;
+			page->sblock = sblock;
+			page->flags = flags;
+			page->generation = generation;
 			page->logical = logical;
+			page->have_csum = have_csum;
+			if (have_csum)
+				memcpy(page->csum,
+				       original_sblock->pagev[0]->csum,
+				       sctx->csum_size);
 
-			scrub_stripe_index_and_offset(logical, raid_map,
+			scrub_stripe_index_and_offset(logical,
+						      bbio->map_type,
+						      bbio->raid_map,
 						      mapped_length,
 						      bbio->num_stripes -
 						      bbio->num_tgtdevs,
@@ -1449,7 +1447,8 @@ static void scrub_bio_wait_endio(struct bio *bio, int error)
 
 static inline int scrub_is_page_on_raid56(struct scrub_page *page)
 {
-	return page->recover && page->recover->raid_map;
+	return page->recover &&
+	       (page->recover->bbio->map_type & BTRFS_BLOCK_GROUP_RAID56_MASK);
 }
 
 static int scrub_submit_raid56_bio_wait(struct btrfs_fs_info *fs_info,
@@ -1466,7 +1465,6 @@ static int scrub_submit_raid56_bio_wait(struct btrfs_fs_info *fs_info,
 	bio->bi_end_io = scrub_bio_wait_endio;
 
 	ret = raid56_parity_recover(fs_info->fs_root, bio, page->recover->bbio,
-				    page->recover->raid_map,
 				    page->recover->map_length,
 				    page->mirror_num, 0);
 	if (ret)
@@ -2220,7 +2218,7 @@ static void scrub_missing_raid56_pages(struct scrub_block *sblock)
 	if (!bio)
 		goto bbio_out;
 
-	bio->bi_iter.bi_sector = logical >> 9;
+	bio->bi_sector = logical >> 9;
 	bio->bi_private = sblock;
 	bio->bi_end_io = scrub_missing_raid56_end_io;
 
@@ -2398,7 +2396,7 @@ static inline void __scrub_mark_bitmap(struct scrub_parity *sparity,
 				       unsigned long *bitmap,
 				       u64 start, u64 len)
 {
-	int offset;
+	u32 offset;
 	int nsectors;
 	int sectorsize = sparity->sctx->dev_root->sectorsize;
 
@@ -2408,7 +2406,7 @@ static inline void __scrub_mark_bitmap(struct scrub_parity *sparity,
 	}
 
 	start -= sparity->logic_start;
-	offset = (int)do_div(start, sparity->stripe_len);
+	start = div_u64_rem(start, sparity->stripe_len, &offset);
 	offset /= sectorsize;
 	nsectors = (int)len / sectorsize;
 
@@ -2695,8 +2693,8 @@ static int get_raid56_logic_offset(u64 physical, int num,
 	int j = 0;
 	u64 stripe_nr;
 	u64 last_offset;
-	int stripe_index;
-	int rot;
+	u32 stripe_index;
+	u32 rot;
 
 	last_offset = (physical - map->stripes[num].physical) *
 		      nr_data_stripes(map);
@@ -2707,12 +2705,11 @@ static int get_raid56_logic_offset(u64 physical, int num,
 	for (i = 0; i < nr_data_stripes(map); i++) {
 		*offset = last_offset + i * map->stripe_len;
 
-		stripe_nr = *offset;
-		do_div(stripe_nr, map->stripe_len);
-		do_div(stripe_nr, nr_data_stripes(map));
+		stripe_nr = div_u64(*offset, map->stripe_len);
+		stripe_nr = div_u64(stripe_nr, nr_data_stripes(map));
 
 		/* Work out the disk rotation on this stripe-set */
-		rot = do_div(stripe_nr, map->num_stripes);
+		stripe_nr = div_u64_rem(stripe_nr, map->num_stripes, &rot);
 		/* calculate which stripe this data locates */
 		rot += i;
 		stripe_index = rot % map->num_stripes;
@@ -2780,7 +2777,6 @@ static void scrub_parity_check_and_repair(struct scrub_parity *sparity)
 	struct btrfs_raid_bio *rbio;
 	struct scrub_page *spage;
 	struct btrfs_bio *bbio = NULL;
-	u64 *raid_map = NULL;
 	u64 length;
 	int ret;
 
@@ -2788,11 +2784,11 @@ static void scrub_parity_check_and_repair(struct scrub_parity *sparity)
 			   sparity->nsectors))
 		goto out;
 
-	length = sparity->logic_end - sparity->logic_start + 1;
+	length = sparity->logic_end - sparity->logic_start;
 	ret = btrfs_map_sblock(sctx->dev_root->fs_info, WRITE,
 			       sparity->logic_start,
-			       &length, &bbio, 0, &raid_map);
-	if (ret || !bbio || !raid_map)
+			       &length, &bbio, 0, 1);
+	if (ret || !bbio || !bbio->raid_map)
 		goto bbio_out;
 
 	bio = btrfs_io_bio_alloc(GFP_NOFS, 0);
@@ -2804,8 +2800,7 @@ static void scrub_parity_check_and_repair(struct scrub_parity *sparity)
 	bio->bi_end_io = scrub_parity_bio_endio;
 
 	rbio = raid56_parity_alloc_scrub_rbio(sctx->dev_root, bio, bbio,
-					      raid_map, length,
-					      sparity->scrub_dev,
+					      length, sparity->scrub_dev,
 					      sparity->dbitmap,
 					      sparity->nsectors);
 	if (!rbio)
@@ -2821,8 +2816,7 @@ static void scrub_parity_check_and_repair(struct scrub_parity *sparity)
 rbio_out:
 	bio_put(bio);
 bbio_out:
-	kfree(bbio);
-	kfree(raid_map);
+	btrfs_put_bbio(bbio);
 	bitmap_or(sparity->ebitmap, sparity->ebitmap, sparity->dbitmap,
 		  sparity->nsectors);
 	spin_lock(&sctx->stat_lock);
@@ -2945,6 +2939,10 @@ static noinline_for_stack int scrub_raid56_parity(struct scrub_ctx *sctx,
 			}
 			btrfs_item_key_to_cpu(l, &key, slot);
 
+			if (key.type != BTRFS_EXTENT_ITEM_KEY &&
+			    key.type != BTRFS_METADATA_ITEM_KEY)
+				goto next;
+
 			if (key.type == BTRFS_METADATA_ITEM_KEY)
 				bytes = root->nodesize;
 			else
@@ -2953,11 +2951,7 @@ static noinline_for_stack int scrub_raid56_parity(struct scrub_ctx *sctx,
 			if (key.objectid + bytes <= logic_start)
 				goto next;
 
-			if (key.type != BTRFS_EXTENT_ITEM_KEY &&
-			    key.type != BTRFS_METADATA_ITEM_KEY)
-				goto next;
-
-			if (key.objectid > logic_end) {
+			if (key.objectid >= logic_end) {
 				stop_loop = 1;
 				break;
 			}
@@ -3061,7 +3055,7 @@ next:
 out:
 	if (ret < 0)
 		scrub_parity_mark_sectors_error(sparity, logic_start,
-						logic_end - logic_start + 1);
+						logic_end - logic_start);
 	scrub_parity_put(sparity);
 	scrub_submit(sctx);
 	mutex_lock(&sctx->wr_ctx.wr_lock);
@@ -3111,10 +3105,9 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 	int extent_mirror_num;
 	int stop_loop = 0;
 
-	nstripes = length;
 	physical = map->stripes[num].physical;
 	offset = 0;
-	do_div(nstripes, map->stripe_len);
+	nstripes = div_u64(length, map->stripe_len);
 	if (map->type & BTRFS_BLOCK_GROUP_RAID0) {
 		offset = map->stripe_len * num;
 		increment = map->stripe_len * map->num_stripes;
@@ -3130,8 +3123,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 	} else if (map->type & BTRFS_BLOCK_GROUP_DUP) {
 		increment = map->stripe_len;
 		mirror_num = num % map->num_stripes + 1;
-	} else if (map->type & (BTRFS_BLOCK_GROUP_RAID5 |
-				BTRFS_BLOCK_GROUP_RAID6)) {
+	} else if (map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 		get_raid56_logic_offset(physical, num, map, &offset, NULL);
 		increment = map->stripe_len * nr_data_stripes(map);
 		mirror_num = 1;
@@ -3167,8 +3159,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 	 */
 	logical = base + offset;
 	physical_end = physical + nstripes * map->stripe_len;
-	if (map->type & (BTRFS_BLOCK_GROUP_RAID5 |
-			 BTRFS_BLOCK_GROUP_RAID6)) {
+	if (map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 		get_raid56_logic_offset(physical_end, num,
 					map, &logic_end, NULL);
 		logic_end += base;
@@ -3213,23 +3204,6 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 	 */
 	ret = 0;
 	while (physical < physical_end) {
-		/* for raid56, we skip parity stripe */
-		if (map->type & (BTRFS_BLOCK_GROUP_RAID5 |
-				BTRFS_BLOCK_GROUP_RAID6)) {
-			ret = get_raid56_logic_offset(physical, num,
-					map, &logical, &stripe_logical);
-			logical += base;
-			if (ret) {
-				stripe_logical += base;
-				stripe_end = stripe_logical + increment - 1;
-				ret = scrub_raid56_parity(sctx, map, scrub_dev,
-						ppath, stripe_logical,
-						stripe_end);
-				if (ret)
-					goto out;
-				goto skip;
-			}
-		}
 		/*
 		 * canceled?
 		 */
@@ -3252,6 +3226,24 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 				   atomic_read(&sctx->bios_in_flight) == 0);
 			atomic_set(&sctx->wr_ctx.flush_all_writes, 0);
 			scrub_blocked_if_needed(fs_info);
+		}
+
+		if (map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
+			ret = get_raid56_logic_offset(physical, num, map,
+						      &logical,
+						      &stripe_logical);
+			logical += base;
+			if (ret) {
+				/* it is parity strip */
+				stripe_logical += base;
+				stripe_end = stripe_logical + increment;
+				ret = scrub_raid56_parity(sctx, map, scrub_dev,
+							  ppath, stripe_logical,
+							  stripe_end);
+				if (ret)
+					goto out;
+				goto skip;
+			}
 		}
 
 		if (btrfs_fs_incompat(fs_info, SKINNY_METADATA))
@@ -3298,16 +3290,16 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 			}
 			btrfs_item_key_to_cpu(l, &key, slot);
 
+			if (key.type != BTRFS_EXTENT_ITEM_KEY &&
+			    key.type != BTRFS_METADATA_ITEM_KEY)
+				goto next;
+
 			if (key.type == BTRFS_METADATA_ITEM_KEY)
 				bytes = root->nodesize;
 			else
 				bytes = key.offset;
 
 			if (key.objectid + bytes <= logical)
-				goto next;
-
-			if (key.type != BTRFS_EXTENT_ITEM_KEY &&
-			    key.type != BTRFS_METADATA_ITEM_KEY)
 				goto next;
 
 			if (key.objectid >= logical + map->stripe_len) {
@@ -3382,8 +3374,7 @@ again:
 
 			if (extent_logical + extent_len <
 			    key.objectid + bytes) {
-				if (map->type & (BTRFS_BLOCK_GROUP_RAID5 |
-					BTRFS_BLOCK_GROUP_RAID6)) {
+				if (map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
 					/*
 					 * loop until we find next data stripe
 					 * or we have finished all stripes.
@@ -3398,7 +3389,7 @@ loop:
 					if (ret && physical < physical_end) {
 						stripe_logical += base;
 						stripe_end = stripe_logical +
-								increment - 1;
+								increment;
 						ret = scrub_raid56_parity(sctx,
 							map, scrub_dev, ppath,
 							stripe_logical,
@@ -4052,14 +4043,14 @@ static void scrub_remap_extent(struct btrfs_fs_info *fs_info,
 			      &mapped_length, &bbio, 0);
 	if (ret || !bbio || mapped_length < extent_len ||
 	    !bbio->stripes[0].dev->bdev) {
-		kfree(bbio);
+		btrfs_put_bbio(bbio);
 		return;
 	}
 
 	*extent_physical = bbio->stripes[0].physical;
 	*extent_mirror_num = bbio->mirror_num;
 	*extent_dev = bbio->stripes[0].dev;
-	kfree(bbio);
+	btrfs_put_bbio(bbio);
 }
 
 static int scrub_setup_wr_ctx(struct scrub_ctx *sctx,

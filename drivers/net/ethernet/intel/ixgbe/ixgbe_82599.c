@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel 10 Gigabit PCI Express Linux driver
-  Copyright(c) 1999 - 2015 Intel Corporation.
+  Copyright(c) 1999 - 2016 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -1296,17 +1296,17 @@ s32 ixgbe_init_fdir_perfect_82599(struct ixgbe_hw *hw, u32 fdirctrl)
 #define IXGBE_COMPUTE_SIG_HASH_ITERATION(_n) \
 do { \
 	u32 n = (_n); \
-	if (IXGBE_ATR_COMMON_HASH_KEY & (0x01 << n)) \
+	if (IXGBE_ATR_COMMON_HASH_KEY & BIT(n)) \
 		common_hash ^= lo_hash_dword >> n; \
-	else if (IXGBE_ATR_BUCKET_HASH_KEY & (0x01 << n)) \
+	else if (IXGBE_ATR_BUCKET_HASH_KEY & BIT(n)) \
 		bucket_hash ^= lo_hash_dword >> n; \
-	else if (IXGBE_ATR_SIGNATURE_HASH_KEY & (0x01 << n)) \
+	else if (IXGBE_ATR_SIGNATURE_HASH_KEY & BIT(n)) \
 		sig_hash ^= lo_hash_dword << (16 - n); \
-	if (IXGBE_ATR_COMMON_HASH_KEY & (0x01 << (n + 16))) \
+	if (IXGBE_ATR_COMMON_HASH_KEY & BIT(n + 16)) \
 		common_hash ^= hi_hash_dword >> n; \
-	else if (IXGBE_ATR_BUCKET_HASH_KEY & (0x01 << (n + 16))) \
+	else if (IXGBE_ATR_BUCKET_HASH_KEY & BIT(n + 16)) \
 		bucket_hash ^= hi_hash_dword >> n; \
-	else if (IXGBE_ATR_SIGNATURE_HASH_KEY & (0x01 << (n + 16))) \
+	else if (IXGBE_ATR_SIGNATURE_HASH_KEY & BIT(n + 16)) \
 		sig_hash ^= hi_hash_dword << (16 - n); \
 } while (0)
 
@@ -1382,20 +1382,28 @@ static u32 ixgbe_atr_compute_sig_hash_82599(union ixgbe_atr_hash_dword input,
  *  @input: unique input dword
  *  @common: compressed common input dword
  *  @queue: queue index to direct traffic to
+ *
+ * Note that the tunnel bit in input must not be set when the hardware
+ * tunneling support does not exist.
  **/
 s32 ixgbe_fdir_add_signature_filter_82599(struct ixgbe_hw *hw,
 					  union ixgbe_atr_hash_dword input,
 					  union ixgbe_atr_hash_dword common,
 					  u8 queue)
 {
-	u64  fdirhashcmd;
-	u32  fdircmd;
+	u64 fdirhashcmd;
+	u8 flow_type;
+	bool tunnel;
+	u32 fdircmd;
 
 	/*
 	 * Get the flow_type in order to program FDIRCMD properly
 	 * lowest 2 bits are FDIRCMD.L4TYPE, third lowest bit is FDIRCMD.IPV6
 	 */
-	switch (input.formatted.flow_type) {
+	tunnel = !!(input.formatted.flow_type & IXGBE_ATR_L4TYPE_TUNNEL_MASK);
+	flow_type = input.formatted.flow_type &
+		    (IXGBE_ATR_L4TYPE_TUNNEL_MASK - 1);
+	switch (flow_type) {
 	case IXGBE_ATR_FLOW_TYPE_TCPV4:
 	case IXGBE_ATR_FLOW_TYPE_UDPV4:
 	case IXGBE_ATR_FLOW_TYPE_SCTPV4:
@@ -1411,8 +1419,10 @@ s32 ixgbe_fdir_add_signature_filter_82599(struct ixgbe_hw *hw,
 	/* configure FDIRCMD register */
 	fdircmd = IXGBE_FDIRCMD_CMD_ADD_FLOW | IXGBE_FDIRCMD_FILTER_UPDATE |
 		  IXGBE_FDIRCMD_LAST | IXGBE_FDIRCMD_QUEUE_EN;
-	fdircmd |= input.formatted.flow_type << IXGBE_FDIRCMD_FLOW_TYPE_SHIFT;
+	fdircmd |= (u32)flow_type << IXGBE_FDIRCMD_FLOW_TYPE_SHIFT;
 	fdircmd |= (u32)queue << IXGBE_FDIRCMD_RX_QUEUE_SHIFT;
+	if (tunnel)
+		fdircmd |= IXGBE_FDIRCMD_TUNNEL_FILTER;
 
 	/*
 	 * The lower 32-bits of fdirhashcmd is for FDIRHASH, the upper 32-bits
@@ -1430,9 +1440,9 @@ s32 ixgbe_fdir_add_signature_filter_82599(struct ixgbe_hw *hw,
 #define IXGBE_COMPUTE_BKT_HASH_ITERATION(_n) \
 do { \
 	u32 n = (_n); \
-	if (IXGBE_ATR_BUCKET_HASH_KEY & (0x01 << n)) \
+	if (IXGBE_ATR_BUCKET_HASH_KEY & BIT(n)) \
 		bucket_hash ^= lo_hash_dword >> n; \
-	if (IXGBE_ATR_BUCKET_HASH_KEY & (0x01 << (n + 16))) \
+	if (IXGBE_ATR_BUCKET_HASH_KEY & BIT(n + 16)) \
 		bucket_hash ^= hi_hash_dword >> n; \
 } while (0)
 
@@ -1623,6 +1633,7 @@ s32 ixgbe_fdir_set_input_mask_82599(struct ixgbe_hw *hw,
 	switch (hw->mac.type) {
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_x550em_a:
 		IXGBE_WRITE_REG(hw, IXGBE_FDIRSCTPM, ~fdirtcpm);
 		break;
 	default:
@@ -2171,7 +2182,7 @@ release_i2c_access:
 	return status;
 }
 
-static struct ixgbe_mac_operations mac_ops_82599 = {
+static const struct ixgbe_mac_operations mac_ops_82599 = {
 	.init_hw                = &ixgbe_init_hw_generic,
 	.reset_hw               = &ixgbe_reset_hw_82599,
 	.start_hw               = &ixgbe_start_hw_82599,
@@ -2227,7 +2238,7 @@ static struct ixgbe_mac_operations mac_ops_82599 = {
 	.disable_rx		= &ixgbe_disable_rx_generic,
 };
 
-static struct ixgbe_eeprom_operations eeprom_ops_82599 = {
+static const struct ixgbe_eeprom_operations eeprom_ops_82599 = {
 	.init_params		= &ixgbe_init_eeprom_params_generic,
 	.read			= &ixgbe_read_eeprom_82599,
 	.read_buffer		= &ixgbe_read_eeprom_buffer_82599,
@@ -2238,7 +2249,7 @@ static struct ixgbe_eeprom_operations eeprom_ops_82599 = {
 	.update_checksum	= &ixgbe_update_eeprom_checksum_generic,
 };
 
-static struct ixgbe_phy_operations phy_ops_82599 = {
+static const struct ixgbe_phy_operations phy_ops_82599 = {
 	.identify		= &ixgbe_identify_phy_82599,
 	.identify_sfp		= &ixgbe_identify_module_generic,
 	.init			= &ixgbe_init_phy_ops_82599,
@@ -2255,7 +2266,7 @@ static struct ixgbe_phy_operations phy_ops_82599 = {
 	.check_overtemp		= &ixgbe_tn_check_overtemp,
 };
 
-struct ixgbe_info ixgbe_82599_info = {
+const struct ixgbe_info ixgbe_82599_info = {
 	.mac                    = ixgbe_mac_82599EB,
 	.get_invariants         = &ixgbe_get_invariants_82599,
 	.mac_ops                = &mac_ops_82599,

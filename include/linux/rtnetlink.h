@@ -83,18 +83,21 @@ extern void __rtnl_unlock(void);
 extern int ndo_dflt_fdb_dump(struct sk_buff *skb,
 			     struct netlink_callback *cb,
 			     struct net_device *dev,
+			     struct net_device *filter_dev,
 			     int idx);
 extern int ndo_dflt_fdb_add(struct ndmsg *ndm,
 			    struct nlattr *tb[],
 			    struct net_device *dev,
 			    const unsigned char *addr,
-			     u16 flags);
+			    u16 vid,
+			    u16 flags);
 extern int ndo_dflt_fdb_del(struct ndmsg *ndm,
 			    struct nlattr *tb[],
 			    struct net_device *dev,
-			    const unsigned char *addr);
+			    const unsigned char *addr,
+			    u16 vid);
 
 extern int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 				   struct net_device *dev, u16 mode,
-				   u32 flags, u32 mask);
+				   u32 flags, u32 mask, int nlflags);
 #endif	/* __LINUX_RTNETLINK_H */

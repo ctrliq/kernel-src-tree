@@ -67,6 +67,8 @@
 #include <net/inet_common.h>
 #include <net/inet_ecn.h>
 
+#define MAX_SCTP_PORT_HASH_ENTRIES (64 * 1024)
+
 /* Global data structures. */
 struct sctp_globals sctp_globals __read_mostly;
 
@@ -153,7 +155,7 @@ static void sctp_v4_copy_addrlist(struct list_head *addrlist,
 
 	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next) {
 		/* Add the address to the local list.  */
-		addr = t_new(struct sctp_sockaddr_entry, GFP_ATOMIC);
+		addr = kzalloc(sizeof(*addr), GFP_ATOMIC);
 		if (addr) {
 			addr->a.v4.sin_family = AF_INET;
 			addr->a.v4.sin_port = 0;
@@ -245,6 +247,7 @@ static void sctp_v4_from_skb(union sctp_addr *addr, struct sk_buff *skb,
 	port = &addr->v4.sin_port;
 	addr->v4.sin_family = AF_INET;
 
+	/* Always called on head skb, so this is safe */
 	sh = sctp_hdr(skb);
 	if (is_saddr) {
 		*port  = sh->source;
@@ -374,7 +377,7 @@ static int sctp_v4_available(union sctp_addr *addr, struct sctp_sock *sp)
 	if (addr->v4.sin_addr.s_addr != htonl(INADDR_ANY) &&
 	   ret != RTN_LOCAL &&
 	   !sp->inet.freebind &&
-	   !sysctl_ip_nonlocal_bind)
+	   !net->ipv4_sysctl_ip_nonlocal_bind)
 		return 0;
 
 	if (ipv6_only_sock(sctp_opt2sk(sp)))
@@ -452,8 +455,8 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
 		fl4->fl4_sport = saddr->v4.sin_port;
 	}
 
-	SCTP_DEBUG_PRINTK("%s: DST:%pI4, SRC:%pI4 - ",
-			  __func__, &fl4->daddr, &fl4->saddr);
+	pr_debug("%s: dst:%pI4, src:%pI4 - ", __func__, &fl4->daddr,
+		 &fl4->saddr);
 
 	rt = ip_route_output_key(sock_net(sk), fl4);
 	if (!IS_ERR(rt))
@@ -539,10 +542,10 @@ out_unlock:
 out:
 	t->dst = dst;
 	if (dst)
-		SCTP_DEBUG_PRINTK("rt_dst:%pI4, rt_src:%pI4\n",
-				  &fl4->daddr, &fl4->saddr);
+		pr_debug("rt_dst:%pI4, rt_src:%pI4\n",
+			 &fl4->daddr, &fl4->saddr);
 	else
-		SCTP_DEBUG_PRINTK("NO ROUTE\n");
+		pr_debug("no route\n");
 }
 
 /* For v4, the source address is cached in the route entry(dst). So no need
@@ -630,9 +633,9 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
 	spin_lock_bh(&net->sctp.addr_wq_lock);
 
 	list_for_each_entry_safe(addrw, temp, &net->sctp.addr_waitq, list) {
-		SCTP_DEBUG_PRINTK_IPADDR("sctp_addrwq_timo_handler: the first ent in wq %p is ",
-		    " for cmd %d at entry %p\n", &net->sctp.addr_waitq, &addrw->a, addrw->state,
-		    addrw);
+		pr_debug("%s: the first ent in wq:%p is addr:%pISc for cmd:%d at "
+			 "entry:%p\n", __func__, &net->sctp.addr_waitq, &addrw->a.sa,
+			 addrw->state, addrw);
 
 #if IS_ENABLED(CONFIG_IPV6)
 		/* Now we send an ASCONF for each association */
@@ -649,8 +652,10 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
 			    addrw->state == SCTP_ADDR_NEW) {
 				unsigned long timeo_val;
 
-				SCTP_DEBUG_PRINTK("sctp_timo_handler: this is on DAD, trying %d sec later\n",
-				    SCTP_ADDRESS_TICK_DELAY);
+				pr_debug("%s: this is on DAD, trying %d sec "
+					 "later\n", __func__,
+					 SCTP_ADDRESS_TICK_DELAY);
+
 				timeo_val = jiffies;
 				timeo_val += msecs_to_jiffies(SCTP_ADDRESS_TICK_DELAY);
 				mod_timer(&net->sctp.addr_wq_timer, timeo_val);
@@ -665,10 +670,10 @@ static void sctp_addr_wq_timeout_handler(unsigned long arg)
 			/* ignore bound-specific endpoints */
 			if (!sctp_is_ep_boundall(sk))
 				continue;
-			sctp_bh_lock_sock(sk);
+			bh_lock_sock(sk);
 			if (sctp_asconf_mgmt(sp, addrw) < 0)
-				SCTP_DEBUG_PRINTK("sctp_addrwq_timo_handler: sctp_asconf_mgmt failed\n");
-			sctp_bh_unlock_sock(sk);
+				pr_debug("%s: sctp_asconf_mgmt failed\n", __func__);
+			bh_unlock_sock(sk);
 		}
 #if IS_ENABLED(CONFIG_IPV6)
 free_next:
@@ -733,9 +738,10 @@ void sctp_addr_wq_mgmt(struct net *net, struct sctp_sockaddr_entry *addr, int cm
 	addrw = sctp_addr_wq_lookup(net, addr);
 	if (addrw) {
 		if (addrw->state != cmd) {
-			SCTP_DEBUG_PRINTK_IPADDR("sctp_addr_wq_mgmt offsets existing entry for %d ",
-			    " in wq %p\n", addrw->state, &addrw->a,
-			    &net->sctp.addr_waitq);
+			pr_debug("%s: offsets existing entry for %d, addr:%pISc "
+				 "in wq:%p\n", __func__, addrw->state, &addrw->a.sa,
+				 &net->sctp.addr_waitq);
+
 			list_del(&addrw->list);
 			kfree(addrw);
 		}
@@ -751,8 +757,9 @@ void sctp_addr_wq_mgmt(struct net *net, struct sctp_sockaddr_entry *addr, int cm
 	}
 	addrw->state = cmd;
 	list_add_tail(&addrw->list, &net->sctp.addr_waitq);
-	SCTP_DEBUG_PRINTK_IPADDR("sctp_addr_wq_mgmt add new entry for cmd:%d ",
-	    " in wq %p\n", addrw->state, &addrw->a, &net->sctp.addr_waitq);
+
+	pr_debug("%s: add new entry for cmd:%d, addr:%pISc in wq:%p\n",
+		 __func__, addrw->state, &addrw->a.sa, &net->sctp.addr_waitq);
 
 	if (!timer_pending(&net->sctp.addr_wq_timer)) {
 		timeo_val = jiffies;
@@ -978,15 +985,14 @@ static inline int sctp_v4_xmit(struct sk_buff *skb,
 {
 	struct inet_sock *inet = inet_sk(skb->sk);
 
-	SCTP_DEBUG_PRINTK("%s: skb:%p, len:%d, src:%pI4, dst:%pI4\n",
-			  __func__, skb, skb->len,
-			  &transport->fl.u.ip4.saddr,
-			  &transport->fl.u.ip4.daddr);
+	pr_debug("%s: skb:%p, len:%d, src:%pI4, dst:%pI4\n", __func__, skb,
+		 skb->len, &transport->fl.u.ip4.saddr, &transport->fl.u.ip4.daddr);
 
 	inet->pmtudisc = transport->param_flags & SPP_PMTUD_ENABLE ?
 			 IP_PMTUDISC_DO : IP_PMTUDISC_DONT;
 
 	SCTP_INC_STATS(sock_net(&inet->sk), SCTP_MIB_OUTSCTPPACKS);
+
 	return ip_queue_xmit(skb, &transport->fl);
 }
 
@@ -1227,7 +1233,7 @@ static int __net_init sctp_defaults_init(struct net *net)
 	net->sctp.max_burst			= SCTP_DEFAULT_MAX_BURST;
 
 	/* Enable pf state by default */
-	net->sctp.pf_enable = 1;
+	net->sctp_pf_enable = 1;
 
 	/* Association.Max.Retrans  - 10 attempts
 	 * Path.Max.Retrans         - 5  attempts (per destination address)
@@ -1350,7 +1356,7 @@ static struct pernet_operations sctp_ctrlsock_ops = {
 };
 
 /* Initialize the universe into something sensible.  */
-SCTP_STATIC __init int sctp_init(void)
+static __init int sctp_init(void)
 {
 	int i;
 	int status = -EINVAL;
@@ -1358,10 +1364,11 @@ SCTP_STATIC __init int sctp_init(void)
 	unsigned long limit;
 	int max_share;
 	int order;
+	int num_entries;
+	int max_entry_order;
 
-	/* SCTP_DEBUG sanity check. */
-	if (!sctp_sanity_check())
-		goto out;
+	BUILD_BUG_ON(sizeof(struct sctp_ulpevent) >
+		     sizeof(((struct sk_buff *) 0)->cb));
 
 	/* Allocate bind_bucket and chunk caches. */
 	status = -ENOBUFS;
@@ -1412,32 +1419,24 @@ SCTP_STATIC __init int sctp_init(void)
 
 	/* Size and allocate the association hash table.
 	 * The methodology is similar to that of the tcp hash tables.
+	 * Though not identical.  Start by getting a goal size
 	 */
 	if (totalram_pages >= (128 * 1024))
 		goal = totalram_pages >> (22 - PAGE_SHIFT);
 	else
 		goal = totalram_pages >> (24 - PAGE_SHIFT);
 
-	for (order = 0; (1UL << order) < goal; order++)
-		;
+	/* Then compute the page order for said goal */
+	order = get_order(goal);
 
-	do {
-		sctp_assoc_hashsize = (1UL << order) * PAGE_SIZE /
-					sizeof(struct sctp_hashbucket);
-		if ((sctp_assoc_hashsize > (64 * 1024)) && order > 0)
-			continue;
-		sctp_assoc_hashtable = (struct sctp_hashbucket *)
-			__get_free_pages(GFP_KERNEL | __GFP_NOWARN, order);
-	} while (!sctp_assoc_hashtable && --order > 0);
-	if (!sctp_assoc_hashtable) {
-		pr_err("Failed association hash alloc\n");
-		status = -ENOMEM;
-		goto err_ahash_alloc;
-	}
-	for (i = 0; i < sctp_assoc_hashsize; i++) {
-		rwlock_init(&sctp_assoc_hashtable[i].lock);
-		INIT_HLIST_HEAD(&sctp_assoc_hashtable[i].chain);
-	}
+	/* Now compute the required page order for the maximum sized table we
+	 * want to create
+	 */
+	max_entry_order = get_order(MAX_SCTP_PORT_HASH_ENTRIES *
+				    sizeof(struct sctp_bind_hashbucket));
+
+	/* Limit the page order by that maximum hash table size */
+	order = min(order, max_entry_order);
 
 	/* Allocate and initialize the endpoint hash table.  */
 	sctp_ep_hashsize = 64;
@@ -1453,27 +1452,45 @@ SCTP_STATIC __init int sctp_init(void)
 		INIT_HLIST_HEAD(&sctp_ep_hashtable[i].chain);
 	}
 
-	/* Allocate and initialize the SCTP port hash table.  */
+	/* Allocate and initialize the SCTP port hash table.
+	 * Note that order is initalized to start at the max sized
+	 * table we want to support.  If we can't get that many pages
+	 * reduce the order and try again
+	 */
 	do {
-		sctp_port_hashsize = (1UL << order) * PAGE_SIZE /
-					sizeof(struct sctp_bind_hashbucket);
-		if ((sctp_port_hashsize > (64 * 1024)) && order > 0)
-			continue;
 		sctp_port_hashtable = (struct sctp_bind_hashbucket *)
 			__get_free_pages(GFP_KERNEL | __GFP_NOWARN, order);
 	} while (!sctp_port_hashtable && --order > 0);
+
 	if (!sctp_port_hashtable) {
 		pr_err("Failed bind hash alloc\n");
 		status = -ENOMEM;
 		goto err_bhash_alloc;
 	}
+
+	/* Now compute the number of entries that will fit in the
+	 * port hash space we allocated
+	 */
+	num_entries = (1UL << order) * PAGE_SIZE /
+		      sizeof(struct sctp_bind_hashbucket);
+
+	/* And finish by rounding it down to the nearest power of two
+	 * this wastes some memory of course, but its needed because
+	 * the hash function operates based on the assumption that
+	 * that the number of entries is a power of two
+	 */
+	sctp_port_hashsize = rounddown_pow_of_two(num_entries);
+
 	for (i = 0; i < sctp_port_hashsize; i++) {
 		spin_lock_init(&sctp_port_hashtable[i].lock);
 		INIT_HLIST_HEAD(&sctp_port_hashtable[i].chain);
 	}
 
-	pr_info("Hash tables configured (established %d bind %d)\n",
-		sctp_assoc_hashsize, sctp_port_hashsize);
+	if (sctp_transport_hashtable_init())
+		goto err_thash_alloc;
+
+	pr_info("Hash tables configured (bind %d/%d)\n", sctp_port_hashsize,
+		num_entries);
 
 	sctp_sysctl_register();
 
@@ -1506,6 +1523,9 @@ SCTP_STATIC __init int sctp_init(void)
 	if (status)
 		goto err_v6_add_protocol;
 
+	if (sctp_offload_init() < 0)
+		pr_crit("%s: Cannot add SCTP protocol offload\n", __func__);
+
 out:
 	return status;
 err_v6_add_protocol:
@@ -1526,12 +1546,10 @@ err_register_defaults:
 		   get_order(sctp_port_hashsize *
 			     sizeof(struct sctp_bind_hashbucket)));
 err_bhash_alloc:
+	sctp_transport_hashtable_destroy();
+err_thash_alloc:
 	kfree(sctp_ep_hashtable);
 err_ehash_alloc:
-	free_pages((unsigned long)sctp_assoc_hashtable,
-		   get_order(sctp_assoc_hashsize *
-			     sizeof(struct sctp_hashbucket)));
-err_ahash_alloc:
 	percpu_counter_destroy(&sctp_sockets_allocated);
 err_percpu_counter_init:
 	kmem_cache_destroy(sctp_chunk_cachep);
@@ -1541,7 +1559,7 @@ err_chunk_cachep:
 }
 
 /* Exit handler for the SCTP protocol.  */
-SCTP_STATIC __exit void sctp_exit(void)
+static __exit void sctp_exit(void)
 {
 	/* BUG.  This should probably do something useful like clean
 	 * up all the remaining associations and all that memory.
@@ -1565,13 +1583,11 @@ SCTP_STATIC __exit void sctp_exit(void)
 
 	sctp_sysctl_unregister();
 
-	free_pages((unsigned long)sctp_assoc_hashtable,
-		   get_order(sctp_assoc_hashsize *
-			     sizeof(struct sctp_hashbucket)));
-	kfree(sctp_ep_hashtable);
 	free_pages((unsigned long)sctp_port_hashtable,
 		   get_order(sctp_port_hashsize *
 			     sizeof(struct sctp_bind_hashbucket)));
+	kfree(sctp_ep_hashtable);
+	sctp_transport_hashtable_destroy();
 
 	percpu_counter_destroy(&sctp_sockets_allocated);
 

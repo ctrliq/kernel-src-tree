@@ -225,6 +225,17 @@ struct module_ref {
 	unsigned long decs;
 } __attribute((aligned(2 * sizeof(unsigned long))));
 
+/* extended module structure for RHEL */
+struct module_ext {
+	struct list_head next;
+	struct module *module; /* "parent" struct */
+	char *rhelversion;
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && defined(CONFIG_S390)
+	unsigned int num_ftrace_callsites;
+	unsigned long *ftrace_callsites;
+#endif
+};
+
 struct module
 {
 	enum module_state state;
@@ -355,7 +366,7 @@ struct module
 	struct ftrace_event_call **trace_events;
 	unsigned int num_trace_events;
 #endif
-#ifdef CONFIG_FTRACE_MCOUNT_RECORD
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && !defined(CONFIG_S390)
 	unsigned int num_ftrace_callsites;
 	unsigned long *ftrace_callsites;
 #endif
@@ -386,6 +397,7 @@ struct module
 #endif
 
 extern struct mutex module_mutex;
+extern struct mutex module_ext_mutex;
 
 /* FIXME: It'd be nice to isolate modules during init, too, so they
    aren't used before they (may) fail.  But presently too much code
@@ -415,6 +427,8 @@ static inline int within_module_init(unsigned long addr, const struct module *mo
 
 /* Search for module by name: must hold module_mutex. */
 struct module *find_module(const char *name);
+/* RHEL-only: find extended module struct associated with a module */
+struct module_ext *find_module_ext(struct module *mod);
 
 struct symsearch {
 	const struct kernel_symbol *start, *stop;

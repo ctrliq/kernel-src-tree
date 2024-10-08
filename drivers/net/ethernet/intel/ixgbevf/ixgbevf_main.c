@@ -56,7 +56,7 @@ const char ixgbevf_driver_name[] = "ixgbevf";
 static const char ixgbevf_driver_string[] =
 	"Intel(R) 10 Gigabit PCI Express Virtual Function Network Driver";
 
-#define DRV_VERSION "2.12.1-k-rh7.2"
+#define DRV_VERSION "2.12.1-k-rh7.3"
 const char ixgbevf_driver_version[] = DRV_VERSION;
 static char ixgbevf_copyright[] =
 	"Copyright (c) 2009 - 2015 Intel Corporation.";
@@ -758,7 +758,7 @@ static void ixgbevf_reuse_rx_page(struct ixgbevf_ring *rx_ring,
 
 static inline bool ixgbevf_page_is_reserved(struct page *page)
 {
-	return (page_to_nid(page) != numa_mem_id()) || page->pfmemalloc;
+	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
 }
 
 /**
@@ -845,7 +845,7 @@ add_tail_frag:
 	/* Even if we own the page, we are not allowed to use atomic_set()
 	 * This would break get_page_unless_zero() users.
 	 */
-	atomic_inc(&page->_count);
+	page_ref_inc(page);
 
 	return true;
 }
@@ -1018,7 +1018,7 @@ static int ixgbevf_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct ixgbevf_q_vector, napi);
 	struct ixgbevf_adapter *adapter = q_vector->adapter;
 	struct ixgbevf_ring *ring;
-	int per_ring_budget;
+	int per_ring_budget, work_done = 0;
 	bool clean_complete = true;
 
 	ixgbevf_for_each_ring(ring, q_vector->tx)
@@ -1039,10 +1039,12 @@ static int ixgbevf_poll(struct napi_struct *napi, int budget)
 	else
 		per_ring_budget = budget;
 
-	ixgbevf_for_each_ring(ring, q_vector->rx)
-		clean_complete &= (ixgbevf_clean_rx_irq(q_vector, ring,
-							per_ring_budget)
-				   < per_ring_budget);
+	ixgbevf_for_each_ring(ring, q_vector->rx) {
+		int cleaned = ixgbevf_clean_rx_irq(q_vector, ring,
+						   per_ring_budget);
+		work_done += cleaned;
+		clean_complete &= (cleaned < per_ring_budget);
+	}
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	ixgbevf_qv_unlock_napi(q_vector);
@@ -1052,8 +1054,8 @@ static int ixgbevf_poll(struct napi_struct *napi, int budget)
 	if (!clean_complete)
 		return budget;
 	/* all work done, exit the polling mode */
-	napi_complete(napi);
-	if (adapter->rx_itr_setting & 1)
+	napi_complete_done(napi, work_done);
+	if (adapter->rx_itr_setting == 1)
 		ixgbevf_set_itr(q_vector);
 	if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
 	    !test_bit(__IXGBEVF_REMOVING, &adapter->state))
@@ -1256,8 +1258,9 @@ static void ixgbevf_set_itr(struct ixgbevf_q_vector *q_vector)
 		new_itr = IXGBE_20K_ITR;
 		break;
 	case bulk_latency:
-	default:
 		new_itr = IXGBE_12K_ITR;
+		break;
+	default:
 		break;
 	}
 
@@ -2488,9 +2491,6 @@ static int ixgbevf_alloc_q_vectors(struct ixgbevf_adapter *adapter)
 		q_vector->v_idx = q_idx;
 		netif_napi_add(adapter->netdev, &q_vector->napi,
 			       ixgbevf_poll, 64);
-#ifdef CONFIG_NET_RX_BUSY_POLL
-		napi_hash_add(&q_vector->napi);
-#endif
 		adapter->q_vector[q_idx] = q_vector;
 	}
 

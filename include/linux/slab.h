@@ -142,30 +142,8 @@ size_t ksize(const void *);
 #define ARCH_KMALLOC_MINALIGN ARCH_DMA_MINALIGN
 #define KMALLOC_MIN_SIZE ARCH_DMA_MINALIGN
 #define KMALLOC_SHIFT_LOW ilog2(ARCH_DMA_MINALIGN)
-/*
- * The KMALLOC_LOOP_LOW is the definition for the for loop index start number
- * to create the kmalloc_caches object in create_kmalloc_caches(). The first
- * and the second are 96 and 192. You can see that in the kmalloc_index(), if
- * the KMALLOC_MIN_SIZE <= 32, then return 1 (96). If KMALLOC_MIN_SIZE <= 64,
- * then return 2 (192). If the KMALLOC_MIN_SIZE is bigger than 64, we don't
- * need to initialize 96 and 192. Go directly to start the KMALLOC_SHIFT_LOW.
- */
-#if KMALLOC_MIN_SIZE <= 32
-#define KMALLOC_LOOP_LOW 1
-#elif KMALLOC_MIN_SIZE <= 64
-#define KMALLOC_LOOP_LOW 2
-#else
-#define KMALLOC_LOOP_LOW KMALLOC_SHIFT_LOW
-#endif
-
 #else
 #define ARCH_KMALLOC_MINALIGN __alignof__(unsigned long long)
-/*
- * The KMALLOC_MIN_SIZE of slub/slab/slob is 2^3/2^5/2^3. So, even slab is used.
- * The KMALLOC_MIN_SIZE <= 32. The kmalloc-96 and kmalloc-192 should also be
- * initialized.
- */
-#define KMALLOC_LOOP_LOW 1
 #endif
 
 #ifdef CONFIG_SLOB
@@ -445,6 +423,16 @@ static inline void *kcalloc(size_t n, size_t size, gfp_t flags)
 {
 	return kmalloc_array(n, size, flags | __GFP_ZERO);
 }
+
+/*
+ * Bulk allocation and freeing operations. These are accellerated in an
+ * allocator specific way to avoid taking locks repeatedly or building
+ * metadata structures unnecessarily.
+ *
+ * Note that interrupts must be enabled when calling these functions.
+ */
+void kmem_cache_free_bulk(struct kmem_cache *, size_t, void **);
+int kmem_cache_alloc_bulk(struct kmem_cache *, gfp_t, size_t, void **);
 
 #if !defined(CONFIG_NUMA) && !defined(CONFIG_SLOB)
 /**

@@ -51,6 +51,8 @@
 #include <linux/netdev_features.h>
 #include <linux/neighbour.h>
 #include <uapi/linux/netdevice.h>
+#include <uapi/linux/if_bonding.h>
+#include <uapi/linux/pkt_cls.h>
 
 #include <linux/rh_kabi.h>
 
@@ -59,6 +61,8 @@ struct device;
 struct phy_device;
 /* 802.11 specific */
 struct wireless_dev;
+/* 802.15.4 specific */
+struct wpan_dev;
 					/* source back-compat hooks */
 #define SET_ETHTOOL_OPS(netdev,ops) \
 	( (netdev)->ethtool_ops = (ops) )
@@ -344,6 +348,7 @@ enum {
 	NAPI_STATE_NPSVC,	/* Netpoll - don't dequeue from poll_list */
 	NAPI_STATE_HASHED,	/* In NAPI hash */
 	NAPI_STATE_EXT,		/* Extended napi_struct */
+	NAPI_STATE_NO_BUSY_POLL,/* Do not add in napi_hash, no busy polling */
 };
 
 enum gro_result {
@@ -487,6 +492,9 @@ void napi_complete(struct napi_struct *n);
  *	@napi: napi context
  *
  * generate a new napi_id and store a @napi under it in napi_hash
+ * Used for busy polling (CONFIG_NET_RX_BUSY_POLL)
+ * Note: This is normally automatically done from netif_napi_add(),
+ * so might disappear in a future linux version.
  */
 void napi_hash_add(struct napi_struct *napi);
 
@@ -497,6 +505,10 @@ void napi_hash_add(struct napi_struct *napi);
  * Warning: caller must observe rcu grace period
  * before freeing memory containing @napi, if
  * this function returns true.
+ * Note: core networking stack automatically calls it
+ * from netif_napi_del()
+ * Drivers might want to call this helper to combine all
+ * the needed rcu grace periods into a single one.
  */
 bool napi_hash_del(struct napi_struct *napi);
 
@@ -580,6 +592,10 @@ struct netdev_queue {
 #if defined(CONFIG_XPS) && defined(CONFIG_NUMA)
 	int			numa_node;
 #endif
+	/* There is a hole that can be used for additional struct members
+	 * without kABI breakage.
+	 * There are 36 bytes available on all supported platforms.
+	 */
 /*
  * write mostly part
  */
@@ -598,6 +614,12 @@ struct netdev_queue {
 
 	unsigned long		state;
 
+	/* There is a hole that can be used for additional struct members
+	 * without kABI breakage.
+	 * There are 32 bytes available on all supported platforms.
+	 */
+	RH_KABI_FILL_HOLE(unsigned long	tx_maxrate)	/* 8 bytes */
+	/* 24 bytes remaining */
 #ifdef CONFIG_BQL
 	struct dql		dql;
 #endif
@@ -756,13 +778,88 @@ struct netdev_fcoe_hbainfo {
 #endif
 
 #define MAX_PHYS_PORT_ID_LEN 32
+#define MAX_PHYS_ITEM_ID_LEN MAX_PHYS_PORT_ID_LEN
 
-/* This structure holds a unique identifier to identify the
- * physical port used by a netdevice.
+/* This structure holds a unique identifier to identify some
+ * physical item (port for example) used by a netdevice.
  */
 struct netdev_phys_port_id {
-	unsigned char id[MAX_PHYS_PORT_ID_LEN];
+	unsigned char id[MAX_PHYS_ITEM_ID_LEN];
 	unsigned char id_len;
+};
+#define netdev_phys_item_id netdev_phys_port_id
+
+typedef u16 (*select_queue_fallback_t)(struct net_device *dev,
+				       struct sk_buff *skb);
+
+/* This structure holds attributes of qdisc and classifiers
+ * that are being passed to the netdevice through the setup_tc op.
+ */
+enum {
+	TC_SETUP_MQPRIO,
+};
+
+struct tc_to_netdev {
+	unsigned int type;
+	union {
+		u8 tc;
+	};
+};
+
+
+/* This structure defines the management hooks for network devices.
+ * It is an extension of net_device_ops. Drivers that want to use any of the
+ * fields defined here must initialize net_device_ops->ndo_size to
+ * sizeof(struct net_device_ops).
+ *
+ * void* (*ndo_dfwd_add_station)(struct net_device *pdev,
+ *				 struct net_device *dev)
+ *	Called by upper layer devices to accelerate switching or other
+ *	station functionality into hardware. 'pdev is the lowerdev
+ *	to use for the offload and 'dev' is the net device that will
+ *	back the offload. Returns a pointer to the private structure
+ *	the upper layer will maintain.
+ * void (*ndo_dfwd_del_station)(struct net_device *pdev, void *priv)
+ *	Called by upper layer device to delete the station created
+ *	by 'ndo_dfwd_add_station'. 'pdev' is the net device backing
+ *	the station and priv is the structure returned by the add
+ *	operation.
+ * int (*ndo_set_tx_maxrate)(struct net_device *dev,
+ *			     int queue_index, u32 maxrate);
+ *	Called when a user wants to set a max-rate limitation of specific
+ *	TX queue.
+ * void (*ndo_set_rx_headroom)(struct net_device *dev, int needed_headroom);
+ *	This function is used to specify the headroom that the skb must
+ *	consider when allocation skb during packet reception. Setting
+ *	appropriate rx headroom value allows avoiding skb head copy on
+ *	forward. Setting a negative value reset the rx headroom to the
+ *	default value.
+ * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
+ *		       struct net_device *dev, struct net_device *filter_dev,
+ *		       int idx)
+ *	Used to add FDB entries to dump requests. Implementers should add
+ *	entries to skb and update idx with the number of entries.
+ */
+struct net_device_ops_extended {
+	int			(*ndo_set_vf_trust)(struct net_device *dev,
+						    int vf, bool setting);
+	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+							struct net_device *dev);
+	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+							void *priv);
+	int			(*ndo_set_tx_maxrate)(struct net_device *dev,
+						      int queue_index,
+						      u32 maxrate);
+	void			(*ndo_set_rx_headroom)(struct net_device *dev,
+						       int needed_headroom);
+	int			(*ndo_set_vf_guid)(struct net_device *dev,
+						   int vf, u64 guid,
+						   int guid_type);
+	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+						struct netlink_callback *cb,
+						struct net_device *dev,
+						struct net_device *filter_dev,
+						int idx);
 };
 
 /*
@@ -795,7 +892,8 @@ struct netdev_phys_port_id {
  *        (can also return NETDEV_TX_LOCKED iff NETIF_F_LLTX)
  *	Required can not be NULL.
  *
- * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb);
+ * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb,
+ *                         void *accel_priv, select_queue_fallback_t fallback);
  *	Called to decide which queue to when device supports multiple
  *	transmit queues.
  *
@@ -862,8 +960,10 @@ struct netdev_phys_port_id {
  *	SR-IOV management functions.
  * int (*ndo_set_vf_mac)(struct net_device *dev, int vf, u8* mac);
  * int (*ndo_set_vf_vlan)(struct net_device *dev, int vf, u16 vlan, u8 qos);
- * int (*ndo_set_vf_tx_rate)(struct net_device *dev, int vf, int rate);
+ * int (*ndo_set_vf_rate)(struct net_device *dev, int vf, int min_tx_rate,
+ *			  int max_tx_rate);
  * int (*ndo_set_vf_spoofchk)(struct net_device *dev, int vf, bool setting);
+ * int (*ndo_set_vf_trust)(struct net_device *dev, int vf, bool setting);
  * int (*ndo_get_vf_config)(struct net_device *dev,
  *			    int vf, struct ifla_vf_info *ivf);
  * int (*ndo_set_vf_link_state)(struct net_device *dev, int vf, int link_state);
@@ -952,21 +1052,17 @@ struct netdev_phys_port_id {
  *
  * int (*ndo_fdb_add)(struct ndmsg *ndm, struct nlattr *tb[],
  *		      struct net_device *dev,
- *		      const unsigned char *addr, u16 flags)
+ *		      const unsigned char *addr, u16 vid, u16 flags)
  *	Adds an FDB entry to dev for addr.
  * int (*ndo_fdb_del)(struct ndmsg *ndm, struct nlattr *tb[],
  *		      struct net_device *dev,
- *		      const unsigned char *addr)
+ *		      const unsigned char *addr, u16 vid)
  *	Deletes the FDB entry from dev coresponding to addr.
- * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
- *		       struct net_device *dev, int idx)
- *	Used to add FDB entries to dump requests. Implementers should add
- *	entries to skb and update idx with the number of entries.
- *
  * int (*ndo_bridge_setlink)(struct net_device *dev, struct nlmsghdr *nlh,
  *			     u16 flags)
  * int (*ndo_bridge_getlink)(struct sk_buff *skb, u32 pid, u32 seq,
- *			     struct net_device *dev, u32 filter_mask)
+ *			     struct net_device *dev, u32 filter_mask,
+ *			     int nlflags)
  * int (*ndo_bridge_dellink)(struct net_device *dev, struct nlmsghdr *nlh,
  *			     u16 flags);
  *
@@ -979,7 +1075,7 @@ struct netdev_phys_port_id {
  *	USB_CDC_NOTIFY_NETWORK_CONNECTION) should NOT implement this function.
  *
  * int (*ndo_get_phys_port_id)(struct net_device *dev,
- *			       struct netdev_phys_port_id *ppid);
+ *			       struct netdev_phys_item_id *ppid);
  *	Called to get ID of physical port of this device. If driver does
  *	not implement this, it is assumed that the hw is not able to have
  *	multiple net devices on single physical port.
@@ -990,6 +1086,19 @@ struct netdev_phys_port_id {
  *	address family that vxlan is listnening to. It is called only when
  *	a new port starts listening. The operation is protected by the
  *	vxlan_net->sock_lock.
+ *
+ * void (*ndo_add_geneve_port)(struct net_device *dev,
+ *			      sa_family_t sa_family, __be16 port);
+ *	Called by geneve to notify a driver about the UDP port and socket
+ *	address family that geneve is listnening to. It is called only when
+ *	a new port starts listening. The operation is protected by the
+ *	geneve_net->sock_lock.
+ *
+ * void (*ndo_del_geneve_port)(struct net_device *dev,
+ *			      sa_family_t sa_family, __be16 port);
+ *	Called by geneve to notify the driver about a UDP port and socket
+ *	address family that geneve is not listening to anymore. The operation
+ *	is protected by the geneve_net->sock_lock.
  *
  * void (*ndo_del_vxlan_port)(struct  net_device *dev,
  *			      sa_family_t sa_family, __be16 port);
@@ -1009,9 +1118,11 @@ struct netdev_phys_port_id {
  *	be otherwise expressed by feature flags. The check is called with
  *	the set of features that the stack has calculated and it returns
  *	those the driver believes to be appropriate.
+ * int (*ndo_fill_metadata_dst)(struct net_device *dev, struct sk_buff *skb);
+ *	This function is used to get egress tunnel information for given skb.
+ *	This is useful for retrieving outer tunnel header parameters while
+ *	sampling packet.
  *
- * int (*ndo_set_vf_rate)(struct net_device *dev, int vf, int min_tx_rate,
- *			  int max_tx_rate);
  */
 struct net_device_ops {
 	int			(*ndo_init)(struct net_device *dev);
@@ -1020,8 +1131,12 @@ struct net_device_ops {
 	int			(*ndo_stop)(struct net_device *dev);
 	netdev_tx_t		(*ndo_start_xmit) (struct sk_buff *skb,
 						   struct net_device *dev);
-	u16			(*ndo_select_queue)(struct net_device *dev,
-						    struct sk_buff *skb);
+	RH_KABI_REPLACE(u16	(*ndo_select_queue)(struct net_device *dev,
+						    struct sk_buff *skb),
+			u16	(*ndo_select_queue)(struct net_device *dev,
+						    struct sk_buff *skb,
+						    void *accel_priv,
+						    select_queue_fallback_t fallback))
 	void			(*ndo_change_rx_flags)(struct net_device *dev,
 						       int flags);
 	void			(*ndo_set_rx_mode)(struct net_device *dev);
@@ -1074,7 +1189,9 @@ struct net_device_ops {
 						   struct nlattr *port[]);
 	int			(*ndo_get_vf_port)(struct net_device *dev,
 						   int vf, struct sk_buff *skb);
-	int			(*ndo_setup_tc)(struct net_device *dev, u8 tc);
+	RH_KABI_RENAME(int	(*ndo_setup_tc),
+		       int	(*ndo_setup_tc_rh72))(struct net_device *dev,
+						      u8 tc);
 #if IS_ENABLED(CONFIG_FCOE)
 	int			(*ndo_fcoe_enable)(struct net_device *dev);
 	int			(*ndo_fcoe_disable)(struct net_device *dev);
@@ -1116,32 +1233,50 @@ struct net_device_ops {
 	int			(*ndo_neigh_construct)(struct neighbour *n);
 	void			(*ndo_neigh_destroy)(struct neighbour *n);
 
-	int			(*ndo_fdb_add)(struct ndmsg *ndm,
+	RH_KABI_RENAME(int	(*ndo_fdb_add),
+		       int	(*ndo_fdb_add_rh72))(struct ndmsg *ndm,
 					       struct nlattr *tb[],
 					       struct net_device *dev,
 					       const unsigned char *addr,
 					       u16 flags);
-	int			(*ndo_fdb_del)(struct ndmsg *ndm,
+	RH_KABI_REPLACE(int	(*ndo_fdb_del)(struct ndmsg *ndm,
 					       struct nlattr *tb[],
 					       struct net_device *dev,
-					       const unsigned char *addr);
-	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+					       const unsigned char *addr),
+			int	(*ndo_fdb_del)(struct ndmsg *ndm,
+					       struct nlattr *tb[],
+					       struct net_device *dev,
+					       const unsigned char *addr,
+					       u16 vid))
+	RH_KABI_RENAME(int	(*ndo_fdb_dump),
+		       int	(*ndo_fdb_dump_rh72))(struct sk_buff *skb,
 						struct netlink_callback *cb,
 						struct net_device *dev,
 						int idx);
 
-	int			(*ndo_bridge_setlink)(struct net_device *dev,
-						      struct nlmsghdr *nlh);
-	int			(*ndo_bridge_getlink)(struct sk_buff *skb,
+	RH_KABI_REPLACE(int	(*ndo_bridge_setlink)(struct net_device *dev,
+						      struct nlmsghdr *nlh),
+			int	(*ndo_bridge_setlink)(struct net_device *dev,
+						      struct nlmsghdr *nlh,
+						      u16 flags))
+	RH_KABI_REPLACE(int	(*ndo_bridge_getlink)(struct sk_buff *skb,
 						      u32 pid, u32 seq,
 						      struct net_device *dev,
-						      u32 filter_mask);
-	int			(*ndo_bridge_dellink)(struct net_device *dev,
-						      struct nlmsghdr *nlh);
+						      u32 filter_mask),
+			int	(*ndo_bridge_getlink)(struct sk_buff *skb,
+						      u32 pid, u32 seq,
+						      struct net_device *dev,
+						      u32 filter_mask,
+						      int nlflags))
+	RH_KABI_REPLACE(int	(*ndo_bridge_dellink)(struct net_device *dev,
+						      struct nlmsghdr *nlh),
+			int	(*ndo_bridge_dellink)(struct net_device *dev,
+						      struct nlmsghdr *nlh,
+						      u16 flags))
 	int			(*ndo_change_carrier)(struct net_device *dev,
 						      bool new_carrier);
 	int			(*ndo_get_phys_port_id)(struct net_device *dev,
-							struct netdev_phys_port_id *ppid);
+							struct netdev_phys_item_id *ppid);
 	void			(*ndo_add_vxlan_port)(struct  net_device *dev,
 						      sa_family_t sa_family,
 						      __be16 port);
@@ -1171,18 +1306,47 @@ struct net_device_ops {
 	RH_KABI_USE_P(5, int    (*ndo_set_vf_rss_query_en)(struct net_device *dev,
 							   int vf, bool setting))
 
-	RH_KABI_RESERVE_P(6)
-	RH_KABI_RESERVE_P(7)
-	RH_KABI_RESERVE_P(8)
-	RH_KABI_RESERVE_P(9)
-	RH_KABI_RESERVE_P(10)
+	RH_KABI_USE_P(6, int	(*ndo_fdb_add)(struct ndmsg *ndm,
+					       struct nlattr *tb[],
+					       struct net_device *dev,
+					       const unsigned char *addr,
+					       u16 vid,
+					       u16 flags))
+	RH_KABI_USE_P(7,int	(*ndo_setup_tc)(struct net_device *dev,
+						u32 handle,
+						__be16 protocol,
+						struct tc_to_netdev *tc))
+	RH_KABI_USE_P(8, int	(*ndo_fill_metadata_dst)(struct net_device *dev,
+						       struct sk_buff *skb))
+	RH_KABI_USE_P(9, void	(*ndo_add_geneve_port)(struct  net_device *dev,
+						       sa_family_t sa_family,
+						       __be16 port))
+	RH_KABI_USE_P(10, void	(*ndo_del_geneve_port)(struct  net_device *dev,
+						       sa_family_t sa_family,
+						       __be16 port))
 	RH_KABI_RESERVE_P(11)
 	RH_KABI_RESERVE_P(12)
 	RH_KABI_RESERVE_P(13)
 	RH_KABI_RESERVE_P(14)
 	RH_KABI_RESERVE_P(15)
-	RH_KABI_RESERVE_P(16)
+	RH_KABI_USE_P(16, size_t ndo_size)
+	/* RHEL: put all new non-performance critical ndo's into
+	 * net_device_ops_extended. The reserved slots above can be used
+	 * only for performance critical operations.
+	 * Drivers may access the extended fields directly from
+	 * net_device_ops, if they allocated the net_device_ops structure
+	 * themselves (usually statically). The kernel core and drivers
+	 * using others' net_device_ops must access the extended fields
+	 * using the get_ndo_ext macro.
+	 */
+	RH_KABI_EXTEND(struct net_device_ops_extended extended)
 };
+
+#define get_ndo_ext(ops, field)		({				\
+	const struct net_device_ops *__ops = (ops);			\
+	size_t __off = offsetof(struct net_device_ops, extended.field);	\
+	__ops->ndo_size > __off ? __ops->extended.field : NULL;		\
+	})
 
 /**
  * enum net_device_priv_flags - &struct net_device priv_flags
@@ -1218,6 +1382,12 @@ struct net_device_ops {
  * @IFF_LIVE_ADDR_CHANGE: device supports hardware address
  *	change when it's running
  * @IFF_MACVLAN: Macvlan device
+ * @IFF_NO_QUEUE: device can run without qdisc attached
+ * @IFF_OPENVSWITCH: device is a Open vSwitch master
+ * @IFF_RXFH_CONFIGURED: device has had Rx Flow indirection table configured
+ * @IFF_PHONY_HEADROOM: the headroom value is controlled by an external
+ *	entity (i.e. the master device for bridged veth)
+ * @IFF_MACSEC: device is a MACsec device
  */
 enum netdev_priv_flags {
 	IFF_802_1Q_VLAN			= 1<<0,
@@ -1243,6 +1413,11 @@ enum netdev_priv_flags {
 	IFF_LIVE_ADDR_CHANGE		= 1<<20,
 	IFF_MACVLAN			= 1<<21,
 	IFF_XMIT_DST_RELEASE_PERM	= 1<<22,
+	IFF_OPENVSWITCH			= 1<<23,
+	IFF_RXFH_CONFIGURED		= 1<<25,
+	IFF_NO_QUEUE			= 1<<26,
+	IFF_PHONY_HEADROOM		= 1<<27,
+	IFF_MACSEC			= 1<<28,
 };
 
 #define IFF_802_1Q_VLAN			IFF_802_1Q_VLAN
@@ -1268,6 +1443,10 @@ enum netdev_priv_flags {
 #define IFF_LIVE_ADDR_CHANGE		IFF_LIVE_ADDR_CHANGE
 #define IFF_MACVLAN			IFF_MACVLAN
 #define IFF_XMIT_DST_RELEASE_PERM	IFF_XMIT_DST_RELEASE_PERM
+#define IFF_NO_QUEUE			IFF_NO_QUEUE
+#define IFF_OPENVSWITCH			IFF_OPENVSWITCH
+#define IFF_RXFH_CONFIGURED		IFF_RXFH_CONFIGURED
+#define IFF_MACSEC			IFF_MACSEC
 
 /*
  *	The DEVICE structure.
@@ -1404,6 +1583,8 @@ struct net_device {
 	unsigned int		promiscuity;
 	unsigned int		allmulti;
 
+	/* Stats to monitor carrier on<->off transitions */
+	RH_KABI_FILL_HOLE(atomic_t	carrier_changes)
 
 	/* Protocol specific pointers */
 
@@ -1574,7 +1755,8 @@ struct net_device {
 	/* group the device belongs to */
 	int group;
 
-	struct pm_qos_request	pm_qos_req;
+	/* RHEL: e1000e was the only in-tree driver that used this */
+	RH_KABI_DEPRECATE(struct pm_qos_request, pm_qos_req)
 
 	/* RHEL SPECIFIC
 	 *
@@ -1584,16 +1766,44 @@ struct net_device {
 	 * additions of your backport.
 	 */
 	RH_KABI_USE_P(1, unsigned long	gro_flush_timeout)
-	RH_KABI_RESERVE_P(2)
-	RH_KABI_RESERVE_P(3)
-	RH_KABI_RESERVE_P(4)
-	RH_KABI_RESERVE_P(5)
-	RH_KABI_RESERVE_P(6)
-	RH_KABI_RESERVE_P(7)
-	RH_KABI_RESERVE_P(8)
-	RH_KABI_RESERVE_P(9)
-	RH_KABI_RESERVE_P(10)
-	RH_KABI_RESERVE_P(11)
+	RH_KABI_USE_P(2, atomic_long_t  rx_nohandler) /* inactive slave drops */
+#ifndef __GENKSYMS__
+	struct list_head	lower_dev_list;
+
+	/* directly linked devices, like slaves for bonding */
+	struct {
+		struct list_head upper;
+		struct list_head lower;
+	} adj_list;
+
+	/*
+	 * RHEL ONLY: upstream has a matching all_adj_list that replaces
+	 * upper_dev_list and lower_dev_list directly, but making that
+	 * replacement would be a kabi nightmare, even more than we've
+	 * already got right here.
+	 */
+#else
+	/*
+	 * struct list_head contains two pointers, no easy way to make use of
+	 * two reserved pointers in a single RH_KABI_* macro, so we're going
+	 * old school and using __GENKSYMS wrappers directly here.
+	 * RH_KABI_RESERVE_P(3) -> void (*rh_reserved3)(void);
+	 * RH_KABI_RESERVE_P(4) -> void (*rh_reserved4)(void);
+	 * RH_KABI_RESERVE_P(5) -> void (*rh_reserved5)(void);
+	 * RH_KABI_RESERVE_P(6) -> void (*rh_reserved6)(void);
+	 * RH_KABI_RESERVE_P(7) -> void (*rh_reserved7)(void);
+	 * RH_KABI_RESERVE_P(8) -> void (*rh_reserved8)(void);
+	 */
+	void (*rh_reserved3)(void);
+	void (*rh_reserved4)(void);
+	void (*rh_reserved5)(void);
+	void (*rh_reserved6)(void);
+	void (*rh_reserved7)(void);
+	void (*rh_reserved8)(void);
+#endif
+	RH_KABI_USE_P(9, const struct forwarding_accel_ops *fwd_ops)
+	RH_KABI_USE_P(10, const struct dcbnl_rtnl_ops_ext *dcbnl_ops_ext)
+	RH_KABI_USE_P(11, struct wpan_dev *ieee802154_ptr)
 	RH_KABI_RESERVE_P(12)
 	RH_KABI_RESERVE_P(13)
 	RH_KABI_RESERVE_P(14)
@@ -1681,8 +1891,28 @@ static inline void netdev_for_each_tx_queue(struct net_device *dev,
 }
 
 struct netdev_queue *netdev_pick_tx(struct net_device *dev,
-				    struct sk_buff *skb);
-u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb);
+				    struct sk_buff *skb,
+				    void *accel_priv);
+
+/* returns the headroom that the master device needs to take in account
+ * when forwarding to this dev
+ */
+static inline unsigned netdev_get_fwd_headroom(struct net_device *dev)
+{
+	return dev->priv_flags & IFF_PHONY_HEADROOM ? 0 : dev->needed_headroom;
+}
+
+static inline void netdev_set_rx_headroom(struct net_device *dev, int new_hr)
+{
+	if (get_ndo_ext(dev->netdev_ops, ndo_set_rx_headroom))
+		get_ndo_ext(dev->netdev_ops, ndo_set_rx_headroom)(dev, new_hr);
+}
+
+/* set the device rx headroom to the dev's default */
+static inline void netdev_reset_rx_headroom(struct net_device *dev)
+{
+	netdev_set_rx_headroom(dev, -1);
+}
 
 /*
  * Net namespace inlines
@@ -1777,6 +2007,26 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
 #define netif_napi_add _netif_napi_add
 
 /**
+ *	netif_tx_napi_add - initialize a napi context
+ *	@dev:  network device
+ *	@napi: napi context
+ *	@poll: polling function
+ *	@weight: default weight
+ *
+ * This variant of netif_napi_add() should be used from drivers using NAPI
+ * to exclusively poll a TX queue.
+ * This will avoid we add it into napi_hash[], thus polluting this hash table.
+ */
+static inline void netif_tx_napi_add(struct net_device *dev,
+				     struct napi_struct *napi,
+				     int (*poll)(struct napi_struct *, int),
+				     int weight)
+{
+	set_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state);
+	netif_napi_add(dev, napi, poll, weight);
+}
+
+/**
  *  netif_napi_del - remove a napi context
  *  @napi: napi context
  *
@@ -1812,8 +2062,8 @@ struct napi_gro_cb {
 	/* Used in ipv6_gro_receive() and foo-over-udp */
 	u16	proto;
 
-	/* Used in udp_gro_receive */
-	u8	udp_mark:1;
+	/* Used in tunnel GRO receive */
+	u8	encap_mark:1;
 
 	/* GRO checksum is valid */
 	u8	csum_valid:1;
@@ -1832,7 +2082,10 @@ struct napi_gro_cb {
 	/* This is non-zero if the packet may be of the same flow. */
 	u8	same_flow:1;
 
-	/* 7 bit hole */
+	/* Number of gro_receive callbacks this packet already went through */
+	u8 recursion_counter:4;
+
+	/* 3 bit hole */
 
 	/* used to support CHECKSUM_COMPLETE for tunneling protocols */
 	__wsum	csum;
@@ -1842,6 +2095,25 @@ struct napi_gro_cb {
 };
 
 #define NAPI_GRO_CB(skb) ((struct napi_gro_cb *)(skb)->cb)
+
+#define GRO_RECURSION_LIMIT 15
+static inline int gro_recursion_inc_test(struct sk_buff *skb)
+{
+	return ++NAPI_GRO_CB(skb)->recursion_counter == GRO_RECURSION_LIMIT;
+}
+
+typedef struct sk_buff **(*gro_receive_t)(struct sk_buff **, struct sk_buff *);
+static inline struct sk_buff **call_gro_receive(gro_receive_t cb,
+						struct sk_buff **head,
+						struct sk_buff *skb)
+{
+	if (gro_recursion_inc_test(skb)) {
+		NAPI_GRO_CB(skb)->flush |= 1;
+		return NULL;
+	}
+
+	return cb(head, skb);
+}
 
 struct packet_type {
 	__be16			type;	/* This is really htons(ether_type). */
@@ -1854,6 +2126,10 @@ struct packet_type {
 					    struct sock *sk);
 	void			*af_packet_priv;
 	struct list_head	list;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 struct offload_callbacks {
@@ -1871,26 +2147,6 @@ struct packet_offload {
 	struct list_head	 list;
 };
 
-struct udp_offload;
-
-/* 'skb->encapsulation' is set before gro_complete() is called.  gro_complete()
- * must set 'skb->inner_mac_header' to the beginning of tunnel payload.
- */
-struct udp_offload_callbacks {
-	struct sk_buff		**(*gro_receive)(struct sk_buff **head,
-						 struct sk_buff *skb,
-						 struct udp_offload *uoff);
-	int			(*gro_complete)(struct sk_buff *skb,
-						int nhoff,
-						struct udp_offload *uoff);
-};
-
-struct udp_offload {
-	__be16			 port;
-	u8			 ipproto;
-	struct udp_offload_callbacks callbacks;
-};
-
 /* often modified stats are per cpu, other are shared (netdev->stats) */
 struct pcpu_sw_netstats {
 	u64     rx_packets;
@@ -1900,19 +2156,22 @@ struct pcpu_sw_netstats {
 	struct u64_stats_sync   syncp;
 };
 
-#define netdev_alloc_pcpu_stats(type)				\
-({								\
-	typeof(type) *pcpu_stats = alloc_percpu(type);		\
-	if (pcpu_stats)	{					\
-		int i;						\
-		for_each_possible_cpu(i) {			\
-			typeof(type) *stat;			\
-			stat = per_cpu_ptr(pcpu_stats, i);	\
-			u64_stats_init(&stat->syncp);		\
-		}						\
-	}							\
-	pcpu_stats;						\
+#define __netdev_alloc_pcpu_stats(type, gfp)				\
+({									\
+	typeof(type) __percpu *pcpu_stats = alloc_percpu_gfp(type, gfp);\
+	if (pcpu_stats)	{						\
+		int __cpu;						\
+		for_each_possible_cpu(__cpu) {				\
+			typeof(type) *stat;				\
+			stat = per_cpu_ptr(pcpu_stats, __cpu);		\
+			u64_stats_init(&stat->syncp);			\
+		}							\
+	}								\
+	pcpu_stats;							\
 })
+
+#define netdev_alloc_pcpu_stats(type)					\
+	__netdev_alloc_pcpu_stats(type, GFP_KERNEL)
 
 #include <linux/notifier.h>
 
@@ -1929,7 +2188,7 @@ struct pcpu_sw_netstats {
 #define NETDEV_CHANGE	0x0004	/* Notify device state change */
 #define NETDEV_REGISTER 0x0005
 #define NETDEV_UNREGISTER	0x0006
-#define NETDEV_CHANGEMTU	0x0007
+#define NETDEV_CHANGEMTU	0x0007 /* notify after mtu change happened */
 #define NETDEV_CHANGEADDR	0x0008
 #define NETDEV_GOING_DOWN	0x0009
 #define NETDEV_CHANGENAME	0x000A
@@ -1943,11 +2202,56 @@ struct pcpu_sw_netstats {
 #define NETDEV_RELEASE		0x0012
 #define NETDEV_NOTIFY_PEERS	0x0013
 #define NETDEV_JOIN		0x0014
+#define NETDEV_CHANGEUPPER	0x0015
 #define NETDEV_RESEND_IGMP	0x0016
+#define NETDEV_PRECHANGEMTU	0x0017 /* notify before mtu change happened */
 #define NETDEV_CHANGEINFODATA	0x0018
+#define NETDEV_BONDING_INFO	0x0019
+#define NETDEV_OFFLOAD_PUSH_VXLAN	0x001C
+#define NETDEV_OFFLOAD_PUSH_GENEVE	0x001D
 
+/* (Un)registration functions for the notifiers that takes
+ * 'struct net_device *' as parameter
+ */
 int register_netdevice_notifier(struct notifier_block *nb);
 int unregister_netdevice_notifier(struct notifier_block *nb);
+
+/* (Un)registration functions for the notifiers that takes
+ * 'struct netdev_notifier_info *' as parameter
+ */
+int register_netdevice_notifier_rh(struct notifier_block *nb);
+int unregister_netdevice_notifier_rh(struct notifier_block *nb);
+
+struct netdev_notifier_info {
+	struct net_device *dev;
+};
+
+struct netdev_notifier_change_info {
+	struct netdev_notifier_info info; /* must be first */
+	unsigned int flags_changed;
+};
+
+struct netdev_notifier_changeupper_info {
+	struct netdev_notifier_info info; /* must be first */
+	struct net_device *upper_dev; /* new upper dev */
+	bool master; /* is upper dev master */
+	bool linking; /* is the nofication for link or unlink */
+};
+
+static inline void netdev_notifier_info_init(struct netdev_notifier_info *info,
+					     struct net_device *dev)
+{
+	info->dev = dev;
+}
+
+static inline struct net_device *
+netdev_notifier_info_to_dev(const struct netdev_notifier_info *info)
+{
+	return info->dev;
+}
+
+int call_netdevice_notifiers_info(unsigned long val, struct net_device *dev,
+				  struct netdev_notifier_info *info);
 int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
 
 
@@ -2020,6 +2324,7 @@ void dev_remove_offload(struct packet_offload *po);
 void __dev_remove_offload(struct packet_offload *po);
 
 int dev_get_iflink(const struct net_device *dev);
+int dev_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb);
 struct net_device *__dev_get_by_flags(struct net *net, unsigned short flags,
 				      unsigned short mask);
 struct net_device *dev_get_by_name(struct net *net, const char *name);
@@ -2032,6 +2337,7 @@ void dev_disable_lro(struct net_device *dev);
 int dev_loopback_xmit(struct sock *sk, struct sk_buff *newskb);
 int dev_queue_xmit_sk(struct sock *sk, struct sk_buff *skb);
 int dev_queue_xmit(struct sk_buff *skb);
+int dev_queue_xmit_accel(struct sk_buff *skb, void *accel_priv);
 int register_netdevice(struct net_device *dev);
 void unregister_netdevice_queue(struct net_device *dev, struct list_head *head);
 void unregister_netdevice_many(struct list_head *head);
@@ -2591,6 +2897,26 @@ static inline void netdev_reset_queue(struct net_device *dev_queue)
 }
 
 /**
+ * 	netdev_cap_txqueue - check if selected tx queue exceeds device queues
+ * 	@dev: network device
+ * 	@queue_index: given tx queue index
+ *
+ * 	Returns 0 if given tx queue index >= number of device tx queues,
+ * 	otherwise returns the originally passed tx queue index.
+ */
+static inline u16 netdev_cap_txqueue(struct net_device *dev, u16 queue_index)
+{
+	if (unlikely(queue_index >= dev->real_num_tx_queues)) {
+		net_warn_ratelimited("%s selects TX queue %d, but real number of TX queues is %d\n",
+				     dev->name, queue_index,
+				     dev->real_num_tx_queues);
+		return 0;
+	}
+
+	return queue_index;
+}
+
+/**
  *	netif_running - test if up
  *	@dev: network device
  *
@@ -2831,7 +3157,7 @@ void dev_set_group(struct net_device *, int);
 int dev_set_mac_address(struct net_device *, struct sockaddr *);
 int dev_change_carrier(struct net_device *, bool new_carrier);
 int dev_get_phys_port_id(struct net_device *dev,
-			 struct netdev_phys_port_id *ppid);
+			 struct netdev_phys_item_id *ppid);
 struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev);
 struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 				    struct netdev_queue *txq, int *ret);
@@ -3322,17 +3648,69 @@ extern int		bpf_jit_enable;
 
 bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
 bool netdev_has_any_upper_dev(struct net_device *dev);
+struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
+						     struct list_head **iter);
+struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
+						     struct list_head **iter);
+
+/* iterate through upper list, must be called under RCU read lock */
+#define netdev_for_each_upper_dev_rcu(dev, updev, iter) \
+	for (iter = &(dev)->adj_list.upper, \
+	     updev = netdev_upper_get_next_dev_rcu(dev, &(iter)); \
+	     updev; \
+	     updev = netdev_upper_get_next_dev_rcu(dev, &(iter)))
+
+/* iterate through upper list, must be called under RCU read lock */
+#define netdev_for_each_all_upper_dev_rcu(dev, updev, iter) \
+	for (iter = &(dev)->upper_dev_list, \
+	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)); \
+	     updev; \
+	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)))
+
+void *netdev_lower_get_next_private(struct net_device *dev,
+				    struct list_head **iter);
+void *netdev_lower_get_next_private_rcu(struct net_device *dev,
+					struct list_head **iter);
+
+#define netdev_for_each_lower_private(dev, priv, iter) \
+	for (iter = (dev)->adj_list.lower.next, \
+	     priv = netdev_lower_get_next_private(dev, &(iter)); \
+	     priv; \
+	     priv = netdev_lower_get_next_private(dev, &(iter)))
+
+#define netdev_for_each_lower_private_rcu(dev, priv, iter) \
+	for (iter = &(dev)->adj_list.lower, \
+	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)); \
+	     priv; \
+	     priv = netdev_lower_get_next_private_rcu(dev, &(iter)))
+
+void *netdev_lower_get_next(struct net_device *dev,
+				struct list_head **iter);
+#define netdev_for_each_lower_dev(dev, ldev, iter) \
+	for (iter = &(dev)->adj_list.lower, \
+	     ldev = netdev_lower_get_next(dev, &(iter)); \
+	     ldev; \
+	     ldev = netdev_lower_get_next(dev, &(iter)))
+
+void *netdev_adjacent_get_private(struct list_head *adj_list);
+void *netdev_lower_get_first_private_rcu(struct net_device *dev);
 struct net_device *netdev_master_upper_dev_get(struct net_device *dev);
 struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *dev);
 int netdev_upper_dev_link(struct net_device *dev, struct net_device *upper_dev);
 int netdev_master_upper_dev_link(struct net_device *dev,
 				 struct net_device *upper_dev);
+int netdev_master_upper_dev_link_private(struct net_device *dev,
+					 struct net_device *upper_dev,
+					 void *private);
 void netdev_upper_dev_unlink(struct net_device *dev,
 			     struct net_device *upper_dev);
+void netdev_adjacent_rename_links(struct net_device *dev, char *oldname);
 void *netdev_lower_dev_get_private_rcu(struct net_device *dev,
 				       struct net_device *lower_dev);
 void *netdev_lower_dev_get_private(struct net_device *dev,
 				   struct net_device *lower_dev);
+int dev_get_nest_level(struct net_device *dev,
+		       bool (*type_check)(struct net_device *dev));
 
 /* RSS keys are 40 or 52 bytes long */
 #define NETDEV_RSS_KEY_LEN 52
@@ -3345,6 +3723,19 @@ struct sk_buff *__skb_gso_segment(struct sk_buff *skb,
 struct sk_buff *skb_mac_gso_segment(struct sk_buff *skb,
 				    netdev_features_t features);
 
+struct netdev_bonding_info {
+	ifslave	slave;
+	ifbond	master;
+};
+
+struct netdev_notifier_bonding_info {
+	struct netdev_notifier_info info; /* must be first */
+	struct netdev_bonding_info  bonding_info;
+};
+
+void netdev_bonding_info_change(struct net_device *dev,
+				struct netdev_bonding_info *bonding_info);
+
 static inline
 struct sk_buff *skb_gso_segment(struct sk_buff *skb, netdev_features_t features)
 {
@@ -3355,13 +3746,24 @@ __be16 skb_network_protocol(struct sk_buff *skb, int *depth);
 static inline bool can_checksum_protocol(netdev_features_t features,
 					 __be16 protocol)
 {
-	return ((features & NETIF_F_GEN_CSUM) ||
-		((features & NETIF_F_V4_CSUM) &&
-		 protocol == htons(ETH_P_IP)) ||
-		((features & NETIF_F_V6_CSUM) &&
-		 protocol == htons(ETH_P_IPV6)) ||
-		((features & NETIF_F_FCOE_CRC) &&
-		 protocol == htons(ETH_P_FCOE)));
+	if (protocol == htons(ETH_P_FCOE))
+		return !!(features & NETIF_F_FCOE_CRC);
+
+	/* Assume this is an IP checksum (not SCTP CRC) */
+
+	if (features & NETIF_F_HW_CSUM) {
+		/* Can checksum everything */
+		return true;
+	}
+
+	switch (protocol) {
+	case htons(ETH_P_IP):
+		return !!(features & NETIF_F_IP_CSUM);
+	case htons(ETH_P_IPV6):
+		return !!(features & NETIF_F_IPV6_CSUM);
+	default:
+		return false;
+	}
 }
 
 #ifdef CONFIG_BUG
@@ -3414,15 +3816,14 @@ void linkwatch_run_queue(void);
 static inline netdev_features_t netdev_intersect_features(netdev_features_t f1,
 							  netdev_features_t f2)
 {
-	if (f1 & NETIF_F_GEN_CSUM)
-		f1 |= (NETIF_F_ALL_CSUM & ~NETIF_F_GEN_CSUM);
-	if (f2 & NETIF_F_GEN_CSUM)
-		f2 |= (NETIF_F_ALL_CSUM & ~NETIF_F_GEN_CSUM);
-	f1 &= f2;
-	if (f1 & NETIF_F_GEN_CSUM)
-		f1 &= ~(NETIF_F_ALL_CSUM & ~NETIF_F_GEN_CSUM);
+	if ((f1 ^ f2) & NETIF_F_HW_CSUM) {
+		if (f1 & NETIF_F_HW_CSUM)
+			f1 |= (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM);
+		else
+			f2 |= (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM);
+	}
 
-	return f1;
+	return f1 & f2;
 }
 
 static inline netdev_features_t netdev_get_wanted_features(
@@ -3484,6 +3885,7 @@ static inline bool net_gso_ok(netdev_features_t features, int gso_type)
 	BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO2_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO2_SHIFT));
 	BUILD_BUG_ON(SKB_GSO_TUNNEL_REMCSUM != (NETIF_F_GSO_TUNNEL_REMCSUM >> NETIF_F_GSO2_SHIFT));
+	BUILD_BUG_ON(SKB_GSO_SCTP    != (NETIF_F_GSO_SCTP >> NETIF_F_GSO2_SHIFT));
 
 	return (features & feature) == feature;
 }
@@ -3521,6 +3923,21 @@ static inline void skb_gso_error_unwind(struct sk_buff *skb, __be16 protocol,
 	skb->mac_len = mac_len;
 }
 
+static inline bool netif_is_macvlan(struct net_device *dev)
+{
+	return dev->priv_flags & IFF_MACVLAN;
+}
+
+static inline bool netif_is_macsec(const struct net_device *dev)
+{
+	return dev->priv_flags & IFF_MACSEC;
+}
+
+static inline bool netif_is_macvlan_port(struct net_device *dev)
+{
+	return dev->priv_flags & IFF_MACVLAN_PORT;
+}
+
 static inline bool netif_is_bond_master(struct net_device *dev)
 {
 	return dev->flags & IFF_MASTER && dev->priv_flags & IFF_BONDING;
@@ -3531,9 +3948,24 @@ static inline bool netif_is_bond_slave(struct net_device *dev)
 	return dev->flags & IFF_SLAVE && dev->priv_flags & IFF_BONDING;
 }
 
+static inline bool netif_is_bridge_port(const struct net_device *dev)
+{
+	return dev->priv_flags & IFF_BRIDGE_PORT;
+}
+
 static inline bool netif_supports_nofcs(struct net_device *dev)
 {
 	return dev->priv_flags & IFF_SUPP_NOFCS;
+}
+
+static inline bool netif_is_ovs_master(const struct net_device *dev)
+{
+	return dev->priv_flags & IFF_OPENVSWITCH;
+}
+
+static inline bool netif_is_rxfh_configured(const struct net_device *dev)
+{
+	return dev->priv_flags & IFF_RXFH_CONFIGURED;
 }
 
 /* This device needs to keep skb dst for qdisc enqueue or ndo_start_xmit() */

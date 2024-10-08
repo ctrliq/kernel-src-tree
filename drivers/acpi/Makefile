@@ -24,7 +24,7 @@ acpi-y				+= nvs.o
 # Power management related files
 acpi-y				+= wakeup.o
 acpi-y				+= sleep.o
-acpi-y				+= device_pm.o
+acpi-y				+= device_sysfs.o device_pm.o
 acpi-$(CONFIG_ACPI_SLEEP)	+= proc.o
 
 
@@ -42,6 +42,7 @@ acpi-y				+= pci_root.o pci_link.o pci_irq.o
 acpi-y				+= acpi_lpss.o
 acpi-y				+= acpi_platform.o
 acpi-y				+= acpi_pnp.o
+acpi-y				+= int340x_thermal.o
 acpi-y				+= power.o
 acpi-y				+= event.o
 acpi-y				+= sysfs.o
@@ -67,6 +68,7 @@ obj-$(CONFIG_ACPI_PCI_SLOT)	+= pci_slot.o
 obj-$(CONFIG_ACPI_PROCESSOR)	+= processor.o
 obj-$(CONFIG_ACPI_CONTAINER)	+= container.o
 obj-$(CONFIG_ACPI_THERMAL)	+= thermal.o
+obj-$(CONFIG_ACPI_NFIT)		+= nfit.o
 obj-$(CONFIG_ACPI_HOTPLUG_MEMORY) += acpi_memhotplug.o
 obj-$(CONFIG_ACPI_BATTERY)	+= battery.o
 obj-$(CONFIG_ACPI_SBS)		+= sbshc.o

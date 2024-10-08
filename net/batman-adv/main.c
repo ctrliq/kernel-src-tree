@@ -71,7 +71,7 @@ static int __init batadv_init(void)
 	batadv_socket_init();
 	batadv_debugfs_init();
 
-	register_netdevice_notifier(&batadv_hard_if_notifier);
+	register_netdevice_notifier_rh(&batadv_hard_if_notifier);
 	rtnl_link_register(&batadv_link_ops);
 
 	pr_info("B.A.T.M.A.N. advanced %s (compatibility version %i) loaded\n",
@@ -84,7 +84,7 @@ static void __exit batadv_exit(void)
 {
 	batadv_debugfs_destroy();
 	rtnl_link_unregister(&batadv_link_ops);
-	unregister_netdevice_notifier(&batadv_hard_if_notifier);
+	unregister_netdevice_notifier_rh(&batadv_hard_if_notifier);
 	batadv_hardif_remove_interfaces();
 
 	flush_workqueue(batadv_event_workqueue);

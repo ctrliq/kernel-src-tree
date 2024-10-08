@@ -172,7 +172,6 @@ struct ext4_map_blocks {
  * Flags for ext4_io_end->flags
  */
 #define	EXT4_IO_END_UNWRITTEN	0x0001
-#define EXT4_IO_END_DIRECT	0x0002
 
 /*
  * For converting unwritten extents on a work queue. 'handle' is used for
@@ -188,8 +187,6 @@ typedef struct ext4_io_end {
 	unsigned int		flag;		/* unwritten or not */
 	loff_t			offset;		/* offset in the file */
 	ssize_t			size;		/* size of the extent */
-	struct kiocb		*iocb;		/* iocb struct for AIO */
-	int			result;		/* error value for AIO */
 	atomic_t		count;		/* reference counter */
 } ext4_io_end_t;
 
@@ -557,10 +554,12 @@ enum {
 #define EXT4_GET_BLOCKS_NO_NORMALIZE		0x0040
 	/* Request will not result in inode size update (user for fallocate) */
 #define EXT4_GET_BLOCKS_KEEP_SIZE		0x0080
-	/* Do not take i_data_sem locking in ext4_map_blocks */
-#define EXT4_GET_BLOCKS_NO_LOCK			0x0100
 	/* Convert written extents to unwritten */
-#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0200
+#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0100
+	/* Write zeros to newly created written extents */
+#define EXT4_GET_BLOCKS_ZERO			0x0200
+#define EXT4_GET_BLOCKS_CREATE_ZERO		(EXT4_GET_BLOCKS_CREATE |\
+					EXT4_GET_BLOCKS_ZERO)
 
 /*
  * The bit position of these flags must not overlap with any of the
@@ -863,6 +862,15 @@ struct ext4_inode_info {
 	 * by other means, so we have i_data_sem.
 	 */
 	struct rw_semaphore i_data_sem;
+	/*
+	 * i_mmap_sem is for serializing page faults with truncate / punch hole
+	 * operations. We have to make sure that new page cannot be faulted in
+	 * a section of the inode that is being punched. We cannot easily use
+	 * i_data_sem for this since we need protection for the whole punch
+	 * operation and i_data_sem ranks below transaction start so we have
+	 * to occasionally drop it.
+	 */
+	struct rw_semaphore i_mmap_sem;
 	struct inode vfs_inode;
 	struct jbd2_inode *jinode;
 
@@ -919,11 +927,9 @@ struct ext4_inode_info {
 	 * Completed IOs that need unwritten extents handling and don't have
 	 * transaction reserved
 	 */
-	struct list_head i_unrsv_conversion_list;
 	atomic_t i_ioend_count;	/* Number of outstanding io_end structs */
 	atomic_t i_unwritten; /* Nr. of inflight conversions pending */
 	struct work_struct i_rsv_conversion_work;
-	struct work_struct i_unrsv_conversion_work;
 
 	spinlock_t i_block_reservation_lock;
 
@@ -963,6 +969,11 @@ struct ext4_inode_info {
 #define EXT4_MOUNT_ERRORS_MASK		0x00070
 #define EXT4_MOUNT_MINIX_DF		0x00080	/* Mimics the Minix statfs */
 #define EXT4_MOUNT_NOLOAD		0x00100	/* Don't use existing journal*/
+#ifdef CONFIG_FS_DAX
+#define EXT4_MOUNT_DAX			0x00200	/* Direct Access */
+#else
+#define EXT4_MOUNT_DAX			0
+#endif
 #define EXT4_MOUNT_DATA_FLAGS		0x00C00	/* Mode for data writes: */
 #define EXT4_MOUNT_JOURNAL_DATA		0x00400	/* Write data to journal */
 #define EXT4_MOUNT_ORDERED_DATA		0x00800	/* Flush data before commit */
@@ -1298,8 +1309,6 @@ struct ext4_sb_info {
 	struct flex_groups *s_flex_groups;
 	ext4_group_t s_flex_groups_allocated;
 
-	/* workqueue for unreserved extent convertions (dio) */
-	struct workqueue_struct *unrsv_conversion_wq;
 	/* workqueue for reserved extent conversions (buffered io) */
 	struct workqueue_struct *rsv_conversion_wq;
 
@@ -1367,9 +1376,6 @@ static inline void ext4_set_io_unwritten_flag(struct inode *inode,
 					      struct ext4_io_end *io_end)
 {
 	if (!(io_end->flag & EXT4_IO_END_UNWRITTEN)) {
-		/* Writeback has to have coversion transaction reserved */
-		WARN_ON(EXT4_SB(inode->i_sb)->s_journal && !io_end->handle &&
-			!(io_end->flag & EXT4_IO_END_DIRECT));
 		io_end->flag |= EXT4_IO_END_UNWRITTEN;
 		atomic_inc(&EXT4_I(inode)->i_unwritten);
 	}
@@ -2090,6 +2096,8 @@ struct buffer_head *ext4_bread(handle_t *, struct inode *,
 						ext4_lblk_t, int, int *);
 int ext4_get_block_write(struct inode *inode, sector_t iblock,
 			 struct buffer_head *bh_result, int create);
+int ext4_dax_mmap_get_block(struct inode *inode, sector_t iblock,
+			    struct buffer_head *bh_result, int create);
 int ext4_get_block(struct inode *inode, sector_t iblock,
 				struct buffer_head *bh_result, int create);
 int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
@@ -2132,9 +2140,12 @@ extern int ext4_chunk_trans_blocks(struct inode *, int nrblocks);
 extern int ext4_zero_partial_blocks(handle_t *handle, struct inode *inode,
 			     loff_t lstart, loff_t lend);
 extern int ext4_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf);
+extern int ext4_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
 extern qsize_t *ext4_get_reserved_space(struct inode *inode);
 extern void ext4_da_update_reserve_space(struct inode *inode,
 					int used, int quota_claim);
+extern int ext4_issue_zeroout(struct inode *inode, ext4_lblk_t lblk,
+			      ext4_fsblk_t pblk, ext4_lblk_t len);
 
 /* indirect.c */
 extern int ext4_ind_map_blocks(handle_t *handle, struct inode *inode,
@@ -2478,6 +2489,9 @@ static inline int ext4_update_inode_size(struct inode *inode, loff_t newsize)
 	return changed;
 }
 
+int ext4_update_disksize_before_punch(struct inode *inode, loff_t offset,
+				      loff_t len);
+
 struct ext4_group_info {
 	unsigned long   bb_state;
 	struct rb_root  bb_free_root;
@@ -2776,7 +2790,6 @@ extern void ext4_put_io_end_defer(ext4_io_end_t *io_end);
 extern void ext4_io_submit_init(struct ext4_io_submit *io,
 				struct writeback_control *wbc);
 extern void ext4_end_io_rsv_work(struct work_struct *work);
-extern void ext4_end_io_unrsv_work(struct work_struct *work);
 extern void ext4_io_submit(struct ext4_io_submit *io);
 extern int ext4_bio_write_page(struct ext4_io_submit *io,
 			       struct page *page,

@@ -333,14 +333,16 @@ static const struct pci_device_id ahci_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, 0x1f3f), board_ahci_avn }, /* Avoton RAID */
 	{ PCI_VDEVICE(INTEL, 0xa182), board_ahci }, /* Lewisburg AHCI*/
 	{ PCI_VDEVICE(INTEL, 0xa202), board_ahci }, /* Lewisburg AHCI*/
-	{ PCI_VDEVICE(INTEL, 0xa184), board_ahci }, /* Lewisburg RAID*/
-	{ PCI_VDEVICE(INTEL, 0xa204), board_ahci }, /* Lewisburg RAID*/
 	{ PCI_VDEVICE(INTEL, 0xa186), board_ahci }, /* Lewisburg RAID*/
 	{ PCI_VDEVICE(INTEL, 0xa206), board_ahci }, /* Lewisburg RAID*/
 	{ PCI_VDEVICE(INTEL, 0x2822), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0x2823), board_ahci }, /* Lewisburg AHCI*/
 	{ PCI_VDEVICE(INTEL, 0x2826), board_ahci }, /* Lewisburg RAID*/
-	{ PCI_VDEVICE(INTEL, 0xa18e), board_ahci }, /* Lewisburg RAID*/
-	{ PCI_VDEVICE(INTEL, 0xa20e), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0x2827), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0xa1d2), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0xa1d6), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0xa252), board_ahci }, /* Lewisburg RAID*/
+	{ PCI_VDEVICE(INTEL, 0xa256), board_ahci }, /* Lewisburg RAID*/
 	{ PCI_VDEVICE(INTEL, 0x2823), board_ahci }, /* Wellsburg RAID */
 	{ PCI_VDEVICE(INTEL, 0x2827), board_ahci }, /* Wellsburg RAID */
 	{ PCI_VDEVICE(INTEL, 0x8d02), board_ahci }, /* Wellsburg AHCI */
@@ -1254,15 +1256,13 @@ static inline void ahci_gtf_filter_workaround(struct ata_host *host)
 #endif
 
 /*
- * ahci_init_msix() only implements single MSI-X support, not multiple
- * MSI-X per-port interrupts. This is needed for host controllers that only
- * have MSI-X support implemented, but no MSI or intx.
+ * ahci_init_msix() - optionally enable per-port MSI-X otherwise defer
+ * to single msi.
  */
 static int ahci_init_msix(struct pci_dev *pdev, unsigned int n_ports,
-			  struct ahci_host_priv *hpriv)
+			  struct ahci_host_priv *hpriv, unsigned long flags)
 {
-	int rc, nvec;
-	struct msix_entry entry = {};
+	int nvec, i, rc;
 
 	/* Do not init MSI-X if MSI is disabled for the device */
 	if (hpriv->flags & AHCI_HFLAG_NO_MSI)
@@ -1272,22 +1272,39 @@ static int ahci_init_msix(struct pci_dev *pdev, unsigned int n_ports,
 	if (nvec < 0)
 		return nvec;
 
-	if (!nvec) {
+	/*
+	 * Proper MSI-X implementations will have a vector per-port.
+	 * Barring that, we prefer single-MSI over single-MSIX.  If this
+	 * check fails (not enough MSI-X vectors for all ports) we will
+	 * be called again with the flag clear iff ahci_init_msi()
+	 * fails.
+	 */
+	if (flags & AHCI_HFLAG_MULTI_MSIX) {
+		if (nvec < n_ports)
+			return -ENODEV;
+		nvec = n_ports;
+	} else if (nvec) {
+		nvec = 1;
+	} else {
+		/*
+		 * Emit dev_err() since this was the non-legacy irq
+		 * method of last resort.
+		 */
 		rc = -ENODEV;
 		goto fail;
 	}
 
-	/*
-	 * There can be more than one vector (e.g. for error detection or
-	 * hdd hotplug). Only the first vector (entry.entry = 0) is used.
-	 */
-	rc = pci_enable_msix_exact(pdev, &entry, 1);
+	for (i = 0; i < nvec; i++)
+		hpriv->msix[i].entry = i;
+	rc = pci_enable_msix_exact(pdev, hpriv->msix, nvec);
 	if (rc < 0)
 		goto fail;
 
-	hpriv->irq = entry.vector;
+	if (nvec > 1)
+		hpriv->flags |= AHCI_HFLAG_MULTI_MSIX;
+	hpriv->irq = hpriv->msix[0].vector; /* for single msi-x */
 
-	return 1;
+	return nvec;
 fail:
 	dev_err(&pdev->dev,
 		"failed to enable MSI-X with error %d, # of vectors: %d\n",
@@ -1332,14 +1349,18 @@ static int ahci_init_msi(struct pci_dev *pdev, unsigned int n_ports,
 	if (nvec > 1)
 		hpriv->flags |= AHCI_HFLAG_MULTI_MSI;
 
-	return nvec;
+	goto out;
 
 single_msi:
+	nvec = 1;
+
 	rc = pci_enable_msi(pdev);
 	if (rc < 0)
 		return rc;
+out:
+	hpriv->irq = pdev->irq;
 
-	return 1;
+	return nvec;
 }
 
 static int ahci_init_interrupts(struct pci_dev *pdev, unsigned int n_ports,
@@ -1347,21 +1368,27 @@ static int ahci_init_interrupts(struct pci_dev *pdev, unsigned int n_ports,
 {
 	int nvec;
 
+	/*
+	 * Try to enable per-port MSI-X.  If the host is not capable
+	 * fall back to single MSI before finally attempting single
+	 * MSI-X.
+	 */
+	nvec = ahci_init_msix(pdev, n_ports, hpriv, AHCI_HFLAG_MULTI_MSIX);
+	if (nvec >= 0)
+		return nvec;
+
 	nvec = ahci_init_msi(pdev, n_ports, hpriv);
 	if (nvec >= 0)
 		return nvec;
 
-	/*
-	 * Currently, MSI-X support only implements single IRQ mode and
-	 * exists for controllers which can't do other types of IRQ. Only
-	 * set it up if MSI fails.
-	 */
-	nvec = ahci_init_msix(pdev, n_ports, hpriv);
+	/* try single-msix */
+	nvec = ahci_init_msix(pdev, n_ports, hpriv, 0);
 	if (nvec >= 0)
 		return nvec;
 
-	/* lagacy intx interrupts */
+	/* legacy intx interrupts */
 	pci_intx(pdev, 1);
+	hpriv->irq = pdev->irq;
 
 	return 0;
 }
@@ -1529,12 +1556,15 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	 */
 	n_ports = max(ahci_nr_ports(hpriv->cap), fls(hpriv->port_map));
 
-	ahci_init_interrupts(pdev, n_ports, hpriv);
-
 	host = ata_host_alloc_pinfo(&pdev->dev, ppi, n_ports);
 	if (!host)
 		return -ENOMEM;
 	host->private_data = hpriv;
+	hpriv->msix = devm_kzalloc(&pdev->dev,
+			sizeof(struct msix_entry) * n_ports, GFP_KERNEL);
+	if (!hpriv->msix)
+		return -ENOMEM;
+	ahci_init_interrupts(pdev, n_ports, hpriv);
 
 	if (!(hpriv->cap & HOST_CAP_SSS) || ahci_ignore_sss)
 		host->flags |= ATA_HOST_PARALLEL_SCAN;
@@ -1581,7 +1611,7 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_master(pdev);
 
-	return ahci_host_activate(host, pdev->irq, &ahci_sht);
+	return ahci_host_activate(host, &ahci_sht);
 }
 
 module_pci_driver(ahci_pci_driver);

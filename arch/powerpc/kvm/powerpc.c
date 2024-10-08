@@ -115,7 +115,7 @@ int kvmppc_prepare_to_enter(struct kvm_vcpu *vcpu)
 			continue;
 		}
 
-		kvm_guest_enter();
+		__kvm_guest_enter();
 		return 1;
 	}
 
@@ -540,18 +540,12 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 			r = 0;
 		break;
 	case KVM_CAP_PPC_RMA:
-		r = hv_enabled;
-		/* PPC970 requires an RMA */
-		if (r && cpu_has_feature(CPU_FTR_ARCH_201))
-			r = 2;
+		r = 0;
 		break;
 #endif
 	case KVM_CAP_SYNC_MMU:
 #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
-		if (hv_enabled)
-			r = cpu_has_feature(CPU_FTR_ARCH_206) ? 1 : 0;
-		else
-			r = 0;
+		r = hv_enabled;
 #elif defined(KVM_ARCH_WANT_MMU_NOTIFIER)
 		r = 1;
 #else
@@ -687,7 +681,7 @@ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
 	return kvmppc_core_pending_dec(vcpu);
 }
 
-enum hrtimer_restart kvmppc_decrementer_wakeup(struct hrtimer *timer)
+static enum hrtimer_restart kvmppc_decrementer_wakeup(struct hrtimer *timer)
 {
 	struct kvm_vcpu *vcpu;
 
@@ -1084,6 +1078,19 @@ static int kvm_vcpu_ioctl_enable_cap(struct kvm_vcpu *vcpu,
 		r = kvmppc_sanity_check(vcpu);
 
 	return r;
+}
+
+bool kvm_arch_intc_initialized(struct kvm *kvm)
+{
+#ifdef CONFIG_KVM_MPIC
+	if (kvm->arch.mpic)
+		return true;
+#endif
+#ifdef CONFIG_KVM_XICS
+	if (kvm->arch.xics)
+		return true;
+#endif
+	return false;
 }
 
 int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,

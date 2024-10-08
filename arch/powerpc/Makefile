@@ -135,6 +135,7 @@ CFLAGS-$(CONFIG_POWER4_CPU) += $(call cc-option,-mcpu=power4)
 CFLAGS-$(CONFIG_POWER5_CPU) += $(call cc-option,-mcpu=power5)
 CFLAGS-$(CONFIG_POWER6_CPU) += $(call cc-option,-mcpu=power6)
 CFLAGS-$(CONFIG_POWER7_CPU) += $(call cc-option,-mcpu=power7)
+CFLAGS-$(CONFIG_POWER8_CPU) += $(call cc-option,-mcpu=power8)
 
 E5500_CPU := $(call cc-option,-mcpu=e500mc64,-mcpu=powerpc64)
 CFLAGS-$(CONFIG_E5500_CPU) += $(E5500_CPU)

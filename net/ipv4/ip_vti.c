@@ -200,7 +200,7 @@ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
 	err = dst_output(skb);
 	if (net_xmit_eval(err) == 0)
 		err = skb->len;
-	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
+	iptunnel_xmit_stats(dev, err);
 	return NETDEV_TX_OK;
 
 tx_error_icmp:
@@ -573,7 +573,7 @@ static int __init vti_init(void)
 
 	pr_info("IPv4 over IPsec tunneling driver\n");
 
-	register_netdevice_notifier(&vti_notifier_block);
+	register_netdevice_notifier_rh(&vti_notifier_block);
 
 	msg = "tunnel device";
 	err = register_pernet_device(&vti_net_ops);
@@ -607,7 +607,7 @@ xfrm_proto_ah_failed:
 xfrm_proto_esp_failed:
 	unregister_pernet_device(&vti_net_ops);
 pernet_dev_failed:
-	unregister_netdevice_notifier(&vti_notifier_block);
+	unregister_netdevice_notifier_rh(&vti_notifier_block);
 	pr_err("vti init: failed to register %s\n", msg);
 	return err;
 }
@@ -619,7 +619,7 @@ static void __exit vti_fini(void)
 	xfrm4_protocol_deregister(&vti_ah4_protocol, IPPROTO_AH);
 	xfrm4_protocol_deregister(&vti_esp4_protocol, IPPROTO_ESP);
 	unregister_pernet_device(&vti_net_ops);
-	unregister_netdevice_notifier(&vti_notifier_block);
+	unregister_netdevice_notifier_rh(&vti_notifier_block);
 }
 
 module_init(vti_init);

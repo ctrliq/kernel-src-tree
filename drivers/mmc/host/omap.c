@@ -1500,6 +1500,8 @@ static int mmc_omap_remove(struct platform_device *pdev)
 	struct mmc_omap_host *host = platform_get_drvdata(pdev);
 	int i;
 
+	platform_set_drvdata(pdev, NULL);
+
 	BUG_ON(host == NULL);
 
 	for (i = 0; i < host->nr_slots; i++)

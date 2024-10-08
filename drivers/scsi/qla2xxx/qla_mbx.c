@@ -1112,6 +1112,8 @@ qla2x00_get_adapter_id(scsi_qla_host_t *vha, uint16_t *id, uint8_t *al_pa,
 		mcp->in_mb |= MBX_13|MBX_12|MBX_11|MBX_10;
 	if (IS_FWI2_CAPABLE(vha->hw))
 		mcp->in_mb |= MBX_19|MBX_18|MBX_17|MBX_16;
+	if (IS_QLA27XX(vha->hw))
+		mcp->in_mb |= MBX_15;
 	mcp->tov = MBX_TOV_SECONDS;
 	mcp->flags = 0;
 	rval = qla2x00_mailbox_command(vha, mcp);
@@ -1163,6 +1165,9 @@ qla2x00_get_adapter_id(scsi_qla_host_t *vha, uint16_t *id, uint8_t *al_pa,
 				    wwn_to_u64(vha->port_name));
 			}
 		}
+
+		if (IS_QLA27XX(vha->hw))
+			vha->bbcr = mcp->mb[15];
 	}
 
 	return rval;
@@ -1878,7 +1883,6 @@ qla24xx_login_fabric(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 	uint32_t	iop[2];
 	struct qla_hw_data *ha = vha->hw;
 	struct req_que *req;
-	struct rsp_que *rsp;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1061,
 	    "Entered %s.\n", __func__);
@@ -1887,7 +1891,6 @@ qla24xx_login_fabric(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 		req = ha->req_q_map[0];
 	else
 		req = vha->req;
-	rsp = req->rsp;
 
 	lg = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &lg_dma);
 	if (lg == NULL) {
@@ -1901,11 +1904,11 @@ qla24xx_login_fabric(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 	lg->entry_count = 1;
 	lg->handle = MAKE_HANDLE(req->id, lg->handle);
 	lg->nport_handle = cpu_to_le16(loop_id);
-	lg->control_flags = __constant_cpu_to_le16(LCF_COMMAND_PLOGI);
+	lg->control_flags = cpu_to_le16(LCF_COMMAND_PLOGI);
 	if (opt & BIT_0)
-		lg->control_flags |= __constant_cpu_to_le16(LCF_COND_PLOGI);
+		lg->control_flags |= cpu_to_le16(LCF_COND_PLOGI);
 	if (opt & BIT_1)
-		lg->control_flags |= __constant_cpu_to_le16(LCF_SKIP_PRLI);
+		lg->control_flags |= cpu_to_le16(LCF_SKIP_PRLI);
 	lg->port_id[0] = al_pa;
 	lg->port_id[1] = area;
 	lg->port_id[2] = domain;
@@ -1920,7 +1923,7 @@ qla24xx_login_fabric(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    lg->entry_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (lg->comp_status != __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (lg->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		iop[0] = le32_to_cpu(lg->io_parameter[0]);
 		iop[1] = le32_to_cpu(lg->io_parameter[1]);
 
@@ -1974,7 +1977,7 @@ qla24xx_login_fabric(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 			mb[10] |= BIT_0;	/* Class 2. */
 		if (lg->io_parameter[9] || lg->io_parameter[10])
 			mb[10] |= BIT_1;	/* Class 3. */
-		if (lg->io_parameter[0] & __constant_cpu_to_le32(BIT_7))
+		if (lg->io_parameter[0] & cpu_to_le32(BIT_7))
 			mb[10] |= BIT_7;	/* Confirmed Completion
 						 * Allowed
 						 */
@@ -2155,7 +2158,6 @@ qla24xx_fabric_logout(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 	dma_addr_t	lg_dma;
 	struct qla_hw_data *ha = vha->hw;
 	struct req_que *req;
-	struct rsp_que *rsp;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x106d,
 	    "Entered %s.\n", __func__);
@@ -2172,13 +2174,12 @@ qla24xx_fabric_logout(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 		req = ha->req_q_map[0];
 	else
 		req = vha->req;
-	rsp = req->rsp;
 	lg->entry_type = LOGINOUT_PORT_IOCB_TYPE;
 	lg->entry_count = 1;
 	lg->handle = MAKE_HANDLE(req->id, lg->handle);
 	lg->nport_handle = cpu_to_le16(loop_id);
 	lg->control_flags =
-	    __constant_cpu_to_le16(LCF_COMMAND_LOGO|LCF_IMPL_LOGO|
+	    cpu_to_le16(LCF_COMMAND_LOGO|LCF_IMPL_LOGO|
 		LCF_FREE_NPORT);
 	lg->port_id[0] = al_pa;
 	lg->port_id[1] = area;
@@ -2194,7 +2195,7 @@ qla24xx_fabric_logout(scsi_qla_host_t *vha, uint16_t loop_id, uint8_t domain,
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    lg->entry_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (lg->comp_status != __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (lg->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		ql_dbg(ql_dbg_mbx, vha, 0x1071,
 		    "Failed to complete IOCB -- completion status (%x) "
 		    "ioparam=%x/%x.\n", le16_to_cpu(lg->comp_status),
@@ -2524,7 +2525,7 @@ qla2x00_get_link_status(scsi_qla_host_t *vha, uint16_t loop_id,
 	int rval;
 	mbx_cmd_t mc;
 	mbx_cmd_t *mcp = &mc;
-	uint32_t *siter, *diter, dwords;
+	uint32_t *iter, dwords;
 	struct qla_hw_data *ha = vha->hw;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1084,
@@ -2564,10 +2565,11 @@ qla2x00_get_link_status(scsi_qla_host_t *vha, uint16_t loop_id,
 			/* Copy over data -- firmware data is LE. */
 			ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1086,
 			    "Done %s.\n", __func__);
-			dwords = offsetof(struct link_statistics, unused1) / 4;
-			siter = diter = &stats->link_fail_cnt;
-			while (dwords--)
-				*diter++ = le32_to_cpu(*siter++);
+			dwords = offsetof(struct link_statistics,
+					link_up_cnt) / 4;
+			iter = &stats->link_fail_cnt;
+			for ( ; dwords--; iter++)
+				le32_to_cpus(iter);
 		}
 	} else {
 		/* Failed. */
@@ -2584,7 +2586,7 @@ qla24xx_get_isp_stats(scsi_qla_host_t *vha, struct link_statistics *stats,
 	int rval;
 	mbx_cmd_t mc;
 	mbx_cmd_t *mcp = &mc;
-	uint32_t *siter, *diter, dwords;
+	uint32_t *iter, dwords;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1088,
 	    "Entered %s.\n", __func__);
@@ -2613,9 +2615,9 @@ qla24xx_get_isp_stats(scsi_qla_host_t *vha, struct link_statistics *stats,
 			    "Done %s.\n", __func__);
 			/* Copy over data -- firmware data is LE. */
 			dwords = sizeof(struct link_statistics) / 4;
-			siter = diter = &stats->link_fail_cnt;
-			while (dwords--)
-				*diter++ = le32_to_cpu(*siter++);
+			iter = &stats->link_fail_cnt;
+			for ( ; dwords--; iter++)
+				le32_to_cpus(iter);
 		}
 	} else {
 		/* Failed. */
@@ -2685,7 +2687,7 @@ qla24xx_abort_command(srb_t *sp)
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    abt->entry_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (abt->nport_handle != __constant_cpu_to_le16(0)) {
+	} else if (abt->nport_handle != cpu_to_le16(0)) {
 		ql_dbg(ql_dbg_mbx, vha, 0x1090,
 		    "Failed to complete IOCB -- completion status (%x).\n",
 		    le16_to_cpu(abt->nport_handle));
@@ -2768,8 +2770,7 @@ __qla24xx_issue_tmf(char *name, uint32_t type, struct fc_port *fcport,
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    sts->entry_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (sts->comp_status !=
-	    __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (sts->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		ql_dbg(ql_dbg_mbx, vha, 0x1096,
 		    "Failed to complete IOCB -- completion status (%x).\n",
 		    le16_to_cpu(sts->comp_status));
@@ -3383,6 +3384,9 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		    rptid_entry->port_id[2], rptid_entry->port_id[1],
 		    rptid_entry->port_id[0]);
 
+		/* buffer to buffer credit flag */
+		vha->flags.bbcr_enable = (rptid_entry->bbcr & 0xf) != 0;
+
 		/* FA-WWN is only for physical port */
 		if (!vp_idx) {
 			void *wwpn = ha->init_cb->port_name;
@@ -3497,7 +3501,7 @@ qla24xx_modify_vp_config(scsi_qla_host_t *vha)
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    vpmod->comp_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (vpmod->comp_status != __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (vpmod->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		ql_dbg(ql_dbg_mbx, vha, 0x10bf,
 		    "Failed to complete IOCB -- completion status (%x).\n",
 		    le16_to_cpu(vpmod->comp_status));
@@ -3556,7 +3560,7 @@ qla24xx_control_vp(scsi_qla_host_t *vha, int cmd)
 	vce->entry_type = VP_CTRL_IOCB_TYPE;
 	vce->entry_count = 1;
 	vce->command = cpu_to_le16(cmd);
-	vce->vp_count = __constant_cpu_to_le16(1);
+	vce->vp_count = cpu_to_le16(1);
 
 	/* index map in firmware starts with 1; decrement index
 	 * this is ok as we never use index 0
@@ -3576,7 +3580,7 @@ qla24xx_control_vp(scsi_qla_host_t *vha, int cmd)
 		    "Failed to complete IOCB -- error status (%x).\n",
 		    vce->entry_status);
 		rval = QLA_FUNCTION_FAILED;
-	} else if (vce->comp_status != __constant_cpu_to_le16(CS_COMPLETE)) {
+	} else if (vce->comp_status != cpu_to_le16(CS_COMPLETE)) {
 		ql_dbg(ql_dbg_mbx, vha, 0x10c5,
 		    "Failed to complet IOCB -- completion status (%x).\n",
 		    le16_to_cpu(vce->comp_status));

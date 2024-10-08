@@ -129,15 +129,6 @@ static inline void *bio_data(struct bio *bio)
 #define BIO_SEG_BOUNDARY(q, b1, b2) \
 	BIOVEC_SEG_BOUNDARY((q), __BVEC_END((b1)), __BVEC_START((b2)))
 
-/*
- * Check if adding a bio_vec after bprv with offset would create a gap in
- * the SG list. Most drivers don't care about this, but some do.
- */
-static inline bool bvec_gap_to_prev(struct bio_vec *bprv, unsigned int offset)
-{
-	return offset || ((bprv->bv_offset + bprv->bv_len) & (PAGE_SIZE - 1));
-}
-
 #define bio_io_error(bio) bio_endio((bio), -EIO)
 
 /*
@@ -522,6 +513,20 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
 	bl->head = bl->tail = NULL;
 
 	return bio;
+}
+
+/*
+ * Increment chain count for the bio. Make sure the CHAIN flag update
+ * is visible before the raised count.
+ */
+static inline void bio_inc_remaining(struct bio *bio)
+{
+	if (WARN_ON_ONCE(!bio->bio_aux))
+		return;
+
+	bio->bio_aux->bi_flags |= (1 << BIO_AUX_CHAIN);
+	smp_mb__before_atomic();
+	atomic_inc(&bio->bio_aux->__bi_remaining);
 }
 
 /*

@@ -292,6 +292,7 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
 {
 	unsigned long start_time;
 	int writing = 0, ret = 0;
+	int at_head = 0;
 	struct request *rq;
 	char sense[SCSI_SENSE_BUFFERSIZE];
 	struct bio *bio;
@@ -315,6 +316,8 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
 		case SG_DXFER_FROM_DEV:
 			break;
 		}
+	if (hdr->flags & SG_FLAG_Q_AT_HEAD)
+		at_head = 1;
 
 	rq = blk_get_request(q, writing ? WRITE : READ, GFP_KERNEL);
 	if (IS_ERR(rq))
@@ -389,7 +392,7 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
 	 * (if he doesn't check that is his problem).
 	 * N.B. a non-zero SCSI status is _not_ necessarily an error.
 	 */
-	blk_execute_rq(q, bd_disk, rq, 0);
+	blk_execute_rq(q, bd_disk, rq, at_head);
 
 	hdr->duration = jiffies_to_msecs(jiffies - start_time);
 

@@ -1741,8 +1741,8 @@ qla82xx_pci_config(scsi_qla_host_t *vha)
 	ret = pci_set_mwi(ha->pdev);
 	ha->chip_revision = ha->pdev->revision;
 	ql_dbg(ql_dbg_init, vha, 0x0043,
-	    "Chip revision:%d.\n",
-	    ha->chip_revision);
+	    "Chip revision:%d; pci_set_mwi() returned %d.\n",
+	    ha->chip_revision, ret);
 	return 0;
 }
 
@@ -1769,8 +1769,8 @@ void qla82xx_config_rings(struct scsi_qla_host *vha)
 
 	/* Setup ring parameters in initialization control block. */
 	icb = (struct init_cb_81xx *)ha->init_cb;
-	icb->request_q_outpointer = __constant_cpu_to_le16(0);
-	icb->response_q_inpointer = __constant_cpu_to_le16(0);
+	icb->request_q_outpointer = cpu_to_le16(0);
+	icb->response_q_inpointer = cpu_to_le16(0);
 	icb->request_q_length = cpu_to_le16(req->length);
 	icb->response_q_length = cpu_to_le16(rsp->length);
 	icb->request_q_address[0] = cpu_to_le32(LSD(req->dma));
@@ -1844,7 +1844,7 @@ qla82xx_set_product_offset(struct qla_hw_data *ha)
 
 	ptab_desc = qla82xx_get_table_desc(unirom,
 		 QLA82XX_URI_DIR_SECT_PRODUCT_TBL);
-       if (!ptab_desc)
+	if (!ptab_desc)
 		return -1;
 
 	entries = cpu_to_le32(ptab_desc->num_entries);
@@ -2107,6 +2107,7 @@ qla82xx_msix_default(int irq, void *dev_id)
 	int status = 0;
 	unsigned long flags;
 	uint32_t stat = 0;
+	uint32_t host_int = 0;
 	uint16_t mb[4];
 
 	rsp = (struct rsp_que *) dev_id;
@@ -2122,7 +2123,10 @@ qla82xx_msix_default(int irq, void *dev_id)
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 	vha = pci_get_drvdata(ha->pdev);
 	do {
-		if (RD_REG_DWORD(&reg->host_int)) {
+		host_int = RD_REG_DWORD(&reg->host_int);
+		if (qla2x00_check_reg32_for_disconnect(vha, host_int))
+			break;
+		if (host_int) {
 			stat = RD_REG_DWORD(&reg->host_status);
 
 			switch (stat & 0xff) {
@@ -2167,6 +2171,7 @@ qla82xx_msix_rsp_q(int irq, void *dev_id)
 	struct rsp_que *rsp;
 	struct device_reg_82xx __iomem *reg;
 	unsigned long flags;
+	uint32_t host_int = 0;
 
 	rsp = (struct rsp_que *) dev_id;
 	if (!rsp) {
@@ -2179,8 +2184,12 @@ qla82xx_msix_rsp_q(int irq, void *dev_id)
 	reg = &ha->iobase->isp82;
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 	vha = pci_get_drvdata(ha->pdev);
+	host_int = RD_REG_DWORD(&reg->host_int);
+	if (qla2x00_check_reg32_for_disconnect(vha, host_int))
+		goto out;
 	qla24xx_process_response_queue(vha, rsp);
 	WRT_REG_DWORD(&reg->host_int, 0);
+out:
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 	return IRQ_HANDLED;
 }
@@ -2194,6 +2203,7 @@ qla82xx_poll(int irq, void *dev_id)
 	struct device_reg_82xx __iomem *reg;
 	int status = 0;
 	uint32_t stat;
+	uint32_t host_int = 0;
 	uint16_t mb[4];
 	unsigned long flags;
 
@@ -2209,7 +2219,10 @@ qla82xx_poll(int irq, void *dev_id)
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 	vha = pci_get_drvdata(ha->pdev);
 
-	if (RD_REG_DWORD(&reg->host_int)) {
+	host_int = RD_REG_DWORD(&reg->host_int);
+	if (qla2x00_check_reg32_for_disconnect(vha, host_int))
+		goto out;
+	if (host_int) {
 		stat = RD_REG_DWORD(&reg->host_status);
 		switch (stat & 0xff) {
 		case 0x1:
@@ -2237,6 +2250,7 @@ qla82xx_poll(int irq, void *dev_id)
 		}
 		WRT_REG_DWORD(&reg->host_int, 0);
 	}
+out:
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 }
 
@@ -2534,7 +2548,7 @@ qla82xx_read_flash_data(scsi_qla_host_t *vha, uint32_t *dwptr, uint32_t faddr,
 			    "Do ROM fast read failed.\n");
 			goto done_read;
 		}
-		dwptr[i] = __constant_cpu_to_le32(val);
+		dwptr[i] = cpu_to_le32(val);
 	}
 done_read:
 	return dwptr;
@@ -2656,7 +2670,7 @@ qla82xx_write_flash_data(struct scsi_qla_host *vha, uint32_t *dwptr,
 {
 	int ret;
 	uint32_t liter;
-	uint32_t sec_mask, rest_addr;
+	uint32_t rest_addr;
 	dma_addr_t optrom_dma;
 	void *optrom = NULL;
 	int page_mode = 0;
@@ -2678,7 +2692,6 @@ qla82xx_write_flash_data(struct scsi_qla_host *vha, uint32_t *dwptr,
 	}
 
 	rest_addr = ha->fdt_block_size - 1;
-	sec_mask = ~rest_addr;
 
 	ret = qla82xx_unprotect_flash(ha);
 	if (ret) {
@@ -2774,7 +2787,6 @@ qla82xx_start_iocbs(scsi_qla_host_t *vha)
 {
 	struct qla_hw_data *ha = vha->hw;
 	struct req_que *req = ha->req_q_map[0];
-	struct device_reg_82xx __iomem *reg;
 	uint32_t dbval;
 
 	/* Adjust ring index. */
@@ -2785,7 +2797,6 @@ qla82xx_start_iocbs(scsi_qla_host_t *vha)
 	} else
 		req->ring_ptr++;
 
-	reg = &ha->iobase->isp82;
 	dbval = 0x04 | (ha->portnum << 5);
 
 	dbval = dbval | (req->id << 8) | (req->ring_index << 16);

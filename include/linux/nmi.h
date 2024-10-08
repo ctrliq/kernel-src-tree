@@ -25,16 +25,9 @@ static inline void touch_nmi_watchdog(void)
 #endif
 
 #if defined(CONFIG_HARDLOCKUP_DETECTOR)
-extern void watchdog_enable_hardlockup_detector(bool val);
-extern bool watchdog_hardlockup_detector_is_enabled(void);
+extern void hardlockup_detector_disable(void);
 #else
-static inline void watchdog_enable_hardlockup_detector(bool val)
-{
-}
-static inline bool watchdog_hardlockup_detector_is_enabled(void)
-{
-	return true;
-}
+static inline void hardlockup_detector_disable(void) {}
 #endif
 
 /*
@@ -72,7 +65,9 @@ extern int nmi_watchdog_enabled;
 extern int soft_watchdog_enabled;
 extern int watchdog_user_enabled;
 extern int watchdog_thresh;
+extern struct cpumask watchdog_cpumask;
 extern int sysctl_softlockup_all_cpu_backtrace;
+extern int sysctl_hardlockup_all_cpu_backtrace;
 struct ctl_table;
 extern int proc_watchdog(struct ctl_table *, int ,
 			 void __user *, size_t *, loff_t *);
@@ -82,8 +77,19 @@ extern int proc_soft_watchdog(struct ctl_table *, int ,
 			      void __user *, size_t *, loff_t *);
 extern int proc_watchdog_thresh(struct ctl_table *, int ,
 				void __user *, size_t *, loff_t *);
-extern int proc_dowatchdog(struct ctl_table *, int ,
-			   void __user *, size_t *, loff_t *);
+extern int proc_watchdog_cpumask(struct ctl_table *, int,
+				 void __user *, size_t *, loff_t *);
+extern int lockup_detector_suspend(void);
+extern void lockup_detector_resume(void);
+#else
+static inline int lockup_detector_suspend(void)
+{
+	return 0;
+}
+
+static inline void lockup_detector_resume(void)
+{
+}
 #endif
 
 #endif

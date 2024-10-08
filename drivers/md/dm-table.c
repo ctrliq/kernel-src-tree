@@ -5,7 +5,7 @@
  * This file is released under the GPL.
  */
 
-#include "dm.h"
+#include "dm-core.h"
 
 #include <linux/module.h>
 #include <linux/vmalloc.h>
@@ -631,7 +631,14 @@ static int validate_hardware_logical_block_alignment(struct dm_table *table,
 
 	struct dm_target *uninitialized_var(ti);
 	struct queue_limits ti_limits;
+	struct queue_limits_aux ti_limits_aux;
 	unsigned i = 0;
+
+	/* 
+	 * Initialize limits_aux pointer to stack queue_limits_aux
+	 * members.
+	 */
+	ti_limits.limits_aux = &ti_limits_aux;
 
 	/*
 	 * Check each entry in the table in turn.
@@ -977,7 +984,7 @@ bool dm_table_mq_request_based(struct dm_table *t)
 static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *md)
 {
 	unsigned type = dm_table_get_type(t);
-	unsigned per_bio_data_size = 0;
+	unsigned per_io_data_size = 0;
 	struct dm_target *tgt;
 	unsigned i;
 
@@ -989,10 +996,10 @@ static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *
 	if (type == DM_TYPE_BIO_BASED)
 		for (i = 0; i < t->num_targets; i++) {
 			tgt = t->targets + i;
-			per_bio_data_size = max(per_bio_data_size, tgt->per_bio_data_size);
+			per_io_data_size = max(per_io_data_size, tgt->per_io_data_size);
 		}
 
-	t->mempools = dm_alloc_md_mempools(md, type, t->integrity_supported, per_bio_data_size);
+	t->mempools = dm_alloc_md_mempools(md, type, t->integrity_supported, per_io_data_size);
 	if (!t->mempools)
 		return -ENOMEM;
 
@@ -1274,9 +1281,16 @@ int dm_calculate_queue_limits(struct dm_table *table,
 {
 	struct dm_target *uninitialized_var(ti);
 	struct queue_limits ti_limits;
+	struct queue_limits_aux ti_limits_aux;
 	unsigned i = 0;
 
 	blk_set_stacking_limits(limits);
+
+	/* 
+	 * Initialize limits_aux pointer to stack queue_limits_aux
+	 * members.
+	 */
+	ti_limits.limits_aux = &ti_limits_aux;
 
 	while (i < dm_table_get_num_targets(table)) {
 		blk_set_stacking_limits(&ti_limits);
@@ -1424,14 +1438,6 @@ static int queue_supports_sg_merge(struct dm_target *ti, struct dm_dev *dev,
 	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
 }
 
-static int queue_supports_sg_gaps(struct dm_target *ti, struct dm_dev *dev,
-				  sector_t start, sector_t len, void *data)
-{
-	struct request_queue *q = bdev_get_queue(dev->bdev);
-
-	return q && !test_bit(QUEUE_FLAG_SG_GAPS, &q->queue_flags);
-}
-
 static bool dm_table_all_devices_attribute(struct dm_table *t,
 					   iterate_devices_callout_fn func)
 {
@@ -1517,11 +1523,14 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 			       struct queue_limits *limits)
 {
 	unsigned flush = 0;
+	struct queue_limits_aux *limits_aux = q->limits.limits_aux;
 
 	/*
 	 * Copy table's limits to the DM device's request_queue
 	 */
 	q->limits = *limits;
+	memcpy(limits_aux, limits->limits_aux, sizeof(struct queue_limits_aux));
+	q->limits.limits_aux = limits_aux;
 
 	if (!dm_table_supports_discards(t))
 		queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, q);
@@ -1551,11 +1560,6 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
 	else
 		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
-
-	if (dm_table_all_devices_attribute(t, queue_supports_sg_gaps))
-		queue_flag_clear_unlocked(QUEUE_FLAG_SG_GAPS, q);
-	else
-		queue_flag_set_unlocked(QUEUE_FLAG_SG_GAPS, q);
 
 	dm_table_set_integrity(t);
 

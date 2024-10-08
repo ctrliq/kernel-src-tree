@@ -125,7 +125,7 @@ static inline void arch_leave_lazy_mmu_mode(void)
 
 
 extern void flush_hash_page(unsigned long vpn, real_pte_t pte, int psize,
-			    int ssize, int local);
+			    int ssize, unsigned long flags);
 extern void flush_hash_range(unsigned long number, int local);
 
 

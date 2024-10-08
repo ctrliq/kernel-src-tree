@@ -624,7 +624,7 @@ static DEVICE_ATTR(multicast_startup_query_interval, S_IRUGO | S_IWUSR,
 		   show_multicast_startup_query_interval,
 		   store_multicast_startup_query_interval);
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 static ssize_t show_nf_call_iptables(
 	struct device *d, struct device_attribute *attr, char *buf)
 {
@@ -761,7 +761,7 @@ static struct attribute *bridge_attrs[] = {
 	&dev_attr_multicast_query_response_interval.attr,
 	&dev_attr_multicast_startup_query_interval.attr,
 #endif
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	&dev_attr_nf_call_iptables.attr,
 	&dev_attr_nf_call_ip6tables.attr,
 	&dev_attr_nf_call_arptables.attr,

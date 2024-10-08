@@ -25,7 +25,6 @@
 #include <linux/firmware.h>
 #include <linux/uaccess.h>
 #include <linux/kernel.h>
-#include <linux/module.h>
 
 #include <asm/microcode_intel.h>
 #include <asm/processor.h>
@@ -145,10 +144,9 @@ int microcode_sanity_check(void *mc, int print_err)
 EXPORT_SYMBOL_GPL(microcode_sanity_check);
 
 /*
- * return 0 - no update found
- * return 1 - found update
+ * Returns 1 if update has been found, 0 otherwise.
  */
-int get_matching_sig(unsigned int csig, int cpf, void *mc, int rev)
+int find_matching_signature(void *mc, unsigned int csig, int cpf)
 {
 	struct microcode_header_intel *mc_hdr = mc;
 	struct extended_sigtable *ext_hdr;
@@ -174,16 +172,15 @@ int get_matching_sig(unsigned int csig, int cpf, void *mc, int rev)
 }
 
 /*
- * return 0 - no update found
- * return 1 - found update
+ * Returns 1 if update has been found, 0 otherwise.
  */
-int get_matching_microcode(unsigned int csig, int cpf, void *mc, int rev)
+int has_newer_microcode(void *mc, unsigned int csig, int cpf, int new_rev)
 {
-	struct microcode_header_intel *mc_header = mc;
+	struct microcode_header_intel *mc_hdr = mc;
 
-	if (!revision_is_newer(mc_header, rev))
+	if (mc_hdr->rev <= new_rev)
 		return 0;
 
-	return get_matching_sig(csig, cpf, mc, rev);
+	return find_matching_signature(mc, csig, cpf);
 }
-EXPORT_SYMBOL_GPL(get_matching_microcode);
+EXPORT_SYMBOL_GPL(has_newer_microcode);

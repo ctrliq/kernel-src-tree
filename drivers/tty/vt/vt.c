@@ -3654,7 +3654,7 @@ EXPORT_SYMBOL_GPL(do_unregister_con_driver);
  *	when a driver wants to take over some existing consoles
  *	and become default driver for newly opened ones.
  *
- *	do_take_over_console is basically a register followed by unbind
+ *	take_over_console is basically a register followed by unbind
  */
 int do_take_over_console(const struct consw *csw, int first, int last, int deflt)
 {

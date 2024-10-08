@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #include "parse-events.h"
-#include "parse-options.h"
+#include <subcmd/parse-options.h>
 
 #include <sys/mman.h>
 
@@ -690,7 +690,7 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
 	/*
 	 * Check if event was unmapped due to a POLLHUP/POLLERR.
 	 */
-	if (!md->refcnt)
+	if (!atomic_read(&md->refcnt))
 		return NULL;
 
 	head = perf_mmap__read_head(md);
@@ -1055,10 +1055,8 @@ static long parse_pages_arg(const char *str, unsigned long min,
 	return pages;
 }
 
-int perf_evlist__parse_mmap_pages(const struct option *opt, const char *str,
-				  int unset __maybe_unused)
+int __perf_evlist__parse_mmap_pages(unsigned int *mmap_pages, const char *str)
 {
-	unsigned int *mmap_pages = opt->value;
 	unsigned long max = UINT_MAX;
 	long pages;
 
@@ -1073,6 +1071,12 @@ int perf_evlist__parse_mmap_pages(const struct option *opt, const char *str,
 
 	*mmap_pages = pages;
 	return 0;
+}
+
+int perf_evlist__parse_mmap_pages(const struct option *opt, const char *str,
+				  int unset __maybe_unused)
+{
+	return __perf_evlist__parse_mmap_pages(opt->value, str);
 }
 
 /**

@@ -282,8 +282,7 @@ static void cachefiles_drop_object(struct fscache_object *_object)
 		    ) {
 			_debug("- retire object OBJ%x", object->fscache.debug_id);
 			inode = d_backing_inode(object->dentry);
-			if (inode)
-				i_blocks = inode->i_blocks;
+			i_blocks = inode ? 0 : inode->i_blocks;
 
 			cachefiles_begin_secure(cache, &saved_cred);
 			cachefiles_delete_object(cache, object);

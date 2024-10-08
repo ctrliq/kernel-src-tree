@@ -22,7 +22,8 @@ struct read_info_sccb {
 	u8	rnsize;			/* 10 */
 	u8	_pad_11[16 - 11];	/* 11-15 */
 	u16	ncpurl;			/* 16-17 */
-	u8	_pad_18[24 - 18];	/* 20-23 */
+	u16	cpuoff;			/* 18-19 */
+	u8	_reserved7[24 - 20];	/* 20-23 */
 	u8	loadparm[8];		/* 24-31 */
 	u8	_pad_32[42 - 32];	/* 32-41 */
 	u8	fac42;			/* 42 */
@@ -50,10 +51,12 @@ static unsigned int sclp_con_has_linemode __initdata;
 static unsigned long sclp_hsa_size;
 static unsigned int sclp_max_cpu;
 static struct sclp_ipl_info sclp_ipl_info;
+static unsigned char sclp_siif;
 static unsigned int sclp_mtid;
 static unsigned int sclp_mtid_cp;
 static unsigned int sclp_mtid_max;
 static unsigned int sclp_mtid_prev;
+static unsigned char sclp_sief2;
 
 u64 sclp_facilities;
 u8 sclp_fac84;
@@ -105,6 +108,9 @@ static int __init sclp_read_info_early(struct read_info_sccb *sccb)
 
 static void __init sclp_facilities_detect(struct read_info_sccb *sccb)
 {
+	struct sclp_cpu_entry *cpue;
+	u16 boot_cpu_address, cpu;
+
 	if (sclp_read_info_early(sccb))
 		return;
 
@@ -123,6 +129,16 @@ static void __init sclp_facilities_detect(struct read_info_sccb *sccb)
 			sclp_max_cpu = sccb->ncpurl;
 	} else {
 		sclp_max_cpu = sccb->hcpua + 1;
+	}
+
+	boot_cpu_address = stap();
+	cpue = (void *)sccb + sccb->cpuoff;
+	for (cpu = 0; cpu < sccb->ncpurl; cpue++, cpu++) {
+		if (boot_cpu_address != cpue->core_id)
+			continue;
+		sclp_siif = cpue->siif;
+		sclp_sief2 = cpue->sief2;
+		break;
 	}
 
 	/* Save IPL information */
@@ -176,6 +192,18 @@ unsigned int sclp_get_max_cpu(void)
 {
 	return sclp_max_cpu;
 }
+
+int sclp_has_siif(void)
+{
+	return sclp_siif;
+}
+EXPORT_SYMBOL(sclp_has_siif);
+
+int sclp_has_sief2(void)
+{
+	return sclp_sief2;
+}
+EXPORT_SYMBOL(sclp_has_sief2);
 
 /*
  * This function will be called after sclp_facilities_detect(), which gets

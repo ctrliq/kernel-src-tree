@@ -271,6 +271,7 @@ enum perf_event_read_format {
 #define PERF_ATTR_SIZE_VER3	96	/* add: sample_regs_user */
 					/* add: sample_stack_user */
 #define PERF_ATTR_SIZE_VER4	104	/* add: sample_regs_intr */
+#define PERF_ATTR_SIZE_VER5	112	/* add: aux_watermark */
 
 /*
  * Hardware event_id to monitor via a performance monitoring event:
@@ -340,7 +341,8 @@ struct perf_event_attr {
 				__reserved_1   : 40;
 #else
 				comm_exec      :  1, /* flag comm events that are due to an exec */
-				__reserved_1   : 39;
+				context_switch :  1, /* context switch data */
+				__reserved_1   : 38;
 #endif
 
 	union {
@@ -382,6 +384,12 @@ struct perf_event_attr {
 	 */
 #ifndef __GENKSYMS__
 	__u64	sample_regs_intr;
+
+	/*
+	 * Wakeup watermark for AUX area
+	 */
+	__u32	aux_watermark;
+	__u32	__reserved_3;	/* align to __u64 */
 #endif
 };
 
@@ -482,7 +490,7 @@ struct perf_event_mmap_page {
 	 *   u64 delta;
 	 *
 	 *   quot = (cyc >> time_shift);
-	 *   rem = cyc & ((1 << time_shift) - 1);
+	 *   rem = cyc & (((u64)1 << time_shift) - 1);
 	 *   delta = time_offset + quot * time_mult +
 	 *              ((rem * time_mult) >> time_shift);
 	 *
@@ -513,7 +521,7 @@ struct perf_event_mmap_page {
 	 * And vice versa:
 	 *
 	 *   quot = cyc >> time_shift;
-	 *   rem  = cyc & ((1 << time_shift) - 1);
+	 *   rem  = cyc & (((u64)1 << time_shift) - 1);
 	 *   timestamp = time_zero + quot * time_mult +
 	 *               ((rem * time_mult) >> time_shift);
 	 */
@@ -546,6 +554,22 @@ struct perf_event_mmap_page {
 	__u64	data_tail;		/* user-space written tail */
 	__u64	data_offset;		/* where the buffer starts */
 	__u64	data_size;		/* data buffer size */
+
+	/*
+	 * AUX area is defined by aux_{offset,size} fields that should be set
+	 * by the userspace, so that
+	 *
+	 *   aux_offset >= data_offset + data_size
+	 *
+	 * prior to mmap()ing it. Size of the mmap()ed area should be aux_size.
+	 *
+	 * Ring buffer pointers aux_{head,tail} have the same semantics as
+	 * data_{head,tail} and same ordering rules apply.
+	 */
+	__u64	aux_head;
+	__u64	aux_tail;
+	__u64	aux_offset;
+	__u64	aux_size;
 };
 
 #define PERF_RECORD_MISC_CPUMODE_MASK		(7 << 0)
@@ -563,9 +587,11 @@ struct perf_event_mmap_page {
 /*
  * PERF_RECORD_MISC_MMAP_DATA and PERF_RECORD_MISC_COMM_EXEC are used on
  * different events so can reuse the same bit position.
+ * Ditto PERF_RECORD_MISC_SWITCH_OUT.
  */
 #define PERF_RECORD_MISC_MMAP_DATA		(1 << 13)
 #define PERF_RECORD_MISC_COMM_EXEC		(1 << 13)
+#define PERF_RECORD_MISC_SWITCH_OUT		(1 << 13)
 /*
  * Indicates that the content of PERF_SAMPLE_IP points to
  * the actual instruction that triggered the event. See also
@@ -786,6 +812,55 @@ enum perf_event_type {
 	 */
 	PERF_RECORD_AUX				= 11,
 
+	/*
+	 * Indicates that instruction trace has started
+	 *
+	 * struct {
+	 *	struct perf_event_header	header;
+	 *	u32				pid;
+	 *	u32				tid;
+	 * };
+	 */
+	PERF_RECORD_ITRACE_START		= 12,
+
+	/*
+	 * Records the dropped/lost sample number.
+	 *
+	 * struct {
+	 *	struct perf_event_header	header;
+	 *
+	 *	u64				lost;
+	 *	struct sample_id		sample_id;
+	 * };
+	 */
+	PERF_RECORD_LOST_SAMPLES		= 13,
+
+	/*
+	 * Records a context switch in or out (flagged by
+	 * PERF_RECORD_MISC_SWITCH_OUT). See also
+	 * PERF_RECORD_SWITCH_CPU_WIDE.
+	 *
+	 * struct {
+	 *	struct perf_event_header	header;
+	 *	struct sample_id		sample_id;
+	 * };
+	 */
+	PERF_RECORD_SWITCH			= 14,
+
+	/*
+	 * CPU-wide version of PERF_RECORD_SWITCH with next_prev_pid and
+	 * next_prev_tid that are the next (switching out) or previous
+	 * (switching in) pid/tid.
+	 *
+	 * struct {
+	 *	struct perf_event_header	header;
+	 *	u32				next_prev_pid;
+	 *	u32				next_prev_tid;
+	 *	struct sample_id		sample_id;
+	 * };
+	 */
+	PERF_RECORD_SWITCH_CPU_WIDE		= 15,
+
 	PERF_RECORD_MAX,			/* non-ABI */
 };
 
@@ -807,6 +882,7 @@ enum perf_callchain_context {
  * PERF_RECORD_AUX::flags bits
  */
 #define PERF_AUX_FLAG_TRUNCATED		0x01	/* record was truncated to fit */
+#define PERF_AUX_FLAG_OVERWRITE		0x02	/* snapshot from overwrite mode */
 
 #define PERF_FLAG_FD_NO_GROUP		(1UL << 0)
 #define PERF_FLAG_FD_OUTPUT		(1UL << 1)
@@ -898,8 +974,12 @@ struct perf_branch_entry {
 		predicted:1,/* target predicted */
 		in_tx:1,    /* in transaction */
 		abort:1,    /* transaction abort */
+#ifndef __GENKSYMS__
 		cycles:16,  /* cycle count to last branch */
 		reserved:44;
+#else
+		reserved:60;
+#endif
 };
 
 #endif /* _UAPI_LINUX_PERF_EVENT_H */

@@ -373,7 +373,7 @@ int vmbus_establish_gpadl(struct vmbus_channel *channel, void *kbuffer,
 	struct vmbus_channel_gpadl_header *gpadlmsg;
 	struct vmbus_channel_gpadl_body *gpadl_body;
 	struct vmbus_channel_msginfo *msginfo = NULL;
-	struct vmbus_channel_msginfo *submsginfo;
+	struct vmbus_channel_msginfo *submsginfo, *tmp;
 	struct list_head *curr;
 	u32 next_gpadl_handle;
 	unsigned long flags;
@@ -430,6 +430,10 @@ cleanup:
 	spin_lock_irqsave(&vmbus_connection.channelmsg_lock, flags);
 	list_del(&msginfo->msglistentry);
 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
+	list_for_each_entry_safe(submsginfo, tmp, &msginfo->submsglist,
+				 msglistentry) {
+		kfree(submsginfo);
+	}
 
 	kfree(msginfo);
 	return ret;
@@ -569,12 +573,6 @@ static int vmbus_close_internal(struct vmbus_channel *channel)
 	free_pages((unsigned long)channel->ringbuffer_pages,
 		get_order(channel->ringbuffer_pagecount * PAGE_SIZE));
 
-	/*
-	 * If the channel has been rescinded; process device removal.
-	 */
-	if (channel->rescind)
-		hv_process_channel_removal(channel,
-					   channel->offermsg.child_relid);
 out:
 	tasklet_enable(tasklet);
 
@@ -645,7 +643,28 @@ int vmbus_sendpacket_ctl(struct vmbus_channel *channel, void *buffer,
 	ret = hv_ringbuffer_write(&channel->outbound, bufferlist, num_vecs,
 				  &signal);
 
-	if ((ret == 0) && kick_q && signal)
+	/*
+	 * Signalling the host is conditional on many factors:
+	 * 1. The ring state changed from being empty to non-empty.
+	 *    This is tracked by the variable "signal".
+	 * 2. The variable kick_q tracks if more data will be placed
+	 *    on the ring. We will not signal if more data is
+	 *    to be placed.
+	 *
+	 * Based on the channel signal state, we will decide
+	 * which signaling policy will be applied.
+	 *
+	 * If we cannot write to the ring-buffer; signal the host
+	 * even if we may not have written anything. This is a rare
+	 * enough condition that it should not matter.
+	 */
+
+	if (channel->signal_policy)
+		signal = true;
+	else
+		kick_q = true;
+
+	if (((ret == 0) && kick_q && signal) || (ret))
 		vmbus_setevent(channel);
 
 	return ret;
@@ -736,7 +755,28 @@ int vmbus_sendpacket_pagebuffer_ctl(struct vmbus_channel *channel,
 
 	ret = hv_ringbuffer_write(&channel->outbound, bufferlist, 3, &signal);
 
-	if ((ret == 0) && kick_q && signal)
+	/*
+	 * Signalling the host is conditional on many factors:
+	 * 1. The ring state changed from being empty to non-empty.
+	 *    This is tracked by the variable "signal".
+	 * 2. The variable kick_q tracks if more data will be placed
+	 *    on the ring. We will not signal if more data is
+	 *    to be placed.
+	 *
+	 * Based on the channel signal state, we will decide
+	 * which signaling policy will be applied.
+	 *
+	 * If we cannot write to the ring-buffer; signal the host
+	 * even if we may not have written anything. This is a rare
+	 * enough condition that it should not matter.
+	 */
+
+	if (channel->signal_policy)
+		signal = true;
+	else
+		kick_q = true;
+
+	if (((ret == 0) && kick_q && signal) || (ret))
 		vmbus_setevent(channel);
 
 	return ret;
@@ -885,37 +925,11 @@ __vmbus_recvpacket(struct vmbus_channel *channel, void *buffer,
 		   u32 bufferlen, u32 *buffer_actual_len, u64 *requestid,
 		   bool raw)
 {
-	struct vmpacket_descriptor desc;
-	u32 packetlen;
-	u32 userlen;
 	int ret;
 	bool signal = false;
 
-	*buffer_actual_len = 0;
-	*requestid = 0;
-
-
-	ret = hv_ringbuffer_peek(&channel->inbound, &desc,
-			     sizeof(struct vmpacket_descriptor));
-	if (ret != 0)
-		return 0;
-
-	packetlen = desc.len8 << 3;
-	if (!raw)
-		userlen = packetlen - (desc.offset8 << 3);
-	else
-		userlen = packetlen;
-
-	*buffer_actual_len = userlen;
-
-	if (userlen > bufferlen)
-		return -ENOBUFS;
-
-	*requestid = desc.trans_id;
-
-	/* Copy over the packet to the user buffer */
-	ret = hv_ringbuffer_read(&channel->inbound, buffer, userlen,
-				 raw ? 0 : desc.offset8 << 3, &signal);
+	ret = hv_ringbuffer_read(&channel->inbound, buffer, bufferlen,
+				 buffer_actual_len, requestid, &signal, raw);
 
 	if (signal)
 		vmbus_setevent(channel);

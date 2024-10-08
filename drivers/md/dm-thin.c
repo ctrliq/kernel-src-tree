@@ -1546,18 +1546,6 @@ static void process_discard_cell_no_passdown(struct thin_c *tc,
 		pool->process_prepared_discard(m);
 }
 
-/*
- * FIXME: DM local hack to defer parent bios's end_io until we
- * _know_ all chained sub range discard bios have completed.
- * Will go away once late bio splitting lands upstream!
- */
-static inline void __bio_inc_remaining(struct bio *bio)
-{
-	bio->bio_aux->bi_flags |= (1 << BIO_AUX_CHAIN);
-	smp_mb__before_atomic();
-	atomic_inc(&bio->bio_aux->__bi_remaining);
-}
-
 static void break_up_discard_bio(struct thin_c *tc, dm_block_t begin, dm_block_t end,
 				 struct bio *bio)
 {
@@ -1613,7 +1601,7 @@ static void break_up_discard_bio(struct thin_c *tc, dm_block_t begin, dm_block_t
 		 * the implicit decrement that occurs via bio_endio() in
 		 * process_prepared_discard_{passdown,no_passdown}.
 		 */
-		__bio_inc_remaining(bio);
+		bio_inc_remaining(bio);
 		if (!dm_deferred_set_add_work(pool->all_io_ds, &m->list))
 			pool->process_prepared_discard(m);
 
@@ -4117,7 +4105,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	ti->num_flush_bios = 1;
 	ti->flush_supported = true;
-	ti->per_bio_data_size = sizeof(struct dm_thin_endio_hook);
+	ti->per_io_data_size = sizeof(struct dm_thin_endio_hook);
 
 	/* In case the pool supports discards, pass them on. */
 	ti->discard_zeroes_data_unsupported = true;

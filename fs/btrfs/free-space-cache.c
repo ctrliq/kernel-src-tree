@@ -226,9 +226,39 @@ int btrfs_check_trunc_cache_free_space(struct btrfs_root *root,
 
 int btrfs_truncate_free_space_cache(struct btrfs_root *root,
 				    struct btrfs_trans_handle *trans,
+				    struct btrfs_block_group_cache *block_group,
 				    struct inode *inode)
 {
 	int ret = 0;
+	struct btrfs_path *path = btrfs_alloc_path();
+	bool locked = false;
+
+	if (!path) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+
+	if (block_group) {
+		locked = true;
+		mutex_lock(&trans->transaction->cache_write_mutex);
+		if (!list_empty(&block_group->io_list)) {
+			list_del_init(&block_group->io_list);
+
+			btrfs_wait_cache_io(root, trans, block_group,
+					    &block_group->io_ctl, path,
+					    block_group->key.objectid);
+			btrfs_put_block_group(block_group);
+		}
+
+		/*
+		 * now that we've truncated the cache away, its no longer
+		 * setup or written
+		 */
+		spin_lock(&block_group->lock);
+		block_group->disk_cache_state = BTRFS_DC_CLEAR;
+		spin_unlock(&block_group->lock);
+	}
+	btrfs_free_path(path);
 
 	btrfs_i_size_write(inode, 0);
 	truncate_pagecache(inode, 0);
@@ -241,12 +271,14 @@ int btrfs_truncate_free_space_cache(struct btrfs_root *root,
 	 */
 	ret = btrfs_truncate_inode_items(trans, root, inode,
 					 0, BTRFS_EXTENT_DATA_KEY);
-	if (ret) {
-		btrfs_abort_transaction(trans, root, ret);
-		return ret;
-	}
+	if (ret)
+		goto fail;
 
 	ret = btrfs_update_inode(trans, root, inode);
+
+fail:
+	if (locked)
+		mutex_unlock(&trans->transaction->cache_write_mutex);
 	if (ret)
 		btrfs_abort_transaction(trans, root, ret);
 
@@ -876,6 +908,7 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
 {
 	int ret;
 	struct btrfs_free_cluster *cluster = NULL;
+	struct btrfs_free_cluster *cluster_locked = NULL;
 	struct rb_node *node = rb_first(&ctl->free_space_offset);
 	struct btrfs_trim_range *trim_entry;
 
@@ -887,6 +920,8 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
 	}
 
 	if (!node && cluster) {
+		cluster_locked = cluster;
+		spin_lock(&cluster_locked->lock);
 		node = rb_first(&cluster->root);
 		cluster = NULL;
 	}
@@ -910,8 +945,14 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
 		node = rb_next(node);
 		if (!node && cluster) {
 			node = rb_first(&cluster->root);
+			cluster_locked = cluster;
+			spin_lock(&cluster_locked->lock);
 			cluster = NULL;
 		}
+	}
+	if (cluster_locked) {
+		spin_unlock(&cluster_locked->lock);
+		cluster_locked = NULL;
 	}
 
 	/*
@@ -930,6 +971,8 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
 
 	return 0;
 fail:
+	if (cluster_locked)
+		spin_unlock(&cluster_locked->lock);
 	return -ENOSPC;
 }
 
@@ -1074,10 +1117,7 @@ static int flush_dirty_cache(struct inode *inode)
 }
 
 static void noinline_for_stack
-cleanup_write_cache_enospc(struct inode *inode,
-			   struct btrfs_io_ctl *io_ctl,
-			   struct extent_state **cached_state,
-			   struct list_head *bitmap_list)
+cleanup_bitmap_list(struct list_head *bitmap_list)
 {
 	struct list_head *pos, *n;
 
@@ -1086,6 +1126,14 @@ cleanup_write_cache_enospc(struct inode *inode,
 			list_entry(pos, struct btrfs_free_space, list);
 		list_del_init(&entry->list);
 	}
+}
+
+static void noinline_for_stack
+cleanup_write_cache_enospc(struct inode *inode,
+			   struct btrfs_io_ctl *io_ctl,
+			   struct extent_state **cached_state,
+			   struct list_head *bitmap_list)
+{
 	io_ctl_drop_pages(io_ctl);
 	unlock_extent_cached(&BTRFS_I(inode)->io_tree, 0,
 			     i_size_read(inode) - 1, cached_state,
@@ -1101,7 +1149,11 @@ int btrfs_wait_cache_io(struct btrfs_root *root,
 	int ret;
 	struct inode *inode = io_ctl->inode;
 
-	root = root->fs_info->tree_root;
+	if (!inode)
+		return 0;
+
+	if (block_group)
+		root = root->fs_info->tree_root;
 
 	/* Flush the dirty pages in the cache file. */
 	ret = flush_dirty_cache(inode);
@@ -1127,11 +1179,16 @@ out:
 	btrfs_update_inode(trans, root, inode);
 
 	if (block_group) {
+		/* the dirty list is protected by the dirty_bgs_lock */
+		spin_lock(&trans->transaction->dirty_bgs_lock);
+
+		/* the disk_cache_state is protected by the block group lock */
 		spin_lock(&block_group->lock);
 
 		/*
 		 * only mark this as written if we didn't get put back on
-		 * the dirty list while waiting for IO.
+		 * the dirty list while waiting for IO.   Otherwise our
+		 * cache state won't be right, and we won't get written again
 		 */
 		if (!ret && list_empty(&block_group->dirty_list))
 			block_group->disk_cache_state = BTRFS_DC_WRITTEN;
@@ -1139,6 +1196,7 @@ out:
 			block_group->disk_cache_state = BTRFS_DC_ERROR;
 
 		spin_unlock(&block_group->lock);
+		spin_unlock(&trans->transaction->dirty_bgs_lock);
 		io_ctl->inode = NULL;
 		iput(inode);
 	}
@@ -1209,24 +1267,24 @@ static int __btrfs_write_out_cache(struct btrfs_root *root, struct inode *inode,
 
 	mutex_lock(&ctl->cache_writeout_mutex);
 	/* Write out the extent entries in the free space cache */
+	spin_lock(&ctl->tree_lock);
 	ret = write_cache_extent_entries(io_ctl, ctl,
 					 block_group, &entries, &bitmaps,
 					 &bitmap_list);
-	if (ret) {
-		mutex_unlock(&ctl->cache_writeout_mutex);
-		goto out_nospc;
-	}
+	if (ret)
+		goto out_nospc_locked;
 
 	/*
 	 * Some spaces that are freed in the current transaction are pinned,
 	 * they will be added into free space cache after the transaction is
 	 * committed, we shouldn't lose them.
+	 *
+	 * If this changes while we are working we'll get added back to
+	 * the dirty list and redo it.  No locking needed
 	 */
 	ret = write_pinned_extent_entries(root, block_group, io_ctl, &entries);
-	if (ret) {
-		mutex_unlock(&ctl->cache_writeout_mutex);
-		goto out_nospc;
-	}
+	if (ret)
+		goto out_nospc_locked;
 
 	/*
 	 * At last, we write out all the bitmaps and keep cache_writeout_mutex
@@ -1234,6 +1292,7 @@ static int __btrfs_write_out_cache(struct btrfs_root *root, struct inode *inode,
 	 * or freeing the bitmap.
 	 */
 	ret = write_bitmap_entries(io_ctl, &bitmap_list);
+	spin_unlock(&ctl->tree_lock);
 	mutex_unlock(&ctl->cache_writeout_mutex);
 	if (ret)
 		goto out_nospc;
@@ -1284,6 +1343,11 @@ out:
 		iput(inode);
 	return ret;
 
+out_nospc_locked:
+	cleanup_bitmap_list(&bitmap_list);
+	spin_unlock(&ctl->tree_lock);
+	mutex_unlock(&ctl->cache_writeout_mutex);
+
 out_nospc:
 	cleanup_write_cache_enospc(inode, io_ctl, &cached_state, &bitmap_list);
 
@@ -1306,12 +1370,6 @@ int btrfs_write_out_cache(struct btrfs_root *root,
 
 	spin_lock(&block_group->lock);
 	if (block_group->disk_cache_state < BTRFS_DC_SETUP) {
-		spin_unlock(&block_group->lock);
-		return 0;
-	}
-
-	if (block_group->delalloc_bytes) {
-		block_group->disk_cache_state = BTRFS_DC_WRITTEN;
 		spin_unlock(&block_group->lock);
 		return 0;
 	}
@@ -1363,11 +1421,11 @@ static inline u64 offset_to_bitmap(struct btrfs_free_space_ctl *ctl,
 				   u64 offset)
 {
 	u64 bitmap_start;
-	u64 bytes_per_bitmap;
+	u32 bytes_per_bitmap;
 
 	bytes_per_bitmap = BITS_PER_BITMAP * ctl->unit;
 	bitmap_start = offset - ctl->start;
-	bitmap_start = div64_u64(bitmap_start, bytes_per_bitmap);
+	bitmap_start = div_u64(bitmap_start, bytes_per_bitmap);
 	bitmap_start *= bytes_per_bitmap;
 	bitmap_start += ctl->start;
 
@@ -1586,10 +1644,10 @@ static void recalculate_thresholds(struct btrfs_free_space_ctl *ctl)
 	u64 bitmap_bytes;
 	u64 extent_bytes;
 	u64 size = block_group->key.offset;
-	u64 bytes_per_bg = BITS_PER_BITMAP * ctl->unit;
-	int max_bitmaps = div64_u64(size + bytes_per_bg - 1, bytes_per_bg);
+	u32 bytes_per_bg = BITS_PER_BITMAP * ctl->unit;
+	u32 max_bitmaps = div_u64(size + bytes_per_bg - 1, bytes_per_bg);
 
-	max_bitmaps = max(max_bitmaps, 1);
+	max_bitmaps = max_t(u32, max_bitmaps, 1);
 
 	ASSERT(ctl->total_bitmaps <= max_bitmaps);
 
@@ -1754,7 +1812,7 @@ find_free_space(struct btrfs_free_space_ctl *ctl, u64 *offset, u64 *bytes,
 		 */
 		if (*bytes >= align) {
 			tmp = entry->offset - ctl->start + align - 1;
-			do_div(tmp, align);
+			tmp = div64_u64(tmp, align);
 			tmp = tmp * align + ctl->start;
 			align_off = tmp - entry->offset;
 		} else {
@@ -3462,15 +3520,28 @@ int btrfs_write_out_ino_cache(struct btrfs_root *root,
 	struct btrfs_free_space_ctl *ctl = root->free_ino_ctl;
 	int ret;
 	struct btrfs_io_ctl io_ctl;
+	bool release_metadata = true;
 
 	if (!btrfs_test_opt(root, INODE_MAP_CACHE))
 		return 0;
 
+	memset(&io_ctl, 0, sizeof(io_ctl));
 	ret = __btrfs_write_out_cache(root, inode, ctl, NULL, &io_ctl,
-				      trans, path, 0) ||
-		btrfs_wait_cache_io(root, trans, NULL, &io_ctl, path, 0);
+				      trans, path, 0);
+	if (!ret) {
+		/*
+		 * At this point writepages() didn't error out, so our metadata
+		 * reservation is released when the writeback finishes, at
+		 * inode.c:btrfs_finish_ordered_io(), regardless of it finishing
+		 * with or without an error.
+		 */
+		release_metadata = false;
+		ret = btrfs_wait_cache_io(root, trans, NULL, &io_ctl, path, 0);
+	}
+
 	if (ret) {
-		btrfs_delalloc_release_metadata(inode, inode->i_size);
+		if (release_metadata)
+			btrfs_delalloc_release_metadata(inode, inode->i_size);
 #ifdef DEBUG
 		btrfs_err(root->fs_info,
 			"failed to write free ino cache for root %llu",

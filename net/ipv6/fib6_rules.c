@@ -146,7 +146,7 @@ static int fib6_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 			return 0;
 	}
 
-	if (r->tclass && r->tclass != ((ntohl(fl6->flowlabel) >> 20) & 0xff))
+	if (r->tclass && r->tclass != ip6_tclass(fl6->flowlabel))
 		return 0;
 
 	return 1;
@@ -234,11 +234,6 @@ nla_put_failure:
 	return -ENOBUFS;
 }
 
-static u32 fib6_rule_default_pref(struct fib_rules_ops *ops)
-{
-	return 0x3FFF;
-}
-
 static size_t fib6_rule_nlmsg_payload(struct fib_rule *rule)
 {
 	return nla_total_size(16) /* dst */
@@ -254,7 +249,6 @@ static const struct fib_rules_ops __net_initconst fib6_rules_ops_template = {
 	.configure		= fib6_rule_configure,
 	.compare		= fib6_rule_compare,
 	.fill			= fib6_rule_fill,
-	.default_pref		= fib6_rule_default_pref,
 	.nlmsg_payload		= fib6_rule_nlmsg_payload,
 	.nlgroup		= RTNLGRP_IPV6_RULE,
 	.policy			= fib6_rule_policy,

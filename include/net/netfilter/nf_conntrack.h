@@ -179,10 +179,6 @@ void *nf_ct_alloc_hashtable(unsigned int *sizep, int nulls);
 
 void nf_ct_free_hashtable(void *hash, unsigned int size);
 
-struct nf_conntrack_tuple_hash *
-__nf_conntrack_find(struct net *net, u16 zone,
-		    const struct nf_conntrack_tuple *tuple);
-
 int nf_conntrack_hash_check_insert(struct nf_conn *ct);
 bool nf_ct_delete(struct nf_conn *ct, u32 pid, int report);
 
@@ -248,8 +244,12 @@ void nf_ct_untracked_status_or(unsigned long bits);
 void nf_ct_iterate_cleanup(struct net *net,
 			   int (*iter)(struct nf_conn *i, void *data),
 			   void *data, u32 portid, int report);
+
+struct nf_conntrack_zone;
+
 void nf_conntrack_free(struct nf_conn *ct);
-struct nf_conn *nf_conntrack_alloc(struct net *net, u16 zone,
+struct nf_conn *nf_conntrack_alloc(struct net *net,
+				   const struct nf_conntrack_zone *zone,
 				   const struct nf_conntrack_tuple *orig,
 				   const struct nf_conntrack_tuple *repl,
 				   gfp_t gfp);
@@ -289,7 +289,9 @@ extern unsigned int nf_conntrack_max;
 extern unsigned int nf_conntrack_hash_rnd;
 void init_nf_conntrack_hash_rnd(void);
 
-struct nf_conn *nf_ct_tmpl_alloc(struct net *net, u16 zone, gfp_t flags);
+struct nf_conn *nf_ct_tmpl_alloc(struct net *net,
+				 const struct nf_conntrack_zone *zone,
+				 gfp_t flags);
 void nf_ct_tmpl_free(struct nf_conn *tmpl);
 
 #define NF_CT_STAT_INC(net, count)	  __this_cpu_inc((net)->ct.stat->count)

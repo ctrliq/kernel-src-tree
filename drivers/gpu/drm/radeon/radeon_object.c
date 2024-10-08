@@ -93,15 +93,6 @@ bool radeon_ttm_bo_is_radeon_bo(struct ttm_buffer_object *bo)
 	return false;
 }
 
-static inline bool radeon_placement_can_wc(struct radeon_bo *rbo)
-{
-	if ((rbo->flags & RADEON_GEM_GTT_WC) && drm_arch_can_wc_memory())
-		return true;
-	if (rbo->rdev->flags & RADEON_IS_AGP)
-		return true;
-	return false;
-}
-
 void radeon_ttm_placement_from_domain(struct radeon_bo *rbo, u32 domain)
 {
 	u32 c = 0, i;
@@ -133,7 +124,8 @@ void radeon_ttm_placement_from_domain(struct radeon_bo *rbo, u32 domain)
 			rbo->placements[c++].flags = TTM_PL_FLAG_UNCACHED |
 				TTM_PL_FLAG_TT;
 
-		} else if (radeon_placement_can_wc(rbo)) {
+		} else if ((rbo->flags & RADEON_GEM_GTT_WC) ||
+			   (rbo->rdev->flags & RADEON_IS_AGP)) {
 			rbo->placements[c].fpfn = 0;
 			rbo->placements[c++].flags = TTM_PL_FLAG_WC |
 				TTM_PL_FLAG_UNCACHED |
@@ -151,7 +143,8 @@ void radeon_ttm_placement_from_domain(struct radeon_bo *rbo, u32 domain)
 			rbo->placements[c++].flags = TTM_PL_FLAG_UNCACHED |
 				TTM_PL_FLAG_SYSTEM;
 
-		} else if (radeon_placement_can_wc(rbo)) {
+		} else if ((rbo->flags & RADEON_GEM_GTT_WC) ||
+		    rbo->rdev->flags & RADEON_IS_AGP) {
 			rbo->placements[c].fpfn = 0;
 			rbo->placements[c++].flags = TTM_PL_FLAG_WC |
 				TTM_PL_FLAG_UNCACHED |
@@ -221,19 +214,25 @@ int radeon_bo_create(struct radeon_device *rdev,
 	INIT_LIST_HEAD(&bo->list);
 	INIT_LIST_HEAD(&bo->va);
 	bo->initial_domain = domain & (RADEON_GEM_DOMAIN_VRAM |
-	                               RADEON_GEM_DOMAIN_GTT |
-	                               RADEON_GEM_DOMAIN_CPU);
+				       RADEON_GEM_DOMAIN_GTT |
+				       RADEON_GEM_DOMAIN_CPU);
 
 	bo->flags = flags;
 	/* PCI GART is always snooped */
 	if (!(rdev->flags & RADEON_IS_PCIE))
 		bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
 
+	/* Write-combined CPU mappings of GTT cause GPU hangs with RV6xx
+	 * See https://bugs.freedesktop.org/show_bug.cgi?id=91268
+	 */
+	if (rdev->family >= CHIP_RV610 && rdev->family <= CHIP_RV635)
+		bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
+
 #ifdef CONFIG_X86_32
 	/* XXX: Write-combined CPU mappings of GTT seem broken on 32-bit
 	 * See https://bugs.freedesktop.org/show_bug.cgi?id=84627
 	 */
-	bo->flags &= ~RADEON_GEM_GTT_WC;
+	bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
 #elif defined(CONFIG_X86) && !defined(CONFIG_X86_PAT)
 	/* Don't try to enable write-combining when it can't work, or things
 	 * may be slow
@@ -243,9 +242,16 @@ int radeon_bo_create(struct radeon_device *rdev,
 #warning Please enable CONFIG_MTRR and CONFIG_X86_PAT for better performance \
 	 thanks to write-combining
 
-	DRM_INFO_ONCE("Please enable CONFIG_MTRR and CONFIG_X86_PAT for "
-		      "better performance thanks to write-combining\n");
-	bo->flags &= ~RADEON_GEM_GTT_WC;
+	if (bo->flags & RADEON_GEM_GTT_WC)
+		DRM_INFO_ONCE("Please enable CONFIG_MTRR and CONFIG_X86_PAT for "
+			      "better performance thanks to write-combining\n");
+	bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
+#else
+	/* For architectures that don't support WC memory,
+	 * mask out the WC flag from the BO
+	 */
+	if (!drm_arch_can_wc_memory())
+		bo->flags &= ~RADEON_GEM_GTT_WC;
 #endif
 
 	radeon_ttm_placement_from_domain(bo, domain);
@@ -427,7 +433,6 @@ void radeon_bo_force_delete(struct radeon_device *rdev)
 	}
 	dev_err(rdev->dev, "Userspace still has active objects !\n");
 	list_for_each_entry_safe(bo, n, &rdev->gem.objects, list) {
-		mutex_lock(&rdev->ddev->struct_mutex);
 		dev_err(rdev->dev, "%p %p %lu %lu force free\n",
 			&bo->gem_base, bo, (unsigned long)bo->gem_base.size,
 			*((unsigned long *)&bo->gem_base.refcount));
@@ -435,8 +440,7 @@ void radeon_bo_force_delete(struct radeon_device *rdev)
 		list_del_init(&bo->list);
 		mutex_unlock(&bo->rdev->gem.mutex);
 		/* this should unref the ttm bo */
-		drm_gem_object_unreference(&bo->gem_base);
-		mutex_unlock(&rdev->ddev->struct_mutex);
+		drm_gem_object_unreference_unlocked(&bo->gem_base);
 	}
 }
 
@@ -795,6 +799,10 @@ int radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
 	if ((offset + size) <= rdev->mc.visible_vram_size)
 		return 0;
 
+	/* Can't move a pinned BO to visible VRAM */
+	if (rbo->pin_count > 0)
+		return -EINVAL;
+
 	/* hurrah the memory is not visible ! */
 	radeon_ttm_placement_from_domain(rbo, RADEON_GEM_DOMAIN_VRAM);
 	lpfn =	rdev->mc.visible_vram_size >> PAGE_SHIFT;
@@ -844,7 +852,7 @@ int radeon_bo_wait(struct radeon_bo *bo, u32 *mem_type, bool no_wait)
  *
  */
 void radeon_bo_fence(struct radeon_bo *bo, struct radeon_fence *fence,
-                     bool shared)
+		     bool shared)
 {
 	struct reservation_object *resv = bo->tbo.resv;
 

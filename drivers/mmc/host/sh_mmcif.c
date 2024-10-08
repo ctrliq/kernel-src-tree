@@ -61,7 +61,6 @@
 #include <linux/platform_device.h>
 #include <linux/pm_qos.h>
 #include <linux/pm_runtime.h>
-#include <linux/sh_dma.h>
 #include <linux/spinlock.h>
 #include <linux/module.h>
 
@@ -957,8 +956,11 @@ static int sh_mmcif_clk_update(struct sh_mmcif_host *host)
 
 static void sh_mmcif_set_power(struct sh_mmcif_host *host, struct mmc_ios *ios)
 {
+	struct sh_mmcif_plat_data *pd = host->pd->dev.platform_data;
 	struct mmc_host *mmc = host->mmc;
 
+	if (pd && pd->set_pwr)
+		pd->set_pwr(host->pd, ios->power_mode != MMC_POWER_OFF);
 	if (!IS_ERR(mmc->supply.vmmc))
 		/* Errors ignored... */
 		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc,
@@ -1498,6 +1500,8 @@ static int sh_mmcif_remove(struct platform_device *pdev)
 	free_irq(irq[0], host);
 	if (irq[1] >= 0)
 		free_irq(irq[1], host);
+
+	platform_set_drvdata(pdev, NULL);
 
 	clk_disable(host->hclk);
 	mmc_free_host(host->mmc);

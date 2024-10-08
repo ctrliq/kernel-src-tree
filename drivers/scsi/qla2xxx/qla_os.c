@@ -221,6 +221,13 @@ MODULE_PARM_DESC(ql2xmdenable,
 		"0 - MiniDump disabled. "
 		"1 (Default) - MiniDump enabled.");
 
+int ql2xfwholdabts = 0;
+module_param(ql2xfwholdabts, int, S_IRUGO);
+MODULE_PARM_DESC(ql2xfwholdabts,
+		"Allow FW to hold status IOCB until ABTS rsp received. "
+		"0 (Default) Do not set fw option. "
+		"1 - Set fw option to hold ABTS.");
+
 /*
  * SCSI host template entry points
  */
@@ -2642,6 +2649,7 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	pci_set_drvdata(pdev, base_vha);
+	set_bit(PFLG_DRIVER_PROBING, &base_vha->pci_flags);
 
 	host = base_vha->host;
 	base_vha->req = req;
@@ -2831,6 +2839,8 @@ que_init:
 	 */
 	qla2xxx_wake_dpc(base_vha);
 
+	INIT_WORK(&ha->board_disable, qla2x00_disable_board_on_pci_error);
+
 	if (IS_QLA8031(ha) || IS_MCTP_CAPABLE(ha)) {
 		sprintf(wq_name, "qla2xxx_%lu_dpc_lp_wq", base_vha->host_no);
 		ha->dpc_lp_wq = create_singlethread_workqueue(wq_name);
@@ -2937,6 +2947,7 @@ skip_dpc:
 
 	qlt_add_target(ha, base_vha);
 
+	clear_bit(PFLG_DRIVER_PROBING, &base_vha->pci_flags);
 	return 0;
 
 probe_init_failed:
@@ -2988,22 +2999,6 @@ probe_out:
 }
 
 static void
-qla2x00_stop_dpc_thread(scsi_qla_host_t *vha)
-{
-	struct qla_hw_data *ha = vha->hw;
-	struct task_struct *t = ha->dpc_thread;
-
-	if (ha->dpc_thread == NULL)
-		return;
-	/*
-	 * qla2xxx_wake_dpc checks for ->dpc_thread
-	 * so we need to zero it out.
-	 */
-	ha->dpc_thread = NULL;
-	kthread_stop(t);
-}
-
-static void
 qla2x00_shutdown(struct pci_dev *pdev)
 {
 	scsi_qla_host_t *vha;
@@ -3049,30 +3044,13 @@ qla2x00_shutdown(struct pci_dev *pdev)
 	pci_disable_device(pdev);
 }
 
+/* Deletes all the virtual ports for a given ha */
 static void
-qla2x00_remove_one(struct pci_dev *pdev)
+qla2x00_delete_all_vps(struct qla_hw_data *ha, scsi_qla_host_t *base_vha)
 {
-	scsi_qla_host_t *base_vha, *vha;
-	struct qla_hw_data  *ha;
+	struct Scsi_Host *scsi_host;
+	scsi_qla_host_t *vha;
 	unsigned long flags;
-
-	/*
-	 * If the PCI device is disabled that means that probe failed and any
-	 * resources should be have cleaned up on probe exit.
-	 */
-	if (!atomic_read(&pdev->enable_cnt))
-		return;
-
-	base_vha = pci_get_drvdata(pdev);
-	ha = base_vha->hw;
-
-	qla2x00_wait_for_hba_ready(base_vha);
-
-	ha->flags.host_shutting_down = 1;
-
-	set_bit(UNLOADING, &base_vha->dpc_flags);
-	if (IS_QLAFX00(ha))
-		qlafx00_driver_shutdown(base_vha, 20);
 
 	mutex_lock(&ha->vport_lock);
 	while (ha->cur_vport_count) {
@@ -3081,7 +3059,7 @@ qla2x00_remove_one(struct pci_dev *pdev)
 		BUG_ON(base_vha->list.next == &ha->vp_list);
 		/* This assumes first entry in ha->vp_list is always base vha */
 		vha = list_first_entry(&base_vha->list, scsi_qla_host_t, list);
-		scsi_host_get(vha->host);
+		scsi_host = scsi_host_get(vha->host);
 
 		spin_unlock_irqrestore(&ha->vport_slock, flags);
 		mutex_unlock(&ha->vport_lock);
@@ -3092,31 +3070,12 @@ qla2x00_remove_one(struct pci_dev *pdev)
 		mutex_lock(&ha->vport_lock);
 	}
 	mutex_unlock(&ha->vport_lock);
+}
 
-	if (IS_QLA8031(ha)) {
-		ql_dbg(ql_dbg_p3p, base_vha, 0xb07e,
-		    "Clearing fcoe driver presence.\n");
-		if (qla83xx_clear_drv_presence(base_vha) != QLA_SUCCESS)
-			ql_dbg(ql_dbg_p3p, base_vha, 0xb079,
-			    "Error while clearing DRV-Presence.\n");
-	}
-
-	qla2x00_abort_all_cmds(base_vha, DID_NO_CONNECT << 16);
-
-	qla2x00_dfs_remove(base_vha);
-
-	qla84xx_put_chip(base_vha);
-
-	/* Laser should be disabled only for ISP2031 */
-	if (IS_QLA2031(ha))
-		qla83xx_disable_laser(base_vha);
-
-	/* Disable timer */
-	if (base_vha->timer_active)
-		qla2x00_stop_timer(base_vha);
-
-	base_vha->flags.online = 0;
-
+/* Stops all deferred work threads */
+static void
+qla2x00_destroy_deferred_work(struct qla_hw_data *ha)
+{
 	/* Flush the work queue and remove it */
 	if (ha->wq) {
 		flush_workqueue(ha->wq);
@@ -3150,25 +3109,12 @@ qla2x00_remove_one(struct pci_dev *pdev)
 		ha->dpc_thread = NULL;
 		kthread_stop(t);
 	}
-	qlt_remove_target(ha, base_vha);
+}
 
-	qla2x00_free_sysfs_attr(base_vha);
-
-	fc_remove_host(base_vha->host);
-
-	scsi_remove_host(base_vha->host);
-
-	qla2x00_free_device(base_vha);
-
-	if (IS_QLA8044(ha)) {
-		qla8044_idc_lock(ha);
-		qla8044_clear_drv_active(ha);
-		qla8044_idc_unlock(ha);
-	}
+static void
+qla2x00_unmap_iobases(struct qla_hw_data *ha)
+{
 	if (IS_QLA82XX(ha)) {
-		qla82xx_idc_lock(ha);
-		qla82xx_clear_drv_active(ha);
-		qla82xx_idc_unlock(ha);
 
 		iounmap((device_reg_t *)ha->nx_pcibase);
 		if (!ql2xdbwr)
@@ -3186,8 +3132,101 @@ qla2x00_remove_one(struct pci_dev *pdev)
 		if ((IS_QLA83XX(ha) || IS_QLA27XX(ha)) && ha->msixbase)
 			iounmap(ha->msixbase);
 	}
+}
+
+static void
+qla2x00_clear_drv_active(struct qla_hw_data *ha)
+{
+	if (IS_QLA8044(ha)) {
+		qla8044_idc_lock(ha);
+		qla8044_clear_drv_active(ha);
+		qla8044_idc_unlock(ha);
+	} else if (IS_QLA82XX(ha)) {
+		qla82xx_idc_lock(ha);
+		qla82xx_clear_drv_active(ha);
+		qla82xx_idc_unlock(ha);
+	}
+}
+
+static void
+qla2x00_remove_one(struct pci_dev *pdev)
+{
+	scsi_qla_host_t *base_vha;
+	struct qla_hw_data  *ha;
+
+	base_vha = pci_get_drvdata(pdev);
+	ha = base_vha->hw;
+
+	/* Indicate device removal to prevent future board_disable and wait
+	 * until any pending board_disable has completed. */
+	set_bit(PFLG_DRIVER_REMOVING, &base_vha->pci_flags);
+	cancel_work_sync(&ha->board_disable);
+
+	/*
+	 * If the PCI device is disabled then there was a PCI-disconnect and
+	 * qla2x00_disable_board_on_pci_error has taken care of most of the
+	 * resources.
+	 */
+	if (!atomic_read(&pdev->enable_cnt)) {
+		scsi_host_put(base_vha->host);
+		kfree(ha);
+		pci_set_drvdata(pdev, NULL);
+		return;
+	}
+
+	qla2x00_wait_for_hba_ready(base_vha);
+
+	ha->flags.host_shutting_down = 1;
+
+	set_bit(UNLOADING, &base_vha->dpc_flags);
+
+	if (IS_QLAFX00(ha))
+		qlafx00_driver_shutdown(base_vha, 20);
+
+	qla2x00_delete_all_vps(ha, base_vha);
+
+	if (IS_QLA8031(ha)) {
+		ql_dbg(ql_dbg_p3p, base_vha, 0xb07e,
+		    "Clearing fcoe driver presence.\n");
+		if (qla83xx_clear_drv_presence(base_vha) != QLA_SUCCESS)
+			ql_dbg(ql_dbg_p3p, base_vha, 0xb079,
+			    "Error while clearing DRV-Presence.\n");
+	}
+
+	qla2x00_abort_all_cmds(base_vha, DID_NO_CONNECT << 16);
+
+	qla2x00_dfs_remove(base_vha);
+
+	qla84xx_put_chip(base_vha);
+
+	/* Laser should be disabled only for ISP2031 */
+	if (IS_QLA2031(ha))
+		qla83xx_disable_laser(base_vha);
+
+	/* Disable timer */
+	if (base_vha->timer_active)
+		qla2x00_stop_timer(base_vha);
+
+	base_vha->flags.online = 0;
+
+	qla2x00_destroy_deferred_work(ha);
+
+	qlt_remove_target(ha, base_vha);
+
+	qla2x00_free_sysfs_attr(base_vha, true);
+
+	fc_remove_host(base_vha->host);
+
+	scsi_remove_host(base_vha->host);
+
+	qla2x00_free_device(base_vha);
+
+	qla2x00_clear_drv_active(ha);
 
 	scsi_host_put(base_vha->host);
+
+	qla2x00_unmap_iobases(ha);
+
 	pci_release_selected_regions(ha->pdev, ha->bars);
 	kfree(ha);
 	ha = NULL;
@@ -3209,9 +3248,8 @@ qla2x00_free_device(scsi_qla_host_t *vha)
 	if (vha->timer_active)
 		qla2x00_stop_timer(vha);
 
-	qla2x00_stop_dpc_thread(vha);
-
 	qla25xx_delete_queues(vha);
+
 	if (ha->flags.fce_enabled)
 		qla2x00_disable_fce_trace(vha, NULL, NULL);
 
@@ -4762,6 +4800,63 @@ exit:
 	return rval;
 }
 
+void
+qla2x00_disable_board_on_pci_error(struct work_struct *work)
+{
+	struct qla_hw_data *ha = container_of(work, struct qla_hw_data,
+	    board_disable);
+	struct pci_dev *pdev = ha->pdev;
+	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
+
+	ql_log(ql_log_warn, base_vha, 0x015b,
+	    "Disabling adapter.\n");
+
+	set_bit(UNLOADING, &base_vha->dpc_flags);
+
+	qla2x00_delete_all_vps(ha, base_vha);
+
+	qla2x00_abort_all_cmds(base_vha, DID_NO_CONNECT << 16);
+
+	qla2x00_dfs_remove(base_vha);
+
+	qla84xx_put_chip(base_vha);
+
+	if (base_vha->timer_active)
+		qla2x00_stop_timer(base_vha);
+
+	base_vha->flags.online = 0;
+
+	qla2x00_destroy_deferred_work(ha);
+
+	/*
+	 * Do not try to stop beacon blink as it will issue a mailbox
+	 * command.
+	 */
+	qla2x00_free_sysfs_attr(base_vha, false);
+
+	fc_remove_host(base_vha->host);
+
+	scsi_remove_host(base_vha->host);
+
+	base_vha->flags.init_done = 0;
+	qla25xx_delete_queues(base_vha);
+	qla2x00_free_irqs(base_vha);
+	qla2x00_free_fcports(base_vha);
+	qla2x00_mem_free(ha);
+	qla82xx_md_free(base_vha);
+	qla2x00_free_queues(ha);
+
+	qla2x00_unmap_iobases(ha);
+
+	pci_release_selected_regions(ha->pdev, ha->bars);
+	pci_disable_pcie_error_reporting(pdev);
+	pci_disable_device(pdev);
+
+	/*
+	 * Let qla2x00_remove_one cleanup qla_hw_data on device removal.
+	 */
+}
+
 /**************************************************************************
 * qla2x00_do_dpc
 *   This kernel thread is a task that is schedule by the interrupt handler
@@ -4778,7 +4873,6 @@ exit:
 static int
 qla2x00_do_dpc(void *data)
 {
-	int		rval;
 	scsi_qla_host_t *base_vha;
 	struct qla_hw_data *ha;
 
@@ -5011,7 +5105,7 @@ loop_resync_check:
 			if (!(test_and_set_bit(LOOP_RESYNC_ACTIVE,
 			    &base_vha->dpc_flags))) {
 
-				rval = qla2x00_loop_resync(base_vha);
+				qla2x00_loop_resync(base_vha);
 
 				clear_bit(LOOP_RESYNC_ACTIVE,
 						&base_vha->dpc_flags);
@@ -5126,9 +5220,14 @@ qla2x00_timer(scsi_qla_host_t *vha)
 		return;
 	}
 
-	/* Hardware read to raise pending EEH errors during mailbox waits. */
-	if (!pci_channel_offline(ha->pdev))
+	/*
+	 * Hardware read to raise pending EEH errors during mailbox waits. If
+	 * the read returns -1 then disable the board.
+	 */
+	if (!pci_channel_offline(ha->pdev)) {
 		pci_read_config_word(ha->pdev, PCI_VENDOR_ID, &w);
+		qla2x00_check_reg16_for_disconnect(vha, w);
+	}
 
 	/* Make sure qla82xx_watchdog is run only for physical port */
 	if (!vha->vp_idx && IS_P3P_TYPE(ha)) {

@@ -734,12 +734,7 @@ __SYSCALL(332, sys_finit_module, 3)
 #define __NR_accept4				333
 __SYSCALL(333, sys_accept4, 4)
 
-#define __NR_sched_setattr			334
-__SYSCALL(334, sys_sched_setattr, 2)
-#define __NR_sched_getattr			335
-__SYSCALL(335, sys_sched_getattr, 3)
-
-#define __NR_syscall_count			336
+#define __NR_syscall_count			334
 
 /*
  * sysxtensa syscall handler

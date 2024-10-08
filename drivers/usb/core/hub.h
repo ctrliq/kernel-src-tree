@@ -98,7 +98,7 @@ struct usb_hub {
 struct usb_port {
 	struct usb_device *child;
 	struct device dev;
-	struct dev_state *port_owner;
+	struct usb_dev_state *port_owner;
 	struct usb_port *peer;
 	struct dev_pm_qos_request *req;
 	enum usb_port_connect_type connect_type;

@@ -30,10 +30,13 @@
 #include <linux/types.h>
 #include <linux/hardirq.h>
 #include <linux/acpi.h>
+#include <linux/dmi.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
+#include <linux/dynamic_debug.h>
 
 #include "internal.h"
+#include "sleep.h"
 
 #define _COMPONENT		ACPI_BUS_COMPONENT
 ACPI_MODULE_NAME("utils");
@@ -481,6 +484,24 @@ acpi_evaluate_ost(acpi_handle handle, u32 source_event, u32 status_code,
 EXPORT_SYMBOL(acpi_evaluate_ost);
 
 /**
+ * acpi_handle_path: Return the object path of handle
+ *
+ * Caller must free the returned buffer
+ */
+static char *acpi_handle_path(acpi_handle handle)
+{
+	struct acpi_buffer buffer = {
+		.length = ACPI_ALLOCATE_BUFFER,
+		.pointer = NULL
+	};
+
+	if (in_interrupt() ||
+	    acpi_get_name(handle, ACPI_FULL_PATHNAME, &buffer) != AE_OK)
+		return NULL;
+	return buffer.pointer;
+}
+
+/**
  * acpi_handle_printk: Print message with ACPI prefix and object path
  *
  * This function is called through acpi_handle_<level> macros and prints
@@ -493,28 +514,49 @@ acpi_handle_printk(const char *level, acpi_handle handle, const char *fmt, ...)
 {
 	struct va_format vaf;
 	va_list args;
-	struct acpi_buffer buffer = {
-		.length = ACPI_ALLOCATE_BUFFER,
-		.pointer = NULL
-	};
 	const char *path;
 
 	va_start(args, fmt);
 	vaf.fmt = fmt;
 	vaf.va = &args;
 
-	if (in_interrupt() ||
-	    acpi_get_name(handle, ACPI_FULL_PATHNAME, &buffer) != AE_OK)
-		path = "<n/a>";
-	else
-		path = buffer.pointer;
-
-	printk("%sACPI: %s: %pV", level, path, &vaf);
+	path = acpi_handle_path(handle);
+	printk("%sACPI: %s: %pV", level, path ? path : "<n/a>" , &vaf);
 
 	va_end(args);
-	kfree(buffer.pointer);
+	kfree(path);
 }
 EXPORT_SYMBOL(acpi_handle_printk);
+
+#if defined(CONFIG_DYNAMIC_DEBUG)
+/**
+ * __acpi_handle_debug: pr_debug with ACPI prefix and object path
+ *
+ * This function is called through acpi_handle_debug macro and debug
+ * prints a message with ACPI prefix and object path. This function
+ * acquires the global namespace mutex to obtain an object path.  In
+ * interrupt context, it shows the object path as <n/a>.
+ */
+void
+__acpi_handle_debug(struct _ddebug *descriptor, acpi_handle handle,
+		    const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+	const char *path;
+
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+
+	path = acpi_handle_path(handle);
+	__dynamic_pr_debug(descriptor, "ACPI: %s: %pV", path ? path : "<n/a>", &vaf);
+
+	va_end(args);
+	kfree(path);
+}
+EXPORT_SYMBOL(__acpi_handle_debug);
+#endif
 
 /**
  * acpi_has_method: Check whether @handle has a method named @name
@@ -673,6 +715,16 @@ bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, u64 rev, u64 funcs)
 	ACPI_FREE(obj);
 
 	/*
+	 * RHEL7: If this is a Cisco system and a mask of 0x80 is returned
+	 * then set the value to 0x81 so the Bit 0 check passes.
+	 */
+	if ((mask == 0x80) &&
+	    dmi_match(DMI_BIOS_VENDOR, "Cisco Systems, Inc.")) {
+		acpi_handle_warn(handle, FW_WARN "Cisco Systems, Inc.: _DSM mask returns 0x80 but should return 0x81.  Please contact Cisco Systems, Inc. for a BIOS upgrade.\n");
+		mask = 0x81;
+	}
+
+	/*
 	 * Bit 0 indicates whether there's support for any functions other than
 	 * function 0 for the specified UUID and revision.
 	 */
@@ -682,3 +734,33 @@ bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, u64 rev, u64 funcs)
 	return false;
 }
 EXPORT_SYMBOL(acpi_check_dsm);
+
+/**
+ * acpi_dev_found - Detect presence of a given ACPI device in the namespace.
+ * @hid: Hardware ID of the device.
+ *
+ * Return %true if the device was present at the moment of invocation.
+ * Note that if the device is pluggable, it may since have disappeared.
+ *
+ * For this function to work, acpi_bus_scan() must have been executed
+ * which happens in the subsys_initcall() subsection. Hence, do not
+ * call from a subsys_initcall() or earlier (use acpi_get_devices()
+ * instead). Calling from module_init() is fine (which is synonymous
+ * with device_initcall()).
+ */
+bool acpi_dev_found(const char *hid)
+{
+	struct acpi_device_bus_id *acpi_device_bus_id;
+	bool found = false;
+
+	mutex_lock(&acpi_device_lock);
+	list_for_each_entry(acpi_device_bus_id, &acpi_bus_id_list, node)
+		if (!strcmp(acpi_device_bus_id->bus_id, hid)) {
+			found = true;
+			break;
+		}
+	mutex_unlock(&acpi_device_lock);
+
+	return found;
+}
+EXPORT_SYMBOL(acpi_dev_found);

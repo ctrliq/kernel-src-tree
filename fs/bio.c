@@ -317,20 +317,6 @@ static void bio_chain_endio(struct bio *bio, int error)
 	bio_put(bio);
 }
 
-/*
- * Increment chain count for the bio. Make sure the CHAIN flag update
- * is visible before the raised count.
- */
-static inline void bio_inc_remaining(struct bio *bio)
-{
-	if (WARN_ON_ONCE(!bio->bio_aux))
-		return;
-
-	bio->bio_aux->bi_flags |= (1 << BIO_AUX_CHAIN);
-	smp_mb__before_atomic();
-	atomic_inc(&bio->bio_aux->__bi_remaining);
-}
-
 /**
  * bio_chain - chain bio completions
  *
@@ -709,8 +695,7 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 		 * If the queue doesn't support SG gaps and adding this
 		 * offset would create a gap, disallow it.
 		 */
-		if (q->queue_flags & (1 << QUEUE_FLAG_SG_GAPS) &&
-		    bvec_gap_to_prev(prev, offset))
+		if (bvec_gap_to_prev(q, prev, offset))
 			return 0;
 	}
 
@@ -1852,6 +1837,13 @@ static void bio_pair_end_1(struct bio *bi, int err)
 	if (err)
 		bp->error = err;
 
+	/*
+	 * If the integrity payload was created for this bio (and not
+	 * split from the parent), then go ahead and free it.
+	 */
+	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip2)
+	        bio_integrity_free(bi);
+
 	bio_pair_release(bp);
 }
 
@@ -1861,6 +1853,13 @@ static void bio_pair_end_2(struct bio *bi, int err)
 
 	if (err)
 		bp->error = err;
+
+	/*
+	 * If the integrity payload was created for this bio (and not
+	 * split from the parent), then go ahead and free it.
+	 */
+	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip1)
+	        bio_integrity_free(bi);
 
 	bio_pair_release(bp);
 }

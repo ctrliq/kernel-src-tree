@@ -20,8 +20,12 @@
  */
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/hugetlb.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
+#include <linux/sched.h>
 #include <asm/atomic.h>
 #include <asm/mm_track.h>
 #include <asm/pgtable.h>
@@ -33,6 +37,166 @@
 struct mm_tracker mm_tracking_struct = {STATIC_KEY_INIT_FALSE, ATOMIC_INIT(0), 0, 0};
 EXPORT_SYMBOL_GPL(mm_tracking_struct);
 
+#ifdef CONFIG_MEM_SOFT_DIRTY
+struct harvest_clear_refs_private {
+	struct vm_area_struct *vma;
+};
+
+/* Please remove if the upstream version is backported */
+static inline pmd_t pmd_clear_soft_dirty(pmd_t pmd)
+{
+	return pmd_clear_flags(pmd, _PAGE_SOFT_DIRTY);
+}
+
+/* Please remove if the upstream version is backported */
+static inline pte_t pte_clear_soft_dirty(pte_t pte)
+{
+	return pte_clear_flags(pte, _PAGE_SOFT_DIRTY);
+}
+
+static inline void harvest_clear_soft_dirty(struct vm_area_struct *vma,
+					    unsigned long addr, pte_t *pte)
+{
+	/*
+	 * The soft-dirty tracker uses #PF-s to catch writes
+	 * to pages, so write-protect the pte as well. See the
+	 * Documentation/vm/soft-dirty.txt for full description
+	 * of how soft-dirty works.
+	 */
+	pte_t ptent = *pte;
+
+	if (pte_present(ptent)) {
+		ptent = ptep_modify_prot_start(vma->vm_mm, addr, pte);
+		ptent = pte_wrprotect(ptent);
+		ptent = pte_clear_soft_dirty(ptent);
+		ptep_modify_prot_commit(vma->vm_mm, addr, pte, ptent);
+	} else if (is_swap_pte(ptent)) {
+		ptent = pte_swp_clear_soft_dirty(ptent);
+		set_pte_at(vma->vm_mm, addr, pte, ptent);
+	} else if (pte_file(ptent)) {
+		ptent = pte_file_clear_soft_dirty(ptent);
+		set_pte_at(vma->vm_mm, addr, pte, ptent);
+	}
+}
+
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE)
+static void harvest_clear_soft_dirty_pmd(struct vm_area_struct *vma,
+					 unsigned long addr, pmd_t *pmdp)
+{
+	/* mm_track in this call will see soft_dirty pages */
+	pmd_t pmd = pmdp_get_and_clear(vma->vm_mm, addr, pmdp);
+
+	pmd = pmd_wrprotect(pmd);
+	pmd = pmd_clear_soft_dirty(pmd);
+
+	set_pmd_at(vma->vm_mm, addr, pmdp, pmd);
+}
+#else
+static void harvest_clear_soft_dirty_pmd(struct vm_area_struct *vma,
+					 unsigned long addr, pmd_t *pmdp)
+{
+	do_mm_track_pmd(pmdp);
+}
+#endif
+
+static int harvest_clear_refs_pte_range(pmd_t *pmd, unsigned long addr,
+					unsigned long end, struct mm_walk *walk)
+{
+	struct harvest_clear_refs_private *cp = walk->private;
+	struct vm_area_struct *vma = cp->vma;
+	pte_t *pte;
+
+	if (pmd_trans_huge(*pmd)) {
+		harvest_clear_soft_dirty_pmd(vma, addr, pmd);
+		return 0;
+	}
+
+	pte = pte_offset_map(pmd, addr);
+	for (; addr != end; pte++, addr += PAGE_SIZE)
+		harvest_clear_soft_dirty(vma, addr, pte);
+
+	return 0;
+}
+
+static void mm_track_one_hugepage(struct vm_area_struct *vma, pte_t *pte)
+{
+	struct hstate *h = hstate_vma(vma);
+	unsigned long addr, end;
+
+	addr = pte_pfn(*pte) << PAGE_SHIFT;
+	end = addr + huge_page_size(h);
+
+	while (addr < end) {
+		do_mm_track_phys((void *)addr);
+		addr += PAGE_SIZE;
+	}
+}
+
+static void mm_track_hugepage(struct vm_area_struct *vma)
+{
+	struct hstate *h = hstate_vma(vma);
+	unsigned long hmask = huge_page_mask(h);
+	unsigned long addr, next, boundary;
+	pte_t *pte;
+
+	addr = vma->vm_start;
+	do {
+		boundary = (addr & hmask) + huge_page_size(h);
+		next = boundary < vma->vm_end ? boundary : vma->vm_end;
+		pte = huge_pte_offset(vma->vm_mm, addr & hmask);
+		if (pte)
+			mm_track_one_hugepage(vma, pte);
+	} while (addr = next, addr != vma->vm_end);
+}
+
+int  __attribute__ ((__unused__)) harvest_user(void)
+{
+	struct task_struct *p;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+
+	for_each_process(p) {
+		mm = get_task_mm(p);
+
+		if (mm) {
+			struct harvest_clear_refs_private cp;
+			struct mm_walk harvest_clear_refs_walk = {
+				.pmd_entry = harvest_clear_refs_pte_range,
+				.mm = mm,
+				.private = &cp,
+			};
+
+			for (vma = mm->mmap; vma; vma = vma->vm_next) {
+				if (!(vma->vm_flags & VM_SOFTDIRTY))
+					continue;
+				for (vma = mm->mmap; vma; vma = vma->vm_next) {
+					vma->vm_flags &= ~VM_SOFTDIRTY;
+					vma_set_page_prot(vma);
+				}
+				break;
+			}
+
+			for (vma = mm->mmap; vma; vma = vma->vm_next) {
+				cp.vma = vma;
+				if (is_vm_hugetlb_page(vma)) {
+					mm_track_hugepage(vma);
+					continue;
+				}
+				if (vma->vm_flags & VM_PFNMAP)
+					continue;
+				walk_page_range(vma->vm_start, vma->vm_end,
+						&harvest_clear_refs_walk);
+			}
+
+			mmput(mm);
+		}
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(harvest_user);
+#endif /* CONFIG_MEM_SOFT_DIRTY */
+
 void do_mm_track_pte(void *val)
 {
 	pte_t *ptep = (pte_t *)val;
@@ -41,8 +205,13 @@ void do_mm_track_pte(void *val)
 	if (!pte_present(*ptep))
 		return;
 
-	if (!(pte_val(*ptep) & _PAGE_DIRTY))
-		return;
+	if (pte_val(*ptep) & _PAGE_USER) {
+		if (!(pte_val(*ptep) & _PAGE_SOFT_DIRTY))
+			return;
+	} else {
+		if (!(pte_val(*ptep) & _PAGE_DIRTY))
+			return;
+	}
 
 	pfn = pte_pfn(*ptep);
 
@@ -52,6 +221,7 @@ void do_mm_track_pte(void *val)
 	if (!test_and_set_bit(pfn, mm_tracking_struct.vector))
 		atomic_inc(&mm_tracking_struct.count);
 }
+EXPORT_SYMBOL_GPL(do_mm_track_pte);
 
 static inline void track_as_pte(void *val)
 {
@@ -81,10 +251,15 @@ void do_mm_track_pmd(void *val)
 		 */
 		unsigned long addr, end;
 
-		if (!(pte_val(*(pte_t *)val) & _PAGE_DIRTY))
-			return;
+		if (pmd_val(*pmd) & _PAGE_USER) {
+			if (!(pmd_val(*pmd) & _PAGE_SOFT_DIRTY))
+				return;
+		} else {
+			if (!(pmd_val(*pmd) & _PAGE_DIRTY))
+				return;
+		}
 
-		addr = pte_pfn(*(pte_t *)val) << PAGE_SHIFT;
+		addr = pmd_pfn(*pmd) << PAGE_SHIFT;
 		end = addr + LARGE_PMD_SIZE;
 
 		while (addr < end) {
@@ -103,6 +278,7 @@ void do_mm_track_pmd(void *val)
 			do_mm_track_pte(pte);
 	}
 }
+EXPORT_SYMBOL_GPL(do_mm_track_pmd);
 
 #define LARGE_PUD_SIZE (1 << PUD_SHIFT)
 
@@ -121,13 +297,15 @@ void do_mm_track_pud(void *val)
 		 */
 		unsigned long addr, end;
 
-		/* Treat this as a PTE for purposes of checking
-		 * the DIRTY bit...
-		 */
-		if (!(pte_val(*(pte_t *)val) & _PAGE_DIRTY))
-			return;
+		if (pud_val(*pud) & _PAGE_USER) {
+			if (!(pud_val(*pud) & _PAGE_SOFT_DIRTY))
+				return;
+		} else {
+			if (!(pud_val(*pud) & _PAGE_DIRTY))
+				return;
+		}
 
-		addr = pmd_pfn(*(pmd_t *)val) << PAGE_SHIFT;
+		addr = pud_pfn(*pud) << PAGE_SHIFT;
 		end = addr + LARGE_PUD_SIZE;
 
 		while (addr < end) {

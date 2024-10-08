@@ -117,7 +117,7 @@ static void nr_kill_by_device(struct net_device *dev)
  */
 static int nr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = (struct net_device *)ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
@@ -1439,7 +1439,7 @@ static int __init nr_proto_init(void)
 		goto fail;
 	}
 
-	register_netdevice_notifier(&nr_dev_notifier);
+	register_netdevice_notifier_rh(&nr_dev_notifier);
 
 	ax25_register_pid(&nr_pid);
 	ax25_linkfail_register(&nr_linkfail_notifier);
@@ -1494,7 +1494,7 @@ static void __exit nr_exit(void)
 	ax25_linkfail_release(&nr_linkfail_notifier);
 	ax25_protocol_release(AX25_P_NETROM);
 
-	unregister_netdevice_notifier(&nr_dev_notifier);
+	unregister_netdevice_notifier_rh(&nr_dev_notifier);
 
 	sock_unregister(PF_NETROM);
 

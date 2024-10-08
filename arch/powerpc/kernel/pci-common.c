@@ -42,18 +42,11 @@
 #include <asm/ppc-pci.h>
 #include <asm/eeh.h>
 
-/* hose_spinlock protects accesses to the the phb_bitmap. */
 static DEFINE_SPINLOCK(hose_spinlock);
 LIST_HEAD(hose_list);
 
-/* For dynamic PHB numbering on get_phb_number(): max number of PHBs. */
-#define MAX_PHBS 0x10000
-
-/*
- * For dynamic PHB numbering: used/free PHBs tracking bitmap.
- * Accesses to this bitmap should be protected by hose_spinlock.
- */
-static DECLARE_BITMAP(phb_bitmap, MAX_PHBS);
+/* XXX kill that some day ... */
+static int global_phb_number;		/* Global phb counter */
 
 /* ISA Memory physical address */
 resource_size_t isa_mem_base;
@@ -72,42 +65,6 @@ struct dma_map_ops *get_pci_dma_ops(void)
 }
 EXPORT_SYMBOL(get_pci_dma_ops);
 
-/*
- * This function should run under locking protection, specifically
- * hose_spinlock.
- */
-static int get_phb_number(struct device_node *dn)
-{
-	int ret, phb_id = -1;
-	u64 prop;
-
-	/*
-	 * Try fixed PHB numbering first, by checking archs and reading
-	 * the respective device-tree properties. Firstly, try powernv by
-	 * reading "ibm,opal-phbid", only present in OPAL environment.
-	 */
-	ret = of_property_read_u64(dn, "ibm,opal-phbid", &prop);
-	if (ret)
-		ret = of_property_read_u32_index(dn, "reg", 1, (u32 *)&prop);
-
-	if (!ret)
-		phb_id = (int)(prop & (MAX_PHBS - 1));
-
-	/* We need to be sure to not use the same PHB number twice. */
-	if ((phb_id >= 0) && !test_and_set_bit(phb_id, phb_bitmap))
-		return phb_id;
-
-	/*
-	 * If not pseries nor powernv, or if fixed PHB numbering tried to add
-	 * the same PHB number twice, then fallback to dynamic PHB numbering.
-	 */
-	phb_id = find_first_zero_bit(phb_bitmap, MAX_PHBS);
-	BUG_ON(phb_id >= MAX_PHBS);
-	set_bit(phb_id, phb_bitmap);
-
-	return phb_id;
-}
-
 struct pci_controller *pcibios_alloc_controller(struct device_node *dev)
 {
 	struct pci_controller *phb;
@@ -116,7 +73,7 @@ struct pci_controller *pcibios_alloc_controller(struct device_node *dev)
 	if (phb == NULL)
 		return NULL;
 	spin_lock(&hose_spinlock);
-	phb->global_number = get_phb_number(dev);
+	phb->global_number = global_phb_number++;
 	list_add_tail(&phb->list_node, &hose_list);
 	spin_unlock(&hose_spinlock);
 	phb->dn = dev;
@@ -133,15 +90,11 @@ struct pci_controller *pcibios_alloc_controller(struct device_node *dev)
 #endif
 	return phb;
 }
+EXPORT_SYMBOL_GPL(pcibios_alloc_controller);
 
 void pcibios_free_controller(struct pci_controller *phb)
 {
 	spin_lock(&hose_spinlock);
-
-	/* Clear bit of phb_bitmap to allow reuse of this PHB number. */
-	if (phb->global_number < MAX_PHBS)
-		clear_bit(phb->global_number, phb_bitmap);
-
 	list_del(&phb->list_node);
 	spin_unlock(&hose_spinlock);
 
@@ -159,12 +112,29 @@ EXPORT_SYMBOL_GPL(pcibios_free_controller);
 resource_size_t pcibios_window_alignment(struct pci_bus *bus,
 					 unsigned long type)
 {
-	return pci_window_alignment(bus, type);
+	struct pci_controller *phb = pci_bus_to_host(bus);
+
+	if (phb->controller_ops.window_alignment)
+		return phb->controller_ops.window_alignment(bus, type);
+
+	/*
+	 * PCI core will figure out the default
+	 * alignment: 4KiB for I/O and 1MiB for
+	 * memory window.
+	 */
+	return 1;
 }
 
 void pcibios_reset_secondary_bus(struct pci_dev *dev)
 {
-	pcibios_reset_secondary_bus_shim(dev);
+	struct pci_controller *phb = pci_bus_to_host(dev->bus);
+
+	if (phb->controller_ops.reset_secondary_bus) {
+		phb->controller_ops.reset_secondary_bus(dev);
+		return;
+	}
+
+	pci_reset_secondary_bus(dev);
 }
 
 static resource_size_t pcibios_io_size(const struct pci_controller *hose)
@@ -1006,6 +976,8 @@ static void pcibios_fixup_bridge(struct pci_bus *bus)
 
 void pcibios_setup_bus_self(struct pci_bus *bus)
 {
+	struct pci_controller *phb;
+
 	/* Fix up the bus resources for P2P bridges */
 	if (bus->self != NULL)
 		pcibios_fixup_bridge(bus);
@@ -1017,11 +989,17 @@ void pcibios_setup_bus_self(struct pci_bus *bus)
 		ppc_md.pcibios_fixup_bus(bus);
 
 	/* Setup bus DMA mappings */
-	pci_dma_bus_setup(bus);
+	phb = pci_bus_to_host(bus);
+	if (phb->controller_ops.dma_bus_setup)
+		phb->controller_ops.dma_bus_setup(bus);
 }
 
 static void pcibios_setup_device(struct pci_dev *dev)
 {
+	struct pci_controller *phb;
+
+	arch_dma_init(&dev->dev);
+
 	/* Fixup NUMA node as it may not be setup yet by the generic
 	 * code and is needed by the DMA init
 	 */
@@ -1032,7 +1010,9 @@ static void pcibios_setup_device(struct pci_dev *dev)
 	set_dma_offset(&dev->dev, PCI_DRAM_OFFSET);
 
 	/* Additional platform DMA/iommu setup */
-	pci_dma_dev_setup(dev);
+	phb = pci_bus_to_host(dev->bus);
+	if (phb->controller_ops.dma_dev_setup)
+		phb->controller_ops.dma_dev_setup(dev);
 
 	/* Read default IRQs and fixup if necessary */
 	pci_read_irq_line(dev);
@@ -1486,6 +1466,7 @@ void pcibios_claim_one_bus(struct pci_bus *bus)
 	list_for_each_entry(child_bus, &bus->children, node)
 		pcibios_claim_one_bus(child_bus);
 }
+EXPORT_SYMBOL_GPL(pcibios_claim_one_bus);
 
 
 /* pcibios_finish_adding_to_bus
@@ -1518,8 +1499,11 @@ EXPORT_SYMBOL_GPL(pcibios_finish_adding_to_bus);
 
 int pcibios_enable_device(struct pci_dev *dev, int mask)
 {
-	if (!pcibios_enable_device_hook(dev))
-		return -EINVAL;
+	struct pci_controller *phb = pci_bus_to_host(dev->bus);
+
+	if (phb->controller_ops.enable_device_hook)
+		if (!phb->controller_ops.enable_device_hook(dev))
+			return -EINVAL;
 
 	return pci_enable_resources(dev, mask);
 }
@@ -1700,8 +1684,8 @@ void pcibios_scan_phb(struct pci_controller *hose)
 
 	/* Get probe mode and perform scan */
 	mode = PCI_PROBE_NORMAL;
-	if (node)
-		mode = pci_probe_mode(bus);
+	if (node && hose->controller_ops.probe_mode)
+		mode = hose->controller_ops.probe_mode(bus);
 	pr_debug("    probe mode: %d\n", mode);
 	if (mode == PCI_PROBE_DEVTREE)
 		of_scan_bus(node, bus);
@@ -1725,6 +1709,7 @@ void pcibios_scan_phb(struct pci_controller *hose)
 			pcie_bus_configure_settings(child);
 	}
 }
+EXPORT_SYMBOL_GPL(pcibios_scan_phb);
 
 static void fixup_hide_host_resource_fsl(struct pci_dev *dev)
 {

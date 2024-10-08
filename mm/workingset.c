@@ -362,8 +362,8 @@ static void shadow_lru_isolate(struct list_head *item,
 			node->slots[i] = NULL;
 			BUG_ON(node->count < (1U << RADIX_TREE_COUNT_SHIFT));
 			node->count -= 1U << RADIX_TREE_COUNT_SHIFT;
-			BUG_ON(!mapping->nrshadows);
-			mapping->nrshadows--;
+			BUG_ON(!mapping->nrexceptional);
+			mapping->nrexceptional--;
 		}
 	}
 	BUG_ON(node->count);

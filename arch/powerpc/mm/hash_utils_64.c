@@ -1005,6 +1005,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
 		 unsigned long access, unsigned long trap,
 		 unsigned long flags)
 {
+	bool is_thp;
 	enum ctx_state prev_state = exception_enter();
 	pgd_t *pgdir;
 	unsigned long vsid;
@@ -1078,7 +1079,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
 #endif /* CONFIG_PPC_64K_PAGES */
 
 	/* Get PTE and page size from page tables */
-	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &hugeshift);
+	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &is_thp, &hugeshift);
 	if (ptep == NULL || !pte_present(*ptep)) {
 		DBG_LOW(" no PTE !\n");
 		rc = 1;
@@ -1098,7 +1099,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
 	}
 
 	if (hugeshift) {
-		if (pmd_trans_huge(*(pmd_t *)ptep))
+		if (is_thp)
 			rc = __hash_page_thp(ea, access, vsid, (pmd_t *)ptep,
 					     trap, flags, ssize, psize);
 #ifdef CONFIG_HUGETLB_PAGE
@@ -1253,7 +1254,7 @@ void hash_preload(struct mm_struct *mm, unsigned long ea,
 	 * THP pages use update_mmu_cache_pmd. We don't do
 	 * hash preload there. Hence can ignore THP here
 	 */
-	ptep = find_linux_pte_or_hugepte(pgdir, ea, &hugepage_shift);
+	ptep = find_linux_pte_or_hugepte(pgdir, ea, NULL, &hugepage_shift);
 	if (!ptep)
 		goto out_exit;
 
@@ -1299,9 +1300,10 @@ out_exit:
  *          do not forget to update the assembly call site !
  */
 void flush_hash_page(unsigned long vpn, real_pte_t pte, int psize, int ssize,
-		     int local)
+		     unsigned long flags)
 {
 	unsigned long hash, index, shift, hidx, slot;
+	int local = flags & HPTE_LOCAL_UPDATE;
 
 	DBG_LOW("flush_hash_page(vpn=%016lx)\n", vpn);
 	pte_iterate_hashed_subpages(pte, psize, vpn, index, shift) {

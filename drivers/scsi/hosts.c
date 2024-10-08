@@ -219,6 +219,14 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
 			goto fail;
 	}
 
+        else if (shost->hostt->use_host_wide_tags) {
+                 shost->bqt = blk_init_tags(shost->can_queue);
+                 if (!shost->bqt) {
+                         error = -ENOMEM;
+                         goto fail;
+                 }
+         }
+
 	/*
 	 * Note that we allocate the freelist even for the MQ case for now,
 	 * as we need a command set aside for scsi_reset_provider.  Having

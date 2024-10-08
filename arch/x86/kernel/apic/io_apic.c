@@ -2436,7 +2436,11 @@ int __ioapic_set_affinity(struct irq_data *data, const struct cpumask *mask,
 
 	return 0;
 }
-
+/*
+ * This export is RHEL-only for Hyper-V PCI pass-through driver, don't add
+ * this function to kABI whitelist.
+ */
+EXPORT_SYMBOL_GPL(__ioapic_set_affinity);
 
 int native_ioapic_set_affinity(struct irq_data *data,
 			       const struct cpumask *mask,

@@ -72,7 +72,7 @@ int efx_sriov_set_vf_link_state(struct net_device *net_dev, int vf_i,
 }
 
 int efx_sriov_get_phys_port_id(struct net_device *net_dev,
-			       struct netdev_phys_port_id *ppid)
+			       struct netdev_phys_item_id *ppid)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 

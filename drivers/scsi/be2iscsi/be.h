@@ -8,7 +8,7 @@
  * Public License is included in this distribution in the file called COPYING.
  *
  * Contact Information:
- * linux-drivers@emulex.com
+ * linux-drivers@avagotech.com
  *
  * Emulex
  * 3333 Susan Street
@@ -20,7 +20,7 @@
 
 #include <linux/pci.h>
 #include <linux/if_vlan.h>
-#include <linux/blk-iopoll.h>
+#include <linux/irq_poll.h>
 #define FW_VER_LEN	32
 #define MCC_Q_LEN	128
 #define MCC_CQ_LEN	256
@@ -42,7 +42,7 @@ struct be_queue_info {
 	u16 id;
 	u16 tail, head;
 	bool created;
-	atomic_t used;		/* Number of valid elements in the queue */
+	u16 used;		/* Number of valid elements in the queue */
 };
 
 static inline u32 MODULO(u16 val, u16 limit)
@@ -101,7 +101,7 @@ struct be_eq_obj {
 	struct beiscsi_hba *phba;
 	struct be_queue_info *cq;
 	struct work_struct work_cqs; /* Work Item */
-	struct blk_iopoll	iopoll;
+	struct irq_poll	iopoll;
 };
 
 struct be_mcc_obj {

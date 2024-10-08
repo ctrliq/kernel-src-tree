@@ -358,7 +358,6 @@ int nfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *)
 /* file.c */
 int nfs_file_fsync_commit(struct file *, loff_t, loff_t, int);
 loff_t nfs_file_llseek(struct file *, loff_t, int);
-int nfs_file_flush(struct file *, fl_owner_t);
 ssize_t nfs_file_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
 ssize_t nfs_file_splice_read(struct file *, loff_t *, struct pipe_inode_info *,
 			     size_t, unsigned int);
@@ -381,7 +380,7 @@ extern int nfs_drop_inode(struct inode *);
 extern void nfs_clear_inode(struct inode *);
 extern void nfs_evict_inode(struct inode *);
 void nfs_zap_acl_cache(struct inode *inode);
-extern int nfs_wait_bit_killable(void *word);
+extern int nfs_wait_bit_killable(struct wait_bit_key *key, int mode);
 
 /* super.c */
 extern const struct super_operations nfs_sops;
@@ -488,6 +487,9 @@ void nfs_retry_commit(struct list_head *page_list,
 void nfs_commitdata_release(struct nfs_commit_data *data);
 void nfs_request_add_commit_list(struct nfs_page *req, struct list_head *dst,
 				 struct nfs_commit_info *cinfo);
+void nfs_request_add_commit_list_locked(struct nfs_page *req,
+		struct list_head *dst,
+		struct nfs_commit_info *cinfo);
 void nfs_request_remove_commit_list(struct nfs_page *req,
 				    struct nfs_commit_info *cinfo);
 void nfs_init_cinfo(struct nfs_commit_info *cinfo,
@@ -618,6 +620,21 @@ void nfs_super_set_maxbytes(struct super_block *sb, __u64 maxfilesize)
 }
 
 /*
+ * Record the page as unstable and mark its inode as dirty.
+ */
+static inline
+void nfs_mark_page_unstable(struct page *page, struct nfs_commit_info *cinfo)
+{
+	if (!cinfo->dreq) {
+		struct inode *inode = page_file_mapping(page)->host;
+
+		inc_zone_page_state(page, NR_UNSTABLE_NFS);
+		inc_bdi_stat(inode->i_mapping->backing_dev_info, BDI_RECLAIMABLE);
+		 __mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+	}
+}
+
+/*
  * Determine the number of bytes of data the page contains
  */
 static inline
@@ -681,9 +698,32 @@ static inline u32 nfs_fhandle_hash(const struct nfs_fh *fh)
 {
 	return ~crc32_le(0xFFFFFFFF, &fh->data[0], fh->size);
 }
+static inline u32 nfs_stateid_hash(const nfs4_stateid *stateid)
+{
+	return ~crc32_le(0xFFFFFFFF, &stateid->other[0],
+				NFS4_STATEID_OTHER_SIZE);
+}
 #else
 static inline u32 nfs_fhandle_hash(const struct nfs_fh *fh)
 {
 	return 0;
 }
+static inline u32 nfs_stateid_hash(nfs4_stateid *stateid)
+{
+	return 0;
+}
 #endif
+
+static inline bool nfs_error_is_fatal(int err)
+{
+	switch (err) {
+	case -ERESTARTSYS:
+	case -EIO:
+	case -ENOSPC:
+	case -EROFS:
+	case -E2BIG:
+		return true;
+	default:
+		return false;
+	}
+}

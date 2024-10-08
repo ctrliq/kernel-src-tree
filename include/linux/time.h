@@ -99,25 +99,7 @@ static inline bool timespec_valid_strict(const struct timespec *ts)
 	return true;
 }
 
-extern bool persistent_clock_exist;
-
-static inline bool has_persistent_clock(void)
-{
-	return persistent_clock_exist;
-}
-
-extern void read_persistent_clock(struct timespec *ts);
-extern void read_boot_clock(struct timespec *ts);
-extern int persistent_clock_is_local;
-extern int update_persistent_clock(struct timespec now);
-void timekeeping_init(void);
-extern int timekeeping_suspended;
-
-unsigned long get_seconds(void);
-struct timespec current_kernel_time(void);
-struct timespec __current_kernel_time(void); /* does not take xtime_lock */
-struct timespec get_monotonic_coarse(void);
-void timekeeping_inject_sleeptime(struct timespec *delta);
+extern struct timespec timespec_trunc(struct timespec t, unsigned gran);
 
 #define CURRENT_TIME		(current_kernel_time())
 #define CURRENT_TIME_SEC	((struct timespec) { get_seconds(), 0 })
@@ -135,11 +117,6 @@ void timekeeping_inject_sleeptime(struct timespec *delta);
 extern u32 (*arch_gettimeoffset)(void);
 #endif
 
-extern void do_gettimeofday(struct timeval *tv);
-extern int do_settimeofday(const struct timespec *tv);
-extern int do_sys_settimeofday(const struct timespec *tv,
-			       const struct timezone *tz);
-#define do_posix_clock_monotonic_gettime(ts) ktime_get_ts(ts)
 extern long do_utimes(int dfd, const char __user *filename, struct timespec *times, int flags);
 struct itimerval;
 extern int do_setitimer(int which, struct itimerval *value,
@@ -150,50 +127,8 @@ extern int do_getitimer(int which, struct itimerval *value);
 extern int __getnstimeofday64(struct timespec64 *tv);
 extern void getnstimeofday64(struct timespec64 *tv);
 
-#if BITS_PER_LONG == 64
-static inline int __getnstimeofday(struct timespec *ts)
-{
-	return __getnstimeofday64(ts);
-}
-
-static inline void getnstimeofday(struct timespec *ts)
-{
-	getnstimeofday64(ts);
-}
-
-#else
-static inline int __getnstimeofday(struct timespec *ts)
-{
-	struct timespec64 ts64;
-	int ret = __getnstimeofday64(&ts64);
-
-	*ts = timespec64_to_timespec(ts64);
-	return ret;
-}
-
-static inline void getnstimeofday(struct timespec *ts)
-{
-	struct timespec64 ts64;
-
-	getnstimeofday64(&ts64);
-	*ts = timespec64_to_timespec(ts64);
-}
-#endif
-
-extern void getrawmonotonic(struct timespec *ts);
 extern void getnstime_raw_and_real(struct timespec *ts_raw,
 		struct timespec *ts_real);
-extern void getboottime(struct timespec *ts);
-extern void monotonic_to_bootbased(struct timespec *ts);
-extern void get_monotonic_boottime(struct timespec *ts);
-
-extern struct timespec timespec_trunc(struct timespec t, unsigned gran);
-extern int timekeeping_valid_for_hres(void);
-extern u64 timekeeping_max_deferment(void);
-extern int timekeeping_inject_offset(struct timespec *ts);
-extern s32 timekeeping_get_tai_offset(void);
-extern void timekeeping_set_tai_offset(s32 tai_offset);
-extern void timekeeping_clocktai(struct timespec *ts);
 
 struct tms;
 extern void do_sys_times(struct tms *);

@@ -2,6 +2,7 @@
 #include "evsel.h"
 #include "stat.h"
 #include "color.h"
+#include "pmu.h"
 
 enum {
 	CTX_BIT_USER	= 1 << 0,
@@ -35,8 +36,14 @@ static struct stats runtime_dtlb_cache_stats[NUM_CTX][MAX_NR_CPUS];
 static struct stats runtime_cycles_in_tx_stats[NUM_CTX][MAX_NR_CPUS];
 static struct stats runtime_transaction_stats[NUM_CTX][MAX_NR_CPUS];
 static struct stats runtime_elision_stats[NUM_CTX][MAX_NR_CPUS];
+static bool have_frontend_stalled;
 
 struct stats walltime_nsecs_stats;
+
+void perf_stat__init_shadow_stats(void)
+{
+	have_frontend_stalled = pmu_have_event("cpu", "stalled-cycles-frontend");
+}
 
 static int evsel_context(struct perf_evsel *evsel)
 {
@@ -145,8 +152,7 @@ static const char *get_ratio_color(enum grc_type type, double ratio)
 }
 
 static void print_stalled_cycles_frontend(int cpu,
-					  struct perf_evsel *evsel
-					  __maybe_unused, double avg,
+					  struct perf_evsel *evsel, double avg,
 					  struct perf_stat_output_ctx *out)
 {
 	double total, ratio = 0.0;
@@ -168,8 +174,7 @@ static void print_stalled_cycles_frontend(int cpu,
 }
 
 static void print_stalled_cycles_backend(int cpu,
-					 struct perf_evsel *evsel
-					 __maybe_unused, double avg,
+					 struct perf_evsel *evsel, double avg,
 					 struct perf_stat_output_ctx *out)
 {
 	double total, ratio = 0.0;
@@ -187,7 +192,7 @@ static void print_stalled_cycles_backend(int cpu,
 }
 
 static void print_branch_misses(int cpu,
-				struct perf_evsel *evsel __maybe_unused,
+				struct perf_evsel *evsel,
 				double avg,
 				struct perf_stat_output_ctx *out)
 {
@@ -206,7 +211,7 @@ static void print_branch_misses(int cpu,
 }
 
 static void print_l1_dcache_misses(int cpu,
-				   struct perf_evsel *evsel __maybe_unused,
+				   struct perf_evsel *evsel,
 				   double avg,
 				   struct perf_stat_output_ctx *out)
 {
@@ -225,7 +230,7 @@ static void print_l1_dcache_misses(int cpu,
 }
 
 static void print_l1_icache_misses(int cpu,
-				   struct perf_evsel *evsel __maybe_unused,
+				   struct perf_evsel *evsel,
 				   double avg,
 				   struct perf_stat_output_ctx *out)
 {
@@ -243,7 +248,7 @@ static void print_l1_icache_misses(int cpu,
 }
 
 static void print_dtlb_cache_misses(int cpu,
-				    struct perf_evsel *evsel __maybe_unused,
+				    struct perf_evsel *evsel,
 				    double avg,
 				    struct perf_stat_output_ctx *out)
 {
@@ -261,7 +266,7 @@ static void print_dtlb_cache_misses(int cpu,
 }
 
 static void print_itlb_cache_misses(int cpu,
-				    struct perf_evsel *evsel __maybe_unused,
+				    struct perf_evsel *evsel,
 				    double avg,
 				    struct perf_stat_output_ctx *out)
 {
@@ -279,7 +284,7 @@ static void print_itlb_cache_misses(int cpu,
 }
 
 static void print_ll_cache_misses(int cpu,
-				  struct perf_evsel *evsel __maybe_unused,
+				  struct perf_evsel *evsel,
 				  double avg,
 				  struct perf_stat_output_ctx *out)
 {
@@ -323,7 +328,7 @@ void perf_stat__print_shadow_stats(struct perf_evsel *evsel,
 			print_metric(ctxp, NULL, "%7.2f ",
 					"stalled cycles per insn",
 					ratio);
-		} else {
+		} else if (have_frontend_stalled) {
 			print_metric(ctxp, NULL, NULL,
 				     "stalled cycles per insn", 0);
 		}

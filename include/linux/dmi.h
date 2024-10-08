@@ -83,6 +83,8 @@ struct dmi_device {
 	void *device_data;	/* Type specific data */
 };
 
+extern int dmi_socket_count;
+
 #ifdef CONFIG_DMI
 
 struct dmi_dev_onboard {

@@ -953,18 +953,19 @@ static void alb_send_lp_vid(struct slave *slave, u8 mac_addr[],
 static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[])
 {
 	struct bonding *bond = bond_get_bond_by_slave(slave);
-	struct netdev_upper *upper;
+	struct net_device *upper;
+	struct list_head *iter;
 
 	/* send untagged */
 	alb_send_lp_vid(slave, mac_addr, 0, 0);
 
 	/* loop through vlans and send one packet for each */
 	rcu_read_lock();
-	list_for_each_entry_rcu(upper, &bond->dev->upper_dev_list, list) {
-		if (upper->dev->priv_flags & IFF_802_1Q_VLAN)
+	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
+		if (upper->priv_flags & IFF_802_1Q_VLAN)
 			alb_send_lp_vid(slave, mac_addr,
-					vlan_dev_vlan_proto(upper->dev),
-					vlan_dev_vlan_id(upper->dev));
+					vlan_dev_vlan_proto(upper),
+					vlan_dev_vlan_id(upper));
 	}
 	rcu_read_unlock();
 }

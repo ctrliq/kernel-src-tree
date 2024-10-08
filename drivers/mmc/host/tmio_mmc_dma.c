@@ -261,6 +261,14 @@ out:
 	spin_unlock_irq(&host->lock);
 }
 
+/* It might be necessary to make filter MFD specific */
+static bool tmio_mmc_filter(struct dma_chan *chan, void *arg)
+{
+	dev_dbg(chan->device->dev, "%s: slave data %p\n", __func__, arg);
+	chan->private = arg;
+	return true;
+}
+
 void tmio_mmc_request_dma(struct tmio_mmc_host *host, struct tmio_mmc_data *pdata)
 {
 	/* We can only either use DMA for both Tx and Rx or not use it at all */
@@ -268,19 +276,12 @@ void tmio_mmc_request_dma(struct tmio_mmc_host *host, struct tmio_mmc_data *pdat
 		return;
 
 	if (!host->chan_tx && !host->chan_rx) {
-		struct resource *res = platform_get_resource(host->pdev,
-							     IORESOURCE_MEM, 0);
-		struct dma_slave_config cfg = {};
 		dma_cap_mask_t mask;
-		int ret;
-
-		if (!res)
-			return;
 
 		dma_cap_zero(mask);
 		dma_cap_set(DMA_SLAVE, mask);
 
-		host->chan_tx = dma_request_channel(mask, pdata->dma->filter,
+		host->chan_tx = dma_request_channel(mask, tmio_mmc_filter,
 						    pdata->dma->chan_priv_tx);
 		dev_dbg(&host->pdev->dev, "%s: TX: got channel %p\n", __func__,
 			host->chan_tx);
@@ -288,29 +289,13 @@ void tmio_mmc_request_dma(struct tmio_mmc_host *host, struct tmio_mmc_data *pdat
 		if (!host->chan_tx)
 			return;
 
-		cfg.slave_id = pdata->dma->slave_id_tx;
-		cfg.direction = DMA_MEM_TO_DEV;
-		cfg.dst_addr = res->start + (CTL_SD_DATA_PORT << host->bus_shift);
-		cfg.src_addr = 0;
-		ret = dmaengine_slave_config(host->chan_tx, &cfg);
-		if (ret < 0)
-			goto ecfgtx;
-
-		host->chan_rx = dma_request_channel(mask, pdata->dma->filter,
+		host->chan_rx = dma_request_channel(mask, tmio_mmc_filter,
 						    pdata->dma->chan_priv_rx);
 		dev_dbg(&host->pdev->dev, "%s: RX: got channel %p\n", __func__,
 			host->chan_rx);
 
 		if (!host->chan_rx)
 			goto ereqrx;
-
-		cfg.slave_id = pdata->dma->slave_id_rx;
-		cfg.direction = DMA_DEV_TO_MEM;
-		cfg.src_addr = cfg.dst_addr;
-		cfg.dst_addr = 0;
-		ret = dmaengine_slave_config(host->chan_rx, &cfg);
-		if (ret < 0)
-			goto ecfgrx;
 
 		host->bounce_buf = (u8 *)__get_free_page(GFP_KERNEL | GFP_DMA);
 		if (!host->bounce_buf)
@@ -325,11 +310,9 @@ void tmio_mmc_request_dma(struct tmio_mmc_host *host, struct tmio_mmc_data *pdat
 	return;
 
 ebouncebuf:
-ecfgrx:
 	dma_release_channel(host->chan_rx);
 	host->chan_rx = NULL;
 ereqrx:
-ecfgtx:
 	dma_release_channel(host->chan_tx);
 	host->chan_tx = NULL;
 }

@@ -82,9 +82,11 @@
 				   * read requests will only be sent here in
 				   * dire need
 				   */
+#define MD_DISK_JOURNAL		18 /* disk is used as the write journal in RAID-5/6 */
 
 #define MD_DISK_ROLE_SPARE	0xffff
 #define MD_DISK_ROLE_FAULTY	0xfffe
+#define MD_DISK_ROLE_JOURNAL	0xfffd
 #define MD_DISK_ROLE_MAX	0xff00 /* max value of regular disk role */
 
 typedef struct mdp_device_descriptor_s {
@@ -248,7 +250,10 @@ struct mdp_superblock_1 {
 	__le64	data_offset;	/* sector start of data, often 0 */
 	__le64	data_size;	/* sectors in this device that can be used for data */
 	__le64	super_offset;	/* sector start of this superblock */
-	__le64	recovery_offset;/* sectors before this offset (from data_offset) have been recovered */
+	union {
+		__le64	recovery_offset;/* sectors before this offset (from data_offset) have been recovered */
+		__le64	journal_tail;/* journal tail of journal device (from data_offset) */
+	};
 	__le32	dev_number;	/* permanent identifier of this  device - not role in raid */
 	__le32	cnt_corrected_read; /* number of read errors that were corrected by re-writing */
 	__u8	device_uuid[16]; /* user-space setable, ignored by kernel */
@@ -298,6 +303,7 @@ struct mdp_superblock_1 {
 #define	MD_FEATURE_RECOVERY_BITMAP	128 /* recovery that is happening
 					     * is guided by bitmap.
 					     */
+#define	MD_FEATURE_JOURNAL		512 /* support write cache */
 #define	MD_FEATURE_ALL			(MD_FEATURE_BITMAP_OFFSET	\
 					|MD_FEATURE_RECOVERY_OFFSET	\
 					|MD_FEATURE_RESHAPE_ACTIVE	\
@@ -306,6 +312,7 @@ struct mdp_superblock_1 {
 					|MD_FEATURE_RESHAPE_BACKWARDS	\
 					|MD_FEATURE_NEW_OFFSET		\
 					|MD_FEATURE_RECOVERY_BITMAP	\
+					|MD_FEATURE_JOURNAL		\
 					)
 
 struct r5l_payload_header {

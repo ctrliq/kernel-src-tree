@@ -49,11 +49,9 @@
 #include <net/netlink.h>
 #include <uapi/rdma/ib_user_sa.h>
 #include <rdma/ib_marshall.h>
+#include <rdma/ib_addr.h>
 #include "sa.h"
-
-MODULE_AUTHOR("Roland Dreier");
-MODULE_DESCRIPTION("InfiniBand subnet administration query support");
-MODULE_LICENSE("Dual BSD/GPL");
+#include "core_priv.h"
 
 #define IB_SA_LOCAL_SVC_TIMEOUT_MIN		100
 #define IB_SA_LOCAL_SVC_TIMEOUT_DEFAULT		2000
@@ -792,8 +790,8 @@ static void ib_nl_request_timeout(struct work_struct *work)
 	spin_unlock_irqrestore(&ib_nl_request_lock, flags);
 }
 
-static int ib_nl_handle_set_timeout(struct sk_buff *skb,
-				    struct netlink_callback *cb)
+int ib_nl_handle_set_timeout(struct sk_buff *skb,
+			     struct netlink_callback *cb)
 {
 	const struct nlmsghdr *nlh = (struct nlmsghdr *)cb->nlh;
 	int timeout, delta, abs_delta;
@@ -869,8 +867,8 @@ static inline int ib_nl_is_good_resolve_resp(const struct nlmsghdr *nlh)
 	return 1;
 }
 
-static int ib_nl_handle_resolve_resp(struct sk_buff *skb,
-				     struct netlink_callback *cb)
+int ib_nl_handle_resolve_resp(struct sk_buff *skb,
+			      struct netlink_callback *cb)
 {
 	const struct nlmsghdr *nlh = (struct nlmsghdr *)cb->nlh;
 	unsigned long flags;
@@ -925,15 +923,6 @@ resp_out:
 	return skb->len;
 }
 
-static struct ibnl_client_cbs ib_sa_cb_table[] = {
-	[RDMA_NL_LS_OP_RESOLVE] = {
-		.dump = ib_nl_handle_resolve_resp,
-		.module = THIS_MODULE },
-	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
-		.dump = ib_nl_handle_set_timeout,
-		.module = THIS_MODULE },
-};
-
 static void free_sm_ah(struct kref *kref)
 {
 	struct ib_sa_sm_ah *sm_ah = container_of(kref, struct ib_sa_sm_ah, ref);
@@ -951,13 +940,12 @@ static void update_sm_ah(struct work_struct *work)
 	struct ib_ah_attr   ah_attr;
 
 	if (ib_query_port(port->agent->device, port->port_num, &port_attr)) {
-		printk(KERN_WARNING "Couldn't query port\n");
+		pr_warn("Couldn't query port\n");
 		return;
 	}
 
 	new_ah = kmalloc(sizeof *new_ah, GFP_KERNEL);
 	if (!new_ah) {
-		printk(KERN_WARNING "Couldn't allocate new SM AH\n");
 		return;
 	}
 
@@ -967,7 +955,7 @@ static void update_sm_ah(struct work_struct *work)
 	new_ah->pkey_index = 0;
 	if (ib_find_pkey(port->agent->device, port->port_num,
 			 IB_DEFAULT_PKEY_FULL, &new_ah->pkey_index))
-		printk(KERN_ERR "Couldn't find index for default PKey\n");
+		pr_err("Couldn't find index for default PKey\n");
 
 	memset(&ah_attr, 0, sizeof ah_attr);
 	ah_attr.dlid     = port_attr.sm_lid;
@@ -981,7 +969,7 @@ static void update_sm_ah(struct work_struct *work)
 
 	new_ah->ah = ib_create_ah(port->agent->qp->pd, &ah_attr);
 	if (IS_ERR(new_ah->ah)) {
-		printk(KERN_WARNING "Couldn't create new SM AH\n");
+		pr_warn("Couldn't create new SM AH\n");
 		kfree(new_ah);
 		return;
 	}
@@ -1101,7 +1089,8 @@ int ib_init_ah_from_path(struct ib_device *device, u8 port_num,
 {
 	int ret;
 	u16 gid_index;
-	int force_grh;
+	int use_roce;
+	struct net_device *ndev = NULL;
 
 	memset(ah_attr, 0, sizeof *ah_attr);
 	ah_attr->dlid = be16_to_cpu(rec->dlid);
@@ -1111,25 +1100,88 @@ int ib_init_ah_from_path(struct ib_device *device, u8 port_num,
 	ah_attr->port_num = port_num;
 	ah_attr->static_rate = rec->rate;
 
-	force_grh = rdma_cap_eth_ah(device, port_num);
+	use_roce = rdma_cap_eth_ah(device, port_num);
 
-	if (rec->hop_limit > 1 || force_grh) {
+	if (use_roce) {
+		struct net_device *idev;
+		struct net_device *resolved_dev;
+		struct rdma_dev_addr dev_addr = {.bound_dev_if = rec->ifindex,
+						 .net = rec->net ? rec->net :
+							 &init_net};
+		union {
+			struct sockaddr     _sockaddr;
+			struct sockaddr_in  _sockaddr_in;
+			struct sockaddr_in6 _sockaddr_in6;
+		} sgid_addr, dgid_addr;
+
+		if (!device->get_netdev)
+			return -EOPNOTSUPP;
+
+		rdma_gid2ip(&sgid_addr._sockaddr, &rec->sgid);
+		rdma_gid2ip(&dgid_addr._sockaddr, &rec->dgid);
+
+		/* validate the route */
+		ret = rdma_resolve_ip_route(&sgid_addr._sockaddr,
+					    &dgid_addr._sockaddr, &dev_addr);
+		if (ret)
+			return ret;
+
+		if ((dev_addr.network == RDMA_NETWORK_IPV4 ||
+		     dev_addr.network == RDMA_NETWORK_IPV6) &&
+		    rec->gid_type != IB_GID_TYPE_ROCE_UDP_ENCAP)
+			return -EINVAL;
+
+		idev = device->get_netdev(device, port_num);
+		if (!idev)
+			return -ENODEV;
+
+		resolved_dev = dev_get_by_index(dev_addr.net,
+						dev_addr.bound_dev_if);
+		if (resolved_dev->flags & IFF_LOOPBACK) {
+			dev_put(resolved_dev);
+			resolved_dev = idev;
+			dev_hold(resolved_dev);
+		}
+		ndev = ib_get_ndev_from_path(rec);
+		rcu_read_lock();
+		if ((ndev && ndev != resolved_dev) ||
+		    (resolved_dev != idev &&
+		     !rdma_is_upper_dev_rcu(idev, resolved_dev)))
+			ret = -EHOSTUNREACH;
+		rcu_read_unlock();
+		dev_put(idev);
+		dev_put(resolved_dev);
+		if (ret) {
+			if (ndev)
+				dev_put(ndev);
+			return ret;
+		}
+	}
+
+	if (rec->hop_limit > 0 || use_roce) {
 		ah_attr->ah_flags = IB_AH_GRH;
 		ah_attr->grh.dgid = rec->dgid;
 
-		ret = ib_find_cached_gid(device, &rec->sgid, &port_num,
-					 &gid_index);
-		if (ret)
+		ret = ib_find_cached_gid_by_port(device, &rec->sgid,
+						 rec->gid_type, port_num, ndev,
+						 &gid_index);
+		if (ret) {
+			if (ndev)
+				dev_put(ndev);
 			return ret;
+		}
 
 		ah_attr->grh.sgid_index    = gid_index;
 		ah_attr->grh.flow_label    = be32_to_cpu(rec->flow_label);
 		ah_attr->grh.hop_limit     = rec->hop_limit;
 		ah_attr->grh.traffic_class = rec->traffic_class;
+		if (ndev)
+			dev_put(ndev);
 	}
-	if (force_grh) {
+
+	if (use_roce)
 		memcpy(ah_attr->dmac, rec->dmac, ETH_ALEN);
-	}
+
 	return 0;
 }
 EXPORT_SYMBOL(ib_init_ah_from_path);
@@ -1253,9 +1305,10 @@ static void ib_sa_path_rec_callback(struct ib_sa_query *sa_query,
 
 		ib_unpack(path_rec_table, ARRAY_SIZE(path_rec_table),
 			  mad->data, &rec);
-		rec.vlan_id = 0xffff;
-		memset(rec.dmac, 0, ETH_ALEN);
-		memset(rec.smac, 0, ETH_ALEN);
+		rec.net = NULL;
+		rec.ifindex = 0;
+		rec.gid_type = IB_GID_TYPE_IB;
+		eth_zero_addr(rec.dmac);
 		query->callback(status, &rec, query->context);
 	} else
 		query->callback(status, NULL, query->context);
@@ -1942,7 +1995,7 @@ static void ib_sa_remove_one(struct ib_device *device, void *client_data)
 	kfree(sa_dev);
 }
 
-static int __init ib_sa_init(void)
+int ib_sa_init(void)
 {
 	int ret;
 
@@ -1952,13 +2005,13 @@ static int __init ib_sa_init(void)
 
 	ret = ib_register_client(&sa_client);
 	if (ret) {
-		printk(KERN_ERR "Couldn't register ib_sa client\n");
+		pr_err("Couldn't register ib_sa client\n");
 		goto err1;
 	}
 
 	ret = mcast_init();
 	if (ret) {
-		printk(KERN_ERR "Couldn't initialize multicast handling\n");
+		pr_err("Couldn't initialize multicast handling\n");
 		goto err2;
 	}
 
@@ -1968,17 +2021,10 @@ static int __init ib_sa_init(void)
 		goto err3;
 	}
 
-	if (ibnl_add_client(RDMA_NL_LS, RDMA_NL_LS_NUM_OPS,
-			    ib_sa_cb_table)) {
-		pr_err("Failed to add netlink callback\n");
-		ret = -EINVAL;
-		goto err4;
-	}
 	INIT_DELAYED_WORK(&ib_nl_timed_work, ib_nl_request_timeout);
 
 	return 0;
-err4:
-	destroy_workqueue(ib_nl_wq);
+
 err3:
 	mcast_cleanup();
 err2:
@@ -1987,9 +2033,8 @@ err1:
 	return ret;
 }
 
-static void __exit ib_sa_cleanup(void)
+void ib_sa_cleanup(void)
 {
-	ibnl_remove_client(RDMA_NL_LS);
 	cancel_delayed_work(&ib_nl_timed_work);
 	flush_workqueue(ib_nl_wq);
 	destroy_workqueue(ib_nl_wq);
@@ -1997,6 +2042,3 @@ static void __exit ib_sa_cleanup(void)
 	ib_unregister_client(&sa_client);
 	idr_destroy(&query_idr);
 }
-
-module_init(ib_sa_init);
-module_exit(ib_sa_cleanup);

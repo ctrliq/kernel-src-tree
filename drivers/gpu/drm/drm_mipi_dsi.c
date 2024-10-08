@@ -94,7 +94,7 @@ static void mipi_dsi_dev_release(struct device *dev)
 {
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
 
-//	of_node_put(dev->of_node);
+	of_node_put(dev->of_node);
 	kfree(dsi);
 }
 
@@ -129,7 +129,6 @@ static int mipi_dsi_device_add(struct mipi_dsi_device *dsi)
 	return device_add(&dsi->dev);
 }
 
-#if 0
 static struct mipi_dsi_device *
 of_mipi_dsi_device_add(struct mipi_dsi_host *host, struct device_node *node)
 {
@@ -171,11 +170,9 @@ of_mipi_dsi_device_add(struct mipi_dsi_host *host, struct device_node *node)
 
 	return dsi;
 }
-#endif
 
 int mipi_dsi_host_register(struct mipi_dsi_host *host)
 {
-#if 0
 	struct device_node *node;
 
 	for_each_available_child_of_node(host->dev->of_node, node) {
@@ -184,7 +181,7 @@ int mipi_dsi_host_register(struct mipi_dsi_host *host)
 			continue;
 		of_mipi_dsi_device_add(host, node);
 	}
-#endif
+
 	return 0;
 }
 EXPORT_SYMBOL(mipi_dsi_host_register);
@@ -367,6 +364,44 @@ int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
 	return 0;
 }
 EXPORT_SYMBOL(mipi_dsi_create_packet);
+
+/**
+ * mipi_dsi_shutdown_peripheral() - sends a Shutdown Peripheral command
+ * @dsi: DSI peripheral device
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int mipi_dsi_shutdown_peripheral(struct mipi_dsi_device *dsi)
+{
+	struct mipi_dsi_msg msg = {
+		.channel = dsi->channel,
+		.type = MIPI_DSI_SHUTDOWN_PERIPHERAL,
+		.tx_buf = (u8 [2]) { 0, 0 },
+		.tx_len = 2,
+	};
+
+	return mipi_dsi_device_transfer(dsi, &msg);
+}
+EXPORT_SYMBOL(mipi_dsi_shutdown_peripheral);
+
+/**
+ * mipi_dsi_turn_on_peripheral() - sends a Turn On Peripheral command
+ * @dsi: DSI peripheral device
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int mipi_dsi_turn_on_peripheral(struct mipi_dsi_device *dsi)
+{
+	struct mipi_dsi_msg msg = {
+		.channel = dsi->channel,
+		.type = MIPI_DSI_TURN_ON_PERIPHERAL,
+		.tx_buf = (u8 [2]) { 0, 0 },
+		.tx_len = 2,
+	};
+
+	return mipi_dsi_device_transfer(dsi, &msg);
+}
+EXPORT_SYMBOL(mipi_dsi_turn_on_peripheral);
 
 /*
  * mipi_dsi_set_maximum_return_packet_size() - specify the maximum size of the

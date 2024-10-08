@@ -48,6 +48,8 @@
 
 #include <asm/uaccess.h>
 
+#include <rdma/ib.h>
+
 #include "uverbs.h"
 
 MODULE_AUTHOR("Roland Dreier");
@@ -132,6 +134,17 @@ static int (*uverbs_ex_cmd_table[])(struct ib_uverbs_file *file,
 
 static void ib_uverbs_add_one(struct ib_device *device);
 static void ib_uverbs_remove_one(struct ib_device *device, void *client_data);
+
+int uverbs_dealloc_mw(struct ib_mw *mw)
+{
+	struct ib_pd *pd = mw->pd;
+	int ret;
+
+	ret = mw->device->dealloc_mw(mw);
+	if (!ret)
+		atomic_dec(&pd->usecnt);
+	return ret;
+}
 
 static void ib_uverbs_release_dev(struct kobject *kobj)
 {
@@ -224,7 +237,7 @@ static int ib_uverbs_cleanup_ucontext(struct ib_uverbs_file *file,
 		struct ib_mw *mw = uobj->object;
 
 		idr_remove_uobj(&ib_uverbs_mw_idr, uobj);
-		ib_dealloc_mw(mw);
+		uverbs_dealloc_mw(mw);
 		kfree(uobj);
 	}
 
@@ -698,6 +711,9 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 	int srcu_key;
 	ssize_t ret;
 
+	if (WARN_ON_ONCE(!ib_safe_file_access(filp)))
+		return -EACCES;
+
 	if (count < sizeof hdr)
 		return -EINVAL;
 
@@ -1045,7 +1061,7 @@ static int find_overflow_devnum(void)
 		ret = alloc_chrdev_region(&overflow_maj, 0, IB_UVERBS_MAX_DEVICES,
 					  "infiniband_verbs");
 		if (ret) {
-			printk(KERN_ERR "user_verbs: couldn't register dynamic device number\n");
+			pr_err("user_verbs: couldn't register dynamic device number\n");
 			return ret;
 		}
 	}
@@ -1266,14 +1282,14 @@ static int __init ib_uverbs_init(void)
 	ret = register_chrdev_region(IB_UVERBS_BASE_DEV, IB_UVERBS_MAX_DEVICES,
 				     "infiniband_verbs");
 	if (ret) {
-		printk(KERN_ERR "user_verbs: couldn't register device number\n");
+		pr_err("user_verbs: couldn't register device number\n");
 		goto out;
 	}
 
 	uverbs_class = class_create(THIS_MODULE, "infiniband_verbs");
 	if (IS_ERR(uverbs_class)) {
 		ret = PTR_ERR(uverbs_class);
-		printk(KERN_ERR "user_verbs: couldn't create class infiniband_verbs\n");
+		pr_err("user_verbs: couldn't create class infiniband_verbs\n");
 		goto out_chrdev;
 	}
 
@@ -1281,13 +1297,13 @@ static int __init ib_uverbs_init(void)
 
 	ret = class_create_file(uverbs_class, &class_attr_abi_version.attr);
 	if (ret) {
-		printk(KERN_ERR "user_verbs: couldn't create abi_version attribute\n");
+		pr_err("user_verbs: couldn't create abi_version attribute\n");
 		goto out_class;
 	}
 
 	ret = ib_register_client(&uverbs_client);
 	if (ret) {
-		printk(KERN_ERR "user_verbs: couldn't register client\n");
+		pr_err("user_verbs: couldn't register client\n");
 		goto out_class;
 	}
 

@@ -21,7 +21,7 @@
 #include "util/evsel.h"
 #include "util/annotate.h"
 #include "util/event.h"
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/parse-events.h"
 #include "util/thread.h"
 #include "util/sort.h"
@@ -243,7 +243,9 @@ static int __cmd_annotate(struct perf_annotate *ann)
 		if (nr_samples > 0) {
 			total_nr_samples += nr_samples;
 			hists__collapse_resort(hists, NULL);
-			hists__output_resort(hists, NULL);
+			/* Don't sort callchain */
+			perf_evsel__reset_sample_bit(pos, CALLCHAIN);
+			perf_evsel__output_resort(pos, NULL);
 
 			if (symbol_conf.event_group &&
 			    !perf_evsel__is_group_leader(pos))

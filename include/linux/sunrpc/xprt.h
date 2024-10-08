@@ -54,6 +54,8 @@ enum rpc_display_format_t {
 struct rpc_task;
 struct rpc_xprt;
 struct seq_file;
+struct svc_serv;
+struct net;
 
 /*
  * This describes a complete RPC request
@@ -138,6 +140,7 @@ struct rpc_xprt_ops {
 	void		(*inject_disconnect)(struct rpc_xprt *xprt);
 	int		(*bc_setup)(struct rpc_xprt *xprt,
 				    unsigned int min_reqs);
+	int		(*bc_up)(struct svc_serv *serv, struct net *net);
 	void		(*bc_free_rqst)(struct rpc_rqst *rqst);
 	void		(*bc_destroy)(struct rpc_xprt *xprt,
 				      unsigned int max_reqs);
@@ -221,7 +224,8 @@ struct rpc_xprt {
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
 	struct svc_serv		*bc_serv;       /* The RPC service which will */
 						/* process the callback */
-	unsigned int		bc_alloc_count;	/* Total number of preallocs */
+	int			bc_alloc_count;	/* Total number of preallocs */
+	atomic_t		bc_free_slots;
 	spinlock_t		bc_pa_lock;	/* Protects the preallocated
 						 * items */
 	struct list_head	bc_pa_list;	/* List of preallocated
@@ -381,8 +385,6 @@ void			xprt_unlock_connect(struct rpc_xprt *, void *);
 #define XPRT_BOUND		(4)
 #define XPRT_BINDING		(5)
 #define XPRT_CLOSING		(6)
-#define XPRT_CONNECTION_ABORT	(7)
-#define XPRT_CONNECTION_CLOSE	(8)
 #define XPRT_CONGESTED		(9)
 
 static inline void xprt_set_connected(struct rpc_xprt *xprt)

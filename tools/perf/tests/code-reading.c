@@ -492,7 +492,7 @@ static int do_test_code_reading(bool try_kcore)
 	}
 
 	ret = perf_event__synthesize_thread_map(NULL, threads,
-						perf_event__process, machine, false);
+						perf_event__process, machine, false, 500);
 	if (ret < 0) {
 		pr_debug("perf_event__synthesize_thread_map failed\n");
 		goto out_err;
@@ -608,7 +608,7 @@ out_err:
 	return err;
 }
 
-int test__code_reading(void)
+int test__code_reading(int subtest __maybe_unused)
 {
 	int ret;
 
@@ -620,16 +620,16 @@ int test__code_reading(void)
 	case TEST_CODE_READING_OK:
 		return 0;
 	case TEST_CODE_READING_NO_VMLINUX:
-		fprintf(stderr, " (no vmlinux)");
+		pr_debug("no vmlinux\n");
 		return 0;
 	case TEST_CODE_READING_NO_KCORE:
-		fprintf(stderr, " (no kcore)");
+		pr_debug("no kcore\n");
 		return 0;
 	case TEST_CODE_READING_NO_ACCESS:
-		fprintf(stderr, " (no access)");
+		pr_debug("no access\n");
 		return 0;
 	case TEST_CODE_READING_NO_KERNEL_OBJ:
-		fprintf(stderr, " (no kernel obj)");
+		pr_debug("no kernel obj\n");
 		return 0;
 	default:
 		return -1;

@@ -966,14 +966,18 @@ static void team_port_disable(struct team *team,
 	team_mcast_rejoin(team);
 }
 
-#define TEAM_VLAN_FEATURES (NETIF_F_ALL_CSUM | NETIF_F_SG | \
+#define TEAM_VLAN_FEATURES (NETIF_F_HW_CSUM | NETIF_F_SG | \
 			    NETIF_F_FRAGLIST | NETIF_F_ALL_TSO | \
 			    NETIF_F_HIGHDMA | NETIF_F_LRO)
 
-static void __team_compute_features(struct team *team)
+#define TEAM_ENC_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
+				 NETIF_F_RXCSUM | NETIF_F_ALL_TSO)
+
+static void ___team_compute_features(struct team *team)
 {
 	struct team_port *port;
 	u32 vlan_features = TEAM_VLAN_FEATURES & NETIF_F_ALL_FOR_ALL;
+	netdev_features_t enc_features  = TEAM_ENC_FEATURES;
 	unsigned short max_hard_header_len = ETH_HLEN;
 	unsigned int dst_release_flag = IFF_XMIT_DST_RELEASE |
 					IFF_XMIT_DST_RELEASE_PERM;
@@ -982,6 +986,11 @@ static void __team_compute_features(struct team *team)
 		vlan_features = netdev_increment_features(vlan_features,
 					port->dev->vlan_features,
 					TEAM_VLAN_FEATURES);
+		enc_features =
+			netdev_increment_features(enc_features,
+						  port->dev->hw_enc_features,
+						  TEAM_ENC_FEATURES);
+
 
 		dst_release_flag &= port->dev->priv_flags;
 		if (port->dev->hard_header_len > max_hard_header_len)
@@ -989,20 +998,26 @@ static void __team_compute_features(struct team *team)
 	}
 
 	team->dev->vlan_features = vlan_features;
+	team->dev->hw_enc_features = enc_features | NETIF_F_GSO_ENCAP_ALL;
 	team->dev->hard_header_len = max_hard_header_len;
 
 	team->dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
 	if (dst_release_flag == (IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM))
 		team->dev->priv_flags |= IFF_XMIT_DST_RELEASE;
+}
 
+static void __team_compute_features(struct team *team)
+{
+	___team_compute_features(team);
 	netdev_change_features(team->dev);
 }
 
 static void team_compute_features(struct team *team)
 {
 	mutex_lock(&team->lock);
-	__team_compute_features(team);
+	___team_compute_features(team);
 	mutex_unlock(&team->lock);
+	netdev_change_features(team->dev);
 }
 
 static int team_port_enter(struct team *team, struct team_port *port)
@@ -1190,6 +1205,9 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
 			   portname);
 		goto err_enable_netpoll;
 	}
+
+	if (!(dev->features & NETIF_F_LRO))
+		dev_disable_lro(port_dev);
 
 	err = netdev_rx_handler_register(port_dev, team_handle_frame,
 					 port);
@@ -1671,7 +1689,8 @@ static netdev_tx_t team_xmit(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 }
 
-static u16 team_select_queue(struct net_device *dev, struct sk_buff *skb)
+static u16 team_select_queue(struct net_device *dev, struct sk_buff *skb,
+			     void *accel_priv, select_queue_fallback_t fallback)
 {
 	/*
 	 * This helper function exists to help dev_pick_tx get the correct
@@ -1985,6 +2004,7 @@ static const struct net_device_ops team_netdev_ops = {
 	.ndo_del_slave		= team_del_slave,
 	.ndo_fix_features	= team_fix_features,
 	.ndo_change_carrier     = team_change_carrier,
+	.ndo_features_check	= passthru_features_check,
 };
 
 /***********************
@@ -2073,7 +2093,7 @@ static void team_setup(struct net_device *dev)
 			   NETIF_F_HW_VLAN_CTAG_RX |
 			   NETIF_F_HW_VLAN_CTAG_FILTER;
 
-	dev->hw_features &= ~(NETIF_F_ALL_CSUM & ~NETIF_F_HW_CSUM);
+	dev->hw_features |= NETIF_F_GSO_ENCAP_ALL;
 	dev->features |= dev->hw_features;
 }
 
@@ -2860,7 +2880,7 @@ static void team_port_change_check(struct team_port *port, bool linkup)
 static int team_device_event(struct notifier_block *unused,
 			     unsigned long event, void *ptr)
 {
-	struct net_device *dev = (struct net_device *) ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct team_port *port;
 
 	port = team_port_get_rtnl(dev);
@@ -2915,7 +2935,7 @@ static int __init team_module_init(void)
 {
 	int err;
 
-	register_netdevice_notifier(&team_notifier_block);
+	register_netdevice_notifier_rh(&team_notifier_block);
 
 	err = rtnl_link_register(&team_link_ops);
 	if (err)
@@ -2931,7 +2951,7 @@ err_nl_init:
 	rtnl_link_unregister(&team_link_ops);
 
 err_rtnl_reg:
-	unregister_netdevice_notifier(&team_notifier_block);
+	unregister_netdevice_notifier_rh(&team_notifier_block);
 
 	return err;
 }
@@ -2940,7 +2960,7 @@ static void __exit team_module_exit(void)
 {
 	team_nl_fini();
 	rtnl_link_unregister(&team_link_ops);
-	unregister_netdevice_notifier(&team_notifier_block);
+	unregister_netdevice_notifier_rh(&team_notifier_block);
 }
 
 module_init(team_module_init);

@@ -1897,7 +1897,7 @@ retry:
 static void fcoe_dev_setup(void)
 {
 	register_dcbevent_notifier(&dcb_notifier);
-	register_netdevice_notifier(&fcoe_notifier);
+	register_netdevice_notifier_rh(&fcoe_notifier);
 }
 
 /**
@@ -1906,7 +1906,7 @@ static void fcoe_dev_setup(void)
 static void fcoe_dev_cleanup(void)
 {
 	unregister_dcbevent_notifier(&dcb_notifier);
-	unregister_netdevice_notifier(&fcoe_notifier);
+	unregister_netdevice_notifier_rh(&fcoe_notifier);
 }
 
 static struct fcoe_interface *
@@ -1983,7 +1983,7 @@ static int fcoe_device_notification(struct notifier_block *notifier,
 {
 	struct fcoe_ctlr_device *cdev;
 	struct fc_lport *lport = NULL;
-	struct net_device *netdev = ptr;
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
 	struct fcoe_ctlr *ctlr;
 	struct fcoe_interface *fcoe;
 	struct fcoe_port *port;

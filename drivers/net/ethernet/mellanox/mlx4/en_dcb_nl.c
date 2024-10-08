@@ -472,6 +472,9 @@ const struct dcbnl_rtnl_ops mlx4_en_dcbnl_ops = {
 
 	.getdcbx	= mlx4_en_dcbnl_getdcbx,
 	.setdcbx	= mlx4_en_dcbnl_setdcbx,
+};
+
+const struct dcbnl_rtnl_ops_ext mlx4_en_dcbnl_ops_ext = {
 	.ieee_getqcn	= mlx4_en_dcbnl_ieee_getqcn,
 	.ieee_setqcn	= mlx4_en_dcbnl_ieee_setqcn,
 	.ieee_getqcnstats = mlx4_en_dcbnl_ieee_getqcnstats,

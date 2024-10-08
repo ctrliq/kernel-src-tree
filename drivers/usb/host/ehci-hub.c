@@ -33,14 +33,7 @@
 
 #ifdef	CONFIG_PM
 
-static int ehci_hub_control(
-	struct usb_hcd	*hcd,
-	u16		typeReq,
-	u16		wValue,
-	u16		wIndex,
-	char		*buf,
-	u16		wLength
-);
+static void unlink_empty_async_suspended(struct ehci_hcd *ehci);
 
 static int persist_enabled_on_companion(struct usb_device *udev, void *unused)
 {
@@ -164,7 +157,7 @@ static int ehci_port_change(struct ehci_hcd *ehci)
 	return 0;
 }
 
-static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
+void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
 		bool suspending, bool do_wakeup)
 {
 	int		port;
@@ -181,7 +174,7 @@ static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
 	spin_lock_irq(&ehci->lock);
 
 	/* clear phy low-power mode before changing wakeup flags */
-	if (ehci->has_hostpc) {
+	if (ehci->has_tdi_phy_lpm) {
 		port = HCS_N_PORTS(ehci->hcs_params);
 		while (port--) {
 			u32 __iomem	*hostpc_reg = &ehci->regs->hostpc[port];
@@ -213,7 +206,7 @@ static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
 	}
 
 	/* enter phy low-power mode again */
-	if (ehci->has_hostpc) {
+	if (ehci->has_tdi_phy_lpm) {
 		port = HCS_N_PORTS(ehci->hcs_params);
 		while (port--) {
 			u32 __iomem	*hostpc_reg = &ehci->regs->hostpc[port];
@@ -229,6 +222,7 @@ static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
 
 	spin_unlock_irq(&ehci->lock);
 }
+EXPORT_SYMBOL_GPL(ehci_adjust_port_wakeup_flags);
 
 static int ehci_bus_suspend (struct usb_hcd *hcd)
 {
@@ -316,7 +310,7 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
 	}
 	spin_unlock_irq(&ehci->lock);
 
-	if ((changed && ehci->has_hostpc) || fs_idle_delay) {
+	if ((changed && ehci->has_tdi_phy_lpm) || fs_idle_delay) {
 		/*
 		 * Wait for HCD to enter low-power mode or for the bus
 		 * to switch to full-speed idle.
@@ -324,7 +318,7 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
 		usleep_range(5000, 5500);
 	}
 
-	if (changed && ehci->has_hostpc) {
+	if (changed && ehci->has_tdi_phy_lpm) {
 		spin_lock_irq(&ehci->lock);
 		port = HCS_N_PORTS(ehci->hcs_params);
 		while (port--) {
@@ -450,7 +444,7 @@ static int ehci_bus_resume (struct usb_hcd *hcd)
 		goto shutdown;
 
 	/* clear phy low-power mode before resume */
-	if (ehci->bus_suspended && ehci->has_hostpc) {
+	if (ehci->bus_suspended && ehci->has_tdi_phy_lpm) {
 		i = HCS_N_PORTS(ehci->hcs_params);
 		while (i--) {
 			if (test_bit(i, &ehci->bus_suspended)) {
@@ -868,7 +862,7 @@ cleanup:
 #endif /* CONFIG_USB_HCD_TEST_MODE */
 /*-------------------------------------------------------------------------*/
 
-static int ehci_hub_control (
+int ehci_hub_control(
 	struct usb_hcd	*hcd,
 	u16		typeReq,
 	u16		wValue,
@@ -934,7 +928,7 @@ static int ehci_hub_control (
 #ifdef CONFIG_USB_OTG
 			if ((hcd->self.otg_port == (wIndex + 1))
 			    && hcd->self.b_hnp_enable) {
-				otg_start_hnp(hcd->phy->otg);
+				otg_start_hnp(hcd->usb_phy->otg);
 				break;
 			}
 #endif
@@ -944,7 +938,7 @@ static int ehci_hub_control (
 				goto error;
 
 			/* clear phy low-power mode before resume */
-			if (ehci->has_hostpc) {
+			if (ehci->has_tdi_phy_lpm) {
 				temp1 = ehci_readl(ehci, hostpc_reg);
 				ehci_writel(ehci, temp1 & ~HOSTPC_PHCD,
 						hostpc_reg);
@@ -1181,12 +1175,12 @@ static int ehci_hub_control (
 
 			/* After above check the port must be connected.
 			 * Set appropriate bit thus could put phy into low power
-			 * mode if we have hostpc feature
+			 * mode if we have tdi_phy_lpm feature
 			 */
 			temp &= ~PORT_WKCONN_E;
 			temp |= PORT_WKDISC_E | PORT_WKOC_E;
 			ehci_writel(ehci, temp | PORT_SUSPEND, status_reg);
-			if (ehci->has_hostpc) {
+			if (ehci->has_tdi_phy_lpm) {
 				spin_unlock_irqrestore(&ehci->lock, flags);
 				msleep(5);/* 5ms for HCD enter low pwr mode */
 				spin_lock_irqsave(&ehci->lock, flags);
@@ -1231,6 +1225,13 @@ static int ehci_hub_control (
 				 */
 				ehci->reset_done [wIndex] = jiffies
 						+ msecs_to_jiffies (50);
+
+				/*
+				 * Force full-speed connect for FSL high-speed
+				 * erratum; disable HS Chirp by setting PFSC bit
+				 */
+				if (ehci_has_fsl_hs_errata(ehci))
+					temp |= (1 << PORTSC_FSL_PFSC);
 			}
 			ehci_writel(ehci, temp, status_reg);
 			break;
@@ -1292,6 +1293,7 @@ error_exit:
 	spin_unlock_irqrestore (&ehci->lock, flags);
 	return retval;
 }
+EXPORT_SYMBOL_GPL(ehci_hub_control);
 
 static void ehci_relinquish_port(struct usb_hcd *hcd, int portnum)
 {

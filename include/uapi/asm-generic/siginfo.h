@@ -91,10 +91,12 @@ typedef struct siginfo {
 			int _trapno;	/* TRAP # which caused the signal */
 #endif
 			short _addr_lsb; /* LSB of the reported address */
+#ifndef __GENKSYMS__
 			struct {
 				void __user *_lower;
 				void __user *_upper;
 			} _addr_bnd;
+#endif
 		} _sigfault;
 
 		/* SIGPOLL */

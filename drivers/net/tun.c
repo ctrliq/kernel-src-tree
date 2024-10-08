@@ -129,6 +129,17 @@ struct tap_filter {
 
 #define TUN_FLOW_EXPIRE (3 * HZ)
 
+struct tun_pcpu_stats {
+	u64 rx_packets;
+	u64 rx_bytes;
+	u64 tx_packets;
+	u64 tx_bytes;
+	struct u64_stats_sync syncp;
+	u32 rx_dropped;
+	u32 tx_dropped;
+	u32 rx_frame_errors;
+};
+
 /* A tun_file connects an open character device to a tuntap netdevice. It
  * also contains all socket related strctures (except sock_fprog and tap_filter)
  * to serve as one transmit queue for tuntap device. The sock_fprog and
@@ -185,6 +196,7 @@ struct tun_struct {
 #define TUN_USER_FEATURES (NETIF_F_HW_CSUM|NETIF_F_TSO_ECN|NETIF_F_TSO| \
 			  NETIF_F_TSO6|NETIF_F_UFO)
 
+	int			align;
 	int			vnet_hdr_sz;
 	int			sndbuf;
 	struct tap_filter	txflt;
@@ -202,6 +214,7 @@ struct tun_struct {
 	struct list_head disabled;
 	void *security;
 	u32 flow_count;
+	struct tun_pcpu_stats __percpu *pcpu_stats;
 };
 
 #ifdef CONFIG_TUN_VNET_CROSS_LE
@@ -423,7 +436,8 @@ unlock:
  * different rxq no. here. If we could not get rxhash, then we would
  * hope the rxq no. may help here.
  */
-static u16 tun_select_queue(struct net_device *dev, struct sk_buff *skb)
+static u16 tun_select_queue(struct net_device *dev, struct sk_buff *skb,
+			    void *accel_priv, select_queue_fallback_t fallback)
 {
 	struct tun_struct *tun = netdev_priv(dev);
 	struct tun_flow_entry *e;
@@ -841,7 +855,7 @@ static netdev_tx_t tun_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 
 drop:
-	dev->stats.tx_dropped++;
+	this_cpu_inc(tun->pcpu_stats->tx_dropped);
 	skb_tx_error(skb);
 	kfree_skb(skb);
 	rcu_read_unlock();
@@ -876,6 +890,44 @@ static netdev_features_t tun_net_fix_features(struct net_device *dev,
 
 	return (features & tun->set_features) | (features & ~TUN_USER_FEATURES);
 }
+
+static struct rtnl_link_stats64 *
+tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+{
+	u32 rx_dropped = 0, tx_dropped = 0, rx_frame_errors = 0;
+	struct tun_struct *tun = netdev_priv(dev);
+	struct tun_pcpu_stats *p;
+	int i;
+
+	for_each_possible_cpu(i) {
+		u64 rxpackets, rxbytes, txpackets, txbytes;
+		unsigned int start;
+
+		p = per_cpu_ptr(tun->pcpu_stats, i);
+		do {
+			start = u64_stats_fetch_begin(&p->syncp);
+			rxpackets	= p->rx_packets;
+			rxbytes		= p->rx_bytes;
+			txpackets	= p->tx_packets;
+			txbytes		= p->tx_bytes;
+		} while (u64_stats_fetch_retry(&p->syncp, start));
+
+		stats->rx_packets	+= rxpackets;
+		stats->rx_bytes		+= rxbytes;
+		stats->tx_packets	+= txpackets;
+		stats->tx_bytes		+= txbytes;
+
+		/* u32 counters */
+		rx_dropped	+= p->rx_dropped;
+		rx_frame_errors	+= p->rx_frame_errors;
+		tx_dropped	+= p->tx_dropped;
+	}
+	stats->rx_dropped  = rx_dropped;
+	stats->rx_frame_errors = rx_frame_errors;
+	stats->tx_dropped = tx_dropped;
+	return stats;
+}
+
 #ifdef CONFIG_NET_POLL_CONTROLLER
 static void tun_poll_controller(struct net_device *dev)
 {
@@ -893,6 +945,17 @@ static void tun_poll_controller(struct net_device *dev)
 	return;
 }
 #endif
+
+static void tun_set_headroom(struct net_device *dev, int new_hr)
+{
+	struct tun_struct *tun = netdev_priv(dev);
+
+	if (new_hr < NET_SKB_PAD)
+		new_hr = NET_SKB_PAD;
+
+	tun->align = new_hr;
+}
+
 static const struct net_device_ops tun_netdev_ops = {
 	.ndo_uninit		= tun_net_uninit,
 	.ndo_open		= tun_net_open,
@@ -904,6 +967,9 @@ static const struct net_device_ops tun_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= tun_poll_controller,
 #endif
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_set_rx_headroom	= tun_set_headroom,
+	.ndo_get_stats64	= tun_net_get_stats64,
 };
 
 static const struct net_device_ops tap_netdev_ops = {
@@ -920,6 +986,9 @@ static const struct net_device_ops tap_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= tun_poll_controller,
 #endif
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_set_rx_headroom	= tun_set_headroom,
+	.ndo_get_stats64	= tun_net_get_stats64,
 };
 
 static int tun_flow_init(struct tun_struct *tun)
@@ -1146,8 +1215,9 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 {
 	struct tun_pi pi = { 0, cpu_to_be16(ETH_P_IP) };
 	struct sk_buff *skb;
-	size_t len = total_len, align = NET_SKB_PAD, linear;
+	size_t len = total_len, align = tun->align, linear;
 	struct virtio_net_hdr gso = { 0 };
+	struct tun_pcpu_stats *stats;
 	int good_linear;
 	int offset = 0;
 	int copylen;
@@ -1215,7 +1285,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	skb = tun_alloc_skb(tfile, align, copylen, linear, noblock);
 	if (IS_ERR(skb)) {
 		if (PTR_ERR(skb) != -EAGAIN)
-			tun->dev->stats.rx_dropped++;
+			this_cpu_inc(tun->pcpu_stats->rx_dropped);
 		return PTR_ERR(skb);
 	}
 
@@ -1230,7 +1300,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	}
 
 	if (err) {
-		tun->dev->stats.rx_dropped++;
+		this_cpu_inc(tun->pcpu_stats->rx_dropped);
 		kfree_skb(skb);
 		return -EFAULT;
 	}
@@ -1238,7 +1308,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	if (gso.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
 		if (!skb_partial_csum_set(skb, tun16_to_cpu(tun, gso.csum_start),
 					  tun16_to_cpu(tun, gso.csum_offset))) {
-			tun->dev->stats.rx_frame_errors++;
+			this_cpu_inc(tun->pcpu_stats->rx_frame_errors);
 			kfree_skb(skb);
 			return -EINVAL;
 		}
@@ -1255,7 +1325,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 				pi.proto = htons(ETH_P_IPV6);
 				break;
 			default:
-				tun->dev->stats.rx_dropped++;
+				this_cpu_inc(tun->pcpu_stats->rx_dropped);
 				kfree_skb(skb);
 				return -EINVAL;
 			}
@@ -1283,7 +1353,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 			skb_shinfo(skb)->gso_type = SKB_GSO_UDP;
 			break;
 		default:
-			tun->dev->stats.rx_frame_errors++;
+			this_cpu_inc(tun->pcpu_stats->rx_frame_errors);
 			kfree_skb(skb);
 			return -EINVAL;
 		}
@@ -1293,7 +1363,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 
 		skb_shinfo(skb)->gso_size = tun16_to_cpu(tun, gso.gso_size);
 		if (skb_shinfo(skb)->gso_size == 0) {
-			tun->dev->stats.rx_frame_errors++;
+			this_cpu_inc(tun->pcpu_stats->rx_frame_errors);
 			kfree_skb(skb);
 			return -EINVAL;
 		}
@@ -1316,8 +1386,12 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	rxhash = skb_get_hash(skb);
 	netif_rx_ni(skb);
 
-	tun->dev->stats.rx_packets++;
-	tun->dev->stats.rx_bytes += len;
+	stats = get_cpu_ptr(tun->pcpu_stats);
+	u64_stats_update_begin(&stats->syncp);
+	stats->rx_packets++;
+	stats->rx_bytes += len;
+	u64_stats_update_end(&stats->syncp);
+	put_cpu_ptr(stats);
 
 	tun_flow_update(tun, rxhash, tfile);
 	return total_len;
@@ -1350,6 +1424,7 @@ static ssize_t tun_put_user(struct tun_struct *tun,
 			    const struct iovec *iv, int len)
 {
 	struct tun_pi pi = { 0, skb->protocol };
+	struct tun_pcpu_stats *stats;
 	ssize_t total = 0;
 	int vlan_offset = 0, copied;
 	int vlan_hlen = 0;
@@ -1457,8 +1532,13 @@ static ssize_t tun_put_user(struct tun_struct *tun,
 	skb_copy_datagram_const_iovec(skb, vlan_offset, iv, copied, len);
 
 done:
-	tun->dev->stats.tx_packets++;
-	tun->dev->stats.tx_bytes += len;
+	/* caller is in process context, */
+	stats = get_cpu_ptr(tun->pcpu_stats);
+	u64_stats_update_begin(&stats->syncp);
+	stats->tx_packets++;
+	stats->tx_bytes += skb->len + vlan_hlen;
+	u64_stats_update_end(&stats->syncp);
+	put_cpu_ptr(tun->pcpu_stats);
 
 	return total;
 }
@@ -1542,6 +1622,7 @@ static void tun_free_netdev(struct net_device *dev)
 	struct tun_struct *tun = netdev_priv(dev);
 
 	BUG_ON(!(list_empty(&tun->disabled)));
+	free_percpu(tun->pcpu_stats);
 	tun_flow_uninit(tun);
 	security_tun_dev_free_security(tun->security);
 	free_netdev(dev);
@@ -1779,14 +1860,21 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 		tun->txflt.count = 0;
 		tun->vnet_hdr_sz = sizeof(struct virtio_net_hdr);
 
+		tun->align = NET_SKB_PAD;
 		tun->filter_attached = false;
 		tun->sndbuf = tfile->socket.sk->sk_sndbuf;
+
+		tun->pcpu_stats = netdev_alloc_pcpu_stats(struct tun_pcpu_stats);
+		if (!tun->pcpu_stats) {
+			err = -ENOMEM;
+			goto err_free_dev;
+		}
 
 		spin_lock_init(&tun->lock);
 
 		err = security_tun_dev_alloc_security(&tun->security);
 		if (err < 0)
-			goto err_free_dev;
+			goto err_free_stat;
 
 		tun_net_init(dev);
 
@@ -1838,6 +1926,8 @@ err_detach:
 err_free_flow:
 	tun_flow_uninit(tun);
 	security_tun_dev_free_security(tun->security);
+err_free_stat:
+	free_percpu(tun->pcpu_stats);
 err_free_dev:
 	free_netdev(dev);
 	return err;

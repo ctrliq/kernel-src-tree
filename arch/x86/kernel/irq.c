@@ -116,6 +116,13 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 		seq_printf(p, "%10u ", irq_stats(j)->irq_threshold_count);
 	seq_printf(p, "  Threshold APIC interrupts\n");
 #endif
+#ifdef CONFIG_X86_MCE_AMD
+	seq_printf(p, "%*s: ", prec, "DFR");
+	for_each_online_cpu(j)
+		seq_printf(p, "%10u ",
+			   rh_irq_stats(j)->irq_deferred_error_count);
+	seq_puts(p, "  Deferred Error APIC interrupts\n");
+#endif
 #ifdef CONFIG_X86_MCE
 	seq_printf(p, "%*s: ", prec, "MCE");
 	for_each_online_cpu(j)
@@ -146,7 +153,7 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	seq_printf(p, "%*s: ", prec, "PIW");
 	for_each_online_cpu(j)
 		seq_printf(p, "%10u ",
-			   irq_stats(j)->kvm_posted_intr_wakeup_ipis);
+			   rh_irq_stats(j)->kvm_posted_intr_wakeup_ipis);
 	seq_puts(p, "  Posted-interrupt wakeup event\n");
 #endif
 	return 0;
@@ -250,6 +257,18 @@ void smp_x86_platform_ipi(struct pt_regs *regs)
 }
 
 #ifdef CONFIG_HAVE_KVM
+static void dummy_handler(void) {}
+static void (*kvm_posted_intr_wakeup_handler)(void) = dummy_handler;
+
+void kvm_set_posted_intr_wakeup_handler(void (*handler)(void))
+{
+	if (handler)
+		kvm_posted_intr_wakeup_handler = handler;
+	else
+		kvm_posted_intr_wakeup_handler = dummy_handler;
+}
+EXPORT_SYMBOL_GPL(kvm_set_posted_intr_wakeup_handler);
+
 /*
  * Handler for POSTED_INTERRUPT_VECTOR.
  */
@@ -267,6 +286,20 @@ void smp_kvm_posted_intr_ipi(struct pt_regs *regs)
 
 	irq_exit();
 
+	set_irq_regs(old_regs);
+}
+
+/*
+ * Handler for POSTED_INTERRUPT_WAKEUP_VECTOR.
+ */
+__visible void smp_kvm_posted_intr_wakeup_ipi(struct pt_regs *regs)
+{
+	struct pt_regs *old_regs = set_irq_regs(regs);
+
+	entering_ack_irq();
+	rh_inc_irq_stat(kvm_posted_intr_wakeup_ipis);
+	kvm_posted_intr_wakeup_handler();
+	exiting_irq();
 	set_irq_regs(old_regs);
 }
 #endif

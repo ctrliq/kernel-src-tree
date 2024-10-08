@@ -475,12 +475,8 @@ int ssb_gpio_unregister(struct ssb_bus *bus)
 {
 	if (ssb_chipco_available(&bus->chipco) ||
 	    ssb_extif_available(&bus->extif)) {
-#if 0 /* Not compile on RHEL */
 		gpiochip_remove(&bus->gpio);
 		return 0;
-#else
-		return gpiochip_remove(&bus->gpio);
-#endif
 	} else {
 		SSB_WARN_ON(1);
 	}

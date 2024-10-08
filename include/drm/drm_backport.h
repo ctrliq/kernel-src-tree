@@ -10,13 +10,8 @@
 #define DRM_BACKPORT_H_
 
 #include <linux/hrtimer.h>
-
-static inline u64 ktime_get_raw_ns(void)
-{
-	struct timespec now;
-	getrawmonotonic(&now);
-	return timespec_to_ns(&now);
-}
+#include <linux/err.h>
+#include <linux/io.h>
 
 /**
  * ktime_mono_to_real - Convert monotonic time to clock realtime
@@ -24,6 +19,11 @@ static inline u64 ktime_get_raw_ns(void)
 static inline ktime_t ktime_mono_to_real(ktime_t mono)
 {
 	return ktime_sub(mono, ktime_get_monotonic_offset());
+}
+
+static inline void get_monotonic_boottime64(struct timespec64 *ts)
+{
+	*ts = ktime_to_timespec64(ktime_get_boottime());
 }
 
 /*
@@ -44,6 +44,8 @@ static inline ktime_t ktime_mono_to_real(ktime_t mono)
 
 #define module_param_named_unsafe(name, value, type, perm)		\
 	module_param_named(name, value, type, perm)
+#define module_param_unsafe(name, type, perm)			\
+	module_param(name, type, perm)
 
 /*
  *
@@ -90,7 +92,7 @@ struct shrinker2 {
 	/* compat: */
 	struct shrinker compat;
 };
-void register_shrinker2(struct shrinker2 *shrinker);
+int register_shrinker2(struct shrinker2 *shrinker);
 void unregister_shrinker2(struct shrinker2 *shrinker);
 
 #define shrinker            shrinker2
@@ -161,6 +163,49 @@ static inline int mipi_dsi_attach(struct mipi_dsi_device *dsi)
 	return -ENOSYS;
 }
 
+#define cpu_relax_lowlatency() cpu_relax()
+#define pagefault_disabled()   in_atomic()
+
+static inline int arch_phys_wc_index(int handle)
+{
+#ifdef CONFIG_X86
+	int phys_wc_to_mtrr_index(int handle);
+	return phys_wc_to_mtrr_index(handle);
+#else
+	return -1;
+#endif
+}
+
+#ifdef CONFIG_X86
+static inline void __iomem *acpi_os_ioremap(u64 phys, u32 size)
+{
+	return ioremap_cache(phys, size);
+}
+#endif
+
+/*
+ * avoiding/emulating 87521e16a7abbf3fa337f56cb4d1e18247f15e8a upstream:
+ */
+
+enum acpi_backlight_type {
+	acpi_backlight_undef = -1,
+	acpi_backlight_none = 0,
+	acpi_backlight_video,
+	acpi_backlight_vendor,
+	acpi_backlight_native,
+};
+
+static inline enum acpi_backlight_type acpi_video_get_backlight_type(void)
+{
+	int acpi_video_backlight_support(void);
+	bool acpi_video_verify_backlight_support(void);
+	if (acpi_video_backlight_support() &&
+			!acpi_video_verify_backlight_support())
+		return acpi_backlight_native;
+	return acpi_backlight_undef;
+}
+
+static inline bool apple_gmux_present(void) { return false; }
 
 int __init drm_backport_init(void);
 void __exit drm_backport_exit(void);

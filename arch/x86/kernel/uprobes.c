@@ -29,6 +29,7 @@
 #include <linux/kdebug.h>
 #include <asm/processor.h>
 #include <asm/insn.h>
+#include <asm/mmu_context.h>
 
 /* Post-execution fixups. */
 
@@ -219,7 +220,7 @@ static int uprobe_init_insn(struct arch_uprobe *auprobe, struct insn *insn, bool
 {
 	u32 volatile *good_insns;
 
-	insn_init(insn, auprobe->insn, x86_64);
+	insn_init(insn, auprobe->insn, sizeof(auprobe->insn), x86_64);
 	/* has the side-effect of processing the entire instruction */
 	insn_get_length(insn);
 	if (WARN_ON_ONCE(!insn_complete(insn)))
@@ -245,11 +246,6 @@ static int uprobe_init_insn(struct arch_uprobe *auprobe, struct insn *insn, bool
 }
 
 #ifdef CONFIG_X86_64
-static inline bool is_64bit_mm(struct mm_struct *mm)
-{
-	return	!config_enabled(CONFIG_IA32_EMULATION) ||
-		!(mm->context.ia32_compat == TIF_IA32);
-}
 /*
  * If arch_uprobe->insn doesn't use rip-relative addressing, return
  * immediately.  Otherwise, rewrite the instruction so that it accesses
@@ -430,10 +426,6 @@ static void riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
 	}
 }
 #else /* 32-bit: */
-static inline bool is_64bit_mm(struct mm_struct *mm)
-{
-	return false;
-}
 /*
  * No RIP-relative addressing on 32-bit
  */

@@ -1569,7 +1569,6 @@ static int iscsi_setup_host(struct transport_container *tc, struct device *dev,
 
 	memset(ihost, 0, sizeof(*ihost));
 	atomic_set(&ihost->nr_scans, 0);
-	mutex_init(&ihost->mutex);
 
 	iscsi_bsg_host_add(shost, ihost);
 	/* ignore any bsg add error - we just can't do sgio */
@@ -1783,14 +1782,13 @@ struct iscsi_scan_data {
 	unsigned int channel;
 	unsigned int id;
 	unsigned int lun;
+	enum scsi_scan_mode rescan;
 };
 
 static int iscsi_user_scan_session(struct device *dev, void *data)
 {
 	struct iscsi_scan_data *scan_data = data;
 	struct iscsi_cls_session *session;
-	struct Scsi_Host *shost;
-	struct iscsi_cls_host *ihost;
 	unsigned long flags;
 	unsigned int id;
 
@@ -1801,10 +1799,7 @@ static int iscsi_user_scan_session(struct device *dev, void *data)
 
 	ISCSI_DBG_TRANS_SESSION(session, "Scanning session\n");
 
-	shost = iscsi_session_to_shost(session);
-	ihost = shost->shost_data;
-
-	mutex_lock(&ihost->mutex);
+	mutex_lock(&session->mutex);
 	spin_lock_irqsave(&session->lock, flags);
 	if (session->state != ISCSI_SESSION_LOGGED_IN) {
 		spin_unlock_irqrestore(&session->lock, flags);
@@ -1819,11 +1814,11 @@ static int iscsi_user_scan_session(struct device *dev, void *data)
 		    (scan_data->id == SCAN_WILD_CARD ||
 		     scan_data->id == id))
 			scsi_scan_target(&session->dev, 0, id,
-					 scan_data->lun, 1);
+					 scan_data->lun, scan_data->rescan);
 	}
 
 user_scan_exit:
-	mutex_unlock(&ihost->mutex);
+	mutex_unlock(&session->mutex);
 	ISCSI_DBG_TRANS_SESSION(session, "Completed session scan\n");
 	return 0;
 }
@@ -1836,6 +1831,7 @@ static int iscsi_user_scan(struct Scsi_Host *shost, uint channel,
 	scan_data.channel = channel;
 	scan_data.id = id;
 	scan_data.lun = lun;
+	scan_data.rescan = SCSI_SCAN_MANUAL;
 
 	return device_for_each_child(&shost->shost_gendev, &scan_data,
 				     iscsi_user_scan_session);
@@ -1852,6 +1848,7 @@ static void iscsi_scan_session(struct work_struct *work)
 	scan_data.channel = 0;
 	scan_data.id = SCAN_WILD_CARD;
 	scan_data.lun = SCAN_WILD_CARD;
+	scan_data.rescan = SCSI_SCAN_RESCAN;
 
 	iscsi_user_scan_session(&session->dev, &scan_data);
 	atomic_dec(&ihost->nr_scans);
@@ -1999,26 +1996,24 @@ static void __iscsi_unbind_session(struct work_struct *work)
 	struct iscsi_cls_session *session =
 			container_of(work, struct iscsi_cls_session,
 				     unbind_work);
-	struct Scsi_Host *shost = iscsi_session_to_shost(session);
-	struct iscsi_cls_host *ihost = shost->shost_data;
 	unsigned long flags;
 	unsigned int target_id;
 
 	ISCSI_DBG_TRANS_SESSION(session, "Unbinding session\n");
 
 	/* Prevent new scans and make sure scanning is not in progress */
-	mutex_lock(&ihost->mutex);
+	mutex_lock(&session->mutex);
 	spin_lock_irqsave(&session->lock, flags);
 	if (session->target_id == ISCSI_MAX_TARGET) {
 		spin_unlock_irqrestore(&session->lock, flags);
-		mutex_unlock(&ihost->mutex);
+		mutex_unlock(&session->mutex);
 		return;
 	}
 
 	target_id = session->target_id;
 	session->target_id = ISCSI_MAX_TARGET;
 	spin_unlock_irqrestore(&session->lock, flags);
-	mutex_unlock(&ihost->mutex);
+	mutex_unlock(&session->mutex);
 
 	if (session->ida_used)
 		ida_simple_remove(&iscsi_sess_ida, target_id);
@@ -2051,6 +2046,7 @@ iscsi_alloc_session(struct Scsi_Host *shost, struct iscsi_transport *transport,
 	INIT_WORK(&session->unbind_work, __iscsi_unbind_session);
 	INIT_WORK(&session->scan_work, iscsi_scan_session);
 	spin_lock_init(&session->lock);
+	mutex_init(&session->mutex);
 
 	/* this is released in the dev's release function */
 	scsi_host_get(shost);
@@ -3039,7 +3035,7 @@ iscsi_get_chap(struct iscsi_transport *transport, struct nlmsghdr *nlh)
 
 	shost = scsi_host_lookup(ev->u.get_chap.host_no);
 	if (!shost) {
-		printk(KERN_ERR "%s: failed. Cound not find host no %u\n",
+		printk(KERN_ERR "%s: failed. Could not find host no %u\n",
 		       __func__, ev->u.get_chap.host_no);
 		return -ENODEV;
 	}

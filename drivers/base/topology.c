@@ -106,9 +106,9 @@ define_one_ro(physical_package_id);
 define_id_show_func(core_id);
 define_one_ro(core_id);
 
-define_siblings_show_func(thread_cpumask);
-define_one_ro_named(thread_siblings, show_thread_cpumask);
-define_one_ro_named(thread_siblings_list, show_thread_cpumask_list);
+define_siblings_show_func(sibling_cpumask);
+define_one_ro_named(thread_siblings, show_sibling_cpumask);
+define_one_ro_named(thread_siblings_list, show_sibling_cpumask_list);
 
 define_siblings_show_func(core_cpumask);
 define_one_ro_named(core_siblings, show_core_cpumask);

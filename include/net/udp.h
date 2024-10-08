@@ -158,9 +158,12 @@ static inline __sum16 udp_v4_check(int len, __be32 saddr,
 void udp_set_csum(bool nocheck, struct sk_buff *skb,
 		  __be32 saddr, __be32 daddr, int len);
 
+typedef struct sock *(*udp_lookup_t)(struct sk_buff *skb, __be16 sport,
+				     __be16 dport);
+
 struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
-				 struct udphdr *uh);
-int udp_gro_complete(struct sk_buff *skb, int nhoff);
+				 struct udphdr *uh, udp_lookup_t lookup);
+int udp_gro_complete(struct sk_buff *skb, int nhoff, udp_lookup_t lookup);
 
 static inline struct udphdr *udp_gro_udphdr(struct sk_buff *skb)
 {
@@ -224,6 +227,7 @@ static inline __be16 udp_flow_src_port(struct net *net, struct sk_buff *skb,
 }
 
 /* net/ipv4/udp.c */
+void udp_v4_early_demux(struct sk_buff *skb);
 extern int udp_get_port(struct sock *sk, unsigned short snum,
 			int (*saddr_cmp)(const struct sock *,
 					 const struct sock *));
@@ -251,12 +255,16 @@ extern struct sock *udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
 extern struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
 				    __be32 daddr, __be16 dport,
 				    int dif, struct udp_table *tbl);
+struct sock *udp4_lib_lookup_skb(struct sk_buff *skb,
+				 __be16 sport, __be16 dport);
 extern struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 				    const struct in6_addr *daddr, __be16 dport,
 				    int dif);
 extern struct sock *__udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 				    const struct in6_addr *daddr, __be16 dport,
 				    int dif, struct udp_table *tbl);
+struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+				 __be16 sport, __be16 dport);
 
 /*
  * 	SNMP statistics for UDP and UDP-Lite

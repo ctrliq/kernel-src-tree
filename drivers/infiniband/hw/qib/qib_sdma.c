@@ -533,12 +533,12 @@ static void complete_sdma_err_req(struct qib_pportdata *ppd,
  * 3) The SGE addresses are suitable for passing to dma_map_single().
  */
 int qib_sdma_verbs_send(struct qib_pportdata *ppd,
-			struct qib_sge_state *ss, u32 dwords,
+			struct rvt_sge_state *ss, u32 dwords,
 			struct qib_verbs_txreq *tx)
 {
 	unsigned long flags;
-	struct qib_sge *sge;
-	struct qib_qp *qp;
+	struct rvt_sge *sge;
+	struct rvt_qp *qp;
 	int ret = 0;
 	u16 tail;
 	__le64 *descqp;
@@ -624,7 +624,7 @@ retry:
 			if (--ss->num_sge)
 				*sge = *ss->sg_list++;
 		} else if (sge->length == 0 && sge->mr->lkey) {
-			if (++sge->n >= QIB_SEGSZ) {
+			if (++sge->n >= RVT_SEGSZ) {
 				if (++sge->m >= sge->mr->mapsz)
 					break;
 				sge->n = 0;
@@ -672,8 +672,8 @@ unmap:
 	spin_lock(&qp->s_lock);
 	if (qp->ibqp.qp_type == IB_QPT_RC) {
 		/* XXX what about error sending RDMA read responses? */
-		if (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK)
-			qib_error_qp(qp, IB_WC_GENERAL_ERR);
+		if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK)
+			rvt_error_qp(qp, IB_WC_GENERAL_ERR);
 	} else if (qp->s_wqe)
 		qib_send_complete(qp, qp->s_wqe, IB_WC_GENERAL_ERR);
 	spin_unlock(&qp->s_lock);
@@ -685,7 +685,7 @@ busy:
 	qp = tx->qp;
 	priv = qp->priv;
 	spin_lock(&qp->s_lock);
-	if (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK) {
+	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
 		struct qib_ibdev *dev;
 
 		/*
@@ -697,17 +697,17 @@ busy:
 		tx->dwords = dwords;
 		priv->s_tx = tx;
 		dev = &ppd->dd->verbs_dev;
-		spin_lock(&dev->pending_lock);
+		spin_lock(&dev->rdi.pending_lock);
 		if (list_empty(&priv->iowait)) {
 			struct qib_ibport *ibp;
 
 			ibp = &ppd->ibport_data;
-			ibp->n_dmawait++;
-			qp->s_flags |= QIB_S_WAIT_DMA_DESC;
+			ibp->rvp.n_dmawait++;
+			qp->s_flags |= RVT_S_WAIT_DMA_DESC;
 			list_add_tail(&priv->iowait, &dev->dmawait);
 		}
-		spin_unlock(&dev->pending_lock);
-		qp->s_flags &= ~QIB_S_BUSY;
+		spin_unlock(&dev->rdi.pending_lock);
+		qp->s_flags &= ~RVT_S_BUSY;
 		spin_unlock(&qp->s_lock);
 		ret = -EBUSY;
 	} else {

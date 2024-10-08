@@ -84,7 +84,7 @@ struct nfsd4_callback_ops {
  * fields that are of general use to any stateid.
  */
 struct nfs4_stid {
-	atomic_t sc_count;
+	atomic_t		sc_count;
 #define NFS4_OPEN_STID 1
 #define NFS4_LOCK_STID 2
 #define NFS4_DELEG_STID 4
@@ -94,11 +94,12 @@ struct nfs4_stid {
 #define NFS4_REVOKED_DELEG_STID 16
 #define NFS4_CLOSED_DELEG_STID 32
 #define NFS4_LAYOUT_STID 64
-	unsigned char sc_type;
-	stateid_t sc_stateid;
-	struct nfs4_client *sc_client;
-	struct nfs4_file *sc_file;
-	void (*sc_free)(struct nfs4_stid *);
+	unsigned char		sc_type;
+	stateid_t		sc_stateid;
+	spinlock_t		sc_lock;
+	struct nfs4_client	*sc_client;
+	struct nfs4_file	*sc_file;
+	void			(*sc_free)(struct nfs4_stid *);
 };
 
 /*
@@ -127,6 +128,7 @@ struct nfs4_delegation {
 	struct list_head	dl_perfile;
 	struct list_head	dl_perclnt;
 	struct list_head	dl_recall_lru;  /* delegation recalled */
+	struct nfs4_clnt_odstate *dl_clnt_odstate;
 	u32			dl_type;
 	time_t			dl_time;
 /* For recall: */
@@ -360,15 +362,6 @@ struct nfs4_client_reclaim {
 	char			cr_recdir[HEXDIR_LEN]; /* recover dir */
 };
 
-static inline void
-update_stateid(stateid_t *stateid)
-{
-	stateid->si_generation++;
-	/* Wraparound recommendation from 3530bis-13 9.1.3.2: */
-	if (stateid->si_generation == 0)
-		stateid->si_generation = 1;
-}
-
 /* A reasonable value for REPLAY_ISIZE was estimated as follows:  
  * The OPEN response, typically the largest, requires 
  *   4(status) + 8(stateid) + 20(changeinfo) + 4(rflags) +  8(verifier) + 
@@ -462,6 +455,17 @@ static inline struct nfs4_lockowner * lockowner(struct nfs4_stateowner *so)
 }
 
 /*
+ * Per-client state indicating no. of opens and outstanding delegations
+ * on a file from a particular client.'od' stands for 'open & delegation'
+ */
+struct nfs4_clnt_odstate {
+	struct nfs4_client	*co_client;
+	struct nfs4_file	*co_file;
+	struct list_head	co_perfile;
+	atomic_t		co_odcount;
+};
+
+/*
  * nfs4_file: a file opened by some number of (open) nfs4_stateowners.
  *
  * These objects are global. nfsd keeps one instance of a nfs4_file per
@@ -478,7 +482,11 @@ struct nfs4_file {
 	spinlock_t		fi_lock;
 	struct hlist_node       fi_hash;	/* hash on fi_fhandle */
 	struct list_head        fi_stateids;
-	struct list_head	fi_delegations;
+	union {
+		struct list_head	fi_delegations;
+		struct rcu_head		fi_rcu;
+	};
+	struct list_head	fi_clnt_odstate;
 	/* One each for O_RDONLY, O_WRONLY, O_RDWR: */
 	struct file *		fi_fds[3];
 	/*
@@ -515,14 +523,16 @@ struct nfs4_file {
  * Better suggestions welcome.
  */
 struct nfs4_ol_stateid {
-	struct nfs4_stid    st_stid; /* must be first field */
-	struct list_head              st_perfile;
-	struct list_head              st_perstateowner;
-	struct list_head              st_locks;
-	struct nfs4_stateowner      * st_stateowner;
-	unsigned char                 st_access_bmap;
-	unsigned char                 st_deny_bmap;
-	struct nfs4_ol_stateid         * st_openstp;
+	struct nfs4_stid		st_stid;
+	struct list_head		st_perfile;
+	struct list_head		st_perstateowner;
+	struct list_head		st_locks;
+	struct nfs4_stateowner		*st_stateowner;
+	struct nfs4_clnt_odstate	*st_clnt_odstate;
+	unsigned char			st_access_bmap;
+	unsigned char			st_deny_bmap;
+	struct nfs4_ol_stateid		*st_openstp;
+	struct rw_semaphore		st_rwsem;
 };
 
 static inline struct nfs4_ol_stateid *openlockstateid(struct nfs4_stid *s)
@@ -564,9 +574,9 @@ enum nfsd4_cb_op {
 struct nfsd4_compound_state;
 struct nfsd_net;
 
-extern __be32 nfs4_preprocess_stateid_op(struct net *net,
-		struct nfsd4_compound_state *cstate,
-		stateid_t *stateid, int flags, struct file **filp);
+extern __be32 nfs4_preprocess_stateid_op(struct svc_rqst *rqstp,
+		struct nfsd4_compound_state *cstate, struct svc_fh *fhp,
+		stateid_t *stateid, int flags, struct file **filp, bool *tmp_file);
 __be32 nfsd4_lookup_stateid(struct nfsd4_compound_state *cstate,
 		     stateid_t *stateid, unsigned char typemask,
 		     struct nfs4_stid **s, struct nfsd_net *nn);
@@ -574,6 +584,7 @@ struct nfs4_stid *nfs4_alloc_stid(struct nfs4_client *cl,
 		struct kmem_cache *slab);
 void nfs4_unhash_stid(struct nfs4_stid *s);
 void nfs4_put_stid(struct nfs4_stid *s);
+void nfs4_inc_and_copy_stateid(stateid_t *dst, struct nfs4_stid *stid);
 void nfs4_remove_reclaim_record(struct nfs4_client_reclaim *, struct nfsd_net *);
 extern void nfs4_release_reclaim(struct nfsd_net *);
 extern struct nfs4_client_reclaim *nfsd4_find_reclaim_client(const char *recdir,

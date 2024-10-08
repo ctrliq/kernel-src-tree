@@ -197,6 +197,7 @@ struct tty_port {
 	int			blocked_open;	/* Waiting to open */
 	int			count;		/* Usage count */
 	wait_queue_head_t	open_wait;	/* Open waiters */
+	RH_KABI_DEPRECATE(wait_queue_head_t, close_wait)
 	wait_queue_head_t	delta_msr_wait;	/* Modem status change */
 	unsigned long		flags;		/* TTY flags ASY_*/
 	unsigned long		iflags;		/* TTYP_ internal flags */
@@ -307,12 +308,10 @@ struct tty_file_private {
 #define TTY_DEBUG 		4	/* Debugging */
 #define TTY_DO_WRITE_WAKEUP 	5	/* Call write_wakeup after queuing new */
 #define TTY_PUSH 		6	/* n_tty private */
-#define TTY_CLOSING 		7	/* ->close() in progress */
 #define TTY_LDISC_OPEN	 	11	/* Line discipline is open */
 #define TTY_PTY_LOCK 		16	/* pty private */
 #define TTY_NO_WRITE_SPLIT 	17	/* Preserve write boundaries to driver */
 #define TTY_HUPPED 		18	/* Post driver->hangup() */
-#define TTY_HUPPING 		21	/* ->hangup() in progress */
 #define TTY_LDISC_HALTED	22	/* Line discipline is halted */
 
 #define TTY_WRITE_FLUSH(tty) tty_write_flush((tty))
@@ -475,13 +474,11 @@ extern int tty_mode_ioctl(struct tty_struct *tty, struct file *file,
 			unsigned int cmd, unsigned long arg);
 extern int tty_perform_flush(struct tty_struct *tty, unsigned long arg);
 extern void tty_default_fops(struct file_operations *fops);
-extern struct tty_struct *alloc_tty_struct(void);
+extern struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx);
 extern int tty_alloc_file(struct file *file);
 extern void tty_add_file(struct tty_struct *tty, struct file *file);
 extern void tty_free_file(struct file *file);
 extern void free_tty_struct(struct tty_struct *tty);
-extern void initialize_tty_struct(struct tty_struct *tty,
-		struct tty_driver *driver, int idx);
 extern void deinitialize_tty_struct(struct tty_struct *tty);
 extern struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx);
 extern int tty_release(struct inode *inode, struct file *filp);
@@ -624,51 +621,9 @@ extern long vt_compat_ioctl(struct tty_struct *tty,
 extern void __lockfunc tty_lock(struct tty_struct *tty);
 extern int  tty_lock_interruptible(struct tty_struct *tty);
 extern void __lockfunc tty_unlock(struct tty_struct *tty);
-extern void __lockfunc tty_lock_pair(struct tty_struct *tty,
-				struct tty_struct *tty2);
-extern void __lockfunc tty_unlock_pair(struct tty_struct *tty,
-				struct tty_struct *tty2);
-
-/*
- * wait_event_interruptible_tty -- wait for a condition with the tty lock held
- *
- * The condition we are waiting for might take a long time to
- * become true, or might depend on another thread taking the
- * BTM. In either case, we need to drop the BTM to guarantee
- * forward progress. This is a leftover from the conversion
- * from the BKL and should eventually get removed as the BTM
- * falls out of use.
- *
- * Do not use in new code.
- */
-#define wait_event_interruptible_tty(tty, wq, condition)		\
-({									\
-	int __ret = 0;							\
-	if (!(condition)) {						\
-		__wait_event_interruptible_tty(tty, wq, condition, __ret);	\
-	}								\
-	__ret;								\
-})
-
-#define __wait_event_interruptible_tty(tty, wq, condition, ret)		\
-do {									\
-	DEFINE_WAIT(__wait);						\
-									\
-	for (;;) {							\
-		prepare_to_wait(&wq, &__wait, TASK_INTERRUPTIBLE);	\
-		if (condition)						\
-			break;						\
-		if (!signal_pending(current)) {				\
-			tty_unlock(tty);					\
-			schedule();					\
-			tty_lock(tty);					\
-			continue;					\
-		}							\
-		ret = -ERESTARTSYS;					\
-		break;							\
-	}								\
-	finish_wait(&wq, &__wait);					\
-} while (0)
+extern void __lockfunc tty_lock_slave(struct tty_struct *tty);
+extern void __lockfunc tty_unlock_slave(struct tty_struct *tty);
+extern void tty_set_lock_subclass(struct tty_struct *tty);
 
 #ifdef CONFIG_PROC_FS
 extern void proc_tty_register_driver(struct tty_driver *);

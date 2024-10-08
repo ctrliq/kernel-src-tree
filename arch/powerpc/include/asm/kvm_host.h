@@ -40,6 +40,8 @@
 #define KVM_MAX_VCORES		NR_CPUS
 #define KVM_USER_MEM_SLOTS	512
 
+#define __KVM_HAVE_ARCH_INTC_INITIALIZED
+
 #ifdef CONFIG_KVM_MMIO
 #define KVM_COALESCED_MMIO_PAGE_OFFSET 1
 #endif
@@ -111,6 +113,7 @@ struct kvm_vcpu_stat {
 	u32 dec_exits;
 	u32 ext_intr_exits;
 	u32 halt_successful_poll;
+	u32 halt_attempted_poll;
 	u32 halt_wakeup;
 	u32 dbell_exits;
 	u32 gdbell_exits;
@@ -185,11 +188,6 @@ struct kvmppc_spapr_tce_table {
 	struct page *pages[0];
 };
 
-struct kvm_rma_info {
-	atomic_t use_count;
-	unsigned long base_pfn;
-};
-
 /* XICS components, defined in book3s_xics.c */
 struct kvmppc_xics;
 struct kvmppc_icp;
@@ -221,16 +219,9 @@ struct revmap_entry {
 #define KVMPPC_RMAP_PRESENT	0x100000000ul
 #define KVMPPC_RMAP_INDEX	0xfffffffful
 
-/* Low-order bits in memslot->arch.slot_phys[] */
-#define KVMPPC_PAGE_ORDER_MASK	0x1f
-#define KVMPPC_PAGE_NO_CACHE	HPTE_R_I	/* 0x20 */
-#define KVMPPC_PAGE_WRITETHRU	HPTE_R_W	/* 0x40 */
-#define KVMPPC_GOT_PAGE		0x80
-
 struct kvm_arch_memory_slot {
 #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
 	unsigned long *rmap;
-	unsigned long *slot_phys;
 #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
 };
 
@@ -245,20 +236,18 @@ struct kvm_arch {
 	unsigned long host_sdr1;
 	int tlbie_lock;
 	unsigned long lpcr;
-	unsigned long rmor;
-	struct kvm_rma_info *rma;
 	unsigned long vrma_slb_v;
-	int rma_setup_done;
-	int using_mmu_notifiers;
+	int hpte_setup_done;
 	u32 hpt_order;
 	atomic_t vcpus_running;
 	u32 online_vcores;
 	unsigned long hpt_npte;
 	unsigned long hpt_mask;
 	atomic_t hpte_mod_interest;
-	spinlock_t slot_phys_lock;
 	cpumask_t need_tlb_flush;
 	int hpt_cma_alloc;
+	struct dentry *debugfs_dir;
+	struct dentry *htab_dentry;
 #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
 #ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
 	struct mutex hpt_mutex;
@@ -290,7 +279,6 @@ struct kvm_arch {
  */
 struct kvmppc_vcore {
 	int n_runnable;
-	int n_busy;
 	int num_threads;
 	int entry_exit_map;
 	int napping_threads;
@@ -394,6 +382,14 @@ struct kvmppc_slb {
 	bool tb		: 1;	/* 1TB segment */
 	bool class	: 1;
 	u8 base_page_size;	/* MMU_PAGE_xxx */
+};
+
+/* Struct used to accumulate timing information in HV real mode code */
+struct kvmhv_tb_accumulator {
+	u64	seqcount;	/* used to synchronize access, also count * 2 */
+	u64	tb_total;	/* total time in timebase ticks */
+	u64	tb_min;		/* min time */
+	u64	tb_max;		/* max time */
 };
 
 # ifdef CONFIG_PPC_FSL_BOOK3E
@@ -695,6 +691,19 @@ struct kvm_vcpu_arch {
 
 	u32 emul_inst;
 #endif
+
+#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
+	struct kvmhv_tb_accumulator *cur_activity;	/* What we're timing */
+	u64	cur_tb_start;			/* when it started */
+	struct kvmhv_tb_accumulator rm_entry;	/* real-mode entry code */
+	struct kvmhv_tb_accumulator rm_intr;	/* real-mode intr handling */
+	struct kvmhv_tb_accumulator rm_exit;	/* real-mode exit code */
+	struct kvmhv_tb_accumulator guest_time;	/* guest execution */
+	struct kvmhv_tb_accumulator cede_time;	/* time napping inside guest */
+
+	struct dentry *debugfs_dir;
+	struct dentry *debugfs_timings;
+#endif /* CONFIG_KVM_BOOK3S_HV_EXIT_TIMING */
 };
 
 #define VCPU_FPR(vcpu, i)	(vcpu)->arch.fp.fpr[i][TS_FPROFFSET]

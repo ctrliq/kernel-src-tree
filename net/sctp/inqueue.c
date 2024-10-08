@@ -143,6 +143,17 @@ struct sctp_chunk *sctp_inq_pop(struct sctp_inq *queue)
 		if (chunk->singleton ||
 		    chunk->end_of_packet ||
 		    chunk->pdiscard) {
+			if (chunk->head_skb == chunk->skb) {
+				chunk->skb = skb_shinfo(chunk->skb)->frag_list;
+				goto new_skb;
+			}
+			if (chunk->skb->next) {
+				chunk->skb = chunk->skb->next;
+				goto new_skb;
+			}
+
+			if (chunk->head_skb)
+				chunk->skb = chunk->head_skb;
 			sctp_chunk_free(chunk);
 			chunk = queue->in_progress = NULL;
 		} else {
@@ -160,34 +171,51 @@ struct sctp_chunk *sctp_inq_pop(struct sctp_inq *queue)
 
 next_chunk:
 		/* Is the queue empty?  */
-		if (list_empty(&queue->in_chunk_list))
+		entry = sctp_list_dequeue(&queue->in_chunk_list);
+		if (!entry)
 			return NULL;
 
-		entry = queue->in_chunk_list.next;
 		chunk = list_entry(entry, struct sctp_chunk, list);
-		list_del_init(entry);
 
-		/* Linearize if it's not GSO */
-		if (skb_is_nonlinear(chunk->skb)) {
-			if (skb_linearize(chunk->skb)) {
-				__SCTP_INC_STATS(dev_net(chunk->skb->dev), SCTP_MIB_IN_PKT_DISCARDS);
+		if ((skb_shinfo(chunk->skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP) {
+			/* GSO-marked skbs but without frags, handle
+			 * them normally
+			 */
+			if (skb_shinfo(chunk->skb)->frag_list)
+				chunk->head_skb = chunk->skb;
+
+			/* skbs with "cover letter" */
+			if (chunk->head_skb && chunk->skb->data_len == chunk->skb->len)
+				chunk->skb = skb_shinfo(chunk->skb)->frag_list;
+
+			if (WARN_ON(!chunk->skb)) {
+				SCTP_INC_STATS_BH(dev_net(chunk->skb->dev), SCTP_MIB_IN_PKT_DISCARDS);
 				sctp_chunk_free(chunk);
 				goto next_chunk;
 			}
-
-			/* Update sctp_hdr as it probably changed */
-			chunk->sctp_hdr = sctp_hdr(chunk->skb);
 		}
-
-		queue->in_progress = chunk;
-
-		/* This is the first chunk in the packet.  */
-		chunk->singleton = 1;
-		ch = (sctp_chunkhdr_t *) chunk->skb->data;
-		chunk->data_accepted = 0;
 
 		if (chunk->asoc)
 			sock_rps_save_rxhash(chunk->asoc->base.sk, chunk->skb);
+
+		queue->in_progress = chunk;
+
+new_skb:
+		/* This is the first chunk in the packet.  */
+		ch = (sctp_chunkhdr_t *) chunk->skb->data;
+		chunk->singleton = 1;
+		chunk->data_accepted = 0;
+		chunk->pdiscard = 0;
+		chunk->auth = 0;
+		chunk->has_asconf = 0;
+		chunk->end_of_packet = 0;
+		if (chunk->head_skb) {
+			struct sctp_input_cb
+				*cb = SCTP_INPUT_CB(chunk->skb),
+				*head_cb = SCTP_INPUT_CB(chunk->head_skb);
+
+			cb->chunk = head_cb->chunk;
+		}
 	}
 
 	chunk->chunk_hdr = ch;
@@ -210,10 +238,10 @@ next_chunk:
 		chunk->end_of_packet = 1;
 	}
 
-	SCTP_DEBUG_PRINTK("+++sctp_inq_pop+++ chunk %p[%s],"
-			  " length %d, skb->len %d\n",chunk,
-			  sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
-			  ntohs(chunk->chunk_hdr->length), chunk->skb->len);
+	pr_debug("+++sctp_inq_pop+++ chunk:%p[%s], length:%d, skb->len:%d\n",
+		 chunk, sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)),
+		 ntohs(chunk->chunk_hdr->length), chunk->skb->len);
+
 	return chunk;
 }
 
@@ -229,4 +257,3 @@ void sctp_inq_set_th_handler(struct sctp_inq *q, work_func_t callback)
 {
 	INIT_WORK(&q->immediate, callback);
 }
-

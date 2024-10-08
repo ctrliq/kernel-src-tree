@@ -298,11 +298,13 @@ static inline int cmdline_find_option_bool(const char *option)
 /* cpu.c, cpucheck.c */
 struct cpu_features {
 	int level;		/* Family, or 64 for x86-64 */
+	int family;		/* Family, always */
 	int model;
 	u32 flags[NCAPINTS];
 };
 extern struct cpu_features cpu;
 int check_cpu(int *cpu_level_ptr, int *req_level_ptr, u32 **err_flags_ptr);
+int check_knl_erratum(void);
 int validate_cpu(void);
 
 /* early_serial_console.c */

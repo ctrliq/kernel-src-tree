@@ -197,6 +197,12 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 		skb_set_owner_r(skb, child);
 		__skb_queue_tail(&child->sk_receive_queue, skb);
 		tp->syn_data_acked = 1;
+
+		/* u64_stats_update_begin(&tp->syncp) not needed here,
+		 * as we certainly are not changing upper 32bit value (0)
+		 */
+		tp->bytes_received = TCP_SKB_CB(skb)->end_seq -
+				     TCP_SKB_CB(skb)->seq - 1;
 	}
 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
 	sk->sk_data_ready(sk, 0);

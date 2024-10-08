@@ -117,13 +117,22 @@
 #define MEI_DEV_ID_WPT_LP     0x9CBA  /* Wildcat Point LP */
 #define MEI_DEV_ID_WPT_LP_2   0x9CBB  /* Wildcat Point LP 2 */
 
-/* Host Firmware Status Registers in PCI Config Space */
-#define PCI_CFG_HFS_1         0x40
-#define PCI_CFG_HFS_2         0x48
-
+#define MEI_DEV_ID_SPT        0x9D3A  /* Sunrise Point */
+#define MEI_DEV_ID_SPT_2      0x9D3B  /* Sunrise Point 2 */
+#define MEI_DEV_ID_SPT_H      0xA13A  /* Sunrise Point H */
+#define MEI_DEV_ID_SPT_H_2    0xA13B  /* Sunrise Point H 2 */
 /*
  * MEI HW Section
  */
+
+/* Host Firmware Status Registers in PCI Config Space */
+#define PCI_CFG_HFS_1         0x40
+#  define PCI_CFG_HFS_1_D0I3_MSK     0x80000000
+#define PCI_CFG_HFS_2         0x48
+#define PCI_CFG_HFS_3         0x60
+#define PCI_CFG_HFS_4         0x64
+#define PCI_CFG_HFS_5         0x68
+#define PCI_CFG_HFS_6         0x6C
 
 /* MEI registers */
 /* H_CB_WW - Host Circular Buffer (CB) Write Window register */
@@ -160,6 +169,10 @@
 #define H_D0I3C_IE        0x00000020
 /* Host D0I3 Interrupt Status */
 #define H_D0I3C_IS        0x00000040
+
+/* H_CSR masks */
+#define H_CSR_IE_MASK     (H_IE | H_D0I3C_IE)
+#define H_CSR_IS_MASK     (H_IS | H_D0I3C_IS)
 
 /* register bits of ME_CSR_HA (ME Control Status Host Access register) */
 /* ME CB (Circular Buffer) Depth HRA (Host Read Access) - host read only

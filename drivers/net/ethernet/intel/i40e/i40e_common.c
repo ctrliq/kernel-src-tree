@@ -55,18 +55,14 @@ static i40e_status i40e_set_mac_type(struct i40e_hw *hw)
 		case I40E_DEV_ID_20G_KR2_A:
 			hw->mac.type = I40E_MAC_XL710;
 			break;
+		case I40E_DEV_ID_KX_X722:
+		case I40E_DEV_ID_QSFP_X722:
 		case I40E_DEV_ID_SFP_X722:
 		case I40E_DEV_ID_1G_BASE_T_X722:
 		case I40E_DEV_ID_10G_BASE_T_X722:
+		case I40E_DEV_ID_SFP_I_X722:
+		case I40E_DEV_ID_QSFP_I_X722:
 			hw->mac.type = I40E_MAC_X722;
-			break;
-		case I40E_DEV_ID_X722_VF:
-		case I40E_DEV_ID_X722_VF_HV:
-			hw->mac.type = I40E_MAC_X722_VF;
-			break;
-		case I40E_DEV_ID_VF:
-		case I40E_DEV_ID_VF_HV:
-			hw->mac.type = I40E_MAC_VF;
 			break;
 		default:
 			hw->mac.type = I40E_MAC_GENERIC;
@@ -1334,7 +1330,7 @@ void i40e_clear_hw(struct i40e_hw *hw)
 	num_vf_int = (val & I40E_GLPCI_CNF2_MSI_X_VF_N_MASK) >>
 		     I40E_GLPCI_CNF2_MSI_X_VF_N_SHIFT;
 
-	val = i40e_read_rx_ctl(hw, I40E_PFLAN_QALLOC);
+	val = rd32(hw, I40E_PFLAN_QALLOC);
 	base_queue = (val & I40E_PFLAN_QALLOC_FIRSTQ_MASK) >>
 		     I40E_PFLAN_QALLOC_FIRSTQ_SHIFT;
 	j = (val & I40E_PFLAN_QALLOC_LASTQ_MASK) >>
@@ -1714,14 +1710,14 @@ enum i40e_status_code i40e_set_fc(struct i40e_hw *hw, u8 *aq_failures,
 			*aq_failures |= I40E_SET_FC_AQ_FAIL_SET;
 	}
 	/* Update the link info */
-	status = i40e_aq_get_link_info(hw, true, NULL, NULL);
+	status = i40e_update_link_info(hw);
 	if (status) {
 		/* Wait a little bit (on 40G cards it sometimes takes a really
 		 * long time for link to come back from the atomic reset)
 		 * and try once more
 		 */
 		msleep(1000);
-		status = i40e_aq_get_link_info(hw, true, NULL, NULL);
+		status = i40e_update_link_info(hw);
 	}
 	if (status)
 		*aq_failures |= I40E_SET_FC_AQ_FAIL_UPDATE;
@@ -1893,6 +1889,32 @@ i40e_status i40e_aq_set_phy_int_mask(struct i40e_hw *hw,
 					  i40e_aqc_opc_set_phy_int_mask);
 
 	cmd->event_mask = cpu_to_le16(mask);
+
+	status = i40e_asq_send_command(hw, &desc, NULL, 0, cmd_details);
+
+	return status;
+}
+
+/**
+ * i40e_aq_set_phy_debug
+ * @hw: pointer to the hw struct
+ * @cmd_flags: debug command flags
+ * @cmd_details: pointer to command details structure or NULL
+ *
+ * Reset the external PHY.
+ **/
+i40e_status i40e_aq_set_phy_debug(struct i40e_hw *hw, u8 cmd_flags,
+				  struct i40e_asq_cmd_details *cmd_details)
+{
+	struct i40e_aq_desc desc;
+	struct i40e_aqc_set_phy_debug *cmd =
+		(struct i40e_aqc_set_phy_debug *)&desc.params.raw;
+	i40e_status status;
+
+	i40e_fill_default_direct_cmd_desc(&desc,
+					  i40e_aqc_opc_set_phy_debug);
+
+	cmd->command_flags = cmd_flags;
 
 	status = i40e_asq_send_command(hw, &desc, NULL, 0, cmd_details);
 
@@ -2358,7 +2380,7 @@ i40e_status i40e_get_link_status(struct i40e_hw *hw, bool *link_up)
 	i40e_status status = 0;
 
 	if (hw->phy.get_link_info) {
-		status = i40e_aq_get_link_info(hw, true, NULL, NULL);
+		status = i40e_update_link_info(hw);
 
 		if (status)
 			i40e_debug(hw, I40E_DEBUG_LINK, "get link failed: status %d\n",
@@ -2366,6 +2388,32 @@ i40e_status i40e_get_link_status(struct i40e_hw *hw, bool *link_up)
 	}
 
 	*link_up = hw->phy.link_info.link_info & I40E_AQ_LINK_UP;
+
+	return status;
+}
+
+/**
+ * i40e_updatelink_status - update status of the HW network link
+ * @hw: pointer to the hw struct
+ **/
+i40e_status i40e_update_link_info(struct i40e_hw *hw)
+{
+	struct i40e_aq_get_phy_abilities_resp abilities;
+	i40e_status status = 0;
+
+	status = i40e_aq_get_link_info(hw, true, NULL, NULL);
+	if (status)
+		return status;
+
+	if (hw->phy.link_info.link_info & I40E_AQ_MEDIA_AVAILABLE) {
+		status = i40e_aq_get_phy_capabilities(hw, false, false,
+						      &abilities, NULL);
+		if (status)
+			return status;
+
+		memcpy(hw->phy.link_info.module_type, &abilities.module_type,
+		       sizeof(hw->phy.link_info.module_type));
+	}
 
 	return status;
 }

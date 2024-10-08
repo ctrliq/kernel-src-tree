@@ -75,9 +75,6 @@ __be32		nfsd_commit(struct svc_rqst *, struct svc_fh *,
 __be32		nfsd_open(struct svc_rqst *, struct svc_fh *, umode_t,
 				int, struct file **);
 struct raparms;
-__be32		nfsd_get_tmp_read_open(struct svc_rqst *, struct svc_fh *,
-				struct file **, struct raparms **);
-void		nfsd_put_tmp_read_open(struct file *, struct raparms *);
 __be32		nfsd_splice_read(struct svc_rqst *,
 				struct file *, loff_t, unsigned long *);
 __be32		nfsd_readv(struct file *, loff_t, struct kvec *, int,
@@ -86,6 +83,10 @@ __be32 		nfsd_read(struct svc_rqst *, struct svc_fh *,
 				loff_t, struct kvec *, int, unsigned long *);
 __be32 		nfsd_write(struct svc_rqst *, struct svc_fh *,struct file *,
 				loff_t, struct kvec *,int, unsigned long *, int *);
+__be32		nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				struct file *file, loff_t offset,
+				struct kvec *vec, int vlen, unsigned long *cnt,
+				int *stablep);
 __be32		nfsd_readlink(struct svc_rqst *, struct svc_fh *,
 				char *, int *);
 __be32		nfsd_symlink(struct svc_rqst *, struct svc_fh *,
@@ -106,6 +107,9 @@ __be32		nfsd_statfs(struct svc_rqst *, struct svc_fh *,
 __be32		nfsd_permission(struct svc_rqst *, struct svc_export *,
 				struct dentry *, int);
 
+struct raparms *nfsd_init_raparms(struct file *file);
+void		nfsd_put_raparams(struct file *file, struct raparms *ra);
+
 #if defined(CONFIG_NFSD_V2_ACL) || defined(CONFIG_NFSD_V3_ACL)
 struct posix_acl *nfsd_get_posix_acl(struct svc_fh *, int);
 int nfsd_set_posix_acl(struct svc_fh *, int, struct posix_acl *);
@@ -116,14 +120,14 @@ static inline int fh_want_write(struct svc_fh *fh)
 	int ret = mnt_want_write(fh->fh_export->ex_path.mnt);
 
 	if (!ret)
-		fh->fh_want_write = 1;
+		fh->fh_want_write = true;
 	return ret;
 }
 
 static inline void fh_drop_write(struct svc_fh *fh)
 {
 	if (fh->fh_want_write) {
-		fh->fh_want_write = 0;
+		fh->fh_want_write = false;
 		mnt_drop_write(fh->fh_export->ex_path.mnt);
 	}
 }
@@ -133,6 +137,25 @@ static inline __be32 fh_getattr(struct svc_fh *fh, struct kstat *stat)
 	struct path p = {.mnt = fh->fh_export->ex_path.mnt,
 			 .dentry = fh->fh_dentry};
 	return nfserrno(vfs_getattr(&p, stat));
+}
+
+static inline bool nfsd_eof_on_read(long requested, long read,
+				loff_t offset, loff_t size)
+{
+	/* We assume a short read means eof: */
+	if (requested > read)
+		return true;
+	/*
+	 * A non-short read might also reach end of file.  The spec
+	 * still requires us to set eof in that case.
+	 *
+	 * Further operations may have modified the file size since
+	 * the read, so the following check is not atomic with the read.
+	 * We've only seen that cause a problem for a client in the case
+	 * where the read returned a count of 0 without setting eof.
+	 * That case was fixed by the addition of the above check.
+	 */
+	return (offset + read >= size);
 }
 
 static inline int nfsd_create_is_exclusive(int createmode)

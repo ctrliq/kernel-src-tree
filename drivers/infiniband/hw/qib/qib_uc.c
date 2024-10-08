@@ -41,34 +41,34 @@
  * qib_make_uc_req - construct a request packet (SEND, RDMA write)
  * @qp: a pointer to the QP
  *
+ * Assumes the s_lock is held.
+ *
  * Return 1 if constructed; otherwise, return 0.
  */
-int qib_make_uc_req(struct qib_qp *qp)
+int qib_make_uc_req(struct rvt_qp *qp, unsigned long *flags)
 {
 	struct qib_qp_priv *priv = qp->priv;
 	struct qib_other_headers *ohdr;
-	struct qib_swqe *wqe;
-	unsigned long flags;
+	struct rvt_swqe *wqe;
 	u32 hwords;
 	u32 bth0;
 	u32 len;
 	u32 pmtu = qp->pmtu;
 	int ret = 0;
 
-	spin_lock_irqsave(&qp->s_lock, flags);
-
-	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_SEND_OK)) {
-		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_SEND_OK)) {
+		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
 			goto bail;
 		/* We are in the error state, flush the work request. */
-		if (qp->s_last == qp->s_head)
+		smp_read_barrier_depends(); /* see post_one_send() */
+		if (qp->s_last == ACCESS_ONCE(qp->s_head))
 			goto bail;
 		/* If DMAs are in progress, we can't flush immediately. */
 		if (atomic_read(&priv->s_dma_busy)) {
-			qp->s_flags |= QIB_S_WAIT_DMA;
+			qp->s_flags |= RVT_S_WAIT_DMA;
 			goto bail;
 		}
-		wqe = get_swqe_ptr(qp, qp->s_last);
+		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
 		qib_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
 		goto done;
 	}
@@ -82,21 +82,21 @@ int qib_make_uc_req(struct qib_qp *qp)
 	bth0 = 0;
 
 	/* Get the next send request. */
-	wqe = get_swqe_ptr(qp, qp->s_cur);
+	wqe = rvt_get_swqe_ptr(qp, qp->s_cur);
 	qp->s_wqe = NULL;
 	switch (qp->s_state) {
 	default:
-		if (!(ib_qib_state_ops[qp->state] &
-		    QIB_PROCESS_NEXT_SEND_OK))
+		if (!(ib_rvt_state_ops[qp->state] &
+		    RVT_PROCESS_NEXT_SEND_OK))
 			goto bail;
 		/* Check if send work queue is empty. */
-		if (qp->s_cur == qp->s_head)
+		smp_read_barrier_depends(); /* see post_one_send() */
+		if (qp->s_cur == ACCESS_ONCE(qp->s_head))
 			goto bail;
 		/*
 		 * Start a new request.
 		 */
-		wqe->psn = qp->s_next_psn;
-		qp->s_psn = qp->s_next_psn;
+		qp->s_psn = wqe->psn;
 		qp->s_sge.sge = wqe->sg_list[0];
 		qp->s_sge.sg_list = wqe->sg_list + 1;
 		qp->s_sge.num_sge = wqe->wr.num_sge;
@@ -130,9 +130,9 @@ int qib_make_uc_req(struct qib_qp *qp)
 		case IB_WR_RDMA_WRITE:
 		case IB_WR_RDMA_WRITE_WITH_IMM:
 			ohdr->u.rc.reth.vaddr =
-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
+				cpu_to_be64(wqe->rdma_wr.remote_addr);
 			ohdr->u.rc.reth.rkey =
-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
+				cpu_to_be32(wqe->rdma_wr.rkey);
 			ohdr->u.rc.reth.length = cpu_to_be32(len);
 			hwords += sizeof(struct ib_reth) / 4;
 			if (len > pmtu) {
@@ -215,15 +215,11 @@ int qib_make_uc_req(struct qib_qp *qp)
 	qp->s_cur_sge = &qp->s_sge;
 	qp->s_cur_size = len;
 	qib_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24),
-			    qp->s_next_psn++ & QIB_PSN_MASK);
+			    qp->s_psn++ & QIB_PSN_MASK);
 done:
-	ret = 1;
-	goto unlock;
-
+	return 1;
 bail:
-	qp->s_flags &= ~QIB_S_BUSY;
-unlock:
-	spin_unlock_irqrestore(&qp->s_lock, flags);
+	qp->s_flags &= ~RVT_S_BUSY;
 	return ret;
 }
 
@@ -241,7 +237,7 @@ unlock:
  * Called at interrupt level.
  */
 void qib_uc_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
-		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
+		int has_grh, void *data, u32 tlen, struct rvt_qp *qp)
 {
 	struct qib_other_headers *ohdr;
 	u32 opcode;
@@ -279,10 +275,10 @@ void qib_uc_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
 inv:
 		if (qp->r_state == OP(SEND_FIRST) ||
 		    qp->r_state == OP(SEND_MIDDLE)) {
-			set_bit(QIB_R_REWIND_SGE, &qp->r_aflags);
+			set_bit(RVT_R_REWIND_SGE, &qp->r_aflags);
 			qp->r_sge.num_sge = 0;
 		} else
-			qib_put_ss(&qp->r_sge);
+			rvt_put_ss(&qp->r_sge);
 		qp->r_state = OP(SEND_LAST);
 		switch (opcode) {
 		case OP(SEND_FIRST):
@@ -329,8 +325,8 @@ inv:
 		goto inv;
 	}
 
-	if (qp->state == IB_QPS_RTR && !(qp->r_flags & QIB_R_COMM_EST)) {
-		qp->r_flags |= QIB_R_COMM_EST;
+	if (qp->state == IB_QPS_RTR && !(qp->r_flags & RVT_R_COMM_EST)) {
+		qp->r_flags |= RVT_R_COMM_EST;
 		if (qp->ibqp.event_handler) {
 			struct ib_event ev;
 
@@ -347,7 +343,7 @@ inv:
 	case OP(SEND_ONLY):
 	case OP(SEND_ONLY_WITH_IMMEDIATE):
 send_first:
-		if (test_and_clear_bit(QIB_R_REWIND_SGE, &qp->r_aflags))
+		if (test_and_clear_bit(RVT_R_REWIND_SGE, &qp->r_aflags))
 			qp->r_sge = qp->s_rdma_read_sge;
 		else {
 			ret = qib_get_rwqe(qp, 0);
@@ -401,7 +397,7 @@ send_last:
 			goto rewind;
 		wc.opcode = IB_WC_RECV;
 		qib_copy_sge(&qp->r_sge, data, tlen, 0);
-		qib_put_ss(&qp->s_rdma_read_sge);
+		rvt_put_ss(&qp->s_rdma_read_sge);
 last_imm:
 		wc.wr_id = qp->r_wr_id;
 		wc.status = IB_WC_SUCCESS;
@@ -415,7 +411,7 @@ last_imm:
 		wc.dlid_path_bits = 0;
 		wc.port_num = 0;
 		/* Signal completion event if the solicited bit is set. */
-		qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
 			     (ohdr->bth[0] &
 				cpu_to_be32(IB_BTH_SOLICITED)) != 0);
 		break;
@@ -439,7 +435,7 @@ rdma_first:
 			int ok;
 
 			/* Check rkey */
-			ok = qib_rkey_ok(qp, &qp->r_sge.sge, qp->r_len,
+			ok = rvt_rkey_ok(qp, &qp->r_sge.sge, qp->r_len,
 					 vaddr, rkey, IB_ACCESS_REMOTE_WRITE);
 			if (unlikely(!ok))
 				goto drop;
@@ -484,8 +480,8 @@ rdma_last_imm:
 		tlen -= (hdrsize + pad + 4);
 		if (unlikely(tlen + qp->r_rcv_len != qp->r_len))
 			goto drop;
-		if (test_and_clear_bit(QIB_R_REWIND_SGE, &qp->r_aflags))
-			qib_put_ss(&qp->s_rdma_read_sge);
+		if (test_and_clear_bit(RVT_R_REWIND_SGE, &qp->r_aflags))
+			rvt_put_ss(&qp->s_rdma_read_sge);
 		else {
 			ret = qib_get_rwqe(qp, 1);
 			if (ret < 0)
@@ -496,7 +492,7 @@ rdma_last_imm:
 		wc.byte_len = qp->r_len;
 		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
 		qib_copy_sge(&qp->r_sge, data, tlen, 1);
-		qib_put_ss(&qp->r_sge);
+		rvt_put_ss(&qp->r_sge);
 		goto last_imm;
 
 	case OP(RDMA_WRITE_LAST):
@@ -512,7 +508,7 @@ rdma_last:
 		if (unlikely(tlen + qp->r_rcv_len != qp->r_len))
 			goto drop;
 		qib_copy_sge(&qp->r_sge, data, tlen, 1);
-		qib_put_ss(&qp->r_sge);
+		rvt_put_ss(&qp->r_sge);
 		break;
 
 	default:
@@ -524,10 +520,10 @@ rdma_last:
 	return;
 
 rewind:
-	set_bit(QIB_R_REWIND_SGE, &qp->r_aflags);
+	set_bit(RVT_R_REWIND_SGE, &qp->r_aflags);
 	qp->r_sge.num_sge = 0;
 drop:
-	ibp->n_pkt_drops++;
+	ibp->rvp.n_pkt_drops++;
 	return;
 
 op_err:

@@ -228,6 +228,7 @@ static void iscsit_set_default_tpg_attribs(struct iscsi_portal_group *tpg)
 	a->demo_mode_discovery = TA_DEMO_MODE_DISCOVERY;
 	a->default_erl = TA_DEFAULT_ERL;
 	a->t10_pi = TA_DEFAULT_T10_PI;
+	a->tpg_enabled_sendtargets = TA_DEFAULT_TPG_ENABLED_SENDTARGETS;
 }
 
 int iscsit_tpg_add_portal_group(struct iscsi_tiqn *tiqn, struct iscsi_portal_group *tpg)
@@ -434,7 +435,7 @@ struct iscsi_tpg_np *iscsit_tpg_locate_child_np(
 
 static bool iscsit_tpg_check_network_portal(
 	struct iscsi_tiqn *tiqn,
-	struct __kernel_sockaddr_storage *sockaddr,
+	struct sockaddr_storage *sockaddr,
 	int network_transport)
 {
 	struct iscsi_portal_group *tpg;
@@ -463,7 +464,7 @@ static bool iscsit_tpg_check_network_portal(
 
 struct iscsi_tpg_np *iscsit_tpg_add_network_portal(
 	struct iscsi_portal_group *tpg,
-	struct __kernel_sockaddr_storage *sockaddr,
+	struct sockaddr_storage *sockaddr,
 	struct iscsi_tpg_np *tpg_np_parent,
 	int network_transport)
 {
@@ -874,6 +875,24 @@ int iscsit_ta_t10_pi(
 	pr_debug("iSCSI_TPG[%hu] - T10 Protection information bit:"
 		" %s\n", tpg->tpgt, (a->t10_pi) ?
 		"ON" : "OFF");
+
+	return 0;
+}
+
+int iscsit_ta_tpg_enabled_sendtargets(
+	struct iscsi_portal_group *tpg,
+	u32 flag)
+{
+	struct iscsi_tpg_attrib *a = &tpg->tpg_attrib;
+
+	if ((flag != 0) && (flag != 1)) {
+		pr_err("Illegal value %d\n", flag);
+		return -EINVAL;
+	}
+
+	a->tpg_enabled_sendtargets = flag;
+	pr_debug("iSCSI_TPG[%hu] - TPG enabled bit required for SendTargets:"
+		" %s\n", tpg->tpgt, (a->tpg_enabled_sendtargets) ? "ON" : "OFF");
 
 	return 0;
 }

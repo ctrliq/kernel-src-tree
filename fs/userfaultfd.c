@@ -1322,12 +1322,6 @@ SYSCALL_DEFINE1(userfaultfd, int, flags)
 {
 	int fd, error;
 	struct file *file;
-	static volatile bool called_mark_tech_preview;
-
-	if (unlikely(!called_mark_tech_preview)) {
-		mark_tech_preview("userfaultfd", NULL);
-		called_mark_tech_preview = true;
-	}
 
 	error = get_unused_fd_flags(flags & UFFD_SHARED_FCNTL_FLAGS);
 	if (error < 0)

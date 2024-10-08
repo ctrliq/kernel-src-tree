@@ -84,11 +84,6 @@ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
 }
 
-#define SELECTOR_TI_MASK (1 << 2)
-#define SELECTOR_RPL_MASK 0x03
-
-#define IOPL_SHIFT 12
-
 #define KVM_PERMILLE_MMU_PAGES 20
 #define KVM_MIN_ALLOC_MMU_PAGES 64
 #define KVM_MMU_HASH_SHIFT 10
@@ -362,6 +357,11 @@ enum {
 	KVM_DEBUGREG_RELOAD = 4,
 };
 
+/* Hyper-V per vcpu emulation context */
+struct kvm_vcpu_hv {
+	u64 hv_vapic;
+};
+
 struct kvm_vcpu_arch {
 	/*
 	 * rip and regs accesses must go through
@@ -382,6 +382,7 @@ struct kvm_vcpu_arch {
 	u64 efer;
 	u64 apic_base;
 	struct kvm_lapic *apic;    /* kernel irqchip context */
+	u64 eoi_exit_bitmap[4];
 	unsigned long apic_attention;
 	int32_t apic_arb_prio;
 	int mp_state;
@@ -419,7 +420,6 @@ struct kvm_vcpu_arch {
 	struct kvm_mmu_memory_cache mmu_page_header_cache;
 
 	struct fpu guest_fpu;
-	bool eager_fpu;
 	u64 xcr0;
 	u64 guest_supported_xcr0;
 	u32 guest_xstate_size;
@@ -447,6 +447,9 @@ struct kvm_vcpu_arch {
 
 	int cpuid_nent;
 	struct kvm_cpuid_entry2 cpuid_entries[KVM_MAX_CPUID_ENTRIES];
+
+	int maxphyaddr;
+
 	/* emulate context */
 
 	struct x86_emulate_ctxt emulate_ctxt;
@@ -481,6 +484,7 @@ struct kvm_vcpu_arch {
 	u32 virtual_tsc_mult;
 	u32 virtual_tsc_khz;
 	s64 ia32_tsc_adjust_msr;
+	u64 tsc_scaling_ratio;
 
 	atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
 	unsigned nmi_pending; /* NMI queued after currently running handler */
@@ -513,8 +517,7 @@ struct kvm_vcpu_arch {
 	/* used for guest single stepping over the given code position */
 	unsigned long singlestep_rip;
 
-	/* fields used by HYPER-V emulation */
-	u64 hv_vapic;
+	struct kvm_vcpu_hv hyperv;
 
 	cpumask_var_t wbinvd_dirty_mask;
 
@@ -555,6 +558,9 @@ struct kvm_vcpu_arch {
 	struct {
 		bool pv_unhalted;
 	} pv;
+
+	int pending_ioapic_eoi;
+	int pending_external_vector;
 };
 
 struct kvm_lpage_info {
@@ -580,9 +586,19 @@ struct kvm_arch_memory_slot {
 struct kvm_apic_map {
 	struct rcu_head rcu;
 	u8 mode;
-	struct kvm_lapic *phys_map[256];
-	/* first index is cluster id second is cpu id in a cluster */
-	struct kvm_lapic *logical_map[16][16];
+	u32 max_apic_id;
+	union {
+		struct kvm_lapic *xapic_flat_map[8];
+		struct kvm_lapic *xapic_cluster_map[16][4];
+	};
+	struct kvm_lapic *phys_map[];
+};
+
+/* Hyper-V emulation context */
+struct kvm_hv {
+	u64 hv_guest_os_id;
+	u64 hv_hypercall;
+	u64 hv_tsc_page;
 };
 
 struct kvm_arch {
@@ -644,10 +660,7 @@ struct kvm_arch {
 	/* reads protected by irq_srcu, writes by irq_lock */
 	struct hlist_head mask_notifier_list;
 
-	/* fields used by HYPER-V emulation */
-	u64 hv_guest_os_id;
-	u64 hv_hypercall;
-	u64 hv_tsc_page;
+	struct kvm_hv hyperv;
 
 	#ifdef CONFIG_KVM_MMU_AUDIT
 	int audit_point;
@@ -657,6 +670,14 @@ struct kvm_arch {
 	u32 bsp_vcpu_id;
 
 	u64 disabled_quirks;
+
+	bool irqchip_split;
+	u8 nr_reserved_ioapic_pins;
+
+	bool disabled_lapic_found;
+
+	bool x2apic_format;
+	bool x2apic_broadcast_quirk_disabled;
 };
 
 struct kvm_vm_stat {
@@ -686,6 +707,7 @@ struct kvm_vcpu_stat {
 	u32 nmi_window_exits;
 	u32 halt_exits;
 	u32 halt_successful_poll;
+	u32 halt_attempted_poll;
 	u32 halt_wakeup;
 	u32 request_irq_exits;
 	u32 irq_exits;
@@ -733,13 +755,13 @@ struct kvm_x86_ops {
 	/* Create, but do not attach this VCPU */
 	struct kvm_vcpu *(*vcpu_create)(struct kvm *kvm, unsigned id);
 	void (*vcpu_free)(struct kvm_vcpu *vcpu);
-	void (*vcpu_reset)(struct kvm_vcpu *vcpu);
+	void (*vcpu_reset)(struct kvm_vcpu *vcpu, bool init_event);
 
 	void (*prepare_guest_switch)(struct kvm_vcpu *vcpu);
 	void (*vcpu_load)(struct kvm_vcpu *vcpu, int cpu);
 	void (*vcpu_put)(struct kvm_vcpu *vcpu);
 
-	void (*update_db_bp_intercept)(struct kvm_vcpu *vcpu);
+	void (*update_bp_intercept)(struct kvm_vcpu *vcpu);
 	int (*get_msr)(struct kvm_vcpu *vcpu, struct msr_data *msr);
 	int (*set_msr)(struct kvm_vcpu *vcpu, struct msr_data *msr);
 	u64 (*get_segment_base)(struct kvm_vcpu *vcpu, int seg);
@@ -792,10 +814,10 @@ struct kvm_x86_ops {
 	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
 	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
-	int (*vm_has_apicv)(struct kvm *kvm);
+	int (*cpu_uses_apicv)(struct kvm_vcpu *vcpu);
 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
 	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
-	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu);
 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
 	void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu, hpa_t hpa);
 	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
@@ -806,7 +828,7 @@ struct kvm_x86_ops {
 	int (*get_lpage_level)(void);
 	bool (*rdtscp_supported)(void);
 	bool (*invpcid_supported)(void);
-	void (*adjust_tsc_offset)(struct kvm_vcpu *vcpu, s64 adjustment, bool host);
+	void (*adjust_tsc_offset_guest)(struct kvm_vcpu *vcpu, s64 adjustment);
 
 	void (*set_tdp_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
 
@@ -814,11 +836,9 @@ struct kvm_x86_ops {
 
 	bool (*has_wbinvd_exit)(void);
 
-	void (*set_tsc_khz)(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale);
 	u64 (*read_tsc_offset)(struct kvm_vcpu *vcpu);
 	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
 
-	u64 (*compute_tsc_offset)(struct kvm_vcpu *vcpu, u64 target_tsc);
 	u64 (*read_l1_tsc)(struct kvm_vcpu *vcpu, u64 host_tsc);
 
 	void (*get_exit_info)(struct kvm_vcpu *vcpu, u64 *info1, u64 *info2);
@@ -859,6 +879,20 @@ struct kvm_x86_ops {
 					   gfn_t offset, unsigned long mask);
 	/* pmu operations of sub-arch */
 	const struct kvm_pmu_ops *pmu_ops;
+
+	/*
+	 * Architecture specific hooks for vCPU blocking due to
+	 * HLT instruction.
+	 * Returns for .pre_block():
+	 *    - 0 means continue to block the vCPU.
+	 *    - 1 means we cannot block the vCPU since some event
+	 *        happens during this period, such as, 'ON' bit in
+	 *        posted-interrupts descriptor is set.
+	 */
+	int (*pre_block)(struct kvm_vcpu *vcpu);
+	void (*post_block)(struct kvm_vcpu *vcpu);
+	int (*update_pi_irte)(struct kvm *kvm, unsigned int host_irq,
+			      uint32_t guest_irq, bool set);
 };
 
 struct kvm_arch_async_pf {
@@ -869,17 +903,6 @@ struct kvm_arch_async_pf {
 };
 
 extern struct kvm_x86_ops *kvm_x86_ops;
-
-static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
-					   s64 adjustment)
-{
-	kvm_x86_ops->adjust_tsc_offset(vcpu, adjustment, false);
-}
-
-static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
-{
-	kvm_x86_ops->adjust_tsc_offset(vcpu, adjustment, true);
-}
 
 int kvm_mmu_module_init(void);
 void kvm_mmu_module_exit(void);
@@ -894,7 +917,7 @@ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
 void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
 				      struct kvm_memory_slot *memslot);
 void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
-					struct kvm_memory_slot *memslot);
+				   const struct kvm_memory_slot *memslot);
 void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
 				   struct kvm_memory_slot *memslot);
 void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
@@ -1027,7 +1050,7 @@ void kvm_pic_clear_all(struct kvm_pic *pic, int irq_source_id);
 
 void kvm_inject_nmi(struct kvm_vcpu *vcpu);
 
-int fx_init(struct kvm_vcpu *vcpu);
+int fx_init(struct kvm_vcpu *vcpu, bool init_event);
 
 void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
 		       const u8 *new, int bytes);
@@ -1175,18 +1198,20 @@ int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end)
 int kvm_age_hva(struct kvm *kvm, unsigned long hva);
 int kvm_test_age_hva(struct kvm *kvm, unsigned long hva);
 void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte);
-int cpuid_maxphyaddr(struct kvm_vcpu *vcpu);
 int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v);
 int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
 int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu);
 int kvm_cpu_get_interrupt(struct kvm_vcpu *v);
-void kvm_vcpu_reset(struct kvm_vcpu *vcpu);
+void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event);
 void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu);
 void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
 					   unsigned long address);
 
 void kvm_define_shared_msr(unsigned index, u32 msr);
 int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
+
+u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc);
+u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc);
 
 unsigned long kvm_get_linear_rip(struct kvm_vcpu *vcpu);
 bool kvm_is_linear_rip(struct kvm_vcpu *vcpu, unsigned long linear_rip);
@@ -1212,6 +1237,6 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu);
 bool kvm_intr_is_single_vcpu(struct kvm *kvm, struct kvm_lapic_irq *irq,
 			     struct kvm_vcpu **dest_vcpu);
 
-void kvm_set_msi_irq(struct kvm_kernel_irq_routing_entry *e,
+void kvm_set_msi_irq(struct kvm *kvm, struct kvm_kernel_irq_routing_entry *e,
 		     struct kvm_lapic_irq *irq);
 #endif /* _ASM_X86_KVM_HOST_H */

@@ -46,12 +46,14 @@ static const struct sh_mobile_sdhi_of_data sh_mobile_sdhi_of_cfg[] = {
 struct sh_mobile_sdhi {
 	struct clk *clk;
 	struct tmio_mmc_data mmc_data;
+	struct sh_dmae_slave param_tx;
+	struct sh_dmae_slave param_rx;
 	struct tmio_mmc_dma dma_priv;
 };
 
 static int sh_mobile_sdhi_clk_enable(struct platform_device *pdev, unsigned int *f)
 {
-	struct mmc_host *mmc = platform_get_drvdata(pdev);
+	struct mmc_host *mmc = dev_get_drvdata(&pdev->dev);
 	struct tmio_mmc_host *host = mmc_priv(mmc);
 	struct sh_mobile_sdhi *priv = container_of(host->pdata, struct sh_mobile_sdhi, mmc_data);
 	int ret = clk_enable(priv->clk);
@@ -64,10 +66,24 @@ static int sh_mobile_sdhi_clk_enable(struct platform_device *pdev, unsigned int 
 
 static void sh_mobile_sdhi_clk_disable(struct platform_device *pdev)
 {
-	struct mmc_host *mmc = platform_get_drvdata(pdev);
+	struct mmc_host *mmc = dev_get_drvdata(&pdev->dev);
 	struct tmio_mmc_host *host = mmc_priv(mmc);
 	struct sh_mobile_sdhi *priv = container_of(host->pdata, struct sh_mobile_sdhi, mmc_data);
 	clk_disable(priv->clk);
+}
+
+static void sh_mobile_sdhi_set_pwr(struct platform_device *pdev, int state)
+{
+	struct sh_mobile_sdhi_info *p = pdev->dev.platform_data;
+
+	p->set_pwr(pdev, state);
+}
+
+static int sh_mobile_sdhi_get_cd(struct platform_device *pdev)
+{
+	struct sh_mobile_sdhi_info *p = pdev->dev.platform_data;
+
+	return p->get_cd(pdev);
 }
 
 static int sh_mobile_sdhi_wait_idle(struct tmio_mmc_host *host)
@@ -105,7 +121,7 @@ static int sh_mobile_sdhi_write16_hook(struct tmio_mmc_host *host, int addr)
 
 static void sh_mobile_sdhi_cd_wakeup(const struct platform_device *pdev)
 {
-	mmc_detect_change(platform_get_drvdata(pdev), msecs_to_jiffies(100));
+	mmc_detect_change(dev_get_drvdata(&pdev->dev), msecs_to_jiffies(100));
 }
 
 static const struct sh_mobile_sdhi_ops sdhi_ops = {
@@ -164,24 +180,18 @@ static int sh_mobile_sdhi_probe(struct platform_device *pdev)
 		mmc_data->capabilities |= p->tmio_caps;
 		mmc_data->capabilities2 |= p->tmio_caps2;
 		mmc_data->cd_gpio = p->cd_gpio;
+		if (p->set_pwr)
+			mmc_data->set_pwr = sh_mobile_sdhi_set_pwr;
+		if (p->get_cd)
+			mmc_data->get_cd = sh_mobile_sdhi_get_cd;
 
 		if (p->dma_slave_tx > 0 && p->dma_slave_rx > 0) {
-			struct tmio_mmc_dma *dma_priv = &priv->dma_priv;
-
-			/*
-			 * Yes, we have to provide slave IDs twice to TMIO:
-			 * once as a filter parameter and once for channel
-			 * configuration as an explicit slave ID
-			 */
-			dma_priv->chan_priv_tx = (void *)p->dma_slave_tx;
-			dma_priv->chan_priv_rx = (void *)p->dma_slave_rx;
-			dma_priv->slave_id_tx = p->dma_slave_tx;
-			dma_priv->slave_id_rx = p->dma_slave_rx;
-
-			dma_priv->alignment_shift = 1; /* 2-byte alignment */
-			dma_priv->filter = shdma_chan_filter;
-
-			mmc_data->dma = dma_priv;
+			priv->param_tx.shdma_slave.slave_id = p->dma_slave_tx;
+			priv->param_rx.shdma_slave.slave_id = p->dma_slave_rx;
+			priv->dma_priv.chan_priv_tx = &priv->param_tx.shdma_slave;
+			priv->dma_priv.chan_priv_rx = &priv->param_rx.shdma_slave;
+			priv->dma_priv.alignment_shift = 1; /* 2-byte alignment */
+			mmc_data->dma = &priv->dma_priv;
 		}
 	}
 

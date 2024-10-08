@@ -40,7 +40,6 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/pm.h>
 #include <linux/mmc/slot-gpio.h>
-#include <linux/mmc/sdhci.h>
 
 #include "sdhci.h"
 
@@ -127,11 +126,19 @@ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
 }
 
 static const struct sdhci_ops sdhci_acpi_ops_dflt = {
+	.set_clock = sdhci_set_clock,
 	.enable_dma = sdhci_acpi_enable_dma,
+	.set_bus_width = sdhci_set_bus_width,
+	.reset = sdhci_reset,
+	.set_uhs_signaling = sdhci_set_uhs_signaling,
 };
 
 static const struct sdhci_ops sdhci_acpi_ops_int = {
+	.set_clock = sdhci_set_clock,
 	.enable_dma = sdhci_acpi_enable_dma,
+	.set_bus_width = sdhci_set_bus_width,
+	.reset = sdhci_reset,
+	.set_uhs_signaling = sdhci_set_uhs_signaling,
 	.hw_reset   = sdhci_acpi_int_hw_reset,
 };
 
@@ -224,7 +231,9 @@ static int sdhci_acpi_sd_probe_slot(struct platform_device *pdev,
 
 static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
 	.chip    = &sdhci_acpi_chip_int,
-	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE | MMC_CAP_HW_RESET,
+	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
+		   MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR |
+		   MMC_CAP_BUS_WIDTH_TEST | MMC_CAP_WAIT_WHILE_BUSY,
 	.caps2   = MMC_CAP2_HC_ERASE_SZ,
 	.flags   = SDHCI_ACPI_RUNTIME_PM,
 	.quirks  = SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
@@ -238,7 +247,8 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
 	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION |
 		   SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
 	.quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON,
-	.caps    = MMC_CAP_NONREMOVABLE | MMC_CAP_POWER_OFF_CARD,
+	.caps    = MMC_CAP_NONREMOVABLE | MMC_CAP_POWER_OFF_CARD |
+		   MMC_CAP_BUS_WIDTH_TEST | MMC_CAP_WAIT_WHILE_BUSY,
 	.flags   = SDHCI_ACPI_RUNTIME_PM,
 	.pm_caps = MMC_PM_KEEP_POWER,
 	.probe_slot	= sdhci_acpi_sdio_probe_slot,
@@ -250,6 +260,7 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
 	.quirks  = SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
 	.quirks2 = SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON |
 		   SDHCI_QUIRK2_STOP_WITH_TC,
+	.caps    = MMC_CAP_BUS_WIDTH_TEST | MMC_CAP_WAIT_WHILE_BUSY,
 	.probe_slot	= sdhci_acpi_sd_probe_slot,
 };
 
@@ -389,7 +400,7 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
 	if (sdhci_acpi_flag(c, SDHCI_ACPI_SD_CD)) {
 		bool v = sdhci_acpi_flag(c, SDHCI_ACPI_SD_CD_OVERRIDE_LEVEL);
 
-		if (mmc_gpiod_request_cd(host->mmc, NULL, 0, v, 0)) {
+		if (mmc_gpiod_request_cd(host->mmc, NULL, 0, v, 0, NULL)) {
 			dev_warn(dev, "failed to setup card detect gpio\n");
 			c->use_runtime_pm = false;
 		}
@@ -459,7 +470,7 @@ static int sdhci_acpi_resume(struct device *dev)
 
 #endif
 
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 
 static int sdhci_acpi_runtime_suspend(struct device *dev)
 {
@@ -487,7 +498,6 @@ static const struct dev_pm_ops sdhci_acpi_pm_ops = {
 static struct platform_driver sdhci_acpi_driver = {
 	.driver = {
 		.name			= "sdhci-acpi",
-		.owner			= THIS_MODULE,
 		.acpi_match_table	= sdhci_acpi_ids,
 		.pm			= &sdhci_acpi_pm_ops,
 	},

@@ -111,7 +111,7 @@ smb2_hdr_assemble(struct smb2_hdr *hdr, __le16 smb2_cmd /* command */ ,
 
 	/* GLOBAL_CAP_LARGE_MTU will only be set if dialect > SMB2.02 */
 	/* See sections 2.2.4 and 3.2.4.1.5 of MS-SMB2 */
-	if ((tcon->ses) &&
+	if ((tcon->ses) && (tcon->ses->server) &&
 	    (tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU))
 		hdr->CreditCharge = cpu_to_le16(1);
 	/* else CreditCharge MBZ */
@@ -449,6 +449,10 @@ SMB2_negotiate(const unsigned int xid, struct cifs_ses *ses)
 		cifs_dbg(FYI, "negotiated smb3.0 dialect\n");
 	else if (rsp->DialectRevision == cpu_to_le16(SMB302_PROT_ID))
 		cifs_dbg(FYI, "negotiated smb3.02 dialect\n");
+#ifdef CONFIG_CIFS_SMB311
+	else if (rsp->DialectRevision == cpu_to_le16(SMB311_PROT_ID))
+		cifs_dbg(FYI, "negotiated smb3.1.1 dialect\n");
+#endif /* SMB311 */
 	else {
 		cifs_dbg(VFS, "Illegal dialect returned by server 0x%x\n",
 			 le16_to_cpu(rsp->DialectRevision));
@@ -587,7 +591,7 @@ SMB2_sess_setup(const unsigned int xid, struct cifs_ses *ses,
 	u16 blob_length = 0;
 	struct key *spnego_key = NULL;
 	char *security_blob = NULL;
-	char *ntlmssp_blob = NULL;
+	unsigned char *ntlmssp_blob = NULL;
 	bool use_spnego = false; /* else use raw ntlmssp */
 
 	cifs_dbg(FYI, "Session Setup\n");
@@ -712,13 +716,7 @@ ssetup_ntlmssp_authenticate:
 		iov[1].iov_len = blob_length;
 	} else if (phase == NtLmAuthenticate) {
 		req->hdr.SessionId = ses->Suid;
-		ntlmssp_blob = kzalloc(sizeof(struct _NEGOTIATE_MESSAGE) + 500,
-				       GFP_KERNEL);
-		if (ntlmssp_blob == NULL) {
-			rc = -ENOMEM;
-			goto ssetup_exit;
-		}
-		rc = build_ntlmssp_auth_blob(ntlmssp_blob, &blob_length, ses,
+		rc = build_ntlmssp_auth_blob(&ntlmssp_blob, &blob_length, ses,
 					     nls_cp);
 		if (rc) {
 			cifs_dbg(FYI, "build_ntlmssp_auth_blob failed %d\n",
@@ -918,7 +916,7 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 	if (tcon && tcon->bad_network_name)
 		return -ENOENT;
 
-	if ((tcon->seal) &&
+	if ((tcon && tcon->seal) &&
 	    ((ses->server->capabilities & SMB2_GLOBAL_CAP_ENCRYPTION) == 0)) {
 		cifs_dbg(VFS, "encryption requested but no server support");
 		return -EOPNOTSUPP;

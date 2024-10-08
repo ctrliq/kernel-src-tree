@@ -37,7 +37,7 @@
 #include "util/strfilter.h"
 #include "util/symbol.h"
 #include "util/debug.h"
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/probe-finder.h"
 #include "util/probe-event.h"
 #include "util/probe-file.h"
@@ -249,6 +249,9 @@ static int opt_show_vars(const struct option *opt,
 
 	return ret;
 }
+#else
+# define opt_show_lines NULL
+# define opt_show_vars NULL
 #endif
 static int opt_add_probe_event(const struct option *opt,
 			      const char *str, int unset __maybe_unused)
@@ -473,7 +476,6 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 		opt_add_probe_event),
 	OPT_BOOLEAN('f', "force", &probe_conf.force_add, "forcibly add events"
 		    " with existing name"),
-#ifdef HAVE_DWARF_SUPPORT
 	OPT_CALLBACK('L', "line", NULL,
 		     "FUNC[:RLN[+NUM|-RLN2]]|SRC:ALN[+NUM|-ALN2]",
 		     "Show source code lines.", opt_show_lines),
@@ -490,7 +492,6 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 		   "directory", "path to kernel source"),
 	OPT_BOOLEAN('\0', "no-inlines", &probe_conf.no_inlines,
 		"Don't search inlined functions"),
-#endif
 	OPT__DRY_RUN(&probe_event_dry_run),
 	OPT_INTEGER('\0', "max-probes", &probe_conf.max_probes,
 		 "Set how many probe points can be found for a probe."),
@@ -521,6 +522,16 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 #ifdef HAVE_DWARF_SUPPORT
 	set_option_flag(options, 'L', "line", PARSE_OPT_EXCLUSIVE);
 	set_option_flag(options, 'V', "vars", PARSE_OPT_EXCLUSIVE);
+#else
+# define set_nobuild(s, l, c) set_option_nobuild(options, s, l, "NO_DWARF=1", c)
+	set_nobuild('L', "line", false);
+	set_nobuild('V', "vars", false);
+	set_nobuild('\0', "externs", false);
+	set_nobuild('\0', "range", false);
+	set_nobuild('k', "vmlinux", true);
+	set_nobuild('s', "source", true);
+	set_nobuild('\0', "no-inlines", true);
+# undef set_nobuild
 #endif
 	set_option_flag(options, 'F', "funcs", PARSE_OPT_EXCLUSIVE);
 
@@ -528,12 +539,12 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 			     PARSE_OPT_STOP_AT_NON_OPTION);
 	if (argc > 0) {
 		if (strcmp(argv[0], "-") == 0) {
-			pr_warning("  Error: '-' is not supported.\n");
-			usage_with_options(probe_usage, options);
+			usage_with_options_msg(probe_usage, options,
+				"'-' is not supported.\n");
 		}
 		if (params.command && params.command != 'a') {
-			pr_warning("  Error: another command except --add is set.\n");
-			usage_with_options(probe_usage, options);
+			usage_with_options_msg(probe_usage, options,
+				"another command except --add is set.\n");
 		}
 		ret = parse_probe_event_argv(argc, argv);
 		if (ret < 0) {
@@ -562,8 +573,10 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 	switch (params.command) {
 	case 'l':
 		if (params.uprobes) {
-			pr_warning("  Error: Don't use --list with --exec.\n");
-			usage_with_options(probe_usage, options);
+			pr_err("  Error: Don't use --list with --exec.\n");
+			parse_options_usage(probe_usage, options, "l", true);
+			parse_options_usage(NULL, options, "x", true);
+			return -EINVAL;
 		}
 		ret = show_perf_probe_events(params.filter);
 		if (ret < 0)
@@ -603,8 +616,10 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 	case 'a':
 		/* Ensure the last given target is used */
 		if (params.target && !params.target_used) {
-			pr_warning("  Error: -x/-m must follow the probe definitions.\n");
-			usage_with_options(probe_usage, options);
+			pr_err("  Error: -x/-m must follow the probe definitions.\n");
+			parse_options_usage(probe_usage, options, "m", true);
+			parse_options_usage(NULL, options, "x", true);
+			return -EINVAL;
 		}
 
 		ret = perf_add_probe_events(params.events, params.nevents);

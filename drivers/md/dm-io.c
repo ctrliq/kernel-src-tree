@@ -5,7 +5,7 @@
  * This file is released under the GPL.
  */
 
-#include "dm.h"
+#include "dm-core.h"
 
 #include <linux/device-mapper.h>
 
@@ -65,8 +65,7 @@ struct dm_io_client *dm_io_client_create(void)
 	return client;
 
    bad:
-	if (client->pool)
-		mempool_destroy(client->pool);
+	mempool_destroy(client->pool);
 	kfree(client);
 	return ERR_PTR(-ENOMEM);
 }

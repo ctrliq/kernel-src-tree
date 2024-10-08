@@ -126,6 +126,9 @@ int main(void)
 	DEFINE(__LC_LAST_UPDATE_TIMER, offsetof(struct _lowcore, last_update_timer));
 	DEFINE(__LC_LAST_UPDATE_CLOCK, offsetof(struct _lowcore, last_update_clock));
 	DEFINE(__LC_CURRENT, offsetof(struct _lowcore, current_task));
+#ifdef CONFIG_64BIT
+	DEFINE(__LC_LPP, offsetof(struct _lowcore, lpp));
+#endif
 	DEFINE(__LC_CURRENT_PID, offsetof(struct _lowcore, current_pid));
 	DEFINE(__LC_THREAD_INFO, offsetof(struct _lowcore, thread_info));
 	DEFINE(__LC_KERNEL_STACK, offsetof(struct _lowcore, kernel_stack));
@@ -160,6 +163,7 @@ int main(void)
 	DEFINE(__LC_PASTE, offsetof(struct _lowcore, paste));
 	DEFINE(__LC_FP_CREG_SAVE_AREA, offsetof(struct _lowcore, fpt_creg_save_area));
 	DEFINE(__LC_LAST_BREAK, offsetof(struct _lowcore, breaking_event_addr));
+	DEFINE(__LC_PERCPU_OFFSET, offsetof(struct _lowcore, percpu_offset));
 	DEFINE(__LC_VDSO_PER_CPU, offsetof(struct _lowcore, vdso_per_cpu_data));
 	DEFINE(__LC_GMAP, offsetof(struct _lowcore, gmap));
 	DEFINE(__LC_PGM_TDB, offsetof(struct _lowcore, pgm_tdb));

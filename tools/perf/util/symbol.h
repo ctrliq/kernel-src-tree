@@ -34,8 +34,8 @@
 #endif
 
 #ifdef HAVE_LIBELF_SUPPORT
-extern Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
-				GElf_Shdr *shp, const char *name, size_t *idx);
+Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
+			     GElf_Shdr *shp, const char *name, size_t *idx);
 #endif
 
 #ifndef DMGL_PARAMS
@@ -107,7 +107,11 @@ struct symbol_conf {
 			filter_relative,
 			show_hist_headers,
 			branch_callstack,
-			has_filter;
+			has_filter,
+			show_ref_callgraph,
+			hide_unresolved,
+			raw_trace,
+			report_hierarchy;
 	const char	*vmlinux_name,
 			*kallsyms_name,
 			*source_prefix,

@@ -107,6 +107,7 @@ static inline struct net *seq_file_single_net(struct seq_file *seq)
 extern int ip_vs_conn_tab_size;
 
 struct ip_vs_iphdr {
+	__u32 off;	/* Where IP or IPv4 header starts */
 	__u32 len;	/* IPv4 simply where L4 starts
 			   IPv6 where L4 Transport Header starts */
 	__u16 fragoffs; /* IPv6 fragment offset, 0 if first frag (or not frag)*/
@@ -123,48 +124,56 @@ static inline void *frag_safe_skb_hp(const struct sk_buff *skb, int offset,
 	return skb_header_pointer(skb, offset, len, buffer);
 }
 
-static inline void
-ip_vs_fill_ip4hdr(const void *nh, struct ip_vs_iphdr *iphdr)
-{
-	const struct iphdr *iph = nh;
-
-	iphdr->len	= iph->ihl * 4;
-	iphdr->fragoffs	= 0;
-	iphdr->protocol	= iph->protocol;
-	iphdr->saddr.ip	= iph->saddr;
-	iphdr->daddr.ip	= iph->daddr;
-}
-
 /* This function handles filling *ip_vs_iphdr, both for IPv4 and IPv6.
  * IPv6 requires some extra work, as finding proper header position,
  * depend on the IPv6 extension headers.
  */
-static inline void
-ip_vs_fill_iph_skb(int af, const struct sk_buff *skb, struct ip_vs_iphdr *iphdr)
+static inline int
+ip_vs_fill_iph_skb_off(int af, const struct sk_buff *skb, int offset,
+		       struct ip_vs_iphdr *iphdr)
 {
+	iphdr->off = offset;
 #ifdef CONFIG_IP_VS_IPV6
 	if (af == AF_INET6) {
-		const struct ipv6hdr *iph =
-			(struct ipv6hdr *)skb_network_header(skb);
+		struct ipv6hdr _iph;
+		const struct ipv6hdr *iph = skb_header_pointer(
+			skb, offset, sizeof(_iph), &_iph);
+		if (!iph)
+			return 0;
+
 		iphdr->saddr.in6 = iph->saddr;
 		iphdr->daddr.in6 = iph->daddr;
 		/* ipv6_find_hdr() updates len, flags */
-		iphdr->len	 = 0;
+		iphdr->len	 = offset;
 		iphdr->flags	 = 0;
 		iphdr->protocol  = ipv6_find_hdr(skb, &iphdr->len, -1,
 						 &iphdr->fragoffs,
 						 &iphdr->flags);
+		if (iphdr->protocol < 0)
+			return 0;
 	} else
 #endif
 	{
-		const struct iphdr *iph =
-			(struct iphdr *)skb_network_header(skb);
-		iphdr->len	= iph->ihl * 4;
+		struct iphdr _iph;
+		const struct iphdr *iph = skb_header_pointer(
+			skb, offset, sizeof(_iph), &_iph);
+		if (!iph)
+			return 0;
+
+		iphdr->len	= offset + iph->ihl * 4;
 		iphdr->fragoffs	= 0;
 		iphdr->protocol	= iph->protocol;
 		iphdr->saddr.ip	= iph->saddr;
 		iphdr->daddr.ip	= iph->daddr;
 	}
+
+	return 1;
+}
+
+static inline int
+ip_vs_fill_iph_skb(int af, const struct sk_buff *skb, struct ip_vs_iphdr *iphdr)
+{
+	return ip_vs_fill_iph_skb_off(af, skb, skb_network_offset(skb), iphdr);
 }
 
 /* This function is a faster version of ip_vs_fill_iph_skb().
@@ -1606,6 +1615,23 @@ static inline void ip_vs_conn_drop_conntrack(struct ip_vs_conn *cp)
 }
 /* CONFIG_IP_VS_NFCT */
 #endif
+
+/* Really using conntrack? */
+static inline bool ip_vs_conn_uses_conntrack(struct ip_vs_conn *cp,
+					     struct sk_buff *skb)
+{
+#ifdef CONFIG_IP_VS_NFCT
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct;
+
+	if (!(cp->flags & IP_VS_CONN_F_NFCT))
+		return false;
+	ct = nf_ct_get(skb, &ctinfo);
+	if (ct && !nf_ct_is_untracked(ct))
+		return true;
+#endif
+	return false;
+}
 
 static inline unsigned int
 ip_vs_dest_conn_overhead(struct ip_vs_dest *dest)

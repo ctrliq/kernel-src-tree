@@ -243,6 +243,21 @@ static inline void ether_addr_copy(u8 *dst, const u8 *src)
 #endif
 }
 
+/*
+ * eth_hw_addr_inherit - Copy dev_addr from another net_device
+ * @dst: pointer to net_device to copy dev_addr to
+ * @src: pointer to net_device to copy dev_addr from
+ *
+ * Copy the Ethernet address from one net_device to another along with
+ * the address attributes (addr_assign_type).
+ */
+static inline void eth_hw_addr_inherit(struct net_device *dst,
+				       struct net_device *src)
+{
+	dst->addr_assign_type = src->addr_assign_type;
+	memcpy(dst->dev_addr, src->dev_addr, ETH_ALEN);
+}
+
 /**
  * compare_ether_addr - Compare two Ethernet addresses
  * @addr1: Pointer to a six-byte array containing the Ethernet address

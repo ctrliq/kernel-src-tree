@@ -53,7 +53,6 @@
 #define SDMMC_IDINTEN		0x090
 #define SDMMC_DSCADDR		0x094
 #define SDMMC_BUFADDR		0x098
-#define SDMMC_CDTHRCTL		0x100
 #define SDMMC_DATA(x)		(x)
 
 /*
@@ -112,7 +111,6 @@
 #define SDMMC_INT_ERROR			0xbfc2
 /* Command register defines */
 #define SDMMC_CMD_START			BIT(31)
-#define SDMMC_CMD_USE_HOLD_REG	BIT(29)
 #define SDMMC_CMD_CCS_EXP		BIT(23)
 #define SDMMC_CMD_CEATA_RD		BIT(22)
 #define SDMMC_CMD_UPD_CLK		BIT(21)
@@ -129,10 +127,6 @@
 #define SDMMC_CMD_INDX(n)		((n) & 0x1F)
 /* Status register defines */
 #define SDMMC_GET_FCNT(x)		(((x)>>17) & 0x1FFF)
-/* FIFOTH register defines */
-#define SDMMC_SET_FIFOTH(m, r, t)	(((m) & 0x7) << 28 | \
-					 ((r) & 0xFFF) << 16 | \
-					 ((t) & 0xFFF))
 /* Internal DMAC interrupt defines */
 #define SDMMC_IDMAC_INT_AI		BIT(9)
 #define SDMMC_IDMAC_INT_NI		BIT(8)
@@ -147,18 +141,6 @@
 #define SDMMC_IDMAC_SWRESET		BIT(0)
 /* Version ID register define */
 #define SDMMC_GET_VERID(x)		((x) & 0xFFFF)
-/* Card read threshold */
-#define SDMMC_SET_RD_THLD(v, x)		(((v) & 0x1FFF) << 16 | (x))
-
-/* FIFO register access macros. These should not change the data endian-ness
- * as they are written to memory to be dealt with by the upper layers */
-#define mci_fifo_readw(__reg)	__raw_readw(__reg)
-#define mci_fifo_readl(__reg)	__raw_readl(__reg)
-#define mci_fifo_readq(__reg)	__raw_readq(__reg)
-
-#define mci_fifo_writew(__value, __reg)	__raw_writew(__reg, __value)
-#define mci_fifo_writel(__value, __reg)	__raw_writel(__reg, __value)
-#define mci_fifo_writeq(__value, __reg)	__raw_writeq(__reg, __value)
 
 /* Register access macros */
 #define mci_readl(dev, reg)			\
@@ -191,10 +173,6 @@
 	(*(volatile u64 __force *)((dev)->regs + SDMMC_##reg))
 #define mci_writeq(dev, reg, value)			\
 	(*(volatile u64 __force *)((dev)->regs + SDMMC_##reg) = (value))
-
-#define __raw_writeq(__value, __reg) \
-	(*(volatile u64 __force *)(__reg) = (__value))
-#define __raw_readq(__reg) (*(volatile u64 __force *)(__reg))
 #endif
 
 extern int dw_mci_probe(struct dw_mci *host);

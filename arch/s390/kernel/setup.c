@@ -78,6 +78,7 @@ EXPORT_SYMBOL(console_irq);
 unsigned long elf_hwcap = 0;
 char elf_platform[ELF_PLATFORM_SIZE];
 
+unsigned long int_hwcap = 0;
 struct mem_chunk __initdata memory_chunk[MEMORY_CHUNKS];
 
 int __initdata memory_end_set;
@@ -329,7 +330,9 @@ static void __init setup_lowcore(void)
 		+ PAGE_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
 	lc->current_task = (unsigned long) init_thread_union.thread_info.task;
 	lc->thread_info = (unsigned long) &init_thread_union;
+#ifdef CONFIG_64BIT
 	lc->lpp = LPP_MAGIC;
+#endif
 	lc->machine_flags = S390_lowcore.machine_flags;
 	lc->stfl_fac_list = S390_lowcore.stfl_fac_list;
 	memcpy(lc->stfle_fac_list, S390_lowcore.stfle_fac_list,
@@ -970,6 +973,12 @@ static void __init setup_hwcaps(void)
 		strcpy(elf_platform, "z13");
 		break;
 	}
+
+	/*
+	 * Virtualization support HWCAP_INT_SIE is bit 0.
+	 */
+	if (sclp_has_sief2())
+		int_hwcap |= HWCAP_INT_SIE;
 }
 
 /*

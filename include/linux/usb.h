@@ -399,6 +399,8 @@ struct usb_bus {
 #endif
 };
 
+struct usb_dev_state;
+
 /* ----------------------------------------------------------------------- */
 
 struct usb_tt;
@@ -510,7 +512,8 @@ struct usb3_lpm_parameters {
  * @usb2_hw_lpm_besl_capable: device can perform USB2 hardware BESL LPM
  * @usb2_hw_lpm_enabled: USB2 hardware LPM is enabled
  * @usb2_hw_lpm_allowed: Userspace allows USB 2.0 LPM to be enabled
- * @usb3_lpm_enabled: USB3 hardware LPM enabled
+ * @usb3_lpm_u1_enabled: USB3 hardware U1 LPM enabled
+ * @usb3_lpm_u2_enabled: USB3 hardware U2 LPM enabled
  * @string_langid: language ID for strings
  * @product: iProduct string, if present (static)
  * @manufacturer: iManufacturer string, if present (static)
@@ -583,7 +586,8 @@ struct usb_device {
 	unsigned usb2_hw_lpm_besl_capable:1;
 	unsigned usb2_hw_lpm_enabled:1;
 	unsigned usb2_hw_lpm_allowed:1;
-	unsigned usb3_lpm_enabled:1;
+	unsigned usb3_lpm_u1_enabled:1;
+	unsigned usb3_lpm_u2_enabled:1;
 	int string_langid;
 
 	/* static strings from the device */
@@ -640,9 +644,10 @@ extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
 		if (!child) continue; else
 
 /* USB device locking */
-#define usb_lock_device(udev)		device_lock(&(udev)->dev)
-#define usb_unlock_device(udev)		device_unlock(&(udev)->dev)
-#define usb_trylock_device(udev)	device_trylock(&(udev)->dev)
+#define usb_lock_device(udev)			device_lock(&(udev)->dev)
+#define usb_unlock_device(udev)			device_unlock(&(udev)->dev)
+#define usb_lock_device_interruptible(udev)	device_lock_interruptible(&(udev)->dev)
+#define usb_trylock_device(udev)		device_trylock(&(udev)->dev)
 extern int usb_lock_device_for_reset(struct usb_device *udev,
 				     const struct usb_interface *iface);
 
@@ -662,7 +667,7 @@ static inline bool usb_acpi_power_manageable(struct usb_device *hdev, int index)
 #endif
 
 /* USB autosuspend and autoresume */
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 extern void usb_enable_autosuspend(struct usb_device *udev);
 extern void usb_disable_autosuspend(struct usb_device *udev);
 
@@ -782,6 +787,11 @@ extern struct usb_host_interface *usb_find_alt_setting(
 		unsigned int iface_num,
 		unsigned int alt_num);
 
+/* port claiming functions */
+int usb_hub_claim_port(struct usb_device *hdev, unsigned port1,
+		struct usb_dev_state *owner);
+int usb_hub_release_port(struct usb_device *hdev, unsigned port1,
+		struct usb_dev_state *owner);
 
 /**
  * usb_make_path - returns stable device path in the usb tree
@@ -1698,6 +1708,10 @@ extern void usb_reset_endpoint(struct usb_device *dev, unsigned int epaddr);
 
 /* this request isn't really synchronous, but it belongs with the others */
 extern int usb_driver_set_configuration(struct usb_device *udev, int config);
+
+/* choose and set configuration for device */
+extern int usb_choose_configuration(struct usb_device *udev);
+extern int usb_set_configuration(struct usb_device *dev, int configuration);
 
 /*
  * timeouts, in milliseconds, used for sending/receiving control messages

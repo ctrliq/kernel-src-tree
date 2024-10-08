@@ -135,8 +135,10 @@ struct filter_entry {
 
 #define FW4_FNAME "cxgb4/t4fw.bin"
 #define FW5_FNAME "cxgb4/t5fw.bin"
+#define FW6_FNAME "cxgb4/t6fw.bin"
 #define FW4_CFNAME "cxgb4/t4-config.txt"
 #define FW5_CFNAME "cxgb4/t5-config.txt"
+#define FW6_CFNAME "cxgb4/t6-config.txt"
 #define PHY_AQ1202_FIRMWARE "cxgb4/aq1202_fw.cld"
 #define PHY_BCM84834_FIRMWARE "cxgb4/bcm8483.bin"
 #define PHY_AQ1202_DEVICEID 0x4409
@@ -1328,7 +1330,8 @@ static int del_filter_wr(struct adapter *adapter, int fidx)
 	return 0;
 }
 
-static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb)
+static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb,
+			     void *accel_priv, select_queue_fallback_t fallback)
 {
 	int txq;
 
@@ -1366,7 +1369,7 @@ static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb)
 		return txq;
 	}
 
-	return skb_tx_hash(dev, skb);
+	return fallback(dev, skb) % dev->real_num_tx_queues;
 }
 
 static int closest_timer(const struct sge *s, int time)
@@ -1677,20 +1680,25 @@ static void process_tid_release_list(struct work_struct *work)
  */
 void cxgb4_remove_tid(struct tid_info *t, unsigned int chan, unsigned int tid)
 {
-	void *old;
 	struct sk_buff *skb;
 	struct adapter *adap = container_of(t, struct adapter, tids);
 
-	old = t->tid_tab[tid];
+	WARN_ON(tid >= t->ntids);
+
+	if (t->tid_tab[tid]) {
+		t->tid_tab[tid] = NULL;
+		if (t->hash_base && (tid >= t->hash_base))
+			atomic_dec(&t->hash_tids_in_use);
+		else
+			atomic_dec(&t->tids_in_use);
+	}
+
 	skb = alloc_skb(sizeof(struct cpl_tid_release), GFP_ATOMIC);
 	if (likely(skb)) {
-		t->tid_tab[tid] = NULL;
 		mk_tid_release(skb, chan, tid);
 		t4_ofld_send(adap, skb);
 	} else
 		cxgb4_queue_tid_release(t, chan, tid);
-	if (old)
-		atomic_dec(&t->tids_in_use);
 }
 EXPORT_SYMBOL(cxgb4_remove_tid);
 
@@ -1729,6 +1737,7 @@ static int tid_init(struct tid_info *t)
 	t->afree = NULL;
 	t->atids_in_use = 0;
 	atomic_set(&t->tids_in_use, 0);
+	atomic_set(&t->hash_tids_in_use, 0);
 
 	/* Setup the free list for atid_tab and clear the stid bitmap. */
 	if (natids) {
@@ -1739,7 +1748,7 @@ static int tid_init(struct tid_info *t)
 	bitmap_zero(t->stid_bmap, t->nstids + t->nsftids);
 	/* Reserve stid 0 for T4/T5 adapters */
 	if (!t->stid_base &&
-	    (is_t4(adap->params.chip) || is_t5(adap->params.chip)))
+	    (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5))
 		__set_bit(0, t->stid_bmap);
 
 	return 0;
@@ -1949,6 +1958,28 @@ unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
 EXPORT_SYMBOL(cxgb4_best_aligned_mtu);
 
 /**
+ *	cxgb4_tp_smt_idx - Get the Source Mac Table index for this VI
+ *	@chip: chip type
+ *	@viid: VI id of the given port
+ *
+ *	Return the SMT index for this VI.
+ */
+unsigned int cxgb4_tp_smt_idx(enum chip_type chip, unsigned int viid)
+{
+	/* In T4/T5, SMT contains 256 SMAC entries organized in
+	 * 128 rows of 2 entries each.
+	 * In T6, SMT contains 256 SMAC entries in 256 rows.
+	 * TODO: The below code needs to be updated when we add support
+	 * for 256 VFs.
+	 */
+	if (CHELSIO_CHIP_VERSION(chip) <= CHELSIO_T5)
+		return ((viid & 0x7f) << 1);
+	else
+		return (viid & 0x7f);
+}
+EXPORT_SYMBOL(cxgb4_tp_smt_idx);
+
+/**
  *	cxgb4_port_chan - get the HW channel of a port
  *	@dev: the net device for the port
  *
@@ -2123,10 +2154,7 @@ int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte)
 		if (offset < mc0_end) {
 			memtype = MEM_MC0;
 			memaddr = offset - edc1_end;
-		} else if (is_t4(adap->params.chip)) {
-			/* T4 only has a single memory channel */
-			goto err;
-		} else {
+		} else if (is_t5(adap->params.chip)) {
 			size = t4_read_reg(adap, MA_EXT_MEMORY1_BAR_A);
 			mc1_size = EXT_MEM1_SIZE_G(size) << 20;
 			mc1_end = mc0_end + mc1_size;
@@ -2137,6 +2165,9 @@ int cxgb4_read_tpte(struct net_device *dev, u32 stag, __be32 *tpte)
 				/* offset beyond the end of any memory */
 				goto err;
 			}
+		} else {
+			/* T4/T6 only has a single memory channel */
+			goto err;
 		}
 	}
 
@@ -2168,6 +2199,7 @@ EXPORT_SYMBOL(cxgb4_read_sge_timestamp);
 int cxgb4_bar2_sge_qregs(struct net_device *dev,
 			 unsigned int qid,
 			 enum cxgb4_bar2_qtype qtype,
+			 int user,
 			 u64 *pbar2_qoffset,
 			 unsigned int *pbar2_qid)
 {
@@ -2176,6 +2208,7 @@ int cxgb4_bar2_sge_qregs(struct net_device *dev,
 				 (qtype == CXGB4_BAR2_QTYPE_EGRESS
 				  ? T4_BAR2_QTYPE_EGRESS
 				  : T4_BAR2_QTYPE_INGRESS),
+				 user,
 				 pbar2_qoffset,
 				 pbar2_qid);
 }
@@ -2301,9 +2334,13 @@ static void process_db_full(struct work_struct *work)
 	drain_db_fifo(adap, dbfifo_drain_delay);
 	enable_dbs(adap);
 	notify_rdma_uld(adap, CXGB4_CONTROL_DB_EMPTY);
-	t4_set_reg_field(adap, SGE_INT_ENABLE3_A,
-			 DBFIFO_HP_INT_F | DBFIFO_LP_INT_F,
-			 DBFIFO_HP_INT_F | DBFIFO_LP_INT_F);
+	if (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5)
+		t4_set_reg_field(adap, SGE_INT_ENABLE3_A,
+				 DBFIFO_HP_INT_F | DBFIFO_LP_INT_F,
+				 DBFIFO_HP_INT_F | DBFIFO_LP_INT_F);
+	else
+		t4_set_reg_field(adap, SGE_INT_ENABLE3_A,
+				 DBFIFO_LP_INT_F, DBFIFO_LP_INT_F);
 }
 
 static void sync_txq_pidx(struct adapter *adap, struct sge_txq *q)
@@ -2365,7 +2402,7 @@ static void process_db_drop(struct work_struct *work)
 		drain_db_fifo(adap, dbfifo_drain_delay);
 		enable_dbs(adap);
 		notify_rdma_uld(adap, CXGB4_CONTROL_DB_EMPTY);
-	} else {
+	} else if (is_t5(adap->params.chip)) {
 		u32 dropped_db = t4_read_reg(adap, 0x010ac);
 		u16 qid = (dropped_db >> 15) & 0x1ffff;
 		u16 pidx_inc = dropped_db & 0x1fff;
@@ -2374,7 +2411,7 @@ static void process_db_drop(struct work_struct *work)
 		int ret;
 
 		ret = t4_bar2_sge_qregs(adap, qid, T4_BAR2_QTYPE_EGRESS,
-					&bar2_qoffset, &bar2_qid);
+					0, &bar2_qoffset, &bar2_qid);
 		if (ret)
 			dev_err(adap->pdev_dev, "doorbell drop recovery: "
 				"qid=%d, pidx_inc=%d\n", qid, pidx_inc);
@@ -2386,7 +2423,8 @@ static void process_db_drop(struct work_struct *work)
 		t4_set_reg_field(adap, 0x10b0, 1<<15, 1<<15);
 	}
 
-	t4_set_reg_field(adap, SGE_DOORBELL_CONTROL_A, DROPPED_DB_F, 0);
+	if (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5)
+		t4_set_reg_field(adap, SGE_DOORBELL_CONTROL_A, DROPPED_DB_F, 0);
 }
 
 void t4_db_full(struct adapter *adap)
@@ -2974,6 +3012,30 @@ static int cxgb_ioctl(struct net_device *dev, struct ifreq *req, int cmd)
 			ret = t4_mdio_wr(pi->adapter, mbox, prtad, devad,
 					 data->reg_num, data->val_in);
 		break;
+	case SIOCGHWTSTAMP:
+		return copy_to_user(req->ifr_data, &pi->tstamp_config,
+				    sizeof(pi->tstamp_config)) ?
+			-EFAULT : 0;
+	case SIOCSHWTSTAMP:
+		if (copy_from_user(&pi->tstamp_config, req->ifr_data,
+				   sizeof(pi->tstamp_config)))
+			return -EFAULT;
+
+		switch (pi->tstamp_config.rx_filter) {
+		case HWTSTAMP_FILTER_NONE:
+			pi->rxtstamp = false;
+			break;
+		case HWTSTAMP_FILTER_ALL:
+			pi->rxtstamp = true;
+			break;
+		default:
+			pi->tstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
+			return -ERANGE;
+		}
+
+		return copy_to_user(req->ifr_data, &pi->tstamp_config,
+				    sizeof(pi->tstamp_config)) ?
+			-EFAULT : 0;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -3401,6 +3463,9 @@ static int adap_init0_config(struct adapter *adapter, int reset)
 	case CHELSIO_T5:
 		fw_config_file = FW5_CFNAME;
 		break;
+	case CHELSIO_T6:
+		fw_config_file = FW6_CFNAME;
+		break;
 	default:
 		dev_err(adapter->pdev_dev, "Device %d is not supported\n",
 		       adapter->pdev->device);
@@ -3597,7 +3662,24 @@ static struct fw_info fw_info_array[] = {
 			.intfver_iscsi = FW_INTFVER(T5, ISCSI),
 			.intfver_fcoe = FW_INTFVER(T5, FCOE),
 		},
+	}, {
+		.chip = CHELSIO_T6,
+		.fs_name = FW6_CFNAME,
+		.fw_mod_name = FW6_FNAME,
+		.fw_hdr = {
+			.chip = FW_HDR_CHIP_T6,
+			.fw_ver = __cpu_to_be32(FW_VERSION(T6)),
+			.intfver_nic = FW_INTFVER(T6, NIC),
+			.intfver_vnic = FW_INTFVER(T6, VNIC),
+			.intfver_ofld = FW_INTFVER(T6, OFLD),
+			.intfver_ri = FW_INTFVER(T6, RI),
+			.intfver_iscsipdu = FW_INTFVER(T6, ISCSIPDU),
+			.intfver_iscsi = FW_INTFVER(T6, ISCSI),
+			.intfver_fcoepdu = FW_INTFVER(T6, FCOEPDU),
+			.intfver_fcoe = FW_INTFVER(T6, FCOE),
+		},
 	}
+
 };
 
 static struct fw_info *find_fw_info(int chip)
@@ -4063,8 +4145,8 @@ static int adap_init0(struct adapter *adap)
 			     adap->params.b_wnd);
 	}
 	t4_init_sge_params(adap);
-	t4_init_tp_params(adap);
 	adap->flags |= FW_OK;
+	t4_init_tp_params(adap);
 	return 0;
 
 	/*
@@ -4490,6 +4572,79 @@ static int init_rss(struct adapter *adap)
 	return 0;
 }
 
+static int cxgb4_get_pcie_dev_link_caps(struct adapter *adap,
+					enum pci_bus_speed *speed,
+					enum pcie_link_width *width)
+{
+	u32 lnkcap1, lnkcap2;
+	int err1, err2;
+
+#define  PCIE_MLW_CAP_SHIFT 4   /* start of MLW mask in link capabilities */
+
+	*speed = PCI_SPEED_UNKNOWN;
+	*width = PCIE_LNK_WIDTH_UNKNOWN;
+
+	err1 = pcie_capability_read_dword(adap->pdev, PCI_EXP_LNKCAP,
+					  &lnkcap1);
+	err2 = pcie_capability_read_dword(adap->pdev, PCI_EXP_LNKCAP2,
+					  &lnkcap2);
+	if (!err2 && lnkcap2) { /* PCIe r3.0-compliant */
+		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_8_0GB)
+			*speed = PCIE_SPEED_8_0GT;
+		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_5_0GB)
+			*speed = PCIE_SPEED_5_0GT;
+		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_2_5GB)
+			*speed = PCIE_SPEED_2_5GT;
+	}
+	if (!err1) {
+		*width = (lnkcap1 & PCI_EXP_LNKCAP_MLW) >> PCIE_MLW_CAP_SHIFT;
+		if (!lnkcap2) { /* pre-r3.0 */
+			if (lnkcap1 & PCI_EXP_LNKCAP_SLS_5_0GB)
+				*speed = PCIE_SPEED_5_0GT;
+			else if (lnkcap1 & PCI_EXP_LNKCAP_SLS_2_5GB)
+				*speed = PCIE_SPEED_2_5GT;
+		}
+	}
+
+	if (*speed == PCI_SPEED_UNKNOWN || *width == PCIE_LNK_WIDTH_UNKNOWN)
+		return err1 ? err1 : err2 ? err2 : -EINVAL;
+	return 0;
+}
+
+static void cxgb4_check_pcie_caps(struct adapter *adap)
+{
+	enum pcie_link_width width, width_cap;
+	enum pci_bus_speed speed, speed_cap;
+
+#define PCIE_SPEED_STR(speed) \
+	(speed == PCIE_SPEED_8_0GT ? "8.0GT/s" : \
+	 speed == PCIE_SPEED_5_0GT ? "5.0GT/s" : \
+	 speed == PCIE_SPEED_2_5GT ? "2.5GT/s" : \
+	 "Unknown")
+
+	if (cxgb4_get_pcie_dev_link_caps(adap, &speed_cap, &width_cap)) {
+		dev_warn(adap->pdev_dev,
+			 "Unable to determine PCIe device BW capabilities\n");
+		return;
+	}
+
+	if (pcie_get_minimum_link(adap->pdev, &speed, &width) ||
+	    speed == PCI_SPEED_UNKNOWN || width == PCIE_LNK_WIDTH_UNKNOWN) {
+		dev_warn(adap->pdev_dev,
+			 "Unable to determine PCI Express bandwidth.\n");
+		return;
+	}
+
+	dev_info(adap->pdev_dev, "PCIe link speed is %s, device supports %s\n",
+		 PCIE_SPEED_STR(speed), PCIE_SPEED_STR(speed_cap));
+	dev_info(adap->pdev_dev, "PCIe link width is x%d, device supports x%d\n",
+		 width, width_cap);
+	if (speed < speed_cap || width < width_cap)
+		dev_info(adap->pdev_dev,
+			 "A slot with more lanes and/or higher speed is "
+			 "suggested for optimal performance.\n");
+}
+
 static void print_port_info(const struct net_device *dev)
 {
 	char buf[80];
@@ -4517,10 +4672,10 @@ static void print_port_info(const struct net_device *dev)
 		--bufp;
 	sprintf(bufp, "BASE-%s", t4_get_port_type_description(pi->port_type));
 
-	netdev_info(dev, "Chelsio %s rev %d %s %sNIC PCIe x%d%s%s\n",
+	netdev_info(dev, "Chelsio %s rev %d %s %sNIC %s\n",
 		    adap->params.vpd.id,
 		    CHELSIO_CHIP_RELEASE(adap->params.chip), buf,
-		    is_offload(adap) ? "R" : "", adap->params.pci.width, spd,
+		    is_offload(adap) ? "R" : "",
 		    (adap->flags & USING_MSIX) ? " MSI-X" :
 		    (adap->flags & USING_MSI) ? " MSI" : "");
 	netdev_info(dev, "S/N: %s, P/N: %s\n",
@@ -4573,6 +4728,27 @@ static void free_some_resources(struct adapter *adapter)
 		   NETIF_F_IPV6_CSUM | NETIF_F_HIGHDMA)
 #define SEGMENT_SIZE 128
 
+static int get_chip_type(struct pci_dev *pdev, u32 pl_rev)
+{
+	u16 device_id;
+
+	/* Retrieve adapter's device ID */
+	pci_read_config_word(pdev, PCI_DEVICE_ID, &device_id);
+
+	switch (device_id >> 12) {
+	case CHELSIO_T4:
+		return CHELSIO_CHIP_CODE(CHELSIO_T4, pl_rev);
+	case CHELSIO_T5:
+		return CHELSIO_CHIP_CODE(CHELSIO_T5, pl_rev);
+	case CHELSIO_T6:
+		return CHELSIO_CHIP_CODE(CHELSIO_T6, pl_rev);
+	default:
+		dev_err(&pdev->dev, "Device %d is not supported\n",
+			device_id);
+	}
+	return -EINVAL;
+}
+
 static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	int func, i, err, s_qpp, qpp, num_seg;
@@ -4580,6 +4756,8 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	bool highdma = false;
 	struct adapter *adapter = NULL;
 	void __iomem *regs;
+	u32 whoami, pl_rev;
+	enum chip_type chip;
 
 	printk_once(KERN_INFO "%s - version %s\n", DRV_DESC, DRV_VERSION);
 
@@ -4608,7 +4786,11 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto out_unmap_bar0;
 
 	/* We control everything through one PF */
-	func = SOURCEPF_G(readl(regs + PL_WHOAMI_A));
+	whoami = readl(regs + PL_WHOAMI_A);
+	pl_rev = REV_G(readl(regs + PL_REV_A));
+	chip = get_chip_type(pdev, pl_rev);
+	func = CHELSIO_CHIP_VERSION(chip) <= CHELSIO_T5 ?
+		SOURCEPF_G(whoami) : T6_SOURCEPF_G(whoami);
 	if (func != ent->driver_data) {
 		iounmap(regs);
 		pci_disable_device(pdev);
@@ -4817,11 +4999,30 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		adapter->params.offload = 0;
 	}
 
+	if (is_offload(adapter)) {
+		if (t4_read_reg(adapter, LE_DB_CONFIG_A) & HASHEN_F) {
+			u32 hash_base, hash_reg;
+
+			if (chip <= CHELSIO_T5) {
+				hash_reg = LE_DB_TID_HASHBASE_A;
+				hash_base = t4_read_reg(adapter, hash_reg);
+				adapter->tids.hash_base = hash_base / 4;
+			} else {
+				hash_reg = T6_LE_DB_HASH_TID_BASE_A;
+				hash_base = t4_read_reg(adapter, hash_reg);
+				adapter->tids.hash_base = hash_base;
+			}
+		}
+	}
+
 	/* See what interrupts we'll be using */
 	if (msi > 1 && enable_msix(adapter) == 0)
 		adapter->flags |= USING_MSIX;
 	else if (msi > 0 && pci_enable_msi(pdev) == 0)
 		adapter->flags |= USING_MSI;
+
+	/* check for PCI Express bandwidth capabiltites */
+	cxgb4_check_pcie_caps(adapter);
 
 	err = init_rss(adapter);
 	if (err)

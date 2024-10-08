@@ -490,7 +490,7 @@ static int lapic_next_deadline(unsigned long delta,
 {
 	u64 tsc;
 
-	rdtscll(tsc);
+	tsc = rdtsc();
 	wrmsrl(MSR_IA32_TSC_DEADLINE, tsc + (((u64) delta) * TSC_DIVISOR));
 	return 0;
 }
@@ -625,7 +625,7 @@ static void __init lapic_cal_handler(struct clock_event_device *dev)
 	unsigned long pm = acpi_pm_read_early();
 
 	if (cpu_has_tsc)
-		rdtscll(tsc);
+		tsc = rdtsc();
 
 	switch (lapic_cal_loops++) {
 	case 0:
@@ -1305,7 +1305,7 @@ void setup_local_APIC(void)
 	long long max_loops = cpu_khz;
 
 	if (cpu_has_tsc)
-		rdtscll(tsc);
+		tsc = rdtsc();
 
 	if (disable_apic) {
 		disable_ioapic_support();
@@ -1400,7 +1400,7 @@ void setup_local_APIC(void)
 		}
 		if (queued) {
 			if (cpu_has_tsc) {
-				rdtscll(ntsc);
+				ntsc = rdtsc();
 				max_loops = (cpu_khz << 10) - (ntsc - tsc);
 			} else
 				max_loops--;
@@ -2205,6 +2205,20 @@ void generic_processor_info(int apicid, int version)
 		cpu = 0;
 	} else
 		cpu = cpumask_next_zero(-1, cpu_present_mask);
+
+	/*
+	 * This can happen on physical hotplug. The sanity check at boot time
+	 * is done from native_smp_prepare_cpus() after num_possible_cpus() is
+	 * established.
+	 */
+	if (topology_update_package_map(apicid, cpu) < 0) {
+		int thiscpu = max + disabled_cpus;
+
+		pr_warning("ACPI: Package limit reached. Processor %d/0x%x ignored.\n",
+			   thiscpu, apicid);
+		disabled_cpus++;
+		return;
+	}
 
 	/*
 	 * Validate version

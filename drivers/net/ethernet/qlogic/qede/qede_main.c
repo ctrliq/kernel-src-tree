@@ -236,7 +236,7 @@ int __init qede_init(void)
 	/* Must register notifier before pci ops, since we might miss
 	 * interface rename after pci probe and netdev registeration.
 	 */
-	ret = register_netdevice_notifier(&qede_netdev_notifier);
+	ret = register_netdevice_notifier_rh(&qede_netdev_notifier);
 	if (ret) {
 		pr_notice("Failed to register netdevice_notifier\n");
 		qed_put_eth_ops();
@@ -246,7 +246,7 @@ int __init qede_init(void)
 	ret = pci_register_driver(&qede_pci_driver);
 	if (ret) {
 		pr_notice("Failed to register driver\n");
-		unregister_netdevice_notifier(&qede_netdev_notifier);
+		unregister_netdevice_notifier_rh(&qede_netdev_notifier);
 		qed_put_eth_ops();
 		return -EINVAL;
 	}
@@ -258,7 +258,7 @@ static void __exit qede_cleanup(void)
 {
 	pr_notice("qede_cleanup called\n");
 
-	unregister_netdevice_notifier(&qede_netdev_notifier);
+	unregister_netdevice_notifier_rh(&qede_netdev_notifier);
 	pci_unregister_driver(&qede_pci_driver);
 	qed_put_eth_ops();
 }
@@ -920,7 +920,7 @@ static inline int qede_realloc_rx_buffer(struct qede_dev *edev,
 		 * network stack to take the ownership of the page
 		 * which can be recycled multiple times by the driver.
 		 */
-		atomic_inc(&curr_cons->data->_count);
+		page_ref_inc(curr_cons->data);
 		qede_reuse_page(edev, rxq, curr_cons);
 	}
 
@@ -1036,7 +1036,7 @@ static int qede_fill_frag_skb(struct qede_dev *edev,
 		/* Incr page ref count to reuse on allocation failure
 		 * so that it doesn't get freed while freeing SKB.
 		 */
-		atomic_inc(&current_bd->data->_count);
+		page_ref_inc(current_bd->data);
 		goto out;
 	}
 
@@ -1486,7 +1486,7 @@ static int qede_rx_int(struct qede_fastpath *fp, int budget)
 				 * freeing SKB.
 				 */
 
-				atomic_inc(&sw_rx_data->data->_count);
+				page_ref_inc(sw_rx_data->data);
 				rxq->rx_alloc_errors++;
 				qede_recycle_rx_bd_ring(rxq, edev,
 							fp_cqe->bd_num);

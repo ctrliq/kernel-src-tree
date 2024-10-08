@@ -179,11 +179,12 @@ static BLOCKING_NOTIFIER_HEAD(inetaddr_chain);
 static void inet_del_ifa(struct in_device *in_dev, struct in_ifaddr **ifap,
 			 int destroy);
 #ifdef CONFIG_SYSCTL
-static void devinet_sysctl_register(struct in_device *idev);
+static int devinet_sysctl_register(struct in_device *idev);
 static void devinet_sysctl_unregister(struct in_device *idev);
 #else
-static void devinet_sysctl_register(struct in_device *idev)
+static int devinet_sysctl_register(struct in_device *idev)
 {
+	return 0;
 }
 static void devinet_sysctl_unregister(struct in_device *idev)
 {
@@ -230,6 +231,7 @@ EXPORT_SYMBOL(in_dev_finish_destroy);
 static struct in_device *inetdev_init(struct net_device *dev)
 {
 	struct in_device *in_dev;
+	int err = -ENOMEM;
 
 	ASSERT_RTNL();
 
@@ -250,7 +252,13 @@ static struct in_device *inetdev_init(struct net_device *dev)
 	/* Account for reference dev->ip_ptr (below) */
 	in_dev_hold(in_dev);
 
-	devinet_sysctl_register(in_dev);
+	err = devinet_sysctl_register(in_dev);
+	if (err) {
+		in_dev->dead = 1;
+		in_dev_put(in_dev);
+		in_dev = NULL;
+		goto out;
+	}
 	ip_mc_init_dev(in_dev);
 	if (dev->flags & IFF_UP)
 		ip_mc_up(in_dev);
@@ -258,7 +266,7 @@ static struct in_device *inetdev_init(struct net_device *dev)
 	/* we can receive as soon as ip_ptr is set -- do this last */
 	rcu_assign_pointer(dev->ip_ptr, in_dev);
 out:
-	return in_dev;
+	return in_dev ?: ERR_PTR(err);
 out_kfree:
 	kfree(in_dev);
 	in_dev = NULL;
@@ -324,6 +332,9 @@ static void __inet_del_ifa(struct in_device *in_dev, struct in_ifaddr **ifap,
 
 	ASSERT_RTNL();
 
+	if (in_dev->dead)
+		goto no_promotions;
+
 	/* 1. Deleting primary ifaddr forces deletion all secondaries
 	 * unless alias promotion is set
 	 **/
@@ -370,6 +381,7 @@ static void __inet_del_ifa(struct in_device *in_dev, struct in_ifaddr **ifap,
 			fib_del_ifaddr(ifa, ifa1);
 	}
 
+no_promotions:
 	/* 2. Unlink it */
 
 	*ifap = ifa1->ifa_next;
@@ -538,6 +550,26 @@ struct in_ifaddr *inet_ifa_byprefix(struct in_device *in_dev, __be32 prefix,
 	return NULL;
 }
 
+static int ip_mc_config(struct sock *sk, bool join, const struct in_ifaddr *ifa)
+{
+	struct ip_mreqn mreq = {
+		.imr_multiaddr.s_addr = ifa->ifa_address,
+		.imr_ifindex = ifa->ifa_dev->dev->ifindex,
+	};
+	int ret;
+
+	ASSERT_RTNL();
+
+	lock_sock(sk);
+	if (join)
+		ret = ip_mc_join_group(sk, &mreq);
+	else
+		ret = ip_mc_leave_group(sk, &mreq);
+	release_sock(sk);
+
+	return ret;
+}
+
 static int inet_rtm_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh)
 {
 	struct net *net = sock_net(skb->sk);
@@ -574,6 +606,8 @@ static int inet_rtm_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh)
 		    !inet_ifa_match(nla_get_in_addr(tb[IFA_ADDRESS]), ifa)))
 			continue;
 
+		if (ipv4_is_multicast(ifa->ifa_address))
+			ip_mc_config(net->ipv4_mc_autojoin_sk, false, ifa);
 		__inet_del_ifa(in_dev, ifap, 1, nlh, NETLINK_CB(skb).portid);
 		return 0;
 	}
@@ -827,6 +861,15 @@ static int inet_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh)
 		 * userspace alreay relies on not having to provide this.
 		 */
 		set_ifa_lifetime(ifa, valid_lft, prefered_lft);
+		if (ifa->ifa_flags & IFA_F_MCAUTOJOIN) {
+			int ret = ip_mc_config(net->ipv4_mc_autojoin_sk,
+					       true, ifa);
+
+			if (ret < 0) {
+				inet_free_ifa(ifa);
+				return ret;
+			}
+		}
 		return __inet_insert_ifa(ifa, nlh, NETLINK_CB(skb).portid);
 	} else {
 		inet_free_ifa(ifa);
@@ -1338,7 +1381,7 @@ static void inetdev_send_gratuitous_arp(struct net_device *dev,
 static int inetdev_event(struct notifier_block *this, unsigned long event,
 			 void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
 
 	ASSERT_RTNL();
@@ -1346,8 +1389,8 @@ static int inetdev_event(struct notifier_block *this, unsigned long event,
 	if (!in_dev) {
 		if (event == NETDEV_REGISTER) {
 			in_dev = inetdev_init(dev);
-			if (!in_dev)
-				return notifier_from_errno(-ENOMEM);
+			if (IS_ERR(in_dev))
+				return notifier_from_errno(PTR_ERR(in_dev));
 			if (dev->flags & IFF_LOOPBACK) {
 				IN_DEV_CONF_SET(in_dev, NOXFRM, 1);
 				IN_DEV_CONF_SET(in_dev, NOPOLICY, 1);
@@ -1512,7 +1555,8 @@ static int inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,
 			  preferred, valid))
 		goto nla_put_failure;
 
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 nla_put_failure:
 	nlmsg_cancel(skb, nlh);
@@ -1556,7 +1600,7 @@ static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
 				if (inet_fill_ifaddr(skb, ifa,
 					     NETLINK_CB(cb->skb).portid,
 					     cb->nlh->nlmsg_seq,
-					     RTM_NEWADDR, NLM_F_MULTI) <= 0) {
+					     RTM_NEWADDR, NLM_F_MULTI) < 0) {
 					rcu_read_unlock();
 					goto done;
 				}
@@ -1733,7 +1777,8 @@ static int inet_netconf_fill_devconf(struct sk_buff *skb, int ifindex,
 			IPV4_DEVCONF(*devconf, MC_FORWARDING)) < 0)
 		goto nla_put_failure;
 
-	return nlmsg_end(skb, nlh);
+	nlmsg_end(skb, nlh);
+	return 0;
 
 nla_put_failure:
 	nlmsg_cancel(skb, nlh);
@@ -2159,11 +2204,21 @@ static void __devinet_sysctl_unregister(struct ipv4_devconf *cnf)
 	kfree(t);
 }
 
-static void devinet_sysctl_register(struct in_device *idev)
+static int devinet_sysctl_register(struct in_device *idev)
 {
-	neigh_sysctl_register(idev->dev, idev->arp_parms, NULL);
-	__devinet_sysctl_register(dev_net(idev->dev), idev->dev->name,
+	int err;
+
+	if (!sysctl_dev_name_is_allowed(idev->dev->name))
+		return -EINVAL;
+
+	err = neigh_sysctl_register(idev->dev, idev->arp_parms, NULL);
+	if (err)
+		return err;
+	err = __devinet_sysctl_register(dev_net(idev->dev), idev->dev->name,
 					&idev->cnf);
+	if (err)
+		neigh_sysctl_unregister(idev->arp_parms);
+	return err;
 }
 
 static void devinet_sysctl_unregister(struct in_device *idev)
@@ -2297,7 +2352,7 @@ void __init devinet_init(void)
 	register_pernet_subsys(&devinet_ops);
 
 	register_gifconf(PF_INET, inet_gifconf);
-	register_netdevice_notifier(&ip_netdev_notifier);
+	register_netdevice_notifier_rh(&ip_netdev_notifier);
 
 	schedule_delayed_work(&check_lifetime_work, 0);
 

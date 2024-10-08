@@ -1879,10 +1879,10 @@ void bnx2x_sp_event(struct bnx2x_fastpath *fp, union eth_rx_cqe *rr_cqe)
 		return;
 #endif
 
-	smp_mb__before_atomic_inc();
+	smp_mb__before_atomic();
 	atomic_inc(&bp->cq_spq_left);
 	/* push the change in bp->spq_left and towards the memory */
-	smp_mb__after_atomic_inc();
+	smp_mb__after_atomic();
 
 	DP(BNX2X_MSG_SP, "bp->cq_spq_left %x\n", atomic_read(&bp->cq_spq_left));
 
@@ -1897,11 +1897,11 @@ void bnx2x_sp_event(struct bnx2x_fastpath *fp, union eth_rx_cqe *rr_cqe)
 		 * sp_state is cleared, and this order prevents
 		 * races
 		 */
-		smp_mb__before_clear_bit();
+		smp_mb__before_atomic();
 		set_bit(BNX2X_AFEX_PENDING_VIFSET_MCP_ACK, &bp->sp_state);
 		wmb();
 		clear_bit(BNX2X_AFEX_FCOE_Q_UPDATE_PENDING, &bp->sp_state);
-		smp_mb__after_clear_bit();
+		smp_mb__after_atomic();
 
 		/* schedule the sp task as mcp ack is required */
 		bnx2x_schedule_sp_task(bp);
@@ -5410,9 +5410,9 @@ static void bnx2x_after_function_update(struct bnx2x *bp)
 		__clear_bit(RAMROD_COMP_WAIT, &queue_params.ramrod_flags);
 
 		/* mark latest Q bit */
-		smp_mb__before_clear_bit();
+		smp_mb__before_atomic();
 		set_bit(BNX2X_AFEX_FCOE_Q_UPDATE_PENDING, &bp->sp_state);
-		smp_mb__after_clear_bit();
+		smp_mb__after_atomic();
 
 		/* send Q update ramrod for FCoE Q */
 		rc = bnx2x_queue_state_change(bp, &queue_params);
@@ -5647,7 +5647,7 @@ next_spqe:
 		spqe_cnt++;
 	} /* for */
 
-	smp_mb__before_atomic_inc();
+	smp_mb__before_atomic();
 	atomic_add(spqe_cnt, &bp->eq_spq_left);
 
 	bp->eq_cons = sw_cons;
@@ -12859,7 +12859,7 @@ static int bnx2x_validate_addr(struct net_device *dev)
 }
 
 static int bnx2x_get_phys_port_id(struct net_device *netdev,
-				  struct netdev_phys_port_id *ppid)
+				  struct netdev_phys_item_id *ppid)
 {
 	struct bnx2x *bp = netdev_priv(netdev);
 
@@ -13034,7 +13034,7 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= poll_bnx2x,
 #endif
-	.ndo_setup_tc		= bnx2x_setup_tc,
+	.ndo_setup_tc		= __bnx2x_setup_tc,
 #ifdef CONFIG_BNX2X_SRIOV
 	.ndo_set_vf_mac		= bnx2x_set_vf_mac,
 	.ndo_set_vf_vlan	= bnx2x_set_vf_vlan,
@@ -13252,8 +13252,10 @@ static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 			bp->accept_any_vlan = true;
 		else
 			dev->hw_features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+#ifdef CONFIG_BNX2X_SRIOV
 	} else if (bp->acquire_resp.pfdev_info.pf_cap & PFVF_CAP_VLAN_FILTER) {
 		dev->hw_features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+#endif
 	}
 
 	dev->features |= dev->hw_features | NETIF_F_HW_VLAN_CTAG_RX;
@@ -14746,9 +14748,9 @@ static int bnx2x_drv_ctl(struct net_device *dev, struct drv_ctl_info *ctl)
 	case DRV_CTL_RET_L2_SPQ_CREDIT_CMD: {
 		int count = ctl->data.credit.credit_count;
 
-		smp_mb__before_atomic_inc();
+		smp_mb__before_atomic();
 		atomic_add(count, &bp->cq_spq_left);
-		smp_mb__after_atomic_inc();
+		smp_mb__after_atomic();
 		break;
 	}
 	case DRV_CTL_ULP_REGISTER_CMD: {

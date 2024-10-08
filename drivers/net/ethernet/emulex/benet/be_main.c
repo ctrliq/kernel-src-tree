@@ -2201,7 +2201,6 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 		skb_set_hash(skb, rxcp->rss_hash, PKT_HASH_TYPE_L3);
 
 	skb->csum_level = rxcp->tunneled;
-	skb_mark_napi_id(skb, napi);
 
 	if (rxcp->vlanf)
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), rxcp->vlan_tag);
@@ -2650,7 +2649,6 @@ static int be_evt_queues_create(struct be_adapter *adapter)
 				eqo->affinity_mask);
 		netif_napi_add(adapter->netdev, &eqo->napi, be_poll,
 			       BE_NAPI_WEIGHT);
-		napi_hash_add(&eqo->napi);
 	}
 	return 0;
 }
@@ -4650,7 +4648,8 @@ fw_exit:
 	return status;
 }
 
-static int be_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh)
+static int be_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+				 u16 flags)
 {
 	struct be_adapter *adapter = netdev_priv(dev);
 	struct nlattr *attr, *br_spec;
@@ -4700,7 +4699,8 @@ err:
 }
 
 static int be_ndo_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
-				 struct net_device *dev, u32 filter_mask)
+				 struct net_device *dev, u32 filter_mask,
+				 int nlflags)
 {
 	struct be_adapter *adapter = netdev_priv(dev);
 	int status = 0;
@@ -4726,7 +4726,7 @@ static int be_ndo_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 	return ndo_dflt_bridge_getlink(skb, pid, seq, dev,
 				       hsw_mode == PORT_FWD_TYPE_VEPA ?
 				       BRIDGE_MODE_VEPA : BRIDGE_MODE_VEB,
-				       0, 0);
+				       0, 0, nlflags);
 }
 
 #ifdef CONFIG_BE2NET_VXLAN
@@ -4859,20 +4859,20 @@ static netdev_features_t be_features_check(struct sk_buff *skb,
 	    skb->inner_protocol != htons(ETH_P_TEB) ||
 	    skb_inner_mac_header(skb) - skb_transport_header(skb) !=
 	    sizeof(struct udphdr) + sizeof(struct vxlanhdr))
-		return features & ~(NETIF_F_ALL_CSUM | NETIF_F_GSO_MASK);
+		return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
 
 	return features;
 }
 #endif
 
 static int be_get_phys_port_id(struct net_device *dev,
-			       struct netdev_phys_port_id *ppid)
+			       struct netdev_phys_item_id *ppid)
 {
 	int i, id_len = CNTL_SERIAL_NUM_WORDS * CNTL_SERIAL_NUM_WORD_SZ + 1;
 	struct be_adapter *adapter = netdev_priv(dev);
 	u8 *id;
 
-	if (MAX_PHYS_PORT_ID_LEN < id_len)
+	if (MAX_PHYS_ITEM_ID_LEN < id_len)
 		return -ENOSPC;
 
 	ppid->id[0] = adapter->hba_port_num + 1;

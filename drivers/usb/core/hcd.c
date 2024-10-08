@@ -42,8 +42,10 @@
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
 
+#include <linux/phy/phy.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
+#include <linux/usb/phy.h>
 
 #include "usb.h"
 
@@ -149,7 +151,7 @@ static const u8 usb31_rh_dev_descriptor[18] = {
 /* usb 3.0 root hub device descriptor */
 static const u8 usb3_rh_dev_descriptor[18] = {
 	0x12,       /*  __u8  bLength; */
-	0x01,       /*  __u8  bDescriptorType; Device */
+	USB_DT_DEVICE, /* __u8 bDescriptorType; Device */
 	0x00, 0x03, /*  __le16 bcdUSB; v3.0 */
 
 	0x09,	    /*  __u8  bDeviceClass; HUB_CLASSCODE */
@@ -170,7 +172,7 @@ static const u8 usb3_rh_dev_descriptor[18] = {
 /* usb 2.5 (wireless USB 1.0) root hub device descriptor */
 static const u8 usb25_rh_dev_descriptor[18] = {
 	0x12,       /*  __u8  bLength; */
-	0x01,       /*  __u8  bDescriptorType; Device */
+	USB_DT_DEVICE, /* __u8 bDescriptorType; Device */
 	0x50, 0x02, /*  __le16 bcdUSB; v2.5 */
 
 	0x09,	    /*  __u8  bDeviceClass; HUB_CLASSCODE */
@@ -191,7 +193,7 @@ static const u8 usb25_rh_dev_descriptor[18] = {
 /* usb 2.0 root hub device descriptor */
 static const u8 usb2_rh_dev_descriptor[18] = {
 	0x12,       /*  __u8  bLength; */
-	0x01,       /*  __u8  bDescriptorType; Device */
+	USB_DT_DEVICE, /* __u8 bDescriptorType; Device */
 	0x00, 0x02, /*  __le16 bcdUSB; v2.0 */
 
 	0x09,	    /*  __u8  bDeviceClass; HUB_CLASSCODE */
@@ -214,7 +216,7 @@ static const u8 usb2_rh_dev_descriptor[18] = {
 /* usb 1.1 root hub device descriptor */
 static const u8 usb11_rh_dev_descriptor[18] = {
 	0x12,       /*  __u8  bLength; */
-	0x01,       /*  __u8  bDescriptorType; Device */
+	USB_DT_DEVICE, /* __u8 bDescriptorType; Device */
 	0x10, 0x01, /*  __le16 bcdUSB; v1.1 */
 
 	0x09,	    /*  __u8  bDeviceClass; HUB_CLASSCODE */
@@ -241,7 +243,7 @@ static const u8 fs_rh_config_descriptor[] = {
 
 	/* one configuration */
 	0x09,       /*  __u8  bLength; */
-	0x02,       /*  __u8  bDescriptorType; Configuration */
+	USB_DT_CONFIG, /* __u8 bDescriptorType; Configuration */
 	0x19, 0x00, /*  __le16 wTotalLength; */
 	0x01,       /*  __u8  bNumInterfaces; (1) */
 	0x01,       /*  __u8  bConfigurationValue; */
@@ -266,7 +268,7 @@ static const u8 fs_rh_config_descriptor[] = {
 
 	/* one interface */
 	0x09,       /*  __u8  if_bLength; */
-	0x04,       /*  __u8  if_bDescriptorType; Interface */
+	USB_DT_INTERFACE,  /* __u8 if_bDescriptorType; Interface */
 	0x00,       /*  __u8  if_bInterfaceNumber; */
 	0x00,       /*  __u8  if_bAlternateSetting; */
 	0x01,       /*  __u8  if_bNumEndpoints; */
@@ -277,7 +279,7 @@ static const u8 fs_rh_config_descriptor[] = {
 
 	/* one endpoint (status change endpoint) */
 	0x07,       /*  __u8  ep_bLength; */
-	0x05,       /*  __u8  ep_bDescriptorType; Endpoint */
+	USB_DT_ENDPOINT, /* __u8 ep_bDescriptorType; Endpoint */
 	0x81,       /*  __u8  ep_bEndpointAddress; IN Endpoint 1 */
 	0x03,       /*  __u8  ep_bmAttributes; Interrupt */
 	0x02, 0x00, /*  __le16 ep_wMaxPacketSize; 1 + (MAX_ROOT_PORTS / 8) */
@@ -288,7 +290,7 @@ static const u8 hs_rh_config_descriptor[] = {
 
 	/* one configuration */
 	0x09,       /*  __u8  bLength; */
-	0x02,       /*  __u8  bDescriptorType; Configuration */
+	USB_DT_CONFIG, /* __u8 bDescriptorType; Configuration */
 	0x19, 0x00, /*  __le16 wTotalLength; */
 	0x01,       /*  __u8  bNumInterfaces; (1) */
 	0x01,       /*  __u8  bConfigurationValue; */
@@ -313,7 +315,7 @@ static const u8 hs_rh_config_descriptor[] = {
 
 	/* one interface */
 	0x09,       /*  __u8  if_bLength; */
-	0x04,       /*  __u8  if_bDescriptorType; Interface */
+	USB_DT_INTERFACE, /* __u8 if_bDescriptorType; Interface */
 	0x00,       /*  __u8  if_bInterfaceNumber; */
 	0x00,       /*  __u8  if_bAlternateSetting; */
 	0x01,       /*  __u8  if_bNumEndpoints; */
@@ -324,7 +326,7 @@ static const u8 hs_rh_config_descriptor[] = {
 
 	/* one endpoint (status change endpoint) */
 	0x07,       /*  __u8  ep_bLength; */
-	0x05,       /*  __u8  ep_bDescriptorType; Endpoint */
+	USB_DT_ENDPOINT, /* __u8 ep_bDescriptorType; Endpoint */
 	0x81,       /*  __u8  ep_bEndpointAddress; IN Endpoint 1 */
 	0x03,       /*  __u8  ep_bmAttributes; Interrupt */
 		    /* __le16 ep_wMaxPacketSize; 1 + (MAX_ROOT_PORTS / 8)
@@ -336,7 +338,7 @@ static const u8 hs_rh_config_descriptor[] = {
 static const u8 ss_rh_config_descriptor[] = {
 	/* one configuration */
 	0x09,       /*  __u8  bLength; */
-	0x02,       /*  __u8  bDescriptorType; Configuration */
+	USB_DT_CONFIG, /* __u8 bDescriptorType; Configuration */
 	0x1f, 0x00, /*  __le16 wTotalLength; */
 	0x01,       /*  __u8  bNumInterfaces; (1) */
 	0x01,       /*  __u8  bConfigurationValue; */
@@ -350,7 +352,7 @@ static const u8 ss_rh_config_descriptor[] = {
 
 	/* one interface */
 	0x09,       /*  __u8  if_bLength; */
-	0x04,       /*  __u8  if_bDescriptorType; Interface */
+	USB_DT_INTERFACE, /* __u8 if_bDescriptorType; Interface */
 	0x00,       /*  __u8  if_bInterfaceNumber; */
 	0x00,       /*  __u8  if_bAlternateSetting; */
 	0x01,       /*  __u8  if_bNumEndpoints; */
@@ -361,7 +363,7 @@ static const u8 ss_rh_config_descriptor[] = {
 
 	/* one endpoint (status change endpoint) */
 	0x07,       /*  __u8  ep_bLength; */
-	0x05,       /*  __u8  ep_bDescriptorType; Endpoint */
+	USB_DT_ENDPOINT, /* __u8 ep_bDescriptorType; Endpoint */
 	0x81,       /*  __u8  ep_bEndpointAddress; IN Endpoint 1 */
 	0x03,       /*  __u8  ep_bmAttributes; Interrupt */
 		    /* __le16 ep_wMaxPacketSize; 1 + (MAX_ROOT_PORTS / 8)
@@ -371,7 +373,8 @@ static const u8 ss_rh_config_descriptor[] = {
 
 	/* one SuperSpeed endpoint companion descriptor */
 	0x06,        /* __u8 ss_bLength */
-	0x30,        /* __u8 ss_bDescriptorType; SuperSpeed EP Companion */
+	USB_DT_SS_ENDPOINT_COMP, /* __u8 ss_bDescriptorType; SuperSpeed EP */
+		     /* Companion */
 	0x00,        /* __u8 ss_bMaxBurst; allows 1 TX between ACKs */
 	0x00,        /* __u8 ss_bmAttributes; 1 packet per service interval */
 	0x02, 0x00   /* __le16 ss_wBytesPerInterval; 15 bits for max 15 ports */
@@ -2333,10 +2336,6 @@ int hcd_bus_resume(struct usb_device *rhdev, pm_message_t msg)
 	return status;
 }
 
-#endif	/* CONFIG_PM */
-
-#ifdef	CONFIG_PM_RUNTIME
-
 /* Workqueue routine for root-hub remote wakeup */
 static void hcd_resume_work(struct work_struct *work)
 {
@@ -2368,7 +2367,7 @@ void usb_hcd_resume_root_hub (struct usb_hcd *hcd)
 }
 EXPORT_SYMBOL_GPL(usb_hcd_resume_root_hub);
 
-#endif	/* CONFIG_PM_RUNTIME */
+#endif	/* CONFIG_PM */
 
 /*-------------------------------------------------------------------------*/
 
@@ -2551,7 +2550,7 @@ struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
 	init_timer(&hcd->rh_timer);
 	hcd->rh_timer.function = rh_timer_func;
 	hcd->rh_timer.data = (unsigned long) hcd;
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 	INIT_WORK(&hcd->wakeup_work, hcd_resume_work);
 #endif
 
@@ -2707,7 +2706,7 @@ int usb_add_hcd(struct usb_hcd *hcd,
 	int retval;
 	struct usb_device *rhdev;
 
-	if (IS_ENABLED(CONFIG_USB_PHY) && !hcd->phy) {
+	if (IS_ENABLED(CONFIG_USB_PHY) && !hcd->usb_phy) {
 		struct usb_phy *phy = usb_get_phy_dev(hcd->self.controller, 0);
 
 		if (IS_ERR(phy)) {
@@ -2719,6 +2718,30 @@ int usb_add_hcd(struct usb_hcd *hcd,
 			if (retval) {
 				usb_put_phy(phy);
 				return retval;
+			}
+			hcd->usb_phy = phy;
+			hcd->remove_phy = 1;
+		}
+	}
+
+	if (IS_ENABLED(CONFIG_GENERIC_PHY) && !hcd->phy) {
+		struct phy *phy = phy_get(hcd->self.controller, "usb");
+
+		if (IS_ERR(phy)) {
+			retval = PTR_ERR(phy);
+			if (retval == -EPROBE_DEFER)
+				goto err_phy;
+		} else {
+			retval = phy_init(phy);
+			if (retval) {
+				phy_put(phy);
+				goto err_phy;
+			}
+			retval = phy_power_on(phy);
+			if (retval) {
+				phy_exit(phy);
+				phy_put(phy);
+				goto err_phy;
 			}
 			hcd->phy = phy;
 			hcd->remove_phy = 1;
@@ -2751,7 +2774,7 @@ int usb_add_hcd(struct usb_hcd *hcd,
 	retval = hcd_buffer_create(hcd);
 	if (retval != 0) {
 		dev_dbg(hcd->self.controller, "pool alloc failed\n");
-		return retval;
+		goto err_create_buf;
 	}
 
 	retval = usb_register_bus(&hcd->self);
@@ -2853,12 +2876,6 @@ int usb_add_hcd(struct usb_hcd *hcd,
 	if (hcd->uses_new_polling && HCD_POLL_RH(hcd))
 		usb_hcd_poll_rh_status(hcd);
 
-	/*
-	 * Host controllers don't generate their own wakeup requests;
-	 * they only forward requests from the root hub.  Therefore
-	 * controllers should always be enabled for remote wakeup.
-	 */
-	device_wakeup_enable(hcd->self.controller);
 	return retval;
 
 error_create_attr_group:
@@ -2869,7 +2886,7 @@ error_create_attr_group:
 	hcd->rh_registered = 0;
 	spin_unlock_irq(&hcd_root_hub_lock);
 
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 	cancel_work_sync(&hcd->wakeup_work);
 #endif
 	mutex_lock(&usb_bus_idr_lock);
@@ -2894,6 +2911,19 @@ err_allocate_root_hub:
 	usb_deregister_bus(&hcd->self);
 err_register_bus:
 	hcd_buffer_destroy(hcd);
+err_create_buf:
+	if (IS_ENABLED(CONFIG_GENERIC_PHY) && hcd->remove_phy && hcd->phy) {
+		phy_power_off(hcd->phy);
+		phy_exit(hcd->phy);
+		phy_put(hcd->phy);
+		hcd->phy = NULL;
+	}
+err_phy:
+	if (hcd->remove_phy && hcd->usb_phy) {
+		usb_phy_shutdown(hcd->usb_phy);
+		usb_put_phy(hcd->usb_phy);
+		hcd->usb_phy = NULL;
+	}
 	return retval;
 }
 EXPORT_SYMBOL_GPL(usb_add_hcd);
@@ -2924,7 +2954,7 @@ void usb_remove_hcd(struct usb_hcd *hcd)
 	hcd->rh_registered = 0;
 	spin_unlock_irq (&hcd_root_hub_lock);
 
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 	cancel_work_sync(&hcd->wakeup_work);
 #endif
 
@@ -2965,6 +2995,18 @@ void usb_remove_hcd(struct usb_hcd *hcd)
 
 	usb_deregister_bus(&hcd->self);
 	hcd_buffer_destroy(hcd);
+
+	if (IS_ENABLED(CONFIG_GENERIC_PHY) && hcd->remove_phy && hcd->phy) {
+		phy_power_off(hcd->phy);
+		phy_exit(hcd->phy);
+		phy_put(hcd->phy);
+		hcd->phy = NULL;
+	}
+	if (hcd->remove_phy && hcd->usb_phy) {
+		usb_phy_shutdown(hcd->usb_phy);
+		usb_put_phy(hcd->usb_phy);
+		hcd->usb_phy = NULL;
+	}
 
 	usb_put_invalidate_rhdev(hcd);
 }

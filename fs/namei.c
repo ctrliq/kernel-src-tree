@@ -2150,10 +2150,37 @@ int vfs_path_lookup(struct dentry *dentry, struct vfsmount *mnt,
  * needs parent already locked. Doesn't follow mounts.
  * SMP-safe.
  */
-static struct dentry *lookup_hash(struct nameidata *nd)
+static struct dentry *lookup_hash_locked(struct nameidata *nd)
 {
 	return __lookup_hash(&nd->last, nd->path.dentry, nd->flags);
 }
+
+/**
+ * lookup_hash - lookup single pathname component on already hashed name
+ * @name:	name and hash to lookup
+ * @base:	base directory to lookup from
+ *
+ * The name must have been verified and hashed (see lookup_one_len()).  Using
+ * this after just full_name_hash() is unsafe.
+ *
+ * This function also doesn't check for search permission on base directory.
+ *
+ * Use lookup_one_len() instead, unless you really know what you are
+ * doing.
+ *
+ * Do not hold i_mutex; this helper takes i_mutex if necessary.
+ */
+struct dentry *lookup_hash(struct qstr *name, struct dentry *base)
+{
+	struct dentry *ret;
+
+	mutex_lock(&base->d_inode->i_mutex);
+	ret = __lookup_hash(name, base, 0);
+	mutex_unlock(&base->d_inode->i_mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL(lookup_hash);
 
 /**
  * lookup_one_len - filesystem helper to lookup single pathname component
@@ -2165,6 +2192,8 @@ static struct dentry *lookup_hash(struct nameidata *nd)
  * not be called by generic code.  Also note that by using this function the
  * nameidata argument is passed to the filesystem methods and a filesystem
  * using this helper needs to be prepared for that.
+ *
+ * The caller must hold base->i_mutex.
  */
 struct dentry *lookup_one_len(const char *name, struct dentry *base, int len)
 {
@@ -2206,6 +2235,75 @@ struct dentry *lookup_one_len(const char *name, struct dentry *base, int len)
 
 	return __lookup_hash(&this, base, 0);
 }
+
+/**
+ * lookup_one_len_unlocked - filesystem helper to lookup single pathname component
+ * @name:	pathname component to lookup
+ * @base:	base directory to lookup from
+ * @len:	maximum length @len should be interpreted to
+ *
+ * Note that this routine is purely a helper for filesystem usage and should
+ * not be called by generic code.
+ *
+ * Unlike lookup_one_len, it should be called without the parent
+ * i_mutex held, and will take the i_mutex itself if necessary.
+ */
+struct dentry *lookup_one_len_unlocked(const char *name,
+				       struct dentry *base, int len)
+{
+	struct qstr this;
+	unsigned int c;
+	int err;
+	struct dentry *ret;
+
+	this.name = name;
+	this.len = len;
+	this.hash = full_name_hash(name, len);
+	if (!len)
+		return ERR_PTR(-EACCES);
+
+	if (unlikely(name[0] == '.')) {
+		if (len < 2 || (len == 2 && name[1] == '.'))
+			return ERR_PTR(-EACCES);
+	}
+
+	while (len--) {
+		c = *(const unsigned char *)name++;
+		if (c == '/' || c == '\0')
+			return ERR_PTR(-EACCES);
+	}
+	/*
+	 * See if the low-level filesystem might want
+	 * to use its own hash..
+	 */
+	if (base->d_flags & DCACHE_OP_HASH) {
+		int err = base->d_op->d_hash(base, &this);
+		if (err < 0)
+			return ERR_PTR(err);
+	}
+
+	err = inode_permission(base->d_inode, MAY_EXEC);
+	if (err)
+		return ERR_PTR(err);
+
+	/*
+	 * __d_lookup() is used to try to get a quick answer and avoid the
+	 * mutex.  A false-negative does no harm.
+	 */
+	ret = __d_lookup(base, &this);
+	if (ret && unlikely(ret->d_flags & DCACHE_OP_REVALIDATE)) {
+		dput(ret);
+		ret = NULL;
+	}
+	if (ret)
+		return ret;
+
+	mutex_lock(&base->d_inode->i_mutex);
+	ret =  __lookup_hash(&this, base, 0);
+	mutex_unlock(&base->d_inode->i_mutex);
+	return ret;
+}
+EXPORT_SYMBOL(lookup_one_len_unlocked);
 
 int user_path_at_empty(int dfd, const char __user *name, unsigned flags,
 		 struct path *path, int *empty)
@@ -3337,7 +3435,7 @@ static struct dentry *filename_create(int dfd, struct filename *name,
 	 * Do the final lookup.
 	 */
 	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
-	dentry = lookup_hash(&nd);
+	dentry = lookup_hash_locked(&nd);
 	if (IS_ERR(dentry))
 		goto unlock;
 
@@ -3646,7 +3744,7 @@ retry:
 		goto exit1;
 
 	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
-	dentry = lookup_hash(&nd);
+	dentry = lookup_hash_locked(&nd);
 	error = PTR_ERR(dentry);
 	if (IS_ERR(dentry))
 		goto exit2;
@@ -3763,7 +3861,7 @@ retry:
 		goto exit1;
 retry_deleg:
 	mutex_lock_nested(&nd.path.dentry->d_inode->i_mutex, I_MUTEX_PARENT);
-	dentry = lookup_hash(&nd);
+	dentry = lookup_hash_locked(&nd);
 	error = PTR_ERR(dentry);
 	if (!IS_ERR(dentry)) {
 		/* Why not before? Because we want correct error value */
@@ -4099,7 +4197,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	 * Check source == target.
 	 * On overlayfs need to look at underlying inodes.
 	 */
-	if (vfs_select_inode(old_dentry, 0) == vfs_select_inode(new_dentry, 0))
+	if (d_real_inode(old_dentry) == d_real_inode(new_dentry))
 		return 0;
 
 	error = may_delete(old_dir, old_dentry, is_dir);
@@ -4284,7 +4382,7 @@ retry:
 retry_deleg:
 	trap = lock_rename(new_dir, old_dir);
 
-	old_dentry = lookup_hash(&oldnd);
+	old_dentry = lookup_hash_locked(&oldnd);
 	error = PTR_ERR(old_dentry);
 	if (IS_ERR(old_dentry))
 		goto exit3;
@@ -4292,7 +4390,7 @@ retry_deleg:
 	error = -ENOENT;
 	if (d_is_negative(old_dentry))
 		goto exit4;
-	new_dentry = lookup_hash(&newnd);
+	new_dentry = lookup_hash_locked(&newnd);
 	error = PTR_ERR(new_dentry);
 	if (IS_ERR(new_dentry))
 		goto exit4;

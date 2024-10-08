@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2012 Advanced Micro Devices, Inc.
- * Author: Joerg Roedel <joerg.roedel@amd.com>
+ * Author: Joerg Roedel <jroedel@suse.de>
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published
@@ -35,6 +35,8 @@ extern int irq_remap_broken;
 extern int disable_sourceid_checking;
 extern int no_x2apic_optout;
 extern int irq_remapping_enabled;
+
+extern int disable_irq_post;
 
 struct irq_remap_ops {
 	/* The supported capabilities */
@@ -80,6 +82,9 @@ struct irq_remap_ops {
 
 	/* Setup interrupt remapping for an HPET MSI */
 	int (*alloc_hpet_msi)(unsigned int, unsigned int);
+
+	/* Setup interrupt to target a vCPU in a virtual machine */
+	int (*irq_set_vcpu_affinity)(int irq, void *vcpu_info);
 };
 
 extern struct irq_remap_ops intel_irq_remap_ops;
@@ -89,6 +94,7 @@ extern struct irq_remap_ops amd_iommu_irq_ops;
 
 #define irq_remapping_enabled 0
 #define irq_remap_broken      0
+#define disable_irq_post      1
 
 #endif /* CONFIG_IRQ_REMAP */
 

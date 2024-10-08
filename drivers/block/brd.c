@@ -19,6 +19,9 @@
 #include <linux/radix-tree.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#ifdef CONFIG_BLK_DEV_RAM_DAX
+#include <linux/pfn_t.h>
+#endif
 
 #include <asm/uaccess.h>
 
@@ -371,7 +374,7 @@ static int brd_rw_page(struct block_device *bdev, sector_t sector,
 
 #ifdef CONFIG_BLK_DEV_RAM_DAX
 static long brd_direct_access(struct block_device *bdev, sector_t sector,
-			void **kaddr, unsigned long *pfn, long size)
+			void **kaddr, pfn_t *pfn)
 {
 	struct brd_device *brd = bdev->bd_disk->private_data;
 	struct page *page;
@@ -382,12 +385,8 @@ static long brd_direct_access(struct block_device *bdev, sector_t sector,
 	if (!page)
 		return -ENOSPC;
 	*kaddr = page_address(page);
-	*pfn = page_to_pfn(page);
+	*pfn = page_to_pfn_t(page);
 
-	/*
-	 * TODO: If size > PAGE_SIZE, we could look to see if the next page in
-	 * the file happens to be mapped to the next page of physical RAM.
-	 */
 	return PAGE_SIZE;
 }
 #else

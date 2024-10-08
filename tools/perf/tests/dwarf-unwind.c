@@ -11,6 +11,10 @@
 #include "thread.h"
 #include "callchain.h"
 
+#if defined (__x86_64__) || defined (__i386__)
+#include "arch-tests.h"
+#endif
+
 /* For bsearch. We try to unwind functions in shared object. */
 #include <stdlib.h>
 
@@ -28,7 +32,7 @@ static int init_live_machine(struct machine *machine)
 	pid_t pid = getpid();
 
 	return perf_event__synthesize_mmap_events(NULL, &event, pid, pid,
-						  mmap_handler, machine, true);
+						  mmap_handler, machine, true, 500);
 }
 
 #define MAX_STACK 8
@@ -154,7 +158,7 @@ static int krava_1(struct thread *thread)
 	return krava_2(thread);
 }
 
-int test__dwarf_unwind(void)
+int test__dwarf_unwind(int subtest __maybe_unused)
 {
 	struct machine *machine;
 	struct thread *thread;

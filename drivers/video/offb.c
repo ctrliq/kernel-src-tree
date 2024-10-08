@@ -28,6 +28,10 @@
 #include <linux/pci.h>
 #include <asm/io.h>
 
+#ifdef CONFIG_PPC64
+#include <asm/pci-bridge.h>
+#endif
+
 #ifdef CONFIG_PPC32
 #include <asm/bootx.h>
 #endif

@@ -106,6 +106,13 @@ DEFINE_PER_CPU_SHARED_ALIGNED(struct rh_cpuinfo_x86, rh_cpu_info);
 EXPORT_PER_CPU_SYMBOL(rh_cpu_info);
 
 atomic_t init_deasserted;
+/* Logical package management. We might want to allocate that dynamically */
+static int *physical_to_logical_pkg __read_mostly;
+static unsigned long *physical_package_map __read_mostly;;
+static unsigned long *logical_package_map  __read_mostly;
+static unsigned int max_physical_pkg_id __read_mostly;
+unsigned int __max_logical_packages __read_mostly;
+EXPORT_SYMBOL(__max_logical_packages);
 
 /*
  * Report back to the Boot Processor during boot time or to the caller processor
@@ -236,6 +243,118 @@ static void notrace start_secondary(void *unused)
 	cpu_startup_entry(CPUHP_ONLINE);
 }
 
+int topology_update_package_map(unsigned int apicid, unsigned int cpu)
+{
+	unsigned int new, pkg = apicid >> boot_cpu_data.x86_coreid_bits;
+
+	/* Called from early boot ? */
+	if (!physical_package_map)
+		return 0;
+
+	if (pkg >= max_physical_pkg_id)
+		return -EINVAL;
+
+	/* Set the logical package id */
+	if (test_and_set_bit(pkg, physical_package_map))
+		goto found;
+
+	new = find_first_zero_bit(logical_package_map, __max_logical_packages);
+	if (new >= __max_logical_packages) {
+		physical_to_logical_pkg[pkg] = -1;
+		pr_warn("APIC(%x) Package %u exceeds logical package map\n",
+			apicid, pkg);
+		return -ENOSPC;
+	}
+	set_bit(new, logical_package_map);
+	pr_info("APIC(%x) Converting physical %u to logical package %u\n",
+		apicid, pkg, new);
+	physical_to_logical_pkg[pkg] = new;
+
+found:
+	rh_cpu_data(cpu).logical_proc_id = physical_to_logical_pkg[pkg];
+	return 0;
+}
+
+/**
+ * topology_phys_to_logical_pkg - Map a physical package id to a logical
+ *
+ * Returns logical package id or -1 if not found
+ */
+int topology_phys_to_logical_pkg(unsigned int phys_pkg)
+{
+	if (phys_pkg >= max_physical_pkg_id)
+		return -1;
+	return physical_to_logical_pkg[phys_pkg];
+}
+EXPORT_SYMBOL(topology_phys_to_logical_pkg);
+
+static void __init smp_init_package_map(void)
+{
+	unsigned int ncpus, cpu;
+	size_t size;
+
+	/*
+	 * Today neither Intel nor AMD support heterogenous systems. That
+	 * might change in the future....
+	 *
+	 * While ideally we'd want '* smp_num_siblings' in the below @ncpus
+	 * computation, this won't actually work since some Intel BIOSes
+	 * report inconsistent HT data when they disable HT.
+	 *
+	 * In particular, they reduce the APIC-IDs to only include the cores,
+	 * but leave the CPUID topology to say there are (2) siblings.
+	 * This means we don't know how many threads there will be until
+	 * after the APIC enumeration.
+	 *
+	 * By not including this we'll sometimes over-estimate the number of
+	 * logical packages by the amount of !present siblings, but this is
+	 * still better than MAX_LOCAL_APIC.
+	 *
+	 * We use total_cpus not nr_cpu_ids because nr_cpu_ids can be limited
+	 * on the command line leading to a similar issue as the HT disable
+	 * problem because the hyperthreads are usually enumerated after the
+	 * primary cores.
+	 */
+	ncpus = boot_cpu_data.x86_max_cores;
+	if (!ncpus) {
+		pr_warn("x86_max_cores == zero !?!?");
+		ncpus = 1;
+	}
+
+	if (is_uv_system())
+		__max_logical_packages = total_cpus;
+	else
+		__max_logical_packages = DIV_ROUND_UP(total_cpus, ncpus);
+
+	/*
+	 * Possibly larger than what we need as the number of apic ids per
+	 * package can be smaller than the actual used apic ids.
+	 */
+	max_physical_pkg_id = DIV_ROUND_UP(MAX_LOCAL_APIC, ncpus);
+	size = max_physical_pkg_id * sizeof(unsigned int);
+	physical_to_logical_pkg = kmalloc(size, GFP_KERNEL);
+	memset(physical_to_logical_pkg, 0xff, size);
+	size = BITS_TO_LONGS(max_physical_pkg_id) * sizeof(unsigned long);
+	physical_package_map = kzalloc(size, GFP_KERNEL);
+	size = BITS_TO_LONGS(__max_logical_packages) * sizeof(unsigned long);
+	logical_package_map = kzalloc(size, GFP_KERNEL);
+
+	pr_info("Max logical packages: %u\n", __max_logical_packages);
+
+	for_each_present_cpu(cpu) {
+		unsigned int apicid = apic->cpu_present_to_apicid(cpu);
+
+		if (apicid == BAD_APICID || !apic->apic_id_valid(apicid))
+			continue;
+		if (!topology_update_package_map(apicid, cpu))
+			continue;
+		pr_warn("CPU %u APICId %x disabled\n", cpu, apicid);
+		per_cpu(x86_bios_cpu_apicid, cpu) = BAD_APICID;
+		set_cpu_possible(cpu, false);
+		set_cpu_present(cpu, false);
+	}
+}
+
 void __init smp_store_boot_cpu_info(void)
 {
 	int id = 0; /* CPU 0 */
@@ -245,6 +364,7 @@ void __init smp_store_boot_cpu_info(void)
 	*c = boot_cpu_data;
 	c->cpu_index = id;
 	*rh_c = rh_boot_cpu_data;
+	smp_init_package_map();
 }
 
 /*
@@ -483,6 +603,44 @@ void __inquire_remote_apic(int apicid)
 }
 
 /*
+ * The Multiprocessor Specification 1.4 (1997) example code suggests
+ * that there should be a 10ms delay between the BSP asserting INIT
+ * and de-asserting INIT, when starting a remote processor.
+ * But that slows boot and resume on modern processors, which include
+ * many cores and don't require that delay.
+ *
+ * Cmdline "init_cpu_udelay=" is available to over-ride this delay.
+ * Modern processor families are quirked to remove the delay entirely.
+ */
+#define UDELAY_10MS_DEFAULT 10000
+
+static unsigned int init_udelay = UINT_MAX;
+
+static int __init cpu_init_udelay(char *str)
+{
+	get_option(&str, &init_udelay);
+
+	return 0;
+}
+early_param("cpu_init_udelay", cpu_init_udelay);
+
+static void __init smp_quirk_init_udelay(void)
+{
+	/* if cmdline changed it from default, leave it alone */
+	if (init_udelay != UINT_MAX)
+		return;
+
+	/* if modern processor, use no delay */
+	if (((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) && (boot_cpu_data.x86 == 6)) ||
+	    ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && (boot_cpu_data.x86 >= 0xF))) {
+		init_udelay = 0;
+		return;
+	}
+	/* else, use legacy delay */
+	init_udelay = UDELAY_10MS_DEFAULT;
+}
+
+/*
  * Poke the other CPU in the eye via NMI to wake it up. Remember that the normal
  * INIT, INIT, STARTUP sequence will reset the chip hard for us, and this
  * won't ... remember to clear down the APIC, etc later.
@@ -552,7 +710,7 @@ wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 	pr_debug("Waiting for send to finish...\n");
 	send_status = safe_apic_wait_icr_idle();
 
-	mdelay(10);
+	udelay(init_udelay);
 
 	pr_debug("Deasserting INIT\n");
 
@@ -609,7 +767,10 @@ wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 		/*
 		 * Give the other CPU some time to accept the IPI.
 		 */
-		udelay(300);
+		if (init_udelay == 0)
+			udelay(10);
+		else
+			udelay(300);
 
 		pr_debug("Startup point 1\n");
 
@@ -619,7 +780,10 @@ wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 		/*
 		 * Give the other CPU some time to accept the IPI.
 		 */
-		udelay(200);
+		if (init_udelay == 0)
+			udelay(10);
+		else
+			udelay(200);
 		if (maxlvt > 3)		/* Due to the Pentium erratum 3AP.  */
 			apic_write(APIC_ESR, 0);
 		accept_status = (apic_read(APIC_ESR) & 0xEF);
@@ -1142,6 +1306,8 @@ out:
 void arch_enable_nonboot_cpus_begin(void)
 {
 	set_mtrr_aps_delayed_init();
+
+	smp_quirk_init_udelay();
 }
 
 void arch_enable_nonboot_cpus_end(void)

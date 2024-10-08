@@ -19,7 +19,7 @@
 #include "util/auxtrace.h"
 #include "util/jit.h"
 
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 
 #include <linux/list.h>
 
@@ -73,7 +73,7 @@ static int perf_event__repipe_oe_synth(struct perf_tool *tool,
 	return perf_event__repipe_synth(tool, event);
 }
 
-#if defined(HAVE_LIBELF_SUPPORT) && defined(HAVE_DWARF_SUPPORT)
+#ifdef HAVE_JITDUMP
 static int perf_event__drop_oe(struct perf_tool *tool __maybe_unused,
 			       union perf_event *event __maybe_unused,
 			       struct ordered_events *oe __maybe_unused)
@@ -131,8 +131,7 @@ static int copy_bytes(struct perf_inject *inject, int fd, off_t size)
 
 static s64 perf_event__repipe_auxtrace(struct perf_tool *tool,
 				       union perf_event *event,
-				       struct perf_session *session
-				       __maybe_unused)
+				       struct perf_session *session)
 {
 	struct perf_inject *inject = container_of(tool, struct perf_inject,
 						  tool);
@@ -245,7 +244,7 @@ static int perf_event__repipe_mmap(struct perf_tool *tool,
 	return err;
 }
 
-#if defined(HAVE_LIBELF_SUPPORT) && defined(HAVE_DWARF_SUPPORT)
+#ifdef HAVE_JITDUMP
 static int perf_event__jit_repipe_mmap(struct perf_tool *tool,
 				       union perf_event *event,
 				       struct perf_sample *sample,
@@ -283,7 +282,7 @@ static int perf_event__repipe_mmap2(struct perf_tool *tool,
 	return err;
 }
 
-#if defined(HAVE_LIBELF_SUPPORT) && defined(HAVE_DWARF_SUPPORT)
+#ifdef HAVE_JITDUMP
 static int perf_event__jit_repipe_mmap2(struct perf_tool *tool,
 					union perf_event *event,
 					struct perf_sample *sample,
@@ -740,6 +739,7 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
 			.lost_samples	= perf_event__repipe,
 			.aux		= perf_event__repipe,
 			.itrace_start	= perf_event__repipe,
+			.context_switch	= perf_event__repipe,
 			.read		= perf_event__repipe_sample,
 			.throttle	= perf_event__repipe,
 			.unthrottle	= perf_event__repipe,
@@ -774,7 +774,9 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
 		OPT_BOOLEAN('s', "sched-stat", &inject.sched_stat,
 			    "Merge sched-stat and sched-switch for getting events "
 			    "where and how long tasks slept"),
+#ifdef HAVE_JITDUMP
 		OPT_BOOLEAN('j', "jit", &inject.jit_mode, "merge jitdump files into perf.data file"),
+#endif
 		OPT_INCR('v', "verbose", &verbose,
 			 "be more verbose (show build ids, etc)"),
 		OPT_STRING(0, "kallsyms", &symbol_conf.kallsyms_name, "file",
@@ -791,7 +793,7 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
 		"perf inject [<options>]",
 		NULL
 	};
-#if !defined(HAVE_LIBELF_SUPPORT) || !defined(HAVE_DWARF_SUPPORT)
+#ifndef HAVE_JITDUMP
 	set_option_nobuild(options, 'j', "jit", "NO_LIBELF=1", true);
 #endif
 	argc = parse_options(argc, argv, options, inject_usage, 0);
@@ -829,7 +831,7 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
 		inject.tool.ordered_events = true;
 		inject.tool.ordering_requires_timestamps = true;
 	}
-#if defined(HAVE_LIBELF_SUPPORT) && defined(HAVE_DWARF_SUPPORT)
+#ifdef HAVE_JITDUMP
 	if (inject.jit_mode) {
 		inject.tool.mmap2	   = perf_event__jit_repipe_mmap2;
 		inject.tool.mmap	   = perf_event__jit_repipe_mmap;

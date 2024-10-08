@@ -29,6 +29,7 @@
 extern void apic_timer_interrupt(void);
 extern void x86_platform_ipi(void);
 extern void kvm_posted_intr_ipi(void);
+extern void kvm_posted_intr_wakeup_ipi(void);
 extern void error_interrupt(void);
 extern void irq_work_interrupt(void);
 
@@ -73,6 +74,7 @@ extern void invalidate_interrupt31(void);
 extern void irq_move_cleanup_interrupt(void);
 extern void reboot_interrupt(void);
 extern void threshold_interrupt(void);
+extern void deferred_error_interrupt(void);
 
 extern void call_function_interrupt(void);
 extern void call_function_single_interrupt(void);
@@ -87,11 +89,13 @@ extern void trace_spurious_interrupt(void);
 extern void trace_thermal_interrupt(void);
 extern void trace_reschedule_interrupt(void);
 extern void trace_threshold_interrupt(void);
+extern void trace_deferred_error_interrupt(void);
 extern void trace_call_function_interrupt(void);
 extern void trace_call_function_single_interrupt(void);
 #define trace_irq_move_cleanup_interrupt  irq_move_cleanup_interrupt
 #define trace_reboot_interrupt  reboot_interrupt
 #define trace_kvm_posted_intr_ipi kvm_posted_intr_ipi
+#define trace_kvm_posted_intr_wakeup_ipi kvm_posted_intr_wakeup_ipi
 #endif /* CONFIG_TRACING */
 
 /* IOAPIC */
@@ -119,12 +123,19 @@ static inline void set_io_apic_irq_attr(struct io_apic_irq_attr *irq_attr,
 	irq_attr->polarity	= polarity;
 }
 
+enum irq_mode {
+       IRQ_REMAPPING,
+       IRQ_POSTING,
+};
+
 /* Intel specific interrupt remapping information */
 struct irq_2_iommu {
 	struct intel_iommu *iommu;
+	u64 irte_entry[2];
 	u16 irte_index;
 	u16 sub_handle;
 	u8  irte_mask;
+	enum irq_mode mode;
 };
 
 /* AMD specific interrupt remapping information */

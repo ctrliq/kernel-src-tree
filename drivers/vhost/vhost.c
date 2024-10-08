@@ -283,6 +283,7 @@ static void vhost_vq_reset(struct vhost_dev *dev,
 	vq->memory = NULL;
 	vq->is_le = virtio_legacy_is_little_endian();
 	vhost_vq_reset_user_be(vq);
+	vq->busyloop_timeout = 0;
 }
 
 static int vhost_worker(void *data)
@@ -917,6 +918,19 @@ long vhost_vring_ioctl(struct vhost_dev *d, int ioctl, void __user *argp)
 		break;
 	case VHOST_GET_VRING_ENDIAN:
 		r = vhost_get_vring_endian(vq, idx, argp);
+		break;
+	case VHOST_SET_VRING_BUSYLOOP_TIMEOUT:
+		if (copy_from_user(&s, argp, sizeof(s))) {
+			r = -EFAULT;
+			break;
+		}
+		vq->busyloop_timeout = s.num;
+		break;
+	case VHOST_GET_VRING_BUSYLOOP_TIMEOUT:
+		s.index = idx;
+		s.num = vq->busyloop_timeout;
+		if (copy_to_user(argp, &s, sizeof(s)))
+			r = -EFAULT;
 		break;
 	default:
 		r = -ENOIOCTLCMD;

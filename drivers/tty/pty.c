@@ -320,7 +320,7 @@ done:
  *	pty_common_install		-	set up the pty pair
  *	@driver: the pty driver
  *	@tty: the tty being instantiated
- *	@bool: legacy, true if this is BSD style
+ *	@legacy: true if this is BSD style
  *
  *	Perform the initial set up for the tty/pty pair. Called from the
  *	tty layer when the port is first opened.
@@ -335,18 +335,23 @@ static int pty_common_install(struct tty_driver *driver, struct tty_struct *tty,
 	int idx = tty->index;
 	int retval = -ENOMEM;
 
-	o_tty = alloc_tty_struct();
-	if (!o_tty)
-		goto err;
+	/* Opening the slave first has always returned -EIO */
+	if (driver->subtype != PTY_TYPE_MASTER)
+		return -EIO;
+
 	ports[0] = kmalloc(sizeof **ports, GFP_KERNEL);
 	ports[1] = kmalloc(sizeof **ports, GFP_KERNEL);
 	if (!ports[0] || !ports[1])
-		goto err_free_tty;
+		goto err;
 	if (!try_module_get(driver->other->owner)) {
 		/* This cannot in fact currently happen */
-		goto err_free_tty;
+		goto err;
 	}
-	initialize_tty_struct(o_tty, driver->other, idx);
+	o_tty = alloc_tty_struct(driver->other, idx);
+	if (!o_tty)
+		goto err_put_module;
+
+	tty_set_lock_subclass(o_tty);
 
 	if (legacy) {
 		/* We always use new tty termios data so we can do this
@@ -372,8 +377,6 @@ static int pty_common_install(struct tty_driver *driver, struct tty_struct *tty,
 	 * Everything allocated ... set up the o_tty structure.
 	 */
 	tty_driver_kref_get(driver->other);
-	if (driver->subtype == PTY_TYPE_MASTER)
-		o_tty->count++;
 	/* Establish the links in both directions */
 	tty->link   = o_tty;
 	o_tty->link = tty;
@@ -385,18 +388,19 @@ static int pty_common_install(struct tty_driver *driver, struct tty_struct *tty,
 
 	tty_driver_kref_get(driver);
 	tty->count++;
+	o_tty->count++;
 	return 0;
 err_free_termios:
 	if (legacy)
 		tty_free_termios(tty);
 err_deinit_tty:
 	deinitialize_tty_struct(o_tty);
-	module_put(o_tty->driver->owner);
-err_free_tty:
+	free_tty_struct(o_tty);
+err_put_module:
+	module_put(driver->other->owner);
+err:
 	kfree(ports[0]);
 	kfree(ports[1]);
-	free_tty_struct(o_tty);
-err:
 	return retval;
 }
 

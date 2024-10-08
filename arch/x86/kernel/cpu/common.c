@@ -34,6 +34,7 @@
 #include <asm/mtrr.h>
 #include <linux/numa.h>
 #include <asm/asm.h>
+#include <asm/bugs.h>
 #include <asm/cpu.h>
 #include <asm/mce.h>
 #include <asm/msr.h>
@@ -147,9 +148,18 @@ static int __init x86_xsave_setup(char *s)
 {
 	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
 	setup_clear_cpu_cap(X86_FEATURE_XSAVEOPT);
+	setup_clear_cpu_cap(X86_FEATURE_XSAVEC);
 	setup_clear_cpu_cap(X86_FEATURE_XSAVES);
 	setup_clear_cpu_cap(X86_FEATURE_AVX);
 	setup_clear_cpu_cap(X86_FEATURE_AVX2);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512F);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512PF);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512ER);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512CD);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512DQ);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512BW);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512VL);
+	setup_clear_cpu_cap(X86_FEATURE_MPX);
 	return 1;
 }
 __setup("noxsave", x86_xsave_setup);
@@ -167,6 +177,22 @@ static int __init x86_xsaves_setup(char *s)
 	return 1;
 }
 __setup("noxsaves", x86_xsaves_setup);
+
+static int __init x86_mpx_setup(char *s)
+{
+	/* require an exact match without trailing characters */
+	if (strlen(s))
+		return 0;
+
+	/* do not emit a message if the feature is not present */
+	if (!boot_cpu_has(X86_FEATURE_MPX))
+		return 1;
+
+	setup_clear_cpu_cap(X86_FEATURE_MPX);
+	pr_info("nompx: Intel Memory Protection Extensions (MPX) disabled\n");
+	return 1;
+}
+__setup("nompx", x86_mpx_setup);
 
 #ifdef CONFIG_X86_32
 static int cachesize_override = -1;
@@ -268,6 +294,8 @@ static inline void squash_the_stupid_serial_number(struct cpuinfo_x86 *c)
 static __init int setup_disable_smep(char *arg)
 {
 	setup_clear_cpu_cap(X86_FEATURE_SMEP);
+	/* Check for things that depend on SMEP being enabled: */
+	check_mpx_erratum(&boot_cpu_data);
 	return 1;
 }
 __setup("nosmep", setup_disable_smep);
@@ -490,18 +518,20 @@ u16 __read_mostly tlb_lld_4m[NR_INFO];
  */
 s8  __read_mostly tlb_flushall_shift = -1;
 
-void cpu_detect_tlb(struct cpuinfo_x86 *c)
+static void cpu_detect_tlb(struct cpuinfo_x86 *c)
 {
 	if (this_cpu->c_detect_tlb)
 		this_cpu->c_detect_tlb(c);
 
-	printk(KERN_INFO "Last level iTLB entries: 4KB %d, 2MB %d, 4MB %d\n" \
-		"Last level dTLB entries: 4KB %d, 2MB %d, 4MB %d\n"	     \
-		"tlb_flushall_shift: %d\n",
+	pr_info("Last level iTLB entries: 4KB %d, 2MB %d, 4MB %d\n",
 		tlb_lli_4k[ENTRIES], tlb_lli_2m[ENTRIES],
-		tlb_lli_4m[ENTRIES], tlb_lld_4k[ENTRIES],
-		tlb_lld_2m[ENTRIES], tlb_lld_4m[ENTRIES],
-		tlb_flushall_shift);
+		tlb_lli_4m[ENTRIES]);
+
+	pr_info("Last level dTLB entries: 4KB %d, 2MB %d, 4MB %d\n",
+		tlb_lld_4k[ENTRIES], tlb_lld_2m[ENTRIES],
+		tlb_lld_4m[ENTRIES]);
+
+	pr_info("tlb_flushall_shift: %d\n", tlb_flushall_shift);
 }
 
 void detect_ht(struct cpuinfo_x86 *c)
@@ -596,14 +626,9 @@ void cpu_detect(struct cpuinfo_x86 *c)
 		u32 junk, tfms, cap0, misc;
 
 		cpuid(0x00000001, &tfms, &misc, &junk, &cap0);
-		c->x86 = (tfms >> 8) & 0xf;
-		c->x86_model = (tfms >> 4) & 0xf;
-		c->x86_mask = tfms & 0xf;
-
-		if (c->x86 == 0xf)
-			c->x86 += (tfms >> 20) & 0xff;
-		if (c->x86 >= 0x6)
-			c->x86_model += ((tfms >> 16) & 0xf) << 4;
+		c->x86		= x86_family(tfms);
+		c->x86_model	= x86_model(tfms);
+		c->x86_mask	= x86_stepping(tfms);
 
 		if (cap0 & (1<<19)) {
 			c->x86_clflush_size = ((misc >> 8) & 0xff) * 8;
@@ -661,7 +686,9 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 			/* QoS sub-leaf, EAX=0Fh, ECX=1 */
 			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
 			c->x86_capability[12] = edx;
-			if (cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) {
+			if ((cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) ||
+			      ((cpu_has(c, X86_FEATURE_CQM_MBM_TOTAL)) ||
+			       (cpu_has(c, X86_FEATURE_CQM_MBM_LOCAL)))) {
 				rh_c->x86_cache_max_rmid = ecx;
 				rh_c->x86_cache_occ_scale = ebx;
 			}
@@ -879,6 +906,9 @@ static void x86_init_cache_qos(struct cpuinfo_x86 *c)
  */
 static void identify_cpu(struct cpuinfo_x86 *c)
 {
+	struct rh_cpuinfo_x86 *rh_c = (c == &boot_cpu_data) ?
+				      &rh_boot_cpu_data :
+				      &rh_cpu_data(c->cpu_index);
 	int i;
 
 	c->loops_per_jiffy = loops_per_jiffy;
@@ -998,6 +1028,9 @@ static void identify_cpu(struct cpuinfo_x86 *c)
 #ifdef CONFIG_NUMA
 	numa_add_cpu(smp_processor_id());
 #endif
+	/* The boot/hotplug time assigment got cleared, restore it */
+	rh_c->logical_proc_id = topology_phys_to_logical_pkg(c->phys_proc_id);
+
 }
 
 #ifdef CONFIG_X86_64
@@ -1406,7 +1439,7 @@ void cpu_init(void)
 
 	printk(KERN_INFO "Initializing CPU#%d\n", cpu);
 
-	if (cpu_has_vme || cpu_has_tsc || cpu_has_de)
+	if (cpu_feature_enabled(X86_FEATURE_VME) || cpu_has_tsc || cpu_has_de)
 		clear_in_cr4(X86_CR4_VME|X86_CR4_PVI|X86_CR4_TSD|X86_CR4_DE);
 
 	load_current_idt();

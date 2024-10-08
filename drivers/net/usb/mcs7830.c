@@ -42,7 +42,6 @@
 #include <linux/crc32.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
-#include <linux/init.h>
 #include <linux/mii.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -446,7 +445,6 @@ static int mcs7830_get_regs_len(struct net_device *net)
 static void mcs7830_get_drvinfo(struct net_device *net, struct ethtool_drvinfo *drvinfo)
 {
 	usbnet_get_drvinfo(net, drvinfo);
-	drvinfo->regdump_len = mcs7830_get_regs_len(net);
 }
 
 static void mcs7830_get_regs(struct net_device *net, struct ethtool_regs *regs, void *data)

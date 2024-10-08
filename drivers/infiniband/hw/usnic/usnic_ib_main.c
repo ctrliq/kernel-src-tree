@@ -229,11 +229,11 @@ static void usnic_ib_handle_usdev_event(struct usnic_ib_dev *us_ibdev,
 }
 
 static int usnic_ib_netdevice_event(struct notifier_block *notifier,
-					unsigned long event,
-					void *data)
+					unsigned long event, void *ptr)
 {
 	struct usnic_ib_dev *us_ibdev;
-	struct net_device *netdev = data;
+
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
 
 	mutex_lock(&usnic_ib_ibdev_list_lock);
 	list_for_each_entry(us_ibdev, &usnic_ib_ibdev_list, ib_dev_link) {
@@ -653,7 +653,7 @@ static int __init usnic_ib_init(void)
 		goto out_umem_fini;
 	}
 
-	err = register_netdevice_notifier(&usnic_ib_netdevice_notifier);
+	err = register_netdevice_notifier_rh(&usnic_ib_netdevice_notifier);
 	if (err) {
 		usnic_err("Failed to register netdev notifier\n");
 		goto out_pci_unreg;
@@ -678,7 +678,7 @@ static int __init usnic_ib_init(void)
 out_unreg_inetaddr_notifier:
 	unregister_inetaddr_notifier(&usnic_ib_inetaddr_notifier);
 out_unreg_netdev_notifier:
-	unregister_netdevice_notifier(&usnic_ib_netdevice_notifier);
+	unregister_netdevice_notifier_rh(&usnic_ib_netdevice_notifier);
 out_pci_unreg:
 	pci_unregister_driver(&usnic_ib_pci_driver);
 out_umem_fini:
@@ -693,7 +693,7 @@ static void __exit usnic_ib_destroy(void)
 	usnic_debugfs_exit();
 	usnic_transport_fini();
 	unregister_inetaddr_notifier(&usnic_ib_inetaddr_notifier);
-	unregister_netdevice_notifier(&usnic_ib_netdevice_notifier);
+	unregister_netdevice_notifier_rh(&usnic_ib_netdevice_notifier);
 	pci_unregister_driver(&usnic_ib_pci_driver);
 	usnic_uiom_fini();
 }

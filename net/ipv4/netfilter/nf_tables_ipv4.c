@@ -26,7 +26,7 @@ static unsigned int nft_do_chain_ipv4(const struct nf_hook_ops *ops,
 {
 	struct nft_pktinfo pkt;
 
-	nft_set_pktinfo_ipv4(&pkt, ops, skb, state);
+	nft_set_pktinfo_ipv4(&pkt, skb, state);
 
 	return nft_do_chain(&pkt, ops);
 }
@@ -82,7 +82,7 @@ err:
 
 static void nf_tables_ipv4_exit_net(struct net *net)
 {
-	nft_unregister_afinfo(net->nft.ipv4);
+	nft_unregister_afinfo(net, net->nft.ipv4);
 	kfree(net->nft.ipv4);
 }
 

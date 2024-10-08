@@ -1,6 +1,8 @@
 #
 # Building vDSO images for x86.
 #
+#
+OBJECT_FILES_NON_STANDARD	:= y
 
 VDSO64-$(CONFIG_X86_64)		:= y
 VDSOX32-$(CONFIG_X86_X32_ABI)	:= y
@@ -24,6 +26,12 @@ vobj64s := $(filter-out $(vobjx32s-compat),$(vobjs-y))
 obj-$(VDSO64-y)			+= vma.o vdso.o
 obj-$(VDSOX32-y)		+= vdsox32.o
 obj-$(VDSO32-y)			+= vdso32.o vdso32-setup.o
+
+OBJECT_FILES_NON_STANDARD_vma.o			:= n
+OBJECT_FILES_NON_STANDARD_vdso.o		:= n
+OBJECT_FILES_NON_STANDARD_vdsox32.o		:= n
+OBJECT_FILES_NON_STANDARD_vdso32.o		:= n
+OBJECT_FILES_NON_STANDARD_vdso32-setup.o	:= n
 
 vobjs := $(foreach F,$(vobj64s),$(obj)/$F)
 

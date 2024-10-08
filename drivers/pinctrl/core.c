@@ -850,7 +850,9 @@ static struct pinctrl *create_pinctrl(struct device *dev)
 	kref_init(&p->users);
 
 	/* Add the pinctrl handle to the global list */
+	mutex_lock(&pinctrl_list_mutex);
 	list_add_tail(&p->node, &pinctrl_list);
+	mutex_unlock(&pinctrl_list_mutex);
 
 	return p;
 }
@@ -1255,7 +1257,7 @@ EXPORT_SYMBOL_GPL(pinctrl_force_default);
  */
 int pinctrl_pm_select_default_state(struct device *dev)
 {
-	struct dev_pin_info *pins = dev->pins;
+	struct dev_pin_info *pins = dev->device_rh->pins;
 	int ret;
 
 	if (!pins)
@@ -1275,7 +1277,7 @@ EXPORT_SYMBOL_GPL(pinctrl_pm_select_default_state);
  */
 int pinctrl_pm_select_sleep_state(struct device *dev)
 {
-	struct dev_pin_info *pins = dev->pins;
+	struct dev_pin_info *pins = dev->device_rh->pins;
 	int ret;
 
 	if (!pins)
@@ -1295,7 +1297,7 @@ EXPORT_SYMBOL_GPL(pinctrl_pm_select_sleep_state);
  */
 int pinctrl_pm_select_idle_state(struct device *dev)
 {
-	struct dev_pin_info *pins = dev->pins;
+	struct dev_pin_info *pins = dev->device_rh->pins;
 	int ret;
 
 	if (!pins)

@@ -827,11 +827,10 @@ static int posix_locks_deadlock(struct file_lock *caller_fl,
  * whether or not a lock was successfully freed by testing the return
  * value for -ENOENT.
  */
-static int flock_lock_file(struct file *filp, struct file_lock *request)
+static int flock_lock_inode(struct inode *inode, struct file_lock *request)
 {
 	struct file_lock *new_fl = NULL;
 	struct file_lock **before;
-	struct inode * inode = file_inode(filp);
 	int error = 0;
 	int found = 0;
 
@@ -851,7 +850,7 @@ static int flock_lock_file(struct file *filp, struct file_lock *request)
 			break;
 		if (IS_LEASE(fl))
 			continue;
-		if (filp != fl->fl_file)
+		if (request->fl_file != fl->fl_file)
 			continue;
 		if (request->fl_type == fl->fl_type)
 			goto out;
@@ -1141,20 +1140,19 @@ int posix_lock_file(struct file *filp, struct file_lock *fl,
 EXPORT_SYMBOL(posix_lock_file);
 
 /**
- * posix_lock_file_wait - Apply a POSIX-style lock to a file
- * @filp: The file to apply the lock to
+ * posix_lock_inode_wait - Apply a POSIX-style lock to a file
+ * @inode: inode of file to which lock request should be applied
  * @fl: The lock to be applied
  *
- * Add a POSIX style lock to a file.
- * We merge adjacent & overlapping locks whenever possible.
- * POSIX locks are sorted by owner task, then by starting address
+ * Variant of posix_lock_file_wait that does not take a filp, and so can be
+ * used after the filp has already been torn down.
  */
-int posix_lock_file_wait(struct file *filp, struct file_lock *fl)
+int posix_lock_inode_wait(struct inode *inode, struct file_lock *fl)
 {
 	int error;
 	might_sleep ();
 	for (;;) {
-		error = posix_lock_file(filp, fl, NULL);
+		error = __posix_lock_file(inode, fl, NULL);
 		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
@@ -1166,7 +1164,7 @@ int posix_lock_file_wait(struct file *filp, struct file_lock *fl)
 	}
 	return error;
 }
-EXPORT_SYMBOL(posix_lock_file_wait);
+EXPORT_SYMBOL(posix_lock_inode_wait);
 
 /**
  * locks_mandatory_locked - Check for an active lock
@@ -1527,7 +1525,7 @@ generic_add_lease(struct file *filp, long arg, struct file_lock **flp, void **pr
 {
 	struct file_lock *fl, **before, **my_before = NULL, *lease;
 	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	bool is_deleg = (*flp)->fl_flags & FL_DELEG;
 	int error;
 
@@ -1624,8 +1622,7 @@ static int generic_delete_lease(struct file *filp, void *owner)
 {
 	int error = -EAGAIN;
 	struct file_lock *fl, **before;
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 
 	for (before = &inode->i_flock;
 			((fl = *before) != NULL) && IS_LEASE(fl);
@@ -1655,8 +1652,7 @@ static int generic_delete_lease(struct file *filp, void *owner)
 int generic_setlease(struct file *filp, long arg, struct file_lock **flp,
 			void **priv)
 {
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	int error;
 
 	if ((!uid_eq(current_fsuid(), inode->i_uid)) && !capable(CAP_LEASE))
@@ -1785,18 +1781,18 @@ int fcntl_setlease(unsigned int fd, struct file *filp, long arg)
 }
 
 /**
- * flock_lock_file_wait - Apply a FLOCK-style lock to a file
- * @filp: The file to apply the lock to
+ * flock_lock_inode_wait - Apply a FLOCK-style lock to a file
+ * @inode: inode of the file to apply to
  * @fl: The lock to be applied
  *
- * Add a FLOCK style lock to a file.
+ * Apply a FLOCK style lock request to an inode.
  */
-int flock_lock_file_wait(struct file *filp, struct file_lock *fl)
+int flock_lock_inode_wait(struct inode *inode, struct file_lock *fl)
 {
 	int error;
 	might_sleep();
 	for (;;) {
-		error = flock_lock_file(filp, fl);
+		error = flock_lock_inode(inode, fl);
 		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
@@ -1808,8 +1804,7 @@ int flock_lock_file_wait(struct file *filp, struct file_lock *fl)
 	}
 	return error;
 }
-
-EXPORT_SYMBOL(flock_lock_file_wait);
+EXPORT_SYMBOL(flock_lock_inode_wait);
 
 /**
  *	sys_flock: - flock() system call.

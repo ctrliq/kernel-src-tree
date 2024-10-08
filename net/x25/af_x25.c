@@ -224,7 +224,7 @@ static void x25_kill_by_device(struct net_device *dev)
 static int x25_device_event(struct notifier_block *this, unsigned long event,
 			    void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct x25_neigh *nb;
 
 	if (!net_eq(dev_net(dev), &init_net))
@@ -1805,7 +1805,7 @@ static int __init x25_init(void)
 
 	dev_add_pack(&x25_packet_type);
 
-	rc = register_netdevice_notifier(&x25_dev_notifier);
+	rc = register_netdevice_notifier_rh(&x25_dev_notifier);
 	if (rc != 0)
 		goto out_sock;
 
@@ -1818,7 +1818,7 @@ static int __init x25_init(void)
 out:
 	return rc;
 out_dev:
-	unregister_netdevice_notifier(&x25_dev_notifier);
+	unregister_netdevice_notifier_rh(&x25_dev_notifier);
 out_sock:
 	sock_unregister(AF_X25);
 out_proto:
@@ -1835,7 +1835,7 @@ static void __exit x25_exit(void)
 
 	x25_unregister_sysctl();
 
-	unregister_netdevice_notifier(&x25_dev_notifier);
+	unregister_netdevice_notifier_rh(&x25_dev_notifier);
 
 	dev_remove_pack(&x25_packet_type);
 

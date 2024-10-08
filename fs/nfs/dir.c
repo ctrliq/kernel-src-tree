@@ -376,7 +376,7 @@ int nfs_readdir_xdr_filler(struct page **pages, nfs_readdir_descriptor_t *desc,
  again:
 	timestamp = jiffies;
 	gencount = nfs_inc_attr_generation_counter();
-	error = NFS_PROTO(inode)->readdir(file->f_path.dentry, cred, entry->cookie, pages,
+	error = NFS_PROTO(inode)->readdir(file_dentry(file), cred, entry->cookie, pages,
 					  NFS_SERVER(inode)->dtsize, desc->plus);
 	if (error < 0) {
 		/* We requested READDIRPLUS, but the server doesn't grok it */
@@ -561,7 +561,7 @@ int nfs_readdir_page_filler(nfs_readdir_descriptor_t *desc, struct nfs_entry *en
 		count++;
 
 		if (desc->plus != 0)
-			nfs_prime_dcache(desc->file->f_path.dentry, entry);
+			nfs_prime_dcache(file_dentry(desc->file), entry);
 
 		status = nfs_readdir_add_to_array(entry, page);
 		if (status != 0)
@@ -868,7 +868,7 @@ static bool nfs_dir_mapping_need_revalidate(struct inode *dir)
  */
 static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 {
-	struct dentry	*dentry = filp->f_path.dentry;
+	struct dentry	*dentry = file_dentry(filp);
 	struct inode	*inode = dentry->d_inode;
 	nfs_readdir_descriptor_t my_desc,
 			*desc = &my_desc;
@@ -2080,6 +2080,10 @@ static DEFINE_SPINLOCK(nfs_access_lru_lock);
 static LIST_HEAD(nfs_access_lru_list);
 static atomic_long_t nfs_access_nr_entries;
 
+static unsigned long nfs_access_max_cachesize = ULONG_MAX;
+module_param(nfs_access_max_cachesize, ulong, 0644);
+MODULE_PARM_DESC(nfs_access_max_cachesize, "NFS access maximum total cache length");
+
 static void nfs_access_free_entry(struct nfs_access_entry *entry)
 {
 	put_rpccred(entry->cred);
@@ -2100,17 +2104,11 @@ static void nfs_access_free_list(struct list_head *head)
 	}
 }
 
-int nfs_access_cache_shrinker(struct shrinker *shrink,
-			      struct shrink_control *sc)
+int nfs_do_access_cache_shrinker(int nr_to_scan)
 {
 	LIST_HEAD(head);
 	struct nfs_inode *nfsi, *next;
 	struct nfs_access_entry *cache;
-	int nr_to_scan = sc->nr_to_scan;
-	gfp_t gfp_mask = sc->gfp_mask;
-
-	if ((gfp_mask & GFP_KERNEL) != GFP_KERNEL)
-		return (nr_to_scan == 0) ? 0 : -1;
 
 	spin_lock(&nfs_access_lru_lock);
 	list_for_each_entry_safe(nfsi, next, &nfs_access_lru_list, access_cache_inode_lru) {
@@ -2141,6 +2139,33 @@ remove_lru_entry:
 	spin_unlock(&nfs_access_lru_lock);
 	nfs_access_free_list(&head);
 	return (atomic_long_read(&nfs_access_nr_entries) / 100) * sysctl_vfs_cache_pressure;
+}
+
+int nfs_access_cache_shrinker(struct shrinker *shrink,
+			      struct shrink_control *sc)
+{
+	int nr_to_scan = sc->nr_to_scan;
+	gfp_t gfp_mask = sc->gfp_mask;
+
+	if ((gfp_mask & GFP_KERNEL) != GFP_KERNEL)
+		return (nr_to_scan == 0) ? 0 : -1;
+	return nfs_do_access_cache_shrinker(nr_to_scan);
+}
+
+static void
+nfs_access_cache_enforce_limit(void)
+{
+	long nr_entries = atomic_long_read(&nfs_access_nr_entries);
+	unsigned long diff;
+	unsigned int nr_to_scan;
+
+	if (nr_entries < 0 || nr_entries <= nfs_access_max_cachesize)
+		return;
+	nr_to_scan = 100;
+	diff = nr_entries - nfs_access_max_cachesize;
+	if (diff < nr_to_scan)
+		nr_to_scan = diff;
+	nfs_do_access_cache_shrinker(nr_to_scan);
 }
 
 static void __nfs_access_zap_cache(struct nfs_inode *nfsi, struct list_head *head)
@@ -2325,6 +2350,7 @@ void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
 					&nfs_access_lru_list);
 		spin_unlock(&nfs_access_lru_lock);
 	}
+	nfs_access_cache_enforce_limit();
 }
 EXPORT_SYMBOL_GPL(nfs_access_add_cache);
 

@@ -111,6 +111,13 @@ void arch_release_task_struct(struct task_struct *tsk)
 }
 #endif
 
+int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+{
+	*dst = *src;
+	dst->thread.vxrs = NULL;
+	return 0;
+}
+
 int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 		unsigned long arg, struct task_struct *p)
 {
@@ -185,7 +192,6 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 	save_fp_ctl(&p->thread.fp_regs.fpc);
 	save_fp_regs(p->thread.fp_regs.fprs);
 	p->thread.fp_regs.pad = 0;
-	p->thread.vxrs = NULL;
 	/* Set a new TLS ?  */
 	if (clone_flags & CLONE_SETTLS) {
 		unsigned long tls = frame->childregs.gprs[6];

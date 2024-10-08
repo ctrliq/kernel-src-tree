@@ -77,7 +77,7 @@ MODULE_ALIAS("can-proto-1");
  */
 
 struct uniqframe {
-	ktime_t tstamp;
+	int skbcnt;
 	const struct sk_buff *skb;
 	unsigned int join_rx_count;
 };
@@ -139,7 +139,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
 
 	/* eliminate multiple filter matches for the same skb */
 	if (this_cpu_ptr(ro->uniq)->skb == oskb &&
-	    ktime_equal(this_cpu_ptr(ro->uniq)->tstamp, oskb->tstamp)) {
+	    this_cpu_ptr(ro->uniq)->skbcnt == can_skb_prv(oskb)->skbcnt) {
 		if (ro->join_filters) {
 			this_cpu_inc(ro->uniq->join_rx_count);
 			/* drop frame until all enabled filters matched */
@@ -150,7 +150,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
 		}
 	} else {
 		this_cpu_ptr(ro->uniq)->skb = oskb;
-		this_cpu_ptr(ro->uniq)->tstamp = oskb->tstamp;
+		this_cpu_ptr(ro->uniq)->skbcnt = can_skb_prv(oskb)->skbcnt;
 		this_cpu_ptr(ro->uniq)->join_rx_count = 1;
 		/* drop first frame to check all enabled filters? */
 		if (ro->join_filters && ro->count > 1)
@@ -267,9 +267,9 @@ static int raw_enable_allfilters(struct net_device *dev, struct sock *sk)
 }
 
 static int raw_notifier(struct notifier_block *nb,
-			unsigned long msg, void *data)
+			unsigned long msg, void *ptr)
 {
-	struct net_device *dev = (struct net_device *)data;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct raw_sock *ro = container_of(nb, struct raw_sock, notifier);
 	struct sock *sk = &ro->sk;
 
@@ -340,7 +340,7 @@ static int raw_init(struct sock *sk)
 	/* set notifier */
 	ro->notifier.notifier_call = raw_notifier;
 
-	register_netdevice_notifier(&ro->notifier);
+	register_netdevice_notifier_rh(&ro->notifier);
 
 	return 0;
 }
@@ -355,7 +355,7 @@ static int raw_release(struct socket *sock)
 
 	ro = raw_sk(sk);
 
-	unregister_netdevice_notifier(&ro->notifier);
+	unregister_netdevice_notifier_rh(&ro->notifier);
 
 	lock_sock(sk);
 
@@ -757,6 +757,7 @@ static int raw_sendmsg(struct kiocb *iocb, struct socket *sock,
 
 	can_skb_reserve(skb);
 	can_skb_prv(skb)->ifindex = dev->ifindex;
+	can_skb_prv(skb)->skbcnt = 0;
 
 	err = memcpy_fromiovec(skb_put(skb, size), msg->msg_iov, size);
 	if (err < 0)

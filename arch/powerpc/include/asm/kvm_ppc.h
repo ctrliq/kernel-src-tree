@@ -171,8 +171,6 @@ extern long kvmppc_h_put_tce(struct kvm_vcpu *vcpu, unsigned long liobn,
 			     unsigned long ioba, unsigned long tce);
 extern long kvmppc_h_get_tce(struct kvm_vcpu *vcpu, unsigned long liobn,
 			     unsigned long ioba);
-extern struct kvm_rma_info *kvm_alloc_rma(void);
-extern void kvm_release_rma(struct kvm_rma_info *ri);
 extern struct page *kvm_alloc_hpt(unsigned long nr_pages);
 extern void kvm_release_hpt(struct page *page, unsigned long nr_pages);
 extern int kvmppc_core_init_vm(struct kvm *kvm);
@@ -502,7 +500,7 @@ void kvmppc_claim_lpid(long lpid);
 void kvmppc_free_lpid(long lpid);
 void kvmppc_init_lpid(unsigned long nr_lpids);
 
-static inline void kvmppc_mmu_flush_icache(pfn_t pfn)
+static inline void kvmppc_mmu_flush_icache(kvm_pfn_t pfn)
 {
 	struct page *page;
 	/*

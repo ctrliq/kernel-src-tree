@@ -34,7 +34,15 @@ char i40evf_driver_name[] = "i40evf";
 static const char i40evf_driver_string[] =
 	"Intel(R) 40-10 Gigabit Virtual Function Network Driver";
 
-#define DRV_VERSION "1.3.33"
+#define DRV_KERN "-k"
+
+#define DRV_VERSION_MAJOR 1
+#define DRV_VERSION_MINOR 5
+#define DRV_VERSION_BUILD 10
+#define DRV_VERSION __stringify(DRV_VERSION_MAJOR) "." \
+	     __stringify(DRV_VERSION_MINOR) "." \
+	     __stringify(DRV_VERSION_BUILD) \
+	     DRV_KERN
 const char i40evf_driver_version[] = DRV_VERSION;
 static const char i40evf_copyright[] =
 	"Copyright (c) 2013 - 2015 Intel Corporation.";
@@ -935,6 +943,14 @@ static void i40evf_set_rx_mode(struct net_device *netdev)
 bottom_of_search_loop:
 		continue;
 	}
+
+	if (netdev->flags & IFF_PROMISC &&
+	    !(adapter->flags & I40EVF_FLAG_PROMISC_ON))
+		adapter->aq_required |= I40EVF_FLAG_AQ_REQUEST_PROMISC;
+	else if (!(netdev->flags & IFF_PROMISC) &&
+		 adapter->flags & I40EVF_FLAG_PROMISC_ON)
+		adapter->aq_required |= I40EVF_FLAG_AQ_RELEASE_PROMISC;
+
 	clear_bit(__I40EVF_IN_CRITICAL_TASK, &adapter->crit_section);
 }
 
@@ -1230,7 +1246,7 @@ static int i40evf_config_rss_aq(struct i40evf_adapter *adapter)
 
 	if (adapter->current_op != I40E_VIRTCHNL_OP_UNKNOWN) {
 		/* bail because we already have a command pending */
-		dev_err(&adapter->pdev->dev, "Cannot confiure RSS, command %d pending\n",
+		dev_err(&adapter->pdev->dev, "Cannot configure RSS, command %d pending\n",
 			adapter->current_op);
 		return -EBUSY;
 	}
@@ -1611,6 +1627,17 @@ static void i40evf_watchdog_task(struct work_struct *work)
 	}
 	if (adapter->aq_required & I40EVF_FLAG_AQ_SET_RSS_LUT) {
 		i40evf_set_rss_lut(adapter);
+		goto watchdog_done;
+	}
+
+	if (adapter->aq_required & I40EVF_FLAG_AQ_REQUEST_PROMISC) {
+		i40evf_set_promiscuous(adapter, I40E_FLAG_VF_UNICAST_PROMISC |
+				       I40E_FLAG_VF_MULTICAST_PROMISC);
+		goto watchdog_done;
+	}
+
+	if (adapter->aq_required & I40EVF_FLAG_AQ_RELEASE_PROMISC) {
+		i40evf_set_promiscuous(adapter, 0);
 		goto watchdog_done;
 	}
 
@@ -2204,40 +2231,40 @@ int i40evf_process_config(struct i40evf_adapter *adapter)
 		return -ENODEV;
 	}
 
-	netdev->features |= NETIF_F_HIGHDMA |
-			    NETIF_F_SG |
-			    NETIF_F_IP_CSUM |
-			    NETIF_F_SCTP_CSUM |
-			    NETIF_F_IPV6_CSUM |
-			    NETIF_F_TSO |
-			    NETIF_F_TSO6 |
-			    NETIF_F_TSO_ECN |
-			    NETIF_F_GSO_GRE |
-			    NETIF_F_GSO_UDP_TUNNEL |
-			    NETIF_F_RXCSUM |
-			    NETIF_F_GRO;
+	netdev->hw_enc_features |= NETIF_F_SG			|
+				   NETIF_F_IP_CSUM		|
+				   NETIF_F_IPV6_CSUM		|
+				   NETIF_F_HIGHDMA		|
+				   NETIF_F_SOFT_FEATURES	|
+				   NETIF_F_TSO			|
+				   NETIF_F_TSO_ECN		|
+				   NETIF_F_TSO6			|
+				   NETIF_F_GSO_GRE		|
+				   NETIF_F_GSO_IPIP		|
+				   NETIF_F_GSO_SIT		|
+				   NETIF_F_GSO_UDP_TUNNEL	|
+				   NETIF_F_GSO_UDP_TUNNEL_CSUM	|
+				   NETIF_F_SCTP_CRC		|
+				   NETIF_F_RXHASH		|
+				   NETIF_F_RXCSUM		|
+				   0;
 
-	netdev->hw_enc_features |= NETIF_F_IP_CSUM	       |
-				   NETIF_F_IPV6_CSUM	       |
-				   NETIF_F_TSO		       |
-				   NETIF_F_TSO6		       |
-				   NETIF_F_TSO_ECN	       |
-				   NETIF_F_GSO_GRE	       |
-				   NETIF_F_GSO_UDP_TUNNEL      |
-				   NETIF_F_GSO_UDP_TUNNEL_CSUM;
+	if (!(adapter->flags & I40EVF_FLAG_OUTER_UDP_CSUM_CAPABLE))
+		netdev->hw_enc_features ^= NETIF_F_GSO_UDP_TUNNEL_CSUM;
 
-	if (adapter->flags & I40EVF_FLAG_OUTER_UDP_CSUM_CAPABLE)
-		netdev->features |= NETIF_F_GSO_UDP_TUNNEL_CSUM;
+	/* record features VLANs can make use of */
+	netdev->vlan_features |= netdev->hw_enc_features;
 
-	/* always clear VLAN features because they can change at every reset */
-	netdev->features &= ~(I40EVF_VLAN_FEATURES);
-	/* copy netdev features into list of user selectable features */
-	netdev->hw_features |= netdev->features;
+	/* Write features and hw_features separately to avoid polluting
+	 * with, or dropping, features that are set when we registgered.
+	 */
+	netdev->hw_features |= netdev->hw_enc_features;
 
-	if (vfres->vf_offload_flags & I40E_VIRTCHNL_VF_OFFLOAD_VLAN) {
-		netdev->vlan_features = netdev->features;
-		netdev->features |= I40EVF_VLAN_FEATURES;
-	}
+	netdev->features |= netdev->hw_enc_features | I40EVF_VLAN_FEATURES;
+
+	/* disable VLAN features if not supported */
+	if (!(vfres->vf_offload_flags & I40E_VIRTCHNL_VF_OFFLOAD_VLAN))
+		netdev->features ^= I40EVF_VLAN_FEATURES;
 
 	adapter->vsi.id = adapter->vsi_res->vsi_id;
 

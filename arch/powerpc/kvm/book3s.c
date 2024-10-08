@@ -53,6 +53,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "ext_intr",    VCPU_STAT(ext_intr_exits) },
 	{ "queue_intr",  VCPU_STAT(queue_intr) },
 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), },
+	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll), },
 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
 	{ "pf_storage",  VCPU_STAT(pf_storage) },
 	{ "sp_storage",  VCPU_STAT(sp_storage) },
@@ -240,7 +241,8 @@ void kvmppc_core_queue_inst_storage(struct kvm_vcpu *vcpu, ulong flags)
 	kvmppc_book3s_queue_irqprio(vcpu, BOOK3S_INTERRUPT_INST_STORAGE);
 }
 
-int kvmppc_book3s_irqprio_deliver(struct kvm_vcpu *vcpu, unsigned int priority)
+static int kvmppc_book3s_irqprio_deliver(struct kvm_vcpu *vcpu,
+					 unsigned int priority)
 {
 	int deliver = 1;
 	int vec = 0;
@@ -364,7 +366,7 @@ int kvmppc_core_prepare_to_enter(struct kvm_vcpu *vcpu)
 }
 EXPORT_SYMBOL_GPL(kvmppc_core_prepare_to_enter);
 
-pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa, bool writing,
+kvm_pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa, bool writing,
 			bool *writable)
 {
 	ulong mp_pa = vcpu->arch.magic_page_pa & KVM_PAM;
@@ -377,9 +379,9 @@ pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa, bool writing,
 	gpa &= ~0xFFFULL;
 	if (unlikely(mp_pa) && unlikely((gpa & KVM_PAM) == mp_pa)) {
 		ulong shared_page = ((ulong)vcpu->arch.shared) & PAGE_MASK;
-		pfn_t pfn;
+		kvm_pfn_t pfn;
 
-		pfn = (pfn_t)virt_to_phys((void*)shared_page) >> PAGE_SHIFT;
+		pfn = (kvm_pfn_t)virt_to_phys((void*)shared_page) >> PAGE_SHIFT;
 		get_page(pfn_to_page(pfn));
 		if (writable)
 			*writable = true;

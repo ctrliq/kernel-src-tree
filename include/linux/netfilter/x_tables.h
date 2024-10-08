@@ -64,7 +64,7 @@ struct xt_mtchk_param {
 	void *matchinfo;
 	unsigned int hook_mask;
 	u_int8_t family;
-	bool nft_compat;
+	RH_KABI_EXTEND(bool nft_compat)
 };
 
 /**
@@ -95,7 +95,7 @@ struct xt_tgchk_param {
 	void *targinfo;
 	unsigned int hook_mask;
 	u_int8_t family;
-	bool nft_compat;
+	RH_KABI_EXTEND(bool nft_compat)
 };
 
 /* Target destructor parameters */
@@ -248,6 +248,10 @@ void xt_unregister_matches(struct xt_match *match, unsigned int n);
 int xt_check_entry_offsets(const void *base, const char *elems,
 			   unsigned int target_offset,
 			   unsigned int next_offset);
+
+unsigned int *xt_alloc_entry_offsets(unsigned int size);
+bool xt_find_jump_offset(const unsigned int *offsets,
+			 unsigned int target, unsigned int size);
 
 int xt_check_match(struct xt_mtchk_param *, unsigned int size, u_int8_t proto,
 		   bool inv_proto);

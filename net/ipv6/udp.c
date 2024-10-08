@@ -244,7 +244,7 @@ begin:
 				goto exact_match;
 		} else if (score == badness && reuseport) {
 			matches++;
-			if (((u64)hash * matches) >> 32 == 0)
+			if (reciprocal_scale(hash, matches) == 0)
 				result = sk;
 			hash = next_pseudo_random32(hash);
 		}
@@ -324,7 +324,7 @@ begin:
 			}
 		} else if (score == badness && reuseport) {
 			matches++;
-			if (((u64)hash * matches) >> 32 == 0)
+			if (reciprocal_scale(hash, matches) == 0)
 				result = sk;
 			hash = next_pseudo_random32(hash);
 		}
@@ -355,15 +355,27 @@ static struct sock *__udp6_lib_lookup_skb(struct sk_buff *skb,
 					  __be16 sport, __be16 dport,
 					  struct udp_table *udptable)
 {
-	struct sock *sk;
 	const struct ipv6hdr *iph = ipv6_hdr(skb);
+	struct sock *sk;
 
-	if (unlikely(sk = skb_steal_sock(skb)))
+	sk = skb_steal_sock(skb);
+	if (unlikely(sk))
 		return sk;
-	return __udp6_lib_lookup(dev_net(skb_dst(skb)->dev), &iph->saddr, sport,
+	return __udp6_lib_lookup(dev_net(skb->dev), &iph->saddr, sport,
 				 &iph->daddr, dport, inet6_iif(skb),
 				 udptable);
 }
+
+struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+				 __be16 sport, __be16 dport)
+{
+	const struct ipv6hdr *iph = ipv6_hdr(skb);
+
+	return __udp6_lib_lookup(dev_net(skb->dev), &iph->saddr, sport,
+				 &iph->daddr, dport, inet6_iif(skb),
+				 &udp_table);
+}
+EXPORT_SYMBOL_GPL(udp6_lib_lookup_skb);
 
 struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 			     const struct in6_addr *daddr, __be16 dport, int dif)
@@ -389,6 +401,7 @@ int udpv6_recvmsg(struct kiocb *iocb, struct sock *sk,
 	int peeked, off = 0;
 	int err;
 	int is_udplite = IS_UDPLITE(sk);
+	bool checksum_valid = false;
 	int is_udp4;
 	bool slow;
 
@@ -420,11 +433,12 @@ try_again:
 	 */
 
 	if (copied < ulen || UDP_SKB_CB(skb)->partial_cov) {
-		if (udp_lib_checksum_complete(skb))
+		checksum_valid = !udp_lib_checksum_complete(skb);
+		if (!checksum_valid)
 			goto csum_copy_err;
 	}
 
-	if (skb_csum_unnecessary(skb))
+	if (checksum_valid || skb_csum_unnecessary(skb))
 		err = skb_copy_datagram_iovec(skb, sizeof(struct udphdr),
 					      msg->msg_iov, copied);
 	else {
@@ -632,7 +646,7 @@ int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 
 		/* if we're overly short, let UDP handle it */
 		encap_rcv = ACCESS_ONCE(up->encap_rcv);
-		if (skb->len > sizeof(struct udphdr) && encap_rcv != NULL) {
+		if (encap_rcv) {
 			int ret;
 
 			/* Verify checksum before giving to encap */
@@ -700,44 +714,28 @@ drop:
 	return -1;
 }
 
-static struct sock *udp_v6_mcast_next(struct net *net, struct sock *sk,
-				      __be16 loc_port, const struct in6_addr *loc_addr,
-				      __be16 rmt_port, const struct in6_addr *rmt_addr,
-				      int dif)
+static bool __udp_v6_is_mcast_sock(struct net *net, struct sock *sk,
+				   __be16 loc_port, const struct in6_addr *loc_addr,
+				   __be16 rmt_port, const struct in6_addr *rmt_addr,
+				   int dif, unsigned short hnum)
 {
-	struct hlist_nulls_node *node;
-	struct sock *s = sk;
-	unsigned short num = ntohs(loc_port);
+	struct inet_sock *inet = inet_sk(sk);
 
-	sk_nulls_for_each_from(s, node) {
-		struct inet_sock *inet = inet_sk(s);
+	if (!net_eq(sock_net(sk), net))
+		return false;
 
-		if (!net_eq(sock_net(s), net))
-			continue;
-
-		if (udp_sk(s)->udp_port_hash == num &&
-		    s->sk_family == PF_INET6) {
-			if (inet->inet_dport) {
-				if (inet->inet_dport != rmt_port)
-					continue;
-			}
-			if (!ipv6_addr_any(&sk->sk_v6_daddr) &&
-			    !ipv6_addr_equal(&sk->sk_v6_daddr, rmt_addr))
-				continue;
-
-			if (s->sk_bound_dev_if && s->sk_bound_dev_if != dif)
-				continue;
-
-			if (!ipv6_addr_any(&sk->sk_v6_rcv_saddr)) {
-				if (!ipv6_addr_equal(&sk->sk_v6_rcv_saddr, loc_addr))
-					continue;
-			}
-			if (!inet6_mc_check(s, loc_addr, rmt_addr))
-				continue;
-			return s;
-		}
-	}
-	return NULL;
+	if (udp_sk(sk)->udp_port_hash != hnum ||
+	    sk->sk_family != PF_INET6 ||
+	    (inet->inet_dport && inet->inet_dport != rmt_port) ||
+	    (!ipv6_addr_any(&sk->sk_v6_daddr) &&
+		    !ipv6_addr_equal(&sk->sk_v6_daddr, rmt_addr)) ||
+	    (sk->sk_bound_dev_if && sk->sk_bound_dev_if != dif) ||
+	    (!ipv6_addr_any(&sk->sk_v6_rcv_saddr) &&
+		    !ipv6_addr_equal(&sk->sk_v6_rcv_saddr, loc_addr)))
+		return false;
+	if (!inet6_mc_check(sk, loc_addr, rmt_addr))
+		return false;
+	return true;
 }
 
 static void flush_stack(struct sock **stack, unsigned int count,
@@ -761,6 +759,7 @@ static void flush_stack(struct sock **stack, unsigned int count,
 
 		if (skb1 && udpv6_queue_rcv_skb(sk, skb1) <= 0)
 			skb1 = NULL;
+		sock_put(sk);
 	}
 	if (unlikely(skb1))
 		kfree_skb(skb1);
@@ -786,43 +785,51 @@ static int __udp6_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
 {
 	struct sock *sk, *stack[256 / sizeof(struct sock *)];
 	const struct udphdr *uh = udp_hdr(skb);
-	struct udp_hslot *hslot = udp_hashslot(udptable, net, ntohs(uh->dest));
-	int dif;
-	unsigned int i, count = 0;
+	struct hlist_nulls_node *node;
+	unsigned short hnum = ntohs(uh->dest);
+	struct udp_hslot *hslot = udp_hashslot(udptable, net, hnum);
+	int dif = inet6_iif(skb);
+	unsigned int count = 0, offset = offsetof(typeof(*sk), sk_nulls_node);
+	unsigned int hash2 = 0, hash2_any = 0, use_hash2 = (hslot->count > 10);
+
+	if (use_hash2) {
+		hash2_any = udp6_portaddr_hash(net, &in6addr_any, hnum) &
+			    udp_table.mask;
+		hash2 = udp6_portaddr_hash(net, daddr, hnum) & udp_table.mask;
+start_lookup:
+		hslot = &udp_table.hash2[hash2];
+		offset = offsetof(typeof(*sk), __sk_common.skc_portaddr_node);
+	}
 
 	spin_lock(&hslot->lock);
-	sk = sk_nulls_head(&hslot->head);
-	dif = inet6_iif(skb);
-	sk = udp_v6_mcast_next(net, sk, uh->dest, daddr, uh->source, saddr, dif);
-	while (sk) {
-		/* If zero checksum and no_check is not on for
-		 * the socket then skip it.
-		 */
-		if (uh->check || udp_sk(sk)->no_check6_rx)
+	sk_nulls_for_each_entry_offset(sk, node, &hslot->head, offset) {
+		if (__udp_v6_is_mcast_sock(net, sk,
+					   uh->dest, daddr,
+					   uh->source, saddr,
+					   dif, hnum) &&
+		    /* If zero checksum and no_check is not on for
+		     * the socket then skip it.
+		     */
+		    (uh->check || udp_sk(sk)->no_check6_rx)) {
+			if (unlikely(count == ARRAY_SIZE(stack))) {
+				flush_stack(stack, count, skb, ~0);
+				count = 0;
+			}
 			stack[count++] = sk;
-
-		sk = udp_v6_mcast_next(net, sk_nulls_next(sk), uh->dest, daddr,
-				       uh->source, saddr, dif);
-		if (unlikely(count == ARRAY_SIZE(stack))) {
-			if (!sk)
-				break;
-			flush_stack(stack, count, skb, ~0);
-			count = 0;
+			sock_hold(sk);
 		}
 	}
-	/*
-	 * before releasing the lock, we must take reference on sockets
-	 */
-	for (i = 0; i < count; i++)
-		sock_hold(stack[i]);
 
 	spin_unlock(&hslot->lock);
 
+	/* Also lookup *:port if we are using hash2 and haven't done so yet. */
+	if (use_hash2 && hash2 != hash2_any) {
+		hash2 = hash2_any;
+		goto start_lookup;
+	}
+
 	if (count) {
 		flush_stack(stack, count, skb, count - 1);
-
-		for (i = 0; i < count; i++)
-			sock_put(stack[i]);
 	} else {
 		kfree_skb(skb);
 	}
@@ -1099,6 +1106,7 @@ int udpv6_sendmsg(struct kiocb *iocb, struct sock *sk,
 	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) msg->msg_name;
 	struct in6_addr *daddr, *final_p, final;
 	struct ipv6_txoptions *opt = NULL;
+	struct ipv6_txoptions *opt_to_free = NULL;
 	struct ip6_flowlabel *flowlabel = NULL;
 	struct flowi6 fl6;
 	struct dst_entry *dst;
@@ -1252,8 +1260,10 @@ do_udp_sendmsg:
 			opt = NULL;
 		connected = 0;
 	}
-	if (opt == NULL)
-		opt = np->opt;
+	if (!opt) {
+		opt = txopt_get(np);
+		opt_to_free = opt;
+	}
 	if (flowlabel)
 		opt = fl6_merge_options(&opt_space, flowlabel, opt);
 	opt = ipv6_fixup_options(&opt_space, opt);
@@ -1368,6 +1378,7 @@ release_dst:
 out:
 	dst_release(dst);
 	fl6_sock_release(flowlabel);
+	txopt_put(opt_to_free);
 	if (!err)
 		return len;
 	/*
@@ -1525,6 +1536,7 @@ struct proto udpv6_prot = {
 	.sendmsg	   = udpv6_sendmsg,
 	.recvmsg	   = udpv6_recvmsg,
 	.backlog_rcv	   = __udpv6_queue_rcv_skb,
+	.release_cb	   = ip6_datagram_release_cb,
 	.hash		   = udp_lib_hash,
 	.unhash		   = udp_lib_unhash,
 	.rehash		   = udp_v6_rehash,

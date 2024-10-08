@@ -1049,6 +1049,9 @@ enum btrfs_raid_types {
 					 BTRFS_BLOCK_GROUP_RAID6 |   \
 					 BTRFS_BLOCK_GROUP_DUP |     \
 					 BTRFS_BLOCK_GROUP_RAID10)
+#define BTRFS_BLOCK_GROUP_RAID56_MASK	(BTRFS_BLOCK_GROUP_RAID5 |   \
+					 BTRFS_BLOCK_GROUP_RAID6)
+
 /*
  * We need a bit for restriper to be able to tell when chunks of type
  * SINGLE are available.  This "extended" profile format is used in
@@ -1331,7 +1334,7 @@ struct btrfs_block_group_cache {
 	/* for raid56, this is a full stripe, without parity */
 	unsigned long full_stripe_len;
 
-	unsigned int ro:1;
+	unsigned int ro;
 	unsigned int iref:1;
 	unsigned int has_caching_ctl:1;
 	unsigned int removed:1;
@@ -1528,6 +1531,12 @@ struct btrfs_fs_info {
 	struct mutex chunk_mutex;
 	struct mutex volume_mutex;
 
+	/*
+	 * this is taken to make sure we don't set block groups ro after
+	 * the free space cache has been allocated on them
+	 */
+	struct mutex ro_block_group_mutex;
+
 	/* this is used during read/modify/write to make sure
 	 * no two ios are trying to mod the same stripe at the same
 	 * time
@@ -1563,7 +1572,7 @@ struct btrfs_fs_info {
 
 	spinlock_t delayed_iput_lock;
 	struct list_head delayed_iputs;
-	struct rw_semaphore delayed_iput_sem;
+	struct mutex cleaner_delayed_iput_mutex;
 
 	/* this protects tree_mod_seq_list */
 	spinlock_t tree_mod_seq_lock;
@@ -3361,6 +3370,9 @@ static inline gfp_t btrfs_alloc_write_mask(struct address_space *mapping)
 }
 
 /* extent-tree.c */
+
+u64 btrfs_csum_bytes_to_leaves(struct btrfs_root *root, u64 csum_bytes);
+
 static inline u64 btrfs_calc_trans_metadata_size(struct btrfs_root *root,
 						 unsigned num_items)
 {
@@ -3418,7 +3430,8 @@ void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
 int btrfs_alloc_reserved_file_extent(struct btrfs_trans_handle *trans,
 				     struct btrfs_root *root,
 				     u64 root_objectid, u64 owner,
-				     u64 offset, struct btrfs_key *ins);
+				     u64 offset, u64 ram_bytes,
+				     struct btrfs_key *ins);
 int btrfs_alloc_logged_file_extent(struct btrfs_trans_handle *trans,
 				   struct btrfs_root *root,
 				   u64 root_objectid, u64 owner, u64 offset,
@@ -3437,7 +3450,7 @@ int btrfs_set_disk_extent_flags(struct btrfs_trans_handle *trans,
 int btrfs_free_extent(struct btrfs_trans_handle *trans,
 		      struct btrfs_root *root,
 		      u64 bytenr, u64 num_bytes, u64 parent, u64 root_objectid,
-		      u64 owner, u64 offset, int no_quota);
+		      u64 owner, u64 offset);
 
 int btrfs_free_reserved_extent(struct btrfs_root *root, u64 start, u64 len,
 			       int delalloc);
@@ -3450,8 +3463,10 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans,
 int btrfs_inc_extent_ref(struct btrfs_trans_handle *trans,
 			 struct btrfs_root *root,
 			 u64 bytenr, u64 num_bytes, u64 parent,
-			 u64 root_objectid, u64 owner, u64 offset, int no_quota);
+			 u64 root_objectid, u64 owner, u64 offset);
 
+int btrfs_start_dirty_block_groups(struct btrfs_trans_handle *trans,
+				   struct btrfs_root *root);
 int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans,
 				    struct btrfs_root *root);
 int btrfs_setup_space_cache(struct btrfs_trans_handle *trans,
@@ -3534,9 +3549,9 @@ int btrfs_cond_migrate_bytes(struct btrfs_fs_info *fs_info,
 void btrfs_block_rsv_release(struct btrfs_root *root,
 			     struct btrfs_block_rsv *block_rsv,
 			     u64 num_bytes);
-int btrfs_set_block_group_ro(struct btrfs_root *root,
+int btrfs_inc_block_group_ro(struct btrfs_root *root,
 			     struct btrfs_block_group_cache *cache);
-void btrfs_set_block_group_rw(struct btrfs_root *root,
+void btrfs_dec_block_group_ro(struct btrfs_root *root,
 			      struct btrfs_block_group_cache *cache);
 void btrfs_put_block_group_cache(struct btrfs_fs_info *info);
 u64 btrfs_account_ro_block_groups_free_space(struct btrfs_space_info *sinfo);

@@ -11,7 +11,7 @@
 #include "tests.h"
 #include "debug.h"
 #include "color.h"
-#include "parse-options.h"
+#include <subcmd/parse-options.h>
 #include "symbol.h"
 
 struct test __weak arch_tests[] = {
@@ -41,12 +41,6 @@ static struct test generic_tests[] = {
 		.desc = "parse events tests",
 		.func = test__parse_events,
 	},
-#if defined(__x86_64__) || defined(__i386__)
-	{
-		.desc = "x86 rdpmc test",
-		.func = test__rdpmc,
-	},
-#endif
 	{
 		.desc = "Validate PERF_RECORD_* events & perf_sample fields",
 		.func = test__PERF_RECORD,
@@ -107,12 +101,6 @@ static struct test generic_tests[] = {
 		.desc = "Test software clock events have valid period values",
 		.func = test__sw_clock_freq,
 	},
-#if defined(__x86_64__) || defined(__i386__)
-	{
-		.desc = "Test converting perf time to TSC",
-		.func = test__perf_time_to_tsc,
-	},
-#endif
 	{
 		.desc = "Test object code reading",
 		.func = test__code_reading,
@@ -129,14 +117,6 @@ static struct test generic_tests[] = {
 		.desc = "Test parsing with no sample_id_all bit set",
 		.func = test__parse_no_sample_id_all,
 	},
-#if defined(__x86_64__) || defined(__i386__) || defined(__arm__) || defined(__aarch64__)
-#ifdef HAVE_DWARF_UNWIND_SUPPORT
-	{
-		.desc = "Test dwarf unwind",
-		.func = test__dwarf_unwind,
-	},
-#endif
-#endif
 	{
 		.desc = "Test filtering hist entries",
 		.func = test__hists_filter,
@@ -178,6 +158,34 @@ static struct test generic_tests[] = {
 		.func = test__thread_map,
 	},
 	{
+		.desc = "Test topology in session",
+		.func = test_session_topology,
+	},
+	{
+		.desc = "Test thread map synthesize",
+		.func = test__thread_map_synthesize,
+	},
+	{
+		.desc = "Test cpu map synthesize",
+		.func = test__cpu_map_synthesize,
+	},
+	{
+		.desc = "Test stat config synthesize",
+		.func = test__synthesize_stat_config,
+	},
+	{
+		.desc = "Test stat synthesize",
+		.func = test__synthesize_stat,
+	},
+	{
+		.desc = "Test stat round synthesize",
+		.func = test__synthesize_stat_round,
+	},
+	{
+		.desc = "Test attr update synthesize",
+		.func = test__event_update,
+	},
+	{
 		.func = NULL,
 	},
 };
@@ -211,7 +219,7 @@ static bool perf_test__matches(struct test *test, int curr, int argc, const char
 	return false;
 }
 
-static int run_test(struct test *test)
+static int run_test(struct test *test, int subtest)
 {
 	int status, err = -1, child = fork();
 	char sbuf[STRERR_BUFSIZE];
@@ -224,7 +232,22 @@ static int run_test(struct test *test)
 
 	if (!child) {
 		pr_debug("test child forked, pid %d\n", getpid());
-		err = test->func();
+		if (!verbose) {
+			int nullfd = open("/dev/null", O_WRONLY);
+			if (nullfd >= 0) {
+				close(STDERR_FILENO);
+				close(STDOUT_FILENO);
+
+				dup2(nullfd, STDOUT_FILENO);
+				dup2(STDOUT_FILENO, STDERR_FILENO);
+				close(nullfd);
+			}
+		} else {
+			signal(SIGSEGV, sighandler_dump_stack);
+			signal(SIGFPE, sighandler_dump_stack);
+		}
+
+		err = test->func(subtest);
 		exit(err);
 	}
 
@@ -273,7 +296,7 @@ static int __cmd_test(int argc, const char *argv[], struct intlist *skiplist)
 		}
 
 		pr_debug("\n--- start ---\n");
-		err = run_test(t);
+		err = run_test(t, i);
 		pr_debug("---- end ----\n%s:", t->desc);
 
 		switch (err) {

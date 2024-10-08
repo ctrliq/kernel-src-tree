@@ -1431,6 +1431,7 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
 	if (!dentry)
 		return NULL;
 
+	dentry->d_flags |= DCACHE_RCUACCESS;
 	spin_lock(&parent->d_lock);
 	/*
 	 * don't need child lock because it is not subject
@@ -1472,7 +1473,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
 				DCACHE_OP_COMPARE	|
 				DCACHE_OP_REVALIDATE	|
 				DCACHE_OP_WEAK_REVALIDATE	|
-				DCACHE_OP_DELETE ));
+				DCACHE_OP_DELETE	|
+				DCACHE_OP_REAL));
 	dentry->d_op = op;
 	if (!op)
 		return;
@@ -1489,6 +1491,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
 	if (op->d_prune)
 		dentry->d_flags |= DCACHE_OP_PRUNE;
 
+	if (get_real_dop(dentry))
+		dentry->d_flags |= DCACHE_OP_REAL;
 }
 EXPORT_SYMBOL(d_set_d_op);
 
@@ -2250,7 +2254,6 @@ static void __d_rehash(struct dentry * entry, struct hlist_bl_head *b)
 {
 	BUG_ON(!d_unhashed(entry));
 	hlist_bl_lock(b);
-	entry->d_flags |= DCACHE_RCUACCESS;
 	hlist_bl_add_head_rcu(&entry->d_hash, b);
 	hlist_bl_unlock(b);
 }
@@ -2445,6 +2448,7 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
 
 	/* ... and switch the parents */
 	if (IS_ROOT(dentry)) {
+		dentry->d_flags |= DCACHE_RCUACCESS;
 		dentry->d_parent = target->d_parent;
 		target->d_parent = target;
 		INIT_LIST_HEAD(&target->d_u.d_child);
@@ -2584,6 +2588,7 @@ static void __d_materialise_dentry(struct dentry *dentry, struct dentry *anon)
 
 	dentry->d_parent = dentry;
 	list_del_init(&dentry->d_u.d_child);
+	anon->d_flags |= DCACHE_RCUACCESS;
 	anon->d_parent = dparent;
 	list_move(&anon->d_u.d_child, &dparent->d_subdirs);
 
@@ -3290,22 +3295,15 @@ void __init vfs_caches_init_early(void)
 	inode_init_early();
 }
 
-void __init vfs_caches_init(unsigned long mempages)
+void __init vfs_caches_init(void)
 {
-	unsigned long reserve;
-
-	/* Base hash sizes on available memory, with a reserve equal to
-           150% of current kernel size */
-
-	reserve = min((mempages - nr_free_pages()) * 3/2, mempages - 1);
-	mempages -= reserve;
-
 	names_cachep = kmem_cache_create("names_cache", PATH_MAX, 0,
 			SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
 
 	dcache_init();
 	inode_init();
-	files_init(mempages);
+	files_init();
+	files_maxfiles_init();
 	mnt_init();
 	bdev_cache_init();
 	chrdev_init();

@@ -19,6 +19,7 @@
 #include <linux/cpu.h>
 #include <linux/pm_runtime.h>
 #include <linux/suspend.h>
+#include <linux/kernel.h>
 #include "pci.h"
 
 extern bool kexec_in_progress;
@@ -309,11 +310,14 @@ const struct pci_device_id *pci_hw_vendor_status(
 						const struct pci_device_id *ids,
 						struct pci_dev *dev)
 {
+	char devinfo[64];
 	const struct pci_device_id *ret = pci_match_id(ids, dev);
 
-	if (ret)
-		dev_printk(KERN_WARNING, &dev->dev,
-			   "The hardware vendor of this device has identified it as being unsupported.  Driver updates and fixes are limited for this device.  Please contact your device's hardware vendor for additional information.\n");
+	if (ret) {
+		snprintf(devinfo, sizeof(devinfo), "%s %s",
+			 dev_driver_string(&dev->dev), dev_name(&dev->dev));
+		mark_hardware_deprecated(devinfo);
+	}
 
 	return ret;
 }

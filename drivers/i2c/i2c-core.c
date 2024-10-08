@@ -666,7 +666,8 @@ i2c_new_device(struct i2c_adapter *adap, struct i2c_board_info const *info)
 	client->dev.bus = &i2c_bus_type;
 	client->dev.type = &i2c_client_type;
 	client->dev.of_node = info->of_node;
-	ACPI_COMPANION_SET(&client->dev, info->acpi_node.companion);
+	device_rh_alloc(&client->dev);
+	set_rh_dev_fwnode(&client->dev, info->fwnode);
 
 	/* For 10-bit clients, add an arbitrary offset to avoid collisions */
 	dev_set_name(&client->dev, "%d-%04x", i2c_adapter_id(adap),
@@ -997,7 +998,7 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
 		return AE_OK;
 
 	memset(&info, 0, sizeof(info));
-	info.acpi_node.companion = adev;
+	info.fwnode = acpi_fwnode_handle(adev);
 	info.irq = -1;
 
 	INIT_LIST_HEAD(&resource_list);

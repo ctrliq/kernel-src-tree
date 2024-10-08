@@ -247,7 +247,7 @@ static bool ipoib_is_dev_match_addr_rcu(const struct sockaddr *addr,
 		if (!in_dev)
 			return false;
 
-		ret_addr = inet_confirm_addr(net, in_dev, 0,
+		ret_addr = inet_confirm_addr(in_dev, 0,
 					     addr_in->sin_addr.s_addr,
 					     RT_SCOPE_HOST);
 		in_dev_put(in_dev);
@@ -462,7 +462,7 @@ int ipoib_set_mode(struct net_device *dev, const char *buf)
 		netdev_update_features(dev);
 		dev_set_mtu(dev, ipoib_cm_max_mtu(dev));
 		rtnl_unlock();
-		priv->tx_wr.send_flags &= ~IB_SEND_IP_CSUM;
+		priv->tx_wr.wr.send_flags &= ~IB_SEND_IP_CSUM;
 
 		ipoib_flush_paths(dev);
 		rtnl_lock();
@@ -1636,6 +1636,7 @@ static const struct header_ops ipoib_header_ops = {
 };
 
 static const struct net_device_ops ipoib_netdev_ops_pf = {
+	.ndo_size		 = sizeof(struct net_device_ops),
 	.ndo_uninit		 = ipoib_uninit,
 	.ndo_open		 = ipoib_open,
 	.ndo_stop		 = ipoib_stop,
@@ -1648,7 +1649,7 @@ static const struct net_device_ops ipoib_netdev_ops_pf = {
 	.ndo_set_vf_link_state	 = ipoib_set_vf_link_state,
 	.ndo_get_vf_config	 = ipoib_get_vf_config,
 	.ndo_get_vf_stats	 = ipoib_get_vf_stats,
-	.ndo_set_vf_guid	 = ipoib_set_vf_guid,
+	.extended.ndo_set_vf_guid	 = ipoib_set_vf_guid,
 };
 
 static const struct net_device_ops ipoib_netdev_ops_vf = {
@@ -1823,26 +1824,7 @@ int ipoib_add_pkey_attr(struct net_device *dev)
 
 int ipoib_set_dev_features(struct ipoib_dev_priv *priv, struct ib_device *hca)
 {
-	struct ib_device_attr *device_attr;
-	int result = -ENOMEM;
-
-	device_attr = kmalloc(sizeof *device_attr, GFP_KERNEL);
-	if (!device_attr) {
-		printk(KERN_WARNING "%s: allocation of %zu bytes failed\n",
-		       hca->name, sizeof *device_attr);
-		return result;
-	}
-
-	result = ib_query_device(hca, device_attr);
-	if (result) {
-		printk(KERN_WARNING "%s: ib_query_device failed (ret = %d)\n",
-		       hca->name, result);
-		kfree(device_attr);
-		return result;
-	}
-	priv->hca_caps = device_attr->device_cap_flags;
-
-	kfree(device_attr);
+	priv->hca_caps = hca->attrs.device_cap_flags;
 
 	if (priv->hca_caps & IB_DEVICE_UD_IP_CSUM) {
 		priv->dev->hw_features = NETIF_F_SG |
@@ -1906,7 +1888,7 @@ static struct net_device *ipoib_add_port(const char *format,
 	priv->dev->broadcast[8] = priv->pkey >> 8;
 	priv->dev->broadcast[9] = priv->pkey & 0xff;
 
-	result = ib_query_gid(hca, port, 0, &priv->local_gid);
+	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
 	if (result) {
 		printk(KERN_WARNING "%s: ib_query_gid port %d failed (ret = %d)\n",
 		       hca->name, port, result);

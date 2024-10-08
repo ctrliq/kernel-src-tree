@@ -78,7 +78,7 @@ enum i40e_debug_mask {
 	I40E_DEBUG_DCB			= 0x00000400,
 	I40E_DEBUG_DIAG			= 0x00000800,
 	I40E_DEBUG_FD			= 0x00001000,
-
+	I40E_DEBUG_IWARP		= 0x00F00000,
 	I40E_DEBUG_AQ_MESSAGE		= 0x01000000,
 	I40E_DEBUG_AQ_DESCRIPTOR	= 0x02000000,
 	I40E_DEBUG_AQ_DESC_BUFFER	= 0x04000000,
@@ -160,6 +160,7 @@ enum i40e_vsi_type {
 	I40E_VSI_MIRROR	= 5,
 	I40E_VSI_SRIOV	= 6,
 	I40E_VSI_FDIR	= 7,
+	I40E_VSI_IWARP	= 8,
 	I40E_VSI_TYPE_UNKNOWN
 };
 
@@ -183,6 +184,24 @@ struct i40e_link_status {
 	bool crc_enable;
 	u8 pacing;
 	u8 requested_speeds;
+	u8 module_type[3];
+	/* 1st byte: module identifier */
+#define I40E_MODULE_TYPE_SFP		0x03
+#define I40E_MODULE_TYPE_QSFP		0x0D
+	/* 2nd byte: ethernet compliance codes for 10/40G */
+#define I40E_MODULE_TYPE_40G_ACTIVE	0x01
+#define I40E_MODULE_TYPE_40G_LR4	0x02
+#define I40E_MODULE_TYPE_40G_SR4	0x04
+#define I40E_MODULE_TYPE_40G_CR4	0x08
+#define I40E_MODULE_TYPE_10G_BASE_SR	0x10
+#define I40E_MODULE_TYPE_10G_BASE_LR	0x20
+#define I40E_MODULE_TYPE_10G_BASE_LRM	0x40
+#define I40E_MODULE_TYPE_10G_BASE_ER	0x80
+	/* 3rd byte: ethernet compliance codes for 1G */
+#define I40E_MODULE_TYPE_1000BASE_SX	0x01
+#define I40E_MODULE_TYPE_1000BASE_LX	0x02
+#define I40E_MODULE_TYPE_1000BASE_CX	0x04
+#define I40E_MODULE_TYPE_1000BASE_T	0x08
 };
 
 enum i40e_aq_capabilities_phy_type {
@@ -536,6 +555,7 @@ struct i40e_hw {
 	struct i40e_aq_desc nvm_wb_desc;
 	struct i40e_virt_mem nvm_buff;
 	bool nvm_release_on_done;
+	u16 nvm_wait_opcode;
 
 	/* HMC info */
 	struct i40e_hmc_info hmc; /* HMC info struct */
@@ -1097,6 +1117,10 @@ enum i40e_filter_program_desc_pcmd {
 						 I40E_TXD_FLTR_QW1_CMD_SHIFT)
 #define I40E_TXD_FLTR_QW1_FD_STATUS_MASK (0x3ULL << \
 					  I40E_TXD_FLTR_QW1_FD_STATUS_SHIFT)
+
+#define I40E_TXD_FLTR_QW1_ATR_SHIFT	(0xEULL + \
+					 I40E_TXD_FLTR_QW1_CMD_SHIFT)
+#define I40E_TXD_FLTR_QW1_ATR_MASK	BIT_ULL(I40E_TXD_FLTR_QW1_ATR_SHIFT)
 
 #define I40E_TXD_FLTR_QW1_ATR_SHIFT	(0xEULL + \
 					 I40E_TXD_FLTR_QW1_CMD_SHIFT)

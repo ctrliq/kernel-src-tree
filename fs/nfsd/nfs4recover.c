@@ -263,6 +263,7 @@ nfsd4_list_rec_dir(recdir_func *f, struct nfsd_net *nn)
 	const struct cred *original_cred;
 	struct dentry *dir = nn->rec_file->f_path.dentry;
 	LIST_HEAD(names);
+	struct name_list *entry, *tmp;
 	int status;
 
 	status = nfs4_save_creds(&original_cred);
@@ -277,9 +278,7 @@ nfsd4_list_rec_dir(recdir_func *f, struct nfsd_net *nn)
 
 	status = vfs_readdir(nn->rec_file, nfsd4_build_namelist, &names);
 	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_PARENT);
-	while (!list_empty(&names)) {
-		struct name_list *entry;
-		entry = list_entry(names.next, struct name_list, list);
+	list_for_each_entry_safe(entry, tmp, &names, list) {
 		if (!status) {
 			struct dentry *dentry;
 			dentry = lookup_one_len(entry->name, dir, HEXDIR_LEN-1);
@@ -295,6 +294,12 @@ nfsd4_list_rec_dir(recdir_func *f, struct nfsd_net *nn)
 	}
 	mutex_unlock(&dir->d_inode->i_mutex);
 	nfs4_reset_creds(original_cred);
+
+	list_for_each_entry_safe(entry, tmp, &names, list) {
+		dprintk("NFSD: %s. Left entry %s\n", __func__, entry->name);
+		list_del(&entry->list);
+		kfree(entry);
+	}
 	return status;
 }
 
@@ -1255,17 +1260,11 @@ nfsd4_umh_cltrack_init(struct net *net)
 	return ret;
 }
 
-static int nfsd_wait_bit_uninterruptible(void *word)
-{
-	io_schedule();
-	return 0;
-}
-
 static void
 nfsd4_cltrack_upcall_lock(struct nfs4_client *clp)
 {
 	wait_on_bit_lock(&clp->cl_flags, NFSD4_CLIENT_UPCALL_LOCK,
-			 nfsd_wait_bit_uninterruptible, TASK_UNINTERRUPTIBLE);
+			 TASK_UNINTERRUPTIBLE);
 }
 
 static void

@@ -87,6 +87,7 @@ extern int qla2xxx_mctp_dump(scsi_qla_host_t *);
 extern int
 qla2x00_alloc_outstanding_cmds(struct qla_hw_data *, struct req_que *);
 extern int qla2x00_init_rings(scsi_qla_host_t *);
+extern uint8_t qla27xx_find_valid_image(struct scsi_qla_host *);
 
 /*
  * Global Data in qla_os.c source file.
@@ -116,6 +117,7 @@ extern int ql2xdontresethba;
 extern unsigned int ql2xmaxlun;
 extern int ql2xmdcapmask;
 extern int ql2xmdenable;
+extern int ql2xfwholdabts;
 
 extern int qla2x00_loop_reset(scsi_qla_host_t *);
 extern void qla2x00_abort_all_cmds(scsi_qla_host_t *, int);
@@ -158,6 +160,9 @@ extern int __qla83xx_set_drv_presence(scsi_qla_host_t *vha);
 extern int qla83xx_clear_drv_presence(scsi_qla_host_t *vha);
 extern int __qla83xx_clear_drv_presence(scsi_qla_host_t *vha);
 extern int qla2x00_post_uevent_work(struct scsi_qla_host *, u32);
+
+extern int qla2x00_post_uevent_work(struct scsi_qla_host *, u32);
+extern void qla2x00_disable_board_on_pci_error(struct work_struct *);
 
 /*
  * Global Functions in qla_mid.c source file.
@@ -465,6 +470,8 @@ extern uint8_t *qla25xx_read_nvram_data(scsi_qla_host_t *, uint8_t *, uint32_t,
 extern int qla25xx_write_nvram_data(scsi_qla_host_t *, uint8_t *, uint32_t,
 				    uint32_t);
 extern int qla2x00_is_a_vp_did(scsi_qla_host_t *, uint32_t);
+bool qla2x00_check_reg32_for_disconnect(scsi_qla_host_t *, uint32_t);
+bool qla2x00_check_reg16_for_disconnect(scsi_qla_host_t *, uint16_t);
 
 extern int qla2x00_beacon_on(struct scsi_qla_host *);
 extern int qla2x00_beacon_off(struct scsi_qla_host *);
@@ -561,10 +568,9 @@ struct fc_function_template;
 extern struct fc_function_template qla2xxx_transport_functions;
 extern struct fc_function_template qla2xxx_transport_vport_functions;
 extern void qla2x00_alloc_sysfs_attr(scsi_qla_host_t *);
-extern void qla2x00_free_sysfs_attr(scsi_qla_host_t *);
+extern void qla2x00_free_sysfs_attr(scsi_qla_host_t *, bool);
 extern void qla2x00_init_host_attr(scsi_qla_host_t *);
 extern void qla2x00_alloc_sysfs_attr(scsi_qla_host_t *);
-extern void qla2x00_free_sysfs_attr(scsi_qla_host_t *);
 extern int qla2x00_loopback_test(scsi_qla_host_t *, struct msg_echo_lb *, uint16_t *);
 extern int qla2x00_echo_test(scsi_qla_host_t *,
 	struct msg_echo_lb *, uint16_t *);

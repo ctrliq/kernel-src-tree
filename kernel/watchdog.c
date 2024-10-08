@@ -19,6 +19,8 @@
 #include <linux/sysctl.h>
 #include <linux/smpboot.h>
 #include <linux/sched/rt.h>
+#include <linux/tick.h>
+#include <linux/workqueue.h>
 
 #include <asm/irq_regs.h>
 #include <linux/kvm_para.h>
@@ -56,11 +58,37 @@ int __read_mostly watchdog_thresh = 10;
 
 #ifdef CONFIG_SMP
 int __read_mostly sysctl_softlockup_all_cpu_backtrace;
+int __read_mostly sysctl_hardlockup_all_cpu_backtrace;
 #else
 #define sysctl_softlockup_all_cpu_backtrace 0
+#define sysctl_hardlockup_all_cpu_backtrace 0
 #endif
+struct cpumask watchdog_cpumask __read_mostly;
 
+/* Helper for online, unparked cpus. */
+#define for_each_watchdog_cpu(cpu) \
+	for_each_cpu_and((cpu), cpu_online_mask, &watchdog_cpumask)
+
+/*
+ * The 'watchdog_running' variable is set to 1 when the watchdog threads
+ * are registered/started and is set to 0 when the watchdog threads are
+ * unregistered/stopped, so it is an indicator whether the threads exist.
+ */
 static int __read_mostly watchdog_running;
+/*
+ * If a subsystem has a need to deactivate the watchdog temporarily, it
+ * can use the suspend/resume interface to achieve this. The content of
+ * the 'watchdog_suspended' variable reflects this state. Existing threads
+ * are parked/unparked by the lockup_detector_{suspend|resume} functions
+ * (see comment blocks pertaining to those functions for further details).
+ *
+ * 'watchdog_suspended' also prevents threads from being registered/started
+ * or unregistered/stopped via parameters in /proc/sys/kernel, so the state
+ * of 'watchdog_running' cannot change while the watchdog is deactivated
+ * temporarily (see related code in 'proc' handlers).
+ */
+static int __read_mostly watchdog_suspended;
+
 static u64 __read_mostly sample_period;
 
 static DEFINE_PER_CPU(unsigned long, watchdog_touch_ts);
@@ -86,8 +114,7 @@ static unsigned long soft_lockup_nmi_warn;
 #ifdef CONFIG_HARDLOCKUP_DETECTOR
 unsigned int __read_mostly hardlockup_panic =
 			CONFIG_BOOTPARAM_HARDLOCKUP_PANIC_VALUE;
-
-static bool hardlockup_detector_enabled = true;
+static unsigned long hardlockup_allcpu_dumped;
 /*
  * We may not want to enable hard lockup detection by default in all cases,
  * for example when running the kernel as a guest on a hypervisor. In these
@@ -96,14 +123,9 @@ static bool hardlockup_detector_enabled = true;
  * kernel command line parameters are parsed, because otherwise it is not
  * possible to override this in hardlockup_panic_setup().
  */
-void watchdog_enable_hardlockup_detector(bool val)
+void hardlockup_detector_disable(void)
 {
-	hardlockup_detector_enabled = val;
-}
-
-bool watchdog_hardlockup_detector_is_enabled(void)
-{
-	return hardlockup_detector_enabled;
+	watchdog_enabled &= ~NMI_WATCHDOG_ENABLED;
 }
 
 static int __init hardlockup_panic_setup(char *str)
@@ -113,15 +135,9 @@ static int __init hardlockup_panic_setup(char *str)
 	else if (!strncmp(str, "nopanic", 7))
 		hardlockup_panic = 0;
 	else if (!strncmp(str, "0", 1))
-		watchdog_user_enabled = 0;
-	else if (!strncmp(str, "1", 1) || !strncmp(str, "2", 1)) {
-		/*
-		 * Setting 'nmi_watchdog=1' or 'nmi_watchdog=2' (legacy option)
-		 * has the same effect.
-		 */
-		watchdog_user_enabled = 1;
-		watchdog_enable_hardlockup_detector(true);
-	}
+		watchdog_enabled = 0;
+	else if (!strncmp(str, "1", 1) || !strncmp(str, "2", 1))
+		watchdog_enabled = NMI_WATCHDOG_ENABLED|SOFT_WATCHDOG_ENABLED;
 	return 1;
 }
 __setup("nmi_watchdog=", hardlockup_panic_setup);
@@ -140,19 +156,18 @@ __setup("softlockup_panic=", softlockup_panic_setup);
 
 static int __init nowatchdog_setup(char *str)
 {
-	watchdog_user_enabled = 0;
+	watchdog_enabled = 0;
 	return 1;
 }
 __setup("nowatchdog", nowatchdog_setup);
 
-/* deprecated */
 static int __init nosoftlockup_setup(char *str)
 {
-	watchdog_user_enabled = 0;
+	watchdog_enabled = 0;
 	return 1;
 }
 __setup("nosoftlockup", nosoftlockup_setup);
-/*  */
+
 #ifdef CONFIG_SMP
 static int __init softlockup_all_cpu_backtrace_setup(char *str)
 {
@@ -161,6 +176,13 @@ static int __init softlockup_all_cpu_backtrace_setup(char *str)
 	return 1;
 }
 __setup("softlockup_all_cpu_backtrace=", softlockup_all_cpu_backtrace_setup);
+static int __init hardlockup_all_cpu_backtrace_setup(char *str)
+{
+	sysctl_hardlockup_all_cpu_backtrace =
+		!!simple_strtol(str, NULL, 0);
+	return 1;
+}
+__setup("hardlockup_all_cpu_backtrace=", hardlockup_all_cpu_backtrace_setup);
 #endif
 
 /*
@@ -203,9 +225,23 @@ static void __touch_watchdog(void)
 	__this_cpu_write(watchdog_touch_ts, get_timestamp());
 }
 
-void touch_softlockup_watchdog(void)
+/**
+ * touch_softlockup_watchdog_sched - touch watchdog on scheduler stalls
+ *
+ * Call when the scheduler may have stalled for legitimate reasons
+ * preventing the watchdog task from executing - e.g. the scheduler
+ * entering idle state.  This should only be used for scheduler events.
+ * Use touch_softlockup_watchdog() for everything else.
+ */
+void touch_softlockup_watchdog_sched(void)
 {
 	__this_cpu_write(watchdog_touch_ts, 0);
+}
+
+void touch_softlockup_watchdog(void)
+{
+	touch_softlockup_watchdog_sched();
+	wq_watchdog_touch(raw_smp_processor_id());
 }
 EXPORT_SYMBOL(touch_softlockup_watchdog);
 
@@ -218,8 +254,9 @@ void touch_all_softlockup_watchdogs(void)
 	 * do we care if a 0 races with a timestamp?
 	 * all it means is the softlock check starts one cycle later
 	 */
-	for_each_online_cpu(cpu)
+	for_each_watchdog_cpu(cpu)
 		per_cpu(watchdog_touch_ts, cpu) = 0;
+	wq_watchdog_touch(-1);
 }
 
 #ifdef CONFIG_HARDLOCKUP_DETECTOR
@@ -263,10 +300,11 @@ static int is_softlockup(unsigned long touch_ts)
 {
 	unsigned long now = get_timestamp();
 
-	/* Warn about unreasonable delays: */
-	if (time_after(now, touch_ts + get_softlockup_thresh()))
-		return now - touch_ts;
-
+	if ((watchdog_enabled & SOFT_WATCHDOG_ENABLED) && watchdog_thresh){
+		/* Warn about unreasonable delays. */
+		if (time_after(now, touch_ts + get_softlockup_thresh()))
+			return now - touch_ts;
+	}
 	return 0;
 }
 
@@ -301,17 +339,30 @@ static void watchdog_overflow_callback(struct perf_event *event,
 	 */
 	if (is_hardlockup()) {
 		int this_cpu = smp_processor_id();
+		struct pt_regs *regs = get_irq_regs();
 
 		/* only print hardlockups once */
 		if (__this_cpu_read(hard_watchdog_warn) == true)
 			return;
 
-		if (hardlockup_panic)
-			panic("Watchdog detected hard LOCKUP on cpu %d",
-			      this_cpu);
+		pr_emerg("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+		print_modules();
+		print_irqtrace_events(current);
+		if (regs)
+			show_regs(regs);
 		else
-			WARN(1, "Watchdog detected hard LOCKUP on cpu %d",
-			     this_cpu);
+			dump_stack();
+
+		/*
+		 * Perform all-CPU dump only once to avoid multiple hardlockups
+		 * generating interleaving traces
+		 */
+		if (sysctl_hardlockup_all_cpu_backtrace &&
+				!test_and_set_bit(0, &hardlockup_allcpu_dumped))
+			trigger_allbutself_cpu_backtrace();
+
+		if (hardlockup_panic)
+			nmi_panic(regs, "Hard LOCKUP");
 
 		__this_cpu_write(hard_watchdog_warn, true);
 		return;
@@ -534,14 +585,9 @@ static int watchdog_nmi_enable(unsigned int cpu)
 	struct perf_event_attr *wd_attr;
 	struct perf_event *event = per_cpu(watchdog_ev, cpu);
 
-	/*
-	 * Some kernels need to default hard lockup detection to
-	 * 'disabled', for example a guest on a hypervisor.
-	 */
-	if (!watchdog_hardlockup_detector_is_enabled()) {
-		event = ERR_PTR(-ENOENT);
-		goto handle_err;
-	}
+	/* nothing to do if the hard lockup detector is disabled */
+	if (!(watchdog_enabled & NMI_WATCHDOG_ENABLED))
+		goto out;
 
 	/* is it already setup and enabled? */
 	if (event && event->state > PERF_EVENT_STATE_OFF)
@@ -557,7 +603,6 @@ static int watchdog_nmi_enable(unsigned int cpu)
 	/* Try to register using hardware perf events */
 	event = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
 
-handle_err:
 	/* save cpu0 error for future comparision */
 	if (cpu == 0 && IS_ERR(event))
 		cpu0_err = PTR_ERR(event);
@@ -625,46 +670,9 @@ static void watchdog_nmi_disable(unsigned int cpu)
 	}
 }
 
-void watchdog_nmi_enable_all(void)
-{
-	int cpu;
-
-	mutex_lock(&watchdog_proc_mutex);
-
-	if (!(watchdog_enabled & NMI_WATCHDOG_ENABLED))
-		goto unlock;
-
-	get_online_cpus();
-	for_each_online_cpu(cpu)
-		watchdog_nmi_enable(cpu);
-	put_online_cpus();
-
-unlock:
-	mutex_unlock(&watchdog_proc_mutex);
-}
-
-void watchdog_nmi_disable_all(void)
-{
-	int cpu;
-
-	mutex_lock(&watchdog_proc_mutex);
-
-	if (!watchdog_running)
-		goto unlock;
-
-	get_online_cpus();
-	for_each_online_cpu(cpu)
-		watchdog_nmi_disable(cpu);
-	put_online_cpus();
-
-unlock:
-	mutex_unlock(&watchdog_proc_mutex);
-}
 #else
 static int watchdog_nmi_enable(unsigned int cpu) { return 0; }
 static void watchdog_nmi_disable(unsigned int cpu) { return; }
-void watchdog_nmi_enable_all(void) {}
-void watchdog_nmi_disable_all(void) {}
 #endif /* CONFIG_HARDLOCKUP_DETECTOR */
 
 static struct smp_hotplug_thread watchdog_threads = {
@@ -717,49 +725,71 @@ static void watchdog_unpark_threads(void)
 		kthread_unpark(per_cpu(softlockup_watchdog, cpu));
 }
 
-static void restart_watchdog_hrtimer(void *info)
+/*
+ * Suspend the hard and soft lockup detector by parking the watchdog threads.
+ */
+int lockup_detector_suspend(void)
 {
-	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
-	int ret;
-
-	/*
-	 * No need to cancel and restart hrtimer if it is currently executing
-	 * because it will reprogram itself with the new period now.
-	 * We should never see it unqueued here because we are running per-cpu
-	 * with interrupts disabled.
-	 */
-	ret = hrtimer_try_to_cancel(hrtimer);
-	if (ret == 1)
-		hrtimer_start(hrtimer, ns_to_ktime(sample_period),
-				HRTIMER_MODE_REL_PINNED);
-}
-
-static void update_timers(int cpu)
-{
-	/*
-	 * Make sure that perf event counter will adopt to a new
-	 * sampling period. Updating the sampling period directly would
-	 * be much nicer but we do not have an API for that now so
-	 * let's use a big hammer.
-	 * Hrtimer will adopt the new period on the next tick but this
-	 * might be late already so we have to restart the timer as well.
-	 */
-	watchdog_nmi_disable(cpu);
-	smp_call_function_single(cpu, restart_watchdog_hrtimer, NULL, 1);
-	watchdog_nmi_enable(cpu);
-}
-
-static void update_timers_all_cpus(void)
-{
-	int cpu;
+	int ret = 0;
 
 	get_online_cpus();
-	for_each_online_cpu(cpu)
-		update_timers(cpu);
+	mutex_lock(&watchdog_proc_mutex);
+	/*
+	 * Multiple suspend requests can be active in parallel (counted by
+	 * the 'watchdog_suspended' variable). If the watchdog threads are
+	 * running, the first caller takes care that they will be parked.
+	 * The state of 'watchdog_running' cannot change while a suspend
+	 * request is active (see related code in 'proc' handlers).
+	 */
+	if (watchdog_running && !watchdog_suspended)
+		ret = watchdog_park_threads();
+
+	if (ret == 0)
+		watchdog_suspended++;
+	else {
+		watchdog_disable_all_cpus();
+		pr_err("Failed to suspend lockup detectors, disabled\n");
+		watchdog_enabled = 0;
+	}
+
+	mutex_unlock(&watchdog_proc_mutex);
+
+	return ret;
+}
+
+/*
+ * Resume the hard and soft lockup detector by unparking the watchdog threads.
+ */
+void lockup_detector_resume(void)
+{
+	mutex_lock(&watchdog_proc_mutex);
+
+	watchdog_suspended--;
+	/*
+	 * The watchdog threads are unparked if they were previously running
+	 * and if there is no more active suspend request.
+	 */
+	if (watchdog_running && !watchdog_suspended)
+		watchdog_unpark_threads();
+
+	mutex_unlock(&watchdog_proc_mutex);
 	put_online_cpus();
 }
 
-static int watchdog_enable_all_cpus(bool sample_period_changed)
+static int update_watchdog_all_cpus(void)
+{
+	int ret;
+
+	ret = watchdog_park_threads();
+	if (ret)
+		return ret;
+
+	watchdog_unpark_threads();
+
+	return 0;
+}
+
+static int watchdog_enable_all_cpus(void)
 {
 	int err = 0;
 
@@ -767,11 +797,27 @@ static int watchdog_enable_all_cpus(bool sample_period_changed)
 		err = smpboot_register_percpu_thread(&watchdog_threads);
 		if (err)
 			pr_err("Failed to create watchdog threads, disabled\n");
-		else
+		else {
+			if (smpboot_update_cpumask_percpu_thread(
+				    &watchdog_threads, &watchdog_cpumask))
+				pr_err("Failed to set cpumask for watchdog threads\n");
 			watchdog_running = 1;
-	} else if (sample_period_changed) {
-		update_timers_all_cpus();
+		}
+	} else {
+		/*
+		 * Enable/disable the lockup detectors or
+		 * change the sample period 'on the fly'.
+		 */
+		err = update_watchdog_all_cpus();
+
+		if (err) {
+			watchdog_disable_all_cpus();
+			pr_err("Failed to update lockup detectors, disabled\n");
+		}
 	}
+
+	if (err)
+		watchdog_enabled = 0;
 
 	return err;
 }
@@ -801,7 +847,7 @@ static int proc_watchdog_update(void)
 	 * or disabled 'on the fly'.
 	 */
 	if (watchdog_enabled && watchdog_thresh)
-		err = watchdog_enable_all_cpus(true);
+		err = watchdog_enable_all_cpus();
 	else
 		watchdog_disable_all_cpus();
 
@@ -829,6 +875,12 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 
 	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
+
+	if (watchdog_suspended) {
+		/* no parameter changes allowed while watchdog is suspended */
+		err = -EAGAIN;
+		goto out;
+	}
 
 	/*
 	 * If the parameter is being read return the state of the corresponding
@@ -863,12 +915,13 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 		} while (cmpxchg(&watchdog_enabled, old, new) != old);
 
 		/*
-		 * Update the run state of the lockup detectors.
-		 * Restore 'watchdog_enabled' on failure.
+		 * Update the run state of the lockup detectors. There is _no_
+		 * need to check the value returned by proc_watchdog_update()
+		 * and to restore the previous value of 'watchdog_enabled' as
+		 * both lockup detectors are disabled if proc_watchdog_update()
+		 * returns an error.
 		 */
 		err = proc_watchdog_update();
-		if (err)
-			watchdog_enabled = old;
 	}
 out:
 	mutex_unlock(&watchdog_proc_mutex);
@@ -892,10 +945,11 @@ int proc_watchdog(struct ctl_table *table, int write,
 int proc_nmi_watchdog(struct ctl_table *table, int write,
 		      void __user *buffer, size_t *lenp, loff_t *ppos)
 {
-	return proc_watchdog_common(NMI_WATCHDOG_ENABLED,
+	return proc_watchdog_common(NMI_WATCHDOG_ENABLED|SOFT_WATCHDOG_ENABLED,
 				    table, write, buffer, lenp, ppos);
 }
 
+#if 0
 /*
  * /proc/sys/kernel/soft_watchdog
  */
@@ -905,6 +959,7 @@ int proc_soft_watchdog(struct ctl_table *table, int write,
 	return proc_watchdog_common(SOFT_WATCHDOG_ENABLED,
 				    table, write, buffer, lenp, ppos);
 }
+#endif
 
 /*
  * /proc/sys/kernel/watchdog_thresh
@@ -916,6 +971,12 @@ int proc_watchdog_thresh(struct ctl_table *table, int write,
 
 	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
+
+	if (watchdog_suspended) {
+		/* no parameter changes allowed while watchdog is suspended */
+		err = -EAGAIN;
+		goto out;
+	}
 
 	old = ACCESS_ONCE(watchdog_thresh);
 	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
@@ -939,59 +1000,66 @@ out:
 }
 
 /*
- * proc handler for /proc/sys/kernel/nmi_watchdog,watchdog_thresh
+ * The cpumask is the mask of possible cpus that the watchdog can run
+ * on, not the mask of cpus it is actually running on.  This allows the
+ * user to specify a mask that will include cpus that have not yet
+ * been brought online, if desired.
  */
-
-int proc_dowatchdog(struct ctl_table *table, int write,
-		    void __user *buffer, size_t *lenp, loff_t *ppos)
+int proc_watchdog_cpumask(struct ctl_table *table, int write,
+			  void __user *buffer, size_t *lenp, loff_t *ppos)
 {
-	int err, old_thresh, old_enabled;
-	bool old_hardlockup;
+	int err;
 
 	get_online_cpus();
 	mutex_lock(&watchdog_proc_mutex);
-	old_thresh = ACCESS_ONCE(watchdog_thresh);
-	old_enabled = ACCESS_ONCE(watchdog_user_enabled);
-	old_hardlockup = watchdog_hardlockup_detector_is_enabled();
 
-	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
-	if (err || !write)
+	if (watchdog_suspended) {
+		/* no parameter changes allowed while watchdog is suspended */
+		err = -EAGAIN;
 		goto out;
+	}
 
-	set_sample_period();
-	/*
-	 * Watchdog threads shouldn't be enabled if they are
-	 * disabled. The 'watchdog_running' variable check in
-	 * watchdog_*_all_cpus() function takes care of this.
-	 */
-	if (watchdog_user_enabled && watchdog_thresh) {
-		/*
-		 * Prevent a change in watchdog_thresh accidentally overriding
-		 * the enablement of the hardlockup detector.
-		 */
-		if (watchdog_user_enabled != old_enabled)
-			watchdog_enable_hardlockup_detector(true);
-		err = watchdog_enable_all_cpus(old_thresh != watchdog_thresh);
-	} else
-		watchdog_disable_all_cpus();
+	err = proc_do_large_bitmap(table, write, buffer, lenp, ppos);
+	if (!err && write) {
+		/* Remove impossible cpus to keep sysctl output cleaner. */
+		cpumask_and(&watchdog_cpumask, &watchdog_cpumask,
+			    cpu_possible_mask);
 
-	/* Restore old values on failure */
-	if (err) {
-		watchdog_thresh = old_thresh;
-		watchdog_user_enabled = old_enabled;
-		watchdog_enable_hardlockup_detector(old_hardlockup);
+		if (watchdog_running) {
+			/*
+			 * Failure would be due to being unable to allocate
+			 * a temporary cpumask, so we are likely not in a
+			 * position to do much else to make things better.
+			 */
+			if (smpboot_update_cpumask_percpu_thread(
+				    &watchdog_threads, &watchdog_cpumask) != 0)
+				pr_err("cpumask update failed\n");
+		}
 	}
 out:
 	mutex_unlock(&watchdog_proc_mutex);
 	put_online_cpus();
 	return err;
 }
+
 #endif /* CONFIG_SYSCTL */
 
 void __init lockup_detector_init(void)
 {
 	set_sample_period();
 
-	if (watchdog_user_enabled)
-		watchdog_enable_all_cpus(false);
+#ifdef CONFIG_NO_HZ_FULL
+	if (tick_nohz_full_enabled()) {
+		if (!cpumask_empty(tick_nohz_full_mask))
+			pr_info("Disabling watchdog on nohz_full cores by default\n");
+		cpumask_andnot(&watchdog_cpumask, cpu_possible_mask,
+			       tick_nohz_full_mask);
+	} else
+		cpumask_copy(&watchdog_cpumask, cpu_possible_mask);
+#else
+	cpumask_copy(&watchdog_cpumask, cpu_possible_mask);
+#endif
+
+	if (watchdog_enabled)
+		watchdog_enable_all_cpus();
 }

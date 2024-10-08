@@ -26,6 +26,7 @@
 #include <linux/export.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 
 #include "internal.h"
@@ -999,8 +1000,16 @@ int acpi_dev_pm_attach(struct device *dev, bool power_on)
 	if (dev->pm_domain)
 		return -EEXIST;
 
+	/*
+	 * Only attach the power domain to the first device if the
+	 * companion is shared by multiple. This is to prevent doing power
+	 * management twice.
+	 */
+	if (!acpi_device_is_first_physical_node(adev, dev))
+		return -EBUSY;
+
 	acpi_add_pm_notifier(adev, acpi_wakeup_device, dev);
-	dev->pm_domain = &acpi_general_pm_domain;
+	dev_pm_domain_set(dev, &acpi_general_pm_domain);
 	if (power_on) {
 		acpi_dev_pm_full_power(adev);
 		__acpi_device_run_wake(adev, false);
@@ -1026,7 +1035,7 @@ void acpi_dev_pm_detach(struct device *dev, bool power_off)
 	struct acpi_device *adev = acpi_dev_pm_get_node(dev);
 
 	if (adev && dev->pm_domain == &acpi_general_pm_domain) {
-		dev->pm_domain = NULL;
+		dev_pm_domain_set(dev, NULL);
 		acpi_remove_pm_notifier(adev, acpi_wakeup_device);
 		if (power_off) {
 			/*

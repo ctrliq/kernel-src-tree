@@ -494,17 +494,22 @@ static int proc_pid_stack(struct seq_file *m, struct pid_namespace *ns,
 }
 #endif
 
-#ifdef CONFIG_SCHEDSTATS
+#ifdef CONFIG_SCHED_INFO
 /*
  * Provides /proc/PID/schedstat
  */
 static int proc_pid_schedstat(struct seq_file *m, struct pid_namespace *ns,
 			      struct pid *pid, struct task_struct *task)
 {
-	return seq_printf(m, "%llu %llu %lu\n",
-			(unsigned long long)task->se.sum_exec_runtime,
-			(unsigned long long)task->sched_info.run_delay,
-			task->sched_info.pcount);
+	if (unlikely(!sched_info_on()))
+		seq_printf(m, "0 0 0\n");
+	else
+		seq_printf(m, "%llu %llu %lu\n",
+		   (unsigned long long)task->se.sum_exec_runtime,
+		   (unsigned long long)task->sched_info.run_delay,
+		   task->sched_info.pcount);
+
+	return 0;
 }
 #endif
 
@@ -604,7 +609,7 @@ static int proc_oom_score(struct task_struct *task, char *buffer)
 	unsigned long totalpages = totalram_pages + total_swap_pages;
 	unsigned long points = 0;
 
-	read_lock(&tasklist_lock);
+	tasklist_read_lock();
 	if (pid_alive(task))
 		points = oom_badness(task, NULL, NULL, totalpages) *
 						1000 / totalpages;
@@ -2899,7 +2904,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_STACKTRACE
 	ONE("stack",      S_IRUGO, proc_pid_stack),
 #endif
-#ifdef CONFIG_SCHEDSTATS
+#ifdef CONFIG_SCHED_INFO
 	ONE("schedstat",  S_IRUGO, proc_pid_schedstat),
 #endif
 #ifdef CONFIG_LATENCYTOP
@@ -3256,7 +3261,7 @@ static const struct pid_entry tid_base_stuff[] = {
 #ifdef CONFIG_STACKTRACE
 	ONE("stack",      S_IRUGO, proc_pid_stack),
 #endif
-#ifdef CONFIG_SCHEDSTATS
+#ifdef CONFIG_SCHED_INFO
 	ONE("schedstat", S_IRUGO, proc_pid_schedstat),
 #endif
 #ifdef CONFIG_LATENCYTOP

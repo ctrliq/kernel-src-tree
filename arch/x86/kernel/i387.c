@@ -170,6 +170,7 @@ static void init_thread_xstate(void)
 	 *   XSAVES* support. )
 	 */
 	setup_clear_cpu_cap(X86_FEATURE_XSAVES);
+
 }
 
 /*

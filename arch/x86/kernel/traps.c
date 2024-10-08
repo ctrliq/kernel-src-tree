@@ -58,6 +58,10 @@
 #include <asm/mce.h>
 #include <asm/fixmap.h>
 #include <asm/mach_traps.h>
+#include <asm/xsave.h>
+#include <asm/trace/mpx.h>
+#include <asm/mpx.h>
+#include <asm/alternative.h>
 
 #ifdef CONFIG_X86_64
 #include <asm/x86_init.h>
@@ -213,7 +217,6 @@ dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	\
 DO_ERROR_INFO(X86_TRAP_DE, SIGFPE, "divide error", divide_error, FPE_INTDIV,
 		regs->ip)
 DO_ERROR(X86_TRAP_OF, SIGSEGV, "overflow", overflow)
-DO_ERROR(X86_TRAP_BR, SIGSEGV, "bounds", bounds)
 DO_ERROR_INFO(X86_TRAP_UD, SIGILL, "invalid opcode", invalid_op, ILL_ILLOPN,
 		regs->ip)
 DO_ERROR(X86_TRAP_OLD_MF, SIGFPE, "coprocessor segment overrun",
@@ -246,6 +249,87 @@ dotraplinkage void do_double_fault(struct pt_regs *regs, long error_code)
 		die(str, regs, error_code);
 }
 #endif
+
+dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
+{
+	enum ctx_state prev_state;
+	const struct bndcsr *bndcsr;
+	siginfo_t *info;
+
+	prev_state = exception_enter();
+	if (notify_die(DIE_TRAP, "bounds", regs, error_code,
+			X86_TRAP_BR, SIGSEGV) == NOTIFY_STOP)
+		goto exit;
+	conditional_sti(regs);
+
+	if (!user_mode_vm(regs))
+		die("bounds", regs, error_code);
+
+	if (!cpu_feature_enabled(X86_FEATURE_MPX)) {
+		/* The exception is not from Intel MPX */
+		goto exit_trap;
+	}
+
+	/*
+	 * We need to look at BNDSTATUS to resolve this exception.
+	 * A NULL here might mean that it is in its 'init state',
+	 * which is all zeros which indicates MPX was not
+	 * responsible for the exception.
+	 */
+	bndcsr = get_xsave_field_ptr(XSTATE_BNDCSR);
+	if (!bndcsr)
+		goto exit_trap;
+
+	trace_bounds_exception_mpx(bndcsr);
+	/*
+	 * The error code field of the BNDSTATUS register communicates status
+	 * information of a bound range exception #BR or operation involving
+	 * bound directory.
+	 */
+	switch (bndcsr->bndstatus & MPX_BNDSTA_ERROR_CODE) {
+	case 2:	/* Bound directory has invalid entry. */
+		if (mpx_handle_bd_fault())
+			goto exit_trap;
+		break; /* Success, it was handled */
+	case 1: /* Bound violation. */
+		info = mpx_generate_siginfo(regs);
+		if (IS_ERR(info)) {
+			/*
+			 * We failed to decode the MPX instruction.  Act as if
+			 * the exception was not caused by MPX.
+			 */
+			goto exit_trap;
+		}
+		/*
+		 * Success, we decoded the instruction and retrieved
+		 * an 'info' containing the address being accessed
+		 * which caused the exception.  This information
+		 * allows and application to possibly handle the
+		 * #BR exception itself.
+		 */
+		do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, info);
+		kfree(info);
+		break;
+	case 0: /* No exception caused by Intel MPX operations. */
+		goto exit_trap;
+	default:
+		die("bounds", regs, error_code);
+	}
+
+exit:
+	exception_exit(prev_state);
+	return;
+exit_trap:
+	/*
+	 * This path out is for all the cases where we could not
+	 * handle the exception in some way (like allocating a
+	 * table or telling userspace about it.  We will also end
+	 * up here if the kernel has MPX turned off at compile
+	 * time..
+	 */
+	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, NULL);
+	exception_exit(prev_state);
+}
 
 dotraplinkage void __kprobes
 do_general_protection(struct pt_regs *regs, long error_code)
@@ -308,6 +392,9 @@ dotraplinkage void __kprobes notrace do_int3(struct pt_regs *regs, long error_co
 	    ftrace_int3_handler(regs))
 		return;
 #endif
+	if (poke_int3_handler(regs))
+		return;
+
 	prev_state = exception_enter();
 #ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
 	if (kgdb_ll_trap(DIE_INT3, "int3", regs, error_code, X86_TRAP_BP,
@@ -403,7 +490,7 @@ dotraplinkage void __kprobes do_debug(struct pt_regs *regs, long error_code)
 	 * then it's very likely the result of an icebp/int01 trap.
 	 * User wants a sigtrap for that.
 	 */
-	if (!dr6 && user_mode(regs))
+	if (!dr6 && user_mode_vm(regs))
 		user_icebp = 1;
 
 	/* Catch kmemcheck conditions first of all! */
@@ -587,6 +674,11 @@ asmlinkage void __attribute__((weak)) smp_thermal_interrupt(void)
 }
 
 asmlinkage void __attribute__((weak)) smp_threshold_interrupt(void)
+{
+}
+
+asmlinkage __visible void __attribute__((weak))
+smp_deferred_error_interrupt(void)
 {
 }
 

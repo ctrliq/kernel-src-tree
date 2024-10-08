@@ -1138,8 +1138,12 @@ static int dasd_eckd_read_conf(struct dasd_device *device)
 			path_data->ppm |= lpm;
 			break;
 		}
-		path_data->opm |= lpm;
-
+		if (!path_data->opm) {
+			path_data->opm = lpm;
+			dasd_generic_path_operational(device);
+		} else {
+			path_data->opm |= lpm;
+		}
 		if (conf_data != private->conf_data)
 			kfree(conf_data);
 	}

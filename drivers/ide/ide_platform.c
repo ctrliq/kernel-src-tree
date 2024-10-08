@@ -56,7 +56,7 @@ static int plat_ide_probe(struct platform_device *pdev)
 	struct ide_hw hw, *hws[] = { &hw };
 	struct ide_port_info d = platform_ide_port_info;
 
-	pdata = dev_get_platdata(&pdev->dev);
+	pdata = pdev->dev.platform_data;
 
 	/* get a pointer to the register memory */
 	res_base = platform_get_resource(pdev, IORESOURCE_IO, 0);

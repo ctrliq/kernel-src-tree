@@ -386,6 +386,12 @@ static int audit_field_valid(struct audit_entry *entry, struct audit_field *f)
 		if (f->val > AUDIT_MAX_FIELD_COMPARE)
 			return -EINVAL;
 		break;
+	case AUDIT_EXE:
+		if (f->op != Audit_equal)
+			return -EINVAL;
+		if (entry->rule.listnr != AUDIT_FILTER_EXIT)
+			return -EINVAL;
+		break;
 	};
 	return 0;
 }
@@ -400,6 +406,7 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 	size_t remain = datasz - sizeof(struct audit_rule_data);
 	int i;
 	char *str;
+	struct audit_fsnotify_mark *audit_mark;
 
 	entry = audit_to_entry_common((struct audit_rule *)data);
 	if (IS_ERR(entry))
@@ -525,6 +532,24 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 			entry->rule.buflen += f->val;
 			entry->rule.filterkey = str;
 			break;
+		case AUDIT_EXE:
+			if (entry->rule.exe || f->val > PATH_MAX)
+				goto exit_free;
+			str = audit_unpack_string(&bufp, &remain, f->val);
+			if (IS_ERR(str)) {
+				err = PTR_ERR(str);
+				goto exit_free;
+			}
+			entry->rule.buflen += f->val;
+
+			audit_mark = audit_alloc_mark(&entry->rule, str, f->val);
+			if (IS_ERR(audit_mark)) {
+				kfree(str);
+				err = PTR_ERR(audit_mark);
+				goto exit_free;
+			}
+			entry->rule.exe = audit_mark;
+			break;
 		}
 	}
 
@@ -537,6 +562,8 @@ exit_nofree:
 exit_free:
 	if (entry->rule.tree)
 		audit_put_tree(entry->rule.tree); /* that's the temporary one */
+	if (entry->rule.exe)
+		audit_remove_mark(entry->rule.exe); /* that's the template one */
 	audit_free_rule(entry);
 	return ERR_PTR(err);
 }
@@ -601,6 +628,10 @@ static struct audit_rule_data *audit_krule_to_data(struct audit_krule *krule)
 			data->buflen += data->values[i] =
 				audit_pack_string(&bufp, krule->filterkey);
 			break;
+		case AUDIT_EXE:
+			data->buflen += data->values[i] =
+				audit_pack_string(&bufp, audit_mark_path(krule->exe));
+			break;
 		case AUDIT_LOGINUID_SET:
 			if (krule->pflags & AUDIT_LOGINUID_LEGACY && !f->val) {
 				data->fields[i] = AUDIT_LOGINUID;
@@ -662,6 +693,12 @@ static int audit_compare_rule(struct audit_krule *a, struct audit_krule *b)
 		case AUDIT_FILTERKEY:
 			/* both filterkeys exist based on above type compare */
 			if (strcmp(a->filterkey, b->filterkey))
+				return 1;
+			break;
+		case AUDIT_EXE:
+			/* both paths exist based on above type compare */
+			if (strcmp(audit_mark_path(a->exe),
+				   audit_mark_path(b->exe)))
 				return 1;
 			break;
 		case AUDIT_UID:
@@ -786,8 +823,14 @@ struct audit_entry *audit_dupe_rule(struct audit_krule *old)
 				err = -ENOMEM;
 			else
 				new->filterkey = fk;
+			break;
+		case AUDIT_EXE:
+			err = audit_dupe_exe(new, old);
+			break;
 		}
 		if (err) {
+			if (new->exe)
+				audit_remove_mark(new->exe);
 			audit_free_rule(entry);
 			return ERR_PTR(err);
 		}
@@ -950,6 +993,9 @@ int audit_del_rule(struct audit_entry *entry)
 	if (e->rule.tree)
 		audit_remove_tree_rule(&e->rule);
 
+	if (e->rule.exe)
+		audit_remove_mark_rule(&e->rule);
+
 #ifdef CONFIG_AUDITSYSCALL
 	if (!dont_count)
 		audit_n_rules--;
@@ -1023,68 +1069,78 @@ static void audit_log_rule_change(char *action, struct audit_krule *rule, int re
 }
 
 /**
- * audit_receive_filter - apply all rules to the specified message type
+ * audit_rule_change - apply all rules to the specified message type
  * @type: audit message type
  * @portid: target port id for netlink audit messages
  * @seq: netlink audit message sequence (serial) number
  * @data: payload data
  * @datasz: size of payload data
  */
-int audit_receive_filter(int type, __u32 portid, int seq, void *data,
-			 size_t datasz)
+int audit_rule_change(int type, __u32 portid, int seq, void *data,
+			size_t datasz)
 {
-	struct task_struct *tsk;
-	struct audit_netlink_list *dest;
 	int err = 0;
 	struct audit_entry *entry;
 
+	entry = audit_data_to_entry(data, datasz);
+	if (IS_ERR(entry))
+		return PTR_ERR(entry);
+
 	switch (type) {
-	case AUDIT_LIST_RULES:
-		/* We can't just spew out the rules here because we might fill
-		 * the available socket buffer space and deadlock waiting for
-		 * auditctl to read from it... which isn't ever going to
-		 * happen if we're actually running in the context of auditctl
-		 * trying to _send_ the stuff */
-
-		dest = kmalloc(sizeof(struct audit_netlink_list), GFP_KERNEL);
-		if (!dest)
-			return -ENOMEM;
-		dest->portid = portid;
-		skb_queue_head_init(&dest->q);
-
-		mutex_lock(&audit_filter_mutex);
-		audit_list_rules(portid, seq, &dest->q);
-		mutex_unlock(&audit_filter_mutex);
-
-		tsk = kthread_run(audit_send_list, dest, "audit_send_list");
-		if (IS_ERR(tsk)) {
-			skb_queue_purge(&dest->q);
-			kfree(dest);
-			err = PTR_ERR(tsk);
-		}
-		break;
 	case AUDIT_ADD_RULE:
-		entry = audit_data_to_entry(data, datasz);
-		if (IS_ERR(entry))
-			return PTR_ERR(entry);
-
 		err = audit_add_rule(entry);
 		audit_log_rule_change("add_rule", &entry->rule, !err);
-		if (err)
-			audit_free_rule(entry);
 		break;
 	case AUDIT_DEL_RULE:
-		entry = audit_data_to_entry(data, datasz);
-		if (IS_ERR(entry))
-			return PTR_ERR(entry);
-
 		err = audit_del_rule(entry);
 		audit_log_rule_change("remove_rule", &entry->rule, !err);
-		audit_free_rule(entry);
 		break;
 	default:
 		err = -EINVAL;
 		WARN_ON(1);
+	}
+
+	if (err || type == AUDIT_DEL_RULE) {
+		if (entry->rule.exe)
+			audit_remove_mark(entry->rule.exe);
+		audit_free_rule(entry);
+	}
+
+	return err;
+}
+
+/**
+ * audit_list_rules_send - list the audit rules
+ * @portid: target portid for netlink audit messages
+ * @seq: netlink audit message sequence (serial) number
+ */
+int audit_list_rules_send(__u32 portid, int seq)
+{
+	struct task_struct *tsk;
+	struct audit_netlink_list *dest;
+	int err = 0;
+
+	/* We can't just spew out the rules here because we might fill
+	 * the available socket buffer space and deadlock waiting for
+	 * auditctl to read from it... which isn't ever going to
+	 * happen if we're actually running in the context of auditctl
+	 * trying to _send_ the stuff */
+
+	dest = kmalloc(sizeof(struct audit_netlink_list), GFP_KERNEL);
+	if (!dest)
+		return -ENOMEM;
+	dest->portid = portid;
+	skb_queue_head_init(&dest->q);
+
+	mutex_lock(&audit_filter_mutex);
+	audit_list_rules(portid, seq, &dest->q);
+	mutex_unlock(&audit_filter_mutex);
+
+	tsk = kthread_run(audit_send_list, dest, "audit_send_list");
+	if (IS_ERR(tsk)) {
+		skb_queue_purge(&dest->q);
+		kfree(dest);
+		err = PTR_ERR(tsk);
 	}
 
 	return err;
@@ -1337,6 +1393,8 @@ static int update_lsm_rule(struct audit_krule *r)
 		return 0;
 
 	nentry = audit_dupe_rule(r);
+	if (entry->rule.exe)
+		audit_remove_mark(entry->rule.exe);
 	if (IS_ERR(nentry)) {
 		/* save the first error encountered for the
 		 * return value */

@@ -23,14 +23,20 @@
 #define _PAGE_BIT_SPECIAL	_PAGE_BIT_UNUSED1
 #define _PAGE_BIT_CPA_TEST	_PAGE_BIT_UNUSED1
 #define _PAGE_BIT_SPLITTING	_PAGE_BIT_UNUSED1 /* only valid on a PSE pmd */
-#define _PAGE_BIT_SOFTDIRTY	_PAGE_BIT_HIDDEN
-#define _PAGE_BIT_NX           63       /* No execute: only valid after cpuid check */
+#define _PAGE_BIT_SOFTW4	58	/* available for programmer */
+#define _PAGE_BIT_DEVMAP		_PAGE_BIT_SOFTW4
+#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
 
 /* If _PAGE_BIT_PRESENT is clear, we use these: */
 /* - if the user mapped it with PROT_NONE; pte_present gives true */
 #define _PAGE_BIT_PROTNONE	_PAGE_BIT_GLOBAL
 /* - set: nonlinear file mapping, saved PTE; unset:swap */
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+/* Pick a bit unaffected by the "KNL4 erratum": */
+#define _PAGE_BIT_FILE		_PAGE_BIT_PCD
+#else
 #define _PAGE_BIT_FILE		_PAGE_BIT_DIRTY
+#endif
 
 #define _PAGE_PRESENT	(_AT(pteval_t, 1) << _PAGE_BIT_PRESENT)
 #define _PAGE_RW	(_AT(pteval_t, 1) << _PAGE_BIT_RW)
@@ -48,8 +54,18 @@
 #define _PAGE_SPECIAL	(_AT(pteval_t, 1) << _PAGE_BIT_SPECIAL)
 #define _PAGE_CPA_TEST	(_AT(pteval_t, 1) << _PAGE_BIT_CPA_TEST)
 #define _PAGE_SPLITTING	(_AT(pteval_t, 1) << _PAGE_BIT_SPLITTING)
-#define _PAGE_SOFTDIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_SOFTDIRTY)
 #define __HAVE_ARCH_PTE_SPECIAL
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+#define _PAGE_KNL_ERRATUM_MASK (_PAGE_DIRTY | _PAGE_ACCESSED)
+#else
+/*
+ * With 32-bit PTEs, _PAGE_DIRTY is used to denote a nonlinear
+ * PTE.  We must not clear the bit.  We do not allow 32-bit
+ * kernels to run on KNL
+ */
+#define _PAGE_KNL_ERRATUM_MASK 0
+#endif
 
 #ifdef CONFIG_KMEMCHECK
 #define _PAGE_HIDDEN	(_AT(pteval_t, 1) << _PAGE_BIT_HIDDEN)
@@ -57,10 +73,67 @@
 #define _PAGE_HIDDEN	(_AT(pteval_t, 0))
 #endif
 
+/*
+ * The same hidden bit is used by kmemcheck, but since kmemcheck
+ * works on kernel pages while soft-dirty engine on user space,
+ * they do not conflict with each other.
+ *
+ * Note that this is well in to the swap PTE's entry/type space
+ * so can not be used for !present PTEs.
+ */
+
+#define _PAGE_BIT_SOFT_DIRTY	_PAGE_BIT_HIDDEN
+
+#ifdef CONFIG_MEM_SOFT_DIRTY
+#define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_SOFT_DIRTY)
+#else
+#define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 0))
+#endif
+
+/*
+ * Tracking soft dirty bit when a page goes to a swap is tricky.
+ * We need a bit which can be stored in pte _and_ not conflict
+ * with swap entry format. On x86 bits 6 and 7 are *not* involved
+ * into swap entry computation, but bit 6 is used for nonlinear
+ * file mapping, so we borrow bit 7 for soft dirty tracking.
+ */
+#ifdef CONFIG_MEM_SOFT_DIRTY
+#define _PAGE_BIT_SWP_SOFT_DIRTY	_PAGE_BIT_PSE
+#define _PAGE_SWP_SOFT_DIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_SWP_SOFT_DIRTY)
+#else
+#define _PAGE_SWP_SOFT_DIRTY	(_AT(pteval_t, 0))
+#endif
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+/*
+ * Do compile-time checks for all the bits that may be set on
+ * non-present PTEs
+ */
+#if _PAGE_BIT_FILE == _PAGE_BIT_SWP_SOFT_DIRTY
+#error conflicting _PAGE_BIT_FILE
+#endif
+#if _PAGE_BIT_FILE == _PAGE_BIT_PROTNONE
+#error conflicting _PAGE_BIT_FILE
+#endif
+/*
+ * Do compile-time checks for all the bits affected by the "KNL4"
+ * erratum:
+ */
+#if _PAGE_BIT_FILE == _PAGE_BIT_DIRTY
+#error conflicting _PAGE_BIT_FILE
+#endif
+#if _PAGE_BIT_FILE == _PAGE_BIT_ACCESSED
+#error conflicting _PAGE_BIT_FILE
+#endif
+#endif
+
 #if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
 #define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
+#define _PAGE_DEVMAP	(_AT(u64, 1) << _PAGE_BIT_DEVMAP)
+#define __HAVE_ARCH_PTE_DEVMAP
 #else
 #define _PAGE_NX	(_AT(pteval_t, 0))
+#define _PAGE_DEVMAP	(_AT(pteval_t, 0))
 #endif
 
 #define _PAGE_FILE	(_AT(pteval_t, 1) << _PAGE_BIT_FILE)
@@ -94,7 +167,7 @@
 /* Set of bits not changed in pte_modify */
 #define _PAGE_CHG_MASK	(PTE_PFN_MASK | _PAGE_PCD | _PAGE_PWT |		\
 			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY |	\
-			 _PAGE_SOFTDIRTY)
+			 _PAGE_SOFT_DIRTY)
 #define _HPAGE_CHG_MASK (_PAGE_CHG_MASK | _PAGE_PSE)
 
 #define _PAGE_CACHE_WB		(0)

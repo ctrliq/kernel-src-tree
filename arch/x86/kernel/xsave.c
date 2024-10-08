@@ -724,19 +724,80 @@ void eager_fpu_init(void)
  * This is the API that is called to get xstate address in either
  * standard format or compacted format of xsave area.
  *
+ * Note that if there is no data for the field in the xsave buffer
+ * this will return NULL.
+ *
  * Inputs:
- *	xsave: base address of the xsave area;
- *	xstate: state which is defined in xsave.h (e.g. XSTATE_FP, XSTATE_SSE,
- *	etc.)
+ *	xstate: the thread's storage area for all FPU data
+ *	xstate_feature: state which is defined in xsave.h (e.g.
+ *	XSTATE_FP, XSTATE_SSE, etc...)
  * Output:
- *	address of the state in the xsave area.
+ *	address of the state in the xsave area, or NULL if the
+ *	field is not present in the xsave buffer.
  */
-void *get_xsave_addr(struct xsave_struct *xsave, int xstate)
+void *get_xsave_addr(struct xsave_struct *xsave, int xstate_feature)
 {
-	int feature = fls64(xstate) - 1;
-	if (!test_bit(feature, (unsigned long *)&pcntxt_mask))
+	int feature_nr = fls64(xstate_feature) - 1;
+	/*
+	 * Do we even *have* xsave state?
+	 */
+	if (!boot_cpu_has(X86_FEATURE_XSAVE))
 		return NULL;
 
-	return (void *)xsave + xstate_comp_offsets[feature];
+	xsave = &current->thread.fpu.state->xsave;
+	/*
+	 * We should not ever be requesting features that we
+	 * have not enabled.  Remember that pcntxt_mask is
+	 * what we write to the XCR0 register.
+	 */
+	WARN_ONCE(!(pcntxt_mask & xstate_feature),
+		  "get of unsupported state");
+	/*
+	 * This assumes the last 'xsave*' instruction to
+	 * have requested that 'xstate_feature' be saved.
+	 * If it did not, we might be seeing and old value
+	 * of the field in the buffer.
+	 *
+	 * This can happen because the last 'xsave' did not
+	 * request that this feature be saved (unlikely)
+	 * or because the "init optimization" caused it
+	 * to not be saved.
+	 */
+	if (!(xsave->xsave_hdr.xstate_bv & xstate_feature))
+		return NULL;
+
+	return (void *)xsave + xstate_comp_offsets[feature_nr];
 }
 EXPORT_SYMBOL_GPL(get_xsave_addr);
+
+/*
+ * This wraps up the common operations that need to occur when retrieving
+ * data from xsave state.  It first ensures that the current task was
+ * using the FPU and retrieves the data in to a buffer.  It then calculates
+ * the offset of the requested field in the buffer.
+ *
+ * This function is safe to call whether the FPU is in use or not.
+ *
+ * Note that this only works on the current task.
+ *
+ * Inputs:
+ *     @xsave_state: state which is defined in xsave.h (e.g. XSTATE_FP,
+ *     XSTATE_SSE, etc...)
+ * Output:
+ *     address of the state in the xsave area or NULL if the state
+ *     is not present or is in its 'init state'.
+ */
+const void *get_xsave_field_ptr(int xsave_state)
+{
+
+	if (!(current->flags & PF_USED_MATH))
+		return NULL;
+	/*
+	 * REDHAT: fpu__save() isn't backported, use unlazy_fpu instead.
+	 * fpu__save() takes the CPU's xstate registers
+	 * and saves them off to the 'fpu memory buffer.
+	 */
+	unlazy_fpu(current);
+
+	return get_xsave_addr(&current->thread.fpu.state->xsave, xsave_state);
+}

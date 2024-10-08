@@ -47,7 +47,13 @@ static int rhel_unused_sysctl __read_mostly;
 /* Update system visible IP port range */
 static void set_local_port_range(struct net *net, int range[2])
 {
+	bool same_parity = !((range[0] ^ range[1]) & 1);
+
 	write_seqlock(&net->ipv4_sysctl_local_ports.lock);
+	if (same_parity && !net->ip_local_ports_warned) {
+		net->ip_local_ports_warned = true;
+		pr_err_ratelimited("ip_local_port_range: prefer different parity for start/end values.\n");
+	}
 	net->ipv4_sysctl_local_ports.range[0] = range[0];
 	net->ipv4_sysctl_local_ports.range[1] = range[1];
 	write_sequnlock(&net->ipv4_sysctl_local_ports.lock);
@@ -329,13 +335,6 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &ip_ttl_min,
 		.extra2		= &ip_ttl_max,
-	},
-	{
-		.procname	= "ip_nonlocal_bind",
-		.data		= &sysctl_ip_nonlocal_bind,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec
 	},
 	{
 		.procname	= "tcp_syn_retries",
@@ -897,6 +896,13 @@ static struct ctl_table ipv4_net_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
+	{
+		.procname	= "ip_nonlocal_bind",
+		.data		= &init_net.ipv4_sysctl_ip_nonlocal_bind,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
 	{ }
 };
 
@@ -946,7 +952,7 @@ static __net_init int ipv4_sysctl_init_net(struct net *net)
 	 */
 	seqlock_init(&net->ipv4_sysctl_local_ports.lock);
 	net->ipv4_sysctl_local_ports.range[0] =  32768;
-	net->ipv4_sysctl_local_ports.range[1] =  61000;
+	net->ipv4_sysctl_local_ports.range[1] =  60999;
 
 	tcp_init_mem(net);
 

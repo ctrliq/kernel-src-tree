@@ -81,6 +81,29 @@ static inline int kmem_cache_sanity_check(struct mem_cgroup *memcg,
 }
 #endif
 
+void __kmem_cache_free_bulk(struct kmem_cache *s, size_t nr, void **p)
+{
+	size_t i;
+
+	for (i = 0; i < nr; i++)
+		kmem_cache_free(s, p[i]);
+}
+
+int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t nr,
+								void **p)
+{
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		void *x = p[i] = kmem_cache_alloc(s, flags);
+		if (!x) {
+			__kmem_cache_free_bulk(s, i, p);
+			return 0;
+		}
+	}
+	return i;
+}
+
 #ifdef CONFIG_MEMCG_KMEM
 int memcg_update_all_caches(int num_memcgs)
 {
@@ -250,6 +273,9 @@ EXPORT_SYMBOL(kmem_cache_create);
 
 void kmem_cache_destroy(struct kmem_cache *s)
 {
+	if (unlikely(!s))
+		return;
+
 	/* Destroy all the children caches if we aren't a memcg cache */
 	kmem_cache_destroy_memcg_children(s);
 
@@ -419,6 +445,12 @@ static struct {
 	{"kmalloc-67108864", 67108864}
 };
 
+static void new_kmalloc_cache(int idx, unsigned long flags)
+{
+	kmalloc_caches[idx] = create_kmalloc_cache(kmalloc_info[idx].name,
+					kmalloc_info[idx].size, flags);
+}
+
 /*
  * Create the kmalloc array. Some of the regular kmalloc arrays
  * may already have been created because they were needed to
@@ -469,25 +501,19 @@ void __init create_kmalloc_caches(unsigned long flags)
 		for (i = 128 + 8; i <= 192; i += 8)
 			size_index[size_index_elem(i)] = 8;
 	}
-	for (i = KMALLOC_LOOP_LOW; i <= KMALLOC_SHIFT_HIGH; i++) {
-		if (!kmalloc_caches[i]) {
-			kmalloc_caches[i] = create_kmalloc_cache(
-						kmalloc_info[i].name,
-						kmalloc_info[i].size,
-						flags);
-		}
+	for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++) {
+		if (!kmalloc_caches[i])
+			new_kmalloc_cache(i, flags);
 
 		/*
-		 * "i == 2" is the "kmalloc-192" case which is the last special
-		 * case for initialization and it's the point to jump to
-		 * allocate the minimize size of the object. In slab allocator,
-		 * the KMALLOC_SHIFT_LOW = 5. So, it needs to skip 2^3 and 2^4
-		 * and go straight to allocate 2^5. If the ARCH_DMA_MINALIGN is
-		 * defined, it may be larger than 2^5 and here is also the
-		 * trick to skip the empty gap.
+		 * Caches that are not of the two-to-the-power-of size.
+		 * These have to be created immediately after the
+		 * earlier power of two caches
 		 */
-		if (i == 2)
-			i = (KMALLOC_SHIFT_LOW - 1);
+		if (KMALLOC_MIN_SIZE <= 32 && !kmalloc_caches[1] && i == 6)
+			new_kmalloc_cache(1, flags);
+		if (KMALLOC_MIN_SIZE <= 64 && !kmalloc_caches[2] && i == 7)
+			new_kmalloc_cache(2, flags);
 	}
 
 	/* Kmalloc array is now usable */

@@ -30,6 +30,9 @@ static void sdhci_cns3xxx_set_clock(struct sdhci_host *host, unsigned int clock)
 	u16 clk;
 	unsigned long timeout;
 
+	if (clock == host->clock)
+		return;
+
 	sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
 
 	if (clock == 0)
@@ -93,7 +96,7 @@ static const struct sdhci_pltfm_data sdhci_cns3xxx_pdata = {
 
 static int sdhci_cns3xxx_probe(struct platform_device *pdev)
 {
-	return sdhci_pltfm_register(pdev, &sdhci_cns3xxx_pdata, 0);
+	return sdhci_pltfm_register(pdev, &sdhci_cns3xxx_pdata);
 }
 
 static int sdhci_cns3xxx_remove(struct platform_device *pdev)

@@ -44,15 +44,6 @@ const char *mei_hbm_state_str(enum mei_hbm_state state);
 
 int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr);
 
-static inline void mei_hbm_hdr(struct mei_msg_hdr *hdr, size_t length)
-{
-	hdr->host_addr = 0;
-	hdr->me_addr = 0;
-	hdr->length = length;
-	hdr->msg_complete = 1;
-	hdr->reserved = 0;
-}
-
 void mei_hbm_idle(struct mei_device *dev);
 void mei_hbm_reset(struct mei_device *dev);
 int mei_hbm_start_req(struct mei_device *dev);
@@ -63,6 +54,9 @@ int mei_hbm_cl_disconnect_rsp(struct mei_device *dev, struct mei_cl *cl);
 int mei_hbm_cl_connect_req(struct mei_device *dev, struct mei_cl *cl);
 bool mei_hbm_version_is_supported(struct mei_device *dev);
 int mei_hbm_pg(struct mei_device *dev, u8 pg_cmd);
+void mei_hbm_pg_resume(struct mei_device *dev);
+int mei_hbm_cl_notify_req(struct mei_device *dev,
+			  struct mei_cl *cl, u8 request);
 
 #endif /* _MEI_HBM_H_ */
 

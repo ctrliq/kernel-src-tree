@@ -906,7 +906,7 @@ xfrm_stateonly_find(struct net *net, u32 mark,
 	unsigned int h;
 	struct xfrm_state *rx = NULL, *x = NULL;
 
-	spin_lock(&net->xfrm_state_lock);
+	spin_lock_bh(&net->xfrm_state_lock);
 	h = xfrm_dst_hash(net, daddr, saddr, reqid, family);
 	hlist_for_each_entry(x, net->xfrm.state_bydst+h, bydst) {
 		if (x->props.family == family &&
@@ -924,7 +924,7 @@ xfrm_stateonly_find(struct net *net, u32 mark,
 
 	if (rx)
 		xfrm_state_hold(rx);
-	spin_unlock(&net->xfrm_state_lock);
+	spin_unlock_bh(&net->xfrm_state_lock);
 
 
 	return rx;
@@ -1217,11 +1217,12 @@ out:
 	return NULL;
 }
 
-/* net->xfrm_state_lock is held */
 struct xfrm_state *xfrm_migrate_state_find(struct xfrm_migrate *m, struct net *net)
 {
 	unsigned int h;
-	struct xfrm_state *x;
+	struct xfrm_state *x = NULL;
+
+	spin_lock_bh(&net->xfrm_state_lock);
 
 	if (m->reqid) {
 		h = xfrm_dst_hash(net, &m->old_daddr, &m->old_saddr,
@@ -1238,7 +1239,7 @@ struct xfrm_state *xfrm_migrate_state_find(struct xfrm_migrate *m, struct net *n
 					     m->old_family))
 				continue;
 			xfrm_state_hold(x);
-			return x;
+			break;
 		}
 	} else {
 		h = xfrm_src_hash(net, &m->old_daddr, &m->old_saddr,
@@ -1253,11 +1254,13 @@ struct xfrm_state *xfrm_migrate_state_find(struct xfrm_migrate *m, struct net *n
 					     m->old_family))
 				continue;
 			xfrm_state_hold(x);
-			return x;
+			break;
 		}
 	}
 
-	return NULL;
+	spin_unlock_bh(&net->xfrm_state_lock);
+
+	return x;
 }
 EXPORT_SYMBOL(xfrm_migrate_state_find);
 

@@ -359,16 +359,20 @@ static int cm_init_av_by_path(struct ib_sa_path_rec *path, struct cm_av *av)
 	unsigned long flags;
 	int ret;
 	u8 p;
+	struct net_device *ndev = ib_get_ndev_from_path(path);
 
 	read_lock_irqsave(&cm.device_lock, flags);
 	list_for_each_entry(cm_dev, &cm.device_list, list) {
 		if (!ib_find_cached_gid(cm_dev->ib_device, &path->sgid,
-					&p, NULL)) {
+					path->gid_type, ndev, &p, NULL)) {
 			port = cm_dev->port[p-1];
 			break;
 		}
 	}
 	read_unlock_irqrestore(&cm.device_lock, flags);
+
+	if (ndev)
+		dev_put(ndev);
 
 	if (!port)
 		return -EINVAL;
@@ -382,7 +386,6 @@ static int cm_init_av_by_path(struct ib_sa_path_rec *path, struct cm_av *av)
 	ib_init_ah_from_path(cm_dev->ib_device, port->port_num, path,
 			     &av->ah_attr);
 	av->timeout = path->packet_life_time + 1;
-	memcpy(av->smac, path->smac, sizeof(av->smac));
 
 	return 0;
 }
@@ -1597,6 +1600,8 @@ static int cm_req_handler(struct cm_work *work)
 	struct ib_cm_id *cm_id;
 	struct cm_id_private *cm_id_priv, *listen_cm_id_priv;
 	struct cm_req_msg *req_msg;
+	union ib_gid gid;
+	struct ib_gid_attr gid_attr;
 	int ret;
 
 	req_msg = (struct cm_req_msg *)work->mad_recv_wc->recv_buf.mad;
@@ -1636,10 +1641,31 @@ static int cm_req_handler(struct cm_work *work)
 	cm_format_paths_from_req(req_msg, &work->path[0], &work->path[1]);
 
 	memcpy(work->path[0].dmac, cm_id_priv->av.ah_attr.dmac, ETH_ALEN);
-	ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av);
+	work->path[0].hop_limit = cm_id_priv->av.ah_attr.grh.hop_limit;
+	ret = ib_get_cached_gid(work->port->cm_dev->ib_device,
+				work->port->port_num,
+				cm_id_priv->av.ah_attr.grh.sgid_index,
+				&gid, &gid_attr);
+	if (!ret) {
+		if (gid_attr.ndev) {
+			work->path[0].ifindex = gid_attr.ndev->ifindex;
+			work->path[0].net = dev_net(gid_attr.ndev);
+			dev_put(gid_attr.ndev);
+		}
+		work->path[0].gid_type = gid_attr.gid_type;
+		ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av);
+	}
 	if (ret) {
-		ib_get_cached_gid(work->port->cm_dev->ib_device,
-				  work->port->port_num, 0, &work->path[0].sgid);
+		int err = ib_get_cached_gid(work->port->cm_dev->ib_device,
+					    work->port->port_num, 0,
+					    &work->path[0].sgid,
+					    &gid_attr);
+		if (!err && gid_attr.ndev) {
+			work->path[0].ifindex = gid_attr.ndev->ifindex;
+			work->path[0].net = dev_net(gid_attr.ndev);
+			dev_put(gid_attr.ndev);
+		}
+		work->path[0].gid_type = gid_attr.gid_type;
 		ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_GID,
 			       &work->path[0].sgid, sizeof work->path[0].sgid,
 			       NULL, 0);

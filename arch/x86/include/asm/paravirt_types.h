@@ -42,6 +42,7 @@
 #include <asm/desc_defs.h>
 #include <asm/kmap_types.h>
 #include <asm/pgtable_types.h>
+#include <linux/rh_kabi.h>
 
 struct page;
 struct thread_struct;
@@ -156,9 +157,14 @@ struct pv_cpu_ops {
 	u64 (*read_msr)(unsigned int msr, int *err);
 	int (*write_msr)(unsigned int msr, unsigned low, unsigned high);
 
+	/*
+	 * The member read_tsc() can't be deprecated because it is used
+	 * by get_cycles() indirectly.
+	 */
+
 	u64 (*read_tsc)(void);
 	u64 (*read_pmc)(int counter);
-	unsigned long long (*read_tscp)(unsigned int *aux);
+	RH_KABI_DEPRECATE_FN(unsigned long long, read_tscp, unsigned int *aux)
 
 	/*
 	 * Atomically enable interrupts and return to userspace.  This

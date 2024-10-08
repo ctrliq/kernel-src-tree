@@ -236,6 +236,7 @@ enum {
 						        error-handling stage) */
 	AHCI_HFLAG_MULTI_MSI		= (1 << 16), /* multiple PCI MSIs */
 	AHCI_HFLAG_NO_FBS		= (1 << 17), /* no FBS */
+	AHCI_HFLAG_MULTI_MSIX		= (1 << 18), /* per-port MSI-X */
 
 	/* ap->flags bits */
 
@@ -326,6 +327,8 @@ struct ahci_host_priv {
 	u32			em_buf_sz;	/* EM buffer size in byte */
 	u32			em_msg_type;	/* EM message type */
 	struct clk		*clk;		/* Only for platforms supporting clk */
+	struct msix_entry	*msix;		/* Optional MSI-X support */
+	unsigned int		irq;		/* interrupt line */
 };
 
 extern int ahci_ignore_sss;
@@ -369,8 +372,7 @@ void ahci_set_em_messages(struct ahci_host_priv *hpriv,
 			  struct ata_port_info *pi);
 int ahci_reset_em(struct ata_host *host);
 void ahci_print_info(struct ata_host *host, const char *scc_s);
-int ahci_host_activate(struct ata_host *host, int irq,
-		       struct scsi_host_template *sht);
+int ahci_host_activate(struct ata_host *host, struct scsi_host_template *sht);
 
 static inline void __iomem *__ahci_port_base(struct ata_host *host,
 					     unsigned int port_no)

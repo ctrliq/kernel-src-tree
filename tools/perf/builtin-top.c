@@ -34,12 +34,13 @@
 #include "util/top.h"
 #include "util/util.h"
 #include <linux/rbtree.h>
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/parse-events.h"
 #include "util/cpumap.h"
 #include "util/xyarray.h"
 #include "util/sort.h"
 #include "util/intlist.h"
+#include "util/parse-branch-options.h"
 #include "arch/common.h"
 
 #include "util/debug.h"
@@ -66,6 +67,7 @@
 #include <sys/utsname.h>
 #include <sys/mman.h>
 
+#include <linux/stringify.h>
 #include <linux/types.h>
 
 static volatile int done;
@@ -251,7 +253,8 @@ static void perf_top__print_sym_table(struct perf_top *top)
 	char bf[160];
 	int printed = 0;
 	const int win_width = top->winsize.ws_col - 1;
-	struct hists *hists = evsel__hists(top->sym_evsel);
+	struct perf_evsel *evsel = top->sym_evsel;
+	struct hists *hists = evsel__hists(evsel);
 
 	puts(CONSOLE_CLEAR);
 
@@ -287,7 +290,7 @@ static void perf_top__print_sym_table(struct perf_top *top)
 	}
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists, NULL);
+	perf_evsel__output_resort(evsel, NULL);
 
 	hists__output_recalc_col_len(hists, top->print_entries - printed);
 	putchar('\n');
@@ -539,6 +542,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 static void perf_top__sort_new_samples(void *arg)
 {
 	struct perf_top *t = arg;
+	struct perf_evsel *evsel = t->sym_evsel;
 	struct hists *hists;
 
 	perf_top__reset_sample_counters(t);
@@ -546,7 +550,7 @@ static void perf_top__sort_new_samples(void *arg)
 	if (t->evlist->selected != NULL)
 		t->sym_evsel = t->evlist->selected;
 
-	hists = evsel__hists(t->sym_evsel);
+	hists = evsel__hists(evsel);
 
 	if (t->evlist->enabled) {
 		if (t->zero) {
@@ -558,7 +562,7 @@ static void perf_top__sort_new_samples(void *arg)
 	}
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists, NULL);
+	perf_evsel__output_resort(evsel, NULL);
 }
 
 static void *display_thread_tui(void *arg)
@@ -687,6 +691,8 @@ static int hist_iter__top_callback(struct hist_entry_iter *iter,
 	if (sort__has_sym && single)
 		perf_top__record_precise_ip(top, he, evsel->idx, al->addr);
 
+	hist__account_cycles(iter->sample->branch_stack, al, iter->sample,
+		     !(top->record_opts.branch_stack & PERF_SAMPLE_BRANCH_ANY));
 	return 0;
 }
 
@@ -954,7 +960,14 @@ static int __cmd_top(struct perf_top *top)
 		goto out_delete;
 
 	machine__synthesize_threads(&top->session->machines.host, &opts->target,
-				    top->evlist->threads, false);
+				    top->evlist->threads, false, opts->proc_map_timeout);
+
+	if (sort__has_socket) {
+		ret = perf_env__read_cpu_topology_map(&perf_env);
+		if (ret < 0)
+			goto out_err_cpu_topo;
+	}
+
 	ret = perf_top__start_counters(top);
 	if (ret)
 		goto out_delete;
@@ -1012,6 +1025,14 @@ out_delete:
 	top->session = NULL;
 
 	return ret;
+
+out_err_cpu_topo: {
+	char errbuf[BUFSIZ];
+	const char *err = strerror_r(-ret, errbuf, sizeof(errbuf));
+
+	ui__error("Could not read the CPU topology map: %s\n", err);
+	goto out_delete;
+}
 }
 
 static int
@@ -1042,7 +1063,7 @@ parse_callchain_opt(const struct option *opt, const char *arg, int unset)
 	return parse_callchain_top_opt(arg);
 }
 
-static int perf_top_config(const char *var, const char *value, void *cb)
+static int perf_top_config(const char *var, const char *value, void *cb __maybe_unused)
 {
 	if (!strcmp(var, "top.call-graph"))
 		var = "call-graph.record-mode"; /* fall-through */
@@ -1051,7 +1072,7 @@ static int perf_top_config(const char *var, const char *value, void *cb)
 		return 0;
 	}
 
-	return perf_default_config(var, value, cb);
+	return 0;
 }
 
 static int
@@ -1081,6 +1102,7 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 			.target		= {
 				.uses_mmap   = true,
 			},
+			.proc_map_timeout    = 500,
 		},
 		.max_stack	     = PERF_MAX_STACK_DEPTH,
 		.sym_pcnt_filter     = 5,
@@ -1180,6 +1202,18 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_STRING('w', "column-widths", &symbol_conf.col_width_list_str,
 		   "width[,width...]",
 		   "don't try to adjust column width, use these fixed values"),
+	OPT_UINTEGER(0, "proc-map-timeout", &opts->proc_map_timeout,
+			"per thread proc mmap processing timeout in ms"),
+	OPT_CALLBACK_NOOPT('b', "branch-any", &opts->branch_stack,
+		     "branch any", "sample any taken branches",
+		     parse_branch_stack),
+	OPT_CALLBACK('j', "branch-filter", &opts->branch_stack,
+		     "branch filter mask", "branch stack filter modes",
+		     parse_branch_stack),
+	OPT_BOOLEAN(0, "raw-trace", &symbol_conf.raw_trace,
+		    "Show raw trace event output (do not use print fmt or plugins)"),
+	OPT_BOOLEAN(0, "hierarchy", &symbol_conf.report_hierarchy,
+		    "Show entries in a hierarchy"),
 	OPT_END()
 	};
 	const char * const top_usage[] = {
@@ -1205,6 +1239,19 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
 	    perf_evlist__add_default(top.evlist) < 0) {
 		pr_err("Not enough memory for event selector list\n");
 		goto out_delete_evlist;
+	}
+
+	if (symbol_conf.report_hierarchy) {
+		/* disable incompatible options */
+		symbol_conf.event_group = false;
+		symbol_conf.cumulate_callchain = false;
+
+		if (field_order) {
+			pr_err("Error: --hierarchy and --fields options cannot be used together\n");
+			parse_options_usage(top_usage, options, "fields", 0);
+			parse_options_usage(NULL, options, "hierarchy", 0);
+			goto out_delete_evlist;
+		}
 	}
 
 	sort__mode = SORT_MODE__TOP;

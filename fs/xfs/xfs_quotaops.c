@@ -134,14 +134,44 @@ xfs_fs_get_dqblk(
 	struct fs_disk_quota	*fdq)
 {
 	struct xfs_mount	*mp = XFS_M(sb);
+	xfs_dqid_t		id;
 
 	if (!XFS_IS_QUOTA_RUNNING(mp))
 		return -ENOSYS;
 	if (!XFS_IS_QUOTA_ON(mp))
 		return -ESRCH;
 
-	return xfs_qm_scall_getquota(mp, from_kqid(&init_user_ns, qid),
-				      xfs_quota_type(qid.type), fdq);
+	id = from_kqid(&init_user_ns, qid);
+	return xfs_qm_scall_getquota(mp, &id,
+				     xfs_quota_type(qid.type), fdq, 0);
+}
+
+/* Return quota info for active quota >= this qid */
+STATIC int
+xfs_fs_get_nextdqblk(
+	struct super_block	*sb,
+	struct kqid		*qid,
+	struct fs_disk_quota	*fdq)
+{
+	int			ret;
+	struct xfs_mount	*mp = XFS_M(sb);
+	xfs_dqid_t		id;
+
+	if (!XFS_IS_QUOTA_RUNNING(mp))
+		return -ENOSYS;
+	if (!XFS_IS_QUOTA_ON(mp))
+		return -ESRCH;
+
+	id = from_kqid(&init_user_ns, *qid);
+	ret = xfs_qm_scall_getquota(mp, &id,
+				    xfs_quota_type(qid->type), fdq,
+				    XFS_QMOPT_DQNEXT);
+	if (ret)
+		return ret;
+
+	/* ID may be different, so convert back what we got */
+	*qid = make_kqid(current_user_ns(), qid->type, id);
+	return 0;
 }
 
 STATIC int
@@ -169,5 +199,6 @@ const struct quotactl_ops xfs_quotactl_operations = {
 	.set_xstate		= xfs_fs_set_xstate,
 	.rm_xquota		= xfs_fs_rm_xquota,
 	.get_dqblk		= xfs_fs_get_dqblk,
+	.get_nextdqblk		= xfs_fs_get_nextdqblk,
 	.set_dqblk		= xfs_fs_set_dqblk,
 };

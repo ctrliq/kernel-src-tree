@@ -25,6 +25,7 @@
 #include <linux/proc_fs.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
+#include <linux/netfilter_bridge.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_queue.h>
 #include <linux/list.h>
@@ -35,7 +36,7 @@
 
 #include <linux/atomic.h>
 
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 #include "../bridge/br_private.h"
 #endif
 
@@ -268,7 +269,7 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 		+ nla_total_size(sizeof(struct nfqnl_msg_packet_hdr))
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
 #endif
@@ -341,7 +342,7 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 
 	indev = entry->state.in;
 	if (indev) {
-#ifndef CONFIG_BRIDGE_NETFILTER
+#if !IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 		if (nla_put_be32(skb, NFQA_IFINDEX_INDEV, htonl(indev->ifindex)))
 			goto nla_put_failure;
 #else
@@ -357,21 +358,25 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 					 htonl(br_port_get_rcu(indev)->br->dev->ifindex)))
 				goto nla_put_failure;
 		} else {
+			int physinif;
+
 			/* Case 2: indev is bridge group, we need to look for
 			 * physical device (when called from ipv4) */
 			if (nla_put_be32(skb, NFQA_IFINDEX_INDEV,
 					 htonl(indev->ifindex)))
 				goto nla_put_failure;
-			if (entskb->nf_bridge && entskb->nf_bridge->physindev &&
+
+			physinif = nf_bridge_get_physinif(entskb);
+			if (physinif &&
 			    nla_put_be32(skb, NFQA_IFINDEX_PHYSINDEV,
-					 htonl(entskb->nf_bridge->physindev->ifindex)))
+					 htonl(physinif)))
 				goto nla_put_failure;
 		}
 #endif
 	}
 
 	if (outdev) {
-#ifndef CONFIG_BRIDGE_NETFILTER
+#if !IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 		if (nla_put_be32(skb, NFQA_IFINDEX_OUTDEV, htonl(outdev->ifindex)))
 			goto nla_put_failure;
 #else
@@ -387,14 +392,18 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 					 htonl(br_port_get_rcu(outdev)->br->dev->ifindex)))
 				goto nla_put_failure;
 		} else {
+			int physoutif;
+
 			/* Case 2: outdev is bridge group, we need to look for
 			 * physical output device (when called from ipv4) */
 			if (nla_put_be32(skb, NFQA_IFINDEX_OUTDEV,
 					 htonl(outdev->ifindex)))
 				goto nla_put_failure;
-			if (entskb->nf_bridge && entskb->nf_bridge->physoutdev &&
+
+			physoutif = nf_bridge_get_physoutif(entskb);
+			if (physoutif &&
 			    nla_put_be32(skb, NFQA_IFINDEX_PHYSOUTDEV,
-					 htonl(entskb->nf_bridge->physoutdev->ifindex)))
+					 htonl(physoutif)))
 				goto nla_put_failure;
 		}
 #endif
@@ -525,7 +534,7 @@ nf_queue_entry_dup(struct nf_queue_entry *e)
 	return NULL;
 }
 
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 /* When called from bridge netfilter, skb->data must point to MAC header
  * before calling skb_gso_segment(). Else, original MAC header is lost
  * and segmented skbs will be sent to wrong destination.
@@ -724,13 +733,14 @@ dev_cmp(struct nf_queue_entry *entry, unsigned long ifindex)
 	if (entry->state.out)
 		if (entry->state.out->ifindex == ifindex)
 			return 1;
-#ifdef CONFIG_BRIDGE_NETFILTER
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	if (entry->skb->nf_bridge) {
-		if (entry->skb->nf_bridge->physindev &&
-		    entry->skb->nf_bridge->physindev->ifindex == ifindex)
-			return 1;
-		if (entry->skb->nf_bridge->physoutdev &&
-		    entry->skb->nf_bridge->physoutdev->ifindex == ifindex)
+		int physinif, physoutif;
+
+		physinif = nf_bridge_get_physinif(entry->skb);
+		physoutif = nf_bridge_get_physoutif(entry->skb);
+
+		if (physinif == ifindex || physoutif == ifindex)
 			return 1;
 	}
 #endif
@@ -764,7 +774,7 @@ static int
 nfqnl_rcv_dev_event(struct notifier_block *this,
 		    unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	/* Drop any packets associated with the downed device */
 	if (event == NETDEV_DOWN)
@@ -1270,7 +1280,13 @@ static struct pernet_operations nfnl_queue_net_ops = {
 
 static int __init nfnetlink_queue_init(void)
 {
-	int status = -ENOMEM;
+	int status;
+
+	status = register_pernet_subsys(&nfnl_queue_net_ops);
+	if (status < 0) {
+		pr_err("nf_queue: failed to register pernet ops\n");
+		goto out;
+	}
 
 	netlink_register_notifier(&nfqnl_rtnl_notifier);
 	status = nfnetlink_subsys_register(&nfqnl_subsys);
@@ -1279,29 +1295,24 @@ static int __init nfnetlink_queue_init(void)
 		goto cleanup_netlink_notifier;
 	}
 
-	status = register_pernet_subsys(&nfnl_queue_net_ops);
-	if (status < 0) {
-		pr_err("nf_queue: failed to register pernet ops\n");
-		goto cleanup_subsys;
-	}
-	register_netdevice_notifier(&nfqnl_dev_notifier);
+	register_netdevice_notifier_rh(&nfqnl_dev_notifier);
 	nf_register_queue_handler(&nfqh);
 	return status;
 
-cleanup_subsys:
-	nfnetlink_subsys_unregister(&nfqnl_subsys);
 cleanup_netlink_notifier:
 	netlink_unregister_notifier(&nfqnl_rtnl_notifier);
+	unregister_pernet_subsys(&nfnl_queue_net_ops);
+out:
 	return status;
 }
 
 static void __exit nfnetlink_queue_fini(void)
 {
 	nf_unregister_queue_handler();
-	unregister_netdevice_notifier(&nfqnl_dev_notifier);
-	unregister_pernet_subsys(&nfnl_queue_net_ops);
+	unregister_netdevice_notifier_rh(&nfqnl_dev_notifier);
 	nfnetlink_subsys_unregister(&nfqnl_subsys);
 	netlink_unregister_notifier(&nfqnl_rtnl_notifier);
+	unregister_pernet_subsys(&nfnl_queue_net_ops);
 
 	rcu_barrier(); /* Wait for completion of call_rcu()'s */
 }

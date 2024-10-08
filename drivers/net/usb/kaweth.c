@@ -45,7 +45,6 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -1172,7 +1171,7 @@ err_fw:
 	netdev->netdev_ops = &kaweth_netdev_ops;
 	netdev->watchdog_timeo = KAWETH_TX_TIMEOUT;
 	netdev->mtu = le16_to_cpu(kaweth->configuration.segment_size);
-	SET_ETHTOOL_OPS(netdev, &ops);
+	netdev->ethtool_ops = &ops;
 
 	/* kaweth is zeroed as part of alloc_netdev */
 	INIT_DELAYED_WORK(&kaweth->lowmem_work, kaweth_resubmit_tl);

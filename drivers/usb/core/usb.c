@@ -50,7 +50,23 @@ const char *usbcore_name = "usbcore";
 
 static bool nousb;	/* Disable USB when built into kernel image */
 
-#ifdef	CONFIG_PM_RUNTIME
+/* To disable USB, kernel command line is 'nousb' not 'usbcore.nousb' */
+#ifdef MODULE
+module_param(nousb, bool, 0444);
+#else
+core_param(nousb, nousb, bool, 0444);
+#endif
+
+/*
+ * for external read access to <nousb>
+ */
+int usb_disabled(void)
+{
+	return nousb;
+}
+EXPORT_SYMBOL_GPL(usb_disabled);
+
+#ifdef	CONFIG_PM
 static int usb_autosuspend_delay = 2;		/* Default delay value,
 						 * in seconds */
 module_param_named(autosuspend, usb_autosuspend_delay, int, 0644);
@@ -290,22 +306,6 @@ static int usb_dev_uevent(struct device *dev, struct kobj_uevent_env *env)
 	return 0;
 }
 
-/* To disable USB, kernel command line is 'nousb' not 'usbcore.nousb' */
-#ifdef MODULE
-module_param(nousb, bool, 0444);
-#else
-core_param(nousb, nousb, bool, 0444);
-#endif
-
-/*
- * for external read access to <nousb>
- */
-int usb_disabled(void)
-{
-	return nousb;
-}
-EXPORT_SYMBOL_GPL(usb_disabled);
-
 #ifdef	CONFIG_PM
 
 /* USB device Power-Management thunks.
@@ -365,11 +365,9 @@ static const struct dev_pm_ops usb_device_pm_ops = {
 	.thaw =		usb_dev_thaw,
 	.poweroff =	usb_dev_poweroff,
 	.restore =	usb_dev_restore,
-#ifdef CONFIG_PM_RUNTIME
 	.runtime_suspend =	usb_runtime_suspend,
 	.runtime_resume =	usb_runtime_resume,
 	.runtime_idle =		usb_runtime_idle,
-#endif
 };
 
 #endif	/* CONFIG_PM */

@@ -59,7 +59,8 @@ long __init kvm_cma_declare_contiguous(phys_addr_t size, phys_addr_t alignment)
 	 * Sanitise input arguments.
 	 * We should be pageblock aligned for CMA.
 	 */
-	alignment = max(alignment, (phys_addr_t)(PAGE_SIZE << pageblock_order));
+	alignment = max(alignment,
+		(phys_addr_t)PAGE_SIZE << max(MAX_ORDER - 1, pageblock_order));
 	size = ALIGN(size, alignment);
 	/*
 	 * Reserve memory

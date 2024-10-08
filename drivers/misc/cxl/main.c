@@ -32,6 +32,8 @@ uint cxl_verbose;
 module_param_named(verbose, cxl_verbose, uint, 0600);
 MODULE_PARM_DESC(verbose, "Enable verbose dmesg output");
 
+const struct cxl_backend_ops *cxl_ops;
+
 int cxl_afu_slbia(struct cxl_afu *afu)
 {
 	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
@@ -46,7 +48,7 @@ int cxl_afu_slbia(struct cxl_afu *afu)
 		/* If the adapter has gone down, we can assume that we
 		 * will PERST it and that will invalidate everything.
 		 */
-		if (!cxl_adapter_link_ok(afu->adapter))
+		if (!cxl_ops->link_ok(afu->adapter, afu))
 			return -EIO;
 		cpu_relax();
 	}
@@ -254,12 +256,11 @@ struct cxl_afu *cxl_alloc_afu(struct cxl *adapter, int slice)
 
 	afu->adapter = adapter;
 	afu->dev.parent = &adapter->dev;
-	afu->dev.release = cxl_release_afu;
+	afu->dev.release = cxl_ops->release_afu;
 	afu->slice = slice;
 	idr_init(&afu->contexts_idr);
 	mutex_init(&afu->contexts_lock);
 	spin_lock_init(&afu->afu_cntl_lock);
-	mutex_init(&afu->spa_mutex);
 
 	afu->prefault_mode = CXL_PREFAULT_NONE;
 	afu->irqs_max = afu->adapter->user_irqs;
@@ -270,10 +271,10 @@ struct cxl_afu *cxl_alloc_afu(struct cxl *adapter, int slice)
 int cxl_afu_select_best_mode(struct cxl_afu *afu)
 {
 	if (afu->modes_supported & CXL_MODE_DIRECTED)
-		return cxl_afu_activate_mode(afu, CXL_MODE_DIRECTED);
+		return cxl_ops->afu_activate_mode(afu, CXL_MODE_DIRECTED);
 
 	if (afu->modes_supported & CXL_MODE_DEDICATED)
-		return cxl_afu_activate_mode(afu, CXL_MODE_DEDICATED);
+		return cxl_ops->afu_activate_mode(afu, CXL_MODE_DEDICATED);
 
 	dev_warn(&afu->dev, "No supported programming modes available\n");
 	/* We don't fail this so the user can inspect sysfs */
@@ -284,9 +285,6 @@ static int __init init_cxl(void)
 {
 	int rc = 0;
 
-	if (!cpu_has_feature(CPU_FTR_HVMODE))
-		return -EPERM;
-
 	if ((rc = cxl_file_init()))
 		return rc;
 
@@ -295,7 +293,17 @@ static int __init init_cxl(void)
 	if ((rc = register_cxl_calls(&cxl_calls)))
 		goto err;
 
-	if ((rc = pci_register_driver(&cxl_pci_driver)))
+	if (cpu_has_feature(CPU_FTR_HVMODE)) {
+		cxl_ops = &cxl_native_ops;
+		rc = pci_register_driver(&cxl_pci_driver);
+	}
+#ifdef CONFIG_PPC_PSERIES
+	else {
+		cxl_ops = &cxl_guest_ops;
+		rc = platform_driver_register(&cxl_of_driver);
+	}
+#endif
+	if (rc)
 		goto err1;
 
 	return 0;
@@ -310,7 +318,12 @@ err:
 
 static void exit_cxl(void)
 {
-	pci_unregister_driver(&cxl_pci_driver);
+	if (cpu_has_feature(CPU_FTR_HVMODE))
+		pci_unregister_driver(&cxl_pci_driver);
+#ifdef CONFIG_PPC_PSERIES
+	else
+		platform_driver_unregister(&cxl_of_driver);
+#endif
 
 	cxl_debugfs_exit();
 	cxl_file_exit();

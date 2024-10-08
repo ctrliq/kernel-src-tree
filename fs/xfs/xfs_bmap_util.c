@@ -75,7 +75,8 @@ xfs_zero_extent(
 	ssize_t		size = XFS_FSB_TO_B(mp, count_fsb);
 
 	if (IS_DAX(VFS_I(ip)))
-		return dax_clear_blocks(VFS_I(ip), block, size);
+		return dax_clear_sectors(xfs_find_bdev_for_inode(VFS_I(ip)),
+				sector, size);
 
 	/*
 	 * let the block layer decide on the fastest method of
@@ -91,32 +92,32 @@ xfs_zero_extent(
  * last due to locking considerations.  We never free any extents in
  * the first transaction.
  *
- * Return 1 if the given transaction was committed and a new one
- * started, and 0 otherwise in the committed parameter.
+ * If an inode *ip is provided, rejoin it to the transaction if
+ * the transaction was committed.
  */
 int						/* error */
 xfs_bmap_finish(
 	struct xfs_trans		**tp,	/* transaction pointer addr */
 	struct xfs_bmap_free		*flist,	/* i/o: list extents to free */
-	int				*committed)/* xact committed or not */
+	struct xfs_inode		*ip)
 {
 	struct xfs_efd_log_item		*efd;	/* extent free data */
 	struct xfs_efi_log_item		*efi;	/* extent free intention */
 	int				error;	/* error return value */
+	int				committed;/* xact committed or not */
 	struct xfs_bmap_free_item	*free;	/* free extent item */
 	struct xfs_bmap_free_item	*next;	/* next item on free list */
 
 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
-	if (flist->xbf_count == 0) {
-		*committed = 0;
+	if (flist->xbf_count == 0)
 		return 0;
-	}
+
 	efi = xfs_trans_get_efi(*tp, flist->xbf_count);
 	for (free = flist->xbf_first; free; free = free->xbfi_next)
 		xfs_trans_log_efi_extent(*tp, efi, free->xbfi_startblock,
 			free->xbfi_blockcount);
 
-	error = __xfs_trans_roll(tp, NULL, committed);
+	error = __xfs_trans_roll(tp, ip, &committed);
 	if (error) {
 		/*
 		 * If the transaction was committed, drop the EFD reference
@@ -128,37 +129,27 @@ xfs_bmap_finish(
 		 * transaction so we should return committed=1 even though we're
 		 * returning an error.
 		 */
-		if (*committed) {
+		if (committed) {
 			xfs_efi_release(efi);
 			xfs_force_shutdown((*tp)->t_mountp,
 				(error == -EFSCORRUPTED) ?
 					SHUTDOWN_CORRUPT_INCORE :
 					SHUTDOWN_META_IO_ERROR);
-		} else {
-			*committed = 1;
 		}
-
 		return error;
 	}
 
+	/*
+	 * Get an EFD and free each extent in the list, logging to the EFD in
+	 * the process. The remaining bmap free list is cleaned up by the caller
+	 * on error.
+	 */
 	efd = xfs_trans_get_efd(*tp, efi, flist->xbf_count);
 	for (free = flist->xbf_first; free != NULL; free = next) {
 		next = free->xbfi_next;
 
-		/*
-		 * Free the extent and log the EFD to dirty the transaction
-		 * before handling errors. This ensures that the transaction is
-		 * aborted, which:
-		 *
-		 * 1.) releases the EFI and frees the EFD
-		 * 2.) shuts down the filesystem
-		 *
-		 * The bmap free list is cleaned up at a higher level.
-		 */
-		error = xfs_free_extent(*tp, free->xbfi_startblock,
-					free->xbfi_blockcount);
-		xfs_trans_log_efd_extent(*tp, efd, free->xbfi_startblock,
-					 free->xbfi_blockcount);
+		error = xfs_trans_free_extent(*tp, efd, free->xbfi_startblock,
+					      free->xbfi_blockcount);
 		if (error)
 			return error;
 
@@ -911,7 +902,7 @@ xfs_free_eofblocks(
 
 		if (need_iolock) {
 			if (!xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
-				xfs_trans_cancel(tp, 0);
+				xfs_trans_cancel(tp);
 				return -EAGAIN;
 			}
 		}
@@ -919,7 +910,7 @@ xfs_free_eofblocks(
 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
 		if (error) {
 			ASSERT(XFS_FORCED_SHUTDOWN(mp));
-			xfs_trans_cancel(tp, 0);
+			xfs_trans_cancel(tp);
 			if (need_iolock)
 				xfs_iunlock(ip, XFS_IOLOCK_EXCL);
 			return error;
@@ -941,12 +932,9 @@ xfs_free_eofblocks(
 			 * If we get an error at this point we simply don't
 			 * bother truncating the file.
 			 */
-			xfs_trans_cancel(tp,
-					 (XFS_TRANS_RELEASE_LOG_RES |
-					  XFS_TRANS_ABORT));
+			xfs_trans_cancel(tp);
 		} else {
-			error = xfs_trans_commit(tp,
-						XFS_TRANS_RELEASE_LOG_RES);
+			error = xfs_trans_commit(tp);
 			if (!error)
 				xfs_inode_clear_eofblocks_tag(ip);
 		}
@@ -979,7 +967,6 @@ xfs_alloc_file_space(
 	xfs_bmbt_irec_t		imaps[1], *imapp;
 	xfs_bmap_free_t		free_list;
 	uint			qblocks, resblks, resrtextents;
-	int			committed;
 	int			error;
 
 	trace_xfs_alloc_file_space(ip);
@@ -1059,7 +1046,7 @@ xfs_alloc_file_space(
 			 * Free the transaction structure.
 			 */
 			ASSERT(error == -ENOSPC || XFS_FORCED_SHUTDOWN(mp));
-			xfs_trans_cancel(tp, 0);
+			xfs_trans_cancel(tp);
 			break;
 		}
 		xfs_ilock(ip, XFS_ILOCK_EXCL);
@@ -1074,23 +1061,20 @@ xfs_alloc_file_space(
 		error = xfs_bmapi_write(tp, ip, startoffset_fsb,
 					allocatesize_fsb, alloc_type, &firstfsb,
 					resblks, imapp, &nimaps, &free_list);
-		if (error) {
+		if (error)
 			goto error0;
-		}
 
 		/*
 		 * Complete the transaction
 		 */
-		error = xfs_bmap_finish(&tp, &free_list, &committed);
-		if (error) {
+		error = xfs_bmap_finish(&tp, &free_list, NULL);
+		if (error)
 			goto error0;
-		}
 
-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+		error = xfs_trans_commit(tp);
 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
-		if (error) {
+		if (error)
 			break;
-		}
 
 		allocated_fsb = imapp->br_blockcount;
 
@@ -1110,7 +1094,7 @@ error0:	/* Cancel bmap, unlock inode, unreserve quota blocks, cancel trans */
 	xfs_trans_unreserve_quota_nblks(tp, ip, (long)qblocks, 0, quota_flag);
 
 error1:	/* Just cancel transaction */
-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+	xfs_trans_cancel(tp);
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	return error;
 }
@@ -1216,7 +1200,6 @@ xfs_free_file_space(
 	xfs_off_t		offset,
 	xfs_off_t		len)
 {
-	int			committed;
 	int			done;
 	xfs_fileoff_t		endoffset_fsb;
 	int			error;
@@ -1337,7 +1320,7 @@ xfs_free_file_space(
 			 * Free the transaction structure.
 			 */
 			ASSERT(error == -ENOSPC || XFS_FORCED_SHUTDOWN(mp));
-			xfs_trans_cancel(tp, 0);
+			xfs_trans_cancel(tp);
 			break;
 		}
 		xfs_ilock(ip, XFS_ILOCK_EXCL);
@@ -1356,19 +1339,17 @@ xfs_free_file_space(
 		error = xfs_bunmapi(tp, ip, startoffset_fsb,
 				  endoffset_fsb - startoffset_fsb,
 				  0, 2, &firstfsb, &free_list, &done);
-		if (error) {
+		if (error)
 			goto error0;
-		}
 
 		/*
 		 * complete the transaction
 		 */
-		error = xfs_bmap_finish(&tp, &free_list, &committed);
-		if (error) {
+		error = xfs_bmap_finish(&tp, &free_list, NULL);
+		if (error)
 			goto error0;
-		}
 
-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+		error = xfs_trans_commit(tp);
 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	}
 
@@ -1378,7 +1359,7 @@ xfs_free_file_space(
  error0:
 	xfs_bmap_cancel(&free_list);
  error1:
-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+	xfs_trans_cancel(tp);
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	goto out;
 }
@@ -1447,7 +1428,6 @@ xfs_collapse_file_space(
 	int			error;
 	struct xfs_bmap_free	free_list;
 	xfs_fsblock_t		first_block;
-	int			committed;
 	xfs_fileoff_t		start_fsb;
 	xfs_fileoff_t		next_fsb;
 	xfs_fileoff_t		shift_fsb;
@@ -1500,7 +1480,7 @@ xfs_collapse_file_space(
 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
 		if (error) {
-			xfs_trans_cancel(tp, 0);
+			xfs_trans_cancel(tp);
 			break;
 		}
 
@@ -1510,7 +1490,7 @@ xfs_collapse_file_space(
 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
 				XFS_QMOPT_RES_REGBLKS);
 		if (error)
-			goto out;
+			goto out_trans_cancel;
 
 		xfs_trans_ijoin(tp, ip, 0);
 
@@ -1525,20 +1505,22 @@ xfs_collapse_file_space(
 				&done, &next_fsb, &first_block, &free_list,
 				XFS_BMAP_MAX_SHIFT_EXTENTS);
 		if (error)
-			goto out;
+			goto out_bmap_cancel;
 
-		error = xfs_bmap_finish(&tp, &free_list, &committed);
+		error = xfs_bmap_finish(&tp, &free_list, NULL);
 		if (error)
-			goto out;
+			goto out_bmap_cancel;
 
-		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+		error = xfs_trans_commit(tp);
 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	}
 
 	return error;
 
-out:
-	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+out_bmap_cancel:
+	xfs_bmap_cancel(&free_list);
+out_trans_cancel:
+	xfs_trans_cancel(tp);
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 	return error;
 }
@@ -1705,7 +1687,7 @@ xfs_swap_extents(
 	tp = xfs_trans_alloc(mp, XFS_TRANS_SWAPEXT);
 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
 	if (error) {
-		xfs_trans_cancel(tp, 0);
+		xfs_trans_cancel(tp);
 		goto out_unlock;
 	}
 
@@ -1888,7 +1870,7 @@ xfs_swap_extents(
 	if (mp->m_flags & XFS_MOUNT_WSYNC)
 		xfs_trans_set_sync(tp);
 
-	error = xfs_trans_commit(tp, 0);
+	error = xfs_trans_commit(tp);
 
 	trace_xfs_swap_extent_after(ip, 0);
 	trace_xfs_swap_extent_after(tip, 1);
@@ -1902,6 +1884,6 @@ out_unlock:
 	goto out;
 
 out_trans_cancel:
-	xfs_trans_cancel(tp, 0);
+	xfs_trans_cancel(tp);
 	goto out;
 }

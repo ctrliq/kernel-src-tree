@@ -261,6 +261,16 @@ static ssize_t operstate_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(operstate);
 
+static ssize_t carrier_changes_show(struct device *dev,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	struct net_device *netdev = to_net_dev(dev);
+	return sprintf(buf, fmt_dec,
+		       atomic_read(&netdev->carrier_changes));
+}
+static DEVICE_ATTR_RO(carrier_changes);
+
 /* read-write attributes */
 
 static int change_mtu(struct net_device *net, unsigned long new_mtu)
@@ -383,7 +393,7 @@ static ssize_t phys_port_id_show(struct device *dev,
 		return restart_syscall();
 
 	if (dev_isalive(netdev)) {
-		struct netdev_phys_port_id ppid;
+		struct netdev_phys_item_id ppid;
 
 		ret = dev_get_phys_port_id(netdev, &ppid);
 		if (!ret)
@@ -411,6 +421,7 @@ static struct attribute *net_class_attrs[] = {
 	&dev_attr_duplex.attr,
 	&dev_attr_dormant.attr,
 	&dev_attr_operstate.attr,
+	&dev_attr_carrier_changes.attr,
 	&dev_attr_ifalias.attr,
 	&dev_attr_carrier.attr,
 	&dev_attr_mtu.attr,
@@ -477,6 +488,7 @@ NETSTAT_ENTRY(tx_heartbeat_errors);
 NETSTAT_ENTRY(tx_window_errors);
 NETSTAT_ENTRY(rx_compressed);
 NETSTAT_ENTRY(tx_compressed);
+NETSTAT_ENTRY(rx_nohandler);
 
 static struct attribute *netstat_attrs[] = {
 	&dev_attr_rx_packets.attr,
@@ -502,6 +514,7 @@ static struct attribute *netstat_attrs[] = {
 	&dev_attr_tx_window_errors.attr,
 	&dev_attr_rx_compressed.attr,
 	&dev_attr_tx_compressed.attr,
+	&dev_attr_rx_nohandler.attr,
 	NULL
 };
 
@@ -886,6 +899,57 @@ static ssize_t show_trans_timeout(struct netdev_queue *queue,
 	return sprintf(buf, "%lu", trans_timeout);
 }
 
+#ifdef CONFIG_XPS
+static unsigned int get_netdev_queue_index(struct netdev_queue *queue)
+{
+	struct net_device *dev = queue->dev;
+	unsigned int i;
+
+	i = queue - dev->_tx;
+	BUG_ON(i >= dev->num_tx_queues);
+
+	return i;
+}
+
+static ssize_t show_tx_maxrate(struct netdev_queue *queue,
+			       struct netdev_queue_attribute *attribute,
+			       char *buf)
+{
+	return sprintf(buf, "%lu\n", queue->tx_maxrate);
+}
+
+static ssize_t set_tx_maxrate(struct netdev_queue *queue,
+			      struct netdev_queue_attribute *attribute,
+			      const char *buf, size_t len)
+{
+	struct net_device *dev = queue->dev;
+	int err, index = get_netdev_queue_index(queue);
+	u32 rate = 0;
+
+	err = kstrtou32(buf, 10, &rate);
+	if (err < 0)
+		return err;
+
+	if (!rtnl_trylock())
+		return restart_syscall();
+
+	err = -EOPNOTSUPP;
+	if (get_ndo_ext(dev->netdev_ops, ndo_set_tx_maxrate))
+		err = get_ndo_ext(dev->netdev_ops, ndo_set_tx_maxrate)(dev, index, rate);
+
+	rtnl_unlock();
+	if (!err) {
+		queue->tx_maxrate = rate;
+		return len;
+	}
+	return err;
+}
+
+static struct netdev_queue_attribute queue_tx_maxrate =
+	__ATTR(tx_maxrate, S_IRUGO | S_IWUSR,
+	       show_tx_maxrate, set_tx_maxrate);
+#endif
+
 static struct netdev_queue_attribute queue_trans_timeout =
 	__ATTR(tx_timeout, S_IRUGO, show_trans_timeout, NULL);
 
@@ -1000,18 +1064,6 @@ static struct attribute_group dql_group = {
 #endif /* CONFIG_BQL */
 
 #ifdef CONFIG_XPS
-static unsigned int get_netdev_queue_index(struct netdev_queue *queue)
-{
-	struct net_device *dev = queue->dev;
-	unsigned int i;
-
-	i = queue - dev->_tx;
-	BUG_ON(i >= dev->num_tx_queues);
-
-	return i;
-}
-
-
 static ssize_t show_xps_map(struct netdev_queue *queue,
 			    struct netdev_queue_attribute *attribute, char *buf)
 {
@@ -1095,6 +1147,7 @@ static struct attribute *netdev_queue_default_attrs[] = {
 	&queue_trans_timeout.attr,
 #ifdef CONFIG_XPS
 	&xps_cpus_attribute.attr,
+	&queue_tx_maxrate.attr,
 #endif
 	NULL
 };

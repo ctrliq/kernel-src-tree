@@ -157,6 +157,11 @@ struct ipmi_shadow_smi_handlers {
 	   watch for these.  This may be NULL if the SMI does not
 	   implement it. */
 	void (*set_need_watch)(void *send_info, int enable);
+
+	/*
+	 * Called when flushing all pending messages.
+	 */
+	void (*flush_messages)(void *send_info);
 };
 
 struct ipmi_shadow_smi_handlers *ipmi_get_shadow_smi_handlers(void);

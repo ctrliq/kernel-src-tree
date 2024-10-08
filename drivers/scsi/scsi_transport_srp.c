@@ -395,6 +395,36 @@ static void srp_reconnect_work(struct work_struct *work)
 	}
 }
 
+/**
+ * scsi_request_fn_active() - number of kernel threads inside scsi_request_fn()
+ * @shost: SCSI host for which to count the number of scsi_request_fn() callers.
+ *
+ * To do: add support for scsi-mq in this function.
+ */
+static int scsi_request_fn_active(struct Scsi_Host *shost)
+{
+	struct scsi_device *sdev;
+	struct request_queue *q;
+	int request_fn_active = 0;
+
+	shost_for_each_device(sdev, shost) {
+		q = sdev->request_queue;
+
+		spin_lock_irq(q->queue_lock);
+		request_fn_active += q->request_fn_active;
+		spin_unlock_irq(q->queue_lock);
+	}
+
+	return request_fn_active;
+}
+
+/* Wait until ongoing shost->hostt->queuecommand() calls have finished. */
+static void srp_wait_for_queuecommand(struct Scsi_Host *shost)
+{
+	while (scsi_request_fn_active(shost))
+		msleep(20);
+}
+
 static void __rport_fail_io_fast(struct srp_rport *rport)
 {
 	struct Scsi_Host *shost = rport_to_shost(rport);
@@ -408,8 +438,10 @@ static void __rport_fail_io_fast(struct srp_rport *rport)
 
 	/* Involve the LLD if possible to terminate all I/O on the rport. */
 	i = to_srp_internal(shost->transportt);
-	if (i->f->terminate_rport_io)
+	if (i->f->terminate_rport_io) {
+		srp_wait_for_queuecommand(shost);
 		i->f->terminate_rport_io(rport);
+	}
 }
 
 /**
@@ -458,37 +490,29 @@ static void __srp_start_tl_fail_timers(struct srp_rport *rport)
 
 	lockdep_assert_held(&rport->mutex);
 
-	if (!rport->deleted) {
-		delay = rport->reconnect_delay;
-		fast_io_fail_tmo = rport->fast_io_fail_tmo;
-		dev_loss_tmo = rport->dev_loss_tmo;
-		pr_debug("%s current state: %d\n",
-			 dev_name(&shost->shost_gendev), rport->state);
+	delay = rport->reconnect_delay;
+	fast_io_fail_tmo = rport->fast_io_fail_tmo;
+	dev_loss_tmo = rport->dev_loss_tmo;
+	pr_debug("%s current state: %d\n", dev_name(&shost->shost_gendev),
+		 rport->state);
 
-		if (delay > 0)
-			queue_delayed_work(system_long_wq,
-					   &rport->reconnect_work,
-					   1UL * delay * HZ);
-		if (fast_io_fail_tmo >= 0 &&
-		    srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
-			pr_debug("%s new state: %d\n",
-				 dev_name(&shost->shost_gendev),
-				 rport->state);
-			scsi_target_block(&shost->shost_gendev);
+	if (rport->state == SRP_RPORT_LOST)
+		return;
+	if (delay > 0)
+		queue_delayed_work(system_long_wq, &rport->reconnect_work,
+				   1UL * delay * HZ);
+	if (srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
+		pr_debug("%s new state: %d\n", dev_name(&shost->shost_gendev),
+			 rport->state);
+		scsi_target_block(&shost->shost_gendev);
+		if (fast_io_fail_tmo >= 0)
 			queue_delayed_work(system_long_wq,
 					   &rport->fast_io_fail_work,
 					   1UL * fast_io_fail_tmo * HZ);
-		}
 		if (dev_loss_tmo >= 0)
 			queue_delayed_work(system_long_wq,
 					   &rport->dev_loss_work,
 					   1UL * dev_loss_tmo * HZ);
-	} else {
-		pr_debug("%s has already been deleted\n",
-			 dev_name(&shost->shost_gendev));
-		srp_rport_set_state(rport, SRP_RPORT_FAIL_FAST);
-		scsi_target_unblock(&shost->shost_gendev,
-				    SDEV_TRANSPORT_OFFLINE);
 	}
 }
 
@@ -505,26 +529,6 @@ void srp_start_tl_fail_timers(struct srp_rport *rport)
 	mutex_unlock(&rport->mutex);
 }
 EXPORT_SYMBOL(srp_start_tl_fail_timers);
-
-/**
- * scsi_request_fn_active() - number of kernel threads inside scsi_request_fn()
- */
-static int scsi_request_fn_active(struct Scsi_Host *shost)
-{
-	struct scsi_device *sdev;
-	struct request_queue *q;
-	int request_fn_active = 0;
-
-	shost_for_each_device(sdev, shost) {
-		q = sdev->request_queue;
-
-		spin_lock_irq(q->queue_lock);
-		request_fn_active += q->request_fn_active;
-		spin_unlock_irq(q->queue_lock);
-	}
-
-	return request_fn_active;
-}
 
 /**
  * srp_reconnect_rport() - reconnect to an SRP target port
@@ -560,9 +564,8 @@ int srp_reconnect_rport(struct srp_rport *rport)
 	if (res)
 		goto out;
 	scsi_target_block(&shost->shost_gendev);
-	while (scsi_request_fn_active(shost))
-		msleep(20);
-	res = i->f->reconnect(rport);
+	srp_wait_for_queuecommand(shost);
+	res = rport->state != SRP_RPORT_LOST ? i->f->reconnect(rport) : -ENODEV;
 	pr_debug("%s (state %d): transport.reconnect() returned %d\n",
 		 dev_name(&shost->shost_gendev), rport->state, res);
 	if (res == 0) {
@@ -629,10 +632,6 @@ static enum blk_eh_timer_return srp_timed_out(struct scsi_cmnd *scmd)
 static void srp_rport_release(struct device *dev)
 {
 	struct srp_rport *rport = dev_to_rport(dev);
-
-	cancel_delayed_work_sync(&rport->reconnect_work);
-	cancel_delayed_work_sync(&rport->fast_io_fail_work);
-	cancel_delayed_work_sync(&rport->dev_loss_work);
 
 	put_device(dev->parent);
 	kfree(rport);
@@ -788,12 +787,6 @@ void srp_rport_del(struct srp_rport *rport)
 	device_del(dev);
 	transport_destroy_device(dev);
 
-	mutex_lock(&rport->mutex);
-	if (rport->state == SRP_RPORT_BLOCKED)
-		__rport_fail_io_fast(rport);
-	rport->deleted = true;
-	mutex_unlock(&rport->mutex);
-
 	put_device(dev);
 }
 EXPORT_SYMBOL_GPL(srp_rport_del);
@@ -817,6 +810,27 @@ void srp_remove_host(struct Scsi_Host *shost)
 	device_for_each_child(&shost->shost_gendev, NULL, do_srp_rport_del);
 }
 EXPORT_SYMBOL_GPL(srp_remove_host);
+
+/**
+ * srp_stop_rport_timers - stop the transport layer recovery timers
+ *
+ * Must be called after srp_remove_host() and scsi_remove_host(). The caller
+ * must hold a reference on the rport (rport->dev) and on the SCSI host
+ * (rport->dev.parent).
+ */
+void srp_stop_rport_timers(struct srp_rport *rport)
+{
+	mutex_lock(&rport->mutex);
+	if (rport->state == SRP_RPORT_BLOCKED)
+		__rport_fail_io_fast(rport);
+	srp_rport_set_state(rport, SRP_RPORT_LOST);
+	mutex_unlock(&rport->mutex);
+
+	cancel_delayed_work_sync(&rport->reconnect_work);
+	cancel_delayed_work_sync(&rport->fast_io_fail_work);
+	cancel_delayed_work_sync(&rport->dev_loss_work);
+}
+EXPORT_SYMBOL_GPL(srp_stop_rport_timers);
 
 static int srp_tsk_mgmt_response(struct Scsi_Host *shost, u64 nexus, u64 tm_id,
 				 int result)

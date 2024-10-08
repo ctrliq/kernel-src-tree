@@ -12,6 +12,7 @@
 
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/fwnode.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -1039,6 +1040,16 @@ int device_private_init(struct device *dev)
 	return 0;
 }
 
+/** device_rh_alloc -- allocate a device_rh
+ * @dev: device to attach device_rh to.
+ */
+void device_rh_alloc(struct device *dev)
+{
+	dev->device_rh = kzalloc(sizeof(struct device_rh),
+				 GFP_KERNEL | __GFP_NOFAIL);
+}
+EXPORT_SYMBOL(device_rh_alloc);
+
 /**
  * device_add - add device to device hierarchy.
  * @dev: device.
@@ -1072,9 +1083,17 @@ int device_add(struct device *dev)
 	if (!dev)
 		goto done;
 
-	/* allocate the Red Hat only struct */
-	dev->device_rh = kzalloc(sizeof(struct device_rh),
-				 GFP_KERNEL | __GFP_NOFAIL);
+	/* In general, this is where we allocate the Red Hat only struct.
+	 * A known exception is the acpi_bus_scan() which requires elements
+	 * from the device_rh struct during initialization.  This test will
+	 * allow code to allocate & use the device_rh struct prior to calling
+	 * device_add().
+	 *
+	 * Regardless of when allocated, the device_rh will be free'd at the
+	 * end of device_del().
+	 */
+	if (!dev->device_rh)
+		device_rh_alloc(dev);
 
 	if (!dev->p) {
 		error = device_private_init(dev);
@@ -2288,3 +2307,64 @@ define_dev_printk_level(dev_notice, KERN_NOTICE);
 define_dev_printk_level(_dev_info, KERN_INFO);
 
 #endif
+
+static inline bool fwnode_is_primary(struct fwnode_handle *fwnode)
+{
+	return fwnode && !IS_ERR(fwnode->secondary);
+}
+
+/**
+ * set_primary_fwnode - Change the primary firmware node of a given device.
+ * @dev: Device to handle.
+ * @fwnode: New primary firmware node of the device.
+ *
+ * Set the device's firmware node pointer to @fwnode, but if a secondary
+ * firmware node of the device is present, preserve it.
+ */
+void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode)
+{
+	if (!dev->device_rh) {
+		dev_dbg(dev, "set_primary_fwnode: allocated device_rh\n");
+		device_rh_alloc(dev);
+	}
+
+	if (fwnode) {
+		struct fwnode_handle *fn = get_rh_dev_fwnode(dev);
+
+		if (fwnode_is_primary(fn))
+			fn = fn->secondary;
+
+		if (fn) {
+			WARN_ON(fwnode->secondary);
+			fwnode->secondary = fn;
+		}
+		set_rh_dev_fwnode(dev, fwnode);
+	} else {
+		if (fwnode_is_primary(get_rh_dev_fwnode(dev)))
+			set_rh_dev_fwnode(dev,
+					  get_rh_dev_fwnode(dev)->secondary);
+		else
+			set_rh_dev_fwnode(dev, NULL);
+	}
+}
+EXPORT_SYMBOL_GPL(set_primary_fwnode);
+
+/**
+ * set_secondary_fwnode - Change the secondary firmware node of a given device.
+ * @dev: Device to handle.
+ * @fwnode: New secondary firmware node of the device.
+ *
+ * If a primary firmware node of the device is present, set its secondary
+ * pointer to @fwnode.  Otherwise, set the device's firmware node pointer to
+ * @fwnode.
+ */
+void set_secondary_fwnode(struct device *dev, struct fwnode_handle *fwnode)
+{
+	if (fwnode)
+		fwnode->secondary = ERR_PTR(-ENODEV);
+
+	if (fwnode_is_primary(get_rh_dev_fwnode(dev)))
+		get_rh_dev_fwnode(dev)->secondary = fwnode;
+	else
+		set_rh_dev_fwnode(dev, fwnode);
+}

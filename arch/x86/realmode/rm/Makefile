@@ -6,6 +6,7 @@
 # for more details.
 #
 #
+OBJECT_FILES_NON_STANDARD	:= y
 
 always := realmode.bin realmode.relocs
 

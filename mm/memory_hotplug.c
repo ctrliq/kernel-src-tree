@@ -18,6 +18,7 @@
 #include <linux/sysctl.h>
 #include <linux/cpu.h>
 #include <linux/memory.h>
+#include <linux/memremap.h>
 #include <linux/memory_hotplug.h>
 #include <linux/highmem.h>
 #include <linux/vmalloc.h>
@@ -32,6 +33,7 @@
 #include <linux/stop_machine.h>
 #include <linux/memblock.h>
 #include <linux/bootmem.h>
+#include <linux/hugetlb.h>
 
 #include <asm/tlbflush.h>
 
@@ -96,7 +98,7 @@ void get_page_bootmem(unsigned long info,  struct page *page,
 	page->lru.next = (struct list_head *) type;
 	SetPagePrivate(page);
 	set_page_private(page, info);
-	atomic_inc(&page->_count);
+	page_ref_inc(page);
 }
 
 void put_page_bootmem(struct page *page)
@@ -107,7 +109,7 @@ void put_page_bootmem(struct page *page)
 	BUG_ON(type < MEMORY_HOTPLUG_MIN_BOOTMEM_TYPE ||
 	       type > MEMORY_HOTPLUG_MAX_BOOTMEM_TYPE);
 
-	if (atomic_dec_return(&page->_count) == 1) {
+	if (page_ref_dec_return(page) == 1) {
 		ClearPagePrivate(page);
 		set_page_private(page, 0);
 		INIT_LIST_HEAD(&page->lru);
@@ -385,7 +387,13 @@ static int __meminit __add_zone(struct zone *zone, unsigned long phys_start_pfn)
 	unsigned long flags, pfn;
 	int ret;
 
-	zone_type = zone - pgdat->node_zones;
+#ifdef CONFIG_ZONE_DEVICE
+	if (zone == pgdat->zone_device)
+		zone_type = ZONE_DEVICE;
+	else
+#endif
+		zone_type = zone - pgdat->node_zones;
+
 	ret = ensure_zone_is_initialized(zone, phys_start_pfn, nr_pages);
 	if (ret)
 		return ret;
@@ -442,9 +450,24 @@ int __ref __add_pages(int nid, struct zone *zone, unsigned long phys_start_pfn,
 	unsigned long i;
 	int err = 0;
 	int start_sec, end_sec;
+	struct vmem_altmap *altmap;
+
 	/* during initialize mem_map, align hot-added range to section */
 	start_sec = pfn_to_section_nr(phys_start_pfn);
 	end_sec = pfn_to_section_nr(phys_start_pfn + nr_pages - 1);
+
+	altmap = to_vmem_altmap((unsigned long) pfn_to_page(phys_start_pfn));
+	if (altmap) {
+		/*
+		 * Validate altmap is within bounds of the total request
+		 */
+		if (altmap->base_pfn != phys_start_pfn
+				|| vmem_altmap_offset(altmap) > nr_pages) {
+			pr_warn_once("memory add fail, invalid altmap\n");
+			return -EINVAL;
+		}
+		altmap->alloc = 0;
+	}
 
 	for (i = start_sec; i <= end_sec; i++) {
 		err = __add_section(nid, zone, i << PFN_SECTION_SHIFT);
@@ -657,7 +680,12 @@ static void __remove_zone(struct zone *zone, unsigned long start_pfn)
 	int zone_type;
 	unsigned long flags;
 
-	zone_type = zone - pgdat->node_zones;
+#ifdef CONFIG_ZONE_DEVICE
+	if (zone == pgdat->zone_device)
+		zone_type = ZONE_DEVICE;
+	else
+#endif
+		zone_type = zone - pgdat->node_zones;
 
 	pgdat_resize_lock(zone->zone_pgdat, &flags);
 	shrink_zone_span(zone, start_pfn, start_pfn + nr_pages);
@@ -665,7 +693,8 @@ static void __remove_zone(struct zone *zone, unsigned long start_pfn)
 	pgdat_resize_unlock(zone->zone_pgdat, &flags);
 }
 
-static int __remove_section(struct zone *zone, struct mem_section *ms)
+static int __remove_section(struct zone *zone, struct mem_section *ms,
+		unsigned long map_offset)
 {
 	unsigned long start_pfn;
 	int scn_nr;
@@ -682,7 +711,7 @@ static int __remove_section(struct zone *zone, struct mem_section *ms)
 	start_pfn = section_nr_to_pfn(scn_nr);
 	__remove_zone(zone, start_pfn);
 
-	sparse_remove_one_section(zone, ms);
+	sparse_remove_one_section(zone, ms, map_offset);
 	return 0;
 }
 
@@ -701,9 +730,32 @@ int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
 		 unsigned long nr_pages)
 {
 	unsigned long i;
-	int sections_to_remove;
-	resource_size_t start, size;
-	int ret = 0;
+	unsigned long map_offset = 0;
+	int sections_to_remove, ret = 0;
+
+	/* In the ZONE_DEVICE case device driver owns the memory region */
+	if (is_dev_zone(zone)) {
+		struct page *page = pfn_to_page(phys_start_pfn);
+		struct vmem_altmap *altmap;
+
+		altmap = to_vmem_altmap((unsigned long) page);
+		if (altmap)
+			map_offset = vmem_altmap_offset(altmap);
+	} else {
+		resource_size_t start, size;
+
+		start = phys_start_pfn << PAGE_SHIFT;
+		size = nr_pages * PAGE_SIZE;
+
+		ret = release_mem_region_adjustable(&iomem_resource, start,
+					size);
+		if (ret) {
+			resource_size_t endres = start + size - 1;
+
+			pr_warn("Unable to release resource <%pa-%pa> (%d)\n",
+					&start, &endres, ret);
+		}
+	}
 
 	/*
 	 * We can only remove entire sections
@@ -711,20 +763,12 @@ int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
 	BUG_ON(phys_start_pfn & ~PAGE_SECTION_MASK);
 	BUG_ON(nr_pages % PAGES_PER_SECTION);
 
-	start = phys_start_pfn << PAGE_SHIFT;
-	size = nr_pages * PAGE_SIZE;
-	ret = release_mem_region_adjustable(&iomem_resource, start, size);
-	if (ret) {
-		resource_size_t endres = start + size - 1;
-
-		pr_warn("Unable to release resource <%pa-%pa> (%d)\n",
-				&start, &endres, ret);
-	}
-
 	sections_to_remove = nr_pages / PAGES_PER_SECTION;
 	for (i = 0; i < sections_to_remove; i++) {
 		unsigned long pfn = phys_start_pfn + i*PAGES_PER_SECTION;
-		ret = __remove_section(zone, __pfn_to_section(pfn));
+
+		ret = __remove_section(zone, __pfn_to_section(pfn), map_offset);
+		map_offset = 0;
 		if (ret)
 			break;
 	}
@@ -778,20 +822,13 @@ EXPORT_SYMBOL_GPL(__online_page_set_limits);
 
 void __online_page_increment_counters(struct page *page)
 {
-	totalram_pages++;
-
-#ifdef CONFIG_HIGHMEM
-	if (PageHighMem(page))
-		totalhigh_pages++;
-#endif
+	adjust_managed_page_count(page, 1);
 }
 EXPORT_SYMBOL_GPL(__online_page_increment_counters);
 
 void __online_page_free(struct page *page)
 {
-	ClearPageReserved(page);
-	init_page_count(page);
-	__free_page(page);
+	__free_reserved_page(page);
 }
 EXPORT_SYMBOL_GPL(__online_page_free);
 
@@ -988,7 +1025,6 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_typ
 		return ret;
 	}
 
-	zone->managed_pages += onlined_pages;
 	zone->present_pages += onlined_pages;
 	zone->zone_pgdat->node_present_pages += onlined_pages;
 	if (onlined_pages) {
@@ -1148,8 +1184,13 @@ static int should_add_memory_movable(int nid, u64 start, u64 size)
 	return 0;
 }
 
-int zone_for_memory(int nid, u64 start, u64 size, int zone_default)
+int zone_for_memory(int nid, u64 start, u64 size, int zone_default,
+		bool for_device)
 {
+#ifdef CONFIG_ZONE_DEVICE
+	if (for_device)
+		return ZONE_DEVICE;
+#endif
 	if (should_add_memory_movable(nid, start, size))
 		return ZONE_MOVABLE;
 
@@ -1180,6 +1221,15 @@ int __ref add_memory(int nid, u64 start, u64 size)
 		void *p = NODE_DATA(nid);
 		new_pgdat = !p;
 	}
+
+	/*
+	 * Add new range to memblock so that when hotadd_new_pgdat() is called
+	 * to allocate new pgdat, get_pfn_range_for_nid() will be able to find
+	 * this new range and calculate total pages correctly.  The range will
+	 * be removed at hot-remove time.
+	 */
+	memblock_add_node(start, size, nid);
+
 	new_node = !node_online(nid);
 	if (new_node) {
 		pgdat = hotadd_new_pgdat(nid, start);
@@ -1189,7 +1239,7 @@ int __ref add_memory(int nid, u64 start, u64 size)
 	}
 
 	/* call arch's memory hotadd */
-	ret = arch_add_memory(nid, start, size);
+	ret = arch_add_memory(nid, start, size, false);
 
 	if (ret < 0)
 		goto error;
@@ -1217,6 +1267,7 @@ error:
 	if (new_pgdat)
 		rollback_node_hotadd(nid, pgdat);
 	release_memory_resource(res);
+	memblock_remove(start, size);
 
 out:
 	unlock_memory_hotplug();
@@ -1306,10 +1357,12 @@ static int test_pages_in_a_zone(unsigned long start_pfn, unsigned long end_pfn)
 }
 
 /*
- * Scanning pfn is much easier than scanning lru list.
- * Scan pfn from start to end and Find LRU page.
+ * Scan pfn range [start,end) to find movable/migratable pages (LRU pages
+ * and hugepages). We scan pfn because it's much easier than scanning over
+ * linked list. This function returns the pfn of the first found movable
+ * page if it's found, otherwise 0.
  */
-static unsigned long scan_lru_pages(unsigned long start, unsigned long end)
+static unsigned long scan_movable_pages(unsigned long start, unsigned long end)
 {
 	unsigned long pfn;
 	struct page *page;
@@ -1318,6 +1371,13 @@ static unsigned long scan_lru_pages(unsigned long start, unsigned long end)
 			page = pfn_to_page(pfn);
 			if (PageLRU(page))
 				return pfn;
+			if (PageHuge(page)) {
+				if (page_huge_active(page))
+					return pfn;
+				else
+					pfn = round_up(pfn + 1,
+						1 << compound_order(page)) - 1;
+			}
 		}
 	}
 	return 0;
@@ -1338,6 +1398,19 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 		if (!pfn_valid(pfn))
 			continue;
 		page = pfn_to_page(pfn);
+
+		if (PageHuge(page)) {
+			struct page *head = compound_head(page);
+			pfn = page_to_pfn(head) + (1<<compound_order(head)) - 1;
+			if (compound_order(head) > PFN_SECTION_SHIFT) {
+				ret = -EBUSY;
+				break;
+			}
+			if (isolate_huge_page(page, &source))
+				move_pages -= 1 << compound_order(head);
+			continue;
+		}
+
 		if (!get_page_unless_zero(page))
 			continue;
 		/*
@@ -1370,7 +1443,7 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 	}
 	if (!list_empty(&source)) {
 		if (not_managed) {
-			putback_lru_pages(&source);
+			putback_movable_pages(&source);
 			goto out;
 		}
 
@@ -1381,7 +1454,7 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 		ret = migrate_pages(&source, alloc_migrate_target, 0,
 					MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
 		if (ret)
-			putback_lru_pages(&source);
+			putback_movable_pages(&source);
 	}
 out:
 	return ret;
@@ -1655,8 +1728,8 @@ repeat:
 		drain_all_pages();
 	}
 
-	pfn = scan_lru_pages(start_pfn, end_pfn);
-	if (pfn) { /* We have page on LRU */
+	pfn = scan_movable_pages(start_pfn, end_pfn);
+	if (pfn) { /* We have movable pages */
 		ret = do_migrate_range(pfn, end_pfn);
 		if (!ret) {
 			drain = 1;
@@ -1675,6 +1748,11 @@ repeat:
 	yield();
 	/* drain pcp pages, this is synchronous. */
 	drain_all_pages();
+	/*
+	 * dissolve free hugepages in the memory block before doing offlining
+	 * actually in order to make hugetlbfs's object counting consistent.
+	 */
+	dissolve_free_huge_pages(start_pfn, end_pfn);
 	/* check again */
 	offlined_pages = check_pages_isolated(start_pfn, end_pfn);
 	if (offlined_pages < 0) {
@@ -1688,10 +1766,9 @@ repeat:
 	/* reset pagetype flags and makes migrate type to be MOVABLE */
 	undo_isolate_page_range(start_pfn, end_pfn, MIGRATE_MOVABLE);
 	/* removal success */
-	zone->managed_pages -= offlined_pages;
+	adjust_managed_page_count(pfn_to_page(start_pfn), -offlined_pages);
 	zone->present_pages -= offlined_pages;
 	zone->zone_pgdat->node_present_pages -= offlined_pages;
-	totalram_pages -= offlined_pages;
 
 	init_per_zone_wmark_min();
 
@@ -1918,6 +1995,8 @@ void __ref remove_memory(int nid, u64 start, u64 size)
 
 	/* remove memmap entry */
 	firmware_map_remove(start, start + size, "System RAM");
+	memblock_free(start, size);
+	memblock_remove(start, size);
 
 	arch_remove_memory(start, size);
 

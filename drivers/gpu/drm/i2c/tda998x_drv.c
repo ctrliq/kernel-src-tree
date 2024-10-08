@@ -15,17 +15,17 @@
  * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-
-
+#include <linux/component.h>
 #include <linux/hdmi.h>
 #include <linux/module.h>
 #include <linux/irq.h>
 #include <sound/asoundef.h>
 
 #include <drm/drmP.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
-#include <drm/drm_encoder_slave.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_of.h>
 #include <drm/i2c/tda998x.h>
 
 #define DBG(fmt, ...) DRM_DEBUG(fmt"\n", ##__VA_ARGS__)
@@ -33,8 +33,9 @@
 struct tda998x_priv {
 	struct i2c_client *cec;
 	struct i2c_client *hdmi;
-	uint16_t rev;
-	uint8_t current_page;
+	struct mutex mutex;
+	u16 rev;
+	u8 current_page;
 	int dpms;
 	bool is_hdmi_sink;
 	u8 vip_cntrl_0;
@@ -44,10 +45,21 @@ struct tda998x_priv {
 
 	wait_queue_head_t wq_edid;
 	volatile int wq_edid_wait;
-	struct drm_encoder *encoder;
+
+	struct work_struct detect_work;
+	struct timer_list edid_delay_timer;
+	wait_queue_head_t edid_delay_waitq;
+	bool edid_delay_active;
+
+	struct drm_encoder encoder;
+	struct drm_connector connector;
 };
 
-#define to_tda998x_priv(x)  ((struct tda998x_priv *)to_encoder_slave(x)->slave_priv)
+#define conn_to_tda998x_priv(x) \
+	container_of(x, struct tda998x_priv, connector)
+
+#define enc_to_tda998x_priv(x) \
+	container_of(x, struct tda998x_priv, encoder)
 
 /* The TDA9988 series of devices use a paged register scheme.. to simplify
  * things we encode the page # in upper bits of the register #.  To read/
@@ -324,6 +336,8 @@ struct tda998x_priv {
 # define CEC_FRO_IM_CLK_CTRL_FRO_DIV   (1 << 0)
 #define REG_CEC_RXSHPDINTENA	  0xfc		      /* read/write */
 #define REG_CEC_RXSHPDINT	  0xfd		      /* read */
+# define CEC_RXSHPDINT_RXSENS     BIT(0)
+# define CEC_RXSHPDINT_HPD        BIT(1)
 #define REG_CEC_RXSHPDLEV         0xfe                /* read */
 # define CEC_RXSHPDLEV_RXSENS     (1 << 0)
 # define CEC_RXSHPDLEV_HPD        (1 << 1)
@@ -343,10 +357,10 @@ struct tda998x_priv {
 #define TDA19988                  0x0301
 
 static void
-cec_write(struct tda998x_priv *priv, uint16_t addr, uint8_t val)
+cec_write(struct tda998x_priv *priv, u16 addr, u8 val)
 {
 	struct i2c_client *client = priv->cec;
-	uint8_t buf[] = {addr, val};
+	u8 buf[] = {addr, val};
 	int ret;
 
 	ret = i2c_master_send(client, buf, sizeof(buf));
@@ -354,11 +368,11 @@ cec_write(struct tda998x_priv *priv, uint16_t addr, uint8_t val)
 		dev_err(&client->dev, "Error %d writing to cec:0x%x\n", ret, addr);
 }
 
-static uint8_t
-cec_read(struct tda998x_priv *priv, uint8_t addr)
+static u8
+cec_read(struct tda998x_priv *priv, u8 addr)
 {
 	struct i2c_client *client = priv->cec;
-	uint8_t val;
+	u8 val;
 	int ret;
 
 	ret = i2c_master_send(client, &addr, sizeof(addr));
@@ -377,16 +391,16 @@ fail:
 }
 
 static int
-set_page(struct tda998x_priv *priv, uint16_t reg)
+set_page(struct tda998x_priv *priv, u16 reg)
 {
 	if (REG2PAGE(reg) != priv->current_page) {
 		struct i2c_client *client = priv->hdmi;
-		uint8_t buf[] = {
+		u8 buf[] = {
 				REG_CURPAGE, REG2PAGE(reg)
 		};
 		int ret = i2c_master_send(client, buf, sizeof(buf));
 		if (ret < 0) {
-			dev_err(&client->dev, "setpage %04x err %d\n",
+			dev_err(&client->dev, "%s %04x err %d\n", __func__,
 					reg, ret);
 			return ret;
 		}
@@ -397,15 +411,16 @@ set_page(struct tda998x_priv *priv, uint16_t reg)
 }
 
 static int
-reg_read_range(struct tda998x_priv *priv, uint16_t reg, char *buf, int cnt)
+reg_read_range(struct tda998x_priv *priv, u16 reg, char *buf, int cnt)
 {
 	struct i2c_client *client = priv->hdmi;
-	uint8_t addr = REG2ADDR(reg);
+	u8 addr = REG2ADDR(reg);
 	int ret;
 
+	mutex_lock(&priv->mutex);
 	ret = set_page(priv, reg);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	ret = i2c_master_send(client, &addr, sizeof(addr));
 	if (ret < 0)
@@ -415,36 +430,41 @@ reg_read_range(struct tda998x_priv *priv, uint16_t reg, char *buf, int cnt)
 	if (ret < 0)
 		goto fail;
 
-	return ret;
+	goto out;
 
 fail:
 	dev_err(&client->dev, "Error %d reading from 0x%x\n", ret, reg);
+out:
+	mutex_unlock(&priv->mutex);
 	return ret;
 }
 
 static void
-reg_write_range(struct tda998x_priv *priv, uint16_t reg, uint8_t *p, int cnt)
+reg_write_range(struct tda998x_priv *priv, u16 reg, u8 *p, int cnt)
 {
 	struct i2c_client *client = priv->hdmi;
-	uint8_t buf[cnt+1];
+	u8 buf[cnt+1];
 	int ret;
 
 	buf[0] = REG2ADDR(reg);
 	memcpy(&buf[1], p, cnt);
 
+	mutex_lock(&priv->mutex);
 	ret = set_page(priv, reg);
 	if (ret < 0)
-		return;
+		goto out;
 
 	ret = i2c_master_send(client, buf, cnt + 1);
 	if (ret < 0)
 		dev_err(&client->dev, "Error %d writing to 0x%x\n", ret, reg);
+out:
+	mutex_unlock(&priv->mutex);
 }
 
 static int
-reg_read(struct tda998x_priv *priv, uint16_t reg)
+reg_read(struct tda998x_priv *priv, u16 reg)
 {
-	uint8_t val = 0;
+	u8 val = 0;
 	int ret;
 
 	ret = reg_read_range(priv, reg, &val, sizeof(val));
@@ -454,39 +474,45 @@ reg_read(struct tda998x_priv *priv, uint16_t reg)
 }
 
 static void
-reg_write(struct tda998x_priv *priv, uint16_t reg, uint8_t val)
+reg_write(struct tda998x_priv *priv, u16 reg, u8 val)
 {
 	struct i2c_client *client = priv->hdmi;
-	uint8_t buf[] = {REG2ADDR(reg), val};
+	u8 buf[] = {REG2ADDR(reg), val};
 	int ret;
 
+	mutex_lock(&priv->mutex);
 	ret = set_page(priv, reg);
 	if (ret < 0)
-		return;
+		goto out;
 
 	ret = i2c_master_send(client, buf, sizeof(buf));
 	if (ret < 0)
 		dev_err(&client->dev, "Error %d writing to 0x%x\n", ret, reg);
+out:
+	mutex_unlock(&priv->mutex);
 }
 
 static void
-reg_write16(struct tda998x_priv *priv, uint16_t reg, uint16_t val)
+reg_write16(struct tda998x_priv *priv, u16 reg, u16 val)
 {
 	struct i2c_client *client = priv->hdmi;
-	uint8_t buf[] = {REG2ADDR(reg), val >> 8, val};
+	u8 buf[] = {REG2ADDR(reg), val >> 8, val};
 	int ret;
 
+	mutex_lock(&priv->mutex);
 	ret = set_page(priv, reg);
 	if (ret < 0)
-		return;
+		goto out;
 
 	ret = i2c_master_send(client, buf, sizeof(buf));
 	if (ret < 0)
 		dev_err(&client->dev, "Error %d writing to 0x%x\n", ret, reg);
+out:
+	mutex_unlock(&priv->mutex);
 }
 
 static void
-reg_set(struct tda998x_priv *priv, uint16_t reg, uint8_t val)
+reg_set(struct tda998x_priv *priv, u16 reg, u8 val)
 {
 	int old_val;
 
@@ -496,7 +522,7 @@ reg_set(struct tda998x_priv *priv, uint16_t reg, uint8_t val)
 }
 
 static void
-reg_clear(struct tda998x_priv *priv, uint16_t reg, uint8_t val)
+reg_clear(struct tda998x_priv *priv, u16 reg, u8 val)
 {
 	int old_val;
 
@@ -538,15 +564,60 @@ tda998x_reset(struct tda998x_priv *priv)
 }
 
 /*
+ * The TDA998x has a problem when trying to read the EDID close to a
+ * HPD assertion: it needs a delay of 100ms to avoid timing out while
+ * trying to read EDID data.
+ *
+ * However, tda998x_encoder_get_modes() may be called at any moment
+ * after tda998x_connector_detect() indicates that we are connected, so
+ * we need to delay probing modes in tda998x_encoder_get_modes() after
+ * we have seen a HPD inactive->active transition.  This code implements
+ * that delay.
+ */
+static void tda998x_edid_delay_done(unsigned long data)
+{
+	struct tda998x_priv *priv = (struct tda998x_priv *)data;
+
+	priv->edid_delay_active = false;
+	wake_up(&priv->edid_delay_waitq);
+	schedule_work(&priv->detect_work);
+}
+
+static void tda998x_edid_delay_start(struct tda998x_priv *priv)
+{
+	priv->edid_delay_active = true;
+	mod_timer(&priv->edid_delay_timer, jiffies + HZ/10);
+}
+
+static int tda998x_edid_delay_wait(struct tda998x_priv *priv)
+{
+	return wait_event_killable(priv->edid_delay_waitq, !priv->edid_delay_active);
+}
+
+/*
+ * We need to run the KMS hotplug event helper outside of our threaded
+ * interrupt routine as this can call back into our get_modes method,
+ * which will want to make use of interrupts.
+ */
+static void tda998x_detect_work(struct work_struct *work)
+{
+	struct tda998x_priv *priv =
+		container_of(work, struct tda998x_priv, detect_work);
+	struct drm_device *dev = priv->encoder.dev;
+
+	if (dev)
+		drm_kms_helper_hotplug_event(dev);
+}
+
+/*
  * only 2 interrupts may occur: screen plug/unplug and EDID read
  */
 static irqreturn_t tda998x_irq_thread(int irq, void *data)
 {
 	struct tda998x_priv *priv = data;
 	u8 sta, cec, lvl, flag0, flag1, flag2;
+	bool handled = false;
 
-	if (!priv)
-		return IRQ_HANDLED;
 	sta = cec_read(priv, REG_CEC_INTSTATUS);
 	cec = cec_read(priv, REG_CEC_RXSHPDINT);
 	lvl = cec_read(priv, REG_CEC_RXSHPDLEV);
@@ -556,73 +627,76 @@ static irqreturn_t tda998x_irq_thread(int irq, void *data)
 	DRM_DEBUG_DRIVER(
 		"tda irq sta %02x cec %02x lvl %02x f0 %02x f1 %02x f2 %02x\n",
 		sta, cec, lvl, flag0, flag1, flag2);
+
+	if (cec & CEC_RXSHPDINT_HPD) {
+		if (lvl & CEC_RXSHPDLEV_HPD)
+			tda998x_edid_delay_start(priv);
+		else
+			schedule_work(&priv->detect_work);
+
+		handled = true;
+	}
+
 	if ((flag2 & INT_FLAGS_2_EDID_BLK_RD) && priv->wq_edid_wait) {
 		priv->wq_edid_wait = 0;
 		wake_up(&priv->wq_edid);
-	} else if (cec != 0) {			/* HPD change */
-		if (priv->encoder && priv->encoder->dev)
-			drm_helper_hpd_irq_event(priv->encoder->dev);
+		handled = true;
 	}
-	return IRQ_HANDLED;
+
+	return IRQ_RETVAL(handled);
 }
-
-static uint8_t tda998x_cksum(uint8_t *buf, size_t bytes)
-{
-	int sum = 0;
-
-	while (bytes--)
-		sum -= *buf++;
-	return sum;
-}
-
-#define HB(x) (x)
-#define PB(x) (HB(2) + 1 + (x))
 
 static void
-tda998x_write_if(struct tda998x_priv *priv, uint8_t bit, uint16_t addr,
-		 uint8_t *buf, size_t size)
+tda998x_write_if(struct tda998x_priv *priv, u8 bit, u16 addr,
+		 union hdmi_infoframe *frame)
 {
-	buf[PB(0)] = tda998x_cksum(buf, size);
+	u8 buf[32];
+	ssize_t len;
+
+	len = hdmi_infoframe_pack(frame, buf, sizeof(buf));
+	if (len < 0) {
+		dev_err(&priv->hdmi->dev,
+			"hdmi_infoframe_pack() type=0x%02x failed: %zd\n",
+			frame->any.type, len);
+		return;
+	}
 
 	reg_clear(priv, REG_DIP_IF_FLAGS, bit);
-	reg_write_range(priv, addr, buf, size);
+	reg_write_range(priv, addr, buf, len);
 	reg_set(priv, REG_DIP_IF_FLAGS, bit);
 }
 
 static void
 tda998x_write_aif(struct tda998x_priv *priv, struct tda998x_encoder_params *p)
 {
-	u8 buf[PB(HDMI_AUDIO_INFOFRAME_SIZE) + 1];
+	union hdmi_infoframe frame;
 
-	memset(buf, 0, sizeof(buf));
-	buf[HB(0)] = HDMI_INFOFRAME_TYPE_AUDIO;
-	buf[HB(1)] = 0x01;
-	buf[HB(2)] = HDMI_AUDIO_INFOFRAME_SIZE;
-	buf[PB(1)] = p->audio_frame[1] & 0x07; /* CC */
-	buf[PB(2)] = p->audio_frame[2] & 0x1c; /* SF */
-	buf[PB(4)] = p->audio_frame[4];
-	buf[PB(5)] = p->audio_frame[5] & 0xf8; /* DM_INH + LSV */
+	hdmi_audio_infoframe_init(&frame.audio);
 
-	tda998x_write_if(priv, DIP_IF_FLAGS_IF4, REG_IF4_HB0, buf,
-			 sizeof(buf));
+	frame.audio.channels = p->audio_frame[1] & 0x07;
+	frame.audio.channel_allocation = p->audio_frame[4];
+	frame.audio.level_shift_value = (p->audio_frame[5] & 0x78) >> 3;
+	frame.audio.downmix_inhibit = (p->audio_frame[5] & 0x80) >> 7;
+
+	/*
+	 * L-PCM and IEC61937 compressed audio shall always set sample
+	 * frequency to "refer to stream".  For others, see the HDMI
+	 * specification.
+	 */
+	frame.audio.sample_frequency = (p->audio_frame[2] & 0x1c) >> 2;
+
+	tda998x_write_if(priv, DIP_IF_FLAGS_IF4, REG_IF4_HB0, &frame);
 }
 
 static void
 tda998x_write_avi(struct tda998x_priv *priv, struct drm_display_mode *mode)
 {
-	u8 buf[PB(HDMI_AVI_INFOFRAME_SIZE) + 1];
+	union hdmi_infoframe frame;
 
-	memset(buf, 0, sizeof(buf));
-	buf[HB(0)] = HDMI_INFOFRAME_TYPE_AVI;
-	buf[HB(1)] = 0x02;
-	buf[HB(2)] = HDMI_AVI_INFOFRAME_SIZE;
-	buf[PB(1)] = HDMI_SCAN_MODE_UNDERSCAN;
-	buf[PB(2)] = HDMI_ACTIVE_ASPECT_PICTURE;
-	buf[PB(3)] = HDMI_QUANTIZATION_RANGE_FULL << 2;
-	buf[PB(4)] = drm_match_cea_mode(mode);
+	drm_hdmi_avi_infoframe_from_display_mode(&frame.avi, mode);
+	frame.avi.quantization_range = HDMI_QUANTIZATION_RANGE_FULL;
 
-	tda998x_write_if(priv, DIP_IF_FLAGS_IF2, REG_IF2_HB0, buf,
-			 sizeof(buf));
+	tda998x_write_if(priv, DIP_IF_FLAGS_IF2, REG_IF2_HB0, &frame);
 }
 
 static void tda998x_audio_mute(struct tda998x_priv *priv, bool on)
@@ -640,8 +714,8 @@ static void
 tda998x_configure_audio(struct tda998x_priv *priv,
 		struct drm_display_mode *mode, struct tda998x_encoder_params *p)
 {
-	uint8_t buf[6], clksel_aip, clksel_fs, cts_n, adiv;
-	uint32_t n;
+	u8 buf[6], clksel_aip, clksel_fs, cts_n, adiv;
+	u32 n;
 
 	/* Enable audio ports */
 	reg_write(priv, REG_ENA_AP, p->audio_cfg);
@@ -730,12 +804,9 @@ tda998x_configure_audio(struct tda998x_priv *priv,
 
 /* DRM encoder functions */
 
-static void
-tda998x_encoder_set_config(struct drm_encoder *encoder, void *params)
+static void tda998x_encoder_set_config(struct tda998x_priv *priv,
+				       const struct tda998x_encoder_params *p)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	struct tda998x_encoder_params *p = params;
-
 	priv->vip_cntrl_0 = VIP_CNTRL_0_SWAP_A(p->swap_a) |
 			    (p->mirr_a ? VIP_CNTRL_0_MIRR_A : 0) |
 			    VIP_CNTRL_0_SWAP_B(p->swap_b) |
@@ -752,10 +823,9 @@ tda998x_encoder_set_config(struct drm_encoder *encoder, void *params)
 	priv->params = *p;
 }
 
-static void
-tda998x_encoder_dpms(struct drm_encoder *encoder, int mode)
+static void tda998x_encoder_dpms(struct drm_encoder *encoder, int mode)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
+	struct tda998x_priv *priv = enc_to_tda998x_priv(encoder);
 
 	/* we only care about on or off: */
 	if (mode != DRM_MODE_DPMS_ON)
@@ -786,31 +856,13 @@ tda998x_encoder_dpms(struct drm_encoder *encoder, int mode)
 	priv->dpms = mode;
 }
 
-static void
-tda998x_encoder_save(struct drm_encoder *encoder)
+static int tda998x_connector_mode_valid(struct drm_connector *connector,
+					struct drm_display_mode *mode)
 {
-	DBG("");
-}
+	/* TDA19988 dotclock can go up to 165MHz */
+	struct tda998x_priv *priv = conn_to_tda998x_priv(connector);
 
-static void
-tda998x_encoder_restore(struct drm_encoder *encoder)
-{
-	DBG("");
-}
-
-static bool
-tda998x_encoder_mode_fixup(struct drm_encoder *encoder,
-			  const struct drm_display_mode *mode,
-			  struct drm_display_mode *adjusted_mode)
-{
-	return true;
-}
-
-static int
-tda998x_encoder_mode_valid(struct drm_encoder *encoder,
-			  struct drm_display_mode *mode)
-{
-	if (mode->clock > 150000)
+	if (mode->clock > ((priv->rev == TDA19988) ? 165000 : 150000))
 		return MODE_CLOCK_HIGH;
 	if (mode->htotal >= BIT(13))
 		return MODE_BAD_HVALUE;
@@ -821,18 +873,18 @@ tda998x_encoder_mode_valid(struct drm_encoder *encoder,
 
 static void
 tda998x_encoder_mode_set(struct drm_encoder *encoder,
-			struct drm_display_mode *mode,
-			struct drm_display_mode *adjusted_mode)
+			 struct drm_display_mode *mode,
+			 struct drm_display_mode *adjusted_mode)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	uint16_t ref_pix, ref_line, n_pix, n_line;
-	uint16_t hs_pix_s, hs_pix_e;
-	uint16_t vs1_pix_s, vs1_pix_e, vs1_line_s, vs1_line_e;
-	uint16_t vs2_pix_s, vs2_pix_e, vs2_line_s, vs2_line_e;
-	uint16_t vwin1_line_s, vwin1_line_e;
-	uint16_t vwin2_line_s, vwin2_line_e;
-	uint16_t de_pix_s, de_pix_e;
-	uint8_t reg, div, rep;
+	struct tda998x_priv *priv = enc_to_tda998x_priv(encoder);
+	u16 ref_pix, ref_line, n_pix, n_line;
+	u16 hs_pix_s, hs_pix_e;
+	u16 vs1_pix_s, vs1_pix_e, vs1_line_s, vs1_line_e;
+	u16 vs2_pix_s, vs2_pix_e, vs2_line_s, vs2_line_e;
+	u16 vwin1_line_s, vwin1_line_e;
+	u16 vwin2_line_s, vwin2_line_e;
+	u16 de_pix_s, de_pix_e;
+	u8 reg, div, rep;
 
 	/*
 	 * Internally TDA998x is using ITU-R BT.656 style sync but
@@ -1012,21 +1064,19 @@ tda998x_encoder_mode_set(struct drm_encoder *encoder,
 }
 
 static enum drm_connector_status
-tda998x_encoder_detect(struct drm_encoder *encoder,
-		      struct drm_connector *connector)
+tda998x_connector_detect(struct drm_connector *connector, bool force)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	uint8_t val = cec_read(priv, REG_CEC_RXSHPDLEV);
+	struct tda998x_priv *priv = conn_to_tda998x_priv(connector);
+	u8 val = cec_read(priv, REG_CEC_RXSHPDLEV);
 
 	return (val & CEC_RXSHPDLEV_HPD) ? connector_status_connected :
 			connector_status_disconnected;
 }
 
-static int
-read_edid_block(struct drm_encoder *encoder, uint8_t *buf, int blk)
+static int read_edid_block(void *data, u8 *buf, unsigned int blk, size_t length)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	uint8_t offset, segptr;
+	struct tda998x_priv *priv = data;
+	u8 offset, segptr;
 	int ret, i;
 
 	offset = (blk & 1) ? 128 : 0;
@@ -1069,8 +1119,8 @@ read_edid_block(struct drm_encoder *encoder, uint8_t *buf, int blk)
 		return -ETIMEDOUT;
 	}
 
-	ret = reg_read_range(priv, REG_EDID_DATA_0, buf, EDID_LENGTH);
-	if (ret != EDID_LENGTH) {
+	ret = reg_read_range(priv, REG_EDID_DATA_0, buf, length);
+	if (ret != length) {
 		dev_err(&priv->hdmi->dev, "failed to read edid block %d: %d\n",
 			blk, ret);
 		return ret;
@@ -1079,171 +1129,74 @@ read_edid_block(struct drm_encoder *encoder, uint8_t *buf, int blk)
 	return 0;
 }
 
-static uint8_t *
-do_get_edid(struct drm_encoder *encoder)
+static int tda998x_connector_get_modes(struct drm_connector *connector)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	int j, valid_extensions = 0;
-	uint8_t *block, *new;
-	bool print_bad_edid = drm_debug & DRM_UT_KMS;
+	struct tda998x_priv *priv = conn_to_tda998x_priv(connector);
+	struct edid *edid;
+	int n;
 
-	if ((block = kmalloc(EDID_LENGTH, GFP_KERNEL)) == NULL)
-		return NULL;
+	/*
+	 * If we get killed while waiting for the HPD timeout, return
+	 * no modes found: we are not in a restartable path, so we
+	 * can't handle signals gracefully.
+	 */
+	if (tda998x_edid_delay_wait(priv))
+		return 0;
 
 	if (priv->rev == TDA19988)
 		reg_clear(priv, REG_TX4, TX4_PD_RAM);
 
-	/* base block fetch */
-	if (read_edid_block(encoder, block, 0))
-		goto fail;
+	edid = drm_do_get_edid(connector, read_edid_block, priv);
 
-	if (!drm_edid_block_valid(block, 0, print_bad_edid))
-		goto fail;
-
-	/* if there's no extensions, we're done */
-	if (block[0x7e] == 0)
-		goto done;
-
-	new = krealloc(block, (block[0x7e] + 1) * EDID_LENGTH, GFP_KERNEL);
-	if (!new)
-		goto fail;
-	block = new;
-
-	for (j = 1; j <= block[0x7e]; j++) {
-		uint8_t *ext_block = block + (valid_extensions + 1) * EDID_LENGTH;
-		if (read_edid_block(encoder, ext_block, j))
-			goto fail;
-
-		if (!drm_edid_block_valid(ext_block, j, print_bad_edid))
-			goto fail;
-
-		valid_extensions++;
-	}
-
-	if (valid_extensions != block[0x7e]) {
-		block[EDID_LENGTH-1] += block[0x7e] - valid_extensions;
-		block[0x7e] = valid_extensions;
-		new = krealloc(block, (valid_extensions + 1) * EDID_LENGTH, GFP_KERNEL);
-		if (!new)
-			goto fail;
-		block = new;
-	}
-
-done:
 	if (priv->rev == TDA19988)
 		reg_set(priv, REG_TX4, TX4_PD_RAM);
 
-	return block;
-
-fail:
-	if (priv->rev == TDA19988)
-		reg_set(priv, REG_TX4, TX4_PD_RAM);
-	dev_warn(&priv->hdmi->dev, "failed to read EDID\n");
-	kfree(block);
-	return NULL;
-}
-
-static int
-tda998x_encoder_get_modes(struct drm_encoder *encoder,
-			 struct drm_connector *connector)
-{
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-	struct edid *edid = (struct edid *)do_get_edid(encoder);
-	int n = 0;
-
-	if (edid) {
-		drm_mode_connector_update_edid_property(connector, edid);
-		n = drm_add_edid_modes(connector, edid);
-		priv->is_hdmi_sink = drm_detect_hdmi_monitor(edid);
-		kfree(edid);
+	if (!edid) {
+		dev_warn(&priv->hdmi->dev, "failed to read EDID\n");
+		return 0;
 	}
+
+	drm_mode_connector_update_edid_property(connector, edid);
+	n = drm_add_edid_modes(connector, edid);
+	priv->is_hdmi_sink = drm_detect_hdmi_monitor(edid);
+	kfree(edid);
 
 	return n;
 }
 
-static int
-tda998x_encoder_create_resources(struct drm_encoder *encoder,
-				struct drm_connector *connector)
+static void tda998x_encoder_set_polling(struct tda998x_priv *priv,
+					struct drm_connector *connector)
 {
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-
 	if (priv->hdmi->irq)
 		connector->polled = DRM_CONNECTOR_POLL_HPD;
 	else
 		connector->polled = DRM_CONNECTOR_POLL_CONNECT |
 			DRM_CONNECTOR_POLL_DISCONNECT;
-	return 0;
 }
 
-static int
-tda998x_encoder_set_property(struct drm_encoder *encoder,
-			    struct drm_connector *connector,
-			    struct drm_property *property,
-			    uint64_t val)
+static void tda998x_destroy(struct tda998x_priv *priv)
 {
-	DBG("");
-	return 0;
-}
-
-static void
-tda998x_encoder_destroy(struct drm_encoder *encoder)
-{
-	struct tda998x_priv *priv = to_tda998x_priv(encoder);
-
 	/* disable all IRQs and free the IRQ handler */
 	cec_write(priv, REG_CEC_RXSHPDINTENA, 0);
 	reg_clear(priv, REG_INT_FLAGS_2, INT_FLAGS_2_EDID_BLK_RD);
+
 	if (priv->hdmi->irq)
 		free_irq(priv->hdmi->irq, priv);
 
-	if (priv->cec)
-		i2c_unregister_device(priv->cec);
-	drm_i2c_encoder_destroy(encoder);
-	kfree(priv);
-}
+	del_timer_sync(&priv->edid_delay_timer);
+	cancel_work_sync(&priv->detect_work);
 
-static struct drm_encoder_slave_funcs tda998x_encoder_funcs = {
-	.set_config = tda998x_encoder_set_config,
-	.destroy = tda998x_encoder_destroy,
-	.dpms = tda998x_encoder_dpms,
-	.save = tda998x_encoder_save,
-	.restore = tda998x_encoder_restore,
-	.mode_fixup = tda998x_encoder_mode_fixup,
-	.mode_valid = tda998x_encoder_mode_valid,
-	.mode_set = tda998x_encoder_mode_set,
-	.detect = tda998x_encoder_detect,
-	.get_modes = tda998x_encoder_get_modes,
-	.create_resources = tda998x_encoder_create_resources,
-	.set_property = tda998x_encoder_set_property,
-};
+	i2c_unregister_device(priv->cec);
+}
 
 /* I2C driver functions */
 
-static int
-tda998x_probe(struct i2c_client *client, const struct i2c_device_id *id)
+static int tda998x_create(struct i2c_client *client, struct tda998x_priv *priv)
 {
-	return 0;
-}
-
-static int
-tda998x_remove(struct i2c_client *client)
-{
-	return 0;
-}
-
-static int
-tda998x_encoder_init(struct i2c_client *client,
-		    struct drm_device *dev,
-		    struct drm_encoder_slave *encoder_slave)
-{
-	struct tda998x_priv *priv;
 	struct device_node *np = client->dev.of_node;
 	u32 video;
 	int rev_lo, rev_hi, ret;
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
+	unsigned short cec_addr;
 
 	priv->vip_cntrl_0 = VIP_CNTRL_0_SWAP_A(2) | VIP_CNTRL_0_SWAP_B(3);
 	priv->vip_cntrl_1 = VIP_CNTRL_1_SWAP_C(0) | VIP_CNTRL_1_SWAP_D(1);
@@ -1251,17 +1204,19 @@ tda998x_encoder_init(struct i2c_client *client,
 
 	priv->current_page = 0xff;
 	priv->hdmi = client;
-	priv->cec = i2c_new_dummy(client->adapter, 0x34);
-	if (!priv->cec) {
-		kfree(priv);
+	/* CEC I2C address bound to TDA998x I2C addr by configuration pins */
+	cec_addr = 0x34 + (client->addr & 0x03);
+	priv->cec = i2c_new_dummy(client->adapter, cec_addr);
+	if (!priv->cec)
 		return -ENODEV;
-	}
 
-	priv->encoder = &encoder_slave->base;
 	priv->dpms = DRM_MODE_DPMS_OFF;
 
-	encoder_slave->slave_priv = priv;
-	encoder_slave->slave_funcs = &tda998x_encoder_funcs;
+	mutex_init(&priv->mutex);	/* protect the page access */
+	init_waitqueue_head(&priv->edid_delay_waitq);
+	setup_timer(&priv->edid_delay_timer, tda998x_edid_delay_done,
+		    (unsigned long)priv);
+	INIT_WORK(&priv->detect_work, tda998x_detect_work);
 
 	/* wake up the device: */
 	cec_write(priv, REG_CEC_ENAMODS,
@@ -1318,7 +1273,7 @@ tda998x_encoder_init(struct i2c_client *client,
 	if (client->irq) {
 		int irqf_trigger;
 
-		/* init read EDID waitqueue */
+		/* init read EDID waitqueue and HDP work */
 		init_waitqueue_head(&priv->wq_edid);
 
 		/* clear pending interrupts */
@@ -1365,10 +1320,170 @@ fail:
 	 */
 	if (priv->cec)
 		i2c_unregister_device(priv->cec);
-	kfree(priv);
-	encoder_slave->slave_priv = NULL;
-	encoder_slave->slave_funcs = NULL;
 	return -ENXIO;
+}
+
+static void tda998x_encoder_prepare(struct drm_encoder *encoder)
+{
+	tda998x_encoder_dpms(encoder, DRM_MODE_DPMS_OFF);
+}
+
+static void tda998x_encoder_commit(struct drm_encoder *encoder)
+{
+	tda998x_encoder_dpms(encoder, DRM_MODE_DPMS_ON);
+}
+
+static const struct drm_encoder_helper_funcs tda998x_encoder_helper_funcs = {
+	.dpms = tda998x_encoder_dpms,
+	.prepare = tda998x_encoder_prepare,
+	.commit = tda998x_encoder_commit,
+	.mode_set = tda998x_encoder_mode_set,
+};
+
+static void tda998x_encoder_destroy(struct drm_encoder *encoder)
+{
+	struct tda998x_priv *priv = enc_to_tda998x_priv(encoder);
+
+	tda998x_destroy(priv);
+	drm_encoder_cleanup(encoder);
+}
+
+static const struct drm_encoder_funcs tda998x_encoder_funcs = {
+	.destroy = tda998x_encoder_destroy,
+};
+
+static struct drm_encoder *
+tda998x_connector_best_encoder(struct drm_connector *connector)
+{
+	struct tda998x_priv *priv = conn_to_tda998x_priv(connector);
+
+	return &priv->encoder;
+}
+
+static
+const struct drm_connector_helper_funcs tda998x_connector_helper_funcs = {
+	.get_modes = tda998x_connector_get_modes,
+	.mode_valid = tda998x_connector_mode_valid,
+	.best_encoder = tda998x_connector_best_encoder,
+};
+
+static void tda998x_connector_destroy(struct drm_connector *connector)
+{
+	drm_connector_unregister(connector);
+	drm_connector_cleanup(connector);
+}
+
+static int tda998x_connector_dpms(struct drm_connector *connector, int mode)
+{
+	if (drm_core_check_feature(connector->dev, DRIVER_ATOMIC))
+		return drm_atomic_helper_connector_dpms(connector, mode);
+	else
+		return drm_helper_connector_dpms(connector, mode);
+}
+
+static const struct drm_connector_funcs tda998x_connector_funcs = {
+	.dpms = tda998x_connector_dpms,
+	.reset = drm_atomic_helper_connector_reset,
+	.fill_modes = drm_helper_probe_single_connector_modes,
+	.detect = tda998x_connector_detect,
+	.destroy = tda998x_connector_destroy,
+	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+static int tda998x_bind(struct device *dev, struct device *master, void *data)
+{
+	struct tda998x_encoder_params *params = dev->platform_data;
+	struct i2c_client *client = to_i2c_client(dev);
+	struct drm_device *drm = data;
+	struct tda998x_priv *priv;
+	u32 crtcs = 0;
+	int ret;
+
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	dev_set_drvdata(dev, priv);
+
+	if (dev->of_node)
+		crtcs = drm_of_find_possible_crtcs(drm, dev->of_node);
+
+	/* If no CRTCs were found, fall back to our old behaviour */
+	if (crtcs == 0) {
+		dev_warn(dev, "Falling back to first CRTC\n");
+		crtcs = 1 << 0;
+	}
+
+	priv->connector.interlace_allowed = 1;
+	priv->encoder.possible_crtcs = crtcs;
+
+	ret = tda998x_create(client, priv);
+	if (ret)
+		return ret;
+
+	if (!dev->of_node && params)
+		tda998x_encoder_set_config(priv, params);
+
+	tda998x_encoder_set_polling(priv, &priv->connector);
+
+	drm_encoder_helper_add(&priv->encoder, &tda998x_encoder_helper_funcs);
+	ret = drm_encoder_init(drm, &priv->encoder, &tda998x_encoder_funcs,
+			       DRM_MODE_ENCODER_TMDS, NULL);
+	if (ret)
+		goto err_encoder;
+
+	drm_connector_helper_add(&priv->connector,
+				 &tda998x_connector_helper_funcs);
+	ret = drm_connector_init(drm, &priv->connector,
+				 &tda998x_connector_funcs,
+				 DRM_MODE_CONNECTOR_HDMIA);
+	if (ret)
+		goto err_connector;
+
+	ret = drm_connector_register(&priv->connector);
+	if (ret)
+		goto err_sysfs;
+
+	drm_mode_connector_attach_encoder(&priv->connector, &priv->encoder);
+
+	return 0;
+
+err_sysfs:
+	drm_connector_cleanup(&priv->connector);
+err_connector:
+	drm_encoder_cleanup(&priv->encoder);
+err_encoder:
+	tda998x_destroy(priv);
+	return ret;
+}
+
+static void tda998x_unbind(struct device *dev, struct device *master,
+			   void *data)
+{
+	struct tda998x_priv *priv = dev_get_drvdata(dev);
+
+	drm_connector_unregister(&priv->connector);
+	drm_connector_cleanup(&priv->connector);
+	drm_encoder_cleanup(&priv->encoder);
+	tda998x_destroy(priv);
+}
+
+static const struct component_ops tda998x_ops = {
+	.bind = tda998x_bind,
+	.unbind = tda998x_unbind,
+};
+
+static int
+tda998x_probe(struct i2c_client *client, const struct i2c_device_id *id)
+{
+	return component_add(&client->dev, &tda998x_ops);
+}
+
+static int tda998x_remove(struct i2c_client *client)
+{
+	component_del(&client->dev, &tda998x_ops);
+	return 0;
 }
 
 #ifdef CONFIG_OF
@@ -1385,38 +1500,18 @@ static struct i2c_device_id tda998x_ids[] = {
 };
 MODULE_DEVICE_TABLE(i2c, tda998x_ids);
 
-static struct drm_i2c_encoder_driver tda998x_driver = {
-	.i2c_driver = {
-		.probe = tda998x_probe,
-		.remove = tda998x_remove,
-		.driver = {
-			.name = "tda998x",
-			.of_match_table = of_match_ptr(tda998x_dt_ids),
-		},
-		.id_table = tda998x_ids,
+static struct i2c_driver tda998x_driver = {
+	.probe = tda998x_probe,
+	.remove = tda998x_remove,
+	.driver = {
+		.name = "tda998x",
+		.of_match_table = of_match_ptr(tda998x_dt_ids),
 	},
-	.encoder_init = tda998x_encoder_init,
+	.id_table = tda998x_ids,
 };
 
-/* Module initialization */
-
-static int __init
-tda998x_init(void)
-{
-	DBG("");
-	return drm_i2c_encoder_register(THIS_MODULE, &tda998x_driver);
-}
-
-static void __exit
-tda998x_exit(void)
-{
-	DBG("");
-	drm_i2c_encoder_unregister(&tda998x_driver);
-}
+module_i2c_driver(tda998x_driver);
 
 MODULE_AUTHOR("Rob Clark <robdclark@gmail.com");
 MODULE_DESCRIPTION("NXP Semiconductors TDA998X HDMI Encoder");
 MODULE_LICENSE("GPL");
-
-module_init(tda998x_init);
-module_exit(tda998x_exit);

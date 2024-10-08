@@ -48,6 +48,19 @@ typedef struct
 	struct ucontext32 uc;
 } rt_sigframe32;
 
+static inline void sigset_to_sigset32(unsigned long *set64,
+				      compat_sigset_word *set32)
+{
+	set32[0] = (compat_sigset_word) set64[0];
+	set32[1] = (compat_sigset_word)(set64[0] >> 32);
+}
+
+static inline void sigset32_to_sigset(compat_sigset_word *set32,
+				      unsigned long *set64)
+{
+	set64[0] = (unsigned long) set32[0] | ((unsigned long) set32[1] << 32);
+}
+
 int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
 {
 	int err;
@@ -303,10 +316,12 @@ asmlinkage long sys32_sigreturn(void)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	sigframe32 __user *frame = (sigframe32 __user *)regs->gprs[15];
+	compat_sigset_t cset;
 	sigset_t set;
 
-	if (__copy_from_user(&set.sig, &frame->sc.oldmask, _SIGMASK_COPY_SIZE32))
+	if (__copy_from_user(&cset.sig, &frame->sc.oldmask, _SIGMASK_COPY_SIZE32))
 		goto badframe;
+	sigset32_to_sigset(cset.sig, set.sig);
 	set_current_blocked(&set);
 	if (restore_sigregs32(regs, &frame->sregs))
 		goto badframe;
@@ -323,10 +338,12 @@ asmlinkage long sys32_rt_sigreturn(void)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	rt_sigframe32 __user *frame = (rt_sigframe32 __user *)regs->gprs[15];
+	compat_sigset_t cset;
 	sigset_t set;
 
-	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
+	if (__copy_from_user(&cset, &frame->uc.uc_sigmask, sizeof(cset)))
 		goto badframe;
+	sigset32_to_sigset(cset.sig, set.sig);
 	set_current_blocked(&set);
 	if (compat_restore_altstack(&frame->uc.uc_stack))
 		goto badframe;
@@ -406,7 +423,7 @@ static int setup_frame32(int sig, struct k_sigaction *ka,
 		goto give_sigsegv;
 
 	/* Create struct sigcontext32 on the signal stack */
-	memcpy(&sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE32);
+	sigset_to_sigset32(set->sig, sc.oldmask);
 	sc.sregs = (__u32)(unsigned long __force) &frame->sregs;
 	if (__copy_to_user(&frame->sc, &sc, sizeof(frame->sc)))
 		goto give_sigsegv;
@@ -472,6 +489,7 @@ give_sigsegv:
 static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
 			   sigset_t *set, struct pt_regs * regs)
 {
+	compat_sigset_t cset;
 	rt_sigframe32 __user *frame;
 	unsigned long restorer;
 	size_t frame_size;
@@ -519,11 +537,12 @@ static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
 	store_sigregs();
 
 	/* Create ucontext on the signal stack. */
+	sigset_to_sigset32(set->sig, cset.sig);
 	if (__put_user(uc_flags, &frame->uc.uc_flags) ||
 	    __put_user(0, &frame->uc.uc_link) ||
 	    __compat_save_altstack(&frame->uc.uc_stack, regs->gprs[15]) ||
 	    save_sigregs32(regs, &frame->uc.uc_mcontext) ||
-	    __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set)) ||
+	    __copy_to_user(&frame->uc.uc_sigmask, &cset, sizeof(cset)) ||
 	    save_sigregs_ext32(regs, &frame->uc.uc_mcontext_ext))
 		goto give_sigsegv;
 

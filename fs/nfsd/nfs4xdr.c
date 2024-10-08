@@ -33,6 +33,7 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/file.h>
 #include <linux/slab.h>
 #include <linux/namei.h>
 #include <linux/statfs.h>
@@ -1885,7 +1886,7 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 	argp->rqstp->rq_cachetype = cachethis ? RC_REPLBUFF : RC_NOCACHE;
 
 	if (readcount > 1 || max_reply > PAGE_SIZE - auth_slack)
-		argp->rqstp->rq_splice_ok = false;
+		clear_bit(RQ_SPLICE_OK, &argp->rqstp->rq_flags);
 
 	DECODE_TAIL;
 }
@@ -2166,6 +2167,7 @@ nfsd4_encode_layout_type(struct xdr_stream *xdr, enum pnfs_layouttype layout_typ
 #define WORD0_ABSENT_FS_ATTRS (FATTR4_WORD0_FS_LOCATIONS | FATTR4_WORD0_FSID | \
 			      FATTR4_WORD0_RDATTR_ERROR)
 #define WORD1_ABSENT_FS_ATTRS FATTR4_WORD1_MOUNTED_ON_FILEID
+#define WORD2_ABSENT_FS_ATTRS 0
 
 #ifdef CONFIG_NFSD_V4_SECURITY_LABEL
 static inline __be32
@@ -2194,7 +2196,7 @@ nfsd4_encode_security_label(struct xdr_stream *xdr, struct svc_rqst *rqstp,
 { return 0; }
 #endif
 
-static __be32 fattr_handle_absent_fs(u32 *bmval0, u32 *bmval1, u32 *rdattr_err)
+static __be32 fattr_handle_absent_fs(u32 *bmval0, u32 *bmval1, u32 *bmval2, u32 *rdattr_err)
 {
 	/* As per referral draft:  */
 	if (*bmval0 & ~WORD0_ABSENT_FS_ATTRS ||
@@ -2207,6 +2209,7 @@ static __be32 fattr_handle_absent_fs(u32 *bmval0, u32 *bmval1, u32 *rdattr_err)
 	}
 	*bmval0 &= WORD0_ABSENT_FS_ATTRS;
 	*bmval1 &= WORD1_ABSENT_FS_ATTRS;
+	*bmval2 &= WORD2_ABSENT_FS_ATTRS;
 	return 0;
 }
 
@@ -2302,8 +2305,7 @@ nfsd4_encode_fattr(struct xdr_stream *xdr, struct svc_fh *fhp,
 	BUG_ON(bmval2 & ~nfsd_suppattrs2(minorversion));
 
 	if (exp->ex_fslocs.migrated) {
-		BUG_ON(bmval[2]);
-		status = fattr_handle_absent_fs(&bmval0, &bmval1, &rdattr_err);
+		status = fattr_handle_absent_fs(&bmval0, &bmval1, &bmval2, &rdattr_err);
 		if (status)
 			goto out;
 	}
@@ -2342,8 +2344,8 @@ nfsd4_encode_fattr(struct xdr_stream *xdr, struct svc_fh *fhp,
 	}
 
 #ifdef CONFIG_NFSD_V4_SECURITY_LABEL
-	if ((bmval[2] & FATTR4_WORD2_SECURITY_LABEL) ||
-			bmval[0] & FATTR4_WORD0_SUPPORTED_ATTRS) {
+	if ((bmval2 & FATTR4_WORD2_SECURITY_LABEL) ||
+	     bmval0 & FATTR4_WORD0_SUPPORTED_ATTRS) {
 		err = security_inode_getsecctx(dentry->d_inode,
 						&context, &contextlen);
 		contextsupport = (err == 0);
@@ -2839,14 +2841,14 @@ nfsd4_encode_dirent_fattr(struct xdr_stream *xdr, struct nfsd4_readdir *cd,
 	__be32 nfserr;
 	int ignore_crossmnt = 0;
 
-	dentry = lookup_one_len(name, cd->rd_fhp->fh_dentry, namlen);
+	dentry = lookup_one_len_unlocked(name, cd->rd_fhp->fh_dentry, namlen);
 	if (IS_ERR(dentry))
 		return nfserrno(PTR_ERR(dentry));
 	if (!dentry->d_inode) {
 		/*
-		 * nfsd_buffered_readdir drops the i_mutex between
-		 * readdir and calling this callback, leaving a window
-		 * where this directory entry could have gone away.
+		 * we're not holding the i_mutex here, so there's
+		 * a window where this directory entry could have gone
+		 * away.
 		 */
 		dput(dentry);
 		return nfserr_noent;
@@ -3343,6 +3345,7 @@ static __be32 nfsd4_encode_splice_read(
 	struct xdr_stream *xdr = &resp->xdr;
 	struct xdr_buf *buf = xdr->buf;
 	u32 eof;
+	long len;
 	int space_left;
 	__be32 nfserr;
 	__be32 *p = xdr->p - 2;
@@ -3351,6 +3354,7 @@ static __be32 nfsd4_encode_splice_read(
 	if (xdr->end - xdr->p < 1)
 		return nfserr_resource;
 
+	len = maxcount;
 	nfserr = nfsd_splice_read(read->rd_rqstp, file,
 				  read->rd_offset, &maxcount);
 	if (nfserr) {
@@ -3363,8 +3367,8 @@ static __be32 nfsd4_encode_splice_read(
 		return nfserr;
 	}
 
-	eof = (read->rd_offset + maxcount >=
-	       read->rd_fhp->fh_dentry->d_inode->i_size);
+	eof = nfsd_eof_on_read(len, maxcount, read->rd_offset,
+			   read->rd_fhp->fh_dentry->d_inode->i_size);
 
 	*(p++) = htonl(eof);
 	*(p++) = htonl(maxcount);
@@ -3434,14 +3438,15 @@ static __be32 nfsd4_encode_readv(struct nfsd4_compoundres *resp,
 	}
 	read->rd_vlen = v;
 
+	len = maxcount;
 	nfserr = nfsd_readv(file, read->rd_offset, resp->rqstp->rq_vec,
 			read->rd_vlen, &maxcount);
 	if (nfserr)
 		return nfserr;
 	xdr_truncate_encode(xdr, starting_len + 8 + ((maxcount+3)&~3));
 
-	eof = (read->rd_offset + maxcount >=
-	       read->rd_fhp->fh_dentry->d_inode->i_size);
+	eof = nfsd_eof_on_read(len, maxcount, read->rd_offset,
+			   read->rd_fhp->fh_dentry->d_inode->i_size);
 
 	tmp = htonl(eof);
 	write_bytes_to_xdr_buf(xdr->buf, starting_len    , &tmp, 4);
@@ -3462,52 +3467,51 @@ nfsd4_encode_read(struct nfsd4_compoundres *resp, __be32 nfserr,
 	unsigned long maxcount;
 	struct xdr_stream *xdr = &resp->xdr;
 	struct file *file = read->rd_filp;
-	struct svc_fh *fhp = read->rd_fhp;
 	int starting_len = xdr->buf->len;
-	struct raparms *ra;
+	struct raparms *ra = NULL;
 	__be32 *p;
-	__be32 err;
 
 	if (nfserr)
-		return nfserr;
+		goto out;
 
 	p = xdr_reserve_space(xdr, 8); /* eof flag and byte count */
 	if (!p) {
-		WARN_ON_ONCE(resp->rqstp->rq_splice_ok);
-		return nfserr_resource;
+		WARN_ON_ONCE(test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags));
+		nfserr = nfserr_resource;
+		goto out;
 	}
-	if (resp->xdr.buf->page_len && resp->rqstp->rq_splice_ok) {
+	if (resp->xdr.buf->page_len &&
+	    test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags)) {
 		WARN_ON_ONCE(1);
-		return nfserr_resource;
+		nfserr = nfserr_resource;
+		goto out;
 	}
 	xdr_commit_encode(xdr);
 
 	maxcount = svc_max_payload(resp->rqstp);
-	maxcount = min_t(unsigned long, maxcount, (xdr->buf->buflen - xdr->buf->len));
+	maxcount = min_t(unsigned long, maxcount,
+			 (xdr->buf->buflen - xdr->buf->len));
 	maxcount = min_t(unsigned long, maxcount, read->rd_length);
 
-	if (read->rd_filp)
-		err = nfsd_permission(resp->rqstp, fhp->fh_export,
-				fhp->fh_dentry,
-				NFSD_MAY_READ|NFSD_MAY_OWNER_OVERRIDE);
+	if (read->rd_tmp_file)
+		ra = nfsd_init_raparms(file);
+
+	if (file->f_op->splice_read &&
+	    test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags))
+		nfserr = nfsd4_encode_splice_read(resp, read, file, maxcount);
 	else
-		err = nfsd_get_tmp_read_open(resp->rqstp, read->rd_fhp,
-						&file, &ra);
-	if (err)
-		goto err_truncate;
+		nfserr = nfsd4_encode_readv(resp, read, file, maxcount);
 
-	if (file->f_op->splice_read && resp->rqstp->rq_splice_ok)
-		err = nfsd4_encode_splice_read(resp, read, file, maxcount);
-	else
-		err = nfsd4_encode_readv(resp, read, file, maxcount);
+	if (ra)
+		nfsd_put_raparams(file, ra);
 
-	if (!read->rd_filp)
-		nfsd_put_tmp_read_open(file, ra);
-
-err_truncate:
-	if (err)
+	if (nfserr)
 		xdr_truncate_encode(xdr, starting_len);
-	return err;
+
+out:
+	if (file)
+		fput(file);
+	return nfserr;
 }
 
 static __be32

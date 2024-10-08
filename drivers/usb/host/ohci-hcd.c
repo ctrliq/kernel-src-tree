@@ -1220,42 +1220,7 @@ MODULE_LICENSE ("GPL");
 #define SA1111_DRIVER		ohci_hcd_sa1111_driver
 #endif
 
-#if defined(CONFIG_ARCH_S3C24XX) || defined(CONFIG_ARCH_S3C64XX)
-#include "ohci-s3c2410.c"
-#define S3C2410_PLATFORM_DRIVER	ohci_hcd_s3c2410_driver
-#endif
-
-#ifdef CONFIG_USB_OHCI_HCD_OMAP1
-#include "ohci-omap.c"
-#define OMAP1_PLATFORM_DRIVER	ohci_hcd_omap_driver
-#endif
-
-#ifdef CONFIG_USB_OHCI_HCD_OMAP3
-#include "ohci-omap3.c"
-#define OMAP3_PLATFORM_DRIVER	ohci_hcd_omap3_driver
-#endif
-
-#if defined(CONFIG_PXA27x) || defined(CONFIG_PXA3xx)
-#include "ohci-pxa27x.c"
-#define PLATFORM_DRIVER		ohci_hcd_pxa27x_driver
-#endif
-
-#ifdef CONFIG_ARCH_EP93XX
-#include "ohci-ep93xx.c"
-#define EP93XX_PLATFORM_DRIVER	ohci_hcd_ep93xx_driver
-#endif
-
-#ifdef CONFIG_ARCH_AT91
-#include "ohci-at91.c"
-#define AT91_PLATFORM_DRIVER	ohci_hcd_at91_driver
-#endif
-
-#ifdef CONFIG_ARCH_LPC32XX
-#include "ohci-nxp.c"
-#define NXP_PLATFORM_DRIVER	usb_hcd_nxp_driver
-#endif
-
-#ifdef CONFIG_ARCH_DAVINCI_DA8XX
+#ifdef CONFIG_USB_OHCI_HCD_DAVINCI
 #include "ohci-da8xx.c"
 #define DAVINCI_PLATFORM_DRIVER	ohci_hcd_da8xx_driver
 #endif
@@ -1263,11 +1228,6 @@ MODULE_LICENSE ("GPL");
 #ifdef CONFIG_USB_OHCI_HCD_PPC_OF
 #include "ohci-ppc-of.c"
 #define OF_PLATFORM_DRIVER	ohci_hcd_ppc_of_driver
-#endif
-
-#ifdef CONFIG_PLAT_SPEAR
-#include "ohci-spear.c"
-#define SPEAR_PLATFORM_DRIVER	spear_ohci_hcd_driver
 #endif
 
 #ifdef CONFIG_PPC_PS3
@@ -1288,11 +1248,6 @@ MODULE_LICENSE ("GPL");
 #ifdef CONFIG_MACH_JZ4740
 #include "ohci-jz4740.c"
 #define PLATFORM_DRIVER	ohci_hcd_jz4740_driver
-#endif
-
-#ifdef CONFIG_USB_OCTEON_OHCI
-#include "ohci-octeon.c"
-#define PLATFORM_DRIVER		ohci_octeon_driver
 #endif
 
 #ifdef CONFIG_TILE_USB
@@ -1330,18 +1285,6 @@ static int __init ohci_hcd_mod_init(void)
 		goto error_platform;
 #endif
 
-#ifdef OMAP1_PLATFORM_DRIVER
-	retval = platform_driver_register(&OMAP1_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_omap1_platform;
-#endif
-
-#ifdef OMAP3_PLATFORM_DRIVER
-	retval = platform_driver_register(&OMAP3_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_omap3_platform;
-#endif
-
 #ifdef OF_PLATFORM_DRIVER
 	retval = platform_driver_register(&OF_PLATFORM_DRIVER);
 	if (retval < 0)
@@ -1366,68 +1309,18 @@ static int __init ohci_hcd_mod_init(void)
 		goto error_tmio;
 #endif
 
-#ifdef S3C2410_PLATFORM_DRIVER
-	retval = platform_driver_register(&S3C2410_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_s3c2410;
-#endif
-
-#ifdef EP93XX_PLATFORM_DRIVER
-	retval = platform_driver_register(&EP93XX_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_ep93xx;
-#endif
-
-#ifdef AT91_PLATFORM_DRIVER
-	retval = platform_driver_register(&AT91_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_at91;
-#endif
-
-#ifdef NXP_PLATFORM_DRIVER
-	retval = platform_driver_register(&NXP_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_nxp;
-#endif
-
 #ifdef DAVINCI_PLATFORM_DRIVER
 	retval = platform_driver_register(&DAVINCI_PLATFORM_DRIVER);
 	if (retval < 0)
 		goto error_davinci;
 #endif
 
-#ifdef SPEAR_PLATFORM_DRIVER
-	retval = platform_driver_register(&SPEAR_PLATFORM_DRIVER);
-	if (retval < 0)
-		goto error_spear;
-#endif
-
 	return retval;
 
 	/* Error path */
-#ifdef SPEAR_PLATFORM_DRIVER
-	platform_driver_unregister(&SPEAR_PLATFORM_DRIVER);
- error_spear:
-#endif
 #ifdef DAVINCI_PLATFORM_DRIVER
 	platform_driver_unregister(&DAVINCI_PLATFORM_DRIVER);
  error_davinci:
-#endif
-#ifdef NXP_PLATFORM_DRIVER
-	platform_driver_unregister(&NXP_PLATFORM_DRIVER);
- error_nxp:
-#endif
-#ifdef AT91_PLATFORM_DRIVER
-	platform_driver_unregister(&AT91_PLATFORM_DRIVER);
- error_at91:
-#endif
-#ifdef EP93XX_PLATFORM_DRIVER
-	platform_driver_unregister(&EP93XX_PLATFORM_DRIVER);
- error_ep93xx:
-#endif
-#ifdef S3C2410_PLATFORM_DRIVER
-	platform_driver_unregister(&S3C2410_PLATFORM_DRIVER);
- error_s3c2410:
 #endif
 #ifdef TMIO_OHCI_DRIVER
 	platform_driver_unregister(&TMIO_OHCI_DRIVER);
@@ -1444,14 +1337,6 @@ static int __init ohci_hcd_mod_init(void)
 #ifdef OF_PLATFORM_DRIVER
 	platform_driver_unregister(&OF_PLATFORM_DRIVER);
  error_of_platform:
-#endif
-#ifdef OMAP3_PLATFORM_DRIVER
-	platform_driver_unregister(&OMAP3_PLATFORM_DRIVER);
- error_omap3_platform:
-#endif
-#ifdef OMAP1_PLATFORM_DRIVER
-	platform_driver_unregister(&OMAP1_PLATFORM_DRIVER);
- error_omap1_platform:
 #endif
 #ifdef PLATFORM_DRIVER
 	platform_driver_unregister(&PLATFORM_DRIVER);
@@ -1472,23 +1357,8 @@ module_init(ohci_hcd_mod_init);
 
 static void __exit ohci_hcd_mod_exit(void)
 {
-#ifdef SPEAR_PLATFORM_DRIVER
-	platform_driver_unregister(&SPEAR_PLATFORM_DRIVER);
-#endif
 #ifdef DAVINCI_PLATFORM_DRIVER
 	platform_driver_unregister(&DAVINCI_PLATFORM_DRIVER);
-#endif
-#ifdef NXP_PLATFORM_DRIVER
-	platform_driver_unregister(&NXP_PLATFORM_DRIVER);
-#endif
-#ifdef AT91_PLATFORM_DRIVER
-	platform_driver_unregister(&AT91_PLATFORM_DRIVER);
-#endif
-#ifdef EP93XX_PLATFORM_DRIVER
-	platform_driver_unregister(&EP93XX_PLATFORM_DRIVER);
-#endif
-#ifdef S3C2410_PLATFORM_DRIVER
-	platform_driver_unregister(&S3C2410_PLATFORM_DRIVER);
 #endif
 #ifdef TMIO_OHCI_DRIVER
 	platform_driver_unregister(&TMIO_OHCI_DRIVER);
@@ -1501,12 +1371,6 @@ static void __exit ohci_hcd_mod_exit(void)
 #endif
 #ifdef OF_PLATFORM_DRIVER
 	platform_driver_unregister(&OF_PLATFORM_DRIVER);
-#endif
-#ifdef OMAP3_PLATFORM_DRIVER
-	platform_driver_unregister(&OMAP3_PLATFORM_DRIVER);
-#endif
-#ifdef OMAP1_PLATFORM_DRIVER
-	platform_driver_unregister(&OMAP1_PLATFORM_DRIVER);
 #endif
 #ifdef PLATFORM_DRIVER
 	platform_driver_unregister(&PLATFORM_DRIVER);

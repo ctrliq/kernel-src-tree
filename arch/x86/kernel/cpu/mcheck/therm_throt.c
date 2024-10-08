@@ -386,7 +386,7 @@ static void intel_thermal_interrupt(void)
 	__u64 msr_val;
 
 	if (static_cpu_has(X86_FEATURE_HWP))
-		wrmsrl_safe(MSR_HWP_STATUS, 0);
+		wrmsrl_safe(MSR_HWP_STATUS, 0ull);
 
 	rdmsrl(MSR_IA32_THERM_STATUS, msr_val);
 

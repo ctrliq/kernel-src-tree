@@ -201,12 +201,15 @@ struct hid_item {
 #define HID_GD_VBRZ		0x00010045
 #define HID_GD_VNO		0x00010046
 #define HID_GD_FEATURE		0x00010047
+#define HID_GD_SYSTEM_CONTROL	0x00010080
 #define HID_GD_UP		0x00010090
 #define HID_GD_DOWN		0x00010091
 #define HID_GD_RIGHT		0x00010092
 #define HID_GD_LEFT		0x00010093
 
 #define HID_DC_BATTERYSTRENGTH	0x00060020
+
+#define HID_CP_CONSUMER_CONTROL	0x000c0001
 
 #define HID_DG_DIGITIZER	0x000d0001
 #define HID_DG_PEN		0x000d0002
@@ -238,6 +241,7 @@ struct hid_item {
 #define HID_DG_DEVICEINDEX	0x000d0053
 #define HID_DG_CONTACTCOUNT	0x000d0054
 #define HID_DG_CONTACTMAX	0x000d0055
+#define HID_DG_BUTTONTYPE	0x000d0059
 #define HID_DG_BARRELSWITCH2	0x000d005a
 #define HID_DG_TOOLSERIALNUMBER	0x000d005b
 
@@ -280,8 +284,11 @@ struct hid_item {
 #define HID_QUIRK_MULTI_INPUT			0x00000040
 #define HID_QUIRK_HIDINPUT_FORCE		0x00000080
 #define HID_QUIRK_NO_EMPTY_INPUT		0x00000100
+#define HID_QUIRK_NO_INIT_INPUT_REPORTS		0x00000200
 #define HID_QUIRK_ALWAYS_POLL			0x00000400
 #define HID_QUIRK_SKIP_OUTPUT_REPORTS		0x00010000
+#define HID_QUIRK_SKIP_OUTPUT_REPORT_ID		0x00020000
+#define HID_QUIRK_NO_OUTPUT_REPORTS_ON_INTR_EP	0x00040000
 #define HID_QUIRK_FULLSPEED_INTERVAL		0x10000000
 #define HID_QUIRK_NO_INIT_REPORTS		0x20000000
 #define HID_QUIRK_NO_IGNORE			0x40000000
@@ -296,6 +303,7 @@ struct hid_item {
 #define HID_GROUP_GENERIC			0x0001
 #define HID_GROUP_MULTITOUCH			0x0002
 #define HID_GROUP_SENSOR_HUB			0x0003
+#define HID_GROUP_MULTITOUCH_WIN_8		0x0004
 
 /*
  * Vendor specific HID device groups
@@ -512,12 +520,6 @@ struct hid_device {							/* device report descriptor */
 				  struct hid_usage *, __s32);
 	void (*hiddev_report_event) (struct hid_device *, struct hid_report *);
 
-	/* handler for raw input (Get_Report) data, used by hidraw */
-	int (*hid_get_raw_report) (struct hid_device *, unsigned char, __u8 *, size_t, unsigned char);
-
-	/* handler for raw output data, used by hidraw */
-	int (*hid_output_raw_report) (struct hid_device *, __u8 *, size_t, unsigned char);
-
 	/* debugging support via debugfs */
 	unsigned short debug;
 	struct dentry *debug_dir;
@@ -527,6 +529,9 @@ struct hid_device {							/* device report descriptor */
 	spinlock_t  debug_list_lock;
 	wait_queue_head_t debug_wait;
 };
+
+#define to_hid_device(pdev) \
+	container_of(pdev, struct hid_device, dev)
 
 static inline void *hid_get_drvdata(struct hid_device *hdev)
 {
@@ -541,6 +546,8 @@ static inline void hid_set_drvdata(struct hid_device *hdev, void *data)
 #define HID_GLOBAL_STACK_SIZE 4
 #define HID_COLLECTION_STACK_SIZE 4
 
+#define HID_SCAN_FLAG_MT_WIN_8			0x00000001
+
 struct hid_parser {
 	struct hid_global     global;
 	struct hid_global     global_stack[HID_GLOBAL_STACK_SIZE];
@@ -549,6 +556,7 @@ struct hid_parser {
 	unsigned              collection_stack[HID_COLLECTION_STACK_SIZE];
 	unsigned              collection_stack_ptr;
 	struct hid_device    *device;
+	unsigned              scan_flags;
 };
 
 struct hid_class_descriptor {
@@ -658,8 +666,8 @@ struct hid_driver {
 	int (*input_mapped)(struct hid_device *hdev,
 			struct hid_input *hidinput, struct hid_field *field,
 			struct hid_usage *usage, unsigned long **bit, int *max);
-	void (*input_configured)(struct hid_device *hdev,
-				 struct hid_input *hidinput);
+	int (*input_configured)(struct hid_device *hdev,
+				struct hid_input *hidinput);
 	void (*feature_mapping)(struct hid_device *hdev,
 			struct hid_field *field,
 			struct hid_usage *usage);
@@ -1000,11 +1008,8 @@ static inline int hid_hw_raw_request(struct hid_device *hdev,
 	if (len < 1 || len > HID_MAX_BUFFER_SIZE || !buf)
 		return -EINVAL;
 
-	if (hdev->ll_driver->raw_request)
-		return hdev->ll_driver->raw_request(hdev, reportnum, buf, len,
+	return hdev->ll_driver->raw_request(hdev, reportnum, buf, len,
 						    rtype, reqtype);
-
-	return -ENOSYS;
 }
 
 /**
@@ -1054,6 +1059,17 @@ static inline void hid_hw_wait(struct hid_device *hdev)
 {
 	if (hdev->ll_driver->wait)
 		hdev->ll_driver->wait(hdev);
+}
+
+/**
+ * hid_report_len - calculate the report length
+ *
+ * @report: the report we want to know the length
+ */
+static inline int hid_report_len(struct hid_report *report)
+{
+	/* equivalent to DIV_ROUND_UP(report->size, 8) + !!(report->id > 0) */
+	return ((report->size - 1) >> 3) + 1 + (report->id > 0);
 }
 
 int hid_report_raw_event(struct hid_device *hid, int type, u8 *data, int size,

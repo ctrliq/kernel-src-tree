@@ -321,7 +321,7 @@ static struct ctl_table sctp_net_table[] = {
 	},
 	{
 		.procname	= "pf_enable",
-		.data		= &init_net.sctp.pf_enable,
+		.data		= &init_net.sctp_pf_enable,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
@@ -504,7 +504,7 @@ void sctp_sysctl_net_unregister(struct net *net)
 	kfree(table);
 }
 
-static struct ctl_table_header * sctp_sysctl_header;
+static struct ctl_table_header *sctp_sysctl_header;
 
 /* Sysctl registration.  */
 void sctp_sysctl_register(void)

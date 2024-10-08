@@ -373,7 +373,7 @@ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 
 	file = alloc_file(&path, FMODE_READ | FMODE_WRITE,
 		  &socket_file_ops);
-	if (unlikely(IS_ERR(file))) {
+	if (IS_ERR(file)) {
 		/* drop dentry, keep inode */
 		ihold(path.dentry->d_inode);
 		path_put(&path);
@@ -1442,7 +1442,7 @@ SYSCALL_DEFINE4(socketpair, int, family, int, type, int, protocol,
 	}
 
 	newfile1 = sock_alloc_file(sock1, flags, NULL);
-	if (unlikely(IS_ERR(newfile1))) {
+	if (IS_ERR(newfile1)) {
 		err = PTR_ERR(newfile1);
 		put_unused_fd(fd1);
 		put_unused_fd(fd2);
@@ -1593,7 +1593,7 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 		goto out_put;
 	}
 	newfile = sock_alloc_file(newsock, flags, sock->sk->sk_prot_creator->name);
-	if (unlikely(IS_ERR(newfile))) {
+	if (IS_ERR(newfile)) {
 		err = PTR_ERR(newfile);
 		put_unused_fd(newfd);
 		sock_release(newsock);

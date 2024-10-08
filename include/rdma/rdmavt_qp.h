@@ -82,6 +82,7 @@
  * RVT_S_WAIT_DMA - waiting for send DMA queue to drain before generating
  *                  next send completion entry not via send DMA
  * RVT_S_WAIT_PIO - waiting for a send buffer to be available
+ * RVT_S_WAIT_PIO_DRAIN - waiting for a qp to drain pio packets
  * RVT_S_WAIT_TX - waiting for a struct verbs_txreq to be available
  * RVT_S_WAIT_DMA_DESC - waiting for DMA descriptors to be available
  * RVT_S_WAIT_KMEM - waiting for kernel memory to be available
@@ -101,16 +102,17 @@
 #define RVT_S_WAIT_SSN_CREDIT	0x0100
 #define RVT_S_WAIT_DMA		0x0200
 #define RVT_S_WAIT_PIO		0x0400
-#define RVT_S_WAIT_TX		0x0800
-#define RVT_S_WAIT_DMA_DESC	0x1000
-#define RVT_S_WAIT_KMEM		0x2000
-#define RVT_S_WAIT_PSN		0x4000
-#define RVT_S_WAIT_ACK		0x8000
-#define RVT_S_SEND_ONE		0x10000
-#define RVT_S_UNLIMITED_CREDIT	0x20000
-#define RVT_S_AHG_VALID		0x40000
-#define RVT_S_AHG_CLEAR		0x80000
-#define RVT_S_ECN		0x100000
+#define RVT_S_WAIT_PIO_DRAIN    0x0800
+#define RVT_S_WAIT_TX		0x1000
+#define RVT_S_WAIT_DMA_DESC	0x2000
+#define RVT_S_WAIT_KMEM		0x4000
+#define RVT_S_WAIT_PSN		0x8000
+#define RVT_S_WAIT_ACK		0x10000
+#define RVT_S_SEND_ONE		0x20000
+#define RVT_S_UNLIMITED_CREDIT	0x40000
+#define RVT_S_AHG_VALID		0x80000
+#define RVT_S_AHG_CLEAR		0x100000
+#define RVT_S_ECN		0x200000
 
 /*
  * Wait flags that would prevent any packet type from being sent.
@@ -209,8 +211,6 @@ struct rvt_mmap_info {
 	unsigned size;
 };
 
-#define RVT_MAX_RDMA_ATOMIC	16
-
 /*
  * This structure holds the information that the send tasklet needs
  * to send a RDMA read response or atomic operation.
@@ -225,6 +225,8 @@ struct rvt_ack_entry {
 		u64 atomic_data;
 	};
 };
+
+#define	RC_QP_SCALING_INTERVAL	5
 
 /*
  * Variables prefixed with s_ are for the requester (sender).
@@ -248,12 +250,14 @@ struct rvt_qp {
 
 	enum ib_mtu path_mtu;
 	int srate_mbps;		/* s_srate (below) converted to Mbit/s */
+	pid_t pid;		/* pid for user mode QPs */
 	u32 remote_qpn;
-	u32 pmtu;		/* decoded from path_mtu */
 	u32 qkey;               /* QKEY for this QP (for UD or RD) */
 	u32 s_size;             /* send work queue size */
 	u32 s_ahgpsn;           /* set to the psn in the copy of the header */
 
+	u16 pmtu;		/* decoded from path_mtu */
+	u8 log_pmtu;		/* shift for pmtu */
 	u8 state;               /* QP state */
 	u8 allowed_ops;		/* high order bits of allowed opcodes */
 	u8 qp_access_flags;
@@ -276,8 +280,7 @@ struct rvt_qp {
 	atomic_t refcount ____cacheline_aligned_in_smp;
 	wait_queue_head_t wait;
 
-	struct rvt_ack_entry s_ack_queue[RVT_MAX_RDMA_ATOMIC + 1]
-		____cacheline_aligned_in_smp;
+	struct rvt_ack_entry *s_ack_queue;
 	struct rvt_sge_state s_rdma_read_sge;
 
 	spinlock_t r_lock ____cacheline_aligned_in_smp;      /* used for APM */
@@ -298,6 +301,13 @@ struct rvt_qp {
 	struct rvt_sge_state r_sge;     /* current receive data */
 	struct rvt_rq r_rq;             /* receive work queue */
 
+	/* post send line */
+	spinlock_t s_hlock ____cacheline_aligned_in_smp;
+	u32 s_head;             /* new entries added here */
+	u32 s_next_psn;         /* PSN for next request */
+	u32 s_avail;            /* number of entries avail */
+	u32 s_ssn;              /* SSN of tail entry */
+
 	spinlock_t s_lock ____cacheline_aligned_in_smp;
 	u32 s_flags;
 	struct rvt_sge_state *s_cur_sge;
@@ -307,19 +317,16 @@ struct rvt_qp {
 	u32 s_cur_size;         /* size of send packet in bytes */
 	u32 s_len;              /* total length of s_sge */
 	u32 s_rdma_read_len;    /* total length of s_rdma_read_sge */
-	u32 s_next_psn;         /* PSN for next request */
 	u32 s_last_psn;         /* last response PSN processed */
 	u32 s_sending_psn;      /* lowest PSN that is being sent */
 	u32 s_sending_hpsn;     /* highest PSN that is being sent */
 	u32 s_psn;              /* current packet sequence number */
 	u32 s_ack_rdma_psn;     /* PSN for sending RDMA read responses */
 	u32 s_ack_psn;          /* PSN for acking sends and RDMA writes */
-	u32 s_head;             /* new entries added here */
 	u32 s_tail;             /* next entry to process */
 	u32 s_cur;              /* current work queue entry */
 	u32 s_acked;            /* last un-ACK'ed entry */
 	u32 s_last;             /* last completed entry */
-	u32 s_ssn;              /* SSN of tail entry */
 	u32 s_lsn;              /* limit sequence number (credit) */
 	u16 s_hdrwords;         /* size of s_hdr in 32 bit words */
 	u16 s_rdma_ack_cnt;
@@ -432,10 +439,6 @@ static inline struct rvt_rwqe *rvt_get_rwqe_ptr(struct rvt_rq *rq, unsigned n)
 extern const int  ib_rvt_state_ops[];
 
 struct rvt_dev_info;
-void rvt_remove_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp);
-void rvt_clear_mr_refs(struct rvt_qp *qp, int clr_sends);
 int rvt_error_qp(struct rvt_qp *qp, enum ib_wc_status err);
-void rvt_free_qpn(struct rvt_qpn_table *qpt, u32 qpn);
-void rvt_dec_qp_cnt(struct rvt_dev_info *rdi);
 
 #endif          /* DEF_RDMAVT_INCQP_H */

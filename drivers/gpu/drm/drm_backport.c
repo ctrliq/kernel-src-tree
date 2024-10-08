@@ -28,11 +28,12 @@ static int shrinker2_shrink(struct shrinker *shrinker, struct shrink_control *sc
 	return count;
 }
 
-void register_shrinker2(struct shrinker2 *s2)
+int register_shrinker2(struct shrinker2 *s2)
 {
 	s2->compat.shrink = shrinker2_shrink;
 	s2->compat.seeks = s2->seeks;
 	register_shrinker(&s2->compat);
+	return 0;
 }
 EXPORT_SYMBOL(register_shrinker2);
 
@@ -42,16 +43,11 @@ void unregister_shrinker2(struct shrinker2 *s2)
 }
 EXPORT_SYMBOL(unregister_shrinker2);
 
-struct workqueue_struct *system_power_efficient_wq __read_mostly;
-EXPORT_SYMBOL_GPL(system_power_efficient_wq);
-
 int __init drm_backport_init(void)
 {
-	system_power_efficient_wq = create_workqueue("events_power_efficient");
 	return 0;
 }
 
 void __exit drm_backport_exit(void)
 {
-	destroy_workqueue(system_power_efficient_wq);
 }

@@ -1449,7 +1449,7 @@ void ndisc_send_redirect(struct sk_buff *skb, const struct in6_addr *target)
 			  "Redirect: destination is not a neighbour\n");
 		goto release;
 	}
-	peer = inet_getpeer_v6(net->ipv6.peers, &rt->rt6i_dst.addr, 1);
+	peer = inet_getpeer_v6(net->ipv6.peers, &ipv6_hdr(skb)->saddr, 1);
 	ret = inet_peer_xrlim_allow(peer, 1*HZ);
 	if (peer)
 		inet_putpeer(peer);
@@ -1575,7 +1575,7 @@ int ndisc_rcv(struct sk_buff *skb)
 
 static int ndisc_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
 	struct inet6_dev *idev;
 
@@ -1727,12 +1727,12 @@ out_unregister_pernet:
 
 int __init ndisc_late_init(void)
 {
-	return register_netdevice_notifier(&ndisc_netdev_notifier);
+	return register_netdevice_notifier_rh(&ndisc_netdev_notifier);
 }
 
 void ndisc_late_cleanup(void)
 {
-	unregister_netdevice_notifier(&ndisc_netdev_notifier);
+	unregister_netdevice_notifier_rh(&ndisc_netdev_notifier);
 }
 
 void ndisc_cleanup(void)

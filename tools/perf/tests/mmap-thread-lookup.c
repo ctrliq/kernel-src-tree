@@ -129,7 +129,7 @@ static int synth_all(struct machine *machine)
 {
 	return perf_event__synthesize_threads(NULL,
 					      perf_event__process,
-					      machine, 0);
+					      machine, 0, 500);
 }
 
 static int synth_process(struct machine *machine)
@@ -141,7 +141,7 @@ static int synth_process(struct machine *machine)
 
 	err = perf_event__synthesize_thread_map(NULL, map,
 						perf_event__process,
-						machine, 0);
+						machine, 0, 500);
 
 	thread_map__put(map);
 	return err;
@@ -219,7 +219,7 @@ static int mmap_events(synth_cb synth)
  *
  * by using all thread objects.
  */
-int test__mmap_thread_lookup(void)
+int test__mmap_thread_lookup(int subtest __maybe_unused)
 {
 	/* perf_event__synthesize_threads synthesize */
 	TEST_ASSERT_VAL("failed with sythesizing all",

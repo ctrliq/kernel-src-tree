@@ -108,7 +108,8 @@ DEFINE_PER_CPU(mce_banks_t, mce_poll_banks) = {
  */
 mce_banks_t mce_banks_ce_disabled;
 
-static DEFINE_PER_CPU(struct work_struct, mce_work);
+static struct work_struct mce_work;
+static struct irq_work mce_irq_work;
 
 static void (*quirk_no_way_out)(int bank, struct mce *m, struct pt_regs *regs);
 
@@ -123,7 +124,7 @@ void mce_setup(struct mce *m)
 {
 	memset(m, 0, sizeof(struct mce));
 	m->cpu = m->extcpu = smp_processor_id();
-	rdtscll(m->tsc);
+	m->tsc = rdtsc();
 	/* We hope get_seconds stays lockless */
 	m->time = get_seconds();
 	m->cpuvendor = boot_cpu_data.x86_vendor;
@@ -155,7 +156,8 @@ void mce_log(struct mce *mce)
 	/* Emit the trace record: */
 	trace_mce_record(mce);
 
-	atomic_notifier_call_chain(&x86_mce_decoder_chain, 0, mce);
+	if (!mce_gen_pool_add(mce))
+		irq_work_queue(&mce_irq_work);
 
 	mce->finished = 0;
 	wmb();
@@ -194,48 +196,23 @@ void mce_log(struct mce *mce)
 	set_bit(0, &mce_need_notify);
 }
 
-static void drain_mcelog_buffer(void)
+void mce_inject_log(struct mce *m)
 {
-	unsigned int next, i, prev = 0;
-
-	next = ACCESS_ONCE(mcelog.next);
-
-	do {
-		struct mce *m;
-
-		/* drain what was logged during boot */
-		for (i = prev; i < next; i++) {
-			unsigned long start = jiffies;
-			unsigned retries = 1;
-
-			m = &mcelog.entry[i];
-
-			while (!m->finished) {
-				if (time_after_eq(jiffies, start + 2*retries))
-					retries++;
-
-				cpu_relax();
-
-				if (!m->finished && retries >= 4) {
-					pr_err("skipping error being logged currently!\n");
-					break;
-				}
-			}
-			smp_rmb();
-			atomic_notifier_call_chain(&x86_mce_decoder_chain, 0, m);
-		}
-
-		memset(mcelog.entry + prev, 0, (next - prev) * sizeof(*m));
-		prev = next;
-		next = cmpxchg(&mcelog.next, prev, 0);
-	} while (next != prev);
+	mutex_lock(&mce_chrdev_read_mutex);
+	mce_log(m);
+	mutex_unlock(&mce_chrdev_read_mutex);
 }
+EXPORT_SYMBOL_GPL(mce_inject_log);
 
+static struct notifier_block mce_srao_nb;
 
 void mce_register_decode_chain(struct notifier_block *nb)
 {
+	/* Ensure SRAO notifier has the highest priority in the decode chain. */
+	if (nb != &mce_srao_nb && nb->priority == INT_MAX)
+		nb->priority -= 1;
+
 	atomic_notifier_chain_register(&x86_mce_decoder_chain, nb);
-	drain_mcelog_buffer();
 }
 EXPORT_SYMBOL_GPL(mce_register_decode_chain);
 
@@ -459,61 +436,6 @@ static inline void mce_gather_info(struct mce *m, struct pt_regs *regs)
 	}
 }
 
-/*
- * Simple lockless ring to communicate PFNs from the exception handler with the
- * process context work function. This is vastly simplified because there's
- * only a single reader and a single writer.
- */
-#define MCE_RING_SIZE 16	/* we use one entry less */
-
-struct mce_ring {
-	unsigned short start;
-	unsigned short end;
-	unsigned long ring[MCE_RING_SIZE];
-};
-static DEFINE_PER_CPU(struct mce_ring, mce_ring);
-
-/* Runs with CPU affinity in workqueue */
-static int mce_ring_empty(void)
-{
-	struct mce_ring *r = &__get_cpu_var(mce_ring);
-
-	return r->start == r->end;
-}
-
-static int mce_ring_get(unsigned long *pfn)
-{
-	struct mce_ring *r;
-	int ret = 0;
-
-	*pfn = 0;
-	get_cpu();
-	r = &__get_cpu_var(mce_ring);
-	if (r->start == r->end)
-		goto out;
-	*pfn = r->ring[r->start];
-	r->start = (r->start + 1) % MCE_RING_SIZE;
-	ret = 1;
-out:
-	put_cpu();
-	return ret;
-}
-
-/* Always runs in MCE context with preempt off */
-static int mce_ring_add(unsigned long pfn)
-{
-	struct mce_ring *r = &__get_cpu_var(mce_ring);
-	unsigned next;
-
-	next = (r->end + 1) % MCE_RING_SIZE;
-	if (next == r->start)
-		return -1;
-	r->ring[r->end] = pfn;
-	wmb();
-	r->end = next;
-	return 0;
-}
-
 int mce_available(struct cpuinfo_x86 *c)
 {
 	if (mca_cfg.disabled)
@@ -523,11 +445,9 @@ int mce_available(struct cpuinfo_x86 *c)
 
 static void mce_schedule_work(void)
 {
-	if (!mce_ring_empty())
-		schedule_work(&__get_cpu_var(mce_work));
+	if (!mce_gen_pool_empty() && keventd_up())
+		schedule_work(&mce_work);
 }
-
-static DEFINE_PER_CPU(struct irq_work, mce_irq_work);
 
 static void mce_irq_work_cb(struct irq_work *entry)
 {
@@ -549,8 +469,51 @@ static void mce_report_event(struct pt_regs *regs)
 		return;
 	}
 
-	irq_work_queue(&__get_cpu_var(mce_irq_work));
+	irq_work_queue(&mce_irq_work);
 }
+
+/*
+ * Check if the address reported by the CPU is in a format we can parse.
+ * It would be possible to add code for most other cases, but all would
+ * be somewhat complicated (e.g. segment offset would require an instruction
+ * parser). So only support physical addresses up to page granuality for now.
+ */
+static int mce_usable_address(struct mce *m)
+{
+	if (!(m->status & MCI_STATUS_MISCV) || !(m->status & MCI_STATUS_ADDRV))
+		return 0;
+
+	/* Checks after this one are Intel-specific: */
+	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
+		return 1;
+
+	if (MCI_MISC_ADDR_LSB(m->misc) > PAGE_SHIFT)
+		return 0;
+	if (MCI_MISC_ADDR_MODE(m->misc) != MCI_MISC_ADDR_PHYS)
+		return 0;
+	return 1;
+}
+
+static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
+				void *data)
+{
+	struct mce *mce = (struct mce *)data;
+	unsigned long pfn;
+
+	if (!mce)
+		return NOTIFY_DONE;
+
+	if (mce_usable_address(mce) && (mce->severity == MCE_AO_SEVERITY)) {
+		pfn = mce->addr >> PAGE_SHIFT;
+		memory_failure(pfn, MCE_VECTOR, 0);
+	}
+
+	return NOTIFY_OK;
+}
+static struct notifier_block mce_srao_nb = {
+	.notifier_call	= srao_decode_notifier,
+	.priority = INT_MAX,
+};
 
 /*
  * Read ADDR and MISC registers.
@@ -623,7 +586,7 @@ DEFINE_PER_CPU(unsigned, mce_poll_count);
  */
 bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 {
-	bool error_logged = false;
+	bool error_seen = false;
 	struct mce m;
 	int severity;
 	int i;
@@ -657,6 +620,8 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 		    (m.status & (mca_cfg.ser ? MCI_STATUS_S : MCI_STATUS_UC)))
 			continue;
 
+		error_seen = true;
+
 		mce_read_aux(&m, i);
 
 		if (!(flags & MCP_TIMESTAMP))
@@ -664,24 +629,24 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 
 		severity = mce_severity(&m, mca_cfg.tolerant, NULL, false);
 
-		/*
-		 * In the cases where we don't have a valid address after all,
-		 * do not add it into the ring buffer.
-		 */
-		if (severity == MCE_DEFERRED_SEVERITY && memory_error(&m)) {
-			if (m.status & MCI_STATUS_ADDRV) {
-				mce_ring_add(m.addr >> PAGE_SHIFT);
-				mce_schedule_work();
-			}
-		}
+		if (severity == MCE_DEFERRED_SEVERITY && memory_error(&m))
+			if (m.status & MCI_STATUS_ADDRV)
+				m.severity = severity;
 
 		/*
 		 * Don't get the IP here because it's unlikely to
 		 * have anything to do with the actual error location.
 		 */
-		if (!(flags & MCP_DONTLOG) && !mca_cfg.dont_log_ce) {
-			error_logged = true;
+		if (!(flags & MCP_DONTLOG) && !mca_cfg.dont_log_ce)
 			mce_log(&m);
+		else if (mce_usable_address(&m)) {
+			/*
+			 * Although we skipped logging this, we still want
+			 * to take action. Add to the pool so the registered
+			 * notifiers will see it.
+			 */
+			if (!mce_gen_pool_add(&m))
+				mce_schedule_work();
 		}
 
 		/*
@@ -697,7 +662,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 
 	sync_core();
 
-	return error_logged;
+	return error_seen;
 }
 EXPORT_SYMBOL_GPL(machine_check_poll);
 
@@ -984,23 +949,6 @@ reset:
 	return ret;
 }
 
-/*
- * Check if the address reported by the CPU is in a format we can parse.
- * It would be possible to add code for most other cases, but all would
- * be somewhat complicated (e.g. segment offset would require an instruction
- * parser). So only support physical addresses up to page granuality for now.
- */
-static int mce_usable_address(struct mce *m)
-{
-	if (!(m->status & MCI_STATUS_MISCV) || !(m->status & MCI_STATUS_ADDRV))
-		return 0;
-	if (MCI_MISC_ADDR_LSB(m->misc) > PAGE_SHIFT)
-		return 0;
-	if (MCI_MISC_ADDR_MODE(m->misc) != MCI_MISC_ADDR_PHYS)
-		return 0;
-	return 1;
-}
-
 static void mce_clear_state(unsigned long *toclear)
 {
 	int i;
@@ -1051,6 +999,17 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	u64 recover_paddr = ~0ull;
 	int flags = MF_ACTION_REQUIRED;
 	int lmce = 0;
+
+	/* If this CPU is offline, just bail out. */
+	if (cpu_is_offline(smp_processor_id())) {
+		u64 mcgstatus;
+
+		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+		if (mcgstatus & MCG_STATUS_RIPV) {
+			mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+			return;
+		}
+	}
 
 	this_cpu_inc(mce_exception_count);
 
@@ -1138,15 +1097,8 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 
 		mce_read_aux(&m, i);
 
-		/*
-		 * Action optional error. Queue address for later processing.
-		 * When the ring overflows we just ignore the AO error.
-		 * RED-PEN add some logging mechanism when
-		 * usable_address or mce_add_ring fails.
-		 * RED-PEN don't ignore overflow for mca_cfg.tolerant == 0
-		 */
-		if (severity == MCE_AO_SEVERITY && mce_usable_address(&m))
-			mce_ring_add(m.addr >> PAGE_SHIFT);
+		/* assuming valid severity level != 0 */
+		m.severity = severity;
 
 		mce_log(&m);
 
@@ -1238,14 +1190,11 @@ int memory_failure(unsigned long pfn, int vector, int flags)
 /*
  * Action optional processing happens here (picking up
  * from the list of faulting pages that do_machine_check()
- * placed into the "ring").
+ * placed into the genpool).
  */
 static void mce_process_work(struct work_struct *dummy)
 {
-	unsigned long pfn;
-
-	while (mce_ring_get(&pfn))
-		memory_failure(pfn, MCE_VECTOR, 0);
+	mce_gen_pool_process();
 }
 
 #ifdef CONFIG_X86_MCE_INTEL
@@ -1673,6 +1622,17 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
 	}
 }
 
+static void __mcheck_cpu_clear_vendor(struct cpuinfo_x86 *c)
+{
+	switch (c->x86_vendor) {
+	case X86_VENDOR_INTEL:
+		mce_intel_feature_clear(c);
+		break;
+	default:
+		break;
+	}
+}
+
 static void mce_start_timer(unsigned int cpu, struct timer_list *t)
 {
 	unsigned long iv = check_interval * HZ;
@@ -1737,8 +1697,25 @@ void mcheck_cpu_init(struct cpuinfo_x86 *c)
 	__mcheck_cpu_init_generic();
 	__mcheck_cpu_init_vendor(c);
 	__mcheck_cpu_init_timer();
-	INIT_WORK(&__get_cpu_var(mce_work), mce_process_work);
-	init_irq_work(&__get_cpu_var(mce_irq_work), &mce_irq_work_cb);
+}
+
+/*
+ * Called for each booted CPU to clear some machine checks opt-ins
+ */
+void mcheck_cpu_clear(struct cpuinfo_x86 *c)
+{
+	if (mca_cfg.disabled)
+		return;
+
+	if (!mce_available(c))
+		return;
+
+	/*
+	 * Possibly to clear general settings generic to x86
+	 * __mcheck_cpu_clear_generic(c);
+	 */
+	__mcheck_cpu_clear_vendor(c);
+
 }
 
 /*
@@ -1785,7 +1762,7 @@ static void collect_tscs(void *data)
 {
 	unsigned long *cpu_tsc = (unsigned long *)data;
 
-	rdtscll(cpu_tsc[smp_processor_id()]);
+	cpu_tsc[smp_processor_id()] = rdtsc();
 }
 
 static int mce_apei_read_done;
@@ -2057,7 +2034,11 @@ __setup("mce", mcheck_enable);
 int __init mcheck_init(void)
 {
 	mcheck_intel_therm_init();
+	mce_register_decode_chain(&mce_srao_nb);
 	mcheck_vendor_init_severity();
+
+	INIT_WORK(&mce_work, mce_process_work);
+	init_irq_work(&mce_irq_work, mce_irq_work_cb);
 
 	return 0;
 }
@@ -2603,5 +2584,20 @@ static int __init mcheck_debugfs_init(void)
 
 	return 0;
 }
-late_initcall(mcheck_debugfs_init);
+#else
+static int __init mcheck_debugfs_init(void) { return -EINVAL; }
 #endif
+
+static int __init mcheck_late_init(void)
+{
+	mcheck_debugfs_init();
+
+	/*
+	 * Flush out everything that has been logged during early boot, now that
+	 * everything has been initialized (workqueues, decoders, ...).
+	 */
+	mce_schedule_work();
+
+	return 0;
+}
+late_initcall(mcheck_late_init);

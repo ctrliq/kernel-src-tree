@@ -173,6 +173,9 @@ queue_max_sectors_store(struct request_queue *q, const char *page, size_t count)
 	if (ret < 0)
 		return ret;
 
+	max_hw_sectors_kb = min_not_zero(max_hw_sectors_kb, (unsigned long)
+					 q->limits.max_dev_sectors >> 1);
+
 	if (max_sectors_kb > max_hw_sectors_kb || max_sectors_kb < page_kb)
 		return -EINVAL;
 
@@ -207,6 +210,9 @@ queue_store_unpriv_sgio(struct request_queue *q, const char *page, size_t count)
 		return -EPERM;
 
 	ret = queue_var_store(&val, page, count);
+	if (ret < 0)
+		return ret;
+
 	spin_lock_irq(q->queue_lock);
 	if (val)
 		queue_flag_set(QUEUE_FLAG_UNPRIV_SGIO, q);
@@ -592,10 +598,13 @@ int blk_register_queue(struct gendisk *disk)
 	 */
 	if (!blk_queue_init_done(q)) {
 		queue_flag_set_unlocked(QUEUE_FLAG_INIT_DONE, q);
+		percpu_ref_switch_to_percpu(&q->q_usage_counter);
 		blk_queue_bypass_end(q);
-		if (q->mq_ops)
-			blk_mq_finish_init(q);
 	}
+
+	/* Convert QUEUE_FLAG_SG_GAPS to use queue limits */
+	if (test_bit(QUEUE_FLAG_SG_GAPS, &q->queue_flags))
+		blk_queue_virt_boundary(q, PAGE_SIZE - 1);
 
 	ret = blk_trace_init_sysfs(dev);
 	if (ret)

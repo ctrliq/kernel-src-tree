@@ -34,7 +34,8 @@ extern int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 			unsigned long addr, pgprot_t newprot,
 			int prot_numa);
 int vmf_insert_pfn_pmd(struct vm_area_struct *, unsigned long addr, pmd_t *,
-			unsigned long pfn, bool write);
+			pfn_t pfn, bool write);
+extern void put_huge_zero_page(void);
 
 enum transparent_hugepage_flag {
 	TRANSPARENT_HUGEPAGE_FLAG,
@@ -154,6 +155,85 @@ static inline int hpage_nr_pages(struct page *page)
 extern int do_huge_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
 				unsigned long addr, pmd_t pmd, pmd_t *pmdp);
 
+static inline bool is_trans_huge_page_release(struct page *page)
+{
+	return (unsigned long) page & 1;
+}
+
+extern struct page *huge_zero_page;
+
+static inline bool is_huge_zero_page(struct page *page)
+{
+	return ACCESS_ONCE(huge_zero_page) == page;
+}
+
+static inline bool is_huge_zero_page_release(struct page *page)
+{
+	return (unsigned long) page == ~0UL;
+}
+
+static inline struct page *trans_huge_page_release_decode(struct page *page)
+{
+	return (struct page *) ((unsigned long)page & ~1UL);
+}
+
+static inline struct page *trans_huge_page_release_encode(struct page *page)
+{
+	return (struct page *) ((unsigned long)page | 1UL);
+}
+
+static inline struct page *huge_zero_page_release_encode(void)
+{
+	/* NOTE: is_trans_huge_page_release() must return true */
+	return (struct page *) (~0UL);
+}
+
+static inline atomic_t *__trans_huge_mmu_gather_count(struct page *page)
+{
+	return &(page + 1)->thp_mmu_gather;
+}
+
+static inline void init_trans_huge_mmu_gather_count(struct page *page)
+{
+	atomic_t *thp_mmu_gather = __trans_huge_mmu_gather_count(page);
+	atomic_set(thp_mmu_gather, 0);
+}
+
+static inline void inc_trans_huge_mmu_gather_count(struct page *page)
+{
+	atomic_t *thp_mmu_gather = __trans_huge_mmu_gather_count(page);
+	VM_BUG_ON(atomic_read(thp_mmu_gather) < 0);
+	atomic_inc(thp_mmu_gather);
+}
+
+static inline void dec_trans_huge_mmu_gather_count(struct page *page)
+{
+	atomic_t *thp_mmu_gather = __trans_huge_mmu_gather_count(page);
+	VM_BUG_ON(atomic_read(thp_mmu_gather) <= 0);
+	atomic_dec(thp_mmu_gather);
+}
+
+static inline int trans_huge_mmu_gather_count(struct page *page)
+{
+	atomic_t *thp_mmu_gather = __trans_huge_mmu_gather_count(page);
+	int ret = atomic_read(thp_mmu_gather);
+	VM_BUG_ON(ret < 0);
+	return ret;
+}
+
+/*
+ * free_trans_huge_page_list() is used to free THP pages (if still
+ * PageTransHuge()) in release_pages().
+ */
+extern void free_trans_huge_page_list(struct list_head *list);
+
+static inline bool is_huge_zero_pmd(pmd_t pmd)
+{
+	return is_huge_zero_page(pmd_page(pmd));
+}
+
+struct page *get_huge_zero_page(void);
+
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
 #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
 #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
@@ -201,6 +281,29 @@ static inline int do_huge_pmd_numa_page(struct mm_struct *mm, struct vm_area_str
 					unsigned long addr, pmd_t pmd, pmd_t *pmdp)
 {
 	return 0;
+}
+
+static inline bool is_trans_huge_page_release(struct page *page)
+{
+	return false;
+}
+
+static inline struct page *trans_huge_page_release_encode(struct page *page)
+{
+	return page;
+}
+
+static inline struct page *trans_huge_page_release_decode(struct page *page)
+{
+	return page;
+}
+
+extern void dec_trans_huge_mmu_gather_count(struct page *page);
+extern bool is_huge_zero_page_release(struct page *page);
+
+static inline bool is_huge_zero_page(struct page *page)
+{
+	return false;
 }
 
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */

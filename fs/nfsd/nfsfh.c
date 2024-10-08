@@ -86,7 +86,7 @@ static __be32 nfsd_setuser_and_check_port(struct svc_rqst *rqstp,
 	int flags = nfsexp_flags(rqstp, exp);
 
 	/* Check if the request originated from a secure port. */
-	if (!rqstp->rq_secure && !(flags & NFSEXP_INSECURE_PORT)) {
+	if (!test_bit(RQ_SECURE, &rqstp->rq_flags) && !(flags & NFSEXP_INSECURE_PORT)) {
 		RPC_IFDEBUG(char buf[RPC_MAX_ADDRBUFLEN]);
 		dprintk("nfsd: request from insecure port %s!\n",
 		        svc_print_addr(rqstp, buf, sizeof(buf)));
@@ -631,10 +631,7 @@ fh_put(struct svc_fh *fhp)
 		fh_unlock(fhp);
 		fhp->fh_dentry = NULL;
 		dput(dentry);
-#ifdef CONFIG_NFSD_V3
-		fhp->fh_pre_saved = 0;
-		fhp->fh_post_saved = 0;
-#endif
+		fh_clear_wcc(fhp);
 	}
 	fh_drop_write(fhp);
 	if (exp) {

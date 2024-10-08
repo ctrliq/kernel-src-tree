@@ -152,7 +152,12 @@ void t4_write_indirect(struct adapter *adap, unsigned int addr_reg,
  */
 void t4_hw_pci_read_cfg4(struct adapter *adap, int reg, u32 *val)
 {
-	u32 req = ENABLE_F | FUNCTION_V(adap->pf) | REGISTER_V(reg);
+	u32 req = FUNCTION_V(adap->pf) | REGISTER_V(reg);
+
+	if (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5)
+		req |= ENABLE_F;
+	else
+		req |= T6_ENABLE_F;
 
 	if (is_t4(adap->params.chip))
 		req |= LOCALCFG_F;
@@ -420,9 +425,8 @@ int t4_memory_rw(struct adapter *adap, int win, int mtype, u32 addr,
 	/* Offset into the region of memory which is being accessed
 	 * MEM_EDC0 = 0
 	 * MEM_EDC1 = 1
-	 * MEM_MC   = 2 -- T4
-	 * MEM_MC0  = 2 -- For T5
-	 * MEM_MC1  = 3 -- For T5
+	 * MEM_MC   = 2 -- MEM_MC for chips with only 1 memory controller
+	 * MEM_MC1  = 3 -- for chips with 2 memory controllers (e.g. T5)
 	 */
 	edc_size  = EDRAM0_SIZE_G(t4_read_reg(adap, MA_EDRAM0_BAR_A));
 	if (mtype != MEM_MC1)
@@ -3021,6 +3025,11 @@ int t4_check_fw_version(struct adapter *adap)
 		exp_minor = T5FW_MIN_VERSION_MINOR;
 		exp_micro = T5FW_MIN_VERSION_MICRO;
 		break;
+	case CHELSIO_T6:
+		exp_major = T6FW_MIN_VERSION_MAJOR;
+		exp_minor = T6FW_MIN_VERSION_MINOR;
+		exp_micro = T6FW_MIN_VERSION_MICRO;
+		break;
 	default:
 		dev_err(adap->pdev_dev, "Unsupported chip type, %x\n",
 			adap->chip);
@@ -3232,7 +3241,8 @@ static bool t4_fw_matches_chip(const struct adapter *adap,
 	 * which will keep us "honest" in the future ...
 	 */
 	if ((is_t4(adap->params.chip) && hdr->chip == FW_HDR_CHIP_T4) ||
-	    (is_t5(adap->params.chip) && hdr->chip == FW_HDR_CHIP_T5))
+	    (is_t5(adap->params.chip) && hdr->chip == FW_HDR_CHIP_T5) ||
+	    (is_t6(adap->params.chip) && hdr->chip == FW_HDR_CHIP_T6))
 		return true;
 
 	dev_err(adap->pdev_dev,
@@ -3827,6 +3837,7 @@ static void tp_intr_handler(struct adapter *adapter)
 static void sge_intr_handler(struct adapter *adapter)
 {
 	u64 v;
+	u32 err;
 
 	static const struct intr_info sge_intr_info[] = {
 		{ ERR_CPL_EXCEED_IQE_SIZE_F,
@@ -3835,8 +3846,6 @@ static void sge_intr_handler(struct adapter *adapter)
 		  "SGE GTS CIDX increment too large", -1, 0 },
 		{ ERR_CPL_OPCODE_0_F, "SGE received 0-length CPL", -1, 0 },
 		{ DBFIFO_LP_INT_F, NULL, -1, 0, t4_db_full },
-		{ DBFIFO_HP_INT_F, NULL, -1, 0, t4_db_full },
-		{ ERR_DROPPED_DB_F, NULL, -1, 0, t4_db_dropped },
 		{ ERR_DATA_CPL_ON_HIGH_QID1_F | ERR_DATA_CPL_ON_HIGH_QID0_F,
 		  "SGE IQID > 1023 received CPL for FL", -1, 0 },
 		{ ERR_BAD_DB_PIDX3_F, "SGE DBP 3 pidx increment too large", -1,
@@ -3849,10 +3858,16 @@ static void sge_intr_handler(struct adapter *adapter)
 		  0 },
 		{ ERR_ING_CTXT_PRIO_F,
 		  "SGE too many priority ingress contexts", -1, 0 },
-		{ ERR_EGR_CTXT_PRIO_F,
-		  "SGE too many priority egress contexts", -1, 0 },
 		{ INGRESS_SIZE_ERR_F, "SGE illegal ingress QID", -1, 0 },
 		{ EGRESS_SIZE_ERR_F, "SGE illegal egress QID", -1, 0 },
+		{ 0 }
+	};
+
+	static struct intr_info t4t5_sge_intr_info[] = {
+		{ ERR_DROPPED_DB_F, NULL, -1, 0, t4_db_dropped },
+		{ DBFIFO_HP_INT_F, NULL, -1, 0, t4_db_full },
+		{ ERR_EGR_CTXT_PRIO_F,
+		  "SGE too many priority egress contexts", -1, 0 },
 		{ 0 }
 	};
 
@@ -3865,8 +3880,23 @@ static void sge_intr_handler(struct adapter *adapter)
 		t4_write_reg(adapter, SGE_INT_CAUSE2_A, v >> 32);
 	}
 
-	if (t4_handle_intr_status(adapter, SGE_INT_CAUSE3_A, sge_intr_info) ||
-	    v != 0)
+	v |= t4_handle_intr_status(adapter, SGE_INT_CAUSE3_A, sge_intr_info);
+	if (CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5)
+		v |= t4_handle_intr_status(adapter, SGE_INT_CAUSE3_A,
+					   t4t5_sge_intr_info);
+
+	err = t4_read_reg(adapter, SGE_ERROR_STATS_A);
+	if (err & ERROR_QID_VALID_F) {
+		dev_err(adapter->pdev_dev, "SGE error for queue %u\n",
+			ERROR_QID_G(err));
+		if (err & UNCAPTURED_ERROR_F)
+			dev_err(adapter->pdev_dev,
+				"SGE UNCAPTURED_ERROR set (clearing)\n");
+		t4_write_reg(adapter, SGE_ERROR_STATS_A, ERROR_QID_VALID_F |
+			     UNCAPTURED_ERROR_F);
+	}
+
+	if (v != 0)
 		t4_fatal_err(adapter);
 }
 
@@ -4039,6 +4069,7 @@ static void cplsw_intr_handler(struct adapter *adapter)
  */
 static void le_intr_handler(struct adapter *adap)
 {
+	enum chip_type chip = CHELSIO_CHIP_VERSION(adap->params.chip);
 	static const struct intr_info le_intr_info[] = {
 		{ LIPMISS_F, "LE LIP miss", -1, 0 },
 		{ LIP0_F, "LE 0 LIP error", -1, 0 },
@@ -4048,7 +4079,18 @@ static void le_intr_handler(struct adapter *adap)
 		{ 0 }
 	};
 
-	if (t4_handle_intr_status(adap, LE_DB_INT_CAUSE_A, le_intr_info))
+	static struct intr_info t6_le_intr_info[] = {
+		{ T6_LIPMISS_F, "LE LIP miss", -1, 0 },
+		{ T6_LIP0_F, "LE 0 LIP error", -1, 0 },
+		{ TCAMINTPERR_F, "LE parity error", -1, 1 },
+		{ T6_UNKNOWNCMD_F, "LE unknown command", -1, 1 },
+		{ SSRAMINTPERR_F, "LE request queue parity error", -1, 1 },
+		{ 0 }
+	};
+
+	if (t4_handle_intr_status(adap, LE_DB_INT_CAUSE_A,
+				  (chip <= CHELSIO_T5) ?
+				  le_intr_info : t6_le_intr_info))
 		t4_fatal_err(adap);
 }
 
@@ -4319,7 +4361,7 @@ int t4_slow_intr_handler(struct adapter *adapter)
 		pcie_intr_handler(adapter);
 	if (cause & MC_F)
 		mem_intr_handler(adapter, MEM_MC);
-	if (!is_t4(adapter->params.chip) && (cause & MC1_S))
+	if (is_t5(adapter->params.chip) && (cause & MC1_F))
 		mem_intr_handler(adapter, MEM_MC1);
 	if (cause & EDC0_F)
 		mem_intr_handler(adapter, MEM_EDC0);
@@ -4365,17 +4407,20 @@ int t4_slow_intr_handler(struct adapter *adapter)
  */
 void t4_intr_enable(struct adapter *adapter)
 {
-	u32 pf = SOURCEPF_G(t4_read_reg(adapter, PL_WHOAMI_A));
+	u32 val = 0;
+	u32 whoami = t4_read_reg(adapter, PL_WHOAMI_A);
+	u32 pf = CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5 ?
+			SOURCEPF_G(whoami) : T6_SOURCEPF_G(whoami);
 
+	if (CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5)
+		val = ERR_DROPPED_DB_F | ERR_EGR_CTXT_PRIO_F | DBFIFO_HP_INT_F;
 	t4_write_reg(adapter, SGE_INT_ENABLE3_A, ERR_CPL_EXCEED_IQE_SIZE_F |
 		     ERR_INVALID_CIDX_INC_F | ERR_CPL_OPCODE_0_F |
-		     ERR_DROPPED_DB_F | ERR_DATA_CPL_ON_HIGH_QID1_F |
+		     ERR_DATA_CPL_ON_HIGH_QID1_F | INGRESS_SIZE_ERR_F |
 		     ERR_DATA_CPL_ON_HIGH_QID0_F | ERR_BAD_DB_PIDX3_F |
 		     ERR_BAD_DB_PIDX2_F | ERR_BAD_DB_PIDX1_F |
 		     ERR_BAD_DB_PIDX0_F | ERR_ING_CTXT_PRIO_F |
-		     ERR_EGR_CTXT_PRIO_F | INGRESS_SIZE_ERR_F |
-		     DBFIFO_HP_INT_F | DBFIFO_LP_INT_F |
-		     EGRESS_SIZE_ERR_F);
+		     DBFIFO_LP_INT_F | EGRESS_SIZE_ERR_F | val);
 	t4_write_reg(adapter, MYPF_REG(PL_PF_INT_ENABLE_A), PF_INTR_MASK);
 	t4_set_reg_field(adapter, PL_INT_MAP0_A, 0, 1 << pf);
 }
@@ -4390,7 +4435,9 @@ void t4_intr_enable(struct adapter *adapter)
  */
 void t4_intr_disable(struct adapter *adapter)
 {
-	u32 pf = SOURCEPF_G(t4_read_reg(adapter, PL_WHOAMI_A));
+	u32 whoami = t4_read_reg(adapter, PL_WHOAMI_A);
+	u32 pf = CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5 ?
+			SOURCEPF_G(whoami) : T6_SOURCEPF_G(whoami);
 
 	t4_write_reg(adapter, MYPF_REG(PL_PF_INT_ENABLE_A), 0);
 	t4_set_reg_field(adapter, PL_INT_MAP0_A, 1 << pf, 0);
@@ -4547,6 +4594,45 @@ int t4_read_rss(struct adapter *adapter, u16 *map)
 	return 0;
 }
 
+static unsigned int t4_use_ldst(struct adapter *adap)
+{
+	return (adap->flags & FW_OK) || !adap->use_bd;
+}
+
+/**
+ *	t4_fw_tp_pio_rw - Access TP PIO through LDST
+ *	@adap: the adapter
+ *	@vals: where the indirect register values are stored/written
+ *	@nregs: how many indirect registers to read/write
+ *	@start_idx: index of first indirect register to read/write
+ *	@rw: Read (1) or Write (0)
+ *
+ *	Access TP PIO registers through LDST
+ */
+static void t4_fw_tp_pio_rw(struct adapter *adap, u32 *vals, unsigned int nregs,
+			    unsigned int start_index, unsigned int rw)
+{
+	int ret, i;
+	int cmd = FW_LDST_ADDRSPC_TP_PIO;
+	struct fw_ldst_cmd c;
+
+	for (i = 0 ; i < nregs; i++) {
+		memset(&c, 0, sizeof(c));
+		c.op_to_addrspace = cpu_to_be32(FW_CMD_OP_V(FW_LDST_CMD) |
+						FW_CMD_REQUEST_F |
+						(rw ? FW_CMD_READ_F :
+						      FW_CMD_WRITE_F) |
+						FW_LDST_CMD_ADDRSPACE_V(cmd));
+		c.cycles_to_len16 = cpu_to_be32(FW_LEN16(c));
+
+		c.u.addrval.addr = cpu_to_be32(start_index + i);
+		c.u.addrval.val  = rw ? 0 : cpu_to_be32(vals[i]);
+		ret = t4_wr_mbox(adap, adap->mbox, &c, sizeof(c), &c);
+		if (!ret && rw)
+			vals[i] = be32_to_cpu(c.u.addrval.val);
+	}
+}
+
 /**
  *	t4_read_rss_key - read the global RSS key
  *	@adap: the adapter
@@ -4556,8 +4642,11 @@ int t4_read_rss(struct adapter *adapter, u16 *map)
  */
 void t4_read_rss_key(struct adapter *adap, u32 *key)
 {
-	t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A, key, 10,
-			 TP_RSS_SECRET_KEY0_A);
+	if (t4_use_ldst(adap))
+		t4_fw_tp_pio_rw(adap, key, 10, TP_RSS_SECRET_KEY0_A, 1);
+	else
+		t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A, key, 10,
+				 TP_RSS_SECRET_KEY0_A);
 }
 
 /**
@@ -4572,11 +4661,32 @@ void t4_read_rss_key(struct adapter *adap, u32 *key)
  */
 void t4_write_rss_key(struct adapter *adap, const u32 *key, int idx)
 {
-	t4_write_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A, key, 10,
-			  TP_RSS_SECRET_KEY0_A);
-	if (idx >= 0 && idx < 16)
-		t4_write_reg(adap, TP_RSS_CONFIG_VRT_A,
-			     KEYWRADDR_V(idx) | KEYWREN_F);
+	u8 rss_key_addr_cnt = 16;
+	u32 vrt = t4_read_reg(adap, TP_RSS_CONFIG_VRT_A);
+
+	/* T6 and later: for KeyMode 3 (per-vf and per-vf scramble),
+	 * allows access to key addresses 16-63 by using KeyWrAddrX
+	 * as index[5:4](upper 2) into key table
+	 */
+	if ((CHELSIO_CHIP_VERSION(adap->params.chip) > CHELSIO_T5) &&
+	    (vrt & KEYEXTEND_F) && (KEYMODE_G(vrt) == 3))
+		rss_key_addr_cnt = 32;
+
+	if (t4_use_ldst(adap))
+		t4_fw_tp_pio_rw(adap, (void *)key, 10, TP_RSS_SECRET_KEY0_A, 0);
+	else
+		t4_write_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A, key, 10,
+				  TP_RSS_SECRET_KEY0_A);
+
+	if (idx >= 0 && idx < rss_key_addr_cnt) {
+		if (rss_key_addr_cnt > 16)
+			t4_write_reg(adap, TP_RSS_CONFIG_VRT_A,
+				     KEYWRADDRX_V(idx >> 4) |
+				     T6_VFWRADDR_V(idx) | KEYWREN_F);
+		else
+			t4_write_reg(adap, TP_RSS_CONFIG_VRT_A,
+				     KEYWRADDR_V(idx) | KEYWREN_F);
+	}
 }
 
 /**
@@ -4591,8 +4701,12 @@ void t4_write_rss_key(struct adapter *adap, const u32 *key, int idx)
 void t4_read_rss_pf_config(struct adapter *adapter, unsigned int index,
 			   u32 *valp)
 {
-	t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 valp, 1, TP_RSS_PF0_CONFIG_A + index);
+	if (t4_use_ldst(adapter))
+		t4_fw_tp_pio_rw(adapter, valp, 1,
+				TP_RSS_PF0_CONFIG_A + index, 1);
+	else
+		t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 valp, 1, TP_RSS_PF0_CONFIG_A + index);
 }
 
 /**
@@ -4610,8 +4724,13 @@ void t4_read_rss_vf_config(struct adapter *adapter, unsigned int index,
 {
 	u32 vrt, mask, data;
 
-	mask = VFWRADDR_V(VFWRADDR_M);
-	data = VFWRADDR_V(index);
+	if (CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5) {
+		mask = VFWRADDR_V(VFWRADDR_M);
+		data = VFWRADDR_V(index);
+	} else {
+		 mask =  T6_VFWRADDR_V(T6_VFWRADDR_M);
+		 data = T6_VFWRADDR_V(index);
+	}
 
 	/* Request that the index'th VF Table values be read into VFL/VFH.
 	 */
@@ -4622,10 +4741,15 @@ void t4_read_rss_vf_config(struct adapter *adapter, unsigned int index,
 
 	/* Grab the VFL/VFH values ...
 	 */
-	t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 vfl, 1, TP_RSS_VFL_CONFIG_A);
-	t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 vfh, 1, TP_RSS_VFH_CONFIG_A);
+	if (t4_use_ldst(adapter)) {
+		t4_fw_tp_pio_rw(adapter, vfl, 1, TP_RSS_VFL_CONFIG_A, 1);
+		t4_fw_tp_pio_rw(adapter, vfh, 1, TP_RSS_VFH_CONFIG_A, 1);
+	} else {
+		t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 vfl, 1, TP_RSS_VFL_CONFIG_A);
+		t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 vfh, 1, TP_RSS_VFH_CONFIG_A);
+	}
 }
 
 /**
@@ -4638,8 +4762,11 @@ u32 t4_read_rss_pf_map(struct adapter *adapter)
 {
 	u32 pfmap;
 
-	t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 &pfmap, 1, TP_RSS_PF_MAP_A);
+	if (t4_use_ldst(adapter))
+		t4_fw_tp_pio_rw(adapter, &pfmap, 1, TP_RSS_PF_MAP_A, 1);
+	else
+		t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 &pfmap, 1, TP_RSS_PF_MAP_A);
 	return pfmap;
 }
 
@@ -4653,8 +4780,11 @@ u32 t4_read_rss_pf_mask(struct adapter *adapter)
 {
 	u32 pfmask;
 
-	t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 &pfmask, 1, TP_RSS_PF_MSK_A);
+	if (t4_use_ldst(adapter))
+		t4_fw_tp_pio_rw(adapter, &pfmask, 1, TP_RSS_PF_MSK_A, 1);
+	else
+		t4_read_indirect(adapter, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 &pfmask, 1, TP_RSS_PF_MSK_A);
 	return pfmask;
 }
 
@@ -4999,6 +5129,119 @@ void t4_get_chan_txrate(struct adapter *adap, u64 *nic_rate, u64 *ofld_rate)
 }
 
 /**
+ *	t4_set_trace_filter - configure one of the tracing filters
+ *	@adap: the adapter
+ *	@tp: the desired trace filter parameters
+ *	@idx: which filter to configure
+ *	@enable: whether to enable or disable the filter
+ *
+ *	Configures one of the tracing filters available in HW.  If @enable is
+ *	%0 @tp is not examined and may be %NULL. The user is responsible to
+ *	set the single/multiple trace mode by writing to MPS_TRC_CFG_A register
+ */
+int t4_set_trace_filter(struct adapter *adap, const struct trace_params *tp,
+			int idx, int enable)
+{
+	int i, ofst = idx * 4;
+	u32 data_reg, mask_reg, cfg;
+	u32 multitrc = TRCMULTIFILTER_F;
+
+	if (!enable) {
+		t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst, 0);
+		return 0;
+	}
+
+	cfg = t4_read_reg(adap, MPS_TRC_CFG_A);
+	if (cfg & TRCMULTIFILTER_F) {
+		/* If multiple tracers are enabled, then maximum
+		 * capture size is 2.5KB (FIFO size of a single channel)
+		 * minus 2 flits for CPL_TRACE_PKT header.
+		 */
+		if (tp->snap_len > ((10 * 1024 / 4) - (2 * 8)))
+			return -EINVAL;
+	} else {
+		/* If multiple tracers are disabled, to avoid deadlocks
+		 * maximum packet capture size of 9600 bytes is recommended.
+		 * Also in this mode, only trace0 can be enabled and running.
+		 */
+		multitrc = 0;
+		if (tp->snap_len > 9600 || idx)
+			return -EINVAL;
+	}
+
+	if (tp->port > (is_t4(adap->params.chip) ? 11 : 19) || tp->invert > 1 ||
+	    tp->skip_len > TFLENGTH_M || tp->skip_ofst > TFOFFSET_M ||
+	    tp->min_len > TFMINPKTSIZE_M)
+		return -EINVAL;
+
+	/* stop the tracer we'll be changing */
+	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst, 0);
+
+	idx *= (MPS_TRC_FILTER1_MATCH_A - MPS_TRC_FILTER0_MATCH_A);
+	data_reg = MPS_TRC_FILTER0_MATCH_A + idx;
+	mask_reg = MPS_TRC_FILTER0_DONT_CARE_A + idx;
+
+	for (i = 0; i < TRACE_LEN / 4; i++, data_reg += 4, mask_reg += 4) {
+		t4_write_reg(adap, data_reg, tp->data[i]);
+		t4_write_reg(adap, mask_reg, ~tp->mask[i]);
+	}
+	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_B_A + ofst,
+		     TFCAPTUREMAX_V(tp->snap_len) |
+		     TFMINPKTSIZE_V(tp->min_len));
+	t4_write_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst,
+		     TFOFFSET_V(tp->skip_ofst) | TFLENGTH_V(tp->skip_len) |
+		     (is_t4(adap->params.chip) ?
+		     TFPORT_V(tp->port) | TFEN_F | TFINVERTMATCH_V(tp->invert) :
+		     T5_TFPORT_V(tp->port) | T5_TFEN_F |
+		     T5_TFINVERTMATCH_V(tp->invert)));
+
+	return 0;
+}
+
+/**
+ *	t4_get_trace_filter - query one of the tracing filters
+ *	@adap: the adapter
+ *	@tp: the current trace filter parameters
+ *	@idx: which trace filter to query
+ *	@enabled: non-zero if the filter is enabled
+ *
+ *	Returns the current settings of one of the HW tracing filters.
+ */
+void t4_get_trace_filter(struct adapter *adap, struct trace_params *tp, int idx,
+			 int *enabled)
+{
+	u32 ctla, ctlb;
+	int i, ofst = idx * 4;
+	u32 data_reg, mask_reg;
+
+	ctla = t4_read_reg(adap, MPS_TRC_FILTER_MATCH_CTL_A_A + ofst);
+	ctlb = t4_read_reg(adap, MPS_TRC_FILTER_MATCH_CTL_B_A + ofst);
+
+	if (is_t4(adap->params.chip)) {
+		*enabled = !!(ctla & TFEN_F);
+		tp->port =  TFPORT_G(ctla);
+		tp->invert = !!(ctla & TFINVERTMATCH_F);
+	} else {
+		*enabled = !!(ctla & T5_TFEN_F);
+		tp->port = T5_TFPORT_G(ctla);
+		tp->invert = !!(ctla & T5_TFINVERTMATCH_F);
+	}
+	tp->snap_len = TFCAPTUREMAX_G(ctlb);
+	tp->min_len = TFMINPKTSIZE_G(ctlb);
+	tp->skip_ofst = TFOFFSET_G(ctla);
+	tp->skip_len = TFLENGTH_G(ctla);
+
+	ofst = (MPS_TRC_FILTER1_MATCH_A - MPS_TRC_FILTER0_MATCH_A) * idx;
+	data_reg = MPS_TRC_FILTER0_MATCH_A + ofst;
+	mask_reg = MPS_TRC_FILTER0_DONT_CARE_A + ofst;
+
+	for (i = 0; i < TRACE_LEN / 4; i++, data_reg += 4, mask_reg += 4) {
+		tp->mask[i] = ~t4_read_reg(adap, mask_reg);
+		tp->data[i] = t4_read_reg(adap, data_reg) & tp->mask[i];
+	}
+}
+
+/**
  *	t4_pmtx_get_stats - returns the HW stats from PMTX
  *	@adap: the adapter
  *	@cnt: where to store the count statistics
@@ -5011,7 +5254,7 @@ void t4_pmtx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[])
 	int i;
 	u32 data[2];
 
-	for (i = 0; i < PM_NSTATS; i++) {
+	for (i = 0; i < adap->params.arch.pm_stats_cnt; i++) {
 		t4_write_reg(adap, PM_TX_STAT_CONFIG_A, i + 1);
 		cnt[i] = t4_read_reg(adap, PM_TX_STAT_COUNT_A);
 		if (is_t4(adap->params.chip)) {
@@ -5038,7 +5281,7 @@ void t4_pmrx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[])
 	int i;
 	u32 data[2];
 
-	for (i = 0; i < PM_NSTATS; i++) {
+	for (i = 0; i < adap->params.arch.pm_stats_cnt; i++) {
 		t4_write_reg(adap, PM_RX_STAT_CONFIG_A, i + 1);
 		cnt[i] = t4_read_reg(adap, PM_RX_STAT_COUNT_A);
 		if (is_t4(adap->params.chip)) {
@@ -6420,45 +6663,71 @@ int t4_alloc_mac_filt(struct adapter *adap, unsigned int mbox,
 		      unsigned int viid, bool free, unsigned int naddr,
 		      const u8 **addr, u16 *idx, u64 *hash, bool sleep_ok)
 {
-	int i, ret;
+	int offset, ret = 0;
 	struct fw_vi_mac_cmd c;
-	struct fw_vi_mac_exact *p;
-	unsigned int max_naddr = is_t4(adap->params.chip) ?
-				       NUM_MPS_CLS_SRAM_L_INSTANCES :
-				       NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+	unsigned int nfilters = 0;
+	unsigned int max_naddr = adap->params.arch.mps_tcam_size;
+	unsigned int rem = naddr;
 
-	if (naddr > 7)
+	if (naddr > max_naddr)
 		return -EINVAL;
 
-	memset(&c, 0, sizeof(c));
-	c.op_to_viid = cpu_to_be32(FW_CMD_OP_V(FW_VI_MAC_CMD) |
-				   FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
-				   (free ? FW_CMD_EXEC_F : 0) |
-				   FW_VI_MAC_CMD_VIID_V(viid));
-	c.freemacs_to_len16 = cpu_to_be32(FW_VI_MAC_CMD_FREEMACS_V(free) |
-					  FW_CMD_LEN16_V((naddr + 2) / 2));
+	for (offset = 0; offset < naddr ; /**/) {
+		unsigned int fw_naddr = (rem < ARRAY_SIZE(c.u.exact) ?
+					 rem : ARRAY_SIZE(c.u.exact));
+		size_t len16 = DIV_ROUND_UP(offsetof(struct fw_vi_mac_cmd,
+						     u.exact[fw_naddr]), 16);
+		struct fw_vi_mac_exact *p;
+		int i;
 
-	for (i = 0, p = c.u.exact; i < naddr; i++, p++) {
-		p->valid_to_idx =
-			cpu_to_be16(FW_VI_MAC_CMD_VALID_F |
-				    FW_VI_MAC_CMD_IDX_V(FW_VI_MAC_ADD_MAC));
-		memcpy(p->macaddr, addr[i], sizeof(p->macaddr));
+		memset(&c, 0, sizeof(c));
+		c.op_to_viid = cpu_to_be32(FW_CMD_OP_V(FW_VI_MAC_CMD) |
+					   FW_CMD_REQUEST_F |
+					   FW_CMD_WRITE_F |
+					   FW_CMD_EXEC_V(free) |
+					   FW_VI_MAC_CMD_VIID_V(viid));
+		c.freemacs_to_len16 =
+			cpu_to_be32(FW_VI_MAC_CMD_FREEMACS_V(free) |
+				    FW_CMD_LEN16_V(len16));
+
+		for (i = 0, p = c.u.exact; i < fw_naddr; i++, p++) {
+			p->valid_to_idx =
+				cpu_to_be16(FW_VI_MAC_CMD_VALID_F |
+					    FW_VI_MAC_CMD_IDX_V(
+						    FW_VI_MAC_ADD_MAC));
+			memcpy(p->macaddr, addr[offset + i],
+			       sizeof(p->macaddr));
+		}
+
+		/* It's okay if we run out of space in our MAC address arena.
+		 * Some of the addresses we submit may get stored so we need
+		 * to run through the reply to see what the results were ...
+		 */
+		ret = t4_wr_mbox_meat(adap, mbox, &c, sizeof(c), &c, sleep_ok);
+		if (ret && ret != -FW_ENOMEM)
+			break;
+
+		for (i = 0, p = c.u.exact; i < fw_naddr; i++, p++) {
+			u16 index = FW_VI_MAC_CMD_IDX_G(
+					be16_to_cpu(p->valid_to_idx));
+
+			if (idx)
+				idx[offset + i] = (index >= max_naddr ?
+						   0xffff : index);
+			if (index < max_naddr)
+				nfilters++;
+			else if (hash)
+				*hash |= (1ULL <<
+					  hash_mac_addr(addr[offset + i]));
+		}
+
+		free = false;
+		offset += fw_naddr;
+		rem -= fw_naddr;
 	}
 
-	ret = t4_wr_mbox_meat(adap, mbox, &c, sizeof(c), &c, sleep_ok);
-	if (ret)
-		return ret;
-
-	for (i = 0, p = c.u.exact; i < naddr; i++, p++) {
-		u16 index = FW_VI_MAC_CMD_IDX_G(be16_to_cpu(p->valid_to_idx));
-
-		if (idx)
-			idx[i] = index >= max_naddr ? 0xffff : index;
-		if (index < max_naddr)
-			ret++;
-		else if (hash)
-			*hash |= (1ULL << hash_mac_addr(addr[i]));
-	}
+	if (ret == 0 || ret == -FW_ENOMEM)
+		ret = nfilters;
 	return ret;
 }
 
@@ -6562,9 +6831,7 @@ int t4_change_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
 	int ret, mode;
 	struct fw_vi_mac_cmd c;
 	struct fw_vi_mac_exact *p = c.u.exact;
-	unsigned int max_mac_addr = is_t4(adap->params.chip) ?
-				    NUM_MPS_CLS_SRAM_L_INSTANCES :
-				    NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+	unsigned int max_mac_addr = adap->params.arch.mps_tcam_size;
 
 	if (idx < 0)                             /* new allocation */
 		idx = persist ? FW_VI_MAC_ADD_PERSIST_MAC : FW_VI_MAC_ADD_MAC;
@@ -7060,9 +7327,42 @@ int t4_prep_adapter(struct adapter *adapter)
 	switch (ver) {
 	case CHELSIO_T4:
 		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T4, pl_rev);
+		adapter->params.arch.sge_fl_db = DBPRIO_F;
+		adapter->params.arch.mps_tcam_size =
+				 NUM_MPS_CLS_SRAM_L_INSTANCES;
+		adapter->params.arch.mps_rplc_size = 128;
+		adapter->params.arch.nchan = NCHAN;
+		adapter->params.arch.pm_stats_cnt = PM_NSTATS;
+		adapter->params.arch.vfcount = 128;
+		/* Congestion map is for 4 channels so that
+		 * MPS can have 4 priority per port.
+		 */
+		adapter->params.arch.cng_ch_bits_log = 2;
 		break;
 	case CHELSIO_T5:
 		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T5, pl_rev);
+		adapter->params.arch.sge_fl_db = DBPRIO_F | DBTYPE_F;
+		adapter->params.arch.mps_tcam_size =
+				 NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+		adapter->params.arch.mps_rplc_size = 128;
+		adapter->params.arch.nchan = NCHAN;
+		adapter->params.arch.pm_stats_cnt = PM_NSTATS;
+		adapter->params.arch.vfcount = 128;
+		adapter->params.arch.cng_ch_bits_log = 2;
+		break;
+	case CHELSIO_T6:
+		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T6, pl_rev);
+		adapter->params.arch.sge_fl_db = 0;
+		adapter->params.arch.mps_tcam_size =
+				 NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+		adapter->params.arch.mps_rplc_size = 256;
+		adapter->params.arch.nchan = 2;
+		adapter->params.arch.pm_stats_cnt = T6_PM_NSTATS;
+		adapter->params.arch.vfcount = 256;
+		/* Congestion map will be for 2 channels so that
+		 * MPS can have 8 priority per port.
+		 */
+		adapter->params.arch.cng_ch_bits_log = 3;
 		break;
 	default:
 		dev_err(adapter->pdev_dev, "Device %d is not supported\n",
@@ -7090,6 +7390,7 @@ int t4_prep_adapter(struct adapter *adapter)
  *	@adapter: the adapter
  *	@qid: the Queue ID
  *	@qtype: the Ingress or Egress type for @qid
+ *	@user: true if this request is for a user mode queue
  *	@pbar2_qoffset: BAR2 Queue Offset
  *	@pbar2_qid: BAR2 Queue ID or 0 for Queue ID inferred SGE Queues
  *
@@ -7113,6 +7414,7 @@ int t4_prep_adapter(struct adapter *adapter)
 int t4_bar2_sge_qregs(struct adapter *adapter,
 		      unsigned int qid,
 		      enum t4_bar2_qtype qtype,
+		      int user,
 		      u64 *pbar2_qoffset,
 		      unsigned int *pbar2_qid)
 {
@@ -7120,9 +7422,8 @@ int t4_bar2_sge_qregs(struct adapter *adapter,
 	u64 bar2_page_offset, bar2_qoffset;
 	unsigned int bar2_qid, bar2_qid_offset, bar2_qinferred;
 
-	/* T4 doesn't support BAR2 SGE Queue registers.
-	 */
-	if (is_t4(adapter->params.chip))
+	/* T4 doesn't support BAR2 SGE Queue registers for kernel mode queues */
+	if (!user && is_t4(adapter->params.chip))
 		return -EINVAL;
 
 	/* Get our SGE Page Size parameters.
@@ -7142,7 +7443,7 @@ int t4_bar2_sge_qregs(struct adapter *adapter,
 	 *  o The BAR2 Queue ID.
 	 *  o The BAR2 Queue ID Offset into the BAR2 page.
 	 */
-	bar2_page_offset = ((qid >> qpp_shift) << page_shift);
+	bar2_page_offset = ((u64)(qid >> qpp_shift) << page_shift);
 	bar2_qid = qid & qpp_mask;
 	bar2_qid_offset = bar2_qid * SGE_UDB_SIZE;
 
@@ -7281,12 +7582,19 @@ int t4_init_tp_params(struct adapter *adap)
 	/* Cache the adapter's Compressed Filter Mode and global Incress
 	 * Configuration.
 	 */
-	t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 &adap->params.tp.vlan_pri_map, 1,
-			 TP_VLAN_PRI_MAP_A);
-	t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A,
-			 &adap->params.tp.ingress_config, 1,
-			 TP_INGRESS_CONFIG_A);
+	if (t4_use_ldst(adap)) {
+		t4_fw_tp_pio_rw(adap, &adap->params.tp.vlan_pri_map, 1,
+				TP_VLAN_PRI_MAP_A, 1);
+		t4_fw_tp_pio_rw(adap, &adap->params.tp.ingress_config, 1,
+				TP_INGRESS_CONFIG_A, 1);
+	} else {
+		t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 &adap->params.tp.vlan_pri_map, 1,
+				 TP_VLAN_PRI_MAP_A);
+		t4_read_indirect(adap, TP_PIO_ADDR_A, TP_PIO_DATA_A,
+				 &adap->params.tp.ingress_config, 1,
+				 TP_INGRESS_CONFIG_A);
+	}
 
 	/* Now that we have TP_VLAN_PRI_MAP cached, we can calculate the field
 	 * shift positions of several elements of the Compressed Filter Tuple

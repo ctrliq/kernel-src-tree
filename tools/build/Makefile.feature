@@ -7,7 +7,7 @@ endif
 
 feature_check = $(eval $(feature_check_code))
 define feature_check_code
-  feature-$(1) := $(shell $(MAKE) OUTPUT=$(OUTPUT_FEATURES) CFLAGS="$(EXTRA_CFLAGS) $(FEATURE_CHECK_CFLAGS-$(1))" LDFLAGS="$(LDFLAGS) $(FEATURE_CHECK_LDFLAGS-$(1))" -C $(feature_dir) test-$1.bin >/dev/null 2>/dev/null && echo 1 || echo 0)
+  feature-$(1) := $(shell $(MAKE) OUTPUT=$(OUTPUT_FEATURES) CFLAGS="$(EXTRA_CFLAGS) $(FEATURE_CHECK_CFLAGS-$(1))" LDFLAGS="$(LDFLAGS) $(FEATURE_CHECK_LDFLAGS-$(1))" -C $(feature_dir) $(OUTPUT_FEATURES)test-$1.bin >/dev/null 2>/dev/null && echo 1 || echo 0)
 endef
 
 feature_set = $(eval $(feature_set_code))
@@ -30,6 +30,7 @@ endef
 FEATURE_TESTS_BASIC :=			\
 	backtrace			\
 	dwarf				\
+	dwarf_getlocations		\
 	fortify-source			\
 	sync-compare-and-swap		\
 	glibc				\
@@ -46,13 +47,15 @@ FEATURE_TESTS_BASIC :=			\
 	libpython			\
 	libpython-version		\
 	libslang			\
+	libcrypto			\
 	libunwind			\
 	pthread-attr-setaffinity-np	\
 	stackprotector-all		\
 	timerfd				\
 	libdw-dwarf-unwind		\
 	zlib				\
-	lzma
+	lzma				\
+	get_cpuid
 
 # FEATURE_TESTS_BASIC + FEATURE_TESTS_EXTRA is the complete list
 # of all feature tests
@@ -75,6 +78,7 @@ endif
 
 FEATURE_DISPLAY ?=			\
 	dwarf				\
+	dwarf_getlocations		\
 	glibc				\
 	gtk2				\
 	libaudit			\
@@ -85,10 +89,12 @@ FEATURE_DISPLAY ?=			\
 	libperl				\
 	libpython			\
 	libslang			\
+	libcrypto			\
 	libunwind			\
 	libdw-dwarf-unwind		\
 	zlib				\
-	lzma
+	lzma				\
+	get_cpuid
 
 # Set FEATURE_CHECK_(C|LD)FLAGS-all for all FEATURE_TESTS features.
 # If in the future we need per-feature checks/flags for features not

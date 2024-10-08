@@ -648,16 +648,18 @@ static void scsi_mq_free_sgtables(struct scsi_cmnd *cmd)
 static void scsi_mq_uninit_cmd(struct scsi_cmnd *cmd)
 {
 	struct scsi_device *sdev = cmd->device;
+	struct Scsi_Host *shost = sdev->host;
 	unsigned long flags;
-
-	BUG_ON(list_empty(&cmd->list));
 
 	scsi_mq_free_sgtables(cmd);
 	scsi_uninit_cmd(cmd);
 
-	spin_lock_irqsave(&sdev->list_lock, flags);
-	list_del_init(&cmd->list);
-	spin_unlock_irqrestore(&sdev->list_lock, flags);
+	if (shost->use_cmd_list) {
+		BUG_ON(list_empty(&cmd->list));
+		spin_lock_irqsave(&sdev->list_lock, flags);
+		list_del_init(&cmd->list);
+		spin_unlock_irqrestore(&sdev->list_lock, flags);
+	}
 }
 
 /*
@@ -1847,13 +1849,11 @@ static int scsi_mq_prep_fn(struct request *req)
 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
 	cmd->jiffies_at_alloc = jiffies;
 
-	/*
-	 * XXX: cmd_list lookups are only used by two drivers, try to get
-	 * rid of this list in common code.
-	 */
-	spin_lock_irq(&sdev->list_lock);
-	list_add_tail(&cmd->list, &sdev->cmd_list);
-	spin_unlock_irq(&sdev->list_lock);
+	if (shost->use_cmd_list) {
+		spin_lock_irq(&sdev->list_lock);
+		list_add_tail(&cmd->list, &sdev->cmd_list);
+		spin_unlock_irq(&sdev->list_lock);
+	}
 
 	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
 	cmd->sdb.table.sgl = sg;
@@ -1888,7 +1888,7 @@ static int scsi_mq_prep_fn(struct request *req)
 static void scsi_mq_done(struct scsi_cmnd *cmd)
 {
 	trace_scsi_dispatch_cmd_done(cmd);
-	blk_mq_complete_request(cmd->request);
+	blk_mq_complete_request(cmd->request, cmd->request->errors);
 }
 
 static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -2129,7 +2129,7 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
 		return -ENOMEM;
 
 	shost->tag_set->ops = &scsi_mq_ops;
-	shost->tag_set->nr_hw_queues = 1;
+	shost->tag_set->nr_hw_queues = shost->nr_hw_queues ? : 1;
 	shost->tag_set->queue_depth = shost->can_queue;
 	shost->tag_set->cmd_size = cmd_size;
 	shost->tag_set->numa_node = NUMA_NO_NODE;

@@ -88,6 +88,7 @@ enum {
 	Opt_fsc, Opt_mfsymlinks,
 	Opt_multiuser, Opt_sloppy, Opt_nosharesock,
 	Opt_persistent, Opt_nopersistent,
+	Opt_resilient, Opt_noresilient,
 
 	/* Mount options which take numeric value */
 	Opt_backupuid, Opt_backupgid, Opt_uid,
@@ -173,6 +174,8 @@ static const match_table_t cifs_mount_option_tokens = {
 	{ Opt_nosharesock, "nosharesock" },
 	{ Opt_persistent, "persistenthandles"},
 	{ Opt_nopersistent, "nopersistenthandles"},
+	{ Opt_resilient, "resilienthandles"},
+	{ Opt_noresilient, "noresilienthandles"},
 
 	{ Opt_backupuid, "backupuid=%s" },
 	{ Opt_backupgid, "backupgid=%s" },
@@ -285,6 +288,10 @@ static const match_table_t cifs_smb_version_tokens = {
 	{ Smb_21, SMB21_VERSION_STRING },
 	{ Smb_30, SMB30_VERSION_STRING },
 	{ Smb_302, SMB302_VERSION_STRING },
+#ifdef CONFIG_CIFS_SMB311
+	{ Smb_311, SMB311_VERSION_STRING },
+	{ Smb_311, ALT_SMB311_VERSION_STRING },
+#endif /* SMB311 */
 	{ Smb_version_err, NULL }
 };
 
@@ -1142,6 +1149,12 @@ cifs_parse_smb_version(char *value, struct smb_vol *vol)
 		vol->ops = &smb30_operations; /* currently identical with 3.0 */
 		vol->vals = &smb302_values;
 		break;
+#ifdef CONFIG_CIFS_SMB311
+	case Smb_311:
+		vol->ops = &smb311_operations;
+		vol->vals = &smb311_values;
+		break;
+#endif /* SMB311 */
 #endif
 	default:
 		cifs_dbg(VFS, "Unknown vers= option specified: %s\n", value);
@@ -1478,9 +1491,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			vol->seal = 1;
 			break;
 		case Opt_noac:
-			printk(KERN_WARNING "CIFS: Mount option noac not "
-				"supported. Instead set "
-				"/proc/fs/cifs/LookupCacheEnabled to 0\n");
+			pr_warn("CIFS: Mount option noac not supported. Instead set /proc/fs/cifs/LookupCacheEnabled to 0\n");
 			break;
 		case Opt_fsc:
 #ifndef CONFIG_CIFS_FSCACHE
@@ -1511,11 +1522,22 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			break;
 		case Opt_persistent:
 			vol->persistent = true;
-			if (vol->nopersistent) {
+			if ((vol->nopersistent) || (vol->resilient)) {
 				cifs_dbg(VFS,
 				  "persistenthandles mount options conflict\n");
 				goto cifs_parse_mount_err;
 			}
+			break;
+		case Opt_resilient:
+			vol->resilient = true;
+			if (vol->persistent) {
+				cifs_dbg(VFS,
+				  "persistenthandles mount options conflict\n");
+				goto cifs_parse_mount_err;
+			}
+			break;
+		case Opt_noresilient:
+			vol->resilient = false; /* already the default */
 			break;
 
 		/* Numeric Values */
@@ -1634,7 +1656,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 
 			if (strnlen(string, CIFS_MAX_USERNAME_LEN) >
 							CIFS_MAX_USERNAME_LEN) {
-				printk(KERN_WARNING "CIFS: username too long\n");
+				pr_warn("CIFS: username too long\n");
 				goto cifs_parse_mount_err;
 			}
 
@@ -1700,8 +1722,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			temp_len = strlen(value);
 			vol->password = kzalloc(temp_len+1, GFP_KERNEL);
 			if (vol->password == NULL) {
-				printk(KERN_WARNING "CIFS: no memory "
-						    "for password\n");
+				pr_warn("CIFS: no memory for password\n");
 				goto cifs_parse_mount_err;
 			}
 
@@ -1725,8 +1746,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 
 			if (!cifs_convert_address(dstaddr, string,
 					strlen(string))) {
-				printk(KERN_ERR "CIFS: bad ip= option (%s).\n",
-					string);
+				pr_err("CIFS: bad ip= option (%s).\n", string);
 				goto cifs_parse_mount_err;
 			}
 			got_ip = true;
@@ -1738,16 +1758,14 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 
 			if (strnlen(string, CIFS_MAX_DOMAINNAME_LEN)
 					== CIFS_MAX_DOMAINNAME_LEN) {
-				printk(KERN_WARNING "CIFS: domain name too"
-						    " long\n");
+				pr_warn("CIFS: domain name too long\n");
 				goto cifs_parse_mount_err;
 			}
 
 			kfree(vol->domainname);
 			vol->domainname = kstrdup(string, GFP_KERNEL);
 			if (!vol->domainname) {
-				printk(KERN_WARNING "CIFS: no memory "
-						    "for domainname\n");
+				pr_warn("CIFS: no memory for domainname\n");
 				goto cifs_parse_mount_err;
 			}
 			cifs_dbg(FYI, "Domain name set\n");
@@ -1760,8 +1778,8 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			if (!cifs_convert_address(
 					(struct sockaddr *)&vol->srcaddr,
 					string, strlen(string))) {
-				printk(KERN_WARNING "CIFS:  Could not parse"
-						    " srcaddr: %s\n", string);
+				pr_warn("CIFS: Could not parse srcaddr: %s\n",
+					string);
 				goto cifs_parse_mount_err;
 			}
 			break;
@@ -1771,8 +1789,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 				goto out_nomem;
 
 			if (strnlen(string, 1024) >= 65) {
-				printk(KERN_WARNING "CIFS: iocharset name "
-						    "too long.\n");
+				pr_warn("CIFS: iocharset name too long.\n");
 				goto cifs_parse_mount_err;
 			}
 
@@ -1781,8 +1798,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 				vol->iocharset = kstrdup(string,
 							 GFP_KERNEL);
 				if (!vol->iocharset) {
-					printk(KERN_WARNING "CIFS: no memory"
-							    "for charset\n");
+					pr_warn("CIFS: no memory for charset\n");
 					goto cifs_parse_mount_err;
 				}
 			}
@@ -1813,9 +1829,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			 * set at top of the function
 			 */
 			if (i == RFC1001_NAME_LEN && string[i] != 0)
-				printk(KERN_WARNING "CIFS: netbiosname"
-				       " longer than 15 truncated.\n");
-
+				pr_warn("CIFS: netbiosname longer than 15 truncated.\n");
 			break;
 		case Opt_servern:
 			/* servernetbiosname specified override *SMBSERVER */
@@ -1841,8 +1855,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 			/* The string has 16th byte zero still from
 			   set at top of the function  */
 			if (i == RFC1001_NAME_LEN && string[i] != 0)
-				printk(KERN_WARNING "CIFS: server net"
-				       "biosname longer than 15 truncated.\n");
+				pr_warn("CIFS: server netbiosname longer than 15 truncated.\n");
 			break;
 		case Opt_ver:
 			string = match_strdup(args);
@@ -1854,8 +1867,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 				break;
 			}
 			/* For all other value, error */
-			printk(KERN_WARNING "CIFS: Invalid version"
-					    " specified\n");
+			pr_warn("CIFS: Invalid version specified\n");
 			goto cifs_parse_mount_err;
 		case Opt_vers:
 			string = match_strdup(args);
@@ -1896,7 +1908,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 	}
 
 	if (!sloppy && invalid) {
-		printk(KERN_ERR "CIFS: Unknown mount option \"%s\"\n", invalid);
+		pr_err("CIFS: Unknown mount option \"%s\"\n", invalid);
 		goto cifs_parse_mount_err;
 	}
 
@@ -1922,8 +1934,7 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 		/* No ip= option specified? Try to get it from UNC */
 		if (!cifs_convert_address(dstaddr, &vol->UNC[2],
 						strlen(&vol->UNC[2]))) {
-			printk(KERN_ERR "Unable to determine destination "
-					"address.\n");
+			pr_err("Unable to determine destination address.\n");
 			goto cifs_parse_mount_err;
 		}
 	}
@@ -1934,20 +1945,18 @@ cifs_parse_mount_options(const char *mountdata, const char *devname,
 	if (uid_specified)
 		vol->override_uid = override_uid;
 	else if (override_uid == 1)
-		printk(KERN_NOTICE "CIFS: ignoring forceuid mount option "
-				   "specified with no uid= option.\n");
+		pr_notice("CIFS: ignoring forceuid mount option specified with no uid= option.\n");
 
 	if (gid_specified)
 		vol->override_gid = override_gid;
 	else if (override_gid == 1)
-		printk(KERN_NOTICE "CIFS: ignoring forcegid mount option "
-				   "specified with no gid= option.\n");
+		pr_notice("CIFS: ignoring forcegid mount option specified with no gid= option.\n");
 
 	kfree(mountdata_copy);
 	return 0;
 
 out_nomem:
-	printk(KERN_WARNING "Could not allocate temporary buffer\n");
+	pr_warn("Could not allocate temporary buffer\n");
 cifs_parse_mount_err:
 	kfree(string);
 	kfree(mountdata_copy);
@@ -2704,6 +2713,42 @@ cifs_get_tcon(struct cifs_ses *ses, struct smb_vol *volume_info)
 		cifs_dbg(FYI, "DFS disabled (%d)\n", tcon->Flags);
 	}
 	tcon->seal = volume_info->seal;
+	tcon->use_persistent = false;
+	/* check if SMB2 or later, CIFS does not support persistent handles */
+	if (volume_info->persistent) {
+		if (ses->server->vals->protocol_id == 0) {
+			cifs_dbg(VFS,
+			     "SMB3 or later required for persistent handles\n");
+			rc = -EOPNOTSUPP;
+			goto out_fail;
+#ifdef CONFIG_CIFS_SMB2
+		} else if (ses->server->capabilities &
+			   SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
+			tcon->use_persistent = true;
+		else /* persistent handles requested but not supported */ {
+			cifs_dbg(VFS,
+				"Persistent handles not supported on share\n");
+			rc = -EOPNOTSUPP;
+			goto out_fail;
+#endif /* CONFIG_CIFS_SMB2 */
+		}
+#ifdef CONFIG_CIFS_SMB2
+	} else if ((tcon->capabilities & SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY)
+	     && (ses->server->capabilities & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
+	     && (volume_info->nopersistent == false)) {
+		cifs_dbg(FYI, "enabling persistent handles\n");
+		tcon->use_persistent = true;
+#endif /* CONFIG_CIFS_SMB2 */
+	} else if (volume_info->resilient) {
+		if (ses->server->vals->protocol_id == 0) {
+			cifs_dbg(VFS,
+			     "SMB2.1 or later required for resilient handles\n");
+			rc = -EOPNOTSUPP;
+			goto out_fail;
+		}
+		tcon->use_resilient = true;
+	}
+
 	/*
 	 * We can have only one retry value for a connection to a share so for
 	 * resources mounted more than once to the same server share the last
@@ -3552,6 +3597,15 @@ try_mount_again:
 		goto mount_fail_check;
 	}
 
+#ifdef CONFIG_CIFS_SMB2
+	if ((volume_info->persistent == true) && ((ses->server->capabilities &
+		SMB2_GLOBAL_CAP_PERSISTENT_HANDLES) == 0)) {
+		cifs_dbg(VFS, "persistent handles not supported by server\n");
+		rc = -EOPNOTSUPP;
+		goto mount_fail_check;
+	}
+#endif /* CONFIG_CIFS_SMB2*/
+
 	/* search for existing tcon to this server share */
 	tcon = cifs_get_tcon(ses, volume_info);
 	if (IS_ERR(tcon)) {
@@ -4022,13 +4076,6 @@ cifs_sb_master_tcon(struct cifs_sb_info *cifs_sb)
 	return tlink_tcon(cifs_sb_master_tlink(cifs_sb));
 }
 
-static int
-cifs_sb_tcon_pending_wait(void *unused)
-{
-	schedule();
-	return signal_pending(current) ? -ERESTARTSYS : 0;
-}
-
 /* find and return a tlink with given uid */
 static struct tcon_link *
 tlink_rb_search(struct rb_root *root, kuid_t uid)
@@ -4127,11 +4174,10 @@ cifs_sb_tlink(struct cifs_sb_info *cifs_sb)
 	} else {
 wait_for_construction:
 		ret = wait_on_bit(&tlink->tl_flags, TCON_LINK_PENDING,
-				  cifs_sb_tcon_pending_wait,
 				  TASK_INTERRUPTIBLE);
 		if (ret) {
 			cifs_put_tlink(tlink);
-			return ERR_PTR(ret);
+			return ERR_PTR(-ERESTARTSYS);
 		}
 
 		/* if it's good, return it */

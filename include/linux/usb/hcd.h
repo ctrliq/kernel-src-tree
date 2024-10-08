@@ -88,7 +88,7 @@ struct usb_hcd {
 
 	struct timer_list	rh_timer;	/* drives root-hub polling */
 	struct urb		*status_urb;	/* the current status urb */
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 	struct work_struct	wakeup_work;	/* for remote wakeup */
 #endif
 
@@ -101,7 +101,8 @@ struct usb_hcd {
 	 * OTG and some Host controllers need software interaction with phys;
 	 * other external phys should be software-transparent
 	 */
-	struct usb_phy	*phy;
+	struct usb_phy		*usb_phy;
+	struct phy		*phy;
 
 	/* Flags that need to be manipulated atomically because they can
 	 * change while the host controller is running.  Always use
@@ -147,6 +148,7 @@ struct usb_hcd {
 	unsigned		rh_registered:1;/* is root hub registered? */
 	unsigned		rh_pollable:1;	/* may we poll the root hub? */
 	unsigned		msix_enabled:1;	/* driver has MSI-X enabled? */
+	unsigned		remove_phy:1;	/* auto-remove USB phy */
 
 	/* The next flag is a stopgap, to be removed when all the HCDs
 	 * support the new root-hub polling mechanism. */
@@ -640,16 +642,13 @@ extern wait_queue_head_t usb_kill_urb_queue;
 extern void usb_root_hub_lost_power(struct usb_device *rhdev);
 extern int hcd_bus_suspend(struct usb_device *rhdev, pm_message_t msg);
 extern int hcd_bus_resume(struct usb_device *rhdev, pm_message_t msg);
-#endif /* CONFIG_PM */
-
-#ifdef CONFIG_PM_RUNTIME
 extern void usb_hcd_resume_root_hub(struct usb_hcd *hcd);
 #else
 static inline void usb_hcd_resume_root_hub(struct usb_hcd *hcd)
 {
 	return;
 }
-#endif /* CONFIG_PM_RUNTIME */
+#endif /* CONFIG_PM */
 
 /*-------------------------------------------------------------------------*/
 

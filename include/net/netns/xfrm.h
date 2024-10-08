@@ -13,10 +13,22 @@ struct ctl_table_header;
 struct xfrm_policy_hash {
 	struct hlist_head	*table;
 	unsigned int		hmask;
+};
+
+struct xfrm_policy_hash_ext {
 	u8			dbits4;
 	u8			sbits4;
 	u8			dbits6;
 	u8			sbits6;
+};
+
+struct xfrm_policy_hthresh {
+	struct work_struct	work;
+	seqlock_t		lock;
+	u8			lbits4;
+	u8			rbits4;
+	u8			lbits6;
+	u8			rbits6;
 };
 
 struct netns_xfrm {

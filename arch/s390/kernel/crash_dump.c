@@ -73,7 +73,7 @@ static ssize_t copy_page_real(void *buf, void *src, size_t csize)
 	size_t size;
 
 	if (is_vmalloc_addr(buf)) {
-		BUG_ON(csize >= PAGE_SIZE);
+		BUG_ON(csize > PAGE_SIZE);
 		/* If buf is not page aligned, copy first part */
 		size = min(roundup(__pa(buf), PAGE_SIZE) - __pa(buf), csize);
 		if (size) {

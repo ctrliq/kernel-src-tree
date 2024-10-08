@@ -38,18 +38,12 @@ bool acpi_force_hot_remove;
 
 static const char *dummy_hid = "device";
 
-static LIST_HEAD(acpi_bus_id_list);
+LIST_HEAD(acpi_bus_id_list);
 static DEFINE_MUTEX(acpi_scan_lock);
 static LIST_HEAD(acpi_scan_handlers_list);
 DEFINE_MUTEX(acpi_device_lock);
 LIST_HEAD(acpi_wakeup_device_list);
 static DEFINE_MUTEX(acpi_hp_context_lock);
-
-struct acpi_device_bus_id{
-	char bus_id[15];
-	unsigned int instance_no;
-	struct list_head node;
-};
 
 void acpi_scan_lock_acquire(void)
 {
@@ -108,53 +102,69 @@ int acpi_scan_add_handler_with_hotplug(struct acpi_scan_handler *handler,
 	return 0;
 }
 
-/*
- * Creates hid/cid(s) string needed for modalias and uevent
- * e.g. on a device with hid:IBM0001 and cid:ACPI0001 you get:
- * char *modalias: "acpi:IBM0001:ACPI0001"
- * Return: 0: no _HID and no _CID
- *         -EINVAL: output error
- *         -ENOMEM: output is truncated
-*/
-static int create_modalias(struct acpi_device *acpi_dev, char *modalias,
-			   int size)
+/**
+ * acpi_device_is_first_physical_node - Is given dev first physical node
+ * @adev: ACPI companion device
+ * @dev: Physical device to check
+ *
+ * Function checks if given @dev is the first physical devices attached to
+ * the ACPI companion device. This distinction is needed in some cases
+ * where the same companion device is shared between many physical devices.
+ *
+ * Note that the caller have to provide valid @adev pointer.
+ */
+bool acpi_device_is_first_physical_node(struct acpi_device *adev,
+					const struct device *dev)
 {
-	int len;
-	int count;
-	struct acpi_hardware_id *id;
+	bool ret = false;
 
-	if (list_empty(&acpi_dev->pnp.ids))
-		return 0;
+	mutex_lock(&adev->physical_node_lock);
+	if (!list_empty(&adev->physical_node_list)) {
+		const struct acpi_device_physical_node *node;
 
-	len = snprintf(modalias, size, "acpi:");
-	size -= len;
-
-	list_for_each_entry(id, &acpi_dev->pnp.ids, list) {
-		count = snprintf(&modalias[len], size, "%s:", id->id);
-		if (count < 0)
-			return EINVAL;
-		if (count >= size)
-			return -ENOMEM;
-		len += count;
-		size -= count;
+		node = list_first_entry(&adev->physical_node_list,
+					struct acpi_device_physical_node, node);
+		ret = node->dev == dev;
 	}
+	mutex_unlock(&adev->physical_node_lock);
 
-	modalias[len] = '\0';
-	return len;
+	return ret;
 }
 
-static ssize_t
-acpi_device_modalias_show(struct device *dev, struct device_attribute *attr, char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	int len;
+ /*
+ * acpi_companion_match() - Can we match via ACPI companion device
+ * @dev: Device in question
+ *
+ * Check if the given device has an ACPI companion and if that companion has
+ * a valid list of PNP IDs, and if the device is the first (primary) physical
+ * device associated with it.  Return the companion pointer if that's the case
+ * or NULL otherwise.
+ *
+ * If multiple physical devices are attached to a single ACPI companion, we need
+ * to be careful.  The usage scenario for this kind of relationship is that all
+ * of the physical devices in question use resources provided by the ACPI
+ * companion.  A typical case is an MFD device where all the sub-devices share
+ * the parent's ACPI companion.  In such cases we can only allow the primary
+ * (first) physical device to be matched with the help of the companion's PNP
+ * IDs.
+ *
+ * Additional physical devices sharing the ACPI companion can still use
+ * resources available from it but they will be matched normally using functions
+ * provided by their bus types (and analogously for their modalias).
+ */
+struct acpi_device *acpi_companion_match(const struct device *dev)
+{
+	struct acpi_device *adev;
 
-	len = create_modalias(acpi_dev, buf, 1024);
-	if (len <= 0)
-		return len;
-	buf[len++] = '\n';
-	return len;
+	adev = ACPI_COMPANION((struct device *)dev);
+	if (!adev)
+		return NULL;
+
+	if (list_empty(&adev->pnp.ids))
+		return NULL;
+
+	return acpi_device_is_first_physical_node(adev, dev) ? adev : NULL;
 }
-static DEVICE_ATTR(modalias, 0444, acpi_device_modalias_show, NULL);
 
 bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent)
 {
@@ -480,279 +490,6 @@ void acpi_device_hotplug(struct acpi_device *adev, u32 src)
 	unlock_device_hotplug();
 }
 
-static ssize_t real_power_state_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	struct acpi_device *adev = to_acpi_device(dev);
-	int state;
-	int ret;
-
-	ret = acpi_device_get_power(adev, &state);
-	if (ret)
-		return ret;
-
-	return sprintf(buf, "%s\n", acpi_power_state_string(state));
-}
-
-static DEVICE_ATTR(real_power_state, 0444, real_power_state_show, NULL);
-
-static ssize_t power_state_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct acpi_device *adev = to_acpi_device(dev);
-
-	return sprintf(buf, "%s\n", acpi_power_state_string(adev->power.state));
-}
-
-static DEVICE_ATTR(power_state, 0444, power_state_show, NULL);
-
-static ssize_t
-acpi_eject_store(struct device *d, struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	struct acpi_device *acpi_device = to_acpi_device(d);
-	acpi_object_type not_used;
-	acpi_status status;
-
-	if (!count || buf[0] != '1')
-		return -EINVAL;
-
-	if ((!acpi_device->handler || !acpi_device->handler->hotplug.enabled)
-	    && !acpi_device->driver)
-		return -ENODEV;
-
-	status = acpi_get_type(acpi_device->handle, &not_used);
-	if (ACPI_FAILURE(status) || !acpi_device->flags.ejectable)
-		return -ENODEV;
-
-	get_device(&acpi_device->dev);
-	status = acpi_hotplug_schedule(acpi_device, ACPI_OST_EC_OSPM_EJECT);
-	if (ACPI_SUCCESS(status))
-		return count;
-
-	put_device(&acpi_device->dev);
-	acpi_evaluate_ost(acpi_device->handle, ACPI_OST_EC_OSPM_EJECT,
-			  ACPI_OST_SC_NON_SPECIFIC_FAILURE, NULL);
-	return status == AE_NO_MEMORY ? -ENOMEM : -EAGAIN;
-}
-
-static DEVICE_ATTR(eject, 0200, NULL, acpi_eject_store);
-
-static ssize_t
-acpi_device_hid_show(struct device *dev, struct device_attribute *attr, char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-
-	return sprintf(buf, "%s\n", acpi_device_hid(acpi_dev));
-}
-static DEVICE_ATTR(hid, 0444, acpi_device_hid_show, NULL);
-
-static ssize_t acpi_device_uid_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-
-	return sprintf(buf, "%s\n", acpi_dev->pnp.unique_id);
-}
-static DEVICE_ATTR(uid, 0444, acpi_device_uid_show, NULL);
-
-static ssize_t acpi_device_adr_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-
-	return sprintf(buf, "0x%08x\n",
-		       (unsigned int)(acpi_dev->pnp.bus_address));
-}
-static DEVICE_ATTR(adr, 0444, acpi_device_adr_show, NULL);
-
-static ssize_t
-acpi_device_path_show(struct device *dev, struct device_attribute *attr, char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	struct acpi_buffer path = {ACPI_ALLOCATE_BUFFER, NULL};
-	int result;
-
-	result = acpi_get_name(acpi_dev->handle, ACPI_FULL_PATHNAME, &path);
-	if (result)
-		goto end;
-
-	result = sprintf(buf, "%s\n", (char*)path.pointer);
-	kfree(path.pointer);
-end:
-	return result;
-}
-static DEVICE_ATTR(path, 0444, acpi_device_path_show, NULL);
-
-/* sysfs file that shows description text from the ACPI _STR method */
-static ssize_t description_show(struct device *dev,
-				struct device_attribute *attr,
-				char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	int result;
-
-	if (acpi_dev->pnp.str_obj == NULL)
-		return 0;
-
-	/*
-	 * The _STR object contains a Unicode identifier for a device.
-	 * We need to convert to utf-8 so it can be displayed.
-	 */
-	result = utf16s_to_utf8s(
-		(wchar_t *)acpi_dev->pnp.str_obj->buffer.pointer,
-		acpi_dev->pnp.str_obj->buffer.length,
-		UTF16_LITTLE_ENDIAN, buf,
-		PAGE_SIZE);
-
-	buf[result++] = '\n';
-
-	return result;
-}
-static DEVICE_ATTR(description, 0444, description_show, NULL);
-
-static ssize_t
-acpi_device_sun_show(struct device *dev, struct device_attribute *attr,
-		     char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	acpi_status status;
-	unsigned long long sun;
-
-	status = acpi_evaluate_integer(acpi_dev->handle, "_SUN", NULL, &sun);
-	if (ACPI_FAILURE(status))
-		return -ENODEV;
-
-	return sprintf(buf, "%llu\n", sun);
-}
-static DEVICE_ATTR(sun, 0444, acpi_device_sun_show, NULL);
-
-static ssize_t status_show(struct device *dev, struct device_attribute *attr,
-				char *buf) {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	acpi_status status;
-	unsigned long long sta;
-
-	status = acpi_evaluate_integer(acpi_dev->handle, "_STA", NULL, &sta);
-	if (ACPI_FAILURE(status))
-		return -ENODEV;
-
-	return sprintf(buf, "%llu\n", sta);
-}
-static DEVICE_ATTR_RO(status);
-
-static int acpi_device_setup_files(struct acpi_device *dev)
-{
-	struct acpi_buffer buffer = {ACPI_ALLOCATE_BUFFER, NULL};
-	acpi_status status;
-	int result = 0;
-
-	/*
-	 * Devices gotten from FADT don't have a "path" attribute
-	 */
-	if (dev->handle) {
-		result = device_create_file(&dev->dev, &dev_attr_path);
-		if (result)
-			goto end;
-	}
-
-	if (!list_empty(&dev->pnp.ids)) {
-		result = device_create_file(&dev->dev, &dev_attr_hid);
-		if (result)
-			goto end;
-
-		result = device_create_file(&dev->dev, &dev_attr_modalias);
-		if (result)
-			goto end;
-	}
-
-	/*
-	 * If device has _STR, 'description' file is created
-	 */
-	if (acpi_has_method(dev->handle, "_STR")) {
-		status = acpi_evaluate_object(dev->handle, "_STR",
-					NULL, &buffer);
-		if (ACPI_FAILURE(status))
-			buffer.pointer = NULL;
-		dev->pnp.str_obj = buffer.pointer;
-		result = device_create_file(&dev->dev, &dev_attr_description);
-		if (result)
-			goto end;
-	}
-
-	if (dev->pnp.type.bus_address)
-		result = device_create_file(&dev->dev, &dev_attr_adr);
-	if (dev->pnp.unique_id)
-		result = device_create_file(&dev->dev, &dev_attr_uid);
-
-	if (acpi_has_method(dev->handle, "_SUN")) {
-		result = device_create_file(&dev->dev, &dev_attr_sun);
-		if (result)
-			goto end;
-	}
-
-	if (acpi_has_method(dev->handle, "_STA")) {
-		result = device_create_file(&dev->dev, &dev_attr_status);
-		if (result)
-			goto end;
-	}
-
-        /*
-         * If device has _EJ0, 'eject' file is created that is used to trigger
-         * hot-removal function from userland.
-         */
-	if (acpi_has_method(dev->handle, "_EJ0")) {
-		result = device_create_file(&dev->dev, &dev_attr_eject);
-		if (result)
-			return result;
-	}
-
-	if (dev->flags.power_manageable) {
-		result = device_create_file(&dev->dev, &dev_attr_power_state);
-		if (result)
-			return result;
-
-		if (dev->power.flags.power_resources)
-			result = device_create_file(&dev->dev,
-						    &dev_attr_real_power_state);
-	}
-
-end:
-	return result;
-}
-
-static void acpi_device_remove_files(struct acpi_device *dev)
-{
-	if (dev->flags.power_manageable) {
-		device_remove_file(&dev->dev, &dev_attr_power_state);
-		if (dev->power.flags.power_resources)
-			device_remove_file(&dev->dev,
-					   &dev_attr_real_power_state);
-	}
-
-	/*
-	 * If device has _STR, remove 'description' file
-	 */
-	if (acpi_has_method(dev->handle, "_STR")) {
-		kfree(dev->pnp.str_obj);
-		device_remove_file(&dev->dev, &dev_attr_description);
-	}
-	/*
-	 * If device has _EJ0, remove 'eject' file.
-	 */
-	if (acpi_has_method(dev->handle, "_EJ0"))
-		device_remove_file(&dev->dev, &dev_attr_eject);
-
-	if (acpi_has_method(dev->handle, "_SUN"))
-		device_remove_file(&dev->dev, &dev_attr_sun);
-
-	if (dev->pnp.unique_id)
-		device_remove_file(&dev->dev, &dev_attr_uid);
-	if (dev->pnp.type.bus_address)
-		device_remove_file(&dev->dev, &dev_attr_adr);
-	device_remove_file(&dev->dev, &dev_attr_modalias);
-	device_remove_file(&dev->dev, &dev_attr_hid);
-	if (acpi_has_method(dev->handle, "_STA"))
-		device_remove_file(&dev->dev, &dev_attr_status);
-	if (dev->handle)
-		device_remove_file(&dev->dev, &dev_attr_path);
-}
 /* --------------------------------------------------------------------------
 			ACPI Bus operations
    -------------------------------------------------------------------------- */
@@ -767,7 +504,7 @@ static const struct acpi_device_id *__acpi_match_device(
 	 * If the device is not present, it is unnecessary to load device
 	 * driver for it.
 	 */
-	if (!device->status.present)
+	if (!device || !device->status.present)
 		return NULL;
 
 	for (id = ids; id->id[0]; id++)
@@ -792,13 +529,7 @@ static const struct acpi_device_id *__acpi_match_device(
 const struct acpi_device_id *acpi_match_device(const struct acpi_device_id *ids,
 					       const struct device *dev)
 {
-	struct acpi_device *adev;
-	acpi_handle handle = ACPI_HANDLE(dev);
-
-	if (!ids || !handle || acpi_bus_get_device(handle, &adev))
-		return NULL;
-
-	return __acpi_match_device(adev, ids);
+	return __acpi_match_device(acpi_companion_match(dev), ids);
 }
 EXPORT_SYMBOL_GPL(acpi_match_device);
 
@@ -808,6 +539,51 @@ int acpi_match_device_ids(struct acpi_device *device,
 	return __acpi_match_device(device, ids) ? 0 : -ENOENT;
 }
 EXPORT_SYMBOL(acpi_match_device_ids);
+
+/* Performs match against special ACPI_DT_NAMESPACE_HID shoehorn ACPI ID */
+static bool acpi_of_driver_match_device(struct device *dev,
+					const struct device_driver *drv)
+{
+	const union acpi_object *of_compatible, *obj;
+	struct acpi_device *adev;
+	int i, nval;
+
+	adev = ACPI_COMPANION(dev);
+	if (!adev)
+		return false;
+
+	of_compatible = adev->data.of_compatible;
+	if (!drv->of_match_table || !of_compatible)
+		return false;
+
+	if (of_compatible->type == ACPI_TYPE_PACKAGE) {
+		nval = of_compatible->package.count;
+		obj = of_compatible->package.elements;
+	} else { /* Must be ACPI_TYPE_STRING. */
+		nval = 1;
+		obj = of_compatible;
+	}
+	/* Now we can look for the driver DT compatible strings */
+	for (i = 0; i < nval; i++, obj++) {
+		const struct of_device_id *id;
+
+		for (id = drv->of_match_table; id->compatible[0]; id++)
+			if (!strcasecmp(obj->string.pointer, id->compatible))
+				return true;
+	}
+
+	return false;
+}
+
+bool acpi_driver_match_device(struct device *dev,
+			      const struct device_driver *drv)
+{
+	if (!drv->acpi_match_table)
+		return acpi_of_driver_match_device(dev, drv);
+
+	return !!acpi_match_device(drv->acpi_match_table, dev);
+}
+EXPORT_SYMBOL_GPL(acpi_driver_match_device);
 
 static void acpi_free_power_resources_lists(struct acpi_device *device)
 {
@@ -846,20 +622,7 @@ static int acpi_bus_match(struct device *dev, struct device_driver *drv)
 
 static int acpi_device_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
-	struct acpi_device *acpi_dev = to_acpi_device(dev);
-	int len;
-
-	if (list_empty(&acpi_dev->pnp.ids))
-		return 0;
-
-	if (add_uevent_var(env, "MODALIAS="))
-		return -ENOMEM;
-	len = create_modalias(acpi_dev, &env->buf[env->buflen - 1],
-			      sizeof(env->buf) - env->buflen);
-	if (len <= 0)
-		return len;
-	env->buflen += len;
-	return 0;
+	return __acpi_device_uevent_modalias(to_acpi_device(dev), env);
 }
 
 static void acpi_device_notify(acpi_handle handle, u32 event, void *data)
@@ -1803,6 +1566,7 @@ void acpi_init_device_object(struct acpi_device *device, acpi_handle handle,
 	device->device_type = type;
 	device->handle = handle;
 	device->parent = acpi_bus_get_parent(handle);
+	device->fwnode.type = FWNODE_ACPI;
 	acpi_set_device_status(device, sta);
 	acpi_device_get_busid(device);
 	acpi_set_pnp_ids(handle, &device->pnp, type);
@@ -2190,6 +1954,7 @@ int __init acpi_scan_init(void)
 	acpi_container_init();
 	acpi_memory_hotplug_init();
 	acpi_pnp_init();
+	acpi_int340x_thermal_init();
 
 	mutex_lock(&acpi_scan_lock);
 	/*

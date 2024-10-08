@@ -12,7 +12,7 @@
 #include "util/tool.h"
 #include "util/cloexec.h"
 
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/trace-event.h"
 
 #include "util/debug.h"
@@ -1729,8 +1729,8 @@ static void setup_sorting(struct perf_sched *sched, const struct option *options
 	for (tok = strtok_r(str, ", ", &tmp);
 			tok; tok = strtok_r(NULL, ", ", &tmp)) {
 		if (sort_dimension__add(tok, &sched->sort_list) < 0) {
-			error("Unknown --sort key: `%s'", tok);
-			usage_with_options(usage_msg, options);
+			usage_with_options_msg(usage_msg, options,
+					"Unknown --sort key: `%s'", tok);
 		}
 	}
 

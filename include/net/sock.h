@@ -54,8 +54,12 @@
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/memcontrol.h>
+#ifdef __GENKSYMS__
 #include <linux/res_counter.h>
+#else
+#include <linux/page_counter.h>
+#endif
+#include <linux/memcontrol.h>
 #include <linux/static_key.h>
 #include <linux/aio.h>
 #include <linux/sched.h>
@@ -69,6 +73,7 @@
 #include <net/checksum.h>
 
 #include <linux/rh_kabi.h>
+#include <net/tcp_states.h>
 
 struct cgroup;
 struct cgroup_subsys;
@@ -224,9 +229,8 @@ struct cg_proto;
   *	@sk_lock:	synchronizer
   *	@sk_rcvbuf: size of receive buffer in bytes
   *	@sk_wq: sock wait queue and async head
-  *	@sk_rx_dst: receive input route used by early tcp demux
+  *	@sk_rx_dst: receive input route used by early demux
   *	@sk_dst_cache: destination cache
-  *	@sk_dst_lock: destination cache lock
   *	@sk_policy: flow policy
   *	@sk_receive_queue: incoming packets
   *	@sk_wmem_alloc: transmit queue bytes committed
@@ -364,7 +368,7 @@ struct sock {
 	unsigned long 		sk_flags;
 	struct dst_entry	*sk_rx_dst;
 	struct dst_entry __rcu	*sk_dst_cache;
-	spinlock_t		sk_dst_lock;
+	RH_KABI_DEPRECATE(spinlock_t,	sk_dst_lock)
 	atomic_t		sk_wmem_alloc;
 	atomic_t		sk_omem_alloc;
 	int			sk_sndbuf;
@@ -379,6 +383,7 @@ struct sock {
 #endif
 				sk_userlocks : 4,
 				sk_protocol  : 8,
+#define SK_PROTOCOL_MAX U8_MAX
 				sk_type      : 16;
 	kmemcheck_bitfield_end(flags);
 	int			sk_wmem_queued;
@@ -673,6 +678,20 @@ static inline void sk_add_bind_node(struct sock *sk,
 	hlist_for_each_entry_safe(__sk, tmp, list, sk_node)
 #define sk_for_each_bound(__sk, list) \
 	hlist_for_each_entry(__sk, list, sk_bind_node)
+
+/**
+ * sk_nulls_for_each_entry_offset - iterate over a list at a given struct offset
+ * @tpos:	the type * to use as a loop cursor.
+ * @pos:	the &struct hlist_node to use as a loop cursor.
+ * @head:	the head for your list.
+ * @offset:	offset of hlist_node within the struct.
+ *
+ */
+#define sk_nulls_for_each_entry_offset(tpos, pos, head, offset)		       \
+	for (pos = (head)->first;					       \
+	     (!is_a_nulls(pos)) &&					       \
+		({ tpos = (typeof(*tpos) *)((void *)pos - offset); 1;});       \
+	     pos = pos->next)
 
 static inline struct user_namespace *sk_user_ns(struct sock *sk)
 {
@@ -1069,7 +1088,9 @@ enum cg_proto_flags {
 
 struct cg_proto {
 	void			(*enter_memory_pressure)(struct sock *sk);
-	struct res_counter	*memory_allocated;	/* Current allocated memory. */
+	/* Current allocated memory. */
+	RH_KABI_REPLACE(struct res_counter	*memory_allocated,
+			struct page_counter	*memory_allocated)
 	struct percpu_counter	*sockets_allocated;	/* Current number of sockets. */
 	int			*memory_pressure;
 	long			*sysctl_mem;
@@ -1222,34 +1243,26 @@ static inline void memcg_memory_allocated_add(struct cg_proto *prot,
 					      unsigned long amt,
 					      int *parent_status)
 {
-	struct res_counter *fail;
-	int ret;
+	page_counter_charge(prot->memory_allocated, amt);
 
-	ret = res_counter_charge_nofail(prot->memory_allocated,
-					amt << PAGE_SHIFT, &fail);
-	if (ret < 0)
+	if (page_counter_read(prot->memory_allocated) >
+	    prot->memory_allocated->limit)
 		*parent_status = OVER_LIMIT;
 }
 
 static inline void memcg_memory_allocated_sub(struct cg_proto *prot,
 					      unsigned long amt)
 {
-	res_counter_uncharge(prot->memory_allocated, amt << PAGE_SHIFT);
-}
-
-static inline u64 memcg_memory_allocated_read(struct cg_proto *prot)
-{
-	u64 ret;
-	ret = res_counter_read_u64(prot->memory_allocated, RES_USAGE);
-	return ret >> PAGE_SHIFT;
+	page_counter_uncharge(prot->memory_allocated, amt);
 }
 
 static inline long
 sk_memory_allocated(const struct sock *sk)
 {
 	struct proto *prot = sk->sk_prot;
+
 	if (mem_cgroup_sockets_enabled && sk->sk_cgrp)
-		return memcg_memory_allocated_read(sk->sk_cgrp);
+		return page_counter_read(sk->sk_cgrp->memory_allocated);
 
 	return atomic_long_read(prot->memory_allocated);
 }
@@ -1263,7 +1276,7 @@ sk_memory_allocated_add(struct sock *sk, int amt, int *parent_status)
 		memcg_memory_allocated_add(sk->sk_cgrp, amt, parent_status);
 		/* update the root cgroup regardless */
 		atomic_long_add_return(amt, prot->memory_allocated);
-		return memcg_memory_allocated_read(sk->sk_cgrp);
+		return page_counter_read(sk->sk_cgrp->memory_allocated);
 	}
 
 	return atomic_long_add_return(amt, prot->memory_allocated);
@@ -1420,7 +1433,7 @@ static inline struct inode *SOCK_INODE(struct socket *socket)
  * Functions for memory accounting
  */
 extern int __sk_mem_schedule(struct sock *sk, int size, int kind);
-extern void __sk_mem_reclaim(struct sock *sk);
+void __sk_mem_reclaim(struct sock *sk, int amount);
 
 #define SK_MEM_QUANTUM ((int)PAGE_SIZE)
 #define SK_MEM_QUANTUM_SHIFT ilog2(SK_MEM_QUANTUM)
@@ -1461,7 +1474,7 @@ static inline void sk_mem_reclaim(struct sock *sk)
 	if (!sk_has_account(sk))
 		return;
 	if (sk->sk_forward_alloc >= SK_MEM_QUANTUM)
-		__sk_mem_reclaim(sk);
+		__sk_mem_reclaim(sk, sk->sk_forward_alloc);
 }
 
 static inline void sk_mem_reclaim_partial(struct sock *sk)
@@ -1469,7 +1482,7 @@ static inline void sk_mem_reclaim_partial(struct sock *sk)
 	if (!sk_has_account(sk))
 		return;
 	if (sk->sk_forward_alloc > SK_MEM_QUANTUM)
-		__sk_mem_reclaim(sk);
+		__sk_mem_reclaim(sk, sk->sk_forward_alloc - 1);
 }
 
 static inline void sk_mem_charge(struct sock *sk, int size)
@@ -1584,7 +1597,11 @@ extern struct sk_buff		*sock_rmalloc(struct sock *sk,
 extern void			sock_wfree(struct sk_buff *skb);
 extern void			sock_rfree(struct sk_buff *skb);
 extern void			sock_efree(struct sk_buff *skb);
-extern void			sock_edemux(struct sk_buff *skb);
+#ifdef CONFIG_INET
+void sock_edemux(struct sk_buff *skb);
+#else
+#define sock_edemux(skb) sock_efree(skb)
+#endif
 
 extern int			sock_setsockopt(struct socket *sock, int level,
 						int op, char __user *optval,
@@ -2341,6 +2358,14 @@ extern int net_msg_warn;
 
 #define LIMIT_NETDEBUG(fmt, args...) \
 	do { if (net_msg_warn && net_ratelimit()) printk(fmt,##args); } while(0)
+
+/* This helper checks if a socket is a full socket,
+ * ie _not_ a timewait socket.
+ */
+static inline bool sk_fullsock(const struct sock *sk)
+{
+	return (1 << sk->sk_state) & ~(TCPF_TIME_WAIT);
+}
 
 extern __u32 sysctl_wmem_max;
 extern __u32 sysctl_rmem_max;

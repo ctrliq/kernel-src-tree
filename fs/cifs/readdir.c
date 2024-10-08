@@ -78,19 +78,19 @@ cifs_prime_dcache(struct dentry *parent, struct qstr *name,
 {
 	struct dentry *dentry, *alias;
 	struct inode *inode;
-	struct super_block *sb = parent->d_inode->i_sb;
+	struct super_block *sb = d_inode(parent)->i_sb;
 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
 
 	cifs_dbg(FYI, "%s: for %s\n", __func__, name->name);
 
 	dentry = d_hash_and_lookup(parent, name);
-	if (unlikely(IS_ERR(dentry)))
+	if (IS_ERR(dentry))
 		return;
 
 	if (dentry) {
 		int err;
 
-		inode = dentry->d_inode;
+		inode = d_inode(dentry);
 		if (inode) {
 			if (d_mountpoint(dentry))
 				goto out;
@@ -304,7 +304,7 @@ initiate_cifs_search(const unsigned int xid, struct file *file)
 	cifsFile->invalidHandle = true;
 	cifsFile->srch_inf.endOfSearch = false;
 
-	full_path = build_path_from_dentry(file->f_path.dentry);
+	full_path = build_path_from_dentry(file_dentry(file));
 	if (full_path == NULL) {
 		rc = -ENOMEM;
 		goto error_exit;
@@ -762,7 +762,7 @@ static int cifs_filldir(char *find_entry, struct file *file, filldir_t filldir,
 		 */
 		fattr.cf_flags |= CIFS_FATTR_NEED_REVAL;
 
-	cifs_prime_dcache(file->f_dentry, &name, &fattr);
+	cifs_prime_dcache(file_dentry(file), &name, &fattr);
 
 	ino = cifs_uniqueid_to_ino_t(fattr.cf_uniqueid);
 	rc = filldir(dirent, name.name, name.len, file->f_pos, ino,
@@ -872,6 +872,7 @@ int cifs_readdir(struct file *file, void *direntry, filldir_t filldir)
 			 * if buggy server returns . and .. late do we want to
 			 * check for that here?
 			 */
+			*tmp_buf = 0;
 			rc = cifs_filldir(current_entry, file, filldir,
 					  direntry, tmp_buf, max_len);
 			if (rc == -EOVERFLOW) {

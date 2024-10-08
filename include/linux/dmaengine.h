@@ -42,13 +42,13 @@ typedef s32 dma_cookie_t;
 
 /**
  * enum dma_status - DMA transaction status
- * @DMA_SUCCESS: transaction completed successfully
+ * @DMA_COMPLETE: transaction completed
  * @DMA_IN_PROGRESS: transaction not yet processed
  * @DMA_PAUSED: transaction is paused
  * @DMA_ERROR: transaction failed
  */
 enum dma_status {
-	DMA_SUCCESS,
+	DMA_SUCCESS = 0, DMA_COMPLETE = 0,
 	DMA_IN_PROGRESS,
 	DMA_PAUSED,
 	DMA_ERROR,
@@ -400,7 +400,7 @@ enum dma_residue_granularity {
 /* struct dma_slave_caps - expose capabilities of a slave channel only
  *
  * @src_addr_widths: bit mask of src addr widths the channel supports
- * @dstn_addr_widths: bit mask of dstn addr widths the channel supports
+ * @dst_addr_widths: bit mask of dstn addr widths the channel supports
  * @directions: bit mask of slave direction the channel supported
  * 	since the enum dma_transfer_direction is not defined as bits for each
  * 	type of direction, the dma controller should fill (1 << <TYPE>) and same
@@ -411,7 +411,7 @@ enum dma_residue_granularity {
  */
 struct dma_slave_caps {
 	u32 src_addr_widths;
-	u32 dstn_addr_widths;
+	u32 dst_addr_widths;
 	u32 directions;
 	bool cmd_pause;
 	bool cmd_terminate;
@@ -626,10 +626,10 @@ struct dma_device {
 	void (*device_free_chan_resources)(struct dma_chan *chan);
 
 	struct dma_async_tx_descriptor *(*device_prep_dma_memcpy)(
-		struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
+		struct dma_chan *chan, dma_addr_t dst, dma_addr_t src,
 		size_t len, unsigned long flags);
 	struct dma_async_tx_descriptor *(*device_prep_dma_xor)(
-		struct dma_chan *chan, dma_addr_t dest, dma_addr_t *src,
+		struct dma_chan *chan, dma_addr_t dst, dma_addr_t *src,
 		unsigned int src_cnt, size_t len, unsigned long flags);
 	struct dma_async_tx_descriptor *(*device_prep_dma_xor_val)(
 		struct dma_chan *chan, dma_addr_t *src,	unsigned int src_cnt,
@@ -1048,10 +1048,10 @@ static inline enum dma_status dma_async_is_complete(dma_cookie_t cookie,
 {
 	if (last_complete <= last_used) {
 		if ((cookie <= last_complete) || (cookie > last_used))
-			return DMA_SUCCESS;
+			return DMA_COMPLETE;
 	} else {
 		if ((cookie <= last_complete) && (cookie > last_used))
-			return DMA_SUCCESS;
+			return DMA_COMPLETE;
 	}
 	return DMA_IN_PROGRESS;
 }
@@ -1077,7 +1077,7 @@ void dma_release_channel(struct dma_chan *chan);
 #else
 static inline enum dma_status dma_wait_for_async_tx(struct dma_async_tx_descriptor *tx)
 {
-	return DMA_SUCCESS;
+	return DMA_COMPLETE;
 }
 static inline void dma_issue_pending_all(void)
 {

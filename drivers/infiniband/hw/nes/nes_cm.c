@@ -2995,7 +2995,6 @@ int nes_accept(struct iw_cm_id *cm_id, struct iw_cm_conn_param *conn_param)
 	int passive_state;
 	struct nes_ib_device *nesibdev;
 	struct ib_mr *ibmr = NULL;
-	struct ib_phys_buf ibphysbuf;
 	struct nes_pd *nespd;
 	u64 tagged_offset;
 	u8 mpa_frame_offset = 0;
@@ -3074,21 +3073,19 @@ int nes_accept(struct iw_cm_id *cm_id, struct iw_cm_conn_param *conn_param)
 		u64temp = (unsigned long)nesqp;
 		nesibdev = nesvnic->nesibdev;
 		nespd = nesqp->nespd;
-		ibphysbuf.addr = nesqp->ietf_frame_pbase + mpa_frame_offset;
-		ibphysbuf.size = buff_len;
 		tagged_offset = (u64)(unsigned long)*start_buff;
-		ibmr = nesibdev->ibdev.reg_phys_mr((struct ib_pd *)nespd,
-						   &ibphysbuf, 1,
-						   IB_ACCESS_LOCAL_WRITE,
-						   &tagged_offset);
-		if (!ibmr) {
+		ibmr = nes_reg_phys_mr(&nespd->ibpd,
+				nesqp->ietf_frame_pbase + mpa_frame_offset,
+				buff_len, IB_ACCESS_LOCAL_WRITE,
+				&tagged_offset);
+		if (IS_ERR(ibmr)) {
 			nes_debug(NES_DBG_CM, "Unable to register memory region"
 				  "for lSMM for cm_node = %p \n",
 				  cm_node);
 			pci_free_consistent(nesdev->pcidev,
 					    nesqp->private_data_len + nesqp->ietf_frame_size,
 					    nesqp->ietf_frame, nesqp->ietf_frame_pbase);
-			return -ENOMEM;
+			return PTR_ERR(ibmr);
 		}
 
 		ibmr->pd = &nespd->ibpd;

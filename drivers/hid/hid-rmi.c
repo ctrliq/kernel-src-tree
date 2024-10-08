@@ -165,7 +165,8 @@ static int rmi_set_mode(struct hid_device *hdev, u8 mode)
 	int ret;
 	u8 txbuf[2] = {RMI_SET_RMI_MODE_REPORT_ID, mode};
 
-	ret = hdev->hid_output_raw_report(hdev, txbuf, sizeof(txbuf), HID_FEATURE_REPORT);
+	ret = hid_hw_raw_request(hdev, RMI_SET_RMI_MODE_REPORT_ID, txbuf,
+			sizeof(txbuf), HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
 	if (ret < 0) {
 		dev_err(&hdev->dev, "unable to set rmi mode to %d (%d)\n", mode,
 			ret);
@@ -179,7 +180,7 @@ static int rmi_write_report(struct hid_device *hdev, u8 *report, int len)
 {
 	int ret;
 
-	ret = hdev->hid_output_raw_report(hdev, (void *)report, len, HID_OUTPUT_REPORT);
+	ret = hid_hw_output_report(hdev, (void *)report, len);
 	if (ret < 0) {
 		dev_err(&hdev->dev, "failed to write hid report (%d)\n", ret);
 		return ret;
@@ -456,7 +457,6 @@ struct pdt_entry {
 	u8 function_number:8;
 } __attribute__((__packed__));
 
-#define GENMASK(h, l)           (((U32_C(1) << ((h) - (l) + 1)) - 1) << (l))
 static inline unsigned long rmi_gen_mask(unsigned irq_base, unsigned irq_count)
 {
 	return GENMASK(irq_count + irq_base - 1, irq_base);
@@ -750,7 +750,7 @@ static int rmi_populate(struct hid_device *hdev)
 	return 0;
 }
 
-static void rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
+static int rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
 {
 	struct rmi_data *data = hid_get_drvdata(hdev);
 	struct input_dev *input = hi->input;
@@ -762,7 +762,7 @@ static void rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
 	hid_dbg(hdev, "Opening low level driver\n");
 	ret = hid_hw_open(hdev);
 	if (ret)
-		return;
+		return ret;
 
 	/* Allow incoming hid reports */
 	hid_device_io_start(hdev);
@@ -800,7 +800,9 @@ static void rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
 	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 0x0f, 0, 0);
 	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 0x0f, 0, 0);
 
-	input_mt_init_slots(input, data->max_fingers, INPUT_MT_POINTER);
+	ret = input_mt_init_slots(input, data->max_fingers, INPUT_MT_POINTER);
+	if (ret < 0)
+		goto exit;
 
 	if (data->button_count) {
 		__set_bit(EV_KEY, input->evbit);
@@ -816,6 +818,7 @@ static void rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
 exit:
 	hid_device_io_stop(hdev);
 	hid_hw_close(hdev);
+	return ret;
 }
 
 static int rmi_input_mapping(struct hid_device *hdev,

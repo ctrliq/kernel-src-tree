@@ -95,9 +95,6 @@ mlx4_en_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *drvinfo)
 		(u16) (mdev->dev->caps.fw_ver & 0xffff));
 	strlcpy(drvinfo->bus_info, pci_name(mdev->dev->persist->pdev),
 		sizeof(drvinfo->bus_info));
-	drvinfo->n_stats = 0;
-	drvinfo->regdump_len = 0;
-	drvinfo->eedump_len = 0;
 }
 
 static const char mlx4_en_priv_flags[][ETH_GSTRING_LEN] = {
@@ -1847,6 +1844,48 @@ static u32 mlx4_en_get_priv_flags(struct net_device *dev)
 	return priv->pflags;
 }
 
+static int mlx4_en_get_tunable(struct net_device *dev,
+			       const struct ethtool_tunable *tuna,
+			       void *data)
+{
+	const struct mlx4_en_priv *priv = netdev_priv(dev);
+	int ret = 0;
+
+	switch (tuna->id) {
+	case ETHTOOL_TX_COPYBREAK:
+		*(u32 *)data = priv->prof->inline_thold;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+static int mlx4_en_set_tunable(struct net_device *dev,
+			       const struct ethtool_tunable *tuna,
+			       const void *data)
+{
+	struct mlx4_en_priv *priv = netdev_priv(dev);
+	int val, ret = 0;
+
+	switch (tuna->id) {
+	case ETHTOOL_TX_COPYBREAK:
+		val = *(u32 *)data;
+		if (val < MIN_PKT_LEN || val > MAX_INLINE)
+			ret = -EINVAL;
+		else
+			priv->prof->inline_thold = val;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
 static int mlx4_en_get_module_info(struct net_device *dev,
 				   struct ethtool_modinfo *modinfo)
 {
@@ -1985,6 +2024,8 @@ const struct ethtool_ops mlx4_en_ethtool_ops = {
 	.get_ts_info = mlx4_en_get_ts_info,
 	.set_priv_flags = mlx4_en_set_priv_flags,
 	.get_priv_flags = mlx4_en_get_priv_flags,
+	.get_tunable		= mlx4_en_get_tunable,
+	.set_tunable		= mlx4_en_set_tunable,
 	.get_module_info = mlx4_en_get_module_info,
 	.get_module_eeprom = mlx4_en_get_module_eeprom
 };

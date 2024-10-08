@@ -80,6 +80,8 @@ struct rh_cpuinfo_x86 {
 	/* Cache QoS architectural values: */
 	int			x86_cache_max_rmid;
 	int			x86_cache_occ_scale;
+	/* Logical processor id: */
+	u16			logical_proc_id;
 };
 
 /*
@@ -391,19 +393,26 @@ struct lwp_struct {
 	u32 event_counter[16];
 };
 
-struct bndregs_struct {
-	u64 bndregs[8];
+struct bndreg {
+	u64 lower_bound;
+	u64 upper_bound;
 } __packed;
 
-struct bndcsr_struct {
-	u64 cfg_reg_u;
-	u64 status_reg;
+struct bndcsr {
+	u64 bndcfgu;
+	u64 bndstatus;
 } __packed;
 
 struct xsave_hdr_struct {
 	u64 xstate_bv;
+#ifdef __GENKSYMS__
+	u64 reserved1[2];
+	u64 reserved2[5];
+#else
 	u64 xcomp_bv;
 	u64 reserved[6];
+
+#endif
 } __attribute__((packed));
 
 struct xsave_struct {
@@ -411,8 +420,8 @@ struct xsave_struct {
 	struct xsave_hdr_struct xsave_hdr;
 	struct ymmh_struct ymmh;
 	RH_KABI_EXTEND(struct lwp_struct lwp)
-	RH_KABI_EXTEND(struct bndregs_struct bndregs)
-	RH_KABI_EXTEND(struct bndcsr_struct bndcsr)
+	RH_KABI_EXTEND(struct bndreg bndreg[4])
+	RH_KABI_EXTEND(struct bndcsr bndcsr)
 	/* new processor state extensions will go here */
 } __attribute__ ((packed, aligned (64)));
 
@@ -950,8 +959,25 @@ extern void start_thread(struct pt_regs *regs, unsigned long new_ip,
 extern int get_tsc_mode(unsigned long adr);
 extern int set_tsc_mode(unsigned int val);
 
+/* Register/unregister a process' MPX related resource */
+#define MPX_ENABLE_MANAGEMENT()	mpx_enable_management()
+#define MPX_DISABLE_MANAGEMENT()	mpx_disable_management()
+
+#ifdef CONFIG_X86_INTEL_MPX
+extern int mpx_enable_management(void);
+extern int mpx_disable_management(void);
+#else
+static inline int mpx_enable_management(void)
+{
+	return -EINVAL;
+}
+static inline int mpx_disable_management(void)
+{
+	return -EINVAL;
+}
+#endif /* CONFIG_X86_INTEL_MPX */
+
 extern u16 amd_get_nb_id(int cpu);
-extern u32 amd_get_nodes_per_socket(void);
 
 static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
 {

@@ -321,48 +321,15 @@ int ff_layout_track_ds_error(struct nfs4_flexfile_layout *flo,
 	return 0;
 }
 
-/* currently we only support AUTH_NONE and AUTH_SYS */
-static rpc_authflavor_t
-nfs4_ff_layout_choose_authflavor(struct nfs4_ff_layout_mirror *mirror)
-{
-	if (mirror->uid == (u32)-1)
-		return RPC_AUTH_NULL;
-	return RPC_AUTH_UNIX;
-}
-
-/* fetch cred for NFSv3 DS */
-static int ff_layout_update_mirror_cred(struct nfs4_ff_layout_mirror *mirror,
-				      struct nfs4_pnfs_ds *ds)
-{
-	if (ds->ds_clp && !mirror->cred &&
-	    mirror->mirror_ds->ds_versions[0].version == 3) {
-		struct rpc_auth *auth = ds->ds_clp->cl_rpcclient->cl_auth;
-		struct rpc_cred *cred;
-		struct auth_cred acred = {
-			.uid = make_kuid(&init_user_ns, mirror->uid),
-			.gid = make_kgid(&init_user_ns, mirror->gid),
-		};
-
-		/* AUTH_NULL ignores acred */
-		cred = auth->au_ops->lookup_cred(auth, &acred, 0);
-		if (IS_ERR(cred)) {
-			dprintk("%s: lookup_cred failed with %ld\n",
-				__func__, PTR_ERR(cred));
-			return PTR_ERR(cred);
-		} else {
-			if (cmpxchg(&mirror->cred, NULL, cred))
-				put_rpccred(cred);
-		}
-	}
-	return 0;
-}
-
 static struct rpc_cred *
 ff_layout_get_mirror_cred(struct nfs4_ff_layout_mirror *mirror, u32 iomode)
 {
-	struct rpc_cred *cred, **pcred;
+	struct rpc_cred *cred, __rcu **pcred;
 
-	pcred = &mirror->cred;
+	if (iomode == IOMODE_READ)
+		pcred = &mirror->ro_cred;
+	else
+		pcred = &mirror->rw_cred;
 
 	rcu_read_lock();
 	do {
@@ -405,7 +372,6 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 	struct inode *ino = lseg->pls_layout->plh_inode;
 	struct nfs_server *s = NFS_SERVER(ino);
 	unsigned int max_payload;
-	rpc_authflavor_t flavor;
 
 	if (!ff_layout_mirror_valid(lseg, mirror)) {
 		pr_err_ratelimited("NFS: %s: No data server for offset index %d\n",
@@ -421,9 +387,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 	/* matching smp_wmb() in _nfs4_pnfs_v3/4_ds_connect */
 	smp_rmb();
 	if (ds->ds_clp)
-		goto out_update_creds;
-
-	flavor = nfs4_ff_layout_choose_authflavor(mirror);
+		goto out;
 
 	/* FIXME: For now we assume the server sent only one version of NFS
 	 * to use for the DS.
@@ -432,7 +396,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 			     dataserver_retrans,
 			     mirror->mirror_ds->ds_versions[0].version,
 			     mirror->mirror_ds->ds_versions[0].minor_version,
-			     flavor);
+			     RPC_AUTH_UNIX);
 
 	/* connect success, check rsize/wsize limit */
 	if (ds->ds_clp) {
@@ -448,26 +412,16 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 					 mirror, lseg->pls_range.offset,
 					 lseg->pls_range.length, NFS4ERR_NXIO,
 					 OP_ILLEGAL, GFP_NOIO);
-		if (fail_return) {
-			pnfs_error_mark_layout_for_return(ino, lseg);
-			if (ff_layout_has_available_ds(lseg))
-				pnfs_set_retry_layoutget(lseg->pls_layout);
-			else
-				pnfs_clear_retry_layoutget(lseg->pls_layout);
-
-		} else {
+		if (!fail_return) {
 			if (ff_layout_has_available_ds(lseg))
 				set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
 					&lseg->pls_layout->plh_flags);
-			else {
+			else
 				pnfs_error_mark_layout_for_return(ino, lseg);
-				pnfs_clear_retry_layoutget(lseg->pls_layout);
-			}
-		}
-	}
-out_update_creds:
-	if (ff_layout_update_mirror_cred(mirror, ds))
+		} else
+			pnfs_error_mark_layout_for_return(ino, lseg);
 		ds = NULL;
+	}
 out:
 	return ds;
 }

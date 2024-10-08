@@ -1756,7 +1756,7 @@ static void *kmem_getpages(struct kmem_cache *cachep, gfp_t flags, int nodeid)
 	}
 
 	/* Record if ALLOC_NO_WATERMARKS was set when allocating the slab */
-	if (unlikely(page->pfmemalloc))
+	if (page_is_pfmemalloc(page))
 		pfmemalloc_active = true;
 
 	nr_pages = (1 << cachep->gfporder);
@@ -1769,7 +1769,7 @@ static void *kmem_getpages(struct kmem_cache *cachep, gfp_t flags, int nodeid)
 	for (i = 0; i < nr_pages; i++) {
 		__SetPageSlab(page + i);
 
-		if (page->pfmemalloc)
+		if (page_is_pfmemalloc(page))
 			SetPageSlabPfmemalloc(page + i);
 	}
 	memcg_bind_pages(cachep, cachep->gfporder);
@@ -3627,6 +3627,19 @@ void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
 	return ret;
 }
 EXPORT_SYMBOL(kmem_cache_alloc);
+
+void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
+{
+	__kmem_cache_free_bulk(s, size, p);
+}
+EXPORT_SYMBOL(kmem_cache_free_bulk);
+
+int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+								void **p)
+{
+	return __kmem_cache_alloc_bulk(s, flags, size, p);
+}
+EXPORT_SYMBOL(kmem_cache_alloc_bulk);
 
 #ifdef CONFIG_TRACING
 void *

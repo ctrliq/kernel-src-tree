@@ -45,6 +45,7 @@ struct inet_skb_parm {
 #define IPSKB_FRAG_COMPLETE	BIT(3)
 #define IPSKB_REROUTED		BIT(4)
 #define IPSKB_DOREDIRECT	BIT(5)
+#define IPSKB_FRAG_PMTU		BIT(6)
 
 	u16			frag_max_size;
 };
@@ -107,8 +108,8 @@ int ip_local_deliver(struct sk_buff *skb);
 int ip_mr_input(struct sk_buff *skb);
 int ip_output(struct sock *sk, struct sk_buff *skb);
 int ip_mc_output(struct sock *sk, struct sk_buff *skb);
-int ip_fragment(struct sock *sk, struct sk_buff *skb,
-		int (*output)(struct sock *, struct sk_buff *));
+int ip_do_fragment(struct sock *sk, struct sk_buff *skb,
+		   int (*output)(struct sock *, struct sk_buff *));
 int ip_do_nat(struct sk_buff *skb);
 void ip_send_check(struct iphdr *ip);
 int __ip_local_out(struct sk_buff *skb);
@@ -230,7 +231,10 @@ static inline int inet_is_reserved_local_port(int port)
 	return test_bit(port, sysctl_local_reserved_ports);
 }
 
-extern int sysctl_ip_nonlocal_bind;
+static inline bool sysctl_dev_name_is_allowed(const char *name)
+{
+	return strcmp(name, "default") != 0  && strcmp(name, "all") != 0;
+}
 
 /* From inetpeer.c */
 extern int inet_peer_threshold;
@@ -314,9 +318,11 @@ static inline unsigned int ip_skb_dst_mtu(const struct sk_buff *skb)
 	}
 }
 
-void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+u32 ip_idents_reserve(u32 hash, int segs);
+void __ip_select_ident(struct net *net, struct iphdr *iph, int segs);
 
-static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk)
+static inline void ip_select_ident_segs(struct net *net, struct sk_buff *skb,
+					struct sock *sk, int segs)
 {
 	struct iphdr *iph = ip_hdr(skb);
 
@@ -326,24 +332,21 @@ static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, s
 		 * does not change, they drop every other packet in
 		 * a TCP stream using header compression.
 		 */
-		iph->id = (sk && inet_sk(sk)->inet_daddr) ?
-					htons(inet_sk(sk)->inet_id++) : 0;
-	} else
-		__ip_select_ident(iph, dst, 0);
-}
-
-static inline void ip_select_ident_more(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk, int more)
-{
-	struct iphdr *iph = ip_hdr(skb);
-
-	if ((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) {
 		if (sk && inet_sk(sk)->inet_daddr) {
 			iph->id = htons(inet_sk(sk)->inet_id);
-			inet_sk(sk)->inet_id += 1 + more;
-		} else
+			inet_sk(sk)->inet_id += segs;
+		} else {
 			iph->id = 0;
-	} else
-		__ip_select_ident(iph, dst, more);
+		}
+	} else {
+		__ip_select_ident(net, iph, segs);
+	}
+}
+
+static inline void ip_select_ident(struct net *net, struct sk_buff *skb,
+				   struct sock *sk)
+{
+	ip_select_ident_segs(net, skb, sk, 1);
 }
 
 static inline __wsum inet_compute_pseudo(struct sk_buff *skb, int proto)

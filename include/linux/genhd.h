@@ -201,7 +201,7 @@ struct gendisk {
 	struct blk_integrity *integrity;
 #endif
 	int node_id;
-	struct badblocks *bb;
+	RH_KABI_EXTEND(struct badblocks *bb)
 };
 
 static inline struct gendisk *part_to_disk(struct hd_struct *part)

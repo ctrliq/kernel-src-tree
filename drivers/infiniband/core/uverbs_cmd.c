@@ -993,7 +993,6 @@ ssize_t ib_uverbs_reg_mr(struct ib_uverbs_file *file,
 	mr->pd      = pd;
 	mr->uobject = uobj;
 	atomic_inc(&pd->usecnt);
-	atomic_set(&mr->usecnt, 0);
 
 	uobj->object = mr;
 	ret = idr_add_uobj(&ib_uverbs_mr_idr, uobj);
@@ -1091,11 +1090,6 @@ ssize_t ib_uverbs_rereg_mr(struct ib_uverbs_file *file,
 		}
 	}
 
-	if (atomic_read(&mr->usecnt)) {
-		ret = -EBUSY;
-		goto put_uobj_pd;
-	}
-
 	old_pd = mr->pd;
 	ret = mr->device->rereg_user_mr(mr, cmd.flags, cmd.start,
 					cmd.length, cmd.hca_va,
@@ -1180,6 +1174,7 @@ ssize_t ib_uverbs_alloc_mw(struct ib_uverbs_file *file,
 	struct ib_uobject             *uobj;
 	struct ib_pd                  *pd;
 	struct ib_mw                  *mw;
+	struct ib_udata		       udata;
 	int                            ret;
 
 	if (out_len < sizeof(resp))
@@ -1201,7 +1196,12 @@ ssize_t ib_uverbs_alloc_mw(struct ib_uverbs_file *file,
 		goto err_free;
 	}
 
-	mw = pd->device->alloc_mw(pd, cmd.mw_type);
+	INIT_UDATA(&udata, buf + sizeof(cmd),
+		   (unsigned long)cmd.response + sizeof(resp),
+		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+		   out_len - sizeof(resp));
+
+	mw = pd->device->alloc_mw(pd, cmd.mw_type, &udata);
 	if (IS_ERR(mw)) {
 		ret = PTR_ERR(mw);
 		goto err_put;
@@ -1243,7 +1243,7 @@ err_copy:
 	idr_remove_uobj(&ib_uverbs_mw_idr, uobj);
 
 err_unalloc:
-	ib_dealloc_mw(mw);
+	uverbs_dealloc_mw(mw);
 
 err_put:
 	put_pd_read(pd);
@@ -1272,7 +1272,7 @@ ssize_t ib_uverbs_dealloc_mw(struct ib_uverbs_file *file,
 
 	mw = uobj->object;
 
-	ret = ib_dealloc_mw(mw);
+	ret = uverbs_dealloc_mw(mw);
 	if (!ret)
 		uobj->live = 0;
 
@@ -2337,7 +2337,7 @@ ssize_t ib_uverbs_modify_qp(struct ib_uverbs_file *file,
 	attr->alt_ah_attr.port_num 	    = cmd.alt_dest.port_num;
 
 	if (qp->real_qp == qp) {
-		ret = ib_resolve_eth_l2_attrs(qp, attr, &cmd.attr_mask);
+		ret = ib_resolve_eth_dmac(qp, attr, &cmd.attr_mask);
 		if (ret)
 			goto release_qp;
 		ret = qp->device->modify_qp(qp, attr,
@@ -2419,6 +2419,12 @@ ssize_t ib_uverbs_destroy_qp(struct ib_uverbs_file *file,
 	return in_len;
 }
 
+static void *alloc_wr(size_t wr_size, __u32 num_sge)
+{
+	return kmalloc(ALIGN(wr_size, sizeof (struct ib_sge)) +
+			 num_sge * sizeof (struct ib_sge), GFP_KERNEL);
+};
+
 ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
 			    struct ib_device *ib_dev,
 			    const char __user *buf, int in_len,
@@ -2432,6 +2438,7 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
 	int                             i, sg_ind;
 	int				is_ud;
 	ssize_t                         ret = -EINVAL;
+	size_t                          next_size;
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
@@ -2467,12 +2474,85 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
 			goto out_put;
 		}
 
-		next = kmalloc(ALIGN(sizeof *next, sizeof (struct ib_sge)) +
-			       user_wr->num_sge * sizeof (struct ib_sge),
-			       GFP_KERNEL);
-		if (!next) {
-			ret = -ENOMEM;
+		if (is_ud) {
+			struct ib_ud_wr *ud;
+
+			if (user_wr->opcode != IB_WR_SEND &&
+			    user_wr->opcode != IB_WR_SEND_WITH_IMM) {
+				ret = -EINVAL;
+				goto out_put;
+			}
+
+			next_size = sizeof(*ud);
+			ud = alloc_wr(next_size, user_wr->num_sge);
+			if (!ud) {
+				ret = -ENOMEM;
+				goto out_put;
+			}
+
+			ud->ah = idr_read_ah(user_wr->wr.ud.ah, file->ucontext);
+			if (!ud->ah) {
+				kfree(ud);
+				ret = -EINVAL;
+				goto out_put;
+			}
+			ud->remote_qpn = user_wr->wr.ud.remote_qpn;
+			ud->remote_qkey = user_wr->wr.ud.remote_qkey;
+
+			next = &ud->wr;
+		} else if (user_wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
+			   user_wr->opcode == IB_WR_RDMA_WRITE ||
+			   user_wr->opcode == IB_WR_RDMA_READ) {
+			struct ib_rdma_wr *rdma;
+
+			next_size = sizeof(*rdma);
+			rdma = alloc_wr(next_size, user_wr->num_sge);
+			if (!rdma) {
+				ret = -ENOMEM;
+				goto out_put;
+			}
+
+			rdma->remote_addr = user_wr->wr.rdma.remote_addr;
+			rdma->rkey = user_wr->wr.rdma.rkey;
+
+			next = &rdma->wr;
+		} else if (user_wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+			   user_wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD) {
+			struct ib_atomic_wr *atomic;
+
+			next_size = sizeof(*atomic);
+			atomic = alloc_wr(next_size, user_wr->num_sge);
+			if (!atomic) {
+				ret = -ENOMEM;
+				goto out_put;
+			}
+
+			atomic->remote_addr = user_wr->wr.atomic.remote_addr;
+			atomic->compare_add = user_wr->wr.atomic.compare_add;
+			atomic->swap = user_wr->wr.atomic.swap;
+			atomic->rkey = user_wr->wr.atomic.rkey;
+
+			next = &atomic->wr;
+		} else if (user_wr->opcode == IB_WR_SEND ||
+			   user_wr->opcode == IB_WR_SEND_WITH_IMM ||
+			   user_wr->opcode == IB_WR_SEND_WITH_INV) {
+			next_size = sizeof(*next);
+			next = alloc_wr(next_size, user_wr->num_sge);
+			if (!next) {
+				ret = -ENOMEM;
+				goto out_put;
+			}
+		} else {
+			ret = -EINVAL;
 			goto out_put;
+		}
+
+		if (user_wr->opcode == IB_WR_SEND_WITH_IMM ||
+		    user_wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM) {
+			next->ex.imm_data =
+					(__be32 __force) user_wr->ex.imm_data;
+		} else if (user_wr->opcode == IB_WR_SEND_WITH_INV) {
+			next->ex.invalidate_rkey = user_wr->ex.invalidate_rkey;
 		}
 
 		if (!last)
@@ -2487,63 +2567,9 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
 		next->opcode     = user_wr->opcode;
 		next->send_flags = user_wr->send_flags;
 
-		if (is_ud) {
-			if (next->opcode != IB_WR_SEND &&
-			    next->opcode != IB_WR_SEND_WITH_IMM) {
-				ret = -EINVAL;
-				goto out_put;
-			}
-
-			next->wr.ud.ah = idr_read_ah(user_wr->wr.ud.ah,
-						     file->ucontext);
-			if (!next->wr.ud.ah) {
-				ret = -EINVAL;
-				goto out_put;
-			}
-			next->wr.ud.remote_qpn  = user_wr->wr.ud.remote_qpn;
-			next->wr.ud.remote_qkey = user_wr->wr.ud.remote_qkey;
-			if (next->opcode == IB_WR_SEND_WITH_IMM)
-				next->ex.imm_data =
-					(__be32 __force) user_wr->ex.imm_data;
-		} else {
-			switch (next->opcode) {
-			case IB_WR_RDMA_WRITE_WITH_IMM:
-				next->ex.imm_data =
-					(__be32 __force) user_wr->ex.imm_data;
-			case IB_WR_RDMA_WRITE:
-			case IB_WR_RDMA_READ:
-				next->wr.rdma.remote_addr =
-					user_wr->wr.rdma.remote_addr;
-				next->wr.rdma.rkey        =
-					user_wr->wr.rdma.rkey;
-				break;
-			case IB_WR_SEND_WITH_IMM:
-				next->ex.imm_data =
-					(__be32 __force) user_wr->ex.imm_data;
-				break;
-			case IB_WR_SEND_WITH_INV:
-				next->ex.invalidate_rkey =
-					user_wr->ex.invalidate_rkey;
-				break;
-			case IB_WR_ATOMIC_CMP_AND_SWP:
-			case IB_WR_ATOMIC_FETCH_AND_ADD:
-				next->wr.atomic.remote_addr =
-					user_wr->wr.atomic.remote_addr;
-				next->wr.atomic.compare_add =
-					user_wr->wr.atomic.compare_add;
-				next->wr.atomic.swap = user_wr->wr.atomic.swap;
-				next->wr.atomic.rkey = user_wr->wr.atomic.rkey;
-			case IB_WR_SEND:
-				break;
-			default:
-				ret = -EINVAL;
-				goto out_put;
-			}
-		}
-
 		if (next->num_sge) {
 			next->sg_list = (void *) next +
-				ALIGN(sizeof *next, sizeof (struct ib_sge));
+				ALIGN(next_size, sizeof(struct ib_sge));
 			if (copy_from_user(next->sg_list,
 					   buf + sizeof cmd +
 					   cmd.wr_count * cmd.wqe_size +
@@ -2574,8 +2600,8 @@ out_put:
 	put_qp_read(qp);
 
 	while (wr) {
-		if (is_ud && wr->wr.ud.ah)
-			put_ah_read(wr->wr.ud.ah);
+		if (is_ud && ud_wr(wr)->ah)
+			put_ah_read(ud_wr(wr)->ah);
 		next = wr->next;
 		kfree(wr);
 		wr = next;

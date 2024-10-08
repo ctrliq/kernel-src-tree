@@ -28,7 +28,7 @@
 
 #define to_mmc_driver(d)	container_of(d, struct mmc_driver, drv)
 
-static ssize_t mmc_type_show(struct device *dev,
+static ssize_t type_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct mmc_card *card = mmc_dev_to_card(dev);
@@ -46,11 +46,13 @@ static ssize_t mmc_type_show(struct device *dev,
 		return -EFAULT;
 	}
 }
+static DEVICE_ATTR_RO(type);
 
-static struct device_attribute mmc_dev_attrs[] = {
-	__ATTR(type, S_IRUGO, mmc_type_show, NULL),
-	__ATTR_NULL,
+static struct attribute *mmc_dev_attrs[] = {
+	&dev_attr_type.attr,
+	NULL,
 };
+ATTRIBUTE_GROUPS(mmc_dev);
 
 /*
  * This currently matches any MMC driver to any MMC card - drivers
@@ -172,7 +174,7 @@ static int mmc_bus_resume(struct device *dev)
 }
 #endif
 
-#ifdef CONFIG_PM_RUNTIME
+#ifdef CONFIG_PM
 static int mmc_runtime_suspend(struct device *dev)
 {
 	struct mmc_card *card = mmc_dev_to_card(dev);
@@ -188,7 +190,7 @@ static int mmc_runtime_resume(struct device *dev)
 
 	return host->bus_ops->runtime_resume(host);
 }
-#endif /* !CONFIG_PM_RUNTIME */
+#endif /* !CONFIG_PM */
 
 static const struct dev_pm_ops mmc_bus_pm_ops = {
 	SET_RUNTIME_PM_OPS(mmc_runtime_suspend, mmc_runtime_resume, NULL)
@@ -197,7 +199,7 @@ static const struct dev_pm_ops mmc_bus_pm_ops = {
 
 static struct bus_type mmc_bus_type = {
 	.name		= "mmc",
-	.dev_attrs	= mmc_dev_attrs,
+	.dev_groups	= mmc_dev_groups,
 	.match		= mmc_bus_match,
 	.uevent		= mmc_bus_uevent,
 	.probe		= mmc_bus_probe,
@@ -326,16 +328,17 @@ int mmc_add_card(struct mmc_card *card)
 	if (mmc_host_is_spi(card->host)) {
 		pr_info("%s: new %s%s%s card on SPI\n",
 			mmc_hostname(card->host),
-			mmc_card_highspeed(card) ? "high speed " : "",
-			mmc_card_ddr_mode(card) ? "DDR " : "",
+			mmc_card_hs(card) ? "high speed " : "",
+			mmc_card_ddr52(card) ? "DDR " : "",
 			type);
 	} else {
 		pr_info("%s: new %s%s%s%s%s card at address %04x\n",
 			mmc_hostname(card->host),
 			mmc_card_uhs(card) ? "ultra high speed " :
-			(mmc_card_highspeed(card) ? "high speed " : ""),
+			(mmc_card_hs(card) ? "high speed " : ""),
+			mmc_card_hs400(card) ? "HS400 " :
 			(mmc_card_hs200(card) ? "HS200 " : ""),
-			mmc_card_ddr_mode(card) ? "DDR " : "",
+			mmc_card_ddr52(card) ? "DDR " : "",
 			uhs_bus_speed_mode, type, card->rca);
 	}
 

@@ -34,6 +34,7 @@ static struct {
 	bool exclude_guest;
 	bool mmap2;
 	bool cloexec;
+	bool lbr_flags;
 } perf_missing_features;
 
 static int perf_evsel__no_extra_init(struct perf_evsel *evsel __maybe_unused)
@@ -205,6 +206,7 @@ void perf_evsel__init(struct perf_evsel *evsel,
 	evsel->scale	   = 1.0;
 	evsel->evlist	   = NULL;
 	INIT_LIST_HEAD(&evsel->node);
+	INIT_LIST_HEAD(&evsel->config_terms);
 	perf_evsel__object.init(evsel);
 	evsel->sample_size = __perf_evsel__sample_size(attr->sample_type);
 	perf_evsel__calc_id_pos(evsel);
@@ -568,7 +570,9 @@ perf_evsel__config_callgraph(struct perf_evsel *evsel,
 			} else {
 				perf_evsel__set_sample_bit(evsel, BRANCH_STACK);
 				attr->branch_sample_type = PERF_SAMPLE_BRANCH_USER |
-							PERF_SAMPLE_BRANCH_CALL_STACK;
+							PERF_SAMPLE_BRANCH_CALL_STACK |
+							PERF_SAMPLE_BRANCH_NO_CYCLES |
+							PERF_SAMPLE_BRANCH_NO_FLAGS;
 			}
 		} else
 			 pr_warning("Cannot use LBR callstack with branch stack. "
@@ -591,6 +595,106 @@ perf_evsel__config_callgraph(struct perf_evsel *evsel,
 	if (function) {
 		pr_info("Disabling user space callchains for function trace event.\n");
 		attr->exclude_callchain_user = 1;
+	}
+}
+
+static void
+perf_evsel__reset_callgraph(struct perf_evsel *evsel,
+			    struct callchain_param *param)
+{
+	struct perf_event_attr *attr = &evsel->attr;
+
+	perf_evsel__reset_sample_bit(evsel, CALLCHAIN);
+	if (param->record_mode == CALLCHAIN_LBR) {
+		perf_evsel__reset_sample_bit(evsel, BRANCH_STACK);
+		attr->branch_sample_type &= ~(PERF_SAMPLE_BRANCH_USER |
+					      PERF_SAMPLE_BRANCH_CALL_STACK);
+	}
+	if (param->record_mode == CALLCHAIN_DWARF) {
+		perf_evsel__reset_sample_bit(evsel, REGS_USER);
+		perf_evsel__reset_sample_bit(evsel, STACK_USER);
+	}
+}
+
+static void apply_config_terms(struct perf_evsel *evsel,
+			       struct record_opts *opts)
+{
+	struct perf_evsel_config_term *term;
+	struct list_head *config_terms = &evsel->config_terms;
+	struct perf_event_attr *attr = &evsel->attr;
+	struct callchain_param param;
+	u32 dump_size = 0;
+	char *callgraph_buf = NULL;
+
+	/* callgraph default */
+	param.record_mode = callchain_param.record_mode;
+
+	list_for_each_entry(term, config_terms, list) {
+		switch (term->type) {
+		case PERF_EVSEL__CONFIG_TERM_PERIOD:
+			attr->sample_period = term->val.period;
+			attr->freq = 0;
+			break;
+		case PERF_EVSEL__CONFIG_TERM_FREQ:
+			attr->sample_freq = term->val.freq;
+			attr->freq = 1;
+			break;
+		case PERF_EVSEL__CONFIG_TERM_TIME:
+			if (term->val.time)
+				perf_evsel__set_sample_bit(evsel, TIME);
+			else
+				perf_evsel__reset_sample_bit(evsel, TIME);
+			break;
+		case PERF_EVSEL__CONFIG_TERM_CALLGRAPH:
+			callgraph_buf = term->val.callgraph;
+			break;
+		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
+			dump_size = term->val.stack_user;
+			break;
+		case PERF_EVSEL__CONFIG_TERM_INHERIT:
+			/*
+			 * attr->inherit should has already been set by
+			 * perf_evsel__config. If user explicitly set
+			 * inherit using config terms, override global
+			 * opt->no_inherit setting.
+			 */
+			attr->inherit = term->val.inherit ? 1 : 0;
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* User explicitly set per-event callgraph, clear the old setting and reset. */
+	if ((callgraph_buf != NULL) || (dump_size > 0)) {
+
+		/* parse callgraph parameters */
+		if (callgraph_buf != NULL) {
+			if (!strcmp(callgraph_buf, "no")) {
+				param.enabled = false;
+				param.record_mode = CALLCHAIN_NONE;
+			} else {
+				param.enabled = true;
+				if (parse_callchain_record(callgraph_buf, &param)) {
+					pr_err("per-event callgraph setting for %s failed. "
+					       "Apply callgraph global setting for it\n",
+					       evsel->name);
+					return;
+				}
+			}
+		}
+		if (dump_size > 0) {
+			dump_size = round_up(dump_size, sizeof(u64));
+			param.dump_size = dump_size;
+		}
+
+		/* If global callgraph set, clear it */
+		if (callchain_param.enabled)
+			perf_evsel__reset_callgraph(evsel, &callchain_param);
+
+		/* set perf-event callgraph */
+		if (param.enabled)
+			perf_evsel__config_callgraph(evsel, opts, &param);
 	}
 }
 
@@ -746,6 +850,9 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 	attr->mmap2 = track && !perf_missing_features.mmap2;
 	attr->comm  = track;
 
+	if (opts->record_switch_events)
+		attr->context_switch = track;
+
 	if (opts->sample_transaction)
 		perf_evsel__set_sample_bit(evsel, TRANSACTION);
 
@@ -776,6 +883,25 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 		attr->disabled = 0;
 		attr->enable_on_exec = 0;
 	}
+
+	if (evsel->precise_max)
+		perf_event_attr__set_max_precise_ip(attr);
+
+	if (opts->all_user) {
+		attr->exclude_kernel = 1;
+		attr->exclude_user   = 0;
+	}
+
+	if (opts->all_kernel) {
+		attr->exclude_kernel = 0;
+		attr->exclude_user   = 1;
+	}
+
+	/*
+	 * Apply event specific term settings,
+	 * it overloads any global configuration.
+	 */
+	apply_config_terms(evsel, opts);
 }
 
 static int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
@@ -912,6 +1038,16 @@ static void perf_evsel__free_id(struct perf_evsel *evsel)
 	zfree(&evsel->id);
 }
 
+static void perf_evsel__free_config_terms(struct perf_evsel *evsel)
+{
+	struct perf_evsel_config_term *term, *h;
+
+	list_for_each_entry_safe(term, h, &evsel->config_terms, list) {
+		list_del(&term->list);
+		free(term);
+	}
+}
+
 void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
 {
 	int cpu, thread;
@@ -932,6 +1068,7 @@ void perf_evsel__exit(struct perf_evsel *evsel)
 	assert(evsel->evlist == NULL);
 	perf_evsel__free_fd(evsel);
 	perf_evsel__free_id(evsel);
+	perf_evsel__free_config_terms(evsel);
 	close_cgroup(evsel->cgrp);
 	cpu_map__put(evsel->cpus);
 	cpu_map__put(evsel->own_cpus);
@@ -1144,6 +1281,7 @@ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
 	PRINT_ATTRf(exclude_callchain_user, p_unsigned);
 	PRINT_ATTRf(mmap2, p_unsigned);
 	PRINT_ATTRf(comm_exec, p_unsigned);
+	PRINT_ATTRf(context_switch, p_unsigned);
 
 	PRINT_ATTRn("{ wakeup_events, wakeup_watermark }", wakeup_events, p_unsigned);
 	PRINT_ATTRf(bp_type, p_unsigned);
@@ -1193,6 +1331,9 @@ fallback_missing_features:
 		evsel->attr.mmap2 = 0;
 	if (perf_missing_features.exclude_guest)
 		evsel->attr.exclude_guest = evsel->attr.exclude_host = 0;
+	if (perf_missing_features.lbr_flags)
+		evsel->attr.branch_sample_type &= ~(PERF_SAMPLE_BRANCH_NO_FLAGS |
+				     PERF_SAMPLE_BRANCH_NO_CYCLES);
 retry_sample_id:
 	if (perf_missing_features.sample_id_all)
 		evsel->attr.sample_id_all = 0;
@@ -1274,6 +1415,12 @@ try_fallback:
 	} else if (!perf_missing_features.sample_id_all) {
 		perf_missing_features.sample_id_all = true;
 		goto retry_sample_id;
+	} else if (!perf_missing_features.lbr_flags &&
+			(evsel->attr.branch_sample_type &
+			 (PERF_SAMPLE_BRANCH_NO_CYCLES |
+			  PERF_SAMPLE_BRANCH_NO_FLAGS))) {
+		perf_missing_features.lbr_flags = true;
+		goto fallback_missing_features;
 	}
 
 out_close:

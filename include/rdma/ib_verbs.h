@@ -51,7 +51,12 @@
 #include <linux/socket.h>
 #include <linux/irq_poll.h>
 #include <uapi/linux/if_ether.h>
+#include <net/ipv6.h>
+#include <net/ip.h>
+#include <linux/string.h>
+#include <linux/slab.h>
 
+#include <linux/if_link.h>
 #include <linux/atomic.h>
 #include <linux/mmu_notifier.h>
 #include <asm/uaccess.h>
@@ -69,7 +74,17 @@ union ib_gid {
 
 extern union ib_gid zgid;
 
+enum ib_gid_type {
+	/* If link layer is Ethernet, this is RoCE V1 */
+	IB_GID_TYPE_IB        = 0,
+	IB_GID_TYPE_ROCE      = 0,
+	IB_GID_TYPE_ROCE_UDP_ENCAP = 1,
+	IB_GID_TYPE_SIZE
+};
+
+#define ROCE_V2_UDP_DPORT      4791
 struct ib_gid_attr {
+	enum ib_gid_type	gid_type;
 	struct net_device	*ndev;
 };
 
@@ -104,6 +119,35 @@ enum rdma_protocol_type {
 
 __attribute_const__ enum rdma_transport_type
 rdma_node_get_transport(enum rdma_node_type node_type);
+
+enum rdma_network_type {
+	RDMA_NETWORK_IB,
+	RDMA_NETWORK_ROCE_V1 = RDMA_NETWORK_IB,
+	RDMA_NETWORK_IPV4,
+	RDMA_NETWORK_IPV6
+};
+
+static inline enum ib_gid_type ib_network_to_gid_type(enum rdma_network_type network_type)
+{
+	if (network_type == RDMA_NETWORK_IPV4 ||
+	    network_type == RDMA_NETWORK_IPV6)
+		return IB_GID_TYPE_ROCE_UDP_ENCAP;
+
+	/* IB_GID_TYPE_IB same as RDMA_NETWORK_ROCE_V1 */
+	return IB_GID_TYPE_IB;
+}
+
+static inline enum rdma_network_type ib_gid_to_network_type(enum ib_gid_type gid_type,
+							    union ib_gid *gid)
+{
+	if (gid_type == IB_GID_TYPE_IB)
+		return RDMA_NETWORK_IB;
+
+	if (ipv6_addr_v4mapped((struct in6_addr *)gid))
+		return RDMA_NETWORK_IPV4;
+	else
+		return RDMA_NETWORK_IPV6;
+}
 
 enum rdma_link_layer {
 	IB_LINK_LAYER_UNSPECIFIED,
@@ -173,7 +217,10 @@ enum ib_device_cap_flags {
 	IB_DEVICE_CROSS_CHANNEL		= (1 << 27),
 	IB_DEVICE_MANAGED_FLOW_STEERING		= (1 << 29),
 	IB_DEVICE_SIGNATURE_HANDOVER		= (1 << 30),
-	IB_DEVICE_ON_DEMAND_PAGING		= (1 << 31),
+	IB_DEVICE_ON_DEMAND_PAGING		= (1ULL << 31),
+	IB_DEVICE_SG_GAPS_REG			= (1ULL << 32),
+	IB_DEVICE_VIRTUAL_FUNCTION		= (1ULL << 33),
+	IB_DEVICE_RAW_SCATTER_FCS		= (1ULL << 34),
 };
 
 enum ib_signature_prot_cap {
@@ -425,6 +472,7 @@ static inline struct rdma_hw_stats *rdma_alloc_hw_stats_struct(
 #define RDMA_CORE_CAP_PROT_IB           0x00100000
 #define RDMA_CORE_CAP_PROT_ROCE         0x00200000
 #define RDMA_CORE_CAP_PROT_IWARP        0x00400000
+#define RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP 0x00800000
 
 #define RDMA_CORE_PORT_IBA_IB          (RDMA_CORE_CAP_PROT_IB  \
 					| RDMA_CORE_CAP_IB_MAD \
@@ -433,6 +481,12 @@ static inline struct rdma_hw_stats *rdma_alloc_hw_stats_struct(
 					| RDMA_CORE_CAP_IB_SA  \
 					| RDMA_CORE_CAP_AF_IB)
 #define RDMA_CORE_PORT_IBA_ROCE        (RDMA_CORE_CAP_PROT_ROCE \
+					| RDMA_CORE_CAP_IB_MAD  \
+					| RDMA_CORE_CAP_IB_CM   \
+					| RDMA_CORE_CAP_AF_IB   \
+					| RDMA_CORE_CAP_ETH_AH)
+#define RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP			\
+					(RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP \
 					| RDMA_CORE_CAP_IB_MAD  \
 					| RDMA_CORE_CAP_IB_CM   \
 					| RDMA_CORE_CAP_AF_IB   \
@@ -553,6 +607,17 @@ struct ib_grh {
 	union ib_gid	dgid;
 };
 
+union rdma_network_hdr {
+	struct ib_grh ibgrh;
+	struct {
+		/* The IB spec states that if it's IPv4, the header
+		 * is located in the last 20 bytes of the header.
+		 */
+		u8		reserved[20];
+		struct iphdr	roce4grh;
+	};
+};
+
 enum {
 	IB_MULTICAST_QPN = 0xffffff
 };
@@ -608,10 +673,15 @@ __attribute_const__ int ib_rate_to_mbps(enum ib_rate rate);
  * @IB_MR_TYPE_SIGNATURE:     memory region that is used for
  *                            signature operations (data-integrity
  *                            capable regions)
+ * @IB_MR_TYPE_SG_GAPS:       memory region that is capable to
+ *                            register any arbitrary sg lists (without
+ *                            the normal mr constraints - see
+ *                            ib_map_mr_sg)
  */
 enum ib_mr_type {
 	IB_MR_TYPE_MEM_REG,
 	IB_MR_TYPE_SIGNATURE,
+	IB_MR_TYPE_SG_GAPS,
 };
 
 /**
@@ -769,10 +839,9 @@ enum ib_wc_opcode {
 	IB_WC_RDMA_READ,
 	IB_WC_COMP_SWAP,
 	IB_WC_FETCH_ADD,
-	IB_WC_BIND_MW,
 	IB_WC_LSO,
 	IB_WC_LOCAL_INV,
-	IB_WC_FAST_REG_MR,
+	IB_WC_REG_MR,
 	IB_WC_MASKED_COMP_SWAP,
 	IB_WC_MASKED_FETCH_ADD,
 /*
@@ -790,6 +859,7 @@ enum ib_wc_flags {
 	IB_WC_IP_CSUM_OK	= (1<<3),
 	IB_WC_WITH_SMAC		= (1<<4),
 	IB_WC_WITH_VLAN		= (1<<5),
+	IB_WC_WITH_NETWORK_HDR_TYPE	= (1<<6),
 };
 
 struct ib_wc {
@@ -815,6 +885,7 @@ struct ib_wc {
 	u8			port_num;	/* valid only for DR SMPs on switches */
 	u8			smac[ETH_ALEN];
 	u16			vlan_id;
+	u8			network_hdr_type;
 };
 
 enum ib_cq_notify_flags {
@@ -860,6 +931,13 @@ struct ib_qp_cap {
 	u32	max_send_sge;
 	u32	max_recv_sge;
 	u32	max_inline_data;
+
+	/*
+	 * Maximum number of rdma_rw_ctx structures in flight at a time.
+	 * ib_create_qp() will calculate the right amount of neededed WRs
+	 * and MRs based on this.
+	 */
+	u32	max_rdma_ctxs;
 };
 
 enum ib_sig_type {
@@ -932,7 +1010,11 @@ struct ib_qp_init_attr {
 	enum ib_sig_type	sq_sig_type;
 	enum ib_qp_type		qp_type;
 	enum ib_qp_create_flags	create_flags;
-	u8			port_num; /* special QP types only */
+
+	/*
+	 * Only needed for special QP types, or when using the RW API.
+	 */
+	u8			port_num;
 };
 
 struct ib_qp_open_attr {
@@ -1066,10 +1148,9 @@ enum ib_wr_opcode {
 	IB_WR_SEND_WITH_INV,
 	IB_WR_RDMA_READ_WITH_INV,
 	IB_WR_LOCAL_INV,
-	IB_WR_FAST_REG_MR,
+	IB_WR_REG_MR,
 	IB_WR_MASKED_ATOMIC_CMP_AND_SWP,
 	IB_WR_MASKED_ATOMIC_FETCH_AND_ADD,
-	IB_WR_BIND_MW,
 	IB_WR_REG_SIG_MR,
 	/* reserve values for low level drivers' internal use.
 	 * These values will not be used at all in the ib core layer.
@@ -1104,29 +1185,6 @@ struct ib_sge {
 	u32	lkey;
 };
 
-struct ib_fast_reg_page_list {
-	struct ib_device       *device;
-	u64		       *page_list;
-	unsigned int		max_page_list_len;
-};
-
-/**
- * struct ib_mw_bind_info - Parameters for a memory window bind operation.
- * @mr: A memory region to bind the memory window to.
- * @addr: The address where the memory window should begin.
- * @length: The length of the memory window, in bytes.
- * @mw_access_flags: Access flags from enum ib_access_flags for the window.
- *
- * This struct contains the shared parameters for type 1 and type 2
- * memory window bind operations.
- */
-struct ib_mw_bind_info {
-	struct ib_mr   *mr;
-	u64		addr;
-	u64		length;
-	int		mw_access_flags;
-};
-
 struct ib_cqe {
 	void (*done)(struct ib_cq *cq, struct ib_wc *wc);
 };
@@ -1145,53 +1203,75 @@ struct ib_send_wr {
 		__be32		imm_data;
 		u32		invalidate_rkey;
 	} ex;
-	union {
-		struct {
-			u64	remote_addr;
-			u32	rkey;
-		} rdma;
-		struct {
-			u64	remote_addr;
-			u64	compare_add;
-			u64	swap;
-			u64	compare_add_mask;
-			u64	swap_mask;
-			u32	rkey;
-		} atomic;
-		struct {
-			struct ib_ah *ah;
-			void   *header;
-			int     hlen;
-			int     mss;
-			u32	remote_qpn;
-			u32	remote_qkey;
-			u16	pkey_index; /* valid for GSI only */
-			u8	port_num;   /* valid for DR SMPs on switch only */
-		} ud;
-		struct {
-			u64				iova_start;
-			struct ib_fast_reg_page_list   *page_list;
-			unsigned int			page_shift;
-			unsigned int			page_list_len;
-			u32				length;
-			int				access_flags;
-			u32				rkey;
-		} fast_reg;
-		struct {
-			struct ib_mw            *mw;
-			/* The new rkey for the memory window. */
-			u32                      rkey;
-			struct ib_mw_bind_info   bind_info;
-		} bind_mw;
-		struct {
-			struct ib_sig_attrs    *sig_attrs;
-			struct ib_mr	       *sig_mr;
-			int			access_flags;
-			struct ib_sge	       *prot;
-		} sig_handover;
-	} wr;
-	u32			xrc_remote_srq_num;	/* XRC TGT QPs only */
 };
+
+struct ib_rdma_wr {
+	struct ib_send_wr	wr;
+	u64			remote_addr;
+	u32			rkey;
+};
+
+static inline struct ib_rdma_wr *rdma_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_rdma_wr, wr);
+}
+
+struct ib_atomic_wr {
+	struct ib_send_wr	wr;
+	u64			remote_addr;
+	u64			compare_add;
+	u64			swap;
+	u64			compare_add_mask;
+	u64			swap_mask;
+	u32			rkey;
+};
+
+static inline struct ib_atomic_wr *atomic_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_atomic_wr, wr);
+}
+
+struct ib_ud_wr {
+	struct ib_send_wr	wr;
+	struct ib_ah		*ah;
+	void			*header;
+	int			hlen;
+	int			mss;
+	u32			remote_qpn;
+	u32			remote_qkey;
+	u16			pkey_index; /* valid for GSI only */
+	u8			port_num;   /* valid for DR SMPs on switch only */
+};
+
+static inline struct ib_ud_wr *ud_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_ud_wr, wr);
+}
+
+struct ib_reg_wr {
+	struct ib_send_wr	wr;
+	struct ib_mr		*mr;
+	u32			key;
+	int			access;
+};
+
+static inline struct ib_reg_wr *reg_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_reg_wr, wr);
+}
+
+struct ib_sig_handover_wr {
+	struct ib_send_wr	wr;
+	struct ib_sig_attrs    *sig_attrs;
+	struct ib_mr	       *sig_mr;
+	int			access_flags;
+	struct ib_sge	       *prot;
+};
+
+static inline struct ib_sig_handover_wr *sig_handover_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_sig_handover_wr, wr);
+}
 
 struct ib_recv_wr {
 	struct ib_recv_wr      *next;
@@ -1213,28 +1293,15 @@ enum ib_access_flags {
 	IB_ACCESS_ON_DEMAND     = (1<<6),
 };
 
-struct ib_phys_buf {
-	u64      addr;
-	u64      size;
-};
-
+/*
+ * XXX: these are apparently used for ->rereg_user_mr, no idea why they
+ * are hidden here instead of a uapi header!
+ */
 enum ib_mr_rereg_flags {
 	IB_MR_REREG_TRANS	= 1,
 	IB_MR_REREG_PD		= (1<<1),
 	IB_MR_REREG_ACCESS	= (1<<2),
 	IB_MR_REREG_SUPPORTED	= ((IB_MR_REREG_ACCESS << 1) - 1)
-};
-
-/**
- * struct ib_mw_bind - Parameters for a type 1 memory window bind operation.
- * @wr_id:      Work request id.
- * @send_flags: Flags from ib_send_flags enum.
- * @bind_info:  More parameters of the bind operation.
- */
-struct ib_mw_bind {
-	u64                    wr_id;
-	int                    send_flags;
-	struct ib_mw_bind_info bind_info;
 };
 
 struct ib_fmr_attr {
@@ -1366,9 +1433,14 @@ struct ib_qp {
 	struct ib_pd	       *pd;
 	struct ib_cq	       *send_cq;
 	struct ib_cq	       *recv_cq;
+	spinlock_t		mr_lock;
+	int			mrs_used;
+	struct list_head	rdma_mrs;
+	struct list_head	sig_mrs;
 	struct ib_srq	       *srq;
 	struct ib_xrcd	       *xrcd; /* XRC TGT QPs only */
 	struct list_head	xrcd_list;
+
 	/* count times opened, mcast attaches, flow attaches */
 	atomic_t		usecnt;
 	struct list_head	open_list;
@@ -1383,10 +1455,16 @@ struct ib_qp {
 struct ib_mr {
 	struct ib_device  *device;
 	struct ib_pd	  *pd;
-	struct ib_uobject *uobject;
 	u32		   lkey;
 	u32		   rkey;
-	atomic_t	   usecnt; /* count number of MWs */
+	u64		   iova;
+	u32		   length;
+	unsigned int	   page_size;
+	bool		   need_inval;
+	union {
+		struct ib_uobject	*uobject;	/* user */
+		struct list_head	qp_entry;	/* FR */
+	};
 };
 
 struct ib_mw {
@@ -1773,11 +1851,6 @@ struct ib_device {
 						      int wc_cnt);
 	struct ib_mr *             (*get_dma_mr)(struct ib_pd *pd,
 						 int mr_access_flags);
-	struct ib_mr *             (*reg_phys_mr)(struct ib_pd *pd,
-						  struct ib_phys_buf *phys_buf_array,
-						  int num_phys_buf,
-						  int mr_access_flags,
-						  u64 *iova_start);
 	struct ib_mr *             (*reg_user_mr)(struct ib_pd *pd,
 						  u64 start, u64 length,
 						  u64 virt_addr,
@@ -1794,21 +1867,13 @@ struct ib_device {
 	struct ib_mr *		   (*alloc_mr)(struct ib_pd *pd,
 					       enum ib_mr_type mr_type,
 					       u32 max_num_sg);
-	struct ib_fast_reg_page_list * (*alloc_fast_reg_page_list)(struct ib_device *device,
-								   int page_list_len);
-	void			   (*free_fast_reg_page_list)(struct ib_fast_reg_page_list *page_list);
-	int                        (*rereg_phys_mr)(struct ib_mr *mr,
-						    int mr_rereg_mask,
-						    struct ib_pd *pd,
-						    struct ib_phys_buf *phys_buf_array,
-						    int num_phys_buf,
-						    int mr_access_flags,
-						    u64 *iova_start);
+	int                        (*map_mr_sg)(struct ib_mr *mr,
+						struct scatterlist *sg,
+						int sg_nents,
+						unsigned int *sg_offset);
 	struct ib_mw *             (*alloc_mw)(struct ib_pd *pd,
-					       enum ib_mw_type type);
-	int                        (*bind_mw)(struct ib_qp *qp,
-					      struct ib_mw *mw,
-					      struct ib_mw_bind *mw_bind);
+					       enum ib_mw_type type,
+					       struct ib_udata *udata);
 	int                        (*dealloc_mw)(struct ib_mw *mw);
 	struct ib_fmr *	           (*alloc_fmr)(struct ib_pd *pd,
 						int mr_access_flags,
@@ -1846,6 +1911,16 @@ struct ib_device {
 	int			   (*check_mr_status)(struct ib_mr *mr, u32 check_mask,
 						      struct ib_mr_status *mr_status);
 	void			   (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
+	int			   (*set_vf_link_state)(struct ib_device *device, int vf, u8 port,
+							int state);
+	int			   (*get_vf_config)(struct ib_device *device, int vf, u8 port,
+						   struct ifla_vf_info *ivf);
+	int			   (*get_vf_stats)(struct ib_device *device, int vf, u8 port,
+						   struct ifla_vf_stats *stats);
+	int			   (*set_vf_guid)(struct ib_device *device, int vf, u8 port, u64 guid,
+						  int type);
+	void			   (*drain_rq)(struct ib_qp *qp);
+	void			   (*drain_sq)(struct ib_qp *qp);
 
 	struct ib_dma_mapping_ops   *dma_ops;
 
@@ -1938,6 +2013,31 @@ static inline int ib_copy_to_udata(struct ib_udata *udata, void *src, size_t len
 	return copy_to_user(udata->outbuf, src, len) ? -EFAULT : 0;
 }
 
+static inline bool ib_is_udata_cleared(struct ib_udata *udata,
+				       size_t offset,
+				       size_t len)
+{
+	const void __user *p = udata->inbuf + offset;
+	bool ret = false;
+	u8 *buf;
+
+	if (len > USHRT_MAX)
+		return false;
+
+	buf = kmalloc(len, GFP_KERNEL);
+	if (!buf)
+		return false;
+
+	if (copy_from_user(buf, p, len))
+		goto free;
+
+	ret = !memchr_inv(buf, 0, len);
+
+free:
+	kfree(buf);
+	return ret;
+}
+
 /**
  * ib_modify_qp_is_ok - Check that the supplied attribute mask
  * contains all required attributes and no attributes not allowed for
@@ -2015,6 +2115,17 @@ static inline bool rdma_protocol_ib(const struct ib_device *device, u8 port_num)
 
 static inline bool rdma_protocol_roce(const struct ib_device *device, u8 port_num)
 {
+	return device->port_immutable[port_num].core_cap_flags &
+		(RDMA_CORE_CAP_PROT_ROCE | RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP);
+}
+
+static inline bool rdma_protocol_roce_udp_encap(const struct ib_device *device, u8 port_num)
+{
+	return device->port_immutable[port_num].core_cap_flags & RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP;
+}
+
+static inline bool rdma_protocol_roce_eth_encap(const struct ib_device *device, u8 port_num)
+{
 	return device->port_immutable[port_num].core_cap_flags & RDMA_CORE_CAP_PROT_ROCE;
 }
 
@@ -2025,8 +2136,8 @@ static inline bool rdma_protocol_iwarp(const struct ib_device *device, u8 port_n
 
 static inline bool rdma_ib_or_roce(const struct ib_device *device, u8 port_num)
 {
-	return device->port_immutable[port_num].core_cap_flags &
-		(RDMA_CORE_CAP_PROT_IB | RDMA_CORE_CAP_PROT_ROCE);
+	return rdma_protocol_ib(device, port_num) ||
+		rdma_protocol_roce(device, port_num);
 }
 
 /**
@@ -2264,7 +2375,17 @@ static inline bool rdma_cap_read_inv(struct ib_device *dev, u32 port_num)
 }
 
 int ib_query_gid(struct ib_device *device,
-		 u8 port_num, int index, union ib_gid *gid);
+		 u8 port_num, int index, union ib_gid *gid,
+		 struct ib_gid_attr *attr);
+
+int ib_set_vf_link_state(struct ib_device *device, int vf, u8 port,
+			 int state);
+int ib_get_vf_config(struct ib_device *device, int vf, u8 port,
+		     struct ifla_vf_info *info);
+int ib_get_vf_stats(struct ib_device *device, int vf, u8 port,
+		    struct ifla_vf_stats *stats);
+int ib_set_vf_guid(struct ib_device *device, int vf, u8 port, u64 guid,
+		   int type);
 
 int ib_query_pkey(struct ib_device *device,
 		  u8 port_num, u16 index, u16 *pkey);
@@ -2278,6 +2399,7 @@ int ib_modify_port(struct ib_device *device,
 		   struct ib_port_modify *port_modify);
 
 int ib_find_gid(struct ib_device *device, union ib_gid *gid,
+		enum ib_gid_type gid_type, struct net_device *ndev,
 		u8 *port_num, u16 *index);
 
 int ib_find_pkey(struct ib_device *device,
@@ -2915,33 +3037,6 @@ struct ib_mr *ib_alloc_mr(struct ib_pd *pd,
 			  u32 max_num_sg);
 
 /**
- * ib_alloc_fast_reg_page_list - Allocates a page list array
- * @device - ib device pointer.
- * @page_list_len - size of the page list array to be allocated.
- *
- * This allocates and returns a struct ib_fast_reg_page_list * and a
- * page_list array that is at least page_list_len in size.  The actual
- * size is returned in max_page_list_len.  The caller is responsible
- * for initializing the contents of the page_list array before posting
- * a send work request with the IB_WC_FAST_REG_MR opcode.
- *
- * The page_list array entries must be translated using one of the
- * ib_dma_*() functions just like the addresses passed to
- * ib_map_phys_fmr().  Once the ib_post_send() is issued, the struct
- * ib_fast_reg_page_list must not be modified by the caller until the
- * IB_WC_FAST_REG_MR work request completes.
- */
-struct ib_fast_reg_page_list *ib_alloc_fast_reg_page_list(
-				struct ib_device *device, int page_list_len);
-
-/**
- * ib_free_fast_reg_page_list - Deallocates a previously allocated
- *   page list array.
- * @page_list - struct ib_fast_reg_page_list pointer to be deallocated.
- */
-void ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list);
-
-/**
  * ib_update_fast_reg_key - updates the key portion of the fast_reg MR
  *   R_Key and L_Key.
  * @mr - struct ib_mr pointer to be updated.
@@ -2963,42 +3058,6 @@ static inline u32 ib_inc_rkey(u32 rkey)
 	const u32 mask = 0x000000ff;
 	return ((rkey + 1) & mask) | (rkey & ~mask);
 }
-
-/**
- * ib_alloc_mw - Allocates a memory window.
- * @pd: The protection domain associated with the memory window.
- * @type: The type of the memory window (1 or 2).
- */
-struct ib_mw *ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type);
-
-/**
- * ib_bind_mw - Posts a work request to the send queue of the specified
- *   QP, which binds the memory window to the given address range and
- *   remote access attributes.
- * @qp: QP to post the bind work request on.
- * @mw: The memory window to bind.
- * @mw_bind: Specifies information about the memory window, including
- *   its address range, remote access rights, and associated memory region.
- *
- * If there is no immediate error, the function will update the rkey member
- * of the mw parameter to its new value. The bind operation can still fail
- * asynchronously.
- */
-static inline int ib_bind_mw(struct ib_qp *qp,
-			     struct ib_mw *mw,
-			     struct ib_mw_bind *mw_bind)
-{
-	/* XXX reference counting in corresponding MR? */
-	return mw->device->bind_mw ?
-		mw->device->bind_mw(qp, mw, mw_bind) :
-		-ENOSYS;
-}
-
-/**
- * ib_dealloc_mw - Deallocates a memory window.
- * @mw: The memory window to deallocate.
- */
-int ib_dealloc_mw(struct ib_mw *mw);
 
 /**
  * ib_alloc_fmr - Allocates a unmapped fast memory region.
@@ -3109,4 +3168,25 @@ struct net_device *ib_get_net_dev_by_params(struct ib_device *dev, u8 port,
 					    u16 pkey, const union ib_gid *gid,
 					    const struct sockaddr *addr);
 
+int ib_map_mr_sg(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
+		 unsigned int *sg_offset, unsigned int page_size);
+
+static inline int
+ib_map_mr_sg_zbva(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
+		  unsigned int *sg_offset, unsigned int page_size)
+{
+	int n;
+
+	n = ib_map_mr_sg(mr, sg, sg_nents, sg_offset, page_size);
+	mr->iova = 0;
+
+	return n;
+}
+
+int ib_sg_to_pages(struct ib_mr *mr, struct scatterlist *sgl, int sg_nents,
+		unsigned int *sg_offset, int (*set_page)(struct ib_mr *, u64));
+
+void ib_drain_rq(struct ib_qp *qp);
+void ib_drain_sq(struct ib_qp *qp);
+void ib_drain_qp(struct ib_qp *qp);
 #endif /* IB_VERBS_H */

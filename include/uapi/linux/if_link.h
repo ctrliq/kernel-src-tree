@@ -35,6 +35,10 @@ struct rtnl_link_stats {
 	/* for cslip etc */
 	__u32	rx_compressed;
 	__u32	tx_compressed;
+
+#ifndef __GENKSYMS__
+	__u32	rx_nohandler;		/* dropped, no handler found	*/
+#endif
 };
 
 /* The main device statistics structure */
@@ -68,6 +72,10 @@ struct rtnl_link_stats64 {
 	/* for cslip etc */
 	__u64	rx_compressed;
 	__u64	tx_compressed;
+
+#ifndef __GENKSYMS__
+	__u64	rx_nohandler;		/* dropped, no handler found	*/
+#endif
 };
 
 /* The struct should be in sync with struct ifmap */
@@ -144,7 +152,7 @@ enum {
 	IFLA_NUM_RX_QUEUES,
 	IFLA_CARRIER,
 	IFLA_PHYS_PORT_ID,
-	__RH_RESERVED_IFLA_CARRIER_CHANGES,
+	IFLA_CARRIER_CHANGES,
 	__RH_RESERVED_IFLA_PHYS_SWITCH_ID,
 	IFLA_LINK_NETNSID,
 	__IFLA_MAX
@@ -216,6 +224,18 @@ enum in6_addr_gen_mode {
 	IN6_ADDR_GEN_MODE_EUI64,
 	IN6_ADDR_GEN_MODE_NONE,
 };
+
+/* Bridge section */
+
+enum {
+	IFLA_BR_UNSPEC,
+	IFLA_BR_FORWARD_DELAY,
+	IFLA_BR_HELLO_TIME,
+	IFLA_BR_MAX_AGE,
+	__IFLA_BR_MAX,
+};
+
+#define IFLA_BR_MAX	(__IFLA_BR_MAX - 1)
 
 enum {
 	BRIDGE_MODE_UNSPEC,
@@ -310,6 +330,35 @@ enum macvlan_mode {
 
 #define MACVLAN_FLAG_NOPROMISC	1
 
+/* MACSEC section */
+enum {
+	IFLA_MACSEC_UNSPEC,
+	IFLA_MACSEC_SCI,
+	IFLA_MACSEC_PORT,
+	IFLA_MACSEC_ICV_LEN,
+	IFLA_MACSEC_CIPHER_SUITE,
+	IFLA_MACSEC_WINDOW,
+	IFLA_MACSEC_ENCODING_SA,
+	IFLA_MACSEC_ENCRYPT,
+	IFLA_MACSEC_PROTECT,
+	IFLA_MACSEC_INC_SCI,
+	IFLA_MACSEC_ES,
+	IFLA_MACSEC_SCB,
+	IFLA_MACSEC_REPLAY_PROTECT,
+	IFLA_MACSEC_VALIDATION,
+	__IFLA_MACSEC_MAX,
+};
+
+#define IFLA_MACSEC_MAX (__IFLA_MACSEC_MAX - 1)
+
+enum macsec_validation_type {
+	MACSEC_VALIDATE_DISABLED = 0,
+	MACSEC_VALIDATE_CHECK = 1,
+	MACSEC_VALIDATE_STRICT = 2,
+	__MACSEC_VALIDATE_END,
+	MACSEC_VALIDATE_MAX = __MACSEC_VALIDATE_END - 1,
+};
+
 /* VXLAN section */
 enum {
 	IFLA_VXLAN_UNSPEC,
@@ -337,6 +386,9 @@ enum {
 	IFLA_VXLAN_REMCSUM_RX,
 	IFLA_VXLAN_GBP,
 	IFLA_VXLAN_REMCSUM_NOPARTIAL,
+	IFLA_VXLAN_COLLECT_METADATA,
+	IFLA_VXLAN_LABEL,
+	IFLA_VXLAN_GPE,
 	__IFLA_VXLAN_MAX
 };
 #define IFLA_VXLAN_MAX	(__IFLA_VXLAN_MAX - 1)
@@ -355,6 +407,11 @@ enum {
 	IFLA_GENEVE_TOS,
 	IFLA_GENEVE_PORT,	/* destination port */
 	IFLA_GENEVE_COLLECT_METADATA,
+	IFLA_GENEVE_REMOTE6,
+	IFLA_GENEVE_UDP_CSUM,
+	IFLA_GENEVE_UDP_ZERO_CSUM6_TX,
+	IFLA_GENEVE_UDP_ZERO_CSUM6_RX,
+	IFLA_GENEVE_LABEL,
 	__IFLA_GENEVE_MAX
 };
 #define IFLA_GENEVE_MAX	(__IFLA_GENEVE_MAX - 1)
@@ -444,6 +501,9 @@ enum {
 				 * on/off switch
 				 */
 	IFLA_VF_STATS,		/* network device statistics */
+	IFLA_VF_TRUST,		/* Trust VF */
+	IFLA_VF_IB_NODE_GUID,	/* VF Infiniband node GUID */
+	IFLA_VF_IB_PORT_GUID,	/* VF Infiniband port GUID */
 	__IFLA_VF_MAX,
 };
 
@@ -476,6 +536,11 @@ struct ifla_vf_spoofchk {
 	__u32 setting;
 };
 
+struct ifla_vf_guid {
+	__u32 vf;
+	__u64 guid;
+};
+
 enum {
 	IFLA_VF_LINK_STATE_AUTO,	/* link state of the uplink */
 	IFLA_VF_LINK_STATE_ENABLE,	/* link always up */
@@ -504,6 +569,11 @@ enum {
 };
 
 #define IFLA_VF_STATS_MAX (__IFLA_VF_STATS_MAX - 1)
+
+struct ifla_vf_trust {
+	__u32 vf;
+	__u32 setting;
+};
 
 /* VF ports management section
  *

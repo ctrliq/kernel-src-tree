@@ -26,18 +26,6 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
 	netdev_features_t mpls_features;
 	__be16 mpls_protocol;
 
-	if (unlikely(skb_shinfo(skb)->gso_type &
-				~(SKB_GSO_TCPV4 |
-				  SKB_GSO_TCPV6 |
-				  SKB_GSO_UDP |
-				  SKB_GSO_DODGY |
-				  SKB_GSO_TCP_ECN |
-				  SKB_GSO_GRE |
-				  SKB_GSO_GRE_CSUM |
-				  SKB_GSO_IPIP |
-				  SKB_GSO_MPLS)))
-		goto out;
-
 	/* Setup inner SKB. */
 	mpls_protocol = skb->protocol;
 	skb->protocol = skb->inner_protocol;
@@ -61,7 +49,6 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
 	 */
 	__skb_push(skb, skb->data - skb_mac_header(skb));
 
-out:
 	return segs;
 }
 

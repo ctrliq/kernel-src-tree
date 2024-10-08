@@ -27,7 +27,6 @@
 
 #include <linux/module.h>
 #include <linux/kmod.h>
-#include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -169,7 +168,7 @@ struct asix_data {
 struct asix_rx_fixup_info {
 	struct sk_buff *ax_skb;
 	u32 header;
-	u16 size;
+	u16 remaining;
 	bool split_head;
 };
 

@@ -351,7 +351,8 @@ EXPORT_SYMBOL(_raw_spin_lock_nested);
 
 void __lockfunc _raw_spin_lock_bh_nested(raw_spinlock_t *lock, int subclass)
 {
-	__local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
+	local_bh_disable();
+	preempt_disable();
 	spin_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
 	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
 }

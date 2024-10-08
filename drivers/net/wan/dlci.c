@@ -495,7 +495,7 @@ static void dlci_setup(struct net_device *dev)
 static int dlci_dev_event(struct notifier_block *unused,
 			  unsigned long event, void *ptr)
 {
-	struct net_device *dev = (struct net_device *) ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	if (dev_net(dev) != &init_net)
 		return NOTIFY_DONE;
@@ -522,7 +522,7 @@ static struct notifier_block dlci_notifier = {
 static int __init init_dlci(void)
 {
 	dlci_ioctl_set(dlci_ioctl);
-	register_netdevice_notifier(&dlci_notifier);
+	register_netdevice_notifier_rh(&dlci_notifier);
 
 	printk("%s.\n", version);
 
@@ -534,7 +534,7 @@ static void __exit dlci_exit(void)
 	struct dlci_local	*dlp, *nxt;
 	
 	dlci_ioctl_set(NULL);
-	unregister_netdevice_notifier(&dlci_notifier);
+	unregister_netdevice_notifier_rh(&dlci_notifier);
 
 	rtnl_lock();
 	list_for_each_entry_safe(dlp, nxt, &dlci_devs, list) {

@@ -174,8 +174,11 @@ struct opal_sg_list {
 #define OPAL_FLASH_WRITE			111
 #define OPAL_FLASH_ERASE			112
 #define OPAL_PRD_MSG				113
+#define OPAL_LEDS_GET_INDICATOR			114
+#define OPAL_LEDS_SET_INDICATOR			115
 #define OPAL_CEC_REBOOT2			116
-#define OPAL_LAST				116
+#define OPAL_CONSOLE_FLUSH			117
+#define OPAL_LAST				117
 
 /* Device tree flags */
 
@@ -443,8 +446,15 @@ enum OpalPciMaskAction {
 };
 
 enum OpalSlotLedType {
-	OPAL_SLOT_LED_ID_TYPE = 0,
-	OPAL_SLOT_LED_FAULT_TYPE = 1
+	OPAL_SLOT_LED_TYPE_ID = 0,      /* IDENTIFY LED */
+	OPAL_SLOT_LED_TYPE_FAULT = 1,   /* FAULT LED */
+	OPAL_SLOT_LED_TYPE_ATTN = 2,    /* System Attention LED */
+	OPAL_SLOT_LED_TYPE_MAX = 3
+};
+
+enum OpalSlotLedState {
+	OPAL_SLOT_LED_STATE_OFF = 0,    /* LED is OFF */
+	OPAL_SLOT_LED_STATE_ON = 1      /* LED is ON */
 };
 
 enum OpalLedAction {
@@ -1013,6 +1023,7 @@ int64_t opal_console_read(int64_t term_number, __be64 *length,
 			  uint8_t *buffer);
 int64_t opal_console_write_buffer_space(int64_t term_number,
 					__be64 *length);
+int64_t opal_console_flush(int64_t term_number);
 int64_t opal_rtc_read(__be32 *year_month_day,
 		      __be64 *hour_minute_second_millisecond);
 int64_t opal_rtc_write(uint32_t year_month_day,
@@ -1174,6 +1185,10 @@ int64_t opal_ipmi_recv(uint64_t interface, struct opal_ipmi_msg *msg,
 int64_t opal_i2c_request(uint64_t async_token, uint32_t bus_id,
 			 struct opal_i2c_request *oreq);
 int64_t opal_prd_msg(struct opal_prd_msg *msg);
+int64_t opal_leds_get_ind(char *loc_code, __be64 *led_mask,
+			  __be64 *led_value, __be64 *max_led_type);
+int64_t opal_leds_set_ind(uint64_t token, char *loc_code, const u64 led_mask,
+			  const u64 led_value, __be64 *max_led_type);
 
 int64_t opal_flash_read(uint64_t id, uint64_t offset, uint64_t buf,
 		uint64_t size, uint64_t token);
@@ -1230,6 +1245,8 @@ extern void opal_shutdown(void);
 extern int opal_resync_timebase(void);
 
 extern void opal_lpc_init(void);
+
+extern void opal_kmsg_init(void);
 
 struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
 					     unsigned long vmalloc_size);

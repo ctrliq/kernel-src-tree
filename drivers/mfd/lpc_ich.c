@@ -54,6 +54,7 @@
  *	document number TBD : Avoton SoC
  *	document number TBD : Coleto Creek
  *	document number TBD : Wildcat Point-LP
+ *	document number TBD : Lewisburg
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -66,6 +67,7 @@
 #include <linux/pci.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/lpc_ich.h>
+#include <linux/platform_data/itco_wdt.h>
 
 #define ACPIBASE		0x40
 #define ACPIBASE_GPE_OFF	0x28
@@ -216,6 +218,7 @@ enum lpc_chipsets {
 	LPC_AVN,	/* Avoton SoC */
 	LPC_COLETO,	/* Coleto Creek */
 	LPC_WPT_LP,	/* Wildcat Point-LP */
+	LPC_LEWISBURG,	/* Lewisburg */
 };
 
 struct lpc_ich_info lpc_chipset_info[] = {
@@ -513,6 +516,10 @@ struct lpc_ich_info lpc_chipset_info[] = {
 		.name = "Lynx Point_LP",
 		.iTCO_version = 2,
 	},
+	[LPC_LEWISBURG] = {
+		.name = "Lewisburg",
+		.iTCO_version = 2,
+	},
 };
 
 /*
@@ -738,6 +745,15 @@ static const struct pci_device_id lpc_ich_ids[] = {
 	{ PCI_VDEVICE(INTEL, 0x9cc6), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc7), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc9), LPC_WPT_LP},
+	{ PCI_VDEVICE(INTEL, 0xa1c1), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c2), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c3), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c4), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c5), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c6), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa1c7), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa242), LPC_LEWISBURG},
+	{ PCI_VDEVICE(INTEL, 0xa243), LPC_LEWISBURG},
 	{ 0, },			/* End of list */
 };
 MODULE_DEVICE_TABLE(pci, lpc_ich_ids);
@@ -811,9 +827,31 @@ static void lpc_ich_enable_pmc_space(struct pci_dev *dev)
 	priv->actrl_pbase_save = reg_save;
 }
 
-static void lpc_ich_finalize_cell(struct pci_dev *dev, struct mfd_cell *cell)
+static int lpc_ich_finalize_wdt_cell(struct pci_dev *dev)
+{
+	struct itco_wdt_platform_data *pdata;
+	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+	struct lpc_ich_info *info;
+	struct mfd_cell *cell = &lpc_ich_cells[LPC_WDT];
+
+	pdata = devm_kzalloc(&dev->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata)
+		return -ENOMEM;
+
+	info = &lpc_chipset_info[priv->chipset];
+
+	pdata->version = info->iTCO_version;
+	strlcpy(pdata->name, info->name, sizeof(pdata->name));
+
+	cell->platform_data = pdata;
+	cell->pdata_size = sizeof(*pdata);
+	return 0;
+}
+
+static void lpc_ich_finalize_gpio_cell(struct pci_dev *dev)
 {
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
+	struct mfd_cell *cell = &lpc_ich_cells[LPC_GPIO];
 
 	cell->platform_data = &lpc_chipset_info[priv->chipset];
 	cell->pdata_size = sizeof(struct lpc_ich_info);
@@ -909,7 +947,7 @@ gpe0_done:
 	lpc_chipset_info[priv->chipset].use_gpio = ret;
 	lpc_ich_enable_gpio_space(dev);
 
-	lpc_ich_finalize_cell(dev, &lpc_ich_cells[LPC_GPIO]);
+	lpc_ich_finalize_gpio_cell(dev);
 	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
 			      &lpc_ich_cells[LPC_GPIO], 1, NULL, 0, NULL);
 
@@ -983,7 +1021,10 @@ static int lpc_ich_init_wdt(struct pci_dev *dev)
 		res->end = base_addr + ACPIBASE_PMC_END;
 	}
 
-	lpc_ich_finalize_cell(dev, &lpc_ich_cells[LPC_WDT]);
+	ret = lpc_ich_finalize_wdt_cell(dev);
+	if (ret)
+		goto wdt_done;
+
 	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
 			      &lpc_ich_cells[LPC_WDT], 1, NULL, 0, NULL);
 

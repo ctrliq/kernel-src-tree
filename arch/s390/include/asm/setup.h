@@ -11,6 +11,9 @@
 #define PARMAREA		0x10400
 #define MEMORY_CHUNKS		256
 
+#define LPP_MAGIC		_BITUL(31)
+#define LPP_PFAULT_PID_MASK	_AC(0xffffffff, UL)
+
 #ifndef __ASSEMBLY__
 
 #include <asm/lowcore.h>

@@ -185,6 +185,7 @@ struct nfs4_state {
 struct nfs4_exception {
 	struct nfs4_state *state;
 	struct inode *inode;
+	nfs4_stateid *stateid;
 	long timeout;
 	unsigned char delay : 1,
 		      recovering : 1,
@@ -235,6 +236,7 @@ extern int nfs4_handle_exception(struct nfs_server *, int, struct nfs4_exception
 extern int nfs4_call_sync(struct rpc_clnt *, struct nfs_server *,
 			  struct rpc_message *, struct nfs4_sequence_args *,
 			  struct nfs4_sequence_res *, int);
+extern void nfs4_init_sequence(struct nfs4_sequence_args *, struct nfs4_sequence_res *, int);
 extern int nfs4_proc_setclientid(struct nfs_client *, u32, unsigned short, struct rpc_cred *, struct nfs4_setclientid_res *);
 extern int nfs4_proc_setclientid_confirm(struct nfs_client *, struct nfs4_setclientid_res *arg, struct rpc_cred *);
 extern int nfs4_proc_get_rootfh(struct nfs_server *, struct nfs_fh *, struct nfs_fsinfo *, bool);
@@ -496,12 +498,15 @@ extern struct svc_version nfs4_callback_version4;
 
 static inline void nfs4_stateid_copy(nfs4_stateid *dst, const nfs4_stateid *src)
 {
-	memcpy(dst, src, sizeof(*dst));
+	memcpy(dst->data, src->data, sizeof(dst->data));
+	dst->type = src->type;
 }
 
 static inline bool nfs4_stateid_match(const nfs4_stateid *dst, const nfs4_stateid *src)
 {
-	return memcmp(dst, src, sizeof(*dst)) == 0;
+	if (dst->type != src->type)
+		return false;
+	return memcmp(dst->data, src->data, sizeof(dst->data)) == 0;
 }
 
 static inline bool nfs4_stateid_match_other(const nfs4_stateid *dst, const nfs4_stateid *src)

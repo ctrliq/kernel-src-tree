@@ -16,6 +16,9 @@
 struct nf_ipv6_ops {
 	int (*chk_addr)(struct net *net, const struct in6_addr *addr,
 			const struct net_device *dev, int strict);
+	void (*route_input)(struct sk_buff *skb);
+	int (*fragment)(struct sock *sk, struct sk_buff *skb,
+			int (*output)(struct sock *, struct sk_buff *));
 };
 
 #ifdef CONFIG_NETFILTER

@@ -45,6 +45,10 @@ unsigned int sdhci_pltfm_clk_get_max_clock(struct sdhci_host *host)
 EXPORT_SYMBOL_GPL(sdhci_pltfm_clk_get_max_clock);
 
 static const struct sdhci_ops sdhci_pltfm_ops = {
+	.set_clock = sdhci_set_clock,
+	.set_bus_width = sdhci_set_bus_width,
+	.reset = sdhci_reset,
+	.set_uhs_signaling = sdhci_set_uhs_signaling,
 };
 
 #ifdef CONFIG_OF
@@ -100,7 +104,8 @@ void sdhci_get_of_property(struct platform_device *pdev)
 	if (of_find_property(np, "keep-power-in-suspend", NULL))
 		host->mmc->pm_caps |= MMC_PM_KEEP_POWER;
 
-	if (of_find_property(np, "enable-sdio-wakeup", NULL))
+	if (of_property_read_bool(np, "wakeup-source") ||
+	    of_property_read_bool(np, "enable-sdio-wakeup")) /* legacy */
 		host->mmc->pm_caps |= MMC_PM_WAKE_SDIO_IRQ;
 }
 #else
@@ -215,9 +220,11 @@ EXPORT_SYMBOL_GPL(sdhci_pltfm_register);
 int sdhci_pltfm_unregister(struct platform_device *pdev)
 {
 	struct sdhci_host *host = platform_get_drvdata(pdev);
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	int dead = (readl(host->ioaddr + SDHCI_INT_STATUS) == 0xffffffff);
 
 	sdhci_remove_host(host, dead);
+	clk_disable_unprepare(pltfm_host->clk);
 	sdhci_pltfm_free(pdev);
 
 	return 0;

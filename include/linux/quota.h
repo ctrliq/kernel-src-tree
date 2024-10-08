@@ -332,6 +332,8 @@ struct quotactl_ops {
 	int (*set_xstate)(struct super_block *, unsigned int, int);
 	int (*get_xstatev)(struct super_block *, struct fs_quota_statv *);
 	RH_KABI_EXTEND(int (*rm_xquota)(struct super_block *, unsigned int))
+	RH_KABI_EXTEND(int (*get_nextdqblk)(struct super_block *, struct kqid *,
+			     struct fs_disk_quota *))
 };
 
 struct quota_format_type {

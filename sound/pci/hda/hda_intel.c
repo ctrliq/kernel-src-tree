@@ -745,7 +745,7 @@ static int azx_acquire_irq(struct azx *chip, int do_disconnect)
 
 	if (request_irq(chip->pci->irq, azx_interrupt,
 			chip->msi ? 0 : IRQF_SHARED,
-			chip->card->irq_descr, chip)) {
+			KBUILD_MODNAME, chip)) {
 		dev_err(chip->card->dev,
 			"unable to grab IRQ %d, disabling device\n",
 			chip->pci->irq);
@@ -1182,8 +1182,7 @@ static int register_vga_switcheroo(struct azx *chip)
 	 * is there any machine with two switchable HDMI audio controllers?
 	 */
 	err = vga_switcheroo_register_audio_client(chip->pci, &azx_vs_ops,
-						    VGA_SWITCHEROO_DIS,
-						    hda->probe_continued);
+						    VGA_SWITCHEROO_DIS);
 	if (err < 0)
 		return err;
 	hda->vga_switcheroo_registered = 1;

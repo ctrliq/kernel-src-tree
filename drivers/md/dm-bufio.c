@@ -16,6 +16,7 @@
 #include <linux/shrinker.h>
 #include <linux/module.h>
 #include <linux/rbtree.h>
+#include <linux/stacktrace.h>
 
 #define DM_MSG_PREFIX "bufio"
 
@@ -149,6 +150,11 @@ struct dm_buffer {
 	struct list_head write_list;
 	struct bio bio;
 	struct bio_vec bio_vec[DM_BUFIO_INLINE_VECS];
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+#define MAX_STACK 10
+	struct stack_trace stack_trace;
+	unsigned long stack_entries[MAX_STACK];
+#endif
 };
 
 /*----------------------------------------------------------------*/
@@ -252,6 +258,17 @@ static LIST_HEAD(dm_bufio_all_clients);
  * dm_bufio_cache_size_per_client and dm_bufio_client_count
  */
 static DEFINE_MUTEX(dm_bufio_clients_lock);
+
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+static void buffer_record_stack(struct dm_buffer *b)
+{
+	b->stack_trace.nr_entries = 0;
+	b->stack_trace.max_entries = MAX_STACK;
+	b->stack_trace.entries = b->stack_entries;
+	b->stack_trace.skip = 2;
+	save_stack_trace(&b->stack_trace);
+}
+#endif
 
 /*----------------------------------------------------------------
  * A red/black tree acts as an index for all the buffers.
@@ -454,6 +471,9 @@ static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
 
 	adjust_total_allocated(b->data_mode, (long)c->block_size);
 
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+	memset(&b->stack_trace, 0, sizeof(b->stack_trace));
+#endif
 	return b;
 }
 
@@ -681,16 +701,6 @@ static void write_endio(struct bio *bio, int error)
 }
 
 /*
- * This function is called when wait_on_bit is actually waiting.
- */
-static int do_io_schedule(void *word)
-{
-	io_schedule();
-
-	return 0;
-}
-
-/*
  * Initiate a write on a dirty buffer, but don't wait for it.
  *
  * - If the buffer is not dirty, exit.
@@ -706,8 +716,7 @@ static void __write_dirty_buffer(struct dm_buffer *b,
 		return;
 
 	clear_bit(B_DIRTY, &b->state);
-	wait_on_bit_lock(&b->state, B_WRITING,
-			 do_io_schedule, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_lock_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 
 	if (!write_list)
 		submit_io(b, WRITE, b->block, write_endio);
@@ -741,9 +750,9 @@ static void __make_buffer_clean(struct dm_buffer *b)
 	if (!b->state)	/* fast case */
 		return;
 
-	wait_on_bit(&b->state, B_READING, do_io_schedule, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
 	__write_dirty_buffer(b, NULL);
-	wait_on_bit(&b->state, B_WRITING, do_io_schedule, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 }
 
 /*
@@ -1069,6 +1078,10 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 
 	dm_bufio_lock(c);
 	b = __bufio_new(c, block, nf, &need_submit, &write_list);
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+	if (b && b->hold_count == 1)
+		buffer_record_stack(b);
+#endif
 	dm_bufio_unlock(c);
 
 	__flush_write_list(&write_list);
@@ -1079,7 +1092,7 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	if (need_submit)
 		submit_io(b, READ, b->block, read_endio);
 
-	wait_on_bit(&b->state, B_READING, do_io_schedule, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
 
 	if (b->read_error) {
 		int error = b->read_error;
@@ -1258,15 +1271,13 @@ again:
 				dropped_lock = 1;
 				b->hold_count++;
 				dm_bufio_unlock(c);
-				wait_on_bit(&b->state, B_WRITING,
-					    do_io_schedule,
-					    TASK_UNINTERRUPTIBLE);
+				wait_on_bit_io(&b->state, B_WRITING,
+					       TASK_UNINTERRUPTIBLE);
 				dm_bufio_lock(c);
 				b->hold_count--;
 			} else
-				wait_on_bit(&b->state, B_WRITING,
-					    do_io_schedule,
-					    TASK_UNINTERRUPTIBLE);
+				wait_on_bit_io(&b->state, B_WRITING,
+					       TASK_UNINTERRUPTIBLE);
 		}
 
 		if (!test_bit(B_DIRTY, &b->state) &&
@@ -1370,15 +1381,15 @@ retry:
 
 	__write_dirty_buffer(b, NULL);
 	if (b->hold_count == 1) {
-		wait_on_bit(&b->state, B_WRITING,
-			    do_io_schedule, TASK_UNINTERRUPTIBLE);
+		wait_on_bit_io(&b->state, B_WRITING,
+			       TASK_UNINTERRUPTIBLE);
 		set_bit(B_DIRTY, &b->state);
 		__unlink_buffer(b);
 		__link_buffer(b, new_block, LIST_DIRTY);
 	} else {
 		sector_t old_block;
-		wait_on_bit_lock(&b->state, B_WRITING,
-				 do_io_schedule, TASK_UNINTERRUPTIBLE);
+		wait_on_bit_lock_io(&b->state, B_WRITING,
+				    TASK_UNINTERRUPTIBLE);
 		/*
 		 * Relink buffer to "new_block" so that write_callback
 		 * sees "new_block" as a block number.
@@ -1390,8 +1401,8 @@ retry:
 		__unlink_buffer(b);
 		__link_buffer(b, new_block, b->list_mode);
 		submit_io(b, WRITE, new_block, write_endio);
-		wait_on_bit(&b->state, B_WRITING,
-			    do_io_schedule, TASK_UNINTERRUPTIBLE);
+		wait_on_bit_io(&b->state, B_WRITING,
+			       TASK_UNINTERRUPTIBLE);
 		__unlink_buffer(b);
 		__link_buffer(b, old_block, b->list_mode);
 	}
@@ -1470,6 +1481,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 {
 	struct dm_buffer *b;
 	int i;
+	bool warned = false;
 
 	BUG_ON(dm_bufio_in_request());
 
@@ -1484,9 +1496,21 @@ static void drop_buffers(struct dm_bufio_client *c)
 		__free_buffer_wake(b);
 
 	for (i = 0; i < LIST_SIZE; i++)
-		list_for_each_entry(b, &c->lru[i], lru_list)
+		list_for_each_entry(b, &c->lru[i], lru_list) {
+			WARN_ON(!warned);
+			warned = true;
 			DMERR("leaked buffer %llx, hold count %u, list %d",
 			      (unsigned long long)b->block, b->hold_count, i);
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+			print_stack_trace(&b->stack_trace, 1);
+			b->hold_count = 0; /* mark unclaimed to avoid BUG_ON below */
+#endif
+		}
+
+#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
+	while ((b = __get_unclaimed_buffer(c)))
+		__free_buffer_wake(b);
+#endif
 
 	for (i = 0; i < LIST_SIZE; i++)
 		BUG_ON(!list_empty(&c->lru[i]));
@@ -1857,12 +1881,8 @@ static void __exit dm_bufio_exit(void)
 	cancel_delayed_work_sync(&dm_bufio_work);
 	destroy_workqueue(dm_bufio_wq);
 
-	for (i = 0; i < ARRAY_SIZE(dm_bufio_caches); i++) {
-		struct kmem_cache *kc = dm_bufio_caches[i];
-
-		if (kc)
-			kmem_cache_destroy(kc);
-	}
+	for (i = 0; i < ARRAY_SIZE(dm_bufio_caches); i++)
+		kmem_cache_destroy(dm_bufio_caches[i]);
 
 	for (i = 0; i < ARRAY_SIZE(dm_bufio_cache_names); i++)
 		kfree(dm_bufio_cache_names[i]);

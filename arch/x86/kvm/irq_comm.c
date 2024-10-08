@@ -31,6 +31,10 @@
 
 #include "ioapic.h"
 
+#include "lapic.h"
+
+#include "x86.h"
+
 static int kvm_set_pic_irq(struct kvm_kernel_irq_routing_entry *e,
 			   struct kvm *kvm, int irq_source_id, int level,
 			   bool line_status)
@@ -48,25 +52,24 @@ static int kvm_set_ioapic_irq(struct kvm_kernel_irq_routing_entry *e,
 				line_status);
 }
 
-inline static bool kvm_is_dm_lowest_prio(struct kvm_lapic_irq *irq)
-{
-	return irq->delivery_mode == APIC_DM_LOWEST;
-}
-
 int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
 		struct kvm_lapic_irq *irq, struct dest_map *dest_map)
 {
 	int i, r = -1;
 	struct kvm_vcpu *vcpu, *lowest = NULL;
+	unsigned long dest_vcpu_bitmap[BITS_TO_LONGS(KVM_MAX_VCPUS)];
+	unsigned int dest_vcpus = 0;
 
 	if (irq->dest_mode == 0 && irq->dest_id == 0xff &&
-			kvm_is_dm_lowest_prio(irq)) {
+			kvm_lowest_prio_delivery(irq)) {
 		printk(KERN_INFO "kvm: apic: phys broadcast and lowest prio\n");
 		irq->delivery_mode = APIC_DM_FIXED;
 	}
 
 	if (kvm_irq_delivery_to_apic_fast(kvm, src, irq, &r, dest_map))
 		return r;
+
+	memset(dest_vcpu_bitmap, 0, sizeof(dest_vcpu_bitmap));
 
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		if (!kvm_apic_present(vcpu))
@@ -76,16 +79,28 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
 					irq->dest_id, irq->dest_mode))
 			continue;
 
-		if (!kvm_is_dm_lowest_prio(irq)) {
+		if (!kvm_lowest_prio_delivery(irq)) {
 			if (r < 0)
 				r = 0;
 			r += kvm_apic_set_irq(vcpu, irq, dest_map);
 		} else if (kvm_lapic_enabled(vcpu)) {
-			if (!lowest)
-				lowest = vcpu;
-			else if (kvm_apic_compare_prio(vcpu, lowest) < 0)
-				lowest = vcpu;
+			if (!kvm_vector_hashing_enabled()) {
+				if (!lowest)
+					lowest = vcpu;
+				else if (kvm_apic_compare_prio(vcpu, lowest) < 0)
+					lowest = vcpu;
+			} else {
+				__set_bit(i, dest_vcpu_bitmap);
+				dest_vcpus++;
+			}
 		}
+	}
+
+	if (dest_vcpus != 0) {
+		int idx = kvm_vector_to_index(irq->vector, dest_vcpus,
+					dest_vcpu_bitmap, KVM_MAX_VCPUS);
+
+		lowest = kvm_get_vcpu(kvm, idx);
 	}
 
 	if (lowest)
@@ -94,13 +109,17 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
 	return r;
 }
 
-void kvm_set_msi_irq(struct kvm_kernel_irq_routing_entry *e,
+void kvm_set_msi_irq(struct kvm *kvm, struct kvm_kernel_irq_routing_entry *e,
 		     struct kvm_lapic_irq *irq)
 {
-	trace_kvm_msi_set_irq(e->msi.address_lo, e->msi.data);
+	trace_kvm_msi_set_irq(e->msi.address_lo | (kvm->arch.x2apic_format ?
+	                                     (u64)e->msi.address_hi << 32 : 0),
+	                      e->msi.data);
 
 	irq->dest_id = (e->msi.address_lo &
 			MSI_ADDR_DEST_ID_MASK) >> MSI_ADDR_DEST_ID_SHIFT;
+	if (kvm->arch.x2apic_format)
+		irq->dest_id |= MSI_ADDR_EXT_DEST_ID(e->msi.address_hi);
 	irq->vector = (e->msi.data &
 			MSI_DATA_VECTOR_MASK) >> MSI_DATA_VECTOR_SHIFT;
 	irq->dest_mode = (1 << MSI_ADDR_DEST_MODE_SHIFT) & e->msi.address_lo;
@@ -113,15 +132,24 @@ void kvm_set_msi_irq(struct kvm_kernel_irq_routing_entry *e,
 }
 EXPORT_SYMBOL_GPL(kvm_set_msi_irq);
 
+static inline bool kvm_msi_route_invalid(struct kvm *kvm,
+		struct kvm_kernel_irq_routing_entry *e)
+{
+	return kvm->arch.x2apic_format && (e->msi.address_hi & 0xff);
+}
+
 int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e,
 		struct kvm *kvm, int irq_source_id, int level, bool line_status)
 {
 	struct kvm_lapic_irq irq;
 
+	if (kvm_msi_route_invalid(kvm, e))
+		return -EINVAL;
+
 	if (!level)
 		return -1;
 
-	kvm_set_msi_irq(e, &irq);
+	kvm_set_msi_irq(kvm, e, &irq);
 
 	return kvm_irq_delivery_to_apic(kvm, NULL, &irq, NULL);
 }
@@ -137,7 +165,10 @@ int kvm_arch_set_irq_inatomic(struct kvm_kernel_irq_routing_entry *e,
 	if (unlikely(e->type != KVM_IRQ_ROUTING_MSI))
 		return -EWOULDBLOCK;
 
-	kvm_set_msi_irq(e, &irq);
+	if (kvm_msi_route_invalid(kvm, e))
+		return -EINVAL;
+
+	kvm_set_msi_irq(kvm, e, &irq);
 
 	if (kvm_irq_delivery_to_apic_fast(kvm, NULL, &irq, &r, NULL))
 		return r;
@@ -180,7 +211,7 @@ void kvm_free_irq_source_id(struct kvm *kvm, int irq_source_id)
 		goto unlock;
 	}
 	clear_bit(irq_source_id, &kvm->arch.irq_sources_bitmap);
-	if (!irqchip_in_kernel(kvm))
+	if (!ioapic_in_kernel(kvm))
 		goto unlock;
 
 	kvm_ioapic_clear_all(kvm->arch.vioapic, irq_source_id);
@@ -222,7 +253,8 @@ void kvm_fire_mask_notifiers(struct kvm *kvm, unsigned irqchip, unsigned pin,
 	srcu_read_unlock(&kvm->irq_srcu, idx);
 }
 
-int kvm_set_routing_entry(struct kvm_kernel_irq_routing_entry *e,
+int kvm_set_routing_entry(struct kvm *kvm,
+			  struct kvm_kernel_irq_routing_entry *e,
 			  const struct kvm_irq_routing_entry *ue)
 {
 	int r = -EINVAL;
@@ -259,6 +291,9 @@ int kvm_set_routing_entry(struct kvm_kernel_irq_routing_entry *e,
 		e->msi.address_lo = ue->u.msi.address_lo;
 		e->msi.address_hi = ue->u.msi.address_hi;
 		e->msi.data = ue->u.msi.data;
+
+		if (kvm_msi_route_invalid(kvm, e))
+			goto out;
 		break;
 	default:
 		goto out;
@@ -326,4 +361,48 @@ int kvm_setup_default_irq_routing(struct kvm *kvm)
 {
 	return kvm_set_irq_routing(kvm, default_routing,
 				   ARRAY_SIZE(default_routing), 0);
+}
+
+static const struct kvm_irq_routing_entry empty_routing[] = {};
+
+int kvm_setup_empty_irq_routing(struct kvm *kvm)
+{
+	return kvm_set_irq_routing(kvm, empty_routing, 0, 0);
+}
+
+void kvm_arch_irq_routing_update(struct kvm *kvm)
+{
+	if (ioapic_in_kernel(kvm) || !irqchip_in_kernel(kvm))
+		return;
+	kvm_make_scan_ioapic_request(kvm);
+}
+
+void kvm_scan_ioapic_routes(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_kernel_irq_routing_entry *entry;
+	struct kvm_irq_routing_table *table;
+	u32 i, nr_ioapic_pins;
+	int idx;
+
+	idx = srcu_read_lock(&kvm->irq_srcu);
+	table = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
+	nr_ioapic_pins = min_t(u32, table->nr_rt_entries,
+			       kvm->arch.nr_reserved_ioapic_pins);
+	for (i = 0; i < nr_ioapic_pins; ++i) {
+		hlist_for_each_entry(entry, &table->map[i], link) {
+			struct kvm_lapic_irq irq;
+
+			if (entry->type != KVM_IRQ_ROUTING_MSI)
+				continue;
+
+			kvm_set_msi_irq(vcpu->kvm, entry, &irq);
+
+			if (irq.level && kvm_apic_match_dest(vcpu, NULL, 0,
+						irq.dest_id, irq.dest_mode))
+				__set_bit(irq.vector,
+				          (unsigned long *) eoi_exit_bitmap);
+		}
+	}
+	srcu_read_unlock(&kvm->irq_srcu, idx);
 }
