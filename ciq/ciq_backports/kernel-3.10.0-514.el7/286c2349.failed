@@ -1,0 +1,209 @@
+ipv6: Clean up ipv6_select_ident() and ip6_fragment()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 286c2349f6665c3e67f464a5faa14a0e28be4842
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/286c2349.failed
+
+This patch changes the ipv6_select_ident() signature to return a
+fragment id instead of taking a whole frag_hdr as a param to
+only set the frag_hdr->identification.
+
+It also cleans up ip6_fragment() to obtain the fragment id at the
+beginning instead of using multiple "if" later to check fragment id
+has been generated or not.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: Steffen Klassert <steffen.klassert@secunet.com>
+	Cc: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 286c2349f6665c3e67f464a5faa14a0e28be4842)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ipv6.h
+#	net/ipv6/ip6_output.c
+#	net/ipv6/output_core.c
+diff --cc include/net/ipv6.h
+index 5dca98c3fc9f,8c4f881edbd2..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -670,7 -671,8 +670,12 @@@ static inline int ipv6_addr_diff(const 
+  	return __ipv6_addr_diff(a1, a2, sizeof(struct in6_addr));
+  }
+  
+++<<<<<<< HEAD
+ +void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt);
+++=======
++ u32 ipv6_select_ident(struct net *net, struct rt6_info *rt);
++ void ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb);
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  
+  int ip6_dst_hoplimit(struct dst_entry *dst);
+  
+diff --cc net/ipv6/ip6_output.c
+index 6e24dc6ba803,05e2cdf938bd..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -531,8 -551,8 +531,13 @@@ int ip6_fragment(struct sock *sk, struc
+  	struct frag_hdr *fh;
+  	unsigned int mtu, hlen, left, len;
+  	int hroom, troom;
+++<<<<<<< HEAD
+ +	__be32 frag_id = 0;
+ +	int ptr, offset = 0, err=0;
+++=======
++ 	__be32 frag_id;
++ 	int ptr, offset = 0, err = 0;
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  	u8 *prevhdr, nexthdr = 0;
+  	struct net *net = dev_net(skb_dst(skb)->dev);
+  
+@@@ -612,7 -634,6 +619,10 @@@
+  		skb_reset_network_header(skb);
+  		memcpy(skb_network_header(skb), tmp_hdr, hlen);
+  
+++<<<<<<< HEAD
+ +		ipv6_select_ident(fh, rt);
+++=======
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  		fh->nexthdr = nexthdr;
+  		fh->reserved = 0;
+  		fh->frag_off = htons(IP6_MF);
+@@@ -764,11 -779,7 +774,15 @@@ slow_path
+  		 */
+  		fh->nexthdr = nexthdr;
+  		fh->reserved = 0;
+++<<<<<<< HEAD
+ +		if (!frag_id) {
+ +			ipv6_select_ident(fh, rt);
+ +			frag_id = fh->identification;
+ +		} else
+ +			fh->identification = frag_id;
+++=======
++ 		fh->identification = frag_id;
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  
+  		/*
+  		 *	Copy a block of the IP datagram.
+@@@ -1068,8 -1102,7 +1081,12 @@@ static inline int ip6_ufo_append_data(s
+  	skb_shinfo(skb)->gso_size = (mtu - fragheaderlen -
+  				     sizeof(struct frag_hdr)) & ~7;
+  	skb_shinfo(skb)->gso_type = SKB_GSO_UDP;
+++<<<<<<< HEAD
+ +	ipv6_select_ident(&fhdr, rt);
+ +	skb_shinfo(skb)->ip6_frag_id = fhdr.identification;
+++=======
++ 	skb_shinfo(skb)->ip6_frag_id = ipv6_select_ident(sock_net(sk), rt);
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  
+  append:
+  	return skb_append_datato_frags(sk, skb, getfrag, from,
+diff --cc net/ipv6/output_core.c
+index f55ca250c2c9,ef0e2326496b..000000000000
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@@ -6,33 -6,70 +6,88 @@@
+  #include <net/ipv6.h>
+  #include <net/ip6_fib.h>
+  #include <net/addrconf.h>
+ -#include <net/secure_seq.h>
+  
+ -static u32 __ipv6_select_ident(struct net *net, u32 hashrnd,
+ -			       struct in6_addr *dst, struct in6_addr *src)
+ +void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt)
+  {
+ -	u32 hash, id;
+ -
+ -	hash = __ipv6_addr_jhash(dst, hashrnd);
+ -	hash = __ipv6_addr_jhash(src, hash);
+ -	hash ^= net_hash_mix(net);
+ +	static atomic_t ipv6_fragmentation_id;
+ +	int old, new;
+  
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	if (rt) {
+ +		struct inet_peer *peer;
+ +		struct net *net;
+ +
+++<<<<<<< HEAD
+ +		net = dev_net(rt->dst.dev);
+ +		peer = inet_getpeer_v6(net->ipv6.peers, &rt->rt6i_dst.addr, 1);
+ +		if (peer) {
+ +			fhdr->identification = htonl(inet_getid(peer, 0));
+ +			inet_putpeer(peer);
+ +			return;
+ +		}
+ +	}
+ +#endif
+ +	do {
+ +		old = atomic_read(&ipv6_fragmentation_id);
+ +		new = old + 1;
+ +		if (!new)
+ +			new = 1;
+ +	} while (atomic_cmpxchg(&ipv6_fragmentation_id, old, new) != old);
+ +	fhdr->identification = htonl(new);
+++=======
++ 	/* Treat id of 0 as unset and if we get 0 back from ip_idents_reserve,
++ 	 * set the hight order instead thus minimizing possible future
++ 	 * collisions.
++ 	 */
++ 	id = ip_idents_reserve(hash, 1);
++ 	if (unlikely(!id))
++ 		id = 1 << 31;
++ 
++ 	return id;
++ }
++ 
++ /* This function exists only for tap drivers that must support broken
++  * clients requesting UFO without specifying an IPv6 fragment ID.
++  *
++  * This is similar to ipv6_select_ident() but we use an independent hash
++  * seed to limit information leakage.
++  *
++  * The network header must be set before calling this.
++  */
++ void ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb)
++ {
++ 	static u32 ip6_proxy_idents_hashrnd __read_mostly;
++ 	struct in6_addr buf[2];
++ 	struct in6_addr *addrs;
++ 	u32 id;
++ 
++ 	addrs = skb_header_pointer(skb,
++ 				   skb_network_offset(skb) +
++ 				   offsetof(struct ipv6hdr, saddr),
++ 				   sizeof(buf), buf);
++ 	if (!addrs)
++ 		return;
++ 
++ 	net_get_random_once(&ip6_proxy_idents_hashrnd,
++ 			    sizeof(ip6_proxy_idents_hashrnd));
++ 
++ 	id = __ipv6_select_ident(net, ip6_proxy_idents_hashrnd,
++ 				 &addrs[1], &addrs[0]);
++ 	skb_shinfo(skb)->ip6_frag_id = htonl(id);
++ }
++ EXPORT_SYMBOL_GPL(ipv6_proxy_select_ident);
++ 
++ u32 ipv6_select_ident(struct net *net, struct rt6_info *rt)
++ {
++ 	static u32 ip6_idents_hashrnd __read_mostly;
++ 	u32 id;
++ 
++ 	net_get_random_once(&ip6_idents_hashrnd, sizeof(ip6_idents_hashrnd));
++ 
++ 	id = __ipv6_select_ident(net, ip6_idents_hashrnd, &rt->rt6i_dst.addr,
++ 				 &rt->rt6i_src.addr);
++ 	return htonl(id);
+++>>>>>>> 286c2349f666 (ipv6: Clean up ipv6_select_ident() and ip6_fragment())
+  }
+  EXPORT_SYMBOL(ipv6_select_ident);
+  
+* Unmerged path include/net/ipv6.h
+* Unmerged path net/ipv6/ip6_output.c
+* Unmerged path net/ipv6/output_core.c
