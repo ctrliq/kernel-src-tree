@@ -1,0 +1,469 @@
+vlan: introduce *vlan_hwaccel_push_inside helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jiri Pirko <jiri@resnulli.us>
+commit 5968250c868ceee680aa77395b24e6ddcae17d36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5968250c.failed
+
+Use them to push skb->vlan_tci into the payload and avoid code
+duplication.
+
+	Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5968250c868ceee680aa77395b24e6ddcae17d36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/core/dev.c
+#	net/core/netpoll.c
+#	net/ipv4/geneve.c
+#	net/openvswitch/datapath.c
+#	net/openvswitch/vport-gre.c
+diff --cc drivers/net/vxlan.c
+index f88e71fe097a,64d45fa3d997..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1565,14 -1599,9 +1565,20 @@@ static int vxlan6_xmit_skb(struct net *
+  	if (unlikely(err))
+  		return err;
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+++=======
++ 	skb = vlan_hwaccel_push_inside(skb);
++ 	if (WARN_ON(!skb))
++ 		return -ENOMEM;
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+  	vxh->vx_flags = htonl(VXLAN_FLAGS);
+@@@ -1638,14 -1638,9 +1644,20 @@@ int vxlan_xmit_skb(struct net *net, str
+  	if (unlikely(err))
+  		return err;
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (WARN_ON(!__vlan_put_tag(skb,
+ +					    skb->vlan_proto,
+ +					    vlan_tx_tag_get(skb))))
+ +			return -ENOMEM;
+ +
+ +		skb->vlan_tci = 0;
+ +	}
+++=======
++ 	skb = vlan_hwaccel_push_inside(skb);
++ 	if (WARN_ON(!skb))
++ 		return -ENOMEM;
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  
+  	vxh = (struct vxlanhdr *) __skb_push(skb, sizeof(*vxh));
+  	vxh->vx_flags = htonl(VXLAN_FLAGS);
+diff --cc net/core/dev.c
+index 883bfd5aec6c,ac4836241a96..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2509,115 -2595,144 +2509,183 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+ -static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+ -		    struct netdev_queue *txq, bool more)
+ +int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ +			struct netdev_queue *txq)
+  {
+ -	unsigned int len;
+ -	int rc;
+ -
+ -	if (!list_empty(&ptype_all))
+ -		dev_queue_xmit_nit(skb, dev);
+ -
+ -	len = skb->len;
+ -	trace_net_dev_start_xmit(skb, dev);
+ -	rc = netdev_start_xmit(skb, dev, txq, more);
+ -	trace_net_dev_xmit(skb, rc, dev, len);
+ -
+ -	return rc;
+ -}
+ -
+ -struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
+ -				    struct netdev_queue *txq, int *ret)
+ -{
+ -	struct sk_buff *skb = first;
+ +	const struct net_device_ops *ops = dev->netdev_ops;
+  	int rc = NETDEV_TX_OK;
+ +	unsigned int skb_len;
+  
+ -	while (skb) {
+ -		struct sk_buff *next = skb->next;
+ +	if (likely(!skb->next)) {
+ +		netdev_features_t features;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If device doesn't need skb->dst, release it right now while
+ +		 * its hot in this cpu cache
+++=======
++ 		skb->next = NULL;
++ 		rc = xmit_one(skb, dev, txq, next != NULL);
++ 		if (unlikely(!dev_xmit_complete(rc))) {
++ 			skb->next = next;
++ 			goto out;
++ 		}
++ 
++ 		skb = next;
++ 		if (netif_xmit_stopped(txq) && skb) {
++ 			rc = NETDEV_TX_BUSY;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	*ret = rc;
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
++ 					  netdev_features_t features)
++ {
++ 	if (vlan_tx_tag_present(skb) &&
++ 	    !vlan_hw_offload_capable(features, skb->vlan_proto))
++ 		skb = __vlan_hwaccel_push_inside(skb);
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	netdev_features_t features;
++ 
++ 	if (skb->next)
++ 		return skb;
++ 
++ 	features = netif_skb_features(skb);
++ 	skb = validate_xmit_vlan(skb, features);
++ 	if (unlikely(!skb))
++ 		goto out_null;
++ 
++ 	/* If encapsulation offload request, verify we are testing
++ 	 * hardware encapsulation features instead of standard
++ 	 * features for the netdev
++ 	 */
++ 	if (skb->encapsulation)
++ 		features &= dev->hw_enc_features;
++ 
++ 	if (netif_needs_gso(dev, skb, features)) {
++ 		struct sk_buff *segs;
++ 
++ 		segs = skb_gso_segment(skb, features);
++ 		if (IS_ERR(segs)) {
++ 			segs = NULL;
++ 		} else if (segs) {
++ 			consume_skb(skb);
++ 			skb = segs;
++ 		}
++ 	} else {
++ 		if (skb_needs_linearize(skb, features) &&
++ 		    __skb_linearize(skb))
++ 			goto out_kfree_skb;
++ 
++ 		/* If packet is not checksummed and device does not
++ 		 * support checksumming for this protocol, complete
++ 		 * checksumming here.
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  		 */
+ -		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ -			if (skb->encapsulation)
+ -				skb_set_inner_transport_header(skb,
+ -							       skb_checksum_start_offset(skb));
+ -			else
+ -				skb_set_transport_header(skb,
+ -							 skb_checksum_start_offset(skb));
+ -			if (!(features & NETIF_F_ALL_CSUM) &&
+ -			    skb_checksum_help(skb))
+ -				goto out_kfree_skb;
+ +		if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+ +			skb_dst_drop(skb);
+ +
+ +		features = netif_skb_features(skb);
+ +
+ +		if (vlan_tx_tag_present(skb) &&
+ +		    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
+ +			skb = __vlan_put_tag(skb, skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb));
+ +			if (unlikely(!skb))
+ +				goto out;
+ +
+ +			skb->vlan_tci = 0;
+  		}
+ -	}
+  
+ -	return skb;
+ +		/* If encapsulation offload request, verify we are testing
+ +		 * hardware encapsulation features instead of standard
+ +		 * features for the netdev
+ +		 */
+ +		if (skb->encapsulation)
+ +			features &= dev->hw_enc_features;
+  
+ -out_kfree_skb:
+ -	kfree_skb(skb);
+ -out_null:
+ -	return NULL;
+ -}
+ +		if (netif_needs_gso(skb, features)) {
+ +			if (unlikely(dev_gso_segment(skb, features)))
+ +				goto out_kfree_skb;
+ +			if (skb->next)
+ +				goto gso;
+ +		} else {
+ +			if (skb_needs_linearize(skb, features) &&
+ +			    __skb_linearize(skb))
+ +				goto out_kfree_skb;
+  
+ -struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev)
+ -{
+ -	struct sk_buff *next, *head = NULL, *tail;
+ +			/* If packet is not checksummed and device does not
+ +			 * support checksumming for this protocol, complete
+ +			 * checksumming here.
+ +			 */
+ +			if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ +				if (skb->encapsulation)
+ +					skb_set_inner_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				else
+ +					skb_set_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				if (!(features & NETIF_F_ALL_CSUM) &&
+ +				     skb_checksum_help(skb))
+ +					goto out_kfree_skb;
+ +			}
+ +		}
+  
+ -	for (; skb != NULL; skb = next) {
+ -		next = skb->next;
+ -		skb->next = NULL;
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(skb, dev);
+ +
+ +		skb_len = skb->len;
+ +		rc = ops->ndo_start_xmit(skb, dev);
+ +		trace_net_dev_xmit(skb, rc, dev, skb_len);
+ +		if (rc == NETDEV_TX_OK)
+ +			txq_trans_update(txq);
+ +		return rc;
+ +	}
+  
+ -		/* in case skb wont be segmented, point to itself */
+ -		skb->prev = skb;
+ +gso:
+ +	do {
+ +		struct sk_buff *nskb = skb->next;
+  
+ -		skb = validate_xmit_skb(skb, dev);
+ -		if (!skb)
+ -			continue;
+ +		skb->next = nskb->next;
+ +		nskb->next = NULL;
+  
+ -		if (!head)
+ -			head = skb;
+ -		else
+ -			tail->next = skb;
+ -		/* If skb was segmented, skb->prev points to
+ -		 * the last segment. If not, it still contains skb.
+ -		 */
+ -		tail = skb->prev;
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(nskb, dev);
+ +
+ +		skb_len = nskb->len;
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+ +		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+ +		if (unlikely(rc != NETDEV_TX_OK)) {
+ +			if (rc & ~NETDEV_TX_MASK)
+ +				goto out_kfree_gso_skb;
+ +			nskb->next = skb->next;
+ +			skb->next = nskb;
+ +			return rc;
+ +		}
+ +		txq_trans_update(txq);
+ +		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ +			return NETDEV_TX_BUSY;
+ +	} while (skb->next);
+ +
+ +out_kfree_gso_skb:
+ +	if (likely(skb->next == NULL)) {
+ +		skb->destructor = DEV_GSO_CB(skb)->destructor;
+ +		consume_skb(skb);
+ +		return rc;
+  	}
+ -	return head;
+ +out_kfree_skb:
+ +	kfree_skb(skb);
+ +out:
+ +	return rc;
+  }
+  
+  static void qdisc_pkt_len_init(struct sk_buff *skb)
+diff --cc net/core/netpoll.c
+index 89e339d3631e,e0ad5d16c9c5..000000000000
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@@ -84,8 -79,7 +84,12 @@@ static int netpoll_start_xmit(struct sk
+  
+  	if (vlan_tx_tag_present(skb) &&
+  	    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
+++<<<<<<< HEAD
+ +		skb = __vlan_put_tag(skb, skb->vlan_proto,
+ +				     vlan_tx_tag_get(skb));
+++=======
++ 		skb = __vlan_hwaccel_push_inside(skb);
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  		if (unlikely(!skb)) {
+  			/* This is actually a packet drop, but we
+  			 * don't want the code that calls this
+@@@ -93,12 -87,9 +97,11 @@@
+  			 */
+  			goto out;
+  		}
+- 		skb->vlan_tci = 0;
+  	}
+  
+ -	status = netdev_start_xmit(skb, dev, txq, false);
+ +	status = ops->ndo_start_xmit(skb, dev);
+ +	if (status == NETDEV_TX_OK)
+ +		txq_trans_update(txq);
+  
+  out:
+  	return status;
+diff --cc net/ipv4/geneve.c
+index 6c1d8cbeb11d,a457232f0131..000000000000
+--- a/net/ipv4/geneve.c
++++ b/net/ipv4/geneve.c
+@@@ -123,15 -131,9 +123,21 @@@ int geneve_xmit_skb(struct geneve_sock 
+  	if (unlikely(err))
+  		return err;
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (unlikely(!__vlan_put_tag(skb,
+ +					     skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb)))) {
+ +			err = -ENOMEM;
+ +			return err;
+ +		}
+ +		skb->vlan_tci = 0;
+ +	}
+++=======
++ 	skb = vlan_hwaccel_push_inside(skb);
++ 	if (unlikely(!skb))
++ 		return -ENOMEM;
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  
+  	gnvh = (struct genevehdr *)__skb_push(skb, sizeof(*gnvh) + opt_len);
+  	geneve_build_header(gnvh, tun_flags, vni, opt_len, opt);
+diff --cc net/openvswitch/datapath.c
+index 7f9ea5979d67,f37ca3e5824c..000000000000
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@@ -425,7 -425,7 +425,11 @@@ static int queue_userspace_packet(struc
+  		if (!nskb)
+  			return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +		nskb = __vlan_put_tag(nskb, nskb->vlan_proto, vlan_tx_tag_get(nskb));
+++=======
++ 		nskb = __vlan_hwaccel_push_inside(nskb);
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  		if (!nskb)
+  			return -ENOMEM;
+  
+diff --cc net/openvswitch/vport-gre.c
+index 734ddb4f442c,6b69df545b1d..000000000000
+--- a/net/openvswitch/vport-gre.c
++++ b/net/openvswitch/vport-gre.c
+@@@ -175,14 -175,10 +175,21 @@@ static int gre_tnl_send(struct vport *v
+  			goto err_free_rt;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vlan_tx_tag_present(skb)) {
+ +		if (unlikely(!__vlan_put_tag(skb,
+ +					     skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb)))) {
+ +			err = -ENOMEM;
+ +			goto err_free_rt;
+ +		}
+ +		skb->vlan_tci = 0;
+++=======
++ 	skb = vlan_hwaccel_push_inside(skb);
++ 	if (unlikely(!skb)) {
++ 		err = -ENOMEM;
++ 		goto err_free_rt;
+++>>>>>>> 5968250c868c (vlan: introduce *vlan_hwaccel_push_inside helpers)
+  	}
+  
+  	/* Push Tunnel header. */
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/linux/if_vlan.h b/include/linux/if_vlan.h
+index 978291b95d4e..1dbb089ff275 100644
+--- a/include/linux/if_vlan.h
++++ b/include/linux/if_vlan.h
+@@ -326,6 +326,40 @@ static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb,
+ 	return skb;
+ }
+ 
++/*
++ * __vlan_hwaccel_push_inside - pushes vlan tag to the payload
++ * @skb: skbuff to tag
++ *
++ * Pushes the VLAN tag from @skb->vlan_tci inside to the payload.
++ *
++ * Following the skb_unshare() example, in case of error, the calling function
++ * doesn't have to worry about freeing the original skb.
++ */
++static inline struct sk_buff *__vlan_hwaccel_push_inside(struct sk_buff *skb)
++{
++	skb = vlan_insert_tag_set_proto(skb, skb->vlan_proto,
++					vlan_tx_tag_get(skb));
++	if (likely(skb))
++		skb->vlan_tci = 0;
++	return skb;
++}
++/*
++ * vlan_hwaccel_push_inside - pushes vlan tag to the payload
++ * @skb: skbuff to tag
++ *
++ * Checks is tag is present in @skb->vlan_tci and if it is, it pushes the
++ * VLAN tag from @skb->vlan_tci inside to the payload.
++ *
++ * Following the skb_unshare() example, in case of error, the calling function
++ * doesn't have to worry about freeing the original skb.
++ */
++static inline struct sk_buff *vlan_hwaccel_push_inside(struct sk_buff *skb)
++{
++	if (vlan_tx_tag_present(skb))
++		skb = __vlan_hwaccel_push_inside(skb);
++	return skb;
++}
++
+ /**
+  * __vlan_hwaccel_put_tag - hardware accelerated VLAN inserting
+  * @skb: skbuff to tag
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/netpoll.c
+* Unmerged path net/ipv4/geneve.c
+* Unmerged path net/openvswitch/datapath.c
+* Unmerged path net/openvswitch/vport-gre.c
