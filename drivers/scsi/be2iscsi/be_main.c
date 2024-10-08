@@ -3742,14 +3742,16 @@ static void be_mcc_queues_destroy(struct beiscsi_hba *phba)
 	struct be_ctrl_info *ctrl = &phba->ctrl;
 
 	q = &phba->ctrl.mcc_obj.q;
-	if (q->created)
+	if (q->created) {
 		beiscsi_cmd_q_destroy(ctrl, q, QTYPE_MCCQ);
-	be_queue_free(phba, q);
+		be_queue_free(phba, q);
+	}
 
 	q = &phba->ctrl.mcc_obj.cq;
-	if (q->created)
+	if (q->created) {
 		beiscsi_cmd_q_destroy(ctrl, q, QTYPE_CQ);
-	be_queue_free(phba, q);
+		be_queue_free(phba, q);
+	}
 }
 
 static void hwi_cleanup(struct beiscsi_hba *phba)
@@ -3793,8 +3795,10 @@ static void hwi_cleanup(struct beiscsi_hba *phba)
 
 	for (i = 0; i < (phba->num_cpus); i++) {
 		q = &phwi_context->be_cq[i];
-		if (q->created)
+		if (q->created) {
+			be_queue_free(phba, q);
 			beiscsi_cmd_q_destroy(ctrl, q, QTYPE_CQ);
+		}
 	}
 
 	be_mcc_queues_destroy(phba);
@@ -3804,8 +3808,10 @@ static void hwi_cleanup(struct beiscsi_hba *phba)
 		eq_for_mcc = 0;
 	for (i = 0; i < (phba->num_cpus + eq_for_mcc); i++) {
 		q = &phwi_context->be_eq[i].q;
-		if (q->created)
+		if (q->created) {
+			be_queue_free(phba, q);
 			beiscsi_cmd_q_destroy(ctrl, q, QTYPE_EQ);
+		}
 	}
 	be_cmd_fw_uninit(ctrl);
 }
