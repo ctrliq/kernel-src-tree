@@ -1,0 +1,176 @@
+Btrfs: add a flags field to btrfs_transaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Josef Bacik <jbacik@fb.com>
+commit 3204d33cda40d9bc97f257c441225d3713916661
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3204d33c.failed
+
+I want to set some per transaction flags, so instead of adding yet another int
+lets just convert the current two int indicators to flags and add a flags field
+for future use.  Thanks,
+
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 3204d33cda40d9bc97f257c441225d3713916661)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+#	fs/btrfs/transaction.c
+diff --cc fs/btrfs/extent-tree.c
+index 97e7c6bc5b80,e0dfe3578b00..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -8796,7 -8933,44 +8797,48 @@@ int btrfs_set_block_group_ro(struct btr
+  	if (IS_ERR(trans))
+  		return PTR_ERR(trans);
+  
+++<<<<<<< HEAD
+ +	ret = set_block_group_ro(cache, 0);
+++=======
++ 	/*
++ 	 * we're not allowed to set block groups readonly after the dirty
++ 	 * block groups cache has started writing.  If it already started,
++ 	 * back off and let this transaction commit
++ 	 */
++ 	mutex_lock(&root->fs_info->ro_block_group_mutex);
++ 	if (test_bit(BTRFS_TRANS_DIRTY_BG_RUN, &trans->transaction->flags)) {
++ 		u64 transid = trans->transid;
++ 
++ 		mutex_unlock(&root->fs_info->ro_block_group_mutex);
++ 		btrfs_end_transaction(trans, root);
++ 
++ 		ret = btrfs_wait_for_commit(root, transid);
++ 		if (ret)
++ 			return ret;
++ 		goto again;
++ 	}
++ 
++ 	/*
++ 	 * if we are changing raid levels, try to allocate a corresponding
++ 	 * block group with the new raid level.
++ 	 */
++ 	alloc_flags = update_block_group_flags(root, cache->flags);
++ 	if (alloc_flags != cache->flags) {
++ 		ret = do_chunk_alloc(trans, root, alloc_flags,
++ 				     CHUNK_ALLOC_FORCE);
++ 		/*
++ 		 * ENOSPC is allowed here, we may have enough space
++ 		 * already allocated at the new raid level to
++ 		 * carry on
++ 		 */
++ 		if (ret == -ENOSPC)
++ 			ret = 0;
++ 		if (ret < 0)
++ 			goto out;
++ 	}
++ 
++ 	ret = inc_block_group_ro(cache, 0);
+++>>>>>>> 3204d33cda40 (Btrfs: add a flags field to btrfs_transaction)
+  	if (!ret)
+  		goto out;
+  	alloc_flags = get_alloc_profile(root, cache->space_info->flags);
+diff --cc fs/btrfs/transaction.c
+index 3b1cf756aa9c,222f9a99a3ce..000000000000
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@@ -224,9 -239,11 +224,14 @@@ loop
+  	 * commit the transaction.
+  	 */
+  	atomic_set(&cur_trans->use_count, 2);
+- 	cur_trans->have_free_bgs = 0;
+  	atomic_set(&cur_trans->pending_ordered, 0);
++ 	cur_trans->flags = 0;
+  	cur_trans->start_time = get_seconds();
+++<<<<<<< HEAD
+++=======
++ 
++ 	memset(&cur_trans->delayed_refs, 0, sizeof(cur_trans->delayed_refs));
+++>>>>>>> 3204d33cda40 (Btrfs: add a flags field to btrfs_transaction)
+  
+  	cur_trans->delayed_refs.href_root = RB_ROOT;
+  	cur_trans->delayed_refs.dirty_extent_root = RB_ROOT;
+@@@ -1788,6 -1836,36 +1793,39 @@@ int btrfs_commit_transaction(struct btr
+  		return ret;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!test_bit(BTRFS_TRANS_DIRTY_BG_RUN, &cur_trans->flags)) {
++ 		int run_it = 0;
++ 
++ 		/* this mutex is also taken before trying to set
++ 		 * block groups readonly.  We need to make sure
++ 		 * that nobody has set a block group readonly
++ 		 * after a extents from that block group have been
++ 		 * allocated for cache files.  btrfs_set_block_group_ro
++ 		 * will wait for the transaction to commit if it
++ 		 * finds BTRFS_TRANS_DIRTY_BG_RUN set.
++ 		 *
++ 		 * The BTRFS_TRANS_DIRTY_BG_RUN flag is also used to make sure
++ 		 * only one process starts all the block group IO.  It wouldn't
++ 		 * hurt to have more than one go through, but there's no
++ 		 * real advantage to it either.
++ 		 */
++ 		mutex_lock(&root->fs_info->ro_block_group_mutex);
++ 		if (!test_and_set_bit(BTRFS_TRANS_DIRTY_BG_RUN,
++ 				      &cur_trans->flags))
++ 			run_it = 1;
++ 		mutex_unlock(&root->fs_info->ro_block_group_mutex);
++ 
++ 		if (run_it)
++ 			ret = btrfs_start_dirty_block_groups(trans, root);
++ 	}
++ 	if (ret) {
++ 		btrfs_end_transaction(trans, root);
++ 		return ret;
++ 	}
++ 
+++>>>>>>> 3204d33cda40 (Btrfs: add a flags field to btrfs_transaction)
+  	spin_lock(&root->fs_info->trans_lock);
+  	if (cur_trans->state >= TRANS_STATE_COMMIT_START) {
+  		spin_unlock(&root->fs_info->trans_lock);
+* Unmerged path fs/btrfs/extent-tree.c
+* Unmerged path fs/btrfs/transaction.c
+diff --git a/fs/btrfs/transaction.h b/fs/btrfs/transaction.h
+index 4083b77d49ae..dc519bc6417f 100644
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@ -32,6 +32,9 @@ enum btrfs_trans_state {
+ 	TRANS_STATE_MAX			= 6,
+ };
+ 
++#define BTRFS_TRANS_HAVE_FREE_BGS	0
++#define BTRFS_TRANS_DIRTY_BG_RUN	1
++
+ struct btrfs_transaction {
+ 	u64 transid;
+ 	/*
+@@ -48,10 +51,7 @@ struct btrfs_transaction {
+ 	atomic_t use_count;
+ 	atomic_t pending_ordered;
+ 
+-	/*
+-	 * true if there is free bgs operations in this transaction
+-	 */
+-	int have_free_bgs;
++	unsigned long flags;
+ 
+ 	/* Be protected by fs_info->trans_lock when we want to change it. */
+ 	enum btrfs_trans_state state;
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 349ba4eda0bc..18dfaf55b349 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -1462,7 +1462,7 @@ again:
+ 		btrfs_std_error(root->fs_info, ret,
+ 			    "Failed to remove dev extent item");
+ 	} else {
+-		trans->transaction->have_free_bgs = 1;
++		set_bit(BTRFS_TRANS_HAVE_FREE_BGS, &trans->transaction->flags);
+ 	}
+ out:
+ 	btrfs_free_path(path);
