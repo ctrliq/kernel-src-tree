@@ -1,0 +1,329 @@
+bonding: Add tlb_dynamic_lb parameter for tlb mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mahesh Bandewar <maheshb@google.com>
+commit e9f0fb88493570200b8dc1cc02d3e676412d25bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e9f0fb88.failed
+
+The aggresive load balancing causes packet re-ordering as active
+flows are moved from a slave to another within the group. Sometime
+this aggresive lb is not necessary if the preference is for less
+re-ordering. This parameter if used with value "0" disables
+this dynamic flow shuffling minimizing packet re-ordering. Of course
+the side effect is that it has to live with the static load balancing
+that the hashing distribution provides. This impact is less severe if
+the correct xmit-hashing-policy is used for the tlb setup.
+
+The default value of the parameter is set to "1" mimicing the earlier
+behavior.
+
+Ran the netperf test with 200 stream for 1 min between two hosts with
+4x1G trunk (xmit-lb mode with xmit-policy L3+4) before and after these
+changes. Following was the command used for those 200 instances -
+
+    netperf -t TCP_RR -l 60 -s 5 -H <host> -- -r81920,81920
+
+Transactions per second:
+    Before change: 1,367.11
+    After  change: 1,470.65
+
+Change-Id: Ie3f75c77282cf602e83a6e833c6eb164e72a0990
+	Signed-off-by: Mahesh Bandewar <maheshb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e9f0fb88493570200b8dc1cc02d3e676412d25bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bond_options.c
+#	drivers/net/bonding/bond_options.h
+#	drivers/net/bonding/bond_sysfs.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_alb.c
+index d3256b311be3,70de039dad2e..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -1314,9 -1343,79 +1314,83 @@@ void bond_alb_deinitialize(struct bondi
+  
+  	tlb_deinitialize(bond);
+  
+ -	if (bond_info->rlb_enabled)
+ +	if (bond_info->rlb_enabled) {
+  		rlb_deinitialize(bond);
+++<<<<<<< HEAD
+ +	}
+++=======
++ }
++ 
++ static int bond_do_alb_xmit(struct sk_buff *skb, struct bonding *bond,
++ 		struct slave *tx_slave)
++ {
++ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
++ 	struct ethhdr *eth_data = eth_hdr(skb);
++ 
++ 	if (!tx_slave) {
++ 		/* unbalanced or unassigned, send through primary */
++ 		tx_slave = rcu_dereference(bond->curr_active_slave);
++ 		if (bond->params.tlb_dynamic_lb)
++ 			bond_info->unbalanced_load += skb->len;
++ 	}
++ 
++ 	if (tx_slave && SLAVE_IS_OK(tx_slave)) {
++ 		if (tx_slave != rcu_dereference(bond->curr_active_slave)) {
++ 			ether_addr_copy(eth_data->h_source,
++ 					tx_slave->dev->dev_addr);
++ 		}
++ 
++ 		bond_dev_queue_xmit(bond, skb, tx_slave->dev);
++ 		goto out;
++ 	}
++ 
++ 	if (tx_slave && bond->params.tlb_dynamic_lb) {
++ 		_lock_tx_hashtbl(bond);
++ 		__tlb_clear_slave(bond, tx_slave, 0);
++ 		_unlock_tx_hashtbl(bond);
++ 	}
++ 
++ 	/* no suitable interface, frame not sent */
++ 	dev_kfree_skb_any(skb);
++ out:
++ 	return NETDEV_TX_OK;
++ }
++ 
++ int bond_tlb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct ethhdr *eth_data;
++ 	struct slave *tx_slave = NULL;
++ 	u32 hash_index;
++ 
++ 	skb_reset_mac_header(skb);
++ 	eth_data = eth_hdr(skb);
++ 
++ 	/* Do not TX balance any multicast or broadcast */
++ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
++ 		switch (skb->protocol) {
++ 		case htons(ETH_P_IP):
++ 		case htons(ETH_P_IPX):
++ 		    /* In case of IPX, it will falback to L2 hash */
++ 		case htons(ETH_P_IPV6):
++ 			hash_index = bond_xmit_hash(bond, skb);
++ 			if (bond->params.tlb_dynamic_lb) {
++ 				tx_slave = tlb_choose_channel(bond,
++ 							      hash_index & 0xFF,
++ 							      skb->len);
++ 			} else {
++ 				struct list_head *iter;
++ 				int idx = hash_index % bond->slave_cnt;
++ 
++ 				bond_for_each_slave_rcu(bond, tx_slave, iter)
++ 					if (--idx < 0)
++ 						break;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	return bond_do_alb_xmit(skb, bond, tx_slave);
+++>>>>>>> e9f0fb884935 (bonding: Add tlb_dynamic_lb parameter for tlb mode)
+  }
+  
+  int bond_alb_xmit(struct sk_buff *skb, struct net_device *bond_dev)
+diff --cc drivers/net/bonding/bond_main.c
+index d0eec7c786f0,9d08e007d853..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -4662,7 -4303,19 +4663,23 @@@ static int bond_check_params(struct bon
+  	params->all_slaves_active = all_slaves_active;
+  	params->resend_igmp = resend_igmp;
+  	params->min_links = min_links;
+++<<<<<<< HEAD
+ +	params->lp_interval = BOND_ALB_DEFAULT_LP_INTERVAL;
+++=======
++ 	params->lp_interval = lp_interval;
++ 	params->packets_per_slave = packets_per_slave;
++ 	params->tlb_dynamic_lb = 1; /* Default value */
++ 	if (packets_per_slave > 0) {
++ 		params->reciprocal_packets_per_slave =
++ 			reciprocal_value(packets_per_slave);
++ 	} else {
++ 		/* reciprocal_packets_per_slave is unused if
++ 		 * packets_per_slave is 0 or 1, just initialize it
++ 		 */
++ 		params->reciprocal_packets_per_slave =
++ 			(struct reciprocal_value) { 0 };
++ 	}
+++>>>>>>> e9f0fb884935 (bonding: Add tlb_dynamic_lb parameter for tlb mode)
+  
+  	if (primary) {
+  		strncpy(params->primary, primary, IFNAMSIZ);
+diff --cc drivers/net/bonding/bond_sysfs.c
+index 9519d678a368,431892f1a4ce..000000000000
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@@ -1741,6 -1039,62 +1741,65 @@@ out
+  static DEVICE_ATTR(lp_interval, S_IRUGO | S_IWUSR,
+  		   bonding_show_lp_interval, bonding_store_lp_interval);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t bonding_show_tlb_dynamic_lb(struct device *d,
++ 					   struct device_attribute *attr,
++ 					   char *buf)
++ {
++ 	struct bonding *bond = to_bond(d);
++ 	return sprintf(buf, "%d\n", bond->params.tlb_dynamic_lb);
++ }
++ 
++ static ssize_t bonding_store_tlb_dynamic_lb(struct device *d,
++ 					    struct device_attribute *attr,
++ 					    const char *buf,
++ 					    size_t count)
++ {
++ 	struct bonding *bond = to_bond(d);
++ 	int ret;
++ 
++ 	ret = bond_opt_tryset_rtnl(bond, BOND_OPT_TLB_DYNAMIC_LB,
++ 				   (char *)buf);
++ 	if (!ret)
++ 		ret = count;
++ 
++ 	return ret;
++ }
++ 
++ static DEVICE_ATTR(tlb_dynamic_lb, S_IRUGO | S_IWUSR,
++ 		   bonding_show_tlb_dynamic_lb,
++ 		   bonding_store_tlb_dynamic_lb);
++ 
++ static ssize_t bonding_show_packets_per_slave(struct device *d,
++ 					      struct device_attribute *attr,
++ 					      char *buf)
++ {
++ 	struct bonding *bond = to_bond(d);
++ 	unsigned int packets_per_slave = bond->params.packets_per_slave;
++ 	return sprintf(buf, "%u\n", packets_per_slave);
++ }
++ 
++ static ssize_t bonding_store_packets_per_slave(struct device *d,
++ 					       struct device_attribute *attr,
++ 					       const char *buf, size_t count)
++ {
++ 	struct bonding *bond = to_bond(d);
++ 	int ret;
++ 
++ 	ret = bond_opt_tryset_rtnl(bond, BOND_OPT_PACKETS_PER_SLAVE,
++ 				   (char *)buf);
++ 	if (!ret)
++ 		ret = count;
++ 
++ 	return ret;
++ }
++ 
++ static DEVICE_ATTR(packets_per_slave, S_IRUGO | S_IWUSR,
++ 		   bonding_show_packets_per_slave,
++ 		   bonding_store_packets_per_slave);
++ 
+++>>>>>>> e9f0fb884935 (bonding: Add tlb_dynamic_lb parameter for tlb mode)
+  static struct attribute *per_bond_attrs[] = {
+  	&dev_attr_slaves.attr,
+  	&dev_attr_mode.attr,
+@@@ -1772,6 -1126,8 +1831,11 @@@
+  	&dev_attr_resend_igmp.attr,
+  	&dev_attr_min_links.attr,
+  	&dev_attr_lp_interval.attr,
+++<<<<<<< HEAD
+++=======
++ 	&dev_attr_packets_per_slave.attr,
++ 	&dev_attr_tlb_dynamic_lb.attr,
+++>>>>>>> e9f0fb884935 (bonding: Add tlb_dynamic_lb parameter for tlb mode)
+  	NULL,
+  };
+  
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,c1c7c2f12ac4..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -159,6 -173,9 +159,12 @@@ struct bond_params 
+  	int all_slaves_active;
+  	int resend_igmp;
+  	int lp_interval;
+++<<<<<<< HEAD
+++=======
++ 	int packets_per_slave;
++ 	int tlb_dynamic_lb;
++ 	struct reciprocal_value reciprocal_packets_per_slave;
+++>>>>>>> e9f0fb884935 (bonding: Add tlb_dynamic_lb parameter for tlb mode)
+  };
+  
+  struct bond_parm_tbl {
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_options.h
+diff --git a/Documentation/networking/bonding.txt b/Documentation/networking/bonding.txt
+index 58926da1a5a1..564e35bced2e 100644
+--- a/Documentation/networking/bonding.txt
++++ b/Documentation/networking/bonding.txt
+@@ -577,13 +577,19 @@ mode
+ 	balance-tlb or 5
+ 
+ 		Adaptive transmit load balancing: channel bonding that
+-		does not require any special switch support.  The
+-		outgoing traffic is distributed according to the
+-		current load (computed relative to the speed) on each
+-		slave.  Incoming traffic is received by the current
+-		slave.  If the receiving slave fails, another slave
+-		takes over the MAC address of the failed receiving
+-		slave.
++		does not require any special switch support.
++
++		In tlb_dynamic_lb=1 mode; the outgoing traffic is
++		distributed according to the current load (computed
++		relative to the speed) on each slave.
++
++		In tlb_dynamic_lb=0 mode; the load balancing based on
++		current load is disabled and the load is distributed
++		only using the hash distribution.
++
++		Incoming traffic is received by the current slave.
++		If the receiving slave fails, another slave takes over
++		the MAC address of the failed receiving slave.
+ 
+ 		Prerequisite:
+ 
+@@ -718,6 +724,28 @@ primary_reselect
+ 
+ 	This option was added for bonding version 3.6.0.
+ 
++tlb_dynamic_lb
++
++	Specifies if dynamic shuffling of flows is enabled in tlb
++	mode. The value has no effect on any other modes.
++
++	The default behavior of tlb mode is to shuffle active flows across
++	slaves based on the load in that interval. This gives nice lb
++	characteristics but can cause packet reordering. If re-ordering is
++	a concern use this variable to disable flow shuffling and rely on
++	load balancing provided solely by the hash distribution.
++	xmit-hash-policy can be used to select the appropriate hashing for
++	the setup.
++
++	The sysfs entry can be used to change the setting per bond device
++	and the initial value is derived from the module parameter. The
++	sysfs entry is allowed to be changed only if the bond device is
++	down.
++
++	The default value is "1" that enables flow shuffling while value "0"
++	disables it. This option was added in bonding driver 3.7.1
++
++
+ updelay
+ 
+ 	Specifies the time, in milliseconds, to wait before enabling a
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_options.h
+* Unmerged path drivers/net/bonding/bond_sysfs.c
+* Unmerged path drivers/net/bonding/bonding.h
