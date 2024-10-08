@@ -1,0 +1,595 @@
+s390: fix save and restore of the floating-point-control register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [s390] fix save and restore of the floating-point-control register (Hendrik Brueckner) [1029602]
+Rebuild_FUZZ: 95.16%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 4725c86055f5bbdcdfe47199c0715881893a2c79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4725c860.failed
+
+The FPC_VALID_MASK has been used to check the validity of the value
+to be loaded into the floating-point-control register. With the
+introduction of the floating-point extension facility and the
+decimal-floating-point additional bits have been defined which need
+to be checked in a non straight forward way. So far these bits have
+been ignored which can cause an incorrect results for decimal-
+floating-point operations, e.g. an incorrect rounding mode to be
+set after signal return.
+
+The static check with the FPC_VALID_MASK is replaced with a trial
+load of the floating-point-control value, see test_fp_ctl.
+
+In addition an information leak with the padding word between the
+floating-point-control word and the floating-point registers in
+the s390_fp_regs is fixed.
+
+	Reported-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 4725c86055f5bbdcdfe47199c0715881893a2c79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/compat_signal.c
+#	arch/s390/kernel/signal.c
+diff --cc arch/s390/kernel/compat_signal.c
+index c439ac9ced09,ceeaaa6633a1..000000000000
+--- a/arch/s390/kernel/compat_signal.c
++++ b/arch/s390/kernel/compat_signal.c
+@@@ -153,24 -153,25 +153,36 @@@ int copy_siginfo_from_user32(siginfo_t 
+  
+  static int save_sigregs32(struct pt_regs *regs, _sigregs32 __user *sregs)
+  {
+- 	_s390_regs_common32 regs32;
+- 	int err, i;
++ 	_sigregs32 user_sregs;
++ 	int i;
+  
+- 	regs32.psw.mask = psw32_user_bits |
++ 	user_sregs.regs.psw.mask = psw32_user_bits |
+  		((__u32)(regs->psw.mask >> 32) & PSW32_MASK_USER);
+- 	regs32.psw.addr = (__u32) regs->psw.addr |
++ 	user_sregs.regs.psw.addr = (__u32) regs->psw.addr |
+  		(__u32)(regs->psw.mask & PSW_MASK_BA);
+  	for (i = 0; i < NUM_GPRS; i++)
+- 		regs32.gprs[i] = (__u32) regs->gprs[i];
++ 		user_sregs.regs.gprs[i] = (__u32) regs->gprs[i];
+  	save_access_regs(current->thread.acrs);
+++<<<<<<< HEAD
+ +	memcpy(regs32.acrs, current->thread.acrs, sizeof(regs32.acrs));
+ +	err = __copy_to_user(&sregs->regs, &regs32, sizeof(regs32));
+ +	if (err)
+ +		return err;
+ +	save_fp_regs(&current->thread.fp_regs);
+ +	/* s390_fp_regs and _s390_fp_regs32 are the same ! */
+ +	return __copy_to_user(&sregs->fpregs, &current->thread.fp_regs,
+ +			      sizeof(_s390_fp_regs32));
+++=======
++ 	memcpy(&user_sregs.regs.acrs, current->thread.acrs,
++ 	       sizeof(user_sregs.regs.acrs));
++ 	save_fp_ctl(&current->thread.fp_regs.fpc);
++ 	save_fp_regs(current->thread.fp_regs.fprs);
++ 	memcpy(&user_sregs.fpregs, &current->thread.fp_regs,
++ 	       sizeof(user_sregs.fpregs));
++ 	if (__copy_to_user(sregs, &user_sregs, sizeof(_sigregs32)))
++ 		return -EFAULT;
++ 	return 0;
+++>>>>>>> 4725c86055f5 (s390: fix save and restore of the floating-point-control register)
+  }
+  
+  static int restore_sigregs32(struct pt_regs *regs,_sigregs32 __user *sregs)
+@@@ -181,29 -182,32 +193,46 @@@
+  	/* Alwys make any pending restarted system call return -EINTR */
+  	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+  
+++<<<<<<< HEAD
+ +	err = __copy_from_user(&regs32, &sregs->regs, sizeof(regs32));
+ +	if (err)
+ +		return err;
+++=======
++ 	if (__copy_from_user(&user_sregs, &sregs->regs, sizeof(user_sregs)))
++ 		return -EFAULT;
++ 
++ 	/* Loading the floating-point-control word can fail. Do that first. */
++ 	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
++ 		return -EINVAL;
++ 
++ 	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
+++>>>>>>> 4725c86055f5 (s390: fix save and restore of the floating-point-control register)
+  	regs->psw.mask = (regs->psw.mask & ~PSW_MASK_USER) |
+- 		(__u64)(regs32.psw.mask & PSW32_MASK_USER) << 32 |
+- 		(__u64)(regs32.psw.addr & PSW32_ADDR_AMODE);
++ 		(__u64)(user_sregs.regs.psw.mask & PSW32_MASK_USER) << 32 |
++ 		(__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_AMODE);
+  	/* Check for invalid user address space control. */
+ -	if ((regs->psw.mask & PSW_MASK_ASC) == PSW_ASC_HOME)
+ -		regs->psw.mask = PSW_ASC_PRIMARY |
+ +	if ((regs->psw.mask & PSW_MASK_ASC) >= (psw_kernel_bits & PSW_MASK_ASC))
+ +		regs->psw.mask = (psw_user_bits & PSW_MASK_ASC) |
+  			(regs->psw.mask & ~PSW_MASK_ASC);
+- 	regs->psw.addr = (__u64)(regs32.psw.addr & PSW32_ADDR_INSN);
++ 	regs->psw.addr = (__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_INSN);
+  	for (i = 0; i < NUM_GPRS; i++)
+- 		regs->gprs[i] = (__u64) regs32.gprs[i];
+- 	memcpy(current->thread.acrs, regs32.acrs, sizeof(current->thread.acrs));
++ 		regs->gprs[i] = (__u64) user_sregs.regs.gprs[i];
++ 	memcpy(&current->thread.acrs, &user_sregs.regs.acrs,
++ 	       sizeof(current->thread.acrs));
+  	restore_access_regs(current->thread.acrs);
+  
+++<<<<<<< HEAD
+ +	err = __copy_from_user(&current->thread.fp_regs, &sregs->fpregs,
+ +			       sizeof(_s390_fp_regs32));
+ +	current->thread.fp_regs.fpc &= FPC_VALID_MASK;
+ +	if (err)
+ +		return err;
+++=======
++ 	memcpy(&current->thread.fp_regs, &user_sregs.fpregs,
++ 	       sizeof(current->thread.fp_regs));
+++>>>>>>> 4725c86055f5 (s390: fix save and restore of the floating-point-control register)
+  
+- 	restore_fp_regs(&current->thread.fp_regs);
++ 	restore_fp_regs(current->thread.fp_regs.fprs);
+  	clear_thread_flag(TIF_SYSCALL);	/* No longer in a system call */
+  	return 0;
+  }
+diff --cc arch/s390/kernel/signal.c
+index c45becf82e01,4c28c39e3718..000000000000
+--- a/arch/s390/kernel/signal.c
++++ b/arch/s390/kernel/signal.c
+@@@ -67,25 -67,30 +67,44 @@@ static int save_sigregs(struct pt_regs 
+  	 * We have to store the fp registers to current->thread.fp_regs
+  	 * to merge them with the emulated registers.
+  	 */
+- 	save_fp_regs(&current->thread.fp_regs);
++ 	save_fp_ctl(&current->thread.fp_regs.fpc);
++ 	save_fp_regs(current->thread.fp_regs.fprs);
+  	memcpy(&user_sregs.fpregs, &current->thread.fp_regs,
+++<<<<<<< HEAD
+ +	       sizeof(s390_fp_regs));
+ +	return __copy_to_user(sregs, &user_sregs, sizeof(_sigregs));
+++=======
++ 	       sizeof(user_sregs.fpregs));
++ 	if (__copy_to_user(sregs, &user_sregs, sizeof(_sigregs)))
++ 		return -EFAULT;
++ 	return 0;
+++>>>>>>> 4725c86055f5 (s390: fix save and restore of the floating-point-control register)
+  }
+  
+ +/* Returns positive number on error */
+  static int restore_sigregs(struct pt_regs *regs, _sigregs __user *sregs)
+  {
+ +	int err;
+  	_sigregs user_sregs;
+  
+  	/* Alwys make any pending restarted system call return -EINTR */
+  	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+  
+++<<<<<<< HEAD
+ +	err = __copy_from_user(&user_sregs, sregs, sizeof(_sigregs));
+ +	if (err)
+ +		return err;
+ +	/* Use regs->psw.mask instead of psw_user_bits to preserve PER bit. */
+++=======
++ 	if (__copy_from_user(&user_sregs, sregs, sizeof(user_sregs)))
++ 		return -EFAULT;
++ 
++ 	/* Loading the floating-point-control word can fail. Do that first. */
++ 	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
++ 		return -EINVAL;
++ 
++ 	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
+++>>>>>>> 4725c86055f5 (s390: fix save and restore of the floating-point-control register)
+  	regs->psw.mask = (regs->psw.mask & ~PSW_MASK_USER) |
+  		(user_sregs.regs.psw.mask & PSW_MASK_USER);
+  	/* Check for invalid user address space control. */
+diff --git a/arch/s390/include/asm/switch_to.h b/arch/s390/include/asm/switch_to.h
+index f3a9e0f92704..0f865824f25e 100644
+--- a/arch/s390/include/asm/switch_to.h
++++ b/arch/s390/include/asm/switch_to.h
+@@ -12,58 +12,94 @@
+ extern struct task_struct *__switch_to(void *, void *);
+ extern void update_per_regs(struct task_struct *task);
+ 
+-static inline void save_fp_regs(s390_fp_regs *fpregs)
++static inline int test_fp_ctl(u32 fpc)
+ {
++	u32 orig_fpc;
++	int rc;
++
++	if (!MACHINE_HAS_IEEE)
++		return 0;
++
+ 	asm volatile(
+-		"	std	0,%O0+8(%R0)\n"
+-		"	std	2,%O0+24(%R0)\n"
+-		"	std	4,%O0+40(%R0)\n"
+-		"	std	6,%O0+56(%R0)"
+-		: "=Q" (*fpregs) : "Q" (*fpregs));
++		"	efpc    %1\n"
++		"	sfpc	%2\n"
++		"0:	sfpc	%1\n"
++		"	la	%0,0\n"
++		"1:\n"
++		EX_TABLE(0b,1b)
++		: "=d" (rc), "=d" (orig_fpc)
++		: "d" (fpc), "0" (-EINVAL));
++	return rc;
++}
++
++static inline void save_fp_ctl(u32 *fpc)
++{
+ 	if (!MACHINE_HAS_IEEE)
+ 		return;
++
+ 	asm volatile(
+-		"	stfpc	%0\n"
+-		"	std	1,%O0+16(%R0)\n"
+-		"	std	3,%O0+32(%R0)\n"
+-		"	std	5,%O0+48(%R0)\n"
+-		"	std	7,%O0+64(%R0)\n"
+-		"	std	8,%O0+72(%R0)\n"
+-		"	std	9,%O0+80(%R0)\n"
+-		"	std	10,%O0+88(%R0)\n"
+-		"	std	11,%O0+96(%R0)\n"
+-		"	std	12,%O0+104(%R0)\n"
+-		"	std	13,%O0+112(%R0)\n"
+-		"	std	14,%O0+120(%R0)\n"
+-		"	std	15,%O0+128(%R0)\n"
+-		: "=Q" (*fpregs) : "Q" (*fpregs));
++		"       stfpc   %0\n"
++		: "+Q" (*fpc));
+ }
+ 
+-static inline void restore_fp_regs(s390_fp_regs *fpregs)
++static inline int restore_fp_ctl(u32 *fpc)
+ {
++	int rc;
++
++	if (!MACHINE_HAS_IEEE)
++		return 0;
++
+ 	asm volatile(
+-		"	ld	0,%O0+8(%R0)\n"
+-		"	ld	2,%O0+24(%R0)\n"
+-		"	ld	4,%O0+40(%R0)\n"
+-		"	ld	6,%O0+56(%R0)"
+-		: : "Q" (*fpregs));
++		"0:	lfpc    %1\n"
++		"	la	%0,0\n"
++		"1:\n"
++		EX_TABLE(0b,1b)
++		: "=d" (rc) : "Q" (*fpc), "0" (-EINVAL));
++	return rc;
++}
++
++static inline void save_fp_regs(freg_t *fprs)
++{
++	asm volatile("std 0,%0" : "=Q" (fprs[0]));
++	asm volatile("std 2,%0" : "=Q" (fprs[2]));
++	asm volatile("std 4,%0" : "=Q" (fprs[4]));
++	asm volatile("std 6,%0" : "=Q" (fprs[6]));
+ 	if (!MACHINE_HAS_IEEE)
+ 		return;
+-	asm volatile(
+-		"	lfpc	%0\n"
+-		"	ld	1,%O0+16(%R0)\n"
+-		"	ld	3,%O0+32(%R0)\n"
+-		"	ld	5,%O0+48(%R0)\n"
+-		"	ld	7,%O0+64(%R0)\n"
+-		"	ld	8,%O0+72(%R0)\n"
+-		"	ld	9,%O0+80(%R0)\n"
+-		"	ld	10,%O0+88(%R0)\n"
+-		"	ld	11,%O0+96(%R0)\n"
+-		"	ld	12,%O0+104(%R0)\n"
+-		"	ld	13,%O0+112(%R0)\n"
+-		"	ld	14,%O0+120(%R0)\n"
+-		"	ld	15,%O0+128(%R0)\n"
+-		: : "Q" (*fpregs));
++	asm volatile("std 1,%0" : "=Q" (fprs[1]));
++	asm volatile("std 3,%0" : "=Q" (fprs[3]));
++	asm volatile("std 5,%0" : "=Q" (fprs[5]));
++	asm volatile("std 7,%0" : "=Q" (fprs[7]));
++	asm volatile("std 8,%0" : "=Q" (fprs[8]));
++	asm volatile("std 9,%0" : "=Q" (fprs[9]));
++	asm volatile("std 10,%0" : "=Q" (fprs[10]));
++	asm volatile("std 11,%0" : "=Q" (fprs[11]));
++	asm volatile("std 12,%0" : "=Q" (fprs[12]));
++	asm volatile("std 13,%0" : "=Q" (fprs[13]));
++	asm volatile("std 14,%0" : "=Q" (fprs[14]));
++	asm volatile("std 15,%0" : "=Q" (fprs[15]));
++}
++
++static inline void restore_fp_regs(freg_t *fprs)
++{
++	asm volatile("ld 0,%0" : : "Q" (fprs[0]));
++	asm volatile("ld 2,%0" : : "Q" (fprs[2]));
++	asm volatile("ld 4,%0" : : "Q" (fprs[4]));
++	asm volatile("ld 6,%0" : : "Q" (fprs[6]));
++	if (!MACHINE_HAS_IEEE)
++		return;
++	asm volatile("ld 1,%0" : : "Q" (fprs[1]));
++	asm volatile("ld 3,%0" : : "Q" (fprs[3]));
++	asm volatile("ld 5,%0" : : "Q" (fprs[5]));
++	asm volatile("ld 7,%0" : : "Q" (fprs[7]));
++	asm volatile("ld 8,%0" : : "Q" (fprs[8]));
++	asm volatile("ld 9,%0" : : "Q" (fprs[9]));
++	asm volatile("ld 10,%0" : : "Q" (fprs[10]));
++	asm volatile("ld 11,%0" : : "Q" (fprs[11]));
++	asm volatile("ld 12,%0" : : "Q" (fprs[12]));
++	asm volatile("ld 13,%0" : : "Q" (fprs[13]));
++	asm volatile("ld 14,%0" : : "Q" (fprs[14]));
++	asm volatile("ld 15,%0" : : "Q" (fprs[15]));
+ }
+ 
+ static inline void save_access_regs(unsigned int *acrs)
+@@ -78,12 +114,14 @@ static inline void restore_access_regs(unsigned int *acrs)
+ 
+ #define switch_to(prev,next,last) do {					\
+ 	if (prev->mm) {							\
+-		save_fp_regs(&prev->thread.fp_regs);			\
++		save_fp_ctl(&prev->thread.fp_regs.fpc);			\
++		save_fp_regs(prev->thread.fp_regs.fprs);		\
+ 		save_access_regs(&prev->thread.acrs[0]);		\
+ 		save_ri_cb(prev->thread.ri_cb);				\
+ 	}								\
+ 	if (next->mm) {							\
+-		restore_fp_regs(&next->thread.fp_regs);			\
++		restore_fp_ctl(&next->thread.fp_regs.fpc);		\
++		restore_fp_regs(next->thread.fp_regs.fprs);		\
+ 		restore_access_regs(&next->thread.acrs[0]);		\
+ 		restore_ri_cb(next->thread.ri_cb, prev->thread.ri_cb);	\
+ 		update_per_regs(next);					\
+diff --git a/arch/s390/include/uapi/asm/ptrace.h b/arch/s390/include/uapi/asm/ptrace.h
+index 3aa9f1ec5b29..072b55c4f739 100644
+--- a/arch/s390/include/uapi/asm/ptrace.h
++++ b/arch/s390/include/uapi/asm/ptrace.h
+@@ -199,6 +199,7 @@ typedef union
+ typedef struct
+ {
+ 	__u32   fpc;
++	__u32	pad;
+ 	freg_t  fprs[NUM_FPRS];              
+ } s390_fp_regs;
+ 
+@@ -206,7 +207,6 @@ typedef struct
+ #define FPC_FLAGS_MASK          0x00F80000
+ #define FPC_DXC_MASK            0x0000FF00
+ #define FPC_RM_MASK             0x00000003
+-#define FPC_VALID_MASK          0xF8F8FF03
+ 
+ /* this typedef defines how a Program Status Word looks like */
+ typedef struct 
+diff --git a/arch/s390/include/uapi/asm/sigcontext.h b/arch/s390/include/uapi/asm/sigcontext.h
+index 584787f6ce44..b30de9c01bbe 100644
+--- a/arch/s390/include/uapi/asm/sigcontext.h
++++ b/arch/s390/include/uapi/asm/sigcontext.h
+@@ -49,6 +49,7 @@ typedef struct
+ typedef struct
+ {
+ 	unsigned int fpc;
++	unsigned int pad;
+ 	double   fprs[__NUM_FPRS];
+ } _s390_fp_regs;
+ 
+diff --git a/arch/s390/kernel/compat_linux.h b/arch/s390/kernel/compat_linux.h
+index 976518c0592a..1bfda3eca379 100644
+--- a/arch/s390/kernel/compat_linux.h
++++ b/arch/s390/kernel/compat_linux.h
+@@ -27,6 +27,7 @@ typedef union
+ typedef struct
+ {
+ 	unsigned int	fpc;
++	unsigned int	pad;
+ 	freg_t32	fprs[__NUM_FPRS];              
+ } _s390_fp_regs32;
+ 
+* Unmerged path arch/s390/kernel/compat_signal.c
+diff --git a/arch/s390/kernel/process.c b/arch/s390/kernel/process.c
+index 2bc3eddae34a..96f9dcc1b43f 100644
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@ -164,7 +164,8 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
+ 	 * save fprs to current->thread.fp_regs to merge them with
+ 	 * the emulated registers and then copy the result to the child.
+ 	 */
+-	save_fp_regs(&current->thread.fp_regs);
++	save_fp_ctl(&current->thread.fp_regs.fpc);
++	save_fp_regs(current->thread.fp_regs.fprs);
+ 	memcpy(&p->thread.fp_regs, &current->thread.fp_regs,
+ 	       sizeof(s390_fp_regs));
+ 	/* Set a new TLS ?  */
+@@ -172,7 +173,9 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
+ 		p->thread.acrs[0] = frame->childregs.gprs[6];
+ #else /* CONFIG_64BIT */
+ 	/* Save the fpu registers to new thread structure. */
+-	save_fp_regs(&p->thread.fp_regs);
++	save_fp_ctl(&p->thread.fp_regs.fpc);
++	save_fp_regs(p->thread.fp_regs.fprs);
++	p->thread.fp_regs.pad = 0;
+ 	/* Set a new TLS ?  */
+ 	if (clone_flags & CLONE_SETTLS) {
+ 		unsigned long tls = frame->childregs.gprs[6];
+@@ -204,10 +207,12 @@ int dump_fpu (struct pt_regs * regs, s390_fp_regs *fpregs)
+ 	 * save fprs to current->thread.fp_regs to merge them with
+ 	 * the emulated registers and then copy the result to the dump.
+ 	 */
+-	save_fp_regs(&current->thread.fp_regs);
++	save_fp_ctl(&current->thread.fp_regs.fpc);
++	save_fp_regs(current->thread.fp_regs.fprs);
+ 	memcpy(fpregs, &current->thread.fp_regs, sizeof(s390_fp_regs));
+ #else /* CONFIG_64BIT */
+-	save_fp_regs(fpregs);
++	save_fp_ctl(&fpregs->fpc);
++	save_fp_regs(fpregs->fprs);
+ #endif /* CONFIG_64BIT */
+ 	return 1;
+ }
+diff --git a/arch/s390/kernel/ptrace.c b/arch/s390/kernel/ptrace.c
+index a314c57f4e94..63394da2df11 100644
+--- a/arch/s390/kernel/ptrace.c
++++ b/arch/s390/kernel/ptrace.c
+@@ -231,8 +231,7 @@ static unsigned long __peek_user(struct task_struct *child, addr_t addr)
+ 		offset = addr - (addr_t) &dummy->regs.fp_regs;
+ 		tmp = *(addr_t *)((addr_t) &child->thread.fp_regs + offset);
+ 		if (addr == (addr_t) &dummy->regs.fp_regs.fpc)
+-			tmp &= (unsigned long) FPC_VALID_MASK
+-				<< (BITS_PER_LONG - 32);
++			tmp <<= BITS_PER_LONG - 32;
+ 
+ 	} else if (addr < (addr_t) (&dummy->regs.per_info + 1)) {
+ 		/*
+@@ -355,10 +354,10 @@ static int __poke_user(struct task_struct *child, addr_t addr, addr_t data)
+ 		/*
+ 		 * floating point regs. are stored in the thread structure
+ 		 */
+-		if (addr == (addr_t) &dummy->regs.fp_regs.fpc &&
+-		    (data & ~((unsigned long) FPC_VALID_MASK
+-			      << (BITS_PER_LONG - 32))) != 0)
+-			return -EINVAL;
++		if (addr == (addr_t) &dummy->regs.fp_regs.fpc)
++			if ((unsigned int) data != 0 ||
++			    test_fp_ctl(data >> (BITS_PER_LONG - 32)))
++				return -EINVAL;
+ 		offset = addr - (addr_t) &dummy->regs.fp_regs;
+ 		*(addr_t *)((addr_t) &child->thread.fp_regs + offset) = data;
+ 
+@@ -668,8 +667,7 @@ static int __poke_user_compat(struct task_struct *child,
+ 		 * floating point regs. are stored in the thread structure 
+ 		 */
+ 		if (addr == (addr_t) &dummy32->regs.fp_regs.fpc &&
+-		    (tmp & ~FPC_VALID_MASK) != 0)
+-			/* Invalid floating point control. */
++		    test_fp_ctl(tmp))
+ 			return -EINVAL;
+ 	        offset = addr - (addr_t) &dummy32->regs.fp_regs;
+ 		*(__u32 *)((addr_t) &child->thread.fp_regs + offset) = tmp;
+@@ -867,8 +865,10 @@ static int s390_fpregs_get(struct task_struct *target,
+ 			   const struct user_regset *regset, unsigned int pos,
+ 			   unsigned int count, void *kbuf, void __user *ubuf)
+ {
+-	if (target == current)
+-		save_fp_regs(&target->thread.fp_regs);
++	if (target == current) {
++		save_fp_ctl(&target->thread.fp_regs.fpc);
++		save_fp_regs(target->thread.fp_regs.fprs);
++	}
+ 
+ 	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+ 				   &target->thread.fp_regs, 0, -1);
+@@ -881,19 +881,21 @@ static int s390_fpregs_set(struct task_struct *target,
+ {
+ 	int rc = 0;
+ 
+-	if (target == current)
+-		save_fp_regs(&target->thread.fp_regs);
++	if (target == current) {
++		save_fp_ctl(&target->thread.fp_regs.fpc);
++		save_fp_regs(target->thread.fp_regs.fprs);
++	}
+ 
+ 	/* If setting FPC, must validate it first. */
+ 	if (count > 0 && pos < offsetof(s390_fp_regs, fprs)) {
+-		u32 fpc[2] = { target->thread.fp_regs.fpc, 0 };
+-		rc = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &fpc,
++		u32 ufpc[2] = { target->thread.fp_regs.fpc, 0 };
++		rc = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &ufpc,
+ 					0, offsetof(s390_fp_regs, fprs));
+ 		if (rc)
+ 			return rc;
+-		if ((fpc[0] & ~FPC_VALID_MASK) != 0 || fpc[1] != 0)
++		if (ufpc[1] != 0 || test_fp_ctl(ufpc[0]))
+ 			return -EINVAL;
+-		target->thread.fp_regs.fpc = fpc[0];
++		target->thread.fp_regs.fpc = ufpc[0];
+ 	}
+ 
+ 	if (rc == 0 && count > 0)
+@@ -901,8 +903,10 @@ static int s390_fpregs_set(struct task_struct *target,
+ 					target->thread.fp_regs.fprs,
+ 					offsetof(s390_fp_regs, fprs), -1);
+ 
+-	if (rc == 0 && target == current)
+-		restore_fp_regs(&target->thread.fp_regs);
++	if (rc == 0 && target == current) {
++		restore_fp_ctl(&target->thread.fp_regs.fpc);
++		restore_fp_regs(target->thread.fp_regs.fprs);
++	}
+ 
+ 	return rc;
+ }
+* Unmerged path arch/s390/kernel/signal.c
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index c1c7c683fa26..7065d91be8fc 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -327,10 +327,11 @@ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
+ 
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+-	save_fp_regs(&vcpu->arch.host_fpregs);
++	save_fp_ctl(&vcpu->arch.host_fpregs.fpc);
++	save_fp_regs(vcpu->arch.host_fpregs.fprs);
+ 	save_access_regs(vcpu->arch.host_acrs);
+-	vcpu->arch.guest_fpregs.fpc &= FPC_VALID_MASK;
+-	restore_fp_regs(&vcpu->arch.guest_fpregs);
++	restore_fp_ctl(&vcpu->arch.guest_fpregs.fpc);
++	restore_fp_regs(vcpu->arch.guest_fpregs.fprs);
+ 	restore_access_regs(vcpu->run->s.regs.acrs);
+ 	gmap_enable(vcpu->arch.gmap);
+ 	atomic_set_mask(CPUSTAT_RUNNING, &vcpu->arch.sie_block->cpuflags);
+@@ -340,9 +341,11 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ {
+ 	atomic_clear_mask(CPUSTAT_RUNNING, &vcpu->arch.sie_block->cpuflags);
+ 	gmap_disable(vcpu->arch.gmap);
+-	save_fp_regs(&vcpu->arch.guest_fpregs);
++	save_fp_ctl(&vcpu->arch.guest_fpregs.fpc);
++	save_fp_regs(vcpu->arch.guest_fpregs.fprs);
+ 	save_access_regs(vcpu->run->s.regs.acrs);
+-	restore_fp_regs(&vcpu->arch.host_fpregs);
++	restore_fp_ctl(&vcpu->arch.host_fpregs.fpc);
++	restore_fp_regs(vcpu->arch.host_fpregs.fprs);
+ 	restore_access_regs(vcpu->arch.host_acrs);
+ }
+ 
+@@ -556,9 +559,12 @@ int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
+ 
+ int kvm_arch_vcpu_ioctl_set_fpu(struct kvm_vcpu *vcpu, struct kvm_fpu *fpu)
+ {
++	if (test_fp_ctl(fpu->fpc))
++		return -EINVAL;
+ 	memcpy(&vcpu->arch.guest_fpregs.fprs, &fpu->fprs, sizeof(fpu->fprs));
+-	vcpu->arch.guest_fpregs.fpc = fpu->fpc & FPC_VALID_MASK;
+-	restore_fp_regs(&vcpu->arch.guest_fpregs);
++	vcpu->arch.guest_fpregs.fpc = fpu->fpc;
++	restore_fp_ctl(&vcpu->arch.guest_fpregs.fpc);
++	restore_fp_regs(vcpu->arch.guest_fpregs.fprs);
+ 	return 0;
+ }
+ 
+@@ -780,7 +786,8 @@ int kvm_s390_vcpu_store_status(struct kvm_vcpu *vcpu, unsigned long addr)
+ 	 * copying in vcpu load/put. Lets update our copies before we save
+ 	 * it into the save area
+ 	 */
+-	save_fp_regs(&vcpu->arch.guest_fpregs);
++	save_fp_ctl(&vcpu->arch.guest_fpregs.fpc);
++	save_fp_regs(vcpu->arch.guest_fpregs.fprs);
+ 	save_access_regs(vcpu->run->s.regs.acrs);
+ 
+ 	if (__guestcopy(vcpu, addr + offsetof(struct save_area, fp_regs),
+diff --git a/arch/s390/math-emu/math.c b/arch/s390/math-emu/math.c
+index 58bff541fde9..a6ba0d724335 100644
+--- a/arch/s390/math-emu/math.c
++++ b/arch/s390/math-emu/math.c
+@@ -19,6 +19,8 @@
+ #include <math-emu/double.h>
+ #include <math-emu/quad.h>
+ 
++#define FPC_VALID_MASK		0xF8F8FF03
++
+ /*
+  * I miss a macro to round a floating point number to the
+  * nearest integer in the same floating point format.
