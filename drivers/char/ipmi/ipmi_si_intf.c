@@ -69,6 +69,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
+#include <linux/acpi.h>
 
 #define PFX "ipmi_si: "
 
@@ -2009,8 +2010,6 @@ static int hardcode_find_bmc(void)
 }
 
 #ifdef CONFIG_ACPI
-
-#include <linux/acpi.h>
 
 /*
  * Once we get an ACPI failure, we don't try any more, because we go
