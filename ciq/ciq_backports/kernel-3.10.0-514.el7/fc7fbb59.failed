@@ -1,0 +1,145 @@
+xprtrdma: Acquire FMRs in rpcrdma_fmr_register_external()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit fc7fbb59e70c65e2bd6170a6de139d5de62dd2be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fc7fbb59.failed
+
+Acquiring 64 FMRs in rpcrdma_buffer_get() while holding the buffer
+pool lock is expensive, and unnecessary because FMR mode can
+transfer up to a 1MB payload using just a single ib_fmr.
+
+Instead, acquire ib_fmrs one-at-a-time as chunks are registered, and
+return them to rb_mws immediately during deregistration.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+Tested-By: Devesh Sharma <devesh.sharma@avagotech.com>
+	Reviewed-by: Doug Ledford <dledford@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit fc7fbb59e70c65e2bd6170a6de139d5de62dd2be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index a91ba2c8ef1e,53fb649071d9..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -85,12 -109,25 +109,25 @@@ fmr_op_map(struct rpcrdma_xprt *r_xprt
+  	   int nsegs, bool writing)
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct ib_device *device = ia->ri_device;
+ +	struct ib_device *device = ia->ri_id->device;
+  	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+  	struct rpcrdma_mr_seg *seg1 = seg;
+- 	struct rpcrdma_mw *mw = seg1->rl_mw;
+  	u64 physaddrs[RPCRDMA_MAX_DATA_SEGS];
+  	int len, pageoff, i, rc;
++ 	struct rpcrdma_mw *mw;
++ 
++ 	mw = seg1->rl_mw;
++ 	seg1->rl_mw = NULL;
++ 	if (!mw) {
++ 		mw = rpcrdma_get_mw(r_xprt);
++ 		if (!mw)
++ 			return -ENOMEM;
++ 	} else {
++ 		/* this is a retransmit; generate a fresh rkey */
++ 		rc = __fmr_unmap(mw);
++ 		if (rc)
++ 			return rc;
++ 	}
+  
+  	pageoff = offset_in_page(seg1->mr_offset);
+  	seg1->mr_offset -= pageoff;	/* start of page */
+@@@ -137,19 -175,18 +175,32 @@@ fmr_op_unmap(struct rpcrdma_xprt *r_xpr
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+  	struct rpcrdma_mr_seg *seg1 = seg;
+++<<<<<<< HEAD
+ +	struct ib_device *device;
+++=======
++ 	struct rpcrdma_mw *mw = seg1->rl_mw;
+++>>>>>>> fc7fbb59e70c (xprtrdma: Acquire FMRs in rpcrdma_fmr_register_external())
+  	int rc, nsegs = seg->mr_nsegs;
+- 	LIST_HEAD(l);
+  
+++<<<<<<< HEAD
+ +	list_add(&seg1->rl_mw->r.fmr->list, &l);
+ +	rc = ib_unmap_fmr(&l);
+ +	read_lock(&ia->ri_qplock);
+ +	device = ia->ri_id->device;
+ +	while (seg1->mr_nsegs--)
+ +		rpcrdma_unmap_one(device, seg++);
+ +	read_unlock(&ia->ri_qplock);
+++=======
++ 	dprintk("RPC:       %s: FMR %p\n", __func__, mw);
++ 
++ 	seg1->rl_mw = NULL;
++ 	while (seg1->mr_nsegs--)
++ 		rpcrdma_unmap_one(ia->ri_device, seg++);
++ 	rc = __fmr_unmap(mw);
+++>>>>>>> fc7fbb59e70c (xprtrdma: Acquire FMRs in rpcrdma_fmr_register_external())
+  	if (rc)
+  		goto out_err;
++ 	rpcrdma_put_mw(r_xprt, mw);
+  	return nsegs;
+  
+  out_err:
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index a035813686ee..25b7c554a12f 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1325,28 +1325,6 @@ rpcrdma_buffer_get_frmrs(struct rpcrdma_req *req, struct rpcrdma_buffer *buf,
+ 	return NULL;
+ }
+ 
+-static struct rpcrdma_req *
+-rpcrdma_buffer_get_fmrs(struct rpcrdma_req *req, struct rpcrdma_buffer *buf)
+-{
+-	struct rpcrdma_mw *r;
+-	int i;
+-
+-	i = RPCRDMA_MAX_SEGS - 1;
+-	while (!list_empty(&buf->rb_mws)) {
+-		r = list_entry(buf->rb_mws.next,
+-			       struct rpcrdma_mw, mw_list);
+-		list_del(&r->mw_list);
+-		req->rl_segments[i].rl_mw = r;
+-		if (unlikely(i-- == 0))
+-			return req;	/* Success */
+-	}
+-
+-	/* Not enough entries on rb_mws for this req */
+-	rpcrdma_buffer_put_sendbuf(req, buf);
+-	rpcrdma_buffer_put_mrs(req, buf);
+-	return NULL;
+-}
+-
+ /*
+  * Get a set of request/reply buffers.
+  *
+@@ -1388,9 +1366,6 @@ rpcrdma_buffer_get(struct rpcrdma_buffer *buffers)
+ 	case RPCRDMA_FRMR:
+ 		req = rpcrdma_buffer_get_frmrs(req, buffers, &stale);
+ 		break;
+-	case RPCRDMA_MTHCAFMR:
+-		req = rpcrdma_buffer_get_fmrs(req, buffers);
+-		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1415,7 +1390,6 @@ rpcrdma_buffer_put(struct rpcrdma_req *req)
+ 	rpcrdma_buffer_put_sendbuf(req, buffers);
+ 	switch (ia->ri_memreg_strategy) {
+ 	case RPCRDMA_FRMR:
+-	case RPCRDMA_MTHCAFMR:
+ 		rpcrdma_buffer_put_mrs(req, buffers);
+ 		break;
+ 	default:
