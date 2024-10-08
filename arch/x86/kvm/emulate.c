@@ -4645,6 +4645,7 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 			/* All REP prefixes have the same first termination condition */
 			if (address_mask(ctxt, reg_read(ctxt, VCPU_REGS_RCX)) == 0) {
 				ctxt->eip = ctxt->_eip;
+				ctxt->eflags &= ~EFLG_RF;
 				goto done;
 			}
 		}
@@ -4686,6 +4687,8 @@ special_insn:
 		if (rc != X86EMUL_CONTINUE)
 			goto done;
 	}
+
+	ctxt->eflags &= ~EFLG_RF;
 
 	if (ctxt->execute) {
 		if (ctxt->d & Fastop) {
