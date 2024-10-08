@@ -1,0 +1,81 @@
+md/raid5: ensure device failure recorded before write request returns.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [md] raid5: ensure device failure recorded before write request returns (Jes Sorensen) [1250578 1265947 1273343 1299140 1307091 1312828 1320563 1340839]
+Rebuild_FUZZ: 97.06%
+commit-author NeilBrown <neilb@suse.com>
+commit c3cce6cda162eb2b2960a85d9c8992f4f3be85d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c3cce6cd.failed
+
+When a write to one of the devices of a RAID5/6 fails, the failure is
+recorded in the metadata of the other devices so that after a restart
+the data on the failed drive wont be trusted even if that drive seems
+to be working again (maybe a cable was unplugged).
+
+Similarly when we record a bad-block in response to a write failure,
+we must not let the write complete until the bad-block update is safe.
+
+Currently there is no interlock between the write request completing
+and the metadata update.  So it is possible that the write will
+complete, the app will confirm success in some way, and then the
+machine will crash before the metadata update completes.
+
+This is an extremely small hole for a racy to fit in, but it is
+theoretically possible and so should be closed.
+
+So:
+ - set MD_CHANGE_PENDING when requesting a metadata update for a
+   failed device, so we can know with certainty when it completes
+ - queue requests that completed when MD_CHANGE_PENDING is set to
+   only be processed after the metadata update completes
+ - call raid_end_bio_io() on bios in that queue when the time comes.
+
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+(cherry picked from commit c3cce6cda162eb2b2960a85d9c8992f4f3be85d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 5e75c2e2a98e,4195064460d0..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -4602,7 -4602,15 +4603,19 @@@ finish
+  			md_wakeup_thread(conf->mddev->thread);
+  	}
+  
+++<<<<<<< HEAD
+ +	return_io(s.return_bi);
+++=======
++ 	if (!bio_list_empty(&s.return_bi)) {
++ 		if (test_bit(MD_CHANGE_PENDING, &conf->mddev->flags)) {
++ 			spin_lock_irq(&conf->device_lock);
++ 			bio_list_merge(&conf->return_bi, &s.return_bi);
++ 			spin_unlock_irq(&conf->device_lock);
++ 			md_wakeup_thread(conf->mddev->thread);
++ 		} else
++ 			return_io(&s.return_bi);
++ 	}
+++>>>>>>> c3cce6cda162 (md/raid5: ensure device failure recorded before write request returns.)
+  
+  	clear_bit_unlock(STRIPE_ACTIVE, &sh->state);
+  }
+* Unmerged path drivers/md/raid5.c
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 8a15d8a6b4e3..698aba67b08c 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -475,6 +475,9 @@ struct r5conf {
+ 	int			skip_copy; /* Don't copy data from bio to stripe cache */
+ 	struct list_head	*last_hold; /* detect hold_list promotions */
+ 
++	/* bios to have bi_end_io called after metadata is synced */
++	struct bio_list		return_bi;
++
+ 	atomic_t		reshape_stripes; /* stripes with pending writes for reshape */
+ 	/* unfortunately we need two cache names as we temporarily have
+ 	 * two caches.
