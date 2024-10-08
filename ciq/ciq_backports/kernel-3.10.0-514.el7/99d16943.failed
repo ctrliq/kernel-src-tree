@@ -1,0 +1,310 @@
+rbd: retry watch re-registration periodically
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 99d1694310df3ffef66902f5bc1a23e95a724aa3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/99d16943.failed
+
+Revamp watch code to support retrying watch re-registration:
+
+- add rbd_dev->watch_state for more robust errcb handling
+- store watch cookie separately to avoid dereferencing watch_handle
+  which is set to NULL on unwatch
+- move re-register code into a delayed work and retry re-registration
+  every second, unless the client is blacklisted
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Tested-by: Mike Christie <mchristi@redhat.com>
+(cherry picked from commit 99d1694310df3ffef66902f5bc1a23e95a724aa3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/rbd.c
+diff --cc drivers/block/rbd.c
+index a9782a132636,cb96fb19e8a7..000000000000
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@@ -351,8 -359,12 +359,16 @@@ struct rbd_device 
+  
+  	struct ceph_file_layout	layout;		/* used for all rbd requests */
+  
+++<<<<<<< HEAD
+ +	struct ceph_osd_event   *watch_event;
+ +	struct rbd_obj_request	*watch_request;
+++=======
++ 	struct mutex		watch_mutex;
++ 	enum rbd_watch_state	watch_state;
++ 	struct ceph_osd_linger_request *watch_handle;
++ 	u64			watch_cookie;
++ 	struct delayed_work	watch_dwork;
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+  
+  	struct workqueue_struct	*task_wq;
+  
+@@@ -3135,9 -3095,10 +3151,14 @@@ out_err
+  	obj_request_done_set(obj_request);
+  }
+  
+++<<<<<<< HEAD
+ +static int rbd_obj_notify_ack_sync(struct rbd_device *rbd_dev, u64 notify_id)
+++=======
++ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie,
++ 			 u64 notifier_id, void *data, size_t data_len)
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+  {
+ -	struct rbd_device *rbd_dev = arg;
+ +	struct rbd_obj_request *obj_request;
+  	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+  	int ret;
+  
+@@@ -3190,127 -3122,98 +3211,186 @@@ static void rbd_watch_cb(u64 ver, u64 n
+  		rbd_warn(rbd_dev, "notify_ack ret %d", ret);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Send a (un)watch request and wait for the ack.  Return a request
+ + * with a ref held on success or error.
+ + */
+ +static struct rbd_obj_request *rbd_obj_watch_request_helper(
+ +						struct rbd_device *rbd_dev,
+ +						bool watch)
+ +{
+ +	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+ +	struct ceph_options *opts = osdc->client->options;
+ +	struct rbd_obj_request *obj_request;
+ +	int ret;
+++=======
++ static void __rbd_unregister_watch(struct rbd_device *rbd_dev);
++ 
++ static void rbd_watch_errcb(void *arg, u64 cookie, int err)
++ {
++ 	struct rbd_device *rbd_dev = arg;
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+ +
+ +	obj_request = rbd_obj_request_create(rbd_dev->header_oid.name, 0, 0,
+ +					     OBJ_REQUEST_NODATA);
+ +	if (!obj_request)
+ +		return ERR_PTR(-ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	obj_request->osd_req = rbd_osd_req_create(rbd_dev, OBJ_OP_WRITE, 1,
+ +						  obj_request);
+ +	if (!obj_request->osd_req) {
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+  
+ -	rbd_warn(rbd_dev, "encountered watch error: %d", err);
+ +	osd_req_op_watch_init(obj_request->osd_req, 0, CEPH_OSD_OP_WATCH,
+ +			      rbd_dev->watch_event->cookie, 0, watch);
+ +	rbd_osd_req_format_write(obj_request);
+  
+ +	if (watch)
+ +		ceph_osdc_set_request_linger(osdc, obj_request->osd_req);
+ +
+ +	ret = rbd_obj_request_submit(osdc, obj_request);
+ +	if (ret)
+ +		goto out;
+ +
+ +	ret = rbd_obj_request_wait_timeout(obj_request, opts->mount_timeout);
+ +	if (ret)
+ +		goto out;
+ +
+ +	ret = obj_request->result;
+ +	if (ret) {
+ +		if (watch)
+ +			rbd_obj_request_end(obj_request);
+ +		goto out;
+ +	}
+ +
+ +	return obj_request;
+ +
+ +out:
+ +	rbd_obj_request_put(obj_request);
+ +	return ERR_PTR(ret);
+++=======
++ 	mutex_lock(&rbd_dev->watch_mutex);
++ 	if (rbd_dev->watch_state == RBD_WATCH_STATE_REGISTERED) {
++ 		__rbd_unregister_watch(rbd_dev);
++ 		rbd_dev->watch_state = RBD_WATCH_STATE_ERROR;
++ 
++ 		queue_delayed_work(rbd_dev->task_wq, &rbd_dev->watch_dwork, 0);
++ 	}
++ 	mutex_unlock(&rbd_dev->watch_mutex);
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+  }
+  
+  /*
+-  * Initiate a watch request, synchronously.
++  * watch_mutex must be locked
+   */
+- static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev)
++ static int __rbd_register_watch(struct rbd_device *rbd_dev)
+  {
+  	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+ -	struct ceph_osd_linger_request *handle;
+ +	struct rbd_obj_request *obj_request;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	rbd_assert(!rbd_dev->watch_event);
+ +	rbd_assert(!rbd_dev->watch_request);
+++=======
++ 	rbd_assert(!rbd_dev->watch_handle);
++ 	dout("%s rbd_dev %p\n", __func__, rbd_dev);
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+  
+ -	handle = ceph_osdc_watch(osdc, &rbd_dev->header_oid,
+ -				 &rbd_dev->header_oloc, rbd_watch_cb,
+ -				 rbd_watch_errcb, rbd_dev);
+ -	if (IS_ERR(handle))
+ -		return PTR_ERR(handle);
+ +	ret = ceph_osdc_create_event(osdc, rbd_watch_cb, rbd_dev,
+ +				     &rbd_dev->watch_event);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	obj_request = rbd_obj_watch_request_helper(rbd_dev, true);
+ +	if (IS_ERR(obj_request)) {
+ +		ceph_osdc_cancel_event(rbd_dev->watch_event);
+ +		rbd_dev->watch_event = NULL;
+ +		return PTR_ERR(obj_request);
+ +	}
+ +
+ +	/*
+ +	 * A watch request is set to linger, so the underlying osd
+ +	 * request won't go away until we unregister it.  We retain
+ +	 * a pointer to the object request during that time (in
+ +	 * rbd_dev->watch_request), so we'll keep a reference to it.
+ +	 * We'll drop that reference after we've unregistered it in
+ +	 * rbd_dev_header_unwatch_sync().
+ +	 */
+ +	rbd_dev->watch_request = obj_request;
+  
+ -	rbd_dev->watch_handle = handle;
+  	return 0;
+  }
+  
+- static void __rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev)
++ /*
++  * watch_mutex must be locked
++  */
++ static void __rbd_unregister_watch(struct rbd_device *rbd_dev)
+  {
+ -	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+ -	int ret;
+ +	struct rbd_obj_request *obj_request;
+  
+++<<<<<<< HEAD
+ +	rbd_assert(rbd_dev->watch_event);
+ +	rbd_assert(rbd_dev->watch_request);
+++=======
++ 	rbd_assert(rbd_dev->watch_handle);
++ 	dout("%s rbd_dev %p\n", __func__, rbd_dev);
+++>>>>>>> 99d1694310df (rbd: retry watch re-registration periodically)
+  
+ -	ret = ceph_osdc_unwatch(osdc, rbd_dev->watch_handle);
+ -	if (ret)
+ -		rbd_warn(rbd_dev, "failed to unwatch: %d", ret);
+ +	rbd_obj_request_end(rbd_dev->watch_request);
+ +	rbd_obj_request_put(rbd_dev->watch_request);
+ +	rbd_dev->watch_request = NULL;
+  
+ -	rbd_dev->watch_handle = NULL;
+ +	obj_request = rbd_obj_watch_request_helper(rbd_dev, false);
+ +	if (!IS_ERR(obj_request))
+ +		rbd_obj_request_put(obj_request);
+ +	else
+ +		rbd_warn(rbd_dev, "unable to tear down watch request (%ld)",
+ +			 PTR_ERR(obj_request));
+ +
+ +	ceph_osdc_cancel_event(rbd_dev->watch_event);
+ +	rbd_dev->watch_event = NULL;
+  }
+  
+- /*
+-  * Tear down a watch request, synchronously.
+-  */
+- static void rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev)
++ static int rbd_register_watch(struct rbd_device *rbd_dev)
+  {
+- 	__rbd_dev_header_unwatch_sync(rbd_dev);
++ 	int ret;
++ 
++ 	mutex_lock(&rbd_dev->watch_mutex);
++ 	rbd_assert(rbd_dev->watch_state == RBD_WATCH_STATE_UNREGISTERED);
++ 	ret = __rbd_register_watch(rbd_dev);
++ 	if (ret)
++ 		goto out;
++ 
++ 	rbd_dev->watch_state = RBD_WATCH_STATE_REGISTERED;
++ 	rbd_dev->watch_cookie = rbd_dev->watch_handle->linger_id;
++ 
++ out:
++ 	mutex_unlock(&rbd_dev->watch_mutex);
++ 	return ret;
++ }
++ 
++ static void cancel_tasks_sync(struct rbd_device *rbd_dev)
++ {
++ 	dout("%s rbd_dev %p\n", __func__, rbd_dev);
++ 
++ 	cancel_delayed_work_sync(&rbd_dev->watch_dwork);
++ }
++ 
++ static void rbd_unregister_watch(struct rbd_device *rbd_dev)
++ {
++ 	cancel_tasks_sync(rbd_dev);
++ 
++ 	mutex_lock(&rbd_dev->watch_mutex);
++ 	if (rbd_dev->watch_state == RBD_WATCH_STATE_REGISTERED)
++ 		__rbd_unregister_watch(rbd_dev);
++ 	rbd_dev->watch_state = RBD_WATCH_STATE_UNREGISTERED;
++ 	mutex_unlock(&rbd_dev->watch_mutex);
+  
+- 	dout("%s flushing notifies\n", __func__);
+  	ceph_osdc_flush_notifies(&rbd_dev->rbd_client->client->osdc);
+  }
+  
+@@@ -4124,7 -4019,10 +4240,9 @@@ static void rbd_spec_free(struct kref *
+  
+  static void rbd_dev_free(struct rbd_device *rbd_dev)
+  {
++ 	WARN_ON(rbd_dev->watch_state != RBD_WATCH_STATE_UNREGISTERED);
++ 
+  	ceph_oid_destroy(&rbd_dev->header_oid);
+ -	ceph_oloc_destroy(&rbd_dev->header_oloc);
+  
+  	rbd_put_client(rbd_dev->rbd_client);
+  	rbd_spec_put(rbd_dev->spec);
+@@@ -4167,7 -4065,12 +4285,11 @@@ static struct rbd_device *__rbd_dev_cre
+  	init_rwsem(&rbd_dev->header_rwsem);
+  
+  	ceph_oid_init(&rbd_dev->header_oid);
+ -	ceph_oloc_init(&rbd_dev->header_oloc);
+  
++ 	mutex_init(&rbd_dev->watch_mutex);
++ 	rbd_dev->watch_state = RBD_WATCH_STATE_UNREGISTERED;
++ 	INIT_DELAYED_WORK(&rbd_dev->watch_dwork, rbd_reregister_watch);
++ 
+  	rbd_dev->dev.bus = &rbd_bus_type;
+  	rbd_dev->dev.type = &rbd_device_type;
+  	rbd_dev->dev.parent = &rbd_root_dev;
+* Unmerged path drivers/block/rbd.c
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index ab89bd91907f..f7e68b454e88 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -2585,6 +2585,7 @@ EXPORT_SYMBOL(ceph_osdc_sync);
+  */
+ void ceph_osdc_flush_notifies(struct ceph_osd_client *osdc)
+ {
++	dout("%s osdc %p\n", __func__, osdc);
+ 	flush_workqueue(osdc->notify_wq);
+ }
+ EXPORT_SYMBOL(ceph_osdc_flush_notifies);
