@@ -1,0 +1,1036 @@
+KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Implement dynamic micro-threading on POWER8 (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 94.31%
+commit-author Paul Mackerras <paulus@samba.org>
+commit b4deba5c41e9f6d3239606c9e060853d9decfee1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b4deba5c.failed
+
+This builds on the ability to run more than one vcore on a physical
+core by using the micro-threading (split-core) modes of the POWER8
+chip.  Previously, only vcores from the same VM could be run together,
+and (on POWER8) only if they had just one thread per core.  With the
+ability to split the core on guest entry and unsplit it on guest exit,
+we can run up to 8 vcpu threads from up to 4 different VMs, and we can
+run multiple vcores with 2 or 4 vcpus per vcore.
+
+Dynamic micro-threading is only available if the static configuration
+of the cores is whole-core mode (unsplit), and only on POWER8.
+
+To manage this, we introduce a new kvm_split_mode struct which is
+shared across all of the subcores in the core, with a pointer in the
+paca on each thread.  In addition we extend the core_info struct to
+have information on each subcore.  When deciding whether to add a
+vcore to the set already on the core, we now have two possibilities:
+(a) piggyback the vcore onto an existing subcore, or (b) start a new
+subcore.
+
+Currently, when any vcpu needs to exit the guest and switch to host
+virtual mode, we interrupt all the threads in all subcores and switch
+the core back to whole-core mode.  It may be possible in future to
+allow some of the subcores to keep executing in the guest while
+subcore 0 switches to the host, but that is not implemented in this
+patch.
+
+This adds a module parameter called dynamic_mt_modes which controls
+which micro-threading (split-core) modes the code will consider, as a
+bitmap.  In other words, if it is 0, no micro-threading mode is
+considered; if it is 2, only 2-way micro-threading is considered; if
+it is 4, only 4-way, and if it is 6, both 2-way and 4-way
+micro-threading mode will be considered.  The default is 6.
+
+With this, we now have secondary threads which are the primary thread
+for their subcore and therefore need to do the MMU switch.  These
+threads will need to be started even if they have no vcpu to run, so
+we use the vcore pointer in the PACA rather than the vcpu pointer to
+trigger them.
+
+It is now possible for thread 0 to find that an exit has been
+requested before it gets to switch the subcore state to the guest.  In
+that case we haven't added the guest's timebase offset to the
+timebase, so we need to be careful not to subtract the offset in the
+guest exit path.  In fact we just skip the whole path that switches
+back to host context, since we haven't switched to the guest context.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit b4deba5c41e9f6d3239606c9e060853d9decfee1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_builtin.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index d17590f243b6,80eb29ab262a..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -316,16 -295,28 +316,28 @@@ struct kvmppc_vcore 
+  	ulong dpdes;		/* doorbell state (POWER8) */
+  	void *mpp_buffer; /* Micro Partition Prefetch buffer */
+  	bool mpp_buffer_is_valid;
+ -	ulong conferring_threads;
+  };
+  
+ -#define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
+ -#define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
+ -#define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
+ +#define VCORE_ENTRY_COUNT(vc)	((vc)->entry_exit_count & 0xff)
+ +#define VCORE_EXIT_COUNT(vc)	((vc)->entry_exit_count >> 8)
+  
+++<<<<<<< HEAD
+ +/* Values for vcore_state */
+++=======
++ /* This bit is used when a vcore exit is triggered from outside the vcore */
++ #define VCORE_EXIT_REQ		0x10000
++ 
++ /*
++  * Values for vcore_state.
++  * Note that these are arranged such that lower values
++  * (< VCORE_SLEEPING) don't require stolen time accounting
++  * on load/unload, and higher values do.
++  */
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  #define VCORE_INACTIVE	0
+ -#define VCORE_PREEMPT	1
+ -#define VCORE_PIGGYBACK	2
+ -#define VCORE_SLEEPING	3
+ -#define VCORE_RUNNING	4
+ -#define VCORE_EXITING	5
+ +#define VCORE_SLEEPING	1
+ +#define VCORE_RUNNING	2
+ +#define VCORE_EXITING	3
+  
+  /*
+   * Struct used to manage memory for a virtual processor area
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 077343fa2903,6e3ef308b4c5..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -76,6 -81,12 +76,15 @@@ static DECLARE_BITMAP(default_enabled_h
+  #define MPP_BUFFER_ORDER	3
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static int dynamic_mt_modes = 6;
++ module_param(dynamic_mt_modes, int, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(dynamic_mt_modes, "Set of allowed dynamic micro-threading modes: 0 (= none), 2, 4, or 6 (= 2 or 4)");
++ static int target_smt_mode;
++ module_param(target_smt_mode, int, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(target_smt_mode, "Target threads per core (0 = max)");
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  
+  static void kvmppc_end_cede(struct kvm_vcpu *vcpu);
+  static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu);
+@@@ -1570,24 -1813,26 +1582,41 @@@ static void kvmppc_start_thread(struct 
+  {
+  	int cpu;
+  	struct paca_struct *tpaca;
+++<<<<<<< HEAD
+ +	struct kvmppc_vcore *vc = vcpu->arch.vcore;
+- 
+- 	if (vcpu->arch.timer_running) {
+- 		hrtimer_try_to_cancel(&vcpu->arch.dec_timer);
+- 		vcpu->arch.timer_running = 0;
+++=======
++ 	struct kvmppc_vcore *mvc = vc->master_vcore;
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
++ 
++ 	cpu = vc->pcpu;
++ 	if (vcpu) {
++ 		if (vcpu->arch.timer_running) {
++ 			hrtimer_try_to_cancel(&vcpu->arch.dec_timer);
++ 			vcpu->arch.timer_running = 0;
++ 		}
++ 		cpu += vcpu->arch.ptid;
++ 		vcpu->cpu = mvc->pcpu;
++ 		vcpu->arch.thread_cpu = cpu;
+  	}
+- 	cpu = vc->pcpu + vcpu->arch.ptid;
+  	tpaca = &paca[cpu];
+++<<<<<<< HEAD
+ +	tpaca->kvm_hstate.kvm_vcore = vc;
+ +	tpaca->kvm_hstate.ptid = vcpu->arch.ptid;
+ +	vcpu->cpu = vc->pcpu;
+ +	/* Order stores to hstate.kvm_vcore etc. before store to kvm_vcpu */
+ +	smp_wmb();
+ +	tpaca->kvm_hstate.kvm_vcpu = vcpu;
+ +#if defined(CONFIG_PPC_ICP_NATIVE) && defined(CONFIG_SMP)
+++=======
++ 	tpaca->kvm_hstate.kvm_vcpu = vcpu;
++ 	tpaca->kvm_hstate.ptid = cpu - mvc->pcpu;
++ 	/* Order stores to hstate.kvm_vcpu etc. before store to kvm_vcore */
++ 	smp_wmb();
++ 	tpaca->kvm_hstate.kvm_vcore = mvc;
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  	if (cpu != smp_processor_id())
+ -		kvmppc_ipi_thread(cpu);
+ +		xics_wake_cpu(cpu);
+ +#endif
+  }
+  
+  static void kvmppc_wait_for_nap(void)
+@@@ -1676,6 -1921,277 +1705,280 @@@ static void kvmppc_start_restoring_l2_c
+  	mtspr(SPRN_MPPR, mpp_addr | PPC_MPPR_FETCH_WHOLE_TABLE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * A list of virtual cores for each physical CPU.
++  * These are vcores that could run but their runner VCPU tasks are
++  * (or may be) preempted.
++  */
++ struct preempted_vcore_list {
++ 	struct list_head	list;
++ 	spinlock_t		lock;
++ };
++ 
++ static DEFINE_PER_CPU(struct preempted_vcore_list, preempted_vcores);
++ 
++ static void init_vcore_lists(void)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct preempted_vcore_list *lp = &per_cpu(preempted_vcores, cpu);
++ 		spin_lock_init(&lp->lock);
++ 		INIT_LIST_HEAD(&lp->list);
++ 	}
++ }
++ 
++ static void kvmppc_vcore_preempt(struct kvmppc_vcore *vc)
++ {
++ 	struct preempted_vcore_list *lp = this_cpu_ptr(&preempted_vcores);
++ 
++ 	vc->vcore_state = VCORE_PREEMPT;
++ 	vc->pcpu = smp_processor_id();
++ 	if (vc->num_threads < threads_per_subcore) {
++ 		spin_lock(&lp->lock);
++ 		list_add_tail(&vc->preempt_list, &lp->list);
++ 		spin_unlock(&lp->lock);
++ 	}
++ 
++ 	/* Start accumulating stolen time */
++ 	kvmppc_core_start_stolen(vc);
++ }
++ 
++ static void kvmppc_vcore_end_preempt(struct kvmppc_vcore *vc)
++ {
++ 	struct preempted_vcore_list *lp = this_cpu_ptr(&preempted_vcores);
++ 
++ 	kvmppc_core_end_stolen(vc);
++ 	if (!list_empty(&vc->preempt_list)) {
++ 		spin_lock(&lp->lock);
++ 		list_del_init(&vc->preempt_list);
++ 		spin_unlock(&lp->lock);
++ 	}
++ 	vc->vcore_state = VCORE_INACTIVE;
++ }
++ 
++ /*
++  * This stores information about the virtual cores currently
++  * assigned to a physical core.
++  */
++ struct core_info {
++ 	int		n_subcores;
++ 	int		max_subcore_threads;
++ 	int		total_threads;
++ 	int		subcore_threads[MAX_SUBCORES];
++ 	struct kvm	*subcore_vm[MAX_SUBCORES];
++ 	struct list_head vcs[MAX_SUBCORES];
++ };
++ 
++ /*
++  * This mapping means subcores 0 and 1 can use threads 0-3 and 4-7
++  * respectively in 2-way micro-threading (split-core) mode.
++  */
++ static int subcore_thread_map[MAX_SUBCORES] = { 0, 4, 2, 6 };
++ 
++ static void init_core_info(struct core_info *cip, struct kvmppc_vcore *vc)
++ {
++ 	int sub;
++ 
++ 	memset(cip, 0, sizeof(*cip));
++ 	cip->n_subcores = 1;
++ 	cip->max_subcore_threads = vc->num_threads;
++ 	cip->total_threads = vc->num_threads;
++ 	cip->subcore_threads[0] = vc->num_threads;
++ 	cip->subcore_vm[0] = vc->kvm;
++ 	for (sub = 0; sub < MAX_SUBCORES; ++sub)
++ 		INIT_LIST_HEAD(&cip->vcs[sub]);
++ 	list_add_tail(&vc->preempt_list, &cip->vcs[0]);
++ }
++ 
++ static bool subcore_config_ok(int n_subcores, int n_threads)
++ {
++ 	/* Can only dynamically split if unsplit to begin with */
++ 	if (n_subcores > 1 && threads_per_subcore < MAX_SMT_THREADS)
++ 		return false;
++ 	if (n_subcores > MAX_SUBCORES)
++ 		return false;
++ 	if (n_subcores > 1) {
++ 		if (!(dynamic_mt_modes & 2))
++ 			n_subcores = 4;
++ 		if (n_subcores > 2 && !(dynamic_mt_modes & 4))
++ 			return false;
++ 	}
++ 
++ 	return n_subcores * roundup_pow_of_two(n_threads) <= MAX_SMT_THREADS;
++ }
++ 
++ static void init_master_vcore(struct kvmppc_vcore *vc)
++ {
++ 	vc->master_vcore = vc;
++ 	vc->entry_exit_map = 0;
++ 	vc->in_guest = 0;
++ 	vc->napping_threads = 0;
++ 	vc->conferring_threads = 0;
++ }
++ 
++ /*
++  * See if the existing subcores can be split into 3 (or fewer) subcores
++  * of at most two threads each, so we can fit in another vcore.  This
++  * assumes there are at most two subcores and at most 6 threads in total.
++  */
++ static bool can_split_piggybacked_subcores(struct core_info *cip)
++ {
++ 	int sub, new_sub;
++ 	int large_sub = -1;
++ 	int thr;
++ 	int n_subcores = cip->n_subcores;
++ 	struct kvmppc_vcore *vc, *vcnext;
++ 	struct kvmppc_vcore *master_vc = NULL;
++ 
++ 	for (sub = 0; sub < cip->n_subcores; ++sub) {
++ 		if (cip->subcore_threads[sub] <= 2)
++ 			continue;
++ 		if (large_sub >= 0)
++ 			return false;
++ 		large_sub = sub;
++ 		vc = list_first_entry(&cip->vcs[sub], struct kvmppc_vcore,
++ 				      preempt_list);
++ 		if (vc->num_threads > 2)
++ 			return false;
++ 		n_subcores += (cip->subcore_threads[sub] - 1) >> 1;
++ 	}
++ 	if (n_subcores > 3 || large_sub < 0)
++ 		return false;
++ 
++ 	/*
++ 	 * Seems feasible, so go through and move vcores to new subcores.
++ 	 * Note that when we have two or more vcores in one subcore,
++ 	 * all those vcores must have only one thread each.
++ 	 */
++ 	new_sub = cip->n_subcores;
++ 	thr = 0;
++ 	sub = large_sub;
++ 	list_for_each_entry_safe(vc, vcnext, &cip->vcs[sub], preempt_list) {
++ 		if (thr >= 2) {
++ 			list_del(&vc->preempt_list);
++ 			list_add_tail(&vc->preempt_list, &cip->vcs[new_sub]);
++ 			/* vc->num_threads must be 1 */
++ 			if (++cip->subcore_threads[new_sub] == 1) {
++ 				cip->subcore_vm[new_sub] = vc->kvm;
++ 				init_master_vcore(vc);
++ 				master_vc = vc;
++ 				++cip->n_subcores;
++ 			} else {
++ 				vc->master_vcore = master_vc;
++ 				++new_sub;
++ 			}
++ 		}
++ 		thr += vc->num_threads;
++ 	}
++ 	cip->subcore_threads[large_sub] = 2;
++ 	cip->max_subcore_threads = 2;
++ 
++ 	return true;
++ }
++ 
++ static bool can_dynamic_split(struct kvmppc_vcore *vc, struct core_info *cip)
++ {
++ 	int n_threads = vc->num_threads;
++ 	int sub;
++ 
++ 	if (!cpu_has_feature(CPU_FTR_ARCH_207S))
++ 		return false;
++ 
++ 	if (n_threads < cip->max_subcore_threads)
++ 		n_threads = cip->max_subcore_threads;
++ 	if (subcore_config_ok(cip->n_subcores + 1, n_threads)) {
++ 		cip->max_subcore_threads = n_threads;
++ 	} else if (cip->n_subcores <= 2 && cip->total_threads <= 6 &&
++ 		   vc->num_threads <= 2) {
++ 		/*
++ 		 * We may be able to fit another subcore in by
++ 		 * splitting an existing subcore with 3 or 4
++ 		 * threads into two 2-thread subcores, or one
++ 		 * with 5 or 6 threads into three subcores.
++ 		 * We can only do this if those subcores have
++ 		 * piggybacked virtual cores.
++ 		 */
++ 		if (!can_split_piggybacked_subcores(cip))
++ 			return false;
++ 	} else {
++ 		return false;
++ 	}
++ 
++ 	sub = cip->n_subcores;
++ 	++cip->n_subcores;
++ 	cip->total_threads += vc->num_threads;
++ 	cip->subcore_threads[sub] = vc->num_threads;
++ 	cip->subcore_vm[sub] = vc->kvm;
++ 	init_master_vcore(vc);
++ 	list_del(&vc->preempt_list);
++ 	list_add_tail(&vc->preempt_list, &cip->vcs[sub]);
++ 
++ 	return true;
++ }
++ 
++ static bool can_piggyback_subcore(struct kvmppc_vcore *pvc,
++ 				  struct core_info *cip, int sub)
++ {
++ 	struct kvmppc_vcore *vc;
++ 	int n_thr;
++ 
++ 	vc = list_first_entry(&cip->vcs[sub], struct kvmppc_vcore,
++ 			      preempt_list);
++ 
++ 	/* require same VM and same per-core reg values */
++ 	if (pvc->kvm != vc->kvm ||
++ 	    pvc->tb_offset != vc->tb_offset ||
++ 	    pvc->pcr != vc->pcr ||
++ 	    pvc->lpcr != vc->lpcr)
++ 		return false;
++ 
++ 	/* P8 guest with > 1 thread per core would see wrong TIR value */
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S) &&
++ 	    (vc->num_threads > 1 || pvc->num_threads > 1))
++ 		return false;
++ 
++ 	n_thr = cip->subcore_threads[sub] + pvc->num_threads;
++ 	if (n_thr > cip->max_subcore_threads) {
++ 		if (!subcore_config_ok(cip->n_subcores, n_thr))
++ 			return false;
++ 		cip->max_subcore_threads = n_thr;
++ 	}
++ 
++ 	cip->total_threads += pvc->num_threads;
++ 	cip->subcore_threads[sub] = n_thr;
++ 	pvc->master_vcore = vc;
++ 	list_del(&pvc->preempt_list);
++ 	list_add_tail(&pvc->preempt_list, &cip->vcs[sub]);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Work out whether it is possible to piggyback the execution of
++  * vcore *pvc onto the execution of the other vcores described in *cip.
++  */
++ static bool can_piggyback(struct kvmppc_vcore *pvc, struct core_info *cip,
++ 			  int target_threads)
++ {
++ 	int sub;
++ 
++ 	if (cip->total_threads + pvc->num_threads > target_threads)
++ 		return false;
++ 	for (sub = 0; sub < cip->n_subcores; ++sub)
++ 		if (cip->subcore_threads[sub] &&
++ 		    can_piggyback_subcore(pvc, cip, sub))
++ 			return true;
++ 
++ 	if (can_dynamic_split(pvc, cip))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  static void prepare_threads(struct kvmppc_vcore *vc)
+  {
+  	struct kvm_vcpu *vcpu, *vnext;
+@@@ -1699,13 -2299,20 +2002,25 @@@
+   * Run a set of guest threads on a physical core.
+   * Called with vc->lock held.
+   */
+ -static noinline void kvmppc_run_core(struct kvmppc_vcore *vc)
+ +static void kvmppc_run_core(struct kvmppc_vcore *vc)
+  {
+  	struct kvm_vcpu *vcpu, *vnext;
+ +	long ret;
+ +	u64 now;
+  	int i;
+  	int srcu_idx;
+++<<<<<<< HEAD
+++=======
++ 	struct core_info core_info;
++ 	struct kvmppc_vcore *pvc, *vcnext;
++ 	struct kvm_split_mode split_info, *sip;
++ 	int split, subcore_size, active;
++ 	int sub;
++ 	bool thr0_done;
++ 	unsigned long cmd_bit, stat_bit;
++ 	int pcpu, thr;
++ 	int target_threads;
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  
+  	/*
+  	 * Remove from the list any threads that have a signal pending
+@@@ -1737,20 -2343,115 +2052,112 @@@
+  		goto out;
+  	}
+  
+ -	/*
+ -	 * See if we could run any other vcores on the physical core
+ -	 * along with this one.
+ -	 */
+ -	init_core_info(&core_info, vc);
+ -	pcpu = smp_processor_id();
+ -	target_threads = threads_per_subcore;
+ -	if (target_smt_mode && target_smt_mode < target_threads)
+ -		target_threads = target_smt_mode;
+ -	if (vc->num_threads < target_threads)
+ -		collect_piggybacks(&core_info, target_threads);
+  
+++<<<<<<< HEAD
+ +	vc->pcpu = smp_processor_id();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		kvmppc_start_thread(vcpu);
+ +		kvmppc_create_dtl_entry(vcpu, vc);
+++=======
++ 	/* Decide on micro-threading (split-core) mode */
++ 	subcore_size = threads_per_subcore;
++ 	cmd_bit = stat_bit = 0;
++ 	split = core_info.n_subcores;
++ 	sip = NULL;
++ 	if (split > 1) {
++ 		/* threads_per_subcore must be MAX_SMT_THREADS (8) here */
++ 		if (split == 2 && (dynamic_mt_modes & 2)) {
++ 			cmd_bit = HID0_POWER8_1TO2LPAR;
++ 			stat_bit = HID0_POWER8_2LPARMODE;
++ 		} else {
++ 			split = 4;
++ 			cmd_bit = HID0_POWER8_1TO4LPAR;
++ 			stat_bit = HID0_POWER8_4LPARMODE;
++ 		}
++ 		subcore_size = MAX_SMT_THREADS / split;
++ 		sip = &split_info;
++ 		memset(&split_info, 0, sizeof(split_info));
++ 		split_info.rpr = mfspr(SPRN_RPR);
++ 		split_info.pmmar = mfspr(SPRN_PMMAR);
++ 		split_info.ldbar = mfspr(SPRN_LDBAR);
++ 		split_info.subcore_size = subcore_size;
++ 		for (sub = 0; sub < core_info.n_subcores; ++sub)
++ 			split_info.master_vcs[sub] =
++ 				list_first_entry(&core_info.vcs[sub],
++ 					struct kvmppc_vcore, preempt_list);
++ 		/* order writes to split_info before kvm_split_mode pointer */
++ 		smp_wmb();
++ 	}
++ 	pcpu = smp_processor_id();
++ 	for (thr = 0; thr < threads_per_subcore; ++thr)
++ 		paca[pcpu + thr].kvm_hstate.kvm_split_mode = sip;
++ 
++ 	/* Initiate micro-threading (split-core) if required */
++ 	if (cmd_bit) {
++ 		unsigned long hid0 = mfspr(SPRN_HID0);
++ 
++ 		hid0 |= cmd_bit | HID0_POWER8_DYNLPARDIS;
++ 		mb();
++ 		mtspr(SPRN_HID0, hid0);
++ 		isync();
++ 		for (;;) {
++ 			hid0 = mfspr(SPRN_HID0);
++ 			if (hid0 & stat_bit)
++ 				break;
++ 			cpu_relax();
++ 		}
++ 		split_info.do_nap = 1;	/* ask secondaries to nap when done */
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  	}
+  
+- 	/* Set this explicitly in case thread 0 doesn't have a vcpu */
+- 	get_paca()->kvm_hstate.kvm_vcore = vc;
+- 	get_paca()->kvm_hstate.ptid = 0;
++ 	/* Start all the threads */
++ 	active = 0;
++ 	for (sub = 0; sub < core_info.n_subcores; ++sub) {
++ 		thr = subcore_thread_map[sub];
++ 		thr0_done = false;
++ 		active |= 1 << thr;
++ 		list_for_each_entry(pvc, &core_info.vcs[sub], preempt_list) {
++ 			pvc->pcpu = pcpu + thr;
++ 			list_for_each_entry(vcpu, &pvc->runnable_threads,
++ 					    arch.run_list) {
++ 				kvmppc_start_thread(vcpu, pvc);
++ 				kvmppc_create_dtl_entry(vcpu, pvc);
++ 				trace_kvm_guest_enter(vcpu);
++ 				if (!vcpu->arch.ptid)
++ 					thr0_done = true;
++ 				active |= 1 << (thr + vcpu->arch.ptid);
++ 			}
++ 			/*
++ 			 * We need to start the first thread of each subcore
++ 			 * even if it doesn't have a vcpu.
++ 			 */
++ 			if (pvc->master_vcore == pvc && !thr0_done)
++ 				kvmppc_start_thread(NULL, pvc);
++ 			thr += pvc->num_threads;
++ 		}
++ 	}
++ 	/*
++ 	 * When doing micro-threading, poke the inactive threads as well.
++ 	 * This gets them to the nap instruction after kvm_do_nap,
++ 	 * which reduces the time taken to unsplit later.
++ 	 */
++ 	if (split > 1)
++ 		for (thr = 1; thr < threads_per_subcore; ++thr)
++ 			if (!(active & (1 << thr)))
++ 				kvmppc_ipi_thread(pcpu + thr);
+  
+  	vc->vcore_state = VCORE_RUNNING;
+  	preempt_disable();
+++<<<<<<< HEAD
+ +	spin_unlock(&vc->lock);
+++=======
++ 
++ 	trace_kvmppc_run_core(vc, 0);
++ 
++ 	for (sub = 0; sub < core_info.n_subcores; ++sub)
++ 		list_for_each_entry(pvc, &core_info.vcs[sub], preempt_list)
++ 			spin_unlock(&pvc->lock);
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  
+  	kvm_guest_enter();
+  
+@@@ -1766,49 -2465,55 +2173,87 @@@
+  	if (vc->mpp_buffer)
+  		kvmppc_start_saving_l2_cache(vc);
+  
+ -	srcu_read_unlock(&vc->kvm->srcu, srcu_idx);
+ -
+ -	spin_lock(&vc->lock);
+ -	/* prevent other vcpu threads from doing kvmppc_start_thread() now */
+ -	vc->vcore_state = VCORE_EXITING;
+ -
+ +	/* disable sending of IPIs on virtual external irqs */
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list)
+ +		vcpu->cpu = -1;
+  	/* wait for secondary threads to finish writing their state to memory */
+  	kvmppc_wait_for_nap();
+++<<<<<<< HEAD
+ +	for (i = 0; i < threads_per_subcore; ++i)
+ +		kvmppc_release_hwthread(vc->pcpu + i);
+ +	/* prevent other vcpu threads from doing kvmppc_start_thread() now */
+ +	vc->vcore_state = VCORE_EXITING;
+++=======
++ 
++ 	/* Return to whole-core mode if we split the core earlier */
++ 	if (split > 1) {
++ 		unsigned long hid0 = mfspr(SPRN_HID0);
++ 		unsigned long loops = 0;
++ 
++ 		hid0 &= ~HID0_POWER8_DYNLPARDIS;
++ 		stat_bit = HID0_POWER8_2LPARMODE | HID0_POWER8_4LPARMODE;
++ 		mb();
++ 		mtspr(SPRN_HID0, hid0);
++ 		isync();
++ 		for (;;) {
++ 			hid0 = mfspr(SPRN_HID0);
++ 			if (!(hid0 & stat_bit))
++ 				break;
++ 			cpu_relax();
++ 			++loops;
++ 		}
++ 		split_info.do_nap = 0;
++ 	}
++ 
++ 	/* Let secondaries go back to the offline loop */
++ 	for (i = 0; i < threads_per_subcore; ++i) {
++ 		kvmppc_release_hwthread(pcpu + i);
++ 		if (sip && sip->napped[i])
++ 			kvmppc_ipi_thread(pcpu + i);
++ 	}
++ 
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  	spin_unlock(&vc->lock);
+  
+ +	srcu_read_unlock(&vc->kvm->srcu, srcu_idx);
+ +
+  	/* make sure updates to secondary vcpu structs are visible now */
+  	smp_mb();
+  	kvm_guest_exit();
+  
+++<<<<<<< HEAD
+ +	preempt_enable();
+ +	cond_resched();
+++=======
++ 	for (sub = 0; sub < core_info.n_subcores; ++sub)
++ 		list_for_each_entry_safe(pvc, vcnext, &core_info.vcs[sub],
++ 					 preempt_list)
++ 			post_guest_process(pvc, pvc == vc);
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  
+  	spin_lock(&vc->lock);
+ -	preempt_enable();
+ +	now = get_tb();
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		/* cancel pending dec exception if dec is positive */
+ +		if (now < vcpu->arch.dec_expires &&
+ +		    kvmppc_core_pending_dec(vcpu))
+ +			kvmppc_core_dequeue_dec(vcpu);
+ +
+ +		ret = RESUME_GUEST;
+ +		if (vcpu->arch.trap)
+ +			ret = kvmppc_handle_exit_hv(vcpu->arch.kvm_run, vcpu,
+ +						    vcpu->arch.run_task);
+ +
+ +		vcpu->arch.ret = ret;
+ +		vcpu->arch.trap = 0;
+ +
+ +		if (vcpu->arch.ceded) {
+ +			if (!is_kvmppc_resume_guest(ret))
+ +				kvmppc_end_cede(vcpu);
+ +			else
+ +				kvmppc_set_timer(vcpu);
+ +		}
+ +	}
+  
+   out:
+  	vc->vcore_state = VCORE_INACTIVE;
+@@@ -1903,10 -2610,22 +2348,29 @@@ static int kvmppc_run_vcpu(struct kvm_r
+  	 * this thread straight away and have it join in.
+  	 */
+  	if (!signal_pending(current)) {
+++<<<<<<< HEAD
+ +		if (vc->vcore_state == VCORE_RUNNING &&
+ +		    VCORE_EXIT_COUNT(vc) == 0) {
+ +			kvmppc_create_dtl_entry(vcpu, vc);
+ +			kvmppc_start_thread(vcpu);
+++=======
++ 		if (vc->vcore_state == VCORE_PIGGYBACK) {
++ 			struct kvmppc_vcore *mvc = vc->master_vcore;
++ 			if (spin_trylock(&mvc->lock)) {
++ 				if (mvc->vcore_state == VCORE_RUNNING &&
++ 				    !VCORE_IS_EXITING(mvc)) {
++ 					kvmppc_create_dtl_entry(vcpu, vc);
++ 					kvmppc_start_thread(vcpu, vc);
++ 					trace_kvm_guest_enter(vcpu);
++ 				}
++ 				spin_unlock(&mvc->lock);
++ 			}
++ 		} else if (vc->vcore_state == VCORE_RUNNING &&
++ 			   !VCORE_IS_EXITING(vc)) {
++ 			kvmppc_create_dtl_entry(vcpu, vc);
++ 			kvmppc_start_thread(vcpu, vc);
++ 			trace_kvm_guest_enter(vcpu);
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  		} else if (vc->vcore_state == VCORE_SLEEPING) {
+  			wake_up(&vc->wq);
+  		}
+diff --cc arch/powerpc/kvm/book3s_hv_builtin.c
+index f719a1437a31,fd7006bf6b1a..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@@ -231,3 -174,112 +231,115 @@@ int kvmppc_hcall_impl_hv_realmode(unsig
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(kvmppc_hcall_impl_hv_realmode);
+++<<<<<<< HEAD
+++=======
++ 
++ int kvmppc_hwrng_present(void)
++ {
++ 	return powernv_hwrng_present();
++ }
++ EXPORT_SYMBOL_GPL(kvmppc_hwrng_present);
++ 
++ long kvmppc_h_random(struct kvm_vcpu *vcpu)
++ {
++ 	if (powernv_get_random_real_mode(&vcpu->arch.gpr[4]))
++ 		return H_SUCCESS;
++ 
++ 	return H_HARDWARE;
++ }
++ 
++ static inline void rm_writeb(unsigned long paddr, u8 val)
++ {
++ 	__asm__ __volatile__("stbcix %0,0,%1"
++ 		: : "r" (val), "r" (paddr) : "memory");
++ }
++ 
++ /*
++  * Send an interrupt or message to another CPU.
++  * This can only be called in real mode.
++  * The caller needs to include any barrier needed to order writes
++  * to memory vs. the IPI/message.
++  */
++ void kvmhv_rm_send_ipi(int cpu)
++ {
++ 	unsigned long xics_phys;
++ 
++ 	/* On POWER8 for IPIs to threads in the same core, use msgsnd */
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S) &&
++ 	    cpu_first_thread_sibling(cpu) ==
++ 	    cpu_first_thread_sibling(raw_smp_processor_id())) {
++ 		unsigned long msg = PPC_DBELL_TYPE(PPC_DBELL_SERVER);
++ 		msg |= cpu_thread_in_core(cpu);
++ 		__asm__ __volatile__ (PPC_MSGSND(%0) : : "r" (msg));
++ 		return;
++ 	}
++ 
++ 	/* Else poke the target with an IPI */
++ 	xics_phys = paca[cpu].kvm_hstate.xics_phys;
++ 	rm_writeb(xics_phys + XICS_MFRR, IPI_PRIORITY);
++ }
++ 
++ /*
++  * The following functions are called from the assembly code
++  * in book3s_hv_rmhandlers.S.
++  */
++ static void kvmhv_interrupt_vcore(struct kvmppc_vcore *vc, int active)
++ {
++ 	int cpu = vc->pcpu;
++ 
++ 	/* Order setting of exit map vs. msgsnd/IPI */
++ 	smp_mb();
++ 	for (; active; active >>= 1, ++cpu)
++ 		if (active & 1)
++ 			kvmhv_rm_send_ipi(cpu);
++ }
++ 
++ void kvmhv_commence_exit(int trap)
++ {
++ 	struct kvmppc_vcore *vc = local_paca->kvm_hstate.kvm_vcore;
++ 	int ptid = local_paca->kvm_hstate.ptid;
++ 	struct kvm_split_mode *sip = local_paca->kvm_hstate.kvm_split_mode;
++ 	int me, ee, i;
++ 
++ 	/* Set our bit in the threads-exiting-guest map in the 0xff00
++ 	   bits of vcore->entry_exit_map */
++ 	me = 0x100 << ptid;
++ 	do {
++ 		ee = vc->entry_exit_map;
++ 	} while (cmpxchg(&vc->entry_exit_map, ee, ee | me) != ee);
++ 
++ 	/* Are we the first here? */
++ 	if ((ee >> 8) != 0)
++ 		return;
++ 
++ 	/*
++ 	 * Trigger the other threads in this vcore to exit the guest.
++ 	 * If this is a hypervisor decrementer interrupt then they
++ 	 * will be already on their way out of the guest.
++ 	 */
++ 	if (trap != BOOK3S_INTERRUPT_HV_DECREMENTER)
++ 		kvmhv_interrupt_vcore(vc, ee & ~(1 << ptid));
++ 
++ 	/*
++ 	 * If we are doing dynamic micro-threading, interrupt the other
++ 	 * subcores to pull them out of their guests too.
++ 	 */
++ 	if (!sip)
++ 		return;
++ 
++ 	for (i = 0; i < MAX_SUBCORES; ++i) {
++ 		vc = sip->master_vcs[i];
++ 		if (!vc)
++ 			break;
++ 		do {
++ 			ee = vc->entry_exit_map;
++ 			/* Already asked to exit? */
++ 			if ((ee >> 8) != 0)
++ 				break;
++ 		} while (cmpxchg(&vc->entry_exit_map, ee,
++ 				 ee | VCORE_EXIT_REQ) != ee);
++ 		if ((ee >> 8) == 0)
++ 			kvmhv_interrupt_vcore(vc, ee);
++ 	}
++ }
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 499fdba9ddf8,db2427db4471..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -289,11 -327,31 +292,31 @@@ kvm_start_guest
+  kvm_secondary_got_guest:
+  
+  	/* Set HSTATE_DSCR(r13) to something sensible */
+ -	ld	r6, PACA_DSCR_DEFAULT(r13)
+ +	ld	r6, PACA_DSCR(r13)
+  	std	r6, HSTATE_DSCR(r13)
+  
+- 	/* Order load of vcore, ptid etc. after load of vcpu */
++ 	/* On thread 0 of a subcore, set HDEC to max */
++ 	lbz	r4, HSTATE_PTID(r13)
++ 	cmpwi	r4, 0
++ 	bne	63f
++ 	lis	r6, 0x7fff
++ 	ori	r6, r6, 0xffff
++ 	mtspr	SPRN_HDEC, r6
++ 	/* and set per-LPAR registers, if doing dynamic micro-threading */
++ 	ld	r6, HSTATE_SPLIT_MODE(r13)
++ 	cmpdi	r6, 0
++ 	beq	63f
++ 	ld	r0, KVM_SPLIT_RPR(r6)
++ 	mtspr	SPRN_RPR, r0
++ 	ld	r0, KVM_SPLIT_PMMAR(r6)
++ 	mtspr	SPRN_PMMAR, r0
++ 	ld	r0, KVM_SPLIT_LDBAR(r6)
++ 	mtspr	SPRN_LDBAR, r0
++ 	isync
++ 63:
++ 	/* Order load of vcpu after load of vcore */
+  	lwsync
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
+  	bl	kvmppc_hv_entry
+  
+  	/* Back from the guest, go back to nap */
+@@@ -928,6 -916,33 +999,36 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  	clrrdi	r6,r6,1
+  	mtspr	SPRN_CTRLT,r6
+  4:
+++<<<<<<< HEAD
+++=======
++ 	/* Secondary threads wait for primary to have done partition switch */
++ 	ld	r5, HSTATE_KVM_VCORE(r13)
++ 	lbz	r6, HSTATE_PTID(r13)
++ 	cmpwi	r6, 0
++ 	beq	21f
++ 	lbz	r0, VCORE_IN_GUEST(r5)
++ 	cmpwi	r0, 0
++ 	bne	21f
++ 	HMT_LOW
++ 20:	lwz	r3, VCORE_ENTRY_EXIT(r5)
++ 	cmpwi	r3, 0x100
++ 	bge	no_switch_exit
++ 	lbz	r0, VCORE_IN_GUEST(r5)
++ 	cmpwi	r0, 0
++ 	beq	20b
++ 	HMT_MEDIUM
++ 21:
++ 	/* Set LPCR. */
++ 	ld	r8,VCORE_LPCR(r5)
++ 	mtspr	SPRN_LPCR,r8
++ 	isync
++ 
++ 	/* Check if HDEC expires soon */
++ 	mfspr	r3, SPRN_HDEC
++ 	cmpwi	r3, 512		/* 1 microsecond */
++ 	blt	hdec_soon
++ 
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  	ld	r6, VCPU_CTR(r4)
+  	lwz	r7, VCPU_XER(r4)
+  
+@@@ -1029,6 -1048,31 +1130,34 @@@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR
+  	hrfid
+  	b	.
+  
+++<<<<<<< HEAD
+++=======
++ secondary_too_late:
++ 	li	r12, 0
++ 	cmpdi	r4, 0
++ 	beq	11f
++ 	stw	r12, VCPU_TRAP(r4)
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 11:	b	kvmhv_switch_to_host
++ 
++ no_switch_exit:
++ 	HMT_MEDIUM
++ 	li	r12, 0
++ 	b	12f
++ hdec_soon:
++ 	li	r12, BOOK3S_INTERRUPT_HV_DECREMENTER
++ 12:	stw	r12, VCPU_TRAP(r4)
++ 	mr	r9, r4
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 	b	guest_exit_cont
++ 
+++>>>>>>> b4deba5c41e9 (KVM: PPC: Book3S HV: Implement dynamic micro-threading on POWER8)
+  /******************************************************************************
+   *                                                                            *
+   *                               Exit code                                    *
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 5bdfb5dd3400..57d5dfef48bd 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -25,6 +25,12 @@
+ #define XICS_MFRR		0xc
+ #define XICS_IPI		2	/* interrupt source # for IPIs */
+ 
++/* Maximum number of threads per physical core */
++#define MAX_SMT_THREADS		8
++
++/* Maximum number of subcores per physical core */
++#define MAX_SUBCORES		4
++
+ #ifdef __ASSEMBLY__
+ 
+ #ifdef CONFIG_KVM_BOOK3S_HANDLER
+@@ -65,6 +71,19 @@ kvmppc_resume_\intno:
+ 
+ #else  /*__ASSEMBLY__ */
+ 
++struct kvmppc_vcore;
++
++/* Struct used for coordinating micro-threading (split-core) mode changes */
++struct kvm_split_mode {
++	unsigned long	rpr;
++	unsigned long	pmmar;
++	unsigned long	ldbar;
++	u8		subcore_size;
++	u8		do_nap;
++	u8		napped[MAX_SMT_THREADS];
++	struct kvmppc_vcore *master_vcs[MAX_SUBCORES];
++};
++
+ /*
+  * This struct goes in the PACA on 64-bit processors.  It is used
+  * to store host state that needs to be saved when we enter a guest
+@@ -100,6 +119,7 @@ struct kvmppc_host_state {
+ 	u64 host_spurr;
+ 	u64 host_dscr;
+ 	u64 dec_expires;
++	struct kvm_split_mode *kvm_split_mode;
+ #endif
+ #ifdef CONFIG_PPC_BOOK3S_64
+ 	u64 cfar;
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index b98af275a63f..a690aed82a19 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -643,7 +643,14 @@ int main(void)
+ 	HSTATE_FIELD(HSTATE_DSCR, host_dscr);
+ 	HSTATE_FIELD(HSTATE_DABR, dabr);
+ 	HSTATE_FIELD(HSTATE_DECEXP, dec_expires);
++	HSTATE_FIELD(HSTATE_SPLIT_MODE, kvm_split_mode);
+ 	DEFINE(IPI_PRIORITY, IPI_PRIORITY);
++	DEFINE(KVM_SPLIT_RPR, offsetof(struct kvm_split_mode, rpr));
++	DEFINE(KVM_SPLIT_PMMAR, offsetof(struct kvm_split_mode, pmmar));
++	DEFINE(KVM_SPLIT_LDBAR, offsetof(struct kvm_split_mode, ldbar));
++	DEFINE(KVM_SPLIT_SIZE, offsetof(struct kvm_split_mode, subcore_size));
++	DEFINE(KVM_SPLIT_DO_NAP, offsetof(struct kvm_split_mode, do_nap));
++	DEFINE(KVM_SPLIT_NAPPED, offsetof(struct kvm_split_mode, napped));
+ #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_builtin.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
