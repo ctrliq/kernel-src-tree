@@ -1,0 +1,363 @@
+iser-target: Add missing se_cmd put for WRITE_PENDING in tx_comp_err
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] iser: Add missing se_cmd put for WRITE_PENDING in tx_comp_err (Andy Grover) [1129387]
+Rebuild_FUZZ: 94.57%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 03e7848a64ed535a30f5d7fc6dede2d5a6a2534b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/03e7848a.failed
+
+This patch fixes a bug where outstanding RDMA_READs with WRITE_PENDING
+status require an extra target_put_sess_cmd() in isert_put_cmd() code
+when called from isert_cq_tx_comp_err() + isert_cq_drain_comp_llist()
+context during session shutdown.
+
+The extra kref PUT is required so that transport_generic_free_cmd()
+invokes the last target_put_sess_cmd() -> target_release_cmd_kref(),
+which will complete(&se_cmd->cmd_wait_comp) the outstanding se_cmd
+descriptor with WRITE_PENDING status, and awake the completion in
+target_wait_for_sess_cmds() to invoke TFO->release_cmd().
+
+The bug was manifesting itself in target_wait_for_sess_cmds() where
+a se_cmd descriptor with WRITE_PENDING status would end up sleeping
+indefinately.
+
+	Acked-by: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Or Gerlitz <ogerlitz@mellanox.com>
+	Cc: <stable@vger.kernel.org> #3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 03e7848a64ed535a30f5d7fc6dede2d5a6a2534b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 3d8fe41643f4,f7801aeb7628..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -1206,11 -1580,12 +1206,11 @@@ isert_unmap_cmd(struct isert_cmd *isert
+  }
+  
+  static void
+- isert_put_cmd(struct isert_cmd *isert_cmd)
++ isert_put_cmd(struct isert_cmd *isert_cmd, bool comp_err)
+  {
+ -	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
+ +	struct iscsi_cmd *cmd = &isert_cmd->iscsi_cmd;
+  	struct isert_conn *isert_conn = isert_cmd->conn;
+  	struct iscsi_conn *conn = isert_conn->conn;
+ -	struct isert_device *device = isert_conn->conn_device;
+  
+  	pr_debug("Entering isert_put_cmd: %p\n", isert_cmd);
+  
+@@@ -1218,13 -1593,26 +1218,26 @@@
+  	case ISCSI_OP_SCSI_CMD:
+  		spin_lock_bh(&conn->cmd_lock);
+  		if (!list_empty(&cmd->i_conn_node))
+ -			list_del_init(&cmd->i_conn_node);
+ +			list_del(&cmd->i_conn_node);
+  		spin_unlock_bh(&conn->cmd_lock);
+  
+- 		if (cmd->data_direction == DMA_TO_DEVICE)
++ 		if (cmd->data_direction == DMA_TO_DEVICE) {
+  			iscsit_stop_dataout_timer(cmd);
++ 			/*
++ 			 * Check for special case during comp_err where
++ 			 * WRITE_PENDING has been handed off from core,
++ 			 * but requires an extra target_put_sess_cmd()
++ 			 * before transport_generic_free_cmd() below.
++ 			 */
++ 			if (comp_err &&
++ 			    cmd->se_cmd.t_state == TRANSPORT_WRITE_PENDING) {
++ 				struct se_cmd *se_cmd = &cmd->se_cmd;
++ 
++ 				target_put_sess_cmd(se_cmd->se_sess, se_cmd);
++ 			}
++ 		}
+  
+ -		device->unreg_rdma_mem(isert_cmd, isert_conn);
+ +		isert_unmap_cmd(isert_cmd, isert_conn);
+  		transport_generic_free_cmd(&cmd->se_cmd, 0);
+  		break;
+  	case ISCSI_OP_SCSI_TMFUNC:
+@@@ -1276,19 -1665,89 +1289,19 @@@ isert_unmap_tx_desc(struct iser_tx_des
+  
+  static void
+  isert_completion_put(struct iser_tx_desc *tx_desc, struct isert_cmd *isert_cmd,
+- 		     struct ib_device *ib_dev)
++ 		     struct ib_device *ib_dev, bool comp_err)
+  {
+ -	if (isert_cmd->pdu_buf_dma != 0) {
+ -		pr_debug("Calling ib_dma_unmap_single for isert_cmd->pdu_buf_dma\n");
+ -		ib_dma_unmap_single(ib_dev, isert_cmd->pdu_buf_dma,
+ -				    isert_cmd->pdu_buf_len, DMA_TO_DEVICE);
+ -		isert_cmd->pdu_buf_dma = 0;
+ +	if (isert_cmd->sense_buf_dma != 0) {
+ +		pr_debug("Calling ib_dma_unmap_single for isert_cmd->sense_buf_dma\n");
+ +		ib_dma_unmap_single(ib_dev, isert_cmd->sense_buf_dma,
+ +				    isert_cmd->sense_buf_len, DMA_TO_DEVICE);
+ +		isert_cmd->sense_buf_dma = 0;
+  	}
+  
+  	isert_unmap_tx_desc(tx_desc, ib_dev);
+- 	isert_put_cmd(isert_cmd);
++ 	isert_put_cmd(isert_cmd, comp_err);
+  }
+  
+ -static int
+ -isert_check_pi_status(struct se_cmd *se_cmd, struct ib_mr *sig_mr)
+ -{
+ -	struct ib_mr_status mr_status;
+ -	int ret;
+ -
+ -	ret = ib_check_mr_status(sig_mr, IB_MR_CHECK_SIG_STATUS, &mr_status);
+ -	if (ret) {
+ -		pr_err("ib_check_mr_status failed, ret %d\n", ret);
+ -		goto fail_mr_status;
+ -	}
+ -
+ -	if (mr_status.fail_status & IB_MR_CHECK_SIG_STATUS) {
+ -		u64 sec_offset_err;
+ -		u32 block_size = se_cmd->se_dev->dev_attrib.block_size + 8;
+ -
+ -		switch (mr_status.sig_err.err_type) {
+ -		case IB_SIG_BAD_GUARD:
+ -			se_cmd->pi_err = TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED;
+ -			break;
+ -		case IB_SIG_BAD_REFTAG:
+ -			se_cmd->pi_err = TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED;
+ -			break;
+ -		case IB_SIG_BAD_APPTAG:
+ -			se_cmd->pi_err = TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED;
+ -			break;
+ -		}
+ -		sec_offset_err = mr_status.sig_err.sig_err_offset;
+ -		do_div(sec_offset_err, block_size);
+ -		se_cmd->bad_sector = sec_offset_err + se_cmd->t_task_lba;
+ -
+ -		pr_err("isert: PI error found type %d at sector 0x%llx "
+ -		       "expected 0x%x vs actual 0x%x\n",
+ -		       mr_status.sig_err.err_type,
+ -		       (unsigned long long)se_cmd->bad_sector,
+ -		       mr_status.sig_err.expected,
+ -		       mr_status.sig_err.actual);
+ -		ret = 1;
+ -	}
+ -
+ -fail_mr_status:
+ -	return ret;
+ -}
+ -
+ -static void
+ -isert_completion_rdma_write(struct iser_tx_desc *tx_desc,
+ -			    struct isert_cmd *isert_cmd)
+ -{
+ -	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+ -	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
+ -	struct se_cmd *se_cmd = &cmd->se_cmd;
+ -	struct isert_conn *isert_conn = isert_cmd->conn;
+ -	struct isert_device *device = isert_conn->conn_device;
+ -	int ret = 0;
+ -
+ -	if (wr->fr_desc && wr->fr_desc->ind & ISERT_PROTECTED) {
+ -		ret = isert_check_pi_status(se_cmd,
+ -					    wr->fr_desc->pi_ctx->sig_mr);
+ -		wr->fr_desc->ind &= ~ISERT_PROTECTED;
+ -	}
+ -
+ -	device->unreg_rdma_mem(isert_cmd, isert_conn);
+ -	wr->send_wr_num = 0;
+ -	if (ret)
+ -		transport_send_check_condition_and_sense(se_cmd,
+ -							 se_cmd->pi_err, 0);
+ -	else
+ -		isert_put_response(isert_conn->conn, cmd);
+ -}
+ -
+  static void
+  isert_completion_rdma_read(struct iser_tx_desc *tx_desc,
+  			   struct isert_cmd *isert_cmd)
+@@@ -1358,6 -1818,11 +1371,14 @@@ isert_do_control_comp(struct work_struc
+  		isert_conn->logout_posted = true;
+  		iscsit_logout_post_handler(cmd, cmd->conn);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case ISTATE_SEND_TEXTRSP:
++ 		atomic_dec(&isert_conn->post_send_buf_count);
++ 		cmd->i_state = ISTATE_SENT_STATUS;
++ 		isert_completion_put(&isert_cmd->tx_desc, isert_cmd, ib_dev, false);
++ 		break;
+++>>>>>>> 03e7848a64ed (iser-target: Add missing se_cmd put for WRITE_PENDING in tx_comp_err)
+  	default:
+  		pr_err("Unknown do_control_comp i_state %d\n", cmd->i_state);
+  		dump_stack();
+@@@ -1382,10 -1849,21 +1403,10 @@@ isert_response_completion(struct iser_t
+  		queue_work(isert_comp_wq, &isert_cmd->comp_work);
+  		return;
+  	}
+ -
+ -	/**
+ -	 * If send_wr_num is 0 this means that we got
+ -	 * RDMA completion and we cleared it and we should
+ -	 * simply decrement the response post. else the
+ -	 * response is incorporated in send_wr_num, just
+ -	 * sub it.
+ -	 **/
+ -	if (wr->send_wr_num)
+ -		atomic_sub(wr->send_wr_num, &isert_conn->post_send_buf_count);
+ -	else
+ -		atomic_dec(&isert_conn->post_send_buf_count);
+ +	atomic_dec(&isert_conn->post_send_buf_count);
+  
+  	cmd->i_state = ISTATE_SENT_STATUS;
+- 	isert_completion_put(tx_desc, isert_cmd, ib_dev);
++ 	isert_completion_put(tx_desc, isert_cmd, ib_dev, false);
+  }
+  
+  static void
+@@@ -1431,31 -1910,118 +1452,116 @@@ isert_send_completion(struct iser_tx_de
+  }
+  
+  static void
+++<<<<<<< HEAD
+ +isert_cq_comp_err(struct iser_tx_desc *tx_desc, struct isert_conn *isert_conn)
+++=======
++ isert_send_completion(struct iser_tx_desc *tx_desc,
++ 		      struct isert_conn *isert_conn)
++ {
++ 	struct llist_node *llnode = tx_desc->comp_llnode_batch;
++ 	struct iser_tx_desc *t;
++ 	/*
++ 	 * Drain coalesced completion llist starting from comp_llnode_batch
++ 	 * setup in isert_init_send_wr(), and then complete trailing tx_desc.
++ 	 */
++ 	while (llnode) {
++ 		t = llist_entry(llnode, struct iser_tx_desc, comp_llnode);
++ 		llnode = llist_next(llnode);
++ 		__isert_send_completion(t, isert_conn);
++ 	}
++ 	__isert_send_completion(tx_desc, isert_conn);
++ }
++ 
++ static void
++ isert_cq_drain_comp_llist(struct isert_conn *isert_conn, struct ib_device *ib_dev)
++ {
++ 	struct llist_node *llnode;
++ 	struct isert_rdma_wr *wr;
++ 	struct iser_tx_desc *t;
++ 
++ 	mutex_lock(&isert_conn->conn_mutex);
++ 	llnode = llist_del_all(&isert_conn->conn_comp_llist);
++ 	isert_conn->conn_comp_batch = 0;
++ 	mutex_unlock(&isert_conn->conn_mutex);
++ 
++ 	while (llnode) {
++ 		t = llist_entry(llnode, struct iser_tx_desc, comp_llnode);
++ 		llnode = llist_next(llnode);
++ 		wr = &t->isert_cmd->rdma_wr;
++ 
++ 		/**
++ 		 * If send_wr_num is 0 this means that we got
++ 		 * RDMA completion and we cleared it and we should
++ 		 * simply decrement the response post. else the
++ 		 * response is incorporated in send_wr_num, just
++ 		 * sub it.
++ 		 **/
++ 		if (wr->send_wr_num)
++ 			atomic_sub(wr->send_wr_num,
++ 				   &isert_conn->post_send_buf_count);
++ 		else
++ 			atomic_dec(&isert_conn->post_send_buf_count);
++ 
++ 		isert_completion_put(t, t->isert_cmd, ib_dev, true);
++ 	}
++ }
++ 
++ static void
++ isert_cq_tx_comp_err(struct iser_tx_desc *tx_desc, struct isert_conn *isert_conn)
+++>>>>>>> 03e7848a64ed (iser-target: Add missing se_cmd put for WRITE_PENDING in tx_comp_err)
+  {
+  	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
+ -	struct isert_cmd *isert_cmd = tx_desc->isert_cmd;
+ -	struct llist_node *llnode = tx_desc->comp_llnode_batch;
+ -	struct isert_rdma_wr *wr;
+ -	struct iser_tx_desc *t;
+  
+ -	while (llnode) {
+ -		t = llist_entry(llnode, struct iser_tx_desc, comp_llnode);
+ -		llnode = llist_next(llnode);
+ -		wr = &t->isert_cmd->rdma_wr;
+ +	if (tx_desc) {
+ +		struct isert_cmd *isert_cmd = tx_desc->isert_cmd;
+  
+ -		/**
+ -		 * If send_wr_num is 0 this means that we got
+ -		 * RDMA completion and we cleared it and we should
+ -		 * simply decrement the response post. else the
+ -		 * response is incorporated in send_wr_num, just
+ -		 * sub it.
+ -		 **/
+ -		if (wr->send_wr_num)
+ -			atomic_sub(wr->send_wr_num,
+ -				   &isert_conn->post_send_buf_count);
+ +		if (!isert_cmd)
+ +			isert_unmap_tx_desc(tx_desc, ib_dev);
+  		else
+++<<<<<<< HEAD
+ +			isert_completion_put(tx_desc, isert_cmd, ib_dev);
+++=======
++ 			atomic_dec(&isert_conn->post_send_buf_count);
++ 
++ 		isert_completion_put(t, t->isert_cmd, ib_dev, true);
++ 	}
++ 	tx_desc->comp_llnode_batch = NULL;
++ 
++ 	if (!isert_cmd)
++ 		isert_unmap_tx_desc(tx_desc, ib_dev);
++ 	else
++ 		isert_completion_put(tx_desc, isert_cmd, ib_dev, true);
++ }
++ 
++ static void
++ isert_cq_rx_comp_err(struct isert_conn *isert_conn)
++ {
++ 	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
++ 	struct iscsi_conn *conn = isert_conn->conn;
++ 
++ 	if (isert_conn->post_recv_buf_count)
++ 		return;
++ 
++ 	isert_cq_drain_comp_llist(isert_conn, ib_dev);
++ 
++ 	if (conn->sess) {
++ 		target_sess_cmd_list_set_waiting(conn->sess->se_sess);
++ 		target_wait_for_sess_cmds(conn->sess->se_sess);
+++>>>>>>> 03e7848a64ed (iser-target: Add missing se_cmd put for WRITE_PENDING in tx_comp_err)
+  	}
+  
+ -	while (atomic_read(&isert_conn->post_send_buf_count))
+ -		msleep(3000);
+ +	if (isert_conn->post_recv_buf_count == 0 &&
+ +	    atomic_read(&isert_conn->post_send_buf_count) == 0) {
+ +		pr_debug("isert_cq_comp_err >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
+ +		pr_debug("Calling wake_up from isert_cq_comp_err\n");
+  
+ -	mutex_lock(&isert_conn->conn_mutex);
+ -	isert_conn->state = ISER_CONN_DOWN;
+ -	mutex_unlock(&isert_conn->conn_mutex);
+ +		mutex_lock(&isert_conn->conn_mutex);
+ +		if (isert_conn->state != ISER_CONN_DOWN)
+ +			isert_conn->state = ISER_CONN_TERMINATING;
+ +		mutex_unlock(&isert_conn->conn_mutex);
+  
+ -	complete(&isert_conn->conn_wait_comp_err);
+ +		wake_up(&isert_conn->conn_wait_comp_err);
+ +	}
+  }
+  
+  static void
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
