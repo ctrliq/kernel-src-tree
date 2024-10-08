@@ -1,0 +1,149 @@
+xprtrdma: Add ro_unmap_sync method for FRWR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit c9918ff56dfb175ce427140c641280d0b4522dbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c9918ff5.failed
+
+FRWR's ro_unmap is asynchronous. The new ro_unmap_sync posts
+LOCAL_INV Work Requests and waits for them to complete before
+returning.
+
+Note also, DMA unmapping is now done _after_ invalidation.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit c9918ff56dfb175ce427140c641280d0b4522dbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 944b72ffed6c,c6836844bd0e..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -196,8 -258,12 +198,17 @@@ __frwr_sendcompletion_flush(struct ib_w
+  
+  	/* WARNING: Only wr_id and status are reliable at this point */
+  	r = (struct rpcrdma_mw *)(unsigned long)wc->wr_id;
+++<<<<<<< HEAD
+ +	pr_warn("RPC:       %s: frmr %p flushed, status %d\n",
+ +		__func__, r, wc->status);
+++=======
++ 	if (wc->status == IB_WC_WR_FLUSH_ERR)
++ 		dprintk("RPC:       %s: frmr %p flushed\n", __func__, r);
++ 	else
++ 		pr_warn("RPC:       %s: frmr %p error, status %s (%d)\n",
++ 			__func__, r, ib_wc_status_msg(wc->status), wc->status);
++ 
+++>>>>>>> c9918ff56dfb (xprtrdma: Add ro_unmap_sync method for FRWR)
+  	r->r.frmr.fr_state = FRMR_IS_STALE;
+  }
+  
+@@@ -248,36 -329,48 +272,54 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  	    int nsegs, bool writing)
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct ib_device *device = ia->ri_device;
+ +	struct ib_device *device = ia->ri_id->device;
+  	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+  	struct rpcrdma_mr_seg *seg1 = seg;
+ -	struct rpcrdma_mw *mw;
+ -	struct rpcrdma_frmr *frmr;
+ -	struct ib_mr *mr;
+ -	struct ib_reg_wr *reg_wr;
+ -	struct ib_send_wr *bad_wr;
+ -	int rc, i, n, dma_nents;
+ +	struct rpcrdma_mw *mw = seg1->rl_mw;
+ +	struct rpcrdma_frmr *frmr = &mw->r.frmr;
+ +	struct ib_mr *mr = frmr->fr_mr;
+ +	struct ib_send_wr fastreg_wr, *bad_wr;
+  	u8 key;
+ -
+ +	int len, pageoff;
+ +	int i, rc;
+ +	int seg_len;
+ +	u64 pa;
+ +	int page_no;
+ +
+++<<<<<<< HEAD
+ +	pageoff = offset_in_page(seg1->mr_offset);
+ +	seg1->mr_offset -= pageoff;	/* start of page */
+ +	seg1->mr_len += pageoff;
+ +	len = -pageoff;
+++=======
++ 	mw = seg1->rl_mw;
++ 	seg1->rl_mw = NULL;
++ 	do {
++ 		if (mw)
++ 			__frwr_queue_recovery(mw);
++ 		mw = rpcrdma_get_mw(r_xprt);
++ 		if (!mw)
++ 			return -ENOMEM;
++ 	} while (mw->r.frmr.fr_state != FRMR_IS_INVALID);
++ 	frmr = &mw->r.frmr;
++ 	frmr->fr_state = FRMR_IS_VALID;
++ 	frmr->fr_waiter = false;
++ 	mr = frmr->fr_mr;
++ 	reg_wr = &frmr->fr_regwr;
++ 
+++>>>>>>> c9918ff56dfb (xprtrdma: Add ro_unmap_sync method for FRWR)
+  	if (nsegs > ia->ri_max_frmr_depth)
+  		nsegs = ia->ri_max_frmr_depth;
+ -
+ -	for (i = 0; i < nsegs;) {
+ -		if (seg->mr_page)
+ -			sg_set_page(&frmr->sg[i],
+ -				    seg->mr_page,
+ -				    seg->mr_len,
+ -				    offset_in_page(seg->mr_offset));
+ -		else
+ -			sg_set_buf(&frmr->sg[i], seg->mr_offset,
+ -				   seg->mr_len);
+ -
+ +	for (page_no = i = 0; i < nsegs;) {
+ +		rpcrdma_map_one(device, seg, direction);
+ +		pa = seg->mr_dma;
+ +		for (seg_len = seg->mr_len; seg_len > 0; seg_len -= PAGE_SIZE) {
+ +			frmr->fr_pgl->page_list[page_no++] = pa;
+ +			pa += PAGE_SIZE;
+ +		}
+ +		len += seg->mr_len;
+  		++seg;
+  		++i;
+ -
+  		/* Check for holes */
+  		if ((i < nsegs && offset_in_page(seg->mr_offset)) ||
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index 2dc9fc842039,ddae4909982b..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -200,6 -207,17 +200,20 @@@ struct rpcrdma_frmr 
+  	enum rpcrdma_frmr_state		fr_state;
+  	struct work_struct		fr_work;
+  	struct rpcrdma_xprt		*fr_xprt;
+++<<<<<<< HEAD
+++=======
++ 	bool				fr_waiter;
++ 	struct completion		fr_linv_done;;
++ 	union {
++ 		struct ib_reg_wr	fr_regwr;
++ 		struct ib_send_wr	fr_invwr;
++ 	};
++ };
++ 
++ struct rpcrdma_fmr {
++ 	struct ib_fmr		*fmr;
++ 	u64			*physaddrs;
+++>>>>>>> c9918ff56dfb (xprtrdma: Add ro_unmap_sync method for FRWR)
+  };
+  
+  struct rpcrdma_mw {
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
