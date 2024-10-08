@@ -969,6 +969,14 @@ static int perf_stat_init_aggr_mode(void)
 	return 0;
 }
 
+static void perf_stat__exit_aggr_mode(void)
+{
+	cpu_map__put(aggr_map);
+	cpu_map__put(cpus_aggr_map);
+	aggr_map = NULL;
+	cpus_aggr_map = NULL;
+}
+
 /*
  * Add default attributes, if there were no attributes specified or
  * if -d/--detailed, -d -d or -d -d -d is used:
@@ -1380,6 +1388,7 @@ int cmd_stat(int argc, const char **argv, const char *prefix __maybe_unused)
 	if (!forever && status != -1 && !interval)
 		print_counters(NULL, argc, argv);
 
+	perf_stat__exit_aggr_mode();
 	perf_evlist__free_stats(evsel_list);
 out:
 	perf_evlist__delete(evsel_list);
