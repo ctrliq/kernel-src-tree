@@ -159,6 +159,8 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
 	cmpwi	r12, BOOK3S_INTERRUPT_EXTERNAL
 BEGIN_FTR_SECTION
 	beq	11f
+	cmpwi	r12, BOOK3S_INTERRUPT_H_DOORBELL
+	beq 	15f	/* Invoke the H_DOORBELL handler */
 	cmpwi	cr2, r12, BOOK3S_INTERRUPT_HMI
 	beq	cr2, 14f			/* HMI check */
 END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
@@ -184,6 +186,10 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
 14:	mtspr	SPRN_HSRR0, r8
 	mtspr	SPRN_HSRR1, r7
 	b	hmi_exception_after_realmode
+
+15:	mtspr SPRN_HSRR0, r8
+	mtspr SPRN_HSRR1, r7
+	ba    0xe80
 
 kvmppc_primary_no_guest:
 	/* We handle this much like a ceded vcpu */
@@ -2497,14 +2503,19 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
 
 	/* hypervisor doorbell */
 3:	li	r12, BOOK3S_INTERRUPT_H_DOORBELL
+
+	/*
+	 * Clear the doorbell as we will invoke the handler
+	 * explicitly in the guest exit path.
+	 */
+	lis	r6, (PPC_DBELL_SERVER << (63-36))@h
+	PPC_MSGCLR(6)
 	/* see if it's a host IPI */
 	li	r3, 1
 	lbz	r0, HSTATE_HOST_IPI(r13)
 	cmpwi	r0, 0
 	bnelr
-	/* if not, clear it and return -1 */
-	lis	r6, (PPC_DBELL_SERVER << (63-36))@h
-	PPC_MSGCLR(6)
+	/* if not, return -1 */
 	li	r3, -1
 	blr
 
