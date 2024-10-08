@@ -1,0 +1,534 @@
+net: Add ops->ndo_xmit_flush()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Add ops->ndo_xmit_flush() (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 90.91%
+commit-author David S. Miller <davem@davemloft.net>
+commit 4798248e4e023170e937a65a1d30fcc52496dd42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4798248e.failed
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4798248e4e023170e937a65a1d30fcc52496dd42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/gadget/f_ncm.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/packet/af_packet.c
+diff --cc drivers/usb/gadget/f_ncm.c
+index ee19bc8d0040,cb5d646db6a7..000000000000
+--- a/drivers/usb/gadget/f_ncm.c
++++ b/drivers/usb/gadget/f_ncm.c
+@@@ -866,91 -953,168 +866,131 @@@ static struct sk_buff *ncm_wrap_ntb(str
+  				    struct sk_buff *skb)
+  {
+  	struct f_ncm	*ncm = func_to_ncm(&port->func);
+ -	struct sk_buff	*skb2 = NULL;
+ +	struct sk_buff	*skb2;
+  	int		ncb_len = 0;
+ -	__le16		*ntb_data;
+ -	__le16		*ntb_ndp;
+ -	int		dgram_pad;
+ -
+ +	__le16		*tmp;
+ +	int		div;
+ +	int		rem;
+ +	int		pad;
+ +	int		ndp_align;
+ +	int		ndp_pad;
+  	unsigned	max_size = ncm->port.fixed_in_len;
+  	const struct ndp_parser_opts *opts = ncm->parser_opts;
+ -	const int ndp_align = le16_to_cpu(ntb_parameters.wNdpInAlignment);
+ -	const int div = le16_to_cpu(ntb_parameters.wNdpInDivisor);
+ -	const int rem = le16_to_cpu(ntb_parameters.wNdpInPayloadRemainder);
+ -	const int dgram_idx_len = 2 * 2 * opts->dgram_item_len;
+ +	unsigned	crc_len = ncm->is_crc ? sizeof(uint32_t) : 0;
+ +
+ +	div = le16_to_cpu(ntb_parameters.wNdpInDivisor);
+ +	rem = le16_to_cpu(ntb_parameters.wNdpInPayloadRemainder);
+ +	ndp_align = le16_to_cpu(ntb_parameters.wNdpInAlignment);
+ +
+ +	ncb_len += opts->nth_size;
+ +	ndp_pad = ALIGN(ncb_len, ndp_align) - ncb_len;
+ +	ncb_len += ndp_pad;
+ +	ncb_len += opts->ndp_size;
+ +	ncb_len += 2 * 2 * opts->dgram_item_len; /* Datagram entry */
+ +	ncb_len += 2 * 2 * opts->dgram_item_len; /* Zero datagram entry */
+ +	pad = ALIGN(ncb_len, div) + rem - ncb_len;
+ +	ncb_len += pad;
+  
+ -	if (!skb && !ncm->skb_tx_data)
+ +	if (ncb_len + skb->len + crc_len > max_size) {
+ +		dev_kfree_skb_any(skb);
+  		return NULL;
+ +	}
+  
+ -	if (skb) {
+ -		/* Add the CRC if required up front */
+ -		if (ncm->is_crc) {
+ -			uint32_t	crc;
+ -			__le16		*crc_pos;
+ -
+ -			crc = ~crc32_le(~0,
+ -					skb->data,
+ -					skb->len);
+ -			crc_pos = (void *) skb_put(skb, sizeof(uint32_t));
+ -			put_unaligned_le32(crc, crc_pos);
+ -		}
+ +	skb2 = skb_copy_expand(skb, ncb_len,
+ +			       max_size - skb->len - ncb_len - crc_len,
+ +			       GFP_ATOMIC);
+ +	dev_kfree_skb_any(skb);
+ +	if (!skb2)
+ +		return NULL;
+  
+ -		/* If the new skb is too big for the current NCM NTB then
+ -		 * set the current stored skb to be sent now and clear it
+ -		 * ready for new data.
+ -		 * NOTE: Assume maximum align for speed of calculation.
+ -		 */
+ -		if (ncm->skb_tx_data
+ -		    && (ncm->ndp_dgram_count >= TX_MAX_NUM_DPE
+ -		    || (ncm->skb_tx_data->len +
+ -		    div + rem + skb->len +
+ -		    ncm->skb_tx_ndp->len + ndp_align + (2 * dgram_idx_len))
+ -		    > max_size)) {
+ -			skb2 = package_for_tx(ncm);
+ -			if (!skb2)
+ -				goto err;
+ -		}
+ +	skb = skb2;
+  
+ -		if (!ncm->skb_tx_data) {
+ -			ncb_len = opts->nth_size;
+ -			dgram_pad = ALIGN(ncb_len, div) + rem - ncb_len;
+ -			ncb_len += dgram_pad;
+ +	tmp = (void *) skb_push(skb, ncb_len);
+ +	memset(tmp, 0, ncb_len);
+  
+ -			/* Create a new skb for the NTH and datagrams. */
+ -			ncm->skb_tx_data = alloc_skb(max_size, GFP_ATOMIC);
+ -			if (!ncm->skb_tx_data)
+ -				goto err;
+ +	put_unaligned_le32(opts->nth_sign, tmp); /* dwSignature */
+ +	tmp += 2;
+ +	/* wHeaderLength */
+ +	put_unaligned_le16(opts->nth_size, tmp++);
+ +	tmp++; /* skip wSequence */
+ +	put_ncm(&tmp, opts->block_length, skb->len); /* (d)wBlockLength */
+ +	/* (d)wFpIndex */
+ +	/* the first pointer is right after the NTH + align */
+ +	put_ncm(&tmp, opts->fp_index, opts->nth_size + ndp_pad);
+  
+ -			ntb_data = (void *) skb_put(ncm->skb_tx_data, ncb_len);
+ -			memset(ntb_data, 0, ncb_len);
+ -			/* dwSignature */
+ -			put_unaligned_le32(opts->nth_sign, ntb_data);
+ -			ntb_data += 2;
+ -			/* wHeaderLength */
+ -			put_unaligned_le16(opts->nth_size, ntb_data++);
+ -
+ -			/* Allocate an skb for storing the NDP,
+ -			 * TX_MAX_NUM_DPE should easily suffice for a
+ -			 * 16k packet.
+ -			 */
+ -			ncm->skb_tx_ndp = alloc_skb((int)(opts->ndp_size
+ -						    + opts->dpe_size
+ -						    * TX_MAX_NUM_DPE),
+ -						    GFP_ATOMIC);
+ -			if (!ncm->skb_tx_ndp)
+ -				goto err;
+ -			ntb_ndp = (void *) skb_put(ncm->skb_tx_ndp,
+ -						    opts->ndp_size);
+ -			memset(ntb_ndp, 0, ncb_len);
+ -			/* dwSignature */
+ -			put_unaligned_le32(ncm->ndp_sign, ntb_ndp);
+ -			ntb_ndp += 2;
+ +	tmp = (void *)tmp + ndp_pad;
+  
+ -			/* There is always a zeroed entry */
+ -			ncm->ndp_dgram_count = 1;
+ +	/* NDP */
+ +	put_unaligned_le32(ncm->ndp_sign, tmp); /* dwSignature */
+ +	tmp += 2;
+ +	/* wLength */
+ +	put_unaligned_le16(ncb_len - opts->nth_size - pad, tmp++);
+  
+ -			/* Note: we skip opts->next_ndp_index */
+ -		}
+ +	tmp += opts->reserved1;
+ +	tmp += opts->next_fp_index; /* skip reserved (d)wNextFpIndex */
+ +	tmp += opts->reserved2;
+  
+ -		/* Delay the timer. */
+ -		hrtimer_start(&ncm->task_timer,
+ -			      ktime_set(0, TX_TIMEOUT_NSECS),
+ -			      HRTIMER_MODE_REL);
+ -
+ -		/* Add the datagram position entries */
+ -		ntb_ndp = (void *) skb_put(ncm->skb_tx_ndp, dgram_idx_len);
+ -		memset(ntb_ndp, 0, dgram_idx_len);
+ -
+ -		ncb_len = ncm->skb_tx_data->len;
+ -		dgram_pad = ALIGN(ncb_len, div) + rem - ncb_len;
+ -		ncb_len += dgram_pad;
+ -
+ -		/* (d)wDatagramIndex */
+ -		put_ncm(&ntb_ndp, opts->dgram_item_len, ncb_len);
+ -		/* (d)wDatagramLength */
+ -		put_ncm(&ntb_ndp, opts->dgram_item_len, skb->len);
+ -		ncm->ndp_dgram_count++;
+ -
+ -		/* Add the new data to the skb */
+ -		ntb_data = (void *) skb_put(ncm->skb_tx_data, dgram_pad);
+ -		memset(ntb_data, 0, dgram_pad);
+ -		ntb_data = (void *) skb_put(ncm->skb_tx_data, skb->len);
+ -		memcpy(ntb_data, skb->data, skb->len);
+ -		dev_kfree_skb_any(skb);
+ -		skb = NULL;
+ +	if (ncm->is_crc) {
+ +		uint32_t crc;
+  
+ -	} else if (ncm->skb_tx_data && ncm->timer_force_tx) {
+ -		/* If the tx was requested because of a timeout then send */
+ -		skb2 = package_for_tx(ncm);
+ -		if (!skb2)
+ -			goto err;
+ +		crc = ~crc32_le(~0,
+ +				skb->data + ncb_len,
+ +				skb->len - ncb_len);
+ +		put_unaligned_le32(crc, skb->data + skb->len);
+ +		skb_put(skb, crc_len);
+  	}
+  
+ -	return skb2;
+ +	/* (d)wDatagramIndex[0] */
+ +	put_ncm(&tmp, opts->dgram_item_len, ncb_len);
+ +	/* (d)wDatagramLength[0] */
+ +	put_ncm(&tmp, opts->dgram_item_len, skb->len - ncb_len);
+ +	/* (d)wDatagramIndex[1] and  (d)wDatagramLength[1] already zeroed */
+  
+ -err:
+ -	ncm->netdev->stats.tx_dropped++;
+ +	if (skb->len > MAX_TX_NONFIXED)
+ +		memset(skb_put(skb, max_size - skb->len),
+ +		       0, max_size - skb->len);
+  
+++<<<<<<< HEAD:drivers/usb/gadget/f_ncm.c
+ +	return skb;
+++=======
++ 	if (skb)
++ 		dev_kfree_skb_any(skb);
++ 	if (ncm->skb_tx_data)
++ 		dev_kfree_skb_any(ncm->skb_tx_data);
++ 	if (ncm->skb_tx_ndp)
++ 		dev_kfree_skb_any(ncm->skb_tx_ndp);
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * This transmits the NTB if there are frames waiting.
++  */
++ static void ncm_tx_tasklet(unsigned long data)
++ {
++ 	struct f_ncm	*ncm = (void *)data;
++ 
++ 	if (ncm->timer_stopping)
++ 		return;
++ 
++ 	/* Only send if data is available. */
++ 	if (ncm->skb_tx_data) {
++ 		ncm->timer_force_tx = true;
++ 		netdev_start_xmit(NULL, ncm->netdev);
++ 		ncm->timer_force_tx = false;
++ 	}
++ }
++ 
++ /*
++  * The transmit should only be run if no skb data has been sent
++  * for a certain duration.
++  */
++ static enum hrtimer_restart ncm_tx_timeout(struct hrtimer *data)
++ {
++ 	struct f_ncm *ncm = container_of(data, struct f_ncm, task_timer);
++ 	tasklet_schedule(&ncm->tx_tasklet);
++ 	return HRTIMER_NORESTART;
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush()):drivers/usb/gadget/function/f_ncm.c
+  }
+  
+  static int ncm_unwrap_ntb(struct gether *port,
+diff --cc include/linux/netdevice.h
+index dba59a041ff6,220c50984688..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -770,7 -782,21 +770,25 @@@ struct netdev_phys_port_id 
+   *        (can also return NETDEV_TX_LOCKED iff NETIF_F_LLTX)
+   *	Required can not be NULL.
+   *
+++<<<<<<< HEAD
+ + * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb);
+++=======
++  * void (*ndo_xmit_flush)(struct net_device *dev, u16 queue);
++  *	A driver implements this function when it wishes to support
++  *	deferred TX queue flushing.  The idea is that the expensive
++  *	operation to trigger TX queue processing can be done after
++  *	N calls to ndo_start_xmit rather than being done every single
++  *	time.  In this regime ndo_start_xmit will be called one or more
++  *	times, and then a final ndo_xmit_flush call will be made to
++  *	have the driver tell the device about the new pending TX queue
++  *	entries.  The kernel keeps track of which queues need flushing
++  *	by monitoring skb->queue_mapping of the packets it submits to
++  *	ndo_start_xmit.  This is the queue value that will be passed
++  *	to ndo_xmit_flush.
++  *
++  * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb,
++  *                         void *accel_priv, select_queue_fallback_t fallback);
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush())
+   *	Called to decide which queue to when device supports multiple
+   *	transmit queues.
+   *
+@@@ -971,8 -1018,11 +989,9 @@@ struct net_device_ops 
+  	int			(*ndo_stop)(struct net_device *dev);
+  	netdev_tx_t		(*ndo_start_xmit) (struct sk_buff *skb,
+  						   struct net_device *dev);
++ 	void			(*ndo_xmit_flush)(struct net_device *dev, u16 queue);
+  	u16			(*ndo_select_queue)(struct net_device *dev,
+ -						    struct sk_buff *skb,
+ -						    void *accel_priv,
+ -						    select_queue_fallback_t fallback);
+ +						    struct sk_buff *skb);
+  	void			(*ndo_change_rx_flags)(struct net_device *dev,
+  						       int flags);
+  	void			(*ndo_set_rx_mode)(struct net_device *dev);
+@@@ -2979,8 -3444,41 +2998,46 @@@ extern int __init dev_proc_init(void)
+  #define dev_proc_init() 0
+  #endif
+  
+++<<<<<<< HEAD
+ +extern int netdev_class_create_file(struct class_attribute *class_attr);
+ +extern void netdev_class_remove_file(struct class_attribute *class_attr);
+++=======
++ static inline netdev_tx_t __netdev_start_xmit(const struct net_device_ops *ops,
++ 					      struct sk_buff *skb, struct net_device *dev)
++ {
++ 	netdev_tx_t ret;
++ 	u16 q;
++ 
++ 	q = skb->queue_mapping;
++ 	ret = ops->ndo_start_xmit(skb, dev);
++ 	if (dev_xmit_complete(ret) && ops->ndo_xmit_flush)
++ 		ops->ndo_xmit_flush(dev, q);
++ 
++ 	return ret;
++ }
++ 
++ static inline netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 
++ 	return __netdev_start_xmit(ops, skb, dev);
++ }
++ 
++ int netdev_class_create_file_ns(struct class_attribute *class_attr,
++ 				const void *ns);
++ void netdev_class_remove_file_ns(struct class_attribute *class_attr,
++ 				 const void *ns);
++ 
++ static inline int netdev_class_create_file(struct class_attribute *class_attr)
++ {
++ 	return netdev_class_create_file_ns(class_attr, NULL);
++ }
++ 
++ static inline void netdev_class_remove_file(struct class_attribute *class_attr)
++ {
++ 	netdev_class_remove_file_ns(class_attr, NULL);
++ }
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush())
+  
+  extern struct kobj_ns_type_operations net_ns_type_operations;
+  
+diff --cc net/core/dev.c
+index 511d2dc85a3a,26d296c2447c..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2567,7 -2665,8 +2566,12 @@@ int dev_hard_start_xmit(struct sk_buff 
+  			dev_queue_xmit_nit(skb, dev);
+  
+  		skb_len = skb->len;
+++<<<<<<< HEAD
+ +		rc = ops->ndo_start_xmit(skb, dev);
+++=======
++ 		trace_net_dev_start_xmit(skb, dev);
++ 		rc = netdev_start_xmit(skb, dev);
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush())
+  		trace_net_dev_xmit(skb, rc, dev, skb_len);
+  		if (rc == NETDEV_TX_OK)
+  			txq_trans_update(txq);
+@@@ -2585,7 -2684,8 +2589,12 @@@ gso
+  			dev_queue_xmit_nit(nskb, dev);
+  
+  		skb_len = nskb->len;
+++<<<<<<< HEAD
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+++=======
++ 		trace_net_dev_start_xmit(nskb, dev);
++ 		rc = netdev_start_xmit(nskb, dev);
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush())
+  		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+  		if (unlikely(rc != NETDEV_TX_OK)) {
+  			if (rc & ~NETDEV_TX_MASK)
+diff --cc net/packet/af_packet.c
+index 4450cf82adc9,0dfa990d4eaa..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -237,6 -237,48 +237,51 @@@ struct packet_skb_cb 
+  static void __fanout_unlink(struct sock *sk, struct packet_sock *po);
+  static void __fanout_link(struct sock *sk, struct packet_sock *po);
+  
+++<<<<<<< HEAD
+++=======
++ static int packet_direct_xmit(struct sk_buff *skb)
++ {
++ 	struct net_device *dev = skb->dev;
++ 	netdev_features_t features;
++ 	struct netdev_queue *txq;
++ 	int ret = NETDEV_TX_BUSY;
++ 	u16 queue_map;
++ 
++ 	if (unlikely(!netif_running(dev) ||
++ 		     !netif_carrier_ok(dev)))
++ 		goto drop;
++ 
++ 	features = netif_skb_features(skb);
++ 	if (skb_needs_linearize(skb, features) &&
++ 	    __skb_linearize(skb))
++ 		goto drop;
++ 
++ 	queue_map = skb_get_queue_mapping(skb);
++ 	txq = netdev_get_tx_queue(dev, queue_map);
++ 
++ 	local_bh_disable();
++ 
++ 	HARD_TX_LOCK(dev, txq, smp_processor_id());
++ 	if (!netif_xmit_frozen_or_drv_stopped(txq)) {
++ 		ret = netdev_start_xmit(skb, dev);
++ 		if (ret == NETDEV_TX_OK)
++ 			txq_trans_update(txq);
++ 	}
++ 	HARD_TX_UNLOCK(dev, txq);
++ 
++ 	local_bh_enable();
++ 
++ 	if (!dev_xmit_complete(ret))
++ 		kfree_skb(skb);
++ 
++ 	return ret;
++ drop:
++ 	atomic_long_inc(&dev->tx_dropped);
++ 	kfree_skb(skb);
++ 	return NET_XMIT_DROP;
++ }
++ 
+++>>>>>>> 4798248e4e02 (net: Add ops->ndo_xmit_flush())
+  static struct net_device *packet_cached_dev_get(struct packet_sock *po)
+  {
+  	struct net_device *dev;
+diff --git a/drivers/net/wan/dlci.c b/drivers/net/wan/dlci.c
+index 6a8a382c5f4c..0f137062ae96 100644
+--- a/drivers/net/wan/dlci.c
++++ b/drivers/net/wan/dlci.c
+@@ -198,7 +198,7 @@ static netdev_tx_t dlci_transmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct dlci_local *dlp = netdev_priv(dev);
+ 
+ 	if (skb)
+-		dlp->slave->netdev_ops->ndo_start_xmit(skb, dlp->slave);
++		netdev_start_xmit(skb, dlp->slave);
+ 	return NETDEV_TX_OK;
+ }
+ 
+* Unmerged path drivers/usb/gadget/f_ncm.c
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/atm/mpc.c b/net/atm/mpc.c
+index d4cc1be5c364..23d2083d5caf 100644
+--- a/net/atm/mpc.c
++++ b/net/atm/mpc.c
+@@ -599,7 +599,7 @@ static netdev_tx_t mpc_send_packet(struct sk_buff *skb,
+ 	}
+ 
+ non_ip:
+-	return mpc->old_ops->ndo_start_xmit(skb, dev);
++	return __netdev_start_xmit(mpc->old_ops, skb, dev);
+ }
+ 
+ static int atm_mpoa_vcc_attach(struct atm_vcc *vcc, void __user *arg)
+* Unmerged path net/core/dev.c
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index 89e339d3631e..ef4ffec17742 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -76,7 +76,6 @@ module_param(carrier_timeout, uint, 0644);
+ static int netpoll_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ 			      struct netdev_queue *txq)
+ {
+-	const struct net_device_ops *ops = dev->netdev_ops;
+ 	int status = NETDEV_TX_OK;
+ 	netdev_features_t features;
+ 
+@@ -96,7 +95,7 @@ static int netpoll_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ 		skb->vlan_tci = 0;
+ 	}
+ 
+-	status = ops->ndo_start_xmit(skb, dev);
++	status = netdev_start_xmit(skb, dev);
+ 	if (status == NETDEV_TX_OK)
+ 		txq_trans_update(txq);
+ 
+diff --git a/net/core/pktgen.c b/net/core/pktgen.c
+index dc189dd7ca08..b66b8573db81 100644
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@ -3202,8 +3202,6 @@ static void pktgen_wait_for_skb(struct pktgen_dev *pkt_dev)
+ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
+ {
+ 	struct net_device *odev = pkt_dev->odev;
+-	netdev_tx_t (*xmit)(struct sk_buff *, struct net_device *)
+-		= odev->netdev_ops->ndo_start_xmit;
+ 	struct netdev_queue *txq;
+ 	u16 queue_map;
+ 	int ret;
+@@ -3254,7 +3252,7 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
+ 		goto unlock;
+ 	}
+ 	atomic_inc(&(pkt_dev->skb->users));
+-	ret = (*xmit)(pkt_dev->skb, odev);
++	ret = netdev_start_xmit(pkt_dev->skb, odev);
+ 
+ 	switch (ret) {
+ 	case NETDEV_TX_OK:
+* Unmerged path net/packet/af_packet.c
+diff --git a/net/sched/sch_teql.c b/net/sched/sch_teql.c
+index 474167162947..c64e178e91ea 100644
+--- a/net/sched/sch_teql.c
++++ b/net/sched/sch_teql.c
+@@ -301,7 +301,6 @@ restart:
+ 	do {
+ 		struct net_device *slave = qdisc_dev(q);
+ 		struct netdev_queue *slave_txq = netdev_get_tx_queue(slave, 0);
+-		const struct net_device_ops *slave_ops = slave->netdev_ops;
+ 
+ 		if (slave_txq->qdisc_sleeping != q)
+ 			continue;
+@@ -317,7 +316,7 @@ restart:
+ 				unsigned int length = qdisc_pkt_len(skb);
+ 
+ 				if (!netif_xmit_frozen_or_stopped(slave_txq) &&
+-				    slave_ops->ndo_start_xmit(skb, slave) == NETDEV_TX_OK) {
++				    netdev_start_xmit(skb, slave) == NETDEV_TX_OK) {
+ 					txq_trans_update(slave_txq);
+ 					__netif_tx_unlock(slave_txq);
+ 					master->slaves = NEXT_SLAVE(q);
