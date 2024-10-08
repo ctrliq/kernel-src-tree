@@ -1,0 +1,206 @@
+perf tools: Force period term to overload global settings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit ee4c75887d12bcd6ecd897291797d969256f39ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ee4c7588.failed
+
+Currently the command line option settings beats the per event period
+settings:
+
+With no global settings, we get per-event configuration:
+
+  $ perf record -e 'cpu/instructions,period=20000/' sleep 1
+  $ perf evlist -v
+  ... { sample_period, sample_freq }: 20000 ...
+
+With 'c' option period setup, we get 'c' option value:
+  $ perf record -e 'cpu/instructions,period=20000/' -c 1000 sleep 1
+  $ perf evlist -v
+  ... { sample_period, sample_freq }: 1000 ...
+
+This patch makes the per-event settings overload the global 'c' option
+setup:
+
+  $ perf record -e 'cpu/instructions,period=20000/' -c 1000 sleep 1
+  $ perf evlist -v
+  ... { sample_period, sample_freq }: 20000 ...
+
+I think the making the per-event settings to overload any other config
+makes more sense than current state. However it breaks the current
+'period' term handling, which might cause some noise.. so let's see ;-).
+
+Also fixing parse event tests with the new behaviour.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1438162936-59698-3-git-send-email-kan.liang@intel.com
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit ee4c75887d12bcd6ecd897291797d969256f39ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+#	tools/perf/util/parse-events.c
+diff --cc tools/perf/util/evsel.c
+index 016bdc7ab6b1,7d3acba5a512..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -582,6 -587,21 +582,24 @@@ perf_evsel__config_callgraph(struct per
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void apply_config_terms(struct perf_event_attr *attr __maybe_unused,
++ 			       struct list_head *config_terms)
++ {
++ 	struct perf_evsel_config_term *term;
++ 
++ 	list_for_each_entry(term, config_terms, list) {
++ 		switch (term->type) {
++ 		case PERF_EVSEL__CONFIG_TERM_PERIOD:
++ 			attr->sample_period = term->val.period;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> ee4c75887d12 (perf tools: Force period term to overload global settings)
+  /*
+   * The enable_on_exec/disabled value strategy:
+   *
+diff --cc tools/perf/util/evsel.h
+index 1fc263a80d91,a7d2175358b8..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -31,6 -31,25 +31,28 @@@ struct perf_sample_id 
+  
+  struct cgroup_sel;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The 'struct perf_evsel_config_term' is used to pass event
++  * specific configuration data to perf_evsel__config routine.
++  * It is allocated within event parsing and attached to
++  * perf_evsel::config_terms list head.
++ */
++ enum {
++ 	PERF_EVSEL__CONFIG_TERM_PERIOD,
++ 	PERF_EVSEL__CONFIG_TERM_MAX,
++ };
++ 
++ struct perf_evsel_config_term {
++ 	struct list_head	list;
++ 	int	type;
++ 	union {
++ 		u64	period;
++ 	} val;
++ };
++ 
+++>>>>>>> ee4c75887d12 (perf tools: Force period term to overload global settings)
+  /** struct perf_evsel - event selector
+   *
+   * @name - Can be set to retain the original event name passed by the user,
+diff --cc tools/perf/util/parse-events.c
+index 4f807fc1b14a,09bee93fd0ec..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -622,6 -627,37 +621,40 @@@ static int config_attr(struct perf_even
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int get_config_terms(struct list_head *head_config,
++ 			    struct list_head *head_terms __maybe_unused)
++ {
++ #define ADD_CONFIG_TERM(__type, __name, __val)			\
++ do {								\
++ 	struct perf_evsel_config_term *__t;			\
++ 								\
++ 	__t = zalloc(sizeof(*__t));				\
++ 	if (!__t)						\
++ 		return -ENOMEM;					\
++ 								\
++ 	INIT_LIST_HEAD(&__t->list);				\
++ 	__t->type       = PERF_EVSEL__CONFIG_TERM_ ## __type;	\
++ 	__t->val.__name = __val;				\
++ 	list_add_tail(&__t->list, head_terms);			\
++ } while (0)
++ 
++ 	struct parse_events_term *term;
++ 
++ 	list_for_each_entry(term, head_config, list) {
++ 		switch (term->type_term) {
++ 		case PARSE_EVENTS__TERM_TYPE_SAMPLE_PERIOD:
++ 			ADD_CONFIG_TERM(PERIOD, period, term->val.num);
++ 		default:
++ 			break;
++ 		}
++ 	}
++ #undef ADD_EVSEL_CONFIG
++ 	return 0;
++ }
++ 
+++>>>>>>> ee4c75887d12 (perf tools: Force period term to overload global settings)
+  int parse_events_add_numeric(struct parse_events_evlist *data,
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index 1c99db2877d3..9d8871010f6e 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -46,7 +46,7 @@ OPTIONS
+           /sys/bus/event_sources/devices/<pmu>/format/*
+ 
+ 	  There are also some params which are not defined in .../<pmu>/format/*.
+-	  These params can be used to set event defaults.
++	  These params can be used to overload default config values per event.
+ 	  Here is a list of the params.
+ 	  - 'period': Set event sampling period
+ 
+diff --git a/tools/perf/tests/parse-events.c b/tools/perf/tests/parse-events.c
+index d76963f7ad3d..f65bb89e109e 100644
+--- a/tools/perf/tests/parse-events.c
++++ b/tools/perf/tests/parse-events.c
+@@ -82,8 +82,12 @@ static int test__checkevent_symbolic_name_config(struct perf_evlist *evlist)
+ 	TEST_ASSERT_VAL("wrong type", PERF_TYPE_HARDWARE == evsel->attr.type);
+ 	TEST_ASSERT_VAL("wrong config",
+ 			PERF_COUNT_HW_CPU_CYCLES == evsel->attr.config);
++	/*
++	 * The period value gets configured within perf_evlist__config,
++	 * while this test executes only parse events method.
++	 */
+ 	TEST_ASSERT_VAL("wrong period",
+-			100000 == evsel->attr.sample_period);
++			0 == evsel->attr.sample_period);
+ 	TEST_ASSERT_VAL("wrong config1",
+ 			0 == evsel->attr.config1);
+ 	TEST_ASSERT_VAL("wrong config2",
+@@ -406,7 +410,11 @@ static int test__checkevent_pmu(struct perf_evlist *evlist)
+ 	TEST_ASSERT_VAL("wrong config",    10 == evsel->attr.config);
+ 	TEST_ASSERT_VAL("wrong config1",    1 == evsel->attr.config1);
+ 	TEST_ASSERT_VAL("wrong config2",    3 == evsel->attr.config2);
+-	TEST_ASSERT_VAL("wrong period",  1000 == evsel->attr.sample_period);
++	/*
++	 * The period value gets configured within perf_evlist__config,
++	 * while this test executes only parse events method.
++	 */
++	TEST_ASSERT_VAL("wrong period",     0 == evsel->attr.sample_period);
+ 
+ 	return 0;
+ }
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/parse-events.c
