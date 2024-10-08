@@ -1,0 +1,180 @@
+ACPI / hotplug / PCI: Add ACPIPHP contexts to devices handled by PCIeHP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Add ACPIPHP contexts to devices handled by PCIeHP (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 93.23%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit cc6254e00eb676dda6501655f8185aef7b761b4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/cc6254e0.failed
+
+Currently, ACPIPHP does not add hotplug context to devices that
+should be handled by the native PCI hotplug (PCIeHP) code.  The
+reason why was because PCIeHP didn't know about the devices'
+connections with ACPI and would not clean up things properly
+during an eject of an ACPI-backed device, for example.
+
+However, after recent changes that made the ACPI core create struct
+acpi_device objects for all namespace nodes regardless of the
+underlying devices' status and added PCI rescan-remove locking to
+both ACPIPHP and PCIeHP, that concern is not valid any more.
+Namely, after those changes PCIeHP need not care about the ACPI
+side of things any more and it should be serialized with respect to
+ACPIPHP and they won't be running concurrently with each other in
+any case.
+
+For this reason, make ACPIPHP to add its hotplug context to
+all devices with ACPI companions, even the ones that should be
+handled by PCIeHP in principle.  That may work around hotplug
+issues on some systems where PCIeHP is supposed to work, but it
+doesn't and the ACPI hotplug signaling works instead.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit cc6254e00eb676dda6501655f8185aef7b761b4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 0f3f960473bc,f2f460cba5f7..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -189,34 -250,42 +189,37 @@@ static void acpiphp_dock_init(void *dat
+  
+  static void acpiphp_dock_release(void *data)
+  {
+ -	struct acpiphp_context *context = data;
+ +	struct acpiphp_func *func = data;
+  
+ -	put_bridge(context->func.parent);
+ +	put_bridge(func->slot->bridge);
+  }
+  
+ -/**
+ - * acpiphp_add_context - Add ACPIPHP context to an ACPI device object.
+ - * @handle: ACPI handle of the object to add a context to.
+ - * @lvl: Not used.
+ - * @data: The object's parent ACPIPHP bridge.
+ - * @rv: Not used.
+ - */
+ -static acpi_status acpiphp_add_context(acpi_handle handle, u32 lvl, void *data,
+ -				       void **rv)
+ +/* callback routine to register each ACPI PCI slot object */
+ +static acpi_status
+ +register_slot(acpi_handle handle, u32 lvl, void *context, void **rv)
+  {
+ -	struct acpiphp_bridge *bridge = data;
+ -	struct acpiphp_context *context;
+ -	struct acpi_device *adev;
+ +	struct acpiphp_bridge *bridge = (struct acpiphp_bridge *)context;
+  	struct acpiphp_slot *slot;
+  	struct acpiphp_func *newfunc;
+ +	acpi_handle tmp;
+  	acpi_status status = AE_OK;
+ -	unsigned long long adr;
+ -	int device, function;
+ +	unsigned long long adr, sun;
+ +	int device, function, retval, found = 0;
+  	struct pci_bus *pbus = bridge->pci_bus;
+ -	struct pci_dev *pdev = bridge->pci_dev;
+ +	struct pci_dev *pdev;
+  	u32 val;
+  
+++<<<<<<< HEAD
+ +	if (!acpi_pci_check_ejectable(pbus, handle) && !is_dock_device(handle))
+ +		return AE_OK;
+ +
+++=======
+++>>>>>>> cc6254e00eb6 (ACPI / hotplug / PCI: Add ACPIPHP contexts to devices handled by PCIeHP)
+  	status = acpi_evaluate_integer(handle, "_ADR", NULL, &adr);
+  	if (ACPI_FAILURE(status)) {
+ -		if (status != AE_NOT_FOUND)
+ -			acpi_handle_warn(handle,
+ -				"can't evaluate _ADR (%#x)\n", status);
+ +		pr_warn("can't evaluate _ADR (%#x)\n", status);
+  		return AE_OK;
+  	}
+ -	if (acpi_bus_get_device(handle, &adev))
+ -		return AE_OK;
+  
+  	device = (adr >> 16) & 0xffff;
+  	function = adr & 0xffff;
+@@@ -258,38 -318,49 +261,57 @@@
+  
+  	/* search for objects that share the same slot */
+  	list_for_each_entry(slot, &bridge->slots, node)
+ -		if (slot->device == device)
+ -			goto slot_found;
+ +		if (slot->device == device) {
+ +			if (slot->sun != sun)
+ +				pr_warn("sibling found, but _SUN doesn't match!\n");
+ +			found = 1;
+ +			break;
+ +		}
+  
+ -	slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ -	if (!slot) {
+ -		acpi_lock_hp_context();
+ -		acpiphp_put_context(context);
+ -		acpi_unlock_hp_context();
+ -		return AE_NO_MEMORY;
+ -	}
+ +	if (!found) {
+ +		slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+ +		if (!slot) {
+ +			kfree(newfunc);
+ +			return AE_NO_MEMORY;
+ +		}
+  
+++<<<<<<< HEAD
+ +		slot->bridge = bridge;
+ +		slot->device = device;
+ +		slot->sun = sun;
+ +		INIT_LIST_HEAD(&slot->funcs);
+ +		mutex_init(&slot->crit_sect);
+++=======
++ 	slot->bus = bridge->pci_bus;
++ 	slot->device = device;
++ 	INIT_LIST_HEAD(&slot->funcs);
++ 
++ 	list_add_tail(&slot->node, &bridge->slots);
++ 
++ 	/*
++ 	 * Expose slots to user space for functions that have _EJ0 or _RMV or
++ 	 * are located in dock stations.  Do not expose them for devices handled
++ 	 * by the native PCIe hotplug (PCIeHP), becuase that code is supposed to
++ 	 * expose slots to user space in those cases.
++ 	 */
++ 	if ((acpi_pci_check_ejectable(pbus, handle) || is_dock_device(handle))
++ 	    && !(pdev && device_is_managed_by_native_pciehp(pdev))) {
++ 		unsigned long long sun;
++ 		int retval;
+++>>>>>>> cc6254e00eb6 (ACPI / hotplug / PCI: Add ACPIPHP contexts to devices handled by PCIeHP)
+  
+ +		mutex_lock(&bridge_mutex);
+ +		list_add_tail(&slot->node, &bridge->slots);
+ +		mutex_unlock(&bridge_mutex);
+  		bridge->nr_slots++;
+ -		status = acpi_evaluate_integer(handle, "_SUN", NULL, &sun);
+ -		if (ACPI_FAILURE(status))
+ -			sun = bridge->nr_slots;
+  
+  		pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+ -		    sun, pci_domain_nr(pbus), pbus->number, device);
+ -
+ -		retval = acpiphp_register_hotplug_slot(slot, sun);
+ +		    slot->sun, pci_domain_nr(pbus), pbus->number, device);
+ +		retval = acpiphp_register_hotplug_slot(slot);
+  		if (retval) {
+ -			slot->slot = NULL;
+ -			bridge->nr_slots--;
+  			if (retval == -EBUSY)
+  				pr_warn("Slot %llu already registered by another "
+ -					"hotplug driver\n", sun);
+ +					"hotplug driver\n", slot->sun);
+  			else
+  				pr_warn("acpiphp_register_hotplug_slot failed "
+  					"(err code = 0x%x)\n", retval);
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
