@@ -1,0 +1,100 @@
+NVMe: Use CMB for the IO SQes if available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jon Derrick <jonathan.derrick@intel.com>
+commit 8ffaadf7429270914b8f146ec13cf305e01df20d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8ffaadf7.failed
+
+Some controllers have a controller-side memory buffer available for use
+for submissions, completions, lists, or data.
+
+If a CMB is available, the entire CMB will be ioremapped and it will
+attempt to map the IO SQes onto the CMB. The queues will be shrunk as
+needed. The CMB will not be used if the queue depth is shrunk below some
+threshold where it may have reduced performance over a larger queue
+in system memory.
+
+	Signed-off-by: Jon Derrick <jonathan.derrick@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 8ffaadf7429270914b8f146ec13cf305e01df20d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 8da4158c74d9,82b4ffb6eefa..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1273,18 -1494,15 +1323,22 @@@ static struct nvme_queue *nvme_alloc_qu
+  	if (!nvmeq)
+  		return NULL;
+  
+ -	nvmeq->cqes = dma_zalloc_coherent(dev->dev, CQ_SIZE(depth),
+ -					  &nvmeq->cq_dma_addr, GFP_KERNEL);
+ +	nvmeq->cqes = dma_alloc_coherent(dmadev, CQ_SIZE(depth),
+ +					&nvmeq->cq_dma_addr, GFP_KERNEL);
+  	if (!nvmeq->cqes)
+  		goto free_nvmeq;
+ +	memset((void *)nvmeq->cqes, 0, CQ_SIZE(depth));
+  
+++<<<<<<< HEAD
+ +	nvmeq->sq_cmds = dma_alloc_coherent(dmadev, SQ_SIZE(depth),
+ +					&nvmeq->sq_dma_addr, GFP_KERNEL);
+ +	if (!nvmeq->sq_cmds)
+++=======
++ 	if (nvme_alloc_sq_cmds(dev, nvmeq, qid, depth))
+++>>>>>>> 8ffaadf74292 (NVMe: Use CMB for the IO SQes if available)
+  		goto free_cqdma;
+  
+ -	nvmeq->q_dmadev = dev->dev;
+ +	nvmeq->q_dmadev = dmadev;
+  	nvmeq->dev = dev;
+  	snprintf(nvmeq->irqname, sizeof(nvmeq->irqname), "nvme%dq%d",
+  			dev->instance, qid);
+* Unmerged path drivers/block/nvme-core.c
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index c0535e04f9c4..36a3c481b6eb 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -32,6 +32,8 @@ struct nvme_bar {
+ 	__u32			aqa;	/* Admin Queue Attributes */
+ 	__u64			asq;	/* Admin SQ Base Address */
+ 	__u64			acq;	/* Admin CQ Base Address */
++	__u32			cmbloc; /* Controller Memory Buffer Location */
++	__u32			cmbsz;  /* Controller Memory Buffer Size */
+ };
+ 
+ #define NVME_CAP_MQES(cap)	((cap) & 0xffff)
+@@ -40,6 +42,17 @@ struct nvme_bar {
+ #define NVME_CAP_MPSMIN(cap)	(((cap) >> 48) & 0xf)
+ #define NVME_CAP_MPSMAX(cap)	(((cap) >> 52) & 0xf)
+ 
++#define NVME_CMB_BIR(cmbloc)	((cmbloc) & 0x7)
++#define NVME_CMB_OFST(cmbloc)	(((cmbloc) >> 12) & 0xfffff)
++#define NVME_CMB_SZ(cmbsz)	(((cmbsz) >> 12) & 0xfffff)
++#define NVME_CMB_SZU(cmbsz)	(((cmbsz) >> 8) & 0xf)
++
++#define NVME_CMB_WDS(cmbsz)	((cmbsz) & 0x10)
++#define NVME_CMB_RDS(cmbsz)	((cmbsz) & 0x8)
++#define NVME_CMB_LISTS(cmbsz)	((cmbsz) & 0x4)
++#define NVME_CMB_CQS(cmbsz)	((cmbsz) & 0x2)
++#define NVME_CMB_SQS(cmbsz)	((cmbsz) & 0x1)
++
+ enum {
+ 	NVME_CC_ENABLE		= 1 << 0,
+ 	NVME_CC_CSS_NVM		= 0 << 4,
+@@ -99,6 +112,10 @@ struct nvme_dev {
+ 	u32 max_hw_sectors;
+ 	u32 stripe_size;
+ 	u32 page_size;
++	void __iomem *cmb;
++	dma_addr_t cmb_dma_addr;
++	u64 cmb_size;
++	u32 cmbsz;
+ 	u16 oncs;
+ 	u16 abort_limit;
+ 	u8 event_limit;
