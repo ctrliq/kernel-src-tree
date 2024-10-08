@@ -1,0 +1,119 @@
+GFS2: Don't brelse rgrp buffer_heads every allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 39b0f1e9290880a6c905f639e7db6b646e302a4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/39b0f1e9.failed
+
+This patch allows the block allocation code to retain the buffers
+for the resource groups so they don't need to be re-read from buffer
+cache with every request. This is a performance improvement that's
+especially noticeable when resource groups are very large. For
+example, with 2GB resource groups and 4K blocks, there can be 33
+blocks for every resource group. This patch allows those 33 buffers
+to be kept around and not read in and thrown away with every
+operation. The buffers are released when the resource group is
+either synced or invalidated.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Steven Whitehouse <swhiteho@redhat.com>
+	Reviewed-by: Benjamin Marzinski <bmarzins@redhat.com>
+(cherry picked from commit 39b0f1e9290880a6c905f639e7db6b646e302a4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glops.c
+index 48654eaae8b6,fa3fa5e94553..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -174,16 -179,19 +180,23 @@@ static void rgrp_go_sync(struct gfs2_gl
+  
+  static void rgrp_go_inval(struct gfs2_glock *gl, int flags)
+  {
+++<<<<<<< HEAD
+ +	struct address_space *mapping = gfs2_glock2aspace(gl);
+++=======
++ 	struct gfs2_sbd *sdp = gl->gl_sbd;
++ 	struct address_space *mapping = &sdp->sd_aspace;
++ 	struct gfs2_rgrpd *rgd = gl->gl_object;
++ 
++ 	if (rgd)
++ 		gfs2_rgrp_brelse(rgd);
+++>>>>>>> 39b0f1e92908 (GFS2: Don't brelse rgrp buffer_heads every allocation)
+  
+  	WARN_ON_ONCE(!(flags & DIO_METADATA));
+ -	gfs2_assert_withdraw(sdp, !atomic_read(&gl->gl_ail_count));
+ -	truncate_inode_pages_range(mapping, gl->gl_vm.start, gl->gl_vm.end);
+ +	gfs2_assert_withdraw(gl->gl_sbd, !atomic_read(&gl->gl_ail_count));
+ +	truncate_inode_pages(mapping, 0);
+  
+- 	if (gl->gl_object) {
+- 		struct gfs2_rgrpd *rgd = (struct gfs2_rgrpd *)gl->gl_object;
++ 	if (rgd)
+  		rgd->rd_flags &= ~GFS2_RDF_UPTODATE;
+- 	}
+  }
+  
+  /**
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 343571dc8841..405fab22389f 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1210,14 +1210,13 @@ int gfs2_rgrp_go_lock(struct gfs2_holder *gh)
+ }
+ 
+ /**
+- * gfs2_rgrp_go_unlock - Release RG bitmaps read in with gfs2_rgrp_bh_get()
+- * @gh: The glock holder for the resource group
++ * gfs2_rgrp_brelse - Release RG bitmaps read in with gfs2_rgrp_bh_get()
++ * @rgd: The resource group
+  *
+  */
+ 
+-void gfs2_rgrp_go_unlock(struct gfs2_holder *gh)
++void gfs2_rgrp_brelse(struct gfs2_rgrpd *rgd)
+ {
+-	struct gfs2_rgrpd *rgd = gh->gh_gl->gl_object;
+ 	int x, length = rgd->rd_length;
+ 
+ 	for (x = 0; x < length; x++) {
+@@ -1230,6 +1229,22 @@ void gfs2_rgrp_go_unlock(struct gfs2_holder *gh)
+ 
+ }
+ 
++/**
++ * gfs2_rgrp_go_unlock - Unlock a rgrp glock
++ * @gh: The glock holder for the resource group
++ *
++ */
++
++void gfs2_rgrp_go_unlock(struct gfs2_holder *gh)
++{
++	struct gfs2_rgrpd *rgd = gh->gh_gl->gl_object;
++	int demote_requested = test_bit(GLF_DEMOTE, &gh->gh_gl->gl_flags) |
++		test_bit(GLF_PENDING_DEMOTE, &gh->gh_gl->gl_flags);
++
++	if (rgd && demote_requested)
++		gfs2_rgrp_brelse(rgd);
++}
++
+ int gfs2_rgrp_send_discards(struct gfs2_sbd *sdp, u64 offset,
+ 			     struct buffer_head *bh,
+ 			     const struct gfs2_bitmap *bi, unsigned minlen, u64 *ptrimmed)
+diff --git a/fs/gfs2/rgrp.h b/fs/gfs2/rgrp.h
+index fa653ce050c8..4043bb699e98 100644
+--- a/fs/gfs2/rgrp.h
++++ b/fs/gfs2/rgrp.h
+@@ -36,6 +36,7 @@ extern void gfs2_clear_rgrpd(struct gfs2_sbd *sdp);
+ extern int gfs2_rindex_update(struct gfs2_sbd *sdp);
+ extern void gfs2_free_clones(struct gfs2_rgrpd *rgd);
+ extern int gfs2_rgrp_go_lock(struct gfs2_holder *gh);
++extern void gfs2_rgrp_brelse(struct gfs2_rgrpd *rgd);
+ extern void gfs2_rgrp_go_unlock(struct gfs2_holder *gh);
+ 
+ extern struct gfs2_alloc *gfs2_alloc_get(struct gfs2_inode *ip);
