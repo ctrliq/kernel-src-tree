@@ -1,0 +1,118 @@
+NVMe: Unify SQ entry writing and doorbell ringing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jon Derrick <jonathan.derrick@intel.com>
+commit 498c43949c7b8f57e0afb8195019cf5a7ba72de0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/498c4394.failed
+
+This patch changes sq_cmd writers to instead create their command on
+the stack. __nvme_submit_cmd copies the sq entry to the queue and writes
+the doorbell.
+
+	Signed-off-by: Jon Derrick <jonathan.derrick@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 498c43949c7b8f57e0afb8195019cf5a7ba72de0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 8da4158c74d9,e09ad6cc6dec..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -632,6 -727,21 +632,24 @@@ int nvme_setup_prps(struct nvme_dev *de
+  	return total_len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_submit_priv(struct nvme_queue *nvmeq, struct request *req,
++ 		struct nvme_iod *iod)
++ {
++ 	struct nvme_command cmnd;
++ 
++ 	memcpy(&cmnd, req->cmd, sizeof(cmnd));
++ 	cmnd.rw.command_id = req->tag;
++ 	if (req->nr_phys_segments) {
++ 		cmnd.rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
++ 		cmnd.rw.prp2 = cpu_to_le64(iod->first_dma);
++ 	}
++ 
++ 	__nvme_submit_cmd(nvmeq, &cmnd);
++ }
++ 
+++>>>>>>> 498c43949c7b (NVMe: Unify SQ entry writing and doorbell ringing)
+  /*
+   * We reuse the small pool to allocate the 16-byte range here as it is not
+   * worth having a special pool for these or additional cases to handle freeing
+@@@ -692,33 -798,43 +706,47 @@@ static int nvme_submit_iod(struct nvme_
+  	if (req->cmd_flags & REQ_RAHEAD)
+  		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+  
+- 	cmnd = &nvmeq->sq_cmds[nvmeq->sq_tail];
+- 	memset(cmnd, 0, sizeof(*cmnd));
+- 
+- 	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
+- 	cmnd->rw.command_id = req->tag;
+- 	cmnd->rw.nsid = cpu_to_le32(ns->ns_id);
+- 	cmnd->rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+- 	cmnd->rw.prp2 = cpu_to_le64(iod->first_dma);
+- 	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
+- 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
++ 	memset(&cmnd, 0, sizeof(cmnd));
++ 	cmnd.rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
++ 	cmnd.rw.command_id = req->tag;
++ 	cmnd.rw.nsid = cpu_to_le32(ns->ns_id);
++ 	cmnd.rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
++ 	cmnd.rw.prp2 = cpu_to_le64(iod->first_dma);
++ 	cmnd.rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 	cmnd.rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+  
+++<<<<<<< HEAD
+ +	if (blk_integrity_rq(req))
+ +		cmnd->rw.metadata = cpu_to_le64(sg_dma_address(iod->meta_sg));
+ +	else if (ns->ms)
+++=======
++ 	if (blk_integrity_rq(req)) {
++ 		cmnd.rw.metadata = cpu_to_le64(sg_dma_address(iod->meta_sg));
++ 		switch (ns->pi_type) {
++ 		case NVME_NS_DPS_PI_TYPE3:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD;
++ 			break;
++ 		case NVME_NS_DPS_PI_TYPE1:
++ 		case NVME_NS_DPS_PI_TYPE2:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD |
++ 					NVME_RW_PRINFO_PRCHK_REF;
++ 			cmnd.rw.reftag = cpu_to_le32(
++ 					nvme_block_nr(ns, blk_rq_pos(req)));
++ 			break;
++ 		}
++ 	} else if (ns->ms)
+++>>>>>>> 498c43949c7b (NVMe: Unify SQ entry writing and doorbell ringing)
+  		control |= NVME_RW_PRINFO_PRACT;
+  
+- 	cmnd->rw.control = cpu_to_le16(control);
+- 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
++ 	cmnd.rw.control = cpu_to_le16(control);
++ 	cmnd.rw.dsmgmt = cpu_to_le32(dsmgmt);
+  
+- 	if (++nvmeq->sq_tail == nvmeq->q_depth)
+- 		nvmeq->sq_tail = 0;
+- 	writel(nvmeq->sq_tail, nvmeq->q_db);
++ 	__nvme_submit_cmd(nvmeq, &cmnd);
+  
+  	return 0;
+ +
+  }
+  
+ -/*
+ - * NOTE: ns is NULL when called on the admin queue.
+ - */
+  static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+  			 const struct blk_mq_queue_data *bd)
+  {
+* Unmerged path drivers/block/nvme-core.c
