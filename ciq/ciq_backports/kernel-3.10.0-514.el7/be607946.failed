@@ -1,0 +1,481 @@
+xfs: Split default quota limits by quota type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Carlos Maiolino <cmaiolino@redhat.com>
+commit be6079461abf796e29d02b450a16908f4bf58f6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/be607946.failed
+
+Default quotas are globally set due historical reasons. IRIX only
+supported user and project quotas, and default quota was only
+applied to user quotas.
+
+In Linux, when a default quota is set, all different quota types
+inherits the same default value.
+
+An user with a quota limit larger than the default quota value, will
+still be limited to the default value because the group quotas also
+inherits the default quotas. Unless the group which the user belongs
+to have a custom quota limit set.
+
+This patch aims to split the default quota value by quota type.
+Allowing each quota type having different default values.
+
+Default time limits are still set globally. XFS does not set a
+per-user/group timer, but a single global timer. For changing this
+behavior, some changes should be made in user-space tools another
+bugs being fixed.
+
+	Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit be6079461abf796e29d02b450a16908f4bf58f6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_qm.c
+diff --cc fs/xfs/xfs_qm.c
+index c93b497fa09e,be125e1758c1..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -424,6 -422,175 +424,178 @@@ xfs_qm_dqdetach
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct xfs_qm_isolate {
++ 	struct list_head	buffers;
++ 	struct list_head	dispose;
++ };
++ 
++ static enum lru_status
++ xfs_qm_dquot_isolate(
++ 	struct list_head	*item,
++ 	struct list_lru_one	*lru,
++ 	spinlock_t		*lru_lock,
++ 	void			*arg)
++ 		__releases(lru_lock) __acquires(lru_lock)
++ {
++ 	struct xfs_dquot	*dqp = container_of(item,
++ 						struct xfs_dquot, q_lru);
++ 	struct xfs_qm_isolate	*isol = arg;
++ 
++ 	if (!xfs_dqlock_nowait(dqp))
++ 		goto out_miss_busy;
++ 
++ 	/*
++ 	 * This dquot has acquired a reference in the meantime remove it from
++ 	 * the freelist and try again.
++ 	 */
++ 	if (dqp->q_nrefs) {
++ 		xfs_dqunlock(dqp);
++ 		XFS_STATS_INC(dqp->q_mount, xs_qm_dqwants);
++ 
++ 		trace_xfs_dqreclaim_want(dqp);
++ 		list_lru_isolate(lru, &dqp->q_lru);
++ 		XFS_STATS_DEC(dqp->q_mount, xs_qm_dquot_unused);
++ 		return LRU_REMOVED;
++ 	}
++ 
++ 	/*
++ 	 * If the dquot is dirty, flush it. If it's already being flushed, just
++ 	 * skip it so there is time for the IO to complete before we try to
++ 	 * reclaim it again on the next LRU pass.
++ 	 */
++ 	if (!xfs_dqflock_nowait(dqp)) {
++ 		xfs_dqunlock(dqp);
++ 		goto out_miss_busy;
++ 	}
++ 
++ 	if (XFS_DQ_IS_DIRTY(dqp)) {
++ 		struct xfs_buf	*bp = NULL;
++ 		int		error;
++ 
++ 		trace_xfs_dqreclaim_dirty(dqp);
++ 
++ 		/* we have to drop the LRU lock to flush the dquot */
++ 		spin_unlock(lru_lock);
++ 
++ 		error = xfs_qm_dqflush(dqp, &bp);
++ 		if (error) {
++ 			xfs_warn(dqp->q_mount, "%s: dquot %p flush failed",
++ 				 __func__, dqp);
++ 			goto out_unlock_dirty;
++ 		}
++ 
++ 		xfs_buf_delwri_queue(bp, &isol->buffers);
++ 		xfs_buf_relse(bp);
++ 		goto out_unlock_dirty;
++ 	}
++ 	xfs_dqfunlock(dqp);
++ 
++ 	/*
++ 	 * Prevent lookups now that we are past the point of no return.
++ 	 */
++ 	dqp->dq_flags |= XFS_DQ_FREEING;
++ 	xfs_dqunlock(dqp);
++ 
++ 	ASSERT(dqp->q_nrefs == 0);
++ 	list_lru_isolate_move(lru, &dqp->q_lru, &isol->dispose);
++ 	XFS_STATS_DEC(dqp->q_mount, xs_qm_dquot_unused);
++ 	trace_xfs_dqreclaim_done(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaims);
++ 	return LRU_REMOVED;
++ 
++ out_miss_busy:
++ 	trace_xfs_dqreclaim_busy(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
++ 	return LRU_SKIP;
++ 
++ out_unlock_dirty:
++ 	trace_xfs_dqreclaim_busy(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
++ 	xfs_dqunlock(dqp);
++ 	spin_lock(lru_lock);
++ 	return LRU_RETRY;
++ }
++ 
++ static unsigned long
++ xfs_qm_shrink_scan(
++ 	struct shrinker		*shrink,
++ 	struct shrink_control	*sc)
++ {
++ 	struct xfs_quotainfo	*qi = container_of(shrink,
++ 					struct xfs_quotainfo, qi_shrinker);
++ 	struct xfs_qm_isolate	isol;
++ 	unsigned long		freed;
++ 	int			error;
++ 
++ 	if ((sc->gfp_mask & (__GFP_FS|__GFP_DIRECT_RECLAIM)) != (__GFP_FS|__GFP_DIRECT_RECLAIM))
++ 		return 0;
++ 
++ 	INIT_LIST_HEAD(&isol.buffers);
++ 	INIT_LIST_HEAD(&isol.dispose);
++ 
++ 	freed = list_lru_shrink_walk(&qi->qi_lru, sc,
++ 				     xfs_qm_dquot_isolate, &isol);
++ 
++ 	error = xfs_buf_delwri_submit(&isol.buffers);
++ 	if (error)
++ 		xfs_warn(NULL, "%s: dquot reclaim failed", __func__);
++ 
++ 	while (!list_empty(&isol.dispose)) {
++ 		struct xfs_dquot	*dqp;
++ 
++ 		dqp = list_first_entry(&isol.dispose, struct xfs_dquot, q_lru);
++ 		list_del_init(&dqp->q_lru);
++ 		xfs_qm_dqfree_one(dqp);
++ 	}
++ 
++ 	return freed;
++ }
++ 
++ static unsigned long
++ xfs_qm_shrink_count(
++ 	struct shrinker		*shrink,
++ 	struct shrink_control	*sc)
++ {
++ 	struct xfs_quotainfo	*qi = container_of(shrink,
++ 					struct xfs_quotainfo, qi_shrinker);
++ 
++ 	return list_lru_shrink_count(&qi->qi_lru, sc);
++ }
++ 
++ STATIC void
++ xfs_qm_set_defquota(
++ 	xfs_mount_t	*mp,
++ 	uint		type,
++ 	xfs_quotainfo_t	*qinf)
++ {
++ 	xfs_dquot_t		*dqp;
++ 	struct xfs_def_quota    *defq;
++ 	int			error;
++ 
++ 	error = xfs_qm_dqread(mp, 0, type, XFS_QMOPT_DOWARN, &dqp);
++ 
++ 	if (!error) {
++ 		xfs_disk_dquot_t        *ddqp = &dqp->q_core;
++ 
++ 		defq = xfs_get_defquota(dqp, qinf);
++ 
++ 		/*
++ 		 * Timers and warnings have been already set, let's just set the
++ 		 * default limits for this quota type
++ 		 */
++ 		defq->bhardlimit = be64_to_cpu(ddqp->d_blk_hardlimit);
++ 		defq->bsoftlimit = be64_to_cpu(ddqp->d_blk_softlimit);
++ 		defq->ihardlimit = be64_to_cpu(ddqp->d_ino_hardlimit);
++ 		defq->isoftlimit = be64_to_cpu(ddqp->d_ino_softlimit);
++ 		defq->rtbhardlimit = be64_to_cpu(ddqp->d_rtb_hardlimit);
++ 		defq->rtbsoftlimit = be64_to_cpu(ddqp->d_rtb_softlimit);
++ 		xfs_qm_dqdestroy(dqp);
++ 	}
++ }
++ 
+++>>>>>>> be6079461abf (xfs: Split default quota limits by quota type)
+  /*
+   * This initializes all the quota information that's kept in the
+   * mount structure
+@@@ -505,13 -670,6 +677,16 @@@ xfs_qm_init_quotainfo
+  			be16_to_cpu(ddqp->d_iwarns) : XFS_QM_IWARNLIMIT;
+  		qinf->qi_rtbwarnlimit = ddqp->d_rtbwarns ?
+  			be16_to_cpu(ddqp->d_rtbwarns) : XFS_QM_RTBWARNLIMIT;
+++<<<<<<< HEAD
+ +		qinf->qi_bhardlimit = be64_to_cpu(ddqp->d_blk_hardlimit);
+ +		qinf->qi_bsoftlimit = be64_to_cpu(ddqp->d_blk_softlimit);
+ +		qinf->qi_ihardlimit = be64_to_cpu(ddqp->d_ino_hardlimit);
+ +		qinf->qi_isoftlimit = be64_to_cpu(ddqp->d_ino_softlimit);
+ +		qinf->qi_rtbhardlimit = be64_to_cpu(ddqp->d_rtb_hardlimit);
+ +		qinf->qi_rtbsoftlimit = be64_to_cpu(ddqp->d_rtb_softlimit);
+ + 
+++=======
+++>>>>>>> be6079461abf (xfs: Split default quota limits by quota type)
+  		xfs_qm_dqdestroy(dqp);
+  	} else {
+  		qinf->qi_btimelimit = XFS_QM_BTIMELIMIT;
+@@@ -522,10 -680,26 +697,22 @@@
+  		qinf->qi_rtbwarnlimit = XFS_QM_RTBWARNLIMIT;
+  	}
+  
+++<<<<<<< HEAD
+ +	qinf->qi_shrinker.shrink = xfs_qm_shake;
+++=======
++ 	if (XFS_IS_UQUOTA_RUNNING(mp))
++ 		xfs_qm_set_defquota(mp, XFS_DQ_USER, qinf);
++ 	if (XFS_IS_GQUOTA_RUNNING(mp))
++ 		xfs_qm_set_defquota(mp, XFS_DQ_GROUP, qinf);
++ 	if (XFS_IS_PQUOTA_RUNNING(mp))
++ 		xfs_qm_set_defquota(mp, XFS_DQ_PROJ, qinf);
++ 
++ 	qinf->qi_shrinker.count_objects = xfs_qm_shrink_count;
++ 	qinf->qi_shrinker.scan_objects = xfs_qm_shrink_scan;
+++>>>>>>> be6079461abf (xfs: Split default quota limits by quota type)
+  	qinf->qi_shrinker.seeks = DEFAULT_SEEKS;
+ -	qinf->qi_shrinker.flags = SHRINKER_NUMA_AWARE;
+  	register_shrinker(&qinf->qi_shrinker);
+  	return 0;
+ -
+ -out_free_lru:
+ -	list_lru_destroy(&qinf->qi_lru);
+ -out_free_qinf:
+ -	kmem_free(qinf);
+ -	mp->m_quotainfo = NULL;
+ -	return error;
+  }
+  
+  
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index be09cd6e2e23..3f3d16c66532 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -92,26 +92,28 @@ xfs_qm_adjust_dqlimits(
+ {
+ 	struct xfs_quotainfo	*q = mp->m_quotainfo;
+ 	struct xfs_disk_dquot	*d = &dq->q_core;
++	struct xfs_def_quota	*defq;
+ 	int			prealloc = 0;
+ 
+ 	ASSERT(d->d_id);
++	defq = xfs_get_defquota(dq, q);
+ 
+-	if (q->qi_bsoftlimit && !d->d_blk_softlimit) {
+-		d->d_blk_softlimit = cpu_to_be64(q->qi_bsoftlimit);
++	if (defq->bsoftlimit && !d->d_blk_softlimit) {
++		d->d_blk_softlimit = cpu_to_be64(defq->bsoftlimit);
+ 		prealloc = 1;
+ 	}
+-	if (q->qi_bhardlimit && !d->d_blk_hardlimit) {
+-		d->d_blk_hardlimit = cpu_to_be64(q->qi_bhardlimit);
++	if (defq->bhardlimit && !d->d_blk_hardlimit) {
++		d->d_blk_hardlimit = cpu_to_be64(defq->bhardlimit);
+ 		prealloc = 1;
+ 	}
+-	if (q->qi_isoftlimit && !d->d_ino_softlimit)
+-		d->d_ino_softlimit = cpu_to_be64(q->qi_isoftlimit);
+-	if (q->qi_ihardlimit && !d->d_ino_hardlimit)
+-		d->d_ino_hardlimit = cpu_to_be64(q->qi_ihardlimit);
+-	if (q->qi_rtbsoftlimit && !d->d_rtb_softlimit)
+-		d->d_rtb_softlimit = cpu_to_be64(q->qi_rtbsoftlimit);
+-	if (q->qi_rtbhardlimit && !d->d_rtb_hardlimit)
+-		d->d_rtb_hardlimit = cpu_to_be64(q->qi_rtbhardlimit);
++	if (defq->isoftlimit && !d->d_ino_softlimit)
++		d->d_ino_softlimit = cpu_to_be64(defq->isoftlimit);
++	if (defq->ihardlimit && !d->d_ino_hardlimit)
++		d->d_ino_hardlimit = cpu_to_be64(defq->ihardlimit);
++	if (defq->rtbsoftlimit && !d->d_rtb_softlimit)
++		d->d_rtb_softlimit = cpu_to_be64(defq->rtbsoftlimit);
++	if (defq->rtbhardlimit && !d->d_rtb_hardlimit)
++		d->d_rtb_hardlimit = cpu_to_be64(defq->rtbhardlimit);
+ 
+ 	if (prealloc)
+ 		xfs_dquot_set_prealloc_limits(dq);
+* Unmerged path fs/xfs/xfs_qm.c
+diff --git a/fs/xfs/xfs_qm.h b/fs/xfs/xfs_qm.h
+index 7c9eec96746d..4426a27963ae 100644
+--- a/fs/xfs/xfs_qm.h
++++ b/fs/xfs/xfs_qm.h
+@@ -53,6 +53,15 @@ extern struct kmem_zone	*xfs_qm_dqtrxzone;
+  */
+ #define XFS_DQUOT_CLUSTER_SIZE_FSB	(xfs_filblks_t)1
+ 
++struct xfs_def_quota {
++	xfs_qcnt_t       bhardlimit;     /* default data blk hard limit */
++	xfs_qcnt_t       bsoftlimit;	 /* default data blk soft limit */
++	xfs_qcnt_t       ihardlimit;	 /* default inode count hard limit */
++	xfs_qcnt_t       isoftlimit;	 /* default inode count soft limit */
++	xfs_qcnt_t	 rtbhardlimit;   /* default realtime blk hard limit */
++	xfs_qcnt_t	 rtbsoftlimit;   /* default realtime blk soft limit */
++};
++
+ /*
+  * Various quota information for individual filesystems.
+  * The mount structure keeps a pointer to this.
+@@ -78,12 +87,9 @@ typedef struct xfs_quotainfo {
+ 	struct mutex	 qi_quotaofflock;/* to serialize quotaoff */
+ 	xfs_filblks_t	 qi_dqchunklen;	 /* # BBs in a chunk of dqs */
+ 	uint		 qi_dqperchunk;	 /* # ondisk dqs in above chunk */
+-	xfs_qcnt_t	 qi_bhardlimit;	 /* default data blk hard limit */
+-	xfs_qcnt_t	 qi_bsoftlimit;	 /* default data blk soft limit */
+-	xfs_qcnt_t	 qi_ihardlimit;	 /* default inode count hard limit */
+-	xfs_qcnt_t	 qi_isoftlimit;	 /* default inode count soft limit */
+-	xfs_qcnt_t	 qi_rtbhardlimit;/* default realtime blk hard limit */
+-	xfs_qcnt_t	 qi_rtbsoftlimit;/* default realtime blk soft limit */
++	struct xfs_def_quota	qi_usr_default;
++	struct xfs_def_quota	qi_grp_default;
++	struct xfs_def_quota	qi_prj_default;
+ 	struct shrinker  qi_shrinker;
+ } xfs_quotainfo_t;
+ 
+@@ -177,4 +183,20 @@ extern int		xfs_qm_scall_getqstatv(struct xfs_mount *,
+ extern int		xfs_qm_scall_quotaon(struct xfs_mount *, uint);
+ extern int		xfs_qm_scall_quotaoff(struct xfs_mount *, uint);
+ 
++static inline struct xfs_def_quota *
++xfs_get_defquota(struct xfs_dquot *dqp, struct xfs_quotainfo *qi)
++{
++	struct xfs_def_quota *defq;
++
++	if (XFS_QM_ISUDQ(dqp))
++		defq = &qi->qi_usr_default;
++	else if (XFS_QM_ISGDQ(dqp))
++		defq = &qi->qi_grp_default;
++	else {
++		ASSERT(XFS_QM_ISPDQ(dqp));
++		defq = &qi->qi_prj_default;
++	}
++	return defq;
++}
++
+ #endif /* __XFS_QM_H__ */
+diff --git a/fs/xfs/xfs_qm_syscalls.c b/fs/xfs/xfs_qm_syscalls.c
+index 784c41b3ad84..71bc53a91763 100644
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@ -560,6 +560,7 @@ xfs_qm_scall_setqlim(
+ 	struct xfs_disk_dquot	*ddq;
+ 	struct xfs_dquot	*dqp;
+ 	struct xfs_trans	*tp;
++	struct xfs_def_quota	*defq;
+ 	int			error;
+ 	xfs_qcnt_t		hard, soft;
+ 
+@@ -587,6 +588,8 @@ xfs_qm_scall_setqlim(
+ 		ASSERT(error != -ENOENT);
+ 		goto out_unlock;
+ 	}
++
++	defq = xfs_get_defquota(dqp, q);
+ 	xfs_dqunlock(dqp);
+ 
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_QM_SETQLIM);
+@@ -614,8 +617,8 @@ xfs_qm_scall_setqlim(
+ 		ddq->d_blk_softlimit = cpu_to_be64(soft);
+ 		xfs_dquot_set_prealloc_limits(dqp);
+ 		if (id == 0) {
+-			q->qi_bhardlimit = hard;
+-			q->qi_bsoftlimit = soft;
++			defq->bhardlimit = hard;
++			defq->bsoftlimit = soft;
+ 		}
+ 	} else {
+ 		xfs_debug(mp, "blkhard %Ld < blksoft %Ld", hard, soft);
+@@ -630,8 +633,8 @@ xfs_qm_scall_setqlim(
+ 		ddq->d_rtb_hardlimit = cpu_to_be64(hard);
+ 		ddq->d_rtb_softlimit = cpu_to_be64(soft);
+ 		if (id == 0) {
+-			q->qi_rtbhardlimit = hard;
+-			q->qi_rtbsoftlimit = soft;
++			defq->rtbhardlimit = hard;
++			defq->rtbsoftlimit = soft;
+ 		}
+ 	} else {
+ 		xfs_debug(mp, "rtbhard %Ld < rtbsoft %Ld", hard, soft);
+@@ -647,8 +650,8 @@ xfs_qm_scall_setqlim(
+ 		ddq->d_ino_hardlimit = cpu_to_be64(hard);
+ 		ddq->d_ino_softlimit = cpu_to_be64(soft);
+ 		if (id == 0) {
+-			q->qi_ihardlimit = hard;
+-			q->qi_isoftlimit = soft;
++			defq->ihardlimit = hard;
++			defq->isoftlimit = soft;
+ 		}
+ 	} else {
+ 		xfs_debug(mp, "ihard %Ld < isoft %Ld", hard, soft);
+diff --git a/fs/xfs/xfs_trans_dquot.c b/fs/xfs/xfs_trans_dquot.c
+index 995170194df0..c3d547211d16 100644
+--- a/fs/xfs/xfs_trans_dquot.c
++++ b/fs/xfs/xfs_trans_dquot.c
+@@ -609,17 +609,20 @@ xfs_trans_dqresv(
+ 	xfs_qcnt_t	total_count;
+ 	xfs_qcnt_t	*resbcountp;
+ 	xfs_quotainfo_t	*q = mp->m_quotainfo;
++	struct xfs_def_quota	*defq;
+ 
+ 
+ 	xfs_dqlock(dqp);
+ 
++	defq = xfs_get_defquota(dqp, q);
++
+ 	if (flags & XFS_TRANS_DQ_RES_BLKS) {
+ 		hardlimit = be64_to_cpu(dqp->q_core.d_blk_hardlimit);
+ 		if (!hardlimit)
+-			hardlimit = q->qi_bhardlimit;
++			hardlimit = defq->bhardlimit;
+ 		softlimit = be64_to_cpu(dqp->q_core.d_blk_softlimit);
+ 		if (!softlimit)
+-			softlimit = q->qi_bsoftlimit;
++			softlimit = defq->bsoftlimit;
+ 		timer = be32_to_cpu(dqp->q_core.d_btimer);
+ 		warns = be16_to_cpu(dqp->q_core.d_bwarns);
+ 		warnlimit = dqp->q_mount->m_quotainfo->qi_bwarnlimit;
+@@ -628,10 +631,10 @@ xfs_trans_dqresv(
+ 		ASSERT(flags & XFS_TRANS_DQ_RES_RTBLKS);
+ 		hardlimit = be64_to_cpu(dqp->q_core.d_rtb_hardlimit);
+ 		if (!hardlimit)
+-			hardlimit = q->qi_rtbhardlimit;
++			hardlimit = defq->rtbhardlimit;
+ 		softlimit = be64_to_cpu(dqp->q_core.d_rtb_softlimit);
+ 		if (!softlimit)
+-			softlimit = q->qi_rtbsoftlimit;
++			softlimit = defq->rtbsoftlimit;
+ 		timer = be32_to_cpu(dqp->q_core.d_rtbtimer);
+ 		warns = be16_to_cpu(dqp->q_core.d_rtbwarns);
+ 		warnlimit = dqp->q_mount->m_quotainfo->qi_rtbwarnlimit;
+@@ -672,10 +675,10 @@ xfs_trans_dqresv(
+ 			warnlimit = dqp->q_mount->m_quotainfo->qi_iwarnlimit;
+ 			hardlimit = be64_to_cpu(dqp->q_core.d_ino_hardlimit);
+ 			if (!hardlimit)
+-				hardlimit = q->qi_ihardlimit;
++				hardlimit = defq->ihardlimit;
+ 			softlimit = be64_to_cpu(dqp->q_core.d_ino_softlimit);
+ 			if (!softlimit)
+-				softlimit = q->qi_isoftlimit;
++				softlimit = defq->isoftlimit;
+ 
+ 			if (hardlimit && total_count > hardlimit) {
+ 				xfs_quota_warn(mp, dqp, QUOTA_NL_IHARDWARN);
