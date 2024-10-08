@@ -1,0 +1,118 @@
+blk-mq: release mq's kobjects in blk_release_queue()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ming Lei <ming.lei@canonical.com>
+commit e09aae7edec1d20824c60a6f0ca4589f99ada17b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e09aae7e.failed
+
+The kobject memory inside blk-mq hctx/ctx shouldn't have been freed
+before the kobject is released because driver core can access it freely
+before its release.
+
+We can't do that in all ctx/hctx/mq_kobj's release handler because
+it can be run before blk_cleanup_queue().
+
+Given mq_kobj shouldn't have been introduced, this patch simply moves
+mq's release into blk_release_queue().
+
+	Reported-by: Sasha Levin <sasha.levin@oracle.com>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit e09aae7edec1d20824c60a6f0ca4589f99ada17b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+diff --cc block/blk-sysfs.c
+index 10d2058fed92,faaf36ade7eb..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -548,7 -515,10 +548,14 @@@ static void blk_release_queue(struct ko
+  	if (q->queue_tags)
+  		__blk_queue_free_tags(q);
+  
+++<<<<<<< HEAD
+ +	kfree(q->flush_rq);
+++=======
++ 	if (!q->mq_ops)
++ 		blk_free_flush_queue(q->fq);
++ 	else
++ 		blk_mq_release(q);
+++>>>>>>> e09aae7edec1 (blk-mq: release mq's kobjects in blk_release_queue())
+  
+  	blk_trace_shutdown(q);
+  
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 18950e09f1d8..a541d0c81194 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1592,10 +1592,8 @@ static void blk_mq_free_hw_queues(struct request_queue *q,
+ 	struct blk_mq_hw_ctx *hctx;
+ 	unsigned int i;
+ 
+-	queue_for_each_hw_ctx(q, hctx, i) {
++	queue_for_each_hw_ctx(q, hctx, i)
+ 		free_cpumask_var(hctx->cpumask);
+-		kfree(hctx);
+-	}
+ }
+ 
+ static int blk_mq_init_hctx(struct request_queue *q,
+@@ -1805,6 +1803,27 @@ static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+ 	mutex_unlock(&set->tag_list_lock);
+ }
+ 
++/*
++ * It is the actual release handler for mq, but we do it from
++ * request queue's release handler for avoiding use-after-free
++ * and headache because q->mq_kobj shouldn't have been introduced,
++ * but we can't group ctx/kctx kobj without it.
++ */
++void blk_mq_release(struct request_queue *q)
++{
++	struct blk_mq_hw_ctx *hctx;
++	unsigned int i;
++
++	/* hctx kobj stays in hctx */
++	queue_for_each_hw_ctx(q, hctx, i)
++		kfree(hctx);
++
++	kfree(q->queue_hw_ctx);
++
++	/* ctx kobj stays in queue_ctx */
++	free_percpu(q->queue_ctx);
++}
++
+ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ {
+ 	struct blk_mq_hw_ctx **hctxs;
+@@ -1938,12 +1957,8 @@ void blk_mq_free_queue(struct request_queue *q)
+ 
+ 	percpu_ref_exit(&q->mq_usage_counter);
+ 
+-	free_percpu(q->queue_ctx);
+-	kfree(q->queue_hw_ctx);
+ 	kfree(q->mq_map);
+ 
+-	q->queue_ctx = NULL;
+-	q->queue_hw_ctx = NULL;
+ 	q->mq_map = NULL;
+ 
+ 	mutex_lock(&all_q_mutex);
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 488710318b99..71a9f4c65b7b 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -66,6 +66,8 @@ extern void blk_mq_sysfs_unregister(struct request_queue *q);
+ 
+ extern void blk_mq_rq_timed_out(struct request *req, bool reserved);
+ 
++void blk_mq_release(struct request_queue *q);
++
+ /*
+  * Basic implementation of sparser bitmap, allowing the user to spread
+  * the bits over more cachelines.
+* Unmerged path block/blk-sysfs.c
