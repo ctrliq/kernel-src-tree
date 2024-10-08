@@ -98,7 +98,6 @@ struct audit_aux_data {
 struct audit_aux_data_execve {
 	struct audit_aux_data	d;
 	int argc;
-	int envc;
 	struct mm_struct *mm;
 };
 
@@ -2132,7 +2131,6 @@ int __audit_bprm(struct linux_binprm *bprm)
 		return -ENOMEM;
 
 	ax->argc = bprm->argc;
-	ax->envc = bprm->envc;
 	ax->mm = bprm->mm;
 	ax->d.type = AUDIT_EXECVE;
 	ax->d.next = context->aux;
