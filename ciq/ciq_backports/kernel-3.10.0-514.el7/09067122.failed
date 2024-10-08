@@ -1,0 +1,106 @@
+net/mlx4_en: Add support for inner IPv6 checksum offloads and TSO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Add support for inner IPv6 checksum offloads and TSO (kamal heib) [1192585]
+Rebuild_FUZZ: 96.83%
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 09067122db3b7fb9cd329fcc16cee12e8f6babcf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/09067122.failed
+
+>From what I can tell the ConnectX-3 will support an inner IPv6 checksum and
+segmentation offload, however it cannot support outer IPv6 headers.  This
+assumption is based on the fact that I could see the checksum being
+offloaded for inner header on IPv4 tunnels, but not on IPv6 tunnels.
+
+For this reason I am adding the feature to the hw_enc_features and adding
+an extra check to the features_check call that will disable GSO and
+checksum offload in the case that the encapsulated frame has an outer IP
+version of that is not 4.  The check in mlx4_en_features_check could be
+removed if at some point in the future a fix is found that allows the
+hardware to offload segmentation/checksum on tunnels with an outer IPv6
+header.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 09067122db3b7fb9cd329fcc16cee12e8f6babcf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index a36e313efa21,6f28ac58251c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -2350,8 -2357,12 +2350,17 @@@ out
+  	}
+  
+  	/* set offloads */
+++<<<<<<< HEAD
+ +	priv->dev->hw_enc_features |= NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
+ +				      NETIF_F_TSO | NETIF_F_GSO_UDP_TUNNEL;
+++=======
++ 	priv->dev->hw_enc_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
++ 				      NETIF_F_RXCSUM |
++ 				      NETIF_F_TSO | NETIF_F_TSO6 |
++ 				      NETIF_F_GSO_UDP_TUNNEL |
++ 				      NETIF_F_GSO_UDP_TUNNEL_CSUM |
++ 				      NETIF_F_GSO_PARTIAL;
+++>>>>>>> 09067122db3b (net/mlx4_en: Add support for inner IPv6 checksum offloads and TSO)
+  }
+  
+  static void mlx4_en_del_vxlan_offloads(struct work_struct *work)
+@@@ -2360,8 -2371,12 +2369,17 @@@
+  	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
+  						 vxlan_del_task);
+  	/* unset offloads */
+++<<<<<<< HEAD
+ +	priv->dev->hw_enc_features &= ~(NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
+ +				      NETIF_F_TSO | NETIF_F_GSO_UDP_TUNNEL);
+++=======
++ 	priv->dev->hw_enc_features &= ~(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
++ 					NETIF_F_RXCSUM |
++ 					NETIF_F_TSO | NETIF_F_TSO6 |
++ 					NETIF_F_GSO_UDP_TUNNEL |
++ 					NETIF_F_GSO_UDP_TUNNEL_CSUM |
++ 					NETIF_F_GSO_PARTIAL);
+++>>>>>>> 09067122db3b (net/mlx4_en: Add support for inner IPv6 checksum offloads and TSO)
+  
+  	ret = mlx4_SET_PORT_VXLAN(priv->mdev->dev, priv->port,
+  				  VXLAN_STEER_BY_OUTER_MAC, 0);
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 7dfd080c34d2..91fbeb345dc2 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -41,6 +41,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
++#include <linux/ipv6.h>
+ #include <linux/moduleparam.h>
+ 
+ #include "mlx4_en.h"
+@@ -910,8 +911,18 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+ 				 tx_ind, fragptr);
+ 
+ 	if (skb->encapsulation) {
+-		struct iphdr *ipv4 = (struct iphdr *)skb_inner_network_header(skb);
+-		if (ipv4->protocol == IPPROTO_TCP || ipv4->protocol == IPPROTO_UDP)
++		union {
++			struct iphdr *v4;
++			struct ipv6hdr *v6;
++			unsigned char *hdr;
++		} ip;
++		u8 proto;
++
++		ip.hdr = skb_inner_network_header(skb);
++		proto = (ip.v4->version == 4) ? ip.v4->protocol :
++						ip.v6->nexthdr;
++
++		if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+ 			op_own |= cpu_to_be32(MLX4_WQE_CTRL_IIP | MLX4_WQE_CTRL_ILP);
+ 		else
+ 			op_own |= cpu_to_be32(MLX4_WQE_CTRL_IIP);
