@@ -1,0 +1,232 @@
+virtio: set VIRTIO_CONFIG_S_FEATURES_OK on restore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [virtio] set VIRTIO_CONFIG_S_FEATURES_OK on restore (Jason Wang) [1227339]
+Rebuild_FUZZ: 91.30%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 30683a8cce8019aa4314c37e629da5c185017166
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/30683a8c.failed
+
+virtio 1.0 devices require that drivers set VIRTIO_CONFIG_S_FEATURES_OK
+after finalizing features.
+virtio core missed doing this on restore, fix it up.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+(cherry picked from commit 30683a8cce8019aa4314c37e629da5c185017166)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio.c
+diff --cc drivers/virtio/virtio.c
+index 683d7137d7c9,b9f70dfc4751..000000000000
+--- a/drivers/virtio/virtio.c
++++ b/drivers/virtio/virtio.c
+@@@ -107,12 -125,72 +107,79 @@@ void virtio_check_driver_offered_featur
+  }
+  EXPORT_SYMBOL_GPL(virtio_check_driver_offered_feature);
+  
+++<<<<<<< HEAD
+++=======
++ static void __virtio_config_changed(struct virtio_device *dev)
++ {
++ 	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
++ 
++ 	if (!dev->config_enabled)
++ 		dev->config_change_pending = true;
++ 	else if (drv && drv->config_changed)
++ 		drv->config_changed(dev);
++ }
++ 
++ void virtio_config_changed(struct virtio_device *dev)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&dev->config_lock, flags);
++ 	__virtio_config_changed(dev);
++ 	spin_unlock_irqrestore(&dev->config_lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(virtio_config_changed);
++ 
++ static void virtio_config_disable(struct virtio_device *dev)
++ {
++ 	spin_lock_irq(&dev->config_lock);
++ 	dev->config_enabled = false;
++ 	spin_unlock_irq(&dev->config_lock);
++ }
++ 
++ static void virtio_config_enable(struct virtio_device *dev)
++ {
++ 	spin_lock_irq(&dev->config_lock);
++ 	dev->config_enabled = true;
++ 	if (dev->config_change_pending)
++ 		__virtio_config_changed(dev);
++ 	dev->config_change_pending = false;
++ 	spin_unlock_irq(&dev->config_lock);
++ }
++ 
++ static int virtio_finalize_features(struct virtio_device *dev)
++ {
++ 	int ret = dev->config->finalize_features(dev);
++ 	unsigned status;
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!virtio_has_feature(dev, VIRTIO_F_VERSION_1))
++ 		return 0;
++ 
++ 	add_status(dev, VIRTIO_CONFIG_S_FEATURES_OK);
++ 	status = dev->config->get_status(dev);
++ 	if (!(status & VIRTIO_CONFIG_S_FEATURES_OK)) {
++ 		dev_err(&dev->dev, "virtio: device refuses features: %x\n",
++ 			status);
++ 		return -ENODEV;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> 30683a8cce80 (virtio: set VIRTIO_CONFIG_S_FEATURES_OK on restore)
+  static int virtio_dev_probe(struct device *_d)
+  {
+  	int err, i;
+  	struct virtio_device *dev = dev_to_virtio(_d);
+  	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
+++<<<<<<< HEAD
+ +	u32 device_features;
+++=======
++ 	u64 device_features;
++ 	u64 driver_features;
++ 	u64 driver_features_legacy;
+++>>>>>>> 30683a8cce80 (virtio: set VIRTIO_CONFIG_S_FEATURES_OK on restore)
+  
+  	/* We have a driver! */
+  	add_status(dev, VIRTIO_CONFIG_S_DRIVER);
+@@@ -120,21 -198,39 +187,27 @@@
+  	/* Figure out what features the device supports. */
+  	device_features = dev->config->get_features(dev);
+  
+ -	/* Figure out what features the driver supports. */
+ -	driver_features = 0;
+ +	/* Features supported by both device and driver into dev->features. */
+ +	memset(dev->features, 0, sizeof(dev->features));
+  	for (i = 0; i < drv->feature_table_size; i++) {
+  		unsigned int f = drv->feature_table[i];
+ -		BUG_ON(f >= 64);
+ -		driver_features |= (1ULL << f);
+ +		BUG_ON(f >= 32);
+ +		if (device_features & (1 << f))
+ +			set_bit(f, dev->features);
+  	}
+  
+ -	/* Some drivers have a separate feature table for virtio v1.0 */
+ -	if (drv->feature_table_legacy) {
+ -		driver_features_legacy = 0;
+ -		for (i = 0; i < drv->feature_table_size_legacy; i++) {
+ -			unsigned int f = drv->feature_table_legacy[i];
+ -			BUG_ON(f >= 64);
+ -			driver_features_legacy |= (1ULL << f);
+ -		}
+ -	} else {
+ -		driver_features_legacy = driver_features;
+ -	}
+ -
+ -	if (device_features & (1ULL << VIRTIO_F_VERSION_1))
+ -		dev->features = driver_features & device_features;
+ -	else
+ -		dev->features = driver_features_legacy & device_features;
+ -
+  	/* Transport features always preserved to pass to finalize_features. */
+  	for (i = VIRTIO_TRANSPORT_F_START; i < VIRTIO_TRANSPORT_F_END; i++)
+ -		if (device_features & (1ULL << i))
+ -			__virtio_set_bit(dev, i);
+ +		if (device_features & (1 << i))
+ +			set_bit(i, dev->features);
+  
+++<<<<<<< HEAD
+ +	dev->config->finalize_features(dev);
+++=======
++ 	err = virtio_finalize_features(dev);
++ 	if (err)
++ 		goto err;
+++>>>>>>> 30683a8cce80 (virtio: set VIRTIO_CONFIG_S_FEATURES_OK on restore)
+  
+  	err = drv->probe(dev);
+  	if (err)
+@@@ -235,6 -342,69 +308,72 @@@ void unregister_virtio_device(struct vi
+  }
+  EXPORT_SYMBOL_GPL(unregister_virtio_device);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_SLEEP
++ int virtio_device_freeze(struct virtio_device *dev)
++ {
++ 	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
++ 
++ 	virtio_config_disable(dev);
++ 
++ 	dev->failed = dev->config->get_status(dev) & VIRTIO_CONFIG_S_FAILED;
++ 
++ 	if (drv && drv->freeze)
++ 		return drv->freeze(dev);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(virtio_device_freeze);
++ 
++ int virtio_device_restore(struct virtio_device *dev)
++ {
++ 	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
++ 	int ret;
++ 
++ 	/* We always start by resetting the device, in case a previous
++ 	 * driver messed it up. */
++ 	dev->config->reset(dev);
++ 
++ 	/* Acknowledge that we've seen the device. */
++ 	add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE);
++ 
++ 	/* Maybe driver failed before freeze.
++ 	 * Restore the failed status, for debugging. */
++ 	if (dev->failed)
++ 		add_status(dev, VIRTIO_CONFIG_S_FAILED);
++ 
++ 	if (!drv)
++ 		return 0;
++ 
++ 	/* We have a driver! */
++ 	add_status(dev, VIRTIO_CONFIG_S_DRIVER);
++ 
++ 	ret = virtio_finalize_features(dev);
++ 	if (ret)
++ 		goto err;
++ 
++ 	if (drv->restore) {
++ 		ret = drv->restore(dev);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 
++ 	/* Finally, tell the device we're all set */
++ 	add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
++ 
++ 	virtio_config_enable(dev);
++ 
++ 	return 0;
++ 
++ err:
++ 	add_status(dev, VIRTIO_CONFIG_S_FAILED);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(virtio_device_restore);
++ #endif
++ 
+++>>>>>>> 30683a8cce80 (virtio: set VIRTIO_CONFIG_S_FEATURES_OK on restore)
+  static int virtio_init(void)
+  {
+  	if (bus_register(&virtio_bus) != 0)
+* Unmerged path drivers/virtio/virtio.c
