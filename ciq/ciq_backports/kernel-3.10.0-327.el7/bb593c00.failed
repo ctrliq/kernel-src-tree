@@ -1,0 +1,161 @@
+powerpc/eeh: Aux PE data for error log
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Aux PE data for error log (Steve Best) [1211945]
+Rebuild_FUZZ: 88.24%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit bb593c0049fd6b6e420a6f68c5a688e14782dba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bb593c00.failed
+
+The patch allows PE (struct eeh_pe) instance to have auxillary data,
+whose size is configurable on basis of platform. For PowerNV, the
+auxillary data will be used to cache PHB diag-data for that PE
+(frozen PE or fenced PHB). In turn, we can retrieve the diag-data
+at any later points.
+
+It's useful for the case of VFIO PCI devices where the error log
+should be cached, and then be retrieved by the guest at later point.
+Also, it can avoid PHB diag-data overwritting if another frozen PE
+reported and the previous diag-data isn't fetched by guest.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit bb593c0049fd6b6e420a6f68c5a688e14782dba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index e8c90cc3885e,f4d0259a63c3..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -239,20 -239,16 +239,26 @@@ static int ioda_eeh_set_option(struct e
+  	return ret;
+  }
+  
+- static void ioda_eeh_phb_diag(struct pci_controller *hose)
++ static void ioda_eeh_phb_diag(struct eeh_pe *pe)
+  {
+- 	struct pnv_phb *phb = hose->private_data;
++ 	struct pnv_phb *phb = pe->phb->private_data;
+  	long rc;
+  
+- 	rc = opal_pci_get_phb_diag_data2(phb->opal_id, phb->diag.blob,
++ 	rc = opal_pci_get_phb_diag_data2(phb->opal_id, pe->data,
+  					 PNV_PCI_DIAG_BUF_SIZE);
+++<<<<<<< HEAD
+ +	if (rc != OPAL_SUCCESS) {
+ +		pr_warning("%s: Failed to get diag-data for PHB#%x (%ld)\n",
+ +			    __func__, hose->global_number, rc);
+ +		return;
+ +	}
+ +
+ +	pnv_pci_dump_phb_diag_data(hose, phb->diag.blob);
+++=======
++ 	if (rc != OPAL_SUCCESS)
++ 		pr_warn("%s: Failed to get diag-data for PHB#%x (%ld)\n",
++ 			__func__, pe->phb->global_number, rc);
+++>>>>>>> bb593c0049fd (powerpc/eeh: Aux PE data for error log)
+  }
+  
+  /**
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 0a55d415c449..add15bd5e134 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -89,6 +89,7 @@ struct eeh_pe {
+ 	int false_positives;		/* Times of reported #ff's	*/
+ 	atomic_t pass_dev_cnt;		/* Count of passed through devs	*/
+ 	struct eeh_pe *parent;		/* Parent PE			*/
++	void *data;			/* PE auxillary data		*/
+ 	struct list_head child_list;	/* Link PE to the child list	*/
+ 	struct list_head edevs;		/* Link list of EEH devices	*/
+ 	struct list_head child;		/* Child PEs			*/
+@@ -264,6 +265,7 @@ static inline void eeh_serialize_unlock(unsigned long flags)
+ #define EEH_MAX_ALLOWED_FREEZES 5
+ 
+ typedef void *(*eeh_traverse_func)(void *data, void *flag);
++void eeh_set_pe_aux_size(int size);
+ int eeh_phb_pe_create(struct pci_controller *phb);
+ struct eeh_pe *eeh_phb_pe_get(struct pci_controller *phb);
+ struct eeh_pe *eeh_pe_get(struct eeh_dev *edev);
+diff --git a/arch/powerpc/kernel/eeh_pe.c b/arch/powerpc/kernel/eeh_pe.c
+index fbd01eba4473..79020dcaed69 100644
+--- a/arch/powerpc/kernel/eeh_pe.c
++++ b/arch/powerpc/kernel/eeh_pe.c
+@@ -32,8 +32,23 @@
+ #include <asm/pci-bridge.h>
+ #include <asm/ppc-pci.h>
+ 
++static int eeh_pe_aux_size = 0;
+ static LIST_HEAD(eeh_phb_pe);
+ 
++/**
++ * eeh_set_pe_aux_size - Set PE auxillary data size
++ * @size: PE auxillary data size
++ *
++ * Set PE auxillary data size
++ */
++void eeh_set_pe_aux_size(int size)
++{
++	if (size < 0)
++		return;
++
++	eeh_pe_aux_size = size;
++}
++
+ /**
+  * eeh_pe_alloc - Allocate PE
+  * @phb: PCI controller
+@@ -44,9 +59,16 @@ static LIST_HEAD(eeh_phb_pe);
+ static struct eeh_pe *eeh_pe_alloc(struct pci_controller *phb, int type)
+ {
+ 	struct eeh_pe *pe;
++	size_t alloc_size;
++
++	alloc_size = sizeof(struct eeh_pe);
++	if (eeh_pe_aux_size) {
++		alloc_size = ALIGN(alloc_size, cache_line_size());
++		alloc_size += eeh_pe_aux_size;
++	}
+ 
+ 	/* Allocate PHB PE */
+-	pe = kzalloc(sizeof(struct eeh_pe), GFP_KERNEL);
++	pe = kzalloc(alloc_size, GFP_KERNEL);
+ 	if (!pe) return NULL;
+ 
+ 	/* Initialize PHB PE */
+@@ -56,6 +78,8 @@ static struct eeh_pe *eeh_pe_alloc(struct pci_controller *phb, int type)
+ 	INIT_LIST_HEAD(&pe->child);
+ 	INIT_LIST_HEAD(&pe->edevs);
+ 
++	pe->data = (void *)pe + ALIGN(sizeof(struct eeh_pe),
++				      cache_line_size());
+ 	return pe;
+ }
+ 
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+index 998bcc18a491..f8d6d0f80492 100644
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -294,7 +294,7 @@ static int powernv_eeh_wait_state(struct eeh_pe *pe, int max_wait)
+  * Retrieve the temporary or permanent error from the PE.
+  */
+ static int powernv_eeh_get_log(struct eeh_pe *pe, int severity,
+-			char *drv_log, unsigned long len)
++			       char *drv_log, unsigned long len)
+ {
+ 	struct pci_controller *hose = pe->phb;
+ 	struct pnv_phb *phb = hose->private_data;
+@@ -398,6 +398,7 @@ static int __init eeh_powernv_init(void)
+ {
+ 	int ret = -EINVAL;
+ 
++	eeh_set_pe_aux_size(PNV_PCI_DIAG_BUF_SIZE);
+ 	ret = eeh_ops_register(&powernv_eeh_ops);
+ 	if (!ret)
+ 		pr_info("EEH: PowerNV platform initialized\n");
