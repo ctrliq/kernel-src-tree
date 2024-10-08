@@ -1,0 +1,161 @@
+kvm: Faults which trigger IO release the mmap_sem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] Faults which trigger IO release the mmap_sem (Bandan Das) [1209995]
+Rebuild_FUZZ: 94.62%
+commit-author Andres Lagar-Cavilla <andreslc@google.com>
+commit 234b239bea395316d7f78018c672f4a88b3cdf0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/234b239b.failed
+
+When KVM handles a tdp fault it uses FOLL_NOWAIT. If the guest memory
+has been swapped out or is behind a filemap, this will trigger async
+readahead and return immediately. The rationale is that KVM will kick
+back the guest with an "async page fault" and allow for some other
+guest process to take over.
+
+If async PFs are enabled the fault is retried asap from an async
+workqueue. If not, it's retried immediately in the same code path. In
+either case the retry will not relinquish the mmap semaphore and will
+block on the IO. This is a bad thing, as other mmap semaphore users
+now stall as a function of swap or filemap latency.
+
+This patch ensures both the regular and async PF path re-enter the
+fault allowing for the mmap semaphore to be relinquished in the case
+of IO wait.
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Andres Lagar-Cavilla <andreslc@google.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 234b239bea395316d7f78018c672f4a88b3cdf0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+#	virt/kvm/async_pf.c
+diff --cc virt/kvm/async_pf.c
+index a53dfa3b8628,5ff7f7f2689a..000000000000
+--- a/virt/kvm/async_pf.c
++++ b/virt/kvm/async_pf.c
+@@@ -65,9 -80,8 +65,14 @@@ static void async_pf_execute(struct wor
+  
+  	might_sleep();
+  
+++<<<<<<< HEAD
+ +	down_read(&mm->mmap_sem);
+ +	get_user_pages(NULL, mm, addr, 1, 1, 0, NULL, NULL);
+ +	up_read(&mm->mmap_sem);
+++=======
++ 	kvm_get_user_page_io(NULL, mm, addr, 1, NULL);
++ 	kvm_async_page_present_sync(vcpu, apf);
+++>>>>>>> 234b239bea39 (kvm: Faults which trigger IO release the mmap_sem)
+  
+  	spin_lock(&vcpu->async_pf.lock);
+  	list_add_tail(&apf->link, &vcpu->async_pf.done);
+* Unmerged path mm/gup.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index e1e1c9fa034a..452a656265ad 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -199,6 +199,17 @@ int kvm_setup_async_pf(struct kvm_vcpu *vcpu, gva_t gva, gfn_t gfn,
+ int kvm_async_pf_wakeup_all(struct kvm_vcpu *vcpu);
+ #endif
+ 
++/*
++ * Carry out a gup that requires IO. Allow the mm to relinquish the mmap
++ * semaphore if the filemap/swap has to wait on a page lock. pagep == NULL
++ * controls whether we retry the gup one more time to completion in that case.
++ * Typically this is called after a FAULT_FLAG_RETRY_NOWAIT in the main tdp
++ * handler.
++ */
++int kvm_get_user_page_io(struct task_struct *tsk, struct mm_struct *mm,
++			 unsigned long addr, bool write_fault,
++			 struct page **pagep);
++
+ enum {
+ 	OUTSIDE_GUEST_MODE,
+ 	IN_GUEST_MODE,
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 9dee9e8b7c59..dadee6a243c2 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1939,6 +1939,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
+ #define FOLL_HWPOISON	0x100	/* check page is hwpoisoned */
+ #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
+ #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
++#define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
+ 
+ typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+ 			void *data);
+* Unmerged path mm/gup.c
+* Unmerged path virt/kvm/async_pf.c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index d94b560606b6..c76be0b3a931 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -1133,6 +1133,43 @@ static int get_user_page_nowait(struct task_struct *tsk, struct mm_struct *mm,
+ 	return __get_user_pages(tsk, mm, start, 1, flags, page, NULL, NULL);
+ }
+ 
++int kvm_get_user_page_io(struct task_struct *tsk, struct mm_struct *mm,
++			 unsigned long addr, bool write_fault,
++			 struct page **pagep)
++{
++	int npages;
++	int locked = 1;
++	int flags = FOLL_TOUCH | FOLL_HWPOISON |
++		    (pagep ? FOLL_GET : 0) |
++		    (write_fault ? FOLL_WRITE : 0);
++
++	/*
++	 * If retrying the fault, we get here *not* having allowed the filemap
++	 * to wait on the page lock. We should now allow waiting on the IO with
++	 * the mmap semaphore released.
++	 */
++	down_read(&mm->mmap_sem);
++	npages = __get_user_pages(tsk, mm, addr, 1, flags, pagep, NULL,
++				  &locked);
++	if (!locked) {
++		VM_BUG_ON(npages != -EBUSY);
++
++		if (!pagep)
++			return 0;
++
++		/*
++		 * The previous call has now waited on the IO. Now we can
++		 * retry and complete. Pass TRIED to ensure we do not re
++		 * schedule async IO (see e.g. filemap_fault).
++		 */
++		down_read(&mm->mmap_sem);
++		npages = __get_user_pages(tsk, mm, addr, 1, flags | FOLL_TRIED,
++					  pagep, NULL, NULL);
++	}
++	up_read(&mm->mmap_sem);
++	return npages;
++}
++
+ static inline int check_user_page_hwpoison(unsigned long addr)
+ {
+ 	int rc, flags = FOLL_TOUCH | FOLL_HWPOISON | FOLL_WRITE;
+@@ -1195,9 +1232,15 @@ static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
+ 		npages = get_user_page_nowait(current, current->mm,
+ 					      addr, write_fault, page);
+ 		up_read(&current->mm->mmap_sem);
+-	} else
+-		npages = get_user_pages_fast(addr, 1, write_fault,
+-					     page);
++	} else {
++		/*
++		 * By now we have tried gup_fast, and possibly async_pf, and we
++		 * are certainly not atomic. Time to retry the gup, allowing
++		 * mmap semaphore to be relinquished in the case of IO.
++		 */
++		npages = kvm_get_user_page_io(current, current->mm, addr,
++					      write_fault, page);
++	}
+ 	if (npages != 1)
+ 		return npages;
+ 
