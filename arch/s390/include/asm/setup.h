@@ -114,9 +114,6 @@ extern unsigned int s390_user_mode;
 #define MACHINE_HAS_RRBM	(S390_lowcore.machine_flags & MACHINE_FLAG_RRBM)
 #endif /* CONFIG_64BIT */
 
-#define ZFCPDUMP_HSA_SIZE	(32UL<<20)
-#define ZFCPDUMP_HSA_SIZE_MAX	(64UL<<20)
-
 /*
  * Console mode. Override with conmode=
  */
