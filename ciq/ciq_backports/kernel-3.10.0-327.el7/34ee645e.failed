@@ -1,0 +1,268 @@
+mmu_notifier: call mmu_notifier_invalidate_range() from VMM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 34ee645e83b60ae3d5955f70ab9ab9a159136673
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/34ee645e.failed
+
+Add calls to the new mmu_notifier_invalidate_range() function to all
+places in the VMM that need it.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Reviewed-by: Andrea Arcangeli <aarcange@redhat.com>
+	Reviewed-by: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Johannes Weiner <jweiner@redhat.com>
+	Cc: Jay Cornwall <Jay.Cornwall@amd.com>
+	Cc: Oded Gabbay <Oded.Gabbay@amd.com>
+	Cc: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+	Cc: Jesse Barnes <jbarnes@virtuousgeek.org>
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Oded Gabbay <oded.gabbay@amd.com>
+(cherry picked from commit 34ee645e83b60ae3d5955f70ab9ab9a159136673)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+#	mm/hugetlb.c
+#	mm/migrate.c
+diff --cc mm/huge_memory.c
+index bff17a8147f4,1d89526ed531..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1206,9 -1177,12 +1206,15 @@@ alloc
+  		goto out_mn;
+  	} else {
+  		pmd_t entry;
+++<<<<<<< HEAD
+ +		entry = mk_huge_pmd(new_page, vma);
+ +		pmdp_clear_flush(vma, haddr, pmd);
+++=======
++ 		entry = mk_huge_pmd(new_page, vma->vm_page_prot);
++ 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
++ 		pmdp_clear_flush_notify(vma, haddr, pmd);
+++>>>>>>> 34ee645e83b6 (mmu_notifier: call mmu_notifier_invalidate_range() from VMM)
+  		page_add_new_anon_rmap(new_page, vma, haddr);
+ -		mem_cgroup_commit_charge(new_page, memcg, false);
+ -		lru_cache_add_active_or_unevictable(new_page, vma);
+  		set_pmd_at(mm, haddr, pmd, entry);
+  		update_mmu_cache_pmd(vma, address, pmd);
+  		if (!page) {
+diff --cc mm/hugetlb.c
+index 567a4225dad3,2e6add04fa1b..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2508,9 -2580,29 +2508,34 @@@ int copy_hugetlb_page_range(struct mm_s
+  		dst_ptl = huge_pte_lock(h, dst, dst_pte);
+  		src_ptl = huge_pte_lockptr(h, src, src_pte);
+  		spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+++<<<<<<< HEAD
+ +		if (!huge_pte_none(huge_ptep_get(src_pte))) {
+ +			if (cow)
+++=======
++ 		entry = huge_ptep_get(src_pte);
++ 		if (huge_pte_none(entry)) { /* skip none entry */
++ 			;
++ 		} else if (unlikely(is_hugetlb_entry_migration(entry) ||
++ 				    is_hugetlb_entry_hwpoisoned(entry))) {
++ 			swp_entry_t swp_entry = pte_to_swp_entry(entry);
++ 
++ 			if (is_write_migration_entry(swp_entry) && cow) {
++ 				/*
++ 				 * COW mappings require pages in both
++ 				 * parent and child to be set to read.
++ 				 */
++ 				make_migration_entry_read(&swp_entry);
++ 				entry = swp_entry_to_pte(swp_entry);
++ 				set_huge_pte_at(src, addr, src_pte, entry);
++ 			}
++ 			set_huge_pte_at(dst, addr, dst_pte, entry);
++ 		} else {
++ 			if (cow) {
+++>>>>>>> 34ee645e83b6 (mmu_notifier: call mmu_notifier_invalidate_range() from VMM)
+  				huge_ptep_set_wrprotect(src, addr, src_pte);
++ 				mmu_notifier_invalidate_range(src, mmun_start,
++ 								   mmun_end);
++ 			}
+  			entry = huge_ptep_get(src_pte);
+  			ptepage = pte_page(entry);
+  			get_page(ptepage);
+@@@ -3327,7 -3378,9 +3353,8 @@@ unsigned long hugetlb_change_protection
+  	 * and that page table be reused and filled with junk.
+  	 */
+  	flush_tlb_range(vma, start, end);
++ 	mmu_notifier_invalidate_range(mm, start, end);
+  	mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
+ -	mmu_notifier_invalidate_range_end(mm, start, end);
+  
+  	return pages << h->order;
+  }
+diff --cc mm/migrate.c
+index 5fcb5bc423ee,41945cb0ca38..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1799,8 -1853,8 +1799,13 @@@ fail_putback
+  	 * guarantee the copy is visible before the pagetable update.
+  	 */
+  	flush_cache_range(vma, mmun_start, mmun_end);
+++<<<<<<< HEAD
+ +	page_add_new_anon_rmap(new_page, vma, mmun_start);
+ +	pmdp_clear_flush(vma, mmun_start, pmd);
+++=======
++ 	page_add_anon_rmap(new_page, vma, mmun_start);
++ 	pmdp_clear_flush_notify(vma, mmun_start, pmd);
+++>>>>>>> 34ee645e83b6 (mmu_notifier: call mmu_notifier_invalidate_range() from VMM)
+  	set_pmd_at(mm, mmun_start, pmd, entry);
+  	flush_tlb_range(vma, mmun_start, mmun_end);
+  	update_mmu_cache_pmd(vma, address, &entry);
+diff --git a/include/linux/mmu_notifier.h b/include/linux/mmu_notifier.h
+index 5d03f310d095..877d1c85dd69 100644
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@ -275,6 +275,44 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
+ 	__young;							\
+ })
+ 
++#define	ptep_clear_flush_notify(__vma, __address, __ptep)		\
++({									\
++	unsigned long ___addr = __address & PAGE_MASK;			\
++	struct mm_struct *___mm = (__vma)->vm_mm;			\
++	pte_t ___pte;							\
++									\
++	___pte = ptep_clear_flush(__vma, __address, __ptep);		\
++	mmu_notifier_invalidate_range(___mm, ___addr,			\
++					___addr + PAGE_SIZE);		\
++									\
++	___pte;								\
++})
++
++#define pmdp_clear_flush_notify(__vma, __haddr, __pmd)			\
++({									\
++	unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;		\
++	struct mm_struct *___mm = (__vma)->vm_mm;			\
++	pmd_t ___pmd;							\
++									\
++	___pmd = pmdp_clear_flush(__vma, __haddr, __pmd);		\
++	mmu_notifier_invalidate_range(___mm, ___haddr,			\
++				      ___haddr + HPAGE_PMD_SIZE);	\
++									\
++	___pmd;								\
++})
++
++#define pmdp_get_and_clear_notify(__mm, __haddr, __pmd)			\
++({									\
++	unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;		\
++	pmd_t ___pmd;							\
++									\
++	___pmd = pmdp_get_and_clear(__mm, __haddr, __pmd);		\
++	mmu_notifier_invalidate_range(__mm, ___haddr,			\
++				      ___haddr + HPAGE_PMD_SIZE);	\
++									\
++	___pmd;								\
++})
++
+ /*
+  * set_pte_at_notify() sets the pte _after_ running the notifier.
+  * This is safe to start by updating the secondary MMUs, because the primary MMU
+@@ -352,6 +390,9 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
+ 
+ #define ptep_clear_flush_young_notify ptep_clear_flush_young
+ #define pmdp_clear_flush_young_notify pmdp_clear_flush_young
++#define	ptep_clear_flush_notify ptep_clear_flush
++#define pmdp_clear_flush_notify pmdp_clear_flush
++#define pmdp_get_and_clear_notify pmdp_get_and_clear
+ #define set_pte_at_notify set_pte_at
+ 
+ #endif /* CONFIG_MMU_NOTIFIER */
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 058aee822ca4..5741a202c558 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -151,7 +151,7 @@ static int __replace_page(struct vm_area_struct *vma, unsigned long addr,
+ 	}
+ 
+ 	flush_cache_page(vma, addr, pte_pfn(*ptep));
+-	ptep_clear_flush(vma, addr, ptep);
++	ptep_clear_flush_notify(vma, addr, ptep);
+ 	set_pte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot));
+ 
+ 	page_remove_rmap(page);
+diff --git a/mm/fremap.c b/mm/fremap.c
+index 87da3590c61e..22eccd898aa0 100644
+--- a/mm/fremap.c
++++ b/mm/fremap.c
+@@ -32,7 +32,7 @@ static void zap_pte(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		struct page *page;
+ 
+ 		flush_cache_page(vma, addr, pte_pfn(pte));
+-		pte = ptep_clear_flush(vma, addr, ptep);
++		pte = ptep_clear_flush_notify(vma, addr, ptep);
+ 		page = vm_normal_page(vma, addr, pte);
+ 		if (page) {
+ 			if (pte_dirty(pte))
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 9a5fdf1f9ad6..7ee5b1c104e0 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -892,7 +892,7 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
+ 		 * this assure us that no O_DIRECT can happen after the check
+ 		 * or in the middle of the check.
+ 		 */
+-		entry = ptep_clear_flush(vma, addr, ptep);
++		entry = ptep_clear_flush_notify(vma, addr, ptep);
+ 		/*
+ 		 * Check that no O_DIRECT or similar I/O is in progress on the
+ 		 * page
+@@ -961,7 +961,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 	page_add_anon_rmap(kpage, vma, addr);
+ 
+ 	flush_cache_page(vma, addr, pte_pfn(*ptep));
+-	ptep_clear_flush(vma, addr, ptep);
++	ptep_clear_flush_notify(vma, addr, ptep);
+ 	set_pte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot));
+ 
+ 	page_remove_rmap(page);
+diff --git a/mm/memory.c b/mm/memory.c
+index 56ba69c35563..d06252456c4e 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -242,6 +242,7 @@ void tlb_flush_mmu(struct mmu_gather *tlb)
+ 		return;
+ 	tlb->need_flush = 0;
+ 	tlb_flush(tlb);
++	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
+ #ifdef CONFIG_HAVE_RCU_TABLE_FREE
+ 	tlb_table_flush(tlb);
+ #endif
+@@ -2835,7 +2836,7 @@ gotten:
+ 		 * seen in the presence of one thread doing SMC and another
+ 		 * thread doing COW.
+ 		 */
+-		ptep_clear_flush(vma, address, page_table);
++		ptep_clear_flush_notify(vma, address, page_table);
+ 		page_add_new_anon_rmap(new_page, vma, address);
+ 		/*
+ 		 * We call the notify macro here because, when using secondary
+* Unmerged path mm/migrate.c
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 1f95c591e5eb..8568be9c271c 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1405,7 +1405,7 @@ static int try_to_unmap_cluster(unsigned long cursor, unsigned int *mapcount,
+ 
+ 		/* Nuke the page table entry. */
+ 		flush_cache_page(vma, address, pte_pfn(*pte));
+-		pteval = ptep_clear_flush(vma, address, pte);
++		pteval = ptep_clear_flush_notify(vma, address, pte);
+ 
+ 		/* If nonlinear, store the file page offset in the pte. */
+ 		if (page->index != linear_page_index(vma, address))
