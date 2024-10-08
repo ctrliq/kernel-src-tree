@@ -1,0 +1,160 @@
+dm thin: remap the bios in a cell immediately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [md] dm-thin: remap the bios in a cell immediately (Mike Snitzer) [1156164]
+Rebuild_FUZZ: 97.78%
+commit-author Joe Thornber <ejt@redhat.com>
+commit 2d759a46b4d65e1392843cf9df7101897af87008
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2d759a46.failed
+
+This use of direct submission in process_prepared_mapping() reduces
+latency for submitting bios in a cell by avoiding adding those bios to
+the deferred list and waiting for the next iteration of the worker.
+
+But this direct submission exposes the potential for a race between
+releasing a cell and incrementing deferred set.  Fix this by introducing
+dm_cell_visit_release() and refactoring inc_remap_and_issue_cell()
+accordingly.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 2d759a46b4d65e1392843cf9df7101897af87008)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index 13e9a0386d73,5036d4b3f368..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -690,25 -721,68 +700,69 @@@ static void cell_defer_no_holder(struc
+  	wake_worker(pool);
+  }
+  
+- /*
+-  * Same as cell_defer above, except it omits the original holder of the cell.
+-  */
+- static void cell_defer_no_holder(struct thin_c *tc, struct dm_bio_prison_cell *cell)
+++<<<<<<< HEAD
+++=======
++ static void thin_defer_bio(struct thin_c *tc, struct bio *bio);
++ 
++ struct remap_info {
++ 	struct thin_c *tc;
++ 	struct bio_list defer_bios;
++ 	struct bio_list issue_bios;
++ };
++ 
++ static void __inc_remap_and_issue_cell(void *context,
++ 				       struct dm_bio_prison_cell *cell)
+  {
+- 	struct pool *pool = tc->pool;
+- 	unsigned long flags;
++ 	struct remap_info *info = context;
++ 	struct bio *bio;
+  
+- 	spin_lock_irqsave(&tc->lock, flags);
+- 	cell_release_no_holder(pool, cell, &tc->deferred_bio_list);
+- 	spin_unlock_irqrestore(&tc->lock, flags);
++ 	while ((bio = bio_list_pop(&cell->bios))) {
++ 		if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA))
++ 			bio_list_add(&info->defer_bios, bio);
++ 		else {
++ 			inc_all_io_entry(info->tc->pool, bio);
++ 
++ 			/*
++ 			 * We can't issue the bios with the bio prison lock
++ 			 * held, so we add them to a list to issue on
++ 			 * return from this function.
++ 			 */
++ 			bio_list_add(&info->issue_bios, bio);
++ 		}
++ 	}
++ }
+  
+- 	wake_worker(pool);
++ static void inc_remap_and_issue_cell(struct thin_c *tc,
++ 				     struct dm_bio_prison_cell *cell,
++ 				     dm_block_t block)
++ {
++ 	struct bio *bio;
++ 	struct remap_info info;
++ 
++ 	info.tc = tc;
++ 	bio_list_init(&info.defer_bios);
++ 	bio_list_init(&info.issue_bios);
++ 
++ 	/*
++ 	 * We have to be careful to inc any bios we're about to issue
++ 	 * before the cell is released, and avoid a race with new bios
++ 	 * being added to the cell.
++ 	 */
++ 	cell_visit_release(tc->pool, __inc_remap_and_issue_cell,
++ 			   &info, cell);
++ 
++ 	while ((bio = bio_list_pop(&info.defer_bios)))
++ 		thin_defer_bio(tc, bio);
++ 
++ 	while ((bio = bio_list_pop(&info.issue_bios)))
++ 		remap_and_issue(info.tc, bio, block);
+  }
+  
+++>>>>>>> 2d759a46b4d6 (dm thin: remap the bios in a cell immediately)
+  static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
+  {
+ -	if (m->bio) {
+ +	if (m->bio)
+  		m->bio->bi_end_io = m->saved_bi_end_io;
+ -		atomic_inc(&m->bio->bi_remaining);
+ -	}
+  	cell_error(m->tc->pool, m->cell);
+  	list_del(&m->list);
+  	mempool_free(m, m->tc->pool->mapping_pool);
+diff --git a/drivers/md/dm-bio-prison.c b/drivers/md/dm-bio-prison.c
+index 90a56625245a..bbe22a5dc06b 100644
+--- a/drivers/md/dm-bio-prison.c
++++ b/drivers/md/dm-bio-prison.c
+@@ -241,6 +241,20 @@ void dm_cell_error(struct dm_bio_prison *prison,
+ }
+ EXPORT_SYMBOL_GPL(dm_cell_error);
+ 
++void dm_cell_visit_release(struct dm_bio_prison *prison,
++			   void (*visit_fn)(void *, struct dm_bio_prison_cell *),
++			   void *context,
++			   struct dm_bio_prison_cell *cell)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&prison->lock, flags);
++	visit_fn(context, cell);
++	rb_erase(&cell->node, &prison->cells);
++	spin_unlock_irqrestore(&prison->lock, flags);
++}
++EXPORT_SYMBOL_GPL(dm_cell_visit_release);
++
+ /*----------------------------------------------------------------*/
+ 
+ #define DEFERRED_SET_SIZE 64
+diff --git a/drivers/md/dm-bio-prison.h b/drivers/md/dm-bio-prison.h
+index 997a43960e77..126c79eca9d3 100644
+--- a/drivers/md/dm-bio-prison.h
++++ b/drivers/md/dm-bio-prison.h
+@@ -88,6 +88,14 @@ void dm_cell_release_no_holder(struct dm_bio_prison *prison,
+ void dm_cell_error(struct dm_bio_prison *prison,
+ 		   struct dm_bio_prison_cell *cell, int error);
+ 
++/*
++ * Visits the cell and then releases.  Guarantees no new inmates are
++ * inserted between the visit and release.
++ */
++void dm_cell_visit_release(struct dm_bio_prison *prison,
++			   void (*visit_fn)(void *, struct dm_bio_prison_cell *),
++			   void *context, struct dm_bio_prison_cell *cell);
++
+ /*----------------------------------------------------------------*/
+ 
+ /*
+* Unmerged path drivers/md/dm-thin.c
