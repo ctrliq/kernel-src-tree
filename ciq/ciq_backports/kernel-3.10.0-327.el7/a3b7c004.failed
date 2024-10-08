@@ -1,0 +1,102 @@
+CacheFiles: Handle object being killed before being set up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author David Howells <dhowells@redhat.com>
+commit a3b7c00484e1177e7eb9b047c46cac571b82442f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a3b7c004.failed
+
+If a cache object gets killed whilst in the process of being set up - for
+instance if the netfs relinquishes the cookie that the object is associated
+with - then the object's state machine will transit to the DROP_OBJECT state
+without necessarily going through the LOOKUP_OBJECT or CREATE_OBJECT states.
+
+This is a problem for CacheFiles because cachefiles_drop_object() assumes that
+object->dentry will be set upon reaching the DROP_OBJECT state and has an
+ASSERT() to that effect (see the oops below) - but object->dentry doesn't get
+set until the LOOKUP_OBJECT or CREATE_OBJECT states (and not always then if
+they fail).
+
+To fix this, just make the dentry cleanup in cachefiles_drop_object()
+conditional on the dentry actually being set and remove the assertion.
+
+	CacheFiles: Assertion failed
+	------------[ cut here ]------------
+	kernel BUG at .../fs/cachefiles/namei.c:425!
+	...
+	Workqueue: fscache_object fscache_object_work_func [fscache]
+	...
+	RIP: ... cachefiles_delete_object+0xcd/0x110 [cachefiles]
+	...
+	Call Trace:
+	 [<ffffffffa043280f>] ? cachefiles_drop_object+0xff/0x130 [cachefiles]
+	 [<ffffffffa02ac511>] ? fscache_drop_object+0xd1/0x1d0 [fscache]
+	 [<ffffffffa02ac697>] ? fscache_object_work_func+0x87/0x210 [fscache]
+	 [<ffffffff81080635>] ? process_one_work+0x155/0x450
+	 [<ffffffff81081c44>] ? worker_thread+0x114/0x370
+	 [<ffffffff81081b30>] ? manage_workers.isra.21+0x2c0/0x2c0
+	 [<ffffffff81087fcc>] ? kthread+0xbc/0xe0
+	 [<ffffffff81087f10>] ? flush_kthread_worker+0xa0/0xa0
+	 [<ffffffff8150638c>] ? ret_from_fork+0x7c/0xb0
+	 [<ffffffff81087f10>] ? flush_kthread_worker+0xa0/0xa0
+
+	Reported-by: Manuel Schölling <manuel.schoelling@gmx.de>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Acked-by: Steve Dickson <steved@redhat.com>
+(cherry picked from commit a3b7c00484e1177e7eb9b047c46cac571b82442f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cachefiles/interface.c
+diff --cc fs/cachefiles/interface.c
+index 69b3f894edc0,1c7293c3a93a..000000000000
+--- a/fs/cachefiles/interface.c
++++ b/fs/cachefiles/interface.c
+@@@ -268,20 -268,27 +268,39 @@@ static void cachefiles_drop_object(stru
+  	ASSERT((atomic_read(&object->usage) & 0xffff0000) != 0x6b6b0000);
+  #endif
+  
+++<<<<<<< HEAD
+ +	/* delete retired objects */
+ +	if (test_bit(FSCACHE_COOKIE_RETIRED, &object->fscache.cookie->flags) &&
+ +	    _object != cache->cache.fsdef
+ +	    ) {
+ +		_debug("- retire object OBJ%x", object->fscache.debug_id);
+ +		cachefiles_begin_secure(cache, &saved_cred);
+ +		cachefiles_delete_object(cache, object);
+ +		cachefiles_end_secure(cache, saved_cred);
+ +	}
+- 
+- 	/* close the filesystem stuff attached to the object */
+- 	if (object->backer != object->dentry)
+- 		dput(object->backer);
+- 	object->backer = NULL;
+++=======
++ 	/* We need to tidy the object up if we did in fact manage to open it.
++ 	 * It's possible for us to get here before the object is fully
++ 	 * initialised if the parent goes away or the object gets retired
++ 	 * before we set it up.
++ 	 */
++ 	if (object->dentry) {
++ 		/* delete retired objects */
++ 		if (test_bit(FSCACHE_OBJECT_RETIRED, &object->fscache.flags) &&
++ 		    _object != cache->cache.fsdef
++ 		    ) {
++ 			_debug("- retire object OBJ%x", object->fscache.debug_id);
++ 			cachefiles_begin_secure(cache, &saved_cred);
++ 			cachefiles_delete_object(cache, object);
++ 			cachefiles_end_secure(cache, saved_cred);
++ 		}
+++>>>>>>> a3b7c00484e1 (CacheFiles: Handle object being killed before being set up)
++ 
++ 		/* close the filesystem stuff attached to the object */
++ 		if (object->backer != object->dentry)
++ 			dput(object->backer);
++ 		object->backer = NULL;
++ 	}
+  
+  	/* note that the object is now inactive */
+  	if (test_bit(CACHEFILES_OBJECT_ACTIVE, &object->flags)) {
+* Unmerged path fs/cachefiles/interface.c
