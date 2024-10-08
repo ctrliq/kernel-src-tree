@@ -1,0 +1,472 @@
+ext4: Fix misspellings using 'codespell' tool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Anatol Pomozov <anatol.pomozov@gmail.com>
+commit 70261f568f3c08552f034742e3d5cb78c3877766
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/70261f56.failed
+
+	Signed-off-by: Anatol Pomozov <anatol.pomozov@gmail.com>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit 70261f568f3c08552f034742e3d5cb78c3877766)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 9b251a9a30ad,9115f2807515..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -2204,9 -1921,342 +2204,348 @@@ static int ext4_writepage(struct page *
+  #define MAX_WRITEPAGES_EXTENT_LEN 2048
+  
+  /*
+++<<<<<<< HEAD
+ + * Calculate the total number of credits to reserve for one writepages
+ + * iteration. This is called from ext4_da_writepages(). We map an extent of
+ + * upto MAX_WRITEPAGES_EXTENT_LEN blocks and then we go on and finish mapping
+++=======
++  * mpage_add_bh_to_extent - try to add bh to extent of blocks to map
++  *
++  * @mpd - extent of blocks
++  * @lblk - logical number of the block in the file
++  * @bh - buffer head we want to add to the extent
++  *
++  * The function is used to collect contig. blocks in the same state. If the
++  * buffer doesn't require mapping for writeback and we haven't started the
++  * extent of buffers to map yet, the function returns 'true' immediately - the
++  * caller can write the buffer right away. Otherwise the function returns true
++  * if the block has been added to the extent, false if the block couldn't be
++  * added.
++  */
++ static bool mpage_add_bh_to_extent(struct mpage_da_data *mpd, ext4_lblk_t lblk,
++ 				   struct buffer_head *bh)
++ {
++ 	struct ext4_map_blocks *map = &mpd->map;
++ 
++ 	/* Buffer that doesn't need mapping for writeback? */
++ 	if (!buffer_dirty(bh) || !buffer_mapped(bh) ||
++ 	    (!buffer_delay(bh) && !buffer_unwritten(bh))) {
++ 		/* So far no extent to map => we write the buffer right away */
++ 		if (map->m_len == 0)
++ 			return true;
++ 		return false;
++ 	}
++ 
++ 	/* First block in the extent? */
++ 	if (map->m_len == 0) {
++ 		map->m_lblk = lblk;
++ 		map->m_len = 1;
++ 		map->m_flags = bh->b_state & BH_FLAGS;
++ 		return true;
++ 	}
++ 
++ 	/* Don't go larger than mballoc is willing to allocate */
++ 	if (map->m_len >= MAX_WRITEPAGES_EXTENT_LEN)
++ 		return false;
++ 
++ 	/* Can we merge the block to our big extent? */
++ 	if (lblk == map->m_lblk + map->m_len &&
++ 	    (bh->b_state & BH_FLAGS) == map->m_flags) {
++ 		map->m_len++;
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * mpage_process_page_bufs - submit page buffers for IO or add them to extent
++  *
++  * @mpd - extent of blocks for mapping
++  * @head - the first buffer in the page
++  * @bh - buffer we should start processing from
++  * @lblk - logical number of the block in the file corresponding to @bh
++  *
++  * Walk through page buffers from @bh upto @head (exclusive) and either submit
++  * the page for IO if all buffers in this page were mapped and there's no
++  * accumulated extent of buffers to map or add buffers in the page to the
++  * extent of buffers to map. The function returns 1 if the caller can continue
++  * by processing the next page, 0 if it should stop adding buffers to the
++  * extent to map because we cannot extend it anymore. It can also return value
++  * < 0 in case of error during IO submission.
++  */
++ static int mpage_process_page_bufs(struct mpage_da_data *mpd,
++ 				   struct buffer_head *head,
++ 				   struct buffer_head *bh,
++ 				   ext4_lblk_t lblk)
++ {
++ 	struct inode *inode = mpd->inode;
++ 	int err;
++ 	ext4_lblk_t blocks = (i_size_read(inode) + (1 << inode->i_blkbits) - 1)
++ 							>> inode->i_blkbits;
++ 
++ 	do {
++ 		BUG_ON(buffer_locked(bh));
++ 
++ 		if (lblk >= blocks || !mpage_add_bh_to_extent(mpd, lblk, bh)) {
++ 			/* Found extent to map? */
++ 			if (mpd->map.m_len)
++ 				return 0;
++ 			/* Everything mapped so far and we hit EOF */
++ 			break;
++ 		}
++ 	} while (lblk++, (bh = bh->b_this_page) != head);
++ 	/* So far everything mapped? Submit the page for IO. */
++ 	if (mpd->map.m_len == 0) {
++ 		err = mpage_submit_page(mpd, head->b_page);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 	return lblk < blocks;
++ }
++ 
++ /*
++  * mpage_map_buffers - update buffers corresponding to changed extent and
++  *		       submit fully mapped pages for IO
++  *
++  * @mpd - description of extent to map, on return next extent to map
++  *
++  * Scan buffers corresponding to changed extent (we expect corresponding pages
++  * to be already locked) and update buffer state according to new extent state.
++  * We map delalloc buffers to their physical location, clear unwritten bits,
++  * and mark buffers as uninit when we perform writes to uninitialized extents
++  * and do extent conversion after IO is finished. If the last page is not fully
++  * mapped, we update @map to the next extent in the last page that needs
++  * mapping. Otherwise we submit the page for IO.
++  */
++ static int mpage_map_and_submit_buffers(struct mpage_da_data *mpd)
++ {
++ 	struct pagevec pvec;
++ 	int nr_pages, i;
++ 	struct inode *inode = mpd->inode;
++ 	struct buffer_head *head, *bh;
++ 	int bpp_bits = PAGE_CACHE_SHIFT - inode->i_blkbits;
++ 	pgoff_t start, end;
++ 	ext4_lblk_t lblk;
++ 	sector_t pblock;
++ 	int err;
++ 
++ 	start = mpd->map.m_lblk >> bpp_bits;
++ 	end = (mpd->map.m_lblk + mpd->map.m_len - 1) >> bpp_bits;
++ 	lblk = start << bpp_bits;
++ 	pblock = mpd->map.m_pblk;
++ 
++ 	pagevec_init(&pvec, 0);
++ 	while (start <= end) {
++ 		nr_pages = pagevec_lookup(&pvec, inode->i_mapping, start,
++ 					  PAGEVEC_SIZE);
++ 		if (nr_pages == 0)
++ 			break;
++ 		for (i = 0; i < nr_pages; i++) {
++ 			struct page *page = pvec.pages[i];
++ 
++ 			if (page->index > end)
++ 				break;
++ 			/* Up to 'end' pages must be contiguous */
++ 			BUG_ON(page->index != start);
++ 			bh = head = page_buffers(page);
++ 			do {
++ 				if (lblk < mpd->map.m_lblk)
++ 					continue;
++ 				if (lblk >= mpd->map.m_lblk + mpd->map.m_len) {
++ 					/*
++ 					 * Buffer after end of mapped extent.
++ 					 * Find next buffer in the page to map.
++ 					 */
++ 					mpd->map.m_len = 0;
++ 					mpd->map.m_flags = 0;
++ 					/*
++ 					 * FIXME: If dioread_nolock supports
++ 					 * blocksize < pagesize, we need to make
++ 					 * sure we add size mapped so far to
++ 					 * io_end->size as the following call
++ 					 * can submit the page for IO.
++ 					 */
++ 					err = mpage_process_page_bufs(mpd, head,
++ 								      bh, lblk);
++ 					pagevec_release(&pvec);
++ 					if (err > 0)
++ 						err = 0;
++ 					return err;
++ 				}
++ 				if (buffer_delay(bh)) {
++ 					clear_buffer_delay(bh);
++ 					bh->b_blocknr = pblock++;
++ 				}
++ 				clear_buffer_unwritten(bh);
++ 			} while (lblk++, (bh = bh->b_this_page) != head);
++ 
++ 			/*
++ 			 * FIXME: This is going to break if dioread_nolock
++ 			 * supports blocksize < pagesize as we will try to
++ 			 * convert potentially unmapped parts of inode.
++ 			 */
++ 			mpd->io_submit.io_end->size += PAGE_CACHE_SIZE;
++ 			/* Page fully mapped - let IO run! */
++ 			err = mpage_submit_page(mpd, page);
++ 			if (err < 0) {
++ 				pagevec_release(&pvec);
++ 				return err;
++ 			}
++ 			start++;
++ 		}
++ 		pagevec_release(&pvec);
++ 	}
++ 	/* Extent fully mapped and matches with page boundary. We are done. */
++ 	mpd->map.m_len = 0;
++ 	mpd->map.m_flags = 0;
++ 	return 0;
++ }
++ 
++ static int mpage_map_one_extent(handle_t *handle, struct mpage_da_data *mpd)
++ {
++ 	struct inode *inode = mpd->inode;
++ 	struct ext4_map_blocks *map = &mpd->map;
++ 	int get_blocks_flags;
++ 	int err;
++ 
++ 	trace_ext4_da_write_pages_extent(inode, map);
++ 	/*
++ 	 * Call ext4_map_blocks() to allocate any delayed allocation blocks, or
++ 	 * to convert an uninitialized extent to be initialized (in the case
++ 	 * where we have written into one or more preallocated blocks).  It is
++ 	 * possible that we're going to need more metadata blocks than
++ 	 * previously reserved. However we must not fail because we're in
++ 	 * writeback and there is nothing we can do about it so it might result
++ 	 * in data loss.  So use reserved blocks to allocate metadata if
++ 	 * possible.
++ 	 *
++ 	 * We pass in the magic EXT4_GET_BLOCKS_DELALLOC_RESERVE if the blocks
++ 	 * in question are delalloc blocks.  This affects functions in many
++ 	 * different parts of the allocation call path.  This flag exists
++ 	 * primarily because we don't want to change *many* call functions, so
++ 	 * ext4_map_blocks() will set the EXT4_STATE_DELALLOC_RESERVED flag
++ 	 * once the inode's allocation semaphore is taken.
++ 	 */
++ 	get_blocks_flags = EXT4_GET_BLOCKS_CREATE |
++ 			   EXT4_GET_BLOCKS_METADATA_NOFAIL;
++ 	if (ext4_should_dioread_nolock(inode))
++ 		get_blocks_flags |= EXT4_GET_BLOCKS_IO_CREATE_EXT;
++ 	if (map->m_flags & (1 << BH_Delay))
++ 		get_blocks_flags |= EXT4_GET_BLOCKS_DELALLOC_RESERVE;
++ 
++ 	err = ext4_map_blocks(handle, inode, map, get_blocks_flags);
++ 	if (err < 0)
++ 		return err;
++ 	if (map->m_flags & EXT4_MAP_UNINIT) {
++ 		if (!mpd->io_submit.io_end->handle &&
++ 		    ext4_handle_valid(handle)) {
++ 			mpd->io_submit.io_end->handle = handle->h_rsv_handle;
++ 			handle->h_rsv_handle = NULL;
++ 		}
++ 		ext4_set_io_unwritten_flag(inode, mpd->io_submit.io_end);
++ 	}
++ 
++ 	BUG_ON(map->m_len == 0);
++ 	if (map->m_flags & EXT4_MAP_NEW) {
++ 		struct block_device *bdev = inode->i_sb->s_bdev;
++ 		int i;
++ 
++ 		for (i = 0; i < map->m_len; i++)
++ 			unmap_underlying_metadata(bdev, map->m_pblk + i);
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * mpage_map_and_submit_extent - map extent starting at mpd->lblk of length
++  *				 mpd->len and submit pages underlying it for IO
++  *
++  * @handle - handle for journal operations
++  * @mpd - extent to map
++  *
++  * The function maps extent starting at mpd->lblk of length mpd->len. If it is
++  * delayed, blocks are allocated, if it is unwritten, we may need to convert
++  * them to initialized or split the described range from larger unwritten
++  * extent. Note that we need not map all the described range since allocation
++  * can return less blocks or the range is covered by more unwritten extents. We
++  * cannot map more because we are limited by reserved transaction credits. On
++  * the other hand we always make sure that the last touched page is fully
++  * mapped so that it can be written out (and thus forward progress is
++  * guaranteed). After mapping we submit all mapped pages for IO.
++  */
++ static int mpage_map_and_submit_extent(handle_t *handle,
++ 				       struct mpage_da_data *mpd,
++ 				       bool *give_up_on_write)
++ {
++ 	struct inode *inode = mpd->inode;
++ 	struct ext4_map_blocks *map = &mpd->map;
++ 	int err;
++ 	loff_t disksize;
++ 
++ 	mpd->io_submit.io_end->offset =
++ 				((loff_t)map->m_lblk) << inode->i_blkbits;
++ 	do {
++ 		err = mpage_map_one_extent(handle, mpd);
++ 		if (err < 0) {
++ 			struct super_block *sb = inode->i_sb;
++ 
++ 			if (EXT4_SB(sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
++ 				goto invalidate_dirty_pages;
++ 			/*
++ 			 * Let the uper layers retry transient errors.
++ 			 * In the case of ENOSPC, if ext4_count_free_blocks()
++ 			 * is non-zero, a commit should free up blocks.
++ 			 */
++ 			if ((err == -ENOMEM) ||
++ 			    (err == -ENOSPC && ext4_count_free_clusters(sb)))
++ 				return err;
++ 			ext4_msg(sb, KERN_CRIT,
++ 				 "Delayed block allocation failed for "
++ 				 "inode %lu at logical offset %llu with"
++ 				 " max blocks %u with error %d",
++ 				 inode->i_ino,
++ 				 (unsigned long long)map->m_lblk,
++ 				 (unsigned)map->m_len, -err);
++ 			ext4_msg(sb, KERN_CRIT,
++ 				 "This should not happen!! Data will "
++ 				 "be lost\n");
++ 			if (err == -ENOSPC)
++ 				ext4_print_free_blocks(inode);
++ 		invalidate_dirty_pages:
++ 			*give_up_on_write = true;
++ 			return err;
++ 		}
++ 		/*
++ 		 * Update buffer state, submit mapped pages, and get us new
++ 		 * extent to map
++ 		 */
++ 		err = mpage_map_and_submit_buffers(mpd);
++ 		if (err < 0)
++ 			return err;
++ 	} while (map->m_len);
++ 
++ 	/* Update on-disk size after IO is submitted */
++ 	disksize = ((loff_t)mpd->first_page) << PAGE_CACHE_SHIFT;
++ 	if (disksize > EXT4_I(inode)->i_disksize) {
++ 		int err2;
++ 
++ 		ext4_wb_update_i_disksize(inode, disksize);
++ 		err2 = ext4_mark_inode_dirty(handle, inode);
++ 		if (err2)
++ 			ext4_error(inode->i_sb,
++ 				   "Failed to mark inode %lu dirty",
++ 				   inode->i_ino);
++ 		if (!err)
++ 			err = err2;
++ 	}
++ 	return err;
++ }
++ 
++ /*
++  * Calculate the total number of credits to reserve for one writepages
++  * iteration. This is called from ext4_writepages(). We map an extent of
++  * up to MAX_WRITEPAGES_EXTENT_LEN blocks and then we go on and finish mapping
+++>>>>>>> 70261f568f3c (ext4: Fix misspellings using 'codespell' tool)
+   * the last partial page. So in total we can map MAX_WRITEPAGES_EXTENT_LEN +
+   * bpp - 1 blocks in bpp different extents.
+   */
+@@@ -2424,6 -2441,32 +2763,35 @@@ static int ext4_da_writepages(struct ad
+  	if (unlikely(sbi->s_mount_flags & EXT4_MF_FS_ABORTED))
+  		return -EROFS;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ext4_should_dioread_nolock(inode)) {
++ 		/*
++ 		 * We may need to convert up to one extent per block in
++ 		 * the page and we may dirty the inode.
++ 		 */
++ 		rsv_blocks = 1 + (PAGE_CACHE_SIZE >> inode->i_blkbits);
++ 	}
++ 
++ 	/*
++ 	 * If we have inline data and arrive here, it means that
++ 	 * we will soon create the block for the 1st page, so
++ 	 * we'd better clear the inline data here.
++ 	 */
++ 	if (ext4_has_inline_data(inode)) {
++ 		/* Just inode will be modified... */
++ 		handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
++ 		if (IS_ERR(handle)) {
++ 			ret = PTR_ERR(handle);
++ 			goto out_writepages;
++ 		}
++ 		BUG_ON(ext4_test_inode_state(inode,
++ 				EXT4_STATE_MAY_INLINE_DATA));
++ 		ext4_destroy_inline_data(handle, inode);
++ 		ext4_journal_stop(handle);
++ 	}
++ 
+++>>>>>>> 70261f568f3c (ext4: Fix misspellings using 'codespell' tool)
+  	if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
+  		range_whole = 1;
+  
+diff --git a/fs/ext3/dir.c b/fs/ext3/dir.c
+index 87eccbbca255..a765380e5768 100644
+--- a/fs/ext3/dir.c
++++ b/fs/ext3/dir.c
+@@ -42,7 +42,7 @@ static unsigned char get_dtype(struct super_block *sb, int filetype)
+ 
+ /**
+  * Check if the given dir-inode refers to an htree-indexed directory
+- * (or a directory which chould potentially get coverted to use htree
++ * (or a directory which could potentially get converted to use htree
+  * indexing).
+  *
+  * Return 1 if it is a dx dir, 0 if not
+diff --git a/fs/ext4/dir.c b/fs/ext4/dir.c
+index f8d56e4254e0..1b17b5465c29 100644
+--- a/fs/ext4/dir.c
++++ b/fs/ext4/dir.c
+@@ -34,7 +34,7 @@ static int ext4_dx_readdir(struct file *filp,
+ 
+ /**
+  * Check if the given dir-inode refers to an htree-indexed directory
+- * (or a directory which chould potentially get coverted to use htree
++ * (or a directory which could potentially get converted to use htree
+  * indexing).
+  *
+  * Return 1 if it is a dx dir, 0 if not
+diff --git a/fs/ext4/ext4_jbd2.h b/fs/ext4/ext4_jbd2.h
+index fdd865eb1879..d1e1c1d11050 100644
+--- a/fs/ext4/ext4_jbd2.h
++++ b/fs/ext4/ext4_jbd2.h
+@@ -196,7 +196,7 @@ static inline void ext4_journal_callback_add(handle_t *handle,
+  * ext4_journal_callback_del: delete a registered callback
+  * @handle: active journal transaction handle on which callback was registered
+  * @jce: registered journal callback entry to unregister
+- * Return true if object was sucessfully removed
++ * Return true if object was successfully removed
+  */
+ static inline bool ext4_journal_callback_try_del(handle_t *handle,
+ 					     struct ext4_journal_cb_entry *jce)
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 615764a44279..9d8c2c121a48 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -3220,7 +3220,7 @@ fix_extent_len:
+  * ext4_split_extents() splits an extent and mark extent which is covered
+  * by @map as split_flags indicates
+  *
+- * It may result in splitting the extent into multiple extents (upto three)
++ * It may result in splitting the extent into multiple extents (up to three)
+  * There are three possibilities:
+  *   a> There is no split required
+  *   b> Splits in two extents: Split is happening at either end of the extent
+* Unmerged path fs/ext4/inode.c
+diff --git a/fs/ext4/migrate.c b/fs/ext4/migrate.c
+index f99bdb8548b2..2ae73a80c19b 100644
+--- a/fs/ext4/migrate.c
++++ b/fs/ext4/migrate.c
+@@ -494,7 +494,7 @@ int ext4_ext_migrate(struct inode *inode)
+ 	 * superblock modification.
+ 	 *
+ 	 * For the tmp_inode we already have committed the
+-	 * trascation that created the inode. Later as and
++	 * transaction that created the inode. Later as and
+ 	 * when we add extents we extent the journal
+ 	 */
+ 	/*
