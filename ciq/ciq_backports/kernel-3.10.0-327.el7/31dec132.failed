@@ -1,0 +1,200 @@
+fold try_to_ascend() into the sole remaining caller
+
+jira LE-1907
+cve CVE-2014-8559
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] dcache: fold try_to_ascend() into the sole remaining caller (Denys Vlasenko) [1173813] {CVE-2014-8559}
+Rebuild_FUZZ: 92.73%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 31dec1327e377b6d91a8a6c92b5cd8513939a233
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/31dec132.failed
+
+There used to be a bunch of tree-walkers in dcache.c, all alike.
+try_to_ascend() had been introduced to abstract a piece of logics
+duplicated in all of them.  These days all these tree-walkers are
+implemented via the same iterator (d_walk()), which is the only
+remaining caller of try_to_ascend(), so let's fold it back...
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 31dec1327e377b6d91a8a6c92b5cd8513939a233)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 3af919733a87,4bdb300b16e2..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -884,157 -1024,20 +884,160 @@@ relock
+   */
+  void shrink_dcache_sb(struct super_block *sb)
+  {
+ -	long freed;
+ +	LIST_HEAD(tmp);
+  
+ -	do {
+ -		LIST_HEAD(dispose);
+ +	spin_lock(&dcache_lru_lock);
+ +	while (!list_empty(&sb->s_dentry_lru)) {
+ +		list_splice_init(&sb->s_dentry_lru, &tmp);
+ +		spin_unlock(&dcache_lru_lock);
+ +		shrink_dentry_list(&tmp);
+ +		spin_lock(&dcache_lru_lock);
+ +	}
+ +	spin_unlock(&dcache_lru_lock);
+ +}
+ +EXPORT_SYMBOL(shrink_dcache_sb);
+ +
+++<<<<<<< HEAD
+ +/*
+ + * destroy a single subtree of dentries for unmount
+ + * - see the comments on shrink_dcache_for_umount() for a description of the
+ + *   locking
+ + */
+ +static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+ +{
+ +	struct dentry *parent;
+ +
+ +	BUG_ON(!IS_ROOT(dentry));
+ +
+ +	for (;;) {
+ +		/* descend to the first leaf in the current subtree */
+ +		while (!list_empty(&dentry->d_subdirs))
+ +			dentry = list_entry(dentry->d_subdirs.next,
+ +					    struct dentry, d_u.d_child);
+  
+ -		freed = list_lru_walk(&sb->s_dentry_lru,
+ -			dentry_lru_isolate_shrink, &dispose, UINT_MAX);
+ +		/* consume the dentries from this leaf up through its parents
+ +		 * until we find one with children or run out altogether */
+ +		do {
+ +			struct inode *inode;
+  
+ -		this_cpu_sub(nr_dentry_unused, freed);
+ -		shrink_dentry_list(&dispose);
+ -	} while (freed > 0);
+ +			/*
+ +			 * inform the fs that this dentry is about to be
+ +			 * unhashed and destroyed.
+ +			 */
+ +			if ((dentry->d_flags & DCACHE_OP_PRUNE) &&
+ +			    !d_unhashed(dentry))
+ +				dentry->d_op->d_prune(dentry);
+ +
+ +			dentry_lru_del(dentry);
+ +			__d_shrink(dentry);
+ +
+ +			if (dentry->d_lockref.count != 0) {
+ +				printk(KERN_ERR
+ +				       "BUG: Dentry %p{i=%lx,n=%s}"
+ +				       " still in use (%d)"
+ +				       " [unmount of %s %s]\n",
+ +				       dentry,
+ +				       dentry->d_inode ?
+ +				       dentry->d_inode->i_ino : 0UL,
+ +				       dentry->d_name.name,
+ +				       dentry->d_lockref.count,
+ +				       dentry->d_sb->s_type->name,
+ +				       dentry->d_sb->s_id);
+ +				BUG();
+ +			}
+ +
+ +			if (IS_ROOT(dentry)) {
+ +				parent = NULL;
+ +				list_del(&dentry->d_u.d_child);
+ +			} else {
+ +				parent = dentry->d_parent;
+ +				parent->d_lockref.count--;
+ +				list_del(&dentry->d_u.d_child);
+ +			}
+ +
+ +			inode = dentry->d_inode;
+ +			if (inode) {
+ +				dentry->d_inode = NULL;
+ +				hlist_del_init(&dentry->d_alias);
+ +				if (dentry->d_op && dentry->d_op->d_iput)
+ +					dentry->d_op->d_iput(dentry, inode);
+ +				else
+ +					iput(inode);
+ +			}
+ +
+ +			d_free(dentry);
+ +
+ +			/* finished when we fall off the top of the tree,
+ +			 * otherwise we ascend to the parent and move to the
+ +			 * next sibling if there is one */
+ +			if (!parent)
+ +				return;
+ +			dentry = parent;
+ +		} while (list_empty(&dentry->d_subdirs));
+ +
+ +		dentry = list_entry(dentry->d_subdirs.next,
+ +				    struct dentry, d_u.d_child);
+ +	}
+  }
+ -EXPORT_SYMBOL(shrink_dcache_sb);
+  
+ +/*
+ + * destroy the dentries attached to a superblock on unmounting
+ + * - we don't need to use dentry->d_lock because:
+ + *   - the superblock is detached from all mountings and open files, so the
+ + *     dentry trees will not be rearranged by the VFS
+ + *   - s_umount is write-locked, so the memory pressure shrinker will ignore
+ + *     any dentries belonging to this superblock that it comes across
+ + *   - the filesystem itself is no longer permitted to rearrange the dentries
+ + *     in this superblock
+ + */
+ +void shrink_dcache_for_umount(struct super_block *sb)
+ +{
+ +	struct dentry *dentry;
+ +
+ +	if (down_read_trylock(&sb->s_umount))
+ +		BUG();
+ +
+ +	dentry = sb->s_root;
+ +	sb->s_root = NULL;
+ +	dentry->d_lockref.count--;
+ +	shrink_dcache_for_umount_subtree(dentry);
+ +
+ +	while (!hlist_bl_empty(&sb->s_anon)) {
+ +		dentry = hlist_bl_entry(hlist_bl_first(&sb->s_anon), struct dentry, d_hash);
+ +		shrink_dcache_for_umount_subtree(dentry);
+ +	}
+ +}
+ +
+ +/*
+ + * This tries to ascend one level of parenthood, but
+ + * we can race with renaming, so we need to re-check
+ + * the parenthood after dropping the lock and check
+ + * that the sequence number still matches.
+ + */
+ +static struct dentry *try_to_ascend(struct dentry *old, unsigned seq)
+ +{
+ +	struct dentry *new = old->d_parent;
+ +
+ +	rcu_read_lock();
+ +	spin_unlock(&old->d_lock);
+ +	spin_lock(&new->d_lock);
+ +
+ +	/*
+ +	 * might go back up the wrong parent if we have had a rename
+ +	 * or deletion
+ +	 */
+ +	if (new != old->d_parent ||
+ +		 (old->d_flags & DCACHE_DENTRY_KILLED) ||
+ +		 need_seqretry(&rename_lock, seq)) {
+ +		spin_unlock(&new->d_lock);
+ +		new = NULL;
+ +	}
+ +	rcu_read_unlock();
+ +	return new;
+ +}
+ +
+++=======
+++>>>>>>> 31dec1327e37 (fold try_to_ascend() into the sole remaining caller)
+  /**
+   * enum d_walk_ret - action to talke during tree walk
+   * @D_WALK_CONTINUE:	contrinue walk
+* Unmerged path fs/dcache.c
