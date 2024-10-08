@@ -1,0 +1,355 @@
+usb: devio: Add ioctl to disallow detaching kernel USB drivers.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] usb: devio: Add ioctl to disallow detaching kernel USB drivers (Torez Smith) [1332712]
+Rebuild_FUZZ: 99.20%
+commit-author Reilly Grant <reillyg@chromium.org>
+commit d883f52e1f6d2eca8378e3795f333c1396943873
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d883f52e.failed
+
+The new USBDEVFS_DROP_PRIVILEGES ioctl allows a process to voluntarily
+relinquish the ability to issue other ioctls that may interfere with
+other processes and drivers that have claimed an interface on the
+device.
+
+This commit also includes a simple utility to be able to test the
+ioctl, located at Documentation/usb/usbdevfs-drop-permissions.c
+
+Example (with qemu-kvm's input device):
+
+    $ lsusb
+    ...
+    Bus 001 Device 002: ID 0627:0001 Adomax Technology Co., Ltd
+
+    $ usb-devices
+    ...
+    C:  #Ifs= 1 Cfg#= 1 Atr=a0 MxPwr=100mA
+    I:  If#= 0 Alt= 0 #EPs= 1 Cls=03(HID  ) Sub=00 Prot=02 Driver=usbhid
+
+    $ sudo ./usbdevfs-drop-permissions /dev/bus/usb/001/002
+    OK: privileges dropped!
+    Available options:
+    [0] Exit now
+    [1] Reset device. Should fail if device is in use
+    [2] Claim 4 interfaces. Should succeed where not in use
+    [3] Narrow interface permission mask
+    Which option shall I run?: 1
+    ERROR: USBDEVFS_RESET failed! (1 - Operation not permitted)
+    Which test shall I run next?: 2
+    ERROR claiming if 0 (1 - Operation not permitted)
+    ERROR claiming if 1 (1 - Operation not permitted)
+    ERROR claiming if 2 (1 - Operation not permitted)
+    ERROR claiming if 3 (1 - Operation not permitted)
+    Which test shall I run next?: 0
+
+After unbinding usbhid:
+
+    $ usb-devices
+    ...
+    I:  If#= 0 Alt= 0 #EPs= 1 Cls=03(HID  ) Sub=00 Prot=02 Driver=(none)
+
+    $ sudo ./usbdevfs-drop-permissions /dev/bus/usb/001/002
+    ...
+    Which option shall I run?: 2
+    OK: claimed if 0
+    ERROR claiming if 1 (1 - Operation not permitted)
+    ERROR claiming if 2 (1 - Operation not permitted)
+    ERROR claiming if 3 (1 - Operation not permitted)
+    Which test shall I run next?: 1
+    OK: USBDEVFS_RESET succeeded
+    Which test shall I run next?: 0
+
+After unbinding usbhid and restricting the mask:
+
+    $ sudo ./usbdevfs-drop-permissions /dev/bus/usb/001/002
+    ...
+    Which option shall I run?: 3
+    Insert new mask: 0
+    OK: privileges dropped!
+    Which test shall I run next?: 2
+    ERROR claiming if 0 (1 - Operation not permitted)
+    ERROR claiming if 1 (1 - Operation not permitted)
+    ERROR claiming if 2 (1 - Operation not permitted)
+    ERROR claiming if 3 (1 - Operation not permitted)
+
+	Signed-off-by: Reilly Grant <reillyg@chromium.org>
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Emilio López <emilio.lopez@collabora.co.uk>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d883f52e1f6d2eca8378e3795f333c1396943873)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/devio.c
+#	include/uapi/linux/usbdevice_fs.h
+diff --cc drivers/usb/core/devio.c
+index 406c1b0a9a5c,52c4461dfccd..000000000000
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@@ -77,11 -79,24 +77,13 @@@ struct dev_state 
+  	unsigned long ifclaimed;
+  	u32 secid;
+  	u32 disabled_bulk_eps;
++ 	bool privileges_dropped;
++ 	unsigned long interface_allowed_mask;
+  };
+  
+ -struct usb_memory {
+ -	struct list_head memlist;
+ -	int vma_use_count;
+ -	int urb_use_count;
+ -	u32 size;
+ -	void *mem;
+ -	dma_addr_t dma_handle;
+ -	unsigned long vm_start;
+ -	struct usb_dev_state *ps;
+ -};
+ -
+  struct async {
+  	struct list_head asynclist;
+ -	struct usb_dev_state *ps;
+ +	struct dev_state *ps;
+  	struct pid *pid;
+  	const struct cred *cred;
+  	unsigned int signr;
+@@@ -885,7 -991,7 +891,11 @@@ static int usbdev_open(struct inode *in
+  	int ret;
+  
+  	ret = -ENOMEM;
+++<<<<<<< HEAD
+ +	ps = kmalloc(sizeof(struct dev_state), GFP_KERNEL);
+++=======
++ 	ps = kzalloc(sizeof(struct usb_dev_state), GFP_KERNEL);
+++>>>>>>> d883f52e1f6d (usb: devio: Add ioctl to disallow detaching kernel USB drivers.)
+  	if (!ps)
+  		goto out_free_ps;
+  
+@@@ -917,12 -1024,10 +928,9 @@@
+  	INIT_LIST_HEAD(&ps->list);
+  	INIT_LIST_HEAD(&ps->async_pending);
+  	INIT_LIST_HEAD(&ps->async_completed);
+ -	INIT_LIST_HEAD(&ps->memory_list);
+  	init_waitqueue_head(&ps->wait);
+- 	ps->discsignr = 0;
+  	ps->disc_pid = get_pid(task_pid(current));
+  	ps->cred = get_current_cred();
+- 	ps->disccontext = NULL;
+- 	ps->ifclaimed = 0;
+  	security_task_getsecid(current, &ps->secid);
+  	smp_wmb();
+  	list_add_tail(&ps->list, &dev->filelist);
+@@@ -1220,8 -1326,30 +1228,30 @@@ static int proc_connectinfo(struct dev_
+  	return 0;
+  }
+  
+ -static int proc_resetdevice(struct usb_dev_state *ps)
+ +static int proc_resetdevice(struct dev_state *ps)
+  {
++ 	struct usb_host_config *actconfig = ps->dev->actconfig;
++ 	struct usb_interface *interface;
++ 	int i, number;
++ 
++ 	/* Don't allow a device reset if the process has dropped the
++ 	 * privilege to do such things and any of the interfaces are
++ 	 * currently claimed.
++ 	 */
++ 	if (ps->privileges_dropped && actconfig) {
++ 		for (i = 0; i < actconfig->desc.bNumInterfaces; ++i) {
++ 			interface = actconfig->interface[i];
++ 			number = interface->cur_altsetting->desc.bInterfaceNumber;
++ 			if (usb_interface_claimed(interface) &&
++ 					!test_bit(number, &ps->ifclaimed)) {
++ 				dev_warn(&ps->dev->dev,
++ 					"usbfs: interface %d claimed by %s while '%s' resets device\n",
++ 					number,	interface->dev.driver->name, current->comm);
++ 				return -EACCES;
++ 			}
++ 		}
++ 	}
++ 
+  	return usb_reset_device(ps->dev);
+  }
+  
+@@@ -2063,7 -2244,8 +2096,12 @@@ static int proc_get_capabilities(struc
+  	__u32 caps;
+  
+  	caps = USBDEVFS_CAP_ZERO_PACKET | USBDEVFS_CAP_NO_PACKET_SIZE_LIM |
+++<<<<<<< HEAD
+ +			USBDEVFS_CAP_REAP_AFTER_DISCONNECT;
+++=======
++ 			USBDEVFS_CAP_REAP_AFTER_DISCONNECT | USBDEVFS_CAP_MMAP |
++ 			USBDEVFS_CAP_DROP_PRIVILEGES;
+++>>>>>>> d883f52e1f6d (usb: devio: Add ioctl to disallow detaching kernel USB drivers.)
+  	if (!ps->dev->bus->no_stop_on_short)
+  		caps |= USBDEVFS_CAP_BULK_CONTINUATION;
+  	if (ps->dev->bus->sg_tablesize)
+diff --cc include/uapi/linux/usbdevice_fs.h
+index 019ba1e0799a,a8653a6f40df..000000000000
+--- a/include/uapi/linux/usbdevice_fs.h
++++ b/include/uapi/linux/usbdevice_fs.h
+@@@ -134,6 -134,8 +134,11 @@@ struct usbdevfs_hub_portinfo 
+  #define USBDEVFS_CAP_NO_PACKET_SIZE_LIM		0x04
+  #define USBDEVFS_CAP_BULK_SCATTER_GATHER	0x08
+  #define USBDEVFS_CAP_REAP_AFTER_DISCONNECT	0x10
+++<<<<<<< HEAD
+++=======
++ #define USBDEVFS_CAP_MMAP			0x20
++ #define USBDEVFS_CAP_DROP_PRIVILEGES		0x40
+++>>>>>>> d883f52e1f6d (usb: devio: Add ioctl to disallow detaching kernel USB drivers.)
+  
+  /* USBDEVFS_DISCONNECT_CLAIM flags & struct */
+  
+diff --git a/Documentation/DocBook/usb.tmpl b/Documentation/DocBook/usb.tmpl
+index 17f6b878c95f..9811ded44ecc 100644
+--- a/Documentation/DocBook/usb.tmpl
++++ b/Documentation/DocBook/usb.tmpl
+@@ -732,6 +732,18 @@ usbdev_ioctl (int fd, int ifno, unsigned request, void *param)
+ 		    or SET_INTERFACE.
+ 		    </para></warning></listitem></varlistentry>
+ 
++		<varlistentry><term>USBDEVFS_DROP_PRIVILEGES</term>
++		    <listitem><para>This is used to relinquish the ability
++		    to do certain operations which are considered to be
++		    privileged on a usbfs file descriptor.
++		    This includes claiming arbitrary interfaces, resetting
++		    a device on which there are currently claimed interfaces
++		    from other users, and issuing USBDEVFS_IOCTL calls.
++		    The ioctl parameter is a 32 bit mask of interfaces
++		    the user is allowed to claim on this file descriptor.
++		    You may issue this ioctl more than one time to narrow
++		    said mask.
++		    </para></listitem></varlistentry>
+ 		</variablelist>
+ 
+ 		</sect2>
+diff --git a/Documentation/usb/usbdevfs-drop-permissions.c b/Documentation/usb/usbdevfs-drop-permissions.c
+new file mode 100644
+index 000000000000..6b8da6ef0c9a
+--- /dev/null
++++ b/Documentation/usb/usbdevfs-drop-permissions.c
+@@ -0,0 +1,120 @@
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <errno.h>
++#include <string.h>
++#include <inttypes.h>
++#include <unistd.h>
++
++#include <linux/usbdevice_fs.h>
++
++/* For building without an updated set of headers */
++#ifndef USBDEVFS_DROP_PRIVILEGES
++#define USBDEVFS_DROP_PRIVILEGES		_IOW('U', 30, __u32)
++#define USBDEVFS_CAP_DROP_PRIVILEGES		0x40
++#endif
++
++void drop_privileges(int fd, uint32_t mask)
++{
++	int res;
++
++	res = ioctl(fd, USBDEVFS_DROP_PRIVILEGES, &mask);
++	if (res)
++		printf("ERROR: USBDEVFS_DROP_PRIVILEGES returned %d\n", res);
++	else
++		printf("OK: privileges dropped!\n");
++}
++
++void reset_device(int fd)
++{
++	int res;
++
++	res = ioctl(fd, USBDEVFS_RESET);
++	if (!res)
++		printf("OK: USBDEVFS_RESET succeeded\n");
++	else
++		printf("ERROR: reset failed! (%d - %s)\n",
++		       -res, strerror(-res));
++}
++
++void claim_some_intf(int fd)
++{
++	int i, res;
++
++	for (i = 0; i < 4; i++) {
++		res = ioctl(fd, USBDEVFS_CLAIMINTERFACE, &i);
++		if (!res)
++			printf("OK: claimed if %d\n", i);
++		else
++			printf("ERROR claiming if %d (%d - %s)\n",
++			       i, -res, strerror(-res));
++	}
++}
++
++int main(int argc, char *argv[])
++{
++	uint32_t mask, caps;
++	int c, fd;
++
++	fd = open(argv[1], O_RDWR);
++	if (fd < 0) {
++		printf("Failed to open file\n");
++		goto err_fd;
++	}
++
++	/*
++	 * check if dropping privileges is supported,
++	 * bail on systems where the capability is not present
++	 */
++	ioctl(fd, USBDEVFS_GET_CAPABILITIES, &caps);
++	if (!(caps & USBDEVFS_CAP_DROP_PRIVILEGES)) {
++		printf("DROP_PRIVILEGES not supported\n");
++		goto err;
++	}
++
++	/*
++	 * Drop privileges but keep the ability to claim all
++	 * free interfaces (i.e., those not used by kernel drivers)
++	 */
++	drop_privileges(fd, -1U);
++
++	printf("Available options:\n"
++		"[0] Exit now\n"
++		"[1] Reset device. Should fail if device is in use\n"
++		"[2] Claim 4 interfaces. Should succeed where not in use\n"
++		"[3] Narrow interface permission mask\n"
++		"Which option shall I run?: ");
++
++	while (scanf("%d", &c) == 1) {
++		switch (c) {
++		case 0:
++			goto exit;
++		case 1:
++			reset_device(fd);
++			break;
++		case 2:
++			claim_some_intf(fd);
++			break;
++		case 3:
++			printf("Insert new mask: ");
++			scanf("%x", &mask);
++			drop_privileges(fd, mask);
++			break;
++		default:
++			printf("I don't recognize that\n");
++		}
++
++		printf("Which test shall I run next?: ");
++	}
++
++exit:
++	close(fd);
++	return 0;
++
++err:
++	close(fd);
++err_fd:
++	return 1;
++}
+* Unmerged path drivers/usb/core/devio.c
+* Unmerged path include/uapi/linux/usbdevice_fs.h
