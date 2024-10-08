@@ -1,0 +1,318 @@
+NFSv4: Add tracepoints for debugging inode manipulations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [fs] nfs: Add tracepoints for debugging inode manipulations (Jeff Layton) [1009119]
+Rebuild_FUZZ: 98.18%
+commit-author Trond Myklebust <Trond.Myklebust@netapp.com>
+commit c1578b769a644fe1ff3e8324fc404b18f3f01fbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/c1578b76.failed
+
+Set up basic tracepoints for debugging NFSv4 setattr, access,
+readlink, readdir, get_acl set_acl get_security_label,
+and set_security_label.
+
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit c1578b769a644fe1ff3e8324fc404b18f3f01fbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+#	fs/nfs/nfs4trace.h
+diff --cc fs/nfs/nfs4proc.c
+index c7f16576f4bc,daf0854aa047..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -2218,7 -2314,8 +2218,12 @@@ static int nfs4_do_setattr(struct inod
+  	};
+  	int err;
+  	do {
+++<<<<<<< HEAD
+ +		err = _nfs4_do_setattr(inode, cred, fattr, sattr, state);
+++=======
++ 		err = _nfs4_do_setattr(inode, cred, fattr, sattr, state, ilabel, olabel);
++ 		trace_nfs4_setattr(inode, err);
+++>>>>>>> c1578b769a64 (NFSv4: Add tracepoints for debugging inode manipulations)
+  		switch (err) {
+  		case -NFS4ERR_OPENMODE:
+  			if (!(sattr->ia_valid & ATTR_SIZE)) {
+@@@ -4221,6 -4425,157 +4231,160 @@@ static int nfs4_proc_set_acl(struct ino
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NFS_V4_SECURITY_LABEL
++ static int _nfs4_get_security_label(struct inode *inode, void *buf,
++ 					size_t buflen)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_fattr fattr;
++ 	struct nfs4_label label = {0, 0, buflen, buf};
++ 
++ 	u32 bitmask[3] = { 0, 0, FATTR4_WORD2_SECURITY_LABEL };
++ 	struct nfs4_getattr_arg args = {
++ 		.fh		= NFS_FH(inode),
++ 		.bitmask	= bitmask,
++ 	};
++ 	struct nfs4_getattr_res res = {
++ 		.fattr		= &fattr,
++ 		.label		= &label,
++ 		.server		= server,
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_GETATTR],
++ 		.rpc_argp	= &args,
++ 		.rpc_resp	= &res,
++ 	};
++ 	int ret;
++ 
++ 	nfs_fattr_init(&fattr);
++ 
++ 	ret = rpc_call_sync(server->client, &msg, 0);
++ 	if (ret)
++ 		return ret;
++ 	if (!(fattr.valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL))
++ 		return -ENOENT;
++ 	if (buflen < label.len)
++ 		return -ERANGE;
++ 	return 0;
++ }
++ 
++ static int nfs4_get_security_label(struct inode *inode, void *buf,
++ 					size_t buflen)
++ {
++ 	struct nfs4_exception exception = { };
++ 	int err;
++ 
++ 	if (!nfs_server_capable(inode, NFS_CAP_SECURITY_LABEL))
++ 		return -EOPNOTSUPP;
++ 
++ 	do {
++ 		err = _nfs4_get_security_label(inode, buf, buflen);
++ 		trace_nfs4_get_security_label(inode, err);
++ 		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++ 				&exception);
++ 	} while (exception.retry);
++ 	return err;
++ }
++ 
++ static int _nfs4_do_set_security_label(struct inode *inode,
++ 		struct nfs4_label *ilabel,
++ 		struct nfs_fattr *fattr,
++ 		struct nfs4_label *olabel)
++ {
++ 
++ 	struct iattr sattr = {0};
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	const u32 bitmask[3] = { 0, 0, FATTR4_WORD2_SECURITY_LABEL };
++ 	struct nfs_setattrargs args = {
++ 		.fh             = NFS_FH(inode),
++ 		.iap            = &sattr,
++ 		.server		= server,
++ 		.bitmask	= bitmask,
++ 		.label		= ilabel,
++ 	};
++ 	struct nfs_setattrres res = {
++ 		.fattr		= fattr,
++ 		.label		= olabel,
++ 		.server		= server,
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc       = &nfs4_procedures[NFSPROC4_CLNT_SETATTR],
++ 		.rpc_argp       = &args,
++ 		.rpc_resp       = &res,
++ 	};
++ 	int status;
++ 
++ 	nfs4_stateid_copy(&args.stateid, &zero_stateid);
++ 
++ 	status = rpc_call_sync(server->client, &msg, 0);
++ 	if (status)
++ 		dprintk("%s failed: %d\n", __func__, status);
++ 
++ 	return status;
++ }
++ 
++ static int nfs4_do_set_security_label(struct inode *inode,
++ 		struct nfs4_label *ilabel,
++ 		struct nfs_fattr *fattr,
++ 		struct nfs4_label *olabel)
++ {
++ 	struct nfs4_exception exception = { };
++ 	int err;
++ 
++ 	do {
++ 		err = _nfs4_do_set_security_label(inode, ilabel,
++ 				fattr, olabel);
++ 		trace_nfs4_set_security_label(inode, err);
++ 		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++ 				&exception);
++ 	} while (exception.retry);
++ 	return err;
++ }
++ 
++ static int
++ nfs4_set_security_label(struct dentry *dentry, const void *buf, size_t buflen)
++ {
++ 	struct nfs4_label ilabel, *olabel = NULL;
++ 	struct nfs_fattr fattr;
++ 	struct rpc_cred *cred;
++ 	struct inode *inode = dentry->d_inode;
++ 	int status;
++ 
++ 	if (!nfs_server_capable(inode, NFS_CAP_SECURITY_LABEL))
++ 		return -EOPNOTSUPP;
++ 
++ 	nfs_fattr_init(&fattr);
++ 
++ 	ilabel.pi = 0;
++ 	ilabel.lfs = 0;
++ 	ilabel.label = (char *)buf;
++ 	ilabel.len = buflen;
++ 
++ 	cred = rpc_lookup_cred();
++ 	if (IS_ERR(cred))
++ 		return PTR_ERR(cred);
++ 
++ 	olabel = nfs4_label_alloc(NFS_SERVER(inode), GFP_KERNEL);
++ 	if (IS_ERR(olabel)) {
++ 		status = -PTR_ERR(olabel);
++ 		goto out;
++ 	}
++ 
++ 	status = nfs4_do_set_security_label(inode, &ilabel, &fattr, olabel);
++ 	if (status == 0)
++ 		nfs_setsecurity(inode, &fattr, olabel);
++ 
++ 	nfs4_label_free(olabel);
++ out:
++ 	put_rpccred(cred);
++ 	return status;
++ }
++ #endif	/* CONFIG_NFS_V4_SECURITY_LABEL */
++ 
++ 
+++>>>>>>> c1578b769a64 (NFSv4: Add tracepoints for debugging inode manipulations)
+  static int
+  nfs4_async_handle_error(struct rpc_task *task, const struct nfs_server *server, struct nfs4_state *state)
+  {
+diff --cc fs/nfs/nfs4trace.h
+index 3f124dbcd60a,6bd65c2c820b..000000000000
+--- a/fs/nfs/nfs4trace.h
++++ b/fs/nfs/nfs4trace.h
+@@@ -411,6 -411,107 +411,110 @@@ DEFINE_NFS4_LOCK_EVENT(nfs4_lock_reclai
+  DEFINE_NFS4_LOCK_EVENT(nfs4_lock_expired);
+  DEFINE_NFS4_LOCK_EVENT(nfs4_unlock);
+  
+++<<<<<<< HEAD
+++=======
++ DECLARE_EVENT_CLASS(nfs4_lookup_event,
++ 		TP_PROTO(
++ 			const struct inode *dir,
++ 			const struct qstr *name,
++ 			int error
++ 		),
++ 
++ 		TP_ARGS(dir, name, error),
++ 
++ 		TP_STRUCT__entry(
++ 			__field(dev_t, dev)
++ 			__field(int, error)
++ 			__field(u64, dir)
++ 			__string(name, name->name)
++ 		),
++ 
++ 		TP_fast_assign(
++ 			__entry->dev = dir->i_sb->s_dev;
++ 			__entry->dir = NFS_FILEID(dir);
++ 			__entry->error = error;
++ 			__assign_str(name, name->name);
++ 		),
++ 
++ 		TP_printk(
++ 			"error=%d (%s) name=%02x:%02x:%llu/%s",
++ 			__entry->error,
++ 			show_nfsv4_errors(__entry->error),
++ 			MAJOR(__entry->dev), MINOR(__entry->dev),
++ 			(unsigned long long)__entry->dir,
++ 			__get_str(name)
++ 		)
++ );
++ 
++ #define DEFINE_NFS4_LOOKUP_EVENT(name) \
++ 	DEFINE_EVENT(nfs4_lookup_event, name, \
++ 			TP_PROTO( \
++ 				const struct inode *dir, \
++ 				const struct qstr *name, \
++ 				int error \
++ 			), \
++ 			TP_ARGS(dir, name, error))
++ 
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_lookup);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_symlink);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_mkdir);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_mknod);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_remove);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_get_fs_locations);
++ DEFINE_NFS4_LOOKUP_EVENT(nfs4_secinfo);
++ 
++ DECLARE_EVENT_CLASS(nfs4_inode_event,
++ 		TP_PROTO(
++ 			const struct inode *inode,
++ 			int error
++ 		),
++ 
++ 		TP_ARGS(inode, error),
++ 
++ 		TP_STRUCT__entry(
++ 			__field(dev_t, dev)
++ 			__field(u32, fhandle)
++ 			__field(u64, fileid)
++ 			__field(int, error)
++ 		),
++ 
++ 		TP_fast_assign(
++ 			__entry->dev = inode->i_sb->s_dev;
++ 			__entry->fileid = NFS_FILEID(inode);
++ 			__entry->fhandle = nfs_fhandle_hash(NFS_FH(inode));
++ 			__entry->error = error;
++ 		),
++ 
++ 		TP_printk(
++ 			"error=%d (%s) fileid=%02x:%02x:%llu fhandle=0x%08x",
++ 			__entry->error,
++ 			show_nfsv4_errors(__entry->error),
++ 			MAJOR(__entry->dev), MINOR(__entry->dev),
++ 			(unsigned long long)__entry->fileid,
++ 			__entry->fhandle
++ 		)
++ );
++ 
++ #define DEFINE_NFS4_INODE_EVENT(name) \
++ 	DEFINE_EVENT(nfs4_inode_event, name, \
++ 			TP_PROTO( \
++ 				const struct inode *inode, \
++ 				int error \
++ 			), \
++ 			TP_ARGS(inode, error))
++ 
++ DEFINE_NFS4_INODE_EVENT(nfs4_setattr);
++ DEFINE_NFS4_INODE_EVENT(nfs4_access);
++ DEFINE_NFS4_INODE_EVENT(nfs4_readlink);
++ DEFINE_NFS4_INODE_EVENT(nfs4_readdir);
++ DEFINE_NFS4_INODE_EVENT(nfs4_get_acl);
++ DEFINE_NFS4_INODE_EVENT(nfs4_set_acl);
++ #ifdef CONFIG_NFS_V4_SECURITY_LABEL
++ DEFINE_NFS4_INODE_EVENT(nfs4_get_security_label);
++ DEFINE_NFS4_INODE_EVENT(nfs4_set_security_label);
++ #endif /* CONFIG_NFS_V4_SECURITY_LABEL */
++ 
+++>>>>>>> c1578b769a64 (NFSv4: Add tracepoints for debugging inode manipulations)
+  #endif /* _TRACE_NFS4_H */
+  
+  #undef TRACE_INCLUDE_PATH
+* Unmerged path fs/nfs/nfs4proc.c
+* Unmerged path fs/nfs/nfs4trace.h
