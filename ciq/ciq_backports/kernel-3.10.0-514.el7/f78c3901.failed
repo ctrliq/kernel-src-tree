@@ -1,0 +1,159 @@
+xfs: fix xfs_log_done interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit f78c3901074e113a04150230087f1d76033bb0a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f78c3901.failed
+
+Instead of the confusing flags argument pass a boolean flag to indicate if
+we want to release or regrant a log reservation.
+
+Also ensure that xfs_log_done always drop the reference on the log ticket,
+to both simplify the code and make the logic in xfs_trans_roll easier
+to understand.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit f78c3901074e113a04150230087f1d76033bb0a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_cil.c
+#	fs/xfs/xfs_trans.c
+diff --cc fs/xfs/xfs_log_cil.c
+index a8d75ff47029,abc2ccbff739..000000000000
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@@ -783,10 -777,6 +783,13 @@@ xfs_log_commit_cil
+  {
+  	struct xlog		*log = mp->m_log;
+  	struct xfs_cil		*cil = log->l_cilp;
+++<<<<<<< HEAD
+ +	int			log_flags = 0;
+ +
+ +	if (flags & XFS_TRANS_RELEASE_LOG_RES)
+ +		log_flags = XFS_LOG_REL_PERM_RESERV;
+++=======
+++>>>>>>> f78c3901074e (xfs: fix xfs_log_done interface)
+  
+  	/* lock out background commit */
+  	down_read(&cil->xc_ctx_lock);
+diff --cc fs/xfs/xfs_trans.c
+index 42a1adf81dad,0582a27107d4..000000000000
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@@ -964,7 -947,7 +957,11 @@@ out_unreserve
+  	 */
+  	xfs_trans_unreserve_and_mod_dquots(tp);
+  	if (tp->t_ticket) {
+++<<<<<<< HEAD
+ +		commit_lsn = xfs_log_done(mp, tp->t_ticket, NULL, log_flags);
+++=======
++ 		commit_lsn = xfs_log_done(mp, tp->t_ticket, NULL, regrant);
+++>>>>>>> f78c3901074e (xfs: fix xfs_log_done interface)
+  		if (commit_lsn == -1 && !error)
+  			error = -EIO;
+  	}
+@@@ -1018,15 -1001,8 +1015,20 @@@ xfs_trans_cancel
+  	xfs_trans_unreserve_and_mod_sb(tp);
+  	xfs_trans_unreserve_and_mod_dquots(tp);
+  
+++<<<<<<< HEAD
+ +	if (tp->t_ticket) {
+ +		if (flags & XFS_TRANS_RELEASE_LOG_RES) {
+ +			ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+ +			log_flags = XFS_LOG_REL_PERM_RESERV;
+ +		} else {
+ +			log_flags = 0;
+ +		}
+ +		xfs_log_done(mp, tp->t_ticket, NULL, log_flags);
+ +	}
+++=======
++ 	if (tp->t_ticket)
++ 		xfs_log_done(mp, tp->t_ticket, NULL, false);
+++>>>>>>> f78c3901074e (xfs: fix xfs_log_done interface)
+  
+  	/* mark this thread as no longer being in a transaction */
+  	current_restore_flags_nested(&tp->t_pflags, PF_FSTRANS);
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 3dfa2dbca48d..19ea74052e26 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -513,7 +513,7 @@ xfs_log_done(
+ 	struct xfs_mount	*mp,
+ 	struct xlog_ticket	*ticket,
+ 	struct xlog_in_core	**iclog,
+-	uint			flags)
++	bool			regrant)
+ {
+ 	struct xlog		*log = mp->m_log;
+ 	xfs_lsn_t		lsn = 0;
+@@ -526,14 +526,11 @@ xfs_log_done(
+ 	    (((ticket->t_flags & XLOG_TIC_INITED) == 0) &&
+ 	     (xlog_commit_record(log, ticket, iclog, &lsn)))) {
+ 		lsn = (xfs_lsn_t) -1;
+-		if (ticket->t_flags & XLOG_TIC_PERM_RESERV) {
+-			flags |= XFS_LOG_REL_PERM_RESERV;
+-		}
++		regrant = false;
+ 	}
+ 
+ 
+-	if ((ticket->t_flags & XLOG_TIC_PERM_RESERV) == 0 ||
+-	    (flags & XFS_LOG_REL_PERM_RESERV)) {
++	if (!regrant) {
+ 		trace_xfs_log_done_nonperm(log, ticket);
+ 
+ 		/*
+@@ -541,7 +538,6 @@ xfs_log_done(
+ 		 * request has been made to release a permanent reservation.
+ 		 */
+ 		xlog_ungrant_log_space(log, ticket);
+-		xfs_log_ticket_put(ticket);
+ 	} else {
+ 		trace_xfs_log_done_perm(log, ticket);
+ 
+@@ -553,6 +549,7 @@ xfs_log_done(
+ 		ticket->t_flags |= XLOG_TIC_INITED;
+ 	}
+ 
++	xfs_log_ticket_put(ticket);
+ 	return lsn;
+ }
+ 
+diff --git a/fs/xfs/xfs_log.h b/fs/xfs/xfs_log.h
+index 84e0deb95abd..140b1828d42d 100644
+--- a/fs/xfs/xfs_log.h
++++ b/fs/xfs/xfs_log.h
+@@ -110,15 +110,6 @@ static inline xfs_lsn_t	_lsn_cmp(xfs_lsn_t lsn1, xfs_lsn_t lsn2)
+ 
+ #define	XFS_LSN_CMP(x,y) _lsn_cmp(x,y)
+ 
+-/*
+- * Macros, structures, prototypes for interface to the log manager.
+- */
+-
+-/*
+- * Flags to xfs_log_done()
+- */
+-#define XFS_LOG_REL_PERM_RESERV	0x1
+-
+ /*
+  * Flags to xfs_log_force()
+  *
+@@ -138,7 +129,7 @@ struct xfs_log_callback;
+ xfs_lsn_t xfs_log_done(struct xfs_mount *mp,
+ 		       struct xlog_ticket *ticket,
+ 		       struct xlog_in_core **iclog,
+-		       uint		flags);
++		       bool regrant);
+ int	  _xfs_log_force(struct xfs_mount *mp,
+ 			 uint		flags,
+ 			 int		*log_forced);
+* Unmerged path fs/xfs/xfs_log_cil.c
+* Unmerged path fs/xfs/xfs_trans.c
