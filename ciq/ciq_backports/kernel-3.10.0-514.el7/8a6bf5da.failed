@@ -1,0 +1,192 @@
+netfilter: nft_masq: support port range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 8a6bf5da1aefdafd60b73d9122c7af9fd2d7bb9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8a6bf5da.failed
+
+Complete masquerading support by allowing port range selection.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8a6bf5da1aefdafd60b73d9122c7af9fd2d7bb9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/nft_masq_ipv4.c
+#	net/ipv6/netfilter/nft_masq_ipv6.c
+diff --cc net/ipv4/netfilter/nft_masq_ipv4.c
+index 665de06561cd,51ced81b616c..000000000000
+--- a/net/ipv4/netfilter/nft_masq_ipv4.c
++++ b/net/ipv4/netfilter/nft_masq_ipv4.c
+@@@ -26,11 -25,14 +26,22 @@@ static void nft_masq_ipv4_eval(const st
+  
+  	memset(&range, 0, sizeof(range));
+  	range.flags = priv->flags;
+++<<<<<<< HEAD
+ +
+ +	verdict = nf_nat_masquerade_ipv4(pkt->skb, pkt->ops->hooknum,
+ +					 &range, pkt->out);
+ +
+ +	data[NFT_REG_VERDICT].verdict = verdict;
+++=======
++ 	if (priv->sreg_proto_min) {
++ 		range.min_proto.all =
++ 			*(__be16 *)&regs->data[priv->sreg_proto_min];
++ 		range.max_proto.all =
++ 			*(__be16 *)&regs->data[priv->sreg_proto_max];
++ 	}
++ 	regs->verdict.code = nf_nat_masquerade_ipv4(pkt->skb, pkt->hook,
++ 						    &range, pkt->out);
+++>>>>>>> 8a6bf5da1aef (netfilter: nft_masq: support port range)
+  }
+  
+  static struct nft_expr_type nft_masq_ipv4_type;
+diff --cc net/ipv6/netfilter/nft_masq_ipv6.c
+index 529c119cbb14,9597ffb74077..000000000000
+--- a/net/ipv6/netfilter/nft_masq_ipv6.c
++++ b/net/ipv6/netfilter/nft_masq_ipv6.c
+@@@ -27,10 -26,13 +27,20 @@@ static void nft_masq_ipv6_eval(const st
+  
+  	memset(&range, 0, sizeof(range));
+  	range.flags = priv->flags;
+++<<<<<<< HEAD
+ +
+ +	verdict = nf_nat_masquerade_ipv6(pkt->skb, &range, pkt->out);
+ +
+ +	data[NFT_REG_VERDICT].verdict = verdict;
+++=======
++ 	if (priv->sreg_proto_min) {
++ 		range.min_proto.all =
++ 			*(__be16 *)&regs->data[priv->sreg_proto_min];
++ 		range.max_proto.all =
++ 			*(__be16 *)&regs->data[priv->sreg_proto_max];
++ 	}
++ 	regs->verdict.code = nf_nat_masquerade_ipv6(pkt->skb, &range, pkt->out);
+++>>>>>>> 8a6bf5da1aef (netfilter: nft_masq: support port range)
+  }
+  
+  static struct nft_expr_type nft_masq_ipv6_type;
+diff --git a/include/net/netfilter/nft_masq.h b/include/net/netfilter/nft_masq.h
+index e2a518b60e19..a3f3c11b2526 100644
+--- a/include/net/netfilter/nft_masq.h
++++ b/include/net/netfilter/nft_masq.h
+@@ -2,7 +2,9 @@
+ #define _NFT_MASQ_H_
+ 
+ struct nft_masq {
+-	u32	flags;
++	u32			flags;
++	enum nft_registers      sreg_proto_min:8;
++	enum nft_registers      sreg_proto_max:8;
+ };
+ 
+ extern const struct nla_policy nft_masq_policy[];
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index afe2956590fb..98d6d6d280f8 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -859,10 +859,14 @@ enum nft_nat_attributes {
+  * enum nft_masq_attributes - nf_tables masquerade expression attributes
+  *
+  * @NFTA_MASQ_FLAGS: NAT flags (see NF_NAT_RANGE_* in linux/netfilter/nf_nat.h) (NLA_U32)
++ * @NFTA_MASQ_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
++ * @NFTA_MASQ_REG_PROTO_MAX: source register of proto range end (NLA_U32: nft_registers)
+  */
+ enum nft_masq_attributes {
+ 	NFTA_MASQ_UNSPEC,
+ 	NFTA_MASQ_FLAGS,
++	NFTA_MASQ_REG_PROTO_MIN,
++	NFTA_MASQ_REG_PROTO_MAX,
+ 	__NFTA_MASQ_MAX
+ };
+ #define NFTA_MASQ_MAX		(__NFTA_MASQ_MAX - 1)
+* Unmerged path net/ipv4/netfilter/nft_masq_ipv4.c
+* Unmerged path net/ipv6/netfilter/nft_masq_ipv6.c
+diff --git a/net/netfilter/nft_masq.c b/net/netfilter/nft_masq.c
+index 9aea747b43ea..81b5ad6165ac 100644
+--- a/net/netfilter/nft_masq.c
++++ b/net/netfilter/nft_masq.c
+@@ -17,7 +17,9 @@
+ #include <net/netfilter/nft_masq.h>
+ 
+ const struct nla_policy nft_masq_policy[NFTA_MASQ_MAX + 1] = {
+-	[NFTA_MASQ_FLAGS]	= { .type = NLA_U32 },
++	[NFTA_MASQ_FLAGS]		= { .type = NLA_U32 },
++	[NFTA_MASQ_REG_PROTO_MIN]	= { .type = NLA_U32 },
++	[NFTA_MASQ_REG_PROTO_MAX]	= { .type = NLA_U32 },
+ };
+ EXPORT_SYMBOL_GPL(nft_masq_policy);
+ 
+@@ -40,6 +42,7 @@ int nft_masq_init(const struct nft_ctx *ctx,
+ 		  const struct nft_expr *expr,
+ 		  const struct nlattr * const tb[])
+ {
++	u32 plen = FIELD_SIZEOF(struct nf_nat_range, min_addr.all);
+ 	struct nft_masq *priv = nft_expr_priv(expr);
+ 	int err;
+ 
+@@ -47,12 +50,32 @@ int nft_masq_init(const struct nft_ctx *ctx,
+ 	if (err)
+ 		return err;
+ 
+-	if (tb[NFTA_MASQ_FLAGS] == NULL)
+-		return 0;
+-
+-	priv->flags = ntohl(nla_get_be32(tb[NFTA_MASQ_FLAGS]));
+-	if (priv->flags & ~NF_NAT_RANGE_MASK)
+-		return -EINVAL;
++	if (tb[NFTA_MASQ_FLAGS]) {
++		priv->flags = ntohl(nla_get_be32(tb[NFTA_MASQ_FLAGS]));
++		if (priv->flags & ~NF_NAT_RANGE_MASK)
++			return -EINVAL;
++	}
++
++	if (tb[NFTA_MASQ_REG_PROTO_MIN]) {
++		priv->sreg_proto_min =
++			nft_parse_register(tb[NFTA_MASQ_REG_PROTO_MIN]);
++
++		err = nft_validate_register_load(priv->sreg_proto_min, plen);
++		if (err < 0)
++			return err;
++
++		if (tb[NFTA_MASQ_REG_PROTO_MAX]) {
++			priv->sreg_proto_max =
++				nft_parse_register(tb[NFTA_MASQ_REG_PROTO_MAX]);
++
++			err = nft_validate_register_load(priv->sreg_proto_max,
++							 plen);
++			if (err < 0)
++				return err;
++		} else {
++			priv->sreg_proto_max = priv->sreg_proto_min;
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -62,12 +85,18 @@ int nft_masq_dump(struct sk_buff *skb, const struct nft_expr *expr)
+ {
+ 	const struct nft_masq *priv = nft_expr_priv(expr);
+ 
+-	if (priv->flags == 0)
+-		return 0;
+-
+-	if (nla_put_be32(skb, NFTA_MASQ_FLAGS, htonl(priv->flags)))
++	if (priv->flags != 0 &&
++	    nla_put_be32(skb, NFTA_MASQ_FLAGS, htonl(priv->flags)))
+ 		goto nla_put_failure;
+ 
++	if (priv->sreg_proto_min) {
++		if (nft_dump_register(skb, NFTA_MASQ_REG_PROTO_MIN,
++				      priv->sreg_proto_min) ||
++		    nft_dump_register(skb, NFTA_MASQ_REG_PROTO_MAX,
++				      priv->sreg_proto_max))
++			goto nla_put_failure;
++	}
++
+ 	return 0;
+ 
+ nla_put_failure:
