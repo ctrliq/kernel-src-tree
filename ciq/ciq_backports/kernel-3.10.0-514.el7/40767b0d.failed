@@ -1,0 +1,376 @@
+sched/deadline: Fix deadline parameter modification handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 40767b0dc768060266d261b4a330164b4be53f7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/40767b0d.failed
+
+Commit 67dfa1b756f2 ("sched/deadline: Implement cancel_dl_timer() to
+use in switched_from_dl()") removed the hrtimer_try_cancel() function
+call out from init_dl_task_timer(), which gets called from
+__setparam_dl().
+
+The result is that we can now re-init the timer while its active --
+this is bad and corrupts timer state.
+
+Furthermore; changing the parameters of an active deadline task is
+tricky in that you want to maintain guarantees, while immediately
+effective change would allow one to circumvent the CBS guarantees --
+this too is bad, as one (bad) task should not be able to affect the
+others.
+
+Rework things to avoid both problems. We only need to initialize the
+timer once, so move that to __sched_fork() for new tasks.
+
+Then make sure __setparam_dl() doesn't affect the current running
+state but only updates the parameters used to calculate the next
+scheduling period -- this guarantees the CBS functions as expected
+(albeit slightly pessimistic).
+
+This however means we need to make sure __dl_clear_params() needs to
+reset the active state otherwise new (and tasks flipping between
+classes) will not properly (re)compute their first instance.
+
+Todo: close class flipping CBS hole.
+Todo: implement delayed BW release.
+
+	Reported-by: Luca Abeni <luca.abeni@unitn.it>
+	Acked-by: Juri Lelli <juri.lelli@arm.com>
+	Tested-by: Luca Abeni <luca.abeni@unitn.it>
+Fixes: 67dfa1b756f2 ("sched/deadline: Implement cancel_dl_timer() to use in switched_from_dl()")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: <stable@vger.kernel.org>
+	Cc: Kirill Tkhai <tkhai@yandex.ru>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20150128140803.GF23038@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 40767b0dc768060266d261b4a330164b4be53f7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+diff --cc kernel/sched/core.c
+index f8654b1100de,9e838095beb8..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1797,6 -1803,24 +1797,27 @@@ int wake_up_state(struct task_struct *p
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * This function clears the sched_dl_entity static params.
++  */
++ void __dl_clear_params(struct task_struct *p)
++ {
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	dl_se->dl_runtime = 0;
++ 	dl_se->dl_deadline = 0;
++ 	dl_se->dl_period = 0;
++ 	dl_se->flags = 0;
++ 	dl_se->dl_bw = 0;
++ 
++ 	dl_se->dl_throttled = 0;
++ 	dl_se->dl_new = 1;
++ 	dl_se->dl_yielded = 0;
++ }
++ 
++ /*
+++>>>>>>> 40767b0dc768 (sched/deadline: Fix deadline parameter modification handling)
+   * Perform scheduler related setup for a newly forked process p.
+   * p is forked by current.
+   *
+@@@ -1827,6 -1842,10 +1848,13 @@@ static void __sched_fork(unsigned long 
+  	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	RB_CLEAR_NODE(&p->dl.rb_node);
++ 	init_dl_task_timer(&p->dl);
++ 	__dl_clear_params(p);
++ 
+++>>>>>>> 40767b0dc768 (sched/deadline: Fix deadline parameter modification handling)
+  	INIT_LIST_HEAD(&p->rt.run_list);
+  
+  #ifdef CONFIG_PREEMPT_NOTIFIERS
+@@@ -1974,8 -1994,109 +2002,110 @@@ void sched_fork(unsigned long clone_fla
+  #endif
+  
+  	put_cpu();
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ unsigned long to_ratio(u64 period, u64 runtime)
++ {
++ 	if (runtime == RUNTIME_INF)
++ 		return 1ULL << 20;
++ 
++ 	/*
++ 	 * Doing this here saves a lot of checks in all
++ 	 * the calling paths, and returning zero seems
++ 	 * safe for them anyway.
++ 	 */
++ 	if (period == 0)
++ 		return 0;
++ 
++ 	return div64_u64(runtime << 20, period);
++ }
++ 
++ #ifdef CONFIG_SMP
++ inline struct dl_bw *dl_bw_of(int i)
++ {
++ 	rcu_lockdep_assert(rcu_read_lock_sched_held(),
++ 			   "sched RCU must be held");
++ 	return &cpu_rq(i)->rd->dl_bw;
++ }
++ 
++ static inline int dl_bw_cpus(int i)
++ {
++ 	struct root_domain *rd = cpu_rq(i)->rd;
++ 	int cpus = 0;
++ 
++ 	rcu_lockdep_assert(rcu_read_lock_sched_held(),
++ 			   "sched RCU must be held");
++ 	for_each_cpu_and(i, rd->span, cpu_active_mask)
++ 		cpus++;
++ 
++ 	return cpus;
++ }
++ #else
++ inline struct dl_bw *dl_bw_of(int i)
++ {
++ 	return &cpu_rq(i)->dl.dl_bw;
++ }
++ 
++ static inline int dl_bw_cpus(int i)
++ {
++ 	return 1;
++ }
++ #endif
++ 
++ /*
++  * We must be sure that accepting a new task (or allowing changing the
++  * parameters of an existing one) is consistent with the bandwidth
++  * constraints. If yes, this function also accordingly updates the currently
++  * allocated bandwidth to reflect the new situation.
++  *
++  * This function is called while holding p's rq->lock.
++  *
++  * XXX we should delay bw change until the task's 0-lag point, see
++  * __setparam_dl().
++  */
++ static int dl_overflow(struct task_struct *p, int policy,
++ 		       const struct sched_attr *attr)
++ {
++ 
++ 	struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
++ 	u64 period = attr->sched_period ?: attr->sched_deadline;
++ 	u64 runtime = attr->sched_runtime;
++ 	u64 new_bw = dl_policy(policy) ? to_ratio(period, runtime) : 0;
++ 	int cpus, err = -1;
++ 
++ 	if (new_bw == p->dl.dl_bw)
++ 		return 0;
++ 
++ 	/*
++ 	 * Either if a task, enters, leave, or stays -deadline but changes
++ 	 * its parameters, we may need to update accordingly the total
++ 	 * allocated bandwidth of the container.
++ 	 */
++ 	raw_spin_lock(&dl_b->lock);
++ 	cpus = dl_bw_cpus(task_cpu(p));
++ 	if (dl_policy(policy) && !task_has_dl_policy(p) &&
++ 	    !__dl_overflow(dl_b, cpus, 0, new_bw)) {
++ 		__dl_add(dl_b, new_bw);
++ 		err = 0;
++ 	} else if (dl_policy(policy) && task_has_dl_policy(p) &&
++ 		   !__dl_overflow(dl_b, cpus, p->dl.dl_bw, new_bw)) {
++ 		__dl_clear(dl_b, p->dl.dl_bw);
++ 		__dl_add(dl_b, new_bw);
++ 		err = 0;
++ 	} else if (!dl_policy(policy) && task_has_dl_policy(p)) {
++ 		__dl_clear(dl_b, p->dl.dl_bw);
++ 		err = 0;
++ 	}
++ 	raw_spin_unlock(&dl_b->lock);
++ 
++ 	return err;
++ }
++ 
++ extern void init_dl_bw(struct dl_bw *dl_b);
++ 
+++>>>>>>> 40767b0dc768 (sched/deadline: Fix deadline parameter modification handling)
+  /*
+   * wake_up_new_task - wake up a newly created task for the first time.
+   *
+@@@ -4083,20 -3245,148 +4213,66 @@@ static struct task_struct *find_process
+  	return pid ? find_task_by_vpid(pid) : current;
+  }
+  
+ -/*
+ - * This function initializes the sched_dl_entity of a newly becoming
+ - * SCHED_DEADLINE task.
+ - *
+ - * Only the static values are considered here, the actual runtime and the
+ - * absolute deadline will be properly calculated when the task is enqueued
+ - * for the first time with its new policy.
+ - */
+ +/* Actually do priority change: must hold rq lock. */
+  static void
+ -__setparam_dl(struct task_struct *p, const struct sched_attr *attr)
+ +__setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct sched_dl_entity *dl_se = &p->dl;
++ 
++ 	dl_se->dl_runtime = attr->sched_runtime;
++ 	dl_se->dl_deadline = attr->sched_deadline;
++ 	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
++ 	dl_se->flags = attr->sched_flags;
++ 	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
++ 
++ 	/*
++ 	 * Changing the parameters of a task is 'tricky' and we're not doing
++ 	 * the correct thing -- also see task_dead_dl() and switched_from_dl().
++ 	 *
++ 	 * What we SHOULD do is delay the bandwidth release until the 0-lag
++ 	 * point. This would include retaining the task_struct until that time
++ 	 * and change dl_overflow() to not immediately decrement the current
++ 	 * amount.
++ 	 *
++ 	 * Instead we retain the current runtime/deadline and let the new
++ 	 * parameters take effect after the current reservation period lapses.
++ 	 * This is safe (albeit pessimistic) because the 0-lag point is always
++ 	 * before the current scheduling deadline.
++ 	 *
++ 	 * We can still have temporary overloads because we do not delay the
++ 	 * change in bandwidth until that time; so admission control is
++ 	 * not on the safe side. It does however guarantee tasks will never
++ 	 * consume more than promised.
++ 	 */
++ }
++ 
++ /*
++  * sched_setparam() passes in -1 for its policy, to let the functions
++  * it calls know not to change it.
++  */
++ #define SETPARAM_POLICY	-1
++ 
++ static void __setscheduler_params(struct task_struct *p,
++ 		const struct sched_attr *attr)
++ {
++ 	int policy = attr->sched_policy;
++ 
++ 	if (policy == SETPARAM_POLICY)
++ 		policy = p->policy;
++ 
+++>>>>>>> 40767b0dc768 (sched/deadline: Fix deadline parameter modification handling)
+  	p->policy = policy;
+ -
+ -	if (dl_policy(policy))
+ -		__setparam_dl(p, attr);
+ -	else if (fair_policy(policy))
+ -		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ -
+ -	/*
+ -	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+ -	 * !rt_policy. Always setting this ensures that things like
+ -	 * getparam()/getattr() don't report silly values for !rt tasks.
+ -	 */
+ -	p->rt_priority = attr->sched_priority;
+ +	p->rt_priority = prio;
+  	p->normal_prio = normal_prio(p);
+ -	set_load_weight(p);
+ -}
+ -
+ -/* Actually do priority change: must hold pi & rq lock. */
+ -static void __setscheduler(struct rq *rq, struct task_struct *p,
+ -			   const struct sched_attr *attr)
+ -{
+ -	__setscheduler_params(p, attr);
+ -
+ -	/*
+ -	 * If we get here, there was no pi waiters boosting the
+ -	 * task. It is safe to use the normal prio.
+ -	 */
+ -	p->prio = normal_prio(p);
+ -
+ -	if (dl_prio(p->prio))
+ -		p->sched_class = &dl_sched_class;
+ -	else if (rt_prio(p->prio))
+ +	/* we are holding p->pi_lock already */
+ +	p->prio = rt_mutex_getprio(p);
+ +	if (rt_prio(p->prio))
+  		p->sched_class = &rt_sched_class;
+  	else
+ -		p->sched_class = &fair_sched_class;
+ -}
+ -
+ -static void
+ -__getparam_dl(struct task_struct *p, struct sched_attr *attr)
+ -{
+ -	struct sched_dl_entity *dl_se = &p->dl;
+ -
+ -	attr->sched_priority = p->rt_priority;
+ -	attr->sched_runtime = dl_se->dl_runtime;
+ -	attr->sched_deadline = dl_se->dl_deadline;
+ -	attr->sched_period = dl_se->dl_period;
+ -	attr->sched_flags = dl_se->flags;
+ -}
+ -
+ -/*
+ - * This function validates the new parameters of a -deadline task.
+ - * We ask for the deadline not being zero, and greater or equal
+ - * than the runtime, as well as the period of being zero or
+ - * greater than deadline. Furthermore, we have to be sure that
+ - * user parameters are above the internal resolution of 1us (we
+ - * check sched_runtime only since it is always the smaller one) and
+ - * below 2^63 ns (we have to check both sched_deadline and
+ - * sched_period, as the latter can be zero).
+ - */
+ -static bool
+ -__checkparam_dl(const struct sched_attr *attr)
+ -{
+ -	/* deadline != 0 */
+ -	if (attr->sched_deadline == 0)
+ -		return false;
+ -
+ -	/*
+ -	 * Since we truncate DL_SCALE bits, make sure we're at least
+ -	 * that big.
+ -	 */
+ -	if (attr->sched_runtime < (1ULL << DL_SCALE))
+ -		return false;
+ -
+ -	/*
+ -	 * Since we use the MSB for wrap-around and sign issues, make
+ -	 * sure it's not set (mind that period can be equal to zero).
+ -	 */
+ -	if (attr->sched_deadline & (1ULL << 63) ||
+ -	    attr->sched_period & (1ULL << 63))
+ -		return false;
+ -
+ -	/* runtime <= deadline <= period (if period != 0) */
+ -	if ((attr->sched_period != 0 &&
+ -	     attr->sched_period < attr->sched_deadline) ||
+ -	    attr->sched_deadline < attr->sched_runtime)
+ -		return false;
+ -
+ -	return true;
+ +		p->sched_class = &fair_sched_class;
+ +	set_load_weight(p);
+  }
+  
+  /*
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
