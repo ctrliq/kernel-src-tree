@@ -1,0 +1,173 @@
+e820, efi: add ACPI 6.0 persistent memory types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit ad5fb870c486d932a1749d7853dd70f436a7e03f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ad5fb870.failed
+
+ACPI 6.0 formalizes e820-type-7 and efi-type-14 as persistent memory.
+Mark it "reserved" and allow it to be claimed by a persistent memory
+device driver.
+
+This definition is in addition to the Linux kernel's existing type-12
+definition that was recently added in support of shipping platforms with
+NVDIMM support that predate ACPI 6.0 (which now classifies type-12 as
+OEM reserved).
+
+Note, /proc/iomem can be consulted for differentiating legacy
+"Persistent Memory (legacy)" E820_PRAM vs standard "Persistent Memory"
+E820_PMEM.
+
+	Cc: Boaz Harrosh <boaz@plexistor.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Jeff Moyer <jmoyer@redhat.com>
+	Acked-by: Andy Lutomirski <luto@amacapital.net>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit ad5fb870c486d932a1749d7853dd70f436a7e03f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/efi.c
+* Unmerged path arch/arm64/kernel/efi.c
+* Unmerged path arch/arm64/kernel/efi.c
+diff --git a/arch/ia64/kernel/efi.c b/arch/ia64/kernel/efi.c
+index a2cdb0e8e667..1f2406134d37 100644
+--- a/arch/ia64/kernel/efi.c
++++ b/arch/ia64/kernel/efi.c
+@@ -1219,6 +1219,10 @@ efi_initialize_iomem_resources(struct resource *code_resource,
+ 				flags |= IORESOURCE_DISABLED;
+ 				break;
+ 
++			case EFI_PERSISTENT_MEMORY:
++				name = "Persistent Memory";
++				break;
++
+ 			case EFI_RESERVED_TYPE:
+ 			case EFI_RUNTIME_SERVICES_CODE:
+ 			case EFI_RUNTIME_SERVICES_DATA:
+diff --git a/arch/x86/boot/compressed/eboot.c b/arch/x86/boot/compressed/eboot.c
+index 0979cdc9b724..ee92ae5f8c56 100644
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@ -668,6 +668,10 @@ static efi_status_t setup_e820(struct boot_params *params,
+ 			e820_type = E820_NVS;
+ 			break;
+ 
++		case EFI_PERSISTENT_MEMORY:
++			e820_type = E820_PMEM;
++			break;
++
+ 		default:
+ 			continue;
+ 		}
+diff --git a/arch/x86/include/uapi/asm/e820.h b/arch/x86/include/uapi/asm/e820.h
+index 8f7a661d8380..39857421eba3 100644
+--- a/arch/x86/include/uapi/asm/e820.h
++++ b/arch/x86/include/uapi/asm/e820.h
+@@ -37,6 +37,7 @@
+ #define E820_ACPI	3
+ #define E820_NVS	4
+ #define E820_UNUSABLE	5
++#define E820_PMEM	7
+ 
+ /*
+  * This is a non-standardized way to represent ADR or NVDIMM regions that
+diff --git a/arch/x86/kernel/e820.c b/arch/x86/kernel/e820.c
+index 2e3b8b7cbe8f..4b8a615528ed 100644
+--- a/arch/x86/kernel/e820.c
++++ b/arch/x86/kernel/e820.c
+@@ -149,6 +149,7 @@ static void __init e820_print_type(u32 type)
+ 	case E820_UNUSABLE:
+ 		printk(KERN_CONT "unusable");
+ 		break;
++	case E820_PMEM:
+ 	case E820_PRAM:
+ 		printk(KERN_CONT "persistent (type %u)", type);
+ 		break;
+@@ -929,11 +930,32 @@ static inline const char *e820_type_to_string(int e820_type)
+ 	case E820_ACPI:	return "ACPI Tables";
+ 	case E820_NVS:	return "ACPI Non-volatile Storage";
+ 	case E820_UNUSABLE:	return "Unusable memory";
+-	case E820_PRAM: return "Persistent RAM";
++	case E820_PRAM: return "Persistent Memory (legacy)";
++	case E820_PMEM: return "Persistent Memory";
+ 	default:	return "reserved";
+ 	}
+ }
+ 
++static bool do_mark_busy(u32 type, struct resource *res)
++{
++	/* this is the legacy bios/dos rom-shadow + mmio region */
++	if (res->start < (1ULL<<20))
++		return true;
++
++	/*
++	 * Treat persistent memory like device memory, i.e. reserve it
++	 * for exclusive use of a driver
++	 */
++	switch (type) {
++	case E820_RESERVED:
++	case E820_PRAM:
++	case E820_PMEM:
++		return false;
++	default:
++		return true;
++	}
++}
++
+ /*
+  * Mark e820 reserved areas as busy for the resource manager.
+  */
+@@ -963,9 +985,7 @@ void __init e820_reserve_resources(void)
+ 		 * pci device BAR resource and insert them later in
+ 		 * pcibios_resource_survey()
+ 		 */
+-		if (((e820.map[i].type != E820_RESERVED) &&
+-		     (e820.map[i].type != E820_PRAM)) ||
+-		     res->start < (1ULL<<20)) {
++		if (do_mark_busy(e820.map[i].type, res)) {
+ 			res->flags |= IORESOURCE_BUSY;
+ 			insert_resource(&iomem_resource, res);
+ 		}
+diff --git a/arch/x86/platform/efi/efi.c b/arch/x86/platform/efi/efi.c
+index 4374bb91ee4e..379ee7f1e944 100644
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@ -380,6 +380,9 @@ static void __init do_add_efi_memmap(void)
+ 		case EFI_UNUSABLE_MEMORY:
+ 			e820_type = E820_UNUSABLE;
+ 			break;
++		case EFI_PERSISTENT_MEMORY:
++			e820_type = E820_PMEM;
++			break;
+ 		default:
+ 			/*
+ 			 * EFI_RESERVED_TYPE EFI_RUNTIME_SERVICES_CODE
+diff --git a/include/linux/efi.h b/include/linux/efi.h
+index 03a5aa6e5c5e..1daa12b26964 100644
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -84,7 +84,8 @@ typedef	struct {
+ #define EFI_MEMORY_MAPPED_IO		11
+ #define EFI_MEMORY_MAPPED_IO_PORT_SPACE	12
+ #define EFI_PAL_CODE			13
+-#define EFI_MAX_MEMORY_TYPE		14
++#define EFI_PERSISTENT_MEMORY		14
++#define EFI_MAX_MEMORY_TYPE		15
+ 
+ /* Attribute values: */
+ #define EFI_MEMORY_UC		((u64)0x0000000000000001ULL)	/* uncached */
