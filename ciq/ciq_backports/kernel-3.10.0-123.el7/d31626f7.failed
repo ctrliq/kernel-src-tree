@@ -1,0 +1,676 @@
+powerpc: Don't corrupt transactional state when using FP/VMX in kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [powerpc] Don't corrupt transactional state when using FP/VMX in kernel (Steve Best) [1052083]
+Rebuild_FUZZ: 93.13%
+commit-author Paul Mackerras <paulus@samba.org>
+commit d31626f70b6103f4d9153b75d07e0e8795728cc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/d31626f7.failed
+
+Currently, when we have a process using the transactional memory
+facilities on POWER8 (that is, the processor is in transactional
+or suspended state), and the process enters the kernel and the
+kernel then uses the floating-point or vector (VMX/Altivec) facility,
+we end up corrupting the user-visible FP/VMX/VSX state.  This
+happens, for example, if a page fault causes a copy-on-write
+operation, because the copy_page function will use VMX to do the
+copy on POWER8.  The test program below demonstrates the bug.
+
+The bug happens because when FP/VMX state for a transactional process
+is stored in the thread_struct, we store the checkpointed state in
+.fp_state/.vr_state and the transactional (current) state in
+.transact_fp/.transact_vr.  However, when the kernel wants to use
+FP/VMX, it calls enable_kernel_fp() or enable_kernel_altivec(),
+which saves the current state in .fp_state/.vr_state.  Furthermore,
+when we return to the user process we return with FP/VMX/VSX
+disabled.  The next time the process uses FP/VMX/VSX, we don't know
+which set of state (the current register values, .fp_state/.vr_state,
+or .transact_fp/.transact_vr) we should be using, since we have no
+way to tell if we are still in the same transaction, and if not,
+whether the previous transaction succeeded or failed.
+
+Thus it is necessary to strictly adhere to the rule that if FP has
+been enabled at any point in a transaction, we must keep FP enabled
+for the user process with the current transactional state in the
+FP registers, until we detect that it is no longer in a transaction.
+Similarly for VMX; once enabled it must stay enabled until the
+process is no longer transactional.
+
+In order to keep this rule, we add a new thread_info flag which we
+test when returning from the kernel to userspace, called TIF_RESTORE_TM.
+This flag indicates that there is FP/VMX/VSX state to be restored
+before entering userspace, and when it is set the .tm_orig_msr field
+in the thread_struct indicates what state needs to be restored.
+The restoration is done by restore_tm_state().  The TIF_RESTORE_TM
+bit is set by new giveup_fpu/altivec_maybe_transactional helpers,
+which are called from enable_kernel_fp/altivec, giveup_vsx, and
+flush_fp/altivec_to_thread instead of giveup_fpu/altivec.
+
+The other thing to be done is to get the transactional FP/VMX/VSX
+state from .fp_state/.vr_state when doing reclaim, if that state
+has been saved there by giveup_fpu/altivec_maybe_transactional.
+Having done this, we set the FP/VMX bit in the thread's MSR after
+reclaim to indicate that that part of the state is now valid
+(having been reclaimed from the processor's checkpointed state).
+
+Finally, in the signal handling code, we move the clearing of the
+transactional state bits in the thread's MSR a bit earlier, before
+calling flush_fp_to_thread(), so that we don't unnecessarily set
+the TIF_RESTORE_TM bit.
+
+This is the test program:
+
+/* Michael Neuling 4/12/2013
+ *
+ * See if the altivec state is leaked out of an aborted transaction due to
+ * kernel vmx copy loops.
+ *
+ *   gcc -m64 htm_vmxcopy.c -o htm_vmxcopy
+ *
+ */
+
+/* We don't use all of these, but for reference: */
+
+int main(int argc, char *argv[])
+{
+	long double vecin = 1.3;
+	long double vecout;
+	unsigned long pgsize = getpagesize();
+	int i;
+	int fd;
+	int size = pgsize*16;
+	char tmpfile[] = "/tmp/page_faultXXXXXX";
+	char buf[pgsize];
+	char *a;
+	uint64_t aborted = 0;
+
+	fd = mkstemp(tmpfile);
+	assert(fd >= 0);
+
+	memset(buf, 0, pgsize);
+	for (i = 0; i < size; i += pgsize)
+		assert(write(fd, buf, pgsize) == pgsize);
+
+	unlink(tmpfile);
+
+	a = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+	assert(a != MAP_FAILED);
+
+	asm __volatile__(
+		"lxvd2x 40,0,%[vecinptr] ; " // set 40 to initial value
+		TBEGIN
+		"beq	3f ;"
+		TSUSPEND
+		"xxlxor 40,40,40 ; " // set 40 to 0
+		"std	5, 0(%[map]) ;" // cause kernel vmx copy page
+		TABORT
+		TRESUME
+		TEND
+		"li	%[res], 0 ;"
+		"b	5f ;"
+		"3: ;" // Abort handler
+		"li	%[res], 1 ;"
+		"5: ;"
+		"stxvd2x 40,0,%[vecoutptr] ; "
+		: [res]"=r"(aborted)
+		: [vecinptr]"r"(&vecin),
+		  [vecoutptr]"r"(&vecout),
+		  [map]"r"(a)
+		: "memory", "r0", "r3", "r4", "r5", "r6", "r7");
+
+	if (aborted && (vecin != vecout)){
+		printf("FAILED: vector state leaked on abort %f != %f\n",
+		       (double)vecin, (double)vecout);
+		exit(1);
+	}
+
+	munmap(a, size);
+
+	close(fd);
+
+	printf("PASSED!\n");
+	return 0;
+}
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit d31626f70b6103f4d9153b75d07e0e8795728cc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/processor.h
+#	arch/powerpc/kernel/fpu.S
+#	arch/powerpc/kernel/signal_32.c
+#	arch/powerpc/kernel/signal_64.c
+#	arch/powerpc/kernel/vector.S
+diff --cc arch/powerpc/include/asm/processor.h
+index 419e7125cce2,232a2fa5b483..000000000000
+--- a/arch/powerpc/include/asm/processor.h
++++ b/arch/powerpc/include/asm/processor.h
+@@@ -363,6 -373,13 +363,16 @@@ extern int set_endian(struct task_struc
+  extern int get_unalign_ctl(struct task_struct *tsk, unsigned long adr);
+  extern int set_unalign_ctl(struct task_struct *tsk, unsigned int val);
+  
+++<<<<<<< HEAD
+++=======
++ extern void fp_enable(void);
++ extern void vec_enable(void);
++ extern void load_fp_state(struct thread_fp_state *fp);
++ extern void store_fp_state(struct thread_fp_state *fp);
++ extern void load_vr_state(struct thread_vr_state *vr);
++ extern void store_vr_state(struct thread_vr_state *vr);
++ 
+++>>>>>>> d31626f70b61 (powerpc: Don't corrupt transactional state when using FP/VMX in kernel)
+  static inline unsigned int __unpack_fe01(unsigned long msr_bits)
+  {
+  	return ((msr_bits & MSR_FE0) >> 10) | ((msr_bits & MSR_FE1) >> 8);
+diff --cc arch/powerpc/kernel/fpu.S
+index caeaabf11a2f,9ad236e5d2c9..000000000000
+--- a/arch/powerpc/kernel/fpu.S
++++ b/arch/powerpc/kernel/fpu.S
+@@@ -117,6 -81,42 +117,45 @@@ END_FTR_SECTION_IFSET(CPU_FTR_VSX
+  #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Enable use of the FPU, and VSX if possible, for the caller.
++  */
++ _GLOBAL(fp_enable)
++ 	mfmsr	r3
++ 	ori	r3,r3,MSR_FP
++ #ifdef CONFIG_VSX
++ BEGIN_FTR_SECTION
++ 	oris	r3,r3,MSR_VSX@h
++ END_FTR_SECTION_IFSET(CPU_FTR_VSX)
++ #endif
++ 	SYNC
++ 	MTMSRD(r3)
++ 	isync			/* (not necessary for arch 2.02 and later) */
++ 	blr
++ 
++ /*
++  * Load state from memory into FP registers including FPSCR.
++  * Assumes the caller has enabled FP in the MSR.
++  */
++ _GLOBAL(load_fp_state)
++ 	lfd	fr0,FPSTATE_FPSCR(r3)
++ 	MTFSF_L(fr0)
++ 	REST_32FPVSRS(0, R4, R3)
++ 	blr
++ 
++ /*
++  * Store FP state into memory, including FPSCR
++  * Assumes the caller has enabled FP in the MSR.
++  */
++ _GLOBAL(store_fp_state)
++ 	SAVE_32FPVSRS(0, R4, R3)
++ 	mffs	fr0
++ 	stfd	fr0,FPSTATE_FPSCR(r3)
++ 	blr
++ 
++ /*
+++>>>>>>> d31626f70b61 (powerpc: Don't corrupt transactional state when using FP/VMX in kernel)
+   * This task wants to use the FPU now.
+   * On UP, disable FP for the task which had the FPU previously,
+   * and save its floating-point registers in its thread_struct.
+diff --cc arch/powerpc/kernel/signal_32.c
+index 323309963cd3,6ce69e6f1fcb..000000000000
+--- a/arch/powerpc/kernel/signal_32.c
++++ b/arch/powerpc/kernel/signal_32.c
+@@@ -1044,15 -1060,9 +1051,19 @@@ int handle_rt_signal32(unsigned long si
+  	regs->gpr[5] = (unsigned long) &rt_sf->uc;
+  	regs->gpr[6] = (unsigned long) rt_sf;
+  	regs->nip = (unsigned long) ka->sa.sa_handler;
+ -	/* enter the signal handler in native-endian mode */
+ +	/* enter the signal handler in big-endian mode */
+  	regs->msr &= ~MSR_LE;
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ +	/* Remove TM bits from thread's MSR.  The MSR in the sigcontext
+ +	 * just indicates to userland that we were doing a transaction, but we
+ +	 * don't want to return in transactional state:
+ +	 */
+ +	regs->msr &= ~MSR_TS_MASK;
+ +#endif
+++=======
++ 	regs->msr |= (MSR_KERNEL & MSR_LE);
+++>>>>>>> d31626f70b61 (powerpc: Don't corrupt transactional state when using FP/VMX in kernel)
+  	return 1;
+  
+  badframe:
+diff --cc arch/powerpc/kernel/signal_64.c
+index 887e99d85bc2,e35bf773df7a..000000000000
+--- a/arch/powerpc/kernel/signal_64.c
++++ b/arch/powerpc/kernel/signal_64.c
+@@@ -741,14 -755,7 +748,18 @@@ int handle_rt_signal64(int signr, struc
+  		goto badframe;
+  
+  	/* Make sure signal handler doesn't get spurious FP exceptions */
+++<<<<<<< HEAD
+ +	current->thread.fpscr.val = 0;
+ +#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ +	/* Remove TM bits from thread's MSR.  The MSR in the sigcontext
+ +	 * just indicates to userland that we were doing a transaction, but we
+ +	 * don't want to return in transactional state:
+ +	 */
+ +	regs->msr &= ~MSR_TS_MASK;
+ +#endif
+++=======
++ 	current->thread.fp_state.fpscr = 0;
+++>>>>>>> d31626f70b61 (powerpc: Don't corrupt transactional state when using FP/VMX in kernel)
+  
+  	/* Set up to return from userspace. */
+  	if (vdso64_rt_sigtramp && current->mm->context.vdso_base) {
+diff --cc arch/powerpc/kernel/vector.S
+index 9e20999aaef2,74f8050518d6..000000000000
+--- a/arch/powerpc/kernel/vector.S
++++ b/arch/powerpc/kernel/vector.S
+@@@ -59,7 -37,38 +59,42 @@@ _GLOBAL(do_load_up_transact_altivec
+  #endif
+  
+  /*
+++<<<<<<< HEAD
+ + * load_up_altivec(unused, unused, tsk)
+++=======
++  * Enable use of VMX/Altivec for the caller.
++  */
++ _GLOBAL(vec_enable)
++ 	mfmsr	r3
++ 	oris	r3,r3,MSR_VEC@h
++ 	MTMSRD(r3)
++ 	isync
++ 	blr
++ 
++ /*
++  * Load state from memory into VMX registers including VSCR.
++  * Assumes the caller has enabled VMX in the MSR.
++  */
++ _GLOBAL(load_vr_state)
++ 	li	r4,VRSTATE_VSCR
++ 	lvx	vr0,r4,r3
++ 	mtvscr	vr0
++ 	REST_32VRS(0,r4,r3)
++ 	blr
++ 
++ /*
++  * Store VMX state into memory, including VSCR.
++  * Assumes the caller has enabled VMX in the MSR.
++  */
++ _GLOBAL(store_vr_state)
++ 	SAVE_32VRS(0, r4, r3)
++ 	mfvscr	vr0
++ 	li	r4, VRSTATE_VSCR
++ 	stvx	vr0, r4, r3
++ 	blr
++ 
++ /*
+++>>>>>>> d31626f70b61 (powerpc: Don't corrupt transactional state when using FP/VMX in kernel)
+   * Disable VMX for the task which had it previously,
+   * and save its vector registers in its thread_struct.
+   * Enables the VMX for use in the kernel on return.
+* Unmerged path arch/powerpc/include/asm/processor.h
+diff --git a/arch/powerpc/include/asm/thread_info.h b/arch/powerpc/include/asm/thread_info.h
+index cc806bac4a20..99cd301d6e11 100644
+--- a/arch/powerpc/include/asm/thread_info.h
++++ b/arch/powerpc/include/asm/thread_info.h
+@@ -93,6 +93,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_POLLING_NRFLAG	3	/* true if poll_idle() is polling
+ 					   TIF_NEED_RESCHED */
+ #define TIF_32BIT		4	/* 32 bit binary */
++#define TIF_RESTORE_TM		5	/* need to restore TM FP/VEC/VSX */
+ #define TIF_SYSCALL_AUDIT	7	/* syscall auditing active */
+ #define TIF_SINGLESTEP		8	/* singlestepping active */
+ #define TIF_NOHZ		9	/* in adaptive nohz mode */
+@@ -112,6 +113,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ #define _TIF_32BIT		(1<<TIF_32BIT)
++#define _TIF_RESTORE_TM		(1<<TIF_RESTORE_TM)
+ #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
+ #define _TIF_SINGLESTEP		(1<<TIF_SINGLESTEP)
+ #define _TIF_SECCOMP		(1<<TIF_SECCOMP)
+@@ -127,7 +129,8 @@ static inline struct thread_info *current_thread_info(void)
+ 				 _TIF_NOHZ)
+ 
+ #define _TIF_USER_WORK_MASK	(_TIF_SIGPENDING | _TIF_NEED_RESCHED | \
+-				 _TIF_NOTIFY_RESUME | _TIF_UPROBE)
++				 _TIF_NOTIFY_RESUME | _TIF_UPROBE | \
++				 _TIF_RESTORE_TM)
+ #define _TIF_PERSYSCALL_MASK	(_TIF_RESTOREALL|_TIF_NOERROR)
+ 
+ /* Bits in local_flags */
+diff --git a/arch/powerpc/include/asm/tm.h b/arch/powerpc/include/asm/tm.h
+index 9dfbc34bdbf5..0c9f8b74dd97 100644
+--- a/arch/powerpc/include/asm/tm.h
++++ b/arch/powerpc/include/asm/tm.h
+@@ -15,6 +15,7 @@ extern void do_load_up_transact_altivec(struct thread_struct *thread);
+ extern void tm_enable(void);
+ extern void tm_reclaim(struct thread_struct *thread,
+ 		       unsigned long orig_msr, uint8_t cause);
++extern void tm_reclaim_current(uint8_t cause);
+ extern void tm_recheckpoint(struct thread_struct *thread,
+ 			    unsigned long orig_msr);
+ extern void tm_abort(uint8_t cause);
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 53a9fde9d40a..9d3b8221aa52 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -689,8 +689,16 @@ _GLOBAL(ret_from_except_lite)
+ 	bl	.restore_interrupts
+ 	SCHEDULE_USER
+ 	b	.ret_from_except_lite
+-
+-2:	bl	.save_nvgprs
++2:
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++	andi.	r0,r4,_TIF_USER_WORK_MASK & ~_TIF_RESTORE_TM
++	bne	3f		/* only restore TM if nothing else to do */
++	addi	r3,r1,STACK_FRAME_OVERHEAD
++	bl	.restore_tm_state
++	b	restore
++3:
++#endif
++	bl	.save_nvgprs
+ 	bl	.restore_interrupts
+ 	addi	r3,r1,STACK_FRAME_OVERHEAD
+ 	bl	.do_notify_resume
+* Unmerged path arch/powerpc/kernel/fpu.S
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index be78b1b1de9d..2bab3cc6a996 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -74,6 +74,48 @@ struct task_struct *last_task_used_vsx = NULL;
+ struct task_struct *last_task_used_spe = NULL;
+ #endif
+ 
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++void giveup_fpu_maybe_transactional(struct task_struct *tsk)
++{
++	/*
++	 * If we are saving the current thread's registers, and the
++	 * thread is in a transactional state, set the TIF_RESTORE_TM
++	 * bit so that we know to restore the registers before
++	 * returning to userspace.
++	 */
++	if (tsk == current && tsk->thread.regs &&
++	    MSR_TM_ACTIVE(tsk->thread.regs->msr) &&
++	    !test_thread_flag(TIF_RESTORE_TM)) {
++		tsk->thread.tm_orig_msr = tsk->thread.regs->msr;
++		set_thread_flag(TIF_RESTORE_TM);
++	}
++
++	giveup_fpu(tsk);
++}
++
++void giveup_altivec_maybe_transactional(struct task_struct *tsk)
++{
++	/*
++	 * If we are saving the current thread's registers, and the
++	 * thread is in a transactional state, set the TIF_RESTORE_TM
++	 * bit so that we know to restore the registers before
++	 * returning to userspace.
++	 */
++	if (tsk == current && tsk->thread.regs &&
++	    MSR_TM_ACTIVE(tsk->thread.regs->msr) &&
++	    !test_thread_flag(TIF_RESTORE_TM)) {
++		tsk->thread.tm_orig_msr = tsk->thread.regs->msr;
++		set_thread_flag(TIF_RESTORE_TM);
++	}
++
++	giveup_altivec(tsk);
++}
++
++#else
++#define giveup_fpu_maybe_transactional(tsk)	giveup_fpu(tsk)
++#define giveup_altivec_maybe_transactional(tsk)	giveup_altivec(tsk)
++#endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
++
+ #ifdef CONFIG_PPC_FPU
+ /*
+  * Make sure the floating-point register state in the
+@@ -102,13 +144,13 @@ void flush_fp_to_thread(struct task_struct *tsk)
+ 			 */
+ 			BUG_ON(tsk != current);
+ #endif
+-			giveup_fpu(tsk);
++			giveup_fpu_maybe_transactional(tsk);
+ 		}
+ 		preempt_enable();
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(flush_fp_to_thread);
+-#endif
++#endif /* CONFIG_PPC_FPU */
+ 
+ void enable_kernel_fp(void)
+ {
+@@ -116,11 +158,11 @@ void enable_kernel_fp(void)
+ 
+ #ifdef CONFIG_SMP
+ 	if (current->thread.regs && (current->thread.regs->msr & MSR_FP))
+-		giveup_fpu(current);
++		giveup_fpu_maybe_transactional(current);
+ 	else
+ 		giveup_fpu(NULL);	/* just enables FP for kernel */
+ #else
+-	giveup_fpu(last_task_used_math);
++	giveup_fpu_maybe_transactional(last_task_used_math);
+ #endif /* CONFIG_SMP */
+ }
+ EXPORT_SYMBOL(enable_kernel_fp);
+@@ -132,11 +174,11 @@ void enable_kernel_altivec(void)
+ 
+ #ifdef CONFIG_SMP
+ 	if (current->thread.regs && (current->thread.regs->msr & MSR_VEC))
+-		giveup_altivec(current);
++		giveup_altivec_maybe_transactional(current);
+ 	else
+ 		giveup_altivec_notask();
+ #else
+-	giveup_altivec(last_task_used_altivec);
++	giveup_altivec_maybe_transactional(last_task_used_altivec);
+ #endif /* CONFIG_SMP */
+ }
+ EXPORT_SYMBOL(enable_kernel_altivec);
+@@ -153,7 +195,7 @@ void flush_altivec_to_thread(struct task_struct *tsk)
+ #ifdef CONFIG_SMP
+ 			BUG_ON(tsk != current);
+ #endif
+-			giveup_altivec(tsk);
++			giveup_altivec_maybe_transactional(tsk);
+ 		}
+ 		preempt_enable();
+ 	}
+@@ -182,8 +224,8 @@ EXPORT_SYMBOL(enable_kernel_vsx);
+ 
+ void giveup_vsx(struct task_struct *tsk)
+ {
+-	giveup_fpu(tsk);
+-	giveup_altivec(tsk);
++	giveup_fpu_maybe_transactional(tsk);
++	giveup_altivec_maybe_transactional(tsk);
+ 	__giveup_vsx(tsk);
+ }
+ 
+@@ -478,7 +520,48 @@ static inline bool hw_brk_match(struct arch_hw_breakpoint *a,
+ 		return false;
+ 	return true;
+ }
++
+ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++static void tm_reclaim_thread(struct thread_struct *thr,
++			      struct thread_info *ti, uint8_t cause)
++{
++	unsigned long msr_diff = 0;
++
++	/*
++	 * If FP/VSX registers have been already saved to the
++	 * thread_struct, move them to the transact_fp array.
++	 * We clear the TIF_RESTORE_TM bit since after the reclaim
++	 * the thread will no longer be transactional.
++	 */
++	if (test_ti_thread_flag(ti, TIF_RESTORE_TM)) {
++		msr_diff = thr->tm_orig_msr & ~thr->regs->msr;
++		if (msr_diff & MSR_FP)
++			memcpy(&thr->transact_fp, &thr->fp_state,
++			       sizeof(struct thread_fp_state));
++		if (msr_diff & MSR_VEC)
++			memcpy(&thr->transact_vr, &thr->vr_state,
++			       sizeof(struct thread_vr_state));
++		clear_ti_thread_flag(ti, TIF_RESTORE_TM);
++		msr_diff &= MSR_FP | MSR_VEC | MSR_VSX | MSR_FE0 | MSR_FE1;
++	}
++
++	tm_reclaim(thr, thr->regs->msr, cause);
++
++	/* Having done the reclaim, we now have the checkpointed
++	 * FP/VSX values in the registers.  These might be valid
++	 * even if we have previously called enable_kernel_fp() or
++	 * flush_fp_to_thread(), so update thr->regs->msr to
++	 * indicate their current validity.
++	 */
++	thr->regs->msr |= msr_diff;
++}
++
++void tm_reclaim_current(uint8_t cause)
++{
++	tm_enable();
++	tm_reclaim_thread(&current->thread, current_thread_info(), cause);
++}
++
+ static inline void tm_reclaim_task(struct task_struct *tsk)
+ {
+ 	/* We have to work out if we're switching from/to a task that's in the
+@@ -501,9 +584,11 @@ static inline void tm_reclaim_task(struct task_struct *tsk)
+ 
+ 	/* Stash the original thread MSR, as giveup_fpu et al will
+ 	 * modify it.  We hold onto it to see whether the task used
+-	 * FP & vector regs.
++	 * FP & vector regs.  If the TIF_RESTORE_TM flag is set,
++	 * tm_orig_msr is already set.
+ 	 */
+-	thr->tm_orig_msr = thr->regs->msr;
++	if (!test_ti_thread_flag(task_thread_info(tsk), TIF_RESTORE_TM))
++		thr->tm_orig_msr = thr->regs->msr;
+ 
+ 	TM_DEBUG("--- tm_reclaim on pid %d (NIP=%lx, "
+ 		 "ccr=%lx, msr=%lx, trap=%lx)\n",
+@@ -511,7 +596,7 @@ static inline void tm_reclaim_task(struct task_struct *tsk)
+ 		 thr->regs->ccr, thr->regs->msr,
+ 		 thr->regs->trap);
+ 
+-	tm_reclaim(thr, thr->regs->msr, TM_CAUSE_RESCHED);
++	tm_reclaim_thread(thr, task_thread_info(tsk), TM_CAUSE_RESCHED);
+ 
+ 	TM_DEBUG("--- tm_reclaim on pid %d complete\n",
+ 		 tsk->pid);
+@@ -587,6 +672,43 @@ static inline void __switch_to_tm(struct task_struct *prev)
+ 		tm_reclaim_task(prev);
+ 	}
+ }
++
++/*
++ * This is called if we are on the way out to userspace and the
++ * TIF_RESTORE_TM flag is set.  It checks if we need to reload
++ * FP and/or vector state and does so if necessary.
++ * If userspace is inside a transaction (whether active or
++ * suspended) and FP/VMX/VSX instructions have ever been enabled
++ * inside that transaction, then we have to keep them enabled
++ * and keep the FP/VMX/VSX state loaded while ever the transaction
++ * continues.  The reason is that if we didn't, and subsequently
++ * got a FP/VMX/VSX unavailable interrupt inside a transaction,
++ * we don't know whether it's the same transaction, and thus we
++ * don't know which of the checkpointed state and the transactional
++ * state to use.
++ */
++void restore_tm_state(struct pt_regs *regs)
++{
++	unsigned long msr_diff;
++
++	clear_thread_flag(TIF_RESTORE_TM);
++	if (!MSR_TM_ACTIVE(regs->msr))
++		return;
++
++	msr_diff = current->thread.tm_orig_msr & ~regs->msr;
++	msr_diff &= MSR_FP | MSR_VEC | MSR_VSX;
++	if (msr_diff & MSR_FP) {
++		fp_enable();
++		load_fp_state(&current->thread.fp_state);
++		regs->msr |= current->thread.fpexc_mode;
++	}
++	if (msr_diff & MSR_VEC) {
++		vec_enable();
++		load_vr_state(&current->thread.vr_state);
++	}
++	regs->msr |= msr_diff;
++}
++
+ #else
+ #define tm_recheckpoint_new_task(new)
+ #define __switch_to_tm(prev)
+diff --git a/arch/powerpc/kernel/signal.c b/arch/powerpc/kernel/signal.c
+index 457e97aa2945..8fc4177ed65a 100644
+--- a/arch/powerpc/kernel/signal.c
++++ b/arch/powerpc/kernel/signal.c
+@@ -203,8 +203,7 @@ unsigned long get_tm_stackpointer(struct pt_regs *regs)
+ 
+ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ 	if (MSR_TM_ACTIVE(regs->msr)) {
+-		tm_enable();
+-		tm_reclaim(&current->thread, regs->msr, TM_CAUSE_SIGNAL);
++		tm_reclaim_current(TM_CAUSE_SIGNAL);
+ 		if (MSR_TM_TRANSACTIONAL(regs->msr))
+ 			return current->thread.ckpt_regs.gpr[1];
+ 	}
+* Unmerged path arch/powerpc/kernel/signal_32.c
+* Unmerged path arch/powerpc/kernel/signal_64.c
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index cba93ca12ca7..8ad15d383c35 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1349,7 +1349,6 @@ void fp_unavailable_tm(struct pt_regs *regs)
+ 
+ 	TM_DEBUG("FP Unavailable trap whilst transactional at 0x%lx, MSR=%lx\n",
+ 		 regs->nip, regs->msr);
+-	tm_enable();
+ 
+         /* We can only have got here if the task started using FP after
+          * beginning the transaction.  So, the transactional regs are just a
+@@ -1358,8 +1357,7 @@ void fp_unavailable_tm(struct pt_regs *regs)
+          * transaction, and probably retry but now with FP enabled.  So the
+          * checkpointed FP registers need to be loaded.
+ 	 */
+-	tm_reclaim(&current->thread, current->thread.regs->msr,
+-		   TM_CAUSE_FAC_UNAV);
++	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+ 	/* Reclaim didn't save out any FPRs to transact_fprs. */
+ 
+ 	/* Enable FP for the task: */
+@@ -1384,9 +1382,7 @@ void altivec_unavailable_tm(struct pt_regs *regs)
+ 	TM_DEBUG("Vector Unavailable trap whilst transactional at 0x%lx,"
+ 		 "MSR=%lx\n",
+ 		 regs->nip, regs->msr);
+-	tm_enable();
+-	tm_reclaim(&current->thread, current->thread.regs->msr,
+-		   TM_CAUSE_FAC_UNAV);
++	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+ 	regs->msr |= MSR_VEC;
+ 	tm_recheckpoint(&current->thread, regs->msr);
+ 	current->thread.used_vr = 1;
+@@ -1407,10 +1403,8 @@ void vsx_unavailable_tm(struct pt_regs *regs)
+ 		 "MSR=%lx\n",
+ 		 regs->nip, regs->msr);
+ 
+-	tm_enable();
+ 	/* This reclaims FP and/or VR regs if they're already enabled */
+-	tm_reclaim(&current->thread, current->thread.regs->msr,
+-		   TM_CAUSE_FAC_UNAV);
++	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+ 
+ 	regs->msr |= MSR_VEC | MSR_FP | current->thread.fpexc_mode |
+ 		MSR_VSX;
+* Unmerged path arch/powerpc/kernel/vector.S
