@@ -1,0 +1,200 @@
+x86, microcode, AMD: Fix early microcode loading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [x86] microcode/amd: Fix early microcode loading (Jarod Wilson) [1016168]
+Rebuild_FUZZ: 91.11%
+commit-author Torsten Kaiser <just.for.lkml@googlemail.com>
+commit 84516098b58e05821780dc0b89abcee434b4dca5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/84516098.failed
+
+load_microcode_amd() (and the helper it is using) should not have an
+cpu parameter. The microcode loading does not depend on the CPU wrt the
+patches loaded since they will end up in a global list for all CPUs
+anyway.
+
+The change from cpu to x86family in load_microcode_amd()
+now allows to drop the code messing with cpu_data(cpu) from
+collect_cpu_info_amd_early(), which is wrong anyway because at that
+point the per-cpu cpu_info is not yet setup (These values would later be
+overwritten by smp_store_boot_cpu_info() / smp_store_cpu_info()).
+
+Fold the rest of collect_cpu_info_amd_early() into load_ucode_amd_ap(),
+because its only used at one place and without the cpuinfo_x86 accesses
+it was not much left.
+
+	Signed-off-by: Torsten Kaiser <just.for.lkml@googlemail.com>
+[ Fengguang: build fix ]
+	Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+[ Boris: adapt it to current tree. ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 84516098b58e05821780dc0b89abcee434b4dca5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/microcode_amd_early.c
+diff --cc arch/x86/kernel/microcode_amd_early.c
+index 1ac6e9aee766,6073104ccaa3..000000000000
+--- a/arch/x86/kernel/microcode_amd_early.c
++++ b/arch/x86/kernel/microcode_amd_early.c
+@@@ -238,25 -238,17 +238,34 @@@ static void __init collect_cpu_sig_on_b
+  	uci->cpu_sig.sig = cpuid_eax(0x00000001);
+  }
+  #else
+++<<<<<<< HEAD
+ +static void __cpuinit collect_cpu_info_amd_early(struct cpuinfo_x86 *c,
+ +						 struct ucode_cpu_info *uci)
+++=======
++ void load_ucode_amd_ap(void)
+++>>>>>>> 84516098b58e (x86, microcode, AMD: Fix early microcode loading)
+  {
++ 	unsigned int cpu = smp_processor_id();
++ 	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+  	u32 rev, eax;
+  
+  	rdmsr(MSR_AMD64_PATCH_LEVEL, rev, eax);
+  	eax = cpuid_eax(0x00000001);
+  
+- 	uci->cpu_sig.sig = eax;
+  	uci->cpu_sig.rev = rev;
+++<<<<<<< HEAD
+ +	c->microcode = rev;
+ +	c->x86 = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+ +}
+ +
+ +void __cpuinit load_ucode_amd_ap(void)
+ +{
+ +	unsigned int cpu = smp_processor_id();
+ +
+ +	collect_cpu_info_amd_early(&cpu_data(cpu), ucode_cpu_info + cpu);
+++=======
++ 	uci->cpu_sig.sig = eax;
+++>>>>>>> 84516098b58e (x86, microcode, AMD: Fix early microcode loading)
+  
+  	if (cpu && !ucode_loaded) {
+  		void *ucode;
+diff --git a/arch/x86/include/asm/microcode_amd.h b/arch/x86/include/asm/microcode_amd.h
+index c6b043f40271..a48ca19f37e2 100644
+--- a/arch/x86/include/asm/microcode_amd.h
++++ b/arch/x86/include/asm/microcode_amd.h
+@@ -59,7 +59,7 @@ static inline u16 find_equiv_id(struct equiv_cpu_entry *equiv_cpu_table,
+ 
+ extern int __apply_microcode_amd(struct microcode_amd *mc_amd);
+ extern int apply_microcode_amd(int cpu);
+-extern enum ucode_state load_microcode_amd(int cpu, const u8 *data, size_t size);
++extern enum ucode_state load_microcode_amd(u8 family, const u8 *data, size_t size);
+ 
+ #ifdef CONFIG_MICROCODE_AMD_EARLY
+ #ifdef CONFIG_X86_32
+diff --git a/arch/x86/kernel/microcode_amd.c b/arch/x86/kernel/microcode_amd.c
+index 7a0adb7ee433..7123b5df479d 100644
+--- a/arch/x86/kernel/microcode_amd.c
++++ b/arch/x86/kernel/microcode_amd.c
+@@ -145,10 +145,9 @@ static int collect_cpu_info_amd(int cpu, struct cpu_signature *csig)
+ 	return 0;
+ }
+ 
+-static unsigned int verify_patch_size(int cpu, u32 patch_size,
++static unsigned int verify_patch_size(u8 family, u32 patch_size,
+ 				      unsigned int size)
+ {
+-	struct cpuinfo_x86 *c = &cpu_data(cpu);
+ 	u32 max_size;
+ 
+ #define F1XH_MPB_MAX_SIZE 2048
+@@ -156,7 +155,7 @@ static unsigned int verify_patch_size(int cpu, u32 patch_size,
+ #define F15H_MPB_MAX_SIZE 4096
+ #define F16H_MPB_MAX_SIZE 3458
+ 
+-	switch (c->x86) {
++	switch (family) {
+ 	case 0x14:
+ 		max_size = F14H_MPB_MAX_SIZE;
+ 		break;
+@@ -277,9 +276,8 @@ static void cleanup(void)
+  * driver cannot continue functioning normally. In such cases, we tear
+  * down everything we've used up so far and exit.
+  */
+-static int verify_and_add_patch(unsigned int cpu, u8 *fw, unsigned int leftover)
++static int verify_and_add_patch(u8 family, u8 *fw, unsigned int leftover)
+ {
+-	struct cpuinfo_x86 *c = &cpu_data(cpu);
+ 	struct microcode_header_amd *mc_hdr;
+ 	struct ucode_patch *patch;
+ 	unsigned int patch_size, crnt_size, ret;
+@@ -299,7 +297,7 @@ static int verify_and_add_patch(unsigned int cpu, u8 *fw, unsigned int leftover)
+ 
+ 	/* check if patch is for the current family */
+ 	proc_fam = ((proc_fam >> 8) & 0xf) + ((proc_fam >> 20) & 0xff);
+-	if (proc_fam != c->x86)
++	if (proc_fam != family)
+ 		return crnt_size;
+ 
+ 	if (mc_hdr->nb_dev_id || mc_hdr->sb_dev_id) {
+@@ -308,7 +306,7 @@ static int verify_and_add_patch(unsigned int cpu, u8 *fw, unsigned int leftover)
+ 		return crnt_size;
+ 	}
+ 
+-	ret = verify_patch_size(cpu, patch_size, leftover);
++	ret = verify_patch_size(family, patch_size, leftover);
+ 	if (!ret) {
+ 		pr_err("Patch-ID 0x%08x: size mismatch.\n", mc_hdr->patch_id);
+ 		return crnt_size;
+@@ -339,7 +337,8 @@ static int verify_and_add_patch(unsigned int cpu, u8 *fw, unsigned int leftover)
+ 	return crnt_size;
+ }
+ 
+-static enum ucode_state __load_microcode_amd(int cpu, const u8 *data, size_t size)
++static enum ucode_state __load_microcode_amd(u8 family, const u8 *data,
++					     size_t size)
+ {
+ 	enum ucode_state ret = UCODE_ERROR;
+ 	unsigned int leftover;
+@@ -362,7 +361,7 @@ static enum ucode_state __load_microcode_amd(int cpu, const u8 *data, size_t siz
+ 	}
+ 
+ 	while (leftover) {
+-		crnt_size = verify_and_add_patch(cpu, fw, leftover);
++		crnt_size = verify_and_add_patch(family, fw, leftover);
+ 		if (crnt_size < 0)
+ 			return ret;
+ 
+@@ -373,22 +372,22 @@ static enum ucode_state __load_microcode_amd(int cpu, const u8 *data, size_t siz
+ 	return UCODE_OK;
+ }
+ 
+-enum ucode_state load_microcode_amd(int cpu, const u8 *data, size_t size)
++enum ucode_state load_microcode_amd(u8 family, const u8 *data, size_t size)
+ {
+ 	enum ucode_state ret;
+ 
+ 	/* free old equiv table */
+ 	free_equiv_cpu_table();
+ 
+-	ret = __load_microcode_amd(cpu, data, size);
++	ret = __load_microcode_amd(family, data, size);
+ 
+ 	if (ret != UCODE_OK)
+ 		cleanup();
+ 
+ #if defined(CONFIG_MICROCODE_AMD_EARLY) && defined(CONFIG_X86_32)
+ 	/* save BSP's matching patch for early load */
+-	if (cpu_data(cpu).cpu_index == boot_cpu_data.cpu_index) {
+-		struct ucode_patch *p = find_patch(cpu);
++	if (cpu_data(smp_processor_id()).cpu_index == boot_cpu_data.cpu_index) {
++		struct ucode_patch *p = find_patch(smp_processor_id());
+ 		if (p) {
+ 			memset(amd_bsp_mpb, 0, MPB_MAX_SIZE);
+ 			memcpy(amd_bsp_mpb, p->data, min_t(u32, ksize(p->data),
+@@ -441,7 +440,7 @@ static enum ucode_state request_microcode_amd(int cpu, struct device *device,
+ 		goto fw_release;
+ 	}
+ 
+-	ret = load_microcode_amd(cpu, fw->data, fw->size);
++	ret = load_microcode_amd(c->x86, fw->data, fw->size);
+ 
+  fw_release:
+ 	release_firmware(fw);
+* Unmerged path arch/x86/kernel/microcode_amd_early.c
