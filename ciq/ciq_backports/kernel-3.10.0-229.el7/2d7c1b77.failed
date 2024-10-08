@@ -1,0 +1,173 @@
+ACPI / hotplug / PCI: Remove entries from bus->devices in reverse order
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug/pci: Remove entries from bus->devices in reverse order (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 93.23%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 2d7c1b77dd59387070aab355532dd157f888325c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2d7c1b77.failed
+
+According to the changelog of commit 29ed1f29b68a (PCI: pciehp: Fix null
+pointer deref when hot-removing SR-IOV device) it is unsafe to walk the
+bus->devices list of a PCI bus and remove devices from it in direct order,
+because that may lead to NULL pointer dereferences related to virtual
+functions.
+
+For this reason, change all of the bus->devices list walks in
+acpiphp_glue.c during which devices may be removed to be carried out in
+reverse order.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 2d7c1b77dd59387070aab355532dd157f888325c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/acpiphp_glue.c
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 212725764a09,6a4b4b734fbd..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -833,34 -710,43 +833,60 @@@ static unsigned int get_slot_status(str
+  }
+  
+  /**
+ - * trim_stale_devices - remove PCI devices that are not responding.
+ - * @dev: PCI device to start walking the hierarchy from.
+ + * acpiphp_eject_slot - physically eject the slot
+ + * @slot: ACPI PHP slot
+   */
+ -static void trim_stale_devices(struct pci_dev *dev)
+ +int acpiphp_eject_slot(struct acpiphp_slot *slot)
+  {
+ -	acpi_handle handle = ACPI_HANDLE(&dev->dev);
+ -	struct pci_bus *bus = dev->subordinate;
+ -	bool alive = false;
+ -
+ -	if (handle) {
+ -		acpi_status status;
+ -		unsigned long long sta;
+ +	acpi_status status;
+ +	struct acpiphp_func *func;
+ +	struct acpi_object_list arg_list;
+ +	union acpi_object arg;
+  
+ +	list_for_each_entry(func, &slot->funcs, sibling) {
+ +		/* We don't want to call _EJ0 on non-existing functions. */
+ +		if ((func->flags & FUNC_HAS_EJ0)) {
+ +			/* _EJ0 method take one argument */
+ +			arg_list.count = 1;
+ +			arg_list.pointer = &arg;
+ +			arg.type = ACPI_TYPE_INTEGER;
+ +			arg.integer.value = 1;
+ +
+++<<<<<<< HEAD
+ +			status = acpi_evaluate_object(func->handle, "_EJ0", &arg_list, NULL);
+ +			if (ACPI_FAILURE(status)) {
+ +				pr_warn("%s: _EJ0 failed\n", __func__);
+ +				return -1;
+ +			} else
+ +				break;
+ +		}
+++=======
++ 		status = acpi_evaluate_integer(handle, "_STA", NULL, &sta);
++ 		alive = (ACPI_SUCCESS(status) && sta == ACPI_STA_ALL)
++ 			|| acpiphp_no_hotplug(handle);
++ 	}
++ 	if (!alive) {
++ 		u32 v;
++ 
++ 		/* Check if the device responds. */
++ 		alive = pci_bus_read_dev_vendor_id(dev->bus, dev->devfn, &v, 0);
++ 	}
++ 	if (!alive) {
++ 		pci_stop_and_remove_bus_device(dev);
++ 		if (handle)
++ 			acpiphp_bus_trim(handle);
++ 	} else if (bus) {
++ 		struct pci_dev *child, *tmp;
++ 
++ 		/* The device is a bridge. so check the bus below it. */
++ 		pm_runtime_get_sync(&dev->dev);
++ 		list_for_each_entry_safe_reverse(child, tmp, &bus->devices, bus_list)
++ 			trim_stale_devices(child);
++ 
++ 		pm_runtime_put(&dev->dev);
+++>>>>>>> 2d7c1b77dd59 (ACPI / hotplug / PCI: Remove entries from bus->devices in reverse order)
+  	}
+ +	return 0;
+  }
+  
+  /**
+@@@ -870,43 -756,35 +896,61 @@@
+   * Iterate over all slots under this bridge and make sure that if a
+   * card is present they are enabled, and if not they are disabled.
+   */
+ -static void acpiphp_check_bridge(struct acpiphp_bridge *bridge)
+ +static int acpiphp_check_bridge(struct acpiphp_bridge *bridge)
+  {
+  	struct acpiphp_slot *slot;
+ +	int retval = 0;
+ +	int enabled, disabled;
+  
+ -	/* Bail out if the bridge is going away. */
+ -	if (bridge->is_going_away)
+ -		return;
+ +	enabled = disabled = 0;
+  
+  	list_for_each_entry(slot, &bridge->slots, node) {
+++<<<<<<< HEAD
+ +		unsigned int status = get_slot_status(slot);
+ +		if (slot->flags & SLOT_ENABLED) {
+ +			if (status == ACPI_STA_ALL)
+ +				continue;
+ +			retval = acpiphp_disable_slot(slot);
+ +			if (retval) {
+ +				pr_err("Error occurred in disabling\n");
+ +				goto err_exit;
+ +			} else {
+ +				acpiphp_eject_slot(slot);
+ +			}
+ +			disabled++;
+++=======
++ 		struct pci_bus *bus = slot->bus;
++ 		struct pci_dev *dev, *tmp;
++ 
++ 		mutex_lock(&slot->crit_sect);
++ 		if (slot_no_hotplug(slot)) {
++ 			; /* do nothing */
++ 		} else if (get_slot_status(slot) == ACPI_STA_ALL) {
++ 			/* remove stale devices if any */
++ 			list_for_each_entry_safe_reverse(dev, tmp,
++ 							 &bus->devices, bus_list)
++ 				if (PCI_SLOT(dev->devfn) == slot->device)
++ 					trim_stale_devices(dev);
++ 
++ 			/* configure all functions */
++ 			enable_slot(slot);
+++>>>>>>> 2d7c1b77dd59 (ACPI / hotplug / PCI: Remove entries from bus->devices in reverse order)
+  		} else {
+ -			disable_slot(slot);
+ +			if (status != ACPI_STA_ALL)
+ +				continue;
+ +			retval = acpiphp_enable_slot(slot);
+ +			if (retval) {
+ +				pr_err("Error occurred in enabling\n");
+ +				goto err_exit;
+ +			}
+ +			enabled++;
+  		}
+ -		mutex_unlock(&slot->crit_sect);
+  	}
+ +
+ +	pr_debug("%s: %d enabled, %d disabled\n", __func__, enabled, disabled);
+ +
+ + err_exit:
+ +	return retval;
+  }
+  
+  static void acpiphp_set_hpp_values(struct pci_bus *bus)
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
