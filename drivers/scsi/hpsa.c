@@ -1369,12 +1369,18 @@ static void hpsa_unmap_sg_chain_block(struct ctlr_info *h,
 	pci_unmap_single(h->pdev, temp64.val, chain_sg->Len, PCI_DMA_TODEVICE);
 }
 
-static void handle_ioaccel_mode2_error(struct ctlr_info *h,
+
+/* Decode the various types of errors on ioaccel2 path.
+ * Return 1 for any error that should generate a RAID path retry.
+ * Return 0 for errors that don't require a RAID path retry.
+ */
+static int handle_ioaccel_mode2_error(struct ctlr_info *h,
 					struct CommandList *c,
 					struct scsi_cmnd *cmd,
 					struct io_accel2_cmd *c2)
 {
 	int data_len;
+	int retry = 0;
 
 	switch (c2->error_data.serv_response) {
 	case IOACCEL2_SERV_RESPONSE_COMPLETE:
@@ -1398,16 +1404,19 @@ static void handle_ioaccel_mode2_error(struct ctlr_info *h,
 			memcpy(cmd->sense_buffer,
 				c2->error_data.sense_data_buff, data_len);
 			cmd->result |= SAM_STAT_CHECK_CONDITION;
+			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_BUSY:
 			dev_warn(&h->pdev->dev,
 				"%s: task complete with BUSY status.\n",
 				"HP SSD Smart Path");
+			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_RES_CON:
 			dev_warn(&h->pdev->dev,
 				"%s: task complete with reservation conflict.\n",
 				"HP SSD Smart Path");
+			retry = 1;
 			break;
 		case IOACCEL2_STATUS_SR_TASK_COMP_SET_FULL:
 			/* Make scsi midlayer do unlimited retries */
@@ -1417,11 +1426,13 @@ static void handle_ioaccel_mode2_error(struct ctlr_info *h,
 			dev_warn(&h->pdev->dev,
 				"%s: task complete with aborted status.\n",
 				"HP SSD Smart Path");
+			retry = 1;
 			break;
 		default:
 			dev_warn(&h->pdev->dev,
 				"%s: task complete with unrecognized status: 0x%02x\n",
 				"HP SSD Smart Path", c2->error_data.status);
+			retry = 1;
 			break;
 		}
 		break;
@@ -1430,6 +1441,7 @@ static void handle_ioaccel_mode2_error(struct ctlr_info *h,
 		dev_warn(&h->pdev->dev,
 			"unexpected delivery or target failure, status = 0x%02x\n",
 			c2->error_data.status);
+		retry = 1;
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_COMPLETE:
 		break;
@@ -1437,6 +1449,7 @@ static void handle_ioaccel_mode2_error(struct ctlr_info *h,
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_REJECTED:
 		dev_warn(&h->pdev->dev, "task management function rejected.\n");
+		retry = 1;
 		break;
 	case IOACCEL2_SERV_RESPONSE_TMF_WRONG_LUN:
 		dev_warn(&h->pdev->dev, "task management function invalid LUN\n");
@@ -1444,9 +1457,13 @@ static void handle_ioaccel_mode2_error(struct ctlr_info *h,
 	default:
 		dev_warn(&h->pdev->dev,
 			"%s: Unrecognized server response: 0x%02x\n",
-			"HP SSD Smart Path", c2->error_data.serv_response);
+			"HP SSD Smart Path",
+			c2->error_data.serv_response);
+		retry = 1;
 		break;
 	}
+
+	return retry;	/* retry on raid path? */
 }
 
 static void process_ioaccel2_completion(struct ctlr_info *h,
@@ -1454,6 +1471,7 @@ static void process_ioaccel2_completion(struct ctlr_info *h,
 		struct hpsa_scsi_dev_t *dev)
 {
 	struct io_accel2_cmd *c2 = &h->ioaccel2_cmd_pool[c->cmdindex];
+	int raid_retry = 0;
 
 	/* check for good status */
 	if (likely(c2->error_data.serv_response == 0 &&
@@ -1470,11 +1488,16 @@ static void process_ioaccel2_completion(struct ctlr_info *h,
 	if (is_logical_dev_addr_mode(dev->scsi3addr) &&
 		c2->error_data.serv_response ==
 			IOACCEL2_SERV_RESPONSE_FAILURE) {
-		if (c2->error_data.status !=
-				IOACCEL2_STATUS_SR_IOACCEL_DISABLED)
+		if (c2->error_data.status ==
+			IOACCEL2_STATUS_SR_IOACCEL_DISABLED)
 			dev_warn(&h->pdev->dev,
-				"%s: Error 0x%02x, Retrying on standard path.\n",
+				"%s: Path is unavailable, retrying on standard path.\n",
+				"HP SSD Smart Path");
+		else
+			dev_warn(&h->pdev->dev,
+				"%s: Error 0x%02x, retrying on standard path.\n",
 				"HP SSD Smart Path", c2->error_data.status);
+
 		dev->offload_enabled = 0;
 		h->drv_req_rescan = 1;	/* schedule controller for a rescan */
 		cmd->result = DID_SOFT_ERROR << 16;
@@ -1482,7 +1505,17 @@ static void process_ioaccel2_completion(struct ctlr_info *h,
 		cmd->scsi_done(cmd);
 		return;
 	}
-	handle_ioaccel_mode2_error(h, c, cmd, c2);
+	raid_retry = handle_ioaccel_mode2_error(h, c, cmd, c2);
+	/* If error found, disable Smart Path, schedule a rescan,
+	 * and force a retry on the standard path.
+	 */
+	if (raid_retry) {
+		dev_warn(&h->pdev->dev, "%s: Retrying on standard path.\n",
+			"HP SSD Smart Path");
+		dev->offload_enabled = 0; /* Disable Smart Path */
+		h->drv_req_rescan = 1;	  /* schedule controller rescan */
+		cmd->result = DID_SOFT_ERROR << 16;
+	}
 	cmd_free(h, c);
 	cmd->scsi_done(cmd);
 }
