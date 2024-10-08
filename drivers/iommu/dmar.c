@@ -1574,7 +1574,7 @@ int dmar_set_interrupt(struct intel_iommu *iommu)
 		return 0;
 
 	irq = create_irq();
-	if (!irq) {
+	if (irq <= 0) {
 		pr_err("IOMMU: no free vectors\n");
 		return -EINVAL;
 	}
