@@ -280,7 +280,7 @@ static int test1(struct perf_evsel *evsel, struct machine *machine)
 	symbol_conf.use_callchain = false;
 	symbol_conf.cumulate_callchain = false;
 
-	setup_sorting();
+	setup_sorting(NULL);
 	callchain_register_param(&callchain_param);
 
 	err = add_hist_entries(hists, machine);
@@ -426,7 +426,7 @@ static int test2(struct perf_evsel *evsel, struct machine *machine)
 	symbol_conf.use_callchain = true;
 	symbol_conf.cumulate_callchain = false;
 
-	setup_sorting();
+	setup_sorting(NULL);
 	callchain_register_param(&callchain_param);
 
 	err = add_hist_entries(hists, machine);
@@ -483,7 +483,7 @@ static int test3(struct perf_evsel *evsel, struct machine *machine)
 	symbol_conf.use_callchain = false;
 	symbol_conf.cumulate_callchain = true;
 
-	setup_sorting();
+	setup_sorting(NULL);
 	callchain_register_param(&callchain_param);
 
 	err = add_hist_entries(hists, machine);
@@ -666,7 +666,7 @@ static int test4(struct perf_evsel *evsel, struct machine *machine)
 	symbol_conf.use_callchain = true;
 	symbol_conf.cumulate_callchain = true;
 
-	setup_sorting();
+	setup_sorting(NULL);
 	callchain_register_param(&callchain_param);
 
 	err = add_hist_entries(hists, machine);
