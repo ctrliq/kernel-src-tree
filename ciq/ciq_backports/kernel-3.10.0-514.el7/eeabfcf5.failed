@@ -1,0 +1,290 @@
+mei: connection to fixed address clients from user-space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit eeabfcf5a92ae3316b23f2da6a2bb5ba60a1b072
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/eeabfcf5.failed
+
+This should be used for debug only.
+The feaure is gated by "allow_fixed_address" control exposed in debugfs.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit eeabfcf5a92ae3316b23f2da6a2bb5ba60a1b072)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/main.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,2887e5607cd6..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -265,13 -213,13 +265,21 @@@ static ssize_t mei_read(struct file *fi
+  		}
+  	}
+  
+ -	cb = mei_cl_read_cb(cl, file);
+ +	cb = cl->read_cb;
+ +
+  	if (!cb) {
+++<<<<<<< HEAD
+ +		rets = -ENODEV;
+ +		goto out;
+ +	}
+ +	if (cl->reading_state != MEI_READ_COMPLETE) {
+++=======
++ 		if (mei_cl_is_fixed_address(cl) && dev->allow_fixed_address) {
++ 			cb = mei_cl_read_cb(cl, NULL);
++ 			if (cb)
++ 				goto copy_buffer;
++ 		}
+++>>>>>>> eeabfcf5a92a (mei: connection to fixed address clients from user-space)
+  		rets = 0;
+  		goto out;
+  	}
+@@@ -467,34 -385,29 +475,52 @@@ static int mei_ioctl_connect_client(str
+  	cl = file->private_data;
+  	dev = cl->dev;
+  
+++<<<<<<< HEAD
+ +	if (dev->dev_state != MEI_DEV_ENABLED) {
+ +		rets = -ENODEV;
+ +		goto end;
+++=======
++ 	if (dev->dev_state != MEI_DEV_ENABLED)
++ 		return -ENODEV;
++ 
++ 	if (cl->state != MEI_FILE_INITIALIZING &&
++ 	    cl->state != MEI_FILE_DISCONNECTED)
++ 		return  -EBUSY;
++ 
++ 	/* find ME client we're trying to connect to */
++ 	me_cl = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
++ 	if (!me_cl ||
++ 	    (me_cl->props.fixed_address && !dev->allow_fixed_address)) {
++ 		dev_dbg(dev->dev, "Cannot connect to FW Client UUID = %pUl\n",
++ 			&data->in_client_uuid);
++ 		mei_me_cl_put(me_cl);
++ 		return  -ENOTTY;
+++>>>>>>> eeabfcf5a92a (mei: connection to fixed address clients from user-space)
+  	}
+  
+ -	dev_dbg(dev->dev, "Connect to FW Client ID = %d\n",
+ -			me_cl->client_id);
+ -	dev_dbg(dev->dev, "FW Client - Protocol Version = %d\n",
+ -			me_cl->props.protocol_version);
+ -	dev_dbg(dev->dev, "FW Client - Max Msg Len = %d\n",
+ -			me_cl->props.max_msg_length);
+ +	if (cl->state != MEI_FILE_INITIALIZING &&
+ +	    cl->state != MEI_FILE_DISCONNECTED) {
+ +		rets = -EBUSY;
+ +		goto end;
+ +	}
+ +
+ +	/* find ME client we're trying to connect to */
+ +	i = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
+ +	if (i < 0 || dev->me_clients[i].props.fixed_address) {
+ +		dev_dbg(&dev->pdev->dev, "Cannot connect to FW Client UUID = %pUl\n",
+ +				&data->in_client_uuid);
+ +		rets = -ENOTTY;
+ +		goto end;
+ +	}
+ +
+ +	cl->me_client_id = dev->me_clients[i].client_id;
+ +
+ +	dev_dbg(&dev->pdev->dev, "Connect to FW Client ID = %d\n",
+ +			cl->me_client_id);
+ +	dev_dbg(&dev->pdev->dev, "FW Client - Protocol Version = %d\n",
+ +			dev->me_clients[i].props.protocol_version);
+ +	dev_dbg(&dev->pdev->dev, "FW Client - Max Msg Len = %d\n",
+ +			dev->me_clients[i].props.max_msg_length);
+  
+  	/* if we're connecting to amthif client then we will use the
+  	 * existing connection
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,fa5ce1de20f6..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -382,55 -427,95 +382,129 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported : hbm feature pgi protocol
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @allow_fixed_address: allow user space to connect a fixed client
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_mtu : amthif client max message length
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
+++>>>>>>> eeabfcf5a92a (mei: connection to fixed address clients from user-space)
+   */
+  struct mei_device {
+ -	struct device *dev;
+ -	struct cdev cdev;
+ -	int minor;
+ -
+ -	struct mei_cl_cb write_list;
+ -	struct mei_cl_cb write_waiting_list;
+ -	struct mei_cl_cb ctrl_wr_list;
+ -	struct mei_cl_cb ctrl_rd_list;
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+@@@ -478,13 -563,14 +552,15 @@@
+  	struct hbm_version version;
+  	unsigned int hbm_f_pg_supported:1;
+  
+ -	struct rw_semaphore me_clients_rwsem;
+ -	struct list_head me_clients;
+ +	struct mei_me_client *me_clients; /* Note: memory has to be allocated */
+  	DECLARE_BITMAP(me_clients_map, MEI_CLIENTS_MAX);
+  	DECLARE_BITMAP(host_clients_map, MEI_CLIENTS_MAX);
+ +	unsigned long me_clients_num;
+ +	unsigned long me_client_presentation_num;
+  	unsigned long me_client_index;
+  
++ 	u32 allow_fixed_address;
++ 
+  	struct mei_cl wd_cl;
+  	enum mei_wd_states wd_state;
+  	bool wd_pending;
+diff --git a/drivers/misc/mei/debugfs.c b/drivers/misc/mei/debugfs.c
+index 85d1d2217fb8..2f657bbf7ef7 100644
+--- a/drivers/misc/mei/debugfs.c
++++ b/drivers/misc/mei/debugfs.c
+@@ -193,6 +193,12 @@ int mei_dbgfs_register(struct mei_device *dev, const char *name)
+ 		dev_err(&dev->pdev->dev, "devstate: registration failed\n");
+ 		goto err;
+ 	}
++	f = debugfs_create_bool("allow_fixed_address", S_IRUSR | S_IWUSR, dir,
++				&dev->allow_fixed_address);
++	if (!f) {
++		dev_err(dev->dev, "allow_fixed_address: registration failed\n");
++		goto err;
++	}
+ 	dev->dbgfs_dir = dir;
+ 	return 0;
+ err:
+* Unmerged path drivers/misc/mei/main.c
+* Unmerged path drivers/misc/mei/mei_dev.h
