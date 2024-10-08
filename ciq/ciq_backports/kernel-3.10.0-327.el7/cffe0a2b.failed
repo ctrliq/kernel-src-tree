@@ -1,0 +1,219 @@
+x86, irq: Keep balance of IOAPIC pin reference count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] irq: Keep balance of IOAPIC pin reference count (Steve Best) [1231358 1238216]
+Rebuild_FUZZ: 94.95%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit cffe0a2b5a34c95a4dadc9ec7132690a5b0f6687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cffe0a2b.failed
+
+To keep balance of IOAPIC pin reference count, we need to protect
+pirq_enable_irq(), acpi_pci_irq_enable() and intel_mid_pci_irq_enable()
+from reentrance. There are two cases which will cause reentrance.
+
+The first case is caused by suspend/hibernation. If pcibios_disable_irq
+is called during suspending/hibernating, we don't release the assigned
+IRQ number, otherwise it may break the suspend/hibernation. So late when
+pcibios_enable_irq is called during resume, we shouldn't allocate IRQ
+number again.
+
+The second case is that function acpi_pci_irq_enable() may be called
+twice for PCI devices present at boot time as below:
+1) pci_acpi_init()
+	--> acpi_pci_irq_enable() if pci_routeirq is true
+2) pci_enable_device()
+	--> pcibios_enable_device()
+		--> acpi_pci_irq_enable()
+We can't kill kernel parameter pci_routeirq yet because it's still
+needed for debugging purpose.
+
+So flag irq_managed is introduced to track whether IRQ number is
+assigned by OS and to protect pirq_enable_irq(), acpi_pci_irq_enable()
+and intel_mid_pci_irq_enable() from reentrance.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Len Brown <lenb@kernel.org>
+Link: http://lkml.kernel.org/r/1414387308-27148-13-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit cffe0a2b5a34c95a4dadc9ec7132690a5b0f6687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/irq.c
+#	arch/x86/pci/mrst.c
+#	drivers/acpi/pci_irq.c
+diff --cc arch/x86/pci/irq.c
+index 84112f55dd7a,99884588a47a..000000000000
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@@ -1227,8 -1231,7 +1230,12 @@@ static int pirq_enable_irq(struct pci_d
+  			}
+  			dev = temp_dev;
+  			if (irq >= 0) {
+++<<<<<<< HEAD
+ +				io_apic_set_pci_routing(&dev->dev, irq,
+ +							 &irq_attr);
+++=======
++ 				dev->irq_managed = 1;
+++>>>>>>> cffe0a2b5a34 (x86, irq: Keep balance of IOAPIC pin reference count)
+  				dev->irq = irq;
+  				dev_info(&dev->dev, "PCI->APIC IRQ transform: "
+  					 "INT %c -> IRQ %d\n", 'A' + pin - 1, irq);
+@@@ -1254,3 -1257,25 +1261,28 @@@
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mp_should_keep_irq(struct device *dev)
++ {
++ 	if (dev->power.is_prepared)
++ 		return true;
++ #ifdef CONFIG_PM_RUNTIME
++ 	if (dev->power.runtime_status == RPM_SUSPENDING)
++ 		return true;
++ #endif
++ 
++ 	return false;
++ }
++ 
++ static void pirq_disable_irq(struct pci_dev *dev)
++ {
++ 	if (io_apic_assign_pci_irqs && !mp_should_keep_irq(&dev->dev) &&
++ 	    dev->irq_managed && dev->irq) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq = 0;
++ 		dev->irq_managed = 0;
++ 	}
++ }
+++>>>>>>> cffe0a2b5a34 (x86, irq: Keep balance of IOAPIC pin reference count)
+diff --cc arch/x86/pci/mrst.c
+index 903fded50786,44b9271580b5..000000000000
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@@ -205,27 -206,42 +205,52 @@@ static int pci_write(struct pci_bus *bu
+  			       where, size, value);
+  }
+  
+ -static int intel_mid_pci_irq_enable(struct pci_dev *dev)
+ +static int mrst_pci_irq_enable(struct pci_dev *dev)
+  {
+ -	int polarity;
+ +	u8 pin;
+ +	struct io_apic_irq_attr irq_attr;
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
+++=======
++ 	if (dev->irq_managed && dev->irq > 0)
++ 		return 0;
++ 
++ 	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER)
++ 		polarity = 0; /* active high */
++ 	else
++ 		polarity = 1; /* active low */
+++>>>>>>> cffe0a2b5a34 (x86, irq: Keep balance of IOAPIC pin reference count):arch/x86/pci/intel_mid_pci.c
+  
+  	/*
+  	 * MRST only have IOAPIC, the PCI irq lines are 1:1 mapped to
+  	 * IOAPIC RTE entries, so we just enable RTE for the device.
+  	 */
+ -	if (mp_set_gsi_attr(dev->irq, 1, polarity, dev_to_node(&dev->dev)))
+ -		return -EBUSY;
+ -	if (mp_map_gsi_to_irq(dev->irq, IOAPIC_MAP_ALLOC) < 0)
+ -		return -EBUSY;
+ +	irq_attr.ioapic = mp_find_ioapic(dev->irq);
+ +	irq_attr.ioapic_pin = dev->irq;
+ +	irq_attr.trigger = 1; /* level */
+ +	irq_attr.polarity = 1; /* active low */
+ +	io_apic_set_pci_routing(&dev->dev, dev->irq, &irq_attr);
+  
++ 	dev->irq_managed = 1;
++ 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:arch/x86/pci/mrst.c
+ +struct pci_ops pci_mrst_ops = {
+++=======
++ static void intel_mid_pci_irq_disable(struct pci_dev *dev)
++ {
++ 	if (!mp_should_keep_irq(&dev->dev) && dev->irq_managed &&
++ 	    dev->irq > 0) {
++ 		mp_unmap_irq(dev->irq);
++ 		dev->irq_managed = 0;
++ 	}
++ }
++ 
++ struct pci_ops intel_mid_pci_ops = {
+++>>>>>>> cffe0a2b5a34 (x86, irq: Keep balance of IOAPIC pin reference count):arch/x86/pci/intel_mid_pci.c
+  	.read = pci_read,
+  	.write = pci_write,
+  };
+diff --cc drivers/acpi/pci_irq.c
+index d8cd9b655f87,5f1fdca65e5f..000000000000
+--- a/drivers/acpi/pci_irq.c
++++ b/drivers/acpi/pci_irq.c
+@@@ -465,9 -482,17 +469,9 @@@ void acpi_pci_irq_disable(struct pci_de
+  	u8 pin;
+  
+  	pin = dev->pin;
+- 	if (!pin)
++ 	if (!pin || !dev->irq_managed || dev->irq <= 0)
+  		return;
+  
+ -	/* Keep IOAPIC pin configuration when suspending */
+ -	if (dev->dev.power.is_prepared)
+ -		return;
+ -#ifdef	CONFIG_PM_RUNTIME
+ -	if (dev->dev.power.runtime_status == RPM_SUSPENDING)
+ -		return;
+ -#endif
+ -
+  	entry = acpi_pci_irq_lookup(dev, pin);
+  	if (!entry)
+  		return;
+@@@ -485,5 -510,9 +489,13 @@@
+  	 */
+  
+  	dev_dbg(&dev->dev, "PCI INT %c disabled\n", pin_name(pin));
+++<<<<<<< HEAD
+ +	acpi_unregister_gsi(gsi);
+++=======
++ 	if (gsi >= 0) {
++ 		acpi_unregister_gsi(gsi);
++ 		dev->irq = 0;
++ 		dev->irq_managed = 0;
++ 	}
+++>>>>>>> cffe0a2b5a34 (x86, irq: Keep balance of IOAPIC pin reference count)
+  }
+* Unmerged path arch/x86/pci/irq.c
+* Unmerged path arch/x86/pci/mrst.c
+* Unmerged path drivers/acpi/pci_irq.c
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index be12434c750f..7fe8bbf74bbf 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -353,6 +353,7 @@ struct pci_dev {
+ 	unsigned int	__aer_firmware_first:1;
+ 	unsigned int	broken_intx_masking:1;
+ 	unsigned int	io_window_1k:1;	/* Intel P2P bridge 1K I/O windows */
++	unsigned int	irq_managed:1;
+ 	pci_dev_flags_t dev_flags;
+ 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
+ 
