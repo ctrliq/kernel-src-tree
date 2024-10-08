@@ -1,0 +1,277 @@
+IB/hfi1: Fix an interval RB node reference count leak
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mitko Haralanov <mitko.haralanov@intel.com>
+commit 9565c6a37a9d69f00e2a7dabbee2b4f6d20dc1ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9565c6a3.failed
+
+Commit e88c9271d9f8 ("IB/hfi1: Fix buffer cache corner case which
+may cause corruption") introduced a bug which may cause a reference
+count of a interval RB node to be leaked in the case where an SDMA
+transfer from that node completes at the same time as the node is
+being extended.
+
+If a node is being extended, it is first removed from the RB tree
+in order to be processed without the risk of an invalidation event
+removing the node at the same time.
+
+If a SDMA completion happens during that time, the completion handler
+will fail to find the node in the RB tree and, therefore, fail to
+correctly decrement its refcount. This leaves the node in the tree and
+its pages pinned for the duration of the user process.
+
+To prevent this from happening the io vector adds a reference to the
+RB node, which is used during the SDMA completion instead of looking
+up the node in the RB tree.
+
+This change adds a performance improvement as a side effect by avoiding
+the RB tree lookup.
+
+Fixes: e88c9271d9f8 ("IB/hfi1: Fix buffer cache corner case which may cause corruption")
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9565c6a37a9d69f00e2a7dabbee2b4f6d20dc1ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/user_sdma.c
+diff --cc drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a,aed2878c97f1..000000000000
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@@ -179,11 -175,26 +181,12 @@@ struct user_sdma_iovec 
+  	unsigned npages;
+  	/* array of pinned pages for this vector */
+  	struct page **pages;
+ -	/*
+ -	 * offset into the virtual address space of the vector at
+ -	 * which we last left off.
+ -	 */
+ +	/* offset into the virtual address space of the vector at
+ +	 * which we last left off. */
+  	u64 offset;
++ 	struct sdma_mmu_node *node;
+  };
+  
+ -#define SDMA_CACHE_NODE_EVICT BIT(0)
+ -
+ -struct sdma_mmu_node {
+ -	struct mmu_rb_node rb;
+ -	struct list_head list;
+ -	struct hfi1_user_sdma_pkt_q *pq;
+ -	atomic_t refcount;
+ -	struct page **pages;
+ -	unsigned npages;
+ -	unsigned long flags;
+ -};
+ -
+  struct user_sdma_request {
+  	struct sdma_req_info info;
+  	struct hfi1_user_sdma_pkt_q *pq;
+@@@ -1036,40 -1043,143 +1039,46 @@@ static inline int num_user_pages(const 
+  	return 1 + ((epage - spage) >> PAGE_SHIFT);
+  }
+  
+ -static u32 sdma_cache_evict(struct hfi1_user_sdma_pkt_q *pq, u32 npages)
+ -{
+ -	u32 cleared = 0;
+ -	struct sdma_mmu_node *node, *ptr;
+ -	struct list_head to_evict = LIST_HEAD_INIT(to_evict);
+ -
+ -	spin_lock(&pq->evict_lock);
+ -	list_for_each_entry_safe_reverse(node, ptr, &pq->evict, list) {
+ -		/* Make sure that no one is still using the node. */
+ -		if (!atomic_read(&node->refcount)) {
+ -			set_bit(SDMA_CACHE_NODE_EVICT, &node->flags);
+ -			list_del_init(&node->list);
+ -			list_add(&node->list, &to_evict);
+ -			cleared += node->npages;
+ -			if (cleared >= npages)
+ -				break;
+ -		}
+ -	}
+ -	spin_unlock(&pq->evict_lock);
+ -
+ -	list_for_each_entry_safe(node, ptr, &to_evict, list)
+ -		hfi1_mmu_rb_remove(&pq->sdma_rb_root, &node->rb);
+ -
+ -	return cleared;
+ -}
+ -
+  static int pin_vector_pages(struct user_sdma_request *req,
+  			    struct user_sdma_iovec *iovec) {
+ -	int ret = 0, pinned, npages, cleared;
+ -	struct page **pages;
+ -	struct hfi1_user_sdma_pkt_q *pq = req->pq;
+ -	struct sdma_mmu_node *node = NULL;
+ -	struct mmu_rb_node *rb_node;
+ -
+ -	rb_node = hfi1_mmu_rb_extract(&pq->sdma_rb_root,
+ -				      (unsigned long)iovec->iov.iov_base,
+ -				      iovec->iov.iov_len);
+ -	if (rb_node && !IS_ERR(rb_node))
+ -		node = container_of(rb_node, struct sdma_mmu_node, rb);
+ -	else
+ -		rb_node = NULL;
+ -
+ -	if (!node) {
+ -		node = kzalloc(sizeof(*node), GFP_KERNEL);
+ -		if (!node)
+ -			return -ENOMEM;
+ -
+ -		node->rb.addr = (unsigned long)iovec->iov.iov_base;
+ -		node->pq = pq;
+ -		atomic_set(&node->refcount, 0);
+ -		INIT_LIST_HEAD(&node->list);
+ -	}
+ +	int pinned, npages;
+  
+  	npages = num_user_pages(&iovec->iov);
+ -	if (node->npages < npages) {
+ -		pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
+ -		if (!pages) {
+ -			SDMA_DBG(req, "Failed page array alloc");
+ -			ret = -ENOMEM;
+ -			goto bail;
+ -		}
+ -		memcpy(pages, node->pages, node->npages * sizeof(*pages));
+ -
+ -		npages -= node->npages;
+ -
+ -		/*
+ -		 * If rb_node is NULL, it means that this is brand new node
+ -		 * and, therefore not on the eviction list.
+ -		 * If, however, the rb_node is non-NULL, it means that the
+ -		 * node is already in RB tree and, therefore on the eviction
+ -		 * list (nodes are unconditionally inserted in the eviction
+ -		 * list). In that case, we have to remove the node prior to
+ -		 * calling the eviction function in order to prevent it from
+ -		 * freeing this node.
+ -		 */
+ -		if (rb_node) {
+ -			spin_lock(&pq->evict_lock);
+ -			list_del_init(&node->list);
+ -			spin_unlock(&pq->evict_lock);
+ -		}
+ -retry:
+ -		if (!hfi1_can_pin_pages(pq->dd, pq->n_locked, npages)) {
+ -			cleared = sdma_cache_evict(pq, npages);
+ -			if (cleared >= npages)
+ -				goto retry;
+ -		}
+ -		pinned = hfi1_acquire_user_pages(
+ -			((unsigned long)iovec->iov.iov_base +
+ -			 (node->npages * PAGE_SIZE)), npages, 0,
+ -			pages + node->npages);
+ -		if (pinned < 0) {
+ -			kfree(pages);
+ -			ret = pinned;
+ -			goto bail;
+ -		}
+ -		if (pinned != npages) {
+ -			unpin_vector_pages(current->mm, pages, node->npages,
+ -					   pinned);
+ -			ret = -EFAULT;
+ -			goto bail;
+ -		}
+ -		kfree(node->pages);
+ -		node->rb.len = iovec->iov.iov_len;
+ -		node->pages = pages;
+ -		node->npages += pinned;
+ -		npages = node->npages;
+ -		spin_lock(&pq->evict_lock);
+ -		list_add(&node->list, &pq->evict);
+ -		pq->n_locked += pinned;
+ -		spin_unlock(&pq->evict_lock);
+ +	iovec->pages = kcalloc(npages, sizeof(*iovec->pages), GFP_KERNEL);
+ +	if (!iovec->pages) {
+ +		SDMA_DBG(req, "Failed page array alloc");
+ +		return -ENOMEM;
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+++=======
++ 	iovec->pages = node->pages;
++ 	iovec->npages = npages;
++ 	iovec->node = node;
+++>>>>>>> 9565c6a37a9d (IB/hfi1: Fix an interval RB node reference count leak):drivers/staging/rdma/hfi1/user_sdma.c
+  
+ -	ret = hfi1_mmu_rb_insert(&req->pq->sdma_rb_root, &node->rb);
+ -	if (ret) {
+ -		spin_lock(&pq->evict_lock);
+ -		if (!list_empty(&node->list))
+ -			list_del(&node->list);
+ -		pq->n_locked -= node->npages;
+ -		spin_unlock(&pq->evict_lock);
+ -		goto bail;
+ +	pinned = hfi1_acquire_user_pages((unsigned long)iovec->iov.iov_base,
+ +					 npages, 0, iovec->pages);
+ +
+ +	if (pinned < 0)
+ +		return pinned;
+ +
+ +	iovec->npages = pinned;
+ +	if (pinned != npages) {
+ +		SDMA_DBG(req, "Failed to pin pages (%d/%u)", pinned, npages);
+ +		unpin_vector_pages(iovec);
+ +		return -EFAULT;
+  	}
+  	return 0;
+ -bail:
+ -	if (rb_node)
+ -		unpin_vector_pages(current->mm, node->pages, 0, node->npages);
+ -	kfree(node);
+ -	return ret;
+  }
+  
+ -static void unpin_vector_pages(struct mm_struct *mm, struct page **pages,
+ -			       unsigned start, unsigned npages)
+ +static void unpin_vector_pages(struct user_sdma_iovec *iovec)
+  {
+ -	hfi1_release_user_pages(mm, pages + start, npages, 0);
+ -	kfree(pages);
+ +	hfi1_release_user_pages(iovec->pages, iovec->npages, 0);
+ +
+ +	kfree(iovec->pages);
+ +	iovec->pages = NULL;
+ +	iovec->npages = 0;
+ +	iovec->offset = 0;
+  }
+  
+  static int check_header_template(struct user_sdma_request *req,
+@@@ -1427,12 -1521,21 +1436,30 @@@ static void user_sdma_free_request(stru
+  			kmem_cache_free(req->pq->txreq_cache, tx);
+  		}
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/user_sdma.c
+ +	if (req->data_iovs && unpin) {
+ +		int i;
+ +
+ +		for (i = 0; i < req->data_iovs; i++)
+ +			if (req->iovs[i].npages && req->iovs[i].pages)
+ +				unpin_vector_pages(&req->iovs[i]);
+++=======
++ 	if (req->data_iovs) {
++ 		struct sdma_mmu_node *node;
++ 		int i;
++ 
++ 		for (i = 0; i < req->data_iovs; i++) {
++ 			node = req->iovs[i].node;
++ 			if (!node)
++ 				continue;
++ 
++ 			if (unpin)
++ 				hfi1_mmu_rb_remove(&req->pq->sdma_rb_root,
++ 						   &node->rb);
++ 			else
++ 				atomic_dec(&node->refcount);
++ 		}
+++>>>>>>> 9565c6a37a9d (IB/hfi1: Fix an interval RB node reference count leak):drivers/staging/rdma/hfi1/user_sdma.c
+  	}
+  	kfree(req->tids);
+  	clear_bit(SDMA_REQ_IN_USE, &req->flags);
+* Unmerged path drivers/staging/hfi1/user_sdma.c
