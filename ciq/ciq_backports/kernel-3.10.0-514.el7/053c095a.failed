@@ -1,0 +1,1919 @@
+netlink: make nlmsg_end() and genlmsg_end() void
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 053c095a82cf773075e83d7233b5cc19a1f73ece
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/053c095a.failed
+
+Contrary to common expectations for an "int" return, these functions
+return only a positive value -- if used correctly they cannot even
+return 0 because the message header will necessarily be in the skb.
+
+This makes the very common pattern of
+
+  if (genlmsg_end(...) < 0) { ... }
+
+be a whole bunch of dead code. Many places also simply do
+
+  return nlmsg_end(...);
+
+and the caller is expected to deal with it.
+
+This also commonly (at least for me) causes errors, because it is very
+common to write
+
+  if (my_function(...))
+    /* error condition */
+
+and if my_function() does "return nlmsg_end()" this is of course wrong.
+
+Additionally, there's not a single place in the kernel that actually
+needs the message length returned, and if anyone needs it later then
+it'll be very easy to just use skb->len there.
+
+Remove this, and make the functions void. This removes a bunch of dead
+code as described above. The patch adds lines because I did
+
+-	return nlmsg_end(...);
++	nlmsg_end(...);
++	return 0;
+
+I could have preserved all the function's return values by returning
+skb->len, but instead I've audited all the places calling the affected
+functions and found that none cared. A few places actually compared
+the return value with <= 0 in dump functionality, but that could just
+be changed to < 0 with no change in behaviour, so I opted for the more
+efficient version.
+
+One instance of the error I've made numerous times now is also present
+in net/phonet/pn_netlink.c in the route_dumpit() function - it didn't
+check for <0 or <=0 and thus broke out of the loop every single time.
+I've preserved this since it will (I think) have caused the messages to
+userspace to be formatted differently with just a single message for
+every SKB returned to userspace. It's possible that this isn't needed
+for the tools that actually use this, but I don't even know what they
+are so couldn't test that changing this behaviour would be acceptable.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 053c095a82cf773075e83d7233b5cc19a1f73ece)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	drivers/net/wireless/mac80211_hwsim.c
+#	net/ieee802154/nl802154.c
+#	net/ipv6/addrconf.c
+#	net/l2tp/l2tp_netlink.c
+#	net/nfc/netlink.c
+diff --cc drivers/net/wireless/mac80211_hwsim.c
+index cb34c7895f2a,4a4c6586a8d2..000000000000
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@@ -1696,8 -2093,477 +1696,477 @@@ static struct ieee80211_ops mac80211_hw
+  	.flush = mac80211_hwsim_flush,
+  	.get_tsf = mac80211_hwsim_get_tsf,
+  	.set_tsf = mac80211_hwsim_set_tsf,
+ -	.get_et_sset_count = mac80211_hwsim_get_et_sset_count,
+ -	.get_et_stats = mac80211_hwsim_get_et_stats,
+ -	.get_et_strings = mac80211_hwsim_get_et_strings,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct ieee80211_ops mac80211_hwsim_mchan_ops;
++ 
++ struct hwsim_new_radio_params {
++ 	unsigned int channels;
++ 	const char *reg_alpha2;
++ 	const struct ieee80211_regdomain *regd;
++ 	bool reg_strict;
++ 	bool p2p_device;
++ 	bool use_chanctx;
++ 	bool destroy_on_close;
++ 	const char *hwname;
++ 	bool no_vif;
++ };
++ 
++ static void hwsim_mcast_config_msg(struct sk_buff *mcast_skb,
++ 				   struct genl_info *info)
++ {
++ 	if (info)
++ 		genl_notify(&hwsim_genl_family, mcast_skb,
++ 			    genl_info_net(info), info->snd_portid,
++ 			    HWSIM_MCGRP_CONFIG, info->nlhdr, GFP_KERNEL);
++ 	else
++ 		genlmsg_multicast(&hwsim_genl_family, mcast_skb, 0,
++ 				  HWSIM_MCGRP_CONFIG, GFP_KERNEL);
++ }
++ 
++ static int append_radio_msg(struct sk_buff *skb, int id,
++ 			    struct hwsim_new_radio_params *param)
++ {
++ 	int ret;
++ 
++ 	ret = nla_put_u32(skb, HWSIM_ATTR_RADIO_ID, id);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (param->channels) {
++ 		ret = nla_put_u32(skb, HWSIM_ATTR_CHANNELS, param->channels);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (param->reg_alpha2) {
++ 		ret = nla_put(skb, HWSIM_ATTR_REG_HINT_ALPHA2, 2,
++ 			      param->reg_alpha2);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (param->regd) {
++ 		int i;
++ 
++ 		for (i = 0; i < ARRAY_SIZE(hwsim_world_regdom_custom); i++) {
++ 			if (hwsim_world_regdom_custom[i] != param->regd)
++ 				continue;
++ 
++ 			ret = nla_put_u32(skb, HWSIM_ATTR_REG_CUSTOM_REG, i);
++ 			if (ret < 0)
++ 				return ret;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (param->reg_strict) {
++ 		ret = nla_put_flag(skb, HWSIM_ATTR_REG_STRICT_REG);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (param->p2p_device) {
++ 		ret = nla_put_flag(skb, HWSIM_ATTR_SUPPORT_P2P_DEVICE);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (param->use_chanctx) {
++ 		ret = nla_put_flag(skb, HWSIM_ATTR_USE_CHANCTX);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (param->hwname) {
++ 		ret = nla_put(skb, HWSIM_ATTR_RADIO_NAME,
++ 			      strlen(param->hwname), param->hwname);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void hwsim_mcast_new_radio(int id, struct genl_info *info,
++ 				  struct hwsim_new_radio_params *param)
++ {
++ 	struct sk_buff *mcast_skb;
++ 	void *data;
++ 
++ 	mcast_skb = genlmsg_new(GENLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!mcast_skb)
++ 		return;
++ 
++ 	data = genlmsg_put(mcast_skb, 0, 0, &hwsim_genl_family, 0,
++ 			   HWSIM_CMD_NEW_RADIO);
++ 	if (!data)
++ 		goto out_err;
++ 
++ 	if (append_radio_msg(mcast_skb, id, param) < 0)
++ 		goto out_err;
++ 
++ 	genlmsg_end(mcast_skb, data);
++ 
++ 	hwsim_mcast_config_msg(mcast_skb, info);
++ 	return;
++ 
++ out_err:
++ 	genlmsg_cancel(mcast_skb, data);
++ 	nlmsg_free(mcast_skb);
++ }
++ 
++ static int mac80211_hwsim_new_radio(struct genl_info *info,
++ 				    struct hwsim_new_radio_params *param)
++ {
++ 	int err;
++ 	u8 addr[ETH_ALEN];
++ 	struct mac80211_hwsim_data *data;
++ 	struct ieee80211_hw *hw;
++ 	enum ieee80211_band band;
++ 	const struct ieee80211_ops *ops = &mac80211_hwsim_ops;
++ 	int idx;
++ 
++ 	if (WARN_ON(param->channels > 1 && !param->use_chanctx))
++ 		return -EINVAL;
++ 
++ 	spin_lock_bh(&hwsim_radio_lock);
++ 	idx = hwsim_radio_idx++;
++ 	spin_unlock_bh(&hwsim_radio_lock);
++ 
++ 	if (param->use_chanctx)
++ 		ops = &mac80211_hwsim_mchan_ops;
++ 	hw = ieee80211_alloc_hw_nm(sizeof(*data), ops, param->hwname);
++ 	if (!hw) {
++ 		printk(KERN_DEBUG "mac80211_hwsim: ieee80211_alloc_hw failed\n");
++ 		err = -ENOMEM;
++ 		goto failed;
++ 	}
++ 	data = hw->priv;
++ 	data->hw = hw;
++ 
++ 	data->dev = device_create(hwsim_class, NULL, 0, hw, "hwsim%d", idx);
++ 	if (IS_ERR(data->dev)) {
++ 		printk(KERN_DEBUG
++ 		       "mac80211_hwsim: device_create failed (%ld)\n",
++ 		       PTR_ERR(data->dev));
++ 		err = -ENOMEM;
++ 		goto failed_drvdata;
++ 	}
++ 	data->dev->driver = &mac80211_hwsim_driver.driver;
++ 	err = device_bind_driver(data->dev);
++ 	if (err != 0) {
++ 		printk(KERN_DEBUG "mac80211_hwsim: device_bind_driver failed (%d)\n",
++ 		       err);
++ 		goto failed_bind;
++ 	}
++ 
++ 	skb_queue_head_init(&data->pending);
++ 
++ 	SET_IEEE80211_DEV(hw, data->dev);
++ 	memset(addr, 0, ETH_ALEN);
++ 	addr[0] = 0x02;
++ 	addr[3] = idx >> 8;
++ 	addr[4] = idx;
++ 	memcpy(data->addresses[0].addr, addr, ETH_ALEN);
++ 	memcpy(data->addresses[1].addr, addr, ETH_ALEN);
++ 	data->addresses[1].addr[0] |= 0x40;
++ 	hw->wiphy->n_addresses = 2;
++ 	hw->wiphy->addresses = data->addresses;
++ 
++ 	data->channels = param->channels;
++ 	data->use_chanctx = param->use_chanctx;
++ 	data->idx = idx;
++ 	data->destroy_on_close = param->destroy_on_close;
++ 	if (info)
++ 		data->portid = info->snd_portid;
++ 
++ 	if (data->use_chanctx) {
++ 		hw->wiphy->max_scan_ssids = 255;
++ 		hw->wiphy->max_scan_ie_len = IEEE80211_MAX_DATA_LEN;
++ 		hw->wiphy->max_remain_on_channel_duration = 1000;
++ 		/* For channels > 1 DFS is not allowed */
++ 		hw->wiphy->n_iface_combinations = 1;
++ 		hw->wiphy->iface_combinations = &data->if_combination;
++ 		if (param->p2p_device)
++ 			data->if_combination = hwsim_if_comb_p2p_dev[0];
++ 		else
++ 			data->if_combination = hwsim_if_comb[0];
++ 		data->if_combination.num_different_channels = data->channels;
++ 	} else if (param->p2p_device) {
++ 		hw->wiphy->iface_combinations = hwsim_if_comb_p2p_dev;
++ 		hw->wiphy->n_iface_combinations =
++ 			ARRAY_SIZE(hwsim_if_comb_p2p_dev);
++ 	} else {
++ 		hw->wiphy->iface_combinations = hwsim_if_comb;
++ 		hw->wiphy->n_iface_combinations = ARRAY_SIZE(hwsim_if_comb);
++ 	}
++ 
++ 	INIT_DELAYED_WORK(&data->roc_done, hw_roc_done);
++ 	INIT_DELAYED_WORK(&data->hw_scan, hw_scan_work);
++ 
++ 	hw->queues = 5;
++ 	hw->offchannel_tx_hw_queue = 4;
++ 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
++ 				     BIT(NL80211_IFTYPE_AP) |
++ 				     BIT(NL80211_IFTYPE_P2P_CLIENT) |
++ 				     BIT(NL80211_IFTYPE_P2P_GO) |
++ 				     BIT(NL80211_IFTYPE_ADHOC) |
++ 				     BIT(NL80211_IFTYPE_MESH_POINT);
++ 
++ 	if (param->p2p_device)
++ 		hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_P2P_DEVICE);
++ 
++ 	hw->flags = IEEE80211_HW_MFP_CAPABLE |
++ 		    IEEE80211_HW_SIGNAL_DBM |
++ 		    IEEE80211_HW_AMPDU_AGGREGATION |
++ 		    IEEE80211_HW_WANT_MONITOR_VIF |
++ 		    IEEE80211_HW_QUEUE_CONTROL |
++ 		    IEEE80211_HW_SUPPORTS_HT_CCK_RATES |
++ 		    IEEE80211_HW_CHANCTX_STA_CSA;
++ 	if (rctbl)
++ 		hw->flags |= IEEE80211_HW_SUPPORTS_RC_TABLE;
++ 
++ 	hw->wiphy->flags |= WIPHY_FLAG_SUPPORTS_TDLS |
++ 			    WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL |
++ 			    WIPHY_FLAG_AP_UAPSD |
++ 			    WIPHY_FLAG_HAS_CHANNEL_SWITCH;
++ 	hw->wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR |
++ 			       NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE |
++ 			       NL80211_FEATURE_STATIC_SMPS |
++ 			       NL80211_FEATURE_DYNAMIC_SMPS |
++ 			       NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR;
++ 
++ 	/* ask mac80211 to reserve space for magic */
++ 	hw->vif_data_size = sizeof(struct hwsim_vif_priv);
++ 	hw->sta_data_size = sizeof(struct hwsim_sta_priv);
++ 	hw->chanctx_data_size = sizeof(struct hwsim_chanctx_priv);
++ 
++ 	memcpy(data->channels_2ghz, hwsim_channels_2ghz,
++ 		sizeof(hwsim_channels_2ghz));
++ 	memcpy(data->channels_5ghz, hwsim_channels_5ghz,
++ 		sizeof(hwsim_channels_5ghz));
++ 	memcpy(data->rates, hwsim_rates, sizeof(hwsim_rates));
++ 
++ 	for (band = IEEE80211_BAND_2GHZ; band < IEEE80211_NUM_BANDS; band++) {
++ 		struct ieee80211_supported_band *sband = &data->bands[band];
++ 		switch (band) {
++ 		case IEEE80211_BAND_2GHZ:
++ 			sband->channels = data->channels_2ghz;
++ 			sband->n_channels = ARRAY_SIZE(hwsim_channels_2ghz);
++ 			sband->bitrates = data->rates;
++ 			sband->n_bitrates = ARRAY_SIZE(hwsim_rates);
++ 			break;
++ 		case IEEE80211_BAND_5GHZ:
++ 			sband->channels = data->channels_5ghz;
++ 			sband->n_channels = ARRAY_SIZE(hwsim_channels_5ghz);
++ 			sband->bitrates = data->rates + 4;
++ 			sband->n_bitrates = ARRAY_SIZE(hwsim_rates) - 4;
++ 			break;
++ 		default:
++ 			continue;
++ 		}
++ 
++ 		sband->ht_cap.ht_supported = true;
++ 		sband->ht_cap.cap = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
++ 				    IEEE80211_HT_CAP_GRN_FLD |
++ 				    IEEE80211_HT_CAP_SGI_20 |
++ 				    IEEE80211_HT_CAP_SGI_40 |
++ 				    IEEE80211_HT_CAP_DSSSCCK40;
++ 		sband->ht_cap.ampdu_factor = 0x3;
++ 		sband->ht_cap.ampdu_density = 0x6;
++ 		memset(&sband->ht_cap.mcs, 0,
++ 		       sizeof(sband->ht_cap.mcs));
++ 		sband->ht_cap.mcs.rx_mask[0] = 0xff;
++ 		sband->ht_cap.mcs.rx_mask[1] = 0xff;
++ 		sband->ht_cap.mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
++ 
++ 		hw->wiphy->bands[band] = sband;
++ 
++ 		sband->vht_cap.vht_supported = true;
++ 		sband->vht_cap.cap =
++ 			IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_11454 |
++ 			IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160_80PLUS80MHZ |
++ 			IEEE80211_VHT_CAP_RXLDPC |
++ 			IEEE80211_VHT_CAP_SHORT_GI_80 |
++ 			IEEE80211_VHT_CAP_SHORT_GI_160 |
++ 			IEEE80211_VHT_CAP_TXSTBC |
++ 			IEEE80211_VHT_CAP_RXSTBC_1 |
++ 			IEEE80211_VHT_CAP_RXSTBC_2 |
++ 			IEEE80211_VHT_CAP_RXSTBC_3 |
++ 			IEEE80211_VHT_CAP_RXSTBC_4 |
++ 			IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK;
++ 		sband->vht_cap.vht_mcs.rx_mcs_map =
++ 			cpu_to_le16(IEEE80211_VHT_MCS_SUPPORT_0_8 << 0 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_8 << 2 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_9 << 4 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_8 << 6 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_8 << 8 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_9 << 10 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_9 << 12 |
++ 				    IEEE80211_VHT_MCS_SUPPORT_0_8 << 14);
++ 		sband->vht_cap.vht_mcs.tx_mcs_map =
++ 			sband->vht_cap.vht_mcs.rx_mcs_map;
++ 	}
++ 
++ 	/* By default all radios belong to the first group */
++ 	data->group = 1;
++ 	mutex_init(&data->mutex);
++ 
++ 	/* Enable frame retransmissions for lossy channels */
++ 	hw->max_rates = 4;
++ 	hw->max_rate_tries = 11;
++ 
++ 	if (param->reg_strict)
++ 		hw->wiphy->regulatory_flags |= REGULATORY_STRICT_REG;
++ 	if (param->regd) {
++ 		data->regd = param->regd;
++ 		hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
++ 		wiphy_apply_custom_regulatory(hw->wiphy, param->regd);
++ 		/* give the regulatory workqueue a chance to run */
++ 		schedule_timeout_interruptible(1);
++ 	}
++ 
++ 	if (param->no_vif)
++ 		hw->flags |= IEEE80211_HW_NO_AUTO_VIF;
++ 
++ 	err = ieee80211_register_hw(hw);
++ 	if (err < 0) {
++ 		printk(KERN_DEBUG "mac80211_hwsim: ieee80211_register_hw failed (%d)\n",
++ 		       err);
++ 		goto failed_hw;
++ 	}
++ 
++ 	wiphy_debug(hw->wiphy, "hwaddr %pM registered\n", hw->wiphy->perm_addr);
++ 
++ 	if (param->reg_alpha2) {
++ 		data->alpha2[0] = param->reg_alpha2[0];
++ 		data->alpha2[1] = param->reg_alpha2[1];
++ 		regulatory_hint(hw->wiphy, param->reg_alpha2);
++ 	}
++ 
++ 	data->debugfs = debugfs_create_dir("hwsim", hw->wiphy->debugfsdir);
++ 	debugfs_create_file("ps", 0666, data->debugfs, data, &hwsim_fops_ps);
++ 	debugfs_create_file("group", 0666, data->debugfs, data,
++ 			    &hwsim_fops_group);
++ 	if (!data->use_chanctx)
++ 		debugfs_create_file("dfs_simulate_radar", 0222,
++ 				    data->debugfs,
++ 				    data, &hwsim_simulate_radar);
++ 
++ 	tasklet_hrtimer_init(&data->beacon_timer,
++ 			     mac80211_hwsim_beacon,
++ 			     CLOCK_MONOTONIC_RAW, HRTIMER_MODE_ABS);
++ 
++ 	spin_lock_bh(&hwsim_radio_lock);
++ 	list_add_tail(&data->list, &hwsim_radios);
++ 	spin_unlock_bh(&hwsim_radio_lock);
++ 
++ 	if (idx > 0)
++ 		hwsim_mcast_new_radio(idx, info, param);
++ 
++ 	return idx;
++ 
++ failed_hw:
++ 	device_release_driver(data->dev);
++ failed_bind:
++ 	device_unregister(data->dev);
++ failed_drvdata:
++ 	ieee80211_free_hw(hw);
++ failed:
++ 	return err;
++ }
++ 
++ static void hwsim_mcast_del_radio(int id, const char *hwname,
++ 				  struct genl_info *info)
++ {
++ 	struct sk_buff *skb;
++ 	void *data;
++ 	int ret;
++ 
++ 	skb = genlmsg_new(GENLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return;
++ 
++ 	data = genlmsg_put(skb, 0, 0, &hwsim_genl_family, 0,
++ 			   HWSIM_CMD_DEL_RADIO);
++ 	if (!data)
++ 		goto error;
++ 
++ 	ret = nla_put_u32(skb, HWSIM_ATTR_RADIO_ID, id);
++ 	if (ret < 0)
++ 		goto error;
++ 
++ 	ret = nla_put(skb, HWSIM_ATTR_RADIO_NAME, strlen(hwname),
++ 		      hwname);
++ 	if (ret < 0)
++ 		goto error;
++ 
++ 	genlmsg_end(skb, data);
++ 
++ 	hwsim_mcast_config_msg(skb, info);
++ 
++ 	return;
++ 
++ error:
++ 	nlmsg_free(skb);
++ }
++ 
++ static void mac80211_hwsim_del_radio(struct mac80211_hwsim_data *data,
++ 				     const char *hwname,
++ 				     struct genl_info *info)
++ {
++ 	hwsim_mcast_del_radio(data->idx, hwname, info);
++ 	debugfs_remove_recursive(data->debugfs);
++ 	ieee80211_unregister_hw(data->hw);
++ 	device_release_driver(data->dev);
++ 	device_unregister(data->dev);
++ 	ieee80211_free_hw(data->hw);
++ }
++ 
++ static int mac80211_hwsim_get_radio(struct sk_buff *skb,
++ 				    struct mac80211_hwsim_data *data,
++ 				    u32 portid, u32 seq,
++ 				    struct netlink_callback *cb, int flags)
++ {
++ 	void *hdr;
++ 	struct hwsim_new_radio_params param = { };
++ 	int res = -EMSGSIZE;
++ 
++ 	hdr = genlmsg_put(skb, portid, seq, &hwsim_genl_family, flags,
++ 			  HWSIM_CMD_GET_RADIO);
++ 	if (!hdr)
++ 		return -EMSGSIZE;
++ 
++ 	if (cb)
++ 		genl_dump_check_consistent(cb, hdr, &hwsim_genl_family);
++ 
++ 	if (data->alpha2[0] && data->alpha2[1])
++ 		param.reg_alpha2 = data->alpha2;
++ 
++ 	param.reg_strict = !!(data->hw->wiphy->regulatory_flags &
++ 					REGULATORY_STRICT_REG);
++ 	param.p2p_device = !!(data->hw->wiphy->interface_modes &
++ 					BIT(NL80211_IFTYPE_P2P_DEVICE));
++ 	param.use_chanctx = data->use_chanctx;
++ 	param.regd = data->regd;
++ 	param.channels = data->channels;
++ 	param.hwname = wiphy_name(data->hw->wiphy);
++ 
++ 	res = append_radio_msg(skb, data->idx, &param);
++ 	if (res < 0)
++ 		goto out_err;
++ 
++ 	genlmsg_end(skb, hdr);
++ 	return 0;
++ 
++ out_err:
++ 	genlmsg_cancel(skb, hdr);
++ 	return res;
++ }
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  
+  static void mac80211_hwsim_free(void)
+  {
+diff --cc net/ipv6/addrconf.c
+index c3291853a9c3,8975d9501d50..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -471,7 -485,12 +471,16 @@@ static int inet6_netconf_fill_devconf(s
+  			devconf->mc_forwarding) < 0)
+  		goto nla_put_failure;
+  #endif
+++<<<<<<< HEAD
+ +	return nlmsg_end(skb, nlh);
+++=======
++ 	if ((type == -1 || type == NETCONFA_PROXY_NEIGH) &&
++ 	    nla_put_s32(skb, NETCONFA_PROXY_NEIGH, devconf->proxy_ndp) < 0)
++ 		goto nla_put_failure;
++ 
++ 	nlmsg_end(skb, nlh);
++ 	return 0;
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  
+  nla_put_failure:
+  	nlmsg_cancel(skb, nlh);
+diff --cc net/l2tp/l2tp_netlink.c
+index 190dfb467519,b4e923f77954..000000000000
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@@ -387,7 -452,7 +388,11 @@@ static int l2tp_nl_cmd_tunnel_dump(stru
+  
+  		if (l2tp_nl_tunnel_send(skb, NETLINK_CB(cb->skb).portid,
+  					cb->nlh->nlmsg_seq, NLM_F_MULTI,
+++<<<<<<< HEAD
+ +					tunnel) <= 0)
+++=======
++ 					tunnel, L2TP_CMD_TUNNEL_GET) < 0)
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  			goto out;
+  
+  		ti++;
+@@@ -737,7 -818,7 +743,11 @@@ static int l2tp_nl_cmd_session_dump(str
+  
+  		if (l2tp_nl_session_send(skb, NETLINK_CB(cb->skb).portid,
+  					 cb->nlh->nlmsg_seq, NLM_F_MULTI,
+++<<<<<<< HEAD
+ +					 session) <= 0)
+++=======
++ 					 session, L2TP_CMD_SESSION_GET) < 0)
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  			break;
+  
+  		si++;
+diff --cc net/nfc/netlink.c
+index f0c4d61f37c0,be387e6219a0..000000000000
+--- a/net/nfc/netlink.c
++++ b/net/nfc/netlink.c
+@@@ -93,7 -94,16 +93,20 @@@ static int nfc_genl_send_target(struct 
+  		    target->sensf_res))
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +	return genlmsg_end(msg, hdr);
+++=======
++ 	if (target->is_iso15693) {
++ 		if (nla_put_u8(msg, NFC_ATTR_TARGET_ISO15693_DSFID,
++ 			       target->iso15693_dsfid) ||
++ 		    nla_put(msg, NFC_ATTR_TARGET_ISO15693_UID,
++ 			    sizeof(target->iso15693_uid), target->iso15693_uid))
++ 			goto nla_put_failure;
++ 	}
++ 
++ 	genlmsg_end(msg, hdr);
++ 	return 0;
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  
+  nla_put_failure:
+  	genlmsg_cancel(msg, hdr);
+@@@ -1025,7 -1124,325 +1040,329 @@@ exit
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static struct genl_ops nfc_genl_ops[] = {
+++=======
++ static int nfc_genl_fw_download(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx;
++ 	char firmware_name[NFC_FIRMWARE_NAME_MAXSIZE + 1];
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	nla_strlcpy(firmware_name, info->attrs[NFC_ATTR_FIRMWARE_NAME],
++ 		    sizeof(firmware_name));
++ 
++ 	rc = nfc_fw_download(dev, firmware_name);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ int nfc_genl_fw_download_done(struct nfc_dev *dev, const char *firmware_name,
++ 			      u32 result)
++ {
++ 	struct sk_buff *msg;
++ 	void *hdr;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	hdr = genlmsg_put(msg, 0, 0, &nfc_genl_family, 0,
++ 			  NFC_CMD_FW_DOWNLOAD);
++ 	if (!hdr)
++ 		goto free_msg;
++ 
++ 	if (nla_put_string(msg, NFC_ATTR_FIRMWARE_NAME, firmware_name) ||
++ 	    nla_put_u32(msg, NFC_ATTR_FIRMWARE_DOWNLOAD_STATUS, result) ||
++ 	    nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, dev->idx))
++ 		goto nla_put_failure;
++ 
++ 	genlmsg_end(msg, hdr);
++ 
++ 	genlmsg_multicast(&nfc_genl_family, msg, 0, 0, GFP_KERNEL);
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ free_msg:
++ 	nlmsg_free(msg);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int nfc_genl_enable_se(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx, se_idx;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	rc = nfc_enable_se(dev, se_idx);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ static int nfc_genl_disable_se(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	int rc;
++ 	u32 idx, se_idx;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX])
++ 		return -EINVAL;
++ 
++ 	idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	rc = nfc_disable_se(dev, se_idx);
++ 
++ 	nfc_put_device(dev);
++ 	return rc;
++ }
++ 
++ static int nfc_genl_send_se(struct sk_buff *msg, struct nfc_dev *dev,
++ 				u32 portid, u32 seq,
++ 				struct netlink_callback *cb,
++ 				int flags)
++ {
++ 	void *hdr;
++ 	struct nfc_se *se, *n;
++ 
++ 	list_for_each_entry_safe(se, n, &dev->secure_elements, list) {
++ 		hdr = genlmsg_put(msg, portid, seq, &nfc_genl_family, flags,
++ 				  NFC_CMD_GET_SE);
++ 		if (!hdr)
++ 			goto nla_put_failure;
++ 
++ 		if (cb)
++ 			genl_dump_check_consistent(cb, hdr, &nfc_genl_family);
++ 
++ 		if (nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, dev->idx) ||
++ 		    nla_put_u32(msg, NFC_ATTR_SE_INDEX, se->idx) ||
++ 		    nla_put_u8(msg, NFC_ATTR_SE_TYPE, se->type))
++ 			goto nla_put_failure;
++ 
++ 		genlmsg_end(msg, hdr);
++ 	}
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int nfc_genl_dump_ses(struct sk_buff *skb,
++ 				 struct netlink_callback *cb)
++ {
++ 	struct class_dev_iter *iter = (struct class_dev_iter *) cb->args[0];
++ 	struct nfc_dev *dev = (struct nfc_dev *) cb->args[1];
++ 	bool first_call = false;
++ 
++ 	if (!iter) {
++ 		first_call = true;
++ 		iter = kmalloc(sizeof(struct class_dev_iter), GFP_KERNEL);
++ 		if (!iter)
++ 			return -ENOMEM;
++ 		cb->args[0] = (long) iter;
++ 	}
++ 
++ 	mutex_lock(&nfc_devlist_mutex);
++ 
++ 	cb->seq = nfc_devlist_generation;
++ 
++ 	if (first_call) {
++ 		nfc_device_iter_init(iter);
++ 		dev = nfc_device_iter_next(iter);
++ 	}
++ 
++ 	while (dev) {
++ 		int rc;
++ 
++ 		rc = nfc_genl_send_se(skb, dev, NETLINK_CB(cb->skb).portid,
++ 					  cb->nlh->nlmsg_seq, cb, NLM_F_MULTI);
++ 		if (rc < 0)
++ 			break;
++ 
++ 		dev = nfc_device_iter_next(iter);
++ 	}
++ 
++ 	mutex_unlock(&nfc_devlist_mutex);
++ 
++ 	cb->args[1] = (long) dev;
++ 
++ 	return skb->len;
++ }
++ 
++ static int nfc_genl_dump_ses_done(struct netlink_callback *cb)
++ {
++ 	struct class_dev_iter *iter = (struct class_dev_iter *) cb->args[0];
++ 
++ 	nfc_device_iter_exit(iter);
++ 	kfree(iter);
++ 
++ 	return 0;
++ }
++ 
++ static int nfc_se_io(struct nfc_dev *dev, u32 se_idx,
++ 		     u8 *apdu, size_t apdu_length,
++ 		     se_io_cb_t cb, void *cb_context)
++ {
++ 	struct nfc_se *se;
++ 	int rc;
++ 
++ 	pr_debug("%s se index %d\n", dev_name(&dev->dev), se_idx);
++ 
++ 	device_lock(&dev->dev);
++ 
++ 	if (!device_is_registered(&dev->dev)) {
++ 		rc = -ENODEV;
++ 		goto error;
++ 	}
++ 
++ 	if (!dev->dev_up) {
++ 		rc = -ENODEV;
++ 		goto error;
++ 	}
++ 
++ 	if (!dev->ops->se_io) {
++ 		rc = -EOPNOTSUPP;
++ 		goto error;
++ 	}
++ 
++ 	se = nfc_find_se(dev, se_idx);
++ 	if (!se) {
++ 		rc = -EINVAL;
++ 		goto error;
++ 	}
++ 
++ 	if (se->state != NFC_SE_ENABLED) {
++ 		rc = -ENODEV;
++ 		goto error;
++ 	}
++ 
++ 	rc = dev->ops->se_io(dev, se_idx, apdu,
++ 			apdu_length, cb, cb_context);
++ 
++ error:
++ 	device_unlock(&dev->dev);
++ 	return rc;
++ }
++ 
++ struct se_io_ctx {
++ 	u32 dev_idx;
++ 	u32 se_idx;
++ };
++ 
++ static void se_io_cb(void *context, u8 *apdu, size_t apdu_len, int err)
++ {
++ 	struct se_io_ctx *ctx = context;
++ 	struct sk_buff *msg;
++ 	void *hdr;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		kfree(ctx);
++ 		return;
++ 	}
++ 
++ 	hdr = genlmsg_put(msg, 0, 0, &nfc_genl_family, 0,
++ 			  NFC_CMD_SE_IO);
++ 	if (!hdr)
++ 		goto free_msg;
++ 
++ 	if (nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, ctx->dev_idx) ||
++ 	    nla_put_u32(msg, NFC_ATTR_SE_INDEX, ctx->se_idx) ||
++ 	    nla_put(msg, NFC_ATTR_SE_APDU, apdu_len, apdu))
++ 		goto nla_put_failure;
++ 
++ 	genlmsg_end(msg, hdr);
++ 
++ 	genlmsg_multicast(&nfc_genl_family, msg, 0, 0, GFP_KERNEL);
++ 
++ 	kfree(ctx);
++ 
++ 	return;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ free_msg:
++ 	nlmsg_free(msg);
++ 	kfree(ctx);
++ 
++ 	return;
++ }
++ 
++ static int nfc_genl_se_io(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nfc_dev *dev;
++ 	struct se_io_ctx *ctx;
++ 	u32 dev_idx, se_idx;
++ 	u8 *apdu;
++ 	size_t apdu_len;
++ 
++ 	if (!info->attrs[NFC_ATTR_DEVICE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_INDEX] ||
++ 	    !info->attrs[NFC_ATTR_SE_APDU])
++ 		return -EINVAL;
++ 
++ 	dev_idx = nla_get_u32(info->attrs[NFC_ATTR_DEVICE_INDEX]);
++ 	se_idx = nla_get_u32(info->attrs[NFC_ATTR_SE_INDEX]);
++ 
++ 	dev = nfc_get_device(dev_idx);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	if (!dev->ops || !dev->ops->se_io)
++ 		return -ENOTSUPP;
++ 
++ 	apdu_len = nla_len(info->attrs[NFC_ATTR_SE_APDU]);
++ 	if (apdu_len == 0)
++ 		return -EINVAL;
++ 
++ 	apdu = nla_data(info->attrs[NFC_ATTR_SE_APDU]);
++ 	if (!apdu)
++ 		return -EINVAL;
++ 
++ 	ctx = kzalloc(sizeof(struct se_io_ctx), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	ctx->dev_idx = dev_idx;
++ 	ctx->se_idx = se_idx;
++ 
++ 	return nfc_se_io(dev, se_idx, apdu, apdu_len, se_io_cb, ctx);
++ }
++ 
++ static const struct genl_ops nfc_genl_ops[] = {
+++>>>>>>> 053c095a82cf (netlink: make nlmsg_end() and genlmsg_end() void)
+  	{
+  		.cmd = NFC_CMD_GET_DEVICE,
+  		.doit = nfc_genl_get_device,
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path net/ieee802154/nl802154.c
+diff --git a/drivers/acpi/event.c b/drivers/acpi/event.c
+index 6cb8cd94d30b..9d55d079b7c4 100644
+--- a/drivers/acpi/event.c
++++ b/drivers/acpi/event.c
+@@ -194,7 +194,6 @@ int acpi_bus_generate_netlink_event(const char *device_class,
+ 	struct acpi_genl_event *event;
+ 	void *msg_header;
+ 	int size;
+-	int result;
+ 
+ 	/* allocate memory */
+ 	size = nla_total_size(sizeof(struct acpi_genl_event)) +
+@@ -236,11 +235,7 @@ int acpi_bus_generate_netlink_event(const char *device_class,
+ 	event->data = data;
+ 
+ 	/* send multicast genetlink message */
+-	result = genlmsg_end(skb, msg_header);
+-	if (result < 0) {
+-		nlmsg_free(skb);
+-		return result;
+-	}
++	genlmsg_end(skb, msg_header);
+ 
+ 	genlmsg_multicast(&acpi_event_genl_family, skb, 0, 0, GFP_ATOMIC);
+ 	return 0;
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index c9c40f07cb6d..3b993cfda5a5 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -363,7 +363,8 @@ static int vxlan_fdb_info(struct sk_buff *skb, struct vxlan_dev *vxlan,
+ 	if (nla_put(skb, NDA_CACHEINFO, sizeof(ci), &ci))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+* Unmerged path drivers/net/wireless/mac80211_hwsim.c
+diff --git a/drivers/scsi/pmcraid.c b/drivers/scsi/pmcraid.c
+index 16da4df74d03..90ece0e487a0 100644
+--- a/drivers/scsi/pmcraid.c
++++ b/drivers/scsi/pmcraid.c
+@@ -1514,13 +1514,7 @@ static int pmcraid_notify_aen(
+ 	}
+ 
+ 	/* send genetlink multicast message to notify appplications */
+-	result = genlmsg_end(skb, msg_header);
+-
+-	if (result < 0) {
+-		pmcraid_err("genlmsg_end failed\n");
+-		nlmsg_free(skb);
+-		return result;
+-	}
++	genlmsg_end(skb, msg_header);
+ 
+ 	result = genlmsg_multicast(&pmcraid_event_family, skb,
+ 				   0, 0, GFP_ATOMIC);
+diff --git a/drivers/thermal/thermal_core.c b/drivers/thermal/thermal_core.c
+index 361d48356562..0dce5095a6a1 100644
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -1906,11 +1906,7 @@ int thermal_generate_netlink_event(struct thermal_zone_device *tz,
+ 	thermal_event->event = event;
+ 
+ 	/* send multicast genetlink message */
+-	result = genlmsg_end(skb, msg_header);
+-	if (result < 0) {
+-		nlmsg_free(skb);
+-		return result;
+-	}
++	genlmsg_end(skb, msg_header);
+ 
+ 	result = genlmsg_multicast(&thermal_event_genl_family, skb, 0,
+ 				   0, GFP_ATOMIC);
+diff --git a/fs/dlm/netlink.c b/fs/dlm/netlink.c
+index e7cfbaf8d0e2..1e6e227134d7 100644
+--- a/fs/dlm/netlink.c
++++ b/fs/dlm/netlink.c
+@@ -56,13 +56,8 @@ static int send_data(struct sk_buff *skb)
+ {
+ 	struct genlmsghdr *genlhdr = nlmsg_data((struct nlmsghdr *)skb->data);
+ 	void *data = genlmsg_data(genlhdr);
+-	int rv;
+ 
+-	rv = genlmsg_end(skb, data);
+-	if (rv < 0) {
+-		nlmsg_free(skb);
+-		return rv;
+-	}
++	genlmsg_end(skb, data);
+ 
+ 	return genlmsg_unicast(&init_net, skb, listener_nlportid);
+ }
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index e6b6ed5ca906..9cbb39e370cd 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -264,9 +264,9 @@ static inline void *genlmsg_put_reply(struct sk_buff *skb,
+  * @skb: socket buffer the message is stored in
+  * @hdr: user specific header
+  */
+-static inline int genlmsg_end(struct sk_buff *skb, void *hdr)
++static inline void genlmsg_end(struct sk_buff *skb, void *hdr)
+ {
+-	return nlmsg_end(skb, hdr - GENL_HDRLEN - NLMSG_HDRLEN);
++	nlmsg_end(skb, hdr - GENL_HDRLEN - NLMSG_HDRLEN);
+ }
+ 
+ /**
+diff --git a/include/net/netlink.h b/include/net/netlink.h
+index 3a4f85cdafa6..a53889ccfa4f 100644
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@ -506,14 +506,10 @@ static inline struct sk_buff *nlmsg_new(size_t payload, gfp_t flags)
+  * Corrects the netlink message header to include the appeneded
+  * attributes. Only necessary if attributes have been added to
+  * the message.
+- *
+- * Returns the total data length of the skb.
+  */
+-static inline int nlmsg_end(struct sk_buff *skb, struct nlmsghdr *nlh)
++static inline void nlmsg_end(struct sk_buff *skb, struct nlmsghdr *nlh)
+ {
+ 	nlh->nlmsg_len = skb_tail_pointer(skb) - (unsigned char *)nlh;
+-
+-	return skb->len;
+ }
+ 
+ /**
+diff --git a/kernel/taskstats.c b/kernel/taskstats.c
+index b737e2756cfe..b9130032dd65 100644
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@ -111,13 +111,8 @@ static int send_reply(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct genlmsghdr *genlhdr = nlmsg_data(nlmsg_hdr(skb));
+ 	void *reply = genlmsg_data(genlhdr);
+-	int rc;
+ 
+-	rc = genlmsg_end(skb, reply);
+-	if (rc < 0) {
+-		nlmsg_free(skb);
+-		return rc;
+-	}
++	genlmsg_end(skb, reply);
+ 
+ 	return genlmsg_reply(skb, info);
+ }
+@@ -134,11 +129,7 @@ static void send_cpu_listeners(struct sk_buff *skb,
+ 	void *reply = genlmsg_data(genlhdr);
+ 	int rc, delcount = 0;
+ 
+-	rc = genlmsg_end(skb, reply);
+-	if (rc < 0) {
+-		nlmsg_free(skb);
+-		return;
+-	}
++	genlmsg_end(skb, reply);
+ 
+ 	rc = 0;
+ 	down_read(&listeners->sem);
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 1e923efdd041..1570ed24465d 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -632,7 +632,8 @@ static int fdb_fill_info(struct sk_buff *skb, const struct net_bridge *br,
+ 	if (fdb->vlan_id && nla_put(skb, NDA_VLAN, sizeof(u16), &fdb->vlan_id))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/bridge/br_mdb.c b/net/bridge/br_mdb.c
+index 1d2610a5b465..e8360b051a46 100644
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -189,7 +189,8 @@ static int nlmsg_populate_mdb_fill(struct sk_buff *skb,
+ 
+ 	nla_nest_end(skb, nest2);
+ 	nla_nest_end(skb, nest);
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ end:
+ 	nla_nest_end(skb, nest);
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 587f0af6378f..204f777cf770 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -262,7 +262,8 @@ static int br_fill_ifinfo(struct sk_buff *skb,
+ 	}
+ 
+ done:
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/can/gw.c b/net/can/gw.c
+index 6465cdd71245..903498dc2f78 100644
+--- a/net/can/gw.c
++++ b/net/can/gw.c
+@@ -564,7 +564,8 @@ static int cgw_put_job(struct sk_buff *skb, struct cgw_job *gwj, int type,
+ 			goto cancel;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ cancel:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index 2771bcd5bded..204a2d5e449f 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -573,7 +573,8 @@ static int fib_nl_fill_rule(struct sk_buff *skb, struct fib_rule *rule,
+ 	if (ops->fill(rule, skb, frh) < 0)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index edb434d186c9..41389dcf4787 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -1915,7 +1915,8 @@ static int neightbl_fill_info(struct sk_buff *skb, struct neigh_table *tbl,
+ 		goto nla_put_failure;
+ 
+ 	read_unlock_bh(&tbl->lock);
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	read_unlock_bh(&tbl->lock);
+@@ -1948,7 +1949,8 @@ static int neightbl_fill_param_info(struct sk_buff *skb,
+ 		goto errout;
+ 
+ 	read_unlock_bh(&tbl->lock);
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ errout:
+ 	read_unlock_bh(&tbl->lock);
+ 	nlmsg_cancel(skb, nlh);
+@@ -2213,7 +2215,8 @@ static int neigh_fill_info(struct sk_buff *skb, struct neighbour *neigh,
+ 	    nla_put(skb, NDA_CACHEINFO, sizeof(ci), &ci))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -2243,7 +2246,8 @@ static int pneigh_fill_info(struct sk_buff *skb, struct pneigh_entry *pn,
+ 	if (nla_put(skb, NDA_DST, tbl->key_len, pn->key))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 02693895e84c..89b72a68f035 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -1256,7 +1256,8 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+ 
+ 	nla_nest_end(skb, af_spec);
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -2425,7 +2426,8 @@ static int nlmsg_populate_fdb_fill(struct sk_buff *skb,
+ 	if (nla_put(skb, NDA_LLADDR, ETH_ALEN, addr))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -2824,7 +2826,8 @@ int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+ 
+ 	nla_nest_end(skb, protinfo);
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+ 	return -EMSGSIZE;
+diff --git a/net/decnet/dn_dev.c b/net/decnet/dn_dev.c
+index 70f254912a36..35fbe0932018 100644
+--- a/net/decnet/dn_dev.c
++++ b/net/decnet/dn_dev.c
+@@ -696,7 +696,8 @@ static int dn_nl_fill_ifaddr(struct sk_buff *skb, struct dn_ifaddr *ifa,
+ 	    (ifa->ifa_label[0] &&
+ 	     nla_put_string(skb, IFA_LABEL, ifa->ifa_label)))
+ 		goto nla_put_failure;
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/decnet/dn_route.c b/net/decnet/dn_route.c
+index d83f33f317e7..0029c771c8bf 100644
+--- a/net/decnet/dn_route.c
++++ b/net/decnet/dn_route.c
+@@ -1616,7 +1616,8 @@ static int dn_rt_fill_info(struct sk_buff *skb, u32 portid, u32 seq,
+ 	    nla_put_u32(skb, RTA_IIF, rt->fld.flowidn_iif) < 0)
+ 		goto errout;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ errout:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/decnet/dn_table.c b/net/decnet/dn_table.c
+index 3f19fcbf126d..1540b506e3e0 100644
+--- a/net/decnet/dn_table.c
++++ b/net/decnet/dn_table.c
+@@ -367,7 +367,8 @@ static int dn_fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
+ 		nla_nest_end(skb, mp_head);
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ errout:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
+index 43f1b2bf469f..0ba69a38fc09 100644
+--- a/net/ieee802154/netlink.c
++++ b/net/ieee802154/netlink.c
+@@ -67,13 +67,9 @@ int ieee802154_nl_mcast(struct sk_buff *msg, unsigned int group)
+ 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
+ 	void *hdr = genlmsg_data(nlmsg_data(nlh));
+ 
+-	if (genlmsg_end(msg, hdr) < 0)
+-		goto out;
++	genlmsg_end(msg, hdr);
+ 
+ 	return genlmsg_multicast(&nl802154_family, msg, 0, group, GFP_ATOMIC);
+-out:
+-	nlmsg_free(msg);
+-	return -ENOBUFS;
+ }
+ 
+ struct sk_buff *ieee802154_nl_new_reply(struct genl_info *info,
+@@ -100,13 +96,9 @@ int ieee802154_nl_reply(struct sk_buff *msg, struct genl_info *info)
+ 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
+ 	void *hdr = genlmsg_data(nlmsg_data(nlh));
+ 
+-	if (genlmsg_end(msg, hdr) < 0)
+-		goto out;
++	genlmsg_end(msg, hdr);
+ 
+ 	return genlmsg_reply(msg, info);
+-out:
+-	nlmsg_free(msg);
+-	return -ENOBUFS;
+ }
+ 
+ static const struct genl_ops ieee8021154_ops[] = {
+diff --git a/net/ieee802154/nl-mac.c b/net/ieee802154/nl-mac.c
+index ba5c1e002f37..9c5c96382675 100644
+--- a/net/ieee802154/nl-mac.c
++++ b/net/ieee802154/nl-mac.c
+@@ -265,7 +265,8 @@ static int ieee802154_nl_fill_iface(struct sk_buff *msg, u32 portid,
+ 			ieee802154_mlme_ops(dev)->get_pan_id(dev)))
+ 		goto nla_put_failure;
+ 	wpan_phy_put(phy);
+-	return genlmsg_end(msg, hdr);
++	genlmsg_end(msg, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	wpan_phy_put(phy);
+diff --git a/net/ieee802154/nl-phy.c b/net/ieee802154/nl-phy.c
+index d08c7a43dcd1..dabb88f79e24 100644
+--- a/net/ieee802154/nl-phy.c
++++ b/net/ieee802154/nl-phy.c
+@@ -67,7 +67,8 @@ static int ieee802154_nl_fill_phy(struct sk_buff *msg, u32 portid,
+ 		goto nla_put_failure;
+ 	mutex_unlock(&phy->pib_lock);
+ 	kfree(buf);
+-	return genlmsg_end(msg, hdr);
++	genlmsg_end(msg, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	mutex_unlock(&phy->pib_lock);
+* Unmerged path net/ieee802154/nl802154.c
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 25ce9bd1a367..e73d7515d150 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1512,7 +1512,8 @@ static int inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,
+ 			  preferred, valid))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -1556,7 +1557,7 @@ static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
+ 				if (inet_fill_ifaddr(skb, ifa,
+ 					     NETLINK_CB(cb->skb).portid,
+ 					     cb->nlh->nlmsg_seq,
+-					     RTM_NEWADDR, NLM_F_MULTI) <= 0) {
++					     RTM_NEWADDR, NLM_F_MULTI) < 0) {
+ 					rcu_read_unlock();
+ 					goto done;
+ 				}
+@@ -1733,7 +1734,8 @@ static int inet_netconf_fill_devconf(struct sk_buff *skb, int ifindex,
+ 			IPV4_DEVCONF(*devconf, MC_FORWARDING)) < 0)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index 1938e2490ebe..63ce80f9cb23 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -1089,7 +1089,8 @@ int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
+ 		nla_nest_end(skb, mp);
+ 	}
+ #endif
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ipv4/inet_diag.c b/net/ipv4/inet_diag.c
+index 9dc6c425c768..d66ec5a042df 100644
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -237,7 +237,8 @@ int inet_sk_diag_fill(struct sock *sk, struct inet_connection_sock *icsk,
+ 	}
+ 
+ out:
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ errout:
+ 	nlmsg_cancel(skb, nlh);
+@@ -305,7 +306,8 @@ static int inet_twsk_diag_fill(struct inet_timewait_sock *tw,
+ 	}
+ #endif
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb,
+@@ -797,7 +799,8 @@ static int inet_diag_fill_req(struct sk_buff *skb, struct sock *sk,
+ 	}
+ #endif
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int inet_diag_dump_reqs(struct sk_buff *skb, struct sock *sk,
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 2a227e82ab08..5d37f45f1f59 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -2299,7 +2299,8 @@ static int ipmr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
+ 	if (err < 0 && err != -ENOENT)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 31700d4dc025..cb5a21d56fea 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2370,7 +2370,8 @@ static int rt_fill_info(struct net *net,  __be32 dst, __be32 src,
+ 	if (rtnl_put_cacheinfo(skb, &rt->dst, 0, expires, error) < 0)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index f24d6544b571..02307e286e43 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -889,7 +889,8 @@ static int tcp_metrics_dump_info(struct sk_buff *skb,
+ 	if (tcp_metrics_fill_info(skb, tm) < 0)
+ 		goto nla_put_failure;
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+* Unmerged path net/ipv6/addrconf.c
+diff --git a/net/ipv6/addrlabel.c b/net/ipv6/addrlabel.c
+index 9147cfafd5f7..6bc7234d62a7 100644
+--- a/net/ipv6/addrlabel.c
++++ b/net/ipv6/addrlabel.c
+@@ -484,7 +484,8 @@ static int ip6addrlbl_fill(struct sk_buff *skb,
+ 		return -EMSGSIZE;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int ip6addrlbl_dump(struct sk_buff *skb, struct netlink_callback *cb)
+@@ -504,7 +505,7 @@ static int ip6addrlbl_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 					      cb->nlh->nlmsg_seq,
+ 					      RTM_NEWADDRLABEL,
+ 					      NLM_F_MULTI);
+-			if (err <= 0)
++			if (err < 0)
+ 				break;
+ 		}
+ 		idx++;
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 052ec06f45c0..677243b37477 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -293,7 +293,6 @@ static int fib6_dump_node(struct fib6_walker_t *w)
+ 			w->leaf = rt;
+ 			return 1;
+ 		}
+-		WARN_ON(res == 0);
+ 	}
+ 	w->leaf = NULL;
+ 	return 0;
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index 5e1be5322898..9253876ae06c 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -2388,7 +2388,8 @@ static int ip6mr_fill_mroute(struct mr6_table *mrt, struct sk_buff *skb,
+ 	if (err < 0 && err != -ENOENT)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 403fb7ab35ee..6df99a400d53 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2746,7 +2746,8 @@ static int rt6_fill_node(struct net *net,
+ 	if (rtnl_put_cacheinfo(skb, &rt->dst, 0, expires, rt->dst.error) < 0)
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+* Unmerged path net/l2tp/l2tp_netlink.c
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index cee5bca3b8b3..d9d68167345e 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -2945,7 +2945,8 @@ static int ip_vs_genl_dump_service(struct sk_buff *skb,
+ 	if (ip_vs_genl_fill_service(skb, svc) < 0)
+ 		goto nla_put_failure;
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+@@ -3136,7 +3137,8 @@ static int ip_vs_genl_dump_dest(struct sk_buff *skb, struct ip_vs_dest *dest,
+ 	if (ip_vs_genl_fill_dest(skb, dest) < 0)
+ 		goto nla_put_failure;
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+@@ -3265,7 +3267,8 @@ static int ip_vs_genl_dump_daemon(struct sk_buff *skb, __u32 state,
+ 	if (ip_vs_genl_fill_daemon(skb, state, mcast_ifn, syncid))
+ 		goto nla_put_failure;
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 9e8a0bd82177..e57cfccd0784 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -449,7 +449,8 @@ static int nf_tables_fill_table_info(struct sk_buff *skb, struct net *net,
+ 	    nla_put_be32(skb, NFTA_TABLE_USE, htonl(table->use)))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+@@ -991,7 +992,8 @@ static int nf_tables_fill_chain_info(struct sk_buff *skb, struct net *net,
+ 	if (nla_put_be32(skb, NFTA_CHAIN_USE, htonl(chain->use)))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+@@ -1776,7 +1778,8 @@ static int nf_tables_fill_rule_info(struct sk_buff *skb, struct net *net,
+ 			goto nla_put_failure;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+@@ -2442,7 +2445,8 @@ static int nf_tables_fill_set(struct sk_buff *skb, const struct nft_ctx *ctx,
+ 		goto nla_put_failure;
+ 	nla_nest_end(skb, desc);
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+@@ -3164,7 +3168,8 @@ static int nf_tables_fill_setelem_info(struct sk_buff *skb,
+ 
+ 	nla_nest_end(skb, nest);
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+@@ -3483,7 +3488,8 @@ static int nf_tables_fill_gen_info(struct sk_buff *skb, struct net *net,
+ 	if (nla_put_be32(skb, NFTA_GEN_ID, htonl(net->nft.base_seq)))
+ 		goto nla_put_failure;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_trim(skb, nlh);
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index 69345cebe3a3..59738ffdc1d9 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -642,7 +642,8 @@ static int netlbl_cipsov4_listall_cb(struct cipso_v4_doi *doi_def, void *arg)
+ 	if (ret_val != 0)
+ 		goto listall_cb_failure;
+ 
+-	return genlmsg_end(cb_arg->skb, data);
++	genlmsg_end(cb_arg->skb, data);
++	return 0;
+ 
+ listall_cb_failure:
+ 	genlmsg_cancel(cb_arg->skb, data);
+diff --git a/net/netlabel/netlabel_mgmt.c b/net/netlabel/netlabel_mgmt.c
+index ef12a28e7be3..2ea2a40e0cdc 100644
+--- a/net/netlabel/netlabel_mgmt.c
++++ b/net/netlabel/netlabel_mgmt.c
+@@ -453,7 +453,8 @@ static int netlbl_mgmt_listall_cb(struct netlbl_dom_map *entry, void *arg)
+ 		goto listall_cb_failure;
+ 
+ 	cb_arg->seq++;
+-	return genlmsg_end(cb_arg->skb, data);
++	genlmsg_end(cb_arg->skb, data);
++	return 0;
+ 
+ listall_cb_failure:
+ 	genlmsg_cancel(cb_arg->skb, data);
+@@ -617,7 +618,8 @@ static int netlbl_mgmt_protocols_cb(struct sk_buff *skb,
+ 	if (ret_val != 0)
+ 		goto protocols_cb_failure;
+ 
+-	return genlmsg_end(skb, data);
++	genlmsg_end(skb, data);
++	return 0;
+ 
+ protocols_cb_failure:
+ 	genlmsg_cancel(skb, data);
+diff --git a/net/netlabel/netlabel_unlabeled.c b/net/netlabel/netlabel_unlabeled.c
+index d2e531aac07a..63daba7ab838 100644
+--- a/net/netlabel/netlabel_unlabeled.c
++++ b/net/netlabel/netlabel_unlabeled.c
+@@ -1161,7 +1161,8 @@ static int netlbl_unlabel_staticlist_gen(u32 cmd,
+ 		goto list_cb_failure;
+ 
+ 	cb_arg->seq++;
+-	return genlmsg_end(cb_arg->skb, data);
++	genlmsg_end(cb_arg->skb, data);
++	return 0;
+ 
+ list_cb_failure:
+ 	genlmsg_cancel(cb_arg->skb, data);
+diff --git a/net/netlink/diag.c b/net/netlink/diag.c
+index fcca36d81a62..d9e7aa2fa3d1 100644
+--- a/net/netlink/diag.c
++++ b/net/netlink/diag.c
+@@ -91,7 +91,8 @@ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb,
+ 	    sk_diag_put_rings_cfg(sk, skb))
+ 		goto out_nlmsg_trim;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ out_nlmsg_trim:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/netlink/genetlink.c b/net/netlink/genetlink.c
+index ad13ef1bdecd..a93aabe188f7 100644
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@ -760,7 +760,8 @@ static int ctrl_fill_info(struct genl_family *family, u32 portid, u32 seq,
+ 		nla_nest_end(skb, nla_grps);
+ 	}
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+@@ -800,7 +801,8 @@ static int ctrl_fill_mcgrp_info(struct genl_family *family,
+ 	nla_nest_end(skb, nest);
+ 	nla_nest_end(skb, nla_grps);
+ 
+-	return genlmsg_end(skb, hdr);
++	genlmsg_end(skb, hdr);
++	return 0;
+ 
+ nla_put_failure:
+ 	genlmsg_cancel(skb, hdr);
+* Unmerged path net/nfc/netlink.c
+diff --git a/net/packet/diag.c b/net/packet/diag.c
+index 92f2c7107eec..0ed68f0238bf 100644
+--- a/net/packet/diag.c
++++ b/net/packet/diag.c
+@@ -177,7 +177,8 @@ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb,
+ 				     PACKET_DIAG_FILTER))
+ 		goto out_nlmsg_trim;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ out_nlmsg_trim:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/phonet/pn_netlink.c b/net/phonet/pn_netlink.c
+index b64151ade6b3..54d766842c2b 100644
+--- a/net/phonet/pn_netlink.c
++++ b/net/phonet/pn_netlink.c
+@@ -121,7 +121,8 @@ static int fill_addr(struct sk_buff *skb, struct net_device *dev, u8 addr,
+ 	ifm->ifa_index = dev->ifindex;
+ 	if (nla_put_u8(skb, IFA_LOCAL, addr))
+ 		goto nla_put_failure;
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -190,7 +191,8 @@ static int fill_route(struct sk_buff *skb, struct net_device *dev, u8 dst,
+ 	if (nla_put_u8(skb, RTA_DST, dst) ||
+ 	    nla_put_u32(skb, RTA_OIF, dev->ifindex))
+ 		goto nla_put_failure;
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb, nlh);
+@@ -282,9 +284,13 @@ static int route_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
+ 
+ 		if (addr_idx++ < addr_start_idx)
+ 			continue;
+-		if (fill_route(skb, dev, addr << 2, NETLINK_CB(cb->skb).portid,
+-				cb->nlh->nlmsg_seq, RTM_NEWROUTE))
+-			goto out;
++		fill_route(skb, dev, addr << 2, NETLINK_CB(cb->skb).portid,
++			   cb->nlh->nlmsg_seq, RTM_NEWROUTE);
++		/* fill_route() used to return > 0 (or negative errors) but
++		 * never 0 - ignore the return value and just go out to
++		 * call dumpit again from outside to preserve the behavior
++		 */
++		goto out;
+ 	}
+ 
+ out:
+diff --git a/net/unix/diag.c b/net/unix/diag.c
+index 86fa0f3b2caf..ef542fbca9fe 100644
+--- a/net/unix/diag.c
++++ b/net/unix/diag.c
+@@ -155,7 +155,8 @@ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb, struct unix_diag_r
+ 	if (nla_put_u8(skb, UNIX_DIAG_SHUTDOWN, sk->sk_shutdown))
+ 		goto out_nlmsg_trim;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ out_nlmsg_trim:
+ 	nlmsg_cancel(skb, nlh);
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index 932527fd68a2..a0aa550c3266 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -977,7 +977,8 @@ static int build_spdinfo(struct sk_buff *skb, struct net *net,
+ 		return err;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_get_spdinfo(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -1034,7 +1035,8 @@ static int build_sadinfo(struct sk_buff *skb, struct net *net,
+ 		return err;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_get_sadinfo(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -1784,7 +1786,8 @@ static int build_aevent(struct sk_buff *skb, struct xfrm_state *x, const struct
+ 	if (err)
+ 		goto out_cancel;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ out_cancel:
+ 	nlmsg_cancel(skb, nlh);
+@@ -2239,7 +2242,8 @@ static int build_migrate(struct sk_buff *skb, const struct xfrm_migrate *m,
+ 			goto out_cancel;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ 
+ out_cancel:
+ 	nlmsg_cancel(skb, nlh);
+@@ -2433,7 +2437,8 @@ static int build_expire(struct sk_buff *skb, struct xfrm_state *x, const struct
+ 	if (err)
+ 		return err;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_exp_state_notify(struct xfrm_state *x, const struct km_event *c)
+@@ -2655,7 +2660,8 @@ static int build_acquire(struct sk_buff *skb, struct xfrm_state *x,
+ 		return err;
+ 	}
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_send_acquire(struct xfrm_state *x, struct xfrm_tmpl *xt,
+@@ -2770,7 +2776,8 @@ static int build_polexpire(struct sk_buff *skb, struct xfrm_policy *xp,
+ 	}
+ 	upe->hard = !!hard;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_exp_policy_notify(struct xfrm_policy *xp, int dir, const struct km_event *c)
+@@ -2929,7 +2936,8 @@ static int build_report(struct sk_buff *skb, u8 proto,
+ 			return err;
+ 		}
+ 	}
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_send_report(struct net *net, u8 proto,
+@@ -2974,7 +2982,8 @@ static int build_mapping(struct sk_buff *skb, struct xfrm_state *x,
+ 	um->old_sport = x->encap->encap_sport;
+ 	um->reqid = x->props.reqid;
+ 
+-	return nlmsg_end(skb, nlh);
++	nlmsg_end(skb, nlh);
++	return 0;
+ }
+ 
+ static int xfrm_send_mapping(struct xfrm_state *x, xfrm_address_t *ipaddr,
