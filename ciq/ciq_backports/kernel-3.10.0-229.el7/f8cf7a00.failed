@@ -1,0 +1,307 @@
+ixgbe: fix errors related to protected AUTOC calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Don Skidmore <donald.c.skidmore@intel.com>
+commit f8cf7a00d82b6c7b984adc917199cb63552957fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f8cf7a00.failed
+
+Found several incorrect conditionals after calling the prot_autoc_*
+functions. Likewise we weren't always freeing the FWSW semaphore after
+grabbing it.   This would lead to DA cables being unable to link along with
+possible other errors.
+
+CC: Arun Sharma <asharma@fb.com>
+CC: Emil Tantilov <emil.s.tantilov@intel.com>
+	Signed-off-by: Don Skidmore <donald.c.skidmore@intel.com>
+	Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit f8cf7a00d82b6c7b984adc917199cb63552957fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+index d21eec09ebb5,572cce47797c..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+@@@ -208,6 -189,81 +208,84 @@@ setup_sfp_err
+  	return IXGBE_ERR_SFP_SETUP_NOT_COMPLETE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *  prot_autoc_read_82599 - Hides MAC differences needed for AUTOC read
++  *  @hw: pointer to hardware structure
++  *  @locked: Return the if we locked for this read.
++  *  @reg_val: Value we read from AUTOC
++  *
++  *  For this part (82599) we need to wrap read-modify-writes with a possible
++  *  FW/SW lock.  It is assumed this lock will be freed with the next
++  *  prot_autoc_write_82599().  Note, that locked can only be true in cases
++  *  where this function doesn't return an error.
++  **/
++ static s32 prot_autoc_read_82599(struct ixgbe_hw *hw, bool *locked,
++ 				 u32 *reg_val)
++ {
++ 	s32 ret_val;
++ 
++ 	*locked = false;
++ 	/* If LESM is on then we need to hold the SW/FW semaphore. */
++ 	if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
++ 		ret_val = hw->mac.ops.acquire_swfw_sync(hw,
++ 					IXGBE_GSSR_MAC_CSR_SM);
++ 		if (ret_val)
++ 			return IXGBE_ERR_SWFW_SYNC;
++ 
++ 		*locked = true;
++ 	}
++ 
++ 	*reg_val = IXGBE_READ_REG(hw, IXGBE_AUTOC);
++ 	return 0;
++ }
++ 
++ /**
++  * prot_autoc_write_82599 - Hides MAC differences needed for AUTOC write
++  * @hw: pointer to hardware structure
++  * @reg_val: value to write to AUTOC
++  * @locked: bool to indicate whether the SW/FW lock was already taken by
++  *	     previous proc_autoc_read_82599.
++  *
++  * This part (82599) may need to hold a the SW/FW lock around all writes to
++  * AUTOC. Likewise after a write we need to do a pipeline reset.
++  **/
++ static s32 prot_autoc_write_82599(struct ixgbe_hw *hw, u32 autoc, bool locked)
++ {
++ 	s32 ret_val = 0;
++ 
++ 	/* Blocked by MNG FW so bail */
++ 	if (ixgbe_check_reset_blocked(hw))
++ 		goto out;
++ 
++ 	/* We only need to get the lock if:
++ 	 *  - We didn't do it already (in the read part of a read-modify-write)
++ 	 *  - LESM is enabled.
++ 	 */
++ 	if (!locked && ixgbe_verify_lesm_fw_enabled_82599(hw)) {
++ 		ret_val = hw->mac.ops.acquire_swfw_sync(hw,
++ 					IXGBE_GSSR_MAC_CSR_SM);
++ 		if (ret_val)
++ 			return IXGBE_ERR_SWFW_SYNC;
++ 
++ 		locked = true;
++ 	}
++ 
++ 	IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc);
++ 	ret_val = ixgbe_reset_pipeline_82599(hw);
++ 
++ out:
++ 	/* Free the SW/FW semaphore as we either grabbed it here or
++ 	 * already had it when this function was called.
++ 	 */
++ 	if (locked)
++ 		hw->mac.ops.release_swfw_sync(hw, IXGBE_GSSR_MAC_CSR_SM);
++ 
++ 	return ret_val;
++ }
++ 
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  static s32 ixgbe_get_invariants_82599(struct ixgbe_hw *hw)
+  {
+  	struct ixgbe_mac_info *mac = &hw->mac;
+@@@ -1031,27 -1094,10 +1109,33 @@@ static s32 ixgbe_setup_mac_link_82599(s
+  	}
+  
+  	if (autoc != start_autoc) {
+ +		/* Need SW/FW semaphore around AUTOC writes if LESM is on,
+ +		 * likewise reset_pipeline requires us to hold this lock as
+ +		 * it also writes to AUTOC.
+ +		 */
+ +		if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+ +			status = hw->mac.ops.acquire_swfw_sync(hw,
+ +							IXGBE_GSSR_MAC_CSR_SM);
+ +			if (status != 0)
+ +				goto out;
+ +
+ +			got_lock = true;
+ +		}
+ +
+  		/* Restart link */
+++<<<<<<< HEAD
+ +		IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc);
+ +		hw->mac.cached_autoc = autoc;
+ +		ixgbe_reset_pipeline_82599(hw);
+ +
+ +		if (got_lock)
+ +			hw->mac.ops.release_swfw_sync(hw,
+ +						      IXGBE_GSSR_MAC_CSR_SM);
+++=======
++ 		status = hw->mac.ops.prot_autoc_write(hw, autoc, false);
++ 		if (status)
++ 			goto out;
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  
+  		/* Only poll for autoneg to complete if specified to do so */
+  		if (autoneg_wait_to_complete) {
+@@@ -1233,28 -1275,12 +1317,37 @@@ mac_reset_top
+  				(hw->mac.orig_autoc & ~IXGBE_AUTOC_LMS_MASK) |
+  				curr_lms;
+  
+++<<<<<<< HEAD
+ +		if (hw->mac.cached_autoc != hw->mac.orig_autoc) {
+ +			/* Need SW/FW semaphore around AUTOC writes if LESM is
+ +			 * on, likewise reset_pipeline requires us to hold
+ +			 * this lock as it also writes to AUTOC.
+ +			 */
+ +			bool got_lock = false;
+ +			if (ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+ +				status = hw->mac.ops.acquire_swfw_sync(hw,
+ +							IXGBE_GSSR_MAC_CSR_SM);
+ +				if (status)
+ +					goto reset_hw_out;
+ +
+ +				got_lock = true;
+ +			}
+ +
+ +			IXGBE_WRITE_REG(hw, IXGBE_AUTOC, hw->mac.orig_autoc);
+ +			hw->mac.cached_autoc = hw->mac.orig_autoc;
+ +			ixgbe_reset_pipeline_82599(hw);
+ +
+ +			if (got_lock)
+ +				hw->mac.ops.release_swfw_sync(hw,
+ +							IXGBE_GSSR_MAC_CSR_SM);
+++=======
++ 		if (autoc != hw->mac.orig_autoc) {
++ 			status = hw->mac.ops.prot_autoc_write(hw,
++ 							hw->mac.orig_autoc,
++ 							false);
++ 			if (status)
++ 				goto reset_hw_out;
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  		}
+  
+  		if ((autoc2 & IXGBE_AUTOC2_UPPER_MASK) !=
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+index 3ccd4f7151a8,38ca24079980..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+@@@ -140,11 -140,17 +140,21 @@@ static s32 ixgbe_setup_fc(struct ixgbe_
+  	 * we link at 10G, the 1G advertisement is harmless and vice versa.
+  	 */
+  	switch (hw->phy.media_type) {
+++<<<<<<< HEAD
+++=======
++ 	case ixgbe_media_type_backplane:
++ 		/* some MAC's need RMW protection on AUTOC */
++ 		ret_val = hw->mac.ops.prot_autoc_read(hw, &locked, &reg_bp);
++ 		if (ret_val)
++ 			goto out;
++ 
++ 		/* only backplane uses autoc so fall though */
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  	case ixgbe_media_type_fiber_fixed:
+  	case ixgbe_media_type_fiber:
+ +	case ixgbe_media_type_backplane:
+  		reg = IXGBE_READ_REG(hw, IXGBE_PCS1GANA);
+ -
+ +		reg_bp = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+  		break;
+  	case ixgbe_media_type_copper:
+  		hw->phy.ops.read_reg(hw, MDIO_AN_ADVERTISE,
+@@@ -2700,28 -2722,19 +2710,42 @@@ s32 ixgbe_blink_led_start_generic(struc
+  	hw->mac.ops.check_link(hw, &speed, &link_up, false);
+  
+  	if (!link_up) {
+++<<<<<<< HEAD
+ +		/* Need the SW/FW semaphore around AUTOC writes if 82599 and
+ +		 * LESM is on.
+ +		 */
+ +		bool got_lock = false;
+++=======
++ 		ret_val = hw->mac.ops.prot_autoc_read(hw, &locked, &autoc_reg);
++ 		if (ret_val)
++ 			goto out;
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+ +
+ +		if ((hw->mac.type == ixgbe_mac_82599EB) &&
+ +		    ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+ +			ret_val = hw->mac.ops.acquire_swfw_sync(hw,
+ +							IXGBE_GSSR_MAC_CSR_SM);
+ +			if (ret_val)
+ +				goto out;
+  
+ +			got_lock = true;
+ +		}
+  		autoc_reg |= IXGBE_AUTOC_AN_RESTART;
+  		autoc_reg |= IXGBE_AUTOC_FLU;
+++<<<<<<< HEAD
+ +		IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc_reg);
+++=======
++ 
++ 		ret_val = hw->mac.ops.prot_autoc_write(hw, autoc_reg, locked);
++ 		if (ret_val)
++ 			goto out;
++ 
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  		IXGBE_WRITE_FLUSH(hw);
+  
+ +		if (got_lock)
+ +			hw->mac.ops.release_swfw_sync(hw,
+ +						      IXGBE_GSSR_MAC_CSR_SM);
+  		usleep_range(10000, 20000);
+  	}
+  
+@@@ -2741,33 -2754,21 +2765,45 @@@ out
+   **/
+  s32 ixgbe_blink_led_stop_generic(struct ixgbe_hw *hw, u32 index)
+  {
+ -	u32 autoc_reg = 0;
+ +	u32 autoc_reg = IXGBE_READ_REG(hw, IXGBE_AUTOC);
+  	u32 led_reg = IXGBE_READ_REG(hw, IXGBE_LEDCTL);
+  	s32 ret_val = 0;
+ -	bool locked = false;
+ +	bool got_lock = false;
+  
+++<<<<<<< HEAD
+ +	/* Need the SW/FW semaphore around AUTOC writes if 82599 and
+ +	 * LESM is on.
+ +	 */
+ +	if ((hw->mac.type == ixgbe_mac_82599EB) &&
+ +	    ixgbe_verify_lesm_fw_enabled_82599(hw)) {
+ +		ret_val = hw->mac.ops.acquire_swfw_sync(hw,
+ +						IXGBE_GSSR_MAC_CSR_SM);
+ +		if (ret_val)
+ +			goto out;
+ +
+ +		got_lock = true;
+ +	}
+++=======
++ 	ret_val = hw->mac.ops.prot_autoc_read(hw, &locked, &autoc_reg);
++ 	if (ret_val)
++ 		goto out;
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  
+  	autoc_reg &= ~IXGBE_AUTOC_FLU;
+  	autoc_reg |= IXGBE_AUTOC_AN_RESTART;
+ +	IXGBE_WRITE_REG(hw, IXGBE_AUTOC, autoc_reg);
+  
+++<<<<<<< HEAD
+ +	if (hw->mac.type == ixgbe_mac_82599EB)
+ +		ixgbe_reset_pipeline_82599(hw);
+ +
+ +	if (got_lock)
+ +		hw->mac.ops.release_swfw_sync(hw, IXGBE_GSSR_MAC_CSR_SM);
+++=======
++ 	ret_val = hw->mac.ops.prot_autoc_write(hw, autoc_reg, locked);
++ 	if (ret_val)
++ 		goto out;
+++>>>>>>> f8cf7a00d82b (ixgbe: fix errors related to protected AUTOC calls)
+  
+  	led_reg &= ~IXGBE_LED_MODE_MASK(index);
+  	led_reg &= ~IXGBE_LED_BLINK(index);
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
