@@ -1,0 +1,145 @@
+allow the temp files created by open() to be linked to
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit f4e0c30c191f87851c4a53454abb55ee276f4a7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f4e0c30c.failed
+
+O_TMPFILE | O_CREAT => linkat() with AT_SYMLINK_FOLLOW and /proc/self/fd/<n>
+as oldpath (i.e. flink()) will create a link
+O_TMPFILE | O_CREAT | O_EXCL => ENOENT on attempt to link those guys
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit f4e0c30c191f87851c4a53454abb55ee276f4a7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+diff --cc fs/namei.c
+index 72c9894b9e82,66998b06d822..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -3120,6 -2902,67 +3120,70 @@@ stale_open
+  	goto retry_lookup;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int do_tmpfile(int dfd, struct filename *pathname,
++ 		struct nameidata *nd, int flags,
++ 		const struct open_flags *op,
++ 		struct file *file, int *opened)
++ {
++ 	static const struct qstr name = QSTR_INIT("/", 1);
++ 	struct dentry *dentry, *child;
++ 	struct inode *dir;
++ 	int error = path_lookupat(dfd, pathname->name,
++ 				  flags | LOOKUP_DIRECTORY, nd);
++ 	if (unlikely(error))
++ 		return error;
++ 	error = mnt_want_write(nd->path.mnt);
++ 	if (unlikely(error))
++ 		goto out;
++ 	/* we want directory to be writable */
++ 	error = inode_permission(nd->inode, MAY_WRITE | MAY_EXEC);
++ 	if (error)
++ 		goto out2;
++ 	dentry = nd->path.dentry;
++ 	dir = dentry->d_inode;
++ 	if (!dir->i_op->tmpfile) {
++ 		error = -EOPNOTSUPP;
++ 		goto out2;
++ 	}
++ 	child = d_alloc(dentry, &name);
++ 	if (unlikely(!child)) {
++ 		error = -ENOMEM;
++ 		goto out2;
++ 	}
++ 	nd->flags &= ~LOOKUP_DIRECTORY;
++ 	nd->flags |= op->intent;
++ 	dput(nd->path.dentry);
++ 	nd->path.dentry = child;
++ 	error = dir->i_op->tmpfile(dir, nd->path.dentry, op->mode);
++ 	if (error)
++ 		goto out2;
++ 	audit_inode(pathname, nd->path.dentry, 0);
++ 	error = may_open(&nd->path, op->acc_mode, op->open_flag);
++ 	if (error)
++ 		goto out2;
++ 	file->f_path.mnt = nd->path.mnt;
++ 	error = finish_open(file, nd->path.dentry, NULL, opened);
++ 	if (error)
++ 		goto out2;
++ 	error = open_check_o_direct(file);
++ 	if (error) {
++ 		fput(file);
++ 	} else if (!(op->open_flag & O_EXCL)) {
++ 		struct inode *inode = file_inode(file);
++ 		spin_lock(&inode->i_lock);
++ 		inode->i_state |= I_LINKABLE;
++ 		spin_unlock(&inode->i_lock);
++ 	}
++ out2:
++ 	mnt_drop_write(nd->path.mnt);
++ out:
++ 	path_put(&nd->path);
++ 	return error;
++ }
++ 
+++>>>>>>> f4e0c30c191f (allow the temp files created by open() to be linked to)
+  static struct file *path_openat(int dfd, struct filename *pathname,
+  		struct nameidata *nd, const struct open_flags *op, int flags)
+  {
+@@@ -3851,10 -3638,13 +3915,20 @@@ int vfs_link(struct dentry *old_dentry
+  		error =  -ENOENT;
+  	else if (max_links && inode->i_nlink >= max_links)
+  		error = -EMLINK;
+++<<<<<<< HEAD
+ +	else {
+ +		error = try_break_deleg(inode, delegated_inode);
+ +		if (!error)
+ +			error = dir->i_op->link(old_dentry, dir, new_dentry);
+++=======
++ 	else
++ 		error = dir->i_op->link(old_dentry, dir, new_dentry);
++ 
++ 	if (!error && (inode->i_state & I_LINKABLE)) {
++ 		spin_lock(&inode->i_lock);
++ 		inode->i_state &= ~I_LINKABLE;
++ 		spin_unlock(&inode->i_lock);
+++>>>>>>> f4e0c30c191f (allow the temp files created by open() to be linked to)
+  	}
+  	mutex_unlock(&inode->i_mutex);
+  	if (!error)
+diff --git a/fs/inode.c b/fs/inode.c
+index 0d319444859d..a26626ea5c22 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -333,8 +333,10 @@ EXPORT_SYMBOL(set_nlink);
+  */
+ void inc_nlink(struct inode *inode)
+ {
+-	if (WARN_ON(inode->i_nlink == 0))
++	if (unlikely(inode->i_nlink == 0)) {
++		WARN_ON(!(inode->i_state & I_LINKABLE));
+ 		atomic_long_dec(&inode->i_sb->s_remove_count);
++	}
+ 
+ 	inode->__i_nlink++;
+ }
+* Unmerged path fs/namei.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 67ee418be1ff..2c55ad6304aa 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1841,6 +1841,7 @@ struct super_operations {
+ #define I_REFERENCED		(1 << 8)
+ #define __I_DIO_WAKEUP		9
+ #define I_DIO_WAKEUP		(1 << I_DIO_WAKEUP)
++#define I_LINKABLE		(1 << 10)
+ 
+ #define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
+ 
