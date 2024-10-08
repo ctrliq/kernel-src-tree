@@ -1,0 +1,170 @@
+qla2xxx: ISP27xx queue index shadow registers.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: ISP27xx queue index shadow registers (Chad Dupuis) [1187302]
+Rebuild_FUZZ: 98.90%
+commit-author Joe Carnuccio <joe.carnuccio@qlogic.com>
+commit 7c6300e3941da8e84bf5faf1358bf3909c5ef97e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7c6300e3.failed
+
+For ISP27xx use the request/response queue index shadow registers
+to avoid directly access them on the PCI bus.
+
+	Signed-off-by: Joe Carnuccio <joe.carnuccio@qlogic.com>
+	Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 7c6300e3941da8e84bf5faf1358bf3909c5ef97e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_tmpl.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 151194d68090,20b569e93340..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -2028,7 -2062,11 +2028,15 @@@ qla24xx_config_rings(struct scsi_qla_ho
+  	icb->atio_q_address[0] = cpu_to_le32(LSD(ha->tgt.atio_dma));
+  	icb->atio_q_address[1] = cpu_to_le32(MSD(ha->tgt.atio_dma));
+  
+++<<<<<<< HEAD
+ +	if (ha->mqenable || IS_QLA83XX(ha)) {
+++=======
++ 	if (IS_SHADOW_REG_CAPABLE(ha))
++ 		icb->firmware_options_2 |=
++ 		    __constant_cpu_to_le32(BIT_30|BIT_29);
++ 
++ 	if (ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha)) {
+++>>>>>>> 7c6300e3941d (qla2xxx: ISP27xx queue index shadow registers.)
+  		icb->qos = __constant_cpu_to_le16(QLA_DEFAULT_QUE_QOS);
+  		icb->rid = __constant_cpu_to_le16(rid);
+  		if (ha->flags.msix_enabled) {
+* Unmerged path drivers/scsi/qla2xxx/qla_tmpl.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 823aec28928b..f47cc90ad930 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2683,6 +2683,7 @@ struct rsp_que {
+ 	uint32_t __iomem *rsp_q_out;
+ 	uint16_t  ring_index;
+ 	uint16_t  out_ptr;
++	uint16_t  *in_ptr;		/* queue shadow in index */
+ 	uint16_t  length;
+ 	uint16_t  options;
+ 	uint16_t  rid;
+@@ -2709,6 +2710,7 @@ struct req_que {
+ 	uint32_t __iomem *req_q_out;
+ 	uint16_t  ring_index;
+ 	uint16_t  in_ptr;
++	uint16_t  *out_ptr;		/* queue shadow out index */
+ 	uint16_t  cnt;
+ 	uint16_t  length;
+ 	uint16_t  options;
+@@ -3003,6 +3005,7 @@ struct qla_hw_data {
+     (((ha)->fw_attributes_h << 16 | (ha)->fw_attributes) & BIT_22))
+ #define IS_ATIO_MSIX_CAPABLE(ha) (IS_QLA83XX(ha))
+ #define IS_TGT_MODE_CAPABLE(ha)	(ha->tgt.atio_q_length)
++#define IS_SHADOW_REG_CAPABLE(ha)  (IS_QLA27XX(ha))
+ 
+ 	/* HBA serial number */
+ 	uint8_t		serial0;
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index b34cd3c541e4..67a0664030eb 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -371,7 +371,10 @@ struct init_cb_24xx {
+ 	 * BIT 14 = Data Rate bit 1
+ 	 * BIT 15 = Data Rate bit 2
+ 	 * BIT 16 = Enable 75 ohm Termination Select
+-	 * BIT 17-31 = Reserved
++	 * BIT 17-28 = Reserved
++	 * BIT 29 = Enable response queue 0 in index shadowing
++	 * BIT 30 = Enable request queue 0 out index shadowing
++	 * BIT 31 = Reserved
+ 	 */
+ 	uint32_t firmware_options_3;
+ 	uint16_t qos;
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_iocb.c b/drivers/scsi/qla2xxx/qla_iocb.c
+index 077390522ba7..1da928bcf762 100644
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -1478,8 +1478,8 @@ qla24xx_start_scsi(srb_t *sp)
+ 	tot_dsds = nseg;
+ 	req_cnt = qla24xx_calc_iocbs(vha, tot_dsds);
+ 	if (req->cnt < (req_cnt + 2)) {
+-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
+-
++		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
++		    RD_REG_DWORD_RELAXED(req->req_q_out);
+ 		if (req->ring_index < cnt)
+ 			req->cnt = cnt - req->ring_index;
+ 		else
+@@ -1697,8 +1697,8 @@ qla24xx_dif_start_scsi(srb_t *sp)
+ 	tot_prot_dsds = nseg;
+ 	tot_dsds += nseg;
+ 	if (req->cnt < (req_cnt + 2)) {
+-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
+-
++		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
++		    RD_REG_DWORD_RELAXED(req->req_q_out);
+ 		if (req->ring_index < cnt)
+ 			req->cnt = cnt - req->ring_index;
+ 		else
+@@ -2825,8 +2825,8 @@ qla2x00_start_bidir(srb_t *sp, struct scsi_qla_host *vha, uint32_t tot_dsds)
+ 
+ 	/* Check for room on request queue. */
+ 	if (req->cnt < req_cnt + 2) {
+-		cnt = RD_REG_DWORD_RELAXED(req->req_q_out);
+-
++		cnt = IS_SHADOW_REG_CAPABLE(ha) ? *req->out_ptr :
++		    RD_REG_DWORD_RELAXED(req->req_q_out);
+ 		if  (req->ring_index < cnt)
+ 			req->cnt = cnt - req->ring_index;
+ 		else
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index e8a6abec03d7..a1eb8d9c3bde 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -3728,6 +3728,9 @@ qla25xx_init_req_que(struct scsi_qla_host *vha, struct req_que *req)
+ 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10d3,
+ 	    "Entered %s.\n", __func__);
+ 
++	if (IS_SHADOW_REG_CAPABLE(ha))
++		req->options |= BIT_13;
++
+ 	mcp->mb[0] = MBC_INITIALIZE_MULTIQ;
+ 	mcp->mb[1] = req->options;
+ 	mcp->mb[2] = MSW(LSD(req->dma));
+@@ -3747,7 +3750,7 @@ qla25xx_init_req_que(struct scsi_qla_host *vha, struct req_que *req)
+ 	/* que in ptr index */
+ 	mcp->mb[8] = 0;
+ 	/* que out ptr index */
+-	mcp->mb[9] = 0;
++	mcp->mb[9] = *req->out_ptr = 0;
+ 	mcp->out_mb = MBX_14|MBX_13|MBX_12|MBX_11|MBX_10|MBX_9|MBX_8|MBX_7|
+ 			MBX_6|MBX_5|MBX_4|MBX_3|MBX_2|MBX_1|MBX_0;
+ 	mcp->in_mb = MBX_0;
+@@ -3794,6 +3797,9 @@ qla25xx_init_rsp_que(struct scsi_qla_host *vha, struct rsp_que *rsp)
+ 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10d6,
+ 	    "Entered %s.\n", __func__);
+ 
++	if (IS_SHADOW_REG_CAPABLE(ha))
++		rsp->options |= BIT_13;
++
+ 	mcp->mb[0] = MBC_INITIALIZE_MULTIQ;
+ 	mcp->mb[1] = rsp->options;
+ 	mcp->mb[2] = MSW(LSD(rsp->dma));
+@@ -3808,7 +3814,7 @@ qla25xx_init_rsp_que(struct scsi_qla_host *vha, struct rsp_que *rsp)
+ 
+ 	mcp->mb[4] = rsp->id;
+ 	/* que in ptr index */
+-	mcp->mb[8] = 0;
++	mcp->mb[8] = *rsp->in_ptr = 0;
+ 	/* que out ptr index */
+ 	mcp->mb[9] = 0;
+ 	mcp->out_mb = MBX_14|MBX_13|MBX_9|MBX_8|MBX_7
+* Unmerged path drivers/scsi/qla2xxx/qla_tmpl.c
