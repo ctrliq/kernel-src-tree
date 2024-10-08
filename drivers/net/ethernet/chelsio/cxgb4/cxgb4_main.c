@@ -1346,11 +1346,6 @@ static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	return skb_tx_hash(dev, skb);
 }
 
-static inline int is_offload(const struct adapter *adap)
-{
-	return adap->params.offload;
-}
-
 static int closest_timer(const struct sge *s, int time)
 {
 	int i, delta, match = 0, min_delta = INT_MAX;
@@ -2877,7 +2872,8 @@ static struct rtnl_link_stats64 *cxgb_get_stats(struct net_device *dev,
 		spin_unlock(&adapter->stats_lock);
 		return ns;
 	}
-	t4_get_port_stats(adapter, p->tx_chan, &stats);
+	t4_get_port_stats_offset(adapter, p->tx_chan, &stats,
+				 &p->stats_base);
 	spin_unlock(&adapter->stats_lock);
 
 	ns->tx_bytes   = stats.tx_octets;
@@ -4648,6 +4644,8 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 			err = -ENOMEM;
 			goto out_free_adapter;
 		}
+		t4_write_reg(adapter, SGE_STAT_CFG_A,
+			     STATSOURCE_T5_V(7) | STATMODE_V(0));
 	}
 
 	setup_memwin(adapter);
