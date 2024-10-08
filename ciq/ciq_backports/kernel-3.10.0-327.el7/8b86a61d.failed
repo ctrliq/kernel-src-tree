@@ -1,0 +1,291 @@
+net: remove unused 'dev' argument from netif_needs_gso()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] remove unused 'dev' argument from netif_needs_gso() (Ivan Vecera) [1200759]
+Rebuild_FUZZ: 95.33%
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 8b86a61da37cbbcf4bd6e87fda494a59b1cf16c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8b86a61d.failed
+
+In commit 04ffcb255f22 ("net: Add ndo_gso_check") Tom originally
+added the 'dev' argument to be able to call ndo_gso_check().
+
+Then later, when generalizing this in commit 5f35227ea34b
+("net: Generalize ndo_gso_check to ndo_features_check")
+Jesse removed the call to ndo_gso_check() in netif_needs_gso()
+by calling the new ndo_features_check() in a different place.
+This made the 'dev' argument unused.
+
+Remove the unused argument and go back to the code as before.
+
+	Cc: Tom Herbert <therbert@google.com>
+	Cc: Jesse Gross <jesse@nicira.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8b86a61da37cbbcf4bd6e87fda494a59b1cf16c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+#	net/core/dev.c
+diff --cc drivers/net/xen-netfront.c
+index df35db45f71c,8dcf31063e9a..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -581,7 -561,7 +581,11 @@@ static int xennet_start_xmit(struct sk_
+  	if (unlikely(!netif_carrier_ok(dev) ||
+  		     (slots > 1 && !xennet_can_sg(dev)) ||
+  		     netif_needs_gso(skb, netif_skb_features(skb)))) {
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&np->tx_lock, flags);
+++=======
++ 		spin_unlock_irqrestore(&queue->tx_lock, flags);
+++>>>>>>> 8b86a61da37c (net: remove unused 'dev' argument from netif_needs_gso())
+  		goto drop;
+  	}
+  
+diff --cc net/core/dev.c
+index 9a2bea4eeeee,1796cef55ab5..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2494,115 -2647,137 +2494,176 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+ -static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+ -		    struct netdev_queue *txq, bool more)
+ -{
+ -	unsigned int len;
+ -	int rc;
+ -
+ -	if (!list_empty(&ptype_all) || !list_empty(&dev->ptype_all))
+ -		dev_queue_xmit_nit(skb, dev);
+ -
+ -	len = skb->len;
+ -	trace_net_dev_start_xmit(skb, dev);
+ -	rc = netdev_start_xmit(skb, dev, txq, more);
+ -	trace_net_dev_xmit(skb, rc, dev, len);
+ -
+ -	return rc;
+ -}
+ -
+ -struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
+ -				    struct netdev_queue *txq, int *ret)
+ +int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ +			struct netdev_queue *txq)
+  {
+ -	struct sk_buff *skb = first;
+ +	const struct net_device_ops *ops = dev->netdev_ops;
+  	int rc = NETDEV_TX_OK;
+ +	unsigned int skb_len;
+  
+ -	while (skb) {
+ -		struct sk_buff *next = skb->next;
+ +	if (likely(!skb->next)) {
+ +		netdev_features_t features;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If device doesn't need skb->dst, release it right now while
+ +		 * its hot in this cpu cache
+++=======
++ 		skb->next = NULL;
++ 		rc = xmit_one(skb, dev, txq, next != NULL);
++ 		if (unlikely(!dev_xmit_complete(rc))) {
++ 			skb->next = next;
++ 			goto out;
++ 		}
++ 
++ 		skb = next;
++ 		if (netif_xmit_stopped(txq) && skb) {
++ 			rc = NETDEV_TX_BUSY;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	*ret = rc;
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
++ 					  netdev_features_t features)
++ {
++ 	if (skb_vlan_tag_present(skb) &&
++ 	    !vlan_hw_offload_capable(features, skb->vlan_proto))
++ 		skb = __vlan_hwaccel_push_inside(skb);
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	netdev_features_t features;
++ 
++ 	if (skb->next)
++ 		return skb;
++ 
++ 	features = netif_skb_features(skb);
++ 	skb = validate_xmit_vlan(skb, features);
++ 	if (unlikely(!skb))
++ 		goto out_null;
++ 
++ 	if (netif_needs_gso(skb, features)) {
++ 		struct sk_buff *segs;
++ 
++ 		segs = skb_gso_segment(skb, features);
++ 		if (IS_ERR(segs)) {
++ 			goto out_kfree_skb;
++ 		} else if (segs) {
++ 			consume_skb(skb);
++ 			skb = segs;
++ 		}
++ 	} else {
++ 		if (skb_needs_linearize(skb, features) &&
++ 		    __skb_linearize(skb))
++ 			goto out_kfree_skb;
++ 
++ 		/* If packet is not checksummed and device does not
++ 		 * support checksumming for this protocol, complete
++ 		 * checksumming here.
+++>>>>>>> 8b86a61da37c (net: remove unused 'dev' argument from netif_needs_gso())
+  		 */
+ -		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ -			if (skb->encapsulation)
+ -				skb_set_inner_transport_header(skb,
+ -							       skb_checksum_start_offset(skb));
+ -			else
+ -				skb_set_transport_header(skb,
+ -							 skb_checksum_start_offset(skb));
+ -			if (!(features & NETIF_F_ALL_CSUM) &&
+ -			    skb_checksum_help(skb))
+ -				goto out_kfree_skb;
+ +		if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
+ +			skb_dst_drop(skb);
+ +
+ +		features = netif_skb_features(skb);
+ +
+ +		if (vlan_tx_tag_present(skb) &&
+ +		    !vlan_hw_offload_capable(features, skb->vlan_proto)) {
+ +			skb = __vlan_put_tag(skb, skb->vlan_proto,
+ +					     vlan_tx_tag_get(skb));
+ +			if (unlikely(!skb))
+ +				goto out;
+ +
+ +			skb->vlan_tci = 0;
+  		}
+ -	}
+  
+ -	return skb;
+ +		/* If encapsulation offload request, verify we are testing
+ +		 * hardware encapsulation features instead of standard
+ +		 * features for the netdev
+ +		 */
+ +		if (skb->encapsulation)
+ +			features &= dev->hw_enc_features;
+  
+ -out_kfree_skb:
+ -	kfree_skb(skb);
+ -out_null:
+ -	return NULL;
+ -}
+ +		if (netif_needs_gso(skb, features)) {
+ +			if (unlikely(dev_gso_segment(skb, features)))
+ +				goto out_kfree_skb;
+ +			if (skb->next)
+ +				goto gso;
+ +		} else {
+ +			if (skb_needs_linearize(skb, features) &&
+ +			    __skb_linearize(skb))
+ +				goto out_kfree_skb;
+  
+ -struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev)
+ -{
+ -	struct sk_buff *next, *head = NULL, *tail;
+ +			/* If packet is not checksummed and device does not
+ +			 * support checksumming for this protocol, complete
+ +			 * checksumming here.
+ +			 */
+ +			if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ +				if (skb->encapsulation)
+ +					skb_set_inner_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				else
+ +					skb_set_transport_header(skb,
+ +						skb_checksum_start_offset(skb));
+ +				if (!(features & NETIF_F_ALL_CSUM) &&
+ +				     skb_checksum_help(skb))
+ +					goto out_kfree_skb;
+ +			}
+ +		}
+  
+ -	for (; skb != NULL; skb = next) {
+ -		next = skb->next;
+ -		skb->next = NULL;
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(skb, dev);
+  
+ -		/* in case skb wont be segmented, point to itself */
+ -		skb->prev = skb;
+ +		skb_len = skb->len;
+ +		rc = ops->ndo_start_xmit(skb, dev);
+ +		trace_net_dev_xmit(skb, rc, dev, skb_len);
+ +		if (rc == NETDEV_TX_OK)
+ +			txq_trans_update(txq);
+ +		return rc;
+ +	}
+  
+ -		skb = validate_xmit_skb(skb, dev);
+ -		if (!skb)
+ -			continue;
+ +gso:
+ +	do {
+ +		struct sk_buff *nskb = skb->next;
+  
+ -		if (!head)
+ -			head = skb;
+ -		else
+ -			tail->next = skb;
+ -		/* If skb was segmented, skb->prev points to
+ -		 * the last segment. If not, it still contains skb.
+ -		 */
+ -		tail = skb->prev;
+ +		skb->next = nskb->next;
+ +		nskb->next = NULL;
+ +
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(nskb, dev);
+ +
+ +		skb_len = nskb->len;
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+ +		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+ +		if (unlikely(rc != NETDEV_TX_OK)) {
+ +			if (rc & ~NETDEV_TX_MASK)
+ +				goto out_kfree_gso_skb;
+ +			nskb->next = skb->next;
+ +			skb->next = nskb;
+ +			return rc;
+ +		}
+ +		txq_trans_update(txq);
+ +		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ +			return NETDEV_TX_BUSY;
+ +	} while (skb->next);
+ +
+ +out_kfree_gso_skb:
+ +	if (likely(skb->next == NULL)) {
+ +		skb->destructor = DEV_GSO_CB(skb)->destructor;
+ +		consume_skb(skb);
+ +		return rc;
+  	}
+ -	return head;
+ +out_kfree_skb:
+ +	kfree_skb(skb);
+ +out:
+ +	return rc;
+  }
+  
+  static void qdisc_pkt_len_init(struct sk_buff *skb)
+* Unmerged path drivers/net/xen-netfront.c
+* Unmerged path net/core/dev.c
