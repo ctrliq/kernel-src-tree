@@ -1,0 +1,316 @@
+IB/iser: Add module parameter for always register memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 3cffd930171518821595839c5ce7036894ef0d74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3cffd930.failed
+
+This module parameter forces memory registration even for
+a continuous memory region. It is true by default as sending
+an all-physical rkey with remote permissions might be insecure.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 3cffd930171518821595839c5ce7036894ef0d74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.c
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_memory.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.c
+index fadc96304e5d,f58ff96b6cbb..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@@ -77,30 -77,38 +77,48 @@@
+  static struct scsi_host_template iscsi_iser_sht;
+  static struct iscsi_transport iscsi_iser_transport;
+  static struct scsi_transport_template *iscsi_iser_scsi_transport;
+ -static struct workqueue_struct *release_wq;
+ -struct iser_global ig;
+ +
+ +static unsigned int iscsi_max_lun = 512;
+ +module_param_named(max_lun, iscsi_max_lun, uint, S_IRUGO);
+  
+  int iser_debug_level = 0;
+ -module_param_named(debug_level, iser_debug_level, int, S_IRUGO | S_IWUSR);
+ +bool iser_pi_enable = false;
+ +int iser_pi_guard = 0;
+ +
+ +MODULE_DESCRIPTION("iSER (iSCSI Extensions for RDMA) Datamover");
+ +MODULE_LICENSE("Dual BSD/GPL");
+ +MODULE_AUTHOR("Alex Nezhinsky, Dan Bar Dov, Or Gerlitz");
+ +MODULE_VERSION(DRV_VER);
+ +
+ +module_param_named(debug_level, iser_debug_level, int, 0644);
+  MODULE_PARM_DESC(debug_level, "Enable debug tracing if > 0 (default:disabled)");
+  
+++<<<<<<< HEAD
+ +module_param_named(pi_enable, iser_pi_enable, bool, 0644);
+++=======
++ static unsigned int iscsi_max_lun = 512;
++ module_param_named(max_lun, iscsi_max_lun, uint, S_IRUGO);
++ MODULE_PARM_DESC(max_lun, "Max LUNs to allow per session (default:512");
++ 
++ unsigned int iser_max_sectors = ISER_DEF_MAX_SECTORS;
++ module_param_named(max_sectors, iser_max_sectors, uint, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(max_sectors, "Max number of sectors in a single scsi command (default:1024");
++ 
++ bool iser_always_reg = true;
++ module_param_named(always_register, iser_always_reg, bool, S_IRUGO);
++ MODULE_PARM_DESC(always_register,
++ 		 "Always register memory, even for continuous memory regions (default:true)");
++ 
++ bool iser_pi_enable = false;
++ module_param_named(pi_enable, iser_pi_enable, bool, S_IRUGO);
+++>>>>>>> 3cffd9301715 (IB/iser: Add module parameter for always register memory)
+  MODULE_PARM_DESC(pi_enable, "Enable T10-PI offload support (default:disabled)");
+  
+ -int iser_pi_guard;
+ -module_param_named(pi_guard, iser_pi_guard, int, S_IRUGO);
+ -MODULE_PARM_DESC(pi_guard, "T10-PI guard_type [deprecated]");
+ +module_param_named(pi_guard, iser_pi_guard, int, 0644);
+ +MODULE_PARM_DESC(pi_guard, "T10-PI guard_type, 0:CRC|1:IP_CSUM (default:CRC)");
+ +
+ +static struct workqueue_struct *release_wq;
+ +struct iser_global ig;
+  
+  /*
+   * iscsi_iser_recv() - Process a successfull recv completion
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index b9dc02d4dd14,a5edd6ede692..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -580,6 -610,8 +580,11 @@@ extern struct iser_global ig
+  extern int iser_debug_level;
+  extern bool iser_pi_enable;
+  extern int iser_pi_guard;
+++<<<<<<< HEAD
+++=======
++ extern unsigned int iser_max_sectors;
++ extern bool iser_always_reg;
+++>>>>>>> 3cffd9301715 (IB/iser: Add module parameter for always register memory)
+  
+  int iser_assign_reg_ops(struct iser_device *device);
+  
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index b04a5e59e448,4c46d67d37a1..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -865,65 -776,104 +865,137 @@@ static int iser_fast_reg_mr(struct iscs
+  		 " length=0x%x\n", reg->sge.lkey, reg->rkey,
+  		 reg->sge.addr, reg->sge.length);
+  
+ -	return 0;
+ +	return ret;
+  }
+  
+ -static int
+ -iser_handle_unaligned_buf(struct iscsi_iser_task *task,
+ -			  struct iser_data_buf *mem,
+ -			  enum iser_data_dir dir)
+ +/**
+ + * iser_reg_rdma_mem_fastreg - Registers memory intended for RDMA,
+ + * using Fast Registration WR (if possible) obtaining rkey and va
+ + *
+ + * returns 0 on success, errno code on failure
+ + */
+ +int iser_reg_rdma_mem_fastreg(struct iscsi_iser_task *iser_task,
+ +			      enum iser_data_dir cmd_dir)
+  {
+ -	struct iser_conn *iser_conn = task->iser_conn;
+ -	struct iser_device *device = iser_conn->ib_conn.device;
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct iser_device *device = ib_conn->device;
+ +	struct ib_device *ibdev = device->ib_device;
+ +	struct iser_data_buf *mem = &iser_task->data[cmd_dir];
+ +	struct iser_mem_reg *mem_reg = &iser_task->rdma_reg[cmd_dir];
+ +	struct iser_fr_desc *desc = NULL;
+  	int err, aligned_len;
+  
+ -	aligned_len = iser_data_buf_aligned_len(mem, device->ib_device,
+ -						iser_conn->scsi_sg_tablesize);
+ +	aligned_len = iser_data_buf_aligned_len(mem, ibdev);
+  	if (aligned_len != mem->dma_nents) {
+ -		err = fall_to_bounce_buf(task, mem, dir);
+ -		if (err)
+ +		err = fall_to_bounce_buf(iser_task, mem, cmd_dir);
+ +		if (err) {
+ +			iser_err("failed to allocate bounce buffer\n");
+  			return err;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mem->dma_nents != 1 ||
+ +	    scsi_get_prot_op(iser_task->sc) != SCSI_PROT_NORMAL) {
+++=======
++ 	return 0;
++ }
++ 
++ static int
++ iser_reg_prot_sg(struct iscsi_iser_task *task,
++ 		 struct iser_data_buf *mem,
++ 		 struct iser_fr_desc *desc,
++ 		 bool use_dma_key,
++ 		 struct iser_mem_reg *reg)
++ {
++ 	struct iser_device *device = task->iser_conn->ib_conn.device;
++ 
++ 	if (use_dma_key)
++ 		return iser_reg_dma(device, mem, reg);
++ 
++ 	return device->reg_ops->reg_mem(task, mem, &desc->pi_ctx->rsc, reg);
++ }
++ 
++ static int
++ iser_reg_data_sg(struct iscsi_iser_task *task,
++ 		 struct iser_data_buf *mem,
++ 		 struct iser_fr_desc *desc,
++ 		 bool use_dma_key,
++ 		 struct iser_mem_reg *reg)
++ {
++ 	struct iser_device *device = task->iser_conn->ib_conn.device;
++ 
++ 	if (use_dma_key)
++ 		return iser_reg_dma(device, mem, reg);
++ 
++ 	return device->reg_ops->reg_mem(task, mem, &desc->rsc, reg);
++ }
++ 
++ int iser_reg_rdma_mem(struct iscsi_iser_task *task,
++ 		      enum iser_data_dir dir)
++ {
++ 	struct ib_conn *ib_conn = &task->iser_conn->ib_conn;
++ 	struct iser_device *device = ib_conn->device;
++ 	struct iser_data_buf *mem = &task->data[dir];
++ 	struct iser_mem_reg *reg = &task->rdma_reg[dir];
++ 	struct iser_mem_reg *data_reg;
++ 	struct iser_fr_desc *desc = NULL;
++ 	bool use_dma_key;
++ 	int err;
++ 
++ 	err = iser_handle_unaligned_buf(task, mem, dir);
++ 	if (unlikely(err))
++ 		return err;
++ 
++ 	use_dma_key = (mem->dma_nents == 1 && !iser_always_reg &&
++ 		       scsi_get_prot_op(task->sc) == SCSI_PROT_NORMAL);
++ 
++ 	if (!use_dma_key) {
+++>>>>>>> 3cffd9301715 (IB/iser: Add module parameter for always register memory)
+  		desc = device->reg_ops->reg_desc_get(ib_conn);
+ -		reg->mem_h = desc;
+ +		mem_reg->mem_h = desc;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iser_fast_reg_mr(iser_task, mem,
+ +			       desc ? &desc->rsc : NULL, mem_reg);
+ +	if (err)
+++=======
++ 	if (scsi_get_prot_op(task->sc) == SCSI_PROT_NORMAL)
++ 		data_reg = reg;
++ 	else
++ 		data_reg = &task->desc.data_reg;
++ 
++ 	err = iser_reg_data_sg(task, mem, desc, use_dma_key, data_reg);
++ 	if (unlikely(err))
+++>>>>>>> 3cffd9301715 (IB/iser: Add module parameter for always register memory)
+  		goto err_reg;
+  
+ -	if (scsi_get_prot_op(task->sc) != SCSI_PROT_NORMAL) {
+ -		struct iser_mem_reg *prot_reg = &task->desc.prot_reg;
+ -
+ -		if (scsi_prot_sg_count(task->sc)) {
+ -			mem = &task->prot[dir];
+ -			err = iser_handle_unaligned_buf(task, mem, dir);
+ -			if (unlikely(err))
+ -				goto err_reg;
+ +	if (scsi_get_prot_op(iser_task->sc) != SCSI_PROT_NORMAL) {
+ +		struct iser_mem_reg prot_reg;
+ +
+ +		memset(&prot_reg, 0, sizeof(prot_reg));
+ +		if (scsi_prot_sg_count(iser_task->sc)) {
+ +			mem = &iser_task->prot[cmd_dir];
+ +			aligned_len = iser_data_buf_aligned_len(mem, ibdev);
+ +			if (aligned_len != mem->dma_nents) {
+ +				err = fall_to_bounce_buf(iser_task, mem,
+ +							 cmd_dir);
+ +				if (err) {
+ +					iser_err("failed to allocate bounce buffer\n");
+ +					return err;
+ +				}
+ +			}
+  
+++<<<<<<< HEAD
+ +			err = iser_fast_reg_mr(iser_task, mem,
+ +					       &desc->pi_ctx->rsc, &prot_reg);
+ +			if (err)
+++=======
++ 			err = iser_reg_prot_sg(task, mem, desc,
++ 					       use_dma_key, prot_reg);
++ 			if (unlikely(err))
+++>>>>>>> 3cffd9301715 (IB/iser: Add module parameter for always register memory)
+  				goto err_reg;
+  		}
+  
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.c
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 3a0562552ca5..5473a7fc7263 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -133,11 +133,15 @@ static int iser_create_device_ib_res(struct iser_device *device)
+ 			     (unsigned long)comp);
+ 	}
+ 
+-	device->mr = ib_get_dma_mr(device->pd, IB_ACCESS_LOCAL_WRITE |
+-				   IB_ACCESS_REMOTE_WRITE |
+-				   IB_ACCESS_REMOTE_READ);
+-	if (IS_ERR(device->mr))
+-		goto dma_mr_err;
++	if (!iser_always_reg) {
++		int access = IB_ACCESS_LOCAL_WRITE |
++			     IB_ACCESS_REMOTE_WRITE |
++			     IB_ACCESS_REMOTE_READ;
++
++		device->mr = ib_get_dma_mr(device->pd, access);
++		if (IS_ERR(device->mr))
++			goto dma_mr_err;
++	}
+ 
+ 	INIT_IB_EVENT_HANDLER(&device->event_handler, device->ib_device,
+ 				iser_event_handler);
+@@ -147,7 +151,8 @@ static int iser_create_device_ib_res(struct iser_device *device)
+ 	return 0;
+ 
+ handler_err:
+-	ib_dereg_mr(device->mr);
++	if (device->mr)
++		ib_dereg_mr(device->mr);
+ dma_mr_err:
+ 	for (i = 0; i < device->comps_used; i++)
+ 		tasklet_kill(&device->comps[i].tasklet);
+@@ -173,7 +178,6 @@ comps_err:
+ static void iser_free_device_ib_res(struct iser_device *device)
+ {
+ 	int i;
+-	BUG_ON(device->mr == NULL);
+ 
+ 	for (i = 0; i < device->comps_used; i++) {
+ 		struct iser_comp *comp = &device->comps[i];
+@@ -184,7 +188,8 @@ static void iser_free_device_ib_res(struct iser_device *device)
+ 	}
+ 
+ 	(void)ib_unregister_event_handler(&device->event_handler);
+-	(void)ib_dereg_mr(device->mr);
++	if (device->mr)
++		(void)ib_dereg_mr(device->mr);
+ 	ib_dealloc_pd(device->pd);
+ 
+ 	kfree(device->comps);
