@@ -1,0 +1,97 @@
+perf: Add ->count() function to read per-package counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] Add ->count() function to read per-package counters (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 94.44%
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit eacd3ecc34472ce3751eedfc94e44c7cc6eb6305
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/eacd3ecc.failed
+
+For PMU drivers that record per-package counters, the ->count variable
+cannot be used to record an accurate aggregated value, since it's not
+possible to perform SMP cross-calls to cpus on other packages from the
+context in which we update ->count.
+
+Introduce a new optional ->count() accessor function that can be used to
+customize how values are collected. If a PMU driver doesn't provide a
+->count() function, we fallback to the existing code.
+
+There is necessarily a window of staleness with this approach because
+the task that generated the counter value may not have been scheduled by
+the cpu recently.
+
+An alternative and more complex approach would be to use a hrtimer to
+periodically refresh the values from a more permissive scheduling
+context. So, we're trading off complexity for accuracy.
+
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kanaka Juvva <kanaka.d.juvva@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+Link: http://lkml.kernel.org/r/1422038748-21397-3-git-send-email-matt@codeblueprint.co.uk
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit eacd3ecc34472ce3751eedfc94e44c7cc6eb6305)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index 68768e324db6,9fc9b0d31442..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -280,16 -263,20 +280,24 @@@ struct pmu 
+  	int (*event_idx)		(struct perf_event *event); /*optional */
+  
+  	/*
+ -	 * context-switches callback
+ +	 * flush branch stack on context-switches (needed in cpu-wide mode)
+  	 */
+ -	void (*sched_task)		(struct perf_event_context *ctx,
+ -					bool sched_in);
+ +	void (*flush_branch_stack)	(void);
+ +
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(struct module *module)
+ +
+  	/*
+ -	 * PMU specific data size
+ +	 * various common per-pmu feature flags
+  	 */
+ -	size_t				task_ctx_size;
+ -
+ +	RH_KABI_EXTEND(int	capabilities)
+++=======
++ 
++ 	/*
++ 	 * Return the count value for a counter.
++ 	 */
++ 	u64 (*count)			(struct perf_event *event); /*optional*/
+++>>>>>>> eacd3ecc3447 (perf: Add ->count() function to read per-package counters)
+  };
+  
+  /**
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9f74e97b5c08..972813212590 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3251,7 +3251,10 @@ static void __perf_event_read(void *info)
+ 
+ static inline u64 perf_event_count(struct perf_event *event)
+ {
+-	return local64_read(&event->count) + atomic64_read(&event->child_count);
++	if (event->pmu->count)
++		return event->pmu->count(event);
++
++	return __perf_event_count(event);
+ }
+ 
+ static u64 perf_event_read(struct perf_event *event)
