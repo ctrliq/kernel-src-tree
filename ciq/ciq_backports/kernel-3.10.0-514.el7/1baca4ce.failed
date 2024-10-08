@@ -1,0 +1,187 @@
+sched/deadline: Add SCHED_DEADLINE SMP-related data structures & logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Juri Lelli <juri.lelli@gmail.com>
+commit 1baca4ce16b8cc7d4f50be1f7914799af30a2861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1baca4ce.failed
+
+Introduces data structures relevant for implementing dynamic
+migration of -deadline tasks and the logic for checking if
+runqueues are overloaded with -deadline tasks and for choosing
+where a task should migrate, when it is the case.
+
+Adds also dynamic migrations to SCHED_DEADLINE, so that tasks can
+be moved among CPUs when necessary. It is also possible to bind a
+task to a (set of) CPU(s), thus restricting its capability of
+migrating, or forbidding migrations at all.
+
+The very same approach used in sched_rt is utilised:
+ - -deadline tasks are kept into CPU-specific runqueues,
+ - -deadline tasks are migrated among runqueues to achieve the
+   following:
+    * on an M-CPU system the M earliest deadline ready tasks
+      are always running;
+    * affinity/cpusets settings of all the -deadline tasks is
+      always respected.
+
+Therefore, this very special form of "load balancing" is done with
+an active method, i.e., the scheduler pushes or pulls tasks between
+runqueues when they are woken up and/or (de)scheduled.
+IOW, every time a preemption occurs, the descheduled task might be sent
+to some other CPU (depending on its deadline) to continue executing
+(push). On the other hand, every time a CPU becomes idle, it might pull
+the second earliest deadline ready task from some other CPU.
+
+To enforce this, a pull operation is always attempted before taking any
+scheduling decision (pre_schedule()), as well as a push one after each
+scheduling decision (post_schedule()). In addition, when a task arrives
+or wakes up, the best CPU where to resume it is selected taking into
+account its affinity mask, the system topology, but also its deadline.
+E.g., from the scheduling point of view, the best CPU where to wake
+up (and also where to push) a task is the one which is running the task
+with the latest deadline among the M executing ones.
+
+In order to facilitate these decisions, per-runqueue "caching" of the
+deadlines of the currently running and of the first ready task is used.
+Queued but not running tasks are also parked in another rb-tree to
+speed-up pushes.
+
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+	Signed-off-by: Dario Faggioli <raistlin@linux.it>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1383831828-15501-5-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1baca4ce16b8cc7d4f50be1f7914799af30a2861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index b976abe32e72,93ea62754f11..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -361,6 -378,40 +361,43 @@@ struct rt_rq 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Deadline class' related fields in a runqueue */
++ struct dl_rq {
++ 	/* runqueue is an rbtree, ordered by deadline */
++ 	struct rb_root rb_root;
++ 	struct rb_node *rb_leftmost;
++ 
++ 	unsigned long dl_nr_running;
++ 
++ #ifdef CONFIG_SMP
++ 	/*
++ 	 * Deadline values of the currently executing and the
++ 	 * earliest ready task on this rq. Caching these facilitates
++ 	 * the decision wether or not a ready but not running task
++ 	 * should migrate somewhere else.
++ 	 */
++ 	struct {
++ 		u64 curr;
++ 		u64 next;
++ 	} earliest_dl;
++ 
++ 	unsigned long dl_nr_migratory;
++ 	unsigned long dl_nr_total;
++ 	int overloaded;
++ 
++ 	/*
++ 	 * Tasks on this rq that can be pushed away. They are kept in
++ 	 * an rb-tree, ordered by tasks' deadlines, with caching
++ 	 * of the leftmost (earliest deadline) element.
++ 	 */
++ 	struct rb_root pushable_dl_tasks_root;
++ 	struct rb_node *pushable_dl_tasks_leftmost;
++ #endif
++ };
++ 
+++>>>>>>> 1baca4ce16b8 (sched/deadline: Add SCHED_DEADLINE SMP-related data structures & logic)
+  #ifdef CONFIG_SMP
+  
+  /*
+* Unmerged path kernel/sched/deadline.c
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e57aba91f593..3045e2346737 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1182,6 +1182,7 @@ struct task_struct {
+ 	struct list_head tasks;
+ #ifdef CONFIG_SMP
+ 	struct plist_node pushable_tasks;
++	struct rb_node pushable_dl_tasks;
+ #endif
+ 
+ 	struct mm_struct *mm, *active_mm;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f167fdc57a94..bb5cb0dbf2dc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1971,6 +1971,7 @@ void sched_fork(unsigned long clone_flags, struct task_struct *p)
+ #endif
+ #ifdef CONFIG_SMP
+ 	plist_node_init(&p->pushable_tasks, MAX_PRIO);
++	RB_CLEAR_NODE(&p->pushable_dl_tasks);
+ #endif
+ 
+ 	put_cpu();
+@@ -5828,6 +5829,7 @@ static void free_rootdomain(struct rcu_head *rcu)
+ 	struct root_domain *rd = container_of(rcu, struct root_domain, rcu);
+ 
+ 	cpupri_cleanup(&rd->cpupri);
++	free_cpumask_var(rd->dlo_mask);
+ 	free_cpumask_var(rd->rto_mask);
+ 	free_cpumask_var(rd->online);
+ 	free_cpumask_var(rd->span);
+@@ -5879,8 +5881,10 @@ static int init_rootdomain(struct root_domain *rd)
+ 		goto out;
+ 	if (!alloc_cpumask_var(&rd->online, GFP_KERNEL))
+ 		goto free_span;
+-	if (!alloc_cpumask_var(&rd->rto_mask, GFP_KERNEL))
++	if (!alloc_cpumask_var(&rd->dlo_mask, GFP_KERNEL))
+ 		goto free_online;
++	if (!alloc_cpumask_var(&rd->rto_mask, GFP_KERNEL))
++		goto free_dlo_mask;
+ 
+ 	if (cpupri_init(&rd->cpupri) != 0)
+ 		goto free_rto_mask;
+@@ -5888,6 +5892,8 @@ static int init_rootdomain(struct root_domain *rd)
+ 
+ free_rto_mask:
+ 	free_cpumask_var(rd->rto_mask);
++free_dlo_mask:
++	free_cpumask_var(rd->dlo_mask);
+ free_online:
+ 	free_cpumask_var(rd->online);
+ free_span:
+@@ -7259,6 +7265,7 @@ void __init sched_init_smp(void)
+ 	free_cpumask_var(non_isolated_cpus);
+ 
+ 	init_sched_rt_class();
++	init_sched_dl_class();
+ }
+ #else
+ void __init sched_init_smp(void)
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 27f9ed8f4b17..617464b75d61 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1796,7 +1796,7 @@ static void task_woken_rt(struct rq *rq, struct task_struct *p)
+ 	    !test_tsk_need_resched(rq->curr) &&
+ 	    has_pushable_tasks(rq) &&
+ 	    p->nr_cpus_allowed > 1 &&
+-	    rt_task(rq->curr) &&
++	    (dl_task(rq->curr) || rt_task(rq->curr)) &&
+ 	    (rq->curr->nr_cpus_allowed < 2 ||
+ 	     rq->curr->prio <= p->prio))
+ 		push_rt_tasks(rq);
+* Unmerged path kernel/sched/sched.h
