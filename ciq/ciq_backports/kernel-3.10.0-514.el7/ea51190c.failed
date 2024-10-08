@@ -1,0 +1,260 @@
+irq_poll: fold irq_poll_sched_prep into irq_poll_sched
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [irq_poll] fold irq_poll_sched_prep into irq_poll_sched (Jeff Moyer) [1336479]
+Rebuild_FUZZ: 89.80%
+commit-author Christoph Hellwig <hch@lst.de>
+commit ea51190c03150fce4d9e428bfb608abbe0991db8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ea51190c.failed
+
+There is no good reason to keep them apart, and this makes using the API
+a bit simpler.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+(cherry picked from commit ea51190c03150fce4d9e428bfb608abbe0991db8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-iopoll.c
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/ipr.c
+#	include/linux/irq_poll.h
+diff --cc block/blk-iopoll.c
+index aaadab9ccfea,43a3370a09fd..000000000000
+--- a/block/blk-iopoll.c
++++ b/block/blk-iopoll.c
+@@@ -26,23 -20,27 +26,33 @@@ static DEFINE_PER_CPU(struct list_head
+   * @iop:      The parent iopoll structure
+   *
+   * Description:
+++<<<<<<< HEAD:block/blk-iopoll.c
+ + *     Add this blk_iopoll structure to the pending poll list and trigger the
+ + *     raise of the blk iopoll softirq. The driver must already have gotten a
+ + *     successful return from blk_iopoll_sched_prep() before calling this.
+++=======
++  *     Add this irq_poll structure to the pending poll list and trigger the
++  *     raise of the blk iopoll softirq.
+++>>>>>>> ea51190c0315 (irq_poll: fold irq_poll_sched_prep into irq_poll_sched):lib/irq_poll.c
+   **/
+ -void irq_poll_sched(struct irq_poll *iop)
+ +void blk_iopoll_sched(struct blk_iopoll *iop)
+  {
+  	unsigned long flags;
+  
++ 	if (test_bit(IRQ_POLL_F_DISABLE, &iop->state))
++ 		return;
++ 	if (!test_and_set_bit(IRQ_POLL_F_SCHED, &iop->state))
++ 		return;
++ 
+  	local_irq_save(flags);
+  	list_add_tail(&iop->list, this_cpu_ptr(&blk_cpu_iopoll));
+ -	__raise_softirq_irqoff(IRQ_POLL_SOFTIRQ);
+ +	__raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ);
+  	local_irq_restore(flags);
+  }
+ -EXPORT_SYMBOL(irq_poll_sched);
+ +EXPORT_SYMBOL(blk_iopoll_sched);
+  
+  /**
+ - * __irq_poll_complete - Mark this @iop as un-polled again
+ + * __blk_iopoll_complete - Mark this @iop as un-polled again
+   * @iop:      The parent iopoll structure
+   *
+   * Description:
+@@@ -64,10 -62,10 +74,14 @@@ EXPORT_SYMBOL(__blk_iopoll_complete)
+   * Description:
+   *     If a driver consumes less than the assigned budget in its run of the
+   *     iopoll handler, it'll end the polled mode by calling this function. The
+++<<<<<<< HEAD:block/blk-iopoll.c
+ + *     iopoll handler will not be invoked again before blk_iopoll_sched_prep()
+++=======
++  *     iopoll handler will not be invoked again before irq_poll_sched()
+++>>>>>>> ea51190c0315 (irq_poll: fold irq_poll_sched_prep into irq_poll_sched):lib/irq_poll.c
+   *     is called.
+   **/
+ -void irq_poll_complete(struct irq_poll *iop)
+ +void blk_iopoll_complete(struct blk_iopoll *iop)
+  {
+  	unsigned long flags;
+  
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 29e4d80b9729,cb9072a841be..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -910,31 -908,14 +910,37 @@@ static irqreturn_t be_isr_msix(int irq
+  
+  	phba = pbe_eq->phba;
+  	num_eq_processed = 0;
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +					& EQE_VALID_MASK) {
+ +			if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+ +				blk_iopoll_sched(&pbe_eq->iopoll);
+++=======
++ 	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++ 				& EQE_VALID_MASK) {
++ 		irq_poll_sched(&pbe_eq->iopoll);
+++>>>>>>> ea51190c0315 (irq_poll: fold irq_poll_sched_prep into irq_poll_sched)
+  
+ -		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ -		queue_tail_inc(eq);
+ -		eqe = queue_tail_node(eq);
+ -		num_eq_processed++;
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +			num_eq_processed++;
+ +		}
+ +	} else {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +						& EQE_VALID_MASK) {
+ +			spin_lock_irqsave(&phba->isr_lock, flags);
+ +			pbe_eq->todo_cq = true;
+ +			spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +			num_eq_processed++;
+ +		}
+ +
+ +		if (pbe_eq->todo_cq)
+ +			queue_work(phba->wq, &pbe_eq->work_cqs);
+  	}
+  
+  	if (num_eq_processed)
+@@@ -981,72 -961,39 +987,86 @@@ static irqreturn_t be_isr(int irq, voi
+  
+  	num_ioeq_processed = 0;
+  	num_mcceq_processed = 0;
+++<<<<<<< HEAD
+ +	if (blk_iopoll_enabled) {
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +					& EQE_VALID_MASK) {
+ +			if (((eqe->dw[offsetof(struct amap_eq_entry,
+ +			     resource_id) / 32] &
+ +			     EQE_RESID_MASK) >> 16) == mcc->id) {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_mcc_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +				num_mcceq_processed++;
+ +			} else {
+ +				if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+ +					blk_iopoll_sched(&pbe_eq->iopoll);
+ +				num_ioeq_processed++;
+ +			}
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+ +		}
+ +		if (num_ioeq_processed || num_mcceq_processed) {
+ +			if (pbe_eq->todo_mcc_cq)
+ +				queue_work(phba->wq, &pbe_eq->work_cqs);
+ +
+ +			if ((num_mcceq_processed) && (!num_ioeq_processed))
+ +				hwi_ring_eq_db(phba, eq->id, 0,
+ +					      (num_ioeq_processed +
+ +					       num_mcceq_processed) , 1, 1);
+ +			else
+ +				hwi_ring_eq_db(phba, eq->id, 0,
+ +					       (num_ioeq_processed +
+ +						num_mcceq_processed), 0, 1);
+ +
+ +			return IRQ_HANDLED;
+ +		} else
+ +			return IRQ_NONE;
+ +	} else {
+ +		cq = &phwi_context->be_cq[0];
+ +		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+ +						& EQE_VALID_MASK) {
+ +
+ +			if (((eqe->dw[offsetof(struct amap_eq_entry,
+ +			     resource_id) / 32] &
+ +			     EQE_RESID_MASK) >> 16) != cq->id) {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_mcc_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			} else {
+ +				spin_lock_irqsave(&phba->isr_lock, flags);
+ +				pbe_eq->todo_cq = true;
+ +				spin_unlock_irqrestore(&phba->isr_lock, flags);
+ +			}
+ +			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ +			queue_tail_inc(eq);
+ +			eqe = queue_tail_node(eq);
+++=======
++ 	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++ 				& EQE_VALID_MASK) {
++ 		if (((eqe->dw[offsetof(struct amap_eq_entry,
++ 		     resource_id) / 32] &
++ 		     EQE_RESID_MASK) >> 16) == mcc->id) {
++ 			spin_lock_irqsave(&phba->isr_lock, flags);
++ 			pbe_eq->todo_mcc_cq = true;
++ 			spin_unlock_irqrestore(&phba->isr_lock, flags);
++ 			num_mcceq_processed++;
++ 		} else {
++ 			irq_poll_sched(&pbe_eq->iopoll);
+++>>>>>>> ea51190c0315 (irq_poll: fold irq_poll_sched_prep into irq_poll_sched)
+  			num_ioeq_processed++;
+  		}
+ -		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+ -		queue_tail_inc(eq);
+ -		eqe = queue_tail_node(eq);
+ -	}
+ -	if (num_ioeq_processed || num_mcceq_processed) {
+ -		if (pbe_eq->todo_mcc_cq)
+ +		if (pbe_eq->todo_cq || pbe_eq->todo_mcc_cq)
+  			queue_work(phba->wq, &pbe_eq->work_cqs);
+  
+ -		if ((num_mcceq_processed) && (!num_ioeq_processed))
+ -			hwi_ring_eq_db(phba, eq->id, 0,
+ -				      (num_ioeq_processed +
+ -				       num_mcceq_processed) , 1, 1);
+ -		else
+ +		if (num_ioeq_processed) {
+  			hwi_ring_eq_db(phba, eq->id, 0,
+ -				       (num_ioeq_processed +
+ -					num_mcceq_processed), 0, 1);
+ -
+ -		return IRQ_HANDLED;
+ -	} else
+ -		return IRQ_NONE;
+ +				       num_ioeq_processed, 1, 1);
+ +			return IRQ_HANDLED;
+ +		} else
+ +			return IRQ_NONE;
+ +	}
+  }
+  
+  static int beiscsi_init_irqs(struct beiscsi_hba *phba)
+diff --cc drivers/scsi/ipr.c
+index 3131cefaf4a9,82031e00b2e9..000000000000
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@@ -5733,12 -5689,10 +5733,16 @@@ static irqreturn_t ipr_isr_mhrrq(int ir
+  		return IRQ_NONE;
+  	}
+  
+ -	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ +	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+ +			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+  		if ((be32_to_cpu(*hrrq->hrrq_curr) & IPR_HRRQ_TOGGLE_BIT) ==
+  		       hrrq->toggle_bit) {
+++<<<<<<< HEAD
+ +			if (!blk_iopoll_sched_prep(&hrrq->iopoll))
+ +				blk_iopoll_sched(&hrrq->iopoll);
+++=======
++ 			irq_poll_sched(&hrrq->iopoll);
+++>>>>>>> ea51190c0315 (irq_poll: fold irq_poll_sched_prep into irq_poll_sched)
+  			spin_unlock_irqrestore(hrrq->lock, hrrq_flags);
+  			return IRQ_HANDLED;
+  		}
+* Unmerged path include/linux/irq_poll.h
+* Unmerged path block/blk-iopoll.c
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+* Unmerged path drivers/scsi/ipr.c
+* Unmerged path include/linux/irq_poll.h
