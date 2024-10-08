@@ -1,0 +1,189 @@
+hpsa: clean up driver init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 105a3dbc74522c294c0b537d9af46ebb23a82791
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/105a3dbc.failed
+
+Improve initialization error handling in hpsa_init_one
+Clean up style and indent issues
+Rename functions for consistency
+Improve error messaging on allocations
+Fix return status from hpsa_put_ctlr_into_performant_mode
+Correct free order in hpsa_init_one using new function
+   hpsa_free_performant_mode
+Prevent inadvertent use of null pointers by nulling out the parent structures
+   and zeroing out associated size variables.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 105a3dbc74522c294c0b537d9af46ebb23a82791)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 713a62ac835d,4006b8df2190..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -6768,7 -7427,20 +6783,24 @@@ reinit_after_soft_reset
+  	spin_lock_init(&h->lock);
+  	spin_lock_init(&h->offline_device_lock);
+  	spin_lock_init(&h->scan_lock);
+++<<<<<<< HEAD
+ +	spin_lock_init(&h->passthru_count_lock);
+++=======
++ 	atomic_set(&h->passthru_cmds_avail, HPSA_MAX_CONCURRENT_PASSTHRUS);
++ 	atomic_set(&h->abort_cmds_available, HPSA_CMDS_RESERVED_FOR_ABORTS);
++ 
++ 	h->rescan_ctlr_wq = hpsa_create_controller_wq(h, "rescan");
++ 	if (!h->rescan_ctlr_wq) {
++ 		rc = -ENOMEM;
++ 		goto clean1;
++ 	}
++ 
++ 	h->resubmit_wq = hpsa_create_controller_wq(h, "resubmit");
++ 	if (!h->resubmit_wq) {
++ 		rc = -ENOMEM;
++ 		goto clean1;	/* aer/h */
++ 	}
+++>>>>>>> 105a3dbc7452 (hpsa: clean up driver init)
+  
+  	/* Allocate and clear per-cpu variable lockup_detected */
+  	h->lockup_detected = alloc_percpu(u32);
+@@@ -6810,10 -7484,12 +6844,11 @@@
+  	       h->intr[h->intr_mode], dac ? "" : " not");
+  	rc = hpsa_alloc_cmd_pool(h);
+  	if (rc)
+- 		goto clean2_and_free_irqs;
+- 	if (hpsa_allocate_sg_chain_blocks(h))
+- 		goto clean4;
++ 		goto clean4;	/* irq, pci, lockup, wq/aer/h */
++ 	rc = hpsa_alloc_sg_chain_blocks(h);
++ 	if (rc)
++ 		goto clean5;	/* cmd, irq, pci, lockup, wq/aer/h */
+  	init_waitqueue_head(&h->scan_wait_queue);
+ -	init_waitqueue_head(&h->abort_cmd_wait_queue);
+  	h->scan_finished = 1; /* no scan currently in progress */
+  
+  	pci_set_drvdata(pdev, h);
+@@@ -6895,20 -7574,37 +6933,39 @@@
+  	INIT_DELAYED_WORK(&h->monitor_ctlr_work, hpsa_monitor_ctlr_worker);
+  	schedule_delayed_work(&h->monitor_ctlr_work,
+  				h->heartbeat_sample_interval);
+ -	INIT_DELAYED_WORK(&h->rescan_ctlr_work, hpsa_rescan_ctlr_worker);
+ -	queue_delayed_work(h->rescan_ctlr_wq, &h->rescan_ctlr_work,
+ -				h->heartbeat_sample_interval);
+  	return 0;
+  
+- clean4:
++ clean7: /* perf, sg, cmd, irq, pci, lockup, wq/aer/h */
++ 	kfree(h->hba_inquiry_data);
++ 	hpsa_free_performant_mode(h);
++ 	h->access.set_intr_mask(h, HPSA_INTR_OFF);
++ clean6: /* sg, cmd, irq, pci, lockup, wq/aer/h */
+  	hpsa_free_sg_chain_blocks(h);
++ clean5: /* cmd, irq, pci, lockup, wq/aer/h */
+  	hpsa_free_cmd_pool(h);
+- 	hpsa_free_ioaccel1_cmd_and_bft(h);
+- 	hpsa_free_ioaccel2_cmd_and_bft(h);
+- clean2_and_free_irqs:
++ clean4: /* irq, pci, lockup, wq/aer/h */
+  	hpsa_free_irqs(h);
+- clean2:
++ clean3: /* pci, lockup, wq/aer/h */
+  	hpsa_free_pci_init(h);
+++<<<<<<< HEAD
+ +clean1:
+ +	if (h->lockup_detected)
+++=======
++ clean2: /* lockup, wq/aer/h */
++ 	if (h->lockup_detected) {
+++>>>>>>> 105a3dbc7452 (hpsa: clean up driver init)
+  		free_percpu(h->lockup_detected);
++ 		h->lockup_detected = NULL;
++ 	}
++ clean1:	/* wq/aer/h */
++ 	if (h->resubmit_wq) {
++ 		destroy_workqueue(h->resubmit_wq);
++ 		h->resubmit_wq = NULL;
++ 	}
++ 	if (h->rescan_ctlr_wq) {
++ 		destroy_workqueue(h->rescan_ctlr_wq);
++ 		h->rescan_ctlr_wq = NULL;
++ 	}
+  	kfree(h);
+  	return rc;
+  }
+@@@ -6981,12 -7680,13 +7040,19 @@@ static void hpsa_remove_one(struct pci_
+  	/* Get rid of any controller monitoring work items */
+  	spin_lock_irqsave(&h->lock, flags);
+  	h->remove_in_progress = 1;
+ +	cancel_delayed_work(&h->monitor_ctlr_work);
+  	spin_unlock_irqrestore(&h->lock, flags);
+++<<<<<<< HEAD
+ +
+ +	hpsa_unregister_scsi(h);	/* unhook from SCSI subsystem */
+- 
+- 	/* includes hpsa_free_irqs */
+++=======
++ 	cancel_delayed_work_sync(&h->monitor_ctlr_work);
++ 	cancel_delayed_work_sync(&h->rescan_ctlr_work);
++ 	destroy_workqueue(h->rescan_ctlr_wq);
++ 	destroy_workqueue(h->resubmit_wq);
+++>>>>>>> 105a3dbc7452 (hpsa: clean up driver init)
++ 
++ 	/* includes hpsa_free_irqs - init_one 4 */
+  	/* includes hpsa_disable_interrupt_mode - pci_init 2 */
+  	hpsa_shutdown(pdev);
+  
+@@@ -7293,7 -8004,9 +7370,13 @@@ clean_up
+  /* Free ioaccel2 mode command blocks and block fetch table */
+  static void hpsa_free_ioaccel2_cmd_and_bft(struct ctlr_info *h)
+  {
+++<<<<<<< HEAD
+ +	if (h->ioaccel2_cmd_pool)
+++=======
++ 	hpsa_free_ioaccel2_sg_chain_blocks(h);
++ 
++ 	if (h->ioaccel2_cmd_pool) {
+++>>>>>>> 105a3dbc7452 (hpsa: clean up driver init)
+  		pci_free_consistent(h->pdev,
+  			h->nr_cmds * sizeof(*h->ioaccel2_cmd_pool),
+  			h->ioaccel2_cmd_pool,
+@@@ -7332,10 -8057,23 +7419,23 @@@ static int hpsa_alloc_ioaccel2_cmd_and_
+  
+  clean_up:
+  	hpsa_free_ioaccel2_cmd_and_bft(h);
+ -	return rc;
+ +	return 1;
+  }
+  
+- static void hpsa_put_ctlr_into_performant_mode(struct ctlr_info *h)
++ /* Free items allocated by hpsa_put_ctlr_into_performant_mode */
++ static void hpsa_free_performant_mode(struct ctlr_info *h)
++ {
++ 	kfree(h->blockFetchTable);
++ 	h->blockFetchTable = NULL;
++ 	hpsa_free_reply_queues(h);
++ 	hpsa_free_ioaccel1_cmd_and_bft(h);
++ 	hpsa_free_ioaccel2_cmd_and_bft(h);
++ }
++ 
++ /* return -ENODEV on error, 0 on success (or no action)
++  * allocates numerous items that must be freed later
++  */
++ static int hpsa_put_ctlr_into_performant_mode(struct ctlr_info *h)
+  {
+  	u32 trans_support;
+  	unsigned long transMethod = CFGTBL_Trans_Performant |
+* Unmerged path drivers/scsi/hpsa.c
