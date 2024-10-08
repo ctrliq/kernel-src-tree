@@ -165,8 +165,8 @@ static void ceph_invalidatepage(struct page *page, unsigned long offset)
 /* just a sanity check */
 static int ceph_releasepage(struct page *page, gfp_t g)
 {
-	struct inode *inode = page->mapping ? page->mapping->host : NULL;
-	dout("%p releasepage %p idx %lu\n", inode, page, page->index);
+	dout("%p releasepage %p idx %lu\n", page->mapping->host,
+	     page, page->index);
 	WARN_ON(PageDirty(page));
 	WARN_ON(PagePrivate(page));
 	return 0;
