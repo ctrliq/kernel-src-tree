@@ -1,0 +1,801 @@
+IB/mlx5, iser, isert: Add Signature API additions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] mlx5: iser,isert: Add Signature API additions (Andy Grover) [1136558 1185396]
+Rebuild_FUZZ: 93.62%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 78eda2bb6542057b214af3bc1cae09c63e65d1d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/78eda2bb.failed
+
+Expose more signature setting parameters. We modify the signature API
+to allow usage of some new execution parameters relevant to data
+integrity feature.
+
+This patch modifies ib_sig_domain structure by:
+
+- Deprecate DIF type in signature API (operation will
+  be determined by the parameters alone, no DIF type awareness)
+- Add APPTAG check bitmask (for input domain)
+- Add REFTAG remap (increment) flag for each domain
+- Add APPTAG/REFTAG escape options for each domain
+
+The mlx5 driver is modified to follow the new parameters in HW
+signature setup.
+
+At the moment the callers (iser/isert) hard-code new parameters (by
+DIF type). In the future, callers will retrieve them from the scsi
+command structure.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 78eda2bb6542057b214af3bc1cae09c63e65d1d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 6b6eb8b033b8,0bea5776bcbc..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -1968,24 -2468,415 +1968,431 @@@ isert_put_datain(struct iscsi_conn *con
+  					send_wr, data_len, offset);
+  		ib_sge += ib_sge_cnt;
+  
+ +		if (i + 1 == wr->send_wr_num)
+ +			send_wr->next = &isert_cmd->tx_desc.send_wr;
+ +		else
+ +			send_wr->next = &wr->send_wr[i + 1];
+ +
+  		offset += data_len;
+ -		va_offset += data_len;
+  		data_left -= data_len;
+  	}
+ +	/*
+ +	 * Build isert_conn->tx_desc for iSCSI response PDU and attach
+ +	 */
+ +	isert_create_send_desc(isert_conn, isert_cmd, &isert_cmd->tx_desc);
+ +	iscsit_build_rsp_pdu(cmd, conn, false, (struct iscsi_scsi_rsp *)
+ +			     &isert_cmd->tx_desc.iscsi_header);
+ +	isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+ +	isert_init_send_wr(isert_cmd, &isert_cmd->tx_desc.send_wr);
+  
+++<<<<<<< HEAD
+ +	atomic_add(wr->send_wr_num + 1, &isert_conn->post_send_buf_count);
+++=======
++ 	return 0;
++ unmap_cmd:
++ 	isert_unmap_data_buf(isert_conn, data);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ isert_map_fr_pagelist(struct ib_device *ib_dev,
++ 		      struct scatterlist *sg_start, int sg_nents, u64 *fr_pl)
++ {
++ 	u64 start_addr, end_addr, page, chunk_start = 0;
++ 	struct scatterlist *tmp_sg;
++ 	int i = 0, new_chunk, last_ent, n_pages;
++ 
++ 	n_pages = 0;
++ 	new_chunk = 1;
++ 	last_ent = sg_nents - 1;
++ 	for_each_sg(sg_start, tmp_sg, sg_nents, i) {
++ 		start_addr = ib_sg_dma_address(ib_dev, tmp_sg);
++ 		if (new_chunk)
++ 			chunk_start = start_addr;
++ 		end_addr = start_addr + ib_sg_dma_len(ib_dev, tmp_sg);
++ 
++ 		pr_debug("SGL[%d] dma_addr: 0x%16llx len: %u\n",
++ 			 i, (unsigned long long)tmp_sg->dma_address,
++ 			 tmp_sg->length);
++ 
++ 		if ((end_addr & ~PAGE_MASK) && i < last_ent) {
++ 			new_chunk = 0;
++ 			continue;
++ 		}
++ 		new_chunk = 1;
++ 
++ 		page = chunk_start & PAGE_MASK;
++ 		do {
++ 			fr_pl[n_pages++] = page;
++ 			pr_debug("Mapped page_list[%d] page_addr: 0x%16llx\n",
++ 				 n_pages - 1, page);
++ 			page += PAGE_SIZE;
++ 		} while (page < end_addr);
++ 	}
++ 
++ 	return n_pages;
++ }
++ 
++ static int
++ isert_fast_reg_mr(struct isert_conn *isert_conn,
++ 		  struct fast_reg_descriptor *fr_desc,
++ 		  struct isert_data_buf *mem,
++ 		  enum isert_indicator ind,
++ 		  struct ib_sge *sge)
++ {
++ 	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
++ 	struct ib_mr *mr;
++ 	struct ib_fast_reg_page_list *frpl;
++ 	struct ib_send_wr fr_wr, inv_wr;
++ 	struct ib_send_wr *bad_wr, *wr = NULL;
++ 	int ret, pagelist_len;
++ 	u32 page_off;
++ 	u8 key;
++ 
++ 	if (mem->dma_nents == 1) {
++ 		sge->lkey = isert_conn->conn_mr->lkey;
++ 		sge->addr = ib_sg_dma_address(ib_dev, &mem->sg[0]);
++ 		sge->length = ib_sg_dma_len(ib_dev, &mem->sg[0]);
++ 		pr_debug("%s:%d sge: addr: 0x%llx  length: %u lkey: %x\n",
++ 			 __func__, __LINE__, sge->addr, sge->length,
++ 			 sge->lkey);
++ 		return 0;
++ 	}
++ 
++ 	if (ind == ISERT_DATA_KEY_VALID) {
++ 		/* Registering data buffer */
++ 		mr = fr_desc->data_mr;
++ 		frpl = fr_desc->data_frpl;
++ 	} else {
++ 		/* Registering protection buffer */
++ 		mr = fr_desc->pi_ctx->prot_mr;
++ 		frpl = fr_desc->pi_ctx->prot_frpl;
++ 	}
++ 
++ 	page_off = mem->offset % PAGE_SIZE;
++ 
++ 	pr_debug("Use fr_desc %p sg_nents %d offset %u\n",
++ 		 fr_desc, mem->nents, mem->offset);
++ 
++ 	pagelist_len = isert_map_fr_pagelist(ib_dev, mem->sg, mem->nents,
++ 					     &frpl->page_list[0]);
++ 
++ 	if (!(fr_desc->ind & ISERT_DATA_KEY_VALID)) {
++ 		memset(&inv_wr, 0, sizeof(inv_wr));
++ 		inv_wr.wr_id = ISER_FASTREG_LI_WRID;
++ 		inv_wr.opcode = IB_WR_LOCAL_INV;
++ 		inv_wr.ex.invalidate_rkey = mr->rkey;
++ 		wr = &inv_wr;
++ 		/* Bump the key */
++ 		key = (u8)(mr->rkey & 0x000000FF);
++ 		ib_update_fast_reg_key(mr, ++key);
++ 	}
++ 
++ 	/* Prepare FASTREG WR */
++ 	memset(&fr_wr, 0, sizeof(fr_wr));
++ 	fr_wr.wr_id = ISER_FASTREG_LI_WRID;
++ 	fr_wr.opcode = IB_WR_FAST_REG_MR;
++ 	fr_wr.wr.fast_reg.iova_start = frpl->page_list[0] + page_off;
++ 	fr_wr.wr.fast_reg.page_list = frpl;
++ 	fr_wr.wr.fast_reg.page_list_len = pagelist_len;
++ 	fr_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
++ 	fr_wr.wr.fast_reg.length = mem->len;
++ 	fr_wr.wr.fast_reg.rkey = mr->rkey;
++ 	fr_wr.wr.fast_reg.access_flags = IB_ACCESS_LOCAL_WRITE;
++ 
++ 	if (!wr)
++ 		wr = &fr_wr;
++ 	else
++ 		wr->next = &fr_wr;
++ 
++ 	ret = ib_post_send(isert_conn->conn_qp, wr, &bad_wr);
++ 	if (ret) {
++ 		pr_err("fast registration failed, ret:%d\n", ret);
++ 		return ret;
++ 	}
++ 	fr_desc->ind &= ~ind;
++ 
++ 	sge->lkey = mr->lkey;
++ 	sge->addr = frpl->page_list[0] + page_off;
++ 	sge->length = mem->len;
++ 
++ 	pr_debug("%s:%d sge: addr: 0x%llx  length: %u lkey: %x\n",
++ 		 __func__, __LINE__, sge->addr, sge->length,
++ 		 sge->lkey);
++ 
++ 	return ret;
++ }
++ 
++ static inline void
++ isert_set_dif_domain(struct se_cmd *se_cmd, struct ib_sig_attrs *sig_attrs,
++ 		     struct ib_sig_domain *domain)
++ {
++ 	domain->sig_type = IB_SIG_TYPE_T10_DIF;
++ 	domain->sig.dif.bg_type = IB_T10DIF_CRC;
++ 	domain->sig.dif.pi_interval = se_cmd->se_dev->dev_attrib.block_size;
++ 	domain->sig.dif.ref_tag = se_cmd->reftag_seed;
++ 	/*
++ 	 * At the moment we hard code those, but if in the future
++ 	 * the target core would like to use it, we will take it
++ 	 * from se_cmd.
++ 	 */
++ 	domain->sig.dif.apptag_check_mask = 0xffff;
++ 	domain->sig.dif.app_escape = true;
++ 	domain->sig.dif.ref_escape = true;
++ 	if (se_cmd->prot_type == TARGET_DIF_TYPE1_PROT ||
++ 	    se_cmd->prot_type == TARGET_DIF_TYPE2_PROT)
++ 		domain->sig.dif.ref_remap = true;
++ };
++ 
++ static int
++ isert_set_sig_attrs(struct se_cmd *se_cmd, struct ib_sig_attrs *sig_attrs)
++ {
++ 	switch (se_cmd->prot_op) {
++ 	case TARGET_PROT_DIN_INSERT:
++ 	case TARGET_PROT_DOUT_STRIP:
++ 		sig_attrs->mem.sig_type = IB_SIG_TYPE_NONE;
++ 		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->wire);
++ 		break;
++ 	case TARGET_PROT_DOUT_INSERT:
++ 	case TARGET_PROT_DIN_STRIP:
++ 		sig_attrs->wire.sig_type = IB_SIG_TYPE_NONE;
++ 		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->mem);
++ 		break;
++ 	case TARGET_PROT_DIN_PASS:
++ 	case TARGET_PROT_DOUT_PASS:
++ 		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->wire);
++ 		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->mem);
++ 		break;
++ 	default:
++ 		pr_err("Unsupported PI operation %d\n", se_cmd->prot_op);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline u8
++ isert_set_prot_checks(u8 prot_checks)
++ {
++ 	return (prot_checks & TARGET_DIF_CHECK_GUARD  ? 0xc0 : 0) |
++ 	       (prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x30 : 0) |
++ 	       (prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x0f : 0);
++ }
++ 
++ static int
++ isert_reg_sig_mr(struct isert_conn *isert_conn, struct se_cmd *se_cmd,
++ 		 struct fast_reg_descriptor *fr_desc,
++ 		 struct ib_sge *data_sge, struct ib_sge *prot_sge,
++ 		 struct ib_sge *sig_sge)
++ {
++ 	struct ib_send_wr sig_wr, inv_wr;
++ 	struct ib_send_wr *bad_wr, *wr = NULL;
++ 	struct pi_context *pi_ctx = fr_desc->pi_ctx;
++ 	struct ib_sig_attrs sig_attrs;
++ 	int ret;
++ 	u32 key;
++ 
++ 	memset(&sig_attrs, 0, sizeof(sig_attrs));
++ 	ret = isert_set_sig_attrs(se_cmd, &sig_attrs);
++ 	if (ret)
++ 		goto err;
++ 
++ 	sig_attrs.check_mask = isert_set_prot_checks(se_cmd->prot_checks);
++ 
++ 	if (!(fr_desc->ind & ISERT_SIG_KEY_VALID)) {
++ 		memset(&inv_wr, 0, sizeof(inv_wr));
++ 		inv_wr.opcode = IB_WR_LOCAL_INV;
++ 		inv_wr.wr_id = ISER_FASTREG_LI_WRID;
++ 		inv_wr.ex.invalidate_rkey = pi_ctx->sig_mr->rkey;
++ 		wr = &inv_wr;
++ 		/* Bump the key */
++ 		key = (u8)(pi_ctx->sig_mr->rkey & 0x000000FF);
++ 		ib_update_fast_reg_key(pi_ctx->sig_mr, ++key);
++ 	}
++ 
++ 	memset(&sig_wr, 0, sizeof(sig_wr));
++ 	sig_wr.opcode = IB_WR_REG_SIG_MR;
++ 	sig_wr.wr_id = ISER_FASTREG_LI_WRID;
++ 	sig_wr.sg_list = data_sge;
++ 	sig_wr.num_sge = 1;
++ 	sig_wr.wr.sig_handover.access_flags = IB_ACCESS_LOCAL_WRITE;
++ 	sig_wr.wr.sig_handover.sig_attrs = &sig_attrs;
++ 	sig_wr.wr.sig_handover.sig_mr = pi_ctx->sig_mr;
++ 	if (se_cmd->t_prot_sg)
++ 		sig_wr.wr.sig_handover.prot = prot_sge;
++ 
++ 	if (!wr)
++ 		wr = &sig_wr;
++ 	else
++ 		wr->next = &sig_wr;
++ 
++ 	ret = ib_post_send(isert_conn->conn_qp, wr, &bad_wr);
++ 	if (ret) {
++ 		pr_err("fast registration failed, ret:%d\n", ret);
++ 		goto err;
++ 	}
++ 	fr_desc->ind &= ~ISERT_SIG_KEY_VALID;
++ 
++ 	sig_sge->lkey = pi_ctx->sig_mr->lkey;
++ 	sig_sge->addr = 0;
++ 	sig_sge->length = se_cmd->data_length;
++ 	if (se_cmd->prot_op != TARGET_PROT_DIN_STRIP &&
++ 	    se_cmd->prot_op != TARGET_PROT_DOUT_INSERT)
++ 		/*
++ 		 * We have protection guards on the wire
++ 		 * so we need to set a larget transfer
++ 		 */
++ 		sig_sge->length += se_cmd->prot_length;
++ 
++ 	pr_debug("sig_sge: addr: 0x%llx  length: %u lkey: %x\n",
++ 		 sig_sge->addr, sig_sge->length,
++ 		 sig_sge->lkey);
++ err:
++ 	return ret;
++ }
++ 
++ static int
++ isert_reg_rdma(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
++ 	       struct isert_rdma_wr *wr)
++ {
++ 	struct se_cmd *se_cmd = &cmd->se_cmd;
++ 	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
++ 	struct isert_conn *isert_conn = conn->context;
++ 	struct ib_sge data_sge;
++ 	struct ib_send_wr *send_wr;
++ 	struct fast_reg_descriptor *fr_desc = NULL;
++ 	u32 offset;
++ 	int ret = 0;
++ 	unsigned long flags;
++ 
++ 	isert_cmd->tx_desc.isert_cmd = isert_cmd;
++ 
++ 	offset = wr->iser_ib_op == ISER_IB_RDMA_READ ? cmd->write_data_done : 0;
++ 	ret = isert_map_data_buf(isert_conn, isert_cmd, se_cmd->t_data_sg,
++ 				 se_cmd->t_data_nents, se_cmd->data_length,
++ 				 offset, wr->iser_ib_op, &wr->data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (wr->data.dma_nents != 1 ||
++ 	    se_cmd->prot_op != TARGET_PROT_NORMAL) {
++ 		spin_lock_irqsave(&isert_conn->conn_lock, flags);
++ 		fr_desc = list_first_entry(&isert_conn->conn_fr_pool,
++ 					   struct fast_reg_descriptor, list);
++ 		list_del(&fr_desc->list);
++ 		spin_unlock_irqrestore(&isert_conn->conn_lock, flags);
++ 		wr->fr_desc = fr_desc;
++ 	}
++ 
++ 	ret = isert_fast_reg_mr(isert_conn, fr_desc, &wr->data,
++ 				ISERT_DATA_KEY_VALID, &data_sge);
++ 	if (ret)
++ 		goto unmap_cmd;
++ 
++ 	if (se_cmd->prot_op != TARGET_PROT_NORMAL) {
++ 		struct ib_sge prot_sge, sig_sge;
++ 
++ 		if (se_cmd->t_prot_sg) {
++ 			ret = isert_map_data_buf(isert_conn, isert_cmd,
++ 						 se_cmd->t_prot_sg,
++ 						 se_cmd->t_prot_nents,
++ 						 se_cmd->prot_length,
++ 						 0, wr->iser_ib_op, &wr->prot);
++ 			if (ret)
++ 				goto unmap_cmd;
++ 
++ 			ret = isert_fast_reg_mr(isert_conn, fr_desc, &wr->prot,
++ 						ISERT_PROT_KEY_VALID, &prot_sge);
++ 			if (ret)
++ 				goto unmap_prot_cmd;
++ 		}
++ 
++ 		ret = isert_reg_sig_mr(isert_conn, se_cmd, fr_desc,
++ 				       &data_sge, &prot_sge, &sig_sge);
++ 		if (ret)
++ 			goto unmap_prot_cmd;
++ 
++ 		fr_desc->ind |= ISERT_PROTECTED;
++ 		memcpy(&wr->s_ib_sge, &sig_sge, sizeof(sig_sge));
++ 	} else
++ 		memcpy(&wr->s_ib_sge, &data_sge, sizeof(data_sge));
++ 
++ 	wr->ib_sge = &wr->s_ib_sge;
++ 	wr->send_wr_num = 1;
++ 	memset(&wr->s_send_wr, 0, sizeof(*send_wr));
++ 	wr->send_wr = &wr->s_send_wr;
++ 	wr->isert_cmd = isert_cmd;
++ 
++ 	send_wr = &isert_cmd->rdma_wr.s_send_wr;
++ 	send_wr->sg_list = &wr->s_ib_sge;
++ 	send_wr->num_sge = 1;
++ 	send_wr->wr_id = (unsigned long)&isert_cmd->tx_desc;
++ 	if (wr->iser_ib_op == ISER_IB_RDMA_WRITE) {
++ 		send_wr->opcode = IB_WR_RDMA_WRITE;
++ 		send_wr->wr.rdma.remote_addr = isert_cmd->read_va;
++ 		send_wr->wr.rdma.rkey = isert_cmd->read_stag;
++ 		send_wr->send_flags = se_cmd->prot_op == TARGET_PROT_NORMAL ?
++ 				      0 : IB_SEND_SIGNALED;
++ 	} else {
++ 		send_wr->opcode = IB_WR_RDMA_READ;
++ 		send_wr->wr.rdma.remote_addr = isert_cmd->write_va;
++ 		send_wr->wr.rdma.rkey = isert_cmd->write_stag;
++ 		send_wr->send_flags = IB_SEND_SIGNALED;
++ 	}
++ 
++ 	return 0;
++ unmap_prot_cmd:
++ 	if (se_cmd->t_prot_sg)
++ 		isert_unmap_data_buf(isert_conn, &wr->prot);
++ unmap_cmd:
++ 	if (fr_desc) {
++ 		spin_lock_irqsave(&isert_conn->conn_lock, flags);
++ 		list_add_tail(&fr_desc->list, &isert_conn->conn_fr_pool);
++ 		spin_unlock_irqrestore(&isert_conn->conn_lock, flags);
++ 	}
++ 	isert_unmap_data_buf(isert_conn, &wr->data);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ isert_put_datain(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
++ {
++ 	struct se_cmd *se_cmd = &cmd->se_cmd;
++ 	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
++ 	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
++ 	struct isert_conn *isert_conn = (struct isert_conn *)conn->context;
++ 	struct isert_device *device = isert_conn->conn_device;
++ 	struct ib_send_wr *wr_failed;
++ 	int rc;
++ 
++ 	pr_debug("Cmd: %p RDMA_WRITE data_length: %u\n",
++ 		 isert_cmd, se_cmd->data_length);
++ 	wr->iser_ib_op = ISER_IB_RDMA_WRITE;
++ 	rc = device->reg_rdma_mem(conn, cmd, wr);
++ 	if (rc) {
++ 		pr_err("Cmd: %p failed to prepare RDMA res\n", isert_cmd);
++ 		return rc;
++ 	}
++ 
++ 	if (se_cmd->prot_op == TARGET_PROT_NORMAL) {
++ 		/*
++ 		 * Build isert_conn->tx_desc for iSCSI response PDU and attach
++ 		 */
++ 		isert_create_send_desc(isert_conn, isert_cmd,
++ 				       &isert_cmd->tx_desc);
++ 		iscsit_build_rsp_pdu(cmd, conn, true, (struct iscsi_scsi_rsp *)
++ 				     &isert_cmd->tx_desc.iscsi_header);
++ 		isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
++ 		isert_init_send_wr(isert_conn, isert_cmd,
++ 				   &isert_cmd->tx_desc.send_wr, true);
++ 		isert_cmd->rdma_wr.s_send_wr.next = &isert_cmd->tx_desc.send_wr;
++ 		wr->send_wr_num += 1;
++ 	}
++ 
++ 	atomic_add(wr->send_wr_num, &isert_conn->post_send_buf_count);
+++>>>>>>> 78eda2bb6542 (IB/mlx5, iser, isert: Add Signature API additions)
+  
+  	rc = ib_post_send(isert_conn->conn_qp, wr->send_wr, &wr_failed);
+  	if (rc) {
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 082db0ec729c..57a6ec5389a6 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -2152,50 +2152,31 @@ static u8 bs_selector(int block_size)
+ 	}
+ }
+ 
+-static int mlx5_fill_inl_bsf(struct ib_sig_domain *domain,
+-			     struct mlx5_bsf_inl *inl)
++static void mlx5_fill_inl_bsf(struct ib_sig_domain *domain,
++			      struct mlx5_bsf_inl *inl)
+ {
+ 	/* Valid inline section and allow BSF refresh */
+ 	inl->vld_refresh = cpu_to_be16(MLX5_BSF_INL_VALID |
+ 				       MLX5_BSF_REFRESH_DIF);
+ 	inl->dif_apptag = cpu_to_be16(domain->sig.dif.app_tag);
+ 	inl->dif_reftag = cpu_to_be32(domain->sig.dif.ref_tag);
++	/* repeating block */
++	inl->rp_inv_seed = MLX5_BSF_REPEAT_BLOCK;
++	inl->sig_type = domain->sig.dif.bg_type == IB_T10DIF_CRC ?
++			MLX5_DIF_CRC : MLX5_DIF_IPCS;
+ 
+-	switch (domain->sig.dif.type) {
+-	case IB_T10DIF_NONE:
+-		/* No DIF */
+-		break;
+-	case IB_T10DIF_TYPE1: /* Fall through */
+-	case IB_T10DIF_TYPE2:
+-		inl->sig_type = domain->sig.dif.bg_type == IB_T10DIF_CRC ?
+-				MLX5_DIF_CRC : MLX5_DIF_IPCS;
+-		/*
+-		 * increment reftag and don't check if
+-		 * apptag=0xffff and reftag=0xffffffff
+-		 */
+-		inl->dif_inc_ref_guard_check = MLX5_BSF_INC_REFTAG |
+-					       MLX5_BSF_APPREF_ESCAPE;
+-		inl->dif_app_bitmask_check = 0xffff;
+-		/* repeating block */
+-		inl->rp_inv_seed = MLX5_BSF_REPEAT_BLOCK;
+-		break;
+-	case IB_T10DIF_TYPE3:
+-		inl->sig_type = domain->sig.dif.bg_type == IB_T10DIF_CRC ?
+-				MLX5_DIF_CRC : MLX5_DIF_IPCS;
+-		/*
+-		 * Don't inc reftag and don't check if
+-		 * apptag=0xffff and reftag=0xffffffff
+-		 */
+-		inl->dif_inc_ref_guard_check = MLX5_BSF_APPREF_ESCAPE;
+-		inl->dif_app_bitmask_check = 0xffff;
+-		/* Repeating block */
+-		inl->rp_inv_seed = MLX5_BSF_REPEAT_BLOCK;
+-		break;
+-	default:
+-		return -EINVAL;
++	if (domain->sig.dif.ref_remap)
++		inl->dif_inc_ref_guard_check |= MLX5_BSF_INC_REFTAG;
++
++	if (domain->sig.dif.app_escape) {
++		if (domain->sig.dif.ref_escape)
++			inl->dif_inc_ref_guard_check |= MLX5_BSF_APPREF_ESCAPE;
++		else
++			inl->dif_inc_ref_guard_check |= MLX5_BSF_APPTAG_ESCAPE;
+ 	}
+ 
+-	return 0;
++	inl->dif_app_bitmask_check =
++		cpu_to_be16(domain->sig.dif.apptag_check_mask);
+ }
+ 
+ static int mlx5_set_bsf(struct ib_mr *sig_mr,
+@@ -2206,20 +2187,35 @@ static int mlx5_set_bsf(struct ib_mr *sig_mr,
+ 	struct mlx5_bsf_basic *basic = &bsf->basic;
+ 	struct ib_sig_domain *mem = &sig_attrs->mem;
+ 	struct ib_sig_domain *wire = &sig_attrs->wire;
+-	int ret;
+ 
+ 	memset(bsf, 0, sizeof(*bsf));
++
++	/* Basic + Extended + Inline */
++	basic->bsf_size_sbs = 1 << 7;
++	/* Input domain check byte mask */
++	basic->check_byte_mask = sig_attrs->check_mask;
++	basic->raw_data_size = cpu_to_be32(data_size);
++
++	/* Memory domain */
+ 	switch (sig_attrs->mem.sig_type) {
++	case IB_SIG_TYPE_NONE:
++		break;
+ 	case IB_SIG_TYPE_T10_DIF:
+-		if (sig_attrs->wire.sig_type != IB_SIG_TYPE_T10_DIF)
+-			return -EINVAL;
++		basic->mem.bs_selector = bs_selector(mem->sig.dif.pi_interval);
++		basic->m_bfs_psv = cpu_to_be32(msig->psv_memory.psv_idx);
++		mlx5_fill_inl_bsf(mem, &bsf->m_inl);
++		break;
++	default:
++		return -EINVAL;
++	}
+ 
+-		/* Basic + Extended + Inline */
+-		basic->bsf_size_sbs = 1 << 7;
+-		/* Input domain check byte mask */
+-		basic->check_byte_mask = sig_attrs->check_mask;
++	/* Wire domain */
++	switch (sig_attrs->wire.sig_type) {
++	case IB_SIG_TYPE_NONE:
++		break;
++	case IB_SIG_TYPE_T10_DIF:
+ 		if (mem->sig.dif.pi_interval == wire->sig.dif.pi_interval &&
+-		    mem->sig.dif.type == wire->sig.dif.type) {
++		    mem->sig_type == wire->sig_type) {
+ 			/* Same block structure */
+ 			basic->bsf_size_sbs |= 1 << 4;
+ 			if (mem->sig.dif.bg_type == wire->sig.dif.bg_type)
+@@ -2231,20 +2227,9 @@ static int mlx5_set_bsf(struct ib_mr *sig_mr,
+ 		} else
+ 			basic->wire.bs_selector = bs_selector(wire->sig.dif.pi_interval);
+ 
+-		basic->mem.bs_selector = bs_selector(mem->sig.dif.pi_interval);
+-		basic->raw_data_size = cpu_to_be32(data_size);
+-		basic->m_bfs_psv = cpu_to_be32(msig->psv_memory.psv_idx);
+ 		basic->w_bfs_psv = cpu_to_be32(msig->psv_wire.psv_idx);
+-
+-		ret = mlx5_fill_inl_bsf(wire, &bsf->w_inl);
+-		if (ret)
+-			return -EINVAL;
+-
+-		ret = mlx5_fill_inl_bsf(mem, &bsf->m_inl);
+-		if (ret)
+-			return -EINVAL;
++		mlx5_fill_inl_bsf(wire, &bsf->w_inl);
+ 		break;
+-
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -2443,20 +2428,21 @@ static int set_psv_wr(struct ib_sig_domain *domain,
+ 	memset(psv_seg, 0, sizeof(*psv_seg));
+ 	psv_seg->psv_num = cpu_to_be32(psv_idx);
+ 	switch (domain->sig_type) {
++	case IB_SIG_TYPE_NONE:
++		break;
+ 	case IB_SIG_TYPE_T10_DIF:
+ 		psv_seg->transient_sig = cpu_to_be32(domain->sig.dif.bg << 16 |
+ 						     domain->sig.dif.app_tag);
+ 		psv_seg->ref_tag = cpu_to_be32(domain->sig.dif.ref_tag);
+-
+-		*seg += sizeof(*psv_seg);
+-		*size += sizeof(*psv_seg) / 16;
+ 		break;
+-
+ 	default:
+ 		pr_err("Bad signature type given.\n");
+ 		return 1;
+ 	}
+ 
++	*seg += sizeof(*psv_seg);
++	*size += sizeof(*psv_seg) / 16;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index f40132fc970c..843a2d645a43 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -437,51 +437,44 @@ int iser_reg_rdma_mem_fmr(struct iscsi_iser_task *iser_task,
+ 	return 0;
+ }
+ 
+-static inline enum ib_t10_dif_type
+-scsi2ib_prot_type(unsigned char prot_type)
+-{
+-	switch (prot_type) {
+-	case SCSI_PROT_DIF_TYPE0:
+-		return IB_T10DIF_NONE;
+-	case SCSI_PROT_DIF_TYPE1:
+-		return IB_T10DIF_TYPE1;
+-	case SCSI_PROT_DIF_TYPE2:
+-		return IB_T10DIF_TYPE2;
+-	case SCSI_PROT_DIF_TYPE3:
+-		return IB_T10DIF_TYPE3;
+-	default:
+-		return IB_T10DIF_NONE;
+-	}
+-}
+-
+ static inline void
+ iser_set_dif_domain(struct scsi_cmnd *sc, struct ib_sig_attrs *sig_attrs,
+ 		    struct ib_sig_domain *domain)
+ {
+-	unsigned char scsi_ptype = scsi_get_prot_type(sc);
+-
+-	domain->sig.dif.type = scsi2ib_prot_type(scsi_ptype);
++	domain->sig_type = IB_SIG_TYPE_T10_DIF;
+ 	domain->sig.dif.pi_interval = sc->device->sector_size;
+ 	domain->sig.dif.ref_tag = scsi_get_lba(sc) & 0xffffffff;
++	/*
++	 * At the moment we hard code those, but in the future
++	 * we will take them from sc.
++	 */
++	domain->sig.dif.apptag_check_mask = 0xffff;
++	domain->sig.dif.app_escape = true;
++	domain->sig.dif.ref_escape = true;
++	if (scsi_get_prot_type(sc) == SCSI_PROT_DIF_TYPE1 ||
++	    scsi_get_prot_type(sc) == SCSI_PROT_DIF_TYPE2)
++		domain->sig.dif.ref_remap = true;
+ };
+ 
+ static int
+ iser_set_sig_attrs(struct scsi_cmnd *sc, struct ib_sig_attrs *sig_attrs)
+ {
+-	sig_attrs->mem.sig_type = IB_SIG_TYPE_T10_DIF;
+-	sig_attrs->wire.sig_type = IB_SIG_TYPE_T10_DIF;
+-
+ 	switch (scsi_get_prot_op(sc)) {
+ 	case SCSI_PROT_WRITE_INSERT:
+ 	case SCSI_PROT_READ_STRIP:
+-		sig_attrs->mem.sig.dif.type = IB_T10DIF_NONE;
++		sig_attrs->mem.sig_type = IB_SIG_TYPE_NONE;
+ 		iser_set_dif_domain(sc, sig_attrs, &sig_attrs->wire);
+ 		sig_attrs->wire.sig.dif.bg_type = IB_T10DIF_CRC;
+ 		break;
+ 	case SCSI_PROT_READ_INSERT:
+ 	case SCSI_PROT_WRITE_STRIP:
+-		sig_attrs->wire.sig.dif.type = IB_T10DIF_NONE;
++		sig_attrs->wire.sig_type = IB_SIG_TYPE_NONE;
+ 		iser_set_dif_domain(sc, sig_attrs, &sig_attrs->mem);
++		/*
++		 * At the moment we use this modparam to tell what is
++		 * the memory bg_type, in the future we will take it
++		 * from sc.
++		 */
+ 		sig_attrs->mem.sig.dif.bg_type = iser_pi_guard ? IB_T10DIF_CSUM :
+ 						 IB_T10DIF_CRC;
+ 		break;
+@@ -490,6 +483,11 @@ iser_set_sig_attrs(struct scsi_cmnd *sc, struct ib_sig_attrs *sig_attrs)
+ 		iser_set_dif_domain(sc, sig_attrs, &sig_attrs->wire);
+ 		sig_attrs->wire.sig.dif.bg_type = IB_T10DIF_CRC;
+ 		iser_set_dif_domain(sc, sig_attrs, &sig_attrs->mem);
++		/*
++		 * At the moment we use this modparam to tell what is
++		 * the memory bg_type, in the future we will take it
++		 * from sc.
++		 */
+ 		sig_attrs->mem.sig.dif.bg_type = iser_pi_guard ? IB_T10DIF_CSUM :
+ 						 IB_T10DIF_CRC;
+ 		break;
+@@ -498,10 +496,10 @@ iser_set_sig_attrs(struct scsi_cmnd *sc, struct ib_sig_attrs *sig_attrs)
+ 			 scsi_get_prot_op(sc));
+ 		return -EINVAL;
+ 	}
++
+ 	return 0;
+ }
+ 
+-
+ static int
+ iser_set_prot_checks(struct scsi_cmnd *sc, u8 *mask)
+ {
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 694968172984..55a5fe0e912a 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -536,20 +536,14 @@ struct ib_mr_init_attr {
+ 	u32	    flags;
+ };
+ 
+-enum ib_signature_type {
+-	IB_SIG_TYPE_T10_DIF,
+-};
+-
+ /**
+- * T10-DIF Signature types
+- * T10-DIF types are defined by SCSI
+- * specifications.
++ * Signature types
++ * IB_SIG_TYPE_NONE: Unprotected.
++ * IB_SIG_TYPE_T10_DIF: Type T10-DIF
+  */
+-enum ib_t10_dif_type {
+-	IB_T10DIF_NONE,
+-	IB_T10DIF_TYPE1,
+-	IB_T10DIF_TYPE2,
+-	IB_T10DIF_TYPE3
++enum ib_signature_type {
++	IB_SIG_TYPE_NONE,
++	IB_SIG_TYPE_T10_DIF,
+ };
+ 
+ /**
+@@ -565,24 +559,26 @@ enum ib_t10_dif_bg_type {
+ /**
+  * struct ib_t10_dif_domain - Parameters specific for T10-DIF
+  *     domain.
+- * @type: T10-DIF type (0|1|2|3)
+  * @bg_type: T10-DIF block guard type (CRC|CSUM)
+  * @pi_interval: protection information interval.
+  * @bg: seed of guard computation.
+  * @app_tag: application tag of guard block
+  * @ref_tag: initial guard block reference tag.
+- * @type3_inc_reftag: T10-DIF type 3 does not state
+- *     about the reference tag, it is the user
+- *     choice to increment it or not.
++ * @ref_remap: Indicate wethear the reftag increments each block
++ * @app_escape: Indicate to skip block check if apptag=0xffff
++ * @ref_escape: Indicate to skip block check if reftag=0xffffffff
++ * @apptag_check_mask: check bitmask of application tag.
+  */
+ struct ib_t10_dif_domain {
+-	enum ib_t10_dif_type	type;
+ 	enum ib_t10_dif_bg_type bg_type;
+ 	u16			pi_interval;
+ 	u16			bg;
+ 	u16			app_tag;
+ 	u32			ref_tag;
+-	bool			type3_inc_reftag;
++	bool			ref_remap;
++	bool			app_escape;
++	bool			ref_escape;
++	u16			apptag_check_mask;
+ };
+ 
+ /**
