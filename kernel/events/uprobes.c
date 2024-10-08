@@ -331,6 +331,18 @@ set_orig_insn(struct arch_uprobe *auprobe, struct mm_struct *mm, unsigned long v
 	return write_opcode(mm, vaddr, *(uprobe_opcode_t *)&auprobe->insn);
 }
 
+static struct uprobe *get_uprobe(struct uprobe *uprobe)
+{
+	atomic_inc(&uprobe->ref);
+	return uprobe;
+}
+
+static void put_uprobe(struct uprobe *uprobe)
+{
+	if (atomic_dec_and_test(&uprobe->ref))
+		kfree(uprobe);
+}
+
 static int match_uprobe(struct uprobe *l, struct uprobe *r)
 {
 	if (l->inode < r->inode)
@@ -358,10 +370,8 @@ static struct uprobe *__find_uprobe(struct inode *inode, loff_t offset)
 	while (n) {
 		uprobe = rb_entry(n, struct uprobe, rb_node);
 		match = match_uprobe(&u, uprobe);
-		if (!match) {
-			atomic_inc(&uprobe->ref);
-			return uprobe;
-		}
+		if (!match)
+			return get_uprobe(uprobe);
 
 		if (match < 0)
 			n = n->rb_left;
@@ -397,10 +407,8 @@ static struct uprobe *__insert_uprobe(struct uprobe *uprobe)
 		parent = *p;
 		u = rb_entry(parent, struct uprobe, rb_node);
 		match = match_uprobe(uprobe, u);
-		if (!match) {
-			atomic_inc(&u->ref);
-			return u;
-		}
+		if (!match)
+			return get_uprobe(u);
 
 		if (match < 0)
 			p = &parent->rb_left;
@@ -435,12 +443,6 @@ static struct uprobe *insert_uprobe(struct uprobe *uprobe)
 	spin_unlock(&uprobes_treelock);
 
 	return u;
-}
-
-static void put_uprobe(struct uprobe *uprobe)
-{
-	if (atomic_dec_and_test(&uprobe->ref))
-		kfree(uprobe);
 }
 
 static struct uprobe *alloc_uprobe(struct inode *inode, loff_t offset)
@@ -1000,14 +1002,14 @@ static void build_probe_list(struct inode *inode,
 			if (u->inode != inode || u->offset < min)
 				break;
 			list_add(&u->pending_list, head);
-			atomic_inc(&u->ref);
+			get_uprobe(u);
 		}
 		for (t = n; (t = rb_next(t)); ) {
 			u = rb_entry(t, struct uprobe, rb_node);
 			if (u->inode != inode || u->offset > max)
 				break;
 			list_add(&u->pending_list, head);
-			atomic_inc(&u->ref);
+			get_uprobe(u);
 		}
 	}
 	spin_unlock(&uprobes_treelock);
@@ -1378,7 +1380,7 @@ static int dup_utask(struct task_struct *t, struct uprobe_task *o_utask)
 			return -ENOMEM;
 
 		*n = *o;
-		atomic_inc(&n->uprobe->ref);
+		get_uprobe(n->uprobe);
 		n->next = NULL;
 
 		*p = n;
@@ -1514,8 +1516,7 @@ static void prepare_uretprobe(struct uprobe *uprobe, struct pt_regs *regs)
 		orig_ret_vaddr = utask->return_instances->orig_ret_vaddr;
 	}
 
-	atomic_inc(&uprobe->ref);
-	ri->uprobe = uprobe;
+	ri->uprobe = get_uprobe(uprobe);
 	ri->func = instruction_pointer(regs);
 	ri->orig_ret_vaddr = orig_ret_vaddr;
 	ri->chained = chained;
