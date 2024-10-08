@@ -141,6 +141,10 @@ static inline void blk_mq_end_io(struct request *rq, int error)
 	BUG_ON(!done);
 }
 
+/*
+ * Complete request through potential IPI for right placement. Driver must
+ * have defined a mq_ops->complete() hook for this.
+ */
 void blk_mq_complete_request(struct request *rq);
 
 void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
