@@ -1,0 +1,147 @@
+IB/hfi1: Fix sleep inside atomic issue in init_asic_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] hfi1: Fix sleep inside atomic issue in init_asic_data (Alex Estrin) [1355901]
+Rebuild_FUZZ: 97.25%
+commit-author Tadeusz Struk <tadeusz.struk@intel.com>
+commit 98f179a5eaf77eaac49df3d0c217c6eaaba8c0db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/98f179a5.failed
+
+The critical section should protect only the list traversal
+and dd->asic_data modification, not the memory allocation.
+The fix pulls the allocation out of the critical section.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 98f179a5eaf77eaac49df3d0c217c6eaaba8c0db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+diff --cc drivers/staging/hfi1/chip.c
+index 0b4db256e34f,dad4d0ebbdff..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -13888,6 -14113,13 +13888,16 @@@ static void asic_should_init(struct hfi
+  {
+  	unsigned long flags;
+  	struct hfi1_devdata *tmp, *peer = NULL;
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ 	struct hfi1_asic_data *asic_data;
++ 	int ret = 0;
+++>>>>>>> 98f179a5eaf7 (IB/hfi1: Fix sleep inside atomic issue in init_asic_data):drivers/infiniband/hw/hfi1/chip.c
++ 
++ 	/* pre-allocate the asic structure in case we are the first device */
++ 	asic_data = kzalloc(sizeof(*dd->asic_data), GFP_KERNEL);
++ 	if (!asic_data)
++ 		return -ENOMEM;
+  
+  	spin_lock_irqsave(&hfi1_devs_lock, flags);
+  	/* Find our peer device */
+@@@ -13899,13 -14131,87 +13909,25 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +	/*
+ +	 * "Claim" the ASIC for initialization if it hasn't been
+ +	 " "claimed" yet.
+ +	 */
+ +	if (!peer || !(peer->flags & HFI1_DO_INIT_ASIC))
+ +		dd->flags |= HFI1_DO_INIT_ASIC;
+++=======
++ 	if (peer) {
++ 		/* use already allocated structure */
++ 		dd->asic_data = peer->asic_data;
++ 		kfree(asic_data);
++ 	} else {
++ 		dd->asic_data = asic_data;
++ 		mutex_init(&dd->asic_data->asic_resource_mutex);
++ 	}
++ 	dd->asic_data->dds[dd->hfi1_id] = dd; /* self back-pointer */
+++>>>>>>> 98f179a5eaf7 (IB/hfi1: Fix sleep inside atomic issue in init_asic_data):drivers/infiniband/hw/hfi1/chip.c
+  	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+ -	return ret;
+ -}
+ -
+ -/*
+ - * Set dd->boardname.  Use a generic name if a name is not returned from
+ - * EFI variable space.
+ - *
+ - * Return 0 on success, -ENOMEM if space could not be allocated.
+ - */
+ -static int obtain_boardname(struct hfi1_devdata *dd)
+ -{
+ -	/* generic board description */
+ -	const char generic[] =
+ -		"Intel Omni-Path Host Fabric Interface Adapter 100 Series";
+ -	unsigned long size;
+ -	int ret;
+ -
+ -	ret = read_hfi1_efi_var(dd, "description", &size,
+ -				(void **)&dd->boardname);
+ -	if (ret) {
+ -		dd_dev_info(dd, "Board description not found\n");
+ -		/* use generic description */
+ -		dd->boardname = kstrdup(generic, GFP_KERNEL);
+ -		if (!dd->boardname)
+ -			return -ENOMEM;
+ -	}
+ -	return 0;
+ -}
+ -
+ -/*
+ - * Check the interrupt registers to make sure that they are mapped correctly.
+ - * It is intended to help user identify any mismapping by VMM when the driver
+ - * is running in a VM. This function should only be called before interrupt
+ - * is set up properly.
+ - *
+ - * Return 0 on success, -EINVAL on failure.
+ - */
+ -static int check_int_registers(struct hfi1_devdata *dd)
+ -{
+ -	u64 reg;
+ -	u64 all_bits = ~(u64)0;
+ -	u64 mask;
+ -
+ -	/* Clear CceIntMask[0] to avoid raising any interrupts */
+ -	mask = read_csr(dd, CCE_INT_MASK);
+ -	write_csr(dd, CCE_INT_MASK, 0ull);
+ -	reg = read_csr(dd, CCE_INT_MASK);
+ -	if (reg)
+ -		goto err_exit;
+ -
+ -	/* Clear all interrupt status bits */
+ -	write_csr(dd, CCE_INT_CLEAR, all_bits);
+ -	reg = read_csr(dd, CCE_INT_STATUS);
+ -	if (reg)
+ -		goto err_exit;
+ -
+ -	/* Set all interrupt status bits */
+ -	write_csr(dd, CCE_INT_FORCE, all_bits);
+ -	reg = read_csr(dd, CCE_INT_STATUS);
+ -	if (reg != all_bits)
+ -		goto err_exit;
+ -
+ -	/* Restore the interrupt mask */
+ -	write_csr(dd, CCE_INT_CLEAR, all_bits);
+ -	write_csr(dd, CCE_INT_MASK, mask);
+ -
+ -	return 0;
+ -err_exit:
+ -	write_csr(dd, CCE_INT_MASK, mask);
+ -	dd_dev_err(dd, "Interrupt registers not properly mapped by VMM\n");
+ -	return -EINVAL;
+  }
+  
+  /**
+* Unmerged path drivers/staging/hfi1/chip.c
