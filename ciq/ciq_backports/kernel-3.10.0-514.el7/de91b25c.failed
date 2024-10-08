@@ -1,0 +1,182 @@
+rhashtable: Eliminate unnecessary branch in rht_key_hashfn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit de91b25c8011089f5dd99b9d24743db1f550ca4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/de91b25c.failed
+
+When rht_key_hashfn is called from rhashtable itself and params
+is equal to ht->p, there is no point in checking params.key_len
+and falling back to ht->p.key_len.
+
+For some reason gcc couldn't figure out that params is the same
+as ht->p.  So let's help it by only checking params.key_len when
+it's a constant.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit de91b25c8011089f5dd99b9d24743db1f550ca4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rhashtable.h
+diff --cc include/linux/rhashtable.h
+index 0839d7b8cd60,3851952781d7..000000000000
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@@ -77,16 -129,146 +77,144 @@@ struct rhashtable_params 
+   */
+  struct rhashtable {
+  	struct bucket_table __rcu	*tbl;
+ -	atomic_t			nelems;
+ -	bool                            being_destroyed;
+ +	size_t				nelems;
+ +	size_t				shift;
+  	struct rhashtable_params	p;
+ -	struct work_struct		run_work;
+ -	struct mutex                    mutex;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rhashtable_walker - Hash table walker
++  * @list: List entry on list of walkers
++  * @tbl: The table that we were walking over
++  */
++ struct rhashtable_walker {
++ 	struct list_head list;
++ 	struct bucket_table *tbl;
++ };
++ 
++ /**
++  * struct rhashtable_iter - Hash table iterator, fits into netlink cb
++  * @ht: Table to iterate through
++  * @p: Current pointer
++  * @walker: Associated rhashtable walker
++  * @slot: Current slot
++  * @skip: Number of entries to skip in slot
++  */
++ struct rhashtable_iter {
++ 	struct rhashtable *ht;
++ 	struct rhash_head *p;
++ 	struct rhashtable_walker *walker;
++ 	unsigned int slot;
++ 	unsigned int skip;
++ };
++ 
++ static inline unsigned long rht_marker(const struct rhashtable *ht, u32 hash)
++ {
++ 	return NULLS_MARKER(ht->p.nulls_base + hash);
++ }
++ 
++ #define INIT_RHT_NULLS_HEAD(ptr, ht, hash) \
++ 	((ptr) = (typeof(ptr)) rht_marker(ht, hash))
++ 
++ static inline bool rht_is_a_nulls(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr & 1);
++ }
++ 
++ static inline unsigned long rht_get_nulls_value(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr) >> 1;
++ }
++ 
++ static inline void *rht_obj(const struct rhashtable *ht,
++ 			    const struct rhash_head *he)
++ {
++ 	return (char *)he - ht->p.head_offset;
++ }
++ 
++ static inline unsigned int rht_bucket_index(const struct bucket_table *tbl,
++ 					    unsigned int hash)
++ {
++ 	return (hash >> RHT_HASH_RESERVED_SPACE) & (tbl->size - 1);
++ }
++ 
++ static inline unsigned int rht_key_hashfn(
++ 	struct rhashtable *ht, const struct bucket_table *tbl,
++ 	const void *key, const struct rhashtable_params params)
++ {
++ 	/* params must be equal to ht->p if it isn't constant. */
++ 	unsigned key_len = __builtin_constant_p(params.key_len) ?
++ 			   (params.key_len ?: ht->p.key_len) :
++ 			   params.key_len;
++ 
++ 	return rht_bucket_index(tbl, params.hashfn(key, key_len,
++ 						   tbl->hash_rnd));
++ }
++ 
++ static inline unsigned int rht_head_hashfn(
++ 	struct rhashtable *ht, const struct bucket_table *tbl,
++ 	const struct rhash_head *he, const struct rhashtable_params params)
++ {
++ 	const char *ptr = rht_obj(ht, he);
++ 
++ 	return likely(params.obj_hashfn) ?
++ 	       rht_bucket_index(tbl, params.obj_hashfn(ptr, tbl->hash_rnd)) :
++ 	       rht_key_hashfn(ht, tbl, ptr + params.key_offset, params);
++ }
++ 
++ /**
++  * rht_grow_above_75 - returns true if nelems > 0.75 * table-size
++  * @ht:		hash table
++  * @tbl:	current table
++  */
++ static inline bool rht_grow_above_75(const struct rhashtable *ht,
++ 				     const struct bucket_table *tbl)
++ {
++ 	/* Expand table when exceeding 75% load */
++ 	return atomic_read(&ht->nelems) > (tbl->size / 4 * 3) &&
++ 	       (!ht->p.max_size || tbl->size < ht->p.max_size);
++ }
++ 
++ /**
++  * rht_shrink_below_30 - returns true if nelems < 0.3 * table-size
++  * @ht:		hash table
++  * @tbl:	current table
++  */
++ static inline bool rht_shrink_below_30(const struct rhashtable *ht,
++ 				       const struct bucket_table *tbl)
++ {
++ 	/* Shrink table beneath 30% load */
++ 	return atomic_read(&ht->nelems) < (tbl->size * 3 / 10) &&
++ 	       tbl->size > ht->p.min_size;
++ }
++ 
++ /* The bucket lock is selected based on the hash and protects mutations
++  * on a group of hash buckets.
++  *
++  * A maximum of tbl->size/2 bucket locks is allocated. This ensures that
++  * a single lock always covers both buckets which may both contains
++  * entries which link to the same bucket of the old table during resizing.
++  * This allows to simplify the locking as locking the bucket in both
++  * tables during resize always guarantee protection.
++  *
++  * IMPORTANT: When holding the bucket lock of both the old and new table
++  * during expansions and shrinking, the old bucket lock must always be
++  * acquired first.
++  */
++ static inline spinlock_t *rht_bucket_lock(const struct bucket_table *tbl,
++ 					  unsigned int hash)
++ {
++ 	return &tbl->locks[hash & tbl->locks_mask];
++ }
++ 
+++>>>>>>> de91b25c8011 (rhashtable: Eliminate unnecessary branch in rht_key_hashfn)
+  #ifdef CONFIG_PROVE_LOCKING
+ -int lockdep_rht_mutex_is_held(struct rhashtable *ht);
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht);
+  int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash);
+  #else
+ -static inline int lockdep_rht_mutex_is_held(struct rhashtable *ht)
+ +static inline int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+  	return 1;
+  }
+* Unmerged path include/linux/rhashtable.h
