@@ -1,0 +1,252 @@
+hpsa: create workqueue after the driver is ready for use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 2efa5929cb448266fcfc19d50cb6cd32c59524ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2efa5929.failed
+
+Don't create the resubmit workqueue in hpsa_init_one until everything else
+is ready to use, so everything can be freed in reverse order of when they
+were allocated without risking freeing things while workqueue items are
+still active.
+
+Destroy the workqueue in the right order in
+hpsa_undo_allocations_after_kdump_soft_reset too.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 2efa5929cb448266fcfc19d50cb6cd32c59524ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 86152e9b07dd,8ef908cc1a2c..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -6770,19 -7671,21 +6770,33 @@@ reinit_after_soft_reset
+  	spin_lock_init(&h->lock);
+  	spin_lock_init(&h->offline_device_lock);
+  	spin_lock_init(&h->scan_lock);
+++<<<<<<< HEAD
+ +	spin_lock_init(&h->passthru_count_lock);
+++=======
++ 	atomic_set(&h->passthru_cmds_avail, HPSA_MAX_CONCURRENT_PASSTHRUS);
++ 	atomic_set(&h->abort_cmds_available, HPSA_CMDS_RESERVED_FOR_ABORTS);
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  
+  	/* Allocate and clear per-cpu variable lockup_detected */
+  	h->lockup_detected = alloc_percpu(u32);
+  	if (!h->lockup_detected) {
+ -		dev_err(&h->pdev->dev, "Failed to allocate lockup detector\n");
+  		rc = -ENOMEM;
+++<<<<<<< HEAD
+ +		goto clean1;
+++=======
++ 		goto clean1;	/* aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  	}
+  	set_lockup_detected_for_all_cpus(h, 0);
+  
+  	rc = hpsa_pci_init(h);
+++<<<<<<< HEAD
+ +	if (rc != 0)
+ +		goto clean1;
+++=======
++ 	if (rc)
++ 		goto clean2;	/* lockup, aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  
+  	sprintf(h->devname, HPSA "%d", number_of_controllers);
+  	h->ctlr = number_of_controllers;
+@@@ -6798,24 -7701,28 +6812,41 @@@
+  			dac = 0;
+  		} else {
+  			dev_err(&pdev->dev, "no suitable DMA available\n");
+++<<<<<<< HEAD
+ +			goto clean2;
+++=======
++ 			goto clean3;	/* pci, lockup, aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  		}
+  	}
+  
+  	/* make sure the board interrupts are off */
+  	h->access.set_intr_mask(h, HPSA_INTR_OFF);
+  
+++<<<<<<< HEAD
+ +	if (hpsa_request_irqs(h, do_hpsa_intr_msi, do_hpsa_intr_intx))
+ +		goto clean2;
+++=======
++ 	rc = hpsa_request_irqs(h, do_hpsa_intr_msi, do_hpsa_intr_intx);
++ 	if (rc)
++ 		goto clean3;	/* pci, lockup, aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  	dev_info(&pdev->dev, "%s: <0x%x> at IRQ %d%s using DAC\n",
+  	       h->devname, pdev->device,
+  	       h->intr[h->intr_mode], dac ? "" : " not");
+  	rc = hpsa_alloc_cmd_pool(h);
+  	if (rc)
+++<<<<<<< HEAD
+ +		goto clean2_and_free_irqs;
+ +	if (hpsa_allocate_sg_chain_blocks(h))
+ +		goto clean4;
+++=======
++ 		goto clean4;	/* irq, pci, lockup, aer/h */
++ 	rc = hpsa_alloc_sg_chain_blocks(h);
++ 	if (rc)
++ 		goto clean5;	/* cmd, irq, pci, lockup, aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  	init_waitqueue_head(&h->scan_wait_queue);
+ -	init_waitqueue_head(&h->abort_cmd_wait_queue);
+ -	init_waitqueue_head(&h->abort_sync_wait_queue);
+  	h->scan_finished = 1; /* no scan currently in progress */
+  
+  	pci_set_drvdata(pdev, h);
+@@@ -6823,9 -7730,25 +6854,28 @@@
+  	h->hba_mode_enabled = 0;
+  	h->scsi_host = NULL;
+  	spin_lock_init(&h->devlock);
+++<<<<<<< HEAD
+ +	hpsa_put_ctlr_into_performant_mode(h);
+++=======
++ 	rc = hpsa_put_ctlr_into_performant_mode(h);
++ 	if (rc)
++ 		goto clean6;	/* sg, cmd, irq, pci, lockup, aer/h */
++ 
++ 	/* create the resubmit workqueue */
++ 	h->rescan_ctlr_wq = hpsa_create_controller_wq(h, "rescan");
++ 	if (!h->rescan_ctlr_wq) {
++ 		rc = -ENOMEM;
++ 		goto clean7;
++ 	}
++ 
++ 	h->resubmit_wq = hpsa_create_controller_wq(h, "resubmit");
++ 	if (!h->resubmit_wq) {
++ 		rc = -ENOMEM;
++ 		goto clean7;	/* aer/h */
++ 	}
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  
+ -	/*
+ -	 * At this point, the controller is ready to take commands.
+ +	/* At this point, the controller is ready to take commands.
+  	 * Now, if reset_devices and the hard reset didn't work, try
+  	 * the soft reset and see if that works.
+  	 */
+@@@ -6899,29 -7822,47 +6949,51 @@@
+  	h->access.set_intr_mask(h, HPSA_INTR_ON);
+  
+  	hpsa_hba_inquiry(h);
+ -	rc = hpsa_register_scsi(h);	/* hook ourselves into SCSI subsystem */
+ +	rc = hpsa_register_scsi(h); /* hook ourselves into SCSI subsystem */
+  	if (rc)
+++<<<<<<< HEAD
+ +		goto clean4;
+++=======
++ 		goto clean8; /* wq, perf, sg, cmd, irq, pci, lockup, aer/h */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  
+  	/* Monitor the controller for firmware lockups */
+  	h->heartbeat_sample_interval = HEARTBEAT_SAMPLE_INTERVAL;
+  	INIT_DELAYED_WORK(&h->monitor_ctlr_work, hpsa_monitor_ctlr_worker);
+  	schedule_delayed_work(&h->monitor_ctlr_work,
+  				h->heartbeat_sample_interval);
+ -	INIT_DELAYED_WORK(&h->rescan_ctlr_work, hpsa_rescan_ctlr_worker);
+ -	queue_delayed_work(h->rescan_ctlr_wq, &h->rescan_ctlr_work,
+ -				h->heartbeat_sample_interval);
+  	return 0;
+  
+++<<<<<<< HEAD
+ +clean4:
+ +	hpsa_free_sg_chain_blocks(h);
+ +	hpsa_free_cmd_pool(h);
+ +	hpsa_free_ioaccel1_cmd_and_bft(h);
+ +	hpsa_free_ioaccel2_cmd_and_bft(h);
+ +clean2_and_free_irqs:
+ +	hpsa_free_irqs(h);
+ +clean2:
+ +	hpsa_free_pci_init(h);
+ +clean1:
+ +	if (h->lockup_detected)
+++=======
++ clean8: /* perf, sg, cmd, irq, pci, lockup, aer/h */
++ 	kfree(h->hba_inquiry_data);
++ clean7: /* perf, sg, cmd, irq, pci, lockup, aer/h */
++ 	hpsa_free_performant_mode(h);
++ 	h->access.set_intr_mask(h, HPSA_INTR_OFF);
++ clean6: /* sg, cmd, irq, pci, lockup, wq/aer/h */
++ 	hpsa_free_sg_chain_blocks(h);
++ clean5: /* cmd, irq, pci, lockup, aer/h */
++ 	hpsa_free_cmd_pool(h);
++ clean4: /* irq, pci, lockup, aer/h */
++ 	hpsa_free_irqs(h);
++ clean3: /* pci, lockup, aer/h */
++ 	hpsa_free_pci_init(h);
++ clean2: /* lockup, aer/h */
++ 	if (h->lockup_detected) {
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  		free_percpu(h->lockup_detected);
+ -		h->lockup_detected = NULL;
+ -	}
+ -clean1:	/* wq/aer/h */
+ -	if (h->resubmit_wq) {
+ -		destroy_workqueue(h->resubmit_wq);
+ -		h->resubmit_wq = NULL;
+ -	}
+ -	if (h->rescan_ctlr_wq) {
+ -		destroy_workqueue(h->rescan_ctlr_wq);
+ -		h->rescan_ctlr_wq = NULL;
+ -	}
+  	kfree(h);
+  	return rc;
+  }
+@@@ -7003,20 -7946,24 +7075,33 @@@ static void hpsa_remove_one(struct pci_
+  	/* includes hpsa_disable_interrupt_mode - pci_init 2 */
+  	hpsa_shutdown(pdev);
+  
+++<<<<<<< HEAD
+ +	hpsa_free_device_info(h);
+ +	hpsa_free_sg_chain_blocks(h);
+ +	kfree(h->blockFetchTable);		/* perf 2 */
+ +	hpsa_free_reply_queues(h);		/* perf 1 */
+ +	hpsa_free_ioaccel1_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_ioaccel2_cmd_and_bft(h);	/* perf 1 */
+ +	hpsa_free_cmd_pool(h);			/* init_one 5 */
+ +	kfree(h->hba_inquiry_data);
+++=======
++ 	hpsa_free_device_info(h);		/* scan */
++ 
++ 	hpsa_unregister_scsi(h);			/* init_one 9 */
++ 	kfree(h->hba_inquiry_data);			/* init_one 9 */
++ 	h->hba_inquiry_data = NULL;			/* init_one 9 */
++ 	hpsa_free_performant_mode(h);			/* init_one 7 */
++ 	hpsa_free_sg_chain_blocks(h);			/* init_one 6 */
++ 	hpsa_free_cmd_pool(h);				/* init_one 5 */
++ 
++ 	/* hpsa_free_irqs already called via hpsa_shutdown init_one 4 */
+++>>>>>>> 2efa5929cb44 (hpsa: create workqueue after the driver is ready for use)
+  
+  	/* includes hpsa_disable_interrupt_mode - pci_init 2 */
+ -	hpsa_free_pci_init(h);				/* init_one 3 */
+ +	hpsa_free_pci_init(h);
+  
+ -	free_percpu(h->lockup_detected);		/* init_one 2 */
+ -	h->lockup_detected = NULL;			/* init_one 2 */
+ -	/* (void) pci_disable_pcie_error_reporting(pdev); */	/* init_one 1 */
+ -	kfree(h);					/* init_one 1 */
+ +	free_percpu(h->lockup_detected);
+ +	kfree(h);
+  }
+  
+  static int hpsa_suspend(__attribute__((unused)) struct pci_dev *pdev,
+* Unmerged path drivers/scsi/hpsa.c
