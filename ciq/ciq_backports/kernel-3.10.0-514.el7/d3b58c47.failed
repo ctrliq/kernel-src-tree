@@ -1,0 +1,208 @@
+can: replace timestamp as unique skb attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Oliver Hartkopp <socketcan@hartkopp.net>
+commit d3b58c47d330de8c29898fe9746f7530408f8a59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d3b58c47.failed
+
+Commit 514ac99c64b "can: fix multiple delivery of a single CAN frame for
+overlapping CAN filters" requires the skb->tstamp to be set to check for
+identical CAN skbs.
+
+Without timestamping to be required by user space applications this timestamp
+was not generated which lead to commit 36c01245eb8 "can: fix loss of CAN frames
+in raw_rcv" - which forces the timestamp to be set in all CAN related skbuffs
+by introducing several __net_timestamp() calls.
+
+This forces e.g. out of tree drivers which are not using alloc_can{,fd}_skb()
+to add __net_timestamp() after skbuff creation to prevent the frame loss fixed
+in mainline Linux.
+
+This patch removes the timestamp dependency and uses an atomic counter to
+create an unique identifier together with the skbuff pointer.
+
+Btw: the new skbcnt element introduced in struct can_skb_priv has to be
+initialized with zero in out-of-tree drivers which are not using
+alloc_can{,fd}_skb() too.
+
+	Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+	Cc: linux-stable <stable@vger.kernel.org>
+	Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+(cherry picked from commit d3b58c47d330de8c29898fe9746f7530408f8a59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/can/dev.c
+diff --cc drivers/net/can/dev.c
+index 02930a57e002,aede704605c6..000000000000
+--- a/drivers/net/can/dev.c
++++ b/drivers/net/can/dev.c
+@@@ -516,8 -579,13 +516,9 @@@ struct sk_buff *alloc_can_skb(struct ne
+  	skb->pkt_type = PACKET_BROADCAST;
+  	skb->ip_summed = CHECKSUM_UNNECESSARY;
+  
+ -	skb_reset_mac_header(skb);
+ -	skb_reset_network_header(skb);
+ -	skb_reset_transport_header(skb);
+ -
+  	can_skb_reserve(skb);
+  	can_skb_prv(skb)->ifindex = dev->ifindex;
++ 	can_skb_prv(skb)->skbcnt = 0;
+  
+  	*cf = (struct can_frame *)skb_put(skb, sizeof(struct can_frame));
+  	memset(*cf, 0, sizeof(struct can_frame));
+@@@ -526,6 -594,35 +527,38 @@@
+  }
+  EXPORT_SYMBOL_GPL(alloc_can_skb);
+  
+++<<<<<<< HEAD
+++=======
++ struct sk_buff *alloc_canfd_skb(struct net_device *dev,
++ 				struct canfd_frame **cfd)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	skb = netdev_alloc_skb(dev, sizeof(struct can_skb_priv) +
++ 			       sizeof(struct canfd_frame));
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	skb->protocol = htons(ETH_P_CANFD);
++ 	skb->pkt_type = PACKET_BROADCAST;
++ 	skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 
++ 	skb_reset_mac_header(skb);
++ 	skb_reset_network_header(skb);
++ 	skb_reset_transport_header(skb);
++ 
++ 	can_skb_reserve(skb);
++ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++ 	can_skb_prv(skb)->skbcnt = 0;
++ 
++ 	*cfd = (struct canfd_frame *)skb_put(skb, sizeof(struct canfd_frame));
++ 	memset(*cfd, 0, sizeof(struct canfd_frame));
++ 
++ 	return skb;
++ }
++ EXPORT_SYMBOL_GPL(alloc_canfd_skb);
++ 
+++>>>>>>> d3b58c47d330 (can: replace timestamp as unique skb attribute)
+  struct sk_buff *alloc_can_err_skb(struct net_device *dev, struct can_frame **cf)
+  {
+  	struct sk_buff *skb;
+* Unmerged path drivers/net/can/dev.c
+diff --git a/drivers/net/can/slcan.c b/drivers/net/can/slcan.c
+index bfd7d3e89a38..f356a3661549 100644
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@ -197,6 +197,7 @@ static void slc_bump(struct slcan *sl)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = sl->dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	memcpy(skb_put(skb, sizeof(struct can_frame)),
+ 	       &cf, sizeof(struct can_frame));
+diff --git a/include/linux/can/skb.h b/include/linux/can/skb.h
+index 2f0543f7510c..0dc09c7dbbe9 100644
+--- a/include/linux/can/skb.h
++++ b/include/linux/can/skb.h
+@@ -25,10 +25,12 @@
+ /**
+  * struct can_skb_priv - private additional data inside CAN sk_buffs
+  * @ifindex:	ifindex of the first interface the CAN frame appeared on
++ * @skbcnt:	atomic counter to have an unique id together with skb pointer
+  * @cf:		align to the following CAN frame at skb->data
+  */
+ struct can_skb_priv {
+ 	int ifindex;
++	int skbcnt;
+ 	struct can_frame cf[0];
+ };
+ 
+diff --git a/net/can/af_can.c b/net/can/af_can.c
+index 55e18c10e4df..55e52580bf75 100644
+--- a/net/can/af_can.c
++++ b/net/can/af_can.c
+@@ -91,6 +91,8 @@ struct timer_list can_stattimer;   /* timer for statistics update */
+ struct s_stats    can_stats;       /* packet statistics */
+ struct s_pstats   can_pstats;      /* receive list statistics */
+ 
++static atomic_t skbcounter = ATOMIC_INIT(0);
++
+ /*
+  * af_can socket functions
+  */
+@@ -657,6 +659,10 @@ static void can_receive(struct sk_buff *skb, struct net_device *dev)
+ 	can_stats.rx_frames++;
+ 	can_stats.rx_frames_delta++;
+ 
++	/* create non-zero unique skb identifier together with *skb */
++	while (!(can_skb_prv(skb)->skbcnt))
++		can_skb_prv(skb)->skbcnt = atomic_inc_return(&skbcounter);
++
+ 	rcu_read_lock();
+ 
+ 	/* deliver the packet to sockets listening on all devices */
+diff --git a/net/can/bcm.c b/net/can/bcm.c
+index 2b12465fc43b..408ae7ad5043 100644
+--- a/net/can/bcm.c
++++ b/net/can/bcm.c
+@@ -263,6 +263,7 @@ static void bcm_can_tx(struct bcm_op *op)
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	memcpy(skb_put(skb, CFSIZ), cf, CFSIZ);
+ 
+@@ -1222,6 +1223,7 @@ static int bcm_tx_send(struct msghdr *msg, int ifindex, struct sock *sk)
+ 	}
+ 
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 	skb->dev = dev;
+ 	skb->sk  = sk;
+ 	err = can_send(skb, 1); /* send with loopback */
+diff --git a/net/can/raw.c b/net/can/raw.c
+index 72dd89b0629c..3fd66f3b7520 100644
+--- a/net/can/raw.c
++++ b/net/can/raw.c
+@@ -77,7 +77,7 @@ MODULE_ALIAS("can-proto-1");
+  */
+ 
+ struct uniqframe {
+-	ktime_t tstamp;
++	int skbcnt;
+ 	const struct sk_buff *skb;
+ 	unsigned int join_rx_count;
+ };
+@@ -139,7 +139,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
+ 
+ 	/* eliminate multiple filter matches for the same skb */
+ 	if (this_cpu_ptr(ro->uniq)->skb == oskb &&
+-	    ktime_equal(this_cpu_ptr(ro->uniq)->tstamp, oskb->tstamp)) {
++	    this_cpu_ptr(ro->uniq)->skbcnt == can_skb_prv(oskb)->skbcnt) {
+ 		if (ro->join_filters) {
+ 			this_cpu_inc(ro->uniq->join_rx_count);
+ 			/* drop frame until all enabled filters matched */
+@@ -150,7 +150,7 @@ static void raw_rcv(struct sk_buff *oskb, void *data)
+ 		}
+ 	} else {
+ 		this_cpu_ptr(ro->uniq)->skb = oskb;
+-		this_cpu_ptr(ro->uniq)->tstamp = oskb->tstamp;
++		this_cpu_ptr(ro->uniq)->skbcnt = can_skb_prv(oskb)->skbcnt;
+ 		this_cpu_ptr(ro->uniq)->join_rx_count = 1;
+ 		/* drop first frame to check all enabled filters? */
+ 		if (ro->join_filters && ro->count > 1)
+@@ -757,6 +757,7 @@ static int raw_sendmsg(struct kiocb *iocb, struct socket *sock,
+ 
+ 	can_skb_reserve(skb);
+ 	can_skb_prv(skb)->ifindex = dev->ifindex;
++	can_skb_prv(skb)->skbcnt = 0;
+ 
+ 	err = memcpy_fromiovec(skb_put(skb, size), msg->msg_iov, size);
+ 	if (err < 0)
