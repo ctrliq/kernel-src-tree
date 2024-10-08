@@ -1,0 +1,425 @@
+x86/platform/UV: Fix incorrect nodes and pnodes for cpuless and memoryless nodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] platform/uv: Fix incorrect nodes and pnodes for cpuless and memoryless nodes (Frank Ramsay) [1276458]
+Rebuild_FUZZ: 97.44%
+commit-author Dimitri Sivanich <sivanich@sgi.com>
+commit f68376fc9e6dc15a08e16f08c95e503f19ad8e34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f68376fc.failed
+
+This patch fixes the problem of incorrect nodes and pnodes being returned
+when referring to nodes that either have no cpus (AKA "headless") or no
+memory.
+
+	Tested-by: John Estabrook <estabrook@sgi.com>
+	Tested-by: Gary Kroening <gfk@sgi.com>
+	Tested-by: Nathan Zimmer <nzimmer@sgi.com>
+	Signed-off-by: Dimitri Sivanich <sivanich@sgi.com>
+	Signed-off-by: Mike Travis <travis@sgi.com>
+	Cc: Andrew Banman <abanman@sgi.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Russ Anderson <rja@sgi.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20160429215406.192644884@asylum.americas.sgi.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f68376fc9e6dc15a08e16f08c95e503f19ad8e34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/x2apic_uv_x.c
+diff --cc arch/x86/kernel/apic/x2apic_uv_x.c
+index fd86a4f25c81,aa6de8bad360..000000000000
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@@ -1030,9 -1131,252 +1030,252 @@@ void __init uv_init_hub_info(struct uv_
+  
+  	pr_info("UV: gnode_upper:0x%lx gnode_extra:0x%x\n",
+  		hub_info->gnode_upper, hub_info->gnode_extra);
+ -}
+  
+ -static void __init decode_gam_params(unsigned long ptr)
+ -{
+ -	uv_gp_table = (struct uv_gam_parameters *)ptr;
+ +	pr_info("UV: global MMR base 0x%lx\n", hub_info->global_mmr_base);
+  
+++<<<<<<< HEAD
+++=======
++ 	pr_info("UV: GAM Params...\n");
++ 	pr_info("UV: mmr_base/shift:0x%llx/%d gru_base/shift:0x%llx/%d gpa_shift:%d\n",
++ 		uv_gp_table->mmr_base, uv_gp_table->mmr_shift,
++ 		uv_gp_table->gru_base, uv_gp_table->gru_shift,
++ 		uv_gp_table->gpa_shift);
++ }
++ 
++ static void __init decode_gam_rng_tbl(unsigned long ptr)
++ {
++ 	struct uv_gam_range_entry *gre = (struct uv_gam_range_entry *)ptr;
++ 	unsigned long lgre = 0;
++ 	int index = 0;
++ 	int sock_min = 999999, pnode_min = 99999;
++ 	int sock_max = -1, pnode_max = -1;
++ 
++ 	uv_gre_table = gre;
++ 	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
++ 		if (!index) {
++ 			pr_info("UV: GAM Range Table...\n");
++ 			pr_info("UV:  # %20s %14s %5s %4s %5s %3s %2s %3s\n",
++ 				"Range", "", "Size", "Type", "NASID",
++ 				"SID", "PN", "PXM");
++ 		}
++ 		pr_info(
++ 		"UV: %2d: 0x%014lx-0x%014lx %5luG %3d   %04x  %02x %02x %3d\n",
++ 			index++,
++ 			(unsigned long)lgre << UV_GAM_RANGE_SHFT,
++ 			(unsigned long)gre->limit << UV_GAM_RANGE_SHFT,
++ 			((unsigned long)(gre->limit - lgre)) >>
++ 				(30 - UV_GAM_RANGE_SHFT), /* 64M -> 1G */
++ 			gre->type, gre->nasid, gre->sockid,
++ 			gre->pnode, gre->pxm);
++ 
++ 		lgre = gre->limit;
++ 		if (sock_min > gre->sockid)
++ 			sock_min = gre->sockid;
++ 		if (sock_max < gre->sockid)
++ 			sock_max = gre->sockid;
++ 		if (pnode_min > gre->pnode)
++ 			pnode_min = gre->pnode;
++ 		if (pnode_max < gre->pnode)
++ 			pnode_max = gre->pnode;
++ 	}
++ 	_min_socket = sock_min;
++ 	_max_socket = sock_max;
++ 	_min_pnode = pnode_min;
++ 	_max_pnode = pnode_max;
++ 	_gr_table_len = index;
++ 	pr_info(
++ 	"UV: GRT: %d entries, sockets(min:%x,max:%x) pnodes(min:%x,max:%x)\n",
++ 		index, _min_socket, _max_socket, _min_pnode, _max_pnode);
++ }
++ 
++ static void __init decode_uv_systab(void)
++ {
++ 	struct uv_systab *st;
++ 	int i;
++ 
++ 	st = uv_systab;
++ 	if ((!st || st->revision < UV_SYSTAB_VERSION_UV4) && !is_uv4_hub())
++ 		return;
++ 	if (st->revision != UV_SYSTAB_VERSION_UV4_LATEST) {
++ 		pr_crit(
++ 		"UV: BIOS UVsystab version(%x) mismatch, expecting(%x)\n",
++ 			st->revision, UV_SYSTAB_VERSION_UV4_LATEST);
++ 		BUG();
++ 	}
++ 
++ 	for (i = 0; st->entry[i].type != UV_SYSTAB_TYPE_UNUSED; i++) {
++ 		unsigned long ptr = st->entry[i].offset;
++ 
++ 		if (!ptr)
++ 			continue;
++ 
++ 		ptr = ptr + (unsigned long)st;
++ 
++ 		switch (st->entry[i].type) {
++ 		case UV_SYSTAB_TYPE_GAM_PARAMS:
++ 			decode_gam_params(ptr);
++ 			break;
++ 
++ 		case UV_SYSTAB_TYPE_GAM_RNG_TBL:
++ 			decode_gam_rng_tbl(ptr);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ /*
++  * Setup physical blade translations from UVH_NODE_PRESENT_TABLE
++  * .. NB: UVH_NODE_PRESENT_TABLE is going away,
++  * .. being replaced by GAM Range Table
++  */
++ static __init void boot_init_possible_blades(struct uv_hub_info_s *hub_info)
++ {
++ 	int i, uv_pb = 0;
++ 
++ 	pr_info("UV: NODE_PRESENT_DEPTH = %d\n", UVH_NODE_PRESENT_TABLE_DEPTH);
++ 	for (i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++) {
++ 		unsigned long np;
++ 
++ 		np = uv_read_local_mmr(UVH_NODE_PRESENT_TABLE + i * 8);
++ 		if (np)
++ 			pr_info("UV: NODE_PRESENT(%d) = 0x%016lx\n", i, np);
++ 
++ 		uv_pb += hweight64(np);
++ 	}
++ 	if (uv_possible_blades != uv_pb)
++ 		uv_possible_blades = uv_pb;
++ }
++ 
++ static void __init build_socket_tables(void)
++ {
++ 	struct uv_gam_range_entry *gre = uv_gre_table;
++ 	int num, nump;
++ 	int cpu, i, lnid;
++ 	int minsock = _min_socket;
++ 	int maxsock = _max_socket;
++ 	int minpnode = _min_pnode;
++ 	int maxpnode = _max_pnode;
++ 	size_t bytes;
++ 
++ 	if (!gre) {
++ 		if (is_uv1_hub() || is_uv2_hub() || is_uv3_hub()) {
++ 			pr_info("UV: No UVsystab socket table, ignoring\n");
++ 			return;		/* not required */
++ 		}
++ 		pr_crit(
++ 		"UV: Error: UVsystab address translations not available!\n");
++ 		BUG();
++ 	}
++ 
++ 	/* build socket id -> node id, pnode */
++ 	num = maxsock - minsock + 1;
++ 	bytes = num * sizeof(_socket_to_node[0]);
++ 	_socket_to_node = kmalloc(bytes, GFP_KERNEL);
++ 	_socket_to_pnode = kmalloc(bytes, GFP_KERNEL);
++ 
++ 	nump = maxpnode - minpnode + 1;
++ 	bytes = nump * sizeof(_pnode_to_socket[0]);
++ 	_pnode_to_socket = kmalloc(bytes, GFP_KERNEL);
++ 	BUG_ON(!_socket_to_node || !_socket_to_pnode || !_pnode_to_socket);
++ 
++ 	for (i = 0; i < num; i++)
++ 		_socket_to_node[i] = _socket_to_pnode[i] = SOCK_EMPTY;
++ 
++ 	for (i = 0; i < nump; i++)
++ 		_pnode_to_socket[i] = SOCK_EMPTY;
++ 
++ 	/* fill in pnode/node/addr conversion list values */
++ 	pr_info("UV: GAM Building socket/pnode/pxm conversion tables\n");
++ 	for (; gre->type != UV_GAM_RANGE_TYPE_UNUSED; gre++) {
++ 		if (gre->type == UV_GAM_RANGE_TYPE_HOLE)
++ 			continue;
++ 		i = gre->sockid - minsock;
++ 		if (_socket_to_pnode[i] != SOCK_EMPTY)
++ 			continue;	/* duplicate */
++ 		_socket_to_pnode[i] = gre->pnode;
++ 		_socket_to_node[i] = gre->pxm;
++ 
++ 		i = gre->pnode - minpnode;
++ 		_pnode_to_socket[i] = gre->sockid;
++ 
++ 		pr_info(
++ 		"UV: sid:%02x type:%d nasid:%04x pn:%02x pxm:%2d pn2s:%2x\n",
++ 			gre->sockid, gre->type, gre->nasid,
++ 			_socket_to_pnode[gre->sockid - minsock],
++ 			_socket_to_node[gre->sockid - minsock],
++ 			_pnode_to_socket[gre->pnode - minpnode]);
++ 	}
++ 
++ 	/* check socket -> node values */
++ 	lnid = -1;
++ 	for_each_present_cpu(cpu) {
++ 		int nid = cpu_to_node(cpu);
++ 		int apicid, sockid;
++ 
++ 		if (lnid == nid)
++ 			continue;
++ 		lnid = nid;
++ 		apicid = per_cpu(x86_cpu_to_apicid, cpu);
++ 		sockid = apicid >> uv_cpuid.socketid_shift;
++ 		i = sockid - minsock;
++ 
++ 		if (nid != _socket_to_node[i]) {
++ 			pr_warn(
++ 			"UV: %02x: type:%d socket:%02x PXM:%02x != node:%2d\n",
++ 				i, sockid, gre->type, _socket_to_node[i], nid);
++ 			_socket_to_node[i] = nid;
++ 		}
++ 	}
++ 
++ 	/* Setup physical blade to pnode translation from GAM Range Table */
++ 	bytes = num_possible_nodes() * sizeof(_node_to_pnode[0]);
++ 	_node_to_pnode = kmalloc(bytes, GFP_KERNEL);
++ 	BUG_ON(!_node_to_pnode);
++ 
++ 	for (lnid = 0; lnid < num_possible_nodes(); lnid++) {
++ 		unsigned short sockid;
++ 
++ 		for (sockid = minsock; sockid <= maxsock; sockid++) {
++ 			if (lnid == _socket_to_node[sockid - minsock]) {
++ 				_node_to_pnode[lnid] =
++ 					_socket_to_pnode[sockid - minsock];
++ 				break;
++ 			}
++ 		}
++ 		if (sockid > maxsock) {
++ 			pr_err("UV: socket for node %d not found!\n", lnid);
++ 			BUG();
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * If socket id == pnode or socket id == node for all nodes,
++ 	 *   system runs faster by removing corresponding conversion table.
++ 	 */
++ 	pr_info("UV: Checking socket->node/pnode for identity maps\n");
++ 	if (minsock == 0) {
++ 		for (i = 0; i < num; i++)
++ 			if (_socket_to_node[i] == SOCK_EMPTY ||
++ 				i != _socket_to_node[i])
++ 				break;
++ 		if (i >= num) {
++ 			kfree(_socket_to_node);
++ 			_socket_to_node = NULL;
++ 			pr_info("UV: 1:1 socket_to_node table removed\n");
++ 		}
++ 	}
++ 	if (minsock == minpnode) {
++ 		for (i = 0; i < num; i++)
++ 			if (_socket_to_pnode[i] != SOCK_EMPTY &&
++ 				_socket_to_pnode[i] != i + minpnode)
++ 				break;
++ 		if (i >= num) {
++ 			kfree(_socket_to_pnode);
++ 			_socket_to_pnode = NULL;
++ 			pr_info("UV: 1:1 socket_to_pnode table removed\n");
++ 		}
++ 	}
+++>>>>>>> f68376fc9e6d (x86/platform/UV: Fix incorrect nodes and pnodes for cpuless and memoryless nodes)
+  }
+  
+  void __init uv_system_init(void)
+@@@ -1105,43 -1419,84 +1348,121 @@@
+  	hub_info.coherency_domain_number = sn_coherency_id;
+  	uv_rtc_init();
+  
+++<<<<<<< HEAD
+ +	for_each_present_cpu(cpu) {
+ +		int apicid = per_cpu(x86_cpu_to_apicid, cpu);
+ +		int nodeid = cpu_to_node(cpu);
+ +		int lcpu;
+ +
+ +		*uv_cpu_hub_info(cpu) = hub_info;	/* common hub values */
+ +		pnode = uv_apicid_to_pnode(apicid);
+ +		blade = boot_pnode_to_blade(pnode);
+ +		lcpu = uv_blade_info[blade].nr_possible_cpus;
+ +		uv_blade_info[blade].nr_possible_cpus++;
+ +
+ +		/* Any node on the blade, else will contain -1. */
+ +		uv_blade_info[blade].memory_nid = nodeid;
+ +
+ +		uv_cpu_hub_info(cpu)->numa_blade_id = blade;
+ +		uv_cpu_hub_info(cpu)->pnode = pnode;
+ +		uv_node_to_blade[nodeid] = blade;
+ +		uv_cpu_to_blade[cpu] = blade;
+ +
+ +		/* Initialize per cpu info list */
+ +		uv_cpu_info_per(cpu)->p_uv_hub_info = uv_cpu_hub_info(cpu);
+ +		uv_cpu_info_per(cpu)->blade_cpu_id = lcpu;
+ +		uv_cpu_info_per(cpu)->scir.offset = uv_scir_offset(apicid);
+ +	}
+ +
+ +	/* Add blade/pnode info for nodes without cpus */
+ +	for_each_online_node(nid) {
+ +		unsigned long paddr;
+ +
+ +		if (uv_node_to_blade[nid] >= 0)
+ +			continue;
+ +		paddr = node_start_pfn(nid) << PAGE_SHIFT;
+ +		pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
+ +		blade = boot_pnode_to_blade(pnode);
+ +		uv_node_to_blade[nid] = blade;
+++=======
++ 	bytes = sizeof(void *) * uv_num_possible_blades();
++ 	__uv_hub_info_list = kzalloc(bytes, GFP_KERNEL);
++ 	BUG_ON(!__uv_hub_info_list);
++ 
++ 	bytes = sizeof(struct uv_hub_info_s);
++ 	for_each_node(nodeid) {
++ 		struct uv_hub_info_s *new_hub;
++ 
++ 		if (__uv_hub_info_list[nodeid]) {
++ 			pr_err("UV: Node %d UV HUB already initialized!?\n",
++ 				nodeid);
++ 			BUG();
++ 		}
++ 
++ 		/* Allocate new per hub info list */
++ 		new_hub = (nodeid == 0) ?
++ 			&uv_hub_info_node0 :
++ 			kzalloc_node(bytes, GFP_KERNEL, nodeid);
++ 		BUG_ON(!new_hub);
++ 		__uv_hub_info_list[nodeid] = new_hub;
++ 		new_hub = uv_hub_info_list(nodeid);
++ 		BUG_ON(!new_hub);
++ 		*new_hub = hub_info;
++ 
++ 		/* Use information from GAM table if available */
++ 		if (_node_to_pnode)
++ 			new_hub->pnode = _node_to_pnode[nodeid];
++ 		else	/* Fill in during cpu loop */
++ 			new_hub->pnode = 0xffff;
++ 		new_hub->numa_blade_id = uv_node_to_blade_id(nodeid);
++ 		new_hub->memory_nid = -1;
++ 		new_hub->nr_possible_cpus = 0;
++ 		new_hub->nr_online_cpus = 0;
++ 	}
++ 
++ 	/* Initialize per cpu info */
++ 	for_each_possible_cpu(cpu) {
++ 		int apicid = per_cpu(x86_cpu_to_apicid, cpu);
++ 		int numa_node_id;
++ 		unsigned short pnode;
++ 
++ 		nodeid = cpu_to_node(cpu);
++ 		numa_node_id = numa_cpu_node(cpu);
++ 		pnode = uv_apicid_to_pnode(apicid);
++ 
++ 		uv_cpu_info_per(cpu)->p_uv_hub_info = uv_hub_info_list(nodeid);
++ 		uv_cpu_info_per(cpu)->blade_cpu_id =
++ 			uv_cpu_hub_info(cpu)->nr_possible_cpus++;
++ 		if (uv_cpu_hub_info(cpu)->memory_nid == -1)
++ 			uv_cpu_hub_info(cpu)->memory_nid = cpu_to_node(cpu);
++ 		if (nodeid != numa_node_id &&	/* init memoryless node */
++ 		    uv_hub_info_list(numa_node_id)->pnode == 0xffff)
++ 			uv_hub_info_list(numa_node_id)->pnode = pnode;
++ 		else if (uv_cpu_hub_info(cpu)->pnode == 0xffff)
++ 			uv_cpu_hub_info(cpu)->pnode = pnode;
++ 		uv_cpu_scir_info(cpu)->offset = uv_scir_offset(apicid);
++ 	}
++ 
++ 	for_each_node(nodeid) {
++ 		unsigned short pnode = uv_hub_info_list(nodeid)->pnode;
++ 
++ 		/* Add pnode info for pre-GAM list nodes without cpus */
++ 		if (pnode == 0xffff) {
++ 			unsigned long paddr;
++ 
++ 			paddr = node_start_pfn(nodeid) << PAGE_SHIFT;
++ 			pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
++ 			uv_hub_info_list(nodeid)->pnode = pnode;
++ 		}
++ 		min_pnode = min(pnode, min_pnode);
++ 		max_pnode = max(pnode, max_pnode);
++ 		pr_info("UV: UVHUB node:%2d pn:%02x nrcpus:%d\n",
++ 			nodeid,
++ 			uv_hub_info_list(nodeid)->pnode,
++ 			uv_hub_info_list(nodeid)->nr_possible_cpus);
+++>>>>>>> f68376fc9e6d (x86/platform/UV: Fix incorrect nodes and pnodes for cpuless and memoryless nodes)
+  	}
+  
+ -	pr_info("UV: min_pnode:%02x max_pnode:%02x\n", min_pnode, max_pnode);
+  	map_gru_high(max_pnode);
+  	map_mmr_high(max_pnode);
+  	map_mmioh_high(min_pnode, max_pnode);
+* Unmerged path arch/x86/kernel/apic/x2apic_uv_x.c
