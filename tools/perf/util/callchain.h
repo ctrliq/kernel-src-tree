@@ -159,4 +159,13 @@ int record_callchain_opt(const struct option *opt, const char *arg, int unset);
 
 extern const char record_callchain_help[];
 int parse_callchain_report_opt(const char *arg);
+
+static inline void callchain_cursor_snapshot(struct callchain_cursor *dest,
+					     struct callchain_cursor *src)
+{
+	*dest = *src;
+
+	dest->first = src->curr;
+	dest->nr -= src->pos;
+}
 #endif	/* __PERF_CALLCHAIN_H */
