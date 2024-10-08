@@ -1,0 +1,233 @@
+usb: Add LED triggers for USB activity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [usb] Add LED triggers for USB activity (Don Zickus) [1232920]
+Rebuild_FUZZ: 92.96%
+commit-author Michal Sojka <sojka@merica.cz>
+commit 0cfbd328d60f85b0dcf66df61a3615e9a8e5d4e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0cfbd328.failed
+
+With this patch, USB activity can be signaled by blinking a LED. There
+are two triggers, one for activity on USB host and one for USB gadget.
+
+Both triggers should work with all host/device controllers. Tested only
+with musb.
+
+Performace: I measured performance overheads on ARM Cortex-A8 (TI
+AM335x) running on 600 MHz.
+
+Duration of usb_led_activity():
+- with no LED attached to the trigger:        2 ± 1 µs
+- with one GPIO LED attached to the trigger:  2 ± 1 µs or 8 ± 2 µs (two peaks in histogram)
+
+Duration of functions calling usb_led_activity() (with this patch
+applied and no LED attached to the trigger):
+- __usb_hcd_giveback_urb():    10 - 25 µs
+- usb_gadget_giveback_request(): 2 - 6 µs
+
+	Signed-off-by: Michal Sojka <sojka@merica.cz>
+	Acked-by: Felipe Balbi <balbi@ti.com>
+	Tested-by: Felipe Balbi <balbi@ti.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 0cfbd328d60f85b0dcf66df61a3615e9a8e5d4e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/common/Makefile
+#	drivers/usb/gadget/udc-core.c
+diff --cc drivers/usb/common/Makefile
+index 9b320d1a11fd,ca2f8bd0e431..000000000000
+--- a/drivers/usb/common/Makefile
++++ b/drivers/usb/common/Makefile
+@@@ -2,4 -2,8 +2,12 @@@
+  # Makefile for the usb common parts.
+  #
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_USB_COMMON) += usb-common.o
+++=======
++ obj-$(CONFIG_USB_COMMON)	  += usb-common.o
++ usb-common-y			  += common.o
++ usb-common-$(CONFIG_USB_LED_TRIG) += led.o
++ 
++ obj-$(CONFIG_USB_OTG_FSM) += usb-otg-fsm.o
+++>>>>>>> 0cfbd328d60f (usb: Add LED triggers for USB activity)
+diff --cc drivers/usb/gadget/udc-core.c
+index 5514822114a5,f107bb60a5ab..000000000000
+--- a/drivers/usb/gadget/udc-core.c
++++ b/drivers/usb/gadget/udc-core.c
+@@@ -99,8 -103,48 +100,49 @@@ void usb_gadget_unmap_request(struct us
+  }
+  EXPORT_SYMBOL_GPL(usb_gadget_unmap_request);
+  
+ -#endif	/* CONFIG_HAS_DMA */
+ -
+  /* ------------------------------------------------------------------------- */
+  
+++<<<<<<< HEAD:drivers/usb/gadget/udc-core.c
+++=======
++ /**
++  * usb_gadget_giveback_request - give the request back to the gadget layer
++  * Context: in_interrupt()
++  *
++  * This is called by device controller drivers in order to return the
++  * completed request back to the gadget layer.
++  */
++ void usb_gadget_giveback_request(struct usb_ep *ep,
++ 		struct usb_request *req)
++ {
++ 	if (likely(req->status == 0))
++ 		usb_led_activity(USB_LED_EVENT_GADGET);
++ 
++ 	req->complete(ep, req);
++ }
++ EXPORT_SYMBOL_GPL(usb_gadget_giveback_request);
++ 
++ /* ------------------------------------------------------------------------- */
++ 
++ static void usb_gadget_state_work(struct work_struct *work)
++ {
++ 	struct usb_gadget	*gadget = work_to_gadget(work);
++ 	struct usb_udc		*udc = NULL;
++ 
++ 	mutex_lock(&udc_lock);
++ 	list_for_each_entry(udc, &udc_list, list)
++ 		if (udc->gadget == gadget)
++ 			goto found;
++ 	mutex_unlock(&udc_lock);
++ 
++ 	return;
++ 
++ found:
++ 	mutex_unlock(&udc_lock);
++ 
++ 	sysfs_notify(&udc->dev.kobj, NULL, "state");
++ }
++ 
+++>>>>>>> 0cfbd328d60f (usb: Add LED triggers for USB activity):drivers/usb/gadget/udc/udc-core.c
+  void usb_gadget_set_state(struct usb_gadget *gadget,
+  		enum usb_device_state state)
+  {
+diff --git a/drivers/usb/Kconfig b/drivers/usb/Kconfig
+index 2642b8a11e05..8aa8f734f7c7 100644
+--- a/drivers/usb/Kconfig
++++ b/drivers/usb/Kconfig
+@@ -155,4 +155,14 @@ source "drivers/usb/phy/Kconfig"
+ 
+ source "drivers/usb/gadget/Kconfig"
+ 
++config USB_LED_TRIG
++	bool "USB LED Triggers"
++	depends on LEDS_CLASS && USB_COMMON && LEDS_TRIGGERS
++	help
++	  This option adds LED triggers for USB host and/or gadget activity.
++
++	  Say Y here if you are working on a system with led-class supported
++	  LEDs and you want to use them as activity indicators for USB host or
++	  gadget.
++
+ endif # USB_SUPPORT
+* Unmerged path drivers/usb/common/Makefile
+diff --git a/drivers/usb/common/led.c b/drivers/usb/common/led.c
+new file mode 100644
+index 000000000000..df23da00a901
+--- /dev/null
++++ b/drivers/usb/common/led.c
+@@ -0,0 +1,57 @@
++/*
++ * LED Triggers for USB Activity
++ *
++ * Copyright 2014 Michal Sojka <sojka@merica.cz>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/leds.h>
++#include <linux/usb.h>
++
++#define BLINK_DELAY 30
++
++static unsigned long usb_blink_delay = BLINK_DELAY;
++
++DEFINE_LED_TRIGGER(ledtrig_usb_gadget);
++DEFINE_LED_TRIGGER(ledtrig_usb_host);
++
++void usb_led_activity(enum usb_led_event ev)
++{
++	struct led_trigger *trig = NULL;
++
++	switch (ev) {
++	case USB_LED_EVENT_GADGET:
++		trig = ledtrig_usb_gadget;
++		break;
++	case USB_LED_EVENT_HOST:
++		trig = ledtrig_usb_host;
++		break;
++	}
++	/* led_trigger_blink_oneshot() handles trig == NULL gracefully */
++	led_trigger_blink_oneshot(trig, &usb_blink_delay, &usb_blink_delay, 0);
++}
++EXPORT_SYMBOL_GPL(usb_led_activity);
++
++
++static int __init ledtrig_usb_init(void)
++{
++	led_trigger_register_simple("usb-gadget", &ledtrig_usb_gadget);
++	led_trigger_register_simple("usb-host", &ledtrig_usb_host);
++	return 0;
++}
++
++static void __exit ledtrig_usb_exit(void)
++{
++	led_trigger_unregister_simple(ledtrig_usb_gadget);
++	led_trigger_unregister_simple(ledtrig_usb_host);
++}
++
++module_init(ledtrig_usb_init);
++module_exit(ledtrig_usb_exit);
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index 9097b8aaaae3..a2233d9d83a1 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1663,6 +1663,8 @@ static void __usb_hcd_giveback_urb(struct urb *urb)
+ 	usbmon_urb_complete(&hcd->self, urb, status);
+ 	usb_anchor_suspend_wakeups(anchor);
+ 	usb_unanchor_urb(urb);
++	if (likely(status == 0))
++		usb_led_activity(USB_LED_EVENT_HOST);
+ 
+ 	/* pass ownership to the completion handler */
+ 	urb->status = status;
+* Unmerged path drivers/usb/gadget/udc-core.c
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 84f4c44602fd..66472067bcf4 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1851,6 +1851,18 @@ extern void usb_unregister_notify(struct notifier_block *nb);
+ /* debugfs stuff */
+ extern struct dentry *usb_debug_root;
+ 
++/* LED triggers */
++enum usb_led_event {
++	USB_LED_EVENT_HOST = 0,
++	USB_LED_EVENT_GADGET = 1,
++};
++
++#ifdef CONFIG_USB_LED_TRIG
++extern void usb_led_activity(enum usb_led_event ev);
++#else
++static inline void usb_led_activity(enum usb_led_event ev) {}
++#endif
++
+ #endif  /* __KERNEL__ */
+ 
+ #endif
