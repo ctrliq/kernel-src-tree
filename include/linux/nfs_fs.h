@@ -167,7 +167,7 @@ struct nfs_inode {
 	 */
 	__be32			cookieverf[2];
 
-	unsigned long		npages;
+	unsigned long		nrequests;
 	struct nfs_mds_commit_info commit_info;
 
 	/* Open contexts for shared mmap writes */
@@ -545,7 +545,7 @@ nfs_commit_inode(struct inode *inode, int how)
 static inline int
 nfs_have_writebacks(struct inode *inode)
 {
-	return NFS_I(inode)->npages != 0;
+	return NFS_I(inode)->nrequests != 0;
 }
 
 /*
