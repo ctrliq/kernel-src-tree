@@ -1,0 +1,306 @@
+fs/fscache: convert printk to pr_foo()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] fscache: convert printk to pr_foo() (David Howells) [1130457 1204964]
+Rebuild_FUZZ: 95.89%
+commit-author Fabian Frederick <fabf@skynet.be>
+commit 36dfd116edd48fa6174d5694c143f1d4bd81aba8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/36dfd116.failed
+
+All printk converted to pr_foo() except internal.h: printk(KERN_DEBUG
+
+Coalesce formats.
+
+Add pr_fmt
+
+	Signed-off-by: Fabian Frederick <fabf@skynet.be>
+	Cc: David Howells <dhowells@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 36dfd116edd48fa6174d5694c143f1d4bd81aba8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fscache/cookie.c
+diff --cc fs/fscache/cookie.c
+index d851aa555d28,aec01be91b0a..000000000000
+--- a/fs/fscache/cookie.c
++++ b/fs/fscache/cookie.c
+@@@ -464,6 -507,73 +464,76 @@@ void __fscache_update_cookie(struct fsc
+  EXPORT_SYMBOL(__fscache_update_cookie);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Disable a cookie to stop it from accepting new requests from the netfs.
++  */
++ void __fscache_disable_cookie(struct fscache_cookie *cookie, bool invalidate)
++ {
++ 	struct fscache_object *object;
++ 	bool awaken = false;
++ 
++ 	_enter("%p,%u", cookie, invalidate);
++ 
++ 	ASSERTCMP(atomic_read(&cookie->n_active), >, 0);
++ 
++ 	if (atomic_read(&cookie->n_children) != 0) {
++ 		pr_err("Cookie '%s' still has children\n",
++ 		       cookie->def->name);
++ 		BUG();
++ 	}
++ 
++ 	wait_on_bit_lock(&cookie->flags, FSCACHE_COOKIE_ENABLEMENT_LOCK,
++ 			 fscache_wait_bit, TASK_UNINTERRUPTIBLE);
++ 	if (!test_and_clear_bit(FSCACHE_COOKIE_ENABLED, &cookie->flags))
++ 		goto out_unlock_enable;
++ 
++ 	/* If the cookie is being invalidated, wait for that to complete first
++ 	 * so that we can reuse the flag.
++ 	 */
++ 	__fscache_wait_on_invalidate(cookie);
++ 
++ 	/* Dispose of the backing objects */
++ 	set_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags);
++ 
++ 	spin_lock(&cookie->lock);
++ 	if (!hlist_empty(&cookie->backing_objects)) {
++ 		hlist_for_each_entry(object, &cookie->backing_objects, cookie_link) {
++ 			if (invalidate)
++ 				set_bit(FSCACHE_OBJECT_RETIRED, &object->flags);
++ 			fscache_raise_event(object, FSCACHE_OBJECT_EV_KILL);
++ 		}
++ 	} else {
++ 		if (test_and_clear_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags))
++ 			awaken = true;
++ 	}
++ 	spin_unlock(&cookie->lock);
++ 	if (awaken)
++ 		wake_up_bit(&cookie->flags, FSCACHE_COOKIE_INVALIDATING);
++ 
++ 	/* Wait for cessation of activity requiring access to the netfs (when
++ 	 * n_active reaches 0).  This makes sure outstanding reads and writes
++ 	 * have completed.
++ 	 */
++ 	if (!atomic_dec_and_test(&cookie->n_active))
++ 		wait_on_atomic_t(&cookie->n_active, fscache_wait_atomic_t,
++ 				 TASK_UNINTERRUPTIBLE);
++ 
++ 	/* Reset the cookie state if it wasn't relinquished */
++ 	if (!test_bit(FSCACHE_COOKIE_RELINQUISHED, &cookie->flags)) {
++ 		atomic_inc(&cookie->n_active);
++ 		set_bit(FSCACHE_COOKIE_NO_DATA_YET, &cookie->flags);
++ 	}
++ 
++ out_unlock_enable:
++ 	clear_bit_unlock(FSCACHE_COOKIE_ENABLEMENT_LOCK, &cookie->flags);
++ 	wake_up_bit(&cookie->flags, FSCACHE_COOKIE_ENABLEMENT_LOCK);
++ 	_leave("");
++ }
++ EXPORT_SYMBOL(__fscache_disable_cookie);
++ 
++ /*
+++>>>>>>> 36dfd116edd4 (fs/fscache: convert printk to pr_foo())
+   * release a cookie back to the cache
+   * - the object will be marked as recyclable on disk if retire is true
+   * - all dependents of this cookie must have already been unregistered
+diff --git a/fs/fscache/cache.c b/fs/fscache/cache.c
+index f7cff367db7f..56cce7fdd39e 100644
+--- a/fs/fscache/cache.c
++++ b/fs/fscache/cache.c
+@@ -280,15 +280,15 @@ int fscache_add_cache(struct fscache_cache *cache,
+ 	spin_unlock(&fscache_fsdef_index.lock);
+ 	up_write(&fscache_addremove_sem);
+ 
+-	printk(KERN_NOTICE "FS-Cache: Cache \"%s\" added (type %s)\n",
+-	       cache->tag->name, cache->ops->name);
++	pr_notice("Cache \"%s\" added (type %s)\n",
++		  cache->tag->name, cache->ops->name);
+ 	kobject_uevent(cache->kobj, KOBJ_ADD);
+ 
+ 	_leave(" = 0 [%s]", cache->identifier);
+ 	return 0;
+ 
+ tag_in_use:
+-	printk(KERN_ERR "FS-Cache: Cache tag '%s' already in use\n", tagname);
++	pr_err("Cache tag '%s' already in use\n", tagname);
+ 	__fscache_release_cache_tag(tag);
+ 	_leave(" = -EXIST");
+ 	return -EEXIST;
+@@ -317,8 +317,7 @@ EXPORT_SYMBOL(fscache_add_cache);
+ void fscache_io_error(struct fscache_cache *cache)
+ {
+ 	if (!test_and_set_bit(FSCACHE_IOERROR, &cache->flags))
+-		printk(KERN_ERR "FS-Cache:"
+-		       " Cache '%s' stopped due to I/O error\n",
++		pr_err("Cache '%s' stopped due to I/O error\n",
+ 		       cache->ops->name);
+ }
+ EXPORT_SYMBOL(fscache_io_error);
+@@ -369,8 +368,8 @@ void fscache_withdraw_cache(struct fscache_cache *cache)
+ 
+ 	_enter("");
+ 
+-	printk(KERN_NOTICE "FS-Cache: Withdrawing cache \"%s\"\n",
+-	       cache->tag->name);
++	pr_notice("Withdrawing cache \"%s\"\n",
++		  cache->tag->name);
+ 
+ 	/* make the cache unavailable for cookie acquisition */
+ 	if (test_and_set_bit(FSCACHE_CACHE_WITHDRAWN, &cache->flags))
+* Unmerged path fs/fscache/cookie.c
+diff --git a/fs/fscache/internal.h b/fs/fscache/internal.h
+index 4226f6680b06..bc6c08fcfddd 100644
+--- a/fs/fscache/internal.h
++++ b/fs/fscache/internal.h
+@@ -22,6 +22,12 @@
+  *
+  */
+ 
++#ifdef pr_fmt
++#undef pr_fmt
++#endif
++
++#define pr_fmt(fmt) "FS-Cache: " fmt
++
+ #include <linux/fscache-cache.h>
+ #include <linux/sched.h>
+ 
+@@ -413,8 +419,8 @@ do {						\
+ #define ASSERT(X)							\
+ do {									\
+ 	if (unlikely(!(X))) {						\
+-		printk(KERN_ERR "\n");					\
+-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
++		pr_err("\n");					\
++		pr_err("Assertion failed\n");	\
+ 		BUG();							\
+ 	}								\
+ } while (0)
+@@ -422,9 +428,9 @@ do {									\
+ #define ASSERTCMP(X, OP, Y)						\
+ do {									\
+ 	if (unlikely(!((X) OP (Y)))) {					\
+-		printk(KERN_ERR "\n");					\
+-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
+-		printk(KERN_ERR "%lx " #OP " %lx is false\n",		\
++		pr_err("\n");					\
++		pr_err("Assertion failed\n");	\
++		pr_err("%lx " #OP " %lx is false\n",		\
+ 		       (unsigned long)(X), (unsigned long)(Y));		\
+ 		BUG();							\
+ 	}								\
+@@ -433,8 +439,8 @@ do {									\
+ #define ASSERTIF(C, X)							\
+ do {									\
+ 	if (unlikely((C) && !(X))) {					\
+-		printk(KERN_ERR "\n");					\
+-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
++		pr_err("\n");					\
++		pr_err("Assertion failed\n");	\
+ 		BUG();							\
+ 	}								\
+ } while (0)
+@@ -442,9 +448,9 @@ do {									\
+ #define ASSERTIFCMP(C, X, OP, Y)					\
+ do {									\
+ 	if (unlikely((C) && !((X) OP (Y)))) {				\
+-		printk(KERN_ERR "\n");					\
+-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
+-		printk(KERN_ERR "%lx " #OP " %lx is false\n",		\
++		pr_err("\n");					\
++		pr_err("Assertion failed\n");	\
++		pr_err("%lx " #OP " %lx is false\n",		\
+ 		       (unsigned long)(X), (unsigned long)(Y));		\
+ 		BUG();							\
+ 	}								\
+diff --git a/fs/fscache/main.c b/fs/fscache/main.c
+index 7c27907e650c..acd4bf1fc277 100644
+--- a/fs/fscache/main.c
++++ b/fs/fscache/main.c
+@@ -146,8 +146,7 @@ static int __init fscache_init(void)
+ 					       0,
+ 					       fscache_cookie_init_once);
+ 	if (!fscache_cookie_jar) {
+-		printk(KERN_NOTICE
+-		       "FS-Cache: Failed to allocate a cookie jar\n");
++		pr_notice("Failed to allocate a cookie jar\n");
+ 		ret = -ENOMEM;
+ 		goto error_cookie_jar;
+ 	}
+@@ -156,7 +155,7 @@ static int __init fscache_init(void)
+ 	if (!fscache_root)
+ 		goto error_kobj;
+ 
+-	printk(KERN_NOTICE "FS-Cache: Loaded\n");
++	pr_notice("Loaded\n");
+ 	return 0;
+ 
+ error_kobj:
+@@ -192,7 +191,7 @@ static void __exit fscache_exit(void)
+ 	fscache_proc_cleanup();
+ 	destroy_workqueue(fscache_op_wq);
+ 	destroy_workqueue(fscache_object_wq);
+-	printk(KERN_NOTICE "FS-Cache: Unloaded\n");
++	pr_notice("Unloaded\n");
+ }
+ 
+ module_exit(fscache_exit);
+diff --git a/fs/fscache/netfs.c b/fs/fscache/netfs.c
+index b1bb6117473a..bb592c6179e6 100644
+--- a/fs/fscache/netfs.c
++++ b/fs/fscache/netfs.c
+@@ -64,8 +64,7 @@ int __fscache_register_netfs(struct fscache_netfs *netfs)
+ 	list_add(&netfs->link, &fscache_netfs_list);
+ 	ret = 0;
+ 
+-	printk(KERN_NOTICE "FS-Cache: Netfs '%s' registered for caching\n",
+-	       netfs->name);
++	pr_notice("Netfs '%s' registered for caching\n", netfs->name);
+ 
+ already_registered:
+ 	up_write(&fscache_addremove_sem);
+@@ -96,8 +95,8 @@ void __fscache_unregister_netfs(struct fscache_netfs *netfs)
+ 
+ 	up_write(&fscache_addremove_sem);
+ 
+-	printk(KERN_NOTICE "FS-Cache: Netfs '%s' unregistered from caching\n",
+-	       netfs->name);
++	pr_notice("Netfs '%s' unregistered from caching\n",
++		  netfs->name);
+ 
+ 	_leave("");
+ }
+diff --git a/fs/fscache/operation.c b/fs/fscache/operation.c
+index 318071aca217..e7b87a0e5185 100644
+--- a/fs/fscache/operation.c
++++ b/fs/fscache/operation.c
+@@ -51,8 +51,7 @@ void fscache_enqueue_operation(struct fscache_operation *op)
+ 		_debug("queue for caller's attention");
+ 		break;
+ 	default:
+-		printk(KERN_ERR "FS-Cache: Unexpected op type %lx",
+-		       op->flags);
++		pr_err("Unexpected op type %lx", op->flags);
+ 		BUG();
+ 		break;
+ 	}
+diff --git a/fs/fscache/page.c b/fs/fscache/page.c
+index 0fe42a6d0e9c..1800d8962d0a 100644
+--- a/fs/fscache/page.c
++++ b/fs/fscache/page.c
+@@ -1103,10 +1103,8 @@ void fscache_mark_page_cached(struct fscache_retrieval *op, struct page *page)
+ 		static bool once_only;
+ 		if (!once_only) {
+ 			once_only = true;
+-			printk(KERN_WARNING "FS-Cache:"
+-			       " Cookie type %s marked page %lx"
+-			       " multiple times\n",
+-			       cookie->def->name, page->index);
++			pr_warn("Cookie type %s marked page %lx multiple times\n",
++				cookie->def->name, page->index);
+ 		}
+ 	}
+ 
