@@ -1,0 +1,425 @@
+be2net: Support for OS2BMC.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] be2net: Support for OS2BMC (Ivan Vecera) [1182733]
+Rebuild_FUZZ: 98.11%
+commit-author Venkata Duvvuru <VenkatKumar.Duvvuru@Emulex.Com>
+commit 760c295e0e8d982917d004c9095cff61c0cbd803
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/760c295e.failed
+
+OS2BMC feature will allow the server to communicate with the on-board
+BMC/idrac (Baseboard Management Controller) over the LOM via
+standard Ethernet.
+
+When OS2BMC feature is enabled, the LOM will filter traffic coming
+from the host. If the destination MAC address matches the iDRAC MAC
+address, it will forward the packet to the NC-SI side band interface
+for iDRAC processing. Otherwise, it would send it out on the wire to
+the external network. Broadcast and multicast packets are sent on the
+side-band NC-SI channel and on the wire as well. Some of the packet
+filters are not supported in the NIC and hence driver will identify
+such packets and will hint the NIC to send those packets to the BMC.
+This is done by duplicating packets on the management ring. Packets
+are sent to the management ring, by setting mgmt bit in the wrb header.
+The NIC will forward the packets on the management ring to the BMC
+through the side-band NC-SI channel.
+
+Please refer to this online document for more details,
+http://www.dell.com/downloads/global/products/pedge/
+os_to_bmc_passthrough_a_new_chapter_in_system_management.pdf
+
+	Signed-off-by: Venkat Duvvuru <VenkatKumar.Duvvuru@Emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 760c295e0e8d982917d004c9095cff61c0cbd803)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be.h
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be.h
+index e375e9118367,8d12b41b3b19..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@@ -402,6 -383,8 +402,11 @@@ enum vf_state 
+  #define BE_FLAGS_VXLAN_OFFLOADS			BIT(8)
+  #define BE_FLAGS_SETUP_DONE			BIT(9)
+  #define BE_FLAGS_EVT_INCOMPATIBLE_SFP		BIT(10)
+++<<<<<<< HEAD
+++=======
++ #define BE_FLAGS_ERR_DETECTION_SCHEDULED	BIT(11)
++ #define BE_FLAGS_OS2BMC				BIT(12)
+++>>>>>>> 760c295e0e8d (be2net: Support for OS2BMC.)
+  
+  #define BE_UC_PMAC_COUNT			30
+  #define BE_VF_UC_PMAC_COUNT			2
+@@@ -453,6 -438,46 +460,49 @@@ struct rss_info 
+  	u8 rss_hkey[RSS_HASH_KEY_LEN];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define BE_INVALID_DIE_TEMP	0xFF
++ struct be_hwmon {
++ 	struct device *hwmon_dev;
++ 	u8 be_on_die_temp;  /* Unit: millidegree Celsius */
++ };
++ 
++ /* Macros to read/write the 'features' word of be_wrb_params structure.
++  */
++ #define	BE_WRB_F_BIT(name)			BE_WRB_F_##name##_BIT
++ #define	BE_WRB_F_MASK(name)			BIT_MASK(BE_WRB_F_##name##_BIT)
++ 
++ #define	BE_WRB_F_GET(word, name)	\
++ 	(((word) & (BE_WRB_F_MASK(name))) >> BE_WRB_F_BIT(name))
++ 
++ #define	BE_WRB_F_SET(word, name, val)	\
++ 	((word) |= (((val) << BE_WRB_F_BIT(name)) & BE_WRB_F_MASK(name)))
++ 
++ /* Feature/offload bits */
++ enum {
++ 	BE_WRB_F_CRC_BIT,		/* Ethernet CRC */
++ 	BE_WRB_F_IPCS_BIT,		/* IP csum */
++ 	BE_WRB_F_TCPCS_BIT,		/* TCP csum */
++ 	BE_WRB_F_UDPCS_BIT,		/* UDP csum */
++ 	BE_WRB_F_LSO_BIT,		/* LSO */
++ 	BE_WRB_F_LSO6_BIT,		/* LSO6 */
++ 	BE_WRB_F_VLAN_BIT,		/* VLAN */
++ 	BE_WRB_F_VLAN_SKIP_HW_BIT,	/* Skip VLAN tag (workaround) */
++ 	BE_WRB_F_OS2BMC_BIT		/* Send packet to the management ring */
++ };
++ 
++ /* The structure below provides a HW-agnostic abstraction of WRB params
++  * retrieved from a TX skb. This is in turn passed to chip specific routines
++  * during transmit, to set the corresponding params in the WRB.
++  */
++ struct be_wrb_params {
++ 	u32 features;	/* Feature bits */
++ 	u16 vlan_tag;	/* VLAN tag */
++ 	u16 lso_mss;	/* MSS for LSO */
++ };
++ 
+++>>>>>>> 760c295e0e8d (be2net: Support for OS2BMC.)
+  struct be_adapter {
+  	struct pci_dev *pdev;
+  	struct net_device *netdev;
+@@@ -559,8 -585,11 +609,10 @@@
+  	u16 qnq_vid;
+  	u32 msg_enable;
+  	int be_get_temp_freq;
+ -	struct be_hwmon hwmon_info;
+  	u8 pf_number;
+  	struct rss_info rss_info;
++ 	/* Filters for packets that need to be sent to BMC */
++ 	u32 bmc_filt_mask;
+  };
+  
+  #define be_physfn(adapter)		(!adapter->virtfn)
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index 4e5ddaa87095,dc7c0fd239f7..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -753,25 -774,54 +753,38 @@@ static void wrb_fill_hdr(struct be_adap
+  			proto = skb_ip_proto(skb);
+  		}
+  		if (proto == IPPROTO_TCP)
+ -			BE_WRB_F_SET(wrb_params->features, TCPCS, 1);
+ +			SET_TX_WRB_HDR_BITS(tcpcs, hdr, 1);
+  		else if (proto == IPPROTO_UDP)
+ -			BE_WRB_F_SET(wrb_params->features, UDPCS, 1);
+ +			SET_TX_WRB_HDR_BITS(udpcs, hdr, 1);
+  	}
+  
+ -	if (skb_vlan_tag_present(skb)) {
+ -		BE_WRB_F_SET(wrb_params->features, VLAN, 1);
+ -		wrb_params->vlan_tag = be_get_tx_vlan_tag(adapter, skb);
+ +	if (vlan_tx_tag_present(skb)) {
+ +		SET_TX_WRB_HDR_BITS(vlan, hdr, 1);
+ +		vlan_tag = be_get_tx_vlan_tag(adapter, skb);
+ +		SET_TX_WRB_HDR_BITS(vlan_tag, hdr, vlan_tag);
+  	}
+  
+ -	BE_WRB_F_SET(wrb_params->features, CRC, 1);
+ -}
+ -
+ -static void wrb_fill_hdr(struct be_adapter *adapter,
+ -			 struct be_eth_hdr_wrb *hdr,
+ -			 struct be_wrb_params *wrb_params,
+ -			 struct sk_buff *skb)
+ -{
+ -	memset(hdr, 0, sizeof(*hdr));
+ +	SET_TX_WRB_HDR_BITS(num_wrb, hdr, wrb_cnt);
+ +	SET_TX_WRB_HDR_BITS(len, hdr, len);
+  
+ -	SET_TX_WRB_HDR_BITS(crc, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, CRC));
+ -	SET_TX_WRB_HDR_BITS(ipcs, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, IPCS));
+ -	SET_TX_WRB_HDR_BITS(tcpcs, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, TCPCS));
+ -	SET_TX_WRB_HDR_BITS(udpcs, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, UDPCS));
+ -
+ -	SET_TX_WRB_HDR_BITS(lso, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, LSO));
+ -	SET_TX_WRB_HDR_BITS(lso6, hdr,
+ -			    BE_WRB_F_GET(wrb_params->features, LSO6));
+ -	SET_TX_WRB_HDR_BITS(lso_mss, hdr, wrb_params->lso_mss);
+ -
+ -	/* Hack to skip HW VLAN tagging needs evt = 1, compl = 0. When this
+ -	 * hack is not needed, the evt bit is set while ringing DB.
+ +	/* Hack to skip HW VLAN tagging needs evt = 1, compl = 0
+ +	 * When this hack is not needed, the evt bit is set while ringing DB
+  	 */
+++<<<<<<< HEAD
+ +	if (skip_hw_vlan)
+ +		SET_TX_WRB_HDR_BITS(event, hdr, 1);
+++=======
++ 	SET_TX_WRB_HDR_BITS(event, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, VLAN_SKIP_HW));
++ 	SET_TX_WRB_HDR_BITS(vlan, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, VLAN));
++ 	SET_TX_WRB_HDR_BITS(vlan_tag, hdr, wrb_params->vlan_tag);
++ 
++ 	SET_TX_WRB_HDR_BITS(num_wrb, hdr, skb_wrb_cnt(skb));
++ 	SET_TX_WRB_HDR_BITS(len, hdr, skb->len);
++ 	SET_TX_WRB_HDR_BITS(mgmt, hdr,
++ 			    BE_WRB_F_GET(wrb_params->features, OS2BMC));
+++>>>>>>> 760c295e0e8d (be2net: Support for OS2BMC.)
+  }
+  
+  static void unmap_tx_frag(struct device *dev, struct be_eth_wrb *wrb,
+@@@ -1054,9 -1158,132 +1067,133 @@@ static void be_xmit_flush(struct be_ada
+  	txo->pend_wrb_cnt = 0;
+  }
+  
++ /* OS2BMC related */
++ 
++ #define DHCP_CLIENT_PORT	68
++ #define DHCP_SERVER_PORT	67
++ #define NET_BIOS_PORT1		137
++ #define NET_BIOS_PORT2		138
++ #define DHCPV6_RAS_PORT		547
++ 
++ #define is_mc_allowed_on_bmc(adapter, eh)	\
++ 	(!is_multicast_filt_enabled(adapter) &&	\
++ 	 is_multicast_ether_addr(eh->h_dest) &&	\
++ 	 !is_broadcast_ether_addr(eh->h_dest))
++ 
++ #define is_bc_allowed_on_bmc(adapter, eh)	\
++ 	(!is_broadcast_filt_enabled(adapter) &&	\
++ 	 is_broadcast_ether_addr(eh->h_dest))
++ 
++ #define is_arp_allowed_on_bmc(adapter, skb)	\
++ 	(is_arp(skb) && is_arp_filt_enabled(adapter))
++ 
++ #define is_broadcast_packet(eh, adapter)	\
++ 		(is_multicast_ether_addr(eh->h_dest) && \
++ 		!compare_ether_addr(eh->h_dest, adapter->netdev->broadcast))
++ 
++ #define is_arp(skb)	(skb->protocol == htons(ETH_P_ARP))
++ 
++ #define is_arp_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & (BMC_FILT_BROADCAST_ARP))
++ 
++ #define is_dhcp_client_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_BROADCAST_DHCP_CLIENT)
++ 
++ #define is_dhcp_srvr_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_BROADCAST_DHCP_SERVER)
++ 
++ #define is_nbios_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_BROADCAST_NET_BIOS)
++ 
++ #define is_ipv6_na_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask &	\
++ 			BMC_FILT_MULTICAST_IPV6_NEIGH_ADVER)
++ 
++ #define is_ipv6_ra_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_MULTICAST_IPV6_RA)
++ 
++ #define is_ipv6_ras_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_MULTICAST_IPV6_RAS)
++ 
++ #define is_broadcast_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_BROADCAST)
++ 
++ #define is_multicast_filt_enabled(adapter)	\
++ 		(adapter->bmc_filt_mask & BMC_FILT_MULTICAST)
++ 
++ static bool be_send_pkt_to_bmc(struct be_adapter *adapter,
++ 			       struct sk_buff **skb)
++ {
++ 	struct ethhdr *eh = (struct ethhdr *)(*skb)->data;
++ 	bool os2bmc = false;
++ 
++ 	if (!be_is_os2bmc_enabled(adapter))
++ 		goto done;
++ 
++ 	if (!is_multicast_ether_addr(eh->h_dest))
++ 		goto done;
++ 
++ 	if (is_mc_allowed_on_bmc(adapter, eh) ||
++ 	    is_bc_allowed_on_bmc(adapter, eh) ||
++ 	    is_arp_allowed_on_bmc(adapter, (*skb))) {
++ 		os2bmc = true;
++ 		goto done;
++ 	}
++ 
++ 	if ((*skb)->protocol == htons(ETH_P_IPV6)) {
++ 		struct ipv6hdr *hdr = ipv6_hdr((*skb));
++ 		u8 nexthdr = hdr->nexthdr;
++ 
++ 		if (nexthdr == IPPROTO_ICMPV6) {
++ 			struct icmp6hdr *icmp6 = icmp6_hdr((*skb));
++ 
++ 			switch (icmp6->icmp6_type) {
++ 			case NDISC_ROUTER_ADVERTISEMENT:
++ 				os2bmc = is_ipv6_ra_filt_enabled(adapter);
++ 				goto done;
++ 			case NDISC_NEIGHBOUR_ADVERTISEMENT:
++ 				os2bmc = is_ipv6_na_filt_enabled(adapter);
++ 				goto done;
++ 			default:
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (is_udp_pkt((*skb))) {
++ 		struct udphdr *udp = udp_hdr((*skb));
++ 
++ 		switch (udp->dest) {
++ 		case DHCP_CLIENT_PORT:
++ 			os2bmc = is_dhcp_client_filt_enabled(adapter);
++ 			goto done;
++ 		case DHCP_SERVER_PORT:
++ 			os2bmc = is_dhcp_srvr_filt_enabled(adapter);
++ 			goto done;
++ 		case NET_BIOS_PORT1:
++ 		case NET_BIOS_PORT2:
++ 			os2bmc = is_nbios_filt_enabled(adapter);
++ 			goto done;
++ 		case DHCPV6_RAS_PORT:
++ 			os2bmc = is_ipv6_ras_filt_enabled(adapter);
++ 			goto done;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ done:
++ 	/* For packets over a vlan, which are destined
++ 	 * to BMC, asic expects the vlan to be inline in the packet.
++ 	 */
++ 	if (os2bmc)
++ 		*skb = be_insert_vlan_in_pkt(adapter, *skb, NULL);
++ 
++ 	return os2bmc;
++ }
++ 
+  static netdev_tx_t be_xmit(struct sk_buff *skb, struct net_device *netdev)
+  {
+ +	bool skip_hw_vlan = false, flush = !skb->xmit_more;
+  	struct be_adapter *adapter = netdev_priv(netdev);
+  	u16 q_idx = skb_get_queue_mapping(skb);
+  	struct be_tx_obj *txo = &adapter->tx_obj[q_idx];
+@@@ -1073,7 -1303,19 +1210,23 @@@
+  		goto drop;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((atomic_read(&txq->used) + BE_MAX_TX_FRAG_COUNT) >= txq->len) {
+++=======
++ 	/* if os2bmc is enabled and if the pkt is destined to bmc,
++ 	 * enqueue the pkt a 2nd time with mgmt bit set.
++ 	 */
++ 	if (be_send_pkt_to_bmc(adapter, &skb)) {
++ 		BE_WRB_F_SET(wrb_params.features, OS2BMC, 1);
++ 		wrb_cnt = be_xmit_enqueue(adapter, txo, skb, &wrb_params);
++ 		if (unlikely(!wrb_cnt))
++ 			goto drop;
++ 		else
++ 			skb_get(skb);
++ 	}
++ 
++ 	if (be_is_txq_full(txo)) {
+++>>>>>>> 760c295e0e8d (be2net: Support for OS2BMC.)
+  		netif_stop_subqueue(netdev, q_idx);
+  		tx_stats(txo)->tx_stops++;
+  	}
+* Unmerged path drivers/net/ethernet/emulex/benet/be.h
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index faa193e12fa0..b8aa02458d69 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -331,6 +331,21 @@ static void be_async_grp5_pvid_state_process(struct be_adapter *adapter,
+ 	}
+ }
+ 
++#define MGMT_ENABLE_MASK	0x4
++static void be_async_grp5_fw_control_process(struct be_adapter *adapter,
++					     struct be_mcc_compl *compl)
++{
++	struct be_async_fw_control *evt = (struct be_async_fw_control *)compl;
++	u32 evt_dw1 = le32_to_cpu(evt->event_data_word1);
++
++	if (evt_dw1 & MGMT_ENABLE_MASK) {
++		adapter->flags |= BE_FLAGS_OS2BMC;
++		adapter->bmc_filt_mask = le32_to_cpu(evt->event_data_word2);
++	} else {
++		adapter->flags &= ~BE_FLAGS_OS2BMC;
++	}
++}
++
+ static void be_async_grp5_evt_process(struct be_adapter *adapter,
+ 				      struct be_mcc_compl *compl)
+ {
+@@ -347,6 +362,10 @@ static void be_async_grp5_evt_process(struct be_adapter *adapter,
+ 	case ASYNC_EVENT_PVID_STATE:
+ 		be_async_grp5_pvid_state_process(adapter, compl);
+ 		break;
++	/* Async event to disable/enable os2bmc and/or mac-learning */
++	case ASYNC_EVENT_FW_CONTROL:
++		be_async_grp5_fw_control_process(adapter, compl);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.h b/drivers/net/ethernet/emulex/benet/be_cmds.h
+index c713d514fcd1..2716e6f30d9a 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.h
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.h
+@@ -105,6 +105,7 @@ struct be_mcc_compl {
+ #define ASYNC_DEBUG_EVENT_TYPE_QNQ	1
+ #define ASYNC_EVENT_CODE_SLIPORT	0x11
+ #define ASYNC_EVENT_PORT_MISCONFIG	0x9
++#define ASYNC_EVENT_FW_CONTROL		0x5
+ 
+ enum {
+ 	LINK_DOWN	= 0x0,
+@@ -181,6 +182,22 @@ struct be_async_event_misconfig_port {
+ 	u32 flags;
+ } __packed;
+ 
++#define BMC_FILT_BROADCAST_ARP				BIT(0)
++#define BMC_FILT_BROADCAST_DHCP_CLIENT			BIT(1)
++#define BMC_FILT_BROADCAST_DHCP_SERVER			BIT(2)
++#define BMC_FILT_BROADCAST_NET_BIOS			BIT(3)
++#define BMC_FILT_BROADCAST				BIT(7)
++#define BMC_FILT_MULTICAST_IPV6_NEIGH_ADVER		BIT(8)
++#define BMC_FILT_MULTICAST_IPV6_RA			BIT(9)
++#define BMC_FILT_MULTICAST_IPV6_RAS			BIT(10)
++#define BMC_FILT_MULTICAST				BIT(15)
++struct be_async_fw_control {
++	u32 event_data_word1;
++	u32 event_data_word2;
++	u32 evt_tag;
++	u32 event_data_word4;
++} __packed;
++
+ struct be_mcc_mailbox {
+ 	struct be_mcc_wrb wrb;
+ 	struct be_mcc_compl compl;
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
