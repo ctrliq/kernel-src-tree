@@ -1,0 +1,155 @@
+openvswitch: Fix skb leak in ovs_fragment()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Joe Stringer <joestringer@nicira.com>
+commit b8f2257069f179c7bdedc9501c1623070c4c37bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b8f22570.failed
+
+If ovs_fragment() was unable to fragment the skb due to an L2 header
+that exceeds the supported length, skbs would be leaked. Fix the bug.
+
+Fixes: 7f8a436eaa2c "openvswitch: Add conntrack action"
+	Signed-off-by: Joe Stringer <joestringer@nicira.com>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b8f2257069f179c7bdedc9501c1623070c4c37bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/actions.c
+diff --cc net/openvswitch/actions.c
+index 1970b0908585,4cb93f92d6be..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -603,7 -620,123 +603,127 @@@ static int set_sctp(struct sk_buff *skb
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port)
+++=======
++ static int ovs_vport_output(struct sock *sock, struct sk_buff *skb)
++ {
++ 	struct ovs_frag_data *data = this_cpu_ptr(&ovs_frag_data_storage);
++ 	struct vport *vport = data->vport;
++ 
++ 	if (skb_cow_head(skb, data->l2_len) < 0) {
++ 		kfree_skb(skb);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	__skb_dst_copy(skb, data->dst);
++ 	*OVS_CB(skb) = data->cb;
++ 	skb->inner_protocol = data->inner_protocol;
++ 	skb->vlan_tci = data->vlan_tci;
++ 	skb->vlan_proto = data->vlan_proto;
++ 
++ 	/* Reconstruct the MAC header.  */
++ 	skb_push(skb, data->l2_len);
++ 	memcpy(skb->data, &data->l2_data, data->l2_len);
++ 	ovs_skb_postpush_rcsum(skb, skb->data, data->l2_len);
++ 	skb_reset_mac_header(skb);
++ 
++ 	ovs_vport_send(vport, skb);
++ 	return 0;
++ }
++ 
++ static unsigned int
++ ovs_dst_get_mtu(const struct dst_entry *dst)
++ {
++ 	return dst->dev->mtu;
++ }
++ 
++ static struct dst_ops ovs_dst_ops = {
++ 	.family = AF_UNSPEC,
++ 	.mtu = ovs_dst_get_mtu,
++ };
++ 
++ /* prepare_frag() is called once per (larger-than-MTU) frame; its inverse is
++  * ovs_vport_output(), which is called once per fragmented packet.
++  */
++ static void prepare_frag(struct vport *vport, struct sk_buff *skb)
++ {
++ 	unsigned int hlen = skb_network_offset(skb);
++ 	struct ovs_frag_data *data;
++ 
++ 	data = this_cpu_ptr(&ovs_frag_data_storage);
++ 	data->dst = skb->_skb_refdst;
++ 	data->vport = vport;
++ 	data->cb = *OVS_CB(skb);
++ 	data->inner_protocol = skb->inner_protocol;
++ 	data->vlan_tci = skb->vlan_tci;
++ 	data->vlan_proto = skb->vlan_proto;
++ 	data->l2_len = hlen;
++ 	memcpy(&data->l2_data, skb->data, hlen);
++ 
++ 	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
++ 	skb_pull(skb, hlen);
++ }
++ 
++ static void ovs_fragment(struct vport *vport, struct sk_buff *skb, u16 mru,
++ 			 __be16 ethertype)
++ {
++ 	if (skb_network_offset(skb) > MAX_L2_LEN) {
++ 		OVS_NLERR(1, "L2 header too long to fragment");
++ 		goto err;
++ 	}
++ 
++ 	if (ethertype == htons(ETH_P_IP)) {
++ 		struct dst_entry ovs_dst;
++ 		unsigned long orig_dst;
++ 
++ 		prepare_frag(vport, skb);
++ 		dst_init(&ovs_dst, &ovs_dst_ops, NULL, 1,
++ 			 DST_OBSOLETE_NONE, DST_NOCOUNT);
++ 		ovs_dst.dev = vport->dev;
++ 
++ 		orig_dst = skb->_skb_refdst;
++ 		skb_dst_set_noref(skb, &ovs_dst);
++ 		IPCB(skb)->frag_max_size = mru;
++ 
++ 		ip_do_fragment(skb->sk, skb, ovs_vport_output);
++ 		refdst_drop(orig_dst);
++ 	} else if (ethertype == htons(ETH_P_IPV6)) {
++ 		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
++ 		unsigned long orig_dst;
++ 		struct rt6_info ovs_rt;
++ 
++ 		if (!v6ops) {
++ 			goto err;
++ 		}
++ 
++ 		prepare_frag(vport, skb);
++ 		memset(&ovs_rt, 0, sizeof(ovs_rt));
++ 		dst_init(&ovs_rt.dst, &ovs_dst_ops, NULL, 1,
++ 			 DST_OBSOLETE_NONE, DST_NOCOUNT);
++ 		ovs_rt.dst.dev = vport->dev;
++ 
++ 		orig_dst = skb->_skb_refdst;
++ 		skb_dst_set_noref(skb, &ovs_rt.dst);
++ 		IP6CB(skb)->frag_max_size = mru;
++ 
++ 		v6ops->fragment(skb->sk, skb, ovs_vport_output);
++ 		refdst_drop(orig_dst);
++ 	} else {
++ 		WARN_ONCE(1, "Failed fragment ->%s: eth=%04x, MRU=%d, MTU=%d.",
++ 			  ovs_vport_name(vport), ntohs(ethertype), mru,
++ 			  vport->dev->mtu);
++ 		goto err;
++ 	}
++ 
++ 	return;
++ err:
++ 	kfree_skb(skb);
++ }
++ 
++ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
++ 		      struct sw_flow_key *key)
+++>>>>>>> b8f2257069f1 (openvswitch: Fix skb leak in ovs_fragment())
+  {
+  	struct vport *vport = ovs_vport_rcu(dp, out_port);
+  
+* Unmerged path net/openvswitch/actions.c
