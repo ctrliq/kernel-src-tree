@@ -951,6 +951,7 @@ extern int get_tsc_mode(unsigned long adr);
 extern int set_tsc_mode(unsigned int val);
 
 extern u16 amd_get_nb_id(int cpu);
+extern u32 amd_get_nodes_per_socket(void);
 
 static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
 {
