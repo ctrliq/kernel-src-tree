@@ -1,0 +1,383 @@
+Btrfs: allow block group cache writeout outside critical section in commit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chris Mason <clm@fb.com>
+commit 1bbc621ef28462456131c035eaeb5567a1a2a2fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1bbc621e.failed
+
+We loop through all of the dirty block groups during commit and write
+the free space cache.  In order to make sure the cache is currect, we do
+this while no other writers are allowed in the commit.
+
+If a large number of block groups are dirty, this can introduce long
+stalls during the final stages of the commit, which can block new procs
+trying to change the filesystem.
+
+This commit changes the block group cache writeout to take appropriate
+locks and allow it to run earlier in the commit.  We'll still have to
+redo some of the block groups, but it means we can get most of the work
+out of the way without blocking the entire FS.
+
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 1bbc621ef28462456131c035eaeb5567a1a2a2fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+#	fs/btrfs/transaction.c
+#	fs/btrfs/transaction.h
+diff --cc fs/btrfs/extent-tree.c
+index 22a3029a3ed9,02c2b29a0840..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -5439,14 -5596,6 +5576,17 @@@ static int update_block_group(struct bt
+  		if (!alloc && cache->cached == BTRFS_CACHE_NO)
+  			cache_block_group(cache, 1);
+  
+++<<<<<<< HEAD
+ +		spin_lock(&trans->transaction->dirty_bgs_lock);
+ +		if (list_empty(&cache->dirty_list)) {
+ +			list_add_tail(&cache->dirty_list,
+ +				      &trans->transaction->dirty_bgs);
+ +			btrfs_get_block_group(cache);
+ +		}
+ +		spin_unlock(&trans->transaction->dirty_bgs_lock);
+ +
+++=======
+++>>>>>>> 1bbc621ef284 (Btrfs: allow block group cache writeout outside critical section in commit)
+  		byte_in_group = bytenr - cache->key.objectid;
+  		WARN_ON(byte_in_group > cache->key.offset);
+  
+diff --cc fs/btrfs/transaction.c
+index e658864f4698,5628e25250c0..000000000000
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@@ -247,6 -252,9 +248,12 @@@ loop
+  	INIT_LIST_HEAD(&cur_trans->switch_commits);
+  	INIT_LIST_HEAD(&cur_trans->pending_ordered);
+  	INIT_LIST_HEAD(&cur_trans->dirty_bgs);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&cur_trans->io_bgs);
++ 	mutex_init(&cur_trans->cache_write_mutex);
++ 	cur_trans->num_dirty_bgs = 0;
+++>>>>>>> 1bbc621ef284 (Btrfs: allow block group cache writeout outside critical section in commit)
+  	spin_lock_init(&cur_trans->dirty_bgs_lock);
+  	list_add_tail(&cur_trans->list, &fs_info->trans_list);
+  	extent_io_tree_init(&cur_trans->dirty_pages,
+diff --cc fs/btrfs/transaction.h
+index 937050a2b68e,0b24755596ba..000000000000
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@@ -64,6 -64,15 +64,18 @@@ struct btrfs_transaction 
+  	struct list_head pending_ordered;
+  	struct list_head switch_commits;
+  	struct list_head dirty_bgs;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head io_bgs;
++ 	u64 num_dirty_bgs;
++ 
++ 	/*
++ 	 * we need to make sure block group deletion doesn't race with
++ 	 * free space cache writeout.  This mutex keeps them from stomping
++ 	 * on each other
++ 	 */
++ 	struct mutex cache_write_mutex;
+++>>>>>>> 1bbc621ef284 (Btrfs: allow block group cache writeout outside critical section in commit)
+  	spinlock_t dirty_bgs_lock;
+  	struct btrfs_delayed_ref_root delayed_refs;
+  	int aborted;
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index a91ec1f9b65f..9585974183d5 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1488,6 +1488,12 @@ struct btrfs_fs_info {
+ 	struct mutex chunk_mutex;
+ 	struct mutex volume_mutex;
+ 
++	/*
++	 * this is taken to make sure we don't set block groups ro after
++	 * the free space cache has been allocated on them
++	 */
++	struct mutex ro_block_group_mutex;
++
+ 	/* this is used during read/modify/write to make sure
+ 	 * no two ios are trying to mod the same stripe at the same
+ 	 * time
+@@ -3400,6 +3406,8 @@ int btrfs_inc_extent_ref(struct btrfs_trans_handle *trans,
+ 			 u64 bytenr, u64 num_bytes, u64 parent,
+ 			 u64 root_objectid, u64 owner, u64 offset, int no_quota);
+ 
++int btrfs_start_dirty_block_groups(struct btrfs_trans_handle *trans,
++				   struct btrfs_root *root);
+ int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans,
+ 				    struct btrfs_root *root);
+ int btrfs_setup_space_cache(struct btrfs_trans_handle *trans,
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 7a93e06e9ee8..af50cb679d55 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2576,6 +2576,7 @@ int open_ctree(struct super_block *sb,
+ 	mutex_init(&fs_info->transaction_kthread_mutex);
+ 	mutex_init(&fs_info->cleaner_mutex);
+ 	mutex_init(&fs_info->volume_mutex);
++	mutex_init(&fs_info->ro_block_group_mutex);
+ 	init_rwsem(&fs_info->commit_root_sem);
+ 	init_rwsem(&fs_info->cleanup_work_sem);
+ 	init_rwsem(&fs_info->subvol_sem);
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+index 39da6626f574..4e04e59e7552 100644
+--- a/fs/btrfs/free-space-cache.c
++++ b/fs/btrfs/free-space-cache.c
+@@ -226,9 +226,37 @@ int btrfs_check_trunc_cache_free_space(struct btrfs_root *root,
+ 
+ int btrfs_truncate_free_space_cache(struct btrfs_root *root,
+ 				    struct btrfs_trans_handle *trans,
++				    struct btrfs_block_group_cache *block_group,
+ 				    struct inode *inode)
+ {
+ 	int ret = 0;
++	struct btrfs_path *path = btrfs_alloc_path();
++
++	if (!path) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	if (block_group) {
++		mutex_lock(&trans->transaction->cache_write_mutex);
++		if (!list_empty(&block_group->io_list)) {
++			list_del_init(&block_group->io_list);
++
++			btrfs_wait_cache_io(root, trans, block_group,
++					    &block_group->io_ctl, path,
++					    block_group->key.objectid);
++			btrfs_put_block_group(block_group);
++		}
++
++		/*
++		 * now that we've truncated the cache away, its no longer
++		 * setup or written
++		 */
++		spin_lock(&block_group->lock);
++		block_group->disk_cache_state = BTRFS_DC_CLEAR;
++		spin_unlock(&block_group->lock);
++	}
++	btrfs_free_path(path);
+ 
+ 	btrfs_i_size_write(inode, 0);
+ 	truncate_pagecache(inode, 0);
+@@ -242,11 +270,17 @@ int btrfs_truncate_free_space_cache(struct btrfs_root *root,
+ 	ret = btrfs_truncate_inode_items(trans, root, inode,
+ 					 0, BTRFS_EXTENT_DATA_KEY);
+ 	if (ret) {
++		mutex_unlock(&trans->transaction->cache_write_mutex);
+ 		btrfs_abort_transaction(trans, root, ret);
+ 		return ret;
+ 	}
+ 
+ 	ret = btrfs_update_inode(trans, root, inode);
++
++	if (block_group)
++		mutex_unlock(&trans->transaction->cache_write_mutex);
++
++fail:
+ 	if (ret)
+ 		btrfs_abort_transaction(trans, root, ret);
+ 
+@@ -876,6 +910,7 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
+ {
+ 	int ret;
+ 	struct btrfs_free_cluster *cluster = NULL;
++	struct btrfs_free_cluster *cluster_locked = NULL;
+ 	struct rb_node *node = rb_first(&ctl->free_space_offset);
+ 	struct btrfs_trim_range *trim_entry;
+ 
+@@ -887,6 +922,8 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
+ 	}
+ 
+ 	if (!node && cluster) {
++		cluster_locked = cluster;
++		spin_lock(&cluster_locked->lock);
+ 		node = rb_first(&cluster->root);
+ 		cluster = NULL;
+ 	}
+@@ -910,9 +947,15 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
+ 		node = rb_next(node);
+ 		if (!node && cluster) {
+ 			node = rb_first(&cluster->root);
++			cluster_locked = cluster;
++			spin_lock(&cluster_locked->lock);
+ 			cluster = NULL;
+ 		}
+ 	}
++	if (cluster_locked) {
++		spin_unlock(&cluster_locked->lock);
++		cluster_locked = NULL;
++	}
+ 
+ 	/*
+ 	 * Make sure we don't miss any range that was removed from our rbtree
+@@ -930,6 +973,8 @@ int write_cache_extent_entries(struct btrfs_io_ctl *io_ctl,
+ 
+ 	return 0;
+ fail:
++	if (cluster_locked)
++		spin_unlock(&cluster_locked->lock);
+ 	return -ENOSPC;
+ }
+ 
+@@ -1101,6 +1146,9 @@ int btrfs_wait_cache_io(struct btrfs_root *root,
+ 	int ret;
+ 	struct inode *inode = io_ctl->inode;
+ 
++	if (!inode)
++		return 0;
++
+ 	root = root->fs_info->tree_root;
+ 
+ 	/* Flush the dirty pages in the cache file. */
+@@ -1127,11 +1175,16 @@ out:
+ 	btrfs_update_inode(trans, root, inode);
+ 
+ 	if (block_group) {
++		/* the dirty list is protected by the dirty_bgs_lock */
++		spin_lock(&trans->transaction->dirty_bgs_lock);
++
++		/* the disk_cache_state is protected by the block group lock */
+ 		spin_lock(&block_group->lock);
+ 
+ 		/*
+ 		 * only mark this as written if we didn't get put back on
+-		 * the dirty list while waiting for IO.
++		 * the dirty list while waiting for IO.   Otherwise our
++		 * cache state won't be right, and we won't get written again
+ 		 */
+ 		if (!ret && list_empty(&block_group->dirty_list))
+ 			block_group->disk_cache_state = BTRFS_DC_WRITTEN;
+@@ -1139,6 +1192,7 @@ out:
+ 			block_group->disk_cache_state = BTRFS_DC_ERROR;
+ 
+ 		spin_unlock(&block_group->lock);
++		spin_unlock(&trans->transaction->dirty_bgs_lock);
+ 		io_ctl->inode = NULL;
+ 		iput(inode);
+ 	}
+@@ -1207,9 +1261,11 @@ static int __btrfs_write_out_cache(struct btrfs_root *root, struct inode *inode,
+ 
+ 	mutex_lock(&ctl->cache_writeout_mutex);
+ 	/* Write out the extent entries in the free space cache */
++	spin_lock(&ctl->tree_lock);
+ 	ret = write_cache_extent_entries(io_ctl, ctl,
+ 					 block_group, &entries, &bitmaps,
+ 					 &bitmap_list);
++	spin_unlock(&ctl->tree_lock);
+ 	if (ret) {
+ 		mutex_unlock(&ctl->cache_writeout_mutex);
+ 		goto out_nospc;
+@@ -1219,6 +1275,9 @@ static int __btrfs_write_out_cache(struct btrfs_root *root, struct inode *inode,
+ 	 * Some spaces that are freed in the current transaction are pinned,
+ 	 * they will be added into free space cache after the transaction is
+ 	 * committed, we shouldn't lose them.
++	 *
++	 * If this changes while we are working we'll get added back to
++	 * the dirty list and redo it.  No locking needed
+ 	 */
+ 	ret = write_pinned_extent_entries(root, block_group, io_ctl, &entries);
+ 	if (ret) {
+@@ -1231,7 +1290,9 @@ static int __btrfs_write_out_cache(struct btrfs_root *root, struct inode *inode,
+ 	 * locked while doing it because a concurrent trim can be manipulating
+ 	 * or freeing the bitmap.
+ 	 */
++	spin_lock(&ctl->tree_lock);
+ 	ret = write_bitmap_entries(io_ctl, &bitmap_list);
++	spin_unlock(&ctl->tree_lock);
+ 	mutex_unlock(&ctl->cache_writeout_mutex);
+ 	if (ret)
+ 		goto out_nospc;
+@@ -1307,12 +1368,6 @@ int btrfs_write_out_cache(struct btrfs_root *root,
+ 		spin_unlock(&block_group->lock);
+ 		return 0;
+ 	}
+-
+-	if (block_group->delalloc_bytes) {
+-		block_group->disk_cache_state = BTRFS_DC_WRITTEN;
+-		spin_unlock(&block_group->lock);
+-		return 0;
+-	}
+ 	spin_unlock(&block_group->lock);
+ 
+ 	inode = lookup_free_space_inode(root, block_group, path);
+diff --git a/fs/btrfs/free-space-cache.h b/fs/btrfs/free-space-cache.h
+index c4339863af05..a16a029ad3b1 100644
+--- a/fs/btrfs/free-space-cache.h
++++ b/fs/btrfs/free-space-cache.h
+@@ -62,6 +62,7 @@ int btrfs_check_trunc_cache_free_space(struct btrfs_root *root,
+ 				       struct btrfs_block_rsv *rsv);
+ int btrfs_truncate_free_space_cache(struct btrfs_root *root,
+ 				    struct btrfs_trans_handle *trans,
++				    struct btrfs_block_group_cache *block_group,
+ 				    struct inode *inode);
+ int load_free_space_cache(struct btrfs_fs_info *fs_info,
+ 			  struct btrfs_block_group_cache *block_group);
+diff --git a/fs/btrfs/inode-map.c b/fs/btrfs/inode-map.c
+index 74faea3a516e..f6a596d5a637 100644
+--- a/fs/btrfs/inode-map.c
++++ b/fs/btrfs/inode-map.c
+@@ -456,7 +456,7 @@ again:
+ 	}
+ 
+ 	if (i_size_read(inode) > 0) {
+-		ret = btrfs_truncate_free_space_cache(root, trans, inode);
++		ret = btrfs_truncate_free_space_cache(root, trans, NULL, inode);
+ 		if (ret) {
+ 			if (ret != -ENOSPC)
+ 				btrfs_abort_transaction(trans, root, ret);
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index d83085381bcc..840a4eb0f396 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -3430,7 +3430,9 @@ static int block_use_full_backref(struct reloc_control *rc,
+ }
+ 
+ static int delete_block_group_cache(struct btrfs_fs_info *fs_info,
+-				    struct inode *inode, u64 ino)
++				    struct btrfs_block_group_cache *block_group,
++				    struct inode *inode,
++				    u64 ino)
+ {
+ 	struct btrfs_key key;
+ 	struct btrfs_root *root = fs_info->tree_root;
+@@ -3463,7 +3465,7 @@ truncate:
+ 		goto out;
+ 	}
+ 
+-	ret = btrfs_truncate_free_space_cache(root, trans, inode);
++	ret = btrfs_truncate_free_space_cache(root, trans, block_group, inode);
+ 
+ 	btrfs_end_transaction(trans, root);
+ 	btrfs_btree_balance_dirty(root);
+@@ -3509,6 +3511,7 @@ static int find_data_references(struct reloc_control *rc,
+ 	 */
+ 	if (ref_root == BTRFS_ROOT_TREE_OBJECTID) {
+ 		ret = delete_block_group_cache(rc->extent_root->fs_info,
++					       rc->block_group,
+ 					       NULL, ref_objectid);
+ 		if (ret != -ENOENT)
+ 			return ret;
+@@ -4223,7 +4226,7 @@ int btrfs_relocate_block_group(struct btrfs_root *extent_root, u64 group_start)
+ 	btrfs_free_path(path);
+ 
+ 	if (!IS_ERR(inode))
+-		ret = delete_block_group_cache(fs_info, inode, 0);
++		ret = delete_block_group_cache(fs_info, rc->block_group, inode, 0);
+ 	else
+ 		ret = PTR_ERR(inode);
+ 
+* Unmerged path fs/btrfs/transaction.c
+* Unmerged path fs/btrfs/transaction.h
