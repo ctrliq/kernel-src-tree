@@ -1,0 +1,170 @@
+xfs: fix double free in xlog_recover_commit_trans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 88b863db97a18a04c90ebd57d84e1b7863114dcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/88b863db.failed
+
+When an error occurs during buffer submission in
+xlog_recover_commit_trans(), we free the trans structure twice. Fix
+it by only freeing the structure in the caller regardless of the
+success or failure of the function.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 88b863db97a18a04c90ebd57d84e1b7863114dcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_recover.c
+diff --cc fs/xfs/xfs_log_recover.c
+index da155de2b4de,89574ff2566e..000000000000
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@@ -3533,13 -3532,132 +3531,130 @@@ out
+  	return error ? error : error2;
+  }
+  
+ -/*
+ - * On error or completion, trans is freed.
+ - */
+  STATIC int
+ -xlog_recovery_process_trans(
+ -	struct xlog		*log,
+ -	struct xlog_recover	*trans,
+ -	xfs_caddr_t		dp,
+ -	unsigned int		len,
+ -	unsigned int		flags,
+ -	int			pass)
+ +xlog_recover_unmount_trans(
+ +	struct xlog		*log)
+  {
+++<<<<<<< HEAD
+ +	/* Do nothing now */
+ +	xfs_warn(log->l_mp, "%s: Unmount LR", __func__);
+ +	return 0;
+++=======
++ 	int			error = 0;
++ 	bool			freeit = false;
++ 
++ 	/* mask off ophdr transaction container flags */
++ 	flags &= ~XLOG_END_TRANS;
++ 	if (flags & XLOG_WAS_CONT_TRANS)
++ 		flags &= ~XLOG_CONTINUE_TRANS;
++ 
++ 	/*
++ 	 * Callees must not free the trans structure. We'll decide if we need to
++ 	 * free it or not based on the operation being done and it's result.
++ 	 */
++ 	switch (flags) {
++ 	/* expected flag values */
++ 	case 0:
++ 	case XLOG_CONTINUE_TRANS:
++ 		error = xlog_recover_add_to_trans(log, trans, dp, len);
++ 		break;
++ 	case XLOG_WAS_CONT_TRANS:
++ 		error = xlog_recover_add_to_cont_trans(log, trans, dp, len);
++ 		break;
++ 	case XLOG_COMMIT_TRANS:
++ 		error = xlog_recover_commit_trans(log, trans, pass);
++ 		/* success or fail, we are now done with this transaction. */
++ 		freeit = true;
++ 		break;
++ 
++ 	/* unexpected flag values */
++ 	case XLOG_UNMOUNT_TRANS:
++ 		/* just skip trans */
++ 		xfs_warn(log->l_mp, "%s: Unmount LR", __func__);
++ 		freeit = true;
++ 		break;
++ 	case XLOG_START_TRANS:
++ 	default:
++ 		xfs_warn(log->l_mp, "%s: bad flag 0x%x", __func__, flags);
++ 		ASSERT(0);
++ 		error = -EIO;
++ 		break;
++ 	}
++ 	if (error || freeit)
++ 		xlog_recover_free_trans(trans);
++ 	return error;
++ }
++ 
++ STATIC struct xlog_recover *
++ xlog_recover_ophdr_to_trans(
++ 	struct hlist_head	rhash[],
++ 	struct xlog_rec_header	*rhead,
++ 	struct xlog_op_header	*ohead)
++ {
++ 	struct xlog_recover	*trans;
++ 	xlog_tid_t		tid;
++ 	struct hlist_head	*rhp;
++ 
++ 	tid = be32_to_cpu(ohead->oh_tid);
++ 	rhp = &rhash[XLOG_RHASH(tid)];
++ 	trans = xlog_recover_find_tid(rhp, tid);
++ 	if (trans)
++ 		return trans;
++ 
++ 	/*
++ 	 * If this is a new transaction, the ophdr only contains the
++ 	 * start record. In that case, the only processing we need to do
++ 	 * on this opheader is allocate a new recovery container to hold
++ 	 * the recovery ops that will follow.
++ 	 */
++ 	if (ohead->oh_flags & XLOG_START_TRANS) {
++ 		ASSERT(be32_to_cpu(ohead->oh_len) == 0);
++ 		xlog_recover_new_tid(rhp, tid, be64_to_cpu(rhead->h_lsn));
++ 	}
++ 	return NULL;
++ }
++ 
++ STATIC int
++ xlog_recover_process_ophdr(
++ 	struct xlog		*log,
++ 	struct hlist_head	rhash[],
++ 	struct xlog_rec_header	*rhead,
++ 	struct xlog_op_header	*ohead,
++ 	xfs_caddr_t		dp,
++ 	xfs_caddr_t		end,
++ 	int			pass)
++ {
++ 	struct xlog_recover	*trans;
++ 	unsigned int		len;
++ 
++ 	/* Do we understand who wrote this op? */
++ 	if (ohead->oh_clientid != XFS_TRANSACTION &&
++ 	    ohead->oh_clientid != XFS_LOG) {
++ 		xfs_warn(log->l_mp, "%s: bad clientid 0x%x",
++ 			__func__, ohead->oh_clientid);
++ 		ASSERT(0);
++ 		return -EIO;
++ 	}
++ 
++ 	/*
++ 	 * Check the ophdr contains all the data it is supposed to contain.
++ 	 */
++ 	len = be32_to_cpu(ohead->oh_len);
++ 	if (dp + len > end) {
++ 		xfs_warn(log->l_mp, "%s: bad length 0x%x", __func__, len);
++ 		WARN_ON(1);
++ 		return -EIO;
++ 	}
++ 
++ 	trans = xlog_recover_ophdr_to_trans(rhash, rhead, ohead);
++ 	if (!trans) {
++ 		/* nothing to do, so skip over this ophdr */
++ 		return 0;
++ 	}
++ 
++ 	return xlog_recovery_process_trans(log, trans, dp, len,
++ 					   ohead->oh_flags, pass);
+++>>>>>>> 88b863db97a1 (xfs: fix double free in xlog_recover_commit_trans)
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_log_recover.c
