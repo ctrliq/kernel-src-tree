@@ -1,0 +1,151 @@
+hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind() (Vitaly Kuznetsov) [1203682]
+Rebuild_FUZZ: 97.10%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit d43e2fe7da320310834467a3fd87a10adb25a221
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d43e2fe7.failed
+
+Since the 2 fucntions can safely run in vmbus_connection.work_queue without
+hang, we don't need to schedule new work items into the per-channel workqueue.
+
+Actally we can even remove the per-channel workqueue now -- we'll do it
+in the next patch.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d43e2fe7da320310834467a3fd87a10adb25a221)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel_mgmt.c
+diff --cc drivers/hv/channel_mgmt.c
+index f9943186ea53,d69864d4a4d7..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -32,12 -32,6 +32,15 @@@
+  
+  #include "hyperv_vmbus.h"
+  
+++<<<<<<< HEAD
+ +struct vmbus_channel_message_table_entry {
+ +	enum vmbus_channel_message_type message_type;
+ +	void (*message_handler)(struct vmbus_channel_message_header *msg);
+ +};
+ +
+ +
+++=======
+++>>>>>>> d43e2fe7da32 (hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind())
+  /**
+   * vmbus_prep_negotiate_resp() - Create default response for Hyper-V Negotiate message
+   * @icmsghdrp: Pointer to msg header structure
+@@@ -338,6 -315,7 +341,10 @@@ static void vmbus_process_offer(struct 
+  			}
+  
+  			newchannel->state = CHANNEL_OPEN_STATE;
+++<<<<<<< HEAD
+++=======
++ 			channel->num_sc++;
+++>>>>>>> d43e2fe7da32 (hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind())
+  			if (channel->sc_creation_callback != NULL)
+  				channel->sc_creation_callback(newchannel);
+  
+@@@ -371,19 -349,28 +378,29 @@@
+  	 * binding which eventually invokes the device driver's AddDevice()
+  	 * method.
+  	 */
+++<<<<<<< HEAD
+ +	ret = vmbus_device_register(newchannel->device_obj);
+ +	if (ret != 0) {
+ +		pr_err("unable to add child device object (relid %d)\n",
+ +			   newchannel->offermsg.child_relid);
+++=======
++ 	if (vmbus_device_register(newchannel->device_obj) != 0) {
++ 		pr_err("unable to add child device object (relid %d)\n",
++ 			newchannel->offermsg.child_relid);
++ 		kfree(newchannel->device_obj);
++ 		goto err_deq_chan;
++ 	}
++ 	return;
+++>>>>>>> d43e2fe7da32 (hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind())
+  
+ -err_deq_chan:
+ -	spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+ -	list_del(&newchannel->listentry);
+ -	spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ -
+ -	if (newchannel->target_cpu != get_cpu()) {
+ -		put_cpu();
+ -		smp_call_function_single(newchannel->target_cpu,
+ -					 percpu_channel_deq, newchannel, true);
+ -	} else {
+ -		percpu_channel_deq(newchannel);
+ -		put_cpu();
+ +		spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+ +		list_del(&newchannel->listentry);
+ +		spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ +		kfree(newchannel->device_obj);
+ +		goto err_free_chan;
+  	}
+ -
+ +out:
+ +	return;
+  err_free_chan:
+  	free_channel(newchannel);
+  }
+@@@ -520,19 -508,35 +537,45 @@@ static void vmbus_onoffer_rescind(struc
+  {
+  	struct vmbus_channel_rescind_offer *rescind;
+  	struct vmbus_channel *channel;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long flags;
++ 	struct device *dev;
+++>>>>>>> d43e2fe7da32 (hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind())
+  
+  	rescind = (struct vmbus_channel_rescind_offer *)hdr;
+  	channel = relid2channel(rescind->child_relid);
+  
+ -	if (channel == NULL) {
+ -		hv_process_channel_removal(NULL, rescind->child_relid);
+ +	if (channel == NULL)
+ +		/* Just return here, no channel found */
+  		return;
+ -	}
+  
+++<<<<<<< HEAD
+ +	channel->rescind = true;
+ +
+ +	/* work is initialized for vmbus_process_rescind_offer() from
+ +	 * vmbus_process_offer() where the channel got created */
+ +	queue_work(channel->controlwq, &channel->work);
+++=======
++ 	spin_lock_irqsave(&channel->lock, flags);
++ 	channel->rescind = true;
++ 	spin_unlock_irqrestore(&channel->lock, flags);
++ 
++ 	if (channel->device_obj) {
++ 		/*
++ 		 * We will have to unregister this device from the
++ 		 * driver core.
++ 		 */
++ 		dev = get_device(&channel->device_obj->device);
++ 		if (dev) {
++ 			vmbus_device_unregister(channel->device_obj);
++ 			put_device(dev);
++ 		}
++ 	} else {
++ 		hv_process_channel_removal(channel,
++ 			channel->offermsg.child_relid);
++ 	}
+++>>>>>>> d43e2fe7da32 (hv: don't schedule new works in vmbus_onoffer()/vmbus_onoffer_rescind())
+  }
+  
+  /*
+* Unmerged path drivers/hv/channel_mgmt.c
