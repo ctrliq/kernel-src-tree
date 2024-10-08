@@ -245,7 +245,6 @@ static inline int snd_register_device(int type, struct snd_card *card, int dev,
 
 int snd_unregister_device(int type, struct snd_card *card, int dev);
 void *snd_lookup_minor_data(unsigned int minor, int type);
-struct device *snd_get_device(int type, struct snd_card *card, int dev);
 
 #ifdef CONFIG_SND_OSSEMUL
 int snd_register_oss_device(int type, struct snd_card *card, int dev,
