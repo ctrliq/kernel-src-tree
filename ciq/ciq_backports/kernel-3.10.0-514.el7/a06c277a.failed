@@ -1,0 +1,312 @@
+xfs: DIO writes within EOF don't need an ioend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit a06c277a13c3620c8ee9304891758f2fcff9c4a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a06c277a.failed
+
+DIO writes that lie entirely within EOF have nothing to do in IO
+completion. In this case, we don't need no steekin' ioend, and so we
+can avoid allocating an ioend until we have a mapping that spans
+EOF.
+
+This means that IO completion has two contexts - deferred completion
+to the dio workqueue that uses an ioend, and interrupt completion
+that does nothing because there is nothing that can be done in this
+context.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit a06c277a13c3620c8ee9304891758f2fcff9c4a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/xfs_aops.c
+index bb6024910e57,c02a47453137..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1260,6 -1233,117 +1260,120 @@@ xfs_vm_releasepage
+  	return try_to_free_buffers(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * When we map a DIO buffer, we may need to attach an ioend that describes the
++  * type of write IO we are doing. This passes to the completion function the
++  * operations it needs to perform. If the mapping is for an overwrite wholly
++  * within the EOF then we don't need an ioend and so we don't allocate one.
++  * This avoids the unnecessary overhead of allocating and freeing ioends for
++  * workloads that don't require transactions on IO completion.
++  *
++  * If we get multiple mappings in a single IO, we might be mapping different
++  * types. But because the direct IO can only have a single private pointer, we
++  * need to ensure that:
++  *
++  * a) i) the ioend spans the entire region of unwritten mappings; or
++  *    ii) the ioend spans all the mappings that cross or are beyond EOF; and
++  * b) if it contains unwritten extents, it is *permanently* marked as such
++  *
++  * We could do this by chaining ioends like buffered IO does, but we only
++  * actually get one IO completion callback from the direct IO, and that spans
++  * the entire IO regardless of how many mappings and IOs are needed to complete
++  * the DIO. There is only going to be one reference to the ioend and its life
++  * cycle is constrained by the DIO completion code. hence we don't need
++  * reference counting here.
++  */
++ static void
++ xfs_map_direct(
++ 	struct inode		*inode,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset)
++ {
++ 	struct xfs_ioend	*ioend;
++ 	xfs_off_t		size = bh_result->b_size;
++ 	int			type;
++ 
++ 	if (ISUNWRITTEN(imap))
++ 		type = XFS_IO_UNWRITTEN;
++ 	else
++ 		type = XFS_IO_OVERWRITE;
++ 
++ 	trace_xfs_gbmap_direct(XFS_I(inode), offset, size, type, imap);
++ 
++ 	if (bh_result->b_private) {
++ 		ioend = bh_result->b_private;
++ 		ASSERT(ioend->io_size > 0);
++ 		ASSERT(offset >= ioend->io_offset);
++ 		if (offset + size > ioend->io_offset + ioend->io_size)
++ 			ioend->io_size = offset - ioend->io_offset + size;
++ 
++ 		if (type == XFS_IO_UNWRITTEN && type != ioend->io_type)
++ 			ioend->io_type = XFS_IO_UNWRITTEN;
++ 
++ 		trace_xfs_gbmap_direct_update(XFS_I(inode), ioend->io_offset,
++ 					      ioend->io_size, ioend->io_type,
++ 					      imap);
++ 	} else if (type == XFS_IO_UNWRITTEN ||
++ 		   offset + size > i_size_read(inode)) {
++ 		ioend = xfs_alloc_ioend(inode, type);
++ 		ioend->io_offset = offset;
++ 		ioend->io_size = size;
++ 
++ 		bh_result->b_private = ioend;
++ 		set_buffer_defer_completion(bh_result);
++ 
++ 		trace_xfs_gbmap_direct_new(XFS_I(inode), offset, size, type,
++ 					   imap);
++ 	} else {
++ 		trace_xfs_gbmap_direct_none(XFS_I(inode), offset, size, type,
++ 					    imap);
++ 	}
++ }
++ 
++ /*
++  * If this is O_DIRECT or the mpage code calling tell them how large the mapping
++  * is, so that we can avoid repeated get_blocks calls.
++  *
++  * If the mapping spans EOF, then we have to break the mapping up as the mapping
++  * for blocks beyond EOF must be marked new so that sub block regions can be
++  * correctly zeroed. We can't do this for mappings within EOF unless the mapping
++  * was just allocated or is unwritten, otherwise the callers would overwrite
++  * existing data with zeros. Hence we have to split the mapping into a range up
++  * to and including EOF, and a second mapping for beyond EOF.
++  */
++ static void
++ xfs_map_trim_size(
++ 	struct inode		*inode,
++ 	sector_t		iblock,
++ 	struct buffer_head	*bh_result,
++ 	struct xfs_bmbt_irec	*imap,
++ 	xfs_off_t		offset,
++ 	ssize_t			size)
++ {
++ 	xfs_off_t		mapping_size;
++ 
++ 	mapping_size = imap->br_startoff + imap->br_blockcount - iblock;
++ 	mapping_size <<= inode->i_blkbits;
++ 
++ 	ASSERT(mapping_size > 0);
++ 	if (mapping_size > size)
++ 		mapping_size = size;
++ 	if (offset < i_size_read(inode) &&
++ 	    offset + mapping_size >= i_size_read(inode)) {
++ 		/* limit mapping to block that spans EOF */
++ 		mapping_size = roundup_64(i_size_read(inode) - offset,
++ 					  1 << inode->i_blkbits);
++ 	}
++ 	if (mapping_size > LONG_MAX)
++ 		mapping_size = LONG_MAX;
++ 
++ 	bh_result->b_size = mapping_size;
++ }
++ 
+++>>>>>>> a06c277a13c3 (xfs: DIO writes within EOF don't need an ioend)
+  STATIC int
+  __xfs_get_blocks(
+  	struct inode		*inode,
+@@@ -1466,63 -1525,80 +1580,126 @@@ xfs_get_blocks_direct
+  /*
+   * Complete a direct I/O write request.
+   *
+++<<<<<<< HEAD
+ + * If the private argument is non-NULL __xfs_get_blocks signals us that we
+ + * need to issue a transaction to convert the range from unwritten to written
+ + * extents.  In case this is regular synchronous I/O we just call xfs_end_io
+ + * to do this and we are done.  But in case this was a successful AIO
+ + * request this handler is called from interrupt context, from which we
+ + * can't start transactions.  In that case offload the I/O completion to
+ + * the workqueues we also use for buffered I/O completion.
+++=======
++  * The ioend structure is passed from __xfs_get_blocks() to tell us what to do.
++  * If no ioend exists (i.e. @private == NULL) then the write IO is an overwrite
++  * wholly within the EOF and so there is nothing for us to do. Note that in this
++  * case the completion can be called in interrupt context, whereas if we have an
++  * ioend we will always be called in task context (i.e. from a workqueue).
+++>>>>>>> a06c277a13c3 (xfs: DIO writes within EOF don't need an ioend)
+   */
+  STATIC void
+  xfs_end_io_direct_write(
+  	struct kiocb		*iocb,
+  	loff_t			offset,
+  	ssize_t			size,
+ -	void			*private)
+ +	void			*private,
+ +	int			ret,
+ +	bool			is_async)
+  {
+++<<<<<<< HEAD
+ +	struct xfs_ioend	*ioend = iocb->private;
+ +	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+ +	unsigned long		flags;
+ +
+ +	/*
+ +	 * While the generic direct I/O code updates the inode size, it does
+ +	 * so only after the end_io handler is called, which means our
+ +	 * end_io handler thinks the on-disk size is outside the in-core
+ +	 * size.  To prevent this just update it a little bit earlier here.
+ +	 *
+ +	 * We need to lock the test/set EOF update as we can be racing with
+ +	 * other IO completions here to update the EOF. Failing to serialise
+ +	 * here can result in EOF moving backwards and Bad Things Happen when
+ +	 * that occurs.
+ +	 */
+ +	spin_lock_irqsave(&ip->i_size_lock, flags);
+ +	if (offset + size > i_size_read(ioend->io_inode))
+ +		i_size_write(ioend->io_inode, offset + size);
+ +	spin_unlock_irqrestore(&ip->i_size_lock, flags);
+++=======
++ 	struct inode		*inode = file_inode(iocb->ki_filp);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_ioend	*ioend = private;
++ 
++ 	trace_xfs_gbmap_direct_endio(ip, offset, size,
++ 				     ioend ? ioend->io_type : 0, NULL);
++ 
++ 	if (!ioend) {
++ 		ASSERT(offset + size <= i_size_read(inode));
++ 		return;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		goto out_end_io;
++ 
++ 	/*
++ 	 * dio completion end_io functions are only called on writes if more
++ 	 * than 0 bytes was written.
++ 	 */
++ 	ASSERT(size > 0);
++ 
++ 	/*
++ 	 * The ioend only maps whole blocks, while the IO may be sector aligned.
++ 	 * Hence the ioend offset/size may not match the IO offset/size exactly.
++ 	 * Because we don't map overwrites within EOF into the ioend, the offset
++ 	 * may not match, but only if the endio spans EOF.  Either way, write
++ 	 * the IO sizes into the ioend so that completion processing does the
++ 	 * right thing.
++ 	 */
++ 	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
++ 	ioend->io_size = size;
++ 	ioend->io_offset = offset;
++ 
++ 	/*
++ 	 * The ioend tells us whether we are doing unwritten extent conversion
++ 	 * or an append transaction that updates the on-disk file size. These
++ 	 * cases are the only cases where we should *potentially* be needing
++ 	 * to update the VFS inode size.
++ 	 *
++ 	 * We need to update the in-core inode size here so that we don't end up
++ 	 * with the on-disk inode size being outside the in-core inode size. We
++ 	 * have no other method of updating EOF for AIO, so always do it here
++ 	 * if necessary.
++ 	 */
++ 	if (offset + size > i_size_read(inode))
++ 		i_size_write(inode, offset + size);
+++>>>>>>> a06c277a13c3 (xfs: DIO writes within EOF don't need an ioend)
+  
+  	/*
+ -	 * If we are doing an append IO that needs to update the EOF on disk,
+ -	 * do the transaction reserve now so we can use common end io
+ -	 * processing. Stashing the error (if there is one) in the ioend will
+ -	 * result in the ioend processing passing on the error if it is
+ -	 * possible as we can't return it from here.
+ +	 * blockdev_direct_IO can return an error even after the I/O
+ +	 * completion handler was called.  Thus we need to protect
+ +	 * against double-freeing.
+  	 */
+++<<<<<<< HEAD
+ +	iocb->private = NULL;
+++=======
++ 	if (ioend->io_type == XFS_IO_OVERWRITE)
++ 		ioend->io_error = xfs_setfilesize_trans_alloc(ioend);
+++>>>>>>> a06c277a13c3 (xfs: DIO writes within EOF don't need an ioend)
+  
+ -out_end_io:
+ -	xfs_end_io(&ioend->io_work);
+ -	return;
+ +	ioend->io_offset = offset;
+ +	ioend->io_size = size;
+ +	ioend->io_iocb = iocb;
+ +	ioend->io_result = ret;
+ +	if (private && size > 0)
+ +		ioend->io_type = XFS_IO_UNWRITTEN;
+ +
+ +	if (is_async) {
+ +		ioend->io_isasync = 1;
+ +		xfs_finish_ioend(ioend);
+ +	} else {
+ +		xfs_finish_ioend_sync(ioend);
+ +	}
+  }
+  
+  STATIC ssize_t
+diff --cc fs/xfs/xfs_trace.h
+index 1cc33065983c,4e0a5773eee4..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -1221,6 -1217,11 +1221,14 @@@ DEFINE_IOMAP_EVENT(xfs_map_blocks_found
+  DEFINE_IOMAP_EVENT(xfs_map_blocks_alloc);
+  DEFINE_IOMAP_EVENT(xfs_get_blocks_found);
+  DEFINE_IOMAP_EVENT(xfs_get_blocks_alloc);
+++<<<<<<< HEAD
+++=======
++ DEFINE_IOMAP_EVENT(xfs_gbmap_direct);
++ DEFINE_IOMAP_EVENT(xfs_gbmap_direct_new);
++ DEFINE_IOMAP_EVENT(xfs_gbmap_direct_update);
++ DEFINE_IOMAP_EVENT(xfs_gbmap_direct_none);
++ DEFINE_IOMAP_EVENT(xfs_gbmap_direct_endio);
+++>>>>>>> a06c277a13c3 (xfs: DIO writes within EOF don't need an ioend)
+  
+  DECLARE_EVENT_CLASS(xfs_simple_io_class,
+  	TP_PROTO(struct xfs_inode *ip, xfs_off_t offset, ssize_t count),
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_trace.h
