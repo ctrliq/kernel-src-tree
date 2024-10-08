@@ -1,0 +1,460 @@
+blk-mq: use sparser tag layout for lower queue depth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 59d13bf5f57ded658c872fa22276f75ab8f12841
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/59d13bf5.failed
+
+For best performance, spreading tags over multiple cachelines
+makes the tagging more efficient on multicore systems. But since
+we have 8 * sizeof(unsigned long) tags per cacheline, we don't
+always get a nice spread.
+
+Attempt to spread the tags over at least 4 cachelines, using fewer
+number of bits per unsigned long if we have to. This improves
+tagging performance in setups with 32-128 tags. For higher depths,
+the spread is the same as before (BITS_PER_LONG tags per cacheline).
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 59d13bf5f57ded658c872fa22276f75ab8f12841)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+diff --cc block/blk-mq-tag.c
+index 83ae96c51a27,6c78c08865e3..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -28,11 -34,145 +28,147 @@@ void blk_mq_wait_for_tags(struct blk_mq
+  
+  bool blk_mq_has_free_tags(struct blk_mq_tags *tags)
+  {
+ -	if (!tags)
+ -		return true;
+ -
+ -	return bt_has_free_tags(&tags->bitmap_tags);
+ +	return !tags ||
+ +		percpu_ida_free_tags(&tags->free_tags, nr_cpu_ids) != 0;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp)
+++=======
++ static int __bt_get_word(struct blk_mq_bitmap *bm, unsigned int last_tag)
++ {
++ 	int tag, org_last_tag, end;
++ 
++ 	org_last_tag = last_tag;
++ 	end = bm->depth;
++ 	do {
++ restart:
++ 		tag = find_next_zero_bit(&bm->word, end, last_tag);
++ 		if (unlikely(tag >= end)) {
++ 			/*
++ 			 * We started with an offset, start from 0 to
++ 			 * exhaust the map.
++ 			 */
++ 			if (org_last_tag && last_tag) {
++ 				end = last_tag;
++ 				last_tag = 0;
++ 				goto restart;
++ 			}
++ 			return -1;
++ 		}
++ 		last_tag = tag + 1;
++ 	} while (test_and_set_bit_lock(tag, &bm->word));
++ 
++ 	return tag;
++ }
++ 
++ /*
++  * Straight forward bitmap tag implementation, where each bit is a tag
++  * (cleared == free, and set == busy). The small twist is using per-cpu
++  * last_tag caches, which blk-mq stores in the blk_mq_ctx software queue
++  * contexts. This enables us to drastically limit the space searched,
++  * without dirtying an extra shared cacheline like we would if we stored
++  * the cache value inside the shared blk_mq_bitmap_tags structure. On top
++  * of that, each word of tags is in a separate cacheline. This means that
++  * multiple users will tend to stick to different cachelines, at least
++  * until the map is exhausted.
++  */
++ static int __bt_get(struct blk_mq_bitmap_tags *bt, unsigned int *tag_cache)
++ {
++ 	unsigned int last_tag, org_last_tag;
++ 	int index, i, tag;
++ 
++ 	last_tag = org_last_tag = *tag_cache;
++ 	index = TAG_TO_INDEX(bt, last_tag);
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		tag = __bt_get_word(&bt->map[index], TAG_TO_BIT(bt, last_tag));
++ 		if (tag != -1) {
++ 			tag += (index << bt->bits_per_word);
++ 			goto done;
++ 		}
++ 
++ 		last_tag = 0;
++ 		if (++index >= bt->map_nr)
++ 			index = 0;
++ 	}
++ 
++ 	*tag_cache = 0;
++ 	return -1;
++ 
++ 	/*
++ 	 * Only update the cache from the allocation path, if we ended
++ 	 * up using the specific cached tag.
++ 	 */
++ done:
++ 	if (tag == org_last_tag) {
++ 		last_tag = tag + 1;
++ 		if (last_tag >= bt->depth - 1)
++ 			last_tag = 0;
++ 
++ 		*tag_cache = last_tag;
++ 	}
++ 
++ 	return tag;
++ }
++ 
++ static inline void bt_index_inc(unsigned int *index)
++ {
++ 	*index = (*index + 1) & (BT_WAIT_QUEUES - 1);
++ }
++ 
++ static struct bt_wait_state *bt_wait_ptr(struct blk_mq_bitmap_tags *bt,
++ 					 struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct bt_wait_state *bs;
++ 
++ 	if (!hctx)
++ 		return &bt->bs[0];
++ 
++ 	bs = &bt->bs[hctx->wait_index];
++ 	bt_index_inc(&hctx->wait_index);
++ 	return bs;
++ }
++ 
++ static int bt_get(struct blk_mq_bitmap_tags *bt, struct blk_mq_hw_ctx *hctx,
++ 		  unsigned int *last_tag, gfp_t gfp)
++ {
++ 	struct bt_wait_state *bs;
++ 	DEFINE_WAIT(wait);
++ 	int tag;
++ 
++ 	tag = __bt_get(bt, last_tag);
++ 	if (tag != -1)
++ 		return tag;
++ 
++ 	if (!(gfp & __GFP_WAIT))
++ 		return -1;
++ 
++ 	bs = bt_wait_ptr(bt, hctx);
++ 	do {
++ 		bool was_empty;
++ 
++ 		was_empty = list_empty(&wait.task_list);
++ 		prepare_to_wait(&bs->wait, &wait, TASK_UNINTERRUPTIBLE);
++ 
++ 		tag = __bt_get(bt, last_tag);
++ 		if (tag != -1)
++ 			break;
++ 
++ 		if (was_empty)
++ 			atomic_set(&bs->wait_cnt, bt->wake_cnt);
++ 
++ 		io_schedule();
++ 	} while (1);
++ 
++ 	finish_wait(&bs->wait, &wait);
++ 	return tag;
++ }
++ 
++ static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags,
++ 				     struct blk_mq_hw_ctx *hctx,
++ 				     unsigned int *last_tag, gfp_t gfp)
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  {
+  	int tag;
+  
+@@@ -68,6 -210,43 +204,46 @@@ unsigned int blk_mq_get_tag(struct blk_
+  	return __blk_mq_get_reserved_tag(tags, gfp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct bt_wait_state *bt_wake_ptr(struct blk_mq_bitmap_tags *bt)
++ {
++ 	int i, wake_index;
++ 
++ 	wake_index = bt->wake_index;
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++) {
++ 		struct bt_wait_state *bs = &bt->bs[wake_index];
++ 
++ 		if (waitqueue_active(&bs->wait)) {
++ 			if (wake_index != bt->wake_index)
++ 				bt->wake_index = wake_index;
++ 
++ 			return bs;
++ 		}
++ 
++ 		bt_index_inc(&wake_index);
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
++ {
++ 	const int index = TAG_TO_INDEX(bt, tag);
++ 	struct bt_wait_state *bs;
++ 
++ 	clear_bit(TAG_TO_BIT(bt, tag), &bt->map[index].word);
++ 
++ 	bs = bt_wake_ptr(bt);
++ 	if (bs && atomic_dec_and_test(&bs->wait_cnt)) {
++ 		smp_mb__after_clear_bit();
++ 		atomic_set(&bs->wait_cnt, bt->wake_cnt);
++ 		bt_index_inc(&bt->wake_index);
++ 		wake_up(&bs->wait);
++ 	}
++ }
++ 
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  static void __blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag)
+  {
+  	BUG_ON(tag >= tags->nr_tags);
+@@@ -91,11 -274,26 +267,31 @@@ void blk_mq_put_tag(struct blk_mq_tags 
+  		__blk_mq_put_reserved_tag(tags, tag);
+  }
+  
+ -static void bt_for_each_free(struct blk_mq_bitmap_tags *bt,
+ -			     unsigned long *free_map, unsigned int off)
+ +static int __blk_mq_tag_iter(unsigned id, void *data)
+  {
+++<<<<<<< HEAD
+ +	unsigned long *tag_map = data;
+ +	__set_bit(id, tag_map);
+ +	return 0;
+++=======
++ 	int i;
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		struct blk_mq_bitmap *bm = &bt->map[i];
++ 		int bit = 0;
++ 
++ 		do {
++ 			bit = find_next_zero_bit(&bm->word, bm->depth, bit);
++ 			if (bit >= bm->depth)
++ 				break;
++ 
++ 			__set_bit(bit + off, free_map);
++ 			bit++;
++ 		} while (1);
++ 
++ 		off += (1 << bt->bits_per_word);
++ 	}
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  }
+  
+  void blk_mq_tag_busy_iter(struct blk_mq_tags *tags,
+@@@ -118,6 -315,102 +314,105 @@@
+  	kfree(tag_map);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int bt_unused_tags(struct blk_mq_bitmap_tags *bt)
++ {
++ 	unsigned int i, used;
++ 
++ 	for (i = 0, used = 0; i < bt->map_nr; i++) {
++ 		struct blk_mq_bitmap *bm = &bt->map[i];
++ 
++ 		used += bitmap_weight(&bm->word, bm->depth);
++ 	}
++ 
++ 	return bt->depth - used;
++ }
++ 
++ static int bt_alloc(struct blk_mq_bitmap_tags *bt, unsigned int depth,
++ 			int node, bool reserved)
++ {
++ 	int i;
++ 
++ 	bt->bits_per_word = ilog2(BITS_PER_LONG);
++ 
++ 	/*
++ 	 * Depth can be zero for reserved tags, that's not a failure
++ 	 * condition.
++ 	 */
++ 	if (depth) {
++ 		unsigned int nr, i, map_depth, tags_per_word;
++ 
++ 		tags_per_word = (1 << bt->bits_per_word);
++ 
++ 		/*
++ 		 * If the tag space is small, shrink the number of tags
++ 		 * per word so we spread over a few cachelines, at least.
++ 		 * If less than 4 tags, just forget about it, it's not
++ 		 * going to work optimally anyway.
++ 		 */
++ 		if (depth >= 4) {
++ 			while (tags_per_word * 4 > depth) {
++ 				bt->bits_per_word--;
++ 				tags_per_word = (1 << bt->bits_per_word);
++ 			}
++ 		}
++ 
++ 		nr = ALIGN(depth, tags_per_word) / tags_per_word;
++ 		bt->map = kzalloc_node(nr * sizeof(struct blk_mq_bitmap),
++ 						GFP_KERNEL, node);
++ 		if (!bt->map)
++ 			return -ENOMEM;
++ 
++ 		bt->map_nr = nr;
++ 		map_depth = depth;
++ 		for (i = 0; i < nr; i++) {
++ 			bt->map[i].depth = min(map_depth, tags_per_word);
++ 			map_depth -= tags_per_word;
++ 		}
++ 	}
++ 
++ 	bt->bs = kzalloc(BT_WAIT_QUEUES * sizeof(*bt->bs), GFP_KERNEL);
++ 	if (!bt->bs) {
++ 		kfree(bt->map);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < BT_WAIT_QUEUES; i++)
++ 		init_waitqueue_head(&bt->bs[i].wait);
++ 
++ 	bt->wake_cnt = BT_WAIT_BATCH;
++ 	if (bt->wake_cnt > depth / 4)
++ 		bt->wake_cnt = max(1U, depth / 4);
++ 
++ 	bt->depth = depth;
++ 	return 0;
++ }
++ 
++ static void bt_free(struct blk_mq_bitmap_tags *bt)
++ {
++ 	kfree(bt->map);
++ 	kfree(bt->bs);
++ }
++ 
++ static struct blk_mq_tags *blk_mq_init_bitmap_tags(struct blk_mq_tags *tags,
++ 						   int node)
++ {
++ 	unsigned int depth = tags->nr_tags - tags->nr_reserved_tags;
++ 
++ 	if (bt_alloc(&tags->bitmap_tags, depth, node, false))
++ 		goto enomem;
++ 	if (bt_alloc(&tags->breserved_tags, tags->nr_reserved_tags, node, true))
++ 		goto enomem;
++ 
++ 	return tags;
++ enomem:
++ 	bt_free(&tags->bitmap_tags);
++ 	kfree(tags);
++ 	return NULL;
++ }
++ 
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  struct blk_mq_tags *blk_mq_init_tags(unsigned int total_tags,
+  				     unsigned int reserved_tags, int node)
+  {
+@@@ -189,18 -460,15 +484,25 @@@ ssize_t blk_mq_tag_sysfs_show(struct bl
+  	if (!tags)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	page += sprintf(page, "nr_tags=%u, reserved_tags=%u, batch_move=%u,"
+ +			" max_cache=%u\n", tags->nr_tags, tags->nr_reserved_tags,
+ +			tags->nr_batch_move, tags->nr_max_cache);
+++=======
++ 	page += sprintf(page, "nr_tags=%u, reserved_tags=%u, "
++ 			"bits_per_word=%u\n",
++ 			tags->nr_tags, tags->nr_reserved_tags,
++ 			tags->bitmap_tags.bits_per_word);
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  
+ -	free = bt_unused_tags(&tags->bitmap_tags);
+ -	res = bt_unused_tags(&tags->breserved_tags);
+ +	page += sprintf(page, "nr_free=%u, nr_reserved=%u\n",
+ +			percpu_ida_free_tags(&tags->free_tags, nr_cpu_ids),
+ +			percpu_ida_free_tags(&tags->reserved_tags, nr_cpu_ids));
+  
+ -	page += sprintf(page, "nr_free=%u, nr_reserved=%u\n", free, res);
+ +	for_each_possible_cpu(cpu) {
+ +		page += sprintf(page, "  cpu%02u: nr_free=%u\n", cpu,
+ +				percpu_ida_free_tags(&tags->free_tags, cpu));
+ +	}
+  
+  	return page - orig_page;
+  }
+diff --cc block/blk-mq-tag.h
+index 947ba2c6148e,7aa9f0665489..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -1,7 -1,50 +1,54 @@@
+  #ifndef INT_BLK_MQ_TAG_H
+  #define INT_BLK_MQ_TAG_H
+  
+++<<<<<<< HEAD
+ +struct blk_mq_tags;
+++=======
++ enum {
++ 	BT_WAIT_QUEUES	= 8,
++ 	BT_WAIT_BATCH	= 8,
++ };
++ 
++ struct bt_wait_state {
++ 	atomic_t wait_cnt;
++ 	wait_queue_head_t wait;
++ } ____cacheline_aligned_in_smp;
++ 
++ #define TAG_TO_INDEX(bt, tag)	((tag) >> (bt)->bits_per_word)
++ #define TAG_TO_BIT(bt, tag)	((tag) & ((1 << (bt)->bits_per_word) - 1))
++ 
++ struct blk_mq_bitmap {
++ 	unsigned long word;
++ 	unsigned long depth;
++ } ____cacheline_aligned_in_smp;
++ 
++ struct blk_mq_bitmap_tags {
++ 	unsigned int depth;
++ 	unsigned int wake_cnt;
++ 	unsigned int bits_per_word;
++ 
++ 	unsigned int map_nr;
++ 	struct blk_mq_bitmap *map;
++ 
++ 	unsigned int wake_index;
++ 	struct bt_wait_state *bs;
++ };
++ 
++ /*
++  * Tag address space map.
++  */
++ struct blk_mq_tags {
++ 	unsigned int nr_tags;
++ 	unsigned int nr_reserved_tags;
++ 
++ 	struct blk_mq_bitmap_tags bitmap_tags;
++ 	struct blk_mq_bitmap_tags breserved_tags;
++ 
++ 	struct request **rqs;
++ 	struct list_head page_list;
++ };
++ 
+++>>>>>>> 59d13bf5f57d (blk-mq: use sparser tag layout for lower queue depth)
+  
+  extern struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags, unsigned int reserved_tags, int node);
+  extern void blk_mq_free_tags(struct blk_mq_tags *tags);
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
