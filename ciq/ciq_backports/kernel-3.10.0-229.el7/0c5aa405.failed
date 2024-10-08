@@ -1,0 +1,194 @@
+cpufreq: resume drivers before enabling governors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] resume drivers before enabling governors (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 89.89%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 0c5aa405a9437d97e09ec289d4f29bb62e0f01b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0c5aa405.failed
+
+During suspend, we first stop governors and then suspend cpufreq drivers and
+resume must be exactly opposite of that. i.e. resume drivers first and then
+start governors.
+
+But the current code in resume enables governors first and then resume drivers.
+Fix it be changing code sequence there.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 0c5aa405a9437d97e09ec289d4f29bb62e0f01b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index c8bc717e8458,d8d6bc9d1815..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1409,83 -1572,103 +1409,124 @@@ static struct subsys_interface cpufreq_
+  	.remove_dev	= cpufreq_remove_dev,
+  };
+  
+ -/*
+ - * In case platform wants some specific frequency to be configured
+ - * during suspend..
+ +/**
+ + * cpufreq_bp_suspend - Prepare the boot CPU for system suspend.
+ + *
+ + * This function is only executed for the boot processor.  The other CPUs
+ + * have been put offline by means of CPU hotplug.
+   */
+ -int cpufreq_generic_suspend(struct cpufreq_policy *policy)
+ +static int cpufreq_bp_suspend(void)
+  {
+ -	int ret;
+ +	int ret = 0;
+  
+ -	if (!policy->suspend_freq) {
+ -		pr_err("%s: suspend_freq can't be zero\n", __func__);
+ -		return -EINVAL;
+ -	}
+ +	int cpu = smp_processor_id();
+ +	struct cpufreq_policy *cpu_policy;
+  
+ -	pr_debug("%s: Setting suspend-freq: %u\n", __func__,
+ -			policy->suspend_freq);
+ +	pr_debug("suspending cpu %u\n", cpu);
+  
+ -	ret = __cpufreq_driver_target(policy, policy->suspend_freq,
+ -			CPUFREQ_RELATION_H);
+ -	if (ret)
+ -		pr_err("%s: unable to set suspend-freq: %u. err: %d\n",
+ -				__func__, policy->suspend_freq, ret);
+ +	/* If there's no policy for the boot CPU, we have nothing to do. */
+ +	cpu_policy = cpufreq_cpu_get(cpu);
+ +	if (!cpu_policy)
+ +		return 0;
+  
+ +	if (cpufreq_driver->suspend) {
+ +		ret = cpufreq_driver->suspend(cpu_policy);
+ +		if (ret)
+ +			printk(KERN_ERR "cpufreq: suspend failed in ->suspend "
+ +					"step on CPU %u\n", cpu_policy->cpu);
+ +	}
+ +
+ +	cpufreq_cpu_put(cpu_policy);
+  	return ret;
+  }
+ -EXPORT_SYMBOL(cpufreq_generic_suspend);
+  
+  /**
+ - * cpufreq_suspend() - Suspend CPUFreq governors
+ + * cpufreq_bp_resume - Restore proper frequency handling of the boot CPU.
+   *
+ - * Called during system wide Suspend/Hibernate cycles for suspending governors
+ - * as some platforms can't change frequency after this point in suspend cycle.
+ - * Because some of the devices (like: i2c, regulators, etc) they use for
+ - * changing frequency are suspended quickly after this point.
+ + *	1.) resume CPUfreq hardware support (cpufreq_driver->resume())
+ + *	2.) schedule call cpufreq_update_policy() ASAP as interrupts are
+ + *	    restored. It will verify that the current freq is in sync with
+ + *	    what we believe it to be. This is a bit later than when it
+ + *	    should be, but nonethteless it's better than calling
+ + *	    cpufreq_driver->get() here which might re-enable interrupts...
+ + *
+ + * This function is only executed for the boot CPU.  The other CPUs have not
+ + * been turned on yet.
+   */
+ -void cpufreq_suspend(void)
+ +static void cpufreq_bp_resume(void)
+  {
+ -	struct cpufreq_policy *policy;
+ +	int ret = 0;
+  
+ -	if (!cpufreq_driver)
+ -		return;
+ +	int cpu = smp_processor_id();
+ +	struct cpufreq_policy *cpu_policy;
+  
+ -	if (!has_target())
+ -		return;
+ +	pr_debug("resuming cpu %u\n", cpu);
+  
+ -	pr_debug("%s: Suspending Governors\n", __func__);
+ +	/* If there's no policy for the boot CPU, we have nothing to do. */
+ +	cpu_policy = cpufreq_cpu_get(cpu);
+ +	if (!cpu_policy)
+ +		return;
+  
+ -	list_for_each_entry(policy, &cpufreq_policy_list, policy_list) {
+ -		if (__cpufreq_governor(policy, CPUFREQ_GOV_STOP))
+ -			pr_err("%s: Failed to stop governor for policy: %p\n",
+ -				__func__, policy);
+ -		else if (cpufreq_driver->suspend
+ -		    && cpufreq_driver->suspend(policy))
+ -			pr_err("%s: Failed to suspend driver: %p\n", __func__,
+ -				policy);
+ +	if (cpufreq_driver->resume) {
+ +		ret = cpufreq_driver->resume(cpu_policy);
+ +		if (ret) {
+ +			printk(KERN_ERR "cpufreq: resume failed in ->resume "
+ +					"step on CPU %u\n", cpu_policy->cpu);
+ +			goto fail;
+ +		}
+  	}
+  
+ -	cpufreq_suspended = true;
+ +	schedule_work(&cpu_policy->update);
+ +
+ +fail:
+ +	cpufreq_cpu_put(cpu_policy);
+  }
+  
+++<<<<<<< HEAD
+ +static struct syscore_ops cpufreq_syscore_ops = {
+ +	.suspend	= cpufreq_bp_suspend,
+ +	.resume		= cpufreq_bp_resume,
+ +};
+++=======
++ /**
++  * cpufreq_resume() - Resume CPUFreq governors
++  *
++  * Called during system wide Suspend/Hibernate cycle for resuming governors that
++  * are suspended with cpufreq_suspend().
++  */
++ void cpufreq_resume(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	if (!cpufreq_driver)
++ 		return;
++ 
++ 	if (!has_target())
++ 		return;
++ 
++ 	pr_debug("%s: Resuming Governors\n", __func__);
++ 
++ 	cpufreq_suspended = false;
++ 
++ 	list_for_each_entry(policy, &cpufreq_policy_list, policy_list) {
++ 		if (cpufreq_driver->resume && cpufreq_driver->resume(policy))
++ 			pr_err("%s: Failed to resume driver: %p\n", __func__,
++ 				policy);
++ 		else if (__cpufreq_governor(policy, CPUFREQ_GOV_START)
++ 		    || __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))
++ 			pr_err("%s: Failed to start governor for policy: %p\n",
++ 				__func__, policy);
++ 
++ 		/*
++ 		 * schedule call cpufreq_update_policy() for boot CPU, i.e. last
++ 		 * policy in list. It will verify that the current freq is in
++ 		 * sync with what we believe it to be.
++ 		 */
++ 		if (list_is_last(&policy->policy_list, &cpufreq_policy_list))
++ 			schedule_work(&policy->update);
++ 	}
++ }
+++>>>>>>> 0c5aa405a943 (cpufreq: resume drivers before enabling governors)
+  
+  /**
+   *	cpufreq_get_current_driver - return current driver's name
+* Unmerged path drivers/cpufreq/cpufreq.c
