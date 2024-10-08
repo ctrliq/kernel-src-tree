@@ -1,0 +1,209 @@
+bridge_netfilter: No ICMP packet on IPv4 fragmentation error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] netfilter: bridge: No ICMP packet on IPv4 fragmentation error (Thadeu Lima de Souza Cascardo) [1274845]
+Rebuild_FUZZ: 87.60%
+commit-author Andy Zhou <azhou@nicira.com>
+commit 49d16b23cd1e61c028ee088c5a64e9ac6a9c6147
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/49d16b23.failed
+
+When bridge netfilter re-fragments an IP packet for output, all
+packets that can not be re-fragmented to their original input size
+should be silently discarded.
+
+However, current bridge netfilter output path generates an ICMP packet
+with 'size exceeded MTU' message for such packets, this is a bug.
+
+This patch refactors the ip_fragment() API to allow two separate
+use cases. The bridge netfilter user case will not
+send ICMP, the routing output will, as before.
+
+	Signed-off-by: Andy Zhou <azhou@nicira.com>
+	Acked-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 49d16b23cd1e61c028ee088c5a64e9ac6a9c6147)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index 6d1f49cc4c25,1d2eb32d8270..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -862,7 -832,46 +862,50 @@@ static unsigned int br_nf_forward_arp(c
+  	return NF_STOLEN;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK_IPV4)
+++=======
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ static int br_nf_push_frag_xmit(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct brnf_frag_data *data;
++ 	int err;
++ 
++ 	data = this_cpu_ptr(&brnf_frag_data_storage);
++ 	err = skb_cow_head(skb, data->size);
++ 
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 
++ 	skb_copy_to_linear_data_offset(skb, -data->size, data->mac, data->size);
++ 	__skb_push(skb, data->encap_size);
++ 
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
++ }
++ 
++ static int br_nf_ip_fragment(struct sock *sk, struct sk_buff *skb,
++ 			     int (*output)(struct sock *, struct sk_buff *))
++ {
++ 	unsigned int mtu = ip_skb_dst_mtu(skb);
++ 	struct iphdr *iph = ip_hdr(skb);
++ 	struct rtable *rt = skb_rtable(skb);
++ 	struct net_device *dev = rt->dst.dev;
++ 
++ 	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
++ 		     (IPCB(skb)->frag_max_size &&
++ 		      IPCB(skb)->frag_max_size > mtu))) {
++ 		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ 
++ 	return ip_do_fragment(sk, skb, output);
++ }
++ 
+++>>>>>>> 49d16b23cd1e (bridge_netfilter: No ICMP packet on IPv4 fragmentation error)
+  static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+  {
+  	int ret;
+@@@ -873,9 -894,22 +916,26 @@@
+  		if (br_parse_ip_options(skb))
+  			/* Drop invalid packet */
+  			return NF_DROP;
+++<<<<<<< HEAD
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+++=======
++ 		IPCB(skb)->frag_max_size = frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		ret = br_nf_ip_fragment(sk, skb, br_nf_push_frag_xmit);
++ 	} else {
++ 		nf_bridge_info_free(skb);
+++>>>>>>> 49d16b23cd1e (bridge_netfilter: No ICMP packet on IPv4 fragmentation error)
+  		ret = br_dev_queue_push_xmit(sk, skb);
+ -	}
+  
+  	return ret;
+  }
+diff --git a/include/net/ip.h b/include/net/ip.h
+index ac68d6939a5b..80cc51f25cea 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -107,8 +107,8 @@ int ip_local_deliver(struct sk_buff *skb);
+ int ip_mr_input(struct sk_buff *skb);
+ int ip_output(struct sock *sk, struct sk_buff *skb);
+ int ip_mc_output(struct sock *sk, struct sk_buff *skb);
+-int ip_fragment(struct sock *sk, struct sk_buff *skb,
+-		int (*output)(struct sock *, struct sk_buff *));
++int ip_do_fragment(struct sock *sk, struct sk_buff *skb,
++		   int (*output)(struct sock *, struct sk_buff *));
+ int ip_do_nat(struct sk_buff *skb);
+ void ip_send_check(struct iphdr *ip);
+ int __ip_local_out(struct sk_buff *skb);
+* Unmerged path net/bridge/br_netfilter.c
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index f60554e30748..00cf90f40d8b 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -83,6 +83,9 @@
+ int sysctl_ip_default_ttl __read_mostly = IPDEFTTL;
+ EXPORT_SYMBOL(sysctl_ip_default_ttl);
+ 
++static int ip_fragment(struct sock *sk, struct sk_buff *skb,
++		       int (*output)(struct sock *, struct sk_buff *));
++
+ /* Generate a checksum for an outgoing IP datagram. */
+ void ip_send_check(struct iphdr *iph)
+ {
+@@ -479,6 +482,28 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
+ 	skb_copy_secmark(to, from);
+ }
+ 
++static int ip_fragment(struct sock *sk, struct sk_buff *skb,
++		       int (*output)(struct sock *, struct sk_buff *))
++{
++	struct iphdr *iph = ip_hdr(skb);
++	unsigned int mtu = ip_skb_dst_mtu(skb);
++
++	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
++		     (IPCB(skb)->frag_max_size &&
++		      IPCB(skb)->frag_max_size > mtu))) {
++		struct rtable *rt = skb_rtable(skb);
++		struct net_device *dev = rt->dst.dev;
++
++		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
++		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
++			  htonl(mtu));
++		kfree_skb(skb);
++		return -EMSGSIZE;
++	}
++
++	return ip_do_fragment(sk, skb, output);
++}
++
+ /*
+  *	This IP datagram is too large to be sent in one piece.  Break it up into
+  *	smaller pieces (each of size equal to IP header plus
+@@ -486,8 +511,8 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
+  *	single device frame, and queue such a frame for sending.
+  */
+ 
+-int ip_fragment(struct sock *sk, struct sk_buff *skb,
+-		int (*output)(struct sock *, struct sk_buff *))
++int ip_do_fragment(struct sock *sk, struct sk_buff *skb,
++		   int (*output)(struct sock *, struct sk_buff *))
+ {
+ 	struct iphdr *iph;
+ 	int ptr;
+@@ -508,15 +533,6 @@ int ip_fragment(struct sock *sk, struct sk_buff *skb,
+ 	iph = ip_hdr(skb);
+ 
+ 	mtu = ip_skb_dst_mtu(skb);
+-	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
+-		     (IPCB(skb)->frag_max_size &&
+-		      IPCB(skb)->frag_max_size > mtu))) {
+-		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+-			  htonl(mtu));
+-		kfree_skb(skb);
+-		return -EMSGSIZE;
+-	}
+ 
+ 	/*
+ 	 *	Setup starting values.
+@@ -757,7 +773,7 @@ fail:
+ 	IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+ 	return err;
+ }
+-EXPORT_SYMBOL(ip_fragment);
++EXPORT_SYMBOL(ip_do_fragment);
+ 
+ int
+ ip_generic_getfrag(void *from, char *to, int offset, int len, int odd, struct sk_buff *skb)
