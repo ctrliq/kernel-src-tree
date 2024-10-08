@@ -1,0 +1,229 @@
+md: split detach operation out from ->stop.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] split detach operation out from ->stop (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 93.83%
+commit-author NeilBrown <neilb@suse.de>
+commit 5aa61f427e4979be733e4847b9199ff9cc48a47e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5aa61f42.failed
+
+Each md personality has a 'stop' operation which does two
+things:
+ 1/ it finalizes some aspects of the array to ensure nothing
+    is accessing the ->private data
+ 2/ it frees the ->private data.
+
+All the steps in '1' can apply to all arrays and so can be
+performed in common code.
+
+This is useful as in the case where we change the personality which
+manages an array (in level_store()), it would be helpful to do
+step 1 early, and step 2 later.
+
+So split the 'step 1' functionality out into a new mddev_detach().
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 5aa61f427e4979be733e4847b9199ff9cc48a47e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/linear.c
+diff --cc drivers/md/linear.c
+index cfa72dcb5f78,c201555b9c6c..000000000000
+--- a/drivers/md/linear.c
++++ b/drivers/md/linear.c
+@@@ -257,20 -251,8 +257,23 @@@ static int linear_add(struct mddev *mdd
+  
+  static int linear_stop (struct mddev *mddev)
+  {
+ -	struct linear_conf *conf = mddev->private;
+ +	struct linear_conf *conf =
+ +		rcu_dereference_protected(mddev->private,
+ +					  lockdep_is_held(
+ +						  &mddev->reconfig_mutex));
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We do not require rcu protection here since
+ +	 * we hold reconfig_mutex for both linear_add and
+ +	 * linear_stop, so they cannot race.
+ +	 * We should make sure any old 'conf's are properly
+ +	 * freed though.
+ +	 */
+ +	rcu_barrier();
+ +	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+++=======
+++>>>>>>> 5aa61f427e49 (md: split detach operation out from ->stop.)
+  	kfree(conf);
+  	mddev->private = NULL;
+  
+* Unmerged path drivers/md/linear.c
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 0227d221c67b..2aa88facefaf 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -74,6 +74,7 @@ static struct workqueue_struct *md_misc_wq;
+ 
+ static int remove_and_add_spares(struct mddev *mddev,
+ 				 struct md_rdev *this);
++static void mddev_detach(struct mddev *mddev);
+ 
+ /*
+  * Default number of read corrections we'll attempt on an rdev
+@@ -3524,6 +3525,7 @@ level_store(struct mddev *mddev, const char *buf, size_t len)
+ 
+ 	/* Looks like we have a winner */
+ 	mddev_suspend(mddev);
++	mddev_detach(mddev);
+ 	mddev->pers->stop(mddev);
+ 	
+ 	if (mddev->pers->sync_request == NULL &&
+@@ -5086,18 +5088,17 @@ int md_run(struct mddev *mddev)
+ 		       (unsigned long long)mddev->array_sectors / 2,
+ 		       (unsigned long long)mddev->pers->size(mddev, 0, 0) / 2);
+ 		err = -EINVAL;
+-		mddev->pers->stop(mddev);
+ 	}
+ 	if (err == 0 && mddev->pers->sync_request &&
+ 	    (mddev->bitmap_info.file || mddev->bitmap_info.offset)) {
+ 		err = bitmap_create(mddev);
+-		if (err) {
++		if (err)
+ 			printk(KERN_ERR "%s: failed to create bitmap (%d)\n",
+ 			       mdname(mddev), err);
+-			mddev->pers->stop(mddev);
+-		}
+ 	}
+ 	if (err) {
++		mddev_detach(mddev);
++		mddev->pers->stop(mddev);
+ 		module_put(mddev->pers->owner);
+ 		mddev->pers = NULL;
+ 		bitmap_destroy(mddev);
+@@ -5270,9 +5271,30 @@ void md_stop_writes(struct mddev *mddev)
+ }
+ EXPORT_SYMBOL_GPL(md_stop_writes);
+ 
++static void mddev_detach(struct mddev *mddev)
++{
++	struct bitmap *bitmap = mddev->bitmap;
++	/* wait for behind writes to complete */
++	if (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
++		printk(KERN_INFO "md:%s: behind writes in progress - waiting to stop.\n",
++		       mdname(mddev));
++		/* need to kick something here to make sure I/O goes? */
++		wait_event(bitmap->behind_wait,
++			   atomic_read(&bitmap->behind_writes) == 0);
++	}
++	if (mddev->pers->quiesce) {
++		mddev->pers->quiesce(mddev, 1);
++		mddev->pers->quiesce(mddev, 0);
++	}
++	md_unregister_thread(&mddev->thread);
++	if (mddev->queue)
++		blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
++}
++
+ static void __md_stop(struct mddev *mddev)
+ {
+ 	mddev->ready = 0;
++	mddev_detach(mddev);
+ 	mddev->pers->stop(mddev);
+ 	if (mddev->pers->sync_request && mddev->to_remove == NULL)
+ 		mddev->to_remove = &md_redundancy_group;
+diff --git a/drivers/md/multipath.c b/drivers/md/multipath.c
+index abf0900675af..5a874eb444af 100644
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -509,8 +509,6 @@ static int multipath_stop (struct mddev *mddev)
+ {
+ 	struct mpconf *conf = mddev->private;
+ 
+-	md_unregister_thread(&mddev->thread);
+-	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+ 	mempool_destroy(conf->pool);
+ 	kfree(conf->multipaths);
+ 	kfree(conf);
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index 633df3e840a6..06b689f82f47 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -478,7 +478,6 @@ static int raid0_stop(struct mddev *mddev)
+ {
+ 	struct r0conf *conf = mddev->private;
+ 
+-	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+ 	kfree(conf->strip_zone);
+ 	kfree(conf->devlist);
+ 	kfree(conf);
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 4178bb7f9cef..6c9b3fe7eb81 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -2953,29 +2953,17 @@ static int run(struct mddev *mddev)
+ 	}
+ 
+ 	ret =  md_integrity_register(mddev);
+-	if (ret)
++	if (ret) {
++		md_unregister_thread(&mddev->thread);
+ 		stop(mddev);
++	}
+ 	return ret;
+ }
+ 
+ static int stop(struct mddev *mddev)
+ {
+ 	struct r1conf *conf = mddev->private;
+-	struct bitmap *bitmap = mddev->bitmap;
+-
+-	/* wait for behind writes to complete */
+-	if (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
+-		printk(KERN_INFO "md/raid1:%s: behind writes in progress - waiting to stop.\n",
+-		       mdname(mddev));
+-		/* need to kick something here to make sure I/O goes? */
+-		wait_event(bitmap->behind_wait,
+-			   atomic_read(&bitmap->behind_writes) == 0);
+-	}
+-
+-	freeze_array(conf, 0);
+-	unfreeze_array(conf);
+ 
+-	md_unregister_thread(&mddev->thread);
+ 	if (conf->r1bio_pool)
+ 		mempool_destroy(conf->r1bio_pool);
+ 	kfree(conf->mirrors);
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 7b666e739d33..d48d25dd2504 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3821,14 +3821,6 @@ static int stop(struct mddev *mddev)
+ {
+ 	struct r10conf *conf = mddev->private;
+ 
+-	raise_barrier(conf, 0);
+-	lower_barrier(conf);
+-
+-	md_unregister_thread(&mddev->thread);
+-	if (mddev->queue)
+-		/* the unplug fn references 'conf'*/
+-		blk_sync_queue(mddev->queue);
+-
+ 	if (conf->r10bio_pool)
+ 		mempool_destroy(conf->r10bio_pool);
+ 	safe_put_page(conf->tmppage);
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 22a4c2e18c39..c25386948cb9 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6254,7 +6254,6 @@ static int stop(struct mddev *mddev)
+ {
+ 	struct r5conf *conf = mddev->private;
+ 
+-	md_unregister_thread(&mddev->thread);
+ 	free_conf(conf);
+ 	mddev->private = NULL;
+ 	mddev->to_remove = &raid5_attrs_group;
