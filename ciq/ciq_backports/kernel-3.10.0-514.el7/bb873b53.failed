@@ -1,0 +1,1195 @@
+libceph: switch to calc_target(), part 2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit bb873b539154ab51893430b4ad6ba4051775276a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bb873b53.failed
+
+The crux of this is getting rid of ceph_osdc_build_request(), so that
+MOSDOp can be encoded not before but after calc_target() calculates the
+actual target.  Encoding now happens within ceph_osdc_start_request().
+
+Also nuked is the accompanying bunch of pointers into the encoded
+buffer that was used to update fields on each send - instead, the
+entire front is re-encoded.  If we want to support target->name_len !=
+base->name_len in the future, there is no other way, because oid is
+surrounded by other fields in the encoded buffer.
+
+Encoding OSD ops and adding data items to the request message were
+mixed together in osd_req_encode_op().  While we want to re-encode OSD
+ops, we don't want to add duplicate data items to the message when
+resending, so all call to ceph_osdc_msg_data_add() are factored out
+into a new setup_request_data().
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit bb873b539154ab51893430b4ad6ba4051775276a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/file.c
+#	include/linux/ceph/osd_client.h
+#	net/ceph/debugfs.c
+#	net/ceph/osd_client.c
+diff --cc fs/ceph/addr.c
+index 5265e35034fa,59b3c3fbd3bd..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -1670,3 -1689,209 +1665,212 @@@ int ceph_mmap(struct file *file, struc
+  	vma->vm_ops = &ceph_vmops;
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ enum {
++ 	POOL_READ	= 1,
++ 	POOL_WRITE	= 2,
++ };
++ 
++ static int __ceph_pool_perm_get(struct ceph_inode_info *ci, u32 pool)
++ {
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(&ci->vfs_inode);
++ 	struct ceph_mds_client *mdsc = fsc->mdsc;
++ 	struct ceph_osd_request *rd_req = NULL, *wr_req = NULL;
++ 	struct rb_node **p, *parent;
++ 	struct ceph_pool_perm *perm;
++ 	struct page **pages;
++ 	int err = 0, err2 = 0, have = 0;
++ 
++ 	down_read(&mdsc->pool_perm_rwsem);
++ 	p = &mdsc->pool_perm_tree.rb_node;
++ 	while (*p) {
++ 		perm = rb_entry(*p, struct ceph_pool_perm, node);
++ 		if (pool < perm->pool)
++ 			p = &(*p)->rb_left;
++ 		else if (pool > perm->pool)
++ 			p = &(*p)->rb_right;
++ 		else {
++ 			have = perm->perm;
++ 			break;
++ 		}
++ 	}
++ 	up_read(&mdsc->pool_perm_rwsem);
++ 	if (*p)
++ 		goto out;
++ 
++ 	dout("__ceph_pool_perm_get pool %u no perm cached\n", pool);
++ 
++ 	down_write(&mdsc->pool_perm_rwsem);
++ 	parent = NULL;
++ 	while (*p) {
++ 		parent = *p;
++ 		perm = rb_entry(parent, struct ceph_pool_perm, node);
++ 		if (pool < perm->pool)
++ 			p = &(*p)->rb_left;
++ 		else if (pool > perm->pool)
++ 			p = &(*p)->rb_right;
++ 		else {
++ 			have = perm->perm;
++ 			break;
++ 		}
++ 	}
++ 	if (*p) {
++ 		up_write(&mdsc->pool_perm_rwsem);
++ 		goto out;
++ 	}
++ 
++ 	rd_req = ceph_osdc_alloc_request(&fsc->client->osdc, NULL,
++ 					 1, false, GFP_NOFS);
++ 	if (!rd_req) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	rd_req->r_flags = CEPH_OSD_FLAG_READ;
++ 	osd_req_op_init(rd_req, 0, CEPH_OSD_OP_STAT, 0);
++ 	rd_req->r_base_oloc.pool = pool;
++ 	ceph_oid_printf(&rd_req->r_base_oid, "%llx.00000000", ci->i_vino.ino);
++ 
++ 	err = ceph_osdc_alloc_messages(rd_req, GFP_NOFS);
++ 	if (err)
++ 		goto out_unlock;
++ 
++ 	wr_req = ceph_osdc_alloc_request(&fsc->client->osdc, NULL,
++ 					 1, false, GFP_NOFS);
++ 	if (!wr_req) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	wr_req->r_flags = CEPH_OSD_FLAG_WRITE |
++ 			  CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
++ 	osd_req_op_init(wr_req, 0, CEPH_OSD_OP_CREATE, CEPH_OSD_OP_FLAG_EXCL);
++ 	ceph_oloc_copy(&wr_req->r_base_oloc, &rd_req->r_base_oloc);
++ 	ceph_oid_copy(&wr_req->r_base_oid, &rd_req->r_base_oid);
++ 
++ 	err = ceph_osdc_alloc_messages(wr_req, GFP_NOFS);
++ 	if (err)
++ 		goto out_unlock;
++ 
++ 	/* one page should be large enough for STAT data */
++ 	pages = ceph_alloc_page_vector(1, GFP_KERNEL);
++ 	if (IS_ERR(pages)) {
++ 		err = PTR_ERR(pages);
++ 		goto out_unlock;
++ 	}
++ 
++ 	osd_req_op_raw_data_in_pages(rd_req, 0, pages, PAGE_SIZE,
++ 				     0, false, true);
++ 	err = ceph_osdc_start_request(&fsc->client->osdc, rd_req, false);
++ 
++ 	wr_req->r_mtime = ci->vfs_inode.i_mtime;
++ 	err2 = ceph_osdc_start_request(&fsc->client->osdc, wr_req, false);
++ 
++ 	if (!err)
++ 		err = ceph_osdc_wait_request(&fsc->client->osdc, rd_req);
++ 	if (!err2)
++ 		err2 = ceph_osdc_wait_request(&fsc->client->osdc, wr_req);
++ 
++ 	if (err >= 0 || err == -ENOENT)
++ 		have |= POOL_READ;
++ 	else if (err != -EPERM)
++ 		goto out_unlock;
++ 
++ 	if (err2 == 0 || err2 == -EEXIST)
++ 		have |= POOL_WRITE;
++ 	else if (err2 != -EPERM) {
++ 		err = err2;
++ 		goto out_unlock;
++ 	}
++ 
++ 	perm = kmalloc(sizeof(*perm), GFP_NOFS);
++ 	if (!perm) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	perm->pool = pool;
++ 	perm->perm = have;
++ 	rb_link_node(&perm->node, parent, p);
++ 	rb_insert_color(&perm->node, &mdsc->pool_perm_tree);
++ 	err = 0;
++ out_unlock:
++ 	up_write(&mdsc->pool_perm_rwsem);
++ 
++ 	ceph_osdc_put_request(rd_req);
++ 	ceph_osdc_put_request(wr_req);
++ out:
++ 	if (!err)
++ 		err = have;
++ 	dout("__ceph_pool_perm_get pool %u result = %d\n", pool, err);
++ 	return err;
++ }
++ 
++ int ceph_pool_perm_check(struct ceph_inode_info *ci, int need)
++ {
++ 	u32 pool;
++ 	int ret, flags;
++ 
++ 	/* does not support pool namespace yet */
++ 	if (ci->i_pool_ns_len)
++ 		return -EIO;
++ 
++ 	if (ceph_test_mount_opt(ceph_inode_to_client(&ci->vfs_inode),
++ 				NOPOOLPERM))
++ 		return 0;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	flags = ci->i_ceph_flags;
++ 	pool = ceph_file_layout_pg_pool(ci->i_layout);
++ 	spin_unlock(&ci->i_ceph_lock);
++ check:
++ 	if (flags & CEPH_I_POOL_PERM) {
++ 		if ((need & CEPH_CAP_FILE_RD) && !(flags & CEPH_I_POOL_RD)) {
++ 			dout("ceph_pool_perm_check pool %u no read perm\n",
++ 			     pool);
++ 			return -EPERM;
++ 		}
++ 		if ((need & CEPH_CAP_FILE_WR) && !(flags & CEPH_I_POOL_WR)) {
++ 			dout("ceph_pool_perm_check pool %u no write perm\n",
++ 			     pool);
++ 			return -EPERM;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	ret = __ceph_pool_perm_get(ci, pool);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	flags = CEPH_I_POOL_PERM;
++ 	if (ret & POOL_READ)
++ 		flags |= CEPH_I_POOL_RD;
++ 	if (ret & POOL_WRITE)
++ 		flags |= CEPH_I_POOL_WR;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if (pool == ceph_file_layout_pg_pool(ci->i_layout)) {
++ 		ci->i_ceph_flags = flags;
++         } else {
++ 		pool = ceph_file_layout_pg_pool(ci->i_layout);
++ 		flags = ci->i_ceph_flags;
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 	goto check;
++ }
++ 
++ void ceph_pool_perm_destroy(struct ceph_mds_client *mdsc)
++ {
++ 	struct ceph_pool_perm *perm;
++ 	struct rb_node *n;
++ 
++ 	while (!RB_EMPTY_ROOT(&mdsc->pool_perm_tree)) {
++ 		n = rb_first(&mdsc->pool_perm_tree);
++ 		perm = rb_entry(n, struct ceph_pool_perm, node);
++ 		rb_erase(n, &mdsc->pool_perm_tree);
++ 		kfree(perm);
++ 	}
++ }
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,52e4b72dd5de..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -491,6 -554,199 +491,202 @@@ static ssize_t ceph_sync_read(struct ki
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct ceph_aio_request {
++ 	struct kiocb *iocb;
++ 	size_t total_len;
++ 	int write;
++ 	int error;
++ 	struct list_head osd_reqs;
++ 	unsigned num_reqs;
++ 	atomic_t pending_reqs;
++ 	struct timespec mtime;
++ 	struct ceph_cap_flush *prealloc_cf;
++ };
++ 
++ struct ceph_aio_work {
++ 	struct work_struct work;
++ 	struct ceph_osd_request *req;
++ };
++ 
++ static void ceph_aio_retry_work(struct work_struct *work);
++ 
++ static void ceph_aio_complete(struct inode *inode,
++ 			      struct ceph_aio_request *aio_req)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	int ret;
++ 
++ 	if (!atomic_dec_and_test(&aio_req->pending_reqs))
++ 		return;
++ 
++ 	ret = aio_req->error;
++ 	if (!ret)
++ 		ret = aio_req->total_len;
++ 
++ 	dout("ceph_aio_complete %p rc %d\n", inode, ret);
++ 
++ 	if (ret >= 0 && aio_req->write) {
++ 		int dirty;
++ 
++ 		loff_t endoff = aio_req->iocb->ki_pos + aio_req->total_len;
++ 		if (endoff > i_size_read(inode)) {
++ 			if (ceph_inode_set_size(inode, endoff))
++ 				ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
++ 		}
++ 
++ 		spin_lock(&ci->i_ceph_lock);
++ 		ci->i_inline_version = CEPH_INLINE_NONE;
++ 		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_FILE_WR,
++ 					       &aio_req->prealloc_cf);
++ 		spin_unlock(&ci->i_ceph_lock);
++ 		if (dirty)
++ 			__mark_inode_dirty(inode, dirty);
++ 
++ 	}
++ 
++ 	ceph_put_cap_refs(ci, (aio_req->write ? CEPH_CAP_FILE_WR :
++ 						CEPH_CAP_FILE_RD));
++ 
++ 	aio_req->iocb->ki_complete(aio_req->iocb, ret, 0);
++ 
++ 	ceph_free_cap_flush(aio_req->prealloc_cf);
++ 	kfree(aio_req);
++ }
++ 
++ static void ceph_aio_complete_req(struct ceph_osd_request *req,
++ 				  struct ceph_msg *msg)
++ {
++ 	int rc = req->r_result;
++ 	struct inode *inode = req->r_inode;
++ 	struct ceph_aio_request *aio_req = req->r_priv;
++ 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
++ 	int num_pages = calc_pages_for((u64)osd_data->alignment,
++ 				       osd_data->length);
++ 
++ 	dout("ceph_aio_complete_req %p rc %d bytes %llu\n",
++ 	     inode, rc, osd_data->length);
++ 
++ 	if (rc == -EOLDSNAPC) {
++ 		struct ceph_aio_work *aio_work;
++ 		BUG_ON(!aio_req->write);
++ 
++ 		aio_work = kmalloc(sizeof(*aio_work), GFP_NOFS);
++ 		if (aio_work) {
++ 			INIT_WORK(&aio_work->work, ceph_aio_retry_work);
++ 			aio_work->req = req;
++ 			queue_work(ceph_inode_to_client(inode)->wb_wq,
++ 				   &aio_work->work);
++ 			return;
++ 		}
++ 		rc = -ENOMEM;
++ 	} else if (!aio_req->write) {
++ 		if (rc == -ENOENT)
++ 			rc = 0;
++ 		if (rc >= 0 && osd_data->length > rc) {
++ 			int zoff = osd_data->alignment + rc;
++ 			int zlen = osd_data->length - rc;
++ 			/*
++ 			 * If read is satisfied by single OSD request,
++ 			 * it can pass EOF. Otherwise read is within
++ 			 * i_size.
++ 			 */
++ 			if (aio_req->num_reqs == 1) {
++ 				loff_t i_size = i_size_read(inode);
++ 				loff_t endoff = aio_req->iocb->ki_pos + rc;
++ 				if (endoff < i_size)
++ 					zlen = min_t(size_t, zlen,
++ 						     i_size - endoff);
++ 				aio_req->total_len = rc + zlen;
++ 			}
++ 
++ 			if (zlen > 0)
++ 				ceph_zero_page_vector_range(zoff, zlen,
++ 							    osd_data->pages);
++ 		}
++ 	}
++ 
++ 	ceph_put_page_vector(osd_data->pages, num_pages, false);
++ 	ceph_osdc_put_request(req);
++ 
++ 	if (rc < 0)
++ 		cmpxchg(&aio_req->error, 0, rc);
++ 
++ 	ceph_aio_complete(inode, aio_req);
++ 	return;
++ }
++ 
++ static void ceph_aio_retry_work(struct work_struct *work)
++ {
++ 	struct ceph_aio_work *aio_work =
++ 		container_of(work, struct ceph_aio_work, work);
++ 	struct ceph_osd_request *orig_req = aio_work->req;
++ 	struct ceph_aio_request *aio_req = orig_req->r_priv;
++ 	struct inode *inode = orig_req->r_inode;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_snap_context *snapc;
++ 	struct ceph_osd_request *req;
++ 	int ret;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if (__ceph_have_pending_cap_snap(ci)) {
++ 		struct ceph_cap_snap *capsnap =
++ 			list_last_entry(&ci->i_cap_snaps,
++ 					struct ceph_cap_snap,
++ 					ci_item);
++ 		snapc = ceph_get_snap_context(capsnap->context);
++ 	} else {
++ 		BUG_ON(!ci->i_head_snapc);
++ 		snapc = ceph_get_snap_context(ci->i_head_snapc);
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 
++ 	req = ceph_osdc_alloc_request(orig_req->r_osdc, snapc, 2,
++ 			false, GFP_NOFS);
++ 	if (!req) {
++ 		ret = -ENOMEM;
++ 		req = orig_req;
++ 		goto out;
++ 	}
++ 
++ 	req->r_flags =	CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	ceph_oloc_copy(&req->r_base_oloc, &orig_req->r_base_oloc);
++ 	ceph_oid_copy(&req->r_base_oid, &orig_req->r_base_oid);
++ 
++ 	ret = ceph_osdc_alloc_messages(req, GFP_NOFS);
++ 	if (ret) {
++ 		ceph_osdc_put_request(req);
++ 		req = orig_req;
++ 		goto out;
++ 	}
++ 
++ 	req->r_ops[0] = orig_req->r_ops[0];
++ 	osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 
++ 	req->r_mtime = aio_req->mtime;
++ 	req->r_data_offset = req->r_ops[0].extent.offset;
++ 
++ 	ceph_osdc_put_request(orig_req);
++ 
++ 	req->r_callback = ceph_aio_complete_req;
++ 	req->r_inode = inode;
++ 	req->r_priv = aio_req;
++ 
++ 	ret = ceph_osdc_start_request(req->r_osdc, req, false);
++ out:
++ 	if (ret < 0) {
++ 		req->r_result = ret;
++ 		ceph_aio_complete_req(req, NULL);
++ 	}
++ 
++ 	ceph_put_snap_context(snapc);
++ 	kfree(aio_work);
++ }
++ 
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+  /*
+   * Write commit request unsafe callback, called to tell us when a
+   * request is unsafe (that is, in flight--has been handed to the
+@@@ -524,6 -780,200 +720,203 @@@ static void ceph_sync_write_unsafe(stru
+  }
+  
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t
++ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
++ 		       struct ceph_snap_context *snapc,
++ 		       struct ceph_cap_flush **pcf)
++ {
++ 	struct file *file = iocb->ki_filp;
++ 	struct inode *inode = file_inode(file);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	struct ceph_vino vino;
++ 	struct ceph_osd_request *req;
++ 	struct page **pages;
++ 	struct ceph_aio_request *aio_req = NULL;
++ 	int num_pages = 0;
++ 	int flags;
++ 	int ret;
++ 	struct timespec mtime = current_fs_time(inode->i_sb);
++ 	size_t count = iov_iter_count(iter);
++ 	loff_t pos = iocb->ki_pos;
++ 	bool write = iov_iter_rw(iter) == WRITE;
++ 
++ 	if (write && ceph_snap(file_inode(file)) != CEPH_NOSNAP)
++ 		return -EROFS;
++ 
++ 	dout("sync_direct_read_write (%s) on file %p %lld~%u\n",
++ 	     (write ? "write" : "read"), file, pos, (unsigned)count);
++ 
++ 	ret = filemap_write_and_wait_range(inode->i_mapping, pos, pos + count);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (write) {
++ 		ret = invalidate_inode_pages2_range(inode->i_mapping,
++ 					pos >> PAGE_SHIFT,
++ 					(pos + count) >> PAGE_SHIFT);
++ 		if (ret < 0)
++ 			dout("invalidate_inode_pages2_range returned %d\n", ret);
++ 
++ 		flags = CEPH_OSD_FLAG_ORDERSNAP |
++ 			CEPH_OSD_FLAG_ONDISK |
++ 			CEPH_OSD_FLAG_WRITE;
++ 	} else {
++ 		flags = CEPH_OSD_FLAG_READ;
++ 	}
++ 
++ 	while (iov_iter_count(iter) > 0) {
++ 		u64 size = dio_get_pagev_size(iter);
++ 		size_t start = 0;
++ 		ssize_t len;
++ 
++ 		vino = ceph_vino(inode);
++ 		req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout,
++ 					    vino, pos, &size, 0,
++ 					    /*include a 'startsync' command*/
++ 					    write ? 2 : 1,
++ 					    write ? CEPH_OSD_OP_WRITE :
++ 						    CEPH_OSD_OP_READ,
++ 					    flags, snapc,
++ 					    ci->i_truncate_seq,
++ 					    ci->i_truncate_size,
++ 					    false);
++ 		if (IS_ERR(req)) {
++ 			ret = PTR_ERR(req);
++ 			break;
++ 		}
++ 
++ 		len = size;
++ 		pages = dio_get_pages_alloc(iter, len, &start, &num_pages);
++ 		if (IS_ERR(pages)) {
++ 			ceph_osdc_put_request(req);
++ 			ret = PTR_ERR(pages);
++ 			break;
++ 		}
++ 
++ 		/*
++ 		 * To simplify error handling, allow AIO when IO within i_size
++ 		 * or IO can be satisfied by single OSD request.
++ 		 */
++ 		if (pos == iocb->ki_pos && !is_sync_kiocb(iocb) &&
++ 		    (len == count || pos + count <= i_size_read(inode))) {
++ 			aio_req = kzalloc(sizeof(*aio_req), GFP_KERNEL);
++ 			if (aio_req) {
++ 				aio_req->iocb = iocb;
++ 				aio_req->write = write;
++ 				INIT_LIST_HEAD(&aio_req->osd_reqs);
++ 				if (write) {
++ 					aio_req->mtime = mtime;
++ 					swap(aio_req->prealloc_cf, *pcf);
++ 				}
++ 			}
++ 			/* ignore error */
++ 		}
++ 
++ 		if (write) {
++ 			/*
++ 			 * throw out any page cache pages in this range. this
++ 			 * may block.
++ 			 */
++ 			truncate_inode_pages_range(inode->i_mapping, pos,
++ 					(pos+len) | (PAGE_SIZE - 1));
++ 
++ 			osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC, 0);
++ 			req->r_mtime = mtime;
++ 		}
++ 
++ 		osd_req_op_extent_osd_data_pages(req, 0, pages, len, start,
++ 						 false, false);
++ 
++ 		if (aio_req) {
++ 			aio_req->total_len += len;
++ 			aio_req->num_reqs++;
++ 			atomic_inc(&aio_req->pending_reqs);
++ 
++ 			req->r_callback = ceph_aio_complete_req;
++ 			req->r_inode = inode;
++ 			req->r_priv = aio_req;
++ 			list_add_tail(&req->r_unsafe_item, &aio_req->osd_reqs);
++ 
++ 			pos += len;
++ 			iov_iter_advance(iter, len);
++ 			continue;
++ 		}
++ 
++ 		ret = ceph_osdc_start_request(req->r_osdc, req, false);
++ 		if (!ret)
++ 			ret = ceph_osdc_wait_request(&fsc->client->osdc, req);
++ 
++ 		size = i_size_read(inode);
++ 		if (!write) {
++ 			if (ret == -ENOENT)
++ 				ret = 0;
++ 			if (ret >= 0 && ret < len && pos + ret < size) {
++ 				int zlen = min_t(size_t, len - ret,
++ 						 size - pos - ret);
++ 				ceph_zero_page_vector_range(start + ret, zlen,
++ 							    pages);
++ 				ret += zlen;
++ 			}
++ 			if (ret >= 0)
++ 				len = ret;
++ 		}
++ 
++ 		ceph_put_page_vector(pages, num_pages, false);
++ 
++ 		ceph_osdc_put_request(req);
++ 		if (ret < 0)
++ 			break;
++ 
++ 		pos += len;
++ 		iov_iter_advance(iter, len);
++ 
++ 		if (!write && pos >= size)
++ 			break;
++ 
++ 		if (write && pos > size) {
++ 			if (ceph_inode_set_size(inode, pos))
++ 				ceph_check_caps(ceph_inode(inode),
++ 						CHECK_CAPS_AUTHONLY,
++ 						NULL);
++ 		}
++ 	}
++ 
++ 	if (aio_req) {
++ 		if (aio_req->num_reqs == 0) {
++ 			kfree(aio_req);
++ 			return ret;
++ 		}
++ 
++ 		ceph_get_cap_refs(ci, write ? CEPH_CAP_FILE_WR :
++ 					      CEPH_CAP_FILE_RD);
++ 
++ 		while (!list_empty(&aio_req->osd_reqs)) {
++ 			req = list_first_entry(&aio_req->osd_reqs,
++ 					       struct ceph_osd_request,
++ 					       r_unsafe_item);
++ 			list_del_init(&req->r_unsafe_item);
++ 			if (ret >= 0)
++ 				ret = ceph_osdc_start_request(req->r_osdc,
++ 							      req, false);
++ 			if (ret < 0) {
++ 				req->r_result = ret;
++ 				ceph_aio_complete_req(req, NULL);
++ 			}
++ 		}
++ 		return -EIOCBQUEUED;
++ 	}
++ 
++ 	if (ret != -EOLDSNAPC && pos > iocb->ki_pos) {
++ 		ret = pos - iocb->ki_pos;
++ 		iocb->ki_pos = pos;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+  /*
+   * Synchronous write, straight from __user pointer or user pages.
+   *
+diff --cc include/linux/ceph/osd_client.h
+index cc16ab3e4c14,67a37d98e0ca..000000000000
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@@ -138,15 -162,6 +138,18 @@@ struct ceph_osd_request 
+  	/* request osd ops array  */
+  	unsigned int		r_num_ops;
+  
+++<<<<<<< HEAD
+ +	/* these are updated on each send */
+ +	__le32           *r_request_osdmap_epoch;
+ +	__le32           *r_request_flags;
+ +	__le64           *r_request_pool;
+ +	void             *r_request_pgid;
+ +	__le32           *r_request_attempts;
+ +	bool              r_paused;
+ +	struct ceph_eversion *r_request_reassert_version;
+ +
+++=======
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+  	int               r_result;
+  	int               r_got_reply;
+  	int		  r_linger;
+@@@ -163,15 -177,17 +165,27 @@@
+  	struct inode *r_inode;         	      /* for use by callbacks */
+  	void *r_priv;			      /* ditto */
+  
+++<<<<<<< HEAD
+ +	struct ceph_object_locator r_base_oloc;
+ +	struct ceph_object_id r_base_oid;
+ +	struct ceph_object_locator r_target_oloc;
+ +	struct ceph_object_id r_target_oid;
+ +
+ +	u64               r_snapid;
+ +	unsigned long     r_stamp;            /* send OR check time */
+- 
+- 	struct ceph_snap_context *r_snapc;    /* snap context for writes */
+++=======
++ 	/* set by submitter */
++ 	u64 r_snapid;                         /* for reads, CEPH_NOSNAP o/w */
++ 	struct ceph_snap_context *r_snapc;    /* for writes */
++ 	struct timespec r_mtime;              /* ditto */
++ 	u64 r_data_offset;                    /* ditto */
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
++ 
++ 	/* internal */
++ 	unsigned long r_stamp;                /* jiffies, send or check time */
++ 	int r_attempts;
++ 	struct ceph_eversion r_replay_version; /* aka reassert_version */
++ 	u32 r_last_force_resend;
+  
+  	struct ceph_osd_req_op r_ops[];
+  };
+@@@ -314,12 -330,8 +328,7 @@@ extern struct ceph_osd_request *ceph_os
+  					       unsigned int num_ops,
+  					       bool use_mempool,
+  					       gfp_t gfp_flags);
+ -int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp);
+  
+- extern void ceph_osdc_build_request(struct ceph_osd_request *req, u64 off,
+- 				    struct ceph_snap_context *snapc,
+- 				    u64 snap_id,
+- 				    struct timespec *mtime);
+- 
+  extern struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *,
+  				      struct ceph_file_layout *layout,
+  				      struct ceph_vino vino,
+diff --cc net/ceph/debugfs.c
+index 1633b622f0f7,6d3ff713edeb..000000000000
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@@ -152,29 -194,7 +189,31 @@@ static int osdc_show(struct seq_file *s
+  
+  		req = rb_entry(p, struct ceph_osd_request, r_node);
+  
+++<<<<<<< HEAD
+ +		seq_printf(s, "%lld\tosd%d\t%lld.%x\t", req->r_tid,
+ +			   req->r_osd ? req->r_osd->o_osd : -1,
+ +			   req->r_pgid.pool, req->r_pgid.seed);
+ +
+ +		seq_printf(s, "%.*s", req->r_base_oid.name_len,
+ +			   req->r_base_oid.name);
+ +
+ +		if (req->r_reassert_version.epoch)
+ +			seq_printf(s, "\t%u'%llu",
+ +			   (unsigned int)le32_to_cpu(req->r_reassert_version.epoch),
+ +			   le64_to_cpu(req->r_reassert_version.version));
+ +		else
+ +			seq_printf(s, "\t");
+ +
+ +		for (i = 0; i < req->r_num_ops; i++) {
+ +			opcode = req->r_ops[i].op;
+ +			seq_printf(s, "%s%s", (i == 0 ? "\t" : ","),
+ +				   ceph_osd_op_name(opcode));
+ +		}
+ +
+ +		seq_printf(s, "\n");
+++=======
++ 		dump_request(s, req);
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+  	}
+  	mutex_unlock(&osdc->request_mutex);
+  	return 0;
+diff --cc net/ceph/osd_client.c
+index 4e649b707367,8a008f083283..000000000000
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@@ -818,17 -811,15 +782,15 @@@ struct ceph_osd_request *ceph_osdc_new_
+  
+  	req = ceph_osdc_alloc_request(osdc, snapc, num_ops, use_mempool,
+  					GFP_NOFS);
+ -	if (!req) {
+ -		r = -ENOMEM;
+ -		goto fail;
+ -	}
+ +	if (!req)
+ +		return ERR_PTR(-ENOMEM);
+  
+- 	req->r_flags = flags;
+- 
+  	/* calculate max write size */
+  	r = calc_layout(layout, off, plen, &objnum, &objoff, &objlen);
+ -	if (r)
+ -		goto fail;
+ +	if (r < 0) {
+ +		ceph_osdc_put_request(req);
+ +		return ERR_PTR(r);
+ +	}
+  
+  	if (opcode == CEPH_OSD_OP_CREATE || opcode == CEPH_OSD_OP_DELETE) {
+  		osd_req_op_init(req, which, opcode, 0);
+@@@ -848,13 -839,23 +810,24 @@@
+  				       truncate_size, truncate_seq);
+  	}
+  
++ 	req->r_flags = flags;
+  	req->r_base_oloc.pool = ceph_file_layout_pg_pool(*layout);
+ -	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
+  
+++<<<<<<< HEAD
+ +	snprintf(req->r_base_oid.name, sizeof(req->r_base_oid.name),
+ +		 "%llx.%08llx", vino.ino, objnum);
+ +	req->r_base_oid.name_len = strlen(req->r_base_oid.name);
+++=======
++ 	req->r_snapid = vino.snap;
++ 	if (flags & CEPH_OSD_FLAG_WRITE)
++ 		req->r_data_offset = off;
++ 
++ 	r = ceph_osdc_alloc_messages(req, GFP_NOFS);
++ 	if (r)
++ 		goto fail;
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+  
+  	return req;
+ -
+ -fail:
+ -	ceph_osdc_put_request(req);
+ -	return ERR_PTR(r);
+  }
+  EXPORT_SYMBOL(ceph_osdc_new_request);
+  
+@@@ -1441,37 -1476,173 +1414,190 @@@ out
+  	return err;
+  }
+  
+- /*
+-  * caller should hold map_sem (for read) and request_mutex
+-  */
+- static void __send_request(struct ceph_osd_client *osdc,
+- 			   struct ceph_osd_request *req)
++ static void setup_request_data(struct ceph_osd_request *req,
++ 			       struct ceph_msg *msg)
+  {
+- 	void *p;
++ 	u32 data_len = 0;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	dout("send_request %p tid %llu to osd%d flags %d pg %lld.%x\n",
+ +	     req, req->r_tid, req->r_osd->o_osd, req->r_flags,
+ +	     (unsigned long long)req->r_pgid.pool, req->r_pgid.seed);
+ +
+ +	/* fill in message content that changes each time we send it */
+ +	put_unaligned_le32(osdc->osdmap->epoch, req->r_request_osdmap_epoch);
+ +	put_unaligned_le32(req->r_flags, req->r_request_flags);
+ +	put_unaligned_le64(req->r_target_oloc.pool, req->r_request_pool);
+ +	p = req->r_request_pgid;
+ +	ceph_encode_64(&p, req->r_pgid.pool);
+ +	ceph_encode_32(&p, req->r_pgid.seed);
+ +	put_unaligned_le64(1, req->r_request_attempts);  /* FIXME */
+ +	memcpy(req->r_request_reassert_version, &req->r_reassert_version,
+ +	       sizeof(req->r_reassert_version));
+++=======
++ 	if (!list_empty(&msg->data))
++ 		return;
+  
+- 	req->r_stamp = jiffies;
+- 	list_move_tail(&req->r_req_lru_item, &osdc->req_lru);
++ 	WARN_ON(msg->data_length);
++ 	for (i = 0; i < req->r_num_ops; i++) {
++ 		struct ceph_osd_req_op *op = &req->r_ops[i];
++ 
++ 		switch (op->op) {
++ 		/* request */
++ 		case CEPH_OSD_OP_WRITE:
++ 		case CEPH_OSD_OP_WRITEFULL:
++ 			WARN_ON(op->indata_len != op->extent.length);
++ 			ceph_osdc_msg_data_add(msg, &op->extent.osd_data);
++ 			break;
++ 		case CEPH_OSD_OP_SETXATTR:
++ 		case CEPH_OSD_OP_CMPXATTR:
++ 			WARN_ON(op->indata_len != op->xattr.name_len +
++ 						  op->xattr.value_len);
++ 			ceph_osdc_msg_data_add(msg, &op->xattr.osd_data);
++ 			break;
++ 
++ 		/* reply */
++ 		case CEPH_OSD_OP_STAT:
++ 			ceph_osdc_msg_data_add(req->r_reply,
++ 					       &op->raw_data_in);
++ 			break;
++ 		case CEPH_OSD_OP_READ:
++ 			ceph_osdc_msg_data_add(req->r_reply,
++ 					       &op->extent.osd_data);
++ 			break;
+  
+- 	ceph_msg_get(req->r_request); /* send consumes a ref */
++ 		/* both */
++ 		case CEPH_OSD_OP_CALL:
++ 			WARN_ON(op->indata_len != op->cls.class_len +
++ 						  op->cls.method_len +
++ 						  op->cls.indata_len);
++ 			ceph_osdc_msg_data_add(msg, &op->cls.request_info);
++ 			/* optional, can be NONE */
++ 			ceph_osdc_msg_data_add(msg, &op->cls.request_data);
++ 			/* optional, can be NONE */
++ 			ceph_osdc_msg_data_add(req->r_reply,
++ 					       &op->cls.response_data);
++ 			break;
++ 		}
+  
+- 	req->r_sent = req->r_osd->o_incarnation;
++ 		data_len += op->indata_len;
++ 	}
+  
+- 	ceph_con_send(&req->r_osd->o_con, req->r_request);
++ 	WARN_ON(data_len != msg->data_length);
++ }
++ 
++ static void encode_request(struct ceph_osd_request *req, struct ceph_msg *msg)
++ {
++ 	void *p = msg->front.iov_base;
++ 	void *const end = p + msg->front_alloc_len;
++ 	u32 data_len = 0;
++ 	int i;
++ 
++ 	if (req->r_flags & CEPH_OSD_FLAG_WRITE) {
++ 		/* snapshots aren't writeable */
++ 		WARN_ON(req->r_snapid != CEPH_NOSNAP);
++ 	} else {
++ 		WARN_ON(req->r_mtime.tv_sec || req->r_mtime.tv_nsec ||
++ 			req->r_data_offset || req->r_snapc);
++ 	}
++ 
++ 	setup_request_data(req, msg);
++ 
++ 	ceph_encode_32(&p, 1); /* client_inc, always 1 */
++ 	ceph_encode_32(&p, req->r_osdc->osdmap->epoch);
++ 	ceph_encode_32(&p, req->r_flags);
++ 	ceph_encode_timespec(p, &req->r_mtime);
++ 	p += sizeof(struct ceph_timespec);
++ 	/* aka reassert_version */
++ 	memcpy(p, &req->r_replay_version, sizeof(req->r_replay_version));
++ 	p += sizeof(req->r_replay_version);
++ 
++ 	/* oloc */
++ 	ceph_encode_8(&p, 4);
++ 	ceph_encode_8(&p, 4);
++ 	ceph_encode_32(&p, 8 + 4 + 4);
++ 	ceph_encode_64(&p, req->r_t.target_oloc.pool);
++ 	ceph_encode_32(&p, -1); /* preferred */
++ 	ceph_encode_32(&p, 0); /* key len */
++ 
++ 	/* pgid */
++ 	ceph_encode_8(&p, 1);
++ 	ceph_encode_64(&p, req->r_t.pgid.pool);
++ 	ceph_encode_32(&p, req->r_t.pgid.seed);
++ 	ceph_encode_32(&p, -1); /* preferred */
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
++ 
++ 	/* oid */
++ 	ceph_encode_32(&p, req->r_t.target_oid.name_len);
++ 	memcpy(p, req->r_t.target_oid.name, req->r_t.target_oid.name_len);
++ 	p += req->r_t.target_oid.name_len;
++ 
++ 	/* ops, can imply data */
++ 	ceph_encode_16(&p, req->r_num_ops);
++ 	for (i = 0; i < req->r_num_ops; i++) {
++ 		data_len += osd_req_encode_op(p, &req->r_ops[i]);
++ 		p += sizeof(struct ceph_osd_op);
++ 	}
++ 
++ 	ceph_encode_64(&p, req->r_snapid); /* snapid */
++ 	if (req->r_snapc) {
++ 		ceph_encode_64(&p, req->r_snapc->seq);
++ 		ceph_encode_32(&p, req->r_snapc->num_snaps);
++ 		for (i = 0; i < req->r_snapc->num_snaps; i++)
++ 			ceph_encode_64(&p, req->r_snapc->snaps[i]);
++ 	} else {
++ 		ceph_encode_64(&p, 0); /* snap_seq */
++ 		ceph_encode_32(&p, 0); /* snaps len */
++ 	}
++ 
++ 	ceph_encode_32(&p, req->r_attempts); /* retry_attempt */
++ 
++ 	BUG_ON(p > end);
++ 	msg->front.iov_len = p - msg->front.iov_base;
++ 	msg->hdr.version = cpu_to_le16(4); /* MOSDOp v4 */
++ 	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
++ 	msg->hdr.data_len = cpu_to_le32(data_len);
++ 	/*
++ 	 * The header "data_off" is a hint to the receiver allowing it
++ 	 * to align received data into its buffers such that there's no
++ 	 * need to re-copy it before writing it to disk (direct I/O).
++ 	 */
++ 	msg->hdr.data_off = cpu_to_le16(req->r_data_offset);
++ 
++ 	dout("%s req %p oid %*pE oid_len %d front %zu data %u\n", __func__,
++ 	     req, req->r_t.target_oid.name_len, req->r_t.target_oid.name,
++ 	     req->r_t.target_oid.name_len, msg->front.iov_len, data_len);
++ }
++ 
++ /*
++  * @req has to be assigned a tid and registered.
++  */
++ static void send_request(struct ceph_osd_request *req)
++ {
++ 	struct ceph_osd *osd = req->r_osd;
++ 
++ 	WARN_ON(osd->o_osd != req->r_t.osd);
++ 
++ 	req->r_flags |= CEPH_OSD_FLAG_KNOWN_REDIR;
++ 	if (req->r_attempts)
++ 		req->r_flags |= CEPH_OSD_FLAG_RETRY;
++ 	else
++ 		WARN_ON(req->r_flags & CEPH_OSD_FLAG_RETRY);
++ 
++ 	encode_request(req, req->r_request);
++ 
++ 	dout("%s req %p tid %llu to pg %llu.%x osd%d flags 0x%x attempt %d\n",
++ 	     __func__, req, req->r_tid, req->r_t.pgid.pool, req->r_t.pgid.seed,
++ 	     req->r_t.osd, req->r_flags, req->r_attempts);
++ 
++ 	req->r_t.paused = false;
++ 	req->r_stamp = jiffies;
++ 	req->r_attempts++;
++ 
++ 	req->r_sent = osd->o_incarnation;
++ 	req->r_request->hdr.tid = cpu_to_le64(req->r_tid);
++ 	ceph_con_send(&osd->o_con, ceph_msg_get(req->r_request));
+  }
+  
+  /*
+@@@ -2358,105 -2538,6 +2486,108 @@@ bad
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * build new request AND message
+ + *
+ + */
+ +void ceph_osdc_build_request(struct ceph_osd_request *req, u64 off,
+ +				struct ceph_snap_context *snapc, u64 snap_id,
+ +				struct timespec *mtime)
+ +{
+ +	struct ceph_msg *msg = req->r_request;
+ +	void *p;
+ +	size_t msg_size;
+ +	int flags = req->r_flags;
+ +	u64 data_len;
+ +	unsigned int i;
+ +
+ +	req->r_snapid = snap_id;
+ +	WARN_ON(snapc != req->r_snapc);
+ +
+ +	/* encode request */
+ +	msg->hdr.version = cpu_to_le16(4);
+ +
+ +	p = msg->front.iov_base;
+ +	ceph_encode_32(&p, 1);   /* client_inc  is always 1 */
+ +	req->r_request_osdmap_epoch = p;
+ +	p += 4;
+ +	req->r_request_flags = p;
+ +	p += 4;
+ +	if (req->r_flags & CEPH_OSD_FLAG_WRITE)
+ +		ceph_encode_timespec(p, mtime);
+ +	p += sizeof(struct ceph_timespec);
+ +	req->r_request_reassert_version = p;
+ +	p += sizeof(struct ceph_eversion); /* will get filled in */
+ +
+ +	/* oloc */
+ +	ceph_encode_8(&p, 4);
+ +	ceph_encode_8(&p, 4);
+ +	ceph_encode_32(&p, 8 + 4 + 4);
+ +	req->r_request_pool = p;
+ +	p += 8;
+ +	ceph_encode_32(&p, -1);  /* preferred */
+ +	ceph_encode_32(&p, 0);   /* key len */
+ +
+ +	ceph_encode_8(&p, 1);
+ +	req->r_request_pgid = p;
+ +	p += 8 + 4;
+ +	ceph_encode_32(&p, -1);  /* preferred */
+ +
+ +	/* oid */
+ +	ceph_encode_32(&p, req->r_base_oid.name_len);
+ +	memcpy(p, req->r_base_oid.name, req->r_base_oid.name_len);
+ +	dout("oid '%.*s' len %d\n", req->r_base_oid.name_len,
+ +	     req->r_base_oid.name, req->r_base_oid.name_len);
+ +	p += req->r_base_oid.name_len;
+ +
+ +	/* ops--can imply data */
+ +	ceph_encode_16(&p, (u16)req->r_num_ops);
+ +	data_len = 0;
+ +	for (i = 0; i < req->r_num_ops; i++) {
+ +		data_len += osd_req_encode_op(req, p, i);
+ +		p += sizeof(struct ceph_osd_op);
+ +	}
+ +
+ +	/* snaps */
+ +	ceph_encode_64(&p, req->r_snapid);
+ +	ceph_encode_64(&p, req->r_snapc ? req->r_snapc->seq : 0);
+ +	ceph_encode_32(&p, req->r_snapc ? req->r_snapc->num_snaps : 0);
+ +	if (req->r_snapc) {
+ +		for (i = 0; i < req->r_snapc->num_snaps; i++) {
+ +			ceph_encode_64(&p, req->r_snapc->snaps[i]);
+ +		}
+ +	}
+ +
+ +	req->r_request_attempts = p;
+ +	p += 4;
+ +
+ +	/* data */
+ +	if (flags & CEPH_OSD_FLAG_WRITE) {
+ +		u16 data_off;
+ +
+ +		/*
+ +		 * The header "data_off" is a hint to the receiver
+ +		 * allowing it to align received data into its
+ +		 * buffers such that there's no need to re-copy
+ +		 * it before writing it to disk (direct I/O).
+ +		 */
+ +		data_off = (u16) (off & 0xffff);
+ +		req->r_request->hdr.data_off = cpu_to_le16(data_off);
+ +	}
+ +	req->r_request->hdr.data_len = cpu_to_le32(data_len);
+ +
+ +	BUG_ON(p > msg->front.iov_base + msg->front.iov_len);
+ +	msg_size = p - msg->front.iov_base;
+ +	msg->front.iov_len = msg_size;
+ +	msg->hdr.front_len = cpu_to_le32(msg_size);
+ +
+ +	dout("build_request msg_size was %d\n", (int)msg_size);
+ +}
+ +EXPORT_SYMBOL(ceph_osdc_build_request);
+ +
+ +/*
+++=======
+++>>>>>>> bb873b539154 (libceph: switch to calc_target(), part 2)
+   * Register request, send initial attempt.
+   */
+  int ceph_osdc_start_request(struct ceph_osd_client *osdc,
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index c099cc2cae71..5f6d22a03cbc 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1940,27 +1940,17 @@ static void rbd_osd_req_format_read(struct rbd_obj_request *obj_request)
+ {
+ 	struct rbd_img_request *img_request = obj_request->img_request;
+ 	struct ceph_osd_request *osd_req = obj_request->osd_req;
+-	u64 snap_id;
+-
+-	rbd_assert(osd_req != NULL);
+ 
+-	snap_id = img_request ? img_request->snap_id : CEPH_NOSNAP;
+-	ceph_osdc_build_request(osd_req, obj_request->offset,
+-			NULL, snap_id, NULL);
++	if (img_request)
++		osd_req->r_snapid = img_request->snap_id;
+ }
+ 
+ static void rbd_osd_req_format_write(struct rbd_obj_request *obj_request)
+ {
+-	struct rbd_img_request *img_request = obj_request->img_request;
+ 	struct ceph_osd_request *osd_req = obj_request->osd_req;
+-	struct ceph_snap_context *snapc;
+-	struct timespec mtime = CURRENT_TIME;
+-
+-	rbd_assert(osd_req != NULL);
+ 
+-	snapc = img_request ? img_request->snapc : NULL;
+-	ceph_osdc_build_request(osd_req, obj_request->offset,
+-			snapc, CEPH_NOSNAP, &mtime);
++	osd_req->r_mtime = CURRENT_TIME;
++	osd_req->r_data_offset = obj_request->offset;
+ }
+ 
+ /*
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/file.c
+* Unmerged path include/linux/ceph/osd_client.h
+diff --git a/include/linux/ceph/rados.h b/include/linux/ceph/rados.h
+index 913c87c26d33..4ade4e5c7559 100644
+--- a/include/linux/ceph/rados.h
++++ b/include/linux/ceph/rados.h
+@@ -389,6 +389,13 @@ enum {
+ 	CEPH_OSD_FLAG_SKIPRWLOCKS =   0x10000,  /* skip rw locks */
+ 	CEPH_OSD_FLAG_IGNORE_OVERLAY = 0x20000, /* ignore pool overlay */
+ 	CEPH_OSD_FLAG_FLUSH =         0x40000,  /* this is part of flush */
++	CEPH_OSD_FLAG_MAP_SNAP_CLONE = 0x80000,  /* map snap direct to clone id */
++	CEPH_OSD_FLAG_ENFORCE_SNAPC   = 0x100000,  /* use snapc provided even if
++						      pool uses pool snaps */
++	CEPH_OSD_FLAG_REDIRECTED   = 0x200000,  /* op has been redirected */
++	CEPH_OSD_FLAG_KNOWN_REDIR = 0x400000,  /* redirect bit is authoritative */
++	CEPH_OSD_FLAG_FULL_TRY =    0x800000,  /* try op despite full flag */
++	CEPH_OSD_FLAG_FULL_FORCE = 0x1000000,  /* force op despite full flag */
+ };
+ 
+ enum {
+* Unmerged path net/ceph/debugfs.c
+* Unmerged path net/ceph/osd_client.c
