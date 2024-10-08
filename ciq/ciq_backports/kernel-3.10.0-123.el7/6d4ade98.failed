@@ -1,0 +1,221 @@
+GFS2: Add atomic_open support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 6d4ade986f9c8df31e68fd30643997f79cc5a5f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6d4ade98.failed
+
+I've restricted atomic_open to only operate on regular files, although
+I still don't understand why atomic_open should not be possible also for
+directories on GFS2. That can always be added in later though, if it
+makes sense.
+
+The ->atomic_open function can be passed negative dentries, which
+in most cases means either ENOENT (->lookup) or a call to d_instantiate
+(->create). In the GFS2 case though, we need to actually perform the
+look up, since we do not know whether there has been a new inode created
+on another node. The look up calls d_splice_alias which then tries to
+rehash the dentry - so the solution here is to simply check for that
+in d_splice_alias. The same issue is likely to affect any other cluster
+filesystem implementing ->atomic_open
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: "J. Bruce Fields" <bfields fieldses org>
+	Cc: Jeff Layton <jlayton@redhat.com>
+(cherry picked from commit 6d4ade986f9c8df31e68fd30643997f79cc5a5f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/inode.c
+index 62b484e4a9e4,bbb2715171cd..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -584,14 -576,29 +587,39 @@@ static int gfs2_create_inode(struct ino
+  		goto fail;
+  
+  	error = create_ok(dip, name, mode);
+++<<<<<<< HEAD
+ +	if ((error == -EEXIST) && S_ISREG(mode) && !excl) {
+ +		inode = gfs2_lookupi(dir, &dentry->d_name, 0);
+ +		gfs2_glock_dq_uninit(ghs);
+ +		d_instantiate(dentry, inode);
+ +		return IS_ERR(inode) ? PTR_ERR(inode) : 0;
+++=======
++ 	if (error)
++ 		goto fail_gunlock;
++ 
++ 	inode = gfs2_dir_search(dir, &dentry->d_name, !S_ISREG(mode) || excl);
++ 	error = PTR_ERR(inode);
++ 	if (!IS_ERR(inode)) {
++ 		d = d_splice_alias(inode, dentry);
++ 		error = 0;
++ 		if (file && !IS_ERR(d)) {
++ 			if (d == NULL)
++ 				d = dentry;
++ 			if (S_ISREG(inode->i_mode))
++ 				error = finish_open(file, d, gfs2_open_common, opened);
++ 			else
++ 				error = finish_no_open(file, d);
++ 		}
++ 		gfs2_glock_dq_uninit(ghs);
++ 		if (IS_ERR(d))
++ 			return PTR_RET(d);
++ 		return error;
++ 	} else if (error != -ENOENT) {
++ 		goto fail_gunlock;
+++>>>>>>> 6d4ade986f9c (GFS2: Add atomic_open support)
+  	}
+ +	if (error)
+ +		goto fail_gunlock;
+  
+  	arq = error = gfs2_diradd_alloc_required(dir, name);
+  	if (error < 0)
+diff --git a/fs/dcache.c b/fs/dcache.c
+index f09b9085f7d8..5a23073138df 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1612,6 +1612,10 @@ EXPORT_SYMBOL(d_obtain_alias);
+  * If a dentry was found and moved, then it is returned.  Otherwise NULL
+  * is returned.  This matches the expected return value of ->lookup.
+  *
++ * Cluster filesystems may call this function with a negative, hashed dentry.
++ * In that case, we know that the inode will be a regular file, and also this
++ * will only occur during atomic_open. So we need to check for the dentry
++ * being already hashed only in the final case.
+  */
+ struct dentry *d_splice_alias(struct inode *inode, struct dentry *dentry)
+ {
+@@ -1636,8 +1640,11 @@ struct dentry *d_splice_alias(struct inode *inode, struct dentry *dentry)
+ 			security_d_instantiate(dentry, inode);
+ 			d_rehash(dentry);
+ 		}
+-	} else
+-		d_add(dentry, inode);
++	} else {
++		d_instantiate(dentry, inode);
++		if (d_unhashed(dentry))
++			d_rehash(dentry);
++	}
+ 	return new;
+ }
+ EXPORT_SYMBOL(d_splice_alias);
+diff --git a/fs/gfs2/file.c b/fs/gfs2/file.c
+index ad0dc38d87ab..4ed6a03e565b 100644
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@ -538,21 +538,30 @@ static int gfs2_mmap(struct file *file, struct vm_area_struct *vma)
+ }
+ 
+ /**
+- * gfs2_open - open a file
+- * @inode: the inode to open
+- * @file: the struct file for this opening
++ * gfs2_open_common - This is common to open and atomic_open
++ * @inode: The inode being opened
++ * @file: The file being opened
+  *
+- * Returns: errno
++ * This maybe called under a glock or not depending upon how it has
++ * been called. We must always be called under a glock for regular
++ * files, however. For other file types, it does not matter whether
++ * we hold the glock or not.
++ *
++ * Returns: Error code or 0 for success
+  */
+ 
+-static int gfs2_open(struct inode *inode, struct file *file)
++int gfs2_open_common(struct inode *inode, struct file *file)
+ {
+-	struct gfs2_inode *ip = GFS2_I(inode);
+-	struct gfs2_holder i_gh;
+ 	struct gfs2_file *fp;
+-	int error;
++	int ret;
+ 
+-	fp = kzalloc(sizeof(struct gfs2_file), GFP_KERNEL);
++	if (S_ISREG(inode->i_mode)) {
++		ret = generic_file_open(inode, file);
++		if (ret)
++			return ret;
++	}
++
++	fp = kzalloc(sizeof(struct gfs2_file), GFP_NOFS);
+ 	if (!fp)
+ 		return -ENOMEM;
+ 
+@@ -560,29 +569,43 @@ static int gfs2_open(struct inode *inode, struct file *file)
+ 
+ 	gfs2_assert_warn(GFS2_SB(inode), !file->private_data);
+ 	file->private_data = fp;
++	return 0;
++}
++
++/**
++ * gfs2_open - open a file
++ * @inode: the inode to open
++ * @file: the struct file for this opening
++ *
++ * After atomic_open, this function is only used for opening files
++ * which are already cached. We must still get the glock for regular
++ * files to ensure that we have the file size uptodate for the large
++ * file check which is in the common code. That is only an issue for
++ * regular files though.
++ *
++ * Returns: errno
++ */
++
++static int gfs2_open(struct inode *inode, struct file *file)
++{
++	struct gfs2_inode *ip = GFS2_I(inode);
++	struct gfs2_holder i_gh;
++	int error;
++	bool need_unlock = false;
+ 
+ 	if (S_ISREG(ip->i_inode.i_mode)) {
+ 		error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED, LM_FLAG_ANY,
+ 					   &i_gh);
+ 		if (error)
+-			goto fail;
++			return error;
++		need_unlock = true;
++	}
+ 
+-		if (!(file->f_flags & O_LARGEFILE) &&
+-		    i_size_read(inode) > MAX_NON_LFS) {
+-			error = -EOVERFLOW;
+-			goto fail_gunlock;
+-		}
++	error = gfs2_open_common(inode, file);
+ 
++	if (need_unlock)
+ 		gfs2_glock_dq_uninit(&i_gh);
+-	}
+-
+-	return 0;
+ 
+-fail_gunlock:
+-	gfs2_glock_dq_uninit(&i_gh);
+-fail:
+-	file->private_data = NULL;
+-	kfree(fp);
+ 	return error;
+ }
+ 
+* Unmerged path fs/gfs2/inode.c
+diff --git a/fs/gfs2/inode.h b/fs/gfs2/inode.h
+index c53c7477f6da..ba4d9492d422 100644
+--- a/fs/gfs2/inode.h
++++ b/fs/gfs2/inode.h
+@@ -109,6 +109,7 @@ extern int gfs2_permission(struct inode *inode, int mask);
+ extern int gfs2_setattr_simple(struct inode *inode, struct iattr *attr);
+ extern struct inode *gfs2_lookup_simple(struct inode *dip, const char *name);
+ extern void gfs2_dinode_out(const struct gfs2_inode *ip, void *buf);
++extern int gfs2_open_common(struct inode *inode, struct file *file);
+ 
+ extern const struct inode_operations gfs2_file_iops;
+ extern const struct inode_operations gfs2_dir_iops;
