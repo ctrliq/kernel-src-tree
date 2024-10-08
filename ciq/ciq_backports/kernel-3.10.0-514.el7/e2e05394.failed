@@ -1,0 +1,175 @@
+pmem, dax: have direct_access use __pmem annotation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit e2e05394e4a3420dab96f728df4531893494e15d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e2e05394.failed
+
+Update the annotation for the kaddr pointer returned by direct_access()
+so that it is a __pmem pointer.  This is consistent with the PMEM driver
+and with how this direct_access() pointer is used in the DAX code.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit e2e05394e4a3420dab96f728df4531893494e15d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/sysdev/axonram.c
+#	drivers/block/pmem.c
+#	fs/dax.c
+diff --cc arch/powerpc/sysdev/axonram.c
+index 45bc123f9227,a2be2a66dab6..000000000000
+--- a/arch/powerpc/sysdev/axonram.c
++++ b/arch/powerpc/sysdev/axonram.c
+@@@ -144,9 -145,10 +144,15 @@@ axon_ram_direct_access(struct block_dev
+  {
+  	struct axon_ram_bank *bank = device->bd_disk->private_data;
+  	loff_t offset = (loff_t)sector << AXON_RAM_SECTOR_SHIFT;
++ 	void *addr = (void *)(bank->ph_addr + offset);
+  
+++<<<<<<< HEAD
+ +	*kaddr = (void *)(bank->ph_addr + offset);
+ +	*pfn = virt_to_phys(kaddr) >> PAGE_SHIFT;
+++=======
++ 	*kaddr = (void __pmem *)addr;
++ 	*pfn = virt_to_phys(addr) >> PAGE_SHIFT;
+++>>>>>>> e2e05394e4a3 (pmem, dax: have direct_access use __pmem annotation)
+  
+  	return bank->size - offset;
+  }
+diff --cc drivers/block/pmem.c
+index 0069d751af83,f3b629779266..000000000000
+--- a/drivers/block/pmem.c
++++ b/drivers/block/pmem.c
+@@@ -89,6 -100,7 +89,10 @@@ static long pmem_direct_access(struct b
+  	if (!pmem)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD:drivers/block/pmem.c
+++=======
++ 	/* FIXME convert DAX to comprehend that this mapping has a lifetime */
+++>>>>>>> e2e05394e4a3 (pmem, dax: have direct_access use __pmem annotation):drivers/nvdimm/pmem.c
+  	*kaddr = pmem->virt_addr + offset;
+  	*pfn = (pmem->phys_addr + offset) >> PAGE_SHIFT;
+  
+* Unmerged path fs/dax.c
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index af63b7f9e0d8..a28ae4357a56 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -397,7 +397,8 @@ prototypes:
+ 	int (*release) (struct gendisk *, fmode_t);
+ 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+ 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+-	int (*direct_access) (struct block_device *, sector_t, void **, unsigned long *);
++	int (*direct_access) (struct block_device *, sector_t, void __pmem **,
++				unsigned long *);
+ 	int (*media_changed) (struct gendisk *);
+ 	void (*unlock_native_capacity) (struct gendisk *);
+ 	int (*revalidate_disk) (struct gendisk *);
+* Unmerged path arch/powerpc/sysdev/axonram.c
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index 9c60a3cd03eb..31d392366ae3 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -371,7 +371,7 @@ static int brd_rw_page(struct block_device *bdev, sector_t sector,
+ 
+ #ifdef CONFIG_BLK_DEV_RAM_DAX
+ static long brd_direct_access(struct block_device *bdev, sector_t sector,
+-			void **kaddr, unsigned long *pfn, long size)
++			void __pmem **kaddr, unsigned long *pfn, long size)
+ {
+ 	struct brd_device *brd = bdev->bd_disk->private_data;
+ 	struct page *page;
+@@ -381,7 +381,7 @@ static long brd_direct_access(struct block_device *bdev, sector_t sector,
+ 	page = brd_insert_page(brd, sector);
+ 	if (!page)
+ 		return -ENOSPC;
+-	*kaddr = page_address(page);
++	*kaddr = (void __pmem *)page_address(page);
+ 	*pfn = page_to_pfn(page);
+ 
+ 	/*
+* Unmerged path drivers/block/pmem.c
+diff --git a/drivers/s390/block/dcssblk.c b/drivers/s390/block/dcssblk.c
+index 234818c98b8f..7d03236b255b 100644
+--- a/drivers/s390/block/dcssblk.c
++++ b/drivers/s390/block/dcssblk.c
+@@ -29,7 +29,7 @@ static int dcssblk_open(struct block_device *bdev, fmode_t mode);
+ static void dcssblk_release(struct gendisk *disk, fmode_t mode);
+ static void dcssblk_make_request(struct request_queue *q, struct bio *bio);
+ static long dcssblk_direct_access(struct block_device *bdev, sector_t secnum,
+-				 void **kaddr, unsigned long *pfn, long size);
++			 void __pmem **kaddr, unsigned long *pfn, long size);
+ 
+ static char dcssblk_segments[DCSSBLK_PARM_LEN] = "\0";
+ 
+@@ -867,18 +867,20 @@ fail:
+ 
+ static long
+ dcssblk_direct_access (struct block_device *bdev, sector_t secnum,
+-			void **kaddr, unsigned long *pfn, long size)
++			void __pmem **kaddr, unsigned long *pfn, long size)
+ {
+ 	struct dcssblk_dev_info *dev_info;
+ 	unsigned long offset, dev_sz;
++	void *addr;
+ 
+ 	dev_info = bdev->bd_disk->private_data;
+ 	if (!dev_info)
+ 		return -ENODEV;
+ 	dev_sz = dev_info->end - dev_info->start;
+ 	offset = secnum * 512;
+-	*kaddr = (void *) (dev_info->start + offset);
+-	*pfn = virt_to_phys(*kaddr) >> PAGE_SHIFT;
++	addr = (void *) (dev_info->start + offset);
++	*pfn = virt_to_phys(addr) >> PAGE_SHIFT;
++	*kaddr = (void __pmem *) addr;
+ 
+ 	return dev_sz - offset;
+ }
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 2557803cf68e..6d5dd2653bc8 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -462,7 +462,7 @@ EXPORT_SYMBOL_GPL(bdev_write_page);
+  * accessible at this address.
+  */
+ long bdev_direct_access(struct block_device *bdev, sector_t sector,
+-			void **addr, unsigned long *pfn, long size)
++			void __pmem **addr, unsigned long *pfn, long size)
+ {
+ 	long avail;
+ 	const struct block_device_operations *ops = bdev->bd_disk->fops;
+* Unmerged path fs/dax.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 7ce94e9d0a73..93f7d190f9f0 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1649,8 +1649,8 @@ struct block_device_operations {
+ 	int (*rw_page)(struct block_device *, sector_t, struct page *, int rw);
+ 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+ 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+-	long (*direct_access)(struct block_device *, sector_t,
+-					void **, unsigned long *pfn, long size);
++	long (*direct_access)(struct block_device *, sector_t, void __pmem **,
++			unsigned long *pfn, long size);
+ 	unsigned int (*check_events) (struct gendisk *disk,
+ 				      unsigned int clearing);
+ 	/* ->media_changed() is DEPRECATED, use ->check_events() instead */
+@@ -1676,8 +1676,8 @@ extern int __blkdev_driver_ioctl(struct block_device *, fmode_t, unsigned int,
+ extern int bdev_read_page(struct block_device *, sector_t, struct page *);
+ extern int bdev_write_page(struct block_device *, sector_t, struct page *,
+ 						struct writeback_control *);
+-extern long bdev_direct_access(struct block_device *, sector_t, void **addr,
+-						unsigned long *pfn, long size);
++extern long bdev_direct_access(struct block_device *, sector_t,
++		void __pmem **addr, unsigned long *pfn, long size);
+ #else /* CONFIG_BLOCK */
+ /*
+  * stubs for when the block layer is configured out
