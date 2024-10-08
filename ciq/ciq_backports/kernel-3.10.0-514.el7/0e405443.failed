@@ -1,0 +1,159 @@
+net/mlx5e: Improve set features ndo resiliency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Improve set features ndo resiliency (kamal heib) [1275159 1296272 1296405 1298421 1298422 1298423 1298424 1298425]
+Rebuild_FUZZ: 95.45%
+commit-author Gal Pressman <galp@mellanox.com>
+commit 0e405443e803a3ce9ba22f11be37e2a74f3fb9ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0e405443.failed
+
+In current mlx5e ndo_set_features implementation, setting some features
+can success while others can fail. Today, we return one error code which
+doesn't reflect the current features status of the netdev at the end of
+the ndo callback.
+
+Set netdev->features with features which were successfully set in order
+to keep the current status in case of failure. For this purpose, define
+new Macro to set/unset specific feature in netdev->features.
+
+This patch introduces a mechanism that uses feature handlers for each
+feature.
+Set features will call a generic handler, which will then call a specific
+handler in his turn and update netdev->features according to it's return
+value. Each specific handler is responsible to perform driver specific
+actions, and updating params if needed.
+
+	Signed-off-by: Gal Pressman <galp@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0e405443e803a3ce9ba22f11be37e2a74f3fb9ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index b70e3293db0b,d82bc6b697f9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1989,37 -2096,88 +1998,109 @@@ static int set_feature_lro(struct net_d
+  
+  	mutex_lock(&priv->state_lock);
+  
+- 	if (changes & NETIF_F_LRO) {
+- 		bool was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
++ 	if (was_opened && (priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST))
++ 		mlx5e_close_locked(priv->netdev);
+  
+++<<<<<<< HEAD
+ +		if (was_opened)
+ +			mlx5e_close_locked(priv->netdev);
+ +
+ +		priv->params.lro_en = !!(features & NETIF_F_LRO);
+ +		err = mlx5e_modify_tirs_lro(priv);
+ +		if (err)
+ +			mlx5_core_warn(priv->mdev, "lro modify failed, %d\n",
+ +				       err);
+ +
+ +		if (was_opened)
+ +			err = mlx5e_open_locked(priv->netdev);
+++=======
++ 	priv->params.lro_en = enable;
++ 	err = mlx5e_modify_tirs_lro(priv);
++ 	if (err) {
++ 		netdev_err(netdev, "lro modify failed, %d\n", err);
++ 		priv->params.lro_en = !enable;
+++>>>>>>> 0e405443e803 (net/mlx5e: Improve set features ndo resiliency)
+  	}
+  
++ 	if (was_opened && (priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST))
++ 		mlx5e_open_locked(priv->netdev);
++ 
+  	mutex_unlock(&priv->state_lock);
+  
+- 	if (changes & NETIF_F_HW_VLAN_CTAG_FILTER) {
+- 		if (features & NETIF_F_HW_VLAN_CTAG_FILTER)
+- 			mlx5e_enable_vlan_filter(priv);
+- 		else
+- 			mlx5e_disable_vlan_filter(priv);
+- 	}
++ 	return err;
++ }
+  
+++<<<<<<< HEAD
+ +	return err;
+++=======
++ static int set_feature_vlan_filter(struct net_device *netdev, bool enable)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	if (enable)
++ 		mlx5e_enable_vlan_filter(priv);
++ 	else
++ 		mlx5e_disable_vlan_filter(priv);
++ 
++ 	return 0;
++ }
++ 
++ static int set_feature_tc_num_filters(struct net_device *netdev, bool enable)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	if (!enable && mlx5e_tc_num_filters(priv)) {
++ 		netdev_err(netdev,
++ 			   "Active offloaded tc filters, can't turn hw_tc_offload off\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5e_handle_feature(struct net_device *netdev,
++ 				netdev_features_t wanted_features,
++ 				netdev_features_t feature,
++ 				mlx5e_feature_handler feature_handler)
++ {
++ 	netdev_features_t changes = wanted_features ^ netdev->features;
++ 	bool enable = !!(wanted_features & feature);
++ 	int err;
++ 
++ 	if (!(changes & feature))
++ 		return 0;
++ 
++ 	err = feature_handler(netdev, enable);
++ 	if (err) {
++ 		netdev_err(netdev, "%s feature 0x%llx failed err %d\n",
++ 			   enable ? "Enable" : "Disable", feature, err);
++ 		return err;
++ 	}
++ 
++ 	MLX5E_SET_FEATURE(netdev, feature, enable);
++ 	return 0;
++ }
++ 
++ static int mlx5e_set_features(struct net_device *netdev,
++ 			      netdev_features_t features)
++ {
++ 	int err;
++ 
++ 	err  = mlx5e_handle_feature(netdev, features, NETIF_F_LRO,
++ 				    set_feature_lro);
++ 	err |= mlx5e_handle_feature(netdev, features,
++ 				    NETIF_F_HW_VLAN_CTAG_FILTER,
++ 				    set_feature_vlan_filter);
++ 	err |= mlx5e_handle_feature(netdev, features, NETIF_F_HW_TC,
++ 				    set_feature_tc_num_filters);
++ 
++ 	return err ? -EINVAL : 0;
+++>>>>>>> 0e405443e803 (net/mlx5e: Improve set features ndo resiliency)
+  }
+  
+ +#define MXL5_HW_MIN_MTU 64
+ +#define MXL5E_MIN_MTU (MXL5_HW_MIN_MTU + ETH_FCS_LEN)
+ +
+  static int mlx5e_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
