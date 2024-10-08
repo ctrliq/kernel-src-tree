@@ -1,0 +1,174 @@
+bridge: Fix the way to check if a local fdb entry can be deleted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+commit 2b292fb4a57dc233e298a84196d33be0bc3828e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2b292fb4.failed
+
+We should take into account the followings when deleting a local fdb
+entry.
+
+- nbp_vlan_find() can be used only when vid != 0 to check if an entry is
+  deletable, because a fdb entry with vid 0 can exist at any time while
+  nbp_vlan_find() always return false with vid 0.
+
+  Example of problematic case:
+    ip link set eth0 address 12:34:56:78:90:ab
+    ip link set eth1 address 12:34:56:78:90:ab
+    brctl addif br0 eth0
+    brctl addif br0 eth1
+    ip link set eth0 address aa:bb:cc:dd:ee:ff
+  Then, the fdb entry 12:34:56:78:90:ab will be deleted even though the
+  bridge port eth1 still has that address.
+
+- The port to which the bridge device is attached might needs a local entry
+  if its mac address is set manually.
+
+  Example of problematic case:
+    ip link set eth0 address 12:34:56:78:90:ab
+    brctl addif br0 eth0
+    ip link set br0 address 12:34:56:78:90:ab
+    ip link set eth0 address aa:bb:cc:dd:ee:ff
+  Then, the fdb still must have the entry 12:34:56:78:90:ab, but it will be
+  deleted.
+
+We can use br->dev->addr_assign_type to check if the address is manually
+set or not, but I propose another approach.
+
+Since we delete and insert local entries whenever changing mac address
+of the bridge device, we can change dst of the entry to NULL regardless of
+addr_assign_type when deleting an entry associated with a certain port,
+and if it is found to be unnecessary later, then delete it.
+That is, if changing mac address of a port, the entry might be changed
+to its dst being NULL first, but is eventually deleted when recalculating
+and changing bridge id.
+
+This approach is especially useful when we want to share the code with
+deleting vlan in which the bridge device might want such an entry regardless
+of addr_assign_type, and makes things easy because we don't have to consider
+if mac address of the bridge device will be changed or not at the time we
+delete a local entry of a port, which means fdb code will not be bothered
+even if the bridge id calculating logic is changed in the future.
+
+Also, this change reduces inconsistent state, where frames whose dst is the
+mac address of the bridge, can't reach the bridge because of premature fdb
+entry deletion. This change reduces the possibility that the bridge device
+replies unreachable mac address to arp requests, which could occur during
+the short window between calling del_nbp() and br_stp_recalculate_bridge_id()
+in br_del_if(). This will effective after br_fdb_delete_by_port() starts to
+use the same code by following patch.
+
+	Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+	Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2b292fb4a57dc233e298a84196d33be0bc3828e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_private.h
+index 10b5654d52ef,f91e1d9c8e92..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -611,22 -575,22 +611,41 @@@ static inline void br_mdb_uninit(void
+  
+  /* br_vlan.c */
+  #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+++<<<<<<< HEAD
+ +extern bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
+ +			       struct sk_buff *skb, u16 *vid);
+ +extern bool br_allowed_egress(struct net_bridge *br,
+ +			      const struct net_port_vlans *v,
+ +			      const struct sk_buff *skb);
+ +extern struct sk_buff *br_handle_vlan(struct net_bridge *br,
+ +				      const struct net_port_vlans *v,
+ +				      struct sk_buff *skb);
+ +extern int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags);
+ +extern int br_vlan_delete(struct net_bridge *br, u16 vid);
+ +extern void br_vlan_flush(struct net_bridge *br);
+ +extern int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
+ +extern int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags);
+ +extern int nbp_vlan_delete(struct net_bridge_port *port, u16 vid);
+ +extern void nbp_vlan_flush(struct net_bridge_port *port);
+ +extern bool nbp_vlan_find(struct net_bridge_port *port, u16 vid);
+++=======
++ bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
++ 			struct sk_buff *skb, u16 *vid);
++ bool br_allowed_egress(struct net_bridge *br, const struct net_port_vlans *v,
++ 		       const struct sk_buff *skb);
++ struct sk_buff *br_handle_vlan(struct net_bridge *br,
++ 			       const struct net_port_vlans *v,
++ 			       struct sk_buff *skb);
++ int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags);
++ int br_vlan_delete(struct net_bridge *br, u16 vid);
++ void br_vlan_flush(struct net_bridge *br);
++ bool br_vlan_find(struct net_bridge *br, u16 vid);
++ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
++ int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags);
++ int nbp_vlan_delete(struct net_bridge_port *port, u16 vid);
++ void nbp_vlan_flush(struct net_bridge_port *port);
++ bool nbp_vlan_find(struct net_bridge_port *port, u16 vid);
+++>>>>>>> 2b292fb4a57d (bridge: Fix the way to check if a local fdb entry can be deleted)
+  
+  static inline struct net_port_vlans *br_get_vlan_info(
+  						const struct net_bridge *br)
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index c2aa0de700b7..52b31514ae17 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -162,12 +162,20 @@ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
+ 					if (op != p &&
+ 					    ether_addr_equal(op->dev->dev_addr,
+ 							     f->addr.addr) &&
+-					    nbp_vlan_find(op, vid)) {
++					    (!vid || nbp_vlan_find(op, vid))) {
+ 						f->dst = op;
+ 						goto skip_delete;
+ 					}
+ 				}
+ 
++				/* maybe bridge device has same hw addr? */
++				if (ether_addr_equal(br->dev->dev_addr,
++						     f->addr.addr) &&
++				    (!vid || br_vlan_find(br, vid))) {
++					f->dst = NULL;
++					goto skip_delete;
++				}
++
+ 				/* delete old one */
+ 				fdb_delete(br, f);
+ skip_delete:
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index c5c15c7d9539..fae4107b6d2c 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -292,6 +292,25 @@ void br_vlan_flush(struct net_bridge *br)
+ 	__vlan_flush(pv);
+ }
+ 
++bool br_vlan_find(struct net_bridge *br, u16 vid)
++{
++	struct net_port_vlans *pv;
++	bool found = false;
++
++	rcu_read_lock();
++	pv = rcu_dereference(br->vlan_info);
++
++	if (!pv)
++		goto out;
++
++	if (test_bit(vid, pv->vlan_bitmap))
++		found = true;
++
++out:
++	rcu_read_unlock();
++	return found;
++}
++
+ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ {
+ 	if (!rtnl_trylock())
