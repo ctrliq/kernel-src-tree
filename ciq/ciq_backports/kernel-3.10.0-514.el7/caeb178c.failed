@@ -1,0 +1,222 @@
+sched/fair: Make update_sd_pick_busiest() return 'true' on a busier sd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [kernel] sched: Make update_sd_pick_busiest() return 'true' on a busier sd (Jiri Olsa) [1211784]
+Rebuild_FUZZ: 96.30%
+commit-author Rik van Riel <riel@redhat.com>
+commit caeb178c60f4f93f1b45c0bc056b5cf6d217b67f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/caeb178c.failed
+
+Currently update_sd_pick_busiest only identifies the busiest sd
+that is either overloaded, or has a group imbalance. When no
+sd is imbalanced or overloaded, the load balancer fails to find
+the busiest domain.
+
+This breaks load balancing between domains that are not overloaded,
+in the !SD_ASYM_PACKING case. This patch makes update_sd_pick_busiest
+return true when the busiest sd yet is encountered.
+
+Groups are ranked in the order overloaded > imbalanced > other,
+with higher ranked groups getting priority even when their load
+is lower. This is necessary due to the possibility of unequal
+capacities and cpumasks between domains within a sched group.
+
+Behaviour for SD_ASYM_PACKING does not seem to match the comment,
+but I have no hardware to test that so I have left the behaviour
+of that code unchanged.
+
+Enum for group classification suggested by Peter Zijlstra.
+
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+[peterz: replaced sg_lb_stats::group_imb with the new enum group_type
+         in an attempt to avoid endless recalculation]
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Acked-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Acked-by: Michael Neuling <mikey@neuling.org>
+	Cc: ktkhai@parallels.com
+	Cc: tim.c.chen@linux.intel.com
+	Cc: nicolas.pitre@linaro.org
+	Cc: jhladky@redhat.com
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20140729152743.GI3935@laptop
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit caeb178c60f4f93f1b45c0bc056b5cf6d217b67f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 961e580cbff7,94377254254e..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5318,13 -5574,13 +5325,18 @@@ struct sg_lb_stats 
+  	unsigned long group_load; /* Total load over the CPUs of the group */
+  	unsigned long sum_weighted_load; /* Weighted load of group's tasks */
+  	unsigned long load_per_task;
+ -	unsigned long group_capacity;
+ +	unsigned long group_power;
+  	unsigned int sum_nr_running; /* Nr tasks running in the group */
+ -	unsigned int group_capacity_factor;
+ +	unsigned int group_capacity;
+  	unsigned int idle_cpus;
+  	unsigned int group_weight;
+++<<<<<<< HEAD
+ +	int group_imb; /* Is there an imbalance in the group ? */
+ +	int group_has_capacity; /* Is there extra capacity in the group? */
+++=======
++ 	enum group_type group_type;
++ 	int group_has_free_capacity;
+++>>>>>>> caeb178c60f4 (sched/fair: Make update_sd_pick_busiest() return 'true' on a busier sd)
+  #ifdef CONFIG_NUMA_BALANCING
+  	unsigned int nr_numa_running;
+  	unsigned int nr_preferred_running;
+@@@ -5371,7 -5610,17 +5383,21 @@@ static inline void init_sd_lb_stats(str
+  	 * We must however clear busiest_stat::avg_load because
+  	 * update_sd_pick_busiest() reads this before assignment.
+  	 */
+++<<<<<<< HEAD
+ +	memset(sds, 0, offsetof(struct sd_lb_stats, busiest_stat.group_load));
+++=======
++ 	*sds = (struct sd_lb_stats){
++ 		.busiest = NULL,
++ 		.local = NULL,
++ 		.total_load = 0UL,
++ 		.total_capacity = 0UL,
++ 		.busiest_stat = {
++ 			.avg_load = 0UL,
++ 			.sum_nr_running = 0,
++ 			.group_type = group_other,
++ 		},
++ 	};
+++>>>>>>> caeb178c60f4 (sched/fair: Make update_sd_pick_busiest() return 'true' on a busier sd)
+  }
+  
+  /**
+@@@ -5619,32 -5873,45 +5645,44 @@@ static inline int sg_imbalanced(struct 
+  }
+  
+  /*
+ - * Compute the group capacity factor.
+ + * Compute the group capacity.
+   *
+ - * Avoid the issue where N*frac(smt_capacity) >= 1 creates 'phantom' cores by
+ + * Avoid the issue where N*frac(smt_power) >= 1 creates 'phantom' cores by
+   * first dividing out the smt factor and computing the actual number of cores
+ - * and limit unit capacity with that.
+ + * and limit power unit capacity with that.
+   */
+ -static inline int sg_capacity_factor(struct lb_env *env, struct sched_group *group)
+ +static inline int sg_capacity(struct lb_env *env, struct sched_group *group)
+  {
+ -	unsigned int capacity_factor, smt, cpus;
+ -	unsigned int capacity, capacity_orig;
+ +	unsigned int capacity, smt, cpus;
+ +	unsigned int power, power_orig;
+  
+ -	capacity = group->sgc->capacity;
+ -	capacity_orig = group->sgc->capacity_orig;
+ +	power = group->sgp->power;
+ +	power_orig = group->sgp->power_orig;
+  	cpus = group->group_weight;
+  
+ -	/* smt := ceil(cpus / capacity), assumes: 1 < smt_capacity < 2 */
+ -	smt = DIV_ROUND_UP(SCHED_CAPACITY_SCALE * cpus, capacity_orig);
+ -	capacity_factor = cpus / smt; /* cores */
+ +	/* smt := ceil(cpus / power), assumes: 1 < smt_power < 2 */
+ +	smt = DIV_ROUND_UP(SCHED_POWER_SCALE * cpus, power_orig);
+ +	capacity = cpus / smt; /* cores */
+  
+ -	capacity_factor = min_t(unsigned,
+ -		capacity_factor, DIV_ROUND_CLOSEST(capacity, SCHED_CAPACITY_SCALE));
+ -	if (!capacity_factor)
+ -		capacity_factor = fix_small_capacity(env->sd, group);
+ +	capacity = min_t(unsigned, capacity, DIV_ROUND_CLOSEST(power, SCHED_POWER_SCALE));
+ +	if (!capacity)
+ +		capacity = fix_small_capacity(env->sd, group);
+  
+ -	return capacity_factor;
+ +	return capacity;
+  }
+  
++ static enum group_type
++ group_classify(struct sched_group *group, struct sg_lb_stats *sgs)
++ {
++ 	if (sgs->sum_nr_running > sgs->group_capacity_factor)
++ 		return group_overloaded;
++ 
++ 	if (sg_imbalanced(group))
++ 		return group_imbalanced;
++ 
++ 	return group_other;
++ }
++ 
+  /**
+   * update_sg_lb_stats - Update sched_group's statistics for load balancing.
+   * @env: The load balancing environment.
+@@@ -5700,12 -5963,11 +5738,17 @@@ static inline void update_sg_lb_stats(s
+  		sgs->load_per_task = sgs->sum_weighted_load / sgs->sum_nr_running;
+  
+  	sgs->group_weight = group->group_weight;
+++<<<<<<< HEAD
+ +
+ +	sgs->group_imb = sg_imbalanced(group);
+ +	sgs->group_capacity = sg_capacity(env, group);
+++=======
++ 	sgs->group_capacity_factor = sg_capacity_factor(env, group);
++ 	sgs->group_type = group_classify(group, sgs);
+++>>>>>>> caeb178c60f4 (sched/fair: Make update_sd_pick_busiest() return 'true' on a busier sd)
+  
+ -	if (sgs->group_capacity_factor > sgs->sum_nr_running)
+ -		sgs->group_has_free_capacity = 1;
+ +	if (sgs->group_capacity > sgs->sum_nr_running)
+ +		sgs->group_has_capacity = 1;
+  }
+  
+  /**
+@@@ -5726,13 -5988,19 +5769,23 @@@ static bool update_sd_pick_busiest(stru
+  				   struct sched_group *sg,
+  				   struct sg_lb_stats *sgs)
+  {
+- 	if (sgs->avg_load <= sds->busiest_stat.avg_load)
+- 		return false;
++ 	struct sg_lb_stats *busiest = &sds->busiest_stat;
+  
+++<<<<<<< HEAD
+ +	if (sgs->sum_nr_running > sgs->group_capacity)
+++=======
++ 	if (sgs->group_type > busiest->group_type)
+++>>>>>>> caeb178c60f4 (sched/fair: Make update_sd_pick_busiest() return 'true' on a busier sd)
+  		return true;
+  
+- 	if (sgs->group_imb)
++ 	if (sgs->group_type < busiest->group_type)
++ 		return false;
++ 
++ 	if (sgs->avg_load <= busiest->avg_load)
++ 		return false;
++ 
++ 	/* This is the busiest node in its class. */
++ 	if (!(env->sd->flags & SD_ASYM_PACKING))
+  		return true;
+  
+  	/*
+@@@ -5977,12 -6248,12 +6029,12 @@@ void fix_small_imbalance(struct lb_env 
+  static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *sds)
+  {
+  	unsigned long max_pull, load_above_capacity = ~0UL;
+ -	struct sg_lb_stats *local, *busiest;
+ +	struct sg_lb_stats *this, *busiest;
+  
+ -	local = &sds->local_stat;
+ +	this = &sds->this_stat;
+  	busiest = &sds->busiest_stat;
+  
+- 	if (busiest->group_imb) {
++ 	if (busiest->group_type == group_imbalanced) {
+  		/*
+  		 * In the group_imb case we cannot rely on group-wide averages
+  		 * to ensure cpu-load equilibrium, look at wider averages. XXX
+* Unmerged path kernel/sched/fair.c
