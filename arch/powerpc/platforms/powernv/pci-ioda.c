@@ -1285,7 +1285,7 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
 		pr_warning("  OPAL Error %ld performing IODA table reset !\n", rc);
 }
 
-void pnv_pci_init_ioda2_phb(struct device_node *np)
+void __init pnv_pci_init_ioda2_phb(struct device_node *np)
 {
 	pnv_pci_init_ioda_phb(np, 0, PNV_PHB_IODA2);
 }
