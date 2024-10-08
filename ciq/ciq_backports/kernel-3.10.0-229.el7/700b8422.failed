@@ -1,0 +1,442 @@
+ACPI: Drop acpi_evaluate_hotplug_ost() and ACPI_HOTPLUG_OST
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] Drop acpi_evaluate_hotplug_ost() and ACPI_HOTPLUG_OST (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 94.64%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 700b8422fb9e6041907bda45a15f4e2ab0438a04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/700b8422.failed
+
+Replace acpi_evaluate_hotplug_ost() with acpi_evaluate_ost()
+everywhere and drop the ACPI_HOTPLUG_OST symbol so that hotplug
+_OST is supported unconditionally.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Toshi Kani <toshi.kani@hp.com>
+(cherry picked from commit 700b8422fb9e6041907bda45a15f4e2ab0438a04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/bus.c
+#	drivers/acpi/scan.c
+diff --cc drivers/acpi/bus.c
+index f7cd8718b651,4cefb98f274d..000000000000
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@@ -474,19 -380,35 +472,24 @@@ static void acpi_bus_notify(acpi_handl
+  		break;
+  
+  	default:
+ -		acpi_handle_warn(handle, "Unsupported event type 0x%x\n", type);
+ -		ost_code = ACPI_OST_SC_UNRECOGNIZED_NOTIFY;
+ -		goto err;
+ -	}
+ -
+ -	adev = acpi_bus_get_acpi_device(handle);
+ -	if (!adev)
+ -		goto err;
+ -
+ -	driver = adev->driver;
+ -	if (driver && driver->ops.notify &&
+ -	    (driver->flags & ACPI_DRIVER_ALL_NOTIFY_EVENTS))
+ -		driver->ops.notify(adev, type);
+ -
+ -	switch (type) {
+ -	case ACPI_NOTIFY_BUS_CHECK:
+ -	case ACPI_NOTIFY_DEVICE_CHECK:
+ -	case ACPI_NOTIFY_EJECT_REQUEST:
+ -		status = acpi_hotplug_execute(acpi_device_hotplug, adev, type);
+ -		if (ACPI_SUCCESS(status))
+ -			return;
+ -	default:
+ +		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+ +				  "Received unknown/unsupported notification [%08x]\n",
+ +				  type));
+  		break;
+  	}
+ -	acpi_bus_put_acpi_device(adev);
+ -	return;
+  
+++<<<<<<< HEAD
+ +	acpi_bus_get_device(handle, &device);
+ +	if (device) {
+ +		driver = device->driver;
+ +		if (driver && driver->ops.notify &&
+ +		    (driver->flags & ACPI_DRIVER_ALL_NOTIFY_EVENTS))
+ +			driver->ops.notify(device, type);
+ +	}
+++=======
++  err:
++ 	acpi_evaluate_ost(handle, type, ost_code, NULL);
+++>>>>>>> 700b8422fb9e (ACPI: Drop acpi_evaluate_hotplug_ost() and ACPI_HOTPLUG_OST)
+  }
+  
+  /* --------------------------------------------------------------------------
+diff --cc drivers/acpi/scan.c
+index b30a50799f84,f2d8d1c1c391..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -285,169 -380,144 +285,271 @@@ static int acpi_scan_hot_remove(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +void acpi_bus_device_eject(struct acpi_device *device, u32 ost_src)
+++=======
++ static int acpi_scan_device_not_present(struct acpi_device *adev)
++ {
++ 	if (!acpi_device_enumerated(adev)) {
++ 		dev_warn(&adev->dev, "Still not present\n");
++ 		return -EALREADY;
++ 	}
++ 	acpi_bus_trim(adev);
++ 	return 0;
++ }
++ 
++ static int acpi_scan_device_check(struct acpi_device *adev)
++ {
++ 	int error;
++ 
++ 	acpi_bus_get_status(adev);
++ 	if (adev->status.present || adev->status.functional) {
++ 		/*
++ 		 * This function is only called for device objects for which
++ 		 * matching scan handlers exist.  The only situation in which
++ 		 * the scan handler is not attached to this device object yet
++ 		 * is when the device has just appeared (either it wasn't
++ 		 * present at all before or it was removed and then added
++ 		 * again).
++ 		 */
++ 		if (adev->handler) {
++ 			dev_warn(&adev->dev, "Already enumerated\n");
++ 			return -EALREADY;
++ 		}
++ 		error = acpi_bus_scan(adev->handle);
++ 		if (error) {
++ 			dev_warn(&adev->dev, "Namespace scan failure\n");
++ 			return error;
++ 		}
++ 		if (!adev->handler) {
++ 			dev_warn(&adev->dev, "Enumeration failure\n");
++ 			error = -ENODEV;
++ 		}
++ 	} else {
++ 		error = acpi_scan_device_not_present(adev);
++ 	}
++ 	return error;
++ }
++ 
++ static int acpi_scan_bus_check(struct acpi_device *adev)
++ {
++ 	struct acpi_scan_handler *handler = adev->handler;
++ 	struct acpi_device *child;
++ 	int error;
++ 
++ 	acpi_bus_get_status(adev);
++ 	if (!(adev->status.present || adev->status.functional)) {
++ 		acpi_scan_device_not_present(adev);
++ 		return 0;
++ 	}
++ 	if (handler && handler->hotplug.scan_dependent)
++ 		return handler->hotplug.scan_dependent(adev);
++ 
++ 	error = acpi_bus_scan(adev->handle);
++ 	if (error) {
++ 		dev_warn(&adev->dev, "Namespace scan failure\n");
++ 		return error;
++ 	}
++ 	list_for_each_entry(child, &adev->children, node) {
++ 		error = acpi_scan_bus_check(child);
++ 		if (error)
++ 			return error;
++ 	}
++ 	return 0;
++ }
++ 
++ static int acpi_generic_hotplug_event(struct acpi_device *adev, u32 type)
++ {
++ 	switch (type) {
++ 	case ACPI_NOTIFY_BUS_CHECK:
++ 		return acpi_scan_bus_check(adev);
++ 	case ACPI_NOTIFY_DEVICE_CHECK:
++ 		return acpi_scan_device_check(adev);
++ 	case ACPI_NOTIFY_EJECT_REQUEST:
++ 	case ACPI_OST_EC_OSPM_EJECT:
++ 		if (adev->handler && !adev->handler->hotplug.enabled) {
++ 			dev_info(&adev->dev, "Eject disabled\n");
++ 			return -EPERM;
++ 		}
++ 		acpi_evaluate_ost(adev->handle, ACPI_NOTIFY_EJECT_REQUEST,
++ 				  ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
++ 		return acpi_scan_hot_remove(adev);
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ void acpi_device_hotplug(void *data, u32 src)
+++>>>>>>> 700b8422fb9e (ACPI: Drop acpi_evaluate_hotplug_ost() and ACPI_HOTPLUG_OST)
+  {
+ +	acpi_handle handle = device->handle;
+  	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ -	struct acpi_device *adev = data;
+ -	int error = -ENODEV;
+ +	int error;
+  
+  	lock_device_hotplug();
+  	mutex_lock(&acpi_scan_lock);
+  
+ -	/*
+ -	 * The device object's ACPI handle cannot become invalid as long as we
+ -	 * are holding acpi_scan_lock, but it might have become invalid before
+ -	 * that lock was acquired.
+ -	 */
+ -	if (adev->handle == INVALID_ACPI_HANDLE)
+ -		goto err_out;
+ +	if (ost_src == ACPI_NOTIFY_EJECT_REQUEST)
+ +		acpi_evaluate_hotplug_ost(handle, ACPI_NOTIFY_EJECT_REQUEST,
+ +					  ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+  
+ -	if (adev->flags.hotplug_notify) {
+ -		error = acpi_generic_hotplug_event(adev, src);
+ -		if (error == -EPERM) {
+ -			ost_code = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
+ -			goto err_out;
+ -		}
+ -	} else {
+ -		int (*event)(struct acpi_device *, u32);
+ +	if (device->handler && device->handler->hotplug.mode == AHM_CONTAINER)
+ +		kobject_uevent(&device->dev.kobj, KOBJ_OFFLINE);
+  
+ -		acpi_lock_hp_context();
+ -		event = adev->hp ? adev->hp->event : NULL;
+ -		acpi_unlock_hp_context();
+ -		/*
+ -		 * There may be additional notify handlers for device objects
+ -		 * without the .event() callback, so ignore them here.
+ -		 */
+ -		if (event)
+ -			error = event(adev, src);
+ -		else
+ -			goto out;
+ +	error = acpi_scan_hot_remove(device);
+ +	if (error == -EPERM) {
+ +		goto err_support;
+ +	} else if (error) {
+ +		goto err_out;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (!error)
++ 		ost_code = ACPI_OST_SC_SUCCESS;
++ 
++  err_out:
++ 	acpi_evaluate_ost(adev->handle, src, ost_code, NULL);
+++>>>>>>> 700b8422fb9e (ACPI: Drop acpi_evaluate_hotplug_ost() and ACPI_HOTPLUG_OST)
+  
+   out:
+ -	acpi_bus_put_acpi_device(adev);
+  	mutex_unlock(&acpi_scan_lock);
+  	unlock_device_hotplug();
+ +	return;
+ +
+ + err_support:
+ +	ost_code = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
+ + err_out:
+ +	acpi_evaluate_hotplug_ost(handle, ost_src, ost_code, NULL);
+ +	goto out;
+ +}
+ +
+ +static void acpi_scan_bus_device_check(acpi_handle handle, u32 ost_source)
+ +{
+ +	struct acpi_device *device = NULL;
+ +	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ +	int error;
+ +
+ +	lock_device_hotplug();
+ +	mutex_lock(&acpi_scan_lock);
+ +
+ +	if (ost_source != ACPI_NOTIFY_BUS_CHECK) {
+ +		acpi_bus_get_device(handle, &device);
+ +		if (device) {
+ +			dev_warn(&device->dev, "Attempt to re-insert\n");
+ +			goto out;
+ +		}
+ +	}
+ +	error = acpi_bus_scan(handle);
+ +	if (error) {
+ +		acpi_handle_warn(handle, "Namespace scan failure\n");
+ +		goto out;
+ +	}
+ +	error = acpi_bus_get_device(handle, &device);
+ +	if (error) {
+ +		acpi_handle_warn(handle, "Missing device node object\n");
+ +		goto out;
+ +	}
+ +	ost_code = ACPI_OST_SC_SUCCESS;
+ +	if (device->handler && device->handler->hotplug.mode == AHM_CONTAINER)
+ +		kobject_uevent(&device->dev.kobj, KOBJ_ONLINE);
+ +
+ + out:
+ +	acpi_evaluate_hotplug_ost(handle, ost_source, ost_code, NULL);
+ +	mutex_unlock(&acpi_scan_lock);
+ +	unlock_device_hotplug();
+ +}
+ +
+ +static void acpi_scan_bus_check(void *context)
+ +{
+ +	acpi_scan_bus_device_check((acpi_handle)context,
+ +				   ACPI_NOTIFY_BUS_CHECK);
+ +}
+ +
+ +static void acpi_scan_device_check(void *context)
+ +{
+ +	acpi_scan_bus_device_check((acpi_handle)context,
+ +				   ACPI_NOTIFY_DEVICE_CHECK);
+ +}
+ +
+ +static void acpi_hotplug_unsupported(acpi_handle handle, u32 type)
+ +{
+ +	u32 ost_status;
+ +
+ +	switch (type) {
+ +	case ACPI_NOTIFY_BUS_CHECK:
+ +		acpi_handle_debug(handle,
+ +			"ACPI_NOTIFY_BUS_CHECK event: unsupported\n");
+ +		ost_status = ACPI_OST_SC_INSERT_NOT_SUPPORTED;
+ +		break;
+ +	case ACPI_NOTIFY_DEVICE_CHECK:
+ +		acpi_handle_debug(handle,
+ +			"ACPI_NOTIFY_DEVICE_CHECK event: unsupported\n");
+ +		ost_status = ACPI_OST_SC_INSERT_NOT_SUPPORTED;
+ +		break;
+ +	case ACPI_NOTIFY_EJECT_REQUEST:
+ +		acpi_handle_debug(handle,
+ +			"ACPI_NOTIFY_EJECT_REQUEST event: unsupported\n");
+ +		ost_status = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
+ +		break;
+ +	default:
+ +		/* non-hotplug event; possibly handled by other handler */
+ +		return;
+ +	}
+ +
+ +	acpi_evaluate_hotplug_ost(handle, type, ost_status, NULL);
+ +}
+ +
+ +/**
+ + * acpi_bus_hot_remove_device: Hot-remove a device and its children.
+ + * @context: Address of the ACPI device object to hot-remove.
+ + */
+ +static void acpi_bus_hot_remove_device(void *context)
+ +{
+ +	acpi_bus_device_eject(context, ACPI_NOTIFY_EJECT_REQUEST);
+ +}
+ +
+ +static void acpi_hotplug_notify_cb(acpi_handle handle, u32 type, void *data)
+ +{
+ +	acpi_osd_exec_callback callback;
+ +	struct acpi_scan_handler *handler = data;
+ +	struct acpi_device *adev;
+ +	acpi_status status;
+ +
+ +	if (!handler->hotplug.enabled)
+ +		return acpi_hotplug_unsupported(handle, type);
+ +
+ +	switch (type) {
+ +	case ACPI_NOTIFY_BUS_CHECK:
+ +		acpi_handle_debug(handle, "ACPI_NOTIFY_BUS_CHECK event\n");
+ +		callback = acpi_scan_bus_check;
+ +		break;
+ +	case ACPI_NOTIFY_DEVICE_CHECK:
+ +		acpi_handle_debug(handle, "ACPI_NOTIFY_DEVICE_CHECK event\n");
+ +		callback = acpi_scan_device_check;
+ +		break;
+ +	case ACPI_NOTIFY_EJECT_REQUEST:
+ +		acpi_handle_debug(handle, "ACPI_NOTIFY_EJECT_REQUEST event\n");
+ +		if (acpi_bus_get_device(handle, &adev))
+ +			goto err_out;
+ +
+ +		get_device(&adev->dev);
+ +		callback = acpi_bus_hot_remove_device;
+ +		status = acpi_os_hotplug_execute(callback, adev);
+ +		if (ACPI_SUCCESS(status))
+ +			return;
+ +
+ +		put_device(&adev->dev);
+ +		goto err_out;
+ +	default:
+ +		/* non-hotplug event; possibly handled by other handler */
+ +		return;
+ +	}
+ +	status = acpi_os_hotplug_execute(callback, handle);
+ +	if (ACPI_SUCCESS(status))
+ +		return;
+ +
+ + err_out:
+ +	acpi_evaluate_hotplug_ost(handle, type,
+ +				  ACPI_OST_SC_NON_SPECIFIC_FAILURE, NULL);
+  }
+  
+  static ssize_t real_power_state_show(struct device *dev,
+* Unmerged path drivers/acpi/bus.c
+* Unmerged path drivers/acpi/scan.c
+diff --git a/drivers/acpi/utils.c b/drivers/acpi/utils.c
+index e2edf0d140bb..0d818ed664b8 100644
+--- a/drivers/acpi/utils.c
++++ b/drivers/acpi/utils.c
+@@ -419,7 +419,7 @@ out:
+ EXPORT_SYMBOL(acpi_get_physical_device_location);
+ 
+ /**
+- * acpi_evaluate_hotplug_ost: Evaluate _OST for hotplug operations
++ * acpi_evaluate_ost: Evaluate _OST for hotplug operations
+  * @handle: ACPI device handle
+  * @source_event: source event code
+  * @status_code: status code
+diff --git a/drivers/xen/xen-acpi-cpuhotplug.c b/drivers/xen/xen-acpi-cpuhotplug.c
+index 8dae6c13063a..b13d49e1ea69 100644
+--- a/drivers/xen/xen-acpi-cpuhotplug.c
++++ b/drivers/xen/xen-acpi-cpuhotplug.c
+@@ -314,7 +314,7 @@ static void acpi_processor_hotplug_notify(acpi_handle handle,
+ 		goto out;
+ 	}
+ 
+-	(void) acpi_evaluate_hotplug_ost(handle, event, ost_code, NULL);
++	(void) acpi_evaluate_ost(handle, event, ost_code, NULL);
+ 
+ out:
+ 	acpi_scan_lock_release();
+diff --git a/drivers/xen/xen-acpi-memhotplug.c b/drivers/xen/xen-acpi-memhotplug.c
+index 9083f1e474f8..800616987937 100644
+--- a/drivers/xen/xen-acpi-memhotplug.c
++++ b/drivers/xen/xen-acpi-memhotplug.c
+@@ -285,7 +285,7 @@ static void acpi_memory_device_notify(acpi_handle handle, u32 event, void *data)
+ 		return;
+ 	}
+ 
+-	(void) acpi_evaluate_hotplug_ost(handle, event, ost_code, NULL);
++	(void) acpi_evaluate_ost(handle, event, ost_code, NULL);
+ 	return;
+ }
+ 
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 717f4adcfbd4..d6e3783e4a9d 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -53,14 +53,6 @@ acpi_evaluate_reference(acpi_handle handle,
+ acpi_status
+ acpi_evaluate_ost(acpi_handle handle, u32 source_event, u32 status_code,
+ 		  struct acpi_buffer *status_buf);
+-#ifdef ACPI_HOTPLUG_OST
+-#define	acpi_evaluate_hotplug_ost	acpi_evaluate_ost
+-#else
+-static inline acpi_status
+-acpi_evaluate_hotplug_ost(acpi_handle handle, u32 source_event,
+-			u32 status_code, struct acpi_buffer *status_buf)
+-{ return AE_OK; }
+-#endif
+ 
+ acpi_status
+ acpi_get_physical_device_location(acpi_handle handle, struct acpi_pld_info **pld);
