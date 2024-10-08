@@ -296,7 +296,7 @@ static acpi_status setup_resource(struct acpi_resource *acpi_res, void *data)
 	struct acpi_resource_address64 addr;
 	acpi_status status;
 	unsigned long flags;
-	u64 start, orig_end, end;
+	u64 start, orig_end, end, res_end;
 
 	status = resource_to_addr(acpi_res, &addr);
 	if (!ACPI_SUCCESS(status))
@@ -306,8 +306,10 @@ static acpi_status setup_resource(struct acpi_resource *acpi_res, void *data)
 		flags = IORESOURCE_MEM;
 		if (addr.info.mem.caching == ACPI_PREFETCHABLE_MEMORY)
 			flags |= IORESOURCE_PREFETCH;
+		res_end = (u64)iomem_resource.end;
 	} else if (addr.resource_type == ACPI_IO_RANGE) {
 		flags = IORESOURCE_IO;
+		res_end = (u64)ioport_resource.end;
 	} else
 		return AE_OK;
 
@@ -315,7 +317,7 @@ static acpi_status setup_resource(struct acpi_resource *acpi_res, void *data)
 	orig_end = end = addr.maximum + addr.translation_offset;
 
 	/* Exclude non-addressable range or non-addressable portion of range */
-	end = min(end, (u64)iomem_resource.end);
+	end = min(end, res_end);
 	if (end <= start) {
 		dev_info(&info->bridge->dev,
 			"host bridge window [%#llx-%#llx] "
