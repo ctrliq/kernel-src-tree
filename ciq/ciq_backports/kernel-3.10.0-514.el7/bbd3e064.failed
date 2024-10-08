@@ -1,0 +1,285 @@
+block: add an API for Persistent Reservations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [block] add an API for Persistent Reservations (Mike Snitzer) [1317629]
+Rebuild_FUZZ: 91.57%
+commit-author Christoph Hellwig <hch@lst.de>
+commit bbd3e064362e5057cc4799ba2e4d68c7593e490b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bbd3e064.failed
+
+This commits adds a driver API and ioctls for controlling Persistent
+Reservations s/genericly/generically/ at the block layer.  Persistent
+Reservations are supported by SCSI and NVMe and allow controlling who gets
+access to a device in a shared storage setup.
+
+Note that we add a pr_ops structure to struct block_device_operations
+instead of adding the members directly to avoid bloating all instances
+of devices that will never support Persistent Reservations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bbd3e064362e5057cc4799ba2e4d68c7593e490b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/ioctl.c
+diff --cc block/ioctl.c
+index 7a9e27b96ce7,0918aed2d847..000000000000
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@@ -447,11 -567,21 +538,27 @@@ int blkdev_ioctl(struct block_device *b
+  	case BLKTRACESTOP:
+  	case BLKTRACESETUP:
+  	case BLKTRACETEARDOWN:
+++<<<<<<< HEAD
+ +		ret = blk_trace_ioctl(bdev, cmd, (char __user *) arg);
+ +		break;
+++=======
++ 		return blk_trace_ioctl(bdev, cmd, argp);
++ 	case IOC_PR_REGISTER:
++ 		return blkdev_pr_register(bdev, argp);
++ 	case IOC_PR_RESERVE:
++ 		return blkdev_pr_reserve(bdev, argp);
++ 	case IOC_PR_RELEASE:
++ 		return blkdev_pr_release(bdev, argp);
++ 	case IOC_PR_PREEMPT:
++ 		return blkdev_pr_preempt(bdev, argp, false);
++ 	case IOC_PR_PREEMPT_ABORT:
++ 		return blkdev_pr_preempt(bdev, argp, true);
++ 	case IOC_PR_CLEAR:
++ 		return blkdev_pr_clear(bdev, argp);
+++>>>>>>> bbd3e064362e (block: add an API for Persistent Reservations)
+  	default:
+ -		return __blkdev_driver_ioctl(bdev, mode, cmd, arg);
+ +		ret = __blkdev_driver_ioctl(bdev, mode, cmd, arg);
+  	}
+ +	return ret;
+  }
+  EXPORT_SYMBOL_GPL(blkdev_ioctl);
+diff --git a/Documentation/block/pr.txt b/Documentation/block/pr.txt
+new file mode 100644
+index 000000000000..d3eb1ca65051
+--- /dev/null
++++ b/Documentation/block/pr.txt
+@@ -0,0 +1,119 @@
++
++Block layer support for Persistent Reservations
++===============================================
++
++The Linux kernel supports a user space interface for simplified
++Persistent Reservations which map to block devices that support
++these (like SCSI). Persistent Reservations allow restricting
++access to block devices to specific initiators in a shared storage
++setup.
++
++This document gives a general overview of the support ioctl commands.
++For a more detailed reference please refer the the SCSI Primary
++Commands standard, specifically the section on Reservations and the
++"PERSISTENT RESERVE IN" and "PERSISTENT RESERVE OUT" commands.
++
++All implementations are expected to ensure the reservations survive
++a power loss and cover all connections in a multi path environment.
++These behaviors are optional in SPC but will be automatically applied
++by Linux.
++
++
++The following types of reservations are supported:
++--------------------------------------------------
++
++ - PR_WRITE_EXCLUSIVE
++
++	Only the initiator that owns the reservation can write to the
++	device.  Any initiator can read from the device.
++
++ - PR_EXCLUSIVE_ACCESS
++
++	Only the initiator that owns the reservation can access the
++	device.
++
++ - PR_WRITE_EXCLUSIVE_REG_ONLY
++
++	Only initiators with a registered key can write to the device,
++	Any initiator can read from the device.
++
++ - PR_EXCLUSIVE_ACCESS_REG_ONLY
++
++	Only initiators with a registered key can access the device.
++
++ - PR_WRITE_EXCLUSIVE_ALL_REGS
++
++	Only initiators with a registered key can write to the device,
++	Any initiator can read from the device.
++	All initiators with a registered key are considered reservation
++	holders.
++	Please reference the SPC spec on the meaning of a reservation
++	holder if you want to use this type. 
++
++ - PR_EXCLUSIVE_ACCESS_ALL_REGS
++
++	Only initiators with a registered key can access the device.
++	All initiators with a registered key are considered reservation
++	holders.
++	Please reference the SPC spec on the meaning of a reservation
++	holder if you want to use this type. 
++
++
++The following ioctl are supported:
++----------------------------------
++
++1. IOC_PR_REGISTER
++
++This ioctl command registers a new reservation if the new_key argument
++is non-null.  If no existing reservation exists old_key must be zero,
++if an existing reservation should be replaced old_key must contain
++the old reservation key.
++
++If the new_key argument is 0 it unregisters the existing reservation passed
++in old_key.
++
++
++2. IOC_PR_RESERVE
++
++This ioctl command reserves the device and thus restricts access for other
++devices based on the type argument.  The key argument must be the existing
++reservation key for the device as acquired by the IOC_PR_REGISTER,
++IOC_PR_REGISTER_IGNORE, IOC_PR_PREEMPT or IOC_PR_PREEMPT_ABORT commands.
++
++
++3. IOC_PR_RELEASE
++
++This ioctl command releases the reservation specified by key and flags
++and thus removes any access restriction implied by it.
++
++
++4. IOC_PR_PREEMPT
++
++This ioctl command releases the existing reservation referred to by
++old_key and replaces it with a a new reservation of type for the
++reservation key new_key.
++
++
++5. IOC_PR_PREEMPT_ABORT
++
++This ioctl command works like IOC_PR_PREEMPT except that it also aborts
++any outstanding command sent over a connection identified by old_key.
++
++6. IOC_PR_CLEAR
++
++This ioctl command unregisters both key and any other reservation key
++registered with the device and drops any existing reservation.
++
++
++Flags
++-----
++
++All the ioctls have a flag field.  Currently only one flag is supported:
++
++ - PR_FL_IGNORE_KEY
++
++	Ignore the existing reservation key.  This is commonly supported for
++	IOC_PR_REGISTER, and some implementation may support the flag for
++	IOC_PR_RESERVE.
++
++For all unknown flags the kernel will return -EOPNOTSUPP.
+* Unmerged path block/ioctl.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 60506c44a9ba..04cd2af2b766 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -39,6 +39,7 @@ struct sg_io_hdr;
+ struct bsg_job;
+ struct blkcg_gq;
+ struct blk_flush_queue;
++struct pr_ops;
+ 
+ #define BLKDEV_MIN_RQ	4
+ #define BLKDEV_MAX_RQ	128	/* Default maximum */
+@@ -1668,6 +1669,7 @@ struct block_device_operations {
+ 	void *rh_reserved_ptrs5;
+ 
+ 	struct module *owner;
++	const struct pr_ops *pr_ops;
+ };
+ 
+ extern int __blkdev_driver_ioctl(struct block_device *, fmode_t, unsigned int,
+diff --git a/include/linux/pr.h b/include/linux/pr.h
+new file mode 100644
+index 000000000000..65c01c10b335
+--- /dev/null
++++ b/include/linux/pr.h
+@@ -0,0 +1,18 @@
++#ifndef LINUX_PR_H
++#define LINUX_PR_H
++
++#include <uapi/linux/pr.h>
++
++struct pr_ops {
++	int (*pr_register)(struct block_device *bdev, u64 old_key, u64 new_key,
++			u32 flags);
++	int (*pr_reserve)(struct block_device *bdev, u64 key,
++			enum pr_type type, u32 flags);
++	int (*pr_release)(struct block_device *bdev, u64 key,
++			enum pr_type type);
++	int (*pr_preempt)(struct block_device *bdev, u64 old_key, u64 new_key,
++			enum pr_type type, bool abort);
++	int (*pr_clear)(struct block_device *bdev, u64 key);
++};
++
++#endif /* LINUX_PR_H */
+diff --git a/include/uapi/linux/pr.h b/include/uapi/linux/pr.h
+new file mode 100644
+index 000000000000..57d7c0f916b6
+--- /dev/null
++++ b/include/uapi/linux/pr.h
+@@ -0,0 +1,48 @@
++#ifndef _UAPI_PR_H
++#define _UAPI_PR_H
++
++enum pr_type {
++	PR_WRITE_EXCLUSIVE		= 1,
++	PR_EXCLUSIVE_ACCESS		= 2,
++	PR_WRITE_EXCLUSIVE_REG_ONLY	= 3,
++	PR_EXCLUSIVE_ACCESS_REG_ONLY	= 4,
++	PR_WRITE_EXCLUSIVE_ALL_REGS	= 5,
++	PR_EXCLUSIVE_ACCESS_ALL_REGS	= 6,
++};
++
++struct pr_reservation {
++	__u64	key;
++	__u32	type;
++	__u32	flags;
++};
++
++struct pr_registration {
++	__u64	old_key;
++	__u64	new_key;
++	__u32	flags;
++	__u32	__pad;
++};
++
++struct pr_preempt {
++	__u64	old_key;
++	__u64	new_key;
++	__u32	type;
++	__u32	flags;
++};
++
++struct pr_clear {
++	__u64	key;
++	__u32	flags;
++	__u32	__pad;
++};
++
++#define PR_FL_IGNORE_KEY	(1 << 0)	/* ignore existing key */
++
++#define IOC_PR_REGISTER		_IOW('p', 200, struct pr_registration)
++#define IOC_PR_RESERVE		_IOW('p', 201, struct pr_reservation)
++#define IOC_PR_RELEASE		_IOW('p', 202, struct pr_reservation)
++#define IOC_PR_PREEMPT		_IOW('p', 203, struct pr_preempt)
++#define IOC_PR_PREEMPT_ABORT	_IOW('p', 204, struct pr_preempt)
++#define IOC_PR_CLEAR		_IOW('p', 205, struct pr_clear)
++
++#endif /* _UAPI_PR_H */
