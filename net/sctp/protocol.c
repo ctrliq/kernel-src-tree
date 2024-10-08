@@ -1502,7 +1502,6 @@ SCTP_STATIC __init int sctp_init(void)
 	if (status)
 		goto err_v6_add_protocol;
 
-	status = 0;
 out:
 	return status;
 err_v6_add_protocol:
