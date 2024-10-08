@@ -1,0 +1,470 @@
+powerpc/mm/thp: Make page table walk safe against thp split/collapse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] mm: Make page table walk safe against thp split/collapse (Gustavo Duarte) [1233071]
+Rebuild_FUZZ: 90.32%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 691e95fd7396905a38d98919e9c150dbc3ea21a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/691e95fd.failed
+
+We can disable a THP split or a hugepage collapse by disabling irq.
+We do send IPI to all the cpus in the early part of split/collapse,
+and disabling local irq ensure we don't make progress with
+split/collapse. If the THP is getting split we return NULL from
+find_linux_pte_or_hugepte(). For all the current callers it should be ok.
+We need to be careful if we want to use returned pte_t pointer outside
+the irq disabled region. W.r.t to THP split, the pfn remains the same,
+but then a hugepage collapse will result in a pfn change. There are
+few steps we can take to avoid a hugepage collapse.One way is to take page
+reference inside the irq disable region. Other option is to take
+mmap_sem so that a parallel collapse will not happen. We can also
+disable collapse by taking pmd_lock. Another method used by kvm
+subsystem is to check whether we had a mmu_notifer update in between
+using mmu_notifier_retry().
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 691e95fd7396905a38d98919e9c150dbc3ea21a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/pgtable.h
+#	arch/powerpc/kvm/book3s_hv_rm_mmu.c
+#	arch/powerpc/kvm/e500_mmu_host.c
+diff --cc arch/powerpc/include/asm/pgtable.h
+index 4fbc04254e64,11a38635dd65..000000000000
+--- a/arch/powerpc/include/asm/pgtable.h
++++ b/arch/powerpc/include/asm/pgtable.h
+@@@ -310,28 -247,16 +310,39 @@@ extern int gup_hugepte(pte_t *ptep, uns
+  #define pmd_large(pmd)		0
+  #define has_transparent_hugepage() 0
+  #endif
+- pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
++ pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+  				 unsigned *shift);
+++<<<<<<< HEAD
+ +
+ +static inline pte_t *lookup_linux_ptep(pgd_t *pgdir, unsigned long hva,
+ +				     unsigned long *pte_sizep)
+ +{
+ +	pte_t *ptep;
+ +	unsigned long ps = *pte_sizep;
+ +	unsigned int shift;
+ +
+ +	ptep = find_linux_pte_or_hugepte(pgdir, hva, &shift);
+ +	if (!ptep)
+ +		return NULL;
+ +	if (shift)
+ +		*pte_sizep = 1ul << shift;
+ +	else
+ +		*pte_sizep = PAGE_SIZE;
+ +
+ +	if (ps > *pte_sizep)
+ +		return NULL;
+ +
+ +	return ptep;
+++=======
++ static inline pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
++ 					       unsigned *shift)
++ {
++ 	if (!arch_irqs_disabled()) {
++ 		pr_info("%s called with irq enabled\n", __func__);
++ 		dump_stack();
++ 	}
++ 	return __find_linux_pte_or_hugepte(pgdir, ea, shift);
+++>>>>>>> 691e95fd7396 (powerpc/mm/thp: Make page table walk safe against thp split/collapse)
+  }
+  #endif /* __ASSEMBLY__ */
+  
+diff --cc arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index f1ee45edf8d1,f559b25de173..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@@ -170,13 -150,13 +173,13 @@@ long kvmppc_do_h_enter(struct kvm *kvm
+  	struct revmap_entry *rev;
+  	unsigned long g_ptel;
+  	struct kvm_memory_slot *memslot;
+ -	unsigned hpage_shift;
+ +	unsigned long *physp, pte_size;
+  	unsigned long is_io;
+  	unsigned long *rmap;
+ -	pte_t *ptep;
+ +	pte_t pte;
+  	unsigned int writing;
+  	unsigned long mmu_seq;
+- 	unsigned long rcbits;
++ 	unsigned long rcbits, irq_flags = 0;
+  
+  	psize = hpte_page_size(pteh, ptel);
+  	if (!psize)
+@@@ -213,29 -190,37 +216,63 @@@
+  	slot_fn = gfn - memslot->base_gfn;
+  	rmap = &memslot->arch.rmap[slot_fn];
+  
+++<<<<<<< HEAD
+ +	if (!kvm->arch.using_mmu_notifiers) {
+ +		physp = memslot->arch.slot_phys;
+ +		if (!physp)
+ +			return H_PARAMETER;
+ +		physp += slot_fn;
+ +		if (realmode)
+ +			physp = real_vmalloc_addr(physp);
+ +		pa = *physp;
+ +		if (!pa)
+ +			return H_TOO_HARD;
+ +		is_io = pa & (HPTE_R_I | HPTE_R_W);
+ +		pte_size = PAGE_SIZE << (pa & KVMPPC_PAGE_ORDER_MASK);
+ +		pa &= PAGE_MASK;
+ +		pa |= gpa & ~PAGE_MASK;
+ +	} else {
+ +		/* Translate to host virtual address */
+ +		hva = __gfn_to_hva_memslot(memslot, gfn);
+ +
+ +		/* Look up the Linux PTE for the backing page */
+ +		pte_size = psize;
+ +		pte = lookup_linux_pte_and_update(pgdir, hva, writing,
+ +						  &pte_size);
+ +		if (pte_present(pte) && !pte_numa(pte)) {
+++=======
++ 	/* Translate to host virtual address */
++ 	hva = __gfn_to_hva_memslot(memslot, gfn);
++ 	/*
++ 	 * If we had a page table table change after lookup, we would
++ 	 * retry via mmu_notifier_retry.
++ 	 */
++ 	if (realmode)
++ 		ptep = __find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
++ 	else {
++ 		local_irq_save(irq_flags);
++ 		ptep = find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
++ 	}
++ 	if (ptep) {
++ 		pte_t pte;
++ 		unsigned int host_pte_size;
++ 
++ 		if (hpage_shift)
++ 			host_pte_size = 1ul << hpage_shift;
++ 		else
++ 			host_pte_size = PAGE_SIZE;
++ 		/*
++ 		 * We should always find the guest page size
++ 		 * to <= host page size, if host is using hugepage
++ 		 */
++ 		if (host_pte_size < psize) {
++ 			if (!realmode)
++ 				local_irq_restore(flags);
++ 			return H_PARAMETER;
++ 		}
++ 		pte = kvmppc_read_update_linux_pte(ptep, writing, hpage_shift);
++ 		if (pte_present(pte) && !pte_protnone(pte)) {
+++>>>>>>> 691e95fd7396 (powerpc/mm/thp: Make page table walk safe against thp split/collapse)
+  			if (writing && !pte_write(pte))
+  				/* make the actual HPTE be read-only */
+  				ptel = hpte_make_readonly(ptel);
+@@@ -245,10 -230,9 +282,12 @@@
+  			pa |= gpa & ~PAGE_MASK;
+  		}
+  	}
++ 	if (!realmode)
++ 		local_irq_restore(irq_flags);
+  
+ +	if (pte_size < psize)
+ +		return H_PARAMETER;
+ +
+  	ptel &= ~(HPTE_R_PP0 - psize);
+  	ptel |= pa;
+  
+diff --cc arch/powerpc/kvm/e500_mmu_host.c
+index 82aafd61162a,4d33e199edcc..000000000000
+--- a/arch/powerpc/kvm/e500_mmu_host.c
++++ b/arch/powerpc/kvm/e500_mmu_host.c
+@@@ -332,6 -331,18 +332,21 @@@ static inline int kvmppc_e500_shadow_ma
+  	unsigned long hva;
+  	int pfnmap = 0;
+  	int tsize = BOOK3E_PAGESZ_4K;
+++<<<<<<< HEAD
+++=======
++ 	int ret = 0;
++ 	unsigned long mmu_seq;
++ 	struct kvm *kvm = vcpu_e500->vcpu.kvm;
++ 	unsigned long tsize_pages = 0;
++ 	pte_t *ptep;
++ 	unsigned int wimg = 0;
++ 	pgd_t *pgdir;
++ 	unsigned long flags;
++ 
++ 	/* used to check for invalidations in progress */
++ 	mmu_seq = kvm->mmu_notifier_seq;
++ 	smp_rmb();
+++>>>>>>> 691e95fd7396 (powerpc/mm/thp: Make page table walk safe against thp split/collapse)
+  
+  	/*
+  	 * Translate guest physical to true physical, acquiring
+@@@ -449,7 -461,38 +464,42 @@@
+  		gvaddr &= ~((tsize_pages << PAGE_SHIFT) - 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	kvmppc_e500_ref_setup(ref, gtlbe, pfn);
+++=======
++ 	spin_lock(&kvm->mmu_lock);
++ 	if (mmu_notifier_retry(kvm, mmu_seq)) {
++ 		ret = -EAGAIN;
++ 		goto out;
++ 	}
++ 
++ 
++ 	pgdir = vcpu_e500->vcpu.arch.pgdir;
++ 	/*
++ 	 * We are just looking at the wimg bits, so we don't
++ 	 * care much about the trans splitting bit.
++ 	 * We are holding kvm->mmu_lock so a notifier invalidate
++ 	 * can't run hence pfn won't change.
++ 	 */
++ 	local_irq_save(flags);
++ 	ptep = find_linux_pte_or_hugepte(pgdir, hva, NULL);
++ 	if (ptep) {
++ 		pte_t pte = READ_ONCE(*ptep);
++ 
++ 		if (pte_present(pte)) {
++ 			wimg = (pte_val(pte) >> PTE_WIMGE_SHIFT) &
++ 				MAS2_WIMGE_MASK;
++ 			local_irq_restore(flags);
++ 		} else {
++ 			local_irq_restore(flags);
++ 			pr_err_ratelimited("%s: pte not present: gfn %lx,pfn %lx\n",
++ 					   __func__, (long)gfn, pfn);
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 	}
++ 	kvmppc_e500_ref_setup(ref, gtlbe, pfn, wimg);
+++>>>>>>> 691e95fd7396 (powerpc/mm/thp: Make page table walk safe against thp split/collapse)
+  
+  	kvmppc_e500_setup_stlbe(&vcpu_e500->vcpu, gtlbe, tsize,
+  				ref, gvaddr, stlbe);
+* Unmerged path arch/powerpc/include/asm/pgtable.h
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 6021b67a433c..e9e12f66e659 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -327,9 +327,11 @@ static inline unsigned long eeh_token_to_phys(unsigned long token)
+ 	int hugepage_shift;
+ 
+ 	/*
+-	 * We won't find hugepages here, iomem
++	 * We won't find hugepages here(this is iomem). Hence we are not
++	 * worried about _PAGE_SPLITTING/collapse. Also we will not hit
++	 * page table free, because of init_mm.
+ 	 */
+-	ptep = find_linux_pte_or_hugepte(init_mm.pgd, token, &hugepage_shift);
++	ptep = __find_linux_pte_or_hugepte(init_mm.pgd, token, &hugepage_shift);
+ 	if (!ptep)
+ 		return token;
+ 	WARN_ON(hugepage_shift);
+diff --git a/arch/powerpc/kernel/io-workarounds.c b/arch/powerpc/kernel/io-workarounds.c
+index 24b968f8e4d8..63d9cc4d7366 100644
+--- a/arch/powerpc/kernel/io-workarounds.c
++++ b/arch/powerpc/kernel/io-workarounds.c
+@@ -71,15 +71,15 @@ struct iowa_bus *iowa_mem_find_bus(const PCI_IO_ADDR addr)
+ 		vaddr = (unsigned long)PCI_FIX_ADDR(addr);
+ 		if (vaddr < PHB_IO_BASE || vaddr >= PHB_IO_END)
+ 			return NULL;
+-
+-		ptep = find_linux_pte_or_hugepte(init_mm.pgd, vaddr,
++		/*
++		 * We won't find huge pages here (iomem). Also can't hit
++		 * a page table free due to init_mm
++		 */
++		ptep = __find_linux_pte_or_hugepte(init_mm.pgd, vaddr,
+ 						 &hugepage_shift);
+ 		if (ptep == NULL)
+ 			paddr = 0;
+ 		else {
+-			/*
+-			 * we don't have hugepages backing iomem
+-			 */
+ 			WARN_ON(hugepage_shift);
+ 			paddr = pte_pfn(*ptep) << PAGE_SHIFT;
+ 		}
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index f682ff67a26c..8a63fe0f58bc 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -677,12 +677,13 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 		if (!writing && hpte_is_writable(r)) {
+ 			unsigned int hugepage_shift;
+ 			pte_t *ptep, pte;
++			unsigned long flags;
+ 
+ 			/*
+ 			 * We need to protect against page table destruction
+ 			 * while looking up and updating the pte.
+ 			 */
+-			rcu_read_lock_sched();
++			local_irq_save(flags);
+ 			ptep = find_linux_pte_or_hugepte(current->mm->pgd,
+ 							 hva, &hugepage_shift);
+ 			if (ptep) {
+@@ -691,7 +692,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 				if (pte_write(pte))
+ 					write_ok = 1;
+ 			}
+-			rcu_read_unlock_sched();
++			local_irq_restore(flags);
+ 		}
+ 	}
+ 
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_mmu.c
+* Unmerged path arch/powerpc/kvm/e500_mmu_host.c
+diff --git a/arch/powerpc/mm/hash_utils_64.c b/arch/powerpc/mm/hash_utils_64.c
+index fac435cd37ea..8c72ff64d9e3 100644
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@ -1080,7 +1080,7 @@ int hash_page(unsigned long ea, unsigned long access, unsigned long trap)
+ #endif /* CONFIG_PPC_64K_PAGES */
+ 
+ 	/* Get PTE and page size from page tables */
+-	ptep = find_linux_pte_or_hugepte(pgdir, ea, &hugeshift);
++	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &hugeshift);
+ 	if (ptep == NULL || !pte_present(*ptep)) {
+ 		DBG_LOW(" no PTE !\n");
+ 		rc = 1;
+diff --git a/arch/powerpc/mm/hugetlbpage.c b/arch/powerpc/mm/hugetlbpage.c
+index 2b186fc7d583..72b186a172fd 100644
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@ -106,7 +106,7 @@ int pgd_huge(pgd_t pgd)
+ pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr)
+ {
+ 	/* Only called for hugetlbfs pages, hence can ignore THP */
+-	return find_linux_pte_or_hugepte(mm->pgd, addr, NULL);
++	return __find_linux_pte_or_hugepte(mm->pgd, addr, NULL);
+ }
+ 
+ static int __hugepte_alloc(struct mm_struct *mm, hugepd_t *hpdp,
+@@ -675,28 +675,35 @@ void hugetlb_free_pgd_range(struct mmu_gather *tlb,
+ 	} while (addr = next, addr != end);
+ }
+ 
++/*
++ * We are holding mmap_sem, so a parallel huge page collapse cannot run.
++ * To prevent hugepage split, disable irq.
++ */
+ struct page *
+ follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+ {
+ 	pte_t *ptep;
+ 	struct page *page;
+ 	unsigned shift;
+-	unsigned long mask;
++	unsigned long mask, flags;
+ 	/*
+ 	 * Transparent hugepages are handled by generic code. We can skip them
+ 	 * here.
+ 	 */
++	local_irq_save(flags);
+ 	ptep = find_linux_pte_or_hugepte(mm->pgd, address, &shift);
+ 
+ 	/* Verify it is a huge page else bail. */
+-	if (!ptep || !shift || pmd_trans_huge(*(pmd_t *)ptep))
++	if (!ptep || !shift || pmd_trans_huge(*(pmd_t *)ptep)) {
++		local_irq_restore(flags);
+ 		return ERR_PTR(-EINVAL);
+-
++	}
+ 	mask = (1UL << shift) - 1;
+ 	page = pte_page(*ptep);
+ 	if (page)
+ 		page += (address & mask) / PAGE_SIZE;
+ 
++	local_irq_restore(flags);
+ 	return page;
+ }
+ 
+@@ -936,9 +943,12 @@ void flush_dcache_icache_hugepage(struct page *page)
+  *
+  * So long as we atomically load page table pointers we are safe against teardown,
+  * we can follow the address down to the the page and take a ref on it.
++ * This function need to be called with interrupts disabled. We use this variant
++ * when we have MSR[EE] = 0 but the paca->soft_enabled = 1
+  */
+ 
+-pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea, unsigned *shift)
++pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
++				   unsigned *shift)
+ {
+ 	pgd_t pgd, *pgdp;
+ 	pud_t pud, *pudp;
+@@ -1017,7 +1027,7 @@ out:
+ 		*shift = pdshift;
+ 	return ret_pte;
+ }
+-EXPORT_SYMBOL_GPL(find_linux_pte_or_hugepte);
++EXPORT_SYMBOL_GPL(__find_linux_pte_or_hugepte);
+ 
+ int gup_hugepte(pte_t *ptep, unsigned long sz, unsigned long addr,
+ 		unsigned long end, int write, struct page **pages, int *nr)
+diff --git a/arch/powerpc/perf/callchain.c b/arch/powerpc/perf/callchain.c
+index 63bc981cea52..342badc08365 100644
+--- a/arch/powerpc/perf/callchain.c
++++ b/arch/powerpc/perf/callchain.c
+@@ -111,41 +111,45 @@ perf_callchain_kernel(struct perf_callchain_entry *entry, struct pt_regs *regs)
+  * interrupt context, so if the access faults, we read the page tables
+  * to find which page (if any) is mapped and access it directly.
+  */
+-static int read_user_stack_slow(void __user *ptr, void *ret, int nb)
++static int read_user_stack_slow(void __user *ptr, void *buf, int nb)
+ {
++	int ret = -EFAULT;
+ 	pgd_t *pgdir;
+ 	pte_t *ptep, pte;
+ 	unsigned shift;
+ 	unsigned long addr = (unsigned long) ptr;
+ 	unsigned long offset;
+-	unsigned long pfn;
++	unsigned long pfn, flags;
+ 	void *kaddr;
+ 
+ 	pgdir = current->mm->pgd;
+ 	if (!pgdir)
+ 		return -EFAULT;
+ 
++	local_irq_save(flags);
+ 	ptep = find_linux_pte_or_hugepte(pgdir, addr, &shift);
++	if (!ptep)
++		goto err_out;
+ 	if (!shift)
+ 		shift = PAGE_SHIFT;
+ 
+ 	/* align address to page boundary */
+ 	offset = addr & ((1UL << shift) - 1);
+-	addr -= offset;
+ 
+-	if (ptep == NULL)
+-		return -EFAULT;
+-	pte = *ptep;
++	pte = READ_ONCE(*ptep);
+ 	if (!pte_present(pte) || !(pte_val(pte) & _PAGE_USER))
+-		return -EFAULT;
++		goto err_out;
+ 	pfn = pte_pfn(pte);
+ 	if (!page_is_ram(pfn))
+-		return -EFAULT;
++		goto err_out;
+ 
+ 	/* no highmem to worry about here */
+ 	kaddr = pfn_to_kaddr(pfn);
+-	memcpy(ret, kaddr + offset, nb);
+-	return 0;
++	memcpy(buf, kaddr + offset, nb);
++	ret = 0;
++err_out:
++	local_irq_restore(flags);
++	return ret;
+ }
+ 
+ static int read_user_stack_64(unsigned long __user *ptr, unsigned long *ret)
