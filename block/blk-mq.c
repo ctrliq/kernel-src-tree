@@ -33,6 +33,7 @@ static DEFINE_MUTEX(all_q_mutex);
 static LIST_HEAD(all_q_list);
 
 static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx);
+static void blk_mq_run_queues(struct request_queue *q);
 
 /*
  * Check if any of the ctx's have pending work in this hardware queue
@@ -117,7 +118,7 @@ static void blk_mq_freeze_queue_start(struct request_queue *q)
 
 	if (freeze) {
 		percpu_ref_kill(&q->mq_usage_counter);
-		blk_mq_run_queues(q, false);
+		blk_mq_run_queues(q);
 	}
 }
 
@@ -823,7 +824,7 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 	}
 }
 
-void blk_mq_run_queues(struct request_queue *q, bool async)
+static void blk_mq_run_queues(struct request_queue *q)
 {
 	struct blk_mq_hw_ctx *hctx;
 	int i;
@@ -834,10 +835,9 @@ void blk_mq_run_queues(struct request_queue *q, bool async)
 		    test_bit(BLK_MQ_S_STOPPED, &hctx->state))
 			continue;
 
-		blk_mq_run_hw_queue(hctx, async);
+		blk_mq_run_hw_queue(hctx, false);
 	}
 }
-EXPORT_SYMBOL(blk_mq_run_queues);
 
 void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx)
 {
@@ -874,7 +874,6 @@ void blk_mq_start_hw_queues(struct request_queue *q)
 		blk_mq_start_hw_queue(hctx);
 }
 EXPORT_SYMBOL(blk_mq_start_hw_queues);
-
 
 void blk_mq_start_stopped_hw_queues(struct request_queue *q, bool async)
 {
