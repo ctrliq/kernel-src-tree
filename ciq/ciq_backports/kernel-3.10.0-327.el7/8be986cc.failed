@@ -1,0 +1,244 @@
+hpsa: add support sending aborts to physical devices via the ioaccel2 path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Stephen Cameron <stephenmcameron@gmail.com>
+commit 8be986cc57f1f802a8cd8542ac309a0e6ac24a4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8be986cc.failed
+
+add support for tmf when in ioaccel2 mode
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Joe Handzik <joseph.t.handzik@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 8be986cc57f1f802a8cd8542ac309a0e6ac24a4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index f57c783f05e4,b92f3bc21bf4..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -802,8 -861,31 +802,30 @@@ static void set_ioaccel1_performant_mod
+  					IOACCEL1_BUSADDR_CMDTYPE;
+  }
+  
++ static void set_ioaccel2_tmf_performant_mode(struct ctlr_info *h,
++ 						struct CommandList *c,
++ 						int reply_queue)
++ {
++ 	struct hpsa_tmf_struct *cp = (struct hpsa_tmf_struct *)
++ 		&h->ioaccel2_cmd_pool[c->cmdindex];
++ 
++ 	/* Tell the controller to post the reply to the queue for this
++ 	 * processor.  This seems to give the best I/O throughput.
++ 	 */
++ 	if (likely(reply_queue == DEFAULT_REPLY_QUEUE))
++ 		cp->reply_queue = smp_processor_id() % h->nreply_queues;
++ 	else
++ 		cp->reply_queue = reply_queue % h->nreply_queues;
++ 	/* Set the bits in the address sent down to include:
++ 	 *  - performant mode bit not used in ioaccel mode 2
++ 	 *  - pull count (bits 0-3)
++ 	 *  - command type isn't needed for ioaccel2
++ 	 */
++ 	c->busaddr |= h->ioaccel2_blockFetchTable[0];
++ }
++ 
+  static void set_ioaccel2_performant_mode(struct ctlr_info *h,
+ -						struct CommandList *c,
+ -						int reply_queue)
+ +						struct CommandList *c)
+  {
+  	struct io_accel2_cmd *cp = &h->ioaccel2_cmd_pool[c->cmdindex];
+  
+@@@ -859,11 -946,15 +881,15 @@@ static void enqueue_cmd_and_start_io(st
+  		writel(c->busaddr, h->vaddr + SA5_REQUEST_PORT_OFFSET);
+  		break;
+  	case CMD_IOACCEL2:
+ -		set_ioaccel2_performant_mode(h, c, reply_queue);
+ +		set_ioaccel2_performant_mode(h, c);
+  		writel(c->busaddr, h->vaddr + IOACCEL2_INBOUND_POSTQ_32);
+  		break;
++ 	case IOACCEL2_TMF:
++ 		set_ioaccel2_tmf_performant_mode(h, c, reply_queue);
++ 		writel(c->busaddr, h->vaddr + IOACCEL2_INBOUND_POSTQ_32);
++ 		break;
+  	default:
+ -		set_performant_mode(h, c, reply_queue);
+ +		set_performant_mode(h, c);
+  		h->access.submit_command(h, c);
+  	}
+  }
+@@@ -4357,25 -5054,94 +4424,91 @@@ static int hpsa_send_reset_as_abort_ioa
+  	return rc; /* success */
+  }
+  
+++<<<<<<< HEAD
+ +/* Some Smart Arrays need the abort tag swizzled, and some don't.  It's hard to
+ + * tell which kind we're dealing with, so we send the abort both ways.  There
+ + * shouldn't be any collisions between swizzled and unswizzled tags due to the
+ + * way we construct our tags but we check anyway in case the assumptions which
+ + * make this true someday become false.
+ + */
+++=======
++ static int hpsa_send_abort_ioaccel2(struct ctlr_info *h,
++ 	struct CommandList *abort, int reply_queue)
++ {
++ 	int rc = IO_OK;
++ 	struct CommandList *c;
++ 	__le32 taglower, tagupper;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	struct io_accel2_cmd *c2;
++ 
++ 	dev = abort->scsi_cmd->device->hostdata;
++ 	if (!dev->offload_enabled && !dev->hba_ioaccel_enabled)
++ 		return -1;
++ 
++ 	c = cmd_alloc(h);
++ 	setup_ioaccel2_abort_cmd(c, h, abort, reply_queue);
++ 	c2 = &h->ioaccel2_cmd_pool[c->cmdindex];
++ 	(void) hpsa_scsi_do_simple_cmd(h, c, reply_queue, NO_TIMEOUT);
++ 	hpsa_get_tag(h, abort, &taglower, &tagupper);
++ 	dev_dbg(&h->pdev->dev,
++ 		"%s: Tag:0x%08x:%08x: do_simple_cmd(ioaccel2 abort) completed.\n",
++ 		__func__, tagupper, taglower);
++ 	/* no unmap needed here because no data xfer. */
++ 
++ 	dev_dbg(&h->pdev->dev,
++ 		"%s: Tag:0x%08x:%08x: abort service response = 0x%02x.\n",
++ 		__func__, tagupper, taglower, c2->error_data.serv_response);
++ 	switch (c2->error_data.serv_response) {
++ 	case IOACCEL2_SERV_RESPONSE_TMF_COMPLETE:
++ 	case IOACCEL2_SERV_RESPONSE_TMF_SUCCESS:
++ 		rc = 0;
++ 		break;
++ 	case IOACCEL2_SERV_RESPONSE_TMF_REJECTED:
++ 	case IOACCEL2_SERV_RESPONSE_FAILURE:
++ 	case IOACCEL2_SERV_RESPONSE_TMF_WRONG_LUN:
++ 		rc = -1;
++ 		break;
++ 	default:
++ 		dev_warn(&h->pdev->dev,
++ 			"%s: Tag:0x%08x:%08x: unknown abort service response 0x%02x\n",
++ 			__func__, tagupper, taglower,
++ 			c2->error_data.serv_response);
++ 		rc = -1;
++ 	}
++ 	cmd_free(h, c);
++ 	dev_dbg(&h->pdev->dev, "%s: Tag:0x%08x:%08x: Finished.\n", __func__,
++ 		tagupper, taglower);
++ 	return rc;
++ }
++ 
+++>>>>>>> 8be986cc57f1 (hpsa: add support sending aborts to physical devices via the ioaccel2 path)
+  static int hpsa_send_abort_both_ways(struct ctlr_info *h,
+ -	unsigned char *scsi3addr, struct CommandList *abort, int reply_queue)
+ +	unsigned char *scsi3addr, struct CommandList *abort)
+  {
+- 	/* ioccelerator mode 2 commands should be aborted via the
++ 	/*
++ 	 * ioccelerator mode 2 commands should be aborted via the
+  	 * accelerated path, since RAID path is unaware of these commands,
+- 	 * but underlying firmware can't handle abort TMF.
+- 	 * Change abort to physical device reset.
++ 	 * but not all underlying firmware can handle abort TMF.
++ 	 * Change abort to physical device reset when abort TMF is unsupported.
+  	 */
+++<<<<<<< HEAD
+ +	if (abort->cmd_type == CMD_IOACCEL2)
+ +		return hpsa_send_reset_as_abort_ioaccel2(h, scsi3addr, abort);
+++=======
++ 	if (abort->cmd_type == CMD_IOACCEL2) {
++ 		if (HPSATMF_IOACCEL_ENABLED & h->TMFSupportFlags)
++ 			return hpsa_send_abort_ioaccel2(h, abort,
++ 						reply_queue);
++ 		else
++ 			return hpsa_send_reset_as_abort_ioaccel2(h, scsi3addr,
++ 							abort, reply_queue);
++ 	}
++ 	return hpsa_send_abort(h, scsi3addr, abort, reply_queue);
++ }
+++>>>>>>> 8be986cc57f1 (hpsa: add support sending aborts to physical devices via the ioaccel2 path)
+  
+ -/* Find out which reply queue a command was meant to return on */
+ -static int hpsa_extract_reply_queue(struct ctlr_info *h,
+ -					struct CommandList *c)
+ -{
+ -	if (c->cmd_type == CMD_IOACCEL2)
+ -		return h->ioaccel2_cmd_pool[c->cmdindex].reply_queue;
+ -	return c->Header.ReplyQueue;
+ -}
+ -
+ -/*
+ - * Limit concurrency of abort commands to prevent
+ - * over-subscription of commands
+ - */
+ -static inline int wait_for_available_abort_cmd(struct ctlr_info *h)
+ -{
+ -#define ABORT_CMD_WAIT_MSECS 5000
+ -	return !wait_event_timeout(h->abort_cmd_wait_queue,
+ -			atomic_dec_if_positive(&h->abort_cmds_available) >= 0,
+ -			msecs_to_jiffies(ABORT_CMD_WAIT_MSECS));
+ +	return hpsa_send_abort(h, scsi3addr, abort, 0) &&
+ +			hpsa_send_abort(h, scsi3addr, abort, 1);
+  }
+  
+  /* Send an abort for the specified command.
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index bb1c5c5da1f2..657f204e45d4 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -207,6 +207,7 @@ struct ctlr_info {
+ #define HPSATMF_PHYS_QRY_TASK   (1 << 7)
+ #define HPSATMF_PHYS_QRY_TSET   (1 << 8)
+ #define HPSATMF_PHYS_QRY_ASYNC  (1 << 9)
++#define HPSATMF_IOACCEL_ENABLED (1 << 15)
+ #define HPSATMF_MASK_SUPPORTED  (1 << 16)
+ #define HPSATMF_LOG_LUN_RESET   (1 << 17)
+ #define HPSATMF_LOG_NEX_RESET   (1 << 18)
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index 9a0de7e7efe1..6a6de947bdd8 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -374,6 +374,7 @@ struct ErrorInfo {
+ #define CMD_SCSI	0x03
+ #define CMD_IOACCEL1	0x04
+ #define CMD_IOACCEL2	0x05
++#define IOACCEL2_TMF	0x06
+ 
+ #define DIRECT_LOOKUP_SHIFT 4
+ #define DIRECT_LOOKUP_MASK (~((1 << DIRECT_LOOKUP_SHIFT) - 1))
+@@ -555,6 +556,7 @@ struct io_accel2_cmd {
+ #define IOACCEL2_DIR_NO_DATA	0x00
+ #define IOACCEL2_DIR_DATA_IN	0x01
+ #define IOACCEL2_DIR_DATA_OUT	0x02
++#define IOACCEL2_TMF_ABORT	0x01
+ /*
+  * SCSI Task Management Request format for Accelerator Mode 2
+  */
+@@ -563,13 +565,13 @@ struct hpsa_tmf_struct {
+ 	u8 reply_queue;		/* Reply Queue ID */
+ 	u8 tmf;			/* Task Management Function */
+ 	u8 reserved1;		/* byte 3 Reserved */
+-	u32 it_nexus;		/* SCSI I-T Nexus */
++	__le32 it_nexus;	/* SCSI I-T Nexus */
+ 	u8 lun_id[8];		/* LUN ID for TMF request */
+ 	__le64 tag;		/* cciss tag associated w/ request */
+ 	__le64 abort_tag;	/* cciss tag of SCSI cmd or TMF to abort */
+ 	__le64 error_ptr;		/* Error Pointer */
+ 	__le32 error_len;		/* Error Length */
+-};
++} __aligned(IOACCEL2_COMMANDLIST_ALIGNMENT);
+ 
+ /* Configuration Table Structure */
+ struct HostWrite {
