@@ -1,0 +1,225 @@
+mm: numa: Do not group on RO pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [mm] numa: Do not group on RO pages (Rik van Riel) [683513]
+Rebuild_FUZZ: 93.75%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6688cc05473b36a0a3d3971e1adf1712919b32eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6688cc05.failed
+
+And here's a little something to make sure not the whole world ends up
+in a single group.
+
+As while we don't migrate shared executable pages, we do scan/fault on
+them. And since everybody links to libc, everybody ends up in the same
+group.
+
+	Suggested-by: Rik van Riel <riel@redhat.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+Link: http://lkml.kernel.org/r/1381141781-10992-47-git-send-email-mgorman@suse.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6688cc05473b36a0a3d3971e1adf1712919b32eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/fair.c
+#	mm/huge_memory.c
+#	mm/memory.c
+diff --cc include/linux/sched.h
+index dcb716d68b2f,ff543851a18a..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1441,13 -1450,22 +1441,25 @@@ struct task_struct 
+  /* Future-safe accessor for struct task_struct's cpus_allowed. */
+  #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+  
++ #define TNF_MIGRATED	0x01
++ #define TNF_NO_GROUP	0x02
++ 
+  #ifdef CONFIG_NUMA_BALANCING
+++<<<<<<< HEAD
+ +extern void task_numa_fault(int node, int pages, bool migrated);
+ +extern void set_numabalancing_state(bool enabled);
+ +#else
+ +static inline void task_numa_fault(int node, int pages, bool migrated)
+++=======
++ extern void task_numa_fault(int last_node, int node, int pages, int flags);
++ extern pid_t task_numa_group_id(struct task_struct *p);
++ extern void set_numabalancing_state(bool enabled);
++ #else
++ static inline void task_numa_fault(int last_node, int node, int pages,
++ 				   int flags)
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  {
+  }
+ -static inline pid_t task_numa_group_id(struct task_struct *p)
+ -{
+ -	return 0;
+ -}
+  static inline void set_numabalancing_state(bool enabled)
+  {
+  }
+diff --cc kernel/sched/fair.c
+index 98cee68da024,35661b8afb4e..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -876,9 -1361,11 +876,17 @@@ static void task_numa_placement(struct 
+  /*
+   * Got a PROT_NONE fault for a page on @node.
+   */
+++<<<<<<< HEAD
+ +void task_numa_fault(int node, int pages, bool migrated)
+ +{
+ +	struct task_struct *p = current;
+++=======
++ void task_numa_fault(int last_cpupid, int node, int pages, int flags)
++ {
++ 	struct task_struct *p = current;
++ 	bool migrated = flags & TNF_MIGRATED;
++ 	int priv;
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  
+  	if (!numabalancing_enabled)
+  		return;
+@@@ -893,7 -1384,19 +901,23 @@@
+  			return;
+  
+  		BUG_ON(p->numa_faults_buffer);
+++<<<<<<< HEAD
+ +		p->numa_faults_buffer = p->numa_faults + nr_node_ids;
+++=======
++ 		p->numa_faults_buffer = p->numa_faults + (2 * nr_node_ids);
++ 	}
++ 
++ 	/*
++ 	 * First accesses are treated as private, otherwise consider accesses
++ 	 * to be private if the accessing pid has not changed
++ 	 */
++ 	if (unlikely(last_cpupid == (-1 & LAST_CPUPID_MASK))) {
++ 		priv = 1;
++ 	} else {
++ 		priv = cpupid_match_pid(p, last_cpupid);
++ 		if (!priv && !(flags & TNF_NO_GROUP))
++ 			task_numa_group(p, last_cpupid);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  	}
+  
+  	/*
+diff --cc mm/huge_memory.c
+index ba9f65152a91,7ab4e32afe12..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1294,9 -1282,10 +1294,10 @@@ int do_huge_pmd_numa_page(struct mm_str
+  	struct page *page;
+  	unsigned long haddr = addr & HPAGE_PMD_MASK;
+  	int page_nid = -1, this_nid = numa_node_id();
+ -	int target_nid, last_cpupid = -1;
+ +	int target_nid;
+  	bool page_locked;
+  	bool migrated = false;
++ 	int flags = 0;
+  
+  	spin_lock(&mm->page_table_lock);
+  	if (unlikely(!pmd_same(pmd, *pmdp)))
+@@@ -1373,7 -1373,7 +1384,11 @@@ out
+  		page_unlock_anon_vma_read(anon_vma);
+  
+  	if (page_nid != -1)
+++<<<<<<< HEAD
+ +		task_numa_fault(page_nid, HPAGE_PMD_NR, migrated);
+++=======
++ 		task_numa_fault(last_cpupid, page_nid, HPAGE_PMD_NR, flags);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  
+  	return 0;
+  }
+diff --cc mm/memory.c
+index 6285e7df615f,eba846bcf124..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3533,8 -3544,10 +3533,9 @@@ int do_numa_page(struct mm_struct *mm, 
+  	struct page *page = NULL;
+  	spinlock_t *ptl;
+  	int page_nid = -1;
+ -	int last_cpupid;
+  	int target_nid;
+  	bool migrated = false;
++ 	int flags = 0;
+  
+  	/*
+  	* The "pte" at this point cannot be used safely without
+@@@ -3563,6 -3576,15 +3564,18 @@@
+  	}
+  	BUG_ON(is_zero_pfn(page_to_pfn(page)));
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Avoid grouping on DSO/COW pages in specific and RO pages
++ 	 * in general, RO pages shouldn't hurt as much anyway since
++ 	 * they can be in shared cache state.
++ 	 */
++ 	if (!pte_write(pte))
++ 		flags |= TNF_NO_GROUP;
++ 
++ 	last_cpupid = page_cpupid_last(page);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  	page_nid = page_to_nid(page);
+  	target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+  	pte_unmap_unlock(ptep, ptl);
+@@@ -3578,7 -3602,7 +3593,11 @@@
+  
+  out:
+  	if (page_nid != -1)
+++<<<<<<< HEAD
+ +		task_numa_fault(page_nid, 1, migrated);
+++=======
++ 		task_numa_fault(last_cpupid, page_nid, 1, flags);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  	return 0;
+  }
+  
+@@@ -3637,6 -3663,15 +3657,18 @@@ static int do_pmd_numa_page(struct mm_s
+  		if (unlikely(!page))
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Avoid grouping on DSO/COW pages in specific and RO pages
++ 		 * in general, RO pages shouldn't hurt as much anyway since
++ 		 * they can be in shared cache state.
++ 		 */
++ 		if (!pte_write(pteval))
++ 			flags |= TNF_NO_GROUP;
++ 
++ 		last_cpupid = page_cpupid_last(page);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  		page_nid = page_to_nid(page);
+  		target_nid = numa_migrate_prep(page, vma, addr, page_nid);
+  		pte_unmap_unlock(pte, ptl);
+@@@ -3649,7 -3686,7 +3683,11 @@@
+  		}
+  
+  		if (page_nid != -1)
+++<<<<<<< HEAD
+ +			task_numa_fault(page_nid, 1, migrated);
+++=======
++ 			task_numa_fault(last_cpupid, page_nid, 1, flags);
+++>>>>>>> 6688cc05473b (mm: numa: Do not group on RO pages)
+  
+  		pte = pte_offset_map_lock(mm, pmdp, addr, &ptl);
+  	}
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/fair.c
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/memory.c
