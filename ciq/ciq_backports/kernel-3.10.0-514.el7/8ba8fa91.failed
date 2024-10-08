@@ -1,0 +1,393 @@
+fsnotify: rename event handling functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 8ba8fa917093510cdcb4ec8ff8b9603e1b525658
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8ba8fa91.failed
+
+Rename fsnotify_add_notify_event() to fsnotify_add_event() since the
+"notify" part is duplicit.  Rename fsnotify_remove_notify_event() and
+fsnotify_peek_notify_event() to fsnotify_remove_first_event() and
+fsnotify_peek_first_event() respectively since "notify" part is duplicit
+and they really look at the first event in the queue.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Cc: Eric Paris <eparis@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8ba8fa917093510cdcb4ec8ff8b9603e1b525658)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/inotify/inotify_fsnotify.c
+#	fs/notify/notification.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/fanotify/fanotify.c
+index 0c2f9122b262,fdeb36b70c65..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -217,6 -142,93 +217,96 @@@ static bool fanotify_should_send_event(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct fanotify_event_info *fanotify_alloc_event(struct inode *inode, u32 mask,
++ 						 struct path *path)
++ {
++ 	struct fanotify_event_info *event;
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		struct fanotify_perm_event_info *pevent;
++ 
++ 		pevent = kmem_cache_alloc(fanotify_perm_event_cachep,
++ 					  GFP_KERNEL);
++ 		if (!pevent)
++ 			return NULL;
++ 		event = &pevent->fae;
++ 		pevent->response = 0;
++ 		goto init;
++ 	}
++ #endif
++ 	event = kmem_cache_alloc(fanotify_event_cachep, GFP_KERNEL);
++ 	if (!event)
++ 		return NULL;
++ init: __maybe_unused
++ 	fsnotify_init_event(&event->fse, inode, mask);
++ 	event->tgid = get_pid(task_tgid(current));
++ 	if (path) {
++ 		event->path = *path;
++ 		path_get(&event->path);
++ 	} else {
++ 		event->path.mnt = NULL;
++ 		event->path.dentry = NULL;
++ 	}
++ 	return event;
++ }
++ 
++ static int fanotify_handle_event(struct fsnotify_group *group,
++ 				 struct inode *inode,
++ 				 struct fsnotify_mark *inode_mark,
++ 				 struct fsnotify_mark *fanotify_mark,
++ 				 u32 mask, void *data, int data_type,
++ 				 const unsigned char *file_name, u32 cookie)
++ {
++ 	int ret = 0;
++ 	struct fanotify_event_info *event;
++ 	struct fsnotify_event *fsn_event;
++ 
++ 	BUILD_BUG_ON(FAN_ACCESS != FS_ACCESS);
++ 	BUILD_BUG_ON(FAN_MODIFY != FS_MODIFY);
++ 	BUILD_BUG_ON(FAN_CLOSE_NOWRITE != FS_CLOSE_NOWRITE);
++ 	BUILD_BUG_ON(FAN_CLOSE_WRITE != FS_CLOSE_WRITE);
++ 	BUILD_BUG_ON(FAN_OPEN != FS_OPEN);
++ 	BUILD_BUG_ON(FAN_EVENT_ON_CHILD != FS_EVENT_ON_CHILD);
++ 	BUILD_BUG_ON(FAN_Q_OVERFLOW != FS_Q_OVERFLOW);
++ 	BUILD_BUG_ON(FAN_OPEN_PERM != FS_OPEN_PERM);
++ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
++ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
++ 
++ 	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
++ 					data_type))
++ 		return 0;
++ 
++ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
++ 		 mask);
++ 
++ 	event = fanotify_alloc_event(inode, mask, data);
++ 	if (unlikely(!event))
++ 		return -ENOMEM;
++ 
++ 	fsn_event = &event->fse;
++ 	ret = fsnotify_add_event(group, fsn_event, fanotify_merge);
++ 	if (ret) {
++ 		/* Permission events shouldn't be merged */
++ 		BUG_ON(ret == 1 && mask & FAN_ALL_PERM_EVENTS);
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
++ 
++ 		return 0;
++ 	}
++ 
++ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++ 	if (mask & FAN_ALL_PERM_EVENTS) {
++ 		ret = fanotify_get_response(group, FANOTIFY_PE(fsn_event));
++ 		fsnotify_destroy_event(group, fsn_event);
++ 	}
++ #endif
++ 	return ret;
++ }
++ 
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  static void fanotify_free_group_priv(struct fsnotify_group *group)
+  {
+  	struct user_struct *user;
+diff --cc fs/notify/inotify/inotify_fsnotify.c
+index 4216308b81b4,0f88bc0b4e6c..000000000000
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@@ -110,25 -95,23 +110,32 @@@ static int inotify_handle_event(struct 
+  
+  	i_mark = container_of(inode_mark, struct inotify_inode_mark,
+  			      fsn_mark);
+ +	wd = i_mark->wd;
+  
+ -	event = kmalloc(alloc_len, GFP_KERNEL);
+ -	if (unlikely(!event))
+ +	event_priv = kmem_cache_alloc(event_priv_cachep, GFP_KERNEL);
+ +	if (unlikely(!event_priv))
+  		return -ENOMEM;
+  
+ -	fsn_event = &event->fse;
+ -	fsnotify_init_event(fsn_event, inode, mask);
+ -	event->wd = i_mark->wd;
+ -	event->sync_cookie = cookie;
+ -	event->name_len = len;
+ -	if (len)
+ -		strcpy(event->name, file_name);
+ -
+ +	fsn_event_priv = &event_priv->fsnotify_event_priv_data;
+ +
+++<<<<<<< HEAD
+ +	fsnotify_get_group(group);
+ +	fsn_event_priv->group = group;
+ +	event_priv->wd = wd;
+ +
+ +	added_event = fsnotify_add_notify_event(group, event, fsn_event_priv, inotify_merge);
+ +	if (added_event) {
+ +		inotify_free_event_priv(fsn_event_priv);
+ +		if (!IS_ERR(added_event))
+ +			fsnotify_put_event(added_event);
+ +		else
+ +			ret = PTR_ERR(added_event);
+++=======
++ 	ret = fsnotify_add_event(group, fsn_event, inotify_merge);
++ 	if (ret) {
++ 		/* Our event wasn't used in the end. Free it. */
++ 		fsnotify_destroy_event(group, fsn_event);
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  	}
+  
+  	if (inode_mark->mask & IN_ONESHOT)
+diff --cc fs/notify/notification.c
+index a03904d119e4,1d394220acbe..000000000000
+--- a/fs/notify/notification.c
++++ b/fs/notify/notification.c
+@@@ -134,34 -79,19 +134,41 @@@ struct fsnotify_event_private_data *fsn
+  
+  /*
+   * Add an event to the group notification queue.  The group can later pull this
+ - * event off the queue to deal with.  The function returns 0 if the event was
+ - * added to the queue, 1 if the event was merged with some other queued event,
+ - * 2 if the queue of events has overflown.
+ + * event off the queue to deal with.  If the event is successfully added to the
+ + * group's notification queue, a reference is taken on event.
+   */
+++<<<<<<< HEAD
+ +struct fsnotify_event *fsnotify_add_notify_event(struct fsnotify_group *group, struct fsnotify_event *event,
+ +						 struct fsnotify_event_private_data *priv,
+ +						 struct fsnotify_event *(*merge)(struct list_head *,
+ +										 struct fsnotify_event *))
+++=======
++ int fsnotify_add_event(struct fsnotify_group *group,
++ 		       struct fsnotify_event *event,
++ 		       int (*merge)(struct list_head *,
++ 				    struct fsnotify_event *))
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  {
+ -	int ret = 0;
+ +	struct fsnotify_event *return_event = NULL;
+ +	struct fsnotify_event_holder *holder = NULL;
+  	struct list_head *list = &group->notification_list;
+  
+ -	pr_debug("%s: group=%p event=%p\n", __func__, group, event);
+ +	pr_debug("%s: group=%p event=%p priv=%p\n", __func__, group, event, priv);
+ +
+ +	/*
+ +	 * There is one fsnotify_event_holder embedded inside each fsnotify_event.
+ +	 * Check if we expect to be able to use that holder.  If not alloc a new
+ +	 * holder.
+ +	 * For the overflow event it's possible that something will use the in
+ +	 * event holder before we get the lock so we may need to jump back and
+ +	 * alloc a new holder, this can't happen for most events...
+ +	 */
+ +	if (!list_empty(&event->holder.event_list)) {
+ +alloc_holder:
+ +		holder = fsnotify_alloc_event_holder();
+ +		if (!holder)
+ +			return ERR_PTR(-ENOMEM);
+ +	}
+  
+  	mutex_lock(&group->notification_mutex);
+  
+@@@ -243,51 -125,39 +250,62 @@@
+  }
+  
+  /*
+ - * Remove and return the first event from the notification list.  It is the
+ - * responsibility of the caller to destroy the obtained event
+ + * Remove and return the first event from the notification list.  There is a
+ + * reference held on this event since it was on the list.  It is the responsibility
+ + * of the caller to drop this reference.
+   */
+- struct fsnotify_event *fsnotify_remove_notify_event(struct fsnotify_group *group)
++ struct fsnotify_event *fsnotify_remove_first_event(struct fsnotify_group *group)
+  {
+  	struct fsnotify_event *event;
+ +	struct fsnotify_event_holder *holder;
+  
+  	BUG_ON(!mutex_is_locked(&group->notification_mutex));
+  
+  	pr_debug("%s: group=%p\n", __func__, group);
+  
+++<<<<<<< HEAD
+ +	holder = list_first_entry(&group->notification_list, struct fsnotify_event_holder, event_list);
+ +
+ +	event = holder->event;
+ +
+ +	spin_lock(&event->lock);
+ +	holder->event = NULL;
+ +	list_del_init(&holder->event_list);
+ +	spin_unlock(&event->lock);
+ +
+ +	/* event == holder means we are referenced through the in event holder */
+ +	if (holder != &event->holder)
+ +		fsnotify_destroy_event_holder(holder);
+ +
+++=======
++ 	event = list_first_entry(&group->notification_list,
++ 				 struct fsnotify_event, list);
++ 	/*
++ 	 * We need to init list head for the case of overflow event so that
++ 	 * check in fsnotify_add_event() works
++ 	 */
++ 	list_del_init(&event->list);
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  	group->q_len--;
+  
+  	return event;
+  }
+  
+  /*
+-  * This will not remove the event, that must be done with fsnotify_remove_notify_event()
++  * This will not remove the event, that must be done with
++  * fsnotify_remove_first_event()
+   */
+- struct fsnotify_event *fsnotify_peek_notify_event(struct fsnotify_group *group)
++ struct fsnotify_event *fsnotify_peek_first_event(struct fsnotify_group *group)
+  {
+ +	struct fsnotify_event *event;
+ +	struct fsnotify_event_holder *holder;
+ +
+  	BUG_ON(!mutex_is_locked(&group->notification_mutex));
+  
+ -	return list_first_entry(&group->notification_list,
+ -				struct fsnotify_event, list);
+ +	holder = list_first_entry(&group->notification_list, struct fsnotify_event_holder, event_list);
+ +	event = holder->event;
+ +
+ +	return event;
+  }
+  
+  /*
+@@@ -301,16 -170,8 +319,21 @@@ void fsnotify_flush_notify(struct fsnot
+  
+  	mutex_lock(&group->notification_mutex);
+  	while (!fsnotify_notify_queue_is_empty(group)) {
+++<<<<<<< HEAD
+ +		event = fsnotify_remove_notify_event(group);
+ +		/* if they don't implement free_event_priv they better not have attached any */
+ +		if (group->ops->free_event_priv) {
+ +			spin_lock(&event->lock);
+ +			priv = fsnotify_remove_priv_from_event(group, event);
+ +			spin_unlock(&event->lock);
+ +			if (priv)
+ +				group->ops->free_event_priv(priv);
+ +		}
+ +		fsnotify_put_event(event); /* matches fsnotify_add_notify_event */
+++=======
++ 		event = fsnotify_remove_first_event(group);
++ 		fsnotify_destroy_event(group, event);
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  	}
+  	mutex_unlock(&group->notification_mutex);
+  }
+diff --cc include/linux/fsnotify_backend.h
+index 4b2ee8d12f5e,a6e899943363..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -370,19 -318,14 +370,26 @@@ extern void fsnotify_put_group(struct f
+  extern void fsnotify_destroy_group(struct fsnotify_group *group);
+  /* fasync handler function */
+  extern int fsnotify_fasync(int fd, struct file *file, int on);
+ -/* Free event from memory */
+ -extern void fsnotify_destroy_event(struct fsnotify_group *group,
+ -				   struct fsnotify_event *event);
+ +/* take a reference to an event */
+ +extern void fsnotify_get_event(struct fsnotify_event *event);
+ +extern void fsnotify_put_event(struct fsnotify_event *event);
+ +/* find private data previously attached to an event and unlink it */
+ +extern struct fsnotify_event_private_data *fsnotify_remove_priv_from_event(struct fsnotify_group *group,
+ +									   struct fsnotify_event *event);
+ +
+  /* attach the event to the group notification queue */
+++<<<<<<< HEAD
+ +extern struct fsnotify_event *fsnotify_add_notify_event(struct fsnotify_group *group,
+ +							struct fsnotify_event *event,
+ +							struct fsnotify_event_private_data *priv,
+ +							struct fsnotify_event *(*merge)(struct list_head *,
+ +											struct fsnotify_event *));
+++=======
++ extern int fsnotify_add_event(struct fsnotify_group *group,
++ 			      struct fsnotify_event *event,
++ 			      int (*merge)(struct list_head *,
++ 					   struct fsnotify_event *));
+++>>>>>>> 8ba8fa917093 (fsnotify: rename event handling functions)
+  /* true if the group notification queue is empty */
+  extern bool fsnotify_notify_queue_is_empty(struct fsnotify_group *group);
+  /* return, but do not dequeue the first event on the notification queue */
+* Unmerged path fs/notify/fanotify/fanotify.c
+diff --git a/fs/notify/fanotify/fanotify_user.c b/fs/notify/fanotify/fanotify_user.c
+index 8ef1b0f829ee..8657165a8324 100644
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -57,7 +57,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 
+ 	/* held the notification_mutex the whole time, so this is the
+ 	 * same event we peeked above */
+-	return fsnotify_remove_notify_event(group);
++	return fsnotify_remove_first_event(group);
+ }
+ 
+ static int create_fd(struct fsnotify_group *group,
+* Unmerged path fs/notify/inotify/inotify_fsnotify.c
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 5fc2bfa3a6c1..acac7752ae77 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -147,7 +147,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 	if (fsnotify_notify_queue_is_empty(group))
+ 		return NULL;
+ 
+-	event = fsnotify_peek_notify_event(group);
++	event = fsnotify_peek_first_event(group);
+ 
+ 	pr_debug("%s: group=%p event=%p\n", __func__, group, event);
+ 
+@@ -157,7 +157,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 
+ 	/* held the notification_mutex the whole time, so this is the
+ 	 * same event we peeked above */
+-	fsnotify_remove_notify_event(group);
++	fsnotify_remove_first_event(group);
+ 
+ 	return event;
+ }
+* Unmerged path fs/notify/notification.c
+* Unmerged path include/linux/fsnotify_backend.h
