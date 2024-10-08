@@ -628,6 +628,11 @@ static void iwl_mvm_mac_ctxt_cmd_fill_sta(struct iwl_mvm *mvm,
 		ctxt_sta->is_assoc = cpu_to_le32(1);
 	} else {
 		ctxt_sta->is_assoc = cpu_to_le32(0);
+
+		/* Allow beacons to pass through as long as we are not
+		 * associated, or we do not have dtim period information.
+		 */
+		cmd.filter_flags |= cpu_to_le32(MAC_FILTER_IN_BEACON);
 	}
 
 	ctxt_sta->bi = cpu_to_le32(vif->bss_conf.beacon_int);
