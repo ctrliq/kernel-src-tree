@@ -1863,6 +1863,7 @@ int probe_nhm_msrs(unsigned int family, unsigned int model)
 		pkg_cstate_limits = phi_pkg_cstate_limits;
 		break;
 	case 0x5C:	/* BXT */
+	case 0x5F:	/* DNV */
 		pkg_cstate_limits = bxt_pkg_cstate_limits;
 		break;
 	default:
@@ -2763,6 +2764,7 @@ void process_cpuid()
 					crystal_hz = 24000000;	/* 24.0 MHz */
 					break;
 				case 0x5C:	/* BXT */
+				case 0x5F:	/* DNV */
 					crystal_hz = 19200000;	/* 19.2 MHz */
 					break;
 				default:
