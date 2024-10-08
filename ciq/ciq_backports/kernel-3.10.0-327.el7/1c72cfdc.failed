@@ -1,0 +1,413 @@
+bonding: clean curr_slave_lock use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 1c72cfdc96e63bf975cab514c4ca4d8a661ba0e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1c72cfdc.failed
+
+Mostly all users of curr_slave_lock already have RTNL as we've discussed
+previously so there's no point in using it, the one case where the lock
+must stay is the 3ad code, in fact it's the only one.
+It's okay to remove it from bond_do_fail_over_mac() as it's called with
+RTNL and drops the curr_slave_lock anyway.
+bond_change_active_slave() is one of the main places where
+curr_slave_lock was used, it's okay to remove it as all callers use RTNL
+these days before calling it, that's why we move the ASSERT_RTNL() in
+the beginning to catch any potential offenders to this rule.
+The RTNL argument actually applies to all of the places where
+curr_slave_lock has been removed from in this patch.
+Also remove the unnecessary bond_deref_active_protected() macro and use
+rtnl_dereference() instead.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1c72cfdc96e63bf975cab514c4ca4d8a661ba0e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bond_options.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_alb.c
+index 06a8df1ef842,b755659ddfdc..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -412,7 -451,9 +412,13 @@@ static struct slave *rlb_next_rx_slave(
+   */
+  static void rlb_teach_disabled_mac_on_primary(struct bonding *bond, u8 addr[])
+  {
+++<<<<<<< HEAD
+ +	if (!bond->curr_active_slave)
+++=======
++ 	struct slave *curr_active = rtnl_dereference(bond->curr_active_slave);
++ 
++ 	if (!curr_active)
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		return;
+  
+  	if (!bond->alb_info.primary_is_promisc) {
+@@@ -471,12 -512,8 +477,16 @@@ static void rlb_clear_slave(struct bond
+  
+  	_unlock_rx_hashtbl_bh(bond);
+  
+++<<<<<<< HEAD
+ +	write_lock_bh(&bond->curr_slave_lock);
+ +
+ +	if (slave != bond->curr_active_slave)
+++=======
++ 	if (slave != rtnl_dereference(bond->curr_active_slave))
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		rlb_teach_disabled_mac_on_primary(bond, slave->dev->dev_addr);
+ +
+ +	write_unlock_bh(&bond->curr_slave_lock);
+  }
+  
+  static void rlb_update_client(struct rlb_client_info *client_info)
+diff --cc drivers/net/bonding/bond_main.c
+index b4cb8784d691,3b06685260b8..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -890,15 -661,13 +885,13 @@@ static void bond_do_fail_over_mac(struc
+  		if (!new_active)
+  			return;
+  
+- 		write_unlock_bh(&bond->curr_slave_lock);
+- 
+  		if (old_active) {
+ -			ether_addr_copy(tmp_mac, new_active->dev->dev_addr);
+ -			ether_addr_copy(saddr.sa_data,
+ -					old_active->dev->dev_addr);
+ +			memcpy(tmp_mac, new_active->dev->dev_addr, ETH_ALEN);
+ +			memcpy(saddr.sa_data, old_active->dev->dev_addr,
+ +			       ETH_ALEN);
+  			saddr.sa_family = new_active->dev->type;
+  		} else {
+ -			ether_addr_copy(saddr.sa_data, bond->dev->dev_addr);
+ +			memcpy(saddr.sa_data, bond->dev->dev_addr, ETH_ALEN);
+  			saddr.sa_family = bond->dev->type;
+  		}
+  
+@@@ -917,14 -686,13 +910,13 @@@
+  
+  		rv = dev_set_mac_address(old_active->dev, &saddr);
+  		if (rv)
+ -			netdev_err(bond->dev, "Error %d setting MAC of slave %s\n",
+ -				   -rv, new_active->dev->name);
+ +			pr_err("%s: Error %d setting MAC of slave %s\n",
+ +			       bond->dev->name, -rv, new_active->dev->name);
+  out:
+- 		write_lock_bh(&bond->curr_slave_lock);
+  		break;
+  	default:
+ -		netdev_err(bond->dev, "bond_do_fail_over_mac impossible: bad policy %d\n",
+ -			   bond->params.fail_over_mac);
+ +		pr_err("%s: bond_do_fail_over_mac impossible: bad policy %d\n",
+ +		       bond->dev->name, bond->params.fail_over_mac);
+  		break;
+  	}
+  
+@@@ -932,8 -700,8 +924,13 @@@
+  
+  static bool bond_should_change_active(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	struct slave *prim = bond->primary_slave;
+ +	struct slave *curr = bond->curr_active_slave;
+++=======
++ 	struct slave *prim = rtnl_dereference(bond->primary_slave);
++ 	struct slave *curr = rtnl_dereference(bond->curr_active_slave);
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  
+  	if (!prim || !curr || curr->link != BOND_LINK_UP)
+  		return true;
+@@@ -1028,7 -781,11 +1025,15 @@@ static bool bond_should_notify_peers(st
+   */
+  void bond_change_active_slave(struct bonding *bond, struct slave *new_active)
+  {
+++<<<<<<< HEAD
+ +	struct slave *old_active = bond->curr_active_slave;
+++=======
++ 	struct slave *old_active;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	old_active = rtnl_dereference(bond->curr_active_slave);
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  
+  	if (old_active == new_active)
+  		return;
+@@@ -1132,7 -889,7 +1133,11 @@@ void bond_select_active_slave(struct bo
+  	int rv;
+  
+  	best_slave = bond_find_best_slave(bond);
+++<<<<<<< HEAD
+ +	if (best_slave != bond->curr_active_slave) {
+++=======
++ 	if (best_slave != rtnl_dereference(bond->curr_active_slave)) {
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		bond_change_active_slave(bond, best_slave);
+  		rv = bond_set_carrier(bond);
+  		if (!rv)
+@@@ -1831,11 -1547,26 +1836,28 @@@ int bond_enslave(struct net_device *bon
+  		goto err_unregister;
+  	}
+  
+ -	res = bond_sysfs_slave_add(new_slave);
+ -	if (res) {
+ -		netdev_dbg(bond_dev, "Error %d calling bond_sysfs_slave_add\n", res);
+ -		goto err_upper_unlink;
+ -	}
+  
+++<<<<<<< HEAD
+ +	pr_info("%s: enslaving %s as a%s interface with a%s link.\n",
+ +		bond_dev->name, slave_dev->name,
+ +		bond_is_active_slave(new_slave) ? "n active" : " backup",
+ +		new_slave->link != BOND_LINK_DOWN ? "n up" : " down");
+++=======
++ 	bond->slave_cnt++;
++ 	bond_compute_features(bond);
++ 	bond_set_carrier(bond);
++ 
++ 	if (bond_uses_primary(bond)) {
++ 		block_netpoll_tx();
++ 		bond_select_active_slave(bond);
++ 		unblock_netpoll_tx();
++ 	}
++ 
++ 	netdev_info(bond_dev, "Enslaving %s as %s interface with %s link\n",
++ 		    slave_dev->name,
++ 		    bond_is_active_slave(new_slave) ? "an active" : "a backup",
++ 		    new_slave->link != BOND_LINK_DOWN ? "an up" : "a down");
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  
+  	/* enslave is successful */
+  	return 0;
+@@@ -1844,31 -1575,24 +1866,43 @@@
+  err_unregister:
+  	netdev_rx_handler_unregister(slave_dev);
+  
+ -err_detach:
+ -	if (!bond_uses_primary(bond))
+ -		bond_hw_addr_flush(bond_dev, slave_dev);
+ +err_dest_symlinks:
+ +	bond_destroy_slave_symlinks(bond_dev, slave_dev);
+  
+++<<<<<<< HEAD
+ +err_detach:
+ +	if (!USES_PRIMARY(bond->params.mode)) {
+ +		netif_addr_lock_bh(bond_dev);
+ +		bond_mc_list_flush(bond_dev, slave_dev);
+ +		netif_addr_unlock_bh(bond_dev);
+ +	}
+ +	bond_del_vlans_from_slave(bond, slave_dev);
+ +	write_lock_bh(&bond->lock);
+ +	bond_detach_slave(bond, new_slave);
+ +	if (bond->primary_slave == new_slave)
+ +		bond->primary_slave = NULL;
+ +	if (bond->curr_active_slave == new_slave) {
+++=======
++ 	vlan_vids_del_by_dev(slave_dev, bond_dev);
++ 	if (rcu_access_pointer(bond->primary_slave) == new_slave)
++ 		RCU_INIT_POINTER(bond->primary_slave, NULL);
++ 	if (rcu_access_pointer(bond->curr_active_slave) == new_slave) {
++ 		block_netpoll_tx();
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		bond_change_active_slave(bond, NULL);
+ +		write_unlock_bh(&bond->lock);
+ +		read_lock(&bond->lock);
+ +		write_lock_bh(&bond->curr_slave_lock);
+  		bond_select_active_slave(bond);
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		read_unlock(&bond->lock);
+ +	} else {
+ +		write_unlock_bh(&bond->lock);
+++=======
++ 		unblock_netpoll_tx();
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  	}
+ -	/* either primary_slave or curr_active_slave might've changed */
+ -	synchronize_rcu();
+  	slave_disable_netpoll(new_slave);
+  
+  err_close:
+@@@ -2008,18 -1724,10 +2042,22 @@@ static int __bond_release_one(struct ne
+  		 * is no concern that another slave add/remove event
+  		 * will interfere.
+  		 */
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->lock);
+ +		read_lock(&bond->lock);
+ +		write_lock_bh(&bond->curr_slave_lock);
+ +
+  		bond_select_active_slave(bond);
+ +
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		read_unlock(&bond->lock);
+ +		write_lock_bh(&bond->lock);
+++=======
+++		bond_select_active_slave(bond);
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  	}
+  
+ -	if (!bond_has_slaves(bond)) {
+ +	if (bond->slave_cnt == 0) {
+  		bond_set_carrier(bond);
+  		eth_hw_addr_random(bond_dev);
+  	}
+@@@ -2735,14 -2472,20 +2771,25 @@@ void bond_loadbalance_arp_mon(struct wo
+  			bond_arp_send_all(bond, slave);
+  	}
+  
+ -	rcu_read_unlock();
+ +	if (do_failover) {
+ +		block_netpoll_tx();
+ +		write_lock_bh(&bond->curr_slave_lock);
+  
+ -	if (do_failover || slave_state_changed) {
+ -		if (!rtnl_trylock())
+ -			goto re_arm;
+ +		bond_select_active_slave(bond);
+  
+++<<<<<<< HEAD
+ +		write_unlock_bh(&bond->curr_slave_lock);
+ +		unblock_netpoll_tx();
+++=======
++ 		if (slave_state_changed) {
++ 			bond_slave_state_change(bond);
++ 		} else if (do_failover) {
++ 			block_netpoll_tx();
++ 			bond_select_active_slave(bond);
++ 			unblock_netpoll_tx();
++ 		}
++ 		rtnl_unlock();
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  	}
+  
+  re_arm:
+@@@ -3158,12 -2901,12 +3203,21 @@@ static int bond_slave_netdev_event(unsi
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		pr_info("%s: Primary slave changed to %s, reselecting active slave.\n",
+ +			bond->dev->name, bond->primary_slave ? slave_dev->name :
+ +							       "none");
+ +		write_lock_bh(&bond->curr_slave_lock);
+ +		bond_select_active_slave(bond);
+ +		write_unlock_bh(&bond->curr_slave_lock);
+++=======
++ 		netdev_info(bond->dev, "Primary slave changed to %s, reselecting active slave\n",
++ 			    primary ? slave_dev->name : "none");
++ 
++ 		block_netpoll_tx();
++ 		bond_select_active_slave(bond);
++ 		unblock_netpoll_tx();
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		break;
+  	case NETDEV_FEAT_CHANGE:
+  		bond_compute_features(bond);
+@@@ -3340,24 -3065,22 +3394,32 @@@ static void bond_work_cancel_all(struc
+  static int bond_open(struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+ -	struct list_head *iter;
+  	struct slave *slave;
+ +	int i;
+  
+  	/* reset slave->backup and slave->inactive */
+++<<<<<<< HEAD
+ +	read_lock(&bond->lock);
+ +	if (bond->slave_cnt > 0) {
+ +		read_lock(&bond->curr_slave_lock);
+ +		bond_for_each_slave(bond, slave, i) {
+ +			if ((bond->params.mode == BOND_MODE_ACTIVEBACKUP)
+ +				&& (slave != bond->curr_active_slave)) {
+ +				bond_set_slave_inactive_flags(slave);
+++=======
++ 	if (bond_has_slaves(bond)) {
++ 		bond_for_each_slave(bond, slave, iter) {
++ 			if (bond_uses_primary(bond) &&
++ 			    slave != rcu_access_pointer(bond->curr_active_slave)) {
++ 				bond_set_slave_inactive_flags(slave,
++ 							      BOND_SLAVE_NOTIFY_NOW);
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  			} else {
+ -				bond_set_slave_active_flags(slave,
+ -							    BOND_SLAVE_NOTIFY_NOW);
+ +				bond_set_slave_active_flags(slave);
+  			}
+  		}
+- 		read_unlock(&bond->curr_slave_lock);
+  	}
+ +	read_unlock(&bond->lock);
+  
+  	bond_work_init_all(bond);
+  
+@@@ -3481,16 -3201,10 +3543,20 @@@ static int bond_do_ioctl(struct net_dev
+  		if (!mii)
+  			return -EINVAL;
+  
+- 
+  		if (mii->reg_num == 1) {
+  			mii->val_out = 0;
+++<<<<<<< HEAD
+ +			read_lock(&bond->lock);
+ +			read_lock(&bond->curr_slave_lock);
+ +			if (netif_carrier_ok(bond->dev))
+ +				mii->val_out = BMSR_LSTATUS;
+ +
+ +			read_unlock(&bond->curr_slave_lock);
+ +			read_unlock(&bond->lock);
+++=======
++ 			if (netif_carrier_ok(bond->dev))
++ 				mii->val_out = BMSR_LSTATUS;
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  		}
+  
+  		return 0;
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,02afdeb08765..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -207,12 -184,7 +207,16 @@@ struct slave 
+  
+  /*
+   * Here are the locking policies for the two bonding locks:
+++<<<<<<< HEAD
+ + *
+ + * 1) Get bond->lock when reading/writing slave list.
+ + * 2) Get bond->curr_slave_lock when reading/writing bond->curr_active_slave.
+ + *    (It is unnecessary when the write-lock is put with bond->lock.)
+ + * 3) When we lock with bond->curr_slave_lock, we must lock with bond->lock
+ + *    beforehand.
+++=======
++  * Get rcu_read_lock when reading or RTNL when writing slave list.
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+   */
+  struct bonding {
+  	struct   net_device *dev; /* first - useful for panic debug */
+@@@ -258,6 -225,11 +262,14 @@@
+  #define bond_slave_get_rtnl(dev) \
+  	((struct slave *) rtnl_dereference(dev->rx_handler_data))
+  
+++<<<<<<< HEAD
+++=======
++ struct bond_vlan_tag {
++ 	__be16		vlan_proto;
++ 	unsigned short	vlan_id;
++ };
++ 
+++>>>>>>> 1c72cfdc96e6 (bonding: clean curr_slave_lock use)
+  /**
+   * Returns NULL if the net_device does not belong to any of the bond's slaves
+   *
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_alb.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bonding.h
