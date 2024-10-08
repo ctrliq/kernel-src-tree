@@ -1,0 +1,154 @@
+block: protect rw_page against device teardown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 2e6edc95382cc36423aff18a237173ad62d5ab52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2e6edc95.failed
+
+Fix use after free crashes like the following:
+
+ general protection fault: 0000 [#1] SMP
+ Call Trace:
+  [<ffffffffa0050216>] ? pmem_do_bvec.isra.12+0xa6/0xf0 [nd_pmem]
+  [<ffffffffa0050ba2>] pmem_rw_page+0x42/0x80 [nd_pmem]
+  [<ffffffff8128fd90>] bdev_read_page+0x50/0x60
+  [<ffffffff812972f0>] do_mpage_readpage+0x510/0x770
+  [<ffffffff8128fd20>] ? I_BDEV+0x20/0x20
+  [<ffffffff811d86dc>] ? lru_cache_add+0x1c/0x50
+  [<ffffffff81297657>] mpage_readpages+0x107/0x170
+  [<ffffffff8128fd20>] ? I_BDEV+0x20/0x20
+  [<ffffffff8128fd20>] ? I_BDEV+0x20/0x20
+  [<ffffffff8129058d>] blkdev_readpages+0x1d/0x20
+  [<ffffffff811d615f>] __do_page_cache_readahead+0x28f/0x310
+  [<ffffffff811d6039>] ? __do_page_cache_readahead+0x169/0x310
+  [<ffffffff811c5abd>] ? pagecache_get_page+0x2d/0x1d0
+  [<ffffffff811c76f6>] filemap_fault+0x396/0x530
+  [<ffffffff811f816e>] __do_fault+0x4e/0xf0
+  [<ffffffff811fce7d>] handle_mm_fault+0x11bd/0x1b50
+
+	Cc: <stable@vger.kernel.org>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Acked-by: Matthew Wilcox <willy@linux.intel.com>
+[willy: symmetry fixups]
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 2e6edc95382cc36423aff18a237173ad62d5ab52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+#	include/linux/blkdev.h
+diff --cc block/blk.h
+index 9eb83530207b,c43926d3d74d..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -74,6 -72,18 +74,21 @@@ void blk_dequeue_request(struct reques
+  void __blk_queue_free_tags(struct request_queue *q);
+  bool __blk_end_bidi_request(struct request *rq, int error,
+  			    unsigned int nr_bytes, unsigned int bidi_bytes);
+++<<<<<<< HEAD
+++=======
++ void blk_freeze_queue(struct request_queue *q);
++ 
++ static inline void blk_queue_enter_live(struct request_queue *q)
++ {
++ 	/*
++ 	 * Given that running in generic_make_request() context
++ 	 * guarantees that a live reference against q_usage_counter has
++ 	 * been established, further references under that same context
++ 	 * need not check that the queue has been frozen (marked dead).
++ 	 */
++ 	percpu_ref_get(&q->q_usage_counter);
++ }
+++>>>>>>> 2e6edc95382c (block: protect rw_page against device teardown)
+  
+  #ifdef CONFIG_BLK_DEV_INTEGRITY
+  void blk_flush_integrity(void);
+diff --cc include/linux/blkdev.h
+index 0e72d45d3caf,c0d2b7927c1f..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -855,27 -794,8 +855,32 @@@ extern int scsi_cmd_ioctl(struct reques
+  extern int sg_scsi_ioctl(struct request_queue *, struct gendisk *, fmode_t,
+  			 struct scsi_ioctl_command __user *);
+  
+++<<<<<<< HEAD
+ +extern void blk_queue_bio(struct request_queue *q, struct bio *bio);
+ +
+ +/*
+ + * A queue has just exitted congestion.  Note this in the global counter of
+ + * congested queues, and wake up anyone who was waiting for requests to be
+ + * put back.
+ + */
+ +static inline void blk_clear_queue_congested(struct request_queue *q, int sync)
+ +{
+ +	clear_bdi_congested(&q->backing_dev_info, sync);
+ +}
+ +
+ +/*
+ + * A queue has just entered congestion.  Flag that in the queue's VM-visible
+ + * state flags and increment the global gounter of congested queues.
+ + */
+ +static inline void blk_set_queue_congested(struct request_queue *q, int sync)
+ +{
+ +	set_bdi_congested(&q->backing_dev_info, sync);
+ +}
+ +
+++=======
++ extern int blk_queue_enter(struct request_queue *q, gfp_t gfp);
++ extern void blk_queue_exit(struct request_queue *q);
+++>>>>>>> 2e6edc95382c (block: protect rw_page against device teardown)
+  extern void blk_start_queue(struct request_queue *q);
+  extern void blk_stop_queue(struct request_queue *q);
+  extern void blk_sync_queue(struct request_queue *q);
+* Unmerged path block/blk.h
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 2557803cf68e..fa67d990f6c7 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -401,9 +401,17 @@ int bdev_read_page(struct block_device *bdev, sector_t sector,
+ 			struct page *page)
+ {
+ 	const struct block_device_operations *ops = bdev->bd_disk->fops;
++	int result = -EOPNOTSUPP;
++
+ 	if (!ops->rw_page || bdev_get_integrity(bdev))
+-		return -EOPNOTSUPP;
+-	return ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
++		return result;
++
++	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
++	if (result)
++		return result;
++	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
++	blk_queue_exit(bdev->bd_queue);
++	return result;
+ }
+ EXPORT_SYMBOL_GPL(bdev_read_page);
+ 
+@@ -432,14 +440,20 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
+ 	int result;
+ 	int rw = (wbc->sync_mode == WB_SYNC_ALL) ? WRITE_SYNC : WRITE;
+ 	const struct block_device_operations *ops = bdev->bd_disk->fops;
++
+ 	if (!ops->rw_page || bdev_get_integrity(bdev))
+ 		return -EOPNOTSUPP;
++	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
++	if (result)
++		return result;
++
+ 	set_page_writeback(page);
+ 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, rw);
+ 	if (result)
+ 		end_page_writeback(page);
+ 	else
+ 		unlock_page(page);
++	blk_queue_exit(bdev->bd_queue);
+ 	return result;
+ }
+ EXPORT_SYMBOL_GPL(bdev_write_page);
+* Unmerged path include/linux/blkdev.h
