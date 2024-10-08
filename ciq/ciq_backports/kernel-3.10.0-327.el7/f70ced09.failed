@@ -1,0 +1,269 @@
+blk-mq: support per-distpatch_queue flush machinery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Ming Lei <ming.lei@canonical.com>
+commit f70ced09170761acb69840cafaace4abc72cba4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f70ced09.failed
+
+This patch supports to run one single flush machinery for
+each blk-mq dispatch queue, so that:
+
+- current init_request and exit_request callbacks can
+cover flush request too, then the buggy copying way of
+initializing flush request's pdu can be fixed
+
+- flushing performance gets improved in case of multi hw-queue
+
+In fio sync write test over virtio-blk(4 hw queues, ioengine=sync,
+iodepth=64, numjobs=4, bs=4K), it is observed that througput gets
+increased a lot over my test environment:
+	- throughput: +70% in case of virtio-blk over null_blk
+	- throughput: +30% in case of virtio-blk over SSD image
+
+The multi virtqueue feature isn't merged to QEMU yet, and patches for
+the feature can be found in below tree:
+
+	git://kernel.ubuntu.com/ming/qemu.git  	v2.1.0-mq.4
+
+And simply passing 'num_queues=4 vectors=5' should be enough to
+enable multi queue(quad queue) feature for QEMU virtio-blk.
+
+	Suggested-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Ming Lei <ming.lei@canonical.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f70ced09170761acb69840cafaace4abc72cba4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-flush.c
+#	block/blk-mq.c
+#	block/blk-sysfs.c
+#	block/blk.h
+#	include/linux/blk-mq.h
+diff --cc block/blk-core.c
+index 6c8ecd3370db,e1c2775c7597..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -708,8 -704,8 +708,13 @@@ blk_init_allocated_queue(struct request
+  	if (!q)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	q->flush_rq = kzalloc(sizeof(struct request), GFP_KERNEL);
+ +	if (!q->flush_rq)
+++=======
++ 	q->fq = blk_alloc_flush_queue(q, NUMA_NO_NODE, 0);
++ 	if (!q->fq)
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  		return NULL;
+  
+  	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
+diff --cc block/blk-flush.c
+index 4ba98aaf2ce6,20badd7b9d1b..000000000000
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@@ -297,11 -302,18 +297,18 @@@ static bool blk_kick_flush(struct reque
+  	 * Issue flush and toggle pending_idx.  This makes pending_idx
+  	 * different from running_idx, which means flush is in flight.
+  	 */
+ -	fq->flush_pending_idx ^= 1;
+ +	q->flush_pending_idx ^= 1;
+  
+  	blk_rq_init(q, flush_rq);
+- 	if (q->mq_ops)
+- 		blk_mq_clone_flush_request(flush_rq, first_rq);
++ 
++ 	/*
++ 	 * Borrow tag from the first request since they can't
++ 	 * be in flight at the same time.
++ 	 */
++ 	if (q->mq_ops) {
++ 		flush_rq->mq_ctx = first_rq->mq_ctx;
++ 		flush_rq->tag = first_rq->tag;
++ 	}
+  
+  	flush_rq->cmd_type = REQ_TYPE_FS;
+  	flush_rq->cmd_flags = WRITE_FLUSH | REQ_FLUSH_SEQ;
+@@@ -490,16 -487,43 +497,57 @@@ int blkdev_issue_flush(struct block_dev
+  }
+  EXPORT_SYMBOL(blkdev_issue_flush);
+  
+++<<<<<<< HEAD
+ +int blk_mq_init_flush(struct request_queue *q)
+++=======
++ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
++ 		int node, int cmd_size)
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  {
+ -	struct blk_flush_queue *fq;
+ -	int rq_sz = sizeof(struct request);
+ -
+ +	struct blk_mq_tag_set *set = q->tag_set;
+ +
+++<<<<<<< HEAD
+ +	spin_lock_init(&q->mq_flush_lock);
+ +
+ +	q->flush_rq = kzalloc(round_up(sizeof(struct request) +
+ +				set->cmd_size, cache_line_size()),
+ +				GFP_KERNEL);
+ +	if (!q->flush_rq)
+ +		return -ENOMEM;
+ +	return 0;
+++=======
++ 	fq = kzalloc_node(sizeof(*fq), GFP_KERNEL, node);
++ 	if (!fq)
++ 		goto fail;
++ 
++ 	if (q->mq_ops) {
++ 		spin_lock_init(&fq->mq_flush_lock);
++ 		rq_sz = round_up(rq_sz + cmd_size, cache_line_size());
++ 	}
++ 
++ 	fq->flush_rq = kzalloc_node(rq_sz, GFP_KERNEL, node);
++ 	if (!fq->flush_rq)
++ 		goto fail_rq;
++ 
++ 	INIT_LIST_HEAD(&fq->flush_queue[0]);
++ 	INIT_LIST_HEAD(&fq->flush_queue[1]);
++ 	INIT_LIST_HEAD(&fq->flush_data_in_flight);
++ 
++ 	return fq;
++ 
++  fail_rq:
++ 	kfree(fq);
++  fail:
++ 	return NULL;
++ }
++ 
++ void blk_free_flush_queue(struct blk_flush_queue *fq)
++ {
++ 	/* bio based request queue hasn't flush queue */
++ 	if (!fq)
++ 		return;
++ 
++ 	kfree(fq->flush_rq);
++ 	kfree(fq);
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  }
+diff --cc block/blk-mq.c
+index 77afc91943c8,4e7a31466139..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1863,9 -1866,6 +1867,12 @@@ struct request_queue *blk_mq_init_queue
+  
+  	blk_mq_add_queue_tag_set(set, q);
+  
+++<<<<<<< HEAD
+ +	if (blk_mq_init_flush(q))
+ +		goto err_hw_queues;
+ +
+++=======
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  	blk_mq_map_swqueue(q);
+  
+  	return q;
+diff --cc block/blk-sysfs.c
+index 10d2058fed92,e8f38a36c625..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -548,7 -517,10 +548,14 @@@ static void blk_release_queue(struct ko
+  	if (q->queue_tags)
+  		__blk_queue_free_tags(q);
+  
+++<<<<<<< HEAD
+ +	kfree(q->flush_rq);
+++=======
++ 	if (q->mq_ops)
++ 		blk_mq_free_queue(q);
++ 	else
++ 		blk_free_flush_queue(q->fq);
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  
+  	blk_trace_shutdown(q);
+  
+diff --cc block/blk.h
+index e515a285d4c9,43b036185712..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -17,11 -30,28 +19,34 @@@ extern struct kmem_cache *request_cache
+  extern struct kobj_type blk_queue_ktype;
+  extern struct ida blk_queue_ida;
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct blk_flush_queue *blk_get_flush_queue(
++ 		struct request_queue *q, struct blk_mq_ctx *ctx)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	if (!q->mq_ops)
++ 		return q->fq;
++ 
++ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++ 
++ 	return hctx->fq;
++ }
++ 
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  static inline void __blk_get_queue(struct request_queue *q)
+  {
+  	kobject_get(&q->kobj);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
++ 		int node, int cmd_size);
++ void blk_free_flush_queue(struct blk_flush_queue *q);
++ 
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  int blk_init_rl(struct request_list *rl, struct request_queue *q,
+  		gfp_t gfp_mask);
+  void blk_exit_rl(struct request_list *rl);
+diff --cc include/linux/blk-mq.h
+index 736ba31fe3c6,02c5d950f444..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -2,9 -2,9 +2,10 @@@
+  #define BLK_MQ_H
+  
+  #include <linux/blkdev.h>
+ +#include <linux/rh_kabi.h>
+  
+  struct blk_mq_tags;
++ struct blk_flush_queue;
+  
+  struct blk_mq_cpu_notifier {
+  	struct list_head list;
+@@@ -168,6 -117,18 +170,21 @@@ struct blk_mq_ops 
+  	 */
+  	init_hctx_fn		*init_hctx;
+  	exit_hctx_fn		*exit_hctx;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Called for every command allocated by the block layer to allow
++ 	 * the driver to set up driver specific data.
++ 	 *
++ 	 * Tag greater than or equal to queue_depth is for setting up
++ 	 * flush request.
++ 	 *
++ 	 * Ditto for exit/teardown.
++ 	 */
++ 	init_request_fn		*init_request;
++ 	exit_request_fn		*exit_request;
+++>>>>>>> f70ced091707 (blk-mq: support per-distpatch_queue flush machinery)
+  };
+  
+  enum {
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-flush.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-sysfs.c
+* Unmerged path block/blk.h
+* Unmerged path include/linux/blk-mq.h
