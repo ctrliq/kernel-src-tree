@@ -1,0 +1,175 @@
+gpiolib: improve overlap check of range of gpio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bamvor Jian Zhang <bamvor.zhangjian@linaro.org>
+commit ef7c7553039b3d1c847b38b0f1ea208f8d5d8370
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ef7c7553.failed
+
+There are limitations for the current checker:
+1.  Could not check the overlap if the new gpiochip is the secondly
+    gpiochip.
+2.  Could not check the overlap if the new gpiochip is overlap
+    with the left of gpiochip. E.g. if we insert [c, d] between
+    [a,b] and [e, f], and e >= c + d, it will successful even if
+    c < a + b.
+3.  Allow overlap of base of different gpiochip.
+
+This patch fix these issues by checking the overlap of both right and
+left gpiochip in the same loop statement.
+
+	Signed-off-by: Bamvor Jian Zhang <bamvor.zhangjian@linaro.org>
+[Tweaked to remove unnecessary ret variable]
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit ef7c7553039b3d1c847b38b0f1ea208f8d5d8370)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib.c
+diff --cc drivers/gpio/gpiolib.c
+index 9b50ed619d38,eed70c36e8ac..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -1127,34 -189,113 +1127,73 @@@ static inline void gpiochip_unexport(st
+   */
+  static int gpiochip_add_to_list(struct gpio_chip *chip)
+  {
+++<<<<<<< HEAD
+ +	struct list_head *pos = &gpio_chips;
+ +	struct gpio_chip *_chip;
+ +	int err = 0;
+++=======
++ 	struct list_head *pos;
++ 	struct gpio_chip *iterator;
++ 	struct gpio_chip *previous = NULL;
++ 
++ 	if (list_empty(&gpio_chips)) {
++ 		pos = gpio_chips.next;
++ 		goto found;
++ 	}
+++>>>>>>> ef7c7553039b (gpiolib: improve overlap check of range of gpio)
+  
+- 	/* find where to insert our chip */
+  	list_for_each(pos, &gpio_chips) {
+++<<<<<<< HEAD
+ +		_chip = list_entry(pos, struct gpio_chip, list);
+ +		/* shall we insert before _chip? */
+ +		if (_chip->base >= chip->base + chip->ngpio)
+ +			break;
+ +	}
+ +
+ +	/* are we stepping on the chip right before? */
+ +	if (pos != &gpio_chips && pos->prev != &gpio_chips) {
+ +		_chip = list_entry(pos->prev, struct gpio_chip, list);
+ +		if (_chip->base + _chip->ngpio > chip->base) {
+ +			dev_err(chip->dev,
+ +			       "GPIO integer space overlap, cannot add chip\n");
+ +			err = -EBUSY;
+++=======
++ 		iterator = list_entry(pos, struct gpio_chip, list);
++ 		if (iterator->base >= chip->base + chip->ngpio) {
++ 			/*
++ 			 * Iterator is the first GPIO chip so there is no
++ 			 * previous one
++ 			 */
++ 			if (previous == NULL) {
++ 				goto found;
++ 			} else {
++ 				/*
++ 				 * We found a valid range(means
++ 				 * [base, base + ngpio - 1]) between previous
++ 				 * and iterator chip.
++ 				 */
++ 				if (previous->base + previous->ngpio
++ 						<= chip->base)
++ 					goto found;
++ 			}
+++>>>>>>> ef7c7553039b (gpiolib: improve overlap check of range of gpio)
+  		}
++ 		previous = iterator;
+  	}
+  
+- 	if (!err)
+- 		list_add_tail(&chip->list, pos);
++ 	/* We are beyond the last chip in the list */
++ 	if (iterator->base + iterator->ngpio <= chip->base)
++ 		goto found;
++ 
++ 	dev_err(chip->parent,
++ 	       "GPIO integer space overlap, cannot add chip\n");
++ 	return -EBUSY;
+  
+- 	return err;
++ found:
++ 	list_add_tail(&chip->list, pos);
++ 	return 0;
+  }
+  
+ -/**
+ - * Convert a GPIO name to its descriptor
+ - */
+ -static struct gpio_desc *gpio_name_to_desc(const char * const name)
+ -{
+ -	struct gpio_chip *chip;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&gpio_lock, flags);
+ -
+ -	list_for_each_entry(chip, &gpio_chips, list) {
+ -		int i;
+ -
+ -		for (i = 0; i != chip->ngpio; ++i) {
+ -			struct gpio_desc *gpio = &chip->desc[i];
+ -
+ -			if (!gpio->name)
+ -				continue;
+ -
+ -			if (!strcmp(gpio->name, name)) {
+ -				spin_unlock_irqrestore(&gpio_lock, flags);
+ -				return gpio;
+ -			}
+ -		}
+ -	}
+ -
+ -	spin_unlock_irqrestore(&gpio_lock, flags);
+ -
+ -	return NULL;
+ -}
+ -
+ -/*
+ - * Takes the names from gc->names and checks if they are all unique. If they
+ - * are, they are assigned to their gpio descriptors.
+ - *
+ - * Warning if one of the names is already used for a different GPIO.
+ - */
+ -static int gpiochip_set_desc_names(struct gpio_chip *gc)
+ -{
+ -	int i;
+ -
+ -	if (!gc->names)
+ -		return 0;
+ -
+ -	/* First check all names if they are unique */
+ -	for (i = 0; i != gc->ngpio; ++i) {
+ -		struct gpio_desc *gpio;
+ -
+ -		gpio = gpio_name_to_desc(gc->names[i]);
+ -		if (gpio)
+ -			dev_warn(gc->parent, "Detected name collision for "
+ -				 "GPIO name '%s'\n",
+ -				 gc->names[i]);
+ -	}
+ -
+ -	/* Then add all names to the GPIO descriptors */
+ -	for (i = 0; i != gc->ngpio; ++i)
+ -		gc->desc[i].name = gc->names[i];
+ -
+ -	return 0;
+ -}
+ -
+  /**
+   * gpiochip_add() - register a gpio_chip
+   * @chip: the chip to register, with chip->base initialized
+* Unmerged path drivers/gpio/gpiolib.c
