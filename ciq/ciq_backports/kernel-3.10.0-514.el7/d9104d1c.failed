@@ -1,0 +1,297 @@
+mm: track vma changes with VM_SOFTDIRTY bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] track vma changes with VM_SOFTDIRTY bit (Oleg Nesterov) [1269561]
+Rebuild_FUZZ: 95.12%
+commit-author Cyrill Gorcunov <gorcunov@gmail.com>
+commit d9104d1ca9662498339c0de975b4666c30485f4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d9104d1c.failed
+
+Pavel reported that in case if vma area get unmapped and then mapped (or
+expanded) in-place, the soft dirty tracker won't be able to recognize this
+situation since it works on pte level and ptes are get zapped on unmap,
+loosing soft dirty bit of course.
+
+So to resolve this situation we need to track actions on vma level, there
+VM_SOFTDIRTY flag comes in.  When new vma area created (or old expanded)
+we set this bit, and keep it here until application calls for clearing
+soft dirty bit.
+
+Thus when user space application track memory changes now it can detect if
+vma area is renewed.
+
+	Reported-by: Pavel Emelyanov <xemul@parallels.com>
+	Signed-off-by: Cyrill Gorcunov <gorcunov@openvz.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Matt Mackall <mpm@selenic.com>
+	Cc: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@gmail.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Rob Landley <rob@landley.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d9104d1ca9662498339c0de975b4666c30485f4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/vm/soft-dirty.txt
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index 452c618feb42,09228639b83d..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -703,8 -716,37 +703,39 @@@ enum clear_refs_types 
+  
+  struct clear_refs_private {
+  	struct vm_area_struct *vma;
+ -	enum clear_refs_types type;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline void clear_soft_dirty(struct vm_area_struct *vma,
++ 		unsigned long addr, pte_t *pte)
++ {
++ #ifdef CONFIG_MEM_SOFT_DIRTY
++ 	/*
++ 	 * The soft-dirty tracker uses #PF-s to catch writes
++ 	 * to pages, so write-protect the pte as well. See the
++ 	 * Documentation/vm/soft-dirty.txt for full description
++ 	 * of how soft-dirty works.
++ 	 */
++ 	pte_t ptent = *pte;
++ 
++ 	if (pte_present(ptent)) {
++ 		ptent = pte_wrprotect(ptent);
++ 		ptent = pte_clear_flags(ptent, _PAGE_SOFT_DIRTY);
++ 	} else if (is_swap_pte(ptent)) {
++ 		ptent = pte_swp_clear_soft_dirty(ptent);
++ 	} else if (pte_file(ptent)) {
++ 		ptent = pte_file_clear_soft_dirty(ptent);
++ 	}
++ 
++ 	if (vma->vm_flags & VM_SOFTDIRTY)
++ 		vma->vm_flags &= ~VM_SOFTDIRTY;
++ 
++ 	set_pte_at(vma->vm_mm, addr, pte, ptent);
++ #endif
++ }
++ 
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  static int clear_refs_pte_range(pmd_t *pmd, unsigned long addr,
+  				unsigned long end, struct mm_walk *walk)
+  {
+@@@ -885,14 -952,18 +916,25 @@@ static void pte_to_pagemap_entry(pagema
+  		if (is_migration_entry(entry))
+  			page = migration_entry_to_page(entry);
+  	} else {
+++<<<<<<< HEAD
+ +		*pme = make_pme(PM_NOT_PRESENT);
+++=======
++ 		if (vma->vm_flags & VM_SOFTDIRTY)
++ 			flags2 |= __PM_SOFT_DIRTY;
++ 		*pme = make_pme(PM_NOT_PRESENT(pm->v2) | PM_STATUS2(pm->v2, flags2));
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  		return;
+  	}
+  
+  	if (page && !PageAnon(page))
+  		flags |= PM_FILE;
+++<<<<<<< HEAD
+++=======
++ 	if ((vma->vm_flags & VM_SOFTDIRTY) || pte_soft_dirty(pte))
++ 		flags2 |= __PM_SOFT_DIRTY;
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  
+ -	*pme = make_pme(PM_PFRAME(frame) | PM_STATUS2(pm->v2, flags2) | flags);
+ +	*pme = make_pme(PM_PFRAME(frame) | PM_PSHIFT(PAGE_SHIFT) | flags);
+  }
+  
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@@ -906,13 -977,13 +948,17 @@@ static void thp_pmd_to_pagemap_entry(pa
+  	 */
+  	if (pmd_present(pmd))
+  		*pme = make_pme(PM_PFRAME(pmd_pfn(pmd) + offset)
+ -				| PM_STATUS2(pm->v2, pmd_flags2) | PM_PRESENT);
+ +				| PM_PSHIFT(PAGE_SHIFT) | PM_PRESENT);
+  	else
+++<<<<<<< HEAD
+ +		*pme = make_pme(PM_NOT_PRESENT);
+++=======
++ 		*pme = make_pme(PM_NOT_PRESENT(pm->v2) | PM_STATUS2(pm->v2, pmd_flags2));
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  }
+  #else
+ -static inline void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
+ -		pmd_t pmd, int offset, int pmd_flags2)
+ +static inline void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme,
+ +						pmd_t pmd, int offset)
+  {
+  }
+  #endif
+@@@ -929,7 -999,14 +975,18 @@@ static int pagemap_pte_range(pmd_t *pmd
+  
+  	/* find the first VMA at or above 'addr' */
+  	vma = find_vma(walk->mm, addr);
+++<<<<<<< HEAD
+ +	if (vma && pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+++=======
++ 	if (vma && pmd_trans_huge_lock(pmd, vma) == 1) {
++ 		int pmd_flags2;
++ 
++ 		if ((vma->vm_flags & VM_SOFTDIRTY) || pmd_soft_dirty(*pmd))
++ 			pmd_flags2 = __PM_SOFT_DIRTY;
++ 		else
++ 			pmd_flags2 = 0;
++ 
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  		for (; addr != end; addr += PAGE_SIZE) {
+  			unsigned long offset;
+  
+@@@ -952,7 -1030,11 +1010,15 @@@
+  		 * and need a new, higher one */
+  		if (vma && (addr >= vma->vm_end)) {
+  			vma = find_vma(walk->mm, addr);
+++<<<<<<< HEAD
+ +			pme = make_pme(PM_NOT_PRESENT);
+++=======
++ 			if (vma && (vma->vm_flags & VM_SOFTDIRTY))
++ 				flags2 = __PM_SOFT_DIRTY;
++ 			else
++ 				flags2 = 0;
++ 			pme = make_pme(PM_NOT_PRESENT(pm->v2) | PM_STATUS2(pm->v2, flags2));
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  		}
+  
+  		/* check that 'vma' actually covers this address,
+@@@ -975,14 -1057,16 +1041,27 @@@
+  }
+  
+  #ifdef CONFIG_HUGETLB_PAGE
+++<<<<<<< HEAD
+ +static void huge_pte_to_pagemap_entry(pagemap_entry_t *pme,
+ +					pte_t pte, int offset)
+ +{
+ +	if (pte_present(pte))
+ +		*pme = make_pme(PM_PFRAME(pte_pfn(pte) + offset)
+ +				| PM_PSHIFT(PAGE_SHIFT) | PM_PRESENT);
+ +	else
+ +		*pme = make_pme(PM_NOT_PRESENT);
+++=======
++ static void huge_pte_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
++ 					pte_t pte, int offset, int flags2)
++ {
++ 	if (pte_present(pte))
++ 		*pme = make_pme(PM_PFRAME(pte_pfn(pte) + offset)	|
++ 				PM_STATUS2(pm->v2, flags2)		|
++ 				PM_PRESENT);
++ 	else
++ 		*pme = make_pme(PM_NOT_PRESENT(pm->v2)			|
++ 				PM_STATUS2(pm->v2, flags2));
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  }
+  
+  /* This function walks within one hugetlb entry in the single call */
+@@@ -991,12 -1075,22 +1070,26 @@@ static int pagemap_hugetlb_range(pte_t 
+  				 struct mm_walk *walk)
+  {
+  	struct pagemapread *pm = walk->private;
++ 	struct vm_area_struct *vma;
+  	int err = 0;
++ 	int flags2;
+  	pagemap_entry_t pme;
+  
++ 	vma = find_vma(walk->mm, addr);
++ 	WARN_ON_ONCE(!vma);
++ 
++ 	if (vma && (vma->vm_flags & VM_SOFTDIRTY))
++ 		flags2 = __PM_SOFT_DIRTY;
++ 	else
++ 		flags2 = 0;
++ 
+  	for (; addr != end; addr += PAGE_SIZE) {
+  		int offset = (addr & ~hmask) >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +		huge_pte_to_pagemap_entry(&pme, *pte, offset);
+++=======
++ 		huge_pte_to_pagemap_entry(&pme, pm, *pte, offset, flags2);
+++>>>>>>> d9104d1ca966 (mm: track vma changes with VM_SOFTDIRTY bit)
+  		err = add_to_pagemap(addr, &pme, pm);
+  		if (err)
+  			return err;
+* Unmerged path Documentation/vm/soft-dirty.txt
+* Unmerged path Documentation/vm/soft-dirty.txt
+diff --git a/fs/exec.c b/fs/exec.c
+index a2f61737d490..f5e8de9b2a99 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -265,7 +265,7 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
+ 	BUILD_BUG_ON(VM_STACK_FLAGS & VM_STACK_INCOMPLETE_SETUP);
+ 	vma->vm_end = STACK_TOP_MAX;
+ 	vma->vm_start = vma->vm_end - PAGE_SIZE;
+-	vma->vm_flags = VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
++	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
+ 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+ 
+* Unmerged path fs/proc/task_mmu.c
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 77beacdc1090..75a5694420b3 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -129,6 +129,12 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_ARCH_2	0x02000000
+ #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
+ 
++#ifdef CONFIG_MEM_SOFT_DIRTY
++# define VM_SOFTDIRTY	0x08000000	/* Not soft dirty clean area */
++#else
++# define VM_SOFTDIRTY	0
++#endif
++
+ #define VM_MIXEDMAP	0x10000000	/* Can contain "struct page" and pure PFN pages */
+ #define VM_HUGEPAGE	0x20000000	/* MADV_HUGEPAGE marked this vma */
+ #define VM_NOHUGEPAGE	0x40000000	/* MADV_NOHUGEPAGE marked this vma */
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 604352be071f..24b806488804 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1638,6 +1638,15 @@ out:
+ 	if (file)
+ 		uprobe_mmap(vma);
+ 
++	/*
++	 * New (or expanded) vma always get soft dirty status.
++	 * Otherwise user-space soft-dirty page tracker won't
++	 * be able to distinguish situation when vma area unmapped,
++	 * then new mapped in-place (which must be aimed as
++	 * a completely new data area).
++	 */
++	vma->vm_flags |= VM_SOFTDIRTY;
++
+ 	return addr;
+ 
+ unmap_and_free_vma:
+@@ -2718,6 +2727,7 @@ out:
+ 	mm->total_vm += len >> PAGE_SHIFT;
+ 	if (flags & VM_LOCKED)
+ 		mm->locked_vm += (len >> PAGE_SHIFT);
++	vma->vm_flags |= VM_SOFTDIRTY;
+ 	return addr;
+ }
+ 
+@@ -2987,7 +2997,7 @@ int install_special_mapping(struct mm_struct *mm,
+ 	vma->vm_start = addr;
+ 	vma->vm_end = addr + len;
+ 
+-	vma->vm_flags = vm_flags | mm->def_flags | VM_DONTEXPAND;
++	vma->vm_flags = vm_flags | mm->def_flags | VM_DONTEXPAND | VM_SOFTDIRTY;
+ 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 
+ 	vma->vm_ops = &special_mapping_vmops;
