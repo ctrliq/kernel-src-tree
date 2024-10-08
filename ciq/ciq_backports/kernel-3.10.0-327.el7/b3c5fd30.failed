@@ -1,0 +1,224 @@
+dm crypt: sort writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] dm-crypt: sort writes (Mike Snitzer) [1205955 752438]
+Rebuild_FUZZ: 95.24%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit b3c5fd3052492f1b8d060799d4f18be5a5438add
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b3c5fd30.failed
+
+Write requests are sorted in a red-black tree structure and are
+submitted in the sorted order.
+
+In theory the sorting should be performed by the underlying disk
+scheduler, however, in practice the disk scheduler only accepts and
+sorts a finite number of requests.  To allow the sorting of all
+requests, dm-crypt needs to implement its own sorting.
+
+The overhead associated with rbtree-based sorting is considered
+negligible so it is not used conditionally.  Even on SSD sorting can be
+beneficial since in-order request dispatch promotes lower latency IO
+completion to the upper layers.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit b3c5fd3052492f1b8d060799d4f18be5a5438add)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index 4fcca8922627,713a96237a80..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -60,7 -60,8 +61,12 @@@ struct dm_crypt_io 
+  	atomic_t io_pending;
+  	int error;
+  	sector_t sector;
+++<<<<<<< HEAD
+ +	struct dm_crypt_io *base_io;
+++=======
++ 
++ 	struct rb_node rb_node;
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  } CRYPTO_MINALIGN_ATTR;
+  
+  struct dm_crypt_request {
+@@@ -130,6 -133,10 +136,13 @@@ struct crypt_config 
+  	struct workqueue_struct *io_queue;
+  	struct workqueue_struct *crypt_queue;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct task_struct *write_thread;
++ 	wait_queue_head_t write_thread_wait;
++ 	struct rb_root write_tree;
++ 
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  	char *cipher;
+  	char *cipher_string;
+  
+@@@ -1157,31 -1169,73 +1170,94 @@@ static void kcryptd_io_write(struct dm_
+  	generic_make_request(clone);
+  }
+  
+++<<<<<<< HEAD
+ +static void kcryptd_io(struct work_struct *work)
+ +{
+ +	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+++=======
++ #define crypt_io_from_node(node) rb_entry((node), struct dm_crypt_io, rb_node)
++ 
++ static int dmcrypt_write(void *data)
++ {
++ 	struct crypt_config *cc = data;
++ 	struct dm_crypt_io *io;
++ 
++ 	while (1) {
++ 		struct rb_root write_tree;
++ 		struct blk_plug plug;
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  
+ -		DECLARE_WAITQUEUE(wait, current);
+ +	if (bio_data_dir(io->base_bio) == READ) {
+ +		crypt_inc_pending(io);
+ +		if (kcryptd_io_read(io, GFP_NOIO))
+ +			io->error = -ENOMEM;
+ +		crypt_dec_pending(io);
+ +	} else
+ +		kcryptd_io_write(io);
+ +}
+  
+ -		spin_lock_irq(&cc->write_thread_wait.lock);
+ -continue_locked:
+ +static void kcryptd_queue_io(struct dm_crypt_io *io)
+ +{
+ +	struct crypt_config *cc = io->cc;
+  
+++<<<<<<< HEAD
+ +	INIT_WORK(&io->work, kcryptd_io);
+ +	queue_work(cc->io_queue, &io->work);
+++=======
++ 		if (!RB_EMPTY_ROOT(&cc->write_tree))
++ 			goto pop_from_list;
++ 
++ 		__set_current_state(TASK_INTERRUPTIBLE);
++ 		__add_wait_queue(&cc->write_thread_wait, &wait);
++ 
++ 		spin_unlock_irq(&cc->write_thread_wait.lock);
++ 
++ 		if (unlikely(kthread_should_stop())) {
++ 			set_task_state(current, TASK_RUNNING);
++ 			remove_wait_queue(&cc->write_thread_wait, &wait);
++ 			break;
++ 		}
++ 
++ 		schedule();
++ 
++ 		set_task_state(current, TASK_RUNNING);
++ 		spin_lock_irq(&cc->write_thread_wait.lock);
++ 		__remove_wait_queue(&cc->write_thread_wait, &wait);
++ 		goto continue_locked;
++ 
++ pop_from_list:
++ 		write_tree = cc->write_tree;
++ 		cc->write_tree = RB_ROOT;
++ 		spin_unlock_irq(&cc->write_thread_wait.lock);
++ 
++ 		BUG_ON(rb_parent(write_tree.rb_node));
++ 
++ 		/*
++ 		 * Note: we cannot walk the tree here with rb_next because
++ 		 * the structures may be freed when kcryptd_io_write is called.
++ 		 */
++ 		blk_start_plug(&plug);
++ 		do {
++ 			io = crypt_io_from_node(rb_first(&write_tree));
++ 			rb_erase(&io->rb_node, &write_tree);
++ 			kcryptd_io_write(io);
++ 		} while (!RB_EMPTY_ROOT(&write_tree));
++ 		blk_finish_plug(&plug);
++ 	}
++ 	return 0;
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  }
+  
+  static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async)
+  {
+  	struct bio *clone = io->ctx.bio_out;
+  	struct crypt_config *cc = io->cc;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long flags;
++ 	sector_t sector;
++ 	struct rb_node **rbp, *parent;
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  
+  	if (unlikely(io->error < 0)) {
+  		crypt_free_buffer_pages(cc, clone);
+@@@ -1191,14 -1245,31 +1267,36 @@@
+  	}
+  
+  	/* crypt_convert should have filled the clone bio */
+ -	BUG_ON(io->ctx.iter_out.bi_size);
+ +	BUG_ON(io->ctx.idx_out < clone->bi_vcnt);
+  
+ -	clone->bi_iter.bi_sector = cc->start + io->sector;
+ +	clone->bi_sector = cc->start + io->sector;
+  
+ -	if (likely(!async) && test_bit(DM_CRYPT_NO_OFFLOAD, &cc->flags)) {
+ +	if (async)
+ +		kcryptd_queue_io(io);
+ +	else
+  		generic_make_request(clone);
+++<<<<<<< HEAD
+++=======
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&cc->write_thread_wait.lock, flags);
++ 	rbp = &cc->write_tree.rb_node;
++ 	parent = NULL;
++ 	sector = io->sector;
++ 	while (*rbp) {
++ 		parent = *rbp;
++ 		if (sector < crypt_io_from_node(parent)->sector)
++ 			rbp = &(*rbp)->rb_left;
++ 		else
++ 			rbp = &(*rbp)->rb_right;
++ 	}
++ 	rb_link_node(&io->rb_node, parent, rbp);
++ 	rb_insert_color(&io->rb_node, &cc->write_tree);
++ 
++ 	wake_up_locked(&cc->write_thread_wait);
++ 	spin_unlock_irqrestore(&cc->write_thread_wait.lock, flags);
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  }
+  
+  static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
+@@@ -1831,6 -1856,18 +1929,21 @@@ static int crypt_ctr(struct dm_target *
+  		goto bad;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	init_waitqueue_head(&cc->write_thread_wait);
++ 	cc->write_tree = RB_ROOT;
++ 
++ 	cc->write_thread = kthread_create(dmcrypt_write, cc, "dmcrypt_write");
++ 	if (IS_ERR(cc->write_thread)) {
++ 		ret = PTR_ERR(cc->write_thread);
++ 		cc->write_thread = NULL;
++ 		ti->error = "Couldn't spawn write thread";
++ 		goto bad;
++ 	}
++ 	wake_up_process(cc->write_thread);
++ 
+++>>>>>>> b3c5fd305249 (dm crypt: sort writes)
+  	ti->num_flush_bios = 1;
+  	ti->discard_zeroes_data_unsupported = true;
+  
+* Unmerged path drivers/md/dm-crypt.c
