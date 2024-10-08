@@ -1,0 +1,318 @@
+ipv6: Nonlocal bind
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit 35a256fee52c7c207796302681fa95189c85b408
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/35a256fe.failed
+
+Add support to allow non-local binds similar to how this was done for IPv4.
+Non-local binds are very useful in emulating the Internet in a box, etc.
+
+This add the ip_nonlocal_bind sysctl under ipv6.
+
+Testing:
+
+Set up nonlocal binding and receive routing on a host, e.g.:
+
+ip -6 rule add from ::/0 iif eth0 lookup 200
+ip -6 route add local 2001:0:0:1::/64 dev lo proto kernel scope host table 200
+sysctl -w net.ipv6.ip_nonlocal_bind=1
+
+Set up routing to 2001:0:0:1::/64 on peer to go to first host
+
+ping6 -I 2001:0:0:1::1 peer-address -- to verify
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 35a256fee52c7c207796302681fa95189c85b408)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/ipv6.h
+#	net/ipv4/ping.c
+#	net/ipv6/sysctl_net_ipv6.c
+diff --cc include/net/netns/ipv6.h
+index 005e2c2e39a9,c0368db6df54..000000000000
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@@ -27,7 -27,15 +27,16 @@@ struct netns_sysctl_ipv6 
+  	int ip6_rt_gc_elasticity;
+  	int ip6_rt_mtu_expires;
+  	int ip6_rt_min_advmss;
+ -	int flowlabel_consistency;
+ -	int auto_flowlabels;
+  	int icmpv6_time;
+++<<<<<<< HEAD
+++=======
++ 	int anycast_src_echo_reply;
++ 	int ip_nonlocal_bind;
++ 	int fwmark_reflect;
++ 	int idgen_retries;
++ 	int idgen_delay;
++ 	int flowlabel_state_ranges;
+++>>>>>>> 35a256fee52c (ipv6: Nonlocal bind)
+  };
+  
+  struct netns_ipv6 {
+diff --cc net/ipv4/ping.c
+index e8952760c7ba,e89094ab5ddb..000000000000
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@@ -242,7 -296,116 +242,118 @@@ static void ping_close(struct sock *sk
+  
+  	sk_common_release(sk);
+  }
+ -EXPORT_SYMBOL_GPL(ping_close);
+  
+++<<<<<<< HEAD
+++=======
++ /* Checks the bind address and possibly modifies sk->sk_bound_dev_if. */
++ static int ping_check_bind_addr(struct sock *sk, struct inet_sock *isk,
++ 				struct sockaddr *uaddr, int addr_len) {
++ 	struct net *net = sock_net(sk);
++ 	if (sk->sk_family == AF_INET) {
++ 		struct sockaddr_in *addr = (struct sockaddr_in *) uaddr;
++ 		int chk_addr_ret;
++ 
++ 		if (addr_len < sizeof(*addr))
++ 			return -EINVAL;
++ 
++ 		if (addr->sin_family != AF_INET &&
++ 		    !(addr->sin_family == AF_UNSPEC &&
++ 		      addr->sin_addr.s_addr == htonl(INADDR_ANY)))
++ 			return -EAFNOSUPPORT;
++ 
++ 		pr_debug("ping_check_bind_addr(sk=%p,addr=%pI4,port=%d)\n",
++ 			 sk, &addr->sin_addr.s_addr, ntohs(addr->sin_port));
++ 
++ 		chk_addr_ret = inet_addr_type(net, addr->sin_addr.s_addr);
++ 
++ 		if (addr->sin_addr.s_addr == htonl(INADDR_ANY))
++ 			chk_addr_ret = RTN_LOCAL;
++ 
++ 		if ((net->ipv4.sysctl_ip_nonlocal_bind == 0 &&
++ 		    isk->freebind == 0 && isk->transparent == 0 &&
++ 		     chk_addr_ret != RTN_LOCAL) ||
++ 		    chk_addr_ret == RTN_MULTICAST ||
++ 		    chk_addr_ret == RTN_BROADCAST)
++ 			return -EADDRNOTAVAIL;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (sk->sk_family == AF_INET6) {
++ 		struct sockaddr_in6 *addr = (struct sockaddr_in6 *) uaddr;
++ 		int addr_type, scoped, has_addr;
++ 		struct net_device *dev = NULL;
++ 
++ 		if (addr_len < sizeof(*addr))
++ 			return -EINVAL;
++ 
++ 		if (addr->sin6_family != AF_INET6)
++ 			return -EAFNOSUPPORT;
++ 
++ 		pr_debug("ping_check_bind_addr(sk=%p,addr=%pI6c,port=%d)\n",
++ 			 sk, addr->sin6_addr.s6_addr, ntohs(addr->sin6_port));
++ 
++ 		addr_type = ipv6_addr_type(&addr->sin6_addr);
++ 		scoped = __ipv6_addr_needs_scope_id(addr_type);
++ 		if ((addr_type != IPV6_ADDR_ANY &&
++ 		     !(addr_type & IPV6_ADDR_UNICAST)) ||
++ 		    (scoped && !addr->sin6_scope_id))
++ 			return -EINVAL;
++ 
++ 		rcu_read_lock();
++ 		if (addr->sin6_scope_id) {
++ 			dev = dev_get_by_index_rcu(net, addr->sin6_scope_id);
++ 			if (!dev) {
++ 				rcu_read_unlock();
++ 				return -ENODEV;
++ 			}
++ 		}
++ 		has_addr = pingv6_ops.ipv6_chk_addr(net, &addr->sin6_addr, dev,
++ 						    scoped);
++ 		rcu_read_unlock();
++ 
++ 		if (!(net->ipv6.sysctl.ip_nonlocal_bind ||
++ 		      isk->freebind || isk->transparent || has_addr ||
++ 		      addr_type == IPV6_ADDR_ANY))
++ 			return -EADDRNOTAVAIL;
++ 
++ 		if (scoped)
++ 			sk->sk_bound_dev_if = addr->sin6_scope_id;
++ #endif
++ 	} else {
++ 		return -EAFNOSUPPORT;
++ 	}
++ 	return 0;
++ }
++ 
++ static void ping_set_saddr(struct sock *sk, struct sockaddr *saddr)
++ {
++ 	if (saddr->sa_family == AF_INET) {
++ 		struct inet_sock *isk = inet_sk(sk);
++ 		struct sockaddr_in *addr = (struct sockaddr_in *) saddr;
++ 		isk->inet_rcv_saddr = isk->inet_saddr = addr->sin_addr.s_addr;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (saddr->sa_family == AF_INET6) {
++ 		struct sockaddr_in6 *addr = (struct sockaddr_in6 *) saddr;
++ 		struct ipv6_pinfo *np = inet6_sk(sk);
++ 		sk->sk_v6_rcv_saddr = np->saddr = addr->sin6_addr;
++ #endif
++ 	}
++ }
++ 
++ static void ping_clear_saddr(struct sock *sk, int dif)
++ {
++ 	sk->sk_bound_dev_if = dif;
++ 	if (sk->sk_family == AF_INET) {
++ 		struct inet_sock *isk = inet_sk(sk);
++ 		isk->inet_rcv_saddr = isk->inet_saddr = 0;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (sk->sk_family == AF_INET6) {
++ 		struct ipv6_pinfo *np = inet6_sk(sk);
++ 		memset(&sk->sk_v6_rcv_saddr, 0, sizeof(sk->sk_v6_rcv_saddr));
++ 		memset(&np->saddr, 0, sizeof(np->saddr));
++ #endif
++ 	}
++ }
+++>>>>>>> 35a256fee52c (ipv6: Nonlocal bind)
+  /*
+   * We need our own bind because there are no privileged id's == local ports.
+   * Moreover, we don't allow binding to multi- and broadcast addresses.
+diff --cc net/ipv6/sysctl_net_ipv6.c
+index 2d528c931397,db48aebd9c47..000000000000
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@@ -26,6 -26,62 +26,65 @@@ static struct ctl_table ipv6_table_temp
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.procname	= "anycast_src_echo_reply",
++ 		.data		= &init_net.ipv6.sysctl.anycast_src_echo_reply,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "flowlabel_consistency",
++ 		.data		= &init_net.ipv6.sysctl.flowlabel_consistency,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "auto_flowlabels",
++ 		.data		= &init_net.ipv6.sysctl.auto_flowlabels,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "fwmark_reflect",
++ 		.data		= &init_net.ipv6.sysctl.fwmark_reflect,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "idgen_retries",
++ 		.data		= &init_net.ipv6.sysctl.idgen_retries,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec,
++ 	},
++ 	{
++ 		.procname	= "idgen_delay",
++ 		.data		= &init_net.ipv6.sysctl.idgen_delay,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_jiffies,
++ 	},
++ 	{
++ 		.procname	= "flowlabel_state_ranges",
++ 		.data		= &init_net.ipv6.sysctl.flowlabel_state_ranges,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "ip_nonlocal_bind",
++ 		.data		= &init_net.ipv6.sysctl.ip_nonlocal_bind,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
+++>>>>>>> 35a256fee52c (ipv6: Nonlocal bind)
+  	{ }
+  };
+  
+@@@ -61,6 -117,14 +120,17 @@@ static int __net_init ipv6_sysctl_net_i
+  	if (!ipv6_table)
+  		goto out;
+  	ipv6_table[0].data = &net->ipv6.sysctl.bindv6only;
+++<<<<<<< HEAD
+++=======
++ 	ipv6_table[1].data = &net->ipv6.sysctl.anycast_src_echo_reply;
++ 	ipv6_table[2].data = &net->ipv6.sysctl.flowlabel_consistency;
++ 	ipv6_table[3].data = &net->ipv6.sysctl.auto_flowlabels;
++ 	ipv6_table[4].data = &net->ipv6.sysctl.fwmark_reflect;
++ 	ipv6_table[5].data = &net->ipv6.sysctl.idgen_retries;
++ 	ipv6_table[6].data = &net->ipv6.sysctl.idgen_delay;
++ 	ipv6_table[7].data = &net->ipv6.sysctl.flowlabel_state_ranges;
++ 	ipv6_table[8].data = &net->ipv6.sysctl.ip_nonlocal_bind;
+++>>>>>>> 35a256fee52c (ipv6: Nonlocal bind)
+  
+  	ipv6_route_table = ipv6_route_sysctl_init(net);
+  	if (!ipv6_route_table)
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index e8d824aef227..94bc3d5d2c51 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -1283,6 +1283,11 @@ mtu - INTEGER
+ 	Default Maximum Transfer Unit
+ 	Default: 1280 (IPv6 required minimum)
+ 
++ip_nonlocal_bind - BOOLEAN
++	If set, allows processes to bind() to non-local IPv6 addresses,
++	which can be quite useful - but may break some applications.
++	Default: 0
++
+ router_probe_interval - INTEGER
+ 	Minimum interval (in seconds) between Router Probing described
+ 	in RFC4191.
+* Unmerged path include/net/netns/ipv6.h
+* Unmerged path net/ipv4/ping.c
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index f6f52bfe535a..b3067643e4db 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -341,7 +341,8 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 			 */
+ 			v4addr = LOOPBACK4_IPV6;
+ 			if (!(addr_type & IPV6_ADDR_MULTICAST))	{
+-				if (!(inet->freebind || inet->transparent) &&
++				if (!net->ipv6.sysctl.ip_nonlocal_bind &&
++				    !(inet->freebind || inet->transparent) &&
+ 				    !ipv6_chk_addr(net, &addr->sin6_addr,
+ 						   dev, 0)) {
+ 					err = -EADDRNOTAVAIL;
+diff --git a/net/ipv6/raw.c b/net/ipv6/raw.c
+index 146ca12277f1..dfec511ddd6e 100644
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@ -286,7 +286,8 @@ static int rawv6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 		 * unspecified and mapped address have a v4 equivalent.
+ 		 */
+ 		v4addr = LOOPBACK4_IPV6;
+-		if (!(addr_type & IPV6_ADDR_MULTICAST))	{
++		if (!(addr_type & IPV6_ADDR_MULTICAST) &&
++		    !sock_net(sk)->ipv6.sysctl.ip_nonlocal_bind) {
+ 			err = -EADDRNOTAVAIL;
+ 			if (!ipv6_chk_addr(sock_net(sk), &addr->sin6_addr,
+ 					   dev, 0)) {
+* Unmerged path net/ipv6/sysctl_net_ipv6.c
