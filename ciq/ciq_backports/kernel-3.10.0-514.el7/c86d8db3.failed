@@ -1,0 +1,129 @@
+ext4: implement allocation of pre-zeroed blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jan Kara <jack@suse.com>
+commit c86d8db33a922da808a5560aa15ed663a9569b37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c86d8db3.failed
+
+DAX page fault path needs to get blocks that are pre-zeroed to avoid
+races when two concurrent page faults happen in the same block of a
+file. Implement support for this in ext4_map_blocks().
+
+	Signed-off-by: Jan Kara <jack@suse.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit c86d8db33a922da808a5560aa15ed663a9569b37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/ext4.h
+#	fs/ext4/inode.c
+#	include/trace/events/ext4.h
+diff --cc fs/ext4/ext4.h
+index 5dda1d21c88f,ae900b530d37..000000000000
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@@ -557,10 -555,12 +557,18 @@@ enum 
+  #define EXT4_GET_BLOCKS_NO_NORMALIZE		0x0040
+  	/* Request will not result in inode size update (user for fallocate) */
+  #define EXT4_GET_BLOCKS_KEEP_SIZE		0x0080
+ +	/* Do not take i_data_sem locking in ext4_map_blocks */
+ +#define EXT4_GET_BLOCKS_NO_LOCK			0x0100
+  	/* Convert written extents to unwritten */
+++<<<<<<< HEAD
+ +#define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0200
+++=======
++ #define EXT4_GET_BLOCKS_CONVERT_UNWRITTEN	0x0100
++ 	/* Write zeros to newly created written extents */
++ #define EXT4_GET_BLOCKS_ZERO			0x0200
++ #define EXT4_GET_BLOCKS_CREATE_ZERO		(EXT4_GET_BLOCKS_CREATE |\
++ 					EXT4_GET_BLOCKS_ZERO)
+++>>>>>>> c86d8db33a92 (ext4: implement allocation of pre-zeroed blocks)
+  
+  /*
+   * The bit position of these flags must not overlap with any of the
+diff --cc fs/ext4/inode.c
+index 235a73f02c8d,4241d0cff062..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -2924,13 -3080,33 +2942,36 @@@ int ext4_get_block_write(struct inode *
+  			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+  }
+  
+ -static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +static int ext4_get_block_write_nolock(struct inode *inode, sector_t iblock,
+  		   struct buffer_head *bh_result, int create)
+  {
+ -	int ret;
+ -
+ -	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +	ext4_debug("ext4_get_block_write_nolock: inode %lu, create flag %d\n",
+  		   inode->i_ino, create);
+++<<<<<<< HEAD
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_NO_LOCK);
+++=======
++ 	ret = _ext4_get_block(inode, iblock, bh_result, 0);
++ 	/*
++ 	 * Blocks should have been preallocated! ext4_file_write_iter() checks
++ 	 * that.
++ 	 */
++ 	WARN_ON_ONCE(!buffer_mapped(bh_result));
++ 
++ 	return ret;
++ }
++ 
++ int ext4_get_block_dax(struct inode *inode, sector_t iblock,
++ 		   struct buffer_head *bh_result, int create)
++ {
++ 	int flags = EXT4_GET_BLOCKS_PRE_IO | EXT4_GET_BLOCKS_UNWRIT_EXT;
++ 
++ 	if (create)
++ 		flags |= EXT4_GET_BLOCKS_CREATE;
++ 	ext4_debug("ext4_get_block_dax: inode %lu, create flag %d\n",
++ 		   inode->i_ino, create);
++ 	return _ext4_get_block(inode, iblock, bh_result, flags);
+++>>>>>>> c86d8db33a92 (ext4: implement allocation of pre-zeroed blocks)
+  }
+  
+  static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+diff --cc include/trace/events/ext4.h
+index 12cd04b9714f,4e4b2fa78609..000000000000
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@@ -52,7 -43,7 +52,11 @@@ struct extent_status
+  	{ EXT4_GET_BLOCKS_METADATA_NOFAIL,	"METADATA_NOFAIL" },	\
+  	{ EXT4_GET_BLOCKS_NO_NORMALIZE,		"NO_NORMALIZE" },	\
+  	{ EXT4_GET_BLOCKS_KEEP_SIZE,		"KEEP_SIZE" },		\
+++<<<<<<< HEAD
+ +	{ EXT4_GET_BLOCKS_NO_LOCK,		"NO_LOCK" })
+++=======
++ 	{ EXT4_GET_BLOCKS_ZERO,			"ZERO" })
+++>>>>>>> c86d8db33a92 (ext4: implement allocation of pre-zeroed blocks)
+  
+  #define show_mflags(flags) __print_flags(flags, "",	\
+  	{ EXT4_MAP_NEW,		"N" },			\
+* Unmerged path fs/ext4/ext4.h
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index d936da6a075b..f0a5309aa619 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -4047,6 +4047,14 @@ ext4_ext_handle_unwritten_extents(handle_t *handle, struct inode *inode,
+ 	}
+ 	/* IO end_io complete, convert the filled extent to written */
+ 	if (flags & EXT4_GET_BLOCKS_CONVERT) {
++		if (flags & EXT4_GET_BLOCKS_ZERO) {
++			if (allocated > map->m_len)
++				allocated = map->m_len;
++			err = ext4_issue_zeroout(inode, map->m_lblk, newblock,
++						 allocated);
++			if (err < 0)
++				goto out2;
++		}
+ 		ret = ext4_convert_unwritten_extents_endio(handle, inode, map,
+ 							path);
+ 		if (ret >= 0) {
+* Unmerged path fs/ext4/inode.c
+* Unmerged path include/trace/events/ext4.h
