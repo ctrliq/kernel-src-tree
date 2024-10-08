@@ -1,0 +1,288 @@
+ethtool: Set cmd field in ETHTOOL_GLINKSETTINGS response to wrong nwords
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ben Hutchings <ben@decadent.org.uk>
+commit 793cf87de9d1a62dc9079c3ec5fcc01cfc62fafb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/793cf87d.failed
+
+When the ETHTOOL_GLINKSETTINGS implementation finds that userland is
+using the wrong number of words of link mode bitmaps (or is trying to
+find out the right numbers) it sets the cmd field to 0 in the response
+structure.
+
+This is inconsistent with the implementation of every other ethtool
+command, so let's remove that inconsistency before it gets into a
+stable release.
+
+Fixes: 3f1ac7a700d03 ("net: ethtool: add new ETHTOOL_xLINKSETTINGS API")
+	Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 793cf87de9d1a62dc9079c3ec5fcc01cfc62fafb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/ethtool.c
+diff --cc net/core/ethtool.c
+index 1ed11f1c82d9,f426c5ad6149..000000000000
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@@ -360,20 -544,254 +360,209 @@@ int __ethtool_get_settings(struct net_d
+  	if (!dev->ethtool_ops->get_settings)
+  		return -EOPNOTSUPP;
+  
+ -	memset(&cmd, 0, sizeof(cmd));
+ -	cmd.cmd = ETHTOOL_GSET;
+ -	err = dev->ethtool_ops->get_settings(dev, &cmd);
+ -	if (err < 0)
+ -		return err;
+ -
+ -	/* we ignore deprecated fields transceiver/maxrxpkt/maxtxpkt
+ -	 */
+ -	convert_legacy_settings_to_link_ksettings(link_ksettings, &cmd);
+ -	return err;
+ +	memset(cmd, 0, sizeof(struct ethtool_cmd));
+ +	cmd->cmd = ETHTOOL_GSET;
+ +	return dev->ethtool_ops->get_settings(dev, cmd);
+  }
+ -EXPORT_SYMBOL(__ethtool_get_link_ksettings);
+ +EXPORT_SYMBOL(__ethtool_get_settings);
+  
+++<<<<<<< HEAD
+++=======
++ /* convert ethtool_link_usettings in user space to a kernel internal
++  * ethtool_link_ksettings. return 0 on success, errno on error.
++  */
++ static int load_link_ksettings_from_user(struct ethtool_link_ksettings *to,
++ 					 const void __user *from)
++ {
++ 	struct ethtool_link_usettings link_usettings;
++ 
++ 	if (copy_from_user(&link_usettings, from, sizeof(link_usettings)))
++ 		return -EFAULT;
++ 
++ 	memcpy(&to->base, &link_usettings.base, sizeof(to->base));
++ 	bitmap_from_u32array(to->link_modes.supported,
++ 			     __ETHTOOL_LINK_MODE_MASK_NBITS,
++ 			     link_usettings.link_modes.supported,
++ 			     __ETHTOOL_LINK_MODE_MASK_NU32);
++ 	bitmap_from_u32array(to->link_modes.advertising,
++ 			     __ETHTOOL_LINK_MODE_MASK_NBITS,
++ 			     link_usettings.link_modes.advertising,
++ 			     __ETHTOOL_LINK_MODE_MASK_NU32);
++ 	bitmap_from_u32array(to->link_modes.lp_advertising,
++ 			     __ETHTOOL_LINK_MODE_MASK_NBITS,
++ 			     link_usettings.link_modes.lp_advertising,
++ 			     __ETHTOOL_LINK_MODE_MASK_NU32);
++ 
++ 	return 0;
++ }
++ 
++ /* convert a kernel internal ethtool_link_ksettings to
++  * ethtool_link_usettings in user space. return 0 on success, errno on
++  * error.
++  */
++ static int
++ store_link_ksettings_for_user(void __user *to,
++ 			      const struct ethtool_link_ksettings *from)
++ {
++ 	struct ethtool_link_usettings link_usettings;
++ 
++ 	memcpy(&link_usettings.base, &from->base, sizeof(link_usettings));
++ 	bitmap_to_u32array(link_usettings.link_modes.supported,
++ 			   __ETHTOOL_LINK_MODE_MASK_NU32,
++ 			   from->link_modes.supported,
++ 			   __ETHTOOL_LINK_MODE_MASK_NBITS);
++ 	bitmap_to_u32array(link_usettings.link_modes.advertising,
++ 			   __ETHTOOL_LINK_MODE_MASK_NU32,
++ 			   from->link_modes.advertising,
++ 			   __ETHTOOL_LINK_MODE_MASK_NBITS);
++ 	bitmap_to_u32array(link_usettings.link_modes.lp_advertising,
++ 			   __ETHTOOL_LINK_MODE_MASK_NU32,
++ 			   from->link_modes.lp_advertising,
++ 			   __ETHTOOL_LINK_MODE_MASK_NBITS);
++ 
++ 	if (copy_to_user(to, &link_usettings, sizeof(link_usettings)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ /* Query device for its ethtool_link_settings.
++  *
++  * Backward compatibility note: this function must fail when driver
++  * does not implement ethtool::get_link_ksettings, even if legacy
++  * ethtool_ops::get_settings is implemented. This tells new versions
++  * of ethtool that they should use the legacy API %ETHTOOL_GSET for
++  * this driver, so that they can correctly access the ethtool_cmd
++  * deprecated fields (transceiver/maxrxpkt/maxtxpkt), until no driver
++  * implements ethtool_ops::get_settings anymore.
++  */
++ static int ethtool_get_link_ksettings(struct net_device *dev,
++ 				      void __user *useraddr)
++ {
++ 	int err = 0;
++ 	struct ethtool_link_ksettings link_ksettings;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!dev->ethtool_ops->get_link_ksettings)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* handle bitmap nbits handshake */
++ 	if (copy_from_user(&link_ksettings.base, useraddr,
++ 			   sizeof(link_ksettings.base)))
++ 		return -EFAULT;
++ 
++ 	if (__ETHTOOL_LINK_MODE_MASK_NU32
++ 	    != link_ksettings.base.link_mode_masks_nwords) {
++ 		/* wrong link mode nbits requested */
++ 		memset(&link_ksettings, 0, sizeof(link_ksettings));
++ 		link_ksettings.base.cmd = ETHTOOL_GLINKSETTINGS;
++ 		/* send back number of words required as negative val */
++ 		compiletime_assert(__ETHTOOL_LINK_MODE_MASK_NU32 <= S8_MAX,
++ 				   "need too many bits for link modes!");
++ 		link_ksettings.base.link_mode_masks_nwords
++ 			= -((s8)__ETHTOOL_LINK_MODE_MASK_NU32);
++ 
++ 		/* copy the base fields back to user, not the link
++ 		 * mode bitmaps
++ 		 */
++ 		if (copy_to_user(useraddr, &link_ksettings.base,
++ 				 sizeof(link_ksettings.base)))
++ 			return -EFAULT;
++ 
++ 		return 0;
++ 	}
++ 
++ 	/* handshake successful: user/kernel agree on
++ 	 * link_mode_masks_nwords
++ 	 */
++ 
++ 	memset(&link_ksettings, 0, sizeof(link_ksettings));
++ 	err = dev->ethtool_ops->get_link_ksettings(dev, &link_ksettings);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	/* make sure we tell the right values to user */
++ 	link_ksettings.base.cmd = ETHTOOL_GLINKSETTINGS;
++ 	link_ksettings.base.link_mode_masks_nwords
++ 		= __ETHTOOL_LINK_MODE_MASK_NU32;
++ 
++ 	return store_link_ksettings_for_user(useraddr, &link_ksettings);
++ }
++ 
++ /* Update device ethtool_link_settings.
++  *
++  * Backward compatibility note: this function must fail when driver
++  * does not implement ethtool::set_link_ksettings, even if legacy
++  * ethtool_ops::set_settings is implemented. This tells new versions
++  * of ethtool that they should use the legacy API %ETHTOOL_SSET for
++  * this driver, so that they can correctly update the ethtool_cmd
++  * deprecated fields (transceiver/maxrxpkt/maxtxpkt), until no driver
++  * implements ethtool_ops::get_settings anymore.
++  */
++ static int ethtool_set_link_ksettings(struct net_device *dev,
++ 				      void __user *useraddr)
++ {
++ 	int err;
++ 	struct ethtool_link_ksettings link_ksettings;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!dev->ethtool_ops->set_link_ksettings)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* make sure nbits field has expected value */
++ 	if (copy_from_user(&link_ksettings.base, useraddr,
++ 			   sizeof(link_ksettings.base)))
++ 		return -EFAULT;
++ 
++ 	if (__ETHTOOL_LINK_MODE_MASK_NU32
++ 	    != link_ksettings.base.link_mode_masks_nwords)
++ 		return -EINVAL;
++ 
++ 	/* copy the whole structure, now that we know it has expected
++ 	 * format
++ 	 */
++ 	err = load_link_ksettings_from_user(&link_ksettings, useraddr);
++ 	if (err)
++ 		return err;
++ 
++ 	/* re-check nwords field, just in case */
++ 	if (__ETHTOOL_LINK_MODE_MASK_NU32
++ 	    != link_ksettings.base.link_mode_masks_nwords)
++ 		return -EINVAL;
++ 
++ 	return dev->ethtool_ops->set_link_ksettings(dev, &link_ksettings);
++ }
++ 
++ static void
++ warn_incomplete_ethtool_legacy_settings_conversion(const char *details)
++ {
++ 	char name[sizeof(current->comm)];
++ 
++ 	pr_info_once("warning: `%s' uses legacy ethtool link settings API, %s\n",
++ 		     get_task_comm(name, current), details);
++ }
++ 
++ /* Query device for its ethtool_cmd settings.
++  *
++  * Backward compatibility note: for compatibility with legacy ethtool,
++  * this has to work with both drivers implementing get_link_ksettings
++  * API and drivers implementing get_settings API. When drivers
++  * implement get_link_ksettings and report higher link mode bits, a
++  * kernel warning is logged once (with name of 1st driver/device) to
++  * recommend user to upgrade ethtool, but the command is successful
++  * (only the lower link mode bits reported back to user).
++  */
+++>>>>>>> 793cf87de9d1 (ethtool: Set cmd field in ETHTOOL_GLINKSETTINGS response to wrong nwords)
+  static int ethtool_get_settings(struct net_device *dev, void __user *useraddr)
+  {
+ +	int err;
+  	struct ethtool_cmd cmd;
+  
+ -	ASSERT_RTNL();
+ -
+ -	if (dev->ethtool_ops->get_link_ksettings) {
+ -		/* First, use link_ksettings API if it is supported */
+ -		int err;
+ -		struct ethtool_link_ksettings link_ksettings;
+ -
+ -		memset(&link_ksettings, 0, sizeof(link_ksettings));
+ -		err = dev->ethtool_ops->get_link_ksettings(dev,
+ -							   &link_ksettings);
+ -		if (err < 0)
+ -			return err;
+ -		if (!convert_link_ksettings_to_legacy_settings(&cmd,
+ -							       &link_ksettings))
+ -			warn_incomplete_ethtool_legacy_settings_conversion(
+ -				"link modes are only partially reported");
+ -
+ -		/* send a sensible cmd tag back to user */
+ -		cmd.cmd = ETHTOOL_GSET;
+ -	} else {
+ -		/* driver doesn't support %ethtool_link_ksettings
+ -		 * API. revert to legacy %ethtool_cmd API, unless it's
+ -		 * not supported either.
+ -		 */
+ -		int err;
+ -
+ -		if (!dev->ethtool_ops->get_settings)
+ -			return -EOPNOTSUPP;
+ -
+ -		memset(&cmd, 0, sizeof(cmd));
+ -		cmd.cmd = ETHTOOL_GSET;
+ -		err = dev->ethtool_ops->get_settings(dev, &cmd);
+ -		if (err < 0)
+ -			return err;
+ -	}
+ +	err = __ethtool_get_settings(dev, &cmd);
+ +	if (err < 0)
+ +		return err;
+  
+  	if (copy_to_user(useraddr, &cmd, sizeof(cmd)))
+  		return -EFAULT;
+* Unmerged path net/core/ethtool.c
