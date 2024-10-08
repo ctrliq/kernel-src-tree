@@ -1,0 +1,361 @@
+KVM: PPC: Book3S HV: Add ICP real mode counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s: Add ICP real mode counters (Thomas Huth) [1287474]
+Rebuild_FUZZ: 90.70%
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 6e0365b782739eb41b03bcfd23abeefacbf0817a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6e0365b7.failed
+
+Add two counters to count how often we generate real-mode ICS resend
+and reject events. The counters provide some performance statistics
+that could be used in the future to consider if the real mode functions
+need further optimizing. The counters are displayed as part of IPC and
+ICP state provided by /sys/debug/kernel/powerpc/kvm* for each VM.
+
+Also added two counters that count (approximately) how many times we
+don't find an ICP or ICS we're looking for. These are not currently
+exposed through sysfs, but can be useful when debugging crashes.
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 6e0365b782739eb41b03bcfd23abeefacbf0817a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index c41307ecf6cf,6dded8c75234..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -106,6 -143,180 +106,183 @@@ static inline int check_too_hard(struc
+  	return (xics->real_mode_dbg || icp->rm_action) ? H_TOO_HARD : H_SUCCESS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void icp_rm_check_resend(struct kvmppc_xics *xics,
++ 			     struct kvmppc_icp *icp)
++ {
++ 	u32 icsid;
++ 
++ 	/* Order this load with the test for need_resend in the caller */
++ 	smp_rmb();
++ 	for_each_set_bit(icsid, icp->resend_map, xics->max_icsid + 1) {
++ 		struct kvmppc_ics *ics = xics->ics[icsid];
++ 
++ 		if (!test_and_clear_bit(icsid, icp->resend_map))
++ 			continue;
++ 		if (!ics)
++ 			continue;
++ 		ics_rm_check_resend(xics, ics, icp);
++ 	}
++ }
++ 
++ static bool icp_rm_try_to_deliver(struct kvmppc_icp *icp, u32 irq, u8 priority,
++ 			       u32 *reject)
++ {
++ 	union kvmppc_icp_state old_state, new_state;
++ 	bool success;
++ 
++ 	do {
++ 		old_state = new_state = READ_ONCE(icp->state);
++ 
++ 		*reject = 0;
++ 
++ 		/* See if we can deliver */
++ 		success = new_state.cppr > priority &&
++ 			new_state.mfrr > priority &&
++ 			new_state.pending_pri > priority;
++ 
++ 		/*
++ 		 * If we can, check for a rejection and perform the
++ 		 * delivery
++ 		 */
++ 		if (success) {
++ 			*reject = new_state.xisr;
++ 			new_state.xisr = irq;
++ 			new_state.pending_pri = priority;
++ 		} else {
++ 			/*
++ 			 * If we failed to deliver we set need_resend
++ 			 * so a subsequent CPPR state change causes us
++ 			 * to try a new delivery.
++ 			 */
++ 			new_state.need_resend = true;
++ 		}
++ 
++ 	} while (!icp_rm_try_update(icp, old_state, new_state));
++ 
++ 	return success;
++ }
++ 
++ static void icp_rm_deliver_irq(struct kvmppc_xics *xics, struct kvmppc_icp *icp,
++ 			    u32 new_irq)
++ {
++ 	struct ics_irq_state *state;
++ 	struct kvmppc_ics *ics;
++ 	u32 reject;
++ 	u16 src;
++ 
++ 	/*
++ 	 * This is used both for initial delivery of an interrupt and
++ 	 * for subsequent rejection.
++ 	 *
++ 	 * Rejection can be racy vs. resends. We have evaluated the
++ 	 * rejection in an atomic ICP transaction which is now complete,
++ 	 * so potentially the ICP can already accept the interrupt again.
++ 	 *
++ 	 * So we need to retry the delivery. Essentially the reject path
++ 	 * boils down to a failed delivery. Always.
++ 	 *
++ 	 * Now the interrupt could also have moved to a different target,
++ 	 * thus we may need to re-do the ICP lookup as well
++ 	 */
++ 
++  again:
++ 	/* Get the ICS state and lock it */
++ 	ics = kvmppc_xics_find_ics(xics, new_irq, &src);
++ 	if (!ics) {
++ 		/* Unsafe increment, but this does not need to be accurate */
++ 		xics->err_noics++;
++ 		return;
++ 	}
++ 	state = &ics->irq_state[src];
++ 
++ 	/* Get a lock on the ICS */
++ 	arch_spin_lock(&ics->lock);
++ 
++ 	/* Get our server */
++ 	if (!icp || state->server != icp->server_num) {
++ 		icp = kvmppc_xics_find_server(xics->kvm, state->server);
++ 		if (!icp) {
++ 			/* Unsafe increment again*/
++ 			xics->err_noicp++;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	/* Clear the resend bit of that interrupt */
++ 	state->resend = 0;
++ 
++ 	/*
++ 	 * If masked, bail out
++ 	 *
++ 	 * Note: PAPR doesn't mention anything about masked pending
++ 	 * when doing a resend, only when doing a delivery.
++ 	 *
++ 	 * However that would have the effect of losing a masked
++ 	 * interrupt that was rejected and isn't consistent with
++ 	 * the whole masked_pending business which is about not
++ 	 * losing interrupts that occur while masked.
++ 	 *
++ 	 * I don't differentiate normal deliveries and resends, this
++ 	 * implementation will differ from PAPR and not lose such
++ 	 * interrupts.
++ 	 */
++ 	if (state->priority == MASKED) {
++ 		state->masked_pending = 1;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Try the delivery, this will set the need_resend flag
++ 	 * in the ICP as part of the atomic transaction if the
++ 	 * delivery is not possible.
++ 	 *
++ 	 * Note that if successful, the new delivery might have itself
++ 	 * rejected an interrupt that was "delivered" before we took the
++ 	 * ics spin lock.
++ 	 *
++ 	 * In this case we do the whole sequence all over again for the
++ 	 * new guy. We cannot assume that the rejected interrupt is less
++ 	 * favored than the new one, and thus doesn't need to be delivered,
++ 	 * because by the time we exit icp_rm_try_to_deliver() the target
++ 	 * processor may well have already consumed & completed it, and thus
++ 	 * the rejected interrupt might actually be already acceptable.
++ 	 */
++ 	if (icp_rm_try_to_deliver(icp, new_irq, state->priority, &reject)) {
++ 		/*
++ 		 * Delivery was successful, did we reject somebody else ?
++ 		 */
++ 		if (reject && reject != XICS_IPI) {
++ 			arch_spin_unlock(&ics->lock);
++ 			new_irq = reject;
++ 			goto again;
++ 		}
++ 	} else {
++ 		/*
++ 		 * We failed to deliver the interrupt we need to set the
++ 		 * resend map bit and mark the ICS state as needing a resend
++ 		 */
++ 		set_bit(ics->icsid, icp->resend_map);
++ 		state->resend = 1;
++ 
++ 		/*
++ 		 * If the need_resend flag got cleared in the ICP some time
++ 		 * between icp_rm_try_to_deliver() atomic update and now, then
++ 		 * we know it might have missed the resend_map bit. So we
++ 		 * retry
++ 		 */
++ 		smp_mb();
++ 		if (!icp->state.need_resend) {
++ 			arch_spin_unlock(&ics->lock);
++ 			goto again;
++ 		}
++ 	}
++  out:
++ 	arch_spin_unlock(&ics->lock);
++ }
++ 
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  static void icp_rm_down_cppr(struct kvmppc_xics *xics, struct kvmppc_icp *icp,
+  			     u8 new_cppr)
+  {
+@@@ -174,8 -385,8 +351,13 @@@
+  	 * separately here as well.
+  	 */
+  	if (resend) {
+++<<<<<<< HEAD
+ +		icp->rm_action |= XICS_RM_CHECK_RESEND;
+ +		icp->rm_resend_icp = icp;
+++=======
++ 		icp->n_check_resend++;
++ 		icp_rm_check_resend(xics, icp);
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  	}
+  }
+  
+@@@ -290,16 -501,16 +472,26 @@@ int kvmppc_rm_h_ipi(struct kvm_vcpu *vc
+  		}
+  	} while (!icp_rm_try_update(icp, old_state, new_state));
+  
+ -	/* Handle reject in real mode */
+ +	/* Pass rejects to virtual mode */
+  	if (reject && reject != XICS_IPI) {
+++<<<<<<< HEAD
+ +		this_icp->rm_action |= XICS_RM_REJECT;
+ +		this_icp->rm_reject = reject;
+++=======
++ 		this_icp->n_reject++;
++ 		icp_rm_deliver_irq(xics, icp, reject);
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  	}
+  
+ -	/* Handle resends in real mode */
+ +	/* Pass resends to virtual mode */
+  	if (resend) {
+++<<<<<<< HEAD
+ +		this_icp->rm_action |= XICS_RM_CHECK_RESEND;
+ +		this_icp->rm_resend_icp = icp;
+++=======
++ 		this_icp->n_check_resend++;
++ 		icp_rm_check_resend(xics, icp);
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  	}
+  
+  	return check_too_hard(xics, this_icp);
+@@@ -355,10 -566,13 +547,15 @@@ int kvmppc_rm_h_cppr(struct kvm_vcpu *v
+  
+  	} while (!icp_rm_try_update(icp, old_state, new_state));
+  
+ -	/*
+ -	 * Check for rejects. They are handled by doing a new delivery
+ -	 * attempt (see comments in icp_rm_deliver_irq).
+ -	 */
+ +	/* Pass rejects to virtual mode */
+  	if (reject && reject != XICS_IPI) {
+++<<<<<<< HEAD
+ +		icp->rm_action |= XICS_RM_REJECT;
+ +		icp->rm_reject = reject;
+++=======
++ 		icp->n_reject++;
++ 		icp_rm_deliver_irq(xics, icp, reject);
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  	}
+   bail:
+  	return check_too_hard(xics, icp);
+@@@ -406,10 -620,10 +603,15 @@@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vc
+  		goto bail;
+  	state = &ics->irq_state[src];
+  
+ -	/* Still asserted, resend it */
+ +	/* Still asserted, resend it, we make it look like a reject */
+  	if (state->asserted) {
+++<<<<<<< HEAD
+ +		icp->rm_action |= XICS_RM_REJECT;
+ +		icp->rm_reject = irq;
+++=======
++ 		icp->n_reject++;
++ 		icp_rm_deliver_irq(xics, icp, irq);
+++>>>>>>> 6e0365b78273 (KVM: PPC: Book3S HV: Add ICP real mode counters)
+  	}
+  
+  	if (!hlist_empty(&vcpu->kvm->irq_ack_notifier_list)) {
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index 62fd9b623f8f..a33cadcc491b 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -901,6 +901,7 @@ static int xics_debug_show(struct seq_file *m, void *private)
+ 	unsigned long flags;
+ 	unsigned long t_rm_kick_vcpu, t_rm_check_resend;
+ 	unsigned long t_rm_reject, t_rm_notify_eoi;
++	unsigned long t_reject, t_check_resend;
+ 
+ 	if (!kvm)
+ 		return 0;
+@@ -909,6 +910,8 @@ static int xics_debug_show(struct seq_file *m, void *private)
+ 	t_rm_notify_eoi = 0;
+ 	t_rm_check_resend = 0;
+ 	t_rm_reject = 0;
++	t_check_resend = 0;
++	t_reject = 0;
+ 
+ 	seq_printf(m, "=========\nICP state\n=========\n");
+ 
+@@ -928,12 +931,15 @@ static int xics_debug_show(struct seq_file *m, void *private)
+ 		t_rm_notify_eoi += icp->n_rm_notify_eoi;
+ 		t_rm_check_resend += icp->n_rm_check_resend;
+ 		t_rm_reject += icp->n_rm_reject;
++		t_check_resend += icp->n_check_resend;
++		t_reject += icp->n_reject;
+ 	}
+ 
+-	seq_puts(m, "ICP Guest Real Mode exit totals: ");
+-	seq_printf(m, "\tkick_vcpu=%lu check_resend=%lu reject=%lu notify_eoi=%lu\n",
++	seq_printf(m, "ICP Guest->Host totals: kick_vcpu=%lu check_resend=%lu reject=%lu notify_eoi=%lu\n",
+ 			t_rm_kick_vcpu, t_rm_check_resend,
+ 			t_rm_reject, t_rm_notify_eoi);
++	seq_printf(m, "ICP Real Mode totals: check_resend=%lu resend=%lu\n",
++			t_check_resend, t_reject);
+ 	for (icsid = 0; icsid <= KVMPPC_XICS_MAX_ICS_ID; icsid++) {
+ 		struct kvmppc_ics *ics = xics->ics[icsid];
+ 
+diff --git a/arch/powerpc/kvm/book3s_xics.h b/arch/powerpc/kvm/book3s_xics.h
+index 055424c43249..56ea44f9867f 100644
+--- a/arch/powerpc/kvm/book3s_xics.h
++++ b/arch/powerpc/kvm/book3s_xics.h
+@@ -83,6 +83,9 @@ struct kvmppc_icp {
+ 	unsigned long n_rm_check_resend;
+ 	unsigned long n_rm_reject;
+ 	unsigned long n_rm_notify_eoi;
++	/* Counters for handling ICP processing in real mode */
++	unsigned long n_check_resend;
++	unsigned long n_reject;
+ 
+ 	/* Debug stuff for real mode */
+ 	union kvmppc_icp_state rm_dbgstate;
+@@ -102,6 +105,8 @@ struct kvmppc_xics {
+ 	u32 max_icsid;
+ 	bool real_mode;
+ 	bool real_mode_dbg;
++	u32 err_noics;
++	u32 err_noicp;
+ 	struct kvmppc_ics *ics[KVMPPC_XICS_MAX_ICS_ID + 1];
+ };
+ 
