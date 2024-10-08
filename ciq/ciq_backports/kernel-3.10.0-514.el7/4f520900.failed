@@ -1,0 +1,134 @@
+netlink: have netlink per-protocol bind function return an error code.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] netlink: have netlink per-protocol bind function return an error code (Phil Sutter) [1238749]
+Rebuild_FUZZ: 99.28%
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 4f520900522fd596e336c07e9aafd5b7a9564235
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4f520900.failed
+
+Have the netlink per-protocol optional bind function return an int error code
+rather than void to signal a failure.
+
+This will enable netlink protocols to perform extra checks including
+capabilities and permissions verifications when updating memberships in
+multicast groups.
+
+In netlink_bind() and netlink_setsockopt() the call to the per-protocol bind
+function was moved above the multicast group update to prevent any access to
+the multicast socket groups before checking with the per-protocol bind
+function.  This will enable the per-protocol bind function to be used to check
+permissions which could be denied before making them available, and to avoid
+the messy job of undoing the addition should the per-protocol bind function
+fail.
+
+The netfilter subsystem seems to be the only one currently using the
+per-protocol bind function.
+
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f520900522fd596e336c07e9aafd5b7a9564235)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/af_netlink.c
+diff --cc net/netlink/af_netlink.c
+index 8c03375d5550,7e8d229bc010..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -1453,8 -1445,8 +1471,13 @@@ static int netlink_bind(struct socket *
+  		return -EINVAL;
+  
+  	/* Only superuser is allowed to listen multicasts */
+++<<<<<<< HEAD
+ +	if (nladdr->nl_groups) {
+ +		if (!netlink_allowed(sock, NL_CFG_F_NONROOT_RECV))
+++=======
++ 	if (groups) {
++ 		if (!netlink_capable(sock, NL_CFG_F_NONROOT_RECV))
+++>>>>>>> 4f520900522f (netlink: have netlink per-protocol bind function return an error code.)
+  			return -EPERM;
+  		err = netlink_realloc_groups(sk);
+  		if (err)
+@@@ -1483,15 -1492,6 +1523,18 @@@
+  	netlink_update_listeners(sk);
+  	netlink_table_ungrab();
+  
+++<<<<<<< HEAD
+ +	if (nlk->netlink_bind && nlk->groups[0]) {
+ +		int i;
+ +
+ +		for (i=0; i<nlk->ngroups; i++) {
+ +			if (test_bit(i, nlk->groups))
+ +				nlk->netlink_bind(i);
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 4f520900522f (netlink: have netlink per-protocol bind function return an error code.)
+  	return 0;
+  }
+  
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index 076b75cbf6e5..ef68e5b1c93f 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -48,7 +48,8 @@ struct netlink_kernel_cfg {
+ 	unsigned int	flags;
+ 	void		(*input)(struct sk_buff *skb);
+ 	struct mutex	*cb_mutex;
+-	void		(*bind)(int group);
++	int		(*bind)(int group);
++	void		(*unbind)(int group);
+ 	bool		(*compare)(struct net *net, struct sock *sk);
+ };
+ 
+diff --git a/net/netfilter/nfnetlink.c b/net/netfilter/nfnetlink.c
+index 48cf7a11bc11..81df6ce23cbc 100644
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@ -399,7 +399,7 @@ static void nfnetlink_rcv(struct sk_buff *skb)
+ }
+ 
+ #ifdef CONFIG_MODULES
+-static void nfnetlink_bind(int group)
++static int nfnetlink_bind(int group)
+ {
+ 	const struct nfnetlink_subsystem *ss;
+ 	int type = nfnl_group2type[group];
+@@ -409,6 +409,7 @@ static void nfnetlink_bind(int group)
+ 	rcu_read_unlock();
+ 	if (!ss)
+ 		request_module("nfnetlink-subsys-%d", type);
++	return 0;
+ }
+ #endif
+ 
+* Unmerged path net/netlink/af_netlink.c
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 5b5d85a60dfc..ab539c5dc527 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -39,7 +39,8 @@ struct netlink_sock {
+ 	struct mutex		*cb_mutex;
+ 	struct mutex		cb_def_mutex;
+ 	void			(*netlink_rcv)(struct sk_buff *skb);
+-	void			(*netlink_bind)(int group);
++	int			(*netlink_bind)(int group);
++	void			(*netlink_unbind)(int group);
+ 	struct module		*module;
+ #ifdef CONFIG_NETLINK_MMAP
+ 	struct mutex		pg_vec_lock;
+@@ -65,7 +66,8 @@ struct netlink_table {
+ 	unsigned int		groups;
+ 	struct mutex		*cb_mutex;
+ 	struct module		*module;
+-	void			(*bind)(int group);
++	int			(*bind)(int group);
++	void			(*unbind)(int group);
+ 	bool			(*compare)(struct net *net, struct sock *sock);
+ 	int			registered;
+ };
