@@ -1,0 +1,202 @@
+gfs2: fix quota updates on block boundaries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Abhi Das <adas@redhat.com>
+commit 39a725803beeffeb319261df1ab145ef3c1ea0a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/39a72580.failed
+
+For smaller block sizes (512B, 1K, 2K), some quotas straddle block
+boundaries such that the usage value is on one block and the rest
+of the quota is on the previous block. In such cases, the value
+does not get updated correctly. This patch fixes that by addressing
+the boundary conditions correctly.
+
+This patch also adds a (s64) cast that was missing in a call to
+gfs2_quota_change() in inode.c
+
+	Signed-off-by: Abhi Das <adas@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 39a725803beeffeb319261df1ab145ef3c1ea0a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/inode.c
+index e5fe7447b3d7,a088e54090f5..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -1662,9 -1889,8 +1662,14 @@@ static int setattr_chown(struct inode *
+  
+  	if (!uid_eq(ouid, NO_UID_QUOTA_CHANGE) ||
+  	    !gid_eq(ogid, NO_GID_QUOTA_CHANGE)) {
+++<<<<<<< HEAD
+ +		u64 blocks = gfs2_get_inode_blocks(&ip->i_inode);
+ +		gfs2_quota_change(ip, -blocks, ouid, ogid);
+ +		gfs2_quota_change(ip, blocks, nuid, ngid);
+++=======
++ 		gfs2_quota_change(ip, -(s64)ap.target, ouid, ogid);
++ 		gfs2_quota_change(ip, ap.target, nuid, ngid);
+++>>>>>>> 39a725803bee (gfs2: fix quota updates on block boundaries)
+  	}
+  
+  out_end_trans:
+diff --cc fs/gfs2/quota.c
+index aa355fb96cc9,7c2003177884..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -660,15 -778,8 +766,20 @@@ static int gfs2_adjust_quota(struct gfs
+  {
+  	struct inode *inode = &ip->i_inode;
+  	struct gfs2_sbd *sdp = GFS2_SB(inode);
+++<<<<<<< HEAD
+ +	struct address_space *mapping = inode->i_mapping;
+ +	unsigned long index = loc >> PAGE_CACHE_SHIFT;
+ +	unsigned offset = loc & (PAGE_CACHE_SIZE - 1);
+ +	unsigned blocksize, iblock, pos;
+ +	struct buffer_head *bh;
+ +	struct page *page;
+ +	void *kaddr, *ptr;
+ +	struct gfs2_quota q, *qp;
+ +	int err, nbytes;
+++=======
++ 	struct gfs2_quota q;
++ 	int err;
+++>>>>>>> 39a725803bee (gfs2: fix quota updates on block boundaries)
+  	u64 size;
+  
+  	if (gfs2_is_stuffed(ip)) {
+@@@ -682,100 -793,37 +793,68 @@@
+  	if (err < 0)
+  		return err;
+  
++ 	loc -= sizeof(q); /* gfs2_internal_read would've advanced the loc ptr */
+  	err = -EIO;
+++<<<<<<< HEAD
+ +	qp = &q;
+ +	qp->qu_value = be64_to_cpu(qp->qu_value);
+ +	qp->qu_value += change;
+ +	qp->qu_value = cpu_to_be64(qp->qu_value);
+ +	qd->qd_qb.qb_value = qp->qu_value;
+++=======
++ 	be64_add_cpu(&q.qu_value, change);
++ 	if (be64_to_cpu(q.qu_value) < 0)
++ 		q.qu_value = 0; /* Never go negative on quota usage */
++ 	qd->qd_qb.qb_value = q.qu_value;
+++>>>>>>> 39a725803bee (gfs2: fix quota updates on block boundaries)
+  	if (fdq) {
+ -		if (fdq->d_fieldmask & QC_SPC_SOFT) {
+ -			q.qu_warn = cpu_to_be64(fdq->d_spc_softlimit >> sdp->sd_sb.sb_bsize_shift);
+ -			qd->qd_qb.qb_warn = q.qu_warn;
+ +		if (fdq->d_fieldmask & FS_DQ_BSOFT) {
+ +			qp->qu_warn = cpu_to_be64(fdq->d_blk_softlimit >> sdp->sd_fsb2bb_shift);
+ +			qd->qd_qb.qb_warn = qp->qu_warn;
+  		}
+ -		if (fdq->d_fieldmask & QC_SPC_HARD) {
+ -			q.qu_limit = cpu_to_be64(fdq->d_spc_hardlimit >> sdp->sd_sb.sb_bsize_shift);
+ -			qd->qd_qb.qb_limit = q.qu_limit;
+ +		if (fdq->d_fieldmask & FS_DQ_BHARD) {
+ +			qp->qu_limit = cpu_to_be64(fdq->d_blk_hardlimit >> sdp->sd_fsb2bb_shift);
+ +			qd->qd_qb.qb_limit = qp->qu_limit;
+  		}
+ -		if (fdq->d_fieldmask & QC_SPACE) {
+ -			q.qu_value = cpu_to_be64(fdq->d_space >> sdp->sd_sb.sb_bsize_shift);
+ -			qd->qd_qb.qb_value = q.qu_value;
+ +		if (fdq->d_fieldmask & FS_DQ_BCOUNT) {
+ +			qp->qu_value = cpu_to_be64(fdq->d_bcount >> sdp->sd_fsb2bb_shift);
+ +			qd->qd_qb.qb_value = qp->qu_value;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Write the quota into the quota file on disk */
+ +	ptr = qp;
+ +	nbytes = sizeof(struct gfs2_quota);
+ +get_a_page:
+ +	page = find_or_create_page(mapping, index, GFP_NOFS);
+ +	if (!page)
+ +		return -ENOMEM;
+ +
+ +	blocksize = inode->i_sb->s_blocksize;
+ +	iblock = index << (PAGE_CACHE_SHIFT - inode->i_sb->s_blocksize_bits);
+ +
+ +	if (!page_has_buffers(page))
+ +		create_empty_buffers(page, blocksize, 0);
+ +
+ +	bh = page_buffers(page);
+ +	pos = blocksize;
+ +	while (offset >= pos) {
+ +		bh = bh->b_this_page;
+ +		iblock++;
+ +		pos += blocksize;
+++=======
++ 	err = gfs2_write_disk_quota(ip, &q, loc);
++ 	if (!err) {
++ 		size = loc + sizeof(struct gfs2_quota);
++ 		if (size > inode->i_size)
++ 			i_size_write(inode, size);
++ 		inode->i_mtime = inode->i_atime = CURRENT_TIME;
++ 		mark_inode_dirty(inode);
++ 		set_bit(QDF_REFRESH, &qd->qd_flags);
+++>>>>>>> 39a725803bee (gfs2: fix quota updates on block boundaries)
+  	}
+  
+- 	if (!buffer_mapped(bh)) {
+- 		gfs2_block_map(inode, iblock, bh, 1);
+- 		if (!buffer_mapped(bh))
+- 			goto unlock_out;
+- 		/* If it's a newly allocated disk block for quota, zero it */
+- 		if (buffer_new(bh))
+- 			zero_user(page, pos - blocksize, bh->b_size);
+- 	}
+- 
+- 	if (PageUptodate(page))
+- 		set_buffer_uptodate(bh);
+- 
+- 	if (!buffer_uptodate(bh)) {
+- 		ll_rw_block(READ | REQ_META, 1, &bh);
+- 		wait_on_buffer(bh);
+- 		if (!buffer_uptodate(bh))
+- 			goto unlock_out;
+- 	}
+- 
+- 	gfs2_trans_add_data(ip->i_gl, bh);
+- 
+- 	kaddr = kmap_atomic(page);
+- 	if (offset + sizeof(struct gfs2_quota) > PAGE_CACHE_SIZE)
+- 		nbytes = PAGE_CACHE_SIZE - offset;
+- 	memcpy(kaddr + offset, ptr, nbytes);
+- 	flush_dcache_page(page);
+- 	kunmap_atomic(kaddr);
+- 	unlock_page(page);
+- 	page_cache_release(page);
+- 
+- 	/* If quota straddles page boundary, we need to update the rest of the
+- 	 * quota at the beginning of the next page */
+- 	if ((offset + sizeof(struct gfs2_quota)) > PAGE_CACHE_SIZE) {
+- 		ptr = ptr + nbytes;
+- 		nbytes = sizeof(struct gfs2_quota) - nbytes;
+- 		offset = 0;
+- 		index++;
+- 		goto get_a_page;
+- 	}
+- 
+- 	size = loc + sizeof(struct gfs2_quota);
+- 	if (size > inode->i_size)
+- 		i_size_write(inode, size);
+- 	inode->i_mtime = inode->i_atime = CURRENT_TIME;
+- 	mark_inode_dirty(inode);
+- 	set_bit(QDF_REFRESH, &qd->qd_flags);
+- 	return 0;
+- 
+- unlock_out:
+- 	unlock_page(page);
+- 	page_cache_release(page);
+  	return err;
+  }
+  
+* Unmerged path fs/gfs2/inode.c
+* Unmerged path fs/gfs2/quota.c
