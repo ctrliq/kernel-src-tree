@@ -275,7 +275,7 @@ static void nfsd4_free_file(struct nfs4_file *f)
 	kmem_cache_free(file_slab, f);
 }
 
-static inline void
+void
 put_nfs4_file(struct nfs4_file *fi)
 {
 	might_lock(&state_lock);
@@ -285,12 +285,6 @@ put_nfs4_file(struct nfs4_file *fi)
 		spin_unlock(&state_lock);
 		nfsd4_free_file(fi);
 	}
-}
-
-static inline void
-get_nfs4_file(struct nfs4_file *fi)
-{
-	atomic_inc(&fi->fi_ref);
 }
 
 static struct file *
@@ -3311,7 +3305,7 @@ find_file_locked(struct knfsd_fh *fh)
 	return NULL;
 }
 
-static struct nfs4_file *
+struct nfs4_file *
 find_file(struct knfsd_fh *fh)
 {
 	struct nfs4_file *fp;
