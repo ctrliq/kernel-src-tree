@@ -1,0 +1,208 @@
+fib_trie: Pull empty_children and full_children into tnode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 6e22d174ba29a04dfd66e9be3fa9b5fad1278001
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6e22d174.failed
+
+This pulls the information about the child array out of the key_vector and
+places it in the tnode since that is where it is needed.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6e22d174ba29a04dfd66e9be3fa9b5fad1278001)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 8be89b1a8b93,acbed2d5347d..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -91,35 -92,32 +91,47 @@@ typedef unsigned int t_key
+  #define IS_TNODE(n) ((n)->bits)
+  #define IS_LEAF(n) (!(n)->bits)
+  
+++<<<<<<< HEAD
+ +#define get_index(_key, _kv) (((_key) ^ (_kv)->key) >> (_kv)->pos)
+++=======
++ struct key_vector {
++ 	struct key_vector __rcu *parent;
+++>>>>>>> 6e22d174ba29 (fib_trie: Pull empty_children and full_children into tnode)
+  
+ +struct tnode {
+  	t_key key;
+ -	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
+ +	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char slen;
+ +	struct tnode __rcu *parent;
+ +	struct rcu_head rcu;
+  	union {
+ -		/* This list pointer if valid if (pos | bits) == 0 (LEAF) */
+ -		struct hlist_head leaf;
+ -		/* This array is valid if (pos | bits) > 0 (TNODE) */
+ -		struct key_vector __rcu *tnode[0];
+ +		/* The fields in this struct are valid if bits > 0 (TNODE) */
+ +		struct {
+ +			t_key empty_children; /* KEYLENGTH bits needed */
+ +			t_key full_children;  /* KEYLENGTH bits needed */
+ +			struct tnode __rcu *child[0];
+ +		};
+ +		/* This list pointer if valid if bits == 0 (LEAF) */
+ +		struct hlist_head list;
+  	};
+  };
+  
+ -struct tnode {
+ +struct leaf_info {
+ +	struct hlist_node hlist;
+ +	int plen;
+ +	u32 mask_plen; /* ntohl(inet_make_mask(plen)) */
+ +	struct list_head falh;
+  	struct rcu_head rcu;
+++<<<<<<< HEAD
+++=======
++ 	t_key empty_children;		/* KEYLENGTH bits needed */
++ 	t_key full_children;		/* KEYLENGTH bits needed */
++ 	struct key_vector kv[1];
++ #define tn_bits kv[0].bits
+++>>>>>>> 6e22d174ba29 (fib_trie: Pull empty_children and full_children into tnode)
+  };
+  
+ -#define TNODE_SIZE(n)	offsetof(struct tnode, kv[0].tnode[n])
+ -#define LEAF_SIZE	TNODE_SIZE(1)
+ -
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+  struct trie_use_stats {
+  	unsigned int gets;
+@@@ -303,33 -307,34 +315,33 @@@ static struct tnode *tnode_alloc(size_
+  		return vzalloc(size);
+  }
+  
+ -static inline void empty_child_inc(struct key_vector *n)
+ +static inline void empty_child_inc(struct tnode *n)
+  {
+- 	++n->empty_children ? : ++n->full_children;
++ 	++tn_info(n)->empty_children ? : ++tn_info(n)->full_children;
+  }
+  
+ -static inline void empty_child_dec(struct key_vector *n)
+ +static inline void empty_child_dec(struct tnode *n)
+  {
+- 	n->empty_children-- ? : n->full_children--;
++ 	tn_info(n)->empty_children-- ? : tn_info(n)->full_children--;
+  }
+  
+ -static struct key_vector *leaf_new(t_key key, struct fib_alias *fa)
+ +static struct tnode *leaf_new(t_key key)
+  {
+ -	struct tnode *kv = kmem_cache_alloc(trie_leaf_kmem, GFP_KERNEL);
+ -	struct key_vector *l = kv->kv;
+ -
+ -	if (!kv)
+ -		return NULL;
+ -
+ -	/* initialize key vector */
+ -	l->key = key;
+ -	l->pos = 0;
+ -	l->bits = 0;
+ -	l->slen = fa->fa_slen;
+ -
+ -	/* link leaf to fib alias */
+ -	INIT_HLIST_HEAD(&l->leaf);
+ -	hlist_add_head(&fa->fa_list, &l->leaf);
+ +	struct tnode *l = kmem_cache_alloc(trie_leaf_kmem, GFP_KERNEL);
+ +	if (l) {
+ +		l->parent = NULL;
+ +		/* set key and pos to reflect full key value
+ +		 * any trailing zeros in the key should be ignored
+ +		 * as the nodes are searched
+ +		 */
+ +		l->key = key;
+ +		l->slen = 0;
+ +		l->pos = 0;
+ +		/* set bits to 0 indicating we are not a tnode */
+ +		l->bits = 0;
+  
+ +		INIT_HLIST_HEAD(&l->list);
+ +	}
+  	return l;
+  }
+  
+@@@ -353,20 -347,22 +365,38 @@@ static struct tnode *tnode_new(t_key ke
+  	/* verify bits and pos their msb bits clear and values are valid */
+  	BUG_ON(!bits || (shift > KEYLENGTH));
+  
+++<<<<<<< HEAD
+ +	if (tn) {
+ +		tn->parent = NULL;
+ +		tn->slen = pos;
+ +		tn->pos = pos;
+ +		tn->bits = bits;
+ +		tn->key = (shift < KEYLENGTH) ? (key >> shift) << shift : 0;
+ +		if (bits == KEYLENGTH)
+ +			tn->full_children = 1;
+ +		else
+ +			tn->empty_children = 1ul << bits;
+ +	}
+++=======
++ 	pr_debug("AT %p s=%zu %zu\n", tnode, TNODE_SIZE(0),
++ 		 sizeof(struct key_vector *) << bits);
++ 
++ 	if (!tnode)
++ 		return NULL;
++ 
++ 	if (bits == KEYLENGTH)
++ 		tnode->full_children = 1;
++ 	else
++ 		tnode->empty_children = 1ul << bits;
++ 
++ 	tn->key = (shift < KEYLENGTH) ? (key >> shift) << shift : 0;
++ 	tn->pos = pos;
++ 	tn->bits = bits;
++ 	tn->slen = pos;
+++>>>>>>> 6e22d174ba29 (fib_trie: Pull empty_children and full_children into tnode)
+  
+ +	pr_debug("AT %p s=%zu %zu\n", tn, sizeof(struct tnode),
+ +		 sizeof(struct tnode *) << bits);
+  	return tn;
+  }
+  
+@@@ -782,14 -790,14 +812,14 @@@ static bool should_halve(const struct t
+  	return (used > 1) && (tn->bits > 1) && ((100 * used) < threshold);
+  }
+  
+ -static inline bool should_collapse(struct key_vector *tn)
+ +static bool should_collapse(const struct tnode *tn)
+  {
+ -	unsigned long used = child_length(tn);
+ +	unsigned long used = tnode_child_length(tn);
+  
+- 	used -= tn->empty_children;
++ 	used -= tn_info(tn)->empty_children;
+  
+  	/* account for bits == KEYLENGTH case */
+- 	if ((tn->bits == KEYLENGTH) && tn->full_children)
++ 	if ((tn->bits == KEYLENGTH) && tn_info(tn)->full_children)
+  		used -= KEY_MAX;
+  
+  	/* One child or none, time to drop us from the trie */
+@@@ -2241,10 -2238,11 +2271,11 @@@ static int fib_trie_seq_show(struct seq
+  		seq_indent(seq, iter->depth-1);
+  		seq_printf(seq, "  +-- %pI4/%zu %u %u %u\n",
+  			   &prf, KEYLENGTH - n->pos - n->bits, n->bits,
+- 			   n->full_children, n->empty_children);
++ 			   tn_info(n)->full_children,
++ 			   tn_info(n)->empty_children);
+  	} else {
+ +		struct leaf_info *li;
+  		__be32 val = htonl(n->key);
+ -		struct fib_alias *fa;
+  
+  		seq_indent(seq, iter->depth);
+  		seq_printf(seq, "  |-- %pI4\n", &val);
+* Unmerged path net/ipv4/fib_trie.c
