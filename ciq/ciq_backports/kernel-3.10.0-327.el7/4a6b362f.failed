@@ -1,0 +1,209 @@
+perf ordered_events: Adopt queue() method
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] ordered_events: Adopt queue() method (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 93.51%
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 4a6b362f36e68618ee4d3cdb361d05a5e80af023
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4a6b362f.failed
+
+From perf_session, will be used in 'trace'.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/n/tip-mfihndzaumx44h6y37ng2irb@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4a6b362f36e68618ee4d3cdb361d05a5e80af023)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/ordered-events.c
+#	tools/perf/util/ordered-events.h
+#	tools/perf/util/session.c
+diff --cc tools/perf/util/session.c
+index 647c690afe48,adf0740c563b..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -619,111 -531,80 +619,115 @@@ static int ordered_events__flush(struc
+   *      Flush every events below timestamp 7
+   *      etc...
+   */
+ -static int process_finished_round(struct perf_tool *tool __maybe_unused,
+ +static int process_finished_round(struct perf_tool *tool,
+  				  union perf_event *event __maybe_unused,
+ -				  struct ordered_events *oe)
+ +				  struct perf_session *session)
+  {
+ -	return ordered_events__flush(oe, OE_FLUSH__ROUND);
+ +	return ordered_events__flush(session, tool, OE_FLUSH__ROUND);
+  }
+  
+ -int perf_session__queue_event(struct perf_session *s, union perf_event *event,
+ -			      struct perf_sample *sample, u64 file_offset)
+ +/* The queue is ordered by time */
+ +static void __queue_event(struct ordered_event *new, struct perf_session *s)
+  {
+ -	return ordered_events__queue(&s->ordered_events, event, sample, file_offset);
+++<<<<<<< HEAD
+ +	struct ordered_events *oe = &s->ordered_events;
+ +	struct ordered_event *last = oe->last;
+ +	u64 timestamp = new->timestamp;
+ +	struct list_head *p;
+ +
+ +	++oe->nr_events;
+ +	oe->last = new;
+ +
+ +	if (!last) {
+ +		list_add(&new->list, &oe->events);
+ +		oe->max_timestamp = timestamp;
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * last event might point to some random place in the list as it's
+ +	 * the last queued event. We expect that the new event is close to
+ +	 * this.
+ +	 */
+ +	if (last->timestamp <= timestamp) {
+ +		while (last->timestamp <= timestamp) {
+ +			p = last->list.next;
+ +			if (p == &oe->events) {
+ +				list_add_tail(&new->list, &oe->events);
+ +				oe->max_timestamp = timestamp;
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add_tail(&new->list, &last->list);
+ +	} else {
+ +		while (last->timestamp > timestamp) {
+ +			p = last->list.prev;
+ +			if (p == &oe->events) {
+ +				list_add(&new->list, &oe->events);
+ +				return;
+ +			}
+ +			last = list_entry(p, struct ordered_event, list);
+ +		}
+ +		list_add(&new->list, &last->list);
+ +	}
+  }
+  
+ -static void callchain__lbr_callstack_printf(struct perf_sample *sample)
+ +#define MAX_SAMPLE_BUFFER	(64 * 1024 / sizeof(struct ordered_event))
+ +
+ +int perf_session_queue_event(struct perf_session *s, union perf_event *event,
+ +				    struct perf_sample *sample, u64 file_offset)
+  {
+ -	struct ip_callchain *callchain = sample->callchain;
+ -	struct branch_stack *lbr_stack = sample->branch_stack;
+ -	u64 kernel_callchain_nr = callchain->nr;
+ -	unsigned int i;
+ +	struct ordered_events *oe = &s->ordered_events;
+ +	struct list_head *cache = &oe->cache;
+ +	u64 timestamp = sample->time;
+ +	struct ordered_event *new;
+  
+ -	for (i = 0; i < kernel_callchain_nr; i++) {
+ -		if (callchain->ips[i] == PERF_CONTEXT_USER)
+ -			break;
+ +	if (!timestamp || timestamp == ~0ULL)
+ +		return -ETIME;
+ +
+ +	if (timestamp < s->ordered_events.last_flush) {
+ +		printf("Warning: Timestamp below last timeslice flush\n");
+ +		return -EINVAL;
+  	}
+  
+ -	if ((i != kernel_callchain_nr) && lbr_stack->nr) {
+ -		u64 total_nr;
+ -		/*
+ -		 * LBR callstack can only get user call chain,
+ -		 * i is kernel call chain number,
+ -		 * 1 is PERF_CONTEXT_USER.
+ -		 *
+ -		 * The user call chain is stored in LBR registers.
+ -		 * LBR are pair registers. The caller is stored
+ -		 * in "from" register, while the callee is stored
+ -		 * in "to" register.
+ -		 * For example, there is a call stack
+ -		 * "A"->"B"->"C"->"D".
+ -		 * The LBR registers will recorde like
+ -		 * "C"->"D", "B"->"C", "A"->"B".
+ -		 * So only the first "to" register and all "from"
+ -		 * registers are needed to construct the whole stack.
+ -		 */
+ -		total_nr = i + 1 + lbr_stack->nr + 1;
+ -		kernel_callchain_nr = i + 1;
+ +	if (!list_empty(cache)) {
+ +		new = list_entry(cache->next, struct ordered_event, list);
+ +		list_del(&new->list);
+ +	} else if (oe->buffer) {
+ +		new = oe->buffer + oe->buffer_idx;
+ +		if (++oe->buffer_idx == MAX_SAMPLE_BUFFER)
+ +			oe->buffer = NULL;
+ +	} else {
+ +		oe->buffer = malloc(MAX_SAMPLE_BUFFER * sizeof(*new));
+ +		if (!oe->buffer)
+ +			return -ENOMEM;
+ +		list_add(&oe->buffer->list, &oe->to_free);
+ +		oe->buffer_idx = 2;
+ +		new = oe->buffer + 1;
+ +	}
+  
+ -		printf("... LBR call chain: nr:%" PRIu64 "\n", total_nr);
+ +	new->timestamp = timestamp;
+ +	new->file_offset = file_offset;
+ +	new->event = event;
+  
+ -		for (i = 0; i < kernel_callchain_nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       i, callchain->ips[i]);
+ +	__queue_event(new, s);
+  
+ -		printf("..... %2d: %016" PRIx64 "\n",
+ -		       (int)(kernel_callchain_nr), lbr_stack->entries[0].to);
+ -		for (i = 0; i < lbr_stack->nr; i++)
+ -			printf("..... %2d: %016" PRIx64 "\n",
+ -			       (int)(i + kernel_callchain_nr + 1), lbr_stack->entries[i].from);
+ -	}
+ +	return 0;
+++=======
+++	return ordered_events__queue(&s->ordered_events, event, sample, file_offset);
+++>>>>>>> 4a6b362f36e6 (perf ordered_events: Adopt queue() method)
+  }
+  
+ -static void callchain__printf(struct perf_evsel *evsel,
+ -			      struct perf_sample *sample)
+ +static void callchain__printf(struct perf_sample *sample)
+  {
+  	unsigned int i;
+ -	struct ip_callchain *callchain = sample->callchain;
+ -
+ -	if (has_branch_callstack(evsel))
+ -		callchain__lbr_callstack_printf(sample);
+  
+ -	printf("... FP chain: nr:%" PRIu64 "\n", callchain->nr);
+ +	printf("... chain: nr:%" PRIu64 "\n", sample->callchain->nr);
+  
+ -	for (i = 0; i < callchain->nr; i++)
+ +	for (i = 0; i < sample->callchain->nr; i++)
+  		printf("..... %2d: %016" PRIx64 "\n",
+ -		       i, callchain->ips[i]);
+ +		       i, sample->callchain->ips[i]);
+  }
+  
+  static void branch_stack__printf(struct perf_sample *sample)
+* Unmerged path tools/perf/util/ordered-events.c
+* Unmerged path tools/perf/util/ordered-events.h
+* Unmerged path tools/perf/util/ordered-events.c
+* Unmerged path tools/perf/util/ordered-events.h
+* Unmerged path tools/perf/util/session.c
