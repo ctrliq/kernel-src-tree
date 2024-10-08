@@ -4411,6 +4411,7 @@ read_more:
 		 * on all the target devices.
 		 */
 		// FIXME
+		mempool_free(r10_bio, conf->r10buf_pool);
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		return sectors_done;
 	}
