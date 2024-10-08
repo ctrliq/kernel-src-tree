@@ -1,0 +1,154 @@
+sched/fair: Rework throttle_count sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 55e16d30bd99510900caec913c90f53bc2b35cba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/55e16d30.failed
+
+Since we already take rq->lock when creating a cgroup, use it to also
+sync the throttle_count and avoid the extra state and enqueue path
+branch.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: bsegall@google.com
+	Cc: linux-kernel@vger.kernel.org
+[ Fixed build warning. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 55e16d30bd99510900caec913c90f53bc2b35cba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 7fbda546148a,4088eedea763..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -3613,14 -4255,31 +3593,31 @@@ static void check_enqueue_throttle(stru
+  		throttle_cfs_rq(cfs_rq);
+  }
+  
++ static void sync_throttle(struct task_group *tg, int cpu)
++ {
++ 	struct cfs_rq *pcfs_rq, *cfs_rq;
++ 
++ 	if (!cfs_bandwidth_used())
++ 		return;
++ 
++ 	if (!tg->parent)
++ 		return;
++ 
++ 	cfs_rq = tg->cfs_rq[cpu];
++ 	pcfs_rq = tg->parent->cfs_rq[cpu];
++ 
++ 	cfs_rq->throttle_count = pcfs_rq->throttle_count;
++ 	pcfs_rq->throttled_clock_task = rq_clock_task(cpu_rq(cpu));
++ }
++ 
+  /* conditionally throttle active cfs_rq's from put_prev_entity() */
+ -static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ +static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+  {
+  	if (!cfs_bandwidth_used())
+ -		return false;
+ +		return;
+  
+  	if (likely(!cfs_rq->runtime_enabled || cfs_rq->runtime_remaining > 0))
+ -		return false;
+ +		return;
+  
+  	/*
+  	 * it's possible for a throttled entity to be forced into a running
+@@@ -3743,8 -4409,9 +3740,9 @@@ static inline u64 cfs_rq_clock_task(str
+  }
+  
+  static void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec) {}
+ -static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq) { return false; }
+ +static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+  static void check_enqueue_throttle(struct cfs_rq *cfs_rq) {}
++ static inline void sync_throttle(struct task_group *tg, int cpu) {}
+  static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+  
+  static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+@@@ -7411,21 -8632,46 +7409,42 @@@ err
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +void unregister_fair_sched_group(struct task_group *tg, int cpu)
+++=======
++ void online_fair_sched_group(struct task_group *tg)
++ {
++ 	struct sched_entity *se;
++ 	struct rq *rq;
++ 	int i;
++ 
++ 	for_each_possible_cpu(i) {
++ 		rq = cpu_rq(i);
++ 		se = tg->se[i];
++ 
++ 		raw_spin_lock_irq(&rq->lock);
++ 		post_init_entity_util_avg(se);
++ 		sync_throttle(tg, i);
++ 		raw_spin_unlock_irq(&rq->lock);
++ 	}
++ }
++ 
++ void unregister_fair_sched_group(struct task_group *tg)
+++>>>>>>> 55e16d30bd99 (sched/fair: Rework throttle_count sync)
+  {
+ +	struct rq *rq = cpu_rq(cpu);
+  	unsigned long flags;
+ -	struct rq *rq;
+ -	int cpu;
+  
+ -	for_each_possible_cpu(cpu) {
+ -		if (tg->se[cpu])
+ -			remove_entity_load_avg(tg->se[cpu]);
+ -
+ -		/*
+ -		 * Only empty task groups can be destroyed; so we can speculatively
+ -		 * check on_list without danger of it being re-added.
+ -		 */
+ -		if (!tg->cfs_rq[cpu]->on_list)
+ -			continue;
+ -
+ -		rq = cpu_rq(cpu);
+ +	/*
+ +	* Only empty task groups can be destroyed; so we can speculatively
+ +	* check on_list without danger of it being re-added.
+ +	*/
+ +	if (!tg->cfs_rq[cpu]->on_list)
+ +		return;
+  
+ -		raw_spin_lock_irqsave(&rq->lock, flags);
+ -		list_del_leaf_cfs_rq(tg->cfs_rq[cpu]);
+ -		raw_spin_unlock_irqrestore(&rq->lock, flags);
+ -	}
+ +	raw_spin_lock_irqsave(&rq->lock, flags);
+ +	list_del_leaf_cfs_rq(tg->cfs_rq[cpu]);
+ +	raw_spin_unlock_irqrestore(&rq->lock, flags);
+  }
+  
+  void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 4200f73f7a8d..b976abe32e72 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -317,7 +317,7 @@ struct cfs_rq {
+ 
+ 	u64 throttled_clock, throttled_clock_task;
+ 	u64 throttled_clock_task_time;
+-	int throttled, throttle_count, throttle_uptodate;
++	int throttled, throttle_count;
+ 	struct list_head throttled_list;
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
