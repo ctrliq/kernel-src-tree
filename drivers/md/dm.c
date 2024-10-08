@@ -2431,7 +2431,7 @@ static struct dm_table *__bind(struct mapped_device *md, struct dm_table *t,
 
 	merge_is_optional = dm_table_merge_is_optional(t);
 
-	old_map = rcu_dereference(md->map);
+	old_map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
 	rcu_assign_pointer(md->map, t);
 	md->immutable_target_type = dm_table_get_immutable_target_type(t);
 
@@ -2451,7 +2451,7 @@ static struct dm_table *__bind(struct mapped_device *md, struct dm_table *t,
  */
 static struct dm_table *__unbind(struct mapped_device *md)
 {
-	struct dm_table *map = rcu_dereference(md->map);
+	struct dm_table *map = rcu_dereference_protected(md->map, 1);
 
 	if (!map)
 		return NULL;
@@ -2946,7 +2946,7 @@ retry:
 		goto retry;
 	}
 
-	map = rcu_dereference(md->map);
+	map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
 
 	r = __dm_suspend(md, map, suspend_flags, TASK_INTERRUPTIBLE);
 	if (r)
@@ -3004,7 +3004,7 @@ retry:
 		goto retry;
 	}
 
-	map = rcu_dereference(md->map);
+	map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
 	if (!map || !dm_table_get_size(map))
 		goto out;
 
@@ -3039,7 +3039,7 @@ static void __dm_internal_suspend(struct mapped_device *md, unsigned suspend_fla
 		return; /* nest suspend */
 	}
 
-	map = rcu_dereference(md->map);
+	map = rcu_dereference_protected(md->map, lockdep_is_held(&md->suspend_lock));
 
 	/*
 	 * Using TASK_UNINTERRUPTIBLE because only NOFLUSH internal suspend is
