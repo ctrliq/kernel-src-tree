@@ -1,0 +1,110 @@
+epoll: do not take the nested ep->mtx on EPOLL_CTL_DEL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jason Baron <jbaron@akamai.com>
+commit 4ff36ee94d93ddb4b7846177f1118d9aa33408e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4ff36ee9.failed
+
+The EPOLL_CTL_DEL path of epoll contains a classic, ab-ba deadlock.
+That is, epoll_ctl(a, EPOLL_CTL_DEL, b, x), will deadlock with
+epoll_ctl(b, EPOLL_CTL_DEL, a, x).  The deadlock was introduced with
+commmit 67347fe4e632 ("epoll: do not take global 'epmutex' for simple
+topologies").
+
+The acquistion of the ep->mtx for the destination 'ep' was added such
+that a concurrent EPOLL_CTL_ADD operation would see the correct state of
+the ep (Specifically, the check for '!list_empty(&f.file->f_ep_links')
+
+However, by simply not acquiring the lock, we do not serialize behind
+the ep->mtx from the add path, and thus may perform a full path check
+when if we had waited a little longer it may not have been necessary.
+However, this is a transient state, and performing the full loop
+checking in this case is not harmful.
+
+The important point is that we wouldn't miss doing the full loop
+checking when required, since EPOLL_CTL_ADD always locks any 'ep's that
+its operating upon.  The reason we don't need to do lock ordering in the
+add path, is that we are already are holding the global 'epmutex'
+whenever we do the double lock.  Further, the original posting of this
+patch, which was tested for the intended performance gains, did not
+perform this additional locking.
+
+	Signed-off-by: Jason Baron <jbaron@akamai.com>
+	Cc: Nathan Zimmer <nzimmer@sgi.com>
+	Cc: Eric Wong <normalperson@yhbt.net>
+	Cc: Nelson Elhage <nelhage@nelhage.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Davide Libenzi <davidel@xmailserver.org>
+	Cc: "Paul E. McKenney" <paulmck@us.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4ff36ee94d93ddb4b7846177f1118d9aa33408e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/eventpoll.c
+diff --cc fs/eventpoll.c
+index 4ff595d6eb53,af903128891c..000000000000
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@@ -1847,27 -1877,37 +1847,31 @@@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, i
+  	 * and hang them on the tfile_check_list, so we can check that we
+  	 * haven't created too many possible wakeup paths.
+  	 *
+ -	 * We do not need to take the global 'epumutex' on EPOLL_CTL_ADD when
+ -	 * the epoll file descriptor is attaching directly to a wakeup source,
+ -	 * unless the epoll file descriptor is nested. The purpose of taking the
+ -	 * 'epmutex' on add is to prevent complex toplogies such as loops and
+ -	 * deep wakeup paths from forming in parallel through multiple
+ -	 * EPOLL_CTL_ADD operations.
+ +	 * We need to hold the epmutex across both ep_insert and ep_remove
+ +	 * b/c we want to make sure we are looking at a coherent view of
+ +	 * epoll network.
+  	 */
+ -	mutex_lock_nested(&ep->mtx, 0);
+ +	if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL) {
+ +		mutex_lock(&epmutex);
+ +		did_lock_epmutex = 1;
+ +	}
+  	if (op == EPOLL_CTL_ADD) {
+ -		if (!list_empty(&f.file->f_ep_links) ||
+ -						is_file_epoll(tf.file)) {
+ -			full_check = 1;
+ -			mutex_unlock(&ep->mtx);
+ -			mutex_lock(&epmutex);
+ -			if (is_file_epoll(tf.file)) {
+ -				error = -ELOOP;
+ -				if (ep_loop_check(ep, tf.file) != 0) {
+ -					clear_tfile_check_list();
+ -					goto error_tgt_fput;
+ -				}
+ -			} else
+ -				list_add(&tf.file->f_tfile_llink,
+ -							&tfile_check_list);
+ -			mutex_lock_nested(&ep->mtx, 0);
+ -			if (is_file_epoll(tf.file)) {
+ -				tep = tf.file->private_data;
+ -				mutex_lock_nested(&tep->mtx, 1);
+ +		if (is_file_epoll(tfile)) {
+ +			error = -ELOOP;
+ +			if (ep_loop_check(ep, tfile) != 0) {
+ +				clear_tfile_check_list();
+ +				goto error_tgt_fput;
+  			}
+++<<<<<<< HEAD
+ +		} else
+ +			list_add(&tfile->f_tfile_llink, &tfile_check_list);
+++=======
++ 		}
+++>>>>>>> 4ff36ee94d93 (epoll: do not take the nested ep->mtx on EPOLL_CTL_DEL)
+  	}
+  
+ +	mutex_lock_nested(&ep->mtx, 0);
+ +
+  	/*
+  	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
+  	 * above, we can be sure to be able to use the item looked up by
+* Unmerged path fs/eventpoll.c
