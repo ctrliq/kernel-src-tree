@@ -1,0 +1,654 @@
+sched: Add new scheduler syscalls to support an extended scheduling parameters ABI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dario Faggioli <raistlin@linux.it>
+commit d50dde5a10f305253cbc3855307f608f8a3c5f73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d50dde5a.failed
+
+Add the syscalls needed for supporting scheduling algorithms
+with extended scheduling parameters (e.g., SCHED_DEADLINE).
+
+In general, it makes possible to specify a periodic/sporadic task,
+that executes for a given amount of runtime at each instance, and is
+scheduled according to the urgency of their own timing constraints,
+i.e.:
+
+ - a (maximum/typical) instance execution time,
+ - a minimum interval between consecutive instances,
+ - a time constraint by which each instance must be completed.
+
+Thus, both the data structure that holds the scheduling parameters of
+the tasks and the system calls dealing with it must be extended.
+Unfortunately, modifying the existing struct sched_param would break
+the ABI and result in potentially serious compatibility issues with
+legacy binaries.
+
+For these reasons, this patch:
+
+ - defines the new struct sched_attr, containing all the fields
+   that are necessary for specifying a task in the computational
+   model described above;
+
+ - defines and implements the new scheduling related syscalls that
+   manipulate it, i.e., sched_setattr() and sched_getattr().
+
+Syscalls are introduced for x86 (32 and 64 bits) and ARM only, as a
+proof of concept and for developing and testing purposes. Making them
+available on other architectures is straightforward.
+
+Since no "user" for these new parameters is introduced in this patch,
+the implementation of the new system calls is just identical to their
+already existing counterpart. Future patches that implement scheduling
+policies able to exploit the new data structure must also take care of
+modifying the sched_*attr() calls accordingly with their own purposes.
+
+	Signed-off-by: Dario Faggioli <raistlin@linux.it>
+[ Rewrote to use sched_attr. ]
+	Signed-off-by: Juri Lelli <juri.lelli@gmail.com>
+[ Removed sched_setscheduler2() for now. ]
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1383831828-15501-3-git-send-email-juri.lelli@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d50dde5a10f305253cbc3855307f608f8a3c5f73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/syscalls/syscall_32.tbl
+#	arch/x86/syscalls/syscall_64.tbl
+diff --cc arch/x86/syscalls/syscall_32.tbl
+index a33d1333367f,96bc506ac6de..000000000000
+--- a/arch/x86/syscalls/syscall_32.tbl
++++ b/arch/x86/syscalls/syscall_32.tbl
+@@@ -357,5 -357,5 +357,10 @@@
+  348	i386	process_vm_writev	sys_process_vm_writev		compat_sys_process_vm_writev
+  349	i386	kcmp			sys_kcmp
+  350	i386	finit_module		sys_finit_module
+++<<<<<<< HEAD
+ +356	i386	memfd_create		sys_memfd_create
+ +374	i386	userfaultfd		sys_userfaultfd
+++=======
++ 351	i386	sched_setattr		sys_sched_setattr
++ 352	i386	sched_getattr		sys_sched_getattr
+++>>>>>>> d50dde5a10f3 (sched: Add new scheduler syscalls to support an extended scheduling parameters ABI)
+diff --cc arch/x86/syscalls/syscall_64.tbl
+index b8fbeb4ac066,a12bddc7ccea..000000000000
+--- a/arch/x86/syscalls/syscall_64.tbl
++++ b/arch/x86/syscalls/syscall_64.tbl
+@@@ -320,10 -320,8 +320,15 @@@
+  311	64	process_vm_writev	sys_process_vm_writev
+  312	common	kcmp			sys_kcmp
+  313	common	finit_module		sys_finit_module
+++<<<<<<< HEAD
+ +316	common	renameat2		sys_renameat2
+ +319	common	memfd_create		sys_memfd_create
+ +320	common	kexec_file_load		sys_kexec_file_load
+ +323	common	userfaultfd		sys_userfaultfd
+++=======
++ 314	common	sched_setattr		sys_sched_setattr
++ 315	common	sched_getattr		sys_sched_getattr
+++>>>>>>> d50dde5a10f3 (sched: Add new scheduler syscalls to support an extended scheduling parameters ABI)
+  
+  #
+  # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/arch/arm/include/asm/unistd.h b/arch/arm/include/asm/unistd.h
+index 141baa3f9a72..acabef1a75df 100644
+--- a/arch/arm/include/asm/unistd.h
++++ b/arch/arm/include/asm/unistd.h
+@@ -15,7 +15,7 @@
+ 
+ #include <uapi/asm/unistd.h>
+ 
+-#define __NR_syscalls  (380)
++#define __NR_syscalls  (384)
+ #define __ARM_NR_cmpxchg		(__ARM_NR_BASE+0x00fff0)
+ 
+ #define __ARCH_WANT_STAT64
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+index af33b44990ed..fb5584d0cc05 100644
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -406,6 +406,8 @@
+ #define __NR_process_vm_writev		(__NR_SYSCALL_BASE+377)
+ #define __NR_kcmp			(__NR_SYSCALL_BASE+378)
+ #define __NR_finit_module		(__NR_SYSCALL_BASE+379)
++#define __NR_sched_setattr		(__NR_SYSCALL_BASE+380)
++#define __NR_sched_getattr		(__NR_SYSCALL_BASE+381)
+ 
+ /*
+  * This may need to be greater than __NR_last_syscall+1 in order to
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index c6ca7e376773..166e945de832 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -389,6 +389,8 @@
+ 		CALL(sys_process_vm_writev)
+ 		CALL(sys_kcmp)
+ 		CALL(sys_finit_module)
++/* 380 */	CALL(sys_sched_setattr)
++		CALL(sys_sched_getattr)
+ #ifndef syscalls_counted
+ .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
+ #define syscalls_counted
+* Unmerged path arch/x86/syscalls/syscall_32.tbl
+* Unmerged path arch/x86/syscalls/syscall_64.tbl
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e57aba91f593..adfb811a5a34 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -55,6 +55,66 @@ struct sched_param {
+ 
+ #include <asm/processor.h>
+ 
++#define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
++
++/*
++ * Extended scheduling parameters data structure.
++ *
++ * This is needed because the original struct sched_param can not be
++ * altered without introducing ABI issues with legacy applications
++ * (e.g., in sched_getparam()).
++ *
++ * However, the possibility of specifying more than just a priority for
++ * the tasks may be useful for a wide variety of application fields, e.g.,
++ * multimedia, streaming, automation and control, and many others.
++ *
++ * This variant (sched_attr) is meant at describing a so-called
++ * sporadic time-constrained task. In such model a task is specified by:
++ *  - the activation period or minimum instance inter-arrival time;
++ *  - the maximum (or average, depending on the actual scheduling
++ *    discipline) computation time of all instances, a.k.a. runtime;
++ *  - the deadline (relative to the actual activation time) of each
++ *    instance.
++ * Very briefly, a periodic (sporadic) task asks for the execution of
++ * some specific computation --which is typically called an instance--
++ * (at most) every period. Moreover, each instance typically lasts no more
++ * than the runtime and must be completed by time instant t equal to
++ * the instance activation time + the deadline.
++ *
++ * This is reflected by the actual fields of the sched_attr structure:
++ *
++ *  @size		size of the structure, for fwd/bwd compat.
++ *
++ *  @sched_policy	task's scheduling policy
++ *  @sched_flags	for customizing the scheduler behaviour
++ *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
++ *  @sched_priority	task's static priority (SCHED_FIFO/RR)
++ *  @sched_deadline	representative of the task's deadline
++ *  @sched_runtime	representative of the task's runtime
++ *  @sched_period	representative of the task's period
++ *
++ * Given this task model, there are a multiplicity of scheduling algorithms
++ * and policies, that can be used to ensure all the tasks will make their
++ * timing constraints.
++ */
++struct sched_attr {
++	u32 size;
++
++	u32 sched_policy;
++	u64 sched_flags;
++
++	/* SCHED_NORMAL, SCHED_BATCH */
++	s32 sched_nice;
++
++	/* SCHED_FIFO, SCHED_RR */
++	u32 sched_priority;
++
++	/* SCHED_DEADLINE */
++	u64 sched_runtime;
++	u64 sched_deadline;
++	u64 sched_period;
++};
++
+ struct exec_domain;
+ struct futex_pi_state;
+ struct robust_list_head;
+@@ -2119,6 +2179,8 @@ extern int sched_setscheduler(struct task_struct *, int,
+ 			      const struct sched_param *);
+ extern int sched_setscheduler_nocheck(struct task_struct *, int,
+ 				      const struct sched_param *);
++extern int sched_setattr(struct task_struct *,
++			 const struct sched_attr *);
+ extern struct task_struct *idle_task(int cpu);
+ /**
+  * is_idle_task - is the specified task an idle task?
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 8828ea4ca245..78299e3c6eb5 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -38,6 +38,7 @@ struct rlimit;
+ struct rlimit64;
+ struct rusage;
+ struct sched_param;
++struct sched_attr;
+ struct sel_arg_struct;
+ struct semaphore;
+ struct sembuf;
+@@ -278,9 +279,14 @@ asmlinkage long sys_sched_setscheduler(pid_t pid, int policy,
+ 					struct sched_param __user *param);
+ asmlinkage long sys_sched_setparam(pid_t pid,
+ 					struct sched_param __user *param);
++asmlinkage long sys_sched_setattr(pid_t pid,
++					struct sched_attr __user *attr);
+ asmlinkage long sys_sched_getscheduler(pid_t pid);
+ asmlinkage long sys_sched_getparam(pid_t pid,
+ 					struct sched_param __user *param);
++asmlinkage long sys_sched_getattr(pid_t pid,
++					struct sched_attr __user *attr,
++					unsigned int size);
+ asmlinkage long sys_sched_setaffinity(pid_t pid, unsigned int len,
+ 					unsigned long __user *user_mask_ptr);
+ asmlinkage long sys_sched_getaffinity(pid_t pid, unsigned int len,
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 8e9396a531c4..b117dbe3c609 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3906,6 +3906,7 @@ out_unlock:
+ 	__task_rq_unlock(rq);
+ }
+ #endif
++
+ void set_user_nice(struct task_struct *p, long nice)
+ {
+ 	int old_prio, delta, on_rq;
+@@ -4080,22 +4081,29 @@ static struct task_struct *find_process_by_pid(pid_t pid)
+ 	return pid ? find_task_by_vpid(pid) : current;
+ }
+ 
+-/* Actually do priority change: must hold rq lock. */
+-static void
+-__setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
++/* Actually do priority change: must hold pi & rq lock. */
++static void __setscheduler(struct rq *rq, struct task_struct *p,
++			   const struct sched_attr *attr)
+ {
++	int policy = attr->sched_policy;
++
+ 	p->policy = policy;
+-	p->rt_priority = prio;
++
++	if (rt_policy(policy))
++		p->rt_priority = attr->sched_priority;
++	else
++		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++
+ 	p->normal_prio = normal_prio(p);
+-	/* we are holding p->pi_lock already */
+ 	p->prio = rt_mutex_getprio(p);
++
+ 	if (rt_prio(p->prio))
+ 		p->sched_class = &rt_sched_class;
+ 	else
+ 		p->sched_class = &fair_sched_class;
++
+ 	set_load_weight(p);
+ }
+-
+ /*
+  * check the target process has a UID that matches the current process's
+  */
+@@ -4112,10 +4120,12 @@ static bool check_same_owner(struct task_struct *p)
+ 	return match;
+ }
+ 
+-static int __sched_setscheduler(struct task_struct *p, int policy,
+-				const struct sched_param *param, bool user)
++static int __sched_setscheduler(struct task_struct *p,
++				const struct sched_attr *attr,
++				bool user)
+ {
+ 	int retval, oldprio, oldpolicy = -1, on_rq, running;
++	int policy = attr->sched_policy;
+ 	unsigned long flags;
+ 	const struct sched_class *prev_class;
+ 	struct rq *rq;
+@@ -4143,17 +4153,22 @@ recheck:
+ 	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
+ 	 * SCHED_BATCH and SCHED_IDLE is 0.
+ 	 */
+-	if (param->sched_priority < 0 ||
+-	    (p->mm && param->sched_priority > MAX_USER_RT_PRIO-1) ||
+-	    (!p->mm && param->sched_priority > MAX_RT_PRIO-1))
++	if (attr->sched_priority < 0 ||
++	    (p->mm && attr->sched_priority > MAX_USER_RT_PRIO-1) ||
++	    (!p->mm && attr->sched_priority > MAX_RT_PRIO-1))
+ 		return -EINVAL;
+-	if (rt_policy(policy) != (param->sched_priority != 0))
++	if (rt_policy(policy) != (attr->sched_priority != 0))
+ 		return -EINVAL;
+ 
+ 	/*
+ 	 * Allow unprivileged RT tasks to decrease priority:
+ 	 */
+ 	if (user && !capable(CAP_SYS_NICE)) {
++		if (fair_policy(policy)) {
++			if (!can_nice(p, attr->sched_nice))
++				return -EPERM;
++		}
++
+ 		if (rt_policy(policy)) {
+ 			unsigned long rlim_rtprio =
+ 					task_rlimit(p, RLIMIT_RTPRIO);
+@@ -4163,8 +4178,8 @@ recheck:
+ 				return -EPERM;
+ 
+ 			/* can't increase priority */
+-			if (param->sched_priority > p->rt_priority &&
+-			    param->sched_priority > rlim_rtprio)
++			if (attr->sched_priority > p->rt_priority &&
++			    attr->sched_priority > rlim_rtprio)
+ 				return -EPERM;
+ 		}
+ 
+@@ -4212,11 +4227,16 @@ recheck:
+ 	/*
+ 	 * If not changing anything there's no need to proceed further:
+ 	 */
+-	if (unlikely(policy == p->policy && (!rt_policy(policy) ||
+-			param->sched_priority == p->rt_priority))) {
++	if (unlikely(policy == p->policy)) {
++		if (fair_policy(policy) && attr->sched_nice != TASK_NICE(p))
++			goto change;
++		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
++			goto change;
++
+ 		task_rq_unlock(rq, p, &flags);
+ 		return 0;
+ 	}
++change:
+ 
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	if (user) {
+@@ -4250,7 +4270,7 @@ recheck:
+ 
+ 	oldprio = p->prio;
+ 	prev_class = p->sched_class;
+-	__setscheduler(rq, p, policy, param->sched_priority);
++	__setscheduler(rq, p, attr);
+ 
+ 	if (running)
+ 		p->sched_class->set_curr_task(rq);
+@@ -4278,10 +4298,20 @@ recheck:
+ int sched_setscheduler(struct task_struct *p, int policy,
+ 		       const struct sched_param *param)
+ {
+-	return __sched_setscheduler(p, policy, param, true);
++	struct sched_attr attr = {
++		.sched_policy   = policy,
++		.sched_priority = param->sched_priority
++	};
++	return __sched_setscheduler(p, &attr, true);
+ }
+ EXPORT_SYMBOL_GPL(sched_setscheduler);
+ 
++int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
++{
++	return __sched_setscheduler(p, attr, true);
++}
++EXPORT_SYMBOL_GPL(sched_setattr);
++
+ /**
+  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
+  * @p: the task in question.
+@@ -4298,7 +4328,11 @@ EXPORT_SYMBOL_GPL(sched_setscheduler);
+ int sched_setscheduler_nocheck(struct task_struct *p, int policy,
+ 			       const struct sched_param *param)
+ {
+-	return __sched_setscheduler(p, policy, param, false);
++	struct sched_attr attr = {
++		.sched_policy   = policy,
++		.sched_priority = param->sched_priority
++	};
++	return __sched_setscheduler(p, &attr, false);
+ }
+ 
+ static int
+@@ -4323,6 +4357,79 @@ do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
+ 	return retval;
+ }
+ 
++/*
++ * Mimics kernel/events/core.c perf_copy_attr().
++ */
++static int sched_copy_attr(struct sched_attr __user *uattr,
++			   struct sched_attr *attr)
++{
++	u32 size;
++	int ret;
++
++	if (!access_ok(VERIFY_WRITE, uattr, SCHED_ATTR_SIZE_VER0))
++		return -EFAULT;
++
++	/*
++	 * zero the full structure, so that a short copy will be nice.
++	 */
++	memset(attr, 0, sizeof(*attr));
++
++	ret = get_user(size, &uattr->size);
++	if (ret)
++		return ret;
++
++	if (size > PAGE_SIZE)	/* silly large */
++		goto err_size;
++
++	if (!size)		/* abi compat */
++		size = SCHED_ATTR_SIZE_VER0;
++
++	if (size < SCHED_ATTR_SIZE_VER0)
++		goto err_size;
++
++	/*
++	 * If we're handed a bigger struct than we know of,
++	 * ensure all the unknown bits are 0 - i.e. new
++	 * user-space does not rely on any kernel feature
++	 * extensions we dont know about yet.
++	 */
++	if (size > sizeof(*attr)) {
++		unsigned char __user *addr;
++		unsigned char __user *end;
++		unsigned char val;
++
++		addr = (void __user *)uattr + sizeof(*attr);
++		end  = (void __user *)uattr + size;
++
++		for (; addr < end; addr++) {
++			ret = get_user(val, addr);
++			if (ret)
++				return ret;
++			if (val)
++				goto err_size;
++		}
++		size = sizeof(*attr);
++	}
++
++	ret = copy_from_user(attr, uattr, size);
++	if (ret)
++		return -EFAULT;
++
++	/*
++	 * XXX: do we want to be lenient like existing syscalls; or do we want
++	 * to be strict and return an error on out-of-bounds values?
++	 */
++	attr->sched_nice = clamp(attr->sched_nice, -20, 19);
++
++out:
++	return ret;
++
++err_size:
++	put_user(sizeof(*attr), &uattr->size);
++	ret = -E2BIG;
++	goto out;
++}
++
+ /**
+  * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+  * @pid: the pid in question.
+@@ -4353,6 +4460,33 @@ SYSCALL_DEFINE2(sched_setparam, pid_t, pid, struct sched_param __user *, param)
+ 	return do_sched_setscheduler(pid, -1, param);
+ }
+ 
++/**
++ * sys_sched_setattr - same as above, but with extended sched_attr
++ * @pid: the pid in question.
++ * @attr: structure containing the extended parameters.
++ */
++SYSCALL_DEFINE2(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr)
++{
++	struct sched_attr attr;
++	struct task_struct *p;
++	int retval;
++
++	if (!uattr || pid < 0)
++		return -EINVAL;
++
++	if (sched_copy_attr(uattr, &attr))
++		return -EFAULT;
++
++	rcu_read_lock();
++	retval = -ESRCH;
++	p = find_process_by_pid(pid);
++	if (p != NULL)
++		retval = sched_setattr(p, &attr);
++	rcu_read_unlock();
++
++	return retval;
++}
++
+ /**
+  * sys_sched_getscheduler - get the policy (scheduling class) of a thread
+  * @pid: the pid in question.
+@@ -4423,6 +4557,92 @@ out_unlock:
+ 	return retval;
+ }
+ 
++static int sched_read_attr(struct sched_attr __user *uattr,
++			   struct sched_attr *attr,
++			   unsigned int usize)
++{
++	int ret;
++
++	if (!access_ok(VERIFY_WRITE, uattr, usize))
++		return -EFAULT;
++
++	/*
++	 * If we're handed a smaller struct than we know of,
++	 * ensure all the unknown bits are 0 - i.e. old
++	 * user-space does not get uncomplete information.
++	 */
++	if (usize < sizeof(*attr)) {
++		unsigned char *addr;
++		unsigned char *end;
++
++		addr = (void *)attr + usize;
++		end  = (void *)attr + sizeof(*attr);
++
++		for (; addr < end; addr++) {
++			if (*addr)
++				goto err_size;
++		}
++
++		attr->size = usize;
++	}
++
++	ret = copy_to_user(uattr, attr, usize);
++	if (ret)
++		return -EFAULT;
++
++out:
++	return ret;
++
++err_size:
++	ret = -E2BIG;
++	goto out;
++}
++
++/**
++ * sys_sched_getattr - same as above, but with extended "sched_param"
++ * @pid: the pid in question.
++ * @attr: structure containing the extended parameters.
++ * @size: sizeof(attr) for fwd/bwd comp.
++ */
++SYSCALL_DEFINE3(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
++		unsigned int, size)
++{
++	struct sched_attr attr = {
++		.size = sizeof(struct sched_attr),
++	};
++	struct task_struct *p;
++	int retval;
++
++	if (!uattr || pid < 0 || size > PAGE_SIZE ||
++	    size < SCHED_ATTR_SIZE_VER0)
++		return -EINVAL;
++
++	rcu_read_lock();
++	p = find_process_by_pid(pid);
++	retval = -ESRCH;
++	if (!p)
++		goto out_unlock;
++
++	retval = security_task_getscheduler(p);
++	if (retval)
++		goto out_unlock;
++
++	attr.sched_policy = p->policy;
++	if (task_has_rt_policy(p))
++		attr.sched_priority = p->rt_priority;
++	else
++		attr.sched_nice = TASK_NICE(p);
++
++	rcu_read_unlock();
++
++	retval = sched_read_attr(uattr, &attr, size);
++	return retval;
++
++out_unlock:
++	rcu_read_unlock();
++	return retval;
++}
++
+ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ {
+ 	cpumask_var_t cpus_allowed, new_mask;
+@@ -7500,13 +7720,16 @@ EXPORT_SYMBOL(__might_sleep);
+ static void normalize_task(struct rq *rq, struct task_struct *p)
+ {
+ 	const struct sched_class *prev_class = p->sched_class;
++	struct sched_attr attr = {
++		.sched_policy = SCHED_NORMAL,
++	};
+ 	int old_prio = p->prio;
+ 	int on_rq;
+ 
+ 	on_rq = p->on_rq;
+ 	if (on_rq)
+ 		dequeue_task(rq, p, 0);
+-	__setscheduler(rq, p, SCHED_NORMAL, 0);
++	__setscheduler(rq, p, &attr);
+ 	if (on_rq) {
+ 		enqueue_task(rq, p, 0);
+ 		resched_task(rq->curr);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d3ebb084e3c4..cd18a0fb7cdf 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -75,11 +75,14 @@ extern __read_mostly int scheduler_running;
+  */
+ #define RUNTIME_INF	((u64)~0ULL)
+ 
++static inline int fair_policy(int policy)
++{
++	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
++}
++
+ static inline int rt_policy(int policy)
+ {
+-	if (policy == SCHED_FIFO || policy == SCHED_RR)
+-		return 1;
+-	return 0;
++	return policy == SCHED_FIFO || policy == SCHED_RR;
+ }
+ 
+ static inline int task_has_rt_policy(struct task_struct *p)
