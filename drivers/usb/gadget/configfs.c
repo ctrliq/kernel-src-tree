@@ -559,7 +559,7 @@ static struct config_group *function_make(
 	if (IS_ERR(fi))
 		return ERR_PTR(PTR_ERR(fi));
 
-	ret = config_item_set_name(&fi->group.cg_item, name);
+	ret = config_item_set_name(&fi->group.cg_item, "%s", name);
 	if (ret) {
 		usb_put_function_instance(fi);
 		return ERR_PTR(ret);
