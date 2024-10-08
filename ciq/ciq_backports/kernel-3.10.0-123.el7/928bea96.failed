@@ -1,0 +1,273 @@
+PCI: Delay enabling bridges until they're needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [pci] Delay enabling bridges until they're needed (Myron Stowe) [1005229]
+Rebuild_FUZZ: 94.51%
+commit-author Yinghai Lu <yinghai@kernel.org>
+commit 928bea964827d7824b548c1f8e06eccbbc4d0d7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/928bea96.failed
+
+We currently enable PCI bridges after scanning a bus and assigning
+resources.  This is often done in arch code.
+
+This patch changes this so we don't enable a bridge until necessary, i.e.,
+until we enable a PCI device behind the bridge.  We do this in the generic
+pci_enable_device() path, so this also removes the arch-specific code to
+enable bridges.
+
+[bhelgaas: changelog]
+	Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 928bea964827d7824b548c1f8e06eccbbc4d0d7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/m68k/platform/coldfire/pci.c
+diff --cc arch/m68k/platform/coldfire/pci.c
+index 8572246db84d,df9679238b6d..000000000000
+--- a/arch/m68k/platform/coldfire/pci.c
++++ b/arch/m68k/platform/coldfire/pci.c
+@@@ -319,8 -319,6 +319,11 @@@ static int __init mcf_pci_init(void
+  	pci_fixup_irqs(pci_common_swizzle, mcf_pci_map_irq);
+  	pci_bus_size_bridges(rootbus);
+  	pci_bus_assign_resources(rootbus);
+++<<<<<<< HEAD
+ +	pci_enable_bridges(rootbus);
+ +	pci_bus_add_devices(rootbus);
+++=======
+++>>>>>>> 928bea964827 (PCI: Delay enabling bridges until they're needed)
+  	return 0;
+  }
+  
+diff --git a/arch/arm/kernel/bios32.c b/arch/arm/kernel/bios32.c
+index b2ed73c45489..0d07f6ef1691 100644
+--- a/arch/arm/kernel/bios32.c
++++ b/arch/arm/kernel/bios32.c
+@@ -524,11 +524,6 @@ void pci_common_init(struct hw_pci *hw)
+ 			 * Assign resources.
+ 			 */
+ 			pci_bus_assign_resources(bus);
+-
+-			/*
+-			 * Enable bridges
+-			 */
+-			pci_enable_bridges(bus);
+ 		}
+ 
+ 		/*
+* Unmerged path arch/m68k/platform/coldfire/pci.c
+diff --git a/arch/mips/pci/pci.c b/arch/mips/pci/pci.c
+index 594e60d6a43b..33e7aa52d9c4 100644
+--- a/arch/mips/pci/pci.c
++++ b/arch/mips/pci/pci.c
+@@ -113,7 +113,6 @@ static void pcibios_scanbus(struct pci_controller *hose)
+ 		if (!pci_has_flag(PCI_PROBE_ONLY)) {
+ 			pci_bus_size_bridges(bus);
+ 			pci_bus_assign_resources(bus);
+-			pci_enable_bridges(bus);
+ 		}
+ 	}
+ }
+diff --git a/arch/sh/drivers/pci/pci.c b/arch/sh/drivers/pci/pci.c
+index 102f5d58b037..60ed3e1c4b75 100644
+--- a/arch/sh/drivers/pci/pci.c
++++ b/arch/sh/drivers/pci/pci.c
+@@ -69,7 +69,6 @@ static void pcibios_scanbus(struct pci_channel *hose)
+ 
+ 		pci_bus_size_bridges(bus);
+ 		pci_bus_assign_resources(bus);
+-		pci_enable_bridges(bus);
+ 	} else {
+ 		pci_free_resource_list(&resources);
+ 	}
+diff --git a/drivers/acpi/pci_root.c b/drivers/acpi/pci_root.c
+index f138982c8b1f..ae1efce1853a 100644
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@ -527,9 +527,6 @@ static int acpi_pci_root_add(struct acpi_device *device,
+ 	if (system_state != SYSTEM_BOOTING) {
+ 		pcibios_resource_survey_bus(root->bus);
+ 		pci_assign_unassigned_bus_resources(root->bus);
+-
+-		/* need to after hot-added ioapic is registered */
+-		pci_enable_bridges(root->bus);
+ 	}
+ 
+ 	pci_bus_add_devices(root->bus);
+diff --git a/drivers/parisc/lba_pci.c b/drivers/parisc/lba_pci.c
+index 1f05913ae677..2fbb60bd6e12 100644
+--- a/drivers/parisc/lba_pci.c
++++ b/drivers/parisc/lba_pci.c
+@@ -1534,7 +1534,6 @@ lba_driver_probe(struct parisc_device *dev)
+ 		lba_dump_res(&lba_dev->hba.lmmio_space, 2);
+ #endif
+ 	}
+-	pci_enable_bridges(lba_bus);
+ 
+ 	/*
+ 	** Once PCI register ops has walked the bus, access to config
+diff --git a/drivers/pci/bus.c b/drivers/pci/bus.c
+index b1ff02ab4f13..fc1b74013743 100644
+--- a/drivers/pci/bus.c
++++ b/drivers/pci/bus.c
+@@ -216,24 +216,6 @@ void pci_bus_add_devices(const struct pci_bus *bus)
+ 	}
+ }
+ 
+-void pci_enable_bridges(struct pci_bus *bus)
+-{
+-	struct pci_dev *dev;
+-	int retval;
+-
+-	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		if (dev->subordinate) {
+-			if (!pci_is_enabled(dev)) {
+-				retval = pci_enable_device(dev);
+-				if (retval)
+-					dev_err(&dev->dev, "Error enabling bridge (%d), continuing\n", retval);
+-				pci_set_master(dev);
+-			}
+-			pci_enable_bridges(dev->subordinate);
+-		}
+-	}
+-}
+-
+ /** pci_walk_bus - walk devices on/under bus, calling callback.
+  *  @top      bus whose devices should be walked
+  *  @cb       callback to be called for each device found
+@@ -301,4 +283,3 @@ EXPORT_SYMBOL(pci_bus_put);
+ EXPORT_SYMBOL(pci_bus_alloc_resource);
+ EXPORT_SYMBOL_GPL(pci_bus_add_device);
+ EXPORT_SYMBOL(pci_bus_add_devices);
+-EXPORT_SYMBOL(pci_enable_bridges);
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 59df8575a48c..52dee9d31e1c 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -723,7 +723,6 @@ static int __ref enable_device(struct acpiphp_slot *slot)
+ 	acpiphp_sanitize_bus(bus);
+ 	acpiphp_set_hpp_values(bus);
+ 	acpiphp_set_acpi_region(slot);
+-	pci_enable_bridges(bus);
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+ 		/* Assume that newly added devices are powered on already. */
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 67dde1234e55..2e65276361f4 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -1145,6 +1145,24 @@ int pci_reenable_device(struct pci_dev *dev)
+ 	return 0;
+ }
+ 
++static void pci_enable_bridge(struct pci_dev *dev)
++{
++	int retval;
++
++	if (!dev)
++		return;
++
++	pci_enable_bridge(dev->bus->self);
++
++	if (pci_is_enabled(dev))
++		return;
++	retval = pci_enable_device(dev);
++	if (retval)
++		dev_err(&dev->dev, "Error enabling bridge (%d), continuing\n",
++			retval);
++	pci_set_master(dev);
++}
++
+ static int pci_enable_device_flags(struct pci_dev *dev, unsigned long flags)
+ {
+ 	int err;
+@@ -1165,6 +1183,8 @@ static int pci_enable_device_flags(struct pci_dev *dev, unsigned long flags)
+ 	if (atomic_inc_return(&dev->enable_cnt) > 1)
+ 		return 0;		/* already enabled */
+ 
++	pci_enable_bridge(dev->bus->self);
++
+ 	/* only skip sriov related */
+ 	for (i = 0; i <= PCI_ROM_RESOURCE; i++)
+ 		if (dev->resource[i].flags & flags)
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index 7c5cde221b93..15a47d7e7344 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1978,7 +1978,6 @@ unsigned int __ref pci_rescan_bus(struct pci_bus *bus)
+ 
+ 	max = pci_scan_child_bus(bus);
+ 	pci_assign_unassigned_bus_resources(bus);
+-	pci_enable_bridges(bus);
+ 	pci_bus_add_devices(bus);
+ 
+ 	return max;
+diff --git a/drivers/pci/setup-bus.c b/drivers/pci/setup-bus.c
+index 4001b9102a70..29c90f91319b 100644
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -1507,7 +1507,7 @@ again:
+ 
+ 	/* any device complain? */
+ 	if (list_empty(&fail_head))
+-		goto enable_and_dump;
++		goto dump;
+ 
+ 	if (tried_times >= pci_try_num) {
+ 		if (enable_local == undefined)
+@@ -1516,7 +1516,7 @@ again:
+ 			dev_info(&bus->dev, "Automatically enabled pci realloc, if you have problem, try booting with pci=realloc=off\n");
+ 
+ 		free_list(&fail_head);
+-		goto enable_and_dump;
++		goto dump;
+ 	}
+ 
+ 	dev_printk(KERN_DEBUG, &bus->dev,
+@@ -1549,10 +1549,7 @@ again:
+ 
+ 	goto again;
+ 
+-enable_and_dump:
+-	/* Depth last, update the hardware. */
+-	pci_enable_bridges(bus);
+-
++dump:
+ 	/* dump the resource on buses */
+ 	pci_bus_dump_resources(bus);
+ }
+@@ -1623,7 +1620,6 @@ enable_all:
+ 	if (retval)
+ 		dev_err(&bridge->dev, "Error reenabling bridge (%d)\n", retval);
+ 	pci_set_master(bridge);
+-	pci_enable_bridges(parent);
+ }
+ EXPORT_SYMBOL_GPL(pci_assign_unassigned_bridge_resources);
+ 
+diff --git a/drivers/pcmcia/cardbus.c b/drivers/pcmcia/cardbus.c
+index 9d3ac998fc1f..b2a98cdbd0d2 100644
+--- a/drivers/pcmcia/cardbus.c
++++ b/drivers/pcmcia/cardbus.c
+@@ -91,7 +91,6 @@ int __ref cb_alloc(struct pcmcia_socket *s)
+ 	if (s->tune_bridge)
+ 		s->tune_bridge(s, bus);
+ 
+-	pci_enable_bridges(bus);
+ 	pci_bus_add_devices(bus);
+ 
+ 	return 0;
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 0fd1f1582fa1..8cd1e6f30acd 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1043,7 +1043,6 @@ int __must_check pci_bus_alloc_resource(struct pci_bus *bus,
+ 						  resource_size_t,
+ 						  resource_size_t),
+ 			void *alignf_data);
+-void pci_enable_bridges(struct pci_bus *bus);
+ 
+ /* Proper probing supporting hot-pluggable devices */
+ int __must_check __pci_register_driver(struct pci_driver *, struct module *,
