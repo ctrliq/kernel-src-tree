@@ -1,0 +1,184 @@
+sfc: add ndo_set_vf_mac() function for EF10
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Shradha Shah <sshah@solarflare.com>
+commit e340be923012bfbc8935aa0af5638349939c82d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e340be92.failed
+
+Implement a response to this entrypoint.
+The ndo_set_vf_mac() entrypoint is only exposed in the driver if
+CONFIG_SFC_SRIOV is defined.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e340be923012bfbc8935aa0af5638349939c82d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10_sriov.h
+diff --cc drivers/net/ethernet/sfc/ef10_sriov.h
+index 6ea115e3c3f2,7f1294265653..000000000000
+--- a/drivers/net/ethernet/sfc/ef10_sriov.h
++++ b/drivers/net/ethernet/sfc/ef10_sriov.h
+@@@ -23,18 -37,11 +23,22 @@@ static inline int efx_ef10_sriov_init(s
+  {
+  	return -EOPNOTSUPP;
+  }
+ +
+ +static inline void efx_ef10_sriov_mac_address_changed(struct efx_nic *efx) {}
+  static inline void efx_ef10_sriov_reset(struct efx_nic *efx) {}
+ -void efx_ef10_sriov_fini(struct efx_nic *efx);
+ +static inline void efx_ef10_sriov_fini(struct efx_nic *efx) {}
+  static inline void efx_ef10_sriov_flr(struct efx_nic *efx, unsigned vf_i) {}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SFC_SRIOV
+ +static inline int efx_ef10_sriov_set_vf_mac(struct efx_nic *efx, int vf,
+ +					    u8 *mac)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+++=======
++ int efx_ef10_sriov_set_vf_mac(struct efx_nic *efx, int vf, u8 *mac);
+++>>>>>>> e340be923012 (sfc: add ndo_set_vf_mac() function for EF10)
+  
+  static inline int efx_ef10_sriov_set_vf_vlan(struct efx_nic *efx, int vf,
+  					     u16 vlan, u8 qos)
+diff --git a/drivers/net/ethernet/sfc/ef10_sriov.c b/drivers/net/ethernet/sfc/ef10_sriov.c
+index 9e6a3e197e01..d4c1c9eb7978 100644
+--- a/drivers/net/ethernet/sfc/ef10_sriov.c
++++ b/drivers/net/ethernet/sfc/ef10_sriov.c
+@@ -50,3 +50,93 @@ int efx_ef10_sriov_configure(struct efx_nic *efx, int num_vfs)
+ 	return -EOPNOTSUPP;
+ #endif
+ }
++
++static int efx_ef10_vport_del_vf_mac(struct efx_nic *efx, unsigned int port_id,
++				     u8 *mac)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_VPORT_DEL_MAC_ADDRESS_IN_LEN);
++	MCDI_DECLARE_BUF_ERR(outbuf);
++	size_t outlen;
++	int rc;
++
++	MCDI_SET_DWORD(inbuf, VPORT_DEL_MAC_ADDRESS_IN_VPORT_ID, port_id);
++	ether_addr_copy(MCDI_PTR(inbuf, VPORT_DEL_MAC_ADDRESS_IN_MACADDR), mac);
++
++	rc = efx_mcdi_rpc(efx, MC_CMD_VPORT_DEL_MAC_ADDRESS, inbuf,
++			  sizeof(inbuf), outbuf, sizeof(outbuf), &outlen);
++
++	return rc;
++}
++
++int efx_ef10_sriov_set_vf_mac(struct efx_nic *efx, int vf_i, u8 *mac)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++	struct ef10_vf *vf;
++	int rc;
++
++	if (!nic_data->vf)
++		return -EOPNOTSUPP;
++
++	if (vf_i >= efx->vf_count)
++		return -EINVAL;
++	vf = nic_data->vf + vf_i;
++
++	if (vf->efx) {
++		efx_device_detach_sync(vf->efx);
++		efx_net_stop(vf->efx->net_dev);
++
++		down_write(&vf->efx->filter_sem);
++		vf->efx->type->filter_table_remove(vf->efx);
++
++		rc = efx_ef10_vadaptor_free(vf->efx, EVB_PORT_ID_ASSIGNED);
++		if (rc) {
++			up_write(&vf->efx->filter_sem);
++			return rc;
++		}
++	}
++
++	rc = efx_ef10_evb_port_assign(efx, EVB_PORT_ID_NULL, vf_i);
++	if (rc)
++		return rc;
++
++	if (!is_zero_ether_addr(vf->mac)) {
++		rc = efx_ef10_vport_del_vf_mac(efx, vf->vport_id, vf->mac);
++		if (rc)
++			return rc;
++	}
++
++	if (!is_zero_ether_addr(mac)) {
++		rc = efx_ef10_vport_add_mac(efx, vf->vport_id, mac);
++		if (rc) {
++			eth_zero_addr(vf->mac);
++			goto fail;
++		}
++		if (vf->efx)
++			ether_addr_copy(vf->efx->net_dev->dev_addr, mac);
++	}
++
++	ether_addr_copy(vf->mac, mac);
++
++	rc = efx_ef10_evb_port_assign(efx, vf->vport_id, vf_i);
++	if (rc)
++		goto fail;
++
++	if (vf->efx) {
++		/* VF cannot use the vport_id that the PF created */
++		rc = efx_ef10_vadaptor_alloc(vf->efx, EVB_PORT_ID_ASSIGNED);
++		if (rc) {
++			up_write(&vf->efx->filter_sem);
++			return rc;
++		}
++		vf->efx->type->filter_table_probe(vf->efx);
++		up_write(&vf->efx->filter_sem);
++		efx_net_open(vf->efx->net_dev);
++		netif_device_attach(vf->efx->net_dev);
++	}
++
++	return 0;
++
++fail:
++	memset(vf->mac, 0, ETH_ALEN);
++	return rc;
++}
+* Unmerged path drivers/net/ethernet/sfc/ef10_sriov.h
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 9557690dd00f..ae20081e1291 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -2067,7 +2067,7 @@ static int efx_busy_poll(struct napi_struct *napi)
+  *************************************************************************/
+ 
+ /* Context: process, rtnl_lock() held. */
+-static int efx_net_open(struct net_device *net_dev)
++int efx_net_open(struct net_device *net_dev)
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	int rc;
+@@ -2096,7 +2096,7 @@ static int efx_net_open(struct net_device *net_dev)
+  * Note that the kernel will ignore our return code; this method
+  * should really be a void.
+  */
+-static int efx_net_stop(struct net_device *net_dev)
++int efx_net_stop(struct net_device *net_dev)
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 
+diff --git a/drivers/net/ethernet/sfc/efx.h b/drivers/net/ethernet/sfc/efx.h
+index bc4e4b3e6aad..e5dba1349606 100644
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -17,6 +17,9 @@
+ /* All controllers use BAR 0 for I/O space and BAR 2(&3) for memory */
+ #define EFX_MEM_BAR 2
+ 
++int efx_net_open(struct net_device *net_dev);
++int efx_net_stop(struct net_device *net_dev);
++
+ /* TX */
+ int efx_probe_tx_queue(struct efx_tx_queue *tx_queue);
+ void efx_remove_tx_queue(struct efx_tx_queue *tx_queue);
