@@ -1,0 +1,95 @@
+SUNRPC: Fix a backchannel race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 0d2a970d0ae55086520e1e58e572a7acd519429c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0d2a970d.failed
+
+We need to allow the server to send a new request immediately after we've
+replied to the previous one. Right now, there is a window between the
+send and the release of the old request in rpc_put_task(), where the
+server could send us a new backchannel RPC call, and we have no
+request to service it.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 0d2a970d0ae55086520e1e58e572a7acd519429c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/backchannel_rqst.c
+diff --cc net/sunrpc/backchannel_rqst.c
+index 9769c56a2130,9825ff0f91d6..000000000000
+--- a/net/sunrpc/backchannel_rqst.c
++++ b/net/sunrpc/backchannel_rqst.c
+@@@ -259,12 -267,22 +267,27 @@@ void xprt_free_bc_request(struct rpc_rq
+  	dprintk("RPC:       free backchannel req=%p\n", req);
+  
+  	req->rq_connect_cookie = xprt->connect_cookie - 1;
+++<<<<<<< HEAD
+ +	smp_mb__before_clear_bit();
+ +	WARN_ON_ONCE(!test_bit(RPC_BC_PA_IN_USE, &req->rq_bc_pa_state));
+++=======
++ 	smp_mb__before_atomic();
+++>>>>>>> 0d2a970d0ae5 (SUNRPC: Fix a backchannel race)
+  	clear_bit(RPC_BC_PA_IN_USE, &req->rq_bc_pa_state);
+ -	smp_mb__after_atomic();
+ +	smp_mb__after_clear_bit();
+  
+- 	if (!xprt_need_to_requeue(xprt)) {
++ 	/*
++ 	 * Return it to the list of preallocations so that it
++ 	 * may be reused by a new callback request.
++ 	 */
++ 	spin_lock_bh(&xprt->bc_pa_lock);
++ 	if (xprt_need_to_requeue(xprt)) {
++ 		list_add_tail(&req->rq_bc_pa_list, &xprt->bc_pa_list);
++ 		xprt->bc_alloc_count++;
++ 		req = NULL;
++ 	}
++ 	spin_unlock_bh(&xprt->bc_pa_lock);
++ 	if (req != NULL) {
+  		/*
+  		 * The last remaining session was destroyed while this
+  		 * entry was in use.  Free the entry and don't attempt
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index d809b906cb69..8e067d561ded 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -212,7 +212,8 @@ struct rpc_xprt {
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+ 	struct svc_serv		*bc_serv;       /* The RPC service which will */
+ 						/* process the callback */
+-	unsigned int		bc_alloc_count;	/* Total number of preallocs */
++	int			bc_alloc_count;	/* Total number of preallocs */
++	atomic_t		bc_free_slots;
+ 	spinlock_t		bc_pa_lock;	/* Protects the preallocated
+ 						 * items */
+ 	struct list_head	bc_pa_list;	/* List of preallocated
+* Unmerged path net/sunrpc/backchannel_rqst.c
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index 9cb0905ec319..0eb6acc73960 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1349,6 +1349,7 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
+ 	struct kvec	*argv = &rqstp->rq_arg.head[0];
+ 	struct kvec	*resv = &rqstp->rq_res.head[0];
+ 	struct rpc_task *task;
++	int proc_error;
+ 	int error;
+ 
+ 	dprintk("svc: %s(%p)\n", __func__, req);
+@@ -1380,7 +1381,10 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
+ 	svc_getnl(argv);	/* CALLDIR */
+ 
+ 	/* Parse and execute the bc call */
+-	if (!svc_process_common(rqstp, argv, resv)) {
++	proc_error = svc_process_common(rqstp, argv, resv);
++
++	atomic_inc(&req->rq_xprt->bc_free_slots);
++	if (!proc_error) {
+ 		/* Processing error: drop the request */
+ 		xprt_free_bc_request(req);
+ 		return 0;
