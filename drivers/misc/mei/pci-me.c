@@ -40,8 +40,9 @@
 #include <linux/mei.h>
 
 #include "mei_dev.h"
-#include "hw-me.h"
 #include "client.h"
+#include "hw-me-regs.h"
+#include "hw-me.h"
 
 /* AMT device is a singleton on the platform */
 static struct pci_dev *mei_pdev;
