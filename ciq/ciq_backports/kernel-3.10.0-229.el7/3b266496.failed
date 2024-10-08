@@ -1,0 +1,182 @@
+x86/efi: Add a wrapper function efi_map_region_fixed()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [firmware] efi: Add a wrapper function efi_map_region_fixed() (Dave Young) [1080109]
+Rebuild_FUZZ: 96.15%
+commit-author Dave Young <dyoung@redhat.com>
+commit 3b2664964bc886ae9d5127c8d3708b1acc0626d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/3b266496.failed
+
+Kexec kernel will use saved runtime virtual mapping, so add a new
+function efi_map_region_fixed() for directly mapping a md to md->virt.
+
+The md is passed in from 1st kernel, the virtual addr is saved in
+md->virt_addr.
+
+	Signed-off-by: Dave Young <dyoung@redhat.com>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 3b2664964bc886ae9d5127c8d3708b1acc0626d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/platform/efi/efi_32.c
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/include/asm/efi.h
+index 0062a0125041,9fbaeb239bde..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -101,6 -127,11 +101,14 @@@ extern void efi_call_phys_prelog(void)
+  extern void efi_call_phys_epilog(void);
+  extern void efi_unmap_memmap(void);
+  extern void efi_memory_uc(u64 addr, unsigned long size);
+++<<<<<<< HEAD
+++=======
++ extern void __init efi_map_region(efi_memory_desc_t *md);
++ extern void __init efi_map_region_fixed(efi_memory_desc_t *md);
++ extern void efi_sync_low_kernel_mappings(void);
++ extern void efi_setup_page_tables(void);
++ extern void __init old_map_region(efi_memory_desc_t *md);
+++>>>>>>> 3b2664964bc8 (x86/efi: Add a wrapper function efi_map_region_fixed())
+  
+  #ifdef CONFIG_EFI
+  
+diff --cc arch/x86/platform/efi/efi_32.c
+index 40e446941dd7,7b3ec6ed99af..000000000000
+--- a/arch/x86/platform/efi/efi_32.c
++++ b/arch/x86/platform/efi/efi_32.c
+@@@ -37,9 -37,18 +37,22 @@@
+   * claim EFI runtime service handler exclusively and to duplicate a memory in
+   * low memory space say 0 - 3G.
+   */
+ +
+  static unsigned long efi_rt_eflags;
+  
+++<<<<<<< HEAD
+++=======
++ void efi_sync_low_kernel_mappings(void) {}
++ void efi_setup_page_tables(void) {}
++ 
++ void __init efi_map_region(efi_memory_desc_t *md)
++ {
++ 	old_map_region(md);
++ }
++ 
++ void __init efi_map_region_fixed(efi_memory_desc_t *md) {}
++ 
+++>>>>>>> 3b2664964bc8 (x86/efi: Add a wrapper function efi_map_region_fixed())
+  void efi_call_phys_prelog(void)
+  {
+  	struct desc_ptr gdt_descr;
+diff --cc arch/x86/platform/efi/efi_64.c
+index 39a0e7f1f0a3,ff08cb19630b..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -94,6 -119,96 +94,99 @@@ void __init efi_call_phys_epilog(void
+  	early_code_mapping_set_exec(0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Add low kernel mappings for passing arguments to EFI functions.
++  */
++ void efi_sync_low_kernel_mappings(void)
++ {
++ 	unsigned num_pgds;
++ 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP))
++ 		return;
++ 
++ 	num_pgds = pgd_index(MODULES_END - 1) - pgd_index(PAGE_OFFSET);
++ 
++ 	memcpy(pgd + pgd_index(PAGE_OFFSET),
++ 		init_mm.pgd + pgd_index(PAGE_OFFSET),
++ 		sizeof(pgd_t) * num_pgds);
++ }
++ 
++ void efi_setup_page_tables(void)
++ {
++ 	efi_scratch.efi_pgt = (pgd_t *)(unsigned long)real_mode_header->trampoline_pgd;
++ 
++ 	if (!efi_enabled(EFI_OLD_MEMMAP))
++ 		efi_scratch.use_pgd = true;
++ }
++ 
++ static void __init __map_region(efi_memory_desc_t *md, u64 va)
++ {
++ 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
++ 	unsigned long pf = 0;
++ 
++ 	if (!(md->attribute & EFI_MEMORY_WB))
++ 		pf |= _PAGE_PCD;
++ 
++ 	if (kernel_map_pages_in_pgd(pgd, md->phys_addr, va, md->num_pages, pf))
++ 		pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
++ 			   md->phys_addr, va);
++ }
++ 
++ void __init efi_map_region(efi_memory_desc_t *md)
++ {
++ 	unsigned long size = md->num_pages << PAGE_SHIFT;
++ 	u64 pa = md->phys_addr;
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP))
++ 		return old_map_region(md);
++ 
++ 	/*
++ 	 * Make sure the 1:1 mappings are present as a catch-all for b0rked
++ 	 * firmware which doesn't update all internal pointers after switching
++ 	 * to virtual mode and would otherwise crap on us.
++ 	 */
++ 	__map_region(md, md->phys_addr);
++ 
++ 	efi_va -= size;
++ 
++ 	/* Is PA 2M-aligned? */
++ 	if (!(pa & (PMD_SIZE - 1))) {
++ 		efi_va &= PMD_MASK;
++ 	} else {
++ 		u64 pa_offset = pa & (PMD_SIZE - 1);
++ 		u64 prev_va = efi_va;
++ 
++ 		/* get us the same offset within this 2M page */
++ 		efi_va = (efi_va & PMD_MASK) + pa_offset;
++ 
++ 		if (efi_va > prev_va)
++ 			efi_va -= PMD_SIZE;
++ 	}
++ 
++ 	if (efi_va < EFI_VA_END) {
++ 		pr_warn(FW_WARN "VA address range overflow!\n");
++ 		return;
++ 	}
++ 
++ 	/* Do the VA map */
++ 	__map_region(md, efi_va);
++ 	md->virt_addr = efi_va;
++ }
++ 
++ /*
++  * kexec kernel will use efi_map_region_fixed to map efi runtime memory ranges.
++  * md->virt_addr is the original virtual address which had been mapped in kexec
++  * 1st kernel.
++  */
++ void __init efi_map_region_fixed(efi_memory_desc_t *md)
++ {
++ 	__map_region(md, md->virt_addr);
++ }
++ 
+++>>>>>>> 3b2664964bc8 (x86/efi: Add a wrapper function efi_map_region_fixed())
+  void __iomem *__init efi_ioremap(unsigned long phys_addr, unsigned long size,
+  				 u32 type, u64 attribute)
+  {
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path arch/x86/platform/efi/efi_32.c
+* Unmerged path arch/x86/platform/efi/efi_64.c
