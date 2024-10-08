@@ -1,0 +1,167 @@
+fib_trie: move leaf and tnode to occupy the same spot in the key vector
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 41b489fd6ce03e96e90fcffdb69b168065ae2e40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/41b489fd.failed
+
+If we are going to compact the leaf and tnode we first need to make sure
+the fields are all in the same place.  In that regard I am moving the leaf
+pointer which represents the fib_alias hash list to occupy what is
+currently the first key_vector pointer.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 41b489fd6ce03e96e90fcffdb69b168065ae2e40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 3fe26090641a,2233ebf2aae8..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -94,31 -94,26 +94,47 @@@ typedef unsigned int t_key
+  #define get_index(_key, _kv) (((_key) ^ (_kv)->key) >> (_kv)->pos)
+  
+  struct tnode {
++ 	struct rcu_head rcu;
++ 
++ 	t_key empty_children; /* KEYLENGTH bits needed */
++ 	t_key full_children;  /* KEYLENGTH bits needed */
++ 	struct tnode __rcu *parent;
++ 
+  	t_key key;
+- 	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
++ 	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char slen;
+- 	struct tnode __rcu *parent;
+- 	struct rcu_head rcu;
+  	union {
+++<<<<<<< HEAD
+ +		/* The fields in this struct are valid if bits > 0 (TNODE) */
+ +		struct {
+ +			t_key empty_children; /* KEYLENGTH bits needed */
+ +			t_key full_children;  /* KEYLENGTH bits needed */
+ +			struct tnode __rcu *child[0];
+ +		};
+ +		/* This list pointer if valid if bits == 0 (LEAF) */
+ +		struct hlist_head list;
+ +	};
+ +};
+ +
+ +struct leaf_info {
+ +	struct hlist_node hlist;
+ +	int plen;
+ +	u32 mask_plen; /* ntohl(inet_make_mask(plen)) */
+ +	struct list_head falh;
+ +	struct rcu_head rcu;
+ +};
+++=======
++ 		/* This list pointer if valid if (pos | bits) == 0 (LEAF) */
++ 		struct hlist_head leaf;
++ 		/* This array is valid if (pos | bits) > 0 (TNODE) */
++ 		struct tnode __rcu *tnode[0];
++ 	};
++ };
++ 
++ #define TNODE_SIZE(n)	offsetof(struct tnode, tnode[n])
++ #define LEAF_SIZE	TNODE_SIZE(1)
+++>>>>>>> 41b489fd6ce0 (fib_trie: move leaf and tnode to occupy the same spot in the key vector)
+  
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+  struct trie_use_stats {
+@@@ -333,20 -325,9 +349,20 @@@ static struct tnode *leaf_new(t_key key
+  	return l;
+  }
+  
+ +static struct leaf_info *leaf_info_new(int plen)
+ +{
+ +	struct leaf_info *li = kmalloc(sizeof(struct leaf_info),  GFP_KERNEL);
+ +	if (li) {
+ +		li->plen = plen;
+ +		li->mask_plen = ntohl(inet_make_mask(plen));
+ +		INIT_LIST_HEAD(&li->falh);
+ +	}
+ +	return li;
+ +}
+ +
+  static struct tnode *tnode_new(t_key key, int pos, int bits)
+  {
+- 	size_t sz = offsetof(struct tnode, child[1ul << bits]);
++ 	size_t sz = TNODE_SIZE(1ul << bits);
+  	struct tnode *tn = tnode_alloc(sz);
+  	unsigned int shift = pos + bits;
+  
+@@@ -406,11 -387,33 +422,11 @@@ static void put_child(struct tnode *tn
+  	if (n && (tn->slen < n->slen))
+  		tn->slen = n->slen;
+  
+- 	rcu_assign_pointer(tn->child[i], n);
++ 	rcu_assign_pointer(tn->tnode[i], n);
+  }
+  
+ -static void update_children(struct tnode *tn)
+ -{
+ -	unsigned long i;
+ -
+ -	/* update all of the child parent pointers */
+ -	for (i = tnode_child_length(tn); i;) {
+ -		struct tnode *inode = tnode_get_child(tn, --i);
+ -
+ -		if (!inode)
+ -			continue;
+ -
+ -		/* Either update the children of a tnode that
+ -		 * already belongs to us or update the child
+ -		 * to point to ourselves.
+ -		 */
+ -		if (node_parent(inode) == tn)
+ -			update_children(inode);
+ -		else
+ -			node_set_parent(inode, tn);
+ -	}
+ -}
+ -
+ -static inline void put_child_root(struct tnode *tp, struct trie *t,
+ -				  t_key key, struct tnode *n)
+ +static void put_child_root(struct tnode *tp, struct trie *t,
+ +			   t_key key, struct tnode *n)
+  {
+  	if (tp)
+  		put_child(tp, get_index(key, tp), n);
+@@@ -1841,8 -1688,7 +1857,12 @@@ void __init fib_trie_init(void
+  					  0, SLAB_PANIC, NULL);
+  
+  	trie_leaf_kmem = kmem_cache_create("ip_fib_trie",
+++<<<<<<< HEAD
+ +					   max(sizeof(struct tnode),
+ +					       sizeof(struct leaf_info)),
+++=======
++ 					   LEAF_SIZE,
+++>>>>>>> 41b489fd6ce0 (fib_trie: move leaf and tnode to occupy the same spot in the key vector)
+  					   0, SLAB_PANIC, NULL);
+  }
+  
+@@@ -2000,13 -1846,13 +2020,13 @@@ static void trie_show_stats(struct seq_
+  	seq_printf(seq, "\tMax depth:      %u\n", stat->maxdepth);
+  
+  	seq_printf(seq, "\tLeaves:         %u\n", stat->leaves);
+- 	bytes = sizeof(struct tnode) * stat->leaves;
++ 	bytes = LEAF_SIZE * stat->leaves;
+  
+  	seq_printf(seq, "\tPrefixes:       %u\n", stat->prefixes);
+ -	bytes += sizeof(struct fib_alias) * stat->prefixes;
+ +	bytes += sizeof(struct leaf_info) * stat->prefixes;
+  
+  	seq_printf(seq, "\tInternal nodes: %u\n\t", stat->tnodes);
+- 	bytes += sizeof(struct tnode) * stat->tnodes;
++ 	bytes += TNODE_SIZE(0) * stat->tnodes;
+  
+  	max = MAX_STAT_DEPTH;
+  	while (max > 0 && stat->nodesizes[max-1] == 0)
+* Unmerged path net/ipv4/fib_trie.c
