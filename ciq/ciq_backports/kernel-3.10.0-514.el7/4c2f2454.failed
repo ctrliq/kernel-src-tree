@@ -1,0 +1,167 @@
+sctp: linearize early if it's not GSO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit 4c2f2454964477c66ef57745daab203b71783f66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4c2f2454.failed
+
+Because otherwise when crc computation is still needed it's way more
+expensive than on a linear buffer to the point that it affects
+performance.
+
+It's so expensive that netperf test gives a perf output as below:
+
+Overhead  Command         Shared Object       Symbol
+  18,62%  netserver       [kernel.vmlinux]    [k] crc32_generic_shift
+   2,57%  netserver       [kernel.vmlinux]    [k] __pskb_pull_tail
+   1,94%  netserver       [kernel.vmlinux]    [k] fib_table_lookup
+   1,90%  netserver       [kernel.vmlinux]    [k] copy_user_enhanced_fast_string
+   1,66%  swapper         [kernel.vmlinux]    [k] intel_idle
+   1,63%  netserver       [kernel.vmlinux]    [k] _raw_spin_lock
+   1,59%  netserver       [sctp]              [k] sctp_packet_transmit
+   1,55%  netserver       [kernel.vmlinux]    [k] memcpy_erms
+   1,42%  netserver       [sctp]              [k] sctp_rcv
+
+# netperf -H 192.168.10.1 -l 10 -t SCTP_STREAM -cC -- -m 12000
+SCTP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.10.1 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+212992 212992  12000    10.00      3016.42   2.88     3.78     1.874   2.462
+
+After patch:
+Overhead  Command         Shared Object      Symbol
+   2,75%  netserver       [kernel.vmlinux]   [k] memcpy_erms
+   2,63%  netserver       [kernel.vmlinux]   [k] copy_user_enhanced_fast_string
+   2,39%  netserver       [kernel.vmlinux]   [k] fib_table_lookup
+   2,04%  netserver       [kernel.vmlinux]   [k] __pskb_pull_tail
+   1,91%  netserver       [kernel.vmlinux]   [k] _raw_spin_lock
+   1,91%  netserver       [sctp]             [k] sctp_packet_transmit
+   1,72%  netserver       [mlx4_en]          [k] mlx4_en_process_rx_cq
+   1,68%  netserver       [sctp]             [k] sctp_rcv
+
+# netperf -H 192.168.10.1 -l 10 -t SCTP_STREAM -cC -- -m 12000
+SCTP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.10.1 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+212992 212992  12000    10.00      3681.77   3.83     3.46     2.045   1.849
+
+Fixes: 3acb50c18d8d ("sctp: delay as much as possible skb_linearize")
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c2f2454964477c66ef57745daab203b71783f66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+#	net/sctp/inqueue.c
+diff --cc net/sctp/input.c
+index 91b674c1e672,69444d32ecda..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -1239,7 -1175,12 +1245,16 @@@ static struct sctp_association *__sctp_
+  {
+  	sctp_chunkhdr_t *ch;
+  
+++<<<<<<< HEAD
+ +	if (skb_linearize(skb))
+++=======
++ 	/* We do not allow GSO frames here as we need to linearize and
++ 	 * then cannot guarantee frame boundaries. This shouldn't be an
++ 	 * issue as packets hitting this are mostly INIT or INIT-ACK and
++ 	 * those cannot be on GSO-style anyway.
++ 	 */
++ 	if ((skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP)
+++>>>>>>> 4c2f24549644 (sctp: linearize early if it's not GSO)
+  		return NULL;
+  
+  	ch = (sctp_chunkhdr_t *) skb->data;
+diff --cc net/sctp/inqueue.c
+index f49b9cedb9f5,6437aa97cfd7..000000000000
+--- a/net/sctp/inqueue.c
++++ b/net/sctp/inqueue.c
+@@@ -160,34 -164,52 +160,43 @@@ struct sctp_chunk *sctp_inq_pop(struct 
+  
+  next_chunk:
+  		/* Is the queue empty?  */
+ -		entry = sctp_list_dequeue(&queue->in_chunk_list);
+ -		if (!entry)
+ +		if (list_empty(&queue->in_chunk_list))
+  			return NULL;
+  
+ +		entry = queue->in_chunk_list.next;
+  		chunk = list_entry(entry, struct sctp_chunk, list);
+ +		list_del_init(entry);
+  
+ -		if ((skb_shinfo(chunk->skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP) {
+ -			/* GSO-marked skbs but without frags, handle
+ -			 * them normally
+ -			 */
+ -			if (skb_shinfo(chunk->skb)->frag_list)
+ -				chunk->head_skb = chunk->skb;
+ -
+ -			/* skbs with "cover letter" */
+ -			if (chunk->head_skb && chunk->skb->data_len == chunk->skb->len)
+ -				chunk->skb = skb_shinfo(chunk->skb)->frag_list;
+ -
+ -			if (WARN_ON(!chunk->skb)) {
+++<<<<<<< HEAD
+ +		/* Linearize if it's not GSO */
+ +		if (skb_is_nonlinear(chunk->skb)) {
+ +			if (skb_linearize(chunk->skb)) {
+  				__SCTP_INC_STATS(dev_net(chunk->skb->dev), SCTP_MIB_IN_PKT_DISCARDS);
+  				sctp_chunk_free(chunk);
+  				goto next_chunk;
+  			}
+ -		}
+  
+ -		if (chunk->asoc)
+ -			sock_rps_save_rxhash(chunk->asoc->base.sk, chunk->skb);
+ +			/* Update sctp_hdr as it probably changed */
+ +			chunk->sctp_hdr = sctp_hdr(chunk->skb);
+ +		}
+  
+  		queue->in_progress = chunk;
+++=======
+++		if ((skb_shinfo(chunk->skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP) {
+++			/* GSO-marked skbs but without frags, handle
+++			 * them normally
+++			 */
+++			if (skb_shinfo(chunk->skb)->frag_list)
+++				chunk->head_skb = chunk->skb;
+++>>>>>>> 4c2f24549644 (sctp: linearize early if it's not GSO)
+  
+ -new_skb:
+  		/* This is the first chunk in the packet.  */
+ -		ch = (sctp_chunkhdr_t *) chunk->skb->data;
+  		chunk->singleton = 1;
+ +		ch = (sctp_chunkhdr_t *) chunk->skb->data;
+  		chunk->data_accepted = 0;
+ -		chunk->pdiscard = 0;
+ -		chunk->auth = 0;
+ -		chunk->has_asconf = 0;
+ -		chunk->end_of_packet = 0;
+ -		if (chunk->head_skb) {
+ -			struct sctp_input_cb
+ -				*cb = SCTP_INPUT_CB(chunk->skb),
+ -				*head_cb = SCTP_INPUT_CB(chunk->head_skb);
+ -
+ -			cb->chunk = head_cb->chunk;
+ -			cb->af = head_cb->af;
+ -		}
+ +
+ +		if (chunk->asoc)
+ +			sock_rps_save_rxhash(chunk->asoc->base.sk, chunk->skb);
+  	}
+  
+  	chunk->chunk_hdr = ch;
+* Unmerged path net/sctp/input.c
+* Unmerged path net/sctp/inqueue.c
