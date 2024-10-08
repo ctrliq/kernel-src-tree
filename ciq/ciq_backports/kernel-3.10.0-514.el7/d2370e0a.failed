@@ -1,0 +1,280 @@
+IB/mlx5: Add memory windows allocation support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matan Barak <matanb@mellanox.com>
+commit d2370e0a573e5c5ea9c96373558727abb3ea71f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d2370e0a.failed
+
+This patch adds user-space support for memory windows allocation and
+deallocation. It also exposes the supported types via
+query_device_caps verb.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Tested-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d2370e0a573e5c5ea9c96373558727abb3ea71f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	include/linux/mlx5/mlx5_ifc.h
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 262b860a11ee,648d2e2e445b..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -405,10 -462,9 +406,16 @@@ struct mlx5_ib_mr 
+  	int			access_flags; /* Needed for rereg MR */
+  };
+  
+++<<<<<<< HEAD
+ +struct mlx5_ib_fast_reg_page_list {
+ +	struct ib_fast_reg_page_list	ibfrpl;
+ +	__be64			       *mapped_page_list;
+ +	dma_addr_t			map;
+++=======
++ struct mlx5_ib_mw {
++ 	struct ib_mw		ibmw;
++ 	struct mlx5_core_mkey	mmkey;
+++>>>>>>> d2370e0a573e (IB/mlx5: Add memory windows allocation support)
+  };
+  
+  struct mlx5_ib_umr_context {
+@@@ -572,9 -639,9 +579,15 @@@ static inline struct mlx5_ib_mr *to_mmr
+  	return container_of(ibmr, struct mlx5_ib_mr, ibmr);
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct mlx5_ib_fast_reg_page_list *to_mfrpl(struct ib_fast_reg_page_list *ibfrpl)
+ +{
+ +	return container_of(ibfrpl, struct mlx5_ib_fast_reg_page_list, ibfrpl);
+++=======
++ static inline struct mlx5_ib_mw *to_mmw(struct ib_mw *ibmw)
++ {
++ 	return container_of(ibmw, struct mlx5_ib_mw, ibmw);
+++>>>>>>> d2370e0a573e (IB/mlx5: Add memory windows allocation support)
+  }
+  
+  struct mlx5_ib_ah {
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 9a8b4ea88eb7,70a047dde69e..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1618,46 -1621,86 +1619,129 @@@ err_free
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+ +struct ib_fast_reg_page_list *mlx5_ib_alloc_fast_reg_page_list(struct ib_device *ibdev,
+ +							       int page_list_len)
+ +{
+ +	struct mlx5_ib_fast_reg_page_list *mfrpl;
+ +	int size = page_list_len * sizeof(u64);
+ +
+ +	mfrpl = kmalloc(sizeof(*mfrpl), GFP_KERNEL);
+ +	if (!mfrpl)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	mfrpl->ibfrpl.page_list = kmalloc(size, GFP_KERNEL);
+ +	if (!mfrpl->ibfrpl.page_list)
+ +		goto err_free;
+ +
+ +	mfrpl->mapped_page_list = dma_alloc_coherent(ibdev->dma_device,
+ +						     size, &mfrpl->map,
+ +						     GFP_KERNEL);
+ +	if (!mfrpl->mapped_page_list)
+ +		goto err_free;
+ +
+ +	WARN_ON(mfrpl->map & 0x3f);
+ +
+ +	return &mfrpl->ibfrpl;
+ +
+ +err_free:
+ +	kfree(mfrpl->ibfrpl.page_list);
+ +	kfree(mfrpl);
+ +	return ERR_PTR(-ENOMEM);
+ +}
+ +
+ +void mlx5_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list)
+ +{
+ +	struct mlx5_ib_fast_reg_page_list *mfrpl = to_mfrpl(page_list);
+ +	struct mlx5_ib_dev *dev = to_mdev(page_list->device);
+ +	int size = page_list->max_page_list_len * sizeof(u64);
+ +
+ +	dma_free_coherent(&dev->mdev->pdev->dev, size, mfrpl->mapped_page_list,
+ +			  mfrpl->map);
+ +	kfree(mfrpl->ibfrpl.page_list);
+ +	kfree(mfrpl);
+++=======
++ struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
++ 			       struct ib_udata *udata)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	struct mlx5_create_mkey_mbox_in *in = NULL;
++ 	struct mlx5_ib_mw *mw = NULL;
++ 	int ndescs;
++ 	int err;
++ 	struct mlx5_ib_alloc_mw req = {};
++ 	struct {
++ 		__u32	comp_mask;
++ 		__u32	response_length;
++ 	} resp = {};
++ 
++ 	err = ib_copy_from_udata(&req, udata, min(udata->inlen, sizeof(req)));
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	if (req.comp_mask || req.reserved1 || req.reserved2)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (udata->inlen > sizeof(req) &&
++ 	    !ib_is_udata_cleared(udata, sizeof(req),
++ 				 udata->inlen - sizeof(req)))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	ndescs = req.num_klms ? roundup(req.num_klms, 4) : roundup(1, 4);
++ 
++ 	mw = kzalloc(sizeof(*mw), GFP_KERNEL);
++ 	in = kzalloc(sizeof(*in), GFP_KERNEL);
++ 	if (!mw || !in) {
++ 		err = -ENOMEM;
++ 		goto free;
++ 	}
++ 
++ 	in->seg.status = MLX5_MKEY_STATUS_FREE;
++ 	in->seg.xlt_oct_size = cpu_to_be32(ndescs);
++ 	in->seg.flags_pd = cpu_to_be32(to_mpd(pd)->pdn);
++ 	in->seg.flags = MLX5_PERM_UMR_EN | MLX5_ACCESS_MODE_KLM |
++ 		MLX5_PERM_LOCAL_READ;
++ 	if (type == IB_MW_TYPE_2)
++ 		in->seg.flags_pd |= cpu_to_be32(MLX5_MKEY_REMOTE_INVAL);
++ 	in->seg.qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
++ 
++ 	err = mlx5_core_create_mkey(dev->mdev, &mw->mmkey, in, sizeof(*in),
++ 				    NULL, NULL, NULL);
++ 	if (err)
++ 		goto free;
++ 
++ 	mw->ibmw.rkey = mw->mmkey.key;
++ 
++ 	resp.response_length = min(offsetof(typeof(resp), response_length) +
++ 				   sizeof(resp.response_length), udata->outlen);
++ 	if (resp.response_length) {
++ 		err = ib_copy_to_udata(udata, &resp, resp.response_length);
++ 		if (err) {
++ 			mlx5_core_destroy_mkey(dev->mdev, &mw->mmkey);
++ 			goto free;
++ 		}
++ 	}
++ 
++ 	kfree(in);
++ 	return &mw->ibmw;
++ 
++ free:
++ 	kfree(mw);
++ 	kfree(in);
++ 	return ERR_PTR(err);
++ }
++ 
++ int mlx5_ib_dealloc_mw(struct ib_mw *mw)
++ {
++ 	struct mlx5_ib_mw *mmw = to_mmw(mw);
++ 	int err;
++ 
++ 	err =  mlx5_core_destroy_mkey((to_mdev(mw->device))->mdev,
++ 				      &mmw->mmkey);
++ 	if (!err)
++ 		kfree(mmw);
++ 	return err;
+++>>>>>>> d2370e0a573e (IB/mlx5: Add memory windows allocation support)
+  }
+  
+  int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
+diff --cc include/linux/mlx5/mlx5_ifc.h
+index 08e2b9ad01d1,3044cfa683f1..000000000000
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@@ -761,16 -763,19 +761,22 @@@ struct mlx5_ifc_cmd_hca_cap_bits 
+  	u8         cq_eq_remap[0x1];
+  	u8         pg[0x1];
+  	u8         block_lb_mc[0x1];
+ -	u8         reserved_at_228[0x1];
+ +	u8         reserved_29[0x1];
+  	u8         scqe_break_moderation[0x1];
+ -	u8         reserved_at_22a[0x1];
+ +	u8         reserved_30[0x1];
+  	u8         cd[0x1];
+ -	u8         reserved_at_22c[0x1];
+ +	u8         reserved_31[0x1];
+  	u8         apm[0x1];
+++<<<<<<< HEAD
+ +	u8         reserved_32[0x7];
+++=======
++ 	u8         reserved_at_22e[0x2];
++ 	u8	   imaicl[0x1];
++ 	u8         reserved_at_231[0x4];
+++>>>>>>> d2370e0a573e (IB/mlx5: Add memory windows allocation support)
+  	u8         qkv[0x1];
+  	u8         pkv[0x1];
+ -	u8         set_deth_sqpn[0x1];
+ -	u8         reserved_at_239[0x3];
+ +	u8         reserved_33[0x4];
+  	u8         xrc[0x1];
+  	u8         ud[0x1];
+  	u8         uc[0x1];
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 4a2beff52a0a..98bd412e2845 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -488,6 +488,11 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
+ 		props->device_cap_flags |= IB_DEVICE_AUTO_PATH_MIG;
+ 	if (MLX5_CAP_GEN(mdev, xrc))
+ 		props->device_cap_flags |= IB_DEVICE_XRC;
++	if (MLX5_CAP_GEN(mdev, imaicl)) {
++		props->device_cap_flags |= IB_DEVICE_MEM_WINDOW |
++					   IB_DEVICE_MEM_WINDOW_TYPE_2B;
++		props->max_mw = 1 << MLX5_CAP_GEN(mdev, log_max_mkey);
++	}
+ 	props->device_cap_flags |= IB_DEVICE_MEM_MGT_EXTENSIONS;
+ 	if (MLX5_CAP_GEN(mdev, sho)) {
+ 		props->device_cap_flags |= IB_DEVICE_SIGNATURE_HANDOVER;
+@@ -2277,6 +2282,14 @@ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+ 
+ 	mlx5_ib_internal_fill_odp_caps(dev);
+ 
++	if (MLX5_CAP_GEN(mdev, imaicl)) {
++		dev->ib_dev.alloc_mw		= mlx5_ib_alloc_mw;
++		dev->ib_dev.dealloc_mw		= mlx5_ib_dealloc_mw;
++		dev->ib_dev.uverbs_cmd_mask |=
++			(1ull << IB_USER_VERBS_CMD_ALLOC_MW)	|
++			(1ull << IB_USER_VERBS_CMD_DEALLOC_MW);
++	}
++
+ 	if (MLX5_CAP_GEN(mdev, xrc)) {
+ 		dev->ib_dev.alloc_xrcd = mlx5_ib_alloc_xrcd;
+ 		dev->ib_dev.dealloc_xrcd = mlx5_ib_dealloc_xrcd;
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+diff --git a/drivers/infiniband/hw/mlx5/user.h b/drivers/infiniband/hw/mlx5/user.h
+index 41f0525e825c..bccf7daed44f 100644
+--- a/drivers/infiniband/hw/mlx5/user.h
++++ b/drivers/infiniband/hw/mlx5/user.h
+@@ -151,6 +151,13 @@ struct mlx5_ib_create_qp_resp {
+ 	__u32	uuar_index;
+ };
+ 
++struct mlx5_ib_alloc_mw {
++	__u32	comp_mask;
++	__u8	num_klms;
++	__u8	reserved1;
++	__u16	reserved2;
++};
++
+ static inline int get_qp_user_index(struct mlx5_ib_ucontext *ucontext,
+ 				    struct mlx5_ib_create_qp *ucmd,
+ 				    int inlen,
+* Unmerged path include/linux/mlx5/mlx5_ifc.h
