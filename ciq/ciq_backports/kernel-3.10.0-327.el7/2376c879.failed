@@ -1,0 +1,167 @@
+cxgb4 : Improve handling of DCB negotiation or loss thereof
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] cxgb4: Improve handling of DCB negotiation or loss thereof (Sai Vemuri) [1251611]
+Rebuild_FUZZ: 99.15%
+commit-author Anish Bhatt <anish@chelsio.com>
+commit 2376c879b80c83424a3013834be97fb9fe2d4180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2376c879.failed
+
+Clear out any DCB apps we might have added to kernel table when we lose DCB
+sync (or IEEE equivalent event). These were previously left behind and not
+cleaned up correctly. IEEE allows individual components to work independently,
+ so improve check for IEEE completion by specifying individual components.
+
+Fixes: 10b0046685ab ("cxgb4: IEEE fixes for DCBx state machine")
+
+	Signed-off-by: Anish Bhatt <anish@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2376c879b80c83424a3013834be97fb9fe2d4180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c
+index a8b1073e6373,ee819fd12bd2..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c
+@@@ -30,8 -41,61 +30,44 @@@ void cxgb4_dcb_state_init(struct net_de
+  
+  	memset(dcb, 0, sizeof(struct port_dcb_info));
+  	dcb->state = CXGB4_DCB_STATE_START;
+ -	if (version_temp)
+ -		dcb->dcb_version = version_temp;
+ -
+ -	netdev_dbg(dev, "%s: Initializing DCB state for port[%d]\n",
+ -		    __func__, pi->port_id);
+ -}
+ -
+ -void cxgb4_dcb_version_init(struct net_device *dev)
+ -{
+ -	struct port_info *pi = netdev2pinfo(dev);
+ -	struct port_dcb_info *dcb = &pi->dcb;
+ -
+ -	/* Any writes here are only done on kernels that exlicitly need
+ -	 * a specific version, say < 2.6.38 which only support CEE
+ -	 */
+ -	dcb->dcb_version = FW_PORT_DCB_VER_AUTO;
+  }
+  
++ static void cxgb4_dcb_cleanup_apps(struct net_device *dev)
++ {
++ 	struct port_info *pi = netdev2pinfo(dev);
++ 	struct adapter *adap = pi->adapter;
++ 	struct port_dcb_info *dcb = &pi->dcb;
++ 	struct dcb_app app;
++ 	int i, err;
++ 
++ 	/* zero priority implies remove */
++ 	app.priority = 0;
++ 
++ 	for (i = 0; i < CXGB4_MAX_DCBX_APP_SUPPORTED; i++) {
++ 		/* Check if app list is exhausted */
++ 		if (!dcb->app_priority[i].protocolid)
++ 			break;
++ 
++ 		app.protocol = dcb->app_priority[i].protocolid;
++ 
++ 		if (dcb->dcb_version == FW_PORT_DCB_VER_IEEE) {
++ 			app.selector = dcb->app_priority[i].sel_field + 1;
++ 			err = dcb_ieee_setapp(dev, &app);
++ 		} else {
++ 			app.selector = !!(dcb->app_priority[i].sel_field);
++ 			err = dcb_setapp(dev, &app);
++ 		}
++ 
++ 		if (err) {
++ 			dev_err(adap->pdev_dev,
++ 				"Failed DCB Clear %s Application Priority: sel=%d, prot=%d, , err=%d\n",
++ 				dcb_ver_array[dcb->dcb_version], app.selector,
++ 				app.protocol, -err);
++ 			break;
++ 		}
++ 	}
++ }
++ 
+  /* Finite State machine for Data Center Bridging.
+   */
+  void cxgb4_dcb_state_fsm(struct net_device *dev,
+@@@ -734,9 -844,35 +771,11 @@@ static u8 cxgb4_setapp(struct net_devic
+  	return 0;
+  }
+  
+ -/* Priority for CEE inside dcb_app is bitmask, with 0 being an invalid value */
+ -static int cxgb4_setapp(struct net_device *dev, u8 app_idtype, u16 app_id,
+ -			u8 app_prio)
+ -{
+ -	int ret;
+ -	struct dcb_app app = {
+ -		.selector = app_idtype,
+ -		.protocol = app_id,
+ -		.priority = app_prio,
+ -	};
+ -
+ -	if (app_idtype != DCB_APP_IDTYPE_ETHTYPE &&
+ -	    app_idtype != DCB_APP_IDTYPE_PORTNUM)
+ -		return -EINVAL;
+ -
+ -	/* Convert app_idtype to a format that firmware understands */
+ -	ret = __cxgb4_setapp(dev, app_idtype == DCB_APP_IDTYPE_ETHTYPE ?
+ -			      app_idtype : 3, app_id, app_prio);
+ -	if (ret)
+ -		return ret;
+ -
+ -	return dcb_setapp(dev, &app);
+ -}
+ -
+  /* Return whether IEEE Data Center Bridging has been negotiated.
+   */
+- static inline int cxgb4_ieee_negotiation_complete(struct net_device *dev)
++ static inline int
++ cxgb4_ieee_negotiation_complete(struct net_device *dev,
++ 				enum cxgb4_dcb_fw_msgs dcb_subtype)
+  {
+  	struct port_info *pi = netdev2pinfo(dev);
+  	struct port_dcb_info *dcb = &pi->dcb;
+@@@ -769,16 -907,29 +811,22 @@@ static int cxgb4_ieee_getapp(struct net
+  	return 0;
+  }
+  
+ -/* Write a new Application User Priority Map for the specified Application ID.
+ - * Priority for IEEE dcb_app is an integer, with 0 being a valid value
+ - */
+ +/* Write a new Application User Priority Map for the specified App id. */
+  static int cxgb4_ieee_setapp(struct net_device *dev, struct dcb_app *app)
+  {
+++<<<<<<< HEAD
+ +	if (!cxgb4_ieee_negotiation_complete(dev))
+++=======
++ 	int ret;
++ 
++ 	if (!cxgb4_ieee_negotiation_complete(dev, CXGB4_DCB_FW_APP_ID))
+++>>>>>>> 2376c879b80c (cxgb4 : Improve handling of DCB negotiation or loss thereof)
+  		return -EINVAL;
+ -	if (!(app->selector && app->protocol))
+ +	if (!(app->selector && app->protocol && app->priority))
+  		return -EINVAL;
+  
+ -	if (!(app->selector > IEEE_8021QAZ_APP_SEL_ETHERTYPE  &&
+ -	      app->selector < IEEE_8021QAZ_APP_SEL_ANY))
+ -		return -EINVAL;
+ -
+ -	/* change selector to a format that firmware understands */
+ -	ret = __cxgb4_setapp(dev, app->selector - 1, app->protocol,
+ -			     (1 << app->priority));
+ -	if (ret)
+ -		return ret;
+ -
+ -	return dcb_ieee_setapp(dev, app);
+ +	cxgb4_setapp(dev, app->selector, app->protocol, app->priority);
+ +	return dcb_setapp(dev, app);
+  }
+  
+  /* Return our DCBX parameters.
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c
