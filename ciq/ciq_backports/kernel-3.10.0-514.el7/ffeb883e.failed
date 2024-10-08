@@ -1,0 +1,180 @@
+perf tools: Show proper error message for wrong terms of hw/sw events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author He Kuang <hekuang@huawei.com>
+commit ffeb883e5662e94b14948078e85812261277ad67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ffeb883e.failed
+
+Show proper error message and show valid terms when wrong config terms
+is specified for hw/sw type perf events.
+
+This patch makes the original error format function formats_error_string()
+more generic, which only outputs the static config terms for hw/sw perf
+events, and prepends pmu formats for pmu events.
+
+Before this patch:
+
+  $ perf record -e 'cpu-clock/freqx=200/' -a sleep 1
+  invalid or unsupported event: 'cpu-clock/freqx=200/'
+  Run 'perf list' for a list of valid events
+
+   usage: perf record [<options>] [<command>]
+      or: perf record [<options>] -- <command> [<options>]
+
+      -e, --event <event>   event selector. use 'perf list' to list available events
+
+After this patch:
+
+  $ perf record -e 'cpu-clock/freqx=200/' -a sleep 1
+  event syntax error: 'cpu-clock/freqx=200/'
+                                 \___ unknown term
+
+  valid terms: config,config1,config2,name,period,freq,branch_type,time,call-graph,stack-size
+
+  Run 'perf list' for a list of valid events
+
+   usage: perf record [<options>] [<command>]
+      or: perf record [<options>] -- <command> [<options>]
+
+      -e, --event <event>   event selector. use 'perf list' to list available events
+
+	Signed-off-by: He Kuang <hekuang@huawei.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Wang Nan <wangnan0@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1443412336-120050-2-git-send-email-hekuang@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit ffeb883e5662e94b14948078e85812261277ad67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/pmu.c
+diff --cc tools/perf/util/pmu.c
+index 29797fd9bedc,ac42c97be9e4..000000000000
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@@ -626,36 -626,26 +626,31 @@@ static int pmu_resolve_param_term(struc
+  	return -1;
+  }
+  
+- static char *formats_error_string(struct list_head *formats)
++ static char *pmu_formats_string(struct list_head *formats)
+  {
+  	struct perf_pmu_format *format;
+++<<<<<<< HEAD
+ +	char *err, *str;
+ +	static const char *static_terms = "config,config1,config2,name,period,branch_type\n";
+++=======
++ 	char *str;
++ 	struct strbuf buf;
+++>>>>>>> ffeb883e5662 (perf tools: Show proper error message for wrong terms of hw/sw events)
+  	unsigned i = 0;
+  
+- 	if (!asprintf(&str, "valid terms:"))
++ 	if (!formats)
+  		return NULL;
+  
++ 	strbuf_init(&buf, 0);
+  	/* sysfs exported terms */
+- 	list_for_each_entry(format, formats, list) {
+- 		char c = i++ ? ',' : ' ';
+- 
+- 		err = str;
+- 		if (!asprintf(&str, "%s%c%s", err, c, format->name))
+- 			goto fail;
+- 		free(err);
+- 	}
++ 	list_for_each_entry(format, formats, list)
++ 		strbuf_addf(&buf, i++ ? ",%s" : "%s",
++ 			    format->name);
+  
+- 	/* static terms */
+- 	err = str;
+- 	if (!asprintf(&str, "%s,%s", err, static_terms))
+- 		goto fail;
++ 	str = strbuf_detach(&buf, NULL);
++ 	strbuf_release(&buf);
+  
+- 	free(err);
+  	return str;
+- fail:
+- 	free(err);
+- 	return NULL;
+  }
+  
+  /*
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index fd7bc5047cba..ac49547d7d0d 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -636,6 +636,9 @@ do {									   \
+ 		CHECK_TYPE_VAL(STR);
+ 		break;
+ 	default:
++		err->str = strdup("unknown term");
++		err->idx = term->err_term;
++		err->help = parse_events_formats_error_string(NULL);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1785,3 +1788,29 @@ void parse_events_evlist_error(struct parse_events_evlist *data,
+ 	err->str = strdup(str);
+ 	WARN_ONCE(!err->str, "WARNING: failed to allocate error string");
+ }
++
++/*
++ * Return string contains valid config terms of an event.
++ * @additional_terms: For terms such as PMU sysfs terms.
++ */
++char *parse_events_formats_error_string(char *additional_terms)
++{
++	char *str;
++	static const char *static_terms = "config,config1,config2,name,"
++					  "period,freq,branch_type,time,"
++					  "call-graph,stack-size\n";
++
++	/* valid terms */
++	if (additional_terms) {
++		if (!asprintf(&str, "valid terms: %s,%s",
++			      additional_terms, static_terms))
++			goto fail;
++	} else {
++		if (!asprintf(&str, "valid terms: %s", static_terms))
++			goto fail;
++	}
++	return str;
++
++fail:
++	return NULL;
++}
+diff --git a/tools/perf/util/parse-events.h b/tools/perf/util/parse-events.h
+index 3500437920bb..d2e7add25188 100644
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@ -152,5 +152,6 @@ int print_hwcache_events(const char *event_glob, bool name_only);
+ extern int is_valid_tracepoint(const char *event_string);
+ 
+ int valid_event_mount(const char *eventfs);
++char *parse_events_formats_error_string(char *additional_terms);
+ 
+ #endif /* __PERF_PARSE_EVENTS_H */
+diff --git a/tools/perf/util/parse-events.l b/tools/perf/util/parse-events.l
+index 13cef3c65565..ca6ef47cf0ab 100644
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@ -174,7 +174,7 @@ modifier_bp	[rwx]{1,3}
+ 
+ <config>{
+ 	/*
+-	 * Please update formats_error_string any time
++	 * Please update parse_events_formats_error_string any time
+ 	 * new static term is added.
+ 	 */
+ config			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CONFIG); }
+* Unmerged path tools/perf/util/pmu.c
