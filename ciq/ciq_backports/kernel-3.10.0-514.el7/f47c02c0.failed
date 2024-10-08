@@ -1,0 +1,189 @@
+perf: Robustify event->owner usage and SMP ordering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit f47c02c0c8403963fbb8c3484e285727305d0f73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f47c02c0.failed
+
+Use smp_store_release() to clear event->owner and
+lockless_dereference() to observe it. Further use READ_ONCE() for all
+lockless reads.
+
+This changes perf_remove_from_owner() to leave event->owner cleared.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f47c02c0c8403963fbb8c3484e285727305d0f73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e086d60d319b,5f055de90c6d..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -124,13 -126,143 +124,145 @@@ static int cpu_function_call(int cpu, r
+  	return data.ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void event_function_call(struct perf_event *event,
+ +				int (*active)(void *),
+ +				void (*inactive)(void *),
+ +				void *data)
+++=======
++ static inline struct perf_cpu_context *
++ __get_cpu_context(struct perf_event_context *ctx)
++ {
++ 	return this_cpu_ptr(ctx->pmu->pmu_cpu_context);
++ }
++ 
++ static void perf_ctx_lock(struct perf_cpu_context *cpuctx,
++ 			  struct perf_event_context *ctx)
++ {
++ 	raw_spin_lock(&cpuctx->ctx.lock);
++ 	if (ctx)
++ 		raw_spin_lock(&ctx->lock);
++ }
++ 
++ static void perf_ctx_unlock(struct perf_cpu_context *cpuctx,
++ 			    struct perf_event_context *ctx)
++ {
++ 	if (ctx)
++ 		raw_spin_unlock(&ctx->lock);
++ 	raw_spin_unlock(&cpuctx->ctx.lock);
++ }
++ 
++ #define TASK_TOMBSTONE ((void *)-1L)
++ 
++ static bool is_kernel_event(struct perf_event *event)
++ {
++ 	return READ_ONCE(event->owner) == TASK_TOMBSTONE;
++ }
++ 
++ /*
++  * On task ctx scheduling...
++  *
++  * When !ctx->nr_events a task context will not be scheduled. This means
++  * we can disable the scheduler hooks (for performance) without leaving
++  * pending task ctx state.
++  *
++  * This however results in two special cases:
++  *
++  *  - removing the last event from a task ctx; this is relatively straight
++  *    forward and is done in __perf_remove_from_context.
++  *
++  *  - adding the first event to a task ctx; this is tricky because we cannot
++  *    rely on ctx->is_active and therefore cannot use event_function_call().
++  *    See perf_install_in_context().
++  *
++  * This is because we need a ctx->lock serialized variable (ctx->is_active)
++  * to reliably determine if a particular task/context is scheduled in. The
++  * task_curr() use in task_function_call() is racy in that a remote context
++  * switch is not a single atomic operation.
++  *
++  * As is, the situation is 'safe' because we set rq->curr before we do the
++  * actual context switch. This means that task_curr() will fail early, but
++  * we'll continue spinning on ctx->is_active until we've passed
++  * perf_event_task_sched_out().
++  *
++  * Without this ctx->lock serialized variable we could have race where we find
++  * the task (and hence the context) would not be active while in fact they are.
++  *
++  * If ctx->nr_events, then ctx->is_active and cpuctx->task_ctx are set.
++  */
++ 
++ typedef void (*event_f)(struct perf_event *, struct perf_cpu_context *,
++ 			struct perf_event_context *, void *);
++ 
++ struct event_function_struct {
++ 	struct perf_event *event;
++ 	event_f func;
++ 	void *data;
++ };
++ 
++ static int event_function(void *info)
++ {
++ 	struct event_function_struct *efs = info;
++ 	struct perf_event *event = efs->event;
++ 	struct perf_event_context *ctx = event->ctx;
++ 	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
++ 	struct perf_event_context *task_ctx = cpuctx->task_ctx;
++ 	int ret = 0;
++ 
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 
++ 	perf_ctx_lock(cpuctx, task_ctx);
++ 	/*
++ 	 * Since we do the IPI call without holding ctx->lock things can have
++ 	 * changed, double check we hit the task we set out to hit.
++ 	 */
++ 	if (ctx->task) {
++ 		if (ctx->task != current) {
++ 			ret = -EAGAIN;
++ 			goto unlock;
++ 		}
++ 
++ 		/*
++ 		 * We only use event_function_call() on established contexts,
++ 		 * and event_function() is only ever called when active (or
++ 		 * rather, we'll have bailed in task_function_call() or the
++ 		 * above ctx->task != current test), therefore we must have
++ 		 * ctx->is_active here.
++ 		 */
++ 		WARN_ON_ONCE(!ctx->is_active);
++ 		/*
++ 		 * And since we have ctx->is_active, cpuctx->task_ctx must
++ 		 * match.
++ 		 */
++ 		WARN_ON_ONCE(task_ctx != ctx);
++ 	} else {
++ 		WARN_ON_ONCE(&cpuctx->ctx != ctx);
++ 	}
++ 
++ 	efs->func(event, cpuctx, ctx, efs->data);
++ unlock:
++ 	perf_ctx_unlock(cpuctx, task_ctx);
++ 
++ 	return ret;
++ }
++ 
++ static void event_function_local(struct perf_event *event, event_f func, void *data)
++ {
++ 	struct event_function_struct efs = {
++ 		.event = event,
++ 		.func = func,
++ 		.data = data,
++ 	};
++ 
++ 	int ret = event_function(&efs);
++ 	WARN_ON_ONCE(ret);
++ }
++ 
++ static void event_function_call(struct perf_event *event, event_f func, void *data)
+++>>>>>>> f47c02c0c840 (perf: Robustify event->owner usage and SMP ordering)
+  {
+  	struct perf_event_context *ctx = event->ctx;
+ -	struct task_struct *task = READ_ONCE(ctx->task); /* verified in event_function */
+ -	struct event_function_struct efs = {
+ -		.event = event,
+ -		.func = func,
+ -		.data = data,
+ -	};
+ +	struct task_struct *task = ctx->task;
+  
+  	if (!event->parent) {
+  		/*
+* Unmerged path kernel/events/core.c
