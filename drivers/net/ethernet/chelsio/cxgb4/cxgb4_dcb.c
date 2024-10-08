@@ -1200,6 +1200,8 @@ static int cxgb4_cee_peer_getpg(struct net_device *dev, struct cee_pg *pg)
 	for (i = 0; i < CXGB4_MAX_PRIORITY; i++)
 		pg->pg_bw[i] = pcmd.u.dcb.pgrate.pgrate[i];
 
+	pg->tcs_supported = pcmd.u.dcb.pgrate.num_tcs_supported;
+
 	return 0;
 }
 
@@ -1216,6 +1218,8 @@ static int cxgb4_cee_peer_getpfc(struct net_device *dev, struct cee_pfc *pfc)
 	 * by bit shifting in other uses of pfcen
 	 */
 	pfc->pfc_en = bitswap_1(pi->dcb.pfcen);
+
+	pfc->tcs_supported = pi->dcb.pfc_num_tcs_supported;
 
 	return 0;
 }
