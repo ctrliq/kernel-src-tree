@@ -1,0 +1,104 @@
+xfs: use i_mmaplock on read faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit de0e8c20ba3a65b0f15040aabbefdc1999876e6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/de0e8c20.failed
+
+Take the i_mmaplock over read page faults. These come through the
+->fault callout, so we need to wrap the generic implementation
+with the i_mmaplock. While there, add tracepoints for the read
+fault as it passes through XFS.
+
+This gives us a lock order of mmap_sem -> i_mmaplock -> page_lock
+-> i_lock.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit de0e8c20ba3a65b0f15040aabbefdc1999876e6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,ac174226244a..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1469,14 -1379,40 +1469,40 @@@ xfs_file_llseek
+  	}
+  }
+  
++ /*
++  * Locking for serialisation of IO during page faults. This results in a lock
++  * ordering of:
++  *
++  * mmap_sem (MM)
++  *   i_mmap_lock (XFS - truncate serialisation)
++  *     page_lock (MM)
++  *       i_lock (XFS - extent map serialisation)
++  */
++ STATIC int
++ xfs_filemap_fault(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
++ 	int			error;
++ 
++ 	trace_xfs_filemap_fault(ip);
++ 
++ 	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
++ 	error = filemap_fault(vma, vmf);
++ 	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
++ 
++ 	return error;
++ }
++ 
+  const struct file_operations xfs_file_operations = {
+  	.llseek		= xfs_file_llseek,
+ -	.read		= new_sync_read,
+ -	.write		= new_sync_write,
+ -	.read_iter	= xfs_file_read_iter,
+ -	.write_iter	= xfs_file_write_iter,
+ +	.read		= do_sync_read,
+ +	.write		= do_sync_write,
+ +	.aio_read	= xfs_file_aio_read,
+ +	.aio_write	= xfs_file_aio_write,
+  	.splice_read	= xfs_file_splice_read,
+ -	.splice_write	= iter_file_splice_write,
+ +	.splice_write	= xfs_file_splice_write,
+  	.unlocked_ioctl	= xfs_file_ioctl,
+  #ifdef CONFIG_COMPAT
+  	.compat_ioctl	= xfs_file_compat_ioctl,
+@@@ -1501,7 -1437,7 +1527,12 @@@ const struct file_operations xfs_dir_fi
+  };
+  
+  static const struct vm_operations_struct xfs_file_vm_ops = {
+++<<<<<<< HEAD
+ +	.fault		= filemap_fault,
+++=======
++ 	.fault		= xfs_filemap_fault,
++ 	.map_pages	= filemap_map_pages,
+++>>>>>>> de0e8c20ba3a (xfs: use i_mmaplock on read faults)
+  	.page_mkwrite	= xfs_vm_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 27fdd8bb499c..206d57089c72 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -625,6 +625,8 @@ DEFINE_INODE_EVENT(xfs_inode_set_eofblocks_tag);
+ DEFINE_INODE_EVENT(xfs_inode_clear_eofblocks_tag);
+ DEFINE_INODE_EVENT(xfs_inode_free_eofblocks_invalid);
+ 
++DEFINE_INODE_EVENT(xfs_filemap_fault);
++
+ DECLARE_EVENT_CLASS(xfs_iref_class,
+ 	TP_PROTO(struct xfs_inode *ip, unsigned long caller_ip),
+ 	TP_ARGS(ip, caller_ip),
