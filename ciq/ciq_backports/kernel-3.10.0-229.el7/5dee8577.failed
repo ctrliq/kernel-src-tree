@@ -1,0 +1,242 @@
+blk-mq: initialize request in __blk_mq_alloc_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5dee857720db15e2c8ef0c03f7eeac00c4c63cb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5dee8577.failed
+
+Both callers if __blk_mq_alloc_request want to initialize the request, so
+lift it into the common path.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5dee857720db15e2c8ef0c03f7eeac00c4c63cb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 2ab20aca2fd8,04ef7ecb3c7f..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -69,27 -78,20 +69,30 @@@ static bool blk_mq_hctx_has_pending(str
+  static void blk_mq_hctx_mark_pending(struct blk_mq_hw_ctx *hctx,
+  				     struct blk_mq_ctx *ctx)
+  {
+ -	struct blk_align_bitmap *bm = get_bm(hctx, ctx);
+ -
+ -	if (!test_bit(CTX_TO_BIT(hctx, ctx), &bm->word))
+ -		set_bit(CTX_TO_BIT(hctx, ctx), &bm->word);
+ +	if (!test_bit(ctx->index_hw, hctx->ctx_map))
+ +		set_bit(ctx->index_hw, hctx->ctx_map);
+  }
+  
+ -static void blk_mq_hctx_clear_pending(struct blk_mq_hw_ctx *hctx,
+ -				      struct blk_mq_ctx *ctx)
+++<<<<<<< HEAD
+ +static struct request *__blk_mq_alloc_request(struct blk_mq_hw_ctx *hctx,
+ +					      gfp_t gfp, bool reserved)
+  {
+ -	struct blk_align_bitmap *bm = get_bm(hctx, ctx);
+ +	struct request *rq;
+ +	unsigned int tag;
+ +
+ +	tag = blk_mq_get_tag(hctx->tags, gfp, reserved);
+ +	if (tag != BLK_MQ_TAG_FAIL) {
+ +		rq = hctx->rqs[tag];
+ +		rq->tag = tag;
+ +
+ +		return rq;
+ +	}
+  
+ -	clear_bit(CTX_TO_BIT(hctx, ctx), &bm->word);
+ +	return NULL;
+  }
+  
+++=======
+++>>>>>>> 5dee857720db (blk-mq: initialize request in __blk_mq_alloc_request)
+  static int blk_mq_queue_enter(struct request_queue *q)
+  {
+  	int ret;
+@@@ -203,11 -275,10 +232,16 @@@ static struct request *blk_mq_alloc_req
+  		struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+  		struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
+++<<<<<<< HEAD
+ +		rq = __blk_mq_alloc_request(hctx, gfp & ~__GFP_WAIT, reserved);
+ +		if (rq) {
+ +			blk_mq_rq_ctx_init(q, ctx, rq, rw);
+++=======
++ 		rq = __blk_mq_alloc_request(q, hctx, ctx, rw, gfp & ~__GFP_WAIT,
++ 						reserved);
++ 		if (rq)
+++>>>>>>> 5dee857720db (blk-mq: initialize request in __blk_mq_alloc_request)
+  			break;
+- 		}
+  
+  		if (gfp & __GFP_WAIT) {
+  			__blk_mq_run_hw_queue(hctx);
+@@@ -858,15 -1126,153 +892,91 @@@ static void blk_mq_bio_to_request(struc
+  	blk_account_io_start(rq, 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool blk_mq_merge_queue_io(struct blk_mq_hw_ctx *hctx,
++ 					 struct blk_mq_ctx *ctx,
++ 					 struct request *rq, struct bio *bio)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 
++ 	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE)) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		spin_lock(&ctx->lock);
++ insert_rq:
++ 		__blk_mq_insert_request(hctx, rq, false);
++ 		spin_unlock(&ctx->lock);
++ 		return false;
++ 	} else {
++ 		spin_lock(&ctx->lock);
++ 		if (!blk_mq_attempt_merge(q, ctx, bio)) {
++ 			blk_mq_bio_to_request(rq, bio);
++ 			goto insert_rq;
++ 		}
++ 
++ 		spin_unlock(&ctx->lock);
++ 		__blk_mq_free_request(hctx, ctx, rq);
++ 		return true;
++ 	}
++ }
++ 
++ struct blk_map_ctx {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct blk_mq_ctx *ctx;
++ };
++ 
++ static struct request *blk_mq_map_request(struct request_queue *q,
++ 					  struct bio *bio,
++ 					  struct blk_map_ctx *data)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct blk_mq_ctx *ctx;
++ 	struct request *rq;
++ 	int rw = bio_data_dir(bio);
++ 
++ 	if (unlikely(blk_mq_queue_enter(q))) {
++ 		bio_endio(bio, -EIO);
++ 		return NULL;
++ 	}
++ 
++ 	ctx = blk_mq_get_ctx(q);
++ 	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++ 
++ 	if (rw_is_sync(bio->bi_rw))
++ 		rw |= REQ_SYNC;
++ 
++ 	trace_block_getrq(q, bio, rw);
++ 	rq = __blk_mq_alloc_request(q, hctx, ctx, rw, GFP_ATOMIC, false);
++ 	if (unlikely(!rq)) {
++ 		blk_mq_put_ctx(ctx);
++ 		trace_block_sleeprq(q, bio, rw);
++ 		rq = blk_mq_alloc_request_pinned(q, rw, __GFP_WAIT|GFP_ATOMIC,
++ 							false);
++ 		ctx = rq->mq_ctx;
++ 		hctx = q->mq_ops->map_queue(q, ctx->cpu);
++ 	}
++ 
++ 	hctx->queued++;
++ 	data->hctx = hctx;
++ 	data->ctx = ctx;
++ 	return rq;
++ }
++ 
++ /*
++  * Multiple hardware queue variant. This will not use per-process plugs,
++  * but will attempt to bypass the hctx queueing if we can go straight to
++  * hardware for SYNC IO.
++  */
+++>>>>>>> 5dee857720db (blk-mq: initialize request in __blk_mq_alloc_request)
+  static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+  	const int is_sync = rw_is_sync(bio->bi_rw);
+  	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ -	struct blk_map_ctx data;
+ +	int rw = bio_data_dir(bio);
+  	struct request *rq;
+ -
+ -	blk_queue_bounce(q, &bio);
+ -
+ -	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_endio(bio, -EIO);
+ -		return;
+ -	}
+ -
+ -	rq = blk_mq_map_request(q, bio, &data);
+ -	if (unlikely(!rq))
+ -		return;
+ -
+ -	if (unlikely(is_flush_fua)) {
+ -		blk_mq_bio_to_request(rq, bio);
+ -		blk_insert_flush(rq);
+ -		goto run_queue;
+ -	}
+ -
+ -	if (is_sync) {
+ -		int ret;
+ -
+ -		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_start_request(rq, true);
+ -
+ -		/*
+ -		 * For OK queue, we are done. For error, kill it. Any other
+ -		 * error (busy), just add it to our list as we previously
+ -		 * would have done
+ -		 */
+ -		ret = q->mq_ops->queue_rq(data.hctx, rq);
+ -		if (ret == BLK_MQ_RQ_QUEUE_OK)
+ -			goto done;
+ -		else {
+ -			__blk_mq_requeue_request(rq);
+ -
+ -			if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
+ -				rq->errors = -EIO;
+ -				blk_mq_end_io(rq, rq->errors);
+ -				goto done;
+ -			}
+ -		}
+ -	}
+ -
+ -	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ -		/*
+ -		 * For a SYNC request, send it to the hardware immediately. For
+ -		 * an ASYNC request, just ensure that we run it later on. The
+ -		 * latter allows for merging opportunities and more efficient
+ -		 * dispatching.
+ -		 */
+ -run_queue:
+ -		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ -	}
+ -done:
+ -	blk_mq_put_ctx(data.ctx);
+ -}
+ -
+ -/*
+ - * Single hardware queue variant. This will attempt to use any per-process
+ - * plug for merging and IO deferral.
+ - */
+ -static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ -{
+ -	const int is_sync = rw_is_sync(bio->bi_rw);
+ -	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	unsigned int use_plug, request_count = 0;
+ -	struct blk_map_ctx data;
+ -	struct request *rq;
+  
+  	/*
+  	 * If we have multiple hardware queues, just go directly to
+* Unmerged path block/blk-mq.c
