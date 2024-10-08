@@ -1,0 +1,233 @@
+drm/i915/skl: Don't try to update plane watermarks if they haven't changed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915/skl: Don't try to update plane watermarks if they haven't changed (Lyude Paul) [1341633 1355776]
+Rebuild_FUZZ: 97.22%
+commit-author Lyude <cpaul@redhat.com>
+commit ccebc23b57c313229526dc76383ce82f5e0b9001
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ccebc23b.failed
+
+i915 sometimes needs to disable planes in the middle of an atomic
+commit, and then reenable them later in the same commit. Because of
+this, we can't make the assumption that the state of the plane actually
+changed. Since the state of the plane hasn't actually changed, neither
+have it's watermarks. And if the watermarks hasn't changed then we
+haven't populated skl_results with anything, which means we'll end up
+zeroing out a plane's watermarks in the middle of the atomic commit
+without restoring them later.
+
+Simple reproduction recipe:
+ - Get a SKL laptop, launch any kind of X session
+ - Get two extra monitors
+ - Keep hotplugging both displays (so that the display configuration
+   jumps from 1 active pipe to 3 active pipes and back)
+ - Eventually underrun
+
+Changes since v1:
+ - Fix incorrect use of "it's"
+Changes since v2:
+ - Add reproduction recipe
+
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Fixes: 62e0fb880123 ("drm/i915/skl: Update plane watermarks atomically during plane updates")
+	Signed-off-by: Lyude <cpaul@redhat.com>
+Testcase: kms_plane
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1472488288-27280-1-git-send-email-cpaul@redhat.com
+	Cc: drm-intel-fixes@lists.freedesktop.org
+(cherry picked from commit ccebc23b57c313229526dc76383ce82f5e0b9001)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_sprite.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 0caacf8c3858,2e7923d80f21..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -2994,36 -3335,128 +2994,45 @@@ static void skylake_update_primary_plan
+  	case DRM_FORMAT_MOD_NONE:
+  		break;
+  	case I915_FORMAT_MOD_X_TILED:
+ -		return PLANE_CTL_TILED_X;
+ +		plane_ctl |= PLANE_CTL_TILED_X;
+ +		break;
+  	case I915_FORMAT_MOD_Y_TILED:
+ -		return PLANE_CTL_TILED_Y;
+ +		plane_ctl |= PLANE_CTL_TILED_Y;
+ +		break;
+  	case I915_FORMAT_MOD_Yf_TILED:
+ -		return PLANE_CTL_TILED_YF;
+ -	default:
+ -		MISSING_CASE(fb_modifier);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -u32 skl_plane_ctl_rotation(unsigned int rotation)
+ -{
+ -	switch (rotation) {
+ -	case DRM_ROTATE_0:
+ +		plane_ctl |= PLANE_CTL_TILED_YF;
+  		break;
+ -	/*
+ -	 * DRM_ROTATE_ is counter clockwise to stay compatible with Xrandr
+ -	 * while i915 HW rotation is clockwise, thats why this swapping.
+ -	 */
+ -	case DRM_ROTATE_90:
+ -		return PLANE_CTL_ROTATE_270;
+ -	case DRM_ROTATE_180:
+ -		return PLANE_CTL_ROTATE_180;
+ -	case DRM_ROTATE_270:
+ -		return PLANE_CTL_ROTATE_90;
+  	default:
+ -		MISSING_CASE(rotation);
+ +		MISSING_CASE(fb->modifier[0]);
+  	}
+  
+ -	return 0;
+ -}
+ -
+ -static void skylake_update_primary_plane(struct drm_plane *plane,
+ -					 const struct intel_crtc_state *crtc_state,
+ -					 const struct intel_plane_state *plane_state)
+ -{
+ -	struct drm_device *dev = plane->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct intel_crtc *intel_crtc = to_intel_crtc(crtc_state->base.crtc);
+ -	struct drm_framebuffer *fb = plane_state->base.fb;
+ -	const struct skl_wm_values *wm = &dev_priv->wm.skl_results;
+ -	int pipe = intel_crtc->pipe;
+ -	u32 plane_ctl;
+ -	unsigned int rotation = plane_state->base.rotation;
+ -	u32 stride = skl_plane_stride(fb, 0, rotation);
+ -	u32 surf_addr = plane_state->main.offset;
+ -	int scaler_id = plane_state->scaler_id;
+ -	int src_x = plane_state->main.x;
+ -	int src_y = plane_state->main.y;
+ -	int src_w = drm_rect_width(&plane_state->base.src) >> 16;
+ -	int src_h = drm_rect_height(&plane_state->base.src) >> 16;
+ -	int dst_x = plane_state->base.dst.x1;
+ -	int dst_y = plane_state->base.dst.y1;
+ -	int dst_w = drm_rect_width(&plane_state->base.dst);
+ -	int dst_h = drm_rect_height(&plane_state->base.dst);
+ -
+ -	plane_ctl = PLANE_CTL_ENABLE |
+ -		    PLANE_CTL_PIPE_GAMMA_ENABLE |
+ -		    PLANE_CTL_PIPE_CSC_ENABLE;
+ -
+ -	plane_ctl |= skl_plane_ctl_format(fb->pixel_format);
+ -	plane_ctl |= skl_plane_ctl_tiling(fb->modifier[0]);
+  	plane_ctl |= PLANE_CTL_PLANE_GAMMA_DISABLE;
+ -	plane_ctl |= skl_plane_ctl_rotation(rotation);
+ -
+ -	/* Sizes are 0 based */
+ -	src_w--;
+ -	src_h--;
+ -	dst_w--;
+ -	dst_h--;
+ -
+ -	intel_crtc->adjusted_x = src_x;
+ -	intel_crtc->adjusted_y = src_y;
+ +	if (crtc->primary->state->rotation == BIT(DRM_ROTATE_180))
+ +		plane_ctl |= PLANE_CTL_ROTATE_180;
+  
+ -	if (wm->dirty_pipes & drm_crtc_mask(&intel_crtc->base))
+ -		skl_write_plane_wm(intel_crtc, wm, 0);
+ +	obj = intel_fb_obj(fb);
+ +	stride_div = intel_fb_stride_alignment(dev, fb->modifier[0],
+ +					       fb->pixel_format);
+ +	surf_addr = intel_plane_obj_offset(to_intel_plane(crtc->primary), obj);
+  
+++<<<<<<< HEAD
+  	I915_WRITE(PLANE_CTL(pipe, 0), plane_ctl);
+ -	I915_WRITE(PLANE_OFFSET(pipe, 0), (src_y << 16) | src_x);
+ -	I915_WRITE(PLANE_STRIDE(pipe, 0), stride);
+ -	I915_WRITE(PLANE_SIZE(pipe, 0), (src_h << 16) | src_w);
+ -
+ -	if (scaler_id >= 0) {
+ -		uint32_t ps_ctrl = 0;
+ -
+ -		WARN_ON(!dst_w || !dst_h);
+ -		ps_ctrl = PS_SCALER_EN | PS_PLANE_SEL(0) |
+ -			crtc_state->scaler_state.scalers[scaler_id].mode;
+ -		I915_WRITE(SKL_PS_CTRL(pipe, scaler_id), ps_ctrl);
+ -		I915_WRITE(SKL_PS_PWR_GATE(pipe, scaler_id), 0);
+ -		I915_WRITE(SKL_PS_WIN_POS(pipe, scaler_id), (dst_x << 16) | dst_y);
+ -		I915_WRITE(SKL_PS_WIN_SZ(pipe, scaler_id), (dst_w << 16) | dst_h);
+ -		I915_WRITE(PLANE_POS(pipe, 0), 0);
+ -	} else {
+ -		I915_WRITE(PLANE_POS(pipe, 0), (dst_y << 16) | dst_x);
+ -	}
+ -
+ -	I915_WRITE(PLANE_SURF(pipe, 0),
+ -		   intel_fb_gtt_offset(fb, rotation) + surf_addr);
+ -
+ -	POSTING_READ(PLANE_SURF(pipe, 0));
+ -}
+ -
+ -static void skylake_disable_primary_plane(struct drm_plane *primary,
+ -					  struct drm_crtc *crtc)
+ -{
+ -	struct drm_device *dev = crtc->dev;
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ -	int pipe = intel_crtc->pipe;
+ -
+ +	I915_WRITE(PLANE_POS(pipe, 0), 0);
+ +	I915_WRITE(PLANE_OFFSET(pipe, 0), (y << 16) | x);
+ +	I915_WRITE(PLANE_SIZE(pipe, 0),
+ +		   (intel_crtc->config->pipe_src_h - 1) << 16 |
+ +		   (intel_crtc->config->pipe_src_w - 1));
+ +	I915_WRITE(PLANE_STRIDE(pipe, 0), fb->pitches[0] / stride_div);
+ +	I915_WRITE(PLANE_SURF(pipe, 0), surf_addr);
+++=======
++ 	/*
++ 	 * We only populate skl_results on watermark updates, and if the
++ 	 * plane's visiblity isn't actually changing neither is its watermarks.
++ 	 */
++ 	if (!crtc->primary->state->visible)
++ 		skl_write_plane_wm(intel_crtc, &dev_priv->wm.skl_results, 0);
+++>>>>>>> ccebc23b57c3 (drm/i915/skl: Don't try to update plane watermarks if they haven't changed)
+  
+ -	I915_WRITE(PLANE_CTL(pipe, 0), 0);
+ -	I915_WRITE(PLANE_SURF(pipe, 0), 0);
+  	POSTING_READ(PLANE_SURF(pipe, 0));
+  }
+  
+diff --cc drivers/gpu/drm/i915/intel_sprite.c
+index a4c0a04b5044,73a521fdf1bd..000000000000
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@@ -301,13 -292,18 +301,24 @@@ skl_disable_plane(struct drm_plane *drm
+  	const int pipe = intel_plane->pipe;
+  	const int plane = intel_plane->plane + 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * We only populate skl_results on watermark updates, and if the
++ 	 * plane's visiblity isn't actually changing neither is its watermarks.
++ 	 */
++ 	if (!dplane->state->visible)
++ 		skl_write_plane_wm(to_intel_crtc(crtc),
++ 				   &dev_priv->wm.skl_results, plane);
++ 
+++>>>>>>> ccebc23b57c3 (drm/i915/skl: Don't try to update plane watermarks if they haven't changed)
+  	I915_WRITE(PLANE_CTL(pipe, plane), 0);
+  
+ +	/* Activate double buffered register update */
+  	I915_WRITE(PLANE_SURF(pipe, plane), 0);
+  	POSTING_READ(PLANE_SURF(pipe, plane));
+ +
+ +	intel_update_sprite_watermarks(drm_plane, crtc, 0, 0, 0, false, false);
+  }
+  
+  static void
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_sprite.c
