@@ -1,0 +1,113 @@
+drm/fb_helper: move deferred fb checking into restore mode (v2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] fb_helper: move deferred fb checking into restore mode (Rob Clark) [1173317]
+Rebuild_FUZZ: 92.31%
+commit-author Dave Airlie <airlied@redhat.com>
+commit e2809c7db818df6bbd0edf843e1beb2fbc9d8541
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e2809c7d.failed
+
+On MST systems the monitors don't appear when we set the fb up,
+but plymouth opens the drm device and holds it open while they
+come up, when plymouth finishes and lastclose gets called we
+don't do the delayed fb probe, so the monitor never appears on the
+console.
+
+Fix this by moving the delayed checking into the mode restore.
+
+v2: Daniel suggested that ->delayed_hotplug is set under
+the mode_config mutex, so we should check it under that as
+well, while we are in the area.
+
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit e2809c7db818df6bbd0edf843e1beb2fbc9d8541)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/drm_fb_helper.c
+diff --cc drivers/gpu/drm/drm_fb_helper.c
+index b09738b19fc1,a467460f2aa6..000000000000
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@@ -366,7 -319,49 +366,53 @@@ bool drm_fb_helper_restore_fbdev_mode(s
+  	}
+  	return error;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(drm_fb_helper_restore_fbdev_mode);
+++=======
++ /**
++  * drm_fb_helper_restore_fbdev_mode - restore fbdev configuration
++  * @fb_helper: fbcon to restore
++  *
++  * This should be called from driver's drm ->lastclose callback
++  * when implementing an fbcon on top of kms using this helper. This ensures that
++  * the user isn't greeted with a black screen when e.g. X dies.
++  *
++  * Use this variant if you need to bypass locking (panic), or already
++  * hold all modeset locks.  Otherwise use drm_fb_helper_restore_fbdev_mode_unlocked()
++  */
++ static bool drm_fb_helper_restore_fbdev_mode(struct drm_fb_helper *fb_helper)
++ {
++ 	return restore_fbdev_mode(fb_helper);
++ }
++ 
++ /**
++  * drm_fb_helper_restore_fbdev_mode_unlocked - restore fbdev configuration
++  * @fb_helper: fbcon to restore
++  *
++  * This should be called from driver's drm ->lastclose callback
++  * when implementing an fbcon on top of kms using this helper. This ensures that
++  * the user isn't greeted with a black screen when e.g. X dies.
++  */
++ bool drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper)
++ {
++ 	struct drm_device *dev = fb_helper->dev;
++ 	bool ret;
++ 	bool do_delayed = false;
++ 
++ 	drm_modeset_lock_all(dev);
++ 	ret = restore_fbdev_mode(fb_helper);
++ 
++ 	do_delayed = fb_helper->delayed_hotplug;
++ 	if (do_delayed)
++ 		fb_helper->delayed_hotplug = false;
++ 	drm_modeset_unlock_all(dev);
++ 
++ 	if (do_delayed)
++ 		drm_fb_helper_hotplug_event(fb_helper);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(drm_fb_helper_restore_fbdev_mode_unlocked);
+++>>>>>>> e2809c7db818 (drm/fb_helper: move deferred fb checking into restore mode (v2))
+  
+  /*
+   * restore fbcon display for all kms driver's using this helper, used for sysrq
+@@@ -868,20 -895,8 +914,16 @@@ int drm_fb_helper_set_par(struct fb_inf
+  		return -EINVAL;
+  	}
+  
+ -	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
+ +	drm_modeset_lock_all(dev);
+ +	for (i = 0; i < fb_helper->crtc_count; i++) {
+ +		ret = drm_mode_set_config_internal(&fb_helper->crtc_info[i].mode_set);
+ +		if (ret) {
+ +			drm_modeset_unlock_all(dev);
+ +			return ret;
+ +		}
+ +	}
+ +	drm_modeset_unlock_all(dev);
+  
+- 	if (fb_helper->delayed_hotplug) {
+- 		fb_helper->delayed_hotplug = false;
+- 		drm_fb_helper_hotplug_event(fb_helper);
+- 	}
+  	return 0;
+  }
+  EXPORT_SYMBOL(drm_fb_helper_set_par);
+* Unmerged path drivers/gpu/drm/drm_fb_helper.c
