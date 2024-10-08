@@ -1,0 +1,247 @@
+iommu/amd: Support IOMMU_DOMAIN_DMA type allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [iommu] amd: Support IOMMU_DOMAIN_DMA type allocation (Myron Stowe) [1050021]
+Rebuild_FUZZ: 93.75%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 0bb6e243d7fbb39fced5bd4a4c83eb49c6e820ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0bb6e243.failed
+
+This enables allocation of DMA-API default domains from the
+IOMMU core and switches allocation of domain dma-api domain
+to the IOMMU core too.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 0bb6e243d7fbb39fced5bd4a4c83eb49c6e820ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 5607b3ae03af,27300aece203..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -2370,100 -2251,30 +2297,120 @@@ static void detach_device(struct devic
+  	dev_data->ats.enabled = false;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Find out the protection domain structure for a given PCI device. This
+ + * will give us the pointer to the page table root for example.
+ + */
+ +static struct protection_domain *domain_for_device(struct device *dev)
+ +{
+ +	struct iommu_dev_data *dev_data;
+ +	struct protection_domain *dom = NULL;
+ +	unsigned long flags;
+ +
+ +	dev_data   = get_dev_data(dev);
+ +
+ +	if (dev_data->domain)
+ +		return dev_data->domain;
+ +
+ +	if (dev_data->alias_data != NULL) {
+ +		struct iommu_dev_data *alias_data = dev_data->alias_data;
+ +
+ +		read_lock_irqsave(&amd_iommu_devtable_lock, flags);
+ +		if (alias_data->domain != NULL) {
+ +			__attach_device(dev_data, alias_data->domain);
+ +			dom = alias_data->domain;
+ +		}
+ +		read_unlock_irqrestore(&amd_iommu_devtable_lock, flags);
+ +	}
+ +
+ +	return dom;
+ +}
+ +
+ +static int device_change_notifier(struct notifier_block *nb,
+ +				  unsigned long action, void *data)
+ +{
+ +	struct dma_ops_domain *dma_domain;
+ +	struct protection_domain *domain;
+ +	struct iommu_dev_data *dev_data;
+ +	struct device *dev = data;
+++=======
++ static int amd_iommu_add_device(struct device *dev)
++ {
+++>>>>>>> 0bb6e243d7fb (iommu/amd: Support IOMMU_DOMAIN_DMA type allocation)
+  	struct amd_iommu *iommu;
+- 	unsigned long flags;
+  	u16 devid;
+ -	int ret;
+  
+ -	if (!check_device(dev) || get_dev_data(dev))
+ +	if (!check_device(dev))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	devid    = get_device_id(dev);
+ +	iommu    = amd_iommu_rlookup_table[devid];
+ +	dev_data = get_dev_data(dev);
+ +
+ +	switch (action) {
+ +	case BUS_NOTIFY_ADD_DEVICE:
+ +
+ +		iommu_init_device(dev);
+ +		init_iommu_group(dev);
+ +
+ +		/*
+ +		 * dev_data is still NULL and
+ +		 * got initialized in iommu_init_device
+ +		 */
+ +		dev_data = get_dev_data(dev);
+ +
+ +		if (iommu_pass_through || dev_data->iommu_v2) {
+ +			dev_data->passthrough = true;
+ +			attach_device(dev, pt_domain);
+ +			break;
+ +		}
+ +
+ +		domain = domain_for_device(dev);
+ +
+ +		/* allocate a protection domain if a device is added */
+ +		dma_domain = find_protection_domain(devid);
+ +		if (!dma_domain) {
+ +			dma_domain = dma_ops_domain_alloc();
+ +			if (!dma_domain)
+ +				goto out;
+ +			dma_domain->target_dev = devid;
+ +
+ +			spin_lock_irqsave(&iommu_pd_list_lock, flags);
+ +			list_add_tail(&dma_domain->list, &iommu_pd_list);
+ +			spin_unlock_irqrestore(&iommu_pd_list_lock, flags);
+ +		}
+ +
+ +		dev->archdata.dma_ops = &amd_iommu_dma_ops;
+ +
+ +		break;
+ +	case BUS_NOTIFY_REMOVED_DEVICE:
+ +
+ +		iommu_uninit_device(dev);
+ +
+ +	default:
+ +		goto out;
+ +	}
+ +
+++=======
++ 	devid = get_device_id(dev);
++ 	iommu = amd_iommu_rlookup_table[devid];
++ 
++ 	ret = iommu_init_device(dev);
++ 	if (ret == -ENOTSUPP) {
++ 		iommu_ignore_device(dev);
++ 		goto out;
++ 	}
++ 	init_iommu_group(dev);
++ 
++ 	dev->archdata.dma_ops = &amd_iommu_dma_ops;
++ 
++ out:
+++>>>>>>> 0bb6e243d7fb (iommu/amd: Support IOMMU_DOMAIN_DMA type allocation)
+  	iommu_completion_wait(iommu);
+  
+ +out:
+  	return 0;
+  }
+  
+@@@ -3111,29 -2864,8 +3043,13 @@@ void __init amd_iommu_init_api(void
+  
+  int __init amd_iommu_init_dma_ops(void)
+  {
+- 	struct amd_iommu *iommu;
+- 	int ret, unhandled;
+- 
+- 	/*
+- 	 * first allocate a default protection domain for every IOMMU we
+- 	 * found in the system. Devices not assigned to any other
+- 	 * protection domain will be assigned to the default one.
+- 	 */
+- 	for_each_iommu(iommu) {
+- 		iommu->default_dom = dma_ops_domain_alloc();
+- 		if (iommu->default_dom == NULL)
+- 			return -ENOMEM;
+- 		iommu->default_dom->domain.flags |= PD_DEFAULT_MASK;
+- 		ret = iommu_init_unity_mappings(iommu);
+- 		if (ret)
+- 			goto free_domains;
+- 	}
++ 	int unhandled;
+  
+ +	/*
+ +	 * Pre-allocate the protection domains for each device.
+ +	 */
+ +	prealloc_protection_domains();
+ +
+  	iommu_detected = 1;
+  	swiotlb = 0;
+  
+@@@ -3240,7 -2964,46 +3148,50 @@@ static int __init alloc_passthrough_dom
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +static int amd_iommu_domain_init(struct iommu_domain *dom)
+++=======
++ 
++ static struct iommu_domain *amd_iommu_domain_alloc(unsigned type)
++ {
++ 	struct protection_domain *pdomain;
++ 	struct dma_ops_domain *dma_domain;
++ 
++ 	switch (type) {
++ 	case IOMMU_DOMAIN_UNMANAGED:
++ 		pdomain = protection_domain_alloc();
++ 		if (!pdomain)
++ 			return NULL;
++ 
++ 		pdomain->mode    = PAGE_MODE_3_LEVEL;
++ 		pdomain->pt_root = (void *)get_zeroed_page(GFP_KERNEL);
++ 		if (!pdomain->pt_root) {
++ 			protection_domain_free(pdomain);
++ 			return NULL;
++ 		}
++ 
++ 		pdomain->domain.geometry.aperture_start = 0;
++ 		pdomain->domain.geometry.aperture_end   = ~0ULL;
++ 		pdomain->domain.geometry.force_aperture = true;
++ 
++ 		break;
++ 	case IOMMU_DOMAIN_DMA:
++ 		dma_domain = dma_ops_domain_alloc();
++ 		if (!dma_domain) {
++ 			pr_err("AMD-Vi: Failed to allocate\n");
++ 			return NULL;
++ 		}
++ 		pdomain = &dma_domain->domain;
++ 		break;
++ 	default:
++ 		return NULL;
++ 	}
++ 
++ 	return &pdomain->domain;
++ }
++ 
++ static void amd_iommu_domain_free(struct iommu_domain *dom)
+++>>>>>>> 0bb6e243d7fb (iommu/amd: Support IOMMU_DOMAIN_DMA type allocation)
+  {
+  	struct protection_domain *domain;
+  
+* Unmerged path drivers/iommu/amd_iommu.c
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index 4ad85cd8402d..1b0f6fb9eea5 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -548,9 +548,6 @@ struct amd_iommu {
+ 	/* if one, we need to send a completion wait command */
+ 	bool need_sync;
+ 
+-	/* default dma_ops domain for that IOMMU */
+-	struct dma_ops_domain *default_dom;
+-
+ 	/* IOMMU sysfs device */
+ 	struct device *iommu_dev;
+ 
