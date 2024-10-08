@@ -1,0 +1,348 @@
+blk-mq: scale depth and rq map appropriate if low on memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit a516440542afcb9647f88d12c35640baf02d07ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/a5164405.failed
+
+If we are running in a kdump environment, resources are scarce.
+For some SCSI setups with a huge set of shared tags, we run out
+of memory allocating what the drivers is asking for. So implement
+a scale back logic to reduce the tag depth for those cases, allowing
+the driver to successfully load.
+
+We should extend this to detect low memory situations, and implement
+a sane fallback for those (1 queue, 64 tags, or something like that).
+
+	Tested-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit a516440542afcb9647f88d12c35640baf02d07ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index e7914e35b358,383ea0cb1f0a..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -949,25 -1308,153 +949,167 @@@ struct blk_mq_hw_ctx *blk_mq_map_queue(
+  }
+  EXPORT_SYMBOL(blk_mq_map_queue);
+  
+ -static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ -		struct blk_mq_tags *tags, unsigned int hctx_idx)
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *reg,
+ +						   unsigned int hctx_index)
+  {
+++<<<<<<< HEAD
+ +	return kmalloc_node(sizeof(struct blk_mq_hw_ctx),
+ +				GFP_KERNEL | __GFP_ZERO, reg->numa_node);
+++=======
++ 	struct page *page;
++ 
++ 	if (tags->rqs && set->ops->exit_request) {
++ 		int i;
++ 
++ 		for (i = 0; i < tags->nr_tags; i++) {
++ 			if (!tags->rqs[i])
++ 				continue;
++ 			set->ops->exit_request(set->driver_data, tags->rqs[i],
++ 						hctx_idx, i);
++ 			tags->rqs[i] = NULL;
++ 		}
++ 	}
++ 
++ 	while (!list_empty(&tags->page_list)) {
++ 		page = list_first_entry(&tags->page_list, struct page, lru);
++ 		list_del_init(&page->lru);
++ 		__free_pages(page, page->private);
++ 	}
++ 
++ 	kfree(tags->rqs);
++ 
++ 	blk_mq_free_tags(tags);
+++>>>>>>> a516440542af (blk-mq: scale depth and rq map appropriate if low on memory)
+  }
+ +EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+  
+ -static size_t order_to_size(unsigned int order)
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *hctx,
+ +				 unsigned int hctx_index)
+  {
+ -	return (size_t)PAGE_SIZE << order;
+ +	kfree(hctx);
+  }
+ +EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+  
+++<<<<<<< HEAD
+ +static int blk_mq_hctx_notify(void *data, unsigned long action,
+ +			      unsigned int cpu)
+++=======
++ static struct blk_mq_tags *blk_mq_init_rq_map(struct blk_mq_tag_set *set,
++ 		unsigned int hctx_idx)
++ {
++ 	struct blk_mq_tags *tags;
++ 	unsigned int i, j, entries_per_page, max_order = 4;
++ 	size_t rq_size, left;
++ 
++ 	tags = blk_mq_init_tags(set->queue_depth, set->reserved_tags,
++ 				set->numa_node);
++ 	if (!tags)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&tags->page_list);
++ 
++ 	tags->rqs = kzalloc_node(set->queue_depth * sizeof(struct request *),
++ 				 GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY,
++ 				 set->numa_node);
++ 	if (!tags->rqs) {
++ 		blk_mq_free_tags(tags);
++ 		return NULL;
++ 	}
++ 
++ 	/*
++ 	 * rq_size is the size of the request plus driver payload, rounded
++ 	 * to the cacheline size
++ 	 */
++ 	rq_size = round_up(sizeof(struct request) + set->cmd_size,
++ 				cache_line_size());
++ 	left = rq_size * set->queue_depth;
++ 
++ 	for (i = 0; i < set->queue_depth; ) {
++ 		int this_order = max_order;
++ 		struct page *page;
++ 		int to_do;
++ 		void *p;
++ 
++ 		while (left < order_to_size(this_order - 1) && this_order)
++ 			this_order--;
++ 
++ 		do {
++ 			page = alloc_pages_node(set->numa_node,
++ 				GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY,
++ 				this_order);
++ 			if (page)
++ 				break;
++ 			if (!this_order--)
++ 				break;
++ 			if (order_to_size(this_order) < rq_size)
++ 				break;
++ 		} while (1);
++ 
++ 		if (!page)
++ 			goto fail;
++ 
++ 		page->private = this_order;
++ 		list_add_tail(&page->lru, &tags->page_list);
++ 
++ 		p = page_address(page);
++ 		entries_per_page = order_to_size(this_order) / rq_size;
++ 		to_do = min(entries_per_page, set->queue_depth - i);
++ 		left -= to_do * rq_size;
++ 		for (j = 0; j < to_do; j++) {
++ 			tags->rqs[i] = p;
++ 			if (set->ops->init_request) {
++ 				if (set->ops->init_request(set->driver_data,
++ 						tags->rqs[i], hctx_idx, i,
++ 						set->numa_node)) {
++ 					tags->rqs[i] = NULL;
++ 					goto fail;
++ 				}
++ 			}
++ 
++ 			p += rq_size;
++ 			i++;
++ 		}
++ 	}
++ 
++ 	return tags;
++ 
++ fail:
++ 	blk_mq_free_rq_map(set, tags, hctx_idx);
++ 	return NULL;
++ }
++ 
++ static void blk_mq_free_bitmap(struct blk_mq_ctxmap *bitmap)
++ {
++ 	kfree(bitmap->map);
++ }
++ 
++ static int blk_mq_alloc_bitmap(struct blk_mq_ctxmap *bitmap, int node)
++ {
++ 	unsigned int bpw = 8, total, num_maps, i;
++ 
++ 	bitmap->bits_per_word = bpw;
++ 
++ 	num_maps = ALIGN(nr_cpu_ids, bpw) / bpw;
++ 	bitmap->map = kzalloc_node(num_maps * sizeof(struct blk_align_bitmap),
++ 					GFP_KERNEL, node);
++ 	if (!bitmap->map)
++ 		return -ENOMEM;
++ 
++ 	bitmap->map_size = num_maps;
++ 
++ 	total = nr_cpu_ids;
++ 	for (i = 0; i < num_maps; i++) {
++ 		bitmap->map[i].depth = min(total, bitmap->bits_per_word);
++ 		total -= bitmap->map[i].depth;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int blk_mq_hctx_cpu_offline(struct blk_mq_hw_ctx *hctx, int cpu)
+++>>>>>>> a516440542af (blk-mq: scale depth and rq map appropriate if low on memory)
+  {
+ +	struct blk_mq_hw_ctx *hctx = data;
+  	struct request_queue *q = hctx->queue;
+  	struct blk_mq_ctx *ctx;
+  	LIST_HEAD(tmp);
+@@@ -1492,6 -1940,141 +1634,144 @@@ static int __cpuinit blk_mq_queue_reini
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		set->tags[i] = blk_mq_init_rq_map(set, i);
++ 		if (!set->tags[i])
++ 			goto out_unwind;
++ 	}
++ 
++ 	return 0;
++ 
++ out_unwind:
++ 	while (--i >= 0)
++ 		blk_mq_free_rq_map(set, set->tags[i], i);
++ 
++ 	set->tags = NULL;
++ 	return -ENOMEM;
++ }
++ 
++ /*
++  * Allocate the request maps associated with this tag_set. Note that this
++  * may reduce the depth asked for, if memory is tight. set->queue_depth
++  * will be updated to reflect the allocated depth.
++  */
++ static int blk_mq_alloc_rq_maps(struct blk_mq_tag_set *set)
++ {
++ 	unsigned int depth;
++ 	int err;
++ 
++ 	depth = set->queue_depth;
++ 	do {
++ 		err = __blk_mq_alloc_rq_maps(set);
++ 		if (!err)
++ 			break;
++ 
++ 		set->queue_depth >>= 1;
++ 		if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN) {
++ 			err = -ENOMEM;
++ 			break;
++ 		}
++ 	} while (set->queue_depth);
++ 
++ 	if (!set->queue_depth || err) {
++ 		pr_err("blk-mq: failed to allocate request map\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (depth != set->queue_depth)
++ 		pr_info("blk-mq: reduced tag depth (%u -> %u)\n",
++ 						depth, set->queue_depth);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Alloc a tag set to be associated with one or more request queues.
++  * May fail with EINVAL for various error conditions. May adjust the
++  * requested depth down, if if it too large. In that case, the set
++  * value will be stored in set->queue_depth.
++  */
++ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	if (!set->nr_hw_queues)
++ 		return -EINVAL;
++ 	if (!set->queue_depth)
++ 		return -EINVAL;
++ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
++ 		return -EINVAL;
++ 
++ 	if (!set->nr_hw_queues || !set->ops->queue_rq || !set->ops->map_queue)
++ 		return -EINVAL;
++ 
++ 	if (set->queue_depth > BLK_MQ_MAX_DEPTH) {
++ 		pr_info("blk-mq: reduced tag depth to %u\n",
++ 			BLK_MQ_MAX_DEPTH);
++ 		set->queue_depth = BLK_MQ_MAX_DEPTH;
++ 	}
++ 
++ 	set->tags = kmalloc_node(set->nr_hw_queues *
++ 				 sizeof(struct blk_mq_tags *),
++ 				 GFP_KERNEL, set->numa_node);
++ 	if (!set->tags)
++ 		return -ENOMEM;
++ 
++ 	if (blk_mq_alloc_rq_maps(set))
++ 		goto enomem;
++ 
++ 	mutex_init(&set->tag_list_lock);
++ 	INIT_LIST_HEAD(&set->tag_list);
++ 
++ 	return 0;
++ enomem:
++ 	kfree(set->tags);
++ 	set->tags = NULL;
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL(blk_mq_alloc_tag_set);
++ 
++ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < set->nr_hw_queues; i++) {
++ 		if (set->tags[i])
++ 			blk_mq_free_rq_map(set, set->tags[i], i);
++ 	}
++ 
++ 	kfree(set->tags);
++ 	set->tags = NULL;
++ }
++ EXPORT_SYMBOL(blk_mq_free_tag_set);
++ 
++ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++ {
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i, ret;
++ 
++ 	if (!set || nr > set->queue_depth)
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		ret = blk_mq_tag_update_depth(hctx->tags, nr);
++ 		if (ret)
++ 			break;
++ 	}
++ 
++ 	if (!ret)
++ 		q->nr_requests = nr;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> a516440542af (blk-mq: scale depth and rq map appropriate if low on memory)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+* Unmerged path block/blk-mq.c
