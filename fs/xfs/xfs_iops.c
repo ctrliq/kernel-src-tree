@@ -59,8 +59,8 @@ xfs_initxattrs(
 	int			error = 0;
 
 	for (xattr = xattr_array; xattr->name != NULL; xattr++) {
-		error = xfs_attr_set(ip, xattr->name, xattr->value,
-				     xattr->value_len, ATTR_SECURE);
+		error = -xfs_attr_set(ip, xattr->name, xattr->value,
+				      xattr->value_len, ATTR_SECURE);
 		if (error < 0)
 			break;
 	}
@@ -80,8 +80,8 @@ xfs_init_security(
 	struct inode	*dir,
 	const struct qstr *qstr)
 {
-	return security_inode_init_security(inode, dir, qstr,
-					    &xfs_initxattrs, NULL);
+	return -security_inode_init_security(inode, dir, qstr,
+					     &xfs_initxattrs, NULL);
 }
 
 static void
