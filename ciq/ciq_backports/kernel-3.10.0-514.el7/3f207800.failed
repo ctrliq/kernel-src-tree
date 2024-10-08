@@ -1,0 +1,196 @@
+ixgbe: add VXLAN offload support for X550 devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Don Skidmore <donald.c.skidmore@intel.com>
+commit 3f207800a998fb1b0b36df251e826ee7682294f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3f207800.failed
+
+Add support VXLAN receive checksum offload in X550 hardware.
+
+	Signed-off-by: Don Skidmore <donald.c.skidmore@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 3f207800a998fb1b0b36df251e826ee7682294f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index aeecc9891f88,6aa9b96b2e10..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -48,7 -49,18 +48,8 @@@
+  #include <linux/if_bridge.h>
+  #include <linux/prefetch.h>
+  #include <scsi/fc/fc_fcoe.h>
++ #include <net/vxlan.h>
+  
+ -#ifdef CONFIG_OF
+ -#include <linux/of_net.h>
+ -#endif
+ -
+ -#ifdef CONFIG_SPARC
+ -#include <asm/idprom.h>
+ -#include <asm/prom.h>
+ -#endif
+ -
+  #include "ixgbe.h"
+  #include "ixgbe_common.h"
+  #include "ixgbe_dcb_82599.h"
+@@@ -7636,9 -7796,67 +7661,67 @@@ static int ixgbe_set_features(struct ne
+  	return 0;
+  }
+  
++ /**
++  * ixgbe_add_vxlan_port - Get notifications about VXLAN ports that come up
++  * @dev: The port's netdev
++  * @sa_family: Socket Family that VXLAN is notifiying us about
++  * @port: New UDP port number that VXLAN started listening to
++  **/
++ static void ixgbe_add_vxlan_port(struct net_device *dev, sa_family_t sa_family,
++ 				 __be16 port)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	u16 new_port = ntohs(port);
++ 
++ 	if (sa_family == AF_INET6)
++ 		return;
++ 
++ 	if (adapter->vxlan_port == new_port) {
++ 		netdev_info(dev, "Port %d already offloaded\n", new_port);
++ 		return;
++ 	}
++ 
++ 	if (adapter->vxlan_port) {
++ 		netdev_info(dev,
++ 			    "Hit Max num of UDP ports, not adding port %d\n",
++ 			    new_port);
++ 		return;
++ 	}
++ 
++ 	adapter->vxlan_port = new_port;
++ 	IXGBE_WRITE_REG(hw, IXGBE_VXLANCTRL, new_port);
++ }
++ 
++ /**
++  * ixgbe_del_vxlan_port - Get notifications about VXLAN ports that go away
++  * @dev: The port's netdev
++  * @sa_family: Socket Family that VXLAN is notifying us about
++  * @port: UDP port number that VXLAN stopped listening to
++  **/
++ static void ixgbe_del_vxlan_port(struct net_device *dev, sa_family_t sa_family,
++ 				 __be16 port)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	u16 new_port = ntohs(port);
++ 
++ 	if (sa_family == AF_INET6)
++ 		return;
++ 
++ 	if (adapter->vxlan_port != new_port) {
++ 		netdev_info(dev, "Port %d was not found, not deleting\n",
++ 			    new_port);
++ 		return;
++ 	}
++ 
++ 	adapter->vxlan_port = 0;
++ 	IXGBE_WRITE_REG(hw, IXGBE_VXLANCTRL, 0);
++ }
++ 
+  static int ixgbe_ndo_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
+  			     struct net_device *dev,
+ -			     const unsigned char *addr, u16 vid,
+ +			     const unsigned char *addr,
+  			     u16 flags)
+  {
+  	/* guarantee we can provide a unique filter for the unicast address */
+@@@ -7817,6 -8063,10 +7900,13 @@@ static const struct net_device_ops ixgb
+  	.ndo_fdb_add		= ixgbe_ndo_fdb_add,
+  	.ndo_bridge_setlink	= ixgbe_ndo_bridge_setlink,
+  	.ndo_bridge_getlink	= ixgbe_ndo_bridge_getlink,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_dfwd_add_station	= ixgbe_fwd_add,
++ 	.ndo_dfwd_del_station	= ixgbe_fwd_del,
++ 	.ndo_add_vxlan_port	= ixgbe_add_vxlan_port,
++ 	.ndo_del_vxlan_port	= ixgbe_del_vxlan_port,
+++>>>>>>> 3f207800a998 (ixgbe: add VXLAN offload support for X550 devices)
+  };
+  
+  /**
+diff --git a/drivers/net/ethernet/intel/Kconfig b/drivers/net/ethernet/intel/Kconfig
+index d89f96325489..618a5403f8e0 100644
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@ -202,6 +202,17 @@ config IXGBE
+ 	  To compile this driver as a module, choose M here. The module
+ 	  will be called ixgbe.
+ 
++config IXGBE_VXLAN
++	bool "Virtual eXtensible Local Area Network Support"
++	default n
++	depends on IXGBE && VXLAN && !(IXGBE=y && VXLAN=m)
++	---help---
++	  This allows one to create VXLAN virtual interfaces that provide
++	  Layer 2 Networks over Layer 3 Networks. VXLAN is often used
++	  to tunnel virtual network infrastructure in virtualized environments.
++	  Say Y here if you want to use Virtual eXtensible Local Area Network
++	  (VXLAN) in the driver.
++
+ config IXGBE_HWMON
+ 	bool "Intel(R) 10GbE PCI Express adapters HWMON support"
+ 	default y
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index 4ac9978176ba..9794bba8960a 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -779,6 +779,7 @@ struct ixgbe_adapter {
+ 	u32 timer_event_accumulator;
+ 	u32 vferr_refcount;
+ 	struct ixgbe_mac_addr *mac_table;
++	u16 vxlan_port;
+ 	struct kobject *info_kobj;
+ #ifdef CONFIG_IXGBE_HWMON
+ 	struct hwmon_buff *ixgbe_hwmon_buff;
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+index 96580388d0fc..8c2bc0dac4d5 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -476,6 +476,7 @@ struct ixgbe_thermal_sensor_data {
+ 
+ #define IXGBE_WUPL      0x05900
+ #define IXGBE_WUPM      0x05A00 /* wake up pkt memory 0x5A00-0x5A7C */
++#define IXGBE_VXLANCTRL	0x0000507C /* Rx filter VXLAN UDPPORT Register */
+ #define IXGBE_FHFT(_n)	(0x09000 + ((_n) * 0x100)) /* Flex host filter table */
+ #define IXGBE_FHFT_EXT(_n)	(0x09800 + ((_n) * 0x100)) /* Ext Flexible Host
+ 							    * Filter Table */
+@@ -2292,6 +2293,7 @@ enum {
+ #define IXGBE_RXD_STAT_IPCS     0x40    /* IP xsum calculated */
+ #define IXGBE_RXD_STAT_PIF      0x80    /* passed in-exact filter */
+ #define IXGBE_RXD_STAT_CRCV     0x100   /* Speculative CRC Valid */
++#define IXGBE_RXD_STAT_OUTERIPCS  0x100 /* Cloud IP xsum calculated */
+ #define IXGBE_RXD_STAT_VEXT     0x200   /* 1st VLAN found */
+ #define IXGBE_RXD_STAT_UDPV     0x400   /* Valid UDP checksum */
+ #define IXGBE_RXD_STAT_DYNINT   0x800   /* Pkt caused INT via DYNINT */
+@@ -2309,6 +2311,7 @@ enum {
+ #define IXGBE_RXD_ERR_IPE       0x80    /* IP Checksum Error */
+ #define IXGBE_RXDADV_ERR_MASK           0xfff00000 /* RDESC.ERRORS mask */
+ #define IXGBE_RXDADV_ERR_SHIFT          20         /* RDESC.ERRORS shift */
++#define IXGBE_RXDADV_ERR_OUTERIPER	0x04000000 /* CRC IP Header error */
+ #define IXGBE_RXDADV_ERR_FCEOFE         0x80000000 /* FCoEFe/IPE */
+ #define IXGBE_RXDADV_ERR_FCERR          0x00700000 /* FCERR/FDIRERR */
+ #define IXGBE_RXDADV_ERR_FDIR_LEN       0x00100000 /* FDIR Length error */
+@@ -2397,6 +2400,8 @@ enum {
+ #define IXGBE_RXDADV_PKTTYPE_UDP        0x00000200 /* UDP hdr present */
+ #define IXGBE_RXDADV_PKTTYPE_SCTP       0x00000400 /* SCTP hdr present */
+ #define IXGBE_RXDADV_PKTTYPE_NFS        0x00000800 /* NFS hdr present */
++#define IXGBE_RXDADV_PKTTYPE_VXLAN	0x00000800 /* VXLAN hdr present */
++#define IXGBE_RXDADV_PKTTYPE_TUNNEL	0x00010000 /* Tunnel type */
+ #define IXGBE_RXDADV_PKTTYPE_IPSEC_ESP  0x00001000 /* IPSec ESP */
+ #define IXGBE_RXDADV_PKTTYPE_IPSEC_AH   0x00002000 /* IPSec AH */
+ #define IXGBE_RXDADV_PKTTYPE_LINKSEC    0x00004000 /* LinkSec Encap */
