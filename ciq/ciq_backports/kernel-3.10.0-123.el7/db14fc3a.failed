@@ -1,0 +1,288 @@
+vfs: add d_walk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Miklos Szeredi <mszeredi@suse.cz>
+commit db14fc3abcd5dcc9b32ad5b9dd5b8f9e16295a39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/db14fc3a.failed
+
+This one replaces three instances open coded tree walking (have_submounts,
+select_parent, d_genocide) with a common helper.
+
+In addition to slightly reducing the kernel size, this simplifies the
+callers and makes them less bug prone.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit db14fc3abcd5dcc9b32ad5b9dd5b8f9e16295a39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 2f8b2937383a,043c5b478a77..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1117,93 -1197,46 +1184,88 @@@ EXPORT_SYMBOL(have_submounts)
+   * drop the lock and return early due to latency
+   * constraints.
+   */
+- static int select_parent(struct dentry *parent, struct list_head *dispose)
++ 
++ struct select_data {
++ 	struct dentry *start;
++ 	struct list_head dispose;
++ 	int found;
++ };
++ 
++ static enum d_walk_ret select_collect(void *_data, struct dentry *dentry)
+  {
+- 	struct dentry *this_parent;
+- 	struct list_head *next;
+- 	unsigned seq;
+- 	int found = 0;
+- 	int locked = 0;
++ 	struct select_data *data = _data;
++ 	enum d_walk_ret ret = D_WALK_CONTINUE;
+  
+- 	seq = read_seqbegin(&rename_lock);
+- again:
+- 	this_parent = parent;
+- 	spin_lock(&this_parent->d_lock);
+- repeat:
+- 	next = this_parent->d_subdirs.next;
+- resume:
+- 	while (next != &this_parent->d_subdirs) {
+- 		struct list_head *tmp = next;
+- 		struct dentry *dentry = list_entry(tmp, struct dentry, d_u.d_child);
+- 		next = tmp->next;
++ 	if (data->start == dentry)
++ 		goto out;
+  
+++<<<<<<< HEAD
+ +		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ +
+ +		/*
+ +		 * move only zero ref count dentries to the dispose list.
+ +		 *
+ +		 * Those which are presently on the shrink list, being processed
+ +		 * by shrink_dentry_list(), shouldn't be moved.  Otherwise the
+ +		 * loop in shrink_dcache_parent() might not make any progress
+ +		 * and loop forever.
+ +		 */
+ +		if (dentry->d_count) {
+ +			dentry_lru_del(dentry);
+ +		} else if (!(dentry->d_flags & DCACHE_SHRINK_LIST)) {
+ +			dentry_lru_move_list(dentry, dispose);
+ +			dentry->d_flags |= DCACHE_SHRINK_LIST;
+ +			found++;
+ +		}
+ +		/*
+ +		 * We can return to the caller if we have found some (this
+ +		 * ensures forward progress). We'll be coming back to find
+ +		 * the rest.
+ +		 */
+ +		if (found && need_resched()) {
+ +			spin_unlock(&dentry->d_lock);
+ +			goto out;
+ +		}
+ +
+ +		/*
+ +		 * Descend a level if the d_subdirs list is non-empty.
+ +		 */
+ +		if (!list_empty(&dentry->d_subdirs)) {
+ +			spin_unlock(&this_parent->d_lock);
+ +			spin_release(&dentry->d_lock.dep_map, 1, _RET_IP_);
+ +			this_parent = dentry;
+ +			spin_acquire(&this_parent->d_lock.dep_map, 0, 1, _RET_IP_);
+ +			goto repeat;
+ +		}
+ +
+ +		spin_unlock(&dentry->d_lock);
+- 	}
+++=======
+  	/*
+- 	 * All done at this level ... ascend and resume the search.
++ 	 * move only zero ref count dentries to the dispose list.
++ 	 *
++ 	 * Those which are presently on the shrink list, being processed
++ 	 * by shrink_dentry_list(), shouldn't be moved.  Otherwise the
++ 	 * loop in shrink_dcache_parent() might not make any progress
++ 	 * and loop forever.
+  	 */
+- 	if (this_parent != parent) {
+- 		struct dentry *child = this_parent;
+- 		this_parent = try_to_ascend(this_parent, locked, seq);
+- 		if (!this_parent)
+- 			goto rename_retry;
+- 		next = child->d_u.d_child.next;
+- 		goto resume;
++ 	if (dentry->d_lockref.count) {
++ 		dentry_lru_del(dentry);
++ 	} else if (!(dentry->d_flags & DCACHE_SHRINK_LIST)) {
++ 		dentry_lru_move_list(dentry, &data->dispose);
++ 		dentry->d_flags |= DCACHE_SHRINK_LIST;
++ 		data->found++;
++ 		ret = D_WALK_NORETRY;
+++>>>>>>> db14fc3abcd5 (vfs: add d_walk())
+  	}
++ 	/*
++ 	 * We can return to the caller if we have found some (this
++ 	 * ensures forward progress). We'll be coming back to find
++ 	 * the rest.
++ 	 */
++ 	if (data->found && need_resched())
++ 		ret = D_WALK_QUIT;
+  out:
+- 	spin_unlock(&this_parent->d_lock);
+- 	if (!locked && read_seqretry(&rename_lock, seq))
+- 		goto rename_retry;
+- 	if (locked)
+- 		write_sequnlock(&rename_lock);
+- 	return found;
+- 
+- rename_retry:
+- 	if (found)
+- 		return found;
+- 	if (locked)
+- 		goto again;
+- 	locked = 1;
+- 	write_seqlock(&rename_lock);
+- 	goto again;
++ 	return ret;
+  }
+  
+  /**
+@@@ -2897,98 -2955,41 +2966,105 @@@ int is_subdir(struct dentry *new_dentry
+  	return result;
+  }
+  
+- void d_genocide(struct dentry *root)
++ static enum d_walk_ret d_genocide_kill(void *data, struct dentry *dentry)
+  {
+- 	struct dentry *this_parent;
+- 	struct list_head *next;
+- 	unsigned seq;
+- 	int locked = 0;
++ 	struct dentry *root = data;
++ 	if (dentry != root) {
++ 		if (d_unhashed(dentry) || !dentry->d_inode)
++ 			return D_WALK_SKIP;
+  
+++<<<<<<< HEAD
+ +	seq = read_seqbegin(&rename_lock);
+ +again:
+ +	this_parent = root;
+ +	spin_lock(&this_parent->d_lock);
+ +repeat:
+ +	next = this_parent->d_subdirs.next;
+ +resume:
+ +	while (next != &this_parent->d_subdirs) {
+ +		struct list_head *tmp = next;
+ +		struct dentry *dentry = list_entry(tmp, struct dentry, d_u.d_child);
+ +		next = tmp->next;
+ +
+ +		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ +		if (d_unhashed(dentry) || !dentry->d_inode) {
+ +			spin_unlock(&dentry->d_lock);
+ +			continue;
+ +		}
+ +		if (!list_empty(&dentry->d_subdirs)) {
+ +			spin_unlock(&this_parent->d_lock);
+ +			spin_release(&dentry->d_lock.dep_map, 1, _RET_IP_);
+ +			this_parent = dentry;
+ +			spin_acquire(&this_parent->d_lock.dep_map, 0, 1, _RET_IP_);
+ +			goto repeat;
+ +		}
+ +		if (!(dentry->d_flags & DCACHE_GENOCIDE)) {
+ +			dentry->d_flags |= DCACHE_GENOCIDE;
+ +			dentry->d_count--;
+ +		}
+ +		spin_unlock(&dentry->d_lock);
+ +	}
+ +	if (this_parent != root) {
+ +		struct dentry *child = this_parent;
+ +		if (!(this_parent->d_flags & DCACHE_GENOCIDE)) {
+ +			this_parent->d_flags |= DCACHE_GENOCIDE;
+ +			this_parent->d_count--;
+ +		}
+ +		this_parent = try_to_ascend(this_parent, locked, seq);
+ +		if (!this_parent)
+ +			goto rename_retry;
+ +		next = child->d_u.d_child.next;
+ +		goto resume;
+ +	}
+ +	spin_unlock(&this_parent->d_lock);
+ +	if (!locked && read_seqretry(&rename_lock, seq))
+ +		goto rename_retry;
+ +	if (locked)
+ +		write_sequnlock(&rename_lock);
+ +	return;
+++=======
++ 		if (!(dentry->d_flags & DCACHE_GENOCIDE)) {
++ 			dentry->d_flags |= DCACHE_GENOCIDE;
++ 			dentry->d_lockref.count--;
++ 		}
++ 	}
++ 	return D_WALK_CONTINUE;
++ }
+++>>>>>>> db14fc3abcd5 (vfs: add d_walk())
+  
+- rename_retry:
+- 	if (locked)
+- 		goto again;
+- 	locked = 1;
+- 	write_seqlock(&rename_lock);
+- 	goto again;
++ void d_genocide(struct dentry *parent)
++ {
++ 	d_walk(parent, parent, d_genocide_kill, NULL);
+  }
+  
+ -void d_tmpfile(struct dentry *dentry, struct inode *inode)
+ +/**
+ + * find_inode_number - check for dentry with name
+ + * @dir: directory to check
+ + * @name: Name to find.
+ + *
+ + * Check whether a dentry already exists for the given name,
+ + * and return the inode number if it has an inode. Otherwise
+ + * 0 is returned.
+ + *
+ + * This routine is used to post-process directory listings for
+ + * filesystems using synthetic inode numbers, and is necessary
+ + * to keep getcwd() working.
+ + */
+ + 
+ +ino_t find_inode_number(struct dentry *dir, struct qstr *name)
+  {
+ -	inode_dec_link_count(inode);
+ -	BUG_ON(dentry->d_name.name != dentry->d_iname ||
+ -		!hlist_unhashed(&dentry->d_alias) ||
+ -		!d_unlinked(dentry));
+ -	spin_lock(&dentry->d_parent->d_lock);
+ -	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ -	dentry->d_name.len = sprintf(dentry->d_iname, "#%llu",
+ -				(unsigned long long)inode->i_ino);
+ -	spin_unlock(&dentry->d_lock);
+ -	spin_unlock(&dentry->d_parent->d_lock);
+ -	d_instantiate(dentry, inode);
+ +	struct dentry * dentry;
+ +	ino_t ino = 0;
+ +
+ +	dentry = d_hash_and_lookup(dir, name);
+ +	if (!IS_ERR_OR_NULL(dentry)) {
+ +		if (dentry->d_inode)
+ +			ino = dentry->d_inode->i_ino;
+ +		dput(dentry);
+ +	}
+ +	return ino;
+  }
+ -EXPORT_SYMBOL(d_tmpfile);
+ +EXPORT_SYMBOL(find_inode_number);
+  
+  static __initdata unsigned long dhash_entries;
+  static int __init set_dhash_entries(char *str)
+* Unmerged path fs/dcache.c
