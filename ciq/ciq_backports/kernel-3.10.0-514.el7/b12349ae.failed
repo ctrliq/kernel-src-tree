@@ -1,0 +1,291 @@
+IB/hfi1: Create a routine to set a receive side mapping rule
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit b12349ae13e13b9d07dfda4c1484f91c44c4b469
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b12349ae.failed
+
+Move the rule setting code into its own routine for improved
+searchability and reuse.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b12349ae13e13b9d07dfda4c1484f91c44c4b469)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+diff --cc drivers/staging/hfi1/chip.c
+index 689fb76865d1,b5edc3ac3c17..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -13532,55 -13424,166 +13532,187 @@@ static void init_qpmap_table(struct hfi
+  			| RCV_CTRL_RCV_BYPASS_ENABLE_SMASK);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ struct rsm_map_table {
++ 	u64 map[NUM_MAP_REGS];
++ 	unsigned int used;
++ };
++ 
++ struct rsm_rule_data {
++ 	u8 offset;
++ 	u8 pkt_type;
++ 	u32 field1_off;
++ 	u32 field2_off;
++ 	u32 index1_off;
++ 	u32 index1_width;
++ 	u32 index2_off;
++ 	u32 index2_width;
++ 	u32 mask1;
++ 	u32 value1;
++ 	u32 mask2;
++ 	u32 value2;
++ };
++ 
++ /*
++  * Return an initialized RMT map table for users to fill in.  OK if it
++  * returns NULL, indicating no table.
++  */
++ static struct rsm_map_table *alloc_rsm_map_table(struct hfi1_devdata *dd)
++ {
++ 	struct rsm_map_table *rmt;
++ 	u8 rxcontext = is_ax(dd) ? 0 : 0xff;  /* 0 is default if a0 ver. */
++ 
++ 	rmt = kmalloc(sizeof(*rmt), GFP_KERNEL);
++ 	if (rmt) {
++ 		memset(rmt->map, rxcontext, sizeof(rmt->map));
++ 		rmt->used = 0;
++ 	}
++ 
++ 	return rmt;
++ }
++ 
++ /*
++  * Write the final RMT map table to the chip and free the table.  OK if
++  * table is NULL.
++  */
++ static void complete_rsm_map_table(struct hfi1_devdata *dd,
++ 				   struct rsm_map_table *rmt)
++ {
++ 	int i;
++ 
++ 	if (rmt) {
++ 		/* write table to chip */
++ 		for (i = 0; i < NUM_MAP_REGS; i++)
++ 			write_csr(dd, RCV_RSM_MAP_TABLE + (8 * i), rmt->map[i]);
++ 
++ 		/* enable RSM */
++ 		add_rcvctrl(dd, RCV_CTRL_RCV_RSM_ENABLE_SMASK);
++ 	}
++ }
++ 
++ /*
++  * Add a receive side mapping rule.
++  */
++ static void add_rsm_rule(struct hfi1_devdata *dd, u8 rule_index,
++ 			 struct rsm_rule_data *rrd)
++ {
++ 	write_csr(dd, RCV_RSM_CFG + (8 * rule_index),
++ 		  (u64)rrd->offset << RCV_RSM_CFG_OFFSET_SHIFT |
++ 		  1ull << rule_index | /* enable bit */
++ 		  (u64)rrd->pkt_type << RCV_RSM_CFG_PACKET_TYPE_SHIFT);
++ 	write_csr(dd, RCV_RSM_SELECT + (8 * rule_index),
++ 		  (u64)rrd->field1_off << RCV_RSM_SELECT_FIELD1_OFFSET_SHIFT |
++ 		  (u64)rrd->field2_off << RCV_RSM_SELECT_FIELD2_OFFSET_SHIFT |
++ 		  (u64)rrd->index1_off << RCV_RSM_SELECT_INDEX1_OFFSET_SHIFT |
++ 		  (u64)rrd->index1_width << RCV_RSM_SELECT_INDEX1_WIDTH_SHIFT |
++ 		  (u64)rrd->index2_off << RCV_RSM_SELECT_INDEX2_OFFSET_SHIFT |
++ 		  (u64)rrd->index2_width << RCV_RSM_SELECT_INDEX2_WIDTH_SHIFT);
++ 	write_csr(dd, RCV_RSM_MATCH + (8 * rule_index),
++ 		  (u64)rrd->mask1 << RCV_RSM_MATCH_MASK1_SHIFT |
++ 		  (u64)rrd->value1 << RCV_RSM_MATCH_VALUE1_SHIFT |
++ 		  (u64)rrd->mask2 << RCV_RSM_MATCH_MASK2_SHIFT |
++ 		  (u64)rrd->value2 << RCV_RSM_MATCH_VALUE2_SHIFT);
++ }
++ 
++ /* return the number of RSM map table entries that will be used for QOS */
++ static int qos_rmt_entries(struct hfi1_devdata *dd, unsigned int *mp,
++ 			   unsigned int *np)
++ {
++ 	int i;
++ 	unsigned int m, n;
++ 	u8 max_by_vl = 0;
++ 
++ 	/* is QOS active at all? */
++ 	if (dd->n_krcv_queues <= MIN_KERNEL_KCTXTS ||
++ 	    num_vls == 1 ||
++ 	    krcvqsset <= 1)
++ 		goto no_qos;
++ 
++ 	/* determine bits for qpn */
++ 	for (i = 0; i < min_t(unsigned int, num_vls, krcvqsset); i++)
++ 		if (krcvqs[i] > max_by_vl)
++ 			max_by_vl = krcvqs[i];
++ 	if (max_by_vl > 32)
++ 		goto no_qos;
++ 	m = ilog2(__roundup_pow_of_two(max_by_vl));
++ 
++ 	/* determine bits for vl */
++ 	n = ilog2(__roundup_pow_of_two(num_vls));
++ 
++ 	/* reject if too much is used */
++ 	if ((m + n) > 7)
++ 		goto no_qos;
++ 
++ 	if (mp)
++ 		*mp = m;
++ 	if (np)
++ 		*np = n;
++ 
++ 	return 1 << (m + n);
++ 
++ no_qos:
++ 	if (mp)
++ 		*mp = 0;
++ 	if (np)
++ 		*np = 0;
++ 	return 0;
++ }
++ 
+++>>>>>>> b12349ae13e1 (IB/hfi1: Create a routine to set a receive side mapping rule):drivers/staging/rdma/hfi1/chip.c
+  /**
+   * init_qos - init RX qos
+   * @dd - device data
+ - * @rmt - RSM map table
+ + * @first_context
+ + *
+ + * This routine initializes Rule 0 and the
+ + * RSM map table to implement qos.
+   *
+ - * This routine initializes Rule 0 and the RSM map table to implement
+ - * quality of service (qos).
+ + * If all of the limit tests succeed,
+ + * qos is applied based on the array
+ + * interpretation of krcvqs where
+ + * entry 0 is VL0.
+   *
+ - * If all of the limit tests succeed, qos is applied based on the array
+ - * interpretation of krcvqs where entry 0 is VL0.
+ + * The number of vl bits (n) and the number of qpn
+ + * bits (m) are computed to feed both the RSM map table
+ + * and the single rule.
+   *
+ - * The number of vl bits (n) and the number of qpn bits (m) are computed to
+ - * feed both the RSM map table and the single rule.
+   */
+ -static void init_qos(struct hfi1_devdata *dd, struct rsm_map_table *rmt)
+ +static void init_qos(struct hfi1_devdata *dd, u32 first_ctxt)
+  {
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +	u8 max_by_vl = 0;
+++=======
++ 	struct rsm_rule_data rrd;
+++>>>>>>> b12349ae13e1 (IB/hfi1: Create a routine to set a receive side mapping rule):drivers/staging/rdma/hfi1/chip.c
+  	unsigned qpns_per_vl, ctxt, i, qpn, n = 1, m;
+ -	unsigned int rmt_entries;
+ +	u64 *rsmmap;
+  	u64 reg;
+ +	u8  rxcontext = is_ax(dd) ? 0 : 0xff;  /* 0 is default if a0 ver. */
+  
+ -	if (!rmt)
+ +	/* validate */
+ +	if (dd->n_krcv_queues <= MIN_KERNEL_KCTXTS ||
+ +	    num_vls == 1 ||
+ +	    krcvqsset <= 1)
+ +		goto bail;
+ +	for (i = 0; i < min_t(unsigned, num_vls, krcvqsset); i++)
+ +		if (krcvqs[i] > max_by_vl)
+ +			max_by_vl = krcvqs[i];
+ +	if (max_by_vl > 32)
+  		goto bail;
+ -	rmt_entries = qos_rmt_entries(dd, &m, &n);
+ -	if (rmt_entries == 0)
+ +	qpns_per_vl = __roundup_pow_of_two(max_by_vl);
+ +	/* determine bits vl */
+ +	n = ilog2(__roundup_pow_of_two(num_vls));
+ +	/* determine bits for qpn */
+ +	m = ilog2(qpns_per_vl);
+ +	if ((m + n) > 7)
+  		goto bail;
+ -	qpns_per_vl = 1 << m;
+ -
+ -	/* enough room in the map table? */
+ -	rmt_entries = 1 << (m + n);
+ -	if (rmt->used + rmt_entries >= NUM_MAP_ENTRIES)
+ +	rsmmap = kmalloc_array(NUM_MAP_REGS, sizeof(u64), GFP_KERNEL);
+ +	if (!rsmmap)
+  		goto bail;
+ -
+ -	/* add qos entries to the the RSM map table */
+ -	for (i = 0, ctxt = FIRST_KERNEL_KCTXT; i < num_vls; i++) {
+ +	memset(rsmmap, rxcontext, NUM_MAP_REGS * sizeof(u64));
+ +	/* init the local copy of the table */
+ +	for (i = 0, ctxt = first_ctxt; i < num_vls; i++) {
+  		unsigned tctxt;
+  
+  		for (qpn = 0, tctxt = ctxt;
+@@@ -13602,32 -13605,27 +13734,56 @@@
+  		}
+  		ctxt += krcvqs[i];
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +	/* flush cached copies to chip */
+ +	for (i = 0; i < NUM_MAP_REGS; i++)
+ +		write_csr(dd, RCV_RSM_MAP_TABLE + (8 * i), rsmmap[i]);
+ +	/* add rule0 */
+ +	write_csr(dd, RCV_RSM_CFG /* + (8 * 0) */,
+ +		RCV_RSM_CFG_ENABLE_OR_CHAIN_RSM0_MASK
+ +			<< RCV_RSM_CFG_ENABLE_OR_CHAIN_RSM0_SHIFT |
+ +		2ull << RCV_RSM_CFG_PACKET_TYPE_SHIFT);
+ +	write_csr(dd, RCV_RSM_SELECT /* + (8 * 0) */,
+ +		LRH_BTH_MATCH_OFFSET
+ +			<< RCV_RSM_SELECT_FIELD1_OFFSET_SHIFT |
+ +		LRH_SC_MATCH_OFFSET << RCV_RSM_SELECT_FIELD2_OFFSET_SHIFT |
+ +		LRH_SC_SELECT_OFFSET << RCV_RSM_SELECT_INDEX1_OFFSET_SHIFT |
+ +		((u64)n) << RCV_RSM_SELECT_INDEX1_WIDTH_SHIFT |
+ +		QPN_SELECT_OFFSET << RCV_RSM_SELECT_INDEX2_OFFSET_SHIFT |
+ +		((u64)m + (u64)n) << RCV_RSM_SELECT_INDEX2_WIDTH_SHIFT);
+ +	write_csr(dd, RCV_RSM_MATCH /* + (8 * 0) */,
+ +		LRH_BTH_MASK << RCV_RSM_MATCH_MASK1_SHIFT |
+ +		LRH_BTH_VALUE << RCV_RSM_MATCH_VALUE1_SHIFT |
+ +		LRH_SC_MASK << RCV_RSM_MATCH_MASK2_SHIFT |
+ +		LRH_SC_VALUE << RCV_RSM_MATCH_VALUE2_SHIFT);
+ +	/* Enable RSM */
+ +	add_rcvctrl(dd, RCV_CTRL_RCV_RSM_ENABLE_SMASK);
+ +	kfree(rsmmap);
+ +	/* map everything else to first context */
+ +	init_qpmap_table(dd, FIRST_KERNEL_KCTXT, MIN_KERNEL_KCTXTS - 1);
+++=======
++ 
++ 	rrd.offset = rmt->used;
++ 	rrd.pkt_type = 2;
++ 	rrd.field1_off = LRH_BTH_MATCH_OFFSET;
++ 	rrd.field2_off = LRH_SC_MATCH_OFFSET;
++ 	rrd.index1_off = LRH_SC_SELECT_OFFSET;
++ 	rrd.index1_width = n;
++ 	rrd.index2_off = QPN_SELECT_OFFSET;
++ 	rrd.index2_width = m + n;
++ 	rrd.mask1 = LRH_BTH_MASK;
++ 	rrd.value1 = LRH_BTH_VALUE;
++ 	rrd.mask2 = LRH_SC_MASK;
++ 	rrd.value2 = LRH_SC_VALUE;
++ 
++ 	/* add rule 0 */
++ 	add_rsm_rule(dd, 0, &rrd);
++ 
++ 	/* mark RSM map entries as used */
++ 	rmt->used += rmt_entries;
++ 	/* map everything else to the mcast/err/vl15 context */
++ 	init_qpmap_table(dd, HFI1_CTRL_CTXT, HFI1_CTRL_CTXT);
+++>>>>>>> b12349ae13e1 (IB/hfi1: Create a routine to set a receive side mapping rule):drivers/staging/rdma/hfi1/chip.c
+  	dd->qos_shift = n + 1;
+  	return;
+  bail:
+* Unmerged path drivers/staging/hfi1/chip.c
