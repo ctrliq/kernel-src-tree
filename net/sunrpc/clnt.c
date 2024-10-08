@@ -2012,6 +2012,10 @@ call_status(struct rpc_task *task)
 	case -EHOSTDOWN:
 	case -EHOSTUNREACH:
 	case -ENETUNREACH:
+		if (RPC_IS_SOFTCONN(task)) {
+			rpc_exit(task, status);
+			break;
+		}
 		/*
 		 * Delay any retries for 3 seconds, then handle as if it
 		 * were a timeout.
