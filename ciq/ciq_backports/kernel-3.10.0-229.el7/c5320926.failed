@@ -1,0 +1,151 @@
+mem-hotplug: introduce movable_node boot option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Tang Chen <tangchen@cn.fujitsu.com>
+commit c5320926e370b4cfb8f10c2169e26f960079cf67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c5320926.failed
+
+The hot-Pluggable field in SRAT specifies which memory is hotpluggable.
+As we mentioned before, if hotpluggable memory is used by the kernel, it
+cannot be hot-removed.  So memory hotplug users may want to set all
+hotpluggable memory in ZONE_MOVABLE so that the kernel won't use it.
+
+Memory hotplug users may also set a node as movable node, which has
+ZONE_MOVABLE only, so that the whole node can be hot-removed.
+
+But the kernel cannot use memory in ZONE_MOVABLE.  By doing this, the
+kernel cannot use memory in movable nodes.  This will cause NUMA
+performance down.  And other users may be unhappy.
+
+So we need a way to allow users to enable and disable this functionality.
+In this patch, we introduce movable_node boot option to allow users to
+choose to not to consume hotpluggable memory at early boot time and later
+we can set it as ZONE_MOVABLE.
+
+To achieve this, the movable_node boot option will control the memblock
+allocation direction.  That said, after memblock is ready, before SRAT is
+parsed, we should allocate memory near the kernel image as we explained in
+the previous patches.  So if movable_node boot option is set, the kernel
+does the following:
+
+1. After memblock is ready, make memblock allocate memory bottom up.
+2. After SRAT is parsed, make memblock behave as default, allocate memory
+   top down.
+
+Users can specify "movable_node" in kernel commandline to enable this
+functionality.  For those who don't use memory hotplug or who don't want
+to lose their NUMA performance, just don't specify anything.  The kernel
+will work as before.
+
+	Signed-off-by: Tang Chen <tangchen@cn.fujitsu.com>
+	Signed-off-by: Zhang Yanfei <zhangyanfei@cn.fujitsu.com>
+	Suggested-by: Kamezawa Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Suggested-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Toshi Kani <toshi.kani@hp.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+	Cc: Thomas Renninger <trenn@suse.de>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Jiang Liu <jiang.liu@huawei.com>
+	Cc: Wen Congyang <wency@cn.fujitsu.com>
+	Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+	Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Taku Izumi <izumi.taku@jp.fujitsu.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Nazarewicz <mina86@mina86.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c5320926e370b4cfb8f10c2169e26f960079cf67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index de0f05d184eb,489f235502db..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -30,6 -30,8 +30,11 @@@
+  #include <linux/mm_inline.h>
+  #include <linux/firmware-map.h>
+  #include <linux/stop_machine.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/hugetlb.h>
++ #include <linux/memblock.h>
+++>>>>>>> c5320926e370 (mem-hotplug: introduce movable_node boot option)
+  
+  #include <asm/tlbflush.h>
+  
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 2492c77b2e90..0526bbc23d99 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1742,6 +1742,9 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			that the amount of memory usable for all allocations
+ 			is not too small.
+ 
++	movable_node	[KNL,X86] Boot-time switch to enable the effects
++			of CONFIG_MOVABLE_NODE=y. See mm/Kconfig for details.
++
+ 	MTD_Partition=	[MTD]
+ 			Format: <name>,<region-number>,<size>,<offset>
+ 
+diff --git a/arch/x86/mm/numa.c b/arch/x86/mm/numa.c
+index f969de8880cb..6d332f9a0193 100644
+--- a/arch/x86/mm/numa.c
++++ b/arch/x86/mm/numa.c
+@@ -567,6 +567,17 @@ static int __init numa_init(int (*init_func)(void))
+ 	ret = init_func();
+ 	if (ret < 0)
+ 		return ret;
++
++	/*
++	 * We reset memblock back to the top-down direction
++	 * here because if we configured ACPI_NUMA, we have
++	 * parsed SRAT in init_func(). It is ok to have the
++	 * reset here even if we did't configure ACPI_NUMA
++	 * or acpi numa init fails and fallbacks to dummy
++	 * numa init.
++	 */
++	memblock_set_bottom_up(false);
++
+ 	ret = numa_cleanup_meminfo(&numa_meminfo);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 344efb638352..4053075b847a 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -153,11 +153,18 @@ config MOVABLE_NODE
+ 	help
+ 	  Allow a node to have only movable memory.  Pages used by the kernel,
+ 	  such as direct mapping pages cannot be migrated.  So the corresponding
+-	  memory device cannot be hotplugged.  This option allows users to
+-	  online all the memory of a node as movable memory so that the whole
+-	  node can be hotplugged.  Users who don't use the memory hotplug
+-	  feature are fine with this option on since they don't online memory
+-	  as movable.
++	  memory device cannot be hotplugged.  This option allows the following
++	  two things:
++	  - When the system is booting, node full of hotpluggable memory can
++	  be arranged to have only movable memory so that the whole node can
++	  be hot-removed. (need movable_node boot option specified).
++	  - After the system is up, the option allows users to online all the
++	  memory of a node as movable memory so that the whole node can be
++	  hot-removed.
++
++	  Users who don't use the memory hotplug feature are fine with this
++	  option on since they don't specify movable_node boot option or they
++	  don't online memory as movable.
+ 
+ 	  Say Y here if you want to hotplug a whole node.
+ 	  Say N here if you want kernel to use memory on all nodes evenly.
+* Unmerged path mm/memory_hotplug.c
