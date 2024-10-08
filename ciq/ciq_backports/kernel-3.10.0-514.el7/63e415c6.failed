@@ -1,0 +1,192 @@
+mmc: core: Simplify by adding mmc_execute_tuning()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] core: Simplify by adding mmc_execute_tuning() (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 94.74%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit 63e415c64003fd62a302a1dc19f082e2c6f1b7cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/63e415c6.failed
+
+For each MMC, SD and SDIO there is code that
+holds the clock, calls ops->execute_tuning, and
+releases the clock. Simplify the code a bit by
+providing a separate function to do that.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 63e415c64003fd62a302a1dc19f082e2c6f1b7cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/mmc.c
+diff --cc drivers/mmc/core/mmc.c
+index 51a18b7ab66f,1fc48a280659..000000000000
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@@ -907,6 -1121,61 +907,64 @@@ err
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Activate High Speed or HS200 mode if supported.
++  */
++ static int mmc_select_timing(struct mmc_card *card)
++ {
++ 	int err = 0;
++ 
++ 	if (!mmc_can_ext_csd(card))
++ 		goto bus_speed;
++ 
++ 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
++ 		err = mmc_select_hs200(card);
++ 	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS)
++ 		err = mmc_select_hs(card);
++ 
++ 	if (err && err != -EBADMSG)
++ 		return err;
++ 
++ 	if (err) {
++ 		pr_warn("%s: switch to %s failed\n",
++ 			mmc_card_hs(card) ? "high-speed" :
++ 			(mmc_card_hs200(card) ? "hs200" : ""),
++ 			mmc_hostname(card->host));
++ 		err = 0;
++ 	}
++ 
++ bus_speed:
++ 	/*
++ 	 * Set the bus speed to the selected bus timing.
++ 	 * If timing is not selected, backward compatible is the default.
++ 	 */
++ 	mmc_set_bus_speed(card);
++ 	return err;
++ }
++ 
++ /*
++  * Execute tuning sequence to seek the proper bus operating
++  * conditions for HS200 and HS400, which sends CMD21 to the device.
++  */
++ static int mmc_hs200_tuning(struct mmc_card *card)
++ {
++ 	struct mmc_host *host = card->host;
++ 
++ 	/*
++ 	 * Timing should be adjusted to the HS400 target
++ 	 * operation frequency for tuning process
++ 	 */
++ 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400 &&
++ 	    host->ios.bus_width == MMC_BUS_WIDTH_8)
++ 		if (host->ops->prepare_hs400_tuning)
++ 			host->ops->prepare_hs400_tuning(host, &host->ios);
++ 
++ 	return mmc_execute_tuning(card);
++ }
++ 
++ /*
+++>>>>>>> 63e415c64003 (mmc: core: Simplify by adding mmc_execute_tuning())
+   * Handle the detection and initialisation of a card.
+   *
+   * In the case of a resume, "oldcard" will contain the card
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 354690df1570..6b8a83c79780 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1076,6 +1076,30 @@ void mmc_set_ungated(struct mmc_host *host)
+ }
+ #endif
+ 
++int mmc_execute_tuning(struct mmc_card *card)
++{
++	struct mmc_host *host = card->host;
++	u32 opcode;
++	int err;
++
++	if (!host->ops->execute_tuning)
++		return 0;
++
++	if (mmc_card_mmc(card))
++		opcode = MMC_SEND_TUNING_BLOCK_HS200;
++	else
++		opcode = MMC_SEND_TUNING_BLOCK;
++
++	mmc_host_clk_hold(host);
++	err = host->ops->execute_tuning(host, opcode);
++	mmc_host_clk_release(host);
++
++	if (err)
++		pr_err("%s: tuning execution failed\n", mmc_hostname(host));
++
++	return err;
++}
++
+ /*
+  * Change the bus mode (open drain/push-pull) of a host.
+  */
+diff --git a/drivers/mmc/core/core.h b/drivers/mmc/core/core.h
+index f712f6e0bc34..953c6a2b3731 100644
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@ -84,5 +84,8 @@ void mmc_add_card_debugfs(struct mmc_card *card);
+ void mmc_remove_card_debugfs(struct mmc_card *card);
+ 
+ void mmc_init_context_info(struct mmc_host *host);
++
++int mmc_execute_tuning(struct mmc_card *card);
++
+ #endif
+ 
+* Unmerged path drivers/mmc/core/mmc.c
+diff --git a/drivers/mmc/core/sd.c b/drivers/mmc/core/sd.c
+index da5e61e128a5..13dd6f6a8935 100644
+--- a/drivers/mmc/core/sd.c
++++ b/drivers/mmc/core/sd.c
+@@ -662,15 +662,10 @@ static int mmc_sd_init_uhs_card(struct mmc_card *card)
+ 	 * SPI mode doesn't define CMD19 and tuning is only valid for SDR50 and
+ 	 * SDR104 mode SD-cards. Note that tuning is mandatory for SDR104.
+ 	 */
+-	if (!mmc_host_is_spi(card->host) && card->host->ops->execute_tuning &&
+-			(card->sd_bus_speed == UHS_SDR50_BUS_SPEED ||
+-			 card->sd_bus_speed == UHS_SDR104_BUS_SPEED)) {
+-		mmc_host_clk_hold(card->host);
+-		err = card->host->ops->execute_tuning(card->host,
+-						      MMC_SEND_TUNING_BLOCK);
+-		mmc_host_clk_release(card->host);
+-	}
+-
++	if (!mmc_host_is_spi(card->host) &&
++	    (card->sd_bus_speed == UHS_SDR50_BUS_SPEED ||
++	     card->sd_bus_speed == UHS_SDR104_BUS_SPEED))
++		err = mmc_execute_tuning(card);
+ out:
+ 	kfree(status);
+ 
+diff --git a/drivers/mmc/core/sdio.c b/drivers/mmc/core/sdio.c
+index e9a1e6e4e446..a54c5f0825e7 100644
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -567,17 +567,11 @@ static int mmc_sdio_init_uhs_card(struct mmc_card *card)
+ 	 * SPI mode doesn't define CMD19 and tuning is only valid for SDR50 and
+ 	 * SDR104 mode SD-cards. Note that tuning is mandatory for SDR104.
+ 	 */
+-	if (!mmc_host_is_spi(card->host) && card->host->ops->execute_tuning &&
+-			((card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR50) ||
+-			 (card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR104))) {
+-		mmc_host_clk_hold(card->host);
+-		err = card->host->ops->execute_tuning(card->host,
+-						      MMC_SEND_TUNING_BLOCK);
+-		mmc_host_clk_release(card->host);
+-	}
+-
++	if (!mmc_host_is_spi(card->host) &&
++	    ((card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR50) ||
++	     (card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR104)))
++		err = mmc_execute_tuning(card);
+ out:
+-
+ 	return err;
+ }
+ 
