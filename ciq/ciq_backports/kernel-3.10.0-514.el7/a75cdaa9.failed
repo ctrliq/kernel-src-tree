@@ -1,0 +1,157 @@
+sched: Set an initial value of runnable avg for new forked task
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alex Shi <alex.shi@intel.com>
+commit a75cdaa915e42ef0e6f38dc7f2a6a1deca91d648
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a75cdaa9.failed
+
+We need to initialize the se.avg.{decay_count, load_avg_contrib} for a
+new forked task. Otherwise random values of above variables cause a
+mess when a new task is enqueued:
+
+    enqueue_task_fair
+        enqueue_entity
+            enqueue_entity_load_avg
+
+and make fork balancing imbalance due to incorrect load_avg_contrib.
+
+Further more, Morten Rasmussen notice some tasks were not launched at
+once after created. So Paul and Peter suggest giving a start value for
+new task runnable avg time same as sched_slice().
+
+PeterZ said:
+
+> So the 'problem' is that our running avg is a 'floating' average; ie. it
+> decays with time. Now we have to guess about the future of our newly
+> spawned task -- something that is nigh impossible seeing these CPU
+> vendors keep refusing to implement the crystal ball instruction.
+>
+> So there's two asymptotic cases we want to deal well with; 1) the case
+> where the newly spawned program will be 'nearly' idle for its lifetime;
+> and 2) the case where its cpu-bound.
+>
+> Since we have to guess, we'll go for worst case and assume its
+> cpu-bound; now we don't want to make the avg so heavy adjusting to the
+> near-idle case takes forever. We want to be able to quickly adjust and
+> lower our running avg.
+>
+> Now we also don't want to make our avg too light, such that it gets
+> decremented just for the new task not having had a chance to run yet --
+> even if when it would run, it would be more cpu-bound than not.
+>
+> So what we do is we make the initial avg of the same duration as that we
+> guess it takes to run each task on the system at least once -- aka
+> sched_slice().
+>
+> Of course we can defeat this with wakeup/fork bombs, but in the 'normal'
+> case it should be good enough.
+
+Paul also contributed most of the code comments in this commit.
+
+	Signed-off-by: Alex Shi <alex.shi@intel.com>
+	Reviewed-by: Gu Zheng <guz.fnst@cn.fujitsu.com>
+	Reviewed-by: Paul Turner <pjt@google.com>
+[peterz; added explanation of sched_slice() usage]
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1371694737-29336-4-git-send-email-alex.shi@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a75cdaa915e42ef0e6f38dc7f2a6a1deca91d648)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index ff17e05e69cf,729e7fc7634b..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1814,15 -1611,6 +1814,18 @@@ static void __sched_fork(unsigned long 
+  	p->se.vruntime			= 0;
+  	INIT_LIST_HEAD(&p->se.group_node);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Load-tracking only depends on SMP, FAIR_GROUP_SCHED dependency below may be
+ + * removed when useful for applications beyond shares distribution (e.g.
+ + * load-balance).
+ + */
+ +#if defined(CONFIG_SMP) && defined(CONFIG_FAIR_GROUP_SCHED)
+ +	p->se.avg.runnable_avg_period = 0;
+ +	p->se.avg.runnable_avg_sum = 0;
+ +#endif
+++=======
+++>>>>>>> a75cdaa915e4 (sched: Set an initial value of runnable avg for new forked task)
+  #ifdef CONFIG_SCHEDSTATS
+  	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
+  #endif
+@@@ -1995,9 -1751,11 +1998,11 @@@ void wake_up_new_task(struct task_struc
+  	 *  - cpus_allowed can change in the fork path
+  	 *  - any previously selected cpu might disappear through hotplug
+  	 */
+ -	set_task_cpu(p, select_task_rq(p, SD_BALANCE_FORK, 0));
+ +	set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+  #endif
+  
++ 	/* Initialize new task's runnable average */
++ 	init_task_runnable_average(p);
+  	rq = __task_rq_lock(p);
+  	activate_task(rq, p, 0);
+  	p->on_rq = 1;
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3c2f426dff2b..f5cb36d664f9 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -664,6 +664,26 @@ static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	return calc_delta_fair(sched_slice(cfs_rq, se), se);
+ }
+ 
++#ifdef CONFIG_SMP
++static inline void __update_task_entity_contrib(struct sched_entity *se);
++
++/* Give new task start runnable values to heavy its load in infant time */
++void init_task_runnable_average(struct task_struct *p)
++{
++	u32 slice;
++
++	p->se.avg.decay_count = 0;
++	slice = sched_slice(task_cfs_rq(p), &p->se) >> 10;
++	p->se.avg.runnable_avg_sum = slice;
++	p->se.avg.runnable_avg_period = slice;
++	__update_task_entity_contrib(&p->se);
++}
++#else
++void init_task_runnable_average(struct task_struct *p)
++{
++}
++#endif
++
+ /*
+  * Update the current task's runtime statistics.
+  */
+@@ -2489,6 +2509,10 @@ static inline void enqueue_entity_load_avg(struct cfs_rq *cfs_rq,
+ 	 * We track migrations using entity decay_count <= 0, on a wake-up
+ 	 * migration we use a negative decay count to track the remote decays
+ 	 * accumulated while sleeping.
++	 *
++	 * Newly forked tasks are enqueued with se->avg.decay_count == 0, they
++	 * are seen by enqueue_entity_load_avg() as a migration with an already
++	 * constructed load_avg_contrib.
+ 	 */
+ 	if (unlikely(se->avg.decay_count <= 0)) {
+ 		se->avg.last_runnable_update = rq_clock_task(rq_of(cfs_rq));
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index ef38b10d3ef4..f8cdfe93bb13 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1113,6 +1113,8 @@ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime
+ 
+ extern void update_idle_cpu_load(struct rq *this_rq);
+ 
++extern void init_task_runnable_average(struct task_struct *p);
++
+ #ifdef CONFIG_PARAVIRT
+ static inline u64 steal_ticks(u64 steal)
+ {
