@@ -1,0 +1,284 @@
+md/raid6 algorithms: delta syndrome functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] raid6 algorithms: delta syndrome functions (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 96.55%
+commit-author Markus Stockhausen <stockhausen@collogia.de>
+commit fe5cbc6e06c7d8b3a86f6f5491d74766bb5c2827
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fe5cbc6e.failed
+
+v3: s-o-b comment, explanation of performance and descision for
+the start/stop implementation
+
+Implementing rmw functionality for RAID6 requires optimized syndrome
+calculation. Up to now we can only generate a complete syndrome. The
+target P/Q pages are always overwritten. With this patch we provide
+a framework for inplace P/Q modification. In the first place simply
+fill those functions with NULL values.
+
+xor_syndrome() has two additional parameters: start & stop. These
+will indicate the first and last page that are changing during a
+rmw run. That makes it possible to avoid several unneccessary loops
+and speed up calculation. The caller needs to implement the following
+logic to make the functions work.
+
+1) xor_syndrome(disks, start, stop, ...): "Remove" all data of source
+blocks inside P/Q between (and including) start and end.
+
+2) modify any block with start <= block <= stop
+
+3) xor_syndrome(disks, start, stop, ...): "Reinsert" all data of
+source blocks into P/Q between (and including) start and end.
+
+Pages between start and stop that won't be changed should be filled
+with a pointer to the kernel zero page. The reasons for not taking NULL
+pages are:
+
+1) Algorithms cross the whole source data line by line. Thus avoid
+additional branches.
+
+2) Having a NULL page avoids calculating the XOR P parity but still
+need calulation steps for the Q parity. Depending on the algorithm
+unrolling that might be only a difference of 2 instructions per loop.
+
+The benchmark numbers of the gen_syndrome() functions are displayed in
+the kernel log. Do the same for the xor_syndrome() functions. This
+will help to analyze performance problems and give an rough estimate
+how well the algorithm works. The choice of the fastest algorithm will
+still depend on the gen_syndrome() performance.
+
+With the start/stop page implementation the speed can vary a lot in real
+life. E.g. a change of page 0 & page 15 on a stripe will be harder to
+compute than the case where page 0 & page 1 are XOR candidates. To be not
+to enthusiatic about the expected speeds we will run a worse case test
+that simulates a change on the upper half of the stripe. So we do:
+
+1) calculation of P/Q for the upper pages
+
+2) continuation of Q for the lower (empty) pages
+
+	Signed-off-by: Markus Stockhausen <stockhausen@collogia.de>
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit fe5cbc6e06c7d8b3a86f6f5491d74766bb5c2827)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/raid6/algos.c
+#	lib/raid6/tilegx.uc
+diff --cc lib/raid6/algos.c
+index 74e6f5629dbc,975c6e0434bd..000000000000
+--- a/lib/raid6/algos.c
++++ b/lib/raid6/algos.c
+@@@ -150,22 -154,48 +151,56 @@@ static inline const struct raid6_calls 
+  			}
+  			preempt_enable();
+  
+- 			if (perf > bestperf) {
+- 				bestperf = perf;
++ 			if (perf > bestgenperf) {
++ 				bestgenperf = perf;
+  				best = *algo;
+  			}
+++<<<<<<< HEAD
+ +			printk("raid6: %-8s %5ld MB/s\n", (*algo)->name,
+++=======
++ 			pr_info("raid6: %-8s gen() %5ld MB/s\n", (*algo)->name,
+++>>>>>>> fe5cbc6e06c7 (md/raid6 algorithms: delta syndrome functions)
+  			       (perf*HZ) >> (20-16+RAID6_TIME_JIFFIES_LG2));
++ 
++ 			if (!(*algo)->xor_syndrome)
++ 				continue;
++ 
++ 			perf = 0;
++ 
++ 			preempt_disable();
++ 			j0 = jiffies;
++ 			while ((j1 = jiffies) == j0)
++ 				cpu_relax();
++ 			while (time_before(jiffies,
++ 					    j1 + (1<<RAID6_TIME_JIFFIES_LG2))) {
++ 				(*algo)->xor_syndrome(disks, start, stop,
++ 						      PAGE_SIZE, *dptrs);
++ 				perf++;
++ 			}
++ 			preempt_enable();
++ 
++ 			if (best == *algo)
++ 				bestxorperf = perf;
++ 
++ 			pr_info("raid6: %-8s xor() %5ld MB/s\n", (*algo)->name,
++ 				(perf*HZ) >> (20-16+RAID6_TIME_JIFFIES_LG2+1));
+  		}
+  	}
+  
+  	if (best) {
+++<<<<<<< HEAD
+ +		printk("raid6: using algorithm %s (%ld MB/s)\n",
+++=======
++ 		pr_info("raid6: using algorithm %s gen() %ld MB/s\n",
+++>>>>>>> fe5cbc6e06c7 (md/raid6 algorithms: delta syndrome functions)
+  		       best->name,
+- 		       (bestperf*HZ) >> (20-16+RAID6_TIME_JIFFIES_LG2));
++ 		       (bestgenperf*HZ) >> (20-16+RAID6_TIME_JIFFIES_LG2));
++ 		if (best->xor_syndrome)
++ 			pr_info("raid6: .... xor() %ld MB/s, rmw enabled\n",
++ 			       (bestxorperf*HZ) >> (20-16+RAID6_TIME_JIFFIES_LG2+1));
+  		raid6_call = *best;
+  	} else
+ -		pr_err("raid6: Yikes!  No algorithm found!\n");
+ +		printk("raid6: Yikes!  No algorithm found!\n");
+  
+  	return best;
+  }
+* Unmerged path lib/raid6/tilegx.uc
+diff --git a/include/linux/raid/pq.h b/include/linux/raid/pq.h
+index 0f424698064f..2c73c302c9f0 100644
+--- a/include/linux/raid/pq.h
++++ b/include/linux/raid/pq.h
+@@ -72,6 +72,7 @@ extern const char raid6_empty_zero_page[PAGE_SIZE];
+ /* Routine choices */
+ struct raid6_calls {
+ 	void (*gen_syndrome)(int, size_t, void **);
++	void (*xor_syndrome)(int, int, int, size_t, void **);
+ 	int  (*valid)(void);	/* Returns 1 if this routine set is usable */
+ 	const char *name;	/* Name of this routine set */
+ 	int prefer;		/* Has special performance attribute */
+* Unmerged path lib/raid6/algos.c
+diff --git a/lib/raid6/altivec.uc b/lib/raid6/altivec.uc
+index 7cc12b532e95..bec27fce7501 100644
+--- a/lib/raid6/altivec.uc
++++ b/lib/raid6/altivec.uc
+@@ -119,6 +119,7 @@ int raid6_have_altivec(void)
+ 
+ const struct raid6_calls raid6_altivec$# = {
+ 	raid6_altivec$#_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_altivec,
+ 	"altivecx$#",
+ 	0
+diff --git a/lib/raid6/avx2.c b/lib/raid6/avx2.c
+index bc3b1dd436eb..76734004358d 100644
+--- a/lib/raid6/avx2.c
++++ b/lib/raid6/avx2.c
+@@ -89,6 +89,7 @@ static void raid6_avx21_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_avx2x1 = {
+ 	raid6_avx21_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_avx2,
+ 	"avx2x1",
+ 	1			/* Has cache hints */
+@@ -150,6 +151,7 @@ static void raid6_avx22_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_avx2x2 = {
+ 	raid6_avx22_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_avx2,
+ 	"avx2x2",
+ 	1			/* Has cache hints */
+@@ -242,6 +244,7 @@ static void raid6_avx24_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_avx2x4 = {
+ 	raid6_avx24_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_avx2,
+ 	"avx2x4",
+ 	1			/* Has cache hints */
+diff --git a/lib/raid6/int.uc b/lib/raid6/int.uc
+index 5b50f8dfc5d2..5ca60bee1388 100644
+--- a/lib/raid6/int.uc
++++ b/lib/raid6/int.uc
+@@ -109,7 +109,8 @@ static void raid6_int$#_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_intx$# = {
+ 	raid6_int$#_gen_syndrome,
+-	NULL,		/* always valid */
++	NULL,			/* XOR not yet implemented */
++	NULL,			/* always valid */
+ 	"int" NSTRING "x$#",
+ 	0
+ };
+diff --git a/lib/raid6/mmx.c b/lib/raid6/mmx.c
+index 590c71c9e200..b3b0e1fcd3af 100644
+--- a/lib/raid6/mmx.c
++++ b/lib/raid6/mmx.c
+@@ -76,6 +76,7 @@ static void raid6_mmx1_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_mmxx1 = {
+ 	raid6_mmx1_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_mmx,
+ 	"mmxx1",
+ 	0
+@@ -134,6 +135,7 @@ static void raid6_mmx2_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_mmxx2 = {
+ 	raid6_mmx2_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_mmx,
+ 	"mmxx2",
+ 	0
+diff --git a/lib/raid6/neon.c b/lib/raid6/neon.c
+index 36ad4705df1a..d9ad6ee284f4 100644
+--- a/lib/raid6/neon.c
++++ b/lib/raid6/neon.c
+@@ -42,6 +42,7 @@
+ 	}								\
+ 	struct raid6_calls const raid6_neonx ## _n = {			\
+ 		raid6_neon ## _n ## _gen_syndrome,			\
++		NULL,		/* XOR not yet implemented */		\
+ 		raid6_have_neon,					\
+ 		"neonx" #_n,						\
+ 		0							\
+diff --git a/lib/raid6/sse1.c b/lib/raid6/sse1.c
+index f76297139445..9025b8ca9aa3 100644
+--- a/lib/raid6/sse1.c
++++ b/lib/raid6/sse1.c
+@@ -92,6 +92,7 @@ static void raid6_sse11_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_sse1x1 = {
+ 	raid6_sse11_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_sse1_or_mmxext,
+ 	"sse1x1",
+ 	1			/* Has cache hints */
+@@ -154,6 +155,7 @@ static void raid6_sse12_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_sse1x2 = {
+ 	raid6_sse12_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_sse1_or_mmxext,
+ 	"sse1x2",
+ 	1			/* Has cache hints */
+diff --git a/lib/raid6/sse2.c b/lib/raid6/sse2.c
+index 85b82c85f28e..31acd59a0ef7 100644
+--- a/lib/raid6/sse2.c
++++ b/lib/raid6/sse2.c
+@@ -90,6 +90,7 @@ static void raid6_sse21_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_sse2x1 = {
+ 	raid6_sse21_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_sse2,
+ 	"sse2x1",
+ 	1			/* Has cache hints */
+@@ -152,6 +153,7 @@ static void raid6_sse22_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_sse2x2 = {
+ 	raid6_sse22_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_sse2,
+ 	"sse2x2",
+ 	1			/* Has cache hints */
+@@ -250,6 +252,7 @@ static void raid6_sse24_gen_syndrome(int disks, size_t bytes, void **ptrs)
+ 
+ const struct raid6_calls raid6_sse2x4 = {
+ 	raid6_sse24_gen_syndrome,
++	NULL,			/* XOR not yet implemented */
+ 	raid6_have_sse2,
+ 	"sse2x4",
+ 	1			/* Has cache hints */
+* Unmerged path lib/raid6/tilegx.uc
