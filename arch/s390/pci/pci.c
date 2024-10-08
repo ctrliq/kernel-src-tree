@@ -564,8 +564,6 @@ static void zpci_map_resources(struct zpci_dev *zdev)
 			continue;
 		pdev->resource[i].start = (resource_size_t) pci_iomap(pdev, i, 0);
 		pdev->resource[i].end = pdev->resource[i].start + len - 1;
-		pr_debug("BAR%i: -> start: %Lx  end: %Lx\n",
-			i, pdev->resource[i].start, pdev->resource[i].end);
 	}
 }
 
@@ -608,32 +606,6 @@ void zpci_free_device(struct zpci_dev *zdev)
 {
 	kmem_cache_free(zdev_irq_cache, zdev->irq_map);
 	kfree(zdev);
-}
-
-/*
- * Too late for any s390 specific setup, since interrupts must be set up
- * already which requires DMA setup too and the pci scan will access the
- * config space, which only works if the function handle is enabled.
- */
-int pcibios_enable_device(struct pci_dev *pdev, int mask)
-{
-	struct resource *res;
-	u16 cmd;
-	int i;
-
-	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
-
-	for (i = 0; i < PCI_BAR_COUNT; i++) {
-		res = &pdev->resource[i];
-
-		if (res->flags & IORESOURCE_IO)
-			return -EINVAL;
-
-		if (res->flags & IORESOURCE_MEM)
-			cmd |= PCI_COMMAND_MEMORY;
-	}
-	pci_write_config_word(pdev, PCI_COMMAND, cmd);
-	return 0;
 }
 
 int pcibios_add_platform_entries(struct pci_dev *pdev)
@@ -801,16 +773,49 @@ static void zpci_free_iomap(struct zpci_dev *zdev, int entry)
 int pcibios_add_device(struct pci_dev *pdev)
 {
 	struct zpci_dev *zdev = get_zdev(pdev);
+	struct resource *res;
+	int i;
+
+	zdev->pdev = pdev;
+	zpci_map_resources(zdev);
+
+	for (i = 0; i < PCI_BAR_COUNT; i++) {
+		res = &pdev->resource[i];
+		if (res->parent || !res->flags)
+			continue;
+		pci_claim_resource(pdev, i);
+	}
+
+	return 0;
+}
+
+int pcibios_enable_device(struct pci_dev *pdev, int mask)
+{
+	struct zpci_dev *zdev = get_zdev(pdev);
+	struct resource *res;
+	u16 cmd;
+	int i;
 
 	zdev->pdev = pdev;
 	zpci_debug_init_device(zdev);
 	zpci_fmb_enable_device(zdev);
 	zpci_map_resources(zdev);
 
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	for (i = 0; i < PCI_BAR_COUNT; i++) {
+		res = &pdev->resource[i];
+
+		if (res->flags & IORESOURCE_IO)
+			return -EINVAL;
+
+		if (res->flags & IORESOURCE_MEM)
+			cmd |= PCI_COMMAND_MEMORY;
+	}
+	pci_write_config_word(pdev, PCI_COMMAND, cmd);
 	return 0;
 }
 
-void pcibios_release_device(struct pci_dev *pdev)
+void pcibios_disable_device(struct pci_dev *pdev)
 {
 	struct zpci_dev *zdev = get_zdev(pdev);
 
