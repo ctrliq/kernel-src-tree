@@ -196,7 +196,7 @@ static const struct file_operations snd_fops =
 };
 
 #ifdef CONFIG_SND_DYNAMIC_MINORS
-static int snd_find_free_minor(int type)
+static int snd_find_free_minor(int type, struct snd_card *card, int dev)
 {
 	int minor;
 
@@ -219,7 +219,7 @@ static int snd_find_free_minor(int type)
 	return -EBUSY;
 }
 #else
-static int snd_kernel_minor(int type, struct snd_card *card, int dev)
+static int snd_find_free_minor(int type, struct snd_card *card, int dev)
 {
 	int minor;
 
@@ -247,6 +247,8 @@ static int snd_kernel_minor(int type, struct snd_card *card, int dev)
 	}
 	if (snd_BUG_ON(minor < 0 || minor >= SNDRV_OS_MINORS))
 		return -EINVAL;
+	if (snd_minors[minor])
+		return -EBUSY;
 	return minor;
 }
 #endif
@@ -286,13 +288,7 @@ int snd_register_device_for_dev(int type, struct snd_card *card, int dev,
 	preg->private_data = private_data;
 	preg->card_ptr = card;
 	mutex_lock(&sound_mutex);
-#ifdef CONFIG_SND_DYNAMIC_MINORS
-	minor = snd_find_free_minor(type);
-#else
-	minor = snd_kernel_minor(type, card, dev);
-	if (minor >= 0 && snd_minors[minor])
-		minor = -EBUSY;
-#endif
+	minor = snd_find_free_minor(type, card, dev);
 	if (minor < 0) {
 		err = minor;
 		goto error;
