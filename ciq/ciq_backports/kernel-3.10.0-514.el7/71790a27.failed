@@ -1,0 +1,153 @@
+hv_netvsc: Add structs and handlers for VF messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit 71790a2792c8772e29bf5aa726215d9256ef93dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/71790a27.failed
+
+This patch adds data structures and handlers for messages related
+to SRIOV Virtual Function.
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 71790a2792c8772e29bf5aa726215d9256ef93dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,5ce7020ca530..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -647,6 -708,18 +671,21 @@@ struct netvsc_device 
+  	unsigned char *cb_buffer;
+  	/* The sub channel callback buffer */
+  	unsigned char *sub_cb_buf;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct multi_send_data msd[NR_CPUS];
++ 	u32 max_pkt; /* max number of pkt in one send, e.g. 8 */
++ 	u32 pkt_align; /* alignment bytes, e.g. 8 */
++ 
++ 	/* The net device context */
++ 	struct net_device_context *nd_ctx;
++ 
++ 	/* 1: allocated, serial number is valid. 0: not allocated */
++ 	u32 vf_alloc;
++ 	/* Serial number of the VF to team with */
++ 	u32 vf_serial;
+++>>>>>>> 71790a2792c8 (hv_netvsc: Add structs and handlers for VF messages)
+  };
+  
+  /* NdisInitialize message */
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 74ee1b57e623..080266b985c1 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -447,13 +447,16 @@ static int negotiate_nvsp_ver(struct hv_device *device,
+ 	if (nvsp_ver == NVSP_PROTOCOL_VERSION_1)
+ 		return 0;
+ 
+-	/* NVSPv2 only: Send NDIS config */
++	/* NVSPv2 or later: Send NDIS config */
+ 	memset(init_packet, 0, sizeof(struct nvsp_message));
+ 	init_packet->hdr.msg_type = NVSP_MSG2_TYPE_SEND_NDIS_CONFIG;
+ 	init_packet->msg.v2_msg.send_ndis_config.mtu = net_device->ndev->mtu +
+ 						       ETH_HLEN;
+ 	init_packet->msg.v2_msg.send_ndis_config.capability.ieee8021q = 1;
+ 
++	if (nvsp_ver >= NVSP_PROTOCOL_VERSION_5)
++		init_packet->msg.v2_msg.send_ndis_config.capability.sriov = 1;
++
+ 	ret = vmbus_sendpacket(device->channel, init_packet,
+ 				sizeof(struct nvsp_message),
+ 				(unsigned long)init_packet,
+@@ -943,11 +946,10 @@ static void netvsc_receive(struct netvsc_device *net_device,
+ 
+ 
+ static void netvsc_send_table(struct hv_device *hdev,
+-			      struct vmpacket_descriptor *vmpkt)
++			      struct nvsp_message *nvmsg)
+ {
+ 	struct netvsc_device *nvscdev;
+ 	struct net_device *ndev;
+-	struct nvsp_message *nvmsg;
+ 	int i;
+ 	u32 count, *tab;
+ 
+@@ -956,12 +958,6 @@ static void netvsc_send_table(struct hv_device *hdev,
+ 		return;
+ 	ndev = nvscdev->ndev;
+ 
+-	nvmsg = (struct nvsp_message *)((unsigned long)vmpkt +
+-					(vmpkt->offset8 << 3));
+-
+-	if (nvmsg->hdr.msg_type != NVSP_MSG5_TYPE_SEND_INDIRECTION_TABLE)
+-		return;
+-
+ 	count = nvmsg->msg.v5_msg.send_table.count;
+ 	if (count != VRSS_SEND_TAB_SIZE) {
+ 		netdev_err(ndev, "Received wrong send-table size:%u\n", count);
+@@ -975,6 +971,28 @@ static void netvsc_send_table(struct hv_device *hdev,
+ 		nvscdev->send_table[i] = tab[i];
+ }
+ 
++static void netvsc_send_vf(struct netvsc_device *nvdev,
++			   struct nvsp_message *nvmsg)
++{
++	nvdev->vf_alloc = nvmsg->msg.v4_msg.vf_assoc.allocated;
++	nvdev->vf_serial = nvmsg->msg.v4_msg.vf_assoc.serial;
++}
++
++static inline void netvsc_receive_inband(struct hv_device *hdev,
++					 struct netvsc_device *nvdev,
++					 struct nvsp_message *nvmsg)
++{
++	switch (nvmsg->hdr.msg_type) {
++	case NVSP_MSG5_TYPE_SEND_INDIRECTION_TABLE:
++		netvsc_send_table(hdev, nvmsg);
++		break;
++
++	case NVSP_MSG4_TYPE_SEND_VF_ASSOCIATION:
++		netvsc_send_vf(nvdev, nvmsg);
++		break;
++	}
++}
++
+ void netvsc_channel_cb(void *context)
+ {
+ 	int ret;
+@@ -987,6 +1005,7 @@ void netvsc_channel_cb(void *context)
+ 	unsigned char *buffer;
+ 	int bufferlen = NETVSC_PACKET_SIZE;
+ 	struct net_device *ndev;
++	struct nvsp_message *nvmsg;
+ 
+ 	if (channel->primary_channel != NULL)
+ 		device = channel->primary_channel->device_obj;
+@@ -1005,6 +1024,8 @@ void netvsc_channel_cb(void *context)
+ 		if (ret == 0) {
+ 			if (bytes_recvd > 0) {
+ 				desc = (struct vmpacket_descriptor *)buffer;
++				nvmsg = (struct nvsp_message *)((unsigned long)
++					 desc + (desc->offset8 << 3));
+ 				switch (desc->type) {
+ 				case VM_PKT_COMP:
+ 					netvsc_send_completion(net_device,
+@@ -1017,7 +1038,9 @@ void netvsc_channel_cb(void *context)
+ 					break;
+ 
+ 				case VM_PKT_DATA_INBAND:
+-					netvsc_send_table(device, desc);
++					netvsc_receive_inband(device,
++							      net_device,
++							      nvmsg);
+ 					break;
+ 
+ 				default:
