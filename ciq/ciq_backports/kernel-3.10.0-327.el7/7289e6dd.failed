@@ -1,0 +1,217 @@
+fib_trie: Only resize tnodes once instead of on each leaf removal in fib_table_flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 7289e6ddb633aaee6ccea2bd2e410654c47b29a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7289e6dd.failed
+
+This change makes it so that we only call resize on the tnodes, instead of
+from each of the leaves.  By doing this we can significantly reduce the
+amount of time spent resizing as we can update all of the leaves in the
+tnode first before we make any determinations about resizing.  As a result
+we can simply free the tnode in the case that all of the leaves from a
+given tnode are flushed instead of resizing with each leaf removed.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7289e6ddb633aaee6ccea2bd2e410654c47b29a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 3fe26090641a,d8b68b4de532..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1557,13 -1464,18 +1538,28 @@@ int fib_table_delete(struct fib_table *
+  	if (!plen)
+  		tb->tb_num_default--;
+  
+++<<<<<<< HEAD
+ +	if (list_empty(fa_head)) {
+ +		remove_leaf_info(l, li);
+ +		free_leaf_info(li);
+ +	}
+ +
+ +	if (hlist_empty(&l->list))
+ +		trie_leaf_remove(t, l);
+++=======
++ 	if (hlist_empty(&l->leaf)) {
++ 		struct tnode *tp = node_parent(l);
++ 
++ 		if (tp) {
++ 			put_child(tp, get_index(l->key, tp), NULL);
++ 			trie_rebalance(t, tp);
++ 		} else {
++ 			RCU_INIT_POINTER(t->trie, NULL);
++ 		}
++ 
++ 		node_free(l);
++ 	}
+++>>>>>>> 7289e6ddb633 (fib_trie: Only resize tnodes once instead of on each leaf removal in fib_table_flush)
+  
+  	if (fa->fa_state & FA_S_ACCESSED)
+  		rt_cache_flush(cfg->fc_nlinfo.nl_net);
+@@@ -1573,51 -1485,7 +1569,55 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int trie_flush_list(struct list_head *head)
+ +{
+ +	struct fib_alias *fa, *fa_node;
+ +	int found = 0;
+ +
+ +	list_for_each_entry_safe(fa, fa_node, head, fa_list) {
+ +		struct fib_info *fi = fa->fa_info;
+ +
+ +		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
+ +			list_del_rcu(&fa->fa_list);
+ +			fib_release_info(fa->fa_info);
+ +			alias_free_mem_rcu(fa);
+ +			found++;
+ +		}
+ +	}
+ +	return found;
+ +}
+ +
+ +static int trie_flush_leaf(struct tnode *l)
+ +{
+ +	int found = 0;
+ +	struct hlist_head *lih = &l->list;
+ +	struct hlist_node *tmp;
+ +	struct leaf_info *li = NULL;
+ +	unsigned char plen = KEYLENGTH;
+ +
+ +	hlist_for_each_entry_safe(li, tmp, lih, hlist) {
+ +		found += trie_flush_list(&li->falh);
+ +
+ +		if (list_empty(&li->falh)) {
+ +			hlist_del_rcu(&li->hlist);
+ +			free_leaf_info(li);
+ +			continue;
+ +		}
+ +
+ +		plen = li->plen;
+ +	}
+ +
+ +	l->slen = KEYLENGTH - plen;
+ +
+ +	return found;
+ +}
+ +
+ +/*
+ + * Scan for the next right leaf starting at node p->child[idx]
+++=======
++ /* Scan for the next right leaf starting at node p->child[idx]
+++>>>>>>> 7289e6ddb633 (fib_trie: Only resize tnodes once instead of on each leaf removal in fib_table_flush)
+   * Since we have back pointer, no recursion necessary.
+   */
+  static struct tnode *leaf_walk_rcu(struct tnode *p, struct tnode *c)
+@@@ -1684,30 -1552,81 +1684,97 @@@ static struct tnode *trie_leafindex(str
+   */
+  int fib_table_flush(struct fib_table *tb)
+  {
+- 	struct trie *t = (struct trie *) tb->tb_data;
+- 	struct tnode *l, *ll = NULL;
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 	struct tnode *n, *pn;
++ 	unsigned long cindex;
++ 	unsigned char slen;
+  	int found = 0;
+  
+- 	for (l = trie_firstleaf(t); l; l = trie_nextleaf(l)) {
+- 		found += trie_flush_leaf(l);
++ 	n = rcu_dereference(t->trie);
++ 	if (!n)
++ 		goto flush_complete;
+  
+++<<<<<<< HEAD
+ +		if (ll) {
+ +			if (hlist_empty(&ll->list))
+ +				trie_leaf_remove(t, ll);
+ +			else
+ +				leaf_pull_suffix(ll);
+++=======
++ 	pn = NULL;
++ 	cindex = 0;
++ 
++ 	while (IS_TNODE(n)) {
++ 		/* record pn and cindex for leaf walking */
++ 		pn = n;
++ 		cindex = 1ul << n->bits;
++ backtrace:
++ 		/* walk trie in reverse order */
++ 		do {
++ 			while (!(cindex--)) {
++ 				t_key pkey = pn->key;
++ 
++ 				n = pn;
++ 				pn = node_parent(n);
++ 
++ 				/* resize completed node */
++ 				resize(t, n);
++ 
++ 				/* if we got the root we are done */
++ 				if (!pn)
++ 					goto flush_complete;
++ 
++ 				cindex = get_index(pkey, pn);
++ 			}
++ 
++ 			/* grab the next available node */
++ 			n = tnode_get_child(pn, cindex);
++ 		} while (!n);
++ 	}
++ 
++ 	/* track slen in case any prefixes survive */
++ 	slen = 0;
++ 
++ 	hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 		struct fib_info *fi = fa->fa_info;
++ 
++ 		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
++ 			hlist_del_rcu(&fa->fa_list);
++ 			fib_release_info(fa->fa_info);
++ 			alias_free_mem_rcu(fa);
++ 			found++;
++ 
++ 			continue;
+++>>>>>>> 7289e6ddb633 (fib_trie: Only resize tnodes once instead of on each leaf removal in fib_table_flush)
+  		}
+  
+- 		ll = l;
++ 		slen = fa->fa_slen;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ll) {
+ +		if (hlist_empty(&ll->list))
+ +			trie_leaf_remove(t, ll);
+ +		else
+ +			leaf_pull_suffix(ll);
+++=======
++ 	/* update leaf slen */
++ 	n->slen = slen;
++ 
++ 	if (hlist_empty(&n->leaf)) {
++ 		put_child_root(pn, t, n->key, NULL);
++ 		node_free(n);
++ 	} else {
++ 		leaf_pull_suffix(n);
+++>>>>>>> 7289e6ddb633 (fib_trie: Only resize tnodes once instead of on each leaf removal in fib_table_flush)
+  	}
+  
++ 	/* if trie is leaf only loop is completed */
++ 	if (pn)
++ 		goto backtrace;
++ flush_complete:
+  	pr_debug("trie_flush found=%d\n", found);
+  	return found;
+  }
+* Unmerged path net/ipv4/fib_trie.c
