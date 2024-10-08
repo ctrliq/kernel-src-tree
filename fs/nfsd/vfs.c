@@ -1338,9 +1338,8 @@ nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		if (!fhp->fh_locked) {
 			/* not actually possible */
 			printk(KERN_ERR
-				"nfsd_create: parent %s/%s not locked!\n",
-				dentry->d_parent->d_name.name,
-				dentry->d_name.name);
+				"nfsd_create: parent %pd2 not locked!\n",
+				dentry);
 			err = nfserr_io;
 			goto out;
 		}
@@ -1350,8 +1349,8 @@ nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	 */
 	err = nfserr_exist;
 	if (dchild->d_inode) {
-		dprintk("nfsd_create: dentry %s/%s not negative!\n",
-			dentry->d_name.name, dchild->d_name.name);
+		dprintk("nfsd_create: dentry %pd/%pd not negative!\n",
+			dentry, dchild);
 		goto out; 
 	}
 
