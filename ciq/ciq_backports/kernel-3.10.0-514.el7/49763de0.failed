@@ -1,0 +1,200 @@
+ixgbe: Add support for generic Tx checksums
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 49763de0425560eed50a186428010189eae69372
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/49763de0.failed
+
+This patch adds support for generic Tx checksums to the ixgbe driver.  It
+turns out this is actually pretty easy after going over the datasheet as we
+were doing a number of steps we didn't need to.
+
+In order to perform a Tx checksum for an L4 header we need to fill in the
+following fields in the Tx descriptor:
+  MACLEN (maximum of 127), retrieved from:
+		skb_network_offset()
+  IPLEN  (maximum of 511), retrieved from:
+		skb_checksum_start_offset() - skb_network_offset()
+  TUCMD.L4T indicates offset and if checksum or crc32c, based on:
+		skb->csum_offset
+
+The added advantage to doing this is that we can support inner checksum
+offloads for tunnels and MPLS while still being able to transparently
+insert VLAN tags.
+
+I also took the opportunity to clean-up many of the feature flag
+configuration bits to make them a bit more consistent between drivers.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 49763de0425560eed50a186428010189eae69372)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 7460492f10e6,0f007d9a2a13..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -6810,59 -7219,39 +6819,91 @@@ static void ixgbe_tx_csum(struct ixgbe_
+  	u32 type_tucmd = 0;
+  
+  	if (skb->ip_summed != CHECKSUM_PARTIAL) {
+- 		if (!(first->tx_flags & IXGBE_TX_FLAGS_HW_VLAN) &&
+- 		    !(first->tx_flags & IXGBE_TX_FLAGS_CC))
++ csum_failed:
++ 		if (!(first->tx_flags & (IXGBE_TX_FLAGS_HW_VLAN |
++ 					 IXGBE_TX_FLAGS_CC)))
+  			return;
+++<<<<<<< HEAD
+ +	} else {
+ +		u8 l4_hdr = 0;
+ +		switch (first->protocol) {
+ +		case htons(ETH_P_IP):
+ +			vlan_macip_lens |= skb_network_header_len(skb);
+ +			type_tucmd |= IXGBE_ADVTXD_TUCMD_IPV4;
+ +			l4_hdr = ip_hdr(skb)->protocol;
+ +			break;
+ +		case htons(ETH_P_IPV6):
+ +			vlan_macip_lens |= skb_network_header_len(skb);
+ +			l4_hdr = ipv6_hdr(skb)->nexthdr;
+ +			break;
+ +		default:
+ +			if (unlikely(net_ratelimit())) {
+ +				dev_warn(tx_ring->dev,
+ +				 "partial checksum but proto=%x!\n",
+ +				 first->protocol);
+ +			}
+ +			break;
+ +		}
+ +
+ +		switch (l4_hdr) {
+ +		case IPPROTO_TCP:
+ +			type_tucmd |= IXGBE_ADVTXD_TUCMD_L4T_TCP;
+ +			mss_l4len_idx = tcp_hdrlen(skb) <<
+ +					IXGBE_ADVTXD_L4LEN_SHIFT;
+ +			break;
+ +		case IPPROTO_SCTP:
+ +			type_tucmd |= IXGBE_ADVTXD_TUCMD_L4T_SCTP;
+ +			mss_l4len_idx = sizeof(struct sctphdr) <<
+ +					IXGBE_ADVTXD_L4LEN_SHIFT;
+ +			break;
+ +		case IPPROTO_UDP:
+ +			mss_l4len_idx = sizeof(struct udphdr) <<
+ +					IXGBE_ADVTXD_L4LEN_SHIFT;
+ +			break;
+ +		default:
+ +			if (unlikely(net_ratelimit())) {
+ +				dev_warn(tx_ring->dev,
+ +				 "partial checksum but l4 proto=%x!\n",
+ +				 l4_hdr);
+ +			}
+ +			break;
+ +		}
+ +
+ +		/* update TX checksum flag */
+ +		first->tx_flags |= IXGBE_TX_FLAGS_CSUM;
+ +	}
+ +
+++=======
++ 		goto no_csum;
++ 	}
++ 
++ 	switch (skb->csum_offset) {
++ 	case offsetof(struct tcphdr, check):
++ 		type_tucmd = IXGBE_ADVTXD_TUCMD_L4T_TCP;
++ 		/* fall through */
++ 	case offsetof(struct udphdr, check):
++ 		break;
++ 	case offsetof(struct sctphdr, checksum):
++ 		/* validate that this is actually an SCTP request */
++ 		if (((first->protocol == htons(ETH_P_IP)) &&
++ 		     (ip_hdr(skb)->protocol == IPPROTO_SCTP)) ||
++ 		    ((first->protocol == htons(ETH_P_IPV6)) &&
++ 		     ixgbe_ipv6_csum_is_sctp(skb))) {
++ 			type_tucmd = IXGBE_ADVTXD_TUCMD_L4T_SCTP;
++ 			break;
++ 		}
++ 		/* fall through */
++ 	default:
++ 		skb_checksum_help(skb);
++ 		goto csum_failed;
++ 	}
++ 
++ 	/* update TX checksum flag */
++ 	first->tx_flags |= IXGBE_TX_FLAGS_CSUM;
++ 	vlan_macip_lens = skb_checksum_start_offset(skb) -
++ 			  skb_network_offset(skb);
++ no_csum:
+++>>>>>>> 49763de04255 (ixgbe: Add support for generic Tx checksums)
+  	/* vlan_macip_lens: MACLEN, VLAN tag */
+  	vlan_macip_lens |= skb_network_offset(skb) << IXGBE_ADVTXD_MACLEN_SHIFT;
+  	vlan_macip_lens |= first->tx_flags & IXGBE_TX_FLAGS_VLAN_MASK;
+@@@ -8315,36 -9151,35 +8355,55 @@@ skip_sriov
+  			   NETIF_F_TSO |
+  			   NETIF_F_TSO6 |
+  			   NETIF_F_RXHASH |
+- 			   NETIF_F_RXCSUM;
++ 			   NETIF_F_RXCSUM |
++ 			   NETIF_F_HW_CSUM |
++ 			   NETIF_F_HW_VLAN_CTAG_TX |
++ 			   NETIF_F_HW_VLAN_CTAG_RX;
+  
+++<<<<<<< HEAD
+ +	netdev->hw_features = netdev->features;
+ +
+ +	switch (adapter->hw.mac.type) {
+ +	case ixgbe_mac_82599EB:
+ +	case ixgbe_mac_X540:
+ +	case ixgbe_mac_X550:
+ +	case ixgbe_mac_X550EM_x:
+ +		netdev->features |= NETIF_F_SCTP_CSUM;
+ +		netdev->hw_features |= NETIF_F_SCTP_CSUM |
+ +				       NETIF_F_NTUPLE;
+ +		break;
+ +	default:
+ +		break;
+ +	}
+++=======
++ 	if (hw->mac.type >= ixgbe_mac_82599EB)
++ 		netdev->features |= NETIF_F_SCTP_CRC;
+++>>>>>>> 49763de04255 (ixgbe: Add support for generic Tx checksums)
++ 
++ 	/* copy netdev features into list of user selectable features */
++ 	netdev->hw_features |= netdev->features;
++ 	netdev->hw_features |= NETIF_F_RXALL |
++ 			       NETIF_F_HW_L2FW_DOFFLOAD;
+  
+- 	netdev->hw_features |= NETIF_F_RXALL;
++ 	if (hw->mac.type >= ixgbe_mac_82599EB)
++ 		netdev->hw_features |= NETIF_F_NTUPLE |
++ 				       NETIF_F_HW_TC;
++ 
++ 	/* set this bit last since it cannot be part of hw_features */
+  	netdev->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+  
+- 	netdev->vlan_features |= NETIF_F_TSO;
+- 	netdev->vlan_features |= NETIF_F_TSO6;
+- 	netdev->vlan_features |= NETIF_F_IP_CSUM;
+- 	netdev->vlan_features |= NETIF_F_IPV6_CSUM;
+- 	netdev->vlan_features |= NETIF_F_SG;
++ 	netdev->vlan_features |= NETIF_F_SG |
++ 				 NETIF_F_TSO |
++ 				 NETIF_F_TSO6 |
++ 				 NETIF_F_HW_CSUM |
++ 				 NETIF_F_SCTP_CRC;
++ 
+++<<<<<<< HEAD
+++=======
++ 	netdev->mpls_features |= NETIF_F_HW_CSUM;
++ 	netdev->hw_enc_features |= NETIF_F_HW_CSUM;
+  
+++>>>>>>> 49763de04255 (ixgbe: Add support for generic Tx checksums)
+  	netdev->priv_flags |= IFF_UNICAST_FLT;
+  	netdev->priv_flags |= IFF_SUPP_NOFCS;
+  
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
