@@ -1,0 +1,186 @@
+deal with deadlock in d_walk()
+
+jira LE-1907
+cve CVE-2014-8559
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [fs] dcache: deal with deadlock in d_walk() (Denys Vlasenko) [1173813] {CVE-2014-8559}
+Rebuild_FUZZ: 88.24%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit ca5358ef75fc69fee5322a38a340f5739d997c10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ca5358ef.failed
+
+... by not hitting rename_retry for reasons other than rename having
+happened.  In other words, do _not_ restart when finding that
+between unlocking the child and locking the parent the former got
+into __dentry_kill().  Skip the killed siblings instead...
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit ca5358ef75fc69fee5322a38a340f5739d997c10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 3af919733a87,e90aa825cc03..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -478,13 -486,108 +478,109 @@@ relock
+  	 * inform the fs via d_prune that this dentry is about to be
+  	 * unhashed and destroyed.
+  	 */
+ -	if (dentry->d_flags & DCACHE_OP_PRUNE)
+ +	if ((dentry->d_flags & DCACHE_OP_PRUNE) && !d_unhashed(dentry))
+  		dentry->d_op->d_prune(dentry);
+  
+ -	if (dentry->d_flags & DCACHE_LRU_LIST) {
+ -		if (!(dentry->d_flags & DCACHE_SHRINK_LIST))
+ -			d_lru_del(dentry);
+ -	}
+ +	dentry_lru_del(dentry);
+  	/* if it was on the hash then remove it */
+  	__d_drop(dentry);
+++<<<<<<< HEAD
+ +	return d_kill(dentry, parent);
+++=======
++ 	__list_del_entry(&dentry->d_child);
++ 	/*
++ 	 * Inform d_walk() that we are no longer attached to the
++ 	 * dentry tree
++ 	 */
++ 	dentry->d_flags |= DCACHE_DENTRY_KILLED;
++ 	if (parent)
++ 		spin_unlock(&parent->d_lock);
++ 	dentry_iput(dentry);
++ 	/*
++ 	 * dentry_iput drops the locks, at which point nobody (except
++ 	 * transient RCU lookups) can reach this dentry.
++ 	 */
++ 	BUG_ON((int)dentry->d_lockref.count > 0);
++ 	this_cpu_dec(nr_dentry);
++ 	if (dentry->d_op && dentry->d_op->d_release)
++ 		dentry->d_op->d_release(dentry);
++ 
++ 	spin_lock(&dentry->d_lock);
++ 	if (dentry->d_flags & DCACHE_SHRINK_LIST) {
++ 		dentry->d_flags |= DCACHE_MAY_FREE;
++ 		can_free = false;
++ 	}
++ 	spin_unlock(&dentry->d_lock);
++ 	if (likely(can_free))
++ 		dentry_free(dentry);
++ }
++ 
++ /*
++  * Finish off a dentry we've decided to kill.
++  * dentry->d_lock must be held, returns with it unlocked.
++  * If ref is non-zero, then decrement the refcount too.
++  * Returns dentry requiring refcount drop, or NULL if we're done.
++  */
++ static struct dentry *dentry_kill(struct dentry *dentry)
++ 	__releases(dentry->d_lock)
++ {
++ 	struct inode *inode = dentry->d_inode;
++ 	struct dentry *parent = NULL;
++ 
++ 	if (inode && unlikely(!spin_trylock(&inode->i_lock)))
++ 		goto failed;
++ 
++ 	if (!IS_ROOT(dentry)) {
++ 		parent = dentry->d_parent;
++ 		if (unlikely(!spin_trylock(&parent->d_lock))) {
++ 			if (inode)
++ 				spin_unlock(&inode->i_lock);
++ 			goto failed;
++ 		}
++ 	}
++ 
++ 	__dentry_kill(dentry);
++ 	return parent;
++ 
++ failed:
++ 	spin_unlock(&dentry->d_lock);
++ 	cpu_relax();
++ 	return dentry; /* try again with same dentry */
++ }
++ 
++ static inline struct dentry *lock_parent(struct dentry *dentry)
++ {
++ 	struct dentry *parent = dentry->d_parent;
++ 	if (IS_ROOT(dentry))
++ 		return NULL;
++ 	if (unlikely((int)dentry->d_lockref.count < 0))
++ 		return NULL;
++ 	if (likely(spin_trylock(&parent->d_lock)))
++ 		return parent;
++ 	rcu_read_lock();
++ 	spin_unlock(&dentry->d_lock);
++ again:
++ 	parent = ACCESS_ONCE(dentry->d_parent);
++ 	spin_lock(&parent->d_lock);
++ 	/*
++ 	 * We can't blindly lock dentry until we are sure
++ 	 * that we won't violate the locking order.
++ 	 * Any changes of dentry->d_parent must have
++ 	 * been done with parent->d_lock held, so
++ 	 * spin_lock() above is enough of a barrier
++ 	 * for checking if it's still our child.
++ 	 */
++ 	if (unlikely(parent != dentry->d_parent)) {
++ 		spin_unlock(&parent->d_lock);
++ 		goto again;
++ 	}
++ 	rcu_read_unlock();
++ 	if (parent != dentry)
++ 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
++ 	else
++ 		parent = NULL;
++ 	return parent;
+++>>>>>>> ca5358ef75fc (deal with deadlock in d_walk())
+  }
+  
+  /* 
+@@@ -1121,18 -1081,31 +1217,38 @@@ resume
+  	/*
+  	 * All done at this level ... ascend and resume the search.
+  	 */
++ 	rcu_read_lock();
++ ascend:
+  	if (this_parent != parent) {
+  		struct dentry *child = this_parent;
+++<<<<<<< HEAD
+ +		this_parent = try_to_ascend(this_parent, seq);
+ +		if (!this_parent)
+ +			goto rename_retry;
+ +		next = child->d_u.d_child.next;
+++=======
++ 		this_parent = child->d_parent;
++ 
++ 		spin_unlock(&child->d_lock);
++ 		spin_lock(&this_parent->d_lock);
++ 
++ 		/* might go back up the wrong parent if we have had a rename. */
++ 		if (need_seqretry(&rename_lock, seq))
++ 			goto rename_retry;
++ 		next = child->d_child.next;
++ 		while (unlikely(child->d_flags & DCACHE_DENTRY_KILLED)) {
++ 			if (next == &this_parent->d_subdirs)
++ 				goto ascend;
++ 			child = list_entry(next, struct dentry, d_child);
++ 			next = next->next;
++ 		}
++ 		rcu_read_unlock();
+++>>>>>>> ca5358ef75fc (deal with deadlock in d_walk())
+  		goto resume;
+  	}
+- 	if (need_seqretry(&rename_lock, seq)) {
+- 		spin_unlock(&this_parent->d_lock);
++ 	if (need_seqretry(&rename_lock, seq))
+  		goto rename_retry;
+- 	}
++ 	rcu_read_unlock();
+  	if (finish)
+  		finish(data);
+  
+* Unmerged path fs/dcache.c
