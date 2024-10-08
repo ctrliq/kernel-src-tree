@@ -196,7 +196,8 @@ static int efi_pstore_sysfs_entry_iter(void *data, struct efivar_entry **pos)
  */
 static ssize_t efi_pstore_read(u64 *id, enum pstore_type_id *type,
 			       int *count, struct timespec *timespec,
-			       char **buf, struct pstore_info *psi)
+			       char **buf, bool *compressed,
+			       struct pstore_info *psi)
 {
 	struct pstore_read_data data;
 	ssize_t size;
