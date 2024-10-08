@@ -1296,7 +1296,7 @@ static void vm_domain_exit(struct dmar_domain *domain);
 void free_dmar_iommu(struct intel_iommu *iommu)
 {
 	struct dmar_domain *domain;
-	int i;
+	int i, count;
 	unsigned long flags;
 
 	if ((iommu->domains) && (iommu->domain_ids)) {
@@ -1305,13 +1305,14 @@ void free_dmar_iommu(struct intel_iommu *iommu)
 			clear_bit(i, iommu->domain_ids);
 
 			spin_lock_irqsave(&domain->iommu_lock, flags);
-			if (--domain->iommu_count == 0) {
+			count = --domain->iommu_count;
+			spin_unlock_irqrestore(&domain->iommu_lock, flags);
+			if (count == 0) {
 				if (domain->flags & DOMAIN_FLAG_VIRTUAL_MACHINE)
 					vm_domain_exit(domain);
 				else
 					domain_exit(domain);
 			}
-			spin_unlock_irqrestore(&domain->iommu_lock, flags);
 		}
 	}
 
