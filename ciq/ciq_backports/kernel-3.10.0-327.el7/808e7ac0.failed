@@ -1,0 +1,93 @@
+qdisc: dequeue bulking also pickup GSO/TSO packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 808e7ac0bdef31204184904f6b3ea356a30a9ed5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/808e7ac0.failed
+
+The TSO and GSO segmented packets already benefit from bulking
+on their own.
+
+The TSO packets have always taken advantage of the only updating
+the tailptr once for a large packet.
+
+The GSO segmented packets have recently taken advantage of
+bulking xmit_more API, via merge commit 53fda7f7f9e8 ("Merge
+branch 'xmit_list'"), specifically via commit 7f2e870f2a4 ("net:
+Move main gso loop out of dev_hard_start_xmit() into helper.")
+allowing qdisc requeue of remaining list.  And via commit
+ce93718fb7cd ("net: Don't keep around original SKB when we
+software segment GSO frames.").
+
+This patch allow further bulking of TSO/GSO packets together,
+when dequeueing from the qdisc.
+
+Testing:
+ Measuring HoL (Head-of-Line) blocking for TSO and GSO, with
+netperf-wrapper. Bulking several TSO show no performance regressions
+(requeues were in the area 32 requeues/sec).
+
+Bulking several GSOs does show small regression or very small
+improvement (requeues were in the area 8000 requeues/sec).
+
+ Using ixgbe 10Gbit/s with GSO bulking, we can measure some additional
+latency. Base-case, which is "normal" GSO bulking, sees varying
+high-prio queue delay between 0.38ms to 0.47ms.  Bulking several GSOs
+together, result in a stable high-prio queue delay of 0.50ms.
+
+ Using igb at 100Mbit/s with GSO bulking, shows an improvement.
+Base-case sees varying high-prio queue delay between 2.23ms to 2.35ms
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 808e7ac0bdef31204184904f6b3ea356a30a9ed5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_generic.c
+diff --cc net/sched/sch_generic.c
+index bba00963a92a,797ebef73642..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -55,6 -56,35 +55,38 @@@ static inline int dev_requeue_skb(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *try_bulk_dequeue_skb(struct Qdisc *q,
++ 					    struct sk_buff *head_skb,
++ 					    int bytelimit)
++ {
++ 	struct sk_buff *skb, *tail_skb = head_skb;
++ 
++ 	while (bytelimit > 0) {
++ 		skb = q->dequeue(q);
++ 		if (!skb)
++ 			break;
++ 
++ 		bytelimit -= skb->len; /* covers GSO len */
++ 		skb = validate_xmit_skb(skb, qdisc_dev(q));
++ 		if (!skb)
++ 			break;
++ 
++ 		while (tail_skb->next) /* GSO list goto tail */
++ 			tail_skb = tail_skb->next;
++ 
++ 		tail_skb->next = skb;
++ 		tail_skb = skb;
++ 	}
++ 
++ 	return head_skb;
++ }
++ 
++ /* Note that dequeue_skb can possibly return a SKB list (via skb->next).
++  * A requeued skb (via q->gso_skb) can also be a SKB list.
++  */
+++>>>>>>> 808e7ac0bdef (qdisc: dequeue bulking also pickup GSO/TSO packets)
+  static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
+  {
+  	struct sk_buff *skb = q->gso_skb;
+* Unmerged path net/sched/sch_generic.c
