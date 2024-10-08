@@ -1,0 +1,244 @@
+mmc: dw_mmc: Add a timeout for sending CMD11
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Doug Anderson <dianders@chromium.org>
+commit 5c935165da79644df90a647ecc140fb77b40dee5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5c935165.failed
+
+In the Designware databook's description of the "Voltage Switch Normal
+Scenario" it instructs us to set a timer and fail the voltage change
+if we don't see the voltage change interrupt within 2ms.  Let's
+implement that.  Without implementing this I have often been able to
+reproduce a hang while trying to send CMD11 on an rk3288-based board
+while constantly ejecting and inserting UHS cards.
+
+	Signed-off-by: Doug Anderson <dianders@chromium.org>
+	Signed-off-by: Jaehoon Chung <jh80.chung@samsung.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 5c935165da79644df90a647ecc140fb77b40dee5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/dw_mmc.c
+#	include/linux/mmc/dw_mmc.h
+diff --cc drivers/mmc/host/dw_mmc.c
+index 1add727a3cc5,8e0836d39081..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -813,8 -1021,19 +813,17 @@@ static void __dw_mci_start_request(stru
+  
+  	dw_mci_start_command(host, cmd, cmdflags);
+  
++ 	if (cmd->opcode == SD_SWITCH_VOLTAGE) {
++ 		/*
++ 		 * Databook says to fail after 2ms w/ no response; give an
++ 		 * extra jiffy just in case we're about to roll over.
++ 		 */
++ 		mod_timer(&host->cmd11_timer,
++ 			  jiffies + msecs_to_jiffies(2) + 1);
++ 	}
++ 
+  	if (mrq->stop)
+  		host->stop_cmdr = dw_mci_prepare_command(slot->mmc, mrq->stop);
+ -	else
+ -		host->stop_cmdr = dw_mci_prep_stop_abort(host, cmd);
+  }
+  
+  static void dw_mci_start_request(struct dw_mci *host,
+@@@ -1694,16 -2154,25 +1703,27 @@@ static irqreturn_t dw_mci_interrupt(in
+  
+  	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
+  
+ -	/*
+ -	 * DTO fix - version 2.10a and below, and only if internal DMA
+ -	 * is configured.
+ -	 */
+ -	if (host->quirks & DW_MCI_QUIRK_IDMAC_DTO) {
+ -		if (!pending &&
+ -		    ((mci_readl(host, STATUS) >> 17) & 0x1fff))
+ -			pending |= SDMMC_INT_DATA_OVER;
+ -	}
+ -
+  	if (pending) {
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * DTO fix - version 2.10a and below, and only if internal DMA
+ +		 * is configured.
+ +		 */
+ +		if (host->quirks & DW_MCI_QUIRK_IDMAC_DTO) {
+ +			if (!pending &&
+ +			    ((mci_readl(host, STATUS) >> 17) & 0x1fff))
+ +				pending |= SDMMC_INT_DATA_OVER;
+++=======
++ 		/* Check volt switch first, since it can look like an error */
++ 		if ((host->state == STATE_SENDING_CMD11) &&
++ 		    (pending & SDMMC_INT_VOLT_SWITCH)) {
++ 			del_timer(&host->cmd11_timer);
++ 
++ 			mci_writel(host, RINTSTS, SDMMC_INT_VOLT_SWITCH);
++ 			pending &= ~SDMMC_INT_VOLT_SWITCH;
++ 			dw_mci_cmd_interrupt(host, pending);
+++>>>>>>> 5c935165da79 (mmc: dw_mmc: Add a timeout for sending CMD11)
+  		}
+  
+  		if (pending & DW_MCI_CMD_ERROR_FLAGS) {
+@@@ -2192,6 -2513,88 +2212,91 @@@ static bool mci_wait_reset(struct devic
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool dw_mci_reset(struct dw_mci *host)
++ {
++ 	u32 flags = SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET;
++ 	bool ret = false;
++ 
++ 	/*
++ 	 * Reseting generates a block interrupt, hence setting
++ 	 * the scatter-gather pointer to NULL.
++ 	 */
++ 	if (host->sg) {
++ 		sg_miter_stop(&host->sg_miter);
++ 		host->sg = NULL;
++ 	}
++ 
++ 	if (host->use_dma)
++ 		flags |= SDMMC_CTRL_DMA_RESET;
++ 
++ 	if (dw_mci_ctrl_reset(host, flags)) {
++ 		/*
++ 		 * In all cases we clear the RAWINTS register to clear any
++ 		 * interrupts.
++ 		 */
++ 		mci_writel(host, RINTSTS, 0xFFFFFFFF);
++ 
++ 		/* if using dma we wait for dma_req to clear */
++ 		if (host->use_dma) {
++ 			unsigned long timeout = jiffies + msecs_to_jiffies(500);
++ 			u32 status;
++ 			do {
++ 				status = mci_readl(host, STATUS);
++ 				if (!(status & SDMMC_STATUS_DMA_REQ))
++ 					break;
++ 				cpu_relax();
++ 			} while (time_before(jiffies, timeout));
++ 
++ 			if (status & SDMMC_STATUS_DMA_REQ) {
++ 				dev_err(host->dev,
++ 					"%s: Timeout waiting for dma_req to "
++ 					"clear during reset\n", __func__);
++ 				goto ciu_out;
++ 			}
++ 
++ 			/* when using DMA next we reset the fifo again */
++ 			if (!dw_mci_ctrl_reset(host, SDMMC_CTRL_FIFO_RESET))
++ 				goto ciu_out;
++ 		}
++ 	} else {
++ 		/* if the controller reset bit did clear, then set clock regs */
++ 		if (!(mci_readl(host, CTRL) & SDMMC_CTRL_RESET)) {
++ 			dev_err(host->dev, "%s: fifo/dma reset bits didn't "
++ 				"clear but ciu was reset, doing clock update\n",
++ 				__func__);
++ 			goto ciu_out;
++ 		}
++ 	}
++ 
++ #if IS_ENABLED(CONFIG_MMC_DW_IDMAC)
++ 	/* It is also recommended that we reset and reprogram idmac */
++ 	dw_mci_idmac_reset(host);
++ #endif
++ 
++ 	ret = true;
++ 
++ ciu_out:
++ 	/* After a CTRL reset we need to have CIU set clock registers  */
++ 	mci_send_cmd(host->cur_slot, SDMMC_CMD_UPD_CLK, 0);
++ 
++ 	return ret;
++ }
++ 
++ static void dw_mci_cmd11_timer(unsigned long arg)
++ {
++ 	struct dw_mci *host = (struct dw_mci *)arg;
++ 
++ 	if (host->state != STATE_SENDING_CMD11)
++ 		dev_info(host->dev, "Unexpected CMD11 timeout\n");
++ 
++ 	host->cmd_status = SDMMC_INT_RTO;
++ 	set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
++ 	tasklet_schedule(&host->tasklet);
++ }
++ 
+++>>>>>>> 5c935165da79 (mmc: dw_mmc: Add a timeout for sending CMD11)
+  #ifdef CONFIG_OF
+  static struct dw_mci_of_quirks {
+  	char *quirk;
+@@@ -2330,30 -2760,17 +2435,35 @@@ int dw_mci_probe(struct dw_mci *host
+  		}
+  	}
+  
+ -	if (drv_data && drv_data->setup_clock) {
+ -		ret = drv_data->setup_clock(host);
+++<<<<<<< HEAD
+ +	host->vmmc = devm_regulator_get(host->dev, "vmmc");
+ +	if (IS_ERR(host->vmmc)) {
+ +		ret = PTR_ERR(host->vmmc);
+ +		if (ret == -EPROBE_DEFER)
+ +			goto err_clk_ciu;
+ +
+ +		dev_info(host->dev, "no vmmc regulator found: %d\n", ret);
+ +		host->vmmc = NULL;
+ +	} else {
+ +		ret = regulator_enable(host->vmmc);
+  		if (ret) {
+ -			dev_err(host->dev,
+ -				"implementation specific clock setup failed\n");
+ +			if (ret != -EPROBE_DEFER)
+ +				dev_err(host->dev,
+ +					"regulator_enable fail: %d\n", ret);
+  			goto err_clk_ciu;
+  		}
+  	}
+  
+ +	if (!host->bus_hz) {
+ +		dev_err(host->dev,
+ +			"Platform data must supply bus speed\n");
+ +		ret = -ENODEV;
+ +		goto err_regulator;
+ +	}
+++=======
++ 	setup_timer(&host->cmd11_timer,
++ 		    dw_mci_cmd11_timer, (unsigned long)host);
+++>>>>>>> 5c935165da79 (mmc: dw_mmc: Add a timeout for sending CMD11)
+  
+  	host->quirks = host->pdata->quirks;
+  
+diff --cc include/linux/mmc/dw_mmc.h
+index a578603b514c,9efc567e3ced..000000000000
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@@ -186,9 -197,13 +186,16 @@@ struct dw_mci 
+  	/* Workaround flags */
+  	u32			quirks;
+  
+ -	bool			vqmmc_enabled;
+ +	struct regulator	*vmmc;	/* Power regulator */
+  	unsigned long		irq_flags; /* IRQ flags */
+  	int			irq;
+++<<<<<<< HEAD
+++=======
++ 
++ 	int			sdio_id0;
++ 
++ 	struct timer_list       cmd11_timer;
+++>>>>>>> 5c935165da79 (mmc: dw_mmc: Add a timeout for sending CMD11)
+  };
+  
+  /* DMA ops for Internal/External DMAC interface */
+* Unmerged path drivers/mmc/host/dw_mmc.c
+* Unmerged path include/linux/mmc/dw_mmc.h
