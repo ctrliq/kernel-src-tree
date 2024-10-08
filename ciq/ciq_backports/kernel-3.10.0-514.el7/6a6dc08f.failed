@@ -1,0 +1,84 @@
+xen-netfront: use napi_complete() correctly to prevent Rx stalling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author David Vrabel <david.vrabel@citrix.com>
+commit 6a6dc08ff6395f58be3ee568cb970ea956f16819
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6a6dc08f.failed
+
+After d75b1ade567ffab085e8adbbdacf0092d10cd09c (net: less interrupt
+masking in NAPI) the napi instance is removed from the per-cpu list
+prior to calling the n->poll(), and is only requeued if all of the
+budget was used.  This inadvertently broke netfront because netfront
+does not use NAPI correctly.
+
+If netfront had not used all of its budget it would do a final check
+for any Rx responses and avoid calling napi_complete() if there were
+more responses.  It would still return under budget so it would never
+be rescheduled.  The final check would also not re-enable the Rx
+interrupt.
+
+Additionally, xenvif_poll() would also call napi_complete() /after/
+enabling the interrupt.  This resulted in a race between the
+napi_complete() and the napi_schedule() in the interrupt handler.  The
+use of local_irq_save/restore() avoided by race iff the handler is
+running on the same CPU but not if it was running on a different CPU.
+
+Fix both of these by always calling napi_compete() if the budget was
+not all used, and then calling napi_schedule() if the final checks
+says there's more work.
+
+	Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6a6dc08ff6395f58be3ee568cb970ea956f16819)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/xen-netfront.c
+index e738889dfa9a,22bcb4e12e2a..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -975,10 -977,9 +975,9 @@@ static int xennet_poll(struct napi_stru
+  	struct sk_buff_head rxq;
+  	struct sk_buff_head errq;
+  	struct sk_buff_head tmpq;
+- 	unsigned long flags;
+  	int err;
+  
+ -	spin_lock(&queue->rx_lock);
+ +	spin_lock(&np->rx_lock);
+  
+  	skb_queue_head_init(&rxq);
+  	skb_queue_head_init(&errq);
+@@@ -1055,18 -1049,14 +1054,22 @@@ err
+  	if (work_done < budget) {
+  		int more_to_do = 0;
+  
+- 		napi_gro_flush(napi, false);
+- 
+- 		local_irq_save(flags);
++ 		napi_complete(napi);
+  
+++<<<<<<< HEAD
+ +		RING_FINAL_CHECK_FOR_RESPONSES(&np->rx, more_to_do);
+ +		if (!more_to_do)
+ +			__napi_complete(napi);
+ +
+ +		local_irq_restore(flags);
+++=======
++ 		RING_FINAL_CHECK_FOR_RESPONSES(&queue->rx, more_to_do);
++ 		if (more_to_do)
++ 			napi_schedule(napi);
+++>>>>>>> 6a6dc08ff639 (xen-netfront: use napi_complete() correctly to prevent Rx stalling)
+  	}
+  
+ -	spin_unlock(&queue->rx_lock);
+ +	spin_unlock(&np->rx_lock);
+  
+  	return work_done;
+  }
+* Unmerged path drivers/net/xen-netfront.c
