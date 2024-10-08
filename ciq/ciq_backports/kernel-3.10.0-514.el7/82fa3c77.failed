@@ -1,0 +1,154 @@
+hv_netvsc: Use the xmit_more skb flag to optimize signaling the host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit 82fa3c776e5abba7ed6e4b4f4983d14731c37d6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/82fa3c77.failed
+
+Based on the information given to this driver (via the xmit_more skb flag),
+we can defer signaling the host if more packets are on the way. This will help
+make the host more efficient since it can potentially process a larger batch of
+packets. Implement this optimization.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 82fa3c776e5abba7ed6e4b4f4983d14731c37d6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/netvsc.c
+index f6702b01e754,1c4f265f4e7c..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -707,53 -726,41 +707,59 @@@ u32 netvsc_copy_to_send_buf(struct netv
+  	return msg_size;
+  }
+  
+ -static inline int netvsc_send_pkt(
+ -	struct hv_netvsc_packet *packet,
+ -	struct netvsc_device *net_device)
+ +int netvsc_send(struct hv_device *device,
+ +			struct hv_netvsc_packet *packet)
+  {
+ -	struct nvsp_message nvmsg;
+ -	struct vmbus_channel *out_channel = packet->channel;
+ -	u16 q_idx = packet->q_idx;
+ -	struct net_device *ndev = net_device->ndev;
+ +	struct netvsc_device *net_device;
+ +	int ret = 0;
+ +	struct nvsp_message sendMessage;
+ +	struct net_device *ndev;
+ +	struct vmbus_channel *out_channel = NULL;
+  	u64 req_id;
+++<<<<<<< HEAD
+ +	unsigned int section_index = NETVSC_INVALID_INDEX;
+ +	u32 msg_size = 0;
+ +	struct sk_buff *skb = NULL;
+ +	u16 q_idx = packet->q_idx;
+++=======
++ 	int ret;
++ 	struct hv_page_buffer *pgbuf;
++ 	u32 ring_avail = hv_ringbuf_avail_percent(&out_channel->outbound);
+++>>>>>>> 82fa3c776e5a (hv_netvsc: Use the xmit_more skb flag to optimize signaling the host)
+  
+ -	nvmsg.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+ +
+ +	net_device = get_outbound_net_device(device);
+ +	if (!net_device)
+ +		return -ENODEV;
+ +	ndev = net_device->ndev;
+ +
+ +	sendMessage.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+  	if (packet->is_data_pkt) {
+  		/* 0 is RMC_DATA; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 0;
+  	} else {
+  		/* 1 is RMC_CONTROL; */
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+ +		sendMessage.msg.v1_msg.send_rndis_pkt.channel_type = 1;
+  	}
+  
+ -	nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ -		packet->send_buf_index;
+ -	if (packet->send_buf_index == NETVSC_INVALID_INDEX)
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size = 0;
+ -	else
+ -		nvmsg.msg.v1_msg.send_rndis_pkt.send_buf_section_size =
+ -			packet->total_data_buflen;
+ +	/* Attempt to send via sendbuf */
+ +	if (packet->total_data_buflen < net_device->send_section_size) {
+ +		section_index = netvsc_get_next_send_section(net_device);
+ +		if (section_index != NETVSC_INVALID_INDEX) {
+ +			msg_size = netvsc_copy_to_send_buf(net_device,
+ +							   section_index,
+ +							   packet);
+ +			skb = (struct sk_buff *)
+ +			      (unsigned long)packet->send_completion_tid;
+ +			packet->page_buf_cnt = 0;
+ +		}
+ +	}
+ +	packet->send_buf_index = section_index;
+ +
+ +
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_index =
+ +		section_index;
+ +	sendMessage.msg.v1_msg.send_rndis_pkt.send_buf_section_size = msg_size;
+  
+  	if (packet->send_completion)
+  		req_id = (ulong)packet;
+@@@ -768,19 -770,34 +774,49 @@@
+  	if (out_channel->rescind)
+  		return -ENODEV;
+  
++ 	/*
++ 	 * It is possible that once we successfully place this packet
++ 	 * on the ringbuffer, we may stop the queue. In that case, we want
++ 	 * to notify the host independent of the xmit_more flag. We don't
++ 	 * need to be precise here; in the worst case we may signal the host
++ 	 * unnecessarily.
++ 	 */
++ 	if (ring_avail < (RING_AVAIL_PERCENT_LOWATER + 1))
++ 		packet->xmit_more = false;
++ 
+  	if (packet->page_buf_cnt) {
+++<<<<<<< HEAD
+ +		ret = vmbus_sendpacket_pagebuffer(out_channel,
+ +						  packet->page_buf,
+ +						  packet->page_buf_cnt,
+ +						  &sendMessage,
+ +						  sizeof(struct nvsp_message),
+ +						  req_id);
+ +	} else {
+ +		ret = vmbus_sendpacket(out_channel, &sendMessage,
+ +				sizeof(struct nvsp_message),
+ +				req_id,
+ +				VM_PKT_DATA_INBAND,
+ +				VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+++=======
++ 		pgbuf = packet->cp_partial ? packet->page_buf +
++ 			packet->rmsg_pgcnt : packet->page_buf;
++ 		ret = vmbus_sendpacket_pagebuffer_ctl(out_channel,
++ 						      pgbuf,
++ 						      packet->page_buf_cnt,
++ 						      &nvmsg,
++ 						      sizeof(struct nvsp_message),
++ 						      req_id,
++ 						      VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED,
++ 						      !packet->xmit_more);
++ 	} else {
++ 		ret = vmbus_sendpacket_ctl(out_channel, &nvmsg,
++ 					   sizeof(struct nvsp_message),
++ 					   req_id,
++ 					   VM_PKT_DATA_INBAND,
++ 					   VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED,
++ 					   !packet->xmit_more);
+++>>>>>>> 82fa3c776e5a (hv_netvsc: Use the xmit_more skb flag to optimize signaling the host)
+  	}
+  
+  	if (ret == 0) {
+* Unmerged path drivers/net/hyperv/netvsc.c
