@@ -1,0 +1,644 @@
+cxgb4: Enable congestion notification from SGE for IQs and FLs.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] cxgb4: Enable congestion notification from SGE for IQs and FLs (Sai Vemuri) [1251611]
+Rebuild_FUZZ: 99.20%
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 145ef8a54eb3bee917947f9bf7940093a0f2b03d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/145ef8a5.failed
+
+Also changed the name of t4_hw.c:get_mps_bg_map() to t4_get_mps_bg_map()
+and make it an exported routine with a definition in cxgb4.h.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 145ef8a54eb3bee917947f9bf7940093a0f2b03d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index dddf17cba9bf,b6fa9583c3f2..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -1015,6 -1215,19 +1015,22 @@@ int t4_mc_read(struct adapter *adap, in
+  	       u64 *parity);
+  int t4_edc_read(struct adapter *adap, int idx, u32 addr, __be32 *data,
+  		u64 *parity);
+++<<<<<<< HEAD
+++=======
++ unsigned int t4_get_mps_bg_map(struct adapter *adapter, int idx);
++ void t4_pmtx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[]);
++ void t4_pmrx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[]);
++ int t4_read_cim_ibq(struct adapter *adap, unsigned int qid, u32 *data,
++ 		    size_t n);
++ int t4_read_cim_obq(struct adapter *adap, unsigned int qid, u32 *data,
++ 		    size_t n);
++ int t4_cim_read(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		unsigned int *valp);
++ int t4_cim_write(struct adapter *adap, unsigned int addr, unsigned int n,
++ 		 const unsigned int *valp);
++ int t4_cim_read_la(struct adapter *adap, u32 *la_buf, unsigned int *wrptr);
++ void t4_read_cimq_cfg(struct adapter *adap, u16 *base, u16 *size, u16 *thres);
+++>>>>>>> 145ef8a54eb3 (cxgb4: Enable congestion notification from SGE for IQs and FLs.)
+  const char *t4_get_port_type_description(enum fw_port_type port_type);
+  void t4_get_port_stats(struct adapter *adap, int idx, struct port_stats *p);
+  void t4_read_mtu_tbl(struct adapter *adap, u16 *mtus, u8 *mtu_log);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index ce6b13a03d09,6397d6ccad1c..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -2275,53 -2409,40 +2275,56 @@@ static void sge_tx_timer_cb(unsigned lo
+  }
+  
+  /**
+ - *	bar2_address - return the BAR2 address for an SGE Queue's Registers
+ - *	@adapter: the adapter
+ - *	@qid: the SGE Queue ID
+ - *	@qtype: the SGE Queue Type (Egress or Ingress)
+ - *	@pbar2_qid: BAR2 Queue ID or 0 for Queue ID inferred SGE Queues
+ + *      udb_address - return the BAR2 User Doorbell address for a Queue
+ + *      @adap: the adapter
+ + *      @cntxt_id: the Queue Context ID
+ + *      @qpp: Queues Per Page (for all PFs)
+   *
+ - *	Returns the BAR2 address for the SGE Queue Registers associated with
+ - *	@qid.  If BAR2 SGE Registers aren't available, returns NULL.  Also
+ - *	returns the BAR2 Queue ID to be used with writes to the BAR2 SGE
+ - *	Queue Registers.  If the BAR2 Queue ID is 0, then "Inferred Queue ID"
+ - *	Registers are supported (e.g. the Write Combining Doorbell Buffer).
+ - */
+ -static void __iomem *bar2_address(struct adapter *adapter,
+ -				  unsigned int qid,
+ -				  enum t4_bar2_qtype qtype,
+ -				  unsigned int *pbar2_qid)
+ -{
+ -	u64 bar2_qoffset;
+ -	int ret;
+ + *      Returns the BAR2 address of the user Doorbell associated with the
+ + *      indicated Queue Context ID.  Note that this is only applicable
+ + *      for T5 and later.
+ + */
+ +static u64 udb_address(struct adapter *adap, unsigned int cntxt_id,
+ +		       unsigned int qpp)
+ +{
+ +	u64 udb;
+ +	unsigned int s_qpp;
+ +	unsigned short udb_density;
+ +	unsigned long qpshift;
+ +	int page;
+  
+ -	ret = cxgb4_t4_bar2_sge_qregs(adapter, qid, qtype,
+ -				&bar2_qoffset, pbar2_qid);
+ -	if (ret)
+ -		return NULL;
+ +	BUG_ON(is_t4(adap->params.chip));
+  
+ -	return adapter->bar2 + bar2_qoffset;
+ +	s_qpp = (QUEUESPERPAGEPF0 +
+ +		(QUEUESPERPAGEPF1 - QUEUESPERPAGEPF0) * adap->fn);
+ +	udb_density = 1 << ((qpp >> s_qpp) & QUEUESPERPAGEPF0_MASK);
+ +	qpshift = PAGE_SHIFT - ilog2(udb_density);
+ +	udb = cntxt_id << qpshift;
+ +	udb &= PAGE_MASK;
+ +	page = udb / PAGE_SIZE;
+ +	udb += (cntxt_id - (page * udb_density)) * SGE_UDB_SIZE;
+ +
+ +	return udb;
+ +}
+ +
+ +static u64 udb_address_eq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_EGRESS_QUEUES_PER_PAGE_PF));
+ +}
+ +
+ +static u64 udb_address_iq(struct adapter *adap, unsigned int cntxt_id)
+ +{
+ +	return udb_address(adap, cntxt_id,
+ +			   t4_read_reg(adap, SGE_INGRESS_QUEUES_PER_PAGE_PF));
+  }
+  
++ /* @intr_idx: MSI/MSI-X vector if >=0, -(absolute qid + 1) if < 0
++  * @cong: < 0 -> no congestion feedback, >= 0 -> congestion channel map
++  */
+  int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
+  		     struct net_device *dev, int intr_idx,
+- 		     struct sge_fl *fl, rspq_handler_t hnd)
++ 		     struct sge_fl *fl, rspq_handler_t hnd, int cong)
+  {
+  	int ret, flsz = 0;
+  	struct fw_iq_cmd c;
+@@@ -2337,22 -2458,24 +2340,24 @@@
+  		return -ENOMEM;
+  
+  	memset(&c, 0, sizeof(c));
+ -	c.op_to_vfn = htonl(FW_CMD_OP_V(FW_IQ_CMD) | FW_CMD_REQUEST_F |
+ -			    FW_CMD_WRITE_F | FW_CMD_EXEC_F |
+ -			    FW_IQ_CMD_PFN_V(adap->fn) | FW_IQ_CMD_VFN_V(0));
+ -	c.alloc_to_len16 = htonl(FW_IQ_CMD_ALLOC_F | FW_IQ_CMD_IQSTART_F |
+ +	c.op_to_vfn = htonl(FW_CMD_OP(FW_IQ_CMD) | FW_CMD_REQUEST |
+ +			    FW_CMD_WRITE | FW_CMD_EXEC |
+ +			    FW_IQ_CMD_PFN(adap->fn) | FW_IQ_CMD_VFN(0));
+ +	c.alloc_to_len16 = htonl(FW_IQ_CMD_ALLOC | FW_IQ_CMD_IQSTART(1) |
+  				 FW_LEN16(c));
+ -	c.type_to_iqandstindex = htonl(FW_IQ_CMD_TYPE_V(FW_IQ_TYPE_FL_INT_CAP) |
+ -		FW_IQ_CMD_IQASYNCH_V(fwevtq) | FW_IQ_CMD_VIID_V(pi->viid) |
+ -		FW_IQ_CMD_IQANDST_V(intr_idx < 0) | FW_IQ_CMD_IQANUD_V(1) |
+ -		FW_IQ_CMD_IQANDSTINDEX_V(intr_idx >= 0 ? intr_idx :
+ +	c.type_to_iqandstindex = htonl(FW_IQ_CMD_TYPE(FW_IQ_TYPE_FL_INT_CAP) |
+ +		FW_IQ_CMD_IQASYNCH(fwevtq) | FW_IQ_CMD_VIID(pi->viid) |
+ +		FW_IQ_CMD_IQANDST(intr_idx < 0) | FW_IQ_CMD_IQANUD(1) |
+ +		FW_IQ_CMD_IQANDSTINDEX(intr_idx >= 0 ? intr_idx :
+  							-intr_idx - 1));
+ -	c.iqdroprss_to_iqesize = htons(FW_IQ_CMD_IQPCIECH_V(pi->tx_chan) |
+ -		FW_IQ_CMD_IQGTSMODE_F |
+ -		FW_IQ_CMD_IQINTCNTTHRESH_V(iq->pktcnt_idx) |
+ -		FW_IQ_CMD_IQESIZE_V(ilog2(iq->iqe_len) - 4));
+ +	c.iqdroprss_to_iqesize = htons(FW_IQ_CMD_IQPCIECH(pi->tx_chan) |
+ +		FW_IQ_CMD_IQGTSMODE |
+ +		FW_IQ_CMD_IQINTCNTTHRESH(iq->pktcnt_idx) |
+ +		FW_IQ_CMD_IQESIZE(ilog2(iq->iqe_len) - 4));
+  	c.iqsize = htons(iq->size);
+  	c.iqaddr = cpu_to_be64(iq->phys_addr);
++ 	if (cong >= 0)
++ 		c.iqns_to_fl0congen = htonl(FW_IQ_CMD_IQFLINTCONGEN_F);
+  
+  	if (fl) {
+  		/* Allocate the ring for the hardware free list (with space
+@@@ -2372,12 -2495,17 +2377,26 @@@
+  			goto fl_nomem;
+  
+  		flsz = fl->size / 8 + s->stat_len / sizeof(struct tx_desc);
+++<<<<<<< HEAD
+ +		c.iqns_to_fl0congen = htonl(FW_IQ_CMD_FL0PACKEN(1) |
+ +					    FW_IQ_CMD_FL0FETCHRO(1) |
+ +					    FW_IQ_CMD_FL0DATARO(1) |
+ +					    FW_IQ_CMD_FL0PADEN(1));
+ +		c.fl0dcaen_to_fl0cidxfthresh = htons(FW_IQ_CMD_FL0FBMIN(2) |
+ +				FW_IQ_CMD_FL0FBMAX(3));
+++=======
++ 		c.iqns_to_fl0congen |= htonl(FW_IQ_CMD_FL0PACKEN_F |
++ 					     FW_IQ_CMD_FL0FETCHRO_F |
++ 					     FW_IQ_CMD_FL0DATARO_F |
++ 					     FW_IQ_CMD_FL0PADEN_F);
++ 		if (cong >= 0)
++ 			c.iqns_to_fl0congen |=
++ 				htonl(FW_IQ_CMD_FL0CNGCHMAP_V(cong) |
++ 				      FW_IQ_CMD_FL0CONGCIF_F |
++ 				      FW_IQ_CMD_FL0CONGEN_F);
++ 		c.fl0dcaen_to_fl0cidxfthresh = htons(FW_IQ_CMD_FL0FBMIN_V(2) |
++ 				FW_IQ_CMD_FL0FBMAX_V(3));
+++>>>>>>> 145ef8a54eb3 (cxgb4: Enable congestion notification from SGE for IQs and FLs.)
+  		c.fl0size = htons(flsz);
+  		c.fl0addr = cpu_to_be64(fl->addr);
+  	}
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 4234b8c917e7,8ba91c328870..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@@ -2375,7 -3347,61 +2375,65 @@@ void t4_load_mtus(struct adapter *adap
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + *	get_mps_bg_map - return the buffer groups associated with a port
+++=======
++  *	t4_pmtx_get_stats - returns the HW stats from PMTX
++  *	@adap: the adapter
++  *	@cnt: where to store the count statistics
++  *	@cycles: where to store the cycle statistics
++  *
++  *	Returns performance statistics from PMTX.
++  */
++ void t4_pmtx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[])
++ {
++ 	int i;
++ 	u32 data[2];
++ 
++ 	for (i = 0; i < PM_NSTATS; i++) {
++ 		t4_write_reg(adap, PM_TX_STAT_CONFIG_A, i + 1);
++ 		cnt[i] = t4_read_reg(adap, PM_TX_STAT_COUNT_A);
++ 		if (is_t4(adap->params.chip)) {
++ 			cycles[i] = t4_read_reg64(adap, PM_TX_STAT_LSB_A);
++ 		} else {
++ 			t4_read_indirect(adap, PM_TX_DBG_CTRL_A,
++ 					 PM_TX_DBG_DATA_A, data, 2,
++ 					 PM_TX_DBG_STAT_MSB_A);
++ 			cycles[i] = (((u64)data[0] << 32) | data[1]);
++ 		}
++ 	}
++ }
++ 
++ /**
++  *	t4_pmrx_get_stats - returns the HW stats from PMRX
++  *	@adap: the adapter
++  *	@cnt: where to store the count statistics
++  *	@cycles: where to store the cycle statistics
++  *
++  *	Returns performance statistics from PMRX.
++  */
++ void t4_pmrx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[])
++ {
++ 	int i;
++ 	u32 data[2];
++ 
++ 	for (i = 0; i < PM_NSTATS; i++) {
++ 		t4_write_reg(adap, PM_RX_STAT_CONFIG_A, i + 1);
++ 		cnt[i] = t4_read_reg(adap, PM_RX_STAT_COUNT_A);
++ 		if (is_t4(adap->params.chip)) {
++ 			cycles[i] = t4_read_reg64(adap, PM_RX_STAT_LSB_A);
++ 		} else {
++ 			t4_read_indirect(adap, PM_RX_DBG_CTRL_A,
++ 					 PM_RX_DBG_DATA_A, data, 2,
++ 					 PM_RX_DBG_STAT_MSB_A);
++ 			cycles[i] = (((u64)data[0] << 32) | data[1]);
++ 		}
++ 	}
++ }
++ 
++ /**
++  *	t4_get_mps_bg_map - return the buffer groups associated with a port
+++>>>>>>> 145ef8a54eb3 (cxgb4: Enable congestion notification from SGE for IQs and FLs.)
+   *	@adap: the adapter
+   *	@idx: the port index
+   *
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+index 6e8a06e7cea8,e34efb7a858f..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+@@@ -1103,85 -1289,241 +1103,323 @@@ struct fw_iq_cmd 
+  	__be64 fl1addr;
+  };
+  
+++<<<<<<< HEAD
+ +#define FW_IQ_CMD_PFN(x) ((x) << 8)
+ +#define FW_IQ_CMD_VFN(x) ((x) << 0)
+ +
+ +#define FW_IQ_CMD_ALLOC (1U << 31)
+ +#define FW_IQ_CMD_FREE (1U << 30)
+ +#define FW_IQ_CMD_MODIFY (1U << 29)
+ +#define FW_IQ_CMD_IQSTART(x) ((x) << 28)
+ +#define FW_IQ_CMD_IQSTOP(x) ((x) << 27)
+ +
+ +#define FW_IQ_CMD_TYPE(x) ((x) << 29)
+ +#define FW_IQ_CMD_IQASYNCH(x) ((x) << 28)
+ +#define FW_IQ_CMD_VIID(x) ((x) << 16)
+ +#define FW_IQ_CMD_IQANDST(x) ((x) << 15)
+ +#define FW_IQ_CMD_IQANUS(x) ((x) << 14)
+ +#define FW_IQ_CMD_IQANUD(x) ((x) << 12)
+ +#define FW_IQ_CMD_IQANDSTINDEX(x) ((x) << 0)
+ +
+ +#define FW_IQ_CMD_IQDROPRSS (1U << 15)
+ +#define FW_IQ_CMD_IQGTSMODE (1U << 14)
+ +#define FW_IQ_CMD_IQPCIECH(x) ((x) << 12)
+ +#define FW_IQ_CMD_IQDCAEN(x) ((x) << 11)
+ +#define FW_IQ_CMD_IQDCACPU(x) ((x) << 6)
+ +#define FW_IQ_CMD_IQINTCNTTHRESH(x) ((x) << 4)
+ +#define FW_IQ_CMD_IQO (1U << 3)
+ +#define FW_IQ_CMD_IQCPRIO(x) ((x) << 2)
+ +#define FW_IQ_CMD_IQESIZE(x) ((x) << 0)
+ +
+ +#define FW_IQ_CMD_IQNS(x) ((x) << 31)
+ +#define FW_IQ_CMD_IQRO(x) ((x) << 30)
+ +#define FW_IQ_CMD_IQFLINTIQHSEN(x) ((x) << 28)
+ +#define FW_IQ_CMD_IQFLINTCONGEN(x) ((x) << 27)
+ +#define FW_IQ_CMD_IQFLINTISCSIC(x) ((x) << 26)
+ +#define FW_IQ_CMD_FL0CNGCHMAP(x) ((x) << 20)
+ +#define FW_IQ_CMD_FL0CACHELOCK(x) ((x) << 15)
+ +#define FW_IQ_CMD_FL0DBP(x) ((x) << 14)
+ +#define FW_IQ_CMD_FL0DATANS(x) ((x) << 13)
+ +#define FW_IQ_CMD_FL0DATARO(x) ((x) << 12)
+ +#define FW_IQ_CMD_FL0CONGCIF(x) ((x) << 11)
+ +#define FW_IQ_CMD_FL0ONCHIP(x) ((x) << 10)
+ +#define FW_IQ_CMD_FL0STATUSPGNS(x) ((x) << 9)
+ +#define FW_IQ_CMD_FL0STATUSPGRO(x) ((x) << 8)
+ +#define FW_IQ_CMD_FL0FETCHNS(x) ((x) << 7)
+ +#define FW_IQ_CMD_FL0FETCHRO(x) ((x) << 6)
+ +#define FW_IQ_CMD_FL0HOSTFCMODE(x) ((x) << 4)
+ +#define FW_IQ_CMD_FL0CPRIO(x) ((x) << 3)
+ +#define FW_IQ_CMD_FL0PADEN(x) ((x) << 2)
+ +#define FW_IQ_CMD_FL0PACKEN(x) ((x) << 1)
+ +#define FW_IQ_CMD_FL0CONGEN (1U << 0)
+ +
+ +#define FW_IQ_CMD_FL0DCAEN(x) ((x) << 15)
+ +#define FW_IQ_CMD_FL0DCACPU(x) ((x) << 10)
+ +#define FW_IQ_CMD_FL0FBMIN(x) ((x) << 7)
+ +#define FW_IQ_CMD_FL0FBMAX(x) ((x) << 4)
+ +#define FW_IQ_CMD_FL0CIDXFTHRESHO (1U << 3)
+ +#define FW_IQ_CMD_FL0CIDXFTHRESH(x) ((x) << 0)
+ +
+ +#define FW_IQ_CMD_FL1CNGCHMAP(x) ((x) << 20)
+ +#define FW_IQ_CMD_FL1CACHELOCK(x) ((x) << 15)
+ +#define FW_IQ_CMD_FL1DBP(x) ((x) << 14)
+ +#define FW_IQ_CMD_FL1DATANS(x) ((x) << 13)
+ +#define FW_IQ_CMD_FL1DATARO(x) ((x) << 12)
+ +#define FW_IQ_CMD_FL1CONGCIF(x) ((x) << 11)
+ +#define FW_IQ_CMD_FL1ONCHIP(x) ((x) << 10)
+ +#define FW_IQ_CMD_FL1STATUSPGNS(x) ((x) << 9)
+ +#define FW_IQ_CMD_FL1STATUSPGRO(x) ((x) << 8)
+ +#define FW_IQ_CMD_FL1FETCHNS(x) ((x) << 7)
+ +#define FW_IQ_CMD_FL1FETCHRO(x) ((x) << 6)
+ +#define FW_IQ_CMD_FL1HOSTFCMODE(x) ((x) << 4)
+ +#define FW_IQ_CMD_FL1CPRIO(x) ((x) << 3)
+ +#define FW_IQ_CMD_FL1PADEN (1U << 2)
+ +#define FW_IQ_CMD_FL1PACKEN (1U << 1)
+ +#define FW_IQ_CMD_FL1CONGEN (1U << 0)
+ +
+ +#define FW_IQ_CMD_FL1DCAEN(x) ((x) << 15)
+ +#define FW_IQ_CMD_FL1DCACPU(x) ((x) << 10)
+ +#define FW_IQ_CMD_FL1FBMIN(x) ((x) << 7)
+ +#define FW_IQ_CMD_FL1FBMAX(x) ((x) << 4)
+ +#define FW_IQ_CMD_FL1CIDXFTHRESHO (1U << 3)
+ +#define FW_IQ_CMD_FL1CIDXFTHRESH(x) ((x) << 0)
+++=======
++ #define FW_IQ_CMD_PFN_S		8
++ #define FW_IQ_CMD_PFN_V(x)	((x) << FW_IQ_CMD_PFN_S)
++ 
++ #define FW_IQ_CMD_VFN_S		0
++ #define FW_IQ_CMD_VFN_V(x)	((x) << FW_IQ_CMD_VFN_S)
++ 
++ #define FW_IQ_CMD_ALLOC_S	31
++ #define FW_IQ_CMD_ALLOC_V(x)	((x) << FW_IQ_CMD_ALLOC_S)
++ #define FW_IQ_CMD_ALLOC_F	FW_IQ_CMD_ALLOC_V(1U)
++ 
++ #define FW_IQ_CMD_FREE_S	30
++ #define FW_IQ_CMD_FREE_V(x)	((x) << FW_IQ_CMD_FREE_S)
++ #define FW_IQ_CMD_FREE_F	FW_IQ_CMD_FREE_V(1U)
++ 
++ #define FW_IQ_CMD_MODIFY_S	29
++ #define FW_IQ_CMD_MODIFY_V(x)	((x) << FW_IQ_CMD_MODIFY_S)
++ #define FW_IQ_CMD_MODIFY_F	FW_IQ_CMD_MODIFY_V(1U)
++ 
++ #define FW_IQ_CMD_IQSTART_S	28
++ #define FW_IQ_CMD_IQSTART_V(x)	((x) << FW_IQ_CMD_IQSTART_S)
++ #define FW_IQ_CMD_IQSTART_F	FW_IQ_CMD_IQSTART_V(1U)
++ 
++ #define FW_IQ_CMD_IQSTOP_S	27
++ #define FW_IQ_CMD_IQSTOP_V(x)	((x) << FW_IQ_CMD_IQSTOP_S)
++ #define FW_IQ_CMD_IQSTOP_F	FW_IQ_CMD_IQSTOP_V(1U)
++ 
++ #define FW_IQ_CMD_TYPE_S	29
++ #define FW_IQ_CMD_TYPE_V(x)	((x) << FW_IQ_CMD_TYPE_S)
++ 
++ #define FW_IQ_CMD_IQASYNCH_S	28
++ #define FW_IQ_CMD_IQASYNCH_V(x)	((x) << FW_IQ_CMD_IQASYNCH_S)
++ 
++ #define FW_IQ_CMD_VIID_S	16
++ #define FW_IQ_CMD_VIID_V(x)	((x) << FW_IQ_CMD_VIID_S)
++ 
++ #define FW_IQ_CMD_IQANDST_S	15
++ #define FW_IQ_CMD_IQANDST_V(x)	((x) << FW_IQ_CMD_IQANDST_S)
++ 
++ #define FW_IQ_CMD_IQANUS_S	14
++ #define FW_IQ_CMD_IQANUS_V(x)	((x) << FW_IQ_CMD_IQANUS_S)
++ 
++ #define FW_IQ_CMD_IQANUD_S	12
++ #define FW_IQ_CMD_IQANUD_V(x)	((x) << FW_IQ_CMD_IQANUD_S)
++ 
++ #define FW_IQ_CMD_IQANDSTINDEX_S	0
++ #define FW_IQ_CMD_IQANDSTINDEX_V(x)	((x) << FW_IQ_CMD_IQANDSTINDEX_S)
++ 
++ #define FW_IQ_CMD_IQDROPRSS_S		15
++ #define FW_IQ_CMD_IQDROPRSS_V(x)	((x) << FW_IQ_CMD_IQDROPRSS_S)
++ #define FW_IQ_CMD_IQDROPRSS_F	FW_IQ_CMD_IQDROPRSS_V(1U)
++ 
++ #define FW_IQ_CMD_IQGTSMODE_S		14
++ #define FW_IQ_CMD_IQGTSMODE_V(x)	((x) << FW_IQ_CMD_IQGTSMODE_S)
++ #define FW_IQ_CMD_IQGTSMODE_F		FW_IQ_CMD_IQGTSMODE_V(1U)
++ 
++ #define FW_IQ_CMD_IQPCIECH_S	12
++ #define FW_IQ_CMD_IQPCIECH_V(x)	((x) << FW_IQ_CMD_IQPCIECH_S)
++ 
++ #define FW_IQ_CMD_IQDCAEN_S	11
++ #define FW_IQ_CMD_IQDCAEN_V(x)	((x) << FW_IQ_CMD_IQDCAEN_S)
++ 
++ #define FW_IQ_CMD_IQDCACPU_S	6
++ #define FW_IQ_CMD_IQDCACPU_V(x)	((x) << FW_IQ_CMD_IQDCACPU_S)
++ 
++ #define FW_IQ_CMD_IQINTCNTTHRESH_S	4
++ #define FW_IQ_CMD_IQINTCNTTHRESH_V(x)	((x) << FW_IQ_CMD_IQINTCNTTHRESH_S)
++ 
++ #define FW_IQ_CMD_IQO_S		3
++ #define FW_IQ_CMD_IQO_V(x)	((x) << FW_IQ_CMD_IQO_S)
++ #define FW_IQ_CMD_IQO_F		FW_IQ_CMD_IQO_V(1U)
++ 
++ #define FW_IQ_CMD_IQCPRIO_S	2
++ #define FW_IQ_CMD_IQCPRIO_V(x)	((x) << FW_IQ_CMD_IQCPRIO_S)
++ 
++ #define FW_IQ_CMD_IQESIZE_S	0
++ #define FW_IQ_CMD_IQESIZE_V(x)	((x) << FW_IQ_CMD_IQESIZE_S)
++ 
++ #define FW_IQ_CMD_IQNS_S	31
++ #define FW_IQ_CMD_IQNS_V(x)	((x) << FW_IQ_CMD_IQNS_S)
++ 
++ #define FW_IQ_CMD_IQRO_S	30
++ #define FW_IQ_CMD_IQRO_V(x)	((x) << FW_IQ_CMD_IQRO_S)
++ 
++ #define FW_IQ_CMD_IQFLINTIQHSEN_S	28
++ #define FW_IQ_CMD_IQFLINTIQHSEN_V(x)	((x) << FW_IQ_CMD_IQFLINTIQHSEN_S)
++ 
++ #define FW_IQ_CMD_IQFLINTCONGEN_S	27
++ #define FW_IQ_CMD_IQFLINTCONGEN_V(x)	((x) << FW_IQ_CMD_IQFLINTCONGEN_S)
++ #define FW_IQ_CMD_IQFLINTCONGEN_F	FW_IQ_CMD_IQFLINTCONGEN_V(1U)
++ 
++ #define FW_IQ_CMD_IQFLINTISCSIC_S	26
++ #define FW_IQ_CMD_IQFLINTISCSIC_V(x)	((x) << FW_IQ_CMD_IQFLINTISCSIC_S)
++ 
++ #define FW_IQ_CMD_FL0CNGCHMAP_S		20
++ #define FW_IQ_CMD_FL0CNGCHMAP_V(x)	((x) << FW_IQ_CMD_FL0CNGCHMAP_S)
++ 
++ #define FW_IQ_CMD_FL0CACHELOCK_S	15
++ #define FW_IQ_CMD_FL0CACHELOCK_V(x)	((x) << FW_IQ_CMD_FL0CACHELOCK_S)
++ 
++ #define FW_IQ_CMD_FL0DBP_S	14
++ #define FW_IQ_CMD_FL0DBP_V(x)	((x) << FW_IQ_CMD_FL0DBP_S)
++ 
++ #define FW_IQ_CMD_FL0DATANS_S		13
++ #define FW_IQ_CMD_FL0DATANS_V(x)	((x) << FW_IQ_CMD_FL0DATANS_S)
++ 
++ #define FW_IQ_CMD_FL0DATARO_S		12
++ #define FW_IQ_CMD_FL0DATARO_V(x)	((x) << FW_IQ_CMD_FL0DATARO_S)
++ #define FW_IQ_CMD_FL0DATARO_F		FW_IQ_CMD_FL0DATARO_V(1U)
++ 
++ #define FW_IQ_CMD_FL0CONGCIF_S		11
++ #define FW_IQ_CMD_FL0CONGCIF_V(x)	((x) << FW_IQ_CMD_FL0CONGCIF_S)
++ #define FW_IQ_CMD_FL0CONGCIF_F		FW_IQ_CMD_FL0CONGCIF_V(1U)
++ 
++ #define FW_IQ_CMD_FL0ONCHIP_S		10
++ #define FW_IQ_CMD_FL0ONCHIP_V(x)	((x) << FW_IQ_CMD_FL0ONCHIP_S)
++ 
++ #define FW_IQ_CMD_FL0STATUSPGNS_S	9
++ #define FW_IQ_CMD_FL0STATUSPGNS_V(x)	((x) << FW_IQ_CMD_FL0STATUSPGNS_S)
++ 
++ #define FW_IQ_CMD_FL0STATUSPGRO_S	8
++ #define FW_IQ_CMD_FL0STATUSPGRO_V(x)	((x) << FW_IQ_CMD_FL0STATUSPGRO_S)
++ 
++ #define FW_IQ_CMD_FL0FETCHNS_S		7
++ #define FW_IQ_CMD_FL0FETCHNS_V(x)	((x) << FW_IQ_CMD_FL0FETCHNS_S)
++ 
++ #define FW_IQ_CMD_FL0FETCHRO_S		6
++ #define FW_IQ_CMD_FL0FETCHRO_V(x)	((x) << FW_IQ_CMD_FL0FETCHRO_S)
++ #define FW_IQ_CMD_FL0FETCHRO_F		FW_IQ_CMD_FL0FETCHRO_V(1U)
++ 
++ #define FW_IQ_CMD_FL0HOSTFCMODE_S	4
++ #define FW_IQ_CMD_FL0HOSTFCMODE_V(x)	((x) << FW_IQ_CMD_FL0HOSTFCMODE_S)
++ 
++ #define FW_IQ_CMD_FL0CPRIO_S	3
++ #define FW_IQ_CMD_FL0CPRIO_V(x)	((x) << FW_IQ_CMD_FL0CPRIO_S)
++ 
++ #define FW_IQ_CMD_FL0PADEN_S	2
++ #define FW_IQ_CMD_FL0PADEN_V(x)	((x) << FW_IQ_CMD_FL0PADEN_S)
++ #define FW_IQ_CMD_FL0PADEN_F	FW_IQ_CMD_FL0PADEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL0PACKEN_S		1
++ #define FW_IQ_CMD_FL0PACKEN_V(x)	((x) << FW_IQ_CMD_FL0PACKEN_S)
++ #define FW_IQ_CMD_FL0PACKEN_F		FW_IQ_CMD_FL0PACKEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL0CONGEN_S		0
++ #define FW_IQ_CMD_FL0CONGEN_V(x)	((x) << FW_IQ_CMD_FL0CONGEN_S)
++ #define FW_IQ_CMD_FL0CONGEN_F		FW_IQ_CMD_FL0CONGEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL0DCAEN_S	15
++ #define FW_IQ_CMD_FL0DCAEN_V(x)	((x) << FW_IQ_CMD_FL0DCAEN_S)
++ 
++ #define FW_IQ_CMD_FL0DCACPU_S		10
++ #define FW_IQ_CMD_FL0DCACPU_V(x)	((x) << FW_IQ_CMD_FL0DCACPU_S)
++ 
++ #define FW_IQ_CMD_FL0FBMIN_S	7
++ #define FW_IQ_CMD_FL0FBMIN_V(x)	((x) << FW_IQ_CMD_FL0FBMIN_S)
++ 
++ #define FW_IQ_CMD_FL0FBMAX_S	4
++ #define FW_IQ_CMD_FL0FBMAX_V(x)	((x) << FW_IQ_CMD_FL0FBMAX_S)
++ 
++ #define FW_IQ_CMD_FL0CIDXFTHRESHO_S	3
++ #define FW_IQ_CMD_FL0CIDXFTHRESHO_V(x)	((x) << FW_IQ_CMD_FL0CIDXFTHRESHO_S)
++ #define FW_IQ_CMD_FL0CIDXFTHRESHO_F	FW_IQ_CMD_FL0CIDXFTHRESHO_V(1U)
++ 
++ #define FW_IQ_CMD_FL0CIDXFTHRESH_S	0
++ #define FW_IQ_CMD_FL0CIDXFTHRESH_V(x)	((x) << FW_IQ_CMD_FL0CIDXFTHRESH_S)
++ 
++ #define FW_IQ_CMD_FL1CNGCHMAP_S		20
++ #define FW_IQ_CMD_FL1CNGCHMAP_V(x)	((x) << FW_IQ_CMD_FL1CNGCHMAP_S)
++ 
++ #define FW_IQ_CMD_FL1CACHELOCK_S	15
++ #define FW_IQ_CMD_FL1CACHELOCK_V(x)	((x) << FW_IQ_CMD_FL1CACHELOCK_S)
++ 
++ #define FW_IQ_CMD_FL1DBP_S	14
++ #define FW_IQ_CMD_FL1DBP_V(x)	((x) << FW_IQ_CMD_FL1DBP_S)
++ 
++ #define FW_IQ_CMD_FL1DATANS_S		13
++ #define FW_IQ_CMD_FL1DATANS_V(x)	((x) << FW_IQ_CMD_FL1DATANS_S)
++ 
++ #define FW_IQ_CMD_FL1DATARO_S		12
++ #define FW_IQ_CMD_FL1DATARO_V(x)	((x) << FW_IQ_CMD_FL1DATARO_S)
++ 
++ #define FW_IQ_CMD_FL1CONGCIF_S		11
++ #define FW_IQ_CMD_FL1CONGCIF_V(x)	((x) << FW_IQ_CMD_FL1CONGCIF_S)
++ 
++ #define FW_IQ_CMD_FL1ONCHIP_S		10
++ #define FW_IQ_CMD_FL1ONCHIP_V(x)	((x) << FW_IQ_CMD_FL1ONCHIP_S)
++ 
++ #define FW_IQ_CMD_FL1STATUSPGNS_S	9
++ #define FW_IQ_CMD_FL1STATUSPGNS_V(x)	((x) << FW_IQ_CMD_FL1STATUSPGNS_S)
++ 
++ #define FW_IQ_CMD_FL1STATUSPGRO_S	8
++ #define FW_IQ_CMD_FL1STATUSPGRO_V(x)	((x) << FW_IQ_CMD_FL1STATUSPGRO_S)
++ 
++ #define FW_IQ_CMD_FL1FETCHNS_S		7
++ #define FW_IQ_CMD_FL1FETCHNS_V(x)	((x) << FW_IQ_CMD_FL1FETCHNS_S)
++ 
++ #define FW_IQ_CMD_FL1FETCHRO_S		6
++ #define FW_IQ_CMD_FL1FETCHRO_V(x)	((x) << FW_IQ_CMD_FL1FETCHRO_S)
++ 
++ #define FW_IQ_CMD_FL1HOSTFCMODE_S	4
++ #define FW_IQ_CMD_FL1HOSTFCMODE_V(x)	((x) << FW_IQ_CMD_FL1HOSTFCMODE_S)
++ 
++ #define FW_IQ_CMD_FL1CPRIO_S	3
++ #define FW_IQ_CMD_FL1CPRIO_V(x)	((x) << FW_IQ_CMD_FL1CPRIO_S)
++ 
++ #define FW_IQ_CMD_FL1PADEN_S	2
++ #define FW_IQ_CMD_FL1PADEN_V(x)	((x) << FW_IQ_CMD_FL1PADEN_S)
++ #define FW_IQ_CMD_FL1PADEN_F	FW_IQ_CMD_FL1PADEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL1PACKEN_S		1
++ #define FW_IQ_CMD_FL1PACKEN_V(x)	((x) << FW_IQ_CMD_FL1PACKEN_S)
++ #define FW_IQ_CMD_FL1PACKEN_F	FW_IQ_CMD_FL1PACKEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL1CONGEN_S		0
++ #define FW_IQ_CMD_FL1CONGEN_V(x)	((x) << FW_IQ_CMD_FL1CONGEN_S)
++ #define FW_IQ_CMD_FL1CONGEN_F	FW_IQ_CMD_FL1CONGEN_V(1U)
++ 
++ #define FW_IQ_CMD_FL1DCAEN_S	15
++ #define FW_IQ_CMD_FL1DCAEN_V(x)	((x) << FW_IQ_CMD_FL1DCAEN_S)
++ 
++ #define FW_IQ_CMD_FL1DCACPU_S		10
++ #define FW_IQ_CMD_FL1DCACPU_V(x)	((x) << FW_IQ_CMD_FL1DCACPU_S)
++ 
++ #define FW_IQ_CMD_FL1FBMIN_S	7
++ #define FW_IQ_CMD_FL1FBMIN_V(x)	((x) << FW_IQ_CMD_FL1FBMIN_S)
++ 
++ #define FW_IQ_CMD_FL1FBMAX_S	4
++ #define FW_IQ_CMD_FL1FBMAX_V(x)	((x) << FW_IQ_CMD_FL1FBMAX_S)
++ 
++ #define FW_IQ_CMD_FL1CIDXFTHRESHO_S	3
++ #define FW_IQ_CMD_FL1CIDXFTHRESHO_V(x)	((x) << FW_IQ_CMD_FL1CIDXFTHRESHO_S)
++ #define FW_IQ_CMD_FL1CIDXFTHRESHO_F	FW_IQ_CMD_FL1CIDXFTHRESHO_V(1U)
++ 
++ #define FW_IQ_CMD_FL1CIDXFTHRESH_S	0
++ #define FW_IQ_CMD_FL1CIDXFTHRESH_V(x)	((x) << FW_IQ_CMD_FL1CIDXFTHRESH_S)
+++>>>>>>> 145ef8a54eb3 (cxgb4: Enable congestion notification from SGE for IQs and FLs.)
+  
+  struct fw_eq_eth_cmd {
+  	__be32 op_to_vfn;
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 1aceddf35b67..4666f47f6bbe 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -1050,7 +1050,7 @@ static int alloc_ofld_rxqs(struct adapter *adap, struct sge_ofld_rxq *q,
+ 		err = t4_sge_alloc_rxq(adap, &q->rspq, false,
+ 				       adap->port[i / per_chan],
+ 				       msi_idx, q->fl.size ? &q->fl : NULL,
+-				       uldrx_handler);
++				       uldrx_handler, 0);
+ 		if (err)
+ 			return err;
+ 		memset(&q->stats, 0, sizeof(q->stats));
+@@ -1080,14 +1080,14 @@ static int setup_sge_queues(struct adapter *adap)
+ 		msi_idx = 1;         /* vector 0 is for non-queue interrupts */
+ 	else {
+ 		err = t4_sge_alloc_rxq(adap, &s->intrq, false, adap->port[0], 0,
+-				       NULL, NULL);
++				       NULL, NULL, -1);
+ 		if (err)
+ 			return err;
+ 		msi_idx = -((int)s->intrq.abs_id + 1);
+ 	}
+ 
+ 	err = t4_sge_alloc_rxq(adap, &s->fw_evtq, true, adap->port[0],
+-			       msi_idx, NULL, fwevtq_handler);
++			       msi_idx, NULL, fwevtq_handler, -1);
+ 	if (err) {
+ freeout:	t4_free_sge_resources(adap);
+ 		return err;
+@@ -1104,7 +1104,9 @@ freeout:	t4_free_sge_resources(adap);
+ 				msi_idx++;
+ 			err = t4_sge_alloc_rxq(adap, &q->rspq, false, dev,
+ 					       msi_idx, &q->fl,
+-					       t4_ethrx_handler);
++					       t4_ethrx_handler,
++					       t4_get_mps_bg_map(adap,
++								 pi->tx_chan));
+ 			if (err)
+ 				goto freeout;
+ 			q->rspq.idx = j;
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
