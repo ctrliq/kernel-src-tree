@@ -8500,7 +8500,7 @@ out:
 	if (!for_reloc && root_dropped == false)
 		btrfs_add_dead_root(root);
 	if (err && err != -EAGAIN)
-		btrfs_std_error(root->fs_info, err);
+		btrfs_std_error(root->fs_info, err, NULL);
 	return err;
 }
 
