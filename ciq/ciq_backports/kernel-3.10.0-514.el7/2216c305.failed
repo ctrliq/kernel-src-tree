@@ -1,0 +1,526 @@
+megaraid_sas: Update device queue depth based on interface type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sumit Saxena <sumit.saxena@avagotech.com>
+commit 2216c30523b0a1835b6d522ffe73ca167f199f00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2216c305.failed
+
+This patch will update device Queue depth based on interface type(SAS,
+SATA..) for sysPDs.  For Virtual disks(VDs), there will be no change in
+queue depth (will remain 256).  To fetch interface type (SAS or SATA or
+FC..) of syspD, driver will send DCMD MR_DCMD_PD_GET_INFO.
+
+	Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 2216c30523b0a1835b6d522ffe73ca167f199f00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index b60f8ef53c66,ea3994b10e2f..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -1747,12 -1797,67 +1749,73 @@@ static void megasas_set_dma_alignment(s
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int megasas_slave_configure(struct scsi_device *sdev)
+ +{
+ +	megasas_set_dma_alignment(sdev);
+++=======
++ static void megasas_set_device_queue_depth(struct scsi_device *sdev)
++ {
++ 	u16				pd_index = 0;
++ 	int		ret = DCMD_FAILED;
++ 	struct megasas_instance *instance;
++ 
++ 	instance = megasas_lookup_instance(sdev->host->host_no);
++ 
++ 	if (sdev->channel < MEGASAS_MAX_PD_CHANNELS) {
++ 		pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
++ 
++ 		if (instance->pd_info) {
++ 			mutex_lock(&instance->hba_mutex);
++ 			ret = megasas_get_pd_info(instance, pd_index);
++ 			mutex_unlock(&instance->hba_mutex);
++ 		}
++ 
++ 		if (ret != DCMD_SUCCESS)
++ 			return;
++ 
++ 		if (instance->pd_list[pd_index].driveState == MR_PD_STATE_SYSTEM) {
++ 
++ 			switch (instance->pd_list[pd_index].interface) {
++ 			case SAS_PD:
++ 				scsi_change_queue_depth(sdev, MEGASAS_SAS_QD);
++ 				break;
++ 
++ 			case SATA_PD:
++ 				scsi_change_queue_depth(sdev, MEGASAS_SATA_QD);
++ 				break;
++ 
++ 			default:
++ 				scsi_change_queue_depth(sdev, MEGASAS_DEFAULT_PD_QD);
++ 			}
++ 		}
++ 	}
++ }
++ 
++ 
++ static int megasas_slave_configure(struct scsi_device *sdev)
++ {
++ 	u16 pd_index = 0;
++ 	struct megasas_instance *instance;
++ 
++ 	instance = megasas_lookup_instance(sdev->host->host_no);
++ 	if (instance->allow_fw_scan) {
++ 		if (sdev->channel < MEGASAS_MAX_PD_CHANNELS &&
++ 			sdev->type == TYPE_DISK) {
++ 			pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +
++ 				sdev->id;
++ 			if (instance->pd_list[pd_index].driveState !=
++ 				MR_PD_STATE_SYSTEM)
++ 				return -ENXIO;
++ 		}
++ 	}
++ 	megasas_set_device_queue_depth(sdev);
++ 	megasas_update_sdev_properties(sdev);
++ 
+++>>>>>>> 2216c30523b0 (megaraid_sas: Update device queue depth based on interface type)
+  	/*
+ -	 * The RAID firmware may require extended timeouts.
+ -	 */
+ +	* The RAID firmware may require extended timeouts.
+ +	*/
+  	blk_queue_rq_timeout(sdev->request_queue,
+  		MEGASAS_DEFAULT_CMD_TIMEOUT * HZ);
+  
+@@@ -3893,6 -3944,92 +3956,95 @@@ int megasas_alloc_cmds(struct megasas_i
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * dcmd_timeout_ocr_possible -	Check if OCR is possible based on Driver/FW state.
++  * @instance:				Adapter soft state
++  *
++  * Return 0 for only Fusion adapter, if driver load/unload is not in progress
++  * or FW is not under OCR.
++  */
++ inline int
++ dcmd_timeout_ocr_possible(struct megasas_instance *instance) {
++ 
++ 	if (!instance->ctrl_context)
++ 		return KILL_ADAPTER;
++ 	else if (instance->unload ||
++ 			test_bit(MEGASAS_FUSION_IN_RESET, &instance->reset_flags))
++ 		return IGNORE_TIMEOUT;
++ 	else
++ 		return INITIATE_OCR;
++ }
++ 
++ static int
++ megasas_get_pd_info(struct megasas_instance *instance, u16 device_id)
++ {
++ 	int ret;
++ 	struct megasas_cmd *cmd;
++ 	struct megasas_dcmd_frame *dcmd;
++ 
++ 	cmd = megasas_get_cmd(instance);
++ 
++ 	if (!cmd) {
++ 		dev_err(&instance->pdev->dev, "Failed to get cmd %s\n", __func__);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	dcmd = &cmd->frame->dcmd;
++ 
++ 	memset(instance->pd_info, 0, sizeof(*instance->pd_info));
++ 	memset(dcmd->mbox.b, 0, MFI_MBOX_SIZE);
++ 
++ 	dcmd->mbox.s[0] = cpu_to_le16(device_id);
++ 	dcmd->cmd = MFI_CMD_DCMD;
++ 	dcmd->cmd_status = 0xFF;
++ 	dcmd->sge_count = 1;
++ 	dcmd->flags = cpu_to_le16(MFI_FRAME_DIR_READ);
++ 	dcmd->timeout = 0;
++ 	dcmd->pad_0 = 0;
++ 	dcmd->data_xfer_len = cpu_to_le32(sizeof(struct MR_PD_INFO));
++ 	dcmd->opcode = cpu_to_le32(MR_DCMD_PD_GET_INFO);
++ 	dcmd->sgl.sge32[0].phys_addr = cpu_to_le32(instance->pd_info_h);
++ 	dcmd->sgl.sge32[0].length = cpu_to_le32(sizeof(struct MR_PD_INFO));
++ 
++ 	if (instance->ctrl_context && !instance->mask_interrupts)
++ 		ret = megasas_issue_blocked_cmd(instance, cmd, MFI_IO_TIMEOUT_SECS);
++ 	else
++ 		ret = megasas_issue_polled(instance, cmd);
++ 
++ 	switch (ret) {
++ 	case DCMD_SUCCESS:
++ 		instance->pd_list[device_id].interface =
++ 				instance->pd_info->state.ddf.pdType.intf;
++ 		break;
++ 
++ 	case DCMD_TIMEOUT:
++ 
++ 		switch (dcmd_timeout_ocr_possible(instance)) {
++ 		case INITIATE_OCR:
++ 			cmd->flags |= DRV_DCMD_SKIP_REFIRE;
++ 			megasas_reset_fusion(instance->host,
++ 				MFI_IO_TIMEOUT_OCR);
++ 			break;
++ 		case KILL_ADAPTER:
++ 			megaraid_sas_kill_hba(instance);
++ 			break;
++ 		case IGNORE_TIMEOUT:
++ 			dev_info(&instance->pdev->dev, "Ignore DCMD timeout: %s %d\n",
++ 				__func__, __LINE__);
++ 			break;
++ 		}
++ 
++ 		break;
++ 	}
++ 
++ 	if (ret != DCMD_TIMEOUT)
++ 		megasas_return_cmd(instance, cmd);
++ 
++ 	return ret;
++ }
++ /*
+++>>>>>>> 2216c30523b0 (megaraid_sas: Update device queue depth based on interface type)
+   * megasas_get_pd_list_info -	Returns FW's pd_list structure
+   * @instance:				Adapter soft state
+   * @pd_list:				pd_list structure
+@@@ -5527,8 -5808,8 +5685,9 @@@ static int megasas_probe_one(struct pci
+  	spin_lock_init(&instance->hba_lock);
+  	spin_lock_init(&instance->completion_lock);
+  
+ +	mutex_init(&instance->aen_mutex);
+  	mutex_init(&instance->reset_mutex);
++ 	mutex_init(&instance->hba_mutex);
+  
+  	/*
+  	 * Initialize PCI related and misc parameters
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index d4c399b43165..b978c635799c 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -214,6 +214,7 @@
+ 
+ #define MR_DCMD_CTRL_SET_CRASH_DUMP_PARAMS	0x01190100
+ #define MR_DRIVER_SET_APP_CRASHDUMP_MODE	(0xF0010000 | 0x0600)
++#define MR_DCMD_PD_GET_INFO			0x02020000
+ 
+ /*
+  * Global functions
+@@ -434,6 +435,257 @@ enum MR_PD_STATE {
+ 	MR_PD_STATE_SYSTEM              = 0x40,
+  };
+ 
++union MR_PD_REF {
++	struct {
++		u16	 deviceId;
++		u16	 seqNum;
++	} mrPdRef;
++	u32	 ref;
++};
++
++/*
++ * define the DDF Type bit structure
++ */
++union MR_PD_DDF_TYPE {
++	 struct {
++		union {
++			struct {
++#ifndef __BIG_ENDIAN_BITFIELD
++				 u16	 forcedPDGUID:1;
++				 u16	 inVD:1;
++				 u16	 isGlobalSpare:1;
++				 u16	 isSpare:1;
++				 u16	 isForeign:1;
++				 u16	 reserved:7;
++				 u16	 intf:4;
++#else
++				 u16	 intf:4;
++				 u16	 reserved:7;
++				 u16	 isForeign:1;
++				 u16	 isSpare:1;
++				 u16	 isGlobalSpare:1;
++				 u16	 inVD:1;
++				 u16	 forcedPDGUID:1;
++#endif
++			 } pdType;
++			 u16	 type;
++		 };
++		 u16	 reserved;
++	 } ddf;
++	 struct {
++		 u32	reserved;
++	 } nonDisk;
++	 u32	 type;
++} __packed;
++
++/*
++ * defines the progress structure
++ */
++union MR_PROGRESS {
++	struct  {
++		u16 progress;
++		union {
++			u16 elapsedSecs;
++			u16 elapsedSecsForLastPercent;
++		};
++	} mrProgress;
++	u32 w;
++} __packed;
++
++/*
++ * defines the physical drive progress structure
++ */
++struct MR_PD_PROGRESS {
++	struct {
++#ifndef MFI_BIG_ENDIAN
++		u32     rbld:1;
++		u32     patrol:1;
++		u32     clear:1;
++		u32     copyBack:1;
++		u32     erase:1;
++		u32     locate:1;
++		u32     reserved:26;
++#else
++		u32     reserved:26;
++		u32     locate:1;
++		u32     erase:1;
++		u32     copyBack:1;
++		u32     clear:1;
++		u32     patrol:1;
++		u32     rbld:1;
++#endif
++	} active;
++	union MR_PROGRESS     rbld;
++	union MR_PROGRESS     patrol;
++	union {
++		union MR_PROGRESS     clear;
++		union MR_PROGRESS     erase;
++	};
++
++	struct {
++#ifndef MFI_BIG_ENDIAN
++		u32     rbld:1;
++		u32     patrol:1;
++		u32     clear:1;
++		u32     copyBack:1;
++		u32     erase:1;
++		u32     reserved:27;
++#else
++		u32     reserved:27;
++		u32     erase:1;
++		u32     copyBack:1;
++		u32     clear:1;
++		u32     patrol:1;
++		u32     rbld:1;
++#endif
++	} pause;
++
++	union MR_PROGRESS     reserved[3];
++} __packed;
++
++struct  MR_PD_INFO {
++	union MR_PD_REF	ref;
++	u8 inquiryData[96];
++	u8 vpdPage83[64];
++	u8 notSupported;
++	u8 scsiDevType;
++
++	union {
++		u8 connectedPortBitmap;
++		u8 connectedPortNumbers;
++	};
++
++	u8 deviceSpeed;
++	u32 mediaErrCount;
++	u32 otherErrCount;
++	u32 predFailCount;
++	u32 lastPredFailEventSeqNum;
++
++	u16 fwState;
++	u8 disabledForRemoval;
++	u8 linkSpeed;
++	union MR_PD_DDF_TYPE state;
++
++	struct {
++		u8 count;
++#ifndef __BIG_ENDIAN_BITFIELD
++		u8 isPathBroken:4;
++		u8 reserved3:3;
++		u8 widePortCapable:1;
++#else
++		u8 widePortCapable:1;
++		u8 reserved3:3;
++		u8 isPathBroken:4;
++#endif
++
++		u8 connectorIndex[2];
++		u8 reserved[4];
++		u64 sasAddr[2];
++		u8 reserved2[16];
++	} pathInfo;
++
++	u64 rawSize;
++	u64 nonCoercedSize;
++	u64 coercedSize;
++	u16 enclDeviceId;
++	u8 enclIndex;
++
++	union {
++		u8 slotNumber;
++		u8 enclConnectorIndex;
++	};
++
++	struct MR_PD_PROGRESS progInfo;
++	u8 badBlockTableFull;
++	u8 unusableInCurrentConfig;
++	u8 vpdPage83Ext[64];
++	u8 powerState;
++	u8 enclPosition;
++	u32 allowedOps;
++	u16 copyBackPartnerId;
++	u16 enclPartnerDeviceId;
++	struct {
++#ifndef __BIG_ENDIAN_BITFIELD
++		u16 fdeCapable:1;
++		u16 fdeEnabled:1;
++		u16 secured:1;
++		u16 locked:1;
++		u16 foreign:1;
++		u16 needsEKM:1;
++		u16 reserved:10;
++#else
++		u16 reserved:10;
++		u16 needsEKM:1;
++		u16 foreign:1;
++		u16 locked:1;
++		u16 secured:1;
++		u16 fdeEnabled:1;
++		u16 fdeCapable:1;
++#endif
++	} security;
++	u8 mediaType;
++	u8 notCertified;
++	u8 bridgeVendor[8];
++	u8 bridgeProductIdentification[16];
++	u8 bridgeProductRevisionLevel[4];
++	u8 satBridgeExists;
++
++	u8 interfaceType;
++	u8 temperature;
++	u8 emulatedBlockSize;
++	u16 userDataBlockSize;
++	u16 reserved2;
++
++	struct {
++#ifndef __BIG_ENDIAN_BITFIELD
++		u32 piType:3;
++		u32 piFormatted:1;
++		u32 piEligible:1;
++		u32 NCQ:1;
++		u32 WCE:1;
++		u32 commissionedSpare:1;
++		u32 emergencySpare:1;
++		u32 ineligibleForSSCD:1;
++		u32 ineligibleForLd:1;
++		u32 useSSEraseType:1;
++		u32 wceUnchanged:1;
++		u32 supportScsiUnmap:1;
++		u32 reserved:18;
++#else
++		u32 reserved:18;
++		u32 supportScsiUnmap:1;
++		u32 wceUnchanged:1;
++		u32 useSSEraseType:1;
++		u32 ineligibleForLd:1;
++		u32 ineligibleForSSCD:1;
++		u32 emergencySpare:1;
++		u32 commissionedSpare:1;
++		u32 WCE:1;
++		u32 NCQ:1;
++		u32 piEligible:1;
++		u32 piFormatted:1;
++		u32 piType:3;
++#endif
++	} properties;
++
++	u64 shieldDiagCompletionTime;
++	u8 shieldCounter;
++
++	u8 linkSpeedOther;
++	u8 reserved4[2];
++
++	struct {
++#ifndef __BIG_ENDIAN_BITFIELD
++		u32 bbmErrCountSupported:1;
++		u32 bbmErrCount:31;
++#else
++		u32 bbmErrCount:31;
++		u32 bbmErrCountSupported:1;
++#endif
++	} bbmErr;
++
++	u8 reserved1[512-428];
++} __packed;
+ 
+  /*
+  * defines the physical drive address structure
+@@ -473,6 +725,7 @@ struct megasas_pd_list {
+ 	u16             tid;
+ 	u8             driveType;
+ 	u8             driveState;
++	u8             interface;
+ } __packed;
+ 
+  /*
+@@ -1700,6 +1953,19 @@ struct MR_DRV_SYSTEM_INFO {
+ 	u8	reserved[1980];
+ };
+ 
++enum MR_PD_TYPE {
++		 UNKNOWN_DRIVE = 0,
++		 PARALLEL_SCSI = 1,
++		 SAS_PD = 2,
++		 SATA_PD = 3,
++		 FC_PD = 4,
++};
++
++/* JBOD Queue depth definitions */
++#define MEGASAS_SATA_QD	32
++#define MEGASAS_SAS_QD	64
++#define MEGASAS_DEFAULT_PD_QD	64
++
+ struct megasas_instance {
+ 
+ 	__le32 *producer;
+@@ -1714,6 +1980,8 @@ struct megasas_instance {
+ 	dma_addr_t vf_affiliation_111_h;
+ 	struct MR_CTRL_HB_HOST_MEM *hb_host_mem;
+ 	dma_addr_t hb_host_mem_h;
++	struct MR_PD_INFO *pd_info;
++	dma_addr_t pd_info_h;
+ 
+ 	__le32 *reply_queue;
+ 	dma_addr_t reply_queue_h;
+@@ -1762,7 +2030,7 @@ struct megasas_instance {
+ 	struct megasas_evt_detail *evt_detail;
+ 	dma_addr_t evt_detail_h;
+ 	struct megasas_cmd *aen_cmd;
+-	struct mutex aen_mutex;
++	struct mutex hba_mutex;
+ 	struct semaphore ioctl_sem;
+ 
+ 	struct Scsi_Host *host;
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
