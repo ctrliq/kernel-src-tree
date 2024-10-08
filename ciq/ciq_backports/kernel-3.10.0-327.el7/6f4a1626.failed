@@ -1,0 +1,245 @@
+scsi-mq: fix requests that use a separate CDB buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tony Battersby <tonyb@cybernetics.com>
+commit 6f4a16266fb3e58cd3e200eab51d2220ef92d604
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6f4a1626.failed
+
+This patch fixes code such as the following with scsi-mq enabled:
+
+    rq = blk_get_request(...);
+    blk_rq_set_block_pc(rq);
+
+    rq->cmd = my_cmd_buffer; /* separate CDB buffer */
+
+    blk_execute_rq_nowait(...);
+
+Code like this appears in e.g. sg_start_req() in drivers/scsi/sg.c (for
+large CDBs only).  Without this patch, scsi_mq_prep_fn() will set
+rq->cmd back to rq->__cmd, causing the wrong CDB to be sent to the device.
+
+	Signed-off-by: Tony Battersby <tonyb@cybernetics.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 6f4a16266fb3e58cd3e200eab51d2220ef92d604)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 2eb9f5889dec,d86808f051e0..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1585,7 -1778,180 +1585,184 @@@ out_delay
+  		blk_delay_queue(q, SCSI_QUEUE_DELAY);
+  }
+  
+++<<<<<<< HEAD
+ +u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++=======
++ static inline int prep_to_mq(int ret)
++ {
++ 	switch (ret) {
++ 	case BLKPREP_OK:
++ 		return 0;
++ 	case BLKPREP_DEFER:
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 	default:
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ }
++ 
++ static int scsi_mq_prep_fn(struct request *req)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	struct scsi_device *sdev = req->q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned char *sense_buf = cmd->sense_buffer;
++ 	struct scatterlist *sg;
++ 
++ 	memset(cmd, 0, sizeof(struct scsi_cmnd));
++ 
++ 	req->special = cmd;
++ 
++ 	cmd->request = req;
++ 	cmd->device = sdev;
++ 	cmd->sense_buffer = sense_buf;
++ 
++ 	cmd->tag = req->tag;
++ 
++ 	cmd->cmnd = req->cmd;
++ 	cmd->prot_op = SCSI_PROT_NORMAL;
++ 
++ 	INIT_LIST_HEAD(&cmd->list);
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies;
++ 
++ 	/*
++ 	 * XXX: cmd_list lookups are only used by two drivers, try to get
++ 	 * rid of this list in common code.
++ 	 */
++ 	spin_lock_irq(&sdev->list_lock);
++ 	list_add_tail(&cmd->list, &sdev->cmd_list);
++ 	spin_unlock_irq(&sdev->list_lock);
++ 
++ 	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
++ 	cmd->sdb.table.sgl = sg;
++ 
++ 	if (scsi_host_get_prot(shost)) {
++ 		cmd->prot_sdb = (void *)sg +
++ 			shost->sg_tablesize * sizeof(struct scatterlist);
++ 		memset(cmd->prot_sdb, 0, sizeof(struct scsi_data_buffer));
++ 
++ 		cmd->prot_sdb->table.sgl =
++ 			(struct scatterlist *)(cmd->prot_sdb + 1);
++ 	}
++ 
++ 	if (blk_bidi_rq(req)) {
++ 		struct request *next_rq = req->next_rq;
++ 		struct scsi_data_buffer *bidi_sdb = blk_mq_rq_to_pdu(next_rq);
++ 
++ 		memset(bidi_sdb, 0, sizeof(struct scsi_data_buffer));
++ 		bidi_sdb->table.sgl =
++ 			(struct scatterlist *)(bidi_sdb + 1);
++ 
++ 		next_rq->special = bidi_sdb;
++ 	}
++ 
++ 	return scsi_setup_cmnd(sdev, req);
++ }
++ 
++ static void scsi_mq_done(struct scsi_cmnd *cmd)
++ {
++ 	trace_scsi_dispatch_cmd_done(cmd);
++ 	blk_mq_complete_request(cmd->request);
++ }
++ 
++ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
++ {
++ 	struct request_queue *q = req->q;
++ 	struct scsi_device *sdev = q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	int ret;
++ 	int reason;
++ 
++ 	ret = prep_to_mq(scsi_prep_state_check(sdev, req));
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 	if (!get_device(&sdev->sdev_gendev))
++ 		goto out;
++ 
++ 	if (!scsi_dev_queue_ready(q, sdev))
++ 		goto out_put_device;
++ 	if (!scsi_target_queue_ready(shost, sdev))
++ 		goto out_dec_device_busy;
++ 	if (!scsi_host_queue_ready(q, shost, sdev))
++ 		goto out_dec_target_busy;
++ 
++ 	if (!(req->cmd_flags & REQ_DONTPREP)) {
++ 		ret = prep_to_mq(scsi_mq_prep_fn(req));
++ 		if (ret)
++ 			goto out_dec_host_busy;
++ 		req->cmd_flags |= REQ_DONTPREP;
++ 	}
++ 
++ 	scsi_init_cmd_errh(cmd);
++ 	cmd->scsi_done = scsi_mq_done;
++ 
++ 	reason = scsi_dispatch_cmd(cmd);
++ 	if (reason) {
++ 		scsi_set_blocked(cmd, reason);
++ 		ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 		goto out_dec_host_busy;
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ 
++ out_dec_host_busy:
++ 	atomic_dec(&shost->host_busy);
++ out_dec_target_busy:
++ 	if (scsi_target(sdev)->can_queue > 0)
++ 		atomic_dec(&scsi_target(sdev)->target_busy);
++ out_dec_device_busy:
++ 	atomic_dec(&sdev->device_busy);
++ out_put_device:
++ 	put_device(&sdev->sdev_gendev);
++ out:
++ 	switch (ret) {
++ 	case BLK_MQ_RQ_QUEUE_BUSY:
++ 		blk_mq_stop_hw_queue(hctx);
++ 		if (atomic_read(&sdev->device_busy) == 0 &&
++ 		    !scsi_device_blocked(sdev))
++ 			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
++ 		break;
++ 	case BLK_MQ_RQ_QUEUE_ERROR:
++ 		/*
++ 		 * Make sure to release all allocated ressources when
++ 		 * we hit an error, as we will never see this command
++ 		 * again.
++ 		 */
++ 		if (req->cmd_flags & REQ_DONTPREP)
++ 			scsi_mq_uninit_cmd(cmd);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int scsi_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->sense_buffer = kzalloc_node(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL,
++ 			numa_node);
++ 	if (!cmd->sense_buffer)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void scsi_exit_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	kfree(cmd->sense_buffer);
++ }
++ 
++ static u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++>>>>>>> 6f4a16266fb3 (scsi-mq: fix requests that use a separate CDB buffer)
+  {
+  	struct device *host_dev;
+  	u64 bounce_limit = 0xffffffff;
+diff --git a/block/blk-core.c b/block/blk-core.c
+index ffbfb47af131..12d3f7a321f6 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1270,7 +1270,6 @@ void blk_rq_set_block_pc(struct request *rq)
+ 	rq->__sector = (sector_t) -1;
+ 	rq->bio = rq->biotail = NULL;
+ 	memset(rq->__cmd, 0, sizeof(rq->__cmd));
+-	rq->cmd = rq->__cmd;
+ }
+ EXPORT_SYMBOL(blk_rq_set_block_pc);
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 13238b516d55..3ddce2587d52 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -207,6 +207,8 @@ static void blk_mq_rq_ctx_init(struct request_queue *q, struct blk_mq_ctx *ctx,
+ 	/* tag was already set */
+ 	rq->errors = 0;
+ 
++	rq->cmd = rq->__cmd;
++
+ 	rq->extra_len = 0;
+ 	rq->sense_len = 0;
+ 	rq->resid_len = 0;
+* Unmerged path drivers/scsi/scsi_lib.c
