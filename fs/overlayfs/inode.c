@@ -342,6 +342,9 @@ static int ovl_dentry_open(struct dentry *dentry, struct file *file,
 	struct path realpath;
 	enum ovl_path_type type;
 
+	if (d_is_dir(dentry))
+		return d_backing_inode(dentry);
+
 	type = ovl_path_real(dentry, &realpath);
 	if (ovl_open_need_copy_up(file->f_flags, type, realpath.dentry)) {
 		err = ovl_want_write(dentry);
