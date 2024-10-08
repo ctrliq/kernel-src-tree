@@ -1,0 +1,393 @@
+KVM: x86: introduce lapic_in_kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 35754c987f252e859bfa390a6816e85563afe79d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/35754c98.failed
+
+Avoid pointer chasing and memory barriers, and simplify the code
+when split irqchip (LAPIC in kernel, IOAPIC/PIC in userspace)
+is introduced.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 35754c987f252e859bfa390a6816e85563afe79d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 843549a0fe2a,4729b7f6e5f2..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -811,6 -808,8 +811,11 @@@ static u64 construct_eptp(unsigned lon
+  static void kvm_cpu_vmxon(u64 addr);
+  static void kvm_cpu_vmxoff(void);
+  static bool vmx_mpx_supported(void);
+++<<<<<<< HEAD
+++=======
++ static bool vmx_xsaves_supported(void);
++ static int vmx_cpu_uses_apicv(struct kvm_vcpu *vcpu);
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr);
+  static void vmx_set_segment(struct kvm_vcpu *vcpu,
+  			    struct kvm_segment *var, int seg);
+@@@ -2379,12 -2366,20 +2384,18 @@@ static __init void nested_vmx_setup_ctl
+  
+  	/* pin-based controls */
+  	rdmsr(MSR_IA32_VMX_PINBASED_CTLS,
+ -		vmx->nested.nested_vmx_pinbased_ctls_low,
+ -		vmx->nested.nested_vmx_pinbased_ctls_high);
+ -	vmx->nested.nested_vmx_pinbased_ctls_low |=
+ -		PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR;
+ -	vmx->nested.nested_vmx_pinbased_ctls_high &=
+ -		PIN_BASED_EXT_INTR_MASK |
+ -		PIN_BASED_NMI_EXITING |
+ -		PIN_BASED_VIRTUAL_NMIS;
+ -	vmx->nested.nested_vmx_pinbased_ctls_high |=
+ -		PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR |
+ +	      nested_vmx_pinbased_ctls_low, nested_vmx_pinbased_ctls_high);
+ +	nested_vmx_pinbased_ctls_low |= PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR;
+ +	nested_vmx_pinbased_ctls_high &= PIN_BASED_EXT_INTR_MASK |
+ +		PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS;
+ +	nested_vmx_pinbased_ctls_high |= PIN_BASED_ALWAYSON_WITHOUT_TRUE_MSR |
+  		PIN_BASED_VMX_PREEMPTION_TIMER;
+++<<<<<<< HEAD
+++=======
++ 	if (vmx_cpu_uses_apicv(&vmx->vcpu))
++ 		vmx->nested.nested_vmx_pinbased_ctls_high |=
++ 			PIN_BASED_POSTED_INTR;
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  
+  	/* exit controls */
+  	rdmsr(MSR_IA32_VMX_EXIT_CTLS,
+@@@ -4231,11 -4332,79 +4242,87 @@@ static void vmx_disable_intercept_msr_w
+  			msr, MSR_TYPE_W);
+  }
+  
+++<<<<<<< HEAD
+ +static int vmx_vm_has_apicv(struct kvm *kvm)
+ +{
+ +	return enable_apicv && irqchip_in_kernel(kvm);
+ +}
+ +
+++=======
++ static int vmx_cpu_uses_apicv(struct kvm_vcpu *vcpu)
++ {
++ 	return enable_apicv && lapic_in_kernel(vcpu);
++ }
++ 
++ static int vmx_complete_nested_posted_interrupt(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	int max_irr;
++ 	void *vapic_page;
++ 	u16 status;
++ 
++ 	if (vmx->nested.pi_desc &&
++ 	    vmx->nested.pi_pending) {
++ 		vmx->nested.pi_pending = false;
++ 		if (!pi_test_and_clear_on(vmx->nested.pi_desc))
++ 			return 0;
++ 
++ 		max_irr = find_last_bit(
++ 			(unsigned long *)vmx->nested.pi_desc->pir, 256);
++ 
++ 		if (max_irr == 256)
++ 			return 0;
++ 
++ 		vapic_page = kmap(vmx->nested.virtual_apic_page);
++ 		if (!vapic_page) {
++ 			WARN_ON(1);
++ 			return -ENOMEM;
++ 		}
++ 		__kvm_apic_update_irr(vmx->nested.pi_desc->pir, vapic_page);
++ 		kunmap(vmx->nested.virtual_apic_page);
++ 
++ 		status = vmcs_read16(GUEST_INTR_STATUS);
++ 		if ((u8)max_irr > ((u8)status & 0xff)) {
++ 			status &= ~0xff;
++ 			status |= (u8)max_irr;
++ 			vmcs_write16(GUEST_INTR_STATUS, status);
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu)
++ {
++ #ifdef CONFIG_SMP
++ 	if (vcpu->mode == IN_GUEST_MODE) {
++ 		apic->send_IPI_mask(get_cpu_mask(vcpu->cpu),
++ 				POSTED_INTR_VECTOR);
++ 		return true;
++ 	}
++ #endif
++ 	return false;
++ }
++ 
++ static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
++ 						int vector)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (is_guest_mode(vcpu) &&
++ 	    vector == vmx->nested.posted_intr_nv) {
++ 		/* the PIR and ON have been set by L1. */
++ 		kvm_vcpu_trigger_posted_interrupt(vcpu);
++ 		/*
++ 		 * If a posted intr is not recognized by hardware,
++ 		 * we will accomplish it in the next vmentry.
++ 		 */
++ 		vmx->nested.pi_pending = true;
++ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
++ 		return 0;
++ 	}
++ 	return -1;
++ }
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  /*
+   * Send interrupt to vcpu via posted interrupt way.
+   * 1. If target vcpu is running(non-root mode), send posted interrupt
+@@@ -4591,11 -4760,11 +4678,15 @@@ static void vmx_vcpu_reset(struct kvm_v
+  
+  	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, 0);  /* 22.2.1 */
+  
+ -	if (cpu_has_vmx_tpr_shadow() && !init_event) {
+ +	if (cpu_has_vmx_tpr_shadow()) {
+  		vmcs_write64(VIRTUAL_APIC_PAGE_ADDR, 0);
+++<<<<<<< HEAD
+ +		if (vm_need_tpr_shadow(vmx->vcpu.kvm))
+++=======
++ 		if (cpu_need_tpr_shadow(vcpu))
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  			vmcs_write64(VIRTUAL_APIC_PAGE_ADDR,
+ -				     __pa(vcpu->arch.apic->regs));
+ +				     __pa(vmx->vcpu.arch.apic->regs));
+  		vmcs_write32(TPR_THRESHOLD, 0);
+  	}
+  
+@@@ -7818,9 -8043,10 +7909,14 @@@ static void vmx_hwapic_irr_update(struc
+  	}
+  }
+  
+ -static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+ +static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+  {
+++<<<<<<< HEAD
+ +	if (!vmx_vm_has_apicv(vcpu->kvm))
+++=======
++ 	u64 *eoi_exit_bitmap = vcpu->arch.eoi_exit_bitmap;
++ 	if (!vmx_cpu_uses_apicv(vcpu))
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  		return;
+  
+  	vmcs_write64(EOI_EXIT_BITMAP0, eoi_exit_bitmap[0]);
+@@@ -8928,7 -9337,8 +9024,12 @@@ static void prepare_vmcs02(struct kvm_v
+  			else
+  				vmcs_write64(APIC_ACCESS_ADDR,
+  				  page_to_phys(vmx->nested.apic_access_page));
+++<<<<<<< HEAD
+ +		} else if (vm_need_virtualize_apic_accesses(vmx->vcpu.kvm)) {
+++=======
++ 		} else if (!(nested_cpu_has_virt_x2apic_mode(vmcs12)) &&
++ 			    cpu_need_virtualize_apic_accesses(&vmx->vcpu)) {
+++>>>>>>> 35754c987f25 (KVM: x86: introduce lapic_in_kernel)
+  			exec_control |=
+  				SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
+  			kvm_vcpu_reload_apic_access_page(vcpu);
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index a1ec6a50a05a..fb57b09d872d 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -57,7 +57,7 @@ static int kvm_cpu_has_extint(struct kvm_vcpu *v)
+  */
+ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
+ {
+-	if (!irqchip_in_kernel(v->kvm))
++	if (!lapic_in_kernel(v))
+ 		return v->arch.interrupt.pending;
+ 
+ 	if (kvm_cpu_has_extint(v))
+@@ -75,7 +75,7 @@ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
+  */
+ int kvm_cpu_has_interrupt(struct kvm_vcpu *v)
+ {
+-	if (!irqchip_in_kernel(v->kvm))
++	if (!lapic_in_kernel(v))
+ 		return v->arch.interrupt.pending;
+ 
+ 	if (kvm_cpu_has_extint(v))
+@@ -103,7 +103,7 @@ int kvm_cpu_get_interrupt(struct kvm_vcpu *v)
+ {
+ 	int vector;
+ 
+-	if (!irqchip_in_kernel(v->kvm))
++	if (!lapic_in_kernel(v))
+ 		return v->arch.interrupt.nr;
+ 
+ 	vector = kvm_cpu_get_extint(v);
+diff --git a/arch/x86/kvm/irq.h b/arch/x86/kvm/irq.h
+index 363023e205ac..e3286bbd9cfd 100644
+--- a/arch/x86/kvm/irq.h
++++ b/arch/x86/kvm/irq.h
+@@ -92,6 +92,14 @@ static inline int irqchip_in_kernel(struct kvm *kvm)
+ 	return vpic != NULL;
+ }
+ 
++static inline int lapic_in_kernel(struct kvm_vcpu *vcpu)
++{
++	/* Same as irqchip_in_kernel(vcpu->kvm), but with less
++	 * pointer chasing and no unnecessary memory barriers.
++	 */
++	return vcpu->arch.apic != NULL;
++}
++
+ void kvm_pic_reset(struct kvm_kpic_state *s);
+ 
+ void kvm_inject_pending_timer_irqs(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1ea3691b454e..835f18093a7c 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2075,7 +2075,7 @@ int kvm_x2apic_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	u32 reg = (msr - APIC_BASE_MSR) << 4;
+ 
+-	if (!irqchip_in_kernel(vcpu->kvm) || !apic_x2apic_mode(apic))
++	if (!lapic_in_kernel(vcpu) || !apic_x2apic_mode(apic))
+ 		return 1;
+ 
+ 	if (reg == APIC_ICR2)
+@@ -2092,7 +2092,7 @@ int kvm_x2apic_msr_read(struct kvm_vcpu *vcpu, u32 msr, u64 *data)
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	u32 reg = (msr - APIC_BASE_MSR) << 4, low, high = 0;
+ 
+-	if (!irqchip_in_kernel(vcpu->kvm) || !apic_x2apic_mode(apic))
++	if (!lapic_in_kernel(vcpu) || !apic_x2apic_mode(apic))
+ 		return 1;
+ 
+ 	if (reg == APIC_DFR || reg == APIC_ICR2) {
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index dde23e41179e..7e56cda47c96 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3516,7 +3516,7 @@ static int kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu, gva_t gva, gfn_t gfn)
+ 
+ static bool can_do_async_pf(struct kvm_vcpu *vcpu)
+ {
+-	if (unlikely(!irqchip_in_kernel(vcpu->kvm) ||
++	if (unlikely(!lapic_in_kernel(vcpu) ||
+ 		     kvm_event_needs_reinjection(vcpu)))
+ 		return false;
+ 
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index f4d872b9eba6..a2fdd696904a 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3051,7 +3051,7 @@ static int cr8_write_interception(struct vcpu_svm *svm)
+ 	u8 cr8_prev = kvm_get_cr8(&svm->vcpu);
+ 	/* instruction emulation calls kvm_set_cr8() */
+ 	r = cr_interception(svm);
+-	if (irqchip_in_kernel(svm->vcpu.kvm))
++	if (lapic_in_kernel(&svm->vcpu))
+ 		return r;
+ 	if (cr8_prev <= kvm_get_cr8(&svm->vcpu))
+ 		return r;
+@@ -3296,7 +3296,7 @@ static int interrupt_window_interception(struct vcpu_svm *svm)
+ 	 * If the user space waits to inject interrupts, exit as soon as
+ 	 * possible
+ 	 */
+-	if (!irqchip_in_kernel(svm->vcpu.kvm) &&
++	if (!lapic_in_kernel(&svm->vcpu) &&
+ 	    kvm_run->request_interrupt_window &&
+ 	    !kvm_cpu_has_interrupt(&svm->vcpu)) {
+ 		kvm_run->exit_reason = KVM_EXIT_IRQ_WINDOW_OPEN;
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 733894b44f8d..faa7bebf14f9 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -795,7 +795,7 @@ int kvm_set_cr8(struct kvm_vcpu *vcpu, unsigned long cr8)
+ {
+ 	if (cr8 & CR8_RESERVED_BITS)
+ 		return 1;
+-	if (irqchip_in_kernel(vcpu->kvm))
++	if (lapic_in_kernel(vcpu))
+ 		kvm_lapic_set_tpr(vcpu, cr8);
+ 	else
+ 		vcpu->arch.cr8 = cr8;
+@@ -805,7 +805,7 @@ EXPORT_SYMBOL_GPL(kvm_set_cr8);
+ 
+ unsigned long kvm_get_cr8(struct kvm_vcpu *vcpu)
+ {
+-	if (irqchip_in_kernel(vcpu->kvm))
++	if (lapic_in_kernel(vcpu))
+ 		return kvm_lapic_get_cr8(vcpu);
+ 	else
+ 		return vcpu->arch.cr8;
+@@ -3592,7 +3592,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 		struct kvm_vapic_addr va;
+ 
+ 		r = -EINVAL;
+-		if (!irqchip_in_kernel(vcpu->kvm))
++		if (!lapic_in_kernel(vcpu))
+ 			goto out;
+ 		r = -EFAULT;
+ 		if (copy_from_user(&va, argp, sizeof va))
+@@ -6088,7 +6088,7 @@ void kvm_arch_exit(void)
+ int kvm_vcpu_halt(struct kvm_vcpu *vcpu)
+ {
+ 	++vcpu->stat.halt_exits;
+-	if (irqchip_in_kernel(vcpu->kvm)) {
++	if (lapic_in_kernel(vcpu)) {
+ 		vcpu->arch.mp_state = KVM_MP_STATE_HALTED;
+ 		return 1;
+ 	} else {
+@@ -6643,7 +6643,7 @@ void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+ {
+ 	struct page *page = NULL;
+ 
+-	if (!irqchip_in_kernel(vcpu->kvm))
++	if (!lapic_in_kernel(vcpu))
+ 		return;
+ 
+ 	if (!kvm_x86_ops->set_apic_access_page_addr)
+@@ -6687,7 +6687,7 @@ static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu)
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+-	bool req_int_win = !irqchip_in_kernel(vcpu->kvm) &&
++	bool req_int_win = !lapic_in_kernel(vcpu) &&
+ 		vcpu->run->request_interrupt_window;
+ 	bool req_immediate_exit = false;
+ 
+@@ -7087,7 +7087,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+ 	}
+ 
+ 	/* re-sync apic's tpr */
+-	if (!irqchip_in_kernel(vcpu->kvm)) {
++	if (!lapic_in_kernel(vcpu)) {
+ 		if (kvm_set_cr8(vcpu, kvm_run->cr8) != 0) {
+ 			r = -EINVAL;
+ 			goto out;
+@@ -7800,7 +7800,7 @@ bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
+ 
+ bool kvm_vcpu_compatible(struct kvm_vcpu *vcpu)
+ {
+-	return irqchip_in_kernel(vcpu->kvm) == (vcpu->arch.apic != NULL);
++	return irqchip_in_kernel(vcpu->kvm) == lapic_in_kernel(vcpu);
+ }
+ 
+ struct static_key kvm_no_apic_vcpu __read_mostly;
+@@ -7893,7 +7893,7 @@ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
+ 	kvm_mmu_destroy(vcpu);
+ 	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ 	free_page((unsigned long)vcpu->arch.pio_data);
+-	if (!irqchip_in_kernel(vcpu->kvm))
++	if (!lapic_in_kernel(vcpu))
+ 		static_key_slow_dec(&kvm_no_apic_vcpu);
+ }
+ 
