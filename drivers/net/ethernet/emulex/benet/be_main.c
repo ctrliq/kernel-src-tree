@@ -3617,8 +3617,6 @@ static void be_netpoll(struct net_device *netdev)
 		be_eq_notify(eqo->adapter, eqo->q.id, false, true, 0);
 		napi_schedule(&eqo->napi);
 	}
-
-	return;
 }
 #endif
 
@@ -4296,7 +4294,6 @@ static void be_add_vxlan_port(struct net_device *netdev, sa_family_t sa_family,
 	return;
 err:
 	be_disable_vxlan_offloads(adapter);
-	return;
 }
 
 static void be_del_vxlan_port(struct net_device *netdev, sa_family_t sa_family,
