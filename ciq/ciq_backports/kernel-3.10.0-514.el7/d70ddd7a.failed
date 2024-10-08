@@ -1,0 +1,420 @@
+mm: page_alloc: pass PFN to __free_pages_bootmem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] page_alloc: pass PFN to __free_pages_bootmem (George Beshers) [727269]
+Rebuild_FUZZ: 95.65%
+commit-author Mel Gorman <mgorman@suse.de>
+commit d70ddd7a5d9aa335f9b4b0c3d879e1e70ee1e4e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d70ddd7a.failed
+
+__free_pages_bootmem prepares a page for release to the buddy allocator
+and assumes that the struct page is initialised.  Parallel initialisation
+of struct pages defers initialisation and __free_pages_bootmem can be
+called for struct pages that cannot yet map struct page to PFN.  This
+patch passes PFN to __free_pages_bootmem with no other functional change.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Tested-by: Nate Zimmer <nzimmer@sgi.com>
+	Tested-by: Waiman Long <waiman.long@hp.com>
+	Tested-by: Daniel J Blueman <daniel@numascale.com>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Robin Holt <robinmholt@gmail.com>
+	Cc: Nate Zimmer <nzimmer@sgi.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Waiman Long <waiman.long@hp.com>
+	Cc: Scott Norton <scott.norton@hp.com>
+	Cc: "Luck, Tony" <tony.luck@intel.com>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d70ddd7a5d9aa335f9b4b0c3d879e1e70ee1e4e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/internal.h
+#	mm/memblock.c
+diff --cc mm/internal.h
+index d07fa9595ecf,58e9022e3757..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -97,7 -108,55 +97,59 @@@ extern pmd_t *mm_find_pmd(struct mm_str
+  /*
+   * in mm/page_alloc.c
+   */
+++<<<<<<< HEAD
+ +extern void __free_pages_bootmem(struct page *page, unsigned int order);
+++=======
++ 
++ /*
++  * Structure for holding the mostly immutable allocation parameters passed
++  * between functions involved in allocations, including the alloc_pages*
++  * family of functions.
++  *
++  * nodemask, migratetype and high_zoneidx are initialized only once in
++  * __alloc_pages_nodemask() and then never change.
++  *
++  * zonelist, preferred_zone and classzone_idx are set first in
++  * __alloc_pages_nodemask() for the fast path, and might be later changed
++  * in __alloc_pages_slowpath(). All other functions pass the whole strucure
++  * by a const pointer.
++  */
++ struct alloc_context {
++ 	struct zonelist *zonelist;
++ 	nodemask_t *nodemask;
++ 	struct zone *preferred_zone;
++ 	int classzone_idx;
++ 	int migratetype;
++ 	enum zone_type high_zoneidx;
++ };
++ 
++ /*
++  * Locate the struct page for both the matching buddy in our
++  * pair (buddy1) and the combined O(n+1) page they form (page).
++  *
++  * 1) Any buddy B1 will have an order O twin B2 which satisfies
++  * the following equation:
++  *     B2 = B1 ^ (1 << O)
++  * For example, if the starting buddy (buddy2) is #8 its order
++  * 1 buddy is #10:
++  *     B2 = 8 ^ (1 << 1) = 8 ^ 2 = 10
++  *
++  * 2) Any buddy B will have an order O+1 parent P which
++  * satisfies the following equation:
++  *     P = B & ~(1 << O)
++  *
++  * Assumption: *_mem_map is contiguous at least up to MAX_ORDER
++  */
++ static inline unsigned long
++ __find_buddy_index(unsigned long page_idx, unsigned int order)
++ {
++ 	return page_idx ^ (1 << order);
++ }
++ 
++ extern int __isolate_free_page(struct page *page, unsigned int order);
++ extern void __free_pages_bootmem(struct page *page, unsigned long pfn,
++ 					unsigned int order);
+++>>>>>>> d70ddd7a5d9a (mm: page_alloc: pass PFN to __free_pages_bootmem)
+  extern void prep_compound_page(struct page *page, unsigned long order);
+  #ifdef CONFIG_MEMORY_FAILURE
+  extern bool is_free_buddy_page(struct page *page);
+diff --cc mm/memblock.c
+index 4158cb85f9e7,87108e77e476..000000000000
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@@ -1012,6 -1217,212 +1012,215 @@@ phys_addr_t __init memblock_alloc_try_n
+  	return memblock_alloc_base(size, align, MEMBLOCK_ALLOC_ACCESSIBLE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * memblock_virt_alloc_internal - allocate boot memory block
++  * @size: size of memory block to be allocated in bytes
++  * @align: alignment of the region and block's size
++  * @min_addr: the lower bound of the memory region to allocate (phys address)
++  * @max_addr: the upper bound of the memory region to allocate (phys address)
++  * @nid: nid of the free area to find, %NUMA_NO_NODE for any node
++  *
++  * The @min_addr limit is dropped if it can not be satisfied and the allocation
++  * will fall back to memory below @min_addr. Also, allocation may fall back
++  * to any node in the system if the specified node can not
++  * hold the requested memory.
++  *
++  * The allocation is performed from memory region limited by
++  * memblock.current_limit if @max_addr == %BOOTMEM_ALLOC_ACCESSIBLE.
++  *
++  * The memory block is aligned on SMP_CACHE_BYTES if @align == 0.
++  *
++  * The phys address of allocated boot memory block is converted to virtual and
++  * allocated memory is reset to 0.
++  *
++  * In addition, function sets the min_count to 0 using kmemleak_alloc for
++  * allocated boot memory block, so that it is never reported as leaks.
++  *
++  * RETURNS:
++  * Virtual address of allocated memory block on success, NULL on failure.
++  */
++ static void * __init memblock_virt_alloc_internal(
++ 				phys_addr_t size, phys_addr_t align,
++ 				phys_addr_t min_addr, phys_addr_t max_addr,
++ 				int nid)
++ {
++ 	phys_addr_t alloc;
++ 	void *ptr;
++ 	ulong flags = choose_memblock_flags();
++ 
++ 	if (WARN_ONCE(nid == MAX_NUMNODES, "Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
++ 		nid = NUMA_NO_NODE;
++ 
++ 	/*
++ 	 * Detect any accidental use of these APIs after slab is ready, as at
++ 	 * this moment memblock may be deinitialized already and its
++ 	 * internal data may be destroyed (after execution of free_all_bootmem)
++ 	 */
++ 	if (WARN_ON_ONCE(slab_is_available()))
++ 		return kzalloc_node(size, GFP_NOWAIT, nid);
++ 
++ 	if (!align)
++ 		align = SMP_CACHE_BYTES;
++ 
++ 	if (max_addr > memblock.current_limit)
++ 		max_addr = memblock.current_limit;
++ 
++ again:
++ 	alloc = memblock_find_in_range_node(size, align, min_addr, max_addr,
++ 					    nid, flags);
++ 	if (alloc)
++ 		goto done;
++ 
++ 	if (nid != NUMA_NO_NODE) {
++ 		alloc = memblock_find_in_range_node(size, align, min_addr,
++ 						    max_addr, NUMA_NO_NODE,
++ 						    flags);
++ 		if (alloc)
++ 			goto done;
++ 	}
++ 
++ 	if (min_addr) {
++ 		min_addr = 0;
++ 		goto again;
++ 	}
++ 
++ 	if (flags & MEMBLOCK_MIRROR) {
++ 		flags &= ~MEMBLOCK_MIRROR;
++ 		pr_warn("Could not allocate %pap bytes of mirrored memory\n",
++ 			&size);
++ 		goto again;
++ 	}
++ 
++ 	return NULL;
++ done:
++ 	memblock_reserve(alloc, size);
++ 	ptr = phys_to_virt(alloc);
++ 	memset(ptr, 0, size);
++ 
++ 	/*
++ 	 * The min_count is set to 0 so that bootmem allocated blocks
++ 	 * are never reported as leaks. This is because many of these blocks
++ 	 * are only referred via the physical address which is not
++ 	 * looked up by kmemleak.
++ 	 */
++ 	kmemleak_alloc(ptr, size, 0, 0);
++ 
++ 	return ptr;
++ }
++ 
++ /**
++  * memblock_virt_alloc_try_nid_nopanic - allocate boot memory block
++  * @size: size of memory block to be allocated in bytes
++  * @align: alignment of the region and block's size
++  * @min_addr: the lower bound of the memory region from where the allocation
++  *	  is preferred (phys address)
++  * @max_addr: the upper bound of the memory region from where the allocation
++  *	      is preferred (phys address), or %BOOTMEM_ALLOC_ACCESSIBLE to
++  *	      allocate only from memory limited by memblock.current_limit value
++  * @nid: nid of the free area to find, %NUMA_NO_NODE for any node
++  *
++  * Public version of _memblock_virt_alloc_try_nid_nopanic() which provides
++  * additional debug information (including caller info), if enabled.
++  *
++  * RETURNS:
++  * Virtual address of allocated memory block on success, NULL on failure.
++  */
++ void * __init memblock_virt_alloc_try_nid_nopanic(
++ 				phys_addr_t size, phys_addr_t align,
++ 				phys_addr_t min_addr, phys_addr_t max_addr,
++ 				int nid)
++ {
++ 	memblock_dbg("%s: %llu bytes align=0x%llx nid=%d from=0x%llx max_addr=0x%llx %pF\n",
++ 		     __func__, (u64)size, (u64)align, nid, (u64)min_addr,
++ 		     (u64)max_addr, (void *)_RET_IP_);
++ 	return memblock_virt_alloc_internal(size, align, min_addr,
++ 					     max_addr, nid);
++ }
++ 
++ /**
++  * memblock_virt_alloc_try_nid - allocate boot memory block with panicking
++  * @size: size of memory block to be allocated in bytes
++  * @align: alignment of the region and block's size
++  * @min_addr: the lower bound of the memory region from where the allocation
++  *	  is preferred (phys address)
++  * @max_addr: the upper bound of the memory region from where the allocation
++  *	      is preferred (phys address), or %BOOTMEM_ALLOC_ACCESSIBLE to
++  *	      allocate only from memory limited by memblock.current_limit value
++  * @nid: nid of the free area to find, %NUMA_NO_NODE for any node
++  *
++  * Public panicking version of _memblock_virt_alloc_try_nid_nopanic()
++  * which provides debug information (including caller info), if enabled,
++  * and panics if the request can not be satisfied.
++  *
++  * RETURNS:
++  * Virtual address of allocated memory block on success, NULL on failure.
++  */
++ void * __init memblock_virt_alloc_try_nid(
++ 			phys_addr_t size, phys_addr_t align,
++ 			phys_addr_t min_addr, phys_addr_t max_addr,
++ 			int nid)
++ {
++ 	void *ptr;
++ 
++ 	memblock_dbg("%s: %llu bytes align=0x%llx nid=%d from=0x%llx max_addr=0x%llx %pF\n",
++ 		     __func__, (u64)size, (u64)align, nid, (u64)min_addr,
++ 		     (u64)max_addr, (void *)_RET_IP_);
++ 	ptr = memblock_virt_alloc_internal(size, align,
++ 					   min_addr, max_addr, nid);
++ 	if (ptr)
++ 		return ptr;
++ 
++ 	panic("%s: Failed to allocate %llu bytes align=0x%llx nid=%d from=0x%llx max_addr=0x%llx\n",
++ 	      __func__, (u64)size, (u64)align, nid, (u64)min_addr,
++ 	      (u64)max_addr);
++ 	return NULL;
++ }
++ 
++ /**
++  * __memblock_free_early - free boot memory block
++  * @base: phys starting address of the  boot memory block
++  * @size: size of the boot memory block in bytes
++  *
++  * Free boot memory block previously allocated by memblock_virt_alloc_xx() API.
++  * The freeing memory will not be released to the buddy allocator.
++  */
++ void __init __memblock_free_early(phys_addr_t base, phys_addr_t size)
++ {
++ 	memblock_dbg("%s: [%#016llx-%#016llx] %pF\n",
++ 		     __func__, (u64)base, (u64)base + size - 1,
++ 		     (void *)_RET_IP_);
++ 	kmemleak_free_part(__va(base), size);
++ 	memblock_remove_range(&memblock.reserved, base, size);
++ }
++ 
++ /*
++  * __memblock_free_late - free bootmem block pages directly to buddy allocator
++  * @addr: phys starting address of the  boot memory block
++  * @size: size of the boot memory block in bytes
++  *
++  * This is only useful when the bootmem allocator has already been torn
++  * down, but we are still initializing the system.  Pages are released directly
++  * to the buddy allocator, no bootmem metadata is updated because it is gone.
++  */
++ void __init __memblock_free_late(phys_addr_t base, phys_addr_t size)
++ {
++ 	u64 cursor, end;
++ 
++ 	memblock_dbg("%s: [%#016llx-%#016llx] %pF\n",
++ 		     __func__, (u64)base, (u64)base + size - 1,
++ 		     (void *)_RET_IP_);
++ 	kmemleak_free_part(__va(base), size);
++ 	cursor = PFN_UP(base);
++ 	end = PFN_DOWN(base + size);
++ 
++ 	for (; cursor < end; cursor++) {
++ 		__free_pages_bootmem(pfn_to_page(cursor), cursor, 0);
++ 		totalram_pages++;
++ 	}
++ }
+++>>>>>>> d70ddd7a5d9a (mm: page_alloc: pass PFN to __free_pages_bootmem)
+  
+  /*
+   * Remaining API functions
+diff --git a/mm/bootmem.c b/mm/bootmem.c
+index 38e966cc9c39..9727f4fb7aae 100644
+--- a/mm/bootmem.c
++++ b/mm/bootmem.c
+@@ -165,7 +165,7 @@ void __init free_bootmem_late(unsigned long physaddr, unsigned long size)
+ 	end = PFN_DOWN(physaddr + size);
+ 
+ 	for (; cursor < end; cursor++) {
+-		__free_pages_bootmem(pfn_to_page(cursor), 0);
++		__free_pages_bootmem(pfn_to_page(cursor), cursor, 0);
+ 		totalram_pages++;
+ 	}
+ }
+@@ -173,7 +173,7 @@ void __init free_bootmem_late(unsigned long physaddr, unsigned long size)
+ static unsigned long __init free_all_bootmem_core(bootmem_data_t *bdata)
+ {
+ 	struct page *page;
+-	unsigned long *map, start, end, pages, count = 0;
++	unsigned long *map, start, end, pages, cur, count = 0;
+ 
+ 	if (!bdata->node_bootmem_map)
+ 		return 0;
+@@ -211,17 +211,17 @@ static unsigned long __init free_all_bootmem_core(bootmem_data_t *bdata)
+ 		if (IS_ALIGNED(start, BITS_PER_LONG) && vec == ~0UL) {
+ 			int order = ilog2(BITS_PER_LONG);
+ 
+-			__free_pages_bootmem(pfn_to_page(start), order);
++			__free_pages_bootmem(pfn_to_page(start), start, order);
+ 			count += BITS_PER_LONG;
+ 			start += BITS_PER_LONG;
+ 		} else {
+-			unsigned long cur = start;
++			cur = start;
+ 
+ 			start = ALIGN(start + 1, BITS_PER_LONG);
+ 			while (vec && cur != start) {
+ 				if (vec & 1) {
+ 					page = pfn_to_page(cur);
+-					__free_pages_bootmem(page, 0);
++					__free_pages_bootmem(page, cur, 0);
+ 					count++;
+ 				}
+ 				vec >>= 1;
+@@ -230,12 +230,13 @@ static unsigned long __init free_all_bootmem_core(bootmem_data_t *bdata)
+ 		}
+ 	}
+ 
++	cur = bdata->node_min_pfn;
+ 	page = virt_to_page(bdata->node_bootmem_map);
+ 	pages = bdata->node_low_pfn - bdata->node_min_pfn;
+ 	pages = bootmem_bootmap_pages(pages);
+ 	count += pages;
+ 	while (pages--)
+-		__free_pages_bootmem(page++, 0);
++		__free_pages_bootmem(page++, cur++, 0);
+ 
+ 	bdebug("nid=%td released=%lx\n", bdata - bootmem_node_data, count);
+ 
+* Unmerged path mm/internal.h
+* Unmerged path mm/memblock.c
+diff --git a/mm/nobootmem.c b/mm/nobootmem.c
+index 7a4c7cd54831..a3fcb8f3f109 100644
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@ -76,7 +76,7 @@ void __init free_bootmem_late(unsigned long addr, unsigned long size)
+ 	end = PFN_DOWN(addr + size);
+ 
+ 	for (; cursor < end; cursor++) {
+-		__free_pages_bootmem(pfn_to_page(cursor), 0);
++		__free_pages_bootmem(pfn_to_page(cursor), cursor, 0);
+ 		totalram_pages++;
+ 	}
+ }
+@@ -91,7 +91,7 @@ static void __init __free_pages_memory(unsigned long start, unsigned long end)
+ 		while (start + (1UL << order) > end)
+ 			order--;
+ 
+-		__free_pages_bootmem(pfn_to_page(start), order);
++		__free_pages_bootmem(pfn_to_page(start), start, order);
+ 
+ 		start += (1UL << order);
+ 	}
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index f60ded95bce9..5c5561f41216 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -761,7 +761,8 @@ static void __free_pages_ok(struct page *page, unsigned int order)
+ 	local_irq_restore(flags);
+ }
+ 
+-void __init __free_pages_bootmem(struct page *page, unsigned int order)
++void __init __free_pages_bootmem(struct page *page, unsigned long pfn,
++							unsigned int order)
+ {
+ 	unsigned int nr_pages = 1 << order;
+ 	unsigned int loop;
