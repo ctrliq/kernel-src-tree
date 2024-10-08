@@ -1,0 +1,144 @@
+powerpc/eeh: Make the delay for PE reset unified
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Make the delay for PE reset unified (Don Zickus) [1127366]
+Rebuild_FUZZ: 90.91%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 26833a5029b710b12f00607fa255ce86909836ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/26833a50.failed
+
+Basically, we have 3 types of resets to fulfil PE reset: fundamental,
+hot and PHB reset. For the later 2 cases, we need PCI bus reset hold
+and settlement delay as specified by PCI spec. PowerNV and pSeries
+platforms are running on top of different firmware and some of the
+delays have been covered by underly firmware (PowerNV).
+
+The patch makes the delays unified to be done in backend, instead of
+EEH core.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 26833a5029b710b12f00607fa255ce86909836ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh.c
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/kernel/eeh.c
+index 26d4b4ef6a26,3764fb788d6c..000000000000
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@@ -615,26 -639,7 +615,22 @@@ static void eeh_reset_pe_once(struct ee
+  	else
+  		eeh_ops->reset(pe, EEH_RESET_HOT);
+  
+++<<<<<<< HEAD
+ +	/* The PCI bus requires that the reset be held high for at least
+ +	 * a 100 milliseconds. We wait a bit longer 'just in case'.
+ +	 */
+ +#define PCI_BUS_RST_HOLD_TIME_MSEC 250
+ +	msleep(PCI_BUS_RST_HOLD_TIME_MSEC);
+ +
+ +	/* We might get hit with another EEH freeze as soon as the
+ +	 * pci slot reset line is dropped. Make sure we don't miss
+ +	 * these, and clear the flag now.
+ +	 */
+ +	eeh_pe_state_clear(pe, EEH_PE_ISOLATED);
+ +
+++=======
+++>>>>>>> 26833a5029b7 (powerpc/eeh: Make the delay for PE reset unified)
+  	eeh_ops->reset(pe, EEH_RESET_DEACTIVATE);
+- 
+- 	/* After a PCI slot has been reset, the PCI Express spec requires
+- 	 * a 1.5 second idle time for the bus to stabilize, before starting
+- 	 * up traffic.
+- 	 */
+- #define PCI_BUS_SETTLE_TIME_MSEC 1800
+- 	msleep(PCI_BUS_SETTLE_TIME_MSEC);
+  }
+  
+  /**
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index be33a16408be,268cd46af8f1..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -471,14 -483,18 +477,26 @@@ static int ioda_eeh_bridge_reset(struc
+  	switch (option) {
+  	case EEH_RESET_FUNDAMENTAL:
+  	case EEH_RESET_HOT:
+ -		eeh_ops->read_config(dn, PCI_BRIDGE_CONTROL, 2, &ctrl);
+ +		pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &ctrl);
+  		ctrl |= PCI_BRIDGE_CTL_BUS_RESET;
+++<<<<<<< HEAD
+ +		pci_write_config_word(dev, PCI_BRIDGE_CONTROL, ctrl);
+++=======
++ 		eeh_ops->write_config(dn, PCI_BRIDGE_CONTROL, 2, ctrl);
++ 
++ 		msleep(EEH_PE_RST_HOLD_TIME);
+++>>>>>>> 26833a5029b7 (powerpc/eeh: Make the delay for PE reset unified)
+  		break;
+  	case EEH_RESET_DEACTIVATE:
+ -		eeh_ops->read_config(dn, PCI_BRIDGE_CONTROL, 2, &ctrl);
+ +		pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &ctrl);
+  		ctrl &= ~PCI_BRIDGE_CTL_BUS_RESET;
+++<<<<<<< HEAD
+ +		pci_write_config_word(dev, PCI_BRIDGE_CONTROL, ctrl);
+++=======
++ 		eeh_ops->write_config(dn, PCI_BRIDGE_CONTROL, 2, ctrl);
++ 
++ 		msleep(EEH_PE_RST_SETTLE_TIME);
+++>>>>>>> 26833a5029b7 (powerpc/eeh: Make the delay for PE reset unified)
+  		break;
+  	}
+  
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 2ff9fdd89bc5..3a5a06d63cce 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -32,6 +32,16 @@ struct device_node;
+ 
+ #ifdef CONFIG_EEH
+ 
++/*
++ * Delay for PE reset, all in ms
++ *
++ * PCI specification has reset hold time of 100 milliseconds.
++ * We have 250 milliseconds here. The PCI bus settlement time
++ * is specified as 1.5 seconds and we have 1.8 seconds.
++ */
++#define EEH_PE_RST_HOLD_TIME		250
++#define EEH_PE_RST_SETTLE_TIME		1800
++
+ /*
+  * The struct is used to trace PE related EEH functionality.
+  * In theory, there will have one instance of the struct to
+* Unmerged path arch/powerpc/kernel/eeh.c
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --git a/arch/powerpc/platforms/pseries/eeh_pseries.c b/arch/powerpc/platforms/pseries/eeh_pseries.c
+index 9ef3cc8ebc11..ab099f718f4e 100644
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@ -499,11 +499,19 @@ static int pseries_eeh_reset(struct eeh_pe *pe, int option)
+ 	/* If fundamental-reset not supported, try hot-reset */
+ 	if (option == EEH_RESET_FUNDAMENTAL &&
+ 	    ret == -8) {
++		option = EEH_RESET_HOT;
+ 		ret = rtas_call(ibm_set_slot_reset, 4, 1, NULL,
+ 				config_addr, BUID_HI(pe->phb->buid),
+-				BUID_LO(pe->phb->buid), EEH_RESET_HOT);
++				BUID_LO(pe->phb->buid), option);
+ 	}
+ 
++	/* We need reset hold or settlement delay */
++	if (option == EEH_RESET_FUNDAMENTAL ||
++	    option == EEH_RESET_HOT)
++		msleep(EEH_PE_RST_HOLD_TIME);
++	else
++		msleep(EEH_PE_RST_SETTLE_TIME);
++
+ 	return ret;
+ }
+ 
