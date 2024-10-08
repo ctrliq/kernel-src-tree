@@ -1,0 +1,109 @@
+block: add support for limiting gaps in SG lists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [block] add support for limiting gaps in SG lists (Mike Snitzer) [1105204]
+Rebuild_FUZZ: 92.13%
+commit-author Jens Axboe <axboe@fb.com>
+commit 66cb45aa41315d1d9972cada354fbdf7870d7714
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/66cb45aa.failed
+
+Another restriction inherited for NVMe - those devices don't support
+SG lists that have "gaps" in them. Gaps refers to cases where the
+previous SG entry doesn't end on a page boundary. For NVMe, all SG
+entries must start at offset 0 (except the first) and end on a page
+boundary (except the last).
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 66cb45aa41315d1d9972cada354fbdf7870d7714)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index f662d2786abe,8699bcf5f099..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -505,7 -511,8 +505,12 @@@ struct request_queue 
+  #define QUEUE_FLAG_SAME_FORCE  18	/* force complete on same CPU */
+  #define QUEUE_FLAG_DEAD        19	/* queue tear-down finished */
+  #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
+++=======
++ #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
++ #define QUEUE_FLAG_SG_GAPS     22	/* queue doesn't support SG gaps */
+++>>>>>>> 66cb45aa4131 (block: add support for limiting gaps in SG lists)
+  
+  #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_STACKABLE)	|	\
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 1ffc58977835..5b28613820e8 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -515,6 +515,8 @@ int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+ 
+ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+ {
++	struct request_queue *q = rq->q;
++
+ 	if (!rq_mergeable(rq) || !bio_mergeable(bio))
+ 		return false;
+ 
+@@ -538,6 +540,14 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+ 	    !blk_write_same_mergeable(rq->bio, bio))
+ 		return false;
+ 
++	if (q->queue_flags & (1 << QUEUE_FLAG_SG_GAPS)) {
++		struct bio_vec *bprev;
++
++		bprev = &rq->biotail->bi_io_vec[bio->bi_vcnt - 1];
++		if (bvec_gap_to_prev(bprev, bio->bi_io_vec[0].bv_offset))
++			return false;
++	}
++
+ 	return true;
+ }
+ 
+diff --git a/fs/bio.c b/fs/bio.c
+index c1430d66b7c3..911639132eae 100644
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@ -647,6 +647,14 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
+ 
+ 			goto done;
+ 		}
++
++		/*
++		 * If the queue doesn't support SG gaps and adding this
++		 * offset would create a gap, disallow it.
++		 */
++		if (q->queue_flags & (1 << QUEUE_FLAG_SG_GAPS) &&
++		    bvec_gap_to_prev(prev, offset))
++			return 0;
+ 	}
+ 
+ 	if (bio->bi_vcnt >= bio->bi_max_vecs)
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 0b7f38a75bd9..2f83ecb0ce88 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -129,6 +129,15 @@ static inline void *bio_data(struct bio *bio)
+ #define BIO_SEG_BOUNDARY(q, b1, b2) \
+ 	BIOVEC_SEG_BOUNDARY((q), __BVEC_END((b1)), __BVEC_START((b2)))
+ 
++/*
++ * Check if adding a bio_vec after bprv with offset would create a gap in
++ * the SG list. Most drivers don't care about this, but some do.
++ */
++static inline bool bvec_gap_to_prev(struct bio_vec *bprv, unsigned int offset)
++{
++	return offset || ((bprv->bv_offset + bprv->bv_len) & (PAGE_SIZE - 1));
++}
++
+ #define bio_io_error(bio) bio_endio((bio), -EIO)
+ 
+ /*
+* Unmerged path include/linux/blkdev.h
