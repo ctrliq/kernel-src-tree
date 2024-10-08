@@ -1,0 +1,201 @@
+perf tools: Cache dso data file descriptor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf: Cache dso data file descriptor (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 92.31%
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit c658045197814b7d762662f9aa9f652379121a03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c6580451.failed
+
+Caching dso data file descriptors to avoid expensive re-opens
+especially during DWARF unwind.
+
+We keep dsos data file descriptors open until their count reaches
+the half of the current fd open limit (RLIMIT_NOFILE). In this case
+we close file descriptor of the first opened dso object.
+
+We've got overall speedup (~27% for my workload) of report:
+ 'perf report --stdio -i perf-test.data' (3 runs)
+  (perf-test.data size was around 12GB)
+
+  current code:
+   545,640,944,228      cycles                     ( +-  0.53% )
+   785,255,798,320      instructions               ( +-  0.03% )
+
+     366.340910010 seconds time elapsed            ( +-  3.65% )
+
+  after change:
+   435,895,036,114      cycles                     ( +-  0.26% )
+   636,790,271,176      instructions               ( +-  0.04% )
+
+     266.481463387 seconds time elapsed            ( +-  0.13% )
+
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Jean Pihet <jean.pihet@linaro.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1401892622-30848-7-git-send-email-jolsa@kernel.org
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+(cherry picked from commit c658045197814b7d762662f9aa9f652379121a03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/dso.c
+#	tools/perf/util/unwind.c
+diff --cc tools/perf/util/dso.c
+index ffd3d5ede878,fbf6cc98b8a9..000000000000
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@@ -1,3 -1,6 +1,9 @@@
+++<<<<<<< HEAD
+++=======
++ #include <asm/bug.h>
++ #include <sys/time.h>
++ #include <sys/resource.h>
+++>>>>>>> c65804519781 (perf tools: Cache dso data file descriptor)
+  #include "symbol.h"
+  #include "dso.h"
+  #include "machine.h"
+@@@ -159,6 -182,91 +165,94 @@@ static int open_dso(struct dso *dso, st
+  	return fd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void check_data_close(void);
++ 
++ static int open_dso(struct dso *dso, struct machine *machine)
++ {
++ 	int fd = __open_dso(dso, machine);
++ 
++ 	if (fd > 0) {
++ 		dso__list_add(dso);
++ 		/*
++ 		 * Check if we crossed the allowed number
++ 		 * of opened DSOs and close one if needed.
++ 		 */
++ 		check_data_close();
++ 	}
++ 
++ 	return fd;
++ }
++ 
++ static void close_data_fd(struct dso *dso)
++ {
++ 	if (dso->data.fd >= 0) {
++ 		close(dso->data.fd);
++ 		dso->data.fd = -1;
++ 		dso__list_del(dso);
++ 	}
++ }
++ 
++ static void close_dso(struct dso *dso)
++ {
++ 	close_data_fd(dso);
++ }
++ 
++ static void close_first_dso(void)
++ {
++ 	struct dso *dso;
++ 
++ 	dso = list_first_entry(&dso__data_open, struct dso, data.open_entry);
++ 	close_dso(dso);
++ }
++ 
++ static rlim_t get_fd_limit(void)
++ {
++ 	struct rlimit l;
++ 	rlim_t limit = 0;
++ 
++ 	/* Allow half of the current open fd limit. */
++ 	if (getrlimit(RLIMIT_NOFILE, &l) == 0) {
++ 		if (l.rlim_cur == RLIM_INFINITY)
++ 			limit = l.rlim_cur;
++ 		else
++ 			limit = l.rlim_cur / 2;
++ 	} else {
++ 		pr_err("failed to get fd limit\n");
++ 		limit = 1;
++ 	}
++ 
++ 	return limit;
++ }
++ 
++ static bool may_cache_fd(void)
++ {
++ 	static rlim_t limit;
++ 
++ 	if (!limit)
++ 		limit = get_fd_limit();
++ 
++ 	if (limit == RLIM_INFINITY)
++ 		return true;
++ 
++ 	return limit > (rlim_t) dso__data_open_cnt;
++ }
++ 
++ static void check_data_close(void)
++ {
++ 	bool cache_fd = may_cache_fd();
++ 
++ 	if (!cache_fd)
++ 		close_first_dso();
++ }
++ 
++ void dso__data_close(struct dso *dso)
++ {
++ 	close_dso(dso);
++ }
++ 
+++>>>>>>> c65804519781 (perf tools: Cache dso data file descriptor)
+  int dso__data_fd(struct dso *dso, struct machine *machine)
+  {
+  	enum dso_binary_type binary_type_data[] = {
+@@@ -302,7 -414,6 +396,10 @@@ dso_cache__read(struct dso *dso, struc
+  	if (ret <= 0)
+  		free(cache);
+  
+++<<<<<<< HEAD
+ +	close(fd);
+++=======
+++>>>>>>> c65804519781 (perf tools: Cache dso data file descriptor)
+  	return ret;
+  }
+  
+diff --cc tools/perf/util/unwind.c
+index 6c308f43c0ca,25578b98f5c5..000000000000
+--- a/tools/perf/util/unwind.c
++++ b/tools/perf/util/unwind.c
+@@@ -267,7 -250,6 +267,10 @@@ static int read_unwind_spec_eh_frame(st
+  
+  	/* Check the .eh_frame section for unwinding info */
+  	offset = elf_section_offset(fd, ".eh_frame_hdr");
+++<<<<<<< HEAD:tools/perf/util/unwind.c
+ +	close(fd);
+++=======
+++>>>>>>> c65804519781 (perf tools: Cache dso data file descriptor):tools/perf/util/unwind-libunwind.c
+  
+  	if (offset)
+  		ret = unwind_spec_ehframe(dso, machine, offset,
+@@@ -288,7 -270,6 +291,10 @@@ static int read_unwind_spec_debug_frame
+  
+  	/* Check the .debug_frame section for unwinding info */
+  	*offset = elf_section_offset(fd, ".debug_frame");
+++<<<<<<< HEAD:tools/perf/util/unwind.c
+ +	close(fd);
+++=======
+++>>>>>>> c65804519781 (perf tools: Cache dso data file descriptor):tools/perf/util/unwind-libunwind.c
+  
+  	if (*offset)
+  		return 0;
+* Unmerged path tools/perf/util/dso.c
+* Unmerged path tools/perf/util/unwind.c
