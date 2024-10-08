@@ -1,0 +1,145 @@
+dm cache: improve discard support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [md] dm-cache: improve discard support (Mike Snitzer) [1159001]
+Rebuild_FUZZ: 96.97%
+commit-author Joe Thornber <ejt@redhat.com>
+commit 7ae34e7778966d39f66397491eb114b613202c20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7ae34e77.failed
+
+Safely allow the discard blocksize to be larger than the cache blocksize
+by using the bio prison's range locking support.  This also improves
+discard performance considerly because larger discards are issued to the
+dm-cache device.  The discard blocksize was always intended to be
+greater than the cache blocksize.  But until now it wasn't implemented
+safely.
+
+Also, by safely restoring the ability to have discard blocksize larger
+than cache blocksize we're able to significantly reduce the memory used
+for the cache's discard bitset.  Before, with a small discard blocksize,
+the discard bitset could get quite large because its size is a function
+of the discard blocksize and the origin device's size.  For example,
+previously, using a 32KB cache blocksize with a 40TB origin resulted in
+1280MB of incore memory use for the discard bitset!  Now, the discard
+blocksize is scaled up accordingly to ensure the discard bitset is
+capped at 2**14 bits, or 16KB.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 7ae34e7778966d39f66397491eb114b613202c20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index e75d70ec363a,6e36a0753105..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -518,7 -536,30 +529,34 @@@ static dm_block_t block_div(dm_block_t 
+  	return b;
+  }
+  
+++<<<<<<< HEAD
+ +static void set_discard(struct cache *cache, dm_oblock_t b)
+++=======
++ static dm_block_t oblocks_per_dblock(struct cache *cache)
++ {
++ 	dm_block_t oblocks = cache->discard_block_size;
++ 
++ 	if (block_size_is_power_of_two(cache))
++ 		oblocks >>= cache->sectors_per_block_shift;
++ 	else
++ 		oblocks = block_div(oblocks, cache->sectors_per_block);
++ 
++ 	return oblocks;
++ }
++ 
++ static dm_dblock_t oblock_to_dblock(struct cache *cache, dm_oblock_t oblock)
++ {
++ 	return to_dblock(block_div(from_oblock(oblock),
++ 				   oblocks_per_dblock(cache)));
++ }
++ 
++ static dm_oblock_t dblock_to_oblock(struct cache *cache, dm_dblock_t dblock)
++ {
++ 	return to_oblock(from_dblock(dblock) * oblocks_per_dblock(cache));
++ }
++ 
++ static void set_discard(struct cache *cache, dm_dblock_t b)
+++>>>>>>> 7ae34e777896 (dm cache: improve discard support)
+  {
+  	unsigned long flags;
+  
+@@@ -1280,31 -1382,27 +1378,39 @@@ static void process_flush_bio(struct ca
+  	issue(cache, bio);
+  }
+  
+- /*
+-  * People generally discard large parts of a device, eg, the whole device
+-  * when formatting.  Splitting these large discards up into cache block
+-  * sized ios and then quiescing (always neccessary for discard) takes too
+-  * long.
+-  *
+-  * We keep it simple, and allow any size of discard to come in, and just
+-  * mark off blocks on the discard bitset.  No passdown occurs!
+-  *
+-  * To implement passdown we need to change the bio_prison such that a cell
+-  * can have a key that spans many blocks.
+-  */
+- static void process_discard_bio(struct cache *cache, struct bio *bio)
++ static void process_discard_bio(struct cache *cache, struct prealloc *structs,
++ 				struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	dm_block_t start_block = dm_sector_div_up(bio->bi_sector,
+ +						  cache->sectors_per_block);
+ +	dm_block_t end_block = bio->bi_sector + bio_sectors(bio);
+ +	dm_block_t b;
+ +
+ +	end_block = block_div(end_block, cache->sectors_per_block);
+ +
+ +	for (b = start_block; b < end_block; b++)
+ +		set_discard(cache, to_oblock(b));
+++=======
++ 	int r;
++ 	dm_dblock_t b, e;
++ 	struct dm_bio_prison_cell *cell_prealloc, *new_ocell;
+  
+- 	bio_endio(bio, 0);
++ 	calc_discard_block_range(cache, bio, &b, &e);
++ 	if (b == e) {
++ 		bio_endio(bio, 0);
++ 		return;
++ 	}
++ 
++ 	cell_prealloc = prealloc_get_cell(structs);
++ 	r = bio_detain_range(cache, dblock_to_oblock(cache, b), dblock_to_oblock(cache, e), bio, cell_prealloc,
++ 			     (cell_free_fn) prealloc_put_cell,
++ 			     structs, &new_ocell);
++ 	if (r > 0)
++ 		return;
+++>>>>>>> 7ae34e777896 (dm cache: improve discard support)
++ 
++ 	discard(cache, structs, new_ocell);
+  }
+  
+  static bool spare_migration_bandwidth(struct cache *cache)
+@@@ -3078,8 -3205,9 +3184,14 @@@ static void set_discard_limits(struct c
+  	/*
+  	 * FIXME: these limits may be incompatible with the cache device
+  	 */
+++<<<<<<< HEAD
+ +	limits->max_discard_sectors = cache->sectors_per_block;
+ +	limits->discard_granularity = cache->sectors_per_block << SECTOR_SHIFT;
+++=======
++ 	limits->max_discard_sectors = min_t(sector_t, cache->discard_block_size * 1024,
++ 					    cache->origin_sectors);
++ 	limits->discard_granularity = cache->discard_block_size << SECTOR_SHIFT;
+++>>>>>>> 7ae34e777896 (dm cache: improve discard support)
+  }
+  
+  static void cache_io_hints(struct dm_target *ti, struct queue_limits *limits)
+* Unmerged path drivers/md/dm-cache-target.c
