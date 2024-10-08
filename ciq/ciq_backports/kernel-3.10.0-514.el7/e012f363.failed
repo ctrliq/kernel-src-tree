@@ -1,0 +1,164 @@
+IB/srp: Fix srp_map_data() error paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit e012f3639c95498d4e8d7a9f44e33f1cd2f241b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e012f363.failed
+
+Ensure that req->nmdesc is set correctly in srp_map_sg() if mapping
+fails. Avoid that mapping failure causes a memory descriptor leak.
+Report srp_map_sg() failure to the caller.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Laurence Oberman <loberman@redhat.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e012f3639c95498d4e8d7a9f44e33f1cd2f241b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srp/ib_srp.c
+diff --cc drivers/infiniband/ulp/srp/ib_srp.c
+index b7e08f782b14,47e753d9ab5b..000000000000
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@@ -1422,47 -1406,72 +1422,106 @@@ static int srp_map_sg_entry(struct srp_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int srp_map_sg(struct srp_map_state *state, struct srp_rdma_ch *ch,
+ +		      struct srp_request *req, struct scatterlist *scat,
+ +		      int count)
+++=======
++ static int srp_map_sg_fmr(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			  struct srp_request *req, struct scatterlist *scat,
++ 			  int count)
++ {
++ 	struct scatterlist *sg;
++ 	int i, ret;
++ 
++ 	state->desc = req->indirect_desc;
++ 	state->pages = req->map_page;
++ 	state->fmr.next = req->fmr_list;
++ 	state->fmr.end = req->fmr_list + ch->target->cmd_sg_cnt;
++ 
++ 	for_each_sg(scat, sg, count, i) {
++ 		ret = srp_map_sg_entry(state, ch, sg, i);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ret = srp_map_finish_fmr(state, ch);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
++ static int srp_map_sg_fr(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			 struct srp_request *req, struct scatterlist *scat,
++ 			 int count)
++ {
++ 	state->desc = req->indirect_desc;
++ 	state->fr.next = req->fr_list;
++ 	state->fr.end = req->fr_list + ch->target->cmd_sg_cnt;
++ 	state->sg = scat;
++ 
++ 	while (count) {
++ 		int i, n;
++ 
++ 		n = srp_map_finish_fr(state, req, ch, count);
++ 		if (unlikely(n < 0))
++ 			return n;
++ 
++ 		count -= n;
++ 		for (i = 0; i < n; i++)
++ 			state->sg = sg_next(state->sg);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int srp_map_sg_dma(struct srp_map_state *state, struct srp_rdma_ch *ch,
++ 			  struct srp_request *req, struct scatterlist *scat,
++ 			  int count)
+++>>>>>>> e012f3639c95 (IB/srp: Fix srp_map_data() error paths)
+  {
+  	struct srp_target_port *target = ch->target;
+  	struct srp_device *dev = target->srp_host->srp_dev;
+  	struct scatterlist *sg;
+ -	int i;
+ +	int i, ret;
+  
+ -	state->desc = req->indirect_desc;
+ -	for_each_sg(scat, sg, count, i) {
+ -		srp_map_desc(state, ib_sg_dma_address(dev->dev, sg),
+ -			     ib_sg_dma_len(dev->dev, sg),
+ -			     target->global_mr->rkey);
+ +	state->desc	= req->indirect_desc;
+ +	state->pages	= req->map_page;
+ +	if (dev->use_fast_reg) {
+ +		state->fr.next = req->fr_list;
+ +		state->fr.end = req->fr_list + target->cmd_sg_cnt;
+ +	} else if (dev->use_fmr) {
+ +		state->fmr.next = req->fmr_list;
+ +		state->fmr.end = req->fmr_list + target->cmd_sg_cnt;
+  	}
+  
+ +	if (dev->use_fast_reg || dev->use_fmr) {
+ +		for_each_sg(scat, sg, count, i) {
+ +			ret = srp_map_sg_entry(state, ch, sg, i);
+ +			if (ret)
+ +				goto out;
+ +		}
+ +		ret = srp_finish_mapping(state, ch);
+ +		if (ret)
+ +			goto out;
+ +	} else {
+ +		for_each_sg(scat, sg, count, i) {
+ +			srp_map_desc(state, ib_sg_dma_address(dev->dev, sg),
+ +				     ib_sg_dma_len(dev->dev, sg),
+ +				     target->global_mr->rkey);
+ +		}
+ +	}
+ +
+++<<<<<<< HEAD
+ +	req->nmdesc = state->nmdesc;
+ +	ret = 0;
+ +
+ +out:
+ +	return ret;
+++=======
++ 	return 0;
+++>>>>>>> e012f3639c95 (IB/srp: Fix srp_map_data() error paths)
+  }
+  
+  /*
+@@@ -1579,7 -1603,15 +1638,19 @@@ static int srp_map_data(struct scsi_cmn
+  				   target->indirect_size, DMA_TO_DEVICE);
+  
+  	memset(&state, 0, sizeof(state));
+++<<<<<<< HEAD
+ +	srp_map_sg(&state, ch, req, scat, count);
+++=======
++ 	if (dev->use_fast_reg)
++ 		ret = srp_map_sg_fr(&state, ch, req, scat, count);
++ 	else if (dev->use_fmr)
++ 		ret = srp_map_sg_fmr(&state, ch, req, scat, count);
++ 	else
++ 		ret = srp_map_sg_dma(&state, ch, req, scat, count);
++ 	req->nmdesc = state.nmdesc;
++ 	if (ret < 0)
++ 		goto unmap;
+++>>>>>>> e012f3639c95 (IB/srp: Fix srp_map_data() error paths)
+  
+  	/* We've mapped the request, now pull as much of the indirect
+  	 * descriptor table as we can into the command buffer. If this
+* Unmerged path drivers/infiniband/ulp/srp/ib_srp.c
