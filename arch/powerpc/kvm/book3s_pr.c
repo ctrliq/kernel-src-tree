@@ -689,8 +689,10 @@ static void kvmppc_handle_lost_ext(struct kvm_vcpu *vcpu)
 
 	if (lost_ext & MSR_FP)
 		kvmppc_load_up_fpu();
+#ifdef CONFIG_ALTIVEC
 	if (lost_ext & MSR_VEC)
 		kvmppc_load_up_altivec();
+#endif
 	current->thread.regs->msr |= lost_ext;
 }
 
