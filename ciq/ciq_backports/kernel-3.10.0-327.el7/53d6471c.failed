@@ -1,0 +1,113 @@
+net: Account for all vlan headers in skb_mac_gso_segment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Account for all vlan headers in skb_mac_gso_segment (Vlad Yasevich) [1135619]
+Rebuild_FUZZ: 95.33%
+commit-author Vlad Yasevich <vyasevic@redhat.com>
+commit 53d6471cef17262d3ad1c7ce8982a234244f68ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/53d6471c.failed
+
+skb_network_protocol() already accounts for multiple vlan
+headers that may be present in the skb.  However, skb_mac_gso_segment()
+doesn't know anything about it and assumes that skb->mac_len
+is set correctly to skip all mac headers.  That may not
+always be the case.  If we are simply forwarding the packet (via
+bridge or macvtap), all vlan headers may not be accounted for.
+
+A simple solution is to allow skb_network_protocol to return
+the vlan depth it has calculated.  This way skb_mac_gso_segment
+will correctly skip all mac headers.
+
+	Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 53d6471cef17262d3ad1c7ce8982a234244f68ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 13e8ed896c2a,90b96a11b974..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -2891,9 -2879,9 +2891,14 @@@ struct sk_buff *skb_segment(struct sk_b
+  	int err = -ENOMEM;
+  	int i = 0;
+  	int pos;
++ 	int dummy;
+  
+++<<<<<<< HEAD
+ +	__skb_push(head_skb, doffset);
+ +	proto = skb_network_protocol(head_skb);
+++=======
++ 	proto = skb_network_protocol(head_skb, &dummy);
+++>>>>>>> 53d6471cef17 (net: Account for all vlan headers in skb_mac_gso_segment)
+  	if (unlikely(!proto))
+  		return ERR_PTR(-EINVAL);
+  
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index d77c2cff9dff..20ca77208fc2 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2956,7 +2956,7 @@ struct sk_buff *skb_gso_segment(struct sk_buff *skb, netdev_features_t features)
+ {
+ 	return __skb_gso_segment(skb, features, true);
+ }
+-__be16 skb_network_protocol(struct sk_buff *skb);
++__be16 skb_network_protocol(struct sk_buff *skb, int *depth);
+ 
+ static inline bool can_checksum_protocol(netdev_features_t features,
+ 					 __be16 protocol)
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 9a2bea4eeeee..7449f8ba4738 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2237,7 +2237,7 @@ out:
+ }
+ EXPORT_SYMBOL(skb_checksum_help);
+ 
+-__be16 skb_network_protocol(struct sk_buff *skb)
++__be16 skb_network_protocol(struct sk_buff *skb, int *depth)
+ {
+ 	__be16 type = skb->protocol;
+ 	int vlan_depth = ETH_HLEN;
+@@ -2264,6 +2264,8 @@ __be16 skb_network_protocol(struct sk_buff *skb)
+ 		vlan_depth += VLAN_HLEN;
+ 	}
+ 
++	*depth = vlan_depth;
++
+ 	return type;
+ }
+ 
+@@ -2277,12 +2279,13 @@ struct sk_buff *skb_mac_gso_segment(struct sk_buff *skb,
+ {
+ 	struct sk_buff *segs = ERR_PTR(-EPROTONOSUPPORT);
+ 	struct packet_offload *ptype;
+-	__be16 type = skb_network_protocol(skb);
++	int vlan_depth = skb->mac_len;
++	__be16 type = skb_network_protocol(skb, &vlan_depth);
+ 
+ 	if (unlikely(!type))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	__skb_pull(skb, skb->mac_len);
++	__skb_pull(skb, vlan_depth);
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(ptype, &offload_base, list) {
+@@ -2448,8 +2451,10 @@ static int dev_gso_segment(struct sk_buff *skb, netdev_features_t features)
+ static netdev_features_t harmonize_features(struct sk_buff *skb,
+ 	netdev_features_t features)
+ {
++	int tmp;
++
+ 	if (skb->ip_summed != CHECKSUM_NONE &&
+-	    !can_checksum_protocol(features, skb_network_protocol(skb))) {
++	    !can_checksum_protocol(features, skb_network_protocol(skb, &tmp))) {
+ 		features &= ~NETIF_F_ALL_CSUM;
+ 	} else if (illegal_highdma(skb->dev, skb)) {
+ 		features &= ~NETIF_F_SG;
+* Unmerged path net/core/skbuff.c
