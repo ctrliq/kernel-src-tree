@@ -1,0 +1,323 @@
+perf: Avoid horrible stack usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] Avoid horrible stack usage (Jiri Olsa) [1209607]
+Rebuild_FUZZ: 89.66%
+commit-author Peter Zijlstra (Intel) <peterz@infradead.org>
+commit 86038c5ea81b519a8a1fcfcd5e4599aab0cdd119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/86038c5e.failed
+
+Both Linus (most recent) and Steve (a while ago) reported that perf
+related callbacks have massive stack bloat.
+
+The problem is that software events need a pt_regs in order to
+properly report the event location and unwind stack. And because we
+could not assume one was present we allocated one on stack and filled
+it with minimal bits required for operation.
+
+Now, pt_regs is quite large, so this is undesirable. Furthermore it
+turns out that most sites actually have a pt_regs pointer available,
+making this even more onerous, as the stack space is pointless waste.
+
+This patch addresses the problem by observing that software events
+have well defined nesting semantics, therefore we can use static
+per-cpu storage instead of on-stack.
+
+Linus made the further observation that all but the scheduler callers
+of perf_sw_event() have a pt_regs available, so we change the regular
+perf_sw_event() to require a valid pt_regs (where it used to be
+optional) and add perf_sw_event_sched() for the scheduler.
+
+We have a scheduler specific call instead of a more generic _noregs()
+like construct because we can assume non-recursion from the scheduler
+and thereby simplify the code further (_noregs would have to put the
+recursion context call inline in order to assertain which __perf_regs
+element to use).
+
+One last note on the implementation of perf_trace_buf_prepare(); we
+allow .regs = NULL for those cases where we already have a pt_regs
+pointer available and do not need another.
+
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Reported-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Javi Merino <javi.merino@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Petr Mladek <pmladek@suse.cz>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Tom Zanussi <tom.zanussi@linux.intel.com>
+	Cc: Vaibhav Nagarnaik <vnagarnaik@google.com>
+Link: http://lkml.kernel.org/r/20141216115041.GW3337@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 86038c5ea81b519a8a1fcfcd5e4599aab0cdd119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/ftrace.h
+#	kernel/sched/core.c
+#	kernel/trace/trace_event_perf.c
+diff --cc include/trace/ftrace.h
+index ce12d6c020e0,27609dfcce25..000000000000
+--- a/include/trace/ftrace.h
++++ b/include/trace/ftrace.h
+@@@ -704,12 -782,8 +704,17 @@@ perf_trace_##call(void *__data, proto
+  			     sizeof(u64));				\
+  	__entry_size -= sizeof(u32);					\
+  									\
+++<<<<<<< HEAD
+ +	if (WARN_ONCE(__entry_size > PERF_MAX_TRACE_SIZE,		\
+ +		      "profile buffer not large enough"))		\
+ +		return;							\
+ +									\
+ +	entry = (struct ftrace_raw_##call *)perf_trace_buf_prepare(	\
+ +		__entry_size, event_call->event.type, &__regs, &rctx);	\
+++=======
++ 	entry = perf_trace_buf_prepare(__entry_size,			\
++ 			event_call->event.type, &__regs, &rctx);	\
+++>>>>>>> 86038c5ea81b (perf: Avoid horrible stack usage)
+  	if (!entry)							\
+  		return;							\
+  									\
+@@@ -717,9 -793,8 +724,9 @@@
+  									\
+  	{ assign; }							\
+  									\
+ +	head = this_cpu_ptr(event_call->perf_events);			\
+  	perf_trace_buf_submit(entry, __entry_size, rctx, __addr,	\
+- 		__count, &__regs, head, __task);			\
++ 		__count, __regs, head, __task);				\
+  }
+  
+  /*
+diff --cc kernel/sched/core.c
+index bb1463993f6a,d22fb16a7153..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1040,13 -1082,7 +1040,17 @@@ void set_task_cpu(struct task_struct *p
+  		if (p->sched_class->migrate_task_rq)
+  			p->sched_class->migrate_task_rq(p, new_cpu);
+  		p->se.nr_migrations++;
+++<<<<<<< HEAD
+ +		perf_sw_event(PERF_COUNT_SW_CPU_MIGRATIONS, 1, NULL, 0);
+ +
+ +		tmn.task = p;
+ +		tmn.from_cpu = task_cpu(p);
+ +		tmn.to_cpu = new_cpu;
+ +
+ +		atomic_notifier_call_chain(&task_migration_notifier, 0, &tmn);
+++=======
++ 		perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
+++>>>>>>> 86038c5ea81b (perf: Avoid horrible stack usage)
+  	}
+  
+  	__set_task_cpu(p, new_cpu);
+diff --cc kernel/trace/trace_event_perf.c
+index 8354dc81ae64,6fa484de2ba1..000000000000
+--- a/kernel/trace/trace_event_perf.c
++++ b/kernel/trace/trace_event_perf.c
+@@@ -226,8 -260,8 +226,13 @@@ void perf_trace_del(struct perf_event *
+  	tp_event->class->reg(tp_event, TRACE_REG_PERF_DEL, p_event);
+  }
+  
+++<<<<<<< HEAD
+ +__kprobes void *perf_trace_buf_prepare(int size, unsigned short type,
+ +				       struct pt_regs *regs, int *rctxp)
+++=======
++ void *perf_trace_buf_prepare(int size, unsigned short type,
++ 			     struct pt_regs **regs, int *rctxp)
+++>>>>>>> 86038c5ea81b (perf: Avoid horrible stack usage)
+  {
+  	struct trace_entry *entry;
+  	unsigned long flags;
+diff --git a/include/linux/ftrace_event.h b/include/linux/ftrace_event.h
+index 120d57a1c3a5..8a98b6ab54fe 100644
+--- a/include/linux/ftrace_event.h
++++ b/include/linux/ftrace_event.h
+@@ -372,7 +372,7 @@ extern int  ftrace_profile_set_filter(struct perf_event *event, int event_id,
+ 				     char *filter_str);
+ extern void ftrace_profile_free_filter(struct perf_event *event);
+ extern void *perf_trace_buf_prepare(int size, unsigned short type,
+-				    struct pt_regs *regs, int *rctxp);
++				    struct pt_regs **regs, int *rctxp);
+ 
+ static inline void
+ perf_trace_buf_submit(void *raw_data, int size, int rctx, u64 addr,
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 7d06dfb6891c..57bbbc3031c8 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -682,6 +682,7 @@ static inline int is_software_event(struct perf_event *event)
+ 
+ extern struct static_key perf_swevent_enabled[PERF_COUNT_SW_MAX];
+ 
++extern void ___perf_sw_event(u32, u64, struct pt_regs *, u64);
+ extern void __perf_sw_event(u32, u64, struct pt_regs *, u64);
+ 
+ #ifndef perf_arch_fetch_caller_regs
+@@ -706,14 +707,25 @@ static inline void perf_fetch_caller_regs(struct pt_regs *regs)
+ static __always_inline void
+ perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
+ {
+-	struct pt_regs hot_regs;
++	if (static_key_false(&perf_swevent_enabled[event_id]))
++		__perf_sw_event(event_id, nr, regs, addr);
++}
++
++DECLARE_PER_CPU(struct pt_regs, __perf_regs[4]);
+ 
++/*
++ * 'Special' version for the scheduler, it hard assumes no recursion,
++ * which is guaranteed by us not actually scheduling inside other swevents
++ * because those disable preemption.
++ */
++static __always_inline void
++perf_sw_event_sched(u32 event_id, u64 nr, u64 addr)
++{
+ 	if (static_key_false(&perf_swevent_enabled[event_id])) {
+-		if (!regs) {
+-			perf_fetch_caller_regs(&hot_regs);
+-			regs = &hot_regs;
+-		}
+-		__perf_sw_event(event_id, nr, regs, addr);
++		struct pt_regs *regs = this_cpu_ptr(&__perf_regs[0]);
++
++		perf_fetch_caller_regs(regs);
++		___perf_sw_event(event_id, nr, regs, addr);
+ 	}
+ }
+ 
+@@ -729,7 +741,7 @@ static inline void perf_event_task_sched_in(struct task_struct *prev,
+ static inline void perf_event_task_sched_out(struct task_struct *prev,
+ 					     struct task_struct *next)
+ {
+-	perf_sw_event(PERF_COUNT_SW_CONTEXT_SWITCHES, 1, NULL, 0);
++	perf_sw_event_sched(PERF_COUNT_SW_CONTEXT_SWITCHES, 1, 0);
+ 
+ 	if (static_key_false(&perf_sched_events.key))
+ 		__perf_event_task_sched_out(prev, next);
+@@ -840,6 +852,8 @@ static inline int perf_event_refresh(struct perf_event *event, int refresh)
+ static inline void
+ perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)	{ }
+ static inline void
++perf_sw_event_sched(u32 event_id, u64 nr, u64 addr)			{ }
++static inline void
+ perf_bp_event(struct perf_event *event, void *data)			{ }
+ 
+ static inline int perf_register_guest_info_callbacks
+* Unmerged path include/trace/ftrace.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 30b7d0bf3ac7..88ab7141986d 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5895,6 +5895,8 @@ end:
+ 	rcu_read_unlock();
+ }
+ 
++DEFINE_PER_CPU(struct pt_regs, __perf_regs[4]);
++
+ int perf_swevent_get_recursion_context(void)
+ {
+ 	struct swevent_htable *swhash = &__get_cpu_var(swevent_htable);
+@@ -5910,21 +5912,30 @@ inline void perf_swevent_put_recursion_context(int rctx)
+ 	put_recursion_context(swhash->recursion, rctx);
+ }
+ 
+-void __perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
++void ___perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
+ {
+ 	struct perf_sample_data data;
+-	int rctx;
+ 
+-	preempt_disable_notrace();
+-	rctx = perf_swevent_get_recursion_context();
+-	if (rctx < 0)
++	if (WARN_ON_ONCE(!regs))
+ 		return;
+ 
+ 	perf_sample_data_init(&data, addr, 0);
+-
+ 	do_perf_sw_event(PERF_TYPE_SOFTWARE, event_id, nr, &data, regs);
++}
++
++void __perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)
++{
++	int rctx;
++
++	preempt_disable_notrace();
++	rctx = perf_swevent_get_recursion_context();
++	if (unlikely(rctx < 0))
++		goto fail;
++
++	___perf_sw_event(event_id, nr, regs, addr);
+ 
+ 	perf_swevent_put_recursion_context(rctx);
++fail:
+ 	preempt_enable_notrace();
+ }
+ 
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/trace/trace_event_perf.c
+diff --git a/kernel/trace/trace_kprobe.c b/kernel/trace/trace_kprobe.c
+index 64abc8ca928b..5bd4c91e94dd 100644
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@ -1183,7 +1183,7 @@ kprobe_perf_func(struct trace_probe *tp, struct pt_regs *regs)
+ 		     "profile buffer not large enough"))
+ 		return;
+ 
+-	entry = perf_trace_buf_prepare(size, call->event.type, regs, &rctx);
++	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
+ 	if (!entry)
+ 		return;
+ 
+@@ -1215,7 +1215,7 @@ kretprobe_perf_func(struct trace_probe *tp, struct kretprobe_instance *ri,
+ 		     "profile buffer not large enough"))
+ 		return;
+ 
+-	entry = perf_trace_buf_prepare(size, call->event.type, regs, &rctx);
++	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
+ 	if (!entry)
+ 		return;
+ 
+diff --git a/kernel/trace/trace_syscalls.c b/kernel/trace/trace_syscalls.c
+index bdb9ee0af991..035f654228ba 100644
+--- a/kernel/trace/trace_syscalls.c
++++ b/kernel/trace/trace_syscalls.c
+@@ -576,7 +576,7 @@ static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
+ 		return;
+ 
+ 	rec = (struct syscall_trace_enter *)perf_trace_buf_prepare(size,
+-				sys_data->enter_event->event.type, regs, &rctx);
++				sys_data->enter_event->event.type, NULL, &rctx);
+ 	if (!rec)
+ 		return;
+ 
+@@ -655,7 +655,7 @@ static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
+ 		return;
+ 
+ 	rec = (struct syscall_trace_exit *)perf_trace_buf_prepare(size,
+-				sys_data->exit_event->event.type, regs, &rctx);
++				sys_data->exit_event->event.type, NULL, &rctx);
+ 	if (!rec)
+ 		return;
+ 
+diff --git a/kernel/trace/trace_uprobe.c b/kernel/trace/trace_uprobe.c
+index 6fd72b768522..960d82ad225a 100644
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@ -846,7 +846,7 @@ static void uprobe_perf_print(struct trace_uprobe *tu,
+ 	if (hlist_empty(head))
+ 		goto out;
+ 
+-	entry = perf_trace_buf_prepare(size, call->event.type, regs, &rctx);
++	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
+ 	if (!entry)
+ 		goto out;
+ 
