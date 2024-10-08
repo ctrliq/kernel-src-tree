@@ -1724,6 +1724,8 @@ call_connect_status(struct rpc_task *task)
 static void
 call_transmit(struct rpc_task *task)
 {
+	int is_retrans = RPC_WAS_SENT(task);
+
 	dprint_status(task);
 
 	task->tk_action = call_status;
@@ -1748,6 +1750,8 @@ call_transmit(struct rpc_task *task)
 	xprt_transmit(task);
 	if (task->tk_status < 0)
 		return;
+	if (is_retrans)
+		task->tk_client->cl_stats->rpcretrans++;
 	/*
 	 * On success, ensure that we call xprt_end_transmit() before sleeping
 	 * in order to allow access to the socket to other RPC requests.
@@ -1988,7 +1992,6 @@ call_timeout(struct rpc_task *task)
 	rpcauth_invalcred(task);
 
 retry:
-	clnt->cl_stats->rpcretrans++;
 	task->tk_action = call_bind;
 	task->tk_status = 0;
 }
@@ -2031,7 +2034,6 @@ call_decode(struct rpc_task *task)
 	if (req->rq_rcv_buf.len < 12) {
 		if (!RPC_IS_SOFT(task)) {
 			task->tk_action = call_bind;
-			clnt->cl_stats->rpcretrans++;
 			goto out_retry;
 		}
 		dprintk("RPC:       %s: too small RPC reply size (%d bytes)\n",
