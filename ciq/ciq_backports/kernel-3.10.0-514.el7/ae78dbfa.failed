@@ -1,0 +1,272 @@
+net: Add trace events for all receive entry points, exposing more skb fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] Add trace events for all receive entry points, exposing more skb fields (Davide Caratti) [1330669]
+Rebuild_FUZZ: 96.60%
+commit-author Ben Hutchings <bhutchings@solarflare.com>
+commit ae78dbfa40c629f79c72ab93525508ef49e798b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ae78dbfa.failed
+
+The existing net/netif_rx and net/netif_receive_skb trace events
+provide little information about the skb, nor do they indicate how it
+entered the stack.
+
+Add trace events at entry of each of the exported functions, including
+most fields that are likely to be interesting for debugging driver
+datapath behaviour.  Split netif_rx() and netif_receive_skb() so that
+internal calls are not traced.
+
+	Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ae78dbfa40c629f79c72ab93525508ef49e798b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index e416d49ce837,20c834e3c7ca..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -1701,7 -1683,24 +1703,28 @@@ EXPORT_SYMBOL_GPL(__dev_forward_skb)
+   */
+  int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	return __dev_forward_skb(dev, skb) ?: netif_rx(skb);
+++=======
++ 	if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
++ 		if (skb_copy_ubufs(skb, GFP_ATOMIC)) {
++ 			atomic_long_inc(&dev->rx_dropped);
++ 			kfree_skb(skb);
++ 			return NET_RX_DROP;
++ 		}
++ 	}
++ 
++ 	if (unlikely(!is_skb_forwardable(dev, skb))) {
++ 		atomic_long_inc(&dev->rx_dropped);
++ 		kfree_skb(skb);
++ 		return NET_RX_DROP;
++ 	}
++ 
++ 	skb_scrub_packet(skb, true);
++ 	skb->protocol = eth_type_trans(skb, dev);
++ 
++ 	return netif_rx_internal(skb);
+++>>>>>>> ae78dbfa40c6 (net: Add trace events for all receive entry points, exposing more skb fields)
+  }
+  EXPORT_SYMBOL_GPL(dev_forward_skb);
+  
+@@@ -3616,25 -3673,8 +3648,10 @@@ static int __netif_receive_skb(struct s
+  	return ret;
+  }
+  
+- /**
+-  *	netif_receive_skb - process receive buffer from network
+-  *	@skb: buffer to process
+-  *
+-  *	netif_receive_skb() is the main receive data processing function.
+-  *	It always succeeds. The buffer may be dropped during processing
+-  *	for congestion control or by the protocol layers.
+-  *
+-  *	This function may only be called from softirq context and interrupts
+-  *	should be enabled.
+-  *
+-  *	Return values (usually ignored):
+-  *	NET_RX_SUCCESS: no congestion
+-  *	NET_RX_DROP: packet was dropped
+-  */
+- int netif_receive_skb(struct sk_buff *skb)
++ static int netif_receive_skb_internal(struct sk_buff *skb)
+  {
+ +	int ret;
+ +
+  	net_timestamp_check(netdev_tstamp_prequeue, skb);
+  
+  	if (skb_defer_rx_timestamp(skb))
+@@@ -3652,20 -3694,35 +3669,42 @@@
+  			rcu_read_unlock();
+  			return ret;
+  		}
+ -		rcu_read_unlock();
+  	}
+  #endif
+ -	return __netif_receive_skb(skb);
+ +	ret = __netif_receive_skb(skb);
+ +	rcu_read_unlock();
+ +	return ret;
+  }
++ 
++ /**
++  *	netif_receive_skb - process receive buffer from network
++  *	@skb: buffer to process
++  *
++  *	netif_receive_skb() is the main receive data processing function.
++  *	It always succeeds. The buffer may be dropped during processing
++  *	for congestion control or by the protocol layers.
++  *
++  *	This function may only be called from softirq context and interrupts
++  *	should be enabled.
++  *
++  *	Return values (usually ignored):
++  *	NET_RX_SUCCESS: no congestion
++  *	NET_RX_DROP: packet was dropped
++  */
++ int netif_receive_skb(struct sk_buff *skb)
++ {
++ 	trace_netif_receive_skb_entry(skb);
++ 
++ 	return netif_receive_skb_internal(skb);
++ }
+  EXPORT_SYMBOL(netif_receive_skb);
+  
+ +int netif_receive_skb_sk(struct sock *sk, struct sk_buff *skb)
+ +{
+ +	return netif_receive_skb(skb);
+ +}
+ +EXPORT_SYMBOL(netif_receive_skb_sk);
+ +
+  /* Network device is going away, flush any packets still pending
+   * Called with irqs disabled.
+   */
+@@@ -3981,7 -4015,7 +4020,11 @@@ static gro_result_t napi_skb_finish(gro
+  
+  gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	skb_gro_reset_offset(skb);
+++=======
++ 	trace_napi_gro_receive_entry(skb);
+++>>>>>>> ae78dbfa40c6 (net: Add trace events for all receive entry points, exposing more skb fields)
+  
+  	return napi_skb_finish(dev_gro_receive(napi, skb), skb);
+  }
+@@@ -4020,10 -4050,7 +4063,14 @@@ static gro_result_t napi_frags_finish(s
+  {
+  	switch (ret) {
+  	case GRO_NORMAL:
+++<<<<<<< HEAD
+ +	case GRO_HELD:
+ +		__skb_push(skb, ETH_HLEN);
+ +		skb->protocol = eth_type_trans(skb, skb->dev);
+ +		if (ret == GRO_NORMAL && netif_receive_skb(skb))
+++=======
++ 		if (netif_receive_skb_internal(skb))
+++>>>>>>> ae78dbfa40c6 (net: Add trace events for all receive entry points, exposing more skb fields)
+  			ret = GRO_DROP;
+  		break;
+  
+diff --git a/include/trace/events/net.h b/include/trace/events/net.h
+index f99645d05a8f..4fa857aec15c 100644
+--- a/include/trace/events/net.h
++++ b/include/trace/events/net.h
+@@ -78,6 +78,106 @@ DEFINE_EVENT(net_dev_template, netif_rx,
+ 
+ 	TP_ARGS(skb)
+ );
++
++DECLARE_EVENT_CLASS(net_dev_rx_verbose_template,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb),
++
++	TP_STRUCT__entry(
++		__string(	name,			skb->dev->name	)
++		__field(	unsigned int,		napi_id		)
++		__field(	u16,			queue_mapping	)
++		__field(	const void *,		skbaddr		)
++		__field(	bool,			vlan_tagged	)
++		__field(	u16,			vlan_proto	)
++		__field(	u16,			vlan_tci	)
++		__field(	u16,			protocol	)
++		__field(	u8,			ip_summed	)
++		__field(	u32,			rxhash		)
++		__field(	bool,			l4_rxhash	)
++		__field(	unsigned int,		len		)
++		__field(	unsigned int,		data_len	)
++		__field(	unsigned int,		truesize	)
++		__field(	bool,			mac_header_valid)
++		__field(	int,			mac_header	)
++		__field(	unsigned char,		nr_frags	)
++		__field(	u16,			gso_size	)
++		__field(	u16,			gso_type	)
++	),
++
++	TP_fast_assign(
++		__assign_str(name, skb->dev->name);
++#ifdef CONFIG_NET_RX_BUSY_POLL
++		__entry->napi_id = skb->napi_id;
++#else
++		__entry->napi_id = 0;
++#endif
++		__entry->queue_mapping = skb->queue_mapping;
++		__entry->skbaddr = skb;
++		__entry->vlan_tagged = vlan_tx_tag_present(skb);
++		__entry->vlan_proto = ntohs(skb->vlan_proto);
++		__entry->vlan_tci = vlan_tx_tag_get(skb);
++		__entry->protocol = ntohs(skb->protocol);
++		__entry->ip_summed = skb->ip_summed;
++		__entry->rxhash = skb->rxhash;
++		__entry->l4_rxhash = skb->l4_rxhash;
++		__entry->len = skb->len;
++		__entry->data_len = skb->data_len;
++		__entry->truesize = skb->truesize;
++		__entry->mac_header_valid = skb_mac_header_was_set(skb);
++		__entry->mac_header = skb_mac_header(skb) - skb->data;
++		__entry->nr_frags = skb_shinfo(skb)->nr_frags;
++		__entry->gso_size = skb_shinfo(skb)->gso_size;
++		__entry->gso_type = skb_shinfo(skb)->gso_type;
++	),
++
++	TP_printk("dev=%s napi_id=%#x queue_mapping=%u skbaddr=%p vlan_tagged=%d vlan_proto=0x%04x vlan_tci=0x%04x protocol=0x%04x ip_summed=%d rxhash=0x%08x l4_rxhash=%d len=%u data_len=%u truesize=%u mac_header_valid=%d mac_header=%d nr_frags=%d gso_size=%d gso_type=%#x",
++		  __get_str(name), __entry->napi_id, __entry->queue_mapping,
++		  __entry->skbaddr, __entry->vlan_tagged, __entry->vlan_proto,
++		  __entry->vlan_tci, __entry->protocol, __entry->ip_summed,
++		  __entry->rxhash, __entry->l4_rxhash, __entry->len,
++		  __entry->data_len, __entry->truesize,
++		  __entry->mac_header_valid, __entry->mac_header,
++		  __entry->nr_frags, __entry->gso_size, __entry->gso_type)
++);
++
++DEFINE_EVENT(net_dev_rx_verbose_template, napi_gro_frags_entry,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb)
++);
++
++DEFINE_EVENT(net_dev_rx_verbose_template, napi_gro_receive_entry,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb)
++);
++
++DEFINE_EVENT(net_dev_rx_verbose_template, netif_receive_skb_entry,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb)
++);
++
++DEFINE_EVENT(net_dev_rx_verbose_template, netif_rx_entry,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb)
++);
++
++DEFINE_EVENT(net_dev_rx_verbose_template, netif_rx_ni_entry,
++
++	TP_PROTO(const struct sk_buff *skb),
++
++	TP_ARGS(skb)
++);
++
+ #endif /* _TRACE_NET_H */
+ 
+ /* This part must be outside protection */
+* Unmerged path net/core/dev.c
