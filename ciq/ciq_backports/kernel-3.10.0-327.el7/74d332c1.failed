@@ -1,0 +1,169 @@
+net: extend net_device allocation to vmalloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] extend net_device allocation to vmalloc() (Jiri Benc) [1245278]
+Rebuild_FUZZ: 94.25%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 74d332c13b2148ae934ea94dac1745ae92efe8e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/74d332c1.failed
+
+Joby Poriyath provided a xen-netback patch to reduce the size of
+xenvif structure as some netdev allocation could fail under
+memory pressure/fragmentation.
+
+This patch is handling the problem at the core level, allowing
+any netdev structures to use vmalloc() if kmalloc() failed.
+
+As vmalloc() adds overhead on a critical network path, add __GFP_REPEAT
+to kzalloc() flags to do this fallback only when really needed.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Joby Poriyath <joby.poriyath@citrix.com>
+	Cc: Ben Hutchings <bhutchings@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 74d332c13b2148ae934ea94dac1745ae92efe8e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+diff --cc include/linux/netdevice.h
+index 3cf462ffc113,e6353cafbf05..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1861,21 -1798,21 +1861,29 @@@ static inline void unregister_netdevice
+  	unregister_netdevice_queue(dev, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +extern int 		netdev_refcnt_read(const struct net_device *dev);
+ +extern void		free_netdev(struct net_device *dev);
+ +extern void		synchronize_net(void);
+ +extern int		init_dummy_netdev(struct net_device *dev);
+++=======
++ int netdev_refcnt_read(const struct net_device *dev);
++ void free_netdev(struct net_device *dev);
++ void netdev_freemem(struct net_device *dev);
++ void synchronize_net(void);
++ int init_dummy_netdev(struct net_device *dev);
+++>>>>>>> 74d332c13b21 (net: extend net_device allocation to vmalloc())
+  
+ -struct net_device *dev_get_by_index(struct net *net, int ifindex);
+ -struct net_device *__dev_get_by_index(struct net *net, int ifindex);
+ -struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+ -int netdev_get_name(struct net *net, char *name, int ifindex);
+ -int dev_restart(struct net_device *dev);
+ +extern struct net_device	*dev_get_by_index(struct net *net, int ifindex);
+ +extern struct net_device	*__dev_get_by_index(struct net *net, int ifindex);
+ +extern struct net_device	*dev_get_by_index_rcu(struct net *net, int ifindex);
+ +extern int		netdev_get_name(struct net *net, char *name, int ifindex);
+ +extern int		dev_restart(struct net_device *dev);
+  #ifdef CONFIG_NETPOLL_TRAP
+ -int netpoll_trap(void);
+ +extern int		netpoll_trap(void);
+  #endif
+ -int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
+ +extern int	       skb_gro_receive(struct sk_buff **head,
+ +				       struct sk_buff *skb);
+  
+  static inline unsigned int skb_gro_offset(const struct sk_buff *skb)
+  {
+diff --git a/Documentation/networking/netdevices.txt b/Documentation/networking/netdevices.txt
+index c7ecc7080494..0b1cf6b2a592 100644
+--- a/Documentation/networking/netdevices.txt
++++ b/Documentation/networking/netdevices.txt
+@@ -10,12 +10,12 @@ network devices.
+ struct net_device allocation rules
+ ==================================
+ Network device structures need to persist even after module is unloaded and
+-must be allocated with kmalloc.  If device has registered successfully,
+-it will be freed on last use by free_netdev.  This is required to handle the
+-pathologic case cleanly (example: rmmod mydriver </sys/class/net/myeth/mtu )
++must be allocated with alloc_netdev_mqs() and friends.
++If device has registered successfully, it will be freed on last use
++by free_netdev(). This is required to handle the pathologic case cleanly
++(example: rmmod mydriver </sys/class/net/myeth/mtu )
+ 
+-There are routines in net_init.c to handle the common cases of
+-alloc_etherdev, alloc_netdev.  These reserve extra space for driver
++alloc_netdev_mqs()/alloc_netdev() reserve extra space for driver
+ private data which gets freed when the network device is freed. If
+ separately allocated data is attached to the network device
+ (netdev_priv(dev)) then it is up to the module exit handler to free that.
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 29fd774854e2..39229f275caf 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5819,6 +5819,16 @@ void netdev_set_default_ethtool_ops(struct net_device *dev,
+ }
+ EXPORT_SYMBOL_GPL(netdev_set_default_ethtool_ops);
+ 
++void netdev_freemem(struct net_device *dev)
++{
++	char *addr = (char *)dev - dev->padded;
++
++	if (is_vmalloc_addr(addr))
++		vfree(addr);
++	else
++		kfree(addr);
++}
++
+ /**
+  *	alloc_netdev_mqs - allocate network device
+  *	@sizeof_priv:	size of private data to allocate space for
+@@ -5862,7 +5872,9 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
+ 	/* ensure 32-byte alignment of whole construct */
+ 	alloc_size += NETDEV_ALIGN - 1;
+ 
+-	p = kzalloc(alloc_size, GFP_KERNEL);
++	p = kzalloc(alloc_size, GFP_KERNEL | __GFP_NOWARN | __GFP_REPEAT);
++	if (!p)
++		p = vzalloc(alloc_size);
+ 	if (!p)
+ 		return NULL;
+ 
+@@ -5871,7 +5883,7 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
+ 
+ 	dev->pcpu_refcnt = alloc_percpu(int);
+ 	if (!dev->pcpu_refcnt)
+-		goto free_p;
++		goto free_dev;
+ 
+ 	if (dev_addr_init(dev))
+ 		goto free_pcpu;
+@@ -5920,8 +5932,8 @@ free_pcpu:
+ 	kfree(dev->_rx);
+ #endif
+ 
+-free_p:
+-	kfree(p);
++free_dev:
++	netdev_freemem(dev);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(alloc_netdev_mqs);
+@@ -5958,7 +5970,7 @@ void free_netdev(struct net_device *dev)
+ 
+ 	/*  Compatibility with error handling in drivers */
+ 	if (dev->reg_state == NETREG_UNINITIALIZED) {
+-		kfree((char *)dev - dev->padded);
++		netdev_freemem(dev);
+ 		return;
+ 	}
+ 
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index 62086f24a037..be47c1c3c136 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -1257,7 +1257,7 @@ static void netdev_release(struct device *d)
+ 	BUG_ON(dev->reg_state != NETREG_RELEASED);
+ 
+ 	kfree(dev->ifalias);
+-	kfree((char *)dev - dev->padded);
++	netdev_freemem(dev);
+ }
+ 
+ static const void *net_namespace(struct device *d)
