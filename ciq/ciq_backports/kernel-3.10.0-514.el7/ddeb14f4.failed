@@ -1,0 +1,116 @@
+xfs: quiesce the filesystem after recovery on readonly mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit ddeb14f4fb2fa1242829a76edc821f087e50bcdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ddeb14f4.failed
+
+Recently we've had a number of reports where log recovery on a v5
+filesystem has reported corruptions that looked to be caused by
+recovery being re-run over the top of an already-recovered
+metadata. This has uncovered a bug in recovery (fixed elsewhere)
+but the vector that caused this was largely unknown.
+
+A kdump test started tripping over this problem - the system
+would be crashed, the kdump kernel and environment would boot and
+dump the kernel core image, and then the system would reboot. After
+reboot, the root filesystem was triggering log recovery and
+corruptions were being detected. The metadumps indicated the above
+log recovery issue.
+
+What is happening is that the kdump kernel and environment is
+mounting the root device read-only to find the binaries needed to do
+it's work. The result of this is that it is running log recovery.
+However, because there were unlinked files and EFIs to be processed
+by recovery, the completion of phase 1 of log recovery could not
+mark the log clean. And because it's a read-only mount, the unmount
+process does not write records to the log to mark it clean, either.
+Hence on the next mount of the filesystem, log recovery was run
+again across all the metadata that had already been recovered and
+this is what triggered corruption warnings.
+
+To avoid this problem, we need to ensure that a read-only mount
+always updates the log when it completes the second phase of
+recovery. We already handle this sort of issue with rw->ro remount
+transitions, so the solution is as simple as quiescing the
+filesystem at the appropriate time during the mount process. This
+results in the log being marked clean so the mount behaviour
+recorded in the logs on repeated RO mounts will change (i.e. log
+recovery will no longer be run on every mount until a RW mount is
+done). This is a user visible change in behaviour, but it is
+harmless.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit ddeb14f4fb2fa1242829a76edc821f087e50bcdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_super.h
+diff --cc fs/xfs/xfs_super.h
+index 499058fea303,b6418abd85ad..000000000000
+--- a/fs/xfs/xfs_super.h
++++ b/fs/xfs/xfs_super.h
+@@@ -61,12 -61,11 +61,16 @@@ struct xfs_mount
+  struct xfs_buftarg;
+  struct block_device;
+  
+++<<<<<<< HEAD
+ +extern __uint64_t xfs_max_file_offset(unsigned int);
+ +
+++=======
++ extern void xfs_quiesce_attr(struct xfs_mount *mp);
+++>>>>>>> ddeb14f4fb2f (xfs: quiesce the filesystem after recovery on readonly mount)
+  extern void xfs_flush_inodes(struct xfs_mount *mp);
+  extern void xfs_blkdev_issue_flush(struct xfs_buftarg *);
+ -extern xfs_agnumber_t xfs_set_inode_alloc(struct xfs_mount *,
+ -					   xfs_agnumber_t agcount);
+ +extern xfs_agnumber_t xfs_set_inode32(struct xfs_mount *, xfs_agnumber_t agcount);
+ +extern xfs_agnumber_t xfs_set_inode64(struct xfs_mount *, xfs_agnumber_t agcount);
+  
+  extern const struct export_operations xfs_export_operations;
+  extern const struct xattr_handler *xfs_xattr_handlers[];
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index dbc29eed5e90..f78c46e09c52 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -939,6 +939,20 @@ xfs_mountfs(
+ 		goto out_rtunmount;
+ 	}
+ 
++	/*
++	 * Now the log is fully replayed, we can transition to full read-only
++	 * mode for read-only mounts. This will sync all the metadata and clean
++	 * the log so that the recovery we just performed does not have to be
++	 * replayed again on the next mount.
++	 *
++	 * We use the same quiesce mechanism as the rw->ro remount, as they are
++	 * semantically identical operations.
++	 */
++	if ((mp->m_flags & (XFS_MOUNT_RDONLY|XFS_MOUNT_NORECOVERY)) ==
++							XFS_MOUNT_RDONLY) {
++		xfs_quiesce_attr(mp);
++	}
++
+ 	/*
+ 	 * Complete the quota initialisation, post-log-replay component.
+ 	 */
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index c827b68f42ea..c0baabae3897 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1148,7 +1148,7 @@ xfs_restore_resvblks(struct xfs_mount *mp)
+  * Note: xfs_log_quiesce() stops background log work - the callers must ensure
+  * it is started again when appropriate.
+  */
+-static void
++void
+ xfs_quiesce_attr(
+ 	struct xfs_mount	*mp)
+ {
+* Unmerged path fs/xfs/xfs_super.h
