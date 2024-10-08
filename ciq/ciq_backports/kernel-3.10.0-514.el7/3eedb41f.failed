@@ -1,0 +1,167 @@
+openvswitch: Remove egress_tun_info.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] openvswitch: Remove egress_tun_info (Lance Richardson) [1283886]
+Rebuild_FUZZ: 98.59%
+commit-author Pravin B Shelar <pshelar@nicira.com>
+commit 3eedb41fb43461b5fde3f72fd00a7706f0b90103
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3eedb41f.failed
+
+tun info is passed using skb-dst pointer. Now we have
+converted all vports to netdev based implementation so
+Now we can remove redundant pointer to tun-info from OVS_CB.
+
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3eedb41fb43461b5fde3f72fd00a7706f0b90103)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-geneve.c
+#	net/openvswitch/vport.c
+diff --cc net/openvswitch/vport-geneve.c
+index 1da3a14d1010,24c56e56fedd..000000000000
+--- a/net/openvswitch/vport-geneve.c
++++ b/net/openvswitch/vport-geneve.c
+@@@ -108,13 -52,17 +108,19 @@@ static int geneve_get_options(const str
+  	return 0;
+  }
+  
+ -static int geneve_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+ -				      struct ip_tunnel_info *egress_tun_info)
+ +static void geneve_tnl_destroy(struct vport *vport)
+  {
+  	struct geneve_port *geneve_port = geneve_vport(vport);
+ -	struct net *net = ovs_dp_get_net(vport->dp);
+ -	__be16 dport = htons(geneve_port->port_no);
+ -	__be16 sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+  
+++<<<<<<< HEAD
+ +	geneve_sock_release(geneve_port->gs);
+ +
+ +	ovs_vport_deferred_free(vport);
+++=======
++ 	return ovs_tunnel_get_egress_info(egress_tun_info,
++ 					  ovs_dp_get_net(vport->dp),
++ 					  skb, IPPROTO_UDP, sport, dport);
+++>>>>>>> 3eedb41fb434 (openvswitch: Remove egress_tun_info.)
+  }
+  
+  static struct vport *geneve_tnl_create(const struct vport_parms *parms)
+diff --cc net/openvswitch/vport.c
+index af23ba077836,e658439a0bdd..000000000000
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@@ -483,7 -483,7 +483,11 @@@ void ovs_vport_receive(struct vport *vp
+  	u64_stats_update_end(&stats->syncp);
+  
+  	OVS_CB(skb)->input_vport = vport;
+++<<<<<<< HEAD
+ +	OVS_CB(skb)->egress_tun_info = NULL;
+++=======
++ 	OVS_CB(skb)->mru = 0;
+++>>>>>>> 3eedb41fb434 (openvswitch: Remove egress_tun_info.)
+  	/* Extract flow from 'skb' into 'key'. */
+  	error = ovs_flow_key_extract(tun_info, skb, &key);
+  	if (unlikely(error)) {
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index 327766f7c945..006cfaeab855 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -744,10 +744,6 @@ static int execute_set_action(struct sk_buff *skb,
+ 		skb_dst_drop(skb);
+ 		dst_hold((struct dst_entry *)tun->tun_dst);
+ 		skb_dst_set(skb, (struct dst_entry *)tun->tun_dst);
+-
+-		/* FIXME: Remove when all vports have been converted */
+-		OVS_CB(skb)->egress_tun_info = &tun->tun_dst->u.tun_info;
+-
+ 		return 0;
+ 	}
+ 
+@@ -991,7 +987,6 @@ int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 	int err;
+ 
+ 	this_cpu_inc(exec_actions_level);
+-	OVS_CB(skb)->egress_tun_info = NULL;
+ 	err = do_execute_actions(dp, skb, key,
+ 				 acts->actions, acts->actions_len);
+ 
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index b447e1242e90..05968bef0bf4 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -578,7 +578,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 		goto err_flow_free;
+ 
+ 	rcu_assign_pointer(flow->sf_acts, acts);
+-	OVS_CB(packet)->egress_tun_info = NULL;
+ 	packet->priority = flow->key.phy.priority;
+ 	packet->mark = flow->key.phy.skb_mark;
+ 
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 487a85f7d967..68a13cae4a8c 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -93,13 +93,10 @@ struct datapath {
+ 
+ /**
+  * struct ovs_skb_cb - OVS data in skb CB
+- * @egress_tun_key: Tunnel information about this packet on egress path.
+- * NULL if the packet is not being tunneled.
+  * @input_vport: The original vport packet came in on. This value is cached
+  * when a packet is received by OVS.
+  */
+ struct ovs_skb_cb {
+-	struct ip_tunnel_info  *egress_tun_info;
+ 	struct vport		*input_vport;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
+* Unmerged path net/openvswitch/vport-geneve.c
+diff --git a/net/openvswitch/vport-gre.c b/net/openvswitch/vport-gre.c
+index b87656c66aaf..f9616e82500c 100644
+--- a/net/openvswitch/vport-gre.c
++++ b/net/openvswitch/vport-gre.c
+@@ -281,8 +281,7 @@ static int gre_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+ {
+ 	return ovs_tunnel_get_egress_info(egress_tun_info,
+ 					  ovs_dp_get_net(vport->dp),
+-					  OVS_CB(skb)->egress_tun_info,
+-					  IPPROTO_GRE, skb->mark, 0, 0);
++					  skb, IPPROTO_GRE, 0, 0);
+ }
+ 
+ static struct vport_ops ovs_gre_vport_ops = {
+diff --git a/net/openvswitch/vport-vxlan.c b/net/openvswitch/vport-vxlan.c
+index 6f7986fabb70..00b40e81f52f 100644
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@ -282,8 +282,7 @@ static int vxlan_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+ 	src_port = udp_flow_src_port(net, skb, 0, 0, true);
+ 
+ 	return ovs_tunnel_get_egress_info(egress_tun_info, net,
+-					  OVS_CB(skb)->egress_tun_info,
+-					  IPPROTO_UDP, skb->mark,
++					  skb, IPPROTO_UDP,
+ 					  src_port, dst_port);
+ }
+ 
+* Unmerged path net/openvswitch/vport.c
+diff --git a/net/openvswitch/vport.h b/net/openvswitch/vport.h
+index 4750fb673a9f..9243abf508d9 100644
+--- a/net/openvswitch/vport.h
++++ b/net/openvswitch/vport.h
+@@ -60,9 +60,8 @@ int ovs_vport_send(struct vport *, struct sk_buff *);
+ 
+ int ovs_tunnel_get_egress_info(struct ip_tunnel_info *egress_tun_info,
+ 			       struct net *net,
+-			       const struct ip_tunnel_info *tun_info,
++			       struct sk_buff *,
+ 			       u8 ipproto,
+-			       u32 skb_mark,
+ 			       __be16 tp_src,
+ 			       __be16 tp_dst);
+ int ovs_vport_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
