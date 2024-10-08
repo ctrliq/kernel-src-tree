@@ -208,13 +208,13 @@ data_access_slb_pSeries:
 	b	.slb_miss_realmode
 #else
 	/*
-	 * We can't just use a direct branch to .slb_miss_realmode
+	 * We can't just use a direct branch to slb_miss_realmode
 	 * because the distance from here to there depends on where
 	 * the kernel ends up being put.
 	 */
 	mfctr	r11
 	ld	r10,PACAKBASE(r13)
-	LOAD_HANDLER(r10, .slb_miss_realmode)
+	LOAD_HANDLER(r10, slb_miss_realmode)
 	mtctr	r10
 	bctr
 #endif
@@ -241,7 +241,7 @@ instruction_access_slb_pSeries:
 #else
 	mfctr	r11
 	ld	r10,PACAKBASE(r13)
-	LOAD_HANDLER(r10, .slb_miss_realmode)
+	LOAD_HANDLER(r10, slb_miss_realmode)
 	mtctr	r10
 	bctr
 #endif
@@ -518,7 +518,7 @@ do_stab_bolted_pSeries:
 	std	r12,PACA_EXSLB+EX_R12(r13)
 	GET_SCRATCH0(r10)
 	std	r10,PACA_EXSLB+EX_R13(r13)
-	EXCEPTION_PROLOG_PSERIES_1(.do_stab_bolted, EXC_STD)
+	EXCEPTION_PROLOG_PSERIES_1(do_stab_bolted, EXC_STD)
 
 	KVM_HANDLER_SKIP(PACA_EXGEN, EXC_STD, 0x300)
 	KVM_HANDLER_SKIP(PACA_EXSLB, EXC_STD, 0x380)
@@ -826,13 +826,13 @@ data_access_slb_relon_pSeries:
 	b	.slb_miss_realmode
 #else
 	/*
-	 * We can't just use a direct branch to .slb_miss_realmode
+	 * We can't just use a direct branch to slb_miss_realmode
 	 * because the distance from here to there depends on where
 	 * the kernel ends up being put.
 	 */
 	mfctr	r11
 	ld	r10,PACAKBASE(r13)
-	LOAD_HANDLER(r10, .slb_miss_realmode)
+	LOAD_HANDLER(r10, slb_miss_realmode)
 	mtctr	r10
 	bctr
 #endif
@@ -852,7 +852,7 @@ instruction_access_slb_relon_pSeries:
 #else
 	mfctr	r11
 	ld	r10,PACAKBASE(r13)
-	LOAD_HANDLER(r10, .slb_miss_realmode)
+	LOAD_HANDLER(r10, slb_miss_realmode)
 	mtctr	r10
 	bctr
 #endif
@@ -1474,7 +1474,7 @@ machine_check_handle_early:
  * r3 is saved in paca->slb_r3
  * We assume we aren't going to take any exceptions during this procedure.
  */
-_GLOBAL(slb_miss_realmode)
+slb_miss_realmode:
 	mflr	r10
 #ifdef CONFIG_RELOCATABLE
 	mtctr	r11
@@ -1652,7 +1652,7 @@ do_ste_alloc:
  * We assume (DAR >> 60) == 0xc.
  */
 	.align	7
-_GLOBAL(do_stab_bolted)
+do_stab_bolted:
 	stw	r9,PACA_EXSLB+EX_CCR(r13)	/* save CR in exc. frame */
 	std	r11,PACA_EXSLB+EX_SRR0(r13)	/* save SRR0 in exc. frame */
 	mfspr	r11,SPRN_DAR			/* ea */
