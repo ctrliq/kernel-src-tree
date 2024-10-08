@@ -1,0 +1,477 @@
+powerpc/mm: Differentiate between hugetlb and THP during page walk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [powerpc] mm: Differentiate between hugetlb and THP during page walk (Thomas Huth) [1287474]
+Rebuild_FUZZ: 93.55%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 891121e6c02c6242487aa4ea1d5c75b7ecdc45ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/891121e6.failed
+
+We need to properly identify whether a hugepage is an explicit or
+a transparent hugepage in follow_huge_addr(). We used to depend
+on hugepage shift argument to do that. But in some case that can
+result in wrong results. For ex:
+
+On finding a transparent hugepage we set hugepage shift to PMD_SHIFT.
+But we can end up clearing the thp pte, via pmdp_huge_get_and_clear.
+We do prevent reusing the pfn page via the usage of
+kick_all_cpus_sync(). But that happens after we updated the pte to 0.
+Hence in follow_huge_addr() we can find hugepage shift set, but transparent
+huge page check fail for a thp pte.
+
+NOTE: We fixed a variant of this race against thp split in commit
+691e95fd7396905a38d98919e9c150dbc3ea21a3
+("powerpc/mm/thp: Make page table walk safe against thp split/collapse")
+
+Without this patch, we may hit the BUG_ON(flags & FOLL_GET) in
+follow_page_mask occasionally.
+
+In the long term, we may want to switch ppc64 64k page size config to
+enable CONFIG_ARCH_WANT_GENERAL_HUGETLB
+
+	Reported-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 891121e6c02c6242487aa4ea1d5c75b7ecdc45ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_mmu.c
+#	arch/powerpc/kvm/e500_mmu_host.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 62e2a8de7eff,0bce4fffcb2e..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@@ -228,69 -214,50 +228,101 @@@ long kvmppc_do_h_enter(struct kvm *kvm
+  	slot_fn = gfn - memslot->base_gfn;
+  	rmap = &memslot->arch.rmap[slot_fn];
+  
+++<<<<<<< HEAD
+ +	if (!kvm->arch.using_mmu_notifiers) {
+ +		physp = memslot->arch.slot_phys;
+ +		if (!physp)
+++=======
++ 	/* Translate to host virtual address */
++ 	hva = __gfn_to_hva_memslot(memslot, gfn);
++ 	/*
++ 	 * If we had a page table table change after lookup, we would
++ 	 * retry via mmu_notifier_retry.
++ 	 */
++ 	if (realmode)
++ 		ptep = __find_linux_pte_or_hugepte(pgdir, hva, NULL,
++ 						   &hpage_shift);
++ 	else {
++ 		local_irq_save(irq_flags);
++ 		ptep = find_linux_pte_or_hugepte(pgdir, hva, NULL,
++ 						 &hpage_shift);
++ 	}
++ 	if (ptep) {
++ 		pte_t pte;
++ 		unsigned int host_pte_size;
++ 
++ 		if (hpage_shift)
++ 			host_pte_size = 1ul << hpage_shift;
++ 		else
++ 			host_pte_size = PAGE_SIZE;
++ 		/*
++ 		 * We should always find the guest page size
++ 		 * to <= host page size, if host is using hugepage
++ 		 */
++ 		if (host_pte_size < psize) {
++ 			if (!realmode)
++ 				local_irq_restore(flags);
+++>>>>>>> 891121e6c02c (powerpc/mm: Differentiate between hugetlb and THP during page walk)
+  			return H_PARAMETER;
+ +		physp += slot_fn;
+ +		if (realmode)
+ +			physp = real_vmalloc_addr(physp);
+ +		pa = *physp;
+ +		if (!pa)
+ +			return H_TOO_HARD;
+ +		is_io = pa & (HPTE_R_I | HPTE_R_W);
+ +		pte_size = PAGE_SIZE << (pa & KVMPPC_PAGE_ORDER_MASK);
+ +		pa &= PAGE_MASK;
+ +		pa |= gpa & ~PAGE_MASK;
+ +
+ +		if (pte_size < psize)
+ +			return H_PARAMETER;
+ +	} else {
+ +		/* Translate to host virtual address */
+ +		hva = __gfn_to_hva_memslot(memslot, gfn);
+ +		/*
+ +		 * If we had a page table table change after lookup, we would
+ +		 * retry via mmu_notifier_retry.
+ +		 */
+ +		if (realmode)
+ +			ptep = __find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+ +		else {
+ +			local_irq_save(irq_flags);
+ +			ptep = find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+  		}
+ -		pte = kvmppc_read_update_linux_pte(ptep, writing);
+ -		if (pte_present(pte) && !pte_protnone(pte)) {
+ -			if (writing && !pte_write(pte))
+ -				/* make the actual HPTE be read-only */
+ -				ptel = hpte_make_readonly(ptel);
+ -			is_io = hpte_cache_bits(pte_val(pte));
+ -			pa = pte_pfn(pte) << PAGE_SHIFT;
+ -			pa |= hva & (host_pte_size - 1);
+ -			pa |= gpa & ~PAGE_MASK;
+ +		if (ptep) {
+ +			pte_t pte;
+ +			unsigned int host_pte_size;
+ +
+ +			if (hpage_shift)
+ +				host_pte_size = 1ul << hpage_shift;
+ +			else
+ +				host_pte_size = PAGE_SIZE;
+ +			/*
+ +			 * We should always find the guest page size
+ +			 * to <= host page size, if host is using hugepage
+ +			 */
+ +
+ +			if (host_pte_size < psize) {
+ +				if (!realmode)
+ +					local_irq_restore(flags);
+ +				return H_PARAMETER;
+ +			}
+ +
+ +			pte = kvmppc_read_update_linux_pte(ptep, writing);
+ +			if (pte_present(pte) && !pte_numa(pte)) {
+ +				if (writing && !pte_write(pte))
+ +					/* make the actual HPTE be read-only */
+ +					ptel = hpte_make_readonly(ptel);
+ +				is_io = hpte_cache_bits(pte_val(pte));
+ +				pa = pte_pfn(pte) << PAGE_SHIFT;
+ +				pa |= hva & (host_pte_size - 1);
+ +				pa |= gpa & ~PAGE_MASK;
+ +			}
+  		}
+ +		if (!realmode)
+ +			local_irq_restore(irq_flags);
+  	}
+ -	if (!realmode)
+ -		local_irq_restore(irq_flags);
+  
+  	ptel &= ~(HPTE_R_PP0 - psize);
+  	ptel |= pa;
+diff --cc arch/powerpc/kvm/e500_mmu_host.c
+index 82aafd61162a,805fee9beefa..000000000000
+--- a/arch/powerpc/kvm/e500_mmu_host.c
++++ b/arch/powerpc/kvm/e500_mmu_host.c
+@@@ -449,7 -461,38 +449,42 @@@ static inline int kvmppc_e500_shadow_ma
+  		gvaddr &= ~((tsize_pages << PAGE_SHIFT) - 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	kvmppc_e500_ref_setup(ref, gtlbe, pfn);
+++=======
++ 	spin_lock(&kvm->mmu_lock);
++ 	if (mmu_notifier_retry(kvm, mmu_seq)) {
++ 		ret = -EAGAIN;
++ 		goto out;
++ 	}
++ 
++ 
++ 	pgdir = vcpu_e500->vcpu.arch.pgdir;
++ 	/*
++ 	 * We are just looking at the wimg bits, so we don't
++ 	 * care much about the trans splitting bit.
++ 	 * We are holding kvm->mmu_lock so a notifier invalidate
++ 	 * can't run hence pfn won't change.
++ 	 */
++ 	local_irq_save(flags);
++ 	ptep = find_linux_pte_or_hugepte(pgdir, hva, NULL, NULL);
++ 	if (ptep) {
++ 		pte_t pte = READ_ONCE(*ptep);
++ 
++ 		if (pte_present(pte)) {
++ 			wimg = (pte_val(pte) >> PTE_WIMGE_SHIFT) &
++ 				MAS2_WIMGE_MASK;
++ 			local_irq_restore(flags);
++ 		} else {
++ 			local_irq_restore(flags);
++ 			pr_err_ratelimited("%s: pte not present: gfn %lx,pfn %lx\n",
++ 					   __func__, (long)gfn, pfn);
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 	}
++ 	kvmppc_e500_ref_setup(ref, gtlbe, pfn, wimg);
+++>>>>>>> 891121e6c02c (powerpc/mm: Differentiate between hugetlb and THP during page walk)
+  
+  	kvmppc_e500_setup_stlbe(&vcpu_e500->vcpu, gtlbe, tsize,
+  				ref, gvaddr, stlbe);
+diff --git a/arch/powerpc/include/asm/mmu-hash64.h b/arch/powerpc/include/asm/mmu-hash64.h
+index 3347320d7dab..e49744c8a58d 100644
+--- a/arch/powerpc/include/asm/mmu-hash64.h
++++ b/arch/powerpc/include/asm/mmu-hash64.h
+@@ -14,6 +14,7 @@
+ 
+ #include <asm/asm-compat.h>
+ #include <asm/page.h>
++#include <asm/bug.h>
+ 
+ /*
+  * This is necessary to get the definition of PGTABLE_RANGE which we
+diff --git a/arch/powerpc/include/asm/pgtable-ppc64.h b/arch/powerpc/include/asm/pgtable-ppc64.h
+index e09d729f8ab2..6b6573bf02b8 100644
+--- a/arch/powerpc/include/asm/pgtable-ppc64.h
++++ b/arch/powerpc/include/asm/pgtable-ppc64.h
+@@ -426,9 +426,9 @@ static inline char *get_hpte_slot_array(pmd_t *pmdp)
+ 
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ extern void hpte_do_hugepage_flush(struct mm_struct *mm, unsigned long addr,
+ 				   pmd_t *pmdp, unsigned long old_pmd);
+-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ extern pmd_t pfn_pmd(unsigned long pfn, pgprot_t pgprot);
+ extern pmd_t mk_pmd(struct page *page, pgprot_t pgprot);
+ extern pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot);
+@@ -463,6 +463,14 @@ static inline int pmd_trans_splitting(pmd_t pmd)
+ }
+ 
+ extern int has_transparent_hugepage(void);
++#else
++static inline void hpte_do_hugepage_flush(struct mm_struct *mm,
++					  unsigned long addr, pmd_t *pmdp,
++					  unsigned long old_pmd)
++{
++
++	WARN(1, "%s called with THP disabled\n", __func__);
++}
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ static inline pte_t pmd_pte(pmd_t pmd)
+diff --git a/arch/powerpc/include/asm/pgtable.h b/arch/powerpc/include/asm/pgtable.h
+index c48167a0d0c2..74b49b6dfa71 100644
+--- a/arch/powerpc/include/asm/pgtable.h
++++ b/arch/powerpc/include/asm/pgtable.h
+@@ -311,15 +311,15 @@ extern int gup_hugepte(pte_t *ptep, unsigned long sz, unsigned long addr,
+ #define has_transparent_hugepage() 0
+ #endif
+ pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+-				 unsigned *shift);
++				   bool *is_thp, unsigned *shift);
+ static inline pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+-					       unsigned *shift)
++					       bool *is_thp, unsigned *shift)
+ {
+ 	if (!arch_irqs_disabled()) {
+ 		pr_info("%s called with irq enabled\n", __func__);
+ 		dump_stack();
+ 	}
+-	return __find_linux_pte_or_hugepte(pgdir, ea, shift);
++	return __find_linux_pte_or_hugepte(pgdir, ea, is_thp, shift);
+ }
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index ee2fda904115..8ead3df5a80f 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -352,7 +352,8 @@ static inline unsigned long eeh_token_to_phys(unsigned long token)
+ 	 * worried about _PAGE_SPLITTING/collapse. Also we will not hit
+ 	 * page table free, because of init_mm.
+ 	 */
+-	ptep = __find_linux_pte_or_hugepte(init_mm.pgd, token, &hugepage_shift);
++	ptep = __find_linux_pte_or_hugepte(init_mm.pgd, token,
++					   NULL, &hugepage_shift);
+ 	if (!ptep)
+ 		return token;
+ 	WARN_ON(hugepage_shift);
+diff --git a/arch/powerpc/kernel/io-workarounds.c b/arch/powerpc/kernel/io-workarounds.c
+index 63d9cc4d7366..5f8613ceb97f 100644
+--- a/arch/powerpc/kernel/io-workarounds.c
++++ b/arch/powerpc/kernel/io-workarounds.c
+@@ -76,7 +76,7 @@ struct iowa_bus *iowa_mem_find_bus(const PCI_IO_ADDR addr)
+ 		 * a page table free due to init_mm
+ 		 */
+ 		ptep = __find_linux_pte_or_hugepte(init_mm.pgd, vaddr,
+-						 &hugepage_shift);
++						   NULL, &hugepage_shift);
+ 		if (ptep == NULL)
+ 			paddr = 0;
+ 		else {
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 96e678cc52f8..1b7575ff505c 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -689,7 +689,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 			 */
+ 			local_irq_save(flags);
+ 			ptep = find_linux_pte_or_hugepte(current->mm->pgd,
+-							 hva, NULL);
++							 hva, NULL, NULL);
+ 			if (ptep) {
+ 				pte = kvmppc_read_update_linux_pte(ptep, 1);
+ 				if (pte_write(pte))
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_mmu.c
+* Unmerged path arch/powerpc/kvm/e500_mmu_host.c
+diff --git a/arch/powerpc/mm/hash_utils_64.c b/arch/powerpc/mm/hash_utils_64.c
+index dcc6b24bbd0f..4eb0baf1f86d 100644
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@ -1005,6 +1005,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
+ 		 unsigned long access, unsigned long trap,
+ 		 unsigned long flags)
+ {
++	bool is_thp;
+ 	enum ctx_state prev_state = exception_enter();
+ 	pgd_t *pgdir;
+ 	unsigned long vsid;
+@@ -1078,7 +1079,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
+ #endif /* CONFIG_PPC_64K_PAGES */
+ 
+ 	/* Get PTE and page size from page tables */
+-	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &hugeshift);
++	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &is_thp, &hugeshift);
+ 	if (ptep == NULL || !pte_present(*ptep)) {
+ 		DBG_LOW(" no PTE !\n");
+ 		rc = 1;
+@@ -1098,7 +1099,7 @@ int hash_page_mm(struct mm_struct *mm, unsigned long ea,
+ 	}
+ 
+ 	if (hugeshift) {
+-		if (pmd_trans_huge(*(pmd_t *)ptep))
++		if (is_thp)
+ 			rc = __hash_page_thp(ea, access, vsid, (pmd_t *)ptep,
+ 					     trap, flags, ssize, psize);
+ #ifdef CONFIG_HUGETLB_PAGE
+@@ -1253,7 +1254,7 @@ void hash_preload(struct mm_struct *mm, unsigned long ea,
+ 	 * THP pages use update_mmu_cache_pmd. We don't do
+ 	 * hash preload there. Hence can ignore THP here
+ 	 */
+-	ptep = find_linux_pte_or_hugepte(pgdir, ea, &hugepage_shift);
++	ptep = find_linux_pte_or_hugepte(pgdir, ea, NULL, &hugepage_shift);
+ 	if (!ptep)
+ 		goto out_exit;
+ 
+diff --git a/arch/powerpc/mm/hugetlbpage.c b/arch/powerpc/mm/hugetlbpage.c
+index 65fa8c71b889..9909073c6bda 100644
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@ -106,7 +106,7 @@ int pgd_huge(pgd_t pgd)
+ pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr)
+ {
+ 	/* Only called for hugetlbfs pages, hence can ignore THP */
+-	return __find_linux_pte_or_hugepte(mm->pgd, addr, NULL);
++	return __find_linux_pte_or_hugepte(mm->pgd, addr, NULL, NULL);
+ }
+ 
+ static int __hugepte_alloc(struct mm_struct *mm, hugepd_t *hpdp,
+@@ -682,13 +682,14 @@ void hugetlb_free_pgd_range(struct mmu_gather *tlb,
+ struct page *
+ follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+ {
++	bool is_thp;
+ 	pte_t *ptep, pte;
+ 	unsigned shift;
+ 	unsigned long mask, flags;
+ 	struct page *page = ERR_PTR(-EINVAL);
+ 
+ 	local_irq_save(flags);
+-	ptep = find_linux_pte_or_hugepte(mm->pgd, address, &shift);
++	ptep = find_linux_pte_or_hugepte(mm->pgd, address, &is_thp, &shift);
+ 	if (!ptep)
+ 		goto no_page;
+ 	pte = READ_ONCE(*ptep);
+@@ -697,7 +698,7 @@ follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+ 	 * Transparent hugepages are handled by generic code. We can skip them
+ 	 * here.
+ 	 */
+-	if (!shift || pmd_trans_huge(__pmd(pte_val(pte))))
++	if (!shift || is_thp)
+ 		goto no_page;
+ 
+ 	if (!pte_present(pte)) {
+@@ -955,7 +956,7 @@ void flush_dcache_icache_hugepage(struct page *page)
+  */
+ 
+ pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+-				   unsigned *shift)
++				   bool *is_thp, unsigned *shift)
+ {
+ 	pgd_t pgd, *pgdp;
+ 	pud_t pud, *pudp;
+@@ -967,6 +968,9 @@ pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+ 	if (shift)
+ 		*shift = 0;
+ 
++	if (is_thp)
++		*is_thp = false;
++
+ 	pgdp = pgdir + pgd_index(ea);
+ 	pgd  = READ_ONCE(*pgdp);
+ 	/*
+@@ -1014,7 +1018,14 @@ pte_t *__find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
+ 			if (pmd_none(pmd))
+ 				return NULL;
+ 
+-			if (pmd_huge(pmd) || pmd_large(pmd)) {
++			if (pmd_trans_huge(pmd)) {
++				if (is_thp)
++					*is_thp = true;
++				ret_pte = (pte_t *) pmdp;
++				goto out;
++			}
++
++			if (pmd_huge(pmd)) {
+ 				ret_pte = (pte_t *) pmdp;
+ 				goto out;
+ 			} else if (is_hugepd(&pmd))
+diff --git a/arch/powerpc/mm/tlb_hash64.c b/arch/powerpc/mm/tlb_hash64.c
+index c522969f012d..f7b80391bee7 100644
+--- a/arch/powerpc/mm/tlb_hash64.c
++++ b/arch/powerpc/mm/tlb_hash64.c
+@@ -190,6 +190,7 @@ void tlb_flush(struct mmu_gather *tlb)
+ void __flush_hash_table_range(struct mm_struct *mm, unsigned long start,
+ 			      unsigned long end)
+ {
++	bool is_thp;
+ 	int hugepage_shift;
+ 	unsigned long flags;
+ 
+@@ -208,21 +209,21 @@ void __flush_hash_table_range(struct mm_struct *mm, unsigned long start,
+ 	local_irq_save(flags);
+ 	arch_enter_lazy_mmu_mode();
+ 	for (; start < end; start += PAGE_SIZE) {
+-		pte_t *ptep = find_linux_pte_or_hugepte(mm->pgd, start,
++		pte_t *ptep = find_linux_pte_or_hugepte(mm->pgd, start, &is_thp,
+ 							&hugepage_shift);
+ 		unsigned long pte;
+ 
+ 		if (ptep == NULL)
+ 			continue;
+ 		pte = pte_val(*ptep);
+-		if (hugepage_shift)
++		if (is_thp)
+ 			trace_hugepage_invalidate(start, pte);
+ 		if (!(pte & _PAGE_HASHPTE))
+ 			continue;
+-		if (unlikely(hugepage_shift && pmd_trans_huge(*(pmd_t *)pte)))
++		if (unlikely(is_thp))
+ 			hpte_do_hugepage_flush(mm, start, (pmd_t *)ptep, pte);
+ 		else
+-			hpte_need_flush(mm, start, ptep, pte, 0);
++			hpte_need_flush(mm, start, ptep, pte, hugepage_shift);
+ 	}
+ 	arch_leave_lazy_mmu_mode();
+ 	local_irq_restore(flags);
+diff --git a/arch/powerpc/perf/callchain.c b/arch/powerpc/perf/callchain.c
+index 342badc08365..5faaab84681f 100644
+--- a/arch/powerpc/perf/callchain.c
++++ b/arch/powerpc/perf/callchain.c
+@@ -127,7 +127,7 @@ static int read_user_stack_slow(void __user *ptr, void *buf, int nb)
+ 		return -EFAULT;
+ 
+ 	local_irq_save(flags);
+-	ptep = find_linux_pte_or_hugepte(pgdir, addr, &shift);
++	ptep = find_linux_pte_or_hugepte(pgdir, addr, NULL, &shift);
+ 	if (!ptep)
+ 		goto err_out;
+ 	if (!shift)
