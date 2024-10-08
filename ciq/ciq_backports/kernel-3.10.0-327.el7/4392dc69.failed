@@ -1,0 +1,517 @@
+sfc: add ndo_set_vf_link_state() function for EF10
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit 4392dc6900618c1d5137a3cd43805d746a2c563a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4392dc69.failed
+
+Exercised with
+"ip link set <PF intf> vf <vf_i> state {auto|enable|disable}"
+Sets the reporting policy for VF link state to either
+ - mirror physical link state
+ - always up
+ - always down
+
+get VF link state mode in efx_ef10_sriov_get_vf_config
+
+Exercised by
+"ip link show <PF intf>";
+output will include a line like
+vf 0 MAC 12:34:56:78:9a:bc, link-state auto
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4392dc6900618c1d5137a3cd43805d746a2c563a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+#	drivers/net/ethernet/sfc/ef10_sriov.c
+#	drivers/net/ethernet/sfc/ef10_sriov.h
+#	drivers/net/ethernet/sfc/net_driver.h
+#	drivers/net/ethernet/sfc/sriov.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index 6249861a8939,e624ddd87d16..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -3728,6 -4135,12 +3728,15 @@@ const struct efx_nic_type efx_hunt_a0_n
+  	.sriov_set_vf_vlan = efx_ef10_sriov_set_vf_vlan,
+  	.sriov_set_vf_spoofchk = efx_ef10_sriov_set_vf_spoofchk,
+  	.sriov_get_vf_config = efx_ef10_sriov_get_vf_config,
+++<<<<<<< HEAD
+++=======
++ 	.sriov_set_vf_link_state = efx_ef10_sriov_set_vf_link_state,
++ 	.vswitching_probe = efx_ef10_vswitching_probe_pf,
++ 	.vswitching_restore = efx_ef10_vswitching_restore_pf,
++ 	.vswitching_remove = efx_ef10_vswitching_remove_pf,
++ #endif
++ 	.get_mac_address = efx_ef10_get_mac_address_pf,
+++>>>>>>> 4392dc690061 (sfc: add ndo_set_vf_link_state() function for EF10)
+  
+  	.revision = EFX_REV_HUNT_A0,
+  	.max_dma_mask = DMA_BIT_MASK(ESF_DZ_TX_KER_BUF_ADDR_WIDTH),
+diff --cc drivers/net/ethernet/sfc/ef10_sriov.c
+index 9e6a3e197e01,edc34f39fa3a..000000000000
+--- a/drivers/net/ethernet/sfc/ef10_sriov.c
++++ b/drivers/net/ethernet/sfc/ef10_sriov.c
+@@@ -46,7 -429,304 +46,310 @@@ int efx_ef10_sriov_configure(struct efx
+  		return efx_ef10_pci_sriov_disable(efx);
+  	else
+  		return efx_ef10_pci_sriov_enable(efx, num_vfs);
+++<<<<<<< HEAD
+ +#else
+ +	return -EOPNOTSUPP;
+ +#endif
+++=======
++ }
++ 
++ int efx_ef10_sriov_init(struct efx_nic *efx)
++ {
++ 	return 0;
++ }
++ 
++ void efx_ef10_sriov_fini(struct efx_nic *efx)
++ {
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	int rc;
++ 
++ 	if (!nic_data->vf)
++ 		return;
++ 
++ 	rc = efx_ef10_pci_sriov_disable(efx);
++ 	if (rc)
++ 		netif_dbg(efx, drv, efx->net_dev,
++ 			  "Disabling SRIOV was not successful rc=%d\n", rc);
++ 	else
++ 		netif_dbg(efx, drv, efx->net_dev, "SRIOV disabled\n");
++ }
++ 
++ static int efx_ef10_vport_del_vf_mac(struct efx_nic *efx, unsigned int port_id,
++ 				     u8 *mac)
++ {
++ 	MCDI_DECLARE_BUF(inbuf, MC_CMD_VPORT_DEL_MAC_ADDRESS_IN_LEN);
++ 	MCDI_DECLARE_BUF_ERR(outbuf);
++ 	size_t outlen;
++ 	int rc;
++ 
++ 	MCDI_SET_DWORD(inbuf, VPORT_DEL_MAC_ADDRESS_IN_VPORT_ID, port_id);
++ 	ether_addr_copy(MCDI_PTR(inbuf, VPORT_DEL_MAC_ADDRESS_IN_MACADDR), mac);
++ 
++ 	rc = efx_mcdi_rpc(efx, MC_CMD_VPORT_DEL_MAC_ADDRESS, inbuf,
++ 			  sizeof(inbuf), outbuf, sizeof(outbuf), &outlen);
++ 
++ 	return rc;
++ }
++ 
++ int efx_ef10_sriov_set_vf_mac(struct efx_nic *efx, int vf_i, u8 *mac)
++ {
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	struct ef10_vf *vf;
++ 	int rc;
++ 
++ 	if (!nic_data->vf)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (vf_i >= efx->vf_count)
++ 		return -EINVAL;
++ 	vf = nic_data->vf + vf_i;
++ 
++ 	if (vf->efx) {
++ 		efx_device_detach_sync(vf->efx);
++ 		efx_net_stop(vf->efx->net_dev);
++ 
++ 		down_write(&vf->efx->filter_sem);
++ 		vf->efx->type->filter_table_remove(vf->efx);
++ 
++ 		rc = efx_ef10_vadaptor_free(vf->efx, EVB_PORT_ID_ASSIGNED);
++ 		if (rc) {
++ 			up_write(&vf->efx->filter_sem);
++ 			return rc;
++ 		}
++ 	}
++ 
++ 	rc = efx_ef10_evb_port_assign(efx, EVB_PORT_ID_NULL, vf_i);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (!is_zero_ether_addr(vf->mac)) {
++ 		rc = efx_ef10_vport_del_vf_mac(efx, vf->vport_id, vf->mac);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	if (!is_zero_ether_addr(mac)) {
++ 		rc = efx_ef10_vport_add_mac(efx, vf->vport_id, mac);
++ 		if (rc) {
++ 			eth_zero_addr(vf->mac);
++ 			goto fail;
++ 		}
++ 		if (vf->efx)
++ 			ether_addr_copy(vf->efx->net_dev->dev_addr, mac);
++ 	}
++ 
++ 	ether_addr_copy(vf->mac, mac);
++ 
++ 	rc = efx_ef10_evb_port_assign(efx, vf->vport_id, vf_i);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	if (vf->efx) {
++ 		/* VF cannot use the vport_id that the PF created */
++ 		rc = efx_ef10_vadaptor_alloc(vf->efx, EVB_PORT_ID_ASSIGNED);
++ 		if (rc) {
++ 			up_write(&vf->efx->filter_sem);
++ 			return rc;
++ 		}
++ 		vf->efx->type->filter_table_probe(vf->efx);
++ 		up_write(&vf->efx->filter_sem);
++ 		efx_net_open(vf->efx->net_dev);
++ 		netif_device_attach(vf->efx->net_dev);
++ 	}
++ 
++ 	return 0;
++ 
++ fail:
++ 	memset(vf->mac, 0, ETH_ALEN);
++ 	return rc;
++ }
++ 
++ int efx_ef10_sriov_set_vf_vlan(struct efx_nic *efx, int vf_i, u16 vlan,
++ 			       u8 qos)
++ {
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	struct ef10_vf *vf;
++ 	u16 old_vlan, new_vlan;
++ 	int rc = 0, rc2 = 0;
++ 
++ 	if (vf_i >= efx->vf_count)
++ 		return -EINVAL;
++ 	if (qos != 0)
++ 		return -EINVAL;
++ 
++ 	vf = nic_data->vf + vf_i;
++ 
++ 	new_vlan = (vlan == 0) ? EFX_EF10_NO_VLAN : vlan;
++ 	if (new_vlan == vf->vlan)
++ 		return 0;
++ 
++ 	if (vf->efx) {
++ 		efx_device_detach_sync(vf->efx);
++ 		efx_net_stop(vf->efx->net_dev);
++ 
++ 		down_write(&vf->efx->filter_sem);
++ 		vf->efx->type->filter_table_remove(vf->efx);
++ 
++ 		rc = efx_ef10_vadaptor_free(vf->efx, EVB_PORT_ID_ASSIGNED);
++ 		if (rc)
++ 			goto restore_filters;
++ 	}
++ 
++ 	if (vf->vport_assigned) {
++ 		rc = efx_ef10_evb_port_assign(efx, EVB_PORT_ID_NULL, vf_i);
++ 		if (rc) {
++ 			netif_warn(efx, drv, efx->net_dev,
++ 				   "Failed to change vlan on VF %d.\n", vf_i);
++ 			netif_warn(efx, drv, efx->net_dev,
++ 				   "This is likely because the VF is bound to a driver in a VM.\n");
++ 			netif_warn(efx, drv, efx->net_dev,
++ 				   "Please unload the driver in the VM.\n");
++ 			goto restore_vadaptor;
++ 		}
++ 		vf->vport_assigned = 0;
++ 	}
++ 
++ 	if (!is_zero_ether_addr(vf->mac)) {
++ 		rc = efx_ef10_vport_del_mac(efx, vf->vport_id, vf->mac);
++ 		if (rc)
++ 			goto restore_evb_port;
++ 	}
++ 
++ 	if (vf->vport_id) {
++ 		rc = efx_ef10_vport_free(efx, vf->vport_id);
++ 		if (rc)
++ 			goto restore_mac;
++ 		vf->vport_id = 0;
++ 	}
++ 
++ 	/* Do the actual vlan change */
++ 	old_vlan = vf->vlan;
++ 	vf->vlan = new_vlan;
++ 
++ 	/* Restore everything in reverse order */
++ 	rc = efx_ef10_vport_alloc(efx, EVB_PORT_ID_ASSIGNED,
++ 				  MC_CMD_VPORT_ALLOC_IN_VPORT_TYPE_NORMAL,
++ 				  vf->vlan, &vf->vport_id);
++ 	if (rc)
++ 		goto reset_nic;
++ 
++ restore_mac:
++ 	if (!is_zero_ether_addr(vf->mac)) {
++ 		rc2 = efx_ef10_vport_add_mac(efx, vf->vport_id, vf->mac);
++ 		if (rc2) {
++ 			eth_zero_addr(vf->mac);
++ 			goto reset_nic;
++ 		}
++ 	}
++ 
++ restore_evb_port:
++ 	rc2 = efx_ef10_evb_port_assign(efx, vf->vport_id, vf_i);
++ 	if (rc2)
++ 		goto reset_nic;
++ 	else
++ 		vf->vport_assigned = 1;
++ 
++ restore_vadaptor:
++ 	if (vf->efx) {
++ 		rc2 = efx_ef10_vadaptor_alloc(vf->efx, EVB_PORT_ID_ASSIGNED);
++ 		if (rc2)
++ 			goto reset_nic;
++ 	}
++ 
++ restore_filters:
++ 	if (vf->efx) {
++ 		rc2 = vf->efx->type->filter_table_probe(vf->efx);
++ 		if (rc2)
++ 			goto reset_nic;
++ 
++ 		up_write(&vf->efx->filter_sem);
++ 
++ 		rc2 = efx_net_open(vf->efx->net_dev);
++ 		if (rc2)
++ 			goto reset_nic;
++ 
++ 		netif_device_attach(vf->efx->net_dev);
++ 	}
++ 	return rc;
++ 
++ reset_nic:
++ 	if (vf->efx) {
++ 		up_write(&vf->efx->filter_sem);
++ 		netif_err(efx, drv, efx->net_dev,
++ 			  "Failed to restore VF - scheduling reset.\n");
++ 		efx_schedule_reset(vf->efx, RESET_TYPE_DATAPATH);
++ 	} else {
++ 		netif_err(efx, drv, efx->net_dev,
++ 			  "Failed to restore the VF and cannot reset the VF "
++ 			  "- VF is not functional.\n");
++ 		netif_err(efx, drv, efx->net_dev,
++ 			  "Please reload the driver attached to the VF.\n");
++ 	}
++ 
++ 	return rc ? rc : rc2;
++ }
++ 
++ int efx_ef10_sriov_set_vf_link_state(struct efx_nic *efx, int vf_i,
++ 				     int link_state)
++ {
++ 	MCDI_DECLARE_BUF(inbuf, MC_CMD_LINK_STATE_MODE_IN_LEN);
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 
++ 	BUILD_BUG_ON(IFLA_VF_LINK_STATE_AUTO !=
++ 		     MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_AUTO);
++ 	BUILD_BUG_ON(IFLA_VF_LINK_STATE_ENABLE !=
++ 		     MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_UP);
++ 	BUILD_BUG_ON(IFLA_VF_LINK_STATE_DISABLE !=
++ 		     MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_DOWN);
++ 	MCDI_POPULATE_DWORD_2(inbuf, LINK_STATE_MODE_IN_FUNCTION,
++ 			      LINK_STATE_MODE_IN_FUNCTION_PF,
++ 			      nic_data->pf_index,
++ 			      LINK_STATE_MODE_IN_FUNCTION_VF, vf_i);
++ 	MCDI_SET_DWORD(inbuf, LINK_STATE_MODE_IN_NEW_MODE, link_state);
++ 	return efx_mcdi_rpc(efx, MC_CMD_LINK_STATE_MODE, inbuf, sizeof(inbuf),
++ 			    NULL, 0, NULL); /* don't care what old mode was */
++ }
++ 
++ int efx_ef10_sriov_get_vf_config(struct efx_nic *efx, int vf_i,
++ 				 struct ifla_vf_info *ivf)
++ {
++ 	MCDI_DECLARE_BUF(inbuf, MC_CMD_LINK_STATE_MODE_IN_LEN);
++ 	MCDI_DECLARE_BUF(outbuf, MC_CMD_LINK_STATE_MODE_OUT_LEN);
++ 
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 	struct ef10_vf *vf;
++ 	size_t outlen;
++ 	int rc;
++ 
++ 	if (vf_i >= efx->vf_count)
++ 		return -EINVAL;
++ 
++ 	if (!nic_data->vf)
++ 		return -EOPNOTSUPP;
++ 
++ 	vf = nic_data->vf + vf_i;
++ 
++ 	ivf->vf = vf_i;
++ 	ivf->min_tx_rate = 0;
++ 	ivf->max_tx_rate = 0;
++ 	ether_addr_copy(ivf->mac, vf->mac);
++ 	ivf->vlan = (vf->vlan == EFX_EF10_NO_VLAN) ? 0 : vf->vlan;
++ 	ivf->qos = 0;
++ 
++ 	MCDI_POPULATE_DWORD_2(inbuf, LINK_STATE_MODE_IN_FUNCTION,
++ 			      LINK_STATE_MODE_IN_FUNCTION_PF,
++ 			      nic_data->pf_index,
++ 			      LINK_STATE_MODE_IN_FUNCTION_VF, vf_i);
++ 	MCDI_SET_DWORD(inbuf, LINK_STATE_MODE_IN_NEW_MODE,
++ 		       MC_CMD_LINK_STATE_MODE_IN_DO_NOT_CHANGE);
++ 	rc = efx_mcdi_rpc(efx, MC_CMD_LINK_STATE_MODE, inbuf, sizeof(inbuf),
++ 			  outbuf, sizeof(outbuf), &outlen);
++ 	if (rc)
++ 		return rc;
++ 	if (outlen < MC_CMD_LINK_STATE_MODE_OUT_LEN)
++ 		return -EIO;
++ 	ivf->linkstate = MCDI_DWORD(outbuf, LINK_STATE_MODE_OUT_OLD_MODE);
++ 
++ 	return 0;
+++>>>>>>> 4392dc690061 (sfc: add ndo_set_vf_link_state() function for EF10)
+  }
+diff --cc drivers/net/ethernet/sfc/ef10_sriov.h
+index 6ea115e3c3f2,91393a69b89f..000000000000
+--- a/drivers/net/ethernet/sfc/ef10_sriov.h
++++ b/drivers/net/ethernet/sfc/ef10_sriov.h
+@@@ -48,11 -55,17 +48,26 @@@ static inline int efx_ef10_sriov_set_vf
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int efx_ef10_sriov_get_vf_config(struct efx_nic *efx, int vf,
+ +					       struct ifla_vf_info *ivf)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+ +#endif /* CONFIG_SFC_SRIOV */
+++=======
++ int efx_ef10_sriov_get_vf_config(struct efx_nic *efx, int vf_i,
++ 				 struct ifla_vf_info *ivf);
++ 
++ int efx_ef10_sriov_set_vf_link_state(struct efx_nic *efx, int vf_i,
++ 				     int link_state);
++ 
++ int efx_ef10_vswitching_probe_pf(struct efx_nic *efx);
++ int efx_ef10_vswitching_probe_vf(struct efx_nic *efx);
++ int efx_ef10_vswitching_restore_pf(struct efx_nic *efx);
++ int efx_ef10_vswitching_restore_vf(struct efx_nic *efx);
++ void efx_ef10_vswitching_remove_pf(struct efx_nic *efx);
++ void efx_ef10_vswitching_remove_vf(struct efx_nic *efx);
+++>>>>>>> 4392dc690061 (sfc: add ndo_set_vf_link_state() function for EF10)
+  
+  #endif /* EF10_SRIOV_H */
+diff --cc drivers/net/ethernet/sfc/net_driver.h
+index a6f4d9aadd40,c2eabd9fd515..000000000000
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@@ -1344,6 -1348,12 +1344,15 @@@ struct efx_nic_type 
+  				     bool spoofchk);
+  	int (*sriov_get_vf_config)(struct efx_nic *efx, int vf_i,
+  				   struct ifla_vf_info *ivi);
+++<<<<<<< HEAD
+++=======
++ 	int (*sriov_set_vf_link_state)(struct efx_nic *efx, int vf_i,
++ 				       int link_state);
++ 	int (*vswitching_probe)(struct efx_nic *efx);
++ 	int (*vswitching_restore)(struct efx_nic *efx);
++ 	void (*vswitching_remove)(struct efx_nic *efx);
++ 	int (*get_mac_address)(struct efx_nic *efx, unsigned char *perm_addr);
+++>>>>>>> 4392dc690061 (sfc: add ndo_set_vf_link_state() function for EF10)
+  
+  	int revision;
+  	unsigned int txd_ptr_tbl_base;
+diff --cc drivers/net/ethernet/sfc/sriov.c
+index ea0b6e763887,6c5edbdbfa27..000000000000
+--- a/drivers/net/ethernet/sfc/sriov.c
++++ b/drivers/net/ethernet/sfc/sriov.c
+@@@ -61,4 -59,14 +61,18 @@@ int efx_sriov_get_vf_config(struct net_
+  		return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+ +#endif
+++=======
++ int efx_sriov_set_vf_link_state(struct net_device *net_dev, int vf_i,
++ 				int link_state)
++ {
++ 	struct efx_nic *efx = netdev_priv(net_dev);
++ 
++ 	if (efx->type->sriov_set_vf_link_state)
++ 		return efx->type->sriov_set_vf_link_state(efx, vf_i,
++ 							  link_state);
++ 	else
++ 		return -EOPNOTSUPP;
++ }
+++>>>>>>> 4392dc690061 (sfc: add ndo_set_vf_link_state() function for EF10)
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+* Unmerged path drivers/net/ethernet/sfc/ef10_sriov.c
+* Unmerged path drivers/net/ethernet/sfc/ef10_sriov.h
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 9557690dd00f..a87f32df42c1 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -2225,6 +2225,7 @@ static const struct net_device_ops efx_netdev_ops = {
+ 	.ndo_set_vf_vlan	= efx_sriov_set_vf_vlan,
+ 	.ndo_set_vf_spoofchk	= efx_sriov_set_vf_spoofchk,
+ 	.ndo_get_vf_config	= efx_sriov_get_vf_config,
++	.ndo_set_vf_link_state  = efx_sriov_set_vf_link_state,
+ #endif
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	.ndo_poll_controller = efx_netpoll,
+diff --git a/drivers/net/ethernet/sfc/mcdi_pcol.h b/drivers/net/ethernet/sfc/mcdi_pcol.h
+index 9e380fd209d7..92108c9d8402 100644
+--- a/drivers/net/ethernet/sfc/mcdi_pcol.h
++++ b/drivers/net/ethernet/sfc/mcdi_pcol.h
+@@ -4226,6 +4226,38 @@
+ #define          MC_CMD_GET_WORKAROUNDS_OUT_BUG35017 0x8
+ 
+ 
++/***********************************/
++/* MC_CMD_LINK_STATE_MODE
++ * Read/set link state mode of a VF
++ */
++#define MC_CMD_LINK_STATE_MODE 0x5c
++
++#define MC_CMD_0x5c_PRIVILEGE_CTG SRIOV_CTG_GENERAL
++
++/* MC_CMD_LINK_STATE_MODE_IN msgrequest */
++#define    MC_CMD_LINK_STATE_MODE_IN_LEN 8
++/* The target function to have its link state mode read or set, must be a VF
++ * e.g. VF 1,3 = 0x00030001
++ */
++#define       MC_CMD_LINK_STATE_MODE_IN_FUNCTION_OFST 0
++#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_PF_LBN 0
++#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_PF_WIDTH 16
++#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_VF_LBN 16
++#define        MC_CMD_LINK_STATE_MODE_IN_FUNCTION_VF_WIDTH 16
++/* New link state mode to be set */
++#define       MC_CMD_LINK_STATE_MODE_IN_NEW_MODE_OFST 4
++#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_AUTO       0x0 /* enum */
++#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_UP         0x1 /* enum */
++#define          MC_CMD_LINK_STATE_MODE_IN_LINK_STATE_DOWN       0x2 /* enum */
++/* enum: Use this value to just read the existing setting without modifying it.
++ */
++#define          MC_CMD_LINK_STATE_MODE_IN_DO_NOT_CHANGE         0xffffffff
++
++/* MC_CMD_LINK_STATE_MODE_OUT msgresponse */
++#define    MC_CMD_LINK_STATE_MODE_OUT_LEN 4
++#define       MC_CMD_LINK_STATE_MODE_OUT_OLD_MODE_OFST 0
++
++
+ /***********************************/
+ /* MC_CMD_READ_REGS
+  * Get a dump of the MCPU registers
+* Unmerged path drivers/net/ethernet/sfc/net_driver.h
+* Unmerged path drivers/net/ethernet/sfc/sriov.c
+diff --git a/drivers/net/ethernet/sfc/sriov.h b/drivers/net/ethernet/sfc/sriov.h
+index 0b9f0f6acf3b..3be15a54c562 100644
+--- a/drivers/net/ethernet/sfc/sriov.h
++++ b/drivers/net/ethernet/sfc/sriov.h
+@@ -21,6 +21,8 @@ int efx_sriov_set_vf_spoofchk(struct net_device *net_dev, int vf_i,
+ 			      bool spoofchk);
+ int efx_sriov_get_vf_config(struct net_device *net_dev, int vf_i,
+ 			    struct ifla_vf_info *ivi);
++int efx_sriov_set_vf_link_state(struct net_device *net_dev, int vf_i,
++				int link_state);
+ 
+ #endif /* CONFIG_SFC_SRIOV */
+ 
