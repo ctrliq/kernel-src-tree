@@ -1,0 +1,128 @@
+vxlan: synchronously and race-free destruction of vxlan sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 0412bd931f5f94d1054e958415c4a945d8ee62f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0412bd93.failed
+
+Due to the fact that the udp socket is destructed asynchronously in a
+work queue, we have some nondeterministic behavior during shutdown of
+vxlan tunnels and creating new ones. Fix this by keeping the destruction
+process synchronous in regards to the user space process so IFF_UP can
+be reliably set.
+
+udp_tunnel_sock_release destroys vs->sock->sk if reference counter
+indicates so. We expect to have the same lifetime of vxlan_sock and
+vxlan_sock->sock->sk even in fast paths with only rcu locks held. So
+only destruct the whole socket after we can be sure it cannot be found
+by searching vxlan_net->sock_list.
+
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: Jiri Benc <jbenc@redhat.com>
+	Cc: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0412bd931f5f94d1054e958415c4a945d8ee62f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/vxlan.h
+diff --cc include/net/vxlan.h
+index b3828bd87f8a,d442eb3129cd..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -103,14 -184,9 +103,16 @@@ typedef void (vxlan_rcv_t)(struct vxlan
+  /* per UDP socket information */
+  struct vxlan_sock {
+  	struct hlist_node hlist;
+++<<<<<<< HEAD
+ +	vxlan_rcv_t	 *rcv;
+ +	void		 *data;
+ +	struct work_struct del_work;
+++=======
+++>>>>>>> 0412bd931f5f (vxlan: synchronously and race-free destruction of vxlan sockets)
+  	struct socket	 *sock;
+- 	struct rcu_head	  rcu;
+  	struct hlist_head vni_list[VNI_HASH_SIZE];
+  	atomic_t	  refcnt;
+ +	struct udp_offload udp_offloads;
+  	u32		  flags;
+  };
+  
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 9215c93ac7ca..9bce67b2d61e 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -138,7 +138,6 @@ struct vxlan_dev {
+ 
+ /* salt for hash table */
+ static u32 vxlan_salt __read_mostly;
+-static struct workqueue_struct *vxlan_wq;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ static inline
+@@ -1065,7 +1064,9 @@ void vxlan_sock_release(struct vxlan_sock *vs)
+ 	vxlan_notify_del_rx_port(vs);
+ 	spin_unlock(&vn->sock_lock);
+ 
+-	queue_work(vxlan_wq, &vs->del_work);
++	synchronize_net();
++	udp_tunnel_sock_release(vs->sock);
++	kfree(vs);
+ }
+ EXPORT_SYMBOL_GPL(vxlan_sock_release);
+ 
+@@ -2468,13 +2469,6 @@ static const struct ethtool_ops vxlan_ethtool_ops = {
+ 	.get_link	= ethtool_op_get_link,
+ };
+ 
+-static void vxlan_del_work(struct work_struct *work)
+-{
+-	struct vxlan_sock *vs = container_of(work, struct vxlan_sock, del_work);
+-	udp_tunnel_sock_release(vs->sock);
+-	kfree_rcu(vs, rcu);
+-}
+-
+ static struct socket *vxlan_create_sock(struct net *net, bool ipv6,
+ 					__be16 port, u32 flags)
+ {
+@@ -2521,8 +2515,6 @@ static struct vxlan_sock *vxlan_socket_create(struct net *net, __be16 port,
+ 	for (h = 0; h < VNI_HASH_SIZE; ++h)
+ 		INIT_HLIST_HEAD(&vs->vni_list[h]);
+ 
+-	INIT_WORK(&vs->del_work, vxlan_del_work);
+-
+ 	sock = vxlan_create_sock(net, ipv6, port, flags);
+ 	if (IS_ERR(sock)) {
+ 		pr_info("Cannot bind port %d, err=%ld\n", ntohs(port),
+@@ -2991,10 +2983,6 @@ static int __init vxlan_init_module(void)
+ {
+ 	int rc;
+ 
+-	vxlan_wq = alloc_workqueue("vxlan", 0, 0);
+-	if (!vxlan_wq)
+-		return -ENOMEM;
+-
+ 	get_random_bytes(&vxlan_salt, sizeof(vxlan_salt));
+ 
+ 	rc = register_pernet_subsys(&vxlan_net_ops);
+@@ -3015,7 +3003,6 @@ out3:
+ out2:
+ 	unregister_pernet_subsys(&vxlan_net_ops);
+ out1:
+-	destroy_workqueue(vxlan_wq);
+ 	return rc;
+ }
+ late_initcall(vxlan_init_module);
+@@ -3024,7 +3011,6 @@ static void __exit vxlan_cleanup_module(void)
+ {
+ 	rtnl_link_unregister(&vxlan_link_ops);
+ 	unregister_netdevice_notifier(&vxlan_notifier_block);
+-	destroy_workqueue(vxlan_wq);
+ 	unregister_pernet_subsys(&vxlan_net_ops);
+ 	/* rcu_barrier() is called by netns */
+ }
+* Unmerged path include/net/vxlan.h
