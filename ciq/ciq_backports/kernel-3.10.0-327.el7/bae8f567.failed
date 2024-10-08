@@ -1,0 +1,155 @@
+s390/spinlock,rwlock: always to a load-and-test first
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] spinlock, rwlock: always to a load-and-test first (Hendrik Brueckner) [1204860]
+Rebuild_FUZZ: 94.12%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit bae8f567344a7cb6a23ca6e13096ba785c69eb42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bae8f567.failed
+
+In case a lock is contended it is better to do a load-and-test first
+before trying to get the lock with compare-and-swap. This helps to avoid
+unnecessary cache invalidations of the cacheline for the lock if the
+CPU has to wait for the lock. For an uncontended lock doing the
+compare-and-swap directly is a bit better, if the CPU does not have the
+cacheline in its cache yet the compare-and-swap will get it read-write
+immediately while a load-and-test would get it read-only first.
+
+Always to the load-and-test first to avoid the cacheline invalidations
+for the contended case outweight the potential read-only to read-write
+cacheline upgrade for the uncontended case.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit bae8f567344a7cb6a23ca6e13096ba785c69eb42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/spinlock.h
+diff --cc arch/s390/include/asm/spinlock.h
+index b60212a02d08,96879f7ad6da..000000000000
+--- a/arch/s390/include/asm/spinlock.h
++++ b/arch/s390/include/asm/spinlock.h
+@@@ -52,9 -59,9 +52,15 @@@ static inline int arch_spin_is_locked(a
+  
+  static inline int arch_spin_trylock_once(arch_spinlock_t *lp)
+  {
+++<<<<<<< HEAD
+ +	unsigned int new = ~smp_processor_id();
+ +
+ +	return _raw_compare_and_swap(&lp->lock, 0, new);
+++=======
++ 	barrier();
++ 	return likely(arch_spin_value_unlocked(*lp) &&
++ 		      _raw_compare_and_swap(&lp->lock, 0, SPINLOCK_LOCKVAL));
+++>>>>>>> bae8f567344a (s390/spinlock,rwlock: always to a load-and-test first)
+  }
+  
+  static inline int arch_spin_tryrelease_once(arch_spinlock_t *lp)
+* Unmerged path arch/s390/include/asm/spinlock.h
+diff --git a/arch/s390/lib/spinlock.c b/arch/s390/lib/spinlock.c
+index b9b707f21df9..a4760dc61905 100644
+--- a/arch/s390/lib/spinlock.c
++++ b/arch/s390/lib/spinlock.c
+@@ -100,12 +100,9 @@ int arch_spin_trylock_retry(arch_spinlock_t *lp)
+ {
+ 	int count;
+ 
+-	for (count = spin_retry; count > 0; count--) {
+-		if (arch_spin_is_locked(lp))
+-			continue;
++	for (count = spin_retry; count > 0; count--)
+ 		if (arch_spin_trylock_once(lp))
+ 			return 1;
+-	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL(arch_spin_trylock_retry);
+@@ -120,9 +117,9 @@ void _raw_read_lock_wait(arch_rwlock_t *rw)
+ 			smp_yield();
+ 			count = spin_retry;
+ 		}
+-		if (!arch_read_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if ((int) old < 0)
+ 			continue;
+-		old = rw->lock & 0x7fffffffU;
+ 		if (_raw_compare_and_swap(&rw->lock, old, old + 1))
+ 			return;
+ 	}
+@@ -140,9 +137,9 @@ void _raw_read_lock_wait_flags(arch_rwlock_t *rw, unsigned long flags)
+ 			smp_yield();
+ 			count = spin_retry;
+ 		}
+-		if (!arch_read_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if ((int) old < 0)
+ 			continue;
+-		old = rw->lock & 0x7fffffffU;
+ 		local_irq_disable();
+ 		if (_raw_compare_and_swap(&rw->lock, old, old + 1))
+ 			return;
+@@ -156,9 +153,9 @@ int _raw_read_trylock_retry(arch_rwlock_t *rw)
+ 	int count = spin_retry;
+ 
+ 	while (count-- > 0) {
+-		if (!arch_read_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if ((int) old < 0)
+ 			continue;
+-		old = rw->lock & 0x7fffffffU;
+ 		if (_raw_compare_and_swap(&rw->lock, old, old + 1))
+ 			return 1;
+ 	}
+@@ -168,6 +165,7 @@ EXPORT_SYMBOL(_raw_read_trylock_retry);
+ 
+ void _raw_write_lock_wait(arch_rwlock_t *rw)
+ {
++	unsigned int old;
+ 	int count = spin_retry;
+ 
+ 	while (1) {
+@@ -175,7 +173,8 @@ void _raw_write_lock_wait(arch_rwlock_t *rw)
+ 			smp_yield();
+ 			count = spin_retry;
+ 		}
+-		if (!arch_write_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if (old)
+ 			continue;
+ 		if (_raw_compare_and_swap(&rw->lock, 0, 0x80000000))
+ 			return;
+@@ -185,6 +184,7 @@ EXPORT_SYMBOL(_raw_write_lock_wait);
+ 
+ void _raw_write_lock_wait_flags(arch_rwlock_t *rw, unsigned long flags)
+ {
++	unsigned int old;
+ 	int count = spin_retry;
+ 
+ 	local_irq_restore(flags);
+@@ -193,7 +193,8 @@ void _raw_write_lock_wait_flags(arch_rwlock_t *rw, unsigned long flags)
+ 			smp_yield();
+ 			count = spin_retry;
+ 		}
+-		if (!arch_write_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if (old)
+ 			continue;
+ 		local_irq_disable();
+ 		if (_raw_compare_and_swap(&rw->lock, 0, 0x80000000))
+@@ -204,10 +205,12 @@ EXPORT_SYMBOL(_raw_write_lock_wait_flags);
+ 
+ int _raw_write_trylock_retry(arch_rwlock_t *rw)
+ {
++	unsigned int old;
+ 	int count = spin_retry;
+ 
+ 	while (count-- > 0) {
+-		if (!arch_write_can_lock(rw))
++		old = ACCESS_ONCE(rw->lock);
++		if (old)
+ 			continue;
+ 		if (_raw_compare_and_swap(&rw->lock, 0, 0x80000000))
+ 			return 1;
