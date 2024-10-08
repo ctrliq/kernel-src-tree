@@ -1,0 +1,199 @@
+nfsd: ensure that seqid morphing operations are atomic wrt to copies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 9767feb2c64b29775f1ea683130b44f95f67d169
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9767feb2.failed
+
+Bruce points out that the increment of the seqid in stateids is not
+serialized in any way, so it's possible for racing calls to bump it
+twice and end up sending the same stateid. While we don't have any
+reports of this problem it _is_ theoretically possible, and could lead
+to spurious state recovery by the client.
+
+In the current code, update_stateid is always followed by a memcpy of
+that stateid, so we can combine the two operations. For better
+atomicity, we add a spinlock to the nfs4_stid and hold that when bumping
+the seqid and copying the stateid.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 9767feb2c64b29775f1ea683130b44f95f67d169)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+diff --cc fs/nfsd/nfs4state.c
+index 3d8207e252c8,0a697158a4ca..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -4123,9 -4227,15 +4136,14 @@@ nfsd4_process_open2(struct svc_rqst *rq
+  			release_open_stateid(stp);
+  			goto out;
+  		}
+ -
+ -		stp->st_clnt_odstate = find_or_hash_clnt_odstate(fp,
+ -							open->op_odstate);
+ -		if (stp->st_clnt_odstate == open->op_odstate)
+ -			open->op_odstate = NULL;
+  	}
+++<<<<<<< HEAD
+ +	update_stateid(&stp->st_stid.sc_stateid);
+ +	memcpy(&open->op_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
+++=======
++ 	nfs4_inc_and_copy_stateid(&open->op_stateid, &stp->st_stid);
++ 	up_read(&stp->st_rwsem);
+++>>>>>>> 9767feb2c64b (nfsd: ensure that seqid morphing operations are atomic wrt to copies)
+  
+  	if (nfsd4_has_session(&resp->cstate)) {
+  		if (open->op_deleg_want & NFS4_SHARE_WANT_NO_DELEG) {
+@@@ -4771,11 -4932,13 +4789,16 @@@ nfsd4_open_confirm(struct svc_rqst *rqs
+  		goto out;
+  	oo = openowner(stp->st_stateowner);
+  	status = nfserr_bad_stateid;
+ -	if (oo->oo_flags & NFS4_OO_CONFIRMED) {
+ -		up_write(&stp->st_rwsem);
+ +	if (oo->oo_flags & NFS4_OO_CONFIRMED)
+  		goto put_stateid;
+ -	}
+  	oo->oo_flags |= NFS4_OO_CONFIRMED;
+++<<<<<<< HEAD
+ +	update_stateid(&stp->st_stid.sc_stateid);
+ +	memcpy(&oc->oc_resp_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
+++=======
++ 	nfs4_inc_and_copy_stateid(&oc->oc_resp_stateid, &stp->st_stid);
++ 	up_write(&stp->st_rwsem);
+++>>>>>>> 9767feb2c64b (nfsd: ensure that seqid morphing operations are atomic wrt to copies)
+  	dprintk("NFSD: %s: success, seqid=%d stateid=" STATEID_FMT "\n",
+  		__func__, oc->oc_seqid, STATEID_VAL(&stp->st_stid.sc_stateid));
+  
+@@@ -4847,13 -5010,11 +4870,10 @@@ nfsd4_open_downgrade(struct svc_rqst *r
+  		goto put_stateid;
+  	}
+  	nfs4_stateid_downgrade(stp, od->od_share_access);
+- 
+  	reset_union_bmap_deny(od->od_share_deny, stp);
+- 
+- 	update_stateid(&stp->st_stid.sc_stateid);
+- 	memcpy(&od->od_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
++ 	nfs4_inc_and_copy_stateid(&od->od_stateid, &stp->st_stid);
+  	status = nfs_ok;
+  put_stateid:
+ -	up_write(&stp->st_rwsem);
+  	nfs4_put_stid(&stp->st_stid);
+  out:
+  	nfsd4_bump_seqid(cstate, status);
+@@@ -4905,11 -5066,8 +4925,16 @@@ nfsd4_close(struct svc_rqst *rqstp, str
+  	nfsd4_bump_seqid(cstate, status);
+  	if (status)
+  		goto out; 
+++<<<<<<< HEAD
+ +	update_stateid(&stp->st_stid.sc_stateid);
+ +	memcpy(&close->cl_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
+ +
+ +	nfsd4_return_all_file_layouts(stp->st_stateowner->so_client,
+ +				      stp->st_stid.sc_file);
+++=======
++ 	nfs4_inc_and_copy_stateid(&close->cl_stateid, &stp->st_stid);
++ 	up_write(&stp->st_rwsem);
+++>>>>>>> 9767feb2c64b (nfsd: ensure that seqid morphing operations are atomic wrt to copies)
+  
+  	nfsd4_close_open_stateid(stp);
+  
+diff --git a/fs/nfsd/nfs4layouts.c b/fs/nfsd/nfs4layouts.c
+index 544c2a99b592..f758ffefe425 100644
+--- a/fs/nfsd/nfs4layouts.c
++++ b/fs/nfsd/nfs4layouts.c
+@@ -408,8 +408,7 @@ nfsd4_insert_layout(struct nfsd4_layoutget *lgp, struct nfs4_layout_stateid *ls)
+ 	list_add_tail(&new->lo_perstate, &ls->ls_layouts);
+ 	new = NULL;
+ done:
+-	update_stateid(&ls->ls_stid.sc_stateid);
+-	memcpy(&lgp->lg_sid, &ls->ls_stid.sc_stateid, sizeof(stateid_t));
++	nfs4_inc_and_copy_stateid(&lgp->lg_sid, &ls->ls_stid);
+ 	spin_unlock(&ls->ls_lock);
+ out:
+ 	spin_unlock(&fp->fi_lock);
+@@ -483,11 +482,8 @@ nfsd4_return_file_layouts(struct svc_rqst *rqstp,
+ 		}
+ 	}
+ 	if (!list_empty(&ls->ls_layouts)) {
+-		if (found) {
+-			update_stateid(&ls->ls_stid.sc_stateid);
+-			memcpy(&lrp->lr_sid, &ls->ls_stid.sc_stateid,
+-				sizeof(stateid_t));
+-		}
++		if (found)
++			nfs4_inc_and_copy_stateid(&lrp->lr_sid, &ls->ls_stid);
+ 		lrp->lrs_present = 1;
+ 	} else {
+ 		trace_layoutstate_unhash(&ls->ls_stid.sc_stateid);
+@@ -618,8 +614,7 @@ nfsd4_cb_layout_prepare(struct nfsd4_callback *cb)
+ 		container_of(cb, struct nfs4_layout_stateid, ls_recall);
+ 
+ 	mutex_lock(&ls->ls_mutex);
+-	update_stateid(&ls->ls_stid.sc_stateid);
+-	memcpy(&ls->ls_recall_sid, &ls->ls_stid.sc_stateid, sizeof(stateid_t));
++	nfs4_inc_and_copy_stateid(&ls->ls_recall_sid, &ls->ls_stid);
+ }
+ 
+ static int
+* Unmerged path fs/nfsd/nfs4state.c
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index b0d2cd4f5b14..35c67bcee8bd 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -84,7 +84,7 @@ struct nfsd4_callback_ops {
+  * fields that are of general use to any stateid.
+  */
+ struct nfs4_stid {
+-	atomic_t sc_count;
++	atomic_t		sc_count;
+ #define NFS4_OPEN_STID 1
+ #define NFS4_LOCK_STID 2
+ #define NFS4_DELEG_STID 4
+@@ -94,11 +94,12 @@ struct nfs4_stid {
+ #define NFS4_REVOKED_DELEG_STID 16
+ #define NFS4_CLOSED_DELEG_STID 32
+ #define NFS4_LAYOUT_STID 64
+-	unsigned char sc_type;
+-	stateid_t sc_stateid;
+-	struct nfs4_client *sc_client;
+-	struct nfs4_file *sc_file;
+-	void (*sc_free)(struct nfs4_stid *);
++	unsigned char		sc_type;
++	stateid_t		sc_stateid;
++	spinlock_t		sc_lock;
++	struct nfs4_client	*sc_client;
++	struct nfs4_file	*sc_file;
++	void			(*sc_free)(struct nfs4_stid *);
+ };
+ 
+ /*
+@@ -360,15 +361,6 @@ struct nfs4_client_reclaim {
+ 	char			cr_recdir[HEXDIR_LEN]; /* recover dir */
+ };
+ 
+-static inline void
+-update_stateid(stateid_t *stateid)
+-{
+-	stateid->si_generation++;
+-	/* Wraparound recommendation from 3530bis-13 9.1.3.2: */
+-	if (stateid->si_generation == 0)
+-		stateid->si_generation = 1;
+-}
+-
+ /* A reasonable value for REPLAY_ISIZE was estimated as follows:  
+  * The OPEN response, typically the largest, requires 
+  *   4(status) + 8(stateid) + 20(changeinfo) + 4(rflags) +  8(verifier) + 
+@@ -574,6 +566,7 @@ struct nfs4_stid *nfs4_alloc_stid(struct nfs4_client *cl,
+ 		struct kmem_cache *slab);
+ void nfs4_unhash_stid(struct nfs4_stid *s);
+ void nfs4_put_stid(struct nfs4_stid *s);
++void nfs4_inc_and_copy_stateid(stateid_t *dst, struct nfs4_stid *stid);
+ void nfs4_remove_reclaim_record(struct nfs4_client_reclaim *, struct nfsd_net *);
+ extern void nfs4_release_reclaim(struct nfsd_net *);
+ extern struct nfs4_client_reclaim *nfsd4_find_reclaim_client(const char *recdir,
