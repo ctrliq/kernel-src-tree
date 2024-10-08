@@ -1,0 +1,143 @@
+NFS: Be more aggressive in using readdirplus for 'ls -l' situations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 311324ad1713666a6e803aecf0d4e1a136a5b34a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/311324ad.failed
+
+Try to detect 'ls -l' by having nfs_getattr() look at whether or not
+there is an opendir() file descriptor for the parent directory.
+If so, then assume that we want to force use of readdirplus in order
+to avoid the multiple GETATTR calls over the wire.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 311324ad1713666a6e803aecf0d4e1a136a5b34a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+#	fs/nfs/internal.h
+diff --cc fs/nfs/dir.c
+index 7e40a5f8eeae,c8e48c26418b..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -842,14 -874,15 +876,19 @@@ static int nfs_readdir(struct file *fil
+  	 */
+  	memset(desc, 0, sizeof(*desc));
+  
+ -	desc->file = file;
+ -	desc->ctx = ctx;
+ +	desc->file = filp;
+  	desc->dir_cookie = &dir_ctx->dir_cookie;
+  	desc->decode = NFS_PROTO(inode)->decode_dirent;
+ -	desc->plus = nfs_use_readdirplus(inode, ctx) ? 1 : 0;
+ +	desc->plus = nfs_use_readdirplus(inode, filp) ? 1 : 0;
+  
+  	nfs_block_sillyrename(dentry);
+++<<<<<<< HEAD
+ +	if (filp->f_pos == 0 || nfs_attribute_cache_expired(inode))
+ +		res = nfs_revalidate_mapping(inode, filp->f_mapping);
+++=======
++ 	if (ctx->pos == 0 || nfs_dir_mapping_need_revalidate(inode))
++ 		res = nfs_revalidate_mapping(inode, file->f_mapping);
+++>>>>>>> 311324ad1713 (NFS: Be more aggressive in using readdirplus for 'ls -l' situations)
+  	if (res < 0)
+  		goto out;
+  
+diff --cc fs/nfs/internal.h
+index e6a70b68cbd7,7f7c476d0c2c..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -301,8 -300,11 +301,16 @@@ extern struct nfs_client *nfs_init_clie
+  			   const char *ip_addr);
+  
+  /* dir.c */
+++<<<<<<< HEAD
+ +extern int nfs_access_cache_shrinker(struct shrinker *shrink,
+ +					struct shrink_control *sc);
+++=======
++ extern void nfs_force_use_readdirplus(struct inode *dir);
++ extern unsigned long nfs_access_cache_count(struct shrinker *shrink,
++ 					    struct shrink_control *sc);
++ extern unsigned long nfs_access_cache_scan(struct shrinker *shrink,
++ 					   struct shrink_control *sc);
+++>>>>>>> 311324ad1713 (NFS: Be more aggressive in using readdirplus for 'ls -l' situations)
+  struct dentry *nfs_lookup(struct inode *, struct dentry *, unsigned int);
+  int nfs_create(struct inode *, struct dentry *, umode_t, bool);
+  int nfs_mkdir(struct inode *, struct dentry *, umode_t);
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 8496d3401226..a0eddba51a1c 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -603,6 +603,25 @@ void nfs_setattr_update_inode(struct inode *inode, struct iattr *attr)
+ }
+ EXPORT_SYMBOL_GPL(nfs_setattr_update_inode);
+ 
++static void nfs_request_parent_use_readdirplus(struct dentry *dentry)
++{
++	struct dentry *parent;
++
++	parent = dget_parent(dentry);
++	nfs_force_use_readdirplus(parent->d_inode);
++	dput(parent);
++}
++
++static bool nfs_need_revalidate_inode(struct inode *inode)
++{
++	if (NFS_I(inode)->cache_validity &
++			(NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
++		return true;
++	if (nfs_attribute_cache_expired(inode))
++		return true;
++	return false;
++}
++
+ int nfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
+ {
+ 	struct inode *inode = dentry->d_inode;
+@@ -631,10 +650,13 @@ int nfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
+  	    ((mnt->mnt_flags & MNT_NODIRATIME) && S_ISDIR(inode->i_mode)))
+ 		need_atime = 0;
+ 
+-	if (need_atime)
+-		err = __nfs_revalidate_inode(NFS_SERVER(inode), inode);
+-	else
+-		err = nfs_revalidate_inode(NFS_SERVER(inode), inode);
++	if (need_atime || nfs_need_revalidate_inode(inode)) {
++		struct nfs_server *server = NFS_SERVER(inode);
++
++		if (server->caps & NFS_CAP_READDIRPLUS)
++			nfs_request_parent_use_readdirplus(dentry);
++		err = __nfs_revalidate_inode(server, inode);
++	}
+ 	if (!err) {
+ 		generic_fillattr(inode, stat);
+ 		stat->ino = nfs_compat_user_ino64(NFS_FILEID(inode));
+@@ -976,9 +998,7 @@ int nfs_attribute_cache_expired(struct inode *inode)
+  */
+ int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ {
+-	if (!(NFS_I(inode)->cache_validity &
+-			(NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
+-			&& !nfs_attribute_cache_expired(inode))
++	if (!nfs_need_revalidate_inode(inode))
+ 		return NFS_STALE(inode) ? -ESTALE : 0;
+ 	return __nfs_revalidate_inode(server, inode);
+ }
+* Unmerged path fs/nfs/internal.h
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index e8e81176df65..2049f4dbdd2d 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -92,6 +92,7 @@ struct nfs_open_context {
+ };
+ 
+ struct nfs_open_dir_context {
++	struct list_head list;
+ 	struct rpc_cred *cred;
+ 	unsigned long attr_gencount;
+ 	__u64 dir_cookie;
