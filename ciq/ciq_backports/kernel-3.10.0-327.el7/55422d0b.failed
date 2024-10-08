@@ -1,0 +1,353 @@
+audit: replace getname()/putname() hacks with reference counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Paul Moore <pmoore@redhat.com>
+commit 55422d0bd292f5ad143cc32cb8bb8505257274c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/55422d0b.failed
+
+In order to ensure that filenames are not released before the audit
+subsystem is done with the strings there are a number of hacks built
+into the fs and audit subsystems around getname() and putname().  To
+say these hacks are "ugly" would be kind.
+
+This patch removes the filename hackery in favor of a more
+conventional reference count based approach.  The diffstat below tells
+most of the story; lots of audit/fs specific code is replaced with a
+traditional reference count based approach that is easily understood,
+even by those not familiar with the audit and/or fs subsystems.
+
+CC: viro@zeniv.linux.org.uk
+CC: linux-fsdevel@vger.kernel.org
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 55422d0bd292f5ad143cc32cb8bb8505257274c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+#	include/linux/fs.h
+#	kernel/audit.h
+#	kernel/auditsc.c
+diff --cc fs/namei.c
+index 72c9894b9e82,96ca11dea4a2..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -210,14 -205,56 +203,60 @@@ getname(const char __user * filename
+  	return getname_flags(filename, 0, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_AUDITSYSCALL
+++=======
++ struct filename *
++ getname_kernel(const char * filename)
++ {
++ 	struct filename *result;
++ 	int len = strlen(filename) + 1;
++ 
++ 	result = __getname();
++ 	if (unlikely(!result))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (len <= EMBEDDED_NAME_MAX) {
++ 		result->name = (char *)(result) + sizeof(*result);
++ 		result->separate = false;
++ 	} else if (len <= PATH_MAX) {
++ 		struct filename *tmp;
++ 
++ 		tmp = kmalloc(sizeof(*tmp), GFP_KERNEL);
++ 		if (unlikely(!tmp)) {
++ 			__putname(result);
++ 			return ERR_PTR(-ENOMEM);
++ 		}
++ 		tmp->name = (char *)result;
++ 		tmp->separate = true;
++ 		result = tmp;
++ 	} else {
++ 		__putname(result);
++ 		return ERR_PTR(-ENAMETOOLONG);
++ 	}
++ 	memcpy((char *)result->name, filename, len);
++ 	result->uptr = NULL;
++ 	result->aname = NULL;
++ 	result->refcnt = 1;
++ 	audit_getname(result);
++ 
++ 	return result;
++ }
++ 
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  void putname(struct filename *name)
+  {
+- 	if (unlikely(!audit_dummy_context()))
+- 		return audit_putname(name);
+- 	final_putname(name);
++ 	BUG_ON(name->refcnt <= 0);
++ 
++ 	if (--name->refcnt > 0)
++ 		return;
++ 
++ 	if (name->separate) {
++ 		__putname(name->name);
++ 		kfree(name);
++ 	} else
++ 		__putname(name);
+  }
+- #endif
+  
+  static int check_acl(struct inode *inode, int mask)
+  {
+diff --cc include/linux/fs.h
+index 664b4d164818,b49842fe203f..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2186,7 -2099,10 +2187,12 @@@ extern int vfs_open(const struct path *
+  extern struct file * dentry_open(const struct path *, int, const struct cred *);
+  extern int filp_close(struct file *, fl_owner_t id);
+  
+ -extern struct filename *getname_flags(const char __user *, int, int *);
+  extern struct filename *getname(const char __user *);
+++<<<<<<< HEAD
+++=======
++ extern struct filename *getname_kernel(const char *);
++ extern void putname(struct filename *name);
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  
+  enum {
+  	FILE_CREATED = 1,
+diff --cc kernel/audit.h
+index ab586ca12b4a,1caa0d345d90..000000000000
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@@ -85,7 -78,7 +78,11 @@@ struct audit_names 
+  
+  	struct filename		*name;
+  	int			name_len;	/* number of chars to log */
+++<<<<<<< HEAD
+ +	bool			name_put;	/* call __putname()? */
+++=======
++ 	bool			hidden;		/* don't log this record */
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  
+  	unsigned long		ino;
+  	dev_t			dev;
+@@@ -202,14 -199,10 +199,18 @@@ struct audit_context 
+  		} execve;
+  	};
+  	int fds[2];
+++<<<<<<< HEAD
+ +
+ +#if AUDIT_DEBUG
+ +	int		    put_count;
+ +	int		    ino_count;
+ +#endif
+++=======
++ 	struct audit_proctitle proctitle;
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  };
+  
+ -extern u32 audit_ever_enabled;
+ +extern int audit_ever_enabled;
+  
+  extern void audit_copy_inode(struct audit_names *name,
+  			     const struct dentry *dentry,
+diff --cc kernel/auditsc.c
+index 01f5de1b9bd4,0c38604a630c..000000000000
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@@ -858,34 -866,10 +858,37 @@@ static inline void audit_free_names(str
+  {
+  	struct audit_names *n, *next;
+  
+++<<<<<<< HEAD
+ +#if AUDIT_DEBUG == 2
+ +	if (context->put_count + context->ino_count != context->name_count) {
+ +		int i = 0;
+ +
+ +		printk(KERN_ERR "%s:%d(:%d): major=%d in_syscall=%d"
+ +		       " name_count=%d put_count=%d"
+ +		       " ino_count=%d [NOT freeing]\n",
+ +		       __FILE__, __LINE__,
+ +		       context->serial, context->major, context->in_syscall,
+ +		       context->name_count, context->put_count,
+ +		       context->ino_count);
+ +		list_for_each_entry(n, &context->names_list, list) {
+ +			printk(KERN_ERR "names[%d] = %p = %s\n", i++,
+ +			       n->name, n->name->name ?: "(null)");
+ +		}
+ +		dump_stack();
+ +		return;
+ +	}
+ +#endif
+ +#if AUDIT_DEBUG
+ +	context->put_count  = 0;
+ +	context->ino_count  = 0;
+ +#endif
+ +
+++=======
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  	list_for_each_entry_safe(n, next, &context->names_list, list) {
+  		list_del(&n->list);
+- 		if (n->name && n->name_put)
+- 			final_putname(n->name);
++ 		if (n->name)
++ 			putname(n->name);
+  		if (n->should_free)
+  			kfree(n);
+  	}
+@@@ -1690,19 -1728,8 +1692,17 @@@ void __audit_getname(struct filename *n
+  	struct audit_context *context = current->audit_context;
+  	struct audit_names *n;
+  
+++<<<<<<< HEAD
+ +	if (!context->in_syscall) {
+ +#if AUDIT_DEBUG == 2
+ +		printk(KERN_ERR "%s:%d(:%d): ignoring getname(%p)\n",
+ +		       __FILE__, __LINE__, context->serial, name);
+ +		dump_stack();
+ +#endif
+++=======
++ 	if (!context->in_syscall)
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  		return;
+- 	}
+- 
+- #if AUDIT_DEBUG
+- 	/* The filename _must_ have a populated ->name */
+- 	BUG_ON(!name->name);
+- #endif
+  
+  	n = audit_alloc_name(context, AUDIT_TYPE_UNKNOWN);
+  	if (!n)
+@@@ -1717,50 -1744,6 +1717,53 @@@
+  		get_fs_pwd(current->fs, &context->pwd);
+  }
+  
+++<<<<<<< HEAD
+ +/* audit_putname - intercept a putname request
+ + * @name: name to intercept and delay for putname
+ + *
+ + * If we have stored the name from getname in the audit context,
+ + * then we delay the putname until syscall exit.
+ + * Called from include/linux/fs.h:putname().
+ + */
+ +void audit_putname(struct filename *name)
+ +{
+ +	struct audit_context *context = current->audit_context;
+ +
+ +	BUG_ON(!context);
+ +	if (!context->in_syscall) {
+ +#if AUDIT_DEBUG == 2
+ +		printk(KERN_ERR "%s:%d(:%d): final_putname(%p)\n",
+ +		       __FILE__, __LINE__, context->serial, name);
+ +		if (context->name_count) {
+ +			struct audit_names *n;
+ +			int i = 0;
+ +
+ +			list_for_each_entry(n, &context->names_list, list)
+ +				printk(KERN_ERR "name[%d] = %p = %s\n", i++,
+ +				       n->name, n->name->name ?: "(null)");
+ +			}
+ +#endif
+ +		final_putname(name);
+ +	}
+ +#if AUDIT_DEBUG
+ +	else {
+ +		++context->put_count;
+ +		if (context->put_count > context->name_count) {
+ +			printk(KERN_ERR "%s:%d(:%d): major=%d"
+ +			       " in_syscall=%d putname(%p) name_count=%d"
+ +			       " put_count=%d\n",
+ +			       __FILE__, __LINE__,
+ +			       context->serial, context->major,
+ +			       context->in_syscall, name->name,
+ +			       context->name_count, context->put_count);
+ +			dump_stack();
+ +		}
+ +	}
+ +#endif
+ +}
+ +
+++=======
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  /**
+   * __audit_inode - store the inode and device from a lookup
+   * @name: name being audited
+@@@ -1781,10 -1764,6 +1784,13 @@@ void __audit_inode(struct filename *nam
+  	if (!name)
+  		goto out_alloc;
+  
+++<<<<<<< HEAD
+ +#if AUDIT_DEBUG
+ +	/* The struct filename _must_ have a populated ->name */
+ +	BUG_ON(!name->name);
+ +#endif
+++=======
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  	/*
+  	 * If we have a pointer to an audit_names entry already, then we can
+  	 * just use it directly if the type is correct.
+@@@ -1818,12 -1806,15 +1824,20 @@@
+  	}
+  
+  out_alloc:
+ -	/* unable to find an entry with both a matching name and type */
+ -	n = audit_alloc_name(context, AUDIT_TYPE_UNKNOWN);
+ +	/* unable to find the name from a previous getname(). Allocate a new
+ +	 * anonymous entry.
+ +	 */
+ +	n = audit_alloc_name(context, AUDIT_TYPE_NORMAL);
+  	if (!n)
+  		return;
+++<<<<<<< HEAD
+++=======
++ 	if (name) {
++ 		n->name = name;
++ 		name->refcnt++;
++ 	}
++ 
+++>>>>>>> 55422d0bd292 (audit: replace getname()/putname() hacks with reference counters)
+  out:
+  	if (parent) {
+  		n->name_len = n->name ? parent_len(n->name->name) : AUDIT_NAME_FULL;
+@@@ -1918,10 -1918,10 +1932,9 @@@ void __audit_inode_child(const struct i
+  		if (found_parent) {
+  			found_child->name = found_parent->name;
+  			found_child->name_len = AUDIT_NAME_FULL;
+- 			/* don't call __putname() */
+- 			found_child->name_put = false;
++ 			found_child->name->refcnt++;
+  		}
+  	}
+ -
+  	if (inode)
+  		audit_copy_inode(found_child, dentry, inode);
+  	else
+* Unmerged path fs/namei.c
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index eba2de895218..61f797b4f7bd 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -109,7 +109,6 @@ extern void __audit_syscall_entry(int major, unsigned long a0, unsigned long a1,
+ extern void __audit_syscall_exit(int ret_success, long ret_value);
+ extern struct filename *__audit_reusename(const __user char *uptr);
+ extern void __audit_getname(struct filename *name);
+-extern void audit_putname(struct filename *name);
+ 
+ #define AUDIT_INODE_PARENT	1	/* dentry represents the parent */
+ #define AUDIT_INODE_HIDDEN	2	/* audit record should be hidden */
+@@ -328,8 +327,6 @@ static inline struct filename *audit_reusename(const __user char *name)
+ }
+ static inline void audit_getname(struct filename *name)
+ { }
+-static inline void audit_putname(struct filename *name)
+-{ }
+ static inline void __audit_inode(struct filename *name,
+ 					const struct dentry *dentry,
+ 					unsigned int flags)
+* Unmerged path include/linux/fs.h
+* Unmerged path kernel/audit.h
+* Unmerged path kernel/auditsc.c
