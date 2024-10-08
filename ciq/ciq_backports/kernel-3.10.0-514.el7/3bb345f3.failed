@@ -1,0 +1,210 @@
+KVM: x86: store IOAPIC-handled vectors in each VCPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 3bb345f387dd26beb097cf776e342bc0d96d805a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3bb345f3.failed
+
+We can reuse the algorithm that computes the EOI exit bitmap to figure
+out which vectors are handled by the IOAPIC.  The only difference
+between the two is for edge-triggered interrupts other than IRQ8
+that have no notifiers active; however, the IOAPIC does not have to
+do anything special for these interrupts anyway.
+
+This again limits the interactions between the IOAPIC and the LAPIC,
+making it easier to move the former to userspace.
+
+Inspired by a patch from Steve Rutherford.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3bb345f387dd26beb097cf776e342bc0d96d805a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/ioapic.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/ioapic.c
+index a42475afc7c9,2dcda0f188ba..000000000000
+--- a/arch/x86/kvm/ioapic.c
++++ b/arch/x86/kvm/ioapic.c
+@@@ -233,21 -233,7 +233,25 @@@ static void kvm_ioapic_inject_all(struc
+  }
+  
+  
+++<<<<<<< HEAD
+ +static void update_handled_vectors(struct kvm_ioapic *ioapic)
+ +{
+ +	DECLARE_BITMAP(handled_vectors, 256);
+ +	int i;
+ +
+ +	memset(handled_vectors, 0, sizeof(handled_vectors));
+ +	for (i = 0; i < IOAPIC_NUM_PINS; ++i)
+ +		__set_bit(ioapic->redirtbl[i].fields.vector, handled_vectors);
+ +	memcpy(ioapic->handled_vectors, handled_vectors,
+ +	       sizeof(handled_vectors));
+ +	smp_wmb();
+ +}
+ +
+ +void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap,
+ +			u32 *tmr)
+++=======
++ void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+++>>>>>>> 3bb345f387dd (KVM: x86: store IOAPIC-handled vectors in each VCPU)
+  {
+  	struct kvm_ioapic *ioapic = vcpu->kvm->arch.vioapic;
+  	union kvm_ioapic_redirect_entry *e;
+diff --cc arch/x86/kvm/x86.c
+index 733894b44f8d,c4adb8847b23..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -6624,19 -6143,19 +6624,35 @@@ static void process_smi(struct kvm_vcp
+  
+  static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	u64 eoi_exit_bitmap[4];
+ +	u32 tmr[8];
+ +
+ +	if (!kvm_apic_hw_enabled(vcpu->arch.apic))
+ +		return;
+ +
+ +	memset(eoi_exit_bitmap, 0, 32);
+ +	memset(tmr, 0, 32);
+ +
+ +	kvm_x86_ops->sync_pir_to_irr(vcpu);
+ +	kvm_ioapic_scan_entry(vcpu, eoi_exit_bitmap, tmr);
+ +	kvm_x86_ops->load_eoi_exitmap(vcpu, eoi_exit_bitmap);
+ +	kvm_apic_update_tmr(vcpu, tmr);
+++=======
++ 	if (!kvm_apic_hw_enabled(vcpu->arch.apic))
++ 		return;
++ 
++ 	memset(vcpu->arch.eoi_exit_bitmap, 0, 256 / 8);
++ 
++ 	kvm_ioapic_scan_entry(vcpu, vcpu->arch.eoi_exit_bitmap);
++ 	kvm_x86_ops->load_eoi_exitmap(vcpu);
++ }
++ 
++ static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu)
++ {
++ 	++vcpu->stat.tlb_flush;
++ 	kvm_x86_ops->tlb_flush(vcpu);
+++>>>>>>> 3bb345f387dd (KVM: x86: store IOAPIC-handled vectors in each VCPU)
+  }
+  
+  void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5d383a89c9d4..49cea045f51d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -382,6 +382,7 @@ struct kvm_vcpu_arch {
+ 	u64 efer;
+ 	u64 apic_base;
+ 	struct kvm_lapic *apic;    /* kernel irqchip context */
++	u64 eoi_exit_bitmap[4];
+ 	unsigned long apic_attention;
+ 	int32_t apic_arb_prio;
+ 	int mp_state;
+@@ -795,7 +796,7 @@ struct kvm_x86_ops {
+ 	int (*vm_has_apicv)(struct kvm *kvm);
+ 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+ 	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
+-	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
++	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu);
+ 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
+ 	void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu, hpa_t hpa);
+ 	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
+* Unmerged path arch/x86/kvm/ioapic.c
+diff --git a/arch/x86/kvm/ioapic.h b/arch/x86/kvm/ioapic.h
+index 6e265cfcd86a..a503a2029059 100644
+--- a/arch/x86/kvm/ioapic.h
++++ b/arch/x86/kvm/ioapic.h
+@@ -73,7 +73,6 @@ struct kvm_ioapic {
+ 	struct kvm *kvm;
+ 	void (*ack_notifier)(void *opaque, int irq);
+ 	spinlock_t lock;
+-	DECLARE_BITMAP(handled_vectors, 256);
+ 	struct rtc_status rtc_status;
+ 	struct delayed_work eoi_inject;
+ 	u32 irq_eoi[IOAPIC_NUM_PINS];
+@@ -98,13 +97,6 @@ static inline struct kvm_ioapic *ioapic_irqchip(struct kvm *kvm)
+ 	return kvm->arch.vioapic;
+ }
+ 
+-static inline bool kvm_ioapic_handles_vector(struct kvm *kvm, int vector)
+-{
+-	struct kvm_ioapic *ioapic = kvm->arch.vioapic;
+-	smp_rmb();
+-	return test_bit(vector, ioapic->handled_vectors);
+-}
+-
+ void kvm_rtc_eoi_tracking_restore_one(struct kvm_vcpu *vcpu);
+ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
+ 		int short_hand, unsigned int dest, int dest_mode);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1ea3691b454e..a8c683426856 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -963,14 +963,20 @@ int kvm_apic_compare_prio(struct kvm_vcpu *vcpu1, struct kvm_vcpu *vcpu2)
+ 	return vcpu1->arch.apic_arb_prio - vcpu2->arch.apic_arb_prio;
+ }
+ 
++static bool kvm_ioapic_handles_vector(struct kvm_lapic *apic, int vector)
++{
++	return test_bit(vector, (ulong *)apic->vcpu->arch.eoi_exit_bitmap);
++}
++
+ static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
+ {
+-	if (kvm_ioapic_handles_vector(apic->vcpu->kvm, vector)) {
++	if (kvm_ioapic_handles_vector(apic, vector)) {
+ 		int trigger_mode;
+ 		if (apic_test_vector(vector, apic->regs + APIC_TMR))
+ 			trigger_mode = IOAPIC_LEVEL_TRIG;
+ 		else
+ 			trigger_mode = IOAPIC_EDGE_TRIG;
++
+ 		kvm_ioapic_update_eoi(apic->vcpu, vector, trigger_mode);
+ 	}
+ }
+@@ -2019,7 +2025,7 @@ static void apic_sync_pv_eoi_to_guest(struct kvm_vcpu *vcpu,
+ 	    /* Cache not set: could be safe but we don't bother. */
+ 	    apic->highest_isr_cache == -1 ||
+ 	    /* Need EOI to update ioapic. */
+-	    kvm_ioapic_handles_vector(vcpu->kvm, apic->highest_isr_cache)) {
++	    kvm_ioapic_handles_vector(apic, apic->highest_isr_cache)) {
+ 		/*
+ 		 * PV EOI was disabled by apic_sync_pv_eoi_from_guest
+ 		 * so we need not do anything here.
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index f4d872b9eba6..e07cb8ff4c35 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3655,7 +3655,7 @@ static int svm_vm_has_apicv(struct kvm *kvm)
+ 	return 0;
+ }
+ 
+-static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
++static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+ {
+ 	return;
+ }
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 843549a0fe2a..6f49a4e3d866 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -7818,8 +7818,9 @@ static void vmx_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr)
+ 	}
+ }
+ 
+-static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
++static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+ {
++	u64 *eoi_exit_bitmap = vcpu->arch.eoi_exit_bitmap;
+ 	if (!vmx_vm_has_apicv(vcpu->kvm))
+ 		return;
+ 
+* Unmerged path arch/x86/kvm/x86.c
