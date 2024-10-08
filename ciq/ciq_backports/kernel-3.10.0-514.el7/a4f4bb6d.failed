@@ -1,0 +1,171 @@
+perf: Allow perf_release() with !event->ctx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a4f4bb6d0c69d0bb573f1d9e6f1b806f9b038b19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a4f4bb6d.failed
+
+In the err_file: fput(event_file) case, the event will not yet have
+been attached to a context. However perf_release() does assume it has
+been. Cure this.
+
+	Tested-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: dvyukov@google.com
+	Cc: eranian@google.com
+	Cc: oleg@redhat.com
+	Cc: panand@redhat.com
+	Cc: sasha.levin@oracle.com
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20160224174947.793996260@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a4f4bb6d0c69d0bb573f1d9e6f1b806f9b038b19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 0e60facd7da7,d5299e2e435d..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -3596,32 -3744,106 +3596,116 @@@ static void put_event(struct perf_even
+  	if (!atomic_long_dec_and_test(&event->refcount))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	_free_event(event);
++ }
++ 
++ /*
++  * Kill an event dead; while event:refcount will preserve the event
++  * object, it will not preserve its functionality. Once the last 'user'
++  * gives up the object, we'll destroy the thing.
++  */
++ int perf_event_release_kernel(struct perf_event *event)
++ {
++ 	struct perf_event_context *ctx = event->ctx;
++ 	struct perf_event *child, *tmp;
++ 
++ 	/*
++ 	 * If we got here through err_file: fput(event_file); we will not have
++ 	 * attached to a context yet.
++ 	 */
++ 	if (!ctx) {
++ 		WARN_ON_ONCE(event->attach_state &
++ 				(PERF_ATTACH_CONTEXT|PERF_ATTACH_GROUP));
++ 		goto no_ctx;
++ 	}
++ 
+++>>>>>>> a4f4bb6d0c69 (perf: Allow perf_release() with !event->ctx)
+  	if (!is_kernel_event(event))
+  		perf_remove_from_owner(event);
+  
+ -	ctx = perf_event_ctx_lock(event);
+ -	WARN_ON_ONCE(ctx->parent_ctx);
+ -	perf_remove_from_context(event, DETACH_GROUP | DETACH_STATE);
+ -	perf_event_ctx_unlock(event, ctx);
+ -
+  	/*
+ -	 * At this point we must have event->state == PERF_EVENT_STATE_EXIT,
+ -	 * either from the above perf_remove_from_context() or through
+ -	 * perf_event_exit_event().
+ +	 * There are two ways this annotation is useful:
+  	 *
+ -	 * Therefore, anybody acquiring event->child_mutex after the below
+ -	 * loop _must_ also see this, most importantly inherit_event() which
+ -	 * will avoid placing more children on the list.
+ +	 *  1) there is a lock recursion from perf_event_exit_task
+ +	 *     see the comment there.
+  	 *
+ -	 * Thus this guarantees that we will in fact observe and kill _ALL_
+ -	 * child events.
+ +	 *  2) there is a lock-inversion with mmap_sem through
+ +	 *     perf_read_group(), which takes faults while
+ +	 *     holding ctx->mutex, however this is called after
+ +	 *     the last filedesc died, so there is no possibility
+ +	 *     to trigger the AB-BA case.
+  	 */
+ -	WARN_ON_ONCE(event->state != PERF_EVENT_STATE_EXIT);
+ +	ctx = perf_event_ctx_lock_nested(event, SINGLE_DEPTH_NESTING);
+ +	WARN_ON_ONCE(ctx->parent_ctx);
+ +	perf_remove_from_context(event, true);
+ +	perf_event_ctx_unlock(event, ctx);
+ +
+ +	_free_event(event);
+ +}
+  
+++<<<<<<< HEAD
+ +int perf_event_release_kernel(struct perf_event *event)
+ +{
+ +	put_event(event);
+++=======
++ again:
++ 	mutex_lock(&event->child_mutex);
++ 	list_for_each_entry(child, &event->child_list, child_list) {
++ 
++ 		/*
++ 		 * Cannot change, child events are not migrated, see the
++ 		 * comment with perf_event_ctx_lock_nested().
++ 		 */
++ 		ctx = lockless_dereference(child->ctx);
++ 		/*
++ 		 * Since child_mutex nests inside ctx::mutex, we must jump
++ 		 * through hoops. We start by grabbing a reference on the ctx.
++ 		 *
++ 		 * Since the event cannot get freed while we hold the
++ 		 * child_mutex, the context must also exist and have a !0
++ 		 * reference count.
++ 		 */
++ 		get_ctx(ctx);
++ 
++ 		/*
++ 		 * Now that we have a ctx ref, we can drop child_mutex, and
++ 		 * acquire ctx::mutex without fear of it going away. Then we
++ 		 * can re-acquire child_mutex.
++ 		 */
++ 		mutex_unlock(&event->child_mutex);
++ 		mutex_lock(&ctx->mutex);
++ 		mutex_lock(&event->child_mutex);
++ 
++ 		/*
++ 		 * Now that we hold ctx::mutex and child_mutex, revalidate our
++ 		 * state, if child is still the first entry, it didn't get freed
++ 		 * and we can continue doing so.
++ 		 */
++ 		tmp = list_first_entry_or_null(&event->child_list,
++ 					       struct perf_event, child_list);
++ 		if (tmp == child) {
++ 			perf_remove_from_context(child, DETACH_GROUP);
++ 			list_del(&child->child_list);
++ 			free_event(child);
++ 			/*
++ 			 * This matches the refcount bump in inherit_event();
++ 			 * this can't be the last reference.
++ 			 */
++ 			put_event(event);
++ 		}
++ 
++ 		mutex_unlock(&event->child_mutex);
++ 		mutex_unlock(&ctx->mutex);
++ 		put_ctx(ctx);
++ 		goto again;
++ 	}
++ 	mutex_unlock(&event->child_mutex);
++ 
++ no_ctx:
++ 	put_event(event); /* Must be the 'last' reference */
+++>>>>>>> a4f4bb6d0c69 (perf: Allow perf_release() with !event->ctx)
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(perf_event_release_kernel);
+* Unmerged path kernel/events/core.c
