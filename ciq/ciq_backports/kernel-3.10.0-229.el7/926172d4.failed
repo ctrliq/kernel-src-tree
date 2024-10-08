@@ -1,0 +1,522 @@
+efi: Export EFI runtime memory mapping to sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Dave Young <dyoung@redhat.com>
+commit 926172d46038d7610b6b8d84e40db727cefb482d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/926172d4.failed
+
+kexec kernel will need exactly same mapping for EFI runtime memory
+ranges. Thus here export the runtime ranges mapping to sysfs,
+kexec-tools will assemble them and pass to 2nd kernel via setup_data.
+
+Introducing a new directory /sys/firmware/efi/runtime-map just like
+/sys/firmware/memmap. Containing below attribute in each file of that
+directory:
+
+attribute  num_pages  phys_addr  type  virt_addr
+
+	Signed-off-by: Dave Young <dyoung@redhat.com>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 926172d46038d7610b6b8d84e40db727cefb482d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+#	drivers/firmware/efi/Kconfig
+#	drivers/firmware/efi/Makefile
+diff --cc arch/x86/platform/efi/efi.c
+index 4ba4bd5dfe10,74fe7a719508..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -804,6 -811,63 +807,66 @@@ void __init efi_enter_virtual_mode(void
+  		}
+  		prev_md = md;
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void __init get_systab_virt_addr(efi_memory_desc_t *md)
++ {
++ 	unsigned long size;
++ 	u64 end, systab;
++ 
++ 	size = md->num_pages << EFI_PAGE_SHIFT;
++ 	end = md->phys_addr + size;
++ 	systab = (u64)(unsigned long)efi_phys.systab;
++ 	if (md->phys_addr <= systab && systab < end) {
++ 		systab += md->virt_addr - md->phys_addr;
++ 		efi.systab = (efi_system_table_t *)(unsigned long)systab;
++ 	}
++ }
++ 
++ static int __init save_runtime_map(void)
++ {
++ 	efi_memory_desc_t *md;
++ 	void *tmp, *p, *q = NULL;
++ 	int count = 0;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RUNTIME) ||
++ 		    (md->type == EFI_BOOT_SERVICES_CODE) ||
++ 		    (md->type == EFI_BOOT_SERVICES_DATA))
++ 			continue;
++ 		tmp = krealloc(q, (count + 1) * memmap.desc_size, GFP_KERNEL);
++ 		if (!tmp)
++ 			goto out;
++ 		q = tmp;
++ 
++ 		memcpy(q + count * memmap.desc_size, md, memmap.desc_size);
++ 		count++;
++ 	}
++ 
++ 	efi_runtime_map = q;
++ 	nr_efi_runtime_map = count;
++ 	efi_runtime_map_setup(efi_runtime_map, nr_efi_runtime_map,
++ 			      boot_params.efi_info.efi_memdesc_size);
++ 
++ 	return 0;
++ out:
++ 	kfree(q);
++ 	return -ENOMEM;
++ }
++ 
++ /*
++  * Map efi memory ranges for runtime serivce and update new_memmap with virtual
++  * addresses.
++  */
++ static void * __init efi_map_regions(int *count)
++ {
++ 	efi_memory_desc_t *md;
++ 	void *p, *tmp, *new_memmap = NULL;
+++>>>>>>> 926172d46038 (efi: Export EFI runtime memory mapping to sysfs)
+  
+  	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+  		md = p;
+@@@ -815,46 -879,76 +878,109 @@@
+  				continue;
+  		}
+  
+ -		efi_map_region(md);
+ -		get_systab_virt_addr(md);
+ +		size = md->num_pages << EFI_PAGE_SHIFT;
+ +		end = md->phys_addr + size;
+ +
+++<<<<<<< HEAD
+ +		start_pfn = PFN_DOWN(md->phys_addr);
+ +		end_pfn = PFN_UP(end);
+ +		if (pfn_range_is_mapped(start_pfn, end_pfn)) {
+ +			va = __va(md->phys_addr);
+ +
+ +			if (!(md->attribute & EFI_MEMORY_WB))
+ +				efi_memory_uc((u64)(unsigned long)va, size);
+ +		} else
+ +			va = efi_ioremap(md->phys_addr, size,
+ +					 md->type, md->attribute);
+ +
+ +		md->virt_addr = (u64) (unsigned long) va;
+ +
+ +		if (!va) {
+ +			pr_err("ioremap of 0x%llX failed!\n",
+ +			       (unsigned long long)md->phys_addr);
+ +			continue;
+ +		}
+ +
+ +		systab = (u64) (unsigned long) efi_phys.systab;
+ +		if (md->phys_addr <= systab && systab < end) {
+ +			systab += md->virt_addr - md->phys_addr;
+ +			efi.systab = (efi_system_table_t *) (unsigned long) systab;
+ +		}
+ +		new_memmap = krealloc(new_memmap,
+ +				      (count + 1) * memmap.desc_size,
+ +				      GFP_KERNEL);
+ +		if (!new_memmap)
+ +			goto err_out;
+  
+ +		memcpy(new_memmap + (count * memmap.desc_size), md,
+ +		       memmap.desc_size);
+ +		count++;
+++=======
++ 		tmp = krealloc(new_memmap, (*count + 1) * memmap.desc_size,
++ 			       GFP_KERNEL);
++ 		if (!tmp)
++ 			goto out;
++ 		new_memmap = tmp;
++ 		memcpy(new_memmap + (*count * memmap.desc_size), md,
++ 		       memmap.desc_size);
++ 		(*count)++;
+  	}
+  
++ 	return new_memmap;
++ out:
++ 	kfree(new_memmap);
++ 	return NULL;
++ }
++ 
++ /*
++  * This function will switch the EFI runtime services to virtual mode.
++  * Essentially, we look through the EFI memmap and map every region that
++  * has the runtime attribute bit set in its memory descriptor into the
++  * ->trampoline_pgd page table using a top-down VA allocation scheme.
++  *
++  * The old method which used to update that memory descriptor with the
++  * virtual address obtained from ioremap() is still supported when the
++  * kernel is booted with efi=old_map on its command line. Same old
++  * method enabled the runtime services to be called without having to
++  * thunk back into physical mode for every invocation.
++  *
++  * The new method does a pagetable switch in a preemption-safe manner
++  * so that we're in a different address space when calling a runtime
++  * function. For function arguments passing we do copy the PGDs of the
++  * kernel page table into ->trampoline_pgd prior to each call.
++  */
++ void __init efi_enter_virtual_mode(void)
++ {
++ 	efi_status_t status;
++ 	void *new_memmap = NULL;
++ 	int err, count = 0;
++ 
++ 	efi.systab = NULL;
++ 
++ 	/*
++ 	 * We don't do virtual mode, since we don't do runtime services, on
++ 	 * non-native EFI
++ 	 */
++ 	if (!efi_is_native()) {
++ 		efi_unmap_memmap();
++ 		return;
++ 	}
++ 
++ 	efi_merge_regions();
++ 
++ 	new_memmap = efi_map_regions(&count);
++ 	if (!new_memmap) {
++ 		pr_err("Error reallocating memory, EFI runtime non-functional!\n");
++ 		return;
+++>>>>>>> 926172d46038 (efi: Export EFI runtime memory mapping to sysfs)
++ 	}
++ 
++ 	err = save_runtime_map();
++ 	if (err)
++ 		pr_err("Error saving runtime map, efi runtime on kexec non-functional!!\n");
++ 
+  	BUG_ON(!efi.systab);
+  
+ -	efi_setup_page_tables();
+ -	efi_sync_low_kernel_mappings();
+ -
+  	status = phys_efi_set_virtual_address_map(
+  		memmap.desc_size * count,
+  		memmap.desc_size,
+diff --cc drivers/firmware/efi/Kconfig
+index b0fc7c79dfbb,730f5f2e8b7f..000000000000
+--- a/drivers/firmware/efi/Kconfig
++++ b/drivers/firmware/efi/Kconfig
+@@@ -36,4 -36,18 +36,21 @@@ config EFI_VARS_PSTORE_DEFAULT_DISABL
+  	  backend for pstore by default. This setting can be overridden
+  	  using the efivars module's pstore_disable parameter.
+  
+++<<<<<<< HEAD
+++=======
++ config UEFI_CPER
++ 	def_bool n
++ 
++ config EFI_RUNTIME_MAP
++ 	bool "Export efi runtime maps to sysfs"
++ 	depends on X86 && EFI && KEXEC
++ 	default y
++ 	help
++ 	  Export efi runtime memory maps to /sys/firmware/efi/runtime-map.
++ 	  That memory map is used for example by kexec to set up efi virtual
++ 	  mapping the 2nd kernel, but can also be used for debugging purposes.
++ 
++ 	  See also Documentation/ABI/testing/sysfs-firmware-efi-runtime-map.
++ 
+++>>>>>>> 926172d46038 (efi: Export EFI runtime memory mapping to sysfs)
+  endmenu
+diff --cc drivers/firmware/efi/Makefile
+index 99245ab5a79c,a58e0f183a08..000000000000
+--- a/drivers/firmware/efi/Makefile
++++ b/drivers/firmware/efi/Makefile
+@@@ -4,3 -4,5 +4,8 @@@
+  obj-y					+= efi.o vars.o
+  obj-$(CONFIG_EFI_VARS)			+= efivars.o
+  obj-$(CONFIG_EFI_VARS_PSTORE)		+= efi-pstore.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_UEFI_CPER)			+= cper.o
++ obj-$(CONFIG_EFI_RUNTIME_MAP)		+= runtime-map.o
+++>>>>>>> 926172d46038 (efi: Export EFI runtime memory mapping to sysfs)
+diff --git a/Documentation/ABI/testing/sysfs-firmware-efi-runtime-map b/Documentation/ABI/testing/sysfs-firmware-efi-runtime-map
+new file mode 100644
+index 000000000000..c61b9b348e99
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-firmware-efi-runtime-map
+@@ -0,0 +1,34 @@
++What:		/sys/firmware/efi/runtime-map/
++Date:		December 2013
++Contact:	Dave Young <dyoung@redhat.com>
++Description:	Switching efi runtime services to virtual mode requires
++		that all efi memory ranges which have the runtime attribute
++		bit set to be mapped to virtual addresses.
++
++		The efi runtime services can only be switched to virtual
++		mode once without rebooting. The kexec kernel must maintain
++		the same physical to virtual address mappings as the first
++		kernel. The mappings are exported to sysfs so userspace tools
++		can reassemble them and pass them into the kexec kernel.
++
++		/sys/firmware/efi/runtime-map/ is the directory the kernel
++		exports that information in.
++
++		subdirectories are named with the number of the memory range:
++
++			/sys/firmware/efi/runtime-map/0
++			/sys/firmware/efi/runtime-map/1
++			/sys/firmware/efi/runtime-map/2
++			/sys/firmware/efi/runtime-map/3
++			...
++
++		Each subdirectory contains five files:
++
++		attribute : The attributes of the memory range.
++		num_pages : The size of the memory range in pages.
++		phys_addr : The physical address of the memory range.
++		type      : The type of the memory range.
++		virt_addr : The virtual address of the memory range.
++
++		Above values are all hexadecimal numbers with the '0x' prefix.
++Users:		Kexec
+* Unmerged path arch/x86/platform/efi/efi.c
+* Unmerged path drivers/firmware/efi/Kconfig
+* Unmerged path drivers/firmware/efi/Makefile
+diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
+index 72533af72b98..4753bac65279 100644
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@ -167,6 +167,10 @@ static int __init efisubsys_init(void)
+ 		goto err_unregister;
+ 	}
+ 
++	error = efi_runtime_map_init(efi_kobj);
++	if (error)
++		goto err_remove_group;
++
+ 	/* and the standard mountpoint for efivarfs */
+ 	efivars_kobj = kobject_create_and_add("efivars", efi_kobj);
+ 	if (!efivars_kobj) {
+diff --git a/drivers/firmware/efi/runtime-map.c b/drivers/firmware/efi/runtime-map.c
+new file mode 100644
+index 000000000000..97cdd16a2169
+--- /dev/null
++++ b/drivers/firmware/efi/runtime-map.c
+@@ -0,0 +1,181 @@
++/*
++ * linux/drivers/efi/runtime-map.c
++ * Copyright (C) 2013 Red Hat, Inc., Dave Young <dyoung@redhat.com>
++ *
++ * This file is released under the GPLv2.
++ */
++
++#include <linux/string.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/efi.h>
++#include <linux/slab.h>
++
++#include <asm/setup.h>
++
++static void *efi_runtime_map;
++static int nr_efi_runtime_map;
++static u32 efi_memdesc_size;
++
++struct efi_runtime_map_entry {
++	efi_memory_desc_t md;
++	struct kobject kobj;   /* kobject for each entry */
++};
++
++static struct efi_runtime_map_entry **map_entries;
++
++struct map_attribute {
++	struct attribute attr;
++	ssize_t (*show)(struct efi_runtime_map_entry *entry, char *buf);
++};
++
++static inline struct map_attribute *to_map_attr(struct attribute *attr)
++{
++	return container_of(attr, struct map_attribute, attr);
++}
++
++static ssize_t type_show(struct efi_runtime_map_entry *entry, char *buf)
++{
++	return snprintf(buf, PAGE_SIZE, "0x%x\n", entry->md.type);
++}
++
++#define EFI_RUNTIME_FIELD(var) entry->md.var
++
++#define EFI_RUNTIME_U64_ATTR_SHOW(name) \
++static ssize_t name##_show(struct efi_runtime_map_entry *entry, char *buf) \
++{ \
++	return snprintf(buf, PAGE_SIZE, "0x%llx\n", EFI_RUNTIME_FIELD(name)); \
++}
++
++EFI_RUNTIME_U64_ATTR_SHOW(phys_addr);
++EFI_RUNTIME_U64_ATTR_SHOW(virt_addr);
++EFI_RUNTIME_U64_ATTR_SHOW(num_pages);
++EFI_RUNTIME_U64_ATTR_SHOW(attribute);
++
++static inline struct efi_runtime_map_entry *to_map_entry(struct kobject *kobj)
++{
++	return container_of(kobj, struct efi_runtime_map_entry, kobj);
++}
++
++static ssize_t map_attr_show(struct kobject *kobj, struct attribute *attr,
++			      char *buf)
++{
++	struct efi_runtime_map_entry *entry = to_map_entry(kobj);
++	struct map_attribute *map_attr = to_map_attr(attr);
++
++	return map_attr->show(entry, buf);
++}
++
++static struct map_attribute map_type_attr = __ATTR_RO(type);
++static struct map_attribute map_phys_addr_attr   = __ATTR_RO(phys_addr);
++static struct map_attribute map_virt_addr_attr  = __ATTR_RO(virt_addr);
++static struct map_attribute map_num_pages_attr  = __ATTR_RO(num_pages);
++static struct map_attribute map_attribute_attr  = __ATTR_RO(attribute);
++
++/*
++ * These are default attributes that are added for every memmap entry.
++ */
++static struct attribute *def_attrs[] = {
++	&map_type_attr.attr,
++	&map_phys_addr_attr.attr,
++	&map_virt_addr_attr.attr,
++	&map_num_pages_attr.attr,
++	&map_attribute_attr.attr,
++	NULL
++};
++
++static const struct sysfs_ops map_attr_ops = {
++	.show = map_attr_show,
++};
++
++static void map_release(struct kobject *kobj)
++{
++	struct efi_runtime_map_entry *entry;
++
++	entry = to_map_entry(kobj);
++	kfree(entry);
++}
++
++static struct kobj_type __refdata map_ktype = {
++	.sysfs_ops	= &map_attr_ops,
++	.default_attrs	= def_attrs,
++	.release	= map_release,
++};
++
++static struct kset *map_kset;
++
++static struct efi_runtime_map_entry *
++add_sysfs_runtime_map_entry(struct kobject *kobj, int nr)
++{
++	int ret;
++	struct efi_runtime_map_entry *entry;
++
++	if (!map_kset) {
++		map_kset = kset_create_and_add("runtime-map", NULL, kobj);
++		if (!map_kset)
++			return ERR_PTR(-ENOMEM);
++	}
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry) {
++		kset_unregister(map_kset);
++		return entry;
++	}
++
++	memcpy(&entry->md, efi_runtime_map + nr * efi_memdesc_size,
++	       sizeof(efi_memory_desc_t));
++
++	kobject_init(&entry->kobj, &map_ktype);
++	entry->kobj.kset = map_kset;
++	ret = kobject_add(&entry->kobj, NULL, "%d", nr);
++	if (ret) {
++		kobject_put(&entry->kobj);
++		kset_unregister(map_kset);
++		return ERR_PTR(ret);
++	}
++
++	return entry;
++}
++
++void efi_runtime_map_setup(void *map, int nr_entries, u32 desc_size)
++{
++	efi_runtime_map = map;
++	nr_efi_runtime_map = nr_entries;
++	efi_memdesc_size = desc_size;
++}
++
++int __init efi_runtime_map_init(struct kobject *efi_kobj)
++{
++	int i, j, ret = 0;
++	struct efi_runtime_map_entry *entry;
++
++	if (!efi_runtime_map)
++		return 0;
++
++	map_entries = kzalloc(nr_efi_runtime_map * sizeof(entry), GFP_KERNEL);
++	if (!map_entries) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	for (i = 0; i < nr_efi_runtime_map; i++) {
++		entry = add_sysfs_runtime_map_entry(efi_kobj, i);
++		if (IS_ERR(entry)) {
++			ret = PTR_ERR(entry);
++			goto out_add_entry;
++		}
++		*(map_entries + i) = entry;
++	}
++
++	return 0;
++out_add_entry:
++	for (j = i - 1; j > 0; j--) {
++		entry = *(map_entries + j);
++		kobject_put(&entry->kobj);
++	}
++	if (map_kset)
++		kset_unregister(map_kset);
++out:
++	return ret;
++}
+diff --git a/include/linux/efi.h b/include/linux/efi.h
+index 4ded1b651ca6..16bb0c49e0ec 100644
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -906,4 +906,17 @@ int efivars_sysfs_init(void);
+ 
+ #endif /* CONFIG_EFI_VARS */
+ 
++#ifdef CONFIG_EFI_RUNTIME_MAP
++int efi_runtime_map_init(struct kobject *);
++void efi_runtime_map_setup(void *, int, u32);
++#else
++static inline int efi_runtime_map_init(struct kobject *kobj)
++{
++	return 0;
++}
++
++static inline void
++efi_runtime_map_setup(void *map, int nr_entries, u32 desc_size) {}
++#endif
++
+ #endif /* _LINUX_EFI_H */
