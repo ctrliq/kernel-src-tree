@@ -1,0 +1,284 @@
+GFS2: Use generic list_lru for quota
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit 2147dbfd059eb7fefcfd5934f74f25f0693d4a1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2147dbfd.failed
+
+By using the generic list_lru code, we can now separate the
+per sb quota list locking from the lru locking. The lru
+lock is made into the inner-most lock.
+
+As a result of this new lock order, we may occasionally see
+items on the per-sb quota list which are "dead" so that the
+two places where we traverse that list are updated to take
+account of that.
+
+As a result of this patch, the gfs2 quota shrinker is now
+NUMA zone aware, and we are also laying the foundations for
+further improvments in due course.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Signed-off-by: Abhijith Das <adas@redhat.com>
+	Tested-by: Abhijith Das <adas@redhat.com>
+	Cc: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 2147dbfd059eb7fefcfd5934f74f25f0693d4a1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/main.c
+#	fs/gfs2/quota.c
+#	fs/gfs2/quota.h
+diff --cc fs/gfs2/main.c
+index e04d0e09ee7b,0650db2541ef..000000000000
+--- a/fs/gfs2/main.c
++++ b/fs/gfs2/main.c
+@@@ -31,11 -31,6 +31,14 @@@
+  
+  struct workqueue_struct *gfs2_control_wq;
+  
+++<<<<<<< HEAD
+ +static struct shrinker qd_shrinker = {
+ +	.shrink = gfs2_shrink_qd_memory,
+ +	.seeks = DEFAULT_SEEKS,
+ +};
+ +
+++=======
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  static void gfs2_init_inode_once(void *foo)
+  {
+  	struct gfs2_inode *ip = foo;
+diff --cc fs/gfs2/quota.c
+index 679b366e073c,453b50eaddec..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -72,30 -73,25 +73,48 @@@ struct gfs2_quota_change_host 
+  	struct kqid qc_id;
+  };
+  
+++<<<<<<< HEAD
+ +static LIST_HEAD(qd_lru_list);
+ +static atomic_t qd_lru_count = ATOMIC_INIT(0);
+ +static DEFINE_SPINLOCK(qd_lru_lock);
+ +
+ +int gfs2_shrink_qd_memory(struct shrinker *shrink, struct shrink_control *sc)
+ +{
+ +	struct gfs2_quota_data *qd;
+ +	struct gfs2_sbd *sdp;
+ +	int nr_to_scan = sc->nr_to_scan;
+ +
+ +	if (nr_to_scan == 0)
+ +		goto out;
+ +
+ +	if (!(sc->gfp_mask & __GFP_FS))
+ +		return -1;
+ +
+ +	spin_lock(&qd_lru_lock);
+ +	while (nr_to_scan && !list_empty(&qd_lru_list)) {
+ +		qd = list_entry(qd_lru_list.next,
+ +				struct gfs2_quota_data, qd_reclaim);
+++=======
++ /* Lock order: qd_lock -> qd->lockref.lock -> lru lock */
++ static DEFINE_SPINLOCK(qd_lock);
++ struct list_lru gfs2_qd_lru;
++ 
++ static void gfs2_qd_dispose(struct list_head *list)
++ {
++ 	struct gfs2_quota_data *qd;
++ 	struct gfs2_sbd *sdp;
++ 
++ 	while (!list_empty(list)) {
++ 		qd = list_entry(list->next, struct gfs2_quota_data, qd_lru);
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  		sdp = qd->qd_gl->gl_sbd;
+  
++ 		list_del(&qd->qd_lru);
++ 
+  		/* Free from the filesystem-specific list */
++ 		spin_lock(&qd_lock);
+  		list_del(&qd->qd_list);
++ 		spin_unlock(&qd_lock);
+  
+  		gfs2_assert_warn(sdp, !qd->qd_change);
+  		gfs2_assert_warn(sdp, !qd->qd_slot_count);
+@@@ -105,19 -101,59 +124,73 @@@
+  		atomic_dec(&sdp->sd_quota_count);
+  
+  		/* Delete it from the common reclaim list */
+++<<<<<<< HEAD
+ +		list_del_init(&qd->qd_reclaim);
+ +		atomic_dec(&qd_lru_count);
+ +		spin_unlock(&qd_lru_lock);
+ +		kmem_cache_free(gfs2_quotad_cachep, qd);
+ +		spin_lock(&qd_lru_lock);
+ +		nr_to_scan--;
+ +	}
+ +	spin_unlock(&qd_lru_lock);
+ +
+ +out:
+ +	return (atomic_read(&qd_lru_count) * sysctl_vfs_cache_pressure) / 100;
+++=======
++ 		kmem_cache_free(gfs2_quotad_cachep, qd);
++ 	}
++ }
++ 
++ 
++ static enum lru_status gfs2_qd_isolate(struct list_head *item, spinlock_t *lock, void *arg)
++ {
++ 	struct list_head *dispose = arg;
++ 	struct gfs2_quota_data *qd = list_entry(item, struct gfs2_quota_data, qd_lru);
++ 
++ 	if (!spin_trylock(&qd->qd_lockref.lock))
++ 		return LRU_SKIP;
++ 
++ 	if (qd->qd_lockref.count == 0) {
++ 		lockref_mark_dead(&qd->qd_lockref);
++ 		list_move(&qd->qd_lru, dispose);
++ 	}
++ 
++ 	spin_unlock(&qd->qd_lockref.lock);
++ 	return LRU_REMOVED;
++ }
++ 
++ static unsigned long gfs2_qd_shrink_scan(struct shrinker *shrink,
++ 					 struct shrink_control *sc)
++ {
++ 	LIST_HEAD(dispose);
++ 	unsigned long freed;
++ 
++ 	if (!(sc->gfp_mask & __GFP_FS))
++ 		return SHRINK_STOP;
++ 
++ 	freed = list_lru_walk_node(&gfs2_qd_lru, sc->nid, gfs2_qd_isolate,
++ 				   &dispose, &sc->nr_to_scan);
++ 
++ 	gfs2_qd_dispose(&dispose);
++ 
++ 	return freed;
++ }
++ 
++ static unsigned long gfs2_qd_shrink_count(struct shrinker *shrink,
++ 					  struct shrink_control *sc)
++ {
++ 	return vfs_pressure_ratio(list_lru_count_node(&gfs2_qd_lru, sc->nid));
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  }
+  
++ struct shrinker gfs2_qd_shrinker = {
++ 	.count_objects = gfs2_qd_shrink_count,
++ 	.scan_objects = gfs2_qd_shrink_scan,
++ 	.seeks = DEFAULT_SEEKS,
++ 	.flags = SHRINKER_NUMA_AWARE,
++ };
++ 
++ 
+  static u64 qd2index(struct gfs2_quota_data *qd)
+  {
+  	struct kqid qid = qd->qd_id;
+@@@ -175,15 -211,11 +248,11 @@@ static int qd_get(struct gfs2_sbd *sdp
+  
+  	for (;;) {
+  		found = 0;
+ -		spin_lock(&qd_lock);
+ +		spin_lock(&qd_lru_lock);
+  		list_for_each_entry(qd, &sdp->sd_quota_list, qd_list) {
+- 			if (qid_eq(qd->qd_id, qid)) {
+- 				lockref_get(&qd->qd_lockref);
+- 				if (!list_empty(&qd->qd_reclaim)) {
+- 					/* Remove it from reclaim list */
+- 					list_del_init(&qd->qd_reclaim);
+- 					atomic_dec(&qd_lru_count);
+- 				}
++ 			if (qid_eq(qd->qd_id, qid) &&
++ 			    lockref_get_not_dead(&qd->qd_lockref)) {
++ 				list_lru_del(&gfs2_qd_lru, &qd->qd_lru);
+  				found = 1;
+  				break;
+  			}
+@@@ -225,18 -257,13 +294,28 @@@ static void qd_hold(struct gfs2_quota_d
+  
+  static void qd_put(struct gfs2_quota_data *qd)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&qd_lru_lock);
+++=======
++ 	if (lockref_put_or_lock(&qd->qd_lockref))
++ 		return;
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  
+- 	if (!lockref_put_or_lock(&qd->qd_lockref)) {
++ 	qd->qd_lockref.count = 0;
++ 	list_lru_add(&gfs2_qd_lru, &qd->qd_lru);
++ 	spin_unlock(&qd->qd_lockref.lock);
+  
+++<<<<<<< HEAD
+ +		/* Add to the reclaim list */
+ +		list_add_tail(&qd->qd_reclaim, &qd_lru_list);
+ +		atomic_inc(&qd_lru_count);
+ +
+ +		spin_unlock(&qd->qd_lockref.lock);
+ +	}
+ +
+ +	spin_unlock(&qd_lru_lock);
+++=======
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  }
+  
+  static int slot_get(struct gfs2_quota_data *qd)
+@@@ -1330,12 -1352,9 +1409,9 @@@ void gfs2_quota_cleanup(struct gfs2_sb
+  
+  		list_del(&qd->qd_list);
+  		/* Also remove if this qd exists in the reclaim list */
+- 		if (!list_empty(&qd->qd_reclaim)) {
+- 			list_del_init(&qd->qd_reclaim);
+- 			atomic_dec(&qd_lru_count);
+- 		}
++ 		list_lru_del(&gfs2_qd_lru, &qd->qd_lru);
+  		atomic_dec(&sdp->sd_quota_count);
+ -		spin_unlock(&qd_lock);
+ +		spin_unlock(&qd_lru_lock);
+  
+  		if (!qd->qd_lockref.count) {
+  			gfs2_assert_warn(sdp, !qd->qd_change);
+diff --cc fs/gfs2/quota.h
+index 4f5e6e44ed83,96e4f34a03b0..000000000000
+--- a/fs/gfs2/quota.h
++++ b/fs/gfs2/quota.h
+@@@ -53,8 -54,8 +54,13 @@@ static inline int gfs2_quota_lock_check
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +extern int gfs2_shrink_qd_memory(struct shrinker *shrink,
+ +				 struct shrink_control *sc);
+++=======
+++>>>>>>> 2147dbfd059e (GFS2: Use generic list_lru for quota)
+  extern const struct quotactl_ops gfs2_quotactl_ops;
++ extern struct shrinker gfs2_qd_shrinker;
++ extern struct list_lru gfs2_qd_lru;
+  
+  #endif /* __QUOTA_DOT_H__ */
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 88b757b58e69..ca0822a73b4b 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -414,11 +414,10 @@ enum {
+ 
+ struct gfs2_quota_data {
+ 	struct list_head qd_list;
+-	struct list_head qd_reclaim;
+-
++	struct kqid qd_id;
+ 	struct lockref qd_lockref;
++	struct list_head qd_lru;
+ 
+-	struct kqid qd_id;
+ 	unsigned long qd_flags;		/* QDF_... */
+ 
+ 	s64 qd_change;
+* Unmerged path fs/gfs2/main.c
+* Unmerged path fs/gfs2/quota.c
+* Unmerged path fs/gfs2/quota.h
