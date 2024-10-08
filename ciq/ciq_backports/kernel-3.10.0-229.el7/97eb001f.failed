@@ -1,0 +1,124 @@
+powerpc/powernv: Add OPAL call to resync timebase on wakeup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Add OPAL call to resync timebase on wakeup (Don Zickus) [1127366]
+Rebuild_FUZZ: 92.73%
+commit-author Vaidyanathan Srinivasan <svaidy@linux.vnet.ibm.com>
+commit 97eb001f03494758a938300908b88929163650ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/97eb001f.failed
+
+During "Fast-sleep" and deeper power savings state, decrementer and
+timebase could be stopped making it out of sync with rest
+of the cores in the system.
+
+Add a firmware call to request platform to resync timebase
+using low level platform methods.
+
+	Signed-off-by: Vaidyanathan Srinivasan <svaidy@linux.vnet.ibm.com>
+	Signed-off-by: Preeti U. Murthy <preeti@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 97eb001f03494758a938300908b88929163650ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/exceptions-64s.S
+diff --cc arch/powerpc/kernel/exceptions-64s.S
+index 0ec7720d4f50,9533d7a9223c..000000000000
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@@ -141,6 -142,11 +141,14 @@@ BEGIN_FTR_SECTIO
+  	beq	cr1,2f
+  	b	.power7_wakeup_noloss
+  2:	b	.power7_wakeup_loss
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Fast Sleep wakeup on PowerNV */
++ 8:	GET_PACA(r13)
++ 	b 	.power7_wakeup_tb_loss
++ 
+++>>>>>>> 97eb001f0349 (powerpc/powernv: Add OPAL call to resync timebase on wakeup)
+  9:
+  END_FTR_SECTION_IFSET(CPU_FTR_HVMODE | CPU_FTR_ARCH_206)
+  #endif /* CONFIG_PPC_P7_NAP */
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index ed82142a3251..c0458d6b473b 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -154,6 +154,7 @@ extern int opal_enter_rtas(struct rtas_args *args,
+ #define OPAL_FLASH_VALIDATE			76
+ #define OPAL_FLASH_MANAGE			77
+ #define OPAL_FLASH_UPDATE			78
++#define OPAL_RESYNC_TIMEBASE			79
+ #define OPAL_GET_MSG				85
+ #define OPAL_CHECK_ASYNC_COMPLETION		86
+ #define OPAL_SYNC_HOST_REBOOT			87
+@@ -865,6 +866,7 @@ extern void opal_flash_init(void);
+ extern int opal_machine_check(struct pt_regs *regs);
+ 
+ extern void opal_shutdown(void);
++extern int opal_resync_timebase(void);
+ 
+ extern void opal_lpc_init(void);
+ 
+* Unmerged path arch/powerpc/kernel/exceptions-64s.S
+diff --git a/arch/powerpc/kernel/idle_power7.S b/arch/powerpc/kernel/idle_power7.S
+index 3fdef0f0c67f..6ff5bfb5e9dc 100644
+--- a/arch/powerpc/kernel/idle_power7.S
++++ b/arch/powerpc/kernel/idle_power7.S
+@@ -17,6 +17,7 @@
+ #include <asm/ppc-opcode.h>
+ #include <asm/hw_irq.h>
+ #include <asm/kvm_book3s_asm.h>
++#include <asm/opal.h>
+ 
+ #undef DEBUG
+ 
+@@ -100,6 +101,32 @@ _GLOBAL(power7_enter_nap_mode)
+ 	PPC_NAP
+ 	b	.
+ 
++_GLOBAL(power7_wakeup_tb_loss)
++	ld	r2,PACATOC(r13);
++	ld	r1,PACAR1(r13)
++
++	/* Time base re-sync */
++	li	r0,OPAL_RESYNC_TIMEBASE
++	LOAD_REG_ADDR(r11,opal);
++	ld	r12,8(r11);
++	ld	r2,0(r11);
++	mtctr	r12
++	bctrl
++
++	/* TODO: Check r3 for failure */
++
++	REST_NVGPRS(r1)
++	REST_GPR(2, r1)
++	ld	r3,_CCR(r1)
++	ld	r4,_MSR(r1)
++	ld	r5,_NIP(r1)
++	addi	r1,r1,INT_FRAME_SIZE
++	mtcr	r3
++	mfspr	r3,SPRN_SRR1		/* Return SRR1 */
++	mtspr	SPRN_SRR1,r4
++	mtspr	SPRN_SRR0,r5
++	rfid
++
+ _GLOBAL(power7_wakeup_loss)
+ 	ld	r1,PACAR1(r13)
+ 	REST_NVGPRS(r1)
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index 3e8829c40fbb..aab54b60334f 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -126,6 +126,7 @@ OPAL_CALL(opal_return_cpu,			OPAL_RETURN_CPU);
+ OPAL_CALL(opal_validate_flash,			OPAL_FLASH_VALIDATE);
+ OPAL_CALL(opal_manage_flash,			OPAL_FLASH_MANAGE);
+ OPAL_CALL(opal_update_flash,			OPAL_FLASH_UPDATE);
++OPAL_CALL(opal_resync_timebase,			OPAL_RESYNC_TIMEBASE);
+ OPAL_CALL(opal_get_msg,				OPAL_GET_MSG);
+ OPAL_CALL(opal_check_completion,		OPAL_CHECK_ASYNC_COMPLETION);
+ OPAL_CALL(opal_sync_host_reboot,		OPAL_SYNC_HOST_REBOOT);
