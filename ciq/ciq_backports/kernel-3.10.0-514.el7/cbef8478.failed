@@ -1,0 +1,120 @@
+mm/hugetlb: pmd_huge() returns true for non-present hugepage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mm: hugetlb: pmd_huge() returns true for non-present hugepage (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 97.52%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit cbef8478bee55775ac312a574aad48af7bb9cf9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cbef8478.failed
+
+Migrating hugepages and hwpoisoned hugepages are considered as non-present
+hugepages, and they are referenced via migration entries and hwpoison
+entries in their page table slots.
+
+This behavior causes race condition because pmd_huge() doesn't tell
+non-huge pages from migrating/hwpoisoned hugepages.  follow_page_mask() is
+one example where the kernel would call follow_page_pte() for such
+hugepage while this function is supposed to handle only normal pages.
+
+To avoid this, this patch makes pmd_huge() return true when pmd_none() is
+true *and* pmd_present() is false.  We don't have to worry about mixing up
+non-present pmd entry with normal pmd (pointing to leaf level pte entry)
+because pmd_present() is true in normal pmd.
+
+The same race condition could happen in (x86-specific) gup_pmd_range(),
+where this patch simply adds pmd_present() check instead of pmd_huge().
+This is because gup_pmd_range() is fast path.  If we have non-present
+hugepage in this function, we will go into gup_huge_pmd(), then return 0
+at flag mask check, and finally fall back to the slow path.
+
+Fixes: 290408d4a2 ("hugetlb: hugepage migration core")
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: James Hogan <james.hogan@imgtec.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Mel Gorman <mel@csn.ul.ie>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Luiz Capitulino <lcapitulino@redhat.com>
+	Cc: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+	Cc: Lee Schermerhorn <lee.schermerhorn@hp.com>
+	Cc: Steve Capper <steve.capper@linaro.org>
+	Cc: <stable@vger.kernel.org>	[2.6.36+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cbef8478bee55775ac312a574aad48af7bb9cf9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/hugetlbpage.c
+diff --cc arch/x86/mm/hugetlbpage.c
+index e4afb30191c1,42982b26e32b..000000000000
+--- a/arch/x86/mm/hugetlbpage.c
++++ b/arch/x86/mm/hugetlbpage.c
+@@@ -217,24 -52,17 +217,33 @@@ int pud_huge(pud_t pud
+  	return 0;
+  }
+  
+ +struct page *
+ +follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ +		pmd_t *pmd, int write)
+ +{
+ +	return NULL;
+ +}
+ +
+  #else
+  
+++<<<<<<< HEAD
+ +struct page *
+ +follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+ +{
+ +	return ERR_PTR(-EINVAL);
+ +}
+ +
+++=======
++ /*
++  * pmd_huge() returns 1 if @pmd is hugetlb related entry, that is normal
++  * hugetlb entry or non-present (migration or hwpoisoned) hugetlb entry.
++  * Otherwise, returns 0.
++  */
+++>>>>>>> cbef8478bee5 (mm/hugetlb: pmd_huge() returns true for non-present hugepage)
+  int pmd_huge(pmd_t pmd)
+  {
+- 	return !!(pmd_val(pmd) & _PAGE_PSE);
++ 	return !pmd_none(pmd) &&
++ 		(pmd_val(pmd) & (_PAGE_PRESENT|_PAGE_PSE)) != _PAGE_PRESENT;
+  }
+  
+  int pud_huge(pud_t pud)
+diff --git a/arch/x86/mm/gup.c b/arch/x86/mm/gup.c
+index 2ab183bfc9f4..eb040e01a557 100644
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@ -172,7 +172,7 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
+ 		 */
+ 		if (pmd_none(pmd) || pmd_trans_splitting(pmd))
+ 			return 0;
+-		if (unlikely(pmd_large(pmd))) {
++		if (unlikely(pmd_large(pmd) || !pmd_present(pmd))) {
+ 			/*
+ 			 * NUMA hinting faults need to be handled in the GUP
+ 			 * slowpath for accounting purposes and so that they
+* Unmerged path arch/x86/mm/hugetlbpage.c
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 4a192c9e708d..d2d12f1d7aea 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3672,6 +3672,8 @@ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ {
+ 	struct page *page;
+ 
++	if (!pmd_present(*pmd))
++		return NULL;
+ 	page = pte_page(*(pte_t *)pmd);
+ 	if (page)
+ 		page += ((address & ~PMD_MASK) >> PAGE_SHIFT);
