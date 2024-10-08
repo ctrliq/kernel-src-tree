@@ -1,0 +1,316 @@
+be2net: Export board temperature using hwmon-sysfs interface.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] be2net: Export board temperature using hwmon-sysfs interface (Ivan Vecera) [1182733]
+Rebuild_FUZZ: 99.17%
+commit-author Venkata Duvvuru <VenkatKumar.Duvvuru@Emulex.Com>
+commit 29e9122b3ab2aa7160e54c2bbea242b99588325c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/29e9122b.failed
+
+Ethtool statistics is not the right place to display board temperature.
+This patch adds support to export die temperature of devices supported
+by be2net driver via the sysfs hwmon interface.
+
+	Signed-off-by: Venkat Duvvuru <VenkatKumar.Duvvuru@Emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 29e9122b3ab2aa7160e54c2bbea242b99588325c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be.h
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be.h
+index e375e9118367,c62a32fc3c0c..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@@ -453,6 -435,45 +454,48 @@@ struct rss_info 
+  	u8 rss_hkey[RSS_HASH_KEY_LEN];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define BE_INVALID_DIE_TEMP	0xFF
++ struct be_hwmon {
++ 	struct device *hwmon_dev;
++ 	u8 be_on_die_temp;  /* Unit: millidegree Celsius */
++ };
++ 
++ /* Macros to read/write the 'features' word of be_wrb_params structure.
++  */
++ #define	BE_WRB_F_BIT(name)			BE_WRB_F_##name##_BIT
++ #define	BE_WRB_F_MASK(name)			BIT_MASK(BE_WRB_F_##name##_BIT)
++ 
++ #define	BE_WRB_F_GET(word, name)	\
++ 	(((word) & (BE_WRB_F_MASK(name))) >> BE_WRB_F_BIT(name))
++ 
++ #define	BE_WRB_F_SET(word, name, val)	\
++ 	((word) |= (((val) << BE_WRB_F_BIT(name)) & BE_WRB_F_MASK(name)))
++ 
++ /* Feature/offload bits */
++ enum {
++ 	BE_WRB_F_CRC_BIT,		/* Ethernet CRC */
++ 	BE_WRB_F_IPCS_BIT,		/* IP csum */
++ 	BE_WRB_F_TCPCS_BIT,		/* TCP csum */
++ 	BE_WRB_F_UDPCS_BIT,		/* UDP csum */
++ 	BE_WRB_F_LSO_BIT,		/* LSO */
++ 	BE_WRB_F_LSO6_BIT,		/* LSO6 */
++ 	BE_WRB_F_VLAN_BIT,		/* VLAN */
++ 	BE_WRB_F_VLAN_SKIP_HW_BIT	/* Skip VLAN tag (workaround) */
++ };
++ 
++ /* The structure below provides a HW-agnostic abstraction of WRB params
++  * retrieved from a TX skb. This is in turn passed to chip specific routines
++  * during transmit, to set the corresponding params in the WRB.
++  */
++ struct be_wrb_params {
++ 	u32 features;	/* Feature bits */
++ 	u16 vlan_tag;	/* VLAN tag */
++ 	u16 lso_mss;	/* MSS for LSO */
++ };
++ 
+++>>>>>>> 29e9122b3ab2 (be2net: Export board temperature using hwmon-sysfs interface.)
+  struct be_adapter {
+  	struct pci_dev *pdev;
+  	struct net_device *netdev;
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index 4e5ddaa87095,b4cea559bacd..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -4963,155 -5470,29 +4963,181 @@@ static void be_remove(struct pci_dev *p
+  	free_netdev(adapter->netdev);
+  }
+  
+++<<<<<<< HEAD
+ +static int be_get_initial_config(struct be_adapter *adapter)
+ +{
+ +	int status, level;
+ +
+ +	status = be_cmd_get_cntl_attributes(adapter);
+ +	if (status)
+ +		return status;
+ +
+ +	/* Must be a power of 2 or else MODULO will BUG_ON */
+ +	adapter->be_get_temp_freq = 64;
+ +
+ +	if (BEx_chip(adapter)) {
+ +		level = be_cmd_get_fw_log_level(adapter);
+ +		adapter->msg_enable =
+ +			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+ +	}
+ +
+ +	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
+ +	return 0;
+ +}
+ +
+ +static int lancer_recover_func(struct be_adapter *adapter)
+ +{
+ +	struct device *dev = &adapter->pdev->dev;
+ +	int status;
+ +
+ +	status = lancer_test_and_set_rdy_state(adapter);
+ +	if (status)
+ +		goto err;
+ +
+ +	if (netif_running(adapter->netdev))
+ +		be_close(adapter->netdev);
+ +
+ +	be_clear(adapter);
+ +
+ +	be_clear_all_error(adapter);
+ +
+ +	status = be_setup(adapter);
+ +	if (status)
+ +		goto err;
+ +
+ +	if (netif_running(adapter->netdev)) {
+ +		status = be_open(adapter->netdev);
+ +		if (status)
+ +			goto err;
+ +	}
+ +
+ +	dev_err(dev, "Adapter recovery successful\n");
+ +	return 0;
+ +err:
+ +	if (status == -EAGAIN)
+ +		dev_err(dev, "Waiting for resource provisioning\n");
+ +	else
+ +		dev_err(dev, "Adapter recovery failed\n");
+ +
+ +	return status;
+ +}
+ +
+ +static void be_func_recovery_task(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+ +		container_of(work, struct be_adapter,  func_recovery_work.work);
+ +	int status = 0;
+ +
+ +	be_detect_error(adapter);
+ +
+ +	if (adapter->hw_error && lancer_chip(adapter)) {
+ +		rtnl_lock();
+ +		netif_device_detach(adapter->netdev);
+ +		rtnl_unlock();
+ +
+ +		status = lancer_recover_func(adapter);
+ +		if (!status)
+ +			netif_device_attach(adapter->netdev);
+ +	}
+ +
+ +	/* In Lancer, for all errors other than provisioning error (-EAGAIN),
+ +	 * no need to attempt further recovery.
+ +	 */
+ +	if (!status || status == -EAGAIN)
+ +		schedule_delayed_work(&adapter->func_recovery_work,
+ +				      msecs_to_jiffies(1000));
+ +}
+ +
+ +static void be_log_sfp_info(struct be_adapter *adapter)
+ +{
+ +	int status;
+ +
+ +	status = be_cmd_query_sfp_info(adapter);
+ +	if (!status) {
+ +		dev_err(&adapter->pdev->dev,
+ +			"Unqualified SFP+ detected on %c from %s part no: %s",
+ +			adapter->port_name, adapter->phy.vendor_name,
+ +			adapter->phy.vendor_pn);
+ +	}
+ +	adapter->flags &= ~BE_FLAGS_EVT_INCOMPATIBLE_SFP;
+ +}
+ +
+ +static void be_worker(struct work_struct *work)
+ +{
+ +	struct be_adapter *adapter =
+ +		container_of(work, struct be_adapter, work.work);
+ +	struct be_rx_obj *rxo;
+ +	int i;
+ +
+ +	/* when interrupts are not yet enabled, just reap any pending
+ +	* mcc completions */
+ +	if (!netif_running(adapter->netdev)) {
+ +		local_bh_disable();
+ +		be_process_mcc(adapter);
+ +		local_bh_enable();
+ +		goto reschedule;
+ +	}
+ +
+ +	if (!adapter->stats_cmd_sent) {
+ +		if (lancer_chip(adapter))
+ +			lancer_cmd_get_pport_stats(adapter,
+ +						   &adapter->stats_cmd);
+ +		else
+ +			be_cmd_get_stats(adapter, &adapter->stats_cmd);
+ +	}
+ +
+ +	if (be_physfn(adapter) &&
+ +	    MODULO(adapter->work_counter, adapter->be_get_temp_freq) == 0)
+ +		be_cmd_get_die_temperature(adapter);
+ +
+ +	for_all_rx_queues(adapter, rxo, i) {
+ +		/* Replenish RX-queues starved due to memory
+ +		 * allocation failures.
+ +		 */
+ +		if (rxo->rx_post_starved)
+ +			be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+ +	}
+ +
+ +	be_eqd_update(adapter);
+ +
+ +	if (adapter->flags & BE_FLAGS_EVT_INCOMPATIBLE_SFP)
+ +		be_log_sfp_info(adapter);
+ +
+ +reschedule:
+ +	adapter->work_counter++;
+ +	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+ +}
+ +
+ +/* If any VFs are already enabled don't FLR the PF */
+ +static bool be_reset_required(struct be_adapter *adapter)
+ +{
+ +	return pci_num_vf(adapter->pdev) ? false : true;
+ +}
+++=======
++ ssize_t be_hwmon_show_temp(struct device *dev,
++ 			   struct device_attribute *dev_attr,
++ 			   char *buf)
++ {
++ 	struct be_adapter *adapter = dev_get_drvdata(dev);
++ 
++ 	/* Unit: millidegree Celsius */
++ 	if (adapter->hwmon_info.be_on_die_temp == BE_INVALID_DIE_TEMP)
++ 		return -EIO;
++ 	else
++ 		return sprintf(buf, "%u\n",
++ 			       adapter->hwmon_info.be_on_die_temp * 1000);
++ }
++ 
++ static SENSOR_DEVICE_ATTR(temp1_input, S_IRUGO,
++ 			  be_hwmon_show_temp, NULL, 1);
++ 
++ static struct attribute *be_hwmon_attrs[] = {
++ 	&sensor_dev_attr_temp1_input.dev_attr.attr,
++ 	NULL
++ };
++ 
++ ATTRIBUTE_GROUPS(be_hwmon);
+++>>>>>>> 29e9122b3ab2 (be2net: Export board temperature using hwmon-sysfs interface.)
+  
+  static char *mc_name(struct be_adapter *adapter)
+  {
+@@@ -5243,9 -5611,18 +5269,19 @@@ static int be_probe(struct pci_dev *pde
+  
+  	be_roce_dev_add(adapter);
+  
+ -	be_schedule_err_detection(adapter);
+ +	schedule_delayed_work(&adapter->func_recovery_work,
+ +			      msecs_to_jiffies(1000));
+  
++ 	/* On Die temperature not supported for VF. */
++ 	if (be_physfn(adapter)) {
++ 		adapter->hwmon_info.hwmon_dev =
++ 			devm_hwmon_device_register_with_groups(&pdev->dev,
++ 							       DRV_NAME,
++ 							       adapter,
++ 							       be_hwmon_groups);
++ 		adapter->hwmon_info.be_on_die_temp = BE_INVALID_DIE_TEMP;
++ 	}
++ 
+  	dev_info(&pdev->dev, "%s: %s %s port %c\n", nic_name(pdev),
+  		 func_name(adapter), mc_name(adapter), adapter->port_name);
+  
+* Unmerged path drivers/net/ethernet/emulex/benet/be.h
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index faa193e12fa0..1f2bc0216983 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -192,10 +192,12 @@ static void be_async_cmd_process(struct be_adapter *adapter,
+ 		if (base_status == MCC_STATUS_SUCCESS) {
+ 			struct be_cmd_resp_get_cntl_addnl_attribs *resp =
+ 							(void *)resp_hdr;
+-			adapter->drv_stats.be_on_die_temperature =
++			adapter->hwmon_info.be_on_die_temp =
+ 						resp->on_die_temperature;
+ 		} else {
+ 			adapter->be_get_temp_freq = 0;
++			adapter->hwmon_info.be_on_die_temp =
++						BE_INVALID_DIE_TEMP;
+ 		}
+ 		return;
+ 	}
+diff --git a/drivers/net/ethernet/emulex/benet/be_ethtool.c b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+index abdfa387832d..ec23e3bec6e0 100644
+--- a/drivers/net/ethernet/emulex/benet/be_ethtool.c
++++ b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+@@ -123,7 +123,6 @@ static const struct be_ethtool_stat et_stats[] = {
+ 	{DRVSTAT_INFO(dma_map_errors)},
+ 	/* Number of packets dropped due to random early drop function */
+ 	{DRVSTAT_INFO(eth_red_drops)},
+-	{DRVSTAT_INFO(be_on_die_temperature)},
+ 	{DRVSTAT_INFO(rx_roce_bytes_lsd)},
+ 	{DRVSTAT_INFO(rx_roce_bytes_msd)},
+ 	{DRVSTAT_INFO(rx_roce_frames)},
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
