@@ -1,0 +1,649 @@
+ACPI / dock: Dispatch dock notifications from the global notify handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] dock: Dispatch dock notifications from the global notify handler (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 94.81%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 1e2380cd144f6a9619f72f80ad9a93268f63b8dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1e2380cd.failed
+
+The ACPI dock station code carries out an extra namespace scan
+before the main one in order to find and register all of the dock
+device objects.  Then, it registers a notify handler for each of
+them for handling dock events.
+
+However, dock device objects need not be scanned for upfront.  They
+very well can be enumerated and registered during the first phase
+of the main namespace scan, before attaching scan handlers and ACPI
+drivers to ACPI device objects.  Then, the dependent devices can be
+added to the in the second phase.  That makes it possible to drop
+the extra namespace scan, so do it.
+
+Moreover, it is not necessary to register notify handlers for all
+of the dock stations' namespace nodes, becuase notifications may
+be dispatched from the global notify handler for them.  Do that and
+drop two functions used for dock notify handling, acpi_dock_deferred_cb()
+and dock_notify_handler(), that aren't necessary any more.
+
+Finally, some dock station objects have _HID objects matching the
+ACPI container scan handler which causes it to claim those objects
+and try to handle their hotplug, but that is not a good idea,
+because those objects have their own special hotplug handling anyway.
+For this reason, the hotplug_notify flag should not be set for ACPI
+device objects representing dock stations and the container scan
+handler should be made ignore those objects, so make that happen.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1e2380cd144f6a9619f72f80ad9a93268f63b8dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/container.c
+#	drivers/acpi/dock.c
+#	drivers/acpi/internal.h
+#	drivers/acpi/scan.c
+#	include/acpi/acpi_bus.h
+diff --cc drivers/acpi/container.c
+index e23151667655,9c35765ac5e9..000000000000
+--- a/drivers/acpi/container.c
++++ b/drivers/acpi/container.c
+@@@ -44,10 -43,49 +44,35 @@@ static const struct acpi_device_id cont
+  	{"", 0},
+  };
+  
+ -static int acpi_container_offline(struct container_dev *cdev)
+ -{
+ -	struct acpi_device *adev = ACPI_COMPANION(&cdev->dev);
+ -	struct acpi_device *child;
+ -
+ -	/* Check all of the dependent devices' physical companions. */
+ -	list_for_each_entry(child, &adev->children, node)
+ -		if (!acpi_scan_is_offline(child, false))
+ -			return -EBUSY;
+ -
+ -	return 0;
+ -}
+ -
+ -static void acpi_container_release(struct device *dev)
+ -{
+ -	kfree(to_container_dev(dev));
+ -}
+ -
+ -static int container_device_attach(struct acpi_device *adev,
+ +static int container_device_attach(struct acpi_device *device,
+  				   const struct acpi_device_id *not_used)
+  {
+++<<<<<<< HEAD
+ +	/* This is necessary for container hotplug to work. */
+++=======
++ 	struct container_dev *cdev;
++ 	struct device *dev;
++ 	int ret;
++ 
++ 	if (adev->flags.is_dock_station)
++ 		return 0;
++ 
++ 	cdev = kzalloc(sizeof(*cdev), GFP_KERNEL);
++ 	if (!cdev)
++ 		return -ENOMEM;
++ 
++ 	cdev->offline = acpi_container_offline;
++ 	dev = &cdev->dev;
++ 	dev->bus = &container_subsys;
++ 	dev_set_name(dev, "%s", dev_name(&adev->dev));
++ 	ACPI_COMPANION_SET(dev, adev);
++ 	dev->release = acpi_container_release;
++ 	ret = device_register(dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	adev->driver_data = dev;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  	return 1;
+  }
+  
+diff --cc drivers/acpi/dock.c
+index c3bab54256c4,44c6e6c0d545..000000000000
+--- a/drivers/acpi/dock.c
++++ b/drivers/acpi/dock.c
+@@@ -682,68 -660,8 +680,70 @@@ int dock_notify(struct acpi_device *ade
+  		else
+  			dock_event(ds, event, UNDOCK_EVENT);
+  		break;
+- 	default:
+- 		acpi_handle_err(handle, "Unknown dock event %d\n", event);
+  	}
+++<<<<<<< HEAD
+ +}
+ +
+ +struct dock_data {
+ +	struct dock_station *ds;
+ +	u32 event;
+ +};
+ +
+ +static void acpi_dock_deferred_cb(void *context)
+ +{
+ +	struct dock_data *data = context;
+ +
+ +	acpi_scan_lock_acquire();
+ +	dock_notify(data->ds, data->event);
+ +	acpi_scan_lock_release();
+ +	kfree(data);
+ +}
+ +
+ +static void dock_notify_handler(acpi_handle handle, u32 event, void *data)
+ +{
+ +	struct dock_data *dd;
+ +
+ +	if (event != ACPI_NOTIFY_BUS_CHECK && event != ACPI_NOTIFY_DEVICE_CHECK
+ +	   && event != ACPI_NOTIFY_EJECT_REQUEST)
+ +		return;
+ +
+ +	dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+ +	if (dd) {
+ +		acpi_status status;
+ +
+ +		dd->ds = data;
+ +		dd->event = event;
+ +		status = acpi_os_hotplug_execute(acpi_dock_deferred_cb, dd);
+ +		if (ACPI_FAILURE(status))
+ +			kfree(dd);
+ +	}
+ +}
+ +
+ +/**
+ + * find_dock_devices - find devices on the dock station
+ + * @handle: the handle of the device we are examining
+ + * @lvl: unused
+ + * @context: the dock station private data
+ + * @rv: unused
+ + *
+ + * This function is called by acpi_walk_namespace.  It will
+ + * check to see if an object has an _EJD method.  If it does, then it
+ + * will see if it is dependent on the dock station.
+ + */
+ +static acpi_status __init find_dock_devices(acpi_handle handle, u32 lvl,
+ +					    void *context, void **rv)
+ +{
+ +	struct dock_station *ds = context;
+ +	acpi_handle ejd = NULL;
+ +
+ +	acpi_bus_get_ejd(handle, &ejd);
+ +	if (ejd == ds->handle)
+ +		add_dock_dependent_device(ds, handle);
+ +
+ +	return AE_OK;
+++=======
++ 	return 0;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  }
+  
+  /*
+@@@ -910,42 -818,4 +900,45 @@@ err_rmgroup
+  err_unregister:
+  	platform_device_unregister(dd);
+  	acpi_handle_err(handle, "%s encountered error %d\n", __func__, ret);
+++<<<<<<< HEAD
+ +	return ret;
+ +}
+ +
+ +/**
+ + * find_dock_and_bay - look for dock stations and bays
+ + * @handle: acpi handle of a device
+ + * @lvl: unused
+ + * @context: unused
+ + * @rv: unused
+ + *
+ + * This is called by acpi_walk_namespace to look for dock stations and bays.
+ + */
+ +static __init acpi_status
+ +find_dock_and_bay(acpi_handle handle, u32 lvl, void *context, void **rv)
+ +{
+ +	if (acpi_dock_match(handle) || is_ejectable_bay(handle))
+ +		dock_add(handle);
+ +
+ +	return AE_OK;
+ +}
+ +
+ +void __init acpi_dock_init(void)
+ +{
+ +	if (acpi_disabled)
+ +		return;
+ +
+ +	/* look for dock stations and bays */
+ +	acpi_walk_namespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
+ +		ACPI_UINT32_MAX, find_dock_and_bay, NULL, NULL, NULL);
+ +
+ +	if (!dock_station_count) {
+ +		pr_info(PREFIX "No dock devices found.\n");
+ +		return;
+ +	}
+ +
+ +	ATOMIC_INIT_NOTIFIER_HEAD(&dock_notifier_list);
+ +	pr_info(PREFIX "%s: %d docks/bays found\n",
+ +		ACPI_DOCK_DRIVER_DESCRIPTION, dock_station_count);
+++=======
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  }
+diff --cc drivers/acpi/internal.h
+index f54dd71472f9,00e3220febda..000000000000
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@@ -85,9 -94,10 +91,14 @@@ void acpi_init_device_object(struct acp
+  			     int type, unsigned long long sta);
+  void acpi_device_add_finalize(struct acpi_device *device);
+  void acpi_free_pnp_ids(struct acpi_device_pnp *pnp);
+ -int acpi_bind_one(struct device *dev, struct acpi_device *adev);
+ +int acpi_bind_one(struct device *dev, acpi_handle handle);
+  int acpi_unbind_one(struct device *dev);
+++<<<<<<< HEAD
+ +void acpi_bus_device_eject(struct acpi_device *device, u32 ost_src);
+++=======
++ bool acpi_device_is_present(struct acpi_device *adev);
++ bool acpi_device_is_battery(acpi_handle handle);
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  
+  /* --------------------------------------------------------------------------
+                                    Power Resource
+diff --cc drivers/acpi/scan.c
+index b30a50799f84,ec12d970d78d..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -285,73 -380,144 +285,99 @@@ static int acpi_scan_hot_remove(struct 
+  	return 0;
+  }
+  
+ -static int acpi_scan_device_not_present(struct acpi_device *adev)
+ -{
+ -	if (!acpi_device_enumerated(adev)) {
+ -		dev_warn(&adev->dev, "Still not present\n");
+ -		return -EALREADY;
+ -	}
+ -	acpi_bus_trim(adev);
+ -	return 0;
+ -}
+ -
+ -static int acpi_scan_device_check(struct acpi_device *adev)
+ -{
+ -	int error;
+ -
+ -	acpi_bus_get_status(adev);
+ -	if (adev->status.present || adev->status.functional) {
+ -		/*
+ -		 * This function is only called for device objects for which
+ -		 * matching scan handlers exist.  The only situation in which
+ -		 * the scan handler is not attached to this device object yet
+ -		 * is when the device has just appeared (either it wasn't
+ -		 * present at all before or it was removed and then added
+ -		 * again).
+ -		 */
+ -		if (adev->handler) {
+ -			dev_warn(&adev->dev, "Already enumerated\n");
+ -			return -EALREADY;
+ -		}
+ -		error = acpi_bus_scan(adev->handle);
+ -		if (error) {
+ -			dev_warn(&adev->dev, "Namespace scan failure\n");
+ -			return error;
+ -		}
+ -		if (!adev->handler) {
+ -			dev_warn(&adev->dev, "Enumeration failure\n");
+ -			error = -ENODEV;
+ -		}
+ -	} else {
+ -		error = acpi_scan_device_not_present(adev);
+ -	}
+ -	return error;
+ -}
+ -
+ -static int acpi_scan_bus_check(struct acpi_device *adev)
+ +void acpi_bus_device_eject(struct acpi_device *device, u32 ost_src)
+  {
+ -	struct acpi_scan_handler *handler = adev->handler;
+ -	struct acpi_device *child;
+ +	acpi_handle handle = device->handle;
+ +	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+  	int error;
+  
+ -	acpi_bus_get_status(adev);
+ -	if (!(adev->status.present || adev->status.functional)) {
+ -		acpi_scan_device_not_present(adev);
+ -		return 0;
+ -	}
+ -	if (handler && handler->hotplug.scan_dependent)
+ -		return handler->hotplug.scan_dependent(adev);
+ -
+ -	error = acpi_bus_scan(adev->handle);
+ -	if (error) {
+ -		dev_warn(&adev->dev, "Namespace scan failure\n");
+ -		return error;
+ -	}
+ -	list_for_each_entry(child, &adev->children, node) {
+ -		error = acpi_scan_bus_check(child);
+ -		if (error)
+ -			return error;
+ -	}
+ -	return 0;
+ -}
+ +	lock_device_hotplug();
+ +	mutex_lock(&acpi_scan_lock);
+  
+ -static int acpi_generic_hotplug_event(struct acpi_device *adev, u32 type)
+ -{
+ -	switch (type) {
+ -	case ACPI_NOTIFY_BUS_CHECK:
+ -		return acpi_scan_bus_check(adev);
+ -	case ACPI_NOTIFY_DEVICE_CHECK:
+ -		return acpi_scan_device_check(adev);
+ -	case ACPI_NOTIFY_EJECT_REQUEST:
+ -	case ACPI_OST_EC_OSPM_EJECT:
+ -		if (adev->handler && !adev->handler->hotplug.enabled) {
+ -			dev_info(&adev->dev, "Eject disabled\n");
+ -			return -EPERM;
+ -		}
+ -		acpi_evaluate_hotplug_ost(adev->handle, ACPI_NOTIFY_EJECT_REQUEST,
+ +	if (ost_src == ACPI_NOTIFY_EJECT_REQUEST)
+ +		acpi_evaluate_hotplug_ost(handle, ACPI_NOTIFY_EJECT_REQUEST,
+  					  ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+ -		return acpi_scan_hot_remove(adev);
+ -	}
+ -	return -EINVAL;
+ -}
+ -
+ -void acpi_device_hotplug(void *data, u32 src)
+ -{
+ -	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ -	struct acpi_device *adev = data;
+ -	int error = -ENODEV;
+  
+ -	lock_device_hotplug();
+ -	mutex_lock(&acpi_scan_lock);
+ +	if (device->handler && device->handler->hotplug.mode == AHM_CONTAINER)
+ +		kobject_uevent(&device->dev.kobj, KOBJ_OFFLINE);
+  
+ -	/*
+ -	 * The device object's ACPI handle cannot become invalid as long as we
+ -	 * are holding acpi_scan_lock, but it might have become invalid before
+ -	 * that lock was acquired.
+ -	 */
+ -	if (adev->handle == INVALID_ACPI_HANDLE)
+ +	error = acpi_scan_hot_remove(device);
+ +	if (error == -EPERM) {
+ +		goto err_support;
+ +	} else if (error) {
+  		goto err_out;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (adev->flags.is_dock_station) {
++ 		error = dock_notify(adev, src);
++ 	} else if (adev->flags.hotplug_notify) {
++ 		error = acpi_generic_hotplug_event(adev, src);
++ 		if (error == -EPERM) {
++ 			ost_code = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
++ 			goto err_out;
++ 		}
++ 	} else {
++ 		int (*event)(struct acpi_device *, u32);
++ 
++ 		acpi_lock_hp_context();
++ 		event = adev->hp ? adev->hp->event : NULL;
++ 		acpi_unlock_hp_context();
++ 		/*
++ 		 * There may be additional notify handlers for device objects
++ 		 * without the .event() callback, so ignore them here.
++ 		 */
++ 		if (event)
++ 			error = event(adev, src);
++ 		else
++ 			goto out;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  	}
+ -	if (!error)
+ -		ost_code = ACPI_OST_SC_SUCCESS;
+  
+ + out:
+ +	mutex_unlock(&acpi_scan_lock);
+ +	unlock_device_hotplug();
+ +	return;
+ +
+ + err_support:
+ +	ost_code = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
+   err_out:
+ -	acpi_evaluate_hotplug_ost(adev->handle, src, ost_code, NULL);
+ +	acpi_evaluate_hotplug_ost(handle, ost_src, ost_code, NULL);
+ +	goto out;
+ +}
+ +
+ +static void acpi_scan_bus_device_check(acpi_handle handle, u32 ost_source)
+ +{
+ +	struct acpi_device *device = NULL;
+ +	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ +	int error;
+ +
+ +	lock_device_hotplug();
+ +	mutex_lock(&acpi_scan_lock);
+ +
+ +	if (ost_source != ACPI_NOTIFY_BUS_CHECK) {
+ +		acpi_bus_get_device(handle, &device);
+ +		if (device) {
+ +			dev_warn(&device->dev, "Attempt to re-insert\n");
+ +			goto out;
+ +		}
+ +	}
+ +	error = acpi_bus_scan(handle);
+ +	if (error) {
+ +		acpi_handle_warn(handle, "Namespace scan failure\n");
+ +		goto out;
+ +	}
+ +	error = acpi_bus_get_device(handle, &device);
+ +	if (error) {
+ +		acpi_handle_warn(handle, "Missing device node object\n");
+ +		goto out;
+ +	}
+ +	ost_code = ACPI_OST_SC_SUCCESS;
+ +	if (device->handler && device->handler->hotplug.mode == AHM_CONTAINER)
+ +		kobject_uevent(&device->dev.kobj, KOBJ_ONLINE);
+  
+   out:
+ -	acpi_bus_put_acpi_device(adev);
+ +	acpi_evaluate_hotplug_ost(handle, ost_source, ost_code, NULL);
+  	mutex_unlock(&acpi_scan_lock);
+  	unlock_device_hotplug();
+  }
+@@@ -1492,26 -1653,38 +1518,49 @@@ static int acpi_bay_match(acpi_handle h
+  	acpi_handle phandle;
+  
+  	if (!acpi_has_method(handle, "_EJ0"))
+ -		return false;
+ -	if (acpi_ata_match(handle))
+ -		return true;
+ -	if (ACPI_FAILURE(acpi_get_parent(handle, &phandle)))
+ -		return false;
+ +		return -ENODEV;
+ +
+ +	if (acpi_has_method(handle, "_GTF") ||
+ +	    acpi_has_method(handle, "_GTM") ||
+ +	    acpi_has_method(handle, "_STM") ||
+ +	    acpi_has_method(handle, "_SDD"))
+ +		return 0;
+ +
+ +	if (acpi_get_parent(handle, &phandle))
+ +		return -ENODEV;
+  
+ -	return acpi_ata_match(phandle);
+ +	if (acpi_has_method(phandle, "_GTF") ||
+ +	    acpi_has_method(phandle, "_GTM") ||
+ +	    acpi_has_method(phandle, "_STM") ||
+ +	    acpi_has_method(phandle, "_SDD"))
+ +                return 0;
+ +
+ +	return -ENODEV;
+  }
+  
++ bool acpi_device_is_battery(acpi_handle handle)
++ {
++ 	struct acpi_device_info *info;
++ 	bool ret = false;
++ 
++ 	if (!ACPI_SUCCESS(acpi_get_object_info(handle, &info)))
++ 		return false;
++ 
++ 	if (info->valid & ACPI_VALID_HID)
++ 		ret = !strcmp("PNP0C0A", info->hardware_id.string);
++ 
++ 	kfree(info);
++ 	return ret;
++ }
++ 
++ static bool is_ejectable_bay(acpi_handle handle)
++ {
++ 	if (acpi_has_method(handle, "_EJ0") && acpi_device_is_battery(handle))
++ 		return true;
++ 
++ 	return acpi_bay_match(handle);
++ }
++ 
+  /*
+   * acpi_dock_match - see if an acpi object has a _DCK method
+   */
+@@@ -1809,27 -1985,20 +1858,36 @@@ void acpi_scan_hotplug_enabled(struct a
+  	mutex_unlock(&acpi_scan_lock);
+  }
+  
+ -static void acpi_scan_init_hotplug(struct acpi_device *adev)
+ +static void acpi_scan_init_hotplug(acpi_handle handle, int type)
+  {
+ +	struct acpi_device_pnp pnp = {};
+  	struct acpi_hardware_id *hwid;
+ +	struct acpi_scan_handler *handler;
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&pnp.ids);
+ +	acpi_set_pnp_ids(handle, &pnp, type);
+++=======
++ 	if (acpi_dock_match(adev->handle) || is_ejectable_bay(adev->handle)) {
++ 		acpi_dock_add(adev);
++ 		return;
++ 	}
++ 	list_for_each_entry(hwid, &adev->pnp.ids, list) {
++ 		struct acpi_scan_handler *handler;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+ +
+ +	if (!pnp.type.hardware_id)
+ +		goto out;
+  
+ +	/*
+ +	 * This relies on the fact that acpi_install_notify_handler() will not
+ +	 * install the same notify handler routine twice for the same handle.
+ +	 */
+ +	list_for_each_entry(hwid, &pnp.ids, list) {
+  		handler = acpi_scan_match_handler(hwid->id, NULL);
+ -		if (handler) {
+ -			adev->flags.hotplug_notify = true;
+ +		if (handler && !handler->hotplug.ignore) {
+ +			acpi_install_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+ +					acpi_hotplug_notify_cb, handler);
+  			break;
+  		}
+  	}
+@@@ -1907,36 -2061,44 +1965,54 @@@ static int acpi_scan_attach_handler(str
+  	return ret;
+  }
+  
+ -static void acpi_bus_attach(struct acpi_device *device)
+ +static acpi_status acpi_bus_device_attach(acpi_handle handle, u32 lvl_not_used,
+ +					  void *not_used, void **ret_not_used)
+  {
+++<<<<<<< HEAD
+ +	struct acpi_device *device;
+ +	unsigned long long sta_not_used;
+ +	int ret;
+ +
+ +	/*
+ +	 * Ignore errors ignored by acpi_bus_check_add() to avoid terminating
+ +	 * namespace walks prematurely.
+ +	 */
+ +	if (acpi_bus_type_and_status(handle, &ret, &sta_not_used))
+ +		return AE_OK;
+ +
+ +	if (acpi_bus_get_device(handle, &device))
+ +		return AE_CTRL_DEPTH;
+ +
+ +	if (device->handler)
+ +		return AE_OK;
+++=======
++ 	struct acpi_device *child;
++ 	acpi_handle ejd;
++ 	int ret;
++ 
++ 	if (ACPI_SUCCESS(acpi_bus_get_ejd(device->handle, &ejd)))
++ 		register_dock_dependent_device(device, ejd);
++ 
++ 	acpi_bus_get_status(device);
++ 	/* Skip devices that are not present. */
++ 	if (!acpi_device_is_present(device)) {
++ 		device->flags.visited = false;
++ 		return;
++ 	}
++ 	if (device->handler)
++ 		goto ok;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  
+ -	if (!device->flags.initialized) {
+ -		acpi_bus_update_power(device, NULL);
+ -		device->flags.initialized = true;
+ -	}
+ -	device->flags.visited = false;
+  	ret = acpi_scan_attach_handler(device);
+  	if (ret < 0)
+ -		return;
+ +		return AE_CTRL_DEPTH;
+  
+  	device->flags.match_driver = true;
+ -	if (!ret) {
+ -		ret = device_attach(&device->dev);
+ -		if (ret < 0)
+ -			return;
+ -	}
+ -	device->flags.visited = true;
+ +	if (ret > 0)
+ +		return AE_OK;
+  
+ - ok:
+ -	list_for_each_entry(child, &device->children, node)
+ -		acpi_bus_attach(child);
+ +	ret = device_attach(&device->dev);
+ +	return ret >= 0 ? AE_OK : AE_CTRL_DEPTH;
+  }
+  
+  /**
+diff --cc include/acpi/acpi_bus.h
+index f5d6e1e4030e,8fb297b5307c..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -166,7 -197,12 +166,16 @@@ struct acpi_device_flags 
+  	u32 ejectable:1;
+  	u32 power_manageable:1;
+  	u32 match_driver:1;
+++<<<<<<< HEAD
+ +	u32 reserved:27;
+++=======
++ 	u32 initialized:1;
++ 	u32 visited:1;
++ 	u32 no_hotplug:1;
++ 	u32 hotplug_notify:1;
++ 	u32 is_dock_station:1;
++ 	u32 reserved:22;
+++>>>>>>> 1e2380cd144f (ACPI / dock: Dispatch dock notifications from the global notify handler)
+  };
+  
+  /* File System */
+* Unmerged path drivers/acpi/container.c
+* Unmerged path drivers/acpi/dock.c
+* Unmerged path drivers/acpi/internal.h
+* Unmerged path drivers/acpi/scan.c
+* Unmerged path include/acpi/acpi_bus.h
