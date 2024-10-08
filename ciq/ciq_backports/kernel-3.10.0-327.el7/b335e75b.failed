@@ -1,0 +1,129 @@
+ixgbe: change handling of multicast filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b335e75bab9e578764fc7dd581b61075bfd8c655
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b335e75b.failed
+
+In line with changes done by Alex Duyck regarding unicast filters, we
+now only set multicast filters when the interface is not in promiscuous
+mode for multicast packets. This also has an impact on the RAR usage
+such that SR-IOV has some RARs reserved for its own usage.
+
+	Reported-by: Alex Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit b335e75bab9e578764fc7dd581b61075bfd8c655)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 2dd08b8c8279,84044ed1914d..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -3980,8 -3981,17 +4009,22 @@@ void ixgbe_set_rx_mode(struct net_devic
+  		vmolr |= IXGBE_VMOLR_ROPE;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (adapter->num_vfs)
+ +		ixgbe_restore_vf_multicasts(adapter);
+++=======
++ 	/* Write addresses to the MTA, if the attempt fails
++ 	 * then we should just turn on promiscuous mode so
++ 	 * that we can at least receive multicast traffic
++ 	 */
++ 	count = ixgbe_write_mc_addr_list(netdev);
++ 	if (count < 0) {
++ 		fctrl |= IXGBE_FCTRL_MPE;
++ 		vmolr |= IXGBE_VMOLR_MPE;
++ 	} else if (count) {
++ 		vmolr |= IXGBE_VMOLR_ROMPE;
++ 	}
+++>>>>>>> b335e75bab9e (ixgbe: change handling of multicast filters)
+  
+  	if (hw->mac.type != ixgbe_mac_82598EB) {
+  		vmolr |= IXGBE_READ_REG(hw, IXGBE_VMOLR(VMDQ_P(0))) &
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+index ac6f5c6e917f..1a96adb465ab 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+@@ -330,6 +330,7 @@ static int ixgbe_set_vf_multicasts(struct ixgbe_adapter *adapter,
+ 	u32 vector_bit;
+ 	u32 vector_reg;
+ 	u32 mta_reg;
++	u32 vmolr = IXGBE_READ_REG(hw, IXGBE_VMOLR(vf));
+ 
+ 	/* only so many hash values supported */
+ 	entries = min(entries, IXGBE_MAX_VF_MC_ENTRIES);
+@@ -356,10 +357,13 @@ static int ixgbe_set_vf_multicasts(struct ixgbe_adapter *adapter,
+ 		mta_reg |= (1 << vector_bit);
+ 		IXGBE_WRITE_REG(hw, IXGBE_MTA(vector_reg), mta_reg);
+ 	}
++	vmolr |= IXGBE_VMOLR_ROMPE;
++	IXGBE_WRITE_REG(hw, IXGBE_VMOLR(vf), vmolr);
+ 
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PCI_IOV
+ static void ixgbe_restore_vf_macvlans(struct ixgbe_adapter *adapter)
+ {
+ 	struct ixgbe_hw *hw = &adapter->hw;
+@@ -385,6 +389,7 @@ void ixgbe_restore_vf_multicasts(struct ixgbe_adapter *adapter)
+ 	u32 mta_reg;
+ 
+ 	for (i = 0; i < adapter->num_vfs; i++) {
++		u32 vmolr = IXGBE_READ_REG(hw, IXGBE_VMOLR(i));
+ 		vfinfo = &adapter->vfinfo[i];
+ 		for (j = 0; j < vfinfo->num_vf_mc_hashes; j++) {
+ 			hw->addr_ctrl.mta_in_use++;
+@@ -394,11 +399,18 @@ void ixgbe_restore_vf_multicasts(struct ixgbe_adapter *adapter)
+ 			mta_reg |= (1 << vector_bit);
+ 			IXGBE_WRITE_REG(hw, IXGBE_MTA(vector_reg), mta_reg);
+ 		}
++
++		if (vfinfo->num_vf_mc_hashes)
++			vmolr |= IXGBE_VMOLR_ROMPE;
++		else
++			vmolr &= ~IXGBE_VMOLR_ROMPE;
++		IXGBE_WRITE_REG(hw, IXGBE_VMOLR(i), vmolr);
+ 	}
+ 
+ 	/* Restore any VF macvlans */
+ 	ixgbe_restore_vf_macvlans(adapter);
+ }
++#endif
+ 
+ static int ixgbe_set_vf_vlan(struct ixgbe_adapter *adapter, int add, int vid,
+ 			     u32 vf)
+@@ -498,8 +510,7 @@ static s32 ixgbe_set_vf_lpe(struct ixgbe_adapter *adapter, u32 *msgbuf, u32 vf)
+ static void ixgbe_set_vmolr(struct ixgbe_hw *hw, u32 vf, bool aupe)
+ {
+ 	u32 vmolr = IXGBE_READ_REG(hw, IXGBE_VMOLR(vf));
+-	vmolr |= (IXGBE_VMOLR_ROMPE |
+-		  IXGBE_VMOLR_BAM);
++	vmolr |= IXGBE_VMOLR_BAM;
+ 	if (aupe)
+ 		vmolr |= IXGBE_VMOLR_AUPE;
+ 	else
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
+index 139eaddfb2ed..cea640147604 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
+@@ -34,7 +34,9 @@
+  */
+ #define IXGBE_MAX_VFS_DRV_LIMIT  (IXGBE_MAX_VF_FUNCTIONS - 1)
+ 
++#ifdef CONFIG_PCI_IOV
+ void ixgbe_restore_vf_multicasts(struct ixgbe_adapter *adapter);
++#endif
+ void ixgbe_msg_task(struct ixgbe_adapter *adapter);
+ int ixgbe_vf_configuration(struct pci_dev *pdev, unsigned int event_mask);
+ void ixgbe_disable_tx_rx(struct ixgbe_adapter *adapter);
