@@ -1,0 +1,350 @@
+ipv6: datagram: Update dst cache of a connected datagram sk during pmtu update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 33c162a980fe03498fcecb917f618ad7e7c55e61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/33c162a9.failed
+
+There is a case in connected UDP socket such that
+getsockopt(IPV6_MTU) will return a stale MTU value. The reproducible
+sequence could be the following:
+1. Create a connected UDP socket
+2. Send some datagrams out
+3. Receive a ICMPV6_PKT_TOOBIG
+4. No new outgoing datagrams to trigger the sk_dst_check()
+   logic to update the sk->sk_dst_cache.
+5. getsockopt(IPV6_MTU) returns the mtu from the invalid
+   sk->sk_dst_cache instead of the newly created RTF_CACHE clone.
+
+This patch updates the sk->sk_dst_cache for a connected datagram sk
+during pmtu-update code path.
+
+Note that the sk->sk_v6_daddr is used to do the route lookup
+instead of skb->data (i.e. iph).  It is because a UDP socket can become
+connected after sending out some datagrams in un-connected state.  or
+It can be connected multiple times to different destinations.  Hence,
+iph may not be related to where sk is currently connected to.
+
+It is done under '!sock_owned_by_user(sk)' condition because
+the user may make another ip6_datagram_connect()  (i.e changing
+the sk->sk_v6_daddr) while dst lookup is happening in the pmtu-update
+code path.
+
+For the sock_owned_by_user(sk) == true case, the next patch will
+introduce a release_cb() which will update the sk->sk_dst_cache.
+
+Test:
+
+Server (Connected UDP Socket):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Route Details:
+[root@arch-fb-vm1 ~]# ip -6 r show | egrep '2fac'
+2fac::/64 dev eth0  proto kernel  metric 256  pref medium
+2fac:face::/64 via 2fac::face dev eth0  metric 1024  pref medium
+
+A simple python code to create a connected UDP socket:
+
+import socket
+import errno
+
+HOST = '2fac::1'
+PORT = 8080
+
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind((HOST, PORT))
+s.connect(('2fac:face::face', 53))
+print("connected")
+while True:
+    try:
+	data = s.recv(1024)
+    except socket.error as se:
+	if se.errno == errno.EMSGSIZE:
+		pmtu = s.getsockopt(41, 24)
+		print("PMTU:%d" % pmtu)
+		break
+s.close()
+
+Python program output after getting a ICMPV6_PKT_TOOBIG:
+[root@arch-fb-vm1 ~]# python2 ~/devshare/kernel/tasks/fib6/udp-connect-53-8080.py
+connected
+PMTU:1300
+
+Cache routes after recieving TOOBIG:
+[root@arch-fb-vm1 ~]# ip -6 r show table cache
+2fac:face::face via 2fac::face dev eth0  metric 0
+    cache  expires 463sec mtu 1300 pref medium
+
+Client (Send the ICMPV6_PKT_TOOBIG):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+scapy is used to generate the TOOBIG message.  Here is the scapy script I have
+used:
+
+>>> p=Ether(src='da:75:4d:36:ac:32', dst='52:54:00:12:34:66', type=0x86dd)/IPv6(src='2fac::face', dst='2fac::1')/ICMPv6PacketTooBig(mtu=1300)/IPv6(src='2fac::
+1',dst='2fac:face::face', nh='UDP')/UDP(sport=8080,dport=53)
+>>> sendp(p, iface='qemubr0')
+
+Fixes: 45e4fd26683c ("ipv6: Only create RTF_CACHE routes after encountering pmtu exception")
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Reported-by: Wei Wang <weiwan@google.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Wei Wang <weiwan@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 33c162a980fe03498fcecb917f618ad7e7c55e61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ipv6.h
+#	net/ipv6/datagram.c
+diff --cc include/net/ipv6.h
+index 5dca98c3fc9f,fd02e90b1289..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -828,11 -957,14 +828,17 @@@ int compat_ipv6_getsockopt(struct sock 
+  			   char __user *optval, int __user *optlen);
+  
+  int ip6_datagram_connect(struct sock *sk, struct sockaddr *addr, int addr_len);
+++<<<<<<< HEAD
+++=======
++ int ip6_datagram_connect_v6_only(struct sock *sk, struct sockaddr *addr,
++ 				 int addr_len);
++ int ip6_datagram_dst_update(struct sock *sk, bool fix_sk_saddr);
+++>>>>>>> 33c162a980fe (ipv6: datagram: Update dst cache of a connected datagram sk during pmtu update)
+  
+  int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len,
+ -		    int *addr_len);
+ +		   int *addr_len);
+  int ipv6_recv_rxpmtu(struct sock *sk, struct msghdr *msg, int len,
+ -		     int *addr_len);
+ +		    int *addr_len);
+  void ipv6_icmp_error(struct sock *sk, struct sk_buff *skb, int err, __be16 port,
+  		     u32 info, u8 *payload);
+  void ipv6_local_error(struct sock *sk, int err, struct flowi6 *fl6, u32 info);
+diff --cc net/ipv6/datagram.c
+index 88fda1924015,59e01f27db9f..000000000000
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@@ -40,18 -40,94 +40,101 @@@ static bool ipv6_mapped_addr_any(const 
+  	return ipv6_addr_v4mapped(a) && (a->s6_addr32[3] == 0);
+  }
+  
+++<<<<<<< HEAD
+ +int ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+++=======
++ static void ip6_datagram_flow_key_init(struct flowi6 *fl6, struct sock *sk)
++ {
++ 	struct inet_sock *inet = inet_sk(sk);
++ 	struct ipv6_pinfo *np = inet6_sk(sk);
++ 
++ 	memset(fl6, 0, sizeof(*fl6));
++ 	fl6->flowi6_proto = sk->sk_protocol;
++ 	fl6->daddr = sk->sk_v6_daddr;
++ 	fl6->saddr = np->saddr;
++ 	fl6->flowi6_oif = sk->sk_bound_dev_if;
++ 	fl6->flowi6_mark = sk->sk_mark;
++ 	fl6->fl6_dport = inet->inet_dport;
++ 	fl6->fl6_sport = inet->inet_sport;
++ 	fl6->flowlabel = np->flow_label;
++ 
++ 	if (!fl6->flowi6_oif)
++ 		fl6->flowi6_oif = np->sticky_pktinfo.ipi6_ifindex;
++ 
++ 	if (!fl6->flowi6_oif && ipv6_addr_is_multicast(&fl6->daddr))
++ 		fl6->flowi6_oif = np->mcast_oif;
++ 
++ 	security_sk_classify_flow(sk, flowi6_to_flowi(fl6));
++ }
++ 
++ int ip6_datagram_dst_update(struct sock *sk, bool fix_sk_saddr)
++ {
++ 	struct ip6_flowlabel *flowlabel = NULL;
++ 	struct in6_addr *final_p, final;
++ 	struct ipv6_txoptions *opt;
++ 	struct dst_entry *dst;
++ 	struct inet_sock *inet = inet_sk(sk);
++ 	struct ipv6_pinfo *np = inet6_sk(sk);
++ 	struct flowi6 fl6;
++ 	int err = 0;
++ 
++ 	if (np->sndflow && (np->flow_label & IPV6_FLOWLABEL_MASK)) {
++ 		flowlabel = fl6_sock_lookup(sk, np->flow_label);
++ 		if (!flowlabel)
++ 			return -EINVAL;
++ 	}
++ 	ip6_datagram_flow_key_init(&fl6, sk);
++ 
++ 	rcu_read_lock();
++ 	opt = flowlabel ? flowlabel->opt : rcu_dereference(np->opt);
++ 	final_p = fl6_update_dst(&fl6, opt, &final);
++ 	rcu_read_unlock();
++ 
++ 	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
++ 	if (IS_ERR(dst)) {
++ 		err = PTR_ERR(dst);
++ 		goto out;
++ 	}
++ 
++ 	if (fix_sk_saddr) {
++ 		if (ipv6_addr_any(&np->saddr))
++ 			np->saddr = fl6.saddr;
++ 
++ 		if (ipv6_addr_any(&sk->sk_v6_rcv_saddr)) {
++ 			sk->sk_v6_rcv_saddr = fl6.saddr;
++ 			inet->inet_rcv_saddr = LOOPBACK4_IPV6;
++ 			if (sk->sk_prot->rehash)
++ 				sk->sk_prot->rehash(sk);
++ 		}
++ 	}
++ 
++ 	ip6_dst_store(sk, dst,
++ 		      ipv6_addr_equal(&fl6.daddr, &sk->sk_v6_daddr) ?
++ 		      &sk->sk_v6_daddr : NULL,
++ #ifdef CONFIG_IPV6_SUBTREES
++ 		      ipv6_addr_equal(&fl6.saddr, &np->saddr) ?
++ 		      &np->saddr :
++ #endif
++ 		      NULL);
++ 
++ out:
++ 	fl6_sock_release(flowlabel);
++ 	return err;
++ }
++ 
++ static int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+++>>>>>>> 33c162a980fe (ipv6: datagram: Update dst cache of a connected datagram sk during pmtu update)
+  {
+  	struct sockaddr_in6	*usin = (struct sockaddr_in6 *) uaddr;
+ -	struct inet_sock	*inet = inet_sk(sk);
+ -	struct ipv6_pinfo	*np = inet6_sk(sk);
+ -	struct in6_addr		*daddr;
+ +	struct inet_sock      	*inet = inet_sk(sk);
+ +	struct ipv6_pinfo      	*np = inet6_sk(sk);
+ +	struct in6_addr		*daddr, *final_p, final;
+ +	struct dst_entry	*dst;
+ +	struct flowi6		fl6;
+ +	struct ip6_flowlabel	*flowlabel = NULL;
+ +	struct ipv6_txoptions   *opt;
+  	int			addr_type;
+  	int			err;
+ -	__be32			fl6_flowlabel = 0;
+  
+  	if (usin->sin6_family == AF_INET) {
+  		if (__ipv6_only_sock(sk))
+@@@ -154,61 -223,37 +237,66 @@@ ipv4_connected
+  	 *	destination cache for it.
+  	 */
+  
+++<<<<<<< HEAD
+ +	fl6.flowi6_proto = sk->sk_protocol;
+ +	fl6.daddr = sk->sk_v6_daddr;
+ +	fl6.saddr = np->saddr;
+ +	fl6.flowi6_oif = sk->sk_bound_dev_if;
+ +	fl6.flowi6_mark = sk->sk_mark;
+ +	fl6.fl6_dport = inet->inet_dport;
+ +	fl6.fl6_sport = inet->inet_sport;
+ +
+ +	if (!fl6.flowi6_oif)
+ +		fl6.flowi6_oif = np->sticky_pktinfo.ipi6_ifindex;
+ +
+ +	if (!fl6.flowi6_oif && (addr_type&IPV6_ADDR_MULTICAST))
+ +		fl6.flowi6_oif = np->mcast_oif;
+ +
+ +	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
+ +
+ +	opt = flowlabel ? flowlabel->opt : np->opt;
+ +	final_p = fl6_update_dst(&fl6, opt, &final);
+ +
+ +	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+ +	err = 0;
+ +	if (IS_ERR(dst)) {
+ +		err = PTR_ERR(dst);
+++=======
++ 	err = ip6_datagram_dst_update(sk, true);
++ 	if (err)
+++>>>>>>> 33c162a980fe (ipv6: datagram: Update dst cache of a connected datagram sk during pmtu update)
+  		goto out;
+ +	}
+ +
+ +	/* source address lookup done in ip6_dst_lookup */
+ +
+ +	if (ipv6_addr_any(&np->saddr))
+ +		np->saddr = fl6.saddr;
+ +
+ +	if (ipv6_addr_any(&sk->sk_v6_rcv_saddr)) {
+ +		sk->sk_v6_rcv_saddr = fl6.saddr;
+ +		inet->inet_rcv_saddr = LOOPBACK4_IPV6;
+ +		if (sk->sk_prot->rehash)
+ +			sk->sk_prot->rehash(sk);
+ +	}
+ +
+ +	ip6_dst_store(sk, dst,
+ +		      ipv6_addr_equal(&fl6.daddr, &sk->sk_v6_daddr) ?
+ +		      &sk->sk_v6_daddr : NULL,
+ +#ifdef CONFIG_IPV6_SUBTREES
+ +		      ipv6_addr_equal(&fl6.saddr, &np->saddr) ?
+ +		      &np->saddr :
+ +#endif
+ +		      NULL);
+  
+  	sk->sk_state = TCP_ESTABLISHED;
+ -	sk_set_txhash(sk);
+ +	ip6_set_txhash(sk);
+  out:
+ +	fl6_sock_release(flowlabel);
+  	return err;
+  }
+ -
+ -int ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ -{
+ -	int res;
+ -
+ -	lock_sock(sk);
+ -	res = __ip6_datagram_connect(sk, uaddr, addr_len);
+ -	release_sock(sk);
+ -	return res;
+ -}
+  EXPORT_SYMBOL_GPL(ip6_datagram_connect);
+  
+ -int ip6_datagram_connect_v6_only(struct sock *sk, struct sockaddr *uaddr,
+ -				 int addr_len)
+ -{
+ -	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin6, uaddr);
+ -	if (sin6->sin6_family != AF_INET6)
+ -		return -EAFNOSUPPORT;
+ -	return ip6_datagram_connect(sk, uaddr, addr_len);
+ -}
+ -EXPORT_SYMBOL_GPL(ip6_datagram_connect_v6_only);
+ -
+  void ipv6_icmp_error(struct sock *sk, struct sk_buff *skb, int err,
+  		     __be16 port, u32 info, u8 *payload)
+  {
+* Unmerged path include/net/ipv6.h
+* Unmerged path net/ipv6/datagram.c
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index e3cf3592b9d2..493f6a6dd867 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1185,8 +1185,20 @@ EXPORT_SYMBOL_GPL(ip6_update_pmtu);
+ 
+ void ip6_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, __be32 mtu)
+ {
++	struct dst_entry *dst;
++
+ 	ip6_update_pmtu(skb, sock_net(sk), mtu,
+ 			sk->sk_bound_dev_if, sk->sk_mark);
++
++	dst = __sk_dst_get(sk);
++	if (!dst || !dst->obsolete ||
++	    dst->ops->check(dst, inet6_sk(sk)->dst_cookie))
++		return;
++
++	bh_lock_sock(sk);
++	if (!sock_owned_by_user(sk) && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
++		ip6_datagram_dst_update(sk, false);
++	bh_unlock_sock(sk);
+ }
+ EXPORT_SYMBOL_GPL(ip6_sk_update_pmtu);
+ 
