@@ -1,0 +1,193 @@
+net: Add GRO support for vxlan traffic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [net] vxlan: Add GRO support for vxlan traffic (Thomas Graf) [1051111]
+Rebuild_FUZZ: 92.31%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit dc01e7d3447793fd9e4090aa9d50c549848b5a18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/dc01e7d3.failed
+
+Add GRO handlers for vxlann, by using the UDP GRO infrastructure.
+
+For single TCP session that goes through vxlan tunneling I got nice
+improvement from 6.8Gbs to 11.5Gbs
+
+--> UDP/VXLAN GRO disabled
+$ netperf  -H 192.168.52.147 -c -C
+
+$ netperf -t TCP_STREAM -H 192.168.52.147 -c -C
+MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.52.147 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+ 87380  65536  65536    10.00      6799.75   12.54    24.79    0.604   1.195
+
+--> UDP/VXLAN GRO enabled
+
+$ netperf -t TCP_STREAM -H 192.168.52.147 -c -C
+MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.52.147 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+ 87380  65536  65536    10.00      11562.72   24.90    20.34    0.706   0.577
+
+	Signed-off-by: Shlomo Pongratz <shlomop@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dc01e7d3447793fd9e4090aa9d50c549848b5a18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 289b0b02e612,942acc20d394..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -554,13 -555,106 +555,110 @@@ static int vxlan_fdb_append(struct vxla
+  	return 1;
+  }
+  
++ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head, struct sk_buff *skb)
++ {
++ 	struct sk_buff *p, **pp = NULL;
++ 	struct vxlanhdr *vh, *vh2;
++ 	struct ethhdr *eh, *eh2;
++ 	unsigned int hlen, off_vx, off_eth;
++ 	const struct packet_offload *ptype;
++ 	__be16 type;
++ 	int flush = 1;
++ 
++ 	off_vx = skb_gro_offset(skb);
++ 	hlen = off_vx + sizeof(*vh);
++ 	vh   = skb_gro_header_fast(skb, off_vx);
++ 	if (skb_gro_header_hard(skb, hlen)) {
++ 		vh = skb_gro_header_slow(skb, hlen, off_vx);
++ 		if (unlikely(!vh))
++ 			goto out;
++ 	}
++ 	skb_gro_pull(skb, sizeof(struct vxlanhdr)); /* pull vxlan header */
++ 
++ 	off_eth = skb_gro_offset(skb);
++ 	hlen = off_eth + sizeof(*eh);
++ 	eh   = skb_gro_header_fast(skb, off_eth);
++ 	if (skb_gro_header_hard(skb, hlen)) {
++ 		eh = skb_gro_header_slow(skb, hlen, off_eth);
++ 		if (unlikely(!eh))
++ 			goto out;
++ 	}
++ 
++ 	flush = 0;
++ 
++ 	for (p = *head; p; p = p->next) {
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		vh2 = (struct vxlanhdr *)(p->data + off_vx);
++ 		eh2 = (struct ethhdr   *)(p->data + off_eth);
++ 		if (vh->vx_vni != vh2->vx_vni || compare_ether_header(eh, eh2)) {
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 			continue;
++ 		}
++ 		goto found;
++ 	}
++ 
++ found:
++ 	type = eh->h_proto;
++ 
++ 	rcu_read_lock();
++ 	ptype = gro_find_receive_by_type(type);
++ 	if (ptype == NULL) {
++ 		flush = 1;
++ 		goto out_unlock;
++ 	}
++ 
++ 	skb_gro_pull(skb, sizeof(*eh)); /* pull inner eth header */
++ 	pp = ptype->callbacks.gro_receive(head, skb);
++ 
++ out_unlock:
++ 	rcu_read_unlock();
++ out:
++ 	NAPI_GRO_CB(skb)->flush |= flush;
++ 
++ 	return pp;
++ }
++ 
++ static int vxlan_gro_complete(struct sk_buff *skb, int nhoff)
++ {
++ 	struct ethhdr *eh;
++ 	struct packet_offload *ptype;
++ 	__be16 type;
++ 	int vxlan_len  = sizeof(struct vxlanhdr) + sizeof(struct ethhdr);
++ 	int err = -ENOSYS;
++ 
++ 	eh = (struct ethhdr *)(skb->data + nhoff + sizeof(struct vxlanhdr));
++ 	type = eh->h_proto;
++ 
++ 	rcu_read_lock();
++ 	ptype = gro_find_complete_by_type(type);
++ 	if (ptype != NULL)
++ 		err = ptype->callbacks.gro_complete(skb, nhoff + vxlan_len);
++ 
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
+  /* Notify netdevs that UDP port started listening */
+- static void vxlan_notify_add_rx_port(struct sock *sk)
++ static void vxlan_notify_add_rx_port(struct vxlan_sock *vs)
+  {
+  	struct net_device *dev;
++ 	struct sock *sk = vs->sock->sk;
+  	struct net *net = sock_net(sk);
+  	sa_family_t sa_family = sk->sk_family;
+++<<<<<<< HEAD
+ +	u16 port = htons(inet_sk(sk)->inet_sport);
+++=======
++ 	__be16 port = inet_sk(sk)->inet_sport;
++ 	int err;
++ 
++ 	if (sa_family == AF_INET) {
++ 		err = udp_add_offload(&vs->udp_offloads);
++ 		if (err)
++ 			pr_warn("vxlan: udp_add_offload failed with status %d\n", err);
++ 	}
+++>>>>>>> dc01e7d34477 (net: Add GRO support for vxlan traffic)
+  
+  	rcu_read_lock();
+  	for_each_netdev_rcu(net, dev) {
+@@@ -572,12 -666,13 +670,13 @@@
+  }
+  
+  /* Notify netdevs that UDP port is no more listening */
+- static void vxlan_notify_del_rx_port(struct sock *sk)
++ static void vxlan_notify_del_rx_port(struct vxlan_sock *vs)
+  {
+  	struct net_device *dev;
++ 	struct sock *sk = vs->sock->sk;
+  	struct net *net = sock_net(sk);
+  	sa_family_t sa_family = sk->sk_family;
+ -	__be16 port = inet_sk(sk)->inet_sport;
+ +	u16 port = htons(inet_sk(sk)->inet_sport);
+  
+  	rcu_read_lock();
+  	for_each_netdev_rcu(net, dev) {
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index 88d137619a5c..cecfc024952f 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -21,6 +21,7 @@ struct vxlan_sock {
+ 	struct rcu_head	  rcu;
+ 	struct hlist_head vni_list[VNI_HASH_SIZE];
+ 	atomic_t	  refcnt;
++	struct udp_offload udp_offloads;
+ };
+ 
+ struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
