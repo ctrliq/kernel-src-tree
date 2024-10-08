@@ -1,0 +1,432 @@
+IB/core: Use GID table in AH creation and dmac resolution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matan Barak <matanb@mellanox.com>
+commit dbf727de7440f73c4b92be4b958cbc24977e8ca2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dbf727de.failed
+
+Previously, vlan id and source MAC were used from QP attributes. Since
+the net device is now stored in the GID attributes, they could be used
+instead of getting this information from the QP attributes.
+
+IB_QP_SMAC, IB_QP_ALT_SMAC, IB_QP_VID and IB_QP_ALT_VID were removed
+because there is no known libibverbs that uses them.
+
+This commit also modifies the vendors (mlx4, ocrdma) drivers in order
+to use the new approach.
+
+ocrdma driver changes were done by Somnath Kotur <Somnath.Kotur@Avagotech.Com>
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit dbf727de7440f73c4b92be4b958cbc24977e8ca2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/hw/mlx4/qp.c
+#	drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --cc drivers/infiniband/core/verbs.c
+index e1f2c9887f3f,46d97f09fbae..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -344,10 -385,13 +385,20 @@@ int ib_init_ah_from_wc(struct ib_devic
+  		ah_attr->ah_flags = IB_AH_GRH;
+  		ah_attr->grh.dgid = grh->sgid;
+  
+++<<<<<<< HEAD
+ +		ret = ib_find_cached_gid(device, &grh->dgid, &port_num,
+ +					 &gid_index);
+ +		if (ret)
+ +			return ret;
+++=======
++ 		if (!rdma_cap_eth_ah(device, port_num)) {
++ 			ret = ib_find_cached_gid_by_port(device, &grh->dgid,
++ 							 port_num, NULL,
++ 							 &gid_index);
++ 			if (ret)
++ 				return ret;
++ 		}
+++>>>>>>> dbf727de7440 (IB/core: Use GID table in AH creation and dmac resolution)
+  
+  		ah_attr->grh.sgid_index = (u8) gid_index;
+  		flow_class = be32_to_cpu(grh->version_tclass_flow);
+@@@ -979,35 -994,47 +1001,56 @@@ int ib_modify_qp_is_ok(enum ib_qp_stat
+  }
+  EXPORT_SYMBOL(ib_modify_qp_is_ok);
+  
+- int ib_resolve_eth_l2_attrs(struct ib_qp *qp,
+- 			    struct ib_qp_attr *qp_attr, int *qp_attr_mask)
++ int ib_resolve_eth_dmac(struct ib_qp *qp,
++ 			struct ib_qp_attr *qp_attr, int *qp_attr_mask)
+  {
+  	int           ret = 0;
+- 	union ib_gid  sgid;
+  
+++<<<<<<< HEAD
+ +	if ((*qp_attr_mask & IB_QP_AV)  &&
+ +	    (rdma_cap_eth_ah(qp->device, qp_attr->ah_attr.port_num))) {
+ +		ret = ib_query_gid(qp->device, qp_attr->ah_attr.port_num,
+ +				   qp_attr->ah_attr.grh.sgid_index, &sgid);
+ +		if (ret)
+ +			goto out;
+++=======
++ 	if (*qp_attr_mask & IB_QP_AV) {
++ 		if (qp_attr->ah_attr.port_num < rdma_start_port(qp->device) ||
++ 		    qp_attr->ah_attr.port_num > rdma_end_port(qp->device))
++ 			return -EINVAL;
++ 
++ 		if (!rdma_cap_eth_ah(qp->device, qp_attr->ah_attr.port_num))
++ 			return 0;
++ 
+++>>>>>>> dbf727de7440 (IB/core: Use GID table in AH creation and dmac resolution)
+  		if (rdma_link_local_addr((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw)) {
+- 			rdma_get_ll_mac((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw, qp_attr->ah_attr.dmac);
+- 			rdma_get_ll_mac((struct in6_addr *)sgid.raw, qp_attr->smac);
+- 			if (!(*qp_attr_mask & IB_QP_VID))
+- 				qp_attr->vlan_id = rdma_get_vlan_id(&sgid);
++ 			rdma_get_ll_mac((struct in6_addr *)qp_attr->ah_attr.grh.dgid.raw,
++ 					qp_attr->ah_attr.dmac);
+  		} else {
+- 			ret = rdma_addr_find_dmac_by_grh(&sgid, &qp_attr->ah_attr.grh.dgid,
+- 					qp_attr->ah_attr.dmac, &qp_attr->vlan_id);
+- 			if (ret)
+- 				goto out;
+- 			ret = rdma_addr_find_smac_by_sgid(&sgid, qp_attr->smac, NULL);
+- 			if (ret)
++ 			union ib_gid		sgid;
++ 			struct ib_gid_attr	sgid_attr;
++ 			int			ifindex;
++ 
++ 			ret = ib_query_gid(qp->device,
++ 					   qp_attr->ah_attr.port_num,
++ 					   qp_attr->ah_attr.grh.sgid_index,
++ 					   &sgid, &sgid_attr);
++ 
++ 			if (ret || !sgid_attr.ndev) {
++ 				if (!ret)
++ 					ret = -ENXIO;
+  				goto out;
++ 			}
++ 
++ 			ifindex = sgid_attr.ndev->ifindex;
++ 
++ 			ret = rdma_addr_find_dmac_by_grh(&sgid,
++ 							 &qp_attr->ah_attr.grh.dgid,
++ 							 qp_attr->ah_attr.dmac,
++ 							 NULL, ifindex);
++ 
++ 			dev_put(sgid_attr.ndev);
+  		}
+- 		*qp_attr_mask |= IB_QP_SMAC;
+- 		if (qp_attr->vlan_id < 0xFFFF)
+- 			*qp_attr_mask |= IB_QP_VID;
+  	}
+  out:
+  	return ret;
+diff --cc drivers/infiniband/hw/mlx4/qp.c
+index c12d726340f5,42a051b088e4..000000000000
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@@ -2265,7 -2294,10 +2290,14 @@@ static int build_mlx_header(struct mlx4
+  		} else  {
+  			err = ib_get_cached_gid(ib_dev,
+  						be32_to_cpu(ah->av.ib.port_pd) >> 24,
+++<<<<<<< HEAD
+ +						ah->av.ib.gid_index, &sgid);
+++=======
++ 						ah->av.ib.gid_index, &sgid,
++ 						NULL);
++ 			if (!err && !memcmp(&sgid, &zgid, sizeof(sgid)))
++ 				err = -ENOENT;
+++>>>>>>> dbf727de7440 (IB/core: Use GID table in AH creation and dmac resolution)
+  			if (err)
+  				return err;
+  		}
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+index 6836aea6a876,9820074be59d..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+@@@ -135,21 -136,28 +136,32 @@@ struct ib_ah *ocrdma_create_ah(struct i
+  	if (status)
+  		goto av_err;
+  
+- 	status = ocrdma_query_gid(&dev->ibdev, 1, attr->grh.sgid_index, &sgid);
++ 	status = ib_get_cached_gid(&dev->ibdev, 1, attr->grh.sgid_index, &sgid,
++ 				   &sgid_attr);
+  	if (status) {
+  		pr_err("%s(): Failed to query sgid, status = %d\n",
+ -		      __func__, status);
+ +		       __func__, status);
+  		goto av_conf_err;
+  	}
++ 	if (sgid_attr.ndev) {
++ 		if (is_vlan_dev(sgid_attr.ndev))
++ 			vlan_tag = vlan_dev_vlan_id(sgid_attr.ndev);
++ 		dev_put(sgid_attr.ndev);
++ 	}
+  
+  	if ((pd->uctx) &&
+  	    (!rdma_is_multicast_addr((struct in6_addr *)attr->grh.dgid.raw)) &&
+  	    (!rdma_link_local_addr((struct in6_addr *)attr->grh.dgid.raw))) {
+  		status = rdma_addr_find_dmac_by_grh(&sgid, &attr->grh.dgid,
+++<<<<<<< HEAD
+ +						    attr->dmac, &attr->vlan_id);
+++=======
++ 						    attr->dmac, &vlan_tag,
++ 						    sgid_attr.ndev->ifindex);
+++>>>>>>> dbf727de7440 (IB/core: Use GID table in AH creation and dmac resolution)
+  		if (status) {
+ -			pr_err("%s(): Failed to resolve dmac from gid." 
+ -				"status = %d\n", __func__, status);
+ +			pr_err("%s(): Failed to resolve dmac from gid. status = %d\n",
+ +			       __func__, status);
+  			goto av_conf_err;
+  		}
+  	}
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index 746cdf56bc76..d3c42b3c1b51 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -458,7 +458,7 @@ static void resolve_cb(int status, struct sockaddr *src_addr,
+ }
+ 
+ int rdma_addr_find_dmac_by_grh(const union ib_gid *sgid, const union ib_gid *dgid,
+-			       u8 *dmac, u16 *vlan_id)
++			       u8 *dmac, u16 *vlan_id, int if_index)
+ {
+ 	int ret = 0;
+ 	struct rdma_dev_addr dev_addr;
+@@ -476,6 +476,7 @@ int rdma_addr_find_dmac_by_grh(const union ib_gid *sgid, const union ib_gid *dgi
+ 	rdma_gid2ip(&dgid_addr._sockaddr, dgid);
+ 
+ 	memset(&dev_addr, 0, sizeof(dev_addr));
++	dev_addr.bound_dev_if = if_index;
+ 
+ 	ctx.addr = &dev_addr;
+ 	init_completion(&ctx.comp);
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 70bb36ebb03b..76a7ede1b206 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -46,8 +46,8 @@ void ib_device_unregister_sysfs(struct ib_device *device);
+ void ib_cache_setup(void);
+ void ib_cache_cleanup(void);
+ 
+-int ib_resolve_eth_l2_attrs(struct ib_qp *qp,
+-			    struct ib_qp_attr *qp_attr, int *qp_attr_mask);
++int ib_resolve_eth_dmac(struct ib_qp *qp,
++			struct ib_qp_attr *qp_attr, int *qp_attr_mask);
+ 
+ typedef void (*roce_netdev_callback)(struct ib_device *device, u8 port,
+ 	      struct net_device *idev, void *cookie);
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index ece9f4c5e4a4..74dbfd782e19 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -2345,7 +2345,7 @@ ssize_t ib_uverbs_modify_qp(struct ib_uverbs_file *file,
+ 	attr->alt_ah_attr.port_num 	    = cmd.alt_dest.port_num;
+ 
+ 	if (qp->real_qp == qp) {
+-		ret = ib_resolve_eth_l2_attrs(qp, attr, &cmd.attr_mask);
++		ret = ib_resolve_eth_dmac(qp, attr, &cmd.attr_mask);
+ 		if (ret)
+ 			goto release_qp;
+ 		ret = qp->device->modify_qp(qp, attr,
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/drivers/infiniband/hw/mlx4/ah.c b/drivers/infiniband/hw/mlx4/ah.c
+index 33fdd50123f7..e74f0c27b4c9 100644
+--- a/drivers/infiniband/hw/mlx4/ah.c
++++ b/drivers/infiniband/hw/mlx4/ah.c
+@@ -76,7 +76,10 @@ static struct ib_ah *create_iboe_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr
+ 	struct mlx4_dev *dev = ibdev->dev;
+ 	int is_mcast = 0;
+ 	struct in6_addr in6;
+-	u16 vlan_tag;
++	u16 vlan_tag = 0xffff;
++	union ib_gid sgid;
++	struct ib_gid_attr gid_attr;
++	int ret;
+ 
+ 	memcpy(&in6, ah_attr->grh.dgid.raw, sizeof(in6));
+ 	if (rdma_is_multicast_addr(&in6)) {
+@@ -85,7 +88,17 @@ static struct ib_ah *create_iboe_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr
+ 	} else {
+ 		memcpy(ah->av.eth.mac, ah_attr->dmac, ETH_ALEN);
+ 	}
+-	vlan_tag = ah_attr->vlan_id;
++	ret = ib_get_cached_gid(pd->device, ah_attr->port_num,
++				ah_attr->grh.sgid_index, &sgid, &gid_attr);
++	if (ret)
++		return ERR_PTR(ret);
++	memset(ah->av.eth.s_mac, 0, ETH_ALEN);
++	if (gid_attr.ndev) {
++		if (is_vlan_dev(gid_attr.ndev))
++			vlan_tag = vlan_dev_vlan_id(gid_attr.ndev);
++		memcpy(ah->av.eth.s_mac, gid_attr.ndev->dev_addr, ETH_ALEN);
++		dev_put(gid_attr.ndev);
++	}
+ 	if (vlan_tag < 0x1000)
+ 		vlan_tag |= (ah_attr->sl & 7) << 13;
+ 	ah->av.eth.port_pd = cpu_to_be32(to_mpd(pd)->pdn | (ah_attr->port_num << 24));
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 68f256716785..67c7120f0d52 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -1183,7 +1183,7 @@ static int is_proxy_qp0(struct mlx4_ib_dev *dev, int qpn, int slave)
+ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 			 enum ib_qp_type dest_qpt, u16 pkey_index,
+ 			 u32 remote_qpn, u32 qkey, struct ib_ah_attr *attr,
+-			 u8 *s_mac, struct ib_mad *mad)
++			 u8 *s_mac, u16 vlan_id, struct ib_mad *mad)
+ {
+ 	struct ib_sge list;
+ 	struct ib_send_wr wr, *bad_wr;
+@@ -1270,6 +1270,9 @@ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 	wr.send_flags = IB_SEND_SIGNALED;
+ 	if (s_mac)
+ 		memcpy(to_mah(ah)->av.eth.s_mac, s_mac, 6);
++	if (vlan_id < 0x1000)
++		vlan_id |= (attr->sl & 7) << 13;
++	to_mah(ah)->av.eth.vlan = cpu_to_be16(vlan_id);
+ 
+ 
+ 	ret = ib_post_send(send_qp, &wr, &bad_wr);
+@@ -1306,6 +1309,7 @@ static void mlx4_ib_multiplex_mad(struct mlx4_ib_demux_pv_ctx *ctx, struct ib_wc
+ 	u8 *slave_id;
+ 	int slave;
+ 	int port;
++	u16 vlan_id;
+ 
+ 	/* Get slave that sent this packet */
+ 	if (wc->src_qp < dev->dev->phys_caps.base_proxy_sqpn ||
+@@ -1394,10 +1398,10 @@ static void mlx4_ib_multiplex_mad(struct mlx4_ib_demux_pv_ctx *ctx, struct ib_wc
+ 		fill_in_real_sgid_index(dev, slave, ctx->port, &ah_attr);
+ 
+ 	memcpy(ah_attr.dmac, tunnel->hdr.mac, 6);
+-	ah_attr.vlan_id = be16_to_cpu(tunnel->hdr.vlan);
++	vlan_id = be16_to_cpu(tunnel->hdr.vlan);
+ 	/* if slave have default vlan use it */
+ 	mlx4_get_slave_default_vlan(dev->dev, ctx->port, slave,
+-				    &ah_attr.vlan_id, &ah_attr.sl);
++				    &vlan_id, &ah_attr.sl);
+ 
+ 	mlx4_ib_send_to_wire(dev, slave, ctx->port,
+ 			     is_proxy_qp0(dev, wc->src_qp, slave) ?
+@@ -1405,7 +1409,7 @@ static void mlx4_ib_multiplex_mad(struct mlx4_ib_demux_pv_ctx *ctx, struct ib_wc
+ 			     be16_to_cpu(tunnel->hdr.pkey_index),
+ 			     be32_to_cpu(tunnel->hdr.remote_qpn),
+ 			     be32_to_cpu(tunnel->hdr.qkey),
+-			     &ah_attr, wc->smac, &tunnel->mad);
++			     &ah_attr, wc->smac, vlan_id, &tunnel->mad);
+ }
+ 
+ static int mlx4_ib_alloc_pv_bufs(struct mlx4_ib_demux_pv_ctx *ctx,
+diff --git a/drivers/infiniband/hw/mlx4/mcg.c b/drivers/infiniband/hw/mlx4/mcg.c
+index 2d5bccd71fc6..99451d887266 100644
+--- a/drivers/infiniband/hw/mlx4/mcg.c
++++ b/drivers/infiniband/hw/mlx4/mcg.c
+@@ -222,7 +222,7 @@ static int send_mad_to_wire(struct mlx4_ib_demux_ctx *ctx, struct ib_mad *mad)
+ 	spin_unlock_irqrestore(&dev->sm_lock, flags);
+ 	return mlx4_ib_send_to_wire(dev, mlx4_master_func_num(dev->dev),
+ 				    ctx->port, IB_QPT_GSI, 0, 1, IB_QP1_QKEY,
+-				    &ah_attr, NULL, mad);
++				    &ah_attr, NULL, 0xffff, mad);
+ }
+ 
+ static int send_mad_to_slave(int slave, struct mlx4_ib_demux_ctx *ctx,
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 8009e0b53f2d..33121fed1c31 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -825,7 +825,7 @@ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 			 enum ib_qp_type dest_qpt, u16 pkey_index, u32 remote_qpn,
+ 			 u32 qkey, struct ib_ah_attr *attr, u8 *s_mac,
+-			 struct ib_mad *mad);
++			 u16 vlan_id, struct ib_mad *mad);
+ 
+ __be64 mlx4_ib_get_new_demux_tid(struct mlx4_ib_demux_ctx *ctx);
+ 
+* Unmerged path drivers/infiniband/hw/mlx4/qp.c
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+index 9d9914299866..30f67bebffa3 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+@@ -47,6 +47,7 @@
+ 
+ #include <rdma/ib_verbs.h>
+ #include <rdma/ib_user_verbs.h>
++#include <rdma/ib_cache.h>
+ 
+ #include "ocrdma.h"
+ #include "ocrdma_hw.h"
+@@ -2470,6 +2471,7 @@ static int ocrdma_set_av_params(struct ocrdma_qp *qp,
+ 	int status;
+ 	struct ib_ah_attr *ah_attr = &attrs->ah_attr;
+ 	union ib_gid sgid, zgid;
++	struct ib_gid_attr sgid_attr;
+ 	u32 vlan_id = 0xFFFF;
+ 	u8 mac_addr[6];
+ 	struct ocrdma_dev *dev = get_ocrdma_dev(qp->ibqp.device);
+@@ -2488,10 +2490,14 @@ static int ocrdma_set_av_params(struct ocrdma_qp *qp,
+ 	cmd->flags |= OCRDMA_QP_PARA_FLOW_LBL_VALID;
+ 	memcpy(&cmd->params.dgid[0], &ah_attr->grh.dgid.raw[0],
+ 	       sizeof(cmd->params.dgid));
+-	status = ocrdma_query_gid(&dev->ibdev, 1,
+-			ah_attr->grh.sgid_index, &sgid);
+-	if (status)
+-		return status;
++
++	status = ib_get_cached_gid(&dev->ibdev, 1, ah_attr->grh.sgid_index,
++				   &sgid, &sgid_attr);
++	if (!status && sgid_attr.ndev) {
++		vlan_id = rdma_vlan_dev_vlan_id(sgid_attr.ndev);
++		memcpy(mac_addr, sgid_attr.ndev->dev_addr, ETH_ALEN);
++		dev_put(sgid_attr.ndev);
++	}
+ 
+ 	memset(&zgid, 0, sizeof(zgid));
+ 	if (!memcmp(&sgid, &zgid, sizeof(zgid)))
+@@ -2508,17 +2514,15 @@ static int ocrdma_set_av_params(struct ocrdma_qp *qp,
+ 	ocrdma_cpu_to_le32(&cmd->params.dgid[0], sizeof(cmd->params.dgid));
+ 	ocrdma_cpu_to_le32(&cmd->params.sgid[0], sizeof(cmd->params.sgid));
+ 	cmd->params.vlan_dmac_b4_to_b5 = mac_addr[4] | (mac_addr[5] << 8);
+-	if (attr_mask & IB_QP_VID) {
+-		vlan_id = attrs->vlan_id;
+-	} else if (dev->pfc_state) {
+-		vlan_id = 0;
+-		pr_err("ocrdma%d:Using VLAN with PFC is recommended\n",
+-			dev->id);
+-		pr_err("ocrdma%d:Using VLAN 0 for this connection\n",
+-			dev->id);
+-	}
+ 
+ 	if (vlan_id < 0x1000) {
++		if (dev->pfc_state) {
++			vlan_id = 0;
++			pr_err("ocrdma%d:Using VLAN with PFC is recommended\n",
++			       dev->id);
++			pr_err("ocrdma%d:Using VLAN 0 for this connection\n",
++			       dev->id);
++		}
+ 		cmd->params.vlan_dmac_b4_to_b5 |=
+ 		    vlan_id << OCRDMA_QP_PARAMS_VLAN_SHIFT;
+ 		cmd->flags |= OCRDMA_QP_PARA_VLAN_EN_VALID;
+diff --git a/include/rdma/ib_addr.h b/include/rdma/ib_addr.h
+index fde33ac6b58a..17e4a8bdecab 100644
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@ -112,7 +112,7 @@ int rdma_addr_size(struct sockaddr *addr);
+ 
+ int rdma_addr_find_smac_by_sgid(union ib_gid *sgid, u8 *smac, u16 *vlan_id);
+ int rdma_addr_find_dmac_by_grh(const union ib_gid *sgid, const union ib_gid *dgid,
+-			       u8 *smac, u16 *vlan_id);
++			       u8 *smac, u16 *vlan_id, int if_index);
+ 
+ static inline u16 ib_addr_get_pkey(struct rdma_dev_addr *dev_addr)
+ {
