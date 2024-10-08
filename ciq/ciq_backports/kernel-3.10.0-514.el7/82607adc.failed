@@ -1,0 +1,1573 @@
+workqueue: implement lockup detector
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 82607adcf9cdf40fb7b5331269780c8f70ec6e35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/82607adc.failed
+
+Workqueue stalls can happen from a variety of usage bugs such as
+missing WQ_MEM_RECLAIM flag or concurrency managed work item
+indefinitely staying RUNNING.  These stalls can be extremely difficult
+to hunt down because the usual warning mechanisms can't detect
+workqueue stalls and the internal state is pretty opaque.
+
+To alleviate the situation, this patch implements workqueue lockup
+detector.  It periodically monitors all worker_pools periodically and,
+if any pool failed to make forward progress longer than the threshold
+duration, triggers warning and dumps workqueue state as follows.
+
+ BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=0 stuck for 31s!
+ Showing busy workqueues and worker pools:
+ workqueue events: flags=0x0
+   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=17/256
+     pending: monkey_wrench_fn, e1000_watchdog, cache_reap, vmstat_shepherd, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, release_one_tty, cgroup_release_agent
+ workqueue events_power_efficient: flags=0x80
+   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=2/256
+     pending: check_lifetime, neigh_periodic_work
+ workqueue cgroup_pidlist_destroy: flags=0x0
+   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/1
+     pending: cgroup_pidlist_destroy_work_fn
+ ...
+
+The detection mechanism is controller through kernel parameter
+workqueue.watchdog_thresh and can be updated at runtime through the
+sysfs module parameter file.
+
+v2: Decoupled from softlockup control knobs.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Don Zickus <dzickus@redhat.com>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Chris Mason <clm@fb.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 82607adcf9cdf40fb7b5331269780c8f70ec6e35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/watchdog.c
+#	kernel/workqueue.c
+#	lib/Kconfig.debug
+diff --cc kernel/watchdog.c
+index edde5b1f4a45,b04f680c4735..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -19,6 -19,8 +19,11 @@@
+  #include <linux/sysctl.h>
+  #include <linux/smpboot.h>
+  #include <linux/sched/rt.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/tick.h>
++ #include <linux/workqueue.h>
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
+  
+  #include <asm/irq_regs.h>
+  #include <linux/kvm_para.h>
+@@@ -203,9 -226,27 +208,14 @@@ static void __touch_watchdog(void
+  	__this_cpu_write(watchdog_touch_ts, get_timestamp());
+  }
+  
+ -/**
+ - * touch_softlockup_watchdog_sched - touch watchdog on scheduler stalls
+ - *
+ - * Call when the scheduler may have stalled for legitimate reasons
+ - * preventing the watchdog task from executing - e.g. the scheduler
+ - * entering idle state.  This should only be used for scheduler events.
+ - * Use touch_softlockup_watchdog() for everything else.
+ - */
+ -void touch_softlockup_watchdog_sched(void)
+ -{
+ -	/*
+ -	 * Preemption can be enabled.  It doesn't matter which CPU's timestamp
+ -	 * gets zeroed here, so use the raw_ operation.
+ -	 */
+ -	raw_cpu_write(watchdog_touch_ts, 0);
+ -}
+ -
+  void touch_softlockup_watchdog(void)
+  {
+++<<<<<<< HEAD
+ +	__this_cpu_write(watchdog_touch_ts, 0);
+++=======
++ 	touch_softlockup_watchdog_sched();
++ 	wq_watchdog_touch(raw_smp_processor_id());
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
+  }
+  EXPORT_SYMBOL(touch_softlockup_watchdog);
+  
+@@@ -218,8 -259,9 +228,9 @@@ void touch_all_softlockup_watchdogs(voi
+  	 * do we care if a 0 races with a timestamp?
+  	 * all it means is the softlock check starts one cycle later
+  	 */
+ -	for_each_watchdog_cpu(cpu)
+ +	for_each_online_cpu(cpu)
+  		per_cpu(watchdog_touch_ts, cpu) = 0;
++ 	wq_watchdog_touch(-1);
+  }
+  
+  #ifdef CONFIG_HARDLOCKUP_DETECTOR
+diff --cc kernel/workqueue.c
+index 6a82d6d2e28d,1ecb588aae07..000000000000
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@@ -2407,15 -2264,44 +2416,26 @@@ repeat
+  		 * Slurp in all works issued via this workqueue and
+  		 * process'em.
+  		 */
+++<<<<<<< HEAD
+ +		WARN_ON_ONCE(!list_empty(&rescuer->scheduled));
+ +		list_for_each_entry_safe(work, n, &pool->worklist, entry)
+ +			if (get_work_pwq(work) == pwq)
+++=======
++ 		WARN_ON_ONCE(!list_empty(scheduled));
++ 		list_for_each_entry_safe(work, n, &pool->worklist, entry) {
++ 			if (get_work_pwq(work) == pwq) {
++ 				if (first)
++ 					pool->watchdog_ts = jiffies;
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
+  				move_linked_works(work, scheduled, &n);
++ 			}
++ 			first = false;
++ 		}
+  
+ -		if (!list_empty(scheduled)) {
+ -			process_scheduled_works(rescuer);
+ -
+ -			/*
+ -			 * The above execution of rescued work items could
+ -			 * have created more to rescue through
+ -			 * pwq_activate_first_delayed() or chained
+ -			 * queueing.  Let's put @pwq back on mayday list so
+ -			 * that such back-to-back work items, which may be
+ -			 * being used to relieve memory pressure, don't
+ -			 * incur MAYDAY_INTERVAL delay inbetween.
+ -			 */
+ -			if (need_to_create_worker(pool)) {
+ -				spin_lock(&wq_mayday_lock);
+ -				get_pwq(pwq);
+ -				list_move_tail(&pwq->mayday_node, &wq->maydays);
+ -				spin_unlock(&wq_mayday_lock);
+ -			}
+ -		}
+ -
+ -		/*
+ -		 * Put the reference grabbed by send_mayday().  @pool won't
+ -		 * go away while we're still attached to it.
+ -		 */
+ -		put_pwq(pwq);
+ +		process_scheduled_works(rescuer);
+  
+  		/*
+ -		 * Leave this pool.  If need_more_worker() is %true, notify a
+ +		 * Leave this pool.  If keep_working() is %true, notify a
+  		 * regular worker; otherwise, we end up with 0 concurrency
+  		 * and stalling the execution.
+  		 */
+@@@ -4659,6 -4215,168 +4680,171 @@@ void print_worker_info(const char *log_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void pr_cont_pool_info(struct worker_pool *pool)
++ {
++ 	pr_cont(" cpus=%*pbl", nr_cpumask_bits, pool->attrs->cpumask);
++ 	if (pool->node != NUMA_NO_NODE)
++ 		pr_cont(" node=%d", pool->node);
++ 	pr_cont(" flags=0x%x nice=%d", pool->flags, pool->attrs->nice);
++ }
++ 
++ static void pr_cont_work(bool comma, struct work_struct *work)
++ {
++ 	if (work->func == wq_barrier_func) {
++ 		struct wq_barrier *barr;
++ 
++ 		barr = container_of(work, struct wq_barrier, work);
++ 
++ 		pr_cont("%s BAR(%d)", comma ? "," : "",
++ 			task_pid_nr(barr->task));
++ 	} else {
++ 		pr_cont("%s %pf", comma ? "," : "", work->func);
++ 	}
++ }
++ 
++ static void show_pwq(struct pool_workqueue *pwq)
++ {
++ 	struct worker_pool *pool = pwq->pool;
++ 	struct work_struct *work;
++ 	struct worker *worker;
++ 	bool has_in_flight = false, has_pending = false;
++ 	int bkt;
++ 
++ 	pr_info("  pwq %d:", pool->id);
++ 	pr_cont_pool_info(pool);
++ 
++ 	pr_cont(" active=%d/%d%s\n", pwq->nr_active, pwq->max_active,
++ 		!list_empty(&pwq->mayday_node) ? " MAYDAY" : "");
++ 
++ 	hash_for_each(pool->busy_hash, bkt, worker, hentry) {
++ 		if (worker->current_pwq == pwq) {
++ 			has_in_flight = true;
++ 			break;
++ 		}
++ 	}
++ 	if (has_in_flight) {
++ 		bool comma = false;
++ 
++ 		pr_info("    in-flight:");
++ 		hash_for_each(pool->busy_hash, bkt, worker, hentry) {
++ 			if (worker->current_pwq != pwq)
++ 				continue;
++ 
++ 			pr_cont("%s %d%s:%pf", comma ? "," : "",
++ 				task_pid_nr(worker->task),
++ 				worker == pwq->wq->rescuer ? "(RESCUER)" : "",
++ 				worker->current_func);
++ 			list_for_each_entry(work, &worker->scheduled, entry)
++ 				pr_cont_work(false, work);
++ 			comma = true;
++ 		}
++ 		pr_cont("\n");
++ 	}
++ 
++ 	list_for_each_entry(work, &pool->worklist, entry) {
++ 		if (get_work_pwq(work) == pwq) {
++ 			has_pending = true;
++ 			break;
++ 		}
++ 	}
++ 	if (has_pending) {
++ 		bool comma = false;
++ 
++ 		pr_info("    pending:");
++ 		list_for_each_entry(work, &pool->worklist, entry) {
++ 			if (get_work_pwq(work) != pwq)
++ 				continue;
++ 
++ 			pr_cont_work(comma, work);
++ 			comma = !(*work_data_bits(work) & WORK_STRUCT_LINKED);
++ 		}
++ 		pr_cont("\n");
++ 	}
++ 
++ 	if (!list_empty(&pwq->delayed_works)) {
++ 		bool comma = false;
++ 
++ 		pr_info("    delayed:");
++ 		list_for_each_entry(work, &pwq->delayed_works, entry) {
++ 			pr_cont_work(comma, work);
++ 			comma = !(*work_data_bits(work) & WORK_STRUCT_LINKED);
++ 		}
++ 		pr_cont("\n");
++ 	}
++ }
++ 
++ /**
++  * show_workqueue_state - dump workqueue state
++  *
++  * Called from a sysrq handler and prints out all busy workqueues and
++  * pools.
++  */
++ void show_workqueue_state(void)
++ {
++ 	struct workqueue_struct *wq;
++ 	struct worker_pool *pool;
++ 	unsigned long flags;
++ 	int pi;
++ 
++ 	rcu_read_lock_sched();
++ 
++ 	pr_info("Showing busy workqueues and worker pools:\n");
++ 
++ 	list_for_each_entry_rcu(wq, &workqueues, list) {
++ 		struct pool_workqueue *pwq;
++ 		bool idle = true;
++ 
++ 		for_each_pwq(pwq, wq) {
++ 			if (pwq->nr_active || !list_empty(&pwq->delayed_works)) {
++ 				idle = false;
++ 				break;
++ 			}
++ 		}
++ 		if (idle)
++ 			continue;
++ 
++ 		pr_info("workqueue %s: flags=0x%x\n", wq->name, wq->flags);
++ 
++ 		for_each_pwq(pwq, wq) {
++ 			spin_lock_irqsave(&pwq->pool->lock, flags);
++ 			if (pwq->nr_active || !list_empty(&pwq->delayed_works))
++ 				show_pwq(pwq);
++ 			spin_unlock_irqrestore(&pwq->pool->lock, flags);
++ 		}
++ 	}
++ 
++ 	for_each_pool(pool, pi) {
++ 		struct worker *worker;
++ 		bool first = true;
++ 
++ 		spin_lock_irqsave(&pool->lock, flags);
++ 		if (pool->nr_workers == pool->nr_idle)
++ 			goto next_pool;
++ 
++ 		pr_info("pool %d:", pool->id);
++ 		pr_cont_pool_info(pool);
++ 		pr_cont(" hung=%us workers=%d",
++ 			jiffies_to_msecs(jiffies - pool->watchdog_ts) / 1000,
++ 			pool->nr_workers);
++ 		if (pool->manager)
++ 			pr_cont(" manager: %d",
++ 				task_pid_nr(pool->manager->task));
++ 		list_for_each_entry(worker, &pool->idle_list, entry) {
++ 			pr_cont(" %s%d", first ? "idle: " : "",
++ 				task_pid_nr(worker->task));
++ 			first = false;
++ 		}
++ 		pr_cont("\n");
++ 	next_pool:
++ 		spin_unlock_irqrestore(&pool->lock, flags);
++ 	}
++ 
++ 	rcu_read_unlock_sched();
++ }
++ 
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
+  /*
+   * CPU hotplug.
+   *
+@@@ -5081,119 -4774,704 +5267,715 @@@ out_unlock
+  }
+  #endif /* CONFIG_FREEZER */
+  
+- static void __init wq_numa_init(void)
+++<<<<<<< HEAD
+++=======
++ static int workqueue_apply_unbound_cpumask(void)
+  {
+- 	cpumask_var_t *tbl;
+- 	int node, cpu;
+- 
+- 	/* determine NUMA pwq table len - highest node id + 1 */
+- 	for_each_node(node)
+- 		wq_numa_tbl_len = max(wq_numa_tbl_len, node + 1);
+- 
+- 	if (num_possible_nodes() <= 1)
+- 		return;
++ 	LIST_HEAD(ctxs);
++ 	int ret = 0;
++ 	struct workqueue_struct *wq;
++ 	struct apply_wqattrs_ctx *ctx, *n;
+  
+- 	if (wq_disable_numa) {
+- 		pr_info("workqueue: NUMA affinity support disabled\n");
+- 		return;
+- 	}
++ 	lockdep_assert_held(&wq_pool_mutex);
+  
+- 	wq_update_unbound_numa_attrs_buf = alloc_workqueue_attrs(GFP_KERNEL);
+- 	BUG_ON(!wq_update_unbound_numa_attrs_buf);
++ 	list_for_each_entry(wq, &workqueues, list) {
++ 		if (!(wq->flags & WQ_UNBOUND))
++ 			continue;
++ 		/* creating multiple pwqs breaks ordering guarantee */
++ 		if (wq->flags & __WQ_ORDERED)
++ 			continue;
+  
+- 	/*
+- 	 * We want masks of possible CPUs of each node which isn't readily
+- 	 * available.  Build one from cpu_to_node() which should have been
+- 	 * fully initialized by now.
+- 	 */
+- 	tbl = kzalloc(wq_numa_tbl_len * sizeof(tbl[0]), GFP_KERNEL);
+- 	BUG_ON(!tbl);
++ 		ctx = apply_wqattrs_prepare(wq, wq->unbound_attrs);
++ 		if (!ctx) {
++ 			ret = -ENOMEM;
++ 			break;
++ 		}
+  
+- 	for_each_node(node)
+- 		BUG_ON(!zalloc_cpumask_var_node(&tbl[node], GFP_KERNEL,
+- 				node_online(node) ? node : NUMA_NO_NODE));
++ 		list_add_tail(&ctx->list, &ctxs);
++ 	}
+  
+- 	for_each_possible_cpu(cpu) {
+- 		node = cpu_to_node(cpu);
+- 		if (WARN_ON(node == NUMA_NO_NODE)) {
+- 			pr_warn("workqueue: NUMA node mapping not available for cpu%d, disabling NUMA support\n", cpu);
+- 			/* happens iff arch is bonkers, let's just proceed */
+- 			return;
+- 		}
+- 		cpumask_set_cpu(cpu, tbl[node]);
++ 	list_for_each_entry_safe(ctx, n, &ctxs, list) {
++ 		if (!ret)
++ 			apply_wqattrs_commit(ctx);
++ 		apply_wqattrs_cleanup(ctx);
+  	}
+  
+- 	wq_numa_possible_cpumask = tbl;
+- 	wq_numa_enabled = true;
++ 	return ret;
+  }
+  
+- static int __init init_workqueues(void)
++ /**
++  *  workqueue_set_unbound_cpumask - Set the low-level unbound cpumask
++  *  @cpumask: the cpumask to set
++  *
++  *  The low-level workqueues cpumask is a global cpumask that limits
++  *  the affinity of all unbound workqueues.  This function check the @cpumask
++  *  and apply it to all unbound workqueues and updates all pwqs of them.
++  *
++  *  Retun:	0	- Success
++  *  		-EINVAL	- Invalid @cpumask
++  *  		-ENOMEM	- Failed to allocate memory for attrs or pwqs.
++  */
++ int workqueue_set_unbound_cpumask(cpumask_var_t cpumask)
+  {
+- 	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
+- 	int i, cpu;
++ 	int ret = -EINVAL;
++ 	cpumask_var_t saved_cpumask;
+  
+- 	/* make sure we have enough bits for OFFQ pool ID */
+- 	BUILD_BUG_ON((1LU << (BITS_PER_LONG - WORK_OFFQ_POOL_SHIFT)) <
+- 		     WORK_CPU_END * NR_STD_WORKER_POOLS);
++ 	if (!zalloc_cpumask_var(&saved_cpumask, GFP_KERNEL))
++ 		return -ENOMEM;
+  
+- 	WARN_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
++ 	cpumask_and(cpumask, cpumask, cpu_possible_mask);
++ 	if (!cpumask_empty(cpumask)) {
++ 		apply_wqattrs_lock();
+  
+- 	BUG_ON(!alloc_cpumask_var(&wq_unbound_cpumask, GFP_KERNEL));
+- 	cpumask_copy(wq_unbound_cpumask, cpu_possible_mask);
++ 		/* save the old wq_unbound_cpumask. */
++ 		cpumask_copy(saved_cpumask, wq_unbound_cpumask);
+  
+- 	pwq_cache = KMEM_CACHE(pool_workqueue, SLAB_PANIC);
++ 		/* update wq_unbound_cpumask at first and apply it to wqs. */
++ 		cpumask_copy(wq_unbound_cpumask, cpumask);
++ 		ret = workqueue_apply_unbound_cpumask();
+  
+- 	cpu_notifier(workqueue_cpu_up_callback, CPU_PRI_WORKQUEUE_UP);
+- 	hotcpu_notifier(workqueue_cpu_down_callback, CPU_PRI_WORKQUEUE_DOWN);
++ 		/* restore the wq_unbound_cpumask when failed. */
++ 		if (ret < 0)
++ 			cpumask_copy(wq_unbound_cpumask, saved_cpumask);
+  
+- 	wq_numa_init();
++ 		apply_wqattrs_unlock();
++ 	}
+  
+- 	/* initialize CPU pools */
+- 	for_each_possible_cpu(cpu) {
+- 		struct worker_pool *pool;
++ 	free_cpumask_var(saved_cpumask);
++ 	return ret;
++ }
+  
+- 		i = 0;
+- 		for_each_cpu_worker_pool(pool, cpu) {
+- 			BUG_ON(init_worker_pool(pool));
+- 			pool->cpu = cpu;
+- 			cpumask_copy(pool->attrs->cpumask, cpumask_of(cpu));
+- 			pool->attrs->nice = std_nice[i++];
+- 			pool->node = cpu_to_node(cpu);
++ #ifdef CONFIG_SYSFS
++ /*
++  * Workqueues with WQ_SYSFS flag set is visible to userland via
++  * /sys/bus/workqueue/devices/WQ_NAME.  All visible workqueues have the
++  * following attributes.
++  *
++  *  per_cpu	RO bool	: whether the workqueue is per-cpu or unbound
++  *  max_active	RW int	: maximum number of in-flight work items
++  *
++  * Unbound workqueues have the following extra attributes.
++  *
++  *  id		RO int	: the associated pool ID
++  *  nice	RW int	: nice value of the workers
++  *  cpumask	RW mask	: bitmask of allowed CPUs for the workers
++  */
++ struct wq_device {
++ 	struct workqueue_struct		*wq;
++ 	struct device			dev;
++ };
+  
+- 			/* alloc pool ID */
+- 			mutex_lock(&wq_pool_mutex);
+- 			BUG_ON(worker_pool_assign_id(pool));
+- 			mutex_unlock(&wq_pool_mutex);
+- 		}
+- 	}
++ static struct workqueue_struct *dev_to_wq(struct device *dev)
++ {
++ 	struct wq_device *wq_dev = container_of(dev, struct wq_device, dev);
+  
+- 	/* create the initial worker */
+- 	for_each_online_cpu(cpu) {
+- 		struct worker_pool *pool;
++ 	return wq_dev->wq;
++ }
+  
+- 		for_each_cpu_worker_pool(pool, cpu) {
+- 			pool->flags &= ~POOL_DISASSOCIATED;
+- 			BUG_ON(create_and_start_worker(pool) < 0);
+- 		}
+- 	}
++ static ssize_t per_cpu_show(struct device *dev, struct device_attribute *attr,
++ 			    char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
+  
+- 	/* create default unbound and ordered wq attrs */
+- 	for (i = 0; i < NR_STD_WORKER_POOLS; i++) {
+- 		struct workqueue_attrs *attrs;
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", (bool)!(wq->flags & WQ_UNBOUND));
++ }
++ static DEVICE_ATTR_RO(per_cpu);
+  
+- 		BUG_ON(!(attrs = alloc_workqueue_attrs(GFP_KERNEL)));
+- 		attrs->nice = std_nice[i];
+- 		unbound_std_wq_attrs[i] = attrs;
++ static ssize_t max_active_show(struct device *dev,
++ 			       struct device_attribute *attr, char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
+  
+- 		/*
+- 		 * An ordered wq should have only one pwq as ordering is
+- 		 * guaranteed by max_active which is enforced by pwqs.
+- 		 * Turn off NUMA so that dfl_pwq is used for all nodes.
+- 		 */
+- 		BUG_ON(!(attrs = alloc_workqueue_attrs(GFP_KERNEL)));
+- 		attrs->nice = std_nice[i];
+- 		attrs->no_numa = true;
+- 		ordered_wq_attrs[i] = attrs;
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", wq->saved_max_active);
++ }
++ 
++ static ssize_t max_active_store(struct device *dev,
++ 				struct device_attribute *attr, const char *buf,
++ 				size_t count)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	int val;
++ 
++ 	if (sscanf(buf, "%d", &val) != 1 || val <= 0)
++ 		return -EINVAL;
++ 
++ 	workqueue_set_max_active(wq, val);
++ 	return count;
++ }
++ static DEVICE_ATTR_RW(max_active);
++ 
++ static struct attribute *wq_sysfs_attrs[] = {
++ 	&dev_attr_per_cpu.attr,
++ 	&dev_attr_max_active.attr,
++ 	NULL,
++ };
++ ATTRIBUTE_GROUPS(wq_sysfs);
++ 
++ static ssize_t wq_pool_ids_show(struct device *dev,
++ 				struct device_attribute *attr, char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	const char *delim = "";
++ 	int node, written = 0;
++ 
++ 	rcu_read_lock_sched();
++ 	for_each_node(node) {
++ 		written += scnprintf(buf + written, PAGE_SIZE - written,
++ 				     "%s%d:%d", delim, node,
++ 				     unbound_pwq_by_node(wq, node)->pool->id);
++ 		delim = " ";
++ 	}
++ 	written += scnprintf(buf + written, PAGE_SIZE - written, "\n");
++ 	rcu_read_unlock_sched();
++ 
++ 	return written;
++ }
++ 
++ static ssize_t wq_nice_show(struct device *dev, struct device_attribute *attr,
++ 			    char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	int written;
++ 
++ 	mutex_lock(&wq->mutex);
++ 	written = scnprintf(buf, PAGE_SIZE, "%d\n", wq->unbound_attrs->nice);
++ 	mutex_unlock(&wq->mutex);
++ 
++ 	return written;
++ }
++ 
++ /* prepare workqueue_attrs for sysfs store operations */
++ static struct workqueue_attrs *wq_sysfs_prep_attrs(struct workqueue_struct *wq)
++ {
++ 	struct workqueue_attrs *attrs;
++ 
++ 	lockdep_assert_held(&wq_pool_mutex);
++ 
++ 	attrs = alloc_workqueue_attrs(GFP_KERNEL);
++ 	if (!attrs)
++ 		return NULL;
++ 
++ 	copy_workqueue_attrs(attrs, wq->unbound_attrs);
++ 	return attrs;
++ }
++ 
++ static ssize_t wq_nice_store(struct device *dev, struct device_attribute *attr,
++ 			     const char *buf, size_t count)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	struct workqueue_attrs *attrs;
++ 	int ret = -ENOMEM;
++ 
++ 	apply_wqattrs_lock();
++ 
++ 	attrs = wq_sysfs_prep_attrs(wq);
++ 	if (!attrs)
++ 		goto out_unlock;
++ 
++ 	if (sscanf(buf, "%d", &attrs->nice) == 1 &&
++ 	    attrs->nice >= MIN_NICE && attrs->nice <= MAX_NICE)
++ 		ret = apply_workqueue_attrs_locked(wq, attrs);
++ 	else
++ 		ret = -EINVAL;
++ 
++ out_unlock:
++ 	apply_wqattrs_unlock();
++ 	free_workqueue_attrs(attrs);
++ 	return ret ?: count;
++ }
++ 
++ static ssize_t wq_cpumask_show(struct device *dev,
++ 			       struct device_attribute *attr, char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	int written;
++ 
++ 	mutex_lock(&wq->mutex);
++ 	written = scnprintf(buf, PAGE_SIZE, "%*pb\n",
++ 			    cpumask_pr_args(wq->unbound_attrs->cpumask));
++ 	mutex_unlock(&wq->mutex);
++ 	return written;
++ }
++ 
++ static ssize_t wq_cpumask_store(struct device *dev,
++ 				struct device_attribute *attr,
++ 				const char *buf, size_t count)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	struct workqueue_attrs *attrs;
++ 	int ret = -ENOMEM;
++ 
++ 	apply_wqattrs_lock();
++ 
++ 	attrs = wq_sysfs_prep_attrs(wq);
++ 	if (!attrs)
++ 		goto out_unlock;
++ 
++ 	ret = cpumask_parse(buf, attrs->cpumask);
++ 	if (!ret)
++ 		ret = apply_workqueue_attrs_locked(wq, attrs);
++ 
++ out_unlock:
++ 	apply_wqattrs_unlock();
++ 	free_workqueue_attrs(attrs);
++ 	return ret ?: count;
++ }
++ 
++ static ssize_t wq_numa_show(struct device *dev, struct device_attribute *attr,
++ 			    char *buf)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	int written;
++ 
++ 	mutex_lock(&wq->mutex);
++ 	written = scnprintf(buf, PAGE_SIZE, "%d\n",
++ 			    !wq->unbound_attrs->no_numa);
++ 	mutex_unlock(&wq->mutex);
++ 
++ 	return written;
++ }
++ 
++ static ssize_t wq_numa_store(struct device *dev, struct device_attribute *attr,
++ 			     const char *buf, size_t count)
++ {
++ 	struct workqueue_struct *wq = dev_to_wq(dev);
++ 	struct workqueue_attrs *attrs;
++ 	int v, ret = -ENOMEM;
++ 
++ 	apply_wqattrs_lock();
++ 
++ 	attrs = wq_sysfs_prep_attrs(wq);
++ 	if (!attrs)
++ 		goto out_unlock;
++ 
++ 	ret = -EINVAL;
++ 	if (sscanf(buf, "%d", &v) == 1) {
++ 		attrs->no_numa = !v;
++ 		ret = apply_workqueue_attrs_locked(wq, attrs);
++ 	}
++ 
++ out_unlock:
++ 	apply_wqattrs_unlock();
++ 	free_workqueue_attrs(attrs);
++ 	return ret ?: count;
++ }
++ 
++ static struct device_attribute wq_sysfs_unbound_attrs[] = {
++ 	__ATTR(pool_ids, 0444, wq_pool_ids_show, NULL),
++ 	__ATTR(nice, 0644, wq_nice_show, wq_nice_store),
++ 	__ATTR(cpumask, 0644, wq_cpumask_show, wq_cpumask_store),
++ 	__ATTR(numa, 0644, wq_numa_show, wq_numa_store),
++ 	__ATTR_NULL,
++ };
++ 
++ static struct bus_type wq_subsys = {
++ 	.name				= "workqueue",
++ 	.dev_groups			= wq_sysfs_groups,
++ };
++ 
++ static ssize_t wq_unbound_cpumask_show(struct device *dev,
++ 		struct device_attribute *attr, char *buf)
++ {
++ 	int written;
++ 
++ 	mutex_lock(&wq_pool_mutex);
++ 	written = scnprintf(buf, PAGE_SIZE, "%*pb\n",
++ 			    cpumask_pr_args(wq_unbound_cpumask));
++ 	mutex_unlock(&wq_pool_mutex);
++ 
++ 	return written;
++ }
++ 
++ static ssize_t wq_unbound_cpumask_store(struct device *dev,
++ 		struct device_attribute *attr, const char *buf, size_t count)
++ {
++ 	cpumask_var_t cpumask;
++ 	int ret;
++ 
++ 	if (!zalloc_cpumask_var(&cpumask, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	ret = cpumask_parse(buf, cpumask);
++ 	if (!ret)
++ 		ret = workqueue_set_unbound_cpumask(cpumask);
++ 
++ 	free_cpumask_var(cpumask);
++ 	return ret ? ret : count;
++ }
++ 
++ static struct device_attribute wq_sysfs_cpumask_attr =
++ 	__ATTR(cpumask, 0644, wq_unbound_cpumask_show,
++ 	       wq_unbound_cpumask_store);
++ 
++ static int __init wq_sysfs_init(void)
++ {
++ 	int err;
++ 
++ 	err = subsys_virtual_register(&wq_subsys, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	return device_create_file(wq_subsys.dev_root, &wq_sysfs_cpumask_attr);
++ }
++ core_initcall(wq_sysfs_init);
++ 
++ static void wq_device_release(struct device *dev)
++ {
++ 	struct wq_device *wq_dev = container_of(dev, struct wq_device, dev);
++ 
++ 	kfree(wq_dev);
++ }
++ 
++ /**
++  * workqueue_sysfs_register - make a workqueue visible in sysfs
++  * @wq: the workqueue to register
++  *
++  * Expose @wq in sysfs under /sys/bus/workqueue/devices.
++  * alloc_workqueue*() automatically calls this function if WQ_SYSFS is set
++  * which is the preferred method.
++  *
++  * Workqueue user should use this function directly iff it wants to apply
++  * workqueue_attrs before making the workqueue visible in sysfs; otherwise,
++  * apply_workqueue_attrs() may race against userland updating the
++  * attributes.
++  *
++  * Return: 0 on success, -errno on failure.
++  */
++ int workqueue_sysfs_register(struct workqueue_struct *wq)
++ {
++ 	struct wq_device *wq_dev;
++ 	int ret;
++ 
++ 	/*
++ 	 * Adjusting max_active or creating new pwqs by applying
++ 	 * attributes breaks ordering guarantee.  Disallow exposing ordered
++ 	 * workqueues.
++ 	 */
++ 	if (WARN_ON(wq->flags & __WQ_ORDERED))
++ 		return -EINVAL;
++ 
++ 	wq->wq_dev = wq_dev = kzalloc(sizeof(*wq_dev), GFP_KERNEL);
++ 	if (!wq_dev)
++ 		return -ENOMEM;
++ 
++ 	wq_dev->wq = wq;
++ 	wq_dev->dev.bus = &wq_subsys;
++ 	wq_dev->dev.init_name = wq->name;
++ 	wq_dev->dev.release = wq_device_release;
++ 
++ 	/*
++ 	 * unbound_attrs are created separately.  Suppress uevent until
++ 	 * everything is ready.
++ 	 */
++ 	dev_set_uevent_suppress(&wq_dev->dev, true);
++ 
++ 	ret = device_register(&wq_dev->dev);
++ 	if (ret) {
++ 		kfree(wq_dev);
++ 		wq->wq_dev = NULL;
++ 		return ret;
++ 	}
++ 
++ 	if (wq->flags & WQ_UNBOUND) {
++ 		struct device_attribute *attr;
++ 
++ 		for (attr = wq_sysfs_unbound_attrs; attr->attr.name; attr++) {
++ 			ret = device_create_file(&wq_dev->dev, attr);
++ 			if (ret) {
++ 				device_unregister(&wq_dev->dev);
++ 				wq->wq_dev = NULL;
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 
++ 	dev_set_uevent_suppress(&wq_dev->dev, false);
++ 	kobject_uevent(&wq_dev->dev.kobj, KOBJ_ADD);
++ 	return 0;
++ }
++ 
++ /**
++  * workqueue_sysfs_unregister - undo workqueue_sysfs_register()
++  * @wq: the workqueue to unregister
++  *
++  * If @wq is registered to sysfs by workqueue_sysfs_register(), unregister.
++  */
++ static void workqueue_sysfs_unregister(struct workqueue_struct *wq)
++ {
++ 	struct wq_device *wq_dev = wq->wq_dev;
++ 
++ 	if (!wq->wq_dev)
++ 		return;
++ 
++ 	wq->wq_dev = NULL;
++ 	device_unregister(&wq_dev->dev);
++ }
++ #else	/* CONFIG_SYSFS */
++ static void workqueue_sysfs_unregister(struct workqueue_struct *wq)	{ }
++ #endif	/* CONFIG_SYSFS */
++ 
++ /*
++  * Workqueue watchdog.
++  *
++  * Stall may be caused by various bugs - missing WQ_MEM_RECLAIM, illegal
++  * flush dependency, a concurrency managed work item which stays RUNNING
++  * indefinitely.  Workqueue stalls can be very difficult to debug as the
++  * usual warning mechanisms don't trigger and internal workqueue state is
++  * largely opaque.
++  *
++  * Workqueue watchdog monitors all worker pools periodically and dumps
++  * state if some pools failed to make forward progress for a while where
++  * forward progress is defined as the first item on ->worklist changing.
++  *
++  * This mechanism is controlled through the kernel parameter
++  * "workqueue.watchdog_thresh" which can be updated at runtime through the
++  * corresponding sysfs parameter file.
++  */
++ #ifdef CONFIG_WQ_WATCHDOG
++ 
++ static void wq_watchdog_timer_fn(unsigned long data);
++ 
++ static unsigned long wq_watchdog_thresh = 30;
++ static struct timer_list wq_watchdog_timer =
++ 	TIMER_DEFERRED_INITIALIZER(wq_watchdog_timer_fn, 0, 0);
++ 
++ static unsigned long wq_watchdog_touched = INITIAL_JIFFIES;
++ static DEFINE_PER_CPU(unsigned long, wq_watchdog_touched_cpu) = INITIAL_JIFFIES;
++ 
++ static void wq_watchdog_reset_touched(void)
++ {
++ 	int cpu;
++ 
++ 	wq_watchdog_touched = jiffies;
++ 	for_each_possible_cpu(cpu)
++ 		per_cpu(wq_watchdog_touched_cpu, cpu) = jiffies;
++ }
++ 
++ static void wq_watchdog_timer_fn(unsigned long data)
++ {
++ 	unsigned long thresh = READ_ONCE(wq_watchdog_thresh) * HZ;
++ 	bool lockup_detected = false;
++ 	struct worker_pool *pool;
++ 	int pi;
++ 
++ 	if (!thresh)
++ 		return;
++ 
++ 	rcu_read_lock();
++ 
++ 	for_each_pool(pool, pi) {
++ 		unsigned long pool_ts, touched, ts;
++ 
++ 		if (list_empty(&pool->worklist))
++ 			continue;
++ 
++ 		/* get the latest of pool and touched timestamps */
++ 		pool_ts = READ_ONCE(pool->watchdog_ts);
++ 		touched = READ_ONCE(wq_watchdog_touched);
++ 
++ 		if (time_after(pool_ts, touched))
++ 			ts = pool_ts;
++ 		else
++ 			ts = touched;
++ 
++ 		if (pool->cpu >= 0) {
++ 			unsigned long cpu_touched =
++ 				READ_ONCE(per_cpu(wq_watchdog_touched_cpu,
++ 						  pool->cpu));
++ 			if (time_after(cpu_touched, ts))
++ 				ts = cpu_touched;
++ 		}
++ 
++ 		/* did we stall? */
++ 		if (time_after(jiffies, ts + thresh)) {
++ 			lockup_detected = true;
++ 			pr_emerg("BUG: workqueue lockup - pool");
++ 			pr_cont_pool_info(pool);
++ 			pr_cont(" stuck for %us!\n",
++ 				jiffies_to_msecs(jiffies - pool_ts) / 1000);
++ 		}
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (lockup_detected)
++ 		show_workqueue_state();
++ 
++ 	wq_watchdog_reset_touched();
++ 	mod_timer(&wq_watchdog_timer, jiffies + thresh);
++ }
++ 
++ void wq_watchdog_touch(int cpu)
++ {
++ 	if (cpu >= 0)
++ 		per_cpu(wq_watchdog_touched_cpu, cpu) = jiffies;
++ 	else
++ 		wq_watchdog_touched = jiffies;
++ }
++ 
++ static void wq_watchdog_set_thresh(unsigned long thresh)
++ {
++ 	wq_watchdog_thresh = 0;
++ 	del_timer_sync(&wq_watchdog_timer);
++ 
++ 	if (thresh) {
++ 		wq_watchdog_thresh = thresh;
++ 		wq_watchdog_reset_touched();
++ 		mod_timer(&wq_watchdog_timer, jiffies + thresh * HZ);
++ 	}
++ }
++ 
++ static int wq_watchdog_param_set_thresh(const char *val,
++ 					const struct kernel_param *kp)
++ {
++ 	unsigned long thresh;
++ 	int ret;
++ 
++ 	ret = kstrtoul(val, 0, &thresh);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (system_wq)
++ 		wq_watchdog_set_thresh(thresh);
++ 	else
++ 		wq_watchdog_thresh = thresh;
++ 
++ 	return 0;
++ }
++ 
++ static const struct kernel_param_ops wq_watchdog_thresh_ops = {
++ 	.set	= wq_watchdog_param_set_thresh,
++ 	.get	= param_get_ulong,
++ };
++ 
++ module_param_cb(watchdog_thresh, &wq_watchdog_thresh_ops, &wq_watchdog_thresh,
++ 		0644);
++ 
++ static void wq_watchdog_init(void)
++ {
++ 	wq_watchdog_set_thresh(wq_watchdog_thresh);
++ }
++ 
++ #else	/* CONFIG_WQ_WATCHDOG */
++ 
++ static inline void wq_watchdog_init(void) { }
++ 
++ #endif	/* CONFIG_WQ_WATCHDOG */
++ 
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
++ static void __init wq_numa_init(void)
++ {
++ 	cpumask_var_t *tbl;
++ 	int node, cpu;
++ 
+++	/* determine NUMA pwq table len - highest node id + 1 */
+++	for_each_node(node)
+++		wq_numa_tbl_len = max(wq_numa_tbl_len, node + 1);
+++
++ 	if (num_possible_nodes() <= 1)
++ 		return;
++ 
++ 	if (wq_disable_numa) {
++ 		pr_info("workqueue: NUMA affinity support disabled\n");
++ 		return;
++ 	}
++ 
++ 	wq_update_unbound_numa_attrs_buf = alloc_workqueue_attrs(GFP_KERNEL);
++ 	BUG_ON(!wq_update_unbound_numa_attrs_buf);
++ 
++ 	/*
++ 	 * We want masks of possible CPUs of each node which isn't readily
++ 	 * available.  Build one from cpu_to_node() which should have been
++ 	 * fully initialized by now.
++ 	 */
+ -	tbl = kzalloc(nr_node_ids * sizeof(tbl[0]), GFP_KERNEL);
+++	tbl = kzalloc(wq_numa_tbl_len * sizeof(tbl[0]), GFP_KERNEL);
++ 	BUG_ON(!tbl);
++ 
++ 	for_each_node(node)
++ 		BUG_ON(!zalloc_cpumask_var_node(&tbl[node], GFP_KERNEL,
++ 				node_online(node) ? node : NUMA_NO_NODE));
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		node = cpu_to_node(cpu);
++ 		if (WARN_ON(node == NUMA_NO_NODE)) {
++ 			pr_warn("workqueue: NUMA node mapping not available for cpu%d, disabling NUMA support\n", cpu);
++ 			/* happens iff arch is bonkers, let's just proceed */
++ 			return;
++ 		}
++ 		cpumask_set_cpu(cpu, tbl[node]);
++ 	}
++ 
++ 	wq_numa_possible_cpumask = tbl;
++ 	wq_numa_enabled = true;
++ }
++ 
++ static int __init init_workqueues(void)
++ {
++ 	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
++ 	int i, cpu;
++ 
+++	/* make sure we have enough bits for OFFQ pool ID */
+++	BUILD_BUG_ON((1LU << (BITS_PER_LONG - WORK_OFFQ_POOL_SHIFT)) <
+++		     WORK_CPU_END * NR_STD_WORKER_POOLS);
+++
++ 	WARN_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
++ 
++ 	BUG_ON(!alloc_cpumask_var(&wq_unbound_cpumask, GFP_KERNEL));
++ 	cpumask_copy(wq_unbound_cpumask, cpu_possible_mask);
++ 
++ 	pwq_cache = KMEM_CACHE(pool_workqueue, SLAB_PANIC);
++ 
++ 	cpu_notifier(workqueue_cpu_up_callback, CPU_PRI_WORKQUEUE_UP);
++ 	hotcpu_notifier(workqueue_cpu_down_callback, CPU_PRI_WORKQUEUE_DOWN);
++ 
++ 	wq_numa_init();
++ 
++ 	/* initialize CPU pools */
++ 	for_each_possible_cpu(cpu) {
++ 		struct worker_pool *pool;
++ 
++ 		i = 0;
++ 		for_each_cpu_worker_pool(pool, cpu) {
++ 			BUG_ON(init_worker_pool(pool));
++ 			pool->cpu = cpu;
++ 			cpumask_copy(pool->attrs->cpumask, cpumask_of(cpu));
++ 			pool->attrs->nice = std_nice[i++];
++ 			pool->node = cpu_to_node(cpu);
++ 
++ 			/* alloc pool ID */
++ 			mutex_lock(&wq_pool_mutex);
++ 			BUG_ON(worker_pool_assign_id(pool));
++ 			mutex_unlock(&wq_pool_mutex);
++ 		}
++ 	}
++ 
++ 	/* create the initial worker */
++ 	for_each_online_cpu(cpu) {
++ 		struct worker_pool *pool;
++ 
++ 		for_each_cpu_worker_pool(pool, cpu) {
++ 			pool->flags &= ~POOL_DISASSOCIATED;
+ -			BUG_ON(!create_worker(pool));
+++			BUG_ON(create_and_start_worker(pool) < 0);
++ 		}
++ 	}
++ 
++ 	/* create default unbound and ordered wq attrs */
++ 	for (i = 0; i < NR_STD_WORKER_POOLS; i++) {
++ 		struct workqueue_attrs *attrs;
++ 
++ 		BUG_ON(!(attrs = alloc_workqueue_attrs(GFP_KERNEL)));
++ 		attrs->nice = std_nice[i];
++ 		unbound_std_wq_attrs[i] = attrs;
++ 
++ 		/*
++ 		 * An ordered wq should have only one pwq as ordering is
++ 		 * guaranteed by max_active which is enforced by pwqs.
++ 		 * Turn off NUMA so that dfl_pwq is used for all nodes.
++ 		 */
++ 		BUG_ON(!(attrs = alloc_workqueue_attrs(GFP_KERNEL)));
++ 		attrs->nice = std_nice[i];
++ 		attrs->no_numa = true;
++ 		ordered_wq_attrs[i] = attrs;
+  	}
+  
+  	system_wq = alloc_workqueue("events", 0, 0);
+diff --cc lib/Kconfig.debug
+index b42d9b05227b,3048bf5b729a..000000000000
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@@ -511,6 -544,380 +511,383 @@@ config DEBUG_KMEMLEAK_DEFAULT_OF
+  	  Say Y here to disable kmemleak by default. It can then be enabled
+  	  on the command line via kmemleak=on.
+  
+++<<<<<<< HEAD
+++=======
++ config DEBUG_STACK_USAGE
++ 	bool "Stack utilization instrumentation"
++ 	depends on DEBUG_KERNEL && !IA64 && !PARISC && !METAG
++ 	help
++ 	  Enables the display of the minimum amount of free stack which each
++ 	  task has ever had available in the sysrq-T and sysrq-P debug output.
++ 
++ 	  This option will slow down process creation somewhat.
++ 
++ config DEBUG_VM
++ 	bool "Debug VM"
++ 	depends on DEBUG_KERNEL
++ 	help
++ 	  Enable this to turn on extended checks in the virtual-memory system
++           that may impact performance.
++ 
++ 	  If unsure, say N.
++ 
++ config DEBUG_VM_VMACACHE
++ 	bool "Debug VMA caching"
++ 	depends on DEBUG_VM
++ 	help
++ 	  Enable this to turn on VMA caching debug information. Doing so
++ 	  can cause significant overhead, so only enable it in non-production
++ 	  environments.
++ 
++ 	  If unsure, say N.
++ 
++ config DEBUG_VM_RB
++ 	bool "Debug VM red-black trees"
++ 	depends on DEBUG_VM
++ 	help
++ 	  Enable VM red-black tree debugging information and extra validations.
++ 
++ 	  If unsure, say N.
++ 
++ config DEBUG_VIRTUAL
++ 	bool "Debug VM translations"
++ 	depends on DEBUG_KERNEL && X86
++ 	help
++ 	  Enable some costly sanity checks in virtual to page code. This can
++ 	  catch mistakes with virt_to_page() and friends.
++ 
++ 	  If unsure, say N.
++ 
++ config DEBUG_NOMMU_REGIONS
++ 	bool "Debug the global anon/private NOMMU mapping region tree"
++ 	depends on DEBUG_KERNEL && !MMU
++ 	help
++ 	  This option causes the global tree of anonymous and private mapping
++ 	  regions to be regularly checked for invalid topology.
++ 
++ config DEBUG_MEMORY_INIT
++ 	bool "Debug memory initialisation" if EXPERT
++ 	default !EXPERT
++ 	help
++ 	  Enable this for additional checks during memory initialisation.
++ 	  The sanity checks verify aspects of the VM such as the memory model
++ 	  and other information provided by the architecture. Verbose
++ 	  information will be printed at KERN_DEBUG loglevel depending
++ 	  on the mminit_loglevel= command-line option.
++ 
++ 	  If unsure, say Y
++ 
++ config MEMORY_NOTIFIER_ERROR_INJECT
++ 	tristate "Memory hotplug notifier error injection module"
++ 	depends on MEMORY_HOTPLUG_SPARSE && NOTIFIER_ERROR_INJECTION
++ 	help
++ 	  This option provides the ability to inject artificial errors to
++ 	  memory hotplug notifier chain callbacks.  It is controlled through
++ 	  debugfs interface under /sys/kernel/debug/notifier-error-inject/memory
++ 
++ 	  If the notifier call chain should be failed with some events
++ 	  notified, write the error code to "actions/<notifier event>/error".
++ 
++ 	  Example: Inject memory hotplug offline error (-12 == -ENOMEM)
++ 
++ 	  # cd /sys/kernel/debug/notifier-error-inject/memory
++ 	  # echo -12 > actions/MEM_GOING_OFFLINE/error
++ 	  # echo offline > /sys/devices/system/memory/memoryXXX/state
++ 	  bash: echo: write error: Cannot allocate memory
++ 
++ 	  To compile this code as a module, choose M here: the module will
++ 	  be called memory-notifier-error-inject.
++ 
++ 	  If unsure, say N.
++ 
++ config DEBUG_PER_CPU_MAPS
++ 	bool "Debug access to per_cpu maps"
++ 	depends on DEBUG_KERNEL
++ 	depends on SMP
++ 	help
++ 	  Say Y to verify that the per_cpu map being accessed has
++ 	  been set up. This adds a fair amount of code to kernel memory
++ 	  and decreases performance.
++ 
++ 	  Say N if unsure.
++ 
++ config DEBUG_HIGHMEM
++ 	bool "Highmem debugging"
++ 	depends on DEBUG_KERNEL && HIGHMEM
++ 	help
++ 	  This option enables additional error checking for high memory
++ 	  systems.  Disable for production systems.
++ 
++ config HAVE_DEBUG_STACKOVERFLOW
++ 	bool
++ 
++ config DEBUG_STACKOVERFLOW
++ 	bool "Check for stack overflows"
++ 	depends on DEBUG_KERNEL && HAVE_DEBUG_STACKOVERFLOW
++ 	---help---
++ 	  Say Y here if you want to check for overflows of kernel, IRQ
++ 	  and exception stacks (if your architecture uses them). This
++ 	  option will show detailed messages if free stack space drops
++ 	  below a certain limit.
++ 
++ 	  These kinds of bugs usually occur when call-chains in the
++ 	  kernel get too deep, especially when interrupts are
++ 	  involved.
++ 
++ 	  Use this in cases where you see apparently random memory
++ 	  corruption, especially if it appears in 'struct thread_info'
++ 
++ 	  If in doubt, say "N".
++ 
++ source "lib/Kconfig.kmemcheck"
++ 
++ source "lib/Kconfig.kasan"
++ 
++ endmenu # "Memory Debugging"
++ 
++ config DEBUG_SHIRQ
++ 	bool "Debug shared IRQ handlers"
++ 	depends on DEBUG_KERNEL
++ 	help
++ 	  Enable this to generate a spurious interrupt as soon as a shared
++ 	  interrupt handler is registered, and just before one is deregistered.
++ 	  Drivers ought to be able to handle interrupts coming in at those
++ 	  points; some don't and need to be caught.
++ 
++ menu "Debug Lockups and Hangs"
++ 
++ config LOCKUP_DETECTOR
++ 	bool "Detect Hard and Soft Lockups"
++ 	depends on DEBUG_KERNEL && !S390
++ 	help
++ 	  Say Y here to enable the kernel to act as a watchdog to detect
++ 	  hard and soft lockups.
++ 
++ 	  Softlockups are bugs that cause the kernel to loop in kernel
++ 	  mode for more than 20 seconds, without giving other tasks a
++ 	  chance to run.  The current stack trace is displayed upon
++ 	  detection and the system will stay locked up.
++ 
++ 	  Hardlockups are bugs that cause the CPU to loop in kernel mode
++ 	  for more than 10 seconds, without letting other interrupts have a
++ 	  chance to run.  The current stack trace is displayed upon detection
++ 	  and the system will stay locked up.
++ 
++ 	  The overhead should be minimal.  A periodic hrtimer runs to
++ 	  generate interrupts and kick the watchdog task every 4 seconds.
++ 	  An NMI is generated every 10 seconds or so to check for hardlockups.
++ 
++ 	  The frequency of hrtimer and NMI events and the soft and hard lockup
++ 	  thresholds can be controlled through the sysctl watchdog_thresh.
++ 
++ config HARDLOCKUP_DETECTOR
++ 	def_bool y
++ 	depends on LOCKUP_DETECTOR && !HAVE_NMI_WATCHDOG
++ 	depends on PERF_EVENTS && HAVE_PERF_EVENTS_NMI
++ 
++ config BOOTPARAM_HARDLOCKUP_PANIC
++ 	bool "Panic (Reboot) On Hard Lockups"
++ 	depends on HARDLOCKUP_DETECTOR
++ 	help
++ 	  Say Y here to enable the kernel to panic on "hard lockups",
++ 	  which are bugs that cause the kernel to loop in kernel
++ 	  mode with interrupts disabled for more than 10 seconds (configurable
++ 	  using the watchdog_thresh sysctl).
++ 
++ 	  Say N if unsure.
++ 
++ config BOOTPARAM_HARDLOCKUP_PANIC_VALUE
++ 	int
++ 	depends on HARDLOCKUP_DETECTOR
++ 	range 0 1
++ 	default 0 if !BOOTPARAM_HARDLOCKUP_PANIC
++ 	default 1 if BOOTPARAM_HARDLOCKUP_PANIC
++ 
++ config BOOTPARAM_SOFTLOCKUP_PANIC
++ 	bool "Panic (Reboot) On Soft Lockups"
++ 	depends on LOCKUP_DETECTOR
++ 	help
++ 	  Say Y here to enable the kernel to panic on "soft lockups",
++ 	  which are bugs that cause the kernel to loop in kernel
++ 	  mode for more than 20 seconds (configurable using the watchdog_thresh
++ 	  sysctl), without giving other tasks a chance to run.
++ 
++ 	  The panic can be used in combination with panic_timeout,
++ 	  to cause the system to reboot automatically after a
++ 	  lockup has been detected. This feature is useful for
++ 	  high-availability systems that have uptime guarantees and
++ 	  where a lockup must be resolved ASAP.
++ 
++ 	  Say N if unsure.
++ 
++ config BOOTPARAM_SOFTLOCKUP_PANIC_VALUE
++ 	int
++ 	depends on LOCKUP_DETECTOR
++ 	range 0 1
++ 	default 0 if !BOOTPARAM_SOFTLOCKUP_PANIC
++ 	default 1 if BOOTPARAM_SOFTLOCKUP_PANIC
++ 
++ config DETECT_HUNG_TASK
++ 	bool "Detect Hung Tasks"
++ 	depends on DEBUG_KERNEL
++ 	default LOCKUP_DETECTOR
++ 	help
++ 	  Say Y here to enable the kernel to detect "hung tasks",
++ 	  which are bugs that cause the task to be stuck in
++ 	  uninterruptible "D" state indefinitiley.
++ 
++ 	  When a hung task is detected, the kernel will print the
++ 	  current stack trace (which you should report), but the
++ 	  task will stay in uninterruptible state. If lockdep is
++ 	  enabled then all held locks will also be reported. This
++ 	  feature has negligible overhead.
++ 
++ config DEFAULT_HUNG_TASK_TIMEOUT
++ 	int "Default timeout for hung task detection (in seconds)"
++ 	depends on DETECT_HUNG_TASK
++ 	default 120
++ 	help
++ 	  This option controls the default timeout (in seconds) used
++ 	  to determine when a task has become non-responsive and should
++ 	  be considered hung.
++ 
++ 	  It can be adjusted at runtime via the kernel.hung_task_timeout_secs
++ 	  sysctl or by writing a value to
++ 	  /proc/sys/kernel/hung_task_timeout_secs.
++ 
++ 	  A timeout of 0 disables the check.  The default is two minutes.
++ 	  Keeping the default should be fine in most cases.
++ 
++ config BOOTPARAM_HUNG_TASK_PANIC
++ 	bool "Panic (Reboot) On Hung Tasks"
++ 	depends on DETECT_HUNG_TASK
++ 	help
++ 	  Say Y here to enable the kernel to panic on "hung tasks",
++ 	  which are bugs that cause the kernel to leave a task stuck
++ 	  in uninterruptible "D" state.
++ 
++ 	  The panic can be used in combination with panic_timeout,
++ 	  to cause the system to reboot automatically after a
++ 	  hung task has been detected. This feature is useful for
++ 	  high-availability systems that have uptime guarantees and
++ 	  where a hung tasks must be resolved ASAP.
++ 
++ 	  Say N if unsure.
++ 
++ config BOOTPARAM_HUNG_TASK_PANIC_VALUE
++ 	int
++ 	depends on DETECT_HUNG_TASK
++ 	range 0 1
++ 	default 0 if !BOOTPARAM_HUNG_TASK_PANIC
++ 	default 1 if BOOTPARAM_HUNG_TASK_PANIC
++ 
++ config WQ_WATCHDOG
++ 	bool "Detect Workqueue Stalls"
++ 	depends on DEBUG_KERNEL
++ 	help
++ 	  Say Y here to enable stall detection on workqueues.  If a
++ 	  worker pool doesn't make forward progress on a pending work
++ 	  item for over a given amount of time, 30s by default, a
++ 	  warning message is printed along with dump of workqueue
++ 	  state.  This can be configured through kernel parameter
++ 	  "workqueue.watchdog_thresh" and its sysfs counterpart.
++ 
++ endmenu # "Debug lockups and hangs"
++ 
++ config PANIC_ON_OOPS
++ 	bool "Panic on Oops"
++ 	help
++ 	  Say Y here to enable the kernel to panic when it oopses. This
++ 	  has the same effect as setting oops=panic on the kernel command
++ 	  line.
++ 
++ 	  This feature is useful to ensure that the kernel does not do
++ 	  anything erroneous after an oops which could result in data
++ 	  corruption or other issues.
++ 
++ 	  Say N if unsure.
++ 
++ config PANIC_ON_OOPS_VALUE
++ 	int
++ 	range 0 1
++ 	default 0 if !PANIC_ON_OOPS
++ 	default 1 if PANIC_ON_OOPS
++ 
++ config PANIC_TIMEOUT
++ 	int "panic timeout"
++ 	default 0
++ 	help
++ 	  Set the timeout value (in seconds) until a reboot occurs when the
++ 	  the kernel panics. If n = 0, then we wait forever. A timeout
++ 	  value n > 0 will wait n seconds before rebooting, while a timeout
++ 	  value n < 0 will reboot immediately.
++ 
++ config SCHED_DEBUG
++ 	bool "Collect scheduler debugging info"
++ 	depends on DEBUG_KERNEL && PROC_FS
++ 	default y
++ 	help
++ 	  If you say Y here, the /proc/sched_debug file will be provided
++ 	  that can help debug the scheduler. The runtime overhead of this
++ 	  option is minimal.
++ 
++ config SCHED_INFO
++ 	bool
++ 	default n
++ 
++ config SCHEDSTATS
++ 	bool "Collect scheduler statistics"
++ 	depends on DEBUG_KERNEL && PROC_FS
++ 	select SCHED_INFO
++ 	help
++ 	  If you say Y here, additional code will be inserted into the
++ 	  scheduler and related routines to collect statistics about
++ 	  scheduler behavior and provide them in /proc/schedstat.  These
++ 	  stats may be useful for both tuning and debugging the scheduler
++ 	  If you aren't debugging the scheduler or trying to tune a specific
++ 	  application, you can say N to avoid the very slight overhead
++ 	  this adds.
++ 
++ config SCHED_STACK_END_CHECK
++ 	bool "Detect stack corruption on calls to schedule()"
++ 	depends on DEBUG_KERNEL
++ 	default n
++ 	help
++ 	  This option checks for a stack overrun on calls to schedule().
++ 	  If the stack end location is found to be over written always panic as
++ 	  the content of the corrupted region can no longer be trusted.
++ 	  This is to ensure no erroneous behaviour occurs which could result in
++ 	  data corruption or a sporadic crash at a later stage once the region
++ 	  is examined. The runtime overhead introduced is minimal.
++ 
++ config DEBUG_TIMEKEEPING
++ 	bool "Enable extra timekeeping sanity checking"
++ 	help
++ 	  This option will enable additional timekeeping sanity checks
++ 	  which may be helpful when diagnosing issues where timekeeping
++ 	  problems are suspected.
++ 
++ 	  This may include checks in the timekeeping hotpaths, so this
++ 	  option may have a (very small) performance impact to some
++ 	  workloads.
++ 
++ 	  If unsure, say N.
++ 
++ config TIMER_STATS
++ 	bool "Collect kernel timers statistics"
++ 	depends on DEBUG_KERNEL && PROC_FS
++ 	help
++ 	  If you say Y here, additional code will be inserted into the
++ 	  timer routines to collect statistics about kernel timers being
++ 	  reprogrammed. The statistics can be read from /proc/timer_stats.
++ 	  The statistics collection is started by writing 1 to /proc/timer_stats,
++ 	  writing 0 stops it. This feature is useful to collect information
++ 	  about timer usage patterns in kernel and userspace. This feature
++ 	  is lightweight if enabled in the kernel config but not activated
++ 	  (it defaults to deactivated on bootup and will only be activated
++ 	  if some application like powertop activates it explicitly).
++ 
+++>>>>>>> 82607adcf9cd (workqueue: implement lockup detector)
+  config DEBUG_PREEMPT
+  	bool "Debug preemptible kernel"
+  	depends on DEBUG_KERNEL && PREEMPT && TRACE_IRQFLAGS_SUPPORT
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index a11881467ef2..bfbae33d6a2e 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -3490,6 +3490,15 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			or other driver-specific files in the
+ 			Documentation/watchdog/ directory.
+ 
++	workqueue.watchdog_thresh=
++			If CONFIG_WQ_WATCHDOG is configured, workqueue can
++			warn stall conditions and dump internal state to
++			help debugging.  0 disables workqueue stall
++			detection; otherwise, it's the stall threshold
++			duration in seconds.  The default value is 30 and
++			it can be updated at runtime by writing to the
++			corresponding sysfs file.
++
+ 	workqueue.disable_numa
+ 			By default, all work items queued to unbound
+ 			workqueues are affine to the NUMA nodes they're
+diff --git a/include/linux/workqueue.h b/include/linux/workqueue.h
+index 71ee1c56ab17..cd143160a1cf 100644
+--- a/include/linux/workqueue.h
++++ b/include/linux/workqueue.h
+@@ -648,4 +648,10 @@ static inline int workqueue_sysfs_register(struct workqueue_struct *wq)
+ { return 0; }
+ #endif	/* CONFIG_SYSFS */
+ 
++#ifdef CONFIG_WQ_WATCHDOG
++void wq_watchdog_touch(int cpu);
++#else	/* CONFIG_WQ_WATCHDOG */
++static inline void wq_watchdog_touch(int cpu) { }
++#endif	/* CONFIG_WQ_WATCHDOG */
++
+ #endif
+* Unmerged path kernel/watchdog.c
+* Unmerged path kernel/workqueue.c
+* Unmerged path lib/Kconfig.debug
