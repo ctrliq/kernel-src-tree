@@ -1,0 +1,147 @@
+drm/radeon: Make sure radeon_vm_bo_set_addr always unreserves the BO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [drm] radeon: Make sure radeon_vm_bo_set_addr always unreserves the BO (Rob Clark) [1249805]
+Rebuild_FUZZ: 96.97%
+commit-author Michel Dänzer <michel.daenzer@amd.com>
+commit ee18e599251ed06bf0c8ade7c434a0de311342ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ee18e599.failed
+
+Some error paths didn't unreserve the BO. This resulted in a deadlock
+down the road on the next attempt to reserve the (still reserved) BO.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=90873
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit ee18e599251ed06bf0c8ade7c434a0de311342ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/radeon/radeon_vm.c
+diff --cc drivers/gpu/drm/radeon/radeon_vm.c
+index abf8e2c876ac,9c3377ca17b7..000000000000
+--- a/drivers/gpu/drm/radeon/radeon_vm.c
++++ b/drivers/gpu/drm/radeon/radeon_vm.c
+@@@ -445,51 -475,62 +447,75 @@@ int radeon_vm_bo_set_addr(struct radeon
+  	}
+  
+  	mutex_lock(&vm->mutex);
+ -	soffset /= RADEON_GPU_PAGE_SIZE;
+ -	eoffset /= RADEON_GPU_PAGE_SIZE;
+ -	if (soffset || eoffset) {
+ -		struct interval_tree_node *it;
+ -		it = interval_tree_iter_first(&vm->va, soffset, eoffset - 1);
+ -		if (it && it != &bo_va->it) {
+ -			struct radeon_bo_va *tmp;
+ -			tmp = container_of(it, struct radeon_bo_va, it);
+ +	head = &vm->va;
+ +	last_offset = 0;
+ +	list_for_each_entry(tmp, &vm->va, vm_list) {
+ +		if (bo_va == tmp) {
+ +			/* skip over currently modified bo */
+ +			continue;
+ +		}
+ +
+ +		if (soffset >= last_offset && eoffset <= tmp->soffset) {
+ +			/* bo can be added before this one */
+ +			break;
+ +		}
+ +		if (eoffset > tmp->soffset && soffset < tmp->eoffset) {
+  			/* bo and tmp overlap, invalid offset */
+ -			dev_err(rdev->dev, "bo %p va 0x%010Lx conflict with "
+ -				"(bo %p 0x%010lx 0x%010lx)\n", bo_va->bo,
+ -				soffset, tmp->bo, tmp->it.start, tmp->it.last);
+ +			dev_err(rdev->dev, "bo %p va 0x%08X conflict with (bo %p 0x%08X 0x%08X)\n",
+ +				bo_va->bo, (unsigned)bo_va->soffset, tmp->bo,
+ +				(unsigned)tmp->soffset, (unsigned)tmp->eoffset);
+  			mutex_unlock(&vm->mutex);
+- 			return -EINVAL;
++ 			r = -EINVAL;
++ 			goto error_unreserve;
+  		}
+ +		last_offset = tmp->eoffset;
+ +		head = &tmp->vm_list;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (bo_va->soffset) {
+ +		/* add a clone of the bo_va to clear the old address */
+ +		tmp = kzalloc(sizeof(struct radeon_bo_va), GFP_KERNEL);
+ +		if (!tmp) {
+ +			mutex_unlock(&vm->mutex);
+ +			return -ENOMEM;
+++=======
++ 	if (bo_va->it.start || bo_va->it.last) {
++ 		if (bo_va->addr) {
++ 			/* add a clone of the bo_va to clear the old address */
++ 			struct radeon_bo_va *tmp;
++ 			tmp = kzalloc(sizeof(struct radeon_bo_va), GFP_KERNEL);
++ 			if (!tmp) {
++ 				mutex_unlock(&vm->mutex);
++ 				r = -ENOMEM;
++ 				goto error_unreserve;
++ 			}
++ 			tmp->it.start = bo_va->it.start;
++ 			tmp->it.last = bo_va->it.last;
++ 			tmp->vm = vm;
++ 			tmp->addr = bo_va->addr;
++ 			tmp->bo = radeon_bo_ref(bo_va->bo);
++ 			spin_lock(&vm->status_lock);
++ 			list_add(&tmp->vm_status, &vm->freed);
++ 			spin_unlock(&vm->status_lock);
++ 
++ 			bo_va->addr = 0;
+++>>>>>>> ee18e599251e (drm/radeon: Make sure radeon_vm_bo_set_addr always unreserves the BO)
+  		}
+ -
+ -		interval_tree_remove(&bo_va->it, &vm->va);
+ -		bo_va->it.start = 0;
+ -		bo_va->it.last = 0;
+ -	}
+ -
+ -	if (soffset || eoffset) {
+ -		bo_va->it.start = soffset;
+ -		bo_va->it.last = eoffset - 1;
+ -		interval_tree_insert(&bo_va->it, &vm->va);
+ +		tmp->soffset = bo_va->soffset;
+ +		tmp->eoffset = bo_va->eoffset;
+ +		tmp->vm = vm;
+ +		list_add(&tmp->vm_status, &vm->freed);
+  	}
+  
+ +	bo_va->soffset = soffset;
+ +	bo_va->eoffset = eoffset;
+  	bo_va->flags = flags;
+ -	bo_va->addr = 0;
+ +	bo_va->valid = false;
+ +	list_move(&bo_va->vm_list, head);
+  
+ -	soffset >>= radeon_vm_block_size;
+ -	eoffset >>= radeon_vm_block_size;
+ +	soffset = (soffset / RADEON_GPU_PAGE_SIZE) >> radeon_vm_block_size;
+ +	eoffset = (eoffset / RADEON_GPU_PAGE_SIZE) >> radeon_vm_block_size;
+  
+  	BUG_ON(eoffset >= radeon_vm_num_pdes(rdev));
+  
+@@@ -536,7 -577,11 +561,15 @@@
+  	}
+  
+  	mutex_unlock(&vm->mutex);
+++<<<<<<< HEAD
+ +	return radeon_bo_reserve(bo_va->bo, false);
+++=======
++ 	return 0;
++ 
++ error_unreserve:
++ 	radeon_bo_unreserve(bo_va->bo);
++ 	return r;
+++>>>>>>> ee18e599251e (drm/radeon: Make sure radeon_vm_bo_set_addr always unreserves the BO)
+  }
+  
+  /**
+* Unmerged path drivers/gpu/drm/radeon/radeon_vm.c
