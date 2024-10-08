@@ -1,0 +1,223 @@
+proc: show locks in /proc/pid/fdinfo/X
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Andrey Vagin <avagin@openvz.org>
+commit 6c8c90319c0bb1c9e0b68e721359b89ae4f28465
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6c8c9031.failed
+
+Let's show locks which are associated with a file descriptor in
+its fdinfo file.
+
+Currently we don't have a reliable way to determine who holds a lock.  We
+can find some information in /proc/locks, but PID which is reported there
+can be wrong.  For example, a process takes a lock, then forks a child and
+dies.  In this case /proc/locks contains the parent pid, which can be
+reused by another process.
+
+$ cat /proc/locks
+...
+6: FLOCK  ADVISORY  WRITE 324 00:13:13431 0 EOF
+...
+
+$ ps -C rpcbind
+  PID TTY          TIME CMD
+  332 ?        00:00:00 rpcbind
+
+$ cat /proc/332/fdinfo/4
+pos:	0
+flags:	0100000
+mnt_id:	22
+lock:	1: FLOCK  ADVISORY  WRITE 324 00:13:13431 0 EOF
+
+$ ls -l /proc/332/fd/4
+lr-x------ 1 root root 64 Mar  5 14:43 /proc/332/fd/4 -> /run/rpcbind.lock
+
+$ ls -l /proc/324/fd/
+total 0
+lrwx------ 1 root root 64 Feb 27 14:50 0 -> /dev/pts/0
+lrwx------ 1 root root 64 Feb 27 14:50 1 -> /dev/pts/0
+lrwx------ 1 root root 64 Feb 27 14:49 2 -> /dev/pts/0
+
+You can see that the process with the 324 pid doesn't hold the lock.
+
+This information is required for proper dumping and restoring file
+locks.
+
+	Signed-off-by: Andrey Vagin <avagin@openvz.org>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Acked-by: Jeff Layton <jlayton@poochiereds.net>
+	Acked-by: "J. Bruce Fields" <bfields@fieldses.org>
+	Acked-by: Cyrill Gorcunov <gorcunov@openvz.org>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Joe Perches <joe@perches.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6c8c90319c0bb1c9e0b68e721359b89ae4f28465)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/fd.c
+#	include/linux/fs.h
+diff --cc fs/proc/fd.c
+index ba40899e6aaf,af84ad04df77..000000000000
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@@ -48,16 -49,23 +49,34 @@@ static int seq_show(struct seq_file *m
+  		put_files_struct(files);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!ret) {
+ +		seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\n",
+ +			   (long long)file->f_pos, f_flags,
+ +			   real_mount(file->f_path.mnt)->mnt_id);
+ +		if (file->f_op->show_fdinfo)
+ +			ret = file->f_op->show_fdinfo(m, file);
+ +		fput(file);
+ +	}
+++=======
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 6c8c90319c0b (proc: show locks in /proc/pid/fdinfo/X)
+  
+- 	return ret;
++ 	seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\n",
++ 		   (long long)file->f_pos, f_flags,
++ 		   real_mount(file->f_path.mnt)->mnt_id);
++ 
++ 	show_fd_locks(m, file, files);
++ 	if (seq_has_overflowed(m))
++ 		goto out;
++ 
++ 	if (file->f_op->show_fdinfo)
++ 		file->f_op->show_fdinfo(m, file);
++ 
++ out:
++ 	fput(file);
++ 	return 0;
+  }
+  
+  static int seq_fdinfo_open(struct inode *inode, struct file *file)
+diff --cc include/linux/fs.h
+index 67ee418be1ff,c4e927358503..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1055,13 -1039,15 +1055,22 @@@ extern int vfs_cancel_lock(struct file 
+  extern int flock_lock_file_wait(struct file *filp, struct file_lock *fl);
+  extern int __break_lease(struct inode *inode, unsigned int flags, unsigned int type);
+  extern void lease_get_mtime(struct inode *, struct timespec *time);
+++<<<<<<< HEAD
+ +extern int generic_setlease(struct file *, long, struct file_lock **);
+ +extern int vfs_setlease(struct file *, long, struct file_lock **);
+ +extern int lease_modify(struct file_lock **, int);
+ +extern int lock_may_read(struct inode *, loff_t start, unsigned long count);
+ +extern int lock_may_write(struct inode *, loff_t start, unsigned long count);
+++=======
++ extern int generic_setlease(struct file *, long, struct file_lock **, void **priv);
++ extern int vfs_setlease(struct file *, long, struct file_lock **, void **);
++ extern int lease_modify(struct file_lock *, int, struct list_head *);
++ struct files_struct;
++ extern void show_fd_locks(struct seq_file *f,
++ 			 struct file *filp, struct files_struct *files);
+++>>>>>>> 6c8c90319c0b (proc: show locks in /proc/pid/fdinfo/X)
+  #else /* !CONFIG_FILE_LOCKING */
+ -static inline int fcntl_getlk(struct file *file, unsigned int cmd,
+ -			      struct flock __user *user)
+ +static inline int fcntl_getlk(struct file *file, struct flock __user *user)
+  {
+  	return -EINVAL;
+  }
+@@@ -1189,17 -1182,9 +1198,23 @@@ static inline int lease_modify(struct f
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int lock_may_read(struct inode *inode, loff_t start,
+ +				unsigned long len)
+ +{
+ +	return 1;
+ +}
+ +
+ +static inline int lock_may_write(struct inode *inode, loff_t start,
+ +				 unsigned long len)
+ +{
+ +	return 1;
+ +}
+++=======
++ struct files_struct;
++ static inline void show_fd_locks(struct seq_file *f,
++ 			struct file *filp, struct files_struct *files) {}
+++>>>>>>> 6c8c90319c0b (proc: show locks in /proc/pid/fdinfo/X)
+  #endif /* !CONFIG_FILE_LOCKING */
+  
+  
+diff --git a/Documentation/filesystems/proc.txt b/Documentation/filesystems/proc.txt
+index 3c103af4d962..922a3c89b2cc 100644
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -1693,6 +1693,10 @@ A typical output is
+ 	flags:	0100002
+ 	mnt_id:	19
+ 
++All locks associated with a file descriptor are shown in its fdinfo too.
++
++lock:       1: FLOCK  ADVISORY  WRITE 359 00:13:11691 0 EOF
++
+ The files such as eventfd, fsnotify, signalfd, epoll among the regular pos/flags
+ pair provide additional information particular to the objects they represent.
+ 
+diff --git a/fs/locks.c b/fs/locks.c
+index 864088fde615..ddb7fb7b330b 100644
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@ -2395,6 +2395,44 @@ static int locks_show(struct seq_file *f, void *v)
+ 	return 0;
+ }
+ 
++static void __show_fd_locks(struct seq_file *f,
++			struct list_head *head, int *id,
++			struct file *filp, struct files_struct *files)
++{
++	struct file_lock *fl;
++
++	list_for_each_entry(fl, head, fl_list) {
++
++		if (filp != fl->fl_file)
++			continue;
++		if (fl->fl_owner != files &&
++		    fl->fl_owner != filp)
++			continue;
++
++		(*id)++;
++		seq_puts(f, "lock:\t");
++		lock_get_status(f, fl, *id, "");
++	}
++}
++
++void show_fd_locks(struct seq_file *f,
++		  struct file *filp, struct files_struct *files)
++{
++	struct inode *inode = file_inode(filp);
++	struct file_lock_context *ctx;
++	int id = 0;
++
++	ctx = inode->i_flctx;
++	if (!ctx)
++		return;
++
++	spin_lock(&ctx->flc_lock);
++	__show_fd_locks(f, &ctx->flc_flock, &id, filp, files);
++	__show_fd_locks(f, &ctx->flc_posix, &id, filp, files);
++	__show_fd_locks(f, &ctx->flc_lease, &id, filp, files);
++	spin_unlock(&ctx->flc_lock);
++}
++
+ static void *locks_start(struct seq_file *f, loff_t *pos)
+ {
+ 	struct locks_iterator *iter = f->private;
+* Unmerged path fs/proc/fd.c
+* Unmerged path include/linux/fs.h
