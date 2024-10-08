@@ -27,7 +27,6 @@ struct xfs_trans;
 /*
  * Allocation parameters for inode allocation.
  */
-#define	XFS_IALLOC_INODES(mp)	(mp)->m_ialloc_inos
 #define	XFS_IALLOC_BLOCKS(mp)	(mp)->m_ialloc_blks
 
 /*
