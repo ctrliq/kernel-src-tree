@@ -1,0 +1,462 @@
+ceph: fix security xattr deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 315f24088048a51eed341c53be66ea477a3c7d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/315f2408.failed
+
+When security is enabled, security module can call filesystem's
+getxattr/setxattr callbacks during d_instantiate(). For cephfs,
+d_instantiate() is usually called by MDS' dispatch thread, while
+handling MDS reply. If the MDS reply does not include xattrs and
+corresponding caps, getxattr/setxattr need to send a new request
+to MDS and waits for the reply. This makes MDS' dispatch sleep,
+nobody handles later MDS replies.
+
+The fix is make sure lookup/atomic_open reply include xattrs and
+corresponding caps. So getxattr can be handled by cached xattrs.
+This requires some modification to both MDS and request message.
+(Client tells MDS what caps it wants; MDS encodes proper caps in
+the reply)
+
+Smack security module may call setxattr during d_instantiate().
+Unlike getxattr, we can't force MDS to issue CEPH_CAP_XATTR_EXCL
+to us. So just make setxattr return error when called by MDS'
+dispatch thread.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 315f24088048a51eed341c53be66ea477a3c7d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+#	fs/ceph/inode.c
+#	fs/ceph/super.h
+#	fs/ceph/xattr.c
+diff --cc fs/ceph/file.c
+index 0c3070bb755c,334a75170a3b..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -218,10 -299,12 +218,15 @@@ int ceph_atomic_open(struct inode *dir
+  	struct ceph_mds_client *mdsc = fsc->mdsc;
+  	struct ceph_mds_request *req;
+  	struct dentry *dn;
+++<<<<<<< HEAD
+++=======
++ 	struct ceph_acls_info acls = {};
++        int mask;
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  	int err;
+  
+ -	dout("atomic_open %p dentry %p '%pd' %s flags %d mode 0%o\n",
+ -	     dir, dentry, dentry,
+ +	dout("atomic_open %p dentry %p '%.*s' %s flags %d mode 0%o\n",
+ +	     dir, dentry, dentry->d_name.len, dentry->d_name.name,
+  	     d_unhashed(dentry) ? "unhashed" : "hashed", flags, mode);
+  
+  	if (dentry->d_name.len > NAME_MAX)
+@@@ -240,7 -331,17 +245,13 @@@
+  	if (flags & O_CREAT) {
+  		req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+  		req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+ -		if (acls.pagelist) {
+ -			req->r_pagelist = acls.pagelist;
+ -			acls.pagelist = NULL;
+ -		}
+  	}
++ 
++        mask = CEPH_STAT_CAP_INODE | CEPH_CAP_AUTH_SHARED;
++        if (ceph_security_xattr_wanted(dir))
++                mask |= CEPH_CAP_XATTR_SHARED;
++        req->r_args.open.mask = cpu_to_le32(mask);
++ 
+  	req->r_locked_dir = dir;           /* caller holds dir->i_mutex */
+  	err = ceph_mdsc_do_request(mdsc,
+  				   (flags & (O_CREAT|O_TRUNC)) ? dir : NULL,
+diff --cc fs/ceph/inode.c
+index a649a586cda7,8b136dc0bc13..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -1435,8 -1499,19 +1435,23 @@@ retry_lookup
+  			goto next_item;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (!dn->d_inode) {
+ +			struct dentry *realdn = splice_dentry(dn, in, NULL);
+++=======
++ 		if (d_really_is_negative(dn)) {
++ 			struct dentry *realdn;
++ 
++ 			if (ceph_security_xattr_deadlock(in)) {
++ 				dout(" skip splicing dn %p to inode %p"
++ 				     " (security xattr deadlock)\n", dn, in);
++ 				iput(in);
++ 				skipped++;
++ 				goto next_item;
++ 			}
++ 
++ 			realdn = splice_dentry(dn, in);
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  			if (IS_ERR(realdn)) {
+  				err = PTR_ERR(realdn);
+  				d_drop(dn);
+@@@ -1452,14 -1527,23 +1467,29 @@@
+  		update_dentry_lease(dn, rinfo->dir_dlease[i],
+  				    req->r_session,
+  				    req->r_request_started);
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (err == 0 && skipped == 0 && cache_ctl.index >= 0) {
++ 			ret = fill_readdir_cache(d_inode(parent), dn,
++ 						 &cache_ctl, req);
++ 			if (ret < 0)
++ 				err = ret;
++ 		}
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  next_item:
+  		if (dn)
+  			dput(dn);
+  	}
+++<<<<<<< HEAD
+ +	if (err == 0)
+++=======
++ out:
++ 	if (err == 0 && skipped == 0) {
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  		req->r_did_prepopulate = true;
+ -		req->r_readdir_cache_idx = cache_ctl.index;
+ -	}
+ -	ceph_readdir_cache_release(&cache_ctl);
+ +
+ +out:
+  	if (snapdir) {
+  		iput(snapdir);
+  		dput(parent);
+diff --cc fs/ceph/super.h
+index 1c439e8e6c74,2d48138da58e..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -440,19 -461,22 +440,30 @@@ static inline struct inode *ceph_find_i
+  /*
+   * Ceph inode.
+   */
+++<<<<<<< HEAD
+ +#define CEPH_I_DIR_ORDERED	1  /* dentries in dir are ordered */
+ +#define CEPH_I_NODELAY		4  /* do not delay cap release */
+ +#define CEPH_I_FLUSH		8  /* do not delay flush of dirty metadata */
+ +#define CEPH_I_NOFLUSH		16 /* do not flush dirty caps */
+++=======
++ #define CEPH_I_DIR_ORDERED	(1 << 0)  /* dentries in dir are ordered */
++ #define CEPH_I_NODELAY		(1 << 1)  /* do not delay cap release */
++ #define CEPH_I_FLUSH		(1 << 2)  /* do not delay flush of dirty metadata */
++ #define CEPH_I_NOFLUSH		(1 << 3)  /* do not flush dirty caps */
++ #define CEPH_I_POOL_PERM	(1 << 4)  /* pool rd/wr bits are valid */
++ #define CEPH_I_POOL_RD		(1 << 5)  /* can read from pool */
++ #define CEPH_I_POOL_WR		(1 << 6)  /* can write to pool */
++ #define CEPH_I_SEC_INITED	(1 << 7)  /* security initialized */
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  
+  static inline void __ceph_dir_set_complete(struct ceph_inode_info *ci,
+ -					   long long release_count,
+ -					   long long ordered_count)
+ +					   int release_count, int ordered_count)
+  {
+ -	smp_mb__before_atomic();
+ -	atomic64_set(&ci->i_complete_seq[0], release_count);
+ -	atomic64_set(&ci->i_complete_seq[1], ordered_count);
+ +	atomic_set(&ci->i_complete_count, release_count);
+ +	if (ci->i_ordered_count == ordered_count)
+ +		ci->i_ceph_flags |= CEPH_I_DIR_ORDERED;
+ +	else
+ +		ci->i_ceph_flags &= ~CEPH_I_DIR_ORDERED;
+  }
+  
+  static inline void __ceph_dir_clear_complete(struct ceph_inode_info *ci)
+@@@ -770,6 -802,70 +781,73 @@@ extern void __ceph_build_xattrs_blob(st
+  extern void __ceph_destroy_xattrs(struct ceph_inode_info *ci);
+  extern void __init ceph_xattr_init(void);
+  extern void ceph_xattr_exit(void);
+++<<<<<<< HEAD
+++=======
++ extern const struct xattr_handler *ceph_xattr_handlers[];
++ 
++ #ifdef CONFIG_SECURITY
++ extern bool ceph_security_xattr_deadlock(struct inode *in);
++ extern bool ceph_security_xattr_wanted(struct inode *in);
++ #else
++ static inline bool ceph_security_xattr_deadlock(struct inode *in)
++ {
++ 	return false;
++ }
++ static inline bool ceph_security_xattr_wanted(struct inode *in)
++ {
++ 	return false;
++ }
++ #endif
++ 
++ /* acl.c */
++ struct ceph_acls_info {
++ 	void *default_acl;
++ 	void *acl;
++ 	struct ceph_pagelist *pagelist;
++ };
++ 
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 
++ struct posix_acl *ceph_get_acl(struct inode *, int);
++ int ceph_set_acl(struct inode *inode, struct posix_acl *acl, int type);
++ int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
++ 		       struct ceph_acls_info *info);
++ void ceph_init_inode_acls(struct inode *inode, struct ceph_acls_info *info);
++ void ceph_release_acls_info(struct ceph_acls_info *info);
++ 
++ static inline void ceph_forget_all_cached_acls(struct inode *inode)
++ {
++        forget_all_cached_acls(inode);
++ }
++ 
++ #else
++ 
++ #define ceph_get_acl NULL
++ #define ceph_set_acl NULL
++ 
++ static inline int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
++ 				     struct ceph_acls_info *info)
++ {
++ 	return 0;
++ }
++ static inline void ceph_init_inode_acls(struct inode *inode,
++ 					struct ceph_acls_info *info)
++ {
++ }
++ static inline void ceph_release_acls_info(struct ceph_acls_info *info)
++ {
++ }
++ static inline int ceph_acl_chmod(struct dentry *dentry, struct inode *inode)
++ {
++ 	return 0;
++ }
++ 
++ static inline void ceph_forget_all_cached_acls(struct inode *inode)
++ {
++ }
++ 
++ #endif
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  
+  /* caps.c */
+  extern const char *ceph_cap_string(int c);
+diff --cc fs/ceph/xattr.c
+index 5ff57c801f5e,9410abdef3ce..000000000000
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@@ -700,14 -714,31 +700,36 @@@ void __ceph_build_xattrs_blob(struct ce
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +ssize_t ceph_getxattr(struct dentry *dentry, const char *name, void *value,
+++=======
++ static inline int __get_request_mask(struct inode *in) {
++ 	struct ceph_mds_request *req = current->journal_info;
++ 	int mask = 0;
++ 	if (req && req->r_target_inode == in) {
++ 		if (req->r_op == CEPH_MDS_OP_LOOKUP ||
++ 		    req->r_op == CEPH_MDS_OP_LOOKUPINO ||
++ 		    req->r_op == CEPH_MDS_OP_LOOKUPPARENT ||
++ 		    req->r_op == CEPH_MDS_OP_GETATTR) {
++ 			mask = le32_to_cpu(req->r_args.getattr.mask);
++ 		} else if (req->r_op == CEPH_MDS_OP_OPEN ||
++ 			   req->r_op == CEPH_MDS_OP_CREATE) {
++ 			mask = le32_to_cpu(req->r_args.open.mask);
++ 		}
++ 	}
++ 	return mask;
++ }
++ 
++ ssize_t __ceph_getxattr(struct inode *inode, const char *name, void *value,
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+  		      size_t size)
+  {
+ +	struct inode *inode = dentry->d_inode;
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+- 	int err;
+  	struct ceph_inode_xattr *xattr;
+  	struct ceph_vxattr *vxattr = NULL;
++ 	int req_mask;
++ 	int err;
+  
+  	if (!ceph_is_valid_xattr(name))
+  		return -ENODATA;
+@@@ -995,8 -1049,17 +1031,16 @@@ do_sync
+  do_sync_unlocked:
+  	if (lock_snap_rwsem)
+  		up_read(&mdsc->snap_rwsem);
+- 	err = ceph_sync_setxattr(dentry, name, value, size, flags);
++ 
++ 	/* security module set xattr while filling trace */
++ 	if (current->journal_info != NULL) {
++ 		pr_warn_ratelimited("sync setxattr %p "
++ 				    "during filling trace\n", inode);
++ 		err = -EBUSY;
++ 	} else {
++ 		err = ceph_sync_setxattr(dentry, name, value, size, flags);
++ 	}
+  out:
+ -	ceph_free_cap_flush(prealloc_cf);
+  	kfree(newname);
+  	kfree(newval);
+  	kfree(xattr);
+@@@ -1113,3 -1196,35 +1157,38 @@@ do_sync_unlocked
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int ceph_removexattr(struct dentry *dentry, const char *name)
++ {
++ 	if (ceph_snap(d_inode(dentry)) != CEPH_NOSNAP)
++ 		return -EROFS;
++ 
++ 	if (!strncmp(name, XATTR_SYSTEM_PREFIX, XATTR_SYSTEM_PREFIX_LEN))
++ 		return generic_removexattr(dentry, name);
++ 
++ 	return __ceph_removexattr(dentry, name);
++ }
++ 
++ #ifdef CONFIG_SECURITY
++ bool ceph_security_xattr_wanted(struct inode *in)
++ {
++ 	return in->i_security != NULL;
++ }
++ 
++ bool ceph_security_xattr_deadlock(struct inode *in)
++ {
++ 	struct ceph_inode_info *ci;
++ 	bool ret;
++ 	if (in->i_security == NULL)
++ 		return false;
++ 	ci = ceph_inode(in);
++ 	spin_lock(&ci->i_ceph_lock);
++ 	ret = !(ci->i_ceph_flags & CEPH_I_SEC_INITED) &&
++ 	      !(ci->i_xattrs.version > 0 &&
++ 		__ceph_caps_issued_mask(ci, CEPH_CAP_XATTR_SHARED, 0));
++ 	spin_unlock(&ci->i_ceph_lock);
++ 	return ret;
++ }
++ #endif
+++>>>>>>> 315f24088048 (ceph: fix security xattr deadlock)
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index 67bdd35eda74..95cb28bb2767 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -618,6 +618,7 @@ static struct dentry *ceph_lookup(struct inode *dir, struct dentry *dentry,
+ 	struct ceph_mds_client *mdsc = fsc->mdsc;
+ 	struct ceph_mds_request *req;
+ 	int op;
++	int mask;
+ 	int err;
+ 
+ 	dout("lookup %p dentry %p '%.*s'\n",
+@@ -660,8 +661,12 @@ static struct dentry *ceph_lookup(struct inode *dir, struct dentry *dentry,
+ 		return ERR_CAST(req);
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+-	/* we only need inode linkage */
+-	req->r_args.getattr.mask = cpu_to_le32(CEPH_STAT_CAP_INODE);
++
++	mask = CEPH_STAT_CAP_INODE | CEPH_CAP_AUTH_SHARED;
++	if (ceph_security_xattr_wanted(dir))
++		mask |= CEPH_CAP_XATTR_SHARED;
++	req->r_args.getattr.mask = cpu_to_le32(mask);
++
+ 	req->r_locked_dir = dir;
+ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
+ 	err = ceph_handle_snapdir(req, dentry, err);
+diff --git a/fs/ceph/export.c b/fs/ceph/export.c
+index 8d7d782f4382..fc5e552e7766 100644
+--- a/fs/ceph/export.c
++++ b/fs/ceph/export.c
+@@ -71,12 +71,18 @@ static struct dentry *__fh_to_dentry(struct super_block *sb, u64 ino)
+ 	inode = ceph_find_inode(sb, vino);
+ 	if (!inode) {
+ 		struct ceph_mds_request *req;
++		int mask;
+ 
+ 		req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_LOOKUPINO,
+ 					       USE_ANY_MDS);
+ 		if (IS_ERR(req))
+ 			return ERR_CAST(req);
+ 
++		mask = CEPH_STAT_CAP_INODE;
++		if (ceph_security_xattr_wanted(d_inode(sb->s_root)))
++			mask |= CEPH_CAP_XATTR_SHARED;
++		req->r_args.getattr.mask = cpu_to_le32(mask);
++
+ 		req->r_ino1 = vino;
+ 		req->r_num_caps = 1;
+ 		err = ceph_mdsc_do_request(mdsc, NULL, req);
+@@ -128,6 +134,7 @@ static struct dentry *__get_parent(struct super_block *sb,
+ 	struct ceph_mds_request *req;
+ 	struct inode *inode;
+ 	struct dentry *dentry;
++	int mask;
+ 	int err;
+ 
+ 	req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_LOOKUPPARENT,
+@@ -144,6 +151,12 @@ static struct dentry *__get_parent(struct super_block *sb,
+ 			.snap = CEPH_NOSNAP,
+ 		};
+ 	}
++
++	mask = CEPH_STAT_CAP_INODE;
++	if (ceph_security_xattr_wanted(d_inode(sb->s_root)))
++		mask |= CEPH_CAP_XATTR_SHARED;
++	req->r_args.getattr.mask = cpu_to_le32(mask);
++
+ 	req->r_num_caps = 1;
+ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
+ 	inode = req->r_target_inode;
+* Unmerged path fs/ceph/file.c
+* Unmerged path fs/ceph/inode.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 0a8d4826f8f7..cd2b3784c9e8 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -2502,6 +2502,7 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 
+ 	/* insert trace into our cache */
+ 	mutex_lock(&req->r_fill_mutex);
++	current->journal_info = req;
+ 	err = ceph_fill_trace(mdsc->fsc->sb, req, req->r_session);
+ 	if (err == 0) {
+ 		if (result == 0 && (req->r_op == CEPH_MDS_OP_READDIR ||
+@@ -2509,6 +2510,7 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 			ceph_readdir_prepopulate(req, req->r_session);
+ 		ceph_unreserve_caps(mdsc, &req->r_caps_reservation);
+ 	}
++	current->journal_info = NULL;
+ 	mutex_unlock(&req->r_fill_mutex);
+ 
+ 	up_read(&mdsc->snap_rwsem);
+* Unmerged path fs/ceph/super.h
+* Unmerged path fs/ceph/xattr.c
+diff --git a/include/linux/ceph/ceph_fs.h b/include/linux/ceph/ceph_fs.h
+index d7d072a25c27..2dffb04e9503 100644
+--- a/include/linux/ceph/ceph_fs.h
++++ b/include/linux/ceph/ceph_fs.h
+@@ -376,7 +376,8 @@ union ceph_mds_request_args {
+ 		__le32 stripe_count;         /* ... */
+ 		__le32 object_size;
+ 		__le32 file_replication;
+-		__le32 unused;               /* used to be preferred osd */
++               __le32 mask;                 /* CEPH_CAP_* */
++               __le32 old_size;
+ 	} __attribute__ ((packed)) open;
+ 	struct {
+ 		__le32 flags;
