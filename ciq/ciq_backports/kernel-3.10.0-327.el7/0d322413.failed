@@ -1,0 +1,176 @@
+sfc: protect filter table against use-after-free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit 0d322413d6cff0bd2ccafc03ab9314dc55417e9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0d322413.failed
+
+If MCDI timeouts are encountered during efx_ef10_filter_table_remove(),
+an FLR will be queued, but efx->filter_state will still be kfree()d.
+The queued FLR will then call efx_ef10_filter_table_restore(), which
+will try to use efx->filter_state. This previously caused a panic.
+This patch adds an rwsem to protect the existence of efx->filter_state,
+separately from the spinlock protecting its contents.  Users which can
+race against efx_ef10_filter_table_remove() should down_read this rwsem.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0d322413d6cff0bd2ccafc03ab9314dc55417e9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/efx.c
+diff --cc drivers/net/ethernet/sfc/efx.c
+index 9557690dd00f,50816cdbcc95..000000000000
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@@ -2417,7 -2472,18 +2434,21 @@@ int efx_reset_up(struct efx_nic *efx, e
+  	rc = efx_enable_interrupts(efx);
+  	if (rc)
+  		goto fail;
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_SFC_SRIOV
++ 	rc = efx->type->vswitching_restore(efx);
++ 	if (rc) /* not fatal; the PF will still work fine */
++ 		netif_warn(efx, probe, efx->net_dev,
++ 			   "failed to restore vswitching rc=%d;"
++ 			   " VFs may not function\n", rc);
++ #endif
++ 
++ 	down_read(&efx->filter_sem);
+++>>>>>>> 0d322413d6cf (sfc: protect filter table against use-after-free)
+  	efx_restore_filters(efx);
++ 	up_read(&efx->filter_sem);
+  	if (efx->type->sriov_reset)
+  		efx->type->sriov_reset(efx);
+  
+diff --git a/drivers/net/ethernet/sfc/ef10.c b/drivers/net/ethernet/sfc/ef10.c
+index cd683661ffb0..cda2b79ae122 100644
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -3081,6 +3081,9 @@ fail:
+ 	return rc;
+ }
+ 
++/* Caller must hold efx->filter_sem for read if race against
++ * efx_ef10_filter_table_remove() is possible
++ */
+ static void efx_ef10_filter_table_restore(struct efx_nic *efx)
+ {
+ 	struct efx_ef10_filter_table *table = efx->filter_state;
+@@ -3090,9 +3093,14 @@ static void efx_ef10_filter_table_restore(struct efx_nic *efx)
+ 	bool failed = false;
+ 	int rc;
+ 
++	WARN_ON(!rwsem_is_locked(&efx->filter_sem));
++
+ 	if (!nic_data->must_restore_filters)
+ 		return;
+ 
++	if (!table)
++		return;
++
+ 	spin_lock_bh(&efx->filter_lock);
+ 
+ 	for (filter_idx = 0; filter_idx < HUNT_FILTER_TBL_ROWS; filter_idx++) {
+@@ -3128,6 +3136,7 @@ static void efx_ef10_filter_table_restore(struct efx_nic *efx)
+ 		nic_data->must_restore_filters = false;
+ }
+ 
++/* Caller must hold efx->filter_sem for write */
+ static void efx_ef10_filter_table_remove(struct efx_nic *efx)
+ {
+ 	struct efx_ef10_filter_table *table = efx->filter_state;
+@@ -3136,6 +3145,10 @@ static void efx_ef10_filter_table_remove(struct efx_nic *efx)
+ 	unsigned int filter_idx;
+ 	int rc;
+ 
++	efx->filter_state = NULL;
++	if (!table)
++		return;
++
+ 	for (filter_idx = 0; filter_idx < HUNT_FILTER_TBL_ROWS; filter_idx++) {
+ 		spec = efx_ef10_filter_entry_spec(table, filter_idx);
+ 		if (!spec)
+@@ -3161,6 +3174,9 @@ static void efx_ef10_filter_table_remove(struct efx_nic *efx)
+ 	kfree(table);
+ }
+ 
++/* Caller must hold efx->filter_sem for read if race against
++ * efx_ef10_filter_table_remove() is possible
++ */
+ static void efx_ef10_filter_sync_rx_mode(struct efx_nic *efx)
+ {
+ 	struct efx_ef10_filter_table *table = efx->filter_state;
+@@ -3175,6 +3191,9 @@ static void efx_ef10_filter_sync_rx_mode(struct efx_nic *efx)
+ 	if (!efx_dev_registered(efx))
+ 		return;
+ 
++	if (!table)
++		return;
++
+ 	/* Mark old filters that may need to be removed */
+ 	spin_lock_bh(&efx->filter_lock);
+ 	n = table->dev_uc_count < 0 ? 1 : table->dev_uc_count;
+* Unmerged path drivers/net/ethernet/sfc/efx.c
+diff --git a/drivers/net/ethernet/sfc/efx.h b/drivers/net/ethernet/sfc/efx.h
+index bc4e4b3e6aad..c555b92f9133 100644
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -71,6 +71,8 @@ void efx_schedule_slow_fill(struct efx_rx_queue *rx_queue);
+ 
+ /* Filters */
+ 
++void efx_mac_reconfigure(struct efx_nic *efx);
++
+ /**
+  * efx_filter_insert_filter - add or replace a filter
+  * @efx: NIC in which to insert the filter
+diff --git a/drivers/net/ethernet/sfc/ethtool.c b/drivers/net/ethernet/sfc/ethtool.c
+index 2f161d4e65ac..b79ac74a6872 100644
+--- a/drivers/net/ethernet/sfc/ethtool.c
++++ b/drivers/net/ethernet/sfc/ethtool.c
+@@ -734,7 +734,7 @@ static int efx_ethtool_set_pauseparam(struct net_device *net_dev,
+ 	/* Reconfigure the MAC. The PHY *may* generate a link state change event
+ 	 * if the user just changed the advertised capabilities, but there's no
+ 	 * harm doing this twice */
+-	efx->type->reconfigure_mac(efx);
++	efx_mac_reconfigure(efx);
+ 
+ out:
+ 	mutex_unlock(&efx->mac_lock);
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index a6f4d9aadd40..2361be9a7fa4 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -25,6 +25,7 @@
+ #include <linux/highmem.h>
+ #include <linux/workqueue.h>
+ #include <linux/mutex.h>
++#include <linux/rwsem.h>
+ #include <linux/vmalloc.h>
+ #include <linux/i2c.h>
+ #include <linux/mtd/mtd.h>
+@@ -897,7 +898,8 @@ struct vfdi_status;
+  * @loopback_mode: Loopback status
+  * @loopback_modes: Supported loopback mode bitmask
+  * @loopback_selftest: Offline self-test private state
+- * @filter_lock: Filter table lock
++ * @filter_sem: Filter table rw_semaphore, for freeing the table
++ * @filter_lock: Filter table lock, for mere content changes
+  * @filter_state: Architecture-dependent filter table state
+  * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
+  *	indexed by filter ID
+@@ -1040,6 +1042,7 @@ struct efx_nic {
+ 
+ 	void *loopback_selftest;
+ 
++	struct rw_semaphore filter_sem;
+ 	spinlock_t filter_lock;
+ 	void *filter_state;
+ #ifdef CONFIG_RFS_ACCEL
