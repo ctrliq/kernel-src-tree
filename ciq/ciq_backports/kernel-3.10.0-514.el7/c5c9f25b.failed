@@ -1,0 +1,92 @@
+NVMe: default to 4k device page size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Nishanth Aravamudan <nacc at linux.vnet.ibm.com>
+commit c5c9f25b98a568451d665afe4aeefe17bf9f2995
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c5c9f25b.failed
+
+We received a bug report recently when DDW (64-bit direct DMA on Power)
+is not enabled for NVMe devices. In that case, we fall back to 32-bit
+DMA via the IOMMU, which is always done via 4K TCEs (Translation Control
+Entries).
+
+The NVMe device driver, though, assumes that the DMA alignment for the
+PRP entries will match the device's page size, and that the DMA aligment
+matches the kernel's page aligment. On Power, the the IOMMU page size,
+as mentioned above, can be 4K, while the device can have a page size of
+8K, while the kernel has a page size of 64K. This eventually trips the
+BUG_ON in nvme_setup_prps(), as we have a 'dma_len' that is a multiple
+of 4K but not 8K (e.g., 0xF000).
+
+In this particular case of page sizes, we clearly want to use the
+IOMMU's page size in the driver. And generally, the NVMe driver in this
+function should be using the IOMMU's page size for the default device
+page size, rather than the kernel's page size. There is not currently an
+API to obtain the IOMMU's page size across all architectures and in the
+interest of a stop-gap fix to this functional issue, default the NVMe
+device page size to 4K, with the intent of adding such an API and
+implementation across all architectures in the next merge window.
+
+With the functionally equivalent v3 of this patch, our hardware test
+exerciser survives when using 32-bit DMA; without the patch, the kernel
+will BUG within a few minutes.
+
+	Signed-off-by: Nishanth Aravamudan <nacc at linux.vnet.ibm.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit c5c9f25b98a568451d665afe4aeefe17bf9f2995)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index c00f9063655c,d9d6229e9f3f..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1504,26 -1726,29 +1504,33 @@@ static int nvme_configure_admin_queue(s
+  {
+  	int result;
+  	u32 aqa;
+ -	u64 cap = lo_hi_readq(&dev->bar->cap);
+ +	u64 cap = readq(&dev->bar->cap);
+  	struct nvme_queue *nvmeq;
+- 	unsigned page_shift = PAGE_SHIFT;
++ 	/*
++ 	 * default to a 4K page size, with the intention to update this
++ 	 * path in the future to accomodate architectures with differing
++ 	 * kernel and IO page sizes.
++ 	 */
++ 	unsigned page_shift = 12;
+  	unsigned dev_page_min = NVME_CAP_MPSMIN(cap) + 12;
+- 	unsigned dev_page_max = NVME_CAP_MPSMAX(cap) + 12;
+  
+  	if (page_shift < dev_page_min) {
+ -		dev_err(dev->dev,
+ +		dev_err(&dev->pci_dev->dev,
+  				"Minimum device page size (%u) too large for "
+  				"host (%u)\n", 1 << dev_page_min,
+  				1 << page_shift);
+  		return -ENODEV;
+  	}
+ -
+ -	dev->subsystem = readl(&dev->bar->vs) >= NVME_VS(1, 1) ?
+ -						NVME_CAP_NSSRC(cap) : 0;
+ -
+ -	if (dev->subsystem && (readl(&dev->bar->csts) & NVME_CSTS_NSSRO))
+ -		writel(NVME_CSTS_NSSRO, &dev->bar->csts);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (page_shift > dev_page_max) {
+ +		dev_info(&dev->pci_dev->dev,
+ +				"Device maximum page size (%u) smaller than "
+ +				"host (%u); enabling work-around\n",
+ +				1 << dev_page_max, 1 << page_shift);
+ +		page_shift = dev_page_max;
+ +	}
+++=======
+++>>>>>>> c5c9f25b98a5 (NVMe: default to 4k device page size):drivers/nvme/host/pci.c
+  
+  	result = nvme_disable_ctrl(dev, cap);
+  	if (result < 0)
+* Unmerged path drivers/block/nvme-core.c
