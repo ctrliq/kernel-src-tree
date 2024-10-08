@@ -1088,7 +1088,7 @@ static bool get_bool(struct platform_device *ofdev, const char *s)
 	} else {
 		dev_warn(&ofdev->dev, "Parameter %s not found,"
 			"defaulting to false\n", s);
-		return 0;
+		return false;
 	}
 }
 
