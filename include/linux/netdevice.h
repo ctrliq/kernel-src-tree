@@ -482,15 +482,6 @@ void napi_complete(struct napi_struct *n);
 #define napi_complete _napi_complete
 
 /**
- *	napi_by_id - lookup a NAPI by napi_id
- *	@napi_id: hashed napi_id
- *
- * lookup @napi_id in napi_hash table
- * must be called under rcu_read_lock()
- */
-struct napi_struct *napi_by_id(unsigned int napi_id);
-
-/**
  *	napi_hash_add - add a NAPI to global hashtable
  *	@napi: napi context
  *
