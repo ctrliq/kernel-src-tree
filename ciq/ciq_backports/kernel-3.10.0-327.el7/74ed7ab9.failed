@@ -1,0 +1,1004 @@
+openvswitch: Add support for unique flow IDs.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] openvswitch: Add support for unique flow IDs (Jiri Benc) [1156461 1211348]
+Rebuild_FUZZ: 98.88%
+commit-author Joe Stringer <joestringer@nicira.com>
+commit 74ed7ab9264c54471c7f057409d352052820d750
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/74ed7ab9.failed
+
+Previously, flows were manipulated by userspace specifying a full,
+unmasked flow key. This adds significant burden onto flow
+serialization/deserialization, particularly when dumping flows.
+
+This patch adds an alternative way to refer to flows using a
+variable-length "unique flow identifier" (UFID). At flow setup time,
+userspace may specify a UFID for a flow, which is stored with the flow
+and inserted into a separate table for lookup, in addition to the
+standard flow table. Flows created using a UFID must be fetched or
+deleted using the UFID.
+
+All flow dump operations may now be made more terse with OVS_UFID_F_*
+flags. For example, the OVS_UFID_F_OMIT_KEY flag allows responses to
+omit the flow key from a datapath operation if the flow has a
+corresponding UFID. This significantly reduces the time spent assembling
+and transacting netlink messages. With all OVS_UFID_F_OMIT_* flags
+enabled, the datapath only returns the UFID and statistics for each flow
+during flow dump, increasing ovs-vswitchd revalidator performance by 40%
+or more.
+
+	Signed-off-by: Joe Stringer <joestringer@nicira.com>
+	Acked-by: Pravin B Shelar <pshelar@nicira.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 74ed7ab9264c54471c7f057409d352052820d750)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/openvswitch.h
+#	net/openvswitch/datapath.c
+#	net/openvswitch/flow_netlink.c
+#	net/openvswitch/flow_netlink.h
+diff --cc include/uapi/linux/openvswitch.h
+index 0d7501a221c7,7a8785a99243..000000000000
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@@ -450,6 -480,10 +458,13 @@@ enum ovs_flow_attr 
+  	OVS_FLOW_ATTR_USED,      /* u64 msecs last used in monotonic time. */
+  	OVS_FLOW_ATTR_CLEAR,     /* Flag to clear stats, tcp_flags, used. */
+  	OVS_FLOW_ATTR_MASK,      /* Sequence of OVS_KEY_ATTR_* attributes. */
+++<<<<<<< HEAD
+++=======
++ 	OVS_FLOW_ATTR_PROBE,     /* Flow operation is a feature probe, error
++ 				  * logging should be suppressed. */
++ 	OVS_FLOW_ATTR_UFID,      /* Variable length unique flow identifier. */
++ 	OVS_FLOW_ATTR_UFID_FLAGS,/* u32 of OVS_UFID_F_*. */
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  	__OVS_FLOW_ATTR_MAX
+  };
+  
+diff --cc net/openvswitch/datapath.c
+index 9399eb45eefe,ae5e77cdc0ca..000000000000
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@@ -669,48 -664,50 +671,81 @@@ static void get_dp_stats(const struct d
+  	}
+  }
+  
+- static size_t ovs_flow_cmd_msg_size(const struct sw_flow_actions *acts)
++ static bool should_fill_key(const struct sw_flow_id *sfid, uint32_t ufid_flags)
++ {
++ 	return ovs_identifier_is_ufid(sfid) &&
++ 	       !(ufid_flags & OVS_UFID_F_OMIT_KEY);
++ }
++ 
++ static bool should_fill_mask(uint32_t ufid_flags)
++ {
++ 	return !(ufid_flags & OVS_UFID_F_OMIT_MASK);
++ }
++ 
++ static bool should_fill_actions(uint32_t ufid_flags)
+  {
+- 	return NLMSG_ALIGN(sizeof(struct ovs_header))
+- 		+ nla_total_size(ovs_key_attr_size()) /* OVS_FLOW_ATTR_KEY */
+- 		+ nla_total_size(ovs_key_attr_size()) /* OVS_FLOW_ATTR_MASK */
++ 	return !(ufid_flags & OVS_UFID_F_OMIT_ACTIONS);
++ }
++ 
++ static size_t ovs_flow_cmd_msg_size(const struct sw_flow_actions *acts,
++ 				    const struct sw_flow_id *sfid,
++ 				    uint32_t ufid_flags)
++ {
++ 	size_t len = NLMSG_ALIGN(sizeof(struct ovs_header));
++ 
++ 	/* OVS_FLOW_ATTR_UFID */
++ 	if (sfid && ovs_identifier_is_ufid(sfid))
++ 		len += nla_total_size(sfid->ufid_len);
++ 
++ 	/* OVS_FLOW_ATTR_KEY */
++ 	if (!sfid || should_fill_key(sfid, ufid_flags))
++ 		len += nla_total_size(ovs_key_attr_size());
++ 
++ 	/* OVS_FLOW_ATTR_MASK */
++ 	if (should_fill_mask(ufid_flags))
++ 		len += nla_total_size(ovs_key_attr_size());
++ 
++ 	/* OVS_FLOW_ATTR_ACTIONS */
++ 	if (should_fill_actions(ufid_flags))
++ 		len += nla_total_size(acts->actions_len);
++ 
++ 	return len
+  		+ nla_total_size(sizeof(struct ovs_flow_stats)) /* OVS_FLOW_ATTR_STATS */
+  		+ nla_total_size(1) /* OVS_FLOW_ATTR_TCP_FLAGS */
+- 		+ nla_total_size(8) /* OVS_FLOW_ATTR_USED */
+- 		+ nla_total_size(acts->actions_len); /* OVS_FLOW_ATTR_ACTIONS */
++ 		+ nla_total_size(8); /* OVS_FLOW_ATTR_USED */
+  }
+  
+ +/* Called with ovs_mutex or RCU read lock. */
+ +static int ovs_flow_cmd_fill_match(const struct sw_flow *flow,
+ +				   struct sk_buff *skb)
+ +{
+ +	struct nlattr *nla;
+ +	int err;
+ +
+ +	/* Fill flow key. */
+ +	nla = nla_nest_start(skb, OVS_FLOW_ATTR_KEY);
+ +	if (!nla)
+ +		return -EMSGSIZE;
+ +
+ +	err = ovs_nla_put_flow(&flow->unmasked_key, &flow->unmasked_key, skb);
+ +	if (err)
+ +		return err;
+ +
+ +	nla_nest_end(skb, nla);
+ +
+ +	/* Fill flow mask. */
+ +	nla = nla_nest_start(skb, OVS_FLOW_ATTR_MASK);
+ +	if (!nla)
+ +		return -EMSGSIZE;
+ +
+ +	err = ovs_nla_put_flow(&flow->key, &flow->mask->key, skb);
+ +	if (err)
+ +		return err;
+ +
+ +	nla_nest_end(skb, nla);
+ +	return 0;
+ +}
+ +
+  /* Called with ovs_mutex or RCU read lock. */
+  static int ovs_flow_cmd_fill_stats(const struct sw_flow *flow,
+  				   struct sk_buff *skb)
+@@@ -792,19 -789,34 +827,39 @@@ static int ovs_flow_cmd_fill_info(cons
+  
+  	ovs_header->dp_ifindex = dp_ifindex;
+  
+++<<<<<<< HEAD
+ +	err = ovs_flow_cmd_fill_match(flow, skb);
+ +	if (err)
+ +		goto error;
+- 
+- 	err = ovs_flow_cmd_fill_stats(flow, skb);
+++=======
++ 	err = ovs_nla_put_identifier(flow, skb);
+  	if (err)
+  		goto error;
+  
+- 	err = ovs_flow_cmd_fill_actions(flow, skb, skb_orig_len);
++ 	if (should_fill_key(&flow->id, ufid_flags)) {
++ 		err = ovs_nla_put_masked_key(flow, skb);
++ 		if (err)
++ 			goto error;
++ 	}
++ 
++ 	if (should_fill_mask(ufid_flags)) {
++ 		err = ovs_nla_put_mask(flow, skb);
++ 		if (err)
++ 			goto error;
++ 	}
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
++ 
++ 	err = ovs_flow_cmd_fill_stats(flow, skb);
+  	if (err)
+  		goto error;
+  
++ 	if (should_fill_actions(ufid_flags)) {
++ 		err = ovs_flow_cmd_fill_actions(flow, skb, skb_orig_len);
++ 		if (err)
++ 			goto error;
++ 	}
++ 
+ -	genlmsg_end(skb, ovs_header);
+ -	return 0;
+ +	return genlmsg_end(skb, ovs_header);
+  
+  error:
+  	genlmsg_cancel(skb, ovs_header);
+@@@ -857,9 -873,12 +916,11 @@@ static int ovs_flow_cmd_new(struct sk_b
+  	struct sw_flow_mask mask;
+  	struct sk_buff *reply;
+  	struct datapath *dp;
++ 	struct sw_flow_key key;
+  	struct sw_flow_actions *acts;
+  	struct sw_flow_match match;
++ 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
+  	int error;
+ -	bool log = !a[OVS_FLOW_ATTR_PROBE];
+  
+  	/* Must have key and actions. */
+  	error = -EINVAL;
+@@@ -882,28 -901,30 +943,41 @@@
+  	}
+  
+  	/* Extract key. */
+++<<<<<<< HEAD
+ +	ovs_match_init(&match, &new_flow->unmasked_key, &mask);
+ +	error = ovs_nla_get_match(&match,
+ +				  a[OVS_FLOW_ATTR_KEY], a[OVS_FLOW_ATTR_MASK]);
+++=======
++ 	ovs_match_init(&match, &key, &mask);
++ 	error = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY],
++ 				  a[OVS_FLOW_ATTR_MASK], log);
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  	if (error)
+  		goto err_kfree_flow;
+  
+- 	ovs_flow_mask_key(&new_flow->key, &new_flow->unmasked_key, &mask);
++ 	ovs_flow_mask_key(&new_flow->key, &key, &mask);
++ 
++ 	/* Extract flow identifier. */
++ 	error = ovs_nla_get_identifier(&new_flow->id, a[OVS_FLOW_ATTR_UFID],
++ 				       &key, log);
++ 	if (error)
++ 		goto err_kfree_flow;
+  
+  	/* Validate actions. */
+ +	acts = ovs_nla_alloc_flow_actions(nla_len(a[OVS_FLOW_ATTR_ACTIONS]));
+ +	error = PTR_ERR(acts);
+ +	if (IS_ERR(acts))
+ +		goto err_kfree_flow;
+ +
+  	error = ovs_nla_copy_actions(a[OVS_FLOW_ATTR_ACTIONS], &new_flow->key,
+ -				     &acts, log);
+ +				     0, &acts);
+  	if (error) {
+ -		OVS_NLERR(log, "Flow actions may not be safe on all matching packets.");
+ -		goto err_kfree_flow;
+ +		OVS_NLERR("Flow actions may not be safe on all matching packets.\n");
+ +		goto err_kfree_acts;
+  	}
+  
+- 	reply = ovs_flow_cmd_alloc_info(acts, info, false);
++ 	reply = ovs_flow_cmd_alloc_info(acts, &new_flow->id, info, false,
++ 					ufid_flags);
+  	if (IS_ERR(reply)) {
+  		error = PTR_ERR(reply);
+  		goto err_kfree_acts;
+@@@ -950,9 -976,15 +1029,21 @@@
+  			error = -EEXIST;
+  			goto err_unlock_ovs;
+  		}
+++<<<<<<< HEAD
+ +		/* The unmasked key has to be the same for flow updates. */
+ +		if (unlikely(!ovs_flow_cmp_unmasked_key(flow, &match))) {
+ +			flow = ovs_flow_tbl_lookup_exact(&dp->table, &match);
+++=======
++ 		/* The flow identifier has to be the same for flow updates.
++ 		 * Look for any overlapping flow.
++ 		 */
++ 		if (unlikely(!ovs_flow_cmp(flow, &match))) {
++ 			if (ovs_identifier_is_key(&flow->id))
++ 				flow = ovs_flow_tbl_lookup_exact(&dp->table,
++ 								 &match);
++ 			else /* UFID matches but key is different */
++ 				flow = NULL;
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  			if (!flow) {
+  				error = -ENOENT;
+  				goto err_unlock_ovs;
+@@@ -1025,7 -1056,11 +1117,14 @@@ static int ovs_flow_cmd_set(struct sk_b
+  	struct datapath *dp;
+  	struct sw_flow_actions *old_acts = NULL, *acts = NULL;
+  	struct sw_flow_match match;
++ 	struct sw_flow_id sfid;
++ 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
+  	int error;
+++<<<<<<< HEAD
+++=======
++ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
++ 	bool ufid_present;
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  
+  	/* Extract key. */
+  	error = -EINVAL;
+@@@ -1034,9 -1069,10 +1133,10 @@@
+  		goto error;
+  	}
+  
++ 	ufid_present = ovs_nla_get_ufid(&sfid, a[OVS_FLOW_ATTR_UFID], log);
+  	ovs_match_init(&match, &key, &mask);
+ -	error = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY],
+ -				  a[OVS_FLOW_ATTR_MASK], log);
+ +	error = ovs_nla_get_match(&match,
+ +				  a[OVS_FLOW_ATTR_KEY], a[OVS_FLOW_ATTR_MASK]);
+  	if (error)
+  		goto error;
+  
+@@@ -1047,11 -1084,10 +1147,17 @@@
+  			error = PTR_ERR(acts);
+  			goto error;
+  		}
+ +	}
+  
+++<<<<<<< HEAD
+ +	/* Can allocate before locking if have acts. */
+ +	if (acts) {
+ +		reply = ovs_flow_cmd_alloc_info(acts, info, false);
+++=======
++ 		/* Can allocate before locking if have acts. */
++ 		reply = ovs_flow_cmd_alloc_info(acts, &sfid, info, false,
++ 						ufid_flags);
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  		if (IS_ERR(reply)) {
+  			error = PTR_ERR(reply);
+  			goto err_kfree_acts;
+@@@ -1124,15 -1166,22 +1236,34 @@@ static int ovs_flow_cmd_get(struct sk_b
+  	struct sw_flow *flow;
+  	struct datapath *dp;
+  	struct sw_flow_match match;
+++<<<<<<< HEAD
+ +	int err;
+ +
+ +	if (!a[OVS_FLOW_ATTR_KEY]) {
+ +		OVS_NLERR("Flow get message rejected, Key attribute missing.\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	ovs_match_init(&match, &key, NULL);
+ +	err = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY], NULL);
+++=======
++ 	struct sw_flow_id ufid;
++ 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
++ 	int err = 0;
++ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
++ 	bool ufid_present;
++ 
++ 	ufid_present = ovs_nla_get_ufid(&ufid, a[OVS_FLOW_ATTR_UFID], log);
++ 	if (a[OVS_FLOW_ATTR_KEY]) {
++ 		ovs_match_init(&match, &key, NULL);
++ 		err = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY], NULL,
++ 					log);
++ 	} else if (!ufid_present) {
++ 		OVS_NLERR(log,
++ 			  "Flow get message rejected, Key attribute missing.");
++ 		err = -EINVAL;
++ 	}
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  	if (err)
+  		return err;
+  
+@@@ -1169,14 -1221,20 +1303,22 @@@ static int ovs_flow_cmd_del(struct sk_b
+  	struct ovs_header *ovs_header = info->userhdr;
+  	struct sw_flow_key key;
+  	struct sk_buff *reply;
+- 	struct sw_flow *flow;
++ 	struct sw_flow *flow = NULL;
+  	struct datapath *dp;
+  	struct sw_flow_match match;
++ 	struct sw_flow_id ufid;
++ 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
+  	int err;
+- 
+- 	if (likely(a[OVS_FLOW_ATTR_KEY])) {
+++<<<<<<< HEAD
+++=======
++ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
++ 	bool ufid_present;
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
++ 
++ 	ufid_present = ovs_nla_get_ufid(&ufid, a[OVS_FLOW_ATTR_UFID], log);
++ 	if (a[OVS_FLOW_ATTR_KEY]) {
+  		ovs_match_init(&match, &key, NULL);
+ -		err = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY], NULL,
+ -					log);
+ +		err = ovs_nla_get_match(&match, a[OVS_FLOW_ATTR_KEY], NULL);
+  		if (unlikely(err))
+  			return err;
+  	}
+@@@ -1266,8 -1337,12 +1421,14 @@@ static int ovs_flow_cmd_dump(struct sk_
+  
+  static const struct nla_policy flow_policy[OVS_FLOW_ATTR_MAX + 1] = {
+  	[OVS_FLOW_ATTR_KEY] = { .type = NLA_NESTED },
+ -	[OVS_FLOW_ATTR_MASK] = { .type = NLA_NESTED },
+  	[OVS_FLOW_ATTR_ACTIONS] = { .type = NLA_NESTED },
+  	[OVS_FLOW_ATTR_CLEAR] = { .type = NLA_FLAG },
+++<<<<<<< HEAD
+++=======
++ 	[OVS_FLOW_ATTR_PROBE] = { .type = NLA_FLAG },
++ 	[OVS_FLOW_ATTR_UFID] = { .type = NLA_UNSPEC, .len = 1 },
++ 	[OVS_FLOW_ATTR_UFID_FLAGS] = { .type = NLA_U32 },
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  };
+  
+  static const struct genl_ops dp_flow_genl_ops[] = {
+diff --cc net/openvswitch/flow_netlink.c
+index d35e6f9713da,8b9a612b39d1..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -1294,9 -1484,52 +1347,55 @@@ nla_put_failure
+  	return -EMSGSIZE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int ovs_nla_put_key(const struct sw_flow_key *swkey,
++ 		    const struct sw_flow_key *output, int attr, bool is_mask,
++ 		    struct sk_buff *skb)
++ {
++ 	int err;
++ 	struct nlattr *nla;
++ 
++ 	nla = nla_nest_start(skb, attr);
++ 	if (!nla)
++ 		return -EMSGSIZE;
++ 	err = __ovs_nla_put_key(swkey, output, is_mask, skb);
++ 	if (err)
++ 		return err;
++ 	nla_nest_end(skb, nla);
++ 
++ 	return 0;
++ }
++ 
++ /* Called with ovs_mutex or RCU read lock. */
++ int ovs_nla_put_identifier(const struct sw_flow *flow, struct sk_buff *skb)
++ {
++ 	if (ovs_identifier_is_ufid(&flow->id))
++ 		return nla_put(skb, OVS_FLOW_ATTR_UFID, flow->id.ufid_len,
++ 			       flow->id.ufid);
++ 
++ 	return ovs_nla_put_key(flow->id.unmasked_key, flow->id.unmasked_key,
++ 			       OVS_FLOW_ATTR_KEY, false, skb);
++ }
++ 
++ /* Called with ovs_mutex or RCU read lock. */
++ int ovs_nla_put_masked_key(const struct sw_flow *flow, struct sk_buff *skb)
++ {
++ 	return ovs_nla_put_key(&flow->mask->key, &flow->key,
++ 				OVS_FLOW_ATTR_KEY, false, skb);
++ }
++ 
++ /* Called with ovs_mutex or RCU read lock. */
++ int ovs_nla_put_mask(const struct sw_flow *flow, struct sk_buff *skb)
++ {
++ 	return ovs_nla_put_key(&flow->key, &flow->mask->key,
++ 				OVS_FLOW_ATTR_MASK, true, skb);
++ }
++ 
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  #define MAX_ACTIONS_BUFSIZE	(32 * 1024)
+  
+ -static struct sw_flow_actions *nla_alloc_flow_actions(int size, bool log)
+ +struct sw_flow_actions *ovs_nla_alloc_flow_actions(int size)
+  {
+  	struct sw_flow_actions *sfa;
+  
+diff --cc net/openvswitch/flow_netlink.h
+index fa24e1dc958c,5c3d75bff310..000000000000
+--- a/net/openvswitch/flow_netlink.h
++++ b/net/openvswitch/flow_netlink.h
+@@@ -43,19 -43,28 +43,33 @@@ size_t ovs_key_attr_size(void)
+  void ovs_match_init(struct sw_flow_match *match,
+  		    struct sw_flow_key *key, struct sw_flow_mask *mask);
+  
+ -int ovs_nla_put_key(const struct sw_flow_key *, const struct sw_flow_key *,
+ -		    int attr, bool is_mask, struct sk_buff *);
+ -int ovs_nla_get_flow_metadata(const struct nlattr *, struct sw_flow_key *,
+ -			      bool log);
+ +int ovs_nla_put_flow(const struct sw_flow_key *,
+ +		     const struct sw_flow_key *, struct sk_buff *);
+ +int ovs_nla_get_flow_metadata(const struct nlattr *, struct sw_flow_key *);
+  
+++<<<<<<< HEAD
+ +int ovs_nla_get_match(struct sw_flow_match *match,
+ +		      const struct nlattr *,
+ +		      const struct nlattr *);
+++=======
++ int ovs_nla_put_identifier(const struct sw_flow *flow, struct sk_buff *skb);
++ int ovs_nla_put_masked_key(const struct sw_flow *flow, struct sk_buff *skb);
++ int ovs_nla_put_mask(const struct sw_flow *flow, struct sk_buff *skb);
++ 
++ int ovs_nla_get_match(struct sw_flow_match *, const struct nlattr *key,
++ 		      const struct nlattr *mask, bool log);
+++>>>>>>> 74ed7ab9264c (openvswitch: Add support for unique flow IDs.)
+  int ovs_nla_put_egress_tunnel_key(struct sk_buff *,
+  				  const struct ovs_tunnel_info *);
+  
++ bool ovs_nla_get_ufid(struct sw_flow_id *, const struct nlattr *, bool log);
++ int ovs_nla_get_identifier(struct sw_flow_id *sfid, const struct nlattr *ufid,
++ 			   const struct sw_flow_key *key, bool log);
++ u32 ovs_nla_get_ufid_flags(const struct nlattr *attr);
++ 
+  int ovs_nla_copy_actions(const struct nlattr *attr,
+ -			 const struct sw_flow_key *key,
+ -			 struct sw_flow_actions **sfa, bool log);
+ +			 const struct sw_flow_key *key, int depth,
+ +			 struct sw_flow_actions **sfa);
+  int ovs_nla_put_actions(const struct nlattr *attr,
+  			int len, struct sk_buff *skb);
+  
+diff --git a/Documentation/networking/openvswitch.txt b/Documentation/networking/openvswitch.txt
+index 37c20ee2455e..b3b9ac61d29d 100644
+--- a/Documentation/networking/openvswitch.txt
++++ b/Documentation/networking/openvswitch.txt
+@@ -131,6 +131,19 @@ performs best-effort detection of overlapping wildcarded flows and may reject
+ some but not all of them. However, this behavior may change in future versions.
+ 
+ 
++Unique flow identifiers
++-----------------------
++
++An alternative to using the original match portion of a key as the handle for
++flow identification is a unique flow identifier, or "UFID". UFIDs are optional
++for both the kernel and user space program.
++
++User space programs that support UFID are expected to provide it during flow
++setup in addition to the flow, then refer to the flow using the UFID for all
++future operations. The kernel is not required to index flows by the original
++flow key if a UFID is specified.
++
++
+ Basic rule for evolving flow keys
+ ---------------------------------
+ 
+* Unmerged path include/uapi/linux/openvswitch.h
+* Unmerged path net/openvswitch/datapath.c
+diff --git a/net/openvswitch/flow.h b/net/openvswitch/flow.h
+index 07a475fcc682..387b7bb5b901 100644
+--- a/net/openvswitch/flow.h
++++ b/net/openvswitch/flow.h
+@@ -192,6 +192,16 @@ struct sw_flow_match {
+ 	struct sw_flow_mask *mask;
+ };
+ 
++#define MAX_UFID_LENGTH 16 /* 128 bits */
++
++struct sw_flow_id {
++	u32 ufid_len;
++	union {
++		u32 ufid[MAX_UFID_LENGTH / 4];
++		struct sw_flow_key *unmasked_key;
++	};
++};
++
+ struct sw_flow_actions {
+ 	struct rcu_head rcu;
+ 	u32 actions_len;
+@@ -208,13 +218,15 @@ struct flow_stats {
+ 
+ struct sw_flow {
+ 	struct rcu_head rcu;
+-	struct hlist_node hash_node[2];
+-	u32 hash;
++	struct {
++		struct hlist_node node[2];
++		u32 hash;
++	} flow_table, ufid_table;
+ 	int stats_last_writer;		/* NUMA-node id of the last writer on
+ 					 * 'stats[0]'.
+ 					 */
+ 	struct sw_flow_key key;
+-	struct sw_flow_key unmasked_key;
++	struct sw_flow_id id;
+ 	struct sw_flow_mask *mask;
+ 	struct sw_flow_actions __rcu *sf_acts;
+ 	struct flow_stats __rcu *stats[]; /* One for each NUMA node.  First one
+@@ -238,6 +250,16 @@ struct arp_eth_header {
+ 	unsigned char       ar_tip[4];		/* target IP address        */
+ } __packed;
+ 
++static inline bool ovs_identifier_is_ufid(const struct sw_flow_id *sfid)
++{
++	return sfid->ufid_len;
++}
++
++static inline bool ovs_identifier_is_key(const struct sw_flow_id *sfid)
++{
++	return !ovs_identifier_is_ufid(sfid);
++}
++
+ void ovs_flow_stats_update(struct sw_flow *, __be16 tcp_flags,
+ 			   const struct sk_buff *);
+ void ovs_flow_stats_get(const struct sw_flow *, struct ovs_flow_stats *,
+* Unmerged path net/openvswitch/flow_netlink.c
+* Unmerged path net/openvswitch/flow_netlink.h
+diff --git a/net/openvswitch/flow_table.c b/net/openvswitch/flow_table.c
+index 474c64de6b8f..559fb2edf6de 100644
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@ -139,6 +139,8 @@ static void flow_free(struct sw_flow *flow)
+ {
+ 	int node;
+ 
++	if (ovs_identifier_is_key(&flow->id))
++		kfree(flow->id.unmasked_key);
+ 	kfree((struct sw_flow_actions __force *)flow->sf_acts);
+ 	for_each_node(node)
+ 		if (flow->stats[node])
+@@ -200,18 +202,28 @@ static struct table_instance *table_instance_alloc(int new_size)
+ 
+ int ovs_flow_tbl_init(struct flow_table *table)
+ {
+-	struct table_instance *ti;
++	struct table_instance *ti, *ufid_ti;
+ 
+ 	ti = table_instance_alloc(TBL_MIN_BUCKETS);
+ 
+ 	if (!ti)
+ 		return -ENOMEM;
+ 
++	ufid_ti = table_instance_alloc(TBL_MIN_BUCKETS);
++	if (!ufid_ti)
++		goto free_ti;
++
+ 	rcu_assign_pointer(table->ti, ti);
++	rcu_assign_pointer(table->ufid_ti, ufid_ti);
+ 	INIT_LIST_HEAD(&table->mask_list);
+ 	table->last_rehash = jiffies;
+ 	table->count = 0;
++	table->ufid_count = 0;
+ 	return 0;
++
++free_ti:
++	__table_instance_destroy(ti);
++	return -ENOMEM;
+ }
+ 
+ static void flow_tbl_destroy_rcu_cb(struct rcu_head *rcu)
+@@ -221,13 +233,16 @@ static void flow_tbl_destroy_rcu_cb(struct rcu_head *rcu)
+ 	__table_instance_destroy(ti);
+ }
+ 
+-static void table_instance_destroy(struct table_instance *ti, bool deferred)
++static void table_instance_destroy(struct table_instance *ti,
++				   struct table_instance *ufid_ti,
++				   bool deferred)
+ {
+ 	int i;
+ 
+ 	if (!ti)
+ 		return;
+ 
++	BUG_ON(!ufid_ti);
+ 	if (ti->keep_flows)
+ 		goto skip_flows;
+ 
+@@ -236,18 +251,24 @@ static void table_instance_destroy(struct table_instance *ti, bool deferred)
+ 		struct hlist_head *head = flex_array_get(ti->buckets, i);
+ 		struct hlist_node *n;
+ 		int ver = ti->node_ver;
++		int ufid_ver = ufid_ti->node_ver;
+ 
+-		hlist_for_each_entry_safe(flow, n, head, hash_node[ver]) {
+-			hlist_del_rcu(&flow->hash_node[ver]);
++		hlist_for_each_entry_safe(flow, n, head, flow_table.node[ver]) {
++			hlist_del_rcu(&flow->flow_table.node[ver]);
++			if (ovs_identifier_is_ufid(&flow->id))
++				hlist_del_rcu(&flow->ufid_table.node[ufid_ver]);
+ 			ovs_flow_free(flow, deferred);
+ 		}
+ 	}
+ 
+ skip_flows:
+-	if (deferred)
++	if (deferred) {
+ 		call_rcu(&ti->rcu, flow_tbl_destroy_rcu_cb);
+-	else
++		call_rcu(&ufid_ti->rcu, flow_tbl_destroy_rcu_cb);
++	} else {
+ 		__table_instance_destroy(ti);
++		__table_instance_destroy(ufid_ti);
++	}
+ }
+ 
+ /* No need for locking this function is called from RCU callback or
+@@ -256,8 +277,9 @@ skip_flows:
+ void ovs_flow_tbl_destroy(struct flow_table *table)
+ {
+ 	struct table_instance *ti = rcu_dereference_raw(table->ti);
++	struct table_instance *ufid_ti = rcu_dereference_raw(table->ufid_ti);
+ 
+-	table_instance_destroy(ti, false);
++	table_instance_destroy(ti, ufid_ti, false);
+ }
+ 
+ struct sw_flow *ovs_flow_tbl_dump_next(struct table_instance *ti,
+@@ -272,7 +294,7 @@ struct sw_flow *ovs_flow_tbl_dump_next(struct table_instance *ti,
+ 	while (*bucket < ti->n_buckets) {
+ 		i = 0;
+ 		head = flex_array_get(ti->buckets, *bucket);
+-		hlist_for_each_entry_rcu(flow, head, hash_node[ver]) {
++		hlist_for_each_entry_rcu(flow, head, flow_table.node[ver]) {
+ 			if (i < *last) {
+ 				i++;
+ 				continue;
+@@ -294,16 +316,26 @@ static struct hlist_head *find_bucket(struct table_instance *ti, u32 hash)
+ 				(hash & (ti->n_buckets - 1)));
+ }
+ 
+-static void table_instance_insert(struct table_instance *ti, struct sw_flow *flow)
++static void table_instance_insert(struct table_instance *ti,
++				  struct sw_flow *flow)
+ {
+ 	struct hlist_head *head;
+ 
+-	head = find_bucket(ti, flow->hash);
+-	hlist_add_head_rcu(&flow->hash_node[ti->node_ver], head);
++	head = find_bucket(ti, flow->flow_table.hash);
++	hlist_add_head_rcu(&flow->flow_table.node[ti->node_ver], head);
++}
++
++static void ufid_table_instance_insert(struct table_instance *ti,
++				       struct sw_flow *flow)
++{
++	struct hlist_head *head;
++
++	head = find_bucket(ti, flow->ufid_table.hash);
++	hlist_add_head_rcu(&flow->ufid_table.node[ti->node_ver], head);
+ }
+ 
+ static void flow_table_copy_flows(struct table_instance *old,
+-				  struct table_instance *new)
++				  struct table_instance *new, bool ufid)
+ {
+ 	int old_ver;
+ 	int i;
+@@ -318,15 +350,21 @@ static void flow_table_copy_flows(struct table_instance *old,
+ 
+ 		head = flex_array_get(old->buckets, i);
+ 
+-		hlist_for_each_entry(flow, head, hash_node[old_ver])
+-			table_instance_insert(new, flow);
++		if (ufid)
++			hlist_for_each_entry(flow, head,
++					     ufid_table.node[old_ver])
++				ufid_table_instance_insert(new, flow);
++		else
++			hlist_for_each_entry(flow, head,
++					     flow_table.node[old_ver])
++				table_instance_insert(new, flow);
+ 	}
+ 
+ 	old->keep_flows = true;
+ }
+ 
+ static struct table_instance *table_instance_rehash(struct table_instance *ti,
+-					    int n_buckets)
++						    int n_buckets, bool ufid)
+ {
+ 	struct table_instance *new_ti;
+ 
+@@ -334,27 +372,38 @@ static struct table_instance *table_instance_rehash(struct table_instance *ti,
+ 	if (!new_ti)
+ 		return NULL;
+ 
+-	flow_table_copy_flows(ti, new_ti);
++	flow_table_copy_flows(ti, new_ti, ufid);
+ 
+ 	return new_ti;
+ }
+ 
+ int ovs_flow_tbl_flush(struct flow_table *flow_table)
+ {
+-	struct table_instance *old_ti;
+-	struct table_instance *new_ti;
++	struct table_instance *old_ti, *new_ti;
++	struct table_instance *old_ufid_ti, *new_ufid_ti;
+ 
+-	old_ti = ovsl_dereference(flow_table->ti);
+ 	new_ti = table_instance_alloc(TBL_MIN_BUCKETS);
+ 	if (!new_ti)
+ 		return -ENOMEM;
++	new_ufid_ti = table_instance_alloc(TBL_MIN_BUCKETS);
++	if (!new_ufid_ti)
++		goto err_free_ti;
++
++	old_ti = ovsl_dereference(flow_table->ti);
++	old_ufid_ti = ovsl_dereference(flow_table->ufid_ti);
+ 
+ 	rcu_assign_pointer(flow_table->ti, new_ti);
++	rcu_assign_pointer(flow_table->ufid_ti, new_ufid_ti);
+ 	flow_table->last_rehash = jiffies;
+ 	flow_table->count = 0;
++	flow_table->ufid_count = 0;
+ 
+-	table_instance_destroy(old_ti, true);
++	table_instance_destroy(old_ti, old_ufid_ti, true);
+ 	return 0;
++
++err_free_ti:
++	__table_instance_destroy(new_ti);
++	return -ENOMEM;
+ }
+ 
+ static u32 flow_hash(const struct sw_flow_key *key,
+@@ -402,14 +451,15 @@ static bool flow_cmp_masked_key(const struct sw_flow *flow,
+ 	return cmp_key(&flow->key, key, range->start, range->end);
+ }
+ 
+-bool ovs_flow_cmp_unmasked_key(const struct sw_flow *flow,
+-			       const struct sw_flow_match *match)
++static bool ovs_flow_cmp_unmasked_key(const struct sw_flow *flow,
++				      const struct sw_flow_match *match)
+ {
+ 	struct sw_flow_key *key = match->key;
+ 	int key_start = flow_key_start(key);
+ 	int key_end = match->range.end;
+ 
+-	return cmp_key(&flow->unmasked_key, key, key_start, key_end);
++	BUG_ON(ovs_identifier_is_ufid(&flow->id));
++	return cmp_key(flow->id.unmasked_key, key, key_start, key_end);
+ }
+ 
+ static struct sw_flow *masked_flow_lookup(struct table_instance *ti,
+@@ -424,8 +474,8 @@ static struct sw_flow *masked_flow_lookup(struct table_instance *ti,
+ 	ovs_flow_mask_key(&masked_key, unmasked, mask);
+ 	hash = flow_hash(&masked_key, &mask->range);
+ 	head = find_bucket(ti, hash);
+-	hlist_for_each_entry_rcu(flow, head, hash_node[ti->node_ver]) {
+-		if (flow->mask == mask && flow->hash == hash &&
++	hlist_for_each_entry_rcu(flow, head, flow_table.node[ti->node_ver]) {
++		if (flow->mask == mask && flow->flow_table.hash == hash &&
+ 		    flow_cmp_masked_key(flow, &masked_key, &mask->range))
+ 			return flow;
+ 	}
+@@ -468,7 +518,48 @@ struct sw_flow *ovs_flow_tbl_lookup_exact(struct flow_table *tbl,
+ 	/* Always called under ovs-mutex. */
+ 	list_for_each_entry(mask, &tbl->mask_list, list) {
+ 		flow = masked_flow_lookup(ti, match->key, mask);
+-		if (flow && ovs_flow_cmp_unmasked_key(flow, match))  /* Found */
++		if (flow && ovs_identifier_is_key(&flow->id) &&
++		    ovs_flow_cmp_unmasked_key(flow, match))
++			return flow;
++	}
++	return NULL;
++}
++
++static u32 ufid_hash(const struct sw_flow_id *sfid)
++{
++	return jhash(sfid->ufid, sfid->ufid_len, 0);
++}
++
++static bool ovs_flow_cmp_ufid(const struct sw_flow *flow,
++			      const struct sw_flow_id *sfid)
++{
++	if (flow->id.ufid_len != sfid->ufid_len)
++		return false;
++
++	return !memcmp(flow->id.ufid, sfid->ufid, sfid->ufid_len);
++}
++
++bool ovs_flow_cmp(const struct sw_flow *flow, const struct sw_flow_match *match)
++{
++	if (ovs_identifier_is_ufid(&flow->id))
++		return flow_cmp_masked_key(flow, match->key, &match->range);
++
++	return ovs_flow_cmp_unmasked_key(flow, match);
++}
++
++struct sw_flow *ovs_flow_tbl_lookup_ufid(struct flow_table *tbl,
++					 const struct sw_flow_id *ufid)
++{
++	struct table_instance *ti = rcu_dereference_ovsl(tbl->ufid_ti);
++	struct sw_flow *flow;
++	struct hlist_head *head;
++	u32 hash;
++
++	hash = ufid_hash(ufid);
++	head = find_bucket(ti, hash);
++	hlist_for_each_entry_rcu(flow, head, ufid_table.node[ti->node_ver]) {
++		if (flow->ufid_table.hash == hash &&
++		    ovs_flow_cmp_ufid(flow, ufid))
+ 			return flow;
+ 	}
+ 	return NULL;
+@@ -485,9 +576,10 @@ int ovs_flow_tbl_num_masks(const struct flow_table *table)
+ 	return num;
+ }
+ 
+-static struct table_instance *table_instance_expand(struct table_instance *ti)
++static struct table_instance *table_instance_expand(struct table_instance *ti,
++						    bool ufid)
+ {
+-	return table_instance_rehash(ti, ti->n_buckets * 2);
++	return table_instance_rehash(ti, ti->n_buckets * 2, ufid);
+ }
+ 
+ /* Remove 'mask' from the mask list, if it is not needed any more. */
+@@ -512,10 +604,15 @@ static void flow_mask_remove(struct flow_table *tbl, struct sw_flow_mask *mask)
+ void ovs_flow_tbl_remove(struct flow_table *table, struct sw_flow *flow)
+ {
+ 	struct table_instance *ti = ovsl_dereference(table->ti);
++	struct table_instance *ufid_ti = ovsl_dereference(table->ufid_ti);
+ 
+ 	BUG_ON(table->count == 0);
+-	hlist_del_rcu(&flow->hash_node[ti->node_ver]);
++	hlist_del_rcu(&flow->flow_table.node[ti->node_ver]);
+ 	table->count--;
++	if (ovs_identifier_is_ufid(&flow->id)) {
++		hlist_del_rcu(&flow->ufid_table.node[ufid_ti->node_ver]);
++		table->ufid_count--;
++	}
+ 
+ 	/* RCU delete the mask. 'flow->mask' is not NULLed, as it should be
+ 	 * accessible as long as the RCU read lock is held.
+@@ -589,24 +686,46 @@ static void flow_key_insert(struct flow_table *table, struct sw_flow *flow)
+ 	struct table_instance *new_ti = NULL;
+ 	struct table_instance *ti;
+ 
+-	flow->hash = flow_hash(&flow->key, &flow->mask->range);
++	flow->flow_table.hash = flow_hash(&flow->key, &flow->mask->range);
+ 	ti = ovsl_dereference(table->ti);
+ 	table_instance_insert(ti, flow);
+ 	table->count++;
+ 
+ 	/* Expand table, if necessary, to make room. */
+ 	if (table->count > ti->n_buckets)
+-		new_ti = table_instance_expand(ti);
++		new_ti = table_instance_expand(ti, false);
+ 	else if (time_after(jiffies, table->last_rehash + REHASH_INTERVAL))
+-		new_ti = table_instance_rehash(ti, ti->n_buckets);
++		new_ti = table_instance_rehash(ti, ti->n_buckets, false);
+ 
+ 	if (new_ti) {
+ 		rcu_assign_pointer(table->ti, new_ti);
+-		table_instance_destroy(ti, true);
++		call_rcu(&ti->rcu, flow_tbl_destroy_rcu_cb);
+ 		table->last_rehash = jiffies;
+ 	}
+ }
+ 
++/* Must be called with OVS mutex held. */
++static void flow_ufid_insert(struct flow_table *table, struct sw_flow *flow)
++{
++	struct table_instance *ti;
++
++	flow->ufid_table.hash = ufid_hash(&flow->id);
++	ti = ovsl_dereference(table->ufid_ti);
++	ufid_table_instance_insert(ti, flow);
++	table->ufid_count++;
++
++	/* Expand table, if necessary, to make room. */
++	if (table->ufid_count > ti->n_buckets) {
++		struct table_instance *new_ti;
++
++		new_ti = table_instance_expand(ti, true);
++		if (new_ti) {
++			rcu_assign_pointer(table->ufid_ti, new_ti);
++			call_rcu(&ti->rcu, flow_tbl_destroy_rcu_cb);
++		}
++	}
++}
++
+ /* Must be called with OVS mutex held. */
+ int ovs_flow_tbl_insert(struct flow_table *table, struct sw_flow *flow,
+ 			const struct sw_flow_mask *mask)
+@@ -617,6 +736,8 @@ int ovs_flow_tbl_insert(struct flow_table *table, struct sw_flow *flow,
+ 	if (err)
+ 		return err;
+ 	flow_key_insert(table, flow);
++	if (ovs_identifier_is_ufid(&flow->id))
++		flow_ufid_insert(table, flow);
+ 
+ 	return 0;
+ }
+diff --git a/net/openvswitch/flow_table.h b/net/openvswitch/flow_table.h
+index 309fa6415689..616eda10d955 100644
+--- a/net/openvswitch/flow_table.h
++++ b/net/openvswitch/flow_table.h
+@@ -47,9 +47,11 @@ struct table_instance {
+ 
+ struct flow_table {
+ 	struct table_instance __rcu *ti;
++	struct table_instance __rcu *ufid_ti;
+ 	struct list_head mask_list;
+ 	unsigned long last_rehash;
+ 	unsigned int count;
++	unsigned int ufid_count;
+ };
+ 
+ extern struct kmem_cache *flow_stats_cache;
+@@ -78,8 +80,10 @@ struct sw_flow *ovs_flow_tbl_lookup(struct flow_table *,
+ 				    const struct sw_flow_key *);
+ struct sw_flow *ovs_flow_tbl_lookup_exact(struct flow_table *tbl,
+ 					  const struct sw_flow_match *match);
+-bool ovs_flow_cmp_unmasked_key(const struct sw_flow *flow,
+-			       const struct sw_flow_match *match);
++struct sw_flow *ovs_flow_tbl_lookup_ufid(struct flow_table *,
++					 const struct sw_flow_id *);
++
++bool ovs_flow_cmp(const struct sw_flow *, const struct sw_flow_match *);
+ 
+ void ovs_flow_mask_key(struct sw_flow_key *dst, const struct sw_flow_key *src,
+ 		       const struct sw_flow_mask *mask);
