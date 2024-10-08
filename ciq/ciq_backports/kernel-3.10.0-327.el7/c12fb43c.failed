@@ -1,0 +1,149 @@
+KVM: PPC: Handle magic page in kvmppc_ld/st
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: Handle magic page in kvmppc_ld/st (Thomas Huth) [1226884 1227323]
+Rebuild_FUZZ: 93.83%
+commit-author Alexander Graf <agraf@suse.de>
+commit c12fb43c2f6d6a57a4e21afe74ff56485d699ee7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c12fb43c.failed
+
+We use kvmppc_ld and kvmppc_st to emulate load/store instructions that may as
+well access the magic page. Special case it out so that we can properly access
+it.
+
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit c12fb43c2f6d6a57a4e21afe74ff56485d699ee7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/powerpc.c
+diff --cc arch/powerpc/kvm/powerpc.c
+index bf2571061516,544d1d30c8cc..000000000000
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@@ -310,6 -309,81 +310,84 @@@ int kvmppc_emulate_mmio(struct kvm_run 
+  }
+  EXPORT_SYMBOL_GPL(kvmppc_emulate_mmio);
+  
+++<<<<<<< HEAD
+++=======
++ int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++ 	      bool data)
++ {
++ 	ulong mp_pa = vcpu->arch.magic_page_pa & KVM_PAM & PAGE_MASK;
++ 	struct kvmppc_pte pte;
++ 	int r;
++ 
++ 	vcpu->stat.st++;
++ 
++ 	r = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++ 			 XLATE_WRITE, &pte);
++ 	if (r < 0)
++ 		return r;
++ 
++ 	*eaddr = pte.raddr;
++ 
++ 	if (!pte.may_write)
++ 		return -EPERM;
++ 
++ 	/* Magic page override */
++ 	if (kvmppc_supports_magic_page(vcpu) && mp_pa &&
++ 	    ((pte.raddr & KVM_PAM & PAGE_MASK) == mp_pa) &&
++ 	    !(kvmppc_get_msr(vcpu) & MSR_PR)) {
++ 		void *magic = vcpu->arch.shared;
++ 		magic += pte.eaddr & 0xfff;
++ 		memcpy(magic, ptr, size);
++ 		return EMULATE_DONE;
++ 	}
++ 
++ 	if (kvm_write_guest(vcpu->kvm, pte.raddr, ptr, size))
++ 		return EMULATE_DO_MMIO;
++ 
++ 	return EMULATE_DONE;
++ }
++ EXPORT_SYMBOL_GPL(kvmppc_st);
++ 
++ int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
++ 		      bool data)
++ {
++ 	ulong mp_pa = vcpu->arch.magic_page_pa & KVM_PAM & PAGE_MASK;
++ 	struct kvmppc_pte pte;
++ 	int rc;
++ 
++ 	vcpu->stat.ld++;
++ 
++ 	rc = kvmppc_xlate(vcpu, *eaddr, data ? XLATE_DATA : XLATE_INST,
++ 			  XLATE_READ, &pte);
++ 	if (rc)
++ 		return rc;
++ 
++ 	*eaddr = pte.raddr;
++ 
++ 	if (!pte.may_read)
++ 		return -EPERM;
++ 
++ 	if (!data && !pte.may_execute)
++ 		return -ENOEXEC;
++ 
++ 	/* Magic page override */
++ 	if (kvmppc_supports_magic_page(vcpu) && mp_pa &&
++ 	    ((pte.raddr & KVM_PAM & PAGE_MASK) == mp_pa) &&
++ 	    !(kvmppc_get_msr(vcpu) & MSR_PR)) {
++ 		void *magic = vcpu->arch.shared;
++ 		magic += pte.eaddr & 0xfff;
++ 		memcpy(ptr, magic, size);
++ 		return EMULATE_DONE;
++ 	}
++ 
++ 	if (kvm_read_guest(vcpu->kvm, pte.raddr, ptr, size))
++ 		return EMULATE_DO_MMIO;
++ 
++ 	return EMULATE_DONE;
++ }
++ EXPORT_SYMBOL_GPL(kvmppc_ld);
++ 
+++>>>>>>> c12fb43c2f6d (KVM: PPC: Handle magic page in kvmppc_ld/st)
+  int kvm_arch_hardware_enable(void *garbage)
+  {
+  	return 0;
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 40c8fc30b955..327d8faaeeed 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -282,6 +282,13 @@ static inline bool is_kvmppc_resume_guest(int r)
+ 	return (r == RESUME_GUEST || r == RESUME_GUEST_NV);
+ }
+ 
++static inline bool is_kvmppc_hv_enabled(struct kvm *kvm);
++static inline bool kvmppc_supports_magic_page(struct kvm_vcpu *vcpu)
++{
++	/* Only PR KVM supports the magic page */
++	return !is_kvmppc_hv_enabled(vcpu->kvm);
++}
++
+ /* Magic register values loaded into r3 and r4 before the 'sc' assembly
+  * instruction for the OSI hypercalls */
+ #define OSI_SC_MAGIC_R3			0x113724FA
+diff --git a/arch/powerpc/include/asm/kvm_booke.h b/arch/powerpc/include/asm/kvm_booke.h
+index 24ec091ac95f..b28cc058194d 100644
+--- a/arch/powerpc/include/asm/kvm_booke.h
++++ b/arch/powerpc/include/asm/kvm_booke.h
+@@ -98,4 +98,14 @@ static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.fault_dear;
+ }
++
++static inline bool kvmppc_supports_magic_page(struct kvm_vcpu *vcpu)
++{
++	/* Magic page is only supported on e500v2 */
++#ifdef CONFIG_KVM_E500V2
++	return true;
++#else
++	return false;
++#endif
++}
+ #endif /* __ASM_KVM_BOOKE_H__ */
+* Unmerged path arch/powerpc/kvm/powerpc.c
