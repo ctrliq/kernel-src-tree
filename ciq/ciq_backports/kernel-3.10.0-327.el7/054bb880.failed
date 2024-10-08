@@ -1,0 +1,195 @@
+bonding: slight optimization for bond xmit path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit 054bb8801038c93c42cb6cde75141aa396afd065
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/054bb880.failed
+
+Add unlikely() micro to the unlikely conditions in the bond
+xmit path for slight optimization.
+
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 054bb8801038c93c42cb6cde75141aa396afd065)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index fe3f9d12b71e,ee17c246326e..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3232,86 -2943,74 +3232,113 @@@ static int bond_xmit_hash_policy_l2(str
+  	return 0;
+  }
+  
+ -/* Extract the appropriate headers based on bond's xmit policy */
+ -static bool bond_flow_dissect(struct bonding *bond, struct sk_buff *skb,
+ -			      struct flow_keys *fk)
+ +/*
+ + * Hash for the output device based upon layer 2 and layer 3 data. If
+ + * the packet is not IP, fall back on bond_xmit_hash_policy_l2()
+ + */
+ +static int bond_xmit_hash_policy_l23(struct sk_buff *skb, int count)
+  {
+ -	const struct ipv6hdr *iph6;
+ +	const struct ethhdr *data;
+  	const struct iphdr *iph;
+ -	int noff, proto = -1;
+ +	const struct ipv6hdr *ipv6h;
+ +	u32 v6hash;
+ +	const __be32 *s, *d;
+  
+++<<<<<<< HEAD
+ +	if (skb->protocol == htons(ETH_P_IP) &&
+ +	    pskb_network_may_pull(skb, sizeof(*iph))) {
+ +		iph = ip_hdr(skb);
+ +		data = (struct ethhdr *)skb->data;
+ +		return ((ntohl(iph->saddr ^ iph->daddr) & 0xffff) ^
+ +			(data->h_dest[5] ^ data->h_source[5])) % count;
+ +	} else if (skb->protocol == htons(ETH_P_IPV6) &&
+ +		   pskb_network_may_pull(skb, sizeof(*ipv6h))) {
+ +		ipv6h = ipv6_hdr(skb);
+ +		data = (struct ethhdr *)skb->data;
+ +		s = &ipv6h->saddr.s6_addr32[0];
+ +		d = &ipv6h->daddr.s6_addr32[0];
+ +		v6hash = (s[1] ^ d[1]) ^ (s[2] ^ d[2]) ^ (s[3] ^ d[3]);
+ +		v6hash ^= (v6hash >> 24) ^ (v6hash >> 16) ^ (v6hash >> 8);
+ +		return (v6hash ^ data->h_dest[5] ^ data->h_source[5]) % count;
+++=======
++ 	if (bond->params.xmit_policy > BOND_XMIT_POLICY_LAYER23)
++ 		return skb_flow_dissect(skb, fk);
++ 
++ 	fk->ports = 0;
++ 	noff = skb_network_offset(skb);
++ 	if (skb->protocol == htons(ETH_P_IP)) {
++ 		if (unlikely(!pskb_may_pull(skb, noff + sizeof(*iph))))
++ 			return false;
++ 		iph = ip_hdr(skb);
++ 		fk->src = iph->saddr;
++ 		fk->dst = iph->daddr;
++ 		noff += iph->ihl << 2;
++ 		if (!ip_is_fragment(iph))
++ 			proto = iph->protocol;
++ 	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++ 		if (unlikely(!pskb_may_pull(skb, noff + sizeof(*iph6))))
++ 			return false;
++ 		iph6 = ipv6_hdr(skb);
++ 		fk->src = (__force __be32)ipv6_addr_hash(&iph6->saddr);
++ 		fk->dst = (__force __be32)ipv6_addr_hash(&iph6->daddr);
++ 		noff += sizeof(*iph6);
++ 		proto = iph6->nexthdr;
++ 	} else {
++ 		return false;
+++>>>>>>> 054bb8801038 (bonding: slight optimization for bond xmit path)
+  	}
+ -	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER34 && proto >= 0)
+ -		fk->ports = skb_flow_get_ports(skb, noff, proto);
+  
+ -	return true;
+ +	return bond_xmit_hash_policy_l2(skb, count);
+  }
+  
+ -/**
+ - * bond_xmit_hash - generate a hash value based on the xmit policy
+ - * @bond: bonding device
+ - * @skb: buffer to use for headers
+ - * @count: modulo value
+ - *
+ - * This function will extract the necessary headers from the skb buffer and use
+ - * them to generate a hash based on the xmit_policy set in the bonding device
+ - * which will be reduced modulo count before returning.
+ +/*
+ + * Hash for the output device based upon layer 3 and layer 4 data. If
+ + * the packet is a frag or not TCP or UDP, just use layer 3 data.  If it is
+ + * altogether not IP, fall back on bond_xmit_hash_policy_l2()
+   */
+ -int bond_xmit_hash(struct bonding *bond, struct sk_buff *skb, int count)
+ +static int bond_xmit_hash_policy_l34(struct sk_buff *skb, int count)
+  {
+ -	struct flow_keys flow;
+ -	u32 hash;
+ -
+ -	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER2 ||
+ -	    !bond_flow_dissect(bond, skb, &flow))
+ -		return bond_eth_hash(skb) % count;
+ +	u32 layer4_xor = 0;
+ +	const struct iphdr *iph;
+ +	const struct ipv6hdr *ipv6h;
+ +	const __be32 *s, *d;
+ +	const __be16 *l4 = NULL;
+ +	__be16 _l4[2];
+ +	int noff = skb_network_offset(skb);
+ +	int poff;
+ +
+ +	if (skb->protocol == htons(ETH_P_IP) &&
+ +	    pskb_may_pull(skb, noff + sizeof(*iph))) {
+ +		iph = ip_hdr(skb);
+ +		poff = proto_ports_offset(iph->protocol);
+  
+ -	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER23 ||
+ -	    bond->params.xmit_policy == BOND_XMIT_POLICY_ENCAP23)
+ -		hash = bond_eth_hash(skb);
+ -	else
+ -		hash = (__force u32)flow.ports;
+ -	hash ^= (__force u32)flow.dst ^ (__force u32)flow.src;
+ -	hash ^= (hash >> 16);
+ -	hash ^= (hash >> 8);
+ +		if (!ip_is_fragment(iph) && poff >= 0) {
+ +			l4 = skb_header_pointer(skb, noff + (iph->ihl << 2) + poff,
+ +						sizeof(_l4), &_l4);
+ +			if (l4)
+ +				layer4_xor = ntohs(l4[0] ^ l4[1]);
+ +		}
+ +		return (layer4_xor ^
+ +			((ntohl(iph->saddr ^ iph->daddr)) & 0xffff)) % count;
+ +	} else if (skb->protocol == htons(ETH_P_IPV6) &&
+ +		   pskb_may_pull(skb, noff + sizeof(*ipv6h))) {
+ +		ipv6h = ipv6_hdr(skb);
+ +		poff = proto_ports_offset(ipv6h->nexthdr);
+ +		if (poff >= 0) {
+ +			l4 = skb_header_pointer(skb, noff + sizeof(*ipv6h) + poff,
+ +						sizeof(_l4), &_l4);
+ +			if (l4)
+ +				layer4_xor = ntohs(l4[0] ^ l4[1]);
+ +		}
+ +		s = &ipv6h->saddr.s6_addr32[0];
+ +		d = &ipv6h->daddr.s6_addr32[0];
+ +		layer4_xor ^= (s[1] ^ d[1]) ^ (s[2] ^ d[2]) ^ (s[3] ^ d[3]);
+ +		layer4_xor ^= (layer4_xor >> 24) ^ (layer4_xor >> 16) ^
+ +			       (layer4_xor >> 8);
+ +		return layer4_xor % count;
+ +	}
+  
+ -	return hash % count;
+ +	return bond_xmit_hash_policy_l2(skb, count);
+  }
+  
+  /*-------------------------- Device entry points ----------------------------*/
+@@@ -4098,17 -3768,15 +4125,17 @@@ static netdev_tx_t bond_start_xmit(stru
+  	 * If we risk deadlock from transmitting this in the
+  	 * netpoll path, tell netpoll to queue the frame for later tx
+  	 */
+- 	if (is_netpoll_tx_blocked(dev))
++ 	if (unlikely(is_netpoll_tx_blocked(dev)))
+  		return NETDEV_TX_BUSY;
+  
+ -	rcu_read_lock();
+ -	if (bond_has_slaves(bond))
+ +	read_lock(&bond->lock);
+ +
+ +	if (bond->slave_cnt)
+  		ret = __bond_start_xmit(skb, dev);
+  	else
+ -		dev_kfree_skb_any(skb);
+ -	rcu_read_unlock();
+ +		kfree_skb(skb);
+ +
+ +	read_unlock(&bond->lock);
+  
+  	return ret;
+  }
+* Unmerged path drivers/net/bonding/bond_main.c
