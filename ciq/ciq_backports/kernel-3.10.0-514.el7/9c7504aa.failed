@@ -1,0 +1,464 @@
+xfs: track and serialize in-flight async buffers against unmount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 9c7504aa72b6e2104ba6dcef518c15672ec51175
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9c7504aa.failed
+
+Newly allocated XFS metadata buffers are added to the LRU once the hold
+count is released, which typically occurs after I/O completion. There is
+no other mechanism at current that tracks the existence or I/O state of
+a new buffer. Further, readahead I/O tends to be submitted
+asynchronously by nature, which means the I/O can remain in flight and
+actually complete long after the calling context is gone. This means
+that file descriptors or any other holds on the filesystem can be
+released, allowing the filesystem to be unmounted while I/O is still in
+flight. When I/O completion occurs, core data structures may have been
+freed, causing completion to run into invalid memory accesses and likely
+to panic.
+
+This problem is reproduced on XFS via directory readahead. A filesystem
+is mounted, a directory is opened/closed and the filesystem immediately
+unmounted. The open/close cycle triggers a directory readahead that if
+delayed long enough, runs buffer I/O completion after the unmount has
+completed.
+
+To address this problem, add a mechanism to track all in-flight,
+asynchronous buffers using per-cpu counters in the buftarg. The buffer
+is accounted on the first I/O submission after the current reference is
+acquired and unaccounted once the buffer is returned to the LRU or
+freed. Update xfs_wait_buftarg() to wait on all in-flight I/O before
+walking the LRU list. Once in-flight I/O has completed and the workqueue
+has drained, all new buffers should have been released onto the LRU.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 9c7504aa72b6e2104ba6dcef518c15672ec51175)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+#	fs/xfs/xfs_buf.h
+diff --cc fs/xfs/xfs_buf.c
+index c8156d3de9e4,2722cb495ef4..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -80,51 -80,44 +80,92 @@@ xfs_buf_vmap_len
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * xfs_buf_lru_add - add a buffer to the LRU.
+ + *
+ + * The LRU takes a new reference to the buffer so that it will only be freed
+ + * once the shrinker takes the buffer off the LRU.
+ + */
+ +STATIC void
+ +xfs_buf_lru_add(
+ +	struct xfs_buf	*bp)
+ +{
+ +	struct xfs_buftarg *btp = bp->b_target;
+ +
+ +	spin_lock(&btp->bt_lru_lock);
+ +	if (list_empty(&bp->b_lru)) {
+ +		atomic_inc(&bp->b_hold);
+ +		list_add_tail(&bp->b_lru, &btp->bt_lru);
+ +		btp->bt_lru_nr++;
+ +		bp->b_lru_flags &= ~_XBF_LRU_DISPOSE;
+ +	}
+ +	spin_unlock(&btp->bt_lru_lock);
+ +}
+ +
+ +/*
+ + * xfs_buf_lru_del - remove a buffer from the LRU
+ + *
+ + * The unlocked check is safe here because it only occurs when there are not
+ + * b_lru_ref counts left on the inode under the pag->pag_buf_lock. it is there
+ + * to optimise the shrinker removing the buffer from the LRU and calling
+ + * xfs_buf_free(). i.e. it removes an unnecessary round trip on the
+ + * bt_lru_lock.
+ + */
+ +STATIC void
+ +xfs_buf_lru_del(
+ +	struct xfs_buf	*bp)
+ +{
+ +	struct xfs_buftarg *btp = bp->b_target;
+ +
+ +	if (list_empty(&bp->b_lru))
+ +		return;
+ +
+ +	spin_lock(&btp->bt_lru_lock);
+ +	if (!list_empty(&bp->b_lru)) {
+ +		list_del_init(&bp->b_lru);
+ +		btp->bt_lru_nr--;
+ +	}
+ +	spin_unlock(&btp->bt_lru_lock);
+++=======
++  * Bump the I/O in flight count on the buftarg if we haven't yet done so for
++  * this buffer. The count is incremented once per buffer (per hold cycle)
++  * because the corresponding decrement is deferred to buffer release. Buffers
++  * can undergo I/O multiple times in a hold-release cycle and per buffer I/O
++  * tracking adds unnecessary overhead. This is used for sychronization purposes
++  * with unmount (see xfs_wait_buftarg()), so all we really need is a count of
++  * in-flight buffers.
++  *
++  * Buffers that are never released (e.g., superblock, iclog buffers) must set
++  * the XBF_NO_IOACCT flag before I/O submission. Otherwise, the buftarg count
++  * never reaches zero and unmount hangs indefinitely.
++  */
++ static inline void
++ xfs_buf_ioacct_inc(
++ 	struct xfs_buf	*bp)
++ {
++ 	if (bp->b_flags & (XBF_NO_IOACCT|_XBF_IN_FLIGHT))
++ 		return;
++ 
++ 	ASSERT(bp->b_flags & XBF_ASYNC);
++ 	bp->b_flags |= _XBF_IN_FLIGHT;
++ 	percpu_counter_inc(&bp->b_target->bt_io_count);
++ }
++ 
++ /*
++  * Clear the in-flight state on a buffer about to be released to the LRU or
++  * freed and unaccount from the buftarg.
++  */
++ static inline void
++ xfs_buf_ioacct_dec(
++ 	struct xfs_buf	*bp)
++ {
++ 	if (!(bp->b_flags & _XBF_IN_FLIGHT))
++ 		return;
++ 
++ 	ASSERT(bp->b_flags & XBF_ASYNC);
++ 	bp->b_flags &= ~_XBF_IN_FLIGHT;
++ 	percpu_counter_dec(&bp->b_target->bt_io_count);
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  }
+  
+  /*
+@@@ -150,20 -143,22 +191,36 @@@ xfs_buf_stale
+  	 */
+  	bp->b_flags &= ~_XBF_DELWRI_Q;
+  
+++<<<<<<< HEAD
+ +	atomic_set(&(bp)->b_lru_ref, 0);
+ +	if (!list_empty(&bp->b_lru)) {
+ +		struct xfs_buftarg *btp = bp->b_target;
+++=======
++ 	/*
++ 	 * Once the buffer is marked stale and unlocked, a subsequent lookup
++ 	 * could reset b_flags. There is no guarantee that the buffer is
++ 	 * unaccounted (released to LRU) before that occurs. Drop in-flight
++ 	 * status now to preserve accounting consistency.
++ 	 */
++ 	xfs_buf_ioacct_dec(bp);
++ 
++ 	spin_lock(&bp->b_lock);
++ 	atomic_set(&bp->b_lru_ref, 0);
++ 	if (!(bp->b_state & XFS_BSTATE_DISPOSE) &&
++ 	    (list_lru_del(&bp->b_target->bt_lru, &bp->b_lru)))
++ 		atomic_dec(&bp->b_hold);
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  
+ +		spin_lock(&btp->bt_lru_lock);
+ +		if (!list_empty(&bp->b_lru) &&
+ +		    !(bp->b_lru_flags & _XBF_LRU_DISPOSE)) {
+ +			list_del_init(&bp->b_lru);
+ +			btp->bt_lru_nr--;
+ +			atomic_dec(&bp->b_hold);
+ +		}
+ +		spin_unlock(&btp->bt_lru_lock);
+ +	}
+  	ASSERT(atomic_read(&bp->b_hold) >= 1);
+ -	spin_unlock(&bp->b_lock);
+  }
+  
+  static int
+@@@ -936,20 -942,59 +997,75 @@@ xfs_buf_rele
+  	ASSERT(!RB_EMPTY_NODE(&bp->b_rbnode));
+  
+  	ASSERT(atomic_read(&bp->b_hold) > 0);
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock)) {
+ +		if (!(bp->b_flags & XBF_STALE) &&
+ +			   atomic_read(&bp->b_lru_ref)) {
+ +			xfs_buf_lru_add(bp);
+ +			spin_unlock(&pag->pag_buf_lock);
+ +		} else {
+ +			xfs_buf_lru_del(bp);
+ +			ASSERT(!(bp->b_flags & _XBF_DELWRI_Q));
+ +			rb_erase(&bp->b_rbnode, &pag->pag_buf_tree);
+ +			spin_unlock(&pag->pag_buf_lock);
+ +			xfs_perag_put(pag);
+ +			xfs_buf_free(bp);
+ +		}
+++=======
++ 
++ 	release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
++ 	spin_lock(&bp->b_lock);
++ 	if (!release) {
++ 		/*
++ 		 * Drop the in-flight state if the buffer is already on the LRU
++ 		 * and it holds the only reference. This is racy because we
++ 		 * haven't acquired the pag lock, but the use of _XBF_IN_FLIGHT
++ 		 * ensures the decrement occurs only once per-buf.
++ 		 */
++ 		if ((atomic_read(&bp->b_hold) == 1) && !list_empty(&bp->b_lru))
++ 			xfs_buf_ioacct_dec(bp);
++ 		goto out_unlock;
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
++ 	}
++ 
++ 	/* the last reference has been dropped ... */
++ 	xfs_buf_ioacct_dec(bp);
++ 	if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
++ 		/*
++ 		 * If the buffer is added to the LRU take a new reference to the
++ 		 * buffer for the LRU and clear the (now stale) dispose list
++ 		 * state flag
++ 		 */
++ 		if (list_lru_add(&bp->b_target->bt_lru, &bp->b_lru)) {
++ 			bp->b_state &= ~XFS_BSTATE_DISPOSE;
++ 			atomic_inc(&bp->b_hold);
++ 		}
++ 		spin_unlock(&pag->pag_buf_lock);
++ 	} else {
++ 		/*
++ 		 * most of the time buffers will already be removed from the
++ 		 * LRU, so optimise that case by checking for the
++ 		 * XFS_BSTATE_DISPOSE flag indicating the last list the buffer
++ 		 * was on was the disposal list
++ 		 */
++ 		if (!(bp->b_state & XFS_BSTATE_DISPOSE)) {
++ 			list_lru_del(&bp->b_target->bt_lru, &bp->b_lru);
++ 		} else {
++ 			ASSERT(list_empty(&bp->b_lru));
++ 		}
++ 
++ 		ASSERT(!(bp->b_flags & _XBF_DELWRI_Q));
++ 		rb_erase(&bp->b_rbnode, &pag->pag_buf_tree);
++ 		spin_unlock(&pag->pag_buf_lock);
++ 		xfs_perag_put(pag);
++ 		freebuf = true;
+  	}
++ 
++ out_unlock:
++ 	spin_unlock(&bp->b_lock);
++ 
++ 	if (freebuf)
++ 		xfs_buf_free(bp);
+  }
+  
+  
+@@@ -1522,39 -1593,82 +1639,77 @@@ voi
+  xfs_wait_buftarg(
+  	struct xfs_buftarg	*btp)
+  {
+ -	LIST_HEAD(dispose);
+ -	int loop = 0;
+ +	struct xfs_buf		*bp;
+  
+++<<<<<<< HEAD
+ +restart:
+ +	spin_lock(&btp->bt_lru_lock);
+ +	while (!list_empty(&btp->bt_lru)) {
+ +		bp = list_first_entry(&btp->bt_lru, struct xfs_buf, b_lru);
+ +		if (atomic_read(&bp->b_hold) > 1) {
+ +			trace_xfs_buf_wait_buftarg(bp, _RET_IP_);
+ +			list_move_tail(&bp->b_lru, &btp->bt_lru);
+ +			spin_unlock(&btp->bt_lru_lock);
+++=======
++ 	/*
++ 	 * First wait on the buftarg I/O count for all in-flight buffers to be
++ 	 * released. This is critical as new buffers do not make the LRU until
++ 	 * they are released.
++ 	 *
++ 	 * Next, flush the buffer workqueue to ensure all completion processing
++ 	 * has finished. Just waiting on buffer locks is not sufficient for
++ 	 * async IO as the reference count held over IO is not released until
++ 	 * after the buffer lock is dropped. Hence we need to ensure here that
++ 	 * all reference counts have been dropped before we start walking the
++ 	 * LRU list.
++ 	 */
++ 	while (percpu_counter_sum(&btp->bt_io_count))
++ 		delay(100);
++ 	drain_workqueue(btp->bt_mount->m_buf_workqueue);
++ 
++ 	/* loop until there is nothing left on the lru list. */
++ 	while (list_lru_count(&btp->bt_lru)) {
++ 		list_lru_walk(&btp->bt_lru, xfs_buftarg_wait_rele,
++ 			      &dispose, LONG_MAX);
++ 
++ 		while (!list_empty(&dispose)) {
++ 			struct xfs_buf *bp;
++ 			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
++ 			list_del_init(&bp->b_lru);
++ 			if (bp->b_flags & XBF_WRITE_FAIL) {
++ 				xfs_alert(btp->bt_mount,
++ "Corruption Alert: Buffer at block 0x%llx had permanent write failures!",
++ 					(long long)bp->b_bn);
++ 				xfs_alert(btp->bt_mount,
++ "Please run xfs_repair to determine the extent of the problem.");
++ 			}
++ 			xfs_buf_rele(bp);
++ 		}
++ 		if (loop++ != 0)
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  			delay(100);
+ +			goto restart;
+ +		}
+ +		/*
+ +		 * clear the LRU reference count so the buffer doesn't get
+ +		 * ignored in xfs_buf_rele().
+ +		 */
+ +		atomic_set(&bp->b_lru_ref, 0);
+ +		spin_unlock(&btp->bt_lru_lock);
+ +		if (bp->b_flags & XBF_WRITE_FAIL) {
+ +			xfs_alert(btp->bt_mount,
+ +"Corruption Alert: Buffer at block 0x%llx had permanent write failures!\n"
+ +"Please run xfs_repair to determine the extent of the problem.",
+ +				(long long)bp->b_bn);
+ +		}
+ +		xfs_buf_rele(bp);
+ +		spin_lock(&btp->bt_lru_lock);
+  	}
+ +	spin_unlock(&btp->bt_lru_lock);
+  }
+  
+ -static enum lru_status
+ -xfs_buftarg_isolate(
+ -	struct list_head	*item,
+ -	struct list_lru_one	*lru,
+ -	spinlock_t		*lru_lock,
+ -	void			*arg)
+ -{
+ -	struct xfs_buf		*bp = container_of(item, struct xfs_buf, b_lru);
+ -	struct list_head	*dispose = arg;
+ -
+ -	/*
+ -	 * we are inverting the lru lock/bp->b_lock here, so use a trylock.
+ -	 * If we fail to get the lock, just skip it.
+ -	 */
+ -	if (!spin_trylock(&bp->b_lock))
+ -		return LRU_SKIP;
+ -	/*
+ -	 * Decrement the b_lru_ref count unless the value is already
+ -	 * zero. If the value is already zero, we need to reclaim the
+ -	 * buffer, otherwise it gets another trip through the LRU.
+ -	 */
+ -	if (!atomic_add_unless(&bp->b_lru_ref, -1, 0)) {
+ -		spin_unlock(&bp->b_lock);
+ -		return LRU_ROTATE;
+ -	}
+ -
+ -	bp->b_state |= XFS_BSTATE_DISPOSE;
+ -	list_lru_isolate_move(lru, item, dispose);
+ -	spin_unlock(&bp->b_lock);
+ -	return LRU_REMOVED;
+ -}
+ -
+ -static unsigned long
+ -xfs_buftarg_shrink_scan(
+ +int
+ +xfs_buftarg_shrink(
+  	struct shrinker		*shrink,
+  	struct shrink_control	*sc)
+  {
+@@@ -1609,6 -1706,9 +1764,12 @@@ xfs_free_buftarg
+  	struct xfs_buftarg	*btp)
+  {
+  	unregister_shrinker(&btp->bt_shrinker);
+++<<<<<<< HEAD
+++=======
++ 	ASSERT(percpu_counter_sum(&btp->bt_io_count) == 0);
++ 	percpu_counter_destroy(&btp->bt_io_count);
++ 	list_lru_destroy(&btp->bt_lru);
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  
+  	if (mp->m_flags & XFS_MOUNT_BARRIER)
+  		xfs_blkdev_issue_flush(btp);
+@@@ -1670,12 -1766,19 +1831,24 @@@ xfs_alloc_buftarg
+  	btp->bt_bdev = bdev;
+  	btp->bt_bdi = blk_get_backing_dev_info(bdev);
+  
+ +	INIT_LIST_HEAD(&btp->bt_lru);
+ +	spin_lock_init(&btp->bt_lru_lock);
+  	if (xfs_setsize_buftarg_early(btp, bdev))
+  		goto error;
+++<<<<<<< HEAD
+ +	btp->bt_shrinker.shrink = xfs_buftarg_shrink;
+++=======
++ 
++ 	if (list_lru_init(&btp->bt_lru))
++ 		goto error;
++ 
++ 	if (percpu_counter_init(&btp->bt_io_count, 0, GFP_KERNEL))
++ 		goto error;
++ 
++ 	btp->bt_shrinker.count_objects = xfs_buftarg_shrink_count;
++ 	btp->bt_shrinker.scan_objects = xfs_buftarg_shrink_scan;
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  	btp->bt_shrinker.seeks = DEFAULT_SEEKS;
+ -	btp->bt_shrinker.flags = SHRINKER_NUMA_AWARE;
+  	register_shrinker(&btp->bt_shrinker);
+  	return btp;
+  
+diff --cc fs/xfs/xfs_buf.h
+index 5e9d6b7627e0,1c2e52b2d926..000000000000
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@@ -61,7 -63,7 +61,11 @@@ typedef enum 
+  #define _XBF_KMEM	 (1 << 21)/* backed by heap memory */
+  #define _XBF_DELWRI_Q	 (1 << 22)/* buffer on a delwri queue */
+  #define _XBF_COMPOUND	 (1 << 23)/* compound buffer */
+++<<<<<<< HEAD
+ +#define _XBF_LRU_DISPOSE (1 << 24)/* buffer being discarded */
+++=======
++ #define _XBF_IN_FLIGHT	 (1 << 25) /* I/O in flight, for accounting purposes */
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  
+  typedef unsigned int xfs_buf_flags_t;
+  
+@@@ -82,9 -84,14 +86,13 @@@
+  	{ _XBF_KMEM,		"KMEM" }, \
+  	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, \
+  	{ _XBF_COMPOUND,	"COMPOUND" }, \
+++<<<<<<< HEAD
+ +	{ _XBF_LRU_DISPOSE,	"LRU_DISPOSE" }
+++=======
++ 	{ _XBF_IN_FLIGHT,	"IN_FLIGHT" }
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  
+  
+ -/*
+ - * Internal state flags.
+ - */
+ -#define XFS_BSTATE_DISPOSE	 (1 << 0)	/* buffer being discarded */
+ -
+  /*
+   * The xfs_buftarg contains 2 notions of "sector size" -
+   *
+@@@ -110,9 -117,9 +118,15 @@@ typedef struct xfs_buftarg 
+  
+  	/* LRU control structures */
+  	struct shrinker		bt_shrinker;
+++<<<<<<< HEAD
+ +	struct list_head	bt_lru;
+ +	spinlock_t		bt_lru_lock;
+ +	unsigned int		bt_lru_nr;
+++=======
++ 	struct list_lru		bt_lru;
++ 
++ 	struct percpu_counter	bt_io_count;
+++>>>>>>> 9c7504aa72b6 (xfs: track and serialize in-flight async buffers against unmount)
+  } xfs_buftarg_t;
+  
+  struct xfs_buf;
+* Unmerged path fs/xfs/xfs_buf.c
+* Unmerged path fs/xfs/xfs_buf.h
