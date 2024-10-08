@@ -1,0 +1,216 @@
+hv_netvsc: remove locking in netvsc_send()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 2a04ae8acb144996eba6e3d69ab2a7156c775416
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2a04ae8a.failed
+
+Packet scheduler guarantees there won't be multiple senders for the same
+queue and as we use q_idx for multi_send_data the spinlock is redundant.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2a04ae8acb144996eba6e3d69ab2a7156c775416)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index cf498664d989,ee0f55957ab8..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -596,7 -628,46 +596,50 @@@ struct nvsp_message 
+  
+  #define VRSS_SEND_TAB_SIZE 16
+  
+++<<<<<<< HEAD
+ +/* Per netvsc channel-specific */
+++=======
++ #define RNDIS_MAX_PKT_DEFAULT 8
++ #define RNDIS_PKT_ALIGN_DEFAULT 8
++ 
++ struct multi_send_data {
++ 	struct hv_netvsc_packet *pkt; /* netvsc pkt pending */
++ 	u32 count; /* counter of batched packets */
++ };
++ 
++ struct netvsc_stats {
++ 	u64 packets;
++ 	u64 bytes;
++ 	struct u64_stats_sync syncp;
++ };
++ 
++ struct netvsc_reconfig {
++ 	struct list_head list;
++ 	u32 event;
++ };
++ 
++ /* The context of the netvsc device  */
++ struct net_device_context {
++ 	/* point back to our device context */
++ 	struct hv_device *device_ctx;
++ 	/* reconfigure work */
++ 	struct delayed_work dwork;
++ 	/* last reconfig time */
++ 	unsigned long last_reconfig;
++ 	/* reconfig events */
++ 	struct list_head reconfig_events;
++ 	/* list protection */
++ 	spinlock_t lock;
++ 
++ 	struct work_struct work;
++ 	u32 msg_enable; /* debug level */
++ 
++ 	struct netvsc_stats __percpu *tx_stats;
++ 	struct netvsc_stats __percpu *rx_stats;
++ };
++ 
++ /* Per netvsc device */
+++>>>>>>> 2a04ae8acb14 (hv_netvsc: remove locking in netvsc_send())
+  struct netvsc_device {
+  	struct hv_device *dev;
+  
+diff --cc drivers/net/hyperv/netvsc.c
+index 74ee1b57e623,081f14f75509..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -54,6 -54,8 +54,11 @@@ static struct netvsc_device *alloc_net_
+  	net_device->destroy = false;
+  	net_device->dev = device;
+  	net_device->ndev = ndev;
+++<<<<<<< HEAD
+++=======
++ 	net_device->max_pkt = RNDIS_MAX_PKT_DEFAULT;
++ 	net_device->pkt_align = RNDIS_PKT_ALIGN_DEFAULT;
+++>>>>>>> 2a04ae8acb14 (hv_netvsc: remove locking in netvsc_send())
+  
+  	hv_set_drvdata(device, net_device);
+  	return net_device;
+@@@ -817,13 -833,110 +822,120 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		if (section_index != NETVSC_INVALID_INDEX)
+ +			netvsc_free_send_slot(net_device, section_index);
+ +	} else if (skb) {
+ +		dev_kfree_skb_any(skb);
+ +	}
+ +
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet,
++ 		struct rndis_message *rndis_msg)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 	bool try_batch;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 	packet->cp_partial = false;
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	try_batch = packet->is_data_pkt && msd_len > 0 && msdp->count <
++ 		    net_device->max_pkt;
++ 
++ 	if (try_batch && msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (try_batch && msd_len + packet->rmsg_size <
++ 		   net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 		packet->cp_partial = true;
++ 
++ 	} else if (packet->is_data_pkt && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet, rndis_msg);
++ 
++ 		packet->send_buf_index = section_index;
++ 
++ 		if (packet->cp_partial) {
++ 			packet->page_buf_cnt -= packet->rmsg_pgcnt;
++ 			packet->total_data_buflen = msd_len + packet->rmsg_size;
++ 		} else {
++ 			packet->page_buf_cnt = 0;
++ 			packet->total_data_buflen += msd_len;
++ 		}
++ 
++ 		if (msdp->pkt)
++ 			netvsc_xmit_completion(msdp->pkt);
++ 
++ 		if (packet->xmit_more && !packet->cp_partial) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			netvsc_xmit_completion(msd_send);
++ 		}
++ 	}
++ 
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device);
++ 
++ 	if (ret != 0 && section_index != NETVSC_INVALID_INDEX)
++ 		netvsc_free_send_slot(net_device, section_index);
++ 
+++>>>>>>> 2a04ae8acb14 (hv_netvsc: remove locking in netvsc_send())
+  	return ret;
+  }
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
