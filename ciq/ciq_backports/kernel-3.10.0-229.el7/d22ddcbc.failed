@@ -1,0 +1,140 @@
+ACPI / hotplug: Add demand_offline hotplug profile flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] hotplug: Add demand_offline hotplug profile flag (Prarit Bhargava) [1141846]
+Rebuild_FUZZ: 93.20%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit d22ddcbc4fb7a483d0721eddfda3f0558821d372
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d22ddcbc.failed
+
+Add a new ACPI hotplug profile flag, demand_offline, such that if
+set for the given ACPI device object's scan handler, it will cause
+acpi_scan_hot_remove() to check if that device object's physical
+companions are offline upfront and fail the hot removal if that
+is not the case.
+
+That flag will be useful to overcome a problem with containers on
+some system where they can only be hot-removed after some cleanup
+operations carried out by user space, which needs to be notified
+of the container hot-removal before the kernel attempts to offline
+devices in the container.  In those cases the current implementation
+of acpi_scan_hot_remove() is not sufficient, because it first tries
+to offline the devices in the container and only if that is
+suffcessful it tries to offline the container itself.  As a result,
+the container hot-removal notification is not delivered to user space
+at the right time.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit d22ddcbc4fb7a483d0721eddfda3f0558821d372)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/acpi/acpi_bus.h
+diff --cc include/acpi/acpi_bus.h
+index f5d6e1e4030e,48d302501539..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -88,17 -89,11 +88,23 @@@ struct acpi_device
+   * -----------------
+   */
+  
+ +enum acpi_hotplug_mode {
+ +	AHM_GENERIC = 0,
+ +	AHM_CONTAINER,
+ +	AHM_COUNT
+ +};
+ +
+  struct acpi_hotplug_profile {
+  	struct kobject kobj;
+++<<<<<<< HEAD
+ +	bool enabled:1;
+ +	bool ignore:1;
+ +	enum acpi_hotplug_mode mode;
+++=======
++ 	int (*scan_dependent)(struct acpi_device *adev);
++ 	bool enabled:1;
++ 	bool demand_offline:1;
+++>>>>>>> d22ddcbc4fb7 (ACPI / hotplug: Add demand_offline hotplug profile flag)
+  };
+  
+  static inline struct acpi_hotplug_profile *to_acpi_hotplug_profile(
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index b30a50799f84..e8c948efc0ba 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -125,6 +125,24 @@ acpi_device_modalias_show(struct device *dev, struct device_attribute *attr, cha
+ }
+ static DEVICE_ATTR(modalias, 0444, acpi_device_modalias_show, NULL);
+ 
++static bool acpi_scan_is_offline(struct acpi_device *adev)
++{
++	struct acpi_device_physical_node *pn;
++	bool offline = true;
++
++	mutex_lock(&adev->physical_node_lock);
++
++	list_for_each_entry(pn, &adev->physical_node_list, node)
++		if (device_supports_offline(pn->dev) && !pn->dev->offline) {
++			kobject_uevent(&pn->dev->kobj, KOBJ_CHANGE);
++			offline = false;
++			break;
++		}
++
++	mutex_unlock(&adev->physical_node_lock);
++	return offline;
++}
++
+ static acpi_status acpi_bus_offline(acpi_handle handle, u32 lvl, void *data,
+ 				    void **ret_p)
+ {
+@@ -195,12 +213,11 @@ static acpi_status acpi_bus_online(acpi_handle handle, u32 lvl, void *data,
+ 	return AE_OK;
+ }
+ 
+-static int acpi_scan_hot_remove(struct acpi_device *device)
++static int acpi_scan_try_to_offline(struct acpi_device *device)
+ {
+ 	acpi_handle handle = device->handle;
+-	struct device *errdev;
++	struct device *errdev = NULL;
+ 	acpi_status status;
+-	unsigned long long sta;
+ 
+ 	/* If there is no handle, the device node has been unregistered. */
+ 	if (!handle) {
+@@ -218,7 +235,6 @@ static int acpi_scan_hot_remove(struct acpi_device *device)
+ 	 *
+ 	 * If the first pass is successful, the second one isn't needed, though.
+ 	 */
+-	errdev = NULL;
+ 	status = acpi_walk_namespace(ACPI_TYPE_ANY, handle, ACPI_UINT32_MAX,
+ 				     NULL, acpi_bus_offline, (void *)false,
+ 				     (void **)&errdev);
+@@ -249,6 +265,23 @@ static int acpi_scan_hot_remove(struct acpi_device *device)
+ 			return -EBUSY;
+ 		}
+ 	}
++	return 0;
++}
++
++static int acpi_scan_hot_remove(struct acpi_device *device)
++{
++	acpi_handle handle = device->handle;
++	unsigned long long sta;
++	acpi_status status;
++
++	if (device->handler->hotplug.demand_offline && !acpi_force_hot_remove) {
++		if (!acpi_scan_is_offline(device))
++			return -EBUSY;
++	} else {
++		int error = acpi_scan_try_to_offline(device);
++		if (error)
++			return error;
++	}
+ 
+ 	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+ 		"Hot-removing device %s...\n", dev_name(&device->dev)));
+* Unmerged path include/acpi/acpi_bus.h
