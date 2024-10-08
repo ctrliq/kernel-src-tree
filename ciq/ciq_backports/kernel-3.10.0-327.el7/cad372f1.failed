@@ -1,0 +1,148 @@
+ALSA: hda - Handle error from get_response bus ops directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] hda - Handle error from get_response bus ops directly (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 94.64%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit cad372f1be5ef7cf14b980e679fbf30430dc241f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cad372f1.failed
+
+... and drop bus->rirb_error flag.  This makes the code simpler.
+
+We treat -EAGAIN from get_response ops as a special meaning: it allows
+the caller to retry after bus reset.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit cad372f1be5ef7cf14b980e679fbf30430dc241f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_codec.c
+#	sound/pci/hda/hda_controller.c
+diff --cc sound/pci/hda/hda_codec.c
+index d744f45d5fe3,c13d5c3e1d03..000000000000
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@@ -170,29 -136,17 +170,35 @@@ static int codec_exec_verb(struct hda_c
+  	if (cmd == ~0)
+  		return -1;
+  
+ +	if (res)
+ +		*res = -1;
+   again:
+ -	snd_hda_power_up_pm(codec);
+ -	mutex_lock(&bus->core.cmd_mutex);
+ +	snd_hda_power_up(codec);
+ +	mutex_lock(&bus->cmd_mutex);
+  	if (flags & HDA_RW_NO_RESPONSE_FALLBACK)
+  		bus->no_response_fallback = 1;
+ -	err = snd_hdac_bus_exec_verb_unlocked(&bus->core, codec->core.addr,
+ -					      cmd, res);
+ +	for (;;) {
+ +		trace_hda_send_cmd(codec, cmd);
+ +		err = bus->ops.command(bus, cmd);
+ +		if (err != -EAGAIN)
+ +			break;
+ +		/* process pending verbs */
+ +		bus->ops.get_response(bus, codec->addr);
+ +	}
+ +	if (!err && res) {
+ +		*res = bus->ops.get_response(bus, codec->addr);
+ +		trace_hda_get_response(codec, *res);
+ +	}
+  	bus->no_response_fallback = 0;
+++<<<<<<< HEAD
+ +	mutex_unlock(&bus->cmd_mutex);
+ +	snd_hda_power_down(codec);
+ +	if (!codec_in_pm(codec) && res && *res == -1 && bus->rirb_error) {
+++=======
++ 	mutex_unlock(&bus->core.cmd_mutex);
++ 	snd_hda_power_down_pm(codec);
++ 	if (!codec_in_pm(codec) && res && err == -EAGAIN) {
+++>>>>>>> cad372f1be5e (ALSA: hda - Handle error from get_response bus ops directly)
+  		if (bus->response_reset) {
+  			codec_dbg(codec,
+  				  "resetting BUS due to fatal communication error\n");
+@@@ -765,6 -507,25 +769,28 @@@ static int snd_hda_bus_dev_disconnect(s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* hdac_bus_ops translations */
++ static int _hda_bus_command(struct hdac_bus *_bus, unsigned int cmd)
++ {
++ 	struct hda_bus *bus = container_of(_bus, struct hda_bus, core);
++ 	return bus->ops.command(bus, cmd);
++ }
++ 
++ static int _hda_bus_get_response(struct hdac_bus *_bus, unsigned int addr,
++ 				 unsigned int *res)
++ {
++ 	struct hda_bus *bus = container_of(_bus, struct hda_bus, core);
++ 	return bus->ops.get_response(bus, addr, res);
++ }
++ 
++ static const struct hdac_bus_ops bus_ops = {
++ 	.command = _hda_bus_command,
++ 	.get_response = _hda_bus_get_response,
++ };
++ 
+++>>>>>>> cad372f1be5e (ALSA: hda - Handle error from get_response bus ops directly)
+  /**
+   * snd_hda_bus_new - create a HDA bus
+   * @card: the card entry
+diff --cc sound/pci/hda/hda_controller.c
+index 0d7233e1e418,b4474e27631d..000000000000
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@@ -1758,15 -1762,16 +1758,21 @@@ static int probe_codec(struct azx *chip
+  {
+  	unsigned int cmd = (addr << 28) | (AC_NODE_ROOT << 20) |
+  		(AC_VERB_PARAMETERS << 8) | AC_PAR_VENDOR_ID;
++ 	int err;
+  	unsigned int res;
+  
+ -	mutex_lock(&chip->bus->core.cmd_mutex);
+ +	mutex_lock(&chip->bus->cmd_mutex);
+  	chip->probing = 1;
+  	azx_send_cmd(chip->bus, cmd);
+- 	res = azx_get_response(chip->bus, addr);
++ 	err = azx_get_response(chip->bus, addr, &res);
+  	chip->probing = 0;
+++<<<<<<< HEAD
+ +	mutex_unlock(&chip->bus->cmd_mutex);
+ +	if (res == -1)
+++=======
++ 	mutex_unlock(&chip->bus->core.cmd_mutex);
++ 	if (err < 0 || res == -1)
+++>>>>>>> cad372f1be5e (ALSA: hda - Handle error from get_response bus ops directly)
+  		return -EIO;
+  	dev_dbg(chip->card->dev, "codec #%d probed OK\n", addr);
+  	return 0;
+* Unmerged path sound/pci/hda/hda_codec.c
+diff --git a/sound/pci/hda/hda_codec.h b/sound/pci/hda/hda_codec.h
+index 00c6f394c5ce..912bd7e0ab50 100644
+--- a/sound/pci/hda/hda_codec.h
++++ b/sound/pci/hda/hda_codec.h
+@@ -73,7 +73,7 @@ struct hda_bus_ops {
+ 	/* send a single command */
+ 	int (*command)(struct hda_bus *bus, unsigned int cmd);
+ 	/* get a response from the last command */
+-	unsigned int (*get_response)(struct hda_bus *bus, unsigned int addr);
++	int (*get_response)(struct hda_bus *bus, unsigned int addr, unsigned int *res);
+ 	/* free the private data */
+ 	void (*private_free)(struct hda_bus *);
+ 	/* attach a PCM stream */
+@@ -144,7 +144,6 @@ struct hda_bus {
+ 	unsigned int sync_write:1;	/* sync after verb write */
+ 	/* status for codec/controller */
+ 	unsigned int shutdown :1;	/* being unloaded */
+-	unsigned int rirb_error:1;	/* error in codec communication */
+ 	unsigned int response_reset:1;	/* controller was reset */
+ 	unsigned int in_reset:1;	/* during reset operation */
+ 	unsigned int power_keep_link_on:1; /* don't power off HDA link */
+* Unmerged path sound/pci/hda/hda_controller.c
