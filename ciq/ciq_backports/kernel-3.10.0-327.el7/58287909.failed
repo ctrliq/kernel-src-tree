@@ -1,0 +1,191 @@
+powerpc/powernv: Handle compound PE for EEH
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Handle compound PE for EEH (Steve Best) [1211946]
+Rebuild_FUZZ: 89.74%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit 5828790931901329c5e2c5ec0baf1c3c2b74967f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/58287909.failed
+
+The patch handles compound PE for EEH backend. If one specific
+PE in compound group has been frozen, we enforces to freeze
+all PEs in the group. If we're enable DMA or MMIO for one PE
+in compound group, DMA or MMIO of all PEs in the group will be
+enabled.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 5828790931901329c5e2c5ec0baf1c3c2b74967f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index e8c90cc3885e,c945bed4dc9e..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -239,20 -236,150 +236,136 @@@ static int ioda_eeh_set_option(struct e
+  	return ret;
+  }
+  
+ -static void ioda_eeh_phb_diag(struct eeh_pe *pe)
+ +static void ioda_eeh_phb_diag(struct pci_controller *hose)
+  {
+ -	struct pnv_phb *phb = pe->phb->private_data;
+ +	struct pnv_phb *phb = hose->private_data;
+  	long rc;
+  
+ -	rc = opal_pci_get_phb_diag_data2(phb->opal_id, pe->data,
+ +	rc = opal_pci_get_phb_diag_data2(phb->opal_id, phb->diag.blob,
+  					 PNV_PCI_DIAG_BUF_SIZE);
+ -	if (rc != OPAL_SUCCESS)
+ -		pr_warn("%s: Failed to get diag-data for PHB#%x (%ld)\n",
+ -			__func__, pe->phb->global_number, rc);
+ -}
+ -
+ -static int ioda_eeh_get_phb_state(struct eeh_pe *pe)
+ -{
+ -	struct pnv_phb *phb = pe->phb->private_data;
+ -	u8 fstate;
+ -	__be16 pcierr;
+ -	s64 rc;
+ -	int result = 0;
+ -
+ -	rc = opal_pci_eeh_freeze_status(phb->opal_id,
+ -					pe->addr,
+ -					&fstate,
+ -					&pcierr,
+ -					NULL);
+  	if (rc != OPAL_SUCCESS) {
+ -		pr_warn("%s: Failure %lld getting PHB#%x state\n",
+ -			__func__, rc, phb->hose->global_number);
+ -		return EEH_STATE_NOT_SUPPORT;
+ +		pr_warning("%s: Failed to get diag-data for PHB#%x (%ld)\n",
+ +			    __func__, hose->global_number, rc);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	pnv_pci_dump_phb_diag_data(hose, phb->diag.blob);
+++=======
++ 	/*
++ 	 * Check PHB state. If the PHB is frozen for the
++ 	 * first time, to dump the PHB diag-data.
++ 	 */
++ 	if (be16_to_cpu(pcierr) != OPAL_EEH_PHB_ERROR) {
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 	} else if (!(pe->state & EEH_PE_ISOLATED)) {
++ 		eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
++ 		ioda_eeh_phb_diag(pe);
++ 	}
++ 
++ 	return result;
++ }
++ 
++ static int ioda_eeh_get_pe_state(struct eeh_pe *pe)
++ {
++ 	struct pnv_phb *phb = pe->phb->private_data;
++ 	u8 fstate;
++ 	__be16 pcierr;
++ 	s64 rc;
++ 	int result;
++ 
++ 	/*
++ 	 * We don't clobber hardware frozen state until PE
++ 	 * reset is completed. In order to keep EEH core
++ 	 * moving forward, we have to return operational
++ 	 * state during PE reset.
++ 	 */
++ 	if (pe->state & EEH_PE_RESET) {
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		return result;
++ 	}
++ 
++ 	/*
++ 	 * Fetch PE state from hardware. If the PHB
++ 	 * supports compound PE, let it handle that.
++ 	 */
++ 	if (phb->get_pe_state) {
++ 		fstate = phb->get_pe_state(phb, pe->addr);
++ 	} else {
++ 		rc = opal_pci_eeh_freeze_status(phb->opal_id,
++ 						pe->addr,
++ 						&fstate,
++ 						&pcierr,
++ 						NULL);
++ 		if (rc != OPAL_SUCCESS) {
++ 			pr_warn("%s: Failure %lld getting PHB#%x-PE%x state\n",
++ 				__func__, rc, phb->hose->global_number, pe->addr);
++ 			return EEH_STATE_NOT_SUPPORT;
++ 		}
++ 	}
++ 
++ 	/* Figure out state */
++ 	switch (fstate) {
++ 	case OPAL_EEH_STOPPED_NOT_FROZEN:
++ 		result = (EEH_STATE_MMIO_ACTIVE  |
++ 			  EEH_STATE_DMA_ACTIVE   |
++ 			  EEH_STATE_MMIO_ENABLED |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_MMIO_FREEZE:
++ 		result = (EEH_STATE_DMA_ACTIVE |
++ 			  EEH_STATE_DMA_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_DMA_FREEZE:
++ 		result = (EEH_STATE_MMIO_ACTIVE |
++ 			  EEH_STATE_MMIO_ENABLED);
++ 		break;
++ 	case OPAL_EEH_STOPPED_MMIO_DMA_FREEZE:
++ 		result = 0;
++ 		break;
++ 	case OPAL_EEH_STOPPED_RESET:
++ 		result = EEH_STATE_RESET_ACTIVE;
++ 		break;
++ 	case OPAL_EEH_STOPPED_TEMP_UNAVAIL:
++ 		result = EEH_STATE_UNAVAILABLE;
++ 		break;
++ 	case OPAL_EEH_STOPPED_PERM_UNAVAIL:
++ 		result = EEH_STATE_NOT_SUPPORT;
++ 		break;
++ 	default:
++ 		result = EEH_STATE_NOT_SUPPORT;
++ 		pr_warn("%s: Invalid PHB#%x-PE#%x state %x\n",
++ 			__func__, phb->hose->global_number,
++ 			pe->addr, fstate);
++ 	}
++ 
++ 	/*
++ 	 * If PHB supports compound PE, to freeze all
++ 	 * slave PEs for consistency.
++ 	 *
++ 	 * If the PE is switching to frozen state for the
++ 	 * first time, to dump the PHB diag-data.
++ 	 */
++ 	if (!(result & EEH_STATE_NOT_SUPPORT) &&
++ 	    !(result & EEH_STATE_UNAVAILABLE) &&
++ 	    !(result & EEH_STATE_MMIO_ACTIVE) &&
++ 	    !(result & EEH_STATE_DMA_ACTIVE)  &&
++ 	    !(pe->state & EEH_PE_ISOLATED)) {
++ 		if (phb->freeze_pe)
++ 			phb->freeze_pe(phb, pe->addr);
++ 
++ 		eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
++ 		ioda_eeh_phb_diag(pe);
++ 	}
++ 
++ 	return result;
+++>>>>>>> 582879093190 (powerpc/powernv: Handle compound PE for EEH)
+  }
+  
+  /**
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
