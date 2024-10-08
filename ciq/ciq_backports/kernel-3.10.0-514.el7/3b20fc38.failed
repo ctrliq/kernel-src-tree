@@ -1,0 +1,133 @@
+RDS: Use a single TCP socket for both send and receive.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] rds: Use a single TCP socket for both send and receive (Don Dutile) [1169955 1259940 1262728 1275187 1275209 1275423 1275425 1289615 1291874 1292284 1292872 1296195 1296269 1296338 1296344 1298707 1302166 1310156]
+Rebuild_FUZZ: 99.08%
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit 3b20fc389705a4c959adebc494578cb99bb8be9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3b20fc38.failed
+
+Commit f711a6ae062c ("net/rds: RDS-TCP: Always create a new rds_sock
+for an incoming connection.") modified rds-tcp so that an incoming SYN
+would ignore an existing "client" TCP connection which had the local
+port set to the transient port.  The motivation for ignoring the existing
+"client" connection in f711a6ae was to avoid race conditions and an
+endless duel of reconnect attempts triggered by a restart/abort of one
+of the nodes in the TCP connection.
+
+However, having separate sockets for active and passive sides
+is avoidable, and the simpler model of a single TCP socket for
+both send and receives of all RDS connections associated with
+that tcp socket makes for easier observability. We avoid the race
+conditions from f711a6ae by attempting reconnects in rds_conn_shutdown
+if, and only if, the (new) c_outgoing bit is set for RDS_TRANS_TCP.
+The c_outgoing bit is initialized in __rds_conn_create().
+
+A side-effect of re-using the client rds_connection for an incoming
+SYN is the potential of encountering duelling SYNs, i.e., we
+have an outgoing RDS_CONN_CONNECTING socket when we get the incoming
+SYN. The logic to arbitrate this criss-crossing SYN exchange in
+rds_tcp_accept_one() has been modified to emulate the BGP state
+machine: the smaller IP address should back off from the connection attempt.
+
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b20fc389705a4c959adebc494578cb99bb8be9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/connection.c
+diff --cc net/rds/connection.c
+index f59460af1f7e,d4564036a339..000000000000
+--- a/net/rds/connection.c
++++ b/net/rds/connection.c
+@@@ -127,14 -128,11 +127,11 @@@ static struct rds_connection *__rds_con
+  	struct rds_transport *loop_trans;
+  	unsigned long flags;
+  	int ret;
+- 	struct rds_transport *otrans = trans;
+  
+- 	if (!is_outgoing && otrans->t_type == RDS_TRANS_TCP)
+- 		goto new_conn;
+  	rcu_read_lock();
+ -	conn = rds_conn_lookup(net, head, laddr, faddr, trans);
+ +	conn = rds_conn_lookup(head, laddr, faddr, trans);
+  	if (conn && conn->c_loopback && conn->c_trans != &rds_loop_transport &&
+ -	    laddr == faddr && !is_outgoing) {
+ +	    !is_outgoing) {
+  		/* This is a looped back IB connection, and we're
+  		 * called by the code handling the incoming connect.
+  		 * We need a second connection object into which we
+@@@ -242,7 -240,7 +239,11 @@@
+  		/* Creating normal conn */
+  		struct rds_connection *found;
+  
+++<<<<<<< HEAD
+ +		found = rds_conn_lookup(head, laddr, faddr, trans);
+++=======
++ 		found = rds_conn_lookup(net, head, laddr, faddr, trans);
+++>>>>>>> 3b20fc389705 (RDS: Use a single TCP socket for both send and receive.)
+  		if (found) {
+  			trans->conn_free(conn->c_transport_data);
+  			kmem_cache_free(rds_conn_slab, conn);
+* Unmerged path net/rds/connection.c
+diff --git a/net/rds/rds.h b/net/rds/rds.h
+index 9fd9a443b66d..2ec38bdbbaa8 100644
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@ -86,7 +86,9 @@ struct rds_connection {
+ 	struct hlist_node	c_hash_node;
+ 	__be32			c_laddr;
+ 	__be32			c_faddr;
+-	unsigned int		c_loopback:1;
++	unsigned int		c_loopback:1,
++				c_outgoing:1,
++				c_pad_to_32:30;
+ 	struct rds_connection	*c_passive;
+ 
+ 	struct rds_cong_map	*c_lcong;
+diff --git a/net/rds/tcp_listen.c b/net/rds/tcp_listen.c
+index f60d21372021..34487fdd7265 100644
+--- a/net/rds/tcp_listen.c
++++ b/net/rds/tcp_listen.c
+@@ -117,28 +117,24 @@ static int rds_tcp_accept_one(struct socket *sock)
+ 		goto out;
+ 	}
+ 	/* An incoming SYN request came in, and TCP just accepted it.
+-	 * We always create a new conn for listen side of TCP, and do not
+-	 * add it to the c_hash_list.
+ 	 *
+ 	 * If the client reboots, this conn will need to be cleaned up.
+ 	 * rds_tcp_state_change() will do that cleanup
+ 	 */
+ 	rs_tcp = (struct rds_tcp_connection *)conn->c_transport_data;
+-	WARN_ON(!rs_tcp || rs_tcp->t_sock);
+-
+-	/*
+-	 * see the comment above rds_queue_delayed_reconnect()
+-	 */
+-	if (!rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING)) {
+-		if (rds_conn_state(conn) == RDS_CONN_UP)
+-			rds_tcp_stats_inc(s_tcp_listen_closed_stale);
+-		else
+-			rds_tcp_stats_inc(s_tcp_connect_raced);
+-		rds_conn_drop(conn);
++	if (rs_tcp->t_sock &&
++	    ntohl(inet->inet_saddr) < ntohl(inet->inet_daddr)) {
++		struct sock *nsk = new_sock->sk;
++
++		nsk->sk_user_data = NULL;
++		nsk->sk_prot->disconnect(nsk, 0);
++		tcp_done(nsk);
++		new_sock = NULL;
+ 		ret = 0;
+ 		goto out;
+ 	}
+ 
++	rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING);
+ 	rds_tcp_set_callbacks(new_sock, conn);
+ 	rds_connect_complete(conn);
+ 	new_sock = NULL;
