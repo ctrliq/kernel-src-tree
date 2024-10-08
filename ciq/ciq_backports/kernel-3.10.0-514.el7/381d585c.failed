@@ -1,0 +1,206 @@
+KVM: x86: Replace call-back set_tsc_khz() with a common function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haozhong Zhang <haozhong.zhang@intel.com>
+commit 381d585c80e34988269bd7901ad910981e900be1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/381d585c.failed
+
+Both VMX and SVM propagate virtual_tsc_khz in the same way, so this
+patch removes the call-back set_tsc_khz() and replaces it with a common
+function.
+
+	Signed-off-by: Haozhong Zhang <haozhong.zhang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 381d585c80e34988269bd7901ad910981e900be1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/svm.c
+index f4d872b9eba6,f6e49a6c9ab0..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -970,68 -957,6 +970,71 @@@ static void init_sys_seg(struct vmcb_se
+  	seg->base = 0;
+  }
+  
+++<<<<<<< HEAD
+ +static u64 __scale_tsc(u64 ratio, u64 tsc)
+ +{
+ +	u64 mult, frac, _tsc;
+ +
+ +	mult  = ratio >> 32;
+ +	frac  = ratio & ((1ULL << 32) - 1);
+ +
+ +	_tsc  = tsc;
+ +	_tsc *= mult;
+ +	_tsc += (tsc >> 32) * frac;
+ +	_tsc += ((tsc & ((1ULL << 32) - 1)) * frac) >> 32;
+ +
+ +	return _tsc;
+ +}
+ +
+ +static u64 svm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	u64 _tsc = tsc;
+ +
+ +	if (svm->tsc_ratio != TSC_RATIO_DEFAULT)
+ +		_tsc = __scale_tsc(svm->tsc_ratio, tsc);
+ +
+ +	return _tsc;
+ +}
+ +
+ +static void svm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	u64 ratio;
+ +	u64 khz;
+ +
+ +	/* Guest TSC same frequency as host TSC? */
+ +	if (!scale) {
+ +		svm->tsc_ratio = TSC_RATIO_DEFAULT;
+ +		return;
+ +	}
+ +
+ +	/* TSC scaling supported? */
+ +	if (!boot_cpu_has(X86_FEATURE_TSCRATEMSR)) {
+ +		if (user_tsc_khz > tsc_khz) {
+ +			vcpu->arch.tsc_catchup = 1;
+ +			vcpu->arch.tsc_always_catchup = 1;
+ +		} else
+ +			WARN(1, "user requested TSC rate below hardware speed\n");
+ +		return;
+ +	}
+ +
+ +	khz = user_tsc_khz;
+ +
+ +	/* TSC scaling required  - calculate ratio */
+ +	ratio = khz << 32;
+ +	do_div(ratio, tsc_khz);
+ +
+ +	if (ratio == 0 || ratio & TSC_RATIO_RSVD) {
+ +		WARN_ONCE(1, "Invalid TSC ratio - virtual-tsc-khz=%u\n",
+ +				user_tsc_khz);
+ +		return;
+ +	}
+ +	svm->tsc_ratio             = ratio;
+ +}
+ +
+++=======
+++>>>>>>> 381d585c80e3 (KVM: x86: Replace call-back set_tsc_khz() with a common function)
+  static u64 svm_read_tsc_offset(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+diff --cc arch/x86/kvm/x86.c
+index 24f418aad1ea,c314e8d22a67..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1243,8 -1295,11 +1279,16 @@@ static int kvm_set_tsc_khz(struct kvm_v
+  	int use_scaling = 0;
+  
+  	/* tsc_khz can be zero if TSC calibration fails */
+++<<<<<<< HEAD
+ +	if (this_tsc_khz == 0)
+ +		return;
+++=======
++ 	if (this_tsc_khz == 0) {
++ 		/* set tsc_scaling_ratio to a safe value */
++ 		vcpu->arch.tsc_scaling_ratio = kvm_default_tsc_scaling_ratio;
++ 		return -1;
++ 	}
+++>>>>>>> 381d585c80e3 (KVM: x86: Replace call-back set_tsc_khz() with a common function)
+  
+  	/* Compute a scale to convert nanoseconds in TSC cycles */
+  	kvm_get_time_scale(this_tsc_khz, NSEC_PER_SEC / 1000,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c40aad26d942..6a36e533d10d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -798,7 +798,6 @@ struct kvm_x86_ops {
+ 
+ 	bool (*has_wbinvd_exit)(void);
+ 
+-	void (*set_tsc_khz)(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale);
+ 	u64 (*read_tsc_offset)(struct kvm_vcpu *vcpu);
+ 	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+ 
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 2e741a634171..55e435586e61 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2231,22 +2231,6 @@ static u64 vmx_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc)
+ 	return host_tsc + tsc_offset;
+ }
+ 
+-/*
+- * Engage any workarounds for mis-matched TSC rates.  Currently limited to
+- * software catchup for faster rates on slower CPUs.
+- */
+-static void vmx_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
+-{
+-	if (!scale)
+-		return;
+-
+-	if (user_tsc_khz > tsc_khz) {
+-		vcpu->arch.tsc_catchup = 1;
+-		vcpu->arch.tsc_always_catchup = 1;
+-	} else
+-		WARN(1, "user requested TSC rate below hardware speed\n");
+-}
+-
+ static u64 vmx_read_tsc_offset(struct kvm_vcpu *vcpu)
+ {
+ 	return vmcs_read64(TSC_OFFSET);
+@@ -9924,7 +9908,6 @@ static struct kvm_x86_ops vmx_x86_ops = {
+ 
+ 	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
+ 
+-	.set_tsc_khz = vmx_set_tsc_khz,
+ 	.read_tsc_offset = vmx_read_tsc_offset,
+ 	.write_tsc_offset = vmx_write_tsc_offset,
+ 	.adjust_tsc_offset = vmx_adjust_tsc_offset,
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/include/linux/math64.h b/include/linux/math64.h
+index c45c089bfdac..798354a2a0ee 100644
+--- a/include/linux/math64.h
++++ b/include/linux/math64.h
+@@ -163,4 +163,33 @@ static inline u64 mul_u64_u32_shr(u64 a, u32 mul, unsigned int shift)
+ 
+ #endif
+ 
++#ifndef mul_u64_u32_div
++static inline u64 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)
++{
++	union {
++		u64 ll;
++		struct {
++#ifdef __BIG_ENDIAN
++			u32 high, low;
++#else
++			u32 low, high;
++#endif
++		} l;
++	} u, rl, rh;
++
++	u.ll = a;
++	rl.ll = (u64)u.l.low * mul;
++	rh.ll = (u64)u.l.high * mul + rl.l.high;
++
++	/* Bits 32-63 of the result will be in rh.l.low. */
++	rl.l.high = do_div(rh.ll, divisor);
++
++	/* Bits 0-31 of the result will be in rl.l.low.	*/
++	do_div(rl.ll, divisor);
++
++	rl.l.high = rh.l.low;
++	return rl.ll;
++}
++#endif /* mul_u64_u32_div */
++
+ #endif /* _LINUX_MATH64_H */
