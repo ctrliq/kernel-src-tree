@@ -97,7 +97,7 @@ static int fan_get_cur_state(struct thermal_cooling_device *cdev, unsigned long
 	if (!device)
 		return -EINVAL;
 
-	result = acpi_bus_update_power(device->handle, &acpi_state);
+	result = acpi_device_update_power(device, &acpi_state);
 	if (result)
 		return result;
 
@@ -115,7 +115,7 @@ fan_set_cur_state(struct thermal_cooling_device *cdev, unsigned long state)
 	if (!device || (state != 0 && state != 1))
 		return -EINVAL;
 
-	result = acpi_bus_set_power(device->handle,
+	result = acpi_device_set_power(device,
 				state ? ACPI_STATE_D0 : ACPI_STATE_D3_COLD);
 
 	return result;
@@ -139,7 +139,7 @@ static int acpi_fan_add(struct acpi_device *device)
 	strcpy(acpi_device_name(device), "Fan");
 	strcpy(acpi_device_class(device), ACPI_FAN_CLASS);
 
-	result = acpi_bus_update_power(device->handle, NULL);
+	result = acpi_device_update_power(device, NULL);
 	if (result) {
 		printk(KERN_ERR PREFIX "Setting initial power state\n");
 		goto end;
@@ -191,7 +191,7 @@ static int acpi_fan_remove(struct acpi_device *device)
 #ifdef CONFIG_PM_SLEEP
 static int acpi_fan_suspend(struct device *dev)
 {
-	acpi_bus_set_power(to_acpi_device(dev)->handle, ACPI_STATE_D0);
+	acpi_device_set_power(to_acpi_device(dev), ACPI_STATE_D0);
 
 	return AE_OK;
 }
@@ -200,7 +200,7 @@ static int acpi_fan_resume(struct device *dev)
 {
 	int result;
 
-	result = acpi_bus_update_power(to_acpi_device(dev)->handle, NULL);
+	result = acpi_device_update_power(to_acpi_device(dev), NULL);
 	if (result)
 		printk(KERN_ERR PREFIX "Error updating fan power state\n");
 

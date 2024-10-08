@@ -116,8 +116,6 @@ int acpi_power_get_inferred_state(struct acpi_device *device, int *state);
 int acpi_power_on_resources(struct acpi_device *device, int state);
 int acpi_power_transition(struct acpi_device *device, int state);
 
-int acpi_device_update_power(struct acpi_device *device, int *state_p);
-
 int acpi_wakeup_device_init(void);
 void acpi_early_processor_set_pdc(void);
 
