@@ -1,0 +1,182 @@
+lpfc: Fix for cleaning up stale ring flag and sp_queue_event entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [scsi] lpfc 10.2.8001.0: Fix for cleaning up stale ring flag and sp_queue_event entries (Rob Evers) [1088574]
+Rebuild_FUZZ: 91.89%
+commit-author James Smart <james.smart@emulex.com>
+commit 68e814f587700b935f696b9e18403fe6c900a4a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/68e814f5.failed
+
+Fix for cleaning up stale ring flag and sp_queue_event entries.
+
+	Signed-off-by: James Smart <james.smart@emulex.com>
+Reviewed-By: Dick Kennedy <dick.kennedy@emulex.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 68e814f587700b935f696b9e18403fe6c900a4a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index e937d89f4675,38a4119d6294..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -820,7 -820,139 +820,141 @@@ lpfc_hba_down_prep(struct lpfc_hba *phb
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_sli4_free_sp_events - Cleanup sp_queue_events to free
++  * rspiocb which got deferred
++  *
++  * @phba: pointer to lpfc HBA data structure.
++  *
++  * This routine will cleanup completed slow path events after HBA is reset
++  * when bringing down the SLI Layer.
++  *
++  *
++  * Return codes
++  *   void.
++  **/
++ static void
++ lpfc_sli4_free_sp_events(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_iocbq *rspiocbq;
++ 	struct hbq_dmabuf *dmabuf;
++ 	struct lpfc_cq_event *cq_event;
++ 
++ 	spin_lock_irq(&phba->hbalock);
++ 	phba->hba_flag &= ~HBA_SP_QUEUE_EVT;
++ 	spin_unlock_irq(&phba->hbalock);
++ 
++ 	while (!list_empty(&phba->sli4_hba.sp_queue_event)) {
++ 		/* Get the response iocb from the head of work queue */
++ 		spin_lock_irq(&phba->hbalock);
++ 		list_remove_head(&phba->sli4_hba.sp_queue_event,
++ 				 cq_event, struct lpfc_cq_event, list);
++ 		spin_unlock_irq(&phba->hbalock);
++ 
++ 		switch (bf_get(lpfc_wcqe_c_code, &cq_event->cqe.wcqe_cmpl)) {
++ 		case CQE_CODE_COMPL_WQE:
++ 			rspiocbq = container_of(cq_event, struct lpfc_iocbq,
++ 						 cq_event);
++ 			lpfc_sli_release_iocbq(phba, rspiocbq);
++ 			break;
++ 		case CQE_CODE_RECEIVE:
++ 		case CQE_CODE_RECEIVE_V1:
++ 			dmabuf = container_of(cq_event, struct hbq_dmabuf,
++ 					      cq_event);
++ 			lpfc_in_buf_free(phba, &dmabuf->dbuf);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * lpfc_hba_free_post_buf - Perform lpfc uninitialization after HBA reset
++  * @phba: pointer to lpfc HBA data structure.
++  *
++  * This routine will cleanup posted ELS buffers after the HBA is reset
++  * when bringing down the SLI Layer.
++  *
++  *
++  * Return codes
++  *   void.
++  **/
++ static void
++ lpfc_hba_free_post_buf(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli *psli = &phba->sli;
++ 	struct lpfc_sli_ring *pring;
++ 	struct lpfc_dmabuf *mp, *next_mp;
++ 	LIST_HEAD(buflist);
++ 	int count;
++ 
++ 	if (phba->sli3_options & LPFC_SLI3_HBQ_ENABLED)
++ 		lpfc_sli_hbqbuf_free_all(phba);
++ 	else {
++ 		/* Cleanup preposted buffers on the ELS ring */
++ 		pring = &psli->ring[LPFC_ELS_RING];
++ 		spin_lock_irq(&phba->hbalock);
++ 		list_splice_init(&pring->postbufq, &buflist);
++ 		spin_unlock_irq(&phba->hbalock);
++ 
++ 		count = 0;
++ 		list_for_each_entry_safe(mp, next_mp, &buflist, list) {
++ 			list_del(&mp->list);
++ 			count++;
++ 			lpfc_mbuf_free(phba, mp->virt, mp->phys);
++ 			kfree(mp);
++ 		}
++ 
++ 		spin_lock_irq(&phba->hbalock);
++ 		pring->postbufq_cnt -= count;
++ 		spin_unlock_irq(&phba->hbalock);
++ 	}
++ }
++ 
++ /**
++  * lpfc_hba_clean_txcmplq - Perform lpfc uninitialization after HBA reset
++  * @phba: pointer to lpfc HBA data structure.
++  *
++  * This routine will cleanup the txcmplq after the HBA is reset when bringing
++  * down the SLI Layer.
++  *
++  * Return codes
++  *   void
++  **/
++ static void
++ lpfc_hba_clean_txcmplq(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli *psli = &phba->sli;
++ 	struct lpfc_sli_ring *pring;
++ 	LIST_HEAD(completions);
++ 	int i;
++ 
++ 	for (i = 0; i < psli->num_rings; i++) {
++ 		pring = &psli->ring[i];
++ 		if (phba->sli_rev >= LPFC_SLI_REV4)
++ 			spin_lock_irq(&pring->ring_lock);
++ 		else
++ 			spin_lock_irq(&phba->hbalock);
++ 		/* At this point in time the HBA is either reset or DOA. Either
++ 		 * way, nothing should be on txcmplq as it will NEVER complete.
++ 		 */
++ 		list_splice_init(&pring->txcmplq, &completions);
++ 		pring->txcmplq_cnt = 0;
++ 
++ 		if (phba->sli_rev >= LPFC_SLI_REV4)
++ 			spin_unlock_irq(&pring->ring_lock);
++ 		else
++ 			spin_unlock_irq(&phba->hbalock);
++ 
++ 		/* Cancel all the IOCBs from the completions list */
++ 		lpfc_sli_cancel_iocbs(phba, &completions, IOSTAT_LOCAL_REJECT,
++ 				      IOERR_SLI_ABORTED);
++ 		lpfc_sli_abort_iocb_ring(phba, pring);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 68e814f58770 (lpfc: Fix for cleaning up stale ring flag and sp_queue_event entries)
+   * lpfc_hba_down_post_s3 - Perform lpfc uninitialization after HBA reset
+ -	int i;
+   * @phba: pointer to lpfc HBA data structure.
+   *
+   * This routine will do uninitialization after the HBA is reset when bring
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 546352fa1999..be95d823d34c 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -9169,6 +9169,7 @@ lpfc_sli_queue_setup(struct lpfc_hba *phba)
+ 		pring->sli.sli3.next_cmdidx  = 0;
+ 		pring->sli.sli3.local_getidx = 0;
+ 		pring->sli.sli3.cmdidx = 0;
++		pring->flag = 0;
+ 		INIT_LIST_HEAD(&pring->txq);
+ 		INIT_LIST_HEAD(&pring->txcmplq);
+ 		INIT_LIST_HEAD(&pring->iocb_continueq);
