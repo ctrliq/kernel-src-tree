@@ -1,0 +1,205 @@
+intel_pstate: Update frequencies of policy->cpus only from ->set_policy()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 41cfd64cf49fc84837341732a142f3d4cdc1e83a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/41cfd64c.failed
+
+The intel-pstate driver is using intel_pstate_hwp_set() from two
+separate paths, i.e. ->set_policy() callback and sysfs update path for
+the files present in /sys/devices/system/cpu/intel_pstate/ directory.
+
+While an update to the sysfs path applies to all the CPUs being managed
+by the driver (which essentially means all the online CPUs), the update
+via the ->set_policy() callback applies to a smaller group of CPUs
+managed by the policy for which ->set_policy() is called.
+
+And so, intel_pstate_hwp_set() should update frequencies of only the
+CPUs that are part of policy->cpus mask, while it is called from
+->set_policy() callback.
+
+In order to do that, add a parameter (cpumask) to intel_pstate_hwp_set()
+and apply the frequency changes only to the concerned CPUs.
+
+For ->set_policy() path, we are only concerned about policy->cpus, and
+so policy->rwsem lock taken by the core prior to calling ->set_policy()
+is enough to take care of any races. The larger lock acquired by
+get_online_cpus() is required only for the updates to sysfs files.
+
+Add another routine, intel_pstate_hwp_set_online_cpus(), and call it
+from the sysfs update paths.
+
+This also fixes a lockdep reported recently, where policy->rwsem and
+get_online_cpus() could have been acquired in any order causing an ABBA
+deadlock. The sequence of events leading to that was:
+
+intel_pstate_init(...)
+	...cpufreq_online(...)
+		down_write(&policy->rwsem); // Locks policy->rwsem
+		...
+		cpufreq_init_policy(policy);
+			...intel_pstate_hwp_set();
+				get_online_cpus(); // Temporarily locks cpu_hotplug.lock
+		...
+		up_write(&policy->rwsem);
+
+pm_suspend(...)
+	...disable_nonboot_cpus()
+		_cpu_down()
+			cpu_hotplug_begin(); // Locks cpu_hotplug.lock
+			__cpu_notify(CPU_DOWN_PREPARE, ...);
+				...cpufreq_offline_prepare();
+					down_write(&policy->rwsem); // Locks policy->rwsem
+
+Reported-and-tested-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Acked-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 41cfd64cf49fc84837341732a142f3d4cdc1e83a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 07d88cb77cb6,e85677653ef8..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -266,11 -296,9 +266,9 @@@ static void intel_pstate_hwp_set(const 
+  	hw_max = HWP_HIGHEST_PERF(cap);
+  	range = hw_max - hw_min;
+  
+- 	get_online_cpus();
+- 
+- 	for_each_online_cpu(cpu) {
++ 	for_each_cpu(cpu, cpumask) {
+  		rdmsrl_on_cpu(cpu, MSR_HWP_REQUEST, &value);
+ -		adj_range = limits->min_perf_pct * range / 100;
+ +		adj_range = limits.min_perf_pct * range / 100;
+  		min = hw_min + adj_range;
+  		value &= ~HWP_MIN_PERF(~0L);
+  		value |= HWP_MIN_PERF(min);
+@@@ -406,10 -439,10 +409,10 @@@ static ssize_t store_no_turbo(struct ko
+  		return -EPERM;
+  	}
+  
+ -	limits->no_turbo = clamp_t(int, input, 0, 1);
+ +	limits.no_turbo = clamp_t(int, input, 0, 1);
+  
+  	if (hwp_active)
+- 		intel_pstate_hwp_set();
++ 		intel_pstate_hwp_set_online_cpus();
+  
+  	return count;
+  }
+@@@ -424,12 -457,18 +427,12 @@@ static ssize_t store_max_perf_pct(struc
+  	if (ret != 1)
+  		return -EINVAL;
+  
+ -	limits->max_sysfs_pct = clamp_t(int, input, 0 , 100);
+ -	limits->max_perf_pct = min(limits->max_policy_pct,
+ -				   limits->max_sysfs_pct);
+ -	limits->max_perf_pct = max(limits->min_policy_pct,
+ -				   limits->max_perf_pct);
+ -	limits->max_perf_pct = max(limits->min_perf_pct,
+ -				   limits->max_perf_pct);
+ -	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ -				  int_tofp(100));
+ +	limits.max_sysfs_pct = clamp_t(int, input, 0 , 100);
+ +	limits.max_perf_pct = min(limits.max_policy_pct, limits.max_sysfs_pct);
+ +	limits.max_perf = div_fp(int_tofp(limits.max_perf_pct), int_tofp(100));
+  
+  	if (hwp_active)
+- 		intel_pstate_hwp_set();
++ 		intel_pstate_hwp_set_online_cpus();
+  	return count;
+  }
+  
+@@@ -442,11 -481,19 +445,11 @@@ static ssize_t store_min_perf_pct(struc
+  	ret = sscanf(buf, "%u", &input);
+  	if (ret != 1)
+  		return -EINVAL;
+ -
+ -	limits->min_sysfs_pct = clamp_t(int, input, 0 , 100);
+ -	limits->min_perf_pct = max(limits->min_policy_pct,
+ -				   limits->min_sysfs_pct);
+ -	limits->min_perf_pct = min(limits->max_policy_pct,
+ -				   limits->min_perf_pct);
+ -	limits->min_perf_pct = min(limits->max_perf_pct,
+ -				   limits->min_perf_pct);
+ -	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ -				  int_tofp(100));
+ +	limits.min_perf_pct = clamp_t(int, input, 0 , 100);
+ +	limits.min_perf = div_fp(int_tofp(limits.min_perf_pct), int_tofp(100));
+  
+  	if (hwp_active)
+- 		intel_pstate_hwp_set();
++ 		intel_pstate_hwp_set_online_cpus();
+  	return count;
+  }
+  
+@@@ -986,26 -1141,42 +989,33 @@@ static int intel_pstate_set_policy(stru
+  
+  	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+  	    policy->max >= policy->cpuinfo.max_freq) {
+++<<<<<<< HEAD
+ +		limits.min_perf_pct = 100;
+ +		limits.min_perf = int_tofp(1);
+ +		limits.max_policy_pct = 100;
+ +		limits.max_perf_pct = 100;
+ +		limits.max_perf = int_tofp(1);
+ +		limits.no_turbo = 0;
+++=======
++ 		pr_debug("intel_pstate: set performance\n");
++ 		limits = &performance_limits;
++ 		if (hwp_active)
++ 			intel_pstate_hwp_set(policy->cpus);
+++>>>>>>> 41cfd64cf49f (intel_pstate: Update frequencies of policy->cpus only from ->set_policy())
+  		return 0;
+  	}
+  
+ -	pr_debug("intel_pstate: set powersave\n");
+ -	limits = &powersave_limits;
+ -	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+ -	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
+ -	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
+ -					      policy->cpuinfo.max_freq);
+ -	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0 , 100);
+ -
+ -	/* Normalize user input to [min_policy_pct, max_policy_pct] */
+ -	limits->min_perf_pct = max(limits->min_policy_pct,
+ -				   limits->min_sysfs_pct);
+ -	limits->min_perf_pct = min(limits->max_policy_pct,
+ -				   limits->min_perf_pct);
+ -	limits->max_perf_pct = min(limits->max_policy_pct,
+ -				   limits->max_sysfs_pct);
+ -	limits->max_perf_pct = max(limits->min_policy_pct,
+ -				   limits->max_perf_pct);
+ -	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+ -
+ -	/* Make sure min_perf_pct <= max_perf_pct */
+ -	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+ -
+ -	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ -				  int_tofp(100));
+ -	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ -				  int_tofp(100));
+ +	limits.min_perf_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+ +	limits.min_perf_pct = clamp_t(int, limits.min_perf_pct, 0 , 100);
+ +	limits.min_perf = div_fp(int_tofp(limits.min_perf_pct), int_tofp(100));
+ +
+ +	limits.max_policy_pct = (policy->max * 100) / policy->cpuinfo.max_freq;
+ +	limits.max_policy_pct = clamp_t(int, limits.max_policy_pct, 0 , 100);
+ +	limits.max_perf_pct = min(limits.max_policy_pct, limits.max_sysfs_pct);
+ +	limits.max_perf = div_fp(int_tofp(limits.max_perf_pct), int_tofp(100));
+  
+  	if (hwp_active)
+- 		intel_pstate_hwp_set();
++ 		intel_pstate_hwp_set(policy->cpus);
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
