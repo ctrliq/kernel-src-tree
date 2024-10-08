@@ -1,0 +1,138 @@
+cpufreq: Initialize governor for a new policy under policy->rwsem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Initialize governor for a new policy under policy->rwsem (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 92.56%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 4e97b631f24c927b2302368f4f83efbba82076ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4e97b631.failed
+
+policy->rwsem is used to lock access to all parts of code modifying
+struct cpufreq_policy, but it's not used on a new policy created by
+__cpufreq_add_dev().
+
+Because of that, if cpufreq_update_policy() is called in a tight loop
+on one CPU in parallel with offline/online of another CPU, then the
+following crash can be triggered:
+
+Unable to handle kernel NULL pointer dereference at virtual address 00000020
+pgd = c0003000
+[00000020] *pgd=80000000004003, *pmd=00000000
+Internal error: Oops: 206 [#1] PREEMPT SMP ARM
+
+PC is at __cpufreq_governor+0x10/0x1ac
+LR is at cpufreq_update_policy+0x114/0x150
+
+---[ end trace f23a8defea6cd706 ]---
+Kernel panic - not syncing: Fatal exception
+CPU0: stopping
+CPU: 0 PID: 7136 Comm: mpdecision Tainted: G      D W    3.10.0-gd727407-00074-g979ede8 #396
+
+[<c0afe180>] (notifier_call_chain+0x40/0x68) from [<c02a23ac>] (__blocking_notifier_call_chain+0x40/0x58)
+[<c02a23ac>] (__blocking_notifier_call_chain+0x40/0x58) from [<c02a23d8>] (blocking_notifier_call_chain+0x14/0x1c)
+[<c02a23d8>] (blocking_notifier_call_chain+0x14/0x1c) from [<c0803c68>] (cpufreq_set_policy+0xd4/0x2b8)
+[<c0803c68>] (cpufreq_set_policy+0xd4/0x2b8) from [<c0803e7c>] (cpufreq_init_policy+0x30/0x98)
+[<c0803e7c>] (cpufreq_init_policy+0x30/0x98) from [<c0805a18>] (__cpufreq_add_dev.isra.17+0x4dc/0x7a4)
+[<c0805a18>] (__cpufreq_add_dev.isra.17+0x4dc/0x7a4) from [<c0805d38>] (cpufreq_cpu_callback+0x58/0x84)
+[<c0805d38>] (cpufreq_cpu_callback+0x58/0x84) from [<c0afe180>] (notifier_call_chain+0x40/0x68)
+[<c0afe180>] (notifier_call_chain+0x40/0x68) from [<c02812dc>] (__cpu_notify+0x28/0x44)
+[<c02812dc>] (__cpu_notify+0x28/0x44) from [<c0aeed90>] (_cpu_up+0xf4/0x1dc)
+[<c0aeed90>] (_cpu_up+0xf4/0x1dc) from [<c0aeeed4>] (cpu_up+0x5c/0x78)
+[<c0aeeed4>] (cpu_up+0x5c/0x78) from [<c0aec808>] (store_online+0x44/0x74)
+[<c0aec808>] (store_online+0x44/0x74) from [<c03a40f4>] (sysfs_write_file+0x108/0x14c)
+[<c03a40f4>] (sysfs_write_file+0x108/0x14c) from [<c03517d4>] (vfs_write+0xd0/0x180)
+[<c03517d4>] (vfs_write+0xd0/0x180) from [<c0351ca8>] (SyS_write+0x38/0x68)
+[<c0351ca8>] (SyS_write+0x38/0x68) from [<c0205de0>] (ret_fast_syscall+0x0/0x30)
+
+Fix that by taking locks at appropriate places in __cpufreq_add_dev()
+as well.
+
+	Reported-by: Saravana Kannan <skannan@codeaurora.org>
+	Suggested-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+[rjw: Changelog]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 4e97b631f24c927b2302368f4f83efbba82076ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index c8bc717e8458,cf485d928903..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -993,6 -1109,26 +993,29 @@@ static int cpufreq_add_dev(struct devic
+  		goto err_set_policy_cpu;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* related cpus should atleast have policy->cpus */
++ 	cpumask_or(policy->related_cpus, policy->related_cpus, policy->cpus);
++ 
++ 	/*
++ 	 * affected cpus must always be the one, which are online. We aren't
++ 	 * managing offline cpus here.
++ 	 */
++ 	cpumask_and(policy->cpus, policy->cpus, cpu_online_mask);
++ 
++ 	if (!frozen) {
++ 		policy->user_policy.min = policy->min;
++ 		policy->user_policy.max = policy->max;
++ 	}
++ 
++ 	down_write(&policy->rwsem);
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	for_each_cpu(j, policy->cpus)
++ 		per_cpu(cpufreq_cpu_data, j) = policy;
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
+++>>>>>>> 4e97b631f24c (cpufreq: Initialize governor for a new policy under policy->rwsem)
+  	if (cpufreq_driver->get) {
+  		policy->cur = cpufreq_driver->get(policy->cpu);
+  		if (!policy->cur) {
+@@@ -1065,21 -1189,29 +1088,30 @@@
+  	}
+  #endif
+  
+ -	if (!frozen) {
+ -		ret = cpufreq_add_dev_interface(policy, dev);
+ -		if (ret)
+ -			goto err_out_unregister;
+ -		blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+ -				CPUFREQ_CREATE_POLICY, policy);
+ -	}
+ -
+  	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ -	list_add(&policy->policy_list, &cpufreq_policy_list);
+ +	for_each_cpu(j, policy->cpus) {
+ +		per_cpu(cpufreq_cpu_data, j) = policy;
+ +		per_cpu(cpufreq_policy_cpu, j) = policy->cpu;
+ +	}
+  	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  
+ +	ret = cpufreq_add_dev_interface(cpu, policy, dev);
+ +	if (ret)
+ +		goto err_out_unregister;
+ +
+  	cpufreq_init_policy(policy);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!frozen) {
++ 		policy->user_policy.policy = policy->policy;
++ 		policy->user_policy.governor = policy->governor;
++ 	}
++ 	up_write(&policy->rwsem);
++ 
+++>>>>>>> 4e97b631f24c (cpufreq: Initialize governor for a new policy under policy->rwsem)
+  	kobject_uevent(&policy->kobj, KOBJ_ADD);
+  	up_read(&cpufreq_rwsem);
+ -
+  	pr_debug("initialization complete\n");
+  
+  	return 0;
+* Unmerged path drivers/cpufreq/cpufreq.c
