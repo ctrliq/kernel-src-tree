@@ -1,0 +1,690 @@
+driver core / ACPI: Represent ACPI companions using fwnode_handle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit ce793486e23e0162a732c605189c8028e0910e86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ce793486.failed
+
+Now that we have struct fwnode_handle, we can use that to point to
+ACPI companions from struct device objects instead of pointing to
+struct acpi_device directly.
+
+There are two benefits from that.  First, the somewhat ugly and
+hackish struct acpi_dev_node can be dropped and, second, the same
+struct fwnode_handle pointer can be used in the future to point
+to other (non-ACPI) firmware device node types.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Acked-by: Grant Likely <grant.likely@linaro.org>
+(cherry picked from commit ce793486e23e0162a732c605189c8028e0910e86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpi_platform.c
+#	drivers/acpi/dock.c
+#	drivers/gpio/gpiolib.h
+#	drivers/i2c/i2c-core.c
+#	include/acpi/acpi_bus.h
+#	include/linux/device.h
+#	include/linux/property.h
+diff --cc drivers/acpi/acpi_platform.c
+index 4a7dc6c4e2de,4bf75597f732..000000000000
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@@ -100,7 -102,8 +100,12 @@@ struct platform_device *acpi_create_pla
+  	pdevinfo.id = -1;
+  	pdevinfo.res = resources;
+  	pdevinfo.num_res = count;
+++<<<<<<< HEAD
+ +	pdevinfo.acpi_node.companion = adev;
+++=======
++ 	pdevinfo.fwnode = acpi_fwnode_handle(adev);
++ 	pdevinfo.dma_mask = DMA_BIT_MASK(32);
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  	pdev = platform_device_register_full(&pdevinfo);
+  	if (IS_ERR(pdev))
+  		dev_err(&adev->dev, "platform device creation failed: %ld\n",
+diff --cc drivers/acpi/dock.c
+index 3d9506a0b27d,a688aa243f6c..000000000000
+--- a/drivers/acpi/dock.c
++++ b/drivers/acpi/dock.c
+@@@ -792,8 -612,13 +792,18 @@@ void acpi_dock_add(struct acpi_device *
+  	struct platform_device *dd;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	dd = platform_device_register_data(NULL, "dock", dock_station_count,
+ +					   &ds, sizeof(ds));
+++=======
++ 	memset(&pdevinfo, 0, sizeof(pdevinfo));
++ 	pdevinfo.name = "dock";
++ 	pdevinfo.id = dock_station_count;
++ 	pdevinfo.fwnode = acpi_fwnode_handle(adev);
++ 	pdevinfo.data = &ds;
++ 	pdevinfo.size_data = sizeof(ds);
++ 	dd = platform_device_register_full(&pdevinfo);
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  	if (IS_ERR(dd))
+  		return;
+  
+diff --cc drivers/i2c/i2c-core.c
+index 50138e7a7cba,c87c31387e2d..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -62,6 -66,381 +62,384 @@@ static DEFINE_IDR(i2c_adapter_idr)
+  static struct device_type i2c_client_type;
+  static int i2c_detect(struct i2c_adapter *adapter, struct i2c_driver *driver);
+  
+++<<<<<<< HEAD
+++=======
++ static struct static_key i2c_trace_msg = STATIC_KEY_INIT_FALSE;
++ 
++ void i2c_transfer_trace_reg(void)
++ {
++ 	static_key_slow_inc(&i2c_trace_msg);
++ }
++ 
++ void i2c_transfer_trace_unreg(void)
++ {
++ 	static_key_slow_dec(&i2c_trace_msg);
++ }
++ 
++ #if defined(CONFIG_ACPI)
++ struct acpi_i2c_handler_data {
++ 	struct acpi_connection_info info;
++ 	struct i2c_adapter *adapter;
++ };
++ 
++ struct gsb_buffer {
++ 	u8	status;
++ 	u8	len;
++ 	union {
++ 		u16	wdata;
++ 		u8	bdata;
++ 		u8	data[0];
++ 	};
++ } __packed;
++ 
++ static int acpi_i2c_add_resource(struct acpi_resource *ares, void *data)
++ {
++ 	struct i2c_board_info *info = data;
++ 
++ 	if (ares->type == ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++ 		struct acpi_resource_i2c_serialbus *sb;
++ 
++ 		sb = &ares->data.i2c_serial_bus;
++ 		if (!info->addr && sb->type == ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++ 			info->addr = sb->slave_address;
++ 			if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 				info->flags |= I2C_CLIENT_TEN;
++ 		}
++ 	} else if (info->irq < 0) {
++ 		struct resource r;
++ 
++ 		if (acpi_dev_resource_interrupt(ares, 0, &r))
++ 			info->irq = r.start;
++ 	}
++ 
++ 	/* Tell the ACPI core to skip this resource */
++ 	return 1;
++ }
++ 
++ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
++ 				       void *data, void **return_value)
++ {
++ 	struct i2c_adapter *adapter = data;
++ 	struct list_head resource_list;
++ 	struct i2c_board_info info;
++ 	struct acpi_device *adev;
++ 	int ret;
++ 
++ 	if (acpi_bus_get_device(handle, &adev))
++ 		return AE_OK;
++ 	if (acpi_bus_get_status(adev) || !adev->status.present)
++ 		return AE_OK;
++ 
++ 	memset(&info, 0, sizeof(info));
++ 	info.fwnode = acpi_fwnode_handle(adev);
++ 	info.irq = -1;
++ 
++ 	INIT_LIST_HEAD(&resource_list);
++ 	ret = acpi_dev_get_resources(adev, &resource_list,
++ 				     acpi_i2c_add_resource, &info);
++ 	acpi_dev_free_resource_list(&resource_list);
++ 
++ 	if (ret < 0 || !info.addr)
++ 		return AE_OK;
++ 
++ 	adev->power.flags.ignore_parent = true;
++ 	strlcpy(info.type, dev_name(&adev->dev), sizeof(info.type));
++ 	if (!i2c_new_device(adapter, &info)) {
++ 		adev->power.flags.ignore_parent = false;
++ 		dev_err(&adapter->dev,
++ 			"failed to add I2C device %s from ACPI\n",
++ 			dev_name(&adev->dev));
++ 	}
++ 
++ 	return AE_OK;
++ }
++ 
++ /**
++  * acpi_i2c_register_devices - enumerate I2C slave devices behind adapter
++  * @adap: pointer to adapter
++  *
++  * Enumerate all I2C slave devices behind this adapter by walking the ACPI
++  * namespace. When a device is found it will be added to the Linux device
++  * model and bound to the corresponding ACPI handle.
++  */
++ static void acpi_i2c_register_devices(struct i2c_adapter *adap)
++ {
++ 	acpi_handle handle;
++ 	acpi_status status;
++ 
++ 	if (!adap->dev.parent)
++ 		return;
++ 
++ 	handle = ACPI_HANDLE(adap->dev.parent);
++ 	if (!handle)
++ 		return;
++ 
++ 	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, handle, 1,
++ 				     acpi_i2c_add_device, NULL,
++ 				     adap, NULL);
++ 	if (ACPI_FAILURE(status))
++ 		dev_warn(&adap->dev, "failed to enumerate I2C slaves\n");
++ }
++ 
++ #else /* CONFIG_ACPI */
++ static inline void acpi_i2c_register_devices(struct i2c_adapter *adap) { }
++ #endif /* CONFIG_ACPI */
++ 
++ #ifdef CONFIG_ACPI_I2C_OPREGION
++ static int acpi_gsb_i2c_read_bytes(struct i2c_client *client,
++ 		u8 cmd, u8 *data, u8 data_len)
++ {
++ 
++ 	struct i2c_msg msgs[2];
++ 	int ret;
++ 	u8 *buffer;
++ 
++ 	buffer = kzalloc(data_len, GFP_KERNEL);
++ 	if (!buffer)
++ 		return AE_NO_MEMORY;
++ 
++ 	msgs[0].addr = client->addr;
++ 	msgs[0].flags = client->flags;
++ 	msgs[0].len = 1;
++ 	msgs[0].buf = &cmd;
++ 
++ 	msgs[1].addr = client->addr;
++ 	msgs[1].flags = client->flags | I2C_M_RD;
++ 	msgs[1].len = data_len;
++ 	msgs[1].buf = buffer;
++ 
++ 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++ 	if (ret < 0)
++ 		dev_err(&client->adapter->dev, "i2c read failed\n");
++ 	else
++ 		memcpy(data, buffer, data_len);
++ 
++ 	kfree(buffer);
++ 	return ret;
++ }
++ 
++ static int acpi_gsb_i2c_write_bytes(struct i2c_client *client,
++ 		u8 cmd, u8 *data, u8 data_len)
++ {
++ 
++ 	struct i2c_msg msgs[1];
++ 	u8 *buffer;
++ 	int ret = AE_OK;
++ 
++ 	buffer = kzalloc(data_len + 1, GFP_KERNEL);
++ 	if (!buffer)
++ 		return AE_NO_MEMORY;
++ 
++ 	buffer[0] = cmd;
++ 	memcpy(buffer + 1, data, data_len);
++ 
++ 	msgs[0].addr = client->addr;
++ 	msgs[0].flags = client->flags;
++ 	msgs[0].len = data_len + 1;
++ 	msgs[0].buf = buffer;
++ 
++ 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++ 	if (ret < 0)
++ 		dev_err(&client->adapter->dev, "i2c write failed\n");
++ 
++ 	kfree(buffer);
++ 	return ret;
++ }
++ 
++ static acpi_status
++ acpi_i2c_space_handler(u32 function, acpi_physical_address command,
++ 			u32 bits, u64 *value64,
++ 			void *handler_context, void *region_context)
++ {
++ 	struct gsb_buffer *gsb = (struct gsb_buffer *)value64;
++ 	struct acpi_i2c_handler_data *data = handler_context;
++ 	struct acpi_connection_info *info = &data->info;
++ 	struct acpi_resource_i2c_serialbus *sb;
++ 	struct i2c_adapter *adapter = data->adapter;
++ 	struct i2c_client client;
++ 	struct acpi_resource *ares;
++ 	u32 accessor_type = function >> 16;
++ 	u8 action = function & ACPI_IO_MASK;
++ 	acpi_status ret;
++ 	int status;
++ 
++ 	ret = acpi_buffer_to_resource(info->connection, info->length, &ares);
++ 	if (ACPI_FAILURE(ret))
++ 		return ret;
++ 
++ 	if (!value64 || ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	sb = &ares->data.i2c_serial_bus;
++ 	if (sb->type != ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	memset(&client, 0, sizeof(client));
++ 	client.adapter = adapter;
++ 	client.addr = sb->slave_address;
++ 	client.flags = 0;
++ 
++ 	if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 		client.flags |= I2C_CLIENT_TEN;
++ 
++ 	switch (accessor_type) {
++ 	case ACPI_GSB_ACCESS_ATTRIB_SEND_RCV:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_byte(&client);
++ 			if (status >= 0) {
++ 				gsb->bdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_byte(&client, gsb->bdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_BYTE:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_byte_data(&client, command);
++ 			if (status >= 0) {
++ 				gsb->bdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_byte_data(&client, command,
++ 					gsb->bdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_WORD:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_word_data(&client, command);
++ 			if (status >= 0) {
++ 				gsb->wdata = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_word_data(&client, command,
++ 					gsb->wdata);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_BLOCK:
++ 		if (action == ACPI_READ) {
++ 			status = i2c_smbus_read_block_data(&client, command,
++ 					gsb->data);
++ 			if (status >= 0) {
++ 				gsb->len = status;
++ 				status = 0;
++ 			}
++ 		} else {
++ 			status = i2c_smbus_write_block_data(&client, command,
++ 					gsb->len, gsb->data);
++ 		}
++ 		break;
++ 
++ 	case ACPI_GSB_ACCESS_ATTRIB_MULTIBYTE:
++ 		if (action == ACPI_READ) {
++ 			status = acpi_gsb_i2c_read_bytes(&client, command,
++ 					gsb->data, info->access_length);
++ 			if (status > 0)
++ 				status = 0;
++ 		} else {
++ 			status = acpi_gsb_i2c_write_bytes(&client, command,
++ 					gsb->data, info->access_length);
++ 		}
++ 		break;
++ 
++ 	default:
++ 		pr_info("protocol(0x%02x) is not supported.\n", accessor_type);
++ 		ret = AE_BAD_PARAMETER;
++ 		goto err;
++ 	}
++ 
++ 	gsb->status = status;
++ 
++  err:
++ 	ACPI_FREE(ares);
++ 	return ret;
++ }
++ 
++ 
++ static int acpi_i2c_install_space_handler(struct i2c_adapter *adapter)
++ {
++ 	acpi_handle handle;
++ 	struct acpi_i2c_handler_data *data;
++ 	acpi_status status;
++ 
++ 	if (!adapter->dev.parent)
++ 		return -ENODEV;
++ 
++ 	handle = ACPI_HANDLE(adapter->dev.parent);
++ 
++ 	if (!handle)
++ 		return -ENODEV;
++ 
++ 	data = kzalloc(sizeof(struct acpi_i2c_handler_data),
++ 			    GFP_KERNEL);
++ 	if (!data)
++ 		return -ENOMEM;
++ 
++ 	data->adapter = adapter;
++ 	status = acpi_bus_attach_private_data(handle, (void *)data);
++ 	if (ACPI_FAILURE(status)) {
++ 		kfree(data);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	status = acpi_install_address_space_handler(handle,
++ 				ACPI_ADR_SPACE_GSBUS,
++ 				&acpi_i2c_space_handler,
++ 				NULL,
++ 				data);
++ 	if (ACPI_FAILURE(status)) {
++ 		dev_err(&adapter->dev, "Error installing i2c space handler\n");
++ 		acpi_bus_detach_private_data(handle);
++ 		kfree(data);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	acpi_walk_dep_device_list(handle);
++ 	return 0;
++ }
++ 
++ static void acpi_i2c_remove_space_handler(struct i2c_adapter *adapter)
++ {
++ 	acpi_handle handle;
++ 	struct acpi_i2c_handler_data *data;
++ 	acpi_status status;
++ 
++ 	if (!adapter->dev.parent)
++ 		return;
++ 
++ 	handle = ACPI_HANDLE(adapter->dev.parent);
++ 
++ 	if (!handle)
++ 		return;
++ 
++ 	acpi_remove_address_space_handler(handle,
++ 				ACPI_ADR_SPACE_GSBUS,
++ 				&acpi_i2c_space_handler);
++ 
++ 	status = acpi_bus_get_private_data(handle, (void **)&data);
++ 	if (ACPI_SUCCESS(status))
++ 		kfree(data);
++ 
++ 	acpi_bus_detach_private_data(handle);
++ }
++ #else /* CONFIG_ACPI_I2C_OPREGION */
++ static inline void acpi_i2c_remove_space_handler(struct i2c_adapter *adapter)
++ { }
++ 
++ static inline int acpi_i2c_install_space_handler(struct i2c_adapter *adapter)
++ { return 0; }
++ #endif /* CONFIG_ACPI_I2C_OPREGION */
++ 
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  /* ------------------------------------------------------------------------- */
+  
+  static const struct i2c_device_id *i2c_match_id(const struct i2c_device_id *id,
+@@@ -671,12 -971,9 +1049,12 @@@ i2c_new_device(struct i2c_adapter *adap
+  	client->dev.bus = &i2c_bus_type;
+  	client->dev.type = &i2c_client_type;
+  	client->dev.of_node = info->of_node;
+- 	ACPI_COMPANION_SET(&client->dev, info->acpi_node.companion);
++ 	client->dev.fwnode = info->fwnode;
+  
+ -	i2c_dev_set_name(adap, client);
+ +	/* For 10-bit clients, add an arbitrary offset to avoid collisions */
+ +	dev_set_name(&client->dev, "%d-%04x", i2c_adapter_id(adap),
+ +		     client->addr | ((client->flags & I2C_CLIENT_TEN)
+ +				     ? 0xa000 : 0));
+  	status = device_register(&client->dev);
+  	if (status)
+  		goto out_err;
+diff --cc include/acpi/acpi_bus.h
+index 8bcd3caab412,dae2a16fe93f..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -363,6 -379,22 +363,25 @@@ struct acpi_device 
+  	void (*remove)(struct acpi_device *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool is_acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return fwnode && fwnode->type == FWNODE_ACPI;
++ }
++ 
++ static inline struct acpi_device *acpi_node(struct fwnode_handle *fwnode)
++ {
++ 	return is_acpi_node(fwnode) ?
++ 		container_of(fwnode, struct acpi_device, fwnode) : NULL;
++ }
++ 
++ static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)
++ {
++ 	return &adev->fwnode;
++ }
++ 
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  static inline void *acpi_driver_data(struct acpi_device *d)
+  {
+  	return d->driver_data;
+diff --cc include/linux/device.h
+index 9ef9c3f0b695,badef20b876a..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -661,16 -651,6 +662,19 @@@ struct device_dma_parameters 
+  	unsigned long segment_boundary_mask;
+  };
+  
+++<<<<<<< HEAD
+ +struct acpi_device;
+ +
+ +struct acpi_dev_node {
+ +#ifdef CONFIG_ACPI
+ +	RH_KABI_REPLACE(void	*handle,
+ +		          struct acpi_device *companion)
+ +
+ +#endif
+ +};
+ +
+++=======
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  /**
+   * struct device - The basic device structure
+   * @parent:	The device's "parent" device, the device to which it is attached.
+@@@ -711,9 -693,10 +715,9 @@@
+   * 		segment limitations.
+   * @dma_pools:	Dma pools (if dma'ble device).
+   * @dma_mem:	Internal for coherent mem override.
+ - * @cma_area:	Contiguous memory area for dma allocations
+   * @archdata:	For arch-specific additions.
+   * @of_node:	Associated device tree node.
+-  * @acpi_node:	Associated ACPI device node.
++  * @fwnode:	Associated device node supplied by platform firmware.
+   * @devt:	For creating the sysfs "dev".
+   * @id:		device instance
+   * @devres_lock: Spinlock to protect the resource of the device.
+diff --cc include/linux/property.h
+index 9242fb0221ba,31dfd3db35d6..000000000000
+--- a/include/linux/property.h
++++ b/include/linux/property.h
+@@@ -40,6 -41,36 +41,39 @@@ int device_property_read_string_array(s
+  int device_property_read_string(struct device *dev, const char *propname,
+  				const char **val);
+  
+++<<<<<<< HEAD
+++=======
++ bool fwnode_property_present(struct fwnode_handle *fwnode, const char *propname);
++ int fwnode_property_read_u8_array(struct fwnode_handle *fwnode,
++ 				  const char *propname, u8 *val,
++ 				  size_t nval);
++ int fwnode_property_read_u16_array(struct fwnode_handle *fwnode,
++ 				   const char *propname, u16 *val,
++ 				   size_t nval);
++ int fwnode_property_read_u32_array(struct fwnode_handle *fwnode,
++ 				   const char *propname, u32 *val,
++ 				   size_t nval);
++ int fwnode_property_read_u64_array(struct fwnode_handle *fwnode,
++ 				   const char *propname, u64 *val,
++ 				   size_t nval);
++ int fwnode_property_read_string_array(struct fwnode_handle *fwnode,
++ 				      const char *propname, const char **val,
++ 				      size_t nval);
++ int fwnode_property_read_string(struct fwnode_handle *fwnode,
++ 				const char *propname, const char **val);
++ 
++ struct fwnode_handle *device_get_next_child_node(struct device *dev,
++ 						 struct fwnode_handle *child);
++ 
++ #define device_for_each_child_node(dev, child) \
++ 	for (child = device_get_next_child_node(dev, NULL); child; \
++ 	     child = device_get_next_child_node(dev, child))
++ 
++ void fwnode_handle_put(struct fwnode_handle *fwnode);
++ 
++ unsigned int device_get_child_node_count(struct device *dev);
++ 
+++>>>>>>> ce793486e23e (driver core / ACPI: Represent ACPI companions using fwnode_handle)
+  static inline bool device_property_read_bool(struct device *dev,
+  					     const char *propname)
+  {
+* Unmerged path drivers/gpio/gpiolib.h
+* Unmerged path drivers/acpi/acpi_platform.c
+* Unmerged path drivers/acpi/dock.c
+diff --git a/drivers/base/platform.c b/drivers/base/platform.c
+index 55684f062830..1ac31caec3f6 100644
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -435,7 +435,7 @@ struct platform_device *platform_device_register_full(
+ 		goto err_alloc;
+ 
+ 	pdev->dev.parent = pdevinfo->parent;
+-	ACPI_COMPANION_SET(&pdev->dev, pdevinfo->acpi_node.companion);
++	pdev->dev.fwnode = pdevinfo->fwnode;
+ 
+ 	if (pdevinfo->dma_mask) {
+ 		/*
+* Unmerged path drivers/gpio/gpiolib.h
+* Unmerged path drivers/i2c/i2c-core.c
+* Unmerged path include/acpi/acpi_bus.h
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 364918faf44f..a5fedcb96a52 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -50,8 +50,9 @@ static inline acpi_handle acpi_device_handle(struct acpi_device *adev)
+ 	return adev ? adev->handle : NULL;
+ }
+ 
+-#define ACPI_COMPANION(dev)		((dev)->acpi_node.companion)
+-#define ACPI_COMPANION_SET(dev, adev)	ACPI_COMPANION(dev) = (adev)
++#define ACPI_COMPANION(dev)		acpi_node((dev)->fwnode)
++#define ACPI_COMPANION_SET(dev, adev)	(dev)->fwnode = (adev) ? \
++	acpi_fwnode_handle(adev) : NULL
+ #define ACPI_HANDLE(dev)		acpi_device_handle(ACPI_COMPANION(dev))
+ 
+ static inline void acpi_preset_companion(struct device *dev,
+* Unmerged path include/linux/device.h
+diff --git a/include/linux/fwnode.h b/include/linux/fwnode.h
+new file mode 100644
+index 000000000000..17bb5f039509
+--- /dev/null
++++ b/include/linux/fwnode.h
+@@ -0,0 +1,25 @@
++/*
++ * fwnode.h - Firmware device node object handle type definition.
++ *
++ * Copyright (C) 2015, Intel Corporation
++ * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef _LINUX_FWNODE_H_
++#define _LINUX_FWNODE_H_
++
++enum fwnode_type {
++	FWNODE_INVALID = 0,
++	FWNODE_OF,
++	FWNODE_ACPI,
++};
++
++struct fwnode_handle {
++	enum fwnode_type type;
++};
++
++#endif
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index 539019e9e4c3..6dc172cce922 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -256,7 +256,7 @@ static inline void i2c_set_clientdata(struct i2c_client *dev, void *data)
+  * @platform_data: stored in i2c_client.dev.platform_data
+  * @archdata: copied into i2c_client.dev.archdata
+  * @of_node: pointer to OpenFirmware device node
+- * @acpi_node: ACPI device node
++ * @fwnode: device node supplied by the platform firmware
+  * @irq: stored in i2c_client.irq
+  *
+  * I2C doesn't actually support hardware probing, although controllers and
+@@ -277,7 +277,7 @@ struct i2c_board_info {
+ 	void		*platform_data;
+ 	struct dev_archdata	*archdata;
+ 	struct device_node *of_node;
+-	struct acpi_dev_node acpi_node;
++	struct fwnode_handle *fwnode;
+ 	int		irq;
+ };
+ 
+diff --git a/include/linux/platform_device.h b/include/linux/platform_device.h
+index 9abf1db6aea6..295fb698b000 100644
+--- a/include/linux/platform_device.h
++++ b/include/linux/platform_device.h
+@@ -58,7 +58,7 @@ extern int platform_add_devices(struct platform_device **, int);
+ 
+ struct platform_device_info {
+ 		struct device *parent;
+-		struct acpi_dev_node acpi_node;
++		struct fwnode_handle *fwnode;
+ 
+ 		const char *name;
+ 		int id;
+* Unmerged path include/linux/property.h
