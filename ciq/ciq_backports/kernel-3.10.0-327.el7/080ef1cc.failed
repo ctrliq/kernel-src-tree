@@ -1,0 +1,151 @@
+hpsa: use workqueue to resubmit failed ioaccel commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Don Brace <don.brace@pmcs.com>
+commit 080ef1cc7fdf5d0800775c8626718da807e7ba99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/080ef1cc.failed
+
+Instead of kicking the commands all the way back to the mid
+layer, use a work queue.  This enables having a mechanism for
+the driver to be able to resubmit the commands down the "normal"
+raid path without turning off the ioaccel feature entirely
+whenever an error is encountered on the ioaccel path, and
+prevent excessive rescanning of devices.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 080ef1cc7fdf5d0800775c8626718da807e7ba99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 3e784c38914c,dcacb29ff589..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -3937,6 -3871,93 +3935,96 @@@ static int hpsa_scsi_queue_command(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hpsa_command_resubmit_worker(struct work_struct *work)
++ {
++ 	struct scsi_cmnd *cmd;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	struct CommandList *c =
++ 			container_of(work, struct CommandList, work);
++ 
++ 	cmd = c->scsi_cmd;
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return;
++ 	}
++ 	if (hpsa_ciss_submit(c->h, c, cmd, dev->scsi3addr)) {
++ 		/*
++ 		 * If we get here, it means dma mapping failed. Try
++ 		 * again via scsi mid layer, which will then get
++ 		 * SCSI_MLQUEUE_HOST_BUSY.
++ 		 */
++ 		cmd->result = DID_IMM_RETRY << 16;
++ 		cmd->scsi_done(cmd);
++ 	}
++ }
++ 
++ /* Running in struct Scsi_Host->host_lock less mode */
++ static int hpsa_scsi_queue_command(struct Scsi_Host *sh, struct scsi_cmnd *cmd)
++ {
++ 	struct ctlr_info *h;
++ 	struct hpsa_scsi_dev_t *dev;
++ 	unsigned char scsi3addr[8];
++ 	struct CommandList *c;
++ 	int rc = 0;
++ 
++ 	/* Get the ptr to our adapter structure out of cmd->host. */
++ 	h = sdev_to_hba(cmd->device);
++ 	dev = cmd->device->hostdata;
++ 	if (!dev) {
++ 		cmd->result = DID_NO_CONNECT << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	memcpy(scsi3addr, dev->scsi3addr, sizeof(scsi3addr));
++ 
++ 	if (unlikely(lockup_detected(h))) {
++ 		cmd->result = DID_ERROR << 16;
++ 		cmd->scsi_done(cmd);
++ 		return 0;
++ 	}
++ 	c = cmd_alloc(h);
++ 	if (c == NULL) {			/* trouble... */
++ 		dev_err(&h->pdev->dev, "cmd_alloc returned NULL!\n");
++ 		return SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 
++ 	/* Call alternate submit routine for I/O accelerated commands.
++ 	 * Retries always go down the normal I/O path.
++ 	 */
++ 	if (likely(cmd->retries == 0 &&
++ 		cmd->request->cmd_type == REQ_TYPE_FS &&
++ 		h->acciopath_status)) {
++ 
++ 		cmd->host_scribble = (unsigned char *) c;
++ 		c->cmd_type = CMD_SCSI;
++ 		c->scsi_cmd = cmd;
++ 
++ 		if (dev->offload_enabled) {
++ 			rc = hpsa_scsi_ioaccel_raid_map(h, c);
++ 			if (rc == 0)
++ 				return 0; /* Sent on ioaccel path */
++ 			if (rc < 0) {   /* scsi_dma_map failed. */
++ 				cmd_free(h, c);
++ 				return SCSI_MLQUEUE_HOST_BUSY;
++ 			}
++ 		} else if (dev->ioaccel_handle) {
++ 			rc = hpsa_scsi_ioaccel_direct_map(h, c);
++ 			if (rc == 0)
++ 				return 0; /* Sent on direct map path */
++ 			if (rc < 0) {   /* scsi_dma_map failed. */
++ 				cmd_free(h, c);
++ 				return SCSI_MLQUEUE_HOST_BUSY;
++ 			}
++ 		}
++ 	}
++ 	return hpsa_ciss_submit(h, c, cmd, scsi3addr);
++ }
++ 
+++>>>>>>> 080ef1cc7fdf (hpsa: use workqueue to resubmit failed ioaccel commands)
+  static int do_not_scan_if_controller_locked_up(struct ctlr_info *h)
+  {
+  	unsigned long flags;
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index b105d9492e11..936a24bf1b03 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -236,6 +236,7 @@ struct ctlr_info {
+ 	struct list_head offline_device_list;
+ 	int	acciopath_status;
+ 	int	raid_offload_debug;
++	struct workqueue_struct *resubmit_wq;
+ };
+ 
+ struct offline_device_entry {
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index d78e66629650..3f2f0af6abb2 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -404,6 +404,7 @@ struct CommandList {
+ 	long			   cmdindex;
+ 	struct completion *waiting;
+ 	void   *scsi_cmd;
++	struct work_struct work;
+ } __aligned(COMMANDLIST_ALIGNMENT);
+ 
+ /* Max S/G elements in I/O accelerator command */
