@@ -1,0 +1,271 @@
+r8152: add mutex for hw settings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author hayeswang <hayeswang@realtek.com>
+commit b54032736dbba2ae18995b930d0176bd8b0386c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b5403273.failed
+
+Use the mutex to avoid the settings are interrupted by other ones.
+
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b54032736dbba2ae18995b930d0176bd8b0386c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index 0f9c353ad1ea,864159eb744e..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -27,9 -26,9 +27,13 @@@
+  #include <linux/mdio.h>
+  
+  /* Version Information */
+++<<<<<<< HEAD
+ +#define DRIVER_VERSION "v1.06.0 (2014/03/03)"
+++=======
++ #define DRIVER_VERSION "v1.07.0 (2014/10/09)"
+++>>>>>>> b54032736dbb (r8152: add mutex for hw settings)
+  #define DRIVER_AUTHOR "Realtek linux nic maintainers <nic_swsd@realtek.com>"
+ -#define DRIVER_DESC "Realtek RTL8152/RTL8153 Based USB Ethernet Adapters"
+ +#define DRIVER_DESC "Realtek RTL8152 Based USB 2.0 Ethernet Adapters"
+  #define MODULENAME "r8152"
+  
+  #define R8152_PHY_ID		32
+@@@ -3139,15 -3201,18 +3170,17 @@@ static int rtl8152_suspend(struct usb_i
+  		clear_bit(WORK_ENABLE, &tp->flags);
+  		usb_kill_urb(tp->intr_urb);
+  		cancel_delayed_work_sync(&tp->schedule);
+ -		tasklet_disable(&tp->tl);
+  		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
+ -			rtl_stop_rx(tp);
+  			rtl_runtime_suspend_enable(tp, true);
+  		} else {
+ +			tasklet_disable(&tp->tl);
+  			tp->rtl_ops.down(tp);
+ +			tasklet_enable(&tp->tl);
+  		}
+ -		tasklet_enable(&tp->tl);
+  	}
+  
++ 	mutex_unlock(&tp->control);
++ 
+  	return 0;
+  }
+  
+@@@ -3267,14 -3349,207 +3316,210 @@@ static int rtl8152_set_settings(struct 
+  	if (ret < 0)
+  		goto out;
+  
++ 	mutex_lock(&tp->control);
++ 
+  	ret = rtl8152_set_speed(tp, cmd->autoneg, cmd->speed, cmd->duplex);
+  
++ 	mutex_unlock(&tp->control);
++ 
++ 	usb_autopm_put_interface(tp->intf);
++ 
++ out:
++ 	return ret;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static const char rtl8152_gstrings[][ETH_GSTRING_LEN] = {
++ 	"tx_packets",
++ 	"rx_packets",
++ 	"tx_errors",
++ 	"rx_errors",
++ 	"rx_missed",
++ 	"align_errors",
++ 	"tx_single_collisions",
++ 	"tx_multi_collisions",
++ 	"rx_unicast",
++ 	"rx_broadcast",
++ 	"rx_multicast",
++ 	"tx_aborted",
++ 	"tx_underrun",
++ };
++ 
++ static int rtl8152_get_sset_count(struct net_device *dev, int sset)
++ {
++ 	switch (sset) {
++ 	case ETH_SS_STATS:
++ 		return ARRAY_SIZE(rtl8152_gstrings);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static void rtl8152_get_ethtool_stats(struct net_device *dev,
++ 				      struct ethtool_stats *stats, u64 *data)
++ {
++ 	struct r8152 *tp = netdev_priv(dev);
++ 	struct tally_counter tally;
++ 
++ 	if (usb_autopm_get_interface(tp->intf) < 0)
++ 		return;
++ 
++ 	generic_ocp_read(tp, PLA_TALLYCNT, sizeof(tally), &tally, MCU_TYPE_PLA);
++ 
++ 	usb_autopm_put_interface(tp->intf);
++ 
++ 	data[0] = le64_to_cpu(tally.tx_packets);
++ 	data[1] = le64_to_cpu(tally.rx_packets);
++ 	data[2] = le64_to_cpu(tally.tx_errors);
++ 	data[3] = le32_to_cpu(tally.rx_errors);
++ 	data[4] = le16_to_cpu(tally.rx_missed);
++ 	data[5] = le16_to_cpu(tally.align_errors);
++ 	data[6] = le32_to_cpu(tally.tx_one_collision);
++ 	data[7] = le32_to_cpu(tally.tx_multi_collision);
++ 	data[8] = le64_to_cpu(tally.rx_unicast);
++ 	data[9] = le64_to_cpu(tally.rx_broadcast);
++ 	data[10] = le32_to_cpu(tally.rx_multicast);
++ 	data[11] = le16_to_cpu(tally.tx_aborted);
++ 	data[12] = le16_to_cpu(tally.tx_underun);
++ }
++ 
++ static void rtl8152_get_strings(struct net_device *dev, u32 stringset, u8 *data)
++ {
++ 	switch (stringset) {
++ 	case ETH_SS_STATS:
++ 		memcpy(data, *rtl8152_gstrings, sizeof(rtl8152_gstrings));
++ 		break;
++ 	}
++ }
++ 
++ static int r8152_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
++ {
++ 	u32 ocp_data, lp, adv, supported = 0;
++ 	u16 val;
++ 
++ 	val = r8152_mmd_read(tp, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
++ 	supported = mmd_eee_cap_to_ethtool_sup_t(val);
++ 
++ 	val = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
++ 	adv = mmd_eee_adv_to_ethtool_adv_t(val);
++ 
++ 	val = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
++ 	lp = mmd_eee_adv_to_ethtool_adv_t(val);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
++ 	ocp_data &= EEE_RX_EN | EEE_TX_EN;
++ 
++ 	eee->eee_enabled = !!ocp_data;
++ 	eee->eee_active = !!(supported & adv & lp);
++ 	eee->supported = supported;
++ 	eee->advertised = adv;
++ 	eee->lp_advertised = lp;
++ 
++ 	return 0;
++ }
++ 
++ static int r8152_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
++ {
++ 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
++ 
++ 	r8152_eee_en(tp, eee->eee_enabled);
++ 
++ 	if (!eee->eee_enabled)
++ 		val = 0;
++ 
++ 	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, val);
++ 
++ 	return 0;
++ }
++ 
++ static int r8153_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
++ {
++ 	u32 ocp_data, lp, adv, supported = 0;
++ 	u16 val;
++ 
++ 	val = ocp_reg_read(tp, OCP_EEE_ABLE);
++ 	supported = mmd_eee_cap_to_ethtool_sup_t(val);
++ 
++ 	val = ocp_reg_read(tp, OCP_EEE_ADV);
++ 	adv = mmd_eee_adv_to_ethtool_adv_t(val);
++ 
++ 	val = ocp_reg_read(tp, OCP_EEE_LPABLE);
++ 	lp = mmd_eee_adv_to_ethtool_adv_t(val);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
++ 	ocp_data &= EEE_RX_EN | EEE_TX_EN;
++ 
++ 	eee->eee_enabled = !!ocp_data;
++ 	eee->eee_active = !!(supported & adv & lp);
++ 	eee->supported = supported;
++ 	eee->advertised = adv;
++ 	eee->lp_advertised = lp;
++ 
++ 	return 0;
++ }
++ 
++ static int r8153_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
++ {
++ 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
++ 
++ 	r8153_eee_en(tp, eee->eee_enabled);
++ 
++ 	if (!eee->eee_enabled)
++ 		val = 0;
++ 
++ 	ocp_reg_write(tp, OCP_EEE_ADV, val);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ rtl_ethtool_get_eee(struct net_device *net, struct ethtool_eee *edata)
++ {
++ 	struct r8152 *tp = netdev_priv(net);
++ 	int ret;
++ 
++ 	ret = usb_autopm_get_interface(tp->intf);
++ 	if (ret < 0)
++ 		goto out;
++ 
++ 	mutex_lock(&tp->control);
++ 
++ 	ret = tp->rtl_ops.eee_get(tp, edata);
++ 
++ 	mutex_unlock(&tp->control);
++ 
++ 	usb_autopm_put_interface(tp->intf);
++ 
++ out:
++ 	return ret;
++ }
++ 
++ static int
++ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_eee *edata)
++ {
++ 	struct r8152 *tp = netdev_priv(net);
++ 	int ret;
++ 
++ 	ret = usb_autopm_get_interface(tp->intf);
++ 	if (ret < 0)
++ 		goto out;
++ 
++ 	mutex_lock(&tp->control);
++ 
++ 	ret = tp->rtl_ops.eee_set(tp, edata);
++ 	if (!ret)
++ 		ret = mii_nway_restart(&tp->mii);
++ 
++ 	mutex_unlock(&tp->control);
++ 
+  	usb_autopm_put_interface(tp->intf);
+  
+  out:
+  	return ret;
+  }
+  
+++>>>>>>> b54032736dbb (r8152: add mutex for hw settings)
+  static struct ethtool_ops ops = {
+  	.get_drvinfo = rtl8152_get_drvinfo,
+  	.get_settings = rtl8152_get_settings,
+* Unmerged path drivers/net/usb/r8152.c
