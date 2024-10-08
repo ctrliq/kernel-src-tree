@@ -1,0 +1,116 @@
+rhashtable: rhashtable_remove() must unlink in both tbl and future_tbl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit fe6a043c535acfec8f8e554536c87923dcb45097
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fe6a043c.failed
+
+As removals can occur during resizes, entries may be referred to from
+both tbl and future_tbl when the removal is requested. Therefore
+rhashtable_remove() must unlink the entry in both tables if this is
+the case. The existing code did search both tables but stopped when it
+hit the first match.
+
+Failing to unlink in both tables resulted in use after free.
+
+Fixes: 97defe1ecf86 ("rhashtable: Per bucket locks & deferred expansion/shrinking")
+	Reported-by: Ying Xue <ying.xue@windriver.com>
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fe6a043c535acfec8f8e554536c87923dcb45097)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index be20e9720492,bc2d0d80d1f9..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -361,33 -580,60 +361,74 @@@ EXPORT_SYMBOL_GPL(rhashtable_insert)
+   */
+  bool rhashtable_remove(struct rhashtable *ht, struct rhash_head *obj)
+  {
+ -	struct bucket_table *tbl;
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+  	struct rhash_head __rcu **pprev;
+  	struct rhash_head *he;
+++<<<<<<< HEAD
+ +	u32 h;
+++=======
++ 	spinlock_t *lock;
++ 	unsigned int hash;
++ 	bool ret = false;
+++>>>>>>> fe6a043c535a (rhashtable: rhashtable_remove() must unlink in both tbl and future_tbl)
+  
+ -	rcu_read_lock();
+ -	tbl = rht_dereference_rcu(ht->tbl, ht);
+ -	hash = head_hashfn(ht, tbl, obj);
+ +	ASSERT_RHT_MUTEX(ht);
+  
+ -	lock = bucket_lock(tbl, hash);
+ -	spin_lock_bh(lock);
+ +	h = head_hashfn(ht, tbl, obj);
+  
+ -restart:
+ -	pprev = &tbl->buckets[hash];
+ -	rht_for_each(he, tbl, hash) {
+ +	pprev = &tbl->buckets[h];
+ +	rht_for_each(he, tbl, h) {
+  		if (he != obj) {
+  			pprev = &he->next;
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		RCU_INIT_POINTER(*pprev, he->next);
+ +		ht->nelems--;
+ +
+ +		if (ht->p.shrink_decision &&
+ +		    ht->p.shrink_decision(ht, tbl->size))
+ +			rhashtable_shrink(ht);
+ +
+ +		return true;
+ +	}
+ +
+ +	return false;
+++=======
++ 		rcu_assign_pointer(*pprev, obj->next);
++ 
++ 		ret = true;
++ 		break;
++ 	}
++ 
++ 	/* The entry may be linked in either 'tbl', 'future_tbl', or both.
++ 	 * 'future_tbl' only exists for a short period of time during
++ 	 * resizing. Thus traversing both is fine and the added cost is
++ 	 * very rare.
++ 	 */
++ 	if (tbl != rht_dereference_rcu(ht->future_tbl, ht)) {
++ 		spin_unlock_bh(lock);
++ 
++ 		tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 		hash = head_hashfn(ht, tbl, obj);
++ 
++ 		lock = bucket_lock(tbl, hash);
++ 		spin_lock_bh(lock);
++ 		goto restart;
++ 	}
++ 
++ 	spin_unlock_bh(lock);
++ 
++ 	if (ret) {
++ 		atomic_dec(&ht->nelems);
++ 		rhashtable_wakeup_worker(ht);
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	return ret;
+++>>>>>>> fe6a043c535a (rhashtable: rhashtable_remove() must unlink in both tbl and future_tbl)
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_remove);
+  
+* Unmerged path lib/rhashtable.c
