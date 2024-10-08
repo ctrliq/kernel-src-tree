@@ -1,0 +1,450 @@
+hrtimer: Get rid of softirq time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 21d6d52a1b7028e6a6840bd82e354aefa9a5e203
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/21d6d52a.failed
+
+The softirq time field in the clock bases is an optimization from the
+early days of hrtimers. It provides a coarse "jiffies" like time
+mostly for self rearming timers.
+
+But that comes with a price:
+    - Larger code size
+    - Extra storage space
+    - Duplicated functions with really small differences
+   
+The benefit of this is optimization is marginal for contemporary
+systems.
+
+Consolidate everything on the high resolution timer
+implementation. This makes further optimizations possible.
+
+Text size reduction:
+       x8664 -95, i386 -356, ARM -148, ARM64 -40, power64 -16
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+	Cc: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Link: http://lkml.kernel.org/r/20150414203501.039977424@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 21d6d52a1b7028e6a6840bd82e354aefa9a5e203)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/hrtimer.c
+#	kernel/time/timekeeping.c
+#	kernel/time/timekeeping.h
+diff --cc kernel/hrtimer.c
+index b2012c5568af,9e111dd83ca3..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -498,6 -414,46 +477,49 @@@ static inline void debug_deactivate(str
+  	trace_hrtimer_cancel(timer);
+  }
+  
+++<<<<<<< HEAD:kernel/hrtimer.c
+++=======
++ #if defined(CONFIG_NO_HZ_COMMON) || defined(CONFIG_HIGH_RES_TIMERS)
++ static ktime_t __hrtimer_get_next_event(struct hrtimer_cpu_base *cpu_base)
++ {
++ 	struct hrtimer_clock_base *base = cpu_base->clock_base;
++ 	ktime_t expires, expires_next = { .tv64 = KTIME_MAX };
++ 	int i;
++ 
++ 	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++, base++) {
++ 		struct timerqueue_node *next;
++ 		struct hrtimer *timer;
++ 
++ 		next = timerqueue_getnext(&base->active);
++ 		if (!next)
++ 			continue;
++ 
++ 		timer = container_of(next, struct hrtimer, node);
++ 		expires = ktime_sub(hrtimer_get_expires(timer), base->offset);
++ 		if (expires.tv64 < expires_next.tv64)
++ 			expires_next = expires;
++ 	}
++ 	/*
++ 	 * clock_was_set() might have changed base->offset of any of
++ 	 * the clock bases so the result might be negative. Fix it up
++ 	 * to prevent a false positive in clockevents_program_event().
++ 	 */
++ 	if (expires_next.tv64 < 0)
++ 		expires_next.tv64 = 0;
++ 	return expires_next;
++ }
++ #endif
++ 
++ static inline ktime_t hrtimer_update_base(struct hrtimer_cpu_base *base)
++ {
++ 	ktime_t *offs_real = &base->clock_base[HRTIMER_BASE_REALTIME].offset;
++ 	ktime_t *offs_boot = &base->clock_base[HRTIMER_BASE_BOOTTIME].offset;
++ 	ktime_t *offs_tai = &base->clock_base[HRTIMER_BASE_TAI].offset;
++ 
++ 	return ktime_get_update_offsets_now(offs_real, offs_boot, offs_tai);
++ }
++ 
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  /* High resolution timer related functions */
+  #ifdef CONFIG_HIGH_RES_TIMERS
+  
+@@@ -546,32 -504,12 +568,41 @@@ static inline int hrtimer_hres_active(v
+  static void
+  hrtimer_force_reprogram(struct hrtimer_cpu_base *cpu_base, int skip_equal)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	int i;
+ +	struct hrtimer_clock_base *base = cpu_base->clock_base;
+ +	ktime_t expires, expires_next;
+ +
+ +	expires_next.tv64 = KTIME_MAX;
+ +
+ +	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++, base++) {
+ +		struct hrtimer *timer;
+ +		struct timerqueue_node *next;
+ +
+ +		next = timerqueue_getnext(&base->active);
+ +		if (!next)
+ +			continue;
+ +		timer = container_of(next, struct hrtimer, node);
+ +
+ +		expires = ktime_sub(hrtimer_get_expires(timer), base->offset);
+ +		/*
+ +		 * clock_was_set() has changed base->offset so the
+ +		 * result might be negative. Fix it up to prevent a
+ +		 * false positive in clockevents_program_event()
+ +		 */
+ +		if (expires.tv64 < 0)
+ +			expires.tv64 = 0;
+ +		if (expires.tv64 < expires_next.tv64)
+ +			expires_next = expires;
+ +	}
+++=======
++ 	ktime_t expires_next;
++ 
++ 	if (!cpu_base->hres_active)
++ 		return;
++ 
++ 	expires_next = __hrtimer_get_next_event(cpu_base);
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  
+  	if (skip_equal && expires_next.tv64 == cpu_base->expires_next.tv64)
+  		return;
+@@@ -1229,30 -1163,10 +1251,34 @@@ void hrtimer_init(struct hrtimer *timer
+  }
+  EXPORT_SYMBOL_GPL(hrtimer_init);
+  
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +/**
+ + * hrtimer_get_res - get the timer resolution for a clock
+ + * @which_clock: which clock to query
+ + * @tp:		 pointer to timespec variable to store the resolution
+ + *
+ + * Store the resolution of the clock selected by @which_clock in the
+ + * variable pointed to by @tp.
+ + */
+ +int hrtimer_get_res(const clockid_t which_clock, struct timespec *tp)
+ +{
+ +	struct hrtimer_cpu_base *cpu_base;
+ +	int base = hrtimer_clockid_to_base(which_clock);
+ +
+ +	cpu_base = &__raw_get_cpu_var(hrtimer_bases);
+ +	*tp = ktime_to_timespec(cpu_base->clock_base[base].resolution);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(hrtimer_get_res);
+ +
+ +static void __run_hrtimer(struct hrtimer *timer, ktime_t *now)
+++=======
++ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
++ 			  struct hrtimer_clock_base *base,
++ 			  struct hrtimer *timer, ktime_t *now)
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  {
+- 	struct hrtimer_clock_base *base = timer->base;
+- 	struct hrtimer_cpu_base *cpu_base = base->cpu_base;
+  	enum hrtimer_restart (*fn)(struct hrtimer *);
+  	int restart;
+  
+@@@ -1289,34 -1203,9 +1315,32 @@@
+  	timer->state &= ~HRTIMER_STATE_CALLBACK;
+  }
+  
+- #ifdef CONFIG_HIGH_RES_TIMERS
+- 
+- /*
+-  * High resolution timer interrupt
+-  * Called with interrupts disabled
+-  */
+- void hrtimer_interrupt(struct clock_event_device *dev)
++ static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+ +	ktime_t expires_next, now, entry_time, delta;
+ +	int i, retries = 0;
+ +
+ +	BUG_ON(!cpu_base->hres_active);
+ +	cpu_base->nr_events++;
+ +	dev->next_event.tv64 = KTIME_MAX;
+ +
+ +	raw_spin_lock(&cpu_base->lock);
+ +	entry_time = now = hrtimer_update_base(cpu_base);
+ +retry:
+ +	expires_next.tv64 = KTIME_MAX;
+ +	/*
+ +	 * We set expires_next to KTIME_MAX here with cpu_base->lock
+ +	 * held to prevent that a timer is enqueued in our queue via
+ +	 * the migration code. This does not affect enqueueing of
+ +	 * timers which run their callback and need to be requeued on
+ +	 * this CPU.
+ +	 */
+ +	cpu_base->expires_next.tv64 = KTIME_MAX;
+++=======
++ 	int i;
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  
+  	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
+  		struct hrtimer_clock_base *base;
+@@@ -1346,23 -1235,47 +1370,61 @@@
+  			 * are right-of a not yet expired timer, because that
+  			 * timer will have to trigger a wakeup anyway.
+  			 */
+ -			if (basenow.tv64 < hrtimer_get_softexpires_tv64(timer))
+ +
+ +			if (basenow.tv64 < hrtimer_get_softexpires_tv64(timer)) {
+ +				ktime_t expires;
+ +
+ +				expires = ktime_sub(hrtimer_get_expires(timer),
+ +						    base->offset);
+ +				if (expires.tv64 < 0)
+ +					expires.tv64 = KTIME_MAX;
+ +				if (expires.tv64 < expires_next.tv64)
+ +					expires_next = expires;
+  				break;
+ +			}
+  
+- 			__run_hrtimer(timer, &basenow);
++ 			__run_hrtimer(cpu_base, base, timer, &basenow);
+  		}
+  	}
+++<<<<<<< HEAD:kernel/hrtimer.c
+++
+++=======
++ }
++ 
++ #ifdef CONFIG_HIGH_RES_TIMERS
++ 
++ /*
++  * High resolution timer interrupt
++  * Called with interrupts disabled
++  */
++ void hrtimer_interrupt(struct clock_event_device *dev)
++ {
++ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
++ 	ktime_t expires_next, now, entry_time, delta;
++ 	int retries = 0;
++ 
++ 	BUG_ON(!cpu_base->hres_active);
++ 	cpu_base->nr_events++;
++ 	dev->next_event.tv64 = KTIME_MAX;
++ 
++ 	raw_spin_lock(&cpu_base->lock);
++ 	entry_time = now = hrtimer_update_base(cpu_base);
++ retry:
++ 	cpu_base->in_hrtirq = 1;
++ 	/*
++ 	 * We set expires_next to KTIME_MAX here with cpu_base->lock
++ 	 * held to prevent that a timer is enqueued in our queue via
++ 	 * the migration code. This does not affect enqueueing of
++ 	 * timers which run their callback and need to be requeued on
++ 	 * this CPU.
++ 	 */
++ 	cpu_base->expires_next.tv64 = KTIME_MAX;
++ 
++ 	__hrtimer_run_queues(cpu_base, now);
+  
++ 	/* Reevaluate the clock bases for the next expiry */
++ 	expires_next = __hrtimer_get_next_event(cpu_base);
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  	/*
+  	 * Store the new expiry value so the migration code can verify
+  	 * against it.
+@@@ -1494,10 -1408,8 +1556,15 @@@ void hrtimer_run_pending(void
+   */
+  void hrtimer_run_queues(void)
+  {
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	struct timerqueue_node *node;
+ +	struct hrtimer_cpu_base *cpu_base = &__get_cpu_var(hrtimer_bases);
+ +	struct hrtimer_clock_base *base;
+ +	int index, gettime = 1;
+++=======
++ 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
++ 	ktime_t now;
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time):kernel/time/hrtimer.c
+  
+  	if (hrtimer_hres_active())
+  		return;
+diff --cc kernel/time/timekeeping.c
+index a690422a076b,dd1efa6a4ea4..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -1549,44 -1926,13 +1549,47 @@@ void do_timer(unsigned long ticks
+  }
+  
+  /**
+ - * ktime_get_update_offsets_now - hrtimer helper
+++<<<<<<< HEAD
+ + * ktime_get_update_offsets_tick - hrtimer helper
+   * @offs_real:	pointer to storage for monotonic -> realtime offset
+   * @offs_boot:	pointer to storage for monotonic -> boottime offset
+   * @offs_tai:	pointer to storage for monotonic -> clock tai offset
+   *
+ + * Returns monotonic time at last tick and various offsets
+ + */
+ +ktime_t ktime_get_update_offsets_tick(ktime_t *offs_real, ktime_t *offs_boot,
+ +							ktime_t *offs_tai)
+ +{
+ +	struct timekeeper *tk = &timekeeper;
+ +	struct timespec ts;
+ +	ktime_t now;
+ +	unsigned int seq;
+ +
+ +	do {
+ +		seq = read_seqcount_begin(&timekeeper_seq);
+ +
+ +		ts = tk_xtime(tk);
+ +
+ +		*offs_real = tk->offs_real;
+ +		*offs_boot = tk->offs_boot;
+ +		*offs_tai = tk->offs_tai;
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+ +
+ +	now = ktime_set(ts.tv_sec, ts.tv_nsec);
+ +	now = ktime_sub(now, *offs_real);
+ +	return now;
+ +}
+ +
+ +#ifdef CONFIG_HIGH_RES_TIMERS
+ +/**
+++=======
+++>>>>>>> 21d6d52a1b70 (hrtimer: Get rid of softirq time)
+ + * ktime_get_update_offsets_now - hrtimer helper
+ + * @offs_real:	pointer to storage for monotonic -> realtime offset
+ + * @offs_boot:	pointer to storage for monotonic -> boottime offset
+ + *
+   * Returns current monotonic time and updates the offsets
+ - * Called from hrtimer_interrupt() or retrigger_next_event()
+ + * Called from hrtimer_interupt() or retrigger_next_event()
+   */
+  ktime_t ktime_get_update_offsets_now(ktime_t *offs_real, ktime_t *offs_boot,
+  							ktime_t *offs_tai)
+@@@ -1605,32 -1951,11 +1608,31 @@@
+  		*offs_real = tk->offs_real;
+  		*offs_boot = tk->offs_boot;
+  		*offs_tai = tk->offs_tai;
+ -	} while (read_seqcount_retry(&tk_core.seq, seq));
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+  
+ -	return ktime_add_ns(base, nsecs);
+ +	now = ktime_add_ns(ktime_set(secs, 0), nsecs);
+ +	now = ktime_sub(now, *offs_real);
+ +	return now;
+  }
+- #endif
+  
+ +/**
+ + * ktime_get_monotonic_offset() - get wall_to_monotonic in ktime_t format
+ + */
+ +ktime_t ktime_get_monotonic_offset(void)
+ +{
+ +	struct timekeeper *tk = &timekeeper;
+ +	unsigned long seq;
+ +	struct timespec wtom;
+ +
+ +	do {
+ +		seq = read_seqcount_begin(&timekeeper_seq);
+ +		wtom = tk->wall_to_monotonic;
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+ +
+ +	return timespec_to_ktime(wtom);
+ +}
+ +EXPORT_SYMBOL_GPL(ktime_get_monotonic_offset);
+ +
+  /**
+   * do_adjtimex() - Accessor function to NTP __do_adjtimex function
+   */
+* Unmerged path kernel/time/timekeeping.h
+diff --git a/include/linux/hrtimer.h b/include/linux/hrtimer.h
+index 9944ae0be366..8cefca1d1734 100644
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@ -139,7 +139,6 @@ struct hrtimer_sleeper {
+  * @active:		red black tree root node for the active timers
+  * @resolution:		the resolution of the clock, in nanoseconds
+  * @get_time:		function to retrieve the current time of the clock
+- * @softirq_time:	the time when running the hrtimer queue in the softirq
+  * @offset:		offset of this clock to the monotonic base
+  */
+ struct hrtimer_clock_base {
+@@ -149,7 +148,6 @@ struct hrtimer_clock_base {
+ 	struct timerqueue_head	active;
+ 	ktime_t			resolution;
+ 	ktime_t			(*get_time)(void);
+-	ktime_t			softirq_time;
+ 	ktime_t			offset;
+ };
+ 
+@@ -260,19 +258,16 @@ static inline ktime_t hrtimer_expires_remaining(const struct hrtimer *timer)
+ 	return ktime_sub(timer->node.expires, timer->base->get_time());
+ }
+ 
+-#ifdef CONFIG_HIGH_RES_TIMERS
+-struct clock_event_device;
+-
+-extern void hrtimer_interrupt(struct clock_event_device *dev);
+-
+-/*
+- * In high resolution mode the time reference must be read accurate
+- */
+ static inline ktime_t hrtimer_cb_get_time(struct hrtimer *timer)
+ {
+ 	return timer->base->get_time();
+ }
+ 
++#ifdef CONFIG_HIGH_RES_TIMERS
++struct clock_event_device;
++
++extern void hrtimer_interrupt(struct clock_event_device *dev);
++
+ static inline int hrtimer_is_hres_active(struct hrtimer *timer)
+ {
+ 	return timer->base->cpu_base->hres_active;
+@@ -300,15 +295,6 @@ extern void clock_was_set_delayed(void);
+ 
+ static inline void hrtimer_peek_ahead_timers(void) { }
+ 
+-/*
+- * In non high resolution mode the time reference is taken from
+- * the base softirq time variable.
+- */
+-static inline ktime_t hrtimer_cb_get_time(struct hrtimer *timer)
+-{
+-	return timer->base->softirq_time;
+-}
+-
+ static inline int hrtimer_is_hres_active(struct hrtimer *timer)
+ {
+ 	return 0;
+* Unmerged path kernel/hrtimer.c
+* Unmerged path kernel/time/timekeeping.c
+* Unmerged path kernel/time/timekeeping.h
