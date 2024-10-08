@@ -1100,6 +1100,9 @@ static int hdmi_setup_stream(struct hda_codec *codec, hda_nid_t cvt_nid,
 		pinctl = snd_hda_codec_read(codec, pin_nid, 0,
 					    AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
 
+		if (pinctl < 0)
+			return hbr ? -EINVAL : 0;
+
 		new_pinctl = pinctl & ~AC_PINCTL_EPT;
 		if (is_hbr_format(format))
 			new_pinctl |= AC_PINCTL_EPT_HBR;
@@ -2793,7 +2796,7 @@ static int atihdmi_pin_hbr_setup(struct hda_codec *codec, hda_nid_t pin_nid,
 	int hbr_ctl, hbr_ctl_new;
 
 	hbr_ctl = snd_hda_codec_read(codec, pin_nid, 0, ATI_VERB_GET_HBR_CONTROL, 0);
-	if (hbr_ctl & ATI_HBR_CAPABLE) {
+	if (hbr_ctl >= 0 && (hbr_ctl & ATI_HBR_CAPABLE)) {
 		if (hbr)
 			hbr_ctl_new = hbr_ctl | ATI_HBR_ENABLE;
 		else
