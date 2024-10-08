@@ -1,0 +1,139 @@
+mm: unmapped page migration avoid unmap+remap overhead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] unmapped page migration avoid unmap+remap overhead (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 96.15%
+commit-author Hugh Dickins <hughd@google.com>
+commit 2ebba6b7e1d98724d266ae048d8af4f7ca95cafd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2ebba6b7.failed
+
+Page migration's __unmap_and_move(), and rmap's try_to_unmap(), were
+created for use on pages almost certainly mapped into userspace.  But
+nowadays compaction often applies them to unmapped page cache pages: which
+may exacerbate contention on i_mmap_rwsem quite unnecessarily, since
+try_to_unmap_file() makes no preliminary page_mapped() check.
+
+Now check page_mapped() in __unmap_and_move(); and avoid repeating the
+same overhead in rmap_walk_file() - don't remove_migration_ptes() when we
+never inserted any.
+
+(The PageAnon(page) comment blocks now look even sillier than before, but
+clean that up on some other occasion.  And note in passing that
+try_to_unmap_one() does not use a migration entry when PageSwapCache, so
+remove_migration_ptes() will then not update that swap entry to newpage
+pte: not a big deal, but something else to clean up later.)
+
+Davidlohr remarked in "mm,fs: introduce helpers around the i_mmap_mutex"
+conversion to i_mmap_rwsem, that "The biggest winner of these changes is
+migration": a part of the reason might be all of that unnecessary taking
+of i_mmap_mutex in page migration; and it's rather a shame that I didn't
+get around to sending this patch in before his - this one is much less
+useful after Davidlohr's conversion to rwsem, but still good.
+
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Mel Gorman <mel@csn.ul.ie>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2ebba6b7e1d98724d266ae048d8af4f7ca95cafd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index c1313d07c550,253474c22239..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -765,7 -783,8 +765,12 @@@ static int move_to_new_page(struct pag
+  	if (rc != MIGRATEPAGE_SUCCESS) {
+  		newpage->mapping = NULL;
+  	} else {
+++<<<<<<< HEAD
+ +		if (remap_swapcache)
+++=======
++ 		mem_cgroup_migrate(page, newpage, false);
++ 		if (page_was_mapped)
+++>>>>>>> 2ebba6b7e1d9 (mm: unmapped page migration avoid unmap+remap overhead)
+  			remove_migration_ptes(page, newpage);
+  		page->mapping = NULL;
+  	}
+@@@ -779,8 -798,7 +784,12 @@@ static int __unmap_and_move(struct pag
+  				int force, enum migrate_mode mode)
+  {
+  	int rc = -EAGAIN;
+++<<<<<<< HEAD
+ +	int remap_swapcache = 1;
+ +	struct mem_cgroup *mem;
+++=======
++ 	int page_was_mapped = 0;
+++>>>>>>> 2ebba6b7e1d9 (mm: unmapped page migration avoid unmap+remap overhead)
+  	struct anon_vma *anon_vma = NULL;
+  
+  	if (!trylock_page(page)) {
+@@@ -855,9 -870,8 +864,8 @@@
+  			 * migrated but are not remapped when migration
+  			 * completes
+  			 */
+- 			remap_swapcache = 0;
+  		} else {
+ -			goto out_unlock;
+ +			goto uncharge;
+  		}
+  	}
+  
+@@@ -1006,9 -1020,23 +1018,14 @@@ static int unmap_and_move_huge_page(new
+  {
+  	int rc = 0;
+  	int *result = NULL;
+++<<<<<<< HEAD
+ +	struct page *new_hpage = get_new_page(hpage, private, &result);
+++=======
++ 	int page_was_mapped = 0;
++ 	struct page *new_hpage;
+++>>>>>>> 2ebba6b7e1d9 (mm: unmapped page migration avoid unmap+remap overhead)
+  	struct anon_vma *anon_vma = NULL;
+  
+ -	/*
+ -	 * Movability of hugepages depends on architectures and hugepage size.
+ -	 * This check is necessary because some callers of hugepage migration
+ -	 * like soft offline and memory hotremove don't walk through page
+ -	 * tables or check whether the hugepage is pmd-based or not before
+ -	 * kicking migration.
+ -	 */
+ -	if (!hugepage_migration_supported(page_hstate(hpage))) {
+ -		putback_active_hugepage(hpage);
+ -		return -ENOSYS;
+ -	}
+ -
+ -	new_hpage = get_new_page(hpage, private, &result);
+  	if (!new_hpage)
+  		return -ENOMEM;
+  
+@@@ -1023,12 -1051,16 +1040,20 @@@
+  	if (PageAnon(hpage))
+  		anon_vma = page_get_anon_vma(hpage);
+  
+- 	try_to_unmap(hpage, TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
++ 	if (page_mapped(hpage)) {
++ 		try_to_unmap(hpage,
++ 			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
++ 		page_was_mapped = 1;
++ 	}
+  
+  	if (!page_mapped(hpage))
+- 		rc = move_to_new_page(new_hpage, hpage, 1, mode);
++ 		rc = move_to_new_page(new_hpage, hpage, page_was_mapped, mode);
+  
+++<<<<<<< HEAD
+ +	if (rc)
+++=======
++ 	if (rc != MIGRATEPAGE_SUCCESS && page_was_mapped)
+++>>>>>>> 2ebba6b7e1d9 (mm: unmapped page migration avoid unmap+remap overhead)
+  		remove_migration_ptes(hpage, hpage);
+  
+  	if (anon_vma)
+* Unmerged path mm/migrate.c
