@@ -1,0 +1,294 @@
+bonding: Changed hashing function to just provide hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mahesh Bandewar <maheshb@google.com>
+commit ee62e868139b96f73f3d01268ca1c39f7c6f4cd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ee62e868.failed
+
+Modified the hash function to return just hash separating from the
+modulo operation that can be performed by the caller. This is to
+make way for the tlb mode to use the same hashing policies that
+are used in the 802.3ad and Xor mode.
+
+Change-Id: I276609e87e0ca213c4d1b17b79c5e0b0f3d0dd6f
+	Signed-off-by: Mahesh Bandewar <maheshb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee62e868139b96f73f3d01268ca1c39f7c6f4cd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_3ad.c
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_3ad.c
+index dc508c87249d,9a0d61e0c188..000000000000
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@@ -2454,20 -2436,28 +2454,25 @@@ int bond_3ad_xmit_xor(struct sk_buff *s
+  	agg_id = ad_info.aggregator_id;
+  
+  	if (slaves_in_agg == 0) {
+ +		/*the aggregator is empty*/
+  		pr_debug("%s: Error: active aggregator is empty\n", dev->name);
+ -		goto err_free;
+ +		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	slave_agg_no = bond->xmit_hash_policy(skb, slaves_in_agg);
+++=======
++ 	slave_agg_no = bond_xmit_hash(bond, skb) % slaves_in_agg;
++ 	first_ok_slave = NULL;
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  
+ -	bond_for_each_slave_rcu(bond, slave, iter) {
+ -		agg = SLAVE_AD_INFO(slave).port.aggregator;
+ -		if (!agg || agg->aggregator_identifier != agg_id)
+ -			continue;
+ +	bond_for_each_slave(bond, slave, i) {
+ +		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+  
+ -		if (slave_agg_no >= 0) {
+ -			if (!first_ok_slave && SLAVE_IS_OK(slave))
+ -				first_ok_slave = slave;
+ +		if (agg && (agg->aggregator_identifier == agg_id)) {
+  			slave_agg_no--;
+ -			continue;
+ -		}
+ -
+ -		if (SLAVE_IS_OK(slave)) {
+ -			bond_dev_queue_xmit(bond, skb, slave->dev);
+ -			goto out;
+ +			if (slave_agg_no < 0)
+ +				break;
+  		}
+  	}
+  
+diff --cc drivers/net/bonding/bond_main.c
+index d0eec7c786f0,c7046350c4b5..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3232,86 -2972,72 +3232,108 @@@ static int bond_xmit_hash_policy_l2(str
+  	return 0;
+  }
+  
+ -/* Extract the appropriate headers based on bond's xmit policy */
+ -static bool bond_flow_dissect(struct bonding *bond, struct sk_buff *skb,
+ -			      struct flow_keys *fk)
+ +/*
+ + * Hash for the output device based upon layer 2 and layer 3 data. If
+ + * the packet is not IP, fall back on bond_xmit_hash_policy_l2()
+ + */
+ +static int bond_xmit_hash_policy_l23(struct sk_buff *skb, int count)
+  {
+ -	const struct ipv6hdr *iph6;
+ +	const struct ethhdr *data;
+  	const struct iphdr *iph;
+ -	int noff, proto = -1;
+ +	const struct ipv6hdr *ipv6h;
+ +	u32 v6hash;
+ +	const __be32 *s, *d;
+  
+ -	if (bond->params.xmit_policy > BOND_XMIT_POLICY_LAYER23)
+ -		return skb_flow_dissect(skb, fk);
+ -
+ -	fk->ports = 0;
+ -	noff = skb_network_offset(skb);
+ -	if (skb->protocol == htons(ETH_P_IP)) {
+ -		if (unlikely(!pskb_may_pull(skb, noff + sizeof(*iph))))
+ -			return false;
+ +	if (skb->protocol == htons(ETH_P_IP) &&
+ +	    pskb_network_may_pull(skb, sizeof(*iph))) {
+  		iph = ip_hdr(skb);
+ -		fk->src = iph->saddr;
+ -		fk->dst = iph->daddr;
+ -		noff += iph->ihl << 2;
+ -		if (!ip_is_fragment(iph))
+ -			proto = iph->protocol;
+ -	} else if (skb->protocol == htons(ETH_P_IPV6)) {
+ -		if (unlikely(!pskb_may_pull(skb, noff + sizeof(*iph6))))
+ -			return false;
+ -		iph6 = ipv6_hdr(skb);
+ -		fk->src = (__force __be32)ipv6_addr_hash(&iph6->saddr);
+ -		fk->dst = (__force __be32)ipv6_addr_hash(&iph6->daddr);
+ -		noff += sizeof(*iph6);
+ -		proto = iph6->nexthdr;
+ -	} else {
+ -		return false;
+ -	}
+ -	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER34 && proto >= 0)
+ -		fk->ports = skb_flow_get_ports(skb, noff, proto);
+ -
+ -	return true;
+ +		data = (struct ethhdr *)skb->data;
+ +		return ((ntohl(iph->saddr ^ iph->daddr) & 0xffff) ^
+ +			(data->h_dest[5] ^ data->h_source[5])) % count;
+ +	} else if (skb->protocol == htons(ETH_P_IPV6) &&
+ +		   pskb_network_may_pull(skb, sizeof(*ipv6h))) {
+ +		ipv6h = ipv6_hdr(skb);
+ +		data = (struct ethhdr *)skb->data;
+ +		s = &ipv6h->saddr.s6_addr32[0];
+ +		d = &ipv6h->daddr.s6_addr32[0];
+ +		v6hash = (s[1] ^ d[1]) ^ (s[2] ^ d[2]) ^ (s[3] ^ d[3]);
+ +		v6hash ^= (v6hash >> 24) ^ (v6hash >> 16) ^ (v6hash >> 8);
+ +		return (v6hash ^ data->h_dest[5] ^ data->h_source[5]) % count;
+ +	}
+ +
+ +	return bond_xmit_hash_policy_l2(skb, count);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Hash for the output device based upon layer 3 and layer 4 data. If
+ + * the packet is a frag or not TCP or UDP, just use layer 3 data.  If it is
+ + * altogether not IP, fall back on bond_xmit_hash_policy_l2()
+ + */
+ +static int bond_xmit_hash_policy_l34(struct sk_buff *skb, int count)
+++=======
++ /**
++  * bond_xmit_hash - generate a hash value based on the xmit policy
++  * @bond: bonding device
++  * @skb: buffer to use for headers
++  *
++  * This function will extract the necessary headers from the skb buffer and use
++  * them to generate a hash based on the xmit_policy set in the bonding device
++  */
++ u32 bond_xmit_hash(struct bonding *bond, struct sk_buff *skb)
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  {
+ -	struct flow_keys flow;
+ -	u32 hash;
+ -
+ +	u32 layer4_xor = 0;
+ +	const struct iphdr *iph;
+ +	const struct ipv6hdr *ipv6h;
+ +	const __be32 *s, *d;
+ +	const __be16 *l4 = NULL;
+ +	__be16 _l4[2];
+ +	int noff = skb_network_offset(skb);
+ +	int poff;
+ +
+++<<<<<<< HEAD
+ +	if (skb->protocol == htons(ETH_P_IP) &&
+ +	    pskb_may_pull(skb, noff + sizeof(*iph))) {
+ +		iph = ip_hdr(skb);
+ +		poff = proto_ports_offset(iph->protocol);
+++=======
++ 	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER2 ||
++ 	    !bond_flow_dissect(bond, skb, &flow))
++ 		return bond_eth_hash(skb);
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  
+ -	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER23 ||
+ -	    bond->params.xmit_policy == BOND_XMIT_POLICY_ENCAP23)
+ -		hash = bond_eth_hash(skb);
+ -	else
+ -		hash = (__force u32)flow.ports;
+ -	hash ^= (__force u32)flow.dst ^ (__force u32)flow.src;
+ -	hash ^= (hash >> 16);
+ -	hash ^= (hash >> 8);
+ +		if (!ip_is_fragment(iph) && poff >= 0) {
+ +			l4 = skb_header_pointer(skb, noff + (iph->ihl << 2) + poff,
+ +						sizeof(_l4), &_l4);
+ +			if (l4)
+ +				layer4_xor = ntohs(l4[0] ^ l4[1]);
+ +		}
+ +		return (layer4_xor ^
+ +			((ntohl(iph->saddr ^ iph->daddr)) & 0xffff)) % count;
+ +	} else if (skb->protocol == htons(ETH_P_IPV6) &&
+ +		   pskb_may_pull(skb, noff + sizeof(*ipv6h))) {
+ +		ipv6h = ipv6_hdr(skb);
+ +		poff = proto_ports_offset(ipv6h->nexthdr);
+ +		if (poff >= 0) {
+ +			l4 = skb_header_pointer(skb, noff + sizeof(*ipv6h) + poff,
+ +						sizeof(_l4), &_l4);
+ +			if (l4)
+ +				layer4_xor = ntohs(l4[0] ^ l4[1]);
+ +		}
+ +		s = &ipv6h->saddr.s6_addr32[0];
+ +		d = &ipv6h->daddr.s6_addr32[0];
+ +		layer4_xor ^= (s[1] ^ d[1]) ^ (s[2] ^ d[2]) ^ (s[3] ^ d[3]);
+ +		layer4_xor ^= (layer4_xor >> 24) ^ (layer4_xor >> 16) ^
+ +			       (layer4_xor >> 8);
+ +		return layer4_xor % count;
+ +	}
+  
+++<<<<<<< HEAD
+ +	return bond_xmit_hash_policy_l2(skb, count);
+++=======
++ 	return hash;
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  }
+  
+  /*-------------------------- Device entry points ----------------------------*/
+@@@ -3923,34 -3663,8 +3945,38 @@@ static int bond_xmit_activebackup(struc
+  static int bond_xmit_xor(struct sk_buff *skb, struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+ +	struct slave *slave, *start_at;
+ +	int slave_no;
+ +	int i;
+ +	int res = 1;
+ +
+++<<<<<<< HEAD
+ +	slave_no = bond->xmit_hash_policy(skb, bond->slave_cnt);
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+ +		slave_no--;
+ +		if (slave_no < 0)
+ +			break;
+ +	}
+ +
+ +	start_at = slave;
+ +
+ +	bond_for_each_slave_from(bond, slave, i, start_at) {
+ +		if (IS_UP(slave->dev) &&
+ +		    (slave->link == BOND_LINK_UP) &&
+ +		    bond_is_active_slave(slave)) {
+ +			res = bond_dev_queue_xmit(bond, skb, slave->dev);
+ +			break;
+ +		}
+ +	}
+  
+ +	if (res) {
+ +		/* no suitable interface, frame not sent */
+ +		kfree_skb(skb);
+ +	}
+++=======
++ 	bond_xmit_slave_id(bond, skb, bond_xmit_hash(bond, skb) % bond->slave_cnt);
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  
+  	return NETDEV_TX_OK;
+  }
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,c0948ca26389..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -417,15 -495,11 +417,19 @@@ int bond_create(struct net *net, const 
+  int bond_create_sysfs(struct bond_net *net);
+  void bond_destroy_sysfs(struct bond_net *net);
+  void bond_prepare_sysfs_group(struct bonding *bond);
+ -int bond_sysfs_slave_add(struct slave *slave);
+ -void bond_sysfs_slave_del(struct slave *slave);
+ +int bond_create_slave_symlinks(struct net_device *master, struct net_device *slave);
+ +void bond_destroy_slave_symlinks(struct net_device *master, struct net_device *slave);
+  int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev);
+  int bond_release(struct net_device *bond_dev, struct net_device *slave_dev);
+++<<<<<<< HEAD
+ +void bond_mii_monitor(struct work_struct *);
+ +void bond_loadbalance_arp_mon(struct work_struct *);
+ +void bond_activebackup_arp_mon(struct work_struct *);
+ +void bond_set_mode_ops(struct bonding *bond, int mode);
+ +int bond_parse_parm(const char *mode_arg, const struct bond_parm_tbl *tbl);
+++=======
++ u32 bond_xmit_hash(struct bonding *bond, struct sk_buff *skb);
+++>>>>>>> ee62e868139b (bonding: Changed hashing function to just provide hash)
+  void bond_select_active_slave(struct bonding *bond);
+  void bond_change_active_slave(struct bonding *bond, struct slave *new_active);
+  void bond_create_debugfs(void);
+* Unmerged path drivers/net/bonding/bond_3ad.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bonding.h
