@@ -1,0 +1,128 @@
+s390/ptrace: PTRACE_TE_ABORT_RAND
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] ptrace: PTRACE_TE_ABORT_RAND (Hendrik Brueckner) [1204860]
+Rebuild_FUZZ: 91.80%
+commit-author Michael Mueller <mimu@linux.vnet.ibm.com>
+commit 64597f9dae1850e0360ae2e9b5485d4b5d1fdf4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/64597f9d.failed
+
+The patch implements a s390 specific ptrace request
+PTRACE_TE_ABORT_RAND to modify the randomness of spontaneous
+aborts of memory transactions of the transaction execution
+facility. The data argument of the ptrace request is used to
+specify the levels of randomness, 0 for normal operation, 1 to
+abort every transaction at a random instruction, and 2 to abort
+a random transaction at a random instruction. The default is 0
+for normal operation.
+
+	Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Michael Mueller <mimu@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 64597f9dae1850e0360ae2e9b5485d4b5d1fdf4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/ptrace.c
+diff --cc arch/s390/kernel/ptrace.c
+index b113cc3c32f6,e9fadb04e3c6..000000000000
+--- a/arch/s390/kernel/ptrace.c
++++ b/arch/s390/kernel/ptrace.c
+@@@ -56,17 -56,25 +56,37 @@@ void update_cr_regs(struct task_struct 
+  #ifdef CONFIG_64BIT
+  	/* Take care of the enable/disable of transactional execution. */
+  	if (MACHINE_HAS_TE) {
+- 		unsigned long cr0, cr0_new;
++ 		unsigned long cr[3], cr_new[3];
+  
+++<<<<<<< HEAD
+ +		__ctl_store(cr0, 0, 0);
+ +		/* set or clear transaction execution bit 8. */
+ +		if (task->thread.per_flags & PER_FLAG_NO_TE)
+ +			cr0_new = cr0 & ~(1UL << 55);
+ +		else
+ +			cr0_new = cr0 | (1UL << 55);
+ +		/* Only load control register 0 if necessary. */
+ +		if (cr0 != cr0_new)
+ +			__ctl_load(cr0_new, 0, 0);
+++=======
++ 		__ctl_store(cr, 0, 2);
++ 		cr_new[1] = cr[1];
++ 		/* Set or clear transaction execution TXC/PIFO bits 8 and 9. */
++ 		if (task->thread.per_flags & PER_FLAG_NO_TE)
++ 			cr_new[0] = cr[0] & ~(3UL << 54);
++ 		else
++ 			cr_new[0] = cr[0] | (3UL << 54);
++ 		/* Set or clear transaction execution TDC bits 62 and 63. */
++ 		cr_new[2] = cr[2] & ~3UL;
++ 		if (task->thread.per_flags & PER_FLAG_TE_ABORT_RAND) {
++ 			if (task->thread.per_flags & PER_FLAG_TE_ABORT_RAND_TEND)
++ 				cr_new[2] |= 1UL;
++ 			else
++ 				cr_new[2] |= 2UL;
++ 		}
++ 		if (memcmp(&cr_new, &cr, sizeof(cr)))
++ 			__ctl_load(cr_new, 0, 2);
+++>>>>>>> 64597f9dae18 (s390/ptrace: PTRACE_TE_ABORT_RAND)
+  	}
+  #endif
+  	/* Copy user specified PER registers */
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index 8879150e41e8..41394250b3d7 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -93,7 +93,15 @@ struct thread_struct {
+ #endif
+ };
+ 
+-#define PER_FLAG_NO_TE		1UL	/* Flag to disable transactions. */
++/* Flag to disable transactions. */
++#define PER_FLAG_NO_TE			1UL
++/* Flag to enable random transaction aborts. */
++#define PER_FLAG_TE_ABORT_RAND		2UL
++/* Flag to specify random transaction abort mode:
++ * - abort each transaction at a random instruction before TEND if set.
++ * - abort random transactions at a random instruction if cleared.
++ */
++#define PER_FLAG_TE_ABORT_RAND_TEND	4UL
+ 
+ typedef struct thread_struct thread_struct;
+ 
+diff --git a/arch/s390/include/asm/switch_to.h b/arch/s390/include/asm/switch_to.h
+index b6d9247bf9b3..3592a173b3a0 100644
+--- a/arch/s390/include/asm/switch_to.h
++++ b/arch/s390/include/asm/switch_to.h
+@@ -10,7 +10,7 @@
+ #include <linux/thread_info.h>
+ 
+ extern struct task_struct *__switch_to(void *, void *);
+-extern void update_per_regs(struct task_struct *task);
++extern void update_cr_regs(struct task_struct *task);
+ 
+ static inline int test_fp_ctl(u32 fpc)
+ {
+@@ -124,7 +124,7 @@ static inline void restore_access_regs(unsigned int *acrs)
+ 		restore_fp_regs(next->thread.fp_regs.fprs);		\
+ 		restore_access_regs(&next->thread.acrs[0]);		\
+ 		restore_ri_cb(next->thread.ri_cb, prev->thread.ri_cb);	\
+-		update_per_regs(next);					\
++		update_cr_regs(next);					\
+ 	}								\
+ 	prev = __switch_to(prev,next);					\
+ 	update_primary_asce(current);					\
+diff --git a/arch/s390/include/uapi/asm/ptrace.h b/arch/s390/include/uapi/asm/ptrace.h
+index c62dc6a3be78..7e0b498a2c2b 100644
+--- a/arch/s390/include/uapi/asm/ptrace.h
++++ b/arch/s390/include/uapi/asm/ptrace.h
+@@ -400,6 +400,7 @@ typedef struct
+ #define PTRACE_POKE_SYSTEM_CALL	      0x5008
+ #define PTRACE_ENABLE_TE	      0x5009
+ #define PTRACE_DISABLE_TE	      0x5010
++#define PTRACE_TE_ABORT_RAND	      0x5011
+ 
+ /*
+  * PT_PROT definition is loosely based on hppa bsd definition in
+* Unmerged path arch/s390/kernel/ptrace.c
