@@ -1,0 +1,103 @@
+sched/cputime: Fix cpu_timer_sample_group() double accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 23cfa361f3e54a3e184a5e126bbbdd95f984881a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/23cfa361.failed
+
+While looking over the cpu-timer code I found that we appear to add
+the delta for the calling task twice, through:
+
+  cpu_timer_sample_group()
+    thread_group_cputimer()
+      thread_group_cputime()
+        times->sum_exec_runtime += task_sched_runtime();
+
+    *sample = cputime.sum_exec_runtime + task_delta_exec();
+
+Which would make the sample run ahead, making the sleep short.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Stanislaw Gruszka <sgruszka@redhat.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20141112113737.GI10476@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 23cfa361f3e54a3e184a5e126bbbdd95f984881a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/posix-cpu-timers.c
+diff --cc kernel/posix-cpu-timers.c
+index 190a887c681a,a16b67859e2a..000000000000
+--- a/kernel/posix-cpu-timers.c
++++ b/kernel/posix-cpu-timers.c
+@@@ -639,13 -547,13 +639,17 @@@ static int cpu_timer_sample_group(cons
+  	default:
+  		return -EINVAL;
+  	case CPUCLOCK_PROF:
+ -		*sample = cputime_to_expires(cputime.utime + cputime.stime);
+ +		cpu->cpu = cputime.utime + cputime.stime;
+  		break;
+  	case CPUCLOCK_VIRT:
+ -		*sample = cputime_to_expires(cputime.utime);
+ +		cpu->cpu = cputime.utime;
+  		break;
+  	case CPUCLOCK_SCHED:
+++<<<<<<< HEAD:kernel/posix-cpu-timers.c
+ +		cpu->sched = cputime.sum_exec_runtime + task_delta_exec(p);
+++=======
++ 		*sample = cputime.sum_exec_runtime;
+++>>>>>>> 23cfa361f3e5 (sched/cputime: Fix cpu_timer_sample_group() double accounting):kernel/time/posix-cpu-timers.c
+  		break;
+  	}
+  	return 0;
+diff --git a/include/linux/kernel_stat.h b/include/linux/kernel_stat.h
+index 09685d041d2b..794659fdb65b 100644
+--- a/include/linux/kernel_stat.h
++++ b/include/linux/kernel_stat.h
+@@ -117,11 +117,6 @@ static inline unsigned int kstat_cpu_irqs_sum(unsigned int cpu)
+ 	return kstat_cpu(cpu).irqs_sum;
+ }
+ 
+-/*
+- * Lock/unlock the current runqueue - to extract task statistics:
+- */
+-extern unsigned long long task_delta_exec(struct task_struct *);
+-
+ extern void account_user_time(struct task_struct *, cputime_t, cputime_t);
+ extern void account_system_time(struct task_struct *, int, cputime_t, cputime_t);
+ extern void account_steal_time(cputime_t);
+* Unmerged path kernel/posix-cpu-timers.c
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 9a510f9b4081..7d8cb0669181 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2879,19 +2879,6 @@ static u64 do_task_delta_exec(struct task_struct *p, struct rq *rq)
+ 	return ns;
+ }
+ 
+-unsigned long long task_delta_exec(struct task_struct *p)
+-{
+-	unsigned long flags;
+-	struct rq *rq;
+-	u64 ns = 0;
+-
+-	rq = task_rq_lock(p, &flags);
+-	ns = do_task_delta_exec(p, rq);
+-	task_rq_unlock(rq, p, &flags);
+-
+-	return ns;
+-}
+-
+ /*
+  * Return accounted runtime for the task.
+  * In case the task is currently running, return the runtime plus current's
