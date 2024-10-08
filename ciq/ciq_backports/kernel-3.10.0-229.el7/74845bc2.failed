@@ -1,0 +1,149 @@
+powerpc/book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest (Don Zickus) [1127366]
+Rebuild_FUZZ: 93.96%
+commit-author Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+commit 74845bc2fa9c0e6b218821cd4e1eb7a552d3e503
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/74845bc2.failed
+
+Currently we forward MCEs to guest which have been recovered by guest.
+And for unhandled errors we do not deliver the MCE to guest. It looks like
+with no support of FWNMI in qemu, guest just panics whenever we deliver the
+recovered MCEs to guest. Also, the existig code used to return to host for
+unhandled errors which was casuing guest to hang with soft lockups inside
+guest and makes it difficult to recover guest instance.
+
+This patch now forwards all fatal MCEs to guest causing guest to crash/panic.
+And, for recovered errors we just go back to normal functioning of guest
+instead of returning to host. This fixes soft lockup issues in guest.
+This patch also fixes an issue where guest MCE events were not logged to
+host console.
+
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 74845bc2fa9c0e6b218821cd4e1eb7a552d3e503)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 0ae4c28ae4b6,868347ef09fd..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -1806,17 -2255,68 +1806,36 @@@ kvm_cede_exit
+  	/* Try to handle a machine check in real mode */
+  machine_check_realmode:
+  	mr	r3, r9		/* get vcpu pointer */
+ -	bl	kvmppc_realmode_machine_check
+ +	bl	.kvmppc_realmode_machine_check
+  	nop
+- 	cmpdi	r3, 0		/* continue exiting from guest? */
++ 	cmpdi	r3, 0		/* Did we handle MCE ? */
+  	ld	r9, HSTATE_KVM_VCPU(r13)
+  	li	r12, BOOK3S_INTERRUPT_MACHINE_CHECK
+- 	beq	mc_cont
++ 	/*
++ 	 * Deliver unhandled/fatal (e.g. UE) MCE errors to guest through
++ 	 * machine check interrupt (set HSRR0 to 0x200). And for handled
++ 	 * errors (no-fatal), just go back to guest execution with current
++ 	 * HSRR0 instead of exiting guest. This new approach will inject
++ 	 * machine check to guest for fatal error causing guest to crash.
++ 	 *
++ 	 * The old code used to return to host for unhandled errors which
++ 	 * was causing guest to hang with soft lockups inside guest and
++ 	 * makes it difficult to recover guest instance.
++ 	 */
++ 	ld	r10, VCPU_PC(r9)
++ 	ld	r11, VCPU_MSR(r9)
++ 	bne	2f	/* Continue guest execution. */
+  	/* If not, deliver a machine check.  SRR0/1 are already set */
+  	li	r10, BOOK3S_INTERRUPT_MACHINE_CHECK
+++<<<<<<< HEAD
+ +	li	r11, (MSR_ME << 1) | 1	/* synthesize MSR_SF | MSR_ME */
+ +	rotldi	r11, r11, 63
+ +	b	fast_interrupt_c_return
+++=======
++ 	ld	r11, VCPU_MSR(r9)
++ 	bl	kvmppc_msr_interrupt
++ 2:	b	fast_interrupt_c_return
+ -
+ -/*
+ - * Check the reason we woke from nap, and take appropriate action.
+ - * Returns:
+ - *	0 if nothing needs to be done
+ - *	1 if something happened that needs to be handled by the host
+ - *	-1 if there was a guest wakeup (IPI)
+ - *
+ - * Also sets r12 to the interrupt vector for any interrupt that needs
+ - * to be handled now by the host (0x500 for external interrupt), or zero.
+ - */
+ -kvmppc_check_wake_reason:
+ -	mfspr	r6, SPRN_SRR1
+ -BEGIN_FTR_SECTION
+ -	rlwinm	r6, r6, 45-31, 0xf	/* extract wake reason field (P8) */
+ -FTR_SECTION_ELSE
+ -	rlwinm	r6, r6, 45-31, 0xe	/* P7 wake reason field is 3 bits */
+ -ALT_FTR_SECTION_END_IFSET(CPU_FTR_ARCH_207S)
+ -	cmpwi	r6, 8			/* was it an external interrupt? */
+ -	li	r12, BOOK3S_INTERRUPT_EXTERNAL
+ -	beq	kvmppc_read_intr	/* if so, see what it was */
+ -	li	r3, 0
+ -	li	r12, 0
+ -	cmpwi	r6, 6			/* was it the decrementer? */
+ -	beq	0f
+ -BEGIN_FTR_SECTION
+ -	cmpwi	r6, 5			/* privileged doorbell? */
+ -	beq	0f
+ -	cmpwi	r6, 3			/* hypervisor doorbell? */
+ -	beq	3f
+ -END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ -	li	r3, 1			/* anything else, return 1 */
+ -0:	blr
+ -
+ -	/* hypervisor doorbell */
+ -3:	li	r12, BOOK3S_INTERRUPT_H_DOORBELL
+ -	li	r3, 1
+ -	blr
+++>>>>>>> 74845bc2fa9c (powerpc/book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest.)
+  
+  /*
+   * Determine what sort of external interrupt is pending (if any).
+diff --git a/arch/powerpc/kvm/book3s_hv_ras.c b/arch/powerpc/kvm/book3s_hv_ras.c
+index 768a9f977c00..3a5c568b1e89 100644
+--- a/arch/powerpc/kvm/book3s_hv_ras.c
++++ b/arch/powerpc/kvm/book3s_hv_ras.c
+@@ -113,10 +113,8 @@ static long kvmppc_realmode_mc_power7(struct kvm_vcpu *vcpu)
+ 	 * We assume that if the condition is recovered then linux host
+ 	 * will have generated an error log event that we will pick
+ 	 * up and log later.
+-	 * Don't release mce event now. In case if condition is not
+-	 * recovered we do guest exit and go back to linux host machine
+-	 * check handler. Hence we need make sure that current mce event
+-	 * is available for linux host to consume.
++	 * Don't release mce event now. We will queue up the event so that
++	 * we can log the MCE event info on host console.
+ 	 */
+ 	if (!get_mce_event(&mce_evt, MCE_EVENT_DONTRELEASE))
+ 		goto out;
+@@ -128,11 +126,12 @@ static long kvmppc_realmode_mc_power7(struct kvm_vcpu *vcpu)
+ 
+ out:
+ 	/*
+-	 * If we have handled the error, then release the mce event because
+-	 * we will be delivering machine check to guest.
++	 * We are now going enter guest either through machine check
++	 * interrupt (for unhandled errors) or will continue from
++	 * current HSRR0 (for handled errors) in guest. Hence
++	 * queue up the event so that we can log it from host console later.
+ 	 */
+-	if (handled)
+-		release_mce_event();
++	machine_check_queue_event();
+ 
+ 	return handled;
+ }
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
