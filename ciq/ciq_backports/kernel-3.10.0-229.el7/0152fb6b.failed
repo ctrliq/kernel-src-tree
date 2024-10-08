@@ -1,0 +1,595 @@
+blk-mq: pass a reserved argument to the timeout handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0152fb6b57c4fae769ee75ea2ae670f4ff39fba9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0152fb6b.failed
+
+Allow blk-mq to pass an argument to the timeout handler to indicate
+if we're timing out a reserved or regular command.  For many drivers
+those need to be handled different.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0152fb6b57c4fae769ee75ea2ae670f4ff39fba9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/scsi/scsi_lib.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 6fcf1deefe8d,d12f1983d493..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -355,94 -421,196 +355,134 @@@ static void blk_mq_start_request(struc
+  		 */
+  		rq->nr_phys_segments++;
+  	}
+ -}
+ -EXPORT_SYMBOL(blk_mq_start_request);
+ -
+ -static void __blk_mq_requeue_request(struct request *rq)
+ -{
+ -	struct request_queue *q = rq->q;
+ -
+ -	trace_block_rq_requeue(q, rq);
+ -
+ -	if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
+ -		if (q->dma_drain_size && blk_rq_bytes(rq))
+ -			rq->nr_phys_segments--;
+ -	}
+ -}
+ -
+ -void blk_mq_requeue_request(struct request *rq)
+ -{
+ -	__blk_mq_requeue_request(rq);
+ -	blk_clear_rq_complete(rq);
+ -
+ -	BUG_ON(blk_queued_rq(rq));
+ -	blk_mq_add_to_requeue_list(rq, true);
+ -}
+ -EXPORT_SYMBOL(blk_mq_requeue_request);
+ -
+ -static void blk_mq_requeue_work(struct work_struct *work)
+ -{
+ -	struct request_queue *q =
+ -		container_of(work, struct request_queue, requeue_work);
+ -	LIST_HEAD(rq_list);
+ -	struct request *rq, *next;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&q->requeue_lock, flags);
+ -	list_splice_init(&q->requeue_list, &rq_list);
+ -	spin_unlock_irqrestore(&q->requeue_lock, flags);
+ -
+ -	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
+ -		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+ -			continue;
+ -
+ -		rq->cmd_flags &= ~REQ_SOFTBARRIER;
+ -		list_del_init(&rq->queuelist);
+ -		blk_mq_insert_request(rq, true, false, false);
+ -	}
+ -
+ -	while (!list_empty(&rq_list)) {
+ -		rq = list_entry(rq_list.next, struct request, queuelist);
+ -		list_del_init(&rq->queuelist);
+ -		blk_mq_insert_request(rq, false, false, false);
+ -	}
+  
+  	/*
+ -	 * Use the start variant of queue running here, so that running
+ -	 * the requeue work will kick stopped queues.
+ +	 * Flag the last request in the series so that drivers know when IO
+ +	 * should be kicked off, if they don't do it on a per-request basis.
+ +	 *
+ +	 * Note: the flag isn't the only condition drivers should do kick off.
+ +	 * If drive is busy, the last request might not have the bit set.
+  	 */
+ -	blk_mq_start_hw_queues(q);
+ +	if (last)
+ +		rq->cmd_flags |= REQ_END;
+  }
+  
+ -void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
+ +static void blk_mq_requeue_request(struct request *rq)
+  {
+  	struct request_queue *q = rq->q;
+ -	unsigned long flags;
+ -
+ -	/*
+ -	 * We abuse this flag that is otherwise used by the I/O scheduler to
+ -	 * request head insertation from the workqueue.
+ -	 */
+ -	BUG_ON(rq->cmd_flags & REQ_SOFTBARRIER);
+ -
+ -	spin_lock_irqsave(&q->requeue_lock, flags);
+ -	if (at_head) {
+ -		rq->cmd_flags |= REQ_SOFTBARRIER;
+ -		list_add(&rq->queuelist, &q->requeue_list);
+ -	} else {
+ -		list_add_tail(&rq->queuelist, &q->requeue_list);
+ -	}
+ -	spin_unlock_irqrestore(&q->requeue_lock, flags);
+ -}
+ -EXPORT_SYMBOL(blk_mq_add_to_requeue_list);
+ -
+ -void blk_mq_kick_requeue_list(struct request_queue *q)
+ -{
+ -	kblockd_schedule_work(&q->requeue_work);
+ -}
+ -EXPORT_SYMBOL(blk_mq_kick_requeue_list);
+ -
+ -static inline bool is_flush_request(struct request *rq, unsigned int tag)
+ -{
+ -	return ((rq->cmd_flags & REQ_FLUSH_SEQ) &&
+ -			rq->q->flush_rq->tag == tag);
+ -}
+  
+ -struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
+ -{
+ -	struct request *rq = tags->rqs[tag];
+ +	trace_block_rq_requeue(q, rq);
+ +	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+  
+ -	if (!is_flush_request(rq, tag))
+ -		return rq;
+ +	rq->cmd_flags &= ~REQ_END;
+  
+ -	return rq->q->flush_rq;
+ +	if (q->dma_drain_size && blk_rq_bytes(rq))
+ +		rq->nr_phys_segments--;
+  }
+ -EXPORT_SYMBOL(blk_mq_tag_to_rq);
+  
+  struct blk_mq_timeout_data {
+ -	unsigned long next;
+ -	unsigned int next_set;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned long *next;
+ +	unsigned int *next_set;
+  };
+  
+++<<<<<<< HEAD
+ +static void blk_mq_timeout_check(void *__data, unsigned long *free_tags)
+++=======
++ static void blk_mq_rq_timed_out(struct request *req, bool reserved)
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  {
+ -	struct blk_mq_ops *ops = req->q->mq_ops;
+ -	enum blk_eh_timer_return ret = BLK_EH_RESET_TIMER;
+ +	struct blk_mq_timeout_data *data = __data;
+ +	struct blk_mq_hw_ctx *hctx = data->hctx;
+ +	unsigned int tag;
+  
+ -	/*
+ -	 * We know that complete is set at this point. If STARTED isn't set
+ -	 * anymore, then the request isn't active and the "timeout" should
+ -	 * just be ignored. This can happen due to the bitflag ordering.
+ -	 * Timeout first checks if STARTED is set, and if it is, assumes
+ -	 * the request is active. But if we race with completion, then
+ -	 * we both flags will get cleared. So check here again, and ignore
+ -	 * a timeout event with a request that isn't active.
+ +	 /* It may not be in flight yet (this is where
+ +	 * the REQ_ATOMIC_STARTED flag comes in). The requests are
+ +	 * statically allocated, so we know it's always safe to access the
+ +	 * memory associated with a bit offset into ->rqs[].
+  	 */
+ -	if (!test_bit(REQ_ATOM_STARTED, &req->atomic_flags))
+ -		return;
+ +	tag = 0;
+ +	do {
+ +		struct request *rq;
+  
+++<<<<<<< HEAD
+ +		tag = find_next_zero_bit(free_tags, hctx->queue_depth, tag);
+ +		if (tag >= hctx->queue_depth)
+ +			break;
+++=======
++ 	if (ops->timeout)
++ 		ret = ops->timeout(req, reserved);
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  
+ -	switch (ret) {
+ -	case BLK_EH_HANDLED:
+ -		__blk_mq_complete_request(req);
+ -		break;
+ -	case BLK_EH_RESET_TIMER:
+ -		blk_add_timer(req);
+ -		blk_clear_rq_complete(req);
+ -		break;
+ -	case BLK_EH_NOT_HANDLED:
+ -		break;
+ -	default:
+ -		printk(KERN_ERR "block: bad eh return: %d\n", ret);
+ -		break;
+ -	}
+ -}
+ -		
+ -static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, void *priv, bool reserved)
+ -{
+ -	struct blk_mq_timeout_data *data = priv;
+ +		rq = hctx->rqs[tag++];
+  
+++<<<<<<< HEAD
+ +		if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+++=======
++ 	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
++ 		return;
++ 
++ 	if (time_after_eq(jiffies, rq->deadline)) {
++ 		if (!blk_mark_rq_complete(rq))
++ 			blk_mq_rq_timed_out(rq, reserved);
++ 	} else if (!data->next_set || time_after(data->next, rq->deadline)) {
++ 		data->next = rq->deadline;
++ 		data->next_set = 1;
++ 	}
++ }
++ 
++ static void blk_mq_rq_timer(unsigned long priv)
++ {
++ 	struct request_queue *q = (struct request_queue *)priv;
++ 	struct blk_mq_timeout_data data = {
++ 		.next		= 0,
++ 		.next_set	= 0,
++ 	};
++ 	struct blk_mq_hw_ctx *hctx;
++ 	int i;
++ 
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		/*
++ 		 * If not software queues are currently mapped to this
++ 		 * hardware queue, there's nothing to check
++ 		 */
++ 		if (!hctx->nr_ctx || !hctx->tags)
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  			continue;
+  
+ -		blk_mq_tag_busy_iter(hctx, blk_mq_check_expired, &data);
+ -	}
+ +		blk_rq_check_expired(rq, data->next, data->next_set);
+ +	} while (1);
+ +}
+  
+ -	if (data.next_set) {
+ -		data.next = blk_rq_timeout(round_jiffies_up(data.next));
+ -		mod_timer(&q->timeout, data.next);
+ -	} else {
+ -		queue_for_each_hw_ctx(q, hctx, i)
+ -			blk_mq_tag_idle(hctx);
+ -	}
+ +static void blk_mq_hw_ctx_check_timeout(struct blk_mq_hw_ctx *hctx,
+ +					unsigned long *next,
+ +					unsigned int *next_set)
+ +{
+ +	struct blk_mq_timeout_data data = {
+ +		.hctx		= hctx,
+ +		.next		= next,
+ +		.next_set	= next_set,
+ +	};
+ +
+ +	/*
+ +	 * Ask the tagging code to iterate busy requests, so we can
+ +	 * check them for timeout.
+ +	 */
+ +	blk_mq_tag_busy_iter(hctx->tags, blk_mq_timeout_check, &data);
+ +}
+ +
+ +static void blk_mq_rq_timer(unsigned long data)
+ +{
+ +	struct request_queue *q = (struct request_queue *) data;
+ +	struct blk_mq_hw_ctx *hctx;
+ +	unsigned long next = 0;
+ +	int i, next_set = 0;
+ +
+ +	queue_for_each_hw_ctx(q, hctx, i)
+ +		blk_mq_hw_ctx_check_timeout(hctx, &next, &next_set);
+ +
+ +	if (next_set)
+ +		mod_timer(&q->timeout, round_jiffies_up(next));
+  }
+  
+  /*
+diff --cc drivers/scsi/scsi_lib.c
+index 224fcb585fa9,86b1156edb82..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1624,7 -1778,190 +1624,194 @@@ out_delay
+  		blk_delay_queue(q, SCSI_QUEUE_DELAY);
+  }
+  
+++<<<<<<< HEAD
+ +u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++=======
++ static inline int prep_to_mq(int ret)
++ {
++ 	switch (ret) {
++ 	case BLKPREP_OK:
++ 		return 0;
++ 	case BLKPREP_DEFER:
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 	default:
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ }
++ 
++ static int scsi_mq_prep_fn(struct request *req)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	struct scsi_device *sdev = req->q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned char *sense_buf = cmd->sense_buffer;
++ 	struct scatterlist *sg;
++ 
++ 	memset(cmd, 0, sizeof(struct scsi_cmnd));
++ 
++ 	req->special = cmd;
++ 
++ 	cmd->request = req;
++ 	cmd->device = sdev;
++ 	cmd->sense_buffer = sense_buf;
++ 
++ 	cmd->tag = req->tag;
++ 
++ 	cmd->cmnd = req->cmd;
++ 	cmd->prot_op = SCSI_PROT_NORMAL;
++ 
++ 	INIT_LIST_HEAD(&cmd->list);
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies;
++ 
++ 	/*
++ 	 * XXX: cmd_list lookups are only used by two drivers, try to get
++ 	 * rid of this list in common code.
++ 	 */
++ 	spin_lock_irq(&sdev->list_lock);
++ 	list_add_tail(&cmd->list, &sdev->cmd_list);
++ 	spin_unlock_irq(&sdev->list_lock);
++ 
++ 	sg = (void *)cmd + sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
++ 	cmd->sdb.table.sgl = sg;
++ 
++ 	if (scsi_host_get_prot(shost)) {
++ 		cmd->prot_sdb = (void *)sg +
++ 			shost->sg_tablesize * sizeof(struct scatterlist);
++ 		memset(cmd->prot_sdb, 0, sizeof(struct scsi_data_buffer));
++ 
++ 		cmd->prot_sdb->table.sgl =
++ 			(struct scatterlist *)(cmd->prot_sdb + 1);
++ 	}
++ 
++ 	if (blk_bidi_rq(req)) {
++ 		struct request *next_rq = req->next_rq;
++ 		struct scsi_data_buffer *bidi_sdb = blk_mq_rq_to_pdu(next_rq);
++ 
++ 		memset(bidi_sdb, 0, sizeof(struct scsi_data_buffer));
++ 		bidi_sdb->table.sgl =
++ 			(struct scatterlist *)(bidi_sdb + 1);
++ 
++ 		next_rq->special = bidi_sdb;
++ 	}
++ 
++ 	return scsi_setup_cmnd(sdev, req);
++ }
++ 
++ static void scsi_mq_done(struct scsi_cmnd *cmd)
++ {
++ 	trace_scsi_dispatch_cmd_done(cmd);
++ 	blk_mq_complete_request(cmd->request);
++ }
++ 
++ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req,
++ 		bool last)
++ {
++ 	struct request_queue *q = req->q;
++ 	struct scsi_device *sdev = q->queuedata;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++ 	int ret;
++ 	int reason;
++ 
++ 	ret = prep_to_mq(scsi_prep_state_check(sdev, req));
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 	if (!get_device(&sdev->sdev_gendev))
++ 		goto out;
++ 
++ 	if (!scsi_dev_queue_ready(q, sdev))
++ 		goto out_put_device;
++ 	if (!scsi_target_queue_ready(shost, sdev))
++ 		goto out_dec_device_busy;
++ 	if (!scsi_host_queue_ready(q, shost, sdev))
++ 		goto out_dec_target_busy;
++ 
++ 	if (!(req->cmd_flags & REQ_DONTPREP)) {
++ 		ret = prep_to_mq(scsi_mq_prep_fn(req));
++ 		if (ret)
++ 			goto out_dec_host_busy;
++ 		req->cmd_flags |= REQ_DONTPREP;
++ 	}
++ 
++ 	scsi_init_cmd_errh(cmd);
++ 	cmd->scsi_done = scsi_mq_done;
++ 
++ 	blk_mq_start_request(req);
++ 	reason = scsi_dispatch_cmd(cmd);
++ 	if (reason) {
++ 		scsi_set_blocked(cmd, reason);
++ 		ret = BLK_MQ_RQ_QUEUE_BUSY;
++ 		goto out_dec_host_busy;
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ 
++ out_dec_host_busy:
++ 	atomic_dec(&shost->host_busy);
++ out_dec_target_busy:
++ 	if (scsi_target(sdev)->can_queue > 0)
++ 		atomic_dec(&scsi_target(sdev)->target_busy);
++ out_dec_device_busy:
++ 	atomic_dec(&sdev->device_busy);
++ out_put_device:
++ 	put_device(&sdev->sdev_gendev);
++ out:
++ 	switch (ret) {
++ 	case BLK_MQ_RQ_QUEUE_BUSY:
++ 		blk_mq_stop_hw_queue(hctx);
++ 		if (atomic_read(&sdev->device_busy) == 0 &&
++ 		    !scsi_device_blocked(sdev))
++ 			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
++ 		break;
++ 	case BLK_MQ_RQ_QUEUE_ERROR:
++ 		/*
++ 		 * Make sure to release all allocated ressources when
++ 		 * we hit an error, as we will never see this command
++ 		 * again.
++ 		 */
++ 		if (req->cmd_flags & REQ_DONTPREP)
++ 			scsi_mq_uninit_cmd(cmd);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static enum blk_eh_timer_return scsi_timeout(struct request *req,
++ 		bool reserved)
++ {
++ 	if (reserved)
++ 		return BLK_EH_RESET_TIMER;
++ 	return scsi_times_out(req);
++ }
++ 
++ static int scsi_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->sense_buffer = kzalloc_node(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL,
++ 			numa_node);
++ 	if (!cmd->sense_buffer)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void scsi_exit_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	kfree(cmd->sense_buffer);
++ }
++ 
++ static u64 scsi_calculate_bounce_limit(struct Scsi_Host *shost)
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  {
+  	struct device *host_dev;
+  	u64 bounce_limit = 0xffffffff;
+@@@ -1706,6 -2047,55 +1893,58 @@@ struct request_queue *scsi_alloc_queue(
+  	return q;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops scsi_mq_ops = {
++ 	.map_queue	= blk_mq_map_queue,
++ 	.queue_rq	= scsi_queue_rq,
++ 	.complete	= scsi_softirq_done,
++ 	.timeout	= scsi_timeout,
++ 	.init_request	= scsi_init_request,
++ 	.exit_request	= scsi_exit_request,
++ };
++ 
++ struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
++ {
++ 	sdev->request_queue = blk_mq_init_queue(&sdev->host->tag_set);
++ 	if (IS_ERR(sdev->request_queue))
++ 		return NULL;
++ 
++ 	sdev->request_queue->queuedata = sdev;
++ 	__scsi_init_queue(sdev->host, sdev->request_queue);
++ 	return sdev->request_queue;
++ }
++ 
++ int scsi_mq_setup_tags(struct Scsi_Host *shost)
++ {
++ 	unsigned int cmd_size, sgl_size, tbl_size;
++ 
++ 	tbl_size = shost->sg_tablesize;
++ 	if (tbl_size > SCSI_MAX_SG_SEGMENTS)
++ 		tbl_size = SCSI_MAX_SG_SEGMENTS;
++ 	sgl_size = tbl_size * sizeof(struct scatterlist);
++ 	cmd_size = sizeof(struct scsi_cmnd) + shost->hostt->cmd_size + sgl_size;
++ 	if (scsi_host_get_prot(shost))
++ 		cmd_size += sizeof(struct scsi_data_buffer) + sgl_size;
++ 
++ 	memset(&shost->tag_set, 0, sizeof(shost->tag_set));
++ 	shost->tag_set.ops = &scsi_mq_ops;
++ 	shost->tag_set.nr_hw_queues = 1;
++ 	shost->tag_set.queue_depth = shost->can_queue;
++ 	shost->tag_set.cmd_size = cmd_size;
++ 	shost->tag_set.numa_node = NUMA_NO_NODE;
++ 	shost->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
++ 	shost->tag_set.driver_data = shost;
++ 
++ 	return blk_mq_alloc_tag_set(&shost->tag_set);
++ }
++ 
++ void scsi_mq_destroy_tags(struct Scsi_Host *shost)
++ {
++ 	blk_mq_free_tag_set(&shost->tag_set);
++ }
++ 
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  /*
+   * Function:    scsi_block_requests()
+   *
+diff --cc include/linux/blk-mq.h
+index 712a6b843fbe,325349559fb0..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -59,14 -69,26 +59,18 @@@ struct blk_mq_reg 
+  	int			numa_node;
+  	unsigned int		timeout;
+  	unsigned int		flags;		/* BLK_MQ_F_* */
+ -	void			*driver_data;
+ -
+ -	struct blk_mq_tags	**tags;
+ -
+ -	struct mutex		tag_list_lock;
+ -	struct list_head	tag_list;
+  };
+  
+ -typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *, bool);
+ +typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+  typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+++<<<<<<< HEAD
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ +typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+++=======
++ typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+++>>>>>>> 0152fb6b57c4 (blk-mq: pass a reserved argument to the timeout handler)
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ -typedef int (init_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int, unsigned int);
+ -typedef void (exit_request_fn)(void *, struct request *, unsigned int,
+ -		unsigned int);
+ -
+ -typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+ -		bool);
+  
+  struct blk_mq_ops {
+  	/*
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/scsi/scsi_lib.c
+* Unmerged path include/linux/blk-mq.h
