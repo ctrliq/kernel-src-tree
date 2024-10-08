@@ -1,0 +1,108 @@
+drm/i915: Use two 32bit reads for select 64bit REG_READ ioctls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [drm] i915: Use two 32bit reads for select 64bit REG_READ ioctls (Rob Clark) [1249805]
+Rebuild_FUZZ: 96.67%
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 648a9bc5308d952f2c80772301b339f73026f013
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/648a9bc5.failed
+
+Since the hardware sometimes mysteriously totally flummoxes the 64bit
+read of a 64bit register when read using a single instruction, split the
+read into two instructions. Since the read here is of automatically
+incrementing timestamp counters, we also have to be very careful in
+order to make sure that it does not increment between the two
+instructions.
+
+However, since userspace tried to workaround this issue and so enshrined
+this ABI for a broken hardware read and in the process neglected that
+the read only fails in some environments, we have to introduce a new
+uABI flag for userspace to request the 2x32 bit accurate read of the
+timestamp.
+
+v2: Fix alignment check and include details of the workaround for
+userspace.
+
+	Reported-by: Karol Herbst <freedesktop@karolherbst.de>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=91317
+Testcase: igt/gem_reg_read
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Michał Winiarski <michal.winiarski@intel.com>
+	Cc: stable@vger.kernel.org
+	Tested-by: Michał Winiarski <michal.winiarski@intel.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 648a9bc5308d952f2c80772301b339f73026f013)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_uncore.c
+diff --cc drivers/gpu/drm/i915/intel_uncore.c
+index 4f6fef7ac069,260389acfb77..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@@ -874,23 -1287,33 +876,37 @@@ int i915_reg_read_ioctl(struct drm_devi
+  	if (i == ARRAY_SIZE(whitelist))
+  		return -EINVAL;
+  
++ 	/* We use the low bits to encode extra flags as the register should
++ 	 * be naturally aligned (and those that are not so aligned merely
++ 	 * limit the available flags for that register).
++ 	 */
++ 	offset = entry->offset;
++ 	size = entry->size;
++ 	size |= reg->offset ^ offset;
++ 
+  	intel_runtime_pm_get(dev_priv);
+  
+- 	switch (entry->size) {
++ 	switch (size) {
++ 	case 8 | 1:
++ 		reg->val = I915_READ64_2x32(offset, offset+4);
++ 		break;
+  	case 8:
+- 		reg->val = I915_READ64(reg->offset);
++ 		reg->val = I915_READ64(offset);
+  		break;
+  	case 4:
+- 		reg->val = I915_READ(reg->offset);
++ 		reg->val = I915_READ(offset);
+  		break;
+  	case 2:
+- 		reg->val = I915_READ16(reg->offset);
++ 		reg->val = I915_READ16(offset);
+  		break;
+  	case 1:
+- 		reg->val = I915_READ8(reg->offset);
++ 		reg->val = I915_READ8(offset);
+  		break;
+  	default:
+++<<<<<<< HEAD
+ +		WARN_ON(1);
+++=======
+++>>>>>>> 648a9bc5308d (drm/i915: Use two 32bit reads for select 64bit REG_READ ioctls)
+  		ret = -EINVAL;
+  		goto out;
+  	}
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.c
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index ff57f07c3249..86a07d6ece9c 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -1035,6 +1035,14 @@ struct drm_i915_reg_read {
+ 	__u64 offset;
+ 	__u64 val; /* Return value */
+ };
++/* Known registers:
++ *
++ * Render engine timestamp - 0x2358 + 64bit - gen7+
++ * - Note this register returns an invalid value if using the default
++ *   single instruction 8byte read, in order to workaround that use
++ *   offset (0x2538 | 1) instead.
++ *
++ */
+ 
+ struct drm_i915_reset_stats {
+ 	__u32 ctx_id;
