@@ -1,0 +1,914 @@
+netfilter: nf_conntrack: add direction support for zones
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit deedb59039f111c41aa5a54ee384c8e7c08bc78a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/deedb590.failed
+
+This work adds a direction parameter to netfilter zones, so identity
+separation can be performed only in original/reply or both directions
+(default). This basically opens up the possibility of doing NAT with
+conflicting IP address/port tuples from multiple, isolated tenants
+on a host (e.g. from a netns) without requiring each tenant to NAT
+twice resp. to use its own dedicated IP address to SNAT to, meaning
+overlapping tuples can be made unique with the zone identifier in
+original direction, where the NAT engine will then allocate a unique
+tuple in the commonly shared default zone for the reply direction.
+In some restricted, local DNAT cases, also port redirection could be
+used for making the reply traffic unique w/o requiring SNAT.
+
+The consensus we've reached and discussed at NFWS and since the initial
+implementation [1] was to directly integrate the direction meta data
+into the existing zones infrastructure, as opposed to the ct->mark
+approach we proposed initially.
+
+As we pass the nf_conntrack_zone object directly around, we don't have
+to touch all call-sites, but only those, that contain equality checks
+of zones. Thus, based on the current direction (original or reply),
+we either return the actual id, or the default NF_CT_DEFAULT_ZONE_ID.
+CT expectations are direction-agnostic entities when expectations are
+being compared among themselves, so we can only use the identifier
+in this case.
+
+Note that zone identifiers can not be included into the hash mix
+anymore as they don't contain a "stable" value that would be equal
+for both directions at all times, f.e. if only zone->id would
+unconditionally be xor'ed into the table slot hash, then replies won't
+find the corresponding conntracking entry anymore.
+
+If no particular direction is specified when configuring zones, the
+behaviour is exactly as we expect currently (both directions).
+
+Support has been added for the CT netlink interface as well as the
+x_tables raw CT target, which both already offer existing interfaces
+to user space for the configuration of zones.
+
+Below a minimal, simplified collision example (script in [2]) with
+netperf sessions:
+
+  +--- tenant-1 ---+   mark := 1
+  |    netperf     |--+
+  +----------------+  |                CT zone := mark [ORIGINAL]
+   [ip,sport] := X   +--------------+  +--- gateway ---+
+                     | mark routing |--|     SNAT      |-- ... +
+                     +--------------+  +---------------+       |
+  +--- tenant-2 ---+  |                                     ~~~|~~~
+  |    netperf     |--+                +-----------+           |
+  +----------------+   mark := 2       | netserver |------ ... +
+   [ip,sport] := X                     +-----------+
+                                        [ip,port] := Y
+On the gateway netns, example:
+
+  iptables -t raw -A PREROUTING -j CT --zone mark --zone-dir ORIGINAL
+  iptables -t nat -A POSTROUTING -o <dev> -j SNAT --to-source <ip> --random-fully
+
+  iptables -t mangle -A PREROUTING -m conntrack --ctdir ORIGINAL -j CONNMARK --save-mark
+  iptables -t mangle -A POSTROUTING -m conntrack --ctdir REPLY -j CONNMARK --restore-mark
+
+conntrack dump from gateway netns:
+
+  netperf -H 10.1.1.2 -t TCP_STREAM -l60 -p12865,5555 from each tenant netns
+
+  tcp 6 431995 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=5555 dport=12865 zone-orig=1
+                           src=10.1.1.2 dst=10.1.1.1 sport=12865 dport=1024
+               [ASSURED] mark=1 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 431994 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=5555 dport=12865 zone-orig=2
+                           src=10.1.1.2 dst=10.1.1.1 sport=12865 dport=5555
+               [ASSURED] mark=2 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 299 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=39438 dport=33768 zone-orig=1
+                        src=10.1.1.2 dst=10.1.1.1 sport=33768 dport=39438
+               [ASSURED] mark=1 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 300 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=32889 dport=40206 zone-orig=2
+                        src=10.1.1.2 dst=10.1.1.1 sport=40206 dport=32889
+               [ASSURED] mark=2 secctx=system_u:object_r:unlabeled_t:s0 use=2
+
+Taking this further, test script in [2] creates 200 tenants and runs
+original-tuple colliding netperf sessions each. A conntrack -L dump in
+the gateway netns also confirms 200 overlapping entries, all in ESTABLISHED
+state as expected.
+
+I also did run various other tests with some permutations of the script,
+to mention some: SNAT in random/random-fully/persistent mode, no zones (no
+overlaps), static zones (original, reply, both directions), etc.
+
+  [1] http://thread.gmane.org/gmane.comp.security.firewalls.netfilter.devel/57412/
+  [2] https://paste.fedoraproject.org/242835/65657871/
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit deedb59039f111c41aa5a54ee384c8e7c08bc78a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_conntrack_zones.h
+#	net/ipv4/netfilter/nf_defrag_ipv4.c
+#	net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_expect.c
+#	net/netfilter/nf_conntrack_netlink.c
+#	net/netfilter/nf_conntrack_standalone.c
+#	net/netfilter/nf_nat_core.c
+#	net/netfilter/xt_CT.c
+#	net/sched/act_connmark.c
+diff --cc include/net/netfilter/nf_conntrack_zones.h
+index 034efe8d45a5,3942ddf0d4ff..000000000000
+--- a/include/net/netfilter/nf_conntrack_zones.h
++++ b/include/net/netfilter/nf_conntrack_zones.h
+@@@ -1,25 -1,67 +1,73 @@@
+  #ifndef _NF_CONNTRACK_ZONES_H
+  #define _NF_CONNTRACK_ZONES_H
+  
+++<<<<<<< HEAD
+ +#define NF_CT_DEFAULT_ZONE	0
+ +
+ +#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ +#include <net/netfilter/nf_conntrack_extend.h>
+++=======
++ #include <linux/netfilter/nf_conntrack_tuple_common.h>
++ 
++ #define NF_CT_DEFAULT_ZONE_ID	0
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
++ 
++ #define NF_CT_ZONE_DIR_ORIG	(1 << IP_CT_DIR_ORIGINAL)
++ #define NF_CT_ZONE_DIR_REPL	(1 << IP_CT_DIR_REPLY)
++ 
++ #define NF_CT_DEFAULT_ZONE_DIR	(NF_CT_ZONE_DIR_ORIG | NF_CT_ZONE_DIR_REPL)
+  
+  struct nf_conntrack_zone {
+  	u16	id;
++ 	u16	dir;
+  };
+  
+ -extern const struct nf_conntrack_zone nf_ct_zone_dflt;
+ -
+ -#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ -#include <net/netfilter/nf_conntrack_extend.h>
+ -
+ -static inline const struct nf_conntrack_zone *
+ -nf_ct_zone(const struct nf_conn *ct)
+ +static inline u16 nf_ct_zone(const struct nf_conn *ct)
+  {
+ -	const struct nf_conntrack_zone *nf_ct_zone = NULL;
+ -
+  #ifdef CONFIG_NF_CONNTRACK_ZONES
+ +	struct nf_conntrack_zone *nf_ct_zone;
+  	nf_ct_zone = nf_ct_ext_find(ct, NF_CT_EXT_ZONE);
+ +	if (nf_ct_zone)
+ +		return nf_ct_zone->id;
+  #endif
+ -	return nf_ct_zone ? nf_ct_zone : &nf_ct_zone_dflt;
+ +	return NF_CT_DEFAULT_ZONE;
+  }
+  
+++<<<<<<< HEAD
+ +#endif /* CONFIG_NF_CONNTRACK || CONFIG_NF_CONNTRACK_MODULE */
+++=======
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone_tmpl(const struct nf_conn *tmpl)
++ {
++ 	return tmpl ? nf_ct_zone(tmpl) : &nf_ct_zone_dflt;
++ }
++ 
++ static inline bool nf_ct_zone_matches_dir(const struct nf_conntrack_zone *zone,
++ 					  enum ip_conntrack_dir dir)
++ {
++ 	return zone->dir & (1 << dir);
++ }
++ 
++ static inline u16 nf_ct_zone_id(const struct nf_conntrack_zone *zone,
++ 				enum ip_conntrack_dir dir)
++ {
++ 	return nf_ct_zone_matches_dir(zone, dir) ?
++ 	       zone->id : NF_CT_DEFAULT_ZONE_ID;
++ }
++ 
++ static inline bool nf_ct_zone_equal(const struct nf_conn *a,
++ 				    const struct nf_conntrack_zone *b,
++ 				    enum ip_conntrack_dir dir)
++ {
++ 	return nf_ct_zone_id(nf_ct_zone(a), dir) ==
++ 	       nf_ct_zone_id(b, dir);
++ }
++ 
++ static inline bool nf_ct_zone_equal_any(const struct nf_conn *a,
++ 					const struct nf_conntrack_zone *b)
++ {
++ 	return nf_ct_zone(a)->id == b->id;
++ }
++ #endif /* IS_ENABLED(CONFIG_NF_CONNTRACK) */
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  #endif /* _NF_CONNTRACK_ZONES_H */
+diff --cc net/ipv4/netfilter/nf_defrag_ipv4.c
+index 98fb69342b21,9306ec4fab41..000000000000
+--- a/net/ipv4/netfilter/nf_defrag_ipv4.c
++++ b/net/ipv4/netfilter/nf_defrag_ipv4.c
+@@@ -43,22 -43,22 +43,36 @@@ static int nf_ct_ipv4_gather_frags(stru
+  static enum ip_defrag_users nf_ct_defrag_user(unsigned int hooknum,
+  					      struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	u16 zone = NF_CT_DEFAULT_ZONE;
+++=======
++ 	u16 zone_id = NF_CT_DEFAULT_ZONE_ID;
++ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
++ 	if (skb->nfct) {
++ 		enum ip_conntrack_info ctinfo;
++ 		const struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++ 
++ 		zone_id = nf_ct_zone_id(nf_ct_zone(ct), CTINFO2DIR(ctinfo));
++ 	}
++ #endif
++ 	if (nf_bridge_in_prerouting(skb))
++ 		return IP_DEFRAG_CONNTRACK_BRIDGE_IN + zone_id;
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+ +
+ +#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ +	if (skb->nfct)
+ +		zone = nf_ct_zone((struct nf_conn *)skb->nfct);
+ +#endif
+  
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & BRNF_NF_BRIDGE_PREROUTING)
+ +		return IP_DEFRAG_CONNTRACK_BRIDGE_IN + zone;
+ +#endif
+  	if (hooknum == NF_INET_PRE_ROUTING)
+ -		return IP_DEFRAG_CONNTRACK_IN + zone_id;
+ +		return IP_DEFRAG_CONNTRACK_IN + zone;
+  	else
+ -		return IP_DEFRAG_CONNTRACK_OUT + zone_id;
+ +		return IP_DEFRAG_CONNTRACK_OUT + zone;
+  }
+  
+  static unsigned int ipv4_conntrack_defrag(const struct nf_hook_ops *ops,
+diff --cc net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+index 1218e80349e4,6d9c0b3d5b8c..000000000000
+--- a/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
++++ b/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+@@@ -33,23 -33,22 +33,32 @@@
+  static enum ip6_defrag_users nf_ct6_defrag_user(unsigned int hooknum,
+  						struct sk_buff *skb)
+  {
+ -	u16 zone_id = NF_CT_DEFAULT_ZONE_ID;
+ +	u16 zone = NF_CT_DEFAULT_ZONE;
+ +
+  #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+++<<<<<<< HEAD
+ +	if (skb->nfct)
+ +		zone = nf_ct_zone((struct nf_conn *)skb->nfct);
+++=======
++ 	if (skb->nfct) {
++ 		enum ip_conntrack_info ctinfo;
++ 		const struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++ 
++ 		zone_id = nf_ct_zone_id(nf_ct_zone(ct), CTINFO2DIR(ctinfo));
++ 	}
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  #endif
+ -	if (nf_bridge_in_prerouting(skb))
+ -		return IP6_DEFRAG_CONNTRACK_BRIDGE_IN + zone_id;
+  
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & BRNF_NF_BRIDGE_PREROUTING)
+ +		return IP6_DEFRAG_CONNTRACK_BRIDGE_IN + zone;
+ +#endif
+  	if (hooknum == NF_INET_PRE_ROUTING)
+ -		return IP6_DEFRAG_CONNTRACK_IN + zone_id;
+ +		return IP6_DEFRAG_CONNTRACK_IN + zone;
+  	else
+ -		return IP6_DEFRAG_CONNTRACK_OUT + zone_id;
+ +		return IP6_DEFRAG_CONNTRACK_OUT + zone;
+ +
+  }
+  
+  static unsigned int ipv6_defrag(const struct nf_hook_ops *ops,
+diff --cc net/netfilter/nf_conntrack_core.c
+index fe40958970b4,acc06222ce6a..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -132,7 -126,7 +132,11 @@@ EXPORT_PER_CPU_SYMBOL(nf_conntrack_untr
+  unsigned int nf_conntrack_hash_rnd __read_mostly;
+  EXPORT_SYMBOL_GPL(nf_conntrack_hash_rnd);
+  
+++<<<<<<< HEAD
+ +static u32 hash_conntrack_raw(const struct nf_conntrack_tuple *tuple, u16 zone)
+++=======
++ static u32 hash_conntrack_raw(const struct nf_conntrack_tuple *tuple)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  {
+  	unsigned int n;
+  
+@@@ -141,7 -135,7 +145,11 @@@
+  	 * three bytes manually.
+  	 */
+  	n = (sizeof(tuple->src) + sizeof(tuple->dst.u3)) / sizeof(u32);
+++<<<<<<< HEAD
+ +	return jhash2((u32 *)tuple, n, zone ^ nf_conntrack_hash_rnd ^
+++=======
++ 	return jhash2((u32 *)tuple, n, nf_conntrack_hash_rnd ^
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  		      (((__force __u16)tuple->dst.u.all << 16) |
+  		      tuple->dst.protonum));
+  }
+@@@ -157,15 -151,15 +165,23 @@@ static u32 hash_bucket(u32 hash, const 
+  }
+  
+  static u_int32_t __hash_conntrack(const struct nf_conntrack_tuple *tuple,
+++<<<<<<< HEAD
+ +				  u16 zone, unsigned int size)
+++=======
++ 				  unsigned int size)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  {
+- 	return __hash_bucket(hash_conntrack_raw(tuple, zone), size);
++ 	return __hash_bucket(hash_conntrack_raw(tuple), size);
+  }
+  
+++<<<<<<< HEAD
+ +static inline u_int32_t hash_conntrack(const struct net *net, u16 zone,
+++=======
++ static inline u_int32_t hash_conntrack(const struct net *net,
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  				       const struct nf_conntrack_tuple *tuple)
+  {
+- 	return __hash_conntrack(tuple, zone, net->ct.htable_size);
++ 	return __hash_conntrack(tuple, net->ct.htable_size);
+  }
+  
+  bool
+@@@ -309,10 -305,11 +325,15 @@@ struct nf_conn *nf_ct_tmpl_alloc(struc
+  	if (zone) {
+  		struct nf_conntrack_zone *nf_ct_zone;
+  
+ -		nf_ct_zone = nf_ct_ext_add(tmpl, NF_CT_EXT_ZONE, GFP_ATOMIC);
+ +		nf_ct_zone = nf_ct_ext_add(tmpl, NF_CT_EXT_ZONE, flags);
+  		if (!nf_ct_zone)
+  			goto out_free;
+++<<<<<<< HEAD
+ +		nf_ct_zone->id = zone;
+++=======
++ 		nf_ct_zone->id = zone->id;
++ 		nf_ct_zone->dir = zone->dir;
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  	}
+  #endif
+  	atomic_set(&tmpl->ct_general.use, 0);
+@@@ -476,8 -442,8 +497,13 @@@ nf_ct_key_equal(struct nf_conntrack_tup
+  	 * so we need to check that the conntrack is confirmed
+  	 */
+  	return nf_ct_tuple_equal(tuple, &h->tuple) &&
+++<<<<<<< HEAD
+ +		nf_ct_zone(ct) == zone &&
+ +		nf_ct_is_confirmed(ct);
+++=======
++ 	       nf_ct_zone_equal(ct, zone, NF_CT_DIRECTION(h)) &&
++ 	       nf_ct_is_confirmed(ct);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  }
+  
+  /*
+@@@ -603,12 -560,14 +629,22 @@@ nf_conntrack_hash_check_insert(struct n
+  	hlist_nulls_for_each_entry(h, n, &net->ct.hash[hash], hnnode)
+  		if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+  				      &h->tuple) &&
+++<<<<<<< HEAD
+ +		    zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+++=======
++ 		    nf_ct_zone_equal(nf_ct_tuplehash_to_ctrack(h), zone,
++ 				     NF_CT_DIRECTION(h)))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			goto out;
+  	hlist_nulls_for_each_entry(h, n, &net->ct.hash[reply_hash], hnnode)
+  		if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+  				      &h->tuple) &&
+++<<<<<<< HEAD
+ +		    zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+++=======
++ 		    nf_ct_zone_equal(nf_ct_tuplehash_to_ctrack(h), zone,
++ 				     NF_CT_DIRECTION(h)))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			goto out;
+  
+  	add_timer(&ct->timeout);
+@@@ -695,16 -653,16 +731,26 @@@ __nf_conntrack_confirm(struct sk_buff *
+  	hlist_nulls_for_each_entry(h, n, &net->ct.hash[hash], hnnode)
+  		if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+  				      &h->tuple) &&
+++<<<<<<< HEAD
+ +		    zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+++=======
++ 		    nf_ct_zone_equal(nf_ct_tuplehash_to_ctrack(h), zone,
++ 				     NF_CT_DIRECTION(h)))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			goto out;
+  	hlist_nulls_for_each_entry(h, n, &net->ct.hash[reply_hash], hnnode)
+  		if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+  				      &h->tuple) &&
+++<<<<<<< HEAD
+ +		    zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+++=======
++ 		    nf_ct_zone_equal(nf_ct_tuplehash_to_ctrack(h), zone,
++ 				     NF_CT_DIRECTION(h)))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			goto out;
+  
+ +	nf_ct_del_from_dying_or_unconfirmed_list(ct);
+ +
+  	/* Timer relative to confirmation time, not original
+  	   setting time, otherwise we'd get timer wrap in
+  	   weird delay cases. */
+@@@ -757,8 -716,11 +803,15 @@@ nf_conntrack_tuple_taken(const struct n
+  	struct nf_conntrack_tuple_hash *h;
+  	struct hlist_nulls_node *n;
+  	struct nf_conn *ct;
+++<<<<<<< HEAD
+ +	u16 zone = nf_ct_zone(ignored_conntrack);
+ +	unsigned int hash = hash_conntrack(net, zone, tuple);
+++=======
++ 	unsigned int hash;
++ 
++ 	zone = nf_ct_zone(ignored_conntrack);
++ 	hash = hash_conntrack(net, tuple);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  
+  	/* Disable BHs the entire time since we need to disable them at
+  	 * least once for the stats anyway.
+@@@ -768,7 -730,7 +821,11 @@@
+  		ct = nf_ct_tuplehash_to_ctrack(h);
+  		if (ct != ignored_conntrack &&
+  		    nf_ct_tuple_equal(tuple, &h->tuple) &&
+++<<<<<<< HEAD
+ +		    nf_ct_zone(ct) == zone) {
+++=======
++ 		    nf_ct_zone_equal(ct, zone, NF_CT_DIRECTION(h))) {
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			NF_CT_STAT_INC(net, found);
+  			rcu_read_unlock_bh();
+  			return 1;
+@@@ -914,7 -874,8 +971,12 @@@ __nf_conntrack_alloc(struct net *net, u
+  		nf_ct_zone = nf_ct_ext_add(ct, NF_CT_EXT_ZONE, GFP_ATOMIC);
+  		if (!nf_ct_zone)
+  			goto out_free;
+++<<<<<<< HEAD
+ +		nf_ct_zone->id = zone;
+++=======
++ 		nf_ct_zone->id = zone->id;
++ 		nf_ct_zone->dir = zone->dir;
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  	}
+  #endif
+  	/* Because we use RCU lookups, we set ct_general.use to zero before
+@@@ -1090,7 -1053,8 +1152,12 @@@ resolve_normal_ct(struct net *net, stru
+  	}
+  
+  	/* look for tuple match */
+++<<<<<<< HEAD
+ +	hash = hash_conntrack_raw(&tuple, zone);
+++=======
++ 	zone = nf_ct_zone_tmpl(tmpl);
++ 	hash = hash_conntrack_raw(&tuple);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  	h = __nf_conntrack_find_get(net, zone, &tuple, hash);
+  	if (!h) {
+  		h = init_conntrack(net, tmpl, &tuple, l3proto, l4proto,
+@@@ -1336,6 -1304,13 +1403,16 @@@ bool __nf_ct_kill_acct(struct nf_conn *
+  }
+  EXPORT_SYMBOL_GPL(__nf_ct_kill_acct);
+  
+++<<<<<<< HEAD
+++=======
++ /* Built-in default zone used e.g. by modules. */
++ const struct nf_conntrack_zone nf_ct_zone_dflt = {
++ 	.id	= NF_CT_DEFAULT_ZONE_ID,
++ 	.dir	= NF_CT_DEFAULT_ZONE_DIR,
++ };
++ EXPORT_SYMBOL_GPL(nf_ct_zone_dflt);
++ 
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  #ifdef CONFIG_NF_CONNTRACK_ZONES
+  static struct nf_ct_ext_type nf_ct_zone_extend __read_mostly = {
+  	.len	= sizeof(struct nf_conntrack_zone),
+diff --cc net/netfilter/nf_conntrack_expect.c
+index c45186f91cc8,acf5c7b3f378..000000000000
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@@ -99,7 -101,7 +99,11 @@@ __nf_ct_expect_find(struct net *net, u1
+  	h = nf_ct_expect_dst_hash(tuple);
+  	hlist_for_each_entry_rcu(i, &net->ct.expect_hash[h], hnode) {
+  		if (nf_ct_tuple_mask_cmp(tuple, &i->tuple, &i->mask) &&
+++<<<<<<< HEAD
+ +		    nf_ct_zone(i->master) == zone)
+++=======
++ 		    nf_ct_zone_equal_any(i->master, zone))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			return i;
+  	}
+  	return NULL;
+@@@ -139,7 -143,7 +143,11 @@@ nf_ct_find_expectation(struct net *net
+  	hlist_for_each_entry(i, &net->ct.expect_hash[h], hnode) {
+  		if (!(i->flags & NF_CT_EXPECT_INACTIVE) &&
+  		    nf_ct_tuple_mask_cmp(tuple, &i->tuple, &i->mask) &&
+++<<<<<<< HEAD
+ +		    nf_ct_zone(i->master) == zone) {
+++=======
++ 		    nf_ct_zone_equal_any(i->master, zone)) {
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			exp = i;
+  			break;
+  		}
+@@@ -219,16 -223,16 +227,26 @@@ static inline int expect_clash(const st
+  	}
+  
+  	return nf_ct_tuple_mask_cmp(&a->tuple, &b->tuple, &intersect_mask) &&
+++<<<<<<< HEAD
+ +	       nf_ct_zone(a->master) == nf_ct_zone(b->master);
+++=======
++ 	       nf_ct_zone_equal_any(a->master, nf_ct_zone(b->master));
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  }
+  
+  static inline int expect_matches(const struct nf_conntrack_expect *a,
+  				 const struct nf_conntrack_expect *b)
+  {
+  	return a->master == b->master && a->class == b->class &&
+++<<<<<<< HEAD
+ +		nf_ct_tuple_equal(&a->tuple, &b->tuple) &&
+ +		nf_ct_tuple_mask_equal(&a->mask, &b->mask) &&
+ +		nf_ct_zone(a->master) == nf_ct_zone(b->master);
+++=======
++ 	       nf_ct_tuple_equal(&a->tuple, &b->tuple) &&
++ 	       nf_ct_tuple_mask_equal(&a->mask, &b->mask) &&
++ 	       nf_ct_zone_equal_any(a->master, nf_ct_zone(b->master));
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  }
+  
+  /* Generally a bad idea to call this: could have matched already. */
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 533cbca24fd6,4eaf925bead4..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -480,10 -505,13 +499,18 @@@ ctnetlink_fill_info(struct sk_buff *skb
+  		goto nla_put_failure;
+  	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+  		goto nla_put_failure;
++ 	if (ctnetlink_dump_zone_id(skb, CTA_TUPLE_ZONE, zone,
++ 				   NF_CT_ZONE_DIR_REPL) < 0)
++ 		goto nla_put_failure;
+  	nla_nest_end(skb, nest_parms);
+  
+++<<<<<<< HEAD
+ +	if (nf_ct_zone(ct) &&
+ +	    nla_put_be16(skb, CTA_ZONE, htons(nf_ct_zone(ct))))
+++=======
++ 	if (ctnetlink_dump_zone_id(skb, CTA_ZONE, zone,
++ 				   NF_CT_DEFAULT_ZONE_DIR) < 0)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  		goto nla_put_failure;
+  
+  	if (ctnetlink_dump_status(skb, ct) < 0 ||
+@@@ -663,10 -696,13 +695,18 @@@ ctnetlink_conntrack_event(unsigned int 
+  		goto nla_put_failure;
+  	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+  		goto nla_put_failure;
++ 	if (ctnetlink_dump_zone_id(skb, CTA_TUPLE_ZONE, zone,
++ 				   NF_CT_ZONE_DIR_REPL) < 0)
++ 		goto nla_put_failure;
+  	nla_nest_end(skb, nest_parms);
+  
+++<<<<<<< HEAD
+ +	if (nf_ct_zone(ct) &&
+ +	    nla_put_be16(skb, CTA_ZONE, htons(nf_ct_zone(ct))))
+++=======
++ 	if (ctnetlink_dump_zone_id(skb, CTA_ZONE, zone,
++ 				   NF_CT_DEFAULT_ZONE_DIR) < 0)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  		goto nla_put_failure;
+  
+  	if (ctnetlink_dump_id(skb, ct) < 0)
+@@@ -937,21 -1046,6 +1027,24 @@@ ctnetlink_parse_tuple(const struct nlat
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +ctnetlink_parse_zone(const struct nlattr *attr, u16 *zone)
+ +{
+ +	if (attr)
+ +#ifdef CONFIG_NF_CONNTRACK_ZONES
+ +		*zone = ntohs(nla_get_be16(attr));
+ +#else
+ +		return -EOPNOTSUPP;
+ +#endif
+ +	else
+ +		*zone = 0;
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  static const struct nla_policy help_nla_policy[CTA_HELP_MAX+1] = {
+  	[CTA_HELP_NAME]		= { .type = NLA_NUL_STRING,
+  				    .len = NF_CT_HELPER_NAME_LEN - 1 },
+@@@ -1020,15 -1133,15 +1113,17 @@@ ctnetlink_del_conntrack(struct sock *ct
+  		return err;
+  
+  	if (cda[CTA_TUPLE_ORIG])
+- 		err = ctnetlink_parse_tuple(cda, &tuple, CTA_TUPLE_ORIG, u3);
++ 		err = ctnetlink_parse_tuple(cda, &tuple, CTA_TUPLE_ORIG,
++ 					    u3, &zone);
+  	else if (cda[CTA_TUPLE_REPLY])
+- 		err = ctnetlink_parse_tuple(cda, &tuple, CTA_TUPLE_REPLY, u3);
++ 		err = ctnetlink_parse_tuple(cda, &tuple, CTA_TUPLE_REPLY,
++ 					    u3, &zone);
+  	else {
+ -		return ctnetlink_flush_conntrack(net, cda,
+ -						 NETLINK_CB(skb).portid,
+ -						 nlmsg_report(nlh));
+ +		/* Flush the whole table */
+ +		nf_conntrack_flush_report(net,
+ +					 NETLINK_CB(skb).portid,
+ +					 nlmsg_report(nlh));
+ +		return 0;
+  	}
+  
+  	if (err < 0)
+@@@ -2067,12 -2187,14 +2172,21 @@@ ctnetlink_nfqueue_build(struct sk_buff 
+  		goto nla_put_failure;
+  	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+  		goto nla_put_failure;
++ 	if (ctnetlink_dump_zone_id(skb, CTA_TUPLE_ZONE, zone,
++ 				   NF_CT_ZONE_DIR_REPL) < 0)
++ 		goto nla_put_failure;
+  	nla_nest_end(skb, nest_parms);
+  
+++<<<<<<< HEAD
+ +	if (nf_ct_zone(ct)) {
+ +		if (nla_put_be16(skb, CTA_ZONE, htons(nf_ct_zone(ct))))
+ +			goto nla_put_failure;
+ +	}
+++=======
++ 	if (ctnetlink_dump_zone_id(skb, CTA_ZONE, zone,
++ 				   NF_CT_DEFAULT_ZONE_DIR) < 0)
++ 		goto nla_put_failure;
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  
+  	if (ctnetlink_dump_id(skb, ct) < 0)
+  		goto nla_put_failure;
+diff --cc net/netfilter/nf_conntrack_standalone.c
+index f641751dba9d,1fb3cacc04e1..000000000000
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@@ -127,17 -128,44 +127,50 @@@ static int ct_show_secctx(struct seq_fi
+  
+  	ret = security_secid_to_secctx(ct->secmark, &secctx, &len);
+  	if (ret)
+ -		return;
+ +		return 0;
+  
+ -	seq_printf(s, "secctx=%s ", secctx);
+ +	ret = seq_printf(s, "secctx=%s ", secctx);
+  
+  	security_release_secctx(secctx, len);
+ +	return ret;
+  }
+  #else
+++<<<<<<< HEAD
+ +static inline int ct_show_secctx(struct seq_file *s, const struct nf_conn *ct)
+++=======
++ static inline void ct_show_secctx(struct seq_file *s, const struct nf_conn *ct)
++ {
++ }
++ #endif
++ 
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ static void ct_show_zone(struct seq_file *s, const struct nf_conn *ct,
++ 			 int dir)
++ {
++ 	const struct nf_conntrack_zone *zone = nf_ct_zone(ct);
++ 
++ 	if (zone->dir != dir)
++ 		return;
++ 	switch (zone->dir) {
++ 	case NF_CT_DEFAULT_ZONE_DIR:
++ 		seq_printf(s, "zone=%u ", zone->id);
++ 		break;
++ 	case NF_CT_ZONE_DIR_ORIG:
++ 		seq_printf(s, "zone-orig=%u ", zone->id);
++ 		break;
++ 	case NF_CT_ZONE_DIR_REPL:
++ 		seq_printf(s, "zone-reply=%u ", zone->id);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ }
++ #else
++ static inline void ct_show_zone(struct seq_file *s, const struct nf_conn *ct,
++ 				int dir)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  {
+ +	return 0;
+  }
+  #endif
+  
+@@@ -192,55 -219,54 +225,72 @@@ static int ct_seq_show(struct seq_file 
+  	NF_CT_ASSERT(l4proto);
+  
+  	ret = -ENOSPC;
+ -	seq_printf(s, "%-8s %u %-8s %u %ld ",
+ -		   l3proto->name, nf_ct_l3num(ct),
+ -		   l4proto->name, nf_ct_protonum(ct),
+ -		   timer_pending(&ct->timeout)
+ -		   ? (long)(ct->timeout.expires - jiffies)/HZ : 0);
+ +	if (seq_printf(s, "%-8s %u %-8s %u %ld ",
+ +		       l3proto->name, nf_ct_l3num(ct),
+ +		       l4proto->name, nf_ct_protonum(ct),
+ +		       timer_pending(&ct->timeout)
+ +		       ? (long)(ct->timeout.expires - jiffies)/HZ : 0) != 0)
+ +		goto release;
+  
+ -	if (l4proto->print_conntrack)
+ -		l4proto->print_conntrack(s, ct);
+ +	if (l4proto->print_conntrack && l4proto->print_conntrack(s, ct))
+ +		goto release;
+  
+++<<<<<<< HEAD
+ +	if (print_tuple(s, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+ +			l3proto, l4proto))
+++=======
++ 	print_tuple(s, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
++ 		    l3proto, l4proto);
++ 
++ 	ct_show_zone(s, ct, NF_CT_ZONE_DIR_ORIG);
++ 
++ 	if (seq_has_overflowed(s))
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  		goto release;
+  
+  	if (seq_print_acct(s, ct, IP_CT_DIR_ORIGINAL))
+  		goto release;
+  
+  	if (!(test_bit(IPS_SEEN_REPLY_BIT, &ct->status)))
+ -		seq_printf(s, "[UNREPLIED] ");
+ +		if (seq_printf(s, "[UNREPLIED] "))
+ +			goto release;
+  
+ -	print_tuple(s, &ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+ -		    l3proto, l4proto);
+ +	if (print_tuple(s, &ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+ +			l3proto, l4proto))
+ +		goto release;
+  
++ 	ct_show_zone(s, ct, NF_CT_ZONE_DIR_REPL);
++ 
+  	if (seq_print_acct(s, ct, IP_CT_DIR_REPLY))
+  		goto release;
+  
+  	if (test_bit(IPS_ASSURED_BIT, &ct->status))
+ -		seq_printf(s, "[ASSURED] ");
+ -
+ -	if (seq_has_overflowed(s))
+ -		goto release;
+ +		if (seq_printf(s, "[ASSURED] "))
+ +			goto release;
+  
+  #if defined(CONFIG_NF_CONNTRACK_MARK)
+ -	seq_printf(s, "mark=%u ", ct->mark);
+ +	if (seq_printf(s, "mark=%u ", ct->mark))
+ +		goto release;
+  #endif
+  
+++<<<<<<< HEAD
+ +	if (ct_show_secctx(s, ct))
+ +		goto release;
+++=======
++ 	ct_show_secctx(s, ct);
++ 	ct_show_zone(s, ct, NF_CT_DEFAULT_ZONE_DIR);
++ 	ct_show_delta_time(s, ct);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+ +
+ +#ifdef CONFIG_NF_CONNTRACK_ZONES
+ +	if (seq_printf(s, "zone=%u ", nf_ct_zone(ct)))
+ +		goto release;
+ +#endif
+  
+ -	seq_printf(s, "use=%u\n", atomic_read(&ct->ct_general.use));
+ +	if (ct_show_delta_time(s, ct))
+ +		goto release;
+  
+ -	if (seq_has_overflowed(s))
+ +	if (seq_printf(s, "use=%u\n", atomic_read(&ct->ct_general.use)))
+  		goto release;
+  
+  	ret = 0;
+diff --cc net/netfilter/nf_nat_core.c
+index a49907b1dabc,5113dfd39df9..000000000000
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@@ -118,15 -118,15 +118,25 @@@ EXPORT_SYMBOL(nf_xfrm_me_harder)
+  
+  /* We keep an extra hash for each conntrack, for fast searching. */
+  static inline unsigned int
+++<<<<<<< HEAD
+ +hash_by_src(const struct net *net, u16 zone,
+ +	    const struct nf_conntrack_tuple *tuple)
+++=======
++ hash_by_src(const struct net *net, const struct nf_conntrack_tuple *tuple)
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  {
+  	unsigned int hash;
+  
+  	/* Original src, to ensure we map it consistently if poss. */
+  	hash = jhash2((u32 *)&tuple->src, sizeof(tuple->src) / sizeof(u32),
+++<<<<<<< HEAD
+ +		      tuple->dst.protonum ^ zone ^ nf_conntrack_hash_rnd);
+ +	return ((u64)hash * net->ct.nat_htable_size) >> 32;
+++=======
++ 		      tuple->dst.protonum ^ nf_conntrack_hash_rnd);
++ 
++ 	return reciprocal_scale(hash, net->ct.nat_htable_size);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  }
+  
+  /* Is this tuple already taken? (not by us) */
+@@@ -197,7 -198,8 +207,12 @@@ find_appropriate_src(struct net *net, u
+  
+  	hlist_for_each_entry_rcu(nat, &net->ct.nat_bysource[h], bysource) {
+  		ct = nat->ct;
+++<<<<<<< HEAD
+ +		if (same_src(ct, tuple) && nf_ct_zone(ct) == zone) {
+++=======
++ 		if (same_src(ct, tuple) &&
++ 		    nf_ct_zone_equal(ct, zone, IP_CT_DIR_ORIGINAL)) {
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  			/* Copy source part from reply tuple. */
+  			nf_ct_invert_tuplepr(result,
+  				       &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+diff --cc net/netfilter/xt_CT.c
+index 888bb8ce55ee,536cb67928ad..000000000000
+--- a/net/netfilter/xt_CT.c
++++ b/net/netfilter/xt_CT.c
+@@@ -201,7 -216,11 +215,15 @@@ static int xt_ct_tg_check(const struct 
+  	if (ret < 0)
+  		goto err1;
+  
+++<<<<<<< HEAD
+ +	ct = nf_ct_tmpl_alloc(par->net, info->zone, GFP_KERNEL);
+++=======
++ 	memset(&zone, 0, sizeof(zone));
++ 	zone.id = info->zone;
++ 	zone.dir = xt_ct_flags_to_dir(info);
++ 
++ 	ct = nf_ct_tmpl_alloc(par->net, &zone, GFP_KERNEL);
+++>>>>>>> deedb59039f1 (netfilter: nf_conntrack: add direction support for zones)
+  	ret = PTR_ERR(ct);
+  	if (IS_ERR(ct))
+  		goto err2;
+* Unmerged path net/sched/act_connmark.c
+* Unmerged path include/net/netfilter/nf_conntrack_zones.h
+diff --git a/include/uapi/linux/netfilter/nfnetlink_conntrack.h b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+index acad6c52a652..c1a4e1441a25 100644
+--- a/include/uapi/linux/netfilter/nfnetlink_conntrack.h
++++ b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+@@ -61,6 +61,7 @@ enum ctattr_tuple {
+ 	CTA_TUPLE_UNSPEC,
+ 	CTA_TUPLE_IP,
+ 	CTA_TUPLE_PROTO,
++	CTA_TUPLE_ZONE,
+ 	__CTA_TUPLE_MAX
+ };
+ #define CTA_TUPLE_MAX (__CTA_TUPLE_MAX - 1)
+diff --git a/include/uapi/linux/netfilter/xt_CT.h b/include/uapi/linux/netfilter/xt_CT.h
+index 5a688c1ca4d7..452005ff0e9e 100644
+--- a/include/uapi/linux/netfilter/xt_CT.h
++++ b/include/uapi/linux/netfilter/xt_CT.h
+@@ -6,7 +6,11 @@
+ enum {
+ 	XT_CT_NOTRACK		= 1 << 0,
+ 	XT_CT_NOTRACK_ALIAS	= 1 << 1,
+-	XT_CT_MASK		= XT_CT_NOTRACK | XT_CT_NOTRACK_ALIAS,
++	XT_CT_ZONE_DIR_ORIG	= 1 << 2,
++	XT_CT_ZONE_DIR_REPL	= 1 << 3,
++
++	XT_CT_MASK		= XT_CT_NOTRACK | XT_CT_NOTRACK_ALIAS |
++				  XT_CT_ZONE_DIR_ORIG | XT_CT_ZONE_DIR_REPL,
+ };
+ 
+ struct xt_ct_target_info {
+* Unmerged path net/ipv4/netfilter/nf_defrag_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_expect.c
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+* Unmerged path net/netfilter/nf_conntrack_standalone.c
+* Unmerged path net/netfilter/nf_nat_core.c
+* Unmerged path net/netfilter/xt_CT.c
+* Unmerged path net/sched/act_connmark.c
