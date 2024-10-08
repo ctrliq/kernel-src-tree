@@ -1,0 +1,263 @@
+powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free() (David Gibson) [1213665]
+Rebuild_FUZZ: 94.52%
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit decbda25728ddfbb28b77749d2545028e892ca99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/decbda25.failed
+
+The pnv_pci_ioda_tce_invalidate() helper invalidates TCE cache. It is
+supposed to be called on IODA1/2 and not called on p5ioc2. It receives
+start and end host addresses of TCE table.
+
+IODA2 actually needs PCI addresses to invalidate the cache. Those
+can be calculated from host addresses but since we are going
+to implement multi-level TCE tables, calculating PCI address from
+a host address might get either tricky or ugly as TCE table remains flat
+on PCI bus but not in RAM.
+
+This moves pnv_pci_ioda_tce_invalidate() from generic pnv_tce_build/
+pnt_tce_free and defines IODA1/2-specific callbacks which call generic
+ones and do PHB-model-specific TCE cache invalidation. P5IOC2 keeps
+using generic callbacks as before.
+
+This changes pnv_pci_ioda2_tce_invalidate() to receives TCE index and
+number of pages which are PCI addresses shifted by IOMMU page shift.
+
+No change in behaviour is expected.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit decbda25728ddfbb28b77749d2545028e892ca99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+#	arch/powerpc/platforms/powernv/pci.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index 109e90d84e34,f710729a4a35..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -589,13 -1680,18 +589,23 @@@ static void pnv_ioda_setup_bus_dma(stru
+  }
+  
+  static void pnv_pci_ioda1_tce_invalidate(struct iommu_table *tbl,
+++<<<<<<< HEAD
+ +					 __be64 *startp, __be64 *endp)
+ +{
+ +	__be64 __iomem *invalidate = (__be64 __iomem *)tbl->it_index;
+++=======
++ 		unsigned long index, unsigned long npages, bool rm)
++ {
++ 	struct pnv_ioda_pe *pe = tbl->data;
++ 	__be64 __iomem *invalidate = rm ?
++ 		(__be64 __iomem *)pe->tce_inval_reg_phys :
++ 		(__be64 __iomem *)tbl->it_index;
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  	unsigned long start, end, inc;
+ -	const unsigned shift = tbl->it_page_shift;
+  
+- 	start = __pa(startp);
+- 	end = __pa(endp);
++ 	start = __pa(((__be64 *)tbl->it_base) + index - tbl->it_offset);
++ 	end = __pa(((__be64 *)tbl->it_base) + index - tbl->it_offset +
++ 			npages - 1);
+  
+  	/* BML uses this case for p6/p7/galaxy2: Shift addr and put in node */
+  	if (tbl->it_busno) {
+@@@ -628,24 -1727,54 +638,65 @@@
+  	 */
+  }
+  
+++<<<<<<< HEAD
+ +static void pnv_pci_ioda2_tce_invalidate(struct pnv_ioda_pe *pe,
+ +					 struct iommu_table *tbl,
+ +					 __be64 *startp, __be64 *endp)
+++=======
++ static int pnv_ioda1_tce_build(struct iommu_table *tbl, long index,
++ 		long npages, unsigned long uaddr,
++ 		enum dma_data_direction direction,
++ 		struct dma_attrs *attrs)
++ {
++ 	int ret = pnv_tce_build(tbl, index, npages, uaddr, direction,
++ 			attrs);
++ 
++ 	if (!ret && (tbl->it_type & TCE_PCI_SWINV_CREATE))
++ 		pnv_pci_ioda1_tce_invalidate(tbl, index, npages, false);
++ 
++ 	return ret;
++ }
++ 
++ static void pnv_ioda1_tce_free(struct iommu_table *tbl, long index,
++ 		long npages)
++ {
++ 	pnv_tce_free(tbl, index, npages);
++ 
++ 	if (tbl->it_type & TCE_PCI_SWINV_FREE)
++ 		pnv_pci_ioda1_tce_invalidate(tbl, index, npages, false);
++ }
++ 
++ static struct iommu_table_ops pnv_ioda1_iommu_ops = {
++ 	.set = pnv_ioda1_tce_build,
++ 	.clear = pnv_ioda1_tce_free,
++ 	.get = pnv_tce_get,
++ };
++ 
++ static void pnv_pci_ioda2_tce_invalidate(struct iommu_table *tbl,
++ 		unsigned long index, unsigned long npages, bool rm)
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  {
++ 	struct pnv_ioda_pe *pe = tbl->data;
+  	unsigned long start, end, inc;
+ -	__be64 __iomem *invalidate = rm ?
+ -		(__be64 __iomem *)pe->tce_inval_reg_phys :
+ -		(__be64 __iomem *)tbl->it_index;
+ -	const unsigned shift = tbl->it_page_shift;
+ +	__be64 __iomem *invalidate = (__be64 __iomem *)tbl->it_index;
+  
+  	/* We'll invalidate DMA address in PE scope */
+ -	start = 0x2ull << 60;
+ +	start = 0x2ul << 60;
+  	start |= (pe->pe_number & 0xFF);
+  	end = start;
+  
+  	/* Figure out the start, end and step */
+++<<<<<<< HEAD
+ +	inc = tbl->it_offset + (((u64)startp - tbl->it_base) / sizeof(u64));
+ +	start |= (inc << 12);
+ +	inc = tbl->it_offset + (((u64)endp - tbl->it_base) / sizeof(u64));
+ +	end |= (inc << 12);
+ +	inc = (0x1ul << 12);
+++=======
++ 	start |= (index << shift);
++ 	end |= ((index + npages - 1) << shift);
++ 	inc = (0x1ull << shift);
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  	mb();
+  
+  	while (start <= end) {
+@@@ -654,19 -1786,35 +705,51 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +void pnv_pci_ioda_tce_invalidate(struct iommu_table *tbl,
+ +				 __be64 *startp, __be64 *endp)
+ +{
+ +	struct pnv_ioda_pe *pe = container_of(tbl, struct pnv_ioda_pe,
+ +					      tce32_table);
+ +	struct pnv_phb *phb = pe->phb;
+ +
+ +	if (phb->type == PNV_PHB_IODA1)
+ +		pnv_pci_ioda1_tce_invalidate(tbl, startp, endp);
+ +	else
+ +		pnv_pci_ioda2_tce_invalidate(pe, tbl, startp, endp);
+ +}
+ +
+++=======
++ static int pnv_ioda2_tce_build(struct iommu_table *tbl, long index,
++ 		long npages, unsigned long uaddr,
++ 		enum dma_data_direction direction,
++ 		struct dma_attrs *attrs)
++ {
++ 	int ret = pnv_tce_build(tbl, index, npages, uaddr, direction,
++ 			attrs);
++ 
++ 	if (!ret && (tbl->it_type & TCE_PCI_SWINV_CREATE))
++ 		pnv_pci_ioda2_tce_invalidate(tbl, index, npages, false);
++ 
++ 	return ret;
++ }
++ 
++ static void pnv_ioda2_tce_free(struct iommu_table *tbl, long index,
++ 		long npages)
++ {
++ 	pnv_tce_free(tbl, index, npages);
++ 
++ 	if (tbl->it_type & TCE_PCI_SWINV_FREE)
++ 		pnv_pci_ioda2_tce_invalidate(tbl, index, npages, false);
++ }
++ 
++ static struct iommu_table_ops pnv_ioda2_iommu_ops = {
++ 	.set = pnv_ioda2_tce_build,
++ 	.clear = pnv_ioda2_tce_free,
++ 	.get = pnv_tce_get,
++ };
++ 
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  static void pnv_pci_ioda_setup_dma_pe(struct pnv_phb *phb,
+  				      struct pnv_ioda_pe *pe, unsigned int base,
+  				      unsigned int segs)
+diff --cc arch/powerpc/platforms/powernv/pci.c
+index 17649771621c,f72fc6e7d63d..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@@ -599,45 -572,36 +599,51 @@@ struct pci_ops pnv_pci_ops = 
+  	.write = pnv_pci_write_config,
+  };
+  
+ -int pnv_tce_build(struct iommu_table *tbl, long index, long npages,
+ -		unsigned long uaddr, enum dma_data_direction direction,
+ -		struct dma_attrs *attrs)
+ +static int pnv_tce_build(struct iommu_table *tbl, long index, long npages,
+ +			 unsigned long uaddr, enum dma_data_direction direction,
+ +			 struct dma_attrs *attrs)
+  {
+  	u64 proto_tce = iommu_direction_to_tce_perm(direction);
+- 	__be64 *tcep, *tces;
++ 	__be64 *tcep;
+  	u64 rpn;
+  
+- 	tces = tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
++ 	tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
+  	rpn = __pa(uaddr) >> tbl->it_page_shift;
+  
+  	while (npages--)
+  		*(tcep++) = cpu_to_be64(proto_tce |
+  				(rpn++ << tbl->it_page_shift));
+  
+++<<<<<<< HEAD
+ +	/* Some implementations won't cache invalid TCEs and thus may not
+ +	 * need that flush. We'll probably turn it_type into a bit mask
+ +	 * of flags if that becomes the case
+ +	 */
+ +	if (tbl->it_type & TCE_PCI_SWINV_CREATE)
+ +		pnv_pci_ioda_tce_invalidate(tbl, tces, tcep - 1);
+++=======
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  
+  	return 0;
+  }
+  
+ -void pnv_tce_free(struct iommu_table *tbl, long index, long npages)
+ +static void pnv_tce_free(struct iommu_table *tbl, long index, long npages)
+  {
+- 	__be64 *tcep, *tces;
++ 	__be64 *tcep;
+  
+- 	tces = tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
++ 	tcep = ((__be64 *)tbl->it_base) + index - tbl->it_offset;
+  
+  	while (npages--)
+  		*(tcep++) = cpu_to_be64(0);
+++<<<<<<< HEAD
+ +
+ +	if (tbl->it_type & TCE_PCI_SWINV_FREE)
+ +		pnv_pci_ioda_tce_invalidate(tbl, tces, tcep - 1);
+++=======
+++>>>>>>> decbda25728d (powerpc/powernv/ioda/ioda2: Rework TCE invalidation in tce_build()/tce_free())
+  }
+  
+ -unsigned long pnv_tce_get(struct iommu_table *tbl, long index)
+ +static unsigned long pnv_tce_get(struct iommu_table *tbl, long index)
+  {
+  	return ((u64 *)tbl->it_base)[index - tbl->it_offset];
+  }
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+* Unmerged path arch/powerpc/platforms/powernv/pci.c
