@@ -1,0 +1,339 @@
+mei: add mei_cl_notify_request command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 51678ccb7b12dd428a84d466ff379a5e2d717f1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/51678ccb.failed
+
+Add per client notification request infrastructure
+that allows client to enable or disable async
+event notification.
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 51678ccb7b12dd428a84d466ff379a5e2d717f1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/client.h
+#	drivers/misc/mei/hbm.c
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,fae4050413a2..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -997,21 -1633,38 +1138,34 @@@ err
+   */
+  void mei_cl_complete(struct mei_cl *cl, struct mei_cl_cb *cb)
+  {
+ -	struct mei_device *dev = cl->dev;
+ -
+ -	switch (cb->fop_type) {
+ -	case MEI_FOP_WRITE:
+ +	if (cb->fop_type == MEI_FOP_WRITE) {
+  		mei_io_cb_free(cb);
+ +		cb = NULL;
+  		cl->writing_state = MEI_WRITE_COMPLETE;
+ -		if (waitqueue_active(&cl->tx_wait)) {
+ +		if (waitqueue_active(&cl->tx_wait))
+  			wake_up_interruptible(&cl->tx_wait);
+ -		} else {
+ -			pm_runtime_mark_last_busy(dev->dev);
+ -			pm_request_autosuspend(dev->dev);
+ -		}
+ -		break;
+  
+ -	case MEI_FOP_READ:
+ -		list_add_tail(&cb->list, &cl->rd_completed);
+ +	} else if (cb->fop_type == MEI_FOP_READ &&
+ +			MEI_READING == cl->reading_state) {
+ +		cl->reading_state = MEI_READ_COMPLETE;
+  		if (waitqueue_active(&cl->rx_wait))
+ -			wake_up_interruptible_all(&cl->rx_wait);
+ +			wake_up_interruptible(&cl->rx_wait);
+  		else
+  			mei_cl_bus_rx_event(cl);
+ -		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case MEI_FOP_CONNECT:
++ 	case MEI_FOP_DISCONNECT:
++ 	case MEI_FOP_NOTIFY_STOP:
++ 	case MEI_FOP_NOTIFY_START:
++ 		if (waitqueue_active(&cl->wait))
++ 			wake_up(&cl->wait);
++ 
++ 		break;
++ 	default:
++ 		BUG_ON(0);
+++>>>>>>> 51678ccb7b12 (mei: add mei_cl_notify_request command)
+  	}
+  }
+  
+diff --cc drivers/misc/mei/client.h
+index f2a130967f1e,506b7d40d427..000000000000
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@@ -91,7 -219,11 +91,15 @@@ void mei_cl_complete(struct mei_cl *cl
+  
+  void mei_host_client_init(struct work_struct *work);
+  
+- 
+++<<<<<<< HEAD
+++
+++=======
++ u8 mei_cl_notify_fop2req(enum mei_cb_file_ops fop);
++ enum mei_cb_file_ops mei_cl_notify_req2fop(u8 request);
++ int mei_cl_notify_request(struct mei_cl *cl, struct file *file, u8 request);
++ int mei_cl_irq_notify(struct mei_cl *cl, struct mei_cl_cb *cb,
++ 		      struct mei_cl_cb *cmpl_list);
+++>>>>>>> 51678ccb7b12 (mei: add mei_cl_notify_request command)
+  
+  void mei_cl_all_disconnect(struct mei_device *dev);
+  void mei_cl_all_wakeup(struct mei_device *dev);
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,12229ff4bc7e..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -288,6 -312,212 +288,215 @@@ static int mei_hbm_enum_clients_req(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * mei_hbm_me_cl_add - add new me client to the list
++  *
++  * @dev: the device structure
++  * @res: hbm property response
++  *
++  * Return: 0 on success and -ENOMEM on allocation failure
++  */
++ 
++ static int mei_hbm_me_cl_add(struct mei_device *dev,
++ 			     struct hbm_props_response *res)
++ {
++ 	struct mei_me_client *me_cl;
++ 	const uuid_le *uuid = &res->client_properties.protocol_name;
++ 
++ 	mei_me_cl_rm_by_uuid(dev, uuid);
++ 
++ 	me_cl = kzalloc(sizeof(struct mei_me_client), GFP_KERNEL);
++ 	if (!me_cl)
++ 		return -ENOMEM;
++ 
++ 	mei_me_cl_init(me_cl);
++ 
++ 	me_cl->props = res->client_properties;
++ 	me_cl->client_id = res->me_addr;
++ 	me_cl->mei_flow_ctrl_creds = 0;
++ 
++ 	mei_me_cl_add(dev, me_cl);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * mei_hbm_add_cl_resp - send response to fw on client add request
++  *
++  * @dev: the device structure
++  * @addr: me address
++  * @status: response status
++  *
++  * Return: 0 on success and < 0 on failure
++  */
++ static int mei_hbm_add_cl_resp(struct mei_device *dev, u8 addr, u8 status)
++ {
++ 	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
++ 	struct hbm_add_client_response *resp;
++ 	const size_t len = sizeof(struct hbm_add_client_response);
++ 	int ret;
++ 
++ 	dev_dbg(dev->dev, "adding client response\n");
++ 
++ 	resp = (struct hbm_add_client_response *)dev->wr_msg.data;
++ 
++ 	mei_hbm_hdr(mei_hdr, len);
++ 	memset(resp, 0, sizeof(struct hbm_add_client_response));
++ 
++ 	resp->hbm_cmd = MEI_HBM_ADD_CLIENT_RES_CMD;
++ 	resp->me_addr = addr;
++ 	resp->status  = status;
++ 
++ 	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++ 	if (ret)
++ 		dev_err(dev->dev, "add client response write failed: ret = %d\n",
++ 			ret);
++ 	return ret;
++ }
++ 
++ /**
++  * mei_hbm_fw_add_cl_req - request from the fw to add a client
++  *
++  * @dev: the device structure
++  * @req: add client request
++  *
++  * Return: 0 on success and < 0 on failure
++  */
++ static int mei_hbm_fw_add_cl_req(struct mei_device *dev,
++ 			      struct hbm_add_client_request *req)
++ {
++ 	int ret;
++ 	u8 status = MEI_HBMS_SUCCESS;
++ 
++ 	BUILD_BUG_ON(sizeof(struct hbm_add_client_request) !=
++ 			sizeof(struct hbm_props_response));
++ 
++ 	ret = mei_hbm_me_cl_add(dev, (struct hbm_props_response *)req);
++ 	if (ret)
++ 		status = !MEI_HBMS_SUCCESS;
++ 
++ 	return mei_hbm_add_cl_resp(dev, req->me_addr, status);
++ }
++ 
++ /**
++  * mei_hbm_cl_notify_req - send notification request
++  *
++  * @dev: the device structure
++  * @cl: a client to disconnect from
++  * @start: true for start false for stop
++  *
++  * Return: 0 on success and -EIO on write failure
++  */
++ int mei_hbm_cl_notify_req(struct mei_device *dev,
++ 			  struct mei_cl *cl, u8 start)
++ {
++ 
++ 	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
++ 	struct hbm_notification_request *req;
++ 	const size_t len = sizeof(struct hbm_notification_request);
++ 	int ret;
++ 
++ 	mei_hbm_hdr(mei_hdr, len);
++ 	mei_hbm_cl_hdr(cl, MEI_HBM_NOTIFY_REQ_CMD, dev->wr_msg.data, len);
++ 
++ 	req = (struct hbm_notification_request *)dev->wr_msg.data;
++ 	req->start = start;
++ 
++ 	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++ 	if (ret)
++ 		dev_err(dev->dev, "notify request failed: ret = %d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  *  notify_res_to_fop - convert notification response to the proper
++  *      notification FOP
++  *
++  * @cmd: client notification start response command
++  *
++  * Return:  MEI_FOP_NOTIFY_START or MEI_FOP_NOTIFY_STOP;
++  */
++ static inline enum mei_cb_file_ops notify_res_to_fop(struct mei_hbm_cl_cmd *cmd)
++ {
++ 	struct hbm_notification_response *rs =
++ 		(struct hbm_notification_response *)cmd;
++ 
++ 	return mei_cl_notify_req2fop(rs->start);
++ }
++ 
++ /**
++  * mei_hbm_cl_notify_start_res - update the client state according
++  *       notify start response
++  *
++  * @dev: the device structure
++  * @cl: mei host client
++  * @cmd: client notification start response command
++  */
++ static void mei_hbm_cl_notify_start_res(struct mei_device *dev,
++ 					struct mei_cl *cl,
++ 					struct mei_hbm_cl_cmd *cmd)
++ {
++ 	struct hbm_notification_response *rs =
++ 		(struct hbm_notification_response *)cmd;
++ 
++ 	cl_dbg(dev, cl, "hbm: notify start response status=%d\n", rs->status);
++ 
++ 	if (rs->status == MEI_HBMS_SUCCESS ||
++ 	    rs->status == MEI_HBMS_ALREADY_STARTED) {
++ 		cl->notify_en = true;
++ 		cl->status = 0;
++ 	} else {
++ 		cl->status = -EINVAL;
++ 	}
++ }
++ 
++ /**
++  * mei_hbm_cl_notify_stop_res - update the client state according
++  *       notify stop response
++  *
++  * @dev: the device structure
++  * @cl: mei host client
++  * @cmd: client notification stop response command
++  */
++ static void mei_hbm_cl_notify_stop_res(struct mei_device *dev,
++ 				       struct mei_cl *cl,
++ 				       struct mei_hbm_cl_cmd *cmd)
++ {
++ 	struct hbm_notification_response *rs =
++ 		(struct hbm_notification_response *)cmd;
++ 
++ 	cl_dbg(dev, cl, "hbm: notify stop response status=%d\n", rs->status);
++ 
++ 	if (rs->status == MEI_HBMS_SUCCESS ||
++ 	    rs->status == MEI_HBMS_NOT_STARTED) {
++ 		cl->notify_en = false;
++ 		cl->status = 0;
++ 	} else {
++ 		/* TODO: spec is not clear yet about other possible issues */
++ 		cl->status = -EINVAL;
++ 	}
++ }
++ 
++ /**
++  * mei_hbm_cl_notify - signal notification event
++  *
++  * @dev: the device structure
++  * @cmd: notification client message
++  */
++ static void mei_hbm_cl_notify(struct mei_device *dev,
++ 			      struct mei_hbm_cl_cmd *cmd)
++ {
++ 	struct mei_cl *cl;
++ 
++ 	cl = mei_hbm_cl_find_by_cmd(dev, cmd);
++ 	if (cl && cl->notify_en)
++ 		cl->notify_ev = true;
++ }
++ 
+++>>>>>>> 51678ccb7b12 (mei: add mei_cl_notify_request command)
+  /**
+   * mei_hbm_prop_req - request property for a single client
+   *
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/client.h
+* Unmerged path drivers/misc/mei/hbm.c
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index b8d9cfee3e87..d1ad13535182 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -521,6 +521,13 @@ int mei_irq_write_handler(struct mei_device *dev, struct mei_cl_cb *cmpl_list)
+ 			if (ret)
+ 				return ret;
+ 			break;
++
++		case MEI_FOP_NOTIFY_START:
++		case MEI_FOP_NOTIFY_STOP:
++			ret = mei_cl_irq_notify(cl, cb, cmpl_list);
++			if (ret)
++				return ret;
++			break;
+ 		default:
+ 			BUG();
+ 		}
