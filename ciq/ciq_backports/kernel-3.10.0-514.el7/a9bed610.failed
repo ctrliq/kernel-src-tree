@@ -1,0 +1,927 @@
+mei: allow read concurrency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit a9bed61053af13c0768f82c9d1c8793515dd067c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a9bed610.failed
+
+Replace clunky read state machine with read stack
+implemented as per client read list, this is important
+mostly for mei drivers with unsolicited reads
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a9bed61053af13c0768f82c9d1c8793515dd067c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/client.h
+#	drivers/misc/mei/interrupt.c
+#	drivers/misc/mei/main.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/bus.c
+index ca8736c3675b,17ca7e20fb6a..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -286,16 -288,15 +286,25 @@@ int __mei_cl_recv(struct mei_cl *cl, u
+  
+  	mutex_lock(&dev->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (!cl->read_cb) {
+ +		err = mei_cl_read_start(cl, length);
+ +		if (err < 0) {
+ +			mutex_unlock(&dev->device_lock);
+ +			return err;
+ +		}
+ +	}
+++=======
++ 	cb = mei_cl_read_cb(cl, NULL);
++ 	if (cb)
++ 		goto copy;
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
++ 
++ 	rets = mei_cl_read_start(cl, length, NULL);
++ 	if (rets && rets != -EBUSY)
++ 		goto out;
+  
+- 	if (cl->reading_state != MEI_READ_COMPLETE &&
+- 	    !waitqueue_active(&cl->rx_wait)) {
++ 	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
+  
+  		mutex_unlock(&dev->device_lock);
+  
+@@@ -309,23 -310,31 +318,46 @@@
+  		}
+  
+  		mutex_lock(&dev->device_lock);
++ 
++ 		if (mei_cl_is_transitioning(cl)) {
++ 			rets = -EBUSY;
++ 			goto out;
++ 		}
+  	}
+  
+++<<<<<<< HEAD
+ +	cb = cl->read_cb;
+ +
+ +	if (cl->reading_state != MEI_READ_COMPLETE) {
+ +		r_length = 0;
+ +		goto out;
+ +	}
+ +
+++=======
++ 	cb = mei_cl_read_cb(cl, NULL);
++ 	if (!cb) {
++ 		rets = 0;
++ 		goto out;
++ 	}
++ 
++ copy:
++ 	if (cb->status) {
++ 		rets = cb->status;
++ 		goto free;
++ 	}
++ 
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  	r_length = min_t(size_t, length, cb->buf_idx);
+ -	memcpy(buf, cb->buf.data, r_length);
+ -	rets = r_length;
+  
+ -free:
+ +	memcpy(buf, cb->response_buffer.data, r_length);
+ +
+  	mei_io_cb_free(cb);
+++<<<<<<< HEAD
+ +	cl->reading_state = MEI_IDLE;
+ +	cl->read_cb = NULL;
+ +
+++=======
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  out:
+  	mutex_unlock(&dev->device_lock);
+  
+@@@ -437,8 -446,8 +469,13 @@@ int mei_cl_enable_device(struct mei_cl_
+  
+  	mutex_unlock(&dev->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (device->event_cb && !cl->read_cb)
+ +		mei_cl_read_start(device->cl, 0);
+++=======
++ 	if (device->event_cb)
++ 		mei_cl_read_start(device->cl, 0, NULL);
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+  	if (!device->ops || !device->ops->enable)
+  		return 0;
+@@@ -479,24 -488,7 +516,28 @@@ int mei_cl_disable_device(struct mei_cl
+  	}
+  
+  	/* Flush queues and remove any pending read */
+++<<<<<<< HEAD
+ +	mei_cl_flush_queues(cl);
+ +
+ +	if (cl->read_cb) {
+ +		struct mei_cl_cb *cb = NULL;
+ +
+ +		cb = mei_cl_find_read_cb(cl);
+ +		/* Remove entry from read list */
+ +		if (cb)
+ +			list_del(&cb->list);
+ +
+ +		cb = cl->read_cb;
+ +		cl->read_cb = NULL;
+ +
+ +		if (cb) {
+ +			mei_io_cb_free(cb);
+ +			cb = NULL;
+ +		}
+ +	}
+++=======
++ 	mei_cl_flush_queues(cl, NULL);
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+  	device->event_cb = NULL;
+  
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,98a5363e1e8a..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -191,45 -423,90 +191,92 @@@ int mei_io_cb_alloc_req_buf(struct mei_
+  	if (length == 0)
+  		return 0;
+  
+ -	cb->buf.data = kmalloc(length, GFP_KERNEL);
+ -	if (!cb->buf.data)
+ +	cb->request_buffer.data = kmalloc(length, GFP_KERNEL);
+ +	if (!cb->request_buffer.data)
+  		return -ENOMEM;
+ -	cb->buf.size = length;
+ +	cb->request_buffer.size = length;
+  	return 0;
+  }
+ -
+  /**
+ - * mei_cl_alloc_cb - a convenient wrapper for allocating read cb
+ + * mei_io_cb_alloc_resp_buf - allocate response buffer
+   *
+ - * @cl: host client
+ + * @cb: io callback structure
+   * @length: size of the buffer
+ - * @type: operation type
+ - * @fp: associated file pointer (might be NULL)
+   *
+ - * Return: cb on success and NULL on failure
+ + * returns 0 on success
+ + *         -EINVAL if cb is NULL
+ + *         -ENOMEM if allocation failed
+   */
+ -struct mei_cl_cb *mei_cl_alloc_cb(struct mei_cl *cl, size_t length,
+ -				  enum mei_cb_file_ops type, struct file *fp)
+ +int mei_io_cb_alloc_resp_buf(struct mei_cl_cb *cb, size_t length)
+  {
+ -	struct mei_cl_cb *cb;
+ -
+ -	cb = mei_io_cb_init(cl, type, fp);
+  	if (!cb)
+ -		return NULL;
+ +		return -EINVAL;
+  
+ -	if (mei_io_cb_alloc_buf(cb, length)) {
+ -		mei_io_cb_free(cb);
+ -		return NULL;
+ -	}
+ +	if (length == 0)
+ +		return 0;
+  
+ -	return cb;
+ +	cb->response_buffer.data = kmalloc(length, GFP_KERNEL);
+ +	if (!cb->response_buffer.data)
+ +		return -ENOMEM;
+ +	cb->response_buffer.size = length;
+ +	return 0;
+  }
+  
+ +
+ +
++ /**
++  * mei_cl_read_cb - find this cl's callback in the read list
++  *     for a specific file
++  *
++  * @cl: host client
++  * @fp: file pointer (matching cb file object), may be NULL
++  *
++  * Return: cb on success, NULL if cb is not found
++  */
++ struct mei_cl_cb *mei_cl_read_cb(const struct mei_cl *cl, const struct file *fp)
++ {
++ 	struct mei_cl_cb *cb;
++ 
++ 	list_for_each_entry(cb, &cl->rd_completed, list)
++ 		if (!fp || fp == cb->file_object)
++ 			return cb;
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * mei_cl_read_cb_flush - free client's read pending and completed cbs
++  *   for a specific file
++  *
++  * @cl: host client
++  * @fp: file pointer (matching cb file object), may be NULL
++  */
++ void mei_cl_read_cb_flush(const struct mei_cl *cl, const struct file *fp)
++ {
++ 	struct mei_cl_cb *cb, *next;
++ 
++ 	list_for_each_entry_safe(cb, next, &cl->rd_completed, list)
++ 		if (!fp || fp == cb->file_object)
++ 			mei_io_cb_free(cb);
++ 
++ 
++ 	list_for_each_entry_safe(cb, next, &cl->rd_pending, list)
++ 		if (!fp || fp == cb->file_object)
++ 			mei_io_cb_free(cb);
++ }
++ 
+  /**
+   * mei_cl_flush_queues - flushes queue lists belonging to cl.
+   *
+   * @cl: host client
+++<<<<<<< HEAD
+++=======
++  * @fp: file pointer (matching cb file object), may be NULL
++  *
++  * Return: 0 on success, -EINVAL if cl or cl->dev is NULL.
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+   */
+- int mei_cl_flush_queues(struct mei_cl *cl)
++ int mei_cl_flush_queues(struct mei_cl *cl, const struct file *fp)
+  {
+  	struct mei_device *dev;
+  
+@@@ -289,24 -569,6 +339,27 @@@ struct mei_cl *mei_cl_allocate(struct m
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * mei_cl_find_read_cb - find this cl's callback in the read list
+ + *
+ + * @cl: host client
+ + *
+ + * returns cb on success, NULL on error
+ + */
+ +struct mei_cl_cb *mei_cl_find_read_cb(struct mei_cl *cl)
+ +{
+ +	struct mei_device *dev = cl->dev;
+ +	struct mei_cl_cb *cb;
+ +
+ +	list_for_each_entry(cb, &dev->read_list.list, list)
+ +		if (mei_cl_cmp_id(cl, cb->cl))
+ +			return cb;
+ +	return NULL;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+   * mei_cl_link - allocate host id in the host map
+   *
+   * @cl: host client
+@@@ -738,12 -1033,12 +791,18 @@@ int mei_cl_read_start(struct mei_cl *cl
+  	if (!mei_cl_is_connected(cl))
+  		return -ENODEV;
+  
+- 	if (cl->read_cb) {
+- 		cl_dbg(dev, cl, "read is pending.\n");
++ 	/* HW currently supports only one pending read */
++ 	if (!list_empty(&cl->rd_pending))
+  		return -EBUSY;
+++<<<<<<< HEAD
+ +	}
+ +	i = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (i < 0) {
+++=======
++ 
++ 	me_cl = mei_me_cl_by_uuid_id(dev, &cl->cl_uuid, cl->me_client_id);
++ 	if (!me_cl) {
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+  		return  -ENOTTY;
+  	}
+@@@ -767,24 -1058,20 +826,22 @@@
+  	if (rets)
+  		goto out;
+  
+ +	cb->fop_type = MEI_FOP_READ;
+  	if (mei_hbuf_acquire(dev)) {
+ -		rets = mei_hbm_cl_flow_control_req(dev, cl);
+ -		if (rets < 0)
+ +		if (mei_hbm_cl_flow_control_req(dev, cl)) {
+ +			rets = -ENODEV;
+  			goto out;
+ +		}
+  
+- 		list_add_tail(&cb->list, &dev->read_list.list);
++ 		list_add_tail(&cb->list, &cl->rd_pending);
+  	} else {
+  		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+  	}
+  
+- 	cl->read_cb = cb;
+- 
+  out:
+  	cl_dbg(dev, cl, "rpm: autosuspend\n");
+ -	pm_runtime_mark_last_busy(dev->dev);
+ -	pm_runtime_put_autosuspend(dev->dev);
+ +	pm_runtime_mark_last_busy(&dev->pdev->dev);
+ +	pm_runtime_put_autosuspend(&dev->pdev->dev);
+  
+  	if (rets)
+  		mei_io_cb_free(cb);
+diff --cc drivers/misc/mei/client.h
+index bf2b0b1b493d,eb02f34b2fe0..000000000000
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@@ -58,9 -75,14 +58,20 @@@ void mei_cl_init(struct mei_cl *cl, str
+  int mei_cl_link(struct mei_cl *cl, int id);
+  int mei_cl_unlink(struct mei_cl *cl);
+  
+++<<<<<<< HEAD
+ +int mei_cl_flush_queues(struct mei_cl *cl);
+ +struct mei_cl_cb *mei_cl_find_read_cb(struct mei_cl *cl);
+ +
+++=======
++ struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev, int id);
++ 
++ struct mei_cl_cb *mei_cl_read_cb(const struct mei_cl *cl,
++ 				 const struct file *fp);
++ void mei_cl_read_cb_flush(const struct mei_cl *cl, const struct file *fp);
++ struct mei_cl_cb *mei_cl_alloc_cb(struct mei_cl *cl, size_t length,
++ 				  enum mei_cb_file_ops type, struct file *fp);
++ int mei_cl_flush_queues(struct mei_cl *cl, const struct file *fp);
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+  int mei_cl_flow_ctrl_creds(struct mei_cl *cl);
+  
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,3f23629759db..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -70,91 -68,91 +70,138 @@@ static inline int mei_cl_hbm_equal(stru
+  	return cl->host_client_id == mei_hdr->host_addr &&
+  		cl->me_client_id == mei_hdr->me_addr;
+  }
+ -
+++<<<<<<< HEAD
+  /**
+ - * mei_irq_discard_msg  - discard received message
+ + * mei_cl_is_reading - checks if the client
+ +		is the one to read this message
+ + *
+ + * @cl: mei client
+ + * @mei_hdr: header of mei message
+   *
+ - * @dev: mei device
+ - * @hdr: message header
+ + * returns true on match and false otherwise
+   */
+ -static inline
+ -void mei_irq_discard_msg(struct mei_device *dev, struct mei_msg_hdr *hdr)
+ +static bool mei_cl_is_reading(struct mei_cl *cl, struct mei_msg_hdr *mei_hdr)
+  {
+ -	/*
+ -	 * no need to check for size as it is guarantied
+ -	 * that length fits into rd_msg_buf
+ -	 */
+ -	mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
+ -	dev_dbg(dev->dev, "discarding message " MEI_HDR_FMT "\n",
+ -		MEI_HDR_PRM(hdr));
+ +	return mei_cl_hbm_equal(cl, mei_hdr) &&
+ +		cl->state == MEI_FILE_CONNECTED &&
+ +		cl->reading_state != MEI_READ_COMPLETE;
+  }
+++=======
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+  /**
+ - * mei_cl_irq_read_msg - process client message
+ + * mei_irq_read_client_message - process client message
+   *
+ - * @cl: reading client
+ + * @dev: the device structure
+   * @mei_hdr: header of mei client message
+ - * @complete_list: completion list
+ + * @complete_list: An instance of our list structure
+   *
+ - * Return: always 0
+ + * returns 0 on success, <0 on failure.
+   */
+ -int mei_cl_irq_read_msg(struct mei_cl *cl,
+ -		       struct mei_msg_hdr *mei_hdr,
+ -		       struct mei_cl_cb *complete_list)
+ +static int mei_cl_irq_read_msg(struct mei_device *dev,
+ +			       struct mei_msg_hdr *mei_hdr,
+ +			       struct mei_cl_cb *complete_list)
+  {
+ -	struct mei_device *dev = cl->dev;
+ -	struct mei_cl_cb *cb;
+ +	struct mei_cl *cl;
+ +	struct mei_cl_cb *cb, *next;
+  	unsigned char *buffer = NULL;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(cb, next, &dev->read_list.list, list) {
+ +		cl = cb->cl;
+ +		if (!cl || !mei_cl_is_reading(cl, mei_hdr))
+ +			continue;
+ +
+ +		cl->reading_state = MEI_READING;
+ +
+ +		if (cb->response_buffer.size == 0 ||
+ +		    cb->response_buffer.data == NULL) {
+ +			cl_err(dev, cl, "response buffer is not allocated.\n");
+ +			list_del(&cb->list);
+ +			return -ENOMEM;
+++=======
++ 	cb = list_first_entry_or_null(&cl->rd_pending, struct mei_cl_cb, list);
++ 	if (!cb) {
++ 		cl_err(dev, cl, "pending read cb not found\n");
++ 		goto out;
++ 	}
++ 
++ 	if (cl->state != MEI_FILE_CONNECTED) {
++ 		cl_dbg(dev, cl, "not connected\n");
++ 		cb->status = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	if (cb->buf.size == 0 || cb->buf.data == NULL) {
++ 		cl_err(dev, cl, "response buffer is not allocated.\n");
++ 		list_move_tail(&cb->list, &complete_list->list);
++ 		cb->status = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	if (cb->buf.size < mei_hdr->length + cb->buf_idx) {
++ 		cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
++ 			cb->buf.size, mei_hdr->length, cb->buf_idx);
++ 		buffer = krealloc(cb->buf.data, mei_hdr->length + cb->buf_idx,
++ 				  GFP_KERNEL);
++ 
++ 		if (!buffer) {
++ 			cb->status = -ENOMEM;
++ 			list_move_tail(&cb->list, &complete_list->list);
++ 			goto out;
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  		}
+ -		cb->buf.data = buffer;
+ -		cb->buf.size = mei_hdr->length + cb->buf_idx;
+ +
+ +		if (cb->response_buffer.size < mei_hdr->length + cb->buf_idx) {
+ +			cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ +				cb->response_buffer.size,
+ +				mei_hdr->length, cb->buf_idx);
+ +			buffer = krealloc(cb->response_buffer.data,
+ +					  mei_hdr->length + cb->buf_idx,
+ +					  GFP_KERNEL);
+ +
+ +			if (!buffer) {
+ +				list_del(&cb->list);
+ +				return -ENOMEM;
+ +			}
+ +			cb->response_buffer.data = buffer;
+ +			cb->response_buffer.size =
+ +				mei_hdr->length + cb->buf_idx;
+ +		}
+ +
+ +		buffer = cb->response_buffer.data + cb->buf_idx;
+ +		mei_read_slots(dev, buffer, mei_hdr->length);
+ +
+ +		cb->buf_idx += mei_hdr->length;
+ +		if (mei_hdr->msg_complete) {
+ +			cl->status = 0;
+ +			list_del(&cb->list);
+ +			cl_dbg(dev, cl, "completed read length = %lu\n",
+ +				cb->buf_idx);
+ +			list_add_tail(&cb->list, &complete_list->list);
+ +		}
+ +		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	dev_dbg(&dev->pdev->dev, "message read\n");
+ +	if (!buffer) {
+ +		mei_read_slots(dev, dev->rd_msg_buf, mei_hdr->length);
+ +		dev_dbg(&dev->pdev->dev, "discarding message " MEI_HDR_FMT "\n",
+ +				MEI_HDR_PRM(mei_hdr));
+++=======
++ 	buffer = cb->buf.data + cb->buf_idx;
++ 	mei_read_slots(dev, buffer, mei_hdr->length);
++ 
++ 	cb->buf_idx += mei_hdr->length;
++ 
++ 	if (mei_hdr->msg_complete) {
++ 		cb->read_time = jiffies;
++ 		cl_dbg(dev, cl, "completed read length = %lu\n", cb->buf_idx);
++ 		list_move_tail(&cb->list, &complete_list->list);
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  	}
+  
+ -out:
+ -	if (!buffer)
+ -		mei_irq_discard_msg(dev, mei_hdr);
+ -
+  	return 0;
+  }
+  
+diff --cc drivers/misc/mei/main.c
+index b23f9eba9e3a,d80867e0d803..000000000000
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@@ -133,23 -117,8 +133,26 @@@ static int mei_release(struct inode *in
+  
+  	mei_cl_unlink(cl);
+  
+++<<<<<<< HEAD
+ +
+ +	/* free read cb */
+ +	cb = NULL;
+ +	if (cl->read_cb) {
+ +		cb = mei_cl_find_read_cb(cl);
+ +		/* Remove entry from read list */
+ +		if (cb)
+ +			list_del(&cb->list);
+ +
+ +		cb = cl->read_cb;
+ +		cl->read_cb = NULL;
+ +	}
+ +
+++=======
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  	file->private_data = NULL;
+  
+ +	mei_io_cb_free(cb);
+ +
+  	kfree(cl);
+  out:
+  	mutex_unlock(&dev->device_lock);
+@@@ -171,10 -140,8 +174,15 @@@ static ssize_t mei_read(struct file *fi
+  			size_t length, loff_t *offset)
+  {
+  	struct mei_cl *cl = file->private_data;
+++<<<<<<< HEAD
+ +	struct mei_cl_cb *cb_pos = NULL;
+ +	struct mei_cl_cb *cb = NULL;
+ +	struct mei_device *dev;
+ +	int i;
+++=======
++ 	struct mei_device *dev;
++ 	struct mei_cl_cb *cb = NULL;
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  	int rets;
+  	int err;
+  
+@@@ -215,8 -168,8 +223,13 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (cl->read_cb) {
+ +		cb = cl->read_cb;
+++=======
++ 	cb = mei_cl_read_cb(cl, file);
++ 	if (cb) {
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  		/* read what left */
+  		if (cb->buf_idx > *offset)
+  			goto copy_buffer;
+@@@ -240,8 -193,7 +253,12 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (MEI_READ_COMPLETE != cl->reading_state &&
+ +			!waitqueue_active(&cl->rx_wait)) {
+++=======
++ 	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  		if (file->f_flags & O_NONBLOCK) {
+  			rets = -EAGAIN;
+  			goto out;
+@@@ -265,13 -217,8 +282,15 @@@
+  		}
+  	}
+  
+- 	cb = cl->read_cb;
+- 
++ 	cb = mei_cl_read_cb(cl, file);
+  	if (!cb) {
+++<<<<<<< HEAD
+ +		rets = -ENODEV;
+ +		goto out;
+ +	}
+ +	if (cl->reading_state != MEI_READ_COMPLETE) {
+++=======
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  		rets = 0;
+  		goto out;
+  	}
+@@@ -300,15 -254,10 +319,19 @@@ copy_buffer
+  		goto out;
+  
+  free:
+ +	cb_pos = mei_cl_find_read_cb(cl);
+ +	/* Remove entry from read list */
+ +	if (cb_pos)
+ +		list_del(&cb_pos->list);
+  	mei_io_cb_free(cb);
+++<<<<<<< HEAD
+ +	cl->reading_state = MEI_IDLE;
+ +	cl->read_cb = NULL;
+++=======
++ 
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  out:
+ -	dev_dbg(dev->dev, "end mei read rets= %d\n", rets);
+ +	dev_dbg(&dev->pdev->dev, "end mei read rets= %d\n", rets);
+  	mutex_unlock(&dev->device_lock);
+  	return rets;
+  }
+@@@ -373,32 -322,16 +396,36 @@@ static ssize_t mei_write(struct file *f
+  			timeout = write_cb->read_time +
+  				mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
+  
+- 			if (time_after(jiffies, timeout) ||
+- 			    cl->reading_state == MEI_READ_COMPLETE) {
++ 			if (time_after(jiffies, timeout)) {
+  				*offset = 0;
+ +				list_del(&write_cb->list);
+  				mei_io_cb_free(write_cb);
+  				write_cb = NULL;
+  			}
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* free entry used in read */
+ +	if (cl->reading_state == MEI_READ_COMPLETE) {
+ +		*offset = 0;
+ +		write_cb = mei_cl_find_read_cb(cl);
+ +		if (write_cb) {
+ +			list_del(&write_cb->list);
+ +			mei_io_cb_free(write_cb);
+ +			write_cb = NULL;
+ +			cl->reading_state = MEI_IDLE;
+ +			cl->read_cb = NULL;
+ +		}
+ +	} else if (cl->reading_state == MEI_IDLE)
+ +		*offset = 0;
+ +
+ +
+ +	write_cb = mei_io_cb_init(cl, file);
+++=======
++ 	*offset = 0;
++ 	write_cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, file);
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  	if (!write_cb) {
+  		rets = -ENOMEM;
+  		goto out;
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,f066ecd71939..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -201,10 -210,34 +201,36 @@@ struct mei_cl_cb 
+  	unsigned long buf_idx;
+  	unsigned long read_time;
+  	struct file *file_object;
+ -	int status;
+  	u32 internal:1;
+ -	u32 completed:1;
+  };
+  
+++<<<<<<< HEAD
+ +/* MEI client instance carried as file->private_data*/
+++=======
++ /**
++  * struct mei_cl - me client host representation
++  *    carried in file->private_data
++  *
++  * @link: link in the clients list
++  * @dev: mei parent device
++  * @state: file operation state
++  * @tx_wait: wait queue for tx completion
++  * @rx_wait: wait queue for rx completion
++  * @wait:  wait queue for management operation
++  * @status: connection status
++  * @cl_uuid: client uuid name
++  * @host_client_id: host id
++  * @me_client_id: me/fw id
++  * @mei_flow_ctrl_creds: transmit flow credentials
++  * @timer_count:  watchdog timer for operation completion
++  * @writing_state: state of the tx
++  * @rd_pending: pending read credits
++  * @rd_completed: completed read
++  *
++  * @device: device on the mei client bus
++  * @device_link:  link to bus clients
++  */
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  struct mei_cl {
+  	struct list_head link;
+  	struct mei_device *dev;
+@@@ -218,10 -251,9 +244,14 @@@
+  	u8 me_client_id;
+  	u8 mei_flow_ctrl_creds;
+  	u8 timer_count;
+- 	enum mei_file_transaction_states reading_state;
+  	enum mei_file_transaction_states writing_state;
+++<<<<<<< HEAD
+ +	int sm_state;
+ +	struct mei_cl_cb *read_cb;
+++=======
++ 	struct list_head rd_pending;
++ 	struct list_head rd_completed;
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+  	/* MEI CL bus data */
+  	struct mei_cl_device *device;
+@@@ -382,55 -418,93 +412,137 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+ + */
+ +struct mei_device {
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported : hbm feature pgi protocol
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_mtu : amthif client max message length
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
++  */
++ struct mei_device {
++ 	struct device *dev;
++ 	struct cdev cdev;
++ 	int minor;
++ 
++ 	struct mei_cl_cb write_list;
++ 	struct mei_cl_cb write_waiting_list;
++ 	struct mei_cl_cb ctrl_wr_list;
++ 	struct mei_cl_cb ctrl_rd_list;
+++>>>>>>> a9bed61053af (mei: allow read concurrency)
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/client.h
+diff --git a/drivers/misc/mei/debugfs.c b/drivers/misc/mei/debugfs.c
+index 85d1d2217fb8..6f51eb203a1b 100644
+--- a/drivers/misc/mei/debugfs.c
++++ b/drivers/misc/mei/debugfs.c
+@@ -107,7 +107,7 @@ static ssize_t mei_dbgfs_read_active(struct file *fp, char __user *ubuf,
+ 		pos += scnprintf(buf + pos, bufsz - pos,
+ 			"%2d|%2d|%4d|%5d|%2d|%2d|\n",
+ 			i, cl->me_client_id, cl->host_client_id, cl->state,
+-			cl->reading_state, cl->writing_state);
++			!list_empty(&cl->rd_completed), cl->writing_state);
+ 		i++;
+ 	}
+ out:
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 08331e745faf..dd84dbdfb766 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -376,7 +376,6 @@ void mei_device_init(struct mei_device *dev, const struct mei_cfg *cfg)
+ 	dev->dev_state = MEI_DEV_INITIALIZING;
+ 	dev->reset_count = 0;
+ 
+-	mei_io_list_init(&dev->read_list);
+ 	mei_io_list_init(&dev->write_list);
+ 	mei_io_list_init(&dev->write_waiting_list);
+ 	mei_io_list_init(&dev->ctrl_wr_list);
+* Unmerged path drivers/misc/mei/interrupt.c
+* Unmerged path drivers/misc/mei/main.c
+* Unmerged path drivers/misc/mei/mei_dev.h
