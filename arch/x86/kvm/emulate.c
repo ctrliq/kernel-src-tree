@@ -4688,7 +4688,10 @@ special_insn:
 			goto done;
 	}
 
-	ctxt->eflags &= ~EFLG_RF;
+	if (ctxt->rep_prefix && (ctxt->d & String))
+		ctxt->eflags |= EFLG_RF;
+	else
+		ctxt->eflags &= ~EFLG_RF;
 
 	if (ctxt->execute) {
 		if (ctxt->d & Fastop) {
@@ -4829,6 +4832,7 @@ writeback:
 			}
 			goto done; /* skip rip writeback */
 		}
+		ctxt->eflags &= ~EFLG_RF;
 	}
 
 	ctxt->eip = ctxt->_eip;
