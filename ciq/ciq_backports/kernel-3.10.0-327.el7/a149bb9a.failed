@@ -1,0 +1,141 @@
+ceph: kstrdup() memory handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sanidhya Kashyap <sanidhya.gatech@gmail.com>
+commit a149bb9a281c5c2904cf6fcdf9ed386340032ce3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a149bb9a.failed
+
+Currently, there is no check for the kstrdup() for r_path2,
+r_path1 and snapdir_name as various locations as there is a
+possibility of failure during memory pressure. Therefore,
+returning ENOMEM where the checks have been missed.
+
+	Signed-off-by: Sanidhya Kashyap <sanidhya.gatech@gmail.com>
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit a149bb9a281c5c2904cf6fcdf9ed386340032ce3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index cff725d5ba3b,98c71e895e81..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -337,9 -337,6 +337,12 @@@ more
+  			ceph_mdsc_put_request(req);
+  			return err;
+  		}
+++<<<<<<< HEAD
+ +		req->r_inode = inode;
+ +		ihold(inode);
+ +		req->r_dentry = dget(filp->f_dentry);
+++=======
+++>>>>>>> a149bb9a281c (ceph: kstrdup() memory handling)
+  		/* hints to request -> mds selection code */
+  		req->r_direct_mode = USE_AUTH_MDS;
+  		req->r_direct_hash = ceph_frag_value(frag);
+@@@ -736,13 -761,18 +749,18 @@@ static int ceph_symlink(struct inode *d
+  	dout("symlink in dir %p dentry %p to '%s'\n", dir, dentry, dest);
+  	req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_SYMLINK, USE_AUTH_MDS);
+  	if (IS_ERR(req)) {
+ -		err = PTR_ERR(req);
+ -		goto out;
+ +		d_drop(dentry);
+ +		return PTR_ERR(req);
+  	}
+- 	req->r_dentry = dget(dentry);
+- 	req->r_num_caps = 2;
+  	req->r_path2 = kstrdup(dest, GFP_NOFS);
++ 	if (!req->r_path2) {
++ 		err = -ENOMEM;
++ 		ceph_mdsc_put_request(req);
++ 		goto out;
++ 	}
+  	req->r_locked_dir = dir;
++ 	req->r_dentry = dget(dentry);
++ 	req->r_num_caps = 2;
+  	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+  	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+  	err = ceph_mdsc_do_request(mdsc, dir, req);
+* Unmerged path fs/ceph/dir.c
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index bbbb8c89195e..2dc947e85fdc 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -329,6 +329,11 @@ static int parse_mount_options(struct ceph_mount_options **pfsopt,
+ 	fsopt->rsize = CEPH_RSIZE_DEFAULT;
+ 	fsopt->rasize = CEPH_RASIZE_DEFAULT;
+ 	fsopt->snapdir_name = kstrdup(CEPH_SNAPDIRNAME_DEFAULT, GFP_KERNEL);
++	if (!fsopt->snapdir_name) {
++		err = -ENOMEM;
++		goto out;
++	}
++
+ 	fsopt->caps_wanted_delay_min = CEPH_CAPS_WANTED_DELAY_MIN_DEFAULT;
+ 	fsopt->caps_wanted_delay_max = CEPH_CAPS_WANTED_DELAY_MAX_DEFAULT;
+ 	fsopt->cap_release_safety = CEPH_CAP_RELEASE_SAFETY_DEFAULT;
+@@ -687,6 +692,11 @@ static struct dentry *open_root_dentry(struct ceph_fs_client *fsc,
+ 	if (IS_ERR(req))
+ 		return ERR_CAST(req);
+ 	req->r_path1 = kstrdup(path, GFP_NOFS);
++	if (!req->r_path1) {
++		root = ERR_PTR(-ENOMEM);
++		goto out;
++	}
++
+ 	req->r_ino1.ino = CEPH_INO_ROOT;
+ 	req->r_ino1.snap = CEPH_NOSNAP;
+ 	req->r_started = started;
+diff --git a/fs/ceph/xattr.c b/fs/ceph/xattr.c
+index 4f17b39614ac..c4e03c235cfa 100644
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@ -856,16 +856,23 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
+ 		err = PTR_ERR(req);
+ 		goto out;
+ 	}
+-	req->r_inode = inode;
+-	ihold(inode);
+-	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
+-	req->r_num_caps = 1;
++
+ 	req->r_args.setxattr.flags = cpu_to_le32(flags);
+ 	req->r_path2 = kstrdup(name, GFP_NOFS);
++	if (!req->r_path2) {
++		ceph_mdsc_put_request(req);
++		err = -ENOMEM;
++		goto out;
++	}
+ 
+ 	req->r_pagelist = pagelist;
+ 	pagelist = NULL;
+ 
++	req->r_inode = inode;
++	ihold(inode);
++	req->r_num_caps = 1;
++	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
++
+ 	dout("xattr.ver (before): %lld\n", ci->i_xattrs.version);
+ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
+ 	ceph_mdsc_put_request(req);
+@@ -986,12 +993,14 @@ static int ceph_send_removexattr(struct dentry *dentry, const char *name)
+ 				       USE_AUTH_MDS);
+ 	if (IS_ERR(req))
+ 		return PTR_ERR(req);
++	req->r_path2 = kstrdup(name, GFP_NOFS);
++	if (!req->r_path2)
++		return -ENOMEM;
++
+ 	req->r_inode = inode;
+ 	ihold(inode);
+-	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
+ 	req->r_num_caps = 1;
+-	req->r_path2 = kstrdup(name, GFP_NOFS);
+-
++	req->r_inode_drop = CEPH_CAP_XATTR_SHARED;
+ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
+ 	ceph_mdsc_put_request(req);
+ 	return err;
