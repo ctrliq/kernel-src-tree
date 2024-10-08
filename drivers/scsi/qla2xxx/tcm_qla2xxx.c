@@ -567,6 +567,12 @@ static u32 tcm_qla2xxx_get_task_tag(struct se_cmd *se_cmd)
 
 static int tcm_qla2xxx_get_cmd_state(struct se_cmd *se_cmd)
 {
+	if (!(se_cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)) {
+		struct qla_tgt_cmd *cmd = container_of(se_cmd,
+				struct qla_tgt_cmd, se_cmd);
+		return cmd->state;
+	}
+
 	return 0;
 }
 
