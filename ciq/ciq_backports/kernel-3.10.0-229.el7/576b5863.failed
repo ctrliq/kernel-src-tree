@@ -1,0 +1,165 @@
+cxgb4i: avoid holding mutex in interrupt context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Anish Bhatt <anish@chelsio.com>
+commit 576b586303f76be9e5e2f5266ccbeba1b46bbd06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/576b5863.failed
+
+cxgbi_inet6addr_handler() can be called in interrupt context, so use rcu
+protected list while finding netdev
+
+Applies on top of core-for-3.18
+
+	Signed-off-by: Anish Bhatt <anish@chelsio.com>
+	Signed-off-by: Karen Xie <kxie@chelsio.com>
+
+Fixes: fc8d0590d914 ("libcxgbi: Add ipv6 api to driver")
+Fixes: 759a0cc5a3e1 ("cxgb4i: Add ipv6 code to driver, call into libcxgbi ipv6
+api")
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 576b586303f76be9e5e2f5266ccbeba1b46bbd06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxgbi/libcxgbi.h
+diff --cc drivers/scsi/cxgbi/libcxgbi.h
+index 8ad73d913f02,1d98fad6a0ab..000000000000
+--- a/drivers/scsi/cxgbi/libcxgbi.h
++++ b/drivers/scsi/cxgbi/libcxgbi.h
+@@@ -709,7 -710,9 +710,13 @@@ void cxgbi_device_unregister(struct cxg
+  void cxgbi_device_unregister_all(unsigned int flag);
+  struct cxgbi_device *cxgbi_device_find_by_lldev(void *);
+  struct cxgbi_device *cxgbi_device_find_by_netdev(struct net_device *, int *);
+++<<<<<<< HEAD
+ +int cxgbi_hbas_add(struct cxgbi_device *, unsigned int, unsigned int,
+++=======
++ struct cxgbi_device *cxgbi_device_find_by_netdev_rcu(struct net_device *,
++ 						     int *);
++ int cxgbi_hbas_add(struct cxgbi_device *, u64, unsigned int,
+++>>>>>>> 576b586303f7 (cxgb4i: avoid holding mutex in interrupt context)
+  			struct scsi_host_template *,
+  			struct scsi_transport_template *);
+  void cxgbi_hbas_remove(struct cxgbi_device *);
+diff --git a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+index 7f7833819b99..0cd91d29673a 100644
+--- a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
++++ b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+@@ -1692,7 +1692,7 @@ static int cxgbi_inet6addr_handler(struct notifier_block *this,
+ 	if (event_dev->priv_flags & IFF_802_1Q_VLAN)
+ 		event_dev = vlan_dev_real_dev(event_dev);
+ 
+-	cdev = cxgbi_device_find_by_netdev(event_dev, NULL);
++	cdev = cxgbi_device_find_by_netdev_rcu(event_dev, NULL);
+ 
+ 	if (!cdev)
+ 		return ret;
+diff --git a/drivers/scsi/cxgbi/libcxgbi.c b/drivers/scsi/cxgbi/libcxgbi.c
+index 3d5322d59f15..e8e665f507d5 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.c
++++ b/drivers/scsi/cxgbi/libcxgbi.c
+@@ -57,6 +57,9 @@ MODULE_PARM_DESC(dbg_level, "libiscsi debug level (default=0)");
+ static LIST_HEAD(cdev_list);
+ static DEFINE_MUTEX(cdev_mutex);
+ 
++static LIST_HEAD(cdev_rcu_list);
++static DEFINE_SPINLOCK(cdev_rcu_lock);
++
+ int cxgbi_device_portmap_create(struct cxgbi_device *cdev, unsigned int base,
+ 				unsigned int max_conn)
+ {
+@@ -142,6 +145,10 @@ struct cxgbi_device *cxgbi_device_register(unsigned int extra,
+ 	list_add_tail(&cdev->list_head, &cdev_list);
+ 	mutex_unlock(&cdev_mutex);
+ 
++	spin_lock(&cdev_rcu_lock);
++	list_add_tail_rcu(&cdev->rcu_node, &cdev_rcu_list);
++	spin_unlock(&cdev_rcu_lock);
++
+ 	log_debug(1 << CXGBI_DBG_DEV,
+ 		"cdev 0x%p, p# %u.\n", cdev, nports);
+ 	return cdev;
+@@ -153,9 +160,16 @@ void cxgbi_device_unregister(struct cxgbi_device *cdev)
+ 	log_debug(1 << CXGBI_DBG_DEV,
+ 		"cdev 0x%p, p# %u,%s.\n",
+ 		cdev, cdev->nports, cdev->nports ? cdev->ports[0]->name : "");
++
+ 	mutex_lock(&cdev_mutex);
+ 	list_del(&cdev->list_head);
+ 	mutex_unlock(&cdev_mutex);
++
++	spin_lock(&cdev_rcu_lock);
++	list_del_rcu(&cdev->rcu_node);
++	spin_unlock(&cdev_rcu_lock);
++	synchronize_rcu();
++
+ 	cxgbi_device_destroy(cdev);
+ }
+ EXPORT_SYMBOL_GPL(cxgbi_device_unregister);
+@@ -167,12 +181,9 @@ void cxgbi_device_unregister_all(unsigned int flag)
+ 	mutex_lock(&cdev_mutex);
+ 	list_for_each_entry_safe(cdev, tmp, &cdev_list, list_head) {
+ 		if ((cdev->flags & flag) == flag) {
+-			log_debug(1 << CXGBI_DBG_DEV,
+-				"cdev 0x%p, p# %u,%s.\n",
+-				cdev, cdev->nports, cdev->nports ?
+-				 cdev->ports[0]->name : "");
+-			list_del(&cdev->list_head);
+-			cxgbi_device_destroy(cdev);
++			mutex_unlock(&cdev_mutex);
++			cxgbi_device_unregister(cdev);
++			mutex_lock(&cdev_mutex);
+ 		}
+ 	}
+ 	mutex_unlock(&cdev_mutex);
+@@ -191,6 +202,7 @@ struct cxgbi_device *cxgbi_device_find_by_lldev(void *lldev)
+ 		}
+ 	}
+ 	mutex_unlock(&cdev_mutex);
++
+ 	log_debug(1 << CXGBI_DBG_DEV,
+ 		"lldev 0x%p, NO match found.\n", lldev);
+ 	return NULL;
+@@ -230,6 +242,39 @@ struct cxgbi_device *cxgbi_device_find_by_netdev(struct net_device *ndev,
+ }
+ EXPORT_SYMBOL_GPL(cxgbi_device_find_by_netdev);
+ 
++struct cxgbi_device *cxgbi_device_find_by_netdev_rcu(struct net_device *ndev,
++						     int *port)
++{
++	struct net_device *vdev = NULL;
++	struct cxgbi_device *cdev;
++	int i;
++
++	if (ndev->priv_flags & IFF_802_1Q_VLAN) {
++		vdev = ndev;
++		ndev = vlan_dev_real_dev(ndev);
++		pr_info("vlan dev %s -> %s.\n", vdev->name, ndev->name);
++	}
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(cdev, &cdev_rcu_list, rcu_node) {
++		for (i = 0; i < cdev->nports; i++) {
++			if (ndev == cdev->ports[i]) {
++				cdev->hbas[i]->vdev = vdev;
++				rcu_read_unlock();
++				if (port)
++					*port = i;
++				return cdev;
++			}
++		}
++	}
++	rcu_read_unlock();
++
++	log_debug(1 << CXGBI_DBG_DEV,
++		  "ndev 0x%p, %s, NO match found.\n", ndev, ndev->name);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(cxgbi_device_find_by_netdev_rcu);
++
+ static struct cxgbi_device *cxgbi_device_find_by_mac(struct net_device *ndev,
+ 						     int *port)
+ {
+* Unmerged path drivers/scsi/cxgbi/libcxgbi.h
