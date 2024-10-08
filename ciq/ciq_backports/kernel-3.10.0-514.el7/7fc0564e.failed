@@ -1,0 +1,102 @@
+nfsd: fix race with open / open upgrade stateids
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andrew Elble <aweits@rit.edu>
+commit 7fc0564e3a8d16df096f48c9c6425ba84d945c6e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7fc0564e.failed
+
+We observed multiple open stateids on the server for files that
+seemingly should have been closed.
+
+nfsd4_process_open2() tests for the existence of a preexisting
+stateid. If one is not found, the locks are dropped and a new
+one is created. The problem is that init_open_stateid(), which
+is also responsible for hashing the newly initialized stateid,
+doesn't check to see if another open has raced in and created
+a matching stateid. This fix is to enable init_open_stateid() to
+return the matching stateid and have nfsd4_process_open2()
+swap to that stateid and switch to the open upgrade path.
+In testing this patch, coverage to the newly created
+path indicates that the race was indeed happening.
+
+	Signed-off-by: Andrew Elble <aweits@rit.edu>
+	Reviewed-by: Jeff Layton <jlayton@poochiereds.net>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 7fc0564e3a8d16df096f48c9c6425ba84d945c6e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+diff --cc fs/nfsd/nfs4state.c
+index 3d8207e252c8,6b800b5b8fed..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -3297,12 -3467,14 +3329,18 @@@ init_open_stateid(struct nfs4_ol_statei
+  	stp->st_access_bmap = 0;
+  	stp->st_deny_bmap = 0;
+  	stp->st_openstp = NULL;
+++<<<<<<< HEAD
+ +	spin_lock(&oo->oo_owner.so_client->cl_lock);
+++=======
++ 	init_rwsem(&stp->st_rwsem);
+++>>>>>>> 7fc0564e3a8d (nfsd: fix race with open / open upgrade stateids)
+  	list_add(&stp->st_perstateowner, &oo->oo_owner.so_stateids);
+- 	spin_lock(&fp->fi_lock);
+  	list_add(&stp->st_perfile, &fp->fi_stateids);
++ 
++ out_unlock:
+  	spin_unlock(&fp->fi_lock);
+  	spin_unlock(&oo->oo_owner.so_client->cl_lock);
++ 	return retstp;
+  }
+  
+  /*
+@@@ -4117,15 -4308,36 +4137,38 @@@ nfsd4_process_open2(struct svc_rqst *rq
+  	} else {
+  		stp = open->op_stp;
+  		open->op_stp = NULL;
+++<<<<<<< HEAD
+ +		init_open_stateid(stp, fp, open);
+++=======
++ 		swapstp = init_open_stateid(stp, fp, open);
++ 		if (swapstp) {
++ 			nfs4_put_stid(&stp->st_stid);
++ 			stp = swapstp;
++ 			down_read(&stp->st_rwsem);
++ 			status = nfs4_upgrade_open(rqstp, fp, current_fh,
++ 						stp, open);
++ 			if (status) {
++ 				up_read(&stp->st_rwsem);
++ 				goto out;
++ 			}
++ 			goto upgrade_out;
++ 		}
++ 		down_read(&stp->st_rwsem);
+++>>>>>>> 7fc0564e3a8d (nfsd: fix race with open / open upgrade stateids)
+  		status = nfs4_get_vfs_file(rqstp, fp, current_fh, stp, open);
+  		if (status) {
+ -			up_read(&stp->st_rwsem);
+  			release_open_stateid(stp);
+  			goto out;
+  		}
+ -
+ -		stp->st_clnt_odstate = find_or_hash_clnt_odstate(fp,
+ -							open->op_odstate);
+ -		if (stp->st_clnt_odstate == open->op_odstate)
+ -			open->op_odstate = NULL;
+  	}
+++<<<<<<< HEAD
+ +	update_stateid(&stp->st_stid.sc_stateid);
+ +	memcpy(&open->op_stateid, &stp->st_stid.sc_stateid, sizeof(stateid_t));
+++=======
++ upgrade_out:
++ 	nfs4_inc_and_copy_stateid(&open->op_stateid, &stp->st_stid);
++ 	up_read(&stp->st_rwsem);
+++>>>>>>> 7fc0564e3a8d (nfsd: fix race with open / open upgrade stateids)
+  
+  	if (nfsd4_has_session(&resp->cstate)) {
+  		if (open->op_deleg_want & NFS4_SHARE_WANT_NO_DELEG) {
+* Unmerged path fs/nfsd/nfs4state.c
