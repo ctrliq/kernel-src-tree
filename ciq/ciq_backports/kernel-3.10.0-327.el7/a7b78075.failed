@@ -1,0 +1,206 @@
+mm: gup: use get_user_pages_unlocked within get_user_pages_fast
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] gup: use get_user_pages_unlocked within get_user_pages_fast (Andrea Arcangeli) [965657]
+Rebuild_FUZZ: 96.72%
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit a7b780750e1a1c7833812681e1f8fa30bbb06802
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a7b78075.failed
+
+This allows the get_user_pages_fast slow path to release the mmap_sem
+before blocking.
+
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Reviewed-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Andres Lagar-Cavilla <andreslc@google.com>
+	Cc: Peter Feiner <pfeiner@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a7b780750e1a1c7833812681e1f8fa30bbb06802)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/mm/gup.c
+#	mm/gup.c
+diff --cc arch/s390/mm/gup.c
+index 1f5315d1215c,5c586c78ca8d..000000000000
+--- a/arch/s390/mm/gup.c
++++ b/arch/s390/mm/gup.c
+@@@ -219,63 -225,20 +219,75 @@@ int get_user_pages_fast(unsigned long s
+  			struct page **pages)
+  {
+  	struct mm_struct *mm = current->mm;
+ -	int nr, ret;
+ +	unsigned long addr, len, end;
+ +	unsigned long next;
+ +	pgd_t *pgdp, pgd;
+ +	int nr = 0;
+  
+  	start &= PAGE_MASK;
+ -	nr = __get_user_pages_fast(start, nr_pages, write, pages);
+ -	if (nr == nr_pages)
+ -		return nr;
+ +	addr = start;
+ +	len = (unsigned long) nr_pages << PAGE_SHIFT;
+ +	end = start + len;
+ +	if ((end < start) || (end > TASK_SIZE))
+ +		goto slow_irqon;
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * local_irq_disable() doesn't prevent pagetable teardown, but does
+ +	 * prevent the pagetables from being freed on s390.
+ +	 *
+ +	 * So long as we atomically load page table pointers versus teardown,
+ +	 * we can follow the address down to the the page and take a ref on it.
+ +	 */
+ +	local_irq_disable();
+ +	pgdp = pgd_offset(mm, addr);
+ +	do {
+ +		pgd = *pgdp;
+ +		barrier();
+ +		next = pgd_addr_end(addr, end);
+ +		if (pgd_none(pgd))
+ +			goto slow;
+ +		if (!gup_pud_range(pgdp, pgd, addr, next, write, pages, &nr))
+ +			goto slow;
+ +	} while (pgdp++, addr = next, addr != end);
+ +	local_irq_enable();
+ +
+ +	VM_BUG_ON(nr != (end - start) >> PAGE_SHIFT);
+ +	return nr;
+ +
+ +	{
+ +		int ret;
+ +slow:
+ +		local_irq_enable();
+ +slow_irqon:
+ +		/* Try to get the remaining pages with get_user_pages */
+ +		start += nr << PAGE_SHIFT;
+ +		pages += nr;
+  
+ +		down_read(&mm->mmap_sem);
+ +		ret = get_user_pages(current, mm, start,
+ +			(end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
+ +		up_read(&mm->mmap_sem);
+ +
+ +		/* Have to be a bit careful with return values */
+ +		if (nr > 0) {
+ +			if (ret < 0)
+ +				ret = nr;
+ +			else
+ +				ret += nr;
+ +		}
+ +
+ +		return ret;
+ +	}
+++=======
++ 	/* Try to get the remaining pages with get_user_pages */
++ 	start += nr << PAGE_SHIFT;
++ 	pages += nr;
++ 	ret = get_user_pages_unlocked(current, mm, start,
++ 			     nr_pages - nr, write, 0, pages);
++ 	/* Have to be a bit careful with return values */
++ 	if (nr > 0)
++ 		ret = (ret < 0) ? nr : ret + nr;
++ 	return ret;
+++>>>>>>> a7b780750e1a (mm: gup: use get_user_pages_unlocked within get_user_pages_fast)
+  }
+* Unmerged path mm/gup.c
+diff --git a/arch/mips/mm/gup.c b/arch/mips/mm/gup.c
+index d4ea5c9c4a93..6e810fe890e3 100644
+--- a/arch/mips/mm/gup.c
++++ b/arch/mips/mm/gup.c
+@@ -300,11 +300,9 @@ slow_irqon:
+ 	start += nr << PAGE_SHIFT;
+ 	pages += nr;
+ 
+-	down_read(&mm->mmap_sem);
+-	ret = get_user_pages(current, mm, start,
+-				(end - start) >> PAGE_SHIFT,
+-				write, 0, pages, NULL);
+-	up_read(&mm->mmap_sem);
++	ret = get_user_pages_unlocked(current, mm, start,
++				      (end - start) >> PAGE_SHIFT,
++				      write, 0, pages);
+ 
+ 	/* Have to be a bit careful with return values */
+ 	if (nr > 0) {
+* Unmerged path arch/s390/mm/gup.c
+diff --git a/arch/sh/mm/gup.c b/arch/sh/mm/gup.c
+index bf8daf9d9c9b..d567a2aa4d59 100644
+--- a/arch/sh/mm/gup.c
++++ b/arch/sh/mm/gup.c
+@@ -255,10 +255,8 @@ slow_irqon:
+ 		start += nr << PAGE_SHIFT;
+ 		pages += nr;
+ 
+-		down_read(&mm->mmap_sem);
+-		ret = get_user_pages(current, mm, start,
+-			(end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
+-		up_read(&mm->mmap_sem);
++		ret = get_user_pages_unlocked(current, mm, start,
++			(end - start) >> PAGE_SHIFT, write, 0, pages);
+ 
+ 		/* Have to be a bit careful with return values */
+ 		if (nr > 0) {
+diff --git a/arch/sparc/mm/gup.c b/arch/sparc/mm/gup.c
+index 01ee23dd724d..31641ea08d9b 100644
+--- a/arch/sparc/mm/gup.c
++++ b/arch/sparc/mm/gup.c
+@@ -220,10 +220,8 @@ slow:
+ 		start += nr << PAGE_SHIFT;
+ 		pages += nr;
+ 
+-		down_read(&mm->mmap_sem);
+-		ret = get_user_pages(current, mm, start,
+-			(end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
+-		up_read(&mm->mmap_sem);
++		ret = get_user_pages_unlocked(current, mm, start,
++			(end - start) >> PAGE_SHIFT, write, 0, pages);
+ 
+ 		/* Have to be a bit careful with return values */
+ 		if (nr > 0) {
+diff --git a/arch/x86/mm/gup.c b/arch/x86/mm/gup.c
+index 207d9aef662d..2ab183bfc9f4 100644
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@ -388,10 +388,9 @@ slow_irqon:
+ 		start += nr << PAGE_SHIFT;
+ 		pages += nr;
+ 
+-		down_read(&mm->mmap_sem);
+-		ret = get_user_pages(current, mm, start,
+-			(end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
+-		up_read(&mm->mmap_sem);
++		ret = get_user_pages_unlocked(current, mm, start,
++					      (end - start) >> PAGE_SHIFT,
++					      write, 0, pages);
+ 
+ 		/* Have to be a bit careful with return values */
+ 		if (nr > 0) {
+* Unmerged path mm/gup.c
+diff --git a/mm/util.c b/mm/util.c
+index 4a15b2ea405d..3c0f20a09fb6 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -344,14 +344,8 @@ int __attribute__((weak)) get_user_pages_fast(unsigned long start,
+ 				int nr_pages, int write, struct page **pages)
+ {
+ 	struct mm_struct *mm = current->mm;
+-	int ret;
+-
+-	down_read(&mm->mmap_sem);
+-	ret = get_user_pages(current, mm, start, nr_pages,
+-					write, 0, pages, NULL);
+-	up_read(&mm->mmap_sem);
+-
+-	return ret;
++	return get_user_pages_unlocked(current, mm, start, nr_pages,
++				       write, 0, pages);
+ }
+ EXPORT_SYMBOL_GPL(get_user_pages_fast);
+ 
