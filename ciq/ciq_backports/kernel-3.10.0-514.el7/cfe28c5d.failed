@@ -1,0 +1,178 @@
+x86: mm: Remove x86 version of huge_pmd_share.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] mm: Remove x86 version of huge_pmd_share (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 93.02%
+commit-author Steve Capper <steve.capper@linaro.org>
+commit cfe28c5d63d86b558a1bf1990db7a0aa55b2dec9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cfe28c5d.failed
+
+The huge_pmd_share code has been copied over to mm/hugetlb.c to
+make it accessible to other architectures.
+
+Remove the x86 copy of the huge_pmd_share code and enable the
+ARCH_WANT_HUGE_PMD_SHARE config flag. That way we reference the
+general one.
+
+	Signed-off-by: Steve Capper <steve.capper@linaro.org>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit cfe28c5d63d86b558a1bf1990db7a0aa55b2dec9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/hugetlbpage.c
+diff --cc arch/x86/mm/hugetlbpage.c
+index e4afb30191c1,7e522a359972..000000000000
+--- a/arch/x86/mm/hugetlbpage.c
++++ b/arch/x86/mm/hugetlbpage.c
+@@@ -16,128 -16,6 +16,131 @@@
+  #include <asm/tlbflush.h>
+  #include <asm/pgalloc.h>
+  
+++<<<<<<< HEAD
+ +static unsigned long page_table_shareable(struct vm_area_struct *svma,
+ +				struct vm_area_struct *vma,
+ +				unsigned long addr, pgoff_t idx)
+ +{
+ +	unsigned long saddr = ((idx - svma->vm_pgoff) << PAGE_SHIFT) +
+ +				svma->vm_start;
+ +	unsigned long sbase = saddr & PUD_MASK;
+ +	unsigned long s_end = sbase + PUD_SIZE;
+ +
+ +	/* Allow segments to share if only one is marked locked */
+ +	unsigned long vm_flags = vma->vm_flags & ~VM_LOCKED;
+ +	unsigned long svm_flags = svma->vm_flags & ~VM_LOCKED;
+ +
+ +	/*
+ +	 * match the virtual addresses, permission and the alignment of the
+ +	 * page table page.
+ +	 */
+ +	if (pmd_index(addr) != pmd_index(saddr) ||
+ +	    vm_flags != svm_flags ||
+ +	    sbase < svma->vm_start || svma->vm_end < s_end)
+ +		return 0;
+ +
+ +	return saddr;
+ +}
+ +
+ +static int vma_shareable(struct vm_area_struct *vma, unsigned long addr)
+ +{
+ +	unsigned long base = addr & PUD_MASK;
+ +	unsigned long end = base + PUD_SIZE;
+ +
+ +	/*
+ +	 * check on proper vm_flags and page table alignment
+ +	 */
+ +	if (vma->vm_flags & VM_MAYSHARE &&
+ +	    vma->vm_start <= base && end <= vma->vm_end)
+ +		return 1;
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
+ + * and returns the corresponding pte. While this is not necessary for the
+ + * !shared pmd case because we can allocate the pmd later as well, it makes the
+ + * code much cleaner. pmd allocation is essential for the shared case because
+ + * pud has to be populated inside the same i_mmap_mutex section - otherwise
+ + * racing tasks could either miss the sharing (see huge_pte_offset) or select a
+ + * bad pmd for sharing.
+ + */
+ +static pte_t *
+ +huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
+ +{
+ +	struct vm_area_struct *vma = find_vma(mm, addr);
+ +	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	pgoff_t idx = ((addr - vma->vm_start) >> PAGE_SHIFT) +
+ +			vma->vm_pgoff;
+ +	struct vm_area_struct *svma;
+ +	unsigned long saddr;
+ +	pte_t *spte = NULL;
+ +	pte_t *pte;
+ +	spinlock_t *ptl;
+ +
+ +	if (!vma_shareable(vma, addr))
+ +		return (pte_t *)pmd_alloc(mm, pud, addr);
+ +
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +	vma_interval_tree_foreach(svma, &mapping->i_mmap, idx, idx) {
+ +		if (svma == vma)
+ +			continue;
+ +
+ +		saddr = page_table_shareable(svma, vma, addr, idx);
+ +		if (saddr) {
+ +			spte = huge_pte_offset(svma->vm_mm, saddr);
+ +			if (spte) {
+ +				get_page(virt_to_page(spte));
+ +				break;
+ +			}
+ +		}
+ +	}
+ +
+ +	if (!spte)
+ +		goto out;
+ +
+ +	ptl = huge_pte_lockptr(hstate_vma(vma), mm, spte);
+ +	spin_lock(ptl);
+ +	if (pud_none(*pud))
+ +		pud_populate(mm, pud, (pmd_t *)((unsigned long)spte & PAGE_MASK));
+ +	else
+ +		put_page(virt_to_page(spte));
+ +	spin_unlock(ptl);
+ +out:
+ +	pte = (pte_t *)pmd_alloc(mm, pud, addr);
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+ +	return pte;
+ +}
+ +
+ +/*
+ + * unmap huge page backed by shared pte.
+ + *
+ + * Hugetlb pte page is ref counted at the time of mapping.  If pte is shared
+ + * indicated by page_count > 1, unmap is achieved by clearing pud and
+ + * decrementing the ref count. If count == 1, the pte page is not shared.
+ + *
+ + * called with page table lock held.
+ + *
+ + * returns: 1 successfully unmapped a shared pte page
+ + *	    0 the underlying pte page is not shared, or it is the last user
+ + */
+ +int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ +{
+ +	pgd_t *pgd = pgd_offset(mm, *addr);
+ +	pud_t *pud = pud_offset(pgd, *addr);
+ +
+ +	BUG_ON(page_count(virt_to_page(ptep)) == 0);
+ +	if (page_count(virt_to_page(ptep)) == 1)
+ +		return 0;
+ +
+ +	pud_clear(pud);
+ +	put_page(virt_to_page(ptep));
+ +	*addr = ALIGN(*addr, HPAGE_SIZE * PTRS_PER_PTE) - HPAGE_SIZE;
+ +	return 1;
+ +}
+ +
+++=======
+++>>>>>>> cfe28c5d63d8 (x86: mm: Remove x86 version of huge_pmd_share.)
+  pte_t *huge_pte_alloc(struct mm_struct *mm,
+  			unsigned long addr, unsigned long sz)
+  {
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 3fae2a63357c..915c515fe681 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -209,6 +209,9 @@ config ARCH_HIBERNATION_POSSIBLE
+ config ARCH_SUSPEND_POSSIBLE
+ 	def_bool y
+ 
++config ARCH_WANT_HUGE_PMD_SHARE
++	def_bool y
++
+ config ZONE_DMA32
+ 	bool
+ 	default X86_64
+* Unmerged path arch/x86/mm/hugetlbpage.c
