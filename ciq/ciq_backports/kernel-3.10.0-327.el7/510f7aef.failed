@@ -1,0 +1,163 @@
+Drivers: hv: vmbus: prefer 'die' notification chain to 'panic'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: prefer 'die' notification chain to 'panic' (Vitaly Kuznetsov) [1235998]
+Rebuild_FUZZ: 88.29%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 510f7aef65bb7ed22cf9c7f94f955727f963ede4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/510f7aef.failed
+
+current_pt_regs() sometimes returns regs of the userspace process and in
+case of a kernel crash this is not what we need to report. E.g. when we
+trigger crash with sysrq we see the following:
+...
+ RIP: 0010:[<ffffffff815b8696>]  [<ffffffff815b8696>] sysrq_handle_crash+0x16/0x20
+ RSP: 0018:ffff8800db0a7d88  EFLAGS: 00010246
+ RAX: 000000000000000f RBX: ffffffff820a0660 RCX: 0000000000000000
+...
+at the same time current_pt_regs() give us:
+ip=7f899ea7e9e0, ax=ffffffffffffffda, bx=26c81a0, cx=7f899ea7e9e0, ...
+These registers come from the userspace process triggered the crash. As we
+don't even know which process it was this information is rather useless.
+
+When kernel crash happens through 'die' proper regs are being passed to
+all receivers on the die_chain (and panic_notifier_list is being notified
+with the string passed to panic() only). If panic() is called manually
+(e.g. on BUG()) we won't get 'die' notification so keep the 'panic'
+notification reporter as well but guard against double reporting.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 510f7aef65bb7ed22cf9c7f94f955727f963ede4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index ca849c308e2e,b6114cc89aeb..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -36,15 -35,73 +36,78 @@@
+  #include <asm/hyperv.h>
+  #include <asm/hypervisor.h>
+  #include <asm/mshyperv.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/notifier.h>
++ #include <linux/ptrace.h>
++ #include <linux/kdebug.h>
+++>>>>>>> 510f7aef65bb (Drivers: hv: vmbus: prefer 'die' notification chain to 'panic')
+  #include "hyperv_vmbus.h"
+  
+ +
+  static struct acpi_device  *hv_acpi_dev;
+  
+  static struct tasklet_struct msg_dpc;
+  static struct completion probe_event;
+  static int irq;
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void hyperv_report_panic(struct pt_regs *regs)
++ {
++ 	static bool panic_reported;
++ 
++ 	/*
++ 	 * We prefer to report panic on 'die' chain as we have proper
++ 	 * registers to report, but if we miss it (e.g. on BUG()) we need
++ 	 * to report it on 'panic'.
++ 	 */
++ 	if (panic_reported)
++ 		return;
++ 	panic_reported = true;
++ 
++ 	wrmsrl(HV_X64_MSR_CRASH_P0, regs->ip);
++ 	wrmsrl(HV_X64_MSR_CRASH_P1, regs->ax);
++ 	wrmsrl(HV_X64_MSR_CRASH_P2, regs->bx);
++ 	wrmsrl(HV_X64_MSR_CRASH_P3, regs->cx);
++ 	wrmsrl(HV_X64_MSR_CRASH_P4, regs->dx);
++ 
++ 	/*
++ 	 * Let Hyper-V know there is crash data available
++ 	 */
++ 	wrmsrl(HV_X64_MSR_CRASH_CTL, HV_CRASH_CTL_CRASH_NOTIFY);
++ }
++ 
++ static int hyperv_panic_event(struct notifier_block *nb, unsigned long val,
++ 			      void *args)
++ {
++ 	struct pt_regs *regs;
++ 
++ 	regs = current_pt_regs();
++ 
++ 	hyperv_report_panic(regs);
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int hyperv_die_event(struct notifier_block *nb, unsigned long val,
++ 			    void *args)
++ {
++ 	struct die_args *die = (struct die_args *)args;
++ 	struct pt_regs *regs = die->regs;
++ 
++ 	hyperv_report_panic(regs);
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block hyperv_die_block = {
++ 	.notifier_call = hyperv_die_event,
++ };
++ static struct notifier_block hyperv_panic_block = {
++ 	.notifier_call = hyperv_panic_event,
++ };
++ 
+++>>>>>>> 510f7aef65bb (Drivers: hv: vmbus: prefer 'die' notification chain to 'panic')
+  struct resource hyperv_mmio = {
+  	.name  = "hyperv mmio",
+  	.flags = IORESOURCE_MEM,
+@@@ -584,6 -866,17 +647,20 @@@ static int vmbus_bus_init(int irq
+  	if (ret)
+  		goto err_alloc;
+  
+++<<<<<<< HEAD
+++=======
++ 	hv_cpu_hotplug_quirk(true);
++ 
++ 	/*
++ 	 * Only register if the crash MSRs are available
++ 	 */
++ 	if (ms_hyperv.features & HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE) {
++ 		register_die_notifier(&hyperv_die_block);
++ 		atomic_notifier_chain_register(&panic_notifier_list,
++ 					       &hyperv_panic_block);
++ 	}
++ 
+++>>>>>>> 510f7aef65bb (Drivers: hv: vmbus: prefer 'die' notification chain to 'panic')
+  	vmbus_request_offers();
+  
+  	return 0;
+@@@ -832,9 -1159,18 +909,10 @@@ cleanup
+  
+  static void __exit vmbus_exit(void)
+  {
+ -	int cpu;
+ -
+ -	hv_remove_kexec_handler();
+ -	hv_remove_crash_handler();
+ -	vmbus_connection.conn_state = DISCONNECTED;
+ -	hv_synic_clockevents_cleanup();
+ -	vmbus_disconnect();
+  	hv_remove_vmbus_irq();
+ -	tasklet_kill(&msg_dpc);
+  	vmbus_free_channels();
+  	if (ms_hyperv.features & HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE) {
++ 		unregister_die_notifier(&hyperv_die_block);
+  		atomic_notifier_chain_unregister(&panic_notifier_list,
+  						 &hyperv_panic_block);
+  	}
+* Unmerged path drivers/hv/vmbus_drv.c
