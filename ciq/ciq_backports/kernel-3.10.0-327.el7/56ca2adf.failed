@@ -1,0 +1,200 @@
+fib_trie: Move rcu from key_vector to tnode, add accessors.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 56ca2adf6ac1fca57f504ac1d76f7dff1dc08d3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/56ca2adf.failed
+
+RCU is only needed once for the entire node, not once per key_vector so we
+can pull that out and move it to the tnode structure.
+
+In addition add accessors to be used inside the RCU functions so that we
+can more easily get from the key vector to either the tnode or the trie
+pointers.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56ca2adf6ac1fca57f504ac1d76f7dff1dc08d3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 8be89b1a8b93,b9b5bbacace6..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -91,35 -92,32 +91,49 @@@ typedef unsigned int t_key
+  #define IS_TNODE(n) ((n)->bits)
+  #define IS_LEAF(n) (!(n)->bits)
+  
+++<<<<<<< HEAD
+ +#define get_index(_key, _kv) (((_key) ^ (_kv)->key) >> (_kv)->pos)
+++=======
++ struct key_vector {
++ 	t_key empty_children; /* KEYLENGTH bits needed */
++ 	t_key full_children;  /* KEYLENGTH bits needed */
++ 	struct key_vector __rcu *parent;
+++>>>>>>> 56ca2adf6ac1 (fib_trie: Move rcu from key_vector to tnode, add accessors.)
+  
+ +struct tnode {
+  	t_key key;
+ -	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char bits;		/* 2log(KEYLENGTH) bits needed */
+ +	unsigned char pos;		/* 2log(KEYLENGTH) bits needed */
+  	unsigned char slen;
+ +	struct tnode __rcu *parent;
+ +	struct rcu_head rcu;
+  	union {
+ -		/* This list pointer if valid if (pos | bits) == 0 (LEAF) */
+ -		struct hlist_head leaf;
+ -		/* This array is valid if (pos | bits) > 0 (TNODE) */
+ -		struct key_vector __rcu *tnode[0];
+ +		/* The fields in this struct are valid if bits > 0 (TNODE) */
+ +		struct {
+ +			t_key empty_children; /* KEYLENGTH bits needed */
+ +			t_key full_children;  /* KEYLENGTH bits needed */
+ +			struct tnode __rcu *child[0];
+ +		};
+ +		/* This list pointer if valid if bits == 0 (LEAF) */
+ +		struct hlist_head list;
+  	};
+  };
+  
+++<<<<<<< HEAD
+ +struct leaf_info {
+ +	struct hlist_node hlist;
+ +	int plen;
+ +	u32 mask_plen; /* ntohl(inet_make_mask(plen)) */
+ +	struct list_head falh;
+ +	struct rcu_head rcu;
+++=======
++ struct tnode {
++ 	struct rcu_head rcu;
++ 	struct key_vector kv[1];
++ #define tn_bits kv[0].bits
+++>>>>>>> 56ca2adf6ac1 (fib_trie: Move rcu from key_vector to tnode, add accessors.)
+  };
+  
+ -#define TNODE_SIZE(n)	offsetof(struct tnode, kv[0].tnode[n])
+ -#define LEAF_SIZE	TNODE_SIZE(1)
+ -
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+  struct trie_use_stats {
+  	unsigned int gets;
+@@@ -161,8 -159,14 +175,13 @@@ static const int sync_pages = 128
+  static struct kmem_cache *fn_alias_kmem __read_mostly;
+  static struct kmem_cache *trie_leaf_kmem __read_mostly;
+  
++ static inline struct tnode *tn_info(struct key_vector *kv)
++ {
++ 	return container_of(kv, struct tnode, kv[0]);
++ }
++ 
+  /* caller must hold RTNL */
+  #define node_parent(n) rtnl_dereference((n)->parent)
+ -#define get_child(tn, i) rtnl_dereference((tn)->tnode[i])
+  
+  /* caller must hold RCU read lock or RTNL */
+  #define node_parent_rcu(n) rcu_dereference_rtnl((n)->parent)
+@@@ -184,20 -189,13 +203,23 @@@ static inline unsigned long tnode_child
+  	return (1ul << tn->bits) & ~(1ul);
+  }
+  
+ -static inline unsigned long get_index(t_key key, struct key_vector *kv)
+ +/* caller must hold RTNL */
+ +static inline struct tnode *tnode_get_child(const struct tnode *tn,
+ +					    unsigned long i)
+  {
+ -	unsigned long index = key ^ kv->key;
+ +	return rtnl_dereference(tn->child[i]);
+ +}
+  
+ -	return index >> kv->pos;
+++<<<<<<< HEAD
+ +/* caller must hold RCU read lock or RTNL */
+ +static inline struct tnode *tnode_get_child_rcu(const struct tnode *tn,
+ +						unsigned long i)
+ +{
+ +	return rcu_dereference_rtnl(tn->child[i]);
+  }
+  
+++=======
+++>>>>>>> 56ca2adf6ac1 (fib_trie: Move rcu from key_vector to tnode, add accessors.)
+  /* To understand this stuff, an understanding of keys and all their bits is
+   * necessary. Every node in the trie has a key associated with it, but not
+   * all of the bits in that key are significant.
+@@@ -288,15 -288,19 +310,15 @@@ static void __node_free_rcu(struct rcu_
+  		vfree(n);
+  }
+  
+- #define node_free(n) call_rcu(&n->rcu, __node_free_rcu)
++ #define node_free(n) call_rcu(&tn_info(n)->rcu, __node_free_rcu)
+  
+ -static struct tnode *tnode_alloc(int bits)
+ +static inline void free_leaf_info(struct leaf_info *leaf)
+  {
+ -	size_t size;
+ -
+ -	/* verify bits is within bounds */
+ -	if (bits > TNODE_VMALLOC_MAX)
+ -		return NULL;
+ -
+ -	/* determine size and verify it is non-zero and didn't overflow */
+ -	size = TNODE_SIZE(1ul << bits);
+ +	kfree_rcu(leaf, rcu);
+ +}
+  
+ +static struct tnode *tnode_alloc(size_t size)
+ +{
+  	if (size <= PAGE_SIZE)
+  		return kzalloc(size, GFP_KERNEL);
+  	else
+@@@ -437,30 -434,31 +459,34 @@@ static inline void put_child_root(struc
+  	if (tp)
+  		put_child(tp, get_index(key, tp), n);
+  	else
+ -		rcu_assign_pointer(t->tnode[0], n);
+ +		rcu_assign_pointer(t->trie, n);
+  }
+  
+ -static inline void tnode_free_init(struct key_vector *tn)
+ +static inline void tnode_free_init(struct tnode *tn)
+  {
+- 	tn->rcu.next = NULL;
++ 	tn_info(tn)->rcu.next = NULL;
+  }
+  
+ -static inline void tnode_free_append(struct key_vector *tn,
+ -				     struct key_vector *n)
+ +static inline void tnode_free_append(struct tnode *tn, struct tnode *n)
+  {
+- 	n->rcu.next = tn->rcu.next;
+- 	tn->rcu.next = &n->rcu;
++ 	tn_info(n)->rcu.next = tn_info(tn)->rcu.next;
++ 	tn_info(tn)->rcu.next = &tn_info(n)->rcu;
+  }
+  
+ -static void tnode_free(struct key_vector *tn)
+ +static void tnode_free(struct tnode *tn)
+  {
+- 	struct callback_head *head = &tn->rcu;
++ 	struct callback_head *head = &tn_info(tn)->rcu;
+  
+  	while (head) {
+  		head = head->next;
+ -		tnode_free_size += TNODE_SIZE(1ul << tn->bits);
+ +		tnode_free_size += offsetof(struct tnode, child[1 << tn->bits]);
+  		node_free(tn);
+  
+++<<<<<<< HEAD
+ +		tn = container_of(head, struct tnode, rcu);
+++=======
++ 		tn = container_of(head, struct tnode, rcu)->kv;
+++>>>>>>> 56ca2adf6ac1 (fib_trie: Move rcu from key_vector to tnode, add accessors.)
+  	}
+  
+  	if (tnode_free_size >= PAGE_SIZE * sync_pages) {
+* Unmerged path net/ipv4/fib_trie.c
