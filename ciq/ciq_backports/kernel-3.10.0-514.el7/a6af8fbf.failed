@@ -1,0 +1,178 @@
+tracing: Cleanup saved_cmdlines_size changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit a6af8fbf17989e41fef5cacf3988a724fb687d78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a6af8fbf.failed
+
+The recent addition of saved_cmdlines_size file had some remaining
+(minor - mostly coding style) issues.  Fix them by passing pointer
+name to sizeof() and using scnprintf().
+
+Link: http://lkml.kernel.org/p/1402384295-23680-1-git-send-email-namhyung@kernel.org
+
+	Cc: Namhyung Kim <namhyung.kim@lge.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Yoshihiro YUNOMAE <yoshihiro.yunomae.ez@hitachi.com>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit a6af8fbf17989e41fef5cacf3988a724fb687d78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace.c
+diff --cc kernel/trace/trace.c
+index be5207f86004,2b458c60e0da..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -1257,11 -1300,56 +1257,62 @@@ static arch_spinlock_t trace_cmdline_lo
+  /* temporary disable recording */
+  static atomic_t trace_record_cmdline_disabled __read_mostly;
+  
+ -static inline char *get_saved_cmdlines(int idx)
+ +static void trace_init_cmdlines(void)
+  {
+++<<<<<<< HEAD
+ +	memset(&map_pid_to_cmdline, NO_CMDLINE_MAP, sizeof(map_pid_to_cmdline));
+ +	memset(&map_cmdline_to_pid, NO_CMDLINE_MAP, sizeof(map_cmdline_to_pid));
+ +	cmdline_idx = 0;
+++=======
++ 	return &savedcmd->saved_cmdlines[idx * TASK_COMM_LEN];
++ }
++ 
++ static inline void set_cmdline(int idx, const char *cmdline)
++ {
++ 	memcpy(get_saved_cmdlines(idx), cmdline, TASK_COMM_LEN);
++ }
++ 
++ static int allocate_cmdlines_buffer(unsigned int val,
++ 				    struct saved_cmdlines_buffer *s)
++ {
++ 	s->map_cmdline_to_pid = kmalloc(val * sizeof(*s->map_cmdline_to_pid),
++ 					GFP_KERNEL);
++ 	if (!s->map_cmdline_to_pid)
++ 		return -ENOMEM;
++ 
++ 	s->saved_cmdlines = kmalloc(val * TASK_COMM_LEN, GFP_KERNEL);
++ 	if (!s->saved_cmdlines) {
++ 		kfree(s->map_cmdline_to_pid);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	s->cmdline_idx = 0;
++ 	s->cmdline_num = val;
++ 	memset(&s->map_pid_to_cmdline, NO_CMDLINE_MAP,
++ 	       sizeof(s->map_pid_to_cmdline));
++ 	memset(s->map_cmdline_to_pid, NO_CMDLINE_MAP,
++ 	       val * sizeof(*s->map_cmdline_to_pid));
++ 
++ 	return 0;
++ }
++ 
++ static int trace_create_savedcmd(void)
++ {
++ 	int ret;
++ 
++ 	savedcmd = kmalloc(sizeof(*savedcmd), GFP_KERNEL);
++ 	if (!savedcmd)
++ 		return -ENOMEM;
++ 
++ 	ret = allocate_cmdlines_buffer(SAVED_CMDLINES_DEFAULT, savedcmd);
++ 	if (ret < 0) {
++ 		kfree(savedcmd);
++ 		savedcmd = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> a6af8fbf1798 (tracing: Cleanup saved_cmdlines_size changes)
+  }
+  
+  int is_tracing_stopped(void)
+@@@ -3631,6 -3833,79 +3682,82 @@@ static const struct file_operations tra
+  };
+  
+  static ssize_t
+++<<<<<<< HEAD
+++=======
++ tracing_saved_cmdlines_size_read(struct file *filp, char __user *ubuf,
++ 				 size_t cnt, loff_t *ppos)
++ {
++ 	char buf[64];
++ 	int r;
++ 
++ 	arch_spin_lock(&trace_cmdline_lock);
++ 	r = scnprintf(buf, sizeof(buf), "%u\n", savedcmd->cmdline_num);
++ 	arch_spin_unlock(&trace_cmdline_lock);
++ 
++ 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, r);
++ }
++ 
++ static void free_saved_cmdlines_buffer(struct saved_cmdlines_buffer *s)
++ {
++ 	kfree(s->saved_cmdlines);
++ 	kfree(s->map_cmdline_to_pid);
++ 	kfree(s);
++ }
++ 
++ static int tracing_resize_saved_cmdlines(unsigned int val)
++ {
++ 	struct saved_cmdlines_buffer *s, *savedcmd_temp;
++ 
++ 	s = kmalloc(sizeof(*s), GFP_KERNEL);
++ 	if (!s)
++ 		return -ENOMEM;
++ 
++ 	if (allocate_cmdlines_buffer(val, s) < 0) {
++ 		kfree(s);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	arch_spin_lock(&trace_cmdline_lock);
++ 	savedcmd_temp = savedcmd;
++ 	savedcmd = s;
++ 	arch_spin_unlock(&trace_cmdline_lock);
++ 	free_saved_cmdlines_buffer(savedcmd_temp);
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t
++ tracing_saved_cmdlines_size_write(struct file *filp, const char __user *ubuf,
++ 				  size_t cnt, loff_t *ppos)
++ {
++ 	unsigned long val;
++ 	int ret;
++ 
++ 	ret = kstrtoul_from_user(ubuf, cnt, 10, &val);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* must have at least 1 entry or less than PID_MAX_DEFAULT */
++ 	if (!val || val > PID_MAX_DEFAULT)
++ 		return -EINVAL;
++ 
++ 	ret = tracing_resize_saved_cmdlines((unsigned int)val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	*ppos += cnt;
++ 
++ 	return cnt;
++ }
++ 
++ static const struct file_operations tracing_saved_cmdlines_size_fops = {
++ 	.open		= tracing_open_generic,
++ 	.read		= tracing_saved_cmdlines_size_read,
++ 	.write		= tracing_saved_cmdlines_size_write,
++ };
++ 
++ static ssize_t
+++>>>>>>> a6af8fbf1798 (tracing: Cleanup saved_cmdlines_size changes)
+  tracing_set_trace_read(struct file *filp, char __user *ubuf,
+  		       size_t cnt, loff_t *ppos)
+  {
+* Unmerged path kernel/trace/trace.c
