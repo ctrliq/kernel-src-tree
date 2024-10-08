@@ -1,0 +1,125 @@
+net: Move main gso loop out of dev_hard_start_xmit() into helper.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Move main gso loop out of dev_hard_start_xmit() into helper (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 95.16%
+commit-author David S. Miller <davem@davemloft.net>
+commit 7f2e870f2a48a0524a3b03b04fa019311d16a7f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7f2e870f.failed
+
+There is a slight policy change happening here as well.
+
+The previous code would drop the entire rest of the GSO skb if any of
+them got, for example, a congestion notification.
+
+That makes no sense, anything NET_XMIT_MASK and below is something
+like congestion or policing.  And in the congestion case it doesn't
+even mean the packet was actually dropped.
+
+Just continue until dev_xmit_complete() evaluates to false.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f2e870f2a48a0524a3b03b04fa019311d16a7f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 1924c9647d47,ab7bb809711e..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2485,6 -2599,51 +2485,54 @@@ netdev_features_t netif_skb_features(st
+  }
+  EXPORT_SYMBOL(netif_skb_features);
+  
+++<<<<<<< HEAD
+++=======
++ static int xmit_one(struct sk_buff *skb, struct net_device *dev,
++ 		    struct netdev_queue *txq)
++ {
++ 	unsigned int len;
++ 	int rc;
++ 
++ 	if (!list_empty(&ptype_all))
++ 		dev_queue_xmit_nit(skb, dev);
++ 
++ 	len = skb->len;
++ 	trace_net_dev_start_xmit(skb, dev);
++ 	rc = netdev_start_xmit(skb, dev, txq);
++ 	trace_net_dev_xmit(skb, rc, dev, len);
++ 
++ 	return rc;
++ }
++ 
++ static struct sk_buff *xmit_list(struct sk_buff *first, struct net_device *dev,
++ 				 struct netdev_queue *txq, int *ret)
++ {
++ 	struct sk_buff *skb = first;
++ 	int rc = NETDEV_TX_OK;
++ 
++ 	while (skb) {
++ 		struct sk_buff *next = skb->next;
++ 
++ 		skb->next = NULL;
++ 		rc = xmit_one(skb, dev, txq);
++ 		if (unlikely(!dev_xmit_complete(rc))) {
++ 			skb->next = next;
++ 			goto out;
++ 		}
++ 
++ 		skb = next;
++ 		if (netif_xmit_stopped(txq) && skb) {
++ 			rc = NETDEV_TX_BUSY;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	*ret = rc;
++ 	return skb;
++ }
++ 
+++>>>>>>> 7f2e870f2a48 (net: Move main gso loop out of dev_hard_start_xmit() into helper.)
+  int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+  			struct netdev_queue *txq)
+  {
+@@@ -2560,31 -2709,7 +2608,35 @@@
+  	}
+  
+  gso:
+++<<<<<<< HEAD
+ +	do {
+ +		struct sk_buff *nskb = skb->next;
+ +
+ +		skb->next = nskb->next;
+ +		nskb->next = NULL;
+ +
+ +		if (!list_empty(&ptype_all))
+ +			dev_queue_xmit_nit(nskb, dev);
+ +
+ +		skb_len = nskb->len;
+ +		rc = ops->ndo_start_xmit(nskb, dev);
+ +		trace_net_dev_xmit(nskb, rc, dev, skb_len);
+ +		if (unlikely(rc != NETDEV_TX_OK)) {
+ +			if (rc & ~NETDEV_TX_MASK)
+ +				goto out_kfree_gso_skb;
+ +			nskb->next = skb->next;
+ +			skb->next = nskb;
+ +			return rc;
+ +		}
+ +		txq_trans_update(txq);
+ +		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ +			return NETDEV_TX_BUSY;
+ +	} while (skb->next);
+ +
+ +out_kfree_gso_skb:
+++=======
++ 	skb->next = xmit_list(skb->next, dev, txq, &rc);
+++>>>>>>> 7f2e870f2a48 (net: Move main gso loop out of dev_hard_start_xmit() into helper.)
+  	if (likely(skb->next == NULL)) {
+  		skb->destructor = DEV_GSO_CB(skb)->destructor;
+  		consume_skb(skb);
+* Unmerged path net/core/dev.c
