@@ -1,0 +1,180 @@
+ipv4: send arp replies to the correct tunnel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 63d008a4e9ee86614ca5671b7f3ba447df007190
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/63d008a4.failed
+
+When using ip lwtunnels, the additional data for xmit (basically, the actual
+tunnel to use) are carried in ip_tunnel_info either in dst->lwtstate or in
+metadata dst. When replying to ARP requests, we need to send the reply to
+the same tunnel the request came from. This means we need to construct
+proper metadata dst for ARP replies.
+
+We could perform another route lookup to get a dst entry with the correct
+lwtstate. However, this won't always ensure that the outgoing tunnel is the
+same as the incoming one, and it won't work anyway for IPv4 duplicate
+address detection.
+
+The only thing to do is to "reverse" the ip_tunnel_info.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 63d008a4e9ee86614ca5671b7f3ba447df007190)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/arp.c
+diff --cc net/ipv4/arp.c
+index eb2b67ce4b84,f03db8b7abee..000000000000
+--- a/net/ipv4/arp.c
++++ b/net/ipv4/arp.c
+@@@ -320,6 -293,39 +322,42 @@@ static void arp_error_report(struct nei
+  	kfree_skb(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Create and send an arp packet. */
++ static void arp_send_dst(int type, int ptype, __be32 dest_ip,
++ 			 struct net_device *dev, __be32 src_ip,
++ 			 const unsigned char *dest_hw,
++ 			 const unsigned char *src_hw,
++ 			 const unsigned char *target_hw,
++ 			 struct dst_entry *dst)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	/* arp on this interface. */
++ 	if (dev->flags & IFF_NOARP)
++ 		return;
++ 
++ 	skb = arp_create(type, ptype, dest_ip, dev, src_ip,
++ 			 dest_hw, src_hw, target_hw);
++ 	if (!skb)
++ 		return;
++ 
++ 	skb_dst_set(skb, dst);
++ 	arp_xmit(skb);
++ }
++ 
++ void arp_send(int type, int ptype, __be32 dest_ip,
++ 	      struct net_device *dev, __be32 src_ip,
++ 	      const unsigned char *dest_hw, const unsigned char *src_hw,
++ 	      const unsigned char *target_hw)
++ {
++ 	arp_send_dst(type, ptype, dest_ip, dev, src_ip, dest_hw, src_hw,
++ 		     target_hw, NULL);
++ }
++ EXPORT_SYMBOL(arp_send);
++ 
+++>>>>>>> 63d008a4e9ee (ipv4: send arp replies to the correct tunnel)
+  static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+  {
+  	__be32 saddr = 0;
+@@@ -375,8 -383,10 +414,15 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	arp_send(ARPOP_REQUEST, ETH_P_ARP, target, dev, saddr,
+ +		 dst_hw, dev->dev_addr, NULL);
+++=======
++ 	if (skb && !(dev->priv_flags & IFF_XMIT_DST_RELEASE))
++ 		dst = dst_clone(skb_dst(skb));
++ 	arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, target, dev, saddr,
++ 		     dst_hw, dev->dev_addr, NULL, dst);
+++>>>>>>> 63d008a4e9ee (ipv4: send arp replies to the correct tunnel)
+  }
+  
+  static int arp_ignore(struct in_device *in_dev, __be32 sip, __be32 tip)
+@@@ -731,6 -652,8 +777,11 @@@ static int arp_process(struct sock *sk
+  	int addr_type;
+  	struct neighbour *n;
+  	struct net *net = dev_net(dev);
+++<<<<<<< HEAD
+++=======
++ 	struct dst_entry *reply_dst = NULL;
++ 	bool is_garp = false;
+++>>>>>>> 63d008a4e9ee (ipv4: send arp replies to the correct tunnel)
+  
+  	/* arp_rcv below verifies the ARP header and verifies the device
+  	 * is ARP'able.
+@@@ -833,10 -761,10 +889,10 @@@
+  	/* Special case: IPv4 duplicate address detection packet (RFC2131) */
+  	if (sip == 0) {
+  		if (arp->ar_op == htons(ARPOP_REQUEST) &&
+ -		    inet_addr_type_dev_table(net, dev, tip) == RTN_LOCAL &&
+ +		    inet_addr_type(net, tip) == RTN_LOCAL &&
+  		    !arp_ignore(in_dev, sip, tip))
+- 			arp_send(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha,
+- 				 dev->dev_addr, sha);
++ 			arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip,
++ 				     sha, dev->dev_addr, sha, reply_dst);
+  		goto out;
+  	}
+  
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 8a38d811a07c..310b3e7b9d45 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -271,6 +271,8 @@ int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto);
+ int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ 		  __be32 src, __be32 dst, u8 proto,
+ 		  u8 tos, u8 ttl, __be16 df, bool xnet);
++struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
++					     gfp_t flags);
+ 
+ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, bool gre_csum,
+ 					 int gso_type_mask);
+* Unmerged path net/ipv4/arp.c
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index c969294e6abb..beb2ff4c33bd 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -45,6 +45,7 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ #include <net/rtnetlink.h>
++#include <net/dst_metadata.h>
+ 
+ int iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
+ 		  __be32 src, __be32 dst, __u8 proto,
+@@ -117,6 +118,33 @@ int iptunnel_pull_header(struct sk_buff *skb, int hdr_len, __be16 inner_proto)
+ }
+ EXPORT_SYMBOL_GPL(iptunnel_pull_header);
+ 
++struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
++					     gfp_t flags)
++{
++	struct metadata_dst *res;
++	struct ip_tunnel_info *dst, *src;
++
++	if (!md || md->u.tun_info.mode & IP_TUNNEL_INFO_TX)
++		return NULL;
++
++	res = metadata_dst_alloc(0, flags);
++	if (!res)
++		return NULL;
++
++	dst = &res->u.tun_info;
++	src = &md->u.tun_info;
++	dst->key.tun_id = src->key.tun_id;
++	if (src->mode & IP_TUNNEL_INFO_IPV6)
++		memcpy(&dst->key.u.ipv6.dst, &src->key.u.ipv6.src,
++		       sizeof(struct in6_addr));
++	else
++		dst->key.u.ipv4.dst = src->key.u.ipv4.src;
++	dst->mode = src->mode | IP_TUNNEL_INFO_TX;
++
++	return res;
++}
++EXPORT_SYMBOL_GPL(iptunnel_metadata_reply);
++
+ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb,
+ 					 bool csum_help,
+ 					 int gso_type_mask)
