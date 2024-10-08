@@ -1,0 +1,111 @@
+x86/PCI: VMD: Use lock save/restore in interrupt enable path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] pci: vmd: Use lock save/restore in interrupt enable path (Myron Stowe) [1364796]
+Rebuild_FUZZ: 96.55%
+commit-author Jon Derrick <jonathan.derrick@intel.com>
+commit 3f57ff4f9c78ee0fafb010287019126ce8c1fc01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3f57ff4f.failed
+
+Enabling interrupts may result in an interrupt raised and serviced while
+VMD holds a lock, resulting in contention with the spin lock held while
+enabling interrupts.
+
+The solution is to disable preemption and save/restore the state during
+interrupt enable and disable.
+
+Fixes lockdep:
+
+  ======================================================
+  [ INFO: HARDIRQ-safe -> HARDIRQ-unsafe lock order detected ]
+  4.6.0-2016-06-16-lockdep+ #47 Tainted: G            E
+  ------------------------------------------------------
+  kworker/0:1/447 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+   (list_lock){+.+...}, at: [<ffffffffa04eb8fc>] vmd_irq_enable+0x3c/0x70 [vmd]
+
+  and this task is already holding:
+   (&irq_desc_lock_class){-.-...}, at: [<ffffffff810e1ff6>] __setup_irq+0xa6/0x610
+  which would create a new lock dependency:
+   (&irq_desc_lock_class){-.-...} -> (list_lock){+.+...}
+
+  but this new dependency connects a HARDIRQ-irq-safe lock:
+   (&irq_desc_lock_class){-.-...}
+  ... which became HARDIRQ-irq-safe at:
+    [<ffffffff810c9f21>] __lock_acquire+0x981/0xe00
+    [<ffffffff810cb039>] lock_acquire+0x119/0x220
+    [<ffffffff8167294d>] _raw_spin_lock+0x3d/0x80
+    [<ffffffff810e36d4>] handle_level_irq+0x24/0x110
+    [<ffffffff8101f20a>] handle_irq+0x1a/0x30
+    [<ffffffff81675fc1>] do_IRQ+0x61/0x120
+    [<ffffffff8167404c>] ret_from_intr+0x0/0x20
+    [<ffffffff81672e30>] _raw_spin_unlock_irqrestore+0x40/0x60
+    [<ffffffff810e21ee>] __setup_irq+0x29e/0x610
+    [<ffffffff810e25a1>] setup_irq+0x41/0x90
+    [<ffffffff81f5777f>] setup_default_timer_irq+0x1e/0x20
+    [<ffffffff81f57798>] hpet_time_init+0x17/0x19
+    [<ffffffff81f5775a>] x86_late_time_init+0xa/0x11
+    [<ffffffff81f51e9b>] start_kernel+0x382/0x436
+    [<ffffffff81f51308>] x86_64_start_reservations+0x2a/0x2c
+    [<ffffffff81f51445>] x86_64_start_kernel+0x13b/0x14a
+
+  to a HARDIRQ-irq-unsafe lock:
+   (list_lock){+.+...}
+  ... which became HARDIRQ-irq-unsafe at:
+  ...  [<ffffffff810c9d8e>] __lock_acquire+0x7ee/0xe00
+    [<ffffffff810cb039>] lock_acquire+0x119/0x220
+    [<ffffffff8167294d>] _raw_spin_lock+0x3d/0x80
+    [<ffffffffa04eba42>] vmd_msi_init+0x72/0x150 [vmd]
+    [<ffffffff810e8597>] msi_domain_alloc+0xb7/0x140
+    [<ffffffff810e6b10>] irq_domain_alloc_irqs_recursive+0x40/0xa0
+    [<ffffffff810e6cea>] __irq_domain_alloc_irqs+0x14a/0x330
+    [<ffffffff810e8a8c>] msi_domain_alloc_irqs+0x8c/0x1d0
+    [<ffffffff813ca4e3>] pci_msi_setup_msi_irqs+0x43/0x70
+    [<ffffffff813cada1>] pci_enable_msi_range+0x131/0x280
+    [<ffffffff813bf5e0>] pcie_port_device_register+0x320/0x4e0
+    [<ffffffff813bf9a4>] pcie_portdrv_probe+0x34/0x60
+    [<ffffffff813b0e85>] local_pci_probe+0x45/0xa0
+    [<ffffffff813b226b>] pci_device_probe+0xdb/0x130
+    [<ffffffff8149e3cc>] driver_probe_device+0x22c/0x440
+    [<ffffffff8149e774>] __device_attach_driver+0x94/0x110
+    [<ffffffff8149bfad>] bus_for_each_drv+0x5d/0x90
+    [<ffffffff8149e030>] __device_attach+0xc0/0x140
+    [<ffffffff8149e0c0>] device_attach+0x10/0x20
+    [<ffffffff813a77f7>] pci_bus_add_device+0x47/0x90
+    [<ffffffff813a7879>] pci_bus_add_devices+0x39/0x70
+    [<ffffffff813aaba7>] pci_rescan_bus+0x27/0x30
+    [<ffffffffa04ec1af>] vmd_probe+0x68f/0x76c [vmd]
+    [<ffffffff813b0e85>] local_pci_probe+0x45/0xa0
+    [<ffffffff81088064>] work_for_cpu_fn+0x14/0x20
+    [<ffffffff8108c244>] process_one_work+0x1f4/0x740
+    [<ffffffff8108c9c6>] worker_thread+0x236/0x4f0
+    [<ffffffff810935c2>] kthread+0xf2/0x110
+    [<ffffffff816738f2>] ret_from_fork+0x22/0x50
+
+  other info that might help us debug this:
+
+   Possible interrupt unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(list_lock);
+				 local_irq_disable();
+				 lock(&irq_desc_lock_class);
+				 lock(list_lock);
+    <Interrupt>
+      lock(&irq_desc_lock_class);
+
+   *** DEADLOCK ***
+
+	Signed-off-by: Jon Derrick <jonathan.derrick@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit 3f57ff4f9c78ee0fafb010287019126ce8c1fc01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/vmd.c
+* Unmerged path arch/x86/pci/vmd.c
+* Unmerged path arch/x86/pci/vmd.c
