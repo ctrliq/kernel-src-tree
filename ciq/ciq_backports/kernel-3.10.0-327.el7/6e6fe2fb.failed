@@ -1,0 +1,217 @@
+IB/iser: Optimize completion polling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Optimize completion polling (Amir Vadai) [1164539]
+Rebuild_FUZZ: 95.65%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 6e6fe2fb1d61b4baef1cf350049c6877583681ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6e6fe2fb.failed
+
+Poll in batch of 16. Since we don't want it on the stack, keep under
+iser completion context (iser_comp).
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 6e6fe2fb1d61b4baef1cf350049c6877583681ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index 9f0e0e34d6ca,6c3743b6860e..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -265,8 -267,27 +267,29 @@@ struct iser_rx_desc 
+  #define ISER_MAX_CQ 4
+  
+  struct iser_conn;
+ -struct ib_conn;
+  struct iscsi_iser_task;
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct iser_comp - iSER completion context
++  *
++  * @device:     pointer to device handle
++  * @cq:         completion queue
++  * @wcs:        work completion array
++  * @tasklet:    Tasklet handle
++  * @active_qps: Number of active QPs attached
++  *              to completion context
++  */
++ struct iser_comp {
++ 	struct iser_device      *device;
++ 	struct ib_cq		*cq;
++ 	struct ib_wc		 wcs[ISER_WC_BATCH_COUNT];
++ 	struct tasklet_struct	 tasklet;
++ 	int                      active_qps;
++ };
++ 
+++>>>>>>> 6e6fe2fb1d61 (IB/iser: Optimize completion polling)
+  struct iser_device {
+  	struct ib_device             *ib_device;
+  	struct ib_pd	             *pd;
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index fbf2a1e0f2e2,82bedbc260b2..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -1114,81 -1177,80 +1114,137 @@@ static void iser_handle_comp_error(stru
+  	}
+  }
+  
+ -/**
+ - * iser_handle_wc - handle a single work completion
+ - * @wc: work completion
+ - *
+ - * Soft-IRQ context, work completion can be either
+ - * SEND or RECV, and can turn out successful or
+ - * with error (or flush error).
+ - */
+ -static void iser_handle_wc(struct ib_wc *wc)
+ +static int iser_drain_tx_cq(struct iser_device  *device, int cq_index)
+  {
+ -	struct ib_conn *ib_conn;
+ +	struct ib_cq  *cq = device->tx_cq[cq_index];
+ +	struct ib_wc  wc;
+  	struct iser_tx_desc *tx_desc;
+++<<<<<<< HEAD
+ +	struct iser_conn *ib_conn;
+ +	int completed_tx = 0;
+ +
+ +	while (ib_poll_cq(cq, 1, &wc) == 1) {
+ +		tx_desc	= (struct iser_tx_desc *) (unsigned long) wc.wr_id;
+ +		ib_conn = wc.qp->qp_context;
+ +		if (wc.status == IB_WC_SUCCESS) {
+ +			if (wc.opcode == IB_WC_SEND)
+ +				iser_snd_completion(tx_desc, ib_conn);
+ +			else
+ +				iser_err("expected opcode %d got %d\n",
+ +					IB_WC_SEND, wc.opcode);
+ +		} else {
+ +			iser_err("tx id %llx status %d vend_err %x\n",
+ +				 wc.wr_id, wc.status, wc.vendor_err);
+ +			if (wc.wr_id != ISER_FASTREG_LI_WRID) {
+ +				atomic_dec(&ib_conn->post_send_buf_count);
+ +				iser_handle_comp_error(tx_desc, ib_conn);
+ +			}
+ +		}
+ +		completed_tx++;
+++=======
++ 	struct iser_rx_desc *rx_desc;
++ 
++ 	ib_conn = wc->qp->qp_context;
++ 	if (wc->status == IB_WC_SUCCESS) {
++ 		if (wc->opcode == IB_WC_RECV) {
++ 			rx_desc = (struct iser_rx_desc *)wc->wr_id;
++ 			iser_rcv_completion(rx_desc, wc->byte_len,
++ 					    ib_conn);
++ 		} else
++ 		if (wc->opcode == IB_WC_SEND) {
++ 			tx_desc = (struct iser_tx_desc *)wc->wr_id;
++ 			iser_snd_completion(tx_desc, ib_conn);
++ 		} else {
++ 			iser_err("Unknown wc opcode %d\n", wc->opcode);
++ 		}
++ 	} else {
++ 		if (wc->status != IB_WC_WR_FLUSH_ERR)
++ 			iser_err("wr id %llx status %d vend_err %x\n",
++ 				 wc->wr_id, wc->status, wc->vendor_err);
++ 		else
++ 			iser_dbg("flush error: wr id %llx\n", wc->wr_id);
++ 
++ 		if (wc->wr_id != ISER_FASTREG_LI_WRID &&
++ 		    wc->wr_id != ISER_BEACON_WRID)
++ 			iser_handle_comp_error(ib_conn, wc);
++ 
++ 		/* complete in case all flush errors were consumed */
++ 		if (wc->wr_id == ISER_BEACON_WRID)
++ 			complete(&ib_conn->flush_comp);
++ 	}
++ }
++ 
++ /**
++  * iser_cq_tasklet_fn - iSER completion polling loop
++  * @data: iSER completion context
++  *
++  * Soft-IRQ context, polling connection CQ until
++  * either CQ was empty or we exausted polling budget
++  */
++ static void iser_cq_tasklet_fn(unsigned long data)
++ {
++ 	struct iser_comp *comp = (struct iser_comp *)data;
++ 	struct ib_cq *cq = comp->cq;
++ 	struct ib_wc *const wcs = comp->wcs;
++ 	int i, n, completed = 0;
++ 
++ 	while ((n = ib_poll_cq(cq, ARRAY_SIZE(comp->wcs), wcs)) > 0) {
++ 		for (i = 0; i < n; i++)
++ 			iser_handle_wc(&wcs[i]);
++ 
++ 		completed += n;
++ 		if (completed >= iser_cq_poll_limit)
++ 			break;
+++>>>>>>> 6e6fe2fb1d61 (IB/iser: Optimize completion polling)
+  	}
+ +	return completed_tx;
+ +}
+  
+ -	/*
+ -	 * It is assumed here that arming CQ only once its empty
+ -	 * would not cause interrupts to be missed.
+ +
+ +static void iser_cq_tasklet_fn(unsigned long data)
+ +{
+ +	struct iser_cq_desc *cq_desc = (struct iser_cq_desc *)data;
+ +	struct iser_device  *device = cq_desc->device;
+ +	int cq_index = cq_desc->cq_index;
+ +	struct ib_cq	     *cq = device->rx_cq[cq_index];
+ +	 struct ib_wc	     wc;
+ +	 struct iser_rx_desc *desc;
+ +	 unsigned long	     xfer_len;
+ +	struct iser_conn *ib_conn;
+ +	int completed_tx, completed_rx = 0;
+ +
+ +	/* First do tx drain, so in a case where we have rx flushes and a successful
+ +	 * tx completion we will still go through completion error handling.
+  	 */
+ +	completed_tx = iser_drain_tx_cq(device, cq_index);
+ +
+ +	while (ib_poll_cq(cq, 1, &wc) == 1) {
+ +		desc	 = (struct iser_rx_desc *) (unsigned long) wc.wr_id;
+ +		BUG_ON(desc == NULL);
+ +		ib_conn = wc.qp->qp_context;
+ +		if (wc.status == IB_WC_SUCCESS) {
+ +			if (wc.opcode == IB_WC_RECV) {
+ +				xfer_len = (unsigned long)wc.byte_len;
+ +				iser_rcv_completion(desc, xfer_len, ib_conn);
+ +			} else
+ +				iser_err("expected opcode %d got %d\n",
+ +					IB_WC_RECV, wc.opcode);
+ +		} else {
+ +			if (wc.status != IB_WC_WR_FLUSH_ERR)
+ +				iser_err("rx id %llx status %d vend_err %x\n",
+ +					wc.wr_id, wc.status, wc.vendor_err);
+ +			ib_conn->post_recv_buf_count--;
+ +			iser_handle_comp_error(NULL, ib_conn);
+ +		}
+ +		completed_rx++;
+ +		if (!(completed_rx & 63))
+ +			completed_tx += iser_drain_tx_cq(device, cq_index);
+ +	}
+ +	/* #warning "it is assumed here that arming CQ only once its empty" *
+ +	 * " would not cause interrupts to be missed"                       */
+  	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+  
+ -	iser_dbg("got %d completions\n", completed);
+ +	iser_dbg("got %d rx %d tx completions\n", completed_rx, completed_tx);
+  }
+  
+  static void iser_cq_callback(struct ib_cq *cq, void *cq_context)
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
