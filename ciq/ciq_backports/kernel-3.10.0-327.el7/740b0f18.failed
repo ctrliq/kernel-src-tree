@@ -1,0 +1,671 @@
+tcp: switch rtt estimations to usec resolution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 740b0f1841f6e39085b711d41db9ffb07198682b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/740b0f18.failed
+
+Upcoming congestion controls for TCP require usec resolution for RTT
+estimations. Millisecond resolution is simply not enough these days.
+
+FQ/pacing in DC environments also require this change for finer control
+and removal of bimodal behavior due to the current hack in
+tcp_update_pacing_rate() for 'small rtt'
+
+TCP_CONG_RTT_STAMP is no longer needed.
+
+As Julian Anastasov pointed out, we need to keep user compatibility :
+tcp_metrics used to export RTT and RTTVAR in msec resolution,
+so we added RTT_US and RTTVAR_US. An iproute2 patch is needed
+to use the new attributes if provided by the kernel.
+
+In this example ss command displays a srtt of 32 usecs (10Gbit link)
+
+lpk51:~# ./ss -i dst lpk52
+Netid  State      Recv-Q Send-Q   Local Address:Port       Peer
+Address:Port
+tcp    ESTAB      0      1         10.246.11.51:42959
+10.246.11.52:64614
+         cubic wscale:6,6 rto:201 rtt:0.032/0.001 ato:40 mss:1448
+cwnd:10 send
+3620.0Mbps pacing_rate 7240.0Mbps unacked:1 rcv_rtt:993 rcv_space:29559
+
+Updated iproute2 ip command displays :
+
+lpk51:~# ./ip tcp_metrics | grep 10.246.11.52
+10.246.11.52 age 561.914sec cwnd 10 rtt 274us rttvar 213us source
+10.246.11.51
+
+Old binary displays :
+
+lpk51:~# ip tcp_metrics | grep 10.246.11.52
+10.246.11.52 age 561.914sec cwnd 10 rtt 250us rttvar 125us source
+10.246.11.51
+
+With help from Julian Anastasov, Stephen Hemminger and Yuchung Cheng
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Cc: Stephen Hemminger <stephen@networkplumber.org>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Cc: Larry Brakmo <brakmo@google.com>
+	Cc: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 740b0f1841f6e39085b711d41db9ffb07198682b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_input.c
+diff --cc include/net/tcp.h
+index ba45accd7103,93eab0b9da60..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -473,14 -474,13 +474,19 @@@ int tcp_send_rcvq(struct sock *sk, stru
+  void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb);
+  
+  /* From syncookies.c */
+ -int __cookie_v4_check(const struct iphdr *iph, const struct tcphdr *th,
+ -		      u32 cookie);
+ -struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
+ -			     struct ip_options *opt);
+ +extern __u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
+ +extern int __cookie_v4_check(const struct iphdr *iph, const struct tcphdr *th,
+ +			     u32 cookie);
+ +extern struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb, 
+ +				    struct ip_options *opt);
+  #ifdef CONFIG_SYN_COOKIES
+++<<<<<<< HEAD
+ +#include <linux/ktime.h>
+ +/* Syncookies use a monotonic timer which increments every 60 seconds.
+++=======
++ 
++ /* Syncookies use a monotonic timer which increments every 64 seconds.
+++>>>>>>> 740b0f1841f6 (tcp: switch rtt estimations to usec resolution)
+   * This counter is used both as a hash input and partially encoded into
+   * the cookie value.  A cookie is only validated further if the delta
+   * between the current counter value and the encoded one is less than this,
+@@@ -622,11 -619,9 +628,11 @@@ static inline void tcp_bound_rto(const 
+  
+  static inline u32 __tcp_set_rto(const struct tcp_sock *tp)
+  {
+- 	return (tp->srtt >> 3) + tp->rttvar;
++ 	return usecs_to_jiffies((tp->srtt_us >> 3) + tp->rttvar_us);
+  }
+  
+ +extern void tcp_set_rto(struct sock *sk);
+ +
+  static inline void __tcp_fast_path_on(struct tcp_sock *tp, u32 snd_wnd)
+  {
+  	tp->pred_flags = htonl((tp->tcp_header_len << 26) |
+diff --cc net/ipv4/tcp_input.c
+index 1392700b76a0,23a41d978fad..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -745,18 -747,15 +746,10 @@@ static void tcp_update_pacing_rate(stru
+  
+  	rate *= max(tp->snd_cwnd, tp->packets_out);
+  
+- 	/* Correction for small srtt and scheduling constraints.
+- 	 * For small rtt, consider noise is too high, and use
+- 	 * the minimal value (srtt = 1 -> 125 us for HZ=1000)
+- 	 *
+- 	 * We probably need usec resolution in the future.
+- 	 * Note: This also takes care of possible srtt=0 case,
+- 	 * when tcp_rtt_estimator() was not yet called.
+- 	 */
+- 	if (tp->srtt > 8 + 2)
+- 		do_div(rate, tp->srtt);
++ 	if (likely(tp->srtt_us))
++ 		do_div(rate, tp->srtt_us);
+  
+ -	/* ACCESS_ONCE() is needed because sch_fq fetches sk_pacing_rate
+ -	 * without any lock. We want to make sure compiler wont store
+ -	 * intermediate values in this location.
+ -	 */
+ -	ACCESS_ONCE(sk->sk_pacing_rate) = min_t(u64, rate,
+ -						sk->sk_max_pacing_rate);
+ +	sk->sk_pacing_rate = min_t(u64, rate, ~0U);
+  }
+  
+  /* Calculate rto without backoff.  This is the second half of Van Jacobson's
+@@@ -2912,14 -2933,14 +2913,14 @@@ static void tcp_synack_rtt_meas(struct 
+  	/* If the ACK acks both the SYNACK and the (Fast Open'd) data packets
+  	 * sent in SYN_RECV, SYNACK RTT is the smooth RTT computed in tcp_ack()
+  	 */
+- 	if (!tp->srtt)
+- 		tcp_ack_update_rtt(sk, FLAG_SYN_ACKED, seq_rtt, -1);
++ 	if (!tp->srtt_us)
++ 		tcp_ack_update_rtt(sk, FLAG_SYN_ACKED, seq_rtt_us, -1L);
+  }
+  
+ -static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 acked, u32 in_flight)
+ +static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+  {
+  	const struct inet_connection_sock *icsk = inet_csk(sk);
+ -	icsk->icsk_ca_ops->cong_avoid(sk, ack, acked, in_flight);
+ +	icsk->icsk_ca_ops->cong_avoid(sk, ack, in_flight);
+  	tcp_sk(sk)->snd_cwnd_stamp = tcp_time_stamp;
+  }
+  
+@@@ -3002,21 -3023,22 +3003,31 @@@ static u32 tcp_tso_acked(struct sock *s
+   * arrived at the other end.
+   */
+  static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
+- 			       u32 prior_snd_una, s32 sack_rtt)
++ 			       u32 prior_snd_una, long sack_rtt_us)
+  {
+- 	struct tcp_sock *tp = tcp_sk(sk);
+  	const struct inet_connection_sock *icsk = inet_csk(sk);
+++<<<<<<< HEAD
+ +	struct sk_buff *skb;
+ +	u32 now = tcp_time_stamp;
+ +	int fully_acked = true;
+ +	int flag = 0;
+ +	u32 pkts_acked = 0;
+ +	u32 reord = tp->packets_out;
+++=======
++ 	struct skb_mstamp first_ackt, last_ackt, now;
++ 	struct tcp_sock *tp = tcp_sk(sk);
+++>>>>>>> 740b0f1841f6 (tcp: switch rtt estimations to usec resolution)
+  	u32 prior_sacked = tp->sacked_out;
+- 	s32 seq_rtt = -1;
+- 	s32 ca_seq_rtt = -1;
+- 	ktime_t last_ackt = net_invalid_timestamp();
++ 	u32 reord = tp->packets_out;
++ 	bool fully_acked = true;
++ 	long ca_seq_rtt_us = -1L;
++ 	long seq_rtt_us = -1L;
++ 	struct sk_buff *skb;
++ 	u32 pkts_acked = 0;
+  	bool rtt_update;
++ 	int flag = 0;
++ 
++ 	first_ackt.v64 = 0;
+  
+  	while ((skb = tcp_write_queue_head(sk)) && skb != tcp_send_head(sk)) {
+  		struct tcp_skb_cb *scb = TCP_SKB_CB(skb);
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f022e6a239f4..7c6a29949220 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -201,10 +201,10 @@ struct tcp_sock {
+ 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
+ 
+ /* RTT measurement */
+-	u32	srtt;		/* smoothed round trip time << 3	*/
+-	u32	mdev;		/* medium deviation			*/
+-	u32	mdev_max;	/* maximal mdev for the last rtt period	*/
+-	u32	rttvar;		/* smoothed mdev_max			*/
++	u32	srtt_us;	/* smoothed round trip time << 3 in usecs */
++	u32	mdev_us;	/* medium deviation			*/
++	u32	mdev_max_us;	/* maximal mdev for the last rtt period	*/
++	u32	rttvar_us;	/* smoothed mdev_max			*/
+ 	u32	rtt_seq;	/* sequence number to update rttvar	*/
+ 
+ 	u32	packets_out;	/* Packets which are "in flight"	*/
+* Unmerged path include/net/tcp.h
+diff --git a/include/uapi/linux/tcp_metrics.h b/include/uapi/linux/tcp_metrics.h
+index 54a37b13f2c4..93533926035c 100644
+--- a/include/uapi/linux/tcp_metrics.h
++++ b/include/uapi/linux/tcp_metrics.h
+@@ -11,12 +11,15 @@
+ #define TCP_METRICS_GENL_VERSION	0x1
+ 
+ enum tcp_metric_index {
+-	TCP_METRIC_RTT,
+-	TCP_METRIC_RTTVAR,
++	TCP_METRIC_RTT,		/* in ms units */
++	TCP_METRIC_RTTVAR,	/* in ms units */
+ 	TCP_METRIC_SSTHRESH,
+ 	TCP_METRIC_CWND,
+ 	TCP_METRIC_REORDERING,
+ 
++	TCP_METRIC_RTT_US,	/* in usec units */
++	TCP_METRIC_RTTVAR_US,	/* in usec units */
++
+ 	/* Always last.  */
+ 	__TCP_METRIC_MAX,
+ };
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index d5f93c6da239..bf978c267473 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -384,7 +384,7 @@ void tcp_init_sock(struct sock *sk)
+ 	INIT_LIST_HEAD(&tp->tsq_node);
+ 
+ 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+-	tp->mdev = TCP_TIMEOUT_INIT;
++	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+ 
+ 	/* So many TCP implementations out there (incorrectly) count the
+ 	 * initial SYN frame in their delayed-ACK and congestion control
+@@ -2220,7 +2220,7 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 
+ 	sk->sk_shutdown = 0;
+ 	sock_reset_flag(sk, SOCK_DONE);
+-	tp->srtt = 0;
++	tp->srtt_us = 0;
+ 	if ((tp->write_seq += tp->max_window + 2) == 0)
+ 		tp->write_seq = 1;
+ 	icsk->icsk_backoff = 0;
+@@ -2660,8 +2660,8 @@ void tcp_get_info(const struct sock *sk, struct tcp_info *info)
+ 
+ 	info->tcpi_pmtu = icsk->icsk_pmtu_cookie;
+ 	info->tcpi_rcv_ssthresh = tp->rcv_ssthresh;
+-	info->tcpi_rtt = jiffies_to_usecs(tp->srtt)>>3;
+-	info->tcpi_rttvar = jiffies_to_usecs(tp->mdev)>>2;
++	info->tcpi_rtt = tp->srtt_us >> 3;
++	info->tcpi_rttvar = tp->mdev_us >> 2;
+ 	info->tcpi_snd_ssthresh = tp->snd_ssthresh;
+ 	info->tcpi_snd_cwnd = tp->snd_cwnd;
+ 	info->tcpi_advmss = tp->advmss;
+diff --git a/net/ipv4/tcp_cubic.c b/net/ipv4/tcp_cubic.c
+index b6ae92a51f58..b4feeb26093c 100644
+--- a/net/ipv4/tcp_cubic.c
++++ b/net/ipv4/tcp_cubic.c
+@@ -475,10 +475,6 @@ static int __init cubictcp_register(void)
+ 	/* divide by bic_scale and by constant Srtt (100ms) */
+ 	do_div(cube_factor, bic_scale * 10);
+ 
+-	/* hystart needs ms clock resolution */
+-	if (hystart && HZ < 1000)
+-		cubictcp.flags |= TCP_CONG_RTT_STAMP;
+-
+ 	return tcp_register_congestion_control(&cubictcp);
+ }
+ 
+diff --git a/net/ipv4/tcp_hybla.c b/net/ipv4/tcp_hybla.c
+index 57bdd17dff4d..ce2fae0f72d0 100644
+--- a/net/ipv4/tcp_hybla.c
++++ b/net/ipv4/tcp_hybla.c
+@@ -21,7 +21,7 @@ struct hybla {
+ 	u32   rho2;	      /* Rho * Rho, integer part */
+ 	u32   rho_3ls;	      /* Rho parameter, <<3 */
+ 	u32   rho2_7ls;	      /* Rho^2, <<7	*/
+-	u32   minrtt;	      /* Minimum smoothed round trip time value seen */
++	u32   minrtt_us;      /* Minimum smoothed round trip time value seen */
+ };
+ 
+ /* Hybla reference round trip time (default= 1/40 sec = 25 ms), in ms */
+@@ -35,7 +35,9 @@ static inline void hybla_recalc_param (struct sock *sk)
+ {
+ 	struct hybla *ca = inet_csk_ca(sk);
+ 
+-	ca->rho_3ls = max_t(u32, tcp_sk(sk)->srtt / msecs_to_jiffies(rtt0), 8);
++	ca->rho_3ls = max_t(u32,
++			    tcp_sk(sk)->srtt_us / (rtt0 * USEC_PER_MSEC),
++			    8U);
+ 	ca->rho = ca->rho_3ls >> 3;
+ 	ca->rho2_7ls = (ca->rho_3ls * ca->rho_3ls) << 1;
+ 	ca->rho2 = ca->rho2_7ls >> 7;
+@@ -59,7 +61,7 @@ static void hybla_init(struct sock *sk)
+ 	hybla_recalc_param(sk);
+ 
+ 	/* set minimum rtt as this is the 1st ever seen */
+-	ca->minrtt = tp->srtt;
++	ca->minrtt_us = tp->srtt_us;
+ 	tp->snd_cwnd = ca->rho;
+ }
+ 
+@@ -93,9 +95,9 @@ static void hybla_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 	int is_slowstart = 0;
+ 
+ 	/*  Recalculate rho only if this srtt is the lowest */
+-	if (tp->srtt < ca->minrtt){
++	if (tp->srtt_us < ca->minrtt_us) {
+ 		hybla_recalc_param(sk);
+-		ca->minrtt = tp->srtt;
++		ca->minrtt_us = tp->srtt_us;
+ 	}
+ 
+ 	if (!tcp_is_cwnd_limited(sk, in_flight))
+diff --git a/net/ipv4/tcp_illinois.c b/net/ipv4/tcp_illinois.c
+index 834857f3c871..2cdf4143d67f 100644
+--- a/net/ipv4/tcp_illinois.c
++++ b/net/ipv4/tcp_illinois.c
+@@ -325,7 +325,6 @@ static void tcp_illinois_info(struct sock *sk, u32 ext,
+ }
+ 
+ static struct tcp_congestion_ops tcp_illinois __read_mostly = {
+-	.flags		= TCP_CONG_RTT_STAMP,
+ 	.init		= tcp_illinois_init,
+ 	.ssthresh	= tcp_illinois_ssthresh,
+ 	.min_cwnd	= tcp_reno_min_cwnd,
+* Unmerged path net/ipv4/tcp_input.c
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 1a340e6ba485..f0e3e6cbb03e 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -434,7 +434,7 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
+ 			break;
+ 
+ 		icsk->icsk_backoff--;
+-		inet_csk(sk)->icsk_rto = (tp->srtt ? __tcp_set_rto(tp) :
++		inet_csk(sk)->icsk_rto = (tp->srtt_us ? __tcp_set_rto(tp) :
+ 			TCP_TIMEOUT_INIT) << icsk->icsk_backoff;
+ 		tcp_bound_rto(sk);
+ 
+diff --git a/net/ipv4/tcp_lp.c b/net/ipv4/tcp_lp.c
+index 72f7218b03f5..15bf8e53b21e 100644
+--- a/net/ipv4/tcp_lp.c
++++ b/net/ipv4/tcp_lp.c
+@@ -314,7 +314,6 @@ static void tcp_lp_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt_us)
+ }
+ 
+ static struct tcp_congestion_ops tcp_lp __read_mostly = {
+-	.flags = TCP_CONG_RTT_STAMP,
+ 	.init = tcp_lp_init,
+ 	.ssthresh = tcp_reno_ssthresh,
+ 	.cong_avoid = tcp_lp_cong_avoid,
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index 8f0699bcdb4b..639a95099097 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -29,6 +29,11 @@ struct tcp_fastopen_metrics {
+ 	struct	tcp_fastopen_cookie	cookie;
+ };
+ 
++/* TCP_METRIC_MAX includes 2 extra fields for userspace compatibility
++ * Kernel only stores RTT and RTTVAR in usec resolution
++ */
++#define TCP_METRIC_MAX_KERNEL (TCP_METRIC_MAX - 2)
++
+ struct tcp_metrics_block {
+ 	struct tcp_metrics_block __rcu	*tcpm_next;
+ 	struct inetpeer_addr		tcpm_saddr;
+@@ -37,7 +42,7 @@ struct tcp_metrics_block {
+ 	u32				tcpm_ts;
+ 	u32				tcpm_ts_stamp;
+ 	u32				tcpm_lock;
+-	u32				tcpm_vals[TCP_METRIC_MAX + 1];
++	u32				tcpm_vals[TCP_METRIC_MAX_KERNEL + 1];
+ 	struct tcp_fastopen_metrics	tcpm_fastopen;
+ 
+ 	struct rcu_head			rcu_head;
+@@ -55,12 +60,6 @@ static u32 tcp_metric_get(struct tcp_metrics_block *tm,
+ 	return tm->tcpm_vals[idx];
+ }
+ 
+-static u32 tcp_metric_get_jiffies(struct tcp_metrics_block *tm,
+-				  enum tcp_metric_index idx)
+-{
+-	return msecs_to_jiffies(tm->tcpm_vals[idx]);
+-}
+-
+ static void tcp_metric_set(struct tcp_metrics_block *tm,
+ 			   enum tcp_metric_index idx,
+ 			   u32 val)
+@@ -68,13 +67,6 @@ static void tcp_metric_set(struct tcp_metrics_block *tm,
+ 	tm->tcpm_vals[idx] = val;
+ }
+ 
+-static void tcp_metric_set_msecs(struct tcp_metrics_block *tm,
+-				 enum tcp_metric_index idx,
+-				 u32 val)
+-{
+-	tm->tcpm_vals[idx] = jiffies_to_msecs(val);
+-}
+-
+ static bool addr_same(const struct inetpeer_addr *a,
+ 		      const struct inetpeer_addr *b)
+ {
+@@ -97,9 +89,11 @@ struct tcpm_hash_bucket {
+ 
+ static DEFINE_SPINLOCK(tcp_metrics_lock);
+ 
+-static void tcpm_suck_dst(struct tcp_metrics_block *tm, struct dst_entry *dst,
++static void tcpm_suck_dst(struct tcp_metrics_block *tm,
++			  const struct dst_entry *dst,
+ 			  bool fastopen_clear)
+ {
++	u32 msval;
+ 	u32 val;
+ 
+ 	tm->tcpm_stamp = jiffies;
+@@ -117,8 +111,11 @@ static void tcpm_suck_dst(struct tcp_metrics_block *tm, struct dst_entry *dst,
+ 		val |= 1 << TCP_METRIC_REORDERING;
+ 	tm->tcpm_lock = val;
+ 
+-	tm->tcpm_vals[TCP_METRIC_RTT] = dst_metric_raw(dst, RTAX_RTT);
+-	tm->tcpm_vals[TCP_METRIC_RTTVAR] = dst_metric_raw(dst, RTAX_RTTVAR);
++	msval = dst_metric_raw(dst, RTAX_RTT);
++	tm->tcpm_vals[TCP_METRIC_RTT] = msval * USEC_PER_MSEC;
++
++	msval = dst_metric_raw(dst, RTAX_RTTVAR);
++	tm->tcpm_vals[TCP_METRIC_RTTVAR] = msval * USEC_PER_MSEC;
+ 	tm->tcpm_vals[TCP_METRIC_SSTHRESH] = dst_metric_raw(dst, RTAX_SSTHRESH);
+ 	tm->tcpm_vals[TCP_METRIC_CWND] = dst_metric_raw(dst, RTAX_CWND);
+ 	tm->tcpm_vals[TCP_METRIC_REORDERING] = dst_metric_raw(dst, RTAX_REORDERING);
+@@ -370,7 +367,7 @@ void tcp_update_metrics(struct sock *sk)
+ 		dst_confirm(dst);
+ 
+ 	rcu_read_lock();
+-	if (icsk->icsk_backoff || !tp->srtt) {
++	if (icsk->icsk_backoff || !tp->srtt_us) {
+ 		/* This session failed to estimate rtt. Why?
+ 		 * Probably, no packets returned in time.  Reset our
+ 		 * results.
+@@ -385,8 +382,8 @@ void tcp_update_metrics(struct sock *sk)
+ 	if (!tm)
+ 		goto out_unlock;
+ 
+-	rtt = tcp_metric_get_jiffies(tm, TCP_METRIC_RTT);
+-	m = rtt - tp->srtt;
++	rtt = tcp_metric_get(tm, TCP_METRIC_RTT);
++	m = rtt - tp->srtt_us;
+ 
+ 	/* If newly calculated rtt larger than stored one, store new
+ 	 * one. Otherwise, use EWMA. Remember, rtt overestimation is
+@@ -394,10 +391,10 @@ void tcp_update_metrics(struct sock *sk)
+ 	 */
+ 	if (!tcp_metric_locked(tm, TCP_METRIC_RTT)) {
+ 		if (m <= 0)
+-			rtt = tp->srtt;
++			rtt = tp->srtt_us;
+ 		else
+ 			rtt -= (m >> 3);
+-		tcp_metric_set_msecs(tm, TCP_METRIC_RTT, rtt);
++		tcp_metric_set(tm, TCP_METRIC_RTT, rtt);
+ 	}
+ 
+ 	if (!tcp_metric_locked(tm, TCP_METRIC_RTTVAR)) {
+@@ -408,16 +405,16 @@ void tcp_update_metrics(struct sock *sk)
+ 
+ 		/* Scale deviation to rttvar fixed point */
+ 		m >>= 1;
+-		if (m < tp->mdev)
+-			m = tp->mdev;
++		if (m < tp->mdev_us)
++			m = tp->mdev_us;
+ 
+-		var = tcp_metric_get_jiffies(tm, TCP_METRIC_RTTVAR);
++		var = tcp_metric_get(tm, TCP_METRIC_RTTVAR);
+ 		if (m >= var)
+ 			var = m;
+ 		else
+ 			var -= (var - m) >> 2;
+ 
+-		tcp_metric_set_msecs(tm, TCP_METRIC_RTTVAR, var);
++		tcp_metric_set(tm, TCP_METRIC_RTTVAR, var);
+ 	}
+ 
+ 	if (tcp_in_initial_slowstart(tp)) {
+@@ -514,7 +511,7 @@ void tcp_init_metrics(struct sock *sk)
+ 		tp->reordering = val;
+ 	}
+ 
+-	crtt = tcp_metric_get_jiffies(tm, TCP_METRIC_RTT);
++	crtt = tcp_metric_get(tm, TCP_METRIC_RTT);
+ 	rcu_read_unlock();
+ reset:
+ 	/* The initial RTT measurement from the SYN/SYN-ACK is not ideal
+@@ -537,18 +534,20 @@ reset:
+ 	 * to low value, and then abruptly stops to do it and starts to delay
+ 	 * ACKs, wait for troubles.
+ 	 */
+-	if (crtt > tp->srtt) {
++	if (crtt > tp->srtt_us) {
+ 		/* Set RTO like tcp_rtt_estimator(), but from cached RTT. */
+-		crtt >>= 3;
++		crtt /= 8 * USEC_PER_MSEC;
+ 		inet_csk(sk)->icsk_rto = crtt + max(2 * crtt, tcp_rto_min(sk));
+-	} else if (tp->srtt == 0) {
++	} else if (tp->srtt_us == 0) {
+ 		/* RFC6298: 5.7 We've failed to get a valid RTT sample from
+ 		 * 3WHS. This is most likely due to retransmission,
+ 		 * including spurious one. Reset the RTO back to 3secs
+ 		 * from the more aggressive 1sec to avoid more spurious
+ 		 * retransmission.
+ 		 */
+-		tp->mdev = tp->mdev_max = tp->rttvar = TCP_TIMEOUT_FALLBACK;
++		tp->rttvar_us = jiffies_to_usecs(TCP_TIMEOUT_FALLBACK);
++		tp->mdev_us = tp->mdev_max_us = tp->rttvar_us;
++
+ 		inet_csk(sk)->icsk_rto = TCP_TIMEOUT_FALLBACK;
+ 	}
+ 	/* Cut cwnd down to 1 per RFC5681 if SYN or SYN-ACK has been
+@@ -795,10 +794,26 @@ static int tcp_metrics_fill_info(struct sk_buff *msg,
+ 		nest = nla_nest_start(msg, TCP_METRICS_ATTR_VALS);
+ 		if (!nest)
+ 			goto nla_put_failure;
+-		for (i = 0; i < TCP_METRIC_MAX + 1; i++) {
+-			if (!tm->tcpm_vals[i])
++		for (i = 0; i < TCP_METRIC_MAX_KERNEL + 1; i++) {
++			u32 val = tm->tcpm_vals[i];
++
++			if (!val)
+ 				continue;
+-			if (nla_put_u32(msg, i + 1, tm->tcpm_vals[i]) < 0)
++			if (i == TCP_METRIC_RTT) {
++				if (nla_put_u32(msg, TCP_METRIC_RTT_US + 1,
++						val) < 0)
++					goto nla_put_failure;
++				n++;
++				val = max(val / 1000, 1U);
++			}
++			if (i == TCP_METRIC_RTTVAR) {
++				if (nla_put_u32(msg, TCP_METRIC_RTTVAR_US + 1,
++						val) < 0)
++					goto nla_put_failure;
++				n++;
++				val = max(val / 1000, 1U);
++			}
++			if (nla_put_u32(msg, i + 1, val) < 0)
+ 				goto nla_put_failure;
+ 			n++;
+ 		}
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 7a436c517e44..ca788ada5bd3 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -398,8 +398,8 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
+ 
+ 		tcp_init_wl(newtp, treq->rcv_isn);
+ 
+-		newtp->srtt = 0;
+-		newtp->mdev = TCP_TIMEOUT_INIT;
++		newtp->srtt_us = 0;
++		newtp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+ 		newicsk->icsk_rto = TCP_TIMEOUT_INIT;
+ 
+ 		newtp->packets_out = 0;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 1d05b200343c..21b452822a0d 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -863,11 +863,7 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 	if (clone_it) {
+ 		const struct sk_buff *fclone = skb + 1;
+ 
+-		/* If congestion control is doing timestamping, we must
+-		 * take such a timestamp before we potentially clone/copy.
+-		 */
+-		if (icsk->icsk_ca_ops->flags & TCP_CONG_RTT_STAMP)
+-			__net_timestamp(skb);
++		skb_mstamp_get(&skb->skb_mstamp);
+ 
+ 		if (unlikely(skb->fclone == SKB_FCLONE_ORIG &&
+ 			     fclone->fclone == SKB_FCLONE_CLONE))
+@@ -1972,7 +1968,7 @@ bool tcp_schedule_loss_probe(struct sock *sk)
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	u32 timeout, tlp_time_stamp, rto_time_stamp;
+-	u32 rtt = tp->srtt >> 3;
++	u32 rtt = usecs_to_jiffies(tp->srtt_us >> 3);
+ 
+ 	if (WARN_ON(icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS))
+ 		return false;
+@@ -1994,7 +1990,7 @@ bool tcp_schedule_loss_probe(struct sock *sk)
+ 	/* Schedule a loss probe in 2*RTT for SACK capable connections
+ 	 * in Open state, that are either limited by cwnd or application.
+ 	 */
+-	if (sysctl_tcp_early_retrans < 3 || !tp->srtt || !tp->packets_out ||
++	if (sysctl_tcp_early_retrans < 3 || !tp->srtt_us || !tp->packets_out ||
+ 	    !tcp_is_sack(tp) || inet_csk(sk)->icsk_ca_state != TCP_CA_Open)
+ 		return false;
+ 
+@@ -3054,8 +3050,9 @@ void tcp_send_delayed_ack(struct sock *sk)
+ 		 * Do not use inet_csk(sk)->icsk_rto here, use results of rtt measurements
+ 		 * directly.
+ 		 */
+-		if (tp->srtt) {
+-			int rtt = max(tp->srtt >> 3, TCP_DELACK_MIN);
++		if (tp->srtt_us) {
++			int rtt = max_t(int, usecs_to_jiffies(tp->srtt_us >> 3),
++					TCP_DELACK_MIN);
+ 
+ 			if (rtt < max_ato)
+ 				max_ato = rtt;
+diff --git a/net/ipv4/tcp_probe.c b/net/ipv4/tcp_probe.c
+index 8b97d71e193b..2d6cd9ff9756 100644
+--- a/net/ipv4/tcp_probe.c
++++ b/net/ipv4/tcp_probe.c
+@@ -154,7 +154,7 @@ static void jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+ 			p->snd_wnd = tp->snd_wnd;
+ 			p->rcv_wnd = tp->rcv_wnd;
+ 			p->ssthresh = tcp_current_ssthresh(sk);
+-			p->srtt = tp->srtt >> 3;
++			p->srtt = tp->srtt_us >> 3;
+ 
+ 			tcp_probe.head = (tcp_probe.head + 1) & (bufsize - 1);
+ 		}
+diff --git a/net/ipv4/tcp_vegas.c b/net/ipv4/tcp_vegas.c
+index 80fa2bfd7ede..53744f444e07 100644
+--- a/net/ipv4/tcp_vegas.c
++++ b/net/ipv4/tcp_vegas.c
+@@ -305,7 +305,6 @@ void tcp_vegas_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+ EXPORT_SYMBOL_GPL(tcp_vegas_get_info);
+ 
+ static struct tcp_congestion_ops tcp_vegas __read_mostly = {
+-	.flags		= TCP_CONG_RTT_STAMP,
+ 	.init		= tcp_vegas_init,
+ 	.ssthresh	= tcp_reno_ssthresh,
+ 	.cong_avoid	= tcp_vegas_cong_avoid,
+diff --git a/net/ipv4/tcp_veno.c b/net/ipv4/tcp_veno.c
+index ac43cd747bce..99b648706646 100644
+--- a/net/ipv4/tcp_veno.c
++++ b/net/ipv4/tcp_veno.c
+@@ -202,7 +202,6 @@ static u32 tcp_veno_ssthresh(struct sock *sk)
+ }
+ 
+ static struct tcp_congestion_ops tcp_veno __read_mostly = {
+-	.flags		= TCP_CONG_RTT_STAMP,
+ 	.init		= tcp_veno_init,
+ 	.ssthresh	= tcp_veno_ssthresh,
+ 	.cong_avoid	= tcp_veno_cong_avoid,
+diff --git a/net/ipv4/tcp_yeah.c b/net/ipv4/tcp_yeah.c
+index 05c3b6f0e8e1..5a9dea97624a 100644
+--- a/net/ipv4/tcp_yeah.c
++++ b/net/ipv4/tcp_yeah.c
+@@ -226,7 +226,6 @@ static u32 tcp_yeah_ssthresh(struct sock *sk) {
+ }
+ 
+ static struct tcp_congestion_ops tcp_yeah __read_mostly = {
+-	.flags		= TCP_CONG_RTT_STAMP,
+ 	.init		= tcp_yeah_init,
+ 	.ssthresh	= tcp_yeah_ssthresh,
+ 	.cong_avoid	= tcp_yeah_cong_avoid,
