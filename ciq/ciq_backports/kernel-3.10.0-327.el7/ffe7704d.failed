@@ -1,0 +1,323 @@
+NVMe: Unify controller probe and resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit ffe7704d59025ce7a37525146d44b6a79510fc8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/ffe7704d.failed
+
+This unifies probe and resume so they both may be scheduled in the same
+way. This is necessary for error handling that may occur during device
+initialization since the task to cleanup the device wouldn't be able to
+run if it is blocked on device initialization.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit ffe7704d59025ce7a37525146d44b6a79510fc8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,01a68250f868..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -2444,34 -2348,35 +2444,53 @@@ static int nvme_dev_add(struct nvme_de
+  	if (ctrl->mdts)
+  		dev->max_hw_sectors = 1 << (ctrl->mdts + shift - 9);
+  	if ((pdev->vendor == PCI_VENDOR_ID_INTEL) &&
+ -			(pdev->device == 0x0953) && ctrl->vs[3]) {
+ -		unsigned int max_hw_sectors;
+ -
+ +			(pdev->device == 0x0953) && ctrl->vs[3])
+  		dev->stripe_size = 1 << (ctrl->vs[3] + shift);
+ -		max_hw_sectors = dev->stripe_size >> (shift - 9);
+ -		if (dev->max_hw_sectors) {
+ -			dev->max_hw_sectors = min(max_hw_sectors,
+ -							dev->max_hw_sectors);
+ -		} else
+ -			dev->max_hw_sectors = max_hw_sectors;
+ +
+ +	id_ns = mem;
+ +	for (i = 1; i <= nn; i++) {
+ +		res = nvme_identify(dev, i, 0, dma_addr);
+ +		if (res)
+ +			continue;
+ +
+ +		if (id_ns->ncap == 0)
+ +			continue;
+ +
+ +		res = nvme_get_features(dev, NVME_FEAT_LBA_RANGE, i,
+ +							dma_addr + 4096, NULL);
+ +		if (res)
+ +			memset(mem + 4096, 0, 4096);
+ +
+ +		ns = nvme_alloc_ns(dev, i, mem, mem + 4096);
+ +		if (ns)
+ +			list_add_tail(&ns->list, &dev->namespaces);
+  	}
+ -	kfree(ctrl);
+ +	list_for_each_entry(ns, &dev->namespaces, list)
+ +		add_disk(ns->disk);
+ +	res = 0;
+  
+++<<<<<<< HEAD
+ + out:
+ +	dma_free_coherent(&dev->pci_dev->dev, 8192, mem, dma_addr);
+ +	return res;
+++=======
++ 	if (!dev->tagset.tags) {
++ 		dev->tagset.ops = &nvme_mq_ops;
++ 		dev->tagset.nr_hw_queues = dev->online_queues - 1;
++ 		dev->tagset.timeout = NVME_IO_TIMEOUT;
++ 		dev->tagset.numa_node = dev_to_node(dev->dev);
++ 		dev->tagset.queue_depth =
++ 				min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
++ 		dev->tagset.cmd_size = nvme_cmd_size(dev);
++ 		dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
++ 		dev->tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->tagset))
++ 			return 0;
++ 	}
++ 	schedule_work(&dev->scan_work);
++ 	return 0;
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  }
+  
+  static int nvme_dev_map(struct nvme_dev *dev)
+@@@ -2923,19 -2920,31 +2942,40 @@@ static int nvme_dev_resume(struct nvme_
+  		return ret;
+  	if (dev->online_queues < 2) {
+  		spin_lock(&dev_list_lock);
+ -		dev->reset_workfn = nvme_remove_disks;
+ +		PREPARE_WORK(&dev->reset_work, nvme_remove_disks);
+  		queue_work(nvme_workq, &dev->reset_work);
+  		spin_unlock(&dev_list_lock);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		nvme_unfreeze_queues(dev);
++ 		nvme_dev_add(dev);
++ 		nvme_set_irq_hints(dev);
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  	}
+ +	dev->initialized = 1;
+  	return 0;
+  }
+  
+  static void nvme_dev_reset(struct nvme_dev *dev)
+  {
++ 	bool in_probe = work_busy(&dev->probe_work);
++ 
+  	nvme_dev_shutdown(dev);
+++<<<<<<< HEAD
+ +	if (nvme_dev_resume(dev)) {
+ +		dev_err(&dev->pci_dev->dev, "Device failed to resume\n");
+++=======
++ 
++ 	/* Synchronize with device probe so that work will see failure status
++ 	 * and exit gracefully without trying to schedule another reset */
++ 	flush_work(&dev->probe_work);
++ 
++ 	/* Fail this device if reset occured during probe to avoid
++ 	 * infinite initialization loops. */
++ 	if (in_probe) {
++ 		dev_warn(dev->dev, "Device failed to resume\n");
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  		kref_get(&dev->kref);
+  		if (IS_ERR(kthread_run(nvme_remove_dead_ctrl, dev, "nvme%d",
+  							dev->instance))) {
+@@@ -2952,30 -2965,77 +2996,79 @@@ static void nvme_reset_failed_dev(struc
+  	nvme_dev_reset(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_reset_workfn(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, reset_work);
++ 	dev->reset_workfn(work);
++ }
++ 
++ static int nvme_reset(struct nvme_dev *dev)
++ {
++ 	int ret = -EBUSY;
++ 
++ 	if (!dev->admin_q || blk_queue_dying(dev->admin_q))
++ 		return -ENODEV;
++ 
++ 	spin_lock(&dev_list_lock);
++ 	if (!work_pending(&dev->reset_work)) {
++ 		dev->reset_workfn = nvme_reset_failed_dev;
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 		ret = 0;
++ 	}
++ 	spin_unlock(&dev_list_lock);
++ 
++ 	if (!ret) {
++ 		flush_work(&dev->reset_work);
++ 		flush_work(&dev->probe_work);
++ 		return 0;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t nvme_sysfs_reset(struct device *dev,
++ 				struct device_attribute *attr, const char *buf,
++ 				size_t count)
++ {
++ 	struct nvme_dev *ndev = dev_get_drvdata(dev);
++ 	int ret;
++ 
++ 	ret = nvme_reset(ndev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return count;
++ }
++ static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
++ 
++ static void nvme_async_probe(struct work_struct *work);
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+ -	int node, result = -ENOMEM;
+ +	int result = -ENOMEM;
+  	struct nvme_dev *dev;
+  
+ -	node = dev_to_node(&pdev->dev);
+ -	if (node == NUMA_NO_NODE)
+ -		set_dev_node(&pdev->dev, 0);
+ -
+ -	dev = kzalloc_node(sizeof(*dev), GFP_KERNEL, node);
+ +	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  	if (!dev)
+  		return -ENOMEM;
+ -	dev->entry = kzalloc_node(num_possible_cpus() * sizeof(*dev->entry),
+ -							GFP_KERNEL, node);
+ +	dev->entry = kcalloc(num_possible_cpus(), sizeof(*dev->entry),
+ +								GFP_KERNEL);
+  	if (!dev->entry)
+  		goto free;
+ -	dev->queues = kzalloc_node((num_possible_cpus() + 1) * sizeof(void *),
+ -							GFP_KERNEL, node);
+ +	dev->queues = kcalloc(num_possible_cpus() + 1, sizeof(void *),
+ +								GFP_KERNEL);
+  	if (!dev->queues)
+  		goto free;
+ +	dev->io_queue = alloc_percpu(unsigned short);
+ +	if (!dev->io_queue)
+ +		goto free;
+  
+  	INIT_LIST_HEAD(&dev->namespaces);
+ -	dev->reset_workfn = nvme_reset_failed_dev;
+ -	INIT_WORK(&dev->reset_work, nvme_reset_workfn);
+ -	dev->dev = get_device(&pdev->dev);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	INIT_WORK(&dev->cpu_work, nvme_cpu_workfn);
+ +	dev->pci_dev = pci_dev_get(pdev);
+  	pci_set_drvdata(pdev, dev);
+  	result = nvme_set_instance(dev);
+  	if (result)
+@@@ -2986,45 -3046,56 +3079,96 @@@
+  		goto release;
+  
+  	kref_init(&dev->kref);
+++<<<<<<< HEAD
+ +	result = nvme_dev_start(dev);
+ +	if (result)
+ +		goto release_pools;
+ +
+ +	if (dev->online_queues > 1)
+ +		result = nvme_dev_add(dev);
+ +	if (result)
+ +		goto shutdown;
+ +
+ +	scnprintf(dev->name, sizeof(dev->name), "nvme%d", dev->instance);
+ +	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+ +	dev->miscdev.parent = &pdev->dev;
+ +	dev->miscdev.name = dev->name;
+ +	dev->miscdev.fops = &nvme_dev_fops;
+ +	result = misc_register(&dev->miscdev);
+ +	if (result)
+ +		goto remove;
+ +
+ +	dev->initialized = 1;
+ +	return 0;
+ +
+ + remove:
+ +	nvme_dev_remove(dev);
+ +	nvme_free_namespaces(dev);
+ + shutdown:
+ +	nvme_dev_shutdown(dev);
+ + release_pools:
+ +	nvme_free_queues(dev, 0);
+++=======
++ 	dev->device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->instance),
++ 				dev, "nvme%d", dev->instance);
++ 	if (IS_ERR(dev->device)) {
++ 		result = PTR_ERR(dev->device);
++ 		goto release_pools;
++ 	}
++ 	get_device(dev->device);
++ 	dev_set_drvdata(dev->device, dev);
++ 
++ 	result = device_create_file(dev->device, &dev_attr_reset_controller);
++ 	if (result)
++ 		goto put_dev;
++ 
++ 	INIT_LIST_HEAD(&dev->node);
++ 	INIT_WORK(&dev->scan_work, nvme_dev_scan);
++ 	INIT_WORK(&dev->probe_work, nvme_async_probe);
++ 	schedule_work(&dev->probe_work);
++ 	return 0;
++ 
++  put_dev:
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
++ 	put_device(dev->device);
++  release_pools:
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  	nvme_release_prp_pools(dev);
+   release:
+  	nvme_release_instance(dev);
+   put_pci:
+++<<<<<<< HEAD
+ +	pci_dev_put(dev->pci_dev);
+ + free:
+ +	free_percpu(dev->io_queue);
+++=======
++ 	put_device(dev->dev);
++  free:
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  	kfree(dev->queues);
+  	kfree(dev->entry);
+  	kfree(dev);
+  	return result;
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void nvme_async_probe(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, probe_work);
++ 
++ 	if (nvme_dev_resume(dev))
++ 		goto reset;
++ 	return;
++  reset:
++ 	spin_lock(&dev_list_lock);
++ 	if (!work_busy(&dev->reset_work)) {
++ 		dev->reset_workfn = nvme_reset_failed_dev;
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 	}
++ 	spin_unlock(&dev_list_lock);
+++>>>>>>> ffe7704d5902 (NVMe: Unify controller probe and resume)
+  }
+  
+  static void nvme_reset_notify(struct pci_dev *pdev, bool prepare)
+* Unmerged path drivers/block/nvme-core.c
