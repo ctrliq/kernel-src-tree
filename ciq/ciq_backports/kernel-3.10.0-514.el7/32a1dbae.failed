@@ -1,0 +1,102 @@
+audit: try harder to send to auditd upon netlink failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 32a1dbaece7e37cea415e03cd426172249aa859e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/32a1dbae.failed
+
+There are several reports of the kernel losing contact with auditd when
+it is, in fact, still running.  When this happens, kernel syslogs show:
+	"audit: *NO* daemon at audit_pid=<pid>"
+although auditd is still running, and is apparently happy, listening on
+the netlink socket. The pid in the "*NO* daemon" message matches the pid
+of the running auditd process.  Restarting auditd solves this.
+
+The problem appears to happen randomly, and doesn't seem to be strongly
+correlated to the rate of audit events being logged.  The problem
+happens fairly regularly (every few days), but not yet reproduced to
+order.
+
+On production kernels, BUG_ON() is a no-op, so any error will trigger
+this.
+
+Commit 34eab0a7cd45 ("audit: prevent an older auditd shutdown from
+orphaning a newer auditd startup") eliminates one possible cause.  This
+isn't the case here, since the PID in the error message and the PID of
+the running auditd match.
+
+The primary expected cause of error here is -ECONNREFUSED when the audit
+daemon goes away, when netlink_getsockbyportid() can't find the auditd
+portid entry in the netlink audit table (or there is no receive
+function).  If -EPERM is returned, that situation isn't likely to be
+resolved in a timely fashion without administrator intervention.  In
+both cases, reset the audit_pid.  This does not rule out a race
+condition.  SELinux is expected to return zero since this isn't an INET
+or INET6 socket.  Other LSMs may have other return codes.  Log the error
+code for better diagnosis in the future.
+
+In the case of -ENOMEM, the situation could be temporary, based on local
+or general availability of buffers.  -EAGAIN should never happen since
+the netlink audit (kernel) socket is set to MAX_SCHEDULE_TIMEOUT.
+-ERESTARTSYS and -EINTR are not expected since this kernel thread is not
+expected to receive signals.  In these cases (or any other unexpected
+ones for now), report the error and re-schedule the thread, retrying up
+to 5 times.
+
+v2:
+	Removed BUG_ON().
+	Moved comma in pr_*() statements.
+	Removed audit_strerror() text.
+
+	Reported-by: Vipin Rathor <v.rathor@gmail.com>
+	Reported-by: <ctcard@hotmail.com>
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+[PM: applied rgb's fixup patch to correct audit_log_lost() format issues]
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+(cherry picked from commit 32a1dbaece7e37cea415e03cd426172249aa859e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/audit.c
+diff --cc kernel/audit.c
+index 584bb403e5b5,c4c98d87456f..000000000000
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@@ -398,10 -415,26 +402,33 @@@ restart
+  	skb_get(skb);
+  	err = netlink_unicast(audit_sock, skb, audit_nlk_portid, 0);
+  	if (err < 0) {
+++<<<<<<< HEAD
+ +		BUG_ON(err != -ECONNREFUSED); /* Shouldn't happen */
+ +		printk(KERN_ERR "audit: *NO* daemon at audit_pid=%d\n", audit_pid);
+ +		audit_log_lost("auditd disappeared\n");
+ +		audit_pid = 0;
+++=======
++ 		pr_err("netlink_unicast sending to audit_pid=%d returned error: %d\n",
++ 		       audit_pid, err);
++ 		if (audit_pid) {
++ 			if (err == -ECONNREFUSED || err == -EPERM
++ 			    || ++attempts >= AUDITD_RETRIES) {
++ 				char s[32];
++ 
++ 				snprintf(s, sizeof(s), "audit_pid=%d reset", audit_pid);
++ 				audit_log_lost(s);
++ 				audit_pid = 0;
++ 				audit_sock = NULL;
++ 			} else {
++ 				pr_warn("re-scheduling(#%d) write to audit_pid=%d\n",
++ 					attempts, audit_pid);
++ 				set_current_state(TASK_INTERRUPTIBLE);
++ 				schedule();
++ 				__set_current_state(TASK_RUNNING);
++ 				goto restart;
++ 			}
++ 		}
+++>>>>>>> 32a1dbaece7e (audit: try harder to send to auditd upon netlink failure)
+  		/* we might get lucky and get this in the next auditd */
+  		audit_hold_skb(skb);
+  	} else
+* Unmerged path kernel/audit.c
