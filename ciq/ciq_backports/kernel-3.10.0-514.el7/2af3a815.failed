@@ -1,0 +1,123 @@
+block: Add vfs_msg() interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Toshi Kani <toshi.kani@hpe.com>
+commit 2af3a8159cd204fc8437ed2f75863f0fb930f0d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2af3a815.failed
+
+In preparation of moving DAX capability checks to the block layer
+from filesystem code, add a VFS message interface that aligns with
+filesystem's message format.
+
+For instance, a vfs_msg() message followed by XFS messages in case
+of a dax mount error may look like:
+
+  VFS (pmem0p1): error: unaligned partition for dax
+  XFS (pmem0p1): DAX unsupported by block device. Turning off DAX.
+  XFS (pmem0p1): Mounting V5 Filesystem
+   :
+
+vfs_msg() is largely based on ext4_msg().
+
+	Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Boaz Harrosh <boaz@plexistor.com>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+(cherry picked from commit 2af3a8159cd204fc8437ed2f75863f0fb930f0d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+diff --cc fs/block_dev.c
+index 2557803cf68e,91e0ec0233c0..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -49,23 -50,36 +49,39 @@@ inline struct block_device *I_BDEV(stru
+  }
+  EXPORT_SYMBOL(I_BDEV);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Move the inode from its current bdi to a new bdi.  Make sure the inode
+ + * is clean before moving so that it doesn't linger on the old bdi.
+ + */
+ +static void bdev_inode_switch_bdi(struct inode *inode,
+ +			struct backing_dev_info *dst)
+++=======
++ void __vfs_msg(struct super_block *sb, const char *prefix, const char *fmt, ...)
++ {
++ 	struct va_format vaf;
++ 	va_list args;
++ 
++ 	va_start(args, fmt);
++ 	vaf.fmt = fmt;
++ 	vaf.va = &args;
++ 	printk_ratelimited("%sVFS (%s): %pV\n", prefix, sb->s_id, &vaf);
++ 	va_end(args);
++ }
++ 
++ static void bdev_write_inode(struct block_device *bdev)
+++>>>>>>> 2af3a8159cd2 (block: Add vfs_msg() interface)
+  {
+ -	struct inode *inode = bdev->bd_inode;
+ -	int ret;
+ -
+ -	spin_lock(&inode->i_lock);
+ -	while (inode->i_state & I_DIRTY) {
+ -		spin_unlock(&inode->i_lock);
+ -		ret = write_inode_now(inode, true);
+ -		if (ret) {
+ -			char name[BDEVNAME_SIZE];
+ -			pr_warn_ratelimited("VFS: Dirty inode writeback failed "
+ -					    "for block device %s (err=%d).\n",
+ -					    bdevname(bdev, name), ret);
+ -		}
+ +	while (true) {
+  		spin_lock(&inode->i_lock);
+ +		if (!(inode->i_state & I_DIRTY)) {
+ +			inode->i_data.backing_dev_info = dst;
+ +			spin_unlock(&inode->i_lock);
+ +			return;
+ +		}
+ +		spin_unlock(&inode->i_lock);
+ +		WARN_ON_ONCE(write_inode_now(inode, true));
+  	}
+ -	spin_unlock(&inode->i_lock);
+  }
+  
+  /* Kill _all_ buffers and pagecache , dirty or not.. */
+* Unmerged path fs/block_dev.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 0e72d45d3caf..a9bef331b714 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -823,6 +823,17 @@ static inline void rq_flush_dcache_pages(struct request *rq)
+ }
+ #endif
+ 
++#ifdef CONFIG_PRINTK
++#define vfs_msg(sb, level, fmt, ...)				\
++	__vfs_msg(sb, level, fmt, ##__VA_ARGS__)
++#else
++#define vfs_msg(sb, level, fmt, ...)				\
++do {								\
++	no_printk(fmt, ##__VA_ARGS__);				\
++	__vfs_msg(sb, "", " ");					\
++} while (0)
++#endif
++
+ extern int blk_register_queue(struct gendisk *disk);
+ extern void blk_unregister_queue(struct gendisk *disk);
+ extern void generic_make_request(struct bio *bio);
