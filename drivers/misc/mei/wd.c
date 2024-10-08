@@ -164,9 +164,8 @@ int mei_wd_stop(struct mei_device *dev)
 	if (ret < 0)
 		goto out;
 
-	if (ret && dev->hbuf_is_ready) {
+	if (ret && mei_hbuf_acquire(dev)) {
 		ret = 0;
-		dev->hbuf_is_ready = false;
 
 		if (!mei_wd_send(dev)) {
 			ret = mei_cl_flow_ctrl_reduce(&dev->wd_cl);
@@ -271,8 +270,8 @@ static int mei_wd_ops_stop(struct watchdog_device *wd_dev)
  */
 static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
 {
-	int ret = 0;
 	struct mei_device *dev;
+	int ret;
 
 	dev = watchdog_get_drvdata(wd_dev);
 	if (!dev)
@@ -288,10 +287,12 @@ static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
 
 	dev->wd_state = MEI_WD_RUNNING;
 
+	ret = mei_cl_flow_ctrl_creds(&dev->wd_cl);
+	if (ret < 0)
+		goto end;
 	/* Check if we can send the ping to HW*/
-	if (dev->hbuf_is_ready && mei_cl_flow_ctrl_creds(&dev->wd_cl) > 0) {
+	if (ret && mei_hbuf_acquire(dev)) {
 
-		dev->hbuf_is_ready = false;
 		dev_dbg(&dev->pdev->dev, "wd: sending ping\n");
 
 		if (mei_wd_send(dev)) {
@@ -301,8 +302,7 @@ static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
 		}
 
 		if (mei_cl_flow_ctrl_reduce(&dev->wd_cl)) {
-			dev_err(&dev->pdev->dev,
-				"wd: mei_cl_flow_ctrl_reduce() failed.\n");
+			dev_err(&dev->pdev->dev, "wd: mei_cl_flow_ctrl_reduce() failed.\n");
 			ret = -EIO;
 			goto end;
 		}
