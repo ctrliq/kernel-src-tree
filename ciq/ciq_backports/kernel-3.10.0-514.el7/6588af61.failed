@@ -1,0 +1,131 @@
+usbnet: Fix tx_packets stat for FLAG_MULTI_FRAME drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ben Hutchings <ben.hutchings@codethink.co.uk>
+commit 6588af614e7b79294fbcd4a666a7422c0c854e80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6588af61.failed
+
+Currently the usbnet core does not update the tx_packets statistic for
+drivers with FLAG_MULTI_PACKET and there is no hook in the TX
+completion path where they could do this.
+
+cdc_ncm and dependent drivers are bumping tx_packets stat on the
+transmit path while asix and sr9800 aren't updating it at all.
+
+Add a packet count in struct skb_data so these drivers can fill it
+in, initialise it to 1 for other drivers, and add the packet count
+to the tx_packets statistic on completion.
+
+	Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+	Tested-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6588af614e7b79294fbcd4a666a7422c0c854e80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/cdc_ncm.c
+diff --cc drivers/net/usb/cdc_ncm.c
+index e977104210f9,70cbea551139..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -806,7 -1172,19 +806,23 @@@ cdc_ncm_fill_tx_frame(struct usbnet *de
+  
+  	/* return skb */
+  	ctx->tx_curr_skb = NULL;
+++<<<<<<< HEAD
+ +	dev->net->stats.tx_packets += ctx->tx_curr_frame_num;
+++=======
++ 
++ 	/* keep private stats: framing overhead and number of NTBs */
++ 	ctx->tx_overhead += skb_out->len - ctx->tx_curr_frame_payload;
++ 	ctx->tx_ntbs++;
++ 
++ 	/* usbnet has already counted all the framing overhead.
++ 	 * Adjust the stats so that the tx_bytes counter show real
++ 	 * payload data instead.
++ 	 */
++ 	dev->net->stats.tx_bytes -= skb_out->len - ctx->tx_curr_frame_payload;
++ 
++ 	usbnet_set_skb_tx_stats(skb_out, n);
++ 
+++>>>>>>> 6588af614e7b (usbnet: Fix tx_packets stat for FLAG_MULTI_FRAME drivers)
+  	return skb_out;
+  
+  exit_no_skb:
+diff --git a/drivers/net/usb/asix_common.c b/drivers/net/usb/asix_common.c
+index 5c55f11572ba..724a9b50df7a 100644
+--- a/drivers/net/usb/asix_common.c
++++ b/drivers/net/usb/asix_common.c
+@@ -188,6 +188,8 @@ struct sk_buff *asix_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
+ 		memcpy(skb_tail_pointer(skb), &padbytes, sizeof(padbytes));
+ 		skb_put(skb, sizeof(padbytes));
+ 	}
++
++	usbnet_set_skb_tx_stats(skb, 1);
+ 	return skb;
+ }
+ 
+* Unmerged path drivers/net/usb/cdc_ncm.c
+diff --git a/drivers/net/usb/sr9800.c b/drivers/net/usb/sr9800.c
+index 801710883727..9ea55510821e 100644
+--- a/drivers/net/usb/sr9800.c
++++ b/drivers/net/usb/sr9800.c
+@@ -140,6 +140,7 @@ static struct sk_buff *sr_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
+ 		skb_put(skb, sizeof(padbytes));
+ 	}
+ 
++	usbnet_set_skb_tx_stats(skb, 1);
+ 	return skb;
+ }
+ 
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index 449835f4331e..0f3ff285f6a1 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -1188,8 +1188,7 @@ static void tx_complete (struct urb *urb)
+ 	struct usbnet		*dev = entry->dev;
+ 
+ 	if (urb->status == 0) {
+-		if (!(dev->driver_info->flags & FLAG_MULTI_PACKET))
+-			dev->net->stats.tx_packets++;
++		dev->net->stats.tx_packets += entry->packets;
+ 		dev->net->stats.tx_bytes += entry->length;
+ 	} else {
+ 		dev->net->stats.tx_errors++;
+@@ -1348,6 +1347,8 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 			urb->transfer_flags |= URB_ZERO_PACKET;
+ 	}
+ 	entry->length = urb->transfer_buffer_length = length;
++	if (!(info->flags & FLAG_MULTI_PACKET))
++		usbnet_set_skb_tx_stats(skb, 1);
+ 
+ 	spin_lock_irqsave(&dev->txq.lock, flags);
+ 	retval = usb_autopm_get_interface_async(dev->intf);
+diff --git a/include/linux/usb/usbnet.h b/include/linux/usb/usbnet.h
+index d9a4905e01d0..ff3fb2bd0e90 100644
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@ -228,8 +228,20 @@ struct skb_data {	/* skb->cb is one of these */
+ 	struct usbnet		*dev;
+ 	enum skb_state		state;
+ 	size_t			length;
++	unsigned long		packets;
+ };
+ 
++/* Drivers that set FLAG_MULTI_PACKET must call this in their
++ * tx_fixup method before returning an skb.
++ */
++static inline void
++usbnet_set_skb_tx_stats(struct sk_buff *skb, unsigned long packets)
++{
++	struct skb_data *entry = (struct skb_data *) skb->cb;
++
++	entry->packets = packets;
++}
++
+ extern int usbnet_open(struct net_device *net);
+ extern int usbnet_stop(struct net_device *net);
+ extern netdev_tx_t usbnet_start_xmit(struct sk_buff *skb,
