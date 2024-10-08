@@ -136,18 +136,10 @@ static int xhci_plat_probe(struct platform_device *pdev)
 	hcd->rsrc_start = res->start;
 	hcd->rsrc_len = resource_size(res);
 
-	if (!request_mem_region(hcd->rsrc_start, hcd->rsrc_len,
-				driver->description)) {
-		dev_dbg(&pdev->dev, "controller already in use\n");
-		ret = -EBUSY;
+	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(hcd->regs)) {
+		ret = PTR_ERR(hcd->regs);
 		goto put_hcd;
-	}
-
-	hcd->regs = ioremap_nocache(hcd->rsrc_start, hcd->rsrc_len);
-	if (!hcd->regs) {
-		dev_dbg(&pdev->dev, "error mapping memory\n");
-		ret = -EFAULT;
-		goto release_mem_region;
 	}
 
 	/*
@@ -158,7 +150,7 @@ static int xhci_plat_probe(struct platform_device *pdev)
 	if (!IS_ERR(clk)) {
 		ret = clk_prepare_enable(clk);
 		if (ret)
-			goto unmap_registers;
+			goto put_hcd;
 	}
 
 	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
@@ -205,12 +197,6 @@ disable_clk:
 	if (!IS_ERR(clk))
 		clk_disable_unprepare(clk);
 
-unmap_registers:
-	iounmap(hcd->regs);
-
-release_mem_region:
-	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
-
 put_hcd:
 	usb_put_hcd(hcd);
 
@@ -229,8 +215,6 @@ static int xhci_plat_remove(struct platform_device *dev)
 	usb_remove_hcd(hcd);
 	if (!IS_ERR(clk))
 		clk_disable_unprepare(clk);
-	iounmap(hcd->regs);
-	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
 	usb_put_hcd(hcd);
 	kfree(xhci);
 
