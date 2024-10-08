@@ -1,0 +1,152 @@
+tcp: do not pace pure ack packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 9878196578286c5ed494778ada01da094377a686
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/98781965.failed
+
+When we added pacing to TCP, we decided to let sch_fq take care
+of actual pacing.
+
+All TCP had to do was to compute sk->pacing_rate using simple formula:
+
+sk->pacing_rate = 2 * cwnd * mss / rtt
+
+It works well for senders (bulk flows), but not very well for receivers
+or even RPC :
+
+cwnd on the receiver can be less than 10, rtt can be around 100ms, so we
+can end up pacing ACK packets, slowing down the sender.
+
+Really, only the sender should pace, according to its own logic.
+
+Instead of adding a new bit in skb, or call yet another flow
+dissection, we tweak skb->truesize to a small value (2), and
+we instruct sch_fq to use new helper and not pace pure ack.
+
+Note this also helps TCP small queue, as ack packets present
+in qdisc/NIC do not prevent sending a data packet (RPC workload)
+
+This helps to reduce tx completion overhead, ack packets can use regular
+sock_wfree() instead of tcp_wfree() which is a bit more expensive.
+
+This has no impact in the case packets are sent to loopback interface,
+as we do not coalesce ack packets (were we would detect skb->truesize
+lie)
+
+In case netem (with a delay) is used, skb_orphan_partial() also sets
+skb->truesize to 1.
+
+This patch is a combination of two patches we used for about one year at
+Google.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9878196578286c5ed494778ada01da094377a686)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index 074c9a68acbd,1b326ed46f7b..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -923,7 -948,8 +923,12 @@@ static int tcp_transmit_skb(struct soc
+  
+  	skb_orphan(skb);
+  	skb->sk = sk;
+++<<<<<<< HEAD
+ +	skb->destructor = tcp_wfree;
+++=======
++ 	skb->destructor = skb_is_tcp_pure_ack(skb) ? sock_wfree : tcp_wfree;
++ 	skb_set_hash_from_sk(skb, sk);
+++>>>>>>> 987819657828 (tcp: do not pace pure ack packets)
+  	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
+  
+  	/* Build TCP header and checksum it. */
+@@@ -3141,8 -3265,16 +3146,16 @@@ void tcp_send_ack(struct sock *sk
+  	skb_reserve(buff, MAX_TCP_HEADER);
+  	tcp_init_nondata_skb(buff, tcp_acceptable_seq(sk), TCPHDR_ACK);
+  
++ 	/* We do not want pure acks influencing TCP Small Queues or fq/pacing
++ 	 * too much.
++ 	 * SKB_TRUESIZE(max(1 .. 66, MAX_TCP_HEADER)) is unfortunately ~784
++ 	 * We also avoid tcp_wfree() overhead (cache line miss accessing
++ 	 * tp->tsq_flags) by using regular sock_wfree()
++ 	 */
++ 	skb_set_tcp_pure_ack(buff);
++ 
+  	/* Send it off, this clears delayed acks for us. */
+ -	skb_mstamp_get(&buff->skb_mstamp);
+ +	TCP_SKB_CB(buff)->when = tcp_time_stamp;
+  	tcp_transmit_skb(sk, buff, 0, sk_gfp_atomic(sk, GFP_ATOMIC));
+  }
+  EXPORT_SYMBOL_GPL(tcp_send_ack);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index aff4173509ce..2376ba16ea18 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1600,4 +1600,19 @@ extern int tcpv4_offload_init(void);
+ extern void tcp_v4_init(void);
+ extern void tcp_init(void);
+ 
++/* locally generated TCP pure ACKs have skb->truesize == 2
++ * (check tcp_send_ack() in net/ipv4/tcp_output.c )
++ * This is much faster than dissecting the packet to find out.
++ * (Think of GRE encapsulations, IPv4, IPv6, ...)
++ */
++static inline bool skb_is_tcp_pure_ack(const struct sk_buff *skb)
++{
++	return skb->truesize == 2;
++}
++
++static inline void skb_set_tcp_pure_ack(struct sk_buff *skb)
++{
++	skb->truesize = 2;
++}
++
+ #endif	/* _TCP_H */
+* Unmerged path net/ipv4/tcp_output.c
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index d74bf47f0ded..69e542b6a9e8 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -52,6 +52,7 @@
+ #include <net/pkt_sched.h>
+ #include <net/sock.h>
+ #include <net/tcp_states.h>
++#include <net/tcp.h>
+ 
+ /*
+  * Per flow structure, dynamically allocated
+@@ -445,7 +446,9 @@ begin:
+ 		goto begin;
+ 	}
+ 
+-	if (unlikely(f->head && now < f->time_next_packet)) {
++	skb = f->head;
++	if (unlikely(skb && now < f->time_next_packet &&
++		     !skb_is_tcp_pure_ack(skb))) {
+ 		head->first = f->next;
+ 		fq_flow_set_throttled(q, f);
+ 		goto begin;
+@@ -464,12 +467,15 @@ begin:
+ 		goto begin;
+ 	}
+ 	prefetch(&skb->end);
+-	f->time_next_packet = now;
+ 	f->credit -= qdisc_pkt_len(skb);
+ 
+ 	if (f->credit > 0 || !q->rate_enable)
+ 		goto out;
+ 
++	/* Do not pace locally generated ack packets */
++	if (skb_is_tcp_pure_ack(skb))
++		goto out;
++
+ 	rate = q->flow_max_rate;
+ 	if (skb->sk)
+ 		rate = min(skb->sk->sk_pacing_rate, rate);
