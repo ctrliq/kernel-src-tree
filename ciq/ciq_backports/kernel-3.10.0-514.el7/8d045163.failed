@@ -1,0 +1,170 @@
+netfilter: bridge: kill nf_bridge_pad
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 8d0451638ad3f7ccd5250c1dd90e06ad487b2703
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8d045163.failed
+
+The br_netfilter frag output function calls skb_cow_head() so in
+case it needs a larger headroom to e.g. re-add a previously stripped PPPOE
+or VLAN header things will still work (at cost of reallocation).
+
+We can then move nf_bridge_encap_header_len to br_netfilter.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8d0451638ad3f7ccd5250c1dd90e06ad487b2703)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter_bridge.h
+diff --cc include/linux/netfilter_bridge.h
+index 91f08439b405,2734977199ca..000000000000
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@@ -23,56 -23,6 +23,59 @@@ enum nf_br_hook_priorities 
+  #define BRNF_8021Q			0x10
+  #define BRNF_PPPoE			0x20
+  
+++<<<<<<< HEAD
+ +static inline unsigned int nf_bridge_encap_header_len(const struct sk_buff *skb)
+ +{
+ +	switch (skb->protocol) {
+ +	case __cpu_to_be16(ETH_P_8021Q):
+ +		return VLAN_HLEN;
+ +	case __cpu_to_be16(ETH_P_PPP_SES):
+ +		return PPPOE_SES_HLEN;
+ +	default:
+ +		return 0;
+ +	}
+ +}
+ +
+ +static inline void nf_bridge_update_protocol(struct sk_buff *skb)
+ +{
+ +	if (skb->nf_bridge->mask & BRNF_8021Q)
+ +		skb->protocol = htons(ETH_P_8021Q);
+ +	else if (skb->nf_bridge->mask & BRNF_PPPoE)
+ +		skb->protocol = htons(ETH_P_PPP_SES);
+ +}
+ +
+ +/* Fill in the header for fragmented IP packets handled by
+ + * the IPv4 connection tracking code.
+ + *
+ + * Only used in br_forward.c
+ + */
+ +static inline int nf_bridge_copy_header(struct sk_buff *skb)
+ +{
+ +	int err;
+ +	unsigned int header_size;
+ +
+ +	nf_bridge_update_protocol(skb);
+ +	header_size = ETH_HLEN + nf_bridge_encap_header_len(skb);
+ +	err = skb_cow_head(skb, header_size);
+ +	if (err)
+ +		return err;
+ +
+ +	skb_copy_to_linear_data_offset(skb, -header_size,
+ +				       skb->nf_bridge->data, header_size);
+ +	__skb_push(skb, nf_bridge_encap_header_len(skb));
+ +	return 0;
+ +}
+ +
+ +static inline int nf_bridge_maybe_copy_header(struct sk_buff *skb)
+ +{
+ +	if (skb->nf_bridge &&
+ +	    skb->nf_bridge->mask & (BRNF_BRIDGED | BRNF_BRIDGED_DNAT))
+ +		return nf_bridge_copy_header(skb);
+ +  	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 8d0451638ad3 (netfilter: bridge: kill nf_bridge_pad)
+  static inline unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
+  {
+  	if (unlikely(skb->nf_bridge->mask & BRNF_PPPoE))
+@@@ -80,29 -30,8 +83,20 @@@
+  	return 0;
+  }
+  
+ -int br_handle_frame_finish(struct sk_buff *skb);
+ +int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb);
+ +/* Only used in br_device.c */
+ +static inline int br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
+ +{
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ +
+ +	skb_pull(skb, ETH_HLEN);
+ +	nf_bridge->mask ^= BRNF_BRIDGED_DNAT;
+ +	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
+ +				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
+ +	skb->dev = nf_bridge->physindev;
+ +	return br_handle_frame_finish(NULL, skb);
+ +}
+  
+- /* This is called by the IP fragmenting code and it ensures there is
+-  * enough room for the encapsulating header (if there is one). */
+- static inline unsigned int nf_bridge_pad(const struct sk_buff *skb)
+- {
+- 	if (skb->nf_bridge)
+- 		return nf_bridge_encap_header_len(skb);
+- 	return 0;
+- }
+- 
+  static inline void br_drop_fake_rtable(struct sk_buff *skb)
+  {
+  	struct dst_entry *dst = skb_dst(skb);
+@@@ -112,8 -41,6 +106,11 @@@
+  }
+  
+  #else
+++<<<<<<< HEAD
+ +#define nf_bridge_maybe_copy_header(skb)	(0)
+ +#define nf_bridge_pad(skb)			(0)
+++=======
+++>>>>>>> 8d0451638ad3 (netfilter: bridge: kill nf_bridge_pad)
+  #define br_drop_fake_rtable(skb)	        do { } while (0)
+  #endif /* CONFIG_BRIDGE_NETFILTER */
+  
+* Unmerged path include/linux/netfilter_bridge.h
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+index e61c718c570d..0896b94afb6a 100644
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -212,6 +212,18 @@ static inline struct nf_bridge_info *nf_bridge_unshare(struct sk_buff *skb)
+ 	return nf_bridge;
+ }
+ 
++static unsigned int nf_bridge_encap_header_len(const struct sk_buff *skb)
++{
++	switch (skb->protocol) {
++	case __cpu_to_be16(ETH_P_8021Q):
++		return VLAN_HLEN;
++	case __cpu_to_be16(ETH_P_PPP_SES):
++		return PPPOE_SES_HLEN;
++	default:
++		return 0;
++	}
++}
++
+ static inline void nf_bridge_push_encap_header(struct sk_buff *skb)
+ {
+ 	unsigned int len = nf_bridge_encap_header_len(skb);
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index c0c838649a76..f04e1df25175 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -645,10 +645,7 @@ slow_path:
+ 	left = skb->len - hlen;		/* Space per frame */
+ 	ptr = hlen;		/* Where to start from */
+ 
+-	/* for bridged IP traffic encapsulated inside f.e. a vlan header,
+-	 * we need to make room for the encapsulating header
+-	 */
+-	ll_rs = LL_RESERVED_SPACE_EXTRA(rt->dst.dev, nf_bridge_pad(skb));
++	ll_rs = LL_RESERVED_SPACE(rt->dst.dev);
+ 
+ 	/*
+ 	 *	Fragment the datagram.
