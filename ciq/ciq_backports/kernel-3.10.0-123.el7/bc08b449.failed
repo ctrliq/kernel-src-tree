@@ -1,0 +1,258 @@
+lockref: implement lockless reference count updates using cmpxchg()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit bc08b449ee14ace4d869adaa1bb35a44ce68d775
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/bc08b449.failed
+
+Instead of taking the spinlock, the lockless versions atomically check
+that the lock is not taken, and do the reference count update using a
+cmpxchg() loop.  This is semantically identical to doing the reference
+count update protected by the lock, but avoids the "wait for lock"
+contention that you get when accesses to the reference count are
+contended.
+
+Note that a "lockref" is absolutely _not_ equivalent to an atomic_t.
+Even when the lockref reference counts are updated atomically with
+cmpxchg, the fact that they also verify the state of the spinlock means
+that the lockless updates can never happen while somebody else holds the
+spinlock.
+
+So while "lockref_put_or_lock()" looks a lot like just another name for
+"atomic_dec_and_lock()", and both optimize to lockless updates, they are
+fundamentally different: the decrement done by atomic_dec_and_lock() is
+truly independent of any lock (as long as it doesn't decrement to zero),
+so a locked region can still see the count change.
+
+The lockref structure, in contrast, really is a *locked* reference
+count.  If you hold the spinlock, the reference count will be stable and
+you can modify the reference count without using atomics, because even
+the lockless updates will see and respect the state of the lock.
+
+In order to enable the cmpxchg lockless code, the architecture needs to
+do three things:
+
+ (1) Make sure that the "arch_spinlock_t" and an "unsigned int" can fit
+     in an aligned u64, and have a "cmpxchg()" implementation that works
+     on such a u64 data type.
+
+ (2) define a helper function to test for a spinlock being unlocked
+     ("arch_spin_value_unlocked()")
+
+ (3) select the "ARCH_USE_CMPXCHG_LOCKREF" config variable in its
+     Kconfig file.
+
+This enables it for x86-64 (but not 32-bit, we'd need to make sure
+cmpxchg() turns into the proper cmpxchg8b in order to enable it for
+32-bit mode).
+
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bc08b449ee14ace4d869adaa1bb35a44ce68d775)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/spinlock.h
+diff --cc arch/x86/include/asm/spinlock.h
+index 4722bb0ccc42,e0e668422c75..000000000000
+--- a/arch/x86/include/asm/spinlock.h
++++ b/arch/x86/include/asm/spinlock.h
+@@@ -34,33 -34,9 +34,39 @@@
+  # define UNLOCK_LOCK_PREFIX
+  #endif
+  
+++<<<<<<< HEAD
+ +/* How long a lock should spin before we consider blocking */
+ +#define SPIN_THRESHOLD	(1 << 15)
+ +
+ +#ifndef CONFIG_PARAVIRT_SPINLOCKS
+ +
+ +static __always_inline void __ticket_lock_spinning(struct arch_spinlock *lock,
+ +							__ticket_t ticket)
+ +{
+ +}
+ +
+ +static __always_inline void ____ticket_unlock_kick(struct arch_spinlock *lock,
+ +							 __ticket_t ticket)
+ +{
+ +}
+ +
+ +#endif	/* CONFIG_PARAVIRT_SPINLOCKS */
+ +
+ +
+ +/*
+ + * If a spinlock has someone waiting on it, then kick the appropriate
+ + * waiting cpu.
+ + */
+ +static __always_inline void __ticket_unlock_kick(struct arch_spinlock *lock,
+ +							__ticket_t next)
+ +{
+ +	if (unlikely(lock->tickets.tail != next))
+ +		____ticket_unlock_kick(lock, next);
+++=======
++ static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
++ {
++ 	return lock.tickets.head == lock.tickets.tail;
+++>>>>>>> bc08b449ee14 (lockref: implement lockless reference count updates using cmpxchg())
+  }
+  
+  /*
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index a673d046c32f..e865af66a1c0 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -16,6 +16,7 @@ config X86_64
+ 	def_bool y
+ 	depends on 64BIT
+ 	select X86_DEV_DMA_OPS
++	select ARCH_USE_CMPXCHG_LOCKREF
+ 
+ ### Arch settings
+ config X86
+* Unmerged path arch/x86/include/asm/spinlock.h
+diff --git a/include/linux/lockref.h b/include/linux/lockref.h
+index 4c0af31c8d47..ca07b5028b01 100644
+--- a/include/linux/lockref.h
++++ b/include/linux/lockref.h
+@@ -17,8 +17,15 @@
+ #include <linux/spinlock.h>
+ 
+ struct lockref {
+-	spinlock_t lock;
+-	unsigned int count;
++	union {
++#ifdef CONFIG_CMPXCHG_LOCKREF
++		aligned_u64 lock_count;
++#endif
++		struct {
++			spinlock_t lock;
++			unsigned int count;
++		};
++	};
+ };
+ 
+ extern void lockref_get(struct lockref *);
+diff --git a/lib/Kconfig b/lib/Kconfig
+index 339d5a4292f8..07b5d974c754 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -45,6 +45,16 @@ config STMP_DEVICE
+ config PERCPU_RWSEM
+ 	boolean
+ 
++config ARCH_USE_CMPXCHG_LOCKREF
++	bool
++
++config CMPXCHG_LOCKREF
++	def_bool y if ARCH_USE_CMPXCHG_LOCKREF
++	depends on SMP
++	depends on !GENERIC_LOCKBREAK
++	depends on !DEBUG_SPINLOCK
++	depends on !DEBUG_LOCK_ALLOC
++
+ config CRC_CCITT
+ 	tristate "CRC-CCITT functions"
+ 	help
+diff --git a/lib/lockref.c b/lib/lockref.c
+index a9a4f4e1eff5..7819c2d1d315 100644
+--- a/lib/lockref.c
++++ b/lib/lockref.c
+@@ -1,6 +1,33 @@
+ #include <linux/export.h>
+ #include <linux/lockref.h>
+ 
++#ifdef CONFIG_CMPXCHG_LOCKREF
++
++/*
++ * Note that the "cmpxchg()" reloads the "old" value for the
++ * failure case.
++ */
++#define CMPXCHG_LOOP(CODE, SUCCESS) do {					\
++	struct lockref old;							\
++	BUILD_BUG_ON(sizeof(old) != 8);						\
++	old.lock_count = ACCESS_ONCE(lockref->lock_count);			\
++	while (likely(arch_spin_value_unlocked(old.lock.rlock.raw_lock))) {  	\
++		struct lockref new = old, prev = old;				\
++		CODE								\
++		old.lock_count = cmpxchg(&lockref->lock_count,			\
++					 old.lock_count, new.lock_count);	\
++		if (likely(old.lock_count == prev.lock_count)) {		\
++			SUCCESS;						\
++		}								\
++	}									\
++} while (0)
++
++#else
++
++#define CMPXCHG_LOOP(CODE, SUCCESS) do { } while (0)
++
++#endif
++
+ /**
+  * lockref_get - Increments reference count unconditionally
+  * @lockcnt: pointer to lockref structure
+@@ -10,6 +37,12 @@
+  */
+ void lockref_get(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count++;
++	,
++		return;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	lockref->count++;
+ 	spin_unlock(&lockref->lock);
+@@ -23,9 +56,18 @@ EXPORT_SYMBOL(lockref_get);
+  */
+ int lockref_get_not_zero(struct lockref *lockref)
+ {
+-	int retval = 0;
++	int retval;
++
++	CMPXCHG_LOOP(
++		new.count++;
++		if (!old.count)
++			return 0;
++	,
++		return 1;
++	);
+ 
+ 	spin_lock(&lockref->lock);
++	retval = 0;
+ 	if (lockref->count) {
+ 		lockref->count++;
+ 		retval = 1;
+@@ -43,6 +85,14 @@ EXPORT_SYMBOL(lockref_get_not_zero);
+  */
+ int lockref_get_or_lock(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count++;
++		if (!old.count)
++			break;
++	,
++		return 1;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	if (!lockref->count)
+ 		return 0;
+@@ -59,6 +109,14 @@ EXPORT_SYMBOL(lockref_get_or_lock);
+  */
+ int lockref_put_or_lock(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count--;
++		if (old.count <= 1)
++			break;
++	,
++		return 1;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	if (lockref->count <= 1)
+ 		return 0;
