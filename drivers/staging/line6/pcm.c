@@ -226,9 +226,8 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
 	struct snd_pcm_substream *s;
 	int err;
-	unsigned long flags;
 
-	spin_lock_irqsave(&line6pcm->lock_trigger, flags);
+	spin_lock(&line6pcm->lock_trigger);
 	clear_bit(LINE6_INDEX_PREPARED, &line6pcm->flags);
 
 	snd_pcm_group_for_each_entry(s, substream) {
@@ -239,8 +238,7 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 			err = snd_line6_playback_trigger(line6pcm, cmd);
 
 			if (err < 0) {
-				spin_unlock_irqrestore(&line6pcm->lock_trigger,
-						       flags);
+				spin_unlock(&line6pcm->lock_trigger);
 				return err;
 			}
 
@@ -250,8 +248,7 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 			err = snd_line6_capture_trigger(line6pcm, cmd);
 
 			if (err < 0) {
-				spin_unlock_irqrestore(&line6pcm->lock_trigger,
-						       flags);
+				spin_unlock(&line6pcm->lock_trigger);
 				return err;
 			}
 
@@ -263,7 +260,7 @@ int snd_line6_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 	}
 
-	spin_unlock_irqrestore(&line6pcm->lock_trigger, flags);
+	spin_unlock(&line6pcm->lock_trigger);
 	return 0;
 }
 
