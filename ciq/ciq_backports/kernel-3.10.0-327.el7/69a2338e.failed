@@ -1,0 +1,401 @@
+net/bonding: Move slave state changes to a helper function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] bonding: Move slave state changes to a helper function (Nikolay Aleksandrov) [1166647]
+Rebuild_FUZZ: 96.43%
+commit-author Moni Shoua <monis@mellanox.com>
+commit 69a2338e05995b10225b2a131f7540d1305980e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/69a2338e.failed
+
+Move slave state changes to a helper function, this is a pre-step for adding
+functionality of dispatching an event when this helper is called.
+
+This commit doesn't add new functionality.
+
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 69a2338e05995b10225b2a131f7540d1305980e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 723c3d160745,92fe3a1bf52b..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1044,9 -790,9 +1044,9 @@@ void bond_change_active_slave(struct bo
+  			}
+  
+  			new_active->delay = 0;
+- 			new_active->link = BOND_LINK_UP;
++ 			bond_set_slave_link_state(new_active, BOND_LINK_UP);
+  
+ -			if (BOND_MODE(bond) == BOND_MODE_8023AD)
+ +			if (bond->params.mode == BOND_MODE_8023AD)
+  				bond_3ad_handle_link_change(new_active, BOND_LINK_UP);
+  
+  			if (bond_is_lb(bond))
+@@@ -1450,6 -1152,50 +1450,53 @@@ static void bond_upper_dev_unlink(struc
+  	rtmsg_ifinfo(RTM_NEWLINK, slave_dev, IFF_SLAVE, GFP_KERNEL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct slave *bond_alloc_slave(struct bonding *bond)
++ {
++ 	struct slave *slave = NULL;
++ 
++ 	slave = kzalloc(sizeof(struct slave), GFP_KERNEL);
++ 	if (!slave)
++ 		return NULL;
++ 
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++ 		SLAVE_AD_INFO(slave) = kzalloc(sizeof(struct ad_slave_info),
++ 					       GFP_KERNEL);
++ 		if (!SLAVE_AD_INFO(slave)) {
++ 			kfree(slave);
++ 			return NULL;
++ 		}
++ 	}
++ 	return slave;
++ }
++ 
++ static void bond_free_slave(struct slave *slave)
++ {
++ 	struct bonding *bond = bond_get_bond_by_slave(slave);
++ 
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD)
++ 		kfree(SLAVE_AD_INFO(slave));
++ 
++ 	kfree(slave);
++ }
++ 
++ static void bond_fill_ifbond(struct bonding *bond, struct ifbond *info)
++ {
++ 	info->bond_mode = BOND_MODE(bond);
++ 	info->miimon = bond->params.miimon;
++ 	info->num_slaves = bond->slave_cnt;
++ }
++ 
++ static void bond_fill_ifslave(struct slave *slave, struct ifslave *info)
++ {
++ 	strcpy(info->slave_name, slave->dev->name);
++ 	info->link = slave->link;
++ 	info->state = bond_slave_state(slave);
++ 	info->link_failure_count = slave->link_failure_count;
++ }
++ 
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  /* enslave device <slave> to bond device <master> */
+  int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev)
+  {
+@@@ -2118,32 -1839,21 +2168,33 @@@ static int  bond_release_and_destroy(st
+  static int bond_info_query(struct net_device *bond_dev, struct ifbond *info)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+++<<<<<<< HEAD
+ +
+ +	info->bond_mode = bond->params.mode;
+ +	info->miimon = bond->params.miimon;
+ +
+ +	read_lock(&bond->lock);
+ +	info->num_slaves = bond->slave_cnt;
+ +	read_unlock(&bond->lock);
+ +
+++=======
++ 	bond_fill_ifbond(bond, info);
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  	return 0;
+  }
+  
+  static int bond_slave_info_query(struct net_device *bond_dev, struct ifslave *info)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+ -	struct list_head *iter;
+ -	int i = 0, res = -ENODEV;
+  	struct slave *slave;
+ +	int i, res = -ENODEV;
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ -		if (i++ == (int)info->slave_id) {
+ +	read_lock(&bond->lock);
+ +
+ +	bond_for_each_slave(bond, slave, i) {
+ +		if (i == (int)info->slave_id) {
+  			res = 0;
+- 			strcpy(info->slave_name, slave->dev->name);
+- 			info->link = slave->link;
+- 			info->state = bond_slave_state(slave);
+- 			info->link_failure_count = slave->link_failure_count;
++ 			bond_fill_ifslave(slave, info);
+  			break;
+  		}
+  	}
+@@@ -2174,31 -1883,27 +2225,41 @@@ static int bond_miimon_inspect(struct b
+  			if (link_state)
+  				continue;
+  
+- 			slave->link = BOND_LINK_FAIL;
++ 			bond_set_slave_link_state(slave, BOND_LINK_FAIL);
+  			slave->delay = bond->params.downdelay;
+  			if (slave->delay) {
+ -				netdev_info(bond->dev, "link status down for %sinterface %s, disabling it in %d ms\n",
+ -					    (BOND_MODE(bond) ==
+ -					     BOND_MODE_ACTIVEBACKUP) ?
+ -					     (bond_is_active_slave(slave) ?
+ -					      "active " : "backup ") : "",
+ -					    slave->dev->name,
+ -					    bond->params.downdelay * bond->params.miimon);
+ +				pr_info("%s: link status down for %sinterface %s, disabling it in %d ms.\n",
+ +					bond->dev->name,
+ +					(bond->params.mode ==
+ +					 BOND_MODE_ACTIVEBACKUP) ?
+ +					(bond_is_active_slave(slave) ?
+ +					 "active " : "backup ") : "",
+ +					slave->dev->name,
+ +					bond->params.downdelay * bond->params.miimon);
+  			}
+  			/*FALLTHRU*/
+  		case BOND_LINK_FAIL:
+  			if (link_state) {
+++<<<<<<< HEAD
+ +				/*
+ +				 * recovered before downdelay expired
+ +				 */
+ +				slave->link = BOND_LINK_UP;
+ +				slave->jiffies = jiffies;
+ +				pr_info("%s: link status up again after %d ms for interface %s.\n",
+ +					bond->dev->name,
+ +					(bond->params.downdelay - slave->delay) *
+ +					bond->params.miimon,
+ +					slave->dev->name);
+++=======
++ 				/* recovered before downdelay expired */
++ 				bond_set_slave_link_state(slave, BOND_LINK_UP);
++ 				slave->last_link_up = jiffies;
++ 				netdev_info(bond->dev, "link status up again after %d ms for interface %s\n",
++ 					    (bond->params.downdelay - slave->delay) *
++ 					    bond->params.miimon,
++ 					    slave->dev->name);
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  				continue;
+  			}
+  
+@@@ -2228,12 -1933,12 +2289,21 @@@
+  			/*FALLTHRU*/
+  		case BOND_LINK_BACK:
+  			if (!link_state) {
+++<<<<<<< HEAD
+ +				slave->link = BOND_LINK_DOWN;
+ +				pr_info("%s: link status down again after %d ms for interface %s.\n",
+ +					bond->dev->name,
+ +					(bond->params.updelay - slave->delay) *
+ +					bond->params.miimon,
+ +					slave->dev->name);
+++=======
++ 				bond_set_slave_link_state(slave,
++ 							  BOND_LINK_DOWN);
++ 				netdev_info(bond->dev, "link status down again after %d ms for interface %s\n",
++ 					    (bond->params.updelay - slave->delay) *
++ 					    bond->params.miimon,
++ 					    slave->dev->name);
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  
+  				continue;
+  			}
+@@@ -2267,16 -1972,17 +2337,21 @@@ static void bond_miimon_commit(struct b
+  			continue;
+  
+  		case BOND_LINK_UP:
+++<<<<<<< HEAD
+ +			slave->link = BOND_LINK_UP;
+ +			slave->jiffies = jiffies;
+++=======
++ 			bond_set_slave_link_state(slave, BOND_LINK_UP);
++ 			slave->last_link_up = jiffies;
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  
+ -			primary = rtnl_dereference(bond->primary_slave);
+ -			if (BOND_MODE(bond) == BOND_MODE_8023AD) {
+ +			if (bond->params.mode == BOND_MODE_8023AD) {
+  				/* prevent it from being the active one */
+  				bond_set_backup_slave(slave);
+ -			} else if (BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP) {
+ +			} else if (bond->params.mode != BOND_MODE_ACTIVEBACKUP) {
+  				/* make it immediately active */
+  				bond_set_active_slave(slave);
+ -			} else if (slave != primary) {
+ +			} else if (slave != bond->primary_slave) {
+  				/* prevent it from being the active one */
+  				bond_set_backup_slave(slave);
+  			}
+@@@ -2304,16 -2012,17 +2379,16 @@@
+  			if (slave->link_failure_count < UINT_MAX)
+  				slave->link_failure_count++;
+  
+- 			slave->link = BOND_LINK_DOWN;
++ 			bond_set_slave_link_state(slave, BOND_LINK_DOWN);
+  
+ -			if (BOND_MODE(bond) == BOND_MODE_ACTIVEBACKUP ||
+ -			    BOND_MODE(bond) == BOND_MODE_8023AD)
+ -				bond_set_slave_inactive_flags(slave,
+ -							      BOND_SLAVE_NOTIFY_NOW);
+ +			if (bond->params.mode == BOND_MODE_ACTIVEBACKUP ||
+ +			    bond->params.mode == BOND_MODE_8023AD)
+ +				bond_set_slave_inactive_flags(slave);
+  
+ -			netdev_info(bond->dev, "link status definitely down for interface %s, disabling it\n",
+ -				    slave->dev->name);
+ +			pr_info("%s: link status definitely down for interface %s, disabling it\n",
+ +				bond->dev->name, slave->dev->name);
+  
+ -			if (BOND_MODE(bond) == BOND_MODE_8023AD)
+ +			if (bond->params.mode == BOND_MODE_8023AD)
+  				bond_3ad_handle_link_change(slave,
+  							    BOND_LINK_DOWN);
+  
+@@@ -2864,23 -2589,25 +2939,34 @@@ static void bond_ab_arp_commit(struct b
+  
+  		case BOND_LINK_UP:
+  			trans_start = dev_trans_start(slave->dev);
+++<<<<<<< HEAD
+ +			if ((!bond->curr_active_slave &&
+ +			     time_in_range(jiffies,
+ +					   trans_start - delta_in_ticks,
+ +					   trans_start + delta_in_ticks + delta_in_ticks / 2)) ||
+ +			    bond->curr_active_slave != slave) {
+ +				slave->link = BOND_LINK_UP;
+ +				if (bond->current_arp_slave) {
+++=======
++ 			if (rtnl_dereference(bond->curr_active_slave) != slave ||
++ 			    (!rtnl_dereference(bond->curr_active_slave) &&
++ 			     bond_time_in_interval(bond, trans_start, 1))) {
++ 				struct slave *current_arp_slave;
++ 
++ 				current_arp_slave = rtnl_dereference(bond->current_arp_slave);
++ 				bond_set_slave_link_state(slave, BOND_LINK_UP);
++ 				if (current_arp_slave) {
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  					bond_set_slave_inactive_flags(
+ -						current_arp_slave,
+ -						BOND_SLAVE_NOTIFY_NOW);
+ -					RCU_INIT_POINTER(bond->current_arp_slave, NULL);
+ +						bond->current_arp_slave);
+ +					bond->current_arp_slave = NULL;
+  				}
+  
+ -				netdev_info(bond->dev, "link status definitely up for interface %s\n",
+ -					    slave->dev->name);
+ +				pr_info("%s: link status definitely up for interface %s.\n",
+ +					bond->dev->name, slave->dev->name);
+  
+ -				if (!rtnl_dereference(bond->curr_active_slave) ||
+ -				    slave == rtnl_dereference(bond->primary_slave))
+ +				if (!bond->curr_active_slave ||
+ +				    (slave == bond->primary_slave))
+  					goto do_failover;
+  
+  			}
+@@@ -2891,14 -2618,15 +2977,20 @@@
+  			if (slave->link_failure_count < UINT_MAX)
+  				slave->link_failure_count++;
+  
+++<<<<<<< HEAD
+ +			slave->link = BOND_LINK_DOWN;
+ +			bond_set_slave_inactive_flags(slave);
+++=======
++ 			bond_set_slave_link_state(slave, BOND_LINK_DOWN);
++ 			bond_set_slave_inactive_flags(slave,
++ 						      BOND_SLAVE_NOTIFY_NOW);
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  
+ -			netdev_info(bond->dev, "link status definitely down for interface %s, disabling it\n",
+ -				    slave->dev->name);
+ +			pr_info("%s: link status definitely down for interface %s, disabling it\n",
+ +				bond->dev->name, slave->dev->name);
+  
+ -			if (slave == rtnl_dereference(bond->curr_active_slave)) {
+ -				RCU_INIT_POINTER(bond->current_arp_slave, NULL);
+ +			if (slave == bond->curr_active_slave) {
+ +				bond->current_arp_slave = NULL;
+  				goto do_failover;
+  			}
+  
+@@@ -2979,20 -2696,44 +3071,52 @@@ static void bond_ab_arp_probe(struct bo
+  		 * one the current slave so it is still marked
+  		 * up when it is actually down
+  		 */
+++<<<<<<< HEAD
+ +		if (slave->link == BOND_LINK_UP) {
+ +			slave->link = BOND_LINK_DOWN;
+++=======
++ 		if (!bond_slave_is_up(slave) && slave->link == BOND_LINK_UP) {
++ 			bond_set_slave_link_state(slave, BOND_LINK_DOWN);
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  			if (slave->link_failure_count < UINT_MAX)
+  				slave->link_failure_count++;
+  
+ -			bond_set_slave_inactive_flags(slave,
+ -						      BOND_SLAVE_NOTIFY_LATER);
+ +			bond_set_slave_inactive_flags(slave);
+  
+++<<<<<<< HEAD
+ +			pr_info("%s: backup interface %s is now down.\n",
+ +				bond->dev->name, slave->dev->name);
+++=======
++ 			netdev_info(bond->dev, "backup interface %s is now down\n",
++ 				    slave->dev->name);
++ 		}
++ 		if (slave == curr_arp_slave)
++ 			found = true;
++ 	}
++ 
++ 	if (!new_slave && before)
++ 		new_slave = before;
++ 
++ 	if (!new_slave)
++ 		goto check_state;
++ 
++ 	bond_set_slave_link_state(new_slave, BOND_LINK_BACK);
++ 	bond_set_slave_active_flags(new_slave, BOND_SLAVE_NOTIFY_LATER);
++ 	bond_arp_send_all(bond, new_slave);
++ 	new_slave->last_link_up = jiffies;
++ 	rcu_assign_pointer(bond->current_arp_slave, new_slave);
++ 
++ check_state:
++ 	bond_for_each_slave_rcu(bond, slave, iter) {
++ 		if (slave->should_notify) {
++ 			should_notify_rtnl = BOND_SLAVE_NOTIFY_NOW;
++ 			break;
+++>>>>>>> 69a2338e0599 (net/bonding: Move slave state changes to a helper function)
+  		}
+  	}
+ -	return should_notify_rtnl;
+  }
+  
+ -static void bond_activebackup_arp_mon(struct work_struct *work)
+ +void bond_activebackup_arp_mon(struct work_struct *work)
+  {
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    arp_work.work);
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 64c0cb81e478..d6f356ab62d6 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -392,6 +392,11 @@ static inline bool bond_is_slave_inactive(struct slave *slave)
+ 	return slave->inactive;
+ }
+ 
++static inline void bond_set_slave_link_state(struct slave *slave, int state)
++{
++	slave->link = state;
++}
++
+ static inline __be32 bond_confirm_addr(struct net_device *dev, __be32 dst, __be32 local)
+ {
+ 	struct in_device *in_dev;
