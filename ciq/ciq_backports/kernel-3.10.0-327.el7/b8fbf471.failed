@@ -1,0 +1,299 @@
+gfs2: perform quota checks against allocation parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Abhi Das <adas@redhat.com>
+commit b8fbf471edb3dbf441716fd2a52a7ca76c381381
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b8fbf471.failed
+
+Use struct gfs2_alloc_parms as an argument to gfs2_quota_check()
+and gfs2_quota_lock_check() to check for quota violations while
+accounting for the new blocks requested by the current operation
+in ap->target.
+
+Previously, the number of new blocks requested during an operation
+were not accounted for during quota_check and would allow these
+operations to exceed quota. This was not very apparent since most
+operations allocated only 1 block at a time and quotas would get
+violated in the next operation. i.e. quota excess would only be by
+1 block or so. With fallocate, (where we allocate a bunch of blocks
+at once) the quota excess is non-trivial and is addressed by this
+patch.
+
+	Signed-off-by: Abhi Das <adas@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit b8fbf471edb3dbf441716fd2a52a7ca76c381381)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/file.c
+index fd5c82990c75,c569adbc1431..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -859,14 -827,13 +859,20 @@@ static long gfs2_fallocate(struct file 
+  			offset += bytes;
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		error = gfs2_quota_lock_check(ip);
+ +		if (error)
+ +			goto out_unlock;
+ +
+++=======
+++>>>>>>> b8fbf471edb3 (gfs2: perform quota checks against allocation parameters)
+  retry:
+  		gfs2_write_calc_reserv(ip, bytes, &data_blocks, &ind_blocks);
+- 
+  		ap.target = data_blocks + ind_blocks;
++ 
++ 		error = gfs2_quota_lock_check(ip, &ap);
++ 		if (error)
++ 			return error;
+  		error = gfs2_inplace_reserve(ip, &ap);
+  		if (error) {
+  			if (error == -ENOSPC && bytes > sdp->sd_sb.sb_bsize) {
+diff --cc fs/gfs2/inode.c
+index e5fe7447b3d7,08bc84d7e768..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -376,14 -376,13 +376,14 @@@ static void munge_mode_uid_gid(const st
+  		inode->i_gid = current_fsgid();
+  }
+  
+ -static int alloc_dinode(struct gfs2_inode *ip, u32 flags, unsigned *dblocks)
+ +static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ -	struct gfs2_alloc_parms ap = { .target = *dblocks, .aflags = flags, };
+ +	struct gfs2_alloc_parms ap = { .target = RES_DINODE, .aflags = flags, };
+  	int error;
+ +	int dblocks = 1;
+  
+- 	error = gfs2_quota_lock_check(ip);
++ 	error = gfs2_quota_lock_check(ip, &ap);
+  	if (error)
+  		goto out;
+  
+@@@ -469,15 -495,37 +469,20 @@@ static void init_dinode(struct gfs2_ino
+  	brelse(dibh);
+  }
+  
+ -/**
+ - * gfs2_trans_da_blocks - Calculate number of blocks to link inode
+ - * @dip: The directory we are linking into
+ - * @da: The dir add information
+ - * @nr_inodes: The number of inodes involved
+ - *
+ - * This calculate the number of blocks we need to reserve in a
+ - * transaction to link @nr_inodes into a directory. In most cases
+ - * @nr_inodes will be 2 (the directory plus the inode being linked in)
+ - * but in case of rename, 4 may be required.
+ - *
+ - * Returns: Number of blocks
+ - */
+ -
+ -static unsigned gfs2_trans_da_blks(const struct gfs2_inode *dip,
+ -				   const struct gfs2_diradd *da,
+ -				   unsigned nr_inodes)
+ -{
+ -	return da->nr_blocks + gfs2_rg_blocks(dip, da->nr_blocks) +
+ -	       (nr_inodes * RES_DINODE) + RES_QUOTA + RES_STATFS;
+ -}
+ -
+  static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
+ -		       struct gfs2_inode *ip, struct gfs2_diradd *da)
+ +		       struct gfs2_inode *ip, int arq)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
+ -	struct gfs2_alloc_parms ap = { .target = da->nr_blocks, };
+ +	struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
+  	int error;
+  
+++<<<<<<< HEAD
+ +	if (arq) {
+ +		error = gfs2_quota_lock_check(dip);
+++=======
++ 	if (da->nr_blocks) {
++ 		error = gfs2_quota_lock_check(dip, &ap);
+++>>>>>>> b8fbf471edb3 (gfs2: perform quota checks against allocation parameters)
+  		if (error)
+  			goto fail_quota_locks;
+  
+@@@ -885,14 -947,13 +890,20 @@@ static int gfs2_link(struct dentry *old
+  	if (ip->i_inode.i_nlink == (u32)-1)
+  		goto out_gunlock;
+  
+ -	error = gfs2_diradd_alloc_required(dir, &dentry->d_name, &da);
+ +	alloc_required = error = gfs2_diradd_alloc_required(dir, &dentry->d_name);
+  	if (error < 0)
+  		goto out_gunlock;
+ +	error = 0;
+  
+++<<<<<<< HEAD
+ +	if (alloc_required) {
+ +		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
+ +		error = gfs2_quota_lock_check(dip);
+++=======
++ 	if (da.nr_blocks) {
++ 		struct gfs2_alloc_parms ap = { .target = da.nr_blocks, };
++ 		error = gfs2_quota_lock_check(dip, &ap);
+++>>>>>>> b8fbf471edb3 (gfs2: perform quota checks against allocation parameters)
+  		if (error)
+  			goto out_gunlock;
+  
+@@@ -1410,15 -1462,15 +1421,21 @@@ static int gfs2_rename(struct inode *od
+  			goto out_gunlock;
+  	}
+  
+ -	if (nip == NULL) {
+ -		error = gfs2_diradd_alloc_required(ndir, &ndentry->d_name, &da);
+ -		if (error)
+ -			goto out_gunlock;
+ -	}
+ +	if (nip == NULL)
+ +		alloc_required = gfs2_diradd_alloc_required(ndir, &ndentry->d_name);
+ +	error = alloc_required;
+ +	if (error < 0)
+ +		goto out_gunlock;
+  
+++<<<<<<< HEAD
+ +	if (alloc_required) {
+ +		struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
+ +		error = gfs2_quota_lock_check(ndip);
+++=======
++ 	if (da.nr_blocks) {
++ 		struct gfs2_alloc_parms ap = { .target = da.nr_blocks, };
++ 		error = gfs2_quota_lock_check(ndip, &ap);
+++>>>>>>> b8fbf471edb3 (gfs2: perform quota checks against allocation parameters)
+  		if (error)
+  			goto out_gunlock;
+  
+diff --git a/fs/gfs2/aops.c b/fs/gfs2/aops.c
+index 1854901a11de..fda3e9513f0b 100644
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@ -699,12 +699,12 @@ static int gfs2_write_begin(struct file *file, struct address_space *mapping,
+ 
+ 	if (alloc_required) {
+ 		struct gfs2_alloc_parms ap = { .aflags = 0, };
+-		error = gfs2_quota_lock_check(ip);
++		requested = data_blocks + ind_blocks;
++		ap.target = requested;
++		error = gfs2_quota_lock_check(ip, &ap);
+ 		if (error)
+ 			goto out_unlock;
+ 
+-		requested = data_blocks + ind_blocks;
+-		ap.target = requested;
+ 		error = gfs2_inplace_reserve(ip, &ap);
+ 		if (error)
+ 			goto out_qunlock;
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 9e43dd6a6454..c9e860161c6f 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -1224,7 +1224,7 @@ static int do_grow(struct inode *inode, u64 size)
+ 
+ 	if (gfs2_is_stuffed(ip) &&
+ 	    (size > (sdp->sd_sb.sb_bsize - sizeof(struct gfs2_dinode)))) {
+-		error = gfs2_quota_lock_check(ip);
++		error = gfs2_quota_lock_check(ip, &ap);
+ 		if (error)
+ 			return error;
+ 
+* Unmerged path fs/gfs2/file.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 0b1540793164..2b4e490013db 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -291,7 +291,7 @@ struct gfs2_blkreserv {
+  * to the allocation code.
+  */
+ struct gfs2_alloc_parms {
+-	u32 target;
++	u64 target;
+ 	u32 aflags;
+ };
+ 
+* Unmerged path fs/gfs2/inode.c
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index c9e262bf7ba3..058295d052cb 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -1085,7 +1085,8 @@ static int print_message(struct gfs2_quota_data *qd, char *type)
+ 	return 0;
+ }
+ 
+-int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid)
++int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid,
++		     struct gfs2_alloc_parms *ap)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ 	struct gfs2_quota_data *qd;
+@@ -1108,14 +1109,13 @@ int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid)
+ 
+ 		value = (s64)be64_to_cpu(qd->qd_qb.qb_value);
+ 		spin_lock(&qd_lock);
+-		value += qd->qd_change;
++		value += qd->qd_change + ap->target;
+ 		spin_unlock(&qd_lock);
+ 
+ 		if (be64_to_cpu(qd->qd_qb.qb_limit) && (s64)be64_to_cpu(qd->qd_qb.qb_limit) < value) {
+ 			print_message(qd, "exceeded");
+ 			quota_send_warning(qd->qd_id,
+ 					   sdp->sd_vfs->s_dev, QUOTA_NL_BHARDWARN);
+-
+ 			error = -EDQUOT;
+ 			break;
+ 		} else if (be64_to_cpu(qd->qd_qb.qb_warn) &&
+diff --git a/fs/gfs2/quota.h b/fs/gfs2/quota.h
+index 55d506eb3c4a..ad04b3acae2b 100644
+--- a/fs/gfs2/quota.h
++++ b/fs/gfs2/quota.h
+@@ -24,7 +24,8 @@ extern void gfs2_quota_unhold(struct gfs2_inode *ip);
+ extern int gfs2_quota_lock(struct gfs2_inode *ip, kuid_t uid, kgid_t gid);
+ extern void gfs2_quota_unlock(struct gfs2_inode *ip);
+ 
+-extern int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid);
++extern int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid,
++			    struct gfs2_alloc_parms *ap);
+ extern void gfs2_quota_change(struct gfs2_inode *ip, s64 change,
+ 			      kuid_t uid, kgid_t gid);
+ 
+@@ -37,7 +38,8 @@ extern int gfs2_quotad(void *data);
+ 
+ extern void gfs2_wake_up_statfs(struct gfs2_sbd *sdp);
+ 
+-static inline int gfs2_quota_lock_check(struct gfs2_inode *ip)
++static inline int gfs2_quota_lock_check(struct gfs2_inode *ip,
++					struct gfs2_alloc_parms *ap)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ 	int ret;
+@@ -48,7 +50,7 @@ static inline int gfs2_quota_lock_check(struct gfs2_inode *ip)
+ 		return ret;
+ 	if (sdp->sd_args.ar_quota != GFS2_QUOTA_ON)
+ 		return 0;
+-	ret = gfs2_quota_check(ip, ip->i_inode.i_uid, ip->i_inode.i_gid);
++	ret = gfs2_quota_check(ip, ip->i_inode.i_uid, ip->i_inode.i_gid, ap);
+ 	if (ret)
+ 		gfs2_quota_unlock(ip);
+ 	return ret;
+diff --git a/fs/gfs2/xattr.c b/fs/gfs2/xattr.c
+index 8c6a6f6bdba9..80196e27eebe 100644
+--- a/fs/gfs2/xattr.c
++++ b/fs/gfs2/xattr.c
+@@ -731,7 +731,7 @@ static int ea_alloc_skeleton(struct gfs2_inode *ip, struct gfs2_ea_request *er,
+ 	if (error)
+ 		return error;
+ 
+-	error = gfs2_quota_lock_check(ip);
++	error = gfs2_quota_lock_check(ip, &ap);
+ 	if (error)
+ 		return error;
+ 
