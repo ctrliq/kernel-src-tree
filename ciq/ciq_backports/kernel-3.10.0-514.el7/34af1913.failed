@@ -1,0 +1,170 @@
+mei: keep the device awake during reads in chunks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit 34af19132ed77b51f84274c23cef4ed520542319
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34af1913.failed
+
+Long messages are read in chunks, to prevent trashing runtime pm between
+the reading of the chunks we call pm_runtime_mark_last_busy() on
+non-final chunk message as the next chunk of the same message will be
+received immediately in the next interrupt with high probablity.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 34af19132ed77b51f84274c23cef4ed520542319)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/interrupt.c
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,64b568a0268d..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -21,6 -20,8 +21,11 @@@
+  #include <linux/interrupt.h>
+  #include <linux/fs.h>
+  #include <linux/jiffies.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/slab.h>
++ #include <linux/pm_runtime.h>
+++>>>>>>> 34af19132ed7 (mei: keep the device awake during reads in chunks)
+  
+  #include <linux/mei.h>
+  
+@@@ -87,74 -89,74 +92,89 @@@ static bool mei_cl_is_reading(struct me
+  }
+  
+  /**
+ - * mei_cl_irq_read_msg - process client message
+ + * mei_irq_read_client_message - process client message
+   *
+ - * @cl: reading client
+ + * @dev: the device structure
+   * @mei_hdr: header of mei client message
+ - * @complete_list: completion list
+ + * @complete_list: An instance of our list structure
+   *
+ - * Return: always 0
+ + * returns 0 on success, <0 on failure.
+   */
+ -int mei_cl_irq_read_msg(struct mei_cl *cl,
+ -		       struct mei_msg_hdr *mei_hdr,
+ -		       struct mei_cl_cb *complete_list)
+ +static int mei_cl_irq_read_msg(struct mei_device *dev,
+ +			       struct mei_msg_hdr *mei_hdr,
+ +			       struct mei_cl_cb *complete_list)
+  {
+ -	struct mei_device *dev = cl->dev;
+ -	struct mei_cl_cb *cb;
+ +	struct mei_cl *cl;
+ +	struct mei_cl_cb *cb, *next;
+  	unsigned char *buffer = NULL;
+  
+ -	cb = list_first_entry_or_null(&cl->rd_pending, struct mei_cl_cb, list);
+ -	if (!cb) {
+ -		cl_err(dev, cl, "pending read cb not found\n");
+ -		goto out;
+ -	}
+ +	list_for_each_entry_safe(cb, next, &dev->read_list.list, list) {
+ +		cl = cb->cl;
+ +		if (!cl || !mei_cl_is_reading(cl, mei_hdr))
+ +			continue;
+  
+ -	if (!mei_cl_is_connected(cl)) {
+ -		cl_dbg(dev, cl, "not connected\n");
+ -		cb->status = -ENODEV;
+ -		goto out;
+ -	}
+ +		cl->reading_state = MEI_READING;
+  
+ -	if (cb->buf.size == 0 || cb->buf.data == NULL) {
+ -		cl_err(dev, cl, "response buffer is not allocated.\n");
+ -		list_move_tail(&cb->list, &complete_list->list);
+ -		cb->status = -ENOMEM;
+ -		goto out;
+ -	}
+ +		if (cb->response_buffer.size == 0 ||
+ +		    cb->response_buffer.data == NULL) {
+ +			cl_err(dev, cl, "response buffer is not allocated.\n");
+ +			list_del(&cb->list);
+ +			return -ENOMEM;
+ +		}
+  
+ -	if (cb->buf.size < mei_hdr->length + cb->buf_idx) {
+ -		cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ -			cb->buf.size, mei_hdr->length, cb->buf_idx);
+ -		buffer = krealloc(cb->buf.data, mei_hdr->length + cb->buf_idx,
+ -				  GFP_KERNEL);
+ +		if (cb->response_buffer.size < mei_hdr->length + cb->buf_idx) {
+ +			cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
+ +				cb->response_buffer.size,
+ +				mei_hdr->length, cb->buf_idx);
+ +			buffer = krealloc(cb->response_buffer.data,
+ +					  mei_hdr->length + cb->buf_idx,
+ +					  GFP_KERNEL);
+ +
+ +			if (!buffer) {
+ +				list_del(&cb->list);
+ +				return -ENOMEM;
+ +			}
+ +			cb->response_buffer.data = buffer;
+ +			cb->response_buffer.size =
+ +				mei_hdr->length + cb->buf_idx;
+ +		}
+  
+ -		if (!buffer) {
+ -			cb->status = -ENOMEM;
+ -			list_move_tail(&cb->list, &complete_list->list);
+ -			goto out;
+ +		buffer = cb->response_buffer.data + cb->buf_idx;
+ +		mei_read_slots(dev, buffer, mei_hdr->length);
+ +
+ +		cb->buf_idx += mei_hdr->length;
+ +		if (mei_hdr->msg_complete) {
+ +			cl->status = 0;
+ +			list_del(&cb->list);
+ +			cl_dbg(dev, cl, "completed read length = %lu\n",
+ +				cb->buf_idx);
+ +			list_add_tail(&cb->list, &complete_list->list);
+  		}
+ -		cb->buf.data = buffer;
+ -		cb->buf.size = mei_hdr->length + cb->buf_idx;
+ +		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	dev_dbg(&dev->pdev->dev, "message read\n");
+ +	if (!buffer) {
+ +		mei_read_slots(dev, dev->rd_msg_buf, mei_hdr->length);
+ +		dev_dbg(&dev->pdev->dev, "discarding message " MEI_HDR_FMT "\n",
+ +				MEI_HDR_PRM(mei_hdr));
+++=======
++ 	buffer = cb->buf.data + cb->buf_idx;
++ 	mei_read_slots(dev, buffer, mei_hdr->length);
++ 
++ 	cb->buf_idx += mei_hdr->length;
++ 
++ 	if (mei_hdr->msg_complete) {
++ 		cb->read_time = jiffies;
++ 		cl_dbg(dev, cl, "completed read length = %lu\n", cb->buf_idx);
++ 		list_move_tail(&cb->list, &complete_list->list);
++ 	} else {
++ 		pm_runtime_mark_last_busy(dev->dev);
++ 		pm_request_autosuspend(dev->dev);
+++>>>>>>> 34af19132ed7 (mei: keep the device awake during reads in chunks)
+  	}
+  
+ -out:
+ -	if (!buffer)
+ -		mei_irq_discard_msg(dev, mei_hdr);
+ -
+  	return 0;
+  }
+  
+* Unmerged path drivers/misc/mei/interrupt.c
