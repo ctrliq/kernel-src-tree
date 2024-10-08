@@ -1,0 +1,282 @@
+netfilter: bridge: restore vlan tag when refragmenting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit d7b597421519d6f680eb8e152a0d8447466ee2d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d7b59742.failed
+
+If bridge netfilter is used with both
+bridge-nf-call-iptables and bridge-nf-filter-vlan-tagged enabled
+then ip fragments in VLAN frames are sent without the vlan header.
+
+This has never worked reliably.  Turns out this relied on pre-3.5
+behaviour where skb frag_list was used to store ip fragments;
+ip_fragment() then re-used these skbs.
+
+But since commit 3cc4949269e01f39443d0fcfffb5bc6b47878d45
+("ipv4: use skb coalescing in defragmentation") this is no longer
+the case.  ip_do_fragment now needs to allocate new skbs, but these
+don't contain the vlan tag information anymore.
+
+Fix it by storing vlan information of the ressembled skb in the
+br netfilter percpu frag area, and restore them for each of the
+fragments.
+
+Fixes: 3cc4949269e01f3 ("ipv4: use skb coalescing in defragmentation")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit d7b597421519d6f680eb8e152a0d8447466ee2d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,e4e5f2f29173..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -110,64 -108,32 +110,83 @@@ static inline __be16 pppoe_proto(const 
+  	 pppoe_proto(skb) == htons(PPP_IPV6) && \
+  	 brnf_filter_pppoe_tagged)
+  
+++<<<<<<< HEAD
+ +static void fake_update_pmtu(struct dst_entry *dst, struct sock *sk,
+ +			     struct sk_buff *skb, u32 mtu)
+++=======
++ /* largest possible L2 header, see br_nf_dev_queue_xmit() */
++ #define NF_BRIDGE_MAX_MAC_HEADER_LENGTH (PPPOE_SES_HLEN + ETH_HLEN)
++ 
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ struct brnf_frag_data {
++ 	char mac[NF_BRIDGE_MAX_MAC_HEADER_LENGTH];
++ 	u8 encap_size;
++ 	u8 size;
++ 	u16 vlan_tci;
++ 	__be16 vlan_proto;
++ };
++ 
++ static DEFINE_PER_CPU(struct brnf_frag_data, brnf_frag_data_storage);
++ #endif
++ 
++ static struct nf_bridge_info *nf_bridge_info_get(const struct sk_buff *skb)
+++>>>>>>> d7b597421519 (netfilter: bridge: restore vlan tag when refragmenting)
+  {
+ -	return skb->nf_bridge;
+  }
+  
+ -static void nf_bridge_info_free(struct sk_buff *skb)
+ +static void fake_redirect(struct dst_entry *dst, struct sock *sk,
+ +			  struct sk_buff *skb)
+  {
+ -	if (skb->nf_bridge) {
+ -		nf_bridge_put(skb->nf_bridge);
+ -		skb->nf_bridge = NULL;
+ -	}
+ +}
+ +
+ +static u32 *fake_cow_metrics(struct dst_entry *dst, unsigned long old)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static struct neighbour *fake_neigh_lookup(const struct dst_entry *dst,
+ +					   struct sk_buff *skb,
+ +					   const void *daddr)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static unsigned int fake_mtu(const struct dst_entry *dst)
+ +{
+ +	return dst->dev->mtu;
+ +}
+ +
+ +static struct dst_ops fake_dst_ops = {
+ +	.family =		AF_INET,
+ +	.protocol =		cpu_to_be16(ETH_P_IP),
+ +	.update_pmtu =		fake_update_pmtu,
+ +	.redirect =		fake_redirect,
+ +	.cow_metrics =		fake_cow_metrics,
+ +	.neigh_lookup =		fake_neigh_lookup,
+ +	.mtu =			fake_mtu,
+ +};
+ +
+ +/*
+ + * Initialize bogus route table used to keep netfilter happy.
+ + * Currently, we fill in the PMTU entry because netfilter
+ + * refragmentation needs it, and the rt_flags entry because
+ + * ipt_REJECT needs it.  Future netfilter modules might
+ + * require us to fill additional fields.
+ + */
+ +static const u32 br_dst_default_metrics[RTAX_MAX] = {
+ +	[RTAX_MTU - 1] = 1500,
+ +};
+ +
+ +void br_netfilter_rtable_init(struct net_bridge *br)
+ +{
+ +	struct rtable *rt = &br->fake_rtable;
+ +
+ +	atomic_set(&rt->dst.__refcnt, 1);
+ +	rt->dst.dev = br->dev;
+ +	rt->dst.path = &rt->dst;
+ +	dst_init_metrics(&rt->dst, br_dst_default_metrics, true);
+ +	rt->dst.flags	= DST_NOXFRM | DST_NOPEER | DST_FAKE_RTABLE;
+ +	rt->dst.ops = &fake_dst_ops;
+  }
+  
+  static inline struct rtable *bridge_parent_rtable(const struct net_device *dev)
+@@@ -848,29 -897,128 +867,132 @@@ static unsigned int br_nf_forward_arp(c
+  	return NF_STOLEN;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK_IPV4)
+++=======
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4) || IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
++ static int br_nf_push_frag_xmit(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct brnf_frag_data *data;
++ 	int err;
++ 
++ 	data = this_cpu_ptr(&brnf_frag_data_storage);
++ 	err = skb_cow_head(skb, data->size);
++ 
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 
++ 	if (data->vlan_tci) {
++ 		skb->vlan_tci = data->vlan_tci;
++ 		skb->vlan_proto = data->vlan_proto;
++ 	}
++ 
++ 	skb_copy_to_linear_data_offset(skb, -data->size, data->mac, data->size);
++ 	__skb_push(skb, data->encap_size);
++ 
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
++ }
++ #endif
++ 
++ static int br_nf_ip_fragment(struct sock *sk, struct sk_buff *skb,
++ 			     int (*output)(struct sock *, struct sk_buff *))
++ {
++ 	unsigned int mtu = ip_skb_dst_mtu(skb);
++ 	struct iphdr *iph = ip_hdr(skb);
++ 	struct rtable *rt = skb_rtable(skb);
++ 	struct net_device *dev = rt->dst.dev;
++ 
++ 	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
++ 		     (IPCB(skb)->frag_max_size &&
++ 		      IPCB(skb)->frag_max_size > mtu))) {
++ 		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ 
++ 	return ip_do_fragment(sk, skb, output);
++ }
++ 
++ static unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge->orig_proto == BRNF_PROTO_PPPOE)
++ 		return PPPOE_SES_HLEN;
++ 	return 0;
++ }
++ 
+++>>>>>>> d7b597421519 (netfilter: bridge: restore vlan tag when refragmenting)
+  static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+  {
+ -	struct nf_bridge_info *nf_bridge;
+ -	unsigned int mtu_reserved;
+ -
+ -	mtu_reserved = nf_bridge_mtu_reduction(skb);
+ -
+ -	if (skb_is_gso(skb) || skb->len + mtu_reserved <= skb->dev->mtu) {
+ -		nf_bridge_info_free(skb);
+ -		return br_dev_queue_push_xmit(sk, skb);
+ -	}
+ -
+ -	nf_bridge = nf_bridge_info_get(skb);
+ -
+ -#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
+ -	/* This is wrong! We should preserve the original fragment
+ -	 * boundaries by preserving frag_list rather than refragmenting.
+ -	 */
+ -	if (skb->protocol == htons(ETH_P_IP)) {
+ -		struct brnf_frag_data *data;
+ +	int ret;
+  
+ -		if (br_validate_ipv4(skb))
+ +	if (skb->nfct != NULL && skb->protocol == htons(ETH_P_IP) &&
+ +	    skb->len + nf_bridge_mtu_reduction(skb) > skb->dev->mtu &&
+ +	    !skb_is_gso(skb)) {
+ +		if (br_parse_ip_options(skb))
+ +			/* Drop invalid packet */
+  			return NF_DROP;
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+ +		ret = br_dev_queue_push_xmit(sk, skb);
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 		IPCB(skb)->frag_max_size = nf_bridge->frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 
++ 		data->vlan_tci = skb->vlan_tci;
++ 		data->vlan_proto = skb->vlan_proto;
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		return br_nf_ip_fragment(sk, skb, br_nf_push_frag_xmit);
++ 	}
++ #endif
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
++ 	if (skb->protocol == htons(ETH_P_IPV6)) {
++ 		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
++ 		struct brnf_frag_data *data;
++ 
++ 		if (br_validate_ipv6(skb))
++ 			return NF_DROP;
++ 
++ 		IP6CB(skb)->frag_max_size = nf_bridge->frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		if (v6ops)
++ 			return v6ops->fragment(sk, skb, br_nf_push_frag_xmit);
++ 		else
++ 			return -EMSGSIZE;
++ 	}
++ #endif
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
+++>>>>>>> d7b597421519 (netfilter: bridge: restore vlan tag when refragmenting)
+  }
+ +#else
+ +static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+ +{
+ +        return br_dev_queue_push_xmit(sk, skb);
+ +}
+ +#endif
+  
+  /* PF_BRIDGE/POST_ROUTING ********************************************/
+  static unsigned int br_nf_post_routing(const struct nf_hook_ops *ops,
+* Unmerged path net/bridge/br_netfilter.c
