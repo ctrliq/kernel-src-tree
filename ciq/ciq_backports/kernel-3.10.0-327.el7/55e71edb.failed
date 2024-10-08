@@ -1,0 +1,364 @@
+i2c: move ACPI helpers into the core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [i2c] move ACPI helpers into the core (Aristeu Rozanski) [1075108 1075114]
+Rebuild_FUZZ: 92.54%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 55e71edb81b2b45273e7b284cce13ff24bde846f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/55e71edb.failed
+
+This follows what has already been done for the DeviceTree helpers. Move
+the ACPI helpers from drivers/acpi/acpi_i2c.c to the I2C core and update
+documentation accordingly.
+
+This also solves a problem reported by Jerry Snitselaar that we can't build
+the ACPI I2C helpers as a module.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+(cherry picked from commit 55e71edb81b2b45273e7b284cce13ff24bde846f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/acpi/enumeration.txt
+#	drivers/acpi/acpi_i2c.c
+#	drivers/i2c/busses/i2c-designware-platdrv.c
+#	drivers/i2c/i2c-core.c
+#	include/linux/i2c.h
+diff --cc Documentation/acpi/enumeration.txt
+index d9be7a97dff3,d977778b5e67..000000000000
+--- a/Documentation/acpi/enumeration.txt
++++ b/Documentation/acpi/enumeration.txt
+@@@ -228,19 -228,9 +228,25 @@@ ACPI handle like
+  I2C serial bus support
+  ~~~~~~~~~~~~~~~~~~~~~~
+  The slaves behind I2C bus controller only need to add the ACPI IDs like
+++<<<<<<< HEAD
+ +with the platform and SPI drivers. However the I2C bus controller driver
+ +needs to call acpi_i2c_register_devices() after it has added the adapter.
+ +
+ +An I2C bus (controller) driver does:
+ +
+ +	...
+ +	ret = i2c_add_numbered_adapter(adapter);
+ +	if (ret)
+ +		/* handle error */
+ +
+ +	of_i2c_register_devices(adapter);
+ +	/* Enumerate the slave devices behind this bus via ACPI */
+ +	acpi_i2c_register_devices(adapter);
+++=======
++ with the platform and SPI drivers. The I2C core automatically enumerates
++ any slave devices behind the controller device once the adapter is
++ registered.
+++>>>>>>> 55e71edb81b2 (i2c: move ACPI helpers into the core)
+  
+  Below is an example of how to add ACPI support to the existing mpu3050
+  input driver:
+diff --cc drivers/i2c/busses/i2c-designware-platdrv.c
+index 35b70a1edf57,6e99d9f56dee..000000000000
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@@ -167,8 -171,6 +167,11 @@@ static int dw_i2c_probe(struct platform
+  		dev_err(&pdev->dev, "failure adding adapter\n");
+  		return r;
+  	}
+++<<<<<<< HEAD
+ +	of_i2c_register_devices(adap);
+ +	acpi_i2c_register_devices(adap);
+++=======
+++>>>>>>> 55e71edb81b2 (i2c: move ACPI helpers into the core)
+  
+  	pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
+  	pm_runtime_use_autosuspend(&pdev->dev);
+diff --cc drivers/i2c/i2c-core.c
+index d6835cd1ee37,29d3f045a2bf..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -954,6 -960,194 +954,197 @@@ static void i2c_scan_static_board_info(
+  	up_read(&__i2c_board_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* OF support code */
++ 
++ #if IS_ENABLED(CONFIG_OF)
++ static void of_i2c_register_devices(struct i2c_adapter *adap)
++ {
++ 	void *result;
++ 	struct device_node *node;
++ 
++ 	/* Only register child devices if the adapter has a node pointer set */
++ 	if (!adap->dev.of_node)
++ 		return;
++ 
++ 	dev_dbg(&adap->dev, "of_i2c: walking child nodes\n");
++ 
++ 	for_each_available_child_of_node(adap->dev.of_node, node) {
++ 		struct i2c_board_info info = {};
++ 		struct dev_archdata dev_ad = {};
++ 		const __be32 *addr;
++ 		int len;
++ 
++ 		dev_dbg(&adap->dev, "of_i2c: register %s\n", node->full_name);
++ 
++ 		if (of_modalias_node(node, info.type, sizeof(info.type)) < 0) {
++ 			dev_err(&adap->dev, "of_i2c: modalias failure on %s\n",
++ 				node->full_name);
++ 			continue;
++ 		}
++ 
++ 		addr = of_get_property(node, "reg", &len);
++ 		if (!addr || (len < sizeof(int))) {
++ 			dev_err(&adap->dev, "of_i2c: invalid reg on %s\n",
++ 				node->full_name);
++ 			continue;
++ 		}
++ 
++ 		info.addr = be32_to_cpup(addr);
++ 		if (info.addr > (1 << 10) - 1) {
++ 			dev_err(&adap->dev, "of_i2c: invalid addr=%x on %s\n",
++ 				info.addr, node->full_name);
++ 			continue;
++ 		}
++ 
++ 		info.irq = irq_of_parse_and_map(node, 0);
++ 		info.of_node = of_node_get(node);
++ 		info.archdata = &dev_ad;
++ 
++ 		if (of_get_property(node, "wakeup-source", NULL))
++ 			info.flags |= I2C_CLIENT_WAKE;
++ 
++ 		request_module("%s%s", I2C_MODULE_PREFIX, info.type);
++ 
++ 		result = i2c_new_device(adap, &info);
++ 		if (result == NULL) {
++ 			dev_err(&adap->dev, "of_i2c: Failure registering %s\n",
++ 				node->full_name);
++ 			of_node_put(node);
++ 			irq_dispose_mapping(info.irq);
++ 			continue;
++ 		}
++ 	}
++ }
++ 
++ static int of_dev_node_match(struct device *dev, void *data)
++ {
++ 	return dev->of_node == data;
++ }
++ 
++ /* must call put_device() when done with returned i2c_client device */
++ struct i2c_client *of_find_i2c_device_by_node(struct device_node *node)
++ {
++ 	struct device *dev;
++ 
++ 	dev = bus_find_device(&i2c_bus_type, NULL, node,
++ 					 of_dev_node_match);
++ 	if (!dev)
++ 		return NULL;
++ 
++ 	return i2c_verify_client(dev);
++ }
++ EXPORT_SYMBOL(of_find_i2c_device_by_node);
++ 
++ /* must call put_device() when done with returned i2c_adapter device */
++ struct i2c_adapter *of_find_i2c_adapter_by_node(struct device_node *node)
++ {
++ 	struct device *dev;
++ 
++ 	dev = bus_find_device(&i2c_bus_type, NULL, node,
++ 					 of_dev_node_match);
++ 	if (!dev)
++ 		return NULL;
++ 
++ 	return i2c_verify_adapter(dev);
++ }
++ EXPORT_SYMBOL(of_find_i2c_adapter_by_node);
++ #else
++ static void of_i2c_register_devices(struct i2c_adapter *adap) { }
++ #endif /* CONFIG_OF */
++ 
++ /* ACPI support code */
++ 
++ #if IS_ENABLED(CONFIG_ACPI)
++ static int acpi_i2c_add_resource(struct acpi_resource *ares, void *data)
++ {
++ 	struct i2c_board_info *info = data;
++ 
++ 	if (ares->type == ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++ 		struct acpi_resource_i2c_serialbus *sb;
++ 
++ 		sb = &ares->data.i2c_serial_bus;
++ 		if (sb->type == ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++ 			info->addr = sb->slave_address;
++ 			if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 				info->flags |= I2C_CLIENT_TEN;
++ 		}
++ 	} else if (info->irq < 0) {
++ 		struct resource r;
++ 
++ 		if (acpi_dev_resource_interrupt(ares, 0, &r))
++ 			info->irq = r.start;
++ 	}
++ 
++ 	/* Tell the ACPI core to skip this resource */
++ 	return 1;
++ }
++ 
++ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
++ 				       void *data, void **return_value)
++ {
++ 	struct i2c_adapter *adapter = data;
++ 	struct list_head resource_list;
++ 	struct i2c_board_info info;
++ 	struct acpi_device *adev;
++ 	int ret;
++ 
++ 	if (acpi_bus_get_device(handle, &adev))
++ 		return AE_OK;
++ 	if (acpi_bus_get_status(adev) || !adev->status.present)
++ 		return AE_OK;
++ 
++ 	memset(&info, 0, sizeof(info));
++ 	info.acpi_node.handle = handle;
++ 	info.irq = -1;
++ 
++ 	INIT_LIST_HEAD(&resource_list);
++ 	ret = acpi_dev_get_resources(adev, &resource_list,
++ 				     acpi_i2c_add_resource, &info);
++ 	acpi_dev_free_resource_list(&resource_list);
++ 
++ 	if (ret < 0 || !info.addr)
++ 		return AE_OK;
++ 
++ 	strlcpy(info.type, dev_name(&adev->dev), sizeof(info.type));
++ 	if (!i2c_new_device(adapter, &info)) {
++ 		dev_err(&adapter->dev,
++ 			"failed to add I2C device %s from ACPI\n",
++ 			dev_name(&adev->dev));
++ 	}
++ 
++ 	return AE_OK;
++ }
++ 
++ /**
++  * acpi_i2c_register_devices - enumerate I2C slave devices behind adapter
++  * @adap: pointer to adapter
++  *
++  * Enumerate all I2C slave devices behind this adapter by walking the ACPI
++  * namespace. When a device is found it will be added to the Linux device
++  * model and bound to the corresponding ACPI handle.
++  */
++ static void acpi_i2c_register_devices(struct i2c_adapter *adap)
++ {
++ 	acpi_handle handle;
++ 	acpi_status status;
++ 
++ 	handle = ACPI_HANDLE(adap->dev.parent);
++ 	if (!handle)
++ 		return;
++ 
++ 	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, handle, 1,
++ 				     acpi_i2c_add_device, NULL,
++ 				     adap, NULL);
++ 	if (ACPI_FAILURE(status))
++ 		dev_warn(&adap->dev, "failed to enumerate I2C slaves\n");
++ }
++ #else
++ static inline void acpi_i2c_register_devices(struct i2c_adapter *adap) {}
++ #endif /* CONFIG_ACPI */
++ 
+++>>>>>>> 55e71edb81b2 (i2c: move ACPI helpers into the core)
+  static int i2c_do_add_adapter(struct i2c_driver *driver,
+  			      struct i2c_adapter *adap)
+  {
+@@@ -1058,6 -1252,9 +1249,12 @@@ static int i2c_register_adapter(struct 
+  
+  exit_recovery:
+  	/* create pre-declared device nodes */
+++<<<<<<< HEAD
+++=======
++ 	of_i2c_register_devices(adap);
++ 	acpi_i2c_register_devices(adap);
++ 
+++>>>>>>> 55e71edb81b2 (i2c: move ACPI helpers into the core)
+  	if (adap->nr < __i2c_first_dynamic_bus_num)
+  		i2c_scan_static_board_info(adap);
+  
+diff --cc include/linux/i2c.h
+index e988fa935b3c,2ab11dc38077..000000000000
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@@ -542,10 -544,24 +542,32 @@@ static inline int i2c_adapter_id(struc
+  
+  #endif /* I2C */
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_ACPI_I2C)
+ +extern void acpi_i2c_register_devices(struct i2c_adapter *adap);
+ +#else
+ +static inline void acpi_i2c_register_devices(struct i2c_adapter *adap) {}
+ +#endif
+++=======
++ #if IS_ENABLED(CONFIG_OF)
++ /* must call put_device() when done with returned i2c_client device */
++ extern struct i2c_client *of_find_i2c_device_by_node(struct device_node *node);
++ 
++ /* must call put_device() when done with returned i2c_adapter device */
++ extern struct i2c_adapter *of_find_i2c_adapter_by_node(struct device_node *node);
++ 
++ #else
++ 
++ static inline struct i2c_client *of_find_i2c_device_by_node(struct device_node *node)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct i2c_adapter *of_find_i2c_adapter_by_node(struct device_node *node)
++ {
++ 	return NULL;
++ }
++ #endif /* CONFIG_OF */
+++>>>>>>> 55e71edb81b2 (i2c: move ACPI helpers into the core)
+  
+  #endif /* _LINUX_I2C_H */
+* Unmerged path drivers/acpi/acpi_i2c.c
+* Unmerged path Documentation/acpi/enumeration.txt
+diff --git a/drivers/acpi/Kconfig b/drivers/acpi/Kconfig
+index 587bb6fe5235..f8b18847c742 100644
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -180,12 +180,6 @@ config ACPI_DOCK
+ 	  This driver supports ACPI-controlled docking stations and removable
+ 	  drive bays such as the IBM Ultrabay and the Dell Module Bay.
+ 
+-config ACPI_I2C
+-	def_tristate I2C
+-	depends on I2C
+-	help
+-	  ACPI I2C enumeration support.
+-
+ config ACPI_PROCESSOR
+ 	tristate "Processor"
+ 	select THERMAL
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index 933be06afd44..bce34afadcd0 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -73,7 +73,6 @@ obj-$(CONFIG_ACPI_HED)		+= hed.o
+ obj-$(CONFIG_ACPI_EC_DEBUGFS)	+= ec_sys.o
+ obj-$(CONFIG_ACPI_CUSTOM_METHOD)+= custom_method.o
+ obj-$(CONFIG_ACPI_BGRT)		+= bgrt.o
+-obj-$(CONFIG_ACPI_I2C)		+= acpi_i2c.o
+ 
+ # processor has its own "processor." module_param namespace
+ processor-y			:= processor_driver.o processor_throttling.o
+* Unmerged path drivers/acpi/acpi_i2c.c
+* Unmerged path drivers/i2c/busses/i2c-designware-platdrv.c
+* Unmerged path drivers/i2c/i2c-core.c
+* Unmerged path include/linux/i2c.h
