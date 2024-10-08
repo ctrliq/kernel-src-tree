@@ -1,0 +1,173 @@
+nfs: handle request add failure properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit 0bcbf039f6b2bcefe4f5dada76079080edf9ecd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0bcbf039.failed
+
+When we fail to queue a read page to IO descriptor,
+we need to clean it up otherwise it is hanging around
+preventing nfs module from being removed.
+
+When we fail to queue a write page to IO descriptor,
+we need to clean it up and also save the failure status
+to open context. Then at file close, we can try to write
+pages back again and drop the page if it fails to writeback
+in .launder_page, which will be done in the next patch.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 0bcbf039f6b2bcefe4f5dada76079080edf9ecd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+#	fs/nfs/read.c
+diff --cc fs/nfs/pnfs.c
+index 8e2d6c267509,580207bc52a5..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -902,17 -904,9 +902,23 @@@ send_layoutget(struct pnfs_layout_hdr *
+  		lseg = nfs4_proc_layoutget(lgp, gfp_flags);
+  	} while (lseg == ERR_PTR(-EAGAIN));
+  
+++<<<<<<< HEAD
+ +	if (IS_ERR(lseg)) {
+ +		switch (PTR_ERR(lseg)) {
+ +		case -ENOMEM:
+ +		case -ERESTARTSYS:
+ +			break;
+ +		default:
+ +			/* remember that LAYOUTGET failed and suspend trying */
+ +			pnfs_layout_io_set_failed(lo, range->iomode);
+ +		}
+ +		return NULL;
+ +	} else
+++=======
++ 	if (IS_ERR(lseg) && !nfs_error_is_fatal(PTR_ERR(lseg)))
++ 		lseg = NULL;
++ 	else
+++>>>>>>> 0bcbf039f6b2 (nfs: handle request add failure properly)
+  		pnfs_layout_clear_fail_bit(lo,
+  				pnfs_iomode_to_fail_bit(range->iomode));
+  
+diff --cc fs/nfs/read.c
+index 3cd19355e71c,eb31e23e7def..000000000000
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@@ -115,26 -135,9 +135,29 @@@ int nfs_readpage_async(struct nfs_open_
+  	pgm = &pgio.pg_mirrors[0];
+  	NFS_I(inode)->read_io += pgm->pg_bytes_written;
+  
+ -	return pgio.pg_error < 0 ? pgio.pg_error : 0;
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +static void nfs_readpage_release(struct nfs_page *req)
+ +{
+ +	struct inode *inode = req->wb_context->dentry->d_inode;
+ +
+ +	dprintk("NFS: read done (%s/%llu %d@%lld)\n", inode->i_sb->s_id,
+ +		(unsigned long long)NFS_FILEID(inode), req->wb_bytes,
+ +		(long long)req_offset(req));
+ +
+ +	if (nfs_page_group_sync_on_bit(req, PG_UNLOCKPAGE)) {
+ +		if (PageUptodate(req->wb_page))
+ +			nfs_readpage_to_fscache(inode, req->wb_page, 0);
+ +
+ +		unlock_page(req->wb_page);
+ +	}
+ +	nfs_release_request(req);
+  }
+  
+++=======
+++>>>>>>> 0bcbf039f6b2 (nfs: handle request add failure properly)
+  static void nfs_page_group_set_uptodate(struct nfs_page *req)
+  {
+  	if (nfs_page_group_sync_on_bit(req, PG_UPTODATE))
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index e94dde09e25e..1dea9e43a3e7 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -906,6 +906,12 @@ void nfs_file_clear_open_context(struct file *filp)
+ 	if (ctx) {
+ 		struct inode *inode = ctx->dentry->d_inode;
+ 
++		/*
++		 * We fatal error on write before. Try to writeback
++		 * every page again.
++		 */
++		if (ctx->error < 0)
++			invalidate_inode_pages2(inode->i_mapping);
+ 		filp->private_data = NULL;
+ 		spin_lock(&inode->i_lock);
+ 		list_move_tail(&ctx->list, &NFS_I(inode)->open_files);
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 81e2e6a142b3..5416f50bada7 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -687,3 +687,17 @@ static inline u32 nfs_fhandle_hash(const struct nfs_fh *fh)
+ 	return 0;
+ }
+ #endif
++
++static inline bool nfs_error_is_fatal(int err)
++{
++	switch (err) {
++	case -ERESTARTSYS:
++	case -EIO:
++	case -ENOSPC:
++	case -EROFS:
++	case -E2BIG:
++		return true;
++	default:
++		return false;
++	}
++}
+* Unmerged path fs/nfs/pnfs.c
+* Unmerged path fs/nfs/read.c
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 7614d127a554..f3a53c23a3c8 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -545,6 +545,15 @@ try_again:
+ 	return head;
+ }
+ 
++static void nfs_write_error_remove_page(struct nfs_page *req)
++{
++	nfs_unlock_request(req);
++	nfs_end_page_writeback(req);
++	nfs_release_request(req);
++	generic_error_remove_page(page_file_mapping(req->wb_page),
++				  req->wb_page);
++}
++
+ /*
+  * Find an associated nfs write request, and prepare to flush it out
+  * May return an error if the user signalled nfs_wait_on_request().
+@@ -567,8 +576,19 @@ static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
+ 
+ 	ret = 0;
+ 	if (!nfs_pageio_add_request(pgio, req)) {
+-		nfs_redirty_request(req);
+ 		ret = pgio->pg_error;
++		/*
++		 * Remove the problematic req upon fatal errors,
++		 * while other dirty pages can still be around
++		 * until they get flushed.
++		 */
++		if (nfs_error_is_fatal(ret)) {
++			nfs_context_set_write_error(req->wb_context, ret);
++			nfs_write_error_remove_page(req);
++		} else {
++			nfs_redirty_request(req);
++			ret = -EAGAIN;
++		}
+ 	} else
+ 		nfs_add_stats(page_file_mapping(page)->host,
+ 				NFSIOS_WRITEPAGES, 1);
