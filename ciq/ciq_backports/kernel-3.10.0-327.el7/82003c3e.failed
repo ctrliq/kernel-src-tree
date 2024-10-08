@@ -1,0 +1,366 @@
+s390/irq: rework irq subclass handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] irq: rework irq subclass handling (Hendrik Brueckner) [1182189]
+Rebuild_FUZZ: 92.96%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 82003c3e606905ca20c78a0ceca9f412e6f71474
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/82003c3e.failed
+
+Let's not add a function for every external interrupt subclass for
+which we need reference counting. Just have two register/unregister
+functions which have a subclass parameter:
+
+void irq_subclass_register(enum irq_subclass subclass);
+void irq_subclass_unregister(enum irq_subclass subclass);
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+(cherry picked from commit 82003c3e606905ca20c78a0ceca9f412e6f71474)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/irq.c
+diff --cc arch/s390/kernel/irq.c
+index e63edadc6fd6,6834277124c9..000000000000
+--- a/arch/s390/kernel/irq.c
++++ b/arch/s390/kernel/irq.c
+@@@ -258,127 -264,51 +258,131 @@@ void __irq_entry do_extint(struct pt_re
+  
+  	index = ext_hash(ext_code.code);
+  	rcu_read_lock();
+ -	hlist_for_each_entry_rcu(p, &ext_int_hash[index], entry) {
+ -		if (unlikely(p->code != ext_code.code))
+ -			continue;
+ -		p->handler(ext_code, regs->int_parm, regs->int_parm_long);
+ -	}
+ +	list_for_each_entry_rcu(p, &ext_int_hash[index], entry)
+ +		if (likely(p->code == ext_code.code))
+ +			p->handler(ext_code, param32, param64);
+  	rcu_read_unlock();
+ -	return IRQ_HANDLED;
+ +	irq_exit();
+ +	set_irq_regs(old_regs);
+  }
+  
+ -static struct irqaction external_interrupt = {
+ -	.name	 = "EXT",
+ -	.handler = do_ext_interrupt,
+ -};
+ -
+ -void __init init_ext_interrupts(void)
+ +void __init init_IRQ(void)
+  {
+ -	int idx;
+ -
+ -	for (idx = 0; idx < ARRAY_SIZE(ext_int_hash); idx++)
+ -		INIT_HLIST_HEAD(&ext_int_hash[idx]);
+ -
+ -	irq_set_chip_and_handler(EXT_INTERRUPT,
+ -				 &dummy_irq_chip, handle_percpu_irq);
+ -	setup_irq(EXT_INTERRUPT, &external_interrupt);
+ +	init_external_interrupts();
+  }
+  
+- static DEFINE_SPINLOCK(sc_irq_lock);
+- static int sc_irq_refcount;
++ static DEFINE_SPINLOCK(irq_subclass_lock);
++ static unsigned char irq_subclass_refcount[64];
+  
+- void service_subclass_irq_register(void)
++ void irq_subclass_register(enum irq_subclass subclass)
+  {
+- 	spin_lock(&sc_irq_lock);
+- 	if (!sc_irq_refcount)
+- 		ctl_set_bit(0, 9);
+- 	sc_irq_refcount++;
+- 	spin_unlock(&sc_irq_lock);
++ 	spin_lock(&irq_subclass_lock);
++ 	if (!irq_subclass_refcount[subclass])
++ 		ctl_set_bit(0, subclass);
++ 	irq_subclass_refcount[subclass]++;
++ 	spin_unlock(&irq_subclass_lock);
+  }
+- EXPORT_SYMBOL(service_subclass_irq_register);
++ EXPORT_SYMBOL(irq_subclass_register);
+  
+- void service_subclass_irq_unregister(void)
++ void irq_subclass_unregister(enum irq_subclass subclass)
+  {
+- 	spin_lock(&sc_irq_lock);
+- 	sc_irq_refcount--;
+- 	if (!sc_irq_refcount)
+- 		ctl_clear_bit(0, 9);
+- 	spin_unlock(&sc_irq_lock);
++ 	spin_lock(&irq_subclass_lock);
++ 	irq_subclass_refcount[subclass]--;
++ 	if (!irq_subclass_refcount[subclass])
++ 		ctl_clear_bit(0, subclass);
++ 	spin_unlock(&irq_subclass_lock);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(service_subclass_irq_unregister);
+ +
+ +static DEFINE_SPINLOCK(ma_subclass_lock);
+ +static int ma_subclass_refcount;
+ +
+ +void measurement_alert_subclass_register(void)
+ +{
+ +	spin_lock(&ma_subclass_lock);
+ +	if (!ma_subclass_refcount)
+ +		ctl_set_bit(0, 5);
+ +	ma_subclass_refcount++;
+ +	spin_unlock(&ma_subclass_lock);
+ +}
+ +EXPORT_SYMBOL(measurement_alert_subclass_register);
+ +
+ +void measurement_alert_subclass_unregister(void)
+ +{
+ +	spin_lock(&ma_subclass_lock);
+ +	ma_subclass_refcount--;
+ +	if (!ma_subclass_refcount)
+ +		ctl_clear_bit(0, 5);
+ +	spin_unlock(&ma_subclass_lock);
+ +}
+ +EXPORT_SYMBOL(measurement_alert_subclass_unregister);
+ +
+ +#ifdef CONFIG_SMP
+ +void synchronize_irq(unsigned int irq)
+ +{
+ +	/*
+ +	 * Not needed, the handler is protected by a lock and IRQs that occur
+ +	 * after the handler is deleted are just NOPs.
+ +	 */
+ +}
+ +EXPORT_SYMBOL_GPL(synchronize_irq);
+ +#endif
+ +
+ +#ifndef CONFIG_PCI
+ +
+ +/* Only PCI devices have dynamically-defined IRQ handlers */
+ +
+ +int request_irq(unsigned int irq, irq_handler_t handler,
+ +		unsigned long irqflags, const char *devname, void *dev_id)
+ +{
+ +	return -EINVAL;
+ +}
+ +EXPORT_SYMBOL_GPL(request_irq);
+ +
+ +void free_irq(unsigned int irq, void *dev_id)
+ +{
+ +	WARN_ON(1);
+ +}
+ +EXPORT_SYMBOL_GPL(free_irq);
+ +
+ +void enable_irq(unsigned int irq)
+ +{
+ +	WARN_ON(1);
+ +}
+ +EXPORT_SYMBOL_GPL(enable_irq);
+ +
+ +void disable_irq(unsigned int irq)
+ +{
+ +	WARN_ON(1);
+ +}
+ +EXPORT_SYMBOL_GPL(disable_irq);
+ +
+ +#endif /* !CONFIG_PCI */
+ +
+ +void disable_irq_nosync(unsigned int irq)
+ +{
+ +	disable_irq(irq);
+ +}
+ +EXPORT_SYMBOL_GPL(disable_irq_nosync);
+ +
+ +unsigned long probe_irq_on(void)
+ +{
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(probe_irq_on);
+ +
+ +int probe_irq_off(unsigned long val)
+ +{
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(probe_irq_off);
+ +
+ +unsigned int probe_irq_mask(unsigned long val)
+ +{
+ +	return val;
+ +}
+ +EXPORT_SYMBOL_GPL(probe_irq_mask);
+++=======
++ EXPORT_SYMBOL(irq_subclass_unregister);
+++>>>>>>> 82003c3e6069 (s390/irq: rework irq subclass handling)
+diff --git a/arch/s390/include/asm/irq.h b/arch/s390/include/asm/irq.h
+index 15c258edc318..ee4b6453e1db 100644
+--- a/arch/s390/include/asm/irq.h
++++ b/arch/s390/include/asm/irq.h
+@@ -70,10 +70,14 @@ typedef void (*ext_int_handler_t)(struct ext_code, unsigned int, unsigned long);
+ 
+ int register_external_interrupt(u16 code, ext_int_handler_t handler);
+ int unregister_external_interrupt(u16 code, ext_int_handler_t handler);
+-void service_subclass_irq_register(void);
+-void service_subclass_irq_unregister(void);
+-void measurement_alert_subclass_register(void);
+-void measurement_alert_subclass_unregister(void);
++
++enum irq_subclass {
++	IRQ_SUBCLASS_MEASUREMENT_ALERT = 5,
++	IRQ_SUBCLASS_SERVICE_SIGNAL = 9,
++};
++
++void irq_subclass_register(enum irq_subclass subclass);
++void irq_subclass_unregister(enum irq_subclass subclass);
+ 
+ #ifdef CONFIG_LOCKDEP
+ #  define disable_irq_nosync_lockdep(irq)	disable_irq_nosync(irq)
+* Unmerged path arch/s390/kernel/irq.c
+diff --git a/arch/s390/kernel/perf_cpum_cf.c b/arch/s390/kernel/perf_cpum_cf.c
+index c46c5b2d6570..f51214c04858 100644
+--- a/arch/s390/kernel/perf_cpum_cf.c
++++ b/arch/s390/kernel/perf_cpum_cf.c
+@@ -274,7 +274,7 @@ static int reserve_pmc_hardware(void)
+ 	int flags = PMC_INIT;
+ 
+ 	on_each_cpu(setup_pmc_cpu, &flags, 1);
+-	measurement_alert_subclass_register();
++	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 
+ 	return 0;
+ }
+@@ -285,7 +285,7 @@ static void release_pmc_hardware(void)
+ 	int flags = PMC_RELEASE;
+ 
+ 	on_each_cpu(setup_pmc_cpu, &flags, 1);
+-	measurement_alert_subclass_unregister();
++	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ }
+ 
+ /* Release the PMU if event is the last perf event */
+diff --git a/arch/s390/kernel/runtime_instr.c b/arch/s390/kernel/runtime_instr.c
+index 040d596c7c47..d817cce7e72d 100644
+--- a/arch/s390/kernel/runtime_instr.c
++++ b/arch/s390/kernel/runtime_instr.c
+@@ -137,10 +137,10 @@ static int __init runtime_instr_init(void)
+ 	if (!runtime_instr_avail())
+ 		return 0;
+ 
+-	measurement_alert_subclass_register();
++	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 	rc = register_external_interrupt(0x1407, runtime_instr_int_handler);
+ 	if (rc)
+-		measurement_alert_subclass_unregister();
++		irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 	else
+ 		pr_info("Runtime instrumentation facility initialized\n");
+ 	return rc;
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index aa05f5819cbb..38c06959f46d 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -610,7 +610,7 @@ static int __init pfault_irq_init(void)
+ 	rc = pfault_init() == 0 ? 0 : -EOPNOTSUPP;
+ 	if (rc)
+ 		goto out_pfault;
+-	service_subclass_irq_register();
++	irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 	hotcpu_notifier(pfault_cpu_notify, 0);
+ 	return 0;
+ 
+diff --git a/arch/s390/oprofile/hwsampler.c b/arch/s390/oprofile/hwsampler.c
+index 8bc0df055863..bbca76ad6e1b 100644
+--- a/arch/s390/oprofile/hwsampler.c
++++ b/arch/s390/oprofile/hwsampler.c
+@@ -940,7 +940,7 @@ int hwsampler_deallocate(void)
+ 	if (hws_state != HWS_STOPPED)
+ 		goto deallocate_exit;
+ 
+-	measurement_alert_subclass_unregister();
++	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 	deallocate_sdbt();
+ 
+ 	hws_state = HWS_DEALLOCATED;
+@@ -1054,7 +1054,7 @@ int hwsampler_shutdown(void)
+ 		mutex_lock(&hws_sem);
+ 
+ 		if (hws_state == HWS_STOPPED) {
+-			measurement_alert_subclass_unregister();
++			irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 			deallocate_sdbt();
+ 		}
+ 		if (hws_wq) {
+@@ -1129,7 +1129,7 @@ start_all_exit:
+ 	hws_oom = 1;
+ 	hws_flush_all = 0;
+ 	/* now let them in, 1407 CPUMF external interrupts */
+-	measurement_alert_subclass_register();
++	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/s390/block/dasd_diag.c b/drivers/s390/block/dasd_diag.c
+index cc0603358522..d9893d2385e4 100644
+--- a/drivers/s390/block/dasd_diag.c
++++ b/drivers/s390/block/dasd_diag.c
+@@ -641,7 +641,7 @@ dasd_diag_init(void)
+ 	}
+ 	ASCEBC(dasd_diag_discipline.ebcname, 4);
+ 
+-	service_subclass_irq_register();
++	irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 	register_external_interrupt(0x2603, dasd_ext_handler);
+ 	dasd_diag_discipline_pointer = &dasd_diag_discipline;
+ 	return 0;
+@@ -651,7 +651,7 @@ static void __exit
+ dasd_diag_cleanup(void)
+ {
+ 	unregister_external_interrupt(0x2603, dasd_ext_handler);
+-	service_subclass_irq_unregister();
++	irq_subclass_unregister(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 	dasd_diag_discipline_pointer = NULL;
+ }
+ 
+diff --git a/drivers/s390/char/sclp.c b/drivers/s390/char/sclp.c
+index d5b6ef09fa60..f8331000b131 100644
+--- a/drivers/s390/char/sclp.c
++++ b/drivers/s390/char/sclp.c
+@@ -910,12 +910,12 @@ sclp_check_interface(void)
+ 		spin_unlock_irqrestore(&sclp_lock, flags);
+ 		/* Enable service-signal interruption - needs to happen
+ 		 * with IRQs enabled. */
+-		service_subclass_irq_register();
++		irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 		/* Wait for signal from interrupt or timeout */
+ 		sclp_sync_wait();
+ 		/* Disable service-signal interruption - needs to happen
+ 		 * with IRQs enabled. */
+-		service_subclass_irq_unregister();
++		irq_subclass_unregister(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 		spin_lock_irqsave(&sclp_lock, flags);
+ 		del_timer(&sclp_request_timer);
+ 		if (sclp_init_req.status == SCLP_REQ_DONE &&
+@@ -1131,7 +1131,7 @@ sclp_init(void)
+ 	spin_unlock_irqrestore(&sclp_lock, flags);
+ 	/* Enable service-signal external interruption - needs to happen with
+ 	 * IRQs enabled. */
+-	service_subclass_irq_register();
++	irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 	sclp_init_mask(1);
+ 	return 0;
+ 
+diff --git a/drivers/s390/kvm/kvm_virtio.c b/drivers/s390/kvm/kvm_virtio.c
+index 0b51fa7ede7f..1abd0db29915 100644
+--- a/drivers/s390/kvm/kvm_virtio.c
++++ b/drivers/s390/kvm/kvm_virtio.c
+@@ -476,7 +476,7 @@ static int __init kvm_devices_init(void)
+ 
+ 	INIT_WORK(&hotplug_work, hotplug_devices);
+ 
+-	service_subclass_irq_register();
++	irq_subclass_register(IRQ_SUBCLASS_SERVICE_SIGNAL);
+ 	register_external_interrupt(0x2603, kvm_extint_handler);
+ 
+ 	scan_devices();
