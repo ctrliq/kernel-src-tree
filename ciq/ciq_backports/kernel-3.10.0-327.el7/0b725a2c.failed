@@ -1,0 +1,159 @@
+net: Remove ndo_xmit_flush netdev operation, use signalling instead.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Remove ndo_xmit_flush netdev operation, use signalling instead (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 95.38%
+commit-author David S. Miller <davem@davemloft.net>
+commit 0b725a2ca61bedc33a2a63d0451d528b268cf975
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0b725a2c.failed
+
+As reported by Jesper Dangaard Brouer, for high packet rates the
+overhead of having another indirect call in the TX path is
+non-trivial.
+
+There is the indirect call itself, and then there is all of the
+reloading of the state to refetch the tail pointer value and
+then write the device register.
+
+Move to a more passive scheme, which requires very light modifications
+to the device drivers.
+
+The signal is a new skb->xmit_more value, if it is non-zero it means
+that more SKBs are pending to be transmitted on the same queue as the
+current SKB.  And therefore, the driver may elide the tail pointer
+update.
+
+Right now skb->xmit_more is always zero.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0b725a2ca61bedc33a2a63d0451d528b268cf975)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igb/igb_main.c
+#	include/linux/netdevice.h
+diff --cc drivers/net/ethernet/intel/igb/igb_main.c
+index cca298badddb,89c29b40d61c..000000000000
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@@ -4915,13 -4915,14 +4915,24 @@@ static void igb_tx_map(struct igb_ring 
+  
+  	tx_ring->next_to_use = i;
+  
+++<<<<<<< HEAD
+ +	writel(i, tx_ring->tail);
+ +
+ +	/* we need this if more than one processor can write to our tail
+ +	 * at a time, it synchronizes IO on IA64/Altix systems
+ +	 */
+ +	mmiowb();
+ +
+++=======
++ 	if (!skb->xmit_more) {
++ 		writel(i, tx_ring->tail);
++ 
++ 		/* we need this if more than one processor can write to our tail
++ 		 * at a time, it synchronizes IO on IA64/Altix systems
++ 		 */
++ 		mmiowb();
++ 	}
+++>>>>>>> 0b725a2ca61b (net: Remove ndo_xmit_flush netdev operation, use signalling instead.)
+  	return;
+  
+  dma_error:
+diff --cc include/linux/netdevice.h
+index dba59a041ff6,039b23786c22..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -770,7 -782,8 +770,12 @@@ struct netdev_phys_port_id 
+   *        (can also return NETDEV_TX_LOCKED iff NETIF_F_LLTX)
+   *	Required can not be NULL.
+   *
+++<<<<<<< HEAD
+ + * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb);
+++=======
++  * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb,
++  *                         void *accel_priv, select_queue_fallback_t fallback);
+++>>>>>>> 0b725a2ca61b (net: Remove ndo_xmit_flush netdev operation, use signalling instead.)
+   *	Called to decide which queue to when device supports multiple
+   *	transmit queues.
+   *
+@@@ -2979,8 -3430,34 +2984,39 @@@ extern int __init dev_proc_init(void)
+  #define dev_proc_init() 0
+  #endif
+  
+++<<<<<<< HEAD
+ +extern int netdev_class_create_file(struct class_attribute *class_attr);
+ +extern void netdev_class_remove_file(struct class_attribute *class_attr);
+++=======
++ static inline netdev_tx_t __netdev_start_xmit(const struct net_device_ops *ops,
++ 					      struct sk_buff *skb, struct net_device *dev)
++ {
++ 	skb->xmit_more = 0;
++ 	return ops->ndo_start_xmit(skb, dev);
++ }
++ 
++ static inline netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 
++ 	return __netdev_start_xmit(ops, skb, dev);
++ }
++ 
++ int netdev_class_create_file_ns(struct class_attribute *class_attr,
++ 				const void *ns);
++ void netdev_class_remove_file_ns(struct class_attribute *class_attr,
++ 				 const void *ns);
++ 
++ static inline int netdev_class_create_file(struct class_attribute *class_attr)
++ {
++ 	return netdev_class_create_file_ns(class_attr, NULL);
++ }
++ 
++ static inline void netdev_class_remove_file(struct class_attribute *class_attr)
++ {
++ 	netdev_class_remove_file_ns(class_attr, NULL);
++ }
+++>>>>>>> 0b725a2ca61b (net: Remove ndo_xmit_flush netdev operation, use signalling instead.)
+  
+  extern struct kobj_ns_type_operations net_ns_type_operations;
+  
+* Unmerged path drivers/net/ethernet/intel/igb/igb_main.c
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 5b00d5c57f29..74dfb5839f63 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -822,6 +822,9 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		}
+ 	}
+ 
++	if (!skb->xmit_more)
++		virtqueue_kick(sq->vq);
++
+ 	return NETDEV_TX_OK;
+ }
+ 
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 67a799712ba7..1c1b39678801 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -477,6 +477,7 @@ static inline u32 skb_mstamp_us_delta(const struct skb_mstamp *t1,
+  *	@tc_verd: traffic control verdict
+  *	@rxhash: the packet hash computed on receive
+  *	@queue_mapping: Queue mapping for multiqueue devices
++ *	@xmit_more: More SKBs are pending for this queue
+  *	@ndisc_nodetype: router type (from link layer)
+  *	@ooo_okay: allow the mapping of a socket to a queue to be changed
+  *	@l4_rxhash: indicate rxhash is a canonical 4-tuple hash over transport
+@@ -580,6 +581,7 @@ struct sk_buff {
+ 
+ 	__u16			queue_mapping;
+ 	kmemcheck_bitfield_begin(flags2);
++	__u8			xmit_more:1;
+ #ifdef CONFIG_IPV6_NDISC_NODETYPE
+ 	__u8			ndisc_nodetype:2;
+ #endif
