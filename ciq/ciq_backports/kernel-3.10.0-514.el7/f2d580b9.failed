@@ -1,0 +1,147 @@
+drm/core: Do not preserve framebuffer on rmfb, v4.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] core: Do not preserve framebuffer on rmfb, v4 (Rob Clark) [1348329 1349064]
+Rebuild_FUZZ: 94.74%
+commit-author Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+commit f2d580b9a8149735cbc4b59c4a8df60173658140
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f2d580b9.failed
+
+It turns out that preserving framebuffers after the rmfb call breaks
+vmwgfx userspace. This was originally introduced because it was thought
+nobody relied on the behavior, but unfortunately it seems there are
+exceptions.
+
+drm_framebuffer_remove may fail with -EINTR now, so a straight revert
+is impossible. There is no way to remove the framebuffer from the lists
+and active planes without introducing a race because of the different
+locking requirements. Instead call drm_framebuffer_remove from a
+workqueue, which is unaffected by signals.
+
+Changes since v1:
+- Add comment.
+Changes since v2:
+- Add fastpath for refcount = 1. (danvet)
+Changes since v3:
+- Rebased.
+- Restore lastclose framebuffer removal too.
+
+	Cc: stable@vger.kernel.org #v4.4+
+Fixes: 13803132818c ("drm/core: Preserve the framebuffer after removing it.")
+Testcase: kms_rmfb_basic
+References: https://lists.freedesktop.org/archives/dri-devel/2016-March/102876.html
+	Cc: Thomas Hellstrom <thellstrom@vmware.com>
+	Cc: David Herrmann <dh.herrmann@gmail.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Tested-by: Thomas Hellstrom <thellstrom@vmware.com> #v3
+	Tested-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/6c63ca37-0e7e-ac7f-a6d2-c7822e3d611f@linux.intel.com
+(cherry picked from commit f2d580b9a8149735cbc4b59c4a8df60173658140)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/drm_crtc.c
+diff --cc drivers/gpu/drm/drm_crtc.c
+index 800a025dd062,70f9c682d144..000000000000
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@@ -3428,17 -3511,37 +3446,42 @@@ int drm_mode_rmfb(struct drm_device *de
+  	list_for_each_entry(fbl, &file_priv->fbs, filp_head)
+  		if (fb == fbl)
+  			found = 1;
+ -	if (!found) {
+ -		mutex_unlock(&file_priv->fbs_lock);
+ -		goto fail_unref;
+ -	}
+ +	if (!found)
+ +		goto fail_lookup;
+ +
+ +	/* Mark fb as reaped, we still have a ref from fpriv->fbs. */
+ +	__drm_framebuffer_unregister(dev, fb);
+  
+  	list_del_init(&fb->filp_head);
+ +	mutex_unlock(&dev->mode_config.fb_lock);
+  	mutex_unlock(&file_priv->fbs_lock);
+  
+++<<<<<<< HEAD
+ +	drm_framebuffer_remove(fb);
+++=======
++ 	/* drop the reference we picked up in framebuffer lookup */
++ 	drm_framebuffer_unreference(fb);
+++>>>>>>> f2d580b9a814 (drm/core: Do not preserve framebuffer on rmfb, v4.)
++ 
++ 	/*
++ 	 * we now own the reference that was stored in the fbs list
++ 	 *
++ 	 * drm_framebuffer_remove may fail with -EINTR on pending signals,
++ 	 * so run this in a separate stack as there's no way to correctly
++ 	 * handle this after the fb is already removed from the lookup table.
++ 	 */
++ 	if (drm_framebuffer_read_refcount(fb) > 1) {
++ 		struct drm_mode_rmfb_work arg;
++ 
++ 		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++ 		INIT_LIST_HEAD(&arg.fbs);
++ 		list_add_tail(&fb->filp_head, &arg.fbs);
++ 
++ 		schedule_work(&arg.work);
++ 		flush_work(&arg.work);
++ 		destroy_work_on_stack(&arg.work);
++ 	} else
++ 		drm_framebuffer_unreference(fb);
+  
+  	return 0;
+  
+@@@ -3605,8 -3705,10 +3647,11 @@@ out_err1
+   */
+  void drm_fb_release(struct drm_file *priv)
+  {
+ +	struct drm_device *dev = priv->minor->dev;
+  	struct drm_framebuffer *fb, *tfb;
++ 	struct drm_mode_rmfb_work arg;
++ 
++ 	INIT_LIST_HEAD(&arg.fbs);
+  
+  	/*
+  	 * When the file gets released that means no one else can access the fb
+@@@ -3619,16 -3721,22 +3664,35 @@@
+  	 * at it any more.
+  	 */
+  	list_for_each_entry_safe(fb, tfb, &priv->fbs, filp_head) {
+++<<<<<<< HEAD
+ +
+ +		mutex_lock(&dev->mode_config.fb_lock);
+ +		/* Mark fb as reaped, we still have a ref from fpriv->fbs. */
+ +		__drm_framebuffer_unregister(dev, fb);
+ +		mutex_unlock(&dev->mode_config.fb_lock);
+ +
+ +		list_del_init(&fb->filp_head);
+ +
+ +		/* This will also drop the fpriv->fbs reference. */
+ +		drm_framebuffer_remove(fb);
+++=======
++ 		if (drm_framebuffer_read_refcount(fb) > 1) {
++ 			list_move_tail(&fb->filp_head, &arg.fbs);
++ 		} else {
++ 			list_del_init(&fb->filp_head);
++ 
++ 			/* This drops the fpriv->fbs reference. */
++ 			drm_framebuffer_unreference(fb);
++ 		}
++ 	}
++ 
++ 	if (!list_empty(&arg.fbs)) {
++ 		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++ 
++ 		schedule_work(&arg.work);
++ 		flush_work(&arg.work);
++ 		destroy_work_on_stack(&arg.work);
+++>>>>>>> f2d580b9a814 (drm/core: Do not preserve framebuffer on rmfb, v4.)
+  	}
+  }
+  
+* Unmerged path drivers/gpu/drm/drm_crtc.c
