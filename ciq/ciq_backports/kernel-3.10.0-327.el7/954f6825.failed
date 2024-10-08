@@ -1,0 +1,544 @@
+be2net: Report a "link down" to the stack when a fatal error or fw reset happens.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [netdrv] be2net: Report a "link down" to the stack when a fatal error or fw reset happens (Ivan Vecera) [1182733]
+Rebuild_FUZZ: 99.38%
+commit-author Venkata Duvvuru <VenkatKumar.Duvvuru@Emulex.Com>
+commit 954f6825eeeecd0d83af9e11a0a54c80d7e0bfad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/954f6825.failed
+
+When an error (related to HW or FW) is detected on a function, the driver
+must pro-actively report a "link down" to the stack so that a possible
+failover can be initiated. This is being done currently only for some
+HW errors. This patch reports a "link down" even for fatal FW errors and
+EEH errors.
+
+	Signed-off-by: Venkat Duvvuru <VenkatKumar.Duvvuru@Emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 954f6825eeeecd0d83af9e11a0a54c80d7e0bfad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be.h
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be.h
+index e375e9118367,63922d440f61..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@@ -500,7 -521,8 +500,12 @@@ struct be_adapter 
+  	struct delayed_work work;
+  	u16 work_counter;
+  
+++<<<<<<< HEAD
+ +	struct delayed_work func_recovery_work;
+++=======
++ 	struct delayed_work be_err_detection_work;
++ 	u8 err_flags;
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  	u32 flags;
+  	u32 cmd_privileges;
+  	/* Ethtool knobs and info */
+@@@ -759,17 -782,31 +764,45 @@@ static inline bool is_ipv4_pkt(struct s
+  	return skb->protocol == htons(ETH_P_IP) && ip_hdr(skb)->version == 4;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void be_vf_eth_addr_generate(struct be_adapter *adapter, u8 *mac)
+ +{
+ +	u32 addr;
+ +
+ +	addr = jhash(adapter->netdev->dev_addr, ETH_ALEN, 0);
+ +
+ +	mac[5] = (u8)(addr & 0xFF);
+ +	mac[4] = (u8)((addr >> 8) & 0xFF);
+ +	mac[3] = (u8)((addr >> 16) & 0xFF);
+ +	/* Use the OUI from the current MAC address */
+ +	memcpy(mac, adapter->netdev->dev_addr, 3);
+++=======
++ #define BE_ERROR_EEH		1
++ #define BE_ERROR_UE		BIT(1)
++ #define BE_ERROR_FW		BIT(2)
++ #define BE_ERROR_HW		(BE_ERROR_EEH | BE_ERROR_UE)
++ #define BE_ERROR_ANY		(BE_ERROR_EEH | BE_ERROR_UE | BE_ERROR_FW)
++ #define BE_CLEAR_ALL		0xFF
++ 
++ static inline u8 be_check_error(struct be_adapter *adapter, u32 err_type)
++ {
++ 	return (adapter->err_flags & err_type);
++ }
++ 
++ static inline void be_set_error(struct be_adapter *adapter, int err_type)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 
++ 	adapter->err_flags |= err_type;
++ 	netif_carrier_off(netdev);
++ 
++ 	dev_info(&adapter->pdev->dev, "%s: Link down\n", netdev->name);
++ }
++ 
++ static inline void  be_clear_error(struct be_adapter *adapter, int err_type)
++ {
++ 	adapter->err_flags &= ~err_type;
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  }
+  
+  static inline bool be_multi_rxq(const struct be_adapter *adapter)
+@@@ -777,155 -814,6 +810,158 @@@
+  	return adapter->num_rx_qs > 1;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool be_error(struct be_adapter *adapter)
+ +{
+ +	return adapter->eeh_error || adapter->hw_error || adapter->fw_timeout;
+ +}
+ +
+ +static inline bool be_hw_error(struct be_adapter *adapter)
+ +{
+ +	return adapter->eeh_error || adapter->hw_error;
+ +}
+ +
+ +static inline void  be_clear_all_error(struct be_adapter *adapter)
+ +{
+ +	adapter->eeh_error = false;
+ +	adapter->hw_error = false;
+ +	adapter->fw_timeout = false;
+ +}
+ +
+ +static inline bool be_is_wol_excluded(struct be_adapter *adapter)
+ +{
+ +	struct pci_dev *pdev = adapter->pdev;
+ +
+ +	if (!be_physfn(adapter))
+ +		return true;
+ +
+ +	switch (pdev->subsystem_device) {
+ +	case OC_SUBSYS_DEVICE_ID1:
+ +	case OC_SUBSYS_DEVICE_ID2:
+ +	case OC_SUBSYS_DEVICE_ID3:
+ +	case OC_SUBSYS_DEVICE_ID4:
+ +		return true;
+ +	default:
+ +		return false;
+ +	}
+ +}
+ +
+ +static inline int qnq_async_evt_rcvd(struct be_adapter *adapter)
+ +{
+ +	return adapter->flags & BE_FLAGS_QNQ_ASYNC_EVT_RCVD;
+ +}
+ +
+ +static inline int fw_major_num(const char *fw_ver)
+ +{
+ +	int fw_major = 0;
+ +
+ +	sscanf(fw_ver, "%d.", &fw_major);
+ +
+ +	return fw_major;
+ +}
+ +
+ +#ifdef CONFIG_NET_RX_BUSY_POLL
+ +static inline bool be_lock_napi(struct be_eq_obj *eqo)
+ +{
+ +	bool status = true;
+ +
+ +	spin_lock(&eqo->lock); /* BH is already disabled */
+ +	if (eqo->state & BE_EQ_LOCKED) {
+ +		WARN_ON(eqo->state & BE_EQ_NAPI);
+ +		eqo->state |= BE_EQ_NAPI_YIELD;
+ +		status = false;
+ +	} else {
+ +		eqo->state = BE_EQ_NAPI;
+ +	}
+ +	spin_unlock(&eqo->lock);
+ +	return status;
+ +}
+ +
+ +static inline void be_unlock_napi(struct be_eq_obj *eqo)
+ +{
+ +	spin_lock(&eqo->lock); /* BH is already disabled */
+ +
+ +	WARN_ON(eqo->state & (BE_EQ_POLL | BE_EQ_NAPI_YIELD));
+ +	eqo->state = BE_EQ_IDLE;
+ +
+ +	spin_unlock(&eqo->lock);
+ +}
+ +
+ +static inline bool be_lock_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +	bool status = true;
+ +
+ +	spin_lock_bh(&eqo->lock);
+ +	if (eqo->state & BE_EQ_LOCKED) {
+ +		eqo->state |= BE_EQ_POLL_YIELD;
+ +		status = false;
+ +	} else {
+ +		eqo->state |= BE_EQ_POLL;
+ +	}
+ +	spin_unlock_bh(&eqo->lock);
+ +	return status;
+ +}
+ +
+ +static inline void be_unlock_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +	spin_lock_bh(&eqo->lock);
+ +
+ +	WARN_ON(eqo->state & (BE_EQ_NAPI));
+ +	eqo->state = BE_EQ_IDLE;
+ +
+ +	spin_unlock_bh(&eqo->lock);
+ +}
+ +
+ +static inline void be_enable_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +	spin_lock_init(&eqo->lock);
+ +	eqo->state = BE_EQ_IDLE;
+ +}
+ +
+ +static inline void be_disable_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +	local_bh_disable();
+ +
+ +	/* It's enough to just acquire napi lock on the eqo to stop
+ +	 * be_busy_poll() from processing any queueus.
+ +	 */
+ +	while (!be_lock_napi(eqo))
+ +		mdelay(1);
+ +
+ +	local_bh_enable();
+ +}
+ +
+ +#else /* CONFIG_NET_RX_BUSY_POLL */
+ +
+ +static inline bool be_lock_napi(struct be_eq_obj *eqo)
+ +{
+ +	return true;
+ +}
+ +
+ +static inline void be_unlock_napi(struct be_eq_obj *eqo)
+ +{
+ +}
+ +
+ +static inline bool be_lock_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +	return false;
+ +}
+ +
+ +static inline void be_unlock_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +}
+ +
+ +static inline void be_enable_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +}
+ +
+ +static inline void be_disable_busy_poll(struct be_eq_obj *eqo)
+ +{
+ +}
+ +#endif /* CONFIG_NET_RX_BUSY_POLL */
+ +
+++=======
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
+  		  u16 num_popped);
+  void be_link_status_update(struct be_adapter *adapter, u8 link_status);
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index 4e5ddaa87095,79fca825d439..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -2749,7 -3017,6 +2757,10 @@@ void be_detect_error(struct be_adapter 
+  						SLIPORT_ERROR1_OFFSET);
+  			sliport_err2 = ioread32(adapter->db +
+  						SLIPORT_ERROR2_OFFSET);
+++<<<<<<< HEAD
+ +			adapter->hw_error = true;
+++=======
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  			/* Do not log error messages if its a FW reset */
+  			if (sliport_err1 == SLIPORT_ERROR_FW_RESET1 &&
+  			    sliport_err2 == SLIPORT_ERROR_FW_RESET2) {
+@@@ -3867,6 -4152,55 +3876,58 @@@ int be_update_queues(struct be_adapter 
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int fw_major_num(const char *fw_ver)
++ {
++ 	int fw_major = 0, i;
++ 
++ 	i = sscanf(fw_ver, "%d.", &fw_major);
++ 	if (i != 1)
++ 		return 0;
++ 
++ 	return fw_major;
++ }
++ 
++ /* If any VFs are already enabled don't FLR the PF */
++ static bool be_reset_required(struct be_adapter *adapter)
++ {
++ 	return pci_num_vf(adapter->pdev) ? false : true;
++ }
++ 
++ /* Wait for the FW to be ready and perform the required initialization */
++ static int be_func_init(struct be_adapter *adapter)
++ {
++ 	int status;
++ 
++ 	status = be_fw_wait_ready(adapter);
++ 	if (status)
++ 		return status;
++ 
++ 	if (be_reset_required(adapter)) {
++ 		status = be_cmd_reset_function(adapter);
++ 		if (status)
++ 			return status;
++ 
++ 		/* Wait for interrupts to quiesce after an FLR */
++ 		msleep(100);
++ 
++ 		/* We can clear all errors when function reset succeeds */
++ 		be_clear_error(adapter, BE_CLEAR_ALL);
++ 	}
++ 
++ 	/* Tell FW we're ready to fire cmds */
++ 	status = be_cmd_fw_init(adapter);
++ 	if (status)
++ 		return status;
++ 
++ 	/* Allow interrupts for other ULPs running on NIC function */
++ 	be_intr_set(adapter, true);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  static int be_setup(struct be_adapter *adapter)
+  {
+  	struct device *dev = &adapter->pdev->dev;
+@@@ -4762,6 -5146,144 +4823,147 @@@ static void be_netdev_init(struct net_d
+  	netdev->ethtool_ops = &be_ethtool_ops;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void be_cleanup(struct be_adapter *adapter)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 
++ 	rtnl_lock();
++ 	netif_device_detach(netdev);
++ 	if (netif_running(netdev))
++ 		be_close(netdev);
++ 	rtnl_unlock();
++ 
++ 	be_clear(adapter);
++ }
++ 
++ static int be_resume(struct be_adapter *adapter)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 	int status;
++ 
++ 	status = be_setup(adapter);
++ 	if (status)
++ 		return status;
++ 
++ 	if (netif_running(netdev)) {
++ 		status = be_open(netdev);
++ 		if (status)
++ 			return status;
++ 	}
++ 
++ 	netif_device_attach(netdev);
++ 
++ 	return 0;
++ }
++ 
++ static int be_err_recover(struct be_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->pdev->dev;
++ 	int status;
++ 
++ 	status = be_resume(adapter);
++ 	if (status)
++ 		goto err;
++ 
++ 	dev_info(dev, "Adapter recovery successful\n");
++ 	return 0;
++ err:
++ 	if (be_physfn(adapter))
++ 		dev_err(dev, "Adapter recovery failed\n");
++ 	else
++ 		dev_err(dev, "Re-trying adapter recovery\n");
++ 
++ 	return status;
++ }
++ 
++ static void be_err_detection_task(struct work_struct *work)
++ {
++ 	struct be_adapter *adapter =
++ 				container_of(work, struct be_adapter,
++ 					     be_err_detection_work.work);
++ 	int status = 0;
++ 
++ 	be_detect_error(adapter);
++ 
++ 	if (be_check_error(adapter, BE_ERROR_HW)) {
++ 		be_cleanup(adapter);
++ 
++ 		/* As of now error recovery support is in Lancer only */
++ 		if (lancer_chip(adapter))
++ 			status = be_err_recover(adapter);
++ 	}
++ 
++ 	/* Always attempt recovery on VFs */
++ 	if (!status || be_virtfn(adapter))
++ 		be_schedule_err_detection(adapter);
++ }
++ 
++ static void be_log_sfp_info(struct be_adapter *adapter)
++ {
++ 	int status;
++ 
++ 	status = be_cmd_query_sfp_info(adapter);
++ 	if (!status) {
++ 		dev_err(&adapter->pdev->dev,
++ 			"Unqualified SFP+ detected on %c from %s part no: %s",
++ 			adapter->port_name, adapter->phy.vendor_name,
++ 			adapter->phy.vendor_pn);
++ 	}
++ 	adapter->flags &= ~BE_FLAGS_EVT_INCOMPATIBLE_SFP;
++ }
++ 
++ static void be_worker(struct work_struct *work)
++ {
++ 	struct be_adapter *adapter =
++ 		container_of(work, struct be_adapter, work.work);
++ 	struct be_rx_obj *rxo;
++ 	int i;
++ 
++ 	/* when interrupts are not yet enabled, just reap any pending
++ 	 * mcc completions
++ 	 */
++ 	if (!netif_running(adapter->netdev)) {
++ 		local_bh_disable();
++ 		be_process_mcc(adapter);
++ 		local_bh_enable();
++ 		goto reschedule;
++ 	}
++ 
++ 	if (!adapter->stats_cmd_sent) {
++ 		if (lancer_chip(adapter))
++ 			lancer_cmd_get_pport_stats(adapter,
++ 						   &adapter->stats_cmd);
++ 		else
++ 			be_cmd_get_stats(adapter, &adapter->stats_cmd);
++ 	}
++ 
++ 	if (be_physfn(adapter) &&
++ 	    MODULO(adapter->work_counter, adapter->be_get_temp_freq) == 0)
++ 		be_cmd_get_die_temperature(adapter);
++ 
++ 	for_all_rx_queues(adapter, rxo, i) {
++ 		/* Replenish RX-queues starved due to memory
++ 		 * allocation failures.
++ 		 */
++ 		if (rxo->rx_post_starved)
++ 			be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
++ 	}
++ 
++ 	/* EQ-delay update for Skyhawk is done while notifying EQ */
++ 	if (!skyhawk_chip(adapter))
++ 		be_eqd_update(adapter, false);
++ 
++ 	if (adapter->flags & BE_FLAGS_EVT_INCOMPATIBLE_SFP)
++ 		be_log_sfp_info(adapter);
++ 
++ reschedule:
++ 	adapter->work_counter++;
++ 	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
++ }
++ 
+++>>>>>>> 954f6825eeee (be2net: Report a "link down" to the stack when a fatal error or fw reset happens.)
+  static void be_unmap_pci_bars(struct be_adapter *adapter)
+  {
+  	if (adapter->csr)
+@@@ -5368,18 -5719,12 +5570,18 @@@ static pci_ers_result_t be_eeh_err_dete
+  
+  	dev_err(&adapter->pdev->dev, "EEH error detected\n");
+  
+- 	if (!adapter->eeh_error) {
+- 		adapter->eeh_error = true;
++ 	if (!be_check_error(adapter, BE_ERROR_EEH)) {
++ 		be_set_error(adapter, BE_ERROR_EEH);
+  
+ -		be_cancel_err_detection(adapter);
+ +		cancel_delayed_work_sync(&adapter->func_recovery_work);
+  
+ -		be_cleanup(adapter);
+ +		rtnl_lock();
+ +		netif_device_detach(netdev);
+ +		if (netif_running(netdev))
+ +			be_close(netdev);
+ +		rtnl_unlock();
+ +
+ +		be_clear(adapter);
+  	}
+  
+  	if (state == pci_channel_io_perm_failure)
+* Unmerged path drivers/net/ethernet/emulex/benet/be.h
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index faa193e12fa0..100abc48b517 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -93,7 +93,7 @@ static void be_mcc_notify(struct be_adapter *adapter)
+ 	struct be_queue_info *mccq = &adapter->mcc_obj.q;
+ 	u32 val = 0;
+ 
+-	if (be_error(adapter))
++	if (be_check_error(adapter, BE_ERROR_ANY))
+ 		return;
+ 
+ 	val |= mccq->id & DB_MCCQ_RING_ID_MASK;
+@@ -487,7 +487,7 @@ static int be_mcc_wait_compl(struct be_adapter *adapter)
+ 	struct be_mcc_obj *mcc_obj = &adapter->mcc_obj;
+ 
+ 	for (i = 0; i < mcc_timeout; i++) {
+-		if (be_error(adapter))
++		if (be_check_error(adapter, BE_ERROR_ANY))
+ 			return -EIO;
+ 
+ 		local_bh_disable();
+@@ -500,7 +500,7 @@ static int be_mcc_wait_compl(struct be_adapter *adapter)
+ 	}
+ 	if (i == mcc_timeout) {
+ 		dev_err(&adapter->pdev->dev, "FW not responding\n");
+-		adapter->fw_timeout = true;
++		be_set_error(adapter, BE_ERROR_FW);
+ 		return -EIO;
+ 	}
+ 	return status;
+@@ -539,7 +539,7 @@ static int be_mbox_db_ready_wait(struct be_adapter *adapter, void __iomem *db)
+ 	u32 ready;
+ 
+ 	do {
+-		if (be_error(adapter))
++		if (be_check_error(adapter, BE_ERROR_ANY))
+ 			return -EIO;
+ 
+ 		ready = ioread32(db);
+@@ -552,7 +552,7 @@ static int be_mbox_db_ready_wait(struct be_adapter *adapter, void __iomem *db)
+ 
+ 		if (msecs > 4000) {
+ 			dev_err(&adapter->pdev->dev, "FW not responding\n");
+-			adapter->fw_timeout = true;
++			be_set_error(adapter, BE_ERROR_FW);
+ 			be_detect_error(adapter);
+ 			return -1;
+ 		}
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
