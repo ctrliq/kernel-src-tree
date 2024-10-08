@@ -118,7 +118,6 @@ struct srp_host {
 };
 
 struct srp_request {
-	struct list_head	list;
 	struct scsi_cmnd       *scmnd;
 	struct srp_iu	       *cmd;
 	union {
@@ -129,7 +128,6 @@ struct srp_request {
 	struct srp_direct_buf  *indirect_desc;
 	dma_addr_t		indirect_dma_addr;
 	short			nmdesc;
-	short			index;
 };
 
 /**
@@ -139,7 +137,6 @@ struct srp_request {
 struct srp_rdma_ch {
 	/* These are RW in the hot path, and commonly used together */
 	struct list_head	free_tx;
-	struct list_head	free_reqs;
 	spinlock_t		lock;
 	s32			req_lim;
 
