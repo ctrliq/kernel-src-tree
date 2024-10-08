@@ -1,0 +1,431 @@
+crypto: nx - add LE support to pSeries platform driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [crypto] nx - add LE support to pSeries platform driver (Gustavo Duarte) [1261375]
+Rebuild_FUZZ: 92.00%
+commit-author Dan Streetman <ddstreet@ieee.org>
+commit c47d63020c03659e584673f78f24f2e5de3e6b9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c47d6302.failed
+
+Add support to the nx-842-pseries.c driver for running in little endian
+mode.
+
+The pSeries platform NX 842 driver currently only works as big endian.
+This adds cpu_to_be*() and be*_to_cpu() in the appropriate places to
+work in LE mode also.
+
+	Signed-off-by: Dan Streetman <ddstreet@ieee.org>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit c47d63020c03659e584673f78f24f2e5de3e6b9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/nx/Kconfig
+#	drivers/crypto/nx/nx-842-pseries.c
+#	drivers/crypto/nx/nx-842.h
+diff --cc drivers/crypto/nx/Kconfig
+index f82616621ae1,e421c96c763a..000000000000
+--- a/drivers/crypto/nx/Kconfig
++++ b/drivers/crypto/nx/Kconfig
+@@@ -18,9 -13,43 +18,50 @@@ config CRYPTO_DEV_NX_ENCRYP
+  
+  config CRYPTO_DEV_NX_COMPRESS
+  	tristate "Compression acceleration support"
+ +	depends on PPC64 && IBMVIO
+  	default y
+  	help
+++<<<<<<< HEAD
+ +	  Support for Power7+ in-Nest compression acceleration. This
+ +	  module supports acceleration for AES and SHA2 algorithms. If you
+ +	  choose 'M' here, this module will be called nx_compress.
+++=======
++ 	  Support for PowerPC Nest (NX) compression acceleration. This
++ 	  module supports acceleration for compressing memory with the 842
++ 	  algorithm.  One of the platform drivers must be selected also.
++ 	  If you choose 'M' here, this module will be called nx_compress.
++ 
++ if CRYPTO_DEV_NX_COMPRESS
++ 
++ config CRYPTO_DEV_NX_COMPRESS_PSERIES
++ 	tristate "Compression acceleration support on pSeries platform"
++ 	depends on PPC_PSERIES && IBMVIO
++ 	default y
++ 	help
++ 	  Support for PowerPC Nest (NX) compression acceleration. This
++ 	  module supports acceleration for compressing memory with the 842
++ 	  algorithm.  This supports NX hardware on the pSeries platform.
++ 	  If you choose 'M' here, this module will be called nx_compress_pseries.
++ 
++ config CRYPTO_DEV_NX_COMPRESS_POWERNV
++ 	tristate "Compression acceleration support on PowerNV platform"
++ 	depends on PPC_POWERNV
++ 	default y
++ 	help
++ 	  Support for PowerPC Nest (NX) compression acceleration. This
++ 	  module supports acceleration for compressing memory with the 842
++ 	  algorithm.  This supports NX hardware on the PowerNV platform.
++ 	  If you choose 'M' here, this module will be called nx_compress_powernv.
++ 
++ config CRYPTO_DEV_NX_COMPRESS_CRYPTO
++ 	tristate "Compression acceleration cryptographic interface"
++ 	select CRYPTO_ALGAPI
++ 	select 842_DECOMPRESS
++ 	default y
++ 	help
++ 	  Support for PowerPC Nest (NX) accelerators using the cryptographic
++ 	  API.  If you choose 'M' here, this module will be called
++ 	  nx_compress_crypto.
++ 
++ endif
+++>>>>>>> c47d63020c03 (crypto: nx - add LE support to pSeries platform driver)
+diff --cc drivers/crypto/nx/nx-842-pseries.c
+index 76beaceab79e,3040a6091bf2..000000000000
+--- a/drivers/crypto/nx/nx-842-pseries.c
++++ b/drivers/crypto/nx/nx-842-pseries.c
+@@@ -374,107 -329,53 +365,131 @@@ int nx842_compress(const unsigned char 
+  	csbcpb = &workmem->csbcpb;
+  	memset(csbcpb, 0, sizeof(*csbcpb));
+  	op.csbcpb = nx842_get_pa(csbcpb);
+- 	op.out = nx842_get_pa(slout.entries);
+  
+ -	if ((inbuf & NX842_HW_PAGE_MASK) ==
+ -	    ((inbuf + inlen - 1) & NX842_HW_PAGE_MASK)) {
+ -		/* Create direct DDE */
+ -		op.in = nx842_get_pa((void *)inbuf);
+ -		op.inlen = inlen;
+ -	} else {
+ -		/* Create indirect DDE (scatterlist) */
+ -		nx842_build_scatterlist(inbuf, inlen, &slin);
+ -		op.in = nx842_get_pa(slin.entries);
+ -		op.inlen = -nx842_get_scatterlist_size(&slin);
+ -	}
+ -
+ -	if ((outbuf & NX842_HW_PAGE_MASK) ==
+ -	    ((outbuf + *outlen - 1) & NX842_HW_PAGE_MASK)) {
+ -		/* Create direct DDE */
+ -		op.out = nx842_get_pa((void *)outbuf);
+ -		op.outlen = *outlen;
+ -	} else {
+ -		/* Create indirect DDE (scatterlist) */
+ -		nx842_build_scatterlist(outbuf, *outlen, &slout);
+ -		op.out = nx842_get_pa(slout.entries);
+ +	for (i = 0; i < hdr->blocks_nr; i++) {
+ +		/*
+ +		 * Aligning the output blocks to 128 bytes does waste space,
+ +		 * but it prevents the need for bounce buffers and memory
+ +		 * copies.  It also simplifies the code a lot.  In the worst
+ +		 * case (64k page, 4k max_sync_size), you lose up to
+ +		 * (128*16)/64k = ~3% the compression factor. For 64k
+ +		 * max_sync_size, the loss would be at most 128/64k = ~0.2%.
+ +		 */
+ +		padding = ALIGN(outbuf, IO_BUFFER_ALIGN) - outbuf;
+ +		outbuf += padding;
+ +		bytesleft -= padding;
+ +		if (i == 0)
+ +			/* save offset into first block in header */
+ +			hdr->offset = padding + hdrsize;
+ +
+ +		if (bytesleft <= 0) {
+ +			ret = -ENOSPC;
+ +			goto unlock;
+ +		}
+ +
+ +		/*
+ +		 * NOTE: If the default max_sync_size is changed from 4k
+ +		 * to 64k, remove the "likely" case below, since a
+ +		 * scatterlist will always be needed.
+ +		 */
+ +		if (likely(max_sync_size == NX842_HW_PAGE_SIZE)) {
+ +			/* Create direct DDE */
+ +			op.in = nx842_get_pa((void *)inbuf);
+ +			op.inlen = max_sync_size;
+ +
+ +		} else {
+ +			/* Create indirect DDE (scatterlist) */
+ +			nx842_build_scatterlist(inbuf, max_sync_size, &slin);
+ +			op.in = nx842_get_pa(slin.entries);
+ +			op.inlen = -nx842_get_scatterlist_size(&slin);
+ +		}
+ +
+ +		/*
+ +		 * If max_sync_size != NX842_HW_PAGE_SIZE, an indirect
+ +		 * DDE is required for the outbuf.
+ +		 * If max_sync_size == NX842_HW_PAGE_SIZE, outbuf must
+ +		 * also be page aligned (1 in 128/4k=32 chance) in order
+ +		 * to use a direct DDE.
+ +		 * This is unlikely, just use an indirect DDE always.
+ +		 */
+ +		nx842_build_scatterlist(outbuf,
+ +			min(bytesleft, max_sync_size), &slout);
+ +		/* op.out set before loop */
+  		op.outlen = -nx842_get_scatterlist_size(&slout);
+ +
+ +		/* Send request to pHyp */
+ +		ret = vio_h_cop_sync(local_devdata->vdev, &op);
+ +
+ +		/* Check for pHyp error */
+ +		if (ret) {
+ +			dev_dbg(dev, "%s: vio_h_cop_sync error (ret=%d, hret=%ld)\n",
+ +				__func__, ret, op.hcall_err);
+ +			ret = -EIO;
+ +			goto unlock;
+ +		}
+ +
+ +		/* Check for hardware error */
+ +		ret = nx842_validate_result(dev, &csbcpb->csb);
+ +		if (ret && ret != -ENOSPC)
+ +			goto unlock;
+ +
+ +		/* Handle incompressible data */
+ +		if (unlikely(ret == -ENOSPC)) {
+ +			if (bytesleft < max_sync_size) {
+ +				/*
+ +				 * Not enough space left in the output buffer
+ +				 * to store uncompressed block
+ +				 */
+ +				goto unlock;
+ +			} else {
+ +				/* Store incompressible block */
+ +				memcpy((void *)outbuf, (void *)inbuf,
+ +					max_sync_size);
+ +				hdr->sizes[i] = -max_sync_size;
+ +				outbuf += max_sync_size;
+ +				bytesleft -= max_sync_size;
+ +				/* Reset ret, incompressible data handled */
+ +				ret = 0;
+ +			}
+ +		} else {
+ +			/* Normal case, compression was successful */
+ +			size = csbcpb->csb.processed_byte_count;
+ +			dev_dbg(dev, "%s: processed_bytes=%d\n",
+ +				__func__, size);
+ +			hdr->sizes[i] = size;
+ +			outbuf += size;
+ +			bytesleft -= size;
+ +		}
+ +
+ +		inbuf += max_sync_size;
+  	}
+  
+++<<<<<<< HEAD
+ +	*outlen = (unsigned int)(outbuf - (unsigned long)out);
+++=======
++ 	dev_dbg(dev, "%s: op.in %lx op.inlen %ld op.out %lx op.outlen %ld\n",
++ 		__func__, (unsigned long)op.in, (long)op.inlen,
++ 		(unsigned long)op.out, (long)op.outlen);
++ 
++ 	/* Send request to pHyp */
++ 	ret = vio_h_cop_sync(local_devdata->vdev, &op);
++ 
++ 	/* Check for pHyp error */
++ 	if (ret) {
++ 		dev_dbg(dev, "%s: vio_h_cop_sync error (ret=%d, hret=%ld)\n",
++ 			__func__, ret, op.hcall_err);
++ 		ret = -EIO;
++ 		goto unlock;
++ 	}
++ 
++ 	/* Check for hardware error */
++ 	ret = nx842_validate_result(dev, &csbcpb->csb);
++ 	if (ret)
++ 		goto unlock;
++ 
++ 	*outlen = be32_to_cpu(csbcpb->csb.processed_byte_count);
++ 	dev_dbg(dev, "%s: processed_bytes=%d\n", __func__, *outlen);
+++>>>>>>> c47d63020c03 (crypto: nx - add LE support to pSeries platform driver)
+  
+  unlock:
+  	if (ret)
+@@@ -570,107 -463,50 +585,142 @@@ int nx842_decompress(const unsigned cha
+  	memset(csbcpb, 0, sizeof(*csbcpb));
+  	op.csbcpb = nx842_get_pa(csbcpb);
+  
+ -	if ((inbuf & NX842_HW_PAGE_MASK) ==
+ -	    ((inbuf + inlen - 1) & NX842_HW_PAGE_MASK)) {
+ -		/* Create direct DDE */
+ -		op.in = nx842_get_pa((void *)inbuf);
+ -		op.inlen = inlen;
+ -	} else {
+ -		/* Create indirect DDE (scatterlist) */
+ -		nx842_build_scatterlist(inbuf, inlen, &slin);
+ -		op.in = nx842_get_pa(slin.entries);
+ -		op.inlen = -nx842_get_scatterlist_size(&slin);
+ +	/*
+ +	 * max_sync_size may have changed since compression,
+ +	 * so we can't read it from the device info. We need
+ +	 * to derive it from hdr->blocks_nr.
+ +	 */
+ +	max_sync_size = PAGE_SIZE / hdr->blocks_nr;
+ +
+ +	for (i = 0; i < hdr->blocks_nr; i++) {
+ +		/* Skip padding */
+ +		inbuf = ALIGN(inbuf, IO_BUFFER_ALIGN);
+ +
+ +		if (hdr->sizes[i] < 0) {
+ +			/* Negative sizes indicate uncompressed data blocks */
+ +			size = abs(hdr->sizes[i]);
+ +			memcpy((void *)outbuf, (void *)inbuf, size);
+ +			outbuf += size;
+ +			inbuf += size;
+ +			continue;
+ +		}
+ +
+ +		if (!dev)
+ +			goto sw;
+ +
+ +		/*
+ +		 * The better the compression, the more likely the "likely"
+ +		 * case becomes.
+ +		 */
+ +		if (likely((inbuf & NX842_HW_PAGE_MASK) ==
+ +			((inbuf + hdr->sizes[i] - 1) & NX842_HW_PAGE_MASK))) {
+ +			/* Create direct DDE */
+ +			op.in = nx842_get_pa((void *)inbuf);
+ +			op.inlen = hdr->sizes[i];
+ +		} else {
+ +			/* Create indirect DDE (scatterlist) */
+ +			nx842_build_scatterlist(inbuf, hdr->sizes[i] , &slin);
+ +			op.in = nx842_get_pa(slin.entries);
+ +			op.inlen = -nx842_get_scatterlist_size(&slin);
+ +		}
+ +
+ +		/*
+ +		 * NOTE: If the default max_sync_size is changed from 4k
+ +		 * to 64k, remove the "likely" case below, since a
+ +		 * scatterlist will always be needed.
+ +		 */
+ +		if (likely(max_sync_size == NX842_HW_PAGE_SIZE)) {
+ +			/* Create direct DDE */
+ +			op.out = nx842_get_pa((void *)outbuf);
+ +			op.outlen = max_sync_size;
+ +		} else {
+ +			/* Create indirect DDE (scatterlist) */
+ +			nx842_build_scatterlist(outbuf, max_sync_size, &slout);
+ +			op.out = nx842_get_pa(slout.entries);
+ +			op.outlen = -nx842_get_scatterlist_size(&slout);
+ +		}
+ +
+ +		/* Send request to pHyp */
+ +		ret = vio_h_cop_sync(local_devdata->vdev, &op);
+ +
+ +		/* Check for pHyp error */
+ +		if (ret) {
+ +			dev_dbg(dev, "%s: vio_h_cop_sync error (ret=%d, hret=%ld)\n",
+ +				__func__, ret, op.hcall_err);
+ +			dev = NULL;
+ +			goto sw;
+ +		}
+ +
+ +		/* Check for hardware error */
+ +		ret = nx842_validate_result(dev, &csbcpb->csb);
+ +		if (ret) {
+ +			dev = NULL;
+ +			goto sw;
+ +		}
+ +
+ +		/* HW decompression success */
+ +		inbuf += hdr->sizes[i];
+ +		outbuf += csbcpb->csb.processed_byte_count;
+ +		continue;
+ +
+ +sw:
+ +		/* software decompression */
+ +		size = max_sync_size;
+ +		ret = sw842_decompress(
+ +			(unsigned char *)inbuf, hdr->sizes[i],
+ +			(unsigned char *)outbuf, &size, wmem);
+ +		if (ret)
+ +			pr_debug("%s: sw842_decompress failed with %d\n",
+ +				__func__, ret);
+ +
+ +		if (ret) {
+ +			if (ret != -ENOSPC && ret != -EINVAL &&
+ +					ret != -EMSGSIZE)
+ +				ret = -EIO;
+ +			goto unlock;
+ +		}
+ +
+ +		/* SW decompression success */
+ +		inbuf += hdr->sizes[i];
+ +		outbuf += size;
+  	}
+  
+++<<<<<<< HEAD
+ +	*outlen = (unsigned int)(outbuf - (unsigned long)out);
+++=======
++ 	if ((outbuf & NX842_HW_PAGE_MASK) ==
++ 	    ((outbuf + *outlen - 1) & NX842_HW_PAGE_MASK)) {
++ 		/* Create direct DDE */
++ 		op.out = nx842_get_pa((void *)outbuf);
++ 		op.outlen = *outlen;
++ 	} else {
++ 		/* Create indirect DDE (scatterlist) */
++ 		nx842_build_scatterlist(outbuf, *outlen, &slout);
++ 		op.out = nx842_get_pa(slout.entries);
++ 		op.outlen = -nx842_get_scatterlist_size(&slout);
++ 	}
++ 
++ 	dev_dbg(dev, "%s: op.in %lx op.inlen %ld op.out %lx op.outlen %ld\n",
++ 		__func__, (unsigned long)op.in, (long)op.inlen,
++ 		(unsigned long)op.out, (long)op.outlen);
++ 
++ 	/* Send request to pHyp */
++ 	ret = vio_h_cop_sync(local_devdata->vdev, &op);
++ 
++ 	/* Check for pHyp error */
++ 	if (ret) {
++ 		dev_dbg(dev, "%s: vio_h_cop_sync error (ret=%d, hret=%ld)\n",
++ 			__func__, ret, op.hcall_err);
++ 		goto unlock;
++ 	}
++ 
++ 	/* Check for hardware error */
++ 	ret = nx842_validate_result(dev, &csbcpb->csb);
++ 	if (ret)
++ 		goto unlock;
++ 
++ 	*outlen = be32_to_cpu(csbcpb->csb.processed_byte_count);
+++>>>>>>> c47d63020c03 (crypto: nx - add LE support to pSeries platform driver)
+  
+  unlock:
+  	if (ret)
+@@@ -832,14 -675,12 +888,12 @@@ static int nx842_OF_upd_maxsyncop(struc
+  	 * decompression. Set a maximum for this so as not to exceed the
+  	 * size that the header can support and round the value down to
+  	 * the hardware page size (4K) */
+- 	devdata->max_sync_size =
+- 			(unsigned int)min(maxsynccop->comp_data_limit,
+- 					maxsynccop->decomp_data_limit);
++ 	devdata->max_sync_size = min(comp_data_limit, decomp_data_limit);
+  
+  	devdata->max_sync_size = min_t(unsigned int, devdata->max_sync_size,
+ -					65536);
+ +					SIZE_64K);
+  
+ -	if (devdata->max_sync_size < 4096) {
+ +	if (devdata->max_sync_size < SIZE_4K) {
+  		dev_err(devdata->dev, "%s: hardware max data size (%u) is "
+  				"less than the driver minimum, unable to use "
+  				"the hardware device\n",
+@@@ -848,8 -689,9 +902,14 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	devdata->max_sync_sg = (unsigned int)min(maxsynccop->comp_sg_limit,
+ +						maxsynccop->decomp_sg_limit);
+++=======
++ 	nx842_pseries_constraints.maximum = devdata->max_sync_size;
++ 
++ 	devdata->max_sync_sg = min(comp_sg_limit, decomp_sg_limit);
+++>>>>>>> c47d63020c03 (crypto: nx - add LE support to pSeries platform driver)
+  	if (devdata->max_sync_sg < 1) {
+  		dev_err(devdata->dev, "%s: hardware max sg size (%u) is "
+  				"less than the driver minimum, unable to use "
+* Unmerged path drivers/crypto/nx/nx-842.h
+* Unmerged path drivers/crypto/nx/Kconfig
+* Unmerged path drivers/crypto/nx/nx-842-pseries.c
+* Unmerged path drivers/crypto/nx/nx-842.h
