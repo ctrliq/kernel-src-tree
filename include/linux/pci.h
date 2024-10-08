@@ -494,7 +494,6 @@ struct pci_bus_rh {
 #endif
 };
 
-#define pci_bus_b(n)	list_entry(n, struct pci_bus, node)
 #define to_pci_bus(n)	container_of(n, struct pci_bus, dev)
 
 /*
