@@ -116,6 +116,7 @@ struct tid_info {
 
 	spinlock_t stid_lock;
 	unsigned int stids_in_use;
+	unsigned int sftids_in_use;
 
 	atomic_t tids_in_use;
 };
