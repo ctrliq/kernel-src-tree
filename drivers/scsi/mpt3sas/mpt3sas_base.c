@@ -643,6 +643,9 @@ _base_display_event_data(struct MPT3SAS_ADAPTER *ioc,
 	case MPI2_EVENT_TEMP_THRESHOLD:
 		desc = "Temperature Threshold";
 		break;
+	case MPI2_EVENT_ACTIVE_CABLE_EXCEPTION:
+		desc = "Active cable exception";
+		break;
 	}
 
 	if (!desc)
@@ -5318,6 +5321,8 @@ mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc)
 	_base_unmask_events(ioc, MPI2_EVENT_IR_OPERATION_STATUS);
 	_base_unmask_events(ioc, MPI2_EVENT_LOG_ENTRY_ADDED);
 	_base_unmask_events(ioc, MPI2_EVENT_TEMP_THRESHOLD);
+	if (ioc->hba_mpi_version_belonged == MPI26_VERSION)
+		_base_unmask_events(ioc, MPI2_EVENT_ACTIVE_CABLE_EXCEPTION);
 
 	r = _base_make_ioc_operational(ioc, CAN_SLEEP);
 	if (r)
