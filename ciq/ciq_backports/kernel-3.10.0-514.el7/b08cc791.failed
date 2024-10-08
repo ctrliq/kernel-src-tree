@@ -1,0 +1,268 @@
+hv_netvsc: Eliminate memory allocation in the packet send path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author KY Srinivasan <kys@microsoft.com>
+commit b08cc79155fc26d0d112b1470d1ece5034651a4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b08cc791.failed
+
+The network protocol used to communicate with the host is the remote ndis (rndis)
+protocol. We need to decorate each outgoing packet with a rndis header and
+additional rndis state (rndis per-packet state). To manage this state, we
+currently allocate memory in the transmit path. Eliminate this allocation by
+requesting additional head room in the skb.
+
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b08cc79155fc26d0d112b1470d1ece5034651a4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 48afb9d964ab,f69923695b5b..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -810,6 -808,107 +810,110 @@@ int netvsc_send(struct hv_device *devic
+  			   packet, ret);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ int netvsc_send(struct hv_device *device,
++ 		struct hv_netvsc_packet *packet)
++ {
++ 	struct netvsc_device *net_device;
++ 	int ret = 0, m_ret = 0;
++ 	struct vmbus_channel *out_channel;
++ 	u16 q_idx = packet->q_idx;
++ 	u32 pktlen = packet->total_data_buflen, msd_len = 0;
++ 	unsigned int section_index = NETVSC_INVALID_INDEX;
++ 	struct sk_buff *skb = NULL;
++ 	unsigned long flag;
++ 	struct multi_send_data *msdp;
++ 	struct hv_netvsc_packet *msd_send = NULL, *cur_send = NULL;
++ 
++ 	net_device = get_outbound_net_device(device);
++ 	if (!net_device)
++ 		return -ENODEV;
++ 
++ 	out_channel = net_device->chn_table[q_idx];
++ 	if (!out_channel) {
++ 		out_channel = device->channel;
++ 		q_idx = 0;
++ 		packet->q_idx = 0;
++ 	}
++ 	packet->channel = out_channel;
++ 	packet->send_buf_index = NETVSC_INVALID_INDEX;
++ 
++ 	msdp = &net_device->msd[q_idx];
++ 
++ 	/* batch packets in send buffer if possible */
++ 	spin_lock_irqsave(&msdp->lock, flag);
++ 	if (msdp->pkt)
++ 		msd_len = msdp->pkt->total_data_buflen;
++ 
++ 	if (packet->is_data_pkt && msd_len > 0 &&
++ 	    msdp->count < net_device->max_pkt &&
++ 	    msd_len + pktlen + net_device->pkt_align <
++ 	    net_device->send_section_size) {
++ 		section_index = msdp->pkt->send_buf_index;
++ 
++ 	} else if (packet->is_data_pkt && pktlen + net_device->pkt_align <
++ 		   net_device->send_section_size) {
++ 		section_index = netvsc_get_next_send_section(net_device);
++ 		if (section_index != NETVSC_INVALID_INDEX) {
++ 				msd_send = msdp->pkt;
++ 				msdp->pkt = NULL;
++ 				msdp->count = 0;
++ 				msd_len = 0;
++ 		}
++ 	}
++ 
++ 	if (section_index != NETVSC_INVALID_INDEX) {
++ 		netvsc_copy_to_send_buf(net_device,
++ 					section_index, msd_len,
++ 					packet);
++ 		if (!packet->part_of_skb) {
++ 			skb = (struct sk_buff *)
++ 				(unsigned long)
++ 				packet->send_completion_tid;
++ 
++ 			packet->send_completion_tid = 0;
++ 		}
++ 
++ 		packet->page_buf_cnt = 0;
++ 		packet->send_buf_index = section_index;
++ 		packet->total_data_buflen += msd_len;
++ 
++ 		kfree(msdp->pkt);
++ 		if (packet->xmit_more) {
++ 			msdp->pkt = packet;
++ 			msdp->count++;
++ 		} else {
++ 			cur_send = packet;
++ 			msdp->pkt = NULL;
++ 			msdp->count = 0;
++ 		}
++ 	} else {
++ 		msd_send = msdp->pkt;
++ 		msdp->pkt = NULL;
++ 		msdp->count = 0;
++ 		cur_send = packet;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&msdp->lock, flag);
++ 
++ 	if (msd_send) {
++ 		m_ret = netvsc_send_pkt(msd_send, net_device);
++ 
++ 		if (m_ret != 0) {
++ 			netvsc_free_send_slot(net_device,
++ 					      msd_send->send_buf_index);
++ 			kfree(msd_send);
++ 		}
++ 	}
++ 
++ 	if (cur_send)
++ 		ret = netvsc_send_pkt(cur_send, net_device);
++ 
+++>>>>>>> b08cc79155fc (hv_netvsc: Eliminate memory allocation in the packet send path)
+  	if (ret != 0) {
+  		if (section_index != NETVSC_INVALID_INDEX)
+  			netvsc_free_send_slot(net_device, section_index);
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index f6bc78f79972,f9db6bc513e9..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -234,11 -234,11 +234,12 @@@ static void netvsc_xmit_completion(voi
+  	struct hv_netvsc_packet *packet = (struct hv_netvsc_packet *)context;
+  	struct sk_buff *skb = (struct sk_buff *)
+  		(unsigned long)packet->send_completion_tid;
+ +	u32 index = packet->send_buf_index;
+  
+- 	kfree(packet);
++ 	if (!packet->part_of_skb)
++ 		kfree(packet);
+  
+ -	if (skb)
+ +	if (skb && (index == NETVSC_INVALID_INDEX))
+  		dev_kfree_skb_any(skb);
+  }
+  
+@@@ -398,22 -401,32 +402,35 @@@ static int netvsc_start_xmit(struct sk_
+  		return NETDEV_TX_OK;
+  	}
+  
+- 	/* Allocate a netvsc packet based on # of frags. */
+- 	packet = kzalloc(sizeof(struct hv_netvsc_packet) +
+- 			 (num_data_pgs * sizeof(struct hv_page_buffer)) +
+- 			 sizeof(struct rndis_message) +
+- 			 NDIS_VLAN_PPI_SIZE + NDIS_CSUM_PPI_SIZE +
+- 			 NDIS_LSO_PPI_SIZE + NDIS_HASH_PPI_SIZE, GFP_ATOMIC);
+- 	if (!packet) {
+- 		/* out of memory, drop packet */
+- 		netdev_err(net, "unable to allocate hv_netvsc_packet\n");
+- 
+- 		dev_kfree_skb(skb);
+- 		net->stats.tx_dropped++;
+- 		return NETDEV_TX_OK;
++ 	pkt_sz = sizeof(struct hv_netvsc_packet) +
++ 			sizeof(struct rndis_message) +
++ 			NDIS_VLAN_PPI_SIZE + NDIS_CSUM_PPI_SIZE +
++ 			NDIS_LSO_PPI_SIZE + NDIS_HASH_PPI_SIZE;
++ 
++ 	if (head_room < pkt_sz) {
++ 		packet = kmalloc(pkt_sz, GFP_ATOMIC);
++ 		if (!packet) {
++ 			/* out of memory, drop packet */
++ 			netdev_err(net, "unable to alloc hv_netvsc_packet\n");
++ 			dev_kfree_skb(skb);
++ 			net->stats.tx_dropped++;
++ 			return NETDEV_TX_OK;
++ 		}
++ 		packet->part_of_skb = false;
++ 	} else {
++ 		/* Use the headroom for building up the packet */
++ 		packet = (struct hv_netvsc_packet *)skb->head;
++ 		packet->part_of_skb = true;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	packet->status = 0;
++ 	packet->xmit_more = skb->xmit_more;
++ 
+++>>>>>>> b08cc79155fc (hv_netvsc: Eliminate memory allocation in the packet send path)
+  	packet->vlan_tci = skb->vlan_tci;
++ 	packet->page_buf = page_buf;
+  
+  	packet->q_idx = skb_get_queue_mapping(skb);
+  
+@@@ -844,9 -891,16 +873,16 @@@ static int netvsc_probe(struct hv_devic
+  	net->features = NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_SG | NETIF_F_RXCSUM |
+  			NETIF_F_IP_CSUM | NETIF_F_TSO;
+  
+ -	net->ethtool_ops = &ethtool_ops;
+ +	SET_ETHTOOL_OPS(net, &ethtool_ops);
+  	SET_NETDEV_DEV(net, &dev->device);
+  
++ 	/*
++ 	 * Request additional head room in the skb.
++ 	 * We will use this space to build the rndis
++ 	 * heaser and other state we need to maintain.
++ 	 */
++ 	net->needed_headroom = max_needed_headroom;
++ 
+  	/* Notify the netvsc driver of the new device */
+  	device_info.ring_size = ring_size;
+  	ret = rndis_filter_device_add(dev, &device_info);
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index 4aebfc3f3dc3..e2c36819dfcf 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -129,6 +129,7 @@ struct ndis_tcp_ip_checksum_info;
+ struct hv_netvsc_packet {
+ 	/* Bookkeeping stuff */
+ 	u32 status;
++	bool part_of_skb;
+ 
+ 	struct hv_device *device;
+ 	bool is_data_pkt;
+@@ -150,7 +151,7 @@ struct hv_netvsc_packet {
+ 	/* Points to the send/receive buffer where the ethernet frame is */
+ 	void *data;
+ 	u32 page_buf_cnt;
+-	struct hv_page_buffer page_buf[0];
++	struct hv_page_buffer *page_buf;
+ };
+ 
+ struct netvsc_device_info {
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index 1923375adf34..01dcc46d2c50 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -211,6 +211,7 @@ static int rndis_filter_send_request(struct rndis_device *dev,
+ {
+ 	int ret;
+ 	struct hv_netvsc_packet *packet;
++	struct hv_page_buffer page_buf[2];
+ 
+ 	/* Setup the packet to send it */
+ 	packet = &req->pkt;
+@@ -218,6 +219,7 @@ static int rndis_filter_send_request(struct rndis_device *dev,
+ 	packet->is_data_pkt = false;
+ 	packet->total_data_buflen = req->request_msg.msg_len;
+ 	packet->page_buf_cnt = 1;
++	packet->page_buf = page_buf;
+ 
+ 	packet->page_buf[0].pfn = virt_to_phys(&req->request_msg) >>
+ 					PAGE_SHIFT;
