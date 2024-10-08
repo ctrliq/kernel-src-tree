@@ -1,0 +1,88 @@
+KVM: x86: latch INITs while in system management mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] x86: latch INITs while in system management mode (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 95.05%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit cd7764fe9f73530b20a0f2310fa753af635fabb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cd7764fe.failed
+
+Do not process INITs immediately while in system management mode, keep
+it instead in apic->pending_events.  Tell userspace if an INIT is
+pending when they issue GET_VCPU_EVENTS, and similarly handle the
+new field in SET_VCPU_EVENTS.
+
+Note that the same treatment should be done while in VMX non-root mode.
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cd7764fe9f73530b20a0f2310fa753af635fabb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 44ac86d26f9f,ab2521b588d8..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5180,9 -5476,27 +5180,27 @@@ static bool retry_instruction(struct x8
+  static int complete_emulated_mmio(struct kvm_vcpu *vcpu);
+  static int complete_emulated_pio(struct kvm_vcpu *vcpu);
+  
+ -static void kvm_smm_changed(struct kvm_vcpu *vcpu)
+ +void kvm_set_hflags(struct kvm_vcpu *vcpu, unsigned emul_flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (!(vcpu->arch.hflags & HF_SMM_MASK)) {
++ 		if (unlikely(vcpu->arch.smi_pending)) {
++ 			kvm_make_request(KVM_REQ_SMI, vcpu);
++ 			vcpu->arch.smi_pending = 0;
++ 		} else {
++ 			/* Process a latched INIT, if any.  */
++ 			kvm_make_request(KVM_REQ_EVENT, vcpu);
++ 		}
++ 	}
++ }
++ 
++ static void kvm_set_hflags(struct kvm_vcpu *vcpu, unsigned emul_flags)
++ {
++ 	unsigned changed = vcpu->arch.hflags ^ emul_flags;
++ 
+++>>>>>>> cd7764fe9f73 (KVM: x86: latch INITs while in system management mode)
+  	vcpu->arch.hflags = emul_flags;
+ -
+ -	if (changed & HF_SMM_MASK)
+ -		kvm_smm_changed(vcpu);
+  }
+  
+  static int kvm_vcpu_check_hw_bp(unsigned long addr, u32 type, u32 dr7,
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index ad5b409427db..1d61887f5b60 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1984,8 +1984,19 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 	if (!kvm_vcpu_has_lapic(vcpu) || !apic->pending_events)
+ 		return;
+ 
+-	pe = xchg(&apic->pending_events, 0);
++	/*
++	 * INITs are latched while in SMM.  Because an SMM CPU cannot
++	 * be in KVM_MP_STATE_INIT_RECEIVED state, just eat SIPIs
++	 * and delay processing of INIT until the next RSM.
++	 */
++	if (is_smm(vcpu)) {
++		WARN_ON_ONCE(vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED);
++		if (test_bit(KVM_APIC_SIPI, &apic->pending_events))
++			clear_bit(KVM_APIC_SIPI, &apic->pending_events);
++		return;
++	}
+ 
++	pe = xchg(&apic->pending_events, 0);
+ 	if (test_bit(KVM_APIC_INIT, &pe)) {
+ 		kvm_lapic_reset(vcpu);
+ 		kvm_vcpu_reset(vcpu);
+* Unmerged path arch/x86/kvm/x86.c
