@@ -1,0 +1,303 @@
+blk-mq: implement new and more efficient tagging scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 4bb659b156996f2993dc16fad71fec9ee070153c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4bb659b1.failed
+
+blk-mq currently uses percpu_ida for tag allocation. But that only
+works well if the ratio between tag space and number of CPUs is
+sufficiently high. For most devices and systems, that is not the
+case. The end result if that we either only utilize the tag space
+partially, or we end up attempting to fully exhaust it and run
+into lots of lock contention with stealing between CPUs. This is
+not optimal.
+
+This new tagging scheme is a hybrid bitmap allocator. It uses
+two tricks to both be SMP friendly and allow full exhaustion
+of the space:
+
+1) We cache the last allocated (or freed) tag on a per blk-mq
+   software context basis. This allows us to limit the space
+   we have to search. The key element here is not caching it
+   in the shared tag structure, otherwise we end up dirtying
+   more shared cache lines on each allocate/free operation.
+
+2) The tag space is split into cache line sized groups, and
+   each context will start off randomly in that space. Even up
+   to full utilization of the space, this divides the tag users
+   efficiently into cache line groups, avoiding dirtying the same
+   one both between allocators and between allocator and freeer.
+
+This scheme shows drastically better behaviour, both on small
+tag spaces but on large ones as well. It has been tested extensively
+to show better performance for all the cases blk-mq cares about.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 4bb659b156996f2993dc16fad71fec9ee070153c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+diff --cc block/blk-mq-tag.c
+index 83ae96c51a27,467f3a20b355..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -1,29 -1,35 +1,59 @@@
+  #include <linux/kernel.h>
+  #include <linux/module.h>
+++<<<<<<< HEAD
+ +#include <linux/percpu_ida.h>
+++=======
++ #include <linux/random.h>
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  
+  #include <linux/blk-mq.h>
+  #include "blk.h"
+  #include "blk-mq.h"
+  #include "blk-mq-tag.h"
+  
+++<<<<<<< HEAD
+ +/*
+ + * Per tagged queue (tag address space) map
+ + */
+ +struct blk_mq_tags {
+ +	unsigned int nr_tags;
+ +	unsigned int nr_reserved_tags;
+ +	unsigned int nr_batch_move;
+ +	unsigned int nr_max_cache;
+ +
+ +	struct percpu_ida free_tags;
+ +	struct percpu_ida reserved_tags;
+ +};
+ +
+ +void blk_mq_wait_for_tags(struct blk_mq_tags *tags)
+ +{
+ +	int tag = blk_mq_get_tag(tags, __GFP_WAIT, false);
+ +	blk_mq_put_tag(tags, tag);
+++=======
++ void blk_mq_wait_for_tags(struct blk_mq_tags *tags, struct blk_mq_hw_ctx *hctx,
++ 			  bool reserved)
++ {
++ 	int tag, zero = 0;
++ 
++ 	tag = blk_mq_get_tag(tags, hctx, &zero, __GFP_WAIT, reserved);
++ 	blk_mq_put_tag(tags, tag, &zero);
++ }
++ 
++ static bool bt_has_free_tags(struct blk_mq_bitmap_tags *bt)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < bt->map_nr; i++) {
++ 		struct blk_mq_bitmap *bm = &bt->map[i];
++ 		int ret;
++ 
++ 		ret = find_first_zero_bit(&bm->word, bm->depth);
++ 		if (ret < bm->depth)
++ 			return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  }
+  
+  bool blk_mq_has_free_tags(struct blk_mq_tags *tags)
+diff --cc block/blk-mq-tag.h
+index 947ba2c6148e,06d4a2f0f7a0..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -1,14 -1,56 +1,66 @@@
+  #ifndef INT_BLK_MQ_TAG_H
+  #define INT_BLK_MQ_TAG_H
+  
+++<<<<<<< HEAD
+ +struct blk_mq_tags;
+++=======
++ enum {
++ 	BT_WAIT_QUEUES	= 8,
++ 	BT_WAIT_BATCH	= 8,
++ };
++ 
++ struct bt_wait_state {
++ 	atomic_t wait_cnt;
++ 	wait_queue_head_t wait;
++ } ____cacheline_aligned_in_smp;
++ 
++ #define TAG_TO_INDEX(tag)	((tag) / BITS_PER_LONG)
++ #define TAG_TO_BIT(tag)		((tag) & (BITS_PER_LONG - 1))
++ 
++ struct blk_mq_bitmap {
++ 	unsigned long word;
++ 	unsigned long depth;
++ } ____cacheline_aligned_in_smp;
++ 
++ struct blk_mq_bitmap_tags {
++ 	unsigned int depth;
++ 	unsigned int wake_cnt;
++ 
++ 	struct blk_mq_bitmap *map;
++ 	unsigned int map_nr;
++ 
++ 	unsigned int wake_index;
++ 	struct bt_wait_state *bs;
++ };
++ 
++ /*
++  * Tag address space map.
++  */
++ struct blk_mq_tags {
++ 	unsigned int nr_tags;
++ 	unsigned int nr_reserved_tags;
++ 
++ 	struct blk_mq_bitmap_tags bitmap_tags;
++ 	struct blk_mq_bitmap_tags breserved_tags;
++ 
++ 	struct request **rqs;
++ 	struct list_head page_list;
++ };
++ 
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  
+  extern struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags, unsigned int reserved_tags, int node);
+  extern void blk_mq_free_tags(struct blk_mq_tags *tags);
+  
+++<<<<<<< HEAD
+ +extern unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp, bool reserved);
+ +extern void blk_mq_wait_for_tags(struct blk_mq_tags *tags);
+ +extern void blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag);
+++=======
++ extern unsigned int blk_mq_get_tag(struct blk_mq_tags *tags, struct blk_mq_hw_ctx *hctx, unsigned int *last_tag, gfp_t gfp, bool reserved);
++ extern void blk_mq_wait_for_tags(struct blk_mq_tags *tags, struct blk_mq_hw_ctx *hctx, bool reserved);
++ extern void blk_mq_put_tag(struct blk_mq_tags *tags, unsigned int tag, unsigned int *last_tag);
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  extern void blk_mq_tag_busy_iter(struct blk_mq_tags *tags, void (*fn)(void *data, unsigned long *), void *data);
+  extern bool blk_mq_has_free_tags(struct blk_mq_tags *tags);
+  extern ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page);
+diff --cc block/blk-mq.c
+index 87e159e32dbc,9f07a266f7ab..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -79,11 -80,10 +80,11 @@@ static struct request *__blk_mq_alloc_r
+  	struct request *rq;
+  	unsigned int tag;
+  
+- 	tag = blk_mq_get_tag(hctx->tags, gfp, reserved);
++ 	tag = blk_mq_get_tag(hctx->tags, hctx, &ctx->last_tag, gfp, reserved);
+  	if (tag != BLK_MQ_TAG_FAIL) {
+ -		rq = hctx->tags->rqs[tag];
+ +		rq = hctx->rqs[tag];
+  		rq->tag = tag;
+ +
+  		return rq;
+  	}
+  
+@@@ -217,7 -262,7 +219,11 @@@ static struct request *blk_mq_alloc_req
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		blk_mq_wait_for_tags(hctx->tags);
+++=======
++ 		blk_mq_wait_for_tags(hctx->tags, hctx, reserved);
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  	} while (1);
+  
+  	return rq;
+@@@ -268,9 -303,8 +275,14 @@@ static void __blk_mq_free_request(struc
+  	const int tag = rq->tag;
+  	struct request_queue *q = rq->q;
+  
+++<<<<<<< HEAD
+ +	blk_mq_rq_init(hctx, rq);
+ +	blk_mq_put_tag(hctx->tags, tag);
+ +
+++=======
++ 	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
++ 	blk_mq_put_tag(hctx->tags, tag, &ctx->last_tag);
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  	blk_mq_queue_exit(q);
+  }
+  
+@@@ -575,13 -680,8 +587,8 @@@ static void __blk_mq_run_hw_queue(struc
+  			queued++;
+  			continue;
+  		case BLK_MQ_RQ_QUEUE_BUSY:
+- 			/*
+- 			 * FIXME: we should have a mechanism to stop the queue
+- 			 * like blk_stop_queue, otherwise we will waste cpu
+- 			 * time
+- 			 */
+  			list_add(&rq->queuelist, &rq_list);
+ -			__blk_mq_requeue_request(rq);
+ +			blk_mq_requeue_request(rq);
+  			break;
+  		default:
+  			pr_err("blk-mq: bad return on queue: %d\n", ret);
+@@@ -970,11 -1126,11 +978,16 @@@ struct blk_mq_hw_ctx *blk_mq_map_queue(
+  }
+  EXPORT_SYMBOL(blk_mq_map_queue);
+  
+ -struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *set,
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *reg,
+  						   unsigned int hctx_index)
+  {
+++<<<<<<< HEAD
+ +	return kmalloc_node(sizeof(struct blk_mq_hw_ctx),
+ +				GFP_KERNEL | __GFP_ZERO, reg->numa_node);
+++=======
++ 	return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL,
++ 				set->numa_node);
+++>>>>>>> 4bb659b15699 (blk-mq: implement new and more efficient tagging scheme)
+  }
+  EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+  
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index aeffa309e46e..0faba1c0179f 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -10,6 +10,8 @@ struct blk_mq_ctx {
+ 	unsigned int		cpu;
+ 	unsigned int		index_hw;
+ 
++	unsigned int		last_tag ____cacheline_aligned_in_smp;
++
+ 	/* incremented at dispatch time */
+ 	unsigned long		rq_dispatched[2];
+ 	unsigned long		rq_merged;
+@@ -19,7 +21,7 @@ struct blk_mq_ctx {
+ 
+ 	struct request_queue	*queue;
+ 	struct kobject		kobj;
+-};
++} ____cacheline_aligned_in_smp;
+ 
+ void __blk_mq_complete_request(struct request *rq);
+ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 82a4a8e60c38..fc4a9ecbbaec 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -28,10 +28,12 @@ struct blk_mq_hw_ctx {
+ 
+ 	void			*driver_data;
+ 
+-	unsigned int		nr_ctx;
+-	struct blk_mq_ctx	**ctxs;
+ 	unsigned int 		nr_ctx_map;
+ 	unsigned long		*ctx_map;
++	unsigned int		nr_ctx;
++	struct blk_mq_ctx	**ctxs;
++
++	unsigned int		wait_index;
+ 
+ 	struct request		**rqs;
+ 	struct list_head	page_list;
