@@ -1,0 +1,280 @@
+net/mlx5: Fix global UAR mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] mlx5: Fix global UAR mapping (kamal heib) [1275159 1296272 1296405 1298421 1298422 1298423 1298424 1298425]
+Rebuild_FUZZ: 93.33%
+commit-author Moshe Lazer <moshel@mellanox.com>
+commit 0ba422410bbf7081c3c7d7b2dcc10e9eb5cb46f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0ba42241.failed
+
+Avoid double mapping of io mapped memory, Device page may be
+mapped to non-cached(NC) or to write-combining(WC).
+The code before this fix tries to map it both to WC and NC
+contrary to what stated in Intel's software developer manual.
+
+Here we remove the global WC mapping of all UARS
+"dev->priv.bf_mapping", since UAR mapping should be decided
+per UAR (e.g we want different mappings for EQs, CQs vs QPs).
+
+Caller will now have to choose whether to map via
+write-combining API or not.
+
+mlx5e SQs will choose write-combining in order to perform
+BlueFlame writes.
+
+Fixes: 88a85f99e51f ('TX latency optimization to save DMA reads')
+	Signed-off-by: Moshe Lazer <moshel@mellanox.com>
+	Reviewed-by: Achiad Shochat <achiad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ba422410bbf7081c3c7d7b2dcc10e9eb5cb46f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 3723f0407c45,c34f4f3e9537..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -270,8 -303,8 +270,13 @@@ static netdev_tx_t mlx5e_sq_xmit(struc
+  	if (!skb->xmit_more || netif_xmit_stopped(sq->txq)) {
+  		int bf_sz = 0;
+  
+++<<<<<<< HEAD
+ +		if (bf && sq->uar_bf_map)
+ +			bf_sz = MLX5E_TX_SKB_CB(skb)->num_wqebbs << 3;
+++=======
++ 		if (bf && test_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state))
++ 			bf_sz = wi->num_wqebbs << 3;
+++>>>>>>> 0ba422410bbf (net/mlx5: Fix global UAR mapping)
+  
+  		cseg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+  		mlx5e_tx_notify_hw(sq, wqe, bf_sz);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 6b43f0a83cd2..43dde6b5d1e9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -341,6 +341,7 @@ struct mlx5e_sq_dma {
+ 
+ enum {
+ 	MLX5E_SQ_STATE_WAKE_TXQ_ENABLE,
++	MLX5E_SQ_STATE_BF_ENABLE,
+ };
+ 
+ struct mlx5e_sq {
+@@ -368,7 +369,6 @@ struct mlx5e_sq {
+ 	struct mlx5_wq_cyc         wq;
+ 	u32                        dma_fifo_mask;
+ 	void __iomem              *uar_map;
+-	void __iomem              *uar_bf_map;
+ 	struct netdev_queue       *txq;
+ 	u32                        sqn;
+ 	u16                        bf_buf_size;
+@@ -604,16 +604,12 @@ static inline void mlx5e_tx_notify_hw(struct mlx5e_sq *sq,
+ 	 * doorbell
+ 	 */
+ 	wmb();
+-
+-	if (bf_sz) {
+-		__iowrite64_copy(sq->uar_bf_map + ofst, &wqe->ctrl, bf_sz);
+-
+-		/* flush the write-combining mapped buffer */
+-		wmb();
+-
+-	} else {
++	if (bf_sz)
++		__iowrite64_copy(sq->uar_map + ofst, &wqe->ctrl, bf_sz);
++	else
+ 		mlx5_write64((__be32 *)&wqe->ctrl, sq->uar_map + ofst, NULL);
+-	}
++	/* flush the write-combining mapped buffer */
++	wmb();
+ 
+ 	sq->bf_offset ^= sq->bf_buf_size;
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 437f092a4bfe..edd85b98ee88 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -534,7 +534,7 @@ static int mlx5e_create_sq(struct mlx5e_channel *c,
+ 	int txq_ix;
+ 	int err;
+ 
+-	err = mlx5_alloc_map_uar(mdev, &sq->uar);
++	err = mlx5_alloc_map_uar(mdev, &sq->uar, true);
+ 	if (err)
+ 		return err;
+ 
+@@ -546,8 +546,12 @@ static int mlx5e_create_sq(struct mlx5e_channel *c,
+ 		goto err_unmap_free_uar;
+ 
+ 	sq->wq.db       = &sq->wq.db[MLX5_SND_DBR];
+-	sq->uar_map     = sq->uar.map;
+-	sq->uar_bf_map  = sq->uar.bf_map;
++	if (sq->uar.bf_map) {
++		set_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state);
++		sq->uar_map = sq->uar.bf_map;
++	} else {
++		sq->uar_map = sq->uar.map;
++	}
+ 	sq->bf_buf_size = (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) / 2;
+ 	sq->max_inline  = param->max_inline;
+ 
+@@ -2220,7 +2224,7 @@ static void *mlx5e_create_netdev(struct mlx5_core_dev *mdev)
+ 
+ 	priv = netdev_priv(netdev);
+ 
+-	err = mlx5_alloc_map_uar(mdev, &priv->cq_uar);
++	err = mlx5_alloc_map_uar(mdev, &priv->cq_uar, false);
+ 	if (err) {
+ 		mlx5_core_err(mdev, "alloc_map uar failed, %d\n", err);
+ 		goto err_free_netdev;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 7729c1efb4c0..790cabe3c44b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -754,22 +754,6 @@ static int mlx5_core_set_issi(struct mlx5_core_dev *dev)
+ 	return -ENOTSUPP;
+ }
+ 
+-static int map_bf_area(struct mlx5_core_dev *dev)
+-{
+-	resource_size_t bf_start = pci_resource_start(dev->pdev, 0);
+-	resource_size_t bf_len = pci_resource_len(dev->pdev, 0);
+-
+-	dev->priv.bf_mapping = io_mapping_create_wc(bf_start, bf_len);
+-
+-	return dev->priv.bf_mapping ? 0 : -ENOMEM;
+-}
+-
+-static void unmap_bf_area(struct mlx5_core_dev *dev)
+-{
+-	if (dev->priv.bf_mapping)
+-		io_mapping_free(dev->priv.bf_mapping);
+-}
+-
+ static void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
+ {
+ 	struct mlx5_device_context *dev_ctx;
+@@ -1090,14 +1074,9 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
+ 		goto err_stop_eqs;
+ 	}
+ 
+-	if (map_bf_area(dev))
+-		dev_err(&pdev->dev, "Failed to map blue flame area\n");
+-
+ 	err = mlx5_irq_set_affinity_hints(dev);
+-	if (err) {
++	if (err)
+ 		dev_err(&pdev->dev, "Failed to alloc affinity hint cpumask\n");
+-		goto err_unmap_bf_area;
+-	}
+ 
+ 	MLX5_INIT_DOORBELL_LOCK(&priv->cq_uar_lock);
+ 
+@@ -1156,10 +1135,6 @@ err_fs:
+ 	mlx5_cleanup_qp_table(dev);
+ 	mlx5_cleanup_cq_table(dev);
+ 	mlx5_irq_clear_affinity_hints(dev);
+-
+-err_unmap_bf_area:
+-	unmap_bf_area(dev);
+-
+ 	free_comp_eqs(dev);
+ 
+ err_stop_eqs:
+@@ -1229,7 +1204,6 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
+ 	mlx5_cleanup_qp_table(dev);
+ 	mlx5_cleanup_cq_table(dev);
+ 	mlx5_irq_clear_affinity_hints(dev);
+-	unmap_bf_area(dev);
+ 	free_comp_eqs(dev);
+ 	mlx5_stop_eqs(dev);
+ 	mlx5_free_uuars(dev, &priv->uuari);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/uar.c b/drivers/net/ethernet/mellanox/mlx5/core/uar.c
+index eb05c845ece9..8ba080e441a1 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/uar.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/uar.c
+@@ -226,7 +226,8 @@ int mlx5_free_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari)
+ 	return 0;
+ }
+ 
+-int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar)
++int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar,
++		       bool map_wc)
+ {
+ 	phys_addr_t pfn;
+ 	phys_addr_t uar_bar_start;
+@@ -240,20 +241,26 @@ int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar)
+ 
+ 	uar_bar_start = pci_resource_start(mdev->pdev, 0);
+ 	pfn           = (uar_bar_start >> PAGE_SHIFT) + uar->index;
+-	uar->map      = ioremap(pfn << PAGE_SHIFT, PAGE_SIZE);
+-	if (!uar->map) {
+-		mlx5_core_warn(mdev, "ioremap() failed, %d\n", err);
+-		err = -ENOMEM;
+-		goto err_free_uar;
+-	}
+ 
+-	if (mdev->priv.bf_mapping)
+-		uar->bf_map = io_mapping_map_wc(mdev->priv.bf_mapping,
+-						uar->index << PAGE_SHIFT);
++	if (map_wc) {
++		uar->bf_map = ioremap_wc(pfn << PAGE_SHIFT, PAGE_SIZE);
++		if (!uar->bf_map) {
++			mlx5_core_warn(mdev, "ioremap_wc() failed\n");
++			uar->map = ioremap(pfn << PAGE_SHIFT, PAGE_SIZE);
++			if (!uar->map)
++				goto err_free_uar;
++		}
++	} else {
++		uar->map = ioremap(pfn << PAGE_SHIFT, PAGE_SIZE);
++		if (!uar->map)
++			goto err_free_uar;
++	}
+ 
+ 	return 0;
+ 
+ err_free_uar:
++	mlx5_core_warn(mdev, "ioremap() failed\n");
++	err = -ENOMEM;
+ 	mlx5_cmd_free_uar(mdev, uar->index);
+ 
+ 	return err;
+@@ -262,8 +269,8 @@ EXPORT_SYMBOL(mlx5_alloc_map_uar);
+ 
+ void mlx5_unmap_free_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar)
+ {
+-	io_mapping_unmap(uar->bf_map);
+ 	iounmap(uar->map);
++	iounmap(uar->bf_map);
+ 	mlx5_cmd_free_uar(mdev, uar->index);
+ }
+ EXPORT_SYMBOL(mlx5_unmap_free_uar);
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 670b0dbd3e9f..740ad27ac9d0 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -458,8 +458,6 @@ struct mlx5_priv {
+ 	struct mlx5_uuar_info	uuari;
+ 	MLX5_DECLARE_DOORBELL_LOCK(cq_uar_lock);
+ 
+-	struct io_mapping	*bf_mapping;
+-
+ 	/* pages stuff */
+ 	struct workqueue_struct *pg_wq;
+ 	struct rb_root		page_root;
+@@ -717,7 +715,8 @@ int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn);
+ int mlx5_cmd_free_uar(struct mlx5_core_dev *dev, u32 uarn);
+ int mlx5_alloc_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari);
+ int mlx5_free_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari);
+-int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar);
++int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar,
++		       bool map_wc);
+ void mlx5_unmap_free_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar);
+ void mlx5_health_cleanup(struct mlx5_core_dev *dev);
+ int mlx5_health_init(struct mlx5_core_dev *dev);
