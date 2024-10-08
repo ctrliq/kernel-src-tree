@@ -1,0 +1,156 @@
+x86/topology: Handle CPUID bogosity gracefully
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] topology: Handle CPUID bogosity gracefully (Vitaly Kuznetsov) [1377988]
+Rebuild_FUZZ: 95.45%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 56402d63eefe22179f7311a51ff2094731420406
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/56402d63.failed
+
+Joseph reported that a XEN guest dies with a division by 0 in the package
+topology setup code. This happens if cpu_info.x86_max_cores is zero.
+
+Handle that case and emit a warning. This does not fix the underlying XEN bug,
+but makes the code more robust.
+
+Reported-and-tested-by: Joseph Salisbury <joseph.salisbury@canonical.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: David Vrabel <david.vrabel@citrix.com>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.11.1605062046270.3540@nanos
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 56402d63eefe22179f7311a51ff2094731420406)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 7aac7b07bd80,0e4329ed91ef..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -233,7 -256,116 +233,120 @@@ static void notrace start_secondary(voi
+  	x86_cpuinit.setup_percpu_clockev();
+  
+  	wmb();
+++<<<<<<< HEAD
+ +	cpu_startup_entry(CPUHP_ONLINE);
+++=======
++ 	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
++ }
++ 
++ int topology_update_package_map(unsigned int apicid, unsigned int cpu)
++ {
++ 	unsigned int new, pkg = apicid >> boot_cpu_data.x86_coreid_bits;
++ 
++ 	/* Called from early boot ? */
++ 	if (!physical_package_map)
++ 		return 0;
++ 
++ 	if (pkg >= max_physical_pkg_id)
++ 		return -EINVAL;
++ 
++ 	/* Set the logical package id */
++ 	if (test_and_set_bit(pkg, physical_package_map))
++ 		goto found;
++ 
++ 	new = find_first_zero_bit(logical_package_map, __max_logical_packages);
++ 	if (new >= __max_logical_packages) {
++ 		physical_to_logical_pkg[pkg] = -1;
++ 		pr_warn("APIC(%x) Package %u exceeds logical package map\n",
++ 			apicid, pkg);
++ 		return -ENOSPC;
++ 	}
++ 	set_bit(new, logical_package_map);
++ 	pr_info("APIC(%x) Converting physical %u to logical package %u\n",
++ 		apicid, pkg, new);
++ 	physical_to_logical_pkg[pkg] = new;
++ 
++ found:
++ 	cpu_data(cpu).logical_proc_id = physical_to_logical_pkg[pkg];
++ 	return 0;
++ }
++ 
++ /**
++  * topology_phys_to_logical_pkg - Map a physical package id to a logical
++  *
++  * Returns logical package id or -1 if not found
++  */
++ int topology_phys_to_logical_pkg(unsigned int phys_pkg)
++ {
++ 	if (phys_pkg >= max_physical_pkg_id)
++ 		return -1;
++ 	return physical_to_logical_pkg[phys_pkg];
++ }
++ EXPORT_SYMBOL(topology_phys_to_logical_pkg);
++ 
++ static void __init smp_init_package_map(void)
++ {
++ 	unsigned int ncpus, cpu;
++ 	size_t size;
++ 
++ 	/*
++ 	 * Today neither Intel nor AMD support heterogenous systems. That
++ 	 * might change in the future....
++ 	 *
++ 	 * While ideally we'd want '* smp_num_siblings' in the below @ncpus
++ 	 * computation, this won't actually work since some Intel BIOSes
++ 	 * report inconsistent HT data when they disable HT.
++ 	 *
++ 	 * In particular, they reduce the APIC-IDs to only include the cores,
++ 	 * but leave the CPUID topology to say there are (2) siblings.
++ 	 * This means we don't know how many threads there will be until
++ 	 * after the APIC enumeration.
++ 	 *
++ 	 * By not including this we'll sometimes over-estimate the number of
++ 	 * logical packages by the amount of !present siblings, but this is
++ 	 * still better than MAX_LOCAL_APIC.
++ 	 *
++ 	 * We use total_cpus not nr_cpu_ids because nr_cpu_ids can be limited
++ 	 * on the command line leading to a similar issue as the HT disable
++ 	 * problem because the hyperthreads are usually enumerated after the
++ 	 * primary cores.
++ 	 */
++ 	ncpus = boot_cpu_data.x86_max_cores;
++ 	if (!ncpus) {
++ 		pr_warn("x86_max_cores == zero !?!?");
++ 		ncpus = 1;
++ 	}
++ 
++ 	__max_logical_packages = DIV_ROUND_UP(total_cpus, ncpus);
++ 
++ 	/*
++ 	 * Possibly larger than what we need as the number of apic ids per
++ 	 * package can be smaller than the actual used apic ids.
++ 	 */
++ 	max_physical_pkg_id = DIV_ROUND_UP(MAX_LOCAL_APIC, ncpus);
++ 	size = max_physical_pkg_id * sizeof(unsigned int);
++ 	physical_to_logical_pkg = kmalloc(size, GFP_KERNEL);
++ 	memset(physical_to_logical_pkg, 0xff, size);
++ 	size = BITS_TO_LONGS(max_physical_pkg_id) * sizeof(unsigned long);
++ 	physical_package_map = kzalloc(size, GFP_KERNEL);
++ 	size = BITS_TO_LONGS(__max_logical_packages) * sizeof(unsigned long);
++ 	logical_package_map = kzalloc(size, GFP_KERNEL);
++ 
++ 	pr_info("Max logical packages: %u\n", __max_logical_packages);
++ 
++ 	for_each_present_cpu(cpu) {
++ 		unsigned int apicid = apic->cpu_present_to_apicid(cpu);
++ 
++ 		if (apicid == BAD_APICID || !apic->apic_id_valid(apicid))
++ 			continue;
++ 		if (!topology_update_package_map(apicid, cpu))
++ 			continue;
++ 		pr_warn("CPU %u APICId %x disabled\n", cpu, apicid);
++ 		per_cpu(x86_bios_cpu_apicid, cpu) = BAD_APICID;
++ 		set_cpu_possible(cpu, false);
++ 		set_cpu_present(cpu, false);
++ 	}
+++>>>>>>> 56402d63eefe (x86/topology: Handle CPUID bogosity gracefully)
+  }
+  
+  void __init smp_store_boot_cpu_info(void)
+* Unmerged path arch/x86/kernel/smpboot.c
