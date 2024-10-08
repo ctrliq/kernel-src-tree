@@ -1,0 +1,125 @@
+pnfs: support multiple verfs per direct req
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [fs] nfs: support multiple verfs per direct req (Steve Dickson) [1113248]
+Rebuild_FUZZ: 98.82%
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit 5002c58639d41b93e800c8a4b7eca49c40d57822
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5002c586.failed
+
+Support direct requests that span multiple pnfs data servers by
+comparing nfs_pgio_header->verf to a cached verf in pnfs_commit_bucket.
+Continue to use dreq->verf if the MDS is used / non-pNFS.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 5002c58639d41b93e800c8a4b7eca49c40d57822)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+diff --cc fs/nfs/direct.c
+index ddbc02a05958,4ad7bc388679..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -812,13 -903,13 +904,23 @@@ static void nfs_direct_write_completion
+  			if (dreq->flags == NFS_ODIRECT_RESCHED_WRITES)
+  				bit = NFS_IOHDR_NEED_RESCHED;
+  			else if (dreq->flags == 0) {
+++<<<<<<< HEAD
+ +				memcpy(&dreq->verf, hdr->verf,
+ +				       sizeof(dreq->verf));
+ +				bit = NFS_IOHDR_NEED_COMMIT;
+ +				dreq->flags = NFS_ODIRECT_DO_COMMIT;
+ +			} else if (dreq->flags == NFS_ODIRECT_DO_COMMIT) {
+ +				if (memcmp(&dreq->verf, hdr->verf, sizeof(dreq->verf))) {
+ +					dreq->flags = NFS_ODIRECT_RESCHED_WRITES;
+++=======
++ 				nfs_direct_set_hdr_verf(dreq, hdr);
++ 				bit = NFS_IOHDR_NEED_COMMIT;
++ 				dreq->flags = NFS_ODIRECT_DO_COMMIT;
++ 			} else if (dreq->flags == NFS_ODIRECT_DO_COMMIT) {
++ 				if (nfs_direct_set_or_cmp_hdr_verf(dreq, hdr)) {
++ 					dreq->flags =
++ 						NFS_ODIRECT_RESCHED_WRITES;
+++>>>>>>> 5002c58639d4 (pnfs: support multiple verfs per direct req)
+  					bit = NFS_IOHDR_NEED_RESCHED;
+  				} else
+  					bit = NFS_IOHDR_NEED_COMMIT;
+* Unmerged path fs/nfs/direct.c
+diff --git a/fs/nfs/nfs4filelayout.c b/fs/nfs/nfs4filelayout.c
+index fc55be16d899..2ab56cd679dd 100644
+--- a/fs/nfs/nfs4filelayout.c
++++ b/fs/nfs/nfs4filelayout.c
+@@ -560,6 +560,7 @@ filelayout_read_pagelist(struct nfs_read_data *data)
+ 	/* No multipath support. Use first DS */
+ 	atomic_inc(&ds->ds_clp->cl_count);
+ 	data->ds_clp = ds->ds_clp;
++	data->ds_idx = idx;
+ 	fh = nfs4_fl_select_ds_fh(lseg, j);
+ 	if (fh)
+ 		data->args.fh = fh;
+@@ -603,6 +604,7 @@ filelayout_write_pagelist(struct nfs_write_data *data, int sync)
+ 	data->write_done_cb = filelayout_write_done_cb;
+ 	atomic_inc(&ds->ds_clp->cl_count);
+ 	data->ds_clp = ds->ds_clp;
++	data->ds_idx = idx;
+ 	fh = nfs4_fl_select_ds_fh(lseg, j);
+ 	if (fh)
+ 		data->args.fh = fh;
+@@ -875,6 +877,8 @@ filelayout_alloc_commit_info(struct pnfs_layout_segment *lseg,
+ 	for (i = 0; i < size; i++) {
+ 		INIT_LIST_HEAD(&buckets[i].written);
+ 		INIT_LIST_HEAD(&buckets[i].committing);
++		/* mark direct verifier as unset */
++		buckets[i].direct_verf.committed = NFS_INVALID_STABLE_HOW;
+ 	}
+ 
+ 	spin_lock(cinfo->lock);
+@@ -885,6 +889,8 @@ filelayout_alloc_commit_info(struct pnfs_layout_segment *lseg,
+ 			    &buckets[i].written);
+ 		list_splice(&cinfo->ds->buckets[i].committing,
+ 			    &buckets[i].committing);
++		buckets[i].direct_verf.committed =
++			cinfo->ds->buckets[i].direct_verf.committed;
+ 		buckets[i].wlseg = cinfo->ds->buckets[i].wlseg;
+ 		buckets[i].clseg = cinfo->ds->buckets[i].clseg;
+ 	}
+diff --git a/include/linux/nfs.h b/include/linux/nfs.h
+index 3e794c12e90a..610af5155ef2 100644
+--- a/include/linux/nfs.h
++++ b/include/linux/nfs.h
+@@ -46,6 +46,9 @@ static inline void nfs_copy_fh(struct nfs_fh *target, const struct nfs_fh *sourc
+ enum nfs3_stable_how {
+ 	NFS_UNSTABLE = 0,
+ 	NFS_DATA_SYNC = 1,
+-	NFS_FILE_SYNC = 2
++	NFS_FILE_SYNC = 2,
++
++	/* used by direct.c to mark verf as invalid */
++	NFS_INVALID_STABLE_HOW = -1
+ };
+ #endif /* _LINUX_NFS_H */
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 381f832b03c6..6b76635e74a8 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1112,6 +1112,7 @@ struct pnfs_commit_bucket {
+ 	struct list_head committing;
+ 	struct pnfs_layout_segment *wlseg;
+ 	struct pnfs_layout_segment *clseg;
++	struct nfs_writeverf direct_verf;
+ };
+ 
+ struct pnfs_ds_commit_info {
+@@ -1311,6 +1312,7 @@ struct nfs_write_data {
+ 	__u64			mds_offset;	/* Filelayout dense stripe */
+ 	struct nfs_page_array	pages;
+ 	struct nfs_client	*ds_clp;	/* pNFS data server */
++	int			ds_idx;		/* ds index if ds_clp is set */
+ };
+ 
+ struct nfs_write_header {
