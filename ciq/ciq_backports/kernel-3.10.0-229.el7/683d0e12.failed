@@ -1,0 +1,291 @@
+blk-mq: Avoid race condition with uninitialized requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author David Hildenbrand <dahi@linux.vnet.ibm.com>
+commit 683d0e126232d898a481daa3a4ca032c2b1a9660
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/683d0e12.failed
+
+This patch should fix the bug reported in
+https://lkml.org/lkml/2014/9/11/249.
+
+We have to initialize at least the atomic_flags and the cmd_flags when
+allocating storage for the requests.
+
+Otherwise blk_mq_timeout_check() might dereference uninitialized
+pointers when racing with the creation of a request.
+
+Also move the reset of cmd_flags for the initializing code to the point
+where a request is freed. So we will never end up with pending flush
+request indicators that might trigger dereferences of invalid pointers
+in blk_mq_timeout_check().
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
+	Reported-by: Paulo De Rezende Pinatti <ppinatti@linux.vnet.ibm.com>
+	Tested-by: Paulo De Rezende Pinatti <ppinatti@linux.vnet.ibm.com>
+	Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 683d0e126232d898a481daa3a4ca032c2b1a9660)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index e7914e35b358,1583ed28ea03..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -161,39 -169,60 +161,45 @@@ static void blk_mq_rq_ctx_init(struct r
+  	ctx->rq_dispatched[rw_is_sync(rw_flags)]++;
+  }
+  
+ -static struct request *
+ -__blk_mq_alloc_request(struct blk_mq_alloc_data *data, int rw)
+ +static struct request *blk_mq_alloc_request_pinned(struct request_queue *q,
+ +						   int rw, gfp_t gfp,
+ +						   bool reserved)
+  {
+  	struct request *rq;
+ -	unsigned int tag;
+  
+ -	tag = blk_mq_get_tag(data);
+ -	if (tag != BLK_MQ_TAG_FAIL) {
+ -		rq = data->hctx->tags->rqs[tag];
+ +	do {
+ +		struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+ +		struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
+++<<<<<<< HEAD
+ +		rq = __blk_mq_alloc_request(hctx, gfp & ~__GFP_WAIT, reserved);
+ +		if (rq) {
+ +			blk_mq_rq_ctx_init(q, ctx, rq, rw);
+ +			break;
+++=======
++ 		if (blk_mq_tag_busy(data->hctx)) {
++ 			rq->cmd_flags = REQ_MQ_INFLIGHT;
++ 			atomic_inc(&data->hctx->nr_active);
+++>>>>>>> 683d0e126232 (blk-mq: Avoid race condition with uninitialized requests)
+  		}
+  
+ -		rq->tag = tag;
+ -		blk_mq_rq_ctx_init(data->q, data->ctx, rq, rw);
+ -		return rq;
+ -	}
+ +		if (gfp & __GFP_WAIT) {
+ +			__blk_mq_run_hw_queue(hctx);
+ +			blk_mq_put_ctx(ctx);
+ +		} else {
+ +			blk_mq_put_ctx(ctx);
+ +			break;
+ +		}
+  
+ -	return NULL;
+ +		blk_mq_wait_for_tags(hctx->tags);
+ +	} while (1);
+ +
+ +	return rq;
+  }
+  
+ -struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp,
+ -		bool reserved)
+ +struct request *blk_mq_alloc_request(struct request_queue *q, int rw, gfp_t gfp)
+  {
+ -	struct blk_mq_ctx *ctx;
+ -	struct blk_mq_hw_ctx *hctx;
+  	struct request *rq;
+ -	struct blk_mq_alloc_data alloc_data;
+  
+  	if (blk_mq_queue_enter(q))
+  		return NULL;
+@@@ -236,9 -255,12 +242,15 @@@ static void __blk_mq_free_request(struc
+  	const int tag = rq->tag;
+  	struct request_queue *q = rq->q;
+  
+++<<<<<<< HEAD
+ +	blk_mq_rq_init(hctx, rq);
+ +	blk_mq_put_tag(hctx->tags, tag);
+++=======
++ 	if (rq->cmd_flags & REQ_MQ_INFLIGHT)
++ 		atomic_dec(&hctx->nr_active);
++ 	rq->cmd_flags = 0;
+++>>>>>>> 683d0e126232 (blk-mq: Avoid race condition with uninitialized requests)
+  
+ -	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+ -	blk_mq_put_tag(hctx, tag, &ctx->last_tag);
+  	blk_mq_queue_exit(q);
+  }
+  
+@@@ -949,25 -1314,155 +961,143 @@@ struct blk_mq_hw_ctx *blk_mq_map_queue(
+  }
+  EXPORT_SYMBOL(blk_mq_map_queue);
+  
+ -static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ -		struct blk_mq_tags *tags, unsigned int hctx_idx)
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *reg,
+ +						   unsigned int hctx_index)
+  {
+ -	struct page *page;
+ -
+ -	if (tags->rqs && set->ops->exit_request) {
+ -		int i;
+ -
+ -		for (i = 0; i < tags->nr_tags; i++) {
+ -			if (!tags->rqs[i])
+ -				continue;
+ -			set->ops->exit_request(set->driver_data, tags->rqs[i],
+ -						hctx_idx, i);
+ -			tags->rqs[i] = NULL;
+ -		}
+ -	}
+ -
+ -	while (!list_empty(&tags->page_list)) {
+ -		page = list_first_entry(&tags->page_list, struct page, lru);
+ -		list_del_init(&page->lru);
+ -		__free_pages(page, page->private);
+ -	}
+ -
+ -	kfree(tags->rqs);
+ -
+ -	blk_mq_free_tags(tags);
+ +	return kmalloc_node(sizeof(struct blk_mq_hw_ctx),
+ +				GFP_KERNEL | __GFP_ZERO, reg->numa_node);
+  }
+ +EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+  
+ -static size_t order_to_size(unsigned int order)
+ +void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *hctx,
+ +				 unsigned int hctx_index)
+  {
+ -	return (size_t)PAGE_SIZE << order;
+ +	kfree(hctx);
+  }
+ +EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+  
+++<<<<<<< HEAD
+ +static int blk_mq_hctx_notify(void *data, unsigned long action,
+ +			      unsigned int cpu)
+++=======
++ static struct blk_mq_tags *blk_mq_init_rq_map(struct blk_mq_tag_set *set,
++ 		unsigned int hctx_idx)
++ {
++ 	struct blk_mq_tags *tags;
++ 	unsigned int i, j, entries_per_page, max_order = 4;
++ 	size_t rq_size, left;
++ 
++ 	tags = blk_mq_init_tags(set->queue_depth, set->reserved_tags,
++ 				set->numa_node);
++ 	if (!tags)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&tags->page_list);
++ 
++ 	tags->rqs = kzalloc_node(set->queue_depth * sizeof(struct request *),
++ 				 GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY,
++ 				 set->numa_node);
++ 	if (!tags->rqs) {
++ 		blk_mq_free_tags(tags);
++ 		return NULL;
++ 	}
++ 
++ 	/*
++ 	 * rq_size is the size of the request plus driver payload, rounded
++ 	 * to the cacheline size
++ 	 */
++ 	rq_size = round_up(sizeof(struct request) + set->cmd_size,
++ 				cache_line_size());
++ 	left = rq_size * set->queue_depth;
++ 
++ 	for (i = 0; i < set->queue_depth; ) {
++ 		int this_order = max_order;
++ 		struct page *page;
++ 		int to_do;
++ 		void *p;
++ 
++ 		while (left < order_to_size(this_order - 1) && this_order)
++ 			this_order--;
++ 
++ 		do {
++ 			page = alloc_pages_node(set->numa_node,
++ 				GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY,
++ 				this_order);
++ 			if (page)
++ 				break;
++ 			if (!this_order--)
++ 				break;
++ 			if (order_to_size(this_order) < rq_size)
++ 				break;
++ 		} while (1);
++ 
++ 		if (!page)
++ 			goto fail;
++ 
++ 		page->private = this_order;
++ 		list_add_tail(&page->lru, &tags->page_list);
++ 
++ 		p = page_address(page);
++ 		entries_per_page = order_to_size(this_order) / rq_size;
++ 		to_do = min(entries_per_page, set->queue_depth - i);
++ 		left -= to_do * rq_size;
++ 		for (j = 0; j < to_do; j++) {
++ 			tags->rqs[i] = p;
++ 			tags->rqs[i]->atomic_flags = 0;
++ 			tags->rqs[i]->cmd_flags = 0;
++ 			if (set->ops->init_request) {
++ 				if (set->ops->init_request(set->driver_data,
++ 						tags->rqs[i], hctx_idx, i,
++ 						set->numa_node)) {
++ 					tags->rqs[i] = NULL;
++ 					goto fail;
++ 				}
++ 			}
++ 
++ 			p += rq_size;
++ 			i++;
++ 		}
++ 	}
++ 
++ 	return tags;
++ 
++ fail:
++ 	blk_mq_free_rq_map(set, tags, hctx_idx);
++ 	return NULL;
++ }
++ 
++ static void blk_mq_free_bitmap(struct blk_mq_ctxmap *bitmap)
++ {
++ 	kfree(bitmap->map);
++ }
++ 
++ static int blk_mq_alloc_bitmap(struct blk_mq_ctxmap *bitmap, int node)
++ {
++ 	unsigned int bpw = 8, total, num_maps, i;
++ 
++ 	bitmap->bits_per_word = bpw;
++ 
++ 	num_maps = ALIGN(nr_cpu_ids, bpw) / bpw;
++ 	bitmap->map = kzalloc_node(num_maps * sizeof(struct blk_align_bitmap),
++ 					GFP_KERNEL, node);
++ 	if (!bitmap->map)
++ 		return -ENOMEM;
++ 
++ 	bitmap->map_size = num_maps;
++ 
++ 	total = nr_cpu_ids;
++ 	for (i = 0; i < num_maps; i++) {
++ 		bitmap->map[i].depth = min(total, bitmap->bits_per_word);
++ 		total -= bitmap->map[i].depth;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int blk_mq_hctx_cpu_offline(struct blk_mq_hw_ctx *hctx, int cpu)
+++>>>>>>> 683d0e126232 (blk-mq: Avoid race condition with uninitialized requests)
+  {
+ +	struct blk_mq_hw_ctx *hctx = data;
+  	struct request_queue *q = hctx->queue;
+  	struct blk_mq_ctx *ctx;
+  	LIST_HEAD(tmp);
+* Unmerged path block/blk-mq.c
