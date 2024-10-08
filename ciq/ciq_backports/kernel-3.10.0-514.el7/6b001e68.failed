@@ -1,0 +1,137 @@
+openvswitch: Use Geneve device.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] openvswitch: Use Geneve device (Lance Richardson) [1283886]
+Rebuild_FUZZ: 98.36%
+commit-author Pravin B Shelar <pshelar@nicira.com>
+commit 6b001e682e90d7edf21f93687f5c3b39d412ad6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6b001e68.failed
+
+With help of tunnel metadata mode OVS can directly use
+Geneve devices to implement Geneve tunnels.
+This patch removes all of the OVS specific Geneve code
+and make OVS use a Geneve net_device. Basic geneve vport
+is still there to handle compatibility with current
+userspace application.
+
+	Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+	Reviewed-by: Jesse Gross <jesse@nicira.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b001e682e90d7edf21f93687f5c3b39d412ad6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/vport-geneve.c
+diff --cc net/openvswitch/vport-geneve.c
+index 1da3a14d1010,fa37c95f7339..000000000000
+--- a/net/openvswitch/vport-geneve.c
++++ b/net/openvswitch/vport-geneve.c
+@@@ -162,81 -114,15 +114,73 @@@ error
+  	return ERR_PTR(err);
+  }
+  
+- static int geneve_tnl_send(struct vport *vport, struct sk_buff *skb)
++ static struct vport *geneve_create(const struct vport_parms *parms)
+  {
+- 	const struct ip_tunnel_key *tun_key;
+- 	struct ip_tunnel_info *tun_info;
+- 	struct net *net = ovs_dp_get_net(vport->dp);
+- 	struct geneve_port *geneve_port = geneve_vport(vport);
+- 	__be16 dport = inet_sk(geneve_port->gs->sock->sk)->inet_sport;
+- 	__be16 sport;
+- 	struct rtable *rt;
+- 	struct flowi4 fl;
+- 	u8 vni[3], opts_len, *opts;
+- 	__be16 df;
+- 	int err;
++ 	struct vport *vport;
+  
+- 	tun_info = OVS_CB(skb)->egress_tun_info;
+- 	if (unlikely(!tun_info)) {
+- 		err = -EINVAL;
+- 		goto error;
+- 	}
++ 	vport = geneve_tnl_create(parms);
++ 	if (IS_ERR(vport))
++ 		return vport;
+  
+++<<<<<<< HEAD
+ +	tun_key = &tun_info->key;
+ +	rt = ovs_tunnel_route_lookup(net, tun_key, skb->mark, &fl, IPPROTO_UDP);
+ +	if (IS_ERR(rt)) {
+ +		err = PTR_ERR(rt);
+ +		goto error;
+ +	}
+ +
+ +	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+ +	sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+ +	tunnel_id_to_vni(tun_key->tun_id, vni);
+ +	skb->ignore_df = 1;
+ +
+ +	if (tun_key->tun_flags & TUNNEL_GENEVE_OPT) {
+ +		opts = (u8 *)tun_info->options;
+ +		opts_len = tun_info->options_len;
+ +	} else {
+ +		opts = NULL;
+ +		opts_len = 0;
+ +	}
+ +
+ +	err = geneve_xmit_skb(geneve_port->gs, rt, skb, fl.saddr,
+ +			      tun_key->ipv4_dst, tun_key->ipv4_tos,
+ +			      tun_key->ipv4_ttl, df, sport, dport,
+ +			      tun_key->tun_flags, vni, opts_len, opts,
+ +			      !!(tun_key->tun_flags & TUNNEL_CSUM), false);
+ +	if (err < 0)
+ +		ip_rt_put(rt);
+ +	return err;
+ +
+ +error:
+ +	kfree_skb(skb);
+ +	return err;
+ +}
+ +
+ +static const char *geneve_get_name(const struct vport *vport)
+ +{
+ +	struct geneve_port *geneve_port = geneve_vport(vport);
+ +
+ +	return geneve_port->name;
+ +}
+ +
+ +static int geneve_get_egress_tun_info(struct vport *vport, struct sk_buff *skb,
+ +				      struct ip_tunnel_info *egress_tun_info)
+ +{
+ +	struct geneve_port *geneve_port = geneve_vport(vport);
+ +	struct net *net = ovs_dp_get_net(vport->dp);
+ +	__be16 dport = inet_sk(geneve_port->gs->sock->sk)->inet_sport;
+ +	__be16 sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+ +
+ +	/* Get tp_src and tp_dst, refert to geneve_build_header().
+ +	 */
+ +	return ovs_tunnel_get_egress_info(egress_tun_info,
+ +					  ovs_dp_get_net(vport->dp),
+ +					  OVS_CB(skb)->egress_tun_info,
+ +					  IPPROTO_UDP, skb->mark, sport, dport);
+++=======
++ 	return ovs_netdev_link(vport, parms->name);
+++>>>>>>> 6b001e682e90 (openvswitch: Use Geneve device.)
+  }
+  
+  static struct vport_ops ovs_geneve_vport_ops = {
+diff --git a/net/openvswitch/Kconfig b/net/openvswitch/Kconfig
+index aa5eac5326eb..758cb245059d 100644
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -60,7 +60,7 @@ config OPENVSWITCH_VXLAN
+ config OPENVSWITCH_GENEVE
+ 	tristate "Open vSwitch Geneve tunneling support"
+ 	depends on OPENVSWITCH
+-	depends on GENEVE_CORE
++	depends on GENEVE
+ 	default OPENVSWITCH
+ 	---help---
+ 	  If you say Y here, then the Open vSwitch will be able create geneve vport.
+* Unmerged path net/openvswitch/vport-geneve.c
