@@ -131,7 +131,7 @@ static int delay_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char dummy;
 
 	if (argc != 3 && argc != 6) {
-		ti->error = "requires exactly 3 or 6 arguments";
+		ti->error = "Requires exactly 3 or 6 arguments";
 		return -EINVAL;
 	}
 
