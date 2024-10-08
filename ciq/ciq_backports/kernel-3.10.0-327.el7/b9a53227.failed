@@ -1,0 +1,111 @@
+Initialize msg/shm IPC objects before doing ipc_addid()
+
+jira LE-1907
+cve CVE-2015-7613
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit b9a532277938798b53178d5a66af6e2915cb27cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b9a53227.failed
+
+As reported by Dmitry Vyukov, we really shouldn't do ipc_addid() before
+having initialized the IPC object state.  Yes, we initialize the IPC
+object in a locked state, but with all the lockless RCU lookup work,
+that IPC object lock no longer means that the state cannot be seen.
+
+We already did this for the IPC semaphore code (see commit e8577d1f0329:
+"ipc/sem.c: fully initialize sem_array before making it visible") but we
+clearly forgot about msg and shm.
+
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Davidlohr Bueso <dbueso@suse.de>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b9a532277938798b53178d5a66af6e2915cb27cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/shm.c
+diff --cc ipc/shm.c
+index 39889a624b56,41787276e141..000000000000
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@@ -558,6 -559,14 +552,17 @@@ static int newseg(struct ipc_namespace 
+  	shp->shm_nattch = 0;
+  	shp->shm_file = file;
+  	shp->shm_creator = current;
+++<<<<<<< HEAD
+++=======
++ 
++ 	id = ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni);
++ 	if (id < 0) {
++ 		error = id;
++ 		goto no_id;
++ 	}
++ 
++ 	list_add(&shp->shm_clist, &current->sysvshm.shm_clist);
+++>>>>>>> b9a532277938 (Initialize msg/shm IPC objects before doing ipc_addid())
+  
+  	/*
+  	 * shmid gets reported as "inode#" in /proc/pid/maps.
+diff --git a/ipc/msg.c b/ipc/msg.c
+index 8983ea57d970..ac74696975a6 100644
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@ -202,13 +202,6 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
+ 		return retval;
+ 	}
+ 
+-	/* ipc_addid() locks msq upon success. */
+-	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
+-	if (id < 0) {
+-		ipc_rcu_putref(msq, msg_rcu_free);
+-		return id;
+-	}
+-
+ 	msq->q_stime = msq->q_rtime = 0;
+ 	msq->q_ctime = get_seconds();
+ 	msq->q_cbytes = msq->q_qnum = 0;
+@@ -218,6 +211,13 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
+ 	INIT_LIST_HEAD(&msq->q_receivers);
+ 	INIT_LIST_HEAD(&msq->q_senders);
+ 
++	/* ipc_addid() locks msq upon success. */
++	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
++	if (id < 0) {
++		ipc_rcu_putref(msq, msg_rcu_free);
++		return id;
++	}
++
+ 	ipc_unlock_object(&msq->q_perm);
+ 	rcu_read_unlock();
+ 
+* Unmerged path ipc/shm.c
+diff --git a/ipc/util.c b/ipc/util.c
+index 61a6a7ebd9ef..0e32955be759 100644
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@ -292,6 +292,10 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+ 	rcu_read_lock();
+ 	spin_lock(&new->lock);
+ 
++	current_euid_egid(&euid, &egid);
++	new->cuid = new->uid = euid;
++	new->gid = new->cgid = egid;
++
+ 	id = idr_alloc(&ids->ipcs_idr, new,
+ 		       (next_id < 0) ? 0 : ipcid_to_idx(next_id), 0,
+ 		       GFP_NOWAIT);
+@@ -304,10 +308,6 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+ 
+ 	ids->in_use++;
+ 
+-	current_euid_egid(&euid, &egid);
+-	new->cuid = new->uid = euid;
+-	new->gid = new->cgid = egid;
+-
+ 	if (next_id < 0) {
+ 		new->seq = ids->seq++;
+ 		if (ids->seq > ids->seq_max)
