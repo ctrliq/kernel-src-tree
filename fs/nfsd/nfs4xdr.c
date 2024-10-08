@@ -2733,12 +2733,6 @@ out_acl:
 		*p++ = cpu_to_be32(stat.blksize);
 	}
 #endif /* CONFIG_NFSD_PNFS */
-	if (bmval2 & FATTR4_WORD2_SECURITY_LABEL) {
-		status = nfsd4_encode_security_label(xdr, rqstp, context,
-								contextlen);
-		if (status)
-			goto out;
-	}
 	if (bmval2 & FATTR4_WORD2_SUPPATTR_EXCLCREAT) {
 		p = xdr_reserve_space(xdr, 16);
 		if (!p)
@@ -2747,6 +2741,13 @@ out_acl:
 		*p++ = cpu_to_be32(NFSD_SUPPATTR_EXCLCREAT_WORD0);
 		*p++ = cpu_to_be32(NFSD_SUPPATTR_EXCLCREAT_WORD1);
 		*p++ = cpu_to_be32(NFSD_SUPPATTR_EXCLCREAT_WORD2);
+	}
+
+	if (bmval2 & FATTR4_WORD2_SECURITY_LABEL) {
+		status = nfsd4_encode_security_label(xdr, rqstp, context,
+								contextlen);
+		if (status)
+			goto out;
 	}
 
 	attrlen = htonl(xdr->buf->len - attrlen_offset - 4);
