@@ -1194,9 +1194,7 @@ int t4vf_alloc_mac_filt(struct adapter *adapter, unsigned int viid, bool free,
 	unsigned nfilters = 0;
 	unsigned int rem = naddr;
 	struct fw_vi_mac_cmd cmd, rpl;
-	unsigned int max_naddr = is_t4(adapter->params.chip) ?
-				 NUM_MPS_CLS_SRAM_L_INSTANCES :
-				 NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+	unsigned int max_naddr = adapter->params.arch.mps_tcam_size;
 
 	if (naddr > max_naddr)
 		return -EINVAL;
@@ -1288,9 +1286,7 @@ int t4vf_change_mac(struct adapter *adapter, unsigned int viid,
 	struct fw_vi_mac_exact *p = &cmd.u.exact[0];
 	size_t len16 = DIV_ROUND_UP(offsetof(struct fw_vi_mac_cmd,
 					     u.exact[1]), 16);
-	unsigned int max_naddr = is_t4(adapter->params.chip) ?
-				 NUM_MPS_CLS_SRAM_L_INSTANCES :
-				 NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+	unsigned int max_mac_addr = adapter->params.arch.mps_tcam_size;
 
 	/*
 	 * If this is a new allocation, determine whether it should be
@@ -1313,7 +1309,7 @@ int t4vf_change_mac(struct adapter *adapter, unsigned int viid,
 	if (ret == 0) {
 		p = &rpl.u.exact[0];
 		ret = FW_VI_MAC_CMD_IDX_G(be16_to_cpu(p->valid_to_idx));
-		if (ret >= max_naddr)
+		if (ret >= max_mac_addr)
 			ret = -ENOMEM;
 	}
 	return ret;
@@ -1584,11 +1580,25 @@ int t4vf_prep_adapter(struct adapter *adapter)
 	switch (CHELSIO_PCI_ID_VER(adapter->pdev->device)) {
 	case CHELSIO_T4:
 		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T4, 0);
+		adapter->params.arch.sge_fl_db = DBPRIO_F;
+		adapter->params.arch.mps_tcam_size =
+				NUM_MPS_CLS_SRAM_L_INSTANCES;
 		break;
 
 	case CHELSIO_T5:
 		chipid = REV_G(t4_read_reg(adapter, PL_VF_REV_A));
 		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T5, chipid);
+		adapter->params.arch.sge_fl_db = DBPRIO_F | DBTYPE_F;
+		adapter->params.arch.mps_tcam_size =
+				NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
+		break;
+
+	case CHELSIO_T6:
+		chipid = REV_G(t4_read_reg(adapter, PL_VF_REV_A));
+		adapter->params.chip |= CHELSIO_CHIP_CODE(CHELSIO_T6, chipid);
+		adapter->params.arch.sge_fl_db = 0;
+		adapter->params.arch.mps_tcam_size =
+				NUM_MPS_T5_CLS_SRAM_L_INSTANCES;
 		break;
 	}
 
