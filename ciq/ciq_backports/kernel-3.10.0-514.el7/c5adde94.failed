@@ -1,0 +1,128 @@
+netlink: eliminate nl_sk_hash_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ying Xue <ying.xue@windriver.com>
+commit c5adde9468b0714a051eac7f9666f23eb10b61f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c5adde94.failed
+
+As rhashtable_lookup_compare_insert() can guarantee the process
+of search and insertion is atomic, it's safe to eliminate the
+nl_sk_hash_lock. After this, object insertion or removal will
+be protected with per bucket lock on write side while object
+lookup is guarded with rcu read lock on read side.
+
+	Signed-off-by: Ying Xue <ying.xue@windriver.com>
+	Cc: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c5adde9468b0714a051eac7f9666f23eb10b61f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/af_netlink.c
+diff --cc net/netlink/af_netlink.c
+index 0a1709dfa494,01b702d63457..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -111,19 -110,6 +111,22 @@@ static atomic_t nl_table_users = ATOMIC
+  
+  #define nl_deref_protected(X) rcu_dereference_protected(X, lockdep_is_held(&nl_table_lock));
+  
+++<<<<<<< HEAD
+ +/* Protects netlink socket hash table mutations */
+ +DEFINE_MUTEX(nl_sk_hash_lock);
+ +EXPORT_SYMBOL_GPL(nl_sk_hash_lock);
+ +
+ +static int lockdep_nl_sk_hash_is_held(void)
+ +{
+ +#ifdef CONFIG_LOCKDEP
+ +	if (debug_locks)
+ +		return lockdep_is_held(&nl_sk_hash_lock) || lockdep_is_held(&nl_table_lock);
+ +#endif
+ +	return 1;
+ +}
+ +
+++=======
+++>>>>>>> c5adde9468b0 (netlink: eliminate nl_sk_hash_lock)
+  static ATOMIC_NOTIFIER_HEAD(netlink_chain);
+  
+  static DEFINE_SPINLOCK(netlink_tap_lock);
+@@@ -1100,11 -1083,12 +1115,10 @@@ static void netlink_remove(struct sock 
+  		WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
+  		__sock_put(sk);
+  	}
+- 	mutex_unlock(&nl_sk_hash_lock);
+  
+  	netlink_table_grab();
+ -	if (nlk_sk(sk)->subscriptions) {
+ +	if (nlk_sk(sk)->subscriptions)
+  		__sk_del_bind_node(sk);
+ -		netlink_update_listeners(sk);
+ -	}
+  	netlink_table_ungrab();
+  }
+  
+* Unmerged path net/netlink/af_netlink.c
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 5b5d85a60dfc..cd36ce7614e9 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -72,6 +72,5 @@ struct netlink_table {
+ 
+ extern struct netlink_table *nl_table;
+ extern rwlock_t nl_table_lock;
+-extern struct mutex nl_sk_hash_lock;
+ 
+ #endif
+diff --git a/net/netlink/diag.c b/net/netlink/diag.c
+index fcca36d81a62..bb59a7ed0859 100644
+--- a/net/netlink/diag.c
++++ b/net/netlink/diag.c
+@@ -103,7 +103,7 @@ static int __netlink_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ {
+ 	struct netlink_table *tbl = &nl_table[protocol];
+ 	struct rhashtable *ht = &tbl->hash;
+-	const struct bucket_table *htbl = rht_dereference(ht->tbl, ht);
++	const struct bucket_table *htbl = rht_dereference_rcu(ht->tbl, ht);
+ 	struct net *net = sock_net(skb->sk);
+ 	struct netlink_diag_req *req;
+ 	struct netlink_sock *nlsk;
+@@ -115,7 +115,7 @@ static int __netlink_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ 	for (i = 0; i < htbl->size; i++) {
+ 		struct rhash_head *pos;
+ 
+-		rht_for_each_entry(nlsk, pos, htbl, i, node) {
++		rht_for_each_entry_rcu(nlsk, pos, htbl, i, node) {
+ 			sk = (struct sock *)nlsk;
+ 
+ 			if (!net_eq(sock_net(sk), net))
+@@ -172,7 +172,7 @@ static int netlink_diag_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 
+ 	req = nlmsg_data(cb->nlh);
+ 
+-	mutex_lock(&nl_sk_hash_lock);
++	rcu_read_lock();
+ 	read_lock(&nl_table_lock);
+ 
+ 	if (req->sdiag_protocol == NDIAG_PROTO_ALL) {
+@@ -186,7 +186,7 @@ static int netlink_diag_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	} else {
+ 		if (req->sdiag_protocol >= MAX_LINKS) {
+ 			read_unlock(&nl_table_lock);
+-			mutex_unlock(&nl_sk_hash_lock);
++			rcu_read_unlock();
+ 			return -ENOENT;
+ 		}
+ 
+@@ -194,7 +194,7 @@ static int netlink_diag_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	}
+ 
+ 	read_unlock(&nl_table_lock);
+-	mutex_unlock(&nl_sk_hash_lock);
++	rcu_read_unlock();
+ 
+ 	return skb->len;
+ }
