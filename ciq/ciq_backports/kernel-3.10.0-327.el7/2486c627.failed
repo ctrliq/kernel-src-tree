@@ -1,0 +1,114 @@
+qla2xxx: Restore WWPN in case of Loop Dead.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Restore WWPN in case of Loop Dead (Chad Dupuis) [1187302]
+Rebuild_FUZZ: 98.82%
+commit-author Himanshu Madhani <himanshu.madhani@qlogic.com>
+commit 2486c62765d73ad8f206ba43b8ede09e689bd803
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2486c627.failed
+
+For FA-WWPN capable device, ISP2031 and ISP27XX, when loop
+dead is detected by a driver, restore WWPN from NVRAM.
+
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2486c62765d73ad8f206ba43b8ede09e689bd803)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index e7fa7d02d853,5f25cf0db568..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -11,17 -11,14 +11,21 @@@
+   * ----------------------------------------------------------------------
+   * |             Level            |   Last Value Used  |     Holes	|
+   * ----------------------------------------------------------------------
+++<<<<<<< HEAD
+ + * | Module Init and Probe        |       0x017d       | 0x004b,0x0141	|
+ + * |                              |                    | 0x0144,0x0146	|
+++=======
++  * | Module Init and Probe        |       0x017d       | 0x0144,0x0146	|
+++>>>>>>> 2486c62765d7 (qla2xxx: Restore WWPN in case of Loop Dead.)
+   * |                              |                    | 0x015b-0x0160	|
+   * |                              |                    | 0x016e-0x0170	|
+ - * | Mailbox commands             |       0x118d       | 0x1115-0x1116	|
+ - * |                              |                    | 0x111a-0x111b  |
+ - * | Device Discovery             |       0x2016       | 0x2020-0x2022, |
+ + * | Mailbox commands             |       0x118d       | 0x1018-0x1019	|
+ + * |                              |                    | 0x10ca         |
+ + * |                              |                    | 0x1115-0x1116  |
+ + * |                              |                    | 0x111a-0x111b	|
+ + * | Device Discovery             |       0x2095       | 0x2020-0x2022, |
+   * |                              |                    | 0x2011-0x2012, |
+ - * |                              |                    | 0x2099-0x20a4  |
+ + * |                              |                    | 0x2016         |
+   * | Queue Command and IO tracing |       0x3059       | 0x3006-0x300b  |
+   * |                              |                    | 0x3027-0x3028  |
+   * |                              |                    | 0x303d-0x3041  |
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index ad94183fb23b,23f12dddcb4a..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -2158,6 -2198,15 +2158,18 @@@ qla2x00_init_rings(scsi_qla_host_t *vha
+  		mid_init_cb->options = __constant_cpu_to_le16(BIT_1);
+  		mid_init_cb->init_cb.execution_throttle =
+  		    cpu_to_le16(ha->fw_xcb_count);
+++<<<<<<< HEAD
+++=======
++ 		/* D-Port Status */
++ 		if (IS_DPORT_CAPABLE(ha))
++ 			mid_init_cb->init_cb.firmware_options_1 |=
++ 			    cpu_to_le16(BIT_7);
++ 		/* Enable FA-WWPN */
++ 		ha->flags.fawwpn_enabled =
++ 		    (mid_init_cb->init_cb.firmware_options_1 & BIT_6) ? 1 : 0;
++ 		ql_dbg(ql_dbg_init, vha, 0x0141, "FA-WWPN Support: %s.\n",
++ 		    (ha->flags.fawwpn_enabled) ? "enabled" : "disabled");
+++>>>>>>> 2486c62765d7 (qla2xxx: Restore WWPN in case of Loop Dead.)
+  	}
+  
+  	rval = qla2x00_init_firmware(vha, ha->init_cb_size);
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 801d423a8d81..0a1beb495d61 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2820,7 +2820,8 @@ struct qla_hw_data {
+ 
+ 		uint32_t        mr_reset_hdlr_active:1;
+ 		uint32_t        mr_intr_valid:1;
+-		/* 34 bits */
++		uint32_t	fawwpn_enabled:1;
++		/* 35 bits */
+ 	} flags;
+ 
+ 	/* This spinlock is used to protect "io transactions", you must
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 4f265c779387..d2a64f79b5b8 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -720,6 +720,16 @@ skip_rio:
+ 		if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 			atomic_set(&vha->loop_state, LOOP_DOWN);
+ 			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
++			/*
++			 * In case of loop down, restore WWPN from
++			 * NVRAM in case of FA-WWPN capable ISP
++			 */
++			if (ha->flags.fawwpn_enabled) {
++				void *wwpn = ha->init_cb->port_name;
++
++				memcpy(vha->port_name, wwpn, WWN_SIZE);
++			}
++
+ 			vha->device_flags |= DFLG_NO_CABLE;
+ 			qla2x00_mark_all_devices_lost(vha, 1);
+ 		}
