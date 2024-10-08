@@ -658,6 +658,10 @@ static int emulate_vsx(unsigned char __user *addr, unsigned int reg,
 	int sw = 0;
 	int i, j;
 
+	/* userland only */
+	if (unlikely(!user_mode(regs)))
+		return 0;
+
 	flush_vsx_to_thread(current);
 
 	if (reg < 32)
