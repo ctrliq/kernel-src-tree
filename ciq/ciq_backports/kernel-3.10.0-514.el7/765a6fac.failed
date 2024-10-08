@@ -1,0 +1,316 @@
+IB/hfi1: Change QSFP functions to use resource reservation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit 765a6fac9132da203347525032bb40b1e9055104
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/765a6fac.failed
+
+Remove the mutex guarding each operation in favor the ASIC
+resource acquire/release.  Push the resource acquire/release,
+above each operation call to allow exclusive access across
+multiple operations.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 765a6fac9132da203347525032bb40b1e9055104)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+#	drivers/staging/hfi1/qsfp.c
+#	drivers/staging/rdma/hfi1/platform.c
+diff --cc drivers/staging/hfi1/chip.c
+index bf5729033eb0,d3a9b9f3b4f5..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -9252,15 -9290,16 +9252,15 @@@ static void qsfp_event(struct work_stru
+  	if (qd->check_interrupt_flags) {
+  		u8 qsfp_interrupt_status[16] = {0,};
+  
+- 		if (qsfp_read(ppd, dd->hfi1_id, 6,
+- 			      &qsfp_interrupt_status[0], 16) != 16) {
++ 		if (one_qsfp_read(ppd, dd->hfi1_id, 6,
++ 				  &qsfp_interrupt_status[0], 16) != 16) {
+  			dd_dev_info(dd,
+ -				    "%s: Failed to read status of QSFP module\n",
+ -				    __func__);
+ +				"%s: Failed to read status of QSFP module\n",
+ +				__func__);
+  		} else {
+  			unsigned long flags;
+ +			u8 data_status;
+  
+ -			handle_qsfp_error_conditions(
+ -					ppd, qsfp_interrupt_status);
+  			spin_lock_irqsave(&ppd->qsfp_info.qsfp_lock, flags);
+  			ppd->qsfp_info.check_interrupt_flags = 0;
+  			spin_unlock_irqrestore(&ppd->qsfp_info.qsfp_lock,
+@@@ -9818,6 -9842,22 +9818,25 @@@ static int goto_offline(struct hfi1_ppo
+  	write_csr(dd, DC_LCB_ERR_EN, ~0ull); /* watch LCB errors */
+  	ppd->host_link_state = HLS_LINK_COOLDOWN; /* LCB access allowed */
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ 	if (ppd->port_type == PORT_TYPE_QSFP &&
++ 	    ppd->qsfp_info.limiting_active &&
++ 	    qsfp_mod_present(ppd)) {
++ 		int ret;
++ 
++ 		ret = acquire_chip_resource(dd, qsfp_resource(dd), QSFP_WAIT);
++ 		if (ret == 0) {
++ 			set_qsfp_tx(ppd, 0);
++ 			release_chip_resource(dd, qsfp_resource(dd));
++ 		} else {
++ 			/* not fatal, but should warn */
++ 			dd_dev_err(dd,
++ 				   "Unable to acquire lock to turn off QSFP TX\n");
++ 		}
++ 	}
++ 
+++>>>>>>> 765a6fac9132 (IB/hfi1: Change QSFP functions to use resource reservation):drivers/staging/rdma/hfi1/chip.c
+  	/*
+  	 * The LNI has a mandatory wait time after the physical state
+  	 * moves to Offline.Quiet.  The wait time may be different
+diff --cc drivers/staging/hfi1/qsfp.c
+index b16ff11927bd,9ed1963010fe..000000000000
+--- a/drivers/staging/hfi1/qsfp.c
++++ b/drivers/staging/hfi1/qsfp.c
+@@@ -188,7 -179,9 +182,13 @@@ int i2c_read(struct hfi1_pportdata *ppd
+  
+  /*
+   * Write page n, offset m of QSFP memory as defined by SFF 8636
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ + * in the cache by writing @addr = ((256 * n) + m)
+++=======
++  * by writing @addr = ((256 * n) + m)
++  *
++  * Caller must hold the i2c chain resource.
+++>>>>>>> 765a6fac9132 (IB/hfi1: Change QSFP functions to use resource reservation):drivers/staging/rdma/hfi1/qsfp.c
+   */
+  int qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+  	       int len)
+@@@ -252,9 -241,31 +248,35 @@@
+  	return count;
+  }
+  
++ /*
++  * Perform a stand-alone single QSFP write.  Acquire the resource, do the
++  * read, then release the resource.
++  */
++ int one_qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
++ 		   int len)
++ {
++ 	struct hfi1_devdata *dd = ppd->dd;
++ 	u32 resource = qsfp_resource(dd);
++ 	int ret;
++ 
++ 	ret = acquire_chip_resource(dd, resource, QSFP_WAIT);
++ 	if (ret)
++ 		return ret;
++ 	ret = qsfp_write(ppd, target, addr, bp, len);
++ 	release_chip_resource(dd, resource);
++ 
++ 	return ret;
++ }
++ 
+  /*
+   * Access page n, offset m of QSFP memory as defined by SFF 8636
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ + * in the cache by reading @addr = ((256 * n) + m)
+++=======
++  * by reading @addr = ((256 * n) + m)
++  *
++  * Caller must hold the i2c chain resource.
+++>>>>>>> 765a6fac9132 (IB/hfi1: Change QSFP functions to use resource reservation):drivers/staging/rdma/hfi1/qsfp.c
+   */
+  int qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+  	      int len)
+@@@ -342,12 -369,15 +380,16 @@@ int refresh_qsfp_cache(struct hfi1_ppor
+  	ppd->qsfp_info.cache_valid = 0;
+  	spin_unlock_irqrestore(&ppd->qsfp_info.qsfp_lock, flags);
+  
+ +	dd_dev_info(ppd->dd, "%s called\n", __func__);
+  	if (!qsfp_mod_present(ppd)) {
+  		ret = -ENODEV;
+- 		goto bail;
++ 		goto bail_no_release;
+  	}
+  
++ 	ret = acquire_chip_resource(ppd->dd, qsfp_resource(ppd->dd), QSFP_WAIT);
++ 	if (ret)
++ 		goto bail_no_release;
++ 
+  	ret = qsfp_read(ppd, target, 0, cache, QSFP_PAGESIZE);
+  	if (ret != QSFP_PAGESIZE) {
+  		dd_dev_info(ppd->dd,
+@@@ -419,7 -450,9 +463,13 @@@
+  	return 0;
+  
+  bail:
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ +	memset(cache, 0, (QSFP_MAX_NUM_PAGES*128));
+++=======
++ 	release_chip_resource(ppd->dd, qsfp_resource(ppd->dd));
++ bail_no_release:
++ 	memset(cache, 0, (QSFP_MAX_NUM_PAGES * 128));
+++>>>>>>> 765a6fac9132 (IB/hfi1: Change QSFP functions to use resource reservation):drivers/staging/rdma/hfi1/qsfp.c
+  	return ret;
+  }
+  
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
+* Unmerged path drivers/staging/hfi1/chip.c
+diff --git a/drivers/staging/hfi1/chip.h b/drivers/staging/hfi1/chip.h
+index dc82815c53a0..f18b6c340e26 100644
+--- a/drivers/staging/hfi1/chip.h
++++ b/drivers/staging/hfi1/chip.h
+@@ -662,6 +662,9 @@ void finish_chip_resources(struct hfi1_devdata *dd);
+ /* ms wait time for access to an SBus resoure */
+ #define SBUS_TIMEOUT 4000 /* long enough for a FW download and SBR */
+ 
++/* ms wait time for a qsfp (i2c) chain to become available */
++#define QSFP_WAIT 20000 /* long enough for FW update to the F4 uc */
++
+ void fabric_serdes_reset(struct hfi1_devdata *dd);
+ int read_8051_data(struct hfi1_devdata *dd, u32 addr, u32 len, u64 *result);
+ 
+diff --git a/drivers/staging/hfi1/debugfs.c b/drivers/staging/hfi1/debugfs.c
+index 8abbfd24e68b..0c1500980587 100644
+--- a/drivers/staging/hfi1/debugfs.c
++++ b/drivers/staging/hfi1/debugfs.c
+@@ -471,16 +471,22 @@ static ssize_t __i2c_debugfs_write(struct file *file, const char __user *buf,
+ 		goto _free;
+ 	}
+ 
++	ret = acquire_chip_resource(ppd->dd, i2c_target(target), 0);
++	if (ret)
++		goto _free;
++
+ 	total_written = i2c_write(ppd, target, i2c_addr, offset, buff, count);
+ 	if (total_written < 0) {
+ 		ret = total_written;
+-		goto _free;
++		goto _release;
+ 	}
+ 
+ 	*ppos += total_written;
+ 
+ 	ret = total_written;
+ 
++ _release:
++	release_chip_resource(ppd->dd, i2c_target(target));
+  _free:
+ 	kfree(buff);
+  _return:
+@@ -532,10 +538,14 @@ static ssize_t __i2c_debugfs_read(struct file *file, char __user *buf,
+ 		goto _return;
+ 	}
+ 
++	ret = acquire_chip_resource(ppd->dd, i2c_target(target), 0);
++	if (ret)
++		goto _free;
++
+ 	total_read = i2c_read(ppd, target, i2c_addr, offset, buff, count);
+ 	if (total_read < 0) {
+ 		ret = total_read;
+-		goto _free;
++		goto _release;
+ 	}
+ 
+ 	*ppos += total_read;
+@@ -543,11 +553,13 @@ static ssize_t __i2c_debugfs_read(struct file *file, char __user *buf,
+ 	ret = copy_to_user(buf, buff, total_read);
+ 	if (ret > 0) {
+ 		ret = -EFAULT;
+-		goto _free;
++		goto _release;
+ 	}
+ 
+ 	ret = total_read;
+ 
++ _release:
++	release_chip_resource(ppd->dd, i2c_target(target));
+  _free:
+ 	kfree(buff);
+  _return:
+@@ -598,7 +610,7 @@ static ssize_t __qsfp_debugfs_write(struct file *file, const char __user *buf,
+ 		goto _free;
+ 	}
+ 
+-	total_written = qsfp_write(ppd, target, *ppos, buff, count);
++	total_written = one_qsfp_write(ppd, target, *ppos, buff, count);
+ 	if (total_written < 0) {
+ 		ret = total_written;
+ 		goto _free;
+@@ -652,7 +664,7 @@ static ssize_t __qsfp_debugfs_read(struct file *file, char __user *buf,
+ 		goto _return;
+ 	}
+ 
+-	total_read = qsfp_read(ppd, target, *ppos, buff, count);
++	total_read = one_qsfp_read(ppd, target, *ppos, buff, count);
+ 	if (total_read < 0) {
+ 		ret = total_read;
+ 		goto _free;
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 6438dccf5749..80965eb7d4b8 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -1018,8 +1018,6 @@ struct hfi1_devdata {
+ 	u16 dc8051_ver; /* 8051 firmware version */
+ 
+ 	struct platform_config_cache pcfg_cache;
+-	/* control high-level access to qsfp */
+-	struct mutex qsfp_i2c_mutex;
+ 
+ 	struct diag_client *diag_client;
+ 	spinlock_t hfi1_diag_trans_lock; /* protect diag observer ops */
+@@ -1887,6 +1885,18 @@ static inline void setextled(struct hfi1_devdata *dd, u32 on)
+ 		write_csr(dd, DCC_CFG_LED_CNTRL, 0x10);
+ }
+ 
++/* return the i2c resource given the target */
++static inline u32 i2c_target(u32 target)
++{
++	return target ? CR_I2C2 : CR_I2C1;
++}
++
++/* return the i2c chain chip resource that this HFI uses for QSFP */
++static inline u32 qsfp_resource(struct hfi1_devdata *dd)
++{
++	return i2c_target(dd->hfi1_id);
++}
++
+ int hfi1_tempsense_rd(struct hfi1_devdata *dd, struct hfi1_temp *temp);
+ 
+ #endif                          /* _HFI1_KERNEL_H */
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index 9c4bb834cbe9..f729976a1166 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -1049,7 +1049,6 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
+ 	spin_lock_init(&dd->sc_init_lock);
+ 	spin_lock_init(&dd->dc8051_lock);
+ 	spin_lock_init(&dd->dc8051_memlock);
+-	mutex_init(&dd->qsfp_i2c_mutex);
+ 	seqlock_init(&dd->sc2vl_lock);
+ 	spin_lock_init(&dd->sde_map_lock);
+ 	init_waitqueue_head(&dd->event_queue);
+* Unmerged path drivers/staging/hfi1/qsfp.c
+diff --git a/drivers/staging/hfi1/qsfp.h b/drivers/staging/hfi1/qsfp.h
+index b5bc61780bca..b162d21f1144 100644
+--- a/drivers/staging/hfi1/qsfp.h
++++ b/drivers/staging/hfi1/qsfp.h
+@@ -236,3 +236,7 @@ int qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+ 	       int len);
+ int qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+ 	      int len);
++int one_qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
++		   int len);
++int one_qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
++		  int len);
+* Unmerged path drivers/staging/rdma/hfi1/platform.c
