@@ -1,0 +1,366 @@
+xfs: introduce xfs_mod_frextents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit bab98bbe6e1e38bf2fa5018a195608553095f51b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bab98bbe.failed
+
+Add a new helper to modify the incore counter of free realtime
+extents. This matches the helpers used for inode and data block
+counters, and removes a significant users of the xfs_mod_incore_sb()
+interface.
+
+Based on a patch originally from Christoph Hellwig.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit bab98bbe6e1e38bf2fa5018a195608553095f51b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.c
+#	fs/xfs/xfs_mount.h
+diff --cc fs/xfs/xfs_mount.c
+index 1f0460bd27b8,df4c32fdc706..000000000000
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@@ -1123,19 -1081,141 +1123,37 @@@ xfs_log_sbcount(xfs_mount_t *mp
+  	if (!xfs_sb_version_haslazysbcount(&mp->m_sb))
+  		return 0;
+  
+ -	return xfs_sync_sb(mp, true);
+ -}
+ -
+ -int
+ -xfs_mod_icount(
+ -	struct xfs_mount	*mp,
+ -	int64_t			delta)
+ -{
+ -	/* deltas are +/-64, hence the large batch size of 128. */
+ -	__percpu_counter_add(&mp->m_icount, delta, 128);
+ -	if (percpu_counter_compare(&mp->m_icount, 0) < 0) {
+ -		ASSERT(0);
+ -		percpu_counter_add(&mp->m_icount, -delta);
+ -		return -EINVAL;
+ -	}
+ -	return 0;
+ -}
+ -
+ -int
+ -xfs_mod_ifree(
+ -	struct xfs_mount	*mp,
+ -	int64_t			delta)
+ -{
+ -	percpu_counter_add(&mp->m_ifree, delta);
+ -	if (percpu_counter_compare(&mp->m_ifree, 0) < 0) {
+ -		ASSERT(0);
+ -		percpu_counter_add(&mp->m_ifree, -delta);
+ -		return -EINVAL;
+ -	}
+ -	return 0;
+ -}
+ -
+ -int
+ -xfs_mod_fdblocks(
+ -	struct xfs_mount	*mp,
+ -	int64_t			delta,
+ -	bool			rsvd)
+ -{
+ -	int64_t			lcounter;
+ -	long long		res_used;
+ -	s32			batch;
+ -
+ -	if (delta > 0) {
+ -		/*
+ -		 * If the reserve pool is depleted, put blocks back into it
+ -		 * first. Most of the time the pool is full.
+ -		 */
+ -		if (likely(mp->m_resblks == mp->m_resblks_avail)) {
+ -			percpu_counter_add(&mp->m_fdblocks, delta);
+ -			return 0;
+ -		}
+ -
+ -		spin_lock(&mp->m_sb_lock);
+ -		res_used = (long long)(mp->m_resblks - mp->m_resblks_avail);
+ -
+ -		if (res_used > delta) {
+ -			mp->m_resblks_avail += delta;
+ -		} else {
+ -			delta -= res_used;
+ -			mp->m_resblks_avail = mp->m_resblks;
+ -			percpu_counter_add(&mp->m_fdblocks, delta);
+ -		}
+ -		spin_unlock(&mp->m_sb_lock);
+ -		return 0;
+ -	}
+ -
+ -	/*
+ -	 * Taking blocks away, need to be more accurate the closer we
+ -	 * are to zero.
+ -	 *
+ -	 * batch size is set to a maximum of 1024 blocks - if we are
+ -	 * allocating of freeing extents larger than this then we aren't
+ -	 * going to be hammering the counter lock so a lock per update
+ -	 * is not a problem.
+ -	 *
+ -	 * If the counter has a value of less than 2 * max batch size,
+ -	 * then make everything serialise as we are real close to
+ -	 * ENOSPC.
+ -	 */
+ -#define __BATCH	1024
+ -	if (percpu_counter_compare(&mp->m_fdblocks, 2 * __BATCH) < 0)
+ -		batch = 1;
+ -	else
+ -		batch = __BATCH;
+ -#undef __BATCH
+ -
+ -	__percpu_counter_add(&mp->m_fdblocks, delta, batch);
+ -	if (percpu_counter_compare(&mp->m_fdblocks,
+ -				   XFS_ALLOC_SET_ASIDE(mp)) >= 0) {
+ -		/* we had space! */
+ -		return 0;
+ +	tp = _xfs_trans_alloc(mp, XFS_TRANS_SB_COUNT, KM_SLEEP);
+ +	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_sb, 0, 0);
+ +	if (error) {
+ +		xfs_trans_cancel(tp, 0);
+ +		return error;
+  	}
+  
+ -	/*
+ -	 * lock up the sb for dipping into reserves before releasing the space
+ -	 * that took us to ENOSPC.
+ -	 */
+ -	spin_lock(&mp->m_sb_lock);
+ -	percpu_counter_add(&mp->m_fdblocks, -delta);
+ -	if (!rsvd)
+ -		goto fdblocks_enospc;
+ -
+ -	lcounter = (long long)mp->m_resblks_avail + delta;
+ -	if (lcounter >= 0) {
+ -		mp->m_resblks_avail = lcounter;
+ -		spin_unlock(&mp->m_sb_lock);
+ -		return 0;
+ -	}
+ -	printk_once(KERN_WARNING
+ -		"Filesystem \"%s\": reserve blocks depleted! "
+ -		"Consider increasing reserve pool size.",
+ -		mp->m_fsname);
+ -fdblocks_enospc:
+ -	spin_unlock(&mp->m_sb_lock);
+ -	return -ENOSPC;
+ +	xfs_mod_sb(tp, XFS_SB_IFREE | XFS_SB_ICOUNT | XFS_SB_FDBLOCKS);
+ +	xfs_trans_set_sync(tp);
+ +	error = xfs_trans_commit(tp, 0);
+ +	return error;
+  }
+  
++ int
++ xfs_mod_frextents(
++ 	struct xfs_mount	*mp,
++ 	int64_t			delta)
++ {
++ 	int64_t			lcounter;
++ 	int			ret = 0;
++ 
++ 	spin_lock(&mp->m_sb_lock);
++ 	lcounter = mp->m_sb.sb_frextents + delta;
++ 	if (lcounter < 0)
++ 		ret = -ENOSPC;
++ 	else
++ 		mp->m_sb.sb_frextents = lcounter;
++ 	spin_unlock(&mp->m_sb_lock);
++ 	return ret;
++ }
++ 
+  /*
+   * xfs_mod_incore_sb_unlocked() is a utility routine commonly used to apply
+   * a delta to a specified field in the in-core superblock.  Simply
+@@@ -1164,73 -1243,11 +1182,79 @@@ xfs_mod_incore_sb_unlocked
+  	 */
+  	switch (field) {
+  	case XFS_SBS_ICOUNT:
+ +		lcounter = (long long)mp->m_sb.sb_icount;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_icount = lcounter;
+ +		return 0;
+  	case XFS_SBS_IFREE:
+ +		lcounter = (long long)mp->m_sb.sb_ifree;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			ASSERT(0);
+ +			return XFS_ERROR(EINVAL);
+ +		}
+ +		mp->m_sb.sb_ifree = lcounter;
+ +		return 0;
+  	case XFS_SBS_FDBLOCKS:
+++<<<<<<< HEAD
+ +		lcounter = (long long)
+ +			mp->m_sb.sb_fdblocks - XFS_ALLOC_SET_ASIDE(mp);
+ +		res_used = (long long)(mp->m_resblks - mp->m_resblks_avail);
+ +
+ +		if (delta > 0) {		/* Putting blocks back */
+ +			if (res_used > delta) {
+ +				mp->m_resblks_avail += delta;
+ +			} else {
+ +				rem = delta - res_used;
+ +				mp->m_resblks_avail = mp->m_resblks;
+ +				lcounter += rem;
+ +			}
+ +		} else {				/* Taking blocks away */
+ +			lcounter += delta;
+ +			if (lcounter >= 0) {
+ +				mp->m_sb.sb_fdblocks = lcounter +
+ +							XFS_ALLOC_SET_ASIDE(mp);
+ +				return 0;
+ +			}
+ +
+ +			/*
+ +			 * We are out of blocks, use any available reserved
+ +			 * blocks if were allowed to.
+ +			 */
+ +			if (!rsvd)
+ +				return XFS_ERROR(ENOSPC);
+ +
+ +			lcounter = (long long)mp->m_resblks_avail + delta;
+ +			if (lcounter >= 0) {
+ +				mp->m_resblks_avail = lcounter;
+ +				return 0;
+ +			}
+ +			printk_once(KERN_WARNING
+ +				"Filesystem \"%s\": reserve blocks depleted! "
+ +				"Consider increasing reserve pool size.",
+ +				mp->m_fsname);
+ +			return XFS_ERROR(ENOSPC);
+ +		}
+ +
+ +		mp->m_sb.sb_fdblocks = lcounter + XFS_ALLOC_SET_ASIDE(mp);
+ +		return 0;
+ +	case XFS_SBS_FREXTENTS:
+ +		lcounter = (long long)mp->m_sb.sb_frextents;
+ +		lcounter += delta;
+ +		if (lcounter < 0) {
+ +			return XFS_ERROR(ENOSPC);
+ +		}
+ +		mp->m_sb.sb_frextents = lcounter;
+ +		return 0;
+++=======
++ 	case XFS_SBS_FREXTENTS:
++ 		ASSERT(0);
++ 		return -EINVAL;
+++>>>>>>> bab98bbe6e1e (xfs: introduce xfs_mod_frextents)
+  	case XFS_SBS_DBLOCKS:
+  		lcounter = (long long)mp->m_sb.sb_dblocks;
+  		lcounter += delta;
+diff --cc fs/xfs/xfs_mount.h
+index 77ab2563aabb,d65e0f23b847..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -399,7 -327,13 +399,17 @@@ extern void	xfs_unmountfs(xfs_mount_t *
+  extern int	xfs_mod_incore_sb(xfs_mount_t *, xfs_sb_field_t, int64_t, int);
+  extern int	xfs_mod_incore_sb_batch(xfs_mount_t *, xfs_mod_sb_t *,
+  			uint, int);
+++<<<<<<< HEAD
+ +extern int	xfs_mount_log_sb(xfs_mount_t *, __int64_t);
+++=======
++ extern int	xfs_mod_icount(struct xfs_mount *mp, int64_t delta);
++ extern int	xfs_mod_ifree(struct xfs_mount *mp, int64_t delta);
++ extern int	xfs_mod_fdblocks(struct xfs_mount *mp, int64_t delta,
++ 				 bool reserved);
++ extern int	xfs_mod_frextents(struct xfs_mount *mp, int64_t delta);
++ 
++ extern int	xfs_mount_log_sb(xfs_mount_t *);
+++>>>>>>> bab98bbe6e1e (xfs: introduce xfs_mod_frextents)
+  extern struct xfs_buf *xfs_getsb(xfs_mount_t *, int);
+  extern int	xfs_readsb(xfs_mount_t *, int);
+  extern void	xfs_freesb(xfs_mount_t *);
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 306dc359fdbf..00f7821adfc7 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -4168,8 +4168,7 @@ xfs_bmapi_reserve_delalloc(
+ 	ASSERT(indlen > 0);
+ 
+ 	if (rt) {
+-		error = xfs_mod_incore_sb(mp, XFS_SBS_FREXTENTS,
+-					  -((int64_t)extsz), 0);
++		error = xfs_mod_frextents(mp, -((int64_t)extsz));
+ 	} else {
+ 		error = xfs_icsb_modify_counters(mp, XFS_SBS_FDBLOCKS,
+ 						 -((int64_t)alen), 0);
+@@ -4206,7 +4205,7 @@ xfs_bmapi_reserve_delalloc(
+ 
+ out_unreserve_blocks:
+ 	if (rt)
+-		xfs_mod_incore_sb(mp, XFS_SBS_FREXTENTS, extsz, 0);
++		xfs_mod_frextents(mp, extsz);
+ 	else
+ 		xfs_icsb_modify_counters(mp, XFS_SBS_FDBLOCKS, alen, 0);
+ out_unreserve_quota:
+@@ -5289,8 +5288,7 @@ xfs_bunmapi(
+ 
+ 				rtexts = XFS_FSB_TO_B(mp, del.br_blockcount);
+ 				do_div(rtexts, mp->m_sb.sb_rextsize);
+-				xfs_mod_incore_sb(mp, XFS_SBS_FREXTENTS,
+-						(int64_t)rtexts, 0);
++				xfs_mod_frextents(mp, (int64_t)rtexts);
+ 				(void)xfs_trans_reserve_quota_nblks(NULL,
+ 					ip, -((long)del.br_blockcount), 0,
+ 					XFS_QMOPT_RES_RTBLKS);
+* Unmerged path fs/xfs/xfs_mount.c
+* Unmerged path fs/xfs/xfs_mount.h
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index ddcabad67a51..493ae68f9343 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -238,8 +238,7 @@ xfs_trans_reserve(
+ 	 * fail if the count would go below zero.
+ 	 */
+ 	if (rtextents > 0) {
+-		error = xfs_mod_incore_sb(tp->t_mountp, XFS_SBS_FREXTENTS,
+-					  -((int64_t)rtextents), rsvd);
++		error = xfs_mod_frextents(tp->t_mountp, -((int64_t)rtextents));
+ 		if (error) {
+ 			error = XFS_ERROR(ENOSPC);
+ 			goto undo_log;
+@@ -570,10 +569,10 @@ xfs_trans_unreserve_and_mod_sb(
+ 	}
+ 
+ 	/* apply remaining deltas */
+-	if (rtxdelta != 0) {
+-		msbp->msb_field = XFS_SBS_FREXTENTS;
+-		msbp->msb_delta = rtxdelta;
+-		msbp++;
++	if (rtxdelta) {
++		error = xfs_mod_frextents(mp, rtxdelta);
++		if (error)
++			goto out_undo_ifree;
+ 	}
+ 
+ 	if (tp->t_flags & XFS_TRANS_SB_DIRTY) {
+@@ -626,12 +625,15 @@ xfs_trans_unreserve_and_mod_sb(
+ 		error = xfs_mod_incore_sb_batch(tp->t_mountp, msb,
+ 			(uint)(msbp - msb), rsvd);
+ 		if (error)
+-			goto out_undo_ifreecount;
++			goto out_undo_frextents;
+ 	}
+ 
+ 	return;
+ 
+-out_undo_ifreecount:
++out_undo_frextents:
++	if (rtxdelta)
++		xfs_mod_frextents(mp, -rtxdelta);
++out_undo_ifree:
+ 	if (ifreedelta)
+ 		xfs_icsb_modify_counters(mp, XFS_SBS_IFREE, -ifreedelta, rsvd);
+ out_undo_icount:
