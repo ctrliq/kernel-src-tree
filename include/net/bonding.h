@@ -143,6 +143,12 @@ struct bond_parm_tbl {
 	int mode;
 };
 
+struct netdev_notify_work {
+	struct delayed_work	work;
+	struct slave		*slave;
+	struct net_device	*dev;
+};
+
 struct slave {
 	struct net_device *dev; /* first - useful for panic debug */
 	struct list_head list;
@@ -245,6 +251,8 @@ struct netdev_upper {
 
 #define bond_slave_get_rtnl(dev) \
 	((struct slave *) rtnl_dereference(dev->rx_handler_data))
+
+void bond_queue_slave_event(struct slave *slave);
 
 struct bond_vlan_tag {
 	__be16		vlan_proto;
@@ -360,6 +368,7 @@ static inline void bond_set_active_slave(struct slave *slave)
 {
 	if (slave->backup) {
 		slave->backup = 0;
+		bond_queue_slave_event(slave);
 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
 	}
 }
@@ -368,6 +377,7 @@ static inline void bond_set_backup_slave(struct slave *slave)
 {
 	if (!slave->backup) {
 		slave->backup = 1;
+		bond_queue_slave_event(slave);
 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
 	}
 }
@@ -381,6 +391,7 @@ static inline void bond_set_slave_state(struct slave *slave,
 	slave->backup = slave_state;
 	if (notify) {
 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
+		bond_queue_slave_event(slave);
 		slave->should_notify = 0;
 	} else {
 		if (slave->should_notify)
@@ -538,6 +549,7 @@ static inline bool bond_is_slave_inactive(struct slave *slave)
 static inline void bond_set_slave_link_state(struct slave *slave, int state)
 {
 	slave->link = state;
+	bond_queue_slave_event(slave);
 }
 
 static inline __be32 bond_confirm_addr(struct net_device *dev, __be32 dst, __be32 local)
