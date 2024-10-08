@@ -1,0 +1,137 @@
+drm/vmwgfx: Work around mode set failure in 2D VMs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] vmwgfx: Work around mode set failure in 2D VMs (Rob Clark) [1348329 1349064]
+Rebuild_FUZZ: 95.83%
+commit-author Sinclair Yeh <syeh@vmware.com>
+commit 7c20d213dd3cd6295bf9162730e7a368af957854
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7c20d213.failed
+
+In a low-memory 2D VM, fbdev can take up a large percentage of
+available memory, making them unavailable for other DRM clients.
+
+Since we do not take fbdev into account when filtering modes,
+we end up claiming to support more modes than we actually do.
+
+As a result, users get a black screen when setting a mode too
+large for current available memory.  In a low-memory VM
+configuration, users can get a black screen for a mode as low
+as 1024x768.
+
+The current mode filtering mechanism keys off of
+SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB, i.e. the maximum amount
+of surface memory we have.  Since this value is a performance
+suggestion, not a hard limit, and since there should not be much
+of a performance impact for a 2D VM, rather than filtering out
+more modes, we will just allow ourselves to exceed the SVGA's
+performance suggestion.
+
+Also changed assumed bpp to 32 from 16 to make sure we can
+actually support all the modes listed.
+
+	Signed-off-by: Sinclair Yeh <syeh@vmware.com>
+	Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
+	Cc: <stable@vger.kernel.org>
+(cherry picked from commit 7c20d213dd3cd6295bf9162730e7a368af957854)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 07cda8cbbddb,077f16d6de6f..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@@ -1948,42 -1553,38 +1948,46 @@@ int vmw_du_connector_fill_modes(struct 
+  		DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_PVSYNC)
+  	};
+  	int i;
+ -	u32 assumed_bpp = 4;
+++<<<<<<< HEAD
+ +	u32 assumed_bpp = 2;
+  
+ -	if (dev_priv->active_display_unit == vmw_du_screen_target) {
+ -		max_width  = min(max_width,  dev_priv->stdu_max_width);
+ -		max_height = min(max_height, dev_priv->stdu_max_height);
+ -	}
+ +	/*
+ +	 * If using screen objects, then assume 32-bpp because that's what the
+ +	 * SVGA device is assuming
+ +	 */
+ +	if (dev_priv->sou_priv)
+ +		assumed_bpp = 4;
+++=======
+++	u32 assumed_bpp = 4;
+++>>>>>>> 7c20d213dd3c (drm/vmwgfx: Work around mode set failure in 2D VMs)
+  
+  	/* Add preferred mode */
+ -	mode = drm_mode_duplicate(dev, &prefmode);
+ -	if (!mode)
+ -		return 0;
+ -	mode->hdisplay = du->pref_width;
+ -	mode->vdisplay = du->pref_height;
+ -	vmw_guess_mode_timing(mode);
+ +	{
+ +		mode = drm_mode_duplicate(dev, &prefmode);
+ +		if (!mode)
+ +			return 0;
+ +		mode->hdisplay = du->pref_width;
+ +		mode->vdisplay = du->pref_height;
+ +		vmw_guess_mode_timing(mode);
+ +
+ +		if (vmw_kms_validate_mode_vram(dev_priv,
+ +						mode->hdisplay * assumed_bpp,
+ +						mode->vdisplay)) {
+ +			drm_mode_probed_add(connector, mode);
+ +		} else {
+ +			drm_mode_destroy(dev, mode);
+ +			mode = NULL;
+ +		}
+  
+ -	if (vmw_kms_validate_mode_vram(dev_priv,
+ -					mode->hdisplay * assumed_bpp,
+ -					mode->vdisplay)) {
+ -		drm_mode_probed_add(connector, mode);
+ -	} else {
+ -		drm_mode_destroy(dev, mode);
+ -		mode = NULL;
+ -	}
+ +		if (du->pref_mode) {
+ +			list_del_init(&du->pref_mode->head);
+ +			drm_mode_destroy(dev, du->pref_mode);
+ +		}
+  
+ -	if (du->pref_mode) {
+ -		list_del_init(&du->pref_mode->head);
+ -		drm_mode_destroy(dev, du->pref_mode);
+ +		/* mode might be null here, this is intended */
+ +		du->pref_mode = mode;
+  	}
+  
+ -	/* mode might be null here, this is intended */
+ -	du->pref_mode = mode;
+ -
+  	for (i = 0; vmw_kms_connector_builtin[i].type != 0; i++) {
+  		bmode = &vmw_kms_connector_builtin[i];
+  		if (bmode->hdisplay > max_width ||
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 620bb5cf617c..af723e106017 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -667,6 +667,13 @@ static int vmw_driver_load(struct drm_device *dev, unsigned long chipset)
+ 			vmw_read(dev_priv,
+ 				 SVGA_REG_SUGGESTED_GBOBJECT_MEM_SIZE_KB);
+ 
++		/*
++		 * Workaround for low memory 2D VMs to compensate for the
++		 * allocation taken by fbdev
++		 */
++		if (!(dev_priv->capabilities & SVGA_CAP_3D))
++			mem_size *= 2;
++
+ 		dev_priv->max_mob_pages = mem_size * 1024 / PAGE_SIZE;
+ 		dev_priv->prim_bb_mem =
+ 			vmw_read(dev_priv,
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
