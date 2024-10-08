@@ -1,0 +1,96 @@
+rhashtable: Lower/upper bucket may map to same lock while shrinking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit 80ca8c3a84c74a87977558861bb8eef650732912
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/80ca8c3a.failed
+
+Each per bucket lock covers a configurable number of buckets. While
+shrinking, two buckets in the old table contain entries for a single
+bucket in the new table. We need to lock down both while linking.
+Check if they are protected by different locks to avoid a recursive
+lock.
+
+Fixes: 97defe1e ("rhashtable: Per bucket locks & deferred expansion/shrinking")
+	Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 80ca8c3a84c74a87977558861bb8eef650732912)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rhashtable.c
+diff --cc lib/rhashtable.c
+index be20e9720492,aca699813ba9..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -282,24 -420,49 +282,48 @@@ int rhashtable_shrink(struct rhashtabl
+  
+  	ASSERT_RHT_MUTEX(ht);
+  
+ -	new_tbl = bucket_table_alloc(ht, tbl->size / 2);
+ -	if (new_tbl == NULL)
+ +	if (ht->shift <= ht->p.min_shift)
+ +		return 0;
+ +
+ +	ntbl = bucket_table_alloc(tbl->size / 2);
+ +	if (ntbl == NULL)
+  		return -ENOMEM;
+  
+ -	rcu_assign_pointer(ht->future_tbl, new_tbl);
+ -	synchronize_rcu();
+ +	ht->shift--;
+  
+ -	/* Link the first entry in the old bucket to the end of the
+ -	 * bucket in the new table. As entries are concurrently being
+ -	 * added to the new table, lock down the new bucket. As we
+ -	 * always divide the size in half when shrinking, each bucket
+ -	 * in the new table maps to exactly two buckets in the old
+ -	 * table.
+ -	 *
+ -	 * As removals can occur concurrently on the old table, we need
+ -	 * to lock down both matching buckets in the old table.
+ +	/* Link each bucket in the new table to the first bucket
+ +	 * in the old table that contains entries which will hash
+ +	 * to the new bucket.
+  	 */
+ -	for (new_hash = 0; new_hash < new_tbl->size; new_hash++) {
+ -		old_bucket_lock1 = bucket_lock(tbl, new_hash);
+ -		old_bucket_lock2 = bucket_lock(tbl, new_hash + new_tbl->size);
+ -		new_bucket_lock = bucket_lock(new_tbl, new_hash);
+ +	for (i = 0; i < ntbl->size; i++) {
+ +		ntbl->buckets[i] = tbl->buckets[i];
+ +		RCU_INIT_POINTER(*bucket_tail(ntbl, i),
+ +				 tbl->buckets[i + ntbl->size]);
+  
+++<<<<<<< HEAD
+++=======
++ 		spin_lock_bh(old_bucket_lock1);
++ 
++ 		/* Depending on the lock per buckets mapping, the bucket in
++ 		 * the lower and upper region may map to the same lock.
++ 		 */
++ 		if (old_bucket_lock1 != old_bucket_lock2) {
++ 			spin_lock_bh_nested(old_bucket_lock2, RHT_LOCK_NESTED);
++ 			spin_lock_bh_nested(new_bucket_lock, RHT_LOCK_NESTED2);
++ 		} else {
++ 			spin_lock_bh_nested(new_bucket_lock, RHT_LOCK_NESTED);
++ 		}
++ 
++ 		rcu_assign_pointer(*bucket_tail(new_tbl, new_hash),
++ 				   tbl->buckets[new_hash]);
++ 		rcu_assign_pointer(*bucket_tail(new_tbl, new_hash),
++ 				   tbl->buckets[new_hash + new_tbl->size]);
++ 
++ 		spin_unlock_bh(new_bucket_lock);
++ 		if (old_bucket_lock1 != old_bucket_lock2)
++ 			spin_unlock_bh(old_bucket_lock2);
++ 		spin_unlock_bh(old_bucket_lock1);
+++>>>>>>> 80ca8c3a84c7 (rhashtable: Lower/upper bucket may map to same lock while shrinking)
+  	}
+  
+  	/* Publish the new, valid hash table */
+* Unmerged path lib/rhashtable.c
