@@ -653,6 +653,7 @@ int ip_defrag(struct sk_buff *skb, u32 user)
 
 	net = skb->dev ? dev_net(skb->dev) : dev_net(skb_dst(skb)->dev);
 	IP_INC_STATS_BH(net, IPSTATS_MIB_REASMREQDS);
+	skb_orphan(skb);
 
 	/* Start by cleaning up the memory. */
 	ip_evictor(net);
