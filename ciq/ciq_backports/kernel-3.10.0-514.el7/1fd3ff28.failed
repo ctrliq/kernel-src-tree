@@ -1,0 +1,262 @@
+cpufreq: powernv: Move smp_call_function_any() out of irq safe block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [cpufreq] powernv: Move smp_call_function_any() out of irq safe block (Gustavo Duarte) [1346255]
+Rebuild_FUZZ: 92.91%
+commit-author Akshay Adiga <akshay.adiga@linux.vnet.ibm.com>
+commit 1fd3ff2874f79c04354f3e80e583afbe6fa6eaa2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1fd3ff28.failed
+
+Fix a WARN_ON caused by smp_call_function_any() when irq is disabled,
+because of changes made in the patch ('cpufreq: powernv: Ramp-down
+ global pstate slower than local-pstate')
+https://patchwork.ozlabs.org/patch/612058/
+
+ WARNING: CPU: 0 PID: 4 at kernel/smp.c:291
+smp_call_function_single+0x170/0x180
+
+ Call Trace:
+ [c0000007f648f9f0] [c0000007f648fa90] 0xc0000007f648fa90 (unreliable)
+ [c0000007f648fa30] [c0000000001430e0] smp_call_function_any+0x170/0x1c0
+ [c0000007f648fa90] [c0000000007b4b00]
+powernv_cpufreq_target_index+0xe0/0x250
+ [c0000007f648fb00] [c0000000007ac9dc]
+__cpufreq_driver_target+0x20c/0x3d0
+ [c0000007f648fbc0] [c0000000007b1b4c] od_dbs_timer+0xcc/0x260
+ [c0000007f648fc10] [c0000000007b3024] dbs_work_handler+0x54/0xa0
+ [c0000007f648fc50] [c0000000000c49a8] process_one_work+0x1d8/0x590
+ [c0000007f648fce0] [c0000000000c4e08] worker_thread+0xa8/0x660
+ [c0000007f648fd80] [c0000000000cca88] kthread+0x108/0x130
+ [c0000007f648fe30] [c0000000000095e8] ret_from_kernel_thread+0x5c/0x74
+
+- Calling smp_call_function_any() with interrupt disabled (through
+ spin_lock_irqsave) could cause a deadlock, as smp_call_function_any()
+ relies on the IPI to complete. This is detected in the
+ smp_call_function_any() call and hence the WARN_ON.
+
+- As the spinlock (gpstates->lock) is only used to synchronize access of
+ global_pstate_info  between timer irq handler and target_index calls. And
+ the timer irq handler just try_locks() hence it would not cause a
+ deadlock. Hence could do without making spinlocks irq safe.
+
+- As the smp_call_function_any() is a blocking call and does not access
+ global_pstates_info, it could reduce the critcal section by moving
+ smp_call_function_any() after giving up the lock.
+
+	Reported-by: Abdul Haleem <abdhalee@linux.vnet.linux.com>
+	Signed-off-by: Akshay Adiga <akshay.adiga@linux.vnet.ibm.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1fd3ff2874f79c04354f3e80e583afbe6fa6eaa2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/powernv-cpufreq.c
+diff --cc drivers/cpufreq/powernv-cpufreq.c
+index f171dd3496cc,1f0e20ccc2ff..000000000000
+--- a/drivers/cpufreq/powernv-cpufreq.c
++++ b/drivers/cpufreq/powernv-cpufreq.c
+@@@ -363,6 -482,111 +363,114 @@@ next
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * calc_global_pstate - Calculate global pstate
++  * @elapsed_time:	Elapsed time in milliseconds
++  * @local_pstate:	New local pstate
++  * @highest_lpstate:	pstate from which its ramping down
++  *
++  * Finds the appropriate global pstate based on the pstate from which its
++  * ramping down and the time elapsed in ramping down. It follows a quadratic
++  * equation which ensures that it reaches ramping down to pmin in 5sec.
++  */
++ static inline int calc_global_pstate(unsigned int elapsed_time,
++ 				     int highest_lpstate, int local_pstate)
++ {
++ 	int pstate_diff;
++ 
++ 	/*
++ 	 * Using ramp_down_percent we get the percentage of rampdown
++ 	 * that we are expecting to be dropping. Difference between
++ 	 * highest_lpstate and powernv_pstate_info.min will give a absolute
++ 	 * number of how many pstates we will drop eventually by the end of
++ 	 * 5 seconds, then just scale it get the number pstates to be dropped.
++ 	 */
++ 	pstate_diff =  ((int)ramp_down_percent(elapsed_time) *
++ 			(highest_lpstate - powernv_pstate_info.min)) / 100;
++ 
++ 	/* Ensure that global pstate is >= to local pstate */
++ 	if (highest_lpstate - pstate_diff < local_pstate)
++ 		return local_pstate;
++ 	else
++ 		return highest_lpstate - pstate_diff;
++ }
++ 
++ static inline void  queue_gpstate_timer(struct global_pstate_info *gpstates)
++ {
++ 	unsigned int timer_interval;
++ 
++ 	/*
++ 	 * Setting up timer to fire after GPSTATE_TIMER_INTERVAL ms, But
++ 	 * if it exceeds MAX_RAMP_DOWN_TIME ms for ramp down time.
++ 	 * Set timer such that it fires exactly at MAX_RAMP_DOWN_TIME
++ 	 * seconds of ramp down time.
++ 	 */
++ 	if ((gpstates->elapsed_time + GPSTATE_TIMER_INTERVAL)
++ 	     > MAX_RAMP_DOWN_TIME)
++ 		timer_interval = MAX_RAMP_DOWN_TIME - gpstates->elapsed_time;
++ 	else
++ 		timer_interval = GPSTATE_TIMER_INTERVAL;
++ 
++ 	mod_timer_pinned(&gpstates->timer, jiffies +
++ 			msecs_to_jiffies(timer_interval));
++ }
++ 
++ /**
++  * gpstate_timer_handler
++  *
++  * @data: pointer to cpufreq_policy on which timer was queued
++  *
++  * This handler brings down the global pstate closer to the local pstate
++  * according quadratic equation. Queues a new timer if it is still not equal
++  * to local pstate
++  */
++ void gpstate_timer_handler(unsigned long data)
++ {
++ 	struct cpufreq_policy *policy = (struct cpufreq_policy *)data;
++ 	struct global_pstate_info *gpstates = policy->driver_data;
++ 	int gpstate_id;
++ 	unsigned int time_diff = jiffies_to_msecs(jiffies)
++ 					- gpstates->last_sampled_time;
++ 	struct powernv_smp_call_data freq_data;
++ 
++ 	if (!spin_trylock(&gpstates->gpstate_lock))
++ 		return;
++ 
++ 	gpstates->last_sampled_time += time_diff;
++ 	gpstates->elapsed_time += time_diff;
++ 	freq_data.pstate_id = gpstates->last_lpstate;
++ 
++ 	if ((gpstates->last_gpstate == freq_data.pstate_id) ||
++ 	    (gpstates->elapsed_time > MAX_RAMP_DOWN_TIME)) {
++ 		gpstate_id = freq_data.pstate_id;
++ 		reset_gpstates(policy);
++ 		gpstates->highest_lpstate = freq_data.pstate_id;
++ 	} else {
++ 		gpstate_id = calc_global_pstate(gpstates->elapsed_time,
++ 						gpstates->highest_lpstate,
++ 						freq_data.pstate_id);
++ 	}
++ 
++ 	/*
++ 	 * If local pstate is equal to global pstate, rampdown is over
++ 	 * So timer is not required to be queued.
++ 	 */
++ 	if (gpstate_id != freq_data.pstate_id)
++ 		queue_gpstate_timer(gpstates);
++ 
++ 	freq_data.gpstate_id = gpstate_id;
++ 	gpstates->last_gpstate = freq_data.gpstate_id;
++ 	gpstates->last_lpstate = freq_data.pstate_id;
++ 
++ 	spin_unlock(&gpstates->gpstate_lock);
++ 
++ 	/* Timer may get migrated to a different cpu on cpu hot unplug */
++ 	smp_call_function_any(policy->cpus, set_pstate, &freq_data, 1);
++ }
++ 
+++>>>>>>> 1fd3ff2874f7 (cpufreq: powernv: Move smp_call_function_any() out of irq safe block)
+  /*
+   * powernv_cpufreq_target_index: Sets the frequency corresponding to
+   * the cpufreq table entry indexed by new_index on the cpus in the
+@@@ -372,6 -596,8 +480,11 @@@ static int powernv_cpufreq_target_index
+  					unsigned int new_index)
+  {
+  	struct powernv_smp_call_data freq_data;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int cur_msec, gpstate_id;
++ 	struct global_pstate_info *gpstates = policy->driver_data;
+++>>>>>>> 1fd3ff2874f7 (cpufreq: powernv: Move smp_call_function_any() out of irq safe block)
+  
+  	if (unlikely(rebooting) && new_index != get_nominal_index())
+  		return 0;
+@@@ -379,15 -605,63 +492,72 @@@
+  	if (!throttled)
+  		powernv_cpufreq_throttle_check(NULL);
+  
+++<<<<<<< HEAD
+++	freq_data.pstate_id = powernv_freqs[new_index].driver_data;
+++
+++=======
++ 	cur_msec = jiffies_to_msecs(get_jiffies_64());
++ 
++ 	spin_lock(&gpstates->gpstate_lock);
+  	freq_data.pstate_id = powernv_freqs[new_index].driver_data;
+  
++ 	if (!gpstates->last_sampled_time) {
++ 		gpstate_id = freq_data.pstate_id;
++ 		gpstates->highest_lpstate = freq_data.pstate_id;
++ 		goto gpstates_done;
++ 	}
++ 
++ 	if (gpstates->last_gpstate > freq_data.pstate_id) {
++ 		gpstates->elapsed_time += cur_msec -
++ 						 gpstates->last_sampled_time;
++ 
++ 		/*
++ 		 * If its has been ramping down for more than MAX_RAMP_DOWN_TIME
++ 		 * we should be resetting all global pstate related data. Set it
++ 		 * equal to local pstate to start fresh.
++ 		 */
++ 		if (gpstates->elapsed_time > MAX_RAMP_DOWN_TIME) {
++ 			reset_gpstates(policy);
++ 			gpstates->highest_lpstate = freq_data.pstate_id;
++ 			gpstate_id = freq_data.pstate_id;
++ 		} else {
++ 		/* Elaspsed_time is less than 5 seconds, continue to rampdown */
++ 			gpstate_id = calc_global_pstate(gpstates->elapsed_time,
++ 							gpstates->highest_lpstate,
++ 							freq_data.pstate_id);
++ 		}
++ 	} else {
++ 		reset_gpstates(policy);
++ 		gpstates->highest_lpstate = freq_data.pstate_id;
++ 		gpstate_id = freq_data.pstate_id;
++ 	}
++ 
++ 	/*
++ 	 * If local pstate is equal to global pstate, rampdown is over
++ 	 * So timer is not required to be queued.
++ 	 */
++ 	if (gpstate_id != freq_data.pstate_id)
++ 		queue_gpstate_timer(gpstates);
++ 
++ gpstates_done:
++ 	freq_data.gpstate_id = gpstate_id;
++ 	gpstates->last_sampled_time = cur_msec;
++ 	gpstates->last_gpstate = freq_data.gpstate_id;
++ 	gpstates->last_lpstate = freq_data.pstate_id;
++ 
++ 	spin_unlock(&gpstates->gpstate_lock);
++ 
+++>>>>>>> 1fd3ff2874f7 (cpufreq: powernv: Move smp_call_function_any() out of irq safe block)
+  	/*
+  	 * Use smp_call_function to send IPI and execute the
+  	 * mtspr on target CPU.  We could do that without IPI
+  	 * if current CPU is within policy->cpus (core)
+  	 */
+  	smp_call_function_any(policy->cpus, set_pstate, &freq_data, 1);
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> 1fd3ff2874f7 (cpufreq: powernv: Move smp_call_function_any() out of irq safe block)
+  	return 0;
+  }
+  
+* Unmerged path drivers/cpufreq/powernv-cpufreq.c
