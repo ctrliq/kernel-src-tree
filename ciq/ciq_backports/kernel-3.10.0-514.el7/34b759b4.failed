@@ -1,0 +1,359 @@
+ceph: kill ceph_empty_snapc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 34b759b4a22b0acb82423389a24699357798cf3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34b759b4.failed
+
+ceph_empty_snapc->num_snaps == 0 at all times.  Passing such a snapc to
+ceph_osdc_alloc_request() (possibly through ceph_osdc_new_request()) is
+equivalent to passing NULL, as ceph_osdc_alloc_request() uses it only
+for sizing the request message.
+
+Further, in all four cases the subsequent ceph_osdc_build_request() is
+passed NULL for snapc, meaning that 0 is encoded for seq and num_snaps
+and making ceph_empty_snapc entirely useless.  The two cases where it
+actually mattered were removed in commits 860560904962 ("ceph: avoid
+sending unnessesary FLUSHSNAP message") and 23078637e054 ("ceph: fix
+queuing inode to mdsdir's snaprealm").
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by:  Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 34b759b4a22b0acb82423389a24699357798cf3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/snap.c
+diff --cc fs/ceph/addr.c
+index 7ae8e963f398,888674c311c5..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -1581,8 -1609,7 +1581,12 @@@ int ceph_uninline_data(struct file *fil
+  				    ceph_vino(inode), 0, &len, 0, 1,
+  				    CEPH_OSD_OP_CREATE,
+  				    CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_WRITE,
+++<<<<<<< HEAD
+ +				    ci->i_snap_realm->cached_context,
+ +				    0, 0, false);
+++=======
++ 				    NULL, 0, 0, false);
+++>>>>>>> 34b759b4a22b (ceph: kill ceph_empty_snapc)
+  	if (IS_ERR(req)) {
+  		err = PTR_ERR(req);
+  		goto out;
+@@@ -1600,9 -1627,8 +1604,14 @@@
+  				    ceph_vino(inode), 0, &len, 1, 3,
+  				    CEPH_OSD_OP_WRITE,
+  				    CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_WRITE,
+++<<<<<<< HEAD
+ +				    ci->i_snap_realm->cached_context,
+ +				    ci->i_truncate_seq, ci->i_truncate_size,
+ +				    false);
+++=======
++ 				    NULL, ci->i_truncate_seq,
++ 				    ci->i_truncate_size, false);
+++>>>>>>> 34b759b4a22b (ceph: kill ceph_empty_snapc)
+  	if (IS_ERR(req)) {
+  		err = PTR_ERR(req);
+  		goto out;
+@@@ -1670,3 -1695,208 +1679,211 @@@ int ceph_mmap(struct file *file, struc
+  	vma->vm_ops = &ceph_vmops;
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ enum {
++ 	POOL_READ	= 1,
++ 	POOL_WRITE	= 2,
++ };
++ 
++ static int __ceph_pool_perm_get(struct ceph_inode_info *ci, u32 pool)
++ {
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(&ci->vfs_inode);
++ 	struct ceph_mds_client *mdsc = fsc->mdsc;
++ 	struct ceph_osd_request *rd_req = NULL, *wr_req = NULL;
++ 	struct rb_node **p, *parent;
++ 	struct ceph_pool_perm *perm;
++ 	struct page **pages;
++ 	int err = 0, err2 = 0, have = 0;
++ 
++ 	down_read(&mdsc->pool_perm_rwsem);
++ 	p = &mdsc->pool_perm_tree.rb_node;
++ 	while (*p) {
++ 		perm = rb_entry(*p, struct ceph_pool_perm, node);
++ 		if (pool < perm->pool)
++ 			p = &(*p)->rb_left;
++ 		else if (pool > perm->pool)
++ 			p = &(*p)->rb_right;
++ 		else {
++ 			have = perm->perm;
++ 			break;
++ 		}
++ 	}
++ 	up_read(&mdsc->pool_perm_rwsem);
++ 	if (*p)
++ 		goto out;
++ 
++ 	dout("__ceph_pool_perm_get pool %u no perm cached\n", pool);
++ 
++ 	down_write(&mdsc->pool_perm_rwsem);
++ 	parent = NULL;
++ 	while (*p) {
++ 		parent = *p;
++ 		perm = rb_entry(parent, struct ceph_pool_perm, node);
++ 		if (pool < perm->pool)
++ 			p = &(*p)->rb_left;
++ 		else if (pool > perm->pool)
++ 			p = &(*p)->rb_right;
++ 		else {
++ 			have = perm->perm;
++ 			break;
++ 		}
++ 	}
++ 	if (*p) {
++ 		up_write(&mdsc->pool_perm_rwsem);
++ 		goto out;
++ 	}
++ 
++ 	rd_req = ceph_osdc_alloc_request(&fsc->client->osdc, NULL,
++ 					 1, false, GFP_NOFS);
++ 	if (!rd_req) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	rd_req->r_flags = CEPH_OSD_FLAG_READ;
++ 	osd_req_op_init(rd_req, 0, CEPH_OSD_OP_STAT, 0);
++ 	rd_req->r_base_oloc.pool = pool;
++ 	snprintf(rd_req->r_base_oid.name, sizeof(rd_req->r_base_oid.name),
++ 		 "%llx.00000000", ci->i_vino.ino);
++ 	rd_req->r_base_oid.name_len = strlen(rd_req->r_base_oid.name);
++ 
++ 	wr_req = ceph_osdc_alloc_request(&fsc->client->osdc, NULL,
++ 					 1, false, GFP_NOFS);
++ 	if (!wr_req) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	wr_req->r_flags = CEPH_OSD_FLAG_WRITE |
++ 			  CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
++ 	osd_req_op_init(wr_req, 0, CEPH_OSD_OP_CREATE, CEPH_OSD_OP_FLAG_EXCL);
++ 	wr_req->r_base_oloc.pool = pool;
++ 	wr_req->r_base_oid = rd_req->r_base_oid;
++ 
++ 	/* one page should be large enough for STAT data */
++ 	pages = ceph_alloc_page_vector(1, GFP_KERNEL);
++ 	if (IS_ERR(pages)) {
++ 		err = PTR_ERR(pages);
++ 		goto out_unlock;
++ 	}
++ 
++ 	osd_req_op_raw_data_in_pages(rd_req, 0, pages, PAGE_SIZE,
++ 				     0, false, true);
++ 	ceph_osdc_build_request(rd_req, 0, NULL, CEPH_NOSNAP,
++ 				&ci->vfs_inode.i_mtime);
++ 	err = ceph_osdc_start_request(&fsc->client->osdc, rd_req, false);
++ 
++ 	ceph_osdc_build_request(wr_req, 0, NULL, CEPH_NOSNAP,
++ 				&ci->vfs_inode.i_mtime);
++ 	err2 = ceph_osdc_start_request(&fsc->client->osdc, wr_req, false);
++ 
++ 	if (!err)
++ 		err = ceph_osdc_wait_request(&fsc->client->osdc, rd_req);
++ 	if (!err2)
++ 		err2 = ceph_osdc_wait_request(&fsc->client->osdc, wr_req);
++ 
++ 	if (err >= 0 || err == -ENOENT)
++ 		have |= POOL_READ;
++ 	else if (err != -EPERM)
++ 		goto out_unlock;
++ 
++ 	if (err2 == 0 || err2 == -EEXIST)
++ 		have |= POOL_WRITE;
++ 	else if (err2 != -EPERM) {
++ 		err = err2;
++ 		goto out_unlock;
++ 	}
++ 
++ 	perm = kmalloc(sizeof(*perm), GFP_NOFS);
++ 	if (!perm) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	perm->pool = pool;
++ 	perm->perm = have;
++ 	rb_link_node(&perm->node, parent, p);
++ 	rb_insert_color(&perm->node, &mdsc->pool_perm_tree);
++ 	err = 0;
++ out_unlock:
++ 	up_write(&mdsc->pool_perm_rwsem);
++ 
++ 	if (rd_req)
++ 		ceph_osdc_put_request(rd_req);
++ 	if (wr_req)
++ 		ceph_osdc_put_request(wr_req);
++ out:
++ 	if (!err)
++ 		err = have;
++ 	dout("__ceph_pool_perm_get pool %u result = %d\n", pool, err);
++ 	return err;
++ }
++ 
++ int ceph_pool_perm_check(struct ceph_inode_info *ci, int need)
++ {
++ 	u32 pool;
++ 	int ret, flags;
++ 
++ 	/* does not support pool namespace yet */
++ 	if (ci->i_pool_ns_len)
++ 		return -EIO;
++ 
++ 	if (ceph_test_mount_opt(ceph_inode_to_client(&ci->vfs_inode),
++ 				NOPOOLPERM))
++ 		return 0;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	flags = ci->i_ceph_flags;
++ 	pool = ceph_file_layout_pg_pool(ci->i_layout);
++ 	spin_unlock(&ci->i_ceph_lock);
++ check:
++ 	if (flags & CEPH_I_POOL_PERM) {
++ 		if ((need & CEPH_CAP_FILE_RD) && !(flags & CEPH_I_POOL_RD)) {
++ 			dout("ceph_pool_perm_check pool %u no read perm\n",
++ 			     pool);
++ 			return -EPERM;
++ 		}
++ 		if ((need & CEPH_CAP_FILE_WR) && !(flags & CEPH_I_POOL_WR)) {
++ 			dout("ceph_pool_perm_check pool %u no write perm\n",
++ 			     pool);
++ 			return -EPERM;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	ret = __ceph_pool_perm_get(ci, pool);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	flags = CEPH_I_POOL_PERM;
++ 	if (ret & POOL_READ)
++ 		flags |= CEPH_I_POOL_RD;
++ 	if (ret & POOL_WRITE)
++ 		flags |= CEPH_I_POOL_WR;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if (pool == ceph_file_layout_pg_pool(ci->i_layout)) {
++ 		ci->i_ceph_flags = flags;
++         } else {
++ 		pool = ceph_file_layout_pg_pool(ci->i_layout);
++ 		flags = ci->i_ceph_flags;
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 	goto check;
++ }
++ 
++ void ceph_pool_perm_destroy(struct ceph_mds_client *mdsc)
++ {
++ 	struct ceph_pool_perm *perm;
++ 	struct rb_node *n;
++ 
++ 	while (!RB_EMPTY_ROOT(&mdsc->pool_perm_tree)) {
++ 		n = rb_first(&mdsc->pool_perm_tree);
++ 		perm = rb_entry(n, struct ceph_pool_perm, node);
++ 		rb_erase(n, &mdsc->pool_perm_tree);
++ 		kfree(perm);
++ 	}
++ }
+++>>>>>>> 34b759b4a22b (ceph: kill ceph_empty_snapc)
+diff --cc fs/ceph/snap.c
+index 1a61764cd591,9caaa7ffc93f..000000000000
+--- a/fs/ceph/snap.c
++++ b/fs/ceph/snap.c
+@@@ -296,8 -296,6 +296,11 @@@ static int cmpu64_rev(const void *a, co
+  }
+  
+  
+++<<<<<<< HEAD
+ +static struct ceph_snap_context *empty_snapc;
+ +
+++=======
+++>>>>>>> 34b759b4a22b (ceph: kill ceph_empty_snapc)
+  /*
+   * build the snap context for a given realm.
+   */
+@@@ -963,17 -985,3 +966,20 @@@ out
+  		up_write(&mdsc->snap_rwsem);
+  	return;
+  }
+++<<<<<<< HEAD
+ +
+ +int __init ceph_snap_init(void)
+ +{
+ +	empty_snapc = ceph_create_snap_context(0, GFP_NOFS);
+ +	if (!empty_snapc)
+ +		return -ENOMEM;
+ +	empty_snapc->seq = 1;
+ +	return 0;
+ +}
+ +
+ +void ceph_snap_exit(void)
+ +{
+ +	ceph_put_snap_context(empty_snapc);
+ +}
+++=======
+++>>>>>>> 34b759b4a22b (ceph: kill ceph_empty_snapc)
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/snap.c
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index 504164e76582..3b1d76133526 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -970,19 +970,14 @@ static int __init init_ceph(void)
+ 
+ 	ceph_flock_init();
+ 	ceph_xattr_init();
+-	ret = ceph_snap_init();
+-	if (ret)
+-		goto out_xattr;
+ 	ret = register_filesystem(&ceph_fs_type);
+ 	if (ret)
+-		goto out_snap;
++		goto out_xattr;
+ 
+ 	pr_info("loaded (mds proto %d)\n", CEPH_MDSC_PROTOCOL);
+ 
+ 	return 0;
+ 
+-out_snap:
+-	ceph_snap_exit();
+ out_xattr:
+ 	ceph_xattr_exit();
+ 	destroy_caches();
+@@ -994,7 +989,6 @@ static void __exit exit_ceph(void)
+ {
+ 	dout("exit_ceph\n");
+ 	unregister_filesystem(&ceph_fs_type);
+-	ceph_snap_exit();
+ 	ceph_xattr_exit();
+ 	destroy_caches();
+ }
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 1c439e8e6c74..c8585c8844f2 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -705,8 +705,6 @@ extern void ceph_queue_cap_snap(struct ceph_inode_info *ci);
+ extern int __ceph_finish_cap_snap(struct ceph_inode_info *ci,
+ 				  struct ceph_cap_snap *capsnap);
+ extern void ceph_cleanup_empty_realms(struct ceph_mds_client *mdsc);
+-extern int ceph_snap_init(void);
+-extern void ceph_snap_exit(void);
+ 
+ /*
+  * a cap_snap is "pending" if it is still awaiting an in-progress
