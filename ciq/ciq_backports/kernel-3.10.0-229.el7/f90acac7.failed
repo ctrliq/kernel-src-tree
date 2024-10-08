@@ -1,0 +1,279 @@
+perf probe: Find given address from offline dwarf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [tools] perf/probe: Find given address from offline dwarf (Jiri Olsa) [1134356]
+Rebuild_FUZZ: 97.96%
+commit-author Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+commit f90acac75713cc6f18a4b2f1b9162bc1cd893c20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f90acac7.failed
+
+Find the given address from offline dwarfs instead of online kernel
+dwarfs.
+
+On the KASLR enabled kernel, the kernel text section is loaded with
+random offset, and the debuginfo__new_online_kernel can't handle it. So
+let's move to the offline dwarf loader instead of using the online dwarf
+loader.
+
+As a result, since we don't need debuginfo__new_online_kernel any more,
+this also removes the functions related to that.
+
+Without this change;
+
+  # ./perf probe -l
+    probe:t_show         (on _stext+901288 with m v)
+    probe:t_show_1       (on _stext+939624 with m v t)
+    probe:t_show_2       (on _stext+980296 with m v fmt)
+    probe:t_show_3       (on _stext+1014392 with m v file)
+
+With this change;
+
+  # ./perf probe -l
+    probe:t_show         (on t_show@linux-3/kernel/trace/ftrace.c with m v)
+    probe:t_show_1       (on t_show@linux-3/kernel/trace/trace.c with m v t)
+    probe:t_show_2       (on t_show@kernel/trace/trace_printk.c with m v fmt)
+    probe:t_show_3       (on t_show@kernel/trace/trace_events.c with m v file)
+
+Changes from v2:
+ - Instead of retrying, directly opens offline dwarf.
+ - Remove debuginfo__new_online_kernel and related functions.
+ - Refer map->reloc to get the correct address of a symbol.
+ - Add a special case for handling ref_reloc_sym based address.
+
+	Signed-off-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: "David A. Long" <dave.long@linaro.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: yrl.pp-manager.tt@hitachi.com
+Link: http://lkml.kernel.org/r/20140206053218.29635.74821.stgit@kbuild-fedora.yrl.intra.hitachi.co.jp
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f90acac75713cc6f18a4b2f1b9162bc1cd893c20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/probe-event.c
+#	tools/perf/util/probe-finder.c
+#	tools/perf/util/probe-finder.h
+diff --cc tools/perf/util/probe-event.c
+index 1c9c96559614,8e34c8d47813..000000000000
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@@ -294,6 -404,50 +315,53 @@@ static int add_module_to_probe_trace_ev
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Post processing the probe events */
++ static int post_process_probe_trace_events(struct probe_trace_event *tevs,
++ 					   int ntevs, const char *module,
++ 					   bool uprobe)
++ {
++ 	struct ref_reloc_sym *reloc_sym;
++ 	char *tmp;
++ 	int i;
++ 
++ 	if (uprobe)
++ 		return add_exec_to_probe_trace_events(tevs, ntevs, module);
++ 
++ 	/* Note that currently ref_reloc_sym based probe is not for drivers */
++ 	if (module)
++ 		return add_module_to_probe_trace_events(tevs, ntevs, module);
++ 
++ 	reloc_sym = __kernel_get_ref_reloc_sym();
++ 	if (!reloc_sym) {
++ 		pr_warning("Relocated base symbol is not found!\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	for (i = 0; i < ntevs; i++) {
++ 		if (tevs[i].point.address) {
++ 			tmp = strdup(reloc_sym->name);
++ 			if (!tmp)
++ 				return -ENOMEM;
++ 			free(tevs[i].point.symbol);
++ 			tevs[i].point.symbol = tmp;
++ 			tevs[i].point.offset = tevs[i].point.address -
++ 					       reloc_sym->unrelocated_addr;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static void clear_probe_trace_events(struct probe_trace_event *tevs, int ntevs)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ntevs; i++)
++ 		clear_probe_trace_event(tevs + i);
++ }
++ 
+++>>>>>>> f90acac75713 (perf probe: Find given address from offline dwarf)
+  /* Try to find perf_probe_event with debuginfo */
+  static int try_to_find_probe_trace_events(struct perf_probe_event *pev,
+  					  struct probe_trace_event **tevs,
+diff --cc tools/perf/util/probe-finder.c
+index cc3411b9db28,4f6e277c457c..000000000000
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@@ -89,113 -89,24 +89,120 @@@ error
+  	return -ENOENT;
+  }
+  
+++<<<<<<< HEAD
+ +#if _ELFUTILS_PREREQ(0, 148)
+ +/* This method is buggy if elfutils is older than 0.148 */
+ +static int __linux_kernel_find_elf(Dwfl_Module *mod,
+ +				   void **userdata,
+ +				   const char *module_name,
+ +				   Dwarf_Addr base,
+ +				   char **file_name, Elf **elfp)
+ +{
+ +	int fd;
+ +	const char *path = kernel_get_module_path(module_name);
+ +
+ +	pr_debug2("Use file %s for %s\n", path, module_name);
+ +	if (path) {
+ +		fd = open(path, O_RDONLY);
+ +		if (fd >= 0) {
+ +			*file_name = strdup(path);
+ +			return fd;
+ +		}
+ +	}
+ +	/* If failed, try to call standard method */
+ +	return dwfl_linux_kernel_find_elf(mod, userdata, module_name, base,
+ +					  file_name, elfp);
+ +}
+ +
+ +static const Dwfl_Callbacks kernel_callbacks = {
+ +	.find_debuginfo = dwfl_standard_find_debuginfo,
+ +	.debuginfo_path = &debuginfo_path,
+ +
+ +	.find_elf = __linux_kernel_find_elf,
+ +	.section_address = dwfl_linux_kernel_module_section_address,
+ +};
+ +
+ +/* Get a Dwarf from live kernel image */
+ +static int debuginfo__init_online_kernel_dwarf(struct debuginfo *self,
+ +					       Dwarf_Addr addr)
+ +{
+ +	self->dwfl = dwfl_begin(&kernel_callbacks);
+ +	if (!self->dwfl)
+ +		return -EINVAL;
+ +
+ +	/* Load the kernel dwarves: Don't care the result here */
+ +	dwfl_linux_kernel_report_kernel(self->dwfl);
+ +	dwfl_linux_kernel_report_modules(self->dwfl);
+ +
+ +	self->dbg = dwfl_addrdwarf(self->dwfl, addr, &self->bias);
+ +	/* Here, check whether we could get a real dwarf */
+ +	if (!self->dbg) {
+ +		pr_debug("Failed to find kernel dwarf at %lx\n",
+ +			 (unsigned long)addr);
+ +		dwfl_end(self->dwfl);
+ +		memset(self, 0, sizeof(*self));
+ +		return -ENOENT;
+ +	}
+ +
+ +	return 0;
+ +}
+ +#else
+ +/* With older elfutils, this just support kernel module... */
+ +static int debuginfo__init_online_kernel_dwarf(struct debuginfo *self,
+ +					       Dwarf_Addr addr __maybe_unused)
+ +{
+ +	const char *path = kernel_get_module_path("kernel");
+ +
+ +	if (!path) {
+ +		pr_err("Failed to find vmlinux path\n");
+ +		return -ENOENT;
+ +	}
+ +
+ +	pr_debug2("Use file %s for debuginfo\n", path);
+ +	return debuginfo__init_offline_dwarf(self, path);
+ +}
+ +#endif
+ +
+++=======
+++>>>>>>> f90acac75713 (perf probe: Find given address from offline dwarf)
+  struct debuginfo *debuginfo__new(const char *path)
+  {
+ -	struct debuginfo *dbg = zalloc(sizeof(*dbg));
+ -	if (!dbg)
+ +	struct debuginfo *self = zalloc(sizeof(struct debuginfo));
+ +	if (!self)
+  		return NULL;
+  
+ -	if (debuginfo__init_offline_dwarf(dbg, path) < 0)
+ -		zfree(&dbg);
+ +	if (debuginfo__init_offline_dwarf(self, path) < 0) {
+ +		free(self);
+ +		self = NULL;
+ +	}
+ +
+ +	return self;
+ +}
+ +
+++<<<<<<< HEAD
+ +struct debuginfo *debuginfo__new_online_kernel(unsigned long addr)
+ +{
+ +	struct debuginfo *self = zalloc(sizeof(struct debuginfo));
+ +	if (!self)
+ +		return NULL;
+ +
+ +	if (debuginfo__init_online_kernel_dwarf(self, (Dwarf_Addr)addr) < 0) {
+ +		free(self);
+ +		self = NULL;
+ +	}
+  
+ -	return dbg;
+ +	return self;
+  }
+  
+ +void debuginfo__delete(struct debuginfo *self)
+++=======
++ void debuginfo__delete(struct debuginfo *dbg)
+++>>>>>>> f90acac75713 (perf probe: Find given address from offline dwarf)
+  {
+ -	if (dbg) {
+ -		if (dbg->dwfl)
+ -			dwfl_end(dbg->dwfl);
+ -		free(dbg);
+ +	if (self) {
+ +		if (self->dwfl)
+ +			dwfl_end(self->dwfl);
+ +		free(self);
+  	}
+  }
+  
+diff --cc tools/perf/util/probe-finder.h
+index 1bb36fdb4e50,3fc597365ce6..000000000000
+--- a/tools/perf/util/probe-finder.h
++++ b/tools/perf/util/probe-finder.h
+@@@ -31,11 -31,10 +31,15 @@@ struct debuginfo 
+  };
+  
+  extern struct debuginfo *debuginfo__new(const char *path);
+++<<<<<<< HEAD
+ +extern struct debuginfo *debuginfo__new_online_kernel(unsigned long addr);
+ +extern void debuginfo__delete(struct debuginfo *self);
+++=======
++ extern void debuginfo__delete(struct debuginfo *dbg);
+++>>>>>>> f90acac75713 (perf probe: Find given address from offline dwarf)
+  
+  /* Find probe_trace_events specified by perf_probe_event from debuginfo */
+ -extern int debuginfo__find_trace_events(struct debuginfo *dbg,
+ +extern int debuginfo__find_trace_events(struct debuginfo *self,
+  					struct perf_probe_event *pev,
+  					struct probe_trace_event **tevs,
+  					int max_tevs);
+* Unmerged path tools/perf/util/probe-event.c
+* Unmerged path tools/perf/util/probe-finder.c
+* Unmerged path tools/perf/util/probe-finder.h
