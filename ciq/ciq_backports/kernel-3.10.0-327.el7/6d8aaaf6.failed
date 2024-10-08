@@ -1,0 +1,314 @@
+sfc: create VEB vswitch and vport above default firmware setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Daniel Pieczko <dpieczko@solarflare.com>
+commit 6d8aaaf6f7980af1d228061ec08f6411e6bb2344
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6d8aaaf6.failed
+
+Adds functions to allocate and free vswitches and vports; vadaptors
+are automatically allocated and freed when TX/RX queues are
+initialised and finalised.  This vswitching structure is only created
+if the firmware supports it, so a check that full-featured firmware
+is running is performed first.
+
+If the MC resets, the vswitching infrastructure will need to be
+recreated, so mark the "must_probe_vswitching" flag when an MC reboot
+is detected.
+
+Don't try to create a vswitch if vf-count=0
+
+This allocation of vswitches and vports does not currently support
+configuring VLAN tags, but that can be added in a future change.
+
+	Signed-off-by: Shradha Shah <sshah@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d8aaaf6f7980af1d228061ec08f6411e6bb2344)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+#	drivers/net/ethernet/sfc/siena.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index 61edbf385044,91a58962f188..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -3714,6 -3719,10 +3718,13 @@@ const struct efx_nic_type efx_hunt_a0_n
+  	.sriov_set_vf_vlan = efx_ef10_sriov_set_vf_vlan,
+  	.sriov_set_vf_spoofchk = efx_ef10_sriov_set_vf_spoofchk,
+  	.sriov_get_vf_config = efx_ef10_sriov_get_vf_config,
+++<<<<<<< HEAD
+++=======
++ 	.vswitching_probe = efx_ef10_vswitching_probe,
++ 	.vswitching_restore = efx_ef10_vswitching_restore,
++ 	.vswitching_remove = efx_ef10_vswitching_remove,
++ #endif
+++>>>>>>> 6d8aaaf6f798 (sfc: create VEB vswitch and vport above default firmware setup)
+  
+  	.revision = EFX_REV_HUNT_A0,
+  	.max_dma_mask = DMA_BIT_MASK(ESF_DZ_TX_KER_BUF_ADDR_WIDTH),
+diff --cc drivers/net/ethernet/sfc/siena.c
+index 49792287dd67,5c2995eafd00..000000000000
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@@ -1009,6 -1011,10 +1009,13 @@@ const struct efx_nic_type siena_a0_nic_
+  	.sriov_set_vf_vlan = efx_siena_sriov_set_vf_vlan,
+  	.sriov_set_vf_spoofchk = efx_siena_sriov_set_vf_spoofchk,
+  	.sriov_get_vf_config = efx_siena_sriov_get_vf_config,
+++<<<<<<< HEAD
+++=======
++ 	.vswitching_probe = efx_port_dummy_op_int,
++ 	.vswitching_restore = efx_port_dummy_op_int,
++ 	.vswitching_remove = efx_port_dummy_op_void,
++ #endif
+++>>>>>>> 6d8aaaf6f798 (sfc: create VEB vswitch and vport above default firmware setup)
+  
+  	.revision = EFX_REV_SIENA_A0,
+  	.txd_ptr_tbl_base = FR_BZ_TX_DESC_PTR_TBL,
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/ef10_sriov.c b/drivers/net/ethernet/sfc/ef10_sriov.c
+index 9e6a3e197e01..0d412aa7ebb5 100644
+--- a/drivers/net/ethernet/sfc/ef10_sriov.c
++++ b/drivers/net/ethernet/sfc/ef10_sriov.c
+@@ -50,3 +50,124 @@ int efx_ef10_sriov_configure(struct efx_nic *efx, int num_vfs)
+ 	return -EOPNOTSUPP;
+ #endif
+ }
++
++static int efx_ef10_vswitch_alloc(struct efx_nic *efx, unsigned int port_id,
++				  unsigned int vswitch_type)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_VSWITCH_ALLOC_IN_LEN);
++
++	MCDI_SET_DWORD(inbuf, VSWITCH_ALLOC_IN_UPSTREAM_PORT_ID, port_id);
++	MCDI_SET_DWORD(inbuf, VSWITCH_ALLOC_IN_TYPE, vswitch_type);
++	MCDI_SET_DWORD(inbuf, VSWITCH_ALLOC_IN_NUM_VLAN_TAGS, 0);
++	MCDI_POPULATE_DWORD_1(inbuf, VSWITCH_ALLOC_IN_FLAGS,
++			      VSWITCH_ALLOC_IN_FLAG_AUTO_PORT, 0);
++
++	return efx_mcdi_rpc(efx, MC_CMD_VSWITCH_ALLOC, inbuf, sizeof(inbuf),
++			    NULL, 0, NULL);
++}
++
++static int efx_ef10_vswitch_free(struct efx_nic *efx, unsigned int port_id)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_VSWITCH_FREE_IN_LEN);
++
++	MCDI_SET_DWORD(inbuf, VSWITCH_FREE_IN_UPSTREAM_PORT_ID, port_id);
++
++	return efx_mcdi_rpc(efx, MC_CMD_VSWITCH_FREE, inbuf, sizeof(inbuf),
++			    NULL, 0, NULL);
++}
++
++static int efx_ef10_vport_alloc(struct efx_nic *efx,
++				unsigned int port_id_in,
++				unsigned int vport_type,
++				unsigned int *port_id_out)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_VPORT_ALLOC_IN_LEN);
++	MCDI_DECLARE_BUF(outbuf, MC_CMD_VPORT_ALLOC_OUT_LEN);
++	size_t outlen;
++	int rc;
++
++	EFX_WARN_ON_PARANOID(!port_id_out);
++
++	MCDI_SET_DWORD(inbuf, VPORT_ALLOC_IN_UPSTREAM_PORT_ID, port_id_in);
++	MCDI_SET_DWORD(inbuf, VPORT_ALLOC_IN_TYPE, vport_type);
++	MCDI_SET_DWORD(inbuf, VPORT_ALLOC_IN_NUM_VLAN_TAGS, 0);
++	MCDI_POPULATE_DWORD_1(inbuf, VPORT_ALLOC_IN_FLAGS,
++			      VPORT_ALLOC_IN_FLAG_AUTO_PORT, 0);
++
++	rc = efx_mcdi_rpc(efx, MC_CMD_VPORT_ALLOC, inbuf, sizeof(inbuf),
++			  outbuf, sizeof(outbuf), &outlen);
++	if (rc)
++		return rc;
++	if (outlen < MC_CMD_VPORT_ALLOC_OUT_LEN)
++		return -EIO;
++
++	*port_id_out = MCDI_DWORD(outbuf, VPORT_ALLOC_OUT_VPORT_ID);
++	return 0;
++}
++
++static int efx_ef10_vport_free(struct efx_nic *efx, unsigned int port_id)
++{
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_VPORT_FREE_IN_LEN);
++
++	MCDI_SET_DWORD(inbuf, VPORT_FREE_IN_VPORT_ID, port_id);
++
++	return efx_mcdi_rpc(efx, MC_CMD_VPORT_FREE, inbuf, sizeof(inbuf),
++			    NULL, 0, NULL);
++}
++
++/* On top of the default firmware vswitch setup, create a VEB vswitch and
++ * expansion vport for use by this function.
++ */
++int efx_ef10_vswitching_probe(struct efx_nic *efx)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++	int rc;
++
++	if (pci_sriov_get_totalvfs(efx->pci_dev) <= 0)
++		return 0; /* vswitch not needed as we have no VFs */
++
++	rc = efx_ef10_vswitch_alloc(efx, EVB_PORT_ID_ASSIGNED,
++				    MC_CMD_VSWITCH_ALLOC_IN_VSWITCH_TYPE_VEB);
++	if (rc)
++		goto fail1;
++
++	rc = efx_ef10_vport_alloc(efx, EVB_PORT_ID_ASSIGNED,
++				  MC_CMD_VPORT_ALLOC_IN_VPORT_TYPE_NORMAL,
++				  &nic_data->vport_id);
++	if (rc)
++		goto fail2;
++
++	return 0;
++fail2:
++	efx_ef10_vswitch_free(efx, EVB_PORT_ID_ASSIGNED);
++fail1:
++	return rc;
++}
++
++int efx_ef10_vswitching_restore(struct efx_nic *efx)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++	int rc;
++
++	if (!nic_data->must_probe_vswitching)
++		return 0;
++
++	rc = efx_ef10_vswitching_probe(efx);
++
++	if (!rc)
++		nic_data->must_probe_vswitching = false;
++	return rc;
++}
++
++void efx_ef10_vswitching_remove(struct efx_nic *efx)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++
++	if (nic_data->vport_id == EVB_PORT_ID_ASSIGNED)
++		return; /* No vswitch was ever created */
++
++	efx_ef10_vport_free(efx, nic_data->vport_id);
++	nic_data->vport_id = EVB_PORT_ID_ASSIGNED;
++
++	efx_ef10_vswitch_free(efx, nic_data->vport_id);
++}
+diff --git a/drivers/net/ethernet/sfc/ef10_sriov.h b/drivers/net/ethernet/sfc/ef10_sriov.h
+index 6ea115e3c3f2..00d0ded3b75c 100644
+--- a/drivers/net/ethernet/sfc/ef10_sriov.h
++++ b/drivers/net/ethernet/sfc/ef10_sriov.h
+@@ -55,4 +55,8 @@ static inline int efx_ef10_sriov_get_vf_config(struct efx_nic *efx, int vf,
+ }
+ #endif /* CONFIG_SFC_SRIOV */
+ 
++int efx_ef10_vswitching_probe(struct efx_nic *efx);
++int efx_ef10_vswitching_restore(struct efx_nic *efx);
++void efx_ef10_vswitching_remove(struct efx_nic *efx);
++
+ #endif /* EF10_SRIOV_H */
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 76f94be1217a..22c59b1f3d77 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1720,21 +1720,33 @@ static int efx_probe_all(struct efx_nic *efx)
+ 	}
+ 	efx->rxq_entries = efx->txq_entries = EFX_DEFAULT_DMAQ_SIZE;
+ 
++#ifdef CONFIG_SFC_SRIOV
++	rc = efx->type->vswitching_probe(efx);
++	if (rc) /* not fatal; the PF will still work fine */
++		netif_warn(efx, probe, efx->net_dev,
++			   "failed to setup vswitching rc=%d;"
++			   " VFs may not function\n", rc);
++#endif
++
+ 	rc = efx_probe_filters(efx);
+ 	if (rc) {
+ 		netif_err(efx, probe, efx->net_dev,
+ 			  "failed to create filter tables\n");
+-		goto fail3;
++		goto fail4;
+ 	}
+ 
+ 	rc = efx_probe_channels(efx);
+ 	if (rc)
+-		goto fail4;
++		goto fail5;
+ 
+ 	return 0;
+ 
+- fail4:
++ fail5:
+ 	efx_remove_filters(efx);
++ fail4:
++#ifdef CONFIG_SFC_SRIOV
++	efx->type->vswitching_remove(efx);
++#endif
+  fail3:
+ 	efx_remove_port(efx);
+  fail2:
+@@ -1824,6 +1836,9 @@ static void efx_remove_all(struct efx_nic *efx)
+ {
+ 	efx_remove_channels(efx);
+ 	efx_remove_filters(efx);
++#ifdef CONFIG_SFC_SRIOV
++	efx->type->vswitching_remove(efx);
++#endif
+ 	efx_remove_port(efx);
+ 	efx_remove_nic(efx);
+ }
+@@ -2416,6 +2431,15 @@ int efx_reset_up(struct efx_nic *efx, enum reset_type method, bool ok)
+ 	rc = efx_enable_interrupts(efx);
+ 	if (rc)
+ 		goto fail;
++
++#ifdef CONFIG_SFC_SRIOV
++	rc = efx->type->vswitching_restore(efx);
++	if (rc) /* not fatal; the PF will still work fine */
++		netif_warn(efx, probe, efx->net_dev,
++			   "failed to restore vswitching rc=%d;"
++			   " VFs may not function\n", rc);
++#endif
++
+ 	efx_restore_filters(efx);
+ 	if (efx->type->sriov_reset)
+ 		efx->type->sriov_reset(efx);
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index a6f4d9aadd40..4bf046b25845 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -1344,6 +1344,9 @@ struct efx_nic_type {
+ 				     bool spoofchk);
+ 	int (*sriov_get_vf_config)(struct efx_nic *efx, int vf_i,
+ 				   struct ifla_vf_info *ivi);
++	int (*vswitching_probe)(struct efx_nic *efx);
++	int (*vswitching_restore)(struct efx_nic *efx);
++	void (*vswitching_remove)(struct efx_nic *efx);
+ 
+ 	int revision;
+ 	unsigned int txd_ptr_tbl_base;
+diff --git a/drivers/net/ethernet/sfc/nic.h b/drivers/net/ethernet/sfc/nic.h
+index ce965cc22a3b..3807c26b4f89 100644
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -492,6 +492,7 @@ enum {
+  * @rx_dpcpu_fw_id: Firmware ID of the RxDPCPU
+  * @tx_dpcpu_fw_id: Firmware ID of the TxDPCPU
+  * @vport_id: The function's vport ID, only relevant for PFs
++ * @must_probe_vswitching: Flag: vswitching has yet to be setup after MC reboot
+  */
+ struct efx_ef10_nic_data {
+ 	struct efx_buffer mcdi_buf;
+@@ -513,6 +514,7 @@ struct efx_ef10_nic_data {
+ 	unsigned int rx_dpcpu_fw_id;
+ 	unsigned int tx_dpcpu_fw_id;
+ 	unsigned int vport_id;
++	bool must_probe_vswitching;
+ };
+ 
+ int efx_init_sriov(void);
+* Unmerged path drivers/net/ethernet/sfc/siena.c
