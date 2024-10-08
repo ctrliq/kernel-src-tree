@@ -1,0 +1,126 @@
+clockevents: export clockevents_unbind_device instead of clockevents_unbind
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 32a158325acf12842764b1681f53903673f2f22e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/32a15832.failed
+
+It looks like clockevents_unbind is being exported by mistake as:
+- it is static;
+- it is not listed in include/linux/clockchips.h;
+- EXPORT_SYMBOL_GPL(clockevents_unbind) follows clockevents_unbind_device()
+  implementation.
+
+I think clockevents_unbind_device should be exported instead. This is going to
+be used to teardown Hyper-V clockevent devices on module unload.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 32a158325acf12842764b1681f53903673f2f22e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/clockevents.c
+diff --cc kernel/time/clockevents.c
+index ac1d2ea08259,888ecc114ddc..000000000000
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@@ -280,6 -289,90 +280,93 @@@ static void clockevents_notify_released
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Try to install a replacement clock event device
++  */
++ static int clockevents_replace(struct clock_event_device *ced)
++ {
++ 	struct clock_event_device *dev, *newdev = NULL;
++ 
++ 	list_for_each_entry(dev, &clockevent_devices, list) {
++ 		if (dev == ced || dev->mode != CLOCK_EVT_MODE_UNUSED)
++ 			continue;
++ 
++ 		if (!tick_check_replacement(newdev, dev))
++ 			continue;
++ 
++ 		if (!try_module_get(dev->owner))
++ 			continue;
++ 
++ 		if (newdev)
++ 			module_put(newdev->owner);
++ 		newdev = dev;
++ 	}
++ 	if (newdev) {
++ 		tick_install_replacement(newdev);
++ 		list_del_init(&ced->list);
++ 	}
++ 	return newdev ? 0 : -EBUSY;
++ }
++ 
++ /*
++  * Called with clockevents_mutex and clockevents_lock held
++  */
++ static int __clockevents_try_unbind(struct clock_event_device *ced, int cpu)
++ {
++ 	/* Fast track. Device is unused */
++ 	if (ced->mode == CLOCK_EVT_MODE_UNUSED) {
++ 		list_del_init(&ced->list);
++ 		return 0;
++ 	}
++ 
++ 	return ced == per_cpu(tick_cpu_device, cpu).evtdev ? -EAGAIN : -EBUSY;
++ }
++ 
++ /*
++  * SMP function call to unbind a device
++  */
++ static void __clockevents_unbind(void *arg)
++ {
++ 	struct ce_unbind *cu = arg;
++ 	int res;
++ 
++ 	raw_spin_lock(&clockevents_lock);
++ 	res = __clockevents_try_unbind(cu->ce, smp_processor_id());
++ 	if (res == -EAGAIN)
++ 		res = clockevents_replace(cu->ce);
++ 	cu->res = res;
++ 	raw_spin_unlock(&clockevents_lock);
++ }
++ 
++ /*
++  * Issues smp function call to unbind a per cpu device. Called with
++  * clockevents_mutex held.
++  */
++ static int clockevents_unbind(struct clock_event_device *ced, int cpu)
++ {
++ 	struct ce_unbind cu = { .ce = ced, .res = -ENODEV };
++ 
++ 	smp_call_function_single(cpu, __clockevents_unbind, &cu, 1);
++ 	return cu.res;
++ }
++ 
++ /*
++  * Unbind a clockevents device.
++  */
++ int clockevents_unbind_device(struct clock_event_device *ced, int cpu)
++ {
++ 	int ret;
++ 
++ 	mutex_lock(&clockevents_mutex);
++ 	ret = clockevents_unbind(ced, cpu);
++ 	mutex_unlock(&clockevents_mutex);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(clockevents_unbind_device);
++ 
+++>>>>>>> 32a158325acf (clockevents: export clockevents_unbind_device instead of clockevents_unbind)
+  /**
+   * clockevents_register_device - register a clock event device
+   * @dev:	device to register
+* Unmerged path kernel/time/clockevents.c
