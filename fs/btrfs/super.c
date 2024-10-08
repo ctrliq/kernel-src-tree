@@ -1894,6 +1894,9 @@ static int btrfs_run_sanity_tests(void)
 	if (ret)
 		goto out;
 	ret = btrfs_test_inodes();
+	if (ret)
+		goto out;
+	ret = btrfs_test_qgroups();
 out:
 	btrfs_destroy_test_fs();
 	return ret;
