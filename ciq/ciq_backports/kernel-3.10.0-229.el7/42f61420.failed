@@ -1,0 +1,162 @@
+NVMe: per-cpu io queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 42f614201e80ff4cfb8b285d7190149a8e1e6cec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/42f61420.failed
+
+The device's IO queues are associated with CPUs, so we can use a per-cpu
+variable to map the a qid to a cpu. This provides a convienient way
+to optimally assign queues to multiple cpus when the device supports
+fewer queues than the host has cpus. The previous implementation may
+have assigned these poorly in these situations. This patch addresses
+this by sharing queues among cpus that are "close" together and should
+have a lower lock contention penalty.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+(cherry picked from commit 42f614201e80ff4cfb8b285d7190149a8e1e6cec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	include/linux/nvme.h
+diff --cc drivers/block/nvme-core.c
+index d4188b311d26,48d7bd55207a..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -262,14 -266,34 +265,40 @@@ static void *cancel_cmdid(struct nvme_q
+  	return ctx;
+  }
+  
+ -static struct nvme_queue *raw_nvmeq(struct nvme_dev *dev, int qid)
+ +struct nvme_queue *get_nvmeq(struct nvme_dev *dev)
+  {
+ -	return rcu_dereference_raw(dev->queues[qid]);
+ +	return dev->queues[get_cpu() + 1];
+  }
+  
+++<<<<<<< HEAD
+ +void put_nvmeq(struct nvme_queue *nvmeq)
+ +{
+ +	put_cpu();
+++=======
++ static struct nvme_queue *get_nvmeq(struct nvme_dev *dev) __acquires(RCU)
++ {
++ 	unsigned queue_id = get_cpu_var(*dev->io_queue);
++ 	rcu_read_lock();
++ 	return rcu_dereference(dev->queues[queue_id]);
++ }
++ 
++ static void put_nvmeq(struct nvme_queue *nvmeq) __releases(RCU)
++ {
++ 	rcu_read_unlock();
++ 	put_cpu_var(nvmeq->dev->io_queue);
++ }
++ 
++ static struct nvme_queue *lock_nvmeq(struct nvme_dev *dev, int q_idx)
++ 							__acquires(RCU)
++ {
++ 	rcu_read_lock();
++ 	return rcu_dereference(dev->queues[q_idx]);
++ }
++ 
++ static void unlock_nvmeq(struct nvme_queue *nvmeq) __releases(RCU)
++ {
++ 	rcu_read_unlock();
+++>>>>>>> 42f614201e80 (NVMe: per-cpu io queues)
+  }
+  
+  /**
+@@@ -1889,11 -2004,11 +2065,11 @@@ static size_t db_bar_size(struct nvme_d
+  
+  static int nvme_setup_io_queues(struct nvme_dev *dev)
+  {
+ -	struct nvme_queue *adminq = raw_nvmeq(dev, 0);
+ +	struct nvme_queue *adminq = dev->queues[0];
+  	struct pci_dev *pdev = dev->pci_dev;
+- 	int result, cpu, i, vecs, nr_io_queues, size, q_depth;
++ 	int result, i, vecs, nr_io_queues, size;
+  
+- 	nr_io_queues = num_online_cpus();
++ 	nr_io_queues = num_possible_cpus();
+  	result = set_queue_count(dev, nr_io_queues);
+  	if (result < 0)
+  		return result;
+@@@ -1961,49 -2077,8 +2138,54 @@@
+  	}
+  
+  	/* Free previously allocated queues that are no longer usable */
+++<<<<<<< HEAD
+ +	spin_lock(&dev_list_lock);
+ +	for (i = dev->queue_count - 1; i > nr_io_queues; i--) {
+ +		struct nvme_queue *nvmeq = dev->queues[i];
+ +
+ +		spin_lock_irq(&nvmeq->q_lock);
+ +		nvme_cancel_ios(nvmeq, false);
+ +		spin_unlock_irq(&nvmeq->q_lock);
+ +
+ +		nvme_free_queue(nvmeq);
+ +		dev->queue_count--;
+ +		dev->queues[i] = NULL;
+ +	}
+ +	spin_unlock(&dev_list_lock);
+ +
+ +	cpu = cpumask_first(cpu_online_mask);
+ +	for (i = 0; i < nr_io_queues; i++) {
+ +		irq_set_affinity_hint(dev->entry[i].vector, get_cpu_mask(cpu));
+ +		cpu = cpumask_next(cpu, cpu_online_mask);
+ +	}
+ +
+ +	q_depth = min_t(int, NVME_CAP_MQES(readq(&dev->bar->cap)) + 1,
+ +								NVME_Q_DEPTH);
+ +	for (i = dev->queue_count - 1; i < nr_io_queues; i++) {
+ +		dev->queues[i + 1] = nvme_alloc_queue(dev, i + 1, q_depth, i);
+ +		if (!dev->queues[i + 1]) {
+ +			result = -ENOMEM;
+ +			goto free_queues;
+ +		}
+ +	}
+ +
+ +	for (; i < num_possible_cpus(); i++) {
+ +		int target = i % rounddown_pow_of_two(dev->queue_count - 1);
+ +		dev->queues[i + 1] = dev->queues[target + 1];
+ +	}
+ +
+ +	for (i = 1; i < dev->queue_count; i++) {
+ +		result = nvme_create_queue(dev->queues[i], i);
+ +		if (result) {
+ +			for (--i; i > 0; i--)
+ +				nvme_disable_queue(dev, i);
+ +			goto free_queues;
+ +		}
+ +	}
+++=======
++ 	nvme_free_queues(dev, nr_io_queues + 1);
++ 	nvme_assign_io_queues(dev);
+++>>>>>>> 42f614201e80 (NVMe: per-cpu io queues)
+  
+  	return 0;
+  
+diff --cc include/linux/nvme.h
+index 69ae03f6eb15,f0f95c719685..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -73,7 -73,8 +73,12 @@@ enum 
+   */
+  struct nvme_dev {
+  	struct list_head node;
+++<<<<<<< HEAD
+ +	struct nvme_queue **queues;
+++=======
++ 	struct nvme_queue __rcu **queues;
++ 	unsigned short __percpu *io_queue;
+++>>>>>>> 42f614201e80 (NVMe: per-cpu io queues)
+  	u32 __iomem *dbs;
+  	struct pci_dev *pci_dev;
+  	struct dma_pool *prp_page_pool;
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path include/linux/nvme.h
