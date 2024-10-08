@@ -1,0 +1,132 @@
+net: provide stubs for ip6_set_txhash and ip6_make_flowlabel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] ipv6: provide stubs for ip6_set_txhash and ip6_make_flowlabel (Ivan Vecera) [1215920]
+Rebuild_FUZZ: 94.21%
+commit-author Florian Fainelli <f.fainelli@gmail.com>
+commit a37934fc0d0c087dd120dba229077048f1abfd37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a37934fc.failed
+
+Commit cb1ce2ef387b ("ipv6: Implement automatic flow label generation
+on transmit") introduced ip6_make_flowlabel, while commit b73c3d0e4f0e
+("net: Save TX flow hash in sock and set in skbuf on xmit") introduced
+ip6_set_txhash.
+
+ip6_set_tx_hash() uses sk_v6_daddr which references
+__sk_common.skc_v6_daddr from struct sock_common, which is gated with
+IS_ENABLED(CONFIG_IPV6).
+
+ip6_make_flowlabel() uses the ipv6 member from struct net which is
+also gated with IS_ENABLED(CONFIG_IPV6).
+
+When CONFIG_IPV6 is disabled, we will hit a build failure that looks
+like this when the compiler attempts inlining these functions:
+
+  CC [M]  drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.o
+In file included from include/net/inet_sock.h:27:0,
+                 from include/net/ip.h:30,
+                 from drivers/net/ethernet/broadcom/cnic.c:37:
+include/net/ipv6.h: In function 'ip6_set_txhash':
+include/net/sock.h:327:33: error: 'struct sock_common' has no member named 'skc_v6_daddr'
+ #define sk_v6_daddr  __sk_common.skc_v6_daddr
+                                 ^
+include/net/ipv6.h:696:49: note: in expansion of macro 'sk_v6_daddr'
+  keys.dst = (__force __be32)ipv6_addr_hash(&sk->sk_v6_daddr);
+                                                 ^
+In file included from include/net/inetpeer.h:15:0,
+                 from include/net/route.h:28,
+                 from include/net/ip.h:31,
+                 from drivers/net/ethernet/broadcom/cnic.c:37:
+include/net/ipv6.h: In function 'ip6_make_flowlabel':
+include/net/ipv6.h:706:37: error: 'struct net' has no member named 'ipv6'
+  if (!flowlabel && (autolabel || net->ipv6.sysctl.auto_flowlabels)) {
+                                     ^
+
+Fixes: cb1ce2ef387b ("ipv6: Implement automatic flow label generation on transmit")
+Fixes: b73c3d0e4f0e ("net: Save TX flow hash in sock and set in skbuf on xmit")
+	Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a37934fc0d0c087dd120dba229077048f1abfd37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ipv6.h
+diff --cc include/net/ipv6.h
+index a8cae4809670,b9ac2357e7db..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -652,9 -669,65 +652,69 @@@ static inline int ipv6_addr_diff(const 
+  	return __ipv6_addr_diff(a1, a2, sizeof(struct in6_addr));
+  }
+  
+ -int ip6_dst_hoplimit(struct dst_entry *dst);
+ +extern void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt);
+  
+++<<<<<<< HEAD
+ +extern int ip6_dst_hoplimit(struct dst_entry *dst);
+++=======
++ static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
++ 				      struct dst_entry *dst)
++ {
++ 	int hlimit;
++ 
++ 	if (ipv6_addr_is_multicast(&fl6->daddr))
++ 		hlimit = np->mcast_hops;
++ 	else
++ 		hlimit = np->hop_limit;
++ 	if (hlimit < 0)
++ 		hlimit = ip6_dst_hoplimit(dst);
++ 	return hlimit;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static inline void ip6_set_txhash(struct sock *sk)
++ {
++ 	struct inet_sock *inet = inet_sk(sk);
++ 	struct ipv6_pinfo *np = inet6_sk(sk);
++ 	struct flow_keys keys;
++ 
++ 	keys.src = (__force __be32)ipv6_addr_hash(&np->saddr);
++ 	keys.dst = (__force __be32)ipv6_addr_hash(&sk->sk_v6_daddr);
++ 	keys.port16[0] = inet->inet_sport;
++ 	keys.port16[1] = inet->inet_dport;
++ 
++ 	sk->sk_txhash = flow_hash_from_keys(&keys);
++ }
++ 
++ static inline __be32 ip6_make_flowlabel(struct net *net, struct sk_buff *skb,
++ 					__be32 flowlabel, bool autolabel)
++ {
++ 	if (!flowlabel && (autolabel || net->ipv6.sysctl.auto_flowlabels)) {
++ 		__be32 hash;
++ 
++ 		hash = skb_get_hash(skb);
++ 
++ 		/* Since this is being sent on the wire obfuscate hash a bit
++ 		 * to minimize possbility that any useful information to an
++ 		 * attacker is leaked. Only lower 20 bits are relevant.
++ 		 */
++ 		hash ^= hash >> 12;
++ 
++ 		flowlabel = hash & IPV6_FLOWLABEL_MASK;
++ 	}
++ 
++ 	return flowlabel;
++ }
++ #else
++ static inline void ip6_set_txhash(struct sock *sk) { }
++ static inline __be32 ip6_make_flowlabel(struct net *net, struct sk_buff *skb,
++ 					__be32 flowlabel, bool autolabel)
++ {
++ 	return flowlabel;
++ }
++ #endif
++ 
+++>>>>>>> a37934fc0d0c (net: provide stubs for ip6_set_txhash and ip6_make_flowlabel)
+  
+  /*
+   *	Header manipulation
+* Unmerged path include/net/ipv6.h
