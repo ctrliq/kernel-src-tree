@@ -1,0 +1,309 @@
+overlayfs: Make f_path always point to the overlay and f_inode to the underlay
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 4bacc9c9234c7c8eec44f5ed4e960d9f96fa0f01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4bacc9c9.failed
+
+Make file->f_path always point to the overlay dentry so that the path in
+/proc/pid/fd is correct and to ensure that label-based LSMs have access to the
+overlay as well as the underlay (path-based LSMs probably don't need it).
+
+Using my union testsuite to set things up, before the patch I see:
+
+	[root@andromeda union-testsuite]# bash 5</mnt/a/foo107
+	[root@andromeda union-testsuite]# ls -l /proc/$$/fd/
+	...
+	lr-x------. 1 root root 64 Jun  5 14:38 5 -> /a/foo107
+	[root@andromeda union-testsuite]# stat /mnt/a/foo107
+	...
+	Device: 23h/35d Inode: 13381       Links: 1
+	...
+	[root@andromeda union-testsuite]# stat -L /proc/$$/fd/5
+	...
+	Device: 23h/35d Inode: 13381       Links: 1
+	...
+
+After the patch:
+
+	[root@andromeda union-testsuite]# bash 5</mnt/a/foo107
+	[root@andromeda union-testsuite]# ls -l /proc/$$/fd/
+	...
+	lr-x------. 1 root root 64 Jun  5 14:22 5 -> /mnt/a/foo107
+	[root@andromeda union-testsuite]# stat /mnt/a/foo107
+	...
+	Device: 23h/35d Inode: 40346       Links: 1
+	...
+	[root@andromeda union-testsuite]# stat -L /proc/$$/fd/5
+	...
+	Device: 23h/35d Inode: 40346       Links: 1
+	...
+
+Note the change in where /proc/$$/fd/5 points to in the ls command.  It was
+pointing to /a/foo107 (which doesn't exist) and now points to /mnt/a/foo107
+(which is correct).
+
+The inode accessed, however, is the lower layer.  The union layer is on device
+25h/37d and the upper layer on 24h/36d.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 4bacc9c9234c7c8eec44f5ed4e960d9f96fa0f01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/open.c
+#	fs/overlayfs/inode.c
+#	include/linux/dcache.h
+#	include/linux/fs.h
+diff --cc fs/open.c
+index eeadbd924dc1,b1c5823b7f11..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -709,24 -688,26 +709,34 @@@ static int do_dentry_open(struct file *
+  	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+  				FMODE_PREAD | FMODE_PWRITE;
+  
+ +	if (unlikely(f->f_flags & O_PATH))
+ +		f->f_mode = FMODE_PATH;
+ +
+  	path_get(&f->f_path);
+++<<<<<<< HEAD
+ +	inode = f->f_inode = f->f_path.dentry->d_inode;
+ +	if (f->f_mode & FMODE_WRITE) {
+ +		error = __get_file_write_access(inode, f->f_path.mnt);
+ +		if (error)
+ +			goto cleanup_file;
+ +		if (!special_file(inode->i_mode))
+ +			file_take_write(f);
+++=======
++ 	f->f_inode = inode;
++ 	f->f_mapping = inode->i_mapping;
++ 
++ 	if (unlikely(f->f_flags & O_PATH)) {
++ 		f->f_mode = FMODE_PATH;
++ 		f->f_op = &empty_fops;
++ 		return 0;
+++>>>>>>> 4bacc9c9234c (overlayfs: Make f_path always point to the overlay and f_inode to the underlay)
+  	}
+  
+ -	if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode)) {
+ -		error = get_write_access(inode);
+ -		if (unlikely(error))
+ -			goto cleanup_file;
+ -		error = __mnt_want_write(f->f_path.mnt);
+ -		if (unlikely(error)) {
+ -			put_write_access(inode);
+ -			goto cleanup_file;
+ -		}
+ -		f->f_mode |= FMODE_WRITER;
+ +	f->f_mapping = inode->i_mapping;
+ +
+ +	if (unlikely(f->f_mode & FMODE_PATH)) {
+ +		f->f_op = &empty_fops;
+ +		return 0;
+  	}
+  
+  	/* POSIX.1-2008/SUSv4 Section XSI 2.9.7 */
+@@@ -871,27 -876,6 +904,30 @@@ struct file *dentry_open(const struct p
+  }
+  EXPORT_SYMBOL(dentry_open);
+  
+++<<<<<<< HEAD
+ +/**
+ + * vfs_open - open the file at the given path
+ + * @path: path to open
+ + * @filp: newly allocated file with f_flag initialized
+ + * @cred: credentials to use
+ + */
+ +int vfs_open(const struct path *path, struct file *filp,
+ +	     const struct cred *cred)
+ +{
+ +	struct inode *inode = path->dentry->d_inode;
+ +	iop_dentry_open_t dentry_open = get_dentry_open_iop(inode);
+ +
+ +	if (dentry_open)
+ +		return dentry_open(path->dentry, filp, cred);
+ +	else {
+ +		filp->f_path = *path;
+ +		return do_dentry_open(filp, NULL, cred);
+ +	}
+ +}
+ +EXPORT_SYMBOL(vfs_open);
+ +
+++=======
+++>>>>>>> 4bacc9c9234c (overlayfs: Make f_path always point to the overlay and f_inode to the underlay)
+  static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+  {
+  	int lookup_flags = 0;
+diff --cc fs/overlayfs/inode.c
+index 5900e8979e6f,f140e3dbfb7b..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -359,11 -360,10 +358,11 @@@ struct inode *ovl_d_select_inode(struc
+  		ovl_path_upper(dentry, &realpath);
+  	}
+  
+- 	return vfs_open(&realpath, file, cred);
++ 	return d_backing_inode(realpath.dentry);
+  }
+  
+ -static const struct inode_operations ovl_file_inode_operations = {
+ +static const struct inode_operations_wrapper ovl_file_inode_operations = {
+ +	.ops = {
+  	.setattr	= ovl_setattr,
+  	.permission	= ovl_permission,
+  	.getattr	= ovl_getattr,
+@@@ -371,8 -371,6 +370,11 @@@
+  	.getxattr	= ovl_getxattr,
+  	.listxattr	= ovl_listxattr,
+  	.removexattr	= ovl_removexattr,
+++<<<<<<< HEAD
+ +	},
+ +	.dentry_open	= ovl_dentry_open,
+++=======
+++>>>>>>> 4bacc9c9234c (overlayfs: Make f_path always point to the overlay and f_inode to the underlay)
+  };
+  
+  static const struct inode_operations ovl_symlink_inode_operations = {
+diff --cc include/linux/dcache.h
+index 5888528c0fa0,167ec0934049..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -208,15 -213,20 +209,30 @@@ struct dentry_operations 
+  #define DCACHE_MANAGED_DENTRY \
+  	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
+  
+ -#define DCACHE_LRU_LIST			0x00080000
+ -
+ +#define DCACHE_LRU_LIST		0x80000
+ +#define DCACHE_DENTRY_KILLED	0x100000
+ +
+++<<<<<<< HEAD
+ +#define DCACHE_ENTRY_TYPE		0x07000000
+ +#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry */
+ +#define DCACHE_DIRECTORY_TYPE		0x01000000 /* Normal directory */
+ +#define DCACHE_AUTODIR_TYPE		0x02000000 /* Lookupless directory (presumed automount) */
+ +#define DCACHE_SYMLINK_TYPE		0x03000000 /* Symlink */
+ +#define DCACHE_FILE_TYPE		0x04000000 /* Other file type */
+++=======
++ #define DCACHE_ENTRY_TYPE		0x00700000
++ #define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry (maybe fallthru to nowhere) */
++ #define DCACHE_WHITEOUT_TYPE		0x00100000 /* Whiteout dentry (stop pathwalk) */
++ #define DCACHE_DIRECTORY_TYPE		0x00200000 /* Normal directory */
++ #define DCACHE_AUTODIR_TYPE		0x00300000 /* Lookupless directory (presumed automount) */
++ #define DCACHE_REGULAR_TYPE		0x00400000 /* Regular file type (or fallthru to such) */
++ #define DCACHE_SPECIAL_TYPE		0x00500000 /* Other file type (or fallthru to such) */
++ #define DCACHE_SYMLINK_TYPE		0x00600000 /* Symlink (or fallthru to such) */
++ 
++ #define DCACHE_MAY_FREE			0x00800000
++ #define DCACHE_FALLTHRU			0x01000000 /* Fall through to lower layer */
++ #define DCACHE_OP_SELECT_INODE		0x02000000 /* Unioned entry: dcache op selects inode */
+++>>>>>>> 4bacc9c9234c (overlayfs: Make f_path always point to the overlay and f_inode to the underlay)
+  
+  extern seqlock_t rename_lock;
+  
+diff --cc include/linux/fs.h
+index 9a3e0574615b,2bd77e10e8e5..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1685,28 -1637,10 +1685,31 @@@ struct inode_operations 
+  	int (*atomic_open)(struct inode *, struct dentry *,
+  			   struct file *, unsigned open_flag,
+  			   umode_t create_mode, int *opened);
+ -	int (*tmpfile) (struct inode *, struct dentry *, umode_t);
+ -	int (*set_acl)(struct inode *, struct posix_acl *, int);
+ +} ____cacheline_aligned;
+ +
+ +
+ +/*
+ + * RHEL inode struct wrapper - should only be used with get_*_iop() accessors.
+ + */
+ +typedef int (*iop_rename2_t) (struct inode *, struct dentry *,
+ +			      struct inode *, struct dentry *, unsigned int);
+ +
+ +typedef int (*iop_dentry_open_t) (struct dentry *, struct file *, const struct cred *);
+ +
+ +struct inode_operations_wrapper {
+ +	struct inode_operations ops;
+ +	unsigned version;
+ +	/* -- Wrapper version 0 -- */
+ +	int (*rename2) (struct inode *, struct dentry *,
+ +			struct inode *, struct dentry *, unsigned int);
+  
+  	/* WARNING: probably going away soon, do not use! */
+++<<<<<<< HEAD
+ +	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+ +
+ +	/* -- Wrapper version 1 -- */
+++=======
+++>>>>>>> 4bacc9c9234c (overlayfs: Make f_path always point to the overlay and f_inode to the underlay)
+  } ____cacheline_aligned;
+  
+  ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 94451775d8ad..edf569942bdb 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1472,7 +1472,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+ 				DCACHE_OP_COMPARE	|
+ 				DCACHE_OP_REVALIDATE	|
+ 				DCACHE_OP_WEAK_REVALIDATE	|
+-				DCACHE_OP_DELETE ));
++				DCACHE_OP_DELETE	|
++				DCACHE_OP_SELECT_INODE));
+ 	dentry->d_op = op;
+ 	if (!op)
+ 		return;
+@@ -1488,6 +1489,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+ 		dentry->d_flags |= DCACHE_OP_DELETE;
+ 	if (op->d_prune)
+ 		dentry->d_flags |= DCACHE_OP_PRUNE;
++	if (op->d_select_inode)
++		dentry->d_flags |= DCACHE_OP_SELECT_INODE;
+ 
+ }
+ EXPORT_SYMBOL(d_set_d_op);
+diff --git a/fs/internal.h b/fs/internal.h
+index 3b41f3e8a80a..5deba8bff87f 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -104,6 +104,7 @@ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
+ extern long do_handle_open(int mountdirfd,
+ 			   struct file_handle __user *ufh, int open_flag);
+ extern int open_check_o_direct(struct file *f);
++extern int vfs_open(const struct path *, struct file *, const struct cred *);
+ 
+ /*
+  * inode.c
+* Unmerged path fs/open.c
+* Unmerged path fs/overlayfs/inode.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 45d183b3e975..b7e9258bd793 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -173,6 +173,7 @@ ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+ 		     void *value, size_t size);
+ ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
+ int ovl_removexattr(struct dentry *dentry, const char *name);
++struct inode *ovl_d_select_inode(struct dentry *dentry, unsigned file_flags);
+ 
+ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+ 			    struct ovl_entry *oe);
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 7e0388b76097..b1455f4d8545 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -316,6 +316,7 @@ static int ovl_dentry_weak_revalidate(struct dentry *dentry, unsigned int flags)
+ 
+ static const struct dentry_operations ovl_dentry_operations = {
+ 	.d_release = ovl_dentry_release,
++	.d_select_inode = ovl_d_select_inode,
+ };
+ 
+ static const struct dentry_operations ovl_reval_dentry_operations = {
+* Unmerged path include/linux/dcache.h
+* Unmerged path include/linux/fs.h
