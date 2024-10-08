@@ -80,7 +80,7 @@ static const struct enic_stat enic_rx_stats[] = {
 static const unsigned int enic_n_tx_stats = ARRAY_SIZE(enic_tx_stats);
 static const unsigned int enic_n_rx_stats = ARRAY_SIZE(enic_rx_stats);
 
-void enic_intr_coal_set_rx(struct enic *enic, u32 timer)
+static void enic_intr_coal_set_rx(struct enic *enic, u32 timer)
 {
 	int i;
 	int intr;
