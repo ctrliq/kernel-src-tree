@@ -1,0 +1,349 @@
+mmc: slot-gpio: Rework how to handle allocation of slot-gpio data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ulf Hansson <ulf.hansson@linaro.org>
+commit df8aca162e5ff2b20c7a4de3e64e5b96ff838ab0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/df8aca16.failed
+
+By moving the allocation of the slot-gpio data into mmc_alloc_host(),
+we can remove the slot-gpio internal calls to mmc_gpio_alloc().
+
+This means mmc_gpio_alloc() has now only one caller left, which
+consequence allow us to simplify and remove some of the slot-gpio code.
+
+Additionally, this makes the slot-gpio mutex redundant, so let's remove
+it.
+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit df8aca162e5ff2b20c7a4de3e64e5b96ff838ab0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/slot-gpio.c
+diff --cc drivers/mmc/core/slot-gpio.c
+index 09ee347e6449,1a3edbd47719..000000000000
+--- a/drivers/mmc/core/slot-gpio.c
++++ b/drivers/mmc/core/slot-gpio.c
+@@@ -43,29 -43,17 +43,37 @@@ static irqreturn_t mmc_gpio_cd_irqt(in
+  int mmc_gpio_alloc(struct mmc_host *host)
+  {
+  	size_t len = strlen(dev_name(host->parent)) + 4;
+- 	struct mmc_gpio *ctx;
++ 	struct mmc_gpio *ctx = devm_kzalloc(host->parent,
++ 				sizeof(*ctx) + 2 * len,	GFP_KERNEL);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&host->slot.lock);
+ +
+ +	ctx = host->slot.handler_priv;
+ +	if (!ctx) {
+ +		/*
+ +		 * devm_kzalloc() can be called after device_initialize(), even
+ +		 * before device_add(), i.e., between mmc_alloc_host() and
+ +		 * mmc_add_host()
+ +		 */
+ +		ctx = devm_kzalloc(&host->class_dev, sizeof(*ctx) + 2 * len,
+ +				   GFP_KERNEL);
+ +		if (ctx) {
+ +			ctx->ro_label = ctx->cd_label + len;
+ +			snprintf(ctx->cd_label, len, "%s cd", dev_name(host->parent));
+ +			snprintf(ctx->ro_label, len, "%s ro", dev_name(host->parent));
+ +			host->slot.handler_priv = ctx;
+ +		}
+++=======
++ 	if (ctx) {
++ 		ctx->ro_label = ctx->cd_label + len;
++ 		snprintf(ctx->cd_label, len, "%s cd", dev_name(host->parent));
++ 		snprintf(ctx->ro_label, len, "%s ro", dev_name(host->parent));
++ 		host->slot.handler_priv = ctx;
++ 		host->slot.cd_irq = -EINVAL;
+++>>>>>>> df8aca162e5f (mmc: slot-gpio: Rework how to handle allocation of slot-gpio data)
+  	}
+  
+- 	mutex_unlock(&host->slot.lock);
+- 
+  	return ctx ? 0 : -ENOMEM;
+  }
+  
+@@@ -121,13 -105,7 +129,17 @@@ int mmc_gpio_request_ro(struct mmc_hos
+  	if (!gpio_is_valid(gpio))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	ret = mmc_gpio_alloc(host);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	ctx = host->slot.handler_priv;
+ +
+ +	ret = devm_gpio_request_one(&host->class_dev, gpio, GPIOF_DIR_IN,
+++=======
++ 	ret = devm_gpio_request_one(host->parent, gpio, GPIOF_DIR_IN,
+++>>>>>>> df8aca162e5f (mmc: slot-gpio: Rework how to handle allocation of slot-gpio data)
+  				    ctx->ro_label);
+  	if (ret < 0)
+  		return ret;
+@@@ -196,6 -148,45 +208,48 @@@ int mmc_gpio_request_cd(struct mmc_hos
+  
+  	if (irq < 0)
+  		host->caps |= MMC_CAP_NEEDS_POLL;
+++<<<<<<< HEAD
+++=======
++ }
++ EXPORT_SYMBOL(mmc_gpiod_request_cd_irq);
++ 
++ /**
++  * mmc_gpio_request_cd - request a gpio for card-detection
++  * @host: mmc host
++  * @gpio: gpio number requested
++  * @debounce: debounce time in microseconds
++  *
++  * As devm_* managed functions are used in mmc_gpio_request_cd(), client
++  * drivers do not need to worry about freeing up memory.
++  *
++  * If GPIO debouncing is desired, set the debounce parameter to a non-zero
++  * value. The caller is responsible for ensuring that the GPIO driver associated
++  * with the GPIO supports debouncing, otherwise an error will be returned.
++  *
++  * Returns zero on success, else an error.
++  */
++ int mmc_gpio_request_cd(struct mmc_host *host, unsigned int gpio,
++ 			unsigned int debounce)
++ {
++ 	struct mmc_gpio *ctx = host->slot.handler_priv;
++ 	int ret;
++ 
++ 	ret = devm_gpio_request_one(host->parent, gpio, GPIOF_DIR_IN,
++ 				    ctx->cd_label);
++ 	if (ret < 0)
++ 		/*
++ 		 * don't bother freeing memory. It might still get used by other
++ 		 * slot functions, in any case it will be freed, when the device
++ 		 * is destroyed.
++ 		 */
++ 		return ret;
++ 
++ 	if (debounce) {
++ 		ret = gpio_set_debounce(gpio, debounce);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
+++>>>>>>> df8aca162e5f (mmc: slot-gpio: Rework how to handle allocation of slot-gpio data)
+  
+  	ctx->override_cd_active_level = true;
+  	ctx->cd_gpio = gpio_to_desc(gpio);
+@@@ -205,50 -196,94 +259,93 @@@
+  EXPORT_SYMBOL(mmc_gpio_request_cd);
+  
+  /**
+ - * mmc_gpiod_request_cd - request a gpio descriptor for card-detection
+ + * mmc_gpio_free_ro - free the write-protection gpio
+   * @host: mmc host
+ - * @con_id: function within the GPIO consumer
+ - * @idx: index of the GPIO to obtain in the consumer
+ - * @override_active_level: ignore %GPIO_ACTIVE_LOW flag
+ - * @debounce: debounce time in microseconds
+ - * @gpio_invert: will return whether the GPIO line is inverted or not, set
+ - * to NULL to ignore
+ - *
+ - * Use this function in place of mmc_gpio_request_cd() to use the GPIO
+ - * descriptor API.  Note that it must be called prior to mmc_add_host()
+ - * otherwise the caller must also call mmc_gpiod_request_cd_irq().
+   *
+ - * Returns zero on success, else an error.
+ + * It's provided only for cases that client drivers need to manually free
+ + * up the write-protection gpio requested by mmc_gpio_request_ro().
+   */
+ -int mmc_gpiod_request_cd(struct mmc_host *host, const char *con_id,
+ -			 unsigned int idx, bool override_active_level,
+ -			 unsigned int debounce, bool *gpio_invert)
+ +void mmc_gpio_free_ro(struct mmc_host *host)
+  {
+  	struct mmc_gpio *ctx = host->slot.handler_priv;
+++<<<<<<< HEAD
+ +	int gpio;
+ +
+ +	if (!ctx || !ctx->ro_gpio)
+ +		return;
+ +
+ +	gpio = desc_to_gpio(ctx->ro_gpio);
+ +	ctx->ro_gpio = NULL;
+ +
+ +	devm_gpio_free(&host->class_dev, gpio);
+++=======
++ 	struct gpio_desc *desc;
++ 	int ret;
++ 
++ 	if (!con_id)
++ 		con_id = ctx->cd_label;
++ 
++ 	desc = devm_gpiod_get_index(host->parent, con_id, idx, GPIOD_IN);
++ 	if (IS_ERR(desc))
++ 		return PTR_ERR(desc);
++ 
++ 	if (debounce) {
++ 		ret = gpiod_set_debounce(desc, debounce);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	if (gpio_invert)
++ 		*gpio_invert = !gpiod_is_active_low(desc);
++ 
++ 	ctx->override_cd_active_level = override_active_level;
++ 	ctx->cd_gpio = desc;
++ 
++ 	return 0;
+++>>>>>>> df8aca162e5f (mmc: slot-gpio: Rework how to handle allocation of slot-gpio data)
+  }
+ -EXPORT_SYMBOL(mmc_gpiod_request_cd);
+ +EXPORT_SYMBOL(mmc_gpio_free_ro);
+  
+  /**
+ - * mmc_gpiod_request_ro - request a gpio descriptor for write protection
+ + * mmc_gpio_free_cd - free the card-detection gpio
+   * @host: mmc host
+ - * @con_id: function within the GPIO consumer
+ - * @idx: index of the GPIO to obtain in the consumer
+ - * @override_active_level: ignore %GPIO_ACTIVE_LOW flag
+ - * @debounce: debounce time in microseconds
+ - * @gpio_invert: will return whether the GPIO line is inverted or not,
+ - * set to NULL to ignore
+ - *
+ - * Use this function in place of mmc_gpio_request_ro() to use the GPIO
+ - * descriptor API.
+   *
+ - * Returns zero on success, else an error.
+ + * It's provided only for cases that client drivers need to manually free
+ + * up the card-detection gpio requested by mmc_gpio_request_cd().
+   */
+ -int mmc_gpiod_request_ro(struct mmc_host *host, const char *con_id,
+ -			 unsigned int idx, bool override_active_level,
+ -			 unsigned int debounce, bool *gpio_invert)
+ +void mmc_gpio_free_cd(struct mmc_host *host)
+  {
+  	struct mmc_gpio *ctx = host->slot.handler_priv;
+++<<<<<<< HEAD
+ +	int gpio;
+ +
+ +	if (!ctx || !ctx->cd_gpio)
+ +		return;
+ +
+ +	if (host->slot.cd_irq >= 0) {
+ +		devm_free_irq(&host->class_dev, host->slot.cd_irq, host);
+ +		host->slot.cd_irq = -EINVAL;
+++=======
++ 	struct gpio_desc *desc;
++ 	int ret;
++ 
++ 	if (!con_id)
++ 		con_id = ctx->ro_label;
++ 
++ 	desc = devm_gpiod_get_index(host->parent, con_id, idx, GPIOD_IN);
++ 	if (IS_ERR(desc))
++ 		return PTR_ERR(desc);
++ 
++ 	if (debounce) {
++ 		ret = gpiod_set_debounce(desc, debounce);
++ 		if (ret < 0)
++ 			return ret;
+++>>>>>>> df8aca162e5f (mmc: slot-gpio: Rework how to handle allocation of slot-gpio data)
+  	}
+  
+ -	if (gpio_invert)
+ -		*gpio_invert = !gpiod_is_active_low(desc);
+ -
+ -	ctx->override_ro_active_level = override_active_level;
+ -	ctx->ro_gpio = desc;
+ +	gpio = desc_to_gpio(ctx->cd_gpio);
+ +	ctx->cd_gpio = NULL;
+  
+ -	return 0;
+ +	devm_gpio_free(&host->class_dev, gpio);
+  }
+ -EXPORT_SYMBOL(mmc_gpiod_request_ro);
+ +EXPORT_SYMBOL(mmc_gpio_free_cd);
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index 1ef8c2a03585..f0e71bfc7b97 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -29,6 +29,7 @@
+ 
+ #include "core.h"
+ #include "host.h"
++#include "slot-gpio.h"
+ 
+ #define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
+ 
+@@ -38,7 +39,6 @@ static DEFINE_SPINLOCK(mmc_host_lock);
+ static void mmc_host_classdev_release(struct device *dev)
+ {
+ 	struct mmc_host *host = cls_dev_to_mmc_host(dev);
+-	mutex_destroy(&host->slot.lock);
+ 	spin_lock(&mmc_host_lock);
+ 	idr_remove(&mmc_host_idr, host->index);
+ 	spin_unlock(&mmc_host_lock);
+@@ -497,8 +497,10 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
+ 		host->index = err;
+ 	spin_unlock(&mmc_host_lock);
+ 	idr_preload_end();
+-	if (err < 0)
+-		goto free;
++	if (err < 0) {
++		kfree(host);
++		return NULL;
++	}
+ 
+ 	dev_set_name(&host->class_dev, "mmc%d", host->index);
+ 
+@@ -507,10 +509,12 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
+ 	host->class_dev.class = &mmc_host_class;
+ 	device_initialize(&host->class_dev);
+ 
+-	mmc_host_clk_init(host);
++	if (mmc_gpio_alloc(host)) {
++		put_device(&host->class_dev);
++		return NULL;
++	}
+ 
+-	mutex_init(&host->slot.lock);
+-	host->slot.cd_irq = -EINVAL;
++	mmc_host_clk_init(host);
+ 
+ 	spin_lock_init(&host->lock);
+ 	init_waitqueue_head(&host->wq);
+@@ -531,10 +535,6 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
+ 	host->max_blk_count = PAGE_CACHE_SIZE / 512;
+ 
+ 	return host;
+-
+-free:
+-	kfree(host);
+-	return NULL;
+ }
+ 
+ EXPORT_SYMBOL(mmc_alloc_host);
+* Unmerged path drivers/mmc/core/slot-gpio.c
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index ad78fb0c2da7..fc70db779f4f 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -167,7 +167,6 @@ struct mmc_async_req {
+  * struct mmc_slot - MMC slot functions
+  *
+  * @cd_irq:		MMC/SD-card slot hotplug detection IRQ or -EINVAL
+- * @lock:		protect the @handler_priv pointer
+  * @handler_priv:	MMC/SD-card slot context
+  *
+  * Some MMC/SD host controllers implement slot-functions like card and
+@@ -177,7 +176,6 @@ struct mmc_async_req {
+  */
+ struct mmc_slot {
+ 	int cd_irq;
+-	struct mutex lock;
+ 	void *handler_priv;
+ };
+ 
