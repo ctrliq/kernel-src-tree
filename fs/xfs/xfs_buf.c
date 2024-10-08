@@ -1661,9 +1661,7 @@ xfs_setsize_buftarg_early(
 xfs_buftarg_t *
 xfs_alloc_buftarg(
 	struct xfs_mount	*mp,
-	struct block_device	*bdev,
-	int			external,
-	const char		*fsname)
+	struct block_device	*bdev)
 {
 	xfs_buftarg_t		*btp;
 
