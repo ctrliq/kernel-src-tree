@@ -1,0 +1,107 @@
+hpsa: optimize cmd_alloc function by remembering last allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 33811026a0a4208dd5725183d37fc92d5e88b0a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/33811026.failed
+
+Empirically, this improves performance slightly (~2% max IOPS) by
+allowing cmd_alloc to remember where it left off searching for
+free commands between calls instead of always starting its search
+at command 0.
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 33811026a0a4208dd5725183d37fc92d5e88b0a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 3e784c38914c,72abcf3bfabf..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -4451,9 -4648,11 +4451,15 @@@ static struct CommandList *cmd_alloc(st
+  	int i;
+  	union u64bit temp64;
+  	dma_addr_t cmd_dma_handle, err_dma_handle;
+++<<<<<<< HEAD
+ +	int loopcount;
+++=======
++ 	int refcount;
++ 	unsigned long offset;
+++>>>>>>> 33811026a0a4 (hpsa: optimize cmd_alloc function by remembering last allocation)
+  
+- 	/* There is some *extremely* small but non-zero chance that that
++ 	/*
++ 	 * There is some *extremely* small but non-zero chance that that
+  	 * multiple threads could get in here, and one thread could
+  	 * be scanning through the list of bits looking for a free
+  	 * one, but the free ones are always behind him, and other
+@@@ -4464,23 -4663,29 +4470,45 @@@
+  	 * infrequently as to be indistinguishable from never.
+  	 */
+  
+++<<<<<<< HEAD
+ +	loopcount = 0;
+ +	do {
+ +		i = find_first_zero_bit(h->cmd_pool_bits, h->nr_cmds);
+ +		if (i == h->nr_cmds)
+ +			i = 0;
+ +		loopcount++;
+ +	} while (test_and_set_bit(i & (BITS_PER_LONG - 1),
+ +		  h->cmd_pool_bits + (i / BITS_PER_LONG)) != 0 &&
+ +		loopcount < 10);
+++=======
++ 	offset = h->last_allocation; /* benignly racy */
++ 	for (;;) {
++ 		i = find_next_zero_bit(h->cmd_pool_bits, h->nr_cmds, offset);
++ 		if (unlikely(i == h->nr_cmds)) {
++ 			offset = 0;
++ 			continue;
++ 		}
++ 		c = h->cmd_pool + i;
++ 		refcount = atomic_inc_return(&c->refcount);
++ 		if (unlikely(refcount > 1)) {
++ 			cmd_free(h, c); /* already in use */
++ 			offset = (i + 1) % h->nr_cmds;
++ 			continue;
++ 		}
++ 		set_bit(i & (BITS_PER_LONG - 1),
++ 			h->cmd_pool_bits + (i / BITS_PER_LONG));
++ 		break; /* it's ours now. */
++ 	}
++ 	h->last_allocation = i; /* benignly racy */
+++>>>>>>> 33811026a0a4 (hpsa: optimize cmd_alloc function by remembering last allocation)
+  
+ -	/* Zero out all of commandlist except the last field, refcount */
+ -	memset(c, 0, offsetof(struct CommandList, refcount));
+ -	c->Header.tag = cpu_to_le64((u64) (i << DIRECT_LOOKUP_SHIFT));
+ +	/* Thread got starved?  We do not expect this to ever happen. */
+ +	if (loopcount >= 10)
+ +		return NULL;
+ +
+ +	c = h->cmd_pool + i;
+ +	memset(c, 0, sizeof(*c));
+ +	c->Header.tag = cpu_to_le64((u64) i << DIRECT_LOOKUP_SHIFT);
+  	cmd_dma_handle = h->cmd_pool_dhandle + i * sizeof(*c);
+  	c->err_info = h->errinfo_pool + i;
+  	memset(c->err_info, 0, sizeof(*c->err_info));
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index b105d9492e11..b93e6e20829f 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -119,6 +119,7 @@ struct ctlr_info {
+ 	struct CfgTable __iomem *cfgtable;
+ 	int	interrupts_enabled;
+ 	int 	max_commands;
++	int last_allocation;
+ 	atomic_t commands_outstanding;
+ #	define PERF_MODE_INT	0
+ #	define DOORBELL_INT	1
