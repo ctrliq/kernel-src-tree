@@ -1,0 +1,171 @@
+xfs: introduce metadata IO error class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Carlos Maiolino <cmaiolino@redhat.com>
+commit ffd40ef697dfd3e06f44b1bb5fea93079de8c77d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ffd40ef6.failed
+
+Now we have the basic infrastructure, add the first error class so
+we can build up the infrastructure in a meaningful way. Add the
+metadata async write IO error class and sysfs entry, and introduce a
+default configuration that matches the existing "retry forever"
+behavior for async write metadata buffers.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit ffd40ef697dfd3e06f44b1bb5fea93079de8c77d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.h
+#	fs/xfs/xfs_sysfs.c
+diff --cc fs/xfs/xfs_mount.h
+index fe5c55265429,352a5c88d7e9..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -37,6 -37,26 +37,29 @@@ enum 
+  	XFS_LOWSP_MAX,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Error Configuration
++  *
++  * Error classes define the subsystem the configuration belongs to.
++  * Error numbers define the errors that are configurable.
++  */
++ enum {
++ 	XFS_ERR_METADATA,
++ 	XFS_ERR_CLASS_MAX,
++ };
++ enum {
++ 	XFS_ERR_DEFAULT,
++ 	XFS_ERR_ERRNO_MAX,
++ };
++ 
++ struct xfs_error_cfg {
++ 	struct xfs_kobj	kobj;
++ 	int		max_retries;
++ };
++ 
+++>>>>>>> ffd40ef697df (xfs: introduce metadata IO error class)
+  typedef struct xfs_mount {
+  	struct super_block	*m_super;
+  	xfs_tid_t		m_tid;		/* next unused tid for fs */
+@@@ -127,6 -147,9 +150,12 @@@
+  	int64_t			m_low_space[XFS_LOWSP_MAX];
+  						/* low free space thresholds */
+  	struct xfs_kobj		m_kobj;
+++<<<<<<< HEAD
+++=======
++ 	struct xfs_kobj		m_error_kobj;
++ 	struct xfs_kobj		m_error_meta_kobj;
++ 	struct xfs_error_cfg	m_error_cfg[XFS_ERR_CLASS_MAX][XFS_ERR_ERRNO_MAX];
+++>>>>>>> ffd40ef697df (xfs: introduce metadata IO error class)
+  	struct xstats		m_stats;	/* per-fs stats */
+  
+  	struct workqueue_struct *m_buf_workqueue;
+diff --cc fs/xfs/xfs_sysfs.c
+index 641d625eb334,07c95999541e..000000000000
+--- a/fs/xfs/xfs_sysfs.c
++++ b/fs/xfs/xfs_sysfs.c
+@@@ -304,3 -363,87 +304,90 @@@ struct kobj_type xfs_log_ktype = 
+  	.sysfs_ops = &xfs_sysfs_ops,
+  	.default_attrs = xfs_log_attrs,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Metadata IO error configuration
++  *
++  * The sysfs structure here is:
++  *	...xfs/<dev>/error/<class>/<errno>/<error_attrs>
++  *
++  * where <class> allows us to discriminate between data IO and metadata IO,
++  * and any other future type of IO (e.g. special inode or directory error
++  * handling) we care to support.
++  */
++ static struct attribute *xfs_error_attrs[] = {
++ 	NULL,
++ };
++ 
++ static inline struct xfs_error_cfg *
++ to_error_cfg(struct kobject *kobject)
++ {
++ 	struct xfs_kobj *kobj = to_kobj(kobject);
++ 	return container_of(kobj, struct xfs_error_cfg, kobj);
++ }
++ 
++ struct kobj_type xfs_error_cfg_ktype = {
++ 	.release = xfs_sysfs_release,
++ 	.sysfs_ops = &xfs_sysfs_ops,
++ 	.default_attrs = xfs_error_attrs,
++ };
++ 
++ struct kobj_type xfs_error_ktype = {
++ 	.release = xfs_sysfs_release,
++ };
++ 
++ int
++ xfs_error_sysfs_init(
++ 	struct xfs_mount	*mp)
++ {
++ 	struct xfs_error_cfg	*cfg;
++ 	int			error;
++ 
++ 	/* .../xfs/<dev>/error/ */
++ 	error = xfs_sysfs_init(&mp->m_error_kobj, &xfs_error_ktype,
++ 				&mp->m_kobj, "error");
++ 	if (error)
++ 		return error;
++ 
++ 	/* .../xfs/<dev>/error/metadata/ */
++ 	error = xfs_sysfs_init(&mp->m_error_meta_kobj, &xfs_error_ktype,
++ 				&mp->m_error_kobj, "metadata");
++ 	if (error)
++ 		goto out_error;
++ 
++ 	cfg = &mp->m_error_cfg[XFS_ERR_METADATA][XFS_ERR_DEFAULT];
++ 	error = xfs_sysfs_init(&cfg->kobj, &xfs_error_cfg_ktype,
++ 				&mp->m_error_meta_kobj, "default");
++ 	if (error)
++ 		goto out_error_meta;
++ 	cfg->max_retries = -1;
++ 
++ 	return 0;
++ 
++ out_error_meta:
++ 	xfs_sysfs_del(&mp->m_error_meta_kobj);
++ out_error:
++ 	xfs_sysfs_del(&mp->m_error_kobj);
++ 	return error;
++ }
++ 
++ void
++ xfs_error_sysfs_del(
++ 	struct xfs_mount	*mp)
++ {
++ 	struct xfs_error_cfg	*cfg;
++ 	int			i, j;
++ 
++ 	for (i = 0; i < XFS_ERR_CLASS_MAX; i++) {
++ 		for (j = 0; j < XFS_ERR_ERRNO_MAX; j++) {
++ 			cfg = &mp->m_error_cfg[i][j];
++ 
++ 			xfs_sysfs_del(&cfg->kobj);
++ 		}
++ 	}
++ 	xfs_sysfs_del(&mp->m_error_meta_kobj);
++ 	xfs_sysfs_del(&mp->m_error_kobj);
++ }
+++>>>>>>> ffd40ef697df (xfs: introduce metadata IO error class)
+* Unmerged path fs/xfs/xfs_mount.h
+* Unmerged path fs/xfs/xfs_sysfs.c
