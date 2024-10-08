@@ -203,11 +203,9 @@ static void vp_reset(struct virtio_device *vdev)
 /* the notify function used when creating a virt queue */
 static bool vp_notify(struct virtqueue *vq)
 {
-	struct virtio_pci_device *vp_dev = to_vp_device(vq->vdev);
-
 	/* we write the queue's selector into the notification register to
 	 * signal the other end */
-	iowrite16(vq->index, vp_dev->ioaddr + VIRTIO_PCI_QUEUE_NOTIFY);
+	iowrite16(vq->index, (void __iomem *)vq->priv);
 	return true;
 }
 
@@ -440,6 +438,7 @@ static struct virtqueue *setup_vq(struct virtio_device *vdev, unsigned index,
 		goto out_activate_queue;
 	}
 
+	vq->priv = (void __force *)vp_dev->ioaddr + VIRTIO_PCI_QUEUE_NOTIFY;
 	info->vq = vq;
 
 	if (msix_vec != VIRTIO_MSI_NO_VECTOR) {
