@@ -1,0 +1,172 @@
+block: missing bio_put following submit_bio_wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [block] missing bio_put following submit_bio_wait (Mike Snitzer) [1356244 1357031]
+Rebuild_FUZZ: 92.13%
+commit-author Shaun Tancheff <shaun@tancheff.com>
+commit 05bd92dddc595d74ea645e793c1f3bd4b1fc251a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/05bd92dd.failed
+
+submit_bio_wait() gives the caller an opportunity to examine
+struct bio and so expects the caller to issue the put_bio()
+
+This fixes a memory leak reported by a few people in 4.7-rc2
+kmemleak report after 9082e87bfbf8 ("block: remove struct bio_batch")
+
+	Signed-off-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+	Tested-by: Catalin Marinas <catalin.marinas@arm.com>
+	Tested-by: Larry Finger@lwfinger.net
+	Tested-by: David Drysdale <drysdale@google.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 05bd92dddc595d74ea645e793c1f3bd4b1fc251a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-lib.c
+diff --cc block/blk-lib.c
+index 35cdebc4817d,9e29dc351695..000000000000
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@@ -60,28 -41,6 +60,29 @@@ int blkdev_issue_discard(struct block_d
+  	granularity = max(q->limits.discard_granularity >> 9, 1U);
+  	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+  
+ +	/*
+ +	 * Ensure that max_discard_sectors is of the proper
+ +	 * granularity, so that requests stay aligned after a split.
+ +	 */
+ +	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
+ +	max_discard_sectors -= max_discard_sectors % granularity;
+ +	if (unlikely(!max_discard_sectors)) {
+ +		/* Avoid infinite loop below. Being cautious never hurts. */
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (flags & BLKDEV_DISCARD_SECURE) {
+ +		if (!blk_queue_secdiscard(q))
+ +			return -EOPNOTSUPP;
+ +		type |= REQ_SECURE;
+ +	}
+ +
+ +	atomic_set(&bb.done, 1);
+ +	bb.flags = 1 << BIO_UPTODATE;
+ +	bb.wait = &wait;
+ +
+ +	blk_start_plug(&plug);
+++<<<<<<< HEAD
+  	while (nr_sects) {
+  		unsigned int req_sects;
+  		sector_t end_sect, tmp;
+@@@ -127,6 -77,43 +128,15 @@@
+  		 * is disabled.
+  		 */
+  		cond_resched();
+ -	}
+ -
+ -	*biop = bio;
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL(__blkdev_issue_discard);
+ -
+ -/**
+ - * blkdev_issue_discard - queue a discard
+ - * @bdev:	blockdev to issue discard for
+ - * @sector:	start sector
+ - * @nr_sects:	number of sectors to discard
+ - * @gfp_mask:	memory allocation flags (for bio_alloc)
+ - * @flags:	BLKDEV_IFL_* flags to control behaviour
+ - *
+ - * Description:
+ - *    Issue a discard request for the sectors in question.
+ - */
+ -int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+ -		sector_t nr_sects, gfp_t gfp_mask, unsigned long flags)
+ -{
+ -	int type = REQ_WRITE | REQ_DISCARD;
+ -	struct bio *bio = NULL;
+ -	struct blk_plug plug;
+ -	int ret;
+ -
+ -	if (flags & BLKDEV_DISCARD_SECURE)
+ -		type |= REQ_SECURE;
+ -
+ -	blk_start_plug(&plug);
+++=======
++ 	ret = __blkdev_issue_discard(bdev, sector, nr_sects, gfp_mask, type,
++ 			&bio);
++ 	if (!ret && bio) {
++ 		ret = submit_bio_wait(type, bio);
++ 		if (ret == -EOPNOTSUPP)
++ 			ret = 0;
++ 		bio_put(bio);
+++>>>>>>> 05bd92dddc59 (block: missing bio_put following submit_bio_wait)
+  	}
+  	blk_finish_plug(&plug);
+  
+@@@ -196,22 -161,16 +206,30 @@@ int blkdev_issue_write_same(struct bloc
+  			nr_sects -= max_write_same_sectors;
+  			sector += max_write_same_sectors;
+  		} else {
+ -			bio->bi_iter.bi_size = nr_sects << 9;
+ +			bio->bi_size = nr_sects << 9;
+  			nr_sects = 0;
+  		}
+ +
+ +		atomic_inc(&bb.done);
+ +		submit_bio(REQ_WRITE | REQ_WRITE_SAME, bio);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Wait for bios in-flight */
+ +	if (!atomic_dec_and_test(&bb.done))
+ +		wait_for_completion_io(&wait);
+ +
+ +	if (!test_bit(BIO_UPTODATE, &bb.flags))
+ +		ret = -ENOTSUPP;
+ +
+ +	return ret;
+++=======
++ 	if (bio) {
++ 		ret = submit_bio_wait(REQ_WRITE | REQ_WRITE_SAME, bio);
++ 		bio_put(bio);
++ 	}
++ 	return ret != -EOPNOTSUPP ? ret : 0;
+++>>>>>>> 05bd92dddc59 (block: missing bio_put following submit_bio_wait)
+  }
+  EXPORT_SYMBOL(blkdev_issue_write_same);
+  
+@@@ -261,20 -207,14 +279,29 @@@ static int __blkdev_issue_zeroout(struc
+  			if (ret < (sz << 9))
+  				break;
+  		}
+ +		ret = 0;
+ +		atomic_inc(&bb.done);
+ +		submit_bio(WRITE, bio);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Wait for bios in-flight */
+ +	if (!atomic_dec_and_test(&bb.done))
+ +		wait_for_completion_io(&wait);
+ +
+ +	if (!test_bit(BIO_UPTODATE, &bb.flags))
+ +		/* One of bios in the batch was completed with error.*/
+ +		ret = -EIO;
+ +
+ +	return ret;
+++=======
++ 	if (bio) {
++ 		ret = submit_bio_wait(WRITE, bio);
++ 		bio_put(bio);
++ 		return ret;
++ 	}
++ 	return 0;
+++>>>>>>> 05bd92dddc59 (block: missing bio_put following submit_bio_wait)
+  }
+  
+  /**
+* Unmerged path block/blk-lib.c
