@@ -1,0 +1,391 @@
+sched: Allow wait_on_bit_action() functions to support a timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author NeilBrown <neilb@suse.de>
+commit c1221321b7c25b53204447cff9949a6d5a7ddddc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c1221321.failed
+
+It is currently not possible for various wait_on_bit functions
+to implement a timeout.
+
+While the "action" function that is called to do the waiting
+could certainly use schedule_timeout(), there is no way to carry
+forward the remaining timeout after a false wake-up.
+As false-wakeups a clearly possible at least due to possible
+hash collisions in bit_waitqueue(), this is a real problem.
+
+The 'action' function is currently passed a pointer to the word
+containing the bit being waited on.  No current action functions
+use this pointer.  So changing it to something else will be a
+little noisy but will have no immediate effect.
+
+This patch changes the 'action' function to take a pointer to
+the "struct wait_bit_key", which contains a pointer to the word
+containing the bit so nothing is really lost.
+
+It also adds a 'private' field to "struct wait_bit_key", which
+is initialized to zero.
+
+An action function can now implement a timeout with something
+like
+
+static int timed_out_waiter(struct wait_bit_key *key)
+{
+	unsigned long waited;
+	if (key->private == 0) {
+		key->private = jiffies;
+		if (key->private == 0)
+			key->private -= 1;
+	}
+	waited = jiffies - key->private;
+	if (waited > 10 * HZ)
+		return -EAGAIN;
+	schedule_timeout(waited - 10 * HZ);
+	return 0;
+}
+
+If any other need for context in a waiter were found it would be
+easy to use ->private for some other purpose, or even extend
+"struct wait_bit_key".
+
+My particular need is to support timeouts in nfs_release_page()
+to avoid deadlocks with loopback mounted NFS.
+
+While wait_on_bit_timeout() would be a cleaner interface, it
+will not meet my need.  I need the timeout to be sensitive to
+the state of the connection with the server, which could change.
+ So I need to use an 'action' interface.
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Steve French <sfrench@samba.org>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20140707051604.28027.41257.stgit@notabene.brown
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c1221321b7c25b53204447cff9949a6d5a7ddddc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+#	include/linux/sunrpc/sched.h
+#	include/linux/wait.h
+#	kernel/wait.c
+diff --cc fs/nfs/pagelist.c
+index 143ab6acb094,745a612dbe22..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -129,8 -117,8 +129,13 @@@ __nfs_iocounter_wait(struct nfs_io_coun
+  		set_bit(NFS_IO_INPROGRESS, &c->flags);
+  		if (atomic_read(&c->io_count) == 0)
+  			break;
+++<<<<<<< HEAD
+ +		ret = nfs_wait_bit_killable(&c->flags);
+ +	} while (atomic_read(&c->io_count) != 0 && !ret);
+++=======
++ 		ret = nfs_wait_bit_killable(&q.key);
++ 	} while (atomic_read(&c->io_count) != 0);
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  	finish_wait(wq, &q.wait);
+  	return ret;
+  }
+diff --cc include/linux/sunrpc/sched.h
+index bf7e9f6cb001,1a8959944c5f..000000000000
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@@ -236,8 -236,8 +236,13 @@@ void *		rpc_malloc(struct rpc_task *, s
+  void		rpc_free(void *);
+  int		rpciod_up(void);
+  void		rpciod_down(void);
+++<<<<<<< HEAD
+ +int		__rpc_wait_for_completion_task(struct rpc_task *task, int (*)(void *));
+ +#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+++=======
++ int		__rpc_wait_for_completion_task(struct rpc_task *task, wait_bit_action_f *);
++ #ifdef RPC_DEBUG
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  struct net;
+  void		rpc_show_tasks(struct net *);
+  #endif
+diff --cc include/linux/wait.h
+index 65da9e322613,6fb1ba5f9b2f..000000000000
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@@ -21,9 -22,10 +21,16 @@@ struct __wait_queue 
+  };
+  
+  struct wait_bit_key {
+++<<<<<<< HEAD
+ +	void *flags;
+ +	int bit_nr;
+ +#define WAIT_ATOMIC_T_BIT_NR -1
+++=======
++ 	void			*flags;
++ 	int			bit_nr;
++ #define WAIT_ATOMIC_T_BIT_NR	-1
++ 	unsigned long		private;
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  };
+  
+  struct wait_bit_queue {
+@@@ -140,10 -142,10 +147,11 @@@ static inline void __remove_wait_queue(
+  	list_del(&old->task_list);
+  }
+  
++ typedef int wait_bit_action_f(struct wait_bit_key *);
+  void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr, void *key);
+  void __wake_up_locked_key(wait_queue_head_t *q, unsigned int mode, void *key);
+ -void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode, int nr, void *key);
+ +void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode, int nr,
+ +			void *key);
+  void __wake_up_locked(wait_queue_head_t *q, unsigned int mode, int nr);
+  void __wake_up_sync(wait_queue_head_t *q, unsigned int mode, int nr);
+  void __wake_up_bit(wait_queue_head_t *, void *, int);
+@@@ -982,6 -856,10 +990,13 @@@ int wake_bit_function(wait_queue_t *wai
+  		(wait)->flags = 0;					\
+  	} while (0)
+  
+++<<<<<<< HEAD
+++=======
++ 
++ extern int bit_wait(struct wait_bit_key *);
++ extern int bit_wait_io(struct wait_bit_key *);
++ 
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  /**
+   * wait_on_bit - wait for a bit to be cleared
+   * @word: the word being waited on, a kernel virtual address
+@@@ -995,9 -872,62 +1010,64 @@@
+   * call wait_on_bit() in threads waiting for the bit to clear.
+   * One uses wait_on_bit() where one is waiting for the bit to clear,
+   * but has no intention of setting it.
+ - * Returned value will be zero if the bit was cleared, or non-zero
+ - * if the process received a signal and the mode permitted wakeup
+ - * on that signal.
+   */
+++<<<<<<< HEAD
+ +static inline int wait_on_bit(void *word, int bit,
+ +				int (*action)(void *), unsigned mode)
+++=======
++ static inline int
++ wait_on_bit(void *word, int bit, unsigned mode)
++ {
++ 	if (!test_bit(bit, word))
++ 		return 0;
++ 	return out_of_line_wait_on_bit(word, bit,
++ 				       bit_wait,
++ 				       mode);
++ }
++ 
++ /**
++  * wait_on_bit_io - wait for a bit to be cleared
++  * @word: the word being waited on, a kernel virtual address
++  * @bit: the bit of the word being waited on
++  * @mode: the task state to sleep in
++  *
++  * Use the standard hashed waitqueue table to wait for a bit
++  * to be cleared.  This is similar to wait_on_bit(), but calls
++  * io_schedule() instead of schedule() for the actual waiting.
++  *
++  * Returned value will be zero if the bit was cleared, or non-zero
++  * if the process received a signal and the mode permitted wakeup
++  * on that signal.
++  */
++ static inline int
++ wait_on_bit_io(void *word, int bit, unsigned mode)
++ {
++ 	if (!test_bit(bit, word))
++ 		return 0;
++ 	return out_of_line_wait_on_bit(word, bit,
++ 				       bit_wait_io,
++ 				       mode);
++ }
++ 
++ /**
++  * wait_on_bit_action - wait for a bit to be cleared
++  * @word: the word being waited on, a kernel virtual address
++  * @bit: the bit of the word being waited on
++  * @action: the function used to sleep, which may take special actions
++  * @mode: the task state to sleep in
++  *
++  * Use the standard hashed waitqueue table to wait for a bit
++  * to be cleared, and allow the waiting action to be specified.
++  * This is like wait_on_bit() but allows fine control of how the waiting
++  * is done.
++  *
++  * Returned value will be zero if the bit was cleared, or non-zero
++  * if the process received a signal and the mode permitted wakeup
++  * on that signal.
++  */
++ static inline int
++ wait_on_bit_action(void *word, int bit, wait_bit_action_f *action, unsigned mode)
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  {
+  	if (!test_bit(bit, word))
+  		return 0;
+@@@ -1019,9 -948,61 +1089,62 @@@
+   * wait_on_bit() in threads waiting to be able to set the bit.
+   * One uses wait_on_bit_lock() where one is waiting for the bit to
+   * clear with the intention of setting it, and when done, clearing it.
+ - *
+ - * Returns zero if the bit was (eventually) found to be clear and was
+ - * set.  Returns non-zero if a signal was delivered to the process and
+ - * the @mode allows that signal to wake the process.
+   */
+++<<<<<<< HEAD
+ +static inline int wait_on_bit_lock(void *word, int bit,
+ +				int (*action)(void *), unsigned mode)
+++=======
++ static inline int
++ wait_on_bit_lock(void *word, int bit, unsigned mode)
++ {
++ 	if (!test_and_set_bit(bit, word))
++ 		return 0;
++ 	return out_of_line_wait_on_bit_lock(word, bit, bit_wait, mode);
++ }
++ 
++ /**
++  * wait_on_bit_lock_io - wait for a bit to be cleared, when wanting to set it
++  * @word: the word being waited on, a kernel virtual address
++  * @bit: the bit of the word being waited on
++  * @mode: the task state to sleep in
++  *
++  * Use the standard hashed waitqueue table to wait for a bit
++  * to be cleared and then to atomically set it.  This is similar
++  * to wait_on_bit(), but calls io_schedule() instead of schedule()
++  * for the actual waiting.
++  *
++  * Returns zero if the bit was (eventually) found to be clear and was
++  * set.  Returns non-zero if a signal was delivered to the process and
++  * the @mode allows that signal to wake the process.
++  */
++ static inline int
++ wait_on_bit_lock_io(void *word, int bit, unsigned mode)
++ {
++ 	if (!test_and_set_bit(bit, word))
++ 		return 0;
++ 	return out_of_line_wait_on_bit_lock(word, bit, bit_wait_io, mode);
++ }
++ 
++ /**
++  * wait_on_bit_lock_action - wait for a bit to be cleared, when wanting to set it
++  * @word: the word being waited on, a kernel virtual address
++  * @bit: the bit of the word being waited on
++  * @action: the function used to sleep, which may take special actions
++  * @mode: the task state to sleep in
++  *
++  * Use the standard hashed waitqueue table to wait for a bit
++  * to be cleared and then to set it, and allow the waiting action
++  * to be specified.
++  * This is like wait_on_bit() but allows fine control of how the waiting
++  * is done.
++  *
++  * Returns zero if the bit was (eventually) found to be clear and was
++  * set.  Returns non-zero if a signal was delivered to the process and
++  * the @mode allows that signal to wake the process.
++  */
++ static inline int
++ wait_on_bit_lock_action(void *word, int bit, wait_bit_action_f *action, unsigned mode)
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout)
+  {
+  	if (!test_and_set_bit(bit, word))
+  		return 0;
+diff --cc kernel/wait.c
+index d550920e040c,15cab1a4f84e..000000000000
+--- a/kernel/wait.c
++++ b/kernel/wait.c
+@@@ -375,3 -502,21 +375,24 @@@ void wake_up_atomic_t(atomic_t *p
+  	__wake_up_bit(atomic_t_waitqueue(p), p, WAIT_ATOMIC_T_BIT_NR);
+  }
+  EXPORT_SYMBOL(wake_up_atomic_t);
+++<<<<<<< HEAD:kernel/wait.c
+++=======
++ 
++ __sched int bit_wait(struct wait_bit_key *word)
++ {
++ 	if (signal_pending_state(current->state, current))
++ 		return 1;
++ 	schedule();
++ 	return 0;
++ }
++ EXPORT_SYMBOL(bit_wait);
++ 
++ __sched int bit_wait_io(struct wait_bit_key *word)
++ {
++ 	if (signal_pending_state(current->state, current))
++ 		return 1;
++ 	io_schedule();
++ 	return 0;
++ }
++ EXPORT_SYMBOL(bit_wait_io);
+++>>>>>>> c1221321b7c2 (sched: Allow wait_on_bit_action() functions to support a timeout):kernel/sched/wait.c
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index 5e1a25971732..0162e4375432 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -1808,7 +1808,7 @@ cifs_invalidate_mapping(struct inode *inode)
+  * @word: long word containing the bit lock
+  */
+ static int
+-cifs_wait_bit_killable(void *word)
++cifs_wait_bit_killable(struct wait_bit_key *key)
+ {
+ 	if (fatal_signal_pending(current))
+ 		return -ERESTARTSYS;
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 010d0b9d900b..5a9b9675cd14 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -75,7 +75,7 @@ nfs_fattr_to_ino_t(struct nfs_fattr *fattr)
+  * nfs_wait_bit_killable - helper for functions that are sleeping on bit locks
+  * @word: long word containing the bit lock
+  */
+-int nfs_wait_bit_killable(void *word)
++int nfs_wait_bit_killable(struct wait_bit_key *key)
+ {
+ 	if (fatal_signal_pending(current))
+ 		return -ERESTARTSYS;
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 756432218866..c46f71d5b831 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -364,7 +364,7 @@ extern int nfs_drop_inode(struct inode *);
+ extern void nfs_clear_inode(struct inode *);
+ extern void nfs_evict_inode(struct inode *);
+ void nfs_zap_acl_cache(struct inode *inode);
+-extern int nfs_wait_bit_killable(void *word);
++extern int nfs_wait_bit_killable(struct wait_bit_key *key);
+ 
+ /* super.c */
+ extern const struct super_operations nfs_sops;
+* Unmerged path fs/nfs/pagelist.c
+* Unmerged path include/linux/sunrpc/sched.h
+* Unmerged path include/linux/wait.h
+* Unmerged path kernel/wait.c
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index fae7a88bc14d..17311b618262 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -250,7 +250,7 @@ void rpc_destroy_wait_queue(struct rpc_wait_queue *queue)
+ }
+ EXPORT_SYMBOL_GPL(rpc_destroy_wait_queue);
+ 
+-static int rpc_wait_bit_killable(void *word)
++static int rpc_wait_bit_killable(struct wait_bit_key *key)
+ {
+ 	if (fatal_signal_pending(current))
+ 		return -ERESTARTSYS;
+@@ -309,7 +309,7 @@ static int rpc_complete_task(struct rpc_task *task)
+  * to enforce taking of the wq->lock and hence avoid races with
+  * rpc_complete_task().
+  */
+-int __rpc_wait_for_completion_task(struct rpc_task *task, int (*action)(void *))
++int __rpc_wait_for_completion_task(struct rpc_task *task, wait_bit_action_f *action)
+ {
+ 	if (action == NULL)
+ 		action = rpc_wait_bit_killable;
