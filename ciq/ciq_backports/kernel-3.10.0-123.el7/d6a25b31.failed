@@ -1,0 +1,216 @@
+blk-mq: support partial I/O completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit d6a25b31315327eef7785b895c354cc45c3f3742
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/d6a25b31.failed
+
+Add a new blk_mq_end_io_partial function to partially complete requests
+as needed by the SCSI layer.  We do this by reusing blk_update_request
+to advance the bio instead of having a simplified version of it in
+the blk-mq code.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit d6a25b31315327eef7785b895c354cc45c3f3742)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 93c74da63cd4,1b8b50df3655..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -285,38 -283,10 +285,43 @@@ void blk_mq_free_request(struct reques
+  	__blk_mq_free_request(hctx, ctx, rq);
+  }
+  
+- static void blk_mq_bio_endio(struct request *rq, struct bio *bio, int error)
++ bool blk_mq_end_io_partial(struct request *rq, int error, unsigned int nr_bytes)
+  {
+++<<<<<<< HEAD
+ +	if (error)
+ +		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
+ +		error = -EIO;
+ +
+ +	if (unlikely(rq->cmd_flags & REQ_QUIET))
+ +		set_bit(BIO_QUIET, &bio->bi_flags);
+ +
+ +	/* don't actually finish bio if it's part of flush sequence */
+ +	if (!(rq->cmd_flags & REQ_FLUSH_SEQ))
+ +		bio_endio(bio, error);
+ +}
+ +
+ +void blk_mq_complete_request(struct request *rq, int error)
+ +{
+ +	struct bio *bio = rq->bio;
+ +	unsigned int bytes = 0;
+ +
+ +	trace_block_rq_complete(rq->q, rq);
+ +
+ +	while (bio) {
+ +		struct bio *next = bio->bi_next;
+ +
+ +		bio->bi_next = NULL;
+ +		bytes += bio->bi_size;
+ +		blk_mq_bio_endio(rq, bio, error);
+ +		bio = next;
+ +	}
+ +
+ +	blk_account_io_completion(rq, bytes);
+++=======
++ 	if (blk_update_request(rq, error, blk_rq_bytes(rq)))
++ 		return true;
+++>>>>>>> d6a25b313153 (blk-mq: support partial I/O completions)
+  
+  	blk_account_io_done(rq);
+  
+@@@ -324,86 -294,55 +329,91 @@@
+  		rq->end_io(rq, error);
+  	else
+  		blk_mq_free_request(rq);
++ 	return false;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(blk_mq_end_io_partial);
+++>>>>>>> d6a25b313153 (blk-mq: support partial I/O completions)
+  
+ -static void __blk_mq_complete_request_remote(void *data)
+ +void __blk_mq_end_io(struct request *rq, int error)
+  {
+ -	struct request *rq = data;
+ -
+ -	rq->q->softirq_done_fn(rq);
+ +	if (!blk_mark_rq_complete(rq))
+ +		blk_mq_complete_request(rq, error);
+  }
+  
+ -void __blk_mq_complete_request(struct request *rq)
+ +#if defined(CONFIG_SMP) && defined(CONFIG_USE_GENERIC_SMP_HELPERS)
+ +
+ +/*
+ + * Called with interrupts disabled.
+ + */
+ +static void ipi_end_io(void *data)
+  {
+ -	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ -	int cpu;
+ +	struct llist_head *list = &per_cpu(ipi_lists, smp_processor_id());
+ +	struct llist_node *entry, *next;
+ +	struct request *rq;
+  
+ -	if (!ctx->ipi_redirect) {
+ -		rq->q->softirq_done_fn(rq);
+ -		return;
+ +	entry = llist_del_all(list);
+ +
+ +	while (entry) {
+ +		next = entry->next;
+ +		rq = llist_entry(entry, struct request, ll_list);
+ +		__blk_mq_end_io(rq, rq->errors);
+ +		entry = next;
+  	}
+ +}
+  
+ -	cpu = get_cpu();
+ -	if (cpu != ctx->cpu && cpu_online(ctx->cpu)) {
+ -		rq->csd.func = __blk_mq_complete_request_remote;
+ -		rq->csd.info = rq;
+ -		rq->csd.flags = 0;
+ -		__smp_call_function_single(ctx->cpu, &rq->csd, 0);
+ -	} else {
+ -		rq->q->softirq_done_fn(rq);
+ +static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
+ +			  struct request *rq, const int error)
+ +{
+ +	struct call_single_data *data = &rq->csd;
+ +
+ +	rq->errors = error;
+ +	rq->ll_list.next = NULL;
+ +
+ +	/*
+ +	 * If the list is non-empty, an existing IPI must already
+ +	 * be "in flight". If that is the case, we need not schedule
+ +	 * a new one.
+ +	 */
+ +	if (llist_add(&rq->ll_list, &per_cpu(ipi_lists, ctx->cpu))) {
+ +		data->func = ipi_end_io;
+ +		data->flags = 0;
+ +		__smp_call_function_single(ctx->cpu, data, 0);
+  	}
+ -	put_cpu();
+ +
+ +	return true;
+  }
+ +#else /* CONFIG_SMP && CONFIG_USE_GENERIC_SMP_HELPERS */
+ +static int ipi_remote_cpu(struct blk_mq_ctx *ctx, const int cpu,
+ +			  struct request *rq, const int error)
+ +{
+ +	return false;
+ +}
+ +#endif
+  
+ -/**
+ - * blk_mq_complete_request - end I/O on a request
+ - * @rq:		the request being processed
+ - *
+ - * Description:
+ - *	Ends all I/O on a request. It does not handle partial completions.
+ - *	The actual completion happens out-of-order, through a IPI handler.
+ - **/
+ -void blk_mq_complete_request(struct request *rq)
+ +/*
+ + * End IO on this request on a multiqueue enabled driver. We'll either do
+ + * it directly inline, or punt to a local IPI handler on the matching
+ + * remote CPU.
+ + */
+ +void blk_mq_end_io(struct request *rq, int error)
+  {
+ -	if (unlikely(blk_should_fake_timeout(rq->q)))
+ -		return;
+ -	if (!blk_mark_rq_complete(rq))
+ -		__blk_mq_complete_request(rq);
+ +	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ +	int cpu;
+ +
+ +	if (!ctx->ipi_redirect)
+ +		return __blk_mq_end_io(rq, error);
+ +
+ +	cpu = get_cpu();
+ +
+ +	if (cpu == ctx->cpu || !cpu_online(ctx->cpu) ||
+ +	    !ipi_remote_cpu(ctx, cpu, rq, error))
+ +		__blk_mq_end_io(rq, error);
+ +
+ +	put_cpu();
+  }
+ -EXPORT_SYMBOL(blk_mq_complete_request);
+ +EXPORT_SYMBOL(blk_mq_end_io);
+  
+  static void blk_mq_start_request(struct request *rq, bool last)
+  {
+* Unmerged path block/blk-mq.c
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 47900d911b7f..caef40b1f0ca 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -132,7 +132,13 @@ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_ind
+ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_reg *, unsigned int);
+ void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+ 
+-void blk_mq_end_io(struct request *rq, int error);
++bool blk_mq_end_io_partial(struct request *rq, int error,
++		unsigned int nr_bytes);
++static inline void blk_mq_end_io(struct request *rq, int error)
++{
++	bool done = !blk_mq_end_io_partial(rq, error, blk_rq_bytes(rq));
++	BUG_ON(!done);
++}
+ 
+ void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+ void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
