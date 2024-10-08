@@ -1,0 +1,443 @@
+i40e/i40evf: Do not write to descriptor unless we complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 475b4205aa52c16feef08d55c8fd76e815b6bee7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/475b4205.failed
+
+This patch defers writing to the Tx descriptor bits until we know we have
+successfully completed a given operation.  So for example we defer updating
+the tunnelling portion of the context descriptor until we have fully
+identified the type.
+
+The advantage to this approach is that we can assemble values as we go
+instead of having to try and kludge everything together all at once.  As a
+result we can significantly clean up the tunneling configuration for
+instance as we can just do a pointer walk and do the math for the distance
+between each set of points.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 475b4205aa52c16feef08d55c8fd76e815b6bee7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 5a3abb58e191,5b591b865fd5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2420,66 -2392,83 +2420,142 @@@ static void i40e_tx_enable_csum(struct 
+  				struct i40e_ring *tx_ring,
+  				u32 *cd_tunneling)
+  {
+++<<<<<<< HEAD
+ +	struct ipv6hdr *this_ipv6_hdr;
+ +	unsigned int this_tcp_hdrlen;
+ +	struct iphdr *this_ip_hdr;
+ +	u32 network_hdr_len;
+ +	u8 l4_hdr = 0;
+ +	u32 l4_tunnel = 0;
+++=======
++ 	union {
++ 		struct iphdr *v4;
++ 		struct ipv6hdr *v6;
++ 		unsigned char *hdr;
++ 	} ip;
++ 	union {
++ 		struct tcphdr *tcp;
++ 		struct udphdr *udp;
++ 		unsigned char *hdr;
++ 	} l4;
++ 	unsigned char *exthdr;
++ 	u32 offset, cmd = 0, tunnel = 0;
++ 	__be16 frag_off;
++ 	u8 l4_proto = 0;
++ 
++ 	ip.hdr = skb_network_header(skb);
++ 	l4.hdr = skb_transport_header(skb);
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
++ 
++ 	/* compute outer L2 header size */
++ 	offset = ((ip.hdr - skb->data) / 2) << I40E_TX_DESC_LENGTH_MACLEN_SHIFT;
+  
+  	if (skb->encapsulation) {
+++<<<<<<< HEAD
+ +		switch (ip_hdr(skb)->protocol) {
+++=======
++ 		/* define outer network header type */
++ 		if (*tx_flags & I40E_TX_FLAGS_IPV4) {
++ 			tunnel |= (*tx_flags & I40E_TX_FLAGS_TSO) ?
++ 				  I40E_TX_CTX_EXT_IP_IPV4 :
++ 				  I40E_TX_CTX_EXT_IP_IPV4_NO_CSUM;
++ 
++ 			l4_proto = ip.v4->protocol;
++ 		} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
++ 			tunnel |= I40E_TX_CTX_EXT_IP_IPV6;
++ 
++ 			exthdr = ip.hdr + sizeof(*ip.v6);
++ 			l4_proto = ip.v6->nexthdr;
++ 			if (l4.hdr != exthdr)
++ 				ipv6_skip_exthdr(skb, exthdr - skb->data,
++ 						 &l4_proto, &frag_off);
++ 		}
++ 
++ 		/* compute outer L3 header size */
++ 		tunnel |= ((l4.hdr - ip.hdr) / 4) <<
++ 			  I40E_TXD_CTX_QW0_EXT_IPLEN_SHIFT;
++ 
++ 		/* switch IP header pointer from outer to inner header */
++ 		ip.hdr = skb_inner_network_header(skb);
++ 
++ 		/* define outer transport */
++ 		switch (l4_proto) {
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  		case IPPROTO_UDP:
+- 			l4_tunnel = I40E_TXD_CTX_UDP_TUNNELING;
++ 			tunnel |= I40E_TXD_CTX_UDP_TUNNELING;
+  			*tx_flags |= I40E_TX_FLAGS_UDP_TUNNEL;
+  			break;
+  		case IPPROTO_GRE:
+++<<<<<<< HEAD
+ +			l4_tunnel = I40E_TXD_CTX_GRE_TUNNELING;
+++=======
++ 			tunnel |= I40E_TXD_CTX_GRE_TUNNELING;
++ 			*tx_flags |= I40E_TX_FLAGS_UDP_TUNNEL;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  			break;
+  		default:
+  			return;
+  		}
+ +		network_hdr_len = skb_inner_network_header_len(skb);
+ +		this_ip_hdr = inner_ip_hdr(skb);
+ +		this_ipv6_hdr = inner_ipv6_hdr(skb);
+ +		this_tcp_hdrlen = inner_tcp_hdrlen(skb);
+ +
+++<<<<<<< HEAD
+ +		if (*tx_flags & I40E_TX_FLAGS_IPV4) {
+ +			if (*tx_flags & I40E_TX_FLAGS_TSO) {
+ +				*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV4;
+ +			} else {
+ +				*cd_tunneling |=
+ +					 I40E_TX_CTX_EXT_IP_IPV4_NO_CSUM;
+ +			}
+ +		} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
+ +			*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV6;
+ +		}
+  
+ +		/* Now set the ctx descriptor fields */
+ +		*cd_tunneling |= (skb_network_header_len(skb) >> 2) <<
+ +				   I40E_TXD_CTX_QW0_EXT_IPLEN_SHIFT      |
+ +				   l4_tunnel                             |
+ +				   ((skb_inner_network_offset(skb) -
+ +					skb_transport_offset(skb)) >> 1) <<
+ +				   I40E_TXD_CTX_QW0_NATLEN_SHIFT;
+ +		if (this_ip_hdr->version == 6) {
+ +			*tx_flags &= ~I40E_TX_FLAGS_IPV4;
+++=======
++ 		/* compute tunnel header size */
++ 		tunnel |= ((ip.hdr - l4.hdr) / 2) <<
++ 			  I40E_TXD_CTX_QW0_NATLEN_SHIFT;
++ 
++ 		/* record tunnel offload values */
++ 		*cd_tunneling |= tunnel;
++ 
++ 		/* switch L4 header pointer from outer to inner */
++ 		l4.hdr = skb_inner_transport_header(skb);
++ 		l4_proto = 0;
++ 
++ 		/* reset type as we transition from outer to inner headers */
++ 		*tx_flags &= ~(I40E_TX_FLAGS_IPV4 | I40E_TX_FLAGS_IPV6);
++ 		if (ip.v4->version == 4)
++ 			*tx_flags |= I40E_TX_FLAGS_IPV4;
++ 		if (ip.v6->version == 6)
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  			*tx_flags |= I40E_TX_FLAGS_IPV6;
+ +		}
+ +		if ((tx_ring->flags & I40E_TXR_FLAGS_OUTER_UDP_CSUM) &&
+ +		    (l4_tunnel == I40E_TXD_CTX_UDP_TUNNELING)        &&
+ +		    (*cd_tunneling & I40E_TXD_CTX_QW0_EXT_IP_MASK)) {
+ +			oudph->check = ~csum_tcpudp_magic(oiph->saddr,
+ +					oiph->daddr,
+ +					(skb->len - skb_transport_offset(skb)),
+ +					IPPROTO_UDP, 0);
+ +			*cd_tunneling |= I40E_TXD_CTX_QW0_L4T_CS_MASK;
+ +		}
+ +	} else {
+ +		network_hdr_len = skb_network_header_len(skb);
+ +		this_ip_hdr = ip_hdr(skb);
+ +		this_ipv6_hdr = ipv6_hdr(skb);
+ +		this_tcp_hdrlen = tcp_hdrlen(skb);
+  	}
+  
+  	/* Enable IP checksum offloads */
+@@@ -2488,32 -2477,28 +2564,55 @@@
+  		/* the stack computes the IP header already, the only time we
+  		 * need the hardware to recompute it is in the case of TSO.
+  		 */
+++<<<<<<< HEAD
+ +		if (*tx_flags & I40E_TX_FLAGS_TSO) {
+ +			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4_CSUM;
+ +		} else {
+ +			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4;
+ +		}
+ +		/* Now set the td_offset for IP header length */
+ +		*td_offset = (network_hdr_len >> 2) <<
+ +			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+ +	} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
+ +		l4_hdr = this_ipv6_hdr->nexthdr;
+ +		*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV6;
+ +		/* Now set the td_offset for IP header length */
+ +		*td_offset = (network_hdr_len >> 2) <<
+ +			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+ +	}
+ +	/* words in MACLEN + dwords in IPLEN + dwords in L4Len */
+ +	*td_offset |= (skb_network_offset(skb) >> 1) <<
+ +		       I40E_TX_DESC_LENGTH_MACLEN_SHIFT;
+++=======
++ 		cmd |= (*tx_flags & I40E_TX_FLAGS_TSO) ?
++ 		       I40E_TX_DESC_CMD_IIPT_IPV4_CSUM :
++ 		       I40E_TX_DESC_CMD_IIPT_IPV4;
++ 	} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
++ 		cmd |= I40E_TX_DESC_CMD_IIPT_IPV6;
++ 
++ 		exthdr = ip.hdr + sizeof(*ip.v6);
++ 		l4_proto = ip.v6->nexthdr;
++ 		if (l4.hdr != exthdr)
++ 			ipv6_skip_exthdr(skb, exthdr - skb->data,
++ 					 &l4_proto, &frag_off);
++ 	}
++ 
++ 	/* compute inner L3 header size */
++ 	offset |= ((l4.hdr - ip.hdr) / 4) << I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  
+  	/* Enable L4 checksum offloads */
+ -	switch (l4_proto) {
+ +	switch (l4_hdr) {
+  	case IPPROTO_TCP:
+  		/* enable checksum offloads */
+++<<<<<<< HEAD
+ +		*td_cmd |= I40E_TX_DESC_CMD_L4T_EOFT_TCP;
+ +		*td_offset |= (this_tcp_hdrlen >> 2) <<
+ +			       I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
+++=======
++ 		cmd |= I40E_TX_DESC_CMD_L4T_EOFT_TCP;
++ 		offset |= l4.tcp->doff << I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  		break;
+  	case IPPROTO_SCTP:
+  		/* enable SCTP checksum offload */
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index f6384b0c8220,0ee13f6619c4..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@@ -1628,65 -1609,83 +1628,143 @@@ static void i40e_tx_enable_csum(struct 
+  				struct i40e_ring *tx_ring,
+  				u32 *cd_tunneling)
+  {
+++<<<<<<< HEAD
+ +	struct ipv6hdr *this_ipv6_hdr;
+ +	unsigned int this_tcp_hdrlen;
+ +	struct iphdr *this_ip_hdr;
+ +	u32 network_hdr_len;
+ +	u8 l4_hdr = 0;
+ +	u32 l4_tunnel = 0;
+++=======
++ 	union {
++ 		struct iphdr *v4;
++ 		struct ipv6hdr *v6;
++ 		unsigned char *hdr;
++ 	} ip;
++ 	union {
++ 		struct tcphdr *tcp;
++ 		struct udphdr *udp;
++ 		unsigned char *hdr;
++ 	} l4;
++ 	unsigned char *exthdr;
++ 	u32 offset, cmd = 0, tunnel = 0;
++ 	__be16 frag_off;
++ 	u8 l4_proto = 0;
++ 
++ 	ip.hdr = skb_network_header(skb);
++ 	l4.hdr = skb_transport_header(skb);
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
++ 
++ 	/* compute outer L2 header size */
++ 	offset = ((ip.hdr - skb->data) / 2) << I40E_TX_DESC_LENGTH_MACLEN_SHIFT;
+  
+  	if (skb->encapsulation) {
+++<<<<<<< HEAD
+ +		switch (ip_hdr(skb)->protocol) {
+++=======
++ 		/* define outer network header type */
++ 		if (*tx_flags & I40E_TX_FLAGS_IPV4) {
++ 			tunnel |= (*tx_flags & I40E_TX_FLAGS_TSO) ?
++ 				  I40E_TX_CTX_EXT_IP_IPV4 :
++ 				  I40E_TX_CTX_EXT_IP_IPV4_NO_CSUM;
++ 
++ 			l4_proto = ip.v4->protocol;
++ 		} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
++ 			tunnel |= I40E_TX_CTX_EXT_IP_IPV6;
++ 
++ 			exthdr = ip.hdr + sizeof(*ip.v6);
++ 			l4_proto = ip.v6->nexthdr;
++ 			if (l4.hdr != exthdr)
++ 				ipv6_skip_exthdr(skb, exthdr - skb->data,
++ 						 &l4_proto, &frag_off);
++ 		}
++ 
++ 		/* compute outer L3 header size */
++ 		tunnel |= ((l4.hdr - ip.hdr) / 4) <<
++ 			  I40E_TXD_CTX_QW0_EXT_IPLEN_SHIFT;
++ 
++ 		/* switch IP header pointer from outer to inner header */
++ 		ip.hdr = skb_inner_network_header(skb);
++ 
++ 		/* define outer transport */
++ 		switch (l4_proto) {
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  		case IPPROTO_UDP:
+- 			l4_tunnel = I40E_TXD_CTX_UDP_TUNNELING;
++ 			tunnel |= I40E_TXD_CTX_UDP_TUNNELING;
+  			*tx_flags |= I40E_TX_FLAGS_VXLAN_TUNNEL;
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case IPPROTO_GRE:
++ 			tunnel |= I40E_TXD_CTX_GRE_TUNNELING;
++ 			*tx_flags |= I40E_TX_FLAGS_VXLAN_TUNNEL;
++ 			break;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  		default:
+  			return;
+  		}
+ +		network_hdr_len = skb_inner_network_header_len(skb);
+ +		this_ip_hdr = inner_ip_hdr(skb);
+ +		this_ipv6_hdr = inner_ipv6_hdr(skb);
+ +		this_tcp_hdrlen = inner_tcp_hdrlen(skb);
+  
+++<<<<<<< HEAD
+ +		if (*tx_flags & I40E_TX_FLAGS_IPV4) {
+ +			if (*tx_flags & I40E_TX_FLAGS_TSO) {
+ +				*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV4;
+ +			} else {
+ +				*cd_tunneling |=
+ +					 I40E_TX_CTX_EXT_IP_IPV4_NO_CSUM;
+ +			}
+ +		} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
+ +			*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV6;
+ +		}
+ +
+ +		/* Now set the ctx descriptor fields */
+ +		*cd_tunneling |= (skb_network_header_len(skb) >> 2) <<
+ +				   I40E_TXD_CTX_QW0_EXT_IPLEN_SHIFT      |
+ +				   l4_tunnel                             |
+ +				   ((skb_inner_network_offset(skb) -
+ +					skb_transport_offset(skb)) >> 1) <<
+ +				   I40E_TXD_CTX_QW0_NATLEN_SHIFT;
+ +		if (this_ip_hdr->version == 6) {
+ +			*tx_flags &= ~I40E_TX_FLAGS_IPV4;
+++=======
++ 		/* compute tunnel header size */
++ 		tunnel |= ((ip.hdr - l4.hdr) / 2) <<
++ 			  I40E_TXD_CTX_QW0_NATLEN_SHIFT;
++ 
++ 		/* record tunnel offload values */
++ 		*cd_tunneling |= tunnel;
++ 
++ 		/* switch L4 header pointer from outer to inner */
++ 		l4.hdr = skb_inner_transport_header(skb);
++ 		l4_proto = 0;
++ 
++ 		/* reset type as we transition from outer to inner headers */
++ 		*tx_flags &= ~(I40E_TX_FLAGS_IPV4 | I40E_TX_FLAGS_IPV6);
++ 		if (ip.v4->version == 4)
++ 			*tx_flags |= I40E_TX_FLAGS_IPV4;
++ 		if (ip.v6->version == 6)
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  			*tx_flags |= I40E_TX_FLAGS_IPV6;
+ +		}
+ +
+ +
+ +		if ((tx_ring->flags & I40E_TXR_FLAGS_OUTER_UDP_CSUM) &&
+ +		    (l4_tunnel == I40E_TXD_CTX_UDP_TUNNELING)        &&
+ +		    (*cd_tunneling & I40E_TXD_CTX_QW0_EXT_IP_MASK)) {
+ +			oudph->check = ~csum_tcpudp_magic(oiph->saddr,
+ +					oiph->daddr,
+ +					(skb->len - skb_transport_offset(skb)),
+ +					IPPROTO_UDP, 0);
+ +			*cd_tunneling |= I40E_TXD_CTX_QW0_L4T_CS_MASK;
+ +		}
+ +	} else {
+ +		network_hdr_len = skb_network_header_len(skb);
+ +		this_ip_hdr = ip_hdr(skb);
+ +		this_ipv6_hdr = ipv6_hdr(skb);
+ +		this_tcp_hdrlen = tcp_hdrlen(skb);
+  	}
+  
+  	/* Enable IP checksum offloads */
+@@@ -1695,32 -1694,28 +1773,55 @@@
+  		/* the stack computes the IP header already, the only time we
+  		 * need the hardware to recompute it is in the case of TSO.
+  		 */
+++<<<<<<< HEAD
+ +		if (*tx_flags & I40E_TX_FLAGS_TSO) {
+ +			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4_CSUM;
+ +		} else {
+ +			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4;
+ +		}
+ +		/* Now set the td_offset for IP header length */
+ +		*td_offset = (network_hdr_len >> 2) <<
+ +			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+ +	} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
+ +		l4_hdr = this_ipv6_hdr->nexthdr;
+ +		*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV6;
+ +		/* Now set the td_offset for IP header length */
+ +		*td_offset = (network_hdr_len >> 2) <<
+ +			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+ +	}
+ +	/* words in MACLEN + dwords in IPLEN + dwords in L4Len */
+ +	*td_offset |= (skb_network_offset(skb) >> 1) <<
+ +		       I40E_TX_DESC_LENGTH_MACLEN_SHIFT;
+++=======
++ 		cmd |= (*tx_flags & I40E_TX_FLAGS_TSO) ?
++ 		       I40E_TX_DESC_CMD_IIPT_IPV4_CSUM :
++ 		       I40E_TX_DESC_CMD_IIPT_IPV4;
++ 	} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
++ 		cmd |= I40E_TX_DESC_CMD_IIPT_IPV6;
++ 
++ 		exthdr = ip.hdr + sizeof(*ip.v6);
++ 		l4_proto = ip.v6->nexthdr;
++ 		if (l4.hdr != exthdr)
++ 			ipv6_skip_exthdr(skb, exthdr - skb->data,
++ 					 &l4_proto, &frag_off);
++ 	}
++ 
++ 	/* compute inner L3 header size */
++ 	offset |= ((l4.hdr - ip.hdr) / 4) << I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  
+  	/* Enable L4 checksum offloads */
+ -	switch (l4_proto) {
+ +	switch (l4_hdr) {
+  	case IPPROTO_TCP:
+  		/* enable checksum offloads */
+++<<<<<<< HEAD
+ +		*td_cmd |= I40E_TX_DESC_CMD_L4T_EOFT_TCP;
+ +		*td_offset |= (this_tcp_hdrlen >> 2) <<
+ +			       I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
+++=======
++ 		cmd |= I40E_TX_DESC_CMD_L4T_EOFT_TCP;
++ 		offset |= l4.tcp->doff << I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
+++>>>>>>> 475b4205aa52 (i40e/i40evf: Do not write to descriptor unless we complete)
+  		break;
+  	case IPPROTO_SCTP:
+  		/* enable SCTP checksum offload */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.c
