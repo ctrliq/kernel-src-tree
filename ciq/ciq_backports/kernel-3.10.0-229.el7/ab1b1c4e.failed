@@ -1,0 +1,207 @@
+cpufreq: send new set of notification for transition failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] send new set of notification for transition failures (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 92.04%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit ab1b1c4e8223f9ee66aa93aaf64c36e77cadffac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ab1b1c4e.failed
+
+In the current code, if we fail during a frequency transition, we
+simply send the POSTCHANGE notification with the old frequency. This
+isn't enough.
+
+One of the core users of these notifications is the code responsible
+for keeping loops_per_jiffy aligned with frequency changes. And mostly
+it is written as:
+
+	if ((val == CPUFREQ_PRECHANGE  && freq->old < freq->new) ||
+	    (val == CPUFREQ_POSTCHANGE && freq->old > freq->new)) {
+		update-loops-per-jiffy...
+	}
+
+So, suppose we are changing to a higher frequency and failed during
+transition, then following will happen:
+- CPUFREQ_PRECHANGE notification with freq-new > freq-old
+- CPUFREQ_POSTCHANGE notification with freq-new == freq-old
+
+The first one will update loops_per_jiffy and second one will do
+nothing. Even if we send the 2nd notification by exchanging values of
+freq-new and old, some users of these notifications might get
+unstable.
+
+This can be fixed by simply calling cpufreq_notify_post_transition()
+with error code and this routine will take care of sending
+notifications in the correct order.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+[rjw: Folded 3 patches into one, rebased unicore2 changes]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit ab1b1c4e8223f9ee66aa93aaf64c36e77cadffac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 7e78bc2de297,d533c205eea4..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1570,7 -1695,55 +1570,53 @@@ int __cpufreq_driver_target(struct cpuf
+  
+  	if (cpufreq_driver->target)
+  		retval = cpufreq_driver->target(policy, target_freq, relation);
+ -	else if (cpufreq_driver->target_index) {
+ -		struct cpufreq_frequency_table *freq_table;
+ -		struct cpufreq_freqs freqs;
+ -		bool notify;
+ -		int index;
+  
+++<<<<<<< HEAD
+++=======
++ 		freq_table = cpufreq_frequency_get_table(policy->cpu);
++ 		if (unlikely(!freq_table)) {
++ 			pr_err("%s: Unable to find freq_table\n", __func__);
++ 			goto out;
++ 		}
++ 
++ 		retval = cpufreq_frequency_table_target(policy, freq_table,
++ 				target_freq, relation, &index);
++ 		if (unlikely(retval)) {
++ 			pr_err("%s: Unable to find matching freq\n", __func__);
++ 			goto out;
++ 		}
++ 
++ 		if (freq_table[index].frequency == policy->cur) {
++ 			retval = 0;
++ 			goto out;
++ 		}
++ 
++ 		notify = !(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION);
++ 
++ 		if (notify) {
++ 			freqs.old = policy->cur;
++ 			freqs.new = freq_table[index].frequency;
++ 			freqs.flags = 0;
++ 
++ 			pr_debug("%s: cpu: %d, oldfreq: %u, new freq: %u\n",
++ 					__func__, policy->cpu, freqs.old,
++ 					freqs.new);
++ 
++ 			cpufreq_notify_transition(policy, &freqs,
++ 					CPUFREQ_PRECHANGE);
++ 		}
++ 
++ 		retval = cpufreq_driver->target_index(policy, index);
++ 		if (retval)
++ 			pr_err("%s: Failed to change cpu frequency: %d\n",
++ 					__func__, retval);
++ 
++ 		if (notify)
++ 			cpufreq_notify_post_transition(policy, &freqs, retval);
++ 	}
++ 
++ out:
+++>>>>>>> ab1b1c4e8223 (cpufreq: send new set of notification for transition failures)
+  	return retval;
+  }
+  EXPORT_SYMBOL_GPL(__cpufreq_driver_target);
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/drivers/cpufreq/pcc-cpufreq.c b/drivers/cpufreq/pcc-cpufreq.c
+index 1a306ce8f1de..5034c29495ff 100644
+--- a/drivers/cpufreq/pcc-cpufreq.c
++++ b/drivers/cpufreq/pcc-cpufreq.c
+@@ -213,6 +213,7 @@ static int pcc_cpufreq_target(struct cpufreq_policy *policy,
+ 		cpu, target_freq,
+ 		(pcch_virt_addr + pcc_cpu_data->input_offset));
+ 
++	freqs.old = policy->cur;
+ 	freqs.new = target_freq;
+ 	cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+ 
+@@ -228,25 +229,20 @@ static int pcc_cpufreq_target(struct cpufreq_policy *policy,
+ 	memset_io((pcch_virt_addr + pcc_cpu_data->input_offset), 0, BUF_SZ);
+ 
+ 	status = ioread16(&pcch_hdr->status);
++	iowrite16(0, &pcch_hdr->status);
++
++	cpufreq_notify_post_transition(policy, &freqs, status != CMD_COMPLETE);
++	spin_unlock(&pcc_lock);
++
+ 	if (status != CMD_COMPLETE) {
+ 		pr_debug("target: FAILED for cpu %d, with status: 0x%x\n",
+ 			cpu, status);
+-		goto cmd_incomplete;
++		return -EINVAL;
+ 	}
+-	iowrite16(0, &pcch_hdr->status);
+ 
+-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+ 	pr_debug("target: was SUCCESSFUL for cpu %d\n", cpu);
+-	spin_unlock(&pcc_lock);
+ 
+ 	return 0;
+-
+-cmd_incomplete:
+-	freqs.new = freqs.old;
+-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+-	iowrite16(0, &pcch_hdr->status);
+-	spin_unlock(&pcc_lock);
+-	return -EINVAL;
+ }
+ 
+ static int pcc_get_offset(int cpu)
+diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
+index eefb04acff89..7b3b465a5150 100644
+--- a/drivers/cpufreq/powernow-k8.c
++++ b/drivers/cpufreq/powernow-k8.c
+@@ -964,14 +964,9 @@ static int transition_frequency_fidvid(struct powernow_k8_data *data,
+ 	cpufreq_cpu_put(policy);
+ 
+ 	cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+-
+ 	res = transition_fid_vid(data, fid, vid);
+-	if (res)
+-		freqs.new = freqs.old;
+-	else
+-		freqs.new = find_khz_freq_from_fid(data->currfid);
++	cpufreq_notify_post_transition(policy, &freqs, res);
+ 
+-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+ 	return res;
+ }
+ 
+diff --git a/drivers/cpufreq/unicore2-cpufreq.c b/drivers/cpufreq/unicore2-cpufreq.c
+index 6e56ae0997e2..d705b5af5b0a 100644
+--- a/drivers/cpufreq/unicore2-cpufreq.c
++++ b/drivers/cpufreq/unicore2-cpufreq.c
+@@ -46,20 +46,18 @@ static int ucv2_target(struct cpufreq_policy *policy,
+ 			 unsigned int target_freq,
+ 			 unsigned int relation)
+ {
+-	unsigned int cur = ucv2_getspeed(0);
+ 	struct cpufreq_freqs freqs;
+ 	struct clk *mclk = clk_get(NULL, "MAIN_CLK");
++	int ret;
+ 
+-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+-
+-	if (!clk_set_rate(mclk, target_freq * 1000)) {
+-		freqs.old = cur;
+-		freqs.new = target_freq;
+-	}
++	freqs.old = policy->cur;
++	freqs.new = target_freq;
+ 
+-	cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
++	cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
++	ret = clk_set_rate(mclk, target_freq * 1000);
++	cpufreq_notify_post_transition(policy, &freqs, ret);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int __init ucv2_cpu_init(struct cpufreq_policy *policy)
