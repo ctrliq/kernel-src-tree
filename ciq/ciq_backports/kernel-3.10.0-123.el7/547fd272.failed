@@ -1,0 +1,148 @@
+cxgb4: Warn if device doesn't have enough PCI bandwidth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [ethernet] mlx4: Warn if device doesn't have enough PCI bandwidth (Amir Vadai) [1030563 1030565 1030568 1030570 1030571 1030573 1030575]
+Rebuild_FUZZ: 95.41%
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 547fd27241a887c1df020c5f8347e348540f0591
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/547fd272.failed
+
+Check if the device get enough bandwidth from the entire PCI chain to
+satisfy its capabilities. This patch determines the PCIe device's
+bandwidth capabilities by reading its PCIe Link Capabilities registers
+and then call the pcie_get_minimum_link function to ensure that the
+adapter is hooked into a slot which is capable of providing the
+necessary bandwidth capabilities.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 547fd27241a887c1df020c5f8347e348540f0591)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 3cd397d60434,8326a7760ffd..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -5452,13 -4532,81 +5452,86 @@@ static int init_rss(struct adapter *ada
+  	return 0;
+  }
+  
++ static int cxgb4_get_pcie_dev_link_caps(struct adapter *adap,
++ 					enum pci_bus_speed *speed,
++ 					enum pcie_link_width *width)
++ {
++ 	u32 lnkcap1, lnkcap2;
++ 	int err1, err2;
++ 
++ #define  PCIE_MLW_CAP_SHIFT 4   /* start of MLW mask in link capabilities */
++ 
++ 	*speed = PCI_SPEED_UNKNOWN;
++ 	*width = PCIE_LNK_WIDTH_UNKNOWN;
++ 
++ 	err1 = pcie_capability_read_dword(adap->pdev, PCI_EXP_LNKCAP,
++ 					  &lnkcap1);
++ 	err2 = pcie_capability_read_dword(adap->pdev, PCI_EXP_LNKCAP2,
++ 					  &lnkcap2);
++ 	if (!err2 && lnkcap2) { /* PCIe r3.0-compliant */
++ 		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_8_0GB)
++ 			*speed = PCIE_SPEED_8_0GT;
++ 		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_5_0GB)
++ 			*speed = PCIE_SPEED_5_0GT;
++ 		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_2_5GB)
++ 			*speed = PCIE_SPEED_2_5GT;
++ 	}
++ 	if (!err1) {
++ 		*width = (lnkcap1 & PCI_EXP_LNKCAP_MLW) >> PCIE_MLW_CAP_SHIFT;
++ 		if (!lnkcap2) { /* pre-r3.0 */
++ 			if (lnkcap1 & PCI_EXP_LNKCAP_SLS_5_0GB)
++ 				*speed = PCIE_SPEED_5_0GT;
++ 			else if (lnkcap1 & PCI_EXP_LNKCAP_SLS_2_5GB)
++ 				*speed = PCIE_SPEED_2_5GT;
++ 		}
++ 	}
++ 
++ 	if (*speed == PCI_SPEED_UNKNOWN || *width == PCIE_LNK_WIDTH_UNKNOWN)
++ 		return err1 ? err1 : err2 ? err2 : -EINVAL;
++ 	return 0;
++ }
++ 
++ static void cxgb4_check_pcie_caps(struct adapter *adap)
++ {
++ 	enum pcie_link_width width, width_cap;
++ 	enum pci_bus_speed speed, speed_cap;
++ 
++ #define PCIE_SPEED_STR(speed) \
++ 	(speed == PCIE_SPEED_8_0GT ? "8.0GT/s" : \
++ 	 speed == PCIE_SPEED_5_0GT ? "5.0GT/s" : \
++ 	 speed == PCIE_SPEED_2_5GT ? "2.5GT/s" : \
++ 	 "Unknown")
++ 
++ 	if (cxgb4_get_pcie_dev_link_caps(adap, &speed_cap, &width_cap)) {
++ 		dev_warn(adap->pdev_dev,
++ 			 "Unable to determine PCIe device BW capabilities\n");
++ 		return;
++ 	}
++ 
++ 	if (pcie_get_minimum_link(adap->pdev, &speed, &width) ||
++ 	    speed == PCI_SPEED_UNKNOWN || width == PCIE_LNK_WIDTH_UNKNOWN) {
++ 		dev_warn(adap->pdev_dev,
++ 			 "Unable to determine PCI Express bandwidth.\n");
++ 		return;
++ 	}
++ 
++ 	dev_info(adap->pdev_dev, "PCIe link speed is %s, device supports %s\n",
++ 		 PCIE_SPEED_STR(speed), PCIE_SPEED_STR(speed_cap));
++ 	dev_info(adap->pdev_dev, "PCIe link width is x%d, device supports x%d\n",
++ 		 width, width_cap);
++ 	if (speed < speed_cap || width < width_cap)
++ 		dev_info(adap->pdev_dev,
++ 			 "A slot with more lanes and/or higher speed is "
++ 			 "suggested for optimal performance.\n");
++ }
++ 
+  static void print_port_info(const struct net_device *dev)
+  {
+ +	static const char *base[] = {
+ +		"R XFI", "R XAUI", "T SGMII", "T XFI", "T XAUI", "KX4", "CX4",
+ +		"KX", "KR", "R SFP+", "KR/KX", "KR/KX/KX4"
+ +	};
+ +
+  	char buf[80];
+  	char *bufp = buf;
+  	const char *spd = "";
+@@@ -5476,18 -4626,20 +5549,23 @@@
+  		bufp += sprintf(bufp, "1000/");
+  	if (pi->link_cfg.supported & FW_PORT_CAP_SPEED_10G)
+  		bufp += sprintf(bufp, "10G/");
+ -	if (pi->link_cfg.supported & FW_PORT_CAP_SPEED_40G)
+ -		bufp += sprintf(bufp, "40G/");
+  	if (bufp != buf)
+  		--bufp;
+ -	sprintf(bufp, "BASE-%s", t4_get_port_type_description(pi->port_type));
+ +	sprintf(bufp, "BASE-%s", base[pi->port_type]);
+  
+- 	netdev_info(dev, "Chelsio %s rev %d %s %sNIC PCIe x%d%s%s\n",
++ 	netdev_info(dev, "Chelsio %s rev %d %s %sNIC %s\n",
+  		    adap->params.vpd.id,
+++<<<<<<< HEAD
+ +		    CHELSIO_CHIP_RELEASE(adap->params.rev), buf,
+ +		    is_offload(adap) ? "R" : "", adap->params.pci.width, spd,
+++=======
++ 		    CHELSIO_CHIP_RELEASE(adap->params.chip), buf,
++ 		    is_offload(adap) ? "R" : "",
+++>>>>>>> 547fd27241a8 (cxgb4: Warn if device doesn't have enough PCI bandwidth)
+  		    (adap->flags & USING_MSIX) ? " MSI-X" :
+  		    (adap->flags & USING_MSI) ? " MSI" : "");
+ -	netdev_info(dev, "S/N: %s, P/N: %s\n",
+ -		    adap->params.vpd.sn, adap->params.vpd.pn);
+ +	netdev_info(dev, "S/N: %s, E/C: %s\n",
+ +		    adap->params.vpd.sn, adap->params.vpd.ec);
+  }
+  
+  static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
