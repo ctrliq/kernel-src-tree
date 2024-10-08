@@ -408,9 +408,10 @@ static inline bool ixgbe_qv_lock_napi(struct ixgbe_q_vector *q_vector)
 #ifdef LL_EXTENDED_STATS
 		q_vector->tx.ring->stats.yields++;
 #endif
-	} else
+	} else {
 		/* we don't care if someone yielded */
 		q_vector->state = IXGBE_QV_STATE_NAPI;
+	}
 	spin_unlock_bh(&q_vector->lock);
 	return rc;
 }
@@ -442,9 +443,10 @@ static inline bool ixgbe_qv_lock_poll(struct ixgbe_q_vector *q_vector)
 #ifdef LL_EXTENDED_STATS
 		q_vector->rx.ring->stats.yields++;
 #endif
-	} else
+	} else {
 		/* preserve yield marks */
 		q_vector->state |= IXGBE_QV_STATE_POLL;
+	}
 	spin_unlock_bh(&q_vector->lock);
 	return rc;
 }
