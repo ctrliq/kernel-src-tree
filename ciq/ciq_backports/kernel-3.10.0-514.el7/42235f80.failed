@@ -1,0 +1,349 @@
+IB/core: Don't drain non-existent rq queue-pair
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 42235f80ab205bf5020cf33cb3e94455410abe36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/42235f80.failed
+
+The drain_rq function expects a normal receive qp to drain.  A qp can
+only have either a normal rq or an srq.  If there is an srq, there
+is no rq to drain.  Until the API supports draining SRQs, simply
+skip draining the rq when the qp has an srq attached.
+
+Fixes: 765d67748bcf ("IB: new common API for draining queues")
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 42235f80ab205bf5020cf33cb3e94455410abe36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index 6ff33ede8c15,b65b3541e732..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1456,3 -1550,317 +1456,320 @@@ int ib_check_mr_status(struct ib_mr *mr
+  		mr->device->check_mr_status(mr, check_mask, mr_status) : -ENOSYS;
+  }
+  EXPORT_SYMBOL(ib_check_mr_status);
+++<<<<<<< HEAD
+++=======
++ 
++ int ib_set_vf_link_state(struct ib_device *device, int vf, u8 port,
++ 			 int state)
++ {
++ 	if (!device->set_vf_link_state)
++ 		return -ENOSYS;
++ 
++ 	return device->set_vf_link_state(device, vf, port, state);
++ }
++ EXPORT_SYMBOL(ib_set_vf_link_state);
++ 
++ int ib_get_vf_config(struct ib_device *device, int vf, u8 port,
++ 		     struct ifla_vf_info *info)
++ {
++ 	if (!device->get_vf_config)
++ 		return -ENOSYS;
++ 
++ 	return device->get_vf_config(device, vf, port, info);
++ }
++ EXPORT_SYMBOL(ib_get_vf_config);
++ 
++ int ib_get_vf_stats(struct ib_device *device, int vf, u8 port,
++ 		    struct ifla_vf_stats *stats)
++ {
++ 	if (!device->get_vf_stats)
++ 		return -ENOSYS;
++ 
++ 	return device->get_vf_stats(device, vf, port, stats);
++ }
++ EXPORT_SYMBOL(ib_get_vf_stats);
++ 
++ int ib_set_vf_guid(struct ib_device *device, int vf, u8 port, u64 guid,
++ 		   int type)
++ {
++ 	if (!device->set_vf_guid)
++ 		return -ENOSYS;
++ 
++ 	return device->set_vf_guid(device, vf, port, guid, type);
++ }
++ EXPORT_SYMBOL(ib_set_vf_guid);
++ 
++ /**
++  * ib_map_mr_sg() - Map the largest prefix of a dma mapped SG list
++  *     and set it the memory region.
++  * @mr:            memory region
++  * @sg:            dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @page_size:     page vector desired page size
++  *
++  * Constraints:
++  * - The first sg element is allowed to have an offset.
++  * - Each sg element must be aligned to page_size (or physically
++  *   contiguous to the previous element). In case an sg element has a
++  *   non contiguous offset, the mapping prefix will not include it.
++  * - The last sg element is allowed to have length less than page_size.
++  * - If sg_nents total byte length exceeds the mr max_num_sge * page_size
++  *   then only max_num_sg entries will be mapped.
++  * - If the MR was allocated with type IB_MR_TYPE_SG_GAPS_REG, non of these
++  *   constraints holds and the page_size argument is ignored.
++  *
++  * Returns the number of sg elements that were mapped to the memory region.
++  *
++  * After this completes successfully, the  memory region
++  * is ready for registration.
++  */
++ int ib_map_mr_sg(struct ib_mr *mr,
++ 		 struct scatterlist *sg,
++ 		 int sg_nents,
++ 		 unsigned int page_size)
++ {
++ 	if (unlikely(!mr->device->map_mr_sg))
++ 		return -ENOSYS;
++ 
++ 	mr->page_size = page_size;
++ 
++ 	return mr->device->map_mr_sg(mr, sg, sg_nents);
++ }
++ EXPORT_SYMBOL(ib_map_mr_sg);
++ 
++ /**
++  * ib_sg_to_pages() - Convert the largest prefix of a sg list
++  *     to a page vector
++  * @mr:            memory region
++  * @sgl:           dma mapped scatterlist
++  * @sg_nents:      number of entries in sg
++  * @set_page:      driver page assignment function pointer
++  *
++  * Core service helper for drivers to convert the largest
++  * prefix of given sg list to a page vector. The sg list
++  * prefix converted is the prefix that meet the requirements
++  * of ib_map_mr_sg.
++  *
++  * Returns the number of sg elements that were assigned to
++  * a page vector.
++  */
++ int ib_sg_to_pages(struct ib_mr *mr,
++ 		   struct scatterlist *sgl,
++ 		   int sg_nents,
++ 		   int (*set_page)(struct ib_mr *, u64))
++ {
++ 	struct scatterlist *sg;
++ 	u64 last_end_dma_addr = 0;
++ 	unsigned int last_page_off = 0;
++ 	u64 page_mask = ~((u64)mr->page_size - 1);
++ 	int i, ret;
++ 
++ 	mr->iova = sg_dma_address(&sgl[0]);
++ 	mr->length = 0;
++ 
++ 	for_each_sg(sgl, sg, sg_nents, i) {
++ 		u64 dma_addr = sg_dma_address(sg);
++ 		unsigned int dma_len = sg_dma_len(sg);
++ 		u64 end_dma_addr = dma_addr + dma_len;
++ 		u64 page_addr = dma_addr & page_mask;
++ 
++ 		/*
++ 		 * For the second and later elements, check whether either the
++ 		 * end of element i-1 or the start of element i is not aligned
++ 		 * on a page boundary.
++ 		 */
++ 		if (i && (last_page_off != 0 || page_addr != dma_addr)) {
++ 			/* Stop mapping if there is a gap. */
++ 			if (last_end_dma_addr != dma_addr)
++ 				break;
++ 
++ 			/*
++ 			 * Coalesce this element with the last. If it is small
++ 			 * enough just update mr->length. Otherwise start
++ 			 * mapping from the next page.
++ 			 */
++ 			goto next_page;
++ 		}
++ 
++ 		do {
++ 			ret = set_page(mr, page_addr);
++ 			if (unlikely(ret < 0))
++ 				return i ? : ret;
++ next_page:
++ 			page_addr += mr->page_size;
++ 		} while (page_addr < end_dma_addr);
++ 
++ 		mr->length += dma_len;
++ 		last_end_dma_addr = end_dma_addr;
++ 		last_page_off = end_dma_addr & ~page_mask;
++ 	}
++ 
++ 	return i;
++ }
++ EXPORT_SYMBOL(ib_sg_to_pages);
++ 
++ struct ib_drain_cqe {
++ 	struct ib_cqe cqe;
++ 	struct completion done;
++ };
++ 
++ static void ib_drain_qp_done(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct ib_drain_cqe *cqe = container_of(wc->wr_cqe, struct ib_drain_cqe,
++ 						cqe);
++ 
++ 	complete(&cqe->done);
++ }
++ 
++ /*
++  * Post a WR and block until its completion is reaped for the SQ.
++  */
++ static void __ib_drain_sq(struct ib_qp *qp)
++ {
++ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
++ 	struct ib_drain_cqe sdrain;
++ 	struct ib_send_wr swr = {}, *bad_swr;
++ 	int ret;
++ 
++ 	if (qp->send_cq->poll_ctx == IB_POLL_DIRECT) {
++ 		WARN_ONCE(qp->send_cq->poll_ctx == IB_POLL_DIRECT,
++ 			  "IB_POLL_DIRECT poll_ctx not supported for drain\n");
++ 		return;
++ 	}
++ 
++ 	swr.wr_cqe = &sdrain.cqe;
++ 	sdrain.cqe.done = ib_drain_qp_done;
++ 	init_completion(&sdrain.done);
++ 
++ 	ret = ib_modify_qp(qp, &attr, IB_QP_STATE);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain send queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	ret = ib_post_send(qp, &swr, &bad_swr);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain send queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	wait_for_completion(&sdrain.done);
++ }
++ 
++ /*
++  * Post a WR and block until its completion is reaped for the RQ.
++  */
++ static void __ib_drain_rq(struct ib_qp *qp)
++ {
++ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
++ 	struct ib_drain_cqe rdrain;
++ 	struct ib_recv_wr rwr = {}, *bad_rwr;
++ 	int ret;
++ 
++ 	if (qp->recv_cq->poll_ctx == IB_POLL_DIRECT) {
++ 		WARN_ONCE(qp->recv_cq->poll_ctx == IB_POLL_DIRECT,
++ 			  "IB_POLL_DIRECT poll_ctx not supported for drain\n");
++ 		return;
++ 	}
++ 
++ 	rwr.wr_cqe = &rdrain.cqe;
++ 	rdrain.cqe.done = ib_drain_qp_done;
++ 	init_completion(&rdrain.done);
++ 
++ 	ret = ib_modify_qp(qp, &attr, IB_QP_STATE);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain recv queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	ret = ib_post_recv(qp, &rwr, &bad_rwr);
++ 	if (ret) {
++ 		WARN_ONCE(ret, "failed to drain recv queue: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	wait_for_completion(&rdrain.done);
++ }
++ 
++ /**
++  * ib_drain_sq() - Block until all SQ CQEs have been consumed by the
++  *		   application.
++  * @qp:            queue pair to drain
++  *
++  * If the device has a provider-specific drain function, then
++  * call that.  Otherwise call the generic drain function
++  * __ib_drain_sq().
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ and SQ for the drain work request and
++  * completion.
++  *
++  * allocate the CQ using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_sq(struct ib_qp *qp)
++ {
++ 	if (qp->device->drain_sq)
++ 		qp->device->drain_sq(qp);
++ 	else
++ 		__ib_drain_sq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_sq);
++ 
++ /**
++  * ib_drain_rq() - Block until all RQ CQEs have been consumed by the
++  *		   application.
++  * @qp:            queue pair to drain
++  *
++  * If the device has a provider-specific drain function, then
++  * call that.  Otherwise call the generic drain function
++  * __ib_drain_rq().
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ and RQ for the drain work request and
++  * completion.
++  *
++  * allocate the CQ using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_rq(struct ib_qp *qp)
++ {
++ 	if (qp->device->drain_rq)
++ 		qp->device->drain_rq(qp);
++ 	else
++ 		__ib_drain_rq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_rq);
++ 
++ /**
++  * ib_drain_qp() - Block until all CQEs have been consumed by the
++  *		   application on both the RQ and SQ.
++  * @qp:            queue pair to drain
++  *
++  * The caller must:
++  *
++  * ensure there is room in the CQ(s), SQ, and RQ for drain work requests
++  * and completions.
++  *
++  * allocate the CQs using ib_alloc_cq() and the CQ poll context cannot be
++  * IB_POLL_DIRECT.
++  *
++  * ensure that there are no other contexts that are posting WRs concurrently.
++  * Otherwise the drain is not guaranteed.
++  */
++ void ib_drain_qp(struct ib_qp *qp)
++ {
++ 	ib_drain_sq(qp);
++ 	if (!qp->srq)
++ 		ib_drain_rq(qp);
++ }
++ EXPORT_SYMBOL(ib_drain_qp);
+++>>>>>>> 42235f80ab20 (IB/core: Don't drain non-existent rq queue-pair)
+* Unmerged path drivers/infiniband/core/verbs.c
