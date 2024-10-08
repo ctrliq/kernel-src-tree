@@ -1,0 +1,371 @@
+staging/rdma/hfi1: move txreq header code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: move txreq header code (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 89.19%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 45842abbb292338d7d328c40bae411218242d2cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/45842abb.failed
+
+The patch separates the txreq defines into new files, one for
+verbs and one for sdma.
+
+The verbs_txreq implementation handles the setup and teardown
+of the txreq cache, so the register routine is changed to call
+the new init/exit routines.
+
+This patch allows for followup patches enhance the send engine.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 45842abbb292338d7d328c40bae411218242d2cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/sdma.h
+#	drivers/staging/hfi1/sdma_txreq.h
+#	drivers/staging/hfi1/verbs.c
+#	drivers/staging/hfi1/verbs_txreq.c
+#	drivers/staging/hfi1/verbs_txreq.h
+#	drivers/staging/rdma/hfi1/Makefile
+#	drivers/staging/rdma/hfi1/qp.c
+diff --cc drivers/staging/hfi1/sdma.h
+index 94364cf6e6da,76ed2157c514..000000000000
+--- a/drivers/staging/hfi1/sdma.h
++++ b/drivers/staging/hfi1/sdma.h
+@@@ -311,83 -310,6 +310,86 @@@ struct hw_sdma_desc 
+  	__le64 qw[2];
+  };
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/sdma.h
+ +/*
+ + * struct sdma_desc - canonical fragment descriptor
+ + *
+ + * This is the descriptor carried in the tx request
+ + * corresponding to each fragment.
+ + *
+ + */
+ +struct sdma_desc {
+ +	/* private:  don't use directly */
+ +	u64 qw[2];
+ +};
+ +
+ +struct sdma_txreq;
+ +typedef void (*callback_t)(struct sdma_txreq *, int, int);
+ +
+ +/**
+ + * struct sdma_txreq - the sdma_txreq structure (one per packet)
+ + * @list: for use by user and by queuing for wait
+ + *
+ + * This is the representation of a packet which consists of some
+ + * number of fragments.   Storage is provided to within the structure.
+ + * for all fragments.
+ + *
+ + * The storage for the descriptors are automatically extended as needed
+ + * when the currently allocation is exceeded.
+ + *
+ + * The user (Verbs or PSM) may overload this structure with fields
+ + * specific to their use by putting this struct first in their struct.
+ + * The method of allocation of the overloaded structure is user dependent
+ + *
+ + * The list is the only public field in the structure.
+ + *
+ + */
+ +
+ +struct sdma_txreq {
+ +	struct list_head list;
+ +	/* private: */
+ +	struct sdma_desc *descp;
+ +	/* private: */
+ +	void *coalesce_buf;
+ +	/* private: */
+ +	u16 coalesce_idx;
+ +	/* private: */
+ +	struct iowait *wait;
+ +	/* private: */
+ +	callback_t                  complete;
+ +#ifdef CONFIG_HFI1_DEBUG_SDMA_ORDER
+ +	u64 sn;
+ +#endif
+ +	/* private: - used in coalesce/pad processing */
+ +	u16                         packet_len;
+ +	/* private: - down-counted to trigger last */
+ +	u16                         tlen;
+ +	/* private: flags */
+ +	u16                         flags;
+ +	/* private: */
+ +	u16                         num_desc;
+ +	/* private: */
+ +	u16                         desc_limit;
+ +	/* private: */
+ +	u16                         next_descq_idx;
+ +	/* private: */
+ +	struct sdma_desc descs[NUM_DESC];
+ +};
+ +
+ +struct verbs_txreq {
+ +	struct hfi1_pio_header	phdr;
+ +	struct sdma_txreq       txreq;
+ +	struct hfi1_qp           *qp;
+ +	struct hfi1_swqe         *wqe;
+ +	struct rvt_mregion	*mr;
+ +	struct hfi1_sge_state    *ss;
+ +	struct sdma_engine     *sde;
+ +	u16                     hdr_dwords;
+ +	u16                     hdr_inx;
+ +};
+ +
+++=======
+++>>>>>>> 45842abbb292 (staging/rdma/hfi1: move txreq header code):drivers/staging/rdma/hfi1/sdma.h
+  /**
+   * struct sdma_engine - Data pertaining to each SDMA engine.
+   * @dd: a back-pointer to the device data
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,7838b212d50c..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -63,9 -63,9 +63,9 @@@
+  #include "device.h"
+  #include "trace.h"
+  #include "qp.h"
+- #include "sdma.h"
++ #include "verbs_txreq.h"
+  
+ -static unsigned int hfi1_lkey_table_size = 16;
+ +unsigned int hfi1_lkey_table_size = 16;
+  module_param_named(lkey_table_size, hfi1_lkey_table_size, uint,
+  		   S_IRUGO);
+  MODULE_PARM_DESC(lkey_table_size,
+@@@ -726,89 -508,6 +726,92 @@@ void update_sge(struct hfi1_sge_state *
+  	}
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +static noinline struct verbs_txreq *__get_txreq(struct hfi1_ibdev *dev,
+ +						struct hfi1_qp *qp)
+ +{
+ +	struct hfi1_qp_priv *priv = qp->priv;
+ +	struct verbs_txreq *tx;
+ +	unsigned long flags;
+ +
+ +	tx = kmem_cache_alloc(dev->verbs_txreq_cache, GFP_ATOMIC);
+ +	if (!tx) {
+ +		spin_lock_irqsave(&qp->s_lock, flags);
+ +		write_seqlock(&dev->iowait_lock);
+ +		if (ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_RECV_OK &&
+ +		    list_empty(&priv->s_iowait.list)) {
+ +			dev->n_txwait++;
+ +			qp->s_flags |= HFI1_S_WAIT_TX;
+ +			list_add_tail(&priv->s_iowait.list, &dev->txwait);
+ +			trace_hfi1_qpsleep(qp, HFI1_S_WAIT_TX);
+ +			atomic_inc(&qp->refcount);
+ +		}
+ +		qp->s_flags &= ~HFI1_S_BUSY;
+ +		write_sequnlock(&dev->iowait_lock);
+ +		spin_unlock_irqrestore(&qp->s_lock, flags);
+ +		tx = ERR_PTR(-EBUSY);
+ +	}
+ +	return tx;
+ +}
+ +
+ +static inline struct verbs_txreq *get_txreq(struct hfi1_ibdev *dev,
+ +					    struct hfi1_qp *qp)
+ +{
+ +	struct verbs_txreq *tx;
+ +
+ +	tx = kmem_cache_alloc(dev->verbs_txreq_cache, GFP_ATOMIC);
+ +	if (!tx) {
+ +		/* call slow path to get the lock */
+ +		tx =  __get_txreq(dev, qp);
+ +		if (IS_ERR(tx))
+ +			return tx;
+ +	}
+ +	tx->qp = qp;
+ +	return tx;
+ +}
+ +
+ +void hfi1_put_txreq(struct verbs_txreq *tx)
+ +{
+ +	struct hfi1_ibdev *dev;
+ +	struct hfi1_qp *qp;
+ +	unsigned long flags;
+ +	unsigned int seq;
+ +	struct hfi1_qp_priv *priv;
+ +
+ +	qp = tx->qp;
+ +	dev = to_idev(qp->ibqp.device);
+ +
+ +	if (tx->mr) {
+ +		hfi1_put_mr(tx->mr);
+ +		tx->mr = NULL;
+ +	}
+ +	sdma_txclean(dd_from_dev(dev), &tx->txreq);
+ +
+ +	/* Free verbs_txreq and return to slab cache */
+ +	kmem_cache_free(dev->verbs_txreq_cache, tx);
+ +
+ +	do {
+ +		seq = read_seqbegin(&dev->iowait_lock);
+ +		if (!list_empty(&dev->txwait)) {
+ +			struct iowait *wait;
+ +
+ +			write_seqlock_irqsave(&dev->iowait_lock, flags);
+ +			/* Wake up first QP wanting a free struct */
+ +			wait = list_first_entry(&dev->txwait, struct iowait,
+ +						list);
+ +			qp = iowait_to_qp(wait);
+ +			priv = qp->priv;
+ +			list_del_init(&priv->s_iowait.list);
+ +			/* refcount held until actual wake up */
+ +			write_sequnlock_irqrestore(&dev->iowait_lock, flags);
+ +			hfi1_qp_wakeup(qp, HFI1_S_WAIT_TX);
+ +			break;
+ +		}
+ +	} while (read_seqretry(&dev->iowait_lock, seq));
+ +}
+ +
+++=======
+++>>>>>>> 45842abbb292 (staging/rdma/hfi1: move txreq header code):drivers/staging/rdma/hfi1/verbs.c
+  /*
+   * This is called with progress side lock held.
+   */
+@@@ -1799,30 -1327,23 +1802,23 @@@ static void init_ibport(struct hfi1_ppo
+  		ibp->sc_to_sl[i] = i;
+  	}
+  
+ -	spin_lock_init(&ibp->rvp.lock);
+ +	spin_lock_init(&ibp->lock);
+  	/* Set the prefix to the default value (see ch. 4.1.1) */
+ -	ibp->rvp.gid_prefix = IB_DEFAULT_GID_PREFIX;
+ -	ibp->rvp.sm_lid = 0;
+ +	ibp->gid_prefix = IB_DEFAULT_GID_PREFIX;
+ +	ibp->sm_lid = 0;
+  	/* Below should only set bits defined in OPA PortInfo.CapabilityMask */
+ -	ibp->rvp.port_cap_flags = IB_PORT_AUTO_MIGR_SUP |
+ +	ibp->port_cap_flags = IB_PORT_AUTO_MIGR_SUP |
+  		IB_PORT_CAP_MASK_NOTICE_SUP;
+ -	ibp->rvp.pma_counter_select[0] = IB_PMA_PORT_XMIT_DATA;
+ -	ibp->rvp.pma_counter_select[1] = IB_PMA_PORT_RCV_DATA;
+ -	ibp->rvp.pma_counter_select[2] = IB_PMA_PORT_XMIT_PKTS;
+ -	ibp->rvp.pma_counter_select[3] = IB_PMA_PORT_RCV_PKTS;
+ -	ibp->rvp.pma_counter_select[4] = IB_PMA_PORT_XMIT_WAIT;
+ -
+ -	RCU_INIT_POINTER(ibp->rvp.qp[0], NULL);
+ -	RCU_INIT_POINTER(ibp->rvp.qp[1], NULL);
+ +	ibp->pma_counter_select[0] = IB_PMA_PORT_XMIT_DATA;
+ +	ibp->pma_counter_select[1] = IB_PMA_PORT_RCV_DATA;
+ +	ibp->pma_counter_select[2] = IB_PMA_PORT_XMIT_PKTS;
+ +	ibp->pma_counter_select[3] = IB_PMA_PORT_RCV_PKTS;
+ +	ibp->pma_counter_select[4] = IB_PMA_PORT_XMIT_WAIT;
+ +
+ +	RCU_INIT_POINTER(ibp->qp[0], NULL);
+ +	RCU_INIT_POINTER(ibp->qp[1], NULL);
+  }
+  
+- static void verbs_txreq_kmem_cache_ctor(void *obj)
+- {
+- 	struct verbs_txreq *tx = obj;
+- 
+- 	memset(tx, 0, sizeof(*tx));
+- }
+- 
+  /**
+   * hfi1_register_ib_device - register our device with the infiniband core
+   * @dd: the device data structure
+@@@ -1831,19 -1352,12 +1827,17 @@@
+  int hfi1_register_ib_device(struct hfi1_devdata *dd)
+  {
+  	struct hfi1_ibdev *dev = &dd->verbs_dev;
+ -	struct ib_device *ibdev = &dev->rdi.ibdev;
+ +	struct ib_device *ibdev = &dev->ibdev;
+  	struct hfi1_pportdata *ppd = dd->pport;
+ -	unsigned i;
+ +	unsigned i, lk_tab_size;
+  	int ret;
+  	size_t lcpysz = IB_DEVICE_NAME_MAX;
+- 	u16 descq_cnt;
+- 	char buf[TXREQ_NAME_LEN];
+  
+ +	ret = hfi1_qp_init(dev);
+ +	if (ret)
+ +		goto err_qp_init;
+ +
+ +
+  	for (i = 0; i < dd->num_pports; i++)
+  		init_ibport(ppd + i);
+  
+@@@ -2012,21 -1472,13 +1997,25 @@@
+  	if (ret)
+  		goto err_class;
+  
+ -	return ret;
+ +	goto bail;
+  
+  err_class:
+ -	rvt_unregister_device(&dd->verbs_dev.rdi);
+ +	hfi1_free_agents(dev);
+ +err_agents:
+ +	ib_unregister_device(ibdev);
+ +err_reg:
+  err_verbs_txreq:
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	kmem_cache_destroy(dev->verbs_txreq_cache);
+ +	vfree(dev->lk_table.table);
+ +err_lk:
+ +	hfi1_qp_exit(dev);
+ +err_qp_init:
+++=======
++ 	verbs_txreq_exit(dev);
+++>>>>>>> 45842abbb292 (staging/rdma/hfi1: move txreq header code):drivers/staging/rdma/hfi1/verbs.c
+  	dd_dev_err(dd, "cannot register verbs: %d!\n", -ret);
+ +bail:
+  	return ret;
+  }
+  
+@@@ -2045,13 -1494,9 +2034,17 @@@ void hfi1_unregister_ib_device(struct h
+  		dd_dev_err(dd, "txwait list not empty!\n");
+  	if (!list_empty(&dev->memwait))
+  		dd_dev_err(dd, "memwait list not empty!\n");
+ +	if (dev->dma_mr)
+ +		dd_dev_err(dd, "DMA MR not NULL!\n");
+  
+ +	hfi1_qp_exit(dev);
+  	del_timer_sync(&dev->mem_timer);
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	kmem_cache_destroy(dev->verbs_txreq_cache);
+ +	vfree(dev->lk_table.table);
+++=======
++ 	verbs_txreq_exit(dev);
+++>>>>>>> 45842abbb292 (staging/rdma/hfi1: move txreq header code):drivers/staging/rdma/hfi1/verbs.c
+  }
+  
+  void hfi1_cnp_rcv(struct hfi1_packet *packet)
+* Unmerged path drivers/staging/hfi1/sdma_txreq.h
+* Unmerged path drivers/staging/hfi1/verbs_txreq.c
+* Unmerged path drivers/staging/hfi1/verbs_txreq.h
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
+diff --git a/drivers/staging/hfi1/ruc.c b/drivers/staging/hfi1/ruc.c
+index c4280b6f47d4..1b573bd4d09c 100644
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@ -53,7 +53,7 @@
+ #include "hfi.h"
+ #include "mad.h"
+ #include "qp.h"
+-#include "sdma.h"
++#include "verbs_txreq.h"
+ 
+ /*
+  * Convert the AETH RNR timeout code into the number of microseconds.
+* Unmerged path drivers/staging/hfi1/sdma.h
+* Unmerged path drivers/staging/hfi1/sdma_txreq.h
+* Unmerged path drivers/staging/hfi1/verbs.c
+* Unmerged path drivers/staging/hfi1/verbs_txreq.c
+* Unmerged path drivers/staging/hfi1/verbs_txreq.h
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
