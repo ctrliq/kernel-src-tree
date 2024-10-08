@@ -1,0 +1,1140 @@
+ip_tunnels: add IPv6 addresses to ip_tunnel_key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit c1ea5d672aaff08da337dee735dbb548e3415585
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c1ea5d67.failed
+
+Add the IPv6 addresses as an union with IPv4 ones. When using IPv4, the
+newly introduced padding after the IPv4 addresses needs to be zeroed out.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c1ea5d672aaff08da337dee735dbb548e3415585)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/core/filter.c
+#	net/ipv4/ip_gre.c
+#	net/ipv4/ip_tunnel_core.c
+diff --cc drivers/net/vxlan.c
+index 37149323723f,30a7abcf2c09..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1200,6 -1268,32 +1200,35 @@@ static int vxlan_udp_encap_recv(struct 
+  		vni &= VXLAN_VNI_MASK;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vxlan_collect_metadata(vs)) {
++ 		const struct iphdr *iph = ip_hdr(skb);
++ 
++ 		tun_dst = metadata_dst_alloc(sizeof(*md), GFP_ATOMIC);
++ 		if (!tun_dst)
++ 			goto drop;
++ 
++ 		info = &tun_dst->u.tun_info;
++ 		info->key.u.ipv4.src = iph->saddr;
++ 		info->key.u.ipv4.dst = iph->daddr;
++ 		info->key.ipv4_tos = iph->tos;
++ 		info->key.ipv4_ttl = iph->ttl;
++ 		info->key.tp_src = udp_hdr(skb)->source;
++ 		info->key.tp_dst = udp_hdr(skb)->dest;
++ 
++ 		info->mode = IP_TUNNEL_INFO_RX;
++ 		info->key.tun_flags = TUNNEL_KEY;
++ 		info->key.tun_id = cpu_to_be64(vni >> 8);
++ 		if (udp_hdr(skb)->check != 0)
++ 			info->key.tun_flags |= TUNNEL_CSUM;
++ 
++ 		md = ip_tunnel_info_opts(info, sizeof(*md));
++ 	} else {
++ 		memset(md, 0, sizeof(*md));
++ 	}
++ 
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+  	/* For backwards compatibility, only allow reserved fields to be
+  	 * used by VXLAN extensions if explicitly requested.
+  	 */
+@@@ -1888,10 -1906,28 +1917,33 @@@ static void vxlan_xmit_one(struct sk_bu
+  	__be16 df = 0;
+  	__u8 tos, ttl;
+  	int err;
+ -	u32 flags = vxlan->flags;
+  
+++<<<<<<< HEAD
+ +	dst_port = rdst->remote_port ? rdst->remote_port : vxlan->dst_port;
+ +	vni = rdst->remote_vni;
+ +	dst = &rdst->remote_ip;
+++=======
++ 	/* FIXME: Support IPv6 */
++ 	info = skb_tunnel_info(skb, AF_INET);
++ 
++ 	if (rdst) {
++ 		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
++ 		vni = rdst->remote_vni;
++ 		dst = &rdst->remote_ip;
++ 	} else {
++ 		if (!info) {
++ 			WARN_ONCE(1, "%s: Missing encapsulation instructions\n",
++ 				  dev->name);
++ 			goto drop;
++ 		}
++ 
++ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
++ 		vni = be64_to_cpu(info->key.tun_id);
++ 		remote_ip.sin.sin_family = AF_INET;
++ 		remote_ip.sin.sin_addr.s_addr = info->key.u.ipv4.dst;
++ 		dst = &remote_ip;
++ 	}
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+  
+  	if (vxlan_addr_any(dst)) {
+  		if (did_rsc) {
+diff --cc net/core/filter.c
+index f4124aee170e,379568562ffb..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -761,6 -1216,607 +761,610 @@@ int sk_attach_filter(struct sock_fprog 
+  }
+  EXPORT_SYMBOL_GPL(sk_attach_filter);
+  
+++<<<<<<< HEAD
+++=======
++ int sk_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog;
++ 	int err;
++ 
++ 	if (sock_flag(sk, SOCK_FILTER_LOCKED))
++ 		return -EPERM;
++ 
++ 	prog = bpf_prog_get(ufd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_SOCKET_FILTER) {
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = __sk_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ #define BPF_RECOMPUTE_CSUM(flags)	((flags) & 1)
++ 
++ static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	void *from = (void *) (long) r3;
++ 	unsigned int len = (unsigned int) r4;
++ 	char buf[16];
++ 	void *ptr;
++ 
++ 	/* bpf verifier guarantees that:
++ 	 * 'from' pointer points to bpf program stack
++ 	 * 'len' bytes of it were initialized
++ 	 * 'len' > 0
++ 	 * 'skb' is a valid pointer to 'struct sk_buff'
++ 	 *
++ 	 * so check for invalid 'offset' and too large 'len'
++ 	 */
++ 	if (unlikely((u32) offset > 0xffff || len > sizeof(buf)))
++ 		return -EFAULT;
++ 
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     !skb_clone_writable(skb, offset + len)))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, len, buf);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	if (BPF_RECOMPUTE_CSUM(flags))
++ 		skb_postpull_rcsum(skb, ptr, len);
++ 
++ 	memcpy(ptr, from, len);
++ 
++ 	if (ptr == buf)
++ 		/* skb_store_bits cannot return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, len);
++ 
++ 	if (BPF_RECOMPUTE_CSUM(flags) && skb->ip_summed == CHECKSUM_COMPLETE)
++ 		skb->csum = csum_add(skb->csum, csum_partial(ptr, len, 0));
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_store_bytes_proto = {
++ 	.func		= bpf_skb_store_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_STACK,
++ 	.arg4_type	= ARG_CONST_STACK_SIZE,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ #define BPF_HEADER_FIELD_SIZE(flags)	((flags) & 0x0f)
++ #define BPF_IS_PSEUDO_HEADER(flags)	((flags) & 0x10)
++ 
++ static u64 bpf_l3_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     !skb_clone_writable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	switch (BPF_HEADER_FIELD_SIZE(flags)) {
++ 	case 2:
++ 		csum_replace2(ptr, from, to);
++ 		break;
++ 	case 4:
++ 		csum_replace4(ptr, from, to);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_l3_csum_replace_proto = {
++ 	.func		= bpf_l3_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_l4_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	bool is_pseudo = !!BPF_IS_PSEUDO_HEADER(flags);
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     !skb_clone_writable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	switch (BPF_HEADER_FIELD_SIZE(flags)) {
++ 	case 2:
++ 		inet_proto_csum_replace2(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	case 4:
++ 		inet_proto_csum_replace4(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_l4_csum_replace_proto = {
++ 	.func		= bpf_l4_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ #define BPF_IS_REDIRECT_INGRESS(flags)	((flags) & 1)
++ 
++ static u64 bpf_clone_redirect(u64 r1, u64 ifindex, u64 flags, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1, *skb2;
++ 	struct net_device *dev;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
++ 	if (unlikely(!dev))
++ 		return -EINVAL;
++ 
++ 	if (unlikely(!(dev->flags & IFF_UP)))
++ 		return -EINVAL;
++ 
++ 	skb2 = skb_clone(skb, GFP_ATOMIC);
++ 	if (unlikely(!skb2))
++ 		return -ENOMEM;
++ 
++ 	if (BPF_IS_REDIRECT_INGRESS(flags))
++ 		return dev_forward_skb(dev, skb2);
++ 
++ 	skb2->dev = dev;
++ 	return dev_queue_xmit(skb2);
++ }
++ 
++ const struct bpf_func_proto bpf_clone_redirect_proto = {
++ 	.func           = bpf_clone_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_get_cgroup_classid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	return task_get_classid((struct sk_buff *) (unsigned long) r1);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_cgroup_classid_proto = {
++ 	.func           = bpf_get_cgroup_classid,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ static u64 bpf_skb_vlan_push(u64 r1, u64 r2, u64 vlan_tci, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	__be16 vlan_proto = (__force __be16) r2;
++ 
++ 	if (unlikely(vlan_proto != htons(ETH_P_8021Q) &&
++ 		     vlan_proto != htons(ETH_P_8021AD)))
++ 		vlan_proto = htons(ETH_P_8021Q);
++ 
++ 	return skb_vlan_push(skb, vlan_proto, vlan_tci);
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_push_proto = {
++ 	.func           = bpf_skb_vlan_push,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_push_proto);
++ 
++ static u64 bpf_skb_vlan_pop(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 
++ 	return skb_vlan_pop(skb);
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_pop_proto = {
++ 	.func           = bpf_skb_vlan_pop,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_pop_proto);
++ 
++ bool bpf_helper_changes_skb_data(void *func)
++ {
++ 	if (func == bpf_skb_vlan_push)
++ 		return true;
++ 	if (func == bpf_skb_vlan_pop)
++ 		return true;
++ 	return false;
++ }
++ 
++ static u64 bpf_skb_get_tunnel_key(u64 r1, u64 r2, u64 size, u64 flags, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	struct bpf_tunnel_key *to = (struct bpf_tunnel_key *) (long) r2;
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb, AF_INET);
++ 
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key) || flags || !info))
++ 		return -EINVAL;
++ 
++ 	to->tunnel_id = be64_to_cpu(info->key.tun_id);
++ 	to->remote_ipv4 = be32_to_cpu(info->key.u.ipv4.src);
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_get_tunnel_key_proto = {
++ 	.func		= bpf_skb_get_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static struct metadata_dst __percpu *md_dst;
++ 
++ static u64 bpf_skb_set_tunnel_key(u64 r1, u64 r2, u64 size, u64 flags, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	struct bpf_tunnel_key *from = (struct bpf_tunnel_key *) (long) r2;
++ 	struct metadata_dst *md = this_cpu_ptr(md_dst);
++ 	struct ip_tunnel_info *info;
++ 
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key) || flags))
++ 		return -EINVAL;
++ 
++ 	skb_dst_drop(skb);
++ 	dst_hold((struct dst_entry *) md);
++ 	skb_dst_set(skb, (struct dst_entry *) md);
++ 
++ 	info = &md->u.tun_info;
++ 	info->mode = IP_TUNNEL_INFO_TX;
++ 	info->key.tun_id = cpu_to_be64(from->tunnel_id);
++ 	info->key.u.ipv4.dst = cpu_to_be32(from->remote_ipv4);
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_set_tunnel_key_proto = {
++ 	.func		= bpf_skb_set_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static const struct bpf_func_proto *bpf_get_skb_set_tunnel_key_proto(void)
++ {
++ 	if (!md_dst) {
++ 		/* race is not possible, since it's called from
++ 		 * verifier that is holding verifier mutex
++ 		 */
++ 		md_dst = metadata_dst_alloc_percpu(0, GFP_KERNEL);
++ 		if (!md_dst)
++ 			return NULL;
++ 	}
++ 	return &bpf_skb_set_tunnel_key_proto;
++ }
++ 
++ static const struct bpf_func_proto *
++ sk_filter_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_map_lookup_elem:
++ 		return &bpf_map_lookup_elem_proto;
++ 	case BPF_FUNC_map_update_elem:
++ 		return &bpf_map_update_elem_proto;
++ 	case BPF_FUNC_map_delete_elem:
++ 		return &bpf_map_delete_elem_proto;
++ 	case BPF_FUNC_get_prandom_u32:
++ 		return &bpf_get_prandom_u32_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_tail_call:
++ 		return &bpf_tail_call_proto;
++ 	case BPF_FUNC_ktime_get_ns:
++ 		return &bpf_ktime_get_ns_proto;
++ 	case BPF_FUNC_trace_printk:
++ 		return bpf_get_trace_printk_proto();
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ tc_cls_act_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_l3_csum_replace:
++ 		return &bpf_l3_csum_replace_proto;
++ 	case BPF_FUNC_l4_csum_replace:
++ 		return &bpf_l4_csum_replace_proto;
++ 	case BPF_FUNC_clone_redirect:
++ 		return &bpf_clone_redirect_proto;
++ 	case BPF_FUNC_get_cgroup_classid:
++ 		return &bpf_get_cgroup_classid_proto;
++ 	case BPF_FUNC_skb_vlan_push:
++ 		return &bpf_skb_vlan_push_proto;
++ 	case BPF_FUNC_skb_vlan_pop:
++ 		return &bpf_skb_vlan_pop_proto;
++ 	case BPF_FUNC_skb_get_tunnel_key:
++ 		return &bpf_skb_get_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return bpf_get_skb_set_tunnel_key_proto();
++ 	default:
++ 		return sk_filter_func_proto(func_id);
++ 	}
++ }
++ 
++ static bool __is_valid_access(int off, int size, enum bpf_access_type type)
++ {
++ 	/* check bounds */
++ 	if (off < 0 || off >= sizeof(struct __sk_buff))
++ 		return false;
++ 
++ 	/* disallow misaligned access */
++ 	if (off % size != 0)
++ 		return false;
++ 
++ 	/* all __sk_buff fields are __u32 */
++ 	if (size != 4)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool sk_filter_is_valid_access(int off, int size,
++ 				      enum bpf_access_type type)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct __sk_buff, cb[0]) ...
++ 			offsetof(struct __sk_buff, cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return __is_valid_access(off, size, type);
++ }
++ 
++ static bool tc_cls_act_is_valid_access(int off, int size,
++ 				       enum bpf_access_type type)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct __sk_buff, mark):
++ 		case offsetof(struct __sk_buff, tc_index):
++ 		case offsetof(struct __sk_buff, cb[0]) ...
++ 			offsetof(struct __sk_buff, cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 	return __is_valid_access(off, size, type);
++ }
++ 
++ static u32 bpf_net_convert_ctx_access(enum bpf_access_type type, int dst_reg,
++ 				      int src_reg, int ctx_off,
++ 				      struct bpf_insn *insn_buf)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (ctx_off) {
++ 	case offsetof(struct __sk_buff, len):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, len) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, len));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, protocol):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, protocol) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, protocol));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, vlan_proto):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_proto) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, vlan_proto));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, priority):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, priority) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, priority));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ingress_ifindex):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, skb_iif) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, skb_iif));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ifindex):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, ifindex) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(bytes_to_bpf_size(FIELD_SIZEOF(struct sk_buff, dev)),
++ 				      dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, dev));
++ 		*insn++ = BPF_JMP_IMM(BPF_JEQ, dst_reg, 0, 1);
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, dst_reg,
++ 				      offsetof(struct net_device, ifindex));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, hash):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, hash) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, hash));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, mark):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, mark) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, mark));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, mark));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, pkt_type):
++ 		return convert_skb_access(SKF_AD_PKTTYPE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, queue_mapping):
++ 		return convert_skb_access(SKF_AD_QUEUE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_present):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG_PRESENT,
++ 					  dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_tci):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG,
++ 					  dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, cb[0]) ...
++ 		offsetof(struct __sk_buff, cb[4]):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct qdisc_skb_cb, data) < 20);
++ 
++ 		ctx_off -= offsetof(struct __sk_buff, cb[0]);
++ 		ctx_off += offsetof(struct sk_buff, cb);
++ 		ctx_off += offsetof(struct qdisc_skb_cb, data);
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, dst_reg, src_reg, ctx_off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg, ctx_off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, tc_index):
++ #ifdef CONFIG_NET_SCHED
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, tc_index) != 2);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_H, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, tc_index));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, tc_index));
++ 		break;
++ #else
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_MOV64_REG(dst_reg, dst_reg);
++ 		else
++ 			*insn++ = BPF_MOV64_IMM(dst_reg, 0);
++ 		break;
++ #endif
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static const struct bpf_verifier_ops sk_filter_ops = {
++ 	.get_func_proto = sk_filter_func_proto,
++ 	.is_valid_access = sk_filter_is_valid_access,
++ 	.convert_ctx_access = bpf_net_convert_ctx_access,
++ };
++ 
++ static const struct bpf_verifier_ops tc_cls_act_ops = {
++ 	.get_func_proto = tc_cls_act_func_proto,
++ 	.is_valid_access = tc_cls_act_is_valid_access,
++ 	.convert_ctx_access = bpf_net_convert_ctx_access,
++ };
++ 
++ static struct bpf_prog_type_list sk_filter_type __read_mostly = {
++ 	.ops = &sk_filter_ops,
++ 	.type = BPF_PROG_TYPE_SOCKET_FILTER,
++ };
++ 
++ static struct bpf_prog_type_list sched_cls_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_CLS,
++ };
++ 
++ static struct bpf_prog_type_list sched_act_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_ACT,
++ };
++ 
++ static int __init register_sk_filter_ops(void)
++ {
++ 	bpf_register_prog_type(&sk_filter_type);
++ 	bpf_register_prog_type(&sched_cls_type);
++ 	bpf_register_prog_type(&sched_act_type);
++ 
++ 	return 0;
++ }
++ late_initcall(register_sk_filter_ops);
++ 
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+  int sk_detach_filter(struct sock *sk)
+  {
+  	int ret = -ENOENT;
+diff --cc net/ipv4/ip_gre.c
+index afc4a83f7ee7,b7bb7d6aa7a8..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -218,7 -399,29 +218,33 @@@ static int ipgre_rcv(struct sk_buff *sk
+  
+  	if (tunnel) {
+  		skb_pop_mac_header(skb);
+++<<<<<<< HEAD
+ +		ip_tunnel_rcv(tunnel, skb, tpi, log_ecn_error);
+++=======
++ 		if (tunnel->collect_md) {
++ 			struct ip_tunnel_info *info;
++ 
++ 			tun_dst = metadata_dst_alloc(0, GFP_ATOMIC);
++ 			if (!tun_dst)
++ 				return PACKET_REJECT;
++ 
++ 			info = &tun_dst->u.tun_info;
++ 			info->key.u.ipv4.src = iph->saddr;
++ 			info->key.u.ipv4.dst = iph->daddr;
++ 			info->key.ipv4_tos = iph->tos;
++ 			info->key.ipv4_ttl = iph->ttl;
++ 
++ 			info->mode = IP_TUNNEL_INFO_RX;
++ 			info->key.tun_flags = tpi->flags &
++ 					      (TUNNEL_CSUM | TUNNEL_KEY);
++ 			info->key.tun_id = key_to_tunnel_id(tpi->key);
++ 
++ 			info->key.tp_src = 0;
++ 			info->key.tp_dst = 0;
++ 		}
++ 
++ 		ip_tunnel_rcv(tunnel, skb, tpi, tun_dst, log_ecn_error);
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+  		return PACKET_RCVD;
+  	}
+  	return PACKET_REJECT;
+@@@ -246,6 -501,81 +272,83 @@@ static void __gre_xmit(struct sk_buff *
+  	ip_tunnel_xmit(skb, dev, tnl_params, tnl_params->protocol);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *gre_handle_offloads(struct sk_buff *skb,
++ 					   bool csum)
++ {
++ 	return iptunnel_handle_offloads(skb, csum,
++ 					csum ? SKB_GSO_GRE_CSUM : SKB_GSO_GRE);
++ }
++ 
++ static void gre_fb_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct ip_tunnel_info *tun_info;
++ 	struct net *net = dev_net(dev);
++ 	const struct ip_tunnel_key *key;
++ 	struct flowi4 fl;
++ 	struct rtable *rt;
++ 	int min_headroom;
++ 	int tunnel_hlen;
++ 	__be16 df, flags;
++ 	int err;
++ 
++ 	tun_info = skb_tunnel_info(skb, AF_INET);
++ 	if (unlikely(!tun_info || tun_info->mode != IP_TUNNEL_INFO_TX))
++ 		goto err_free_skb;
++ 
++ 	key = &tun_info->key;
++ 	memset(&fl, 0, sizeof(fl));
++ 	fl.daddr = key->u.ipv4.dst;
++ 	fl.saddr = key->u.ipv4.src;
++ 	fl.flowi4_tos = RT_TOS(key->ipv4_tos);
++ 	fl.flowi4_mark = skb->mark;
++ 	fl.flowi4_proto = IPPROTO_GRE;
++ 
++ 	rt = ip_route_output_key(net, &fl);
++ 	if (IS_ERR(rt))
++ 		goto err_free_skb;
++ 
++ 	tunnel_hlen = ip_gre_calc_hlen(key->tun_flags);
++ 
++ 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
++ 			+ tunnel_hlen + sizeof(struct iphdr);
++ 	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
++ 		int head_delta = SKB_DATA_ALIGN(min_headroom -
++ 						skb_headroom(skb) +
++ 						16);
++ 		err = pskb_expand_head(skb, max_t(int, head_delta, 0),
++ 				       0, GFP_ATOMIC);
++ 		if (unlikely(err))
++ 			goto err_free_rt;
++ 	}
++ 
++ 	/* Push Tunnel header. */
++ 	skb = gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM));
++ 	if (IS_ERR(skb)) {
++ 		skb = NULL;
++ 		goto err_free_rt;
++ 	}
++ 
++ 	flags = tun_info->key.tun_flags & (TUNNEL_CSUM | TUNNEL_KEY);
++ 	build_header(skb, tunnel_hlen, flags, htons(ETH_P_TEB),
++ 		     tunnel_id_to_key(tun_info->key.tun_id), 0);
++ 
++ 	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ?  htons(IP_DF) : 0;
++ 	err = iptunnel_xmit(skb->sk, rt, skb, fl.saddr,
++ 			    key->u.ipv4.dst, IPPROTO_GRE,
++ 			    key->ipv4_tos, key->ipv4_ttl, df, false);
++ 	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
++ 	return;
++ 
++ err_free_rt:
++ 	ip_rt_put(rt);
++ err_free_skb:
++ 	kfree_skb(skb);
++ 	dev->stats.tx_dropped++;
++ }
++ 
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+  static netdev_tx_t ipgre_xmit(struct sk_buff *skb,
+  			      struct net_device *dev)
+  {
+diff --cc net/ipv4/ip_tunnel_core.c
+index 010b54caceed,93907d71cda6..000000000000
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@@ -188,3 -191,130 +188,133 @@@ struct rtnl_link_stats64 *ip_tunnel_get
+  	return tot;
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+++<<<<<<< HEAD
+++=======
++ 
++ static const struct nla_policy ip_tun_policy[LWTUNNEL_IP_MAX + 1] = {
++ 	[LWTUNNEL_IP_ID]	= { .type = NLA_U64 },
++ 	[LWTUNNEL_IP_DST]	= { .type = NLA_U32 },
++ 	[LWTUNNEL_IP_SRC]	= { .type = NLA_U32 },
++ 	[LWTUNNEL_IP_TTL]	= { .type = NLA_U8 },
++ 	[LWTUNNEL_IP_TOS]	= { .type = NLA_U8 },
++ 	[LWTUNNEL_IP_SPORT]	= { .type = NLA_U16 },
++ 	[LWTUNNEL_IP_DPORT]	= { .type = NLA_U16 },
++ 	[LWTUNNEL_IP_FLAGS]	= { .type = NLA_U16 },
++ };
++ 
++ static int ip_tun_build_state(struct net_device *dev, struct nlattr *attr,
++ 			      struct lwtunnel_state **ts)
++ {
++ 	struct ip_tunnel_info *tun_info;
++ 	struct lwtunnel_state *new_state;
++ 	struct nlattr *tb[LWTUNNEL_IP_MAX + 1];
++ 	int err;
++ 
++ 	err = nla_parse_nested(tb, LWTUNNEL_IP_MAX, attr, ip_tun_policy);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	new_state = lwtunnel_state_alloc(sizeof(*tun_info));
++ 	if (!new_state)
++ 		return -ENOMEM;
++ 
++ 	new_state->type = LWTUNNEL_ENCAP_IP;
++ 
++ 	tun_info = lwt_tun_info(new_state);
++ 
++ 	if (tb[LWTUNNEL_IP_ID])
++ 		tun_info->key.tun_id = nla_get_u64(tb[LWTUNNEL_IP_ID]);
++ 
++ 	if (tb[LWTUNNEL_IP_DST])
++ 		tun_info->key.u.ipv4.dst = nla_get_be32(tb[LWTUNNEL_IP_DST]);
++ 
++ 	if (tb[LWTUNNEL_IP_SRC])
++ 		tun_info->key.u.ipv4.src = nla_get_be32(tb[LWTUNNEL_IP_SRC]);
++ 
++ 	if (tb[LWTUNNEL_IP_TTL])
++ 		tun_info->key.ipv4_ttl = nla_get_u8(tb[LWTUNNEL_IP_TTL]);
++ 
++ 	if (tb[LWTUNNEL_IP_TOS])
++ 		tun_info->key.ipv4_tos = nla_get_u8(tb[LWTUNNEL_IP_TOS]);
++ 
++ 	if (tb[LWTUNNEL_IP_SPORT])
++ 		tun_info->key.tp_src = nla_get_be16(tb[LWTUNNEL_IP_SPORT]);
++ 
++ 	if (tb[LWTUNNEL_IP_DPORT])
++ 		tun_info->key.tp_dst = nla_get_be16(tb[LWTUNNEL_IP_DPORT]);
++ 
++ 	if (tb[LWTUNNEL_IP_FLAGS])
++ 		tun_info->key.tun_flags = nla_get_u16(tb[LWTUNNEL_IP_FLAGS]);
++ 
++ 	tun_info->mode = IP_TUNNEL_INFO_TX;
++ 	tun_info->options = NULL;
++ 	tun_info->options_len = 0;
++ 
++ 	*ts = new_state;
++ 
++ 	return 0;
++ }
++ 
++ static int ip_tun_fill_encap_info(struct sk_buff *skb,
++ 				  struct lwtunnel_state *lwtstate)
++ {
++ 	struct ip_tunnel_info *tun_info = lwt_tun_info(lwtstate);
++ 
++ 	if (nla_put_u64(skb, LWTUNNEL_IP_ID, tun_info->key.tun_id) ||
++ 	    nla_put_be32(skb, LWTUNNEL_IP_DST, tun_info->key.u.ipv4.dst) ||
++ 	    nla_put_be32(skb, LWTUNNEL_IP_SRC, tun_info->key.u.ipv4.src) ||
++ 	    nla_put_u8(skb, LWTUNNEL_IP_TOS, tun_info->key.ipv4_tos) ||
++ 	    nla_put_u8(skb, LWTUNNEL_IP_TTL, tun_info->key.ipv4_ttl) ||
++ 	    nla_put_u16(skb, LWTUNNEL_IP_SPORT, tun_info->key.tp_src) ||
++ 	    nla_put_u16(skb, LWTUNNEL_IP_DPORT, tun_info->key.tp_dst) ||
++ 	    nla_put_u16(skb, LWTUNNEL_IP_FLAGS, tun_info->key.tun_flags))
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ static int ip_tun_encap_nlsize(struct lwtunnel_state *lwtstate)
++ {
++ 	return nla_total_size(8)	/* LWTUNNEL_IP_ID */
++ 		+ nla_total_size(4)	/* LWTUNNEL_IP_DST */
++ 		+ nla_total_size(4)	/* LWTUNNEL_IP_SRC */
++ 		+ nla_total_size(1)	/* LWTUNNEL_IP_TOS */
++ 		+ nla_total_size(1)	/* LWTUNNEL_IP_TTL */
++ 		+ nla_total_size(2)	/* LWTUNNEL_IP_SPORT */
++ 		+ nla_total_size(2)	/* LWTUNNEL_IP_DPORT */
++ 		+ nla_total_size(2);	/* LWTUNNEL_IP_FLAGS */
++ }
++ 
++ static int ip_tun_cmp_encap(struct lwtunnel_state *a, struct lwtunnel_state *b)
++ {
++ 	return memcmp(lwt_tun_info(a), lwt_tun_info(b),
++ 		      sizeof(struct ip_tunnel_info));
++ }
++ 
++ static const struct lwtunnel_encap_ops ip_tun_lwt_ops = {
++ 	.build_state = ip_tun_build_state,
++ 	.fill_encap = ip_tun_fill_encap_info,
++ 	.get_encap_size = ip_tun_encap_nlsize,
++ 	.cmp_encap = ip_tun_cmp_encap,
++ };
++ 
++ void __init ip_tunnel_core_init(void)
++ {
++ 	lwtunnel_encap_add_ops(&ip_tun_lwt_ops, LWTUNNEL_ENCAP_IP);
++ }
++ 
++ struct static_key ip_tunnel_metadata_cnt = STATIC_KEY_INIT_FALSE;
++ EXPORT_SYMBOL(ip_tunnel_metadata_cnt);
++ 
++ void ip_tunnel_need_metadata(void)
++ {
++ 	static_key_slow_inc(&ip_tunnel_metadata_cnt);
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_need_metadata);
++ 
++ void ip_tunnel_unneed_metadata(void)
++ {
++ 	static_key_slow_dec(&ip_tunnel_metadata_cnt);
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_unneed_metadata);
+++>>>>>>> c1ea5d672aaf (ip_tunnels: add IPv6 addresses to ip_tunnel_key)
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 8a38d811a07c..360a4564d98d 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -27,10 +27,24 @@
+ /* Used to memset ip_tunnel padding. */
+ #define IP_TUNNEL_KEY_SIZE	offsetofend(struct ip_tunnel_key, tp_dst)
+ 
++/* Used to memset ipv4 address padding. */
++#define IP_TUNNEL_KEY_IPV4_PAD	offsetofend(struct ip_tunnel_key, u.ipv4.dst)
++#define IP_TUNNEL_KEY_IPV4_PAD_LEN				\
++	(FIELD_SIZEOF(struct ip_tunnel_key, u) -		\
++	 FIELD_SIZEOF(struct ip_tunnel_key, u.ipv4))
++
+ struct ip_tunnel_key {
+ 	__be64			tun_id;
+-	__be32			ipv4_src;
+-	__be32			ipv4_dst;
++	union {
++		struct {
++			__be32	src;
++			__be32	dst;
++		} ipv4;
++		struct {
++			struct in6_addr src;
++			struct in6_addr dst;
++		} ipv6;
++	} u;
+ 	__be16			tun_flags;
+ 	u8			ipv4_tos;
+ 	u8			ipv4_ttl;
+@@ -176,8 +190,10 @@ static inline void __ip_tunnel_info_init(struct ip_tunnel_info *tun_info,
+ 					 const void *opts, u8 opts_len)
+ {
+ 	tun_info->key.tun_id = tun_id;
+-	tun_info->key.ipv4_src = saddr;
+-	tun_info->key.ipv4_dst = daddr;
++	tun_info->key.u.ipv4.src = saddr;
++	tun_info->key.u.ipv4.dst = daddr;
++	memset((unsigned char *)&tun_info->key + IP_TUNNEL_KEY_IPV4_PAD,
++	       0, IP_TUNNEL_KEY_IPV4_PAD_LEN);
+ 	tun_info->key.ipv4_tos = tos;
+ 	tun_info->key.ipv4_ttl = ttl;
+ 	tun_info->key.tun_flags = tun_flags;
+* Unmerged path net/core/filter.c
+* Unmerged path net/ipv4/ip_gre.c
+* Unmerged path net/ipv4/ip_tunnel_core.c
+diff --git a/net/openvswitch/flow_netlink.c b/net/openvswitch/flow_netlink.c
+index 7f4707e70b38..6dfb5f6ebeb4 100644
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -534,11 +534,11 @@ static int ipv4_tun_from_nlattr(const struct nlattr *attr,
+ 			tun_flags |= TUNNEL_KEY;
+ 			break;
+ 		case OVS_TUNNEL_KEY_ATTR_IPV4_SRC:
+-			SW_FLOW_KEY_PUT(match, tun_key.ipv4_src,
++			SW_FLOW_KEY_PUT(match, tun_key.u.ipv4.src,
+ 					nla_get_in_addr(a), is_mask);
+ 			break;
+ 		case OVS_TUNNEL_KEY_ATTR_IPV4_DST:
+-			SW_FLOW_KEY_PUT(match, tun_key.ipv4_dst,
++			SW_FLOW_KEY_PUT(match, tun_key.u.ipv4.dst,
+ 					nla_get_in_addr(a), is_mask);
+ 			break;
+ 		case OVS_TUNNEL_KEY_ATTR_TOS:
+@@ -609,7 +609,7 @@ static int ipv4_tun_from_nlattr(const struct nlattr *attr,
+ 	}
+ 
+ 	if (!is_mask) {
+-		if (!match->key->tun_key.ipv4_dst) {
++		if (!match->key->tun_key.u.ipv4.dst) {
+ 			OVS_NLERR(log, "IPv4 tunnel dst address is zero");
+ 			return -EINVAL;
+ 		}
+@@ -647,13 +647,13 @@ static int __ipv4_tun_to_nlattr(struct sk_buff *skb,
+ 	if (output->tun_flags & TUNNEL_KEY &&
+ 	    nla_put_be64(skb, OVS_TUNNEL_KEY_ATTR_ID, output->tun_id))
+ 		return -EMSGSIZE;
+-	if (output->ipv4_src &&
++	if (output->u.ipv4.src &&
+ 	    nla_put_in_addr(skb, OVS_TUNNEL_KEY_ATTR_IPV4_SRC,
+-			    output->ipv4_src))
++			    output->u.ipv4.src))
+ 		return -EMSGSIZE;
+-	if (output->ipv4_dst &&
++	if (output->u.ipv4.dst &&
+ 	    nla_put_in_addr(skb, OVS_TUNNEL_KEY_ATTR_IPV4_DST,
+-			    output->ipv4_dst))
++			    output->u.ipv4.dst))
+ 		return -EMSGSIZE;
+ 	if (output->ipv4_tos &&
+ 	    nla_put_u8(skb, OVS_TUNNEL_KEY_ATTR_TOS, output->ipv4_tos))
+@@ -1116,7 +1116,7 @@ int ovs_nla_get_match(struct sw_flow_match *match,
+ 			/* The userspace does not send tunnel attributes that
+ 			 * are 0, but we should not wildcard them nonetheless.
+ 			 */
+-			if (match->key->tun_key.ipv4_dst)
++			if (match->key->tun_key.u.ipv4.dst)
+ 				SW_FLOW_KEY_MEMSET_FIELD(match, tun_key,
+ 							 0xff, true);
+ 
+@@ -1287,7 +1287,7 @@ static int __ovs_nla_put_key(const struct sw_flow_key *swkey,
+ 	if (nla_put_u32(skb, OVS_KEY_ATTR_PRIORITY, output->phy.priority))
+ 		goto nla_put_failure;
+ 
+-	if ((swkey->tun_key.ipv4_dst || is_mask)) {
++	if ((swkey->tun_key.u.ipv4.dst || is_mask)) {
+ 		const void *opts = NULL;
+ 
+ 		if (output->tun_key.tun_flags & TUNNEL_OPTIONS_PRESENT)
+diff --git a/net/openvswitch/flow_table.c b/net/openvswitch/flow_table.c
+index 89c596500853..f05557109ae0 100644
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@ -427,7 +427,7 @@ static u32 flow_hash(const struct sw_flow_key *key,
+ 
+ static int flow_key_start(const struct sw_flow_key *key)
+ {
+-	if (key->tun_key.ipv4_dst)
++	if (key->tun_key.u.ipv4.dst)
+ 		return 0;
+ 	else
+ 		return rounddown(offsetof(struct sw_flow_key, phy),
+diff --git a/net/openvswitch/vport-geneve.c b/net/openvswitch/vport-geneve.c
+index 1da3a14d1010..023813d05f88 100644
+--- a/net/openvswitch/vport-geneve.c
++++ b/net/openvswitch/vport-geneve.c
+@@ -203,7 +203,7 @@ static int geneve_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 	}
+ 
+ 	err = geneve_xmit_skb(geneve_port->gs, rt, skb, fl.saddr,
+-			      tun_key->ipv4_dst, tun_key->ipv4_tos,
++			      tun_key->u.ipv4.dst, tun_key->ipv4_tos,
+ 			      tun_key->ipv4_ttl, df, sport, dport,
+ 			      tun_key->tun_flags, vni, opts_len, opts,
+ 			      !!(tun_key->tun_flags & TUNNEL_CSUM), false);
+diff --git a/net/openvswitch/vport.c b/net/openvswitch/vport.c
+index af23ba077836..adac70d148b4 100644
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@ -603,7 +603,7 @@ int ovs_tunnel_get_egress_info(struct ip_tunnel_info *egress_tun_info,
+ 	 * saddr, tp_src and tp_dst
+ 	 */
+ 	__ip_tunnel_info_init(egress_tun_info,
+-			      fl.saddr, tun_key->ipv4_dst,
++			      fl.saddr, tun_key->u.ipv4.dst,
+ 			      tun_key->ipv4_tos,
+ 			      tun_key->ipv4_ttl,
+ 			      tp_src, tp_dst,
+diff --git a/net/openvswitch/vport.h b/net/openvswitch/vport.h
+index 4750fb673a9f..12b4671dbe27 100644
+--- a/net/openvswitch/vport.h
++++ b/net/openvswitch/vport.h
+@@ -247,8 +247,8 @@ static inline struct rtable *ovs_tunnel_route_lookup(struct net *net,
+ 	struct rtable *rt;
+ 
+ 	memset(fl, 0, sizeof(*fl));
+-	fl->daddr = key->ipv4_dst;
+-	fl->saddr = key->ipv4_src;
++	fl->daddr = key->u.ipv4.dst;
++	fl->saddr = key->u.ipv4.src;
+ 	fl->flowi4_tos = RT_TOS(key->ipv4_tos);
+ 	fl->flowi4_mark = mark;
+ 	fl->flowi4_proto = protocol;
