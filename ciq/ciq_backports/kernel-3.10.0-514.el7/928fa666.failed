@@ -1,0 +1,357 @@
+mei: simplify io callback disposal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Tomas Winkler <tomas.winkler@intel.com>
+commit 928fa6664b362aad70c16f04483414f60743e15e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/928fa666.failed
+
+Simplify disposal of io callback by removing the callback
+implicitly from its lookup list inside mei_io_cb_free
+
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 928fa6664b362aad70c16f04483414f60743e15e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/amthif.c
+#	drivers/misc/mei/bus.c
+#	drivers/misc/mei/client.c
+diff --cc drivers/misc/mei/amthif.c
+index a11128c1997f,7b6ed0bbfc9c..000000000000
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@@ -196,26 -176,29 +196,35 @@@ int mei_amthif_read(struct mei_device *
+  		if (wait_ret)
+  			return -ERESTARTSYS;
+  
+ -		dev_dbg(dev->dev, "woke up from sleep\n");
+ +		dev_dbg(&dev->pdev->dev, "woke up from sleep\n");
+  	}
+  
+ -	if (cb->status) {
+ -		rets = cb->status;
+ -		dev_dbg(dev->dev, "read operation failed %d\n", rets);
+ -		goto free;
+ -	}
+  
+ -	dev_dbg(dev->dev, "Got amthif data\n");
+ +	dev_dbg(&dev->pdev->dev, "Got amthif data\n");
+  	dev->iamthif_timer = 0;
+  
+ -	timeout = cb->read_time +
+ -		mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
+ -	dev_dbg(dev->dev, "amthif timeout = %lud\n",
+ -			timeout);
+ -
+ +	if (cb) {
+ +		timeout = cb->read_time +
+ +			mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
+ +		dev_dbg(&dev->pdev->dev, "amthif timeout = %lud\n",
+ +				timeout);
+ +
+++<<<<<<< HEAD
+ +		if  (time_after(jiffies, timeout)) {
+ +			dev_dbg(&dev->pdev->dev, "amthif Time out\n");
+ +			/* 15 sec for the message has expired */
+ +			list_del(&cb->list);
+ +			rets = -ETIME;
+ +			goto free;
+ +		}
+++=======
++ 	if  (time_after(jiffies, timeout)) {
++ 		dev_dbg(dev->dev, "amthif Time out\n");
++ 		/* 15 sec for the message has expired */
++ 		list_del_init(&cb->list);
++ 		rets = -ETIME;
++ 		goto free;
+++>>>>>>> 928fa6664b36 (mei: simplify io callback disposal)
+  	}
+  	/* if the whole message will fit remove it from the list */
+  	if (cb->buf_idx >= *offset && length >= (cb->buf_idx - *offset))
+diff --cc drivers/misc/mei/bus.c
+index ca8736c3675b,b5385372693d..000000000000
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@@ -311,20 -311,26 +311,28 @@@ int __mei_cl_recv(struct mei_cl *cl, u
+  		mutex_lock(&dev->device_lock);
+  	}
+  
+- 	cb = cl->read_cb;
+  
+  	if (cl->reading_state != MEI_READ_COMPLETE) {
+ -		rets = 0;
+ +		r_length = 0;
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	cb = cl->read_cb;
++ 	if (cb->status) {
++ 		rets = cb->status;
++ 		goto free;
++ 	}
++ 
+++>>>>>>> 928fa6664b36 (mei: simplify io callback disposal)
+  	r_length = min_t(size_t, length, cb->buf_idx);
+ -	memcpy(buf, cb->buf.data, r_length);
+ -	rets = r_length;
+  
+ -free:
+ +	memcpy(buf, cb->response_buffer.data, r_length);
+ +
+  	mei_io_cb_free(cb);
+- 	cl->reading_state = MEI_IDLE;
+  	cl->read_cb = NULL;
++ 	cl->reading_state = MEI_IDLE;
+  
+  out:
+  	mutex_unlock(&dev->device_lock);
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,624bf0182a50..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -89,26 -246,23 +89,27 @@@ static inline bool mei_cl_cmp_id(const 
+  }
+  
+  /**
+ - * mei_me_cl_rm_by_uuid - remove all me clients matching uuid
+ - *
+ - * @dev: the device structure
+ - * @uuid: me client uuid
+++<<<<<<< HEAD
+ + * __mei_io_list_flush - removes and frees cbs belonging to cl.
+   *
+ - * Locking: called under "dev->device_lock" lock
+ + * @list:  an instance of our list structure
+ + * @cl:    host client, can be NULL for flushing the whole list
+ + * @free:  whether to free the cbs
+   */
+ -void mei_me_cl_rm_by_uuid(struct mei_device *dev, const uuid_le *uuid)
+ +static void __mei_io_list_flush(struct mei_cl_cb *list,
+ +				struct mei_cl *cl, bool free)
+  {
+ -	struct mei_me_client *me_cl;
+ -
+ -	dev_dbg(dev->dev, "remove %pUl\n", uuid);
+ +	struct mei_cl_cb *cb;
+ +	struct mei_cl_cb *next;
+  
+ -	down_write(&dev->me_clients_rwsem);
+ -	me_cl = __mei_me_cl_by_uuid(dev, uuid);
+ -	__mei_me_cl_del(dev, me_cl);
+ -	up_write(&dev->me_clients_rwsem);
+ +	/* enable removing everything if no cl is specified */
+ +	list_for_each_entry_safe(cb, next, &list->list, list) {
+ +		if (!cl || (cb->cl && mei_cl_cmp_id(cl, cb->cl))) {
+ +			list_del(&cb->list);
+ +			if (free)
+ +				mei_io_cb_free(cb);
+ +		}
+ +	}
+  }
+  
+  /**
+@@@ -135,6 -321,6 +136,8 @@@ static inline void mei_io_list_free(str
+  }
+  
+  /**
+++=======
+++>>>>>>> 928fa6664b36 (mei: simplify io callback disposal)
+   * mei_io_cb_free - free mei_cb_private related memory
+   *
+   * @cb: mei callback struct
+@@@ -144,8 -330,8 +147,13 @@@ void mei_io_cb_free(struct mei_cl_cb *c
+  	if (cb == NULL)
+  		return;
+  
+++<<<<<<< HEAD
+ +	kfree(cb->request_buffer.data);
+ +	kfree(cb->response_buffer.data);
+++=======
++ 	list_del(&cb->list);
++ 	kfree(cb->buf.data);
+++>>>>>>> 928fa6664b36 (mei: simplify io callback disposal)
+  	kfree(cb);
+  }
+  
+@@@ -174,7 -362,51 +181,55 @@@ struct mei_cl_cb *mei_io_cb_init(struc
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * mei_io_cb_alloc_req_buf - allocate request buffer
+++=======
++  * __mei_io_list_flush - removes and frees cbs belonging to cl.
++  *
++  * @list:  an instance of our list structure
++  * @cl:    host client, can be NULL for flushing the whole list
++  * @free:  whether to free the cbs
++  */
++ static void __mei_io_list_flush(struct mei_cl_cb *list,
++ 				struct mei_cl *cl, bool free)
++ {
++ 	struct mei_cl_cb *cb, *next;
++ 
++ 	/* enable removing everything if no cl is specified */
++ 	list_for_each_entry_safe(cb, next, &list->list, list) {
++ 		if (!cl || mei_cl_cmp_id(cl, cb->cl)) {
++ 			list_del_init(&cb->list);
++ 			if (free)
++ 				mei_io_cb_free(cb);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * mei_io_list_flush - removes list entry belonging to cl.
++  *
++  * @list:  An instance of our list structure
++  * @cl: host client
++  */
++ void mei_io_list_flush(struct mei_cl_cb *list, struct mei_cl *cl)
++ {
++ 	__mei_io_list_flush(list, cl, false);
++ }
++ 
++ /**
++  * mei_io_list_free - removes cb belonging to cl and free them
++  *
++  * @list:  An instance of our list structure
++  * @cl: host client
++  */
++ static inline void mei_io_list_free(struct mei_cl_cb *list, struct mei_cl *cl)
++ {
++ 	__mei_io_list_flush(list, cl, true);
++ }
++ 
++ /**
++  * mei_io_cb_alloc_buf - allocate callback buffer
+++>>>>>>> 928fa6664b36 (mei: simplify io callback disposal)
+   *
+   * @cb: io callback structure
+   * @length: size of the buffer
+* Unmerged path drivers/misc/mei/amthif.c
+* Unmerged path drivers/misc/mei/bus.c
+* Unmerged path drivers/misc/mei/client.c
+diff --git a/drivers/misc/mei/hbm.c b/drivers/misc/mei/hbm.c
+index 3cb8e1000d69..14564a99bcee 100644
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -597,7 +597,7 @@ static void mei_hbm_cl_res(struct mei_device *dev,
+ 			continue;
+ 
+ 		if (mei_hbm_cl_addr_equal(cl, rs)) {
+-			list_del(&cb->list);
++			list_del_init(&cb->list);
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index b8d9cfee3e87..04d9f919142f 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -185,7 +185,6 @@ static int mei_cl_irq_disconnect_rsp(struct mei_cl *cl, struct mei_cl_cb *cb,
+ 
+ 	cl->state = MEI_FILE_DISCONNECTED;
+ 	cl->status = 0;
+-	list_del(&cb->list);
+ 	mei_io_cb_free(cb);
+ 
+ 	return ret;
+@@ -303,7 +302,7 @@ static int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
+ 	if (ret) {
+ 		cl->status = ret;
+ 		cb->buf_idx = 0;
+-		list_del(&cb->list);
++		list_del_init(&cb->list);
+ 		return ret;
+ 	}
+ 
+diff --git a/drivers/misc/mei/main.c b/drivers/misc/mei/main.c
+index b23f9eba9e3a..7a00f3a9fa5c 100644
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -109,7 +109,6 @@ err_unlock:
+ static int mei_release(struct inode *inode, struct file *file)
+ {
+ 	struct mei_cl *cl = file->private_data;
+-	struct mei_cl_cb *cb;
+ 	struct mei_device *dev;
+ 	int rets = 0;
+ 
+@@ -133,23 +132,11 @@ static int mei_release(struct inode *inode, struct file *file)
+ 
+ 	mei_cl_unlink(cl);
+ 
+-
+-	/* free read cb */
+-	cb = NULL;
+-	if (cl->read_cb) {
+-		cb = mei_cl_find_read_cb(cl);
+-		/* Remove entry from read list */
+-		if (cb)
+-			list_del(&cb->list);
+-
+-		cb = cl->read_cb;
+-		cl->read_cb = NULL;
+-	}
++	mei_io_cb_free(cl->read_cb);
++	cl->read_cb = NULL;
+ 
+ 	file->private_data = NULL;
+ 
+-	mei_io_cb_free(cb);
+-
+ 	kfree(cl);
+ out:
+ 	mutex_unlock(&dev->device_lock);
+@@ -171,7 +158,6 @@ static ssize_t mei_read(struct file *file, char __user *ubuf,
+ 			size_t length, loff_t *offset)
+ {
+ 	struct mei_cl *cl = file->private_data;
+-	struct mei_cl_cb *cb_pos = NULL;
+ 	struct mei_cl_cb *cb = NULL;
+ 	struct mei_device *dev;
+ 	int i;
+@@ -300,13 +286,10 @@ copy_buffer:
+ 		goto out;
+ 
+ free:
+-	cb_pos = mei_cl_find_read_cb(cl);
+-	/* Remove entry from read list */
+-	if (cb_pos)
+-		list_del(&cb_pos->list);
+ 	mei_io_cb_free(cb);
+-	cl->reading_state = MEI_IDLE;
+ 	cl->read_cb = NULL;
++
++	cl->reading_state = MEI_IDLE;
+ out:
+ 	dev_dbg(&dev->pdev->dev, "end mei read rets= %d\n", rets);
+ 	mutex_unlock(&dev->device_lock);
+@@ -376,7 +359,6 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 			if (time_after(jiffies, timeout) ||
+ 			    cl->reading_state == MEI_READ_COMPLETE) {
+ 				*offset = 0;
+-				list_del(&write_cb->list);
+ 				mei_io_cb_free(write_cb);
+ 				write_cb = NULL;
+ 			}
+@@ -388,11 +370,10 @@ static ssize_t mei_write(struct file *file, const char __user *ubuf,
+ 		*offset = 0;
+ 		write_cb = mei_cl_find_read_cb(cl);
+ 		if (write_cb) {
+-			list_del(&write_cb->list);
+ 			mei_io_cb_free(write_cb);
+ 			write_cb = NULL;
+-			cl->reading_state = MEI_IDLE;
+ 			cl->read_cb = NULL;
++			cl->reading_state = MEI_IDLE;
+ 		}
+ 	} else if (cl->reading_state == MEI_IDLE)
+ 		*offset = 0;
