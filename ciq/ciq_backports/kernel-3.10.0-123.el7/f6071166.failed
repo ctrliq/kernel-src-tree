@@ -1,0 +1,297 @@
+i915/vlv: untangle integrated clock source handling v4
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jesse Barnes <jbarnes@virtuousgeek.org>
+commit f60711666bcab6df2c6c91d851e07ed54088453c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/f6071166.failed
+
+The global integrated clock source bit resides in DPLL B on VLV, but we
+were treating it as a per-pipe resource.  It needs to be set whenever
+any PLL is active, so pull setting the bit out of vlv_update_pll and
+into vlv_enable_pll.  Also add a vlv_disable_pll to prevent disabling it
+when pipe B shuts down.
+
+I'm guessing on the references here, I expect this to bite any config
+where multiple displays are active or displays are moved from pipe to
+pipe.
+
+v2: re-add bits in vlv_update_pll to keep from confusing the state checker
+v3: use enum pipe checks (Daniel)
+    set CRI clock source early (Ville)
+    consistently set CRI clock source everywhere (Ville)
+v4: drop unnecessary setting of bit in vlv enable pll (Ville)
+
+References: https://bugs.freedesktop.org/show_bug.cgi?id=67245
+References: https://bugs.freedesktop.org/show_bug.cgi?id=69693
+	Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+[danvet: s/1/PIPE_B/]
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit f60711666bcab6df2c6c91d851e07ed54088453c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index bcc9e0539bc8,99efbe51d7ce..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -1518,72 -1462,36 +1518,90 @@@ static void intel_disable_pll(struct dr
+  	/* Make sure the pipe isn't still relying on us */
+  	assert_pipe_disabled(dev_priv, pipe);
+  
+ -	I915_WRITE(DPLL(pipe), 0);
+ -	POSTING_READ(DPLL(pipe));
+ +	reg = DPLL(pipe);
+ +	val = I915_READ(reg);
+ +	val &= ~DPLL_VCO_ENABLE;
+ +	I915_WRITE(reg, val);
+ +	POSTING_READ(reg);
+  }
+  
+++<<<<<<< HEAD
+ +/* SBI access */
+ +static void
+ +intel_sbi_write(struct drm_i915_private *dev_priv, u16 reg, u32 value,
+ +		enum intel_sbi_destination destination)
+++=======
++ static void vlv_disable_pll(struct drm_i915_private *dev_priv, enum pipe pipe)
++ {
++ 	u32 val = 0;
++ 
++ 	/* Make sure the pipe isn't still relying on us */
++ 	assert_pipe_disabled(dev_priv, pipe);
++ 
++ 	/* Leave integrated clock source enabled */
++ 	if (pipe == PIPE_B)
++ 		val = DPLL_INTEGRATED_CRI_CLK_VLV;
++ 	I915_WRITE(DPLL(pipe), val);
++ 	POSTING_READ(DPLL(pipe));
++ }
++ 
++ void vlv_wait_port_ready(struct drm_i915_private *dev_priv, int port)
+++>>>>>>> f60711666bca (i915/vlv: untangle integrated clock source handling v4)
+ +{
+ +	u32 tmp;
+ +
+ +	WARN_ON(!mutex_is_locked(&dev_priv->dpio_lock));
+ +
+ +	if (wait_for((I915_READ(SBI_CTL_STAT) & SBI_BUSY) == 0,
+ +				100)) {
+ +		DRM_ERROR("timeout waiting for SBI to become ready\n");
+ +		return;
+ +	}
+ +
+ +	I915_WRITE(SBI_ADDR, (reg << 16));
+ +	I915_WRITE(SBI_DATA, value);
+ +
+ +	if (destination == SBI_ICLK)
+ +		tmp = SBI_CTL_DEST_ICLK | SBI_CTL_OP_CRWR;
+ +	else
+ +		tmp = SBI_CTL_DEST_MPHY | SBI_CTL_OP_IOWR;
+ +	I915_WRITE(SBI_CTL_STAT, SBI_BUSY | tmp);
+ +
+ +	if (wait_for((I915_READ(SBI_CTL_STAT) & (SBI_BUSY | SBI_RESPONSE_FAIL)) == 0,
+ +				100)) {
+ +		DRM_ERROR("timeout waiting for SBI to complete write transaction\n");
+ +		return;
+ +	}
+ +}
+ +
+ +static u32
+ +intel_sbi_read(struct drm_i915_private *dev_priv, u16 reg,
+ +	       enum intel_sbi_destination destination)
+  {
+ -	u32 port_mask;
+ +	u32 value = 0;
+ +	WARN_ON(!mutex_is_locked(&dev_priv->dpio_lock));
+ +
+ +	if (wait_for((I915_READ(SBI_CTL_STAT) & SBI_BUSY) == 0,
+ +				100)) {
+ +		DRM_ERROR("timeout waiting for SBI to become ready\n");
+ +		return 0;
+ +	}
+ +
+ +	I915_WRITE(SBI_ADDR, (reg << 16));
+  
+ -	if (!port)
+ -		port_mask = DPLL_PORTB_READY_MASK;
+ +	if (destination == SBI_ICLK)
+ +		value = SBI_CTL_DEST_ICLK | SBI_CTL_OP_CRRD;
+  	else
+ -		port_mask = DPLL_PORTC_READY_MASK;
+ +		value = SBI_CTL_DEST_MPHY | SBI_CTL_OP_IORD;
+ +	I915_WRITE(SBI_CTL_STAT, value | SBI_BUSY);
+ +
+ +	if (wait_for((I915_READ(SBI_CTL_STAT) & (SBI_BUSY | SBI_RESPONSE_FAIL)) == 0,
+ +				100)) {
+ +		DRM_ERROR("timeout waiting for SBI to complete read transaction\n");
+ +		return 0;
+ +	}
+  
+ -	if (wait_for((I915_READ(DPLL(0)) & port_mask) == 0, 1000))
+ -		WARN(1, "timed out waiting for port %c ready: 0x%08x\n",
+ -		     'B' + port, I915_READ(DPLL(0)));
+ +	return I915_READ(SBI_DATA);
+  }
+  
+  /**
+@@@ -3773,11 -3885,19 +3791,22 @@@ static void i9xx_crtc_disable(struct dr
+  
+  	i9xx_pfit_disable(intel_crtc);
+  
+++<<<<<<< HEAD
+ +	intel_disable_pll(dev_priv, pipe);
+++=======
++ 	for_each_encoder_on_crtc(dev, crtc, encoder)
++ 		if (encoder->post_disable)
++ 			encoder->post_disable(encoder);
++ 
++ 	if (IS_VALLEYVIEW(dev) && !intel_pipe_has_type(crtc, INTEL_OUTPUT_DSI))
++ 		vlv_disable_pll(dev_priv, pipe);
++ 	else if (!IS_VALLEYVIEW(dev))
++ 		i9xx_disable_pll(dev_priv, pipe);
+++>>>>>>> f60711666bca (i915/vlv: untangle integrated clock source handling v4)
+  
+  	intel_crtc->active = false;
+ -	intel_update_watermarks(crtc);
+ -
+  	intel_update_fbc(dev);
+ +	intel_update_watermarks(dev);
+  }
+  
+  static void i9xx_crtc_off(struct drm_crtc *crtc)
+@@@ -4269,28 -4577,69 +4298,46 @@@ static void vlv_update_pll(struct intel
+  	mdiv = ((bestm1 << DPIO_M1DIV_SHIFT) | (bestm2 & DPIO_M2DIV_MASK));
+  	mdiv |= ((bestp1 << DPIO_P1_SHIFT) | (bestp2 << DPIO_P2_SHIFT));
+  	mdiv |= ((bestn << DPIO_N_SHIFT));
+ +	mdiv |= (1 << DPIO_POST_DIV_SHIFT);
+  	mdiv |= (1 << DPIO_K_SHIFT);
+ +	mdiv |= DPIO_ENABLE_CALIBRATION;
+ +	intel_dpio_write(dev_priv, DPIO_DIV(pipe), mdiv);
+  
+ -	/*
+ -	 * Post divider depends on pixel clock rate, DAC vs digital (and LVDS,
+ -	 * but we don't support that).
+ -	 * Note: don't use the DAC post divider as it seems unstable.
+ -	 */
+ -	mdiv |= (DPIO_POST_DIV_HDMIDP << DPIO_POST_DIV_SHIFT);
+ -	vlv_dpio_write(dev_priv, pipe, DPIO_DIV(pipe), mdiv);
+ +	intel_dpio_write(dev_priv, DPIO_CORE_CLK(pipe), 0x01000000);
+  
+ -	mdiv |= DPIO_ENABLE_CALIBRATION;
+ -	vlv_dpio_write(dev_priv, pipe, DPIO_DIV(pipe), mdiv);
+ -
+ -	/* Set HBR and RBR LPF coefficients */
+ -	if (crtc->config.port_clock == 162000 ||
+ -	    intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_ANALOG) ||
+ -	    intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_HDMI))
+ -		vlv_dpio_write(dev_priv, pipe, DPIO_LPF_COEFF(pipe),
+ -				 0x009f0003);
+ -	else
+ -		vlv_dpio_write(dev_priv, pipe, DPIO_LPF_COEFF(pipe),
+ -				 0x00d0000f);
+ -
+ -	if (intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_EDP) ||
+ -	    intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_DISPLAYPORT)) {
+ -		/* Use SSC source */
+ -		if (!pipe)
+ -			vlv_dpio_write(dev_priv, pipe, DPIO_REFSFR(pipe),
+ -					 0x0df40000);
+ -		else
+ -			vlv_dpio_write(dev_priv, pipe, DPIO_REFSFR(pipe),
+ -					 0x0df70000);
+ -	} else { /* HDMI or VGA */
+ -		/* Use bend source */
+ -		if (!pipe)
+ -			vlv_dpio_write(dev_priv, pipe, DPIO_REFSFR(pipe),
+ -					 0x0df70000);
+ -		else
+ -			vlv_dpio_write(dev_priv, pipe, DPIO_REFSFR(pipe),
+ -					 0x0df40000);
+ -	}
+ +	pdiv = (1 << DPIO_REFSEL_OVERRIDE) | (5 << DPIO_PLL_MODESEL_SHIFT) |
+ +		(3 << DPIO_BIAS_CURRENT_CTL_SHIFT) | (1<<20) |
+ +		(7 << DPIO_PLL_REFCLK_SEL_SHIFT) | (8 << DPIO_DRIVER_CTL_SHIFT) |
+ +		(5 << DPIO_CLK_BIAS_CTL_SHIFT);
+ +	intel_dpio_write(dev_priv, DPIO_REFSFR(pipe), pdiv);
+  
+++<<<<<<< HEAD
+ +	intel_dpio_write(dev_priv, DPIO_LFP_COEFF(pipe), 0x005f003b);
+ +
+++=======
++ 	coreclk = vlv_dpio_read(dev_priv, pipe, DPIO_CORE_CLK(pipe));
++ 	coreclk = (coreclk & 0x0000ff00) | 0x01c00000;
++ 	if (intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_DISPLAYPORT) ||
++ 	    intel_pipe_has_type(&crtc->base, INTEL_OUTPUT_EDP))
++ 		coreclk |= 0x01000000;
++ 	vlv_dpio_write(dev_priv, pipe, DPIO_CORE_CLK(pipe), coreclk);
++ 
++ 	vlv_dpio_write(dev_priv, pipe, DPIO_PLL_CML(pipe), 0x87871000);
++ 
++ 	/* Enable DPIO clock input */
++ 	dpll = DPLL_EXT_BUFFER_ENABLE_VLV | DPLL_REFA_CLK_ENABLE_VLV |
++ 		DPLL_VGA_MODE_DIS | DPLL_INTEGRATED_CLOCK_VLV;
++ 	/* We should never disable this, set it here for state tracking */
++ 	if (pipe == PIPE_B)
++ 		dpll |= DPLL_INTEGRATED_CRI_CLK_VLV;
+++>>>>>>> f60711666bca (i915/vlv: untangle integrated clock source handling v4)
+  	dpll |= DPLL_VCO_ENABLE;
+ -	crtc->config.dpll_hw_state.dpll = dpll;
+ +	I915_WRITE(DPLL(pipe), dpll);
+ +	POSTING_READ(DPLL(pipe));
+ +	if (wait_for(((I915_READ(DPLL(pipe)) & DPLL_LOCK_VLV) == DPLL_LOCK_VLV), 1))
+ +		DRM_ERROR("DPLL %d failed to lock\n", pipe);
+  
+ -	dpll_md = (crtc->config.pixel_multiplier - 1)
+ -		<< DPLL_MD_UDI_MULTIPLIER_SHIFT;
+ -	crtc->config.dpll_hw_state.dpll_md = dpll_md;
+ +	intel_dpio_write(dev_priv, DPIO_FASTCLK_DISABLE, 0x620);
+  
+  	if (crtc->config.has_dp_encoder)
+  		intel_dp_set_m_n(crtc);
+@@@ -9024,9 -10266,36 +9071,13 @@@ static void i915_disable_vga(struct drm
+  	POSTING_READ(vga_reg);
+  }
+  
+ -static void i915_enable_vga_mem(struct drm_device *dev)
+ -{
+ -	/* Enable VGA memory on Intel HD */
+ -	if (HAS_PCH_SPLIT(dev)) {
+ -		vga_get_uninterruptible(dev->pdev, VGA_RSRC_LEGACY_IO);
+ -		outb(inb(VGA_MSR_READ) | VGA_MSR_MEM_EN, VGA_MSR_WRITE);
+ -		vga_set_legacy_decoding(dev->pdev, VGA_RSRC_LEGACY_IO |
+ -						   VGA_RSRC_LEGACY_MEM |
+ -						   VGA_RSRC_NORMAL_IO |
+ -						   VGA_RSRC_NORMAL_MEM);
+ -		vga_put(dev->pdev, VGA_RSRC_LEGACY_IO);
+ -	}
+ -}
+ -
+ -void i915_disable_vga_mem(struct drm_device *dev)
+ -{
+ -	/* Disable VGA memory on Intel HD */
+ -	if (HAS_PCH_SPLIT(dev)) {
+ -		vga_get_uninterruptible(dev->pdev, VGA_RSRC_LEGACY_IO);
+ -		outb(inb(VGA_MSR_READ) & ~VGA_MSR_MEM_EN, VGA_MSR_WRITE);
+ -		vga_set_legacy_decoding(dev->pdev, VGA_RSRC_LEGACY_IO |
+ -						   VGA_RSRC_NORMAL_IO |
+ -						   VGA_RSRC_NORMAL_MEM);
+ -		vga_put(dev->pdev, VGA_RSRC_LEGACY_IO);
+ -	}
+ -}
+ -
+  void intel_modeset_init_hw(struct drm_device *dev)
+  {
+++<<<<<<< HEAD
+ +	intel_init_power_well(dev);
+++=======
++ 	struct drm_i915_private *dev_priv = dev->dev_private;
+++>>>>>>> f60711666bca (i915/vlv: untangle integrated clock source handling v4)
+  
+  	intel_prepare_ddi(dev);
+  
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
