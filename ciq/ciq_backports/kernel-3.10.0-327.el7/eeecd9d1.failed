@@ -1,0 +1,112 @@
+ALSA: hda - Use regmap for amp accesses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] hda - Use regmap for amp accesses (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 91.67%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit eeecd9d10d3da0b9efd6f58fad55c4355dcc246a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/eeecd9d1.failed
+
+This patch converts the amp access functions to the regmap helpers.
+The amp values were formerly cached in the own hash table.  Now it's
+dropped by the regmap's cache.
+
+The only tricky conversion is snd_hda_codec_amp_init().  This function
+shouldn't do anything if the amp was already initialized.  For
+achieving this behavior, a value is read once at first temporarily in
+the cache-only mode.  Only if it returns an error,  i.e. the item
+still doesn't exist in the cache, it proceeds to the update.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit eeecd9d10d3da0b9efd6f58fad55c4355dcc246a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_codec.c
+diff --cc sound/pci/hda/hda_codec.c
+index 05cb5f57659a,52962f697825..000000000000
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@@ -3978,9 -3474,11 +3809,15 @@@ static void hda_mark_cmd_cache_dirty(st
+   */
+  static void hda_call_codec_resume(struct hda_codec *codec)
+  {
+ -	atomic_inc(&codec->core.in_pm);
+ +	atomic_inc(&codec->in_pm);
+  
+++<<<<<<< HEAD
+ +	trace_hda_power_up(codec);
+++=======
++ 	if (codec->core.regmap)
++ 		regcache_mark_dirty(codec->core.regmap);
++ 
+++>>>>>>> eeecd9d10d3d (ALSA: hda - Use regmap for amp accesses)
+  	hda_mark_cmd_cache_dirty(codec);
+  
+  	codec->power_jiffies = jiffies;
+* Unmerged path sound/pci/hda/hda_codec.c
+diff --git a/sound/pci/hda/hda_local.h b/sound/pci/hda/hda_local.h
+index 1d001647fc47..a6390243bc6f 100644
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -127,18 +127,16 @@ int snd_hda_mixer_amp_switch_put_beep(struct snd_kcontrol *kcontrol,
+ 				      struct snd_ctl_elem_value *ucontrol);
+ #endif
+ /* lowlevel accessor with caching; use carefully */
+-int snd_hda_codec_amp_read(struct hda_codec *codec, hda_nid_t nid, int ch,
+-			   int direction, int index);
+-int snd_hda_codec_amp_update(struct hda_codec *codec, hda_nid_t nid, int ch,
+-			     int direction, int idx, int mask, int val);
++#define snd_hda_codec_amp_read(codec, nid, ch, dir, idx) \
++	snd_hdac_regmap_get_amp(&(codec)->core, nid, ch, dir, idx)
++#define snd_hda_codec_amp_update(codec, nid, ch, dir, idx, mask, val) \
++	snd_hdac_regmap_update_amp(&(codec)->core, nid, ch, dir, idx, mask, val)
+ int snd_hda_codec_amp_stereo(struct hda_codec *codec, hda_nid_t nid,
+ 			     int dir, int idx, int mask, int val);
+ int snd_hda_codec_amp_init(struct hda_codec *codec, hda_nid_t nid, int ch,
+ 			   int direction, int idx, int mask, int val);
+ int snd_hda_codec_amp_init_stereo(struct hda_codec *codec, hda_nid_t nid,
+ 				  int dir, int idx, int mask, int val);
+-void snd_hda_codec_resume_amp(struct hda_codec *codec);
+-
+ void snd_hda_set_vmaster_tlv(struct hda_codec *codec, hda_nid_t nid, int dir,
+ 			     unsigned int *tlv);
+ struct snd_kcontrol *snd_hda_find_mixer_ctl(struct hda_codec *codec,
+diff --git a/sound/pci/hda/patch_hdmi.c b/sound/pci/hda/patch_hdmi.c
+index 7e9ff7b16e56..3763526c8147 100644
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@ -2212,7 +2212,7 @@ static int generic_hdmi_resume(struct hda_codec *codec)
+ 	int pin_idx;
+ 
+ 	codec->patch_ops.init(codec);
+-	snd_hda_codec_resume_amp(codec);
++	regcache_sync(codec->core.regmap);
+ 	snd_hda_codec_resume_cache(codec);
+ 
+ 	for (pin_idx = 0; pin_idx < spec->num_pins; pin_idx++) {
+diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
+index 124eacf67fc4..e26881163d06 100644
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -799,7 +799,7 @@ static int alc_resume(struct hda_codec *codec)
+ 	if (!spec->no_depop_delay)
+ 		msleep(150); /* to avoid pop noise */
+ 	codec->patch_ops.init(codec);
+-	snd_hda_codec_resume_amp(codec);
++	regcache_sync(codec->core.regmap);
+ 	snd_hda_codec_resume_cache(codec);
+ 	hda_call_check_power_status(codec, 0x01);
+ 	return 0;
+@@ -3058,7 +3058,7 @@ static int alc269_resume(struct hda_codec *codec)
+ 		msleep(200);
+ 	}
+ 
+-	snd_hda_codec_resume_amp(codec);
++	regcache_sync(codec->core.regmap);
+ 	snd_hda_codec_resume_cache(codec);
+ 	hda_call_check_power_status(codec, 0x01);
+ 
