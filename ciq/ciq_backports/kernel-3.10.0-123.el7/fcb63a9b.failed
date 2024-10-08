@@ -1,0 +1,187 @@
+NFS: Fix a missing initialisation when reading the SELinux label
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Trond Myklebust <Trond.Myklebust@netapp.com>
+commit fcb63a9bd8427fc584229048ea14f1453dc9a2e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/fcb63a9b.failed
+
+Ensure that _nfs4_do_get_security_label() also initialises the
+SEQUENCE call correctly, by having it call into nfs4_call_sync().
+
+	Reported-by: Jeff Layton <jlayton@redhat.com>
+	Cc: stable@vger.kernel.org # 3.11+
+	Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+(cherry picked from commit fcb63a9bd8427fc584229048ea14f1453dc9a2e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 243e7b5c4025,7e28b5c77cbc..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -4256,6 -4593,157 +4256,160 @@@ static int nfs4_proc_set_acl(struct ino
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NFS_V4_SECURITY_LABEL
++ static int _nfs4_get_security_label(struct inode *inode, void *buf,
++ 					size_t buflen)
++ {
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_fattr fattr;
++ 	struct nfs4_label label = {0, 0, buflen, buf};
++ 
++ 	u32 bitmask[3] = { 0, 0, FATTR4_WORD2_SECURITY_LABEL };
++ 	struct nfs4_getattr_arg arg = {
++ 		.fh		= NFS_FH(inode),
++ 		.bitmask	= bitmask,
++ 	};
++ 	struct nfs4_getattr_res res = {
++ 		.fattr		= &fattr,
++ 		.label		= &label,
++ 		.server		= server,
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_GETATTR],
++ 		.rpc_argp	= &arg,
++ 		.rpc_resp	= &res,
++ 	};
++ 	int ret;
++ 
++ 	nfs_fattr_init(&fattr);
++ 
++ 	ret = nfs4_call_sync(server->client, server, &msg, &arg.seq_args, &res.seq_res, 0);
++ 	if (ret)
++ 		return ret;
++ 	if (!(fattr.valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL))
++ 		return -ENOENT;
++ 	if (buflen < label.len)
++ 		return -ERANGE;
++ 	return 0;
++ }
++ 
++ static int nfs4_get_security_label(struct inode *inode, void *buf,
++ 					size_t buflen)
++ {
++ 	struct nfs4_exception exception = { };
++ 	int err;
++ 
++ 	if (!nfs_server_capable(inode, NFS_CAP_SECURITY_LABEL))
++ 		return -EOPNOTSUPP;
++ 
++ 	do {
++ 		err = _nfs4_get_security_label(inode, buf, buflen);
++ 		trace_nfs4_get_security_label(inode, err);
++ 		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++ 				&exception);
++ 	} while (exception.retry);
++ 	return err;
++ }
++ 
++ static int _nfs4_do_set_security_label(struct inode *inode,
++ 		struct nfs4_label *ilabel,
++ 		struct nfs_fattr *fattr,
++ 		struct nfs4_label *olabel)
++ {
++ 
++ 	struct iattr sattr = {0};
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	const u32 bitmask[3] = { 0, 0, FATTR4_WORD2_SECURITY_LABEL };
++ 	struct nfs_setattrargs arg = {
++ 		.fh             = NFS_FH(inode),
++ 		.iap            = &sattr,
++ 		.server		= server,
++ 		.bitmask	= bitmask,
++ 		.label		= ilabel,
++ 	};
++ 	struct nfs_setattrres res = {
++ 		.fattr		= fattr,
++ 		.label		= olabel,
++ 		.server		= server,
++ 	};
++ 	struct rpc_message msg = {
++ 		.rpc_proc       = &nfs4_procedures[NFSPROC4_CLNT_SETATTR],
++ 		.rpc_argp       = &arg,
++ 		.rpc_resp       = &res,
++ 	};
++ 	int status;
++ 
++ 	nfs4_stateid_copy(&arg.stateid, &zero_stateid);
++ 
++ 	status = nfs4_call_sync(server->client, server, &msg, &arg.seq_args, &res.seq_res, 1);
++ 	if (status)
++ 		dprintk("%s failed: %d\n", __func__, status);
++ 
++ 	return status;
++ }
++ 
++ static int nfs4_do_set_security_label(struct inode *inode,
++ 		struct nfs4_label *ilabel,
++ 		struct nfs_fattr *fattr,
++ 		struct nfs4_label *olabel)
++ {
++ 	struct nfs4_exception exception = { };
++ 	int err;
++ 
++ 	do {
++ 		err = _nfs4_do_set_security_label(inode, ilabel,
++ 				fattr, olabel);
++ 		trace_nfs4_set_security_label(inode, err);
++ 		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++ 				&exception);
++ 	} while (exception.retry);
++ 	return err;
++ }
++ 
++ static int
++ nfs4_set_security_label(struct dentry *dentry, const void *buf, size_t buflen)
++ {
++ 	struct nfs4_label ilabel, *olabel = NULL;
++ 	struct nfs_fattr fattr;
++ 	struct rpc_cred *cred;
++ 	struct inode *inode = dentry->d_inode;
++ 	int status;
++ 
++ 	if (!nfs_server_capable(inode, NFS_CAP_SECURITY_LABEL))
++ 		return -EOPNOTSUPP;
++ 
++ 	nfs_fattr_init(&fattr);
++ 
++ 	ilabel.pi = 0;
++ 	ilabel.lfs = 0;
++ 	ilabel.label = (char *)buf;
++ 	ilabel.len = buflen;
++ 
++ 	cred = rpc_lookup_cred();
++ 	if (IS_ERR(cred))
++ 		return PTR_ERR(cred);
++ 
++ 	olabel = nfs4_label_alloc(NFS_SERVER(inode), GFP_KERNEL);
++ 	if (IS_ERR(olabel)) {
++ 		status = -PTR_ERR(olabel);
++ 		goto out;
++ 	}
++ 
++ 	status = nfs4_do_set_security_label(inode, &ilabel, &fattr, olabel);
++ 	if (status == 0)
++ 		nfs_setsecurity(inode, &fattr, olabel);
++ 
++ 	nfs4_label_free(olabel);
++ out:
++ 	put_rpccred(cred);
++ 	return status;
++ }
++ #endif	/* CONFIG_NFS_V4_SECURITY_LABEL */
++ 
++ 
+++>>>>>>> fcb63a9bd842 (NFS: Fix a missing initialisation when reading the SELinux label)
+  static int
+  nfs4_async_handle_error(struct rpc_task *task, const struct nfs_server *server, struct nfs4_state *state)
+  {
+* Unmerged path fs/nfs/nfs4proc.c
