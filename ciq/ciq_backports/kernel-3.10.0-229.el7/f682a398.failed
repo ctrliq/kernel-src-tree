@@ -1,0 +1,71 @@
+NFS: allow lockless access to access_cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author NeilBrown <neilb@suse.de>
+commit f682a398b2e24ae0a775ddf37cced83b897198ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f682a398.failed
+
+The access cache is used during RCU-walk path lookups, so it is best
+to avoid locking if possible as taking a lock kills concurrency.
+
+The rbtree is not rcu-safe and cannot easily be made so.
+Instead we simply check the last (i.e. most recent) entry on the LRU
+list.  If this doesn't match, then we return -ECHILD and retry in
+lock/refcount mode.
+
+This requires freeing the nfs_access_entry struct with rcu, and
+requires using rcu access primatives when adding entries to the lru, and
+when examining the last entry.
+
+Calling put_rpccred before kfree_rcu looks a bit odd, but as
+put_rpccred already provides rcu protection, we know that the cred will
+not actually be freed until the next grace period, so any concurrent
+access will be safe.
+
+This patch provides about 5% performance improvement on a stat-heavy
+synthetic work load with 4 threads on a 2-core CPU.
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit f682a398b2e24ae0a775ddf37cced83b897198ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+diff --cc fs/nfs/dir.c
+index f8526c925fb3,1b5f38f48dab..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -2042,10 -2075,14 +2042,15 @@@ static atomic_long_t nfs_access_nr_entr
+  static void nfs_access_free_entry(struct nfs_access_entry *entry)
+  {
+  	put_rpccred(entry->cred);
+++<<<<<<< HEAD
+ +	kfree(entry);
+ +	smp_mb__before_atomic_dec();
+++=======
++ 	kfree_rcu(entry, rcu_head);
++ 	smp_mb__before_atomic();
+++>>>>>>> f682a398b2e2 (NFS: allow lockless access to access_cache)
+  	atomic_long_dec(&nfs_access_nr_entries);
+ -	smp_mb__after_atomic();
+ +	smp_mb__after_atomic_dec();
+  }
+  
+  static void nfs_access_free_list(struct list_head *head)
+* Unmerged path fs/nfs/dir.c
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index b038f24f46b3..112b3c94ed5c 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -52,6 +52,7 @@ struct nfs_access_entry {
+ 	unsigned long		jiffies;
+ 	struct rpc_cred *	cred;
+ 	int			mask;
++	struct rcu_head		rcu_head;
+ };
+ 
+ struct nfs_lockowner {
