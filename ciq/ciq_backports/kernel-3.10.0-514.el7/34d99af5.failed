@@ -1,0 +1,246 @@
+audit: implement audit by executable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 34d99af52ad40bd498ba66970579a5bc1fb1a3bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/34d99af5.failed
+
+This adds the ability audit the actions of a not-yet-running process.
+
+This patch implements the ability to filter on the executable path.  Instead of
+just hard coding the ino and dev of the executable we care about at the moment
+the rule is inserted into the kernel, use the new audit_fsnotify
+infrastructure to manage this dynamically.  This means that if the filename
+does not yet exist but the containing directory does, or if the inode in
+question is unlinked and creat'd (aka updated) the rule will just continue to
+work.  If the containing directory is moved or deleted or the filesystem is
+unmounted, the rule is deleted automatically.  A future enhancement would be to
+have the rule survive across directory disruptions.
+
+This is a heavily modified version of a patch originally submitted by Eric
+Paris with some ideas from Peter Moody.
+
+	Cc: Peter Moody <peter@hda3.com>
+	Cc: Eric Paris <eparis@redhat.com>
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+[PM: minor whitespace clean to satisfy ./scripts/checkpatch]
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+(cherry picked from commit 34d99af52ad40bd498ba66970579a5bc1fb1a3bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/audit.h
+#	kernel/auditfilter.c
+diff --cc include/uapi/linux/audit.h
+index 589a7852657d,f6ff62c24aba..000000000000
+--- a/include/uapi/linux/audit.h
++++ b/include/uapi/linux/audit.h
+@@@ -319,9 -321,14 +320,17 @@@ enum 
+  #define AUDIT_STATUS_PID		0x0004
+  #define AUDIT_STATUS_RATE_LIMIT		0x0008
+  #define AUDIT_STATUS_BACKLOG_LIMIT	0x0010
+ -#define AUDIT_STATUS_BACKLOG_WAIT_TIME	0x0020
+  
+  #define AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT	0x00000001
+++<<<<<<< HEAD
+ +#define AUDIT_FEATURE_BITMAP_ALL (AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT)
+++=======
++ #define AUDIT_FEATURE_BITMAP_BACKLOG_WAIT_TIME	0x00000002
++ #define AUDIT_FEATURE_BITMAP_EXECUTABLE_PATH	0x00000004
++ #define AUDIT_FEATURE_BITMAP_ALL (AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT | \
++ 				  AUDIT_FEATURE_BITMAP_BACKLOG_WAIT_TIME | \
++ 				  AUDIT_FEATURE_BITMAP_EXECUTABLE_PATH)
+++>>>>>>> 34d99af52ad4 (audit: implement audit by executable)
+  
+  /* deprecated: AUDIT_VERSION_* */
+  #define AUDIT_VERSION_LATEST 		AUDIT_FEATURE_BITMAP_ALL
+diff --cc kernel/auditfilter.c
+index e5a79a6752e0,7714d93edb85..000000000000
+--- a/kernel/auditfilter.c
++++ b/kernel/auditfilter.c
+@@@ -400,8 -425,9 +406,9 @@@ static struct audit_entry *audit_data_t
+  	size_t remain = datasz - sizeof(struct audit_rule_data);
+  	int i;
+  	char *str;
++ 	struct audit_fsnotify_mark *audit_mark;
+  
+ -	entry = audit_to_entry_common(data);
+ +	entry = audit_to_entry_common((struct audit_rule *)data);
+  	if (IS_ERR(entry))
+  		goto exit_nofree;
+  
+@@@ -1087,6 -1113,52 +1133,55 @@@ int audit_receive_filter(int type, __u3
+  		WARN_ON(1);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (err || type == AUDIT_DEL_RULE) {
++ 		if (entry->rule.exe)
++ 			audit_remove_mark(entry->rule.exe);
++ 		audit_free_rule(entry);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ /**
++  * audit_list_rules_send - list the audit rules
++  * @request_skb: skb of request we are replying to (used to target the reply)
++  * @seq: netlink audit message sequence (serial) number
++  */
++ int audit_list_rules_send(struct sk_buff *request_skb, int seq)
++ {
++ 	u32 portid = NETLINK_CB(request_skb).portid;
++ 	struct net *net = sock_net(NETLINK_CB(request_skb).sk);
++ 	struct task_struct *tsk;
++ 	struct audit_netlink_list *dest;
++ 	int err = 0;
++ 
++ 	/* We can't just spew out the rules here because we might fill
++ 	 * the available socket buffer space and deadlock waiting for
++ 	 * auditctl to read from it... which isn't ever going to
++ 	 * happen if we're actually running in the context of auditctl
++ 	 * trying to _send_ the stuff */
++ 
++ 	dest = kmalloc(sizeof(struct audit_netlink_list), GFP_KERNEL);
++ 	if (!dest)
++ 		return -ENOMEM;
++ 	dest->net = get_net(net);
++ 	dest->portid = portid;
++ 	skb_queue_head_init(&dest->q);
++ 
++ 	mutex_lock(&audit_filter_mutex);
++ 	audit_list_rules(portid, seq, &dest->q);
++ 	mutex_unlock(&audit_filter_mutex);
++ 
++ 	tsk = kthread_run(audit_send_list, dest, "audit_send_list");
++ 	if (IS_ERR(tsk)) {
++ 		skb_queue_purge(&dest->q);
++ 		kfree(dest);
++ 		err = PTR_ERR(tsk);
++ 	}
++ 
+++>>>>>>> 34d99af52ad4 (audit: implement audit by executable)
+  	return err;
+  }
+  
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index 006227fc9978..488d63c5aa49 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -62,6 +62,7 @@ struct audit_krule {
+ 	struct audit_field	*inode_f; /* quick access to an inode field */
+ 	struct audit_watch	*watch;	/* associated watch */
+ 	struct audit_tree	*tree;	/* associated watched tree */
++	struct audit_fsnotify_mark	*exe;
+ 	struct list_head	rlist;	/* entry in audit_{watch,tree}.rules list */
+ 	struct list_head	list;	/* for AUDIT_LIST* purposes only */
+ 	u64			prio;
+* Unmerged path include/uapi/linux/audit.h
+diff --git a/kernel/audit.h b/kernel/audit.h
+index 9fe1fb5894c9..18a56271aa9d 100644
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -278,6 +278,8 @@ extern char *audit_mark_path(struct audit_fsnotify_mark *mark);
+ extern void audit_remove_mark(struct audit_fsnotify_mark *audit_mark);
+ extern void audit_remove_mark_rule(struct audit_krule *krule);
+ extern int audit_mark_compare(struct audit_fsnotify_mark *mark, unsigned long ino, dev_t dev);
++extern int audit_dupe_exe(struct audit_krule *new, struct audit_krule *old);
++extern int audit_exe_compare(struct task_struct *tsk, struct audit_fsnotify_mark *mark);
+ 
+ #else
+ #define audit_put_watch(w) {}
+@@ -293,6 +295,8 @@ extern int audit_mark_compare(struct audit_fsnotify_mark *mark, unsigned long in
+ #define audit_remove_mark(m)
+ #define audit_remove_mark_rule(k)
+ #define audit_mark_compare(m, i, d) 0
++#define audit_exe_compare(t, m) (-EINVAL)
++#define audit_dupe_exe(n, o) (-EINVAL)
+ #endif /* CONFIG_AUDIT_WATCH */
+ 
+ #ifdef CONFIG_AUDIT_TREE
+diff --git a/kernel/audit_tree.c b/kernel/audit_tree.c
+index ea4c1d0e95c8..18cad03ff421 100644
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@ -478,6 +478,8 @@ static void kill_rules(struct audit_tree *tree)
+ 		if (rule->tree) {
+ 			/* not a half-baked one */
+ 			audit_tree_log_remove_rule(rule);
++			if (entry->rule.exe)
++				audit_remove_mark(entry->rule.exe);
+ 			rule->tree = NULL;
+ 			list_del_rcu(&entry->list);
+ 			list_del(&entry->rule.list);
+diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
+index ad2f90d15b85..f3fd370c2d0e 100644
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@ -312,6 +312,8 @@ static void audit_update_watch(struct audit_parent *parent,
+ 				list_replace(&oentry->rule.list,
+ 					     &nentry->rule.list);
+ 			}
++			if (oentry->rule.exe)
++				audit_remove_mark(oentry->rule.exe);
+ 
+ 			audit_watch_log_rule_change(r, owatch, "updated_rules");
+ 
+@@ -342,6 +344,8 @@ static void audit_remove_parent_watches(struct audit_parent *parent)
+ 		list_for_each_entry_safe(r, nextr, &w->rules, rlist) {
+ 			e = container_of(r, struct audit_entry, rule);
+ 			audit_watch_log_rule_change(r, w, "remove_rule");
++			if (e->rule.exe)
++				audit_remove_mark(e->rule.exe);
+ 			list_del(&r->rlist);
+ 			list_del(&r->list);
+ 			list_del_rcu(&e->list);
+@@ -526,3 +530,30 @@ static int __init audit_watch_init(void)
+ 	return 0;
+ }
+ device_initcall(audit_watch_init);
++
++int audit_dupe_exe(struct audit_krule *new, struct audit_krule *old)
++{
++	struct audit_fsnotify_mark *audit_mark;
++	char *pathname;
++
++	pathname = kstrdup(audit_mark_path(old->exe), GFP_KERNEL);
++	if (!pathname)
++		return -ENOMEM;
++
++	audit_mark = audit_alloc_mark(new, pathname, strlen(pathname));
++	if (IS_ERR(audit_mark)) {
++		kfree(pathname);
++		return PTR_ERR(audit_mark);
++	}
++	new->exe = audit_mark;
++
++	return 0;
++}
++
++int audit_exe_compare(struct task_struct *tsk, struct audit_fsnotify_mark *mark)
++{
++	unsigned long ino = tsk->mm->exe_file->f_inode->i_ino;
++	dev_t dev = tsk->mm->exe_file->f_inode->i_sb->s_dev;
++
++	return audit_mark_compare(mark, ino, dev);
++}
+* Unmerged path kernel/auditfilter.c
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index 32e9c4626d5d..ca5e17909691 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -466,6 +466,9 @@ static int audit_filter_rules(struct task_struct *tsk,
+ 				result = audit_comparator(ctx->ppid, f->op, f->val);
+ 			}
+ 			break;
++		case AUDIT_EXE:
++			result = audit_exe_compare(tsk, rule->exe);
++			break;
+ 		case AUDIT_UID:
+ 			result = audit_uid_comparator(cred->uid, f->op, f->uid);
+ 			break;
