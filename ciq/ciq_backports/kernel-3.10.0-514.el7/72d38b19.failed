@@ -1,0 +1,501 @@
+s390/vtime: correct scaled cputime of partially idle CPUs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [s390] vtime: correct scaled cputime of partially idle CPUs (Hendrik Brueckner) [1308883]
+Rebuild_FUZZ: 95.41%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 72d38b19781de457def0a62dfaa50134fc6e15f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/72d38b19.failed
+
+The calculation for the SMT scaling factor for a hardware thread
+which has been partially idle needs to disregard the cycles spent
+by the other threads of the core while the thread is idle.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 72d38b19781de457def0a62dfaa50134fc6e15f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/entry.S
+#	arch/s390/kernel/vtime.c
+diff --cc arch/s390/kernel/entry.S
+index 9fd2c1f12630,582fe44ab07c..000000000000
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@@ -578,47 -702,169 +578,62 @@@ io_notify_resume
+  /*
+   * External interrupt handler routine
+   */
+ +
+  ENTRY(ext_int_handler)
+ -	STCK	__LC_INT_CLOCK
+ +	stck	__LC_INT_CLOCK
+  	stpt	__LC_ASYNC_ENTER_TIMER
+ -	stmg	%r8,%r15,__LC_SAVE_AREA_ASYNC
+ -	lg	%r10,__LC_LAST_BREAK
+ -	lg	%r12,__LC_THREAD_INFO
+ -	larl	%r13,cleanup_critical
+ -	lmg	%r8,%r9,__LC_EXT_OLD_PSW
+ -	SWITCH_ASYNC __LC_SAVE_AREA_ASYNC,__LC_ASYNC_ENTER_TIMER
+ -	stmg	%r0,%r7,__PT_R0(%r11)
+ -	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA_ASYNC
+ -	stmg	%r8,%r9,__PT_PSW(%r11)
+ -	lghi	%r1,__LC_EXT_PARAMS2
+ -	mvc	__PT_INT_CODE(4,%r11),__LC_EXT_CPU_ADDR
+ -	mvc	__PT_INT_PARM(4,%r11),__LC_EXT_PARAMS
+ -	mvc	__PT_INT_PARM_LONG(8,%r11),0(%r1)
+ -	xc	__PT_FLAGS(8,%r11),__PT_FLAGS(%r11)
+ +	stm	%r8,%r15,__LC_SAVE_AREA_ASYNC
+ +	l	%r12,__LC_THREAD_INFO
+ +	l	%r13,__LC_SVC_NEW_PSW+4
+ +	lm	%r8,%r9,__LC_EXT_OLD_PSW
+ +	tmh	%r8,0x0001		# interrupting from user ?
+ +	jz	ext_skip
+ +	UPDATE_VTIME %r14,%r15,__LC_ASYNC_ENTER_TIMER
+ +ext_skip:
+ +	SWITCH_ASYNC __LC_SAVE_AREA_ASYNC,__LC_ASYNC_STACK,STACK_SHIFT
+ +	stm	%r0,%r7,__PT_R0(%r11)
+ +	mvc	__PT_R8(32,%r11),__LC_SAVE_AREA_ASYNC
+ +	stm	%r8,%r9,__PT_PSW(%r11)
+  	TRACE_IRQS_OFF
+ -	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+ -	lgr	%r2,%r11		# pass pointer to pt_regs
+ -	lghi	%r3,EXT_INTERRUPT
+ -	brasl	%r14,do_IRQ
+ -	j	.Lio_return
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+ +	l	%r3,__LC_EXT_CPU_ADDR	# get cpu address + interruption code
+ +	l	%r4,__LC_EXT_PARAMS	# get external parameters
+ +	l	%r1,BASED(.Ldo_extint)
+ +	basr	%r14,%r1		# call do_extint
+ +	j	io_return
+  
+  /*
+ - * Load idle PSW. The second "half" of this function is in .Lcleanup_idle.
+ + * Load idle PSW. The second "half" of this function is in cleanup_idle.
+   */
+  ENTRY(psw_idle)
+++<<<<<<< HEAD
+ +	st	%r3,__SF_EMPTY(%r15)
+ +	basr	%r1,0
+ +	la	%r1,psw_idle_lpsw+4-.(%r1)
+ +	st	%r1,__SF_EMPTY+4(%r15)
+ +	oi	__SF_EMPTY+4(%r15),0x80
+ +	stck	__CLOCK_IDLE_ENTER(%r2)
+++=======
++ 	stg	%r3,__SF_EMPTY(%r15)
++ 	larl	%r1,.Lpsw_idle_lpsw+4
++ 	stg	%r1,__SF_EMPTY+8(%r15)
++ #ifdef CONFIG_SMP
++ 	larl	%r1,smp_cpu_mtid
++ 	llgf	%r1,0(%r1)
++ 	ltgr	%r1,%r1
++ 	jz	.Lpsw_idle_stcctm
++ 	.insn	rsy,0xeb0000000017,%r1,5,__SF_EMPTY+16(%r15)
++ .Lpsw_idle_stcctm:
++ #endif
++ 	STCK	__CLOCK_IDLE_ENTER(%r2)
+++>>>>>>> 72d38b19781d (s390/vtime: correct scaled cputime of partially idle CPUs)
+  	stpt	__TIMER_IDLE_ENTER(%r2)
+ -.Lpsw_idle_lpsw:
+ -	lpswe	__SF_EMPTY(%r15)
+ -	br	%r14
+ -.Lpsw_idle_end:
+ -
+ -/* Store floating-point controls and floating-point or vector extension
+ - * registers instead.  A critical section cleanup assures that the registers
+ - * are stored even if interrupted for some other work.	The register %r2
+ - * designates a struct fpu to store register contents.	If the specified
+ - * structure does not contain a register save area, the register store is
+ - * omitted (see also comments in arch_dup_task_struct()).
+ - *
+ - * The CIF_FPU flag is set in any case.  The CIF_FPU triggers a lazy restore
+ - * of the register contents at system call or io return.
+ - */
+ -ENTRY(save_fpu_regs)
+ -	lg	%r2,__LC_CURRENT
+ -	aghi	%r2,__TASK_thread
+ -	tm	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	bor	%r14
+ -	stfpc	__THREAD_FPU_fpc(%r2)
+ -.Lsave_fpu_regs_fpc_end:
+ -	lg	%r3,__THREAD_FPU_regs(%r2)
+ -	ltgr	%r3,%r3
+ -	jz	.Lsave_fpu_regs_done	  # no save area -> set CIF_FPU
+ -	tm	__THREAD_FPU_flags+3(%r2),FPU_USE_VX
+ -	jz	.Lsave_fpu_regs_fp	  # no -> store FP regs
+ -.Lsave_fpu_regs_vx_low:
+ -	VSTM	%v0,%v15,0,%r3		  # vstm 0,15,0(3)
+ -.Lsave_fpu_regs_vx_high:
+ -	VSTM	%v16,%v31,256,%r3	  # vstm 16,31,256(3)
+ -	j	.Lsave_fpu_regs_done	  # -> set CIF_FPU flag
+ -.Lsave_fpu_regs_fp:
+ -	std	0,0(%r3)
+ -	std	1,8(%r3)
+ -	std	2,16(%r3)
+ -	std	3,24(%r3)
+ -	std	4,32(%r3)
+ -	std	5,40(%r3)
+ -	std	6,48(%r3)
+ -	std	7,56(%r3)
+ -	std	8,64(%r3)
+ -	std	9,72(%r3)
+ -	std	10,80(%r3)
+ -	std	11,88(%r3)
+ -	std	12,96(%r3)
+ -	std	13,104(%r3)
+ -	std	14,112(%r3)
+ -	std	15,120(%r3)
+ -.Lsave_fpu_regs_done:
+ -	oi	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	br	%r14
+ -.Lsave_fpu_regs_end:
+ -
+ -/* Load floating-point controls and floating-point or vector extension
+ - * registers.  A critical section cleanup assures that the register contents
+ - * are loaded even if interrupted for some other work.	Depending on the saved
+ - * FP/VX state, the vector-enablement control, CR0.46, is either set or cleared.
+ - *
+ - * There are special calling conventions to fit into sysc and io return work:
+ - *	%r15:	<kernel stack>
+ - * The function requires:
+ - *	%r4 and __SF_EMPTY+32(%r15)
+ - */
+ -load_fpu_regs:
+ -	lg	%r4,__LC_CURRENT
+ -	aghi	%r4,__TASK_thread
+ -	tm	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	bnor	%r14
+ -	lfpc	__THREAD_FPU_fpc(%r4)
+ -	stctg	%c0,%c0,__SF_EMPTY+32(%r15)	# store CR0
+ -	tm	__THREAD_FPU_flags+3(%r4),FPU_USE_VX	# VX-enabled task ?
+ -	lg	%r4,__THREAD_FPU_regs(%r4)	# %r4 <- reg save area
+ -	jz	.Lload_fpu_regs_fp_ctl		# -> no VX, load FP regs
+ -.Lload_fpu_regs_vx_ctl:
+ -	tm	__SF_EMPTY+32+5(%r15),2		# test VX control
+ -	jo	.Lload_fpu_regs_vx
+ -	oi	__SF_EMPTY+32+5(%r15),2		# set VX control
+ -	lctlg	%c0,%c0,__SF_EMPTY+32(%r15)
+ -.Lload_fpu_regs_vx:
+ -	VLM	%v0,%v15,0,%r4
+ -.Lload_fpu_regs_vx_high:
+ -	VLM	%v16,%v31,256,%r4
+ -	j	.Lload_fpu_regs_done
+ -.Lload_fpu_regs_fp_ctl:
+ -	tm	__SF_EMPTY+32+5(%r15),2		# test VX control
+ -	jz	.Lload_fpu_regs_fp
+ -	ni	__SF_EMPTY+32+5(%r15),253	# clear VX control
+ -	lctlg	%c0,%c0,__SF_EMPTY+32(%r15)
+ -.Lload_fpu_regs_fp:
+ -	ld	0,0(%r4)
+ -	ld	1,8(%r4)
+ -	ld	2,16(%r4)
+ -	ld	3,24(%r4)
+ -	ld	4,32(%r4)
+ -	ld	5,40(%r4)
+ -	ld	6,48(%r4)
+ -	ld	7,56(%r4)
+ -	ld	8,64(%r4)
+ -	ld	9,72(%r4)
+ -	ld	10,80(%r4)
+ -	ld	11,88(%r4)
+ -	ld	12,96(%r4)
+ -	ld	13,104(%r4)
+ -	ld	14,112(%r4)
+ -	ld	15,120(%r4)
+ -.Lload_fpu_regs_done:
+ -	ni	__LC_CPU_FLAGS+7,255-_CIF_FPU
+ -	br	%r14
+ -.Lload_fpu_regs_end:
+ -
+ -/* Test and set the vector enablement control in CR0.46 */
+ -ENTRY(__ctl_set_vx)
+ -	stctg	%c0,%c0,__SF_EMPTY(%r15)
+ -	tm	__SF_EMPTY+5(%r15),2
+ -	bor	%r14
+ -	oi	__SF_EMPTY+5(%r15),2
+ -	lctlg	%c0,%c0,__SF_EMPTY(%r15)
+ +psw_idle_lpsw:
+ +	lpsw	__SF_EMPTY(%r15)
+  	br	%r14
+ -.L__ctl_set_vx_end:
+ +psw_idle_end:
+  
+ -.L__critical_end:
+ +__critical_end:
+  
+  /*
+   * Machine check handler routines
+@@@ -875,30 -1162,189 +890,59 @@@ cleanup_idle
+  	je	0f
+  	mvc	__CLOCK_IDLE_EXIT(8,%r2),__LC_MCCK_CLOCK
+  	mvc	__TIMER_IDLE_EXIT(8,%r2),__LC_MCCK_ENTER_TIMER
+ -0:	# check if stck & stpt have been executed
+ -	clg	%r9,BASED(.Lcleanup_idle_insn)
+ +0:	# check if stck has been executed
+ +	cl	%r9,BASED(cleanup_idle_insn)
+  	jhe	1f
+  	mvc	__CLOCK_IDLE_ENTER(8,%r2),__CLOCK_IDLE_EXIT(%r2)
+++<<<<<<< HEAD
+ +	mvc	__TIMER_IDLE_ENTER(8,%r2),__TIMER_IDLE_EXIT(%r3)
+ +1:	# account system time going idle
+ +	lm	%r9,%r10,__LC_STEAL_TIMER
+ +	ADD64	%r9,%r10,__CLOCK_IDLE_ENTER(%r2)
+ +	SUB64	%r9,%r10,__LC_LAST_UPDATE_CLOCK
+ +	stm	%r9,%r10,__LC_STEAL_TIMER
+++=======
++ 	mvc	__TIMER_IDLE_ENTER(8,%r2),__TIMER_IDLE_EXIT(%r2)
++ 1:	# calculate idle cycles
++ #ifdef CONFIG_SMP
++ 	clg	%r9,BASED(.Lcleanup_idle_insn)
++ 	jl	3f
++ 	larl	%r1,smp_cpu_mtid
++ 	llgf	%r1,0(%r1)
++ 	ltgr	%r1,%r1
++ 	jz	3f
++ 	.insn	rsy,0xeb0000000017,%r1,5,__SF_EMPTY+80(%r15)
++ 	larl	%r3,mt_cycles
++ 	ag	%r3,__LC_PERCPU_OFFSET
++ 	la	%r4,__SF_EMPTY+16(%r15)
++ 2:	lg	%r0,0(%r3)
++ 	slg	%r0,0(%r4)
++ 	alg	%r0,64(%r4)
++ 	stg	%r0,0(%r3)
++ 	la	%r3,8(%r3)
++ 	la	%r4,8(%r4)
++ 	brct	%r1,2b
++ #endif
++ 3:	# account system time going idle
++ 	lg	%r9,__LC_STEAL_TIMER
++ 	alg	%r9,__CLOCK_IDLE_ENTER(%r2)
++ 	slg	%r9,__LC_LAST_UPDATE_CLOCK
++ 	stg	%r9,__LC_STEAL_TIMER
+++>>>>>>> 72d38b19781d (s390/vtime: correct scaled cputime of partially idle CPUs)
+  	mvc	__LC_LAST_UPDATE_CLOCK(8),__CLOCK_IDLE_EXIT(%r2)
+ -	lg	%r9,__LC_SYSTEM_TIMER
+ -	alg	%r9,__LC_LAST_UPDATE_TIMER
+ -	slg	%r9,__TIMER_IDLE_ENTER(%r2)
+ -	stg	%r9,__LC_SYSTEM_TIMER
+ +	lm	%r9,%r10,__LC_SYSTEM_TIMER
+ +	ADD64	%r9,%r10,__LC_LAST_UPDATE_TIMER
+ +	SUB64	%r9,%r10,__TIMER_IDLE_ENTER(%r2)
+ +	stm	%r9,%r10,__LC_SYSTEM_TIMER
+  	mvc	__LC_LAST_UPDATE_TIMER(8),__TIMER_IDLE_EXIT(%r2)
+  	# prepare return psw
+ -	nihh	%r8,0xfcfd		# clear irq & wait state bits
+ -	lg	%r9,48(%r11)		# return from psw_idle
+ -	br	%r14
+ -.Lcleanup_idle_insn:
+ -	.quad	.Lpsw_idle_lpsw
+ -
+ -.Lcleanup_save_fpu_regs:
+ -	tm	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	bor	%r14
+ -	clg	%r9,BASED(.Lcleanup_save_fpu_regs_done)
+ -	jhe	5f
+ -	clg	%r9,BASED(.Lcleanup_save_fpu_regs_fp)
+ -	jhe	4f
+ -	clg	%r9,BASED(.Lcleanup_save_fpu_regs_vx_high)
+ -	jhe	3f
+ -	clg	%r9,BASED(.Lcleanup_save_fpu_regs_vx_low)
+ -	jhe	2f
+ -	clg	%r9,BASED(.Lcleanup_save_fpu_fpc_end)
+ -	jhe	1f
+ -	lg	%r2,__LC_CURRENT
+ -	aghi	%r2,__TASK_thread
+ -0:	# Store floating-point controls
+ -	stfpc	__THREAD_FPU_fpc(%r2)
+ -1:	# Load register save area and check if VX is active
+ -	lg	%r3,__THREAD_FPU_regs(%r2)
+ -	ltgr	%r3,%r3
+ -	jz	5f			  # no save area -> set CIF_FPU
+ -	tm	__THREAD_FPU_flags+3(%r2),FPU_USE_VX
+ -	jz	4f			  # no VX -> store FP regs
+ -2:	# Store vector registers (V0-V15)
+ -	VSTM	%v0,%v15,0,%r3		  # vstm 0,15,0(3)
+ -3:	# Store vector registers (V16-V31)
+ -	VSTM	%v16,%v31,256,%r3	  # vstm 16,31,256(3)
+ -	j	5f			  # -> done, set CIF_FPU flag
+ -4:	# Store floating-point registers
+ -	std	0,0(%r3)
+ -	std	1,8(%r3)
+ -	std	2,16(%r3)
+ -	std	3,24(%r3)
+ -	std	4,32(%r3)
+ -	std	5,40(%r3)
+ -	std	6,48(%r3)
+ -	std	7,56(%r3)
+ -	std	8,64(%r3)
+ -	std	9,72(%r3)
+ -	std	10,80(%r3)
+ -	std	11,88(%r3)
+ -	std	12,96(%r3)
+ -	std	13,104(%r3)
+ -	std	14,112(%r3)
+ -	std	15,120(%r3)
+ -5:	# Set CIF_FPU flag
+ -	oi	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	lg	%r9,48(%r11)		# return from save_fpu_regs
+ -	br	%r14
+ -.Lcleanup_save_fpu_fpc_end:
+ -	.quad	.Lsave_fpu_regs_fpc_end
+ -.Lcleanup_save_fpu_regs_vx_low:
+ -	.quad	.Lsave_fpu_regs_vx_low
+ -.Lcleanup_save_fpu_regs_vx_high:
+ -	.quad	.Lsave_fpu_regs_vx_high
+ -.Lcleanup_save_fpu_regs_fp:
+ -	.quad	.Lsave_fpu_regs_fp
+ -.Lcleanup_save_fpu_regs_done:
+ -	.quad	.Lsave_fpu_regs_done
+ -
+ -.Lcleanup_load_fpu_regs:
+ -	tm	__LC_CPU_FLAGS+7,_CIF_FPU
+ -	bnor	%r14
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_done)
+ -	jhe	1f
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_fp)
+ -	jhe	2f
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_fp_ctl)
+ -	jhe	3f
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_vx_high)
+ -	jhe	4f
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_vx)
+ -	jhe	5f
+ -	clg	%r9,BASED(.Lcleanup_load_fpu_regs_vx_ctl)
+ -	jhe	6f
+ -	lg	%r4,__LC_CURRENT
+ -	aghi	%r4,__TASK_thread
+ -	lfpc	__THREAD_FPU_fpc(%r4)
+ -	tm	__THREAD_FPU_flags+3(%r4),FPU_USE_VX	# VX-enabled task ?
+ -	lg	%r4,__THREAD_FPU_regs(%r4)	# %r4 <- reg save area
+ -	jz	3f				# -> no VX, load FP regs
+ -6:	# Set VX-enablement control
+ -	stctg	%c0,%c0,__SF_EMPTY+32(%r15)	# store CR0
+ -	tm	__SF_EMPTY+32+5(%r15),2		# test VX control
+ -	jo	5f
+ -	oi	__SF_EMPTY+32+5(%r15),2		# set VX control
+ -	lctlg	%c0,%c0,__SF_EMPTY+32(%r15)
+ -5:	# Load V0 ..V15 registers
+ -	VLM	%v0,%v15,0,%r4
+ -4:	# Load V16..V31 registers
+ -	VLM	%v16,%v31,256,%r4
+ -	j	1f
+ -3:	# Clear VX-enablement control for FP
+ -	stctg	%c0,%c0,__SF_EMPTY+32(%r15)	# store CR0
+ -	tm	__SF_EMPTY+32+5(%r15),2		# test VX control
+ -	jz	2f
+ -	ni	__SF_EMPTY+32+5(%r15),253	# clear VX control
+ -	lctlg	%c0,%c0,__SF_EMPTY+32(%r15)
+ -2:	# Load floating-point registers
+ -	ld	0,0(%r4)
+ -	ld	1,8(%r4)
+ -	ld	2,16(%r4)
+ -	ld	3,24(%r4)
+ -	ld	4,32(%r4)
+ -	ld	5,40(%r4)
+ -	ld	6,48(%r4)
+ -	ld	7,56(%r4)
+ -	ld	8,64(%r4)
+ -	ld	9,72(%r4)
+ -	ld	10,80(%r4)
+ -	ld	11,88(%r4)
+ -	ld	12,96(%r4)
+ -	ld	13,104(%r4)
+ -	ld	14,112(%r4)
+ -	ld	15,120(%r4)
+ -1:	# Clear CIF_FPU bit
+ -	ni	__LC_CPU_FLAGS+7,255-_CIF_FPU
+ -	lg	%r9,48(%r11)		# return from load_fpu_regs
+ -	br	%r14
+ -.Lcleanup_load_fpu_regs_vx_ctl:
+ -	.quad	.Lload_fpu_regs_vx_ctl
+ -.Lcleanup_load_fpu_regs_vx:
+ -	.quad	.Lload_fpu_regs_vx
+ -.Lcleanup_load_fpu_regs_vx_high:
+ -	.quad	.Lload_fpu_regs_vx_high
+ -.Lcleanup_load_fpu_regs_fp_ctl:
+ -	.quad	.Lload_fpu_regs_fp_ctl
+ -.Lcleanup_load_fpu_regs_fp:
+ -	.quad	.Lload_fpu_regs_fp
+ -.Lcleanup_load_fpu_regs_done:
+ -	.quad	.Lload_fpu_regs_done
+ -
+ -.Lcleanup___ctl_set_vx:
+ -	stctg	%c0,%c0,__SF_EMPTY(%r15)
+ -	tm	__SF_EMPTY+5(%r15),2
+ -	bor	%r14
+ -	oi	__SF_EMPTY+5(%r15),2
+ -	lctlg	%c0,%c0,__SF_EMPTY(%r15)
+ -	lg	%r9,48(%r11)		# return from __ctl_set_vx
+ +	n	%r8,BASED(cleanup_idle_wait)	# clear irq & wait state bits
+ +	l	%r9,24(%r11)			# return from psw_idle
+  	br	%r14
+ +cleanup_idle_insn:
+ +	.long	psw_idle_lpsw + 0x80000000
+ +cleanup_idle_wait:
+ +	.long	0xfcfdffff
+  
+  /*
+   * Integer constants
+diff --cc arch/s390/kernel/vtime.c
+index 44daff66bacb,dafc44f519c3..000000000000
+--- a/arch/s390/kernel/vtime.c
++++ b/arch/s390/kernel/vtime.c
+@@@ -94,34 -112,10 +121,39 @@@ static int do_account_vtime(struct task
+  	S390_lowcore.system_timer += timer - S390_lowcore.last_update_timer;
+  	S390_lowcore.steal_timer += S390_lowcore.last_update_clock - clock;
+  
+- 	/* Do MT utilization calculation */
++ 	/* Update MT utilization calculation */
+  	if (smp_cpu_mtid &&
+++<<<<<<< HEAD
+ +	    time_after64(jiffies_64, __this_cpu_read(mt_scaling_jiffies))) {
+ +		u64 cycles_new[32], *cycles_old;
+ +		u64 delta, fac, mult, div;
+ +
+ +		cycles_old = __get_cpu_var(mt_cycles);
+ +		if (stcctm5(smp_cpu_mtid + 1, cycles_new) < 2) {
+ +			fac = 1;
+ +			mult = div = 0;
+ +			for (i = 0; i <= smp_cpu_mtid; i++) {
+ +				delta = cycles_new[i] - cycles_old[i];
+ +				div += delta;
+ +				mult *= i + 1;
+ +				mult += delta * fac;
+ +				fac *= i + 1;
+ +			}
+ +			div *= fac;
+ +			if (div > 0) {
+ +				/* Update scaling factor */
+ +				__get_cpu_var(mt_scaling_mult) = mult;
+ +				__get_cpu_var(mt_scaling_div) = div;
+ +				memcpy(cycles_old, cycles_new,
+ +				       sizeof(u64) * (smp_cpu_mtid + 1));
+ +			}
+ +		}
+ +		__this_cpu_write(mt_scaling_jiffies, jiffies_64);
+ +	}
+++=======
++ 	    time_after64(jiffies_64, this_cpu_read(mt_scaling_jiffies)))
++ 		update_mt_scaling();
+++>>>>>>> 72d38b19781d (s390/vtime: correct scaled cputime of partially idle CPUs)
+  
+  	user = S390_lowcore.user_timer - ti->user_timer;
+  	S390_lowcore.steal_timer -= user;
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 809fed72a8da..386569edcb65 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -160,6 +160,7 @@ int main(void)
+ 	DEFINE(__LC_PASTE, offsetof(struct _lowcore, paste));
+ 	DEFINE(__LC_FP_CREG_SAVE_AREA, offsetof(struct _lowcore, fpt_creg_save_area));
+ 	DEFINE(__LC_LAST_BREAK, offsetof(struct _lowcore, breaking_event_addr));
++	DEFINE(__LC_PERCPU_OFFSET, offsetof(struct _lowcore, percpu_offset));
+ 	DEFINE(__LC_VDSO_PER_CPU, offsetof(struct _lowcore, vdso_per_cpu_data));
+ 	DEFINE(__LC_GMAP, offsetof(struct _lowcore, gmap));
+ 	DEFINE(__LC_PGM_TDB, offsetof(struct _lowcore, pgm_tdb));
+* Unmerged path arch/s390/kernel/entry.S
+* Unmerged path arch/s390/kernel/vtime.c
