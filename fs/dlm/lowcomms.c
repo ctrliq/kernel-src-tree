@@ -1254,6 +1254,7 @@ out_err:
 			  con->retries, result);
 		mutex_unlock(&con->sock_mutex);
 		msleep(1000);
+		clear_bit(CF_CONNECT_PENDING, &con->flags);
 		lowcomms_connect_sock(con);
 		return;
 	}
