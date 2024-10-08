@@ -458,7 +458,7 @@ out:
  *
  * Disables link, should be called during D3 power down sequence.
  *
- */
+ **/
 static void ixgbe_stop_mac_link_on_d3_82599(struct ixgbe_hw *hw)
 {
 	u32 autoc2_reg;
@@ -943,8 +943,7 @@ static s32 ixgbe_setup_mac_link_smartspeed(struct ixgbe_hw *hw,
 
 out:
 	if (link_up && (link_speed == IXGBE_LINK_SPEED_1GB_FULL))
-		hw_dbg(hw, "Smartspeed has downgraded the link speed from "
-		       "the maximum advertised\n");
+		hw_dbg(hw, "Smartspeed has downgraded the link speed from the maximum advertised\n");
 	return status;
 }
 
@@ -1070,8 +1069,7 @@ static s32 ixgbe_setup_mac_link_82599(struct ixgbe_hw *hw,
 				if (!(links_reg & IXGBE_LINKS_KX_AN_COMP)) {
 					status =
 					        IXGBE_ERR_AUTONEG_NOT_COMPLETE;
-					hw_dbg(hw, "Autoneg did not "
-					       "complete.\n");
+					hw_dbg(hw, "Autoneg did not complete.\n");
 				}
 			}
 		}
