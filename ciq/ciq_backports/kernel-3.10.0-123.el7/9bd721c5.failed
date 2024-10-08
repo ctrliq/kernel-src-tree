@@ -1,0 +1,160 @@
+sched/balancing: Consider max cost of idle balance per sched domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jason Low <jason.low2@hp.com>
+commit 9bd721c55c8a886b938a45198aab0ccb52f1f7fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/9bd721c5.failed
+
+In this patch, we keep track of the max cost we spend doing idle load balancing
+for each sched domain. If the avg time the CPU remains idle is less then the
+time we have already spent on idle balancing + the max cost of idle balancing
+in the sched domain, then we don't continue to attempt the balance. We also
+keep a per rq variable, max_idle_balance_cost, which keeps track of the max
+time spent on newidle load balances throughout all its domains so that we can
+determine the avg_idle's max value.
+
+By using the max, we avoid overrunning the average. This further reduces the
+chance we attempt balancing when the CPU is not idle for longer than the cost
+to balance.
+
+	Signed-off-by: Jason Low <jason.low2@hp.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1379096813-3032-3-git-send-email-jason.low2@hp.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 9bd721c55c8a886b938a45198aab0ccb52f1f7fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index c33e42bc435b,ffc99d8f0a95..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5434,15 -5412,28 +5435,36 @@@ void idle_balance(int this_cpu, struct 
+  	rcu_read_lock();
+  	for_each_domain(this_cpu, sd) {
+  		unsigned long interval;
+++<<<<<<< HEAD
+ +		int balance = 1;
+++=======
++ 		int continue_balancing = 1;
++ 		u64 t0, domain_cost;
+++>>>>>>> 9bd721c55c8a (sched/balancing: Consider max cost of idle balance per sched domain)
+  
+  		if (!(sd->flags & SD_LOAD_BALANCE))
+  			continue;
+  
++ 		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost)
++ 			break;
++ 
+  		if (sd->flags & SD_BALANCE_NEWIDLE) {
++ 			t0 = sched_clock_cpu(this_cpu);
++ 
+  			/* If we've pulled tasks over stop searching: */
+  			pulled_task = load_balance(this_cpu, this_rq,
+++<<<<<<< HEAD
+ +						   sd, CPU_NEWLY_IDLE, &balance);
+++=======
++ 						   sd, CPU_NEWLY_IDLE,
++ 						   &continue_balancing);
++ 
++ 			domain_cost = sched_clock_cpu(this_cpu) - t0;
++ 			if (domain_cost > sd->max_newidle_lb_cost)
++ 				sd->max_newidle_lb_cost = domain_cost;
++ 
++ 			curr_cost += domain_cost;
+++>>>>>>> 9bd721c55c8a (sched/balancing: Consider max cost of idle balance per sched domain)
+  		}
+  
+  		interval = msecs_to_jiffies(sd->balance_interval);
+diff --git a/arch/metag/include/asm/topology.h b/arch/metag/include/asm/topology.h
+index 23f5118f58db..db192924f4b0 100644
+--- a/arch/metag/include/asm/topology.h
++++ b/arch/metag/include/asm/topology.h
+@@ -26,6 +26,7 @@
+ 	.last_balance		= jiffies,		\
+ 	.balance_interval	= 1,			\
+ 	.nr_balance_failed	= 0,			\
++	.max_newidle_lb_cost	= 0,			\
+ }
+ 
+ #define cpu_to_node(cpu)	((void)(cpu), 0)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 933a94b9c8f9..68c7dfe988e7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -828,6 +828,7 @@ struct sched_domain {
+ 	unsigned int nr_balance_failed; /* initialise to 0 */
+ 
+ 	u64 last_update;
++	u64 max_newidle_lb_cost;
+ 
+ #ifdef CONFIG_SCHEDSTATS
+ 	/* load_balance() stats */
+diff --git a/include/linux/topology.h b/include/linux/topology.h
+index d3cf0d6e7712..e2a2c3da2929 100644
+--- a/include/linux/topology.h
++++ b/include/linux/topology.h
+@@ -106,6 +106,7 @@ int arch_update_cpu_topology(void);
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
+ 	.smt_gain		= 1178,	/* 15% */			\
++	.max_newidle_lb_cost	= 0,					\
+ }
+ #endif
+ #endif /* CONFIG_SCHED_SMT */
+@@ -135,6 +136,7 @@ int arch_update_cpu_topology(void);
+ 				,					\
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
++	.max_newidle_lb_cost	= 0,					\
+ }
+ #endif
+ #endif /* CONFIG_SCHED_MC */
+@@ -166,6 +168,7 @@ int arch_update_cpu_topology(void);
+ 				,					\
+ 	.last_balance		= jiffies,				\
+ 	.balance_interval	= 1,					\
++	.max_newidle_lb_cost	= 0,					\
+ }
+ #endif
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c43e920b195e..d6a97da4d026 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1343,7 +1343,7 @@ ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
+ 
+ 	if (rq->idle_stamp) {
+ 		u64 delta = rq_clock(rq) - rq->idle_stamp;
+-		u64 max = 2*sysctl_sched_migration_cost;
++		u64 max = 2*rq->max_idle_balance_cost;
+ 
+ 		update_avg(&rq->avg_idle, delta);
+ 
+@@ -7104,6 +7104,7 @@ void __init sched_init(void)
+ 		rq->online = 0;
+ 		rq->idle_stamp = 0;
+ 		rq->avg_idle = 2*sysctl_sched_migration_cost;
++		rq->max_idle_balance_cost = sysctl_sched_migration_cost;
+ 
+ 		INIT_LIST_HEAD(&rq->cfs_tasks);
+ 
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 5abdf358588f..7d39929fb3ec 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -475,6 +475,9 @@ struct rq {
+ 	u64 age_stamp;
+ 	u64 idle_stamp;
+ 	u64 avg_idle;
++
++	/* This is used to determine avg_idle's max value */
++	u64 max_idle_balance_cost;
+ #endif
+ 
+ #ifdef CONFIG_IRQ_TIME_ACCOUNTING
