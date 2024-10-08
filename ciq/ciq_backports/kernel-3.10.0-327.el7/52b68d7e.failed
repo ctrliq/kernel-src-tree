@@ -1,0 +1,250 @@
+NVMe: Fix for BLK_DEV_INTEGRITY not set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 52b68d7ef8838b4322da3dc35a05e02c63b05a0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/52b68d7e.failed
+
+Need to define and use appropriate functions for when BLK_DEV_INTEGRITY
+is not set.
+
+	Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 52b68d7ef8838b4322da3dc35a05e02c63b05a0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,ceb32dd52a6c..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -455,7 -482,116 +455,120 @@@ static int nvme_error_status(u16 status
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void bio_completion(struct nvme_queue *nvmeq, void *ctx,
+++=======
++ #ifdef CONFIG_BLK_DEV_INTEGRITY
++ static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == v)
++ 		pi->ref_tag = cpu_to_be32(p);
++ }
++ 
++ static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == p)
++ 		pi->ref_tag = cpu_to_be32(v);
++ }
++ 
++ /**
++  * nvme_dif_remap - remaps ref tags to bip seed and physical lba
++  *
++  * The virtual start sector is the one that was originally submitted by the
++  * block layer.	Due to partitioning, MD/DM cloning, etc. the actual physical
++  * start sector may be different. Remap protection information to match the
++  * physical LBA on writes, and back to the original seed on reads.
++  *
++  * Type 0 and 3 do not have a ref tag, so no remapping required.
++  */
++ static void nvme_dif_remap(struct request *req,
++ 			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
++ {
++ 	struct nvme_ns *ns = req->rq_disk->private_data;
++ 	struct bio_integrity_payload *bip;
++ 	struct t10_pi_tuple *pi;
++ 	void *p, *pmap;
++ 	u32 i, nlb, ts, phys, virt;
++ 
++ 	if (!ns->pi_type || ns->pi_type == NVME_NS_DPS_PI_TYPE3)
++ 		return;
++ 
++ 	bip = bio_integrity(req->bio);
++ 	if (!bip)
++ 		return;
++ 
++ 	pmap = kmap_atomic(bip->bip_vec->bv_page) + bip->bip_vec->bv_offset;
++ 	if (!pmap)
++ 		return;
++ 
++ 	p = pmap;
++ 	virt = bip_get_seed(bip);
++ 	phys = nvme_block_nr(ns, blk_rq_pos(req));
++ 	nlb = (blk_rq_bytes(req) >> ns->lba_shift);
++ 	ts = ns->disk->integrity->tuple_size;
++ 
++ 	for (i = 0; i < nlb; i++, virt++, phys++) {
++ 		pi = (struct t10_pi_tuple *)p;
++ 		dif_swap(phys, virt, pi);
++ 		p += ts;
++ 	}
++ 	kunmap_atomic(pmap);
++ }
++ 
++ static int nvme_noop_verify(struct blk_integrity_iter *iter)
++ {
++ 	return 0;
++ }
++ 
++ static int nvme_noop_generate(struct blk_integrity_iter *iter)
++ {
++ 	return 0;
++ }
++ 
++ struct blk_integrity nvme_meta_noop = {
++ 	.name			= "NVME_META_NOOP",
++ 	.generate_fn		= nvme_noop_generate,
++ 	.verify_fn		= nvme_noop_verify,
++ };
++ 
++ static void nvme_init_integrity(struct nvme_ns *ns)
++ {
++ 	struct blk_integrity integrity;
++ 
++ 	switch (ns->pi_type) {
++ 	case NVME_NS_DPS_PI_TYPE3:
++ 		integrity = t10_pi_type3_crc;
++ 		break;
++ 	case NVME_NS_DPS_PI_TYPE1:
++ 	case NVME_NS_DPS_PI_TYPE2:
++ 		integrity = t10_pi_type1_crc;
++ 		break;
++ 	default:
++ 		integrity = nvme_meta_noop;
++ 		break;
++ 	}
++ 	integrity.tuple_size = ns->ms;
++ 	blk_integrity_register(ns->disk, &integrity);
++ 	blk_queue_max_integrity_segments(ns->queue, 1);
++ }
++ #else /* CONFIG_BLK_DEV_INTEGRITY */
++ static void nvme_dif_remap(struct request *req,
++ 			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
++ {
++ }
++ static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ }
++ static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ }
++ static void nvme_init_integrity(struct nvme_ns *ns)
++ {
++ }
++ #endif
++ 
++ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+++>>>>>>> 52b68d7ef883 (NVMe: Fix for BLK_DEV_INTEGRITY not set)
+  						struct nvme_completion *cqe)
+  {
+  	struct nvme_iod *iod = ctx;
+@@@ -1917,6 -2002,16 +2030,19 @@@ static int nvme_getgeo(struct block_dev
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_config_discard(struct nvme_ns *ns)
++ {
++ 	u32 logical_block_size = queue_logical_block_size(ns->queue);
++ 	ns->queue->limits.discard_zeroes_data = 0;
++ 	ns->queue->limits.discard_alignment = logical_block_size;
++ 	ns->queue->limits.discard_granularity = logical_block_size;
++ 	ns->queue->limits.max_discard_sectors = 0xffffffff;
++ 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, ns->queue);
++ }
++ 
+++>>>>>>> 52b68d7ef883 (NVMe: Fix for BLK_DEV_INTEGRITY not set)
+  static int nvme_revalidate_disk(struct gendisk *disk)
+  {
+  	struct nvme_ns *ns = disk->private_data;
+@@@ -1932,16 -2028,51 +2058,53 @@@
+  								__func__);
+  		return 0;
+  	}
+ -	if (nvme_identify(dev, ns->ns_id, 0, dma_addr)) {
+ -		dev_warn(&dev->pci_dev->dev,
+ -			"identify failed ns:%d, setting capacity to 0\n",
+ -			ns->ns_id);
+ -		memset(id, 0, sizeof(*id));
+ -	}
+  
+ -	old_ms = ns->ms;
+ -	lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+ +	if (nvme_identify(dev, ns->ns_id, 0, dma_addr))
+ +		goto free;
+ +
+ +	lbaf = id->flbas & 0xf;
+  	ns->lba_shift = id->lbaf[lbaf].ds;
+++<<<<<<< HEAD
+++=======
++ 	ns->ms = le16_to_cpu(id->lbaf[lbaf].ms);
++ 
++ 	/*
++ 	 * If identify namespace failed, use default 512 byte block size so
++ 	 * block layer can use before failing read/write for 0 capacity.
++ 	 */
++ 	if (ns->lba_shift == 0)
++ 		ns->lba_shift = 9;
++ 	bs = 1 << ns->lba_shift;
++ 
++ 	/* XXX: PI implementation requires metadata equal t10 pi tuple size */
++ 	pi_type = ns->ms == sizeof(struct t10_pi_tuple) ?
++ 					id->dps & NVME_NS_DPS_PI_MASK : 0;
++ 
++ 	if (blk_get_integrity(disk) && (ns->pi_type != pi_type ||
++ 				ns->ms != old_ms ||
++ 				bs != queue_logical_block_size(disk->queue) ||
++ 				(ns->ms && id->flbas & NVME_NS_FLBAS_META_EXT)))
++ 		blk_integrity_unregister(disk);
++ 
++ 	ns->pi_type = pi_type;
++ 	blk_queue_logical_block_size(ns->queue, bs);
++ 
++ 	if (ns->ms && !blk_get_integrity(disk) && (disk->flags & GENHD_FL_UP) &&
++ 				!(id->flbas & NVME_NS_FLBAS_META_EXT))
++ 		nvme_init_integrity(ns);
++ 
++ 	if (id->ncap == 0 || (ns->ms && !blk_get_integrity(disk)))
++ 		set_capacity(disk, 0);
++ 	else
++ 		set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
++ 
++ 	if (dev->oncs & NVME_CTRL_ONCS_DSM)
++ 		nvme_config_discard(ns);
+++>>>>>>> 52b68d7ef883 (NVMe: Fix for BLK_DEV_INTEGRITY not set)
+  
+ +	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+ +	set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
+ + free:
+  	dma_free_coherent(&dev->pci_dev->dev, 4096, id, dma_addr);
+  	return 0;
+  }
+@@@ -2723,10 -2668,15 +2886,16 @@@ static void nvme_dev_remove(struct nvme
+  	struct nvme_ns *ns;
+  
+  	list_for_each_entry(ns, &dev->namespaces, list) {
+++<<<<<<< HEAD
+ +		if (ns->disk->flags & GENHD_FL_UP)
+++=======
++ 		if (ns->disk->flags & GENHD_FL_UP) {
++ 			if (blk_get_integrity(ns->disk))
++ 				blk_integrity_unregister(ns->disk);
+++>>>>>>> 52b68d7ef883 (NVMe: Fix for BLK_DEV_INTEGRITY not set)
+  			del_gendisk(ns->disk);
+ -		}
+ -		if (!blk_queue_dying(ns->queue)) {
+ -			blk_mq_abort_requeue_list(ns->queue);
+ +		if (!blk_queue_dying(ns->queue))
+  			blk_cleanup_queue(ns->queue);
+ -		}
+  	}
+  }
+  
+* Unmerged path drivers/block/nvme-core.c
