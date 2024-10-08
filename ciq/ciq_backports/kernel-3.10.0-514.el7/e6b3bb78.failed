@@ -1,0 +1,480 @@
+xfs: add "fail at unmount" error handling configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Carlos Maiolino <cmaiolino@redhat.com>
+commit e6b3bb78962e65c4ad125598755cfbf2a8779e86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e6b3bb78.failed
+
+If we take "retry forever" literally on metadata IO errors, we can
+hang at unmount, once it retries those writes forever. This is the
+default behavior, unfortunately.
+
+Add an error configuration option for this behavior and default it
+to "fail" so that an unmount will trigger actuall errors, a shutdown
+and allow the unmount to succeed. It will be noisy, though, as it
+will log the errors and shutdown that occurs.
+
+To fix this, we need to mark the filesystem as being in the process
+of unmounting. Do this with a mount flag that is added at the
+appropriate time (i.e. before the blocking AIL sync). We also need
+to add this flag if mount fails after the initial phase of log
+recovery has been run.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit e6b3bb78962e65c4ad125598755cfbf2a8779e86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item.c
+#	fs/xfs/xfs_mount.h
+#	fs/xfs/xfs_sysfs.c
+diff --cc fs/xfs/xfs_buf_item.c
+index 9099b323a893,34257992934c..000000000000
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@@ -1117,15 -1094,65 +1117,43 @@@ xfs_buf_iodone_callbacks
+  	}
+  
+  	/*
+ -	 * Repeated failure on an async write. Take action according to the
+ -	 * error configuration we have been set up to use.
+ +	 * If the write of the buffer was synchronous, we want to make
+ +	 * sure to return the error to the caller of xfs_bwrite().
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	cfg = xfs_error_get_cfg(mp, XFS_ERR_METADATA, bp->b_error);
++ 
++ 	if (cfg->max_retries != XFS_ERR_RETRY_FOREVER &&
++ 	    ++bp->b_retries > cfg->max_retries)
++ 			goto permanent_error;
++ 	if (cfg->retry_timeout &&
++ 	    time_after(jiffies, cfg->retry_timeout + bp->b_first_retry_time))
++ 			goto permanent_error;
++ 
++ 	/* At unmount we may treat errors differently */
++ 	if ((mp->m_flags & XFS_MOUNT_UNMOUNTING) && mp->m_fail_unmount)
++ 		goto permanent_error;
++ 
++ 	/* still a transient error, higher layers will retry */
++ 	xfs_buf_ioerror(bp, 0);
++ 	xfs_buf_relse(bp);
++ 	return true;
++ 
++ 	/*
++ 	 * Permanent error - we need to trigger a shutdown if we haven't already
++ 	 * to indicate that inconsistency will result from this action.
++ 	 */
++ permanent_error:
++ 	xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
++ out_stale:
+++>>>>>>> e6b3bb78962e (xfs: add "fail at unmount" error handling configuration)
+  	xfs_buf_stale(bp);
+ -	bp->b_flags |= XBF_DONE;
+ -	trace_xfs_buf_error_relse(bp, _RET_IP_);
+ -	return false;
+ -}
+ +	XFS_BUF_DONE(bp);
+  
+ -/*
+ - * This is the iodone() function for buffers which have had callbacks attached
+ - * to them by xfs_buf_attach_iodone(). We need to iterate the items on the
+ - * callback list, mark the buffer as having no more callbacks and then push the
+ - * buffer through IO completion processing.
+ - */
+ -void
+ -xfs_buf_iodone_callbacks(
+ -	struct xfs_buf		*bp)
+ -{
+ -	/*
+ -	 * If there is an error, process it. Some errors require us
+ -	 * to run callbacks after failure processing is done so we
+ -	 * detect that and take appropriate action.
+ -	 */
+ -	if (bp->b_error && xfs_buf_iodone_callback_error(bp))
+ -		return;
+ -
+ -	/*
+ -	 * Successful IO or permanent error. Either way, we can clear the
+ -	 * retry state here in preparation for the next error that may occur.
+ -	 */
+ -	bp->b_last_error = 0;
+ -	bp->b_retries = 0;
+ +	trace_xfs_buf_error_relse(bp, _RET_IP_);
+  
+ +do_callbacks:
+  	xfs_buf_do_callbacks(bp);
+  	bp->b_fspriv = NULL;
+  	bp->b_iodone = NULL;
+diff --cc fs/xfs/xfs_mount.h
+index fe5c55265429,9063a9c7b2fe..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -147,6 -176,18 +147,21 @@@ typedef struct xfs_mount 
+  	 * to various other kinds of pain inflicted on the pNFS server.
+  	 */
+  	__uint32_t		m_generation;
+++<<<<<<< HEAD
+++=======
++ 
++ 	bool			m_fail_unmount;
++ #ifdef DEBUG
++ 	/*
++ 	 * DEBUG mode instrumentation to test and/or trigger delayed allocation
++ 	 * block killing in the event of failed writes. When enabled, all
++ 	 * buffered writes are forced to fail. All delalloc blocks in the range
++ 	 * of the write (including pre-existing delalloc blocks!) are tossed as
++ 	 * part of the write failure error handling sequence.
++ 	 */
++ 	bool			m_fail_writes;
++ #endif
+++>>>>>>> e6b3bb78962e (xfs: add "fail at unmount" error handling configuration)
+  } xfs_mount_t;
+  
+  /*
+diff --cc fs/xfs/xfs_sysfs.c
+index 641d625eb334,4c2c55086208..000000000000
+--- a/fs/xfs/xfs_sysfs.c
++++ b/fs/xfs/xfs_sysfs.c
+@@@ -304,3 -363,291 +304,294 @@@ struct kobj_type xfs_log_ktype = 
+  	.sysfs_ops = &xfs_sysfs_ops,
+  	.default_attrs = xfs_log_attrs,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Metadata IO error configuration
++  *
++  * The sysfs structure here is:
++  *	...xfs/<dev>/error/<class>/<errno>/<error_attrs>
++  *
++  * where <class> allows us to discriminate between data IO and metadata IO,
++  * and any other future type of IO (e.g. special inode or directory error
++  * handling) we care to support.
++  */
++ static inline struct xfs_error_cfg *
++ to_error_cfg(struct kobject *kobject)
++ {
++ 	struct xfs_kobj *kobj = to_kobj(kobject);
++ 	return container_of(kobj, struct xfs_error_cfg, kobj);
++ }
++ 
++ static inline struct xfs_mount *
++ err_to_mp(struct kobject *kobject)
++ {
++ 	struct xfs_kobj *kobj = to_kobj(kobject);
++ 	return container_of(kobj, struct xfs_mount, m_error_kobj);
++ }
++ 
++ static ssize_t
++ max_retries_show(
++ 	struct kobject	*kobject,
++ 	char		*buf)
++ {
++ 	struct xfs_error_cfg *cfg = to_error_cfg(kobject);
++ 
++ 	return snprintf(buf, PAGE_SIZE, "%d\n", cfg->max_retries);
++ }
++ 
++ static ssize_t
++ max_retries_store(
++ 	struct kobject	*kobject,
++ 	const char	*buf,
++ 	size_t		count)
++ {
++ 	struct xfs_error_cfg *cfg = to_error_cfg(kobject);
++ 	int		ret;
++ 	int		val;
++ 
++ 	ret = kstrtoint(buf, 0, &val);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (val < -1)
++ 		return -EINVAL;
++ 
++ 	cfg->max_retries = val;
++ 	return count;
++ }
++ XFS_SYSFS_ATTR_RW(max_retries);
++ 
++ static ssize_t
++ retry_timeout_seconds_show(
++ 	struct kobject	*kobject,
++ 	char		*buf)
++ {
++ 	struct xfs_error_cfg *cfg = to_error_cfg(kobject);
++ 
++ 	return snprintf(buf, PAGE_SIZE, "%ld\n",
++ 			jiffies_to_msecs(cfg->retry_timeout) / MSEC_PER_SEC);
++ }
++ 
++ static ssize_t
++ retry_timeout_seconds_store(
++ 	struct kobject	*kobject,
++ 	const char	*buf,
++ 	size_t		count)
++ {
++ 	struct xfs_error_cfg *cfg = to_error_cfg(kobject);
++ 	int		ret;
++ 	int		val;
++ 
++ 	ret = kstrtoint(buf, 0, &val);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* 1 day timeout maximum */
++ 	if (val < 0 || val > 86400)
++ 		return -EINVAL;
++ 
++ 	cfg->retry_timeout = msecs_to_jiffies(val * MSEC_PER_SEC);
++ 	return count;
++ }
++ XFS_SYSFS_ATTR_RW(retry_timeout_seconds);
++ 
++ static ssize_t
++ fail_at_unmount_show(
++ 	struct kobject	*kobject,
++ 	char		*buf)
++ {
++ 	struct xfs_mount	*mp = err_to_mp(kobject);
++ 
++ 	return snprintf(buf, PAGE_SIZE, "%d\n", mp->m_fail_unmount);
++ }
++ 
++ static ssize_t
++ fail_at_unmount_store(
++ 	struct kobject	*kobject,
++ 	const char	*buf,
++ 	size_t		count)
++ {
++ 	struct xfs_mount	*mp = err_to_mp(kobject);
++ 	int		ret;
++ 	int		val;
++ 
++ 	ret = kstrtoint(buf, 0, &val);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (val < 0 || val > 1)
++ 		return -EINVAL;
++ 
++ 	mp->m_fail_unmount = val;
++ 	return count;
++ }
++ XFS_SYSFS_ATTR_RW(fail_at_unmount);
++ 
++ static struct attribute *xfs_error_attrs[] = {
++ 	ATTR_LIST(max_retries),
++ 	ATTR_LIST(retry_timeout_seconds),
++ 	NULL,
++ };
++ 
++ 
++ struct kobj_type xfs_error_cfg_ktype = {
++ 	.release = xfs_sysfs_release,
++ 	.sysfs_ops = &xfs_sysfs_ops,
++ 	.default_attrs = xfs_error_attrs,
++ };
++ 
++ struct kobj_type xfs_error_ktype = {
++ 	.release = xfs_sysfs_release,
++ 	.sysfs_ops = &xfs_sysfs_ops,
++ };
++ 
++ /*
++  * Error initialization tables. These need to be ordered in the same
++  * order as the enums used to index the array. All class init tables need to
++  * define a "default" behaviour as the first entry, all other entries can be
++  * empty.
++  */
++ struct xfs_error_init {
++ 	char		*name;
++ 	int		max_retries;
++ 	int		retry_timeout;	/* in seconds */
++ };
++ 
++ static const struct xfs_error_init xfs_error_meta_init[XFS_ERR_ERRNO_MAX] = {
++ 	{ .name = "default",
++ 	  .max_retries = XFS_ERR_RETRY_FOREVER,
++ 	  .retry_timeout = 0,
++ 	},
++ 	{ .name = "EIO",
++ 	  .max_retries = XFS_ERR_RETRY_FOREVER,
++ 	  .retry_timeout = 0,
++ 	},
++ 	{ .name = "ENOSPC",
++ 	  .max_retries = XFS_ERR_RETRY_FOREVER,
++ 	  .retry_timeout = 0,
++ 	},
++ 	{ .name = "ENODEV",
++ 	  .max_retries = 0,
++ 	},
++ };
++ 
++ static int
++ xfs_error_sysfs_init_class(
++ 	struct xfs_mount	*mp,
++ 	int			class,
++ 	const char		*parent_name,
++ 	struct xfs_kobj		*parent_kobj,
++ 	const struct xfs_error_init init[])
++ {
++ 	struct xfs_error_cfg	*cfg;
++ 	int			error;
++ 	int			i;
++ 
++ 	ASSERT(class < XFS_ERR_CLASS_MAX);
++ 
++ 	error = xfs_sysfs_init(parent_kobj, &xfs_error_ktype,
++ 				&mp->m_error_kobj, parent_name);
++ 	if (error)
++ 		return error;
++ 
++ 	for (i = 0; i < XFS_ERR_ERRNO_MAX; i++) {
++ 		cfg = &mp->m_error_cfg[class][i];
++ 		error = xfs_sysfs_init(&cfg->kobj, &xfs_error_cfg_ktype,
++ 					parent_kobj, init[i].name);
++ 		if (error)
++ 			goto out_error;
++ 
++ 		cfg->max_retries = init[i].max_retries;
++ 		cfg->retry_timeout = msecs_to_jiffies(
++ 					init[i].retry_timeout * MSEC_PER_SEC);
++ 	}
++ 	return 0;
++ 
++ out_error:
++ 	/* unwind the entries that succeeded */
++ 	for (i--; i >= 0; i--) {
++ 		cfg = &mp->m_error_cfg[class][i];
++ 		xfs_sysfs_del(&cfg->kobj);
++ 	}
++ 	xfs_sysfs_del(parent_kobj);
++ 	return error;
++ }
++ 
++ int
++ xfs_error_sysfs_init(
++ 	struct xfs_mount	*mp)
++ {
++ 	int			error;
++ 
++ 	/* .../xfs/<dev>/error/ */
++ 	error = xfs_sysfs_init(&mp->m_error_kobj, &xfs_error_ktype,
++ 				&mp->m_kobj, "error");
++ 	if (error)
++ 		return error;
++ 
++ 	error = sysfs_create_file(&mp->m_error_kobj.kobject,
++ 				  ATTR_LIST(fail_at_unmount));
++ 
++ 	if (error)
++ 		goto out_error;
++ 
++ 	/* .../xfs/<dev>/error/metadata/ */
++ 	error = xfs_error_sysfs_init_class(mp, XFS_ERR_METADATA,
++ 				"metadata", &mp->m_error_meta_kobj,
++ 				xfs_error_meta_init);
++ 	if (error)
++ 		goto out_error;
++ 
++ 	return 0;
++ 
++ out_error:
++ 	xfs_sysfs_del(&mp->m_error_kobj);
++ 	return error;
++ }
++ 
++ void
++ xfs_error_sysfs_del(
++ 	struct xfs_mount	*mp)
++ {
++ 	struct xfs_error_cfg	*cfg;
++ 	int			i, j;
++ 
++ 	for (i = 0; i < XFS_ERR_CLASS_MAX; i++) {
++ 		for (j = 0; j < XFS_ERR_ERRNO_MAX; j++) {
++ 			cfg = &mp->m_error_cfg[i][j];
++ 
++ 			xfs_sysfs_del(&cfg->kobj);
++ 		}
++ 	}
++ 	xfs_sysfs_del(&mp->m_error_meta_kobj);
++ 	xfs_sysfs_del(&mp->m_error_kobj);
++ }
++ 
++ struct xfs_error_cfg *
++ xfs_error_get_cfg(
++ 	struct xfs_mount	*mp,
++ 	int			error_class,
++ 	int			error)
++ {
++ 	struct xfs_error_cfg	*cfg;
++ 
++ 	switch (error) {
++ 	case EIO:
++ 		cfg = &mp->m_error_cfg[error_class][XFS_ERR_EIO];
++ 		break;
++ 	case ENOSPC:
++ 		cfg = &mp->m_error_cfg[error_class][XFS_ERR_ENOSPC];
++ 		break;
++ 	case ENODEV:
++ 		cfg = &mp->m_error_cfg[error_class][XFS_ERR_ENODEV];
++ 		break;
++ 	default:
++ 		cfg = &mp->m_error_cfg[error_class][XFS_ERR_DEFAULT];
++ 		break;
++ 	}
++ 
++ 	return cfg;
++ }
+++>>>>>>> e6b3bb78962e (xfs: add "fail at unmount" error handling configuration)
+* Unmerged path fs/xfs/xfs_buf_item.c
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index bb753b359bee..99afa5b04196 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -699,6 +699,9 @@ xfs_mountfs(
+ 
+ 	xfs_set_maxicount(mp);
+ 
++	/* enable fail_at_unmount as default */
++	mp->m_fail_unmount = 1;
++
+ 	error = xfs_sysfs_init(&mp->m_kobj, &xfs_mp_ktype, NULL, mp->m_fsname);
+ 	if (error)
+ 		goto out;
+@@ -975,6 +978,7 @@ xfs_mountfs(
+ 	cancel_delayed_work_sync(&mp->m_reclaim_work);
+ 	xfs_reclaim_inodes(mp, SYNC_WAIT);
+  out_log_dealloc:
++	mp->m_flags |= XFS_MOUNT_UNMOUNTING;
+ 	xfs_log_mount_cancel(mp);
+  out_fail_wait:
+ 	if (mp->m_logdev_targp && mp->m_logdev_targp != mp->m_ddev_targp)
+@@ -1023,6 +1027,14 @@ xfs_unmountfs(
+ 	 */
+ 	xfs_log_force(mp, XFS_LOG_SYNC);
+ 
++	/*
++	 * We now need to tell the world we are unmounting. This will allow
++	 * us to detect that the filesystem is going away and we should error
++	 * out anything that we have been retrying in the background. This will
++	 * prevent neverending retries in AIL pushing from hanging the unmount.
++	 */
++	mp->m_flags |= XFS_MOUNT_UNMOUNTING;
++
+ 	/*
+ 	 * Flush all pending changes from the AIL.
+ 	 */
+* Unmerged path fs/xfs/xfs_mount.h
+* Unmerged path fs/xfs/xfs_sysfs.c
