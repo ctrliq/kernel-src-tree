@@ -1,0 +1,172 @@
+xfs: don't reset b_retries to 0 on every failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric Sandeen <sandeen@sandeen.net>
+commit 5539d36752eb789f4067a9f88e72177895d56317
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5539d367.failed
+
+With the code as it stands today, b_retries never increments because
+it gets reset to 0 in the error callback.
+
+Remove that, and fix a similar problem where the first retry time
+was constantly being overwritten, which defeated the timeout tunable
+as well.  We now only set first retry time if a non-zero timeout is
+set, to match the behavior of only incrementing retries if a retry
+value is set.
+
+This way max retries & timeouts consistently take effect after a
+tunable is set, rather than acting retroactively on a buffer which
+has failed at some point in the past and has accumulated state from
+those prior failures.
+
+Thanks to dchinner for talking through this with me.
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 5539d36752eb789f4067a9f88e72177895d56317)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item.c
+diff --cc fs/xfs/xfs_buf_item.c
+index 9099b323a893,3b19e5219d9a..000000000000
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@@ -1087,45 -1066,93 +1087,93 @@@ xfs_buf_iodone_callbacks
+  	}
+  	lasttarg = bp->b_target;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* synchronous writes will have callers process the error */
++ 	if (!(bp->b_flags & XBF_ASYNC))
++ 		goto out_stale;
++ 
++ 	trace_xfs_buf_item_iodone_async(bp, _RET_IP_);
++ 	ASSERT(bp->b_iodone != NULL);
++ 
++ 	cfg = xfs_error_get_cfg(mp, XFS_ERR_METADATA, bp->b_error);
++ 
+++>>>>>>> 5539d36752eb (xfs: don't reset b_retries to 0 on every failure)
+  	/*
+  	 * If the write was asynchronous then no one will be looking for the
+ -	 * error.  If this is the first failure of this type, clear the error
+ -	 * state and write the buffer out again. This means we always retry an
+ -	 * async write failure at least once, but we also need to set the buffer
+ -	 * up to behave correctly now for repeated failures.
+ +	 * error.  Clear the error state and write the buffer out again.
+ +	 *
+ +	 * XXX: This helps against transient write errors, but we need to find
+ +	 * a way to shut the filesystem down if the writes keep failing.
+ +	 *
+ +	 * In practice we'll shut the filesystem down soon as non-transient
+ +	 * errors tend to affect the whole device and a failing log write
+ +	 * will make us give up.  But we really ought to do better here.
+  	 */
+++<<<<<<< HEAD
+ +	if (XFS_BUF_ISASYNC(bp)) {
+ +		ASSERT(bp->b_iodone != NULL);
+++=======
++ 	if (!(bp->b_flags & (XBF_STALE | XBF_WRITE_FAIL)) ||
++ 	     bp->b_last_error != bp->b_error) {
++ 		bp->b_flags |= (XBF_WRITE | XBF_DONE | XBF_WRITE_FAIL);
++ 		bp->b_last_error = bp->b_error;
++ 		if (cfg->retry_timeout && !bp->b_first_retry_time)
++ 			bp->b_first_retry_time = jiffies;
+++>>>>>>> 5539d36752eb (xfs: don't reset b_retries to 0 on every failure)
+ +
+ +		trace_xfs_buf_item_iodone_async(bp, _RET_IP_);
+ +
+ +		xfs_buf_ioerror(bp, 0); /* errno of 0 unsets the flag */
+ +
+ +		if (!(bp->b_flags & (XBF_STALE|XBF_WRITE_FAIL))) {
+ +			bp->b_flags |= XBF_WRITE | XBF_ASYNC |
+ +				       XBF_DONE | XBF_WRITE_FAIL;
+ +			xfs_buf_submit(bp);
+ +		} else {
+ +			xfs_buf_relse(bp);
+ +		}
+  
+ -		xfs_buf_ioerror(bp, 0);
+ -		xfs_buf_submit(bp);
+ -		return true;
+ +		return;
+  	}
+  
+  	/*
+ -	 * Repeated failure on an async write. Take action according to the
+ -	 * error configuration we have been set up to use.
+ +	 * If the write of the buffer was synchronous, we want to make
+ +	 * sure to return the error to the caller of xfs_bwrite().
+  	 */
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (cfg->max_retries != XFS_ERR_RETRY_FOREVER &&
++ 	    ++bp->b_retries > cfg->max_retries)
++ 			goto permanent_error;
++ 	if (cfg->retry_timeout &&
++ 	    time_after(jiffies, cfg->retry_timeout + bp->b_first_retry_time))
++ 			goto permanent_error;
++ 
++ 	/* At unmount we may treat errors differently */
++ 	if ((mp->m_flags & XFS_MOUNT_UNMOUNTING) && mp->m_fail_unmount)
++ 		goto permanent_error;
++ 
++ 	/* still a transient error, higher layers will retry */
++ 	xfs_buf_ioerror(bp, 0);
++ 	xfs_buf_relse(bp);
++ 	return true;
++ 
++ 	/*
++ 	 * Permanent error - we need to trigger a shutdown if we haven't already
++ 	 * to indicate that inconsistency will result from this action.
++ 	 */
++ permanent_error:
++ 	xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
++ out_stale:
+++>>>>>>> 5539d36752eb (xfs: don't reset b_retries to 0 on every failure)
+  	xfs_buf_stale(bp);
+ -	bp->b_flags |= XBF_DONE;
+ -	trace_xfs_buf_error_relse(bp, _RET_IP_);
+ -	return false;
+ -}
+ -
+ -/*
+ - * This is the iodone() function for buffers which have had callbacks attached
+ - * to them by xfs_buf_attach_iodone(). We need to iterate the items on the
+ - * callback list, mark the buffer as having no more callbacks and then push the
+ - * buffer through IO completion processing.
+ - */
+ -void
+ -xfs_buf_iodone_callbacks(
+ -	struct xfs_buf		*bp)
+ -{
+ -	/*
+ -	 * If there is an error, process it. Some errors require us
+ -	 * to run callbacks after failure processing is done so we
+ -	 * detect that and take appropriate action.
+ -	 */
+ -	if (bp->b_error && xfs_buf_iodone_callback_error(bp))
+ -		return;
+ +	XFS_BUF_DONE(bp);
+  
+ -	/*
+ -	 * Successful IO or permanent error. Either way, we can clear the
+ -	 * retry state here in preparation for the next error that may occur.
+ -	 */
+ -	bp->b_last_error = 0;
+ -	bp->b_retries = 0;
+ +	trace_xfs_buf_error_relse(bp, _RET_IP_);
+  
+ +do_callbacks:
+  	xfs_buf_do_callbacks(bp);
+  	bp->b_fspriv = NULL;
+  	bp->b_iodone = NULL;
+* Unmerged path fs/xfs/xfs_buf_item.c
