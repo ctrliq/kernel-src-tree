@@ -116,6 +116,12 @@ int acpi_power_transition(struct acpi_device *device, int state);
 int acpi_wakeup_device_init(void);
 void acpi_early_processor_set_pdc(void);
 
+#ifdef CONFIG_X86
+void acpi_early_processor_osc(void);
+#else
+static inline void acpi_early_processor_osc(void) {}
+#endif
+
 /* --------------------------------------------------------------------------
                                   Embedded Controller
    -------------------------------------------------------------------------- */
