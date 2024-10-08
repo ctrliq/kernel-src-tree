@@ -1,0 +1,142 @@
+vxlan: set mac_header correctly in GPE mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 8be0cfa4d352167df508acd571eb19afd8a2ce93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8be0cfa4.failed
+
+For VXLAN-GPE, the interface is ARPHRD_NONE, thus we need to reset
+mac_header after pulling the outer header.
+
+v2: Put the code to the existing conditional block as suggested by
+    Shmulik Ladkani.
+
+Fixes: e1e5314de08b ("vxlan: implement GPE")
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Reviewed-by: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8be0cfa4d352167df508acd571eb19afd8a2ce93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index c9c40f07cb6d,25ab6bf013c4..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1222,95 -1374,25 +1222,101 @@@ static int vxlan_udp_encap_recv(struct 
+  		 * is more robust and provides a little more security in
+  		 * adding extensions to VXLAN.
+  		 */
+ -		goto drop;
+ +
+ +		goto bad_flags;
+  	}
+  
+ -	if (!raw_proto) {
+ -		if (!vxlan_set_mac(vxlan, vs, skb))
+ -			goto drop;
+ +	md.vni = vxh->vx_vni;
+ +	vs->rcv(vs, skb, &md);
+ +	return 0;
+ +
+ +drop:
+ +	/* Consume bad packet */
+ +	kfree_skb(skb);
+ +	return 0;
+ +
+ +bad_flags:
+ +	netdev_dbg(skb->dev, "invalid vxlan flags=%#x vni=%#x\n",
+ +		   ntohl(vxh->vx_flags), ntohl(vxh->vx_vni));
+ +
+ +error:
+ +	/* Return non vxlan pkt */
+ +	return 1;
+ +}
+ +
+ +static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ +		      struct vxlan_metadata *md)
+ +{
+ +	struct iphdr *oip = NULL;
+ +	struct ipv6hdr *oip6 = NULL;
+ +	struct vxlan_dev *vxlan;
+ +	struct pcpu_sw_netstats *stats;
+ +	union vxlan_addr saddr;
+ +	__u32 vni;
+ +	int err = 0;
+ +	union vxlan_addr *remote_ip;
+ +
+ +	vni = ntohl(md->vni) >> 8;
+ +	/* Is this VNI defined? */
+ +	vxlan = vxlan_vs_find_vni(vs, vni);
+ +	if (!vxlan)
+ +		goto drop;
+ +
+ +	remote_ip = &vxlan->default_dst.remote_ip;
+ +	skb_reset_mac_header(skb);
+ +	skb_scrub_packet(skb, !net_eq(vxlan->net, dev_net(vxlan->dev)));
+ +	skb->protocol = eth_type_trans(skb, vxlan->dev);
+ +	skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ +
+ +	/* Ignore packet loops (and multicast echo) */
+ +	if (ether_addr_equal(eth_hdr(skb)->h_source, vxlan->dev->dev_addr))
+ +		goto drop;
+ +
+ +	/* Re-examine inner Ethernet packet */
+ +	if (remote_ip->sa.sa_family == AF_INET) {
+ +		oip = ip_hdr(skb);
+ +		saddr.sin.sin_addr.s_addr = oip->saddr;
+ +		saddr.sa.sa_family = AF_INET;
+ +#if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+++<<<<<<< HEAD
+ +		oip6 = ipv6_hdr(skb);
+ +		saddr.sin6.sin6_addr = oip6->saddr;
+ +		saddr.sa.sa_family = AF_INET6;
+ +#endif
+++=======
++ 		skb_reset_mac_header(skb);
++ 		skb->dev = vxlan->dev;
++ 		skb->pkt_type = PACKET_HOST;
+++>>>>>>> 8be0cfa4d352 (vxlan: set mac_header correctly in GPE mode)
+  	}
+  
+ -	oiph = skb_network_header(skb);
+ -	skb_reset_network_header(skb);
+ -
+ -	if (!vxlan_ecn_decapsulate(vs, oiph, skb)) {
+ -		++vxlan->dev->stats.rx_frame_errors;
+ -		++vxlan->dev->stats.rx_errors;
+ +	if ((vxlan->flags & VXLAN_F_LEARN) &&
+ +	    vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source))
+  		goto drop;
+ +
+ +	skb_reset_network_header(skb);
+ +	skb->mark = md->gbp;
+ +
+ +	if (oip6)
+ +		err = IP6_ECN_decapsulate(oip6, skb);
+ +	if (oip)
+ +		err = IP_ECN_decapsulate(oip, skb);
+ +
+ +	if (unlikely(err)) {
+ +		if (log_ecn_error) {
+ +			if (oip6)
+ +				net_info_ratelimited("non-ECT from %pI6\n",
+ +						     &oip6->saddr);
+ +			if (oip)
+ +				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
+ +						     &oip->saddr, oip->tos);
+ +		}
+ +		if (err > 1) {
+ +			++vxlan->dev->stats.rx_frame_errors;
+ +			++vxlan->dev->stats.rx_errors;
+ +			goto drop;
+ +		}
+  	}
+  
+  	stats = this_cpu_ptr(vxlan->dev->tstats);
+* Unmerged path drivers/net/vxlan.c
