@@ -1,0 +1,413 @@
+nfsd: take struct file setup fully into nfs4_preprocess_stateid_op
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit af90f707fa6d54dbb725c4b919c976cd23cd07f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/af90f707.failed
+
+This patch changes nfs4_preprocess_stateid_op so it always returns
+a valid struct file if it has been asked for that.  For that we
+now allocate a temporary struct file for special stateids, and check
+permissions if we got the file structure from the stateid.  This
+ensures that all callers will get their handling of special stateids
+right, and avoids code duplication.
+
+There is a little wart in here because the read code needs to know
+if we allocated a file structure so that it can copy around the
+read-ahead parameters.  In the long run we should probably aim to
+cache full file structures used with special stateids instead.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit af90f707fa6d54dbb725c4b919c976cd23cd07f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4state.c
+index 0a0ff7c79780,61dfb33f0559..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -4499,20 -4573,86 +4499,99 @@@ nfsd4_lookup_stateid(struct nfsd4_compo
+  	return nfs_ok;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct file *
++ nfs4_find_file(struct nfs4_stid *s, int flags)
++ {
++ 	if (!s)
++ 		return NULL;
++ 
++ 	switch (s->sc_type) {
++ 	case NFS4_DELEG_STID:
++ 		if (WARN_ON_ONCE(!s->sc_file->fi_deleg_file))
++ 			return NULL;
++ 		return get_file(s->sc_file->fi_deleg_file);
++ 	case NFS4_OPEN_STID:
++ 	case NFS4_LOCK_STID:
++ 		if (flags & RD_STATE)
++ 			return find_readable_file(s->sc_file);
++ 		else
++ 			return find_writeable_file(s->sc_file);
++ 		break;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static __be32
++ nfs4_check_olstateid(struct svc_fh *fhp, struct nfs4_ol_stateid *ols, int flags)
++ {
++ 	__be32 status;
++ 
++ 	status = nfs4_check_fh(fhp, ols);
++ 	if (status)
++ 		return status;
++ 	status = nfsd4_check_openowner_confirmed(ols);
++ 	if (status)
++ 		return status;
++ 	return nfs4_check_openmode(ols, flags);
++ }
++ 
++ static __be32
++ nfs4_check_file(struct svc_rqst *rqstp, struct svc_fh *fhp, struct nfs4_stid *s,
++ 		struct file **filpp, bool *tmp_file, int flags)
++ {
++ 	int acc = (flags & RD_STATE) ? NFSD_MAY_READ : NFSD_MAY_WRITE;
++ 	struct file *file;
++ 	__be32 status;
++ 
++ 	file = nfs4_find_file(s, flags);
++ 	if (file) {
++ 		status = nfsd_permission(rqstp, fhp->fh_export, fhp->fh_dentry,
++ 				acc | NFSD_MAY_OWNER_OVERRIDE);
++ 		if (status) {
++ 			fput(file);
++ 			return status;
++ 		}
++ 
++ 		*filpp = file;
++ 	} else {
++ 		status = nfsd_open(rqstp, fhp, S_IFREG, acc, filpp);
++ 		if (status)
++ 			return status;
++ 
++ 		if (tmp_file)
++ 			*tmp_file = true;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  /*
+ - * Checks for stateid operations
+ - */
+ +* Checks for stateid operations
+ +*/
+  __be32
+- nfs4_preprocess_stateid_op(struct net *net, struct nfsd4_compound_state *cstate,
+- 			   stateid_t *stateid, int flags, struct file **filpp)
++ nfs4_preprocess_stateid_op(struct svc_rqst *rqstp,
++ 		struct nfsd4_compound_state *cstate, stateid_t *stateid,
++ 		int flags, struct file **filpp, bool *tmp_file)
+  {
+++<<<<<<< HEAD
+ +	struct nfs4_stid *s;
+ +	struct nfs4_ol_stateid *stp = NULL;
+ +	struct nfs4_delegation *dp = NULL;
+ +	struct svc_fh *current_fh = &cstate->current_fh;
+ +	struct inode *ino = current_fh->fh_dentry->d_inode;
+ +	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+ +	struct file *file = NULL;
+++=======
++ 	struct svc_fh *fhp = &cstate->current_fh;
++ 	struct inode *ino = d_inode(fhp->fh_dentry);
++ 	struct net *net = SVC_NET(rqstp);
++ 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
++ 	struct nfs4_stid *s = NULL;
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  	__be32 status;
+  
+  	if (filpp)
+@@@ -4521,8 -4663,10 +4602,15 @@@
+  	if (grace_disallows_io(net, ino))
+  		return nfserr_grace;
+  
+++<<<<<<< HEAD
+ +	if (ZERO_STATEID(stateid) || ONE_STATEID(stateid))
+ +		return check_special_stateids(net, current_fh, stateid, flags);
+++=======
++ 	if (ZERO_STATEID(stateid) || ONE_STATEID(stateid)) {
++ 		status = check_special_stateids(net, fhp, stateid, flags);
++ 		goto done;
++ 	}
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  
+  	status = nfsd4_lookup_stateid(cstate, stateid,
+  				NFS4_DELEG_STID|NFS4_OPEN_STID|NFS4_LOCK_STID,
+@@@ -4571,13 -4688,15 +4659,23 @@@
+  		break;
+  	default:
+  		status = nfserr_bad_stateid;
+++<<<<<<< HEAD
+ +		goto out;
+ +	}
+ +	status = nfs_ok;
+ +	if (file)
+ +		*filpp = file;
+++=======
++ 		break;
++ 	}
++ 
++ done:
++ 	if (!status && filpp)
++ 		status = nfs4_check_file(rqstp, fhp, s, filpp, tmp_file, flags);
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  out:
+- 	nfs4_put_stid(s);
++ 	if (s)
++ 		nfs4_put_stid(s);
+  	return status;
+  }
+  
+diff --cc fs/nfsd/nfs4xdr.c
+index 1be91163d0ce,3b3b3fbd9319..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -3417,9 -3417,8 +3417,8 @@@ nfsd4_encode_read(struct nfsd4_compound
+  	unsigned long maxcount;
+  	struct xdr_stream *xdr = &resp->xdr;
+  	struct file *file = read->rd_filp;
+- 	struct svc_fh *fhp = read->rd_fhp;
+  	int starting_len = xdr->buf->len;
+ -	struct raparms *ra = NULL;
+ +	struct raparms *ra;
+  	__be32 *p;
+  	__be32 err;
+  
+@@@ -3441,25 -3440,17 +3440,36 @@@
+  	maxcount = min_t(unsigned long, maxcount, (xdr->buf->buflen - xdr->buf->len));
+  	maxcount = min_t(unsigned long, maxcount, read->rd_length);
+  
+++<<<<<<< HEAD
+ +	if (read->rd_filp)
+ +		err = nfsd_permission(resp->rqstp, fhp->fh_export,
+ +				fhp->fh_dentry,
+ +				NFSD_MAY_READ|NFSD_MAY_OWNER_OVERRIDE);
+ +	else
+ +		err = nfsd_get_tmp_read_open(resp->rqstp, read->rd_fhp,
+ +						&file, &ra);
+ +	if (err)
+ +		goto err_truncate;
+ +
+ +	if (file->f_op->splice_read && resp->rqstp->rq_splice_ok)
+++=======
++ 	if (read->rd_tmp_file)
++ 		ra = nfsd_init_raparms(file);
++ 
++ 	if (file->f_op->splice_read && test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags))
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  		err = nfsd4_encode_splice_read(resp, read, file, maxcount);
+  	else
+  		err = nfsd4_encode_readv(resp, read, file, maxcount);
+  
+++<<<<<<< HEAD
+ +	if (!read->rd_filp)
+ +		nfsd_put_tmp_read_open(file, ra);
+++=======
++ 	if (ra)
++ 		nfsd_put_raparams(file, ra);
+++>>>>>>> af90f707fa6d (nfsd: take struct file setup fully into nfs4_preprocess_stateid_op)
+  
+- err_truncate:
+  	if (err)
+  		xdr_truncate_encode(xdr, starting_len);
+  	return err;
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 61084d7f71c1..d6d06bd7a9df 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -759,8 +759,6 @@ nfsd4_read(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ {
+ 	__be32 status;
+ 
+-	/* no need to check permission - this will be done in nfsd_read() */
+-
+ 	read->rd_filp = NULL;
+ 	if (read->rd_offset >= OFFSET_MAX)
+ 		return nfserr_inval;
+@@ -777,9 +775,9 @@ nfsd4_read(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 		rqstp->rq_splice_ok = false;
+ 
+ 	/* check stateid */
+-	if ((status = nfs4_preprocess_stateid_op(SVC_NET(rqstp),
+-						 cstate, &read->rd_stateid,
+-						 RD_STATE, &read->rd_filp))) {
++	status = nfs4_preprocess_stateid_op(rqstp, cstate, &read->rd_stateid,
++			RD_STATE, &read->rd_filp, &read->rd_tmp_file);
++	if (status) {
+ 		dprintk("NFSD: nfsd4_read: couldn't process stateid!\n");
+ 		goto out;
+ 	}
+@@ -923,8 +921,8 @@ nfsd4_setattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	int err;
+ 
+ 	if (setattr->sa_iattr.ia_valid & ATTR_SIZE) {
+-		status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
+-			&setattr->sa_stateid, WR_STATE, NULL);
++		status = nfs4_preprocess_stateid_op(rqstp, cstate,
++			&setattr->sa_stateid, WR_STATE, NULL, NULL);
+ 		if (status) {
+ 			dprintk("NFSD: nfsd4_setattr: couldn't process stateid!\n");
+ 			return status;
+@@ -985,13 +983,11 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	unsigned long cnt;
+ 	int nvecs;
+ 
+-	/* no need to check permission - this will be done in nfsd_write() */
+-
+ 	if (write->wr_offset >= OFFSET_MAX)
+ 		return nfserr_inval;
+ 
+-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp),
+-					cstate, stateid, WR_STATE, &filp);
++	status = nfs4_preprocess_stateid_op(rqstp, cstate, stateid, WR_STATE,
++			&filp, NULL);
+ 	if (status) {
+ 		dprintk("NFSD: nfsd4_write: couldn't process stateid!\n");
+ 		return status;
+@@ -1004,11 +1000,10 @@ nfsd4_write(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	nvecs = fill_in_write_vector(rqstp->rq_vec, write);
+ 	WARN_ON_ONCE(nvecs > ARRAY_SIZE(rqstp->rq_vec));
+ 
+-	status =  nfsd_write(rqstp, &cstate->current_fh, filp,
+-			     write->wr_offset, rqstp->rq_vec, nvecs,
+-			     &cnt, &write->wr_how_written);
+-	if (filp)
+-		fput(filp);
++	status = nfsd_vfs_write(rqstp, &cstate->current_fh, filp,
++				write->wr_offset, rqstp->rq_vec, nvecs, &cnt,
++				&write->wr_how_written);
++	fput(filp);
+ 
+ 	write->wr_bytes_written = cnt;
+ 
+@@ -1022,15 +1017,13 @@ nfsd4_fallocate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	__be32 status = nfserr_notsupp;
+ 	struct file *file;
+ 
+-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
++	status = nfs4_preprocess_stateid_op(rqstp, cstate,
+ 					    &fallocate->falloc_stateid,
+-					    WR_STATE, &file);
++					    WR_STATE, &file, NULL);
+ 	if (status != nfs_ok) {
+ 		dprintk("NFSD: nfsd4_fallocate: couldn't process stateid!\n");
+ 		return status;
+ 	}
+-	if (!file)
+-		return nfserr_bad_stateid;
+ 
+ 	status = nfsd4_vfs_fallocate(rqstp, &cstate->current_fh, file,
+ 				     fallocate->falloc_offset,
+@@ -1063,15 +1056,13 @@ nfsd4_seek(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	__be32 status;
+ 	struct file *file;
+ 
+-	status = nfs4_preprocess_stateid_op(SVC_NET(rqstp), cstate,
++	status = nfs4_preprocess_stateid_op(rqstp, cstate,
+ 					    &seek->seek_stateid,
+-					    RD_STATE, &file);
++					    RD_STATE, &file, NULL);
+ 	if (status) {
+ 		dprintk("NFSD: nfsd4_seek: couldn't process stateid!\n");
+ 		return status;
+ 	}
+-	if (!file)
+-		return nfserr_bad_stateid;
+ 
+ 	switch (seek->seek_whence) {
+ 	case NFS4_CONTENT_DATA:
+* Unmerged path fs/nfsd/nfs4state.c
+* Unmerged path fs/nfsd/nfs4xdr.c
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 30bc9f132921..e98f7cc4e3cf 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -563,9 +563,9 @@ enum nfsd4_cb_op {
+ struct nfsd4_compound_state;
+ struct nfsd_net;
+ 
+-extern __be32 nfs4_preprocess_stateid_op(struct net *net,
+-		struct nfsd4_compound_state *cstate,
+-		stateid_t *stateid, int flags, struct file **filp);
++extern __be32 nfs4_preprocess_stateid_op(struct svc_rqst *rqstp,
++		struct nfsd4_compound_state *cstate, stateid_t *stateid,
++		int flags, struct file **filp, bool *tmp_file);
+ __be32 nfsd4_lookup_stateid(struct nfsd4_compound_state *cstate,
+ 		     stateid_t *stateid, unsigned char typemask,
+ 		     struct nfs4_stid **s, struct nfsd_net *nn);
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 5d9062b29c59..4e4287fed0ee 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -653,16 +653,11 @@ __be32 nfsd4_vfs_fallocate(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 			   struct file *file, loff_t offset, loff_t len,
+ 			   int flags)
+ {
+-	__be32 err;
+ 	int error;
+ 
+ 	if (!S_ISREG(file_inode(file)->i_mode))
+ 		return nfserr_inval;
+ 
+-	err = nfsd_permission(rqstp, fhp->fh_export, fhp->fh_dentry, NFSD_MAY_WRITE);
+-	if (err)
+-		return err;
+-
+ 	error = vfs_fallocate(file, flags, offset, len);
+ 	if (!error)
+ 		error = commit_metadata(fhp);
+@@ -1051,7 +1046,7 @@ static int wait_for_concurrent_writes(struct file *file)
+ 	return err;
+ }
+ 
+-static __be32
++__be32
+ nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
+ 				loff_t offset, struct kvec *vec, int vlen,
+ 				unsigned long *cnt, int *stablep)
+diff --git a/fs/nfsd/vfs.h b/fs/nfsd/vfs.h
+index 4fa7020b02b0..50e98e1d013f 100644
+--- a/fs/nfsd/vfs.h
++++ b/fs/nfsd/vfs.h
+@@ -86,6 +86,10 @@ __be32 		nfsd_read(struct svc_rqst *, struct svc_fh *,
+ 				loff_t, struct kvec *, int, unsigned long *);
+ __be32 		nfsd_write(struct svc_rqst *, struct svc_fh *,struct file *,
+ 				loff_t, struct kvec *,int, unsigned long *, int *);
++__be32		nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp,
++				struct file *file, loff_t offset,
++				struct kvec *vec, int vlen, unsigned long *cnt,
++				int *stablep);
+ __be32		nfsd_readlink(struct svc_rqst *, struct svc_fh *,
+ 				char *, int *);
+ __be32		nfsd_symlink(struct svc_rqst *, struct svc_fh *,
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index 556ce2e47555..a9cd3594ff26 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -272,6 +272,7 @@ struct nfsd4_read {
+ 	u32		rd_length;          /* request */
+ 	int		rd_vlen;
+ 	struct file     *rd_filp;
++	bool		rd_tmp_file;
+ 	
+ 	struct svc_rqst *rd_rqstp;          /* response */
+ 	struct svc_fh * rd_fhp;             /* response */
