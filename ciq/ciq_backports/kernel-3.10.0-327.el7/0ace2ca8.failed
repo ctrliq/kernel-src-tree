@@ -1,0 +1,296 @@
+vxlan: Use checksum partial with remote checksum offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit 0ace2ca89cbd6bcdf2b9d2df1fa0fa24ea9d1653
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0ace2ca8.failed
+
+Change remote checksum handling to set checksum partial as default
+behavior. Added an iflink parameter to configure not using
+checksum partial (calling csum_partial to update checksum).
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ace2ca89cbd6bcdf2b9d2df1fa0fa24ea9d1653)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	include/net/vxlan.h
+#	include/uapi/linux/if_link.h
+diff --cc drivers/net/vxlan.c
+index f6bd9cff732e,1e0a775ea882..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -549,7 -552,45 +549,49 @@@ static int vxlan_fdb_append(struct vxla
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff **vxlan_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+++=======
++ static struct vxlanhdr *vxlan_gro_remcsum(struct sk_buff *skb,
++ 					  unsigned int off,
++ 					  struct vxlanhdr *vh, size_t hdrlen,
++ 					  u32 data, struct gro_remcsum *grc,
++ 					  bool nopartial)
++ {
++ 	size_t start, offset, plen;
++ 
++ 	if (skb->remcsum_offload)
++ 		return NULL;
++ 
++ 	if (!NAPI_GRO_CB(skb)->csum_valid)
++ 		return NULL;
++ 
++ 	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ 	offset = start + ((data & VXLAN_RCO_UDP) ?
++ 			  offsetof(struct udphdr, check) :
++ 			  offsetof(struct tcphdr, check));
++ 
++ 	plen = hdrlen + offset + sizeof(u16);
++ 
++ 	/* Pull checksum that will be written */
++ 	if (skb_gro_header_hard(skb, off + plen)) {
++ 		vh = skb_gro_header_slow(skb, off + plen, off);
++ 		if (!vh)
++ 			return NULL;
++ 	}
++ 
++ 	skb_gro_remcsum_process(skb, (void *)vh + hdrlen,
++ 				start, offset, grc, nopartial);
++ 
++ 	skb->remcsum_offload = 1;
++ 
++ 	return vh;
++ }
++ 
++ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head,
++ 					  struct sk_buff *skb,
++ 					  struct udp_offload *uoff)
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  {
+  	struct sk_buff *p, **pp = NULL;
+  	struct vxlanhdr *vh, *vh2;
+@@@ -565,6 -612,21 +607,24 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	skb_gro_pull(skb, sizeof(struct vxlanhdr)); /* pull vxlan header */
++ 	skb_gro_postpull_rcsum(skb, vh, sizeof(struct vxlanhdr));
++ 
++ 	flags = ntohl(vh->vx_flags);
++ 
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		vh = vxlan_gro_remcsum(skb, off_vx, vh, sizeof(struct vxlanhdr),
++ 				       ntohl(vh->vx_vni), &grc,
++ 				       !!(vs->flags &
++ 					  VXLAN_F_REMCSUM_NOPARTIAL));
++ 
++ 		if (!vh)
++ 			goto out;
++ 	}
++ 
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  	flush = 0;
+  
+  	for (p = *head; p; p = p->next) {
+@@@ -1094,6 -1157,29 +1154,32 @@@ static void vxlan_igmp_leave(struct wor
+  	dev_put(vxlan->dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct vxlanhdr *vxlan_remcsum(struct sk_buff *skb, struct vxlanhdr *vh,
++ 				      size_t hdrlen, u32 data, bool nopartial)
++ {
++ 	size_t start, offset, plen;
++ 
++ 	start = (data & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
++ 	offset = start + ((data & VXLAN_RCO_UDP) ?
++ 			  offsetof(struct udphdr, check) :
++ 			  offsetof(struct tcphdr, check));
++ 
++ 	plen = hdrlen + offset + sizeof(u16);
++ 
++ 	if (!pskb_may_pull(skb, plen))
++ 		return NULL;
++ 
++ 	vh = (struct vxlanhdr *)(udp_hdr(skb) + 1);
++ 
++ 	skb_remcsum_process(skb, (void *)vh + hdrlen, start, offset,
++ 			    nopartial);
++ 
++ 	return vh;
++ }
++ 
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  /* Callback from net/ipv4/udp.c to receive packets */
+  static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+  {
+@@@ -1120,7 -1211,49 +1206,53 @@@
+  	if (!vs)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	vs->rcv(vs, skb, vxh->vx_vni);
+++=======
++ 	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++ 		vxh = vxlan_remcsum(skb, vxh, sizeof(struct vxlanhdr), vni,
++ 				    !!(vs->flags & VXLAN_F_REMCSUM_NOPARTIAL));
++ 		if (!vxh)
++ 			goto drop;
++ 
++ 		flags &= ~VXLAN_HF_RCO;
++ 		vni &= VXLAN_VID_MASK;
++ 	}
++ 
++ 	/* For backwards compatibility, only allow reserved fields to be
++ 	 * used by VXLAN extensions if explicitly requested.
++ 	 */
++ 	if ((flags & VXLAN_HF_GBP) && (vs->flags & VXLAN_F_GBP)) {
++ 		struct vxlanhdr_gbp *gbp;
++ 
++ 		gbp = (struct vxlanhdr_gbp *)vxh;
++ 		md.gbp = ntohs(gbp->policy_id);
++ 
++ 		if (gbp->dont_learn)
++ 			md.gbp |= VXLAN_GBP_DONT_LEARN;
++ 
++ 		if (gbp->policy_applied)
++ 			md.gbp |= VXLAN_GBP_POLICY_APPLIED;
++ 
++ 		flags &= ~VXLAN_GBP_USED_BITS;
++ 	}
++ 
++ 	if (flags || (vni & ~VXLAN_VID_MASK)) {
++ 		/* If there are any unprocessed flags remaining treat
++ 		 * this as a malformed packet. This behavior diverges from
++ 		 * VXLAN RFC (RFC7348) which stipulates that bits in reserved
++ 		 * in reserved fields are to be ignored. The approach here
++ 		 * maintains compatbility with previous stack code, and also
++ 		 * is more robust and provides a little more security in
++ 		 * adding extensions to VXLAN.
++ 		 */
++ 
++ 		goto bad_flags;
++ 	}
++ 
++ 	md.vni = vxh->vx_vni;
++ 	vs->rcv(vs, skb, &md);
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  	return 0;
+  
+  drop:
+@@@ -2243,6 -2439,10 +2375,13 @@@ static const struct nla_policy vxlan_po
+  	[IFLA_VXLAN_UDP_CSUM]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]	= { .type = NLA_U8 },
+  	[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]	= { .type = NLA_U8 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_VXLAN_REMCSUM_TX]	= { .type = NLA_U8 },
++ 	[IFLA_VXLAN_REMCSUM_RX]	= { .type = NLA_U8 },
++ 	[IFLA_VXLAN_GBP]	= { .type = NLA_FLAG, },
++ 	[IFLA_VXLAN_REMCSUM_NOPARTIAL]	= { .type = NLA_FLAG },
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  };
+  
+  static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
+@@@ -2566,8 -2755,22 +2705,27 @@@ static int vxlan_newlink(struct net *ne
+  	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
+  		vxlan->flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
+  
+++<<<<<<< HEAD
+ +	if (vxlan_find_vni(net, vni, use_ipv6 ? AF_INET6 : AF_INET,
+ +			   vxlan->dst_port)) {
+++=======
++ 	if (data[IFLA_VXLAN_REMCSUM_TX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 		vxlan->flags |= VXLAN_F_REMCSUM_TX;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX] &&
++ 	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 		vxlan->flags |= VXLAN_F_REMCSUM_RX;
++ 
++ 	if (data[IFLA_VXLAN_GBP])
++ 		vxlan->flags |= VXLAN_F_GBP;
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL])
++ 		vxlan->flags |= VXLAN_F_REMCSUM_NOPARTIAL;
++ 
++ 	if (vxlan_find_vni(src_net, vni, use_ipv6 ? AF_INET6 : AF_INET,
++ 			   vxlan->dst_port, vxlan->flags)) {
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  		pr_info("duplicate VNI %u\n", vni);
+  		return -EEXIST;
+  	}
+@@@ -2705,6 -2914,14 +2863,17 @@@ static int vxlan_fill_info(struct sk_bu
+  	if (nla_put(skb, IFLA_VXLAN_PORT_RANGE, sizeof(ports), &ports))
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vxlan->flags & VXLAN_F_GBP &&
++ 	    nla_put_flag(skb, IFLA_VXLAN_GBP))
++ 		goto nla_put_failure;
++ 
++ 	if (vxlan->flags & VXLAN_F_REMCSUM_NOPARTIAL &&
++ 	    nla_put_flag(skb, IFLA_VXLAN_REMCSUM_NOPARTIAL))
++ 		goto nla_put_failure;
++ 
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  	return 0;
+  
+  nla_put_failure:
+diff --cc include/net/vxlan.h
+index 1ddc74769f81,eabd3a038674..000000000000
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@@ -33,6 -125,18 +33,21 @@@ struct vxlan_sock 
+  #define VXLAN_F_UDP_CSUM		0x40
+  #define VXLAN_F_UDP_ZERO_CSUM6_TX	0x80
+  #define VXLAN_F_UDP_ZERO_CSUM6_RX	0x100
+++<<<<<<< HEAD
+++=======
++ #define VXLAN_F_REMCSUM_TX		0x200
++ #define VXLAN_F_REMCSUM_RX		0x400
++ #define VXLAN_F_GBP			0x800
++ #define VXLAN_F_REMCSUM_NOPARTIAL	0x1000
++ 
++ /* Flags that are used in the receive patch. These flags must match in
++  * order for a socket to be shareable
++  */
++ #define VXLAN_F_RCV_FLAGS		(VXLAN_F_GBP |			\
++ 					 VXLAN_F_UDP_ZERO_CSUM6_RX |	\
++ 					 VXLAN_F_REMCSUM_RX |		\
++ 					 VXLAN_F_REMCSUM_NOPARTIAL)
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  
+  struct vxlan_sock *vxlan_sock_add(struct net *net, __be16 port,
+  				  vxlan_rcv_t *rcv, void *data,
+diff --cc include/uapi/linux/if_link.h
+index 4efe6bcb6e67,dfd0bb22e554..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -325,6 -371,10 +325,13 @@@ enum 
+  	IFLA_VXLAN_UDP_CSUM,
+  	IFLA_VXLAN_UDP_ZERO_CSUM6_TX,
+  	IFLA_VXLAN_UDP_ZERO_CSUM6_RX,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_VXLAN_REMCSUM_TX,
++ 	IFLA_VXLAN_REMCSUM_RX,
++ 	IFLA_VXLAN_GBP,
++ 	IFLA_VXLAN_REMCSUM_NOPARTIAL,
+++>>>>>>> 0ace2ca89cbd (vxlan: Use checksum partial with remote checksum offload)
+  	__IFLA_VXLAN_MAX
+  };
+  #define IFLA_VXLAN_MAX	(__IFLA_VXLAN_MAX - 1)
+* Unmerged path drivers/net/vxlan.c
+* Unmerged path include/net/vxlan.h
+* Unmerged path include/uapi/linux/if_link.h
