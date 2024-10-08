@@ -1,0 +1,413 @@
+dm: add 'use_blk_mq' module param and expose in per-device ro sysfs attr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 17e149b8f73ba116e71e25930dd6f2eb3828792d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/17e149b8.failed
+
+Request-based DM's blk-mq support defaults to off; but a user can easily
+change the default using the dm_mod.use_blk_mq module/boot option.
+
+Also, you can check what mode a given request-based DM device is using
+with: cat /sys/block/dm-X/dm/use_blk_mq
+
+This change enabled further cleanup and reduced work (e.g. the
+md->io_pool and md->rq_pool isn't created if using blk-mq).
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 17e149b8f73ba116e71e25930dd6f2eb3828792d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 7270805de04c,944cdb322708..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -224,8 -225,23 +224,26 @@@ struct mapped_device 
+  	int last_rq_rw;
+  	sector_t last_rq_pos;
+  	ktime_t last_rq_start_time;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* for blk-mq request-based DM support */
++ 	struct blk_mq_tag_set tag_set;
++ 	bool use_blk_mq;
+++>>>>>>> 17e149b8f73b (dm: add 'use_blk_mq' module param and expose in per-device ro sysfs attr)
+  };
+  
++ #ifdef CONFIG_DM_MQ_DEFAULT
++ static bool use_blk_mq = true;
++ #else
++ static bool use_blk_mq = false;
++ #endif
++ 
++ bool dm_use_blk_mq(struct mapped_device *md)
++ {
++ 	return md->use_blk_mq;
++ }
++ 
+  /*
+   * For mempools pre-allocation at the table loading time.
+   */
+@@@ -2253,7 -2230,16 +2271,18 @@@ static void dm_init_md_queue(struct map
+  	 * This queue is new, so no concurrency on the queue_flags.
+  	 */
+  	queue_flag_clear_unlocked(QUEUE_FLAG_STACKABLE, md->queue);
+ -}
+  
+++<<<<<<< HEAD
+++=======
++ static void dm_init_old_md_queue(struct mapped_device *md)
++ {
++ 	md->use_blk_mq = false;
++ 	dm_init_md_queue(md);
++ 
++ 	/*
++ 	 * Initialize aspects of queue that aren't relevant for blk-mq
++ 	 */
+++>>>>>>> 17e149b8f73b (dm: add 'use_blk_mq' module param and expose in per-device ro sysfs attr)
+  	md->queue->queuedata = md;
+  	md->queue->backing_dev_info.congested_fn = dm_any_congested;
+  	md->queue->backing_dev_info.congested_data = md;
+@@@ -2401,6 -2388,8 +2431,11 @@@ static void free_dev(struct mapped_devi
+  	del_gendisk(md->disk);
+  	put_disk(md->disk);
+  	blk_cleanup_queue(md->queue);
+++<<<<<<< HEAD
+++=======
++ 	if (md->use_blk_mq)
++ 		blk_mq_free_tag_set(&md->tag_set);
+++>>>>>>> 17e149b8f73b (dm: add 'use_blk_mq' module param and expose in per-device ro sysfs attr)
+  	bdput(md->bdev);
+  	free_minor(minor);
+  
+@@@ -2696,23 -2682,171 +2731,41 @@@ static int dm_init_request_based_queue(
+  
+  	elv_register_queue(md->queue);
+  
+ -	return 0;
+ -}
+ -
+ -static int dm_mq_init_request(void *data, struct request *rq,
+ -			      unsigned int hctx_idx, unsigned int request_idx,
+ -			      unsigned int numa_node)
+ -{
+ -	struct mapped_device *md = data;
+ -	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
+ -
+ -	/*
+ -	 * Must initialize md member of tio, otherwise it won't
+ -	 * be available in dm_mq_queue_rq.
+ -	 */
+ -	tio->md = md;
+ -
+ -	return 0;
+ -}
+ -
+ -static int dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
+ -			  const struct blk_mq_queue_data *bd)
+ -{
+ -	struct request *rq = bd->rq;
+ -	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
+ -	struct mapped_device *md = tio->md;
+ -	int srcu_idx;
+ -	struct dm_table *map = dm_get_live_table(md, &srcu_idx);
+ -	struct dm_target *ti;
+ -	sector_t pos;
+ -
+ -	/* always use block 0 to find the target for flushes for now */
+ -	pos = 0;
+ -	if (!(rq->cmd_flags & REQ_FLUSH))
+ -		pos = blk_rq_pos(rq);
+ -
+ -	ti = dm_table_find_target(map, pos);
+ -	if (!dm_target_is_valid(ti)) {
+ -		dm_put_live_table(md, srcu_idx);
+ -		DMERR_LIMIT("request attempted access beyond the end of device");
+ -		/*
+ -		 * Must perform setup, that rq_completed() requires,
+ -		 * before returning BLK_MQ_RQ_QUEUE_ERROR
+ -		 */
+ -		dm_start_request(md, rq);
+ -		return BLK_MQ_RQ_QUEUE_ERROR;
+ -	}
+ -	dm_put_live_table(md, srcu_idx);
+ -
+ -	if (ti->type->busy && ti->type->busy(ti))
+ -		return BLK_MQ_RQ_QUEUE_BUSY;
+ -
+ -	dm_start_request(md, rq);
+ -
+ -	/* Init tio using md established in .init_request */
+ -	init_tio(tio, rq, md);
+ -
+ -	/*
+ -	 * Establish tio->ti before queuing work (map_tio_request)
+ -	 * or making direct call to map_request().
+ -	 */
+ -	tio->ti = ti;
+ -
+ -	/* Clone the request if underlying devices aren't blk-mq */
+ -	if (dm_table_get_type(map) == DM_TYPE_REQUEST_BASED) {
+ -		/* clone request is allocated at the end of the pdu */
+ -		tio->clone = (void *)blk_mq_rq_to_pdu(rq) + sizeof(struct dm_rq_target_io);
+ -		if (!clone_rq(rq, md, tio, GFP_ATOMIC))
+ -			return BLK_MQ_RQ_QUEUE_BUSY;
+ -		queue_kthread_work(&md->kworker, &tio->work);
+ -	} else {
+ -		/* Direct call is fine since .queue_rq allows allocations */
+ -		if (map_request(tio, rq, md) == DM_MAPIO_REQUEUE)
+ -			dm_requeue_unmapped_original_request(md, rq);
+ -	}
+ -
+ -	return BLK_MQ_RQ_QUEUE_OK;
+ -}
+ -
+ -static struct blk_mq_ops dm_mq_ops = {
+ -	.queue_rq = dm_mq_queue_rq,
+ -	.map_queue = blk_mq_map_queue,
+ -	.complete = dm_softirq_done,
+ -	.init_request = dm_mq_init_request,
+ -};
+ -
+ -static int dm_init_request_based_blk_mq_queue(struct mapped_device *md)
+ -{
+ -	unsigned md_type = dm_get_md_type(md);
+ -	struct request_queue *q;
+ -	int err;
+ -
+ -	memset(&md->tag_set, 0, sizeof(md->tag_set));
+ -	md->tag_set.ops = &dm_mq_ops;
+ -	md->tag_set.queue_depth = BLKDEV_MAX_RQ;
+ -	md->tag_set.numa_node = NUMA_NO_NODE;
+ -	md->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+ -	md->tag_set.nr_hw_queues = 1;
+ -	if (md_type == DM_TYPE_REQUEST_BASED) {
+ -		/* make the memory for non-blk-mq clone part of the pdu */
+ -		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io) + sizeof(struct request);
+ -	} else
+ -		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io);
+ -	md->tag_set.driver_data = md;
+ -
+ -	err = blk_mq_alloc_tag_set(&md->tag_set);
+ -	if (err)
+ -		return err;
+ -
+ -	q = blk_mq_init_allocated_queue(&md->tag_set, md->queue);
+ -	if (IS_ERR(q)) {
+ -		err = PTR_ERR(q);
+ -		goto out_tag_set;
+ -	}
+ -	md->queue = q;
+ -	dm_init_md_queue(md);
+ -
+ -	/* backfill 'mq' sysfs registration normally done in blk_register_queue */
+ -	blk_mq_register_disk(md->disk);
+ -
+ -	if (md_type == DM_TYPE_REQUEST_BASED)
+ -		init_rq_based_worker_thread(md);
+ -
+ -	return 0;
+ -
+ -out_tag_set:
+ -	blk_mq_free_tag_set(&md->tag_set);
+ -	return err;
+ +	return 1;
+  }
+  
++ static unsigned filter_md_type(unsigned type, struct mapped_device *md)
++ {
++ 	if (type == DM_TYPE_BIO_BASED)
++ 		return type;
++ 
++ 	return !md->use_blk_mq ? DM_TYPE_REQUEST_BASED : DM_TYPE_MQ_REQUEST_BASED;
++ }
++ 
+  /*
+   * Setup the DM device's queue based on md's type
+   */
+  int dm_setup_md_queue(struct mapped_device *md)
+  {
+++<<<<<<< HEAD
+ +	if (dm_md_type_request_based(md)) {
+ +		if (!dm_init_request_based_queue(md)) {
+++=======
++ 	int r;
++ 	unsigned md_type = filter_md_type(dm_get_md_type(md), md);
++ 
++ 	switch (md_type) {
++ 	case DM_TYPE_REQUEST_BASED:
++ 		r = dm_init_request_based_queue(md);
++ 		if (r) {
+++>>>>>>> 17e149b8f73b (dm: add 'use_blk_mq' module param and expose in per-device ro sysfs attr)
+  			DMWARN("Cannot initialize queue for request-based mapped device");
+ -			return r;
+ +			return -EINVAL;
+  		}
+ -		break;
+ -	case DM_TYPE_MQ_REQUEST_BASED:
+ -		r = dm_init_request_based_blk_mq_queue(md);
+ -		if (r) {
+ -			DMWARN("Cannot initialize queue for request-based blk-mq mapped device");
+ -			return r;
+ -		}
+ -		break;
+ -	case DM_TYPE_BIO_BASED:
+ -		dm_init_old_md_queue(md);
+ +	} else {
+ +		/* bio-based specific initialization */
+  		blk_queue_make_request(md->queue, dm_make_request);
+  		blk_queue_merge_bvec(md->queue, dm_merge_bvec);
+ -		break;
+  	}
+  
+  	return 0;
+@@@ -3420,14 -3564,16 +3476,16 @@@ struct dm_md_mempools *dm_alloc_md_memp
+  		WARN_ON(per_bio_data_size != 0);
+  		break;
+  	default:
+- 		goto out;
++ 		BUG();
+  	}
+  
+- 	pools->io_pool = mempool_create_slab_pool(pool_size, cachep);
+- 	if (!pools->io_pool)
+- 		goto out;
++ 	if (cachep) {
++ 		pools->io_pool = mempool_create_slab_pool(pool_size, cachep);
++ 		if (!pools->io_pool)
++ 			goto out;
++ 	}
+  
+ -	pools->bs = bioset_create_nobvec(pool_size, front_pad);
+ +	pools->bs = bioset_create(pool_size, front_pad);
+  	if (!pools->bs)
+  		goto out;
+  
+diff --git a/Documentation/ABI/testing/sysfs-block-dm b/Documentation/ABI/testing/sysfs-block-dm
+index ac4b6fe245d9..f9f2339b9a0a 100644
+--- a/Documentation/ABI/testing/sysfs-block-dm
++++ b/Documentation/ABI/testing/sysfs-block-dm
+@@ -37,3 +37,11 @@ Description:	Allow control over how long a request that is a
+ 		accounting.  This attribute is not applicable to
+ 		bio-based DM devices so it will only ever report 0 for
+ 		them.
++
++What:		/sys/block/dm-<num>/dm/use_blk_mq
++Date:		March 2015
++KernelVersion:	4.1
++Contact:	dm-devel@redhat.com
++Description:	Request-based Device-mapper blk-mq I/O path mode.
++		Contains the value 1 if the device is using blk-mq.
++		Otherwise it contains 0. Read-only attribute.
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 09c89a4b014d..142a235c60db 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -195,6 +195,17 @@ config BLK_DEV_DM
+ 
+ 	  If unsure, say N.
+ 
++config DM_MQ_DEFAULT
++	bool "request-based DM: use blk-mq I/O path by default"
++	depends on BLK_DEV_DM
++	---help---
++	  This option enables the blk-mq based I/O path for request-based
++	  DM devices by default.  With the option the dm_mod.use_blk_mq
++	  module/boot option defaults to Y, without it to N, but it can
++	  still be overriden either way.
++
++	  If unsure say N.
++
+ config DM_DEBUG
+ 	boolean "Device mapper debugging support"
+ 	depends on BLK_DEV_DM
+diff --git a/drivers/md/dm-sysfs.c b/drivers/md/dm-sysfs.c
+index f5bb3944f75e..7e818f5f1dc4 100644
+--- a/drivers/md/dm-sysfs.c
++++ b/drivers/md/dm-sysfs.c
+@@ -89,15 +89,24 @@ static ssize_t dm_attr_suspended_show(struct mapped_device *md, char *buf)
+ 	return strlen(buf);
+ }
+ 
++static ssize_t dm_attr_use_blk_mq_show(struct mapped_device *md, char *buf)
++{
++	sprintf(buf, "%d\n", dm_use_blk_mq(md));
++
++	return strlen(buf);
++}
++
+ static DM_ATTR_RO(name);
+ static DM_ATTR_RO(uuid);
+ static DM_ATTR_RO(suspended);
++static DM_ATTR_RO(use_blk_mq);
+ static DM_ATTR_RW(rq_based_seq_io_merge_deadline);
+ 
+ static struct attribute *dm_attrs[] = {
+ 	&dm_attr_name.attr,
+ 	&dm_attr_uuid.attr,
+ 	&dm_attr_suspended.attr,
++	&dm_attr_use_blk_mq.attr,
+ 	&dm_attr_rq_based_seq_io_merge_deadline.attr,
+ 	NULL,
+ };
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index f0e1b4aff2f4..11564d189243 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -939,7 +939,7 @@ bool dm_table_mq_request_based(struct dm_table *t)
+ 	return dm_table_get_type(t) == DM_TYPE_MQ_REQUEST_BASED;
+ }
+ 
+-static int dm_table_alloc_md_mempools(struct dm_table *t)
++static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *md)
+ {
+ 	unsigned type = dm_table_get_type(t);
+ 	unsigned per_bio_data_size = 0;
+@@ -957,7 +957,7 @@ static int dm_table_alloc_md_mempools(struct dm_table *t)
+ 			per_bio_data_size = max(per_bio_data_size, tgt->per_bio_data_size);
+ 		}
+ 
+-	t->mempools = dm_alloc_md_mempools(type, t->integrity_supported, per_bio_data_size);
++	t->mempools = dm_alloc_md_mempools(md, type, t->integrity_supported, per_bio_data_size);
+ 	if (!t->mempools)
+ 		return -ENOMEM;
+ 
+@@ -1127,7 +1127,7 @@ int dm_table_complete(struct dm_table *t)
+ 		return r;
+ 	}
+ 
+-	r = dm_table_alloc_md_mempools(t);
++	r = dm_table_alloc_md_mempools(t, t->md);
+ 	if (r)
+ 		DMERR("unable to allocate mempools");
+ 
+* Unmerged path drivers/md/dm.c
+diff --git a/drivers/md/dm.h b/drivers/md/dm.h
+index 5522422cc6c4..6123c2bf9150 100644
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@ -211,6 +211,8 @@ int dm_kobject_uevent(struct mapped_device *md, enum kobject_action action,
+ void dm_internal_suspend(struct mapped_device *md);
+ void dm_internal_resume(struct mapped_device *md);
+ 
++bool dm_use_blk_mq(struct mapped_device *md);
++
+ int dm_io_init(void);
+ void dm_io_exit(void);
+ 
+@@ -220,7 +222,8 @@ void dm_kcopyd_exit(void);
+ /*
+  * Mempool operations
+  */
+-struct dm_md_mempools *dm_alloc_md_mempools(unsigned type, unsigned integrity, unsigned per_bio_data_size);
++struct dm_md_mempools *dm_alloc_md_mempools(struct mapped_device *md, unsigned type,
++					    unsigned integrity, unsigned per_bio_data_size);
+ void dm_free_md_mempools(struct dm_md_mempools *pools);
+ 
+ /*
