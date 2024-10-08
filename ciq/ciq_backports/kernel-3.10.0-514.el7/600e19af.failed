@@ -1,0 +1,146 @@
+mm: use only per-device readahead limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] use only per-device readahead limit (Eric Sandeen) [1280355]
+Rebuild_FUZZ: 94.59%
+commit-author Roman Gushchin <klamm@yandex-team.ru>
+commit 600e19afc5f8a6c18ea49cee9511c5797db02391
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/600e19af.failed
+
+Maximal readahead size is limited now by two values:
+ 1) by global 2Mb constant (MAX_READAHEAD in max_sane_readahead())
+ 2) by configurable per-device value* (bdi->ra_pages)
+
+There are devices, which require custom readahead limit.
+For instance, for RAIDs it's calculated as number of devices
+multiplied by chunk size times 2.
+
+Readahead size can never be larger than bdi->ra_pages * 2 value
+(POSIX_FADV_SEQUNTIAL doubles readahead size).
+
+If so, why do we need two limits?
+I suggest to completely remove this max_sane_readahead() stuff and
+use per-device readahead limit everywhere.
+
+Also, using right readahead size for RAID disks can significantly
+increase i/o performance:
+
+before:
+  dd if=/dev/md2 of=/dev/null bs=100M count=100
+  100+0 records in
+  100+0 records out
+  10485760000 bytes (10 GB) copied, 12.9741 s, 808 MB/s
+
+after:
+  $ dd if=/dev/md2 of=/dev/null bs=100M count=100
+  100+0 records in
+  100+0 records out
+  10485760000 bytes (10 GB) copied, 8.91317 s, 1.2 GB/s
+
+(It's an 8-disks RAID5 storage).
+
+This patch doesn't change sys_readahead and madvise(MADV_WILLNEED)
+behavior introduced by 6d2be915e589b58 ("mm/readahead.c: fix readahead
+failure for memoryless NUMA nodes and limit readahead pages").
+
+	Signed-off-by: Roman Gushchin <klamm@yandex-team.ru>
+	Cc: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Wu Fengguang <fengguang.wu@intel.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: onstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 600e19afc5f8a6c18ea49cee9511c5797db02391)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index b2e1abb95390,fa08f3cf0f22..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -1873,11 -2036,6 +1873,14 @@@ void page_cache_async_readahead(struct 
+  				pgoff_t offset,
+  				unsigned long size);
+  
+++<<<<<<< HEAD
+ +unsigned long max_sane_readahead(unsigned long nr);
+ +unsigned long ra_submit(struct file_ra_state *ra,
+ +			struct address_space *mapping,
+ +			struct file *filp);
+ +
+++=======
+++>>>>>>> 600e19afc5f8 (mm: use only per-device readahead limit)
+  /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */
+  extern int expand_stack(struct vm_area_struct *vma, unsigned long address);
+  
+* Unmerged path include/linux/mm.h
+diff --git a/mm/filemap.c b/mm/filemap.c
+index c892a9baf867..44cf34fc2c5f 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2032,7 +2032,6 @@ static void do_sync_mmap_readahead(struct vm_area_struct *vma,
+ 				   struct file *file,
+ 				   pgoff_t offset)
+ {
+-	unsigned long ra_pages;
+ 	struct address_space *mapping = file->f_mapping;
+ 
+ 	/* If we don't want any read-ahead, don't bother */
+@@ -2061,10 +2060,9 @@ static void do_sync_mmap_readahead(struct vm_area_struct *vma,
+ 	/*
+ 	 * mmap read-around
+ 	 */
+-	ra_pages = max_sane_readahead(ra->ra_pages);
+-	ra->start = max_t(long, 0, offset - ra_pages / 2);
+-	ra->size = ra_pages;
+-	ra->async_size = ra_pages / 4;
++	ra->start = max_t(long, 0, offset - ra->ra_pages / 2);
++	ra->size = ra->ra_pages;
++	ra->async_size = ra->ra_pages / 4;
+ 	ra_submit(ra, mapping, file);
+ }
+ 
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 6c167419ad04..e9322db4662d 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -216,7 +216,7 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
+ 	if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages))
+ 		return -EINVAL;
+ 
+-	nr_to_read = max_sane_readahead(nr_to_read);
++	nr_to_read = min(nr_to_read, inode_to_bdi(mapping->host)->ra_pages);
+ 	while (nr_to_read) {
+ 		int err;
+ 
+@@ -237,16 +237,6 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
+ 	return ret;
+ }
+ 
+-#define MAX_READAHEAD   ((512*4096)/PAGE_CACHE_SIZE)
+-/*
+- * Given a desired number of PAGE_CACHE_SIZE readahead pages, return a
+- * sensible upper limit.
+- */
+-unsigned long max_sane_readahead(unsigned long nr)
+-{
+-	return min(nr, MAX_READAHEAD);
+-}
+-
+ /*
+  * Submit IO for the read-ahead request in file_ra_state.
+  */
+@@ -400,7 +390,7 @@ ondemand_readahead(struct address_space *mapping,
+ 		   bool hit_readahead_marker, pgoff_t offset,
+ 		   unsigned long req_size)
+ {
+-	unsigned long max = max_sane_readahead(ra->ra_pages);
++	unsigned long max = ra->ra_pages;
+ 	pgoff_t prev_offset;
+ 
+ 	/*
