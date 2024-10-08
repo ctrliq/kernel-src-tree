@@ -1,0 +1,373 @@
+mm/hugetlb: reduce arch dependent code around follow_huge_*
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] hugetlb: reduce arch dependent code around follow_huge_* (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 97.39%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit 61f77eda9bbf0d2e922197ed2dcf88638a639ce5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/61f77eda.failed
+
+Currently we have many duplicates in definitions around
+follow_huge_addr(), follow_huge_pmd(), and follow_huge_pud(), so this
+patch tries to remove the m.  The basic idea is to put the default
+implementation for these functions in mm/hugetlb.c as weak symbols
+(regardless of CONFIG_ARCH_WANT_GENERAL_HUGETL B), and to implement
+arch-specific code only when the arch needs it.
+
+For follow_huge_addr(), only powerpc and ia64 have their own
+implementation, and in all other architectures this function just returns
+ERR_PTR(-EINVAL).  So this patch sets returning ERR_PTR(-EINVAL) as
+default.
+
+As for follow_huge_(pmd|pud)(), if (pmd|pud)_huge() is implemented to
+always return 0 in your architecture (like in ia64 or sparc,) it's never
+called (the callsite is optimized away) no matter how implemented it is.
+So in such architectures, we don't need arch-specific implementation.
+
+In some architecture (like mips, s390 and tile,) their current
+arch-specific follow_huge_(pmd|pud)() are effectively identical with the
+common code, so this patch lets these architecture use the common code.
+
+One exception is metag, where pmd_huge() could return non-zero but it
+expects follow_huge_pmd() to always return NULL.  This means that we need
+arch-specific implementation which returns NULL.  This behavior looks
+strange to me (because non-zero pmd_huge() implies that the architecture
+supports PMD-based hugepage, so follow_huge_pmd() can/should return some
+relevant value,) but that's beyond this cleanup patch, so let's keep it.
+
+Justification of non-trivial changes:
+- in s390, follow_huge_pmd() checks !MACHINE_HAS_HPAGE at first, and this
+  patch removes the check. This is OK because we can assume MACHINE_HAS_HPAGE
+  is true when follow_huge_pmd() can be called (note that pmd_huge() has
+  the same check and always returns 0 for !MACHINE_HAS_HPAGE.)
+- in s390 and mips, we use HPAGE_MASK instead of PMD_MASK as done in common
+  code. This patch forces these archs use PMD_MASK, but it's OK because
+  they are identical in both archs.
+  In s390, both of HPAGE_SHIFT and PMD_SHIFT are 20.
+  In mips, HPAGE_SHIFT is defined as (PAGE_SHIFT + PAGE_SHIFT - 3) and
+  PMD_SHIFT is define as (PAGE_SHIFT + PAGE_SHIFT + PTE_ORDER - 3), but
+  PTE_ORDER is always 0, so these are identical.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Cc: James Hogan <james.hogan@imgtec.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Mel Gorman <mel@csn.ul.ie>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Luiz Capitulino <lcapitulino@redhat.com>
+	Cc: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+	Cc: Lee Schermerhorn <lee.schermerhorn@hp.com>
+	Cc: Steve Capper <steve.capper@linaro.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 61f77eda9bbf0d2e922197ed2dcf88638a639ce5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/mm/hugetlbpage.c
+#	arch/arm64/mm/hugetlbpage.c
+#	arch/x86/mm/hugetlbpage.c
+#	mm/hugetlb.c
+diff --cc arch/x86/mm/hugetlbpage.c
+index e4afb30191c1,f48423f10141..000000000000
+--- a/arch/x86/mm/hugetlbpage.c
++++ b/arch/x86/mm/hugetlbpage.c
+@@@ -217,21 -52,8 +217,18 @@@ int pud_huge(pud_t pud
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct page *
+ +follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ +		pmd_t *pmd, int write)
+ +{
+ +	return NULL;
+ +}
+ +
+++=======
+++>>>>>>> 61f77eda9bbf (mm/hugetlb: reduce arch dependent code around follow_huge_*)
+  #else
+  
+- struct page *
+- follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+- {
+- 	return ERR_PTR(-EINVAL);
+- }
+- 
+  int pmd_huge(pmd_t pmd)
+  {
+  	return !!(pmd_val(pmd) & _PAGE_PSE);
+diff --cc mm/hugetlb.c
+index 4a192c9e708d,f533d336e569..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3690,21 -3697,22 +3703,24 @@@ follow_huge_pud(struct mm_struct *mm, u
+  	return page;
+  }
+  
+ -#ifdef CONFIG_MEMORY_FAILURE
+++<<<<<<< HEAD
+ +#else /* !CONFIG_ARCH_WANT_GENERAL_HUGETLB */
+  
+ -/* Should be called in hugetlb_lock */
+ -static int is_hugepage_on_freelist(struct page *hpage)
+ +/* Can be overriden by architectures */
+ +__attribute__((weak)) struct page *
+ +follow_huge_pud(struct mm_struct *mm, unsigned long address,
+ +	       pud_t *pud, int write)
+  {
+ -	struct page *page;
+ -	struct page *tmp;
+ -	struct hstate *h = page_hstate(hpage);
+ -	int nid = page_to_nid(hpage);
+ -
+ -	list_for_each_entry_safe(page, tmp, &h->hugepage_freelists[nid], lru)
+ -		if (page == hpage)
+ -			return 1;
+ -	return 0;
+ +	BUG();
+ +	return NULL;
+  }
+  
+ +#endif /* CONFIG_ARCH_WANT_GENERAL_HUGETLB */
+ +
+++=======
+++>>>>>>> 61f77eda9bbf (mm/hugetlb: reduce arch dependent code around follow_huge_*)
+ +#ifdef CONFIG_MEMORY_FAILURE
+ +
+  /*
+   * This function is called from memory failure code.
+   * Assume the caller holds page lock of the head page.
+* Unmerged path arch/arm/mm/hugetlbpage.c
+* Unmerged path arch/arm64/mm/hugetlbpage.c
+* Unmerged path arch/arm/mm/hugetlbpage.c
+* Unmerged path arch/arm64/mm/hugetlbpage.c
+diff --git a/arch/ia64/mm/hugetlbpage.c b/arch/ia64/mm/hugetlbpage.c
+index 76069c18ee42..52b7604b5215 100644
+--- a/arch/ia64/mm/hugetlbpage.c
++++ b/arch/ia64/mm/hugetlbpage.c
+@@ -114,12 +114,6 @@ int pud_huge(pud_t pud)
+ 	return 0;
+ }
+ 
+-struct page *
+-follow_huge_pmd(struct mm_struct *mm, unsigned long address, pmd_t *pmd, int write)
+-{
+-	return NULL;
+-}
+-
+ void hugetlb_free_pgd_range(struct mmu_gather *tlb,
+ 			unsigned long addr, unsigned long end,
+ 			unsigned long floor, unsigned long ceiling)
+diff --git a/arch/metag/mm/hugetlbpage.c b/arch/metag/mm/hugetlbpage.c
+index 3c52fa6d0f8e..745081427659 100644
+--- a/arch/metag/mm/hugetlbpage.c
++++ b/arch/metag/mm/hugetlbpage.c
+@@ -94,12 +94,6 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ 	return 0;
+ }
+ 
+-struct page *follow_huge_addr(struct mm_struct *mm,
+-			      unsigned long address, int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	return pmd_page_shift(pmd) > PAGE_SHIFT;
+diff --git a/arch/mips/mm/hugetlbpage.c b/arch/mips/mm/hugetlbpage.c
+index a7fee0dfb7a9..e656e7f61e65 100644
+--- a/arch/mips/mm/hugetlbpage.c
++++ b/arch/mips/mm/hugetlbpage.c
+@@ -69,12 +69,6 @@ int is_aligned_hugepage_range(unsigned long addr, unsigned long len)
+ 	return 0;
+ }
+ 
+-struct page *
+-follow_huge_addr(struct mm_struct *mm, unsigned long address, int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	return (pmd_val(pmd) & _PAGE_HUGE) != 0;
+@@ -84,15 +78,3 @@ int pud_huge(pud_t pud)
+ {
+ 	return (pud_val(pud) & _PAGE_HUGE) != 0;
+ }
+-
+-struct page *
+-follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+-		pmd_t *pmd, int write)
+-{
+-	struct page *page;
+-
+-	page = pte_page(*(pte_t *)pmd);
+-	if (page)
+-		page += ((address & ~HPAGE_MASK) >> PAGE_SHIFT);
+-	return page;
+-}
+diff --git a/arch/powerpc/mm/hugetlbpage.c b/arch/powerpc/mm/hugetlbpage.c
+index 65fa8c71b889..fe76bd77b390 100644
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@ -722,6 +722,14 @@ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ 	return NULL;
+ }
+ 
++struct page *
++follow_huge_pud(struct mm_struct *mm, unsigned long address,
++		pud_t *pud, int write)
++{
++	BUG();
++	return NULL;
++}
++
+ static unsigned long hugepte_addr_end(unsigned long addr, unsigned long end,
+ 				      unsigned long sz)
+ {
+diff --git a/arch/s390/mm/hugetlbpage.c b/arch/s390/mm/hugetlbpage.c
+index 248445f92604..99a68d579828 100644
+--- a/arch/s390/mm/hugetlbpage.c
++++ b/arch/s390/mm/hugetlbpage.c
+@@ -204,12 +204,6 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ 	return 0;
+ }
+ 
+-struct page *follow_huge_addr(struct mm_struct *mm, unsigned long address,
+-			      int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	if (!MACHINE_HAS_HPAGE)
+@@ -222,17 +216,3 @@ int pud_huge(pud_t pud)
+ {
+ 	return 0;
+ }
+-
+-struct page *follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+-			     pmd_t *pmdp, int write)
+-{
+-	struct page *page;
+-
+-	if (!MACHINE_HAS_HPAGE)
+-		return NULL;
+-
+-	page = pmd_page(*pmdp);
+-	if (page)
+-		page += ((address & ~HPAGE_MASK) >> PAGE_SHIFT);
+-	return page;
+-}
+diff --git a/arch/sh/mm/hugetlbpage.c b/arch/sh/mm/hugetlbpage.c
+index d7762349ea48..534bc978af8a 100644
+--- a/arch/sh/mm/hugetlbpage.c
++++ b/arch/sh/mm/hugetlbpage.c
+@@ -67,12 +67,6 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ 	return 0;
+ }
+ 
+-struct page *follow_huge_addr(struct mm_struct *mm,
+-			      unsigned long address, int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	return 0;
+@@ -82,9 +76,3 @@ int pud_huge(pud_t pud)
+ {
+ 	return 0;
+ }
+-
+-struct page *follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+-			     pmd_t *pmd, int write)
+-{
+-	return NULL;
+-}
+diff --git a/arch/sparc/mm/hugetlbpage.c b/arch/sparc/mm/hugetlbpage.c
+index d2b59441ebdd..bd2e1b30d40f 100644
+--- a/arch/sparc/mm/hugetlbpage.c
++++ b/arch/sparc/mm/hugetlbpage.c
+@@ -218,12 +218,6 @@ pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
+ 	return entry;
+ }
+ 
+-struct page *follow_huge_addr(struct mm_struct *mm,
+-			      unsigned long address, int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	return 0;
+@@ -233,9 +227,3 @@ int pud_huge(pud_t pud)
+ {
+ 	return 0;
+ }
+-
+-struct page *follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+-			     pmd_t *pmd, int write)
+-{
+-	return NULL;
+-}
+diff --git a/arch/tile/mm/hugetlbpage.c b/arch/tile/mm/hugetlbpage.c
+index 650ccff8378c..df67b0a31c63 100644
+--- a/arch/tile/mm/hugetlbpage.c
++++ b/arch/tile/mm/hugetlbpage.c
+@@ -182,12 +182,6 @@ pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr)
+ 	return NULL;
+ }
+ 
+-struct page *follow_huge_addr(struct mm_struct *mm, unsigned long address,
+-			      int write)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-
+ int pmd_huge(pmd_t pmd)
+ {
+ 	return !!(pmd_val(pmd) & _PAGE_HUGE_PAGE);
+@@ -198,28 +192,6 @@ int pud_huge(pud_t pud)
+ 	return !!(pud_val(pud) & _PAGE_HUGE_PAGE);
+ }
+ 
+-struct page *follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+-			     pmd_t *pmd, int write)
+-{
+-	struct page *page;
+-
+-	page = pte_page(*(pte_t *)pmd);
+-	if (page)
+-		page += ((address & ~PMD_MASK) >> PAGE_SHIFT);
+-	return page;
+-}
+-
+-struct page *follow_huge_pud(struct mm_struct *mm, unsigned long address,
+-			     pud_t *pud, int write)
+-{
+-	struct page *page;
+-
+-	page = pte_page(*(pte_t *)pud);
+-	if (page)
+-		page += ((address & ~PUD_MASK) >> PAGE_SHIFT);
+-	return page;
+-}
+-
+ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ {
+ 	return 0;
+* Unmerged path arch/x86/mm/hugetlbpage.c
+* Unmerged path mm/hugetlb.c
