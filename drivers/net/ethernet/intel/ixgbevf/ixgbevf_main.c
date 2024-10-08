@@ -1650,6 +1650,7 @@ static void ixgbevf_up_complete(struct ixgbevf_adapter *adapter)
 
 	spin_unlock_bh(&adapter->mbx_lock);
 
+	smp_mb__before_clear_bit();
 	clear_bit(__IXGBEVF_DOWN, &adapter->state);
 	ixgbevf_napi_enable_all(adapter);
 
@@ -1779,7 +1780,8 @@ void ixgbevf_down(struct ixgbevf_adapter *adapter)
 	int i;
 
 	/* signal that we are down to the interrupt handler */
-	set_bit(__IXGBEVF_DOWN, &adapter->state);
+	if (test_and_set_bit(__IXGBEVF_DOWN, &adapter->state))
+		return; /* do nothing if already down */
 
 	/* disable all enabled rx queues */
 	for (i = 0; i < adapter->num_rx_queues; i++)
