@@ -1,0 +1,418 @@
+be2net: move be_func_init() call inside be_setup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sathya Perla <sathya.perla@emulex.com>
+commit f962f840f81f5b9f2df136dd44872f18a82def38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f962f840.failed
+
+Every time be_setup() is called, the driver will have to wait for the
+function/FW to be properly initialized. So, it make sense to move this call
+inside be_setup().
+
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f962f840f81f5b9f2df136dd44872f18a82def38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index b2184bdb8a43,b2277a4c7ddf..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -3705,6 -3933,55 +3705,58 @@@ int be_update_queues(struct be_adapter 
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int fw_major_num(const char *fw_ver)
++ {
++ 	int fw_major = 0, i;
++ 
++ 	i = sscanf(fw_ver, "%d.", &fw_major);
++ 	if (i != 1)
++ 		return 0;
++ 
++ 	return fw_major;
++ }
++ 
++ /* If any VFs are already enabled don't FLR the PF */
++ static bool be_reset_required(struct be_adapter *adapter)
++ {
++ 	return pci_num_vf(adapter->pdev) ? false : true;
++ }
++ 
++ /* Wait for the FW to be ready and perform the required initialization */
++ static int be_func_init(struct be_adapter *adapter)
++ {
++ 	int status;
++ 
++ 	status = be_fw_wait_ready(adapter);
++ 	if (status)
++ 		return status;
++ 
++ 	if (be_reset_required(adapter)) {
++ 		status = be_cmd_reset_function(adapter);
++ 		if (status)
++ 			return status;
++ 
++ 		/* Wait for interrupts to quiesce after an FLR */
++ 		msleep(100);
++ 
++ 		/* We can clear all errors when function reset succeeds */
++ 		be_clear_all_error(adapter);
++ 	}
++ 
++ 	/* Tell FW we're ready to fire cmds */
++ 	status = be_cmd_fw_init(adapter);
++ 	if (status)
++ 		return status;
++ 
++ 	/* Allow interrupts for other ULPs running on NIC function */
++ 	be_intr_set(adapter, true);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f962f840f81f (be2net: move be_func_init() call inside be_setup())
+  static int be_setup(struct be_adapter *adapter)
+  {
+  	struct device *dev = &adapter->pdev->dev;
+@@@ -4622,245 -4945,45 +4678,255 @@@ static void be_netdev_init(struct net_d
+  	netdev->ethtool_ops = &be_ethtool_ops;
+  }
+  
+ -static void be_cleanup(struct be_adapter *adapter)
+++<<<<<<< HEAD
+ +static void be_unmap_pci_bars(struct be_adapter *adapter)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -
+ -	rtnl_lock();
+ -	netif_device_detach(netdev);
+ -	if (netif_running(netdev))
+ -		be_close(netdev);
+ -	rtnl_unlock();
+ +	if (adapter->csr)
+ +		pci_iounmap(adapter->pdev, adapter->csr);
+ +	if (adapter->db)
+ +		pci_iounmap(adapter->pdev, adapter->db);
+ +}
+  
+ -	be_clear(adapter);
+ +static int db_bar(struct be_adapter *adapter)
+ +{
+ +	if (lancer_chip(adapter) || !be_physfn(adapter))
+ +		return 0;
+ +	else
+ +		return 4;
+  }
+  
+ -static int be_resume(struct be_adapter *adapter)
+ +static int be_roce_map_pci_bars(struct be_adapter *adapter)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int status;
+ +	if (skyhawk_chip(adapter)) {
+ +		adapter->roce_db.size = 4096;
+ +		adapter->roce_db.io_addr = pci_resource_start(adapter->pdev,
+ +							      db_bar(adapter));
+ +		adapter->roce_db.total_size = pci_resource_len(adapter->pdev,
+ +							       db_bar(adapter));
+ +	}
+ +	return 0;
+ +}
+  
+ -	status = be_setup(adapter);
+ -	if (status)
+ -		return status;
+ +static int be_map_pci_bars(struct be_adapter *adapter)
+++=======
+++static void be_cleanup(struct be_adapter *adapter)
+++>>>>>>> f962f840f81f (be2net: move be_func_init() call inside be_setup())
+ +{
+ +	struct pci_dev *pdev = adapter->pdev;
+ +	u8 __iomem *addr;
+  
+ -	if (netif_running(netdev)) {
+ -		status = be_open(netdev);
+ -		if (status)
+ -			return status;
+ +	if (BEx_chip(adapter) && be_physfn(adapter)) {
+ +		adapter->csr = pci_iomap(pdev, 2, 0);
+ +		if (!adapter->csr)
+ +			return -ENOMEM;
+  	}
+  
+ -	netif_device_attach(netdev);
+ +	addr = pci_iomap(pdev, db_bar(adapter), 0);
+ +	if (!addr)
+ +		goto pci_map_err;
+ +	adapter->db = addr;
+ +
+ +	if (skyhawk_chip(adapter) || BEx_chip(adapter)) {
+ +		if (be_physfn(adapter)) {
+ +			/* PCICFG is the 2nd BAR in BE2 */
+ +			addr = pci_iomap(pdev, BE2_chip(adapter) ? 1 : 0, 0);
+ +			if (!addr)
+ +				goto pci_map_err;
+ +			adapter->pcicfg = addr;
+ +		} else {
+ +			adapter->pcicfg = adapter->db + SRIOV_VF_PCICFG_OFFSET;
+ +		}
+ +	}
+  
+ +	be_roce_map_pci_bars(adapter);
+  	return 0;
+ +
+ +pci_map_err:
+ +	dev_err(&pdev->dev, "Error in mapping PCI BARs\n");
+ +	be_unmap_pci_bars(adapter);
+ +	return -ENOMEM;
+  }
+  
+ -static int be_err_recover(struct be_adapter *adapter)
+ +static void be_ctrl_cleanup(struct be_adapter *adapter)
+  {
+ -	struct device *dev = &adapter->pdev->dev;
+ +	struct be_dma_mem *mem = &adapter->mbox_mem_alloced;
+ +
+ +	be_unmap_pci_bars(adapter);
+ +
+ +	if (mem->va)
+ +		dma_free_coherent(&adapter->pdev->dev, mem->size, mem->va,
+ +				  mem->dma);
+ +
+ +	mem = &adapter->rx_filter;
+ +	if (mem->va)
+ +		dma_free_coherent(&adapter->pdev->dev, mem->size, mem->va,
+ +				  mem->dma);
+ +}
+ +
+ +static int be_ctrl_init(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *mbox_mem_alloc = &adapter->mbox_mem_alloced;
+ +	struct be_dma_mem *mbox_mem_align = &adapter->mbox_mem;
+ +	struct be_dma_mem *rx_filter = &adapter->rx_filter;
+ +	u32 sli_intf;
+  	int status;
+  
+ -	status = be_resume(adapter);
+ +	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
+ +	adapter->sli_family = (sli_intf & SLI_INTF_FAMILY_MASK) >>
+ +				 SLI_INTF_FAMILY_SHIFT;
+ +	adapter->virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
+ +
+ +	status = be_map_pci_bars(adapter);
+ +	if (status)
+ +		goto done;
+ +
+ +	mbox_mem_alloc->size = sizeof(struct be_mcc_mailbox) + 16;
+ +	mbox_mem_alloc->va = dma_alloc_coherent(&adapter->pdev->dev,
+ +						mbox_mem_alloc->size,
+ +						&mbox_mem_alloc->dma,
+ +						GFP_KERNEL);
+ +	if (!mbox_mem_alloc->va) {
+ +		status = -ENOMEM;
+ +		goto unmap_pci_bars;
+ +	}
+ +	mbox_mem_align->size = sizeof(struct be_mcc_mailbox);
+ +	mbox_mem_align->va = PTR_ALIGN(mbox_mem_alloc->va, 16);
+ +	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
+ +	memset(mbox_mem_align->va, 0, sizeof(struct be_mcc_mailbox));
+ +
+ +	rx_filter->size = sizeof(struct be_cmd_req_rx_filter);
+ +	rx_filter->va = dma_zalloc_coherent(&adapter->pdev->dev,
+ +					    rx_filter->size, &rx_filter->dma,
+ +					    GFP_KERNEL);
+ +	if (!rx_filter->va) {
+ +		status = -ENOMEM;
+ +		goto free_mbox;
+ +	}
+ +
+ +	mutex_init(&adapter->mbox_lock);
+ +	spin_lock_init(&adapter->mcc_lock);
+ +	spin_lock_init(&adapter->mcc_cq_lock);
+ +
+ +	init_completion(&adapter->et_cmd_compl);
+ +	pci_save_state(adapter->pdev);
+ +	return 0;
+ +
+ +free_mbox:
+ +	dma_free_coherent(&adapter->pdev->dev, mbox_mem_alloc->size,
+ +			  mbox_mem_alloc->va, mbox_mem_alloc->dma);
+ +
+ +unmap_pci_bars:
+ +	be_unmap_pci_bars(adapter);
+ +
+ +done:
+ +	return status;
+ +}
+ +
+ +static void be_stats_cleanup(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *cmd = &adapter->stats_cmd;
+ +
+ +	if (cmd->va)
+ +		dma_free_coherent(&adapter->pdev->dev, cmd->size,
+ +				  cmd->va, cmd->dma);
+ +}
+ +
+ +static int be_stats_init(struct be_adapter *adapter)
+ +{
+ +	struct be_dma_mem *cmd = &adapter->stats_cmd;
+ +
+ +	if (lancer_chip(adapter))
+ +		cmd->size = sizeof(struct lancer_cmd_req_pport_stats);
+ +	else if (BE2_chip(adapter))
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v0);
+ +	else if (BE3_chip(adapter))
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v1);
+ +	else
+ +		/* ALL non-BE ASICs */
+ +		cmd->size = sizeof(struct be_cmd_req_get_stats_v2);
+ +
+ +	cmd->va = dma_zalloc_coherent(&adapter->pdev->dev, cmd->size, &cmd->dma,
+ +				      GFP_KERNEL);
+ +	if (!cmd->va)
+ +		return -ENOMEM;
+ +	return 0;
+ +}
+ +
+ +static void be_remove(struct pci_dev *pdev)
+ +{
+ +	struct be_adapter *adapter = pci_get_drvdata(pdev);
+ +
+ +	if (!adapter)
+ +		return;
+ +
+ +	be_roce_dev_remove(adapter);
+ +	be_intr_set(adapter, false);
+ +
+ +	cancel_delayed_work_sync(&adapter->func_recovery_work);
+ +
+ +	unregister_netdev(adapter->netdev);
+ +
+ +	be_clear(adapter);
+ +
+ +	/* tell fw we're done with firing cmds */
+ +	be_cmd_fw_clean(adapter);
+ +
+ +	be_stats_cleanup(adapter);
+ +
+ +	be_ctrl_cleanup(adapter);
+ +
+ +	pci_disable_pcie_error_reporting(pdev);
+ +
+ +	pci_release_regions(pdev);
+ +	pci_disable_device(pdev);
+ +
+ +	free_netdev(adapter->netdev);
+ +}
+ +
+ +static int be_get_initial_config(struct be_adapter *adapter)
+ +{
+ +	int status, level;
+ +
+++<<<<<<< HEAD
+ +	status = be_cmd_get_cntl_attributes(adapter);
+ +	if (status)
+ +		return status;
+ +
+ +	/* Must be a power of 2 or else MODULO will BUG_ON */
+ +	adapter->be_get_temp_freq = 64;
+++=======
+++	status = be_setup(adapter);
+++	if (status)
+++		return status;
+++>>>>>>> f962f840f81f (be2net: move be_func_init() call inside be_setup())
+ +
+ +	if (BEx_chip(adapter)) {
+ +		level = be_cmd_get_fw_log_level(adapter);
+ +		adapter->msg_enable =
+ +			level <= FW_LOG_LEVEL_DEFAULT ? NETIF_MSG_HW : 0;
+ +	}
+ +
+ +	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
+ +	return 0;
+ +}
+ +
+ +static int lancer_recover_func(struct be_adapter *adapter)
+ +{
+ +	struct device *dev = &adapter->pdev->dev;
+ +	int status;
+ +
+ +	status = lancer_test_and_set_rdy_state(adapter);
+ +	if (status)
+ +		goto err;
+ +
+ +	if (netif_running(adapter->netdev))
+ +		be_close(adapter->netdev);
+ +
+ +	be_clear(adapter);
+ +
+ +	be_clear_all_error(adapter);
+ +
+ +	status = be_setup(adapter);
+  	if (status)
+  		goto err;
+  
+@@@ -5055,46 -5361,13 +5121,49 @@@ static int be_probe(struct pci_dev *pde
+  	if (status)
+  		goto free_netdev;
+  
+ -	status = be_drv_init(adapter);
+ +	/* sync up with fw's ready state */
+ +	if (be_physfn(adapter)) {
+ +		status = be_fw_wait_ready(adapter);
+ +		if (status)
+ +			goto ctrl_clean;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	if (be_reset_required(adapter)) {
+ +		status = be_cmd_reset_function(adapter);
+ +		if (status)
+ +			goto ctrl_clean;
+ +
+ +		/* Wait for interrupts to quiesce after an FLR */
+ +		msleep(100);
+ +	}
+ +
+ +	/* Allow interrupts for other ULPs running on NIC function */
+ +	be_intr_set(adapter, true);
+ +
+ +	/* tell fw we're ready to fire cmds */
+ +	status = be_cmd_fw_init(adapter);
+ +	if (status)
+ +		goto ctrl_clean;
+ +
+ +	status = be_stats_init(adapter);
+  	if (status)
+ -		goto unmap_bars;
+ +		goto ctrl_clean;
+ +
+ +	status = be_get_initial_config(adapter);
+ +	if (status)
+ +		goto stats_clean;
+ +
+ +	INIT_DELAYED_WORK(&adapter->work, be_worker);
+ +	INIT_DELAYED_WORK(&adapter->func_recovery_work, be_func_recovery_task);
+ +	adapter->rx_fc = true;
+ +	adapter->tx_fc = true;
+  
+++=======
+++>>>>>>> f962f840f81f (be2net: move be_func_init() call inside be_setup())
+  	status = be_setup(adapter);
+  	if (status)
+ -		goto drv_cleanup;
+ +		goto stats_clean;
+  
+  	be_netdev_init(netdev);
+  	status = register_netdev(netdev);
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
