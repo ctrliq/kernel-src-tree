@@ -1,0 +1,133 @@
+GFS2: Implement a "rgrp has no extents longer than X" scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 5ea5050cec9c02e86ceb5e707a889003f895a690
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/5ea5050c.failed
+
+With the preceding patch, we started accepting block reservations
+smaller than the ideal size, which requires a lot more parsing of the
+bitmaps. To reduce the amount of bitmap searching, this patch
+implements a scheme whereby each rgrp keeps track of the point
+at this multi-block reservations will fail.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit 5ea5050cec9c02e86ceb5e707a889003f895a690)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/rgrp.c
+diff --cc fs/gfs2/rgrp.c
+index 644847617f39,797f1d3114ef..000000000000
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@@ -608,9 -639,15 +608,18 @@@ static void __rs_deltree(struct gfs2_bl
+  		/* return reserved blocks to the rgrp */
+  		BUG_ON(rs->rs_rbm.rgd->rd_reserved < rs->rs_free);
+  		rs->rs_rbm.rgd->rd_reserved -= rs->rs_free;
++ 		/* The rgrp extent failure point is likely not to increase;
++ 		   it will only do so if the freed blocks are somehow
++ 		   contiguous with a span of free blocks that follows. Still,
++ 		   it will force the number to be recalculated later. */
++ 		rgd->rd_extfail_pt += rs->rs_free;
+  		rs->rs_free = 0;
+++<<<<<<< HEAD
+ +		clear_bit(GBF_FULL, &rs->rs_rbm.bi->bi_flags);
+ +		smp_mb__after_clear_bit();
+++=======
++ 		clear_bit(GBF_FULL, &bi->bi_flags);
+++>>>>>>> 5ea5050cec9c (GFS2: Implement a "rgrp has no extents longer than X" scheme)
+  	}
+  }
+  
+@@@ -1096,8 -1136,10 +1105,10 @@@ int gfs2_rgrp_bh_get(struct gfs2_rgrpd 
+  		gfs2_rgrp_in(rgd, (rgd->rd_bits[0].bi_bh)->b_data);
+  		rgd->rd_flags |= (GFS2_RDF_UPTODATE | GFS2_RDF_CHECK);
+  		rgd->rd_free_clone = rgd->rd_free;
++ 		/* max out the rgrp allocation failure point */
++ 		rgd->rd_extfail_pt = rgd->rd_free;
+  	}
+ -	if (cpu_to_be32(GFS2_MAGIC) != rgd->rd_rgl->rl_magic) {
+ +	if (be32_to_cpu(GFS2_MAGIC) != rgd->rd_rgl->rl_magic) {
+  		rgd->rd_rgl->rl_unlinked = cpu_to_be32(count_unlinked(rgd));
+  		gfs2_rgrp_ondisk2lvb(rgd->rd_rgl,
+  				     rgd->rd_bits[0].bi_bh->b_data);
+@@@ -1548,15 -1605,17 +1561,17 @@@ fail
+   * Returns: 0 on success, -ENOSPC if there is no block of the requested state
+   */
+  
+ -static int gfs2_rbm_find(struct gfs2_rbm *rbm, u8 state, u32 *minext,
+ -			 const struct gfs2_inode *ip, bool nowrap,
+ -			 const struct gfs2_alloc_parms *ap)
+ +static int gfs2_rbm_find(struct gfs2_rbm *rbm, u8 state, u32 minext,
+ +			 const struct gfs2_inode *ip, bool nowrap)
+  {
+  	struct buffer_head *bh;
+ -	int initial_bii;
+ +	struct gfs2_bitmap *initial_bi;
+  	u32 initial_offset;
++ 	int first_bii = rbm->bii;
++ 	u32 first_offset = rbm->offset;
+  	u32 offset;
+  	u8 *buffer;
+ +	int index;
+  	int n = 0;
+  	int iters = rbm->rgd->rd_length;
+  	int ret;
+@@@ -1622,6 -1686,24 +1637,27 @@@ next_iter
+  			break;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (minext == NULL || state != GFS2_BLKST_FREE)
++ 		return -ENOSPC;
++ 
++ 	/* If the extent was too small, and it's smaller than the smallest
++ 	   to have failed before, remember for future reference that it's
++ 	   useless to search this rgrp again for this amount or more. */
++ 	if ((first_offset == 0) && (first_bii == 0) &&
++ 	    (*minext < rbm->rgd->rd_extfail_pt))
++ 		rbm->rgd->rd_extfail_pt = *minext;
++ 
++ 	/* If the maximum extent we found is big enough to fulfill the
++ 	   minimum requirements, use it anyway. */
++ 	if (maxext.len) {
++ 		*rbm = maxext.rbm;
++ 		*minext = maxext.len;
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 5ea5050cec9c (GFS2: Implement a "rgrp has no extents longer than X" scheme)
+  	return -ENOSPC;
+  }
+  
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 4e814a2eadb4..f4e16a1c8c58 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -91,6 +91,7 @@ struct gfs2_rgrpd {
+ 	struct gfs2_rgrp_lvb *rd_rgl;
+ 	u32 rd_last_alloc;
+ 	u32 rd_flags;
++	u32 rd_extfail_pt;		/* extent failure point */
+ #define GFS2_RDF_CHECK		0x10000000 /* check for unlinked inodes */
+ #define GFS2_RDF_UPTODATE	0x20000000 /* rg is up to date */
+ #define GFS2_RDF_ERROR		0x40000000 /* error in rg */
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 6c33d7b6e0c4..67a3c0218c6e 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -82,6 +82,7 @@ static void maybe_release_space(struct gfs2_bufdata *bd)
+ 	       bd->bd_bh->b_data + bi->bi_offset, bi->bi_len);
+ 	clear_bit(GBF_FULL, &bi->bi_flags);
+ 	rgd->rd_free_clone = rgd->rd_free;
++	rgd->rd_extfail_pt = rgd->rd_free;
+ }
+ 
+ /**
+* Unmerged path fs/gfs2/rgrp.c
