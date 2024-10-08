@@ -1,0 +1,156 @@
+perf record: Add option --switch-events to select PERF_RECORD_SWITCH events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit b757bb09134f479a087ece08d2cd2a6ba31c9210
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b757bb09.failed
+
+Add an option to select PERF_RECORD_SWITCH events.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Tested-by: Jiri Olsa <jolsa@redhat.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Cc: Pawel Moll <pawel.moll@arm.com>
+	Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/r/1437471846-26995-4-git-send-email-adrian.hunter@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit b757bb09134f479a087ece08d2cd2a6ba31c9210)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-record.txt
+#	tools/perf/builtin-record.c
+diff --cc tools/perf/Documentation/perf-record.txt
+index 1c99db2877d3,63ee0408761d..000000000000
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@@ -272,6 -274,29 +272,32 @@@ is off by default
+  --running-time::
+  Record running and enabled time for read events (:S)
+  
+++<<<<<<< HEAD
+++=======
++ -k::
++ --clockid::
++ Sets the clock id to use for the various time fields in the perf_event_type
++ records. See clock_gettime(). In particular CLOCK_MONOTONIC and
++ CLOCK_MONOTONIC_RAW are supported, some events might also allow
++ CLOCK_BOOTTIME, CLOCK_REALTIME and CLOCK_TAI.
++ 
++ -S::
++ --snapshot::
++ Select AUX area tracing Snapshot Mode. This option is valid only with an
++ AUX area tracing event. Optionally the number of bytes to capture per
++ snapshot can be specified. In Snapshot Mode, trace data is captured only when
++ signal SIGUSR2 is received.
++ 
++ --proc-map-timeout::
++ When processing pre-existing threads /proc/XXX/mmap, it may take a long time,
++ because the file may be huge. A time out is needed in such cases.
++ This option sets the time out limit. The default value is 500 ms.
++ 
++ --switch-events::
++ Record context switch events i.e. events of type PERF_RECORD_SWITCH or
++ PERF_RECORD_SWITCH_CPU_WIDE.
++ 
+++>>>>>>> b757bb09134f (perf record: Add option --switch-events to select PERF_RECORD_SWITCH events)
+  SEE ALSO
+  --------
+  linkperf:perf-stat[1], linkperf:perf-list[1]
+diff --cc tools/perf/builtin-record.c
+index 11646c0813f1,445a64d19625..000000000000
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@@ -864,6 -1068,15 +864,18 @@@ struct option __record_options[] = 
+  		    "Sample machine registers on interrupt"),
+  	OPT_BOOLEAN(0, "running-time", &record.opts.running_time,
+  		    "Record running/enabled time of read (:S) events"),
+++<<<<<<< HEAD
+++=======
++ 	OPT_CALLBACK('k', "clockid", &record.opts,
++ 	"clockid", "clockid to use for events, see clock_gettime()",
++ 	parse_clockid),
++ 	OPT_STRING_OPTARG('S', "snapshot", &record.opts.auxtrace_snapshot_opts,
++ 			  "opts", "AUX area tracing Snapshot Mode", ""),
++ 	OPT_UINTEGER(0, "proc-map-timeout", &record.opts.proc_map_timeout,
++ 			"per thread proc mmap processing timeout in ms"),
++ 	OPT_BOOLEAN(0, "switch-events", &record.opts.record_switch_events,
++ 		    "Record context switch events"),
+++>>>>>>> b757bb09134f (perf record: Add option --switch-events to select PERF_RECORD_SWITCH events)
+  	OPT_END()
+  };
+  
+* Unmerged path tools/perf/Documentation/perf-record.txt
+* Unmerged path tools/perf/builtin-record.c
+diff --git a/tools/perf/perf.h b/tools/perf/perf.h
+index ad2a76fef7a4..7af6c152cb28 100644
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@ -57,6 +57,7 @@ struct record_opts {
+ 	bool	     running_time;
+ 	bool	     full_auxtrace;
+ 	bool	     auxtrace_snapshot_mode;
++	bool	     record_switch_events;
+ 	unsigned int freq;
+ 	unsigned int mmap_pages;
+ 	unsigned int auxtrace_mmap_pages;
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index baff391ab212..d7d69ae342e7 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -114,6 +114,7 @@ void perf_evlist__close(struct perf_evlist *evlist);
+ 
+ void perf_evlist__set_id_pos(struct perf_evlist *evlist);
+ bool perf_can_sample_identifier(void);
++bool perf_can_record_switch_events(void);
+ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts);
+ int record_opts__config(struct record_opts *opts);
+ 
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 016bdc7ab6b1..58389a085884 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -734,6 +734,9 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+ 	attr->mmap2 = track && !perf_missing_features.mmap2;
+ 	attr->comm  = track;
+ 
++	if (opts->record_switch_events)
++		attr->context_switch = track;
++
+ 	if (opts->sample_transaction)
+ 		perf_evsel__set_sample_bit(evsel, TRANSACTION);
+ 
+diff --git a/tools/perf/util/record.c b/tools/perf/util/record.c
+index 1f7becbe5e18..0d228a29526d 100644
+--- a/tools/perf/util/record.c
++++ b/tools/perf/util/record.c
+@@ -85,6 +85,11 @@ static void perf_probe_comm_exec(struct perf_evsel *evsel)
+ 	evsel->attr.comm_exec = 1;
+ }
+ 
++static void perf_probe_context_switch(struct perf_evsel *evsel)
++{
++	evsel->attr.context_switch = 1;
++}
++
+ bool perf_can_sample_identifier(void)
+ {
+ 	return perf_probe_api(perf_probe_sample_identifier);
+@@ -95,6 +100,11 @@ static bool perf_can_comm_exec(void)
+ 	return perf_probe_api(perf_probe_comm_exec);
+ }
+ 
++bool perf_can_record_switch_events(void)
++{
++	return perf_probe_api(perf_probe_context_switch);
++}
++
+ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts)
+ {
+ 	struct perf_evsel *evsel;
