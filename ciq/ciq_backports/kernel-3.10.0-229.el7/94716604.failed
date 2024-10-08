@@ -1,0 +1,152 @@
+powerpc/powernv: Dump PHB diag-data immediately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Dump PHB diag-data immediately (Don Zickus) [1127366]
+Rebuild_FUZZ: 90.70%
+commit-author Gavin Shan <shangw@linux.vnet.ibm.com>
+commit 947166043732b69878123bf31f51933ad0316080
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/94716604.failed
+
+The PHB diag-data is important to help locating the root cause for
+EEH errors such as frozen PE or fenced PHB. However, the EEH core
+enables IO path by clearing part of HW registers before collecting
+this data causing it to be corrupted.
+
+This patch fixes this by dumping the PHB diag-data immediately when
+frozen/fenced state on PE or PHB is detected for the first time in
+eeh_ops::get_state() or next_error() backend.
+
+	Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+CC: <stable@vger.kernel.org>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 947166043732b69878123bf31f51933ad0316080)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/eeh-ioda.c
+diff --cc arch/powerpc/platforms/powernv/eeh-ioda.c
+index be33a16408be,253fefe3d1a0..000000000000
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@@ -561,45 -559,6 +590,48 @@@ static int ioda_eeh_reset(struct eeh_p
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ioda_eeh_get_log - Retrieve error log
+ + * @pe: EEH PE
+ + * @severity: Severity level of the log
+ + * @drv_log: buffer to store the log
+ + * @len: space of the log buffer
+ + *
+ + * The function is used to retrieve error log from P7IOC.
+ + */
+ +static int ioda_eeh_get_log(struct eeh_pe *pe, int severity,
+ +			    char *drv_log, unsigned long len)
+ +{
+ +	s64 ret;
+ +	unsigned long flags;
+ +	struct pci_controller *hose = pe->phb;
+ +	struct pnv_phb *phb = hose->private_data;
+ +
+ +	spin_lock_irqsave(&phb->lock, flags);
+ +
+ +	ret = opal_pci_get_phb_diag_data2(phb->opal_id,
+ +			phb->diag.blob, PNV_PCI_DIAG_BUF_SIZE);
+ +	if (ret) {
+ +		spin_unlock_irqrestore(&phb->lock, flags);
+ +		pr_warning("%s: Can't get log for PHB#%x-PE#%x (%lld)\n",
+ +			   __func__, hose->global_number, pe->addr, ret);
+ +		return -EIO;
+ +	}
+ +
+ +	/*
+ +	 * FIXME: We probably need log the error in somewhere.
+ +	 * Lets make it up in future.
+ +	 */
+ +	/* pr_info("%s", phb->diag.blob); */
+ +
+ +	spin_unlock_irqrestore(&phb->lock, flags);
+ +
+ +	return 0;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 947166043732 (powerpc/powernv: Dump PHB diag-data immediately)
+   * ioda_eeh_configure_bridge - Configure the PCI bridges for the indicated PE
+   * @pe: EEH PE
+   *
+@@@ -847,18 -784,57 +863,44 @@@ static int ioda_eeh_next_error(struct e
+  
+  			break;
+  		case OPAL_EEH_PE_ERROR:
+ -			/*
+ -			 * If we can't find the corresponding PE, the
+ -			 * PEEV / PEST would be messy. So we force an
+ -			 * fenced PHB so that it can be recovered.
+ -			 */
+ -			if (ioda_eeh_get_pe(hose, frozen_pe_no, pe)) {
+ -				if (!ioda_eeh_get_phb_pe(hose, pe)) {
+ -					pr_err("EEH: Escalated fenced PHB#%x "
+ -					       "detected for PE#%llx\n",
+ -						hose->global_number,
+ -						frozen_pe_no);
+ -					ret = EEH_NEXT_ERR_FENCED_PHB;
+ -				} else {
+ -					ret = EEH_NEXT_ERR_NONE;
+ -				}
+ -			} else {
+ -				pr_err("EEH: Frozen PE#%x on PHB#%x detected\n",
+ -					(*pe)->addr, (*pe)->phb->global_number);
+ -				ret = EEH_NEXT_ERR_FROZEN_PE;
+ -			}
+ +			if (ioda_eeh_get_pe(hose, frozen_pe_no, pe))
+ +				break;
+  
+ -			break;
+ -		default:
+ -			pr_warn("%s: Unexpected error type %d\n",
+ -				__func__, err_type);
+ +			pr_err("EEH: Frozen PE#%x on PHB#%x detected\n",
+ +				(*pe)->addr, (*pe)->phb->global_number);
+ +			ret = 1;
+ +			goto out;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * EEH core will try recover from fenced PHB or
++ 		 * frozen PE. In the time for frozen PE, EEH core
++ 		 * enable IO path for that before collecting logs,
++ 		 * but it ruins the site. So we have to dump the
++ 		 * log in advance here.
++ 		 */
++ 		if ((ret == EEH_NEXT_ERR_FROZEN_PE  ||
++ 		    ret == EEH_NEXT_ERR_FENCED_PHB) &&
++ 		    !((*pe)->state & EEH_PE_ISOLATED)) {
++ 			eeh_pe_state_mark(*pe, EEH_PE_ISOLATED);
++ 			ioda_eeh_phb_diag(hose);
++ 		}
++ 
++ 		/*
++ 		 * If we have no errors on the specific PHB or only
++ 		 * informative error there, we continue poking it.
++ 		 * Otherwise, we need actions to be taken by upper
++ 		 * layer.
++ 		 */
++ 		if (ret > EEH_NEXT_ERR_INF)
++ 			break;
+++>>>>>>> 947166043732 (powerpc/powernv: Dump PHB diag-data immediately)
+  	}
+  
+ +	ret = 0;
+ +out:
+  	return ret;
+  }
+  
+* Unmerged path arch/powerpc/platforms/powernv/eeh-ioda.c
