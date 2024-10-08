@@ -1,0 +1,102 @@
+cpufreq: move policy kobj to policy->cpu at resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] move policy kobj to policy->cpu at resume (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 90.11%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 92c14bd9477a20a83144f08c0ca25b0308bf0730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/92c14bd9.failed
+
+This is only relevant to implementations with multiple clusters, where clusters
+have separate clock lines but all CPUs within a cluster share it.
+
+Consider a dual cluster platform with 2 cores per cluster. During suspend we
+start hot unplugging CPUs in order 1 to 3. When CPU2 is removed, policy->kobj
+would be moved to CPU3 and when CPU3 goes down we wouldn't free policy or its
+kobj as we want to retain permissions/values/etc.
+
+Now on resume, we will get CPU2 before CPU3 and will call __cpufreq_add_dev().
+We will recover the old policy and update policy->cpu from 3 to 2 from
+update_policy_cpu().
+
+But the kobj is still tied to CPU3 and isn't moved to CPU2. We wouldn't create a
+link for CPU2, but would try that for CPU3 while bringing it online. Which will
+report errors as CPU3 already has kobj assigned to it.
+
+This bug got introduced with commit 42f921a, which overlooked this scenario.
+
+To fix this, lets move kobj to the new policy->cpu while bringing first CPU of a
+cluster back. Also do a WARN_ON() if kobject_move failed, as we would reach here
+only for the first CPU of a non-boot cluster. And we can't recover from this
+situation, if kobject_move() fails.
+
+Fixes: 42f921a6f10c (cpufreq: remove sysfs files for CPUs which failed to come back after resume)
+	Cc:  3.13+ <stable@vger.kernel.org> # 3.13+
+Reported-and-tested-by: Bu Yitian <ybu@qti.qualcomm.com>
+	Reported-by: Saravana Kannan <skannan@codeaurora.org>
+	Reviewed-by: Srivatsa S. Bhat <srivatsa@mit.edu>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 92c14bd9477a20a83144f08c0ca25b0308bf0730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index a029f5bcbc1e,6f024852c6fb..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -975,23 -1135,33 +975,38 @@@ static int cpufreq_add_dev(struct devic
+  	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+  #endif
+  
+ -	/*
+ -	 * Restore the saved policy when doing light-weight init and fall back
+ -	 * to the full init if that fails.
+ -	 */
+ -	policy = recover_policy ? cpufreq_policy_restore(cpu) : NULL;
+ -	if (!policy) {
+ -		recover_policy = false;
+ -		policy = cpufreq_policy_alloc();
+ -		if (!policy)
+ -			goto nomem_out;
+ -	}
+ +	policy = kzalloc(sizeof(struct cpufreq_policy), GFP_KERNEL);
+ +	if (!policy)
+ +		goto nomem_out;
+  
+++<<<<<<< HEAD
+ +	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
+ +		goto err_free_policy;
+++=======
++ 	/*
++ 	 * In the resume path, since we restore a saved policy, the assignment
++ 	 * to policy->cpu is like an update of the existing policy, rather than
++ 	 * the creation of a brand new one. So we need to perform this update
++ 	 * by invoking update_policy_cpu().
++ 	 */
++ 	if (recover_policy && cpu != policy->cpu) {
++ 		update_policy_cpu(policy, cpu);
++ 		WARN_ON(kobject_move(&policy->kobj, &dev->kobj));
++ 	} else {
++ 		policy->cpu = cpu;
++ 	}
+++>>>>>>> 92c14bd9477a (cpufreq: move policy kobj to policy->cpu at resume)
+ +
+ +	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
+ +		goto err_free_cpumask;
+  
+ +	policy->cpu = cpu;
+ +	policy->governor = CPUFREQ_DEFAULT_GOVERNOR;
+  	cpumask_copy(policy->cpus, cpumask_of(cpu));
+  
+ +	/* Initially set CPU itself as the policy_cpu */
+ +	per_cpu(cpufreq_policy_cpu, cpu) = cpu;
+ +
+  	init_completion(&policy->kobj_unregister);
+  	INIT_WORK(&policy->update, handle_update);
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
