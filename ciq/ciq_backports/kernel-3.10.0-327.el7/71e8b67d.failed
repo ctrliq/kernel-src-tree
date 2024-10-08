@@ -1,0 +1,159 @@
+fib_trie: Update last spot w/ idx >> n->bits code and explanation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 71e8b67d0fdd2fe22a657bb98716c5cf0e31e828
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/71e8b67d.failed
+
+This change updates the fib_table_lookup function so that it is in sync
+with the fib_find_node function in terms of the explanation for the index
+check based on the bits value.
+
+I have also updated it from doing a mask to just doing a compare as I have
+found that seems to provide more options to the compiler as I have seen it
+turn this into a shift of the value and test under some circumstances.
+
+In addition I addressed one minor issue in which we kept computing the key
+^ n->key when checking the fib aliases.  I pulled the xor out of the loop
+in order to reduce the number of memory reads in the lookup.  As a result
+we should save a couple cycles since the xor is only done once much earlier
+in the lookup.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 71e8b67d0fdd2fe22a657bb98716c5cf0e31e828)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 3fe26090641a,08676c56efc3..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1301,7 -1200,8 +1301,12 @@@ int fib_table_lookup(struct fib_table *
+  #endif
+  	const t_key key = ntohl(flp->daddr);
+  	struct tnode *n, *pn;
+++<<<<<<< HEAD
+ +	struct leaf_info *li;
+++=======
++ 	struct fib_alias *fa;
++ 	unsigned long index;
+++>>>>>>> 71e8b67d0fdd (fib_trie: Update last spot w/ idx >> n->bits code and explanation)
+  	t_key cindex;
+  
+  	n = rcu_dereference(t->trie);
+@@@ -1403,62 -1307,60 +1412,80 @@@ backtrace
+  	}
+  
+  found:
++ 	/* this line carries forward the xor from earlier in the function */
++ 	index = key ^ n->key;
++ 
+  	/* Step 3: Process the leaf, if that fails fall back to backtracing */
+ -	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
+ -		struct fib_info *fi = fa->fa_info;
+ -		int nhsel, err;
+ +	hlist_for_each_entry_rcu(li, &n->list, hlist) {
+ +		struct fib_alias *fa;
+  
+++<<<<<<< HEAD
+ +		if ((key ^ n->key) & li->mask_plen)
+ +			continue;
+ +
+ +		list_for_each_entry_rcu(fa, &li->falh, fa_list) {
+ +			struct fib_info *fi = fa->fa_info;
+ +			int nhsel, err;
+ +
+ +			if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
+ +				continue;
+ +			if (fi->fib_dead)
+ +				continue;
+ +			if (fa->fa_info->fib_scope < flp->flowi4_scope)
+ +				continue;
+ +			fib_alias_accessed(fa);
+ +			err = fib_props[fa->fa_type].error;
+ +			if (unlikely(err < 0)) {
+++=======
++ 		if ((index >= (1ul << fa->fa_slen)) &&
++ 		    ((BITS_PER_LONG > KEYLENGTH) || (fa->fa_slen != KEYLENGTH)))
++ 			continue;
++ 		if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
++ 			continue;
++ 		if (fi->fib_dead)
++ 			continue;
++ 		if (fa->fa_info->fib_scope < flp->flowi4_scope)
++ 			continue;
++ 		fib_alias_accessed(fa);
++ 		err = fib_props[fa->fa_type].error;
++ 		if (unlikely(err < 0)) {
+++>>>>>>> 71e8b67d0fdd (fib_trie: Update last spot w/ idx >> n->bits code and explanation)
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+ -			this_cpu_inc(stats->semantic_match_passed);
+ +				this_cpu_inc(stats->semantic_match_passed);
+  #endif
+ -			return err;
+ -		}
+ -		if (fi->fib_flags & RTNH_F_DEAD)
+ -			continue;
+ -		for (nhsel = 0; nhsel < fi->fib_nhs; nhsel++) {
+ -			const struct fib_nh *nh = &fi->fib_nh[nhsel];
+ -
+ -			if (nh->nh_flags & RTNH_F_DEAD)
+ -				continue;
+ -			if (flp->flowi4_oif && flp->flowi4_oif != nh->nh_oif)
+ +				return err;
+ +			}
+ +			if (fi->fib_flags & RTNH_F_DEAD)
+  				continue;
+ -
+ -			if (!(fib_flags & FIB_LOOKUP_NOREF))
+ -				atomic_inc(&fi->fib_clntref);
+ -
+ -			res->prefixlen = KEYLENGTH - fa->fa_slen;
+ -			res->nh_sel = nhsel;
+ -			res->type = fa->fa_type;
+ -			res->scope = fi->fib_scope;
+ -			res->fi = fi;
+ -			res->table = tb;
+ -			res->fa_head = &n->leaf;
+ +			for (nhsel = 0; nhsel < fi->fib_nhs; nhsel++) {
+ +				const struct fib_nh *nh = &fi->fib_nh[nhsel];
+ +
+ +				if (nh->nh_flags & RTNH_F_DEAD)
+ +					continue;
+ +				if (flp->flowi4_oif && flp->flowi4_oif != nh->nh_oif)
+ +					continue;
+ +
+ +				if (!(fib_flags & FIB_LOOKUP_NOREF))
+ +					atomic_inc(&fi->fib_clntref);
+ +
+ +				res->prefixlen = li->plen;
+ +				res->nh_sel = nhsel;
+ +				res->type = fa->fa_type;
+ +				res->scope = fi->fib_scope;
+ +				res->fi = fi;
+ +				res->table = tb;
+ +				res->fa_head = &li->falh;
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+ -			this_cpu_inc(stats->semantic_match_passed);
+ +				this_cpu_inc(stats->semantic_match_passed);
+  #endif
+ -			return err;
+ +				return err;
+ +			}
+  		}
+ -	}
+ +
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+ -	this_cpu_inc(stats->semantic_match_miss);
+ +		this_cpu_inc(stats->semantic_match_miss);
+  #endif
+ +	}
+  	goto backtrace;
+  }
+  EXPORT_SYMBOL_GPL(fib_table_lookup);
+* Unmerged path net/ipv4/fib_trie.c
