@@ -1,0 +1,241 @@
+KVM: x86: Add a common TSC scaling function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haozhong Zhang <haozhong.zhang@intel.com>
+commit 35181e86df97e4223f4a28fb33e2bcf3b73de141
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/35181e86.failed
+
+VMX and SVM calculate the TSC scaling ratio in a similar logic, so this
+patch generalizes it to a common TSC scaling function.
+
+	Signed-off-by: Haozhong Zhang <haozhong.zhang@intel.com>
+[Inline the multiplication and shift steps into mul_u64_u64_shr.  Remove
+ BUG_ON.  - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 35181e86df97e4223f4a28fb33e2bcf3b73de141)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/x86.c
+#	include/linux/kvm_host.h
+diff --cc arch/x86/kvm/svm.c
+index f4d872b9eba6,65f4f1947a62..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -970,35 -957,8 +955,38 @@@ static void init_sys_seg(struct vmcb_se
+  	seg->base = 0;
+  }
+  
+++<<<<<<< HEAD
+ +static u64 __scale_tsc(u64 ratio, u64 tsc)
+ +{
+ +	u64 mult, frac, _tsc;
+ +
+ +	mult  = ratio >> 32;
+ +	frac  = ratio & ((1ULL << 32) - 1);
+ +
+ +	_tsc  = tsc;
+ +	_tsc *= mult;
+ +	_tsc += (tsc >> 32) * frac;
+ +	_tsc += ((tsc & ((1ULL << 32) - 1)) * frac) >> 32;
+ +
+ +	return _tsc;
+ +}
+ +
+ +static u64 svm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	u64 _tsc = tsc;
+ +
+ +	if (svm->tsc_ratio != TSC_RATIO_DEFAULT)
+ +		_tsc = __scale_tsc(svm->tsc_ratio, tsc);
+ +
+ +	return _tsc;
+ +}
+ +
+++=======
+++>>>>>>> 35181e86df97 (KVM: x86: Add a common TSC scaling function)
+  static void svm_set_tsc_khz(struct kvm_vcpu *vcpu, u32 user_tsc_khz, bool scale)
+  {
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+  	u64 ratio;
+  	u64 khz;
+  
+@@@ -1063,9 -1023,9 +1051,9 @@@ static void svm_adjust_tsc_offset(struc
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+  	if (host) {
+ -		if (vcpu->arch.tsc_scaling_ratio != TSC_RATIO_DEFAULT)
+ +		if (svm->tsc_ratio != TSC_RATIO_DEFAULT)
+  			WARN_ON(adjustment < 0);
+- 		adjustment = svm_scale_tsc(vcpu, (u64)adjustment);
++ 		adjustment = kvm_scale_tsc(vcpu, (u64)adjustment);
+  	}
+  
+  	svm->vmcb->control.tsc_offset += adjustment;
+@@@ -1083,7 -1043,7 +1071,11 @@@ static u64 svm_compute_tsc_offset(struc
+  {
+  	u64 tsc;
+  
+++<<<<<<< HEAD
+ +	tsc = svm_scale_tsc(vcpu, native_read_tsc());
+++=======
++ 	tsc = kvm_scale_tsc(vcpu, rdtsc());
+++>>>>>>> 35181e86df97 (KVM: x86: Add a common TSC scaling function)
+  
+  	return target_tsc - tsc;
+  }
+@@@ -3073,7 -3045,7 +3065,11 @@@ static int svm_get_msr(struct kvm_vcpu 
+  	switch (msr_info->index) {
+  	case MSR_IA32_TSC: {
+  		msr_info->data = svm->vmcb->control.tsc_offset +
+++<<<<<<< HEAD
+ +			svm_scale_tsc(vcpu, native_read_tsc());
+++=======
++ 			kvm_scale_tsc(vcpu, rdtsc());
+++>>>>>>> 35181e86df97 (KVM: x86: Add a common TSC scaling function)
+  
+  		break;
+  	}
+diff --cc arch/x86/kvm/x86.c
+index 24f418aad1ea,1473e64cb744..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7754,6 -7398,20 +7781,23 @@@ int kvm_arch_hardware_setup(void
+  	if (r != 0)
+  		return r;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (kvm_has_tsc_control) {
++ 		/*
++ 		 * Make sure the user can only configure tsc_khz values that
++ 		 * fit into a signed integer.
++ 		 * A min value is not calculated needed because it will always
++ 		 * be 1 on all machines.
++ 		 */
++ 		u64 max = min(0x7fffffffULL,
++ 			      __scale_tsc(kvm_max_tsc_scaling_ratio, tsc_khz));
++ 		kvm_max_guest_tsc_khz = max;
++ 
++ 		kvm_default_tsc_scaling_ratio = 1ULL << kvm_tsc_scaling_ratio_frac_bits;
++ 	}
++ 
+++>>>>>>> 35181e86df97 (KVM: x86: Add a common TSC scaling function)
+  	kvm_init_msr_list();
+  	return 0;
+  }
+diff --cc include/linux/kvm_host.h
+index fa2bee22c9da,5706a2108f0a..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -1097,5 -1172,16 +1097,20 @@@ static inline void kvm_vcpu_set_dy_elig
+  {
+  }
+  #endif /* CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT */
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_HAVE_KVM_IRQ_BYPASS
++ int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *,
++ 			   struct irq_bypass_producer *);
++ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *,
++ 			   struct irq_bypass_producer *);
++ void kvm_arch_irq_bypass_stop(struct irq_bypass_consumer *);
++ void kvm_arch_irq_bypass_start(struct irq_bypass_consumer *);
++ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
++ 				  uint32_t guest_irq, bool set);
++ #endif /* CONFIG_HAVE_KVM_IRQ_BYPASS */
++ 
+++>>>>>>> 35181e86df97 (KVM: x86: Add a common TSC scaling function)
+  #endif
+ +
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c40aad26d942..540e6759b623 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1172,6 +1172,8 @@ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+ void kvm_define_shared_msr(unsigned index, u32 msr);
+ int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
+ 
++u64 kvm_scale_tsc(struct kvm_vcpu *vcpu, u64 tsc);
++
+ unsigned long kvm_get_linear_rip(struct kvm_vcpu *vcpu);
+ bool kvm_is_linear_rip(struct kvm_vcpu *vcpu, unsigned long linear_rip);
+ 
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/linux/kvm_host.h
+diff --git a/include/linux/math64.h b/include/linux/math64.h
+index c45c089bfdac..44282ec7b682 100644
+--- a/include/linux/math64.h
++++ b/include/linux/math64.h
+@@ -142,6 +142,13 @@ static inline u64 mul_u64_u32_shr(u64 a, u32 mul, unsigned int shift)
+ }
+ #endif /* mul_u64_u32_shr */
+ 
++#ifndef mul_u64_u64_shr
++static inline u64 mul_u64_u64_shr(u64 a, u64 mul, unsigned int shift)
++{
++	return (u64)(((unsigned __int128)a * mul) >> shift);
++}
++#endif /* mul_u64_u64_shr */
++
+ #else
+ 
+ #ifndef mul_u64_u32_shr
+@@ -161,6 +168,50 @@ static inline u64 mul_u64_u32_shr(u64 a, u32 mul, unsigned int shift)
+ }
+ #endif /* mul_u64_u32_shr */
+ 
++#ifndef mul_u64_u64_shr
++static inline u64 mul_u64_u64_shr(u64 a, u64 b, unsigned int shift)
++{
++	union {
++		u64 ll;
++		struct {
++#ifdef __BIG_ENDIAN
++			u32 high, low;
++#else
++			u32 low, high;
++#endif
++		} l;
++	} rl, rm, rn, rh, a0, b0;
++	u64 c;
++
++	a0.ll = a;
++	b0.ll = b;
++
++	rl.ll = (u64)a0.l.low * b0.l.low;
++	rm.ll = (u64)a0.l.low * b0.l.high;
++	rn.ll = (u64)a0.l.high * b0.l.low;
++	rh.ll = (u64)a0.l.high * b0.l.high;
++
++	/*
++	 * Each of these lines computes a 64-bit intermediate result into "c",
++	 * starting at bits 32-95.  The low 32-bits go into the result of the
++	 * multiplication, the high 32-bits are carried into the next step.
++	 */
++	rl.l.high = c = (u64)rl.l.high + rm.l.low + rn.l.low;
++	rh.l.low = c = (c >> 32) + rm.l.high + rn.l.high + rh.l.low;
++	rh.l.high = (c >> 32) + rh.l.high;
++
++	/*
++	 * The 128-bit result of the multiplication is in rl.ll and rh.ll,
++	 * shift it right and throw away the high part of the result.
++	 */
++	if (shift == 0)
++		return rl.ll;
++	if (shift < 64)
++		return (rl.ll >> shift) | (rh.ll << (64 - shift));
++	return rh.ll >> (shift & 63);
++}
++#endif /* mul_u64_u64_shr */
++
+ #endif
+ 
+ #endif /* _LINUX_MATH64_H */
