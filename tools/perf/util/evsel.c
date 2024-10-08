@@ -680,6 +680,9 @@ void perf_evsel__config(struct perf_evsel *evsel,
 	attr->mmap  = track;
 	attr->comm  = track;
 
+	if (opts->sample_transaction)
+		attr->sample_type	|= PERF_SAMPLE_TRANSACTION;
+
 	/*
 	 * XXX see the function comment above
 	 *
@@ -1466,6 +1469,12 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 	if (type & PERF_SAMPLE_DATA_SRC) {
 		OVERFLOW_CHECK_u64(array);
 		data->data_src = *array;
+		array++;
+	}
+
+	data->transaction = 0;
+	if (type & PERF_SAMPLE_TRANSACTION) {
+		data->transaction = *array;
 		array++;
 	}
 
