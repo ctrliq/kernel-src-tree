@@ -1,0 +1,138 @@
+nfs: disallow duplicate pages in pgio page vectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit bba5c1887a925a9945d22217d38d58d8b3ba1043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/bba5c188.failed
+
+Adjacent requests that share the same page are allowed, but should only
+use one entry in the page vector. This avoids overruning the page
+vector - it is sized based on how many bytes there are, not by
+request count.
+
+This fixes issues that manifest as "Redzone overwritten" bugs (the
+vector overrun) and hangs waiting on page read / write, as it waits on
+the same page more than once.
+
+This also adds bounds checking to the page vector with a graceful failure
+(WARN_ON_ONCE and pgio error returned to application).
+
+	Reported-by: Toralf Förster <toralf.foerster@gmx.de>
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit bba5c1887a925a9945d22217d38d58d8b3ba1043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 3e37cab99ceb,a1d1de7b97c5..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -340,6 -691,99 +340,102 @@@ void nfs_pageio_init(struct nfs_pageio_
+  }
+  EXPORT_SYMBOL_GPL(nfs_pageio_init);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * nfs_pgio_result - Basic pageio error handling
++  * @task: The task that ran
++  * @calldata: Pageio header to check
++  */
++ static void nfs_pgio_result(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_header *hdr = calldata;
++ 	struct inode *inode = hdr->inode;
++ 
++ 	dprintk("NFS: %s: %5u, (status %d)\n", __func__,
++ 		task->tk_pid, task->tk_status);
++ 
++ 	if (hdr->rw_ops->rw_done(task, hdr, inode) != 0)
++ 		return;
++ 	if (task->tk_status < 0)
++ 		nfs_set_pgio_error(hdr, task->tk_status, hdr->args.offset);
++ 	else
++ 		hdr->rw_ops->rw_result(task, hdr);
++ }
++ 
++ /*
++  * Create an RPC task for the given read or write request and kick it.
++  * The page must have been locked by the caller.
++  *
++  * It may happen that the page we're passed is not marked dirty.
++  * This is the case if nfs_updatepage detects a conflicting request
++  * that has been written but not committed.
++  */
++ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
++ 		     struct nfs_pgio_header *hdr)
++ {
++ 	struct nfs_page		*req;
++ 	struct page		**pages,
++ 				*last_page;
++ 	struct list_head *head = &desc->pg_list;
++ 	struct nfs_commit_info cinfo;
++ 	unsigned int pagecount, pageused;
++ 
++ 	pagecount = nfs_page_array_len(desc->pg_base, desc->pg_count);
++ 	if (!nfs_pgarray_set(&hdr->page_array, pagecount))
++ 		return nfs_pgio_error(desc, hdr);
++ 
++ 	nfs_init_cinfo(&cinfo, desc->pg_inode, desc->pg_dreq);
++ 	pages = hdr->page_array.pagevec;
++ 	last_page = NULL;
++ 	pageused = 0;
++ 	while (!list_empty(head)) {
++ 		req = nfs_list_entry(head->next);
++ 		nfs_list_remove_request(req);
++ 		nfs_list_add_request(req, &hdr->pages);
++ 
++ 		if (WARN_ON_ONCE(pageused >= pagecount))
++ 			return nfs_pgio_error(desc, hdr);
++ 
++ 		if (!last_page || last_page != req->wb_page) {
++ 			*pages++ = last_page = req->wb_page;
++ 			pageused++;
++ 		}
++ 	}
++ 	if (WARN_ON_ONCE(pageused != pagecount))
++ 		return nfs_pgio_error(desc, hdr);
++ 
++ 	if ((desc->pg_ioflags & FLUSH_COND_STABLE) &&
++ 	    (desc->pg_moreio || nfs_reqs_to_commit(&cinfo)))
++ 		desc->pg_ioflags &= ~FLUSH_COND_STABLE;
++ 
++ 	/* Set up the argument struct */
++ 	nfs_pgio_rpcsetup(hdr, desc->pg_count, 0, desc->pg_ioflags, &cinfo);
++ 	desc->pg_rpc_callops = &nfs_pgio_common_ops;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nfs_generic_pgio);
++ 
++ static int nfs_generic_pg_pgios(struct nfs_pageio_descriptor *desc)
++ {
++ 	struct nfs_pgio_header *hdr;
++ 	int ret;
++ 
++ 	hdr = nfs_pgio_header_alloc(desc->pg_rw_ops);
++ 	if (!hdr) {
++ 		desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 		return -ENOMEM;
++ 	}
++ 	nfs_pgheader_init(desc, hdr, nfs_pgio_header_free);
++ 	ret = nfs_generic_pgio(desc, hdr);
++ 	if (ret == 0)
++ 		ret = nfs_initiate_pgio(NFS_CLIENT(hdr->inode),
++ 					hdr, desc->pg_rpc_callops,
++ 					desc->pg_ioflags, 0);
++ 	return ret;
++ }
++ 
+++>>>>>>> bba5c1887a92 (nfs: disallow duplicate pages in pgio page vectors)
+  static bool nfs_match_open_context(const struct nfs_open_context *ctx1,
+  		const struct nfs_open_context *ctx2)
+  {
+* Unmerged path fs/nfs/pagelist.c
