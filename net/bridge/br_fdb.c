@@ -239,6 +239,8 @@ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr)
 	struct net_port_vlans *pv;
 	u16 vid = 0;
 
+	spin_lock_bh(&br->hash_lock);
+
 	/* If old entry was unassociated with any port, then delete it. */
 	f = __br_fdb_get(br, br->dev->dev_addr, 0);
 	if (f && f->is_local && !f->dst)
@@ -252,7 +254,7 @@ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr)
 	 */
 	pv = br_get_vlan_info(br);
 	if (!pv)
-		return;
+		goto out;
 
 	for_each_set_bit_from(vid, pv->vlan_bitmap, VLAN_N_VID) {
 		f = __br_fdb_get(br, br->dev->dev_addr, vid);
@@ -260,6 +262,8 @@ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr)
 			fdb_delete_local(br, NULL, f);
 		fdb_insert(br, NULL, newaddr, vid);
 	}
+out:
+	spin_unlock_bh(&br->hash_lock);
 }
 
 void br_fdb_cleanup(unsigned long _data)
