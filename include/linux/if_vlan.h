@@ -334,13 +334,11 @@ static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb,
  *
  * Puts the VLAN TCI in @skb->vlan_tci and lets the device do the rest
  */
-static inline struct sk_buff *__vlan_hwaccel_put_tag(struct sk_buff *skb,
-						     __be16 vlan_proto,
-						     u16 vlan_tci)
+static inline void __vlan_hwaccel_put_tag(struct sk_buff *skb,
+					  __be16 vlan_proto, u16 vlan_tci)
 {
 	skb->vlan_proto = vlan_proto;
 	skb->vlan_tci = VLAN_TAG_PRESENT | vlan_tci;
-	return skb;
 }
 
 #define HAVE_VLAN_PUT_TAG
@@ -357,7 +355,8 @@ static inline struct sk_buff *vlan_put_tag(struct sk_buff *skb,
 					   __be16 vlan_proto, u16 vlan_tci)
 {
 	if (vlan_hw_offload_capable(skb->dev->features, vlan_proto)) {
-		return __vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
+		__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
+		return skb;
 	} else {
 		return __vlan_put_tag(skb, vlan_proto, vlan_tci);
 	}
