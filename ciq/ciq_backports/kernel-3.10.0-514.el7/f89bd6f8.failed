@@ -1,0 +1,403 @@
+rhashtable: Supports for nulls marker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Thomas Graf <tgraf@suug.ch>
+commit f89bd6f87a53ce5a7d60662429591ebac2745c10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f89bd6f8.failed
+
+In order to allow for wider usage of rhashtable, use a special nulls
+marker to terminate each chain. The reason for not using the existing
+nulls_list is that the prev pointer usage would not be valid as entries
+can be linked in two different buckets at the same time.
+
+The 4 nulls base bits can be set through the rhashtable_params structure
+like this:
+
+struct rhashtable_params params = {
+        [...]
+        .nulls_base = (1U << RHT_BASE_SHIFT),
+};
+
+This reduces the hash length from 32 bits to 27 bits.
+
+	Signed-off-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f89bd6f87a53ce5a7d60662429591ebac2745c10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rhashtable.h
+#	lib/rhashtable.c
+diff --cc include/linux/rhashtable.h
+index 0839d7b8cd60,de7cac753b09..000000000000
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@@ -18,16 -18,43 +18,50 @@@
+  #ifndef _LINUX_RHASHTABLE_H
+  #define _LINUX_RHASHTABLE_H
+  
+++<<<<<<< HEAD
+ +#include <linux/rculist.h>
+++=======
++ #include <linux/list_nulls.h>
++ #include <linux/workqueue.h>
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
++ 
++ /*
++  * The end of the chain is marked with a special nulls marks which has
++  * the following format:
++  *
++  * +-------+-----------------------------------------------------+-+
++  * | Base  |                      Hash                           |1|
++  * +-------+-----------------------------------------------------+-+
++  *
++  * Base (4 bits) : Reserved to distinguish between multiple tables.
++  *                 Specified via &struct rhashtable_params.nulls_base.
++  * Hash (27 bits): Full hash (unmasked) of first element added to bucket
++  * 1 (1 bit)     : Nulls marker (always set)
++  *
++  * The remaining bits of the next pointer remain unused for now.
++  */
++ #define RHT_BASE_BITS		4
++ #define RHT_HASH_BITS		27
++ #define RHT_BASE_SHIFT		RHT_HASH_BITS
+  
+  struct rhash_head {
+  	struct rhash_head __rcu		*next;
+  };
+  
+++<<<<<<< HEAD
+ +#define INIT_HASH_HEAD(ptr) ((ptr)->next = NULL)
+ +
+++=======
++ /**
++  * struct bucket_table - Table of hash buckets
++  * @size: Number of hash buckets
++  * @locks_mask: Mask to apply before accessing locks[]
++  * @locks: Array of spinlocks protecting individual buckets
++  * @buckets: size * hash buckets
++  */
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  struct bucket_table {
+  	size_t				size;
+ -	unsigned int			locks_mask;
+ -	spinlock_t			*locks;
+  	struct rhash_head __rcu		*buckets[];
+  };
+  
+@@@ -45,6 -72,8 +79,11 @@@ struct rhashtable
+   * @hash_rnd: Seed to use while hashing
+   * @max_shift: Maximum number of shifts while expanding
+   * @min_shift: Minimum number of shifts while shrinking
+++<<<<<<< HEAD
+++=======
++  * @nulls_base: Base value to generate nulls marker
++  * @locks_mul: Number of bucket locks to allocate per cpu (default: 128)
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+   * @hashfn: Function to hash key
+   * @obj_hashfn: Function to hash object
+   * @grow_decision: If defined, may return true if table should expand
+@@@ -59,6 -87,8 +98,11 @@@ struct rhashtable_params 
+  	u32			hash_rnd;
+  	size_t			max_shift;
+  	size_t			min_shift;
+++<<<<<<< HEAD
+++=======
++ 	u32			nulls_base;
++ 	size_t			locks_mul;
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  	rht_hashfn_t		hashfn;
+  	rht_obj_hashfn_t	obj_hashfn;
+  	bool			(*grow_decision)(const struct rhashtable *ht,
+@@@ -77,16 -107,41 +121,34 @@@
+   */
+  struct rhashtable {
+  	struct bucket_table __rcu	*tbl;
+ -	struct bucket_table __rcu       *future_tbl;
+ -	atomic_t			nelems;
+ +	size_t				nelems;
+  	size_t				shift;
+  	struct rhashtable_params	p;
+ -	struct delayed_work             run_work;
+ -	struct mutex                    mutex;
+ -	bool                            being_destroyed;
+  };
+  
++ static inline unsigned long rht_marker(const struct rhashtable *ht, u32 hash)
++ {
++ 	return NULLS_MARKER(ht->p.nulls_base + hash);
++ }
++ 
++ #define INIT_RHT_NULLS_HEAD(ptr, ht, hash) \
++ 	((ptr) = (typeof(ptr)) rht_marker(ht, hash))
++ 
++ static inline bool rht_is_a_nulls(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr & 1);
++ }
++ 
++ static inline unsigned long rht_get_nulls_value(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr) >> 1;
++ }
++ 
+  #ifdef CONFIG_PROVE_LOCKING
+ -int lockdep_rht_mutex_is_held(struct rhashtable *ht);
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht);
+  int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash);
+  #else
+ -static inline int lockdep_rht_mutex_is_held(struct rhashtable *ht)
+ +static inline int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+  	return 1;
+  }
+diff --cc lib/rhashtable.c
+index be20e9720492,cbad192d3b3d..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -26,13 -26,37 +26,38 @@@
+  
+  #define HASH_DEFAULT_SIZE	64UL
+  #define HASH_MIN_SIZE		4UL
+++<<<<<<< HEAD
+++=======
++ #define BUCKET_LOCKS_PER_CPU   128UL
++ 
++ /* Base bits plus 1 bit for nulls marker */
++ #define HASH_RESERVED_SPACE	(RHT_BASE_BITS + 1)
++ 
++ enum {
++ 	RHT_LOCK_NORMAL,
++ 	RHT_LOCK_NESTED,
++ 	RHT_LOCK_NESTED2,
++ };
++ 
++ /* The bucket lock is selected based on the hash and protects mutations
++  * on a group of hash buckets.
++  *
++  * IMPORTANT: When holding the bucket lock of both the old and new table
++  * during expansions and shrinking, the old bucket lock must always be
++  * acquired first.
++  */
++ static spinlock_t *bucket_lock(const struct bucket_table *tbl, u32 hash)
++ {
++ 	return &tbl->locks[hash & tbl->locks_mask];
++ }
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  
+  #define ASSERT_RHT_MUTEX(HT) BUG_ON(!lockdep_rht_mutex_is_held(HT))
+ -#define ASSERT_BUCKET_LOCK(TBL, HASH) \
+ -	BUG_ON(!lockdep_rht_bucket_is_held(TBL, HASH))
+  
+  #ifdef CONFIG_PROVE_LOCKING
+ -int lockdep_rht_mutex_is_held(struct rhashtable *ht)
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+ -	return (debug_locks) ? lockdep_is_held(&ht->mutex) : 1;
+ +	return ht->p.mutex_is_held();
+  }
+  EXPORT_SYMBOL_GPL(lockdep_rht_mutex_is_held);
+  
+@@@ -63,10 -89,10 +88,10 @@@ static u32 obj_raw_hashfn(const struct 
+  		hash = ht->p.hashfn(ptr + ht->p.key_offset, ht->p.key_len,
+  				    ht->p.hash_rnd);
+  
+- 	return hash;
++ 	return hash >> HASH_RESERVED_SPACE;
+  }
+  
+ -static u32 key_hashfn(struct rhashtable *ht, const void *key, u32 len)
+ +static u32 key_hashfn(const struct rhashtable *ht, const void *key, u32 len)
+  {
+  	struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
+  	u32 hash;
+@@@ -110,6 -180,14 +137,17 @@@ static struct bucket_table *bucket_tabl
+  
+  	tbl->size = nbuckets;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (alloc_bucket_locks(ht, tbl) < 0) {
++ 		bucket_table_free(tbl);
++ 		return NULL;
++ 	}
++ 
++ 	for (i = 0; i < nbuckets; i++)
++ 		INIT_RHT_NULLS_HEAD(tbl->buckets[i], ht, i);
++ 
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  	return tbl;
+  }
+  
+@@@ -144,16 -217,24 +182,22 @@@ EXPORT_SYMBOL_GPL(rht_shrink_below_30)
+  
+  static void hashtable_chain_unzip(const struct rhashtable *ht,
+  				  const struct bucket_table *new_tbl,
+ -				  struct bucket_table *old_tbl,
+ -				  size_t old_hash)
+ +				  struct bucket_table *old_tbl, size_t n)
+  {
+  	struct rhash_head *he, *p, *next;
+ -	spinlock_t *new_bucket_lock, *new_bucket_lock2 = NULL;
+ -	unsigned int new_hash, new_hash2;
+ -
+ -	ASSERT_BUCKET_LOCK(old_tbl, old_hash);
+ +	unsigned int h;
+  
+  	/* Old bucket empty, no work needed. */
+++<<<<<<< HEAD
+ +	p = rht_dereference(old_tbl->buckets[n], ht);
+ +	if (!p)
+++=======
++ 	p = rht_dereference_bucket(old_tbl->buckets[old_hash], old_tbl,
++ 				   old_hash);
++ 	if (rht_is_a_nulls(p))
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  		return;
+  
+ -	new_hash = new_hash2 = head_hashfn(ht, new_tbl, p);
+ -	new_bucket_lock = bucket_lock(new_tbl, new_hash);
+ -
+  	/* Advance the old bucket pointer one or more times until it
+  	 * reaches a node that doesn't hash to the same bucket as the
+  	 * previous node p. Call the previous node p;
+@@@ -169,10 -260,10 +213,17 @@@
+  	/* Find the subsequent node which does hash to the same
+  	 * bucket as node P, or NULL if no such node exists.
+  	 */
+++<<<<<<< HEAD
+ +	next = NULL;
+ +	if (he) {
+ +		rht_for_each_continue(he, he->next, old_tbl, n) {
+ +			if (head_hashfn(ht, new_tbl, he) == h) {
+++=======
++ 	INIT_RHT_NULLS_HEAD(next, ht, old_hash);
++ 	if (!rht_is_a_nulls(he)) {
++ 		rht_for_each_continue(he, he->next, old_tbl, old_hash) {
++ 			if (head_hashfn(ht, new_tbl, he) == new_hash) {
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  				next = he;
+  				break;
+  			}
+@@@ -253,12 -376,21 +304,25 @@@ int rhashtable_expand(struct rhashtabl
+  		 * table): ...
+  		 */
+  		complete = true;
+++<<<<<<< HEAD
+ +		for (i = 0; i < old_tbl->size; i++) {
+ +			hashtable_chain_unzip(ht, new_tbl, old_tbl, i);
+ +			if (old_tbl->buckets[i] != NULL)
+++=======
++ 		for (old_hash = 0; old_hash < old_tbl->size; old_hash++) {
++ 			struct rhash_head *head;
++ 
++ 			old_bucket_lock = bucket_lock(old_tbl, old_hash);
++ 			spin_lock_bh(old_bucket_lock);
++ 
++ 			hashtable_chain_unzip(ht, new_tbl, old_tbl, old_hash);
++ 			head = rht_dereference_bucket(old_tbl->buckets[old_hash],
++ 						      old_tbl, old_hash);
++ 			if (!rht_is_a_nulls(head))
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  				complete = false;
+ -
+ -			spin_unlock_bh(old_bucket_lock);
+  		}
+ -	}
+ +	} while (!complete);
+  
+  	bucket_table_free(old_tbl);
+  	return 0;
+@@@ -329,18 -509,35 +393,37 @@@ EXPORT_SYMBOL_GPL(rhashtable_shrink)
+   */
+  void rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj)
+  {
+++<<<<<<< HEAD
+ +	struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+ +	u32 hash;
+++=======
++ 	struct bucket_table *tbl;
++ 	struct rhash_head *head;
++ 	spinlock_t *lock;
++ 	unsigned hash;
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  
+ -	rcu_read_lock();
+ +	ASSERT_RHT_MUTEX(ht);
+  
+ -	tbl = rht_dereference_rcu(ht->future_tbl, ht);
+  	hash = head_hashfn(ht, tbl, obj);
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(obj->next, tbl->buckets[hash]);
+++=======
++ 	lock = bucket_lock(tbl, hash);
++ 
++ 	spin_lock_bh(lock);
++ 	head = rht_dereference_bucket(tbl->buckets[hash], tbl, hash);
++ 	if (rht_is_a_nulls(head))
++ 		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
++ 	else
++ 		RCU_INIT_POINTER(obj->next, head);
++ 
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  	rcu_assign_pointer(tbl->buckets[hash], obj);
+ -	spin_unlock_bh(lock);
+ -
+ -	atomic_inc(&ht->nelems);
+ -
+ -	/* Only grow the table if no resizing is currently in progress. */
+ -	if (ht->tbl != ht->future_tbl &&
+ -	    ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
+ -		schedule_delayed_work(&ht->run_work, 0);
+ +	ht->nelems++;
+  
+ -	rcu_read_unlock();
+ +	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
+ +		rhashtable_expand(ht);
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_insert);
+  
+@@@ -485,7 -727,7 +568,11 @@@ static size_t rounded_hashtable_size(st
+   *	.key_offset = offsetof(struct test_obj, key),
+   *	.key_len = sizeof(int),
+   *	.hashfn = jhash,
+++<<<<<<< HEAD
+ + *	.mutex_is_held = &my_mutex_is_held,
+++=======
++  *	.nulls_base = (1U << RHT_BASE_SHIFT),
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+   * };
+   *
+   * Configuration Example 2: Variable length keys
+@@@ -735,7 -996,7 +825,11 @@@ static int __init test_rht_init(void
+  		.key_offset = offsetof(struct test_obj, value),
+  		.key_len = sizeof(int),
+  		.hashfn = jhash,
+++<<<<<<< HEAD
+ +		.mutex_is_held = &test_mutex_is_held,
+++=======
++ 		.nulls_base = (3U << RHT_BASE_SHIFT),
+++>>>>>>> f89bd6f87a53 (rhashtable: Supports for nulls marker)
+  		.grow_decision = rht_grow_above_75,
+  		.shrink_decision = rht_shrink_below_30,
+  	};
+diff --git a/include/linux/list_nulls.h b/include/linux/list_nulls.h
+index 5d10ae364b5e..e8c300e06438 100644
+--- a/include/linux/list_nulls.h
++++ b/include/linux/list_nulls.h
+@@ -21,8 +21,9 @@ struct hlist_nulls_head {
+ struct hlist_nulls_node {
+ 	struct hlist_nulls_node *next, **pprev;
+ };
++#define NULLS_MARKER(value) (1UL | (((long)value) << 1))
+ #define INIT_HLIST_NULLS_HEAD(ptr, nulls) \
+-	((ptr)->first = (struct hlist_nulls_node *) (1UL | (((long)nulls) << 1)))
++	((ptr)->first = (struct hlist_nulls_node *) NULLS_MARKER(nulls))
+ 
+ #define hlist_nulls_entry(ptr, type, member) container_of(ptr,type,member)
+ /**
+* Unmerged path include/linux/rhashtable.h
+* Unmerged path lib/rhashtable.c
