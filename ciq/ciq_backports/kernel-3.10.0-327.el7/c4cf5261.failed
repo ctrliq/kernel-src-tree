@@ -1,0 +1,413 @@
+bio: skip atomic inc/dec of ->bi_remaining for non-chains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] bio: skip atomic inc_dec of ->bi_remaining for non-chains (Mike Snitzer) [1222004]
+Rebuild_FUZZ: 98.25%
+commit-author Jens Axboe <axboe@fb.com>
+commit c4cf5261f8bffd9de132b50660a69148e7575bd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c4cf5261.failed
+
+Struct bio has an atomic ref count for chained bio's, and we use this
+to know when to end IO on the bio. However, most bio's are not chained,
+so we don't need to always introduce this atomic operation as part of
+ending IO.
+
+Add a helper to elevate the bi_remaining count, and flag the bio as
+now actually needing the decrement at end_io time. Rename the field
+to __bi_remaining to catch any current users of this doing the
+incrementing manually.
+
+For high IOPS workloads, this reduces the overhead of bio_endio()
+substantially.
+
+	Tested-by: Robert Elliott <elliott@hp.com>
+	Acked-by: Kent Overstreet <kent.overstreet@gmail.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit c4cf5261f8bffd9de132b50660a69148e7575bd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+#	drivers/md/dm-snap.c
+#	drivers/md/dm-thin.c
+#	fs/bio.c
+#	include/linux/blk_types.h
+diff --cc drivers/md/dm-cache-target.c
+index 6df940c581fc,705eb7b99d69..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -86,6 -86,12 +86,15 @@@ static void dm_unhook_bio(struct dm_hoo
+  {
+  	bio->bi_end_io = h->bi_end_io;
+  	bio->bi_private = h->bi_private;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Must bump bi_remaining to allow bio to complete with
++ 	 * restored bi_end_io.
++ 	 */
++ 	bio_inc_remaining(bio);
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  }
+  
+  /*----------------------------------------------------------------*/
+diff --cc drivers/md/dm-snap.c
+index 4b4bf607855a,8bfeae218531..000000000000
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@@ -1438,6 -1478,7 +1438,10 @@@ out
+  	if (full_bio) {
+  		full_bio->bi_end_io = pe->full_bio_end_io;
+  		full_bio->bi_private = pe->full_bio_private;
+++<<<<<<< HEAD
+++=======
++ 		bio_inc_remaining(full_bio);
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  	}
+  	increment_pending_exceptions_done_count();
+  
+diff --cc drivers/md/dm-thin.c
+index f761dad02142,342dbdad6131..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -792,8 -793,10 +792,13 @@@ static void inc_remap_and_issue_cell(st
+  
+  static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
+  {
+ -	if (m->bio) {
+ +	if (m->bio)
+  		m->bio->bi_end_io = m->saved_bi_end_io;
+++<<<<<<< HEAD
+++=======
++ 		bio_inc_remaining(m->bio);
++ 	}
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  	cell_error(m->tc->pool, m->cell);
+  	list_del(&m->list);
+  	mempool_free(m, m->tc->pool->mapping_pool);
+@@@ -807,8 -810,10 +812,13 @@@ static void process_prepared_mapping(st
+  	int r;
+  
+  	bio = m->bio;
+ -	if (bio) {
+ +	if (bio)
+  		bio->bi_end_io = m->saved_bi_end_io;
+++<<<<<<< HEAD
+++=======
++ 		bio_inc_remaining(bio);
++ 	}
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  
+  	if (m->err) {
+  		cell_error(pool, m->cell);
+diff --cc fs/bio.c
+index 4329823b87b2,117da319afb6..000000000000
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@@ -273,6 -270,7 +273,10 @@@ void bio_init(struct bio *bio
+  {
+  	memset(bio, 0, sizeof(*bio));
+  	bio->bi_flags = 1 << BIO_UPTODATE;
+++<<<<<<< HEAD:fs/bio.c
+++=======
++ 	atomic_set(&bio->__bi_remaining, 1);
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains):block/bio.c
+  	atomic_set(&bio->bi_cnt, 1);
+  }
+  EXPORT_SYMBOL(bio_init);
+@@@ -294,10 -292,38 +298,45 @@@ void bio_reset(struct bio *bio
+  	__bio_free(bio);
+  
+  	memset(bio, 0, BIO_RESET_BYTES);
+++<<<<<<< HEAD:fs/bio.c
+ +	bio->bi_flags = flags|(1 << BIO_UPTODATE);
+ +}
+ +EXPORT_SYMBOL(bio_reset);
+ +
+++=======
++ 	bio->bi_flags = flags | (1 << BIO_UPTODATE);
++ 	atomic_set(&bio->__bi_remaining, 1);
++ }
++ EXPORT_SYMBOL(bio_reset);
++ 
++ static void bio_chain_endio(struct bio *bio, int error)
++ {
++ 	bio_endio(bio->bi_private, error);
++ 	bio_put(bio);
++ }
++ 
++ /**
++  * bio_chain - chain bio completions
++  * @bio: the target bio
++  * @parent: the @bio's parent bio
++  *
++  * The caller won't have a bi_end_io called when @bio completes - instead,
++  * @parent's bi_end_io won't be called until both @parent and @bio have
++  * completed; the chained bio will also be freed when it completes.
++  *
++  * The caller must not set bi_private or bi_end_io in @bio.
++  */
++ void bio_chain(struct bio *bio, struct bio *parent)
++ {
++ 	BUG_ON(bio->bi_private || bio->bi_end_io);
++ 
++ 	bio->bi_private = parent;
++ 	bio->bi_end_io	= bio_chain_endio;
++ 	bio_inc_remaining(parent);
++ }
++ EXPORT_SYMBOL(bio_chain);
++ 
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains):block/bio.c
+  static void bio_alloc_rescue(struct work_struct *work)
+  {
+  	struct bio_set *bs = container_of(work, struct bio_set, rescue_work);
+@@@ -1725,96 -1774,89 +1781,136 @@@ static inline bool bio_remaining_done(s
+   **/
+  void bio_endio(struct bio *bio, int error)
+  {
+++<<<<<<< HEAD:fs/bio.c
+ +	if (error)
+ +		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
+ +		error = -EIO;
+ +
+ +	if (bio->bi_end_io)
+ +		bio->bi_end_io(bio, error);
+++=======
++ 	while (bio) {
++ 		if (error)
++ 			clear_bit(BIO_UPTODATE, &bio->bi_flags);
++ 		else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
++ 			error = -EIO;
++ 
++ 		if (unlikely(!bio_remaining_done(bio)))
++ 			break;
++ 
++ 		/*
++ 		 * Need to have a real endio function for chained bios,
++ 		 * otherwise various corner cases will break (like stacking
++ 		 * block devices that save/restore bi_end_io) - however, we want
++ 		 * to avoid unbounded recursion and blowing the stack. Tail call
++ 		 * optimization would handle this, but compiling with frame
++ 		 * pointers also disables gcc's sibling call optimization.
++ 		 */
++ 		if (bio->bi_end_io == bio_chain_endio) {
++ 			struct bio *parent = bio->bi_private;
++ 			bio_put(bio);
++ 			bio = parent;
++ 		} else {
++ 			if (bio->bi_end_io)
++ 				bio->bi_end_io(bio, error);
++ 			bio = NULL;
++ 		}
++ 	}
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains):block/bio.c
+  }
+  EXPORT_SYMBOL(bio_endio);
+  
+ -/**
+ - * bio_endio_nodec - end I/O on a bio, without decrementing bi_remaining
+ - * @bio:	bio
+ - * @error:	error, if any
+ - *
+ - * For code that has saved and restored bi_end_io; thing hard before using this
+ - * function, probably you should've cloned the entire bio.
+ - **/
+ -void bio_endio_nodec(struct bio *bio, int error)
+ +void bio_pair_release(struct bio_pair *bp)
+  {
+++<<<<<<< HEAD:fs/bio.c
+ +	if (atomic_dec_and_test(&bp->cnt)) {
+ +		struct bio *master = bp->bio1.bi_private;
+ +
+ +		bio_endio(master, bp->error);
+ +		mempool_free(bp, bp->bio2.bi_private);
+ +	}
+++=======
++ 	/*
++ 	 * If it's not flagged as a chain, we are not going to dec the count
++ 	 */
++ 	if (bio_flagged(bio, BIO_CHAIN))
++ 		bio_inc_remaining(bio);
++ 
++ 	bio_endio(bio, error);
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains):block/bio.c
+  }
+ -EXPORT_SYMBOL(bio_endio_nodec);
+ +EXPORT_SYMBOL(bio_pair_release);
+  
+ -/**
+ - * bio_split - split a bio
+ - * @bio:	bio to split
+ - * @sectors:	number of sectors to split from the front of @bio
+ - * @gfp:	gfp mask
+ - * @bs:		bio set to allocate from
+ - *
+ - * Allocates and returns a new bio which represents @sectors from the start of
+ - * @bio, and updates @bio to represent the remaining sectors.
+ - *
+ - * The newly allocated bio will point to @bio's bi_io_vec; it is the caller's
+ - * responsibility to ensure that @bio is not freed before the split.
+ +static void bio_pair_end_1(struct bio *bi, int err)
+ +{
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio1);
+ +
+ +	if (err)
+ +		bp->error = err;
+ +
+ +	bio_pair_release(bp);
+ +}
+ +
+ +static void bio_pair_end_2(struct bio *bi, int err)
+ +{
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio2);
+ +
+ +	if (err)
+ +		bp->error = err;
+ +
+ +	bio_pair_release(bp);
+ +}
+ +
+ +/*
+ + * split a bio - only worry about a bio with a single page in its iovec
+   */
+ -struct bio *bio_split(struct bio *bio, int sectors,
+ -		      gfp_t gfp, struct bio_set *bs)
+ +struct bio_pair *bio_split(struct bio *bi, int first_sectors)
+  {
+ -	struct bio *split = NULL;
+ +	struct bio_pair *bp = mempool_alloc(bio_split_pool, GFP_NOIO);
+  
+ -	BUG_ON(sectors <= 0);
+ -	BUG_ON(sectors >= bio_sectors(bio));
+ +	if (!bp)
+ +		return bp;
+  
+ -	split = bio_clone_fast(bio, gfp, bs);
+ -	if (!split)
+ -		return NULL;
+ +	trace_block_split(bdev_get_queue(bi->bi_bdev), bi,
+ +				bi->bi_sector + first_sectors);
+  
+ -	split->bi_iter.bi_size = sectors << 9;
+ +	BUG_ON(bio_segments(bi) > 1);
+ +	atomic_set(&bp->cnt, 3);
+ +	bp->error = 0;
+ +	bp->bio1 = *bi;
+ +	bp->bio2 = *bi;
+ +	bp->bio2.bi_sector += first_sectors;
+ +	bp->bio2.bi_size -= first_sectors << 9;
+ +	bp->bio1.bi_size = first_sectors << 9;
+  
+ -	if (bio_integrity(split))
+ -		bio_integrity_trim(split, 0, sectors);
+ +	if (bi->bi_vcnt != 0) {
+ +		bp->bv1 = *bio_iovec(bi);
+ +		bp->bv2 = *bio_iovec(bi);
+  
+ -	bio_advance(bio, split->bi_iter.bi_size);
+ +		if (bio_is_rw(bi)) {
+ +			bp->bv2.bv_offset += first_sectors << 9;
+ +			bp->bv2.bv_len -= first_sectors << 9;
+ +			bp->bv1.bv_len = first_sectors << 9;
+ +		}
+ +
+ +		bp->bio1.bi_io_vec = &bp->bv1;
+ +		bp->bio2.bi_io_vec = &bp->bv2;
+  
+ -	return split;
+ +		bp->bio1.bi_max_vecs = 1;
+ +		bp->bio2.bi_max_vecs = 1;
+ +	}
+ +
+ +	bp->bio1.bi_end_io = bio_pair_end_1;
+ +	bp->bio2.bi_end_io = bio_pair_end_2;
+ +
+ +	bp->bio1.bi_private = bi;
+ +	bp->bio2.bi_private = bio_split_pool;
+ +
+ +	if (bio_integrity(bi))
+ +		bio_integrity_split(bi, bp, first_sectors);
+ +
+ +	return bp;
+  }
+  EXPORT_SYMBOL(bio_split);
+  
+diff --cc include/linux/blk_types.h
+index e231d099df27,8b07e0603887..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -59,6 -65,8 +59,11 @@@ struct bio 
+  	unsigned int		bi_seg_front_size;
+  	unsigned int		bi_seg_back_size;
+  
+++<<<<<<< HEAD
+++=======
++ 	atomic_t		__bi_remaining;
++ 
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  	bio_end_io_t		*bi_end_io;
+  
+  	void			*bi_private;
+@@@ -113,10 -120,9 +118,16 @@@
+  #define BIO_USER_MAPPED 6	/* contains user pages */
+  #define BIO_EOPNOTSUPP	7	/* not supported */
+  #define BIO_NULL_MAPPED 8	/* contains invalid user pages */
+++<<<<<<< HEAD
+ +#define BIO_FS_INTEGRITY 9	/* fs owns integrity data, not block layer */
+ +#define BIO_QUIET	10	/* Make BIO Quiet */
+ +#define BIO_MAPPED_INTEGRITY 11/* integrity metadata has been remapped */
+ +#define BIO_SNAP_STABLE	12	/* bio data must be snapshotted during write */
+++=======
++ #define BIO_QUIET	9	/* Make BIO Quiet */
++ #define BIO_SNAP_STABLE	10	/* bio data must be snapshotted during write */
++ #define BIO_CHAIN	11	/* chained bio, ->bi_remaining in effect */
+++>>>>>>> c4cf5261f8bf (bio: skip atomic inc/dec of ->bi_remaining for non-chains)
+  
+  /*
+   * Flags starting here get preserved by bio_reset() - this includes
+* Unmerged path drivers/md/dm-cache-target.c
+diff --git a/drivers/md/dm-raid1.c b/drivers/md/dm-raid1.c
+index a0a133994150..895df0a6e3d1 100644
+--- a/drivers/md/dm-raid1.c
++++ b/drivers/md/dm-raid1.c
+@@ -1254,7 +1254,7 @@ static int mirror_end_io(struct dm_target *ti, struct bio *bio, int error)
+ 			dm_bio_restore(bd, bio);
+ 			bio_record->details.bi_bdev = NULL;
+ 
+-			atomic_inc(&bio->bi_remaining);
++			bio_inc_remaining(bio);
+ 
+ 			queue_bio(ms, bio, rw);
+ 			return DM_ENDIO_INCOMPLETE;
+* Unmerged path drivers/md/dm-snap.c
+* Unmerged path drivers/md/dm-thin.c
+* Unmerged path fs/bio.c
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 2043865e1b57..ee2fe68713e0 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -523,6 +523,17 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
+ 	return bio;
+ }
+ 
++/*
++ * Increment chain count for the bio. Make sure the CHAIN flag update
++ * is visible before the raised count.
++ */
++static inline void bio_inc_remaining(struct bio *bio)
++{
++	bio->bi_flags |= (1 << BIO_CHAIN);
++	smp_mb__before_atomic();
++	atomic_inc(&bio->__bi_remaining);
++}
++
+ /*
+  * bio_set is used to allow other portions of the IO system to
+  * allocate their own private memory pools for bio and iovec structures.
+* Unmerged path include/linux/blk_types.h
