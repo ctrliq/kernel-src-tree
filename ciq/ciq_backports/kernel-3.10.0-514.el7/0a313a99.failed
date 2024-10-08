@@ -1,0 +1,146 @@
+mem-hotplug: let memblock skip the hotpluggable memory regions in __next_mem_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xishi Qiu <qiuxishi@huawei.com>
+commit 0a313a998adbae19c1309f80a3ad79107fff7c4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0a313a99.failed
+
+Let memblock skip the hotpluggable memory regions in __next_mem_range(),
+it is used to to prevent memblock from allocating hotpluggable memory
+for the kernel at early time. The code is the same as __next_mem_range_rev().
+
+Clear hotpluggable flag before releasing free pages to the buddy
+allocator.  If we don't clear hotpluggable flag in
+free_low_memory_core_early(), the memory which marked hotpluggable flag
+will not free to buddy allocator.  Because __next_mem_range() will skip
+them.
+
+free_low_memory_core_early
+	for_each_free_mem_range
+		for_each_mem_range
+			__next_mem_range
+
+[akpm@linux-foundation.org: fix warning]
+	Signed-off-by: Xishi Qiu <qiuxishi@huawei.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Tang Chen <tangchen@cn.fujitsu.com>
+	Cc: Zhang Yanfei <zhangyanfei@cn.fujitsu.com>
+	Cc: Wen Congyang <wency@cn.fujitsu.com>
+	Cc: "Rafael J. Wysocki" <rjw@sisk.pl>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Wu Fengguang <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0a313a998adbae19c1309f80a3ad79107fff7c4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memblock.c
+diff --cc mm/memblock.c
+index 4158cb85f9e7,6ecb0d937fb5..000000000000
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@@ -757,36 -792,61 +757,54 @@@ int __init_memblock memblock_clear_hotp
+   * As both region arrays are sorted, the function advances the two indices
+   * in lockstep and returns each intersection.
+   */
+ -void __init_memblock __next_mem_range(u64 *idx, int nid,
+ -				      struct memblock_type *type_a,
+ -				      struct memblock_type *type_b,
+ -				      phys_addr_t *out_start,
+ -				      phys_addr_t *out_end, int *out_nid)
+ +void __init_memblock __next_free_mem_range(u64 *idx, int nid,
+ +					   phys_addr_t *out_start,
+ +					   phys_addr_t *out_end, int *out_nid)
+  {
+ -	int idx_a = *idx & 0xffffffff;
+ -	int idx_b = *idx >> 32;
+ -
+ -	if (WARN_ONCE(nid == MAX_NUMNODES,
+ -	"Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
+ -		nid = NUMA_NO_NODE;
+ -
+ -	for (; idx_a < type_a->cnt; idx_a++) {
+ -		struct memblock_region *m = &type_a->regions[idx_a];
+ -
+ +	struct memblock_type *mem = &memblock.memory;
+ +	struct memblock_type *rsv = &memblock.reserved;
+ +	int mi = *idx & 0xffffffff;
+ +	int ri = *idx >> 32;
+ +	bool check_node = (nid != NUMA_NO_NODE) && (nid != MAX_NUMNODES);
+ +
+ +	if (nid == MAX_NUMNODES)
+ +		pr_warn_once("%s: Usage of MAX_NUMNODES is depricated. Use NUMA_NO_NODE instead\n",
+ +			     __func__);
+ +
+ +	for ( ; mi < mem->cnt; mi++) {
+ +		struct memblock_region *m = &mem->regions[mi];
+  		phys_addr_t m_start = m->base;
+  		phys_addr_t m_end = m->base + m->size;
+ -		int	    m_nid = memblock_get_region_node(m);
+  
+  		/* only memory regions are associated with nodes, check it */
+ -		if (nid != NUMA_NO_NODE && nid != m_nid)
+ +		if (check_node && nid != memblock_get_region_node(m))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		/* scan areas before each reservation for intersection */
+ +		for ( ; ri < rsv->cnt + 1; ri++) {
+ +			struct memblock_region *r = &rsv->regions[ri];
+ +			phys_addr_t r_start = ri ? r[-1].base + r[-1].size : 0;
+ +			phys_addr_t r_end = ri < rsv->cnt ? r->base : ULLONG_MAX;
+++=======
++ 		/* skip hotpluggable memory regions if needed */
++ 		if (movable_node_is_enabled() && memblock_is_hotpluggable(m))
++ 			continue;
++ 
++ 		if (!type_b) {
++ 			if (out_start)
++ 				*out_start = m_start;
++ 			if (out_end)
++ 				*out_end = m_end;
++ 			if (out_nid)
++ 				*out_nid = m_nid;
++ 			idx_a++;
++ 			*idx = (u32)idx_a | (u64)idx_b << 32;
++ 			return;
++ 		}
+++>>>>>>> 0a313a998adb (mem-hotplug: let memblock skip the hotpluggable memory regions in __next_mem_range())
+  
+ -		/* scan areas before each reservation */
+ -		for (; idx_b < type_b->cnt + 1; idx_b++) {
+ -			struct memblock_region *r;
+ -			phys_addr_t r_start;
+ -			phys_addr_t r_end;
+ -
+ -			r = &type_b->regions[idx_b];
+ -			r_start = idx_b ? r[-1].base + r[-1].size : 0;
+ -			r_end = idx_b < type_b->cnt ?
+ -				r->base : ULLONG_MAX;
+ -
+ -			/*
+ -			 * if idx_b advanced past idx_a,
+ -			 * break out to advance idx_a
+ -			 */
+ +			/* if ri advanced past mi, break out to advance mi */
+  			if (r_start >= m_end)
+  				break;
+  			/* if the two regions intersect, we're done */
+* Unmerged path mm/memblock.c
+diff --git a/mm/nobootmem.c b/mm/nobootmem.c
+index dbdd2db64f47..d8492716dd83 100644
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@ -127,6 +127,8 @@ static unsigned long __init free_low_memory_core_early(void)
+ 	phys_addr_t start, end, size;
+ 	u64 i;
+ 
++	memblock_clear_hotplug(0, -1);
++
+ 	for_each_free_mem_range(i, NUMA_NO_NODE, &start, &end, NULL)
+ 		count += __free_memory_core(start, end);
+ 
