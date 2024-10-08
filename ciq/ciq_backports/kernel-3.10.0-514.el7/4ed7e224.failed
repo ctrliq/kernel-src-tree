@@ -1,0 +1,180 @@
+drm/vmwgfx: Check pin count before attempting to move a buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] vmwgfx: Check pin count before attempting to move a buffer (Rob Clark) [1348329 1349064]
+Rebuild_FUZZ: 96.67%
+commit-author Sinclair Yeh <syeh@vmware.com>
+commit 4ed7e2242b637bc4af0416e4aa9f945db30fb44a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/4ed7e224.failed
+
+In certain scenarios, e.g. when fbdev is enabled, we can get into
+a situation where a vmw_framebuffer_pin() is called on a buffer
+that is already pinned.
+
+When this happens, ttm_bo_validate() will unintentially remove the
+TTM_PL_FLAG_NO_EVICT flag, thus unpinning it, and leaving no way
+to actually pin the buffer again.
+
+To prevent this, if a buffer is already pinned, then instead of
+calling ttm_bo_validate(), just make sure the proposed placement is
+compatible with the existing placement.
+
+	Signed-off-by: Sinclair Yeh <syeh@vmware.com>
+	Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
+	Cc: <stable@vger.kernel.org>
+---
+This is the 2nd patch in a 3-patch series to fix a console black
+screen issue on Ubuntu 16.04 server.  This fixes a BUG_ON()
+condition where a pinned buffer gets accidentally put onto the
+LRU list.
+(cherry picked from commit 4ed7e2242b637bc4af0416e4aa9f945db30fb44a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+index 914b375763dc,0cd889015dc5..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+@@@ -65,7 -61,14 +66,18 @@@ int vmw_dmabuf_to_placement(struct vmw_
+  	if (unlikely(ret != 0))
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	ret = ttm_bo_validate(bo, placement, interruptible, false);
+++=======
++ 	if (buf->pin_count > 0)
++ 		ret = ttm_bo_mem_compat(placement, &bo->mem,
++ 					&new_flags) == true ? 0 : -EINVAL;
++ 	else
++ 		ret = ttm_bo_validate(bo, placement, interruptible, false);
++ 
++ 	if (!ret)
++ 		vmw_bo_pin_reserved(buf, true);
+++>>>>>>> 4ed7e2242b63 (drm/vmwgfx: Check pin count before attempting to move a buffer)
+  
+  	ttm_bo_unreserve(bo);
+  
+@@@ -90,13 -91,13 +102,14 @@@ err
+   * Returns
+   * -ERESTARTSYS if interrupted by a signal.
+   */
+ -int vmw_dmabuf_pin_in_vram_or_gmr(struct vmw_private *dev_priv,
+ -				  struct vmw_dma_buffer *buf,
+ -				  bool interruptible)
+ +int vmw_dmabuf_to_vram_or_gmr(struct vmw_private *dev_priv,
+ +			      struct vmw_dma_buffer *buf,
+ +			      bool pin, bool interruptible)
+  {
+  	struct ttm_buffer_object *bo = &buf->base;
+ +	struct ttm_placement *placement;
+  	int ret;
++ 	uint32_t new_flags;
+  
+  	ret = ttm_write_lock(&dev_priv->reservation_sem, interruptible);
+  	if (unlikely(ret != 0))
+@@@ -109,36 -109,23 +122,47 @@@
+  	if (unlikely(ret != 0))
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	/**
+ +	 * Put BO in VRAM if there is space, otherwise as a GMR.
+ +	 * If there is no space in VRAM and GMR ids are all used up,
+ +	 * start evicting GMRs to make room. If the DMA buffer can't be
+ +	 * used as a GMR, this will return -ENOMEM.
+ +	 */
+ +
+ +	if (pin)
+ +		placement = &vmw_vram_gmr_ne_placement;
+ +	else
+ +		placement = &vmw_vram_gmr_placement;
+ +
+ +	ret = ttm_bo_validate(bo, placement, interruptible, false);
+++=======
++ 	if (buf->pin_count > 0) {
++ 		ret = ttm_bo_mem_compat(&vmw_vram_gmr_placement, &bo->mem,
++ 					&new_flags) == true ? 0 : -EINVAL;
++ 		goto out_unreserve;
++ 	}
++ 
++ 	ret = ttm_bo_validate(bo, &vmw_vram_gmr_placement, interruptible,
++ 			      false);
+++>>>>>>> 4ed7e2242b63 (drm/vmwgfx: Check pin count before attempting to move a buffer)
+  	if (likely(ret == 0) || ret == -ERESTARTSYS)
+ -		goto out_unreserve;
+ +		goto err_unreserve;
+  
+ -	ret = ttm_bo_validate(bo, &vmw_vram_placement, interruptible, false);
+  
+ -out_unreserve:
+ -	if (!ret)
+ -		vmw_bo_pin_reserved(buf, true);
+ +	/**
+ +	 * If that failed, try VRAM again, this time evicting
+ +	 * previous contents.
+ +	 */
+ +
+ +	if (pin)
+ +		placement = &vmw_vram_ne_placement;
+ +	else
+ +		placement = &vmw_vram_placement;
+  
+ +	ret = ttm_bo_validate(bo, placement, interruptible, false);
+ +
+ +err_unreserve:
+  	ttm_bo_unreserve(bo);
+  err:
+  	ttm_write_unlock(&dev_priv->reservation_sem);
+@@@ -200,13 -174,10 +224,14 @@@ int vmw_dmabuf_to_start_of_vram(struct 
+  	struct ttm_placement placement;
+  	struct ttm_place place;
+  	int ret = 0;
++ 	uint32_t new_flags;
+  
+ -	place = vmw_vram_placement.placement[0];
+ +	if (pin)
+ +		place = vmw_vram_ne_placement.placement[0];
+ +	else
+ +		place = vmw_vram_placement.placement[0];
+  	place.lpfn = bo->num_pages;
+ +
+  	placement.num_placement = 1;
+  	placement.placement = &place;
+  	placement.num_busy_placement = 1;
+@@@ -222,16 -192,27 +247,21 @@@
+  	if (unlikely(ret != 0))
+  		goto err_unlock;
+  
+ -	/*
+ -	 * Is this buffer already in vram but not at the start of it?
+ -	 * In that case, evict it first because TTM isn't good at handling
+ -	 * that situation.
+ -	 */
+ +	/* Is this buffer already in vram but not at the start of it? */
+  	if (bo->mem.mem_type == TTM_PL_VRAM &&
+  	    bo->mem.start < bo->num_pages &&
+- 	    bo->mem.start > 0)
++ 	    bo->mem.start > 0 &&
++ 	    buf->pin_count == 0)
+  		(void) ttm_bo_validate(bo, &vmw_sys_placement, false, false);
+  
+- 	ret = ttm_bo_validate(bo, &placement, interruptible, false);
++ 	if (buf->pin_count > 0)
++ 		ret = ttm_bo_mem_compat(&placement, &bo->mem,
++ 					&new_flags) == true ? 0 : -EINVAL;
++ 	else
++ 		ret = ttm_bo_validate(bo, &placement, interruptible, false);
+  
+ -	/* For some reason we didn't end up at the start of vram */
+ +	/* For some reason we didn't up at the start of vram */
+  	WARN_ON(ret == 0 && bo->offset != 0);
+ -	if (!ret)
+ -		vmw_bo_pin_reserved(buf, true);
+  
+  	ttm_bo_unreserve(bo);
+  err_unlock:
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
