@@ -1,0 +1,245 @@
+kvmppc: Implement H_LOGICAL_CI_{LOAD,STORE} in KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] kvm: Implement H_LOGICAL_CI_{LOAD,STORE} in KVM (David Gibson) [1184290]
+Rebuild_FUZZ: 96.91%
+commit-author David Gibson <david@gibson.dropbear.id.au>
+commit 99342cf8044420eebdf9297ca03a14cb6a7085a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/99342cf8.failed
+
+On POWER, storage caching is usually configured via the MMU - attributes
+such as cache-inhibited are stored in the TLB and the hashed page table.
+
+This makes correctly performing cache inhibited IO accesses awkward when
+the MMU is turned off (real mode).  Some CPU models provide special
+registers to control the cache attributes of real mode load and stores but
+this is not at all consistent.  This is a problem in particular for SLOF,
+the firmware used on KVM guests, which runs entirely in real mode, but
+which needs to do IO to load the kernel.
+
+To simplify this qemu implements two special hypercalls, H_LOGICAL_CI_LOAD
+and H_LOGICAL_CI_STORE which simulate a cache-inhibited load or store to
+a logical address (aka guest physical address).  SLOF uses these for IO.
+
+However, because these are implemented within qemu, not the host kernel,
+these bypass any IO devices emulated within KVM itself.  The simplest way
+to see this problem is to attempt to boot a KVM guest from a virtio-blk
+device with iothread / dataplane enabled.  The iothread code relies on an
+in kernel implementation of the virtio queue notification, which is not
+triggered by the IO hcalls, and so the guest will stall in SLOF unable to
+load the guest OS.
+
+This patch addresses this by providing in-kernel implementations of the
+2 hypercalls, which correctly scan the KVM IO bus.  Any access to an
+address not handled by the KVM IO bus will cause a VM exit, hitting the
+qemu implementation as before.
+
+Note that a userspace change is also required, in order to enable these
+new hcall implementations with KVM_CAP_PPC_ENABLE_HCALL.
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+[agraf: fix compilation]
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 99342cf8044420eebdf9297ca03a14cb6a7085a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index bf186d1e449b,578e550f937b..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -310,6 -285,16 +310,19 @@@ static inline bool is_kvmppc_resume_gue
+  	return (r == RESUME_GUEST || r == RESUME_GUEST_NV);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool is_kvmppc_hv_enabled(struct kvm *kvm);
++ static inline bool kvmppc_supports_magic_page(struct kvm_vcpu *vcpu)
++ {
++ 	/* Only PR KVM supports the magic page */
++ 	return !is_kvmppc_hv_enabled(vcpu->kvm);
++ }
++ 
++ extern int kvmppc_h_logical_ci_load(struct kvm_vcpu *vcpu);
++ extern int kvmppc_h_logical_ci_store(struct kvm_vcpu *vcpu);
++ 
+++>>>>>>> 99342cf80444 (kvmppc: Implement H_LOGICAL_CI_{LOAD,STORE} in KVM)
+  /* Magic register values loaded into r3 and r4 before the 'sc' assembly
+   * instruction for the OSI hypercalls */
+  #define OSI_SC_MAGIC_R3			0x113724FA
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index c14aa96517c5..f062be951ac6 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -903,6 +903,82 @@ void kvmppc_core_destroy_vm(struct kvm *kvm)
+ #endif
+ }
+ 
++int kvmppc_h_logical_ci_load(struct kvm_vcpu *vcpu)
++{
++	unsigned long size = kvmppc_get_gpr(vcpu, 4);
++	unsigned long addr = kvmppc_get_gpr(vcpu, 5);
++	u64 buf;
++	int ret;
++
++	if (!is_power_of_2(size) || (size > sizeof(buf)))
++		return H_TOO_HARD;
++
++	ret = kvm_io_bus_read(vcpu, KVM_MMIO_BUS, addr, size, &buf);
++	if (ret != 0)
++		return H_TOO_HARD;
++
++	switch (size) {
++	case 1:
++		kvmppc_set_gpr(vcpu, 4, *(u8 *)&buf);
++		break;
++
++	case 2:
++		kvmppc_set_gpr(vcpu, 4, be16_to_cpu(*(__be16 *)&buf));
++		break;
++
++	case 4:
++		kvmppc_set_gpr(vcpu, 4, be32_to_cpu(*(__be32 *)&buf));
++		break;
++
++	case 8:
++		kvmppc_set_gpr(vcpu, 4, be64_to_cpu(*(__be64 *)&buf));
++		break;
++
++	default:
++		BUG();
++	}
++
++	return H_SUCCESS;
++}
++EXPORT_SYMBOL_GPL(kvmppc_h_logical_ci_load);
++
++int kvmppc_h_logical_ci_store(struct kvm_vcpu *vcpu)
++{
++	unsigned long size = kvmppc_get_gpr(vcpu, 4);
++	unsigned long addr = kvmppc_get_gpr(vcpu, 5);
++	unsigned long val = kvmppc_get_gpr(vcpu, 6);
++	u64 buf;
++	int ret;
++
++	switch (size) {
++	case 1:
++		*(u8 *)&buf = val;
++		break;
++
++	case 2:
++		*(__be16 *)&buf = cpu_to_be16(val);
++		break;
++
++	case 4:
++		*(__be32 *)&buf = cpu_to_be32(val);
++		break;
++
++	case 8:
++		*(__be64 *)&buf = cpu_to_be64(val);
++		break;
++
++	default:
++		return H_TOO_HARD;
++	}
++
++	ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, addr, size, &buf);
++	if (ret != 0)
++		return H_TOO_HARD;
++
++	return H_SUCCESS;
++}
++EXPORT_SYMBOL_GPL(kvmppc_h_logical_ci_store);
++
+ int kvmppc_core_check_processor_compat(void)
+ {
+ 	/*
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index ca8de8b47c9a..9692fc207ce1 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -668,6 +668,16 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ 
+ 		/* Send the error out to userspace via KVM_RUN */
+ 		return rc;
++	case H_LOGICAL_CI_LOAD:
++		ret = kvmppc_h_logical_ci_load(vcpu);
++		if (ret == H_TOO_HARD)
++			return RESUME_HOST;
++		break;
++	case H_LOGICAL_CI_STORE:
++		ret = kvmppc_h_logical_ci_store(vcpu);
++		if (ret == H_TOO_HARD)
++			return RESUME_HOST;
++		break;
+ 	case H_SET_MODE:
+ 		ret = kvmppc_h_set_mode(vcpu, kvmppc_get_gpr(vcpu, 4),
+ 					kvmppc_get_gpr(vcpu, 5),
+@@ -702,6 +712,8 @@ static int kvmppc_hcall_impl_hv(unsigned long cmd)
+ 	case H_CONFER:
+ 	case H_REGISTER_VPA:
+ 	case H_SET_MODE:
++	case H_LOGICAL_CI_LOAD:
++	case H_LOGICAL_CI_STORE:
+ #ifdef CONFIG_KVM_XICS
+ 	case H_XIRR:
+ 	case H_CPPR:
+diff --git a/arch/powerpc/kvm/book3s_pr_papr.c b/arch/powerpc/kvm/book3s_pr_papr.c
+index ff076d336d07..68cbe9eca843 100644
+--- a/arch/powerpc/kvm/book3s_pr_papr.c
++++ b/arch/powerpc/kvm/book3s_pr_papr.c
+@@ -257,6 +257,28 @@ static int kvmppc_h_pr_put_tce(struct kvm_vcpu *vcpu)
+ 	return EMULATE_DONE;
+ }
+ 
++static int kvmppc_h_pr_logical_ci_load(struct kvm_vcpu *vcpu)
++{
++	long rc;
++
++	rc = kvmppc_h_logical_ci_load(vcpu);
++	if (rc == H_TOO_HARD)
++		return EMULATE_FAIL;
++	kvmppc_set_gpr(vcpu, 3, rc);
++	return EMULATE_DONE;
++}
++
++static int kvmppc_h_pr_logical_ci_store(struct kvm_vcpu *vcpu)
++{
++	long rc;
++
++	rc = kvmppc_h_logical_ci_store(vcpu);
++	if (rc == H_TOO_HARD)
++		return EMULATE_FAIL;
++	kvmppc_set_gpr(vcpu, 3, rc);
++	return EMULATE_DONE;
++}
++
+ static int kvmppc_h_pr_xics_hcall(struct kvm_vcpu *vcpu, u32 cmd)
+ {
+ 	long rc = kvmppc_xics_hcall(vcpu, cmd);
+@@ -289,6 +311,10 @@ int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd)
+ 		clear_bit(KVM_REQ_UNHALT, &vcpu->requests);
+ 		vcpu->stat.halt_wakeup++;
+ 		return EMULATE_DONE;
++	case H_LOGICAL_CI_LOAD:
++		return kvmppc_h_pr_logical_ci_load(vcpu);
++	case H_LOGICAL_CI_STORE:
++		return kvmppc_h_pr_logical_ci_store(vcpu);
+ 	case H_XIRR:
+ 	case H_CPPR:
+ 	case H_EOI:
+@@ -322,6 +348,8 @@ int kvmppc_hcall_impl_pr(unsigned long cmd)
+ 	case H_BULK_REMOVE:
+ 	case H_PUT_TCE:
+ 	case H_CEDE:
++	case H_LOGICAL_CI_LOAD:
++	case H_LOGICAL_CI_STORE:
+ #ifdef CONFIG_KVM_XICS
+ 	case H_XIRR:
+ 	case H_CPPR:
