@@ -1,0 +1,176 @@
+x86, mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks (Prarit Bhargava) [1217770]
+Rebuild_FUZZ: 95.73%
+commit-author Tony Luck <tony.luck@intel.com>
+commit d4812e169de44f4ab53ff671c6193c67de24da62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d4812e16.failed
+
+We now switch to the kernel stack when a machine check interrupts
+during user mode.  This means that we can perform recovery actions
+in the tail of do_machine_check()
+
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+(cherry picked from commit d4812e169de44f4ab53ff671c6193c67de24da62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/thread_info.h
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/include/asm/thread_info.h
+index f9513ef09010,e82e95abc92b..000000000000
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@@ -146,8 -138,8 +144,13 @@@ struct thread_info 
+  
+  /* Only used for 64 bit */
+  #define _TIF_DO_NOTIFY_MASK						\
+++<<<<<<< HEAD
+ +	(_TIF_SIGPENDING | _TIF_MCE_NOTIFY | _TIF_NOTIFY_RESUME |	\
+ +	 _TIF_USER_RETURN_NOTIFY)
+++=======
++ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME |				\
++ 	 _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE)
+++>>>>>>> d4812e169de4 (x86, mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks)
+  
+  /* flags to check in __switch_to() */
+  #define _TIF_WORK_CTXSW							\
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index a0f9f08e18a6,d23179900755..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -957,51 -1004,6 +957,54 @@@ static void mce_clear_state(unsigned lo
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Need to save faulting physical address associated with a process
+ + * in the machine check handler some place where we can grab it back
+ + * later in mce_notify_process()
+ + */
+ +#define	MCE_INFO_MAX	16
+ +
+ +static struct mce_info {
+ +	atomic_t		inuse;
+ +	struct task_struct	*t;
+ +	__u64			paddr;
+ +	int			restartable;
+ +} mce_info[MCE_INFO_MAX];
+ +
+ +static void mce_save_info(__u64 addr, int c)
+ +{
+ +	struct mce_info *mi;
+ +
+ +	for (mi = mce_info; mi < &mce_info[MCE_INFO_MAX]; mi++) {
+ +		if (atomic_cmpxchg(&mi->inuse, 0, 1) == 0) {
+ +			mi->t = current;
+ +			mi->paddr = addr;
+ +			mi->restartable = c;
+ +			return;
+ +		}
+ +	}
+ +
+ +	mce_panic("Too many concurrent recoverable errors", NULL, NULL);
+ +}
+ +
+ +static struct mce_info *mce_find_info(void)
+ +{
+ +	struct mce_info *mi;
+ +
+ +	for (mi = mce_info; mi < &mce_info[MCE_INFO_MAX]; mi++)
+ +		if (atomic_read(&mi->inuse) && mi->t == current)
+ +			return mi;
+ +	return NULL;
+ +}
+ +
+ +static void mce_clear_info(struct mce_info *mi)
+ +{
+ +	atomic_set(&mi->inuse, 0);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> d4812e169de4 (x86, mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks)
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+   *
+@@@ -1038,7 -1041,11 +1041,9 @@@ void do_machine_check(struct pt_regs *r
+  	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
+  	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
+  	char *msg = "Unknown";
++ 	u64 recover_paddr = ~0ull;
++ 	int flags = MF_ACTION_REQUIRED;
+  
+ -	prev_state = ist_enter(regs);
+ -
+  	this_cpu_inc(mce_exception_count);
+  
+  	if (!cfg->banks)
+@@@ -1170,6 -1177,27 +1175,30 @@@
+  	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+  out:
+  	sync_core();
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (recover_paddr == ~0ull)
++ 		goto done;
++ 
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx",
++ 		 recover_paddr);
++ 	/*
++ 	 * We must call memory_failure() here even if the current process is
++ 	 * doomed. We still need to mark the page as poisoned and alert any
++ 	 * other users of the page.
++ 	 */
++ 	ist_begin_non_atomic(regs);
++ 	local_irq_enable();
++ 	if (memory_failure(recover_paddr >> PAGE_SHIFT, MCE_VECTOR, flags) < 0) {
++ 		pr_err("Memory error not recovered");
++ 		force_sig(SIGBUS, current);
++ 	}
++ 	local_irq_disable();
++ 	ist_end_non_atomic();
++ done:
++ 	ist_exit(regs, prev_state);
+++>>>>>>> d4812e169de4 (x86, mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks)
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 40b35a55ce8b..ad09d2b05a81 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -191,7 +191,6 @@ enum mcp_flags {
+ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b);
+ 
+ int mce_notify_irq(void);
+-void mce_notify_process(void);
+ 
+ DECLARE_PER_CPU(struct mce, injectm);
+ 
+* Unmerged path arch/x86/include/asm/thread_info.h
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index e74ab4963926..008732a8b8e2 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -738,12 +738,6 @@ do_notify_resume(struct pt_regs *regs, void *unused, __u32 thread_info_flags)
+ {
+ 	user_exit();
+ 
+-#ifdef CONFIG_X86_MCE
+-	/* notify userspace of pending MCEs */
+-	if (thread_info_flags & _TIF_MCE_NOTIFY)
+-		mce_notify_process();
+-#endif /* CONFIG_X86_64 && CONFIG_X86_MCE */
+-
+ 	if (thread_info_flags & _TIF_UPROBE)
+ 		uprobe_notify_resume(regs);
+ 
