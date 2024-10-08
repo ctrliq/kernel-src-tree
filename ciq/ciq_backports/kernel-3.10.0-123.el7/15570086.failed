@@ -1,0 +1,140 @@
+vfs: reimplement d_rcu_to_refcount() using lockref_get_or_lock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 15570086b590a69d59183b08a7770e316cca20a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/15570086.failed
+
+This moves __d_rcu_to_refcount() from <linux/dcache.h> into fs/namei.c
+and re-implements it using the lockref infrastructure instead.  It also
+adds a lot of comments about what is actually going on, because turning
+a dentry that was looked up using RCU into a long-lived reference
+counted entry is one of the more subtle parts of the rcu walk.
+
+We also used to be _particularly_ subtle in unlazy_walk() where we
+re-validate both the dentry and its parent using the same sequence
+count.  We used to do it by nesting the locks and then verifying the
+sequence count just once.
+
+That was silly, because nested locking is expensive, but the sequence
+count check is not.  So this just re-validates the dentry and the parent
+separately, avoiding the nested locking, and making the lockref lookup
+possible.
+
+	Acked-by: Waiman Long <waiman.long@hp.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 15570086b590a69d59183b08a7770e316cca20a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+#	include/linux/dcache.h
+diff --cc fs/namei.c
+index b8c893be1266,2c30c84d4ea1..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -518,29 -562,28 +562,44 @@@ static int unlazy_walk(struct nameidat
+  				nd->root.dentry != fs->root.dentry)
+  			goto err_root;
+  	}
+- 	spin_lock(&parent->d_lock);
++ 
++ 	/*
++ 	 * For a negative lookup, the lookup sequence point is the parents
++ 	 * sequence point, and it only needs to revalidate the parent dentry.
++ 	 *
++ 	 * For a positive lookup, we need to move both the parent and the
++ 	 * dentry from the RCU domain to be properly refcounted. And the
++ 	 * sequence number in the dentry validates *both* dentry counters,
++ 	 * since we checked the sequence number of the parent after we got
++ 	 * the child sequence number. So we know the parent must still
++ 	 * be valid if the child sequence number is still valid.
++ 	 */
+  	if (!dentry) {
+- 		if (!__d_rcu_to_refcount(parent, nd->seq))
+- 			goto err_parent;
++ 		if (d_rcu_to_refcount(parent, &parent->d_seq, nd->seq) < 0)
++ 			goto err_root;
+  		BUG_ON(nd->inode != parent->d_inode);
+  	} else {
+- 		if (dentry->d_parent != parent)
++ 		if (d_rcu_to_refcount(dentry, &dentry->d_seq, nd->seq) < 0)
++ 			goto err_root;
++ 		if (d_rcu_to_refcount(parent, &dentry->d_seq, nd->seq) < 0)
+  			goto err_parent;
+++<<<<<<< HEAD
+ +		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ +		if (!__d_rcu_to_refcount(dentry, nd->seq))
+ +			goto err_child;
+ +		/*
+ +		 * If the sequence check on the child dentry passed, then
+ +		 * the child has not been removed from its parent. This
+ +		 * means the parent dentry must be valid and able to take
+ +		 * a reference at this point.
+ +		 */
+ +		BUG_ON(!IS_ROOT(dentry) && dentry->d_parent != parent);
+ +		BUG_ON(!parent->d_count);
+ +		parent->d_count++;
+ +		spin_unlock(&dentry->d_lock);
+++=======
+++>>>>>>> 15570086b590 (vfs: reimplement d_rcu_to_refcount() using lockref_get_or_lock())
+  	}
+- 	spin_unlock(&parent->d_lock);
+  	if (want_root) {
+  		path_get(&nd->root);
+  		spin_unlock(&fs->lock);
+diff --cc include/linux/dcache.h
+index 4c0560aed145,9169b91ea2d2..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -301,26 -304,9 +301,32 @@@ extern struct dentry *__d_lookup(const 
+  extern struct dentry *__d_lookup_rcu(const struct dentry *parent,
+  				const struct qstr *name, unsigned *seq);
+  
+++<<<<<<< HEAD
+ +/**
+ + * __d_rcu_to_refcount - take a refcount on dentry if sequence check is ok
+ + * @dentry: dentry to take a ref on
+ + * @seq: seqcount to verify against
+ + * Returns: 0 on failure, else 1.
+ + *
+ + * __d_rcu_to_refcount operates on a dentry,seq pair that was returned
+ + * by __d_lookup_rcu, to get a reference on an rcu-walk dentry.
+ + */
+ +static inline int __d_rcu_to_refcount(struct dentry *dentry, unsigned seq)
+ +{
+ +	int ret = 0;
+ +
+ +	assert_spin_locked(&dentry->d_lock);
+ +	if (!read_seqcount_retry(&dentry->d_seq, seq)) {
+ +		ret = 1;
+ +		dentry->d_count++;
+ +	}
+ +
+ +	return ret;
+++=======
++ static inline unsigned d_count(const struct dentry *dentry)
++ {
++ 	return dentry->d_lockref.count;
+++>>>>>>> 15570086b590 (vfs: reimplement d_rcu_to_refcount() using lockref_get_or_lock())
+  }
+  
+  /* validate "insecure" dentry pointer */
+diff --git a/fs/dcache.c b/fs/dcache.c
+index c1d239fbff60..6d1dfd465e5d 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1888,7 +1888,7 @@ static noinline enum slow_d_compare slow_dentry_cmp(
+  * without taking d_lock and checking d_seq sequence count against @seq
+  * returned here.
+  *
+- * A refcount may be taken on the found dentry with the __d_rcu_to_refcount
++ * A refcount may be taken on the found dentry with the d_rcu_to_refcount
+  * function.
+  *
+  * Alternatively, __d_lookup_rcu may be called again to look up the child of
+* Unmerged path fs/namei.c
+* Unmerged path include/linux/dcache.h
