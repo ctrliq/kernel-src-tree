@@ -136,8 +136,7 @@ static int ohci_platform_remove(struct platform_device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_PM
-
+#ifdef CONFIG_PM_SLEEP
 static int ohci_platform_suspend(struct device *dev)
 {
 	struct usb_ohci_pdata *pdata = dev->platform_data;
@@ -166,11 +165,7 @@ static int ohci_platform_resume(struct device *dev)
 	ohci_resume(hcd, false);
 	return 0;
 }
-
-#else /* !CONFIG_PM */
-#define ohci_platform_suspend	NULL
-#define ohci_platform_resume	NULL
-#endif /* CONFIG_PM */
+#endif /* CONFIG_PM_SLEEP */
 
 static const struct platform_device_id ohci_platform_table[] = {
 	{ "ohci-platform", 0 },
@@ -178,10 +173,8 @@ static const struct platform_device_id ohci_platform_table[] = {
 };
 MODULE_DEVICE_TABLE(platform, ohci_platform_table);
 
-static const struct dev_pm_ops ohci_platform_pm_ops = {
-	.suspend	= ohci_platform_suspend,
-	.resume		= ohci_platform_resume,
-};
+static SIMPLE_DEV_PM_OPS(ohci_platform_pm_ops, ohci_platform_suspend,
+	ohci_platform_resume);
 
 static struct platform_driver ohci_platform_driver = {
 	.id_table	= ohci_platform_table,
