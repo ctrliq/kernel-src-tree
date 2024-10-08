@@ -1,0 +1,455 @@
+IB: Add rdma_cap_ib_switch helper and use where appropriate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] Add rdma_cap_ib_switch helper and use where appropriate (Honggang Li) [1244604]
+Rebuild_FUZZ: 96.49%
+commit-author Hal Rosenstock <hal@dev.mellanox.co.il>
+commit 4139032b4860c06ff3a7687041f06535fed901ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4139032b.failed
+
+Persuant to Liran's comments on node_type on linux-rdma
+mailing list:
+
+In an effort to reform the RDMA core and ULPs to minimize use of
+node_type in struct ib_device, an additional bit is added to
+struct ib_device for is_switch (IB switch). This is needed
+to be initialized by any IB switch device driver. This is a
+NEW requirement on such device drivers which are all
+"out of tree".
+
+In addition, an ib_switch helper was added to ib_verbs.h
+based on the is_switch device bit rather than node_type
+(although those should be consistent).
+
+The RDMA core (MAD, SMI, agent, sa_query, multicast, sysfs)
+as well as (IPoIB and SRP) ULPs are updated where
+appropriate to use this new helper. In some cases,
+the helper is now used under the covers of using
+rdma_[start end]_port rather than the open coding
+previously used.
+
+	Reviewed-by: Sean Hefty <sean.hefty@intel.com>
+Reviewed-By: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Tested-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Hal Rosenstock <hal@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 4139032b4860c06ff3a7687041f06535fed901ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/opa_smi.h
+#	drivers/infiniband/core/smi.c
+diff --cc drivers/infiniband/core/smi.c
+index c523b2df2571,f19b23817c2b..000000000000
+--- a/drivers/infiniband/core/smi.c
++++ b/drivers/infiniband/core/smi.c
+@@@ -38,8 -39,9 +38,8 @@@
+  
+  #include <rdma/ib_smi.h>
+  #include "smi.h"
+ -#include "opa_smi.h"
+  
+- static enum smi_action __smi_handle_dr_smp_send(u8 node_type, int port_num,
++ static enum smi_action __smi_handle_dr_smp_send(bool is_switch, int port_num,
+  						u8 *hop_ptr, u8 hop_cnt,
+  						const u8 *initial_path,
+  						const u8 *return_path,
+@@@ -136,7 -138,21 +136,25 @@@ enum smi_action smi_handle_dr_smp_send(
+  					smp->dr_slid == IB_LID_PERMISSIVE);
+  }
+  
+++<<<<<<< HEAD
+ +static enum smi_action __smi_handle_dr_smp_recv(u8 node_type, int port_num,
+++=======
++ enum smi_action opa_smi_handle_dr_smp_send(struct opa_smp *smp,
++ 				       bool is_switch, int port_num)
++ {
++ 	return __smi_handle_dr_smp_send(is_switch, port_num,
++ 					&smp->hop_ptr, smp->hop_cnt,
++ 					smp->route.dr.initial_path,
++ 					smp->route.dr.return_path,
++ 					opa_get_smp_direction(smp),
++ 					smp->route.dr.dr_dlid ==
++ 					OPA_LID_PERMISSIVE,
++ 					smp->route.dr.dr_slid ==
++ 					OPA_LID_PERMISSIVE);
++ }
++ 
++ static enum smi_action __smi_handle_dr_smp_recv(bool is_switch, int port_num,
+++>>>>>>> 4139032b4860 (IB: Add rdma_cap_ib_switch helper and use where appropriate)
+  						int phys_port_cnt,
+  						u8 *hop_ptr, u8 hop_cnt,
+  						const u8 *initial_path,
+@@@ -234,6 -249,24 +251,27 @@@ enum smi_action smi_handle_dr_smp_recv(
+  					smp->dr_slid == IB_LID_PERMISSIVE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Adjust information for a received SMP
++  * Return IB_SMI_DISCARD if the SMP should be dropped
++  */
++ enum smi_action opa_smi_handle_dr_smp_recv(struct opa_smp *smp, bool is_switch,
++ 					   int port_num, int phys_port_cnt)
++ {
++ 	return __smi_handle_dr_smp_recv(is_switch, port_num, phys_port_cnt,
++ 					&smp->hop_ptr, smp->hop_cnt,
++ 					smp->route.dr.initial_path,
++ 					smp->route.dr.return_path,
++ 					opa_get_smp_direction(smp),
++ 					smp->route.dr.dr_dlid ==
++ 					OPA_LID_PERMISSIVE,
++ 					smp->route.dr.dr_slid ==
++ 					OPA_LID_PERMISSIVE);
++ }
++ 
+++>>>>>>> 4139032b4860 (IB: Add rdma_cap_ib_switch helper and use where appropriate)
+  static enum smi_forward_action __smi_check_forward_dr_smp(u8 hop_ptr, u8 hop_cnt,
+  							  u8 direction,
+  							  bool dr_dlid_is_permissive,
+* Unmerged path drivers/infiniband/core/opa_smi.h
+diff --git a/drivers/infiniband/core/agent.c b/drivers/infiniband/core/agent.c
+index c7dcfe4ca5f1..0429040304fd 100644
+--- a/drivers/infiniband/core/agent.c
++++ b/drivers/infiniband/core/agent.c
+@@ -88,7 +88,7 @@ void agent_send_response(const struct ib_mad_hdr *mad_hdr, const struct ib_grh *
+ 	struct ib_ah *ah;
+ 	struct ib_mad_send_wr_private *mad_send_wr;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH)
++	if (rdma_cap_ib_switch(device))
+ 		port_priv = ib_get_agent_port(device, 0);
+ 	else
+ 		port_priv = ib_get_agent_port(device, port_num);
+@@ -122,7 +122,7 @@ void agent_send_response(const struct ib_mad_hdr *mad_hdr, const struct ib_grh *
+ 	memcpy(send_buf->mad, mad_hdr, resp_mad_len);
+ 	send_buf->ah = ah;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
++	if (rdma_cap_ib_switch(device)) {
+ 		mad_send_wr = container_of(send_buf,
+ 					   struct ib_mad_send_wr_private,
+ 					   send_buf);
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 835e4dd8a613..40a831f5f069 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -769,7 +769,7 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 	bool opa = rdma_cap_opa_mad(mad_agent_priv->qp_info->port_priv->device,
+ 				    mad_agent_priv->qp_info->port_priv->port_num);
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH &&
++	if (rdma_cap_ib_switch(device) &&
+ 	    smp->mgmt_class == IB_MGMT_CLASS_SUBN_DIRECTED_ROUTE)
+ 		port_num = send_wr->wr.ud.port_num;
+ 	else
+@@ -787,7 +787,8 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 		if ((opa_get_smp_direction(opa_smp)
+ 		     ? opa_smp->route.dr.dr_dlid : opa_smp->route.dr.dr_slid) ==
+ 		     OPA_LID_PERMISSIVE &&
+-		     opa_smi_handle_dr_smp_send(opa_smp, device->node_type,
++		     opa_smi_handle_dr_smp_send(opa_smp,
++						rdma_cap_ib_switch(device),
+ 						port_num) == IB_SMI_DISCARD) {
+ 			ret = -EINVAL;
+ 			dev_err(&device->dev, "OPA Invalid directed route\n");
+@@ -810,7 +811,7 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 	} else {
+ 		if ((ib_get_smp_direction(smp) ? smp->dr_dlid : smp->dr_slid) ==
+ 		     IB_LID_PERMISSIVE &&
+-		     smi_handle_dr_smp_send(smp, device->node_type, port_num) ==
++		     smi_handle_dr_smp_send(smp, rdma_cap_ib_switch(device), port_num) ==
+ 		     IB_SMI_DISCARD) {
+ 			ret = -EINVAL;
+ 			dev_err(&device->dev, "Invalid directed route\n");
+@@ -2030,7 +2031,7 @@ static enum smi_action handle_ib_smi(const struct ib_mad_port_private *port_priv
+ 	struct ib_smp *smp = (struct ib_smp *)recv->mad;
+ 
+ 	if (smi_handle_dr_smp_recv(smp,
+-				   port_priv->device->node_type,
++				   rdma_cap_ib_switch(port_priv->device),
+ 				   port_num,
+ 				   port_priv->device->phys_port_cnt) ==
+ 				   IB_SMI_DISCARD)
+@@ -2042,13 +2043,13 @@ static enum smi_action handle_ib_smi(const struct ib_mad_port_private *port_priv
+ 
+ 	if (retsmi == IB_SMI_SEND) { /* don't forward */
+ 		if (smi_handle_dr_smp_send(smp,
+-					   port_priv->device->node_type,
++					   rdma_cap_ib_switch(port_priv->device),
+ 					   port_num) == IB_SMI_DISCARD)
+ 			return IB_SMI_DISCARD;
+ 
+ 		if (smi_check_local_smp(smp, port_priv->device) == IB_SMI_DISCARD)
+ 			return IB_SMI_DISCARD;
+-	} else if (port_priv->device->node_type == RDMA_NODE_IB_SWITCH) {
++	} else if (rdma_cap_ib_switch(port_priv->device)) {
+ 		/* forward case for switches */
+ 		memcpy(response, recv, mad_priv_size(response));
+ 		response->header.recv_wc.wc = &response->header.wc;
+@@ -2115,7 +2116,7 @@ handle_opa_smi(struct ib_mad_port_private *port_priv,
+ 	struct opa_smp *smp = (struct opa_smp *)recv->mad;
+ 
+ 	if (opa_smi_handle_dr_smp_recv(smp,
+-				   port_priv->device->node_type,
++				   rdma_cap_ib_switch(port_priv->device),
+ 				   port_num,
+ 				   port_priv->device->phys_port_cnt) ==
+ 				   IB_SMI_DISCARD)
+@@ -2127,7 +2128,7 @@ handle_opa_smi(struct ib_mad_port_private *port_priv,
+ 
+ 	if (retsmi == IB_SMI_SEND) { /* don't forward */
+ 		if (opa_smi_handle_dr_smp_send(smp,
+-					   port_priv->device->node_type,
++					   rdma_cap_ib_switch(port_priv->device),
+ 					   port_num) == IB_SMI_DISCARD)
+ 			return IB_SMI_DISCARD;
+ 
+@@ -2135,7 +2136,7 @@ handle_opa_smi(struct ib_mad_port_private *port_priv,
+ 		    IB_SMI_DISCARD)
+ 			return IB_SMI_DISCARD;
+ 
+-	} else if (port_priv->device->node_type == RDMA_NODE_IB_SWITCH) {
++	} else if (rdma_cap_ib_switch(port_priv->device)) {
+ 		/* forward case for switches */
+ 		memcpy(response, recv, mad_priv_size(response));
+ 		response->header.recv_wc.wc = &response->header.wc;
+@@ -2235,7 +2236,7 @@ static void ib_mad_recv_done_handler(struct ib_mad_port_private *port_priv,
+ 		goto out;
+ 	}
+ 
+-	if (port_priv->device->node_type == RDMA_NODE_IB_SWITCH)
++	if (rdma_cap_ib_switch(port_priv->device))
+ 		port_num = wc->port_num;
+ 	else
+ 		port_num = port_priv->port_num;
+@@ -3295,17 +3296,11 @@ static int ib_mad_port_close(struct ib_device *device, int port_num)
+ 
+ static void ib_mad_init_device(struct ib_device *device)
+ {
+-	int start, end, i;
++	int start, i;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
+-		start = 0;
+-		end   = 0;
+-	} else {
+-		start = 1;
+-		end   = device->phys_port_cnt;
+-	}
++	start = rdma_start_port(device);
+ 
+-	for (i = start; i <= end; i++) {
++	for (i = start; i <= rdma_end_port(device); i++) {
+ 		if (!rdma_cap_ib_mad(device, i))
+ 			continue;
+ 
+@@ -3340,17 +3335,9 @@ error:
+ 
+ static void ib_mad_remove_device(struct ib_device *device)
+ {
+-	int start, end, i;
+-
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
+-		start = 0;
+-		end   = 0;
+-	} else {
+-		start = 1;
+-		end   = device->phys_port_cnt;
+-	}
++	int i;
+ 
+-	for (i = start; i <= end; i++) {
++	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
+ 		if (!rdma_cap_ib_mad(device, i))
+ 			continue;
+ 
+diff --git a/drivers/infiniband/core/multicast.c b/drivers/infiniband/core/multicast.c
+index 1244f02a5c6d..2cb865c7ce7a 100644
+--- a/drivers/infiniband/core/multicast.c
++++ b/drivers/infiniband/core/multicast.c
+@@ -812,12 +812,8 @@ static void mcast_add_one(struct ib_device *device)
+ 	if (!dev)
+ 		return;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH)
+-		dev->start_port = dev->end_port = 0;
+-	else {
+-		dev->start_port = 1;
+-		dev->end_port = device->phys_port_cnt;
+-	}
++	dev->start_port = rdma_start_port(device);
++	dev->end_port = rdma_end_port(device);
+ 
+ 	for (i = 0; i <= dev->end_port - dev->start_port; i++) {
+ 		if (!rdma_cap_ib_mcast(device, dev->start_port + i))
+* Unmerged path drivers/infiniband/core/opa_smi.h
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index 0fae85062a65..ca919f429666 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -1156,12 +1156,8 @@ static void ib_sa_add_one(struct ib_device *device)
+ 	int s, e, i;
+ 	int count = 0;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH)
+-		s = e = 0;
+-	else {
+-		s = 1;
+-		e = device->phys_port_cnt;
+-	}
++	s = rdma_start_port(device);
++	e = rdma_end_port(device);
+ 
+ 	sa_dev = kzalloc(sizeof *sa_dev +
+ 			 (e - s + 1) * sizeof (struct ib_sa_port),
+* Unmerged path drivers/infiniband/core/smi.c
+diff --git a/drivers/infiniband/core/smi.h b/drivers/infiniband/core/smi.h
+index aff96bac49b4..33c91c8a16e9 100644
+--- a/drivers/infiniband/core/smi.h
++++ b/drivers/infiniband/core/smi.h
+@@ -51,12 +51,12 @@ enum smi_forward_action {
+ 	IB_SMI_FORWARD	/* SMP should be forwarded (for switches only) */
+ };
+ 
+-enum smi_action smi_handle_dr_smp_recv(struct ib_smp *smp, u8 node_type,
++enum smi_action smi_handle_dr_smp_recv(struct ib_smp *smp, bool is_switch,
+ 				       int port_num, int phys_port_cnt);
+ int smi_get_fwd_port(struct ib_smp *smp);
+ extern enum smi_forward_action smi_check_forward_dr_smp(struct ib_smp *smp);
+ extern enum smi_action smi_handle_dr_smp_send(struct ib_smp *smp,
+-					      u8 node_type, int port_num);
++					      bool is_switch, int port_num);
+ 
+ /*
+  * Return IB_SMI_HANDLE if the SMP should be handled by the local SMA/SM
+diff --git a/drivers/infiniband/core/sysfs.c b/drivers/infiniband/core/sysfs.c
+index ed6b6c85c334..0b84a9cdfe5b 100644
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -870,7 +870,7 @@ int ib_device_register_sysfs(struct ib_device *device,
+ 		goto err_put;
+ 	}
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
++	if (rdma_cap_ib_switch(device)) {
+ 		ret = add_port(device, 0, port_callback);
+ 		if (ret)
+ 			goto err_put;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 83c47f1cbb03..6002b53942c0 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -1662,7 +1662,7 @@ static void ipoib_add_one(struct ib_device *device)
+ 	struct list_head *dev_list;
+ 	struct net_device *dev;
+ 	struct ipoib_dev_priv *priv;
+-	int s, e, p;
++	int p;
+ 	int count = 0;
+ 
+ 	dev_list = kmalloc(sizeof *dev_list, GFP_KERNEL);
+@@ -1671,15 +1671,7 @@ static void ipoib_add_one(struct ib_device *device)
+ 
+ 	INIT_LIST_HEAD(dev_list);
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
+-		s = 0;
+-		e = 0;
+-	} else {
+-		s = 1;
+-		e = device->phys_port_cnt;
+-	}
+-
+-	for (p = s; p <= e; ++p) {
++	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
+ 		if (!rdma_protocol_ib(device, p))
+ 			continue;
+ 		dev = ipoib_add_port("ib%d", device, p);
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index aac280420243..ffbc87865efb 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -3276,7 +3276,7 @@ static void srp_add_one(struct ib_device *device)
+ 	struct srp_device *srp_dev;
+ 	struct ib_device_attr *dev_attr;
+ 	struct srp_host *host;
+-	int mr_page_shift, s, e, p;
++	int mr_page_shift, p;
+ 	u64 max_pages_per_mr;
+ 
+ 	dev_attr = kmalloc(sizeof *dev_attr, GFP_KERNEL);
+@@ -3340,15 +3340,7 @@ static void srp_add_one(struct ib_device *device)
+ 	if (IS_ERR(srp_dev->mr))
+ 		goto err_pd;
+ 
+-	if (device->node_type == RDMA_NODE_IB_SWITCH) {
+-		s = 0;
+-		e = 0;
+-	} else {
+-		s = 1;
+-		e = device->phys_port_cnt;
+-	}
+-
+-	for (p = s; p <= e; ++p) {
++	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
+ 		host = srp_add_port(srp_dev, p);
+ 		if (host)
+ 			list_add_tail(&host->list, &srp_dev->dev_list);
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 694968172984..1711200c1765 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1693,6 +1693,7 @@ struct ib_device {
+ 	char			     node_desc[64];
+ 	__be64			     node_guid;
+ 	u32			     local_dma_lkey;
++	u16                          is_switch:1;
+ 	u8                           node_type;
+ 	u8                           phys_port_cnt;
+ 
+@@ -1774,6 +1775,20 @@ int ib_query_port(struct ib_device *device,
+ enum rdma_link_layer rdma_port_get_link_layer(struct ib_device *device,
+ 					       u8 port_num);
+ 
++/**
++ * rdma_cap_ib_switch - Check if the device is IB switch
++ * @device: Device to check
++ *
++ * Device driver is responsible for setting is_switch bit on
++ * in ib_device structure at init time.
++ *
++ * Return: true if the device is IB switch.
++ */
++static inline bool rdma_cap_ib_switch(const struct ib_device *device)
++{
++	return device->is_switch;
++}
++
+ /**
+  * rdma_start_port - Return the first valid port number for the device
+  * specified
+@@ -1784,7 +1799,7 @@ enum rdma_link_layer rdma_port_get_link_layer(struct ib_device *device,
+  */
+ static inline u8 rdma_start_port(const struct ib_device *device)
+ {
+-	return (device->node_type == RDMA_NODE_IB_SWITCH) ? 0 : 1;
++	return rdma_cap_ib_switch(device) ? 0 : 1;
+ }
+ 
+ /**
+@@ -1797,8 +1812,7 @@ static inline u8 rdma_start_port(const struct ib_device *device)
+  */
+ static inline u8 rdma_end_port(const struct ib_device *device)
+ {
+-	return (device->node_type == RDMA_NODE_IB_SWITCH) ?
+-		0 : device->phys_port_cnt;
++	return rdma_cap_ib_switch(device) ? 0 : device->phys_port_cnt;
+ }
+ 
+ static inline bool rdma_protocol_ib(const struct ib_device *device, u8 port_num)
