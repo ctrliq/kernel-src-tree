@@ -1,0 +1,194 @@
+NFSv4.1: Optimise layout return-on-close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 40dd4b7aee1a8c3b8dac7b67ba710692d7691b77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/40dd4b7a.failed
+
+Optimise the layout return on close code by ensuring that
+
+1) Add a check for whether we hold a layout before taking any spinlocks
+2) Only take the spin lock once
+3) Use nfs_state->state to speed up open file checks
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 40dd4b7aee1a8c3b8dac7b67ba710692d7691b77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+#	fs/nfs/pnfs.h
+diff --cc fs/nfs/pnfs.c
+index 40ce52cc28db,4d69076a6028..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1051,18 -955,31 +1052,37 @@@ pnfs_commit_and_return_layout(struct in
+  
+  bool pnfs_roc(struct inode *ino)
+  {
++ 	struct nfs_inode *nfsi = NFS_I(ino);
++ 	struct nfs_open_context *ctx;
++ 	struct nfs4_state *state;
+  	struct pnfs_layout_hdr *lo;
+  	struct pnfs_layout_segment *lseg, *tmp;
+ +	nfs4_stateid stateid;
+  	LIST_HEAD(tmp_list);
+ -	bool found = false;
+ +	bool found = false, layoutreturn = false;
+  
+  	spin_lock(&ino->i_lock);
+- 	lo = NFS_I(ino)->layout;
++ 	lo = nfsi->layout;
+  	if (!lo || !test_and_clear_bit(NFS_LAYOUT_ROC, &lo->plh_flags) ||
+  	    test_bit(NFS_LAYOUT_BULK_RECALL, &lo->plh_flags))
+++<<<<<<< HEAD
+ +		goto out_nolayout;
+ +	pnfs_clear_retry_layoutget(lo);
+++=======
++ 		goto out_noroc;
++ 
++ 	/* Don't return layout if we hold a delegation */
++ 	if (nfs4_check_delegation(ino, FMODE_READ))
++ 		goto out_noroc;
++ 
++ 	list_for_each_entry(ctx, &nfsi->open_files, list) {
++ 		state = ctx->state;
++ 		/* Don't return layout if there is open file state */
++ 		if (state != NULL && state->state != 0)
++ 			goto out_noroc;
++ 	}
++ 
+++>>>>>>> 40dd4b7aee1a (NFSv4.1: Optimise layout return-on-close)
+  	list_for_each_entry_safe(lseg, tmp, &lo->plh_segs, pls_list)
+  		if (test_bit(NFS_LSEG_ROC, &lseg->pls_flags)) {
+  			mark_lseg_invalid(lseg, &tmp_list);
+@@@ -1076,20 -993,8 +1096,24 @@@
+  	pnfs_free_lseg_list(&tmp_list);
+  	return true;
+  
+++<<<<<<< HEAD
+ +out_nolayout:
+ +	if (lo) {
+ +		stateid = lo->plh_stateid;
+ +		layoutreturn =
+ +			test_and_clear_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
+ +					   &lo->plh_flags);
+ +		if (layoutreturn) {
+ +			lo->plh_block_lgets++;
+ +			pnfs_get_layout_hdr(lo);
+ +		}
+ +	}
+++=======
++ out_noroc:
+++>>>>>>> 40dd4b7aee1a (NFSv4.1: Optimise layout return-on-close)
+  	spin_unlock(&ino->i_lock);
+ +	if (layoutreturn)
+ +		pnfs_send_layoutreturn(lo, stateid, IOMODE_ANY, true);
+  	return false;
+  }
+  
+diff --cc fs/nfs/pnfs.h
+index 9a0d3f9e9661,a98d8fd9637f..000000000000
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@@ -317,37 -275,10 +317,44 @@@ void nfs4_mark_deviceid_unavailable(str
+  bool nfs4_test_deviceid_unavailable(struct nfs4_deviceid_node *node);
+  void nfs4_deviceid_purge_client(const struct nfs_client *);
+  
+++<<<<<<< HEAD
+ +/* pnfs_nfs.c */
+ +void pnfs_generic_clear_request_commit(struct nfs_page *req,
+ +				       struct nfs_commit_info *cinfo);
+ +void pnfs_generic_commit_release(void *calldata);
+ +void pnfs_generic_prepare_to_resend_writes(struct nfs_commit_data *data);
+ +void pnfs_generic_rw_release(void *data);
+ +void pnfs_generic_recover_commit_reqs(struct list_head *dst,
+ +				      struct nfs_commit_info *cinfo);
+ +int pnfs_generic_commit_pagelist(struct inode *inode,
+ +				 struct list_head *mds_pages,
+ +				 int how,
+ +				 struct nfs_commit_info *cinfo,
+ +				 int (*initiate_commit)(struct nfs_commit_data *data,
+ +							int how));
+ +int pnfs_generic_scan_commit_lists(struct nfs_commit_info *cinfo, int max);
+ +void pnfs_generic_write_commit_done(struct rpc_task *task, void *data);
+ +void nfs4_pnfs_ds_put(struct nfs4_pnfs_ds *ds);
+ +struct nfs4_pnfs_ds *nfs4_pnfs_ds_add(struct list_head *dsaddrs,
+ +				      gfp_t gfp_flags);
+ +void nfs4_pnfs_v3_ds_connect_unload(void);
+ +void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
+ +			  struct nfs4_deviceid_node *devid, unsigned int timeo,
+ +			  unsigned int retrans, u32 version, u32 minor_version,
+ +			  rpc_authflavor_t au_flavor);
+ +struct nfs4_pnfs_ds_addr *nfs4_decode_mp_ds_addr(struct net *net,
+ +						 struct xdr_stream *xdr,
+ +						 gfp_t gfp_flags);
+ +void pnfs_layout_mark_request_commit(struct nfs_page *req,
+ +				     struct pnfs_layout_segment *lseg,
+ +				     struct nfs_commit_info *cinfo,
+ +				     u32 ds_commit_idx);
+++=======
++ static inline bool nfs_have_layout(struct inode *inode)
++ {
++ 	return NFS_I(inode)->layout != NULL;
++ }
+++>>>>>>> 40dd4b7aee1a (NFSv4.1: Optimise layout return-on-close)
+  
+  static inline struct nfs4_deviceid_node *
+  nfs4_get_deviceid(struct nfs4_deviceid_node *d)
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 4b1be4f12c57..7d5fc94e6ee4 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2760,45 +2760,10 @@ static const struct rpc_call_ops nfs4_close_ops = {
+ 	.rpc_release = nfs4_free_closedata,
+ };
+ 
+-static bool nfs4_state_has_opener(struct nfs4_state *state)
+-{
+-	/* first check existing openers */
+-	if (test_bit(NFS_O_RDONLY_STATE, &state->flags) != 0 &&
+-	    state->n_rdonly != 0)
+-		return true;
+-
+-	if (test_bit(NFS_O_WRONLY_STATE, &state->flags) != 0 &&
+-	    state->n_wronly != 0)
+-		return true;
+-
+-	if (test_bit(NFS_O_RDWR_STATE, &state->flags) != 0 &&
+-	    state->n_rdwr != 0)
+-		return true;
+-
+-	return false;
+-}
+-
+ static bool nfs4_roc(struct inode *inode)
+ {
+-	struct nfs_inode *nfsi = NFS_I(inode);
+-	struct nfs_open_context *ctx;
+-	struct nfs4_state *state;
+-
+-	spin_lock(&inode->i_lock);
+-	list_for_each_entry(ctx, &nfsi->open_files, list) {
+-		state = ctx->state;
+-		if (state == NULL)
+-			continue;
+-		if (nfs4_state_has_opener(state)) {
+-			spin_unlock(&inode->i_lock);
+-			return false;
+-		}
+-	}
+-	spin_unlock(&inode->i_lock);
+-
+-	if (nfs4_check_delegation(inode, FMODE_READ))
++	if (!nfs_have_layout(inode))
+ 		return false;
+-
+ 	return pnfs_roc(inode);
+ }
+ 
+* Unmerged path fs/nfs/pnfs.c
+* Unmerged path fs/nfs/pnfs.h
