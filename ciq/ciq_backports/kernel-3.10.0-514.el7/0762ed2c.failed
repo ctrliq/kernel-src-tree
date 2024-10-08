@@ -1,0 +1,133 @@
+NFSv4.1/flexfiles: Allow coalescing of new layout segments and existing ones
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 0762ed2ced40bfe648378ef0e1635cf4d3a6fb76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/0762ed2c.failed
+
+In order to ensure atomicity of updates, we merge the old layout segments
+into the new ones, and then invalidate the old ones.
+
+Also ensure that we order the list of layout segments so that
+RO segments are preferred over RW.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 0762ed2ced40bfe648378ef0e1635cf4d3a6fb76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.h
+diff --cc fs/nfs/pnfs.h
+index 36a0c1c82c9e,78c9351ff117..000000000000
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@@ -534,6 -539,24 +534,27 @@@ pnfs_use_threshold(struct nfs4_threshol
+  					nfss->pnfs_curr_ld->id == src->l_type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64
++ pnfs_calc_offset_end(u64 offset, u64 len)
++ {
++ 	if (len == NFS4_MAX_UINT64 || len >= NFS4_MAX_UINT64 - offset)
++ 		return NFS4_MAX_UINT64;
++ 	return offset + len - 1;
++ }
++ 
++ static inline u64
++ pnfs_calc_offset_length(u64 offset, u64 end)
++ {
++ 	if (end == NFS4_MAX_UINT64 || end <= offset)
++ 		return NFS4_MAX_UINT64;
++ 	return 1 + end - offset;
++ }
++ 
++ extern unsigned int layoutstats_timer;
++ 
+++>>>>>>> 0762ed2ced40 (NFSv4.1/flexfiles: Allow coalescing of new layout segments and existing ones)
+  #ifdef NFS_DEBUG
+  void nfs4_print_deviceid(const struct nfs4_deviceid *dev_id);
+  #else
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.c b/fs/nfs/flexfilelayout/flexfilelayout.c
+index 0a92c66de517..9055688ca273 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -202,6 +202,65 @@ static void _ff_layout_free_lseg(struct nfs4_ff_layout_segment *fls)
+ 	}
+ }
+ 
++static bool
++ff_lseg_range_is_after(const struct pnfs_layout_range *l1,
++		const struct pnfs_layout_range *l2)
++{
++	u64 end1, end2;
++
++	if (l1->iomode != l2->iomode)
++		return l1->iomode != IOMODE_READ;
++	end1 = pnfs_calc_offset_end(l1->offset, l1->length);
++	end2 = pnfs_calc_offset_end(l2->offset, l2->length);
++	if (end1 < l2->offset)
++		return false;
++	if (end2 < l1->offset)
++		return true;
++	return l2->offset <= l1->offset;
++}
++
++static bool
++ff_lseg_merge(struct pnfs_layout_segment *new,
++		struct pnfs_layout_segment *old)
++{
++	u64 new_end, old_end;
++
++	if (new->pls_range.iomode != old->pls_range.iomode)
++		return false;
++	old_end = pnfs_calc_offset_end(old->pls_range.offset,
++			old->pls_range.length);
++	if (old_end < new->pls_range.offset)
++		return false;
++	new_end = pnfs_calc_offset_end(new->pls_range.offset,
++			new->pls_range.length);
++	if (new_end < old->pls_range.offset)
++		return false;
++
++	/* Mergeable: copy info from 'old' to 'new' */
++	if (new_end < old_end)
++		new_end = old_end;
++	if (new->pls_range.offset < old->pls_range.offset)
++		new->pls_range.offset = old->pls_range.offset;
++	new->pls_range.length = pnfs_calc_offset_length(new->pls_range.offset,
++			new_end);
++	if (test_bit(NFS_LSEG_ROC, &old->pls_flags))
++		set_bit(NFS_LSEG_ROC, &new->pls_flags);
++	if (test_bit(NFS_LSEG_LAYOUTRETURN, &old->pls_flags))
++		set_bit(NFS_LSEG_LAYOUTRETURN, &new->pls_flags);
++	return true;
++}
++
++static void
++ff_layout_add_lseg(struct pnfs_layout_hdr *lo,
++		struct pnfs_layout_segment *lseg,
++		struct list_head *free_me)
++{
++	pnfs_generic_layout_insert_lseg(lo, lseg,
++			ff_lseg_range_is_after,
++			ff_lseg_merge,
++			free_me);
++}
++
+ static void ff_layout_sort_mirrors(struct nfs4_ff_layout_segment *fls)
+ {
+ 	int i, j;
+@@ -1975,6 +2034,7 @@ static struct pnfs_layoutdriver_type flexfilelayout_type = {
+ 	.free_layout_hdr	= ff_layout_free_layout_hdr,
+ 	.alloc_lseg		= ff_layout_alloc_lseg,
+ 	.free_lseg		= ff_layout_free_lseg,
++	.add_lseg		= ff_layout_add_lseg,
+ 	.pg_read_ops		= &ff_layout_pg_read_ops,
+ 	.pg_write_ops		= &ff_layout_pg_write_ops,
+ 	.get_ds_info		= ff_layout_get_ds_info,
+* Unmerged path fs/nfs/pnfs.h
