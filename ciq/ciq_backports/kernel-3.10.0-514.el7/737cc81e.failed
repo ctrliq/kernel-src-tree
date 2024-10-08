@@ -1,0 +1,212 @@
+libceph: support for subscribing to "mdsmap.<id>" maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 737cc81ead34bcef0b1f6ea8322228e4378cf21a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/737cc81e.failed
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 737cc81ead34bcef0b1f6ea8322228e4378cf21a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/mon_client.h
+#	net/ceph/debugfs.c
+#	net/ceph/mon_client.c
+diff --cc include/linux/ceph/mon_client.h
+index 604ce57921e7,e2a92df08b47..000000000000
+--- a/include/linux/ceph/mon_client.h
++++ b/include/linux/ceph/mon_client.h
+@@@ -86,10 -90,13 +86,20 @@@ struct ceph_mon_client 
+  	struct rb_root generic_request_tree;
+  	u64 last_tid;
+  
+++<<<<<<< HEAD
+ +	/* mds/osd map */
+ +	int want_mdsmap;
+ +	int want_next_osdmap; /* 1 = want, 2 = want+asked */
+ +	u32 have_osdmap, have_mdsmap;
+++=======
++ 	/* subs, indexed with CEPH_SUB_* */
++ 	struct {
++ 		struct ceph_mon_subscribe_item item;
++ 		bool want;
++ 		u32 have; /* epoch */
++ 	} subs[3];
++ 	int fs_cluster_id; /* "mdsmap.<id>" sub */
+++>>>>>>> 737cc81ead34 (libceph: support for subscribing to "mdsmap.<id>" maps)
+  
+  #ifdef CONFIG_DEBUG_FS
+  	struct dentry *debugfs_file;
+diff --cc net/ceph/debugfs.c
+index 57d72c16f2f1,e77b04ca7802..000000000000
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@@ -117,12 -117,18 +117,26 @@@ static int monc_show(struct seq_file *s
+  
+  	mutex_lock(&monc->mutex);
+  
+++<<<<<<< HEAD
+ +	if (monc->have_mdsmap)
+ +		seq_printf(s, "have mdsmap %u\n", (unsigned int)monc->have_mdsmap);
+ +	if (monc->have_osdmap)
+ +		seq_printf(s, "have osdmap %u\n", (unsigned int)monc->have_osdmap);
+ +	if (monc->want_next_osdmap)
+ +		seq_printf(s, "want next osdmap\n");
+++=======
++ 	for (i = 0; i < ARRAY_SIZE(monc->subs); i++) {
++ 		seq_printf(s, "have %s %u", ceph_sub_str[i],
++ 			   monc->subs[i].have);
++ 		if (monc->subs[i].want)
++ 			seq_printf(s, " want %llu%s",
++ 				   le64_to_cpu(monc->subs[i].item.start),
++ 				   (monc->subs[i].item.flags &
++ 					CEPH_SUBSCRIBE_ONETIME ?  "" : "+"));
++ 		seq_putc(s, '\n');
++ 	}
++ 	seq_printf(s, "fs_cluster_id %d\n", monc->fs_cluster_id);
+++>>>>>>> 737cc81ead34 (libceph: support for subscribing to "mdsmap.<id>" maps)
+  
+  	for (rp = rb_first(&monc->generic_request_tree); rp; rp = rb_next(rp)) {
+  		__u16 op;
+diff --cc net/ceph/mon_client.c
+index 46dc90a5f37f,37c38a7fb5c5..000000000000
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@@ -185,54 -238,52 +185,84 @@@ static void __schedule_delayed(struct c
+   */
+  static void __send_subscribe(struct ceph_mon_client *monc)
+  {
+ -	struct ceph_msg *msg = monc->m_subscribe;
+ -	void *p = msg->front.iov_base;
+ -	void *const end = p + msg->front_alloc_len;
+ -	int num = 0;
+ -	int i;
+ -
+ -	dout("%s sent %lu\n", __func__, monc->sub_renew_sent);
+ -
+ -	BUG_ON(monc->cur_mon < 0);
+ -
+ -	if (!monc->sub_renew_sent)
+ -		monc->sub_renew_sent = jiffies | 1; /* never 0 */
+ -
+ -	msg->hdr.version = cpu_to_le16(2);
+ -
+ -	for (i = 0; i < ARRAY_SIZE(monc->subs); i++) {
+ -		if (monc->subs[i].want)
+ -			num++;
+ +	dout("__send_subscribe sub_sent=%u exp=%u want_osd=%d\n",
+ +	     (unsigned int)monc->sub_sent, __sub_expired(monc),
+ +	     monc->want_next_osdmap);
+ +	if ((__sub_expired(monc) && !monc->sub_sent) ||
+ +	    monc->want_next_osdmap == 1) {
+ +		struct ceph_msg *msg = monc->m_subscribe;
+ +		struct ceph_mon_subscribe_item *i;
+ +		void *p, *end;
+ +		int num;
+ +
+ +		p = msg->front.iov_base;
+ +		end = p + msg->front_alloc_len;
+ +
+ +		num = 1 + !!monc->want_next_osdmap + !!monc->want_mdsmap;
+ +		ceph_encode_32(&p, num);
+ +
+ +		if (monc->want_next_osdmap) {
+ +			dout("__send_subscribe to 'osdmap' %u\n",
+ +			     (unsigned int)monc->have_osdmap);
+ +			ceph_encode_string(&p, end, "osdmap", 6);
+ +			i = p;
+ +			i->have = cpu_to_le64(monc->have_osdmap);
+ +			i->onetime = 1;
+ +			p += sizeof(*i);
+ +			monc->want_next_osdmap = 2;  /* requested */
+ +		}
+ +		if (monc->want_mdsmap) {
+ +			dout("__send_subscribe to 'mdsmap' %u+\n",
+ +			     (unsigned int)monc->have_mdsmap);
+ +			ceph_encode_string(&p, end, "mdsmap", 6);
+ +			i = p;
+ +			i->have = cpu_to_le64(monc->have_mdsmap);
+ +			i->onetime = 0;
+ +			p += sizeof(*i);
+ +		}
+ +		ceph_encode_string(&p, end, "monmap", 6);
+ +		i = p;
+ +		i->have = 0;
+ +		i->onetime = 0;
+ +		p += sizeof(*i);
+ +
+ +		msg->front.iov_len = p - msg->front.iov_base;
+ +		msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
+ +		ceph_msg_revoke(msg);
+ +		ceph_con_send(&monc->con, ceph_msg_get(msg));
+ +
+ +		monc->sub_sent = jiffies | 1;  /* never 0 */
+  	}
+++<<<<<<< HEAD
+++=======
++ 	BUG_ON(num < 1); /* monmap sub is always there */
++ 	ceph_encode_32(&p, num);
++ 	for (i = 0; i < ARRAY_SIZE(monc->subs); i++) {
++ 		char buf[32];
++ 		int len;
++ 
++ 		if (!monc->subs[i].want)
++ 			continue;
++ 
++ 		len = sprintf(buf, "%s", ceph_sub_str[i]);
++ 		if (i == CEPH_SUB_MDSMAP &&
++ 		    monc->fs_cluster_id != CEPH_FS_CLUSTER_ID_NONE)
++ 			len += sprintf(buf + len, ".%d", monc->fs_cluster_id);
++ 
++ 		dout("%s %s start %llu flags 0x%x\n", __func__, buf,
++ 		     le64_to_cpu(monc->subs[i].item.start),
++ 		     monc->subs[i].item.flags);
++ 		ceph_encode_string(&p, end, buf, len);
++ 		memcpy(p, &monc->subs[i].item, sizeof(monc->subs[i].item));
++ 		p += sizeof(monc->subs[i].item);
++ 	}
++ 
++ 	BUG_ON(p > end);
++ 	msg->front.iov_len = p - msg->front.iov_base;
++ 	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
++ 	ceph_msg_revoke(msg);
++ 	ceph_con_send(&monc->con, ceph_msg_get(msg));
+++>>>>>>> 737cc81ead34 (libceph: support for subscribing to "mdsmap.<id>" maps)
+  }
+  
+  static void handle_subscribe_ack(struct ceph_mon_client *monc,
+@@@ -857,9 -980,8 +887,14 @@@ int ceph_monc_init(struct ceph_mon_clie
+  	monc->generic_request_tree = RB_ROOT;
+  	monc->last_tid = 0;
+  
+++<<<<<<< HEAD
+ +	monc->have_mdsmap = 0;
+ +	monc->have_osdmap = 0;
+ +	monc->want_next_osdmap = 1;
+++=======
++ 	monc->fs_cluster_id = CEPH_FS_CLUSTER_ID_NONE;
++ 
+++>>>>>>> 737cc81ead34 (libceph: support for subscribing to "mdsmap.<id>" maps)
+  	return 0;
+  
+  out_auth_reply:
+diff --git a/include/linux/ceph/ceph_fs.h b/include/linux/ceph/ceph_fs.h
+index d7d072a25c27..b853d3695361 100644
+--- a/include/linux/ceph/ceph_fs.h
++++ b/include/linux/ceph/ceph_fs.h
+@@ -207,6 +207,8 @@ struct ceph_mon_subscribe_ack {
+ 	struct ceph_fsid fsid;
+ } __attribute__ ((packed));
+ 
++#define CEPH_FS_CLUSTER_ID_NONE  -1
++
+ /*
+  * mdsmap flags
+  */
+* Unmerged path include/linux/ceph/mon_client.h
+* Unmerged path net/ceph/debugfs.c
+* Unmerged path net/ceph/mon_client.c
