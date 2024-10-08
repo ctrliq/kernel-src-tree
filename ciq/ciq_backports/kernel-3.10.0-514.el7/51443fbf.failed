@@ -1,0 +1,428 @@
+cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Fix intel_pstate powersave min_perf_pct value (Prarit Bhargava) [1283337]
+Rebuild_FUZZ: 92.91%
+commit-author Prarit Bhargava <prarit@redhat.com>
+commit 51443fbf3d2cde16011b994252c8004ebcd66fb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/51443fbf.failed
+
+On systems that initialize the intel_pstate driver with the performance
+governor, and then switch to the powersave governor will not transition to
+lower cpu frequencies until /sys/devices/system/cpu/intel_pstate/min_perf_pct
+is set to a low value.
+
+The behavior of governor switching changed after commit a04759924e25
+("[cpufreq] intel_pstate: honor user space min_perf_pct override on
+ resume").  The commit introduced tracking of performance percentage
+changes via sysfs in order to restore userspace changes during
+suspend/resume.  The problem occurs because the global values of the newly
+introduced max_sysfs_pct and min_sysfs_pct are not lowered on the governor
+change and this causes the powersave governor to inherit the performance
+governor's settings.
+
+A simple change would have been to reset max_sysfs_pct to 100 and
+min_sysfs_pct to 0 on a governor change, which fixes the problem with
+governor switching.  However, since we cannot break userspace[1] the fix
+is now to give each governor its own limits storage area so that governor
+specific changes are tracked.
+
+I successfully tested this by booting with both the performance governor
+and the powersave governor by default, and switching between the two
+governors (while monitoring /sys/devices/system/cpu/intel_pstate/ values,
+and looking at the output of cpupower frequency-info).  Suspend/Resume
+testing was performed by Doug Smythies.
+
+[1] Systems which suspend/resume using the unmaintained pm-utils package
+will always transition to the performance governor before the suspend and
+after the resume.  This means a system using the powersave governor will
+go from powersave to performance, then suspend/resume, performance to
+powersave.  The simple change during governor changes would have been
+overwritten when the governor changed before and after the suspend/resume.
+I have submitted https://bugzilla.redhat.com/show_bug.cgi?id=1271225
+against Fedora to remove the 94cpufreq file that causes the problem.  It
+should be noted that pm-utils is obsoleted with newer versions of systemd.
+
+	Signed-off-by: Prarit Bhargava <prarit@redhat.com>
+	Acked-by: Kristen Carlson Accardi <kristen@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 51443fbf3d2cde16011b994252c8004ebcd66fb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 07d88cb77cb6,93a3c635ea27..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -152,9 -161,26 +152,22 @@@ struct perf_limits 
+  	int32_t min_perf;
+  	int max_policy_pct;
+  	int max_sysfs_pct;
+ -	int min_policy_pct;
+ -	int min_sysfs_pct;
+ -	int max_perf_ctl;
+ -	int min_perf_ctl;
+  };
+  
+- static struct perf_limits limits = {
++ static struct perf_limits performance_limits = {
++ 	.no_turbo = 0,
++ 	.turbo_disabled = 0,
++ 	.max_perf_pct = 100,
++ 	.max_perf = int_tofp(1),
++ 	.min_perf_pct = 100,
++ 	.min_perf = int_tofp(1),
++ 	.max_policy_pct = 100,
++ 	.max_sysfs_pct = 100,
++ 	.min_policy_pct = 0,
++ 	.min_sysfs_pct = 0,
++ };
++ 
++ static struct perf_limits powersave_limits = {
+  	.no_turbo = 0,
+  	.turbo_disabled = 0,
+  	.max_perf_pct = 100,
+@@@ -163,8 -189,165 +176,164 @@@
+  	.min_perf = 0,
+  	.max_policy_pct = 100,
+  	.max_sysfs_pct = 100,
+ -	.min_policy_pct = 0,
+ -	.min_sysfs_pct = 0,
+ -	.max_perf_ctl = 0,
+ -	.min_perf_ctl = 0,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE
++ static struct perf_limits *limits = &performance_limits;
++ #else
++ static struct perf_limits *limits = &powersave_limits;
++ #endif
++ 
++ #if IS_ENABLED(CONFIG_ACPI)
++ /*
++  * The max target pstate ratio is a 8 bit value in both PLATFORM_INFO MSR and
++  * in TURBO_RATIO_LIMIT MSR, which pstate driver stores in max_pstate and
++  * max_turbo_pstate fields. The PERF_CTL MSR contains 16 bit value for P state
++  * ratio, out of it only high 8 bits are used. For example 0x1700 is setting
++  * target ratio 0x17. The _PSS control value stores in a format which can be
++  * directly written to PERF_CTL MSR. But in intel_pstate driver this shift
++  * occurs during write to PERF_CTL (E.g. for cores core_set_pstate()).
++  * This function converts the _PSS control value to intel pstate driver format
++  * for comparison and assignment.
++  */
++ static int convert_to_native_pstate_format(struct cpudata *cpu, int index)
++ {
++ 	return cpu->acpi_perf_data.states[index].control >> 8;
++ }
++ 
++ static int intel_pstate_init_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	int ret;
++ 	bool turbo_absent = false;
++ 	int max_pstate_index;
++ 	int min_pss_ctl, max_pss_ctl, turbo_pss_ctl;
++ 	int i;
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 
++ 	pr_debug("intel_pstate: default limits 0x%x 0x%x 0x%x\n",
++ 		 cpu->pstate.min_pstate, cpu->pstate.max_pstate,
++ 		 cpu->pstate.turbo_pstate);
++ 
++ 	if (!cpu->acpi_perf_data.shared_cpu_map &&
++ 	    zalloc_cpumask_var_node(&cpu->acpi_perf_data.shared_cpu_map,
++ 				    GFP_KERNEL, cpu_to_node(policy->cpu))) {
++ 		return -ENOMEM;
++ 	}
++ 
++ 	ret = acpi_processor_register_performance(&cpu->acpi_perf_data,
++ 						  policy->cpu);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * Check if the control value in _PSS is for PERF_CTL MSR, which should
++ 	 * guarantee that the states returned by it map to the states in our
++ 	 * list directly.
++ 	 */
++ 	if (cpu->acpi_perf_data.control_register.space_id !=
++ 						ACPI_ADR_SPACE_FIXED_HARDWARE)
++ 		return -EIO;
++ 
++ 	pr_debug("intel_pstate: CPU%u - ACPI _PSS perf data\n", policy->cpu);
++ 	for (i = 0; i < cpu->acpi_perf_data.state_count; i++)
++ 		pr_debug("     %cP%d: %u MHz, %u mW, 0x%x\n",
++ 			 (i == cpu->acpi_perf_data.state ? '*' : ' '), i,
++ 			 (u32) cpu->acpi_perf_data.states[i].core_frequency,
++ 			 (u32) cpu->acpi_perf_data.states[i].power,
++ 			 (u32) cpu->acpi_perf_data.states[i].control);
++ 
++ 	/*
++ 	 * If there is only one entry _PSS, simply ignore _PSS and continue as
++ 	 * usual without taking _PSS into account
++ 	 */
++ 	if (cpu->acpi_perf_data.state_count < 2)
++ 		return 0;
++ 
++ 	turbo_pss_ctl = convert_to_native_pstate_format(cpu, 0);
++ 	min_pss_ctl = convert_to_native_pstate_format(cpu,
++ 					cpu->acpi_perf_data.state_count - 1);
++ 	/* Check if there is a turbo freq in _PSS */
++ 	if (turbo_pss_ctl <= cpu->pstate.max_pstate &&
++ 	    turbo_pss_ctl > cpu->pstate.min_pstate) {
++ 		pr_debug("intel_pstate: no turbo range exists in _PSS\n");
++ 		limits->no_turbo = limits->turbo_disabled = 1;
++ 		cpu->pstate.turbo_pstate = cpu->pstate.max_pstate;
++ 		turbo_absent = true;
++ 	}
++ 
++ 	/* Check if the max non turbo p state < Intel P state max */
++ 	max_pstate_index = turbo_absent ? 0 : 1;
++ 	max_pss_ctl = convert_to_native_pstate_format(cpu, max_pstate_index);
++ 	if (max_pss_ctl < cpu->pstate.max_pstate &&
++ 	    max_pss_ctl > cpu->pstate.min_pstate)
++ 		cpu->pstate.max_pstate = max_pss_ctl;
++ 
++ 	/* check If min perf > Intel P State min */
++ 	if (min_pss_ctl > cpu->pstate.min_pstate &&
++ 	    min_pss_ctl < cpu->pstate.max_pstate) {
++ 		cpu->pstate.min_pstate = min_pss_ctl;
++ 		policy->cpuinfo.min_freq = min_pss_ctl * cpu->pstate.scaling;
++ 	}
++ 
++ 	if (turbo_absent)
++ 		policy->cpuinfo.max_freq = cpu->pstate.max_pstate *
++ 						cpu->pstate.scaling;
++ 	else {
++ 		policy->cpuinfo.max_freq = cpu->pstate.turbo_pstate *
++ 						cpu->pstate.scaling;
++ 		/*
++ 		 * The _PSS table doesn't contain whole turbo frequency range.
++ 		 * This just contains +1 MHZ above the max non turbo frequency,
++ 		 * with control value corresponding to max turbo ratio. But
++ 		 * when cpufreq set policy is called, it will call with this
++ 		 * max frequency, which will cause a reduced performance as
++ 		 * this driver uses real max turbo frequency as the max
++ 		 * frequeny. So correct this frequency in _PSS table to
++ 		 * correct max turbo frequency based on the turbo ratio.
++ 		 * Also need to convert to MHz as _PSS freq is in MHz.
++ 		 */
++ 		cpu->acpi_perf_data.states[0].core_frequency =
++ 						turbo_pss_ctl * 100;
++ 	}
++ 
++ 	pr_debug("intel_pstate: Updated limits using _PSS 0x%x 0x%x 0x%x\n",
++ 		 cpu->pstate.min_pstate, cpu->pstate.max_pstate,
++ 		 cpu->pstate.turbo_pstate);
++ 	pr_debug("intel_pstate: policy max_freq=%d Khz min_freq = %d KHz\n",
++ 		 policy->cpuinfo.max_freq, policy->cpuinfo.min_freq);
++ 
++ 	return 0;
++ }
++ 
++ static int intel_pstate_exit_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 
++ 	if (!no_acpi_perf)
++ 		return 0;
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	acpi_processor_unregister_performance(policy->cpu);
++ 	return 0;
++ }
++ 
++ #else
++ static int intel_pstate_init_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	return 0;
++ }
++ 
++ static int intel_pstate_exit_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  static inline void pid_reset(struct _pid *pid, int setpoint, int busy,
+  			     int deadband, int integral) {
+  	pid->setpoint = setpoint;
+@@@ -401,8 -584,8 +570,13 @@@ static ssize_t store_no_turbo(struct ko
+  		return -EINVAL;
+  
+  	update_turbo_state();
+++<<<<<<< HEAD
+ +	if (limits.turbo_disabled) {
+ +		pr_warn("Turbo disabled by BIOS or unavailable on processor\n");
+++=======
++ 	if (limits->turbo_disabled) {
++ 		pr_warn("intel_pstate: Turbo disabled by BIOS or unavailable on processor\n");
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  		return -EPERM;
+  	}
+  
+@@@ -424,9 -607,15 +598,21 @@@ static ssize_t store_max_perf_pct(struc
+  	if (ret != 1)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	limits.max_sysfs_pct = clamp_t(int, input, 0 , 100);
+ +	limits.max_perf_pct = min(limits.max_policy_pct, limits.max_sysfs_pct);
+ +	limits.max_perf = div_fp(int_tofp(limits.max_perf_pct), int_tofp(100));
+++=======
++ 	limits->max_sysfs_pct = clamp_t(int, input, 0 , 100);
++ 	limits->max_perf_pct = min(limits->max_policy_pct,
++ 				   limits->max_sysfs_pct);
++ 	limits->max_perf_pct = max(limits->min_policy_pct,
++ 				   limits->max_perf_pct);
++ 	limits->max_perf_pct = max(limits->min_perf_pct,
++ 				   limits->max_perf_pct);
++ 	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
++ 				  int_tofp(100));
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  
+  	if (hwp_active)
+  		intel_pstate_hwp_set();
+@@@ -442,8 -631,16 +628,21 @@@ static ssize_t store_min_perf_pct(struc
+  	ret = sscanf(buf, "%u", &input);
+  	if (ret != 1)
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	limits.min_perf_pct = clamp_t(int, input, 0 , 100);
+ +	limits.min_perf = div_fp(int_tofp(limits.min_perf_pct), int_tofp(100));
+++=======
++ 
++ 	limits->min_sysfs_pct = clamp_t(int, input, 0 , 100);
++ 	limits->min_perf_pct = max(limits->min_policy_pct,
++ 				   limits->min_sysfs_pct);
++ 	limits->min_perf_pct = min(limits->max_policy_pct,
++ 				   limits->min_perf_pct);
++ 	limits->min_perf_pct = min(limits->max_perf_pct,
++ 				   limits->min_perf_pct);
++ 	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
++ 				  int_tofp(100));
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  
+  	if (hwp_active)
+  		intel_pstate_hwp_set();
+@@@ -712,15 -940,26 +911,35 @@@ static void intel_pstate_get_min_max(st
+  	 * policy, or by cpu specific default values determined through
+  	 * experimentation.
+  	 */
+++<<<<<<< HEAD
+ +	max_perf_adj = fp_toint(mul_fp(int_tofp(max_perf), limits.max_perf));
+ +	*max = clamp_t(int, max_perf_adj,
+ +			cpu->pstate.min_pstate, cpu->pstate.turbo_pstate);
+ +
+ +	min_perf = fp_toint(mul_fp(int_tofp(max_perf), limits.min_perf));
+ +	*min = clamp_t(int, min_perf, cpu->pstate.min_pstate, max_perf);
+++=======
++ 	if (limits->max_perf_ctl && limits->max_sysfs_pct >=
++ 						limits->max_policy_pct) {
++ 		*max = limits->max_perf_ctl;
++ 	} else {
++ 		max_perf_adj = fp_toint(mul_fp(int_tofp(max_perf),
++ 					limits->max_perf));
++ 		*max = clamp_t(int, max_perf_adj, cpu->pstate.min_pstate,
++ 			       cpu->pstate.turbo_pstate);
++ 	}
++ 
++ 	if (limits->min_perf_ctl) {
++ 		*min = limits->min_perf_ctl;
++ 	} else {
++ 		min_perf = fp_toint(mul_fp(int_tofp(max_perf),
++ 				    limits->min_perf));
++ 		*min = clamp_t(int, min_perf, cpu->pstate.min_pstate, max_perf);
++ 	}
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  }
+  
+ -static void intel_pstate_set_pstate(struct cpudata *cpu, int pstate, bool force)
+ +static void intel_pstate_set_pstate(struct cpudata *cpu, int pstate)
+  {
+  	int max_perf, min_perf;
+  
+@@@ -986,24 -1242,53 +1205,74 @@@ static int intel_pstate_set_policy(stru
+  
+  	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+  	    policy->max >= policy->cpuinfo.max_freq) {
+++<<<<<<< HEAD
+ +		limits.min_perf_pct = 100;
+ +		limits.min_perf = int_tofp(1);
+ +		limits.max_policy_pct = 100;
+ +		limits.max_perf_pct = 100;
+ +		limits.max_perf = int_tofp(1);
+ +		limits.no_turbo = 0;
+ +		return 0;
+ +	}
+ +
+ +	limits.min_perf_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+ +	limits.min_perf_pct = clamp_t(int, limits.min_perf_pct, 0 , 100);
+ +	limits.min_perf = div_fp(int_tofp(limits.min_perf_pct), int_tofp(100));
+ +
+ +	limits.max_policy_pct = (policy->max * 100) / policy->cpuinfo.max_freq;
+ +	limits.max_policy_pct = clamp_t(int, limits.max_policy_pct, 0 , 100);
+ +	limits.max_perf_pct = min(limits.max_policy_pct, limits.max_sysfs_pct);
+ +	limits.max_perf = div_fp(int_tofp(limits.max_perf_pct), int_tofp(100));
+ +
+++=======
++ 		pr_debug("intel_pstate: set performance\n");
++ 		limits = &performance_limits;
++ 		return 0;
++ 	}
++ 
++ 	pr_debug("intel_pstate: set powersave\n");
++ 	limits = &powersave_limits;
++ 	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
++ 	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
++ 	limits->max_policy_pct = (policy->max * 100) / policy->cpuinfo.max_freq;
++ 	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0 , 100);
++ 
++ 	/* Normalize user input to [min_policy_pct, max_policy_pct] */
++ 	limits->min_perf_pct = max(limits->min_policy_pct,
++ 				   limits->min_sysfs_pct);
++ 	limits->min_perf_pct = min(limits->max_policy_pct,
++ 				   limits->min_perf_pct);
++ 	limits->max_perf_pct = min(limits->max_policy_pct,
++ 				   limits->max_sysfs_pct);
++ 	limits->max_perf_pct = max(limits->min_policy_pct,
++ 				   limits->max_perf_pct);
++ 
++ 	/* Make sure min_perf_pct <= max_perf_pct */
++ 	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
++ 
++ 	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
++ 				  int_tofp(100));
++ 	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
++ 				  int_tofp(100));
++ 
++ #if IS_ENABLED(CONFIG_ACPI)
++ 	cpu = all_cpu_data[policy->cpu];
++ 	for (i = 0; i < cpu->acpi_perf_data.state_count; i++) {
++ 		int control;
++ 
++ 		control = convert_to_native_pstate_format(cpu, i);
++ 		if (control * cpu->pstate.scaling == policy->max)
++ 			limits->max_perf_ctl = control;
++ 		if (control * cpu->pstate.scaling == policy->min)
++ 			limits->min_perf_ctl = control;
++ 	}
++ 
++ 	pr_debug("intel_pstate: max %u policy_max %u perf_ctl [0x%x-0x%x]\n",
++ 		 policy->cpuinfo.max_freq, policy->max, limits->min_perf_ctl,
++ 		 limits->max_perf_ctl);
++ #endif
++ 
+++>>>>>>> 51443fbf3d2c (cpufreq: intel_pstate: Fix intel_pstate powersave min_perf_pct value)
+  	if (hwp_active)
+  		intel_pstate_hwp_set();
+  
+* Unmerged path drivers/cpufreq/intel_pstate.c
