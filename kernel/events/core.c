@@ -3614,6 +3614,19 @@ static int perf_event_read_one(struct perf_event *event,
 	return n * sizeof(u64);
 }
 
+static bool is_event_hup(struct perf_event *event)
+{
+	bool no_children;
+
+	if (event->state != PERF_EVENT_STATE_EXIT)
+		return false;
+
+	mutex_lock(&event->child_mutex);
+	no_children = list_empty(&event->child_list);
+	mutex_unlock(&event->child_mutex);
+	return no_children;
+}
+
 /*
  * Read the performance event - simple non blocking version for now
  */
@@ -3659,7 +3672,7 @@ static unsigned int perf_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &event->waitq, wait);
 
-	if (event->state == PERF_EVENT_STATE_EXIT)
+	if (is_event_hup(event))
 		return events;
 
 	/*
@@ -7600,6 +7613,12 @@ static void sync_child_event(struct perf_event *child_event,
 	mutex_lock(&parent_event->child_mutex);
 	list_del_init(&child_event->child_list);
 	mutex_unlock(&parent_event->child_mutex);
+
+	/*
+	 * Make sure user/parent get notified, that we just
+	 * lost one event.
+	 */
+	perf_event_wakeup(parent_event);
 
 	/*
 	 * Release the parent event, if this was the last
