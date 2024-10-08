@@ -1,0 +1,182 @@
+PCI: Mark AMD/ATI VGA devices that don't reset on D3hot->D0 transition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [pci] Mark AMD/ATI VGA devices that don't reset on D3hot->D0 transition (Myron Stowe) [1171802]
+Rebuild_FUZZ: 96.30%
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit d84f31744643e2c439466d513ebc1bc81c4d9186
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d84f3174.failed
+
+Some AMD/ATI GPUs report NoSoftRst- to indicate that they perform a reset
+when software transitions them from D3hot to D0, but there is no apparent
+effect on the device: the monitor remains synced and the framebuffer
+contents are retained.
+
+Callers of pci_reset_function() don't necessarily have a way to validate
+whether a reset was effective, so we don't want to rely on NoSoftRst if
+it's known to be inaccurate.  Returning an error in such cases appears to
+be the better option.  For users like vfio-pci, this allows the driver to
+escalate to the bus reset interfaces.
+
+If a device lives on the root bus, there's really no further
+escalation path, so we exempt PM reset as potentially better than
+nothing.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit d84f31744643e2c439466d513ebc1bc81c4d9186)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/quirks.c
+diff --cc drivers/pci/quirks.c
+index 198ddcbe8322,31e7972ca1b5..000000000000
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@@ -3027,6 -3028,138 +3027,141 @@@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_
+  DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MELLANOX, PCI_ANY_ID,
+  			 quirk_broken_intx_masking);
+  
+++<<<<<<< HEAD
+++=======
++ static void quirk_no_bus_reset(struct pci_dev *dev)
++ {
++ 	dev->dev_flags |= PCI_DEV_FLAGS_NO_BUS_RESET;
++ }
++ 
++ /*
++  * Atheros AR93xx chips do not behave after a bus reset.  The device will
++  * throw a Link Down error on AER-capable systems and regardless of AER,
++  * config space of the device is never accessible again and typically
++  * causes the system to hang or reset when access is attempted.
++  * http://www.spinics.net/lists/linux-pci/msg34797.html
++  */
++ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_ATHEROS, 0x0030, quirk_no_bus_reset);
++ 
++ static void quirk_no_pm_reset(struct pci_dev *dev)
++ {
++ 	/*
++ 	 * We can't do a bus reset on root bus devices, but an ineffective
++ 	 * PM reset may be better than nothing.
++ 	 */
++ 	if (!pci_is_root_bus(dev->bus))
++ 		dev->dev_flags |= PCI_DEV_FLAGS_NO_PM_RESET;
++ }
++ 
++ /*
++  * Some AMD/ATI GPUS (HD8570 - Oland) report that a D3hot->D0 transition
++  * causes a reset (i.e., they advertise NoSoftRst-).  This transition seems
++  * to have no effect on the device: it retains the framebuffer contents and
++  * monitor sync.  Advertising this support makes other layers, like VFIO,
++  * assume pci_reset_function() is viable for this device.  Mark it as
++  * unavailable to skip it when testing reset methods.
++  */
++ DECLARE_PCI_FIXUP_CLASS_HEADER(PCI_VENDOR_ID_ATI, PCI_ANY_ID,
++ 			       PCI_CLASS_DISPLAY_VGA, 8, quirk_no_pm_reset);
++ 
++ #ifdef CONFIG_ACPI
++ /*
++  * Apple: Shutdown Cactus Ridge Thunderbolt controller.
++  *
++  * On Apple hardware the Cactus Ridge Thunderbolt controller needs to be
++  * shutdown before suspend. Otherwise the native host interface (NHI) will not
++  * be present after resume if a device was plugged in before suspend.
++  *
++  * The thunderbolt controller consists of a pcie switch with downstream
++  * bridges leading to the NHI and to the tunnel pci bridges.
++  *
++  * This quirk cuts power to the whole chip. Therefore we have to apply it
++  * during suspend_noirq of the upstream bridge.
++  *
++  * Power is automagically restored before resume. No action is needed.
++  */
++ static void quirk_apple_poweroff_thunderbolt(struct pci_dev *dev)
++ {
++ 	acpi_handle bridge, SXIO, SXFP, SXLV;
++ 
++ 	if (!dmi_match(DMI_BOARD_VENDOR, "Apple Inc."))
++ 		return;
++ 	if (pci_pcie_type(dev) != PCI_EXP_TYPE_UPSTREAM)
++ 		return;
++ 	bridge = ACPI_HANDLE(&dev->dev);
++ 	if (!bridge)
++ 		return;
++ 	/*
++ 	 * SXIO and SXLV are present only on machines requiring this quirk.
++ 	 * TB bridges in external devices might have the same device id as those
++ 	 * on the host, but they will not have the associated ACPI methods. This
++ 	 * implicitly checks that we are at the right bridge.
++ 	 */
++ 	if (ACPI_FAILURE(acpi_get_handle(bridge, "DSB0.NHI0.SXIO", &SXIO))
++ 	    || ACPI_FAILURE(acpi_get_handle(bridge, "DSB0.NHI0.SXFP", &SXFP))
++ 	    || ACPI_FAILURE(acpi_get_handle(bridge, "DSB0.NHI0.SXLV", &SXLV)))
++ 		return;
++ 	dev_info(&dev->dev, "quirk: cutting power to thunderbolt controller...\n");
++ 
++ 	/* magic sequence */
++ 	acpi_execute_simple_method(SXIO, NULL, 1);
++ 	acpi_execute_simple_method(SXFP, NULL, 0);
++ 	msleep(300);
++ 	acpi_execute_simple_method(SXLV, NULL, 0);
++ 	acpi_execute_simple_method(SXIO, NULL, 0);
++ 	acpi_execute_simple_method(SXLV, NULL, 0);
++ }
++ DECLARE_PCI_FIXUP_SUSPEND_LATE(PCI_VENDOR_ID_INTEL, 0x1547,
++ 			       quirk_apple_poweroff_thunderbolt);
++ 
++ /*
++  * Apple: Wait for the thunderbolt controller to reestablish pci tunnels.
++  *
++  * During suspend the thunderbolt controller is reset and all pci
++  * tunnels are lost. The NHI driver will try to reestablish all tunnels
++  * during resume. We have to manually wait for the NHI since there is
++  * no parent child relationship between the NHI and the tunneled
++  * bridges.
++  */
++ static void quirk_apple_wait_for_thunderbolt(struct pci_dev *dev)
++ {
++ 	struct pci_dev *sibling = NULL;
++ 	struct pci_dev *nhi = NULL;
++ 
++ 	if (!dmi_match(DMI_BOARD_VENDOR, "Apple Inc."))
++ 		return;
++ 	if (pci_pcie_type(dev) != PCI_EXP_TYPE_DOWNSTREAM)
++ 		return;
++ 	/*
++ 	 * Find the NHI and confirm that we are a bridge on the tb host
++ 	 * controller and not on a tb endpoint.
++ 	 */
++ 	sibling = pci_get_slot(dev->bus, 0x0);
++ 	if (sibling == dev)
++ 		goto out; /* we are the downstream bridge to the NHI */
++ 	if (!sibling || !sibling->subordinate)
++ 		goto out;
++ 	nhi = pci_get_slot(sibling->subordinate, 0x0);
++ 	if (!nhi)
++ 		goto out;
++ 	if (nhi->vendor != PCI_VENDOR_ID_INTEL
++ 			|| (nhi->device != 0x1547 && nhi->device != 0x156c)
++ 			|| nhi->subsystem_vendor != 0x2222
++ 			|| nhi->subsystem_device != 0x1111)
++ 		goto out;
++ 	dev_info(&dev->dev, "quirk: wating for thunderbolt to reestablish pci tunnels...\n");
++ 	device_pm_wait_for_dev(&dev->dev, &nhi->dev);
++ out:
++ 	pci_dev_put(nhi);
++ 	pci_dev_put(sibling);
++ }
++ DECLARE_PCI_FIXUP_RESUME_EARLY(PCI_VENDOR_ID_INTEL, 0x1547,
++ 			       quirk_apple_wait_for_thunderbolt);
++ DECLARE_PCI_FIXUP_RESUME_EARLY(PCI_VENDOR_ID_INTEL, 0x156d,
++ 			       quirk_apple_wait_for_thunderbolt);
++ #endif
++ 
+++>>>>>>> d84f31744643 (PCI: Mark AMD/ATI VGA devices that don't reset on D3hot->D0 transition)
+  static void pci_do_fixups(struct pci_dev *dev, struct pci_fixup *f,
+  			  struct pci_fixup *end)
+  {
+* Unmerged path drivers/pci/quirks.c
