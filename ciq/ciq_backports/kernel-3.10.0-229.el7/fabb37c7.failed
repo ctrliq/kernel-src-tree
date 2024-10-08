@@ -1,0 +1,387 @@
+x86/efi: Split efi_enter_virtual_mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [x86] efi: Split efi_enter_virtual_mode (Dave Young) [1080109]
+Rebuild_FUZZ: 94.29%
+commit-author Borislav Petkov <bp@suse.de>
+commit fabb37c736f9f688fe3eec98550a5c032a07cfaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/fabb37c7.failed
+
+... into a kexec flavor for better code readability and simplicity. The
+original one was getting ugly with ifdeffery.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Toshi Kani <toshi.kani@hp.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit fabb37c736f9f688fe3eec98550a5c032a07cfaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+diff --cc arch/x86/platform/efi/efi.c
+index 4ba4bd5dfe10,6f0a46730826..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -804,6 -863,84 +804,87 @@@ void __init efi_enter_virtual_mode(void
+  		}
+  		prev_md = md;
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static void __init get_systab_virt_addr(efi_memory_desc_t *md)
++ {
++ 	unsigned long size;
++ 	u64 end, systab;
++ 
++ 	size = md->num_pages << EFI_PAGE_SHIFT;
++ 	end = md->phys_addr + size;
++ 	systab = (u64)(unsigned long)efi_phys.systab;
++ 	if (md->phys_addr <= systab && systab < end) {
++ 		systab += md->virt_addr - md->phys_addr;
++ 		efi.systab = (efi_system_table_t *)(unsigned long)systab;
++ 	}
++ }
++ 
++ static void __init save_runtime_map(void)
++ {
++ #ifdef CONFIG_KEXEC
++ 	efi_memory_desc_t *md;
++ 	void *tmp, *p, *q = NULL;
++ 	int count = 0;
++ 
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RUNTIME) ||
++ 		    (md->type == EFI_BOOT_SERVICES_CODE) ||
++ 		    (md->type == EFI_BOOT_SERVICES_DATA))
++ 			continue;
++ 		tmp = krealloc(q, (count + 1) * memmap.desc_size, GFP_KERNEL);
++ 		if (!tmp)
++ 			goto out;
++ 		q = tmp;
++ 
++ 		memcpy(q + count * memmap.desc_size, md, memmap.desc_size);
++ 		count++;
++ 	}
++ 
++ 	efi_runtime_map_setup(q, count, memmap.desc_size);
++ 	return;
++ 
++ out:
++ 	kfree(q);
++ 	pr_err("Error saving runtime map, efi runtime on kexec non-functional!!\n");
++ #endif
++ }
++ 
++ static void *realloc_pages(void *old_memmap, int old_shift)
++ {
++ 	void *ret;
++ 
++ 	ret = (void *)__get_free_pages(GFP_KERNEL, old_shift + 1);
++ 	if (!ret)
++ 		goto out;
++ 
++ 	/*
++ 	 * A first-time allocation doesn't have anything to copy.
++ 	 */
++ 	if (!old_memmap)
++ 		return ret;
++ 
++ 	memcpy(ret, old_memmap, PAGE_SIZE << old_shift);
++ 
++ out:
++ 	free_pages((unsigned long)old_memmap, old_shift);
++ 	return ret;
++ }
++ 
++ /*
++  * Map the efi memory ranges of the runtime services and update new_mmap with
++  * virtual addresses.
++  */
++ static void * __init efi_map_regions(int *count, int *pg_shift)
++ {
++ 	void *p, *new_memmap = NULL;
++ 	unsigned long left = 0;
++ 	efi_memory_desc_t *md;
+++>>>>>>> fabb37c736f9 (x86/efi: Split efi_enter_virtual_mode)
+  
+  	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+  		md = p;
+@@@ -815,55 -952,159 +896,196 @@@
+  				continue;
+  		}
+  
+ -		efi_map_region(md);
+ -		get_systab_virt_addr(md);
+ +		size = md->num_pages << EFI_PAGE_SHIFT;
+ +		end = md->phys_addr + size;
+ +
+ +		start_pfn = PFN_DOWN(md->phys_addr);
+ +		end_pfn = PFN_UP(end);
+ +		if (pfn_range_is_mapped(start_pfn, end_pfn)) {
+ +			va = __va(md->phys_addr);
+ +
+ +			if (!(md->attribute & EFI_MEMORY_WB))
+ +				efi_memory_uc((u64)(unsigned long)va, size);
+ +		} else
+ +			va = efi_ioremap(md->phys_addr, size,
+ +					 md->type, md->attribute);
+  
+ -		if (left < memmap.desc_size) {
+ -			new_memmap = realloc_pages(new_memmap, *pg_shift);
+ -			if (!new_memmap)
+ -				return NULL;
+ +		md->virt_addr = (u64) (unsigned long) va;
+  
+ -			left += PAGE_SIZE << *pg_shift;
+ -			(*pg_shift)++;
+ +		if (!va) {
+ +			pr_err("ioremap of 0x%llX failed!\n",
+ +			       (unsigned long long)md->phys_addr);
+ +			continue;
+  		}
+  
+ -		memcpy(new_memmap + (*count * memmap.desc_size), md,
+ +		systab = (u64) (unsigned long) efi_phys.systab;
+ +		if (md->phys_addr <= systab && systab < end) {
+ +			systab += md->virt_addr - md->phys_addr;
+ +			efi.systab = (efi_system_table_t *) (unsigned long) systab;
+ +		}
+ +		new_memmap = krealloc(new_memmap,
+ +				      (count + 1) * memmap.desc_size,
+ +				      GFP_KERNEL);
+ +		if (!new_memmap)
+ +			goto err_out;
+ +
+ +		memcpy(new_memmap + (count * memmap.desc_size), md,
+  		       memmap.desc_size);
+++<<<<<<< HEAD
+ +		count++;
+++=======
++ 
++ 		left -= memmap.desc_size;
++ 		(*count)++;
++ 	}
++ 
++ 	return new_memmap;
++ }
++ 
++ static void __init kexec_enter_virtual_mode(void)
++ {
++ #ifdef CONFIG_KEXEC
++ 	efi_memory_desc_t *md;
++ 	void *p;
++ 
++ 	efi.systab = NULL;
++ 
++ 	/*
++ 	 * We don't do virtual mode, since we don't do runtime services, on
++ 	 * non-native EFI
++ 	 */
++ 	if (!efi_is_native()) {
++ 		efi_unmap_memmap();
++ 		return;
+  	}
+  
++ 	/*
++ 	* Map efi regions which were passed via setup_data. The virt_addr is a
++ 	* fixed addr which was used in first kernel of a kexec boot.
++ 	*/
++ 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
++ 		md = p;
++ 		efi_map_region_fixed(md); /* FIXME: add error handling */
++ 		get_systab_virt_addr(md);
++ 	}
++ 
++ 	save_runtime_map();
++ 
+  	BUG_ON(!efi.systab);
+  
++ 	efi_sync_low_kernel_mappings();
++ 
++ 	/*
++ 	 * Now that EFI is in virtual mode, update the function
++ 	 * pointers in the runtime service table to the new virtual addresses.
++ 	 *
++ 	 * Call EFI services through wrapper functions.
++ 	 */
++ 	efi.runtime_version = efi_systab.hdr.revision;
++ 	efi.get_time = virt_efi_get_time;
++ 	efi.set_time = virt_efi_set_time;
++ 	efi.get_wakeup_time = virt_efi_get_wakeup_time;
++ 	efi.set_wakeup_time = virt_efi_set_wakeup_time;
++ 	efi.get_variable = virt_efi_get_variable;
++ 	efi.get_next_variable = virt_efi_get_next_variable;
++ 	efi.set_variable = virt_efi_set_variable;
++ 	efi.get_next_high_mono_count = virt_efi_get_next_high_mono_count;
++ 	efi.reset_system = virt_efi_reset_system;
++ 	efi.set_virtual_address_map = NULL;
++ 	efi.query_variable_info = virt_efi_query_variable_info;
++ 	efi.update_capsule = virt_efi_update_capsule;
++ 	efi.query_capsule_caps = virt_efi_query_capsule_caps;
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP) && (__supported_pte_mask & _PAGE_NX))
++ 		runtime_code_page_mkexec();
++ 
++ 	/* clean DUMMY object */
++ 	efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
++ 			 EFI_VARIABLE_NON_VOLATILE |
++ 			 EFI_VARIABLE_BOOTSERVICE_ACCESS |
++ 			 EFI_VARIABLE_RUNTIME_ACCESS,
++ 			 0, NULL);
++ #endif
++ }
++ 
++ /*
++  * This function will switch the EFI runtime services to virtual mode.
++  * Essentially, we look through the EFI memmap and map every region that
++  * has the runtime attribute bit set in its memory descriptor into the
++  * ->trampoline_pgd page table using a top-down VA allocation scheme.
++  *
++  * The old method which used to update that memory descriptor with the
++  * virtual address obtained from ioremap() is still supported when the
++  * kernel is booted with efi=old_map on its command line. Same old
++  * method enabled the runtime services to be called without having to
++  * thunk back into physical mode for every invocation.
++  *
++  * The new method does a pagetable switch in a preemption-safe manner
++  * so that we're in a different address space when calling a runtime
++  * function. For function arguments passing we do copy the PGDs of the
++  * kernel page table into ->trampoline_pgd prior to each call.
++  *
++  * Specially for kexec boot, efi runtime maps in previous kernel should
++  * be passed in via setup_data. In that case runtime ranges will be mapped
++  * to the same virtual addresses as the first kernel, see
++  * kexec_enter_virtual_mode().
++  */
++ static void __init __efi_enter_virtual_mode(void)
++ {
++ 	int count = 0, pg_shift = 0;
++ 	void *new_memmap = NULL;
++ 	efi_status_t status;
++ 
++ 	efi.systab = NULL;
++ 
++ 	/*
++ 	 * We don't do virtual mode, since we don't do runtime services, on
++ 	 * non-native EFI
++ 	 */
++ 	if (!efi_is_native()) {
++ 		efi_unmap_memmap();
++ 		return;
++ 	}
++ 
++ 	efi_merge_regions();
++ 	new_memmap = efi_map_regions(&count, &pg_shift);
++ 	if (!new_memmap) {
++ 		pr_err("Error reallocating memory, EFI runtime non-functional!\n");
++ 		return;
+++>>>>>>> fabb37c736f9 (x86/efi: Split efi_enter_virtual_mode)
++ 	}
++ 
++ 	save_runtime_map();
++ 
++ 	BUG_ON(!efi.systab);
++ 
+++<<<<<<< HEAD
+ +	status = phys_efi_set_virtual_address_map(
+ +		memmap.desc_size * count,
+ +		memmap.desc_size,
+ +		memmap.desc_version,
+ +		(efi_memory_desc_t *)__pa(new_memmap));
+ +
+ +	if (status != EFI_SUCCESS) {
+ +		pr_alert("Unable to switch EFI into virtual mode "
+ +			 "(status=%lx)!\n", status);
+++=======
++ 	if (efi_setup_page_tables(__pa(new_memmap), 1 << pg_shift))
++ 		return;
++ 
++ 	efi_sync_low_kernel_mappings();
++ 	efi_dump_pagetable();
++ 
++ 	status = phys_efi_set_virtual_address_map(
++ 			memmap.desc_size * count,
++ 			memmap.desc_size,
++ 			memmap.desc_version,
++ 			(efi_memory_desc_t *)__pa(new_memmap));
++ 
++ 	if (status != EFI_SUCCESS) {
++ 		pr_alert("Unable to switch EFI into virtual mode (status=%lx)!\n",
++ 			 status);
+++>>>>>>> fabb37c736f9 (x86/efi: Split efi_enter_virtual_mode)
+  		panic("EFI call to SetVirtualAddressMap() failed!");
+  	}
+  
+@@@ -887,10 -1128,36 +1109,42 @@@
+  	efi.query_variable_info = virt_efi_query_variable_info;
+  	efi.update_capsule = virt_efi_update_capsule;
+  	efi.query_capsule_caps = virt_efi_query_capsule_caps;
+ +	if (__supported_pte_mask & _PAGE_NX)
+ +		runtime_code_page_mkexec();
+  
+++<<<<<<< HEAD
+ +	kfree(new_memmap);
+++=======
++ 	efi_runtime_mkexec();
++ 
++ 	/*
++ 	 * We mapped the descriptor array into the EFI pagetable above but we're
++ 	 * not unmapping it here. Here's why:
++ 	 *
++ 	 * We're copying select PGDs from the kernel page table to the EFI page
++ 	 * table and when we do so and make changes to those PGDs like unmapping
++ 	 * stuff from them, those changes appear in the kernel page table and we
++ 	 * go boom.
++ 	 *
++ 	 * From setup_real_mode():
++ 	 *
++ 	 * ...
++ 	 * trampoline_pgd[0] = init_level4_pgt[pgd_index(__PAGE_OFFSET)].pgd;
++ 	 *
++ 	 * In this particular case, our allocation is in PGD 0 of the EFI page
++ 	 * table but we've copied that PGD from PGD[272] of the EFI page table:
++ 	 *
++ 	 *	pgd_index(__PAGE_OFFSET = 0xffff880000000000) = 272
++ 	 *
++ 	 * where the direct memory mapping in kernel space is.
++ 	 *
++ 	 * new_memmap's VA comes from that direct mapping and thus clearing it,
++ 	 * it would get cleared in the kernel page table too.
++ 	 *
++ 	 * efi_cleanup_page_tables(__pa(new_memmap), 1 << pg_shift);
++ 	 */
++ 	free_pages((unsigned long)new_memmap, pg_shift);
+++>>>>>>> fabb37c736f9 (x86/efi: Split efi_enter_virtual_mode)
+  
+  	/* clean DUMMY object */
+  	efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
+@@@ -898,13 -1165,16 +1152,21 @@@
+  			 EFI_VARIABLE_BOOTSERVICE_ACCESS |
+  			 EFI_VARIABLE_RUNTIME_ACCESS,
+  			 0, NULL);
+ +
+ +	return;
+ +
+ + err_out:
+ +	pr_err("Error reallocating memory, EFI runtime non-functional!\n");
+  }
+  
++ void __init efi_enter_virtual_mode(void)
++ {
++ 	if (efi_setup)
++ 		kexec_enter_virtual_mode();
++ 	else
++ 		__efi_enter_virtual_mode();
++ }
++ 
+  /*
+   * Convenience functions to obtain memory types and attributes
+   */
+* Unmerged path arch/x86/platform/efi/efi.c
