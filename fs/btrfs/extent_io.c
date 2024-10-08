@@ -1981,6 +1981,7 @@ int repair_io_failure(struct btrfs_fs_info *fs_info, u64 start,
 	struct btrfs_mapping_tree *map_tree = &fs_info->mapping_tree;
 	int ret;
 
+	ASSERT(!(fs_info->sb->s_flags & MS_RDONLY));
 	BUG_ON(!mirror_num);
 
 	/* we can't repair anything in raid56 yet */
@@ -2037,6 +2038,9 @@ int repair_eb_io_failure(struct btrfs_root *root, struct extent_buffer *eb,
 	unsigned long i, num_pages = num_extent_pages(eb->start, eb->len);
 	int ret = 0;
 
+	if (root->fs_info->sb->s_flags & MS_RDONLY)
+		return -EROFS;
+
 	for (i = 0; i < num_pages; i++) {
 		struct page *p = extent_buffer_page(eb, i);
 		ret = repair_io_failure(root->fs_info, start, PAGE_CACHE_SIZE,
@@ -2058,12 +2062,12 @@ static int clean_io_failure(u64 start, struct page *page)
 	u64 private;
 	u64 private_failure;
 	struct io_failure_record *failrec;
-	struct btrfs_fs_info *fs_info;
+	struct inode *inode = page->mapping->host;
+	struct btrfs_fs_info *fs_info = BTRFS_I(inode)->root->fs_info;
 	struct extent_state *state;
 	int num_copies;
 	int did_repair = 0;
 	int ret;
-	struct inode *inode = page->mapping->host;
 
 	private = 0;
 	ret = count_range_bits(&BTRFS_I(inode)->io_failure_tree, &private,
@@ -2086,6 +2090,8 @@ static int clean_io_failure(u64 start, struct page *page)
 		did_repair = 1;
 		goto out;
 	}
+	if (fs_info->sb->s_flags & MS_RDONLY)
+		goto out;
 
 	spin_lock(&BTRFS_I(inode)->io_tree.lock);
 	state = find_first_extent_bit_state(&BTRFS_I(inode)->io_tree,
@@ -2095,7 +2101,6 @@ static int clean_io_failure(u64 start, struct page *page)
 
 	if (state && state->start <= failrec->start &&
 	    state->end >= failrec->start + failrec->len - 1) {
-		fs_info = BTRFS_I(inode)->root->fs_info;
 		num_copies = btrfs_num_copies(fs_info, failrec->logical,
 					      failrec->len);
 		if (num_copies > 1)  {
