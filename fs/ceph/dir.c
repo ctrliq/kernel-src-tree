@@ -449,7 +449,7 @@ more:
 	return 0;
 }
 
-static void reset_readdir(struct ceph_file_info *fi)
+static void reset_readdir(struct ceph_file_info *fi, unsigned frag)
 {
 	if (fi->last_readdir) {
 		ceph_mdsc_put_request(fi->last_readdir);
@@ -457,7 +457,10 @@ static void reset_readdir(struct ceph_file_info *fi)
 	}
 	kfree(fi->last_name);
 	fi->last_name = NULL;
-	fi->next_offset = 2;  /* compensate for . and .. */
+	if (ceph_frag_is_leftmost(frag))
+		fi->next_offset = 2;  /* compensate for . and .. */
+	else
+		fi->next_offset = 0;
 	if (fi->dentry) {
 		dput(fi->dentry);
 		fi->dentry = NULL;
@@ -502,7 +505,7 @@ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
 		    fpos_frag(offset) != fpos_frag(old_offset) ||
 		    fpos_off(offset) < fi->offset) {
 			dout("dir_llseek dropping %p content\n", file);
-			reset_readdir(fi);
+			reset_readdir(fi, fpos_frag(offset));
 		}
 
 		/* bump dir_release_count if we did a forward seek */
