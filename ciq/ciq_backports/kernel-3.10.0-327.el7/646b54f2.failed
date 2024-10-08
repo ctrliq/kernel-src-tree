@@ -1,0 +1,402 @@
+powerpc/powernv: Remove powernv RTAS support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Remove powernv RTAS support (David Gibson) [1232550]
+Rebuild_FUZZ: 90.00%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit 646b54f2f2041473495f166479e3e17fd59a9dd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/646b54f2.failed
+
+The powernv code has some conditional support for running on bare metal
+machines that have no OPAL firmware, but provide RTAS.
+
+No released machines ever supported that, and even in the lab it was
+just a transitional hack in the days when OPAL was still being
+developed.
+
+So remove the code.
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Acked-by: Stewart Smith <stewart@linux.vnet.ibm.com>
+(cherry picked from commit 646b54f2f2041473495f166479e3e17fd59a9dd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/setup.c
+diff --cc arch/powerpc/platforms/powernv/setup.c
+index d9b88fa7c5a3,16fdcb23f4c3..000000000000
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@@ -264,21 -273,176 +263,190 @@@ static void __init pnv_setup_machdep_op
+  	ppc_md.halt = pnv_halt;
+  	ppc_md.machine_check_exception = opal_machine_check;
+  	ppc_md.mce_check_early_recovery = opal_mce_check_early_recovery;
+ -	ppc_md.hmi_exception_early = opal_hmi_exception_early;
+ -	ppc_md.handle_hmi_exception = opal_handle_hmi_exception;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PPC_POWERNV_RTAS
+ +static void __init pnv_setup_machdep_rtas(void)
+ +{
+ +	if (rtas_token("get-time-of-day") != RTAS_UNKNOWN_SERVICE) {
+ +		ppc_md.get_boot_time = rtas_get_boot_time;
+ +		ppc_md.get_rtc_time = rtas_get_rtc_time;
+ +		ppc_md.set_rtc_time = rtas_set_rtc_time;
+ +	}
+ +	ppc_md.restart = rtas_restart;
+ +	ppc_md.power_off = rtas_power_off;
+ +	ppc_md.halt = rtas_halt;
+ +}
+ +#endif /* CONFIG_PPC_POWERNV_RTAS */
+++=======
++ static u32 supported_cpuidle_states;
++ 
++ int pnv_save_sprs_for_winkle(void)
++ {
++ 	int cpu;
++ 	int rc;
++ 
++ 	/*
++ 	 * hid0, hid1, hid4, hid5, hmeer and lpcr values are symmetric accross
++ 	 * all cpus at boot. Get these reg values of current cpu and use the
++ 	 * same accross all cpus.
++ 	 */
++ 	uint64_t lpcr_val = mfspr(SPRN_LPCR) & ~(u64)LPCR_PECE1;
++ 	uint64_t hid0_val = mfspr(SPRN_HID0);
++ 	uint64_t hid1_val = mfspr(SPRN_HID1);
++ 	uint64_t hid4_val = mfspr(SPRN_HID4);
++ 	uint64_t hid5_val = mfspr(SPRN_HID5);
++ 	uint64_t hmeer_val = mfspr(SPRN_HMEER);
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		uint64_t pir = get_hard_smp_processor_id(cpu);
++ 		uint64_t hsprg0_val = (uint64_t)&paca[cpu];
++ 
++ 		/*
++ 		 * HSPRG0 is used to store the cpu's pointer to paca. Hence last
++ 		 * 3 bits are guaranteed to be 0. Program slw to restore HSPRG0
++ 		 * with 63rd bit set, so that when a thread wakes up at 0x100 we
++ 		 * can use this bit to distinguish between fastsleep and
++ 		 * deep winkle.
++ 		 */
++ 		hsprg0_val |= 1;
++ 
++ 		rc = opal_slw_set_reg(pir, SPRN_HSPRG0, hsprg0_val);
++ 		if (rc != 0)
++ 			return rc;
++ 
++ 		rc = opal_slw_set_reg(pir, SPRN_LPCR, lpcr_val);
++ 		if (rc != 0)
++ 			return rc;
++ 
++ 		/* HIDs are per core registers */
++ 		if (cpu_thread_in_core(cpu) == 0) {
++ 
++ 			rc = opal_slw_set_reg(pir, SPRN_HMEER, hmeer_val);
++ 			if (rc != 0)
++ 				return rc;
++ 
++ 			rc = opal_slw_set_reg(pir, SPRN_HID0, hid0_val);
++ 			if (rc != 0)
++ 				return rc;
++ 
++ 			rc = opal_slw_set_reg(pir, SPRN_HID1, hid1_val);
++ 			if (rc != 0)
++ 				return rc;
++ 
++ 			rc = opal_slw_set_reg(pir, SPRN_HID4, hid4_val);
++ 			if (rc != 0)
++ 				return rc;
++ 
++ 			rc = opal_slw_set_reg(pir, SPRN_HID5, hid5_val);
++ 			if (rc != 0)
++ 				return rc;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void pnv_alloc_idle_core_states(void)
++ {
++ 	int i, j;
++ 	int nr_cores = cpu_nr_cores();
++ 	u32 *core_idle_state;
++ 
++ 	/*
++ 	 * core_idle_state - First 8 bits track the idle state of each thread
++ 	 * of the core. The 8th bit is the lock bit. Initially all thread bits
++ 	 * are set. They are cleared when the thread enters deep idle state
++ 	 * like sleep and winkle. Initially the lock bit is cleared.
++ 	 * The lock bit has 2 purposes
++ 	 * a. While the first thread is restoring core state, it prevents
++ 	 * other threads in the core from switching to process context.
++ 	 * b. While the last thread in the core is saving the core state, it
++ 	 * prevents a different thread from waking up.
++ 	 */
++ 	for (i = 0; i < nr_cores; i++) {
++ 		int first_cpu = i * threads_per_core;
++ 		int node = cpu_to_node(first_cpu);
++ 
++ 		core_idle_state = kmalloc_node(sizeof(u32), GFP_KERNEL, node);
++ 		*core_idle_state = PNV_CORE_IDLE_THREAD_BITS;
++ 
++ 		for (j = 0; j < threads_per_core; j++) {
++ 			int cpu = first_cpu + j;
++ 
++ 			paca[cpu].core_idle_state_ptr = core_idle_state;
++ 			paca[cpu].thread_idle_state = PNV_THREAD_RUNNING;
++ 			paca[cpu].thread_mask = 1 << j;
++ 		}
++ 	}
++ 
++ 	update_subcore_sibling_mask();
++ 
++ 	if (supported_cpuidle_states & OPAL_PM_WINKLE_ENABLED)
++ 		pnv_save_sprs_for_winkle();
++ }
++ 
++ u32 pnv_get_supported_cpuidle_states(void)
++ {
++ 	return supported_cpuidle_states;
++ }
++ EXPORT_SYMBOL_GPL(pnv_get_supported_cpuidle_states);
++ 
++ static int __init pnv_init_idle_states(void)
++ {
++ 	struct device_node *power_mgt;
++ 	int dt_idle_states;
++ 	u32 *flags;
++ 	int i;
++ 
++ 	supported_cpuidle_states = 0;
++ 
++ 	if (cpuidle_disable != IDLE_NO_OVERRIDE)
++ 		goto out;
++ 
++ 	if (!firmware_has_feature(FW_FEATURE_OPALv3))
++ 		goto out;
++ 
++ 	power_mgt = of_find_node_by_path("/ibm,opal/power-mgt");
++ 	if (!power_mgt) {
++ 		pr_warn("opal: PowerMgmt Node not found\n");
++ 		goto out;
++ 	}
++ 	dt_idle_states = of_property_count_u32_elems(power_mgt,
++ 			"ibm,cpu-idle-state-flags");
++ 	if (dt_idle_states < 0) {
++ 		pr_warn("cpuidle-powernv: no idle states found in the DT\n");
++ 		goto out;
++ 	}
++ 
++ 	flags = kzalloc(sizeof(*flags) * dt_idle_states, GFP_KERNEL);
++ 	if (of_property_read_u32_array(power_mgt,
++ 			"ibm,cpu-idle-state-flags", flags, dt_idle_states)) {
++ 		pr_warn("cpuidle-powernv: missing ibm,cpu-idle-state-flags in DT\n");
++ 		goto out_free;
++ 	}
++ 
++ 	for (i = 0; i < dt_idle_states; i++)
++ 		supported_cpuidle_states |= flags[i];
++ 
++ 	if (!(supported_cpuidle_states & OPAL_PM_SLEEP_ENABLED_ER1)) {
++ 		patch_instruction(
++ 			(unsigned int *)pnv_fastsleep_workaround_at_entry,
++ 			PPC_INST_NOP);
++ 		patch_instruction(
++ 			(unsigned int *)pnv_fastsleep_workaround_at_exit,
++ 			PPC_INST_NOP);
++ 	}
++ 	pnv_alloc_idle_core_states();
++ out_free:
++ 	kfree(flags);
++ out:
++ 	return 0;
++ }
++ 
++ subsys_initcall(pnv_init_idle_states);
+++>>>>>>> 646b54f2f204 (powerpc/powernv: Remove powernv RTAS support)
+  
+  static int __init pnv_probe(void)
+  {
+diff --git a/arch/powerpc/platforms/powernv/Kconfig b/arch/powerpc/platforms/powernv/Kconfig
+index 336a9a475274..64d19febb583 100644
+--- a/arch/powerpc/platforms/powernv/Kconfig
++++ b/arch/powerpc/platforms/powernv/Kconfig
+@@ -13,10 +13,3 @@ config PPC_POWERNV
+ 	select ARCH_RANDOM
+ 	select PPC_DOORBELL
+ 	default y
+-
+-config PPC_POWERNV_RTAS
+-	depends on PPC_POWERNV
+-	bool "Support for RTAS based PowerNV platforms such as BML"
+-	default y
+-	select PPC_ICS_RTAS
+-	select PPC_RTAS
+diff --git a/arch/powerpc/platforms/powernv/pci.c b/arch/powerpc/platforms/powernv/pci.c
+index b35c71df73ff..1c0f1214cf80 100644
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -661,66 +661,13 @@ void pnv_pci_setup_iommu_table(struct iommu_table *tbl,
+ 	tbl->it_type = TCE_PCI;
+ }
+ 
+-static struct iommu_table *pnv_pci_setup_bml_iommu(struct pci_controller *hose)
+-{
+-	struct iommu_table *tbl;
+-	const __be64 *basep, *swinvp;
+-	const __be32 *sizep;
+-
+-	basep = of_get_property(hose->dn, "linux,tce-base", NULL);
+-	sizep = of_get_property(hose->dn, "linux,tce-size", NULL);
+-	if (basep == NULL || sizep == NULL) {
+-		pr_err("PCI: %s has missing tce entries !\n",
+-		       hose->dn->full_name);
+-		return NULL;
+-	}
+-	tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL, hose->node);
+-	if (WARN_ON(!tbl))
+-		return NULL;
+-	pnv_pci_setup_iommu_table(tbl, __va(be64_to_cpup(basep)),
+-				  be32_to_cpup(sizep), 0, IOMMU_PAGE_SHIFT_4K);
+-	iommu_init_table(tbl, hose->node);
+-	iommu_register_group(tbl, pci_domain_nr(hose->bus), 0);
+-
+-	/* Deal with SW invalidated TCEs when needed (BML way) */
+-	swinvp = of_get_property(hose->dn, "linux,tce-sw-invalidate-info",
+-				 NULL);
+-	if (swinvp) {
+-		tbl->it_busno = be64_to_cpu(swinvp[1]);
+-		tbl->it_index = (unsigned long)ioremap(be64_to_cpup(swinvp), 8);
+-		tbl->it_type = TCE_PCI_SWINV_CREATE | TCE_PCI_SWINV_FREE;
+-	}
+-	return tbl;
+-}
+-
+-static void pnv_pci_dma_fallback_setup(struct pci_controller *hose,
+-				       struct pci_dev *pdev)
+-{
+-	struct device_node *np = pci_bus_to_OF_node(hose->bus);
+-	struct pci_dn *pdn;
+-
+-	if (np == NULL)
+-		return;
+-	pdn = PCI_DN(np);
+-	if (!pdn->iommu_table)
+-		pdn->iommu_table = pnv_pci_setup_bml_iommu(hose);
+-	if (!pdn->iommu_table)
+-		return;
+-	set_iommu_table_base_and_group(&pdev->dev, pdn->iommu_table);
+-}
+-
+ static void pnv_pci_dma_dev_setup(struct pci_dev *pdev)
+ {
+ 	struct pci_controller *hose = pci_bus_to_host(pdev->bus);
+ 	struct pnv_phb *phb = hose->private_data;
+ 
+-	/* If we have no phb structure, try to setup a fallback based on
+-	 * the device-tree (RTAS PCI for example)
+-	 */
+ 	if (phb && phb->dma_dev_setup)
+ 		phb->dma_dev_setup(phb, pdev);
+-	else
+-		pnv_pci_dma_fallback_setup(hose, pdev);
+ }
+ 
+ int pnv_pci_dma_set_mask(struct pci_dev *pdev, u64 dma_mask)
+@@ -784,38 +731,31 @@ static int pnv_pci_probe_mode(struct pci_bus *bus)
+ void __init pnv_pci_init(void)
+ {
+ 	struct device_node *np;
++	bool found_ioda = false;
+ 
+ 	pci_add_flags(PCI_CAN_SKIP_ISA_ALIGN);
+ 
+-	/* OPAL absent, try POPAL first then RTAS detection of PHBs */
+-	if (!firmware_has_feature(FW_FEATURE_OPAL)) {
+-#ifdef CONFIG_PPC_POWERNV_RTAS
+-		init_pci_config_tokens();
+-		find_and_init_phbs();
+-#endif /* CONFIG_PPC_POWERNV_RTAS */
+-	}
+-	/* OPAL is here, do our normal stuff */
+-	else {
+-		int found_ioda = 0;
++	/* If we don't have OPAL, eg. in sim, just skip PCI probe */
++	if (!firmware_has_feature(FW_FEATURE_OPAL))
++		return;
+ 
+-		/* Look for IODA IO-Hubs. We don't support mixing IODA
+-		 * and p5ioc2 due to the need to change some global
+-		 * probing flags
+-		 */
+-		for_each_compatible_node(np, NULL, "ibm,ioda-hub") {
+-			pnv_pci_init_ioda_hub(np);
+-			found_ioda = 1;
+-		}
++	/* Look for IODA IO-Hubs. We don't support mixing IODA
++	 * and p5ioc2 due to the need to change some global
++	 * probing flags
++	 */
++	for_each_compatible_node(np, NULL, "ibm,ioda-hub") {
++		pnv_pci_init_ioda_hub(np);
++		found_ioda = true;
++	}
+ 
+-		/* Look for p5ioc2 IO-Hubs */
+-		if (!found_ioda)
+-			for_each_compatible_node(np, NULL, "ibm,p5ioc2")
+-				pnv_pci_init_p5ioc2_hub(np);
++	/* Look for p5ioc2 IO-Hubs */
++	if (!found_ioda)
++		for_each_compatible_node(np, NULL, "ibm,p5ioc2")
++			pnv_pci_init_p5ioc2_hub(np);
+ 
+-		/* Look for ioda2 built-in PHB3's */
+-		for_each_compatible_node(np, NULL, "ibm,ioda2-phb")
+-			pnv_pci_init_ioda2_phb(np);
+-	}
++	/* Look for ioda2 built-in PHB3's */
++	for_each_compatible_node(np, NULL, "ibm,ioda2-phb")
++		pnv_pci_init_ioda2_phb(np);
+ 
+ 	/* Setup the linkage between OF nodes and PHBs */
+ 	pci_devs_phb_init();
+* Unmerged path arch/powerpc/platforms/powernv/setup.c
+diff --git a/arch/powerpc/platforms/powernv/smp.c b/arch/powerpc/platforms/powernv/smp.c
+index 1c14ba216c76..92ed6fee6dbd 100644
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@ -25,7 +25,6 @@
+ #include <asm/machdep.h>
+ #include <asm/cputable.h>
+ #include <asm/firmware.h>
+-#include <asm/rtas.h>
+ #include <asm/vdso_datapage.h>
+ #include <asm/cputhreads.h>
+ #include <asm/xics.h>
+@@ -230,18 +229,6 @@ void __init pnv_smp_init(void)
+ {
+ 	smp_ops = &pnv_smp_ops;
+ 
+-	/* XXX We don't yet have a proper entry point from HAL, for
+-	 * now we rely on kexec-style entry from BML
+-	 */
+-
+-#ifdef CONFIG_PPC_RTAS
+-	/* Non-lpar has additional take/give timebase */
+-	if (rtas_token("freeze-time-base") != RTAS_UNKNOWN_SERVICE) {
+-		smp_ops->give_timebase = rtas_give_timebase;
+-		smp_ops->take_timebase = rtas_take_timebase;
+-	}
+-#endif /* CONFIG_PPC_RTAS */
+-
+ #ifdef CONFIG_HOTPLUG_CPU
+ 	ppc_md.cpu_die	= pnv_smp_cpu_kill_self;
+ #endif
