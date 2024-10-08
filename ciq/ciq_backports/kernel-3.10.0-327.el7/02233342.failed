@@ -1,0 +1,245 @@
+dm: optimize dm_mq_queue_rq to _not_ use kthread if using pure blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 022333427a8aa4ccb318a9db90cea4e69ca1826b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/02233342.failed
+
+dm_mq_queue_rq() is in atomic context so care must be taken to not
+sleep -- as such GFP_ATOMIC is used for the md->bs bioset allocations
+and dm-mpath's call to blk_get_request().  In the future the bioset
+allocations will hopefully go away (by removing support for partial
+completions of bios in a cloned request).
+
+Also prepare for supporting DM blk-mq ontop of old-style request_fn
+device(s) if a new dm-mod 'use_blk_mq' parameter is set.  The kthread
+will still be used to queue work if blk-mq is used ontop of old-style
+request_fn device(s).
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 022333427a8aa4ccb318a9db90cea4e69ca1826b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 7270805de04c,55cadb1a2735..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1065,13 -1073,18 +1065,25 @@@ static void rq_completed(struct mapped_
+  static void free_rq_clone(struct request *clone)
+  {
+  	struct dm_rq_target_io *tio = clone->end_io_data;
+ -	struct mapped_device *md = tio->md;
+  
+  	blk_rq_unprep_clone(clone);
+++<<<<<<< HEAD
+ +	if (clone->q && clone->q->mq_ops)
+ +		tio->ti->type->release_clone_rq(clone);
+ +	else
+ +		free_clone_request(tio->md, clone);
+ +	free_rq_tio(tio);
+++=======
++ 
++ 	if (clone->q->mq_ops)
++ 		tio->ti->type->release_clone_rq(clone);
++ 	else if (!md->queue->mq_ops)
++ 		/* request_fn queue stacked on request_fn queue(s) */
++ 		free_clone_request(md, clone);
++ 
++ 	if (!md->queue->mq_ops)
++ 		free_rq_tio(tio);
+++>>>>>>> 022333427a8a (dm: optimize dm_mq_queue_rq to _not_ use kthread if using pure blk-mq)
+  }
+  
+  /*
+@@@ -1911,6 -1866,19 +1933,22 @@@ static struct request *clone_rq(struct 
+  
+  static void map_tio_request(struct kthread_work *work);
+  
+++<<<<<<< HEAD
+++=======
++ static void init_tio(struct dm_rq_target_io *tio, struct request *rq,
++ 		     struct mapped_device *md)
++ {
++ 	tio->md = md;
++ 	tio->ti = NULL;
++ 	tio->clone = NULL;
++ 	tio->orig = rq;
++ 	tio->error = 0;
++ 	memset(&tio->info, 0, sizeof(tio->info));
++ 	if (md->kworker_task)
++ 		init_kthread_work(&tio->work, map_tio_request);
++ }
++ 
+++>>>>>>> 022333427a8a (dm: optimize dm_mq_queue_rq to _not_ use kthread if using pure blk-mq)
+  static struct dm_rq_target_io *prep_tio(struct request *rq,
+  					struct mapped_device *md, gfp_t gfp_mask)
+  {
+@@@ -1991,7 -1953,7 +2029,11 @@@ static int map_request(struct dm_targe
+  		}
+  		if (IS_ERR(clone))
+  			return DM_MAPIO_REQUEUE;
+++<<<<<<< HEAD
+ +		if (setup_clone(clone, rq, tio, GFP_KERNEL)) {
+++=======
++ 		if (setup_clone(clone, rq, tio, GFP_ATOMIC)) {
+++>>>>>>> 022333427a8a (dm: optimize dm_mq_queue_rq to _not_ use kthread if using pure blk-mq)
+  			/* -ENOMEM */
+  			ti->type->release_clone_rq(clone);
+  			return DM_MAPIO_REQUEUE;
+@@@ -2696,7 -2669,133 +2738,137 @@@ static int dm_init_request_based_queue(
+  
+  	elv_register_queue(md->queue);
+  
+++<<<<<<< HEAD
+ +	return 1;
+++=======
++ 	return 0;
++ }
++ 
++ static int dm_mq_init_request(void *data, struct request *rq,
++ 			      unsigned int hctx_idx, unsigned int request_idx,
++ 			      unsigned int numa_node)
++ {
++ 	struct mapped_device *md = data;
++ 	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
++ 
++ 	/*
++ 	 * Must initialize md member of tio, otherwise it won't
++ 	 * be available in dm_mq_queue_rq.
++ 	 */
++ 	tio->md = md;
++ 
++ 	return 0;
++ }
++ 
++ static int dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
++ 			  const struct blk_mq_queue_data *bd)
++ {
++ 	struct request *rq = bd->rq;
++ 	struct dm_rq_target_io *tio = blk_mq_rq_to_pdu(rq);
++ 	struct mapped_device *md = tio->md;
++ 	int srcu_idx;
++ 	struct dm_table *map = dm_get_live_table(md, &srcu_idx);
++ 	struct dm_target *ti;
++ 	sector_t pos;
++ 
++ 	/* always use block 0 to find the target for flushes for now */
++ 	pos = 0;
++ 	if (!(rq->cmd_flags & REQ_FLUSH))
++ 		pos = blk_rq_pos(rq);
++ 
++ 	ti = dm_table_find_target(map, pos);
++ 	if (!dm_target_is_valid(ti)) {
++ 		dm_put_live_table(md, srcu_idx);
++ 		DMERR_LIMIT("request attempted access beyond the end of device");
++ 		/*
++ 		 * Must perform setup, that rq_completed() requires,
++ 		 * before returning BLK_MQ_RQ_QUEUE_ERROR
++ 		 */
++ 		dm_start_request(md, rq);
++ 		return BLK_MQ_RQ_QUEUE_ERROR;
++ 	}
++ 	dm_put_live_table(md, srcu_idx);
++ 
++ 	if (ti->type->busy && ti->type->busy(ti))
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	dm_start_request(md, rq);
++ 
++ 	/* Init tio using md established in .init_request */
++ 	init_tio(tio, rq, md);
++ 
++ 	/*
++ 	 * Establish tio->ti before queuing work (map_tio_request)
++ 	 * or making direct call to map_request().
++ 	 */
++ 	tio->ti = ti;
++ 
++ 	/* Clone the request if underlying devices aren't blk-mq */
++ 	if (dm_table_get_type(map) == DM_TYPE_REQUEST_BASED) {
++ 		/* clone request is allocated at the end of the pdu */
++ 		tio->clone = (void *)blk_mq_rq_to_pdu(rq) + sizeof(struct dm_rq_target_io);
++ 		if (!clone_rq(rq, md, tio, GFP_ATOMIC))
++ 			return BLK_MQ_RQ_QUEUE_BUSY;
++ 		queue_kthread_work(&md->kworker, &tio->work);
++ 	} else {
++ 		/* Direct call is fine since .queue_rq allows allocations */
++ 		if (map_request(tio, rq, md) == DM_MAPIO_REQUEUE)
++ 			dm_requeue_unmapped_original_request(md, rq);
++ 	}
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static struct blk_mq_ops dm_mq_ops = {
++ 	.queue_rq = dm_mq_queue_rq,
++ 	.map_queue = blk_mq_map_queue,
++ 	.complete = dm_softirq_done,
++ 	.init_request = dm_mq_init_request,
++ };
++ 
++ static int dm_init_request_based_blk_mq_queue(struct mapped_device *md)
++ {
++ 	unsigned md_type = dm_get_md_type(md);
++ 	struct request_queue *q;
++ 	int err;
++ 
++ 	memset(&md->tag_set, 0, sizeof(md->tag_set));
++ 	md->tag_set.ops = &dm_mq_ops;
++ 	md->tag_set.queue_depth = BLKDEV_MAX_RQ;
++ 	md->tag_set.numa_node = NUMA_NO_NODE;
++ 	md->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
++ 	md->tag_set.nr_hw_queues = 1;
++ 	if (md_type == DM_TYPE_REQUEST_BASED) {
++ 		/* make the memory for non-blk-mq clone part of the pdu */
++ 		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io) + sizeof(struct request);
++ 	} else
++ 		md->tag_set.cmd_size = sizeof(struct dm_rq_target_io);
++ 	md->tag_set.driver_data = md;
++ 
++ 	err = blk_mq_alloc_tag_set(&md->tag_set);
++ 	if (err)
++ 		return err;
++ 
++ 	q = blk_mq_init_allocated_queue(&md->tag_set, md->queue);
++ 	if (IS_ERR(q)) {
++ 		err = PTR_ERR(q);
++ 		goto out_tag_set;
++ 	}
++ 	md->queue = q;
++ 	dm_init_md_queue(md);
++ 
++ 	/* backfill 'mq' sysfs registration normally done in blk_register_queue */
++ 	blk_mq_register_disk(md->disk);
++ 
++ 	if (md_type == DM_TYPE_REQUEST_BASED)
++ 		init_rq_based_worker_thread(md);
++ 
++ 	return 0;
++ 
++ out_tag_set:
++ 	blk_mq_free_tag_set(&md->tag_set);
++ 	return err;
+++>>>>>>> 022333427a8a (dm: optimize dm_mq_queue_rq to _not_ use kthread if using pure blk-mq)
+  }
+  
+  /*
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index add6391f3f8e..26d6cf05f9f0 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -428,7 +428,7 @@ static int __multipath_map(struct dm_target *ti, struct request *clone,
+ 	} else {
+ 		/* blk-mq request-based interface */
+ 		*__clone = blk_get_request(bdev_get_queue(bdev),
+-					   rq_data_dir(rq), GFP_KERNEL);
++					   rq_data_dir(rq), GFP_ATOMIC);
+ 		if (IS_ERR(*__clone))
+ 			/* ENOMEM, requeue */
+ 			return r;
+* Unmerged path drivers/md/dm.c
