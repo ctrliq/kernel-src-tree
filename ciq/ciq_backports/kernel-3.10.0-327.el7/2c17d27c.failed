@@ -1,0 +1,193 @@
+net: call rcu_read_lock early in process_backlog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] call rcu_read_lock early in process_backlog (Jiri Benc) [1243980]
+Rebuild_FUZZ: 94.51%
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 2c17d27c36dcce2b6bf689f41a46b9e909877c21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/2c17d27c.failed
+
+Incoming packet should be either in backlog queue or
+in RCU read-side section. Otherwise, the final sequence of
+flush_backlog() and synchronize_net() may miss packets
+that can run without device reference:
+
+CPU 1                  CPU 2
+                       skb->dev: no reference
+                       process_backlog:__skb_dequeue
+                       process_backlog:local_irq_enable
+
+on_each_cpu for
+flush_backlog =>       IPI(hardirq): flush_backlog
+                       - packet not found in backlog
+
+                       CPU delayed ...
+synchronize_net
+- no ongoing RCU
+read-side sections
+
+netdev_run_todo,
+rcu_barrier: no
+ongoing callbacks
+                       __netif_receive_skb_core:rcu_read_lock
+                       - too late
+free dev
+                       process packet for freed dev
+
+Fixes: 6e583ce5242f ("net: eliminate refcounting in backlog queue")
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2c17d27c36dcce2b6bf689f41a46b9e909877c21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 393a0ed882b1,a8e4dd430285..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3448,9 -3781,9 +3446,9 @@@ another_round
+  
+  	if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+  	    skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+ -		skb = skb_vlan_untag(skb);
+ +		skb = vlan_untag(skb);
+  		if (unlikely(!skb))
+- 			goto unlock;
++ 			goto out;
+  	}
+  
+  #ifdef CONFIG_NET_CLS_ACT
+@@@ -3472,13 -3809,20 +3470,26 @@@
+  	}
+  
+  skip_taps:
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_INGRESS
++ 	if (static_key_false(&ingress_needed)) {
++ 		skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
++ 		if (!skb)
++ 			goto out;
++ 
++ 		if (nf_ingress(skb, &pt_prev, &ret, orig_dev) < 0)
++ 			goto out;
++ 	}
++ #endif
+++>>>>>>> 2c17d27c36dc (net: call rcu_read_lock early in process_backlog)
+  #ifdef CONFIG_NET_CLS_ACT
+ -	skb->tc_verd = 0;
+ +	skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+ +	if (!skb)
+ +		goto unlock;
+  ncls:
+  #endif
+ +
+  	if (pfmemalloc && !skb_pfmemalloc_protocol(skb))
+  		goto drop;
+  
+@@@ -3554,8 -3900,6 +3565,11 @@@ drop
+  		ret = NET_RX_DROP;
+  	}
+  
+++<<<<<<< HEAD
+ +unlock:
+ +	rcu_read_unlock();
+++=======
+++>>>>>>> 2c17d27c36dc (net: call rcu_read_lock early in process_backlog)
+  out:
+  	return ret;
+  }
+@@@ -3585,23 -3929,10 +3599,25 @@@ static int __netif_receive_skb(struct s
+  	return ret;
+  }
+  
+ -static int netif_receive_skb_internal(struct sk_buff *skb)
+ +/**
+ + *	netif_receive_skb - process receive buffer from network
+ + *	@skb: buffer to process
+ + *
+ + *	netif_receive_skb() is the main receive data processing function.
+ + *	It always succeeds. The buffer may be dropped during processing
+ + *	for congestion control or by the protocol layers.
+ + *
+ + *	This function may only be called from softirq context and interrupts
+ + *	should be enabled.
+ + *
+ + *	Return values (usually ignored):
+ + *	NET_RX_SUCCESS: no congestion
+ + *	NET_RX_DROP: packet was dropped
+ + */
+ +int netif_receive_skb(struct sk_buff *skb)
+  {
++ 	int ret;
++ 
+  	net_timestamp_check(netdev_tstamp_prequeue, skb);
+  
+  	if (skb_defer_rx_timestamp(skb))
+@@@ -3621,12 -3950,35 +3635,13 @@@
+  			rcu_read_unlock();
+  			return ret;
+  		}
+- 		rcu_read_unlock();
+  	}
+  #endif
+- 	return __netif_receive_skb(skb);
++ 	ret = __netif_receive_skb(skb);
++ 	rcu_read_unlock();
++ 	return ret;
+  }
+ -
+ -/**
+ - *	netif_receive_skb - process receive buffer from network
+ - *	@skb: buffer to process
+ - *
+ - *	netif_receive_skb() is the main receive data processing function.
+ - *	It always succeeds. The buffer may be dropped during processing
+ - *	for congestion control or by the protocol layers.
+ - *
+ - *	This function may only be called from softirq context and interrupts
+ - *	should be enabled.
+ - *
+ - *	Return values (usually ignored):
+ - *	NET_RX_SUCCESS: no congestion
+ - *	NET_RX_DROP: packet was dropped
+ - */
+ -int netif_receive_skb_sk(struct sock *sk, struct sk_buff *skb)
+ -{
+ -	trace_netif_receive_skb_entry(skb);
+ -
+ -	return netif_receive_skb_internal(skb);
+ -}
+ -EXPORT_SYMBOL(netif_receive_skb_sk);
+ +EXPORT_SYMBOL(netif_receive_skb);
+  
+  /* Network device is going away, flush any packets still pending
+   * Called with irqs disabled.
+@@@ -4116,16 -4492,17 +4131,18 @@@ static int process_backlog(struct napi_
+  		local_irq_disable();
+  		net_rps_action_and_irq_enable(sd);
+  	}
+ -
+ +#endif
+  	napi->weight = weight_p;
+  	local_irq_disable();
+ -	while (1) {
+ +	while (work < quota) {
+  		struct sk_buff *skb;
+ +		unsigned int qlen;
+  
+  		while ((skb = __skb_dequeue(&sd->process_queue))) {
++ 			rcu_read_lock();
+  			local_irq_enable();
+  			__netif_receive_skb(skb);
++ 			rcu_read_unlock();
+  			local_irq_disable();
+  			input_queue_head_incr(sd);
+  			if (++work >= quota) {
+* Unmerged path net/core/dev.c
