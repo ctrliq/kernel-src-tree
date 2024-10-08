@@ -1,0 +1,181 @@
+fib, fib6: reject invalid feature bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit b8d3e4163a3562d7cba486687904383e78e7dd6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b8d3e416.failed
+
+Feature bits that are invalid should not be accepted by the kernel,
+only the lower 4 bits may be configured, but not the remaining ones.
+Even from these 4, 2 of them are unused.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b8d3e4163a3562d7cba486687904383e78e7dd6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_semantics.c
+#	net/ipv6/route.c
+diff --cc net/ipv4/fib_semantics.c
+index 33ffde3d859d,115a08e70d43..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -772,6 -859,63 +772,66 @@@ __be32 fib_info_update_nh_saddr(struct 
+  	return nh->nh_saddr;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool fib_valid_prefsrc(struct fib_config *cfg, __be32 fib_prefsrc)
++ {
++ 	if (cfg->fc_type != RTN_LOCAL || !cfg->fc_dst ||
++ 	    fib_prefsrc != cfg->fc_dst) {
++ 		int tb_id = cfg->fc_table;
++ 
++ 		if (tb_id == RT_TABLE_MAIN)
++ 			tb_id = RT_TABLE_LOCAL;
++ 
++ 		if (inet_addr_type_table(cfg->fc_nlinfo.nl_net,
++ 					 fib_prefsrc, tb_id) != RTN_LOCAL) {
++ 			return false;
++ 		}
++ 	}
++ 	return true;
++ }
++ 
++ static int
++ fib_convert_metrics(struct fib_info *fi, const struct fib_config *cfg)
++ {
++ 	struct nlattr *nla;
++ 	int remaining;
++ 
++ 	if (!cfg->fc_mx)
++ 		return 0;
++ 
++ 	nla_for_each_attr(nla, cfg->fc_mx, cfg->fc_mx_len, remaining) {
++ 		int type = nla_type(nla);
++ 		u32 val;
++ 
++ 		if (!type)
++ 			continue;
++ 		if (type > RTAX_MAX)
++ 			return -EINVAL;
++ 
++ 		if (type == RTAX_CC_ALGO) {
++ 			char tmp[TCP_CA_NAME_MAX];
++ 
++ 			nla_strlcpy(tmp, nla, sizeof(tmp));
++ 			val = tcp_ca_get_key_by_name(tmp);
++ 			if (val == TCP_CA_UNSPEC)
++ 				return -EINVAL;
++ 		} else {
++ 			val = nla_get_u32(nla);
++ 		}
++ 		if (type == RTAX_ADVMSS && val > 65535 - 40)
++ 			val = 65535 - 40;
++ 		if (type == RTAX_MTU && val > 65535 - 15)
++ 			val = 65535 - 15;
++ 		if (type == RTAX_FEATURES && (val & ~RTAX_FEATURE_MASK))
++ 			return -EINVAL;
++ 		fi->fib_metrics[type - 1] = val;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> b8d3e4163a35 (fib, fib6: reject invalid feature bits)
+  struct fib_info *fib_create_info(struct fib_config *cfg)
+  {
+  	int err;
+diff --cc net/ipv6/route.c
+index 40dd7c53aa88,8771530df45e..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -1452,9 -1695,53 +1452,59 @@@ out
+  	return entries > rt_max_size;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + *
+ + */
+++=======
++ static int ip6_convert_metrics(struct mx6_config *mxc,
++ 			       const struct fib6_config *cfg)
++ {
++ 	struct nlattr *nla;
++ 	int remaining;
++ 	u32 *mp;
++ 
++ 	if (!cfg->fc_mx)
++ 		return 0;
++ 
++ 	mp = kzalloc(sizeof(u32) * RTAX_MAX, GFP_KERNEL);
++ 	if (unlikely(!mp))
++ 		return -ENOMEM;
++ 
++ 	nla_for_each_attr(nla, cfg->fc_mx, cfg->fc_mx_len, remaining) {
++ 		int type = nla_type(nla);
++ 		u32 val;
++ 
++ 		if (!type)
++ 			continue;
++ 		if (unlikely(type > RTAX_MAX))
++ 			goto err;
++ 
++ 		if (type == RTAX_CC_ALGO) {
++ 			char tmp[TCP_CA_NAME_MAX];
++ 
++ 			nla_strlcpy(tmp, nla, sizeof(tmp));
++ 			val = tcp_ca_get_key_by_name(tmp);
++ 			if (val == TCP_CA_UNSPEC)
++ 				goto err;
++ 		} else {
++ 			val = nla_get_u32(nla);
++ 		}
++ 		if (type == RTAX_FEATURES && (val & ~RTAX_FEATURE_MASK))
++ 			goto err;
++ 
++ 		mp[type - 1] = val;
++ 		__set_bit(type - 1, mxc->mx_valid);
++ 	}
++ 
++ 	mxc->mx = mp;
++ 
++ 	return 0;
++  err:
++ 	kfree(mp);
++ 	return -EINVAL;
++ }
+++>>>>>>> b8d3e4163a35 (fib, fib6: reject invalid feature bits)
+  
+  int ip6_route_add(struct fib6_config *cfg)
+  {
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index b6d178256c4a..a694059c943d 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -401,10 +401,13 @@ enum {
+ 
+ #define RTAX_MAX (__RTAX_MAX - 1)
+ 
+-#define RTAX_FEATURE_ECN	0x00000001
+-#define RTAX_FEATURE_SACK	0x00000002
+-#define RTAX_FEATURE_TIMESTAMP	0x00000004
+-#define RTAX_FEATURE_ALLFRAG	0x00000008
++#define RTAX_FEATURE_ECN	(1 << 0)
++#define RTAX_FEATURE_SACK	(1 << 1)
++#define RTAX_FEATURE_TIMESTAMP	(1 << 2)
++#define RTAX_FEATURE_ALLFRAG	(1 << 3)
++
++#define RTAX_FEATURE_MASK	(RTAX_FEATURE_ECN | RTAX_FEATURE_SACK | \
++				 RTAX_FEATURE_TIMESTAMP | RTAX_FEATURE_ALLFRAG)
+ 
+ struct rta_session {
+ 	__u8	proto;
+* Unmerged path net/ipv4/fib_semantics.c
+* Unmerged path net/ipv6/route.c
