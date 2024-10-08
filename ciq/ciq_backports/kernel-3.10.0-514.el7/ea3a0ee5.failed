@@ -1,0 +1,199 @@
+IB/hfi1: Restructure hfi1_file_open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ira Weiny <ira.weiny@intel.com>
+commit ea3a0ee52db0c2ec8d1d0ecdd21e650e6e183085
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ea3a0ee5.failed
+
+Rearrange the file open call in prep for new changes.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ea3a0ee52db0c2ec8d1d0ecdd21e650e6e183085)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/file_ops.c
+diff --cc drivers/staging/hfi1/file_ops.c
+index 834243df87b3,0522bafb190b..000000000000
+--- a/drivers/staging/hfi1/file_ops.c
++++ b/drivers/staging/hfi1/file_ops.c
+@@@ -194,122 -168,72 +194,138 @@@ static inline int is_valid_mmap(u64 tok
+  
+  static int hfi1_file_open(struct inode *inode, struct file *fp)
+  {
+++<<<<<<< HEAD:drivers/staging/hfi1/file_ops.c
+++=======
++ 	struct hfi1_filedata *fd;
++ 	struct hfi1_devdata *dd = container_of(inode->i_cdev,
++ 					       struct hfi1_devdata,
++ 					       user_cdev);
++ 
++ 	/* Just take a ref now. Not all opens result in a context assign */
++ 	kobject_get(&dd->kobj);
++ 
+++>>>>>>> ea3a0ee52db0 (IB/hfi1: Restructure hfi1_file_open):drivers/infiniband/hw/hfi1/file_ops.c
+  	/* The real work is performed later in assign_ctxt() */
+- 	fp->private_data = kzalloc(sizeof(struct hfi1_filedata), GFP_KERNEL);
+- 	if (fp->private_data) /* no cpu affinity by default */
+- 		((struct hfi1_filedata *)fp->private_data)->rec_cpu_num = -1;
+- 	return fp->private_data ? 0 : -ENOMEM;
++ 
++ 	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
++ 
++ 	if (fd) /* no cpu affinity by default */
++ 		fd->rec_cpu_num = -1;
++ 
++ 	fp->private_data = fd;
++ 
++ 	return fd ? 0 : -ENOMEM;
+  }
+  
+ -static long hfi1_file_ioctl(struct file *fp, unsigned int cmd,
+ -			    unsigned long arg)
+ +static ssize_t hfi1_file_write(struct file *fp, const char __user *data,
+ +			       size_t count, loff_t *offset)
+  {
+ +	const struct hfi1_cmd __user *ucmd;
+  	struct hfi1_filedata *fd = fp->private_data;
+  	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ +	struct hfi1_cmd cmd;
+  	struct hfi1_user_info uinfo;
+  	struct hfi1_tid_info tinfo;
+ -	int ret = 0;
+ -	unsigned long addr;
+ -	int uval = 0;
+ -	unsigned long ul_uval = 0;
+ -	u16 uval16 = 0;
+ -
+ -	hfi1_cdbg(IOCTL, "IOCTL recv: 0x%x", cmd);
+ -	if (cmd != HFI1_IOCTL_ASSIGN_CTXT &&
+ -	    cmd != HFI1_IOCTL_GET_VERS &&
+ -	    !uctxt)
+ -		return -EINVAL;
+ +	ssize_t consumed = 0, copy = 0, ret = 0;
+ +	void *dest = NULL;
+ +	__u64 user_val = 0;
+ +	int uctxt_required = 1;
+ +	int must_be_root = 0;
+ +
+ +	if (count < sizeof(cmd)) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	ucmd = (const struct hfi1_cmd __user *)data;
+ +	if (copy_from_user(&cmd, ucmd, sizeof(cmd))) {
+ +		ret = -EFAULT;
+ +		goto bail;
+ +	}
+ +
+ +	consumed = sizeof(cmd);
+ +
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		copy = sizeof(uinfo);
+ +		dest = &uinfo;
+ +		break;
+ +	case HFI1_CMD_CREDIT_UPD:
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_UPDATE:
+ +	case HFI1_CMD_TID_FREE:
+ +		copy = sizeof(tinfo);
+ +		dest = &tinfo;
+ +		break;
+ +	case HFI1_CMD_USER_INFO:
+ +	case HFI1_CMD_RECV_CTRL:
+ +	case HFI1_CMD_POLL_TYPE:
+ +	case HFI1_CMD_ACK_EVENT:
+ +	case HFI1_CMD_CTXT_INFO:
+ +	case HFI1_CMD_SET_PKEY:
+ +	case HFI1_CMD_CTXT_RESET:
+ +		copy = 0;
+ +		user_val = cmd.addr;
+ +		break;
+ +	case HFI1_CMD_EP_INFO:
+ +	case HFI1_CMD_EP_ERASE_CHIP:
+ +	case HFI1_CMD_EP_ERASE_RANGE:
+ +	case HFI1_CMD_EP_READ_RANGE:
+ +	case HFI1_CMD_EP_WRITE_RANGE:
+ +		uctxt_required = 0;	/* assigned user context not required */
+ +		must_be_root = 1;	/* validate user */
+ +		copy = 0;
+ +		break;
+ +	case HFI1_CMD_TID_INVAL_READ:
+ +	default:
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+  
+ -	switch (cmd) {
+ -	case HFI1_IOCTL_ASSIGN_CTXT:
+ -		if (uctxt)
+ -			return -EINVAL;
+ +	/* If the command comes with user data, copy it. */
+ +	if (copy) {
+ +		if (copy_from_user(dest, (void __user *)cmd.addr, copy)) {
+ +			ret = -EFAULT;
+ +			goto bail;
+ +		}
+ +		consumed += copy;
+ +	}
+  
+ -		if (copy_from_user(&uinfo,
+ -				   (struct hfi1_user_info __user *)arg,
+ -				   sizeof(uinfo)))
+ -			return -EFAULT;
+ +	/*
+ +	 * Make sure there is a uctxt when needed.
+ +	 */
+ +	if (uctxt_required && !uctxt) {
+ +		ret = -EINVAL;
+ +		goto bail;
+ +	}
+ +
+ +	/* only root can do these operations */
+ +	if (must_be_root && !capable(CAP_SYS_ADMIN)) {
+ +		ret = -EPERM;
+ +		goto bail;
+ +	}
+  
+ +	switch (cmd.type) {
+ +	case HFI1_CMD_ASSIGN_CTXT:
+  		ret = assign_ctxt(fp, &uinfo);
+  		if (ret < 0)
+ -			return ret;
+ -		setup_ctxt(fp);
+ +			goto bail;
+ +		ret = setup_ctxt(fp);
+  		if (ret)
+ -			return ret;
+ +			goto bail;
+  		ret = user_init(fp);
+  		break;
+ -	case HFI1_IOCTL_CTXT_INFO:
+ -		ret = get_ctxt_info(fp, (void __user *)(unsigned long)arg,
+ -				    sizeof(struct hfi1_ctxt_info));
+ +	case HFI1_CMD_CTXT_INFO:
+ +		ret = get_ctxt_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+  		break;
+ -	case HFI1_IOCTL_USER_INFO:
+ -		ret = get_base_info(fp, (void __user *)(unsigned long)arg,
+ -				    sizeof(struct hfi1_base_info));
+ +	case HFI1_CMD_USER_INFO:
+ +		ret = get_base_info(fp, (void __user *)(unsigned long)
+ +				    user_val, cmd.len);
+  		break;
+ -	case HFI1_IOCTL_CREDIT_UPD:
+ +	case HFI1_CMD_CREDIT_UPD:
+  		if (uctxt && uctxt->sc)
+  			sc_return_credits(uctxt->sc);
+  		break;
+* Unmerged path drivers/staging/hfi1/file_ops.c
