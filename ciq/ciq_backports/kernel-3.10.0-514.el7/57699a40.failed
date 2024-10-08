@@ -1,0 +1,192 @@
+rhashtable: Fix race in rhashtable_destroy() and use regular work_struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ying Xue <ying.xue@windriver.com>
+commit 57699a40b4f2694d3ee63fd5e6465ec8f600b620
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/57699a40.failed
+
+When we put our declared work task in the global workqueue with
+schedule_delayed_work(), its delay parameter is always zero.
+Therefore, we should define a regular work in rhashtable structure
+instead of a delayed work.
+
+By the way, we add a condition to check whether resizing functions
+are NULL before cancelling the work, avoiding to cancel an
+uninitialized work.
+
+Lastly, while we wait for all work items we submitted before to run
+to completion with cancel_delayed_work(), ht->mutex has been taken in
+rhashtable_destroy(). Moreover, cancel_delayed_work() doesn't return
+until all work items are accomplished, and when work items are
+scheduled, the work's function - rht_deferred_worker() will be called.
+However, as rht_deferred_worker() also needs to acquire the lock,
+deadlock might happen at the moment as the lock is already held before.
+So if the cancel work function is moved out of the lock covered scope,
+this will avoid the deadlock.
+
+Fixes: 97defe1 ("rhashtable: Per bucket locks & deferred expansion/shrinking")
+	Signed-off-by: Ying Xue <ying.xue@windriver.com>
+	Cc: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 57699a40b4f2694d3ee63fd5e6465ec8f600b620)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rhashtable.h
+#	lib/rhashtable.c
+diff --cc include/linux/rhashtable.h
+index 0839d7b8cd60,a2562ed53ea3..000000000000
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@@ -77,16 -112,41 +77,22 @@@ struct rhashtable_params 
+   */
+  struct rhashtable {
+  	struct bucket_table __rcu	*tbl;
+ -	struct bucket_table __rcu       *future_tbl;
+ -	atomic_t			nelems;
+ -	atomic_t			shift;
+ +	size_t				nelems;
+ +	size_t				shift;
+  	struct rhashtable_params	p;
+++<<<<<<< HEAD
+++=======
++ 	struct work_struct		run_work;
++ 	struct mutex                    mutex;
++ 	bool                            being_destroyed;
+++>>>>>>> 57699a40b4f2 (rhashtable: Fix race in rhashtable_destroy() and use regular work_struct)
+  };
+  
+ -static inline unsigned long rht_marker(const struct rhashtable *ht, u32 hash)
+ -{
+ -	return NULLS_MARKER(ht->p.nulls_base + hash);
+ -}
+ -
+ -#define INIT_RHT_NULLS_HEAD(ptr, ht, hash) \
+ -	((ptr) = (typeof(ptr)) rht_marker(ht, hash))
+ -
+ -static inline bool rht_is_a_nulls(const struct rhash_head *ptr)
+ -{
+ -	return ((unsigned long) ptr & 1);
+ -}
+ -
+ -static inline unsigned long rht_get_nulls_value(const struct rhash_head *ptr)
+ -{
+ -	return ((unsigned long) ptr) >> 1;
+ -}
+ -
+  #ifdef CONFIG_PROVE_LOCKING
+ -int lockdep_rht_mutex_is_held(struct rhashtable *ht);
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht);
+  int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash);
+  #else
+ -static inline int lockdep_rht_mutex_is_held(struct rhashtable *ht)
+ +static inline int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+  	return 1;
+  }
+diff --cc lib/rhashtable.c
+index be20e9720492,84a78e396a56..000000000000
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@@ -316,8 -480,56 +316,59 @@@ int rhashtable_shrink(struct rhashtabl
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_shrink);
+  
+++<<<<<<< HEAD
+++=======
++ static void rht_deferred_worker(struct work_struct *work)
++ {
++ 	struct rhashtable *ht;
++ 	struct bucket_table *tbl;
++ 
++ 	ht = container_of(work, struct rhashtable, run_work);
++ 	mutex_lock(&ht->mutex);
++ 	tbl = rht_dereference(ht->tbl, ht);
++ 
++ 	if (ht->p.grow_decision && ht->p.grow_decision(ht, tbl->size))
++ 		rhashtable_expand(ht);
++ 	else if (ht->p.shrink_decision && ht->p.shrink_decision(ht, tbl->size))
++ 		rhashtable_shrink(ht);
++ 
++ 	mutex_unlock(&ht->mutex);
++ }
++ 
++ static void rhashtable_wakeup_worker(struct rhashtable *ht)
++ {
++ 	struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
++ 	struct bucket_table *new_tbl = rht_dereference_rcu(ht->future_tbl, ht);
++ 	size_t size = tbl->size;
++ 
++ 	/* Only adjust the table if no resizing is currently in progress. */
++ 	if (tbl == new_tbl &&
++ 	    ((ht->p.grow_decision && ht->p.grow_decision(ht, size)) ||
++ 	     (ht->p.shrink_decision && ht->p.shrink_decision(ht, size))))
++ 		schedule_work(&ht->run_work);
++ }
++ 
++ static void __rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj,
++ 				struct bucket_table *tbl, u32 hash)
++ {
++ 	struct rhash_head *head = rht_dereference_bucket(tbl->buckets[hash],
++ 							 tbl, hash);
++ 
++ 	if (rht_is_a_nulls(head))
++ 		INIT_RHT_NULLS_HEAD(obj->next, ht, hash);
++ 	else
++ 		RCU_INIT_POINTER(obj->next, head);
++ 
++ 	rcu_assign_pointer(tbl->buckets[hash], obj);
++ 
++ 	atomic_inc(&ht->nelems);
++ 
++ 	rhashtable_wakeup_worker(ht);
++ }
++ 
+++>>>>>>> 57699a40b4f2 (rhashtable: Fix race in rhashtable_destroy() and use regular work_struct)
+  /**
+ - * rhashtable_insert - insert object into hash table
+ + * rhashtable_insert - insert object into hash hash table
+   * @ht:		hash table
+   * @obj:	pointer to hash head inside object
+   *
+@@@ -537,6 -902,9 +588,12 @@@ int rhashtable_init(struct rhashtable *
+  	if (!ht->p.hash_rnd)
+  		get_random_bytes(&ht->p.hash_rnd, sizeof(ht->p.hash_rnd));
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ht->p.grow_decision || ht->p.shrink_decision)
++ 		INIT_WORK(&ht->run_work, rht_deferred_worker);
++ 
+++>>>>>>> 57699a40b4f2 (rhashtable: Fix race in rhashtable_destroy() and use regular work_struct)
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_init);
+@@@ -549,9 -917,16 +606,20 @@@
+   * has to make sure that no resizing may happen by unpublishing the hashtable
+   * and waiting for the quiescent cycle before releasing the bucket array.
+   */
+ -void rhashtable_destroy(struct rhashtable *ht)
+ +void rhashtable_destroy(const struct rhashtable *ht)
+  {
+++<<<<<<< HEAD
+ +	bucket_table_free(ht->tbl);
+++=======
++ 	ht->being_destroyed = true;
++ 
++ 	if (ht->p.grow_decision || ht->p.shrink_decision)
++ 		cancel_work_sync(&ht->run_work);
++ 
++ 	mutex_lock(&ht->mutex);
++ 	bucket_table_free(rht_dereference(ht->tbl, ht));
++ 	mutex_unlock(&ht->mutex);
+++>>>>>>> 57699a40b4f2 (rhashtable: Fix race in rhashtable_destroy() and use regular work_struct)
+  }
+  EXPORT_SYMBOL_GPL(rhashtable_destroy);
+  
+* Unmerged path include/linux/rhashtable.h
+* Unmerged path lib/rhashtable.c
