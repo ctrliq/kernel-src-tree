@@ -1,0 +1,595 @@
+bonding: convert primary_slave to use RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 059b47e8aaf997245bc531e980581de492315fe6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/059b47e8.failed
+
+This is necessary mainly for two bonding call sites: procfs and
+sysfs as it was dereferenced without any real protection.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 059b47e8aaf997245bc531e980581de492315fe6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/bonding/bond_netlink.c
+#	drivers/net/bonding/bond_options.c
+#	drivers/net/bonding/bond_procfs.c
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bond_main.c
+index f10f65fec93b,629037f79213..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -932,8 -708,8 +932,13 @@@ out
+  
+  static bool bond_should_change_active(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	struct slave *prim = bond->primary_slave;
+ +	struct slave *curr = bond->curr_active_slave;
+++=======
++ 	struct slave *prim = rtnl_dereference(bond->primary_slave);
++ 	struct slave *curr = bond_deref_active_protected(bond);
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  
+  	if (!prim || !curr || curr->link != BOND_LINK_UP)
+  		return true;
+@@@ -958,39 -732,22 +963,51 @@@
+   */
+  static struct slave *bond_find_best_slave(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	struct slave *new_active, *old_active;
+ +	struct slave *bestslave = NULL;
+++=======
++ 	struct slave *slave, *bestslave = NULL, *primary;
++ 	struct list_head *iter;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  	int mintime = bond->params.updelay;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	new_active = bond->curr_active_slave;
+++=======
++ 	primary = rtnl_dereference(bond->primary_slave);
++ 	if (primary && primary->link == BOND_LINK_UP &&
++ 	    bond_should_change_active(bond))
++ 		return primary;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+ +
+ +	if (!new_active) { /* there were no active slaves left */
+ +		if (bond->slave_cnt > 0)   /* found one slave */
+ +			new_active = bond->first_slave;
+ +		else
+ +			return NULL; /* still no slave, return NULL */
+ +	}
+ +
+ +	if ((bond->primary_slave) &&
+ +	    bond->primary_slave->link == BOND_LINK_UP &&
+ +	    bond_should_change_active(bond)) {
+ +		new_active = bond->primary_slave;
+ +	}
+ +
+ +	/* remember where to stop iterating over the slaves */
+ +	old_active = new_active;
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ -		if (slave->link == BOND_LINK_UP)
+ -			return slave;
+ -		if (slave->link == BOND_LINK_BACK && bond_slave_is_up(slave) &&
+ -		    slave->delay < mintime) {
+ -			mintime = slave->delay;
+ -			bestslave = slave;
+ +	bond_for_each_slave_from(bond, new_active, i, old_active) {
+ +		if (new_active->link == BOND_LINK_UP) {
+ +			return new_active;
+ +		} else if (new_active->link == BOND_LINK_BACK &&
+ +			   IS_UP(new_active->dev)) {
+ +			/* link up, but waiting for stabilization */
+ +			if (new_active->delay < mintime) {
+ +				mintime = new_active->delay;
+ +				bestslave = new_active;
+ +			}
+  		}
+  	}
+  
+@@@ -1733,15 -1475,15 +1750,15 @@@ int bond_enslave(struct net_device *bon
+  	}
+  
+  	if (new_slave->link != BOND_LINK_DOWN)
+ -		new_slave->last_link_up = jiffies;
+ -	netdev_dbg(bond_dev, "Initial state of slave_dev is BOND_LINK_%s\n",
+ -		   new_slave->link == BOND_LINK_DOWN ? "DOWN" :
+ -		   (new_slave->link == BOND_LINK_UP ? "UP" : "BACK"));
+ +		new_slave->jiffies = jiffies;
+ +	pr_debug("Initial state of slave_dev is BOND_LINK_%s\n",
+ +		new_slave->link == BOND_LINK_DOWN ? "DOWN" :
+ +			(new_slave->link == BOND_LINK_UP ? "UP" : "BACK"));
+  
+ -	if (bond_uses_primary(bond) && bond->params.primary[0]) {
+ +	if (USES_PRIMARY(bond->params.mode) && bond->params.primary[0]) {
+  		/* if there is a primary slave, remember it */
+  		if (strcmp(bond->params.primary, new_slave->dev->name) == 0) {
+- 			bond->primary_slave = new_slave;
++ 			rcu_assign_pointer(bond->primary_slave, new_slave);
+  			bond->force_primary = true;
+  		}
+  	}
+@@@ -1844,31 -1589,26 +1861,42 @@@
+  err_unregister:
+  	netdev_rx_handler_unregister(slave_dev);
+  
+ -err_detach:
+ -	if (!bond_uses_primary(bond))
+ -		bond_hw_addr_flush(bond_dev, slave_dev);
+ +err_dest_symlinks:
+ +	bond_destroy_slave_symlinks(bond_dev, slave_dev);
+  
+++<<<<<<< HEAD
+ +err_detach:
+ +	if (!USES_PRIMARY(bond->params.mode)) {
+ +		netif_addr_lock_bh(bond_dev);
+ +		bond_mc_list_flush(bond_dev, slave_dev);
+ +		netif_addr_unlock_bh(bond_dev);
+ +	}
+ +	bond_del_vlans_from_slave(bond, slave_dev);
+ +	write_lock_bh(&bond->lock);
+ +	bond_detach_slave(bond, new_slave);
+ +	if (bond->primary_slave == new_slave)
+ +		bond->primary_slave = NULL;
+ +	if (bond->curr_active_slave == new_slave) {
+++=======
++ 	vlan_vids_del_by_dev(slave_dev, bond_dev);
++ 	if (rcu_access_pointer(bond->primary_slave) == new_slave)
++ 		RCU_INIT_POINTER(bond->primary_slave, NULL);
++ 	if (rcu_access_pointer(bond->curr_active_slave) == new_slave) {
++ 		block_netpoll_tx();
++ 		write_lock_bh(&bond->curr_slave_lock);
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  		bond_change_active_slave(bond, NULL);
+ +		write_unlock_bh(&bond->lock);
+ +		read_lock(&bond->lock);
+ +		write_lock_bh(&bond->curr_slave_lock);
+  		bond_select_active_slave(bond);
+  		write_unlock_bh(&bond->curr_slave_lock);
+ -		unblock_netpoll_tx();
+ +		read_unlock(&bond->lock);
+ +	} else {
+ +		write_unlock_bh(&bond->lock);
+  	}
++ 	/* either primary_slave or curr_active_slave might've changed */
++ 	synchronize_rcu();
+  	slave_disable_netpoll(new_slave);
+  
+  err_close:
+@@@ -1952,42 -1690,41 +1980,42 @@@ static int __bond_release_one(struct ne
+  	 * for this slave anymore.
+  	 */
+  	netdev_rx_handler_unregister(slave_dev);
+ +	write_lock_bh(&bond->lock);
+  
+ -	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
+ -		/* Sync against bond_3ad_rx_indication and
+ -		 * bond_3ad_state_machine_handler
+ +	if (!all && !bond->params.fail_over_mac) {
+ +		if (ether_addr_equal(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ +		    bond->slave_cnt > 1)
+ +			pr_warning("%s: Warning: the permanent HWaddr of %s - %pM - is still in use by %s. Set the HWaddr of %s to a different address to avoid conflicts.\n",
+ +				   bond_dev->name, slave_dev->name,
+ +				   slave->perm_hwaddr,
+ +				   bond_dev->name, slave_dev->name);
+ +	}
+ +
+ +	/* Inform AD package of unbinding of slave. */
+ +	if (bond->params.mode == BOND_MODE_8023AD) {
+ +		/* must be called before the slave is
+ +		 * detached from the list
+  		 */
+ -		write_lock_bh(&bond->curr_slave_lock);
+  		bond_3ad_unbind_slave(slave);
+ -		write_unlock_bh(&bond->curr_slave_lock);
+  	}
+  
+ -	netdev_info(bond_dev, "Releasing %s interface %s\n",
+ -		    bond_is_active_slave(slave) ? "active" : "backup",
+ -		    slave_dev->name);
+ +	pr_info("%s: releasing %s interface %s\n",
+ +		bond_dev->name,
+ +		bond_is_active_slave(slave) ? "active" : "backup",
+ +		slave_dev->name);
+  
+ -	oldcurrent = rcu_access_pointer(bond->curr_active_slave);
+ +	oldcurrent = bond->curr_active_slave;
+  
+ -	RCU_INIT_POINTER(bond->current_arp_slave, NULL);
+ +	bond->current_arp_slave = NULL;
+  
+ -	if (!all && (!bond->params.fail_over_mac ||
+ -		     BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)) {
+ -		if (ether_addr_equal_64bits(bond_dev->dev_addr, slave->perm_hwaddr) &&
+ -		    bond_has_slaves(bond))
+ -			netdev_warn(bond_dev, "the permanent HWaddr of %s - %pM - is still in use by %s - set the HWaddr of %s to a different address to avoid conflicts\n",
+ -				    slave_dev->name, slave->perm_hwaddr,
+ -				    bond_dev->name, slave_dev->name);
+ -	}
+ +	/* release the slave from its bond */
+ +	bond_detach_slave(bond, slave);
+  
+- 	if (bond->primary_slave == slave)
+- 		bond->primary_slave = NULL;
++ 	if (rtnl_dereference(bond->primary_slave) == slave)
++ 		RCU_INIT_POINTER(bond->primary_slave, NULL);
+  
+ -	if (oldcurrent == slave) {
+ -		write_lock_bh(&bond->curr_slave_lock);
+ +	if (oldcurrent == slave)
+  		bond_change_active_slave(bond, NULL);
+ -		write_unlock_bh(&bond->curr_slave_lock);
+ -	}
+  
+  	if (bond_is_lb(bond)) {
+  		/* Must be called only after the slave has been
+@@@ -2258,25 -1978,26 +2286,35 @@@ static int bond_miimon_inspect(struct b
+  
+  static void bond_miimon_commit(struct bonding *bond)
+  {
+++<<<<<<< HEAD
+ +	struct slave *slave;
+ +	int i;
+++=======
++ 	struct list_head *iter;
++ 	struct slave *slave, *primary;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  
+ -	bond_for_each_slave(bond, slave, iter) {
+ +	bond_for_each_slave(bond, slave, i) {
+  		switch (slave->new_link) {
+  		case BOND_LINK_NOCHANGE:
+  			continue;
+  
+  		case BOND_LINK_UP:
+  			slave->link = BOND_LINK_UP;
+ -			slave->last_link_up = jiffies;
+ +			slave->jiffies = jiffies;
+  
+++<<<<<<< HEAD
+ +			if (bond->params.mode == BOND_MODE_8023AD) {
+++=======
++ 			primary = rtnl_dereference(bond->primary_slave);
++ 			if (BOND_MODE(bond) == BOND_MODE_8023AD) {
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  				/* prevent it from being the active one */
+  				bond_set_backup_slave(slave);
+ -			} else if (BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP) {
+ +			} else if (bond->params.mode != BOND_MODE_ACTIVEBACKUP) {
+  				/* make it immediately active */
+  				bond_set_active_slave(slave);
+- 			} else if (slave != bond->primary_slave) {
++ 			} else if (slave != primary) {
+  				/* prevent it from being the active one */
+  				bond_set_backup_slave(slave);
+  			}
+@@@ -2864,23 -2618,25 +2901,28 @@@ static void bond_ab_arp_commit(struct b
+  
+  		case BOND_LINK_UP:
+  			trans_start = dev_trans_start(slave->dev);
+ -			if (rtnl_dereference(bond->curr_active_slave) != slave ||
+ -			    (!rtnl_dereference(bond->curr_active_slave) &&
+ -			     bond_time_in_interval(bond, trans_start, 1))) {
+ -				struct slave *current_arp_slave;
+ -
+ -				current_arp_slave = rtnl_dereference(bond->current_arp_slave);
+ +			if ((!bond->curr_active_slave &&
+ +			     time_in_range(jiffies,
+ +					   trans_start - delta_in_ticks,
+ +					   trans_start + delta_in_ticks + delta_in_ticks / 2)) ||
+ +			    bond->curr_active_slave != slave) {
+  				slave->link = BOND_LINK_UP;
+ -				if (current_arp_slave) {
+ +				if (bond->current_arp_slave) {
+  					bond_set_slave_inactive_flags(
+ -						current_arp_slave,
+ -						BOND_SLAVE_NOTIFY_NOW);
+ -					RCU_INIT_POINTER(bond->current_arp_slave, NULL);
+ +						bond->current_arp_slave);
+ +					bond->current_arp_slave = NULL;
+  				}
+  
+ -				netdev_info(bond->dev, "link status definitely up for interface %s\n",
+ -					    slave->dev->name);
+ +				pr_info("%s: link status definitely up for interface %s.\n",
+ +					bond->dev->name, slave->dev->name);
+  
+++<<<<<<< HEAD
+ +				if (!bond->curr_active_slave ||
+ +				    (slave == bond->primary_slave))
+++=======
++ 				if (!rtnl_dereference(bond->curr_active_slave) ||
++ 				    slave == rtnl_dereference(bond->primary_slave))
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  					goto do_failover;
+  
+  			}
+@@@ -3158,9 -2935,10 +3201,16 @@@ static int bond_slave_netdev_event(unsi
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		pr_info("%s: Primary slave changed to %s, reselecting active slave.\n",
+ +			bond->dev->name, bond->primary_slave ? slave_dev->name :
+ +							       "none");
+++=======
++ 		netdev_info(bond->dev, "Primary slave changed to %s, reselecting active slave\n",
++ 			    primary ? slave_dev->name : "none");
++ 
++ 		block_netpoll_tx();
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  		write_lock_bh(&bond->curr_slave_lock);
+  		bond_select_active_slave(bond);
+  		write_unlock_bh(&bond->curr_slave_lock);
+diff --cc drivers/net/bonding/bond_netlink.c
+index 40e7b1cb4aea,c13d83e15ace..000000000000
+--- a/drivers/net/bonding/bond_netlink.c
++++ b/drivers/net/bonding/bond_netlink.c
+@@@ -90,12 -440,140 +90,149 @@@ static int bond_fill_info(struct sk_buf
+  			  const struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+++<<<<<<< HEAD
+ +	struct net_device *slave_dev = bond_option_active_slave_get(bond);
+++=======
++ 	unsigned int packets_per_slave;
++ 	int ifindex, i, targets_added;
++ 	struct nlattr *targets;
++ 	struct slave *primary;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  
+ -	if (nla_put_u8(skb, IFLA_BOND_MODE, BOND_MODE(bond)))
+ +	if (nla_put_u8(skb, IFLA_BOND_MODE, bond->params.mode) ||
+ +	    (slave_dev &&
+ +	     nla_put_u32(skb, IFLA_BOND_ACTIVE_SLAVE, slave_dev->ifindex)))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+++=======
++ 
++ 	ifindex = bond_option_active_slave_get_ifindex(bond);
++ 	if (ifindex && nla_put_u32(skb, IFLA_BOND_ACTIVE_SLAVE, ifindex))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_MIIMON, bond->params.miimon))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_UPDELAY,
++ 			bond->params.updelay * bond->params.miimon))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_DOWNDELAY,
++ 			bond->params.downdelay * bond->params.miimon))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_USE_CARRIER, bond->params.use_carrier))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_ARP_INTERVAL, bond->params.arp_interval))
++ 		goto nla_put_failure;
++ 
++ 	targets = nla_nest_start(skb, IFLA_BOND_ARP_IP_TARGET);
++ 	if (!targets)
++ 		goto nla_put_failure;
++ 
++ 	targets_added = 0;
++ 	for (i = 0; i < BOND_MAX_ARP_TARGETS; i++) {
++ 		if (bond->params.arp_targets[i]) {
++ 			nla_put_be32(skb, i, bond->params.arp_targets[i]);
++ 			targets_added = 1;
++ 		}
++ 	}
++ 
++ 	if (targets_added)
++ 		nla_nest_end(skb, targets);
++ 	else
++ 		nla_nest_cancel(skb, targets);
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_ARP_VALIDATE, bond->params.arp_validate))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_ARP_ALL_TARGETS,
++ 			bond->params.arp_all_targets))
++ 		goto nla_put_failure;
++ 
++ 	primary = rtnl_dereference(bond->primary_slave);
++ 	if (primary &&
++ 	    nla_put_u32(skb, IFLA_BOND_PRIMARY, primary->dev->ifindex))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_PRIMARY_RESELECT,
++ 		       bond->params.primary_reselect))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_FAIL_OVER_MAC,
++ 		       bond->params.fail_over_mac))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_XMIT_HASH_POLICY,
++ 		       bond->params.xmit_policy))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_RESEND_IGMP,
++ 		        bond->params.resend_igmp))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_NUM_PEER_NOTIF,
++ 		       bond->params.num_peer_notif))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_ALL_SLAVES_ACTIVE,
++ 		       bond->params.all_slaves_active))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_MIN_LINKS,
++ 			bond->params.min_links))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(skb, IFLA_BOND_LP_INTERVAL,
++ 			bond->params.lp_interval))
++ 		goto nla_put_failure;
++ 
++ 	packets_per_slave = bond->params.packets_per_slave;
++ 	if (nla_put_u32(skb, IFLA_BOND_PACKETS_PER_SLAVE,
++ 			packets_per_slave))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_AD_LACP_RATE,
++ 		       bond->params.lacp_fast))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(skb, IFLA_BOND_AD_SELECT,
++ 		       bond->params.ad_select))
++ 		goto nla_put_failure;
++ 
++ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++ 		struct ad_info info;
++ 
++ 		if (!bond_3ad_get_active_agg_info(bond, &info)) {
++ 			struct nlattr *nest;
++ 
++ 			nest = nla_nest_start(skb, IFLA_BOND_AD_INFO);
++ 			if (!nest)
++ 				goto nla_put_failure;
++ 
++ 			if (nla_put_u16(skb, IFLA_BOND_AD_INFO_AGGREGATOR,
++ 					info.aggregator_id))
++ 				goto nla_put_failure;
++ 			if (nla_put_u16(skb, IFLA_BOND_AD_INFO_NUM_PORTS,
++ 					info.ports))
++ 				goto nla_put_failure;
++ 			if (nla_put_u16(skb, IFLA_BOND_AD_INFO_ACTOR_KEY,
++ 					info.actor_key))
++ 				goto nla_put_failure;
++ 			if (nla_put_u16(skb, IFLA_BOND_AD_INFO_PARTNER_KEY,
++ 					info.partner_key))
++ 				goto nla_put_failure;
++ 			if (nla_put(skb, IFLA_BOND_AD_INFO_PARTNER_MAC,
++ 				    sizeof(info.partner_system),
++ 				    &info.partner_system))
++ 				goto nla_put_failure;
++ 
++ 			nla_nest_end(skb, nest);
++ 		}
++ 	}
++ 
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  	return 0;
+  
+  nla_put_failure:
+diff --cc drivers/net/bonding/bond_procfs.c
+index 96f629d77b41,1a9fe1ba4c60..000000000000
+--- a/drivers/net/bonding/bond_procfs.c
++++ b/drivers/net/bonding/bond_procfs.c
+@@@ -56,7 -65,8 +56,12 @@@ static void bond_info_seq_stop(struct s
+  static void bond_info_show_master(struct seq_file *seq)
+  {
+  	struct bonding *bond = seq->private;
+++<<<<<<< HEAD
+ +	struct slave *curr;
+++=======
++ 	const struct bond_opt_value *optval;
++ 	struct slave *curr, *primary;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  	int i;
+  
+  	curr = rcu_dereference(bond->curr_active_slave);
+@@@ -71,20 -83,24 +76,30 @@@
+  
+  	seq_printf(seq, "\n");
+  
+ -	if (BOND_MODE(bond) == BOND_MODE_XOR ||
+ -		BOND_MODE(bond) == BOND_MODE_8023AD) {
+ -		optval = bond_opt_get_val(BOND_OPT_XMIT_HASH,
+ -					  bond->params.xmit_policy);
+ +	if (bond->params.mode == BOND_MODE_XOR ||
+ +		bond->params.mode == BOND_MODE_8023AD) {
+  		seq_printf(seq, "Transmit Hash Policy: %s (%d)\n",
+ -			   optval->string, bond->params.xmit_policy);
+ +			xmit_hashtype_tbl[bond->params.xmit_policy].modename,
+ +			bond->params.xmit_policy);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (USES_PRIMARY(bond->params.mode)) {
+ +		seq_printf(seq, "Primary Slave: %s",
+ +			   (bond->primary_slave) ?
+ +			   bond->primary_slave->dev->name : "None");
+ +		if (bond->primary_slave)
+++=======
++ 	if (bond_uses_primary(bond)) {
++ 		primary = rcu_dereference(bond->primary_slave);
++ 		seq_printf(seq, "Primary Slave: %s",
++ 			   primary ? primary->dev->name : "None");
++ 		if (primary) {
++ 			optval = bond_opt_get_val(BOND_OPT_PRIMARY_RESELECT,
++ 						  bond->params.primary_reselect);
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  			seq_printf(seq, " (primary_reselect %s)",
+ -				   optval->string);
+ -		}
+ +		   pri_reselect_tbl[bond->params.primary_reselect].modename);
+  
+  		seq_printf(seq, "\nCurrently Active Slave: %s\n",
+  			   (curr) ? curr->dev->name : "None");
+diff --cc drivers/net/bonding/bonding.h
+index 64c0cb81e478,c798561a6f01..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -216,10 -193,9 +216,16 @@@ struct slave 
+   */
+  struct bonding {
+  	struct   net_device *dev; /* first - useful for panic debug */
+++<<<<<<< HEAD
+ +	struct   slave *first_slave;
+ +	struct   slave *curr_active_slave;
+ +	struct   slave *current_arp_slave;
+ +	struct   slave *primary_slave;
+++=======
++ 	struct   slave __rcu *curr_active_slave;
++ 	struct   slave __rcu *current_arp_slave;
++ 	struct   slave __rcu *primary_slave;
+++>>>>>>> 059b47e8aaf9 (bonding: convert primary_slave to use RCU)
+  	bool     force_primary;
+  	s32      slave_cnt; /* never change this value outside the attach/detach wrappers */
+  	int     (*recv_probe)(const struct sk_buff *, struct bonding *,
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/bonding/bond_netlink.c
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_procfs.c
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index c7fd44189961..9222861a3286 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -1098,11 +1098,15 @@ static ssize_t bonding_show_primary(struct device *d,
+ 				    struct device_attribute *attr,
+ 				    char *buf)
+ {
+-	int count = 0;
+ 	struct bonding *bond = to_bond(d);
++	struct slave *primary;
++	int count = 0;
+ 
+-	if (bond->primary_slave)
+-		count = sprintf(buf, "%s\n", bond->primary_slave->dev->name);
++	rcu_read_lock();
++	primary = rcu_dereference(bond->primary_slave);
++	if (primary)
++		count = sprintf(buf, "%s\n", primary->dev->name);
++	rcu_read_unlock();
+ 
+ 	return count;
+ }
+* Unmerged path drivers/net/bonding/bonding.h
