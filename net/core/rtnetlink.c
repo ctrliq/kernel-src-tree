@@ -2561,12 +2561,14 @@ static inline size_t bridge_nlmsg_size(void)
 		+ nla_total_size(sizeof(u16));	/* IFLA_BRIDGE_MODE */
 }
 
-static int rtnl_bridge_notify(struct net_device *dev, u16 flags)
+static int rtnl_bridge_notify(struct net_device *dev)
 {
 	struct net *net = dev_net(dev);
-	struct net_device *br_dev = netdev_master_upper_dev_get(dev);
 	struct sk_buff *skb;
 	int err = -EOPNOTSUPP;
+
+	if (!dev->netdev_ops->ndo_bridge_getlink)
+		return 0;
 
 	skb = nlmsg_new(bridge_nlmsg_size(), GFP_ATOMIC);
 	if (!skb) {
@@ -2574,19 +2576,9 @@ static int rtnl_bridge_notify(struct net_device *dev, u16 flags)
 		goto errout;
 	}
 
-	if ((!flags || (flags & BRIDGE_FLAGS_MASTER)) &&
-	    br_dev && br_dev->netdev_ops->ndo_bridge_getlink) {
-		err = br_dev->netdev_ops->ndo_bridge_getlink(skb, 0, 0, dev, 0);
-		if (err < 0)
-			goto errout;
-	}
-
-	if ((flags & BRIDGE_FLAGS_SELF) &&
-	    dev->netdev_ops->ndo_bridge_getlink) {
-		err = dev->netdev_ops->ndo_bridge_getlink(skb, 0, 0, dev, 0);
-		if (err < 0)
-			goto errout;
-	}
+	err = dev->netdev_ops->ndo_bridge_getlink(skb, 0, 0, dev, 0);
+	if (err < 0)
+		goto errout;
 
 	rtnl_notify(skb, net, 0, RTNLGRP_LINK, NULL, GFP_ATOMIC);
 	return 0;
@@ -2653,16 +2645,18 @@ static int rtnl_bridge_setlink(struct sk_buff *skb, struct nlmsghdr *nlh)
 			err = -EOPNOTSUPP;
 		else
 			err = dev->netdev_ops->ndo_bridge_setlink(dev, nlh);
-
-		if (!err)
+		if (!err) {
 			flags &= ~BRIDGE_FLAGS_SELF;
+
+			/* Generate event to notify upper layer of bridge
+			 * change
+			 */
+			err = rtnl_bridge_notify(dev);
+		}
 	}
 
 	if (have_flags)
 		memcpy(nla_data(attr), &flags, sizeof(flags));
-	/* Generate event to notify upper layer of bridge change */
-	if (!err)
-		err = rtnl_bridge_notify(dev, oflags);
 out:
 	return err;
 }
@@ -2724,15 +2718,18 @@ static int rtnl_bridge_dellink(struct sk_buff *skb, struct nlmsghdr *nlh)
 		else
 			err = dev->netdev_ops->ndo_bridge_dellink(dev, nlh);
 
-		if (!err)
+		if (!err) {
 			flags &= ~BRIDGE_FLAGS_SELF;
+
+			/* Generate event to notify upper layer of bridge
+			 * change
+			 */
+			err = rtnl_bridge_notify(dev);
+		}
 	}
 
 	if (have_flags)
 		memcpy(nla_data(attr), &flags, sizeof(flags));
-	/* Generate event to notify upper layer of bridge change */
-	if (!err)
-		err = rtnl_bridge_notify(dev, oflags);
 out:
 	return err;
 }
