@@ -1,0 +1,138 @@
+vxlan: advertise netns of vxlan dev in fdb msg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 193523bf937309d57c6dd7839bcf34d7a029dbee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/193523bf.failed
+
+Netlink FDB messages are sent in the link netns. The header of these messages
+contains the ifindex (ndm_ifindex) of the netdevice, but this ifindex is
+unusable in case of x-netns vxlan.
+I named the new attribute NDA_NDM_IFINDEX_NETNSID, to avoid confusion with
+NDA_IFINDEX.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 193523bf937309d57c6dd7839bcf34d7a029dbee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/net_namespace.c
+diff --cc net/core/net_namespace.c
+index 4cf6699528f0,b7bde551ef76..000000000000
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@@ -144,6 -148,78 +144,81 @@@ static void ops_free_list(const struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int alloc_netid(struct net *net, struct net *peer, int reqid)
++ {
++ 	int min = 0, max = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (reqid >= 0) {
++ 		min = reqid;
++ 		max = reqid + 1;
++ 	}
++ 
++ 	return idr_alloc(&net->netns_ids, peer, min, max, GFP_KERNEL);
++ }
++ 
++ /* This function is used by idr_for_each(). If net is equal to peer, the
++  * function returns the id so that idr_for_each() stops. Because we cannot
++  * returns the id 0 (idr_for_each() will not stop), we return the magic value
++  * NET_ID_ZERO (-1) for it.
++  */
++ #define NET_ID_ZERO -1
++ static int net_eq_idr(int id, void *net, void *peer)
++ {
++ 	if (net_eq(net, peer))
++ 		return id ? : NET_ID_ZERO;
++ 	return 0;
++ }
++ 
++ static int __peernet2id(struct net *net, struct net *peer, bool alloc)
++ {
++ 	int id = idr_for_each(&net->netns_ids, net_eq_idr, peer);
++ 
++ 	ASSERT_RTNL();
++ 
++ 	/* Magic value for id 0. */
++ 	if (id == NET_ID_ZERO)
++ 		return 0;
++ 	if (id > 0)
++ 		return id;
++ 
++ 	if (alloc)
++ 		return alloc_netid(net, peer, -1);
++ 
++ 	return -ENOENT;
++ }
++ 
++ /* This function returns the id of a peer netns. If no id is assigned, one will
++  * be allocated and returned.
++  */
++ int peernet2id(struct net *net, struct net *peer)
++ {
++ 	int id = __peernet2id(net, peer, true);
++ 
++ 	return id >= 0 ? id : NETNSA_NSID_NOT_ASSIGNED;
++ }
++ EXPORT_SYMBOL(peernet2id);
++ 
++ struct net *get_net_ns_by_id(struct net *net, int id)
++ {
++ 	struct net *peer;
++ 
++ 	if (id < 0)
++ 		return NULL;
++ 
++ 	rcu_read_lock();
++ 	peer = idr_find(&net->netns_ids, id);
++ 	if (peer)
++ 		get_net(peer);
++ 	rcu_read_unlock();
++ 
++ 	return peer;
++ }
++ 
+++>>>>>>> 193523bf9373 (vxlan: advertise netns of vxlan dev in fdb msg)
+  /*
+   * setup_net runs the initializers for the network namespace object.
+   */
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 1f7710467383..f21088795102 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -344,6 +344,11 @@ static int vxlan_fdb_info(struct sk_buff *skb, struct vxlan_dev *vxlan,
+ 	ndm->ndm_flags = fdb->flags;
+ 	ndm->ndm_type = RTN_UNICAST;
+ 
++	if (!net_eq(dev_net(vxlan->dev), vxlan->net) &&
++	    nla_put_s32(skb, NDA_NDM_IFINDEX_NETNSID,
++			peernet2id(vxlan->net, dev_net(vxlan->dev))))
++		goto nla_put_failure;
++
+ 	if (send_eth && nla_put(skb, NDA_LLADDR, ETH_ALEN, &fdb->eth_addr))
+ 		goto nla_put_failure;
+ 
+diff --git a/include/uapi/linux/neighbour.h b/include/uapi/linux/neighbour.h
+index bfe6283064ff..0796be971ae0 100644
+--- a/include/uapi/linux/neighbour.h
++++ b/include/uapi/linux/neighbour.h
+@@ -25,6 +25,7 @@ enum {
+ 	NDA_VNI,
+ 	NDA_IFINDEX,
+ 	NDA_MASTER,
++	NDA_NDM_IFINDEX_NETNSID,
+ 	__NDA_MAX
+ };
+ 
+* Unmerged path net/core/net_namespace.c
