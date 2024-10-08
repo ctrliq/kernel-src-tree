@@ -648,6 +648,12 @@ static void rfcomm_tty_cleanup(struct tty_struct *tty)
 	dev->port.tty = NULL;
 	rfcomm_dlc_unlock(dev->dlc);
 
+	/*
+	 * purge the dlc->tx_queue to avoid circular dependencies
+	 * between dev and dlc
+	 */
+	skb_queue_purge(&dev->dlc->tx_queue);
+
 	tty_port_put(&dev->port);
 }
 
