@@ -1,0 +1,151 @@
+xprtrdma: Clean up rpcrdma_ia_open()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit d1ed857e5707e073973cfb1b8df801053a356518
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d1ed857e.failed
+
+Untangle the end of rpcrdma_ia_open() by moving DMA MR set-up, which
+is different for each registration method, to the .ro_open functions.
+
+This is refactoring only. No behavior change is expected.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Devesh Sharma <devesh.sharma@avagotech.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit d1ed857e5707e073973cfb1b8df801053a356518)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/physical_ops.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/physical_ops.c
+index ba518af16787,72cf8b15bbb4..000000000000
+--- a/net/sunrpc/xprtrdma/physical_ops.c
++++ b/net/sunrpc/xprtrdma/physical_ops.c
+@@@ -50,9 -73,8 +73,14 @@@ physical_op_map(struct rpcrdma_xprt *r_
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+  
+++<<<<<<< HEAD
+ +	rpcrdma_map_one(ia->ri_id->device, seg,
+ +			rpcrdma_data_dir(writing));
+ +	seg->mr_rkey = ia->ri_bind_mem->rkey;
+++=======
++ 	rpcrdma_map_one(ia->ri_device, seg, rpcrdma_data_dir(writing));
++ 	seg->mr_rkey = ia->ri_dma_mr->rkey;
+++>>>>>>> d1ed857e5707 (xprtrdma: Clean up rpcrdma_ia_open())
+  	seg->mr_base = seg->mr_dma;
+  	seg->mr_nsegs = 1;
+  	return 1;
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 93940b99263d,8516d9894599..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -600,11 -521,6 +602,14 @@@ rpcrdma_ia_open(struct rpcrdma_xprt *xp
+  		goto out3;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (devattr->device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY) {
+ +		ia->ri_have_dma_lkey = 1;
+ +		ia->ri_dma_lkey = ia->ri_id->device->local_dma_lkey;
+ +	}
+ +
+++=======
+++>>>>>>> d1ed857e5707 (xprtrdma: Clean up rpcrdma_ia_open())
+  	if (memreg == RPCRDMA_FRMR) {
+  		/* Requires both frmr reg and local dma lkey */
+  		if (((devattr->device_cap_flags &
+@@@ -1560,13 -1231,17 +1545,25 @@@ rpcrdma_alloc_regbuf(struct rpcrdma_ia 
+  	if (rb == NULL)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	iov = &rb->rg_iov;
++ 	iov->addr = ib_dma_map_single(ia->ri_device,
++ 				      (void *)rb->rg_base, size,
++ 				      DMA_BIDIRECTIONAL);
++ 	if (ib_dma_mapping_error(ia->ri_device, iov->addr))
++ 		goto out_free;
++ 
++ 	iov->length = size;
++ 	iov->lkey = ia->ri_dma_lkey;
+++>>>>>>> d1ed857e5707 (xprtrdma: Clean up rpcrdma_ia_open())
+  	rb->rg_size = size;
+  	rb->rg_owner = NULL;
+ +	rc = rpcrdma_register_internal(ia, rb->rg_base, size,
+ +				       &rb->rg_mr, &rb->rg_iov);
+ +	if (rc)
+ +		goto out_free;
+ +
+  	return rb;
+  
+  out_free:
+diff --git a/net/sunrpc/xprtrdma/fmr_ops.c b/net/sunrpc/xprtrdma/fmr_ops.c
+index e0da9f8f1686..3a15566840d2 100644
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@ -24,6 +24,25 @@ static int
+ fmr_op_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep,
+ 	    struct rpcrdma_create_data_internal *cdata)
+ {
++	struct ib_device_attr *devattr = &ia->ri_devattr;
++	struct ib_mr *mr;
++
++	/* Obtain an lkey to use for the regbufs, which are
++	 * protected from remote access.
++	 */
++	if (devattr->device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY) {
++		ia->ri_dma_lkey = ia->ri_device->local_dma_lkey;
++	} else {
++		mr = ib_get_dma_mr(ia->ri_pd, IB_ACCESS_LOCAL_WRITE);
++		if (IS_ERR(mr)) {
++			pr_err("%s: ib_get_dma_mr for failed with %lX\n",
++			       __func__, PTR_ERR(mr));
++			return -ENOMEM;
++		}
++		ia->ri_dma_lkey = ia->ri_dma_mr->lkey;
++		ia->ri_dma_mr = mr;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 98b2c213e28f..276bcc418600 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -133,6 +133,11 @@ frwr_op_open(struct rpcrdma_ia *ia, struct rpcrdma_ep *ep,
+ 	struct ib_device_attr *devattr = &ia->ri_devattr;
+ 	int depth, delta;
+ 
++	/* Obtain an lkey to use for the regbufs, which are
++	 * protected from remote access.
++	 */
++	ia->ri_dma_lkey = ia->ri_device->local_dma_lkey;
++
+ 	ia->ri_max_frmr_depth =
+ 			min_t(unsigned int, RPCRDMA_MAX_DATA_SEGS,
+ 			      devattr->max_fast_reg_page_list_len);
+* Unmerged path net/sunrpc/xprtrdma/physical_ops.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 5689008ef62a..8488d831159b 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -64,9 +64,8 @@ struct rpcrdma_ia {
+ 	rwlock_t		ri_qplock;
+ 	struct rdma_cm_id 	*ri_id;
+ 	struct ib_pd		*ri_pd;
+-	struct ib_mr		*ri_bind_mem;
++	struct ib_mr		*ri_dma_mr;
+ 	u32			ri_dma_lkey;
+-	int			ri_have_dma_lkey;
+ 	struct completion	ri_done;
+ 	int			ri_async_rc;
+ 	unsigned int		ri_max_frmr_depth;
