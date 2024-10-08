@@ -131,6 +131,7 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 			       sizeof(dest->data) - size);
 		return;
 	}
+#endif
 	case NFT_CT_BYTES: /* fallthrough */
 	case NFT_CT_PKTS: {
 		const struct nf_conn_acct *acct = nf_conn_acct_find(ct);
@@ -142,7 +143,6 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 		memcpy(dest, &count, sizeof(count));
 		return;
 	}
-#endif
 	default:
 		break;
 	}
