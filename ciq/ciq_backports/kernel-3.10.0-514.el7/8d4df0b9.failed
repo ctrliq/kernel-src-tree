@@ -1,0 +1,187 @@
+bridge: Pass net into br_nf_ip_fragment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 8d4df0b9300a2623559a8f616a152312454cada1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8d4df0b9.failed
+
+This is a prep work for passing struct net through ip_do_fragment and
+later the netfilter okfn.   Doing this independently makes the later
+code changes clearer.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d4df0b9300a2623559a8f616a152312454cada1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netfilter.c
+diff --cc net/bridge/br_netfilter.c
+index 9c51a9410f9c,971d45d24c64..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -848,29 -667,134 +848,159 @@@ static unsigned int br_nf_forward_arp(c
+  	return NF_STOLEN;
+  }
+  
+++<<<<<<< HEAD:net/bridge/br_netfilter.c
+ +#if IS_ENABLED(CONFIG_NF_CONNTRACK_IPV4)
+ +static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+ +{
+ +	int ret;
+++=======
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4) || IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
++ static int br_nf_push_frag_xmit(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct brnf_frag_data *data;
++ 	int err;
++ 
++ 	data = this_cpu_ptr(&brnf_frag_data_storage);
++ 	err = skb_cow_head(skb, data->size);
++ 
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return 0;
++ 	}
++ 
++ 	if (data->vlan_tci) {
++ 		skb->vlan_tci = data->vlan_tci;
++ 		skb->vlan_proto = data->vlan_proto;
++ 	}
++ 
++ 	skb_copy_to_linear_data_offset(skb, -data->size, data->mac, data->size);
++ 	__skb_push(skb, data->encap_size);
++ 
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
++ }
++ #endif
++ 
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ static int
++ br_nf_ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
++ 		  int (*output)(struct sock *, struct sk_buff *))
++ {
++ 	unsigned int mtu = ip_skb_dst_mtu(skb);
++ 	struct iphdr *iph = ip_hdr(skb);
++ 
++ 	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) ||
++ 		     (IPCB(skb)->frag_max_size &&
++ 		      IPCB(skb)->frag_max_size > mtu))) {
++ 		IP_INC_STATS(net, IPSTATS_MIB_FRAGFAILS);
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ 
++ 	return ip_do_fragment(sk, skb, output);
++ }
++ #endif
++ 
++ static unsigned int nf_bridge_mtu_reduction(const struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge->orig_proto == BRNF_PROTO_PPPOE)
++ 		return PPPOE_SES_HLEN;
++ 	return 0;
++ }
++ 
++ static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge;
++ 	unsigned int mtu_reserved;
++ 	struct net *net = dev_net(skb_dst(skb)->dev);
+++>>>>>>> 8d4df0b9300a (bridge: Pass net into br_nf_ip_fragment):net/bridge/br_netfilter_hooks.c
+  
+ -	mtu_reserved = nf_bridge_mtu_reduction(skb);
+ +	if (skb->nfct != NULL && skb->protocol == htons(ETH_P_IP) &&
+ +	    skb->len + nf_bridge_mtu_reduction(skb) > skb->dev->mtu &&
+ +	    !skb_is_gso(skb)) {
+ +		if (br_parse_ip_options(skb))
+ +			/* Drop invalid packet */
+ +			return NF_DROP;
+ +		ret = ip_fragment(sk, skb, br_dev_queue_push_xmit);
+ +	} else
+ +		ret = br_dev_queue_push_xmit(sk, skb);
+  
+++<<<<<<< HEAD:net/bridge/br_netfilter.c
+ +	return ret;
+++=======
++ 	if (skb_is_gso(skb) || skb->len + mtu_reserved <= skb->dev->mtu) {
++ 		nf_bridge_info_free(skb);
++ 		return br_dev_queue_push_xmit(sk, skb);
++ 	}
++ 
++ 	nf_bridge = nf_bridge_info_get(skb);
++ 
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV4)
++ 	/* This is wrong! We should preserve the original fragment
++ 	 * boundaries by preserving frag_list rather than refragmenting.
++ 	 */
++ 	if (skb->protocol == htons(ETH_P_IP)) {
++ 		struct brnf_frag_data *data;
++ 
++ 		if (br_validate_ipv4(skb))
++ 			goto drop;
++ 
++ 		IPCB(skb)->frag_max_size = nf_bridge->frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 
++ 		data->vlan_tci = skb->vlan_tci;
++ 		data->vlan_proto = skb->vlan_proto;
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		return br_nf_ip_fragment(net, sk, skb, br_nf_push_frag_xmit);
++ 	}
++ #endif
++ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
++ 	if (skb->protocol == htons(ETH_P_IPV6)) {
++ 		const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
++ 		struct brnf_frag_data *data;
++ 
++ 		if (br_validate_ipv6(skb))
++ 			goto drop;
++ 
++ 		IP6CB(skb)->frag_max_size = nf_bridge->frag_max_size;
++ 
++ 		nf_bridge_update_protocol(skb);
++ 
++ 		data = this_cpu_ptr(&brnf_frag_data_storage);
++ 		data->encap_size = nf_bridge_encap_header_len(skb);
++ 		data->size = ETH_HLEN + data->encap_size;
++ 
++ 		skb_copy_from_linear_data_offset(skb, -data->size, data->mac,
++ 						 data->size);
++ 
++ 		if (v6ops)
++ 			return v6ops->fragment(sk, skb, br_nf_push_frag_xmit);
++ 
++ 		kfree_skb(skb);
++ 		return -EMSGSIZE;
++ 	}
++ #endif
++ 	nf_bridge_info_free(skb);
++ 	return br_dev_queue_push_xmit(sk, skb);
++  drop:
++ 	kfree_skb(skb);
++ 	return 0;
+++>>>>>>> 8d4df0b9300a (bridge: Pass net into br_nf_ip_fragment):net/bridge/br_netfilter_hooks.c
+  }
+ +#else
+ +static int br_nf_dev_queue_xmit(struct sock *sk, struct sk_buff *skb)
+ +{
+ +        return br_dev_queue_push_xmit(sk, skb);
+ +}
+ +#endif
+  
+  /* PF_BRIDGE/POST_ROUTING ********************************************/
+  static unsigned int br_nf_post_routing(const struct nf_hook_ops *ops,
+* Unmerged path net/bridge/br_netfilter.c
