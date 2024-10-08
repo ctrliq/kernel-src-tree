@@ -1,0 +1,140 @@
+perf: Fix race in perf_event_exit_task_context()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6a3351b612b72c558910c88a43e2ef6d7d68bc97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6a3351b6.failed
+
+There is a race between perf_event_exit_task_context() and
+orphans_remove_work() which results in a use-after-free.
+
+We mark ctx->task with TASK_TOMBSTONE to indicate a context is
+'dead', under ctx->lock. After which point event_function_call()
+on any event of that context will NOP
+
+A concurrent orphans_remove_work() will only hold ctx->mutex for
+the list iteration and not serialize against this. Therefore its
+possible that orphans_remove_work()'s perf_remove_from_context()
+call will fail, but we'll continue to free the event, with the
+result of free'd memory still being on lists and everything.
+
+Once perf_event_exit_task_context() gets around to acquiring
+ctx->mutex it too will iterate the event list, encounter the
+already free'd event and proceed to free it _again_. This fails
+with the WARN in free_event().
+
+Plug the race by having perf_event_exit_task_context() hold
+ctx::mutex over the whole tear-down, thereby 'naturally'
+serializing against all other sites, including the orphan work.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: alexander.shishkin@linux.intel.com
+	Cc: dsahern@gmail.com
+	Cc: namhyung@kernel.org
+Link: http://lkml.kernel.org/r/20160125130954.GY6357@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6a3351b612b72c558910c88a43e2ef6d7d68bc97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index a9738dcf3255,1d243fadfd12..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -8128,36 -8746,54 +8128,72 @@@ __perf_event_exit_task(struct perf_even
+  
+  static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+  {
+ -	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+  	struct perf_event *child_event, *next;
+++<<<<<<< HEAD
+ +	struct perf_event_context *child_ctx, *clone_ctx = NULL;
+ +
+ +	if (likely(!child->perf_event_ctxp[ctxn]))
+ +		return;
+ +
+ +	local_irq_disable();
+ +	WARN_ON_ONCE(child != current);
+ +	/*
+ +	 * We can't reschedule here because interrupts are disabled,
+ +	 * and child must be current.
+ +	 */
+ +	child_ctx = rcu_dereference_raw(child->perf_event_ctxp[ctxn]);
+++=======
++ 
++ 	WARN_ON_ONCE(child != current);
++ 
++ 	child_ctx = perf_pin_task_context(child, ctxn);
++ 	if (!child_ctx)
++ 		return;
++ 
++ 	/*
++ 	 * In order to reduce the amount of tricky in ctx tear-down, we hold
++ 	 * ctx::mutex over the entire thing. This serializes against almost
++ 	 * everything that wants to access the ctx.
++ 	 *
++ 	 * The exception is sys_perf_event_open() /
++ 	 * perf_event_create_kernel_count() which does find_get_context()
++ 	 * without ctx::mutex (it cannot because of the move_group double mutex
++ 	 * lock thing). See the comments in perf_install_in_context().
++ 	 *
++ 	 * We can recurse on the same lock type through:
++ 	 *
++ 	 *   __perf_event_exit_task()
++ 	 *     sync_child_event()
++ 	 *       put_event()
++ 	 *         mutex_lock(&ctx->mutex)
++ 	 *
++ 	 * But since its the parent context it won't be the same instance.
++ 	 */
++ 	mutex_lock(&child_ctx->mutex);
++ 
++ 	/*
++ 	 * In a single ctx::lock section, de-schedule the events and detach the
++ 	 * context from the task such that we cannot ever get it scheduled back
++ 	 * in.
++ 	 */
++ 	raw_spin_lock_irq(&child_ctx->lock);
++ 	task_ctx_sched_out(__get_cpu_context(child_ctx), child_ctx);
+++>>>>>>> 6a3351b612b7 (perf: Fix race in perf_event_exit_task_context())
+  
+  	/*
+ -	 * Now that the context is inactive, destroy the task <-> ctx relation
+ -	 * and mark the context dead.
+ +	 * Take the context lock here so that if find_get_context is
+ +	 * reading child->perf_event_ctxp, we wait until it has
+ +	 * incremented the context's refcount before we do put_ctx below.
+  	 */
+ -	RCU_INIT_POINTER(child->perf_event_ctxp[ctxn], NULL);
+ -	put_ctx(child_ctx); /* cannot be last */
+ -	WRITE_ONCE(child_ctx->task, TASK_TOMBSTONE);
+ -	put_task_struct(current); /* cannot be last */
+ +	raw_spin_lock(&child_ctx->lock);
+ +	task_ctx_sched_out(child_ctx);
+ +	child->perf_event_ctxp[ctxn] = NULL;
+  
+- 	/*
+- 	 * If this context is a clone; unclone it so it can't get
+- 	 * swapped to another process while we're removing all
+- 	 * the events from it.
+- 	 */
+  	clone_ctx = unclone_ctx(child_ctx);
+++<<<<<<< HEAD
+ +	update_context_time(child_ctx);
+++=======
+++>>>>>>> 6a3351b612b7 (perf: Fix race in perf_event_exit_task_context())
+  	raw_spin_unlock_irq(&child_ctx->lock);
+  
+  	if (clone_ctx)
+* Unmerged path kernel/events/core.c
