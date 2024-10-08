@@ -1,0 +1,485 @@
+net: bulk free infrastructure for NAPI context, use napi_consume_skb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] bulk free infrastructure for NAPI context, use napi_consume_skb (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 96.18%
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 795bb1c00dd338aa0d12f9a7f1f4776fb3160416
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/795bb1c0.failed
+
+Discovered that network stack were hitting the kmem_cache/SLUB
+slowpath when freeing SKBs.  Doing bulk free with kmem_cache_free_bulk
+can speedup this slowpath.
+
+NAPI context is a bit special, lets take advantage of that for bulk
+free'ing SKBs.
+
+In NAPI context we are running in softirq, which gives us certain
+protection.  A softirq can run on several CPUs at once.  BUT the
+important part is a softirq will never preempt another softirq running
+on the same CPU.  This gives us the opportunity to access per-cpu
+variables in softirq context.
+
+Extend napi_alloc_cache (before only contained page_frag_cache) to be
+a struct with a small array based stack for holding SKBs.  Introduce a
+SKB defer and flush API for accessing this.
+
+Introduce napi_consume_skb() as replacement for e.g. dev_consume_skb_any()
+when running in NAPI context.  A small trick to handle/detect if we
+are called from netpoll is to see if budget is 0.  In that case, we
+need to invoke dev_consume_skb_irq().
+
+Joint work with Alexander Duyck.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 795bb1c00dd338aa0d12f9a7f1f4776fb3160416)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/core/skbuff.c
+diff --cc net/core/dev.c
+index e416d49ce837,9b2c7a999e71..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4470,91 -5058,113 +4470,104 @@@ void netif_napi_del(struct napi_struct 
+  }
+  EXPORT_SYMBOL(netif_napi_del);
+  
+ -static int napi_poll(struct napi_struct *n, struct list_head *repoll)
+ +static void net_rx_action(struct softirq_action *h)
+  {
+ +	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+ +	unsigned long time_limit = jiffies + 2;
+ +	int budget = netdev_budget;
+  	void *have;
+ -	int work, weight;
+  
+ -	list_del_init(&n->poll_list);
+ -
+ -	have = netpoll_poll_lock(n);
+ -
+ -	weight = n->weight;
+ -
+ -	/* This NAPI_STATE_SCHED test is for avoiding a race
+ -	 * with netpoll's poll_napi().  Only the entity which
+ -	 * obtains the lock and sees NAPI_STATE_SCHED set will
+ -	 * actually make the ->poll() call.  Therefore we avoid
+ -	 * accidentally calling ->poll() when NAPI is not scheduled.
+ -	 */
+ -	work = 0;
+ -	if (test_bit(NAPI_STATE_SCHED, &n->state)) {
+ -		work = n->poll(n, weight);
+ -		trace_napi_poll(n);
+ -	}
+ -
+ -	WARN_ON_ONCE(work > weight);
+ -
+ -	if (likely(work < weight))
+ -		goto out_unlock;
+ +	local_irq_disable();
+  
+ -	/* Drivers must not modify the NAPI state if they
+ -	 * consume the entire weight.  In such cases this code
+ -	 * still "owns" the NAPI instance and therefore can
+ -	 * move the instance around on the list at-will.
+ -	 */
+ -	if (unlikely(napi_disable_pending(n))) {
+ -		napi_complete(n);
+ -		goto out_unlock;
+ -	}
+ +	while (!list_empty(&sd->poll_list)) {
+ +		struct napi_struct *n;
+ +		int work, weight;
+  
+ -	if (n->gro_list) {
+ -		/* flush too old packets
+ -		 * If HZ < 1000, flush all packets.
+ +		/* If softirq window is exhuasted then punt.
+ +		 * Allow this to run for 2 jiffies since which will allow
+ +		 * an average latency of 1.5/HZ.
+  		 */
+ -		napi_gro_flush(n, HZ >= 1000);
+ -	}
+ +		if (unlikely(budget <= 0 || time_after_eq(jiffies, time_limit)))
+ +			goto softnet_break;
+  
+ -	/* Some drivers may have called napi_schedule
+ -	 * prior to exhausting their budget.
+ -	 */
+ -	if (unlikely(!list_empty(&n->poll_list))) {
+ -		pr_warn_once("%s: Budget exhausted after napi rescheduled\n",
+ -			     n->dev ? n->dev->name : "backlog");
+ -		goto out_unlock;
+ -	}
+ -
+ -	list_add_tail(&n->poll_list, repoll);
+ +		local_irq_enable();
+  
+ -out_unlock:
+ -	netpoll_poll_unlock(have);
+ +		/* Even though interrupts have been re-enabled, this
+ +		 * access is safe because interrupts can only add new
+ +		 * entries to the tail of this list, and only ->poll()
+ +		 * calls can remove this head entry from the list.
+ +		 */
+ +		n = list_first_entry(&sd->poll_list, struct napi_struct, poll_list);
+  
+ -	return work;
+ -}
+ +		have = netpoll_poll_lock(n);
+  
+ -static void net_rx_action(struct softirq_action *h)
+ -{
+ -	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+ -	unsigned long time_limit = jiffies + 2;
+ -	int budget = netdev_budget;
+ -	LIST_HEAD(list);
+ -	LIST_HEAD(repoll);
+ +		weight = n->weight;
+  
+ -	local_irq_disable();
+ -	list_splice_init(&sd->poll_list, &list);
+ -	local_irq_enable();
+ +		/* This NAPI_STATE_SCHED test is for avoiding a race
+ +		 * with netpoll's poll_napi().  Only the entity which
+ +		 * obtains the lock and sees NAPI_STATE_SCHED set will
+ +		 * actually make the ->poll() call.  Therefore we avoid
+ +		 * accidentally calling ->poll() when NAPI is not scheduled.
+ +		 */
+ +		work = 0;
+ +		if (test_bit(NAPI_STATE_SCHED, &n->state)) {
+ +			work = n->poll(n, weight);
+ +			trace_napi_poll(n);
+ +		}
+  
+ -	for (;;) {
+ -		struct napi_struct *n;
+ +		WARN_ON_ONCE(work > weight);
+  
+ -		if (list_empty(&list)) {
+ -			if (!sd_has_rps_ipi_waiting(sd) && list_empty(&repoll))
+ -				return;
+ -			break;
+ -		}
+ +		budget -= work;
+  
+ -		n = list_first_entry(&list, struct napi_struct, poll_list);
+ -		budget -= napi_poll(n, &repoll);
+ +		local_irq_disable();
+  
+ -		/* If softirq window is exhausted then punt.
+ -		 * Allow this to run for 2 jiffies since which will allow
+ -		 * an average latency of 1.5/HZ.
+ +		/* Drivers must not modify the NAPI state if they
+ +		 * consume the entire weight.  In such cases this code
+ +		 * still "owns" the NAPI instance and therefore can
+ +		 * move the instance around on the list at-will.
+  		 */
+ -		if (unlikely(budget <= 0 ||
+ -			     time_after_eq(jiffies, time_limit))) {
+ -			sd->time_squeeze++;
+ -			break;
+ +		if (unlikely(work == weight)) {
+ +			if (unlikely(napi_disable_pending(n))) {
+ +				local_irq_enable();
+ +				napi_complete(n);
+ +				local_irq_disable();
+ +			} else {
+ +				if (n->gro_list) {
+ +					/* flush too old packets
+ +					 * If HZ < 1000, flush all packets.
+ +					 */
+ +					local_irq_enable();
+ +					napi_gro_flush(n, HZ >= 1000);
+ +					local_irq_disable();
+ +				}
+ +				list_move_tail(&n->poll_list, &sd->poll_list);
+ +			}
+  		}
+ +
+ +		netpoll_poll_unlock(have);
+  	}
+++<<<<<<< HEAD
+ +out:
+++=======
++ 
++ 	__kfree_skb_flush();
++ 	local_irq_disable();
++ 
++ 	list_splice_tail_init(&sd->poll_list, &list);
++ 	list_splice_tail(&repoll, &list);
++ 	list_splice(&list, &sd->poll_list);
++ 	if (!list_empty(&sd->poll_list))
++ 		__raise_softirq_irqoff(NET_RX_SOFTIRQ);
++ 
+++>>>>>>> 795bb1c00dd3 (net: bulk free infrastructure for NAPI context, use napi_consume_skb)
+  	net_rps_action_and_irq_enable(sd);
+ +
+ +	return;
+ +
+ +softnet_break:
+ +	sd->time_squeeze++;
+ +	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+ +	goto out;
+  }
+  
+  struct netdev_adjacent {
+diff --cc net/core/skbuff.c
+index fc02ef9734c7,b64187b87773..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -360,98 -328,35 +360,111 @@@ struct sk_buff *build_skb(void *data, u
+  
+  	return skb;
+  }
+ +EXPORT_SYMBOL(build_skb);
+  
+ -/* build_skb() is wrapper over __build_skb(), that specifically
+ - * takes care of skb->head and skb->pfmemalloc
+ - * This means that if @frag_size is not zero, then @data must be backed
+ - * by a page fragment, not kmalloc() or vmalloc()
+ - */
+ -struct sk_buff *build_skb(void *data, unsigned int frag_size)
+++<<<<<<< HEAD
+ +struct netdev_alloc_cache {
+ +	void * va;
+ +#if (PAGE_SIZE < NETDEV_FRAG_PAGE_MAX_SIZE)
+ +	__u16 offset;
+ +	__u16 size;
+ +#else
+ +	__u32 offset;
+ +#endif
+ +	/* we maintain a pagecount bias, so that we dont dirty cache line
+ +	 * containing page->_count every time we allocate a fragment.
+ +	 */
+ +	unsigned int		pagecnt_bias;
+ +	bool pfmemalloc;
+ +};
+ +static DEFINE_PER_CPU(struct netdev_alloc_cache, netdev_alloc_cache);
+ +static DEFINE_PER_CPU(struct netdev_alloc_cache, napi_alloc_cache);
+ +
+ +static struct page *__page_frag_refill(struct netdev_alloc_cache *nc,
+ +				       gfp_t gfp_mask)
+  {
+ -	struct sk_buff *skb = __build_skb(data, frag_size);
+ +	struct page *page = NULL;
+ +	gfp_t gfp = gfp_mask;
+  
+ -	if (skb && frag_size) {
+ -		skb->head_frag = 1;
+ -		if (page_is_pfmemalloc(virt_to_head_page(data)))
+ -			skb->pfmemalloc = 1;
+ -	}
+ -	return skb;
+ +#if (PAGE_SIZE < NETDEV_FRAG_PAGE_MAX_SIZE)
+ +	gfp_mask |= __GFP_COMP | __GFP_NOWARN | __GFP_NORETRY |
+ +		    __GFP_NOMEMALLOC;
+ +	page = alloc_pages_node(NUMA_NO_NODE, gfp_mask,
+ +				NETDEV_FRAG_PAGE_MAX_ORDER);
+ +	nc->size = page ? NETDEV_FRAG_PAGE_MAX_SIZE : PAGE_SIZE;
+ +#endif
+ +	if (unlikely(!page))
+ +		page = alloc_pages_node(NUMA_NO_NODE, gfp, 0);
+ +
+ +	nc->va = page ? page_address(page) : NULL;
+ +
+ +	return page;
+  }
+ -EXPORT_SYMBOL(build_skb);
+  
+ +static void *__alloc_page_frag(struct netdev_alloc_cache *nc,
+ +			       unsigned int fragsz, gfp_t gfp_mask)
+ +{
+ +	unsigned int size = PAGE_SIZE;
+ +	struct page *page;
+ +	int offset;
+ +
+ +	if (unlikely(!nc->va)) {
+ +refill:
+ +		page = __page_frag_refill(nc, gfp_mask);
+ +		if (!page)
+ +			return NULL;
+ +
+ +#if (PAGE_SIZE < NETDEV_FRAG_PAGE_MAX_SIZE)
+ +		/* if size can vary use size else just use PAGE_SIZE */
+ +		size = nc->size;
+ +#endif
+ +		/* Even if we own the page, we do not use atomic_set().
+ +		 * This would break get_page_unless_zero() users.
+ +		 */
+ +		atomic_add(size - 1, &page->_count);
+ +
+ +		/* reset page count bias and offset to start of new frag */
+ +		nc->pfmemalloc = page->pfmemalloc;
+ +		nc->pagecnt_bias = size;
+ +		nc->offset = size;
+ +	}
+ +
+ +	offset = nc->offset - fragsz;
+ +	if (unlikely(offset < 0)) {
+ +		page = virt_to_page(nc->va);
+ +
+ +		if (!atomic_sub_and_test(nc->pagecnt_bias, &page->_count))
+ +			goto refill;
+ +
+ +#if (PAGE_SIZE < NETDEV_FRAG_PAGE_MAX_SIZE)
+ +		/* if size can vary use size else just use PAGE_SIZE */
+ +		size = nc->size;
+ +#endif
+ +		/* OK, page count is 0, we can safely set it */
+ +		atomic_set(&page->_count, size);
+ +
+ +		/* reset page count bias and offset to start of new frag */
+ +		nc->pagecnt_bias = size;
+ +		offset = size - fragsz;
+ +	}
+ +
+ +	nc->pagecnt_bias--;
+ +	nc->offset = offset;
+ +
+ +	return nc->va + offset;
+ +}
+++=======
++ #define NAPI_SKB_CACHE_SIZE	64
++ 
++ struct napi_alloc_cache {
++ 	struct page_frag_cache page;
++ 	size_t skb_count;
++ 	void *skb_cache[NAPI_SKB_CACHE_SIZE];
++ };
++ 
++ static DEFINE_PER_CPU(struct page_frag_cache, netdev_alloc_cache);
++ static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache);
+++>>>>>>> 795bb1c00dd3 (net: bulk free infrastructure for NAPI context, use napi_consume_skb)
+  
+  static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+  {
+@@@ -481,9 -386,9 +494,13 @@@ EXPORT_SYMBOL(netdev_alloc_frag)
+  
+  static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+  {
+++<<<<<<< HEAD
+ +	struct netdev_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+++=======
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+++>>>>>>> 795bb1c00dd3 (net: bulk free infrastructure for NAPI context, use napi_consume_skb)
+  
+- 	return __alloc_page_frag(nc, fragsz, gfp_mask);
++ 	return __alloc_page_frag(&nc->page, fragsz, gfp_mask);
+  }
+  
+  void *napi_alloc_frag(unsigned int fragsz)
+@@@ -571,7 -482,7 +588,11 @@@ EXPORT_SYMBOL(__netdev_alloc_skb)
+  struct sk_buff *__napi_alloc_skb(struct napi_struct *napi, unsigned int len,
+  				 gfp_t gfp_mask)
+  {
+++<<<<<<< HEAD
+ +	struct netdev_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+++=======
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+++>>>>>>> 795bb1c00dd3 (net: bulk free infrastructure for NAPI context, use napi_consume_skb)
+  	struct sk_buff *skb;
+  	void *data;
+  
+@@@ -831,6 -755,76 +852,79 @@@ void consume_skb(struct sk_buff *skb
+  }
+  EXPORT_SYMBOL(consume_skb);
+  
+++<<<<<<< HEAD
+++=======
++ void __kfree_skb_flush(void)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 
++ 	/* flush skb_cache if containing objects */
++ 	if (nc->skb_count) {
++ 		kmem_cache_free_bulk(skbuff_head_cache, nc->skb_count,
++ 				     nc->skb_cache);
++ 		nc->skb_count = 0;
++ 	}
++ }
++ 
++ static void __kfree_skb_defer(struct sk_buff *skb)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 
++ 	/* drop skb->head and call any destructors for packet */
++ 	skb_release_all(skb);
++ 
++ 	/* record skb to CPU local list */
++ 	nc->skb_cache[nc->skb_count++] = skb;
++ 
++ #ifdef CONFIG_SLUB
++ 	/* SLUB writes into objects when freeing */
++ 	prefetchw(skb);
++ #endif
++ 
++ 	/* flush skb_cache if it is filled */
++ 	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
++ 		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
++ 				     nc->skb_cache);
++ 		nc->skb_count = 0;
++ 	}
++ }
++ 
++ void napi_consume_skb(struct sk_buff *skb, int budget)
++ {
++ 	if (unlikely(!skb))
++ 		return;
++ 
++ 	/* if budget is 0 assume netpoll w/ IRQs disabled */
++ 	if (unlikely(!budget)) {
++ 		dev_consume_skb_irq(skb);
++ 		return;
++ 	}
++ 
++ 	if (likely(atomic_read(&skb->users) == 1))
++ 		smp_rmb();
++ 	else if (likely(!atomic_dec_and_test(&skb->users)))
++ 		return;
++ 	/* if reaching here SKB is ready to free */
++ 	trace_consume_skb(skb);
++ 
++ 	/* if SKB is a clone, don't handle this case */
++ 	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
++ 		__kfree_skb(skb);
++ 		return;
++ 	}
++ 
++ 	__kfree_skb_defer(skb);
++ }
++ EXPORT_SYMBOL(napi_consume_skb);
++ 
++ /* Make sure a field is enclosed inside headers_start/headers_end section */
++ #define CHECK_SKB_FIELD(field) \
++ 	BUILD_BUG_ON(offsetof(struct sk_buff, field) <		\
++ 		     offsetof(struct sk_buff, headers_start));	\
++ 	BUILD_BUG_ON(offsetof(struct sk_buff, field) >		\
++ 		     offsetof(struct sk_buff, headers_end));	\
++ 
+++>>>>>>> 795bb1c00dd3 (net: bulk free infrastructure for NAPI context, use napi_consume_skb)
+  static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+  {
+  	new->tstamp		= old->tstamp;
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index afd3465150d2..5c07719e60a7 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2155,6 +2155,9 @@ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
+ {
+ 	return __napi_alloc_skb(napi, length, GFP_ATOMIC);
+ }
++void napi_consume_skb(struct sk_buff *skb, int budget);
++
++void __kfree_skb_flush(void);
+ 
+ /**
+  * __dev_alloc_pages - allocate page for network Rx
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/skbuff.c
