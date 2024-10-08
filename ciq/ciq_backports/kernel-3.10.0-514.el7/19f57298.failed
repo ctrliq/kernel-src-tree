@@ -1,0 +1,130 @@
+IB/srpt: Fix the RDMA completion handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 19f57298f03825e36aefc866d8472b43780538d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/19f57298.failed
+
+Avoid that the following kernel crash is triggered when processing
+an RDMA completion:
+
+BUG: unable to handle kernel paging request at 0000000100000198
+IP: [<ffffffff810a4ea2>] __lock_acquire+0xa2/0x560
+Call Trace:
+ [<ffffffff810a53c2>] lock_acquire+0x62/0x80
+ [<ffffffff8151bd33>] _raw_spin_lock_irqsave+0x43/0x60
+ [<ffffffffa04fd437>] srpt_rdma_read_done+0x57/0x120 [ib_srpt]
+ [<ffffffffa0144dd3>] __ib_process_cq+0x43/0xc0 [ib_core]
+ [<ffffffffa0145115>] ib_cq_poll_work+0x25/0x70 [ib_core]
+ [<ffffffff8107184d>] process_one_work+0x1bd/0x460
+ [<ffffffff81073148>] worker_thread+0x118/0x420
+ [<ffffffff81078454>] kthread+0xe4/0x100
+ [<ffffffff8151cbbf>] ret_from_fork+0x3f/0x70
+
+Fixes: commit 59fae4deaad3 ("IB/srpt: chain RDMA READ/WRITE requests").
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 19f57298f03825e36aefc866d8472b43780538d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index d1d1764b0e41,2b5e0023dabf..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1444,57 -1392,39 +1444,69 @@@ static void srpt_handle_send_comp(struc
+   * check_stop_free() callback.  None of this is necessary anymore and needs to
+   * be cleaned up.
+   */
+ -static void srpt_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
+ +static void srpt_handle_rdma_comp(struct srpt_rdma_ch *ch,
+ +				  struct srpt_send_ioctx *ioctx,
+ +				  enum srpt_opcode opcode)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct srpt_rdma_ch *ch = cq->cq_context;
++ 	struct srpt_send_ioctx *ioctx =
++ 		container_of(wc->wr_cqe, struct srpt_send_ioctx, rdma_cqe);
++ 
+++>>>>>>> 19f57298f038 (IB/srpt: Fix the RDMA completion handlers)
+  	WARN_ON(ioctx->n_rdma <= 0);
+  	atomic_add(ioctx->n_rdma, &ch->sq_wr_avail);
+  
+ -	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ -		pr_info("RDMA_READ for ioctx 0x%p failed with status %d\n",
+ -			ioctx, wc->status);
+ -		srpt_abort_cmd(ioctx);
+ -		return;
+ +	if (opcode == SRPT_RDMA_READ_LAST) {
+ +		if (srpt_test_and_set_cmd_state(ioctx, SRPT_STATE_NEED_DATA,
+ +						SRPT_STATE_DATA_IN))
+ +			target_execute_cmd(&ioctx->cmd);
+ +		else
+ +			pr_err("%s[%d]: wrong state = %d\n", __func__,
+ +			       __LINE__, srpt_get_cmd_state(ioctx));
+ +	} else if (opcode == SRPT_RDMA_ABORT) {
+ +		ioctx->rdma_aborted = true;
+ +	} else {
+ +		WARN(true, "unexpected opcode %d\n", opcode);
+  	}
+ -
+ -	if (srpt_test_and_set_cmd_state(ioctx, SRPT_STATE_NEED_DATA,
+ -					SRPT_STATE_DATA_IN))
+ -		target_execute_cmd(&ioctx->cmd);
+ -	else
+ -		pr_err("%s[%d]: wrong state = %d\n", __func__,
+ -		       __LINE__, srpt_get_cmd_state(ioctx));
+  }
+  
+ -static void srpt_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
+ +/**
+ + * srpt_handle_rdma_err_comp() - Process an IB RDMA error completion.
+ + */
+ +static void srpt_handle_rdma_err_comp(struct srpt_rdma_ch *ch,
+ +				      struct srpt_send_ioctx *ioctx,
+ +				      enum srpt_opcode opcode)
+  {
+++<<<<<<< HEAD
+ +	enum srpt_command_state state;
+++=======
++ 	struct srpt_send_ioctx *ioctx =
++ 		container_of(wc->wr_cqe, struct srpt_send_ioctx, rdma_cqe);
+ -
+ -	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ -		pr_info("RDMA_WRITE for ioctx 0x%p failed with status %d\n",
+ -			ioctx, wc->status);
+ -		srpt_abort_cmd(ioctx);
+++>>>>>>> 19f57298f038 (IB/srpt: Fix the RDMA completion handlers)
+ +
+ +	state = srpt_get_cmd_state(ioctx);
+ +	switch (opcode) {
+ +	case SRPT_RDMA_READ_LAST:
+ +		if (ioctx->n_rdma <= 0) {
+ +			pr_err("Received invalid RDMA read"
+ +			       " error completion with idx %d\n",
+ +			       ioctx->ioctx.index);
+ +			break;
+ +		}
+ +		atomic_add(ioctx->n_rdma, &ch->sq_wr_avail);
+ +		if (state == SRPT_STATE_NEED_DATA)
+ +			srpt_abort_cmd(ioctx);
+ +		else
+ +			pr_err("%s[%d]: wrong state = %d\n",
+ +			       __func__, __LINE__, state);
+ +		break;
+ +	case SRPT_RDMA_WRITE_LAST:
+ +		break;
+ +	default:
+ +		pr_err("%s[%d]: opcode = %u\n", __func__, __LINE__, opcode);
+ +		break;
+  	}
+  }
+  
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
