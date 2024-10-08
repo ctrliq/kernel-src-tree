@@ -1026,7 +1026,7 @@ EXPORT_SYMBOL(pci_msix_vec_count);
  **/
 int pci_enable_msix(struct pci_dev *dev, struct msix_entry *entries, int nvec)
 {
-	int status, nr_entries;
+	int nr_entries;
 	int i, j;
 
 	if (!entries || !dev->msix_cap || dev->current_state != PCI_D0)
@@ -1058,8 +1058,7 @@ int pci_enable_msix(struct pci_dev *dev, struct msix_entry *entries, int nvec)
 		dev_info(&dev->dev, "can't enable MSI-X (MSI IRQ already assigned)\n");
 		return -EINVAL;
 	}
-	status = msix_capability_init(dev, entries, nvec);
-	return status;
+	return msix_capability_init(dev, entries, nvec);
 }
 EXPORT_SYMBOL(pci_enable_msix);
 
