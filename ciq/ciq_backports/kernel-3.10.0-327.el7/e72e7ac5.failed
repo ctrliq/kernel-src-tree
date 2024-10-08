@@ -1,0 +1,104 @@
+drivers: hv: vmbus: Teardown synthetic interrupt controllers on module unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [hv] vmbus: Teardown synthetic interrupt controllers on module unload (Vitaly Kuznetsov) [1201889]
+Rebuild_FUZZ: 90.78%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit e72e7ac583ee8adddbc668cdefde7d7d3021be79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e72e7ac5.failed
+
+SynIC has to be switched off when we unload the module, otherwise registered
+memory pages can get corrupted after (as Hyper-V host still writes there) and
+we see the following crashes for random processes:
+
+[   89.116774] BUG: Bad page map in process sh  pte:4989c716 pmd:36f81067
+[   89.159454] addr:0000000000437000 vm_flags:00000875 anon_vma:          (null) mapping:ffff88007bba55a0 index:37
+[   89.226146] vma->vm_ops->fault: filemap_fault+0x0/0x410
+[   89.257776] vma->vm_file->f_op->mmap: generic_file_mmap+0x0/0x60
+[   89.297570] CPU: 0 PID: 215 Comm: sh Tainted: G    B          3.19.0-rc5_bug923184+ #488
+[   89.353738] Hardware name: Microsoft Corporation Virtual Machine/Virtual Machine, BIOS 090006  05/23/2012
+[   89.409138]  0000000000000000 000000004e083d7b ffff880036e9fa18 ffffffff81a68d31
+[   89.468724]  0000000000000000 0000000000437000 ffff880036e9fa68 ffffffff811a1e3a
+[   89.519233]  000000004989c716 0000000000000037 ffffea0001edc340 0000000000437000
+[   89.575751] Call Trace:
+[   89.591060]  [<ffffffff81a68d31>] dump_stack+0x45/0x57
+[   89.625164]  [<ffffffff811a1e3a>] print_bad_pte+0x1aa/0x250
+[   89.667234]  [<ffffffff811a2c95>] vm_normal_page+0x55/0xa0
+[   89.703818]  [<ffffffff811a3105>] unmap_page_range+0x425/0x8a0
+[   89.737982]  [<ffffffff811a3601>] unmap_single_vma+0x81/0xf0
+[   89.780385]  [<ffffffff81184320>] ? lru_deactivate_fn+0x190/0x190
+[   89.820130]  [<ffffffff811a4131>] unmap_vmas+0x51/0xa0
+[   89.860168]  [<ffffffff811ad12c>] exit_mmap+0xac/0x1a0
+[   89.890588]  [<ffffffff810763c3>] mmput+0x63/0x100
+[   89.919205]  [<ffffffff811eba48>] flush_old_exec+0x3f8/0x8b0
+[   89.962135]  [<ffffffff8123b5bb>] load_elf_binary+0x32b/0x1260
+[   89.998581]  [<ffffffff811a14f2>] ? get_user_pages+0x52/0x60
+
+hv_synic_cleanup() function exists but noone calls it now. Do the following:
+- call hv_synic_cleanup() on each cpu from vmbus_exit();
+- write global disable bit through MSR;
+- use hv_synic_free_cpu() to avoid memory leask and code duplication.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit e72e7ac583ee8adddbc668cdefde7d7d3021be79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 143d8f6191ee,d8233d4513a5..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -832,11 -1029,18 +832,19 @@@ cleanup
+  
+  static void __exit vmbus_exit(void)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int cpu;
++ 
++ 	vmbus_connection.conn_state = DISCONNECTED;
+++>>>>>>> e72e7ac583ee (drivers: hv: vmbus: Teardown synthetic interrupt controllers on module unload)
+  	hv_remove_vmbus_irq();
+  	vmbus_free_channels();
+  	bus_unregister(&hv_bus);
+  	hv_cleanup();
++ 	for_each_online_cpu(cpu)
++ 		smp_call_function_single(cpu, hv_synic_cleanup, NULL, 1);
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+ -	hv_cpu_hotplug_quirk(false);
+ -	vmbus_disconnect();
+  }
+  
+  
+diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
+index d8dedd1fccee..33d2632a1716 100644
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@ -396,6 +396,7 @@ void hv_synic_cleanup(void *arg)
+ 	union hv_synic_sint shared_sint;
+ 	union hv_synic_simp simp;
+ 	union hv_synic_siefp siefp;
++	union hv_synic_scontrol sctrl;
+ 	int cpu = smp_processor_id();
+ 
+ 	if (!hv_context.synic_initialized)
+@@ -421,6 +422,10 @@ void hv_synic_cleanup(void *arg)
+ 
+ 	wrmsrl(HV_X64_MSR_SIEFP, siefp.as_uint64);
+ 
+-	free_page((unsigned long)hv_context.synic_message_page[cpu]);
+-	free_page((unsigned long)hv_context.synic_event_page[cpu]);
++	/* Disable the global synic bit */
++	rdmsrl(HV_X64_MSR_SCONTROL, sctrl.as_uint64);
++	sctrl.enable = 0;
++	wrmsrl(HV_X64_MSR_SCONTROL, sctrl.as_uint64);
++
++	hv_synic_free_cpu(cpu);
+ }
+* Unmerged path drivers/hv/vmbus_drv.c
