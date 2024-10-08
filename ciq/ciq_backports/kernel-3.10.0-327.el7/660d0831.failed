@@ -1,0 +1,131 @@
+libiscsi: Fix host busy blocking during connection teardown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author John Soni Jose <sony.john@avagotech.com>
+commit 660d0831d1494a6837b2f810d08b5be092c1f31d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/660d0831.failed
+
+In case of hw iscsi offload, an host can have N-number of active
+connections. There can be IO's running on some connections which
+make host->host_busy always TRUE. Now if logout from a connection
+is tried then the code gets into an infinite loop as host->host_busy
+is always TRUE.
+
+ iscsi_conn_teardown(....)
+ {
+   .........
+    /*
+     * Block until all in-progress commands for this connection
+     * time out or fail.
+     */
+     for (;;) {
+      spin_lock_irqsave(session->host->host_lock, flags);
+      if (!atomic_read(&session->host->host_busy)) { /* OK for ERL == 0 */
+	      spin_unlock_irqrestore(session->host->host_lock, flags);
+              break;
+      }
+     spin_unlock_irqrestore(session->host->host_lock, flags);
+     msleep_interruptible(500);
+     iscsi_conn_printk(KERN_INFO, conn, "iscsi conn_destroy(): "
+                 "host_busy %d host_failed %d\n",
+	          atomic_read(&session->host->host_busy),
+	          session->host->host_failed);
+
+	................
+	...............
+     }
+  }
+
+This is not an issue with software-iscsi/iser as each cxn is a separate
+host.
+
+Fix:
+Acquiring eh_mutex in iscsi_conn_teardown() before setting
+session->state = ISCSI_STATE_TERMINATE.
+
+	Signed-off-by: John Soni Jose <sony.john@avagotech.com>
+	Reviewed-by: Mike Christie <michaelc@cs.wisc.edu>
+	Reviewed-by: Chris Leech <cleech@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 660d0831d1494a6837b2f810d08b5be092c1f31d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/libiscsi.c
+diff --cc drivers/scsi/libiscsi.c
+index 0c863af09254,98d9bb6ff725..000000000000
+--- a/drivers/scsi/libiscsi.c
++++ b/drivers/scsi/libiscsi.c
+@@@ -2936,8 -2944,8 +2936,12 @@@ void iscsi_conn_teardown(struct iscsi_c
+  
+  	del_timer_sync(&conn->transport_timer);
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&session->lock);
+++=======
++ 	mutex_lock(&session->eh_mutex);
++ 	spin_lock_bh(&session->frwd_lock);
+++>>>>>>> 660d0831d149 (libiscsi: Fix host busy blocking during connection teardown)
+  	conn->c_stage = ISCSI_CONN_CLEANUP_WAIT;
+  	if (session->leadconn == conn) {
+  		/*
+@@@ -2946,30 -2954,8 +2950,33 @@@
+  		session->state = ISCSI_STATE_TERMINATE;
+  		wake_up(&conn->ehwait);
+  	}
+ -	spin_unlock_bh(&session->frwd_lock);
+ +	spin_unlock_bh(&session->lock);
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * Block until all in-progress commands for this connection
+ +	 * time out or fail.
+ +	 */
+ +	for (;;) {
+ +		spin_lock_irqsave(session->host->host_lock, flags);
+ +		if (!session->host->host_busy) { /* OK for ERL == 0 */
+ +			spin_unlock_irqrestore(session->host->host_lock, flags);
+ +			break;
+ +		}
+ +		spin_unlock_irqrestore(session->host->host_lock, flags);
+ +		msleep_interruptible(500);
+ +		iscsi_conn_printk(KERN_INFO, conn, "iscsi conn_destroy(): "
+ +				  "host_busy %d host_failed %d\n",
+ +				  session->host->host_busy,
+ +				  session->host->host_failed);
+ +		/*
+ +		 * force eh_abort() to unblock
+ +		 */
+ +		wake_up(&conn->ehwait);
+ +	}
+  
+++=======
+++>>>>>>> 660d0831d149 (libiscsi: Fix host busy blocking during connection teardown)
+  	/* flush queued up work because we free the connection below */
+  	iscsi_suspend_tx(conn);
+  
+@@@ -2978,11 -2964,15 +2985,16 @@@
+  		   get_order(ISCSI_DEF_MAX_RECV_SEG_LEN));
+  	kfree(conn->persistent_address);
+  	kfree(conn->local_ipaddr);
+ -	/* regular RX path uses back_lock */
+ -	spin_lock_bh(&session->back_lock);
+  	kfifo_in(&session->cmdpool.queue, (void*)&conn->login_task,
+  		    sizeof(void*));
+ -	spin_unlock_bh(&session->back_lock);
+  	if (session->leadconn == conn)
+  		session->leadconn = NULL;
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&session->lock);
+++=======
++ 	spin_unlock_bh(&session->frwd_lock);
++ 	mutex_unlock(&session->eh_mutex);
+++>>>>>>> 660d0831d149 (libiscsi: Fix host busy blocking during connection teardown)
+  
+  	iscsi_destroy_conn(cls_conn);
+  }
+* Unmerged path drivers/scsi/libiscsi.c
