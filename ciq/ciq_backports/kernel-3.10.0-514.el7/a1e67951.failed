@@ -1,0 +1,139 @@
+netfilter: bridge: make BRNF_PKT_TYPE flag a bool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit a1e67951e6c0b11bb11c256f8e1c45ed51fcd760
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a1e67951.failed
+
+nf_bridge_info->mask is used for several things, for example to
+remember if skb->pkt_type was set to OTHER_HOST.
+
+For a bridge, OTHER_HOST is expected case. For ip forward its a non-starter
+though -- routing expects PACKET_HOST.
+
+Bridge netfilter thus changes OTHER_HOST to PACKET_HOST before hook
+invocation and then un-does it after hook traversal.
+
+This information is irrelevant outside of br_netfilter.
+
+After this change, ->mask now only contains flags that need to be
+known outside of br_netfilter in fast-path.
+
+Future patch changes mask into a 2bit state field in sk_buff, so that
+we can remove skb->nf_bridge pointer for good and consider all remaining
+places that access nf_bridge info content a not-so fastpath.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit a1e67951e6c0b11bb11c256f8e1c45ed51fcd760)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index 2e271768b46a,0991259643d6..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -163,9 -163,15 +163,18 @@@ struct nf_conntrack 
+  };
+  #endif
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+  struct nf_bridge_info {
+  	atomic_t		use;
+++<<<<<<< HEAD
+++=======
++ 	enum {
++ 		BRNF_PROTO_UNCHANGED,
++ 		BRNF_PROTO_8021Q,
++ 		BRNF_PROTO_PPPOE
++ 	} orig_proto;
++ 	bool			pkt_otherhost;
+++>>>>>>> a1e67951e6c0 (netfilter: bridge: make BRNF_PKT_TYPE flag a bool)
+  	unsigned int		mask;
+  	struct net_device	*physindev;
+  	struct net_device	*physoutdev;
+diff --git a/include/linux/netfilter_bridge.h b/include/linux/netfilter_bridge.h
+index 91f08439b405..4894d9bf7127 100644
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@ -17,7 +17,6 @@ enum nf_br_hook_priorities {
+ 
+ #ifdef CONFIG_BRIDGE_NETFILTER
+ 
+-#define BRNF_PKT_TYPE			0x01
+ #define BRNF_BRIDGED_DNAT		0x02
+ #define BRNF_NF_BRIDGE_PREROUTING	0x08
+ #define BRNF_8021Q			0x10
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+index bfa28cea8c79..9f73d0206522 100644
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -305,9 +305,9 @@ static int br_nf_pre_routing_finish_ipv6(struct sock *sk, struct sk_buff *skb)
+ 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+ 	struct rtable *rt;
+ 
+-	if (nf_bridge->mask & BRNF_PKT_TYPE) {
++	if (nf_bridge->pkt_otherhost) {
+ 		skb->pkt_type = PACKET_OTHERHOST;
+-		nf_bridge->mask ^= BRNF_PKT_TYPE;
++		nf_bridge->pkt_otherhost = false;
+ 	}
+ 	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+ 
+@@ -434,9 +434,9 @@ static int br_nf_pre_routing_finish(struct sock *sk, struct sk_buff *skb)
+ 	struct rtable *rt;
+ 	int err;
+ 
+-	if (nf_bridge->mask & BRNF_PKT_TYPE) {
++	if (nf_bridge->pkt_otherhost) {
+ 		skb->pkt_type = PACKET_OTHERHOST;
+-		nf_bridge->mask ^= BRNF_PKT_TYPE;
++		nf_bridge->pkt_otherhost = false;
+ 	}
+ 	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+ 	if (dnat_took_place(skb)) {
+@@ -523,7 +523,7 @@ static struct net_device *setup_pre_routing(struct sk_buff *skb)
+ 
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		skb->pkt_type = PACKET_HOST;
+-		nf_bridge->mask |= BRNF_PKT_TYPE;
++		nf_bridge->pkt_otherhost = true;
+ 	}
+ 
+ 	nf_bridge->mask |= BRNF_NF_BRIDGE_PREROUTING;
+@@ -732,9 +732,9 @@ static int br_nf_forward_finish(struct sock *sk, struct sk_buff *skb)
+ 		}
+ 
+ 		in = nf_bridge->physindev;
+-		if (nf_bridge->mask & BRNF_PKT_TYPE) {
++		if (nf_bridge->pkt_otherhost) {
+ 			skb->pkt_type = PACKET_OTHERHOST;
+-			nf_bridge->mask ^= BRNF_PKT_TYPE;
++			nf_bridge->pkt_otherhost = false;
+ 		}
+ 		nf_bridge_update_protocol(skb);
+ 	} else {
+@@ -787,7 +787,7 @@ static unsigned int br_nf_forward_ip(const struct nf_hook_ops *ops,
+ 	nf_bridge = skb->nf_bridge;
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		skb->pkt_type = PACKET_HOST;
+-		nf_bridge->mask |= BRNF_PKT_TYPE;
++		nf_bridge->pkt_otherhost = true;
+ 	}
+ 
+ 	if (pf == NFPROTO_IPV4) {
+@@ -905,7 +905,7 @@ static unsigned int br_nf_post_routing(const struct nf_hook_ops *ops,
+ 	 * about the value of skb->pkt_type. */
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		skb->pkt_type = PACKET_HOST;
+-		nf_bridge->mask |= BRNF_PKT_TYPE;
++		nf_bridge->pkt_otherhost = true;
+ 	}
+ 
+ 	nf_bridge_pull_encap_header(skb);
