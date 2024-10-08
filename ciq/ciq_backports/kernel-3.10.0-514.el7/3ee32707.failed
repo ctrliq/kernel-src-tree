@@ -1,0 +1,244 @@
+net: add sysfs helpers for netdev_adjacent logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] add sysfs helpers for netdev_adjacent logic (Ivan Vecera) [1333228]
+Rebuild_FUZZ: 94.51%
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 3ee32707560955e92d30f7f6e5138cb92a3b1a7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3ee32707.failed
+
+They clean up the code a bit and can be used further.
+
+CC: Ding Tianhong <dingtianhong@huawei.com>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Eric Dumazet <edumazet@google.com>
+CC: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+CC: Cong Wang <amwang@redhat.com>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3ee32707560955e92d30f7f6e5138cb92a3b1a7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index ce5758e98847,130d3bd0ce6f..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4711,10 -4623,207 +4711,208 @@@ struct net_device *netdev_master_upper_
+  }
+  EXPORT_SYMBOL(netdev_master_upper_dev_get_rcu);
+  
+++<<<<<<< HEAD
+++=======
++ int netdev_adjacent_sysfs_add(struct net_device *dev,
++ 			      struct net_device *adj_dev,
++ 			      struct list_head *dev_list)
++ {
++ 	char linkname[IFNAMSIZ+7];
++ 	sprintf(linkname, dev_list == &dev->adj_list.upper ?
++ 		"upper_%s" : "lower_%s", adj_dev->name);
++ 	return sysfs_create_link(&(dev->dev.kobj), &(adj_dev->dev.kobj),
++ 				 linkname);
++ }
++ void netdev_adjacent_sysfs_del(struct net_device *dev,
++ 			       char *name,
++ 			       struct list_head *dev_list)
++ {
++ 	char linkname[IFNAMSIZ+7];
++ 	sprintf(linkname, dev_list == &dev->adj_list.upper ?
++ 		"upper_%s" : "lower_%s", name);
++ 	sysfs_remove_link(&(dev->dev.kobj), linkname);
++ }
++ 
++ #define netdev_adjacent_is_neigh_list(dev, dev_list) \
++ 		(dev_list == &dev->adj_list.upper || \
++ 		 dev_list == &dev->adj_list.lower)
++ 
++ static int __netdev_adjacent_dev_insert(struct net_device *dev,
++ 					struct net_device *adj_dev,
++ 					struct list_head *dev_list,
++ 					void *private, bool master)
++ {
++ 	struct netdev_adjacent *adj;
++ 	int ret;
++ 
++ 	adj = __netdev_find_adj(dev, adj_dev, dev_list);
++ 
++ 	if (adj) {
++ 		adj->ref_nr++;
++ 		return 0;
++ 	}
++ 
++ 	adj = kmalloc(sizeof(*adj), GFP_KERNEL);
++ 	if (!adj)
++ 		return -ENOMEM;
++ 
++ 	adj->dev = adj_dev;
++ 	adj->master = master;
++ 	adj->ref_nr = 1;
++ 	adj->private = private;
++ 	dev_hold(adj_dev);
++ 
++ 	pr_debug("dev_hold for %s, because of link added from %s to %s\n",
++ 		 adj_dev->name, dev->name, adj_dev->name);
++ 
++ 	if (netdev_adjacent_is_neigh_list(dev, dev_list)) {
++ 		ret = netdev_adjacent_sysfs_add(dev, adj_dev, dev_list);
++ 		if (ret)
++ 			goto free_adj;
++ 	}
++ 
++ 	/* Ensure that master link is always the first item in list. */
++ 	if (master) {
++ 		ret = sysfs_create_link(&(dev->dev.kobj),
++ 					&(adj_dev->dev.kobj), "master");
++ 		if (ret)
++ 			goto remove_symlinks;
++ 
++ 		list_add_rcu(&adj->list, dev_list);
++ 	} else {
++ 		list_add_tail_rcu(&adj->list, dev_list);
++ 	}
++ 
++ 	return 0;
++ 
++ remove_symlinks:
++ 	if (netdev_adjacent_is_neigh_list(dev, dev_list))
++ 		netdev_adjacent_sysfs_del(dev, adj_dev->name, dev_list);
++ free_adj:
++ 	kfree(adj);
++ 	dev_put(adj_dev);
++ 
++ 	return ret;
++ }
++ 
++ static void __netdev_adjacent_dev_remove(struct net_device *dev,
++ 					 struct net_device *adj_dev,
++ 					 struct list_head *dev_list)
++ {
++ 	struct netdev_adjacent *adj;
++ 
++ 	adj = __netdev_find_adj(dev, adj_dev, dev_list);
++ 
++ 	if (!adj) {
++ 		pr_err("tried to remove device %s from %s\n",
++ 		       dev->name, adj_dev->name);
++ 		BUG();
++ 	}
++ 
++ 	if (adj->ref_nr > 1) {
++ 		pr_debug("%s to %s ref_nr-- = %d\n", dev->name, adj_dev->name,
++ 			 adj->ref_nr-1);
++ 		adj->ref_nr--;
++ 		return;
++ 	}
++ 
++ 	if (adj->master)
++ 		sysfs_remove_link(&(dev->dev.kobj), "master");
++ 
++ 	if (netdev_adjacent_is_neigh_list(dev, dev_list))
++ 		netdev_adjacent_sysfs_del(dev, adj_dev->name, dev_list);
++ 
++ 	list_del_rcu(&adj->list);
++ 	pr_debug("dev_put for %s, because link removed from %s to %s\n",
++ 		 adj_dev->name, dev->name, adj_dev->name);
++ 	dev_put(adj_dev);
++ 	kfree_rcu(adj, rcu);
++ }
++ 
++ static int __netdev_adjacent_dev_link_lists(struct net_device *dev,
++ 					    struct net_device *upper_dev,
++ 					    struct list_head *up_list,
++ 					    struct list_head *down_list,
++ 					    void *private, bool master)
++ {
++ 	int ret;
++ 
++ 	ret = __netdev_adjacent_dev_insert(dev, upper_dev, up_list, private,
++ 					   master);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = __netdev_adjacent_dev_insert(upper_dev, dev, down_list, private,
++ 					   false);
++ 	if (ret) {
++ 		__netdev_adjacent_dev_remove(dev, upper_dev, up_list);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __netdev_adjacent_dev_link(struct net_device *dev,
++ 				      struct net_device *upper_dev)
++ {
++ 	return __netdev_adjacent_dev_link_lists(dev, upper_dev,
++ 						&dev->all_adj_list.upper,
++ 						&upper_dev->all_adj_list.lower,
++ 						NULL, false);
++ }
++ 
++ static void __netdev_adjacent_dev_unlink_lists(struct net_device *dev,
++ 					       struct net_device *upper_dev,
++ 					       struct list_head *up_list,
++ 					       struct list_head *down_list)
++ {
++ 	__netdev_adjacent_dev_remove(dev, upper_dev, up_list);
++ 	__netdev_adjacent_dev_remove(upper_dev, dev, down_list);
++ }
++ 
++ static void __netdev_adjacent_dev_unlink(struct net_device *dev,
++ 					 struct net_device *upper_dev)
++ {
++ 	__netdev_adjacent_dev_unlink_lists(dev, upper_dev,
++ 					   &dev->all_adj_list.upper,
++ 					   &upper_dev->all_adj_list.lower);
++ }
++ 
++ static int __netdev_adjacent_dev_link_neighbour(struct net_device *dev,
++ 						struct net_device *upper_dev,
++ 						void *private, bool master)
++ {
++ 	int ret = __netdev_adjacent_dev_link(dev, upper_dev);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = __netdev_adjacent_dev_link_lists(dev, upper_dev,
++ 					       &dev->adj_list.upper,
++ 					       &upper_dev->adj_list.lower,
++ 					       private, master);
++ 	if (ret) {
++ 		__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void __netdev_adjacent_dev_unlink_neighbour(struct net_device *dev,
++ 						   struct net_device *upper_dev)
++ {
++ 	__netdev_adjacent_dev_unlink(dev, upper_dev);
++ 	__netdev_adjacent_dev_unlink_lists(dev, upper_dev,
++ 					   &dev->adj_list.upper,
++ 					   &upper_dev->adj_list.lower);
++ }
++ 
+++>>>>>>> 3ee327075609 (net: add sysfs helpers for netdev_adjacent logic)
+  static int __netdev_upper_dev_link(struct net_device *dev,
+ -				   struct net_device *upper_dev, bool master,
+ -				   void *private)
+ +				   struct net_device *upper_dev, bool master)
+  {
+ -	struct netdev_adjacent *i, *j, *to_i, *to_j;
+ -	int ret = 0;
+ +	struct netdev_adjacent *upper;
+  
+  	ASSERT_RTNL();
+  
+* Unmerged path net/core/dev.c
