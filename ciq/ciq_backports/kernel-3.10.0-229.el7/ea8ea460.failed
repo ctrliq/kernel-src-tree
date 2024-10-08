@@ -1,0 +1,129 @@
+iommu/vt-d: Clean up and fix page table clear/free behaviour
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Clean up and fix page table clear/free behaviour (Myron Stowe) [1129880 1087643]
+Rebuild_FUZZ: 94.74%
+commit-author David Woodhouse <David.Woodhouse@intel.com>
+commit ea8ea460c9ace60bbb5ac6e5521d637d5c15293d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/ea8ea460.failed
+
+There is a race condition between the existing clear/free code and the
+hardware. The IOMMU is actually permitted to cache the intermediate
+levels of the page tables, and doesn't need to walk the table from the
+very top of the PGD each time. So the existing back-to-back calls to
+dma_pte_clear_range() and dma_pte_free_pagetable() can lead to a
+use-after-free where the IOMMU reads from a freed page table.
+
+When freeing page tables we actually need to do the IOTLB flush, with
+the 'invalidation hint' bit clear to indicate that it's not just a
+leaf-node flush, after unlinking each page table page from the next level
+up but before actually freeing it.
+
+So in the rewritten domain_unmap() we just return a list of pages (using
+pg->freelist to make a list of them), and then the caller is expected to
+do the appropriate IOTLB flush (or tear down the domain completely,
+whatever), before finally calling dma_free_pagelist() to free the pages.
+
+As an added bonus, we no longer need to flush the CPU's data cache for
+pages which are about to be *removed* from the page table hierarchy anyway,
+in the non-cache-coherent case. This drastically improves the performance
+of large unmaps.
+
+As a side-effect of all these changes, this also fixes the fact that
+intel_iommu_unmap() was neglecting to free the page tables for the range
+in question after clearing them.
+
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit ea8ea460c9ace60bbb5ac6e5521d637d5c15293d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 9b6d839e77fe,f5934fc2bbcc..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -1572,16 -1654,19 +1689,14 @@@ static void domain_exit(struct dmar_dom
+  	/* destroy iovas */
+  	put_iova_domain(&domain->iovad);
+  
+- 	/* clear ptes */
+- 	dma_pte_clear_range(domain, 0, DOMAIN_MAX_PFN(domain->gaw));
+- 
+- 	/* free page tables */
+- 	dma_pte_free_pagetable(domain, 0, DOMAIN_MAX_PFN(domain->gaw));
++ 	freelist = domain_unmap(domain, 0, DOMAIN_MAX_PFN(domain->gaw));
+  
+ -	/* clear attached or cached domains */
+ -	rcu_read_lock();
+  	for_each_active_iommu(iommu, drhd)
+ -		if (domain->flags & DOMAIN_FLAG_VIRTUAL_MACHINE ||
+ -		    test_bit(iommu->seq_id, domain->iommu_bmp))
+ +		if (test_bit(iommu->seq_id, domain->iommu_bmp))
+  			iommu_detach_domain(domain, iommu);
+ -	rcu_read_unlock();
+  
++ 	dma_free_pagelist(freelist);
++ 
+  	free_domain_mem(domain);
+  }
+  
+@@@ -4201,13 -4217,46 +4318,53 @@@ static int intel_iommu_map(struct iommu
+  }
+  
+  static size_t intel_iommu_unmap(struct iommu_domain *domain,
+- 			     unsigned long iova, size_t size)
++ 				unsigned long iova, size_t size)
+  {
+  	struct dmar_domain *dmar_domain = domain->priv;
+++<<<<<<< HEAD
+ +	int order;
+ +
+ +	order = dma_pte_clear_range(dmar_domain, iova >> VTD_PAGE_SHIFT,
+ +			    (iova + size - 1) >> VTD_PAGE_SHIFT);
+++=======
++ 	struct page *freelist = NULL;
++ 	struct intel_iommu *iommu;
++ 	unsigned long start_pfn, last_pfn;
++ 	unsigned int npages;
++ 	int iommu_id, num, ndomains, level = 0;
++ 
++ 	/* Cope with horrid API which requires us to unmap more than the
++ 	   size argument if it happens to be a large-page mapping. */
++ 	if (!pfn_to_dma_pte(dmar_domain, iova >> VTD_PAGE_SHIFT, &level))
++ 		BUG();
++ 
++ 	if (size < VTD_PAGE_SIZE << level_to_offset_bits(level))
++ 		size = VTD_PAGE_SIZE << level_to_offset_bits(level);
++ 
++ 	start_pfn = iova >> VTD_PAGE_SHIFT;
++ 	last_pfn = (iova + size - 1) >> VTD_PAGE_SHIFT;
++ 
++ 	freelist = domain_unmap(dmar_domain, start_pfn, last_pfn);
++ 
++ 	npages = last_pfn - start_pfn + 1;
++ 
++ 	for_each_set_bit(iommu_id, dmar_domain->iommu_bmp, g_num_of_iommus) {
++                iommu = g_iommus[iommu_id];
++ 
++                /*
++                 * find bit position of dmar_domain
++                 */
++                ndomains = cap_ndoms(iommu->cap);
++                for_each_set_bit(num, iommu->domain_ids, ndomains) {
++                        if (iommu->domains[num] == dmar_domain)
++                                iommu_flush_iotlb_psi(iommu, num, start_pfn,
++ 						     npages, !freelist, 0);
++ 	       }
++ 
++ 	}
++ 
++ 	dma_free_pagelist(freelist);
+++>>>>>>> ea8ea460c9ac (iommu/vt-d: Clean up and fix page table clear/free behaviour)
+  
+  	if (dmar_domain->max_addr == iova + size)
+  		dmar_domain->max_addr = iova;
+* Unmerged path drivers/iommu/intel-iommu.c
