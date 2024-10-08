@@ -1,0 +1,4347 @@
+IB: split struct ib_send_wr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit e622f2f4ad2142d2a613a57fb85f8cf737935ef5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e622f2f4.failed
+
+This patch split up struct ib_send_wr so that all non-trivial verbs
+use their own structure which embedds struct ib_send_wr.  This dramaticly
+shrinks the size of a WR for most common operations:
+
+sizeof(struct ib_send_wr) (old):	96
+
+sizeof(struct ib_send_wr):		48
+sizeof(struct ib_rdma_wr):		64
+sizeof(struct ib_atomic_wr):		96
+sizeof(struct ib_ud_wr):		88
+sizeof(struct ib_fast_reg_wr):		88
+sizeof(struct ib_bind_mw_wr):		96
+sizeof(struct ib_sig_handover_wr):	80
+
+And with Sagi's pending MR rework the fast registration WR will also be
+down to a reasonable size:
+
+sizeof(struct ib_fastreg_wr):		64
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com> [srp, srpt]
+	Reviewed-by: Chuck Lever <chuck.lever@oracle.com> [sunrpc]
+	Tested-by: Haggai Eran <haggaie@mellanox.com>
+	Tested-by: Sagi Grimberg <sagig@mellanox.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+(cherry picked from commit e622f2f4ad2142d2a613a57fb85f8cf737935ef5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_memory.c
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+#	drivers/infiniband/ulp/isert/ib_isert.c
+#	drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
+#	drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
+#	net/rds/iw_send.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index b9dc02d4dd14,2fab519dbd86..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -280,6 -299,15 +280,18 @@@ struct iser_tx_desc 
+  	struct ib_sge		     tx_sg[2];
+  	int                          num_sge;
+  	bool			     mapped;
+++<<<<<<< HEAD
+++=======
++ 	u8                           wr_idx;
++ 	union iser_wr {
++ 		struct ib_send_wr		send;
++ 		struct ib_fast_reg_wr		fast_reg;
++ 		struct ib_sig_handover_wr	sig;
++ 	} wrs[ISER_MAX_WRS];
++ 	struct iser_mem_reg          data_reg;
++ 	struct iser_mem_reg          prot_reg;
++ 	struct ib_sig_attrs          sig_attrs;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  };
+  
+  #define ISER_RX_PAD_SIZE	(256 - (ISER_RX_PAYLOAD_SIZE + \
+@@@ -676,4 -712,20 +688,23 @@@ iser_reg_desc_get_fmr(struct ib_conn *i
+  void
+  iser_reg_desc_put_fmr(struct ib_conn *ib_conn,
+  		      struct iser_fr_desc *desc);
+++<<<<<<< HEAD
+++=======
++ 
++ static inline struct ib_send_wr *
++ iser_tx_next_wr(struct iser_tx_desc *tx_desc)
++ {
++ 	struct ib_send_wr *cur_wr = &tx_desc->wrs[tx_desc->wr_idx].send;
++ 	struct ib_send_wr *last_wr;
++ 
++ 	if (tx_desc->wr_idx) {
++ 		last_wr = &tx_desc->wrs[tx_desc->wr_idx - 1].send;
++ 		last_wr->next = cur_wr;
++ 	}
++ 	tx_desc->wr_idx++;
++ 
++ 	return cur_wr;
++ }
++ 
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  #endif
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index b04a5e59e448,f45e6a352173..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -741,49 -681,36 +741,76 @@@ iser_reg_sig_mr(struct iscsi_iser_task 
+  		struct iser_mem_reg *prot_reg,
+  		struct iser_mem_reg *sig_reg)
+  {
+++<<<<<<< HEAD
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct ib_send_wr sig_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	struct ib_sig_attrs sig_attrs;
+++=======
++ 	struct iser_tx_desc *tx_desc = &iser_task->desc;
++ 	struct ib_sig_attrs *sig_attrs = &tx_desc->sig_attrs;
++ 	struct ib_sig_handover_wr *wr;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	int ret;
+  
+ -	memset(sig_attrs, 0, sizeof(*sig_attrs));
+ -	ret = iser_set_sig_attrs(iser_task->sc, sig_attrs);
+ +	memset(&sig_attrs, 0, sizeof(sig_attrs));
+ +	ret = iser_set_sig_attrs(iser_task->sc, &sig_attrs);
+ +	if (ret)
+ +		goto err;
+ +
+ +	ret = iser_set_prot_checks(iser_task->sc, &sig_attrs.check_mask);
+  	if (ret)
+  		goto err;
+  
+ -	iser_set_prot_checks(iser_task->sc, &sig_attrs->check_mask);
+++<<<<<<< HEAD
+ +	if (!pi_ctx->sig_mr_valid) {
+ +		iser_inv_rkey(&inv_wr, pi_ctx->sig_mr);
+ +		wr = &inv_wr;
+ +	}
+ +
+ +	memset(&sig_wr, 0, sizeof(sig_wr));
+ +	sig_wr.opcode = IB_WR_REG_SIG_MR;
+ +	sig_wr.wr_id = ISER_FASTREG_LI_WRID;
+ +	sig_wr.sg_list = &data_reg->sge;
+ +	sig_wr.num_sge = 1;
+ +	sig_wr.wr.sig_handover.sig_attrs = &sig_attrs;
+ +	sig_wr.wr.sig_handover.sig_mr = pi_ctx->sig_mr;
+ +	if (scsi_prot_sg_count(iser_task->sc))
+ +		sig_wr.wr.sig_handover.prot = &prot_reg->sge;
+ +	sig_wr.wr.sig_handover.access_flags = IB_ACCESS_LOCAL_WRITE |
+ +					      IB_ACCESS_REMOTE_READ |
+ +					      IB_ACCESS_REMOTE_WRITE;
+  
+ +	if (!wr)
+ +		wr = &sig_wr;
+ +	else
+ +		wr->next = &sig_wr;
+ +
+ +	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ +	if (ret) {
+ +		iser_err("reg_sig_mr failed, ret:%d\n", ret);
+ +		goto err;
+ +	}
+++=======
++ 	if (!pi_ctx->sig_mr_valid)
++ 		iser_inv_rkey(iser_tx_next_wr(tx_desc), pi_ctx->sig_mr);
++ 
++ 	wr = sig_handover_wr(iser_tx_next_wr(tx_desc));
++ 	wr->wr.opcode = IB_WR_REG_SIG_MR;
++ 	wr->wr.wr_id = ISER_FASTREG_LI_WRID;
++ 	wr->wr.sg_list = &data_reg->sge;
++ 	wr->wr.num_sge = 1;
++ 	wr->wr.send_flags = 0;
++ 	wr->sig_attrs = sig_attrs;
++ 	wr->sig_mr = pi_ctx->sig_mr;
++ 	if (scsi_prot_sg_count(iser_task->sc))
++ 		wr->prot = &prot_reg->sge;
++ 	else
++ 		wr->prot = NULL;
++ 	wr->access_flags = IB_ACCESS_LOCAL_WRITE |
++ 			   IB_ACCESS_REMOTE_READ |
++ 			   IB_ACCESS_REMOTE_WRITE;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	pi_ctx->sig_mr_valid = 0;
+  
+  	sig_reg->sge.lkey = pi_ctx->sig_mr->lkey;
+@@@ -805,18 -732,11 +832,26 @@@ static int iser_fast_reg_mr(struct iscs
+  {
+  	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+  	struct iser_device *device = ib_conn->device;
+++<<<<<<< HEAD
+ +	struct ib_mr *mr;
+ +	struct ib_fast_reg_page_list *frpl;
+ +	struct ib_send_wr fastreg_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	int ret, offset, size, plen;
+ +
+ +	/* if there a single dma entry, dma mr suffices */
+ +	if (mem->dma_nents == 1)
+ +		return iser_reg_dma(device, mem, reg);
+ +
+ +	mr = rsc->mr;
+ +	frpl = rsc->frpl;
+++=======
++ 	struct ib_mr *mr = rsc->mr;
++ 	struct ib_fast_reg_page_list *frpl = rsc->frpl;
++ 	struct iser_tx_desc *tx_desc = &iser_task->desc;
++ 	struct ib_fast_reg_wr *wr;
++ 	int offset, size, plen;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  
+  	plen = iser_sg_to_page_vec(mem, device->ib_device, frpl->page_list,
+  				   &offset, &size);
+@@@ -825,35 -745,22 +860,54 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!rsc->mr_valid) {
+ +		iser_inv_rkey(&inv_wr, mr);
+ +		wr = &inv_wr;
+ +	}
+ +
+ +	/* Prepare FASTREG WR */
+ +	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+ +	fastreg_wr.wr_id = ISER_FASTREG_LI_WRID;
+ +	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+ +	fastreg_wr.wr.fast_reg.iova_start = frpl->page_list[0] + offset;
+ +	fastreg_wr.wr.fast_reg.page_list = frpl;
+ +	fastreg_wr.wr.fast_reg.page_list_len = plen;
+ +	fastreg_wr.wr.fast_reg.page_shift = SHIFT_4K;
+ +	fastreg_wr.wr.fast_reg.length = size;
+ +	fastreg_wr.wr.fast_reg.rkey = mr->rkey;
+ +	fastreg_wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE  |
+ +					       IB_ACCESS_REMOTE_WRITE |
+ +					       IB_ACCESS_REMOTE_READ);
+ +
+ +	if (!wr)
+ +		wr = &fastreg_wr;
+ +	else
+ +		wr->next = &fastreg_wr;
+ +
+ +	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+ +	if (ret) {
+ +		iser_err("fast registration failed, ret:%d\n", ret);
+ +		return ret;
+ +	}
+++=======
++ 	if (!rsc->mr_valid)
++ 		iser_inv_rkey(iser_tx_next_wr(tx_desc), mr);
++ 
++ 	wr = fast_reg_wr(iser_tx_next_wr(tx_desc));
++ 	wr->wr.opcode = IB_WR_FAST_REG_MR;
++ 	wr->wr.wr_id = ISER_FASTREG_LI_WRID;
++ 	wr->wr.send_flags = 0;
++ 	wr->iova_start = frpl->page_list[0] + offset;
++ 	wr->page_list = frpl;
++ 	wr->page_list_len = plen;
++ 	wr->page_shift = SHIFT_4K;
++ 	wr->length = size;
++ 	wr->rkey = mr->rkey;
++ 	wr->access_flags = (IB_ACCESS_LOCAL_WRITE  |
++ 			    IB_ACCESS_REMOTE_WRITE |
++ 			    IB_ACCESS_REMOTE_READ);
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	rsc->mr_valid = 0;
+  
+  	reg->sge.lkey = mr->lkey;
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 3a0562552ca5,b26022e30af1..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -1097,16 -1128,17 +1097,20 @@@ int iser_post_send(struct ib_conn *ib_c
+  				      tx_desc->dma_addr, ISER_HEADERS_LEN,
+  				      DMA_TO_DEVICE);
+  
+ -	wr->next = NULL;
+ -	wr->wr_id = (uintptr_t)tx_desc;
+ -	wr->sg_list = tx_desc->tx_sg;
+ -	wr->num_sge = tx_desc->num_sge;
+ -	wr->opcode = IB_WR_SEND;
+ -	wr->send_flags = signal ? IB_SEND_SIGNALED : 0;
+ +	send_wr.next	   = NULL;
+ +	send_wr.wr_id	   = (uintptr_t)tx_desc;
+ +	send_wr.sg_list	   = tx_desc->tx_sg;
+ +	send_wr.num_sge	   = tx_desc->num_sge;
+ +	send_wr.opcode	   = IB_WR_SEND;
+ +	send_wr.send_flags = signal ? IB_SEND_SIGNALED : 0;
+  
+++<<<<<<< HEAD
+ +	ib_ret = ib_post_send(ib_conn->qp, &send_wr, &send_wr_failed);
+++=======
++ 	ib_ret = ib_post_send(ib_conn->qp, &tx_desc->wrs[0].send, &bad_wr);
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	if (ib_ret)
+ -		iser_err("ib_post_send failed, ret:%d opcode:%d\n",
+ -			 ib_ret, bad_wr->opcode);
+ +		iser_err("ib_post_send failed, ret:%d\n", ib_ret);
+  
+  	return ib_ret;
+  }
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 50a292e5fc81,02c4c0b4569d..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -2971,17 -2948,11 +2971,22 @@@ isert_put_datain(struct iscsi_conn *con
+  		isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+  		isert_init_send_wr(isert_conn, isert_cmd,
+  				   &isert_cmd->tx_desc.send_wr);
+++<<<<<<< HEAD
+ +		isert_cmd->rdma_wr.s_send_wr.next = &isert_cmd->tx_desc.send_wr;
+ +		wr->send_wr_num += 1;
+ +
+ +		rc = isert_post_recv(isert_conn, isert_cmd->rx_desc);
+ +		if (rc) {
+ +			isert_err("ib_post_recv failed with %d\n", rc);
+ +			return rc;
+ +		}
+++=======
++ 		isert_cmd->rdma_wr.s_rdma_wr.wr.next = &isert_cmd->tx_desc.send_wr;
++ 		wr->rdma_wr_num += 1;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	}
+  
+- 	rc = ib_post_send(isert_conn->qp, wr->send_wr, &wr_failed);
++ 	rc = ib_post_send(isert_conn->qp, &wr->rdma_wr->wr, &wr_failed);
+  	if (rc)
+  		isert_warn("ib_post_send() failed for IB_WR_RDMA_WRITE\n");
+  
+diff --cc net/rds/iw_send.c
+index 4626926033f8,f6e23c515b44..000000000000
+--- a/net/rds/iw_send.c
++++ b/net/rds/iw_send.c
+@@@ -266,9 -266,9 +266,15 @@@ void rds_iw_send_cq_comp_handler(struc
+  				break;
+  			}
+  
+++<<<<<<< HEAD
+ +			send->s_wr.opcode = 0xdead;
+ +			send->s_wr.num_sge = 1;
+ +			if (send->s_queued + HZ/2 < jiffies)
+++=======
++ 			send->s_send_wr.opcode = 0xdead;
++ 			send->s_send_wr.num_sge = 1;
++ 			if (time_after(jiffies, send->s_queued + HZ/2))
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  				rds_iw_stats_inc(s_iw_tx_stalled);
+  
+  			/* If a RDMA operation produced an error, signal this right
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 944b72ffed6c,0d2f46f600b6..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -248,13 -306,14 +248,21 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  	    int nsegs, bool writing)
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct ib_device *device = ia->ri_device;
+ +	struct ib_device *device = ia->ri_id->device;
+  	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+  	struct rpcrdma_mr_seg *seg1 = seg;
+++<<<<<<< HEAD
+ +	struct rpcrdma_mw *mw = seg1->rl_mw;
+ +	struct rpcrdma_frmr *frmr = &mw->r.frmr;
+ +	struct ib_mr *mr = frmr->fr_mr;
+ +	struct ib_send_wr fastreg_wr, *bad_wr;
+++=======
++ 	struct rpcrdma_mw *mw;
++ 	struct rpcrdma_frmr *frmr;
++ 	struct ib_mr *mr;
++ 	struct ib_fast_reg_wr fastreg_wr;
++ 	struct ib_send_wr *bad_wr;
+++>>>>>>> e622f2f4ad21 (IB: split struct ib_send_wr)
+  	u8 key;
+  	int len, pageoff;
+  	int i, rc;
+@@@ -286,25 -358,24 +294,25 @@@
+  	dprintk("RPC:       %s: Using frmr %p to map %d segments (%d bytes)\n",
+  		__func__, mw, i, len);
+  
+ +	frmr->fr_state = FRMR_IS_VALID;
+ +
+  	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+- 	fastreg_wr.wr_id = (unsigned long)(void *)mw;
+- 	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+- 	fastreg_wr.wr.fast_reg.iova_start = seg1->mr_dma + pageoff;
+- 	fastreg_wr.wr.fast_reg.page_list = frmr->fr_pgl;
+- 	fastreg_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
+- 	fastreg_wr.wr.fast_reg.page_list_len = page_no;
+- 	fastreg_wr.wr.fast_reg.length = len;
+- 	fastreg_wr.wr.fast_reg.access_flags = writing ?
++ 	fastreg_wr.wr.wr_id = (unsigned long)(void *)mw;
++ 	fastreg_wr.wr.opcode = IB_WR_FAST_REG_MR;
++ 	fastreg_wr.iova_start = seg1->mr_dma + pageoff;
++ 	fastreg_wr.page_list = frmr->fr_pgl;
++ 	fastreg_wr.page_shift = PAGE_SHIFT;
++ 	fastreg_wr.page_list_len = page_no;
++ 	fastreg_wr.length = len;
++ 	fastreg_wr.access_flags = writing ?
+  				IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE :
+  				IB_ACCESS_REMOTE_READ;
+ -	mr = frmr->fr_mr;
+  	key = (u8)(mr->rkey & 0x000000FF);
+  	ib_update_fast_reg_key(mr, ++key);
+- 	fastreg_wr.wr.fast_reg.rkey = mr->rkey;
++ 	fastreg_wr.rkey = mr->rkey;
+  
+  	DECR_CQCOUNT(&r_xprt->rx_ep);
+- 	rc = ib_post_send(ia->ri_id->qp, &fastreg_wr, &bad_wr);
++ 	rc = ib_post_send(ia->ri_id->qp, &fastreg_wr.wr, &bad_wr);
+  	if (rc)
+  		goto out_senderr;
+  
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
+diff --git a/drivers/infiniband/core/agent.c b/drivers/infiniband/core/agent.c
+index 0429040304fd..4fa524dfb6cf 100644
+--- a/drivers/infiniband/core/agent.c
++++ b/drivers/infiniband/core/agent.c
+@@ -126,7 +126,7 @@ void agent_send_response(const struct ib_mad_hdr *mad_hdr, const struct ib_grh *
+ 		mad_send_wr = container_of(send_buf,
+ 					   struct ib_mad_send_wr_private,
+ 					   send_buf);
+-		mad_send_wr->send_wr.wr.ud.port_num = port_num;
++		mad_send_wr->send_wr.port_num = port_num;
+ 	}
+ 
+ 	if (ib_post_send_mad(send_buf, NULL)) {
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 4b5c72311deb..844d9bb22700 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -752,7 +752,7 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 	struct ib_device *device = mad_agent_priv->agent.device;
+ 	u8 port_num;
+ 	struct ib_wc mad_wc;
+-	struct ib_send_wr *send_wr = &mad_send_wr->send_wr;
++	struct ib_ud_wr *send_wr = &mad_send_wr->send_wr;
+ 	size_t mad_size = port_mad_size(mad_agent_priv->qp_info->port_priv);
+ 	u16 out_mad_pkey_index = 0;
+ 	u16 drslid;
+@@ -761,7 +761,7 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 
+ 	if (rdma_cap_ib_switch(device) &&
+ 	    smp->mgmt_class == IB_MGMT_CLASS_SUBN_DIRECTED_ROUTE)
+-		port_num = send_wr->wr.ud.port_num;
++		port_num = send_wr->port_num;
+ 	else
+ 		port_num = mad_agent_priv->agent.port_num;
+ 
+@@ -832,9 +832,9 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 	}
+ 
+ 	build_smp_wc(mad_agent_priv->agent.qp,
+-		     send_wr->wr_id, drslid,
+-		     send_wr->wr.ud.pkey_index,
+-		     send_wr->wr.ud.port_num, &mad_wc);
++		     send_wr->wr.wr_id, drslid,
++		     send_wr->pkey_index,
++		     send_wr->port_num, &mad_wc);
+ 
+ 	if (opa && smp->base_version == OPA_MGMT_BASE_VERSION) {
+ 		mad_wc.byte_len = mad_send_wr->send_buf.hdr_len
+@@ -894,7 +894,7 @@ static int handle_outgoing_dr_smp(struct ib_mad_agent_private *mad_agent_priv,
+ 
+ 	local->mad_send_wr = mad_send_wr;
+ 	if (opa) {
+-		local->mad_send_wr->send_wr.wr.ud.pkey_index = out_mad_pkey_index;
++		local->mad_send_wr->send_wr.pkey_index = out_mad_pkey_index;
+ 		local->return_wc_byte_len = mad_size;
+ 	}
+ 	/* Reference MAD agent until send side of local completion handled */
+@@ -1039,14 +1039,14 @@ struct ib_mad_send_buf * ib_create_send_mad(struct ib_mad_agent *mad_agent,
+ 
+ 	mad_send_wr->sg_list[1].lkey = mad_agent->qp->pd->local_dma_lkey;
+ 
+-	mad_send_wr->send_wr.wr_id = (unsigned long) mad_send_wr;
+-	mad_send_wr->send_wr.sg_list = mad_send_wr->sg_list;
+-	mad_send_wr->send_wr.num_sge = 2;
+-	mad_send_wr->send_wr.opcode = IB_WR_SEND;
+-	mad_send_wr->send_wr.send_flags = IB_SEND_SIGNALED;
+-	mad_send_wr->send_wr.wr.ud.remote_qpn = remote_qpn;
+-	mad_send_wr->send_wr.wr.ud.remote_qkey = IB_QP_SET_QKEY;
+-	mad_send_wr->send_wr.wr.ud.pkey_index = pkey_index;
++	mad_send_wr->send_wr.wr.wr_id = (unsigned long) mad_send_wr;
++	mad_send_wr->send_wr.wr.sg_list = mad_send_wr->sg_list;
++	mad_send_wr->send_wr.wr.num_sge = 2;
++	mad_send_wr->send_wr.wr.opcode = IB_WR_SEND;
++	mad_send_wr->send_wr.wr.send_flags = IB_SEND_SIGNALED;
++	mad_send_wr->send_wr.remote_qpn = remote_qpn;
++	mad_send_wr->send_wr.remote_qkey = IB_QP_SET_QKEY;
++	mad_send_wr->send_wr.pkey_index = pkey_index;
+ 
+ 	if (rmpp_active) {
+ 		ret = alloc_send_rmpp_list(mad_send_wr, mad_size, gfp_mask);
+@@ -1151,7 +1151,7 @@ int ib_send_mad(struct ib_mad_send_wr_private *mad_send_wr)
+ 
+ 	/* Set WR ID to find mad_send_wr upon completion */
+ 	qp_info = mad_send_wr->mad_agent_priv->qp_info;
+-	mad_send_wr->send_wr.wr_id = (unsigned long)&mad_send_wr->mad_list;
++	mad_send_wr->send_wr.wr.wr_id = (unsigned long)&mad_send_wr->mad_list;
+ 	mad_send_wr->mad_list.mad_queue = &qp_info->send_queue;
+ 
+ 	mad_agent = mad_send_wr->send_buf.mad_agent;
+@@ -1179,7 +1179,7 @@ int ib_send_mad(struct ib_mad_send_wr_private *mad_send_wr)
+ 
+ 	spin_lock_irqsave(&qp_info->send_queue.lock, flags);
+ 	if (qp_info->send_queue.count < qp_info->send_queue.max_active) {
+-		ret = ib_post_send(mad_agent->qp, &mad_send_wr->send_wr,
++		ret = ib_post_send(mad_agent->qp, &mad_send_wr->send_wr.wr,
+ 				   &bad_send_wr);
+ 		list = &qp_info->send_queue.list;
+ 	} else {
+@@ -1244,7 +1244,7 @@ int ib_post_send_mad(struct ib_mad_send_buf *send_buf,
+ 		 * request associated with the completion
+ 		 */
+ 		next_send_buf = send_buf->next;
+-		mad_send_wr->send_wr.wr.ud.ah = send_buf->ah;
++		mad_send_wr->send_wr.ah = send_buf->ah;
+ 
+ 		if (((struct ib_mad_hdr *) send_buf->mad)->mgmt_class ==
+ 		    IB_MGMT_CLASS_SUBN_DIRECTED_ROUTE) {
+@@ -2457,7 +2457,7 @@ retry:
+ 	ib_mad_complete_send_wr(mad_send_wr, &mad_send_wc);
+ 
+ 	if (queued_send_wr) {
+-		ret = ib_post_send(qp_info->qp, &queued_send_wr->send_wr,
++		ret = ib_post_send(qp_info->qp, &queued_send_wr->send_wr.wr,
+ 				   &bad_send_wr);
+ 		if (ret) {
+ 			dev_err(&port_priv->device->dev,
+@@ -2515,7 +2515,7 @@ static void mad_error_handler(struct ib_mad_port_private *port_priv,
+ 			struct ib_send_wr *bad_send_wr;
+ 
+ 			mad_send_wr->retry = 0;
+-			ret = ib_post_send(qp_info->qp, &mad_send_wr->send_wr,
++			ret = ib_post_send(qp_info->qp, &mad_send_wr->send_wr.wr,
+ 					&bad_send_wr);
+ 			if (ret)
+ 				ib_mad_send_done_handler(port_priv, wc);
+@@ -2713,7 +2713,7 @@ static void local_completions(struct work_struct *work)
+ 			build_smp_wc(recv_mad_agent->agent.qp,
+ 				     (unsigned long) local->mad_send_wr,
+ 				     be16_to_cpu(IB_LID_PERMISSIVE),
+-				     local->mad_send_wr->send_wr.wr.ud.pkey_index,
++				     local->mad_send_wr->send_wr.pkey_index,
+ 				     recv_mad_agent->agent.port_num, &wc);
+ 
+ 			local->mad_priv->header.recv_wc.wc = &wc;
+diff --git a/drivers/infiniband/core/mad_priv.h b/drivers/infiniband/core/mad_priv.h
+index 4a4f7aad0978..990698a6ab4b 100644
+--- a/drivers/infiniband/core/mad_priv.h
++++ b/drivers/infiniband/core/mad_priv.h
+@@ -123,7 +123,7 @@ struct ib_mad_send_wr_private {
+ 	struct ib_mad_send_buf send_buf;
+ 	u64 header_mapping;
+ 	u64 payload_mapping;
+-	struct ib_send_wr send_wr;
++	struct ib_ud_wr send_wr;
+ 	struct ib_sge sg_list[IB_MAD_SEND_REQ_MAX_SG];
+ 	__be64 tid;
+ 	unsigned long timeout;
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index be4cb9f04be3..8adb71fd6a3a 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -2303,6 +2303,12 @@ ssize_t ib_uverbs_destroy_qp(struct ib_uverbs_file *file,
+ 	return in_len;
+ }
+ 
++static void *alloc_wr(size_t wr_size, __u32 num_sge)
++{
++	return kmalloc(ALIGN(wr_size, sizeof (struct ib_sge)) +
++			 num_sge * sizeof (struct ib_sge), GFP_KERNEL);
++};
++
+ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
+ 			    struct ib_device *ib_dev,
+ 			    const char __user *buf, int in_len,
+@@ -2351,14 +2357,83 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
+ 			goto out_put;
+ 		}
+ 
+-		next = kmalloc(ALIGN(sizeof *next, sizeof (struct ib_sge)) +
+-			       user_wr->num_sge * sizeof (struct ib_sge),
+-			       GFP_KERNEL);
+-		if (!next) {
+-			ret = -ENOMEM;
++		if (is_ud) {
++			struct ib_ud_wr *ud;
++
++			if (user_wr->opcode != IB_WR_SEND &&
++			    user_wr->opcode != IB_WR_SEND_WITH_IMM) {
++				ret = -EINVAL;
++				goto out_put;
++			}
++
++			ud = alloc_wr(sizeof(*ud), user_wr->num_sge);
++			if (!ud) {
++				ret = -ENOMEM;
++				goto out_put;
++			}
++
++			ud->ah = idr_read_ah(user_wr->wr.ud.ah, file->ucontext);
++			if (!ud->ah) {
++				kfree(ud);
++				ret = -EINVAL;
++				goto out_put;
++			}
++			ud->remote_qpn = user_wr->wr.ud.remote_qpn;
++			ud->remote_qkey = user_wr->wr.ud.remote_qkey;
++
++			next = &ud->wr;
++		} else if (user_wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
++			   user_wr->opcode == IB_WR_RDMA_WRITE ||
++			   user_wr->opcode == IB_WR_RDMA_READ) {
++			struct ib_rdma_wr *rdma;
++
++			rdma = alloc_wr(sizeof(*rdma), user_wr->num_sge);
++			if (!rdma) {
++				ret = -ENOMEM;
++				goto out_put;
++			}
++
++			rdma->remote_addr = user_wr->wr.rdma.remote_addr;
++			rdma->rkey = user_wr->wr.rdma.rkey;
++
++			next = &rdma->wr;
++		} else if (user_wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
++			   user_wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD) {
++			struct ib_atomic_wr *atomic;
++
++			atomic = alloc_wr(sizeof(*atomic), user_wr->num_sge);
++			if (!atomic) {
++				ret = -ENOMEM;
++				goto out_put;
++			}
++
++			atomic->remote_addr = user_wr->wr.atomic.remote_addr;
++			atomic->compare_add = user_wr->wr.atomic.compare_add;
++			atomic->swap = user_wr->wr.atomic.swap;
++			atomic->rkey = user_wr->wr.atomic.rkey;
++
++			next = &atomic->wr;
++		} else if (user_wr->opcode == IB_WR_SEND ||
++			   user_wr->opcode == IB_WR_SEND_WITH_IMM ||
++			   user_wr->opcode == IB_WR_SEND_WITH_INV) {
++			next = alloc_wr(sizeof(*next), user_wr->num_sge);
++			if (!next) {
++				ret = -ENOMEM;
++				goto out_put;
++			}
++		} else {
++			ret = -EINVAL;
+ 			goto out_put;
+ 		}
+ 
++		if (user_wr->opcode == IB_WR_SEND_WITH_IMM ||
++		    user_wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM) {
++			next->ex.imm_data =
++					(__be32 __force) user_wr->ex.imm_data;
++		} else if (user_wr->opcode == IB_WR_SEND_WITH_INV) {
++			next->ex.invalidate_rkey = user_wr->ex.invalidate_rkey;
++		}
++
+ 		if (!last)
+ 			wr = next;
+ 		else
+@@ -2371,60 +2446,6 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
+ 		next->opcode     = user_wr->opcode;
+ 		next->send_flags = user_wr->send_flags;
+ 
+-		if (is_ud) {
+-			if (next->opcode != IB_WR_SEND &&
+-			    next->opcode != IB_WR_SEND_WITH_IMM) {
+-				ret = -EINVAL;
+-				goto out_put;
+-			}
+-
+-			next->wr.ud.ah = idr_read_ah(user_wr->wr.ud.ah,
+-						     file->ucontext);
+-			if (!next->wr.ud.ah) {
+-				ret = -EINVAL;
+-				goto out_put;
+-			}
+-			next->wr.ud.remote_qpn  = user_wr->wr.ud.remote_qpn;
+-			next->wr.ud.remote_qkey = user_wr->wr.ud.remote_qkey;
+-			if (next->opcode == IB_WR_SEND_WITH_IMM)
+-				next->ex.imm_data =
+-					(__be32 __force) user_wr->ex.imm_data;
+-		} else {
+-			switch (next->opcode) {
+-			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				next->ex.imm_data =
+-					(__be32 __force) user_wr->ex.imm_data;
+-			case IB_WR_RDMA_WRITE:
+-			case IB_WR_RDMA_READ:
+-				next->wr.rdma.remote_addr =
+-					user_wr->wr.rdma.remote_addr;
+-				next->wr.rdma.rkey        =
+-					user_wr->wr.rdma.rkey;
+-				break;
+-			case IB_WR_SEND_WITH_IMM:
+-				next->ex.imm_data =
+-					(__be32 __force) user_wr->ex.imm_data;
+-				break;
+-			case IB_WR_SEND_WITH_INV:
+-				next->ex.invalidate_rkey =
+-					user_wr->ex.invalidate_rkey;
+-				break;
+-			case IB_WR_ATOMIC_CMP_AND_SWP:
+-			case IB_WR_ATOMIC_FETCH_AND_ADD:
+-				next->wr.atomic.remote_addr =
+-					user_wr->wr.atomic.remote_addr;
+-				next->wr.atomic.compare_add =
+-					user_wr->wr.atomic.compare_add;
+-				next->wr.atomic.swap = user_wr->wr.atomic.swap;
+-				next->wr.atomic.rkey = user_wr->wr.atomic.rkey;
+-			case IB_WR_SEND:
+-				break;
+-			default:
+-				ret = -EINVAL;
+-				goto out_put;
+-			}
+-		}
+-
+ 		if (next->num_sge) {
+ 			next->sg_list = (void *) next +
+ 				ALIGN(sizeof *next, sizeof (struct ib_sge));
+@@ -2458,8 +2479,8 @@ out_put:
+ 	put_qp_read(qp);
+ 
+ 	while (wr) {
+-		if (is_ud && wr->wr.ud.ah)
+-			put_ah_read(wr->wr.ud.ah);
++		if (is_ud && ud_wr(wr)->ah)
++			put_ah_read(ud_wr(wr)->ah);
+ 		next = wr->next;
+ 		kfree(wr);
+ 		wr = next;
+diff --git a/drivers/infiniband/hw/amso1100/c2_qp.c b/drivers/infiniband/hw/amso1100/c2_qp.c
+index 86708dee58b1..4c43ca935cc7 100644
+--- a/drivers/infiniband/hw/amso1100/c2_qp.c
++++ b/drivers/infiniband/hw/amso1100/c2_qp.c
+@@ -860,9 +860,9 @@ int c2_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 				flags |= SQ_READ_FENCE;
+ 			}
+ 			wr.sqwr.rdma_write.remote_stag =
+-			    cpu_to_be32(ib_wr->wr.rdma.rkey);
++			    cpu_to_be32(rdma_wr(ib_wr)->rkey);
+ 			wr.sqwr.rdma_write.remote_to =
+-			    cpu_to_be64(ib_wr->wr.rdma.remote_addr);
++			    cpu_to_be64(rdma_wr(ib_wr)->remote_addr);
+ 			err = move_sgl((struct c2_data_addr *)
+ 				       & (wr.sqwr.rdma_write.data),
+ 				       ib_wr->sg_list,
+@@ -889,9 +889,9 @@ int c2_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 			wr.sqwr.rdma_read.local_to =
+ 			    cpu_to_be64(ib_wr->sg_list->addr);
+ 			wr.sqwr.rdma_read.remote_stag =
+-			    cpu_to_be32(ib_wr->wr.rdma.rkey);
++			    cpu_to_be32(rdma_wr(ib_wr)->rkey);
+ 			wr.sqwr.rdma_read.remote_to =
+-			    cpu_to_be64(ib_wr->wr.rdma.remote_addr);
++			    cpu_to_be64(rdma_wr(ib_wr)->remote_addr);
+ 			wr.sqwr.rdma_read.length =
+ 			    cpu_to_be32(ib_wr->sg_list->length);
+ 			break;
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_qp.c b/drivers/infiniband/hw/cxgb3/iwch_qp.c
+index b57c0befd962..bac0508fedd9 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_qp.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_qp.c
+@@ -95,8 +95,8 @@ static int build_rdma_write(union t3_wr *wqe, struct ib_send_wr *wr,
+ 	wqe->write.reserved[0] = 0;
+ 	wqe->write.reserved[1] = 0;
+ 	wqe->write.reserved[2] = 0;
+-	wqe->write.stag_sink = cpu_to_be32(wr->wr.rdma.rkey);
+-	wqe->write.to_sink = cpu_to_be64(wr->wr.rdma.remote_addr);
++	wqe->write.stag_sink = cpu_to_be32(rdma_wr(wr)->rkey);
++	wqe->write.to_sink = cpu_to_be64(rdma_wr(wr)->remote_addr);
+ 
+ 	if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM) {
+ 		plen = 4;
+@@ -137,8 +137,8 @@ static int build_rdma_read(union t3_wr *wqe, struct ib_send_wr *wr,
+ 		wqe->read.local_inv = 0;
+ 	wqe->read.reserved[0] = 0;
+ 	wqe->read.reserved[1] = 0;
+-	wqe->read.rem_stag = cpu_to_be32(wr->wr.rdma.rkey);
+-	wqe->read.rem_to = cpu_to_be64(wr->wr.rdma.remote_addr);
++	wqe->read.rem_stag = cpu_to_be32(rdma_wr(wr)->rkey);
++	wqe->read.rem_to = cpu_to_be64(rdma_wr(wr)->remote_addr);
+ 	wqe->read.local_stag = cpu_to_be32(wr->sg_list[0].lkey);
+ 	wqe->read.local_len = cpu_to_be32(wr->sg_list[0].length);
+ 	wqe->read.local_to = cpu_to_be64(wr->sg_list[0].addr);
+@@ -146,27 +146,27 @@ static int build_rdma_read(union t3_wr *wqe, struct ib_send_wr *wr,
+ 	return 0;
+ }
+ 
+-static int build_fastreg(union t3_wr *wqe, struct ib_send_wr *wr,
++static int build_fastreg(union t3_wr *wqe, struct ib_send_wr *send_wr,
+ 				u8 *flit_cnt, int *wr_cnt, struct t3_wq *wq)
+ {
++	struct ib_fast_reg_wr *wr = fast_reg_wr(send_wr);
+ 	int i;
+ 	__be64 *p;
+ 
+-	if (wr->wr.fast_reg.page_list_len > T3_MAX_FASTREG_DEPTH)
++	if (wr->page_list_len > T3_MAX_FASTREG_DEPTH)
+ 		return -EINVAL;
+ 	*wr_cnt = 1;
+-	wqe->fastreg.stag = cpu_to_be32(wr->wr.fast_reg.rkey);
+-	wqe->fastreg.len = cpu_to_be32(wr->wr.fast_reg.length);
+-	wqe->fastreg.va_base_hi = cpu_to_be32(wr->wr.fast_reg.iova_start >> 32);
+-	wqe->fastreg.va_base_lo_fbo =
+-				cpu_to_be32(wr->wr.fast_reg.iova_start & 0xffffffff);
++	wqe->fastreg.stag = cpu_to_be32(wr->rkey);
++	wqe->fastreg.len = cpu_to_be32(wr->length);
++	wqe->fastreg.va_base_hi = cpu_to_be32(wr->iova_start >> 32);
++	wqe->fastreg.va_base_lo_fbo = cpu_to_be32(wr->iova_start & 0xffffffff);
+ 	wqe->fastreg.page_type_perms = cpu_to_be32(
+-		V_FR_PAGE_COUNT(wr->wr.fast_reg.page_list_len) |
+-		V_FR_PAGE_SIZE(wr->wr.fast_reg.page_shift-12) |
++		V_FR_PAGE_COUNT(wr->page_list_len) |
++		V_FR_PAGE_SIZE(wr->page_shift-12) |
+ 		V_FR_TYPE(TPT_VATO) |
+-		V_FR_PERMS(iwch_ib_to_tpt_access(wr->wr.fast_reg.access_flags)));
++		V_FR_PERMS(iwch_ib_to_tpt_access(wr->access_flags)));
+ 	p = &wqe->fastreg.pbl_addrs[0];
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++, p++) {
++	for (i = 0; i < wr->page_list_len; i++, p++) {
+ 
+ 		/* If we need a 2nd WR, then set it up */
+ 		if (i == T3_MAX_FASTREG_FRAG) {
+@@ -175,14 +175,14 @@ static int build_fastreg(union t3_wr *wqe, struct ib_send_wr *wr,
+ 				Q_PTR2IDX((wq->wptr+1), wq->size_log2));
+ 			build_fw_riwrh((void *)wqe, T3_WR_FASTREG, 0,
+ 			       Q_GENBIT(wq->wptr + 1, wq->size_log2),
+-			       0, 1 + wr->wr.fast_reg.page_list_len - T3_MAX_FASTREG_FRAG,
++			       0, 1 + wr->page_list_len - T3_MAX_FASTREG_FRAG,
+ 			       T3_EOP);
+ 
+ 			p = &wqe->pbl_frag.pbl_addrs[0];
+ 		}
+-		*p = cpu_to_be64((u64)wr->wr.fast_reg.page_list->page_list[i]);
++		*p = cpu_to_be64((u64)wr->page_list->page_list[i]);
+ 	}
+-	*flit_cnt = 5 + wr->wr.fast_reg.page_list_len;
++	*flit_cnt = 5 + wr->page_list_len;
+ 	if (*flit_cnt > 15)
+ 		*flit_cnt = 15;
+ 	return 0;
+diff --git a/drivers/infiniband/hw/cxgb4/qp.c b/drivers/infiniband/hw/cxgb4/qp.c
+index 323fa1d872d6..ffae54c52639 100644
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -528,8 +528,8 @@ static int build_rdma_write(struct t4_sq *sq, union t4_wr *wqe,
+ 	if (wr->num_sge > T4_MAX_SEND_SGE)
+ 		return -EINVAL;
+ 	wqe->write.r2 = 0;
+-	wqe->write.stag_sink = cpu_to_be32(wr->wr.rdma.rkey);
+-	wqe->write.to_sink = cpu_to_be64(wr->wr.rdma.remote_addr);
++	wqe->write.stag_sink = cpu_to_be32(rdma_wr(wr)->rkey);
++	wqe->write.to_sink = cpu_to_be64(rdma_wr(wr)->remote_addr);
+ 	if (wr->num_sge) {
+ 		if (wr->send_flags & IB_SEND_INLINE) {
+ 			ret = build_immd(sq, wqe->write.u.immd_src, wr,
+@@ -566,10 +566,10 @@ static int build_rdma_read(union t4_wr *wqe, struct ib_send_wr *wr, u8 *len16)
+ 	if (wr->num_sge > 1)
+ 		return -EINVAL;
+ 	if (wr->num_sge) {
+-		wqe->read.stag_src = cpu_to_be32(wr->wr.rdma.rkey);
+-		wqe->read.to_src_hi = cpu_to_be32((u32)(wr->wr.rdma.remote_addr
++		wqe->read.stag_src = cpu_to_be32(rdma_wr(wr)->rkey);
++		wqe->read.to_src_hi = cpu_to_be32((u32)(rdma_wr(wr)->remote_addr
+ 							>> 32));
+-		wqe->read.to_src_lo = cpu_to_be32((u32)wr->wr.rdma.remote_addr);
++		wqe->read.to_src_lo = cpu_to_be32((u32)rdma_wr(wr)->remote_addr);
+ 		wqe->read.stag_sink = cpu_to_be32(wr->sg_list[0].lkey);
+ 		wqe->read.plen = cpu_to_be32(wr->sg_list[0].length);
+ 		wqe->read.to_sink_hi = cpu_to_be32((u32)(wr->sg_list[0].addr
+@@ -606,39 +606,36 @@ static int build_rdma_recv(struct c4iw_qp *qhp, union t4_recv_wr *wqe,
+ }
+ 
+ static int build_fastreg(struct t4_sq *sq, union t4_wr *wqe,
+-			 struct ib_send_wr *wr, u8 *len16, u8 t5dev)
++			 struct ib_send_wr *send_wr, u8 *len16, u8 t5dev)
+ {
+-
++	struct ib_fast_reg_wr *wr = fast_reg_wr(send_wr);
+ 	struct fw_ri_immd *imdp;
+ 	__be64 *p;
+ 	int i;
+-	int pbllen = roundup(wr->wr.fast_reg.page_list_len * sizeof(u64), 32);
++	int pbllen = roundup(wr->page_list_len * sizeof(u64), 32);
+ 	int rem;
+ 
+-	if (wr->wr.fast_reg.page_list_len >
+-	    t4_max_fr_depth(use_dsgl))
++	if (wr->page_list_len > t4_max_fr_depth(use_dsgl))
+ 		return -EINVAL;
+ 
+ 	wqe->fr.qpbinde_to_dcacpu = 0;
+-	wqe->fr.pgsz_shift = wr->wr.fast_reg.page_shift - 12;
++	wqe->fr.pgsz_shift = wr->page_shift - 12;
+ 	wqe->fr.addr_type = FW_RI_VA_BASED_TO;
+-	wqe->fr.mem_perms = c4iw_ib_to_tpt_access(wr->wr.fast_reg.access_flags);
++	wqe->fr.mem_perms = c4iw_ib_to_tpt_access(wr->access_flags);
+ 	wqe->fr.len_hi = 0;
+-	wqe->fr.len_lo = cpu_to_be32(wr->wr.fast_reg.length);
+-	wqe->fr.stag = cpu_to_be32(wr->wr.fast_reg.rkey);
+-	wqe->fr.va_hi = cpu_to_be32(wr->wr.fast_reg.iova_start >> 32);
+-	wqe->fr.va_lo_fbo = cpu_to_be32(wr->wr.fast_reg.iova_start &
+-					0xffffffff);
++	wqe->fr.len_lo = cpu_to_be32(wr->length);
++	wqe->fr.stag = cpu_to_be32(wr->rkey);
++	wqe->fr.va_hi = cpu_to_be32(wr->iova_start >> 32);
++	wqe->fr.va_lo_fbo = cpu_to_be32(wr->iova_start & 0xffffffff);
+ 
+ 	if (t5dev && use_dsgl && (pbllen > max_fr_immd)) {
+ 		struct c4iw_fr_page_list *c4pl =
+-			to_c4iw_fr_page_list(wr->wr.fast_reg.page_list);
++			to_c4iw_fr_page_list(wr->page_list);
+ 		struct fw_ri_dsgl *sglp;
+ 
+-		for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
+-			wr->wr.fast_reg.page_list->page_list[i] = (__force u64)
+-				cpu_to_be64((u64)
+-				wr->wr.fast_reg.page_list->page_list[i]);
++		for (i = 0; i < wr->page_list_len; i++) {
++			wr->page_list->page_list[i] = (__force u64)
++				cpu_to_be64((u64)wr->page_list->page_list[i]);
+ 		}
+ 
+ 		sglp = (struct fw_ri_dsgl *)(&wqe->fr + 1);
+@@ -657,9 +654,8 @@ static int build_fastreg(struct t4_sq *sq, union t4_wr *wqe,
+ 		imdp->immdlen = cpu_to_be32(pbllen);
+ 		p = (__be64 *)(imdp + 1);
+ 		rem = pbllen;
+-		for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
+-			*p = cpu_to_be64(
+-				(u64)wr->wr.fast_reg.page_list->page_list[i]);
++		for (i = 0; i < wr->page_list_len; i++) {
++			*p = cpu_to_be64((u64)wr->page_list->page_list[i]);
+ 			rem -= sizeof(*p);
+ 			if (++p == (__be64 *)&sq->queue[sq->size])
+ 				p = (__be64 *)sq->queue;
+diff --git a/drivers/infiniband/hw/ehca/ehca_reqs.c b/drivers/infiniband/hw/ehca/ehca_reqs.c
+index 47f94984353d..10e2074384f5 100644
+--- a/drivers/infiniband/hw/ehca/ehca_reqs.c
++++ b/drivers/infiniband/hw/ehca/ehca_reqs.c
+@@ -110,19 +110,19 @@ static inline int ehca_write_rwqe(struct ipz_queue *ipz_rqueue,
+ /* need ib_mad struct */
+ #include <rdma/ib_mad.h>
+ 
+-static void trace_send_wr_ud(const struct ib_send_wr *send_wr)
++static void trace_ud_wr(const struct ib_ud_wr *ud_wr)
+ {
+ 	int idx;
+ 	int j;
+-	while (send_wr) {
+-		struct ib_mad_hdr *mad_hdr = send_wr->wr.ud.mad_hdr;
+-		struct ib_sge *sge = send_wr->sg_list;
+-		ehca_gen_dbg("send_wr#%x wr_id=%lx num_sge=%x "
+-			     "send_flags=%x opcode=%x", idx, send_wr->wr_id,
+-			     send_wr->num_sge, send_wr->send_flags,
+-			     send_wr->opcode);
++	while (ud_wr) {
++		struct ib_mad_hdr *mad_hdr = ud_wrmad_hdr;
++		struct ib_sge *sge = ud_wr->wr.sg_list;
++		ehca_gen_dbg("ud_wr#%x wr_id=%lx num_sge=%x "
++			     "send_flags=%x opcode=%x", idx, ud_wr->wr.wr_id,
++			     ud_wr->wr.num_sge, ud_wr->wr.send_flags,
++			     ud_wr->.wr.opcode);
+ 		if (mad_hdr) {
+-			ehca_gen_dbg("send_wr#%x mad_hdr base_version=%x "
++			ehca_gen_dbg("ud_wr#%x mad_hdr base_version=%x "
+ 				     "mgmt_class=%x class_version=%x method=%x "
+ 				     "status=%x class_specific=%x tid=%lx "
+ 				     "attr_id=%x resv=%x attr_mod=%x",
+@@ -134,33 +134,33 @@ static void trace_send_wr_ud(const struct ib_send_wr *send_wr)
+ 				     mad_hdr->resv,
+ 				     mad_hdr->attr_mod);
+ 		}
+-		for (j = 0; j < send_wr->num_sge; j++) {
++		for (j = 0; j < ud_wr->wr.num_sge; j++) {
+ 			u8 *data = __va(sge->addr);
+-			ehca_gen_dbg("send_wr#%x sge#%x addr=%p length=%x "
++			ehca_gen_dbg("ud_wr#%x sge#%x addr=%p length=%x "
+ 				     "lkey=%x",
+ 				     idx, j, data, sge->length, sge->lkey);
+ 			/* assume length is n*16 */
+-			ehca_dmp(data, sge->length, "send_wr#%x sge#%x",
++			ehca_dmp(data, sge->length, "ud_wr#%x sge#%x",
+ 				 idx, j);
+ 			sge++;
+ 		} /* eof for j */
+ 		idx++;
+-		send_wr = send_wr->next;
+-	} /* eof while send_wr */
++		ud_wr = ud_wr(ud_wr->wr.next);
++	} /* eof while ud_wr */
+ }
+ 
+ #endif /* DEBUG_GSI_SEND_WR */
+ 
+ static inline int ehca_write_swqe(struct ehca_qp *qp,
+ 				  struct ehca_wqe *wqe_p,
+-				  const struct ib_send_wr *send_wr,
++				  struct ib_send_wr *send_wr,
+ 				  u32 sq_map_idx,
+ 				  int hidden)
+ {
+ 	u32 idx;
+ 	u64 dma_length;
+ 	struct ehca_av *my_av;
+-	u32 remote_qkey = send_wr->wr.ud.remote_qkey;
++	u32 remote_qkey;
+ 	struct ehca_qmap_entry *qmap_entry = &qp->sq_map.map[sq_map_idx];
+ 
+ 	if (unlikely((send_wr->num_sge < 0) ||
+@@ -223,20 +223,21 @@ static inline int ehca_write_swqe(struct ehca_qp *qp,
+ 		/* no break is intential here */
+ 	case IB_QPT_UD:
+ 		/* IB 1.2 spec C10-15 compliance */
+-		if (send_wr->wr.ud.remote_qkey & 0x80000000)
++		remote_qkey = ud_wr(send_wr)->remote_qkey;
++		if (remote_qkey & 0x80000000)
+ 			remote_qkey = qp->qkey;
+ 
+-		wqe_p->destination_qp_number = send_wr->wr.ud.remote_qpn << 8;
++		wqe_p->destination_qp_number = ud_wr(send_wr)->remote_qpn << 8;
+ 		wqe_p->local_ee_context_qkey = remote_qkey;
+-		if (unlikely(!send_wr->wr.ud.ah)) {
+-			ehca_gen_err("wr.ud.ah is NULL. qp=%p", qp);
++		if (unlikely(!ud_wr(send_wr)->ah)) {
++			ehca_gen_err("ud_wr(send_wr) is NULL. qp=%p", qp);
+ 			return -EINVAL;
+ 		}
+-		if (unlikely(send_wr->wr.ud.remote_qpn == 0)) {
++		if (unlikely(ud_wr(send_wr)->remote_qpn == 0)) {
+ 			ehca_gen_err("dest QP# is 0. qp=%x", qp->real_qp_num);
+ 			return -EINVAL;
+ 		}
+-		my_av = container_of(send_wr->wr.ud.ah, struct ehca_av, ib_ah);
++		my_av = container_of(ud_wr(send_wr)->ah, struct ehca_av, ib_ah);
+ 		wqe_p->u.ud_av.ud_av = my_av->av;
+ 
+ 		/*
+@@ -255,9 +256,9 @@ static inline int ehca_write_swqe(struct ehca_qp *qp,
+ 		    qp->qp_type == IB_QPT_GSI)
+ 			wqe_p->u.ud_av.ud_av.pmtu = 1;
+ 		if (qp->qp_type == IB_QPT_GSI) {
+-			wqe_p->pkeyi = send_wr->wr.ud.pkey_index;
++			wqe_p->pkeyi = ud_wr(send_wr)->pkey_index;
+ #ifdef DEBUG_GSI_SEND_WR
+-			trace_send_wr_ud(send_wr);
++			trace_ud_wr(ud_wr(send_wr));
+ #endif /* DEBUG_GSI_SEND_WR */
+ 		}
+ 		break;
+@@ -269,8 +270,8 @@ static inline int ehca_write_swqe(struct ehca_qp *qp,
+ 	case IB_QPT_RC:
+ 		/* TODO: atomic not implemented */
+ 		wqe_p->u.nud.remote_virtual_address =
+-			send_wr->wr.rdma.remote_addr;
+-		wqe_p->u.nud.rkey = send_wr->wr.rdma.rkey;
++			rdma_wr(send_wr)->remote_addr;
++		wqe_p->u.nud.rkey = rdma_wr(send_wr)->rkey;
+ 
+ 		/*
+ 		 * omitted checking of IB_SEND_INLINE
+diff --git a/drivers/infiniband/hw/ipath/ipath_rc.c b/drivers/infiniband/hw/ipath/ipath_rc.c
+index 79b3dbc97179..d4aa53574e57 100644
+--- a/drivers/infiniband/hw/ipath/ipath_rc.c
++++ b/drivers/infiniband/hw/ipath/ipath_rc.c
+@@ -350,9 +350,9 @@ int ipath_make_rc_req(struct ipath_qp *qp)
+ 				goto bail;
+ 			}
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / sizeof(u32);
+ 			wqe->lpsn = wqe->psn;
+@@ -401,9 +401,9 @@ int ipath_make_rc_req(struct ipath_qp *qp)
+ 				wqe->lpsn = qp->s_next_psn++;
+ 			}
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			qp->s_state = OP(RDMA_READ_REQUEST);
+ 			hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+@@ -433,21 +433,21 @@ int ipath_make_rc_req(struct ipath_qp *qp)
+ 			if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+ 				qp->s_state = OP(COMPARE_SWAP);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.swap);
++					wqe->atomic_wr.swap);
+ 				ohdr->u.atomic_eth.compare_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 			} else {
+ 				qp->s_state = OP(FETCH_ADD);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 				ohdr->u.atomic_eth.compare_data = 0;
+ 			}
+ 			ohdr->u.atomic_eth.vaddr[0] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr >> 32);
++				wqe->atomic_wr.remote_addr >> 32);
+ 			ohdr->u.atomic_eth.vaddr[1] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr);
++				wqe->atomic_wr.remote_addr);
+ 			ohdr->u.atomic_eth.rkey = cpu_to_be32(
+-				wqe->wr.wr.atomic.rkey);
++				wqe->atomic_wr.rkey);
+ 			hwords += sizeof(struct ib_atomic_eth) / sizeof(u32);
+ 			ss = NULL;
+ 			len = 0;
+@@ -567,9 +567,9 @@ int ipath_make_rc_req(struct ipath_qp *qp)
+ 		ipath_init_restart(qp, wqe);
+ 		len = ((qp->s_psn - wqe->psn) & IPATH_PSN_MASK) * pmtu;
+ 		ohdr->u.rc.reth.vaddr =
+-			cpu_to_be64(wqe->wr.wr.rdma.remote_addr + len);
++			cpu_to_be64(wqe->rdma_wr.remote_addr + len);
+ 		ohdr->u.rc.reth.rkey =
+-			cpu_to_be32(wqe->wr.wr.rdma.rkey);
++			cpu_to_be32(wqe->rdma_wr.rkey);
+ 		ohdr->u.rc.reth.length = cpu_to_be32(qp->s_len);
+ 		qp->s_state = OP(RDMA_READ_REQUEST);
+ 		hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+diff --git a/drivers/infiniband/hw/ipath/ipath_ruc.c b/drivers/infiniband/hw/ipath/ipath_ruc.c
+index 1f95bbaf7602..46af8b03d3d4 100644
+--- a/drivers/infiniband/hw/ipath/ipath_ruc.c
++++ b/drivers/infiniband/hw/ipath/ipath_ruc.c
+@@ -353,8 +353,8 @@ again:
+ 		if (wqe->length == 0)
+ 			break;
+ 		if (unlikely(!ipath_rkey_ok(qp, &qp->r_sge, wqe->length,
+-					    wqe->wr.wr.rdma.remote_addr,
+-					    wqe->wr.wr.rdma.rkey,
++					    wqe->rdma_wr.remote_addr,
++					    wqe->rdma_wr.rkey,
+ 					    IB_ACCESS_REMOTE_WRITE)))
+ 			goto acc_err;
+ 		break;
+@@ -363,8 +363,8 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+ 			goto inv_err;
+ 		if (unlikely(!ipath_rkey_ok(qp, &sqp->s_sge, wqe->length,
+-					    wqe->wr.wr.rdma.remote_addr,
+-					    wqe->wr.wr.rdma.rkey,
++					    wqe->rdma_wr.remote_addr,
++					    wqe->rdma_wr.rkey,
+ 					    IB_ACCESS_REMOTE_READ)))
+ 			goto acc_err;
+ 		qp->r_sge.sge = wqe->sg_list[0];
+@@ -377,18 +377,18 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto inv_err;
+ 		if (unlikely(!ipath_rkey_ok(qp, &qp->r_sge, sizeof(u64),
+-					    wqe->wr.wr.atomic.remote_addr,
+-					    wqe->wr.wr.atomic.rkey,
++					    wqe->atomic_wr.remote_addr,
++					    wqe->atomic_wr.rkey,
+ 					    IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto acc_err;
+ 		/* Perform atomic OP and save result. */
+ 		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+-		sdata = wqe->wr.wr.atomic.compare_add;
++		sdata = wqe->atomic_wr.compare_add;
+ 		*(u64 *) sqp->s_sge.sge.vaddr =
+ 			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ 			(u64) atomic64_add_return(sdata, maddr) - sdata :
+ 			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+-				      sdata, wqe->wr.wr.atomic.swap);
++				      sdata, wqe->atomic_wr.swap);
+ 		goto send_comp;
+ 
+ 	default:
+diff --git a/drivers/infiniband/hw/ipath/ipath_uc.c b/drivers/infiniband/hw/ipath/ipath_uc.c
+index 22e60998f1a7..0246b30280b9 100644
+--- a/drivers/infiniband/hw/ipath/ipath_uc.c
++++ b/drivers/infiniband/hw/ipath/ipath_uc.c
+@@ -126,9 +126,9 @@ int ipath_make_uc_req(struct ipath_qp *qp)
+ 		case IB_WR_RDMA_WRITE:
+ 		case IB_WR_RDMA_WRITE_WITH_IMM:
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / 4;
+ 			if (len > pmtu) {
+diff --git a/drivers/infiniband/hw/ipath/ipath_ud.c b/drivers/infiniband/hw/ipath/ipath_ud.c
+index e8a2a915251e..3ffc1565d03d 100644
+--- a/drivers/infiniband/hw/ipath/ipath_ud.c
++++ b/drivers/infiniband/hw/ipath/ipath_ud.c
+@@ -65,7 +65,7 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
+ 	u32 rlen;
+ 	u32 length;
+ 
+-	qp = ipath_lookup_qpn(&dev->qp_table, swqe->wr.wr.ud.remote_qpn);
++	qp = ipath_lookup_qpn(&dev->qp_table, swqe->ud_wr.remote_qpn);
+ 	if (!qp || !(ib_ipath_state_ops[qp->state] & IPATH_PROCESS_RECV_OK)) {
+ 		dev->n_pkt_drops++;
+ 		goto done;
+@@ -77,8 +77,8 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+ 	if (unlikely(qp->ibqp.qp_num &&
+-		     ((int) swqe->wr.wr.ud.remote_qkey < 0 ?
+-		      sqp->qkey : swqe->wr.wr.ud.remote_qkey) != qp->qkey)) {
++		     ((int) swqe->ud_wr.remote_qkey < 0 ?
++		      sqp->qkey : swqe->ud_wr.remote_qkey) != qp->qkey)) {
+ 		/* XXX OK to lose a count once in a while. */
+ 		dev->qkey_violations++;
+ 		dev->n_pkt_drops++;
+@@ -175,7 +175,7 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
+ 	} else
+ 		spin_unlock_irqrestore(&rq->lock, flags);
+ 
+-	ah_attr = &to_iah(swqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(swqe->ud_wr.ah)->attr;
+ 	if (ah_attr->ah_flags & IB_AH_GRH) {
+ 		ipath_copy_sge(&rsge, &ah_attr->grh, sizeof(struct ib_grh));
+ 		wc.wc_flags |= IB_WC_GRH;
+@@ -225,7 +225,7 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
+ 	wc.port_num = 1;
+ 	/* Signal completion event if the solicited bit is set. */
+ 	ipath_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+-		       swqe->wr.send_flags & IB_SEND_SOLICITED);
++		       swqe->ud_wr.wr.send_flags & IB_SEND_SOLICITED);
+ drop:
+ 	if (atomic_dec_and_test(&qp->refcount))
+ 		wake_up(&qp->wait);
+@@ -280,7 +280,7 @@ int ipath_make_ud_req(struct ipath_qp *qp)
+ 		next_cur = 0;
+ 
+ 	/* Construct the header. */
+-	ah_attr = &to_iah(wqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(wqe->ud_wr.ah)->attr;
+ 	if (ah_attr->dlid >= IPATH_MULTICAST_LID_BASE) {
+ 		if (ah_attr->dlid != IPATH_PERMISSIVE_LID)
+ 			dev->n_multicast_xmit++;
+@@ -322,7 +322,7 @@ int ipath_make_ud_req(struct ipath_qp *qp)
+ 	qp->s_wqe = wqe;
+ 	qp->s_sge.sge = wqe->sg_list[0];
+ 	qp->s_sge.sg_list = wqe->sg_list + 1;
+-	qp->s_sge.num_sge = wqe->wr.num_sge;
++	qp->s_sge.num_sge = wqe->ud_wr.wr.num_sge;
+ 
+ 	if (ah_attr->ah_flags & IB_AH_GRH) {
+ 		/* Header size in 32-bit words. */
+@@ -340,9 +340,9 @@ int ipath_make_ud_req(struct ipath_qp *qp)
+ 		lrh0 = IPATH_LRH_BTH;
+ 		ohdr = &qp->s_hdr.u.oth;
+ 	}
+-	if (wqe->wr.opcode == IB_WR_SEND_WITH_IMM) {
++	if (wqe->ud_wr.wr.opcode == IB_WR_SEND_WITH_IMM) {
+ 		qp->s_hdrwords++;
+-		ohdr->u.ud.imm_data = wqe->wr.ex.imm_data;
++		ohdr->u.ud.imm_data = wqe->ud_wr.wr.ex.imm_data;
+ 		bth0 = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE << 24;
+ 	} else
+ 		bth0 = IB_OPCODE_UD_SEND_ONLY << 24;
+@@ -360,7 +360,7 @@ int ipath_make_ud_req(struct ipath_qp *qp)
+ 		qp->s_hdr.lrh[3] = cpu_to_be16(lid);
+ 	} else
+ 		qp->s_hdr.lrh[3] = IB_LID_PERMISSIVE;
+-	if (wqe->wr.send_flags & IB_SEND_SOLICITED)
++	if (wqe->ud_wr.wr.send_flags & IB_SEND_SOLICITED)
+ 		bth0 |= 1 << 23;
+ 	bth0 |= extra_bytes << 20;
+ 	bth0 |= qp->ibqp.qp_type == IB_QPT_SMI ? IPATH_DEFAULT_P_KEY :
+@@ -372,14 +372,14 @@ int ipath_make_ud_req(struct ipath_qp *qp)
+ 	ohdr->bth[1] = ah_attr->dlid >= IPATH_MULTICAST_LID_BASE &&
+ 		ah_attr->dlid != IPATH_PERMISSIVE_LID ?
+ 		cpu_to_be32(IPATH_MULTICAST_QPN) :
+-		cpu_to_be32(wqe->wr.wr.ud.remote_qpn);
++		cpu_to_be32(wqe->ud_wr.remote_qpn);
+ 	ohdr->bth[2] = cpu_to_be32(qp->s_next_psn++ & IPATH_PSN_MASK);
+ 	/*
+ 	 * Qkeys with the high order bit set mean use the
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+-	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->wr.wr.ud.remote_qkey < 0 ?
+-					 qp->qkey : wqe->wr.wr.ud.remote_qkey);
++	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
++					 qp->qkey : wqe->ud_wr.remote_qkey);
+ 	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+ 
+ done:
+diff --git a/drivers/infiniband/hw/ipath/ipath_verbs.c b/drivers/infiniband/hw/ipath/ipath_verbs.c
+index ed2bbc2f7eae..15633ec1843f 100644
+--- a/drivers/infiniband/hw/ipath/ipath_verbs.c
++++ b/drivers/infiniband/hw/ipath/ipath_verbs.c
+@@ -374,7 +374,7 @@ static int ipath_post_one_send(struct ipath_qp *qp, struct ib_send_wr *wr)
+ 		    wr->opcode != IB_WR_SEND_WITH_IMM)
+ 			goto bail_inval;
+ 		/* Check UD destination address PD */
+-		if (qp->ibqp.pd != wr->wr.ud.ah->pd)
++		if (qp->ibqp.pd != ud_wr(wr)->ah->pd)
+ 			goto bail_inval;
+ 	} else if ((unsigned) wr->opcode > IB_WR_ATOMIC_FETCH_AND_ADD)
+ 		goto bail_inval;
+@@ -395,7 +395,23 @@ static int ipath_post_one_send(struct ipath_qp *qp, struct ib_send_wr *wr)
+ 	}
+ 
+ 	wqe = get_swqe_ptr(qp, qp->s_head);
+-	wqe->wr = *wr;
++
++	if (qp->ibqp.qp_type != IB_QPT_UC &&
++	    qp->ibqp.qp_type != IB_QPT_RC)
++		memcpy(&wqe->ud_wr, ud_wr(wr), sizeof(wqe->ud_wr));
++	else if (wr->opcode == IB_WR_FAST_REG_MR)
++		memcpy(&wqe->fast_reg_wr, fast_reg_wr(wr),
++			sizeof(wqe->fast_reg_wr));
++	else if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
++		 wr->opcode == IB_WR_RDMA_WRITE ||
++		 wr->opcode == IB_WR_RDMA_READ)
++		memcpy(&wqe->rdma_wr, rdma_wr(wr), sizeof(wqe->rdma_wr));
++	else if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
++		 wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
++		memcpy(&wqe->atomic_wr, atomic_wr(wr), sizeof(wqe->atomic_wr));
++	else
++		memcpy(&wqe->wr, wr, sizeof(wqe->wr));
++
+ 	wqe->length = 0;
+ 	if (wr->num_sge) {
+ 		acc = wr->opcode >= IB_WR_RDMA_READ ?
+diff --git a/drivers/infiniband/hw/ipath/ipath_verbs.h b/drivers/infiniband/hw/ipath/ipath_verbs.h
+index ec167e545e15..ed102a26ec08 100644
+--- a/drivers/infiniband/hw/ipath/ipath_verbs.h
++++ b/drivers/infiniband/hw/ipath/ipath_verbs.h
+@@ -277,7 +277,14 @@ struct ipath_mr {
+  * in qp->s_max_sge.
+  */
+ struct ipath_swqe {
+-	struct ib_send_wr wr;	/* don't use wr.sg_list */
++	union {
++		struct ib_send_wr wr;   /* don't use wr.sg_list */
++		struct ib_ud_wr ud_wr;
++		struct ib_fast_reg_wr fast_reg_wr;
++		struct ib_rdma_wr rdma_wr;
++		struct ib_atomic_wr atomic_wr;
++	};
++
+ 	u32 psn;		/* first packet sequence number */
+ 	u32 lpsn;		/* last packet sequence number */
+ 	u32 ssn;		/* send sequence number */
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 1cd75ff02251..5f2de2ed5598 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -457,7 +457,8 @@ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 			  struct ib_grh *grh, struct ib_mad *mad)
+ {
+ 	struct ib_sge list;
+-	struct ib_send_wr wr, *bad_wr;
++	struct ib_ud_wr wr;
++	struct ib_send_wr *bad_wr;
+ 	struct mlx4_ib_demux_pv_ctx *tun_ctx;
+ 	struct mlx4_ib_demux_pv_qp *tun_qp;
+ 	struct mlx4_rcv_tunnel_mad *tun_mad;
+@@ -582,18 +583,18 @@ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 	list.length = sizeof (struct mlx4_rcv_tunnel_mad);
+ 	list.lkey = tun_ctx->pd->local_dma_lkey;
+ 
+-	wr.wr.ud.ah = ah;
+-	wr.wr.ud.port_num = port;
+-	wr.wr.ud.remote_qkey = IB_QP_SET_QKEY;
+-	wr.wr.ud.remote_qpn = dqpn;
+-	wr.next = NULL;
+-	wr.wr_id = ((u64) tun_tx_ix) | MLX4_TUN_SET_WRID_QPN(dest_qpt);
+-	wr.sg_list = &list;
+-	wr.num_sge = 1;
+-	wr.opcode = IB_WR_SEND;
+-	wr.send_flags = IB_SEND_SIGNALED;
+-
+-	ret = ib_post_send(src_qp, &wr, &bad_wr);
++	wr.ah = ah;
++	wr.port_num = port;
++	wr.remote_qkey = IB_QP_SET_QKEY;
++	wr.remote_qpn = dqpn;
++	wr.wr.next = NULL;
++	wr.wr.wr_id = ((u64) tun_tx_ix) | MLX4_TUN_SET_WRID_QPN(dest_qpt);
++	wr.wr.sg_list = &list;
++	wr.wr.num_sge = 1;
++	wr.wr.opcode = IB_WR_SEND;
++	wr.wr.send_flags = IB_SEND_SIGNALED;
++
++	ret = ib_post_send(src_qp, &wr.wr, &bad_wr);
+ out:
+ 	if (ret)
+ 		ib_destroy_ah(ah);
+@@ -1175,7 +1176,8 @@ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 			 u8 *s_mac, struct ib_mad *mad)
+ {
+ 	struct ib_sge list;
+-	struct ib_send_wr wr, *bad_wr;
++	struct ib_ud_wr wr;
++	struct ib_send_wr *bad_wr;
+ 	struct mlx4_ib_demux_pv_ctx *sqp_ctx;
+ 	struct mlx4_ib_demux_pv_qp *sqp;
+ 	struct mlx4_mad_snd_buf *sqp_mad;
+@@ -1246,22 +1248,22 @@ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 	list.length = sizeof (struct mlx4_mad_snd_buf);
+ 	list.lkey = sqp_ctx->pd->local_dma_lkey;
+ 
+-	wr.wr.ud.ah = ah;
+-	wr.wr.ud.port_num = port;
+-	wr.wr.ud.pkey_index = wire_pkey_ix;
+-	wr.wr.ud.remote_qkey = qkey;
+-	wr.wr.ud.remote_qpn = remote_qpn;
+-	wr.next = NULL;
+-	wr.wr_id = ((u64) wire_tx_ix) | MLX4_TUN_SET_WRID_QPN(src_qpnum);
+-	wr.sg_list = &list;
+-	wr.num_sge = 1;
+-	wr.opcode = IB_WR_SEND;
+-	wr.send_flags = IB_SEND_SIGNALED;
++	wr.ah = ah;
++	wr.port_num = port;
++	wr.pkey_index = wire_pkey_ix;
++	wr.remote_qkey = qkey;
++	wr.remote_qpn = remote_qpn;
++	wr.wr.next = NULL;
++	wr.wr.wr_id = ((u64) wire_tx_ix) | MLX4_TUN_SET_WRID_QPN(src_qpnum);
++	wr.wr.sg_list = &list;
++	wr.wr.num_sge = 1;
++	wr.wr.opcode = IB_WR_SEND;
++	wr.wr.send_flags = IB_SEND_SIGNALED;
+ 	if (s_mac)
+ 		memcpy(to_mah(ah)->av.eth.s_mac, s_mac, 6);
+ 
+ 
+-	ret = ib_post_send(send_qp, &wr, &bad_wr);
++	ret = ib_post_send(send_qp, &wr.wr, &bad_wr);
+ out:
+ 	if (ret)
+ 		ib_destroy_ah(ah);
+diff --git a/drivers/infiniband/hw/mlx4/mr.c b/drivers/infiniband/hw/mlx4/mr.c
+index 2542fd3c1a49..5bba176e9dfa 100644
+--- a/drivers/infiniband/hw/mlx4/mr.c
++++ b/drivers/infiniband/hw/mlx4/mr.c
+@@ -321,21 +321,21 @@ err_free:
+ int mlx4_ib_bind_mw(struct ib_qp *qp, struct ib_mw *mw,
+ 		    struct ib_mw_bind *mw_bind)
+ {
+-	struct ib_send_wr  wr;
++	struct ib_bind_mw_wr  wr;
+ 	struct ib_send_wr *bad_wr;
+ 	int ret;
+ 
+ 	memset(&wr, 0, sizeof(wr));
+-	wr.opcode               = IB_WR_BIND_MW;
+-	wr.wr_id                = mw_bind->wr_id;
+-	wr.send_flags           = mw_bind->send_flags;
+-	wr.wr.bind_mw.mw        = mw;
+-	wr.wr.bind_mw.bind_info = mw_bind->bind_info;
+-	wr.wr.bind_mw.rkey      = ib_inc_rkey(mw->rkey);
+-
+-	ret = mlx4_ib_post_send(qp, &wr, &bad_wr);
++	wr.wr.opcode		= IB_WR_BIND_MW;
++	wr.wr.wr_id		= mw_bind->wr_id;
++	wr.wr.send_flags	= mw_bind->send_flags;
++	wr.mw			= mw;
++	wr.bind_info		= mw_bind->bind_info;
++	wr.rkey			= ib_inc_rkey(mw->rkey);
++
++	ret = mlx4_ib_post_send(qp, &wr.wr, &bad_wr);
+ 	if (!ret)
+-		mw->rkey = wr.wr.bind_mw.rkey;
++		mw->rkey = wr.rkey;
+ 
+ 	return ret;
+ }
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index c5a3a5f0de41..2ba401e39052 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2032,14 +2032,14 @@ static int vf_get_qp0_qkey(struct mlx4_dev *dev, int qpn, u32 *qkey)
+ }
+ 
+ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
+-				  struct ib_send_wr *wr,
++				  struct ib_ud_wr *wr,
+ 				  void *wqe, unsigned *mlx_seg_len)
+ {
+ 	struct mlx4_ib_dev *mdev = to_mdev(sqp->qp.ibqp.device);
+ 	struct ib_device *ib_dev = &mdev->ib_dev;
+ 	struct mlx4_wqe_mlx_seg *mlx = wqe;
+ 	struct mlx4_wqe_inline_seg *inl = wqe + sizeof *mlx;
+-	struct mlx4_ib_ah *ah = to_mah(wr->wr.ud.ah);
++	struct mlx4_ib_ah *ah = to_mah(wr->ah);
+ 	u16 pkey;
+ 	u32 qkey;
+ 	int send_size;
+@@ -2047,13 +2047,13 @@ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
+ 	int spc;
+ 	int i;
+ 
+-	if (wr->opcode != IB_WR_SEND)
++	if (wr->wr.opcode != IB_WR_SEND)
+ 		return -EINVAL;
+ 
+ 	send_size = 0;
+ 
+-	for (i = 0; i < wr->num_sge; ++i)
+-		send_size += wr->sg_list[i].length;
++	for (i = 0; i < wr->wr.num_sge; ++i)
++		send_size += wr->wr.sg_list[i].length;
+ 
+ 	/* for proxy-qp0 sends, need to add in size of tunnel header */
+ 	/* for tunnel-qp0 sends, tunnel header is already in s/g list */
+@@ -2078,11 +2078,11 @@ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
+ 	mlx->rlid = sqp->ud_header.lrh.destination_lid;
+ 
+ 	sqp->ud_header.lrh.virtual_lane    = 0;
+-	sqp->ud_header.bth.solicited_event = !!(wr->send_flags & IB_SEND_SOLICITED);
++	sqp->ud_header.bth.solicited_event = !!(wr->wr.send_flags & IB_SEND_SOLICITED);
+ 	ib_get_cached_pkey(ib_dev, sqp->qp.port, 0, &pkey);
+ 	sqp->ud_header.bth.pkey = cpu_to_be16(pkey);
+ 	if (sqp->qp.mlx4_ib_qp_type == MLX4_IB_QPT_TUN_SMI_OWNER)
+-		sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->wr.ud.remote_qpn);
++		sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->remote_qpn);
+ 	else
+ 		sqp->ud_header.bth.destination_qpn =
+ 			cpu_to_be32(mdev->dev->caps.qp0_tunnel[sqp->qp.port - 1]);
+@@ -2154,14 +2154,14 @@ static void mlx4_u64_to_smac(u8 *dst_mac, u64 src_mac)
+ 	}
+ }
+ 
+-static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
++static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_ud_wr *wr,
+ 			    void *wqe, unsigned *mlx_seg_len)
+ {
+ 	struct ib_device *ib_dev = sqp->qp.ibqp.device;
+ 	struct mlx4_wqe_mlx_seg *mlx = wqe;
+ 	struct mlx4_wqe_ctrl_seg *ctrl = wqe;
+ 	struct mlx4_wqe_inline_seg *inl = wqe + sizeof *mlx;
+-	struct mlx4_ib_ah *ah = to_mah(wr->wr.ud.ah);
++	struct mlx4_ib_ah *ah = to_mah(wr->ah);
+ 	union ib_gid sgid;
+ 	u16 pkey;
+ 	int send_size;
+@@ -2175,8 +2175,8 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 	bool is_grh;
+ 
+ 	send_size = 0;
+-	for (i = 0; i < wr->num_sge; ++i)
+-		send_size += wr->sg_list[i].length;
++	for (i = 0; i < wr->wr.num_sge; ++i)
++		send_size += wr->wr.sg_list[i].length;
+ 
+ 	is_eth = rdma_port_get_link_layer(sqp->qp.ibqp.device, sqp->qp.port) == IB_LINK_LAYER_ETHERNET;
+ 	is_grh = mlx4_ib_ah_grh_present(ah);
+@@ -2253,7 +2253,7 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 		mlx->rlid = sqp->ud_header.lrh.destination_lid;
+ 	}
+ 
+-	switch (wr->opcode) {
++	switch (wr->wr.opcode) {
+ 	case IB_WR_SEND:
+ 		sqp->ud_header.bth.opcode	 = IB_OPCODE_UD_SEND_ONLY;
+ 		sqp->ud_header.immediate_present = 0;
+@@ -2261,7 +2261,7 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 	case IB_WR_SEND_WITH_IMM:
+ 		sqp->ud_header.bth.opcode	 = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE;
+ 		sqp->ud_header.immediate_present = 1;
+-		sqp->ud_header.immediate_data    = wr->ex.imm_data;
++		sqp->ud_header.immediate_data    = wr->wr.ex.imm_data;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -2304,16 +2304,16 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+ 		if (sqp->ud_header.lrh.destination_lid == IB_LID_PERMISSIVE)
+ 			sqp->ud_header.lrh.source_lid = IB_LID_PERMISSIVE;
+ 	}
+-	sqp->ud_header.bth.solicited_event = !!(wr->send_flags & IB_SEND_SOLICITED);
++	sqp->ud_header.bth.solicited_event = !!(wr->wr.send_flags & IB_SEND_SOLICITED);
+ 	if (!sqp->qp.ibqp.qp_num)
+ 		ib_get_cached_pkey(ib_dev, sqp->qp.port, sqp->pkey_index, &pkey);
+ 	else
+-		ib_get_cached_pkey(ib_dev, sqp->qp.port, wr->wr.ud.pkey_index, &pkey);
++		ib_get_cached_pkey(ib_dev, sqp->qp.port, wr->pkey_index, &pkey);
+ 	sqp->ud_header.bth.pkey = cpu_to_be16(pkey);
+-	sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->wr.ud.remote_qpn);
++	sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->remote_qpn);
+ 	sqp->ud_header.bth.psn = cpu_to_be32((sqp->send_psn++) & ((1 << 24) - 1));
+-	sqp->ud_header.deth.qkey = cpu_to_be32(wr->wr.ud.remote_qkey & 0x80000000 ?
+-					       sqp->qkey : wr->wr.ud.remote_qkey);
++	sqp->ud_header.deth.qkey = cpu_to_be32(wr->remote_qkey & 0x80000000 ?
++					       sqp->qkey : wr->remote_qkey);
+ 	sqp->ud_header.deth.source_qpn = cpu_to_be32(sqp->qp.ibqp.qp_num);
+ 
+ 	header_size = ib_ud_header_pack(&sqp->ud_header, sqp->header_buf);
+@@ -2401,43 +2401,45 @@ static __be32 convert_access(int acc)
+ 		cpu_to_be32(MLX4_WQE_FMR_PERM_LOCAL_READ);
+ }
+ 
+-static void set_fmr_seg(struct mlx4_wqe_fmr_seg *fseg, struct ib_send_wr *wr)
++static void set_fmr_seg(struct mlx4_wqe_fmr_seg *fseg,
++		struct ib_fast_reg_wr *wr)
+ {
+-	struct mlx4_ib_fast_reg_page_list *mfrpl = to_mfrpl(wr->wr.fast_reg.page_list);
++	struct mlx4_ib_fast_reg_page_list *mfrpl = to_mfrpl(wr->page_list);
+ 	int i;
+ 
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; ++i)
++	for (i = 0; i < wr->page_list_len; ++i)
+ 		mfrpl->mapped_page_list[i] =
+-			cpu_to_be64(wr->wr.fast_reg.page_list->page_list[i] |
++			cpu_to_be64(wr->page_list->page_list[i] |
+ 				    MLX4_MTT_FLAG_PRESENT);
+ 
+-	fseg->flags		= convert_access(wr->wr.fast_reg.access_flags);
+-	fseg->mem_key		= cpu_to_be32(wr->wr.fast_reg.rkey);
++	fseg->flags		= convert_access(wr->access_flags);
++	fseg->mem_key		= cpu_to_be32(wr->rkey);
+ 	fseg->buf_list		= cpu_to_be64(mfrpl->map);
+-	fseg->start_addr	= cpu_to_be64(wr->wr.fast_reg.iova_start);
+-	fseg->reg_len		= cpu_to_be64(wr->wr.fast_reg.length);
++	fseg->start_addr	= cpu_to_be64(wr->iova_start);
++	fseg->reg_len		= cpu_to_be64(wr->length);
+ 	fseg->offset		= 0; /* XXX -- is this just for ZBVA? */
+-	fseg->page_size		= cpu_to_be32(wr->wr.fast_reg.page_shift);
++	fseg->page_size		= cpu_to_be32(wr->page_shift);
+ 	fseg->reserved[0]	= 0;
+ 	fseg->reserved[1]	= 0;
+ }
+ 
+-static void set_bind_seg(struct mlx4_wqe_bind_seg *bseg, struct ib_send_wr *wr)
++static void set_bind_seg(struct mlx4_wqe_bind_seg *bseg,
++		struct ib_bind_mw_wr *wr)
+ {
+ 	bseg->flags1 =
+-		convert_access(wr->wr.bind_mw.bind_info.mw_access_flags) &
++		convert_access(wr->bind_info.mw_access_flags) &
+ 		cpu_to_be32(MLX4_WQE_FMR_AND_BIND_PERM_REMOTE_READ  |
+ 			    MLX4_WQE_FMR_AND_BIND_PERM_REMOTE_WRITE |
+ 			    MLX4_WQE_FMR_AND_BIND_PERM_ATOMIC);
+ 	bseg->flags2 = 0;
+-	if (wr->wr.bind_mw.mw->type == IB_MW_TYPE_2)
++	if (wr->mw->type == IB_MW_TYPE_2)
+ 		bseg->flags2 |= cpu_to_be32(MLX4_WQE_BIND_TYPE_2);
+-	if (wr->wr.bind_mw.bind_info.mw_access_flags & IB_ZERO_BASED)
++	if (wr->bind_info.mw_access_flags & IB_ZERO_BASED)
+ 		bseg->flags2 |= cpu_to_be32(MLX4_WQE_BIND_ZERO_BASED);
+-	bseg->new_rkey = cpu_to_be32(wr->wr.bind_mw.rkey);
+-	bseg->lkey = cpu_to_be32(wr->wr.bind_mw.bind_info.mr->lkey);
+-	bseg->addr = cpu_to_be64(wr->wr.bind_mw.bind_info.addr);
+-	bseg->length = cpu_to_be64(wr->wr.bind_mw.bind_info.length);
++	bseg->new_rkey = cpu_to_be32(wr->rkey);
++	bseg->lkey = cpu_to_be32(wr->bind_info.mr->lkey);
++	bseg->addr = cpu_to_be64(wr->bind_info.addr);
++	bseg->length = cpu_to_be64(wr->bind_info.length);
+ }
+ 
+ static void set_local_inv_seg(struct mlx4_wqe_local_inval_seg *iseg, u32 rkey)
+@@ -2454,46 +2456,47 @@ static __always_inline void set_raddr_seg(struct mlx4_wqe_raddr_seg *rseg,
+ 	rseg->reserved = 0;
+ }
+ 
+-static void set_atomic_seg(struct mlx4_wqe_atomic_seg *aseg, struct ib_send_wr *wr)
++static void set_atomic_seg(struct mlx4_wqe_atomic_seg *aseg,
++		struct ib_atomic_wr *wr)
+ {
+-	if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+-		aseg->swap_add = cpu_to_be64(wr->wr.atomic.swap);
+-		aseg->compare  = cpu_to_be64(wr->wr.atomic.compare_add);
+-	} else if (wr->opcode == IB_WR_MASKED_ATOMIC_FETCH_AND_ADD) {
+-		aseg->swap_add = cpu_to_be64(wr->wr.atomic.compare_add);
+-		aseg->compare  = cpu_to_be64(wr->wr.atomic.compare_add_mask);
++	if (wr->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
++		aseg->swap_add = cpu_to_be64(wr->swap);
++		aseg->compare  = cpu_to_be64(wr->compare_add);
++	} else if (wr->wr.opcode == IB_WR_MASKED_ATOMIC_FETCH_AND_ADD) {
++		aseg->swap_add = cpu_to_be64(wr->compare_add);
++		aseg->compare  = cpu_to_be64(wr->compare_add_mask);
+ 	} else {
+-		aseg->swap_add = cpu_to_be64(wr->wr.atomic.compare_add);
++		aseg->swap_add = cpu_to_be64(wr->compare_add);
+ 		aseg->compare  = 0;
+ 	}
+ 
+ }
+ 
+ static void set_masked_atomic_seg(struct mlx4_wqe_masked_atomic_seg *aseg,
+-				  struct ib_send_wr *wr)
++				  struct ib_atomic_wr *wr)
+ {
+-	aseg->swap_add		= cpu_to_be64(wr->wr.atomic.swap);
+-	aseg->swap_add_mask	= cpu_to_be64(wr->wr.atomic.swap_mask);
+-	aseg->compare		= cpu_to_be64(wr->wr.atomic.compare_add);
+-	aseg->compare_mask	= cpu_to_be64(wr->wr.atomic.compare_add_mask);
++	aseg->swap_add		= cpu_to_be64(wr->swap);
++	aseg->swap_add_mask	= cpu_to_be64(wr->swap_mask);
++	aseg->compare		= cpu_to_be64(wr->compare_add);
++	aseg->compare_mask	= cpu_to_be64(wr->compare_add_mask);
+ }
+ 
+ static void set_datagram_seg(struct mlx4_wqe_datagram_seg *dseg,
+-			     struct ib_send_wr *wr)
++			     struct ib_ud_wr *wr)
+ {
+-	memcpy(dseg->av, &to_mah(wr->wr.ud.ah)->av, sizeof (struct mlx4_av));
+-	dseg->dqpn = cpu_to_be32(wr->wr.ud.remote_qpn);
+-	dseg->qkey = cpu_to_be32(wr->wr.ud.remote_qkey);
+-	dseg->vlan = to_mah(wr->wr.ud.ah)->av.eth.vlan;
+-	memcpy(dseg->mac, to_mah(wr->wr.ud.ah)->av.eth.mac, 6);
++	memcpy(dseg->av, &to_mah(wr->ah)->av, sizeof (struct mlx4_av));
++	dseg->dqpn = cpu_to_be32(wr->remote_qpn);
++	dseg->qkey = cpu_to_be32(wr->remote_qkey);
++	dseg->vlan = to_mah(wr->ah)->av.eth.vlan;
++	memcpy(dseg->mac, to_mah(wr->ah)->av.eth.mac, 6);
+ }
+ 
+ static void set_tunnel_datagram_seg(struct mlx4_ib_dev *dev,
+ 				    struct mlx4_wqe_datagram_seg *dseg,
+-				    struct ib_send_wr *wr,
++				    struct ib_ud_wr *wr,
+ 				    enum mlx4_ib_qp_type qpt)
+ {
+-	union mlx4_ext_av *av = &to_mah(wr->wr.ud.ah)->av;
++	union mlx4_ext_av *av = &to_mah(wr->ah)->av;
+ 	struct mlx4_av sqp_av = {0};
+ 	int port = *((u8 *) &av->ib.port_pd) & 0x3;
+ 
+@@ -2512,18 +2515,18 @@ static void set_tunnel_datagram_seg(struct mlx4_ib_dev *dev,
+ 	dseg->qkey = cpu_to_be32(IB_QP_SET_QKEY);
+ }
+ 
+-static void build_tunnel_header(struct ib_send_wr *wr, void *wqe, unsigned *mlx_seg_len)
++static void build_tunnel_header(struct ib_ud_wr *wr, void *wqe, unsigned *mlx_seg_len)
+ {
+ 	struct mlx4_wqe_inline_seg *inl = wqe;
+ 	struct mlx4_ib_tunnel_header hdr;
+-	struct mlx4_ib_ah *ah = to_mah(wr->wr.ud.ah);
++	struct mlx4_ib_ah *ah = to_mah(wr->ah);
+ 	int spc;
+ 	int i;
+ 
+ 	memcpy(&hdr.av, &ah->av, sizeof hdr.av);
+-	hdr.remote_qpn = cpu_to_be32(wr->wr.ud.remote_qpn);
+-	hdr.pkey_index = cpu_to_be16(wr->wr.ud.pkey_index);
+-	hdr.qkey = cpu_to_be32(wr->wr.ud.remote_qkey);
++	hdr.remote_qpn = cpu_to_be32(wr->remote_qpn);
++	hdr.pkey_index = cpu_to_be16(wr->pkey_index);
++	hdr.qkey = cpu_to_be32(wr->remote_qkey);
+ 	memcpy(hdr.mac, ah->av.eth.mac, 6);
+ 	hdr.vlan = ah->av.eth.vlan;
+ 
+@@ -2595,22 +2598,22 @@ static void __set_data_seg(struct mlx4_wqe_data_seg *dseg, struct ib_sge *sg)
+ 	dseg->addr       = cpu_to_be64(sg->addr);
+ }
+ 
+-static int build_lso_seg(struct mlx4_wqe_lso_seg *wqe, struct ib_send_wr *wr,
++static int build_lso_seg(struct mlx4_wqe_lso_seg *wqe, struct ib_ud_wr *wr,
+ 			 struct mlx4_ib_qp *qp, unsigned *lso_seg_len,
+ 			 __be32 *lso_hdr_sz, __be32 *blh)
+ {
+-	unsigned halign = ALIGN(sizeof *wqe + wr->wr.ud.hlen, 16);
++	unsigned halign = ALIGN(sizeof *wqe + wr->hlen, 16);
+ 
+ 	if (unlikely(halign > MLX4_IB_CACHE_LINE_SIZE))
+ 		*blh = cpu_to_be32(1 << 6);
+ 
+ 	if (unlikely(!(qp->flags & MLX4_IB_QP_LSO) &&
+-		     wr->num_sge > qp->sq.max_gs - (halign >> 4)))
++		     wr->wr.num_sge > qp->sq.max_gs - (halign >> 4)))
+ 		return -EINVAL;
+ 
+-	memcpy(wqe->header, wr->wr.ud.header, wr->wr.ud.hlen);
++	memcpy(wqe->header, wr->header, wr->hlen);
+ 
+-	*lso_hdr_sz  = cpu_to_be32(wr->wr.ud.mss << 16 | wr->wr.ud.hlen);
++	*lso_hdr_sz  = cpu_to_be32(wr->mss << 16 | wr->hlen);
+ 	*lso_seg_len = halign;
+ 	return 0;
+ }
+@@ -2709,11 +2712,11 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_ATOMIC_CMP_AND_SWP:
+ 			case IB_WR_ATOMIC_FETCH_AND_ADD:
+ 			case IB_WR_MASKED_ATOMIC_FETCH_AND_ADD:
+-				set_raddr_seg(wqe, wr->wr.atomic.remote_addr,
+-					      wr->wr.atomic.rkey);
++				set_raddr_seg(wqe, atomic_wr(wr)->remote_addr,
++					      atomic_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mlx4_wqe_raddr_seg);
+ 
+-				set_atomic_seg(wqe, wr);
++				set_atomic_seg(wqe, atomic_wr(wr));
+ 				wqe  += sizeof (struct mlx4_wqe_atomic_seg);
+ 
+ 				size += (sizeof (struct mlx4_wqe_raddr_seg) +
+@@ -2722,11 +2725,11 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 				break;
+ 
+ 			case IB_WR_MASKED_ATOMIC_CMP_AND_SWP:
+-				set_raddr_seg(wqe, wr->wr.atomic.remote_addr,
+-					      wr->wr.atomic.rkey);
++				set_raddr_seg(wqe, atomic_wr(wr)->remote_addr,
++					      atomic_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mlx4_wqe_raddr_seg);
+ 
+-				set_masked_atomic_seg(wqe, wr);
++				set_masked_atomic_seg(wqe, atomic_wr(wr));
+ 				wqe  += sizeof (struct mlx4_wqe_masked_atomic_seg);
+ 
+ 				size += (sizeof (struct mlx4_wqe_raddr_seg) +
+@@ -2737,8 +2740,8 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_RDMA_READ:
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(wqe, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(wqe, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mlx4_wqe_raddr_seg);
+ 				size += sizeof (struct mlx4_wqe_raddr_seg) / 16;
+ 				break;
+@@ -2754,7 +2757,7 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_FAST_REG_MR:
+ 				ctrl->srcrb_flags |=
+ 					cpu_to_be32(MLX4_WQE_CTRL_STRONG_ORDER);
+-				set_fmr_seg(wqe, wr);
++				set_fmr_seg(wqe, fast_reg_wr(wr));
+ 				wqe  += sizeof (struct mlx4_wqe_fmr_seg);
+ 				size += sizeof (struct mlx4_wqe_fmr_seg) / 16;
+ 				break;
+@@ -2762,7 +2765,7 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_BIND_MW:
+ 				ctrl->srcrb_flags |=
+ 					cpu_to_be32(MLX4_WQE_CTRL_STRONG_ORDER);
+-				set_bind_seg(wqe, wr);
++				set_bind_seg(wqe, bind_mw_wr(wr));
+ 				wqe  += sizeof(struct mlx4_wqe_bind_seg);
+ 				size += sizeof(struct mlx4_wqe_bind_seg) / 16;
+ 				break;
+@@ -2773,7 +2776,8 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			break;
+ 
+ 		case MLX4_IB_QPT_TUN_SMI_OWNER:
+-			err =  build_sriov_qp0_header(to_msqp(qp), wr, ctrl, &seglen);
++			err =  build_sriov_qp0_header(to_msqp(qp), ud_wr(wr),
++					ctrl, &seglen);
+ 			if (unlikely(err)) {
+ 				*bad_wr = wr;
+ 				goto out;
+@@ -2784,19 +2788,20 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 		case MLX4_IB_QPT_TUN_SMI:
+ 		case MLX4_IB_QPT_TUN_GSI:
+ 			/* this is a UD qp used in MAD responses to slaves. */
+-			set_datagram_seg(wqe, wr);
++			set_datagram_seg(wqe, ud_wr(wr));
+ 			/* set the forced-loopback bit in the data seg av */
+ 			*(__be32 *) wqe |= cpu_to_be32(0x80000000);
+ 			wqe  += sizeof (struct mlx4_wqe_datagram_seg);
+ 			size += sizeof (struct mlx4_wqe_datagram_seg) / 16;
+ 			break;
+ 		case MLX4_IB_QPT_UD:
+-			set_datagram_seg(wqe, wr);
++			set_datagram_seg(wqe, ud_wr(wr));
+ 			wqe  += sizeof (struct mlx4_wqe_datagram_seg);
+ 			size += sizeof (struct mlx4_wqe_datagram_seg) / 16;
+ 
+ 			if (wr->opcode == IB_WR_LSO) {
+-				err = build_lso_seg(wqe, wr, qp, &seglen, &lso_hdr_sz, &blh);
++				err = build_lso_seg(wqe, ud_wr(wr), qp, &seglen,
++						&lso_hdr_sz, &blh);
+ 				if (unlikely(err)) {
+ 					*bad_wr = wr;
+ 					goto out;
+@@ -2808,7 +2813,8 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			break;
+ 
+ 		case MLX4_IB_QPT_PROXY_SMI_OWNER:
+-			err = build_sriov_qp0_header(to_msqp(qp), wr, ctrl, &seglen);
++			err = build_sriov_qp0_header(to_msqp(qp), ud_wr(wr),
++					ctrl, &seglen);
+ 			if (unlikely(err)) {
+ 				*bad_wr = wr;
+ 				goto out;
+@@ -2819,7 +2825,7 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			add_zero_len_inline(wqe);
+ 			wqe += 16;
+ 			size++;
+-			build_tunnel_header(wr, wqe, &seglen);
++			build_tunnel_header(ud_wr(wr), wqe, &seglen);
+ 			wqe  += seglen;
+ 			size += seglen / 16;
+ 			break;
+@@ -2829,18 +2835,20 @@ int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			 * In this case we first add a UD segment targeting
+ 			 * the tunnel qp, and then add a header with address
+ 			 * information */
+-			set_tunnel_datagram_seg(to_mdev(ibqp->device), wqe, wr,
++			set_tunnel_datagram_seg(to_mdev(ibqp->device), wqe,
++						ud_wr(wr),
+ 						qp->mlx4_ib_qp_type);
+ 			wqe  += sizeof (struct mlx4_wqe_datagram_seg);
+ 			size += sizeof (struct mlx4_wqe_datagram_seg) / 16;
+-			build_tunnel_header(wr, wqe, &seglen);
++			build_tunnel_header(ud_wr(wr), wqe, &seglen);
+ 			wqe  += seglen;
+ 			size += seglen / 16;
+ 			break;
+ 
+ 		case MLX4_IB_QPT_SMI:
+ 		case MLX4_IB_QPT_GSI:
+-			err = build_mlx_header(to_msqp(qp), wr, ctrl, &seglen);
++			err = build_mlx_header(to_msqp(qp), ud_wr(wr), ctrl,
++					&seglen);
+ 			if (unlikely(err)) {
+ 				*bad_wr = wr;
+ 				goto out;
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 22123b79d550..29f3ecdbe790 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -245,6 +245,7 @@ enum mlx5_ib_qp_flags {
+ };
+ 
+ struct mlx5_umr_wr {
++	struct ib_send_wr		wr;
+ 	union {
+ 		u64			virt_addr;
+ 		u64			offset;
+@@ -257,6 +258,11 @@ struct mlx5_umr_wr {
+ 	u32				mkey;
+ };
+ 
++static inline struct mlx5_umr_wr *umr_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct mlx5_umr_wr, wr);
++}
++
+ struct mlx5_shared_mr_info {
+ 	int mr_id;
+ 	struct ib_umem		*umem;
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 54a15b5d336d..b30d4ae0fb61 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -687,7 +687,7 @@ static void prep_umr_reg_wqe(struct ib_pd *pd, struct ib_send_wr *wr,
+ 			     int access_flags)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
++	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ 
+ 	sg->addr = dma;
+ 	sg->length = ALIGN(sizeof(u64) * n, 64);
+@@ -715,7 +715,7 @@ static void prep_umr_reg_wqe(struct ib_pd *pd, struct ib_send_wr *wr,
+ static void prep_umr_unreg_wqe(struct mlx5_ib_dev *dev,
+ 			       struct ib_send_wr *wr, u32 key)
+ {
+-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
++	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ 
+ 	wr->send_flags = MLX5_IB_SEND_UMR_UNREG | MLX5_IB_SEND_UMR_FAIL_IF_FREE;
+ 	wr->opcode = MLX5_IB_WR_UMR;
+@@ -752,7 +752,8 @@ static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
+ 	struct device *ddev = dev->ib_dev.dma_device;
+ 	struct umr_common *umrc = &dev->umrc;
+ 	struct mlx5_ib_umr_context umr_context;
+-	struct ib_send_wr wr, *bad;
++	struct mlx5_umr_wr umrwr;
++	struct ib_send_wr *bad;
+ 	struct mlx5_ib_mr *mr;
+ 	struct ib_sge sg;
+ 	int size;
+@@ -798,14 +799,14 @@ static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
+ 		goto free_pas;
+ 	}
+ 
+-	memset(&wr, 0, sizeof(wr));
+-	wr.wr_id = (u64)(unsigned long)&umr_context;
+-	prep_umr_reg_wqe(pd, &wr, &sg, dma, npages, mr->mmr.key, page_shift,
+-			 virt_addr, len, access_flags);
++	memset(&umrwr, 0, sizeof(umrwr));
++	umrwr.wr.wr_id = (u64)(unsigned long)&umr_context;
++	prep_umr_reg_wqe(pd, &umrwr.wr, &sg, dma, npages, mr->mmr.key,
++			 page_shift, virt_addr, len, access_flags);
+ 
+ 	mlx5_ib_init_umr_context(&umr_context);
+ 	down(&umrc->sem);
+-	err = ib_post_send(umrc->qp, &wr, &bad);
++	err = ib_post_send(umrc->qp, &umrwr.wr, &bad);
+ 	if (err) {
+ 		mlx5_ib_warn(dev, "post send failed, err %d\n", err);
+ 		goto unmap_dma;
+@@ -851,8 +852,8 @@ int mlx5_ib_update_mtt(struct mlx5_ib_mr *mr, u64 start_page_index, int npages,
+ 	int size;
+ 	__be64 *pas;
+ 	dma_addr_t dma;
+-	struct ib_send_wr wr, *bad;
+-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr.wr.fast_reg;
++	struct ib_send_wr *bad;
++	struct mlx5_umr_wr wr;
+ 	struct ib_sge sg;
+ 	int err = 0;
+ 	const int page_index_alignment = MLX5_UMR_MTT_ALIGNMENT / sizeof(u64);
+@@ -917,26 +918,26 @@ int mlx5_ib_update_mtt(struct mlx5_ib_mr *mr, u64 start_page_index, int npages,
+ 		dma_sync_single_for_device(ddev, dma, size, DMA_TO_DEVICE);
+ 
+ 		memset(&wr, 0, sizeof(wr));
+-		wr.wr_id = (u64)(unsigned long)&umr_context;
++		wr.wr.wr_id = (u64)(unsigned long)&umr_context;
+ 
+ 		sg.addr = dma;
+ 		sg.length = ALIGN(npages * sizeof(u64),
+ 				MLX5_UMR_MTT_ALIGNMENT);
+ 		sg.lkey = dev->umrc.pd->local_dma_lkey;
+ 
+-		wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE |
++		wr.wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE |
+ 				MLX5_IB_SEND_UMR_UPDATE_MTT;
+-		wr.sg_list = &sg;
+-		wr.num_sge = 1;
+-		wr.opcode = MLX5_IB_WR_UMR;
+-		umrwr->npages = sg.length / sizeof(u64);
+-		umrwr->page_shift = PAGE_SHIFT;
+-		umrwr->mkey = mr->mmr.key;
+-		umrwr->target.offset = start_page_index;
++		wr.wr.sg_list = &sg;
++		wr.wr.num_sge = 1;
++		wr.wr.opcode = MLX5_IB_WR_UMR;
++		wr.npages = sg.length / sizeof(u64);
++		wr.page_shift = PAGE_SHIFT;
++		wr.mkey = mr->mmr.key;
++		wr.target.offset = start_page_index;
+ 
+ 		mlx5_ib_init_umr_context(&umr_context);
+ 		down(&umrc->sem);
+-		err = ib_post_send(umrc->qp, &wr, &bad);
++		err = ib_post_send(umrc->qp, &wr.wr, &bad);
+ 		if (err) {
+ 			mlx5_ib_err(dev, "UMR post send failed, err %d\n", err);
+ 		} else {
+@@ -1122,16 +1123,17 @@ static int unreg_umr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
+ {
+ 	struct umr_common *umrc = &dev->umrc;
+ 	struct mlx5_ib_umr_context umr_context;
+-	struct ib_send_wr wr, *bad;
++	struct mlx5_umr_wr umrwr;
++	struct ib_send_wr *bad;
+ 	int err;
+ 
+-	memset(&wr, 0, sizeof(wr));
+-	wr.wr_id = (u64)(unsigned long)&umr_context;
+-	prep_umr_unreg_wqe(dev, &wr, mr->mmr.key);
++	memset(&umrwr.wr, 0, sizeof(umrwr));
++	umrwr.wr.wr_id = (u64)(unsigned long)&umr_context;
++	prep_umr_unreg_wqe(dev, &umrwr.wr, mr->mmr.key);
+ 
+ 	mlx5_ib_init_umr_context(&umr_context);
+ 	down(&umrc->sem);
+-	err = ib_post_send(umrc->qp, &wr, &bad);
++	err = ib_post_send(umrc->qp, &umrwr.wr, &bad);
+ 	if (err) {
+ 		up(&umrc->sem);
+ 		mlx5_ib_dbg(dev, "err %d\n", err);
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 6f521a3418e8..d4c36af4270f 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1838,9 +1838,9 @@ static __always_inline void set_raddr_seg(struct mlx5_wqe_raddr_seg *rseg,
+ static void set_datagram_seg(struct mlx5_wqe_datagram_seg *dseg,
+ 			     struct ib_send_wr *wr)
+ {
+-	memcpy(&dseg->av, &to_mah(wr->wr.ud.ah)->av, sizeof(struct mlx5_av));
+-	dseg->av.dqp_dct = cpu_to_be32(wr->wr.ud.remote_qpn | MLX5_EXTENDED_UD_AV);
+-	dseg->av.key.qkey.qkey = cpu_to_be32(wr->wr.ud.remote_qkey);
++	memcpy(&dseg->av, &to_mah(ud_wr(wr)->ah)->av, sizeof(struct mlx5_av));
++	dseg->av.dqp_dct = cpu_to_be32(ud_wr(wr)->remote_qpn | MLX5_EXTENDED_UD_AV);
++	dseg->av.key.qkey.qkey = cpu_to_be32(ud_wr(wr)->remote_qkey);
+ }
+ 
+ static void set_data_ptr_seg(struct mlx5_wqe_data_seg *dseg, struct ib_sge *sg)
+@@ -1908,7 +1908,7 @@ static void set_frwr_umr_segment(struct mlx5_wqe_umr_ctrl_seg *umr,
+ 	}
+ 
+ 	umr->flags = (1 << 5); /* fail if not free */
+-	umr->klm_octowords = get_klm_octo(wr->wr.fast_reg.page_list_len);
++	umr->klm_octowords = get_klm_octo(fast_reg_wr(wr)->page_list_len);
+ 	umr->mkey_mask = frwr_mkey_mask();
+ }
+ 
+@@ -1952,7 +1952,7 @@ static __be64 get_umr_update_mtt_mask(void)
+ static void set_reg_umr_segment(struct mlx5_wqe_umr_ctrl_seg *umr,
+ 				struct ib_send_wr *wr)
+ {
+-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
++	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ 
+ 	memset(umr, 0, sizeof(*umr));
+ 
+@@ -1996,20 +1996,20 @@ static void set_mkey_segment(struct mlx5_mkey_seg *seg, struct ib_send_wr *wr,
+ 		return;
+ 	}
+ 
+-	seg->flags = get_umr_flags(wr->wr.fast_reg.access_flags) |
++	seg->flags = get_umr_flags(fast_reg_wr(wr)->access_flags) |
+ 		     MLX5_ACCESS_MODE_MTT;
+ 	*writ = seg->flags & (MLX5_PERM_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE);
+-	seg->qpn_mkey7_0 = cpu_to_be32((wr->wr.fast_reg.rkey & 0xff) | 0xffffff00);
++	seg->qpn_mkey7_0 = cpu_to_be32((fast_reg_wr(wr)->rkey & 0xff) | 0xffffff00);
+ 	seg->flags_pd = cpu_to_be32(MLX5_MKEY_REMOTE_INVAL);
+-	seg->start_addr = cpu_to_be64(wr->wr.fast_reg.iova_start);
+-	seg->len = cpu_to_be64(wr->wr.fast_reg.length);
+-	seg->xlt_oct_size = cpu_to_be32((wr->wr.fast_reg.page_list_len + 1) / 2);
+-	seg->log2_page_size = wr->wr.fast_reg.page_shift;
++	seg->start_addr = cpu_to_be64(fast_reg_wr(wr)->iova_start);
++	seg->len = cpu_to_be64(fast_reg_wr(wr)->length);
++	seg->xlt_oct_size = cpu_to_be32((fast_reg_wr(wr)->page_list_len + 1) / 2);
++	seg->log2_page_size = fast_reg_wr(wr)->page_shift;
+ }
+ 
+ static void set_reg_mkey_segment(struct mlx5_mkey_seg *seg, struct ib_send_wr *wr)
+ {
+-	struct mlx5_umr_wr *umrwr = (struct mlx5_umr_wr *)&wr->wr.fast_reg;
++	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ 
+ 	memset(seg, 0, sizeof(*seg));
+ 	if (wr->send_flags & MLX5_IB_SEND_UMR_UNREG) {
+@@ -2034,15 +2034,15 @@ static void set_frwr_pages(struct mlx5_wqe_data_seg *dseg,
+ 			   struct mlx5_ib_pd *pd,
+ 			   int writ)
+ {
+-	struct mlx5_ib_fast_reg_page_list *mfrpl = to_mfrpl(wr->wr.fast_reg.page_list);
+-	u64 *page_list = wr->wr.fast_reg.page_list->page_list;
++	struct mlx5_ib_fast_reg_page_list *mfrpl = to_mfrpl(fast_reg_wr(wr)->page_list);
++	u64 *page_list = fast_reg_wr(wr)->page_list->page_list;
+ 	u64 perm = MLX5_EN_RD | (writ ? MLX5_EN_WR : 0);
+ 	int i;
+ 
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++)
++	for (i = 0; i < fast_reg_wr(wr)->page_list_len; i++)
+ 		mfrpl->mapped_page_list[i] = cpu_to_be64(page_list[i] | perm);
+ 	dseg->addr = cpu_to_be64(mfrpl->map);
+-	dseg->byte_count = cpu_to_be32(ALIGN(sizeof(u64) * wr->wr.fast_reg.page_list_len, 64));
++	dseg->byte_count = cpu_to_be32(ALIGN(sizeof(u64) * fast_reg_wr(wr)->page_list_len, 64));
+ 	dseg->lkey = cpu_to_be32(pd->ibpd.local_dma_lkey);
+ }
+ 
+@@ -2224,22 +2224,22 @@ static int mlx5_set_bsf(struct ib_mr *sig_mr,
+ 	return 0;
+ }
+ 
+-static int set_sig_data_segment(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
+-				void **seg, int *size)
++static int set_sig_data_segment(struct ib_sig_handover_wr *wr,
++				struct mlx5_ib_qp *qp, void **seg, int *size)
+ {
+-	struct ib_sig_attrs *sig_attrs = wr->wr.sig_handover.sig_attrs;
+-	struct ib_mr *sig_mr = wr->wr.sig_handover.sig_mr;
++	struct ib_sig_attrs *sig_attrs = wr->sig_attrs;
++	struct ib_mr *sig_mr = wr->sig_mr;
+ 	struct mlx5_bsf *bsf;
+-	u32 data_len = wr->sg_list->length;
+-	u32 data_key = wr->sg_list->lkey;
+-	u64 data_va = wr->sg_list->addr;
++	u32 data_len = wr->wr.sg_list->length;
++	u32 data_key = wr->wr.sg_list->lkey;
++	u64 data_va = wr->wr.sg_list->addr;
+ 	int ret;
+ 	int wqe_size;
+ 
+-	if (!wr->wr.sig_handover.prot ||
+-	    (data_key == wr->wr.sig_handover.prot->lkey &&
+-	     data_va == wr->wr.sig_handover.prot->addr &&
+-	     data_len == wr->wr.sig_handover.prot->length)) {
++	if (!wr->prot ||
++	    (data_key == wr->prot->lkey &&
++	     data_va == wr->prot->addr &&
++	     data_len == wr->prot->length)) {
+ 		/**
+ 		 * Source domain doesn't contain signature information
+ 		 * or data and protection are interleaved in memory.
+@@ -2273,8 +2273,8 @@ static int set_sig_data_segment(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
+ 		struct mlx5_stride_block_ctrl_seg *sblock_ctrl;
+ 		struct mlx5_stride_block_entry *data_sentry;
+ 		struct mlx5_stride_block_entry *prot_sentry;
+-		u32 prot_key = wr->wr.sig_handover.prot->lkey;
+-		u64 prot_va = wr->wr.sig_handover.prot->addr;
++		u32 prot_key = wr->prot->lkey;
++		u64 prot_va = wr->prot->addr;
+ 		u16 block_size = sig_attrs->mem.sig.dif.pi_interval;
+ 		int prot_size;
+ 
+@@ -2326,16 +2326,16 @@ static int set_sig_data_segment(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
+ }
+ 
+ static void set_sig_mkey_segment(struct mlx5_mkey_seg *seg,
+-				 struct ib_send_wr *wr, u32 nelements,
++				 struct ib_sig_handover_wr *wr, u32 nelements,
+ 				 u32 length, u32 pdn)
+ {
+-	struct ib_mr *sig_mr = wr->wr.sig_handover.sig_mr;
++	struct ib_mr *sig_mr = wr->sig_mr;
+ 	u32 sig_key = sig_mr->rkey;
+ 	u8 sigerr = to_mmr(sig_mr)->sig->sigerr_count & 1;
+ 
+ 	memset(seg, 0, sizeof(*seg));
+ 
+-	seg->flags = get_umr_flags(wr->wr.sig_handover.access_flags) |
++	seg->flags = get_umr_flags(wr->access_flags) |
+ 				   MLX5_ACCESS_MODE_KLM;
+ 	seg->qpn_mkey7_0 = cpu_to_be32((sig_key & 0xff) | 0xffffff00);
+ 	seg->flags_pd = cpu_to_be32(MLX5_MKEY_REMOTE_INVAL | sigerr << 26 |
+@@ -2346,7 +2346,7 @@ static void set_sig_mkey_segment(struct mlx5_mkey_seg *seg,
+ }
+ 
+ static void set_sig_umr_segment(struct mlx5_wqe_umr_ctrl_seg *umr,
+-				struct ib_send_wr *wr, u32 nelements)
++				u32 nelements)
+ {
+ 	memset(umr, 0, sizeof(*umr));
+ 
+@@ -2357,37 +2357,37 @@ static void set_sig_umr_segment(struct mlx5_wqe_umr_ctrl_seg *umr,
+ }
+ 
+ 
+-static int set_sig_umr_wr(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
++static int set_sig_umr_wr(struct ib_send_wr *send_wr, struct mlx5_ib_qp *qp,
+ 			  void **seg, int *size)
+ {
+-	struct mlx5_ib_mr *sig_mr = to_mmr(wr->wr.sig_handover.sig_mr);
++	struct ib_sig_handover_wr *wr = sig_handover_wr(send_wr);
++	struct mlx5_ib_mr *sig_mr = to_mmr(wr->sig_mr);
+ 	u32 pdn = get_pd(qp)->pdn;
+ 	u32 klm_oct_size;
+ 	int region_len, ret;
+ 
+-	if (unlikely(wr->num_sge != 1) ||
+-	    unlikely(wr->wr.sig_handover.access_flags &
+-		     IB_ACCESS_REMOTE_ATOMIC) ||
++	if (unlikely(wr->wr.num_sge != 1) ||
++	    unlikely(wr->access_flags & IB_ACCESS_REMOTE_ATOMIC) ||
+ 	    unlikely(!sig_mr->sig) || unlikely(!qp->signature_en) ||
+ 	    unlikely(!sig_mr->sig->sig_status_checked))
+ 		return -EINVAL;
+ 
+ 	/* length of the protected region, data + protection */
+-	region_len = wr->sg_list->length;
+-	if (wr->wr.sig_handover.prot &&
+-	    (wr->wr.sig_handover.prot->lkey != wr->sg_list->lkey  ||
+-	     wr->wr.sig_handover.prot->addr != wr->sg_list->addr  ||
+-	     wr->wr.sig_handover.prot->length != wr->sg_list->length))
+-		region_len += wr->wr.sig_handover.prot->length;
++	region_len = wr->wr.sg_list->length;
++	if (wr->prot &&
++	    (wr->prot->lkey != wr->wr.sg_list->lkey  ||
++	     wr->prot->addr != wr->wr.sg_list->addr  ||
++	     wr->prot->length != wr->wr.sg_list->length))
++		region_len += wr->prot->length;
+ 
+ 	/**
+ 	 * KLM octoword size - if protection was provided
+ 	 * then we use strided block format (3 octowords),
+ 	 * else we use single KLM (1 octoword)
+ 	 **/
+-	klm_oct_size = wr->wr.sig_handover.prot ? 3 : 1;
++	klm_oct_size = wr->prot ? 3 : 1;
+ 
+-	set_sig_umr_segment(*seg, wr, klm_oct_size);
++	set_sig_umr_segment(*seg, klm_oct_size);
+ 	*seg += sizeof(struct mlx5_wqe_umr_ctrl_seg);
+ 	*size += sizeof(struct mlx5_wqe_umr_ctrl_seg) / 16;
+ 	if (unlikely((*seg == qp->sq.qend)))
+@@ -2454,8 +2454,8 @@ static int set_frwr_li_wr(void **seg, struct ib_send_wr *wr, int *size,
+ 	if (unlikely((*seg == qp->sq.qend)))
+ 		*seg = mlx5_get_send_wqe(qp, 0);
+ 	if (!li) {
+-		if (unlikely(wr->wr.fast_reg.page_list_len >
+-			     wr->wr.fast_reg.page_list->max_page_list_len))
++		if (unlikely(fast_reg_wr(wr)->page_list_len >
++			     fast_reg_wr(wr)->page_list->max_page_list_len))
+ 			return	-ENOMEM;
+ 
+ 		set_frwr_pages(*seg, wr, mdev, pd, writ);
+@@ -2636,8 +2636,8 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_RDMA_READ:
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(seg, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(seg, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				seg += sizeof(struct mlx5_wqe_raddr_seg);
+ 				size += sizeof(struct mlx5_wqe_raddr_seg) / 16;
+ 				break;
+@@ -2666,7 +2666,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_FAST_REG_MR:
+ 				next_fence = MLX5_FENCE_MODE_INITIATOR_SMALL;
+ 				qp->sq.wr_data[idx] = IB_WR_FAST_REG_MR;
+-				ctrl->imm = cpu_to_be32(wr->wr.fast_reg.rkey);
++				ctrl->imm = cpu_to_be32(fast_reg_wr(wr)->rkey);
+ 				err = set_frwr_li_wr(&seg, wr, &size, mdev, to_mpd(ibqp->pd), qp);
+ 				if (err) {
+ 					mlx5_ib_warn(dev, "\n");
+@@ -2678,7 +2678,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 
+ 			case IB_WR_REG_SIG_MR:
+ 				qp->sq.wr_data[idx] = IB_WR_REG_SIG_MR;
+-				mr = to_mmr(wr->wr.sig_handover.sig_mr);
++				mr = to_mmr(sig_handover_wr(wr)->sig_mr);
+ 
+ 				ctrl->imm = cpu_to_be32(mr->ibmr.rkey);
+ 				err = set_sig_umr_wr(wr, qp, &seg, &size);
+@@ -2706,7 +2706,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 					goto out;
+ 				}
+ 
+-				err = set_psv_wr(&wr->wr.sig_handover.sig_attrs->mem,
++				err = set_psv_wr(&sig_handover_wr(wr)->sig_attrs->mem,
+ 						 mr->sig->psv_memory.psv_idx, &seg,
+ 						 &size);
+ 				if (err) {
+@@ -2728,7 +2728,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 				}
+ 
+ 				next_fence = MLX5_FENCE_MODE_INITIATOR_SMALL;
+-				err = set_psv_wr(&wr->wr.sig_handover.sig_attrs->wire,
++				err = set_psv_wr(&sig_handover_wr(wr)->sig_attrs->wire,
+ 						 mr->sig->psv_wire.psv_idx, &seg,
+ 						 &size);
+ 				if (err) {
+@@ -2752,8 +2752,8 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			switch (wr->opcode) {
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(seg, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(seg, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				seg  += sizeof(struct mlx5_wqe_raddr_seg);
+ 				size += sizeof(struct mlx5_wqe_raddr_seg) / 16;
+ 				break;
+@@ -2780,7 +2780,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 				goto out;
+ 			}
+ 			qp->sq.wr_data[idx] = MLX5_IB_WR_UMR;
+-			ctrl->imm = cpu_to_be32(wr->wr.fast_reg.rkey);
++			ctrl->imm = cpu_to_be32(umr_wr(wr)->mkey);
+ 			set_reg_umr_segment(seg, wr);
+ 			seg += sizeof(struct mlx5_wqe_umr_ctrl_seg);
+ 			size += sizeof(struct mlx5_wqe_umr_ctrl_seg) / 16;
+diff --git a/drivers/infiniband/hw/mthca/mthca_qp.c b/drivers/infiniband/hw/mthca/mthca_qp.c
+index e354b2f04ad9..35fe506e2cfa 100644
+--- a/drivers/infiniband/hw/mthca/mthca_qp.c
++++ b/drivers/infiniband/hw/mthca/mthca_qp.c
+@@ -1476,7 +1476,7 @@ void mthca_free_qp(struct mthca_dev *dev,
+ 
+ /* Create UD header for an MLX send and build a data segment for it */
+ static int build_mlx_header(struct mthca_dev *dev, struct mthca_sqp *sqp,
+-			    int ind, struct ib_send_wr *wr,
++			    int ind, struct ib_ud_wr *wr,
+ 			    struct mthca_mlx_seg *mlx,
+ 			    struct mthca_data_seg *data)
+ {
+@@ -1485,10 +1485,10 @@ static int build_mlx_header(struct mthca_dev *dev, struct mthca_sqp *sqp,
+ 	u16 pkey;
+ 
+ 	ib_ud_header_init(256, /* assume a MAD */ 1, 0, 0,
+-			  mthca_ah_grh_present(to_mah(wr->wr.ud.ah)), 0,
++			  mthca_ah_grh_present(to_mah(wr->ah)), 0,
+ 			  &sqp->ud_header);
+ 
+-	err = mthca_read_ah(dev, to_mah(wr->wr.ud.ah), &sqp->ud_header);
++	err = mthca_read_ah(dev, to_mah(wr->ah), &sqp->ud_header);
+ 	if (err)
+ 		return err;
+ 	mlx->flags &= ~cpu_to_be32(MTHCA_NEXT_SOLICIT | 1);
+@@ -1499,7 +1499,7 @@ static int build_mlx_header(struct mthca_dev *dev, struct mthca_sqp *sqp,
+ 	mlx->rlid = sqp->ud_header.lrh.destination_lid;
+ 	mlx->vcrc = 0;
+ 
+-	switch (wr->opcode) {
++	switch (wr->wr.opcode) {
+ 	case IB_WR_SEND:
+ 		sqp->ud_header.bth.opcode = IB_OPCODE_UD_SEND_ONLY;
+ 		sqp->ud_header.immediate_present = 0;
+@@ -1507,7 +1507,7 @@ static int build_mlx_header(struct mthca_dev *dev, struct mthca_sqp *sqp,
+ 	case IB_WR_SEND_WITH_IMM:
+ 		sqp->ud_header.bth.opcode = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE;
+ 		sqp->ud_header.immediate_present = 1;
+-		sqp->ud_header.immediate_data = wr->ex.imm_data;
++		sqp->ud_header.immediate_data = wr->wr.ex.imm_data;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -1516,18 +1516,18 @@ static int build_mlx_header(struct mthca_dev *dev, struct mthca_sqp *sqp,
+ 	sqp->ud_header.lrh.virtual_lane    = !sqp->qp.ibqp.qp_num ? 15 : 0;
+ 	if (sqp->ud_header.lrh.destination_lid == IB_LID_PERMISSIVE)
+ 		sqp->ud_header.lrh.source_lid = IB_LID_PERMISSIVE;
+-	sqp->ud_header.bth.solicited_event = !!(wr->send_flags & IB_SEND_SOLICITED);
++	sqp->ud_header.bth.solicited_event = !!(wr->wr.send_flags & IB_SEND_SOLICITED);
+ 	if (!sqp->qp.ibqp.qp_num)
+ 		ib_get_cached_pkey(&dev->ib_dev, sqp->qp.port,
+ 				   sqp->pkey_index, &pkey);
+ 	else
+ 		ib_get_cached_pkey(&dev->ib_dev, sqp->qp.port,
+-				   wr->wr.ud.pkey_index, &pkey);
++				   wr->pkey_index, &pkey);
+ 	sqp->ud_header.bth.pkey = cpu_to_be16(pkey);
+-	sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->wr.ud.remote_qpn);
++	sqp->ud_header.bth.destination_qpn = cpu_to_be32(wr->remote_qpn);
+ 	sqp->ud_header.bth.psn = cpu_to_be32((sqp->send_psn++) & ((1 << 24) - 1));
+-	sqp->ud_header.deth.qkey = cpu_to_be32(wr->wr.ud.remote_qkey & 0x80000000 ?
+-					       sqp->qkey : wr->wr.ud.remote_qkey);
++	sqp->ud_header.deth.qkey = cpu_to_be32(wr->remote_qkey & 0x80000000 ?
++					       sqp->qkey : wr->remote_qkey);
+ 	sqp->ud_header.deth.source_qpn = cpu_to_be32(sqp->qp.ibqp.qp_num);
+ 
+ 	header_size = ib_ud_header_pack(&sqp->ud_header,
+@@ -1569,34 +1569,34 @@ static __always_inline void set_raddr_seg(struct mthca_raddr_seg *rseg,
+ }
+ 
+ static __always_inline void set_atomic_seg(struct mthca_atomic_seg *aseg,
+-					   struct ib_send_wr *wr)
++					   struct ib_atomic_wr *wr)
+ {
+-	if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+-		aseg->swap_add = cpu_to_be64(wr->wr.atomic.swap);
+-		aseg->compare  = cpu_to_be64(wr->wr.atomic.compare_add);
++	if (wr->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
++		aseg->swap_add = cpu_to_be64(wr->swap);
++		aseg->compare  = cpu_to_be64(wr->compare_add);
+ 	} else {
+-		aseg->swap_add = cpu_to_be64(wr->wr.atomic.compare_add);
++		aseg->swap_add = cpu_to_be64(wr->compare_add);
+ 		aseg->compare  = 0;
+ 	}
+ 
+ }
+ 
+ static void set_tavor_ud_seg(struct mthca_tavor_ud_seg *useg,
+-			     struct ib_send_wr *wr)
++			     struct ib_ud_wr *wr)
+ {
+-	useg->lkey    = cpu_to_be32(to_mah(wr->wr.ud.ah)->key);
+-	useg->av_addr =	cpu_to_be64(to_mah(wr->wr.ud.ah)->avdma);
+-	useg->dqpn    =	cpu_to_be32(wr->wr.ud.remote_qpn);
+-	useg->qkey    =	cpu_to_be32(wr->wr.ud.remote_qkey);
++	useg->lkey    = cpu_to_be32(to_mah(wr->ah)->key);
++	useg->av_addr =	cpu_to_be64(to_mah(wr->ah)->avdma);
++	useg->dqpn    =	cpu_to_be32(wr->remote_qpn);
++	useg->qkey    =	cpu_to_be32(wr->remote_qkey);
+ 
+ }
+ 
+ static void set_arbel_ud_seg(struct mthca_arbel_ud_seg *useg,
+-			     struct ib_send_wr *wr)
++			     struct ib_ud_wr *wr)
+ {
+-	memcpy(useg->av, to_mah(wr->wr.ud.ah)->av, MTHCA_AV_SIZE);
+-	useg->dqpn = cpu_to_be32(wr->wr.ud.remote_qpn);
+-	useg->qkey = cpu_to_be32(wr->wr.ud.remote_qkey);
++	memcpy(useg->av, to_mah(wr->ah)->av, MTHCA_AV_SIZE);
++	useg->dqpn = cpu_to_be32(wr->remote_qpn);
++	useg->qkey = cpu_to_be32(wr->remote_qkey);
+ }
+ 
+ int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+@@ -1664,11 +1664,11 @@ int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			switch (wr->opcode) {
+ 			case IB_WR_ATOMIC_CMP_AND_SWP:
+ 			case IB_WR_ATOMIC_FETCH_AND_ADD:
+-				set_raddr_seg(wqe, wr->wr.atomic.remote_addr,
+-					      wr->wr.atomic.rkey);
++				set_raddr_seg(wqe, atomic_wr(wr)->remote_addr,
++					      atomic_wr(wr)->rkey);
+ 				wqe += sizeof (struct mthca_raddr_seg);
+ 
+-				set_atomic_seg(wqe, wr);
++				set_atomic_seg(wqe, atomic_wr(wr));
+ 				wqe += sizeof (struct mthca_atomic_seg);
+ 				size += (sizeof (struct mthca_raddr_seg) +
+ 					 sizeof (struct mthca_atomic_seg)) / 16;
+@@ -1677,8 +1677,8 @@ int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+ 			case IB_WR_RDMA_READ:
+-				set_raddr_seg(wqe, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(wqe, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mthca_raddr_seg);
+ 				size += sizeof (struct mthca_raddr_seg) / 16;
+ 				break;
+@@ -1694,8 +1694,8 @@ int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			switch (wr->opcode) {
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(wqe, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(wqe, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mthca_raddr_seg);
+ 				size += sizeof (struct mthca_raddr_seg) / 16;
+ 				break;
+@@ -1708,13 +1708,13 @@ int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			break;
+ 
+ 		case UD:
+-			set_tavor_ud_seg(wqe, wr);
++			set_tavor_ud_seg(wqe, ud_wr(wr));
+ 			wqe  += sizeof (struct mthca_tavor_ud_seg);
+ 			size += sizeof (struct mthca_tavor_ud_seg) / 16;
+ 			break;
+ 
+ 		case MLX:
+-			err = build_mlx_header(dev, to_msqp(qp), ind, wr,
++			err = build_mlx_header(dev, to_msqp(qp), ind, ud_wr(wr),
+ 					       wqe - sizeof (struct mthca_next_seg),
+ 					       wqe);
+ 			if (err) {
+@@ -2005,11 +2005,11 @@ int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			switch (wr->opcode) {
+ 			case IB_WR_ATOMIC_CMP_AND_SWP:
+ 			case IB_WR_ATOMIC_FETCH_AND_ADD:
+-				set_raddr_seg(wqe, wr->wr.atomic.remote_addr,
+-					      wr->wr.atomic.rkey);
++				set_raddr_seg(wqe, atomic_wr(wr)->remote_addr,
++					      atomic_wr(wr)->rkey);
+ 				wqe += sizeof (struct mthca_raddr_seg);
+ 
+-				set_atomic_seg(wqe, wr);
++				set_atomic_seg(wqe, atomic_wr(wr));
+ 				wqe  += sizeof (struct mthca_atomic_seg);
+ 				size += (sizeof (struct mthca_raddr_seg) +
+ 					 sizeof (struct mthca_atomic_seg)) / 16;
+@@ -2018,8 +2018,8 @@ int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			case IB_WR_RDMA_READ:
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(wqe, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(wqe, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mthca_raddr_seg);
+ 				size += sizeof (struct mthca_raddr_seg) / 16;
+ 				break;
+@@ -2035,8 +2035,8 @@ int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			switch (wr->opcode) {
+ 			case IB_WR_RDMA_WRITE:
+ 			case IB_WR_RDMA_WRITE_WITH_IMM:
+-				set_raddr_seg(wqe, wr->wr.rdma.remote_addr,
+-					      wr->wr.rdma.rkey);
++				set_raddr_seg(wqe, rdma_wr(wr)->remote_addr,
++					      rdma_wr(wr)->rkey);
+ 				wqe  += sizeof (struct mthca_raddr_seg);
+ 				size += sizeof (struct mthca_raddr_seg) / 16;
+ 				break;
+@@ -2049,13 +2049,13 @@ int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 			break;
+ 
+ 		case UD:
+-			set_arbel_ud_seg(wqe, wr);
++			set_arbel_ud_seg(wqe, ud_wr(wr));
+ 			wqe  += sizeof (struct mthca_arbel_ud_seg);
+ 			size += sizeof (struct mthca_arbel_ud_seg) / 16;
+ 			break;
+ 
+ 		case MLX:
+-			err = build_mlx_header(dev, to_msqp(qp), ind, wr,
++			err = build_mlx_header(dev, to_msqp(qp), ind, ud_wr(wr),
+ 					       wqe - sizeof (struct mthca_next_seg),
+ 					       wqe);
+ 			if (err) {
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 80f5c3e95564..a38b5086b997 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -3372,9 +3372,9 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 				wqe_misc |= NES_IWARP_SQ_WQE_LOCAL_FENCE;
+ 
+ 			set_wqe_32bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_RDMA_STAG_IDX,
+-					    ib_wr->wr.rdma.rkey);
++					    rdma_wr(ib_wr)->rkey);
+ 			set_wqe_64bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_RDMA_TO_LOW_IDX,
+-					    ib_wr->wr.rdma.remote_addr);
++					    rdma_wr(ib_wr)->remote_addr);
+ 
+ 			if ((ib_wr->send_flags & IB_SEND_INLINE) &&
+ 			    ((nes_drv_opt & NES_DRV_OPT_NO_INLINE_DATA) == 0) &&
+@@ -3409,9 +3409,9 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 			}
+ 
+ 			set_wqe_64bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_RDMA_TO_LOW_IDX,
+-					    ib_wr->wr.rdma.remote_addr);
++					    rdma_wr(ib_wr)->remote_addr);
+ 			set_wqe_32bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_RDMA_STAG_IDX,
+-					    ib_wr->wr.rdma.rkey);
++					    rdma_wr(ib_wr)->rkey);
+ 			set_wqe_32bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_RDMA_LENGTH_IDX,
+ 					    ib_wr->sg_list->length);
+ 			set_wqe_64bit_value(wqe->wqe_words, NES_IWARP_SQ_WQE_FRAG0_LOW_IDX,
+@@ -3428,15 +3428,16 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 		case IB_WR_FAST_REG_MR:
+ 		{
+ 			int i;
+-			int flags = ib_wr->wr.fast_reg.access_flags;
++			struct ib_fast_reg_wr *fwr = fast_reg_wr(ib_wr);
++			int flags = fwr->access_flags;
+ 			struct nes_ib_fast_reg_page_list *pnesfrpl =
+-				container_of(ib_wr->wr.fast_reg.page_list,
++				container_of(fwr->page_list,
+ 					     struct nes_ib_fast_reg_page_list,
+ 					     ibfrpl);
+ 			u64 *src_page_list = pnesfrpl->ibfrpl.page_list;
+ 			u64 *dst_page_list = pnesfrpl->nes_wqe_pbl.kva;
+ 
+-			if (ib_wr->wr.fast_reg.page_list_len >
++			if (fwr->page_list_len >
+ 			    (NES_4K_PBL_CHUNK_SIZE / sizeof(u64))) {
+ 				nes_debug(NES_DBG_IW_TX, "SQ_FMR: bad page_list_len\n");
+ 				err = -EINVAL;
+@@ -3445,19 +3446,19 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 			wqe_misc = NES_IWARP_SQ_OP_FAST_REG;
+ 			set_wqe_64bit_value(wqe->wqe_words,
+ 					    NES_IWARP_SQ_FMR_WQE_VA_FBO_LOW_IDX,
+-					    ib_wr->wr.fast_reg.iova_start);
++					    fwr->iova_start);
+ 			set_wqe_32bit_value(wqe->wqe_words,
+ 					    NES_IWARP_SQ_FMR_WQE_LENGTH_LOW_IDX,
+-					    ib_wr->wr.fast_reg.length);
++					    fwr->length);
+ 			set_wqe_32bit_value(wqe->wqe_words,
+ 					    NES_IWARP_SQ_FMR_WQE_LENGTH_HIGH_IDX, 0);
+ 			set_wqe_32bit_value(wqe->wqe_words,
+ 					    NES_IWARP_SQ_FMR_WQE_MR_STAG_IDX,
+-					    ib_wr->wr.fast_reg.rkey);
++					    fwr->rkey);
+ 			/* Set page size: */
+-			if (ib_wr->wr.fast_reg.page_shift == 12) {
++			if (fwr->page_shift == 12) {
+ 				wqe_misc |= NES_IWARP_SQ_FMR_WQE_PAGE_SIZE_4K;
+-			} else if (ib_wr->wr.fast_reg.page_shift == 21) {
++			} else if (fwr->page_shift == 21) {
+ 				wqe_misc |= NES_IWARP_SQ_FMR_WQE_PAGE_SIZE_2M;
+ 			} else {
+ 				nes_debug(NES_DBG_IW_TX, "Invalid page shift,"
+@@ -3480,11 +3481,11 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 				wqe_misc |= NES_IWARP_SQ_FMR_WQE_RIGHTS_ENABLE_WINDOW_BIND;
+ 
+ 			/* Fill in PBL info: */
+-			if (ib_wr->wr.fast_reg.page_list_len >
++			if (fwr->page_list_len >
+ 			    pnesfrpl->ibfrpl.max_page_list_len) {
+ 				nes_debug(NES_DBG_IW_TX, "Invalid page list length,"
+ 					  " ib_wr=%p, value=%u, max=%u\n",
+-					  ib_wr, ib_wr->wr.fast_reg.page_list_len,
++					  ib_wr, fwr->page_list_len,
+ 					  pnesfrpl->ibfrpl.max_page_list_len);
+ 				err = -EINVAL;
+ 				break;
+@@ -3496,19 +3497,19 @@ static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+ 
+ 			set_wqe_32bit_value(wqe->wqe_words,
+ 					    NES_IWARP_SQ_FMR_WQE_PBL_LENGTH_IDX,
+-					    ib_wr->wr.fast_reg.page_list_len * 8);
++					    fwr->page_list_len * 8);
+ 
+-			for (i = 0; i < ib_wr->wr.fast_reg.page_list_len; i++)
++			for (i = 0; i < fwr->page_list_len; i++)
+ 				dst_page_list[i] = cpu_to_le64(src_page_list[i]);
+ 
+ 			nes_debug(NES_DBG_IW_TX, "SQ_FMR: iova_start: %llx, "
+ 				  "length: %d, rkey: %0x, pgl_paddr: %llx, "
+ 				  "page_list_len: %u, wqe_misc: %x\n",
+-				  (unsigned long long) ib_wr->wr.fast_reg.iova_start,
+-				  ib_wr->wr.fast_reg.length,
+-				  ib_wr->wr.fast_reg.rkey,
++				  (unsigned long long) fwr->iova_start,
++				  fwr->length,
++				  fwr->rkey,
+ 				  (unsigned long long) pnesfrpl->nes_wqe_pbl.paddr,
+-				  ib_wr->wr.fast_reg.page_list_len,
++				  fwr->page_list_len,
+ 				  wqe_misc);
+ 			break;
+ 		}
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 836ba5e325ea..b247f7b35531 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -1997,13 +1997,13 @@ static void ocrdma_build_ud_hdr(struct ocrdma_qp *qp,
+ {
+ 	struct ocrdma_ewqe_ud_hdr *ud_hdr =
+ 		(struct ocrdma_ewqe_ud_hdr *)(hdr + 1);
+-	struct ocrdma_ah *ah = get_ocrdma_ah(wr->wr.ud.ah);
++	struct ocrdma_ah *ah = get_ocrdma_ah(ud_wr(wr)->ah);
+ 
+-	ud_hdr->rsvd_dest_qpn = wr->wr.ud.remote_qpn;
++	ud_hdr->rsvd_dest_qpn = ud_wr(wr)->remote_qpn;
+ 	if (qp->qp_type == IB_QPT_GSI)
+ 		ud_hdr->qkey = qp->qkey;
+ 	else
+-		ud_hdr->qkey = wr->wr.ud.remote_qkey;
++		ud_hdr->qkey = ud_wr(wr)->remote_qkey;
+ 	ud_hdr->rsvd_ahid = ah->id;
+ 	if (ah->av->valid & OCRDMA_AV_VLAN_VALID)
+ 		hdr->cw |= (OCRDMA_FLAG_AH_VLAN_PR << OCRDMA_WQE_FLAGS_SHIFT);
+@@ -2106,9 +2106,9 @@ static int ocrdma_build_write(struct ocrdma_qp *qp, struct ocrdma_hdr_wqe *hdr,
+ 	status = ocrdma_build_inline_sges(qp, hdr, sge, wr, wqe_size);
+ 	if (status)
+ 		return status;
+-	ext_rw->addr_lo = wr->wr.rdma.remote_addr;
+-	ext_rw->addr_hi = upper_32_bits(wr->wr.rdma.remote_addr);
+-	ext_rw->lrkey = wr->wr.rdma.rkey;
++	ext_rw->addr_lo = rdma_wr(wr)->remote_addr;
++	ext_rw->addr_hi = upper_32_bits(rdma_wr(wr)->remote_addr);
++	ext_rw->lrkey = rdma_wr(wr)->rkey;
+ 	ext_rw->len = hdr->total_len;
+ 	return 0;
+ }
+@@ -2126,13 +2126,14 @@ static void ocrdma_build_read(struct ocrdma_qp *qp, struct ocrdma_hdr_wqe *hdr,
+ 	hdr->cw |= (OCRDMA_READ << OCRDMA_WQE_OPCODE_SHIFT);
+ 	hdr->cw |= (OCRDMA_TYPE_LKEY << OCRDMA_WQE_TYPE_SHIFT);
+ 
+-	ext_rw->addr_lo = wr->wr.rdma.remote_addr;
+-	ext_rw->addr_hi = upper_32_bits(wr->wr.rdma.remote_addr);
+-	ext_rw->lrkey = wr->wr.rdma.rkey;
++	ext_rw->addr_lo = rdma_wr(wr)->remote_addr;
++	ext_rw->addr_hi = upper_32_bits(rdma_wr(wr)->remote_addr);
++	ext_rw->lrkey = rdma_wr(wr)->rkey;
+ 	ext_rw->len = hdr->total_len;
+ }
+ 
+-static void build_frmr_pbes(struct ib_send_wr *wr, struct ocrdma_pbl *pbl_tbl,
++static void build_frmr_pbes(struct ib_fast_reg_wr *wr,
++			    struct ocrdma_pbl *pbl_tbl,
+ 			    struct ocrdma_hw_mr *hwmr)
+ {
+ 	int i;
+@@ -2144,12 +2145,12 @@ static void build_frmr_pbes(struct ib_send_wr *wr, struct ocrdma_pbl *pbl_tbl,
+ 	num_pbes = 0;
+ 
+ 	/* go through the OS phy regions & fill hw pbe entries into pbls. */
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
++	for (i = 0; i < wr->page_list_len; i++) {
+ 		/* number of pbes can be more for one OS buf, when
+ 		 * buffers are of different sizes.
+ 		 * split the ib_buf to one or more pbes.
+ 		 */
+-		buf_addr = wr->wr.fast_reg.page_list->page_list[i];
++		buf_addr = wr->page_list->page_list[i];
+ 		pbe->pa_lo = cpu_to_le32((u32) (buf_addr & PAGE_MASK));
+ 		pbe->pa_hi = cpu_to_le32((u32) upper_32_bits(buf_addr));
+ 		num_pbes += 1;
+@@ -2178,9 +2179,10 @@ static int get_encoded_page_size(int pg_sz)
+ 
+ 
+ static int ocrdma_build_fr(struct ocrdma_qp *qp, struct ocrdma_hdr_wqe *hdr,
+-			   struct ib_send_wr *wr)
++			   struct ib_send_wr *send_wr)
+ {
+ 	u64 fbo;
++	struct ib_fast_reg_wr *wr = fast_reg_wr(send_wr);
+ 	struct ocrdma_ewqe_fr *fast_reg = (struct ocrdma_ewqe_fr *)(hdr + 1);
+ 	struct ocrdma_mr *mr;
+ 	struct ocrdma_dev *dev = get_ocrdma_dev(qp->ibqp.device);
+@@ -2188,33 +2190,32 @@ static int ocrdma_build_fr(struct ocrdma_qp *qp, struct ocrdma_hdr_wqe *hdr,
+ 
+ 	wqe_size = roundup(wqe_size, OCRDMA_WQE_ALIGN_BYTES);
+ 
+-	if (wr->wr.fast_reg.page_list_len > dev->attr.max_pages_per_frmr)
++	if (wr->page_list_len > dev->attr.max_pages_per_frmr)
+ 		return -EINVAL;
+ 
+ 	hdr->cw |= (OCRDMA_FR_MR << OCRDMA_WQE_OPCODE_SHIFT);
+ 	hdr->cw |= ((wqe_size / OCRDMA_WQE_STRIDE) << OCRDMA_WQE_SIZE_SHIFT);
+ 
+-	if (wr->wr.fast_reg.page_list_len == 0)
++	if (wr->page_list_len == 0)
+ 		BUG();
+-	if (wr->wr.fast_reg.access_flags & IB_ACCESS_LOCAL_WRITE)
++	if (wr->access_flags & IB_ACCESS_LOCAL_WRITE)
+ 		hdr->rsvd_lkey_flags |= OCRDMA_LKEY_FLAG_LOCAL_WR;
+-	if (wr->wr.fast_reg.access_flags & IB_ACCESS_REMOTE_WRITE)
++	if (wr->access_flags & IB_ACCESS_REMOTE_WRITE)
+ 		hdr->rsvd_lkey_flags |= OCRDMA_LKEY_FLAG_REMOTE_WR;
+-	if (wr->wr.fast_reg.access_flags & IB_ACCESS_REMOTE_READ)
++	if (wr->access_flags & IB_ACCESS_REMOTE_READ)
+ 		hdr->rsvd_lkey_flags |= OCRDMA_LKEY_FLAG_REMOTE_RD;
+-	hdr->lkey = wr->wr.fast_reg.rkey;
+-	hdr->total_len = wr->wr.fast_reg.length;
++	hdr->lkey = wr->rkey;
++	hdr->total_len = wr->length;
+ 
+-	fbo = wr->wr.fast_reg.iova_start -
+-	    (wr->wr.fast_reg.page_list->page_list[0] & PAGE_MASK);
++	fbo = wr->iova_start - (wr->page_list->page_list[0] & PAGE_MASK);
+ 
+-	fast_reg->va_hi = upper_32_bits(wr->wr.fast_reg.iova_start);
+-	fast_reg->va_lo = (u32) (wr->wr.fast_reg.iova_start & 0xffffffff);
++	fast_reg->va_hi = upper_32_bits(wr->iova_start);
++	fast_reg->va_lo = (u32) (wr->iova_start & 0xffffffff);
+ 	fast_reg->fbo_hi = upper_32_bits(fbo);
+ 	fast_reg->fbo_lo = (u32) fbo & 0xffffffff;
+-	fast_reg->num_sges = wr->wr.fast_reg.page_list_len;
++	fast_reg->num_sges = wr->page_list_len;
+ 	fast_reg->size_sge =
+-		get_encoded_page_size(1 << wr->wr.fast_reg.page_shift);
++		get_encoded_page_size(1 << wr->page_shift);
+ 	mr = (struct ocrdma_mr *) (unsigned long)
+ 		dev->stag_arr[(hdr->lkey >> 8) & (OCRDMA_MAX_STAG - 1)];
+ 	build_frmr_pbes(wr, mr->hwmr.pbl_table, &mr->hwmr);
+diff --git a/drivers/infiniband/hw/qib/qib_keys.c b/drivers/infiniband/hw/qib/qib_keys.c
+index eabe54738be6..ef0f4f3d1a84 100644
+--- a/drivers/infiniband/hw/qib/qib_keys.c
++++ b/drivers/infiniband/hw/qib/qib_keys.c
+@@ -338,12 +338,13 @@ bail:
+ /*
+  * Initialize the memory region specified by the work reqeust.
+  */
+-int qib_fast_reg_mr(struct qib_qp *qp, struct ib_send_wr *wr)
++int qib_fast_reg_mr(struct qib_qp *qp, struct ib_send_wr *send_wr)
+ {
++	struct ib_fast_reg_wr *wr = fast_reg_wr(send_wr);
+ 	struct qib_lkey_table *rkt = &to_idev(qp->ibqp.device)->lk_table;
+ 	struct qib_pd *pd = to_ipd(qp->ibqp.pd);
+ 	struct qib_mregion *mr;
+-	u32 rkey = wr->wr.fast_reg.rkey;
++	u32 rkey = wr->rkey;
+ 	unsigned i, n, m;
+ 	int ret = -EINVAL;
+ 	unsigned long flags;
+@@ -360,22 +361,22 @@ int qib_fast_reg_mr(struct qib_qp *qp, struct ib_send_wr *wr)
+ 	if (unlikely(mr == NULL || qp->ibqp.pd != mr->pd))
+ 		goto bail;
+ 
+-	if (wr->wr.fast_reg.page_list_len > mr->max_segs)
++	if (wr->page_list_len > mr->max_segs)
+ 		goto bail;
+ 
+-	ps = 1UL << wr->wr.fast_reg.page_shift;
+-	if (wr->wr.fast_reg.length > ps * wr->wr.fast_reg.page_list_len)
++	ps = 1UL << wr->page_shift;
++	if (wr->length > ps * wr->page_list_len)
+ 		goto bail;
+ 
+-	mr->user_base = wr->wr.fast_reg.iova_start;
+-	mr->iova = wr->wr.fast_reg.iova_start;
++	mr->user_base = wr->iova_start;
++	mr->iova = wr->iova_start;
+ 	mr->lkey = rkey;
+-	mr->length = wr->wr.fast_reg.length;
+-	mr->access_flags = wr->wr.fast_reg.access_flags;
+-	page_list = wr->wr.fast_reg.page_list->page_list;
++	mr->length = wr->length;
++	mr->access_flags = wr->access_flags;
++	page_list = wr->page_list->page_list;
+ 	m = 0;
+ 	n = 0;
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
++	for (i = 0; i < wr->page_list_len; i++) {
+ 		mr->map[m]->segs[n].vaddr = (void *) page_list[i];
+ 		mr->map[m]->segs[n].length = ps;
+ 		if (++n == QIB_SEGSZ) {
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index 6ddc0264aad2..961736de19a1 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -436,7 +436,7 @@ static void clear_mr_refs(struct qib_qp *qp, int clr_sends)
+ 			if (qp->ibqp.qp_type == IB_QPT_UD ||
+ 			    qp->ibqp.qp_type == IB_QPT_SMI ||
+ 			    qp->ibqp.qp_type == IB_QPT_GSI)
+-				atomic_dec(&to_iah(wqe->wr.wr.ud.ah)->refcount);
++				atomic_dec(&to_iah(wqe->ud_wr.ah)->refcount);
+ 			if (++qp->s_last >= qp->s_size)
+ 				qp->s_last = 0;
+ 		}
+diff --git a/drivers/infiniband/hw/qib/qib_rc.c b/drivers/infiniband/hw/qib/qib_rc.c
+index 4544d6f88ad7..e6b7556d5221 100644
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@ -373,10 +373,11 @@ int qib_make_rc_req(struct qib_qp *qp)
+ 				qp->s_flags |= QIB_S_WAIT_SSN_CREDIT;
+ 				goto bail;
+ 			}
++
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / sizeof(u32);
+ 			wqe->lpsn = wqe->psn;
+@@ -386,15 +387,15 @@ int qib_make_rc_req(struct qib_qp *qp)
+ 				len = pmtu;
+ 				break;
+ 			}
+-			if (wqe->wr.opcode == IB_WR_RDMA_WRITE)
++			if (wqe->rdma_wr.wr.opcode == IB_WR_RDMA_WRITE)
+ 				qp->s_state = OP(RDMA_WRITE_ONLY);
+ 			else {
+-				qp->s_state =
+-					OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE);
++				qp->s_state = OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE);
+ 				/* Immediate data comes after RETH */
+-				ohdr->u.rc.imm_data = wqe->wr.ex.imm_data;
++				ohdr->u.rc.imm_data =
++					wqe->rdma_wr.wr.ex.imm_data;
+ 				hwords += 1;
+-				if (wqe->wr.send_flags & IB_SEND_SOLICITED)
++				if (wqe->rdma_wr.wr.send_flags & IB_SEND_SOLICITED)
+ 					bth0 |= IB_BTH_SOLICITED;
+ 			}
+ 			bth2 |= IB_BTH_REQ_ACK;
+@@ -424,10 +425,11 @@ int qib_make_rc_req(struct qib_qp *qp)
+ 					qp->s_next_psn += (len - 1) / pmtu;
+ 				wqe->lpsn = qp->s_next_psn++;
+ 			}
++
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			qp->s_state = OP(RDMA_READ_REQUEST);
+ 			hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+@@ -455,24 +457,24 @@ int qib_make_rc_req(struct qib_qp *qp)
+ 					qp->s_lsn++;
+ 				wqe->lpsn = wqe->psn;
+ 			}
+-			if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
++			if (wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+ 				qp->s_state = OP(COMPARE_SWAP);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.swap);
++					wqe->atomic_wr.swap);
+ 				ohdr->u.atomic_eth.compare_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 			} else {
+ 				qp->s_state = OP(FETCH_ADD);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 				ohdr->u.atomic_eth.compare_data = 0;
+ 			}
+ 			ohdr->u.atomic_eth.vaddr[0] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr >> 32);
++				wqe->atomic_wr.remote_addr >> 32);
+ 			ohdr->u.atomic_eth.vaddr[1] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr);
++				wqe->atomic_wr.remote_addr);
+ 			ohdr->u.atomic_eth.rkey = cpu_to_be32(
+-				wqe->wr.wr.atomic.rkey);
++				wqe->atomic_wr.rkey);
+ 			hwords += sizeof(struct ib_atomic_eth) / sizeof(u32);
+ 			ss = NULL;
+ 			len = 0;
+@@ -597,9 +599,9 @@ int qib_make_rc_req(struct qib_qp *qp)
+ 		 */
+ 		len = ((qp->s_psn - wqe->psn) & QIB_PSN_MASK) * pmtu;
+ 		ohdr->u.rc.reth.vaddr =
+-			cpu_to_be64(wqe->wr.wr.rdma.remote_addr + len);
++			cpu_to_be64(wqe->rdma_wr.remote_addr + len);
+ 		ohdr->u.rc.reth.rkey =
+-			cpu_to_be32(wqe->wr.wr.rdma.rkey);
++			cpu_to_be32(wqe->rdma_wr.rkey);
+ 		ohdr->u.rc.reth.length = cpu_to_be32(wqe->length - len);
+ 		qp->s_state = OP(RDMA_READ_REQUEST);
+ 		hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+diff --git a/drivers/infiniband/hw/qib/qib_ruc.c b/drivers/infiniband/hw/qib/qib_ruc.c
+index 22e356ca8058..b1aa21bdd484 100644
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@ -459,8 +459,8 @@ again:
+ 		if (wqe->length == 0)
+ 			break;
+ 		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
+-					  wqe->wr.wr.rdma.remote_addr,
+-					  wqe->wr.wr.rdma.rkey,
++					  wqe->rdma_wr.remote_addr,
++					  wqe->rdma_wr.rkey,
+ 					  IB_ACCESS_REMOTE_WRITE)))
+ 			goto acc_err;
+ 		qp->r_sge.sg_list = NULL;
+@@ -472,8 +472,8 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+ 			goto inv_err;
+ 		if (unlikely(!qib_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+-					  wqe->wr.wr.rdma.remote_addr,
+-					  wqe->wr.wr.rdma.rkey,
++					  wqe->rdma_wr.remote_addr,
++					  wqe->rdma_wr.rkey,
+ 					  IB_ACCESS_REMOTE_READ)))
+ 			goto acc_err;
+ 		release = 0;
+@@ -490,18 +490,18 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto inv_err;
+ 		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+-					  wqe->wr.wr.atomic.remote_addr,
+-					  wqe->wr.wr.atomic.rkey,
++					  wqe->atomic_wr.remote_addr,
++					  wqe->atomic_wr.rkey,
+ 					  IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto acc_err;
+ 		/* Perform atomic OP and save result. */
+ 		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+-		sdata = wqe->wr.wr.atomic.compare_add;
++		sdata = wqe->atomic_wr.compare_add;
+ 		*(u64 *) sqp->s_sge.sge.vaddr =
+-			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
++			(wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ 			(u64) atomic64_add_return(sdata, maddr) - sdata :
+ 			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+-				      sdata, wqe->wr.wr.atomic.swap);
++				      sdata, wqe->atomic_wr.swap);
+ 		qib_put_mr(qp->r_sge.sge.mr);
+ 		qp->r_sge.num_sge = 0;
+ 		goto send_comp;
+@@ -785,7 +785,7 @@ void qib_send_complete(struct qib_qp *qp, struct qib_swqe *wqe,
+ 	if (qp->ibqp.qp_type == IB_QPT_UD ||
+ 	    qp->ibqp.qp_type == IB_QPT_SMI ||
+ 	    qp->ibqp.qp_type == IB_QPT_GSI)
+-		atomic_dec(&to_iah(wqe->wr.wr.ud.ah)->refcount);
++		atomic_dec(&to_iah(wqe->ud_wr.ah)->refcount);
+ 
+ 	/* See ch. 11.2.4.1 and 10.7.3.1 */
+ 	if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+diff --git a/drivers/infiniband/hw/qib/qib_uc.c b/drivers/infiniband/hw/qib/qib_uc.c
+index aa3a8035bb68..06a564589c35 100644
+--- a/drivers/infiniband/hw/qib/qib_uc.c
++++ b/drivers/infiniband/hw/qib/qib_uc.c
+@@ -129,9 +129,9 @@ int qib_make_uc_req(struct qib_qp *qp)
+ 		case IB_WR_RDMA_WRITE:
+ 		case IB_WR_RDMA_WRITE_WITH_IMM:
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / 4;
+ 			if (len > pmtu) {
+diff --git a/drivers/infiniband/hw/qib/qib_ud.c b/drivers/infiniband/hw/qib/qib_ud.c
+index 26243b722b5e..59193f67ea78 100644
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@ -59,7 +59,7 @@ static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+ 	u32 length;
+ 	enum ib_qp_type sqptype, dqptype;
+ 
+-	qp = qib_lookup_qpn(ibp, swqe->wr.wr.ud.remote_qpn);
++	qp = qib_lookup_qpn(ibp, swqe->ud_wr.remote_qpn);
+ 	if (!qp) {
+ 		ibp->n_pkt_drops++;
+ 		return;
+@@ -76,7 +76,7 @@ static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+ 		goto drop;
+ 	}
+ 
+-	ah_attr = &to_iah(swqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(swqe->ud_wr.ah)->attr;
+ 	ppd = ppd_from_ibp(ibp);
+ 
+ 	if (qp->ibqp.qp_num > 1) {
+@@ -106,8 +106,8 @@ static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+ 	if (qp->ibqp.qp_num) {
+ 		u32 qkey;
+ 
+-		qkey = (int)swqe->wr.wr.ud.remote_qkey < 0 ?
+-			sqp->qkey : swqe->wr.wr.ud.remote_qkey;
++		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
++			sqp->qkey : swqe->ud_wr.remote_qkey;
+ 		if (unlikely(qkey != qp->qkey)) {
+ 			u16 lid;
+ 
+@@ -210,7 +210,7 @@ static void qib_ud_loopback(struct qib_qp *sqp, struct qib_swqe *swqe)
+ 	wc.qp = &qp->ibqp;
+ 	wc.src_qp = sqp->ibqp.qp_num;
+ 	wc.pkey_index = qp->ibqp.qp_type == IB_QPT_GSI ?
+-		swqe->wr.wr.ud.pkey_index : 0;
++		swqe->ud_wr.pkey_index : 0;
+ 	wc.slid = ppd->lid | (ah_attr->src_path_bits & ((1 << ppd->lmc) - 1));
+ 	wc.sl = ah_attr->sl;
+ 	wc.dlid_path_bits = ah_attr->dlid & ((1 << ppd->lmc) - 1);
+@@ -277,7 +277,7 @@ int qib_make_ud_req(struct qib_qp *qp)
+ 	/* Construct the header. */
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &to_iah(wqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(wqe->ud_wr.ah)->attr;
+ 	if (ah_attr->dlid >= QIB_MULTICAST_LID_BASE) {
+ 		if (ah_attr->dlid != QIB_PERMISSIVE_LID)
+ 			this_cpu_inc(ibp->pmastats->n_multicast_xmit);
+@@ -363,7 +363,7 @@ int qib_make_ud_req(struct qib_qp *qp)
+ 	bth0 |= extra_bytes << 20;
+ 	bth0 |= qp->ibqp.qp_type == IB_QPT_SMI ? QIB_DEFAULT_P_KEY :
+ 		qib_get_pkey(ibp, qp->ibqp.qp_type == IB_QPT_GSI ?
+-			     wqe->wr.wr.ud.pkey_index : qp->s_pkey_index);
++			     wqe->ud_wr.pkey_index : qp->s_pkey_index);
+ 	ohdr->bth[0] = cpu_to_be32(bth0);
+ 	/*
+ 	 * Use the multicast QP if the destination LID is a multicast LID.
+@@ -371,14 +371,14 @@ int qib_make_ud_req(struct qib_qp *qp)
+ 	ohdr->bth[1] = ah_attr->dlid >= QIB_MULTICAST_LID_BASE &&
+ 		ah_attr->dlid != QIB_PERMISSIVE_LID ?
+ 		cpu_to_be32(QIB_MULTICAST_QPN) :
+-		cpu_to_be32(wqe->wr.wr.ud.remote_qpn);
++		cpu_to_be32(wqe->ud_wr.remote_qpn);
+ 	ohdr->bth[2] = cpu_to_be32(qp->s_next_psn++ & QIB_PSN_MASK);
+ 	/*
+ 	 * Qkeys with the high order bit set mean use the
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+-	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->wr.wr.ud.remote_qkey < 0 ?
+-					 qp->qkey : wqe->wr.wr.ud.remote_qkey);
++	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
++					 qp->qkey : wqe->ud_wr.remote_qkey);
+ 	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+ 
+ done:
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 3dcc4985b60f..a6b0b098ff30 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -374,7 +374,7 @@ static int qib_post_one_send(struct qib_qp *qp, struct ib_send_wr *wr,
+ 		    wr->opcode != IB_WR_SEND_WITH_IMM)
+ 			goto bail_inval;
+ 		/* Check UD destination address PD */
+-		if (qp->ibqp.pd != wr->wr.ud.ah->pd)
++		if (qp->ibqp.pd != ud_wr(wr)->ah->pd)
+ 			goto bail_inval;
+ 	} else if ((unsigned) wr->opcode > IB_WR_ATOMIC_FETCH_AND_ADD)
+ 		goto bail_inval;
+@@ -397,7 +397,23 @@ static int qib_post_one_send(struct qib_qp *qp, struct ib_send_wr *wr,
+ 	rkt = &to_idev(qp->ibqp.device)->lk_table;
+ 	pd = to_ipd(qp->ibqp.pd);
+ 	wqe = get_swqe_ptr(qp, qp->s_head);
+-	wqe->wr = *wr;
++
++	if (qp->ibqp.qp_type != IB_QPT_UC &&
++	    qp->ibqp.qp_type != IB_QPT_RC)
++		memcpy(&wqe->ud_wr, ud_wr(wr), sizeof(wqe->ud_wr));
++	else if (wr->opcode == IB_WR_FAST_REG_MR)
++		memcpy(&wqe->fast_reg_wr, fast_reg_wr(wr),
++			sizeof(wqe->fast_reg_wr));
++	else if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
++		 wr->opcode == IB_WR_RDMA_WRITE ||
++		 wr->opcode == IB_WR_RDMA_READ)
++		memcpy(&wqe->rdma_wr, rdma_wr(wr), sizeof(wqe->rdma_wr));
++	else if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
++		 wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
++		memcpy(&wqe->atomic_wr, atomic_wr(wr), sizeof(wqe->atomic_wr));
++	else
++		memcpy(&wqe->wr, wr, sizeof(wqe->wr));
++
+ 	wqe->length = 0;
+ 	j = 0;
+ 	if (wr->num_sge) {
+@@ -426,7 +442,7 @@ static int qib_post_one_send(struct qib_qp *qp, struct ib_send_wr *wr,
+ 				  qp->port_num - 1)->ibmtu)
+ 		goto bail_inval_free;
+ 	else
+-		atomic_inc(&to_iah(wr->wr.ud.ah)->refcount);
++		atomic_inc(&to_iah(ud_wr(wr)->ah)->refcount);
+ 	wqe->ssn = qp->s_ssn++;
+ 	qp->s_head = next;
+ 
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.h b/drivers/infiniband/hw/qib/qib_verbs.h
+index a08df70e8503..8aa16851a5e6 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@ -338,7 +338,13 @@ struct qib_mr {
+  * in qp->s_max_sge.
+  */
+ struct qib_swqe {
+-	struct ib_send_wr wr;   /* don't use wr.sg_list */
++	union {
++		struct ib_send_wr wr;   /* don't use wr.sg_list */
++		struct ib_ud_wr ud_wr;
++		struct ib_fast_reg_wr fast_reg_wr;
++		struct ib_rdma_wr rdma_wr;
++		struct ib_atomic_wr atomic_wr;
++	};
+ 	u32 psn;                /* first packet sequence number */
+ 	u32 lpsn;               /* last packet sequence number */
+ 	u32 ssn;                /* send sequence number */
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index edc5b8565d6d..3ede10309754 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -360,7 +360,7 @@ struct ipoib_dev_priv {
+ 	unsigned	     tx_head;
+ 	unsigned	     tx_tail;
+ 	struct ib_sge	     tx_sge[MAX_SKB_FRAGS + 1];
+-	struct ib_send_wr    tx_wr;
++	struct ib_ud_wr      tx_wr;
+ 	unsigned	     tx_outstanding;
+ 	struct ib_wc	     send_wc[MAX_SEND_CQE];
+ 
+@@ -528,7 +528,7 @@ static inline void ipoib_build_sge(struct ipoib_dev_priv *priv,
+ 		priv->tx_sge[i + off].addr = mapping[i + off];
+ 		priv->tx_sge[i + off].length = skb_frag_size(&frags[i]);
+ 	}
+-	priv->tx_wr.num_sge	     = nr_frags + off;
++	priv->tx_wr.wr.num_sge	     = nr_frags + off;
+ }
+ 
+ #ifdef CONFIG_INFINIBAND_IPOIB_DEBUG
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index c78dc1638030..3ae9726efb98 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -700,9 +700,9 @@ static inline int post_send(struct ipoib_dev_priv *priv,
+ 
+ 	ipoib_build_sge(priv, tx_req);
+ 
+-	priv->tx_wr.wr_id	= wr_id | IPOIB_OP_CM;
++	priv->tx_wr.wr.wr_id	= wr_id | IPOIB_OP_CM;
+ 
+-	return ib_post_send(tx->qp, &priv->tx_wr, &bad_wr);
++	return ib_post_send(tx->qp, &priv->tx_wr.wr, &bad_wr);
+ }
+ 
+ void ipoib_cm_send(struct net_device *dev, struct sk_buff *skb, struct ipoib_cm_tx *tx)
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index d266667ca9b8..5ea0c14070d1 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -518,19 +518,19 @@ static inline int post_send(struct ipoib_dev_priv *priv,
+ 
+ 	ipoib_build_sge(priv, tx_req);
+ 
+-	priv->tx_wr.wr_id 	     = wr_id;
+-	priv->tx_wr.wr.ud.remote_qpn = qpn;
+-	priv->tx_wr.wr.ud.ah 	     = address;
++	priv->tx_wr.wr.wr_id	= wr_id;
++	priv->tx_wr.remote_qpn	= qpn;
++	priv->tx_wr.ah		= address;
+ 
+ 	if (head) {
+-		priv->tx_wr.wr.ud.mss	 = skb_shinfo(skb)->gso_size;
+-		priv->tx_wr.wr.ud.header = head;
+-		priv->tx_wr.wr.ud.hlen	 = hlen;
+-		priv->tx_wr.opcode	 = IB_WR_LSO;
++		priv->tx_wr.mss		= skb_shinfo(skb)->gso_size;
++		priv->tx_wr.header	= head;
++		priv->tx_wr.hlen	= hlen;
++		priv->tx_wr.wr.opcode	= IB_WR_LSO;
+ 	} else
+-		priv->tx_wr.opcode	 = IB_WR_SEND;
++		priv->tx_wr.wr.opcode	= IB_WR_SEND;
+ 
+-	return ib_post_send(priv->qp, &priv->tx_wr, &bad_wr);
++	return ib_post_send(priv->qp, &priv->tx_wr.wr, &bad_wr);
+ }
+ 
+ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+@@ -583,9 +583,9 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 	}
+ 
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
+-		priv->tx_wr.send_flags |= IB_SEND_IP_CSUM;
++		priv->tx_wr.wr.send_flags |= IB_SEND_IP_CSUM;
+ 	else
+-		priv->tx_wr.send_flags &= ~IB_SEND_IP_CSUM;
++		priv->tx_wr.wr.send_flags &= ~IB_SEND_IP_CSUM;
+ 
+ 	if (++priv->tx_outstanding == ipoib_sendq_size) {
+ 		ipoib_dbg(priv, "TX ring full, stopping kernel net queue\n");
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 99e6cd24bcd7..c2e35794a5c0 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -461,7 +461,7 @@ int ipoib_set_mode(struct net_device *dev, const char *buf)
+ 		netdev_update_features(dev);
+ 		dev_set_mtu(dev, ipoib_cm_max_mtu(dev));
+ 		rtnl_unlock();
+-		priv->tx_wr.send_flags &= ~IB_SEND_IP_CSUM;
++		priv->tx_wr.wr.send_flags &= ~IB_SEND_IP_CSUM;
+ 
+ 		ipoib_flush_paths(dev);
+ 		rtnl_lock();
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index d750a86042f3..151a919ed410 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -245,7 +245,7 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
+ 
+ 		priv->qkey = be32_to_cpu(priv->broadcast->mcmember.qkey);
+ 		spin_unlock_irq(&priv->lock);
+-		priv->tx_wr.wr.ud.remote_qkey = priv->qkey;
++		priv->tx_wr.remote_qkey = priv->qkey;
+ 		set_qkey = 1;
+ 	}
+ 
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+index 78845b6e8b81..d48c5bae7877 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+@@ -221,9 +221,9 @@ int ipoib_transport_dev_init(struct net_device *dev, struct ib_device *ca)
+ 	for (i = 0; i < MAX_SKB_FRAGS + 1; ++i)
+ 		priv->tx_sge[i].lkey = priv->pd->local_dma_lkey;
+ 
+-	priv->tx_wr.opcode	= IB_WR_SEND;
+-	priv->tx_wr.sg_list	= priv->tx_sge;
+-	priv->tx_wr.send_flags	= IB_SEND_SIGNALED;
++	priv->tx_wr.wr.opcode		= IB_WR_SEND;
++	priv->tx_wr.wr.sg_list		= priv->tx_sge;
++	priv->tx_wr.wr.send_flags	= IB_SEND_SIGNALED;
+ 
+ 	priv->rx_sge[0].lkey = priv->pd->local_dma_lkey;
+ 
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.h b/drivers/infiniband/ulp/isert/ib_isert.h
+index 6f7db3ebfd35..a22602908835 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -117,9 +117,9 @@ struct isert_rdma_wr {
+ 	enum iser_ib_op_code	iser_ib_op;
+ 	struct ib_sge		*ib_sge;
+ 	struct ib_sge		s_ib_sge;
+-	int			send_wr_num;
+-	struct ib_send_wr	*send_wr;
+-	struct ib_send_wr	s_send_wr;
++	int			rdma_wr_num;
++	struct ib_rdma_wr	*rdma_wr;
++	struct ib_rdma_wr	s_rdma_wr;
+ 	struct ib_sge		ib_sg[3];
+ 	struct isert_data_buf	data;
+ 	struct isert_data_buf	prot;
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index feb0c8ea0788..ba4a67fcb876 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -1305,7 +1305,7 @@ static int srp_map_finish_fr(struct srp_map_state *state,
+ 	struct srp_target_port *target = ch->target;
+ 	struct srp_device *dev = target->srp_host->srp_dev;
+ 	struct ib_send_wr *bad_wr;
+-	struct ib_send_wr wr;
++	struct ib_fast_reg_wr wr;
+ 	struct srp_fr_desc *desc;
+ 	u32 rkey;
+ 
+@@ -1323,17 +1323,17 @@ static int srp_map_finish_fr(struct srp_map_state *state,
+ 	       sizeof(state->pages[0]) * state->npages);
+ 
+ 	memset(&wr, 0, sizeof(wr));
+-	wr.opcode = IB_WR_FAST_REG_MR;
+-	wr.wr_id = FAST_REG_WR_ID_MASK;
+-	wr.wr.fast_reg.iova_start = state->base_dma_addr;
+-	wr.wr.fast_reg.page_list = desc->frpl;
+-	wr.wr.fast_reg.page_list_len = state->npages;
+-	wr.wr.fast_reg.page_shift = ilog2(dev->mr_page_size);
+-	wr.wr.fast_reg.length = state->dma_len;
+-	wr.wr.fast_reg.access_flags = (IB_ACCESS_LOCAL_WRITE |
+-				       IB_ACCESS_REMOTE_READ |
+-				       IB_ACCESS_REMOTE_WRITE);
+-	wr.wr.fast_reg.rkey = desc->mr->lkey;
++	wr.wr.opcode = IB_WR_FAST_REG_MR;
++	wr.wr.wr_id = FAST_REG_WR_ID_MASK;
++	wr.iova_start = state->base_dma_addr;
++	wr.page_list = desc->frpl;
++	wr.page_list_len = state->npages;
++	wr.page_shift = ilog2(dev->mr_page_size);
++	wr.length = state->dma_len;
++	wr.access_flags = (IB_ACCESS_LOCAL_WRITE |
++			   IB_ACCESS_REMOTE_READ |
++			   IB_ACCESS_REMOTE_WRITE);
++	wr.rkey = desc->mr->lkey;
+ 
+ 	*state->fr.next++ = desc;
+ 	state->nmdesc++;
+@@ -1341,7 +1341,7 @@ static int srp_map_finish_fr(struct srp_map_state *state,
+ 	srp_map_desc(state, state->base_dma_addr, state->dma_len,
+ 		     desc->mr->rkey);
+ 
+-	return ib_post_send(ch->qp, &wr, &bad_wr);
++	return ib_post_send(ch->qp, &wr.wr, &bad_wr);
+ }
+ 
+ static int srp_finish_mapping(struct srp_map_state *state,
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 6df2d90f10ad..9288fe049868 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -2823,7 +2823,7 @@ static int srpt_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event)
+ static int srpt_perform_rdmas(struct srpt_rdma_ch *ch,
+ 			      struct srpt_send_ioctx *ioctx)
+ {
+-	struct ib_send_wr wr;
++	struct ib_rdma_wr wr;
+ 	struct ib_send_wr *bad_wr;
+ 	struct rdma_iu *riu;
+ 	int i;
+@@ -2851,29 +2851,29 @@ static int srpt_perform_rdmas(struct srpt_rdma_ch *ch,
+ 
+ 	for (i = 0; i < n_rdma; ++i, ++riu) {
+ 		if (dir == DMA_FROM_DEVICE) {
+-			wr.opcode = IB_WR_RDMA_WRITE;
+-			wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
++			wr.wr.opcode = IB_WR_RDMA_WRITE;
++			wr.wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
+ 						SRPT_RDMA_WRITE_LAST :
+ 						SRPT_RDMA_MID,
+ 						ioctx->ioctx.index);
+ 		} else {
+-			wr.opcode = IB_WR_RDMA_READ;
+-			wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
++			wr.wr.opcode = IB_WR_RDMA_READ;
++			wr.wr.wr_id = encode_wr_id(i == n_rdma - 1 ?
+ 						SRPT_RDMA_READ_LAST :
+ 						SRPT_RDMA_MID,
+ 						ioctx->ioctx.index);
+ 		}
+-		wr.next = NULL;
+-		wr.wr.rdma.remote_addr = riu->raddr;
+-		wr.wr.rdma.rkey = riu->rkey;
+-		wr.num_sge = riu->sge_cnt;
+-		wr.sg_list = riu->sge;
++		wr.wr.next = NULL;
++		wr.remote_addr = riu->raddr;
++		wr.rkey = riu->rkey;
++		wr.wr.num_sge = riu->sge_cnt;
++		wr.wr.sg_list = riu->sge;
+ 
+ 		/* only get completion event for the last rdma write */
+ 		if (i == (n_rdma - 1) && dir == DMA_TO_DEVICE)
+-			wr.send_flags = IB_SEND_SIGNALED;
++			wr.wr.send_flags = IB_SEND_SIGNALED;
+ 
+-		ret = ib_post_send(ch->qp, &wr, &bad_wr);
++		ret = ib_post_send(ch->qp, &wr.wr, &bad_wr);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -2882,11 +2882,11 @@ static int srpt_perform_rdmas(struct srpt_rdma_ch *ch,
+ 		pr_err("%s[%d]: ib_post_send() returned %d for %d/%d\n",
+ 				 __func__, __LINE__, ret, i, n_rdma);
+ 	if (ret && i > 0) {
+-		wr.num_sge = 0;
+-		wr.wr_id = encode_wr_id(SRPT_RDMA_ABORT, ioctx->ioctx.index);
+-		wr.send_flags = IB_SEND_SIGNALED;
++		wr.wr.num_sge = 0;
++		wr.wr.wr_id = encode_wr_id(SRPT_RDMA_ABORT, ioctx->ioctx.index);
++		wr.wr.send_flags = IB_SEND_SIGNALED;
+ 		while (ch->state == CH_LIVE &&
+-			ib_post_send(ch->qp, &wr, &bad_wr) != 0) {
++			ib_post_send(ch->qp, &wr.wr, &bad_wr) != 0) {
+ 			pr_info("Trying to abort failed RDMA transfer [%d]\n",
+ 				ioctx->ioctx.index);
+ 			msleep(1000);
+diff --git a/drivers/staging/hfi1/keys.c b/drivers/staging/hfi1/keys.c
+index f6eff177ace1..82c21b1c0263 100644
+--- a/drivers/staging/hfi1/keys.c
++++ b/drivers/staging/hfi1/keys.c
+@@ -358,12 +358,12 @@ bail:
+ /*
+  * Initialize the memory region specified by the work request.
+  */
+-int hfi1_fast_reg_mr(struct hfi1_qp *qp, struct ib_send_wr *wr)
++int hfi1_fast_reg_mr(struct hfi1_qp *qp, struct ib_fast_reg_wr *wr)
+ {
+ 	struct hfi1_lkey_table *rkt = &to_idev(qp->ibqp.device)->lk_table;
+ 	struct hfi1_pd *pd = to_ipd(qp->ibqp.pd);
+ 	struct hfi1_mregion *mr;
+-	u32 rkey = wr->wr.fast_reg.rkey;
++	u32 rkey = wr->rkey;
+ 	unsigned i, n, m;
+ 	int ret = -EINVAL;
+ 	unsigned long flags;
+@@ -380,22 +380,22 @@ int hfi1_fast_reg_mr(struct hfi1_qp *qp, struct ib_send_wr *wr)
+ 	if (unlikely(mr == NULL || qp->ibqp.pd != mr->pd))
+ 		goto bail;
+ 
+-	if (wr->wr.fast_reg.page_list_len > mr->max_segs)
++	if (wr->page_list_len > mr->max_segs)
+ 		goto bail;
+ 
+-	ps = 1UL << wr->wr.fast_reg.page_shift;
+-	if (wr->wr.fast_reg.length > ps * wr->wr.fast_reg.page_list_len)
++	ps = 1UL << wr->page_shift;
++	if (wr->length > ps * wr->page_list_len)
+ 		goto bail;
+ 
+-	mr->user_base = wr->wr.fast_reg.iova_start;
+-	mr->iova = wr->wr.fast_reg.iova_start;
++	mr->user_base = wr->iova_start;
++	mr->iova = wr->iova_start;
+ 	mr->lkey = rkey;
+-	mr->length = wr->wr.fast_reg.length;
+-	mr->access_flags = wr->wr.fast_reg.access_flags;
+-	page_list = wr->wr.fast_reg.page_list->page_list;
++	mr->length = wr->length;
++	mr->access_flags = wr->access_flags;
++	page_list = wr->page_list->page_list;
+ 	m = 0;
+ 	n = 0;
+-	for (i = 0; i < wr->wr.fast_reg.page_list_len; i++) {
++	for (i = 0; i < wr->page_list_len; i++) {
+ 		mr->map[m]->segs[n].vaddr = (void *) page_list[i];
+ 		mr->map[m]->segs[n].length = ps;
+ 		if (++n == HFI1_SEGSZ) {
+diff --git a/drivers/staging/hfi1/qp.c b/drivers/staging/hfi1/qp.c
+index df1fa56eaf85..f8c36166962f 100644
+--- a/drivers/staging/hfi1/qp.c
++++ b/drivers/staging/hfi1/qp.c
+@@ -422,7 +422,7 @@ static void clear_mr_refs(struct hfi1_qp *qp, int clr_sends)
+ 			if (qp->ibqp.qp_type == IB_QPT_UD ||
+ 			    qp->ibqp.qp_type == IB_QPT_SMI ||
+ 			    qp->ibqp.qp_type == IB_QPT_GSI)
+-				atomic_dec(&to_iah(wqe->wr.wr.ud.ah)->refcount);
++				atomic_dec(&to_iah(wqe->ud_wr.ah)->refcount);
+ 			if (++qp->s_last >= qp->s_size)
+ 				qp->s_last = 0;
+ 		}
+diff --git a/drivers/staging/hfi1/rc.c b/drivers/staging/hfi1/rc.c
+index 1e9caebb0281..80d41e7c6702 100644
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@ -404,9 +404,9 @@ int hfi1_make_rc_req(struct hfi1_qp *qp)
+ 				goto bail;
+ 			}
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / sizeof(u32);
+ 			wqe->lpsn = wqe->psn;
+@@ -455,9 +455,9 @@ int hfi1_make_rc_req(struct hfi1_qp *qp)
+ 				wqe->lpsn = qp->s_next_psn++;
+ 			}
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			qp->s_state = OP(RDMA_READ_REQUEST);
+ 			hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+@@ -488,21 +488,21 @@ int hfi1_make_rc_req(struct hfi1_qp *qp)
+ 			if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+ 				qp->s_state = OP(COMPARE_SWAP);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.swap);
++					wqe->atomic_wr.swap);
+ 				ohdr->u.atomic_eth.compare_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 			} else {
+ 				qp->s_state = OP(FETCH_ADD);
+ 				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+-					wqe->wr.wr.atomic.compare_add);
++					wqe->atomic_wr.compare_add);
+ 				ohdr->u.atomic_eth.compare_data = 0;
+ 			}
+ 			ohdr->u.atomic_eth.vaddr[0] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr >> 32);
++				wqe->atomic_wr.remote_addr >> 32);
+ 			ohdr->u.atomic_eth.vaddr[1] = cpu_to_be32(
+-				wqe->wr.wr.atomic.remote_addr);
++				wqe->atomic_wr.remote_addr);
+ 			ohdr->u.atomic_eth.rkey = cpu_to_be32(
+-				wqe->wr.wr.atomic.rkey);
++				wqe->atomic_wr.rkey);
+ 			hwords += sizeof(struct ib_atomic_eth) / sizeof(u32);
+ 			ss = NULL;
+ 			len = 0;
+@@ -629,9 +629,9 @@ int hfi1_make_rc_req(struct hfi1_qp *qp)
+ 		 */
+ 		len = (delta_psn(qp->s_psn, wqe->psn)) * pmtu;
+ 		ohdr->u.rc.reth.vaddr =
+-			cpu_to_be64(wqe->wr.wr.rdma.remote_addr + len);
++			cpu_to_be64(wqe->rdma_wr.remote_addr + len);
+ 		ohdr->u.rc.reth.rkey =
+-			cpu_to_be32(wqe->wr.wr.rdma.rkey);
++			cpu_to_be32(wqe->rdma_wr.rkey);
+ 		ohdr->u.rc.reth.length = cpu_to_be32(wqe->length - len);
+ 		qp->s_state = OP(RDMA_READ_REQUEST);
+ 		hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+diff --git a/drivers/staging/hfi1/ruc.c b/drivers/staging/hfi1/ruc.c
+index a4115288db66..d614474770b3 100644
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@ -481,8 +481,8 @@ again:
+ 		if (wqe->length == 0)
+ 			break;
+ 		if (unlikely(!hfi1_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
+-					   wqe->wr.wr.rdma.remote_addr,
+-					   wqe->wr.wr.rdma.rkey,
++					   wqe->rdma_wr.remote_addr,
++					   wqe->rdma_wr.rkey,
+ 					   IB_ACCESS_REMOTE_WRITE)))
+ 			goto acc_err;
+ 		qp->r_sge.sg_list = NULL;
+@@ -494,8 +494,8 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+ 			goto inv_err;
+ 		if (unlikely(!hfi1_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+-					   wqe->wr.wr.rdma.remote_addr,
+-					   wqe->wr.wr.rdma.rkey,
++					   wqe->rdma_wr.remote_addr,
++					   wqe->rdma_wr.rkey,
+ 					   IB_ACCESS_REMOTE_READ)))
+ 			goto acc_err;
+ 		release = 0;
+@@ -512,18 +512,18 @@ again:
+ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto inv_err;
+ 		if (unlikely(!hfi1_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+-					   wqe->wr.wr.atomic.remote_addr,
+-					   wqe->wr.wr.atomic.rkey,
++					   wqe->atomic_wr.remote_addr,
++					   wqe->atomic_wr.rkey,
+ 					   IB_ACCESS_REMOTE_ATOMIC)))
+ 			goto acc_err;
+ 		/* Perform atomic OP and save result. */
+ 		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+-		sdata = wqe->wr.wr.atomic.compare_add;
++		sdata = wqe->atomic_wr.compare_add;
+ 		*(u64 *) sqp->s_sge.sge.vaddr =
+ 			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ 			(u64) atomic64_add_return(sdata, maddr) - sdata :
+ 			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+-				      sdata, wqe->wr.wr.atomic.swap);
++				      sdata, wqe->atomic_wr.swap);
+ 		hfi1_put_mr(qp->r_sge.sge.mr);
+ 		qp->r_sge.num_sge = 0;
+ 		goto send_comp;
+@@ -913,7 +913,7 @@ void hfi1_send_complete(struct hfi1_qp *qp, struct hfi1_swqe *wqe,
+ 	if (qp->ibqp.qp_type == IB_QPT_UD ||
+ 	    qp->ibqp.qp_type == IB_QPT_SMI ||
+ 	    qp->ibqp.qp_type == IB_QPT_GSI)
+-		atomic_dec(&to_iah(wqe->wr.wr.ud.ah)->refcount);
++		atomic_dec(&to_iah(wqe->ud_wr.ah)->refcount);
+ 
+ 	/* See ch. 11.2.4.1 and 10.7.3.1 */
+ 	if (!(qp->s_flags & HFI1_S_SIGNAL_REQ_WR) ||
+diff --git a/drivers/staging/hfi1/uc.c b/drivers/staging/hfi1/uc.c
+index b536f397737c..6095039c4485 100644
+--- a/drivers/staging/hfi1/uc.c
++++ b/drivers/staging/hfi1/uc.c
+@@ -147,9 +147,9 @@ int hfi1_make_uc_req(struct hfi1_qp *qp)
+ 		case IB_WR_RDMA_WRITE:
+ 		case IB_WR_RDMA_WRITE_WITH_IMM:
+ 			ohdr->u.rc.reth.vaddr =
+-				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
++				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ 			ohdr->u.rc.reth.rkey =
+-				cpu_to_be32(wqe->wr.wr.rdma.rkey);
++				cpu_to_be32(wqe->rdma_wr.rkey);
+ 			ohdr->u.rc.reth.length = cpu_to_be32(len);
+ 			hwords += sizeof(struct ib_reth) / 4;
+ 			if (len > pmtu) {
+diff --git a/drivers/staging/hfi1/ud.c b/drivers/staging/hfi1/ud.c
+index d40d1a1e10aa..5a9c784bec04 100644
+--- a/drivers/staging/hfi1/ud.c
++++ b/drivers/staging/hfi1/ud.c
+@@ -80,7 +80,7 @@ static void ud_loopback(struct hfi1_qp *sqp, struct hfi1_swqe *swqe)
+ 
+ 	rcu_read_lock();
+ 
+-	qp = hfi1_lookup_qpn(ibp, swqe->wr.wr.ud.remote_qpn);
++	qp = hfi1_lookup_qpn(ibp, swqe->ud_wr.remote_qpn);
+ 	if (!qp) {
+ 		ibp->n_pkt_drops++;
+ 		rcu_read_unlock();
+@@ -98,7 +98,7 @@ static void ud_loopback(struct hfi1_qp *sqp, struct hfi1_swqe *swqe)
+ 		goto drop;
+ 	}
+ 
+-	ah_attr = &to_iah(swqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(swqe->ud_wr.ah)->attr;
+ 	ppd = ppd_from_ibp(ibp);
+ 
+ 	if (qp->ibqp.qp_num > 1) {
+@@ -128,8 +128,8 @@ static void ud_loopback(struct hfi1_qp *sqp, struct hfi1_swqe *swqe)
+ 	if (qp->ibqp.qp_num) {
+ 		u32 qkey;
+ 
+-		qkey = (int)swqe->wr.wr.ud.remote_qkey < 0 ?
+-			sqp->qkey : swqe->wr.wr.ud.remote_qkey;
++		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
++			sqp->qkey : swqe->ud_wr.remote_qkey;
+ 		if (unlikely(qkey != qp->qkey)) {
+ 			u16 lid;
+ 
+@@ -234,7 +234,7 @@ static void ud_loopback(struct hfi1_qp *sqp, struct hfi1_swqe *swqe)
+ 	if (qp->ibqp.qp_type == IB_QPT_GSI || qp->ibqp.qp_type == IB_QPT_SMI) {
+ 		if (sqp->ibqp.qp_type == IB_QPT_GSI ||
+ 		    sqp->ibqp.qp_type == IB_QPT_SMI)
+-			wc.pkey_index = swqe->wr.wr.ud.pkey_index;
++			wc.pkey_index = swqe->ud_wr.pkey_index;
+ 		else
+ 			wc.pkey_index = sqp->s_pkey_index;
+ 	} else {
+@@ -309,7 +309,7 @@ int hfi1_make_ud_req(struct hfi1_qp *qp)
+ 	/* Construct the header. */
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+-	ah_attr = &to_iah(wqe->wr.wr.ud.ah)->attr;
++	ah_attr = &to_iah(wqe->ud_wr.ah)->attr;
+ 	if (ah_attr->dlid < HFI1_MULTICAST_LID_BASE ||
+ 	    ah_attr->dlid == HFI1_PERMISSIVE_LID) {
+ 		lid = ah_attr->dlid & ~((1 << ppd->lmc) - 1);
+@@ -401,18 +401,18 @@ int hfi1_make_ud_req(struct hfi1_qp *qp)
+ 		bth0 |= IB_BTH_SOLICITED;
+ 	bth0 |= extra_bytes << 20;
+ 	if (qp->ibqp.qp_type == IB_QPT_GSI || qp->ibqp.qp_type == IB_QPT_SMI)
+-		bth0 |= hfi1_get_pkey(ibp, wqe->wr.wr.ud.pkey_index);
++		bth0 |= hfi1_get_pkey(ibp, wqe->ud_wr.pkey_index);
+ 	else
+ 		bth0 |= hfi1_get_pkey(ibp, qp->s_pkey_index);
+ 	ohdr->bth[0] = cpu_to_be32(bth0);
+-	ohdr->bth[1] = cpu_to_be32(wqe->wr.wr.ud.remote_qpn);
++	ohdr->bth[1] = cpu_to_be32(wqe->ud_wr.remote_qpn);
+ 	ohdr->bth[2] = cpu_to_be32(mask_psn(qp->s_next_psn++));
+ 	/*
+ 	 * Qkeys with the high order bit set mean use the
+ 	 * qkey from the QP context instead of the WR (see 10.2.5).
+ 	 */
+-	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->wr.wr.ud.remote_qkey < 0 ?
+-					 qp->qkey : wqe->wr.wr.ud.remote_qkey);
++	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
++					 qp->qkey : wqe->ud_wr.remote_qkey);
+ 	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+ 	/* disarm any ahg */
+ 	qp->s_hdr->ahgcount = 0;
+diff --git a/drivers/staging/hfi1/verbs.c b/drivers/staging/hfi1/verbs.c
+index a43fccd68a73..e2850de025f0 100644
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@ -391,7 +391,7 @@ static int post_one_send(struct hfi1_qp *qp, struct ib_send_wr *wr)
+ 		    wr->opcode != IB_WR_SEND_WITH_IMM)
+ 			return -EINVAL;
+ 		/* Check UD destination address PD */
+-		if (qp->ibqp.pd != wr->wr.ud.ah->pd)
++		if (qp->ibqp.pd != ud_wr(wr)->ah->pd)
+ 			return -EINVAL;
+ 	} else if ((unsigned) wr->opcode > IB_WR_ATOMIC_FETCH_AND_ADD)
+ 		return -EINVAL;
+@@ -412,7 +412,24 @@ static int post_one_send(struct hfi1_qp *qp, struct ib_send_wr *wr)
+ 	rkt = &to_idev(qp->ibqp.device)->lk_table;
+ 	pd = to_ipd(qp->ibqp.pd);
+ 	wqe = get_swqe_ptr(qp, qp->s_head);
+-	wqe->wr = *wr;
++
++
++	if (qp->ibqp.qp_type != IB_QPT_UC &&
++	    qp->ibqp.qp_type != IB_QPT_RC)
++		memcpy(&wqe->ud_wr, ud_wr(wr), sizeof(wqe->ud_wr));
++	else if (wr->opcode == IB_WR_FAST_REG_MR)
++		memcpy(&wqe->fast_reg_wr, fast_reg_wr(wr),
++			sizeof(wqe->fast_reg_wr));
++	else if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM ||
++		 wr->opcode == IB_WR_RDMA_WRITE ||
++		 wr->opcode == IB_WR_RDMA_READ)
++		memcpy(&wqe->rdma_wr, rdma_wr(wr), sizeof(wqe->rdma_wr));
++	else if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
++		 wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
++		memcpy(&wqe->atomic_wr, atomic_wr(wr), sizeof(wqe->atomic_wr));
++	else
++		memcpy(&wqe->wr, wr, sizeof(wqe->wr));
++
+ 	wqe->length = 0;
+ 	j = 0;
+ 	if (wr->num_sge) {
+@@ -438,7 +455,7 @@ static int post_one_send(struct hfi1_qp *qp, struct ib_send_wr *wr)
+ 		if (wqe->length > 0x80000000U)
+ 			goto bail_inval_free;
+ 	} else {
+-		struct hfi1_ah *ah = to_iah(wr->wr.ud.ah);
++		struct hfi1_ah *ah = to_iah(ud_wr(wr)->ah);
+ 
+ 		atomic_inc(&ah->refcount);
+ 	}
+diff --git a/drivers/staging/hfi1/verbs.h b/drivers/staging/hfi1/verbs.h
+index ed903a93baf7..cf5a3c956284 100644
+--- a/drivers/staging/hfi1/verbs.h
++++ b/drivers/staging/hfi1/verbs.h
+@@ -348,7 +348,13 @@ struct hfi1_mr {
+  * in qp->s_max_sge.
+  */
+ struct hfi1_swqe {
+-	struct ib_send_wr wr;   /* don't use wr.sg_list */
++	union {
++		struct ib_send_wr wr;   /* don't use wr.sg_list */
++		struct ib_rdma_wr rdma_wr;
++		struct ib_atomic_wr atomic_wr;
++		struct ib_ud_wr ud_wr;
++		struct ib_fast_reg_wr fast_reg_wr;
++	};
+ 	u32 psn;                /* first packet sequence number */
+ 	u32 lpsn;               /* last packet sequence number */
+ 	u32 ssn;                /* send sequence number */
+@@ -1025,7 +1031,7 @@ struct ib_fast_reg_page_list *hfi1_alloc_fast_reg_page_list(
+ 
+ void hfi1_free_fast_reg_page_list(struct ib_fast_reg_page_list *pl);
+ 
+-int hfi1_fast_reg_mr(struct hfi1_qp *qp, struct ib_send_wr *wr);
++int hfi1_fast_reg_mr(struct hfi1_qp *qp, struct ib_fast_reg_wr *wr);
+ 
+ struct ib_fmr *hfi1_alloc_fmr(struct ib_pd *pd, int mr_access_flags,
+ 			      struct ib_fmr_attr *fmr_attr);
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
+* Unmerged path drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index e1f65e204d37..c9abc8fec620 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1101,54 +1101,94 @@ struct ib_send_wr {
+ 		__be32		imm_data;
+ 		u32		invalidate_rkey;
+ 	} ex;
+-	union {
+-		struct {
+-			u64	remote_addr;
+-			u32	rkey;
+-		} rdma;
+-		struct {
+-			u64	remote_addr;
+-			u64	compare_add;
+-			u64	swap;
+-			u64	compare_add_mask;
+-			u64	swap_mask;
+-			u32	rkey;
+-		} atomic;
+-		struct {
+-			struct ib_ah *ah;
+-			void   *header;
+-			int     hlen;
+-			int     mss;
+-			u32	remote_qpn;
+-			u32	remote_qkey;
+-			u16	pkey_index; /* valid for GSI only */
+-			u8	port_num;   /* valid for DR SMPs on switch only */
+-		} ud;
+-		struct {
+-			u64				iova_start;
+-			struct ib_fast_reg_page_list   *page_list;
+-			unsigned int			page_shift;
+-			unsigned int			page_list_len;
+-			u32				length;
+-			int				access_flags;
+-			u32				rkey;
+-		} fast_reg;
+-		struct {
+-			struct ib_mw            *mw;
+-			/* The new rkey for the memory window. */
+-			u32                      rkey;
+-			struct ib_mw_bind_info   bind_info;
+-		} bind_mw;
+-		struct {
+-			struct ib_sig_attrs    *sig_attrs;
+-			struct ib_mr	       *sig_mr;
+-			int			access_flags;
+-			struct ib_sge	       *prot;
+-		} sig_handover;
+-	} wr;
+ 	u32			xrc_remote_srq_num;	/* XRC TGT QPs only */
+ };
+ 
++struct ib_rdma_wr {
++	struct ib_send_wr	wr;
++	u64			remote_addr;
++	u32			rkey;
++};
++
++static inline struct ib_rdma_wr *rdma_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_rdma_wr, wr);
++}
++
++struct ib_atomic_wr {
++	struct ib_send_wr	wr;
++	u64			remote_addr;
++	u64			compare_add;
++	u64			swap;
++	u64			compare_add_mask;
++	u64			swap_mask;
++	u32			rkey;
++};
++
++static inline struct ib_atomic_wr *atomic_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_atomic_wr, wr);
++}
++
++struct ib_ud_wr {
++	struct ib_send_wr	wr;
++	struct ib_ah		*ah;
++	void			*header;
++	int			hlen;
++	int			mss;
++	u32			remote_qpn;
++	u32			remote_qkey;
++	u16			pkey_index; /* valid for GSI only */
++	u8			port_num;   /* valid for DR SMPs on switch only */
++};
++
++static inline struct ib_ud_wr *ud_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_ud_wr, wr);
++}
++
++struct ib_fast_reg_wr {
++	struct ib_send_wr	wr;
++	u64			iova_start;
++	struct ib_fast_reg_page_list *page_list;
++	unsigned int		page_shift;
++	unsigned int		page_list_len;
++	u32			length;
++	int			access_flags;
++	u32			rkey;
++};
++
++static inline struct ib_fast_reg_wr *fast_reg_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_fast_reg_wr, wr);
++}
++
++struct ib_bind_mw_wr {
++	struct ib_send_wr	wr;
++	struct ib_mw		*mw;
++	/* The new rkey for the memory window. */
++	u32			rkey;
++	struct ib_mw_bind_info	bind_info;
++};
++
++static inline struct ib_bind_mw_wr *bind_mw_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_bind_mw_wr, wr);
++}
++
++struct ib_sig_handover_wr {
++	struct ib_send_wr	wr;
++	struct ib_sig_attrs    *sig_attrs;
++	struct ib_mr	       *sig_mr;
++	int			access_flags;
++	struct ib_sge	       *prot;
++};
++
++static inline struct ib_sig_handover_wr *sig_handover_wr(struct ib_send_wr *wr)
++{
++	return container_of(wr, struct ib_sig_handover_wr, wr);
++}
++
+ struct ib_recv_wr {
+ 	struct ib_recv_wr      *next;
+ 	u64			wr_id;
+diff --git a/net/rds/ib.h b/net/rds/ib.h
+index 46b9a6594257..1632a06d4df0 100644
+--- a/net/rds/ib.h
++++ b/net/rds/ib.h
+@@ -72,7 +72,11 @@ struct rds_ib_connect_private {
+ 
+ struct rds_ib_send_work {
+ 	void			*s_op;
+-	struct ib_send_wr	s_wr;
++	union {
++		struct ib_send_wr	s_wr;
++		struct ib_rdma_wr	s_rdma_wr;
++		struct ib_atomic_wr	s_atomic_wr;
++	};
+ 	struct ib_sge		s_sge[RDS_IB_MAX_SGE];
+ 	unsigned long		s_queued;
+ };
+diff --git a/net/rds/ib_send.c b/net/rds/ib_send.c
+index a7bb8b3ffd9d..d94be727df94 100644
+--- a/net/rds/ib_send.c
++++ b/net/rds/ib_send.c
+@@ -786,23 +786,23 @@ int rds_ib_xmit_atomic(struct rds_connection *conn, struct rm_atomic_op *op)
+ 	send->s_queued = jiffies;
+ 
+ 	if (op->op_type == RDS_ATOMIC_TYPE_CSWP) {
+-		send->s_wr.opcode = IB_WR_MASKED_ATOMIC_CMP_AND_SWP;
+-		send->s_wr.wr.atomic.compare_add = op->op_m_cswp.compare;
+-		send->s_wr.wr.atomic.swap = op->op_m_cswp.swap;
+-		send->s_wr.wr.atomic.compare_add_mask = op->op_m_cswp.compare_mask;
+-		send->s_wr.wr.atomic.swap_mask = op->op_m_cswp.swap_mask;
++		send->s_atomic_wr.wr.opcode = IB_WR_MASKED_ATOMIC_CMP_AND_SWP;
++		send->s_atomic_wr.compare_add = op->op_m_cswp.compare;
++		send->s_atomic_wr.swap = op->op_m_cswp.swap;
++		send->s_atomic_wr.compare_add_mask = op->op_m_cswp.compare_mask;
++		send->s_atomic_wr.swap_mask = op->op_m_cswp.swap_mask;
+ 	} else { /* FADD */
+-		send->s_wr.opcode = IB_WR_MASKED_ATOMIC_FETCH_AND_ADD;
+-		send->s_wr.wr.atomic.compare_add = op->op_m_fadd.add;
+-		send->s_wr.wr.atomic.swap = 0;
+-		send->s_wr.wr.atomic.compare_add_mask = op->op_m_fadd.nocarry_mask;
+-		send->s_wr.wr.atomic.swap_mask = 0;
++		send->s_atomic_wr.wr.opcode = IB_WR_MASKED_ATOMIC_FETCH_AND_ADD;
++		send->s_atomic_wr.compare_add = op->op_m_fadd.add;
++		send->s_atomic_wr.swap = 0;
++		send->s_atomic_wr.compare_add_mask = op->op_m_fadd.nocarry_mask;
++		send->s_atomic_wr.swap_mask = 0;
+ 	}
+ 	nr_sig = rds_ib_set_wr_signal_state(ic, send, op->op_notify);
+-	send->s_wr.num_sge = 1;
+-	send->s_wr.next = NULL;
+-	send->s_wr.wr.atomic.remote_addr = op->op_remote_addr;
+-	send->s_wr.wr.atomic.rkey = op->op_rkey;
++	send->s_atomic_wr.wr.num_sge = 1;
++	send->s_atomic_wr.wr.next = NULL;
++	send->s_atomic_wr.remote_addr = op->op_remote_addr;
++	send->s_atomic_wr.rkey = op->op_rkey;
+ 	send->s_op = op;
+ 	rds_message_addref(container_of(send->s_op, struct rds_message, atomic));
+ 
+@@ -827,11 +827,11 @@ int rds_ib_xmit_atomic(struct rds_connection *conn, struct rm_atomic_op *op)
+ 	if (nr_sig)
+ 		atomic_add(nr_sig, &ic->i_signaled_sends);
+ 
+-	failed_wr = &send->s_wr;
+-	ret = ib_post_send(ic->i_cm_id->qp, &send->s_wr, &failed_wr);
++	failed_wr = &send->s_atomic_wr.wr;
++	ret = ib_post_send(ic->i_cm_id->qp, &send->s_atomic_wr.wr, &failed_wr);
+ 	rdsdebug("ic %p send %p (wr %p) ret %d wr %p\n", ic,
+-		 send, &send->s_wr, ret, failed_wr);
+-	BUG_ON(failed_wr != &send->s_wr);
++		 send, &send->s_atomic_wr, ret, failed_wr);
++	BUG_ON(failed_wr != &send->s_atomic_wr.wr);
+ 	if (ret) {
+ 		printk(KERN_WARNING "RDS/IB: atomic ib_post_send to %pI4 "
+ 		       "returned %d\n", &conn->c_faddr, ret);
+@@ -840,9 +840,9 @@ int rds_ib_xmit_atomic(struct rds_connection *conn, struct rm_atomic_op *op)
+ 		goto out;
+ 	}
+ 
+-	if (unlikely(failed_wr != &send->s_wr)) {
++	if (unlikely(failed_wr != &send->s_atomic_wr.wr)) {
+ 		printk(KERN_WARNING "RDS/IB: atomic ib_post_send() rc=%d, but failed_wqe updated!\n", ret);
+-		BUG_ON(failed_wr != &send->s_wr);
++		BUG_ON(failed_wr != &send->s_atomic_wr.wr);
+ 	}
+ 
+ out:
+@@ -913,22 +913,23 @@ int rds_ib_xmit_rdma(struct rds_connection *conn, struct rm_rdma_op *op)
+ 		nr_sig += rds_ib_set_wr_signal_state(ic, send, op->op_notify);
+ 
+ 		send->s_wr.opcode = op->op_write ? IB_WR_RDMA_WRITE : IB_WR_RDMA_READ;
+-		send->s_wr.wr.rdma.remote_addr = remote_addr;
+-		send->s_wr.wr.rdma.rkey = op->op_rkey;
++		send->s_rdma_wr.remote_addr = remote_addr;
++		send->s_rdma_wr.rkey = op->op_rkey;
+ 
+ 		if (num_sge > max_sge) {
+-			send->s_wr.num_sge = max_sge;
++			send->s_rdma_wr.wr.num_sge = max_sge;
+ 			num_sge -= max_sge;
+ 		} else {
+-			send->s_wr.num_sge = num_sge;
++			send->s_rdma_wr.wr.num_sge = num_sge;
+ 		}
+ 
+-		send->s_wr.next = NULL;
++		send->s_rdma_wr.wr.next = NULL;
+ 
+ 		if (prev)
+-			prev->s_wr.next = &send->s_wr;
++			prev->s_rdma_wr.wr.next = &send->s_rdma_wr.wr;
+ 
+-		for (j = 0; j < send->s_wr.num_sge && scat != &op->op_sg[op->op_count]; j++) {
++		for (j = 0; j < send->s_rdma_wr.wr.num_sge &&
++		     scat != &op->op_sg[op->op_count]; j++) {
+ 			len = ib_sg_dma_len(ic->i_cm_id->device, scat);
+ 			send->s_sge[j].addr =
+ 				 ib_sg_dma_address(ic->i_cm_id->device, scat);
+@@ -943,7 +944,9 @@ int rds_ib_xmit_rdma(struct rds_connection *conn, struct rm_rdma_op *op)
+ 		}
+ 
+ 		rdsdebug("send %p wr %p num_sge %u next %p\n", send,
+-			&send->s_wr, send->s_wr.num_sge, send->s_wr.next);
++			&send->s_rdma_wr.wr,
++			send->s_rdma_wr.wr.num_sge,
++			send->s_rdma_wr.wr.next);
+ 
+ 		prev = send;
+ 		if (++send == &ic->i_sends[ic->i_send_ring.w_nr])
+@@ -964,11 +967,11 @@ int rds_ib_xmit_rdma(struct rds_connection *conn, struct rm_rdma_op *op)
+ 	if (nr_sig)
+ 		atomic_add(nr_sig, &ic->i_signaled_sends);
+ 
+-	failed_wr = &first->s_wr;
+-	ret = ib_post_send(ic->i_cm_id->qp, &first->s_wr, &failed_wr);
++	failed_wr = &first->s_rdma_wr.wr;
++	ret = ib_post_send(ic->i_cm_id->qp, &first->s_rdma_wr.wr, &failed_wr);
+ 	rdsdebug("ic %p first %p (wr %p) ret %d wr %p\n", ic,
+-		 first, &first->s_wr, ret, failed_wr);
+-	BUG_ON(failed_wr != &first->s_wr);
++		 first, &first->s_rdma_wr.wr, ret, failed_wr);
++	BUG_ON(failed_wr != &first->s_rdma_wr.wr);
+ 	if (ret) {
+ 		printk(KERN_WARNING "RDS/IB: rdma ib_post_send to %pI4 "
+ 		       "returned %d\n", &conn->c_faddr, ret);
+@@ -977,9 +980,9 @@ int rds_ib_xmit_rdma(struct rds_connection *conn, struct rm_rdma_op *op)
+ 		goto out;
+ 	}
+ 
+-	if (unlikely(failed_wr != &first->s_wr)) {
++	if (unlikely(failed_wr != &first->s_rdma_wr.wr)) {
+ 		printk(KERN_WARNING "RDS/IB: ib_post_send() rc=%d, but failed_wqe updated!\n", ret);
+-		BUG_ON(failed_wr != &first->s_wr);
++		BUG_ON(failed_wr != &first->s_rdma_wr.wr);
+ 	}
+ 
+ 
+diff --git a/net/rds/iw.h b/net/rds/iw.h
+index 04ce3b193f79..79e3ffdd072f 100644
+--- a/net/rds/iw.h
++++ b/net/rds/iw.h
+@@ -77,7 +77,11 @@ struct rds_iw_send_work {
+ 	struct ib_fast_reg_page_list *s_page_list;
+ 	unsigned char		s_remap_count;
+ 
+-	struct ib_send_wr	s_wr;
++	union {
++		struct ib_send_wr	s_send_wr;
++		struct ib_rdma_wr	s_rdma_wr;
++		struct ib_fast_reg_wr	s_fast_reg_wr;
++	};
+ 	struct ib_sge		s_sge[RDS_IW_MAX_SGE];
+ 	unsigned long		s_queued;
+ };
+diff --git a/net/rds/iw_rdma.c b/net/rds/iw_rdma.c
+index b6ec2a6c7add..954857733b39 100644
+--- a/net/rds/iw_rdma.c
++++ b/net/rds/iw_rdma.c
+@@ -692,7 +692,8 @@ static int rds_iw_init_fastreg(struct rds_iw_mr_pool *pool,
+ static int rds_iw_rdma_build_fastreg(struct rds_iw_mapping *mapping)
+ {
+ 	struct rds_iw_mr *ibmr = mapping->m_mr;
+-	struct ib_send_wr f_wr, *failed_wr;
++	struct ib_fast_reg_wr f_wr;
++	struct ib_send_wr *failed_wr;
+ 	int ret;
+ 
+ 	/*
+@@ -705,22 +706,22 @@ static int rds_iw_rdma_build_fastreg(struct rds_iw_mapping *mapping)
+ 	mapping->m_rkey = ibmr->mr->rkey;
+ 
+ 	memset(&f_wr, 0, sizeof(f_wr));
+-	f_wr.wr_id = RDS_IW_FAST_REG_WR_ID;
+-	f_wr.opcode = IB_WR_FAST_REG_MR;
+-	f_wr.wr.fast_reg.length = mapping->m_sg.bytes;
+-	f_wr.wr.fast_reg.rkey = mapping->m_rkey;
+-	f_wr.wr.fast_reg.page_list = ibmr->page_list;
+-	f_wr.wr.fast_reg.page_list_len = mapping->m_sg.dma_len;
+-	f_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
+-	f_wr.wr.fast_reg.access_flags = IB_ACCESS_LOCAL_WRITE |
++	f_wr.wr.wr_id = RDS_IW_FAST_REG_WR_ID;
++	f_wr.wr.opcode = IB_WR_FAST_REG_MR;
++	f_wr.length = mapping->m_sg.bytes;
++	f_wr.rkey = mapping->m_rkey;
++	f_wr.page_list = ibmr->page_list;
++	f_wr.page_list_len = mapping->m_sg.dma_len;
++	f_wr.page_shift = PAGE_SHIFT;
++	f_wr.access_flags = IB_ACCESS_LOCAL_WRITE |
+ 				IB_ACCESS_REMOTE_READ |
+ 				IB_ACCESS_REMOTE_WRITE;
+-	f_wr.wr.fast_reg.iova_start = 0;
+-	f_wr.send_flags = IB_SEND_SIGNALED;
++	f_wr.iova_start = 0;
++	f_wr.wr.send_flags = IB_SEND_SIGNALED;
+ 
+-	failed_wr = &f_wr;
+-	ret = ib_post_send(ibmr->cm_id->qp, &f_wr, &failed_wr);
+-	BUG_ON(failed_wr != &f_wr);
++	failed_wr = &f_wr.wr;
++	ret = ib_post_send(ibmr->cm_id->qp, &f_wr.wr, &failed_wr);
++	BUG_ON(failed_wr != &f_wr.wr);
+ 	if (ret)
+ 		printk_ratelimited(KERN_WARNING "RDS/IW: %s:%d ib_post_send returned %d\n",
+ 			__func__, __LINE__, ret);
+* Unmerged path net/rds/iw_send.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index f0c3ff67ca98..3b3e71efe860 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@ -126,7 +126,7 @@ int rdma_read_chunk_lcl(struct svcxprt_rdma *xprt,
+ 			u64 rs_offset,
+ 			bool last)
+ {
+-	struct ib_send_wr read_wr;
++	struct ib_rdma_wr read_wr;
+ 	int pages_needed = PAGE_ALIGN(*page_offset + rs_length) >> PAGE_SHIFT;
+ 	struct svc_rdma_op_ctxt *ctxt = svc_rdma_get_context(xprt);
+ 	int ret, read, pno;
+@@ -180,16 +180,16 @@ int rdma_read_chunk_lcl(struct svcxprt_rdma *xprt,
+ 		clear_bit(RDMACTXT_F_LAST_CTXT, &ctxt->flags);
+ 
+ 	memset(&read_wr, 0, sizeof(read_wr));
+-	read_wr.wr_id = (unsigned long)ctxt;
+-	read_wr.opcode = IB_WR_RDMA_READ;
+-	ctxt->wr_op = read_wr.opcode;
+-	read_wr.send_flags = IB_SEND_SIGNALED;
+-	read_wr.wr.rdma.rkey = rs_handle;
+-	read_wr.wr.rdma.remote_addr = rs_offset;
+-	read_wr.sg_list = ctxt->sge;
+-	read_wr.num_sge = pages_needed;
+-
+-	ret = svc_rdma_send(xprt, &read_wr);
++	read_wr.wr.wr_id = (unsigned long)ctxt;
++	read_wr.wr.opcode = IB_WR_RDMA_READ;
++	ctxt->wr_op = read_wr.wr.opcode;
++	read_wr.wr.send_flags = IB_SEND_SIGNALED;
++	read_wr.rkey = rs_handle;
++	read_wr.remote_addr = rs_offset;
++	read_wr.wr.sg_list = ctxt->sge;
++	read_wr.wr.num_sge = pages_needed;
++
++	ret = svc_rdma_send(xprt, &read_wr.wr);
+ 	if (ret) {
+ 		pr_err("svcrdma: Error %d posting RDMA_READ\n", ret);
+ 		set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
+@@ -219,9 +219,9 @@ int rdma_read_chunk_frmr(struct svcxprt_rdma *xprt,
+ 			 u64 rs_offset,
+ 			 bool last)
+ {
+-	struct ib_send_wr read_wr;
++	struct ib_rdma_wr read_wr;
+ 	struct ib_send_wr inv_wr;
+-	struct ib_send_wr fastreg_wr;
++	struct ib_fast_reg_wr fastreg_wr;
+ 	u8 key;
+ 	int pages_needed = PAGE_ALIGN(*page_offset + rs_length) >> PAGE_SHIFT;
+ 	struct svc_rdma_op_ctxt *ctxt = svc_rdma_get_context(xprt);
+@@ -291,31 +291,31 @@ int rdma_read_chunk_frmr(struct svcxprt_rdma *xprt,
+ 
+ 	/* Prepare FASTREG WR */
+ 	memset(&fastreg_wr, 0, sizeof(fastreg_wr));
+-	fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+-	fastreg_wr.send_flags = IB_SEND_SIGNALED;
+-	fastreg_wr.wr.fast_reg.iova_start = (unsigned long)frmr->kva;
+-	fastreg_wr.wr.fast_reg.page_list = frmr->page_list;
+-	fastreg_wr.wr.fast_reg.page_list_len = frmr->page_list_len;
+-	fastreg_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
+-	fastreg_wr.wr.fast_reg.length = frmr->map_len;
+-	fastreg_wr.wr.fast_reg.access_flags = frmr->access_flags;
+-	fastreg_wr.wr.fast_reg.rkey = frmr->mr->lkey;
+-	fastreg_wr.next = &read_wr;
++	fastreg_wr.wr.opcode = IB_WR_FAST_REG_MR;
++	fastreg_wr.wr.send_flags = IB_SEND_SIGNALED;
++	fastreg_wr.iova_start = (unsigned long)frmr->kva;
++	fastreg_wr.page_list = frmr->page_list;
++	fastreg_wr.page_list_len = frmr->page_list_len;
++	fastreg_wr.page_shift = PAGE_SHIFT;
++	fastreg_wr.length = frmr->map_len;
++	fastreg_wr.access_flags = frmr->access_flags;
++	fastreg_wr.rkey = frmr->mr->lkey;
++	fastreg_wr.wr.next = &read_wr.wr;
+ 
+ 	/* Prepare RDMA_READ */
+ 	memset(&read_wr, 0, sizeof(read_wr));
+-	read_wr.send_flags = IB_SEND_SIGNALED;
+-	read_wr.wr.rdma.rkey = rs_handle;
+-	read_wr.wr.rdma.remote_addr = rs_offset;
+-	read_wr.sg_list = ctxt->sge;
+-	read_wr.num_sge = 1;
++	read_wr.wr.send_flags = IB_SEND_SIGNALED;
++	read_wr.rkey = rs_handle;
++	read_wr.remote_addr = rs_offset;
++	read_wr.wr.sg_list = ctxt->sge;
++	read_wr.wr.num_sge = 1;
+ 	if (xprt->sc_dev_caps & SVCRDMA_DEVCAP_READ_W_INV) {
+-		read_wr.opcode = IB_WR_RDMA_READ_WITH_INV;
+-		read_wr.wr_id = (unsigned long)ctxt;
+-		read_wr.ex.invalidate_rkey = ctxt->frmr->mr->lkey;
++		read_wr.wr.opcode = IB_WR_RDMA_READ_WITH_INV;
++		read_wr.wr.wr_id = (unsigned long)ctxt;
++		read_wr.wr.ex.invalidate_rkey = ctxt->frmr->mr->lkey;
+ 	} else {
+-		read_wr.opcode = IB_WR_RDMA_READ;
+-		read_wr.next = &inv_wr;
++		read_wr.wr.opcode = IB_WR_RDMA_READ;
++		read_wr.wr.next = &inv_wr;
+ 		/* Prepare invalidate */
+ 		memset(&inv_wr, 0, sizeof(inv_wr));
+ 		inv_wr.wr_id = (unsigned long)ctxt;
+@@ -323,10 +323,10 @@ int rdma_read_chunk_frmr(struct svcxprt_rdma *xprt,
+ 		inv_wr.send_flags = IB_SEND_SIGNALED | IB_SEND_FENCE;
+ 		inv_wr.ex.invalidate_rkey = frmr->mr->lkey;
+ 	}
+-	ctxt->wr_op = read_wr.opcode;
++	ctxt->wr_op = read_wr.wr.opcode;
+ 
+ 	/* Post the chain */
+-	ret = svc_rdma_send(xprt, &fastreg_wr);
++	ret = svc_rdma_send(xprt, &fastreg_wr.wr);
+ 	if (ret) {
+ 		pr_err("svcrdma: Error %d posting RDMA_READ\n", ret);
+ 		set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_sendto.c b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index cc3fac70562c..a14652141625 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@ -217,7 +217,7 @@ static int send_write(struct svcxprt_rdma *xprt, struct svc_rqst *rqstp,
+ 		      u32 xdr_off, int write_len,
+ 		      struct svc_rdma_req_map *vec)
+ {
+-	struct ib_send_wr write_wr;
++	struct ib_rdma_wr write_wr;
+ 	struct ib_sge *sge;
+ 	int xdr_sge_no;
+ 	int sge_no;
+@@ -282,17 +282,17 @@ static int send_write(struct svcxprt_rdma *xprt, struct svc_rqst *rqstp,
+ 	/* Prepare WRITE WR */
+ 	memset(&write_wr, 0, sizeof write_wr);
+ 	ctxt->wr_op = IB_WR_RDMA_WRITE;
+-	write_wr.wr_id = (unsigned long)ctxt;
+-	write_wr.sg_list = &sge[0];
+-	write_wr.num_sge = sge_no;
+-	write_wr.opcode = IB_WR_RDMA_WRITE;
+-	write_wr.send_flags = IB_SEND_SIGNALED;
+-	write_wr.wr.rdma.rkey = rmr;
+-	write_wr.wr.rdma.remote_addr = to;
++	write_wr.wr.wr_id = (unsigned long)ctxt;
++	write_wr.wr.sg_list = &sge[0];
++	write_wr.wr.num_sge = sge_no;
++	write_wr.wr.opcode = IB_WR_RDMA_WRITE;
++	write_wr.wr.send_flags = IB_SEND_SIGNALED;
++	write_wr.rkey = rmr;
++	write_wr.remote_addr = to;
+ 
+ 	/* Post It */
+ 	atomic_inc(&rdma_stat_write);
+-	if (svc_rdma_send(xprt, &write_wr))
++	if (svc_rdma_send(xprt, &write_wr.wr))
+ 		goto err;
+ 	return write_len - bc;
+  err:
