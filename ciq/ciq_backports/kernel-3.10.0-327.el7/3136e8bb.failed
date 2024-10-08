@@ -1,0 +1,147 @@
+xfs: always drain dio before extending aio write submission
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 3136e8bb3054d3bb68942f8f1ee6c26c05f798b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3136e8bb.failed
+
+XFS supports and typically allows concurrent asynchronous direct I/O
+submission to a single file. One exception to the rule is that file
+extending dio writes that start beyond the current EOF (e.g.,
+potentially create a hole at EOF) require exclusive I/O access to the
+file. This is because such writes must zero any pre-existing blocks
+beyond EOF that are exposed by virtue of now residing within EOF as a
+result of the write about to be submitted.
+
+Before EOF zeroing can occur, the current file i_size must be stabilized
+to avoid data corruption. In this scenario, XFS upgrades the iolock to
+exclude any further I/O submission, waits on in-flight I/O to complete
+to ensure i_size is up to date (i_size is updated on dio write
+completion) and restarts the various checks against the state of the
+file. The problem is that this protection sequence is triggered only
+when the iolock is currently held shared. While this is true for async
+dio in most cases, the caller may upgrade the lock in advance based on
+arbitrary circumstances with respect to EOF zeroing. For example, the
+iolock is always acquired exclusively if the start offset is not block
+aligned. This means that even though the iolock is already held
+exclusive for such I/Os, pending I/O is not drained and thus EOF zeroing
+can occur based on an unstable i_size.
+
+This problem has been reproduced as guest data corruption in virtual
+machines with file-backed qcow2 virtual disks hosted on an XFS
+filesystem. The virtual disks must be configured with aio=native mode
+and the must not be truncated out to the maximum file size (as some virt
+managers will do).
+
+Update xfs_file_aio_write_checks() to unconditionally drain in-flight
+dio before EOF zeroing can occur. Rather than trigger the wait based on
+iolock state, use a new flag and upgrade the iolock when necessary. Note
+that this results in a full restart of the inode checks even when the
+iolock was already held exclusive when technically it is only required
+to recheck i_size. This should be a rare enough occurrence that it is
+preferable to keep the code simple rather than create an alternate
+restart jump target.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 3136e8bb3054d3bb68942f8f1ee6c26c05f798b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 4a8e73027673,347b3e07ec2b..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -555,17 -565,23 +555,23 @@@ xfs_zero_eof
+   */
+  STATIC ssize_t
+  xfs_file_aio_write_checks(
+ -	struct kiocb		*iocb,
+ -	struct iov_iter		*from,
+ +	struct file		*file,
+ +	loff_t			*pos,
+ +	size_t			*count,
+  	int			*iolock)
+  {
+ -	struct file		*file = iocb->ki_filp;
+  	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+++<<<<<<< HEAD
+ +	int			error = 0;
+++=======
++ 	ssize_t			error = 0;
++ 	size_t			count = iov_iter_count(from);
++ 	bool			drained_dio = false;
+++>>>>>>> 3136e8bb3054 (xfs: always drain dio before extending aio write submission)
+  
+  restart:
+ -	error = generic_write_checks(iocb, from);
+ -	if (error <= 0)
+ -		return error;
+ -
+ -	error = xfs_break_layouts(inode, iolock, true);
+ +	error = generic_write_checks(file, pos, count, S_ISBLK(inode->i_mode));
+  	if (error)
+  		return error;
+  
+@@@ -575,13 -598,27 +581,28 @@@
+  	 * write.  If zeroing is needed and we are currently holding the
+  	 * iolock shared, we need to update it to exclusive which implies
+  	 * having to redo all checks before.
+ -	 *
+ -	 * We need to serialise against EOF updates that occur in IO
+ -	 * completions here. We want to make sure that nobody is changing the
+ -	 * size while we do this check until we have placed an IO barrier (i.e.
+ -	 * hold the XFS_IOLOCK_EXCL) that prevents new IO from being dispatched.
+ -	 * The spinlock effectively forms a memory barrier once we have the
+ -	 * XFS_IOLOCK_EXCL so we are guaranteed to see the latest EOF value
+ -	 * and hence be able to correctly determine if we need to run zeroing.
+  	 */
+++<<<<<<< HEAD
+ +	if (*pos > i_size_read(inode)) {
+ +		if (*iolock == XFS_IOLOCK_SHARED) {
+ +			xfs_rw_iunlock(ip, *iolock);
+ +			*iolock = XFS_IOLOCK_EXCL;
+ +			xfs_rw_ilock(ip, *iolock);
+ +
+++=======
++ 	spin_lock(&ip->i_flags_lock);
++ 	if (iocb->ki_pos > i_size_read(inode)) {
++ 		bool	zero = false;
++ 
++ 		spin_unlock(&ip->i_flags_lock);
++ 		if (!drained_dio) {
++ 			if (*iolock == XFS_IOLOCK_SHARED) {
++ 				xfs_rw_iunlock(ip, *iolock);
++ 				*iolock = XFS_IOLOCK_EXCL;
++ 				xfs_rw_ilock(ip, *iolock);
++ 				iov_iter_reexpand(from, count);
++ 			}
+++>>>>>>> 3136e8bb3054 (xfs: always drain dio before extending aio write submission)
+  			/*
+  			 * We now have an IO submission barrier in place, but
+  			 * AIO can do EOF updates during IO completion and hence
+@@@ -591,12 -628,14 +612,13 @@@
+  			 * no-op.
+  			 */
+  			inode_dio_wait(inode);
++ 			drained_dio = true;
+  			goto restart;
+  		}
+ -		error = xfs_zero_eof(ip, iocb->ki_pos, i_size_read(inode), &zero);
+ +		error = -xfs_zero_eof(ip, *pos, i_size_read(inode));
+  		if (error)
+  			return error;
+ -	} else
+ -		spin_unlock(&ip->i_flags_lock);
+ +	}
+  
+  	/*
+  	 * Updating the timestamps will grab the ilock again from
+* Unmerged path fs/xfs/xfs_file.c
