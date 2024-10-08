@@ -151,4 +151,5 @@ int record_parse_callchain_opt(const struct option *opt, const char *arg, int un
 int record_callchain_opt(const struct option *opt, const char *arg, int unset);
 
 extern const char record_callchain_help[];
+int parse_callchain_report_opt(const char *arg);
 #endif	/* __PERF_CALLCHAIN_H */
