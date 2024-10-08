@@ -169,6 +169,11 @@ int test__dwarf_unwind(void)
 		return -1;
 	}
 
+	if (machine__create_kernel_maps(machine)) {
+		pr_err("Failed to create kernel maps\n");
+		return -1;
+	}
+
 	callchain_param.record_mode = CALLCHAIN_DWARF;
 
 	if (init_live_machine(machine)) {
