@@ -1,0 +1,474 @@
+netfilter: nf_conntrack: add efficient mark to zone mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 5e8018fc61423e677398d4ad4d72df70b9788e77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5e8018fc.failed
+
+This work adds the possibility of deriving the zone id from the skb->mark
+field in a scalable manner. This allows for having only a single template
+serving hundreds/thousands of different zones, for example, instead of the
+need to have one match for each zone as an extra CT jump target.
+
+Note that we'd need to have this information attached to the template as at
+the time when we're trying to lookup a possible ct object, we already need
+to know zone information for a possible match when going into
+__nf_conntrack_find_get(). This work provides a minimal implementation for
+a possible mapping.
+
+In order to not add/expose an extra ct->status bit, the zone structure has
+been extended to carry a flag for deriving the mark.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 5e8018fc61423e677398d4ad4d72df70b9788e77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_conntrack_zones.h
+#	include/uapi/linux/netfilter/xt_CT.h
+#	net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+#	net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_netlink.c
+#	net/netfilter/xt_CT.c
+diff --cc include/net/netfilter/nf_conntrack_zones.h
+index 034efe8d45a5,5316c7b3a374..000000000000
+--- a/include/net/netfilter/nf_conntrack_zones.h
++++ b/include/net/netfilter/nf_conntrack_zones.h
+@@@ -1,25 -1,106 +1,104 @@@
+  #ifndef _NF_CONNTRACK_ZONES_H
+  #define _NF_CONNTRACK_ZONES_H
+  
+ -#include <linux/netfilter/nf_conntrack_tuple_common.h>
+ +#define NF_CT_DEFAULT_ZONE	0
+  
+ -#define NF_CT_DEFAULT_ZONE_ID	0
+ -
+ -#define NF_CT_ZONE_DIR_ORIG	(1 << IP_CT_DIR_ORIGINAL)
+ -#define NF_CT_ZONE_DIR_REPL	(1 << IP_CT_DIR_REPLY)
+ -
+ -#define NF_CT_DEFAULT_ZONE_DIR	(NF_CT_ZONE_DIR_ORIG | NF_CT_ZONE_DIR_REPL)
+ +#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ +#include <net/netfilter/nf_conntrack_extend.h>
+  
++ #define NF_CT_FLAG_MARK		1
++ 
+  struct nf_conntrack_zone {
+  	u16	id;
+++<<<<<<< HEAD
+++=======
++ 	u8	flags;
++ 	u8	dir;
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  };
+  
+ -extern const struct nf_conntrack_zone nf_ct_zone_dflt;
+ -
+ -#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ -#include <net/netfilter/nf_conntrack_extend.h>
+ -
+ -static inline const struct nf_conntrack_zone *
+ -nf_ct_zone(const struct nf_conn *ct)
+ +static inline u16 nf_ct_zone(const struct nf_conn *ct)
+  {
+ -	const struct nf_conntrack_zone *nf_ct_zone = NULL;
+ -
+  #ifdef CONFIG_NF_CONNTRACK_ZONES
+ +	struct nf_conntrack_zone *nf_ct_zone;
+  	nf_ct_zone = nf_ct_ext_find(ct, NF_CT_EXT_ZONE);
+ +	if (nf_ct_zone)
+ +		return nf_ct_zone->id;
+  #endif
+ -	return nf_ct_zone ? nf_ct_zone : &nf_ct_zone_dflt;
+ +	return NF_CT_DEFAULT_ZONE;
+  }
+  
+++<<<<<<< HEAD
+ +#endif /* CONFIG_NF_CONNTRACK || CONFIG_NF_CONNTRACK_MODULE */
+++=======
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone_init(struct nf_conntrack_zone *zone, u16 id, u8 dir, u8 flags)
++ {
++ 	zone->id = id;
++ 	zone->flags = flags;
++ 	zone->dir = dir;
++ 
++ 	return zone;
++ }
++ 
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone_tmpl(const struct nf_conn *tmpl, const struct sk_buff *skb,
++ 		struct nf_conntrack_zone *tmp)
++ {
++ 	const struct nf_conntrack_zone *zone;
++ 
++ 	if (!tmpl)
++ 		return &nf_ct_zone_dflt;
++ 
++ 	zone = nf_ct_zone(tmpl);
++ 	if (zone->flags & NF_CT_FLAG_MARK)
++ 		zone = nf_ct_zone_init(tmp, skb->mark, zone->dir, 0);
++ 
++ 	return zone;
++ }
++ 
++ static inline int nf_ct_zone_add(struct nf_conn *ct, gfp_t flags,
++ 				 const struct nf_conntrack_zone *info)
++ {
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ 	struct nf_conntrack_zone *nf_ct_zone;
++ 
++ 	nf_ct_zone = nf_ct_ext_add(ct, NF_CT_EXT_ZONE, flags);
++ 	if (!nf_ct_zone)
++ 		return -ENOMEM;
++ 
++ 	nf_ct_zone_init(nf_ct_zone, info->id, info->dir,
++ 			info->flags);
++ #endif
++ 	return 0;
++ }
++ 
++ static inline bool nf_ct_zone_matches_dir(const struct nf_conntrack_zone *zone,
++ 					  enum ip_conntrack_dir dir)
++ {
++ 	return zone->dir & (1 << dir);
++ }
++ 
++ static inline u16 nf_ct_zone_id(const struct nf_conntrack_zone *zone,
++ 				enum ip_conntrack_dir dir)
++ {
++ 	return nf_ct_zone_matches_dir(zone, dir) ?
++ 	       zone->id : NF_CT_DEFAULT_ZONE_ID;
++ }
++ 
++ static inline bool nf_ct_zone_equal(const struct nf_conn *a,
++ 				    const struct nf_conntrack_zone *b,
++ 				    enum ip_conntrack_dir dir)
++ {
++ 	return nf_ct_zone_id(nf_ct_zone(a), dir) ==
++ 	       nf_ct_zone_id(b, dir);
++ }
++ 
++ static inline bool nf_ct_zone_equal_any(const struct nf_conn *a,
++ 					const struct nf_conntrack_zone *b)
++ {
++ 	return nf_ct_zone(a)->id == b->id;
++ }
++ #endif /* IS_ENABLED(CONFIG_NF_CONNTRACK) */
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  #endif /* _NF_CONNTRACK_ZONES_H */
+diff --cc include/uapi/linux/netfilter/xt_CT.h
+index 5a688c1ca4d7,9e520418b858..000000000000
+--- a/include/uapi/linux/netfilter/xt_CT.h
++++ b/include/uapi/linux/netfilter/xt_CT.h
+@@@ -6,7 -6,13 +6,17 @@@
+  enum {
+  	XT_CT_NOTRACK		= 1 << 0,
+  	XT_CT_NOTRACK_ALIAS	= 1 << 1,
+++<<<<<<< HEAD
+ +	XT_CT_MASK		= XT_CT_NOTRACK | XT_CT_NOTRACK_ALIAS,
+++=======
++ 	XT_CT_ZONE_DIR_ORIG	= 1 << 2,
++ 	XT_CT_ZONE_DIR_REPL	= 1 << 3,
++ 	XT_CT_ZONE_MARK		= 1 << 4,
++ 
++ 	XT_CT_MASK		= XT_CT_NOTRACK | XT_CT_NOTRACK_ALIAS |
++ 				  XT_CT_ZONE_DIR_ORIG | XT_CT_ZONE_DIR_REPL |
++ 				  XT_CT_ZONE_MARK,
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  };
+  
+  struct xt_ct_target_info {
+diff --cc net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+index a338dad41b7d,cdde3ec496e9..000000000000
+--- a/net/ipv4/netfilter/nf_conntrack_proto_icmp.c
++++ b/net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+@@@ -134,9 -134,11 +134,17 @@@ icmp_error_message(struct net *net, str
+  	struct nf_conntrack_tuple innertuple, origtuple;
+  	const struct nf_conntrack_l4proto *innerproto;
+  	const struct nf_conntrack_tuple_hash *h;
+++<<<<<<< HEAD
+ +	u16 zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
+ +
+ +	NF_CT_ASSERT(skb->nfct == NULL);
+++=======
++ 	const struct nf_conntrack_zone *zone;
++ 	struct nf_conntrack_zone tmp;
++ 
++ 	NF_CT_ASSERT(skb->nfct == NULL);
++ 	zone = nf_ct_zone_tmpl(tmpl, skb, &tmp);
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  
+  	/* Are they talking about one of our connections? */
+  	if (!nf_ct_get_tuplepr(skb,
+diff --cc net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+index b3807c5cb888,0e6fae103d33..000000000000
+--- a/net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
++++ b/net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+@@@ -150,7 -150,7 +150,11 @@@ icmpv6_error_message(struct net *net, s
+  	struct nf_conntrack_tuple intuple, origtuple;
+  	const struct nf_conntrack_tuple_hash *h;
+  	const struct nf_conntrack_l4proto *inproto;
+++<<<<<<< HEAD
+ +	u16 zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
+++=======
++ 	struct nf_conntrack_zone tmp;
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  
+  	NF_CT_ASSERT(skb->nfct == NULL);
+  
+@@@ -177,7 -177,8 +181,12 @@@
+  
+  	*ctinfo = IP_CT_RELATED;
+  
+++<<<<<<< HEAD
+ +	h = nf_conntrack_find_get(net, zone, &intuple);
+++=======
++ 	h = nf_conntrack_find_get(net, nf_ct_zone_tmpl(tmpl, skb, &tmp),
++ 				  &intuple);
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	if (!h) {
+  		pr_debug("icmpv6_error: no match\n");
+  		return -NF_ACCEPT;
+diff --cc net/netfilter/nf_conntrack_core.c
+index fe40958970b4,48521d62c672..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -305,16 -301,9 +305,18 @@@ struct nf_conn *nf_ct_tmpl_alloc(struc
+  	tmpl->status = IPS_TEMPLATE;
+  	write_pnet(&tmpl->ct_net, net);
+  
+- #ifdef CONFIG_NF_CONNTRACK_ZONES
+- 	if (zone) {
+- 		struct nf_conntrack_zone *nf_ct_zone;
++ 	if (nf_ct_zone_add(tmpl, flags, zone) < 0)
++ 		goto out_free;
+  
+++<<<<<<< HEAD
+ +		nf_ct_zone = nf_ct_ext_add(tmpl, NF_CT_EXT_ZONE, flags);
+ +		if (!nf_ct_zone)
+ +			goto out_free;
+ +		nf_ct_zone->id = zone;
+ +	}
+ +#endif
+++=======
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	atomic_set(&tmpl->ct_general.use, 0);
+  
+  	return tmpl;
+@@@ -887,17 -840,9 +887,23 @@@ __nf_conntrack_alloc(struct net *net, u
+  	 * SLAB_DESTROY_BY_RCU.
+  	 */
+  	ct = kmem_cache_alloc(net->ct.nf_conntrack_cachep, gfp);
+++<<<<<<< HEAD
+ +	if (ct == NULL) {
+ +		atomic_dec(&net->ct.count);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +	/*
+ +	 * Let ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.next
+ +	 * and ct->tuplehash[IP_CT_DIR_REPLY].hnnode.next unchanged.
+ +	 */
+ +	memset(&ct->tuplehash[IP_CT_DIR_MAX], 0,
+ +	       offsetof(struct nf_conn, proto) -
+ +	       offsetof(struct nf_conn, tuplehash[IP_CT_DIR_MAX]));
+++=======
++ 	if (ct == NULL)
++ 		goto out;
++ 
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	spin_lock_init(&ct->lock);
+  	ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple = *orig;
+  	ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.pprev = NULL;
+@@@ -907,31 -852,28 +913,39 @@@
+  	/* Don't set timer yet: wait for confirmation */
+  	setup_timer(&ct->timeout, death_by_timeout, (unsigned long)ct);
+  	write_pnet(&ct->ct_net, net);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NF_CONNTRACK_ZONES
+ +	if (zone) {
+ +		struct nf_conntrack_zone *nf_ct_zone;
+ +
+ +		nf_ct_zone = nf_ct_ext_add(ct, NF_CT_EXT_ZONE, GFP_ATOMIC);
+ +		if (!nf_ct_zone)
+ +			goto out_free;
+ +		nf_ct_zone->id = zone;
+ +	}
+ +#endif
+++=======
++ 	memset(&ct->__nfct_init_offset[0], 0,
++ 	       offsetof(struct nf_conn, proto) -
++ 	       offsetof(struct nf_conn, __nfct_init_offset[0]));
++ 
++ 	if (zone && nf_ct_zone_add(ct, GFP_ATOMIC, zone) < 0)
++ 		goto out_free;
++ 
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	/* Because we use RCU lookups, we set ct_general.use to zero before
+  	 * this is inserted in any list.
+  	 */
+  	atomic_set(&ct->ct_general.use, 0);
+  	return ct;
+- 
+- #ifdef CONFIG_NF_CONNTRACK_ZONES
+  out_free:
+- 	atomic_dec(&net->ct.count);
+  	kmem_cache_free(net->ct.nf_conntrack_cachep, ct);
++ out:
++ 	atomic_dec(&net->ct.count);
+  	return ERR_PTR(-ENOMEM);
+- #endif
+  }
+  
+ -struct nf_conn *nf_conntrack_alloc(struct net *net,
+ -				   const struct nf_conntrack_zone *zone,
+ +struct nf_conn *nf_conntrack_alloc(struct net *net, u16 zone,
+  				   const struct nf_conntrack_tuple *orig,
+  				   const struct nf_conntrack_tuple *repl,
+  				   gfp_t gfp)
+@@@ -973,8 -915,9 +987,9 @@@ init_conntrack(struct net *net, struct 
+  	struct nf_conntrack_tuple repl_tuple;
+  	struct nf_conntrack_ecache *ecache;
+  	struct nf_conntrack_expect *exp = NULL;
+ -	const struct nf_conntrack_zone *zone;
+ +	u16 zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
+  	struct nf_conn_timeout *timeout_ext;
++ 	struct nf_conntrack_zone tmp;
+  	unsigned int *timeouts;
+  
+  	if (!nf_ct_invert_tuple(&repl_tuple, tuple, l3proto, l4proto)) {
+@@@ -982,6 -925,7 +997,10 @@@
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	zone = nf_ct_zone_tmpl(tmpl, skb, &tmp);
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	ct = __nf_conntrack_alloc(net, zone, tuple, &repl_tuple, GFP_ATOMIC,
+  				  hash);
+  	if (IS_ERR(ct))
+@@@ -1076,10 -1020,11 +1095,11 @@@ resolve_normal_ct(struct net *net, stru
+  		  int *set_reply,
+  		  enum ip_conntrack_info *ctinfo)
+  {
+ -	const struct nf_conntrack_zone *zone;
+  	struct nf_conntrack_tuple tuple;
+  	struct nf_conntrack_tuple_hash *h;
++ 	struct nf_conntrack_zone tmp;
+  	struct nf_conn *ct;
+ +	u16 zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
+  	u32 hash;
+  
+  	if (!nf_ct_get_tuple(skb, skb_network_offset(skb),
+@@@ -1090,7 -1035,8 +1110,12 @@@
+  	}
+  
+  	/* look for tuple match */
+++<<<<<<< HEAD
+ +	hash = hash_conntrack_raw(&tuple, zone);
+++=======
++ 	zone = nf_ct_zone_tmpl(tmpl, skb, &tmp);
++ 	hash = hash_conntrack_raw(&tuple);
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	h = __nf_conntrack_find_get(net, zone, &tuple, hash);
+  	if (!h) {
+  		h = init_conntrack(net, tmpl, &tuple, l3proto, l4proto,
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 533cbca24fd6,94a66541e0b7..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -893,6 -952,43 +893,46 @@@ ctnetlink_parse_tuple_proto(struct nlat
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ctnetlink_parse_zone(const struct nlattr *attr,
++ 		     struct nf_conntrack_zone *zone)
++ {
++ 	nf_ct_zone_init(zone, NF_CT_DEFAULT_ZONE_ID,
++ 			NF_CT_DEFAULT_ZONE_DIR, 0);
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ 	if (attr)
++ 		zone->id = ntohs(nla_get_be16(attr));
++ #else
++ 	if (attr)
++ 		return -EOPNOTSUPP;
++ #endif
++ 	return 0;
++ }
++ 
++ static int
++ ctnetlink_parse_tuple_zone(struct nlattr *attr, enum ctattr_type type,
++ 			   struct nf_conntrack_zone *zone)
++ {
++ 	int ret;
++ 
++ 	if (zone->id != NF_CT_DEFAULT_ZONE_ID)
++ 		return -EINVAL;
++ 
++ 	ret = ctnetlink_parse_zone(attr, zone);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (type == CTA_TUPLE_REPLY)
++ 		zone->dir = NF_CT_ZONE_DIR_REPL;
++ 	else
++ 		zone->dir = NF_CT_ZONE_DIR_ORIG;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  static const struct nla_policy tuple_nla_policy[CTA_TUPLE_MAX+1] = {
+  	[CTA_TUPLE_IP]		= { .type = NLA_NESTED },
+  	[CTA_TUPLE_PROTO]	= { .type = NLA_NESTED },
+diff --cc net/netfilter/xt_CT.c
+index 888bb8ce55ee,346509825a80..000000000000
+--- a/net/netfilter/xt_CT.c
++++ b/net/netfilter/xt_CT.c
+@@@ -193,7 -207,9 +193,13 @@@ static int xt_ct_tg_check(const struct 
+  	}
+  
+  #ifndef CONFIG_NF_CONNTRACK_ZONES
+++<<<<<<< HEAD
+ +	if (info->zone)
+++=======
++ 	if (info->zone || info->flags & (XT_CT_ZONE_DIR_ORIG |
++ 					 XT_CT_ZONE_DIR_REPL |
++ 					 XT_CT_ZONE_MARK))
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  		goto err1;
+  #endif
+  
+@@@ -201,7 -217,13 +207,17 @@@
+  	if (ret < 0)
+  		goto err1;
+  
+++<<<<<<< HEAD
+ +	ct = nf_ct_tmpl_alloc(par->net, info->zone, GFP_KERNEL);
+++=======
++ 	memset(&zone, 0, sizeof(zone));
++ 	zone.id = info->zone;
++ 	zone.dir = xt_ct_flags_to_dir(info);
++ 	if (info->flags & XT_CT_ZONE_MARK)
++ 		zone.flags |= NF_CT_FLAG_MARK;
++ 
++ 	ct = nf_ct_tmpl_alloc(par->net, &zone, GFP_KERNEL);
+++>>>>>>> 5e8018fc6142 (netfilter: nf_conntrack: add efficient mark to zone mapping)
+  	ret = PTR_ERR(ct);
+  	if (IS_ERR(ct))
+  		goto err2;
+* Unmerged path include/net/netfilter/nf_conntrack_zones.h
+* Unmerged path include/uapi/linux/netfilter/xt_CT.h
+* Unmerged path net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+* Unmerged path net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+* Unmerged path net/netfilter/xt_CT.c
