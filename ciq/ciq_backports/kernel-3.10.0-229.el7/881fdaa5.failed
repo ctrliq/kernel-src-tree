@@ -1,0 +1,318 @@
+drm/ttm: Avoid memory allocation from shrinker functions.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [drm] ttm: Avoid memory allocation from shrinker functions (Rob Clark) [1173317]
+Rebuild_FUZZ: 95.41%
+commit-author Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+commit 881fdaa5e4cb0d68e52acab0ad4e1820e2bfffa4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/881fdaa5.failed
+
+Andrew Morton wrote:
+> On Wed, 12 Nov 2014 13:08:55 +0900 Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp> wrote:
+>
+> > Andrew Morton wrote:
+> > > Poor ttm guys - this is a bit of a trap we set for them.
+> >
+> > Commit a91576d7916f6cce ("drm/ttm: Pass GFP flags in order to avoid deadlock.")
+> > changed to use sc->gfp_mask rather than GFP_KERNEL.
+> >
+> > -       pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
+> > -                       GFP_KERNEL);
+> > +       pages_to_free = kmalloc(npages_to_free * sizeof(struct page *), gfp);
+> >
+> > But this bug is caused by sc->gfp_mask containing some flags which are not
+> > in GFP_KERNEL, right? Then, I think
+> >
+> > -       pages_to_free = kmalloc(npages_to_free * sizeof(struct page *), gfp);
+> > +       pages_to_free = kmalloc(npages_to_free * sizeof(struct page *), gfp & GFP_KERNEL);
+> >
+> > would hide this bug.
+> >
+> > But I think we should use GFP_ATOMIC (or drop __GFP_WAIT flag)
+>
+> Well no - ttm_page_pool_free() should stop calling kmalloc altogether.
+> Just do
+>
+> 	struct page *pages_to_free[16];
+>
+> and rework the code to free 16 pages at a time.  Easy.
+
+Well, ttm code wants to process 512 pages at a time for performance.
+Memory footprint increased by 512 * sizeof(struct page *) buffer is
+only 4096 bytes. What about using static buffer like below?
+----------
+>From d3cb5393c9c8099d6b37e769f78c31af1541fe8c Mon Sep 17 00:00:00 2001
+From: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date: Thu, 13 Nov 2014 22:21:54 +0900
+Subject: [PATCH] drm/ttm: Avoid memory allocation from shrinker functions.
+
+Commit a91576d7916f6cce ("drm/ttm: Pass GFP flags in order to avoid
+deadlock.") caused BUG_ON() due to sc->gfp_mask containing flags
+which are not in GFP_KERNEL.
+
+  https://bugzilla.kernel.org/show_bug.cgi?id=87891
+
+Changing from sc->gfp_mask to (sc->gfp_mask & GFP_KERNEL) would
+avoid the BUG_ON(), but avoiding memory allocation from shrinker
+function is better and reliable fix.
+
+Shrinker function is already serialized by global lock, and
+clean up function is called after shrinker function is unregistered.
+Thus, we can use static buffer when called from shrinker function
+and clean up function.
+
+	Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: stable <stable@kernel.org> [2.6.35+]
+	Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 881fdaa5e4cb0d68e52acab0ad4e1820e2bfffa4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ttm/ttm_page_alloc.c
+#	drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+diff --cc drivers/gpu/drm/ttm/ttm_page_alloc.c
+index bd2a3b40cd12,025c429050c0..000000000000
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+@@@ -297,9 -297,12 +297,17 @@@ static void ttm_pool_update_free_locked
+   *
+   * @pool: to free the pages from
+   * @free_all: If set to true will free all pages in pool
+++<<<<<<< HEAD
+ + **/
+ +static int ttm_page_pool_free(struct ttm_page_pool *pool, unsigned nr_free)
+++=======
++  * @use_static: Safe to use static buffer
++  **/
++ static int ttm_page_pool_free(struct ttm_page_pool *pool, unsigned nr_free,
++ 			      bool use_static)
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  {
++ 	static struct page *static_buf[NUM_PAGES_TO_ALLOC];
+  	unsigned long irq_flags;
+  	struct page *p;
+  	struct page **pages_to_free;
+@@@ -309,8 -312,11 +317,16 @@@
+  	if (NUM_PAGES_TO_ALLOC < nr_free)
+  		npages_to_free = NUM_PAGES_TO_ALLOC;
+  
+++<<<<<<< HEAD
+ +	pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
+ +			GFP_KERNEL);
+++=======
++ 	if (use_static)
++ 		pages_to_free = static_buf;
++ 	else
++ 		pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
++ 					GFP_KERNEL);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  	if (!pages_to_free) {
+  		pr_err("Failed to allocate memory for pool free operation\n");
+  		return 0;
+@@@ -377,40 -384,52 +394,53 @@@ out
+  	return nr_free;
+  }
+  
+ +/* Get good estimation how many pages are free in pools */
+ +static int ttm_pool_get_num_unused_pages(void)
+ +{
+ +	unsigned i;
+ +	int total = 0;
+ +	for (i = 0; i < NUM_POOLS; ++i)
+ +		total += _manager->pools[i].npages;
+ +
+ +	return total;
+ +}
+ +
+  /**
+   * Callback for mm to request pool to reduce number of page held.
+++<<<<<<< HEAD
+++=======
++  *
++  * XXX: (dchinner) Deadlock warning!
++  *
++  * This code is crying out for a shrinker per pool....
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+   */
+ -static unsigned long
+ -ttm_pool_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ +static int ttm_pool_mm_shrink(struct shrinker *shrink,
+ +			      struct shrink_control *sc)
+  {
+ -	static DEFINE_MUTEX(lock);
+ -	static unsigned start_pool;
+ +	static atomic_t start_pool = ATOMIC_INIT(0);
+  	unsigned i;
+ -	unsigned pool_offset;
+ +	unsigned pool_offset = atomic_add_return(1, &start_pool);
+  	struct ttm_page_pool *pool;
+  	int shrink_pages = sc->nr_to_scan;
+ -	unsigned long freed = 0;
+  
+ -	if (!mutex_trylock(&lock))
+ -		return SHRINK_STOP;
+ -	pool_offset = ++start_pool % NUM_POOLS;
+ +	pool_offset = pool_offset % NUM_POOLS;
+  	/* select start pool in round robin fashion */
+  	for (i = 0; i < NUM_POOLS; ++i) {
+  		unsigned nr_free = shrink_pages;
+  		if (shrink_pages == 0)
+  			break;
+  		pool = &_manager->pools[(i + pool_offset)%NUM_POOLS];
+++<<<<<<< HEAD
+ +		shrink_pages = ttm_page_pool_free(pool, nr_free);
+++=======
++ 		/* OK to use static buffer since global mutex is held. */
++ 		shrink_pages = ttm_page_pool_free(pool, nr_free, true);
++ 		freed += nr_free - shrink_pages;
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  	}
+ -	mutex_unlock(&lock);
+ -	return freed;
+ -}
+ -
+ -
+ -static unsigned long
+ -ttm_pool_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+ -{
+ -	unsigned i;
+ -	unsigned long count = 0;
+ -
+ -	for (i = 0; i < NUM_POOLS; ++i)
+ -		count += _manager->pools[i].npages;
+ -
+ -	return count;
+ +	/* return estimated number of unused pages in pool */
+ +	return ttm_pool_get_num_unused_pages();
+  }
+  
+  static void ttm_pool_mm_shrink_init(struct ttm_pool_manager *manager)
+@@@ -694,7 -714,7 +724,11 @@@ static void ttm_put_pages(struct page *
+  	}
+  	spin_unlock_irqrestore(&pool->lock, irq_flags);
+  	if (npages)
+++<<<<<<< HEAD
+ +		ttm_page_pool_free(pool, npages);
+++=======
++ 		ttm_page_pool_free(pool, npages, false);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  }
+  
+  /*
+@@@ -833,8 -853,9 +867,13 @@@ void ttm_page_alloc_fini(void
+  	pr_info("Finalizing pool allocator\n");
+  	ttm_pool_mm_shrink_fini(_manager);
+  
++ 	/* OK to use static buffer since global mutex is no longer used. */
+  	for (i = 0; i < NUM_POOLS; ++i)
+++<<<<<<< HEAD
+ +		ttm_page_pool_free(&_manager->pools[i], FREE_ALL_PAGES);
+++=======
++ 		ttm_page_pool_free(&_manager->pools[i], FREE_ALL_PAGES, true);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  
+  	kobject_put(&_manager->kobj);
+  	_manager = NULL;
+diff --cc drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+index de1a753b1d56,01e1d27eb078..000000000000
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+@@@ -410,9 -411,12 +410,17 @@@ static void ttm_dma_page_put(struct dma
+   *
+   * @pool: to free the pages from
+   * @nr_free: If set to true will free all pages in pool
+++<<<<<<< HEAD
+ + **/
+ +static unsigned ttm_dma_page_pool_free(struct dma_pool *pool, unsigned nr_free)
+++=======
++  * @use_static: Safe to use static buffer
++  **/
++ static unsigned ttm_dma_page_pool_free(struct dma_pool *pool, unsigned nr_free,
++ 				       bool use_static)
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  {
++ 	static struct page *static_buf[NUM_PAGES_TO_ALLOC];
+  	unsigned long irq_flags;
+  	struct dma_page *dma_p, *tmp;
+  	struct page **pages_to_free;
+@@@ -429,8 -433,11 +437,16 @@@
+  			 npages_to_free, nr_free);
+  	}
+  #endif
+++<<<<<<< HEAD
+ +	pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
+ +			GFP_KERNEL);
+++=======
++ 	if (use_static)
++ 		pages_to_free = static_buf;
++ 	else
++ 		pages_to_free = kmalloc(npages_to_free * sizeof(struct page *),
++ 					GFP_KERNEL);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  
+  	if (!pages_to_free) {
+  		pr_err("%s: Failed to allocate memory for pool free operation\n",
+@@@ -529,7 -537,8 +546,12 @@@ static void ttm_dma_free_pool(struct de
+  		if (pool->type != type)
+  			continue;
+  		/* Takes a spinlock.. */
+++<<<<<<< HEAD
+ +		ttm_dma_page_pool_free(pool, FREE_ALL_PAGES);
+++=======
++ 		/* OK to use static buffer since global mutex is held. */
++ 		ttm_dma_page_pool_free(pool, FREE_ALL_PAGES, true);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  		WARN_ON(((pool->npages_in_use + pool->npages_free) != 0));
+  		/* This code path is called after _all_ references to the
+  		 * struct device has been dropped - so nobody should be
+@@@ -995,16 -993,21 +1017,28 @@@ void ttm_dma_unpopulate(struct ttm_dma_
+  
+  	/* shrink pool if necessary (only on !is_cached pools)*/
+  	if (npages)
+++<<<<<<< HEAD
+ +		ttm_dma_page_pool_free(pool, npages);
+++=======
++ 		ttm_dma_page_pool_free(pool, npages, false);
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  	ttm->state = tt_unpopulated;
+  }
+  EXPORT_SYMBOL_GPL(ttm_dma_unpopulate);
+  
+  /**
+   * Callback for mm to request pool to reduce number of page held.
+++<<<<<<< HEAD
+++=======
++  *
++  * XXX: (dchinner) Deadlock warning!
++  *
++  * I'm getting sadder as I hear more pathetical whimpers about needing per-pool
++  * shrinkers
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+   */
+ -static unsigned long
+ -ttm_dma_pool_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ +static int ttm_dma_pool_mm_shrink(struct shrinker *shrink,
+ +				  struct shrink_control *sc)
+  {
+  	static unsigned start_pool;
+  	unsigned idx = 0;
+@@@ -1030,7 -1035,10 +1064,14 @@@
+  		if (++idx < pool_offset)
+  			continue;
+  		nr_free = shrink_pages;
+++<<<<<<< HEAD
+ +		shrink_pages = ttm_dma_page_pool_free(p->pool, nr_free);
+++=======
++ 		/* OK to use static buffer since global mutex is held. */
++ 		shrink_pages = ttm_dma_page_pool_free(p->pool, nr_free, true);
++ 		freed += nr_free - shrink_pages;
++ 
+++>>>>>>> 881fdaa5e4cb (drm/ttm: Avoid memory allocation from shrinker functions.)
+  		pr_debug("%s: (%s:%d) Asked to shrink %d, have %d more to go\n",
+  			 p->pool->dev_name, p->pool->name, current->pid,
+  			 nr_free, shrink_pages);
+* Unmerged path drivers/gpu/drm/ttm/ttm_page_alloc.c
+* Unmerged path drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
