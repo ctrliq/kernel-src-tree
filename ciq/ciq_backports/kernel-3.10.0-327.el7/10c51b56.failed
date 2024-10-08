@@ -1,0 +1,156 @@
+net: add skb_get_tx_queue() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] add skb_get_tx_queue() helper (Alexander Duyck) [1205266]
+Rebuild_FUZZ: 92.06%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit 10c51b56232d24f150e39884a9e749fd99cbc60c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/10c51b56.failed
+
+Replace occurences of skb_get_queue_mapping() and follow-up
+netdev_get_tx_queue() with an actual helper function.
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10c51b56232d24f150e39884a9e749fd99cbc60c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 4450cf82adc9,b7a7f5a721bd..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -237,6 -237,46 +237,49 @@@ struct packet_skb_cb 
+  static void __fanout_unlink(struct sock *sk, struct packet_sock *po);
+  static void __fanout_link(struct sock *sk, struct packet_sock *po);
+  
+++<<<<<<< HEAD
+++=======
++ static int packet_direct_xmit(struct sk_buff *skb)
++ {
++ 	struct net_device *dev = skb->dev;
++ 	netdev_features_t features;
++ 	struct netdev_queue *txq;
++ 	int ret = NETDEV_TX_BUSY;
++ 
++ 	if (unlikely(!netif_running(dev) ||
++ 		     !netif_carrier_ok(dev)))
++ 		goto drop;
++ 
++ 	features = netif_skb_features(skb);
++ 	if (skb_needs_linearize(skb, features) &&
++ 	    __skb_linearize(skb))
++ 		goto drop;
++ 
++ 	txq = skb_get_tx_queue(dev, skb);
++ 
++ 	local_bh_disable();
++ 
++ 	HARD_TX_LOCK(dev, txq, smp_processor_id());
++ 	if (!netif_xmit_frozen_or_drv_stopped(txq)) {
++ 		ret = netdev_start_xmit(skb, dev);
++ 		if (ret == NETDEV_TX_OK)
++ 			txq_trans_update(txq);
++ 	}
++ 	HARD_TX_UNLOCK(dev, txq);
++ 
++ 	local_bh_enable();
++ 
++ 	if (!dev_xmit_complete(ret))
++ 		kfree_skb(skb);
++ 
++ 	return ret;
++ drop:
++ 	atomic_long_inc(&dev->tx_dropped);
++ 	kfree_skb(skb);
++ 	return NET_XMIT_DROP;
++ }
++ 
+++>>>>>>> 10c51b56232d (net: add skb_get_tx_queue() helper)
+  static struct net_device *packet_cached_dev_get(struct packet_sock *po)
+  {
+  	struct net_device *dev;
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index dba59a041ff6..b4e7e5f3ea6c 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1520,6 +1520,12 @@ struct netdev_queue *netdev_get_tx_queue(const struct net_device *dev,
+ 	return &dev->_tx[index];
+ }
+ 
++static inline struct netdev_queue *skb_get_tx_queue(const struct net_device *dev,
++						    const struct sk_buff *skb)
++{
++	return netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
++}
++
+ static inline void netdev_for_each_tx_queue(struct net_device *dev,
+ 					    void (*f)(struct net_device *,
+ 						      struct netdev_queue *,
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index 89e339d3631e..58ad0b51cf0b 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -120,7 +120,7 @@ static void queue_process(struct work_struct *work)
+ 			continue;
+ 		}
+ 
+-		txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
++		txq = skb_get_tx_queue(dev, skb);
+ 
+ 		local_irq_save(flags);
+ 		__netif_tx_lock(txq, smp_processor_id());
+diff --git a/net/core/pktgen.c b/net/core/pktgen.c
+index dc189dd7ca08..1d0c48666d10 100644
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@ -3205,7 +3205,6 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
+ 	netdev_tx_t (*xmit)(struct sk_buff *, struct net_device *)
+ 		= odev->netdev_ops->ndo_start_xmit;
+ 	struct netdev_queue *txq;
+-	u16 queue_map;
+ 	int ret;
+ 
+ 	/* If device is offline, then don't send */
+@@ -3243,8 +3242,7 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
+ 	if (pkt_dev->delay && pkt_dev->last_ok)
+ 		spin(pkt_dev, pkt_dev->next_tx);
+ 
+-	queue_map = skb_get_queue_mapping(pkt_dev->skb);
+-	txq = netdev_get_tx_queue(odev, queue_map);
++	txq = skb_get_tx_queue(odev, pkt_dev->skb);
+ 
+ 	__netif_tx_lock_bh(txq);
+ 
+* Unmerged path net/packet/af_packet.c
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 7fbf6a59446f..e8dbc02f3cf3 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -62,7 +62,7 @@ static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
+ 
+ 	if (unlikely(skb)) {
+ 		/* check the reason of requeuing without tx lock first */
+-		txq = netdev_get_tx_queue(txq->dev, skb_get_queue_mapping(skb));
++		txq = skb_get_tx_queue(txq->dev, skb);
+ 		if (!netif_xmit_frozen_or_stopped(txq)) {
+ 			q->gso_skb = NULL;
+ 			q->q.qlen--;
+@@ -182,10 +182,12 @@ static inline int qdisc_restart(struct Qdisc *q)
+ 	skb = dequeue_skb(q);
+ 	if (unlikely(!skb))
+ 		return 0;
++
+ 	WARN_ON_ONCE(skb_dst_is_noref(skb));
++
+ 	root_lock = qdisc_lock(q);
+ 	dev = qdisc_dev(q);
+-	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
++	txq = skb_get_tx_queue(dev, skb);
+ 
+ 	return sch_direct_xmit(skb, q, dev, txq, root_lock);
+ }
