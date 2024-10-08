@@ -1,0 +1,235 @@
+mmc: core: Add helper function for EXT_CSD support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] core: Add helper function for EXT_CSD support (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 94.74%
+commit-author Ulf Hansson <ulf.hansson@linaro.org>
+commit 148bcab28f51c80f13e5ad678fe840e8a34af46f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/148bcab2.failed
+
+The helper function mmc_can_ext_csd() will return a positive value if
+the card supports the EXT_CSD register. Start using it at relavant
+places in the mmc core.
+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 148bcab28f51c80f13e5ad678fe840e8a34af46f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/mmc.c
+diff --cc drivers/mmc/core/mmc.c
+index 612454f49fe3,7c257c93ecd7..000000000000
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@@ -816,39 -877,47 +816,45 @@@ static int mmc_select_powerclass(struc
+  }
+  
+  /*
+ - * Set the bus speed for the selected speed mode.
+ - */
+ -static void mmc_set_bus_speed(struct mmc_card *card)
+ -{
+ -	unsigned int max_dtr = (unsigned int)-1;
+ -
+ -	if ((mmc_card_hs200(card) || mmc_card_hs400(card)) &&
+ -	     max_dtr > card->ext_csd.hs200_max_dtr)
+ -		max_dtr = card->ext_csd.hs200_max_dtr;
+ -	else if (mmc_card_hs(card) && max_dtr > card->ext_csd.hs_max_dtr)
+ -		max_dtr = card->ext_csd.hs_max_dtr;
+ -	else if (max_dtr > card->csd.max_dtr)
+ -		max_dtr = card->csd.max_dtr;
+ -
+ -	mmc_set_clock(card->host, max_dtr);
+ -}
+ -
+ -/*
+ - * Select the bus width amoung 4-bit and 8-bit(SDR).
+ - * If the bus width is changed successfully, return the selected width value.
+ - * Zero is returned instead of error value if the wide width is not supported.
+ + * Selects the desired buswidth and switch to the HS200 mode
+ + * if bus width set without error
+   */
+ -static int mmc_select_bus_width(struct mmc_card *card)
+ +static int mmc_select_hs200(struct mmc_card *card)
+  {
+ +	int idx, err = -EINVAL;
+ +	struct mmc_host *host;
+  	static unsigned ext_csd_bits[] = {
+ -		EXT_CSD_BUS_WIDTH_8,
+  		EXT_CSD_BUS_WIDTH_4,
+ +		EXT_CSD_BUS_WIDTH_8,
+  	};
+  	static unsigned bus_widths[] = {
+ -		MMC_BUS_WIDTH_8,
+  		MMC_BUS_WIDTH_4,
+ +		MMC_BUS_WIDTH_8,
+  	};
+ -	struct mmc_host *host = card->host;
+ -	unsigned idx, bus_width = 0;
+ -	int err = 0;
+  
+++<<<<<<< HEAD
+ +	BUG_ON(!card);
+++=======
++ 	if (!mmc_can_ext_csd(card) &&
++ 	    !(host->caps & (MMC_CAP_4_BIT_DATA | MMC_CAP_8_BIT_DATA)))
++ 		return 0;
+++>>>>>>> 148bcab28f51 (mmc: core: Add helper function for EXT_CSD support)
+  
+ -	idx = (host->caps & MMC_CAP_8_BIT_DATA) ? 0 : 1;
+ +	host = card->host;
+ +
+ +	if (card->ext_csd.card_type & EXT_CSD_CARD_TYPE_SDR_1_2V &&
+ +			host->caps2 & MMC_CAP2_HS200_1_2V_SDR)
+ +		err = __mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_120);
+ +
+ +	if (err && card->ext_csd.card_type & EXT_CSD_CARD_TYPE_SDR_1_8V &&
+ +			host->caps2 & MMC_CAP2_HS200_1_8V_SDR)
+ +		err = __mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_180);
+ +
+ +	/* If fails try again during next card power cycle */
+ +	if (err)
+ +		goto err;
+ +
+ +	idx = (host->caps & MMC_CAP_8_BIT_DATA) ? 1 : 0;
+  
+  	/*
+  	 * Unlike SD, MMC cards dont have a configuration register to notify
+@@@ -893,6 -1148,105 +899,108 @@@ err
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Activate High Speed or HS200 mode if supported.
++  */
++ static int mmc_select_timing(struct mmc_card *card)
++ {
++ 	int err = 0;
++ 
++ 	if (!mmc_can_ext_csd(card))
++ 		goto bus_speed;
++ 
++ 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
++ 		err = mmc_select_hs200(card);
++ 	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS)
++ 		err = mmc_select_hs(card);
++ 
++ 	if (err && err != -EBADMSG)
++ 		return err;
++ 
++ 	if (err) {
++ 		pr_warn("%s: switch to %s failed\n",
++ 			mmc_card_hs(card) ? "high-speed" :
++ 			(mmc_card_hs200(card) ? "hs200" : ""),
++ 			mmc_hostname(card->host));
++ 		err = 0;
++ 	}
++ 
++ bus_speed:
++ 	/*
++ 	 * Set the bus speed to the selected bus timing.
++ 	 * If timing is not selected, backward compatible is the default.
++ 	 */
++ 	mmc_set_bus_speed(card);
++ 	return err;
++ }
++ 
++ const u8 tuning_blk_pattern_4bit[MMC_TUNING_BLK_PATTERN_4BIT_SIZE] = {
++ 	0xff, 0x0f, 0xff, 0x00, 0xff, 0xcc, 0xc3, 0xcc,
++ 	0xc3, 0x3c, 0xcc, 0xff, 0xfe, 0xff, 0xfe, 0xef,
++ 	0xff, 0xdf, 0xff, 0xdd, 0xff, 0xfb, 0xff, 0xfb,
++ 	0xbf, 0xff, 0x7f, 0xff, 0x77, 0xf7, 0xbd, 0xef,
++ 	0xff, 0xf0, 0xff, 0xf0, 0x0f, 0xfc, 0xcc, 0x3c,
++ 	0xcc, 0x33, 0xcc, 0xcf, 0xff, 0xef, 0xff, 0xee,
++ 	0xff, 0xfd, 0xff, 0xfd, 0xdf, 0xff, 0xbf, 0xff,
++ 	0xbb, 0xff, 0xf7, 0xff, 0xf7, 0x7f, 0x7b, 0xde,
++ };
++ EXPORT_SYMBOL(tuning_blk_pattern_4bit);
++ 
++ const u8 tuning_blk_pattern_8bit[MMC_TUNING_BLK_PATTERN_8BIT_SIZE] = {
++ 	0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00,
++ 	0xff, 0xff, 0xcc, 0xcc, 0xcc, 0x33, 0xcc, 0xcc,
++ 	0xcc, 0x33, 0x33, 0xcc, 0xcc, 0xcc, 0xff, 0xff,
++ 	0xff, 0xee, 0xff, 0xff, 0xff, 0xee, 0xee, 0xff,
++ 	0xff, 0xff, 0xdd, 0xff, 0xff, 0xff, 0xdd, 0xdd,
++ 	0xff, 0xff, 0xff, 0xbb, 0xff, 0xff, 0xff, 0xbb,
++ 	0xbb, 0xff, 0xff, 0xff, 0x77, 0xff, 0xff, 0xff,
++ 	0x77, 0x77, 0xff, 0x77, 0xbb, 0xdd, 0xee, 0xff,
++ 	0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00,
++ 	0x00, 0xff, 0xff, 0xcc, 0xcc, 0xcc, 0x33, 0xcc,
++ 	0xcc, 0xcc, 0x33, 0x33, 0xcc, 0xcc, 0xcc, 0xff,
++ 	0xff, 0xff, 0xee, 0xff, 0xff, 0xff, 0xee, 0xee,
++ 	0xff, 0xff, 0xff, 0xdd, 0xff, 0xff, 0xff, 0xdd,
++ 	0xdd, 0xff, 0xff, 0xff, 0xbb, 0xff, 0xff, 0xff,
++ 	0xbb, 0xbb, 0xff, 0xff, 0xff, 0x77, 0xff, 0xff,
++ 	0xff, 0x77, 0x77, 0xff, 0x77, 0xbb, 0xdd, 0xee,
++ };
++ EXPORT_SYMBOL(tuning_blk_pattern_8bit);
++ 
++ /*
++  * Execute tuning sequence to seek the proper bus operating
++  * conditions for HS200 and HS400, which sends CMD21 to the device.
++  */
++ static int mmc_hs200_tuning(struct mmc_card *card)
++ {
++ 	struct mmc_host *host = card->host;
++ 	int err = 0;
++ 
++ 	/*
++ 	 * Timing should be adjusted to the HS400 target
++ 	 * operation frequency for tuning process
++ 	 */
++ 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400 &&
++ 	    host->ios.bus_width == MMC_BUS_WIDTH_8)
++ 		if (host->ops->prepare_hs400_tuning)
++ 			host->ops->prepare_hs400_tuning(host, &host->ios);
++ 
++ 	if (host->ops->execute_tuning) {
++ 		mmc_host_clk_hold(host);
++ 		err = host->ops->execute_tuning(host,
++ 				MMC_SEND_TUNING_BLOCK_HS200);
++ 		mmc_host_clk_release(host);
++ 
++ 		if (err)
++ 			pr_err("%s: tuning execution failed\n",
++ 				mmc_hostname(host));
++ 	}
++ 
++ 	return err;
++ }
++ 
++ /*
+++>>>>>>> 148bcab28f51 (mmc: core: Add helper function for EXT_CSD support)
+   * Handle the detection and initialisation of a card.
+   *
+   * In the case of a resume, "oldcard" will contain the card
+* Unmerged path drivers/mmc/core/mmc.c
+diff --git a/drivers/mmc/core/mmc_ops.c b/drivers/mmc/core/mmc_ops.c
+index ba0275e90617..24d3409fc529 100644
+--- a/drivers/mmc/core/mmc_ops.c
++++ b/drivers/mmc/core/mmc_ops.c
+@@ -675,3 +675,8 @@ int mmc_send_hpi_cmd(struct mmc_card *card, u32 *status)
+ 
+ 	return 0;
+ }
++
++int mmc_can_ext_csd(struct mmc_card *card)
++{
++	return (card && card->csd.mmca_vsn > CSD_SPEC_VER_3);
++}
+diff --git a/drivers/mmc/core/mmc_ops.h b/drivers/mmc/core/mmc_ops.h
+index f752ec67c102..6f4b00ed93de 100644
+--- a/drivers/mmc/core/mmc_ops.h
++++ b/drivers/mmc/core/mmc_ops.h
+@@ -26,6 +26,7 @@ int mmc_spi_read_ocr(struct mmc_host *host, int highcap, u32 *ocrp);
+ int mmc_spi_set_crc(struct mmc_host *host, int use_crc);
+ int mmc_bus_test(struct mmc_card *card, u8 bus_width);
+ int mmc_send_hpi_cmd(struct mmc_card *card, u32 *status);
++int mmc_can_ext_csd(struct mmc_card *card);
+ 
+ #endif
+ 
