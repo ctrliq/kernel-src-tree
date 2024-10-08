@@ -1,0 +1,520 @@
+KVM: PPC: Book3S HV: Align physical and virtual CPU thread numbers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [virt] kvm/ppc: book3s hv - Align physical and virtual CPU thread numbers (Don Zickus) [1127366]
+Rebuild_FUZZ: 95.45%
+commit-author Paul Mackerras <paulus@samba.org>
+commit e0b7ec058c0eb7ba8d5d937d81de2bd16db6970e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e0b7ec05.failed
+
+On a threaded processor such as POWER7, we group VCPUs into virtual
+cores and arrange that the VCPUs in a virtual core run on the same
+physical core.  Currently we don't enforce any correspondence between
+virtual thread numbers within a virtual core and physical thread
+numbers.  Physical threads are allocated starting at 0 on a first-come
+first-served basis to runnable virtual threads (VCPUs).
+
+POWER8 implements a new "msgsndp" instruction which guest kernels can
+use to interrupt other threads in the same core or sub-core.  Since
+the instruction takes the destination physical thread ID as a parameter,
+it becomes necessary to align the physical thread IDs with the virtual
+thread IDs, that is, to make sure virtual thread N within a virtual
+core always runs on physical thread N.
+
+This means that it's possible that thread 0, which is where we call
+__kvmppc_vcore_entry, may end up running some other vcpu than the
+one whose task called kvmppc_run_core(), or it may end up running
+no vcpu at all, if for example thread 0 of the virtual core is
+currently executing in userspace.  However, we do need thread 0
+to be responsible for switching the MMU -- a previous version of
+this patch that had other threads switching the MMU was found to
+be responsible for occasional memory corruption and machine check
+interrupts in the guest on POWER7 machines.
+
+To accommodate this, we no longer pass the vcpu pointer to
+__kvmppc_vcore_entry, but instead let the assembly code load it from
+the PACA.  Since the assembly code will need to know the kvm pointer
+and the thread ID for threads which don't have a vcpu, we move the
+thread ID into the PACA and we add a kvm pointer to the virtual core
+structure.
+
+In the case where thread 0 has no vcpu to run, it still calls into
+kvmppc_hv_entry in order to do the MMU switch, and then naps until
+either its vcpu is ready to run in the guest, or some other thread
+needs to exit the guest.  In the latter case, thread 0 jumps to the
+code that switches the MMU back to the host.  This control flow means
+that now we switch the MMU before loading any guest vcpu state.
+Similarly, on guest exit we now save all the guest vcpu state before
+switching the MMU back to the host.  This has required substantial
+code movement, making the diff rather large.
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit e0b7ec058c0eb7ba8d5d937d81de2bd16db6970e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 71043f429f30,7da53cd215db..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1140,9 -1147,12 +1143,18 @@@ static void kvmppc_start_thread(struct 
+  	vcpu->cpu = vc->pcpu;
+  	smp_wmb();
+  #if defined(CONFIG_PPC_ICP_NATIVE) && defined(CONFIG_SMP)
+++<<<<<<< HEAD
+ +	if (vcpu->arch.ptid) {
+ +		xics_wake_cpu(cpu);
+ +		++vc->n_woken;
+++=======
++ 	if (cpu != smp_processor_id()) {
++ #ifdef CONFIG_KVM_XICS
++ 		xics_wake_cpu(cpu);
++ #endif
++ 		if (vcpu->arch.ptid)
++ 			++vc->n_woken;
+++>>>>>>> e0b7ec058c0e (KVM: PPC: Book3S HV: Align physical and virtual CPU thread numbers)
+  	}
+  #endif
+  }
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a13f539b4888,8bbe91bdb6da..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -155,8 -160,78 +160,81 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  
+  13:	b	machine_check_fwnmi
+  
+++<<<<<<< HEAD
+++=======
++ 
++ kvmppc_primary_no_guest:
++ 	/* We handle this much like a ceded vcpu */
++ 	/* set our bit in napping_threads */
++ 	ld	r5, HSTATE_KVM_VCORE(r13)
++ 	lbz	r7, HSTATE_PTID(r13)
++ 	li	r0, 1
++ 	sld	r0, r0, r7
++ 	addi	r6, r5, VCORE_NAPPING_THREADS
++ 1:	lwarx	r3, 0, r6
++ 	or	r3, r3, r0
++ 	stwcx.	r3, 0, r6
++ 	bne	1b
++ 	/* order napping_threads update vs testing entry_exit_count */
++ 	isync
++ 	li	r12, 0
++ 	lwz	r7, VCORE_ENTRY_EXIT(r5)
++ 	cmpwi	r7, 0x100
++ 	bge	kvm_novcpu_exit	/* another thread already exiting */
++ 	li	r3, NAPPING_NOVCPU
++ 	stb	r3, HSTATE_NAPPING(r13)
++ 	li	r3, 1
++ 	stb	r3, HSTATE_HWTHREAD_REQ(r13)
++ 
++ 	b	kvm_do_nap
++ 
++ kvm_novcpu_wakeup:
++ 	ld	r1, HSTATE_HOST_R1(r13)
++ 	ld	r5, HSTATE_KVM_VCORE(r13)
++ 	li	r0, 0
++ 	stb	r0, HSTATE_NAPPING(r13)
++ 	stb	r0, HSTATE_HWTHREAD_REQ(r13)
++ 
++ 	/* see if any other thread is already exiting */
++ 	li	r12, 0
++ 	lwz	r0, VCORE_ENTRY_EXIT(r5)
++ 	cmpwi	r0, 0x100
++ 	bge	kvm_novcpu_exit
++ 
++ 	/* clear our bit in napping_threads */
++ 	lbz	r7, HSTATE_PTID(r13)
++ 	li	r0, 1
++ 	sld	r0, r0, r7
++ 	addi	r6, r5, VCORE_NAPPING_THREADS
++ 4:	lwarx	r3, 0, r6
++ 	andc	r3, r3, r0
++ 	stwcx.	r3, 0, r6
++ 	bne	4b
++ 
++ 	/* Check the wake reason in SRR1 to see why we got here */
++ 	mfspr	r3, SPRN_SRR1
++ 	rlwinm	r3, r3, 44-31, 0x7	/* extract wake reason field */
++ 	cmpwi	r3, 4			/* was it an external interrupt? */
++ 	bne	kvm_novcpu_exit		/* if not, exit the guest */
++ 
++ 	/* extern interrupt - read and handle it */
++ 	li	r12, BOOK3S_INTERRUPT_EXTERNAL
++ 	bl	kvmppc_read_intr
++ 	cmpdi	r3, 0
++ 	bge	kvm_novcpu_exit
++ 	li	r12, 0
++ 
++ 	/* Got an IPI but other vcpus aren't yet exiting, must be a latecomer */
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	cmpdi	r4, 0
++ 	bne	kvmppc_got_guest
++ 
++ kvm_novcpu_exit:
++ 	b	hdec_soon
++ 
+++>>>>>>> e0b7ec058c0e (KVM: PPC: Book3S HV: Align physical and virtual CPU thread numbers)
+  /*
+-  * We come in here when wakened from nap mode on a secondary hw thread.
++  * We come in here when wakened from nap mode.
+   * Relocation is off and most register values are lost.
+   * r13 points to the PACA.
+   */
+@@@ -987,227 -1074,6 +1081,230 @@@ BEGIN_FTR_SECTIO
+  	mtspr	SPRN_SPURR,r4
+  END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_201)
+  
+++<<<<<<< HEAD
+ +	/* Clear out SLB */
+ +	li	r5,0
+ +	slbmte	r5,r5
+ +	slbia
+ +	ptesync
+ +
+ +hdec_soon:			/* r9 = vcpu, r12 = trap, r13 = paca */
+ +BEGIN_FTR_SECTION
+ +	b	32f
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ +	/*
+ +	 * POWER7 guest -> host partition switch code.
+ +	 * We don't have to lock against tlbies but we do
+ +	 * have to coordinate the hardware threads.
+ +	 */
+ +	/* Increment the threads-exiting-guest count in the 0xff00
+ +	   bits of vcore->entry_exit_count */
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	addi	r6,r5,VCORE_ENTRY_EXIT
+ +41:	lwarx	r3,0,r6
+ +	addi	r0,r3,0x100
+ +	stwcx.	r0,0,r6
+ +	bne	41b
+ +	isync		/* order stwcx. vs. reading napping_threads */
+ +
+ +	/*
+ +	 * At this point we have an interrupt that we have to pass
+ +	 * up to the kernel or qemu; we can't handle it in real mode.
+ +	 * Thus we have to do a partition switch, so we have to
+ +	 * collect the other threads, if we are the first thread
+ +	 * to take an interrupt.  To do this, we set the HDEC to 0,
+ +	 * which causes an HDEC interrupt in all threads within 2ns
+ +	 * because the HDEC register is shared between all 4 threads.
+ +	 * However, we don't need to bother if this is an HDEC
+ +	 * interrupt, since the other threads will already be on their
+ +	 * way here in that case.
+ +	 */
+ +	cmpwi	r3,0x100	/* Are we the first here? */
+ +	bge	43f
+ +	cmpwi	r3,1		/* Are any other threads in the guest? */
+ +	ble	43f
+ +	cmpwi	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+ +	beq	40f
+ +	li	r0,0
+ +	mtspr	SPRN_HDEC,r0
+ +40:
+ +	/*
+ +	 * Send an IPI to any napping threads, since an HDEC interrupt
+ +	 * doesn't wake CPUs up from nap.
+ +	 */
+ +	lwz	r3,VCORE_NAPPING_THREADS(r5)
+ +	lwz	r4,VCPU_PTID(r9)
+ +	li	r0,1
+ +	sld	r0,r0,r4
+ +	andc.	r3,r3,r0		/* no sense IPI'ing ourselves */
+ +	beq	43f
+ +	/* Order entry/exit update vs. IPIs */
+ +	sync
+ +	mulli	r4,r4,PACA_SIZE		/* get paca for thread 0 */
+ +	subf	r6,r4,r13
+ +42:	andi.	r0,r3,1
+ +	beq	44f
+ +	ld	r8,HSTATE_XICS_PHYS(r6)	/* get thread's XICS reg addr */
+ +	li	r0,IPI_PRIORITY
+ +	li	r7,XICS_MFRR
+ +	stbcix	r0,r7,r8		/* trigger the IPI */
+ +44:	srdi.	r3,r3,1
+ +	addi	r6,r6,PACA_SIZE
+ +	bne	42b
+ +
+ +	/* Secondary threads wait for primary to do partition switch */
+ +43:	ld	r4,VCPU_KVM(r9)		/* pointer to struct kvm */
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	lwz	r3,VCPU_PTID(r9)
+ +	cmpwi	r3,0
+ +	beq	15f
+ +	HMT_LOW
+ +13:	lbz	r3,VCORE_IN_GUEST(r5)
+ +	cmpwi	r3,0
+ +	bne	13b
+ +	HMT_MEDIUM
+ +	b	16f
+ +
+ +	/* Primary thread waits for all the secondaries to exit guest */
+ +15:	lwz	r3,VCORE_ENTRY_EXIT(r5)
+ +	srwi	r0,r3,8
+ +	clrldi	r3,r3,56
+ +	cmpw	r3,r0
+ +	bne	15b
+ +	isync
+ +
+ +	/* Primary thread switches back to host partition */
+ +	ld	r6,KVM_HOST_SDR1(r4)
+ +	lwz	r7,KVM_HOST_LPID(r4)
+ +	li	r8,LPID_RSVD		/* switch to reserved LPID */
+ +	mtspr	SPRN_LPID,r8
+ +	ptesync
+ +	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
+ +	mtspr	SPRN_LPID,r7
+ +	isync
+ +
+ +	/* Subtract timebase offset from timebase */
+ +	ld	r8,VCORE_TB_OFFSET(r5)
+ +	cmpdi	r8,0
+ +	beq	17f
+ +	mftb	r6			/* current host timebase */
+ +	subf	r8,r8,r6
+ +	mtspr	SPRN_TBU40,r8		/* update upper 40 bits */
+ +	mftb	r7			/* check if lower 24 bits overflowed */
+ +	clrldi	r6,r6,40
+ +	clrldi	r7,r7,40
+ +	cmpld	r7,r6
+ +	bge	17f
+ +	addis	r8,r8,0x100		/* if so, increment upper 40 bits */
+ +	mtspr	SPRN_TBU40,r8
+ +
+ +	/* Reset PCR */
+ +17:	ld	r0, VCORE_PCR(r5)
+ +	cmpdi	r0, 0
+ +	beq	18f
+ +	li	r0, 0
+ +	mtspr	SPRN_PCR, r0
+ +18:
+ +	/* Signal secondary CPUs to continue */
+ +	stb	r0,VCORE_IN_GUEST(r5)
+ +	lis	r8,0x7fff		/* MAX_INT@h */
+ +	mtspr	SPRN_HDEC,r8
+ +
+ +16:	ld	r8,KVM_HOST_LPCR(r4)
+ +	mtspr	SPRN_LPCR,r8
+ +	isync
+ +	b	33f
+ +
+ +	/*
+ +	 * PPC970 guest -> host partition switch code.
+ +	 * We have to lock against concurrent tlbies, and
+ +	 * we have to flush the whole TLB.
+ +	 */
+ +32:	ld	r4,VCPU_KVM(r9)		/* pointer to struct kvm */
+ +
+ +	/* Take the guest's tlbie_lock */
+ +#ifdef __BIG_ENDIAN__
+ +	lwz	r8,PACA_LOCK_TOKEN(r13)
+ +#else
+ +	lwz	r8,PACAPACAINDEX(r13)
+ +#endif
+ +	addi	r3,r4,KVM_TLBIE_LOCK
+ +24:	lwarx	r0,0,r3
+ +	cmpwi	r0,0
+ +	bne	24b
+ +	stwcx.	r8,0,r3
+ +	bne	24b
+ +	isync
+ +
+ +	ld	r7,KVM_HOST_LPCR(r4)	/* use kvm->arch.host_lpcr for HID4 */
+ +	li	r0,0x18f
+ +	rotldi	r0,r0,HID4_LPID5_SH	/* all lpid bits in HID4 = 1 */
+ +	or	r0,r7,r0
+ +	ptesync
+ +	sync
+ +	mtspr	SPRN_HID4,r0		/* switch to reserved LPID */
+ +	isync
+ +	li	r0,0
+ +	stw	r0,0(r3)		/* drop guest tlbie_lock */
+ +
+ +	/* invalidate the whole TLB */
+ +	li	r0,256
+ +	mtctr	r0
+ +	li	r6,0
+ +25:	tlbiel	r6
+ +	addi	r6,r6,0x1000
+ +	bdnz	25b
+ +	ptesync
+ +
+ +	/* take native_tlbie_lock */
+ +	ld	r3,toc_tlbie_lock@toc(2)
+ +24:	lwarx	r0,0,r3
+ +	cmpwi	r0,0
+ +	bne	24b
+ +	stwcx.	r8,0,r3
+ +	bne	24b
+ +	isync
+ +
+ +	ld	r6,KVM_HOST_SDR1(r4)
+ +	mtspr	SPRN_SDR1,r6		/* switch to host page table */
+ +
+ +	/* Set up host HID4 value */
+ +	sync
+ +	mtspr	SPRN_HID4,r7
+ +	isync
+ +	li	r0,0
+ +	stw	r0,0(r3)		/* drop native_tlbie_lock */
+ +
+ +	lis	r8,0x7fff		/* MAX_INT@h */
+ +	mtspr	SPRN_HDEC,r8
+ +
+ +	/* Disable HDEC interrupts */
+ +	mfspr	r0,SPRN_HID0
+ +	li	r3,0
+ +	rldimi	r0,r3, HID0_HDICE_SH, 64-HID0_HDICE_SH-1
+ +	sync
+ +	mtspr	SPRN_HID0,r0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +
+ +	/* load host SLB entries */
+ +33:	ld	r8,PACA_SLBSHADOWPTR(r13)
+ +
+ +	.rept	SLB_NUM_BOLTED
+ +	ld	r5,SLBSHADOW_SAVEAREA(r8)
+ +	ld	r6,SLBSHADOW_SAVEAREA+8(r8)
+ +	andis.	r7,r5,SLB_ESID_V@h
+ +	beq	1f
+ +	slbmte	r6,r5
+ +1:	addi	r8,r8,16
+ +	.endr
+ +
+++=======
+++>>>>>>> e0b7ec058c0e (KVM: PPC: Book3S HV: Align physical and virtual CPU thread numbers)
+  	/* Save DEC */
+  	mfspr	r5,SPRN_DEC
+  	mftb	r6
+@@@ -1666,10 -1732,10 +1963,14 @@@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206
+  	bge	kvm_cede_exit
+  	stwcx.	r4,0,r6
+  	bne	31b
+++<<<<<<< HEAD
+ +	/* order napping_threads update vs testing entry_exit_count */
+ +	isync
+ +	li	r0,1
+++=======
++ 	li	r0,NAPPING_CEDE
+++>>>>>>> e0b7ec058c0e (KVM: PPC: Book3S HV: Align physical and virtual CPU thread numbers)
+  	stb	r0,HSTATE_NAPPING(r13)
+ -	/* order napping_threads update vs testing entry_exit_count */
+ -	lwsync
+  	mr	r4,r3
+  	lwz	r7,VCORE_ENTRY_EXIT(r5)
+  	cmpwi	r7,0x100
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 0bd9348a4db9..490b34f5d6bf 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -87,6 +87,7 @@ struct kvmppc_host_state {
+ 	u8 hwthread_req;
+ 	u8 hwthread_state;
+ 	u8 host_ipi;
++	u8 ptid;
+ 	struct kvm_vcpu *kvm_vcpu;
+ 	struct kvmppc_vcore *kvm_vcore;
+ 	unsigned long xics_phys;
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 80c8a73bb706..25979c989206 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -292,6 +292,7 @@ struct kvmppc_vcore {
+ 	int n_woken;
+ 	int nap_count;
+ 	int napping_threads;
++	int first_vcpuid;
+ 	u16 pcpu;
+ 	u16 last_cpu;
+ 	u8 vcore_state;
+@@ -302,6 +303,7 @@ struct kvmppc_vcore {
+ 	u64 stolen_tb;
+ 	u64 preempt_tb;
+ 	struct kvm_vcpu *runner;
++	struct kvm *kvm;
+ 	u64 tb_offset;		/* guest timebase - host timebase */
+ 	ulong lpcr;
+ 	u32 arch_compat;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 79fa5c26d629..05752da59e7c 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -511,7 +511,6 @@ int main(void)
+ 	DEFINE(VCPU_FAULT_DAR, offsetof(struct kvm_vcpu, arch.fault_dar));
+ 	DEFINE(VCPU_LAST_INST, offsetof(struct kvm_vcpu, arch.last_inst));
+ 	DEFINE(VCPU_TRAP, offsetof(struct kvm_vcpu, arch.trap));
+-	DEFINE(VCPU_PTID, offsetof(struct kvm_vcpu, arch.ptid));
+ 	DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+ 	DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
+ 	DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+@@ -519,6 +518,7 @@ int main(void)
+ 	DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+ 	DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+ 	DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
++	DEFINE(VCORE_KVM, offsetof(struct kvmppc_vcore, kvm));
+ 	DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+ 	DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+ 	DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
+@@ -588,6 +588,7 @@ int main(void)
+ 	HSTATE_FIELD(HSTATE_XICS_PHYS, xics_phys);
+ 	HSTATE_FIELD(HSTATE_SAVED_XIRR, saved_xirr);
+ 	HSTATE_FIELD(HSTATE_HOST_IPI, host_ipi);
++	HSTATE_FIELD(HSTATE_PTID, ptid);
+ 	HSTATE_FIELD(HSTATE_MMCR, host_mmcr);
+ 	HSTATE_FIELD(HSTATE_PMC, host_pmc);
+ 	HSTATE_FIELD(HSTATE_PURR, host_purr);
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv_interrupts.S b/arch/powerpc/kvm/book3s_hv_interrupts.S
+index 00b7ed41ea17..e873796b1a29 100644
+--- a/arch/powerpc/kvm/book3s_hv_interrupts.S
++++ b/arch/powerpc/kvm/book3s_hv_interrupts.S
+@@ -35,7 +35,7 @@
+  ****************************************************************************/
+ 
+ /* Registers:
+- *  r4: vcpu pointer
++ *  none
+  */
+ _GLOBAL(__kvmppc_vcore_entry)
+ 
+@@ -71,7 +71,6 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ 	mtmsrd  r10,1
+ 
+ 	/* Save host PMU registers */
+-	/* R4 is live here (vcpu pointer) but not r3 or r5 */
+ 	li	r3, 1
+ 	sldi	r3, r3, 31		/* MMCR0_FC (freeze counters) bit */
+ 	mfspr	r7, SPRN_MMCR0		/* save MMCR0 */
+@@ -136,16 +135,15 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ 	 * enters the guest with interrupts enabled.
+ 	 */
+ BEGIN_FTR_SECTION
++	ld	r4, HSTATE_KVM_VCPU(r13)
+ 	ld	r0, VCPU_PENDING_EXC(r4)
+ 	li	r7, (1 << BOOK3S_IRQPRIO_EXTERNAL)
+ 	oris	r7, r7, (1 << BOOK3S_IRQPRIO_EXTERNAL_LEVEL)@h
+ 	and.	r0, r0, r7
+ 	beq	32f
+-	mr	r31, r4
+ 	lhz	r3, PACAPACAINDEX(r13)
+ 	bl	smp_send_reschedule
+ 	nop
+-	mr	r4, r31
+ 32:
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ #endif /* CONFIG_SMP */
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
