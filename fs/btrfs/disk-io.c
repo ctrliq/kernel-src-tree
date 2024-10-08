@@ -2000,7 +2000,7 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
 	btrfs_destroy_workqueue(fs_info->endio_workers);
 	btrfs_destroy_workqueue(fs_info->endio_meta_workers);
 	btrfs_destroy_workqueue(fs_info->endio_raid56_workers);
-	btrfs_stop_workers(&fs_info->rmw_workers);
+	btrfs_destroy_workqueue(fs_info->rmw_workers);
 	btrfs_destroy_workqueue(fs_info->endio_meta_write_workers);
 	btrfs_destroy_workqueue(fs_info->endio_write_workers);
 	btrfs_destroy_workqueue(fs_info->endio_freespace_worker);
@@ -2512,9 +2512,8 @@ int open_ctree(struct super_block *sb,
 		btrfs_alloc_workqueue("endio-meta-write", flags, max_active, 2);
 	fs_info->endio_raid56_workers =
 		btrfs_alloc_workqueue("endio-raid56", flags, max_active, 4);
-	btrfs_init_workers(&fs_info->rmw_workers,
-			   "rmw", fs_info->thread_pool_size,
-			   &fs_info->generic_worker);
+	fs_info->rmw_workers =
+		btrfs_alloc_workqueue("rmw", flags, max_active, 2);
 	fs_info->endio_write_workers =
 		btrfs_alloc_workqueue("endio-write", flags, max_active, 2);
 	fs_info->endio_freespace_worker =
@@ -2528,8 +2527,6 @@ int open_ctree(struct super_block *sb,
 	btrfs_init_workers(&fs_info->qgroup_rescan_workers, "qgroup-rescan", 1,
 			   &fs_info->generic_worker);
 
-	fs_info->rmw_workers.idle_thresh = 2;
-
 	fs_info->readahead_workers.idle_thresh = 2;
 
 	/*
@@ -2538,7 +2535,6 @@ int open_ctree(struct super_block *sb,
 	 */
 	ret = btrfs_start_workers(&fs_info->generic_worker);
 	ret |= btrfs_start_workers(&fs_info->fixup_workers);
-	ret |= btrfs_start_workers(&fs_info->rmw_workers);
 	ret |= btrfs_start_workers(&fs_info->delayed_workers);
 	ret |= btrfs_start_workers(&fs_info->caching_workers);
 	ret |= btrfs_start_workers(&fs_info->readahead_workers);
@@ -2552,7 +2548,7 @@ int open_ctree(struct super_block *sb,
 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
 	      fs_info->endio_meta_write_workers &&
 	      fs_info->endio_write_workers && fs_info->endio_raid56_workers &&
-	      fs_info->endio_freespace_worker)) {
+	      fs_info->endio_freespace_worker && fs_info->rmw_workers)) {
 		err = -ENOMEM;
 		goto fail_sb_buffer;
 	}
