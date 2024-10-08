@@ -1,0 +1,166 @@
+[SCSI] qla4xxx: ISP8xxx: Correct retry of adapter initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [scsi] qla4xxx: ISP8xxx: Correct retry of adapter initialization (Chad Dupuis) [1049707]
+Rebuild_FUZZ: 94.21%
+commit-author Nilesh Javali <nilesh.javali@qlogic.com>
+commit 37418cc61d0d71fc576bb49694d978c8e94e6e23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/37418cc6.failed
+
+Issue:
+
+For ISP8xxx, adapter initialization is not retried if
+qla4xxx_initialize_adapter fails.
+
+Fix:
+
+If qla4xxx_initialize_adapter fails, first check if failure is due to IRQs not
+attached in order to skip retrial, then free the IRQs and then retry
+initializing the adapter.
+
+	Signed-off-by: Nilesh Javali <nilesh.javali@qlogic.com>
+	Signed-off-by: Vikas Chaudhary <vikas.chaudhary@qlogic.com>
+	Reviewed-by: Mike Christie <michaelc@cs.wisc.edu>
+	Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 37418cc61d0d71fc576bb49694d978c8e94e6e23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla4xxx/ql4_glbl.h
+diff --cc drivers/scsi/qla4xxx/ql4_glbl.h
+index b8e87b33b48e,6d72e1dde19f..000000000000
+--- a/drivers/scsi/qla4xxx/ql4_glbl.h
++++ b/drivers/scsi/qla4xxx/ql4_glbl.h
+@@@ -277,6 -277,9 +277,12 @@@ int qla4_84xx_config_acb(struct scsi_ql
+  int qla4_83xx_ms_mem_write_128b(struct scsi_qla_host *ha,
+  				uint64_t addr, uint32_t *data, uint32_t count);
+  uint8_t qla4xxx_set_ipaddr_state(uint8_t fw_ipaddr_state);
+++<<<<<<< HEAD
+++=======
++ int qla4_83xx_get_port_config(struct scsi_qla_host *ha, uint32_t *config);
++ int qla4_83xx_set_port_config(struct scsi_qla_host *ha, uint32_t *config);
++ int qla4_8xxx_check_init_adapter_retry(struct scsi_qla_host *ha);
+++>>>>>>> 37418cc61d0d ([SCSI] qla4xxx: ISP8xxx: Correct retry of adapter initialization)
+  
+  extern int ql4xextended_error_logging;
+  extern int ql4xdontresethba;
+* Unmerged path drivers/scsi/qla4xxx/ql4_glbl.h
+diff --git a/drivers/scsi/qla4xxx/ql4_init.c b/drivers/scsi/qla4xxx/ql4_init.c
+index 7456eeb2e58a..28fbece7e08f 100644
+--- a/drivers/scsi/qla4xxx/ql4_init.c
++++ b/drivers/scsi/qla4xxx/ql4_init.c
+@@ -959,13 +959,8 @@ int qla4xxx_initialize_adapter(struct scsi_qla_host *ha, int is_reset)
+ 		qla4xxx_build_ddb_list(ha, is_reset);
+ 
+ 	set_bit(AF_ONLINE, &ha->flags);
+-exit_init_hba:
+-	if (is_qla80XX(ha) && (status == QLA_ERROR)) {
+-		/* Since interrupts are registered in start_firmware for
+-		 * 80XX, release them here if initialize_adapter fails */
+-		qla4xxx_free_irqs(ha);
+-	}
+ 
++exit_init_hba:
+ 	DEBUG2(printk("scsi%ld: initialize adapter: %s\n", ha->host_no,
+ 	    status == QLA_ERROR ? "FAILED" : "SUCCEEDED"));
+ 	return status;
+diff --git a/drivers/scsi/qla4xxx/ql4_nx.c b/drivers/scsi/qla4xxx/ql4_nx.c
+index d001202d3565..bbe836146837 100644
+--- a/drivers/scsi/qla4xxx/ql4_nx.c
++++ b/drivers/scsi/qla4xxx/ql4_nx.c
+@@ -3836,3 +3836,24 @@ qla4_8xxx_enable_msix(struct scsi_qla_host *ha)
+ msix_out:
+ 	return ret;
+ }
++
++int qla4_8xxx_check_init_adapter_retry(struct scsi_qla_host *ha)
++{
++	int status = QLA_SUCCESS;
++
++	/* Dont retry adapter initialization if IRQ allocation failed */
++	if (!test_bit(AF_IRQ_ATTACHED, &ha->flags)) {
++		ql4_printk(KERN_WARNING, ha, "%s: Skipping retry of adapter initialization as IRQs are not attached\n",
++			   __func__);
++		status = QLA_ERROR;
++		goto exit_init_adapter_failure;
++	}
++
++	/* Since interrupts are registered in start_firmware for
++	 * 8xxx, release them here if initialize_adapter fails
++	 * and retry adapter initialization */
++	qla4xxx_free_irqs(ha);
++
++exit_init_adapter_failure:
++	return status;
++}
+diff --git a/drivers/scsi/qla4xxx/ql4_os.c b/drivers/scsi/qla4xxx/ql4_os.c
+index 05de07a650cc..b183abc68744 100644
+--- a/drivers/scsi/qla4xxx/ql4_os.c
++++ b/drivers/scsi/qla4xxx/ql4_os.c
+@@ -4602,8 +4602,21 @@ recover_ha_init_adapter:
+ 			ssleep(6);
+ 
+ 		/* NOTE: AF_ONLINE flag set upon successful completion of
+-		 *       qla4xxx_initialize_adapter */
++		 * qla4xxx_initialize_adapter */
+ 		status = qla4xxx_initialize_adapter(ha, RESET_ADAPTER);
++		if (is_qla80XX(ha) && (status == QLA_ERROR)) {
++			status = qla4_8xxx_check_init_adapter_retry(ha);
++			if (status == QLA_ERROR) {
++				ql4_printk(KERN_INFO, ha, "scsi%ld: %s: Don't retry recover adapter\n",
++					   ha->host_no, __func__);
++				qla4xxx_dead_adapter_cleanup(ha);
++				clear_bit(DPC_RETRY_RESET_HA, &ha->dpc_flags);
++				clear_bit(DPC_RESET_HA, &ha->dpc_flags);
++				clear_bit(DPC_RESET_HA_FW_CONTEXT,
++					  &ha->dpc_flags);
++				goto exit_recover;
++			}
++		}
+ 	}
+ 
+ 	/* Retry failed adapter initialization, if necessary
+@@ -8457,11 +8470,8 @@ static int qla4xxx_probe_adapter(struct pci_dev *pdev,
+ 	status = qla4xxx_initialize_adapter(ha, INIT_ADAPTER);
+ 
+ 	/* Dont retry adapter initialization if IRQ allocation failed */
+-	if (is_qla80XX(ha) && !test_bit(AF_IRQ_ATTACHED, &ha->flags)) {
+-		ql4_printk(KERN_WARNING, ha, "%s: Skipping retry of adapter initialization\n",
+-			   __func__);
++	if (is_qla80XX(ha) && (status == QLA_ERROR))
+ 		goto skip_retry_init;
+-	}
+ 
+ 	while ((!test_bit(AF_ONLINE, &ha->flags)) &&
+ 	    init_retry_count++ < MAX_INIT_RETRIES) {
+@@ -8485,6 +8495,10 @@ static int qla4xxx_probe_adapter(struct pci_dev *pdev,
+ 			continue;
+ 
+ 		status = qla4xxx_initialize_adapter(ha, INIT_ADAPTER);
++		if (is_qla80XX(ha) && (status == QLA_ERROR)) {
++			if (qla4_8xxx_check_init_adapter_retry(ha) == QLA_ERROR)
++				goto skip_retry_init;
++		}
+ 	}
+ 
+ skip_retry_init:
+@@ -9392,6 +9406,7 @@ static uint32_t qla4_8xxx_error_recovery(struct scsi_qla_host *ha)
+ 		if (rval != QLA_SUCCESS) {
+ 			ql4_printk(KERN_INFO, ha, "scsi%ld: %s: HW State: "
+ 			    "FAILED\n", ha->host_no, __func__);
++			qla4xxx_free_irqs(ha);
+ 			ha->isp_ops->idc_lock(ha);
+ 			qla4_8xxx_clear_drv_active(ha);
+ 			qla4_8xxx_wr_direct(ha, QLA8XXX_CRB_DEV_STATE,
+@@ -9419,6 +9434,8 @@ static uint32_t qla4_8xxx_error_recovery(struct scsi_qla_host *ha)
+ 			rval = qla4xxx_initialize_adapter(ha, RESET_ADAPTER);
+ 			if (rval == QLA_SUCCESS)
+ 				ha->isp_ops->enable_intrs(ha);
++			else
++				qla4xxx_free_irqs(ha);
+ 
+ 			ha->isp_ops->idc_lock(ha);
+ 			qla4_8xxx_set_drv_active(ha);
