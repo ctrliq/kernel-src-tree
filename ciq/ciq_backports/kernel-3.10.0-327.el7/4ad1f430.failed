@@ -1,0 +1,288 @@
+perf kmem: Fix compiles on RHEL6/OL6
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [perf] kmem: Fix compiles on RHEL6/OL6 (Jiri Olsa) [1222189]
+Rebuild_FUZZ: 92.54%
+commit-author David Ahern <david.ahern@oracle.com>
+commit 4ad1f4300e3bddf63109aa63cfb2d37e8585ecc7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4ad1f430.failed
+
+0d68bc92c48 breaks compiles on RHEL6/OL6:
+    cc1: warnings being treated as errors
+    builtin-kmem.c: In function ‘search_page_alloc_stat’:
+    builtin-kmem.c:322: error: declaration of ‘stat’ shadows a global declaration
+                            node = &parent->rb_left;
+    /usr/include/sys/stat.h:455: error: shadowed declaration is here
+    builtin-kmem.c: In function ‘perf_evsel__process_page_alloc_event’:
+    builtin-kmem.c:378: error: declaration of ‘stat’ shadows a global declaration
+    /usr/include/sys/stat.h:455: error: shadowed declaration is here
+    builtin-kmem.c: In function ‘perf_evsel__process_page_free_event’:
+    builtin-kmem.c:431: error: declaration of ‘stat’ shadows a global declaration
+    /usr/include/sys/stat.h:455: error: shadowed declaration is here
+
+Rename local variable to pstat to avoid the name conflict.
+
+	Signed-off-by: David Ahern <david.ahern@oracle.com>
+Link: http://lkml.kernel.org/r/1429033773-31383-1-git-send-email-david.ahern@oracle.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4ad1f4300e3bddf63109aa63cfb2d37e8585ecc7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-kmem.c
+diff --cc tools/perf/builtin-kmem.c
+index 625af3a853c2,1634186d537c..000000000000
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@@ -226,6 -231,244 +226,247 @@@ static int perf_evsel__process_free_eve
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u64 total_page_alloc_bytes;
++ static u64 total_page_free_bytes;
++ static u64 total_page_nomatch_bytes;
++ static u64 total_page_fail_bytes;
++ static unsigned long nr_page_allocs;
++ static unsigned long nr_page_frees;
++ static unsigned long nr_page_fails;
++ static unsigned long nr_page_nomatch;
++ 
++ static bool use_pfn;
++ 
++ #define MAX_MIGRATE_TYPES  6
++ #define MAX_PAGE_ORDER     11
++ 
++ static int order_stats[MAX_PAGE_ORDER][MAX_MIGRATE_TYPES];
++ 
++ struct page_stat {
++ 	struct rb_node 	node;
++ 	u64 		page;
++ 	int 		order;
++ 	unsigned 	gfp_flags;
++ 	unsigned 	migrate_type;
++ 	u64		alloc_bytes;
++ 	u64 		free_bytes;
++ 	int 		nr_alloc;
++ 	int 		nr_free;
++ };
++ 
++ static struct rb_root page_tree;
++ static struct rb_root page_alloc_tree;
++ static struct rb_root page_alloc_sorted;
++ 
++ static struct page_stat *search_page(unsigned long page, bool create)
++ {
++ 	struct rb_node **node = &page_tree.rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct page_stat *data;
++ 
++ 	while (*node) {
++ 		s64 cmp;
++ 
++ 		parent = *node;
++ 		data = rb_entry(*node, struct page_stat, node);
++ 
++ 		cmp = data->page - page;
++ 		if (cmp < 0)
++ 			node = &parent->rb_left;
++ 		else if (cmp > 0)
++ 			node = &parent->rb_right;
++ 		else
++ 			return data;
++ 	}
++ 
++ 	if (!create)
++ 		return NULL;
++ 
++ 	data = zalloc(sizeof(*data));
++ 	if (data != NULL) {
++ 		data->page = page;
++ 
++ 		rb_link_node(&data->node, parent, node);
++ 		rb_insert_color(&data->node, &page_tree);
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static int page_stat_cmp(struct page_stat *a, struct page_stat *b)
++ {
++ 	if (a->page > b->page)
++ 		return -1;
++ 	if (a->page < b->page)
++ 		return 1;
++ 	if (a->order > b->order)
++ 		return -1;
++ 	if (a->order < b->order)
++ 		return 1;
++ 	if (a->migrate_type > b->migrate_type)
++ 		return -1;
++ 	if (a->migrate_type < b->migrate_type)
++ 		return 1;
++ 	if (a->gfp_flags > b->gfp_flags)
++ 		return -1;
++ 	if (a->gfp_flags < b->gfp_flags)
++ 		return 1;
++ 	return 0;
++ }
++ 
++ static struct page_stat *search_page_alloc_stat(struct page_stat *pstat, bool create)
++ {
++ 	struct rb_node **node = &page_alloc_tree.rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct page_stat *data;
++ 
++ 	while (*node) {
++ 		s64 cmp;
++ 
++ 		parent = *node;
++ 		data = rb_entry(*node, struct page_stat, node);
++ 
++ 		cmp = page_stat_cmp(data, pstat);
++ 		if (cmp < 0)
++ 			node = &parent->rb_left;
++ 		else if (cmp > 0)
++ 			node = &parent->rb_right;
++ 		else
++ 			return data;
++ 	}
++ 
++ 	if (!create)
++ 		return NULL;
++ 
++ 	data = zalloc(sizeof(*data));
++ 	if (data != NULL) {
++ 		data->page = pstat->page;
++ 		data->order = pstat->order;
++ 		data->gfp_flags = pstat->gfp_flags;
++ 		data->migrate_type = pstat->migrate_type;
++ 
++ 		rb_link_node(&data->node, parent, node);
++ 		rb_insert_color(&data->node, &page_alloc_tree);
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static bool valid_page(u64 pfn_or_page)
++ {
++ 	if (use_pfn && pfn_or_page == -1UL)
++ 		return false;
++ 	if (!use_pfn && pfn_or_page == 0)
++ 		return false;
++ 	return true;
++ }
++ 
++ static int perf_evsel__process_page_alloc_event(struct perf_evsel *evsel,
++ 						struct perf_sample *sample)
++ {
++ 	u64 page;
++ 	unsigned int order = perf_evsel__intval(evsel, sample, "order");
++ 	unsigned int gfp_flags = perf_evsel__intval(evsel, sample, "gfp_flags");
++ 	unsigned int migrate_type = perf_evsel__intval(evsel, sample,
++ 						       "migratetype");
++ 	u64 bytes = kmem_page_size << order;
++ 	struct page_stat *pstat;
++ 	struct page_stat this = {
++ 		.order = order,
++ 		.gfp_flags = gfp_flags,
++ 		.migrate_type = migrate_type,
++ 	};
++ 
++ 	if (use_pfn)
++ 		page = perf_evsel__intval(evsel, sample, "pfn");
++ 	else
++ 		page = perf_evsel__intval(evsel, sample, "page");
++ 
++ 	nr_page_allocs++;
++ 	total_page_alloc_bytes += bytes;
++ 
++ 	if (!valid_page(page)) {
++ 		nr_page_fails++;
++ 		total_page_fail_bytes += bytes;
++ 
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * This is to find the current page (with correct gfp flags and
++ 	 * migrate type) at free event.
++ 	 */
++ 	pstat = search_page(page, true);
++ 	if (pstat == NULL)
++ 		return -ENOMEM;
++ 
++ 	pstat->order = order;
++ 	pstat->gfp_flags = gfp_flags;
++ 	pstat->migrate_type = migrate_type;
++ 
++ 	this.page = page;
++ 	pstat = search_page_alloc_stat(&this, true);
++ 	if (pstat == NULL)
++ 		return -ENOMEM;
++ 
++ 	pstat->nr_alloc++;
++ 	pstat->alloc_bytes += bytes;
++ 
++ 	order_stats[order][migrate_type]++;
++ 
++ 	return 0;
++ }
++ 
++ static int perf_evsel__process_page_free_event(struct perf_evsel *evsel,
++ 						struct perf_sample *sample)
++ {
++ 	u64 page;
++ 	unsigned int order = perf_evsel__intval(evsel, sample, "order");
++ 	u64 bytes = kmem_page_size << order;
++ 	struct page_stat *pstat;
++ 	struct page_stat this = {
++ 		.order = order,
++ 	};
++ 
++ 	if (use_pfn)
++ 		page = perf_evsel__intval(evsel, sample, "pfn");
++ 	else
++ 		page = perf_evsel__intval(evsel, sample, "page");
++ 
++ 	nr_page_frees++;
++ 	total_page_free_bytes += bytes;
++ 
++ 	pstat = search_page(page, false);
++ 	if (pstat == NULL) {
++ 		pr_debug2("missing free at page %"PRIx64" (order: %d)\n",
++ 			  page, order);
++ 
++ 		nr_page_nomatch++;
++ 		total_page_nomatch_bytes += bytes;
++ 
++ 		return 0;
++ 	}
++ 
++ 	this.page = page;
++ 	this.gfp_flags = pstat->gfp_flags;
++ 	this.migrate_type = pstat->migrate_type;
++ 
++ 	rb_erase(&pstat->node, &page_tree);
++ 	free(pstat);
++ 
++ 	pstat = search_page_alloc_stat(&this, false);
++ 	if (pstat == NULL)
++ 		return -ENOENT;
++ 
++ 	pstat->nr_free++;
++ 	pstat->free_bytes += bytes;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 4ad1f4300e3b (perf kmem: Fix compiles on RHEL6/OL6)
+  typedef int (*tracepoint_handler)(struct perf_evsel *evsel,
+  				  struct perf_sample *sample);
+  
+* Unmerged path tools/perf/builtin-kmem.c
