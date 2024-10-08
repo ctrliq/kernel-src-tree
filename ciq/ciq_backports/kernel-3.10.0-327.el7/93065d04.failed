@@ -1,0 +1,178 @@
+s390/pci: use pdev->dev.groups for attribute creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] pci: use pdev->dev.groups for attribute creation (Myron Stowe) [1110898]
+Rebuild_FUZZ: 95.05%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 93065d045a99391c60fa9ab8aca6b503f51b2e95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/93065d04.failed
+
+Let the driver core handle attribute creation by putting all s390
+specific pci attributes in an attribute group which is referenced
+by pdev->dev.groups in pcibios_add_device.
+
+Link: https://lkml.kernel.org/r/alpine.LFD.2.11.1404141101500.1529@denkbrett
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 93065d045a99391c60fa9ab8aca6b503f51b2e95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index ab84c6948b6a,bdf02570d1df..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -546,66 -530,6 +546,69 @@@ static void zpci_unmap_resources(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +int pcibios_add_platform_entries(struct pci_dev *pdev)
+ +{
+ +	return zpci_sysfs_add_device(&pdev->dev);
+ +}
+ +
+ +int zpci_request_irq(unsigned int irq, irq_handler_t handler, void *data)
+ +{
+ +	unsigned int msi_nr = irq_to_msi_nr(irq);
+ +	unsigned int dev_nr = irq_to_dev_nr(irq);
+ +	struct zdev_irq_map *imap;
+ +	struct msi_desc *msi;
+ +
+ +	msi = irq_get_msi_desc(irq);
+ +	if (!msi)
+ +		return -EIO;
+ +
+ +	imap = zpci_imap[dev_nr];
+ +	imap->cb[msi_nr].handler = handler;
+ +	imap->cb[msi_nr].data = data;
+ +
+ +	/*
+ +	 * The generic MSI code returns with the interrupt disabled on the
+ +	 * card, using the MSI mask bits. Firmware doesn't appear to unmask
+ +	 * at that level, so we do it here by hand.
+ +	 */
+ +	zpci_msi_set_mask_bits(msi, 1, 0);
+ +	return 0;
+ +}
+ +
+ +void zpci_free_irq(unsigned int irq)
+ +{
+ +	unsigned int msi_nr = irq_to_msi_nr(irq);
+ +	unsigned int dev_nr = irq_to_dev_nr(irq);
+ +	struct zdev_irq_map *imap;
+ +	struct msi_desc *msi;
+ +
+ +	/* Disable interrupt */
+ +	msi = irq_get_msi_desc(irq);
+ +	if (!msi)
+ +		return;
+ +	zpci_msi_set_mask_bits(msi, 1, 1);
+ +	imap = zpci_imap[dev_nr];
+ +	imap->cb[msi_nr].handler = NULL;
+ +	imap->cb[msi_nr].data = NULL;
+ +	synchronize_rcu();
+ +}
+ +
+ +int request_irq(unsigned int irq, irq_handler_t handler,
+ +		unsigned long irqflags, const char *devname, void *dev_id)
+ +{
+ +	return zpci_request_irq(irq, handler, dev_id);
+ +}
+ +EXPORT_SYMBOL_GPL(request_irq);
+ +
+ +void free_irq(unsigned int irq, void *dev_id)
+ +{
+ +	zpci_free_irq(irq);
+ +}
+ +EXPORT_SYMBOL_GPL(free_irq);
+ +
+++=======
+++>>>>>>> 93065d045a99 (s390/pci: use pdev->dev.groups for attribute creation)
+  static int __init zpci_irq_init(void)
+  {
+  	int rc;
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index d3577edd06ca..f7a6712797b2 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -128,6 +128,8 @@ static inline bool zdev_enabled(struct zpci_dev *zdev)
+ 	return (zdev->fh & (1UL << 31)) ? true : false;
+ }
+ 
++extern const struct attribute_group *zpci_attr_groups[];
++
+ /* -----------------------------------------------------------------------------
+   Prototypes
+ ----------------------------------------------------------------------------- */
+@@ -182,10 +184,6 @@ static inline void zpci_exit_slot(struct zpci_dev *zdev) {}
+ struct zpci_dev *get_zdev(struct pci_dev *);
+ struct zpci_dev *get_zdev_by_fid(u32);
+ 
+-/* sysfs */
+-int zpci_sysfs_add_device(struct device *);
+-void zpci_sysfs_remove_device(struct device *);
+-
+ /* DMA */
+ int zpci_dma_init(void);
+ void zpci_dma_exit(void);
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_sysfs.c b/arch/s390/pci/pci_sysfs.c
+index cf8a12ff733b..e449bdc72568 100644
+--- a/arch/s390/pci/pci_sysfs.c
++++ b/arch/s390/pci/pci_sysfs.c
+@@ -74,36 +74,18 @@ static ssize_t store_recover(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR(recover, S_IWUSR, NULL, store_recover);
+ 
+-static struct device_attribute *zpci_dev_attrs[] = {
+-	&dev_attr_function_id,
+-	&dev_attr_function_handle,
+-	&dev_attr_pchid,
+-	&dev_attr_pfgid,
+-	&dev_attr_recover,
++static struct attribute *zpci_dev_attrs[] = {
++	&dev_attr_function_id.attr,
++	&dev_attr_function_handle.attr,
++	&dev_attr_pchid.attr,
++	&dev_attr_pfgid.attr,
++	&dev_attr_recover.attr,
++	NULL,
++};
++static struct attribute_group zpci_attr_group = {
++	.attrs = zpci_dev_attrs,
++};
++const struct attribute_group *zpci_attr_groups[] = {
++	&zpci_attr_group,
+ 	NULL,
+ };
+-
+-int zpci_sysfs_add_device(struct device *dev)
+-{
+-	int i, rc = 0;
+-
+-	for (i = 0; zpci_dev_attrs[i]; i++) {
+-		rc = device_create_file(dev, zpci_dev_attrs[i]);
+-		if (rc)
+-			goto error;
+-	}
+-	return 0;
+-
+-error:
+-	while (--i >= 0)
+-		device_remove_file(dev, zpci_dev_attrs[i]);
+-	return rc;
+-}
+-
+-void zpci_sysfs_remove_device(struct device *dev)
+-{
+-	int i;
+-
+-	for (i = 0; zpci_dev_attrs[i]; i++)
+-		device_remove_file(dev, zpci_dev_attrs[i]);
+-}
