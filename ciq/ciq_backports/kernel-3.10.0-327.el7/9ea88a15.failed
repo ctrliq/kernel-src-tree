@@ -1,0 +1,166 @@
+tcp: md5: check md5 signature without socket lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dmitry Popov <ixaphire@qrator.net>
+commit 9ea88a153001ffeb3d8810917e8eea62ca9b6f25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/9ea88a15.failed
+
+Since a8afca032 (tcp: md5: protects md5sig_info with RCU) tcp_md5_do_lookup
+doesn't require socket lock, rcu_read_lock is enough. Therefore socket lock is
+no longer required for tcp_v{4,6}_inbound_md5_hash too, so we can move these
+calls (wrapped with rcu_read_{,un}lock) before bh_lock_sock:
+from tcp_v{4,6}_do_rcv to tcp_v{4,6}_rcv.
+
+	Signed-off-by: Dmitry Popov <ixaphire@qrator.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9ea88a153001ffeb3d8810917e8eea62ca9b6f25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/tcp_ipv6.c
+diff --cc net/ipv6/tcp_ipv6.c
+index 45f11a2930c9,f2ce95502392..000000000000
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@@ -714,8 -708,54 +715,20 @@@ static int __tcp_v6_inbound_md5_hash(st
+  	}
+  	return 0;
+  }
++ 
++ static int tcp_v6_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
++ {
++ 	int ret;
++ 
++ 	rcu_read_lock();
++ 	ret = __tcp_v6_inbound_md5_hash(sk, skb);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
+  #endif
+  
+ -static void tcp_v6_init_req(struct request_sock *req, struct sock *sk,
+ -			    struct sk_buff *skb)
+ -{
+ -	struct inet_request_sock *ireq = inet_rsk(req);
+ -	struct ipv6_pinfo *np = inet6_sk(sk);
+ -
+ -	ireq->ir_v6_rmt_addr = ipv6_hdr(skb)->saddr;
+ -	ireq->ir_v6_loc_addr = ipv6_hdr(skb)->daddr;
+ -
+ -	ireq->ir_iif = sk->sk_bound_dev_if;
+ -
+ -	/* So that link locals have meaning */
+ -	if (!sk->sk_bound_dev_if &&
+ -	    ipv6_addr_type(&ireq->ir_v6_rmt_addr) & IPV6_ADDR_LINKLOCAL)
+ -		ireq->ir_iif = inet6_iif(skb);
+ -
+ -	if (!TCP_SKB_CB(skb)->when &&
+ -	    (ipv6_opt_accepted(sk, skb) || np->rxopt.bits.rxinfo ||
+ -	     np->rxopt.bits.rxoinfo || np->rxopt.bits.rxhlim ||
+ -	     np->rxopt.bits.rxohlim || np->repflow)) {
+ -		atomic_inc(&skb->users);
+ -		ireq->pktopts = skb;
+ -	}
+ -}
+ -
+ -static struct dst_entry *tcp_v6_route_req(struct sock *sk, struct flowi *fl,
+ -					  const struct request_sock *req,
+ -					  bool *strict)
+ -{
+ -	if (strict)
+ -		*strict = true;
+ -	return inet6_csk_route_req(sk, &fl->u.ip6, req);
+ -}
+ -
+  struct request_sock_ops tcp6_request_sock_ops __read_mostly = {
+  	.family		=	AF_INET6,
+  	.obj_size	=	sizeof(struct tcp6_request_sock),
+@@@ -1321,11 -1260,6 +1334,14 @@@ static int tcp_v6_do_rcv(struct sock *s
+  	if (skb->protocol == htons(ETH_P_IP))
+  		return tcp_v4_do_rcv(sk, skb);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_TCP_MD5SIG
+ +	if (tcp_v6_inbound_md5_hash (sk, skb))
+ +		goto discard;
+ +#endif
+ +
+++=======
+++>>>>>>> 9ea88a153001 (tcp: md5: check md5 signature without socket lock)
+  	if (sk_filter(sk, skb))
+  		goto discard;
+  
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index f2224d131626..3295f43c7ea5 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1180,7 +1180,8 @@ clear_hash_noput:
+ }
+ EXPORT_SYMBOL(tcp_v4_md5_hash_skb);
+ 
+-static bool tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
++static bool __tcp_v4_inbound_md5_hash(struct sock *sk,
++				      const struct sk_buff *skb)
+ {
+ 	/*
+ 	 * This gets called for each TCP segment that arrives
+@@ -1233,6 +1234,17 @@ static bool tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
+ 	return false;
+ }
+ 
++static bool tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
++{
++	bool ret;
++
++	rcu_read_lock();
++	ret = __tcp_v4_inbound_md5_hash(sk, skb);
++	rcu_read_unlock();
++
++	return ret;
++}
++
+ #endif
+ 
+ struct request_sock_ops tcp_request_sock_ops __read_mostly = {
+@@ -1747,16 +1759,6 @@ static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct sock *rsk;
+-#ifdef CONFIG_TCP_MD5SIG
+-	/*
+-	 * We really want to reject the packet as early as possible
+-	 * if:
+-	 *  o We're expecting an MD5'd packet and this is no MD5 tcp option
+-	 *  o There is an MD5 option and we're not expecting one
+-	 */
+-	if (tcp_v4_inbound_md5_hash(sk, skb))
+-		goto discard;
+-#endif
+ 
+ 	if (sk->sk_state == TCP_ESTABLISHED) { /* Fast path */
+ 		struct dst_entry *dst = sk->sk_rx_dst;
+@@ -1959,6 +1961,18 @@ process:
+ 
+ 	if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb))
+ 		goto discard_and_relse;
++
++#ifdef CONFIG_TCP_MD5SIG
++	/*
++	 * We really want to reject the packet as early as possible
++	 * if:
++	 *  o We're expecting an MD5'd packet and this is no MD5 tcp option
++	 *  o There is an MD5 option and we're not expecting one
++	 */
++	if (tcp_v4_inbound_md5_hash(sk, skb))
++		goto discard_and_relse;
++#endif
++
+ 	nf_reset(skb);
+ 
+ 	if (sk_filter(sk, skb))
+* Unmerged path net/ipv6/tcp_ipv6.c
