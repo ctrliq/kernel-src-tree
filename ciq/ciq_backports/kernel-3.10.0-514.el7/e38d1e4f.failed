@@ -1,0 +1,233 @@
+IB/hfi1: Check P_KEY for all sent packets from user mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sebastian Sanchez <sebastian.sanchez@intel.com>
+commit e38d1e4f5099d533a833afee89f439853c94f272
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e38d1e4f.failed
+
+Add the P_KEY check for user-context mechanism for
+both PIO and SDMA. For PIO, the
+SendCtxtCheckEnable.DisallowKDETHPackets is set by
+default. When the P_KEY is set,
+SendCtxtCheckEnable.DisallowKDETHPackets is cleared.
+For SDMA, a software check was included. This change
+requires user processes to set the P_KEY before sending
+any packets, otherwise, the sent packet will fail. The
+original submission didn't have this check but it's
+required.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Mikto Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e38d1e4f5099d533a833afee89f439853c94f272)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/verbs.c
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,c56c0cb0de80..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -1240,20 -1111,27 +1240,33 @@@ static inline int egress_pkey_matches_e
+  	return 0;
+  }
+  
+- /*
+-  * egress_pkey_check - return 0 if hdr's pkey matches according to the
+-  * criteria in the OPAv1 spec., section 9.11.7.
++ /**
++  * egress_pkey_check - check P_KEY of a packet
++  * @ppd:    Physical IB port data
++  * @lrh: Local route header
++  * @bth: Base transport header
++  * @sc5:    SC for packet
++  * @s_pkey_index: It will be used for look up optimization for kernel contexts
++  * only. If it is negative value, then it means user contexts is calling this
++  * function.
++  *
++  * It checks if hdr's pkey is valid.
++  *
++  * Return: 0 on success, otherwise, 1
+   */
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +static inline int egress_pkey_check(struct hfi1_pportdata *ppd,
+ +				    struct hfi1_ib_header *hdr,
+ +				    struct hfi1_qp *qp)
+++=======
++ int egress_pkey_check(struct hfi1_pportdata *ppd, __be16 *lrh, __be32 *bth,
++ 		      u8 sc5, int8_t s_pkey_index)
+++>>>>>>> e38d1e4f5099 (IB/hfi1: Check P_KEY for all sent packets from user mode):drivers/staging/rdma/hfi1/verbs.c
+  {
+- 	struct hfi1_qp_priv *priv = qp->priv;
+- 	struct hfi1_other_headers *ohdr;
+  	struct hfi1_devdata *dd;
+- 	int i = 0;
++ 	int i;
+  	u16 pkey;
+- 	u8 lnh, sc5 = priv->s_sc;
++ 	int is_user_ctxt_mechanism = (s_pkey_index < 0);
+  
+  	if (!(ppd->part_enforce & HFI1_PART_ENFORCE_OUT))
+  		return 0;
+@@@ -1276,27 -1146,37 +1282,48 @@@
+  	if ((pkey & PKEY_LOW_15_MASK) == 0)
+  		goto bad;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	/* The most likely matching pkey has index qp->s_pkey_index */
+ +	if (unlikely(!egress_pkey_matches_entry(pkey,
+ +					ppd->pkeys[qp->s_pkey_index]))) {
+ +		/* no match - try the entire table */
+ +		for (; i < MAX_PKEY_VALUES; i++) {
+ +			if (egress_pkey_matches_entry(pkey, ppd->pkeys[i]))
+ +				break;
+ +		}
+++=======
++ 	/*
++ 	 * For the kernel contexts only, if a qp is passed into the function,
++ 	 * the most likely matching pkey has index qp->s_pkey_index
++ 	 */
++ 	if (!is_user_ctxt_mechanism &&
++ 	    egress_pkey_matches_entry(pkey, ppd->pkeys[s_pkey_index])) {
++ 		return 0;
+++>>>>>>> e38d1e4f5099 (IB/hfi1: Check P_KEY for all sent packets from user mode):drivers/staging/rdma/hfi1/verbs.c
+  	}
+  
+- 	if (i < MAX_PKEY_VALUES)
+- 		return 0;
++ 	for (i = 0; i < MAX_PKEY_VALUES; i++) {
++ 		if (egress_pkey_matches_entry(pkey, ppd->pkeys[i]))
++ 			return 0;
++ 	}
+  bad:
+- 	incr_cntr64(&ppd->port_xmit_constraint_errors);
+- 	dd = ppd->dd;
+- 	if (!(dd->err_info_xmit_constraint.status & OPA_EI_STATUS_SMASK)) {
+- 		u16 slid = be16_to_cpu(hdr->lrh[3]);
+- 
+- 		dd->err_info_xmit_constraint.status |= OPA_EI_STATUS_SMASK;
+- 		dd->err_info_xmit_constraint.slid = slid;
+- 		dd->err_info_xmit_constraint.pkey = pkey;
++ 	/*
++ 	 * For the user-context mechanism, the P_KEY check would only happen
++ 	 * once per SDMA request, not once per packet.  Therefore, there's no
++ 	 * need to increment the counter for the user-context mechanism.
++ 	 */
++ 	if (!is_user_ctxt_mechanism) {
++ 		incr_cntr64(&ppd->port_xmit_constraint_errors);
++ 		dd = ppd->dd;
++ 		if (!(dd->err_info_xmit_constraint.status &
++ 		      OPA_EI_STATUS_SMASK)) {
++ 			u16 slid = be16_to_cpu(lrh[3]);
++ 
++ 			dd->err_info_xmit_constraint.status |=
++ 				OPA_EI_STATUS_SMASK;
++ 			dd->err_info_xmit_constraint.slid = slid;
++ 			dd->err_info_xmit_constraint.pkey = pkey;
++ 		}
+  	}
+  	return 1;
+  }
+@@@ -1313,21 -1236,26 +1340,44 @@@ int hfi1_verbs_send(struct hfi1_qp *qp
+  {
+  	struct hfi1_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+  	struct hfi1_qp_priv *priv = qp->priv;
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	struct ahg_ib_header *ahdr = priv->s_hdr;
+ +	int ret;
+ +	int pio = 0;
+ +	unsigned long flags = 0;
+ +
+ +	/*
+ +	 * VL15 packets (IB_QPT_SMI) will always use PIO, so we
+ +	 * can defer SDMA restart until link goes ACTIVE without
+ +	 * worrying about just how we got there.
+ +	 */
+ +	if ((qp->ibqp.qp_type == IB_QPT_SMI) ||
+ +	    !(dd->flags & HFI1_HAS_SEND_DMA))
+ +		pio = 1;
+ +
+ +	ret = egress_pkey_check(dd->pport, &ahdr->ibh, qp);
+++=======
++ 	struct hfi1_other_headers *ohdr;
++ 	struct hfi1_ib_header *hdr;
++ 	send_routine sr;
++ 	int ret;
++ 	u8 lnh;
++ 
++ 	hdr = &ps->s_txreq->phdr.hdr;
++ 	/* locate the pkey within the headers */
++ 	lnh = be16_to_cpu(hdr->lrh[0]) & 3;
++ 	if (lnh == HFI1_LRH_GRH)
++ 		ohdr = &hdr->u.l.oth;
++ 	else
++ 		ohdr = &hdr->u.oth;
++ 
++ 	sr = get_send_routine(qp, ps->s_txreq);
++ 	ret = egress_pkey_check(dd->pport,
++ 				hdr->lrh,
++ 				ohdr->bth,
++ 				priv->s_sc,
++ 				qp->s_pkey_index);
+++>>>>>>> e38d1e4f5099 (IB/hfi1: Check P_KEY for all sent packets from user mode):drivers/staging/rdma/hfi1/verbs.c
+  	if (unlikely(ret)) {
+  		/*
+  		 * The value we are returning here does not get propagated to
+diff --git a/drivers/staging/hfi1/chip.c b/drivers/staging/hfi1/chip.c
+index 689fb76865d1..46eee05fafa9 100644
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@ -13828,6 +13828,7 @@ int hfi1_set_ctxt_pkey(struct hfi1_devdata *dd, unsigned ctxt, u16 pkey)
+ 	write_kctxt_csr(dd, sctxt, SEND_CTXT_CHECK_PARTITION_KEY, reg);
+ 	reg = read_kctxt_csr(dd, sctxt, SEND_CTXT_CHECK_ENABLE);
+ 	reg |= SEND_CTXT_CHECK_ENABLE_CHECK_PARTITION_KEY_SMASK;
++	reg &= ~SEND_CTXT_CHECK_ENABLE_DISALLOW_KDETH_PACKETS_SMASK;
+ 	write_kctxt_csr(dd, sctxt, SEND_CTXT_CHECK_ENABLE, reg);
+ done:
+ 	return ret;
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index ec4274792def..a52d8e86e001 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -1297,6 +1297,9 @@ void process_becn(struct hfi1_pportdata *ppd, u8 sl,  u16 rlid, u32 lqpn,
+ void return_cnp(struct hfi1_ibport *ibp, struct hfi1_qp *qp, u32 remote_qpn,
+ 		u32 pkey, u32 slid, u32 dlid, u8 sc5,
+ 		const struct ib_grh *old_grh);
++#define PKEY_CHECK_INVALID -1
++int egress_pkey_check(struct hfi1_pportdata *ppd, __be16 *lrh, __be32 *bth,
++		      u8 sc5, int8_t s_pkey_index);
+ 
+ #define PACKET_EGRESS_TIMEOUT 350
+ static inline void pause_for_credit_return(struct hfi1_devdata *dd)
+@@ -1739,6 +1742,7 @@ extern struct mutex hfi1_mutex;
+ 
+ #define HFI1_PKT_USER_SC_INTEGRITY					    \
+ 	(SEND_CTXT_CHECK_ENABLE_DISALLOW_NON_KDETH_PACKETS_SMASK	    \
++	| SEND_CTXT_CHECK_ENABLE_DISALLOW_KDETH_PACKETS_SMASK		\
+ 	| SEND_CTXT_CHECK_ENABLE_DISALLOW_BYPASS_SMASK		    \
+ 	| SEND_CTXT_CHECK_ENABLE_DISALLOW_GRH_SMASK)
+ 
+diff --git a/drivers/staging/hfi1/user_sdma.c b/drivers/staging/hfi1/user_sdma.c
+index 6967deb7956a..43d6ce32f979 100644
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@ -582,6 +582,13 @@ int hfi1_user_sdma_process_request(struct file *fp, struct iovec *iovec,
+ 		goto free_req;
+ 	}
+ 
++	/* Checking P_KEY for requests from user-space */
++	if (egress_pkey_check(dd->pport, req->hdr.lrh, req->hdr.bth, sc,
++			      PKEY_CHECK_INVALID)) {
++		ret = -EINVAL;
++		goto free_req;
++	}
++
+ 	/*
+ 	 * Also should check the BTH.lnh. If it says the next header is GRH then
+ 	 * the RXE parsing will be off and will land in the middle of the KDETH
+* Unmerged path drivers/staging/hfi1/verbs.c
