@@ -1,0 +1,129 @@
+KVM: VMX: Fix commit which broke PML
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kai Huang <kai.huang@linux.intel.com>
+commit a3eaa8649e4c6a6afdafaa04b9114fb230617bb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a3eaa864.failed
+
+I found PML was broken since below commit:
+
+	commit feda805fe7c4ed9cf78158e73b1218752e3b4314
+	Author: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Date:   Wed Sep 9 14:05:55 2015 +0800
+
+	KVM: VMX: unify SECONDARY_VM_EXEC_CONTROL update
+
+	Unify the update in vmx_cpuid_update()
+
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	[Rewrite to use vmcs_set_secondary_exec_control. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+The reason is in above commit vmx_cpuid_update calls vmx_secondary_exec_control,
+in which currently SECONDARY_EXEC_ENABLE_PML bit is cleared unconditionally (as
+PML is enabled in creating vcpu). Therefore if vcpu_cpuid_update is called after
+vcpu is created, PML will be disabled unexpectedly while log-dirty code still
+thinks PML is used.
+
+Fix this by clearing SECONDARY_EXEC_ENABLE_PML in vmx_secondary_exec_control
+only when PML is not supported or not enabled (!enable_pml). This is more
+reasonable as PML is currently either always enabled or disabled. With this
+explicit updating SECONDARY_EXEC_ENABLE_PML in vmx_enable{disable}_pml is not
+needed so also rename vmx_enable{disable}_pml to vmx_create{destroy}_pml_buffer.
+
+Fixes: feda805fe7c4ed9cf78158e73b1218752e3b4314
+	Signed-off-by: Kai Huang <kai.huang@linux.intel.com>
+[While at it, change a wrong ASSERT to an "if".  The condition can happen
+ if creating the VCPU fails with ENOMEM. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a3eaa8649e4c6a6afdafaa04b9114fb230617bb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index d1ae1d645663,5eb56ed77c1f..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -4327,9 -4718,13 +4327,10 @@@ static u32 vmx_secondary_exec_control(s
+  	   a current VMCS12
+  	*/
+  	exec_control &= ~SECONDARY_EXEC_SHADOW_VMCS;
+- 	/* PML is enabled/disabled in creating/destorying vcpu */
+- 	exec_control &= ~SECONDARY_EXEC_ENABLE_PML;
++ 
++ 	if (!enable_pml)
++ 		exec_control &= ~SECONDARY_EXEC_ENABLE_PML;
+  
+ -	/* Currently, we allow L1 guest to directly run pcommit instruction. */
+ -	exec_control &= ~SECONDARY_EXEC_PCOMMIT;
+ -
+  	return exec_control;
+  }
+  
+@@@ -7301,10 -7805,9 +7302,10 @@@ static void vmx_get_exit_info(struct kv
+  	*info2 = vmcs_read32(VM_EXIT_INTR_INFO);
+  }
+  
+- static int vmx_enable_pml(struct vcpu_vmx *vmx)
++ static int vmx_create_pml_buffer(struct vcpu_vmx *vmx)
+  {
+  	struct page *pml_pg;
+ +	u32 exec_control;
+  
+  	pml_pg = alloc_page(GFP_KERNEL | __GFP_ZERO);
+  	if (!pml_pg)
+@@@ -7315,24 -7818,15 +7316,34 @@@
+  	vmcs_write64(PML_ADDRESS, page_to_phys(vmx->pml_pg));
+  	vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+  
+++<<<<<<< HEAD
+ +	exec_control = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+ +	exec_control |= SECONDARY_EXEC_ENABLE_PML;
+ +	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, exec_control);
+ +
+++=======
+++>>>>>>> a3eaa8649e4c (KVM: VMX: Fix commit which broke PML)
+  	return 0;
+  }
+  
+- static void vmx_disable_pml(struct vcpu_vmx *vmx)
++ static void vmx_destroy_pml_buffer(struct vcpu_vmx *vmx)
+  {
+++<<<<<<< HEAD
+ +	u32 exec_control;
+ +
+ +	ASSERT(vmx->pml_pg);
+ +	__free_page(vmx->pml_pg);
+ +	vmx->pml_pg = NULL;
+ +
+ +	exec_control = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+ +	exec_control &= ~SECONDARY_EXEC_ENABLE_PML;
+ +	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, exec_control);
+++=======
++ 	if (vmx->pml_pg) {
++ 		__free_page(vmx->pml_pg);
++ 		vmx->pml_pg = NULL;
++ 	}
+++>>>>>>> a3eaa8649e4c (KVM: VMX: Fix commit which broke PML)
+  }
+  
+  static void vmx_flush_pml_buffer(struct kvm_vcpu *vcpu)
+@@@ -8203,8 -8704,8 +8214,13 @@@ static void vmx_free_vcpu(struct kvm_vc
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  
+  	if (enable_pml)
+++<<<<<<< HEAD
+ +		vmx_disable_pml(vmx);
+ +	free_vpid(vmx);
+++=======
++ 		vmx_destroy_pml_buffer(vmx);
++ 	free_vpid(vmx->vpid);
+++>>>>>>> a3eaa8649e4c (KVM: VMX: Fix commit which broke PML)
+  	leave_guest_mode(vcpu);
+  	vmx_load_vmcs01(vcpu);
+  	free_nested(vmx);
+* Unmerged path arch/x86/kvm/vmx.c
