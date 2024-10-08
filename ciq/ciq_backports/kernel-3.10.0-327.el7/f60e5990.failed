@@ -1,0 +1,213 @@
+ipv6: protect skb->sk accesses from recursive dereference inside the stack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author hannes@stressinduktion.org <hannes@stressinduktion.org>
+commit f60e5990d9c1424af9dbca60a23ba2a1c7c1ce90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f60e5990.failed
+
+We should not consult skb->sk for output decisions in xmit recursion
+levels > 0 in the stack. Otherwise local socket settings could influence
+the result of e.g. tunnel encapsulation process.
+
+ipv6 does not conform with this in three places:
+
+1) ip6_fragment: we do consult ipv6_npinfo for frag_size
+
+2) sk_mc_loop in ipv6 uses skb->sk and checks if we should
+   loop the packet back to the local socket
+
+3) ip6_skb_dst_mtu could query the settings from the user socket and
+   force a wrong MTU
+
+Furthermore:
+In sk_mc_loop we could potentially land in WARN_ON(1) if we use a
+PF_PACKET socket ontop of an IPv6-backed vxlan device.
+
+Reuse xmit_recursion as we are currently only interested in protecting
+tunnel devices.
+
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f60e5990d9c1424af9dbca60a23ba2a1c7c1ce90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/ip.h
+#	net/ipv6/ip6_output.c
+diff --cc include/linux/netdevice.h
+index dba59a041ff6,278738873703..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1844,21 -2179,24 +1844,36 @@@ static inline void unregister_netdevice
+  	unregister_netdevice_queue(dev, NULL);
+  }
+  
+ -int netdev_refcnt_read(const struct net_device *dev);
+ -void free_netdev(struct net_device *dev);
+ -void netdev_freemem(struct net_device *dev);
+ -void synchronize_net(void);
+ -int init_dummy_netdev(struct net_device *dev);
+ +extern int 		netdev_refcnt_read(const struct net_device *dev);
+ +extern void		free_netdev(struct net_device *dev);
+ +extern void		synchronize_net(void);
+ +extern int		init_dummy_netdev(struct net_device *dev);
+  
+++<<<<<<< HEAD
+ +extern struct net_device	*dev_get_by_index(struct net *net, int ifindex);
+ +extern struct net_device	*__dev_get_by_index(struct net *net, int ifindex);
+ +extern struct net_device	*dev_get_by_index_rcu(struct net *net, int ifindex);
+ +extern int		netdev_get_name(struct net *net, char *name, int ifindex);
+ +extern int		dev_restart(struct net_device *dev);
+ +#ifdef CONFIG_NETPOLL_TRAP
+ +extern int		netpoll_trap(void);
+ +#endif
+ +extern int	       skb_gro_receive(struct sk_buff **head,
+ +				       struct sk_buff *skb);
+++=======
++ DECLARE_PER_CPU(int, xmit_recursion);
++ static inline int dev_recursion_level(void)
++ {
++ 	return this_cpu_read(xmit_recursion);
++ }
++ 
++ struct net_device *dev_get_by_index(struct net *net, int ifindex);
++ struct net_device *__dev_get_by_index(struct net *net, int ifindex);
++ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
++ int netdev_get_name(struct net *net, char *name, int ifindex);
++ int dev_restart(struct net_device *dev);
++ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
+++>>>>>>> f60e5990d9c1 (ipv6: protect skb->sk accesses from recursive dereference inside the stack)
+  
+  static inline unsigned int skb_gro_offset(const struct sk_buff *skb)
+  {
+diff --cc include/net/ip.h
+index 01f9ccf5f537,6cc1eafb153a..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -443,23 -453,7 +443,27 @@@ static __inline__ void inet_reset_saddr
+  
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline int sk_mc_loop(struct sock *sk)
+ +{
+ +	if (!sk)
+ +		return 1;
+ +	switch (sk->sk_family) {
+ +	case AF_INET:
+ +		return inet_sk(sk)->mc_loop;
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	case AF_INET6:
+ +		return inet6_sk(sk)->mc_loop;
+ +#endif
+ +	}
+ +	WARN_ON(1);
+ +	return 1;
+ +}
+ +
+ +extern bool ip_call_ra_chain(struct sk_buff *skb);
+++=======
++ bool ip_call_ra_chain(struct sk_buff *skb);
+++>>>>>>> f60e5990d9c1 (ipv6: protect skb->sk accesses from recursive dereference inside the stack)
+  
+  /*
+   *	Functions provided by ip_fragment.c
+diff --cc net/ipv6/ip6_output.c
+index 524b4ad02d70,36cf0ab685a0..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -518,8 -541,9 +518,14 @@@ static void ip6_copy_metadata(struct sk
+  int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
+  {
+  	struct sk_buff *frag;
+++<<<<<<< HEAD
+ +	struct rt6_info *rt = (struct rt6_info*)skb_dst(skb);
+ +	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
+++=======
++ 	struct rt6_info *rt = (struct rt6_info *)skb_dst(skb);
++ 	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
++ 				inet6_sk(skb->sk) : NULL;
+++>>>>>>> f60e5990d9c1 (ipv6: protect skb->sk accesses from recursive dereference inside the stack)
+  	struct ipv6hdr *tmp_hdr;
+  	struct frag_hdr *fh;
+  	unsigned int mtu, hlen, left, len;
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/net/ip.h
+diff --git a/include/net/ip6_route.h b/include/net/ip6_route.h
+index 71256172cd6b..252a7c34642f 100644
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -189,7 +189,8 @@ int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+ 
+ static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+ {
+-	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
++	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
++				inet6_sk(skb->sk) : NULL;
+ 
+ 	return (np && np->pmtudisc >= IPV6_PMTUDISC_PROBE) ?
+ 	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 294615bbc86d..ff2c2b45d9d4 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1843,6 +1843,8 @@ extern struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
+ 
+ extern struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+ 
++bool sk_mc_loop(struct sock *sk);
++
+ static inline bool sk_can_gso(const struct sock *sk)
+ {
+ 	return net_gso_ok(sk->sk_route_caps, sk->sk_gso_type);
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1924c9647d47..fa5f666ec71f 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2705,7 +2705,9 @@ static void skb_update_prio(struct sk_buff *skb)
+ #define skb_update_prio(skb)
+ #endif
+ 
+-static DEFINE_PER_CPU(int, xmit_recursion);
++DEFINE_PER_CPU(int, xmit_recursion);
++EXPORT_SYMBOL(xmit_recursion);
++
+ #define RECURSION_LIMIT 10
+ 
+ /**
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 5a083b2d2957..55d36c9fc2a0 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -615,6 +615,25 @@ static inline void sock_valbool_flag(struct sock *sk, int bit, int valbool)
+ 		sock_reset_flag(sk, bit);
+ }
+ 
++bool sk_mc_loop(struct sock *sk)
++{
++	if (dev_recursion_level())
++		return false;
++	if (!sk)
++		return true;
++	switch (sk->sk_family) {
++	case AF_INET:
++		return inet_sk(sk)->mc_loop;
++#if IS_ENABLED(CONFIG_IPV6)
++	case AF_INET6:
++		return inet6_sk(sk)->mc_loop;
++#endif
++	}
++	WARN_ON(1);
++	return true;
++}
++EXPORT_SYMBOL(sk_mc_loop);
++
+ /*
+  *	This is meant for all protocols to use and covers goings on
+  *	at the socket level. Everything here is generic.
+* Unmerged path net/ipv6/ip6_output.c
