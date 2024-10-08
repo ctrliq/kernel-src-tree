@@ -1,0 +1,152 @@
+IB/iser: Merge build page-vec into register page-vec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [infiniband] iser: Merge build page-vec into register page-vec (Amir Vadai) [1164539]
+Rebuild_FUZZ: 97.03%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit f0e35c27a5962cbd17fc58737c7f5f7b398bccb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f0e35c27.failed
+
+No need for these two separate. Keep it in a single routine
+like in the fastreg case. This will also make iser_reg_page_vec
+closer to iser_fast_reg_mr arguments. This is a preparation
+step for registration flow refactor.
+
+This patch does not change any functionality.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Adir Lev <adirl@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f0e35c27a5962cbd17fc58737c7f5f7b398bccb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_memory.c
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index f40132fc970c,6e6b75319bf9..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -366,6 -337,92 +341,95 @@@ static int fall_to_bounce_buf(struct is
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * iser_reg_page_vec - Register physical memory
++  *
++  * returns: 0 on success, errno code on failure
++  */
++ static
++ int iser_reg_page_vec(struct iscsi_iser_task *iser_task,
++ 		      struct iser_data_buf *mem,
++ 		      struct iser_page_vec *page_vec,
++ 		      struct iser_mem_reg *mem_reg)
++ {
++ 	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
++ 	struct iser_device *device = ib_conn->device;
++ 	struct ib_pool_fmr *fmr;
++ 	int ret, plen;
++ 
++ 	plen = iser_sg_to_page_vec(mem, device->ib_device,
++ 				   page_vec->pages,
++ 				   &page_vec->offset,
++ 				   &page_vec->data_size);
++ 	page_vec->length = plen;
++ 	if (plen * SIZE_4K < page_vec->data_size) {
++ 		iser_err("page vec too short to hold this SG\n");
++ 		iser_data_buf_dump(mem, device->ib_device);
++ 		iser_dump_page_vec(page_vec);
++ 		return -EINVAL;
++ 	}
++ 
++ 	fmr  = ib_fmr_pool_map_phys(ib_conn->fmr.pool,
++ 				    page_vec->pages,
++ 				    page_vec->length,
++ 				    page_vec->pages[0]);
++ 	if (IS_ERR(fmr)) {
++ 		ret = PTR_ERR(fmr);
++ 		iser_err("ib_fmr_pool_map_phys failed: %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	mem_reg->lkey = fmr->fmr->lkey;
++ 	mem_reg->rkey = fmr->fmr->rkey;
++ 	mem_reg->va = page_vec->pages[0] + page_vec->offset;
++ 	mem_reg->len = page_vec->data_size;
++ 	mem_reg->mem_h = fmr;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * Unregister (previosuly registered using FMR) memory.
++  * If memory is non-FMR does nothing.
++  */
++ void iser_unreg_mem_fmr(struct iscsi_iser_task *iser_task,
++ 			enum iser_data_dir cmd_dir)
++ {
++ 	struct iser_mem_reg *reg = &iser_task->rdma_reg[cmd_dir];
++ 	int ret;
++ 
++ 	if (!reg->mem_h)
++ 		return;
++ 
++ 	iser_dbg("PHYSICAL Mem.Unregister mem_h %p\n", reg->mem_h);
++ 
++ 	ret = ib_fmr_pool_unmap((struct ib_pool_fmr *)reg->mem_h);
++ 	if (ret)
++ 		iser_err("ib_fmr_pool_unmap failed %d\n", ret);
++ 
++ 	reg->mem_h = NULL;
++ }
++ 
++ void iser_unreg_mem_fastreg(struct iscsi_iser_task *iser_task,
++ 			    enum iser_data_dir cmd_dir)
++ {
++ 	struct iser_mem_reg *reg = &iser_task->rdma_reg[cmd_dir];
++ 	struct iser_conn *iser_conn = iser_task->iser_conn;
++ 	struct ib_conn *ib_conn = &iser_conn->ib_conn;
++ 	struct fast_reg_descriptor *desc = reg->mem_h;
++ 
++ 	if (!desc)
++ 		return;
++ 
++ 	reg->mem_h = NULL;
++ 	spin_lock_bh(&ib_conn->lock);
++ 	list_add_tail(&desc->list, &ib_conn->fastreg.pool);
++ 	spin_unlock_bh(&ib_conn->lock);
++ }
++ 
++ /**
+++>>>>>>> f0e35c27a596 (IB/iser: Merge build page-vec into register page-vec)
+   * iser_reg_rdma_mem_fmr - Registers memory intended for RDMA,
+   * using FMR (if possible) obtaining rkey and va
+   *
+@@@ -410,14 -464,13 +474,19 @@@ int iser_reg_rdma_mem_fmr(struct iscsi_
+  
+  		iser_dbg("PHYSICAL Mem.register: lkey: 0x%08X rkey: 0x%08X  "
+  			 "va: 0x%08lX sz: %ld]\n",
+ -			 (unsigned int)mem_reg->lkey,
+ -			 (unsigned int)mem_reg->rkey,
+ -			 (unsigned long)mem_reg->va,
+ -			 (unsigned long)mem_reg->len);
+ +			 (unsigned int)regd_buf->reg.lkey,
+ +			 (unsigned int)regd_buf->reg.rkey,
+ +			 (unsigned long)regd_buf->reg.va,
+ +			 (unsigned long)regd_buf->reg.len);
+  	} else { /* use FMR for multiple dma entries */
+++<<<<<<< HEAD
+ +		iser_page_vec_build(mem, ib_conn->fmr.page_vec, ibdev);
+ +		err = iser_reg_page_vec(ib_conn, ib_conn->fmr.page_vec,
+ +					&regd_buf->reg);
+++=======
++ 		err = iser_reg_page_vec(iser_task, mem, ib_conn->fmr.page_vec,
++ 					mem_reg);
+++>>>>>>> f0e35c27a596 (IB/iser: Merge build page-vec into register page-vec)
+  		if (err && err != -EAGAIN) {
+  			iser_data_buf_dump(mem, ibdev);
+  			iser_err("mem->dma_nents = %d (dlength = 0x%x)\n",
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
