@@ -1,0 +1,268 @@
+ipv4: introduce ip_dst_mtu_maybe_forward and protect forwarding path against pmtu spoofing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit f87c10a8aa1e82498c42d0335524d6ae7cf5a52b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f87c10a8.failed
+
+While forwarding we should not use the protocol path mtu to calculate
+the mtu for a forwarded packet but instead use the interface mtu.
+
+We mark forwarded skbs in ip_forward with IPSKB_FORWARDED, which was
+introduced for multicast forwarding. But as it does not conflict with
+our usage in unicast code path it is perfect for reuse.
+
+I moved the functions ip_sk_accept_pmtu, ip_sk_use_pmtu and ip_skb_dst_mtu
+along with the new ip_dst_mtu_maybe_forward to net/ip.h to fix circular
+dependencies because of IPSKB_FORWARDED.
+
+Because someone might have written a software which does probe
+destinations manually and expects the kernel to honour those path mtus
+I introduced a new per-namespace "ip_forward_use_pmtu" knob so someone
+can disable this new behaviour. We also still use mtus which are locked on a
+route for forwarding.
+
+The reason for this change is, that path mtus information can be injected
+into the kernel via e.g. icmp_err protocol handler without verification
+of local sockets. As such, this could cause the IPv4 forwarding path to
+wrongfully emit fragmentation needed notifications or start to fragment
+packets along a path.
+
+Tunnel and ipsec output paths clear IPCB again, thus IPSKB_FORWARDED
+won't be set and further fragmentation logic will use the path mtu to
+determine the fragmentation size. They also recheck packet size with
+help of path mtu discovery and report appropriate errors.
+
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: David Miller <davem@davemloft.net>
+	Cc: John Heffner <johnwheffner@gmail.com>
+	Cc: Steffen Klassert <steffen.klassert@secunet.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f87c10a8aa1e82498c42d0335524d6ae7cf5a52b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+#	net/ipv4/ip_forward.c
+#	net/ipv4/route.c
+diff --cc include/net/ip.h
+index 3bcd4b1a964e,0dab95c2e4d5..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -270,7 -263,40 +270,44 @@@ int ip_dont_fragment(struct sock *sk, s
+  		 !(dst_metric_locked(dst, RTAX_MTU)));
+  }
+  
+++<<<<<<< HEAD
+ +extern void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+++=======
++ static inline bool ip_sk_accept_pmtu(const struct sock *sk)
++ {
++ 	return inet_sk(sk)->pmtudisc != IP_PMTUDISC_INTERFACE;
++ }
++ 
++ static inline bool ip_sk_use_pmtu(const struct sock *sk)
++ {
++ 	return inet_sk(sk)->pmtudisc < IP_PMTUDISC_PROBE;
++ }
++ 
++ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
++ 						    bool forwarding)
++ {
++ 	struct net *net = dev_net(dst->dev);
++ 
++ 	if (net->ipv4.sysctl_ip_fwd_use_pmtu ||
++ 	    dst_metric_locked(dst, RTAX_MTU) ||
++ 	    !forwarding)
++ 		return dst_mtu(dst);
++ 
++ 	return min(dst->dev->mtu, IP_MAX_MTU);
++ }
++ 
++ static inline unsigned int ip_skb_dst_mtu(const struct sk_buff *skb)
++ {
++ 	if (!skb->sk || ip_sk_use_pmtu(skb->sk)) {
++ 		bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
++ 		return ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
++ 	} else {
++ 		return min(skb_dst(skb)->dev->mtu, IP_MAX_MTU);
++ 	}
++ }
++ 
++ void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
+++>>>>>>> f87c10a8aa1e (ipv4: introduce ip_dst_mtu_maybe_forward and protect forwarding path against pmtu spoofing)
+  
+  static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk)
+  {
+diff --cc net/ipv4/ip_forward.c
+index bd1c5baf69be,e9f1217a8afd..000000000000
+--- a/net/ipv4/ip_forward.c
++++ b/net/ipv4/ip_forward.c
+@@@ -156,10 -89,13 +157,17 @@@ int ip_forward(struct sk_buff *skb
+  	if (opt->is_strictroute && rt->rt_uses_gateway)
+  		goto sr_failed;
+  
+++<<<<<<< HEAD
+ +	if (!ip_may_fragment(skb) && ip_exceeds_mtu(skb, dst_mtu(&rt->dst))) {
+++=======
++ 	IPCB(skb)->flags |= IPSKB_FORWARDED;
++ 	mtu = ip_dst_mtu_maybe_forward(&rt->dst, true);
++ 	if (unlikely(skb->len > mtu && !skb_is_gso(skb) &&
++ 		     (ip_hdr(skb)->frag_off & htons(IP_DF))) && !skb->local_df) {
+++>>>>>>> f87c10a8aa1e (ipv4: introduce ip_dst_mtu_maybe_forward and protect forwarding path against pmtu spoofing)
+  		IP_INC_STATS(dev_net(rt->dst.dev), IPSTATS_MIB_FRAGFAILS);
+  		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+- 			  htonl(dst_mtu(&rt->dst)));
++ 			  htonl(mtu));
+  		goto drop;
+  	}
+  
+diff --cc net/ipv4/route.c
+index 4aae243883df,25071b48921c..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -112,8 -112,6 +112,11 @@@
+  #define RT_FL_TOS(oldflp4) \
+  	((oldflp4)->flowi4_tos & (IPTOS_RT_MASK | RTO_ONLINK))
+  
+++<<<<<<< HEAD
+ +#define IP_MAX_MTU	0xFFF0
+ +
+++=======
+++>>>>>>> f87c10a8aa1e (ipv4: introduce ip_dst_mtu_maybe_forward and protect forwarding path against pmtu spoofing)
+  #define RT_GC_TIMEOUT (300*HZ)
+  
+  static int ip_rt_max_size;
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 6e9bad4728bf..32d7b6763989 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -32,6 +32,19 @@ ip_no_pmtu_disc - INTEGER
+ min_pmtu - INTEGER
+ 	default 552 - minimum discovered Path MTU
+ 
++ip_forward_use_pmtu - BOOLEAN
++	By default we don't trust protocol path MTUs while forwarding
++	because they could be easily forged and can lead to unwanted
++	fragmentation by the router.
++	You only need to enable this if you have user-space software
++	which tries to discover path mtus by itself and depends on the
++	kernel honoring this information. This is normally not the
++	case.
++	Default: 0 (disabled)
++	Possible values:
++	0 - disabled
++	1 - enabled
++
+ route/max_size - INTEGER
+ 	Maximum number of routes allowed in the kernel.  Increase
+ 	this when using large numbers of interfaces and/or routes.
+* Unmerged path include/net/ip.h
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index f0615b7b9473..a2f72c38b154 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -64,6 +64,7 @@ struct netns_ipv4 {
+ 
+ 	int sysctl_tcp_ecn;
+ 	int sysctl_ip_no_pmtu_disc;
++	int sysctl_ip_fwd_use_pmtu;
+ 
+ 	kgid_t sysctl_ping_group_range[2];
+ 	long sysctl_tcp_mem[3];
+diff --git a/include/net/route.h b/include/net/route.h
+index ce9329dfbc10..9d26f443a873 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -36,6 +36,9 @@
+ #include <linux/cache.h>
+ #include <linux/security.h>
+ 
++/* IPv4 datagram length is stored into 16bit field (tot_len) */
++#define IP_MAX_MTU	0xFFFFU
++
+ #define RTO_ONLINK	0x01
+ 
+ #define RT_CONN_FLAGS(sk)   (RT_TOS(inet_sk(sk)->tos) | sock_flag(sk, SOCK_LOCALROUTE))
+@@ -318,20 +321,4 @@ static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+ 	return hoplimit;
+ }
+ 
+-static inline bool ip_sk_accept_pmtu(const struct sock *sk)
+-{
+-	return inet_sk(sk)->pmtudisc != IP_PMTUDISC_INTERFACE;
+-}
+-
+-static inline bool ip_sk_use_pmtu(const struct sock *sk)
+-{
+-	return inet_sk(sk)->pmtudisc < IP_PMTUDISC_PROBE;
+-}
+-
+-static inline int ip_skb_dst_mtu(const struct sk_buff *skb)
+-{
+-	return (!skb->sk || ip_sk_use_pmtu(skb->sk)) ?
+-	       dst_mtu(skb_dst(skb)) : skb_dst(skb)->dev->mtu;
+-}
+-
+ #endif	/* _ROUTE_H */
+* Unmerged path net/ipv4/ip_forward.c
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 912402752f2f..f05b2d550b30 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -449,6 +449,7 @@ int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
+ 	__be16 not_last_frag;
+ 	struct rtable *rt = skb_rtable(skb);
+ 	int err = 0;
++	bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
+ 
+ 	dev = rt->dst.dev;
+ 
+@@ -458,12 +459,13 @@ int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
+ 
+ 	iph = ip_hdr(skb);
+ 
++	mtu = ip_dst_mtu_maybe_forward(&rt->dst, forwarding);
+ 	if (unlikely(((iph->frag_off & htons(IP_DF)) && !skb->local_df) ||
+ 		     (IPCB(skb)->frag_max_size &&
+-		      IPCB(skb)->frag_max_size > dst_mtu(&rt->dst)))) {
++		      IPCB(skb)->frag_max_size > mtu))) {
+ 		IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+ 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+-			  htonl(ip_skb_dst_mtu(skb)));
++			  htonl(mtu));
+ 		kfree_skb(skb);
+ 		return -EMSGSIZE;
+ 	}
+@@ -473,7 +475,7 @@ int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
+ 	 */
+ 
+ 	hlen = iph->ihl * 4;
+-	mtu = dst_mtu(&rt->dst) - hlen;	/* Size of data space */
++	mtu = mtu - hlen;	/* Size of data space */
+ #ifdef CONFIG_BRIDGE_NETFILTER
+ 	if (skb->nf_bridge)
+ 		mtu -= nf_bridge_mtu_reduction(skb);
+* Unmerged path net/ipv4/route.c
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 524b1774e29f..32836d2018ab 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -852,6 +852,13 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
+ 	},
++	{
++		.procname	= "ip_forward_use_pmtu",
++		.data		= &init_net.ipv4.sysctl_ip_fwd_use_pmtu,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
+ 	{ }
+ };
+ 
