@@ -1,0 +1,136 @@
+KVM: add vcpu-specific functions to read/write/translate GFNs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] add vcpu-specific functions to read/write/translate GFNs (Paolo Bonzini) [1202825]
+Rebuild_FUZZ: 95.73%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 8e73485c7959fd25650761eab04db1e72ea14c23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8e73485c.failed
+
+We need to hide SMRAM from guests not running in SMM.  Therefore, all
+uses of kvm_read_guest* and kvm_write_guest* must be changed to use
+different address spaces, depending on whether the VCPU is in system
+management mode.  We need to introduce a new family of functions for
+this purpose.
+
+For now, the VCPU-based functions have the same behavior as the
+existing per-VM ones, they just accept a different type for the
+first argument.  Later however they will be changed to use one of many
+"struct kvm_memslots" stored in struct kvm, through an architecture hook.
+VM-based functions will unconditionally use the first memslots pointer.
+
+Whenever possible, this patch introduces slot-based functions with an
+__ prefix, with two wrappers for generic and vcpu-based actions.
+The exceptions are kvm_read_guest and kvm_write_guest, which are copied
+into the new functions kvm_vcpu_read_guest and kvm_vcpu_write_guest.
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8e73485c7959fd25650761eab04db1e72ea14c23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 9c5b960f56f6,3a121cedcc77..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1445,9 -1486,18 +1475,19 @@@ struct page *gfn_to_page(struct kvm *kv
+  
+  	return kvm_pfn_to_page(pfn);
+  }
+ +
+  EXPORT_SYMBOL_GPL(gfn_to_page);
+  
++ struct page *kvm_vcpu_gfn_to_page(struct kvm_vcpu *vcpu, gfn_t gfn)
++ {
++ 	pfn_t pfn;
++ 
++ 	pfn = kvm_vcpu_gfn_to_pfn(vcpu, gfn);
++ 
++ 	return kvm_pfn_to_page(pfn);
++ }
++ EXPORT_SYMBOL_GPL(kvm_vcpu_gfn_to_page);
++ 
+  void kvm_release_page_clean(struct page *page)
+  {
+  	WARN_ON(is_error_page(page));
+@@@ -1739,6 -1882,29 +1871,32 @@@ void mark_page_dirty(struct kvm *kvm, g
+  }
+  EXPORT_SYMBOL_GPL(mark_page_dirty);
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn)
++ {
++ 	struct kvm_memory_slot *memslot;
++ 
++ 	memslot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++ 	mark_page_dirty_in_slot(memslot, gfn);
++ }
++ EXPORT_SYMBOL_GPL(kvm_vcpu_mark_page_dirty);
++ 
++ static int kvm_vcpu_check_block(struct kvm_vcpu *vcpu)
++ {
++ 	if (kvm_arch_vcpu_runnable(vcpu)) {
++ 		kvm_make_request(KVM_REQ_UNHALT, vcpu);
++ 		return -EINTR;
++ 	}
++ 	if (kvm_cpu_has_pending_timer(vcpu))
++ 		return -EINTR;
++ 	if (signal_pending(current))
++ 		return -EINTR;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8e73485c7959 (KVM: add vcpu-specific functions to read/write/translate GFNs)
+  /*
+   * The vCPU has executed a HLT instruction with in-kernel mode enabled.
+   */
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 9984ea276f63..bb53fc76f846 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -466,6 +466,11 @@ static inline struct kvm_memslots *kvm_memslots(struct kvm *kvm)
+ 			|| lockdep_is_held(&kvm->slots_lock));
+ }
+ 
++static inline struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu)
++{
++	return kvm_memslots(vcpu->kvm);
++}
++
+ static inline struct kvm_memory_slot *
+ id_to_memslot(struct kvm_memslots *slots, int id)
+ {
+@@ -570,6 +575,25 @@ int kvm_is_visible_gfn(struct kvm *kvm, gfn_t gfn);
+ unsigned long kvm_host_page_size(struct kvm *kvm, gfn_t gfn);
+ void mark_page_dirty(struct kvm *kvm, gfn_t gfn);
+ 
++struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu);
++struct kvm_memory_slot *kvm_vcpu_gfn_to_memslot(struct kvm_vcpu *vcpu, gfn_t gfn);
++pfn_t kvm_vcpu_gfn_to_pfn_atomic(struct kvm_vcpu *vcpu, gfn_t gfn);
++pfn_t kvm_vcpu_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn);
++struct page *kvm_vcpu_gfn_to_page(struct kvm_vcpu *vcpu, gfn_t gfn);
++unsigned long kvm_vcpu_gfn_to_hva(struct kvm_vcpu *vcpu, gfn_t gfn);
++unsigned long kvm_vcpu_gfn_to_hva_prot(struct kvm_vcpu *vcpu, gfn_t gfn, bool *writable);
++int kvm_vcpu_read_guest_page(struct kvm_vcpu *vcpu, gfn_t gfn, void *data, int offset,
++			     int len);
++int kvm_vcpu_read_guest_atomic(struct kvm_vcpu *vcpu, gpa_t gpa, void *data,
++			       unsigned long len);
++int kvm_vcpu_read_guest(struct kvm_vcpu *vcpu, gpa_t gpa, void *data,
++			unsigned long len);
++int kvm_vcpu_write_guest_page(struct kvm_vcpu *vcpu, gfn_t gfn, const void *data,
++			      int offset, int len);
++int kvm_vcpu_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa, const void *data,
++			 unsigned long len);
++void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn);
++
+ void kvm_vcpu_block(struct kvm_vcpu *vcpu);
+ void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
+ int kvm_vcpu_yield_to(struct kvm_vcpu *target);
+* Unmerged path virt/kvm/kvm_main.c
