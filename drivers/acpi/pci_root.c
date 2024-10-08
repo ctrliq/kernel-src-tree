@@ -645,16 +645,6 @@ static void handle_root_bridge_insertion(acpi_handle handle)
 		acpi_handle_err(handle, "cannot add bridge to acpi list\n");
 }
 
-static void handle_root_bridge_removal(struct acpi_device *device)
-{
-	acpi_status status;
-
-	get_device(&device->dev);
-	status = acpi_os_hotplug_execute(acpi_bus_hot_remove_device, device);
-	if (ACPI_FAILURE(status))
-		put_device(&device->dev);
-}
-
 static void _handle_hotplug_event_root(struct work_struct *work)
 {
 	struct acpi_pci_root *root;
@@ -665,6 +655,7 @@ static void _handle_hotplug_event_root(struct work_struct *work)
 	hp_work = container_of(work, struct acpi_hp_work, work);
 	handle = hp_work->handle;
 	type = hp_work->type;
+	kfree(hp_work); /* allocated in handle_hotplug_event_bridge */
 
 	acpi_scan_lock_acquire();
 
@@ -694,9 +685,15 @@ static void _handle_hotplug_event_root(struct work_struct *work)
 		/* request device eject */
 		acpi_handle_printk(KERN_DEBUG, handle,
 				   "Device eject notify on %s\n", __func__);
-		if (root)
-			handle_root_bridge_removal(root->device);
-		break;
+		if (!root)
+			break;
+
+		get_device(&root->device->dev);
+
+		acpi_scan_lock_release();
+
+		acpi_bus_device_eject(root->device, ACPI_NOTIFY_EJECT_REQUEST);
+		return;
 	default:
 		acpi_handle_warn(handle,
 				 "notify_handler: unknown event type 0x%x\n",
@@ -705,7 +702,6 @@ static void _handle_hotplug_event_root(struct work_struct *work)
 	}
 
 	acpi_scan_lock_release();
-	kfree(hp_work); /* allocated in handle_hotplug_event_bridge */
 }
 
 static void handle_hotplug_event_root(acpi_handle handle, u32 type,
