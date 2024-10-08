@@ -1,0 +1,897 @@
+IB/hfi1: Use built-in i2c bit-shift bus adapter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dean Luick <dean.luick@intel.com>
+commit dba715f0c8b5daa1fca041c1c9011632c7a83105
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dba715f0.failed
+
+Use built-in i2c bit-shift bus adapter to control the
+i2c busses on the chip.
+
+	Cc: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Reviewed-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit dba715f0c8b5daa1fca041c1c9011632c7a83105)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/Kconfig
+#	drivers/staging/hfi1/chip.c
+#	drivers/staging/hfi1/hfi.h
+#	drivers/staging/hfi1/init.c
+#	drivers/staging/hfi1/qsfp.c
+#	drivers/staging/hfi1/qsfp.h
+diff --cc drivers/staging/hfi1/Kconfig
+index 78bc89ef28cc,bac18607fd5b..000000000000
+--- a/drivers/staging/hfi1/Kconfig
++++ b/drivers/staging/hfi1/Kconfig
+@@@ -1,6 -1,9 +1,13 @@@
+  config INFINIBAND_HFI1
+  	tristate "Intel OPA Gen1 support"
+++<<<<<<< HEAD:drivers/staging/hfi1/Kconfig
+ +	depends on X86_64 && INFINIBAND
+++=======
++ 	depends on X86_64 && INFINIBAND_RDMAVT && I2C
++ 	select MMU_NOTIFIER
++ 	select CRC32
++ 	select I2C_ALGOBIT
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/Kconfig
+  	default m
+  	---help---
+  	This is a low-level driver for Intel OPA Gen1 adapter.
+diff --cc drivers/staging/hfi1/chip.c
+index 0b4db256e34f,22bfe0e0ce4e..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -13899,13 -14155,92 +13899,92 @@@ static void asic_should_init(struct hfi
+  		}
+  	}
+  
+ -	if (peer) {
+ -		/* use already allocated structure */
+ -		dd->asic_data = peer->asic_data;
+ -		kfree(asic_data);
+ -	} else {
+ -		dd->asic_data = asic_data;
+ -		mutex_init(&dd->asic_data->asic_resource_mutex);
+ -	}
+ -	dd->asic_data->dds[dd->hfi1_id] = dd; /* self back-pointer */
+ +	/*
+ +	 * "Claim" the ASIC for initialization if it hasn't been
+ +	 " "claimed" yet.
+ +	 */
+ +	if (!peer || !(peer->flags & HFI1_DO_INIT_ASIC))
+ +		dd->flags |= HFI1_DO_INIT_ASIC;
+  	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ 
++ 	/* first one through - set up i2c devices */
++ 	if (!peer)
++ 		ret = set_up_i2c(dd, dd->asic_data);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Set dd->boardname.  Use a generic name if a name is not returned from
++  * EFI variable space.
++  *
++  * Return 0 on success, -ENOMEM if space could not be allocated.
++  */
++ static int obtain_boardname(struct hfi1_devdata *dd)
++ {
++ 	/* generic board description */
++ 	const char generic[] =
++ 		"Intel Omni-Path Host Fabric Interface Adapter 100 Series";
++ 	unsigned long size;
++ 	int ret;
++ 
++ 	ret = read_hfi1_efi_var(dd, "description", &size,
++ 				(void **)&dd->boardname);
++ 	if (ret) {
++ 		dd_dev_info(dd, "Board description not found\n");
++ 		/* use generic description */
++ 		dd->boardname = kstrdup(generic, GFP_KERNEL);
++ 		if (!dd->boardname)
++ 			return -ENOMEM;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Check the interrupt registers to make sure that they are mapped correctly.
++  * It is intended to help user identify any mismapping by VMM when the driver
++  * is running in a VM. This function should only be called before interrupt
++  * is set up properly.
++  *
++  * Return 0 on success, -EINVAL on failure.
++  */
++ static int check_int_registers(struct hfi1_devdata *dd)
++ {
++ 	u64 reg;
++ 	u64 all_bits = ~(u64)0;
++ 	u64 mask;
++ 
++ 	/* Clear CceIntMask[0] to avoid raising any interrupts */
++ 	mask = read_csr(dd, CCE_INT_MASK);
++ 	write_csr(dd, CCE_INT_MASK, 0ull);
++ 	reg = read_csr(dd, CCE_INT_MASK);
++ 	if (reg)
++ 		goto err_exit;
++ 
++ 	/* Clear all interrupt status bits */
++ 	write_csr(dd, CCE_INT_CLEAR, all_bits);
++ 	reg = read_csr(dd, CCE_INT_STATUS);
++ 	if (reg)
++ 		goto err_exit;
++ 
++ 	/* Set all interrupt status bits */
++ 	write_csr(dd, CCE_INT_FORCE, all_bits);
++ 	reg = read_csr(dd, CCE_INT_STATUS);
++ 	if (reg != all_bits)
++ 		goto err_exit;
++ 
++ 	/* Restore the interrupt mask */
++ 	write_csr(dd, CCE_INT_CLEAR, all_bits);
++ 	write_csr(dd, CCE_INT_MASK, mask);
++ 
++ 	return 0;
++ err_exit:
++ 	write_csr(dd, CCE_INT_MASK, mask);
++ 	dd_dev_err(dd, "Interrupt registers not properly mapped by VMM\n");
++ 	return -EINVAL;
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/chip.c
+  }
+  
+  /**
+diff --cc drivers/staging/hfi1/hfi.h
+index df3a4d4d0748,c433eb8d5729..000000000000
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@@ -65,6 -62,9 +65,12 @@@
+  #include <linux/cdev.h>
+  #include <linux/delay.h>
+  #include <linux/kthread.h>
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+++=======
++ #include <linux/i2c.h>
++ #include <linux/i2c-algo-bit.h>
++ #include <rdma/rdma_vt.h>
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/hfi.h
+  
+  #include "chip_registers.h"
+  #include "common.h"
+@@@ -795,6 -807,21 +801,24 @@@ struct hfi1_temp 
+  	u8 triggers;      /* temperature triggers */
+  };
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/hfi.h
+++=======
++ struct hfi1_i2c_bus {
++ 	struct hfi1_devdata *controlling_dd; /* current controlling device */
++ 	struct i2c_adapter adapter;	/* bus details */
++ 	struct i2c_algo_bit_data algo;	/* bus algorithm details */
++ 	int num;			/* bus number, 0 or 1 */
++ };
++ 
++ /* common data between shared ASIC HFIs */
++ struct hfi1_asic_data {
++ 	struct hfi1_devdata *dds[2];	/* back pointers */
++ 	struct mutex asic_resource_mutex;
++ 	struct hfi1_i2c_bus *i2c_bus0;
++ 	struct hfi1_i2c_bus *i2c_bus1;
++ };
++ 
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/hfi.h
+  /* device data struct now contains only "general per-device" info.
+   * fields related to a physical IB port are in a hfi1_pportdata struct.
+   */
+diff --cc drivers/staging/hfi1/init.c
+index 8a9276b28f8a,ec77c7edb025..000000000000
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@@ -975,15 -971,48 +975,58 @@@ void hfi1_free_ctxtdata(struct hfi1_dev
+  	kfree(rcd);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +void hfi1_free_devdata(struct hfi1_devdata *dd)
+ +{
+++=======
++ /*
++  * Release our hold on the shared asic data.  If we are the last one,
++  * return the structure to be finalized outside the lock.  Must be
++  * holding hfi1_devs_lock.
++  */
++ static struct hfi1_asic_data *release_asic_data(struct hfi1_devdata *dd)
++ {
++ 	struct hfi1_asic_data *ad;
++ 	int other;
++ 
++ 	if (!dd->asic_data)
++ 		return NULL;
++ 	dd->asic_data->dds[dd->hfi1_id] = NULL;
++ 	other = dd->hfi1_id ? 0 : 1;
++ 	ad = dd->asic_data;
++ 	dd->asic_data = NULL;
++ 	/* return NULL if the other dd still has a link */
++ 	return ad->dds[other] ? NULL : ad;
++ }
++ 
++ static void finalize_asic_data(struct hfi1_devdata *dd,
++ 			       struct hfi1_asic_data *ad)
++ {
++ 	clean_up_i2c(dd, ad);
++ 	kfree(ad);
++ }
++ 
++ static void __hfi1_free_devdata(struct kobject *kobj)
++ {
++ 	struct hfi1_devdata *dd =
++ 		container_of(kobj, struct hfi1_devdata, kobj);
++ 	struct hfi1_asic_data *ad;
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/init.c
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&hfi1_devs_lock, flags);
+  	idr_remove(&hfi1_unit_table, dd->unit);
+  	list_del(&dd->list);
+++<<<<<<< HEAD:drivers/staging/hfi1/init.c
+ +	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+ +	hfi1_dbg_ibdev_exit(&dd->verbs_dev);
+++=======
++ 	ad = release_asic_data(dd);
++ 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++ 	if (ad)
++ 		finalize_asic_data(dd, ad);
++ 	free_platform_config(dd);
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/init.c
+  	rcu_barrier(); /* wait for rcu callbacks to complete */
+  	free_percpu(dd->int_counter);
+  	free_percpu(dd->rcv_limit);
+diff --cc drivers/staging/hfi1/qsfp.c
+index b16ff11927bd,a207717ade2a..000000000000
+--- a/drivers/staging/hfi1/qsfp.c
++++ b/drivers/staging/hfi1/qsfp.c
+@@@ -53,142 -50,347 +53,403 @@@
+  #include <linux/vmalloc.h>
+  
+  #include "hfi.h"
+- #include "twsi.h"
++ 
++ /* for the given bus number, return the CSR for reading an i2c line */
++ static inline u32 i2c_in_csr(u32 bus_num)
++ {
++ 	return bus_num ? ASIC_QSFP2_IN : ASIC_QSFP1_IN;
++ }
++ 
++ /* for the given bus number, return the CSR for writing an i2c line */
++ static inline u32 i2c_oe_csr(u32 bus_num)
++ {
++ 	return bus_num ? ASIC_QSFP2_OE : ASIC_QSFP1_OE;
++ }
++ 
++ static void hfi1_setsda(void *data, int state)
++ {
++ 	struct hfi1_i2c_bus *bus = (struct hfi1_i2c_bus *)data;
++ 	struct hfi1_devdata *dd = bus->controlling_dd;
++ 	u64 reg;
++ 	u32 target_oe;
++ 
++ 	target_oe = i2c_oe_csr(bus->num);
++ 	reg = read_csr(dd, target_oe);
++ 	/*
++ 	 * The OE bit value is inverted and connected to the pin.  When
++ 	 * OE is 0 the pin is left to be pulled up, when the OE is 1
++ 	 * the pin is driven low.  This matches the "open drain" or "open
++ 	 * collector" convention.
++ 	 */
++ 	if (state)
++ 		reg &= ~QSFP_HFI0_I2CDAT;
++ 	else
++ 		reg |= QSFP_HFI0_I2CDAT;
++ 	write_csr(dd, target_oe, reg);
++ 	/* do a read to force the write into the chip */
++ 	(void)read_csr(dd, target_oe);
++ }
++ 
++ static void hfi1_setscl(void *data, int state)
++ {
++ 	struct hfi1_i2c_bus *bus = (struct hfi1_i2c_bus *)data;
++ 	struct hfi1_devdata *dd = bus->controlling_dd;
++ 	u64 reg;
++ 	u32 target_oe;
++ 
++ 	target_oe = i2c_oe_csr(bus->num);
++ 	reg = read_csr(dd, target_oe);
++ 	/*
++ 	 * The OE bit value is inverted and connected to the pin.  When
++ 	 * OE is 0 the pin is left to be pulled up, when the OE is 1
++ 	 * the pin is driven low.  This matches the "open drain" or "open
++ 	 * collector" convention.
++ 	 */
++ 	if (state)
++ 		reg &= ~QSFP_HFI0_I2CCLK;
++ 	else
++ 		reg |= QSFP_HFI0_I2CCLK;
++ 	write_csr(dd, target_oe, reg);
++ 	/* do a read to force the write into the chip */
++ 	(void)read_csr(dd, target_oe);
++ }
++ 
++ static int hfi1_getsda(void *data)
++ {
++ 	struct hfi1_i2c_bus *bus = (struct hfi1_i2c_bus *)data;
++ 	u64 reg;
++ 	u32 target_in;
++ 
++ 	hfi1_setsda(data, 1);	/* clear OE so we do not pull line down */
++ 	udelay(2);		/* 1us pull up + 250ns hold */
++ 
++ 	target_in = i2c_in_csr(bus->num);
++ 	reg = read_csr(bus->controlling_dd, target_in);
++ 	return !!(reg & QSFP_HFI0_I2CDAT);
++ }
++ 
++ static int hfi1_getscl(void *data)
++ {
++ 	struct hfi1_i2c_bus *bus = (struct hfi1_i2c_bus *)data;
++ 	u64 reg;
++ 	u32 target_in;
++ 
++ 	hfi1_setscl(data, 1);	/* clear OE so we do not pull line down */
++ 	udelay(2);		/* 1us pull up + 250ns hold */
++ 
++ 	target_in = i2c_in_csr(bus->num);
++ 	reg = read_csr(bus->controlling_dd, target_in);
++ 	return !!(reg & QSFP_HFI0_I2CCLK);
++ }
+  
+  /*
+-  * QSFP support for hfi driver, using "Two Wire Serial Interface" driver
+-  * in twsi.c
++  * Allocate and initialize the given i2c bus number.
++  * Returns NULL on failure.
+   */
+- #define I2C_MAX_RETRY 4
++ static struct hfi1_i2c_bus *init_i2c_bus(struct hfi1_devdata *dd,
++ 					 struct hfi1_asic_data *ad, int num)
++ {
++ 	struct hfi1_i2c_bus *bus;
++ 	int ret;
++ 
++ 	bus = kzalloc(sizeof(*bus), GFP_KERNEL);
++ 	if (!bus)
++ 		return NULL;
++ 
++ 	bus->controlling_dd = dd;
++ 	bus->num = num;	/* our bus number */
++ 
++ 	bus->algo.setsda = hfi1_setsda;
++ 	bus->algo.setscl = hfi1_setscl;
++ 	bus->algo.getsda = hfi1_getsda;
++ 	bus->algo.getscl = hfi1_getscl;
++ 	bus->algo.udelay = 5;
++ 	bus->algo.timeout = usecs_to_jiffies(50);
++ 	bus->algo.data = bus;
++ 
++ 	bus->adapter.owner = THIS_MODULE;
++ 	bus->adapter.algo_data = &bus->algo;
++ 	bus->adapter.dev.parent = &dd->pcidev->dev;
++ 	snprintf(bus->adapter.name, sizeof(bus->adapter.name),
++ 		 "hfi1_i2c%d", num);
++ 
++ 	ret = i2c_bit_add_bus(&bus->adapter);
++ 	if (ret) {
++ 		dd_dev_info(dd, "%s: unable to add i2c bus %d, err %d\n",
++ 			    __func__, num, ret);
++ 		kfree(bus);
++ 		return NULL;
++ 	}
++ 
++ 	return bus;
++ }
+  
+  /*
+-  * Unlocked i2c write.  Must hold dd->qsfp_i2c_mutex.
++  * Initialize i2c buses.
++  * Return 0 on success, -errno on error.
+   */
+- static int __i2c_write(struct hfi1_pportdata *ppd, u32 target, int i2c_addr,
+- 		       int offset, void *bp, int len)
++ int set_up_i2c(struct hfi1_devdata *dd, struct hfi1_asic_data *ad)
+  {
+- 	struct hfi1_devdata *dd = ppd->dd;
+- 	int ret, cnt;
+- 	u8 *buff = bp;
++ 	ad->i2c_bus0 = init_i2c_bus(dd, ad, 0);
++ 	ad->i2c_bus1 = init_i2c_bus(dd, ad, 1);
++ 	if (!ad->i2c_bus0 || !ad->i2c_bus1)
++ 		return -ENOMEM;
++ 	return 0;
++ };
++ 
++ static void clean_i2c_bus(struct hfi1_i2c_bus *bus)
++ {
++ 	if (bus) {
++ 		i2c_del_adapter(&bus->adapter);
++ 		kfree(bus);
++ 	}
++ }
+  
+- 	cnt = 0;
+- 	while (cnt < len) {
+- 		int wlen = len - cnt;
++ void clean_up_i2c(struct hfi1_devdata *dd, struct hfi1_asic_data *ad)
++ {
++ 	clean_i2c_bus(ad->i2c_bus0);
++ 	ad->i2c_bus0 = NULL;
++ 	clean_i2c_bus(ad->i2c_bus1);
++ 	ad->i2c_bus1 = NULL;
++ }
+  
+- 		ret = hfi1_twsi_blk_wr(dd, target, i2c_addr, offset,
+- 				       buff + cnt, wlen);
+- 		if (ret) {
+- 			/* hfi1_twsi_blk_wr() 1 for error, else 0 */
+- 			return -EIO;
+- 		}
+- 		offset += wlen;
+- 		cnt += wlen;
++ static int i2c_bus_write(struct hfi1_devdata *dd, struct hfi1_i2c_bus *i2c,
++ 			 u8 slave_addr, int offset, int offset_size,
++ 			 u8 *data, u16 len)
++ {
++ 	int ret;
++ 	int num_msgs;
++ 	u8 offset_bytes[2];
++ 	struct i2c_msg msgs[2];
++ 
++ 	switch (offset_size) {
++ 	case 0:
++ 		num_msgs = 1;
++ 		msgs[0].addr = slave_addr;
++ 		msgs[0].flags = 0;
++ 		msgs[0].len = len;
++ 		msgs[0].buf = data;
++ 		break;
++ 	case 2:
++ 		offset_bytes[1] = (offset >> 8) & 0xff;
++ 		/* fall through */
++ 	case 1:
++ 		num_msgs = 2;
++ 		offset_bytes[0] = offset & 0xff;
++ 
++ 		msgs[0].addr = slave_addr;
++ 		msgs[0].flags = 0;
++ 		msgs[0].len = offset_size;
++ 		msgs[0].buf = offset_bytes;
++ 
++ 		msgs[1].addr = slave_addr;
++ 		msgs[1].flags = I2C_M_NOSTART,
++ 		msgs[1].len = len;
++ 		msgs[1].buf = data;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	i2c->controlling_dd = dd;
++ 	ret = i2c_transfer(&i2c->adapter, msgs, num_msgs);
++ 	if (ret != num_msgs) {
++ 		dd_dev_err(dd, "%s: bus %d, i2c slave 0x%x, offset 0x%x, len 0x%x; write failed, ret %d\n",
++ 			   __func__, i2c->num, slave_addr, offset, len, ret);
++ 		return ret < 0 ? ret : -EIO;
++ 	}
++ 	return 0;
++ }
++ 
++ static int i2c_bus_read(struct hfi1_devdata *dd, struct hfi1_i2c_bus *bus,
++ 			u8 slave_addr, int offset, int offset_size,
++ 			u8 *data, u16 len)
++ {
++ 	int ret;
++ 	int num_msgs;
++ 	u8 offset_bytes[2];
++ 	struct i2c_msg msgs[2];
++ 
++ 	switch (offset_size) {
++ 	case 0:
++ 		num_msgs = 1;
++ 		msgs[0].addr = slave_addr;
++ 		msgs[0].flags = I2C_M_RD;
++ 		msgs[0].len = len;
++ 		msgs[0].buf = data;
++ 		break;
++ 	case 2:
++ 		offset_bytes[1] = (offset >> 8) & 0xff;
++ 		/* fall through */
++ 	case 1:
++ 		num_msgs = 2;
++ 		offset_bytes[0] = offset & 0xff;
++ 
++ 		msgs[0].addr = slave_addr;
++ 		msgs[0].flags = 0;
++ 		msgs[0].len = offset_size;
++ 		msgs[0].buf = offset_bytes;
++ 
++ 		msgs[1].addr = slave_addr;
++ 		msgs[1].flags = I2C_M_RD,
++ 		msgs[1].len = len;
++ 		msgs[1].buf = data;
++ 		break;
++ 	default:
++ 		return -EINVAL;
+  	}
+  
+- 	/* Must wait min 20us between qsfp i2c transactions */
+- 	udelay(20);
++ 	bus->controlling_dd = dd;
++ 	ret = i2c_transfer(&bus->adapter, msgs, num_msgs);
++ 	if (ret != num_msgs) {
++ 		dd_dev_err(dd, "%s: bus %d, i2c slave 0x%x, offset 0x%x, len 0x%x; read failed, ret %d\n",
++ 			   __func__, bus->num, slave_addr, offset, len, ret);
++ 		return ret < 0 ? ret : -EIO;
++ 	}
++ 	return 0;
++ }
+  
+- 	return cnt;
++ /*
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+++ * Unlocked i2c write.  Must hold dd->qsfp_i2c_mutex.
+++=======
++  * Raw i2c write.  No set-up or lock checking.
++  *
++  * Return 0 on success, -errno on error.
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
++  */
++ static int __i2c_write(struct hfi1_pportdata *ppd, u32 target, int i2c_addr,
++ 		       int offset, void *bp, int len)
++ {
++ 	struct hfi1_devdata *dd = ppd->dd;
++ 	struct hfi1_i2c_bus *bus;
++ 	u8 slave_addr;
++ 	int offset_size;
++ 
++ 	bus = target ? dd->asic_data->i2c_bus1 : dd->asic_data->i2c_bus0;
++ 	slave_addr = (i2c_addr & 0xff) >> 1; /* convert to 7-bit addr */
++ 	offset_size = (i2c_addr >> 8) & 0x3;
++ 	return i2c_bus_write(dd, bus, slave_addr, offset, offset_size, bp, len);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+++=======
++ /*
++  * Caller must hold the i2c chain resource.
++  *
++  * Return number of bytes written, or -errno.
++  */
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+  int i2c_write(struct hfi1_pportdata *ppd, u32 target, int i2c_addr, int offset,
+  	      void *bp, int len)
+  {
+ +	struct hfi1_devdata *dd = ppd->dd;
+  	int ret;
+  
+ -	if (!check_chip_resource(ppd->dd, i2c_target(target), __func__))
+ -		return -EACCES;
+ +	ret = mutex_lock_interruptible(&dd->qsfp_i2c_mutex);
+ +	if (ret)
+ +		return ret;
+ +
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ +	/* make sure the TWSI bus is in a sane state */
+ +	ret = hfi1_twsi_reset(ppd->dd, target);
+ +	if (ret) {
+ +		hfi1_dev_porterr(ppd->dd, ppd->port,
+ +				 "I2C chain %d write interface reset failed\n",
+ +				 target);
+ +		goto done;
+ +	}
+  
+  	ret = __i2c_write(ppd, target, i2c_addr, offset, bp, len);
+ +
+ +done:
+ +	mutex_unlock(&dd->qsfp_i2c_mutex);
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Unlocked i2c read.  Must hold dd->qsfp_i2c_mutex.
+++=======
+++	ret = __i2c_write(ppd, target, i2c_addr, offset, bp, len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return len;
++ }
++ 
++ /*
++  * Raw i2c read.  No set-up or lock checking.
++  *
++  * Return 0 on success, -errno on error.
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+   */
+  static int __i2c_read(struct hfi1_pportdata *ppd, u32 target, int i2c_addr,
+  		      int offset, void *bp, int len)
+  {
+  	struct hfi1_devdata *dd = ppd->dd;
+- 	int ret, cnt, pass = 0;
+- 	int orig_offset = offset;
+- 
+- 	cnt = 0;
+- 	while (cnt < len) {
+- 		int rlen = len - cnt;
+- 
+- 		ret = hfi1_twsi_blk_rd(dd, target, i2c_addr, offset,
+- 				       bp + cnt, rlen);
+- 		/* Some QSFP's fail first try. Retry as experiment */
+- 		if (ret && cnt == 0 && ++pass < I2C_MAX_RETRY)
+- 			continue;
+- 		if (ret) {
+- 			/* hfi1_twsi_blk_rd() 1 for error, else 0 */
+- 			ret = -EIO;
+- 			goto exit;
+- 		}
+- 		offset += rlen;
+- 		cnt += rlen;
+- 	}
+- 
+- 	ret = cnt;
+- 
+- exit:
+- 	if (ret < 0) {
+- 		hfi1_dev_porterr(dd, ppd->port,
+- 				 "I2C chain %d read failed, addr 0x%x, offset 0x%x, len %d\n",
+- 				 target, i2c_addr, orig_offset, len);
+- 	}
+- 
+- 	/* Must wait min 20us between qsfp i2c transactions */
+- 	udelay(20);
+- 
+- 	return ret;
++ 	struct hfi1_i2c_bus *bus;
++ 	u8 slave_addr;
++ 	int offset_size;
++ 
++ 	bus = target ? dd->asic_data->i2c_bus1 : dd->asic_data->i2c_bus0;
++ 	slave_addr = (i2c_addr & 0xff) >> 1; /* convert to 7-bit addr */
++ 	offset_size = (i2c_addr >> 8) & 0x3;
++ 	return i2c_bus_read(dd, bus, slave_addr, offset, offset_size, bp, len);
+  }
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+++=======
++ /*
++  * Caller must hold the i2c chain resource.
++  *
++  * Return number of bytes read, or -errno.
++  */
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+  int i2c_read(struct hfi1_pportdata *ppd, u32 target, int i2c_addr, int offset,
+  	     void *bp, int len)
+  {
+ +	struct hfi1_devdata *dd = ppd->dd;
+  	int ret;
+  
+ -	if (!check_chip_resource(ppd->dd, i2c_target(target), __func__))
+ -		return -EACCES;
+ +	ret = mutex_lock_interruptible(&dd->qsfp_i2c_mutex);
+ +	if (ret)
+ +		return ret;
+ +
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ +	/* make sure the TWSI bus is in a sane state */
+ +	ret = hfi1_twsi_reset(ppd->dd, target);
+ +	if (ret) {
+ +		hfi1_dev_porterr(ppd->dd, ppd->port,
+ +				 "I2C chain %d read interface reset failed\n",
+ +				 target);
+ +		goto done;
+ +	}
+ +
+ +	ret = __i2c_read(ppd, target, i2c_addr, offset, bp, len);
+  
+ +done:
+ +	mutex_unlock(&dd->qsfp_i2c_mutex);
+ +	return ret;
+++=======
++ 	ret = __i2c_read(ppd, target, i2c_addr, offset, bp, len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return len;
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+  }
+  
+  /*
+   * Write page n, offset m of QSFP memory as defined by SFF 8636
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ + * in the cache by writing @addr = ((256 * n) + m)
+++=======
++  * by writing @addr = ((256 * n) + m)
++  *
++  * Caller must hold the i2c chain resource.
++  *
++  * Return number of bytes written or -errno.
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+   */
+  int qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+  	       int len)
+@@@ -196,26 -398,15 +457,29 @@@
+  	int count = 0;
+  	int offset;
+  	int nwrite;
+- 	int ret;
++ 	int ret = 0;
+  	u8 page;
+  
+ -	if (!check_chip_resource(ppd->dd, i2c_target(target), __func__))
+ -		return -EACCES;
+ +	ret = mutex_lock_interruptible(&ppd->dd->qsfp_i2c_mutex);
+ +	if (ret)
+ +		return ret;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ +	/* make sure the TWSI bus is in a sane state */
+ +	ret = hfi1_twsi_reset(ppd->dd, target);
+ +	if (ret) {
+ +		hfi1_dev_porterr(ppd->dd, ppd->port,
+ +				 "QSFP chain %d write interface reset failed\n",
+ +				 target);
+ +		mutex_unlock(&ppd->dd->qsfp_i2c_mutex);
+ +		return ret;
+ +	}
+ +
+++=======
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+  	while (count < len) {
+  		/*
+ -		 * Set the qsfp page based on a zero-based address
+ +		 * Set the qsfp page based on a zero-based addresss
+  		 * and a page size of QSFP_PAGESIZE bytes.
+  		 */
+  		page = (u8)(addr / QSFP_PAGESIZE);
+@@@ -238,23 -430,47 +503,33 @@@
+  
+  		ret = __i2c_write(ppd, target, QSFP_DEV | QSFP_OFFSET_SIZE,
+  				  offset, bp + count, nwrite);
+- 		if (ret <= 0)	/* stop on error or nothing written */
++ 		/* QSFPs require a 5-10msec delay after write operations */
++ 		mdelay(5);
++ 		if (ret)	/* stop on error */
+  			break;
+  
+- 		count += ret;
+- 		addr += ret;
++ 		count += nwrite;
++ 		addr += nwrite;
+  	}
+  
+ +	mutex_unlock(&ppd->dd->qsfp_i2c_mutex);
+ +
+  	if (ret < 0)
+  		return ret;
+  	return count;
+  }
+  
+ -/*
+ - * Perform a stand-alone single QSFP write.  Acquire the resource, do the
+ - * write, then release the resource.
+ - */
+ -int one_qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+ -		   int len)
+ -{
+ -	struct hfi1_devdata *dd = ppd->dd;
+ -	u32 resource = qsfp_resource(dd);
+ -	int ret;
+ -
+ -	ret = acquire_chip_resource(dd, resource, QSFP_WAIT);
+ -	if (ret)
+ -		return ret;
+ -	ret = qsfp_write(ppd, target, addr, bp, len);
+ -	release_chip_resource(dd, resource);
+ -
+ -	return ret;
+ -}
+ -
+  /*
+   * Access page n, offset m of QSFP memory as defined by SFF 8636
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ + * in the cache by reading @addr = ((256 * n) + m)
+++=======
++  * by reading @addr = ((256 * n) + m)
++  *
++  * Caller must hold the i2c chain resource.
++  *
++  * Return the number of bytes read or -errno.
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+   */
+  int qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+  	      int len)
+@@@ -262,23 -478,12 +537,26 @@@
+  	int count = 0;
+  	int offset;
+  	int nread;
+- 	int ret;
++ 	int ret = 0;
+  	u8 page;
+  
+ -	if (!check_chip_resource(ppd->dd, i2c_target(target), __func__))
+ -		return -EACCES;
+ +	ret = mutex_lock_interruptible(&ppd->dd->qsfp_i2c_mutex);
+ +	if (ret)
+ +		return ret;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.c
+ +	/* make sure the TWSI bus is in a sane state */
+ +	ret = hfi1_twsi_reset(ppd->dd, target);
+ +	if (ret) {
+ +		hfi1_dev_porterr(ppd->dd, ppd->port,
+ +				 "QSFP chain %d read interface reset failed\n",
+ +				 target);
+ +		mutex_unlock(&ppd->dd->qsfp_i2c_mutex);
+ +		return ret;
+ +	}
+ +
+++=======
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.c
+  	while (count < len) {
+  		/*
+  		 * Set the qsfp page based on a zero-based address
+@@@ -301,19 -507,15 +580,17 @@@
+  		if (((addr % QSFP_RW_BOUNDARY) + nread) > QSFP_RW_BOUNDARY)
+  			nread = QSFP_RW_BOUNDARY - (addr % QSFP_RW_BOUNDARY);
+  
+- 		/* QSFPs require a 5-10msec delay after write operations */
+- 		mdelay(5);
+  		ret = __i2c_read(ppd, target, QSFP_DEV | QSFP_OFFSET_SIZE,
+  				 offset, bp + count, nread);
+- 		if (ret <= 0)	/* stop on error or nothing read */
++ 		if (ret)	/* stop on error */
+  			break;
+  
+- 		count += ret;
+- 		addr += ret;
++ 		count += nread;
++ 		addr += nread;
+  	}
+  
+ +	mutex_unlock(&ppd->dd->qsfp_i2c_mutex);
+ +
+  	if (ret < 0)
+  		return ret;
+  	return count;
+diff --cc drivers/staging/hfi1/qsfp.h
+index b5bc61780bca,69275ebd9597..000000000000
+--- a/drivers/staging/hfi1/qsfp.h
++++ b/drivers/staging/hfi1/qsfp.h
+@@@ -236,3 -234,10 +236,13 @@@ int qsfp_write(struct hfi1_pportdata *p
+  	       int len);
+  int qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
+  	      int len);
+++<<<<<<< HEAD:drivers/staging/hfi1/qsfp.h
+++=======
++ int one_qsfp_write(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
++ 		   int len);
++ int one_qsfp_read(struct hfi1_pportdata *ppd, u32 target, int addr, void *bp,
++ 		  int len);
++ struct hfi1_asic_data;
++ int set_up_i2c(struct hfi1_devdata *dd, struct hfi1_asic_data *ad);
++ void clean_up_i2c(struct hfi1_devdata *dd, struct hfi1_asic_data *ad);
+++>>>>>>> dba715f0c8b5 (IB/hfi1: Use built-in i2c bit-shift bus adapter):drivers/infiniband/hw/hfi1/qsfp.h
+* Unmerged path drivers/staging/hfi1/Kconfig
+* Unmerged path drivers/staging/hfi1/chip.c
+* Unmerged path drivers/staging/hfi1/hfi.h
+* Unmerged path drivers/staging/hfi1/init.c
+* Unmerged path drivers/staging/hfi1/qsfp.c
+* Unmerged path drivers/staging/hfi1/qsfp.h
