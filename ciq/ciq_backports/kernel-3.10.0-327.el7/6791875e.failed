@@ -1,0 +1,315 @@
+md: make reconfig_mutex optional for writes to md sysfs files.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] make reconfig_mutex optional for writes to md sysfs files (Jes Sorensen) [1150149 1173510 1194720]
+Rebuild_FUZZ: 95.80%
+commit-author NeilBrown <neilb@suse.de>
+commit 6791875e2e5393845b9c781d2998481089735134
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6791875e.failed
+
+Rather than using mddev_lock() to take the reconfig_mutex
+when writing to any md sysfs file, we only take mddev_lock()
+in the particular _store() functions that require it.
+Admittedly this is most, but it isn't all.
+
+This also allows us to remove special-case handling for new_dev_store
+(in md_attr_store).
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 6791875e2e5393845b9c781d2998481089735134)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 5d8c7c589a1e,c8d2bac4e28b..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -3424,26 -3256,32 +3424,37 @@@ static ssize_
+  level_store(struct mddev *mddev, const char *buf, size_t len)
+  {
+  	char clevel[16];
+++<<<<<<< HEAD
+ +	ssize_t rv = len;
+ +	struct md_personality *pers;
+++=======
++ 	ssize_t rv;
++ 	size_t slen = len;
++ 	struct md_personality *pers, *oldpers;
+++>>>>>>> 6791875e2e53 (md: make reconfig_mutex optional for writes to md sysfs files.)
+  	long level;
+ -	void *priv, *oldpriv;
+ +	void *priv;
+  	struct md_rdev *rdev;
+  
++ 	if (slen == 0 || slen >= sizeof(clevel))
++ 		return -EINVAL;
++ 
++ 	rv = mddev_lock(mddev);
++ 	if (rv)
++ 		return rv;
++ 
+  	if (mddev->pers == NULL) {
+- 		if (len == 0)
+- 			return 0;
+- 		if (len >= sizeof(mddev->clevel))
+- 			return -ENOSPC;
+- 		strncpy(mddev->clevel, buf, len);
+- 		if (mddev->clevel[len-1] == '\n')
+- 			len--;
+- 		mddev->clevel[len] = 0;
++ 		strncpy(mddev->clevel, buf, slen);
++ 		if (mddev->clevel[slen-1] == '\n')
++ 			slen--;
++ 		mddev->clevel[slen] = 0;
+  		mddev->level = LEVEL_NONE;
+- 		return rv;
++ 		rv = len;
++ 		goto out_unlock;
+  	}
++ 	rv = -EROFS;
+  	if (mddev->ro)
+- 		return  -EROFS;
++ 		goto out_unlock;
+  
+  	/* request to change the personality.  Need to ensure:
+  	 *  - array is not engaged in resync/recovery/reshape
+@@@ -4007,7 -3909,11 +4078,15 @@@ new_dev_store(struct mddev *mddev, cons
+  	    minor != MINOR(dev))
+  		return -EOVERFLOW;
+  
+++<<<<<<< HEAD
+++
+++=======
++ 	flush_workqueue(md_misc_wq);
+  
++ 	err = mddev_lock(mddev);
++ 	if (err)
++ 		return err;
+++>>>>>>> 6791875e2e53 (md: make reconfig_mutex optional for writes to md sysfs files.)
+  	if (mddev->persistent) {
+  		rdev = md_import_device(dev, mddev->major_version,
+  					mddev->minor_version);
+@@@ -4485,11 -4446,9 +4593,15 @@@ suspend_lo_store(struct mddev *mddev, c
+  {
+  	char *e;
+  	unsigned long long new = simple_strtoull(buf, &e, 10);
+- 	unsigned long long old = mddev->suspend_lo;
++ 	unsigned long long old;
++ 	int err;
+  
+++<<<<<<< HEAD
+ +	if (mddev->pers == NULL || 
+ +	    mddev->pers->quiesce == NULL)
+ +		return -EINVAL;
+++=======
+++>>>>>>> 6791875e2e53 (md: make reconfig_mutex optional for writes to md sysfs files.)
+  	if (buf == e || (*e && *e != '\n'))
+  		return -EINVAL;
+  
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 356ad3203a59..1baffb535cd7 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5335,21 +5335,25 @@ EXPORT_SYMBOL(raid5_set_cache_size);
+ static ssize_t
+ raid5_store_stripe_cache_size(struct mddev *mddev, const char *page, size_t len)
+ {
+-	struct r5conf *conf = mddev->private;
++	struct r5conf *conf;
+ 	unsigned long new;
+ 	int err;
+ 
+ 	if (len >= PAGE_SIZE)
+ 		return -EINVAL;
+-	if (!conf)
+-		return -ENODEV;
+-
+ 	if (kstrtoul(page, 10, &new))
+ 		return -EINVAL;
+-	err = raid5_set_cache_size(mddev, new);
++	err = mddev_lock(mddev);
+ 	if (err)
+ 		return err;
+-	return len;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else
++		err = raid5_set_cache_size(mddev, new);
++	mddev_unlock(mddev);
++
++	return err ?: len;
+ }
+ 
+ static struct md_sysfs_entry
+@@ -5373,19 +5377,27 @@ raid5_show_preread_threshold(struct mddev *mddev, char *page)
+ static ssize_t
+ raid5_store_preread_threshold(struct mddev *mddev, const char *page, size_t len)
+ {
+-	struct r5conf *conf = mddev->private;
++	struct r5conf *conf;
+ 	unsigned long new;
++	int err;
++
+ 	if (len >= PAGE_SIZE)
+ 		return -EINVAL;
+-	if (!conf)
+-		return -ENODEV;
+-
+ 	if (kstrtoul(page, 10, &new))
+ 		return -EINVAL;
+-	if (new > conf->max_nr_stripes)
+-		return -EINVAL;
+-	conf->bypass_threshold = new;
+-	return len;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else if (new > conf->max_nr_stripes)
++		err = -EINVAL;
++	else
++		conf->bypass_threshold = new;
++	mddev_unlock(mddev);
++	return err ?: len;
+ }
+ 
+ static struct md_sysfs_entry
+@@ -5410,29 +5422,35 @@ raid5_show_skip_copy(struct mddev *mddev, char *page)
+ static ssize_t
+ raid5_store_skip_copy(struct mddev *mddev, const char *page, size_t len)
+ {
+-	struct r5conf *conf = mddev->private;
++	struct r5conf *conf;
+ 	unsigned long new;
++	int err;
++
+ 	if (len >= PAGE_SIZE)
+ 		return -EINVAL;
+-	if (!conf)
+-		return -ENODEV;
+-
+ 	if (kstrtoul(page, 10, &new))
+ 		return -EINVAL;
+ 	new = !!new;
+-	if (new == conf->skip_copy)
+-		return len;
+ 
+-	mddev_suspend(mddev);
+-	conf->skip_copy = new;
+-	if (new)
+-		mddev->queue->backing_dev_info.capabilities |=
+-						BDI_CAP_STABLE_WRITES;
+-	else
+-		mddev->queue->backing_dev_info.capabilities &=
+-						~BDI_CAP_STABLE_WRITES;
+-	mddev_resume(mddev);
+-	return len;
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else if (new != conf->skip_copy) {
++		mddev_suspend(mddev);
++		conf->skip_copy = new;
++		if (new)
++			mddev->queue->backing_dev_info.capabilities |=
++				BDI_CAP_STABLE_WRITES;
++		else
++			mddev->queue->backing_dev_info.capabilities &=
++				~BDI_CAP_STABLE_WRITES;
++		mddev_resume(mddev);
++	}
++	mddev_unlock(mddev);
++	return err ?: len;
+ }
+ 
+ static struct md_sysfs_entry
+@@ -5474,7 +5492,7 @@ static int alloc_thread_groups(struct r5conf *conf, int cnt,
+ static ssize_t
+ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
+ {
+-	struct r5conf *conf = mddev->private;
++	struct r5conf *conf;
+ 	unsigned long new;
+ 	int err;
+ 	struct r5worker_group *new_groups, *old_groups;
+@@ -5482,41 +5500,41 @@ raid5_store_group_thread_cnt(struct mddev *mddev, const char *page, size_t len)
+ 
+ 	if (len >= PAGE_SIZE)
+ 		return -EINVAL;
+-	if (!conf)
+-		return -ENODEV;
+-
+ 	if (kstrtoul(page, 10, &new))
+ 		return -EINVAL;
+ 
+-	if (new == conf->worker_cnt_per_group)
+-		return len;
+-
+-	mddev_suspend(mddev);
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else if (new != conf->worker_cnt_per_group) {
++		mddev_suspend(mddev);
+ 
+-	old_groups = conf->worker_groups;
+-	if (old_groups)
+-		flush_workqueue(raid5_wq);
++		old_groups = conf->worker_groups;
++		if (old_groups)
++			flush_workqueue(raid5_wq);
+ 
+-	err = alloc_thread_groups(conf, new,
+-				  &group_cnt, &worker_cnt_per_group,
+-				  &new_groups);
+-	if (!err) {
+-		spin_lock_irq(&conf->device_lock);
+-		conf->group_cnt = group_cnt;
+-		conf->worker_cnt_per_group = worker_cnt_per_group;
+-		conf->worker_groups = new_groups;
+-		spin_unlock_irq(&conf->device_lock);
++		err = alloc_thread_groups(conf, new,
++					  &group_cnt, &worker_cnt_per_group,
++					  &new_groups);
++		if (!err) {
++			spin_lock_irq(&conf->device_lock);
++			conf->group_cnt = group_cnt;
++			conf->worker_cnt_per_group = worker_cnt_per_group;
++			conf->worker_groups = new_groups;
++			spin_unlock_irq(&conf->device_lock);
+ 
+-		if (old_groups)
+-			kfree(old_groups[0].workers);
+-		kfree(old_groups);
++			if (old_groups)
++				kfree(old_groups[0].workers);
++			kfree(old_groups);
++		}
++		mddev_resume(mddev);
+ 	}
++	mddev_unlock(mddev);
+ 
+-	mddev_resume(mddev);
+-
+-	if (err)
+-		return err;
+-	return len;
++	return err ?: len;
+ }
+ 
+ static struct md_sysfs_entry
