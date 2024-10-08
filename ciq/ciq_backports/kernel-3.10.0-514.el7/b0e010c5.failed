@@ -1,0 +1,164 @@
+ipvs: replace ip_vs_fill_ip4hdr with ip_vs_fill_iph_skb_off
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alex Gartrell <agartrell@fb.com>
+commit b0e010c527de742cb18e8d50a06dfd1a995b5382
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b0e010c5.failed
+
+This removes some duplicated code and makes the ICMPv6 path look more like
+the ICMP path.
+
+	Signed-off-by: Alex Gartrell <agartrell@fb.com>
+	Acked-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit b0e010c527de742cb18e8d50a06dfd1a995b5382)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_core.c
+#	net/netfilter/ipvs/ip_vs_xmit.c
+diff --cc net/netfilter/ipvs/ip_vs_core.c
+index f9e5f557d613,b831fe84bff7..000000000000
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@@ -970,9 -997,10 +961,14 @@@ static int ip_vs_out_icmp_v6(struct sk_
+  		return NF_ACCEPT;
+  
+  	snet.in6 = ciph.saddr.in6;
+- 	writable = ciph.len;
++ 	offset = ciph.len;
+  	return handle_response_icmp(AF_INET6, skb, &snet, ciph.protocol, cp,
+++<<<<<<< HEAD
+ +				    pp, writable, sizeof(struct ipv6hdr));
+++=======
++ 				    pp, offset, sizeof(struct ipv6hdr),
++ 				    hooknum);
+++>>>>>>> b0e010c527de (ipvs: replace ip_vs_fill_ip4hdr with ip_vs_fill_iph_skb_off)
+  }
+  #endif
+  
+@@@ -1089,10 -1118,10 +1085,10 @@@ handle_response(int af, struct sk_buff 
+  	 * if it came from this machine itself.  So re-compute
+  	 * the routing information.
+  	 */
+ -	if (ip_vs_route_me_harder(af, skb, hooknum))
+ +	if (ip_vs_route_me_harder(af, skb))
+  		goto drop;
+  
+- 	IP_VS_DBG_PKT(10, af, pp, skb, 0, "After SNAT");
++ 	IP_VS_DBG_PKT(10, af, pp, skb, iph->off, "After SNAT");
+  
+  	ip_vs_out_stats(cp, skb);
+  	ip_vs_set_state(cp, IP_VS_DIR_OUTPUT, skb, pd);
+diff --cc net/netfilter/ipvs/ip_vs_xmit.c
+index 033f02180460,9a26f2ea86d9..000000000000
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@@ -748,8 -823,8 +749,13 @@@ ip_vs_nat_xmit_v6(struct sk_buff *skb, 
+  
+  	/* From world but DNAT to loopback address? */
+  	if (local && skb->dev && !(skb->dev->flags & IFF_LOOPBACK) &&
+++<<<<<<< HEAD
+ +	    ipv6_addr_type(&rt->rt6i_dst.addr) & IPV6_ADDR_LOOPBACK) {
+ +		IP_VS_DBG_RL_PKT(1, AF_INET6, pp, skb, 0,
+++=======
++ 	    ipv6_addr_type(&cp->daddr.in6) & IPV6_ADDR_LOOPBACK) {
++ 		IP_VS_DBG_RL_PKT(1, AF_INET6, pp, skb, ipvsh->off,
+++>>>>>>> b0e010c527de (ipvs: replace ip_vs_fill_ip4hdr with ip_vs_fill_iph_skb_off)
+  				 "ip_vs_nat_xmit_v6(): "
+  				 "stopping DNAT to loopback address");
+  		goto tx_error;
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index cd8fbdafdc98..da1818833080 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -107,6 +107,7 @@ static inline struct net *seq_file_single_net(struct seq_file *seq)
+ extern int ip_vs_conn_tab_size;
+ 
+ struct ip_vs_iphdr {
++	__u32 off;	/* Where IP or IPv4 header starts */
+ 	__u32 len;	/* IPv4 simply where L4 starts
+ 			   IPv6 where L4 Transport Header starts */
+ 	__u16 fragoffs; /* IPv6 fragment offset, 0 if first frag (or not frag)*/
+@@ -123,48 +124,56 @@ static inline void *frag_safe_skb_hp(const struct sk_buff *skb, int offset,
+ 	return skb_header_pointer(skb, offset, len, buffer);
+ }
+ 
+-static inline void
+-ip_vs_fill_ip4hdr(const void *nh, struct ip_vs_iphdr *iphdr)
+-{
+-	const struct iphdr *iph = nh;
+-
+-	iphdr->len	= iph->ihl * 4;
+-	iphdr->fragoffs	= 0;
+-	iphdr->protocol	= iph->protocol;
+-	iphdr->saddr.ip	= iph->saddr;
+-	iphdr->daddr.ip	= iph->daddr;
+-}
+-
+ /* This function handles filling *ip_vs_iphdr, both for IPv4 and IPv6.
+  * IPv6 requires some extra work, as finding proper header position,
+  * depend on the IPv6 extension headers.
+  */
+-static inline void
+-ip_vs_fill_iph_skb(int af, const struct sk_buff *skb, struct ip_vs_iphdr *iphdr)
++static inline int
++ip_vs_fill_iph_skb_off(int af, const struct sk_buff *skb, int offset,
++		       struct ip_vs_iphdr *iphdr)
+ {
++	iphdr->off = offset;
+ #ifdef CONFIG_IP_VS_IPV6
+ 	if (af == AF_INET6) {
+-		const struct ipv6hdr *iph =
+-			(struct ipv6hdr *)skb_network_header(skb);
++		struct ipv6hdr _iph;
++		const struct ipv6hdr *iph = skb_header_pointer(
++			skb, offset, sizeof(_iph), &_iph);
++		if (!iph)
++			return 0;
++
+ 		iphdr->saddr.in6 = iph->saddr;
+ 		iphdr->daddr.in6 = iph->daddr;
+ 		/* ipv6_find_hdr() updates len, flags */
+-		iphdr->len	 = 0;
++		iphdr->len	 = offset;
+ 		iphdr->flags	 = 0;
+ 		iphdr->protocol  = ipv6_find_hdr(skb, &iphdr->len, -1,
+ 						 &iphdr->fragoffs,
+ 						 &iphdr->flags);
++		if (iphdr->protocol < 0)
++			return 0;
+ 	} else
+ #endif
+ 	{
+-		const struct iphdr *iph =
+-			(struct iphdr *)skb_network_header(skb);
+-		iphdr->len	= iph->ihl * 4;
++		struct iphdr _iph;
++		const struct iphdr *iph = skb_header_pointer(
++			skb, offset, sizeof(_iph), &_iph);
++		if (!iph)
++			return 0;
++
++		iphdr->len	= offset + iph->ihl * 4;
+ 		iphdr->fragoffs	= 0;
+ 		iphdr->protocol	= iph->protocol;
+ 		iphdr->saddr.ip	= iph->saddr;
+ 		iphdr->daddr.ip	= iph->daddr;
+ 	}
++
++	return 1;
++}
++
++static inline int
++ip_vs_fill_iph_skb(int af, const struct sk_buff *skb, struct ip_vs_iphdr *iphdr)
++{
++	return ip_vs_fill_iph_skb_off(af, skb, skb_network_offset(skb), iphdr);
+ }
+ 
+ /* This function is a faster version of ip_vs_fill_iph_skb().
+* Unmerged path net/netfilter/ipvs/ip_vs_core.c
+* Unmerged path net/netfilter/ipvs/ip_vs_xmit.c
