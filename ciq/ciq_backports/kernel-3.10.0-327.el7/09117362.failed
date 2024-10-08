@@ -1,0 +1,192 @@
+bonding: add infrastructure for an option API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nikolay Aleksandrov <nikolay@redhat.com>
+commit 0911736245df19b423a3b156f6709e7bba48b18a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/09117362.failed
+
+This patch adds the necessary basic infrastructure to support
+centralized and unified option manipulation API for the bonding. The new
+structure bond_option will be used to describe each option with its
+dependencies on modes which will be checked automatically thus removing a
+lot of duplicated code. Also automatic range checking is added for
+some options. Currently the option setting function requires RTNL to
+be acquired prior to calling it, since many options already rely on RTNL
+it seemed like the best choice to protect all against common race
+conditions.
+In order to add an option the following steps need to be done:
+1. Add an entry BOND_OPT_<option> to bond_options.h so it gets a unique id
+   and a bit corresponding to the id
+2. Add a bond_option entry to the bond_opts[] array in bond_options.c which
+   describes the option, its dependencies and its manipulation function
+3. Add code to export the option through sysfs and/or as a module parameter
+   (the sysfs export will be made automatically in the future)
+
+The options can have different flags set, currently the following are
+supported:
+BOND_OPTFLAG_NOSLAVES - require that the bond device has no slaves prior
+                        to setting the option
+BOND_OPTFLAG_IFDOWN - require that the bond device is down prior to
+                      setting the option
+BOND_OPTFLAG_RAWVAL - don't parse the value but return it raw for the
+                      option to parse
+
+There's a new value structure to describe different types of values
+which can have the following flags:
+BOND_VALFLAG_DEFAULT - marks the default option (permanent string alias
+                       to this option is "default")
+BOND_VALFLAG_MIN - the minimum value that this option can have
+BOND_VALFLAG_MAX - the maximum value that this option can have
+
+An example would be nice here, so if we have an option which can have
+the values "off"(2), "special"(4, default) and supports a range, say
+16 - 32, it should be defined as follows:
+"off", 2,
+"special", 4, BOND_VALFLAG_DEFAULT,
+"rangemin", 16, BOND_VALFLAG_MIN,
+"rangemax", 32, BOND_VALFLAG_MAX
+So we have the valid intervals: [2, 2], [4, 4], [16, 32]
+Also the valid strings: "off" = 2, "special" and "default" = 4
+                        "rangemin" = 16, "rangemax" = 32
+
+BOND_VALFLAG_(MIN|MAX) can be used to specify a valid range for an
+option, if MIN is omitted then 0 is considered as a minimum. If an
+exact match is found in the values[] table it will be returned,
+otherwise the range is tried (if available).
+
+The option parameter passing is done by using a special structure called
+bond_opt_value which can take either a string or a value to parse. One
+of the bond_opt_init(val|str) macros should be used depending on which
+one does the user want to parse (string or value). Then a call to
+__bond_opt_set should be done under RTNL.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0911736245df19b423a3b156f6709e7bba48b18a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_options.c
+* Unmerged path drivers/net/bonding/bond_options.c
+diff --git a/drivers/net/bonding/bond_options.h b/drivers/net/bonding/bond_options.h
+new file mode 100644
+index 000000000000..e20f2ebaf5c3
+--- /dev/null
++++ b/drivers/net/bonding/bond_options.h
+@@ -0,0 +1,100 @@
++/*
++ * drivers/net/bond/bond_options.h - bonding options
++ * Copyright (c) 2013 Nikolay Aleksandrov <nikolay@redhat.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef _BOND_OPTIONS_H
++#define _BOND_OPTIONS_H
++
++#define BOND_OPT_MAX_NAMELEN 32
++#define BOND_OPT_VALID(opt) ((opt) < BOND_OPT_LAST)
++#define BOND_MODE_ALL_EX(x) (~(x))
++
++/* Option flags:
++ * BOND_OPTFLAG_NOSLAVES - check if the bond device is empty before setting
++ * BOND_OPTFLAG_IFDOWN - check if the bond device is down before setting
++ * BOND_OPTFLAG_RAWVAL - the option parses the value itself
++ */
++enum {
++	BOND_OPTFLAG_NOSLAVES	= BIT(0),
++	BOND_OPTFLAG_IFDOWN	= BIT(1),
++	BOND_OPTFLAG_RAWVAL	= BIT(2)
++};
++
++/* Value type flags:
++ * BOND_VALFLAG_DEFAULT - mark the value as default
++ * BOND_VALFLAG_(MIN|MAX) - mark the value as min/max
++ */
++enum {
++	BOND_VALFLAG_DEFAULT	= BIT(0),
++	BOND_VALFLAG_MIN	= BIT(1),
++	BOND_VALFLAG_MAX	= BIT(2)
++};
++
++/* Option IDs, their bit positions correspond to their IDs */
++enum {
++	BOND_OPT_LAST
++};
++
++/* This structure is used for storing option values and for passing option
++ * values when changing an option. The logic when used as an arg is as follows:
++ * - if string != NULL -> parse it, if the opt is RAW type then return it, else
++ *   return the parse result
++ * - if string == NULL -> parse value
++ */
++struct bond_opt_value {
++	char *string;
++	u64 value;
++	u32 flags;
++};
++
++struct bonding;
++
++struct bond_option {
++	int id;
++	char *name;
++	char *desc;
++	u32 flags;
++
++	/* unsuppmodes is used to denote modes in which the option isn't
++	 * supported.
++	 */
++	unsigned long unsuppmodes;
++	/* supported values which this option can have, can be a subset of
++	 * BOND_OPTVAL_RANGE's value range
++	 */
++	struct bond_opt_value *values;
++
++	int (*set)(struct bonding *bond, struct bond_opt_value *val);
++};
++
++int __bond_opt_set(struct bonding *bond, unsigned int option,
++		   struct bond_opt_value *val);
++int bond_opt_tryset_rtnl(struct bonding *bond, unsigned int option, char *buf);
++struct bond_opt_value *bond_opt_parse(const struct bond_option *opt,
++				      struct bond_opt_value *val);
++struct bond_option *bond_opt_get(unsigned int option);
++struct bond_opt_value *bond_opt_get_val(unsigned int option, u64 val);
++
++/* This helper is used to initialize a bond_opt_value structure for parameter
++ * passing. There should be either a valid string or value, but not both.
++ * When value is ULLONG_MAX then string will be used.
++ */
++static inline void __bond_opt_init(struct bond_opt_value *optval,
++				   char *string, u64 value)
++{
++	memset(optval, 0, sizeof(*optval));
++	optval->value = ULLONG_MAX;
++	if (value == ULLONG_MAX)
++		optval->string = string;
++	else
++		optval->value = value;
++}
++#define bond_opt_initval(optval, value) __bond_opt_init(optval, NULL, value)
++#define bond_opt_initstr(optval, str) __bond_opt_init(optval, str, ULLONG_MAX)
++#endif /* _BOND_OPTIONS_H */
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 6097f0c04b95..3298c1b15744 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -25,6 +25,7 @@
+ #include <linux/etherdevice.h>
+ #include "bond_3ad.h"
+ #include "bond_alb.h"
++#include "bond_options.h"
+ 
+ #define DRV_VERSION	"3.7.1"
+ #define DRV_RELDATE	"April 27, 2011"
