@@ -1,0 +1,124 @@
+xfs: flush entire file on dio read/write to cached file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 3d751af2cbe9a73a869986a18e865f8a34265052
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3d751af2.failed
+
+Filesystems are responsible to manage file coherency between the page
+cache and direct I/O. The generic dio code flushes dirty pages over the
+range of a dio to ensure that the dio read or a future buffered read
+returns the correct data. XFS has generally followed this pattern,
+though traditionally has flushed and invalidated the range from the
+start of the I/O all the way to the end of the file. This changed after
+the following commit:
+
+	7d4ea3ce xfs: use ranged writeback and invalidation for direct IO
+
+... as the full file flush was no longer necessary to deal with the
+strange post-eof delalloc issues that were since fixed. Unfortunately,
+we have since received complaints about performance degradation due to
+the increased exclusive iolock cycles (which locks out parallel dio
+submission) that occur when a file has cached pages. This does not occur
+on filesystems that use the generic code as it also does not incorporate
+locking.
+
+The exclusive iolock is acquired any time the inode mapping has cached
+pages, regardless of whether they reside in the range of the I/O or not.
+If not, the flush/inval calls do no work and the lock was cycled for no
+reason.
+
+Under consideration of the cost of the exclusive iolock, update the dio
+read and write handlers to flush and invalidate the entire mapping when
+cached pages exist. In most cases, this increases the cost of the
+initial flush sequence but eliminates the need for further lock cycles
+and flushes so long as the workload does not actively mix direct and
+buffered I/O. This also more closely matches historical behavior and
+performance characteristics that users have come to expect.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 3d751af2cbe9a73a869986a18e865f8a34265052)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 4a8e73027673,2d91ab066370..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -281,17 -317,17 +281,17 @@@ xfs_file_aio_read
+  		return -EIO;
+  
+  	/*
+- 	 * Locking is a bit tricky here. If we take an exclusive lock
+- 	 * for direct IO, we effectively serialise all new concurrent
+- 	 * read IO to this file and block it behind IO that is currently in
+- 	 * progress because IO in progress holds the IO lock shared. We only
+- 	 * need to hold the lock exclusive to blow away the page cache, so
+- 	 * only take lock exclusively if the page cache needs invalidation.
+- 	 * This allows the normal direct IO case of no page cache pages to
+- 	 * proceeed concurrently without serialisation.
++ 	 * Locking is a bit tricky here. If we take an exclusive lock for direct
++ 	 * IO, we effectively serialise all new concurrent read IO to this file
++ 	 * and block it behind IO that is currently in progress because IO in
++ 	 * progress holds the IO lock shared. We only need to hold the lock
++ 	 * exclusive to blow away the page cache, so only take lock exclusively
++ 	 * if the page cache needs invalidation. This allows the normal direct
++ 	 * IO case of no page cache pages to proceeed concurrently without
++ 	 * serialisation.
+  	 */
+  	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
+ -	if ((ioflags & XFS_IO_ISDIRECT) && inode->i_mapping->nrpages) {
+ +	if ((ioflags & IO_ISDIRECT) && inode->i_mapping->nrpages) {
+  		xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+  		xfs_rw_ilock(ip, XFS_IOLOCK_EXCL);
+  
+@@@ -695,23 -733,26 +702,34 @@@ xfs_file_dio_aio_write
+  		xfs_rw_ilock(ip, iolock);
+  	}
+  
+ -	ret = xfs_file_aio_write_checks(iocb, from, &iolock);
+ +	ret = xfs_file_aio_write_checks(file, &pos, &count, &iolock);
+  	if (ret)
+  		goto out;
+ -	count = iov_iter_count(from);
+ -	pos = iocb->ki_pos;
+ -	end = pos + count - 1;
+  
++ 	/*
++ 	 * See xfs_file_read_iter() for why we do a full-file flush here.
++ 	 */
+  	if (mapping->nrpages) {
+++<<<<<<< HEAD
+ +		ret = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
+ +						    pos, pos + count - 1);
+++=======
++ 		ret = filemap_write_and_wait(VFS_I(ip)->i_mapping);
+++>>>>>>> 3d751af2cbe9 (xfs: flush entire file on dio read/write to cached file)
+  		if (ret)
+  			goto out;
+  		/*
+- 		 * Invalidate whole pages. This can return an error if
+- 		 * we fail to invalidate a page, but this should never
+- 		 * happen on XFS. Warn if it does fail.
++ 		 * Invalidate whole pages. This can return an error if we fail
++ 		 * to invalidate a page, but this should never happen on XFS.
++ 		 * Warn if it does fail.
+  		 */
+++<<<<<<< HEAD
+ +		ret = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
+ +					pos >> PAGE_CACHE_SHIFT,
+ +					(pos + count - 1) >> PAGE_CACHE_SHIFT);
+++=======
++ 		ret = invalidate_inode_pages2(VFS_I(ip)->i_mapping);
+++>>>>>>> 3d751af2cbe9 (xfs: flush entire file on dio read/write to cached file)
+  		WARN_ON_ONCE(ret);
+  		ret = 0;
+  	}
+* Unmerged path fs/xfs/xfs_file.c
