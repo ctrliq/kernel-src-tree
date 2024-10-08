@@ -1,0 +1,163 @@
+libnvdimm, dax: introduce device-dax infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit cd03412a51ac4cb3001a8cdfae4560c9602f3387
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cd03412a.failed
+
+Device DAX is the device-centric analogue of Filesystem DAX
+(CONFIG_FS_DAX).  It allows persistent memory ranges to be allocated and
+mapped without need of an intervening file system.  This initial
+infrastructure arranges for a libnvdimm pfn-device to be represented as
+a different device-type so that it can be attached to a driver other
+than the pmem driver.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit cd03412a51ac4cb3001a8cdfae4560c9602f3387)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/Kconfig
+#	drivers/nvdimm/Makefile
+#	drivers/nvdimm/bus.c
+#	drivers/nvdimm/claim.c
+#	drivers/nvdimm/namespace_devs.c
+#	drivers/nvdimm/nd-core.h
+#	drivers/nvdimm/nd.h
+#	drivers/nvdimm/pfn_devs.c
+#	drivers/nvdimm/region.c
+#	drivers/nvdimm/region_devs.c
+#	include/uapi/linux/ndctl.h
+#	tools/testing/nvdimm/Kbuild
+* Unmerged path drivers/nvdimm/Kconfig
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/claim.c
+* Unmerged path drivers/nvdimm/namespace_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path drivers/nvdimm/nd.h
+* Unmerged path drivers/nvdimm/pfn_devs.c
+* Unmerged path drivers/nvdimm/region.c
+* Unmerged path drivers/nvdimm/region_devs.c
+* Unmerged path include/uapi/linux/ndctl.h
+* Unmerged path tools/testing/nvdimm/Kbuild
+* Unmerged path drivers/nvdimm/Kconfig
+* Unmerged path drivers/nvdimm/Makefile
+* Unmerged path drivers/nvdimm/bus.c
+* Unmerged path drivers/nvdimm/claim.c
+diff --git a/drivers/nvdimm/dax_devs.c b/drivers/nvdimm/dax_devs.c
+new file mode 100644
+index 000000000000..f90f7549e7f4
+--- /dev/null
++++ b/drivers/nvdimm/dax_devs.c
+@@ -0,0 +1,99 @@
++/*
++ * Copyright(c) 2013-2016 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#include <linux/device.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include "nd-core.h"
++#include "nd.h"
++
++static void nd_dax_release(struct device *dev)
++{
++	struct nd_region *nd_region = to_nd_region(dev->parent);
++	struct nd_dax *nd_dax = to_nd_dax(dev);
++	struct nd_pfn *nd_pfn = &nd_dax->nd_pfn;
++
++	dev_dbg(dev, "%s\n", __func__);
++	nd_detach_ndns(dev, &nd_pfn->ndns);
++	ida_simple_remove(&nd_region->dax_ida, nd_pfn->id);
++	kfree(nd_pfn->uuid);
++	kfree(nd_dax);
++}
++
++static struct device_type nd_dax_device_type = {
++	.name = "nd_dax",
++	.release = nd_dax_release,
++};
++
++bool is_nd_dax(struct device *dev)
++{
++	return dev ? dev->type == &nd_dax_device_type : false;
++}
++EXPORT_SYMBOL(is_nd_dax);
++
++struct nd_dax *to_nd_dax(struct device *dev)
++{
++	struct nd_dax *nd_dax = container_of(dev, struct nd_dax, nd_pfn.dev);
++
++	WARN_ON(!is_nd_dax(dev));
++	return nd_dax;
++}
++EXPORT_SYMBOL(to_nd_dax);
++
++static const struct attribute_group *nd_dax_attribute_groups[] = {
++	&nd_pfn_attribute_group,
++	&nd_device_attribute_group,
++	&nd_numa_attribute_group,
++	NULL,
++};
++
++static struct nd_dax *nd_dax_alloc(struct nd_region *nd_region)
++{
++	struct nd_pfn *nd_pfn;
++	struct nd_dax *nd_dax;
++	struct device *dev;
++
++	nd_dax = kzalloc(sizeof(*nd_dax), GFP_KERNEL);
++	if (!nd_dax)
++		return NULL;
++
++	nd_pfn = &nd_dax->nd_pfn;
++	nd_pfn->id = ida_simple_get(&nd_region->dax_ida, 0, 0, GFP_KERNEL);
++	if (nd_pfn->id < 0) {
++		kfree(nd_dax);
++		return NULL;
++	}
++
++	dev = &nd_pfn->dev;
++	dev_set_name(dev, "dax%d.%d", nd_region->id, nd_pfn->id);
++	dev->groups = nd_dax_attribute_groups;
++	dev->type = &nd_dax_device_type;
++	dev->parent = &nd_region->dev;
++
++	return nd_dax;
++}
++
++struct device *nd_dax_create(struct nd_region *nd_region)
++{
++	struct device *dev = NULL;
++	struct nd_dax *nd_dax;
++
++	if (!is_nd_pmem(&nd_region->dev))
++		return NULL;
++
++	nd_dax = nd_dax_alloc(nd_region);
++	if (nd_dax)
++		dev = nd_pfn_devinit(&nd_dax->nd_pfn, NULL);
++	__nd_device_register(dev);
++	return dev;
++}
+* Unmerged path drivers/nvdimm/namespace_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path drivers/nvdimm/nd.h
+* Unmerged path drivers/nvdimm/pfn_devs.c
+* Unmerged path drivers/nvdimm/region.c
+* Unmerged path drivers/nvdimm/region_devs.c
+* Unmerged path include/uapi/linux/ndctl.h
+* Unmerged path tools/testing/nvdimm/Kbuild
