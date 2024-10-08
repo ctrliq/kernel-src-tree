@@ -1207,4 +1207,5 @@ struct pci_driver cxl_pci_driver = {
 	.id_table = cxl_pci_tbl,
 	.probe = cxl_probe,
 	.remove = cxl_remove,
+	.shutdown = cxl_remove,
 };
