@@ -1,0 +1,470 @@
+net: Introduce possible_net_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [net] Introduce possible_net_t (Jiri Benc) [1200759]
+Rebuild_FUZZ: 90.57%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 0c5c9fb55106333e773de8c9dd321fa8240caeb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/0c5c9fb5.failed
+
+Having to say
+> #ifdef CONFIG_NET_NS
+> 	struct net *net;
+> #endif
+
+in structures is a little bit wordy and a little bit error prone.
+
+Instead it is possible to say:
+> typedef struct {
+> #ifdef CONFIG_NET_NS
+>       struct net *net;
+> #endif
+> } possible_net_t;
+
+And then in a header say:
+
+> 	possible_net_t net;
+
+Which is cleaner and easier to use and easier to test, as the
+possible_net_t is always there no matter what the compile options.
+
+Further this allows read_pnet and write_pnet to be functions in all
+cases which is better at catching typos.
+
+This change adds possible_net_t, updates the definitions of read_pnet
+and write_pnet, updates optional struct net * variables that
+write_pnet uses on to have the type possible_net_t, and finally fixes
+up the b0rked users of read_pnet and write_pnet.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0c5c9fb55106333e773de8c9dd321fa8240caeb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/net_namespace.h
+#	include/net/netfilter/nf_conntrack.h
+#	net/ipv6/addrlabel.c
+diff --cc include/linux/netdevice.h
+index d77c2cff9dff,ddab1a2a07a0..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1377,10 -1721,7 +1377,14 @@@ struct net_device 
+  	struct netpoll_info __rcu	*npinfo;
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_NS
+ +	/* Network namespace this network device is inside */
+ +	struct net		*nd_net;
+ +#endif
+++=======
++ 	possible_net_t			nd_net;
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  
+  	/* mid-layer private */
+  	union {
+@@@ -1548,30 -1861,16 +1552,34 @@@ struct net *dev_net(const struct net_de
+  static inline
+  void dev_net_set(struct net_device *dev, struct net *net)
+  {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_NS
+ +	release_net(dev->nd_net);
+ +	dev->nd_net = hold_net(net);
+ +#endif
+++=======
++ 	write_pnet(&dev->nd_net, net);
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  }
+  
+ -static inline bool netdev_uses_dsa(struct net_device *dev)
+ +static inline bool netdev_uses_dsa_tags(struct net_device *dev)
+  {
+ -#if IS_ENABLED(CONFIG_NET_DSA)
+ +#ifdef CONFIG_NET_DSA_TAG_DSA
+  	if (dev->dsa_ptr != NULL)
+ -		return dsa_uses_tagged_protocol(dev->dsa_ptr);
+ +		return dsa_uses_dsa_tags(dev->dsa_ptr);
+  #endif
+ -	return false;
+ +
+ +	return 0;
+ +}
+ +
+ +static inline bool netdev_uses_trailer_tags(struct net_device *dev)
+ +{
+ +#ifdef CONFIG_NET_DSA_TAG_TRAILER
+ +	if (dev->dsa_ptr != NULL)
+ +		return dsa_uses_trailer_tags(dev->dsa_ptr);
+ +#endif
+ +
+ +	return 0;
+  }
+  
+  /**
+diff --cc include/net/net_namespace.h
+index 385ac027c602,f733656404de..000000000000
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@@ -227,48 -231,27 +227,54 @@@ int net_eq(const struct net *net1, cons
+  #endif
+  
+  
+++<<<<<<< HEAD
+ +#ifdef NETNS_REFCNT_DEBUG
+ +static inline struct net *hold_net(struct net *net)
+ +{
+ +	if (net)
+ +		atomic_inc(&net->use_count);
+ +	return net;
+ +}
+ +
+ +static inline void release_net(struct net *net)
+ +{
+ +	if (net)
+ +		atomic_dec(&net->use_count);
+ +}
+ +#else
+ +static inline struct net *hold_net(struct net *net)
+ +{
+ +	return net;
+ +}
+ +
+ +static inline void release_net(struct net *net)
+ +{
+ +}
+ +#endif
+ +
+++=======
++ typedef struct {
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  #ifdef CONFIG_NET_NS
++ 	struct net *net;
++ #endif
++ } possible_net_t;
+  
+- static inline void write_pnet(struct net **pnet, struct net *net)
++ static inline void write_pnet(possible_net_t *pnet, struct net *net)
+  {
+- 	*pnet = net;
++ #ifdef CONFIG_NET_NS
++ 	pnet->net = net;
++ #endif
+  }
+  
+- static inline struct net *read_pnet(struct net * const *pnet)
++ static inline struct net *read_pnet(const possible_net_t *pnet)
+  {
+- 	return *pnet;
+- }
+- 
++ #ifdef CONFIG_NET_NS
++ 	return pnet->net;
+  #else
+- 
+- #define write_pnet(pnet, net)	do { (void)(net);} while (0)
+- #define read_pnet(pnet)		(&init_net)
+- 
++ 	return &init_net;
+  #endif
++ }
+  
+  #define for_each_net(VAR)				\
+  	list_for_each_entry(VAR, &net_namespace_list, list)
+diff --cc include/net/netfilter/nf_conntrack.h
+index 37252f71a380,095433b8a8b0..000000000000
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@@ -92,6 -92,14 +92,17 @@@ struct nf_conn 
+  	/* Have we seen traffic both ways yet? (bitset) */
+  	unsigned long status;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Timer function; drops refcnt when it goes off. */
++ 	struct timer_list timeout;
++ 
++ 	possible_net_t ct_net;
++ 
++ 	/* all members below initialized via memset */
++ 	u8 __nfct_init_offset[0];
++ 
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  	/* If we were expected by an expectation, this will be it */
+  	struct nf_conn *master;
+  
+diff --cc net/ipv6/addrlabel.c
+index b30ad3741b46,3cc50e2d3bf5..000000000000
+--- a/net/ipv6/addrlabel.c
++++ b/net/ipv6/addrlabel.c
+@@@ -28,11 -28,8 +28,16 @@@
+  /*
+   * Policy Table
+   */
+++<<<<<<< HEAD
+ +struct ip6addrlbl_entry
+ +{
+ +#ifdef CONFIG_NET_NS
+ +	struct net *lbl_net;
+ +#endif
+++=======
++ struct ip6addrlbl_entry {
++ 	possible_net_t lbl_net;
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  	struct in6_addr prefix;
+  	int prefixlen;
+  	int ifindex;
+@@@ -241,9 -235,7 +246,13 @@@ static struct ip6addrlbl_entry *ip6addr
+  	newp->addrtype = addrtype;
+  	newp->label = label;
+  	INIT_HLIST_NODE(&newp->list);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_NS
+ +	newp->lbl_net = hold_net(net);
+ +#endif
+++=======
++ 	write_pnet(&newp->lbl_net, net);
+++>>>>>>> 0c5c9fb55106 (net: Introduce possible_net_t)
+  	atomic_set(&newp->refcnt, 1);
+  	return newp;
+  }
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index e46c437944f7..832b57200c40 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -3067,10 +3067,8 @@ struct wiphy {
+ 	const struct ieee80211_ht_cap *ht_capa_mod_mask;
+ 	const struct ieee80211_vht_cap *vht_capa_mod_mask;
+ 
+-#ifdef CONFIG_NET_NS
+ 	/* the network namespace this phy lives in currently */
+-	struct net *_net;
+-#endif
++	possible_net_t _net;
+ 
+ #ifdef CONFIG_CFG80211_WEXT
+ 	const struct iw_handler_def *wext;
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 159a11b35fe8..a04382e2ce95 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -91,9 +91,7 @@ struct genl_info {
+ 	struct genlmsghdr *	genlhdr;
+ 	void *			userhdr;
+ 	struct nlattr **	attrs;
+-#ifdef CONFIG_NET_NS
+-	struct net *		_net;
+-#endif
++	possible_net_t		_net;
+ 	void *			user_ptr[2];
+ 	struct sock *		dst_sk;
+ };
+diff --git a/include/net/inet_hashtables.h b/include/net/inet_hashtables.h
+index 1bdb47715def..15ecbbb58928 100644
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -76,9 +76,7 @@ struct inet_ehash_bucket {
+  * ports are created in O(1) time?  I thought so. ;-)	-DaveM
+  */
+ struct inet_bind_bucket {
+-#ifdef CONFIG_NET_NS
+-	struct net		*ib_net;
+-#endif
++	possible_net_t		ib_net;
+ 	unsigned short		port;
+ 	signed char		fastreuse;
+ 	signed char		fastreuseport;
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index b27f91aebb4c..d39a0c420ce2 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -50,13 +50,13 @@ static inline struct net *skb_net(const struct sk_buff *skb)
+ 	 * Start with the most likely hit
+ 	 * End with BUG
+ 	 */
+-	if (likely(skb->dev && skb->dev->nd_net))
++	if (likely(skb->dev && dev_net(skb->dev)))
+ 		return dev_net(skb->dev);
+ 	if (skb_dst(skb) && skb_dst(skb)->dev)
+ 		return dev_net(skb_dst(skb)->dev);
+ 	WARN(skb->sk, "Maybe skb_sknet should be used in %s() at line:%d\n",
+ 		      __func__, __LINE__);
+-	if (likely(skb->sk && skb->sk->sk_net))
++	if (likely(skb->sk && sock_net(skb->sk)))
+ 		return sock_net(skb->sk);
+ 	pr_err("There is no net ptr to find in the skb in %s() line:%d\n",
+ 		__func__, __LINE__);
+@@ -74,11 +74,11 @@ static inline struct net *skb_sknet(const struct sk_buff *skb)
+ #ifdef CONFIG_NET_NS
+ #ifdef CONFIG_IP_VS_DEBUG
+ 	/* Start with the most likely hit */
+-	if (likely(skb->sk && skb->sk->sk_net))
++	if (likely(skb->sk && sock_net(skb->sk)))
+ 		return sock_net(skb->sk);
+ 	WARN(skb->dev, "Maybe skb_net should be used instead in %s() line:%d\n",
+ 		       __func__, __LINE__);
+-	if (likely(skb->dev && skb->dev->nd_net))
++	if (likely(skb->dev && dev_net(skb->dev)))
+ 		return dev_net(skb->dev);
+ 	pr_err("There is no net ptr to find in the skb in %s() line:%d\n",
+ 		__func__, __LINE__);
+diff --git a/include/net/neighbour.h b/include/net/neighbour.h
+index 4c09bd23b832..e70ffb911499 100644
+--- a/include/net/neighbour.h
++++ b/include/net/neighbour.h
+@@ -65,9 +65,7 @@ enum {
+ };
+ 
+ struct neigh_parms {
+-#ifdef CONFIG_NET_NS
+-	struct net *net;
+-#endif
++	possible_net_t net;
+ 	struct net_device *dev;
+ 	struct neigh_parms *next;
+ 	int	(*neigh_setup)(struct neighbour *);
+@@ -162,9 +160,7 @@ struct neigh_ops {
+ 
+ struct pneigh_entry {
+ 	struct pneigh_entry	*next;
+-#ifdef CONFIG_NET_NS
+-	struct net		*net;
+-#endif
++	possible_net_t		net;
+ 	struct net_device	*dev;
+ 	u8			flags;
+ 	u8			key[0];
+* Unmerged path include/net/net_namespace.h
+* Unmerged path include/net/netfilter/nf_conntrack.h
+diff --git a/include/net/sock.h b/include/net/sock.h
+index a7480947869a..34487a702084 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -190,9 +190,7 @@ struct sock_common {
+ 		struct hlist_nulls_node skc_portaddr_node;
+ 	};
+ 	struct proto		*skc_prot;
+-#ifdef CONFIG_NET_NS
+-	struct net	 	*skc_net;
+-#endif
++	possible_net_t		skc_net;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	struct in6_addr		skc_v6_daddr;
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index 5211203ed953..6bfc683cb5ca 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -130,9 +130,7 @@ struct xfrm_state_walk {
+ 
+ /* Full description of state of transformer. */
+ struct xfrm_state {
+-#ifdef CONFIG_NET_NS
+-	struct net		*xs_net;
+-#endif
++	possible_net_t		xs_net;
+ 	union {
+ 		struct hlist_node	gclist;
+ 		struct hlist_node	bydst;
+@@ -512,9 +510,7 @@ struct xfrm_policy_queue {
+ };
+ 
+ struct xfrm_policy {
+-#ifdef CONFIG_NET_NS
+-	struct net		*xp_net;
+-#endif
++	possible_net_t		xp_net;
+ 	struct hlist_node	bydst;
+ 	struct hlist_node	byidx;
+ 
+diff --git a/net/9p/trans_fd.c b/net/9p/trans_fd.c
+index 02efb25c2957..f0bf7001f4f9 100644
+--- a/net/9p/trans_fd.c
++++ b/net/9p/trans_fd.c
+@@ -918,7 +918,7 @@ p9_fd_create_tcp(struct p9_client *client, const char *addr, char *args)
+ 	sin_server.sin_family = AF_INET;
+ 	sin_server.sin_addr.s_addr = in_aton(addr);
+ 	sin_server.sin_port = htons(opts.port);
+-	err = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_INET,
++	err = __sock_create(current->nsproxy->net_ns, PF_INET,
+ 			    SOCK_STREAM, IPPROTO_TCP, &csocket, 1);
+ 	if (err) {
+ 		pr_err("%s (%d): problem creating socket\n",
+@@ -956,7 +956,7 @@ p9_fd_create_unix(struct p9_client *client, const char *addr, char *args)
+ 
+ 	sun_server.sun_family = PF_UNIX;
+ 	strcpy(sun_server.sun_path, addr);
+-	err = __sock_create(read_pnet(&current->nsproxy->net_ns), PF_UNIX,
++	err = __sock_create(current->nsproxy->net_ns, PF_UNIX,
+ 			    SOCK_STREAM, 0, &csocket, 1);
+ 	if (err < 0) {
+ 		pr_err("%s (%d): problem creating socket\n",
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index ca997b6766ed..4ae12b800d90 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -73,9 +73,7 @@
+ 
+ struct mr_table {
+ 	struct list_head	list;
+-#ifdef CONFIG_NET_NS
+-	struct net		*net;
+-#endif
++	possible_net_t		net;
+ 	u32			id;
+ 	struct sock __rcu	*mroute_sk;
+ 	struct timer_list	ipmr_expire_timer;
+* Unmerged path net/ipv6/addrlabel.c
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index 4896130c6c59..02e8fd1673a9 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -56,9 +56,7 @@
+ 
+ struct mr6_table {
+ 	struct list_head	list;
+-#ifdef CONFIG_NET_NS
+-	struct net		*net;
+-#endif
++	possible_net_t		net;
+ 	u32			id;
+ 	struct sock		*mroute6_sk;
+ 	struct timer_list	ipmr_expire_timer;
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index ac3f3df96961..977db99f4520 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -84,10 +84,8 @@ struct datapath {
+ 	/* Stats. */
+ 	struct dp_stats_percpu __percpu *stats_percpu;
+ 
+-#ifdef CONFIG_NET_NS
+ 	/* Network namespace ref. */
+-	struct net *net;
+-#endif
++	possible_net_t net;
+ 
+ 	u32 user_features;
+ };
+diff --git a/net/packet/internal.h b/net/packet/internal.h
+index 8d3add860edb..0ecefd49dd2d 100644
+--- a/net/packet/internal.h
++++ b/net/packet/internal.h
+@@ -74,9 +74,7 @@ extern struct mutex fanout_mutex;
+ #define PACKET_FANOUT_MAX	256
+ 
+ struct packet_fanout {
+-#ifdef CONFIG_NET_NS
+-	struct net		*net;
+-#endif
++	possible_net_t		net;
+ 	unsigned int		num_members;
+ 	u16			id;
+ 	u8			type;
