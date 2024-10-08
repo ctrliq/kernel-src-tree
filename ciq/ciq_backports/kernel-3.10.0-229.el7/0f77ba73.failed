@@ -1,0 +1,215 @@
+be2net: fixup TX-rate setting code for Skyhawk-R
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Ravikumar Nelavelli <ravikumar.nelavelli@emulex.com>
+commit 0f77ba73533ab9ae3845f4c7439d340dcafef7ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0f77ba73.failed
+
+Skyhawk-R FW supports TX-rate setting only as a % value of the link
+speed, set via the SET_PROFILE_CONFIG cmd.
+
+This patch makes the necessary changes to the FW cmd descriptors to support
+the above change and also introduces checks in be_set_vf_tx_rate() to allow
+only discrete values (that map to % of the link-speed).
+
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0f77ba73533ab9ae3845f4c7439d340dcafef7ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index be7982ca5072,d39a1c611b3b..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -1347,10 -1348,14 +1347,13 @@@ static int be_set_vf_vlan(struct net_de
+  	return status;
+  }
+  
+ -static int be_set_vf_tx_rate(struct net_device *netdev, int vf,
+ -			     int min_tx_rate, int max_tx_rate)
+ +static int be_set_vf_tx_rate(struct net_device *netdev, int vf, int rate)
+  {
+  	struct be_adapter *adapter = netdev_priv(netdev);
+- 	int status = 0;
++ 	struct device *dev = &adapter->pdev->dev;
++ 	int percent_rate, status = 0;
++ 	u16 link_speed = 0;
++ 	u8 link_status;
+  
+  	if (!sriov_enabled(adapter))
+  		return -EPERM;
+@@@ -1358,18 -1363,50 +1361,65 @@@
+  	if (vf >= adapter->num_vfs)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (rate < 100 || rate > 10000) {
+ +		dev_err(&adapter->pdev->dev,
+ +			"tx rate must be between 100 and 10000 Mbps\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	status = be_cmd_config_qos(adapter, rate / 10, vf + 1);
+ +	if (status)
+ +		dev_err(&adapter->pdev->dev,
+ +			"tx rate %d on VF %d failed\n", rate, vf);
+ +	else
+ +		adapter->vf_cfg[vf].tx_rate = rate;
+++=======
++ 	if (min_tx_rate)
++ 		return -EINVAL;
++ 
++ 	if (!max_tx_rate)
++ 		goto config_qos;
++ 
++ 	status = be_cmd_link_status_query(adapter, &link_speed,
++ 					  &link_status, 0);
++ 	if (status)
++ 		goto err;
++ 
++ 	if (!link_status) {
++ 		dev_err(dev, "TX-rate setting not allowed when link is down\n");
++ 		status = -EPERM;
++ 		goto err;
++ 	}
++ 
++ 	if (max_tx_rate < 100 || max_tx_rate > link_speed) {
++ 		dev_err(dev, "TX-rate must be between 100 and %d Mbps\n",
++ 			link_speed);
++ 		status = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	/* On Skyhawk the QOS setting must be done only as a % value */
++ 	percent_rate = link_speed / 100;
++ 	if (skyhawk_chip(adapter) && (max_tx_rate % percent_rate)) {
++ 		dev_err(dev, "TX-rate must be a multiple of %d Mbps\n",
++ 			percent_rate);
++ 		status = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ config_qos:
++ 	status = be_cmd_config_qos(adapter, max_tx_rate, link_speed, vf + 1);
++ 	if (status)
++ 		goto err;
++ 
++ 	adapter->vf_cfg[vf].tx_rate = max_tx_rate;
++ 	return 0;
++ 
++ err:
++ 	dev_err(dev, "TX-rate setting of %dMbps on VF%d failed\n",
++ 		max_tx_rate, vf);
+++>>>>>>> 0f77ba73533a (be2net: fixup TX-rate setting code for Skyhawk-R)
+  	return status;
+  }
+  static int be_set_vf_link_state(struct net_device *netdev, int vf,
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index 476752d0a6a4..216463bd128b 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3562,33 +3562,47 @@ void be_reset_nic_desc(struct be_nic_res_desc *nic)
+ 	nic->cq_count = 0xFFFF;
+ 	nic->toe_conn_count = 0xFFFF;
+ 	nic->eq_count = 0xFFFF;
++	nic->iface_count = 0xFFFF;
+ 	nic->link_param = 0xFF;
++	nic->channel_id_param = cpu_to_le16(0xF000);
+ 	nic->acpi_params = 0xFF;
+ 	nic->wol_param = 0x0F;
+-	nic->bw_min = 0xFFFFFFFF;
++	nic->tunnel_iface_count = 0xFFFF;
++	nic->direct_tenant_iface_count = 0xFFFF;
+ 	nic->bw_max = 0xFFFFFFFF;
+ }
+ 
+-int be_cmd_config_qos(struct be_adapter *adapter, u32 bps, u8 domain)
++int be_cmd_config_qos(struct be_adapter *adapter, u32 max_rate, u16 link_speed,
++		      u8 domain)
+ {
+-	if (lancer_chip(adapter)) {
+-		struct be_nic_res_desc nic_desc;
++	struct be_nic_res_desc nic_desc;
++	u32 bw_percent;
++	u16 version = 0;
++
++	if (BE3_chip(adapter))
++		return be_cmd_set_qos(adapter, max_rate / 10, domain);
+ 
+-		be_reset_nic_desc(&nic_desc);
++	be_reset_nic_desc(&nic_desc);
++	nic_desc.pf_num = adapter->pf_number;
++	nic_desc.vf_num = domain;
++	if (lancer_chip(adapter)) {
+ 		nic_desc.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V0;
+ 		nic_desc.hdr.desc_len = RESOURCE_DESC_SIZE_V0;
+ 		nic_desc.flags = (1 << QUN_SHIFT) | (1 << IMM_SHIFT) |
+ 					(1 << NOSV_SHIFT);
+-		nic_desc.pf_num = adapter->pf_number;
+-		nic_desc.vf_num = domain;
+-		nic_desc.bw_max = cpu_to_le32(bps);
+-
+-		return be_cmd_set_profile_config(adapter, &nic_desc,
+-						 RESOURCE_DESC_SIZE_V0,
+-						 0, domain);
++		nic_desc.bw_max = cpu_to_le32(max_rate / 10);
+ 	} else {
+-		return be_cmd_set_qos(adapter, bps, domain);
++		version = 1;
++		nic_desc.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V1;
++		nic_desc.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
++		nic_desc.flags = (1 << IMM_SHIFT) | (1 << NOSV_SHIFT);
++		bw_percent = max_rate ? (max_rate * 100) / link_speed : 100;
++		nic_desc.bw_max = cpu_to_le32(bw_percent);
+ 	}
++
++	return be_cmd_set_profile_config(adapter, &nic_desc,
++					 nic_desc.hdr.desc_len,
++					 version, domain);
+ }
+ 
+ int be_cmd_manage_iface(struct be_adapter *adapter, u32 iface, u8 op)
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.h b/drivers/net/ethernet/emulex/benet/be_cmds.h
+index 228d4b611084..9df9d3bfe907 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.h
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.h
+@@ -1891,16 +1891,20 @@ struct be_nic_res_desc {
+ 	u16 cq_count;
+ 	u16 toe_conn_count;
+ 	u16 eq_count;
+-	u32 rsvd5;
++	u16 vlan_id;
++	u16 iface_count;
+ 	u32 cap_flags;
+ 	u8 link_param;
+-	u8 rsvd6[3];
++	u8 rsvd6;
++	u16 channel_id_param;
+ 	u32 bw_min;
+ 	u32 bw_max;
+ 	u8 acpi_params;
+ 	u8 wol_param;
+ 	u16 rsvd7;
+-	u32 rsvd8[7];
++	u16 tunnel_iface_count;
++	u16 direct_tenant_iface_count;
++	u32 rsvd8[6];
+ } __packed;
+ 
+ /************ Multi-Channel type ***********/
+@@ -2101,7 +2105,8 @@ int be_cmd_get_seeprom_data(struct be_adapter *adapter,
+ int be_cmd_set_loopback(struct be_adapter *adapter, u8 port_num,
+ 			u8 loopback_type, u8 enable);
+ int be_cmd_get_phy_info(struct be_adapter *adapter);
+-int be_cmd_config_qos(struct be_adapter *adapter, u32 bps, u8 domain);
++int be_cmd_config_qos(struct be_adapter *adapter, u32 max_rate,
++		      u16 link_speed, u8 domain);
+ void be_detect_error(struct be_adapter *adapter);
+ int be_cmd_get_die_temperature(struct be_adapter *adapter);
+ int be_cmd_get_cntl_attributes(struct be_adapter *adapter);
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
