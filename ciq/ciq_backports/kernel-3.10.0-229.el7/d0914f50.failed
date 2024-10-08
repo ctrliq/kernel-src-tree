@@ -1,0 +1,247 @@
+powerpc/eeh: Block PCI-CFG access during PE reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] eeh: Block PCI-CFG access during PE reset (Don Zickus) [1127366]
+Rebuild_FUZZ: 91.11%
+commit-author Gavin Shan <gwshan@linux.vnet.ibm.com>
+commit d0914f503f7ba2cd078b123983562be8951296d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d0914f50.failed
+
+We've observed multiple PE reset failures because of PCI-CFG
+access during that period. Potentially, some device drivers
+can't support EEH very well and they can't put the device to
+motionless state before PE reset. So those device drivers might
+produce PCI-CFG accesses during PE reset. Also, we could have
+PCI-CFG access from user space (e.g. "lspci"). Since access to
+frozen PE should return 0xFF's, we can block PCI-CFG access
+during the period of PE reset so that we won't get recrusive EEH
+errors.
+
+The patch adds flag EEH_PE_RESET, which is kept during PE reset.
+The PowerNV/pSeries PCI-CFG accessors reuse the flag to block
+PCI-CFG accordingly.
+
+	Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit d0914f503f7ba2cd078b123983562be8951296d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/eeh.h
+#	arch/powerpc/platforms/powernv/pci.c
+diff --cc arch/powerpc/include/asm/eeh.h
+index 2ff9fdd89bc5,fa32d8dbf1cd..000000000000
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@@ -53,7 -53,7 +53,11 @@@ struct device_node
+  
+  #define EEH_PE_ISOLATED		(1 << 0)	/* Isolated PE		*/
+  #define EEH_PE_RECOVERING	(1 << 1)	/* Recovering PE	*/
+++<<<<<<< HEAD
+ +#define EEH_PE_PHB_DEAD		(1 << 2)	/* Dead PHB		*/
+++=======
++ #define EEH_PE_RESET		(1 << 2)	/* PE reset in progress	*/
+++>>>>>>> d0914f503f7b (powerpc/eeh: Block PCI-CFG access during PE reset)
+  
+  #define EEH_PE_KEEP		(1 << 8)	/* Keep PE on hotplug	*/
+  
+diff --cc arch/powerpc/platforms/powernv/pci.c
+index 356790ddcc05,f98cf99c9f8c..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@@ -401,31 -398,9 +398,35 @@@ int pnv_pci_cfg_read(struct device_nod
+  	default:
+  		return PCIBIOS_FUNC_NOT_SUPPORTED;
+  	}
++ 
+  	cfg_dbg("%s: bus: %x devfn: %x +%x/%x -> %08x\n",
+  		__func__, pdn->busno, pdn->devfn, where, size, *val);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * Check if the specified PE has been put into frozen
+ +	 * state. On the other hand, we needn't do that while
+ +	 * the PHB has been put into frozen state because of
+ +	 * PHB-fatal errors.
+ +	 */
+ +#ifdef CONFIG_EEH
+ +	phb_pe = eeh_phb_pe_get(pdn->phb);
+ +	if (phb_pe && (phb_pe->state & EEH_PE_ISOLATED))
+ +		return PCIBIOS_SUCCESSFUL;
+ +
+ +	if (phb->eeh_state & PNV_EEH_STATE_ENABLED) {
+ +		if (*val == EEH_IO_ERROR_VALUE(size) &&
+ +		    eeh_dev_check_failure(of_node_to_eeh_dev(dn)))
+ +			return PCIBIOS_DEVICE_NOT_FOUND;
+ +	} else {
+ +		pnv_pci_config_check_eeh(phb, dn);
+ +	}
+ +#else
+ +	pnv_pci_config_check_eeh(phb, dn);
+ +#endif
+ +
+++=======
+++>>>>>>> d0914f503f7b (powerpc/eeh: Block PCI-CFG access during PE reset)
+  	return PCIBIOS_SUCCESSFUL;
+  }
+  
+@@@ -452,14 -427,6 +453,17 @@@ int pnv_pci_cfg_write(struct device_nod
+  		return PCIBIOS_FUNC_NOT_SUPPORTED;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Check if the PHB got frozen due to an error (no response) */
+ +#ifdef CONFIG_EEH
+ +	if (!(phb->eeh_state & PNV_EEH_STATE_ENABLED))
+ +		pnv_pci_config_check_eeh(phb, dn);
+ +#else
+ +	pnv_pci_config_check_eeh(phb, dn);
+ +#endif
+ +
+++=======
+++>>>>>>> d0914f503f7b (powerpc/eeh: Block PCI-CFG access during PE reset)
+  	return PCIBIOS_SUCCESSFUL;
+  }
+  
+* Unmerged path arch/powerpc/include/asm/eeh.h
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index 4a8ec7a2ebc7..29f708f6bac8 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -447,19 +447,28 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
+ 		eeh_pe_dev_traverse(pe, eeh_rmv_device, &removed);
+ 	}
+ 
+-	/* Reset the pci controller. (Asserts RST#; resets config space).
++	/*
++	 * Reset the pci controller. (Asserts RST#; resets config space).
+ 	 * Reconfigure bridges and devices. Don't try to bring the system
+ 	 * up if the reset failed for some reason.
++	 *
++	 * During the reset, it's very dangerous to have uncontrolled PCI
++	 * config accesses. So we prefer to block them. However, controlled
++	 * PCI config accesses initiated from EEH itself are allowed.
+ 	 */
++	eeh_pe_state_mark(pe, EEH_PE_RESET);
+ 	rc = eeh_reset_pe(pe);
+-	if (rc)
++	if (rc) {
++		eeh_pe_state_clear(pe, EEH_PE_RESET);
+ 		return rc;
++	}
+ 
+ 	pci_lock_rescan_remove();
+ 
+ 	/* Restore PE */
+ 	eeh_ops->configure_bridge(pe);
+ 	eeh_pe_restore_bars(pe);
++	eeh_pe_state_clear(pe, EEH_PE_RESET);
+ 
+ 	/* Give the system 5 seconds to finish running the user-space
+ 	 * hotplug shutdown scripts, e.g. ifdown for ethernet.  Yes,
+diff --git a/arch/powerpc/kernel/rtas_pci.c b/arch/powerpc/kernel/rtas_pci.c
+index 7d4c7172f38e..c168337aef9d 100644
+--- a/arch/powerpc/kernel/rtas_pci.c
++++ b/arch/powerpc/kernel/rtas_pci.c
+@@ -80,10 +80,6 @@ int rtas_read_config(struct pci_dn *pdn, int where, int size, u32 *val)
+ 	if (ret)
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ 
+-	if (returnval == EEH_IO_ERROR_VALUE(size) &&
+-	    eeh_dev_check_failure(of_node_to_eeh_dev(pdn->node)))
+-		return PCIBIOS_DEVICE_NOT_FOUND;
+-
+ 	return PCIBIOS_SUCCESSFUL;
+ }
+ 
+@@ -92,18 +88,39 @@ static int rtas_pci_read_config(struct pci_bus *bus,
+ 				int where, int size, u32 *val)
+ {
+ 	struct device_node *busdn, *dn;
+-
+-	busdn = pci_bus_to_OF_node(bus);
++	struct pci_dn *pdn;
++	bool found = false;
++#ifdef CONFIG_EEH
++	struct eeh_dev *edev;
++#endif
++	int ret;
+ 
+ 	/* Search only direct children of the bus */
++	*val = 0xFFFFFFFF;
++	busdn = pci_bus_to_OF_node(bus);
+ 	for (dn = busdn->child; dn; dn = dn->sibling) {
+-		struct pci_dn *pdn = PCI_DN(dn);
++		pdn = PCI_DN(dn);
+ 		if (pdn && pdn->devfn == devfn
+-		    && of_device_is_available(dn))
+-			return rtas_read_config(pdn, where, size, val);
++		    && of_device_is_available(dn)) {
++			found = true;
++			break;
++		}
+ 	}
+ 
+-	return PCIBIOS_DEVICE_NOT_FOUND;
++	if (!found)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++#ifdef CONFIG_EEH
++	edev = of_node_to_eeh_dev(dn);
++	if (edev && edev->pe && edev->pe->state & EEH_PE_RESET)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++#endif
++
++	ret = rtas_read_config(pdn, where, size, val);
++	if (*val == EEH_IO_ERROR_VALUE(size) &&
++	    eeh_dev_check_failure(of_node_to_eeh_dev(dn)))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++
++	return ret;
+ }
+ 
+ int rtas_write_config(struct pci_dn *pdn, int where, int size, u32 val)
+@@ -136,17 +153,34 @@ static int rtas_pci_write_config(struct pci_bus *bus,
+ 				 int where, int size, u32 val)
+ {
+ 	struct device_node *busdn, *dn;
+-
+-	busdn = pci_bus_to_OF_node(bus);
++	struct pci_dn *pdn;
++	bool found = false;
++#ifdef CONFIG_EEH
++	struct eeh_dev *edev;
++#endif
++	int ret;
+ 
+ 	/* Search only direct children of the bus */
++	busdn = pci_bus_to_OF_node(bus);
+ 	for (dn = busdn->child; dn; dn = dn->sibling) {
+-		struct pci_dn *pdn = PCI_DN(dn);
++		pdn = PCI_DN(dn);
+ 		if (pdn && pdn->devfn == devfn
+-		    && of_device_is_available(dn))
+-			return rtas_write_config(pdn, where, size, val);
++		    && of_device_is_available(dn)) {
++			found = true;
++			break;
++		}
+ 	}
+-	return PCIBIOS_DEVICE_NOT_FOUND;
++
++	if (!found)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++#ifdef CONFIG_EEH
++	edev = of_node_to_eeh_dev(dn);
++	if (edev && edev->pe && (edev->pe->state & EEH_PE_RESET))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++#endif
++	ret = rtas_write_config(pdn, where, size, val);
++
++	return ret;
+ }
+ 
+ static struct pci_ops rtas_pci_ops = {
+* Unmerged path arch/powerpc/platforms/powernv/pci.c
