@@ -1,0 +1,153 @@
+mm/rmap: calculate page offset when needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] rmap: calculate page offset when needed (Tomoaki Nishimura) [1287322]
+Rebuild_FUZZ: 96.30%
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit b258d860652934b5e014408302335430b81bd7ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b258d860.failed
+
+Call page_to_pgoff() to get the page offset once we are sure we actually
+need it, and any very obvious initial function checks have passed.
+Trivial micro-optimization, and potentially save some cycles.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b258d860652934b5e014408302335430b81bd7ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/rmap.c
+diff --cc mm/rmap.c
+index 8a1f7d7fc267,c52f43a69eea..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1697,8 -1612,38 +1697,43 @@@ static int rmap_walk_anon(struct page *
+  	 */
+  	anon_vma = page_anon_vma(page);
+  	if (!anon_vma)
+++<<<<<<< HEAD
+ +		return ret;
+ +	anon_vma_lock_read(anon_vma);
+++=======
++ 		return NULL;
++ 
++ 	anon_vma_lock_read(anon_vma);
++ 	return anon_vma;
++ }
++ 
++ /*
++  * rmap_walk_anon - do something to anonymous page using the object-based
++  * rmap method
++  * @page: the page to be handled
++  * @rwc: control variable according to each walk type
++  *
++  * Find all the mappings of a page using the mapping pointer and the vma chains
++  * contained in the anon_vma struct it points to.
++  *
++  * When called from try_to_munlock(), the mmap_sem of the mm containing the vma
++  * where the page was found will be held for write.  So, we won't recheck
++  * vm_flags for that VMA.  That should be OK, because that vma shouldn't be
++  * LOCKED.
++  */
++ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc)
++ {
++ 	struct anon_vma *anon_vma;
++ 	pgoff_t pgoff;
++ 	struct anon_vma_chain *avc;
++ 	int ret = SWAP_AGAIN;
++ 
++ 	anon_vma = rmap_walk_anon_lock(page, rwc);
++ 	if (!anon_vma)
++ 		return ret;
++ 
++ 	pgoff = page_to_pgoff(page);
+++>>>>>>> b258d8606529 (mm/rmap: calculate page offset when needed)
+  	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
+  		struct vm_area_struct *vma = avc->vma;
+  		unsigned long address = vma_address(page, vma);
+@@@ -1710,29 -1661,61 +1745,39 @@@
+  	return ret;
+  }
+  
+ -/*
+ - * rmap_walk_file - do something to file page using the object-based rmap method
+ - * @page: the page to be handled
+ - * @rwc: control variable according to each walk type
+ - *
+ - * Find all the mappings of a page using the mapping pointer and the vma chains
+ - * contained in the address_space struct it points to.
+ - *
+ - * When called from try_to_munlock(), the mmap_sem of the mm containing the vma
+ - * where the page was found will be held for write.  So, we won't recheck
+ - * vm_flags for that VMA.  That should be OK, because that vma shouldn't be
+ - * LOCKED.
+ - */
+ -static int rmap_walk_file(struct page *page, struct rmap_walk_control *rwc)
+ +static int rmap_walk_file(struct page *page, int (*rmap_one)(struct page *,
+ +		struct vm_area_struct *, unsigned long, void *), void *arg)
+  {
+  	struct address_space *mapping = page->mapping;
+++<<<<<<< HEAD
+ +	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
+++=======
++ 	pgoff_t pgoff;
+++>>>>>>> b258d8606529 (mm/rmap: calculate page offset when needed)
+  	struct vm_area_struct *vma;
+  	int ret = SWAP_AGAIN;
+  
+ -	/*
+ -	 * The page lock not only makes sure that page->mapping cannot
+ -	 * suddenly be NULLified by truncation, it makes sure that the
+ -	 * structure at mapping cannot be freed and reused yet,
+ -	 * so we can safely take mapping->i_mmap_rwsem.
+ -	 */
+ -	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ -
+  	if (!mapping)
+  		return ret;
+++<<<<<<< HEAD
+ +	mutex_lock(&mapping->i_mmap_mutex);
+++=======
++ 
++ 	pgoff = page_to_pgoff(page);
++ 	i_mmap_lock_read(mapping);
+++>>>>>>> b258d8606529 (mm/rmap: calculate page offset when needed)
+  	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
+  		unsigned long address = vma_address(page, vma);
+ -
+ -		if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
+ -			continue;
+ -
+ -		ret = rwc->rmap_one(page, vma, address, rwc->arg);
+ +		ret = rmap_one(page, vma, address, arg);
+  		if (ret != SWAP_AGAIN)
+ -			goto done;
+ -		if (rwc->done && rwc->done(page))
+ -			goto done;
+ +			break;
+  	}
+ -
+ -	if (!rwc->file_nonlinear)
+ -		goto done;
+ -
+ -	if (list_empty(&mapping->i_mmap_nonlinear))
+ -		goto done;
+ -
+ -	ret = rwc->file_nonlinear(page, mapping, rwc->arg);
+ -done:
+ -	i_mmap_unlock_read(mapping);
+ +	/*
+ +	 * No nonlinear handling: being always shared, nonlinear vmas
+ +	 * never contain migration ptes.  Decide what to do about this
+ +	 * limitation to linear when we need rmap_walk() on nonlinear.
+ +	 */
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+  	return ret;
+  }
+  
+* Unmerged path mm/rmap.c
