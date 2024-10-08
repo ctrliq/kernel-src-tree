@@ -3122,8 +3122,7 @@ flush_cap_releases:
 done:
 	mutex_unlock(&session->s_mutex);
 done_unlocked:
-	if (inode)
-		iput(inode);
+	iput(inode);
 	return;
 
 bad:
