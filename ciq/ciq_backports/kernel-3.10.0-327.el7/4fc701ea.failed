@@ -1,0 +1,101 @@
+IB/core: Properly handle registration of on-demand paging MRs after dereg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Haggai Eran <haggaie@mellanox.com>
+commit 4fc701ead77ede96df3e8b3de13fdf2b1326ee5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4fc701ea.failed
+
+When the last on-demand paging MR is released the notifier count is
+left non-zero so that concurrent page faults will have to abort. If a
+new MR is then registered, the counter is reset. However, the decision
+is made to put the new MR in the list waiting for the notifier count
+to reach zero, before the counter is reset. An invalidation or another
+MR registration can release the MR to handle page faults, but without
+such an event the MR can wait forever.
+
+The patch fixes this issue by adding a check whether the MR is the
+first on-demand paging MR when deciding whether it is ready to handle
+page faults. If it is the first MR, we know that there are no mmu
+notifiers running in parallel to the registration.
+
+Fixes: 882214e2b128 ("IB/core: Implement support for MMU notifiers regarding on demand paging regions")
+	Signed-off-by: Haggai Eran <haggaie@mellanox.com>
+	Signed-off-by: Shachar Raindel <raindel@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 4fc701ead77ede96df3e8b3de13fdf2b1326ee5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+diff --cc drivers/infiniband/core/umem_odp.c
+index f889e8d793bd,8b8cc6fa0ab0..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -75,8 -284,60 +75,60 @@@ int ib_umem_odp_get(struct ib_ucontext 
+  		goto out_page_list;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * When using MMU notifiers, we will get a
++ 	 * notification before the "current" task (and MM) is
++ 	 * destroyed. We use the umem_rwsem semaphore to synchronize.
++ 	 */
++ 	down_write(&context->umem_rwsem);
++ 	context->odp_mrs_count++;
++ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
++ 		rbt_ib_umem_insert(&umem->odp_data->interval_tree,
++ 				   &context->umem_tree);
++ 	if (likely(!atomic_read(&context->notifier_count)) ||
++ 	    context->odp_mrs_count == 1)
++ 		umem->odp_data->mn_counters_active = true;
++ 	else
++ 		list_add(&umem->odp_data->no_private_counters,
++ 			 &context->no_private_counters);
++ 	downgrade_write(&context->umem_rwsem);
++ 
++ 	if (context->odp_mrs_count == 1) {
++ 		/*
++ 		 * Note that at this point, no MMU notifier is running
++ 		 * for this context!
++ 		 */
++ 		atomic_set(&context->notifier_count, 0);
++ 		INIT_HLIST_NODE(&context->mn.hlist);
++ 		context->mn.ops = &ib_umem_notifiers;
++ 		/*
++ 		 * Lock-dep detects a false positive for mmap_sem vs.
++ 		 * umem_rwsem, due to not grasping downgrade_write correctly.
++ 		 */
++ 		lockdep_off();
++ 		ret_val = mmu_notifier_register(&context->mn, mm);
++ 		lockdep_on();
++ 		if (ret_val) {
++ 			pr_err("Failed to register mmu_notifier %d\n", ret_val);
++ 			ret_val = -EBUSY;
++ 			goto out_mutex;
++ 		}
++ 	}
++ 
++ 	up_read(&context->umem_rwsem);
++ 
++ 	/*
++ 	 * Note that doing an mmput can cause a notifier for the relevant mm.
++ 	 * If the notifier is called while we hold the umem_rwsem, this will
++ 	 * cause a deadlock. Therefore, we release the reference only after we
++ 	 * released the semaphore.
++ 	 */
++ 	mmput(mm);
+++>>>>>>> 4fc701ead77e (IB/core: Properly handle registration of on-demand paging MRs after dereg)
+  	return 0;
+  
+ -out_mutex:
+ -	up_read(&context->umem_rwsem);
+ -	vfree(umem->odp_data->dma_list);
+  out_page_list:
+  	vfree(umem->odp_data->page_list);
+  out_odp_data:
+* Unmerged path drivers/infiniband/core/umem_odp.c
