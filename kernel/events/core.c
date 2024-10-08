@@ -132,6 +132,15 @@ static void event_function_call(struct perf_event *event,
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
 
+	if (!event->parent) {
+		/*
+		 * If this is a !child event, we must hold ctx::mutex to
+		 * stabilize the the event->ctx relation. See
+		 * perf_event_ctx_lock().
+		 */
+		lockdep_assert_held(&ctx->mutex);
+	}
+
 	if (!task) {
 		cpu_function_call(event->cpu, active, data);
 		return;
