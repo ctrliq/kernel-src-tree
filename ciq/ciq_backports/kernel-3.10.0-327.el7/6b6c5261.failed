@@ -1,0 +1,82 @@
+bonding: remove bond read lock for bond_mii_monitor()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit 6b6c526147bb00b5788a2f48463481dd30c29b71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b6c5261.failed
+
+The bond slave list may change when the monitor is running, the slave list is no longer
+protected by bond->lock, only protected by rtnl lock(), so we have 3 ways to modify it:
+1.add bond_master_upper_dev_link() and bond_upper_dev_unlink() in bond->lock, but it is unsafe
+to call call_netdevice_notifiers() in write lock.
+2.remove unused bond->lock for monitor function, only use the existing rtnl lock().
+3.use rcu_read_lock() to protect it, of course, it will transform bond_for_each_slave to
+bond_for_each_slave_rcu() and performance is better, but in slow path, it is ignored.
+so I remove the bond->lock and move the rtnl lock to protect the whole monitor function.
+
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b6c526147bb00b5788a2f48463481dd30c29b71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f2744db511b6,0a7e32578540..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2390,36 -2118,24 +2390,32 @@@ void bond_mii_monitor(struct work_struc
+  	struct bonding *bond = container_of(work, struct bonding,
+  					    mii_work.work);
+  	bool should_notify_peers = false;
+- 	unsigned long delay;
+  
+++<<<<<<< HEAD
+ +	read_lock(&bond->lock);
+ +
+ +	delay = msecs_to_jiffies(bond->params.miimon);
+ +
+ +	if (bond->slave_cnt == 0)
+++=======
++ 	if (!rtnl_trylock())
+++>>>>>>> 6b6c526147bb (bonding: remove bond read lock for bond_mii_monitor())
+  		goto re_arm;
+  
+- 	should_notify_peers = bond_should_notify_peers(bond);
+- 
+- 	if (bond_miimon_inspect(bond)) {
+- 		read_unlock(&bond->lock);
+- 
+- 		/* Race avoidance with bond_close cancel of workqueue */
+- 		if (!rtnl_trylock()) {
+- 			read_lock(&bond->lock);
+- 			delay = 1;
+- 			should_notify_peers = false;
+- 			goto re_arm;
+- 		}
++ 	if (!bond_has_slaves(bond)) {
++ 		rtnl_unlock();
++ 		goto re_arm;
++ 	}
+  
+- 		read_lock(&bond->lock);
++ 	should_notify_peers = bond_should_notify_peers(bond);
+  
++ 	if (bond_miimon_inspect(bond))
+  		bond_miimon_commit(bond);
+  
+- 		read_unlock(&bond->lock);
+- 		rtnl_unlock();	/* might sleep, hold no other locks */
+- 		read_lock(&bond->lock);
+- 	}
++ 	if (should_notify_peers)
++ 		call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, bond->dev);
++ 
++ 	rtnl_unlock();
+  
+  re_arm:
+  	if (bond->params.miimon)
+* Unmerged path drivers/net/bonding/bond_main.c
