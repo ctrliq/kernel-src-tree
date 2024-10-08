@@ -1,0 +1,201 @@
+mm: meminit: only set page reserved in the memblock region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] meminit: only set page reserved in the memblock region (George Beshers) [727269]
+Rebuild_FUZZ: 96.43%
+commit-author Nathan Zimmer <nzimmer@sgi.com>
+commit 92923ca3aacef63c92dc297a75ad0c6dfe4eab37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/92923ca3.failed
+
+Currently each page struct is set as reserved upon initialization.  This
+patch leaves the reserved bit clear and only sets the reserved bit when it
+is known the memory was allocated by the bootmem allocator.  This makes it
+easier to distinguish between uninitialised struct pages and reserved
+struct pages in later patches.
+
+	Signed-off-by: Robin Holt <holt@sgi.com>
+	Signed-off-by: Nathan Zimmer <nzimmer@sgi.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Tested-by: Nate Zimmer <nzimmer@sgi.com>
+	Tested-by: Waiman Long <waiman.long@hp.com>
+	Tested-by: Daniel J Blueman <daniel@numascale.com>
+	Acked-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Robin Holt <robinmholt@gmail.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Waiman Long <waiman.long@hp.com>
+	Cc: Scott Norton <scott.norton@hp.com>
+	Cc: "Luck, Tony" <tony.luck@intel.com>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 92923ca3aacef63c92dc297a75ad0c6dfe4eab37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/nobootmem.c
+#	mm/page_alloc.c
+diff --cc mm/nobootmem.c
+index dbdd2db64f47,4af8f88c2bd1..000000000000
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@@ -124,16 -125,33 +124,26 @@@ static unsigned long __init __free_memo
+  static unsigned long __init free_low_memory_core_early(void)
+  {
+  	unsigned long count = 0;
+ -	phys_addr_t start, end;
+ +	phys_addr_t start, end, size;
+  	u64 i;
+  
+++<<<<<<< HEAD
+ +	for_each_free_mem_range(i, NUMA_NO_NODE, &start, &end, NULL)
+++=======
++ 	memblock_clear_hotplug(0, -1);
++ 
++ 	for_each_reserved_mem_region(i, &start, &end)
++ 		reserve_bootmem_region(start, end);
++ 
++ 	for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end,
++ 				NULL)
+++>>>>>>> 92923ca3aace (mm: meminit: only set page reserved in the memblock region)
+  		count += __free_memory_core(start, end);
+  
+ -#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+ -	{
+ -		phys_addr_t size;
+ -
+ -		/* Free memblock.reserved array if it was allocated */
+ -		size = get_allocated_memblock_reserved_regions_info(&start);
+ -		if (size)
+ -			count += __free_memory_core(start, start + size);
+ -
+ -		/* Free memblock.memory array if it was allocated */
+ -		size = get_allocated_memblock_memory_regions_info(&start);
+ -		if (size)
+ -			count += __free_memory_core(start, start + size);
+ -	}
+ -#endif
+ +	/* free range that is used for reserved array if we allocate it */
+ +	size = get_allocated_memblock_reserved_regions_info(&start);
+ +	if (size)
+ +		count += __free_memory_core(start, start + size);
+  
+  	return count;
+  }
+diff --cc mm/page_alloc.c
+index f60ded95bce9,39c8d56a4056..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -719,10 -749,88 +719,88 @@@ static void free_one_page(struct zone *
+  	spin_unlock(&zone->lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int free_tail_pages_check(struct page *head_page, struct page *page)
++ {
++ 	if (!IS_ENABLED(CONFIG_DEBUG_VM))
++ 		return 0;
++ 	if (unlikely(!PageTail(page))) {
++ 		bad_page(page, "PageTail not set", 0);
++ 		return 1;
++ 	}
++ 	if (unlikely(page->first_page != head_page)) {
++ 		bad_page(page, "first_page not consistent", 0);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static void __meminit __init_single_page(struct page *page, unsigned long pfn,
++ 				unsigned long zone, int nid)
++ {
++ 	struct zone *z = &NODE_DATA(nid)->node_zones[zone];
++ 
++ 	set_page_links(page, zone, nid, pfn);
++ 	mminit_verify_page_links(page, zone, nid, pfn);
++ 	init_page_count(page);
++ 	page_mapcount_reset(page);
++ 	page_cpupid_reset_last(page);
++ 
++ 	/*
++ 	 * Mark the block movable so that blocks are reserved for
++ 	 * movable at startup. This will force kernel allocations
++ 	 * to reserve their blocks rather than leaking throughout
++ 	 * the address space during boot when many long-lived
++ 	 * kernel allocations are made. Later some blocks near
++ 	 * the start are marked MIGRATE_RESERVE by
++ 	 * setup_zone_migrate_reserve()
++ 	 *
++ 	 * bitmap is created for zone's valid pfn range. but memmap
++ 	 * can be created for invalid pages (for alignment)
++ 	 * check here not to call set_pageblock_migratetype() against
++ 	 * pfn out of zone.
++ 	 */
++ 	if ((z->zone_start_pfn <= pfn)
++ 	    && (pfn < zone_end_pfn(z))
++ 	    && !(pfn & (pageblock_nr_pages - 1)))
++ 		set_pageblock_migratetype(page, MIGRATE_MOVABLE);
++ 
++ 	INIT_LIST_HEAD(&page->lru);
++ #ifdef WANT_PAGE_VIRTUAL
++ 	/* The shift won't overflow because ZONE_NORMAL is below 4G. */
++ 	if (!is_highmem_idx(zone))
++ 		set_page_address(page, __va(pfn << PAGE_SHIFT));
++ #endif
++ }
++ 
++ static void __meminit __init_single_pfn(unsigned long pfn, unsigned long zone,
++ 					int nid)
++ {
++ 	return __init_single_page(pfn_to_page(pfn), pfn, zone, nid);
++ }
++ 
++ /*
++  * Initialised pages do not have PageReserved set. This function is
++  * called for each range allocated by the bootmem allocator and
++  * marks the pages PageReserved. The remaining valid pages are later
++  * sent to the buddy page allocator.
++  */
++ void reserve_bootmem_region(unsigned long start, unsigned long end)
++ {
++ 	unsigned long start_pfn = PFN_DOWN(start);
++ 	unsigned long end_pfn = PFN_UP(end);
++ 
++ 	for (; start_pfn < end_pfn; start_pfn++)
++ 		if (pfn_valid(start_pfn))
++ 			SetPageReserved(pfn_to_page(start_pfn));
++ }
++ 
+++>>>>>>> 92923ca3aace (mm: meminit: only set page reserved in the memblock region)
+  static bool free_pages_prepare(struct page *page, unsigned int order)
+  {
+ -	bool compound = PageCompound(page);
+ -	int i, bad = 0;
+ -
+ -	VM_BUG_ON_PAGE(PageTail(page), page);
+ -	VM_BUG_ON_PAGE(compound && compound_order(page) != order, page);
+ +	int i;
+ +	int bad = 0;
+  
+  	trace_mm_page_free(page, order);
+  	kmemcheck_free_shadow(page, order);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 77beacdc1090..231ecbed8dc8 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1574,6 +1574,8 @@ extern void free_highmem_page(struct page *page);
+ extern void adjust_managed_page_count(struct page *page, long count);
+ extern void mem_init_print_info(const char *str);
+ 
++extern void reserve_bootmem_region(unsigned long start, unsigned long end);
++
+ /* Free the reserved page into the buddy system, so it gets managed. */
+ static inline void __free_reserved_page(struct page *page)
+ {
+* Unmerged path mm/nobootmem.c
+* Unmerged path mm/page_alloc.c
