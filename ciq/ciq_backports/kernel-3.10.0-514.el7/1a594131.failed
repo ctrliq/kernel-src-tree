@@ -1,0 +1,508 @@
+perf: Add wakeup watermark control to the AUX area
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Shishkin <alexander.shishkin@linux.intel.com>
+commit 1a5941312414c71dece6717da9a0fa1303127afa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1a594131.failed
+
+When AUX area gets a certain amount of new data, we want to wake up
+userspace to collect it. This adds a new control to specify how much
+data will cause a wakeup. This is then passed down to pmu drivers via
+output handle's "wakeup" field, so that the driver can find the nearest
+point where it can generate an interrupt.
+
+We repurpose __reserved_2 in the event attribute for this, even though
+it was never checked to be zero before, aux_watermark will only matter
+for new AUX-aware code, so the old code should still be fine.
+
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Kaixu Xia <kaixu.xia@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Robert Richter <rric@kernel.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: acme@infradead.org
+	Cc: adrian.hunter@intel.com
+	Cc: kan.liang@intel.com
+	Cc: markus.t.metzger@intel.com
+	Cc: mathieu.poirier@linaro.org
+Link: http://lkml.kernel.org/r/1421237903-181015-10-git-send-email-alexander.shishkin@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1a5941312414c71dece6717da9a0fa1303127afa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/perf_event.h
+#	kernel/events/core.c
+#	kernel/events/internal.h
+#	kernel/events/ring_buffer.c
+diff --cc include/uapi/linux/perf_event.h
+index 31428ba83f05,84819546c8ce..000000000000
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@@ -370,9 -366,13 +371,18 @@@ struct perf_event_attr 
+  	 *
+  	 * See asm/perf_regs.h for details.
+  	 */
+ +#ifndef __GENKSYMS__
+  	__u64	sample_regs_intr;
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ 	/*
++ 	 * Wakeup watermark for AUX area
++ 	 */
++ 	__u32	aux_watermark;
++ 	__u32	__reserved_2;	/* align to __u64 */
+++>>>>>>> 1a5941312414 (perf: Add wakeup watermark control to the AUX area)
+  };
+  
+  #define perf_flags(attr)	(*(&(attr)->read_format + 1))
+diff --cc kernel/events/core.c
+index c71870e24d1d,31f6b504ad62..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4479,31 -4658,41 +4479,56 @@@ again
+  	if (vma->vm_flags & VM_WRITE)
+  		flags |= RING_BUFFER_WRITABLE;
+  
+ +	rb = rb_alloc(nr_pages, 
+ +		event->attr.watermark ? event->attr.wakeup_watermark : 0,
+ +		event->cpu, flags);
+ +
+  	if (!rb) {
+++<<<<<<< HEAD
+ +		ret = -ENOMEM;
+ +		goto unlock;
+++=======
++ 		rb = rb_alloc(nr_pages,
++ 			      event->attr.watermark ? event->attr.wakeup_watermark : 0,
++ 			      event->cpu, flags);
++ 
++ 		if (!rb) {
++ 			ret = -ENOMEM;
++ 			goto unlock;
++ 		}
++ 
++ 		atomic_set(&rb->mmap_count, 1);
++ 		rb->mmap_user = get_current_user();
++ 		rb->mmap_locked = extra;
++ 
++ 		ring_buffer_attach(event, rb);
++ 
++ 		perf_event_init_userpage(event);
++ 		perf_event_update_userpage(event);
++ 	} else {
++ 		ret = rb_alloc_aux(rb, event, vma->vm_pgoff, nr_pages,
++ 				   event->attr.aux_watermark, flags);
++ 		if (!ret)
++ 			rb->aux_mmap_locked = extra;
+++>>>>>>> 1a5941312414 (perf: Add wakeup watermark control to the AUX area)
+  	}
+  
+ -unlock:
+ -	if (!ret) {
+ -		atomic_long_add(user_extra, &user->locked_vm);
+ -		vma->vm_mm->pinned_vm += extra;
+ +	atomic_set(&rb->mmap_count, 1);
+ +	rb->mmap_locked = extra;
+ +	rb->mmap_user = get_current_user();
+ +
+ +	atomic_long_add(user_extra, &user->locked_vm);
+ +	vma->vm_mm->pinned_vm += extra;
+ +
+ +	ring_buffer_attach(event, rb);
+ +	rcu_assign_pointer(event->rb, rb);
+ +
+ +	perf_event_init_userpage(event);
+ +	perf_event_update_userpage(event);
+  
+ +unlock:
+ +	if (!ret)
+  		atomic_inc(&event->mmap_count);
+ -	} else if (rb) {
+ -		atomic_dec(&rb->mmap_count);
+ -	}
+ -aux_unlock:
+  	mutex_unlock(&event->mmap_mutex);
+  
+  	/*
+diff --cc kernel/events/internal.h
+index f1670628dd0e,9f6ce9ba4a04..000000000000
+--- a/kernel/events/internal.h
++++ b/kernel/events/internal.h
+@@@ -35,6 -36,20 +36,23 @@@ struct ring_buffer 
+  	unsigned long			mmap_locked;
+  	struct user_struct		*mmap_user;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* AUX area */
++ 	local_t				aux_head;
++ 	local_t				aux_nest;
++ 	local_t				aux_wakeup;
++ 	unsigned long			aux_pgoff;
++ 	int				aux_nr_pages;
++ 	int				aux_overwrite;
++ 	atomic_t			aux_mmap_count;
++ 	unsigned long			aux_mmap_locked;
++ 	void				(*free_aux)(void *);
++ 	atomic_t			aux_refcount;
++ 	void				**aux_pages;
++ 	void				*aux_priv;
++ 
+++>>>>>>> 1a5941312414 (perf: Add wakeup watermark control to the AUX area)
+  	struct perf_event_mmap_page	*user_page;
+  	void				*data_pages[0];
+  };
+@@@ -43,6 -58,16 +61,19 @@@ extern void rb_free(struct ring_buffer 
+  extern struct ring_buffer *
+  rb_alloc(int nr_pages, long watermark, int cpu, int flags);
+  extern void perf_event_wakeup(struct perf_event *event);
+++<<<<<<< HEAD
+++=======
++ extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
++ 			pgoff_t pgoff, int nr_pages, long watermark, int flags);
++ extern void rb_free_aux(struct ring_buffer *rb);
++ extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
++ extern void ring_buffer_put(struct ring_buffer *rb);
++ 
++ static inline bool rb_has_aux(struct ring_buffer *rb)
++ {
++ 	return !!rb->aux_nr_pages;
++ }
+++>>>>>>> 1a5941312414 (perf: Add wakeup watermark control to the AUX area)
+  
+  void perf_event_aux_event(struct perf_event *event, unsigned long head,
+  			  unsigned long size, u64 flags);
+diff --cc kernel/events/ring_buffer.c
+index eadb95ce7aac,232f00f273cb..000000000000
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@@ -243,6 -243,309 +243,312 @@@ ring_buffer_init(struct ring_buffer *rb
+  	spin_lock_init(&rb->event_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This is called before hardware starts writing to the AUX area to
++  * obtain an output handle and make sure there's room in the buffer.
++  * When the capture completes, call perf_aux_output_end() to commit
++  * the recorded data to the buffer.
++  *
++  * The ordering is similar to that of perf_output_{begin,end}, with
++  * the exception of (B), which should be taken care of by the pmu
++  * driver, since ordering rules will differ depending on hardware.
++  */
++ void *perf_aux_output_begin(struct perf_output_handle *handle,
++ 			    struct perf_event *event)
++ {
++ 	struct perf_event *output_event = event;
++ 	unsigned long aux_head, aux_tail;
++ 	struct ring_buffer *rb;
++ 
++ 	if (output_event->parent)
++ 		output_event = output_event->parent;
++ 
++ 	/*
++ 	 * Since this will typically be open across pmu::add/pmu::del, we
++ 	 * grab ring_buffer's refcount instead of holding rcu read lock
++ 	 * to make sure it doesn't disappear under us.
++ 	 */
++ 	rb = ring_buffer_get(output_event);
++ 	if (!rb)
++ 		return NULL;
++ 
++ 	if (!rb_has_aux(rb) || !atomic_inc_not_zero(&rb->aux_refcount))
++ 		goto err;
++ 
++ 	/*
++ 	 * Nesting is not supported for AUX area, make sure nested
++ 	 * writers are caught early
++ 	 */
++ 	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest, 1)))
++ 		goto err_put;
++ 
++ 	aux_head = local_read(&rb->aux_head);
++ 
++ 	handle->rb = rb;
++ 	handle->event = event;
++ 	handle->head = aux_head;
++ 	handle->size = 0;
++ 
++ 	/*
++ 	 * In overwrite mode, AUX data stores do not depend on aux_tail,
++ 	 * therefore (A) control dependency barrier does not exist. The
++ 	 * (B) <-> (C) ordering is still observed by the pmu driver.
++ 	 */
++ 	if (!rb->aux_overwrite) {
++ 		aux_tail = ACCESS_ONCE(rb->user_page->aux_tail);
++ 		handle->wakeup = local_read(&rb->aux_wakeup) + rb->aux_watermark;
++ 		if (aux_head - aux_tail < perf_aux_size(rb))
++ 			handle->size = CIRC_SPACE(aux_head, aux_tail, perf_aux_size(rb));
++ 
++ 		/*
++ 		 * handle->size computation depends on aux_tail load; this forms a
++ 		 * control dependency barrier separating aux_tail load from aux data
++ 		 * store that will be enabled on successful return
++ 		 */
++ 		if (!handle->size) { /* A, matches D */
++ 			event->pending_disable = 1;
++ 			perf_output_wakeup(handle);
++ 			local_set(&rb->aux_nest, 0);
++ 			goto err_put;
++ 		}
++ 	}
++ 
++ 	return handle->rb->aux_priv;
++ 
++ err_put:
++ 	rb_free_aux(rb);
++ 
++ err:
++ 	ring_buffer_put(rb);
++ 	handle->event = NULL;
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Commit the data written by hardware into the ring buffer by adjusting
++  * aux_head and posting a PERF_RECORD_AUX into the perf buffer. It is the
++  * pmu driver's responsibility to observe ordering rules of the hardware,
++  * so that all the data is externally visible before this is called.
++  */
++ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
++ 			 bool truncated)
++ {
++ 	struct ring_buffer *rb = handle->rb;
++ 	unsigned long aux_head;
++ 	u64 flags = 0;
++ 
++ 	if (truncated)
++ 		flags |= PERF_AUX_FLAG_TRUNCATED;
++ 
++ 	/* in overwrite mode, driver provides aux_head via handle */
++ 	if (rb->aux_overwrite) {
++ 		flags |= PERF_AUX_FLAG_OVERWRITE;
++ 
++ 		aux_head = handle->head;
++ 		local_set(&rb->aux_head, aux_head);
++ 	} else {
++ 		aux_head = local_read(&rb->aux_head);
++ 		local_add(size, &rb->aux_head);
++ 	}
++ 
++ 	if (size || flags) {
++ 		/*
++ 		 * Only send RECORD_AUX if we have something useful to communicate
++ 		 */
++ 
++ 		perf_event_aux_event(handle->event, aux_head, size, flags);
++ 	}
++ 
++ 	aux_head = rb->user_page->aux_head = local_read(&rb->aux_head);
++ 
++ 	if (aux_head - local_read(&rb->aux_wakeup) >= rb->aux_watermark) {
++ 		perf_output_wakeup(handle);
++ 		local_add(rb->aux_watermark, &rb->aux_wakeup);
++ 	}
++ 	handle->event = NULL;
++ 
++ 	local_set(&rb->aux_nest, 0);
++ 	rb_free_aux(rb);
++ 	ring_buffer_put(rb);
++ }
++ 
++ /*
++  * Skip over a given number of bytes in the AUX buffer, due to, for example,
++  * hardware's alignment constraints.
++  */
++ int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
++ {
++ 	struct ring_buffer *rb = handle->rb;
++ 	unsigned long aux_head;
++ 
++ 	if (size > handle->size)
++ 		return -ENOSPC;
++ 
++ 	local_add(size, &rb->aux_head);
++ 
++ 	aux_head = rb->user_page->aux_head = local_read(&rb->aux_head);
++ 	if (aux_head - local_read(&rb->aux_wakeup) >= rb->aux_watermark) {
++ 		perf_output_wakeup(handle);
++ 		local_add(rb->aux_watermark, &rb->aux_wakeup);
++ 		handle->wakeup = local_read(&rb->aux_wakeup) +
++ 				 rb->aux_watermark;
++ 	}
++ 
++ 	handle->head = aux_head;
++ 	handle->size -= size;
++ 
++ 	return 0;
++ }
++ 
++ void *perf_get_aux(struct perf_output_handle *handle)
++ {
++ 	/* this is only valid between perf_aux_output_begin and *_end */
++ 	if (!handle->event)
++ 		return NULL;
++ 
++ 	return handle->rb->aux_priv;
++ }
++ 
++ #define PERF_AUX_GFP	(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY)
++ 
++ static struct page *rb_alloc_aux_page(int node, int order)
++ {
++ 	struct page *page;
++ 
++ 	if (order > MAX_ORDER)
++ 		order = MAX_ORDER;
++ 
++ 	do {
++ 		page = alloc_pages_node(node, PERF_AUX_GFP, order);
++ 	} while (!page && order--);
++ 
++ 	if (page && order) {
++ 		/*
++ 		 * Communicate the allocation size to the driver
++ 		 */
++ 		split_page(page, order);
++ 		SetPagePrivate(page);
++ 		set_page_private(page, order);
++ 	}
++ 
++ 	return page;
++ }
++ 
++ static void rb_free_aux_page(struct ring_buffer *rb, int idx)
++ {
++ 	struct page *page = virt_to_page(rb->aux_pages[idx]);
++ 
++ 	ClearPagePrivate(page);
++ 	page->mapping = NULL;
++ 	__free_page(page);
++ }
++ 
++ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
++ 		 pgoff_t pgoff, int nr_pages, long watermark, int flags)
++ {
++ 	bool overwrite = !(flags & RING_BUFFER_WRITABLE);
++ 	int node = (event->cpu == -1) ? -1 : cpu_to_node(event->cpu);
++ 	int ret = -ENOMEM, max_order = 0;
++ 
++ 	if (!has_aux(event))
++ 		return -ENOTSUPP;
++ 
++ 	if (event->pmu->capabilities & PERF_PMU_CAP_AUX_NO_SG) {
++ 		/*
++ 		 * We need to start with the max_order that fits in nr_pages,
++ 		 * not the other way around, hence ilog2() and not get_order.
++ 		 */
++ 		max_order = ilog2(nr_pages);
++ 
++ 		/*
++ 		 * PMU requests more than one contiguous chunks of memory
++ 		 * for SW double buffering
++ 		 */
++ 		if ((event->pmu->capabilities & PERF_PMU_CAP_AUX_SW_DOUBLEBUF) &&
++ 		    !overwrite) {
++ 			if (!max_order)
++ 				return -EINVAL;
++ 
++ 			max_order--;
++ 		}
++ 	}
++ 
++ 	rb->aux_pages = kzalloc_node(nr_pages * sizeof(void *), GFP_KERNEL, node);
++ 	if (!rb->aux_pages)
++ 		return -ENOMEM;
++ 
++ 	rb->free_aux = event->pmu->free_aux;
++ 	for (rb->aux_nr_pages = 0; rb->aux_nr_pages < nr_pages;) {
++ 		struct page *page;
++ 		int last, order;
++ 
++ 		order = min(max_order, ilog2(nr_pages - rb->aux_nr_pages));
++ 		page = rb_alloc_aux_page(node, order);
++ 		if (!page)
++ 			goto out;
++ 
++ 		for (last = rb->aux_nr_pages + (1 << page_private(page));
++ 		     last > rb->aux_nr_pages; rb->aux_nr_pages++)
++ 			rb->aux_pages[rb->aux_nr_pages] = page_address(page++);
++ 	}
++ 
++ 	rb->aux_priv = event->pmu->setup_aux(event->cpu, rb->aux_pages, nr_pages,
++ 					     overwrite);
++ 	if (!rb->aux_priv)
++ 		goto out;
++ 
++ 	ret = 0;
++ 
++ 	/*
++ 	 * aux_pages (and pmu driver's private data, aux_priv) will be
++ 	 * referenced in both producer's and consumer's contexts, thus
++ 	 * we keep a refcount here to make sure either of the two can
++ 	 * reference them safely.
++ 	 */
++ 	atomic_set(&rb->aux_refcount, 1);
++ 
++ 	rb->aux_overwrite = overwrite;
++ 	rb->aux_watermark = watermark;
++ 
++ 	if (!rb->aux_watermark && !rb->aux_overwrite)
++ 		rb->aux_watermark = nr_pages << (PAGE_SHIFT - 1);
++ 
++ out:
++ 	if (!ret)
++ 		rb->aux_pgoff = pgoff;
++ 	else
++ 		rb_free_aux(rb);
++ 
++ 	return ret;
++ }
++ 
++ static void __rb_free_aux(struct ring_buffer *rb)
++ {
++ 	int pg;
++ 
++ 	if (rb->aux_priv) {
++ 		rb->free_aux(rb->aux_priv);
++ 		rb->free_aux = NULL;
++ 		rb->aux_priv = NULL;
++ 	}
++ 
++ 	for (pg = 0; pg < rb->aux_nr_pages; pg++)
++ 		rb_free_aux_page(rb, pg);
++ 
++ 	kfree(rb->aux_pages);
++ 	rb->aux_nr_pages = 0;
++ }
++ 
++ void rb_free_aux(struct ring_buffer *rb)
++ {
++ 	if (atomic_dec_and_test(&rb->aux_refcount))
++ 		__rb_free_aux(rb);
++ }
++ 
+++>>>>>>> 1a5941312414 (perf: Add wakeup watermark control to the AUX area)
+  #ifndef CONFIG_PERF_USE_VMALLOC
+  
+  /*
+* Unmerged path include/uapi/linux/perf_event.h
+* Unmerged path kernel/events/core.c
+* Unmerged path kernel/events/internal.h
+* Unmerged path kernel/events/ring_buffer.c
