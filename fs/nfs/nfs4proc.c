@@ -7236,6 +7236,8 @@ static int nfs4_verify_back_channel_attrs(struct nfs41_create_session_args *args
 	struct nfs4_channel_attrs *sent = &args->bc_attrs;
 	struct nfs4_channel_attrs *rcvd = &res->bc_attrs;
 
+	if (!(res->flags & SESSION4_BACK_CHAN))
+		goto out;
 	if (rcvd->max_rqst_sz > sent->max_rqst_sz)
 		return -EINVAL;
 	if (rcvd->max_resp_sz < sent->max_resp_sz)
@@ -7247,6 +7249,7 @@ static int nfs4_verify_back_channel_attrs(struct nfs41_create_session_args *args
 		return -EINVAL;
 	if (rcvd->max_reqs != sent->max_reqs)
 		return -EINVAL;
+out:
 	return 0;
 }
 
@@ -7267,7 +7270,9 @@ static void nfs4_update_session(struct nfs4_session *session,
 	nfs4_copy_sessionid(&session->sess_id, &res->sessionid);
 	session->flags = res->flags;
 	memcpy(&session->fc_attrs, &res->fc_attrs, sizeof(session->fc_attrs));
-	memcpy(&session->bc_attrs, &res->bc_attrs, sizeof(session->bc_attrs));
+	if (res->flags & SESSION4_BACK_CHAN)
+		memcpy(&session->bc_attrs, &res->bc_attrs,
+				sizeof(session->bc_attrs));
 }
 
 static int _nfs4_proc_create_session(struct nfs_client *clp,
