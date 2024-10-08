@@ -1,0 +1,364 @@
+xfs: DAX does not use IO completion callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 01a155e6cf7db1a8ff2aa73162d7d9ec05ad298f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/01a155e6.failed
+
+For DAX, we are now doing block zeroing during allocation. This
+means we no longer need a special DAX fault IO completion callback
+to do unwritten extent conversion. Because mmap never extends the
+file size (it SEGVs the process) we don't need a callback to update
+the file size, either. Hence we can remove the completion callbacks
+from the __dax_fault and __dax_mkwrite calls.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 01a155e6cf7db1a8ff2aa73162d7d9ec05ad298f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_aops.h
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_aops.c
+index 3ffbdb7cbd8f,69c2dbc20836..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1460,69 -1548,136 +1460,107 @@@ xfs_get_blocks_direct
+  	struct buffer_head	*bh_result,
+  	int			create)
+  {
+ -	return __xfs_get_blocks(inode, iblock, bh_result, create, true, false);
+ +	return __xfs_get_blocks(inode, iblock, bh_result, create, 1);
+  }
+  
+ -int
+ -xfs_get_blocks_dax_fault(
+ -	struct inode		*inode,
+ -	sector_t		iblock,
+ -	struct buffer_head	*bh_result,
+ -	int			create)
+ -{
+ -	return __xfs_get_blocks(inode, iblock, bh_result, create, true, true);
+ -}
+ -
+ -static void
+ -__xfs_end_io_direct_write(
+ -	struct inode		*inode,
+ -	struct xfs_ioend	*ioend,
+ +/*
+ + * Complete a direct I/O write request.
+ + *
+ + * If the private argument is non-NULL __xfs_get_blocks signals us that we
+ + * need to issue a transaction to convert the range from unwritten to written
+ + * extents.  In case this is regular synchronous I/O we just call xfs_end_io
+ + * to do this and we are done.  But in case this was a successful AIO
+ + * request this handler is called from interrupt context, from which we
+ + * can't start transactions.  In that case offload the I/O completion to
+ + * the workqueues we also use for buffered I/O completion.
+ + */
+ +STATIC void
+ +xfs_end_io_direct_write(
+ +	struct kiocb		*iocb,
+  	loff_t			offset,
+ -	ssize_t			size)
+ +	ssize_t			size,
+ +	void			*private,
+ +	int			ret,
+ +	bool			is_async)
+  {
+ -	struct xfs_mount	*mp = XFS_I(inode)->i_mount;
+ -
+ -	if (XFS_FORCED_SHUTDOWN(mp) || ioend->io_error)
+ -		goto out_end_io;
+ -
+ -	/*
+ -	 * dio completion end_io functions are only called on writes if more
+ -	 * than 0 bytes was written.
+ -	 */
+ -	ASSERT(size > 0);
+ -
+ -	/*
+ -	 * The ioend only maps whole blocks, while the IO may be sector aligned.
+ -	 * Hence the ioend offset/size may not match the IO offset/size exactly.
+ -	 * Because we don't map overwrites within EOF into the ioend, the offset
+ -	 * may not match, but only if the endio spans EOF.  Either way, write
+ -	 * the IO sizes into the ioend so that completion processing does the
+ -	 * right thing.
+ -	 */
+ -	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
+ -	ioend->io_size = size;
+ -	ioend->io_offset = offset;
+++<<<<<<< HEAD
+ +	struct xfs_ioend	*ioend = iocb->private;
+ +	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+ +	unsigned long		flags;
+  
+  	/*
+ -	 * The ioend tells us whether we are doing unwritten extent conversion
+ -	 * or an append transaction that updates the on-disk file size. These
+ -	 * cases are the only cases where we should *potentially* be needing
+ -	 * to update the VFS inode size.
+ -	 *
+ -	 * We need to update the in-core inode size here so that we don't end up
+ -	 * with the on-disk inode size being outside the in-core inode size. We
+ -	 * have no other method of updating EOF for AIO, so always do it here
+ -	 * if necessary.
+ +	 * While the generic direct I/O code updates the inode size, it does
+ +	 * so only after the end_io handler is called, which means our
+ +	 * end_io handler thinks the on-disk size is outside the in-core
+ +	 * size.  To prevent this just update it a little bit earlier here.
+  	 *
+  	 * We need to lock the test/set EOF update as we can be racing with
+  	 * other IO completions here to update the EOF. Failing to serialise
+  	 * here can result in EOF moving backwards and Bad Things Happen when
+  	 * that occurs.
+  	 */
+ -	spin_lock(&XFS_I(inode)->i_flags_lock);
+ -	if (offset + size > i_size_read(inode))
+ -		i_size_write(inode, offset + size);
+ -	spin_unlock(&XFS_I(inode)->i_flags_lock);
+ +	spin_lock_irqsave(&ip->i_size_lock, flags);
+ +	if (offset + size > i_size_read(ioend->io_inode))
+ +		i_size_write(ioend->io_inode, offset + size);
+ +	spin_unlock_irqrestore(&ip->i_size_lock, flags);
+  
+  	/*
+ -	 * If we are doing an append IO that needs to update the EOF on disk,
+ -	 * do the transaction reserve now so we can use common end io
+ -	 * processing. Stashing the error (if there is one) in the ioend will
+ -	 * result in the ioend processing passing on the error if it is
+ -	 * possible as we can't return it from here.
+ +	 * blockdev_direct_IO can return an error even after the I/O
+ +	 * completion handler was called.  Thus we need to protect
+ +	 * against double-freeing.
+  	 */
+ -	if (ioend->io_type == XFS_IO_OVERWRITE)
+ -		ioend->io_error = xfs_setfilesize_trans_alloc(ioend);
+ +	iocb->private = NULL;
+  
+ -out_end_io:
+ -	xfs_end_io(&ioend->io_work);
+ -	return;
+ -}
+ +	ioend->io_offset = offset;
+ +	ioend->io_size = size;
+ +	ioend->io_iocb = iocb;
+ +	ioend->io_result = ret;
+ +	if (private && size > 0)
+ +		ioend->io_type = XFS_IO_UNWRITTEN;
+  
+ -/*
+ - * Complete a direct I/O write request.
+ - *
+ - * The ioend structure is passed from __xfs_get_blocks() to tell us what to do.
+ - * If no ioend exists (i.e. @private == NULL) then the write IO is an overwrite
+ - * wholly within the EOF and so there is nothing for us to do. Note that in this
+ - * case the completion can be called in interrupt context, whereas if we have an
+ - * ioend we will always be called in task context (i.e. from a workqueue).
+ - */
+ -STATIC void
+ -xfs_end_io_direct_write(
+ -	struct kiocb		*iocb,
+ -	loff_t			offset,
+ -	ssize_t			size,
+ -	void			*private)
+ -{
+ +	if (is_async) {
+ +		ioend->io_isasync = 1;
+ +		xfs_finish_ioend(ioend);
+ +	} else {
+ +		xfs_finish_ioend_sync(ioend);
+ +	}
+++=======
++ 	struct inode		*inode = file_inode(iocb->ki_filp);
++ 	struct xfs_ioend	*ioend = private;
++ 
++ 	trace_xfs_gbmap_direct_endio(XFS_I(inode), offset, size,
++ 				     ioend ? ioend->io_type : 0, NULL);
++ 
++ 	if (!ioend) {
++ 		ASSERT(offset + size <= i_size_read(inode));
++ 		return;
++ 	}
++ 
++ 	__xfs_end_io_direct_write(inode, ioend, offset, size);
++ }
++ 
++ static inline ssize_t
++ xfs_vm_do_dio(
++ 	struct inode		*inode,
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*iter,
++ 	loff_t			offset,
++ 	void			(*endio)(struct kiocb	*iocb,
++ 					 loff_t		offset,
++ 					 ssize_t	size,
++ 					 void		*private),
++ 	int			flags)
++ {
++ 	struct block_device	*bdev;
++ 
++ 	if (IS_DAX(inode))
++ 		return dax_do_io(iocb, inode, iter, offset,
++ 				 xfs_get_blocks_direct, endio, 0);
++ 
++ 	bdev = xfs_find_bdev_for_inode(inode);
++ 	return  __blockdev_direct_IO(iocb, inode, bdev, iter, offset,
++ 				     xfs_get_blocks_direct, endio, NULL, flags);
+++>>>>>>> 01a155e6cf7d (xfs: DAX does not use IO completion callbacks)
+  }
+  
+  STATIC ssize_t
+diff --cc fs/xfs/xfs_aops.h
+index c325abb8d61a,f6ffc9ae5ceb..000000000000
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@@ -59,7 -53,13 +59,17 @@@ typedef struct xfs_ioend 
+  } xfs_ioend_t;
+  
+  extern const struct address_space_operations xfs_address_space_operations;
+++<<<<<<< HEAD
+ +extern int xfs_get_blocks(struct inode *, sector_t, struct buffer_head *, int);
+++=======
++ 
++ int	xfs_get_blocks(struct inode *inode, sector_t offset,
++ 		       struct buffer_head *map_bh, int create);
++ int	xfs_get_blocks_direct(struct inode *inode, sector_t offset,
++ 			      struct buffer_head *map_bh, int create);
++ int	xfs_get_blocks_dax_fault(struct inode *inode, sector_t offset,
++ 			         struct buffer_head *map_bh, int create);
+++>>>>>>> 01a155e6cf7d (xfs: DAX does not use IO completion callbacks)
+  
+  extern void xfs_count_page_state(struct page *, int *, int *);
+  
+diff --cc fs/xfs/xfs_file.c
+index ff72b4ea0a57,9c8eef7c57b4..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1562,21 -1493,102 +1562,110 @@@ xfs_filemap_page_mkwrite
+  	struct vm_area_struct	*vma,
+  	struct vm_fault		*vmf)
+  {
+ -	struct inode		*inode = file_inode(vma->vm_file);
+ +	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
+  	int			ret;
+  
+ -	trace_xfs_filemap_page_mkwrite(XFS_I(inode));
+ +	trace_xfs_filemap_page_mkwrite(ip);
+  
+ -	sb_start_pagefault(inode->i_sb);
+ +	sb_start_pagefault(VFS_I(ip)->i_sb);
+  	file_update_time(vma->vm_file);
+ -	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+ +	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
+  
+++<<<<<<< HEAD
+ +	ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
+++=======
++ 	if (IS_DAX(inode)) {
++ 		ret = __dax_mkwrite(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++ 	} else {
++ 		ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
++ 		ret = block_page_mkwrite_return(ret);
++ 	}
+++>>>>>>> 01a155e6cf7d (xfs: DAX does not use IO completion callbacks)
+  
+ -	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+ -	sb_end_pagefault(inode->i_sb);
+ +	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
+ +	sb_end_pagefault(VFS_I(ip)->i_sb);
+  
+++<<<<<<< HEAD
+ +	return block_page_mkwrite_return(ret);
+++=======
++ 	return ret;
++ }
++ 
++ STATIC int
++ xfs_filemap_fault(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	int			ret;
++ 
++ 	trace_xfs_filemap_fault(XFS_I(inode));
++ 
++ 	/* DAX can shortcut the normal fault path on write faults! */
++ 	if ((vmf->flags & FAULT_FLAG_WRITE) && IS_DAX(inode))
++ 		return xfs_filemap_page_mkwrite(vma, vmf);
++ 
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	if (IS_DAX(inode)) {
++ 		/*
++ 		 * we do not want to trigger unwritten extent conversion on read
++ 		 * faults - that is unnecessary overhead and would also require
++ 		 * changes to xfs_get_blocks_direct() to map unwritten extent
++ 		 * ioend for conversion on read-only mappings.
++ 		 */
++ 		ret = __dax_fault(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++ 	} else
++ 		ret = filemap_fault(vma, vmf);
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 
++ 	return ret;
++ }
++ 
++ STATIC int
++ xfs_filemap_pmd_fault(
++ 	struct vm_area_struct	*vma,
++ 	unsigned long		addr,
++ 	pmd_t			*pmd,
++ 	unsigned int		flags)
++ {
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	int			ret;
++ 
++ 	if (!IS_DAX(inode))
++ 		return VM_FAULT_FALLBACK;
++ 
++ 	trace_xfs_filemap_pmd_fault(ip);
++ 
++ 	sb_start_pagefault(inode->i_sb);
++ 	file_update_time(vma->vm_file);
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	ret = __dax_pmd_fault(vma, addr, pmd, flags, xfs_get_blocks_dax_fault,
++ 			      NULL);
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return ret;
++ }
++ 
++ static const struct vm_operations_struct xfs_file_vm_ops = {
++ 	.fault		= xfs_filemap_fault,
++ 	.pmd_fault	= xfs_filemap_pmd_fault,
++ 	.map_pages	= filemap_map_pages,
++ 	.page_mkwrite	= xfs_filemap_page_mkwrite,
++ };
++ 
++ STATIC int
++ xfs_file_mmap(
++ 	struct file	*filp,
++ 	struct vm_area_struct *vma)
++ {
++ 	file_accessed(filp);
++ 	vma->vm_ops = &xfs_file_vm_ops;
++ 	if (IS_DAX(file_inode(filp)))
++ 		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
++ 	return 0;
+++>>>>>>> 01a155e6cf7d (xfs: DAX does not use IO completion callbacks)
+  }
+  
+  const struct file_operations xfs_file_operations = {
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_aops.h
+* Unmerged path fs/xfs/xfs_file.c
