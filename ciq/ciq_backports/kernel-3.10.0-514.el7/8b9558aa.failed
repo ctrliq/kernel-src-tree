@@ -1,0 +1,310 @@
+libceph: use keepalive2 to verify the mon session is alive
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 8b9558aab853e98ba6e3fee0dd8545544966958c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8b9558aa.failed
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 8b9558aab853e98ba6e3fee0dd8545544966958c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/libceph.h
+#	net/ceph/ceph_common.c
+diff --cc include/linux/ceph/libceph.h
+index 08ebcf672b61,397c5cd09794..000000000000
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@@ -43,9 -43,10 +43,16 @@@ struct ceph_options 
+  	int flags;
+  	struct ceph_fsid fsid;
+  	struct ceph_entity_addr my_addr;
+++<<<<<<< HEAD
+ +	int mount_timeout;
+ +	int osd_idle_ttl;
+ +	int osd_keepalive_timeout;
+++=======
++ 	unsigned long mount_timeout;		/* jiffies */
++ 	unsigned long osd_idle_ttl;		/* jiffies */
++ 	unsigned long osd_keepalive_timeout;	/* jiffies */
++ 	unsigned long monc_ping_timeout;	/* jiffies */
+++>>>>>>> 8b9558aab853 (libceph: use keepalive2 to verify the mon session is alive)
+  
+  	/*
+  	 * any type that can't be simply compared or doesn't need need
+@@@ -63,9 -64,10 +70,16 @@@
+  /*
+   * defaults
+   */
+++<<<<<<< HEAD
+ +#define CEPH_MOUNT_TIMEOUT_DEFAULT  60
+ +#define CEPH_OSD_KEEPALIVE_DEFAULT  5
+ +#define CEPH_OSD_IDLE_TTL_DEFAULT    60
+++=======
++ #define CEPH_MOUNT_TIMEOUT_DEFAULT	msecs_to_jiffies(60 * 1000)
++ #define CEPH_OSD_KEEPALIVE_DEFAULT	msecs_to_jiffies(5 * 1000)
++ #define CEPH_OSD_IDLE_TTL_DEFAULT	msecs_to_jiffies(60 * 1000)
++ #define CEPH_MONC_PING_TIMEOUT_DEFAULT	msecs_to_jiffies(30 * 1000)
+++>>>>>>> 8b9558aab853 (libceph: use keepalive2 to verify the mon session is alive)
+  
+  #define CEPH_MSG_MAX_FRONT_LEN	(16*1024*1024)
+  #define CEPH_MSG_MAX_MIDDLE_LEN	(16*1024*1024)
+diff --cc net/ceph/ceph_common.c
+index 9807430864b1,3f56eefc2a07..000000000000
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@@ -352,8 -355,9 +352,14 @@@ ceph_parse_options(char *options, cons
+  	/* start with defaults */
+  	opt->flags = CEPH_OPT_DEFAULT;
+  	opt->osd_keepalive_timeout = CEPH_OSD_KEEPALIVE_DEFAULT;
+++<<<<<<< HEAD
+ +	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT; /* seconds */
+ +	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;   /* seconds */
+++=======
++ 	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT;
++ 	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;
++ 	opt->monc_ping_timeout = CEPH_MONC_PING_TIMEOUT_DEFAULT;
+++>>>>>>> 8b9558aab853 (libceph: use keepalive2 to verify the mon session is alive)
+  
+  	/* get mon ip(s) */
+  	/* ip1[:port1][,ip2[:port2]...] */
+* Unmerged path include/linux/ceph/libceph.h
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index 363d6b80443d..1fad7a2c6629 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -246,6 +246,8 @@ struct ceph_connection {
+ 	int in_base_pos;     /* bytes read */
+ 	__le64 in_temp_ack;  /* for reading an ack */
+ 
++	struct timespec last_keepalive_ack;
++
+ 	struct delayed_work work;	    /* send|recv work */
+ 	unsigned long       delay;          /* current delay interval */
+ };
+@@ -282,6 +284,8 @@ extern void ceph_msg_revoke(struct ceph_msg *msg);
+ extern void ceph_msg_revoke_incoming(struct ceph_msg *msg);
+ 
+ extern void ceph_con_keepalive(struct ceph_connection *con);
++extern bool ceph_con_keepalive_expired(struct ceph_connection *con,
++				       unsigned long interval);
+ 
+ extern void ceph_msg_data_add_pages(struct ceph_msg *msg, struct page **pages,
+ 				size_t length, size_t alignment);
+diff --git a/include/linux/ceph/msgr.h b/include/linux/ceph/msgr.h
+index 1c1887206ffa..0fe2656ac415 100644
+--- a/include/linux/ceph/msgr.h
++++ b/include/linux/ceph/msgr.h
+@@ -84,10 +84,12 @@ struct ceph_entity_inst {
+ #define CEPH_MSGR_TAG_MSG           7  /* message */
+ #define CEPH_MSGR_TAG_ACK           8  /* message ack */
+ #define CEPH_MSGR_TAG_KEEPALIVE     9  /* just a keepalive byte! */
+-#define CEPH_MSGR_TAG_BADPROTOVER  10  /* bad protocol version */
++#define CEPH_MSGR_TAG_BADPROTOVER   10 /* bad protocol version */
+ #define CEPH_MSGR_TAG_BADAUTHORIZER 11 /* bad authorizer */
+ #define CEPH_MSGR_TAG_FEATURES      12 /* insufficient features */
+ #define CEPH_MSGR_TAG_SEQ           13 /* 64-bit int follows with seen seq number */
++#define CEPH_MSGR_TAG_KEEPALIVE2    14 /* keepalive2 byte + ceph_timespec */
++#define CEPH_MSGR_TAG_KEEPALIVE2_ACK 15 /* keepalive2 reply */
+ 
+ 
+ /*
+* Unmerged path net/ceph/ceph_common.c
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index 91d6104dfc01..1abb05305b28 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -162,6 +162,7 @@ static struct kmem_cache	*ceph_msg_data_cache;
+ static char tag_msg = CEPH_MSGR_TAG_MSG;
+ static char tag_ack = CEPH_MSGR_TAG_ACK;
+ static char tag_keepalive = CEPH_MSGR_TAG_KEEPALIVE;
++static char tag_keepalive2 = CEPH_MSGR_TAG_KEEPALIVE2;
+ 
+ #ifdef CONFIG_LOCKDEP
+ static struct lock_class_key socket_class;
+@@ -1352,7 +1353,15 @@ static void prepare_write_keepalive(struct ceph_connection *con)
+ {
+ 	dout("prepare_write_keepalive %p\n", con);
+ 	con_out_kvec_reset(con);
+-	con_out_kvec_add(con, sizeof (tag_keepalive), &tag_keepalive);
++	if (con->peer_features & CEPH_FEATURE_MSGR_KEEPALIVE2) {
++		struct timespec ts = CURRENT_TIME;
++		struct ceph_timespec ceph_ts;
++		ceph_encode_timespec(&ceph_ts, &ts);
++		con_out_kvec_add(con, sizeof(tag_keepalive2), &tag_keepalive2);
++		con_out_kvec_add(con, sizeof(ceph_ts), &ceph_ts);
++	} else {
++		con_out_kvec_add(con, sizeof(tag_keepalive), &tag_keepalive);
++	}
+ 	con_flag_set(con, CON_FLAG_WRITE_PENDING);
+ }
+ 
+@@ -1626,6 +1635,12 @@ static void prepare_read_tag(struct ceph_connection *con)
+ 	con->in_tag = CEPH_MSGR_TAG_READY;
+ }
+ 
++static void prepare_read_keepalive_ack(struct ceph_connection *con)
++{
++	dout("prepare_read_keepalive_ack %p\n", con);
++	con->in_base_pos = 0;
++}
++
+ /*
+  * Prepare to read a message.
+  */
+@@ -2458,6 +2473,17 @@ static void process_message(struct ceph_connection *con)
+ 	mutex_lock(&con->mutex);
+ }
+ 
++static int read_keepalive_ack(struct ceph_connection *con)
++{
++	struct ceph_timespec ceph_ts;
++	size_t size = sizeof(ceph_ts);
++	int ret = read_partial(con, size, size, &ceph_ts);
++	if (ret <= 0)
++		return ret;
++	ceph_decode_timespec(&con->last_keepalive_ack, &ceph_ts);
++	prepare_read_tag(con);
++	return 1;
++}
+ 
+ /*
+  * Write something to the socket.  Called in a worker thread when the
+@@ -2527,6 +2553,10 @@ more_kvec:
+ 
+ do_next:
+ 	if (con->state == CON_STATE_OPEN) {
++		if (con_flag_test_and_clear(con, CON_FLAG_KEEPALIVE_PENDING)) {
++			prepare_write_keepalive(con);
++			goto more;
++		}
+ 		/* is anything else pending? */
+ 		if (!list_empty(&con->out_queue)) {
+ 			prepare_write_message(con);
+@@ -2536,10 +2566,6 @@ do_next:
+ 			prepare_write_ack(con);
+ 			goto more;
+ 		}
+-		if (con_flag_test_and_clear(con, CON_FLAG_KEEPALIVE_PENDING)) {
+-			prepare_write_keepalive(con);
+-			goto more;
+-		}
+ 	}
+ 
+ 	/* Nothing to do! */
+@@ -2642,6 +2668,9 @@ more:
+ 		case CEPH_MSGR_TAG_ACK:
+ 			prepare_read_ack(con);
+ 			break;
++		case CEPH_MSGR_TAG_KEEPALIVE2_ACK:
++			prepare_read_keepalive_ack(con);
++			break;
+ 		case CEPH_MSGR_TAG_CLOSE:
+ 			con_close_socket(con);
+ 			con->state = CON_STATE_CLOSED;
+@@ -2685,6 +2714,12 @@ more:
+ 		process_ack(con);
+ 		goto more;
+ 	}
++	if (con->in_tag == CEPH_MSGR_TAG_KEEPALIVE2_ACK) {
++		ret = read_keepalive_ack(con);
++		if (ret <= 0)
++			goto out;
++		goto more;
++	}
+ 
+ out:
+ 	dout("try_read done on %p ret %d\n", con, ret);
+@@ -3095,6 +3130,20 @@ void ceph_con_keepalive(struct ceph_connection *con)
+ }
+ EXPORT_SYMBOL(ceph_con_keepalive);
+ 
++bool ceph_con_keepalive_expired(struct ceph_connection *con,
++			       unsigned long interval)
++{
++	if (interval > 0 &&
++	    (con->peer_features & CEPH_FEATURE_MSGR_KEEPALIVE2)) {
++		struct timespec now = CURRENT_TIME;
++		struct timespec ts;
++		jiffies_to_timespec(interval, &ts);
++		ts = timespec_add(con->last_keepalive_ack, ts);
++		return timespec_compare(&now, &ts) >= 0;
++	}
++	return false;
++}
++
+ static struct ceph_msg_data *ceph_msg_data_create(enum ceph_msg_data_type type)
+ {
+ 	struct ceph_msg_data *data;
+diff --git a/net/ceph/mon_client.c b/net/ceph/mon_client.c
+index 2b3cf05e87b0..06b7374a9cbd 100644
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@ -149,6 +149,10 @@ static int __open_session(struct ceph_mon_client *monc)
+ 			      CEPH_ENTITY_TYPE_MON, monc->cur_mon,
+ 			      &monc->monmap->mon_inst[monc->cur_mon].addr);
+ 
++		/* send an initial keepalive to ensure our timestamp is
++		 * valid by the time we are in an OPENED state */
++		ceph_con_keepalive(&monc->con);
++
+ 		/* initiatiate authentication handshake */
+ 		ret = ceph_auth_build_hello(monc->auth,
+ 					    monc->m_auth->front.iov_base,
+@@ -170,14 +174,19 @@ static bool __sub_expired(struct ceph_mon_client *monc)
+  */
+ static void __schedule_delayed(struct ceph_mon_client *monc)
+ {
+-	unsigned int delay;
++	struct ceph_options *opt = monc->client->options;
++	unsigned long delay;
+ 
+-	if (monc->cur_mon < 0 || __sub_expired(monc))
++	if (monc->cur_mon < 0 || __sub_expired(monc)) {
+ 		delay = 10 * HZ;
+-	else
++	} else {
+ 		delay = 20 * HZ;
+-	dout("__schedule_delayed after %u\n", delay);
+-	schedule_delayed_work(&monc->delayed_work, delay);
++		if (opt->monc_ping_timeout > 0)
++			delay = min(delay, opt->monc_ping_timeout / 3);
++	}
++	dout("__schedule_delayed after %lu\n", delay);
++	schedule_delayed_work(&monc->delayed_work,
++			      round_jiffies_relative(delay));
+ }
+ 
+ /*
+@@ -736,11 +745,23 @@ static void delayed_work(struct work_struct *work)
+ 		__close_session(monc);
+ 		__open_session(monc);  /* continue hunting */
+ 	} else {
+-		ceph_con_keepalive(&monc->con);
++		struct ceph_options *opt = monc->client->options;
++		int is_auth = ceph_auth_is_authenticated(monc->auth);
++		if (ceph_con_keepalive_expired(&monc->con,
++					       opt->monc_ping_timeout)) {
++			dout("monc keepalive timeout\n");
++			is_auth = 0;
++			__close_session(monc);
++			monc->hunting = true;
++			__open_session(monc);
++		}
+ 
+-		__validate_auth(monc);
++		if (!monc->hunting) {
++			ceph_con_keepalive(&monc->con);
++			__validate_auth(monc);
++		}
+ 
+-		if (ceph_auth_is_authenticated(monc->auth))
++		if (is_auth)
+ 			__send_subscribe(monc);
+ 	}
+ 	__schedule_delayed(monc);
