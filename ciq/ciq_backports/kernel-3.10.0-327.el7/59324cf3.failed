@@ -1,0 +1,266 @@
+netlink: allow to listen "all" netns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 59324cf35aba5336b611074028777838a963d03b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/59324cf3.failed
+
+More accurately, listen all netns that have a nsid assigned into the netns
+where the netlink socket is opened.
+For this purpose, a netlink socket option is added:
+NETLINK_LISTEN_ALL_NSID. When this option is set on a netlink socket, this
+socket will receive netlink notifications from all netns that have a nsid
+assigned into the netns where the socket has been opened. The nsid is sent
+to userland via an anscillary data.
+
+With this patch, a daemon needs only one socket to listen many netns. This
+is useful when the number of netns is high.
+
+Because 0 is a valid value for a nsid, the field nsid_is_set indicates if
+the field nsid is valid or not. skb->cb is initialized to 0 on skb
+allocation, thus we are sure that we will never send a nsid 0 by error to
+the userland.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 59324cf35aba5336b611074028777838a963d03b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/net_namespace.h
+#	net/core/net_namespace.c
+#	net/netlink/af_netlink.c
+diff --cc include/net/net_namespace.h
+index 385ac027c602,3f850acc844e..000000000000
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@@ -288,6 -271,11 +288,14 @@@ static inline struct net *read_pnet(str
+  #define __net_initconst	__initconst
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ int peernet2id_alloc(struct net *net, struct net *peer);
++ int peernet2id(struct net *net, struct net *peer);
++ bool peernet_has_id(struct net *net, struct net *peer);
++ struct net *get_net_ns_by_id(struct net *net, int id);
++ 
+++>>>>>>> 59324cf35aba (netlink: allow to listen "all" netns)
+  struct pernet_operations {
+  	struct list_head list;
+  	int (*init)(struct net *net);
+diff --cc net/core/net_namespace.c
+index 4cf6699528f0,a665bf490c88..000000000000
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@@ -144,6 -148,125 +144,128 @@@ static void ops_free_list(const struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* should be called with nsid_lock held */
++ static int alloc_netid(struct net *net, struct net *peer, int reqid)
++ {
++ 	int min = 0, max = 0;
++ 
++ 	if (reqid >= 0) {
++ 		min = reqid;
++ 		max = reqid + 1;
++ 	}
++ 
++ 	return idr_alloc(&net->netns_ids, peer, min, max, GFP_ATOMIC);
++ }
++ 
++ /* This function is used by idr_for_each(). If net is equal to peer, the
++  * function returns the id so that idr_for_each() stops. Because we cannot
++  * returns the id 0 (idr_for_each() will not stop), we return the magic value
++  * NET_ID_ZERO (-1) for it.
++  */
++ #define NET_ID_ZERO -1
++ static int net_eq_idr(int id, void *net, void *peer)
++ {
++ 	if (net_eq(net, peer))
++ 		return id ? : NET_ID_ZERO;
++ 	return 0;
++ }
++ 
++ /* Should be called with nsid_lock held. If a new id is assigned, the bool alloc
++  * is set to true, thus the caller knows that the new id must be notified via
++  * rtnl.
++  */
++ static int __peernet2id_alloc(struct net *net, struct net *peer, bool *alloc)
++ {
++ 	int id = idr_for_each(&net->netns_ids, net_eq_idr, peer);
++ 	bool alloc_it = *alloc;
++ 
++ 	*alloc = false;
++ 
++ 	/* Magic value for id 0. */
++ 	if (id == NET_ID_ZERO)
++ 		return 0;
++ 	if (id > 0)
++ 		return id;
++ 
++ 	if (alloc_it) {
++ 		id = alloc_netid(net, peer, -1);
++ 		*alloc = true;
++ 		return id >= 0 ? id : NETNSA_NSID_NOT_ASSIGNED;
++ 	}
++ 
++ 	return NETNSA_NSID_NOT_ASSIGNED;
++ }
++ 
++ /* should be called with nsid_lock held */
++ static int __peernet2id(struct net *net, struct net *peer)
++ {
++ 	bool no = false;
++ 
++ 	return __peernet2id_alloc(net, peer, &no);
++ }
++ 
++ static void rtnl_net_notifyid(struct net *net, int cmd, int id);
++ /* This function returns the id of a peer netns. If no id is assigned, one will
++  * be allocated and returned.
++  */
++ int peernet2id_alloc(struct net *net, struct net *peer)
++ {
++ 	unsigned long flags;
++ 	bool alloc;
++ 	int id;
++ 
++ 	spin_lock_irqsave(&nsid_lock, flags);
++ 	alloc = atomic_read(&peer->count) == 0 ? false : true;
++ 	id = __peernet2id_alloc(net, peer, &alloc);
++ 	spin_unlock_irqrestore(&nsid_lock, flags);
++ 	if (alloc && id >= 0)
++ 		rtnl_net_notifyid(net, RTM_NEWNSID, id);
++ 	return id;
++ }
++ EXPORT_SYMBOL(peernet2id_alloc);
++ 
++ /* This function returns, if assigned, the id of a peer netns. */
++ int peernet2id(struct net *net, struct net *peer)
++ {
++ 	unsigned long flags;
++ 	int id;
++ 
++ 	spin_lock_irqsave(&nsid_lock, flags);
++ 	id = __peernet2id(net, peer);
++ 	spin_unlock_irqrestore(&nsid_lock, flags);
++ 	return id;
++ }
++ 
++ /* This function returns true is the peer netns has an id assigned into the
++  * current netns.
++  */
++ bool peernet_has_id(struct net *net, struct net *peer)
++ {
++ 	return peernet2id(net, peer) >= 0;
++ }
++ 
++ struct net *get_net_ns_by_id(struct net *net, int id)
++ {
++ 	unsigned long flags;
++ 	struct net *peer;
++ 
++ 	if (id < 0)
++ 		return NULL;
++ 
++ 	rcu_read_lock();
++ 	spin_lock_irqsave(&nsid_lock, flags);
++ 	peer = idr_find(&net->netns_ids, id);
++ 	if (peer)
++ 		get_net(peer);
++ 	spin_unlock_irqrestore(&nsid_lock, flags);
++ 	rcu_read_unlock();
++ 
++ 	return peer;
++ }
++ 
+++>>>>>>> 59324cf35aba (netlink: allow to listen "all" netns)
+  /*
+   * setup_net runs the initializers for the network namespace object.
+   */
+diff --cc net/netlink/af_netlink.c
+index 23140567c3d3,a5fff75accf8..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -2228,13 -2298,21 +2258,27 @@@ static void netlink_cmsg_recv_pktinfo(s
+  	put_cmsg(msg, SOL_NETLINK, NETLINK_PKTINFO, sizeof(info), &info);
+  }
+  
+++<<<<<<< HEAD
+ +static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+ +			   struct msghdr *msg, size_t len)
+++=======
++ static void netlink_cmsg_listen_all_nsid(struct sock *sk, struct msghdr *msg,
++ 					 struct sk_buff *skb)
++ {
++ 	if (!NETLINK_CB(skb).nsid_is_set)
++ 		return;
++ 
++ 	put_cmsg(msg, SOL_NETLINK, NETLINK_LISTEN_ALL_NSID, sizeof(int),
++ 		 &NETLINK_CB(skb).nsid);
++ }
++ 
++ static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+++>>>>>>> 59324cf35aba (netlink: allow to listen "all" netns)
+  {
+ +	struct sock_iocb *siocb = kiocb_to_siocb(kiocb);
+  	struct sock *sk = sock->sk;
+  	struct netlink_sock *nlk = nlk_sk(sk);
+ -	DECLARE_SOCKADDR(struct sockaddr_nl *, addr, msg->msg_name);
+ +	struct sockaddr_nl *addr = msg->msg_name;
+  	u32 dst_portid;
+  	u32 dst_group;
+  	struct sk_buff *skb;
+@@@ -2383,12 -2461,11 +2427,14 @@@ static int netlink_recvmsg(struct kioc
+  
+  	if (nlk->flags & NETLINK_F_RECV_PKTINFO)
+  		netlink_cmsg_recv_pktinfo(msg, skb);
++ 	if (nlk->flags & NETLINK_F_LISTEN_ALL_NSID)
++ 		netlink_cmsg_listen_all_nsid(sk, msg, skb);
+  
+ -	memset(&scm, 0, sizeof(scm));
+ -	scm.creds = *NETLINK_CREDS(skb);
+ +	if (NULL == siocb->scm) {
+ +		memset(&scm, 0, sizeof(scm));
+ +		siocb->scm = &scm;
+ +	}
+ +	siocb->scm->creds = *NETLINK_CREDS(skb);
+  	if (flags & MSG_TRUNC)
+  		copied = data_skb->len;
+  
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index 8b50a62ef98b..076b75cbf6e5 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -28,6 +28,8 @@ struct netlink_skb_parms {
+ 	__u32			dst_group;
+ 	__u32			flags;
+ 	struct sock		*sk;
++	bool			nsid_is_set;
++	int			nsid;
+ };
+ 
+ #define NETLINK_CB(skb)		(*(struct netlink_skb_parms*)&((skb)->cb))
+* Unmerged path include/net/net_namespace.h
+diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
+index 1a85940f8ab7..3e34b7d702f8 100644
+--- a/include/uapi/linux/netlink.h
++++ b/include/uapi/linux/netlink.h
+@@ -108,6 +108,7 @@ struct nlmsgerr {
+ #define NETLINK_NO_ENOBUFS	5
+ #define NETLINK_RX_RING		6
+ #define NETLINK_TX_RING		7
++#define NETLINK_LISTEN_ALL_NSID	8
+ 
+ struct nl_pktinfo {
+ 	__u32	group;
+* Unmerged path net/core/net_namespace.c
+* Unmerged path net/netlink/af_netlink.c
