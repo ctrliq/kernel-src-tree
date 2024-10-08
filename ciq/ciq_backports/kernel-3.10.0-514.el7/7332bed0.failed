@@ -1,0 +1,401 @@
+IB/iser: Chain all iser transaction send work requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 7332bed085c68fc76462583a1003c6dca2c31e11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7332bed0.failed
+
+Chaning of send work requests benefits performance by
+reducing the send queue lock contention (acquired in
+ib_post_send) and saves us HW doorbells which is posted
+only once.
+
+Currently, in normal IO flows iser does not chain the CDB send
+work request with the registration work request. Also in PI
+flows, signature work requests are not chained as well.
+
+Lets chain those and post only once.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 7332bed085c68fc76462583a1003c6dca2c31e11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_memory.c
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index cfe91d24f96b,09640c811fdd..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -752,38 -691,28 +752,34 @@@ iser_reg_sig_mr(struct iscsi_iser_task 
+  	if (ret)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	ret = iser_set_prot_checks(iser_task->sc, &sig_attrs.check_mask);
+ +	if (ret)
+ +		goto err;
+++=======
++ 	iser_set_prot_checks(iser_task->sc, &sig_attrs->check_mask);
+++>>>>>>> 7332bed085c6 (IB/iser: Chain all iser transaction send work requests)
+  
+  	if (!pi_ctx->sig_mr_valid) {
+- 		iser_inv_rkey(&inv_wr, pi_ctx->sig_mr);
+- 		wr = &inv_wr;
++ 		wr = iser_tx_next_wr(tx_desc);
++ 		iser_inv_rkey(wr, pi_ctx->sig_mr);
+  	}
+  
+- 	memset(&sig_wr, 0, sizeof(sig_wr));
+- 	sig_wr.opcode = IB_WR_REG_SIG_MR;
+- 	sig_wr.wr_id = ISER_FASTREG_LI_WRID;
+- 	sig_wr.sg_list = &data_reg->sge;
+- 	sig_wr.num_sge = 1;
+- 	sig_wr.wr.sig_handover.sig_attrs = &sig_attrs;
+- 	sig_wr.wr.sig_handover.sig_mr = pi_ctx->sig_mr;
++ 	wr = iser_tx_next_wr(tx_desc);
++ 	wr->opcode = IB_WR_REG_SIG_MR;
++ 	wr->wr_id = ISER_FASTREG_LI_WRID;
++ 	wr->sg_list = &data_reg->sge;
++ 	wr->num_sge = 1;
++ 	wr->send_flags = 0;
++ 	wr->wr.sig_handover.sig_attrs = sig_attrs;
++ 	wr->wr.sig_handover.sig_mr = pi_ctx->sig_mr;
+  	if (scsi_prot_sg_count(iser_task->sc))
+- 		sig_wr.wr.sig_handover.prot = &prot_reg->sge;
+- 	sig_wr.wr.sig_handover.access_flags = IB_ACCESS_LOCAL_WRITE |
+- 					      IB_ACCESS_REMOTE_READ |
+- 					      IB_ACCESS_REMOTE_WRITE;
+- 
+- 	if (!wr)
+- 		wr = &sig_wr;
++ 		wr->wr.sig_handover.prot = &prot_reg->sge;
+  	else
+- 		wr->next = &sig_wr;
+- 
+- 	ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+- 	if (ret) {
+- 		iser_err("reg_sig_mr failed, ret:%d\n", ret);
+- 		goto err;
+- 	}
++ 		wr->wr.sig_handover.prot = NULL;
++ 	wr->wr.sig_handover.access_flags = IB_ACCESS_LOCAL_WRITE |
++ 					   IB_ACCESS_REMOTE_READ |
++ 					   IB_ACCESS_REMOTE_WRITE;
+  	pi_ctx->sig_mr_valid = 0;
+  
+  	sig_reg->sge.lkey = pi_ctx->sig_mr->lkey;
+@@@ -805,18 -734,11 +801,26 @@@ static int iser_fast_reg_mr(struct iscs
+  {
+  	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+  	struct iser_device *device = ib_conn->device;
+++<<<<<<< HEAD
+ +	struct ib_mr *mr;
+ +	struct ib_fast_reg_page_list *frpl;
+ +	struct ib_send_wr fastreg_wr, inv_wr;
+ +	struct ib_send_wr *bad_wr, *wr = NULL;
+ +	int ret, offset, size, plen;
+++=======
++ 	struct ib_mr *mr = rsc->mr;
++ 	struct ib_fast_reg_page_list *frpl = rsc->frpl;
++ 	struct iser_tx_desc *tx_desc = &iser_task->desc;
++ 	struct ib_send_wr *wr;
++ 	int offset, size, plen;
+++>>>>>>> 7332bed085c6 (IB/iser: Chain all iser transaction send work requests)
+ +
+ +	/* if there a single dma entry, dma mr suffices */
+ +	if (mem->dma_nents == 1)
+ +		return iser_reg_dma(device, mem, reg);
+ +
+ +	mr = rsc->mr;
+ +	frpl = rsc->frpl;
+  
+  	plen = iser_sg_to_page_vec(mem, device->ib_device, frpl->page_list,
+  				   &offset, &size);
+@@@ -865,74 -776,106 +858,154 @@@
+  		 " length=0x%x\n", reg->sge.lkey, reg->rkey,
+  		 reg->sge.addr, reg->sge.length);
+  
+- 	return ret;
++ 	return 0;
+  }
+  
+ -static int
+ -iser_handle_unaligned_buf(struct iscsi_iser_task *task,
+ -			  struct iser_data_buf *mem,
+ -			  enum iser_data_dir dir)
+ +/**
+ + * iser_reg_rdma_mem_fastreg - Registers memory intended for RDMA,
+ + * using Fast Registration WR (if possible) obtaining rkey and va
+ + *
+ + * returns 0 on success, errno code on failure
+ + */
+ +int iser_reg_rdma_mem_fastreg(struct iscsi_iser_task *iser_task,
+ +			      enum iser_data_dir cmd_dir)
+  {
+ -	struct iser_conn *iser_conn = task->iser_conn;
+ -	struct iser_device *device = iser_conn->ib_conn.device;
+ +	struct ib_conn *ib_conn = &iser_task->iser_conn->ib_conn;
+ +	struct iser_device *device = ib_conn->device;
+ +	struct ib_device *ibdev = device->ib_device;
+ +	struct iser_data_buf *mem = &iser_task->data[cmd_dir];
+ +	struct iser_mem_reg *mem_reg = &iser_task->rdma_reg[cmd_dir];
+ +	struct iser_fr_desc *desc = NULL;
+  	int err, aligned_len;
+  
+ -	aligned_len = iser_data_buf_aligned_len(mem, device->ib_device,
+ -						iser_conn->scsi_sg_tablesize);
+ +	aligned_len = iser_data_buf_aligned_len(mem, ibdev);
+  	if (aligned_len != mem->dma_nents) {
+ -		err = fall_to_bounce_buf(task, mem, dir);
+ -		if (err)
+ +		err = fall_to_bounce_buf(iser_task, mem, cmd_dir);
+ +		if (err) {
+ +			iser_err("failed to allocate bounce buffer\n");
+  			return err;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ static int
++ iser_reg_prot_sg(struct iscsi_iser_task *task,
++ 		 struct iser_data_buf *mem,
++ 		 struct iser_fr_desc *desc,
++ 		 struct iser_mem_reg *reg)
++ {
++ 	struct iser_device *device = task->iser_conn->ib_conn.device;
++ 
++ 	if (mem->dma_nents == 1)
++ 		return iser_reg_dma(device, mem, reg);
++ 
++ 	return device->reg_ops->reg_mem(task, mem, &desc->pi_ctx->rsc, reg);
++ }
++ 
++ static int
++ iser_reg_data_sg(struct iscsi_iser_task *task,
++ 		 struct iser_data_buf *mem,
++ 		 struct iser_fr_desc *desc,
++ 		 struct iser_mem_reg *reg)
++ {
++ 	struct iser_device *device = task->iser_conn->ib_conn.device;
++ 
++ 	if (mem->dma_nents == 1)
++ 		return iser_reg_dma(device, mem, reg);
++ 
++ 	return device->reg_ops->reg_mem(task, mem, &desc->rsc, reg);
++ }
++ 
++ int iser_reg_rdma_mem(struct iscsi_iser_task *task,
++ 		      enum iser_data_dir dir)
++ {
++ 	struct ib_conn *ib_conn = &task->iser_conn->ib_conn;
++ 	struct iser_device *device = ib_conn->device;
++ 	struct iser_data_buf *mem = &task->data[dir];
++ 	struct iser_mem_reg *reg = &task->rdma_reg[dir];
++ 	struct iser_mem_reg *data_reg;
++ 	struct iser_fr_desc *desc = NULL;
++ 	int err;
++ 
++ 	err = iser_handle_unaligned_buf(task, mem, dir);
++ 	if (unlikely(err))
++ 		return err;
++ 
+++>>>>>>> 7332bed085c6 (IB/iser: Chain all iser transaction send work requests)
+  	if (mem->dma_nents != 1 ||
+ -	    scsi_get_prot_op(task->sc) != SCSI_PROT_NORMAL) {
+ +	    scsi_get_prot_op(iser_task->sc) != SCSI_PROT_NORMAL) {
+  		desc = device->reg_ops->reg_desc_get(ib_conn);
+ -		reg->mem_h = desc;
+ +		mem_reg->mem_h = desc;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iser_fast_reg_mr(iser_task, mem,
+ +			       desc ? &desc->rsc : NULL, mem_reg);
+ +	if (err)
+ +		goto err_reg;
+ +
+ +	if (scsi_get_prot_op(iser_task->sc) != SCSI_PROT_NORMAL) {
+ +		struct iser_mem_reg prot_reg;
+ +
+ +		memset(&prot_reg, 0, sizeof(prot_reg));
+ +		if (scsi_prot_sg_count(iser_task->sc)) {
+ +			mem = &iser_task->prot[cmd_dir];
+ +			aligned_len = iser_data_buf_aligned_len(mem, ibdev);
+ +			if (aligned_len != mem->dma_nents) {
+ +				err = fall_to_bounce_buf(iser_task, mem,
+ +							 cmd_dir);
+ +				if (err) {
+ +					iser_err("failed to allocate bounce buffer\n");
+ +					return err;
+ +				}
+ +			}
+ +
+ +			err = iser_fast_reg_mr(iser_task, mem,
+ +					       &desc->pi_ctx->rsc, &prot_reg);
+ +			if (err)
+ +				goto err_reg;
+ +		}
+ +
+ +		err = iser_reg_sig_mr(iser_task, desc->pi_ctx, mem_reg,
+ +				      &prot_reg, mem_reg);
+ +		if (err) {
+ +			iser_err("Failed to register signature mr\n");
+ +			return err;
+ +		}
+++=======
++ 	if (scsi_get_prot_op(task->sc) == SCSI_PROT_NORMAL)
++ 		data_reg = reg;
++ 	else
++ 		data_reg = &task->desc.data_reg;
++ 
++ 	err = iser_reg_data_sg(task, mem, desc, data_reg);
++ 	if (unlikely(err))
++ 		goto err_reg;
++ 
++ 	if (scsi_get_prot_op(task->sc) != SCSI_PROT_NORMAL) {
++ 		struct iser_mem_reg *prot_reg = &task->desc.prot_reg;
++ 
++ 		if (scsi_prot_sg_count(task->sc)) {
++ 			mem = &task->prot[dir];
++ 			err = iser_handle_unaligned_buf(task, mem, dir);
++ 			if (unlikely(err))
++ 				goto err_reg;
++ 
++ 			err = iser_reg_prot_sg(task, mem, desc, prot_reg);
++ 			if (unlikely(err))
++ 				goto err_reg;
++ 		}
++ 
++ 		err = iser_reg_sig_mr(task, desc->pi_ctx, data_reg,
++ 				      prot_reg, reg);
++ 		if (unlikely(err))
++ 			goto err_reg;
++ 
+++>>>>>>> 7332bed085c6 (IB/iser: Chain all iser transaction send work requests)
+  		desc->pi_ctx->sig_protected = 1;
+  	}
+  
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index 0bfb7fbb2197..14d5a07c9ad6 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -201,6 +201,7 @@ iser_initialize_task_headers(struct iscsi_task *task,
+ 		goto out;
+ 	}
+ 
++	tx_desc->wr_idx = 0;
+ 	tx_desc->mapped = true;
+ 	tx_desc->dma_addr = dma_addr;
+ 	tx_desc->tx_sg[0].addr   = tx_desc->dma_addr;
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index b9dc02d4dd14..5ef5d2179dfe 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -259,6 +259,14 @@ enum iser_desc_type {
+ 	ISCSI_TX_DATAOUT
+ };
+ 
++/* Maximum number of work requests per task:
++ * Data memory region local invalidate + fast registration
++ * Protection memory region local invalidate + fast registration
++ * Signature memory region local invalidate + fast registration
++ * PDU send
++ */
++#define ISER_MAX_WRS 7
++
+ /**
+  * struct iser_tx_desc - iSER TX descriptor (for send wr_id)
+  *
+@@ -271,6 +279,11 @@ enum iser_desc_type {
+  *                 unsolicited data-out or control
+  * @num_sge:       number sges used on this TX task
+  * @mapped:        Is the task header mapped
++ * @wr_idx:        Current WR index
++ * @wrs:           Array of WRs per task
++ * @data_reg:      Data buffer registration details
++ * @prot_reg:      Protection buffer registration details
++ * @sig_attrs:     Signature attributes
+  */
+ struct iser_tx_desc {
+ 	struct iser_hdr              iser_header;
+@@ -280,6 +293,11 @@ struct iser_tx_desc {
+ 	struct ib_sge		     tx_sg[2];
+ 	int                          num_sge;
+ 	bool			     mapped;
++	u8                           wr_idx;
++	struct ib_send_wr            wrs[ISER_MAX_WRS];
++	struct iser_mem_reg          data_reg;
++	struct iser_mem_reg          prot_reg;
++	struct ib_sig_attrs          sig_attrs;
+ };
+ 
+ #define ISER_RX_PAD_SIZE	(256 - (ISER_RX_PAYLOAD_SIZE + \
+@@ -676,4 +694,20 @@ iser_reg_desc_get_fmr(struct ib_conn *ib_conn);
+ void
+ iser_reg_desc_put_fmr(struct ib_conn *ib_conn,
+ 		      struct iser_fr_desc *desc);
++
++static inline struct ib_send_wr *
++iser_tx_next_wr(struct iser_tx_desc *tx_desc)
++{
++	struct ib_send_wr *cur_wr = &tx_desc->wrs[tx_desc->wr_idx];
++	struct ib_send_wr *last_wr;
++
++	if (tx_desc->wr_idx) {
++		last_wr = &tx_desc->wrs[tx_desc->wr_idx - 1];
++		last_wr->next = cur_wr;
++	}
++	tx_desc->wr_idx++;
++
++	return cur_wr;
++}
++
+ #endif
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 3c2e44e4edb0..def25a4e20a2 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -1090,23 +1090,24 @@ int iser_post_recvm(struct iser_conn *iser_conn, int count)
+ int iser_post_send(struct ib_conn *ib_conn, struct iser_tx_desc *tx_desc,
+ 		   bool signal)
+ {
+-	int		  ib_ret;
+-	struct ib_send_wr send_wr, *send_wr_failed;
++	struct ib_send_wr *bad_wr, *wr = iser_tx_next_wr(tx_desc);
++	int ib_ret;
+ 
+ 	ib_dma_sync_single_for_device(ib_conn->device->ib_device,
+ 				      tx_desc->dma_addr, ISER_HEADERS_LEN,
+ 				      DMA_TO_DEVICE);
+ 
+-	send_wr.next	   = NULL;
+-	send_wr.wr_id	   = (uintptr_t)tx_desc;
+-	send_wr.sg_list	   = tx_desc->tx_sg;
+-	send_wr.num_sge	   = tx_desc->num_sge;
+-	send_wr.opcode	   = IB_WR_SEND;
+-	send_wr.send_flags = signal ? IB_SEND_SIGNALED : 0;
++	wr->next = NULL;
++	wr->wr_id = (uintptr_t)tx_desc;
++	wr->sg_list = tx_desc->tx_sg;
++	wr->num_sge = tx_desc->num_sge;
++	wr->opcode = IB_WR_SEND;
++	wr->send_flags = signal ? IB_SEND_SIGNALED : 0;
+ 
+-	ib_ret = ib_post_send(ib_conn->qp, &send_wr, &send_wr_failed);
++	ib_ret = ib_post_send(ib_conn->qp, &tx_desc->wrs[0], &bad_wr);
+ 	if (ib_ret)
+-		iser_err("ib_post_send failed, ret:%d\n", ib_ret);
++		iser_err("ib_post_send failed, ret:%d opcode:%d\n",
++			 ib_ret, bad_wr->opcode);
+ 
+ 	return ib_ret;
+ }
