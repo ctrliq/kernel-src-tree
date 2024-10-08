@@ -1,0 +1,288 @@
+mm, hugetlb: use memory policy when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] hugetlb: use memory policy when available (Dave Anderson) [1274624]
+Rebuild_FUZZ: 95.35%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 099730d67417dfee273e9b10ac2560ca7fac7eb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/099730d6.failed
+
+I have a hugetlbfs user which is never explicitly allocating huge pages
+with 'nr_hugepages'.  They only set 'nr_overcommit_hugepages' and then let
+the pages be allocated from the buddy allocator at fault time.
+
+This works, but they noticed that mbind() was not doing them any good and
+the pages were being allocated without respect for the policy they
+specified.
+
+The code in question is this:
+
+> struct page *alloc_huge_page(struct vm_area_struct *vma,
+...
+>         page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
+>         if (!page) {
+>                 page = alloc_buddy_huge_page(h, NUMA_NO_NODE);
+
+dequeue_huge_page_vma() is smart and will respect the VMA's memory policy.
+ But, it only grabs _existing_ huge pages from the huge page pool.  If the
+pool is empty, we fall back to alloc_buddy_huge_page() which obviously
+can't do anything with the VMA's policy because it isn't even passed the
+VMA.
+
+Almost everybody preallocates huge pages.  That's probably why nobody has
+ever noticed this.  Looking back at the git history, I don't think this
+_ever_ worked from when alloc_buddy_huge_page() was introduced in
+7893d1d5, 8 years ago.
+
+The fix is to pass vma/addr down in to the places where we actually call
+in to the buddy allocator.  It's fairly straightforward plumbing.  This
+has been lightly tested.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 099730d67417dfee273e9b10ac2560ca7fac7eb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 71d89b84e581,899f6a81e77a..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1068,7 -1402,111 +1068,115 @@@ static int free_pool_huge_page(struct h
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static struct page *alloc_buddy_huge_page(struct hstate *h, int nid)
+++=======
++ /*
++  * Dissolve a given free hugepage into free buddy pages. This function does
++  * nothing for in-use (including surplus) hugepages.
++  */
++ static void dissolve_free_huge_page(struct page *page)
++ {
++ 	spin_lock(&hugetlb_lock);
++ 	if (PageHuge(page) && !page_count(page)) {
++ 		struct hstate *h = page_hstate(page);
++ 		int nid = page_to_nid(page);
++ 		list_del(&page->lru);
++ 		h->free_huge_pages--;
++ 		h->free_huge_pages_node[nid]--;
++ 		update_and_free_page(h, page);
++ 	}
++ 	spin_unlock(&hugetlb_lock);
++ }
++ 
++ /*
++  * Dissolve free hugepages in a given pfn range. Used by memory hotplug to
++  * make specified memory blocks removable from the system.
++  * Note that start_pfn should aligned with (minimum) hugepage size.
++  */
++ void dissolve_free_huge_pages(unsigned long start_pfn, unsigned long end_pfn)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (!hugepages_supported())
++ 		return;
++ 
++ 	VM_BUG_ON(!IS_ALIGNED(start_pfn, 1 << minimum_order));
++ 	for (pfn = start_pfn; pfn < end_pfn; pfn += 1 << minimum_order)
++ 		dissolve_free_huge_page(pfn_to_page(pfn));
++ }
++ 
++ /*
++  * There are 3 ways this can get called:
++  * 1. With vma+addr: we use the VMA's memory policy
++  * 2. With !vma, but nid=NUMA_NO_NODE:  We try to allocate a huge
++  *    page from any node, and let the buddy allocator itself figure
++  *    it out.
++  * 3. With !vma, but nid!=NUMA_NO_NODE.  We allocate a huge page
++  *    strictly from 'nid'
++  */
++ static struct page *__hugetlb_alloc_buddy_huge_page(struct hstate *h,
++ 		struct vm_area_struct *vma, unsigned long addr, int nid)
++ {
++ 	int order = huge_page_order(h);
++ 	gfp_t gfp = htlb_alloc_mask(h)|__GFP_COMP|__GFP_REPEAT|__GFP_NOWARN;
++ 	unsigned int cpuset_mems_cookie;
++ 
++ 	/*
++ 	 * We need a VMA to get a memory policy.  If we do not
++ 	 * have one, we use the 'nid' argument
++ 	 */
++ 	if (!vma) {
++ 		/*
++ 		 * If a specific node is requested, make sure to
++ 		 * get memory from there, but only when a node
++ 		 * is explicitly specified.
++ 		 */
++ 		if (nid != NUMA_NO_NODE)
++ 			gfp |= __GFP_THISNODE;
++ 		/*
++ 		 * Make sure to call something that can handle
++ 		 * nid=NUMA_NO_NODE
++ 		 */
++ 		return alloc_pages_node(nid, gfp, order);
++ 	}
++ 
++ 	/*
++ 	 * OK, so we have a VMA.  Fetch the mempolicy and try to
++ 	 * allocate a huge page with it.
++ 	 */
++ 	do {
++ 		struct page *page;
++ 		struct mempolicy *mpol;
++ 		struct zonelist *zl;
++ 		nodemask_t *nodemask;
++ 
++ 		cpuset_mems_cookie = read_mems_allowed_begin();
++ 		zl = huge_zonelist(vma, addr, gfp, &mpol, &nodemask);
++ 		mpol_cond_put(mpol);
++ 		page = __alloc_pages_nodemask(gfp, order, zl, nodemask);
++ 		if (page)
++ 			return page;
++ 	} while (read_mems_allowed_retry(cpuset_mems_cookie));
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * There are two ways to allocate a huge page:
++  * 1. When you have a VMA and an address (like a fault)
++  * 2. When you have no VMA (like when setting /proc/.../nr_hugepages)
++  *
++  * 'vma' and 'addr' are only for (1).  'nid' is always NUMA_NO_NODE in
++  * this case which signifies that the allocation should be done with
++  * respect for the VMA's memory policy.
++  *
++  * For (2), we ignore 'vma' and 'addr' and use 'nid' exclusively. This
++  * implies that memory policies will not be taken in to account.
++  */
++ static struct page *__alloc_buddy_huge_page(struct hstate *h,
++ 		struct vm_area_struct *vma, unsigned long addr, int nid)
+++>>>>>>> 099730d67417 (mm, hugetlb: use memory policy when available)
+  {
+  	struct page *page;
+  	unsigned int r_nid;
+@@@ -1109,19 -1556,7 +1226,23 @@@
+  	}
+  	spin_unlock(&hugetlb_lock);
+  
+++<<<<<<< HEAD
+ +	if (nid == NUMA_NO_NODE)
+ +		page = alloc_pages(htlb_alloc_mask|__GFP_COMP|
+ +				   __GFP_REPEAT|__GFP_NOWARN,
+ +				   huge_page_order(h));
+ +	else
+ +		page = alloc_pages_exact_node(nid,
+ +			htlb_alloc_mask|__GFP_COMP|__GFP_THISNODE|
+ +			__GFP_REPEAT|__GFP_NOWARN, huge_page_order(h));
+++=======
++ 	page = __hugetlb_alloc_buddy_huge_page(h, vma, addr, nid);
+++>>>>>>> 099730d67417 (mm, hugetlb: use memory policy when available)
+ +
+ +	if (page && arch_prepare_hugepage(page)) {
+ +		__free_pages(page, huge_page_order(h));
+ +		page = NULL;
+ +	}
+  
+  	spin_lock(&hugetlb_lock);
+  	if (page) {
+@@@ -1354,40 -1831,58 +1496,47 @@@ static struct page *alloc_huge_page(str
+  	struct hugetlb_cgroup *h_cg;
+  
+  	idx = hstate_index(h);
+ -	/*
+ -	 * Examine the region/reserve map to determine if the process
+ -	 * has a reservation for the page to be allocated.  A return
+ -	 * code of zero indicates a reservation exists (no change).
+ -	 */
+ -	map_chg = gbl_chg = vma_needs_reservation(h, vma, addr);
+ -	if (map_chg < 0)
+ -		return ERR_PTR(-ENOMEM);
+ -
+  	/*
+  	 * Processes that did not create the mapping will have no
+ -	 * reserves as indicated by the region/reserve map. Check
+ -	 * that the allocation will not exceed the subpool limit.
+ -	 * Allocations for MAP_NORESERVE mappings also need to be
+ -	 * checked against any subpool limit.
+ +	 * reserves and will not have accounted against subpool
+ +	 * limit. Check that the subpool limit can be made before
+ +	 * satisfying the allocation MAP_NORESERVE mappings may also
+ +	 * need pages and subpool limit allocated allocated if no reserve
+ +	 * mapping overlaps.
+  	 */
+ -	if (map_chg || avoid_reserve) {
+ -		gbl_chg = hugepage_subpool_get_pages(spool, 1);
+ -		if (gbl_chg < 0) {
+ -			vma_end_reservation(h, vma, addr);
+ +	chg = vma_needs_reservation(h, vma, addr);
+ +	if (chg < 0)
+ +		return ERR_PTR(-ENOMEM);
+ +	if (chg || avoid_reserve)
+ +		if (hugepage_subpool_get_pages(spool, 1))
+  			return ERR_PTR(-ENOSPC);
+ -		}
+ -
+ -		/*
+ -		 * Even though there was no reservation in the region/reserve
+ -		 * map, there could be reservations associated with the
+ -		 * subpool that can be used.  This would be indicated if the
+ -		 * return value of hugepage_subpool_get_pages() is zero.
+ -		 * However, if avoid_reserve is specified we still avoid even
+ -		 * the subpool reservations.
+ -		 */
+ -		if (avoid_reserve)
+ -			gbl_chg = 1;
+ -	}
+  
+  	ret = hugetlb_cgroup_charge_cgroup(idx, pages_per_huge_page(h), &h_cg);
+ -	if (ret)
+ -		goto out_subpool_put;
+ -
+ +	if (ret) {
+ +		if (chg || avoid_reserve)
+ +			hugepage_subpool_put_pages(spool, 1);
+ +		return ERR_PTR(-ENOSPC);
+ +	}
+  	spin_lock(&hugetlb_lock);
+ -	/*
+ -	 * glb_chg is passed to indicate whether or not a page must be taken
+ -	 * from the global free pool (global change).  gbl_chg == 0 indicates
+ -	 * a reservation exists for the allocation.
+ -	 */
+ -	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
+ +	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, chg);
+  	if (!page) {
+  		spin_unlock(&hugetlb_lock);
+++<<<<<<< HEAD
+ +		page = alloc_buddy_huge_page(h, NUMA_NO_NODE);
+ +		if (!page) {
+ +			hugetlb_cgroup_uncharge_cgroup(idx,
+ +						       pages_per_huge_page(h),
+ +						       h_cg);
+ +			if (chg || avoid_reserve)
+ +				hugepage_subpool_put_pages(spool, 1);
+ +			return ERR_PTR(-ENOSPC);
+ +		}
+++=======
++ 		page = __alloc_buddy_huge_page_with_mpol(h, vma, addr);
++ 		if (!page)
++ 			goto out_uncharge_cgroup;
++ 
+++>>>>>>> 099730d67417 (mm, hugetlb: use memory policy when available)
+  		spin_lock(&hugetlb_lock);
+  		list_move(&page->lru, &h->hugepage_activelist);
+  		/* Fall through */
+* Unmerged path mm/hugetlb.c
