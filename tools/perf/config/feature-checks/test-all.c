@@ -102,7 +102,7 @@
 #undef main
 
 #define main main_test_pthread_attr_setaffinity_np
-# include "test-pthread_attr_setaffinity_np.c"
+# include "test-pthread-attr-setaffinity-np.c"
 #undef main
 
 #define main main_test_libbabeltrace
