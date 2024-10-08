@@ -1,0 +1,268 @@
+IB/iser: Reuse ib_sg_to_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit bfe066e256d55562b00c2d4897ae52e1545a084e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bfe066e2.failed
+
+We have in iser iser_sg_to_page_vec which has exactly
+the same role as ib_sg_to_pages. Customize the page_vec
+to hold a fake MR so we can reuse ib_sg_to_pages.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit bfe066e256d55562b00c2d4897ae52e1545a084e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iser_memory.c
+diff --cc drivers/infiniband/ulp/iser/iser_memory.c
+index 5502beb685d5,e3d9d134f4f4..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@@ -228,172 -135,6 +228,175 @@@ iser_reg_desc_put_fmr(struct ib_conn *i
+  {
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * iser_start_rdma_unaligned_sg
+ + */
+ +static int iser_start_rdma_unaligned_sg(struct iscsi_iser_task *iser_task,
+ +					struct iser_data_buf *data,
+ +					enum iser_data_dir cmd_dir)
+ +{
+ +	struct ib_device *dev = iser_task->iser_conn->ib_conn.device->ib_device;
+ +	int rc;
+ +
+ +	rc = iser_alloc_bounce_sg(data);
+ +	if (rc) {
+ +		iser_err("Failed to allocate bounce for data len %lu\n",
+ +			 data->data_len);
+ +		return rc;
+ +	}
+ +
+ +	if (cmd_dir == ISER_DIR_OUT)
+ +		iser_copy_to_bounce(data);
+ +
+ +	data->dma_nents = ib_dma_map_sg(dev, data->sg, data->size,
+ +					(cmd_dir == ISER_DIR_OUT) ?
+ +					DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +	if (!data->dma_nents) {
+ +		iser_err("Got dma_nents %d, something went wrong...\n",
+ +			 data->dma_nents);
+ +		rc = -ENOMEM;
+ +		goto err;
+ +	}
+ +
+ +	return 0;
+ +err:
+ +	iser_free_bounce_sg(data);
+ +	return rc;
+ +}
+ +
+ +/**
+ + * iser_finalize_rdma_unaligned_sg
+ + */
+ +
+ +void iser_finalize_rdma_unaligned_sg(struct iscsi_iser_task *iser_task,
+ +				     struct iser_data_buf *data,
+ +				     enum iser_data_dir cmd_dir)
+ +{
+ +	struct ib_device *dev = iser_task->iser_conn->ib_conn.device->ib_device;
+ +
+ +	ib_dma_unmap_sg(dev, data->sg, data->size,
+ +			(cmd_dir == ISER_DIR_OUT) ?
+ +			DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +
+ +	if (cmd_dir == ISER_DIR_IN)
+ +		iser_copy_from_bounce(data);
+ +
+ +	iser_free_bounce_sg(data);
+ +}
+ +
+ +#define IS_4K_ALIGNED(addr)	((((unsigned long)addr) & ~MASK_4K) == 0)
+ +
+ +/**
+ + * iser_sg_to_page_vec - Translates scatterlist entries to physical addresses
+ + * and returns the length of resulting physical address array (may be less than
+ + * the original due to possible compaction).
+ + *
+ + * we build a "page vec" under the assumption that the SG meets the RDMA
+ + * alignment requirements. Other then the first and last SG elements, all
+ + * the "internal" elements can be compacted into a list whose elements are
+ + * dma addresses of physical pages. The code supports also the weird case
+ + * where --few fragments of the same page-- are present in the SG as
+ + * consecutive elements. Also, it handles one entry SG.
+ + */
+ +
+ +static int iser_sg_to_page_vec(struct iser_data_buf *data,
+ +			       struct ib_device *ibdev, u64 *pages,
+ +			       int *offset, int *data_size)
+ +{
+ +	struct scatterlist *sg, *sgl = data->sg;
+ +	u64 start_addr, end_addr, page, chunk_start = 0;
+ +	unsigned long total_sz = 0;
+ +	unsigned int dma_len;
+ +	int i, new_chunk, cur_page, last_ent = data->dma_nents - 1;
+ +
+ +	/* compute the offset of first element */
+ +	*offset = (u64) sgl[0].offset & ~MASK_4K;
+ +
+ +	new_chunk = 1;
+ +	cur_page  = 0;
+ +	for_each_sg(sgl, sg, data->dma_nents, i) {
+ +		start_addr = ib_sg_dma_address(ibdev, sg);
+ +		if (new_chunk)
+ +			chunk_start = start_addr;
+ +		dma_len = ib_sg_dma_len(ibdev, sg);
+ +		end_addr = start_addr + dma_len;
+ +		total_sz += dma_len;
+ +
+ +		/* collect page fragments until aligned or end of SG list */
+ +		if (!IS_4K_ALIGNED(end_addr) && i < last_ent) {
+ +			new_chunk = 0;
+ +			continue;
+ +		}
+ +		new_chunk = 1;
+ +
+ +		/* address of the first page in the contiguous chunk;
+ +		   masking relevant for the very first SG entry,
+ +		   which might be unaligned */
+ +		page = chunk_start & MASK_4K;
+ +		do {
+ +			pages[cur_page++] = page;
+ +			page += SIZE_4K;
+ +		} while (page < end_addr);
+ +	}
+ +
+ +	*data_size = total_sz;
+ +	iser_dbg("page_vec->data_size:%d cur_page %d\n",
+ +		 *data_size, cur_page);
+ +	return cur_page;
+ +}
+ +
+ +
+ +/**
+ + * iser_data_buf_aligned_len - Tries to determine the maximal correctly aligned
+ + * for RDMA sub-list of a scatter-gather list of memory buffers, and  returns
+ + * the number of entries which are aligned correctly. Supports the case where
+ + * consecutive SG elements are actually fragments of the same physcial page.
+ + */
+ +static int iser_data_buf_aligned_len(struct iser_data_buf *data,
+ +				      struct ib_device *ibdev)
+ +{
+ +	struct scatterlist *sg, *sgl, *next_sg = NULL;
+ +	u64 start_addr, end_addr;
+ +	int i, ret_len, start_check = 0;
+ +
+ +	if (data->dma_nents == 1)
+ +		return 1;
+ +
+ +	sgl = data->sg;
+ +	start_addr  = ib_sg_dma_address(ibdev, sgl);
+ +
+ +	for_each_sg(sgl, sg, data->dma_nents, i) {
+ +		if (start_check && !IS_4K_ALIGNED(start_addr))
+ +			break;
+ +
+ +		next_sg = sg_next(sg);
+ +		if (!next_sg)
+ +			break;
+ +
+ +		end_addr    = start_addr + ib_sg_dma_len(ibdev, sg);
+ +		start_addr  = ib_sg_dma_address(ibdev, next_sg);
+ +
+ +		if (end_addr == start_addr) {
+ +			start_check = 0;
+ +			continue;
+ +		} else
+ +			start_check = 1;
+ +
+ +		if (!IS_4K_ALIGNED(end_addr))
+ +			break;
+ +	}
+ +	ret_len = (next_sg) ? i : i+1;
+ +
+ +	if (unlikely(ret_len != data->dma_nents))
+ +		iser_warn("rdma alignment violation (%d/%d aligned)\n",
+ +			  ret_len, data->dma_nents);
+ +
+ +	return ret_len;
+ +}
+ +
+++=======
+++>>>>>>> bfe066e256d5 (IB/iser: Reuse ib_sg_to_pages)
+  static void iser_data_buf_dump(struct iser_data_buf *data,
+  			       struct ib_device *ibdev)
+  {
+@@@ -464,36 -205,16 +467,48 @@@ iser_reg_dma(struct iser_device *device
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int fall_to_bounce_buf(struct iscsi_iser_task *iser_task,
+ +			      struct iser_data_buf *mem,
+ +			      enum iser_data_dir cmd_dir)
+ +{
+ +	struct iscsi_conn *iscsi_conn = iser_task->iser_conn->iscsi_conn;
+ +	struct iser_device *device = iser_task->iser_conn->ib_conn.device;
+ +
+ +	iscsi_conn->fmr_unalign_cnt++;
+ +
+ +	if (iser_debug_level > 0)
+ +		iser_data_buf_dump(mem, device->ib_device);
+ +
+ +	/* unmap the command data before accessing it */
+ +	iser_dma_unmap_task_data(iser_task, mem,
+ +				 (cmd_dir == ISER_DIR_OUT) ?
+ +				 DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ +
+ +	/* allocate copy buf, if we are writing, copy the */
+ +	/* unaligned scatterlist, dma map the copy        */
+ +	if (iser_start_rdma_unaligned_sg(iser_task, mem, cmd_dir) != 0)
+ +		return -ENOMEM;
+++=======
++ static int iser_set_page(struct ib_mr *mr, u64 addr)
++ {
++ 	struct iser_page_vec *page_vec =
++ 		container_of(mr, struct iser_page_vec, fake_mr);
++ 
++ 	page_vec->pages[page_vec->npages++] = addr;
+++>>>>>>> bfe066e256d5 (IB/iser: Reuse ib_sg_to_pages)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * iser_reg_page_vec - Register physical memory
+ + *
+ + * returns: 0 on success, errno code on failure
+ + */
+++=======
+++>>>>>>> bfe066e256d5 (IB/iser: Reuse ib_sg_to_pages)
+  static
+  int iser_fast_reg_fmr(struct iscsi_iser_task *iser_task,
+  		      struct iser_data_buf *mem,
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index dfd5c4290bc2..c53c4701bee8 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -566,9 +566,8 @@ struct iscsi_iser_task {
+ 
+ struct iser_page_vec {
+ 	u64 *pages;
+-	int length;
+-	int offset;
+-	int data_size;
++	int npages;
++	struct ib_mr fake_mr;
+ };
+ 
+ /**
+* Unmerged path drivers/infiniband/ulp/iser/iser_memory.c
