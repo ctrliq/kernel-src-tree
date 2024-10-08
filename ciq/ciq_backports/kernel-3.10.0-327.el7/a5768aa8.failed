@@ -1,0 +1,464 @@
+NVMe: Automatic namespace rescan
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit a5768aa887fb636f0cc4c83a2f1242506aaf50f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a5768aa8.failed
+
+Namespaces may be dynamically allocated and deleted or attached and
+detached. This has the driver rescan the device for namespace changes
+after each device reset or namespace change asynchronous event.
+
+There could potentially be many detached namespaces that we don't want
+polluting /dev/ with unusable block handles, so this will delete disks
+if the namespace is not active as indicated by the response from identify
+namespace. This also skips adding the disk if no capacity is provisioned
+to the namespace in the first place.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit a5768aa887fb636f0cc4c83a2f1242506aaf50f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	include/linux/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,2072ae81c13a..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -243,6 -281,52 +244,55 @@@ static void special_completion(struct n
+  	dev_warn(nvmeq->q_dmadev, "Unknown special completion %p\n", ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *cancel_cmd_info(struct nvme_cmd_info *cmd, nvme_completion_fn *fn)
++ {
++ 	void *ctx;
++ 
++ 	if (fn)
++ 		*fn = cmd->fn;
++ 	ctx = cmd->ctx;
++ 	cmd->fn = special_completion;
++ 	cmd->ctx = CMD_CTX_CANCELLED;
++ 	return ctx;
++ }
++ 
++ static void async_req_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 
++ 	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ)
++ 		++nvmeq->dev->event_limit;
++ 	if (status != NVME_SC_SUCCESS)
++ 		return;
++ 
++ 	switch (result & 0xff07) {
++ 	case NVME_AER_NOTICE_NS_CHANGED:
++ 		dev_info(nvmeq->q_dmadev, "rescanning\n");
++ 		schedule_work(&nvmeq->dev->scan_work);
++ 	default:
++ 		dev_warn(nvmeq->q_dmadev, "async event result %08x\n", result);
++ 	}
++ }
++ 
++ static void abort_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	struct request *req = ctx;
++ 
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 
++ 	blk_mq_free_request(req);
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
++ 	++nvmeq->dev->abort_limit;
++ }
++ 
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  static void async_completion(struct nvme_queue *nvmeq, void *ctx,
+  						struct nvme_completion *cqe)
+  {
+@@@ -1922,27 -1926,60 +1972,75 @@@ static int nvme_revalidate_disk(struct 
+  	struct nvme_ns *ns = disk->private_data;
+  	struct nvme_dev *dev = ns->dev;
+  	struct nvme_id_ns *id;
+ -	u8 lbaf, pi_type;
+ -	u16 old_ms;
+ -	unsigned short bs;
+ -
+ +	dma_addr_t dma_addr;
+ +	int lbaf;
+ +
+++<<<<<<< HEAD
+ +	id = dma_alloc_coherent(&dev->pci_dev->dev, 4096, &dma_addr,
+ +								GFP_KERNEL);
+ +	if (!id) {
+ +		dev_warn(&dev->pci_dev->dev, "%s: Memory alocation failure\n",
+ +								__func__);
+ +		return 0;
+++=======
++ 	if (nvme_identify_ns(dev, ns->ns_id, &id)) {
++ 		dev_warn(dev->dev, "%s: Identify failure nvme%dn%d\n", __func__,
++ 						dev->instance, ns->ns_id);
++ 		return -ENODEV;
++ 	}
++ 	if (id->ncap == 0) {
++ 		kfree(id);
++ 		return -ENODEV;
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	}
+  
+ -	old_ms = ns->ms;
+ -	lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+ +	if (nvme_identify(dev, ns->ns_id, 0, dma_addr))
+ +		goto free;
+ +
+ +	lbaf = id->flbas & 0xf;
+  	ns->lba_shift = id->lbaf[lbaf].ds;
+ -	ns->ms = le16_to_cpu(id->lbaf[lbaf].ms);
+ -	ns->ext = ns->ms && (id->flbas & NVME_NS_FLBAS_META_EXT);
+  
+++<<<<<<< HEAD
+ +	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+ +	set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
+ + free:
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, id, dma_addr);
+++=======
++ 	/*
++ 	 * If identify namespace failed, use default 512 byte block size so
++ 	 * block layer can use before failing read/write for 0 capacity.
++ 	 */
++ 	if (ns->lba_shift == 0)
++ 		ns->lba_shift = 9;
++ 	bs = 1 << ns->lba_shift;
++ 
++ 	/* XXX: PI implementation requires metadata equal t10 pi tuple size */
++ 	pi_type = ns->ms == sizeof(struct t10_pi_tuple) ?
++ 					id->dps & NVME_NS_DPS_PI_MASK : 0;
++ 
++ 	if (blk_get_integrity(disk) && (ns->pi_type != pi_type ||
++ 				ns->ms != old_ms ||
++ 				bs != queue_logical_block_size(disk->queue) ||
++ 				(ns->ms && ns->ext)))
++ 		blk_integrity_unregister(disk);
++ 
++ 	ns->pi_type = pi_type;
++ 	blk_queue_logical_block_size(ns->queue, bs);
++ 
++ 	if (ns->ms && !blk_get_integrity(disk) && (disk->flags & GENHD_FL_UP) &&
++ 								!ns->ext)
++ 		nvme_init_integrity(ns);
++ 
++ 	if (ns->ms && !blk_get_integrity(disk))
++ 		set_capacity(disk, 0);
++ 	else
++ 		set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
++ 
++ 	if (dev->oncs & NVME_CTRL_ONCS_DSM)
++ 		nvme_config_discard(ns);
++ 
++ 	kfree(id);
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	return 0;
+  }
+  
+@@@ -2117,16 -2075,27 +2215,36 @@@ static struct nvme_ns *nvme_alloc_ns(st
+  	disk->fops = &nvme_fops;
+  	disk->private_data = ns;
+  	disk->queue = ns->queue;
+ -	disk->driverfs_dev = dev->device;
+ +	disk->driverfs_dev = &dev->pci_dev->dev;
+  	disk->flags = GENHD_FL_EXT_DEVT;
+  	sprintf(disk->disk_name, "nvme%dn%d", dev->instance, nsid);
+ +	set_capacity(disk, le64_to_cpup(&id->nsze) << (ns->lba_shift - 9));
+ +
+ +	if (dev->oncs & NVME_CTRL_ONCS_DSM)
+ +		nvme_config_discard(ns);
+ +
+ +	return ns;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Initialize capacity to 0 until we establish the namespace format and
++ 	 * setup integrity extentions if necessary. The revalidate_disk after
++ 	 * add_disk allows the driver to register with integrity if the format
++ 	 * requires it.
++ 	 */
++ 	set_capacity(disk, 0);
++ 	if (nvme_revalidate_disk(ns->disk))
++ 		goto out_free_disk;
++ 
++ 	add_disk(ns->disk);
++ 	if (ns->ms)
++ 		revalidate_disk(ns->disk);
++ 	return;
++  out_free_disk:
++ 	kfree(disk);
++ 	list_del(&ns->list);
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+   out_free_queue:
+  	blk_cleanup_queue(ns->queue);
+   out_free_ns:
+@@@ -2411,28 -2313,18 +2622,32 @@@ static void nvme_dev_scan(struct work_s
+   */
+  static int nvme_dev_add(struct nvme_dev *dev)
+  {
+ -	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ +	struct pci_dev *pdev = dev->pci_dev;
+  	int res;
+++<<<<<<< HEAD
+ +	unsigned nn, i;
+ +	struct nvme_ns *ns;
+++=======
++ 	unsigned nn;
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	struct nvme_id_ctrl *ctrl;
+ +	struct nvme_id_ns *id_ns;
+ +	void *mem;
+ +	dma_addr_t dma_addr;
+  	int shift = NVME_CAP_MPSMIN(readq(&dev->bar->cap)) + 12;
+  
+ -	res = nvme_identify_ctrl(dev, &ctrl);
+ +	mem = dma_alloc_coherent(&pdev->dev, 8192, &dma_addr, GFP_KERNEL);
+ +	if (!mem)
+ +		return -ENOMEM;
+ +
+ +	res = nvme_identify(dev, 0, 1, dma_addr);
+  	if (res) {
+ -		dev_err(dev->dev, "Identify Controller failed (%d)\n", res);
+ -		return -EIO;
+ +		dev_err(&pdev->dev, "Identify Controller failed (%d)\n", res);
+ +		res = -EIO;
+ +		goto out;
+  	}
+  
+ +	ctrl = mem;
+  	nn = le32_to_cpup(&ctrl->nn);
+  	dev->oncs = le16_to_cpup(&ctrl->oncs);
+  	dev->abort_limit = ctrl->acl + 1;
+@@@ -2444,34 -2335,34 +2659,52 @@@
+  	if (ctrl->mdts)
+  		dev->max_hw_sectors = 1 << (ctrl->mdts + shift - 9);
+  	if ((pdev->vendor == PCI_VENDOR_ID_INTEL) &&
+ -			(pdev->device == 0x0953) && ctrl->vs[3]) {
+ -		unsigned int max_hw_sectors;
+ -
+ +			(pdev->device == 0x0953) && ctrl->vs[3])
+  		dev->stripe_size = 1 << (ctrl->vs[3] + shift);
+ -		max_hw_sectors = dev->stripe_size >> (shift - 9);
+ -		if (dev->max_hw_sectors) {
+ -			dev->max_hw_sectors = min(max_hw_sectors,
+ -							dev->max_hw_sectors);
+ -		} else
+ -			dev->max_hw_sectors = max_hw_sectors;
+ +
+ +	id_ns = mem;
+ +	for (i = 1; i <= nn; i++) {
+ +		res = nvme_identify(dev, i, 0, dma_addr);
+ +		if (res)
+ +			continue;
+ +
+ +		if (id_ns->ncap == 0)
+ +			continue;
+ +
+ +		res = nvme_get_features(dev, NVME_FEAT_LBA_RANGE, i,
+ +							dma_addr + 4096, NULL);
+ +		if (res)
+ +			memset(mem + 4096, 0, 4096);
+ +
+ +		ns = nvme_alloc_ns(dev, i, mem, mem + 4096);
+ +		if (ns)
+ +			list_add_tail(&ns->list, &dev->namespaces);
+  	}
+ -	kfree(ctrl);
+ +	list_for_each_entry(ns, &dev->namespaces, list)
+ +		add_disk(ns->disk);
+ +	res = 0;
+  
+++<<<<<<< HEAD
+ + out:
+ +	dma_free_coherent(&dev->pci_dev->dev, 8192, mem, dma_addr);
+ +	return res;
+++=======
++ 	dev->tagset.ops = &nvme_mq_ops;
++ 	dev->tagset.nr_hw_queues = dev->online_queues - 1;
++ 	dev->tagset.timeout = NVME_IO_TIMEOUT;
++ 	dev->tagset.numa_node = dev_to_node(dev->dev);
++ 	dev->tagset.queue_depth =
++ 				min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
++ 	dev->tagset.cmd_size = nvme_cmd_size(dev);
++ 	dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
++ 	dev->tagset.driver_data = dev;
++ 
++ 	if (blk_mq_alloc_tag_set(&dev->tagset))
++ 		return 0;
++ 
++ 	schedule_work(&dev->scan_work);
++ 	return 0;
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  }
+  
+  static int nvme_dev_map(struct nvme_dev *dev)
+@@@ -2722,12 -2661,8 +2955,17 @@@ static void nvme_dev_remove(struct nvme
+  {
+  	struct nvme_ns *ns;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(ns, &dev->namespaces, list) {
+ +		if (ns->disk->flags & GENHD_FL_UP)
+ +			del_gendisk(ns->disk);
+ +		if (!blk_queue_dying(ns->queue))
+ +			blk_cleanup_queue(ns->queue);
+ +	}
+++=======
++ 	list_for_each_entry(ns, &dev->namespaces, list)
++ 		nvme_ns_remove(ns);
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  }
+  
+  static int nvme_setup_prp_pools(struct nvme_dev *dev)
+@@@ -2923,11 -2901,14 +3153,18 @@@ static int nvme_dev_resume(struct nvme_
+  		return ret;
+  	if (dev->online_queues < 2) {
+  		spin_lock(&dev_list_lock);
+ -		dev->reset_workfn = nvme_remove_disks;
+ +		PREPARE_WORK(&dev->reset_work, nvme_remove_disks);
+  		queue_work(nvme_workq, &dev->reset_work);
+  		spin_unlock(&dev_list_lock);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		nvme_unfreeze_queues(dev);
++ 		schedule_work(&dev->scan_work);
++ 		nvme_set_irq_hints(dev);
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	}
+ +	dev->initialized = 1;
+  	return 0;
+  }
+  
+@@@ -2986,9 -3013,50 +3223,53 @@@ static int nvme_probe(struct pci_dev *p
+  		goto release;
+  
+  	kref_init(&dev->kref);
+++<<<<<<< HEAD
+++=======
++ 	dev->device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->instance),
++ 				dev, "nvme%d", dev->instance);
++ 	if (IS_ERR(dev->device)) {
++ 		result = PTR_ERR(dev->device);
++ 		goto release_pools;
++ 	}
++ 	get_device(dev->device);
++ 	dev_set_drvdata(dev->device, dev);
++ 
++ 	result = device_create_file(dev->device, &dev_attr_reset_controller);
++ 	if (result)
++ 		goto put_dev;
++ 
++ 	INIT_LIST_HEAD(&dev->node);
++ 	INIT_WORK(&dev->scan_work, nvme_dev_scan);
++ 	INIT_WORK(&dev->probe_work, nvme_async_probe);
++ 	schedule_work(&dev->probe_work);
++ 	return 0;
++ 
++  put_dev:
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
++ 	put_device(dev->device);
++  release_pools:
++ 	nvme_release_prp_pools(dev);
++  release:
++ 	nvme_release_instance(dev);
++  put_pci:
++ 	put_device(dev->dev);
++  free:
++ 	kfree(dev->queues);
++ 	kfree(dev->entry);
++ 	kfree(dev);
++ 	return result;
++ }
++ 
++ static void nvme_async_probe(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, probe_work);
++ 	int result;
++ 
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	result = nvme_dev_start(dev);
+  	if (result)
+ -		goto reset;
+ +		goto release_pools;
+  
+  	if (dev->online_queues > 1)
+  		result = nvme_dev_add(dev);
+@@@ -3052,13 -3099,15 +3333,18 @@@ static void nvme_remove(struct pci_dev 
+  	spin_unlock(&dev_list_lock);
+  
+  	pci_set_drvdata(pdev, NULL);
+ -	flush_work(&dev->probe_work);
+  	flush_work(&dev->reset_work);
+++<<<<<<< HEAD
+ +	flush_work(&dev->cpu_work);
+ +	misc_deregister(&dev->miscdev);
+++=======
++ 	flush_work(&dev->scan_work);
++ 	device_remove_file(dev->device, &dev_attr_reset_controller);
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	nvme_dev_shutdown(dev);
+ -	nvme_dev_remove(dev);
+ -	nvme_dev_remove_admin(dev);
+ -	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+  	nvme_free_queues(dev, 0);
+ +	nvme_dev_remove(dev);
+ +	nvme_release_instance(dev);
+  	nvme_release_prp_pools(dev);
+  	kref_put(&dev->kref, nvme_free_dev);
+  }
+diff --cc include/linux/nvme.h
+index 0ee15565532d,c0d94ed8ce9a..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -85,9 -88,11 +85,14 @@@ struct nvme_dev 
+  	struct nvme_bar __iomem *bar;
+  	struct list_head namespaces;
+  	struct kref kref;
+ -	struct device *device;
+ -	work_func_t reset_workfn;
+ +	struct miscdevice miscdev;
+  	struct work_struct reset_work;
+++<<<<<<< HEAD
+ +	struct work_struct cpu_work;
+++=======
++ 	struct work_struct probe_work;
++ 	struct work_struct scan_work;
+++>>>>>>> a5768aa887fb (NVMe: Automatic namespace rescan)
+  	char name[12];
+  	char serial[20];
+  	char model[40];
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path include/linux/nvme.h
+diff --git a/include/uapi/linux/nvme.h b/include/uapi/linux/nvme.h
+index 521ca5ae2746..a5ad23d338e1 100644
+--- a/include/uapi/linux/nvme.h
++++ b/include/uapi/linux/nvme.h
+@@ -167,6 +167,10 @@ enum {
+ 	NVME_SMART_CRIT_VOLATILE_MEMORY	= 1 << 4,
+ };
+ 
++enum {
++	NVME_AER_NOTICE_NS_CHANGED	= 0x0002,
++};
++
+ struct nvme_lba_range_type {
+ 	__u8			type;
+ 	__u8			attributes;
