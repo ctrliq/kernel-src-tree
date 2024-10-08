@@ -2324,7 +2324,6 @@ int t4_sge_alloc_rxq(struct adapter *adap, struct sge_rspq *iq, bool fwevtq,
 	if (!is_t4(adap->params.chip))
 		iq->udb = udb_address_iq(adap, iq->cntxt_id);
 	iq->size--;                           /* subtract status entry */
-	iq->adap = adap;
 	iq->netdev = dev;
 	iq->handler = hnd;
 
