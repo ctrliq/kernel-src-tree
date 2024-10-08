@@ -1,0 +1,136 @@
+bonding: support QinQ for bond arp interval
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit fbd929f2dce460456807a51e18d623db3db9f077
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fbd929f2.failed
+
+The bond send arp request to indicate that the slave is active, and if the bond dev
+is a vlan dev, it will set the vlan tag in skb to notice the vlan group, but the
+bond could only send a skb with 802.1q proto, not support for QinQ.
+
+So add outer tag for lower vlan tag and inner tag for upper vlan tag to support QinQ,
+The new skb will be consist of two vlan tag just like this:
+
+dst mac | src mac | outer vlan tag | inner vlan tag | data | .....
+
+If We don't need QinQ, the inner vlan tag could be set to 0 and use outer vlan tag
+ as a normal vlan group.
+
+Using "ip link" to configure the bond for QinQ and add test log:
+
+ip link add link bond0  bond0.20 type vlan proto 802.1ad id 20
+ip link add link bond0.20  bond0.20.200 type vlan proto 802.1q id 200
+
+ifconfig bond0.20 11.11.20.36/24
+ifconfig bond0.20.200 11.11.200.36/24
+
+echo +11.11.200.37 > /sys/class/net/bond0/bonding/arp_ip_target
+
+90:e2:ba:07:4a:5c (oui Unknown) > Broadcast, ethertype 802.1Q-QinQ (0x88a8),length 50: vlan 20, p 0,ethertype 802.1Q, vlan 200, p 0, ethertype ARP, Ethernet (len 6), IPv4 (len 4), Request who-has 11.11.200.37 tell 11.11.200.36, length 28
+
+90:e2:ba:06:f9:86 (oui Unknown) > 90:e2:ba:07:4a:5c (oui Unknown), ethertype 802.1Q-QinQ (0x88a8), length 50: vlan 20, p 0, ethertype 802.1Q, vlan 200, p 0, ethertype ARP, Ethernet (len 6), IPv4 (len 4), Reply 11.11.200.37 is-at 90:e2:ba:06:f9:86 (oui Unknown), length 28
+
+v1->v2: remove the comment "TODO: QinQ?".
+
+	Cc: Jay Vosburgh <fubar@us.ibm.com>
+	Cc: Veaceslav Falico <vfalico@redhat.com>
+	Cc: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fbd929f2dce460456807a51e18d623db3db9f077)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 6df1bb589f96,7802c2ebdb0d..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2436,8 -2131,8 +2439,13 @@@ static void bond_arp_send(struct net_de
+  {
+  	struct sk_buff *skb;
+  
+++<<<<<<< HEAD
+ +	pr_debug("arp %d on slave %s: dst %pI4 src %pI4 vid %d\n", arp_op,
+ +		 slave_dev->name, &dest_ip, &src_ip, vlan_id);
+++=======
++ 	pr_debug("arp %d on slave %s: dst %pI4 src %pI4\n",
++ 		 arp_op, slave_dev->name, &dest_ip, &src_ip);
+++>>>>>>> fbd929f2dce4 (bonding: support QinQ for bond arp interval)
+  
+  	skb = arp_create(arp_op, ETH_P_ARP, dest_ip, slave_dev, src_ip,
+  			 NULL, slave_dev->dev_addr, NULL);
+@@@ -2493,15 -2203,30 +2516,33 @@@ static void bond_arp_send_all(struct bo
+  		 * found we verify its upper dev list, searching for the
+  		 * rt->dst.dev. If found we save the tag of the vlan and
+  		 * proceed to send the packet.
+- 		 *
+- 		 * TODO: QinQ?
+  		 */
+ -		netdev_for_each_all_upper_dev_rcu(bond->dev, vlan_upper,
+ -						  vlan_iter) {
+ +		netdev_for_each_upper_dev_rcu(bond->dev, vlan_upper, vlan_iter) {
+  			if (!is_vlan_dev(vlan_upper))
+  				continue;
+++<<<<<<< HEAD
+ +			netdev_for_each_upper_dev_rcu(vlan_upper, upper, iter) {
+++=======
++ 
++ 			if (vlan_upper == rt->dst.dev) {
++ 				outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper);
++ 				outer.vlan_id = vlan_dev_vlan_id(vlan_upper);
++ 				rcu_read_unlock();
++ 				goto found;
++ 			}
++ 			netdev_for_each_all_upper_dev_rcu(vlan_upper, upper,
++ 							  iter) {
+++>>>>>>> fbd929f2dce4 (bonding: support QinQ for bond arp interval)
+  				if (upper == rt->dst.dev) {
+- 					vlan_id = vlan_dev_vlan_id(vlan_upper);
++ 					/* If the upper dev is a vlan dev too,
++ 					 *  set the vlan tag to inner tag.
++ 					 */
++ 					if (is_vlan_dev(upper)) {
++ 						inner.vlan_proto = vlan_dev_vlan_proto(upper);
++ 						inner.vlan_id = vlan_dev_vlan_id(upper);
++ 					}
++ 					outer.vlan_proto = vlan_dev_vlan_proto(vlan_upper);
++ 					outer.vlan_id = vlan_dev_vlan_id(vlan_upper);
+  					rcu_read_unlock();
+  					goto found;
+  				}
+@@@ -2512,12 -2237,8 +2553,8 @@@
+  		 * our upper vlans, then just search for any dev that
+  		 * matches, and in case it's a vlan - save the id
+  		 */
+ -		netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
+ +		netdev_for_each_upper_dev_rcu(bond->dev, upper, iter) {
+  			if (upper == rt->dst.dev) {
+- 				/* if it's a vlan - get its VID */
+- 				if (is_vlan_dev(upper))
+- 					vlan_id = vlan_dev_vlan_id(upper);
+- 
+  				rcu_read_unlock();
+  				goto found;
+  			}
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index e1ca02f0b074..b46777bee495 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -258,6 +258,11 @@ struct bonding {
+ #define bond_slave_get_rtnl(dev) \
+ 	((struct slave *) rtnl_dereference(dev->rx_handler_data))
+ 
++struct bond_vlan_tag {
++	__be16		vlan_proto;
++	unsigned short	vlan_id;
++};
++
+ /**
+  * Returns NULL if the net_device does not belong to any of the bond's slaves
+  *
