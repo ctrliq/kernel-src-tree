@@ -1,0 +1,242 @@
+powerpc/boot: Add support for 64bit little endian wrapper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] boot: Add support for 64bit little endian wrapper (Don Zickus) [1127366]
+Rebuild_FUZZ: 92.45%
+commit-author Cédric Le Goater <clg@fr.ibm.com>
+commit 147c05168fc86e824ccd1c0a02b40843e3cbca88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/147c0516.failed
+
+The code is only slightly modified : entry points now use the
+FIXUP_ENDIAN trampoline to switch endian order. The 32bit wrapper
+is kept for big endian kernels and 64bit is enforced for little
+endian kernels with a PPC64_BOOT_WRAPPER config option.
+
+The linker script is generated using the kernel preprocessor flags
+to make use of the CONFIG_* definitions and the wrapper script is
+modified to take into account the new elf64ppc format.
+
+Finally, the zImage file is compiled as a position independent
+executable (-pie) which makes it loadable at any address by the
+firmware.
+
+	Signed-off-by: Cédric Le Goater <clg@fr.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 147c05168fc86e824ccd1c0a02b40843e3cbca88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/boot/ppc_asm.h
+diff --cc arch/powerpc/boot/ppc_asm.h
+index 1c2c2817f9b7,35ea60c1f070..000000000000
+--- a/arch/powerpc/boot/ppc_asm.h
++++ b/arch/powerpc/boot/ppc_asm.h
+@@@ -59,4 -59,19 +59,22 @@@
+  #define	r30	30
+  #define	r31	31
+  
+++<<<<<<< HEAD
+++=======
++ #define SPRN_TBRL	268
++ #define SPRN_TBRU	269
++ 
++ #define FIXUP_ENDIAN						   \
++ 	tdi   0, 0, 0x48; /* Reverse endian of b . + 8		*/ \
++ 	b     $+36;	  /* Skip trampoline if endian is good	*/ \
++ 	.long 0x05009f42; /* bcl 20,31,$+4			*/ \
++ 	.long 0xa602487d; /* mflr r10				*/ \
++ 	.long 0x1c004a39; /* addi r10,r10,28			*/ \
++ 	.long 0xa600607d; /* mfmsr r11				*/ \
++ 	.long 0x01006b69; /* xori r11,r11,1			*/ \
++ 	.long 0xa6035a7d; /* mtsrr0 r10				*/ \
++ 	.long 0xa6037b7d; /* mtsrr1 r11				*/ \
++ 	.long 0x2400004c  /* rfid				*/
++ 
+++>>>>>>> 147c05168fc8 (powerpc/boot: Add support for 64bit little endian wrapper)
+  #endif /* _PPC64_PPC_ASM_H */
+diff --git a/arch/powerpc/boot/Makefile b/arch/powerpc/boot/Makefile
+index cf45071a7129..0ee6da3a12de 100644
+--- a/arch/powerpc/boot/Makefile
++++ b/arch/powerpc/boot/Makefile
+@@ -22,8 +22,14 @@ all: $(obj)/zImage
+ BOOTCFLAGS    := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
+ 		 -fno-strict-aliasing -Os -msoft-float -pipe \
+ 		 -fomit-frame-pointer -fno-builtin -fPIC -nostdinc \
+-		 -isystem $(shell $(CROSS32CC) -print-file-name=include) \
+-		 -mbig-endian
++		 -isystem $(shell $(CROSS32CC) -print-file-name=include)
++ifdef CONFIG_PPC64_BOOT_WRAPPER
++BOOTCFLAGS	+= -m64
++endif
++ifdef CONFIG_CPU_BIG_ENDIAN
++BOOTCFLAGS	+= -mbig-endian
++endif
++
+ BOOTAFLAGS	:= -D__ASSEMBLY__ $(BOOTCFLAGS) -traditional -nostdinc
+ 
+ ifdef CONFIG_DEBUG_INFO
+@@ -142,7 +148,11 @@ $(addprefix $(obj)/,$(libfdt) $(libfdtheader)): $(obj)/%: $(srctree)/scripts/dtc
+ $(obj)/empty.c:
+ 	@touch $@
+ 
+-$(obj)/zImage.lds $(obj)/zImage.coff.lds $(obj)/zImage.ps3.lds: $(obj)/%: $(srctree)/$(src)/%.S
++$(obj)/zImage.lds: $(obj)/%: $(srctree)/$(src)/%.S
++	$(CROSS32CC) $(cpp_flags) -E -Wp,-MD,$(depfile) -P -Upowerpc \
++		-D__ASSEMBLY__ -DLINKER_SCRIPT -o $@ $<
++
++$(obj)/zImage.coff.lds $(obj)/zImage.ps3.lds : $(obj)/%: $(srctree)/$(src)/%.S
+ 	@cp $< $@
+ 
+ clean-files := $(zlib) $(zlibheader) $(zliblinuxheader) \
+diff --git a/arch/powerpc/boot/crt0.S b/arch/powerpc/boot/crt0.S
+index 689290561e69..14de4f8778a7 100644
+--- a/arch/powerpc/boot/crt0.S
++++ b/arch/powerpc/boot/crt0.S
+@@ -275,6 +275,7 @@ prom:
+ 	rfid
+ 
+ 1:	/* Return from OF */
++	FIXUP_ENDIAN
+ 
+ 	/* Restore registers and return. */
+ 	rldicl  r1,r1,0,32
+* Unmerged path arch/powerpc/boot/ppc_asm.h
+diff --git a/arch/powerpc/boot/pseries-head.S b/arch/powerpc/boot/pseries-head.S
+index 655c3d2c321b..6ef6e02e80f9 100644
+--- a/arch/powerpc/boot/pseries-head.S
++++ b/arch/powerpc/boot/pseries-head.S
+@@ -1,5 +1,8 @@
++#include "ppc_asm.h"
++
+ 	.text
+ 
+ 	.globl _zimage_start
+ _zimage_start:
++	FIXUP_ENDIAN
+ 	b _zimage_start_lib
+diff --git a/arch/powerpc/boot/wrapper b/arch/powerpc/boot/wrapper
+index e327bd77d077..f7389831a560 100755
+--- a/arch/powerpc/boot/wrapper
++++ b/arch/powerpc/boot/wrapper
+@@ -40,6 +40,7 @@ cacheit=
+ binary=
+ gzip=.gz
+ pie=
++format=
+ 
+ # cross-compilation prefix
+ CROSS=
+@@ -136,6 +137,14 @@ if [ -z "$kernel" ]; then
+     kernel=vmlinux
+ fi
+ 
++elfformat="`${CROSS}objdump -p "$kernel" | grep 'file format' | awk '{print $4}'`"
++case "$elfformat" in
++    elf64-powerpcle)	format=elf64lppc	;;
++    elf64-powerpc)	format=elf32ppc	;;
++    elf32-powerpc)	format=elf32ppc	;;
++esac
++
++
+ platformo=$object/"$platform".o
+ lds=$object/zImage.lds
+ ext=strip
+@@ -153,6 +162,10 @@ of)
+ pseries)
+     platformo="$object/pseries-head.o $object/of.o $object/epapr.o"
+     link_address='0x4000000'
++    if [ "$format" != "elf32ppc" ]; then
++	link_address=
++	pie=-pie
++    fi
+     make_space=n
+     ;;
+ maple)
+@@ -374,7 +387,7 @@ if [ "$platform" != "miboot" ]; then
+     if [ -n "$link_address" ] ; then
+         text_start="-Ttext $link_address"
+     fi
+-    ${CROSS}ld -m elf32ppc -T $lds $text_start $pie -o "$ofile" \
++    ${CROSS}ld -m $format -T $lds $text_start $pie -o "$ofile" \
+ 	$platformo $tmp $object/wrapper.a
+     rm $tmp
+ fi
+diff --git a/arch/powerpc/boot/zImage.lds.S b/arch/powerpc/boot/zImage.lds.S
+index 2bd8731f1365..861e72109df2 100644
+--- a/arch/powerpc/boot/zImage.lds.S
++++ b/arch/powerpc/boot/zImage.lds.S
+@@ -1,4 +1,10 @@
++#include <asm-generic/vmlinux.lds.h>
++
++#ifdef CONFIG_PPC64_BOOT_WRAPPER
++OUTPUT_ARCH(powerpc:common64)
++#else
+ OUTPUT_ARCH(powerpc:common)
++#endif
+ ENTRY(_zimage_start)
+ EXTERN(_zimage_start)
+ SECTIONS
+@@ -16,7 +22,9 @@ SECTIONS
+     *(.rodata*)
+     *(.data*)
+     *(.sdata*)
++#ifndef CONFIG_PPC64_BOOT_WRAPPER
+     *(.got2)
++#endif
+   }
+   .dynsym : { *(.dynsym) }
+   .dynstr : { *(.dynstr) }
+@@ -27,7 +35,13 @@ SECTIONS
+   }
+   .hash : { *(.hash) }
+   .interp : { *(.interp) }
+-  .rela.dyn : { *(.rela*) }
++  .rela.dyn :
++  {
++#ifdef CONFIG_PPC64_BOOT_WRAPPER
++    __rela_dyn_start = .;
++#endif
++    *(.rela*)
++  }
+ 
+   . = ALIGN(8);
+   .kernel:dtb :
+@@ -53,6 +67,15 @@ SECTIONS
+     _initrd_end =  .;
+   }
+ 
++#ifdef CONFIG_PPC64_BOOT_WRAPPER
++  .got :
++  {
++    __toc_start = .;
++    *(.got)
++    *(.toc)
++  }
++#endif
++
+   . = ALIGN(4096);
+   .bss       :
+   {
+diff --git a/arch/powerpc/platforms/Kconfig.cputype b/arch/powerpc/platforms/Kconfig.cputype
+index 981012ec0cd3..60b004cc0c59 100644
+--- a/arch/powerpc/platforms/Kconfig.cputype
++++ b/arch/powerpc/platforms/Kconfig.cputype
+@@ -420,6 +420,7 @@ config CPU_BIG_ENDIAN
+ 
+ config CPU_LITTLE_ENDIAN
+ 	bool "Build little endian kernel"
++	select PPC64_BOOT_WRAPPER
+ 	help
+ 	  Build a little endian kernel.
+ 
+@@ -428,3 +429,7 @@ config CPU_LITTLE_ENDIAN
+ 	  little endian powerpc.
+ 
+ endchoice
++
++config PPC64_BOOT_WRAPPER
++	def_bool n
++	depends on CPU_LITTLE_ENDIAN
