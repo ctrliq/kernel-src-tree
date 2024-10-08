@@ -1,0 +1,302 @@
+ACPI / scan: Define non-empty device removal handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] scan: Define non-empty device removal handler (Myron Stowe) [1128632]
+Rebuild_FUZZ: 92.78%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit d783156ea38431b20af0d4f910a6f9f9054d33b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d783156e.failed
+
+If an ACPI namespace node is removed (usually, as a result of a
+table unload), and there is a data object attached to that node,
+acpi_ns_delete_node() executes the removal handler submitted to
+acpi_attach_data() for that object.  That handler is currently empty
+for struct acpi_device objects, so it is necessary to detach those
+objects from the corresponding ACPI namespace nodes in advance every
+time a table unload may happen.  That is cumbersome and inefficient
+and leads to some design constraints that turn out to be quite
+inconvenient (in particular, struct acpi_device objects cannot be
+registered for namespace nodes representing devices that are not
+reported as present or functional by _STA).
+
+For this reason, introduce a non-empty removal handler for ACPI
+device objects that will unregister them when their ACPI namespace
+nodes go away.
+
+This code modification alone should not change functionality except
+for the ordering of the ACPI hotplug workqueue which should not
+matter (without subsequent code changes).
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit d783156ea38431b20af0d4f910a6f9f9054d33b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/osl.c
+diff --cc drivers/acpi/osl.c
+index e5a3e78ead26,5b9a785e2155..000000000000
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@@ -1171,7 -1170,55 +1171,59 @@@ void acpi_os_wait_events_complete(void
+  	flush_workqueue(kacpi_notify_wq);
+  }
+  
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(acpi_os_wait_events_complete);
+++=======
++ struct acpi_hp_work {
++ 	struct work_struct work;
++ 	acpi_hp_callback func;
++ 	void *data;
++ 	u32 src;
++ };
++ 
++ static void acpi_hotplug_work_fn(struct work_struct *work)
++ {
++ 	struct acpi_hp_work *hpw = container_of(work, struct acpi_hp_work, work);
++ 
++ 	acpi_os_wait_events_complete();
++ 	hpw->func(hpw->data, hpw->src);
++ 	kfree(hpw);
++ }
++ 
++ acpi_status acpi_hotplug_execute(acpi_hp_callback func, void *data, u32 src)
++ {
++ 	struct acpi_hp_work *hpw;
++ 
++ 	ACPI_DEBUG_PRINT((ACPI_DB_EXEC,
++ 		  "Scheduling function [%p(%p, %u)] for deferred execution.\n",
++ 		  func, data, src));
++ 
++ 	hpw = kmalloc(sizeof(*hpw), GFP_KERNEL);
++ 	if (!hpw)
++ 		return AE_NO_MEMORY;
++ 
++ 	INIT_WORK(&hpw->work, acpi_hotplug_work_fn);
++ 	hpw->func = func;
++ 	hpw->data = data;
++ 	hpw->src = src;
++ 	/*
++ 	 * We can't run hotplug code in kacpid_wq/kacpid_notify_wq etc., because
++ 	 * the hotplug code may call driver .remove() functions, which may
++ 	 * invoke flush_scheduled_work()/acpi_os_wait_events_complete() to flush
++ 	 * these workqueues.
++ 	 */
++ 	if (!queue_work(kacpi_hotplug_wq, &hpw->work)) {
++ 		kfree(hpw);
++ 		return AE_ERROR;
++ 	}
++ 	return AE_OK;
++ }
++ 
++ bool acpi_queue_hotplug_work(struct work_struct *work)
++ {
++ 	return queue_work(kacpi_hotplug_wq, work);
++ }
+++>>>>>>> d783156ea384 (ACPI / scan: Define non-empty device removal handler)
+  
+  acpi_status
+  acpi_os_create_semaphore(u32 max_units, u32 initial_units, acpi_handle * handle)
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index f9b49d659abb..f1a6d164cf5a 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -72,6 +72,8 @@ void acpi_lpss_init(void);
+ static inline void acpi_lpss_init(void) {}
+ #endif
+ 
++bool acpi_queue_hotplug_work(struct work_struct *work);
++
+ /* --------------------------------------------------------------------------
+                      Device Node Initialization / Removal
+    -------------------------------------------------------------------------- */
+* Unmerged path drivers/acpi/osl.c
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 2bbdeee33be4..f9f7c8329510 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -14,6 +14,8 @@
+ 
+ #include <acpi/acpi_drivers.h>
+ 
++#include <asm/pgtable.h>
++
+ #include "internal.h"
+ 
+ #define _COMPONENT		ACPI_BUS_COMPONENT
+@@ -27,6 +29,8 @@ extern struct acpi_device *acpi_root;
+ 
+ #define ACPI_IS_ROOT_DEVICE(device)    (!(device)->parent)
+ 
++#define INVALID_ACPI_HANDLE	((acpi_handle)empty_zero_page)
++
+ /*
+  * If set, devices will be hot-removed even if they cannot be put offline
+  * gracefully (from the kernel's standpoint).
+@@ -934,9 +938,91 @@ struct bus_type acpi_bus_type = {
+ 	.uevent		= acpi_device_uevent,
+ };
+ 
+-static void acpi_bus_data_handler(acpi_handle handle, void *context)
++static void acpi_device_del(struct acpi_device *device)
++{
++	mutex_lock(&acpi_device_lock);
++	if (device->parent)
++		list_del(&device->node);
++
++	list_del(&device->wakeup_list);
++	mutex_unlock(&acpi_device_lock);
++
++	acpi_power_add_remove_device(device, false);
++	acpi_device_remove_files(device);
++	if (device->remove)
++		device->remove(device);
++
++	device_del(&device->dev);
++}
++
++static LIST_HEAD(acpi_device_del_list);
++static DEFINE_MUTEX(acpi_device_del_lock);
++
++static void acpi_device_del_work_fn(struct work_struct *work_not_used)
++{
++	for (;;) {
++		struct acpi_device *adev;
++
++		mutex_lock(&acpi_device_del_lock);
++
++		if (list_empty(&acpi_device_del_list)) {
++			mutex_unlock(&acpi_device_del_lock);
++			break;
++		}
++		adev = list_first_entry(&acpi_device_del_list,
++					struct acpi_device, del_list);
++		list_del(&adev->del_list);
++
++		mutex_unlock(&acpi_device_del_lock);
++
++		acpi_device_del(adev);
++		/*
++		 * Drop references to all power resources that might have been
++		 * used by the device.
++		 */
++		acpi_power_transition(adev, ACPI_STATE_D3_COLD);
++		put_device(&adev->dev);
++	}
++}
++
++/**
++ * acpi_scan_drop_device - Drop an ACPI device object.
++ * @handle: Handle of an ACPI namespace node, not used.
++ * @context: Address of the ACPI device object to drop.
++ *
++ * This is invoked by acpi_ns_delete_node() during the removal of the ACPI
++ * namespace node the device object pointed to by @context is attached to.
++ *
++ * The unregistration is carried out asynchronously to avoid running
++ * acpi_device_del() under the ACPICA's namespace mutex and the list is used to
++ * ensure the correct ordering (the device objects must be unregistered in the
++ * same order in which the corresponding namespace nodes are deleted).
++ */
++static void acpi_scan_drop_device(acpi_handle handle, void *context)
+ {
+-	/* Intentionally empty. */
++	static DECLARE_WORK(work, acpi_device_del_work_fn);
++	struct acpi_device *adev = context;
++
++	mutex_lock(&acpi_device_del_lock);
++
++	/*
++	 * Use the ACPI hotplug workqueue which is ordered, so this work item
++	 * won't run after any hotplug work items submitted subsequently.  That
++	 * prevents attempts to register device objects identical to those being
++	 * deleted from happening concurrently (such attempts result from
++	 * hotplug events handled via the ACPI hotplug workqueue).  It also will
++	 * run after all of the work items submitted previosuly, which helps
++	 * those work items to ensure that they are not accessing stale device
++	 * objects.
++	 */
++	if (list_empty(&acpi_device_del_list))
++		acpi_queue_hotplug_work(&work);
++
++	list_add_tail(&adev->del_list, &acpi_device_del_list);
++	/* Make acpi_ns_validate_handle() return NULL for this handle. */
++	adev->handle = INVALID_ACPI_HANDLE;
++
++	mutex_unlock(&acpi_device_del_lock);
+ }
+ 
+ int acpi_bus_get_device(acpi_handle handle, struct acpi_device **device)
+@@ -946,7 +1032,7 @@ int acpi_bus_get_device(acpi_handle handle, struct acpi_device **device)
+ 	if (!device)
+ 		return -EINVAL;
+ 
+-	status = acpi_get_data(handle, acpi_bus_data_handler, (void **)device);
++	status = acpi_get_data(handle, acpi_scan_drop_device, (void **)device);
+ 	if (ACPI_FAILURE(status) || !*device) {
+ 		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "No context for object [%p]\n",
+ 				  handle));
+@@ -966,7 +1052,7 @@ int acpi_device_add(struct acpi_device *device,
+ 	if (device->handle) {
+ 		acpi_status status;
+ 
+-		status = acpi_attach_data(device->handle, acpi_bus_data_handler,
++		status = acpi_attach_data(device->handle, acpi_scan_drop_device,
+ 					  device);
+ 		if (ACPI_FAILURE(status)) {
+ 			acpi_handle_err(device->handle,
+@@ -984,6 +1070,7 @@ int acpi_device_add(struct acpi_device *device,
+ 	INIT_LIST_HEAD(&device->node);
+ 	INIT_LIST_HEAD(&device->wakeup_list);
+ 	INIT_LIST_HEAD(&device->physical_node_list);
++	INIT_LIST_HEAD(&device->del_list);
+ 	mutex_init(&device->physical_node_lock);
+ 
+ 	new_bus_id = kzalloc(sizeof(struct acpi_device_bus_id), GFP_KERNEL);
+@@ -1047,27 +1134,14 @@ int acpi_device_add(struct acpi_device *device,
+ 	mutex_unlock(&acpi_device_lock);
+ 
+  err_detach:
+-	acpi_detach_data(device->handle, acpi_bus_data_handler);
++	acpi_detach_data(device->handle, acpi_scan_drop_device);
+ 	return result;
+ }
+ 
+ static void acpi_device_unregister(struct acpi_device *device)
+ {
+-	mutex_lock(&acpi_device_lock);
+-	if (device->parent)
+-		list_del(&device->node);
+-
+-	list_del(&device->wakeup_list);
+-	mutex_unlock(&acpi_device_lock);
+-
+-	acpi_detach_data(device->handle, acpi_bus_data_handler);
+-
+-	acpi_power_add_remove_device(device, false);
+-	acpi_device_remove_files(device);
+-	if (device->remove)
+-		device->remove(device);
+-
+-	device_del(&device->dev);
++	acpi_detach_data(device->handle, acpi_scan_drop_device);
++	acpi_device_del(device);
+ 	/*
+ 	 * Transition the device to D3cold to drop the reference counts of all
+ 	 * power resources the device depends on and turn off the ones that have
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index be0290eb08d8..19dedbfa33ee 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -295,6 +295,7 @@ struct acpi_device {
+ 	struct list_head children;
+ 	struct list_head node;
+ 	struct list_head wakeup_list;
++	struct list_head del_list;
+ 	struct acpi_device_status status;
+ 	struct acpi_device_flags flags;
+ 	struct acpi_device_pnp pnp;
