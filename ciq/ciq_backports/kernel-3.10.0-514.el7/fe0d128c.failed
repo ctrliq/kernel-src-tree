@@ -1,0 +1,259 @@
+ALSA: jack: Allow building the jack layer without input device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit fe0d128c57bf927a713159f60a18d9f315d4d91d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fe0d128c.failed
+
+Since the recent integration of kctl jack and input jack layers, we
+can basically build the jack layer even without input devices.  That
+is, the jack layer itself can be built with conditional to enable the
+input device support or not, while the users may enable always
+CONFIG_SND_JACK unconditionally.
+
+For achieving it, this patch changes the following:
+- A new Kconfig, CONFIG_SND_JACK_INPUT_DEV, was introduced to indicate
+  whether the jack layer supports the input device,
+- A few items in snd_jack struct and relevant codes are conditionally
+  built upon CONFIG_SND_JACK_INPUT_DEV,
+- The users of CONFIG_SND_JACK drop the messy dependency on
+  CONFIG_INPUT.
+
+This change also automagically fixes a potential bug in HD-audio
+driver Arnd reported, where the NULL or uninitialized jack instance is
+dereferenced.
+
+	Reported-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit fe0d128c57bf927a713159f60a18d9f315d4d91d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/jack.h
+diff --cc include/sound/jack.h
+index b3387937d046,1e84bfb553cf..000000000000
+--- a/include/sound/jack.h
++++ b/include/sound/jack.h
+@@@ -97,10 -122,12 +107,20 @@@ static inline void snd_jack_set_parent(
+  {
+  }
+  
+++<<<<<<< HEAD
+ +static inline void snd_jack_report(struct snd_jack *jack, int status)
+ +{
+ +}
+ +
+ +#endif
+++=======
++ static inline int snd_jack_set_key(struct snd_jack *jack,
++ 				   enum snd_jack_types type,
++ 				   int keytype)
++ {
++ 	return 0;
++ }
++ #endif /* !CONFIG_SND_JACK || !CONFIG_SND_JACK_INPUT_DEV */
+++>>>>>>> fe0d128c57bf (ALSA: jack: Allow building the jack layer without input device)
+  
+  #endif
+* Unmerged path include/sound/jack.h
+diff --git a/sound/core/Kconfig b/sound/core/Kconfig
+index 8570471e0c52..a3e523ae7d7e 100644
+--- a/sound/core/Kconfig
++++ b/sound/core/Kconfig
+@@ -21,12 +21,15 @@ config SND_RAWMIDI
+ config SND_COMPRESS_OFFLOAD
+ 	tristate
+ 
+-# To be effective this also requires INPUT - users should say:
+-#    select SND_JACK if INPUT=y || INPUT=SND
+-# to avoid having to force INPUT on.
+ config SND_JACK
+ 	bool
+ 
++# enable input device support in jack layer
++config SND_JACK_INPUT_DEV
++	bool
++	depends on SND_JACK
++	default y if INPUT=y || INPUT=SND
++
+ config SND_SEQUENCER
+ 	tristate "Sequencer support"
+ 	select SND_TIMER
+diff --git a/sound/core/jack.c b/sound/core/jack.c
+index 7237acbdcbbc..f652e90efd7e 100644
+--- a/sound/core/jack.c
++++ b/sound/core/jack.c
+@@ -32,6 +32,7 @@ struct snd_jack_kctl {
+ 	unsigned int mask_bits; /* only masked status bits are reported via kctl */
+ };
+ 
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ static int jack_switch_types[SND_JACK_SWITCH_TYPES] = {
+ 	SW_HEADPHONE_INSERT,
+ 	SW_MICROPHONE_INSERT,
+@@ -40,9 +41,11 @@ static int jack_switch_types[SND_JACK_SWITCH_TYPES] = {
+ 	SW_VIDEOOUT_INSERT,
+ 	SW_LINEIN_INSERT,
+ };
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 
+ static int snd_jack_dev_disconnect(struct snd_device *device)
+ {
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ 	struct snd_jack *jack = device->device_data;
+ 
+ 	if (!jack->input_dev)
+@@ -55,6 +58,7 @@ static int snd_jack_dev_disconnect(struct snd_device *device)
+ 	else
+ 		input_free_device(jack->input_dev);
+ 	jack->input_dev = NULL;
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 	return 0;
+ }
+ 
+@@ -79,6 +83,7 @@ static int snd_jack_dev_free(struct snd_device *device)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ static int snd_jack_dev_register(struct snd_device *device)
+ {
+ 	struct snd_jack *jack = device->device_data;
+@@ -116,6 +121,7 @@ static int snd_jack_dev_register(struct snd_device *device)
+ 
+ 	return err;
+ }
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 
+ static void snd_jack_kctl_private_free(struct snd_kcontrol *kctl)
+ {
+@@ -209,11 +215,12 @@ int snd_jack_new(struct snd_card *card, const char *id, int type,
+ 	struct snd_jack *jack;
+ 	struct snd_jack_kctl *jack_kctl = NULL;
+ 	int err;
+-	int i;
+ 	static struct snd_device_ops ops = {
+ 		.dev_free = snd_jack_dev_free,
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ 		.dev_register = snd_jack_dev_register,
+ 		.dev_disconnect = snd_jack_dev_disconnect,
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 	};
+ 
+ 	if (initial_kctl) {
+@@ -230,6 +237,9 @@ int snd_jack_new(struct snd_card *card, const char *id, int type,
+ 
+ 	/* don't creat input device for phantom jack */
+ 	if (!phantom_jack) {
++#ifdef CONFIG_SND_JACK_INPUT_DEV
++		int i;
++
+ 		jack->input_dev = input_allocate_device();
+ 		if (jack->input_dev == NULL) {
+ 			err = -ENOMEM;
+@@ -245,6 +255,7 @@ int snd_jack_new(struct snd_card *card, const char *id, int type,
+ 				input_set_capability(jack->input_dev, EV_SW,
+ 						     jack_switch_types[i]);
+ 
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 	}
+ 
+ 	err = snd_device_new(card, SNDRV_DEV_JACK, jack, &ops);
+@@ -262,13 +273,16 @@ int snd_jack_new(struct snd_card *card, const char *id, int type,
+ 	return 0;
+ 
+ fail_input:
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ 	input_free_device(jack->input_dev);
++#endif
+ 	kfree(jack->id);
+ 	kfree(jack);
+ 	return err;
+ }
+ EXPORT_SYMBOL(snd_jack_new);
+ 
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ /**
+  * snd_jack_set_parent - Set the parent device for a jack
+  *
+@@ -326,10 +340,10 @@ int snd_jack_set_key(struct snd_jack *jack, enum snd_jack_types type,
+ 
+ 	jack->type |= type;
+ 	jack->key[key] = keytype;
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL(snd_jack_set_key);
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ 
+ /**
+  * snd_jack_report - Report the current status of a jack
+@@ -340,7 +354,9 @@ EXPORT_SYMBOL(snd_jack_set_key);
+ void snd_jack_report(struct snd_jack *jack, int status)
+ {
+ 	struct snd_jack_kctl *jack_kctl;
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ 	int i;
++#endif
+ 
+ 	if (!jack)
+ 		return;
+@@ -349,6 +365,7 @@ void snd_jack_report(struct snd_jack *jack, int status)
+ 		snd_kctl_jack_report(jack->card, jack_kctl->kctl,
+ 					    status & jack_kctl->mask_bits);
+ 
++#ifdef CONFIG_SND_JACK_INPUT_DEV
+ 	if (!jack->input_dev)
+ 		return;
+ 
+@@ -369,6 +386,6 @@ void snd_jack_report(struct snd_jack *jack, int status)
+ 	}
+ 
+ 	input_sync(jack->input_dev);
+-
++#endif /* CONFIG_SND_JACK_INPUT_DEV */
+ }
+ EXPORT_SYMBOL(snd_jack_report);
+diff --git a/sound/pci/Kconfig b/sound/pci/Kconfig
+index f170fc97e0c0..dca488eae7e9 100644
+--- a/sound/pci/Kconfig
++++ b/sound/pci/Kconfig
+@@ -863,7 +863,7 @@ config SND_VIRTUOSO
+ 	select SND_OXYGEN_LIB
+ 	select SND_PCM
+ 	select SND_MPU401_UART
+-	select SND_JACK if INPUT=y || INPUT=SND
++	select SND_JACK
+ 	help
+ 	  Say Y here to include support for sound cards based on the
+ 	  Asus AV66/AV100/AV200 chips, i.e., Xonar D1, DX, D2, D2X, DS, DSX,
+diff --git a/sound/pci/hda/Kconfig b/sound/pci/hda/Kconfig
+index e94cfd5c69f7..bb02c2d48fd5 100644
+--- a/sound/pci/hda/Kconfig
++++ b/sound/pci/hda/Kconfig
+@@ -4,7 +4,7 @@ config SND_HDA
+ 	tristate
+ 	select SND_PCM
+ 	select SND_VMASTER
+-	select SND_JACK if INPUT=y || INPUT=SND
++	select SND_JACK
+ 	select SND_HDA_CORE
+ 
+ config SND_HDA_INTEL
+diff --git a/sound/soc/Kconfig b/sound/soc/Kconfig
+index 9e675c76436c..af87b9895a7e 100644
+--- a/sound/soc/Kconfig
++++ b/sound/soc/Kconfig
+@@ -6,7 +6,7 @@ menuconfig SND_SOC
+ 	tristate "ALSA for SoC audio support"
+ 	select SND_PCM
+ 	select AC97_BUS if SND_SOC_AC97_BUS
+-	select SND_JACK if INPUT=y || INPUT=SND
++	select SND_JACK
+ 	select REGMAP_I2C if I2C
+ 	select REGMAP_SPI if SPI_MASTER
+ 	select SND_COMPRESS_OFFLOAD
