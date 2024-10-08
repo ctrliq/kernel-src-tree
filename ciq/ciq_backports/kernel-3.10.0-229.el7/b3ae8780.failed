@@ -1,0 +1,187 @@
+[SCSI] Add EVPD page 0x83 and 0x80 to sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [scsi] Add EVPD page 0x83 and 0x80 to sysfs (Ewan Milne) [1132092]
+Rebuild_FUZZ: 91.14%
+commit-author Hannes Reinecke <hare@suse.de>
+commit b3ae8780b42918111387240762f470d5c1e269d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b3ae8780.failed
+
+EVPD page 0x83 is used to uniquely identify the device.
+So instead of having each and every program issue a separate
+SG_IO call to retrieve this information it does make far more
+sense to display it in sysfs.
+
+Some older devices (most notably tapes) will only report reliable
+information in page 0x80 (Unit Serial Number). So export this
+in the sysfs attribute 'vpd_pg80'.
+
+[jejb: checkpatch fix]
+[hare: attach after transport configure]
+[fengguang.wu@intel.com: spotted problems with the original now fixed]
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit b3ae8780b42918111387240762f470d5c1e269d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_sysfs.c
+diff --cc drivers/scsi/scsi_sysfs.c
+index 196e59ae746f,1392474c3499..000000000000
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@@ -413,8 -412,8 +413,13 @@@ static void scsi_device_dev_release_use
+  	/* NULL queue means the device can't be used */
+  	sdev->request_queue = NULL;
+  
+++<<<<<<< HEAD
+ +	scsi_target_reap(scsi_target(sdev));
+ +
+++=======
++ 	kfree(sdev->vpd_pg83);
++ 	kfree(sdev->vpd_pg80);
+++>>>>>>> b3ae8780b429 ([SCSI] Add EVPD page 0x83 and 0x80 to sysfs)
+  	kfree(sdev->inquiry);
+  	kfree(sdev);
+  
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 7134b07437ac..1dea33b9434f 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -958,6 +958,93 @@ int scsi_get_vpd_page(struct scsi_device *sdev, u8 page, unsigned char *buf,
+ }
+ EXPORT_SYMBOL_GPL(scsi_get_vpd_page);
+ 
++/**
++ * scsi_attach_vpd - Attach Vital Product Data to a SCSI device structure
++ * @sdev: The device to ask
++ *
++ * Attach the 'Device Identification' VPD page (0x83) and the
++ * 'Unit Serial Number' VPD page (0x80) to a SCSI device
++ * structure. This information can be used to identify the device
++ * uniquely.
++ */
++void scsi_attach_vpd(struct scsi_device *sdev)
++{
++	int result, i;
++	int vpd_len = SCSI_VPD_PG_LEN;
++	int pg80_supported = 0;
++	int pg83_supported = 0;
++	unsigned char *vpd_buf;
++
++	if (sdev->skip_vpd_pages)
++		return;
++retry_pg0:
++	vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
++	if (!vpd_buf)
++		return;
++
++	/* Ask for all the pages supported by this device */
++	result = scsi_vpd_inquiry(sdev, vpd_buf, 0, vpd_len);
++	if (result < 0) {
++		kfree(vpd_buf);
++		return;
++	}
++	if (result > vpd_len) {
++		vpd_len = result;
++		kfree(vpd_buf);
++		goto retry_pg0;
++	}
++
++	for (i = 4; i < result; i++) {
++		if (vpd_buf[i] == 0x80)
++			pg80_supported = 1;
++		if (vpd_buf[i] == 0x83)
++			pg83_supported = 1;
++	}
++	kfree(vpd_buf);
++	vpd_len = SCSI_VPD_PG_LEN;
++
++	if (pg80_supported) {
++retry_pg80:
++		vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
++		if (!vpd_buf)
++			return;
++
++		result = scsi_vpd_inquiry(sdev, vpd_buf, 0x80, vpd_len);
++		if (result < 0) {
++			kfree(vpd_buf);
++			return;
++		}
++		if (result > vpd_len) {
++			vpd_len = result;
++			kfree(vpd_buf);
++			goto retry_pg80;
++		}
++		sdev->vpd_pg80_len = result;
++		sdev->vpd_pg80 = vpd_buf;
++		vpd_len = SCSI_VPD_PG_LEN;
++	}
++
++	if (pg83_supported) {
++retry_pg83:
++		vpd_buf = kmalloc(vpd_len, GFP_KERNEL);
++		if (!vpd_buf)
++			return;
++
++		result = scsi_vpd_inquiry(sdev, vpd_buf, 0x83, vpd_len);
++		if (result < 0) {
++			kfree(vpd_buf);
++			return;
++		}
++		if (result > vpd_len) {
++			vpd_len = result;
++			kfree(vpd_buf);
++			goto retry_pg83;
++		}
++		sdev->vpd_pg83_len = result;
++		sdev->vpd_pg83 = vpd_buf;
++	}
++}
++
+ /**
+  * scsi_report_opcode - Find out if a given command opcode is supported
+  * @sdev:	scsi device to query
+diff --git a/drivers/scsi/scsi_scan.c b/drivers/scsi/scsi_scan.c
+index 307a81137607..cb85d0458c9c 100644
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -946,6 +946,9 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
+ 		}
+ 	}
+ 
++	if (sdev->scsi_level >= SCSI_3)
++		scsi_attach_vpd(sdev);
++
+ 	sdev->max_queue_depth = sdev->queue_depth;
+ 
+ 	/*
+* Unmerged path drivers/scsi/scsi_sysfs.c
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 529be095a16e..e826e4f6f528 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -113,6 +113,12 @@ struct scsi_device {
+ 	const char * vendor;		/* [back_compat] point into 'inquiry' ... */
+ 	const char * model;		/* ... after scan; point to static string */
+ 	const char * rev;		/* ... "nullnullnullnull" before scan */
++
++#define SCSI_VPD_PG_LEN                255
++	int vpd_pg83_len;
++	unsigned char *vpd_pg83;
++	int vpd_pg80_len;
++	unsigned char *vpd_pg80;
+ 	unsigned char current_tag;	/* current tag */
+ 	struct scsi_target      *sdev_target;   /* used only for single_lun */
+ 
+@@ -372,6 +378,7 @@ extern int scsi_add_device(struct Scsi_Host *host, uint channel,
+ extern int scsi_register_device_handler(struct scsi_device_handler *scsi_dh);
+ extern void scsi_remove_device(struct scsi_device *);
+ extern int scsi_unregister_device_handler(struct scsi_device_handler *scsi_dh);
++void scsi_attach_vpd(struct scsi_device *sdev);
+ 
+ extern int scsi_device_get(struct scsi_device *);
+ extern void scsi_device_put(struct scsi_device *);
