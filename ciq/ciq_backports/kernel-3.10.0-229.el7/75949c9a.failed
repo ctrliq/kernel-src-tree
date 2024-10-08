@@ -1,0 +1,187 @@
+cpufreq: don't break string in print statements
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] don't break string in print statements (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 89.41%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 75949c9a1fe0fd07983788449059337edac2b9f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/75949c9a.failed
+
+As a rule its better not to break string (quoted inside "") in a
+print statement even if it crosses 80 column boundary as that may
+introduce bugs and so this patch rewrites one of the print statements..
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 75949c9a1fe0fd07983788449059337edac2b9f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 006b599e5bea,0255c081b4ee..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1106,6 -1153,154 +1106,157 @@@ static int cpufreq_nominate_new_policy_
+  	return cpu_dev->id;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __cpufreq_remove_dev_prepare(struct device *dev,
++ 					struct subsys_interface *sif,
++ 					bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int new_cpu, ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 
++ 	pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 
++ 	/* Save the policy somewhere when doing a light-weight tear-down */
++ 	if (frozen)
++ 		per_cpu(cpufreq_cpu_data_fallback, cpu) = policy;
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (cpufreq_driver->target) {
++ 		ret = __cpufreq_governor(policy, CPUFREQ_GOV_STOP);
++ 		if (ret) {
++ 			pr_err("%s: Failed to stop governor\n", __func__);
++ 			return ret;
++ 		}
++ 	}
++ 
++ #ifdef CONFIG_HOTPLUG_CPU
++ 	if (!cpufreq_driver->setpolicy)
++ 		strncpy(per_cpu(cpufreq_cpu_governor, cpu),
++ 			policy->governor->name, CPUFREQ_NAME_LEN);
++ #endif
++ 
++ 	lock_policy_rwsem_read(cpu);
++ 	cpus = cpumask_weight(policy->cpus);
++ 	unlock_policy_rwsem_read(cpu);
++ 
++ 	if (cpu != policy->cpu) {
++ 		if (!frozen)
++ 			sysfs_remove_link(&dev->kobj, "cpufreq");
++ 	} else if (cpus > 1) {
++ 		new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu, frozen);
++ 		if (new_cpu >= 0) {
++ 			update_policy_cpu(policy, new_cpu);
++ 
++ 			if (!frozen) {
++ 				pr_debug("%s: policy Kobject moved to cpu: %d from: %d\n",
++ 						__func__, new_cpu, cpu);
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __cpufreq_remove_dev_finish(struct device *dev,
++ 				       struct subsys_interface *sif,
++ 				       bool frozen)
++ {
++ 	unsigned int cpu = dev->id, cpus;
++ 	int ret;
++ 	unsigned long flags;
++ 	struct cpufreq_policy *policy;
++ 	struct kobject *kobj;
++ 	struct completion *cmp;
++ 
++ 	read_lock_irqsave(&cpufreq_driver_lock, flags);
++ 	policy = per_cpu(cpufreq_cpu_data, cpu);
++ 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	if (!policy) {
++ 		pr_debug("%s: No cpu_data found\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	lock_policy_rwsem_write(cpu);
++ 	cpus = cpumask_weight(policy->cpus);
++ 
++ 	if (cpus > 1)
++ 		cpumask_clear_cpu(cpu, policy->cpus);
++ 	unlock_policy_rwsem_write(cpu);
++ 
++ 	/* If cpu is last user of policy, free policy */
++ 	if (cpus == 1) {
++ 		if (cpufreq_driver->target) {
++ 			ret = __cpufreq_governor(policy,
++ 					CPUFREQ_GOV_POLICY_EXIT);
++ 			if (ret) {
++ 				pr_err("%s: Failed to exit governor\n",
++ 						__func__);
++ 				return ret;
++ 			}
++ 		}
++ 
++ 		if (!frozen) {
++ 			lock_policy_rwsem_read(cpu);
++ 			kobj = &policy->kobj;
++ 			cmp = &policy->kobj_unregister;
++ 			unlock_policy_rwsem_read(cpu);
++ 			kobject_put(kobj);
++ 
++ 			/*
++ 			 * We need to make sure that the underlying kobj is
++ 			 * actually not referenced anymore by anybody before we
++ 			 * proceed with unloading.
++ 			 */
++ 			pr_debug("waiting for dropping of refcount\n");
++ 			wait_for_completion(cmp);
++ 			pr_debug("wait complete\n");
++ 		}
++ 
++ 		/*
++ 		 * Perform the ->exit() even during light-weight tear-down,
++ 		 * since this is a core component, and is essential for the
++ 		 * subsequent light-weight ->init() to succeed.
++ 		 */
++ 		if (cpufreq_driver->exit)
++ 			cpufreq_driver->exit(policy);
++ 
++ 		/* Remove policy from list of active policies */
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		list_del(&policy->policy_list);
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 		if (!frozen)
++ 			cpufreq_policy_free(policy);
++ 	} else {
++ 		if (cpufreq_driver->target) {
++ 			if ((ret = __cpufreq_governor(policy, CPUFREQ_GOV_START)) ||
++ 					(ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))) {
++ 				pr_err("%s: Failed to start governor\n",
++ 						__func__);
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 
++ 	per_cpu(cpufreq_cpu_data, cpu) = NULL;
++ 	return 0;
++ }
++ 
+++>>>>>>> 75949c9a1fe0 (cpufreq: don't break string in print statements)
+  /**
+   * __cpufreq_remove_dev - remove a CPU device
+   *
+* Unmerged path drivers/cpufreq/cpufreq.c
