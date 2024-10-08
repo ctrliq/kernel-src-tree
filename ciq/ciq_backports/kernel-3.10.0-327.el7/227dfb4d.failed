@@ -1,0 +1,128 @@
+AHCI: Do not read HOST_IRQ_STAT reg in multi-MSI mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Gordeev <agordeev@redhat.com>
+commit 227dfb4dbf109596d76a9b842856c4ff68e4efb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/227dfb4d.failed
+
+As described in AHCI v1.0 specification chapter 10.6.2.2
+"Multiple MSI Based Messages" generation of interrupts
+is not controlled through the HOST_IRQ_STAT register.
+
+Considering MMIO access is expensive remove unnecessary
+reading and writing of HOST_IRQ_STAT register.
+
+Further, serializing access to the host data is no longer
+needed and the interrupt service routine can avoid competing
+on the host lock.
+
+	Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+	Suggested-by: "Jiang, Dave" <dave.jiang@intel.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: "Jiang, Dave" <dave.jiang@intel.com>
+	Cc: linux-ide@vger.kernel.org
+(cherry picked from commit 227dfb4dbf109596d76a9b842856c4ff68e4efb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/libahci.c
+diff --cc drivers/ata/libahci.c
+index 198a9d07a8bc,97683e45ab04..000000000000
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@@ -1801,10 -1806,10 +1798,15 @@@ irqreturn_t ahci_thread_fn(int irq, voi
+  
+  	return IRQ_HANDLED;
+  }
+ +EXPORT_SYMBOL_GPL(ahci_thread_fn);
+  
+++<<<<<<< HEAD
+ +static void ahci_hw_port_interrupt(struct ata_port *ap)
+++=======
++ static irqreturn_t ahci_multi_irqs_intr(int irq, void *dev_instance)
+++>>>>>>> 227dfb4dbf10 (AHCI: Do not read HOST_IRQ_STAT reg in multi-MSI mode)
+  {
++ 	struct ata_port *ap = dev_instance;
+  	void __iomem *port_mmio = ahci_port_base(ap);
+  	struct ahci_port_priv *pp = ap->private_data;
+  	u32 status;
+@@@ -1812,58 -1819,7 +1816,62 @@@
+  	status = readl(port_mmio + PORT_IRQ_STAT);
+  	writel(status, port_mmio + PORT_IRQ_STAT);
+  
+++<<<<<<< HEAD
+ +	pp->intr_status |= status;
+ +}
+ +
+ +irqreturn_t ahci_hw_interrupt(int irq, void *dev_instance)
+ +{
+ +	struct ata_port *ap_this = dev_instance;
+ +	struct ahci_port_priv *pp = ap_this->private_data;
+ +	struct ata_host *host = ap_this->host;
+ +	struct ahci_host_priv *hpriv = host->private_data;
+ +	void __iomem *mmio = hpriv->mmio;
+ +	unsigned int i;
+ +	u32 irq_stat, irq_masked;
+ +
+ +	VPRINTK("ENTER\n");
+ +
+ +	spin_lock(&host->lock);
+ +
+ +	irq_stat = readl(mmio + HOST_IRQ_STAT);
+ +
+ +	if (!irq_stat) {
+ +		u32 status = pp->intr_status;
+ +
+ +		spin_unlock(&host->lock);
+ +
+ +		VPRINTK("EXIT\n");
+ +
+ +		return status ? IRQ_WAKE_THREAD : IRQ_NONE;
+ +	}
+ +
+ +	irq_masked = irq_stat & hpriv->port_map;
+ +
+ +	for (i = 0; i < host->n_ports; i++) {
+ +		struct ata_port *ap;
+ +
+ +		if (!(irq_masked & (1 << i)))
+ +			continue;
+ +
+ +		ap = host->ports[i];
+ +		if (ap) {
+ +			ahci_hw_port_interrupt(ap);
+ +			VPRINTK("port %u\n", i);
+ +		} else {
+ +			VPRINTK("port %u (no irq)\n", i);
+ +			if (ata_ratelimit())
+ +				dev_warn(host->dev,
+ +					 "interrupt on disabled port %u\n", i);
+ +		}
+ +	}
+ +
+ +	writel(irq_stat, mmio + HOST_IRQ_STAT);
+ +
+ +	spin_unlock(&host->lock);
+++=======
++ 	atomic_or(status, &pp->intr_status);
+++>>>>>>> 227dfb4dbf10 (AHCI: Do not read HOST_IRQ_STAT reg in multi-MSI mode)
+  
+  	VPRINTK("EXIT\n");
+  
+diff --git a/drivers/ata/ahci.h b/drivers/ata/ahci.h
+index 16b1c42fa23e..b550fb92dc27 100644
+--- a/drivers/ata/ahci.h
++++ b/drivers/ata/ahci.h
+@@ -300,7 +300,7 @@ struct ahci_port_priv {
+ 	unsigned int		ncq_saw_d2h:1;
+ 	unsigned int		ncq_saw_dmas:1;
+ 	unsigned int		ncq_saw_sdb:1;
+-	u32			intr_status;	/* interrupts to handle */
++	atomic_t		intr_status;	/* interrupts to handle */
+ 	spinlock_t		lock;		/* protects parent ata_port */
+ 	u32 			intr_mask;	/* interrupts to enable */
+ 	bool			fbs_supported;	/* set iff FBS is supported */
+* Unmerged path drivers/ata/libahci.c
