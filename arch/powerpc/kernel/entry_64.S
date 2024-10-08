@@ -1180,7 +1180,7 @@ _GLOBAL(mcount)
 _GLOBAL(_mcount)
 	blr
 
-_GLOBAL(ftrace_caller)
+_GLOBAL_TOC(ftrace_caller)
 	/* Taken from output of objdump from lib64/glibc */
 	mflr	r3
 	ld	r11, 0(r1)
@@ -1204,10 +1204,7 @@ _GLOBAL(ftrace_graph_stub)
 _GLOBAL(ftrace_stub)
 	blr
 #else
-_GLOBAL(mcount)
-	blr
-
-_GLOBAL(_mcount)
+_GLOBAL_TOC(_mcount)
 	/* Taken from output of objdump from lib64/glibc */
 	mflr	r3
 	ld	r11, 0(r1)
