@@ -1,0 +1,211 @@
+cpufreq: Fix crash in cpufreq-stats during suspend/resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [cpufreq] Fix crash in cpufreq-stats during suspend/resume (Prarit Bhargava) [1134369]
+Rebuild_FUZZ: 91.43%
+commit-author Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+commit 0d66b91ebff49841f607a3c079984c907c8a4199
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/0d66b91e.failed
+
+Stephen Warren reported that the cpufreq-stats code hits a NULL pointer
+dereference during the second attempt to suspend a system. He also
+pin-pointed the problem to commit 5302c3f "cpufreq: Perform light-weight
+init/teardown during suspend/resume".
+
+That commit actually ensured that the cpufreq-stats table and the
+cpufreq-stats sysfs entries are *not* torn down (ie., not freed) during
+suspend/resume, which makes it all the more surprising. However, it turns
+out that the root-cause is not that we access an already freed memory, but
+that the reference to the allocated memory gets moved around and we lose
+track of that during resume, leading to the reported crash in a subsequent
+suspend attempt.
+
+In the suspend path, during CPU offline, the value of policy->cpu is updated
+by choosing one of the surviving CPUs in that policy, as long as there is
+atleast one CPU in that policy. And cpufreq_stats_update_policy_cpu() is
+invoked to update the reference to the stats structure by assigning it to
+the new CPU. However, in the resume path, during CPU online, we end up
+assigning a fresh CPU as the policy->cpu, without letting cpufreq-stats
+know about this. Thus the reference to the stats structure remains
+(incorrectly) associated with the old CPU. So, in a subsequent suspend attempt,
+during CPU offline, we end up accessing an incorrect location to get the
+stats structure, which eventually leads to the NULL pointer dereference.
+
+Fix this by letting cpufreq-stats know about the update of the policy->cpu
+during CPU online in the resume path. (Also, move the update_policy_cpu()
+function higher up in the file, so that __cpufreq_add_dev() can invoke
+it).
+
+Reported-and-tested-by: Stephen Warren <swarren@nvidia.com>
+	Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 0d66b91ebff49841f607a3c079984c907c8a4199)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 806f30d4db8c,62bdb955ea56..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -911,16 -901,66 +911,79 @@@ static int cpufreq_add_policy_cpu(unsig
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/**
+ + * cpufreq_add_dev - add a CPU device
+ + *
+ + * Adds the cpufreq interface for a CPU device.
+ + *
+ + * The Oracle says: try running cpufreq registration/unregistration concurrently
+ + * with with cpu hotplugging and all hell will break loose. Tried to clean this
+ + * mess up, but more thorough testing is needed. - Mathieu
+ + */
+ +static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
++ {
++ 	struct cpufreq_policy *policy;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 
++ 	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
++ 
++ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++ 
++ 	return policy;
++ }
++ 
++ static struct cpufreq_policy *cpufreq_policy_alloc(void)
++ {
++ 	struct cpufreq_policy *policy;
++ 
++ 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
++ 	if (!policy)
++ 		return NULL;
++ 
++ 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
++ 		goto err_free_policy;
++ 
++ 	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
++ 		goto err_free_cpumask;
++ 
++ 	INIT_LIST_HEAD(&policy->policy_list);
++ 	return policy;
++ 
++ err_free_cpumask:
++ 	free_cpumask_var(policy->cpus);
++ err_free_policy:
++ 	kfree(policy);
++ 
++ 	return NULL;
++ }
++ 
++ static void cpufreq_policy_free(struct cpufreq_policy *policy)
++ {
++ 	free_cpumask_var(policy->related_cpus);
++ 	free_cpumask_var(policy->cpus);
++ 	kfree(policy);
++ }
++ 
++ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
++ {
++ 	policy->last_cpu = policy->cpu;
++ 	policy->cpu = cpu;
++ 
++ #ifdef CONFIG_CPU_FREQ_TABLE
++ 	cpufreq_frequency_table_update_policy_cpu(policy);
++ #endif
++ 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 			CPUFREQ_UPDATE_POLICY_CPU, policy);
++ }
++ 
++ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
++ 			     bool frozen)
+++>>>>>>> 0d66b91ebff4 (cpufreq: Fix crash in cpufreq-stats during suspend/resume)
+  {
+  	unsigned int j, cpu = dev->id;
+  	int ret = -ENOMEM;
+@@@ -968,13 -1012,18 +1031,28 @@@
+  	if (!policy)
+  		goto nomem_out;
+  
+++<<<<<<< HEAD
+ +	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
+ +		goto err_free_policy;
+ +
+ +	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
+ +		goto err_free_cpumask;
+ +
+ +	policy->cpu = cpu;
+++=======
++ 
++ 	/*
++ 	 * In the resume path, since we restore a saved policy, the assignment
++ 	 * to policy->cpu is like an update of the existing policy, rather than
++ 	 * the creation of a brand new one. So we need to perform this update
++ 	 * by invoking update_policy_cpu().
++ 	 */
++ 	if (frozen && cpu != policy->cpu)
++ 		update_policy_cpu(policy, cpu);
++ 	else
++ 		policy->cpu = cpu;
++ 
+++>>>>>>> 0d66b91ebff4 (cpufreq: Fix crash in cpufreq-stats during suspend/resume)
+  	policy->governor = CPUFREQ_DEFAULT_GOVERNOR;
+  	cpumask_copy(policy->cpus, cpumask_of(cpu));
+  
+@@@ -1057,28 -1100,25 +1135,47 @@@ nomem_out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+ +{
+ +	int j;
+ +
+ +	policy->last_cpu = policy->cpu;
+ +	policy->cpu = cpu;
+ +
+ +	for_each_cpu(j, policy->cpus)
+ +		per_cpu(cpufreq_policy_cpu, j) = cpu;
+ +
+ +#ifdef CONFIG_CPU_FREQ_TABLE
+ +	cpufreq_frequency_table_update_policy_cpu(policy);
+ +#endif
+ +	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+ +			CPUFREQ_UPDATE_POLICY_CPU, policy);
+ +}
+ +
+ +static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *data,
+ +					   unsigned int old_cpu)
+++=======
++ /**
++  * cpufreq_add_dev - add a CPU device
++  *
++  * Adds the cpufreq interface for a CPU device.
++  *
++  * The Oracle says: try running cpufreq registration/unregistration concurrently
++  * with with cpu hotplugging and all hell will break loose. Tried to clean this
++  * mess up, but more thorough testing is needed. - Mathieu
++  */
++ static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
++ {
++ 	return __cpufreq_add_dev(dev, sif, false);
++ }
++ 
++ static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *policy,
++ 					   unsigned int old_cpu, bool frozen)
+++>>>>>>> 0d66b91ebff4 (cpufreq: Fix crash in cpufreq-stats during suspend/resume)
+  {
+  	struct device *cpu_dev;
+ +	unsigned long flags;
+  	int ret;
+  
+  	/* first sibling now owns the new sysfs dir */
+* Unmerged path drivers/cpufreq/cpufreq.c
