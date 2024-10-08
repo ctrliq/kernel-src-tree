@@ -1,0 +1,287 @@
+perf/x86: Improve accuracy of perf/sched clock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] kernel: Improve accuracy of perf/sched clock (Prarit Bhargava) [1303663]
+Rebuild_FUZZ: 88.89%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit b20112edeadf0b8a1416de061caa4beb11539902
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b20112ed.failed
+
+When TSC is stable perf/sched clock is based on it.
+However the conversion from cycles to nanoseconds
+is not as accurate as it could be.  Because
+CYC2NS_SCALE_FACTOR is 10, the accuracy is +/- 1/2048
+
+The change is to calculate the maximum shift that
+results in a multiplier that is still a 32-bit number.
+For example all frequencies over 1 GHz will have
+a shift of 32, making the accuracy of the conversion
++/- 1/(2^33).  That is achieved by using the
+'clocks_calc_mult_shift()' function.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1440147918-22250-1-git-send-email-adrian.hunter@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b20112edeadf0b8a1416de061caa4beb11539902)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/tsc.c
+diff --cc arch/x86/kernel/tsc.c
+index 7605aa369d68,39ec3d07affd..000000000000
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@@ -38,9 -38,235 +38,238 @@@ static int __read_mostly tsc_unstable
+     erroneous rdtsc usage on !cpu_has_tsc processors */
+  static int __read_mostly tsc_disabled = -1;
+  
+ -static DEFINE_STATIC_KEY_FALSE(__use_tsc);
+ +static struct static_key __use_tsc = STATIC_KEY_INIT;
+  
+  int tsc_clocksource_reliable;
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Use a ring-buffer like data structure, where a writer advances the head by
++  * writing a new data entry and a reader advances the tail when it observes a
++  * new entry.
++  *
++  * Writers are made to wait on readers until there's space to write a new
++  * entry.
++  *
++  * This means that we can always use an {offset, mul} pair to compute a ns
++  * value that is 'roughly' in the right direction, even if we're writing a new
++  * {offset, mul} pair during the clock read.
++  *
++  * The down-side is that we can no longer guarantee strict monotonicity anymore
++  * (assuming the TSC was that to begin with), because while we compute the
++  * intersection point of the two clock slopes and make sure the time is
++  * continuous at the point of switching; we can no longer guarantee a reader is
++  * strictly before or after the switch point.
++  *
++  * It does mean a reader no longer needs to disable IRQs in order to avoid
++  * CPU-Freq updates messing with his times, and similarly an NMI reader will
++  * no longer run the risk of hitting half-written state.
++  */
++ 
++ struct cyc2ns {
++ 	struct cyc2ns_data data[2];	/*  0 + 2*24 = 48 */
++ 	struct cyc2ns_data *head;	/* 48 + 8    = 56 */
++ 	struct cyc2ns_data *tail;	/* 56 + 8    = 64 */
++ }; /* exactly fits one cacheline */
++ 
++ static DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
++ 
++ struct cyc2ns_data *cyc2ns_read_begin(void)
++ {
++ 	struct cyc2ns_data *head;
++ 
++ 	preempt_disable();
++ 
++ 	head = this_cpu_read(cyc2ns.head);
++ 	/*
++ 	 * Ensure we observe the entry when we observe the pointer to it.
++ 	 * matches the wmb from cyc2ns_write_end().
++ 	 */
++ 	smp_read_barrier_depends();
++ 	head->__count++;
++ 	barrier();
++ 
++ 	return head;
++ }
++ 
++ void cyc2ns_read_end(struct cyc2ns_data *head)
++ {
++ 	barrier();
++ 	/*
++ 	 * If we're the outer most nested read; update the tail pointer
++ 	 * when we're done. This notifies possible pending writers
++ 	 * that we've observed the head pointer and that the other
++ 	 * entry is now free.
++ 	 */
++ 	if (!--head->__count) {
++ 		/*
++ 		 * x86-TSO does not reorder writes with older reads;
++ 		 * therefore once this write becomes visible to another
++ 		 * cpu, we must be finished reading the cyc2ns_data.
++ 		 *
++ 		 * matches with cyc2ns_write_begin().
++ 		 */
++ 		this_cpu_write(cyc2ns.tail, head);
++ 	}
++ 	preempt_enable();
++ }
++ 
++ /*
++  * Begin writing a new @data entry for @cpu.
++  *
++  * Assumes some sort of write side lock; currently 'provided' by the assumption
++  * that cpufreq will call its notifiers sequentially.
++  */
++ static struct cyc2ns_data *cyc2ns_write_begin(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 	struct cyc2ns_data *data = c2n->data;
++ 
++ 	if (data == c2n->head)
++ 		data++;
++ 
++ 	/* XXX send an IPI to @cpu in order to guarantee a read? */
++ 
++ 	/*
++ 	 * When we observe the tail write from cyc2ns_read_end(),
++ 	 * the cpu must be done with that entry and its safe
++ 	 * to start writing to it.
++ 	 */
++ 	while (c2n->tail == data)
++ 		cpu_relax();
++ 
++ 	return data;
++ }
++ 
++ static void cyc2ns_write_end(int cpu, struct cyc2ns_data *data)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	/*
++ 	 * Ensure the @data writes are visible before we publish the
++ 	 * entry. Matches the data-depencency in cyc2ns_read_begin().
++ 	 */
++ 	smp_wmb();
++ 
++ 	ACCESS_ONCE(c2n->head) = data;
++ }
++ 
++ /*
++  * Accelerators for sched_clock()
++  * convert from cycles(64bits) => nanoseconds (64bits)
++  *  basic equation:
++  *              ns = cycles / (freq / ns_per_sec)
++  *              ns = cycles * (ns_per_sec / freq)
++  *              ns = cycles * (10^9 / (cpu_khz * 10^3))
++  *              ns = cycles * (10^6 / cpu_khz)
++  *
++  *      Then we use scaling math (suggested by george@mvista.com) to get:
++  *              ns = cycles * (10^6 * SC / cpu_khz) / SC
++  *              ns = cycles * cyc2ns_scale / SC
++  *
++  *      And since SC is a constant power of two, we can convert the div
++  *  into a shift. The larger SC is, the more accurate the conversion, but
++  *  cyc2ns_scale needs to be a 32-bit value so that 32-bit multiplication
++  *  (64-bit result) can be used.
++  *
++  *  We can use khz divisor instead of mhz to keep a better precision.
++  *  (mathieu.desnoyers@polymtl.ca)
++  *
++  *                      -johnstul@us.ibm.com "math is hard, lets go shopping!"
++  */
++ 
++ static void cyc2ns_data_init(struct cyc2ns_data *data)
++ {
++ 	data->cyc2ns_mul = 0;
++ 	data->cyc2ns_shift = 0;
++ 	data->cyc2ns_offset = 0;
++ 	data->__count = 0;
++ }
++ 
++ static void cyc2ns_init(int cpu)
++ {
++ 	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
++ 
++ 	cyc2ns_data_init(&c2n->data[0]);
++ 	cyc2ns_data_init(&c2n->data[1]);
++ 
++ 	c2n->head = c2n->data;
++ 	c2n->tail = c2n->data;
++ }
++ 
++ static inline unsigned long long cycles_2_ns(unsigned long long cyc)
++ {
++ 	struct cyc2ns_data *data, *tail;
++ 	unsigned long long ns;
++ 
++ 	/*
++ 	 * See cyc2ns_read_*() for details; replicated in order to avoid
++ 	 * an extra few instructions that came with the abstraction.
++ 	 * Notable, it allows us to only do the __count and tail update
++ 	 * dance when its actually needed.
++ 	 */
++ 
++ 	preempt_disable_notrace();
++ 	data = this_cpu_read(cyc2ns.head);
++ 	tail = this_cpu_read(cyc2ns.tail);
++ 
++ 	if (likely(data == tail)) {
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, data->cyc2ns_shift);
++ 	} else {
++ 		data->__count++;
++ 
++ 		barrier();
++ 
++ 		ns = data->cyc2ns_offset;
++ 		ns += mul_u64_u32_shr(cyc, data->cyc2ns_mul, data->cyc2ns_shift);
++ 
++ 		barrier();
++ 
++ 		if (!--data->__count)
++ 			this_cpu_write(cyc2ns.tail, data);
++ 	}
++ 	preempt_enable_notrace();
++ 
++ 	return ns;
++ }
++ 
++ static void set_cyc2ns_scale(unsigned long cpu_khz, int cpu)
++ {
++ 	unsigned long long tsc_now, ns_now;
++ 	struct cyc2ns_data *data;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	sched_clock_idle_sleep_event();
++ 
++ 	if (!cpu_khz)
++ 		goto done;
++ 
++ 	data = cyc2ns_write_begin(cpu);
++ 
++ 	tsc_now = rdtsc();
++ 	ns_now = cycles_2_ns(tsc_now);
++ 
++ 	/*
++ 	 * Compute a new multiplier as per the above comment and ensure our
++ 	 * time function is continuous; see the comment near struct
++ 	 * cyc2ns_data.
++ 	 */
++ 	clocks_calc_mult_shift(&data->cyc2ns_mul, &data->cyc2ns_shift, cpu_khz,
++ 			       NSEC_PER_MSEC, 0);
++ 
++ 	data->cyc2ns_offset = ns_now -
++ 		mul_u64_u32_shr(tsc_now, data->cyc2ns_mul, data->cyc2ns_shift);
++ 
++ 	cyc2ns_write_end(cpu, data);
++ 
++ done:
++ 	sched_clock_idle_wakeup_event(0);
++ 	local_irq_restore(flags);
++ }
+++>>>>>>> b20112edeadf (perf/x86: Improve accuracy of perf/sched clock)
+  /*
+   * Scheduler clock - returns current time in nanosec units.
+   */
+* Unmerged path arch/x86/kernel/tsc.c
