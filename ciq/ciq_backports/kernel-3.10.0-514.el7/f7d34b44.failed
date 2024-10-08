@@ -1,0 +1,261 @@
+USB: Add support for usbfs zerocopy.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] usb: Add support for usbfs zerocopy (Torez Smith) [1332712]
+Rebuild_FUZZ: 98.59%
+commit-author Steinar H. Gunderson <sesse@google.com>
+commit f7d34b445abc00e979b7cf36b9580ac3d1a47cd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f7d34b44.failed
+
+Add a new interface for userspace to preallocate memory that can be
+used with usbfs. This gives two primary benefits:
+
+ - Zerocopy; data no longer needs to be copied between the userspace
+   and the kernel, but can instead be read directly by the driver from
+   userspace's buffers. This works for all kinds of transfers (even if
+   nonsensical for control and interrupt transfers); isochronous also
+   no longer need to memset() the buffer to zero to avoid leaking kernel data.
+
+ - Once the buffers are allocated, USB transfers can no longer fail due to
+   memory fragmentation; previously, long-running programs could run into
+   problems finding a large enough contiguous memory chunk, especially on
+   embedded systems or at high rates.
+
+Memory is allocated by using mmap() against the usbfs file descriptor,
+and similarly deallocated by munmap(). Once memory has been allocated,
+using it as pointers to a bulk or isochronous operation means you will
+automatically get zerocopy behavior. Note that this also means you cannot
+modify outgoing data until the transfer is complete. The same holds for
+data on the same cache lines as incoming data; DMA modifying them at the
+same time could lead to your changes being overwritten.
+
+There's a new capability USBDEVFS_CAP_MMAP that userspace can query to see
+if the running kernel supports this functionality, if just trying mmap() is
+not acceptable.
+
+Largely based on a patch by Markus Rechberger with some updates. The original
+patch can be found at:
+
+  http://sundtek.de/support/devio_mmap_v0.4.diff
+
+	Signed-off-by: Steinar H. Gunderson <sesse@google.com>
+	Signed-off-by: Markus Rechberger <mrechberger@gmail.com>
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit f7d34b445abc00e979b7cf36b9580ac3d1a47cd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/devio.c
+diff --cc drivers/usb/core/devio.c
+index 406c1b0a9a5c,39da1662b76f..000000000000
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@@ -79,9 -81,20 +81,20 @@@ struct dev_state 
+  	u32 disabled_bulk_eps;
+  };
+  
++ struct usb_memory {
++ 	struct list_head memlist;
++ 	int vma_use_count;
++ 	int urb_use_count;
++ 	u32 size;
++ 	void *mem;
++ 	dma_addr_t dma_handle;
++ 	unsigned long vm_start;
++ 	struct usb_dev_state *ps;
++ };
++ 
+  struct async {
+  	struct list_head asynclist;
+ -	struct usb_dev_state *ps;
+ +	struct dev_state *ps;
+  	struct pid *pid;
+  	const struct cred *cred;
+  	unsigned int signr;
+@@@ -162,27 -176,108 +176,132 @@@ static int connected(struct dev_state *
+  			ps->dev->state != USB_STATE_NOTATTACHED);
+  }
+  
+++<<<<<<< HEAD
+ +static loff_t usbdev_lseek(struct file *file, loff_t offset, int orig)
+ +{
+ +	loff_t ret;
+ +
+ +	mutex_lock(&file_inode(file)->i_mutex);
+ +
+ +	switch (orig) {
+ +	case 0:
+ +		file->f_pos = offset;
+ +		ret = file->f_pos;
+ +		break;
+ +	case 1:
+ +		file->f_pos += offset;
+ +		ret = file->f_pos;
+ +		break;
+ +	case 2:
+ +	default:
+ +		ret = -EINVAL;
+ +	}
+ +
+ +	mutex_unlock(&file_inode(file)->i_mutex);
+++=======
++ static void dec_usb_memory_use_count(struct usb_memory *usbm, int *count)
++ {
++ 	struct usb_dev_state *ps = usbm->ps;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ps->lock, flags);
++ 	--*count;
++ 	if (usbm->urb_use_count == 0 && usbm->vma_use_count == 0) {
++ 		list_del(&usbm->memlist);
++ 		spin_unlock_irqrestore(&ps->lock, flags);
++ 
++ 		usb_free_coherent(ps->dev, usbm->size, usbm->mem,
++ 				usbm->dma_handle);
++ 		usbfs_decrease_memory_usage(
++ 			usbm->size + sizeof(struct usb_memory));
++ 		kfree(usbm);
++ 	} else {
++ 		spin_unlock_irqrestore(&ps->lock, flags);
++ 	}
++ }
++ 
++ static void usbdev_vm_open(struct vm_area_struct *vma)
++ {
++ 	struct usb_memory *usbm = vma->vm_private_data;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&usbm->ps->lock, flags);
++ 	++usbm->vma_use_count;
++ 	spin_unlock_irqrestore(&usbm->ps->lock, flags);
++ }
++ 
++ static void usbdev_vm_close(struct vm_area_struct *vma)
++ {
++ 	struct usb_memory *usbm = vma->vm_private_data;
++ 
++ 	dec_usb_memory_use_count(usbm, &usbm->vma_use_count);
++ }
++ 
++ struct vm_operations_struct usbdev_vm_ops = {
++ 	.open = usbdev_vm_open,
++ 	.close = usbdev_vm_close
++ };
++ 
++ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	struct usb_memory *usbm = NULL;
++ 	struct usb_dev_state *ps = file->private_data;
++ 	size_t size = vma->vm_end - vma->vm_start;
++ 	void *mem;
++ 	unsigned long flags;
++ 	dma_addr_t dma_handle;
++ 	int ret;
++ 
++ 	ret = usbfs_increase_memory_usage(size + sizeof(struct usb_memory));
++ 	if (ret)
++ 		goto error;
++ 
++ 	usbm = kzalloc(sizeof(struct usb_memory), GFP_KERNEL);
++ 	if (!usbm) {
++ 		ret = -ENOMEM;
++ 		goto error_decrease_mem;
++ 	}
++ 
++ 	mem = usb_alloc_coherent(ps->dev, size, GFP_USER, &dma_handle);
++ 	if (!mem) {
++ 		ret = -ENOMEM;
++ 		goto error_free_usbm;
++ 	}
++ 
++ 	memset(mem, 0, size);
++ 
++ 	usbm->mem = mem;
++ 	usbm->dma_handle = dma_handle;
++ 	usbm->size = size;
++ 	usbm->ps = ps;
++ 	usbm->vm_start = vma->vm_start;
++ 	usbm->vma_use_count = 1;
++ 	INIT_LIST_HEAD(&usbm->memlist);
++ 
++ 	if (remap_pfn_range(vma, vma->vm_start,
++ 			virt_to_phys(usbm->mem) >> PAGE_SHIFT,
++ 			size, vma->vm_page_prot) < 0) {
++ 		dec_usb_memory_use_count(usbm, &usbm->vma_use_count);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	vma->vm_flags |= VM_IO;
++ 	vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
++ 	vma->vm_ops = &usbdev_vm_ops;
++ 	vma->vm_private_data = usbm;
++ 
++ 	spin_lock_irqsave(&ps->lock, flags);
++ 	list_add_tail(&usbm->memlist, &ps->memory_list);
++ 	spin_unlock_irqrestore(&ps->lock, flags);
++ 
++ 	return 0;
++ 
++ error_free_usbm:
++ 	kfree(usbm);
++ error_decrease_mem:
++ 	usbfs_decrease_memory_usage(size + sizeof(struct usb_memory));
++ error:
+++>>>>>>> f7d34b445abc (USB: Add support for usbfs zerocopy.)
+  	return ret;
+  }
+  
+@@@ -1290,7 -1392,32 +1416,36 @@@ static int proc_setconfig(struct dev_st
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+ +static int proc_do_submiturb(struct dev_state *ps, struct usbdevfs_urb *uurb,
+++=======
++ static struct usb_memory *
++ find_memory_area(struct usb_dev_state *ps, const struct usbdevfs_urb *uurb)
++ {
++ 	struct usb_memory *usbm = NULL, *iter;
++ 	unsigned long flags;
++ 	unsigned long uurb_start = (unsigned long)uurb->buffer;
++ 
++ 	spin_lock_irqsave(&ps->lock, flags);
++ 	list_for_each_entry(iter, &ps->memory_list, memlist) {
++ 		if (uurb_start >= iter->vm_start &&
++ 				uurb_start < iter->vm_start + iter->size) {
++ 			if (uurb->buffer_length > iter->vm_start + iter->size -
++ 					uurb_start) {
++ 				usbm = ERR_PTR(-EINVAL);
++ 			} else {
++ 				usbm = iter;
++ 				usbm->urb_use_count++;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&ps->lock, flags);
++ 	return usbm;
++ }
++ 
++ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb,
+++>>>>>>> f7d34b445abc (USB: Add support for usbfs zerocopy.)
+  			struct usbdevfs_iso_packet_desc __user *iso_frame_desc,
+  			void __user *arg)
+  {
+* Unmerged path drivers/usb/core/devio.c
+diff --git a/include/uapi/linux/usbdevice_fs.h b/include/uapi/linux/usbdevice_fs.h
+index 019ba1e0799a..ecbd17650e6c 100644
+--- a/include/uapi/linux/usbdevice_fs.h
++++ b/include/uapi/linux/usbdevice_fs.h
+@@ -134,6 +134,7 @@ struct usbdevfs_hub_portinfo {
+ #define USBDEVFS_CAP_NO_PACKET_SIZE_LIM		0x04
+ #define USBDEVFS_CAP_BULK_SCATTER_GATHER	0x08
+ #define USBDEVFS_CAP_REAP_AFTER_DISCONNECT	0x10
++#define USBDEVFS_CAP_MMAP			0x20
+ 
+ /* USBDEVFS_DISCONNECT_CLAIM flags & struct */
+ 
