@@ -1,0 +1,411 @@
+KVM: PPC: Book3S HV: Streamline guest entry and exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] ppc: book3s-hv: Streamline guest entry and exit (Laurent Vivier) [1213669]
+Rebuild_FUZZ: 92.93%
+commit-author Paul Mackerras <paulus@samba.org>
+commit 6af27c847ad1b889c29a641dfc41f2d78c46a048
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6af27c84.failed
+
+On entry to the guest, secondary threads now wait for the primary to
+switch the MMU after loading up most of their state, rather than before.
+This means that the secondary threads get into the guest sooner, in the
+common case where the secondary threads get to kvmppc_hv_entry before
+the primary thread.
+
+On exit, the first thread out increments the exit count and interrupts
+the other threads (to get them out of the guest) before saving most
+of its state, rather than after.  That means that the other threads
+exit sooner and means that the first thread doesn't spend so much
+time waiting for the other threads at the point where the MMU gets
+switched back to the host.
+
+This pulls out the code that increments the exit count and interrupts
+other threads into a separate function, kvmhv_commence_exit().
+This also makes sure that r12 and vcpu->arch.trap are set correctly
+in some corner cases.
+
+Statistics from /sys/kernel/debug/kvm/vm*/vcpu*/timings show the
+improvement.  Aggregating across vcpus for a guest with 32 vcpus,
+8 threads/vcore, running on a POWER8, gives this before the change:
+
+ rm_entry:     avg 4537.3ns (222 - 48444, 1068878 samples)
+  rm_exit:     avg 4787.6ns (152 - 165490, 1010717 samples)
+  rm_intr:     avg 1673.6ns (12 - 341304, 3818691 samples)
+
+and this after the change:
+
+ rm_entry:     avg 3427.7ns (232 - 68150, 1118921 samples)
+  rm_exit:     avg 4716.0ns (12 - 150720, 1119477 samples)
+  rm_intr:     avg 1614.8ns (12 - 522436, 3850432 samples)
+
+showing a substantial reduction in the time spent per guest entry in
+the real-mode guest entry code, and smaller reductions in the real
+mode guest exit and interrupt handling times.  (The test was to start
+the guest and boot Fedora 20 big-endian to the login prompt.)
+
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit 6af27c847ad1b889c29a641dfc41f2d78c46a048)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 499fdba9ddf8,3f6fd78cccd2..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -178,6 -169,25 +178,25 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206
+  
+  kvmppc_primary_no_guest:
+  	/* We handle this much like a ceded vcpu */
+++<<<<<<< HEAD
+++=======
++ 	/* put the HDEC into the DEC, since HDEC interrupts don't wake us */
++ 	mfspr	r3, SPRN_HDEC
++ 	mtspr	SPRN_DEC, r3
++ 	/*
++ 	 * Make sure the primary has finished the MMU switch.
++ 	 * We should never get here on a secondary thread, but
++ 	 * check it for robustness' sake.
++ 	 */
++ 	ld	r5, HSTATE_KVM_VCORE(r13)
++ 65:	lbz	r0, VCORE_IN_GUEST(r5)
++ 	cmpwi	r0, 0
++ 	beq	65b
++ 	/* Set LPCR. */
++ 	ld	r8,VCORE_LPCR(r5)
++ 	mtspr	SPRN_LPCR,r8
++ 	isync
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+  	/* set our bit in napping_threads */
+  	ld	r5, HSTATE_KVM_VCORE(r13)
+  	lbz	r7, HSTATE_PTID(r13)
+@@@ -231,10 -242,30 +250,18 @@@ kvm_novcpu_wakeup
+  	/* Got an IPI but other vcpus aren't yet exiting, must be a latecomer */
+  	ld	r4, HSTATE_KVM_VCPU(r13)
+  	cmpdi	r4, 0
+ -	beq	kvmppc_primary_no_guest
+ -
+ -#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
+ -	addi	r3, r4, VCPU_TB_RMENTRY
+ -	bl	kvmhv_start_timing
+ -#endif
+ -	b	kvmppc_got_guest
+ +	bne	kvmppc_got_guest
+  
+  kvm_novcpu_exit:
+- 	b	hdec_soon
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	ld	r4, HSTATE_KVM_VCPU(r13)
++ 	cmpdi	r4, 0
++ 	beq	13f
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 13:	bl	kvmhv_commence_exit
++ 	b	kvmhv_switch_to_host
+  
+  /*
+   * We come in here when wakened from nap mode.
+@@@ -403,9 -442,8 +430,9 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201
+  
+  	/* Primary thread switches to guest partition. */
+  	ld	r9,VCORE_KVM(r5)	/* pointer to struct kvm */
+ +	lbz	r6,HSTATE_PTID(r13)
+  	cmpwi	r6,0
+- 	bne	20f
++ 	bne	10f
+  	ld	r6,KVM_SDR1(r9)
+  	lwz	r7,KVM_LPID(r9)
+  	li	r0,LPID_RSVD		/* switch to reserved LPID */
+@@@ -476,118 -514,9 +503,121 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  
+  	li	r0,1
+  	stb	r0,VCORE_IN_GUEST(r5)	/* signal secondaries to continue */
+++<<<<<<< HEAD
+ +	b	10f
+ +
+ +	/* Secondary threads wait for primary to have done partition switch */
+ +20:	lbz	r0,VCORE_IN_GUEST(r5)
+ +	cmpwi	r0,0
+ +	beq	20b
+ +
+ +	/* Set LPCR and RMOR. */
+ +10:	ld	r8,VCORE_LPCR(r5)
+ +	mtspr	SPRN_LPCR,r8
+ +	ld	r8,KVM_RMOR(r9)
+ +	mtspr	SPRN_RMOR,r8
+ +	isync
+ +
+ +	/* Check if HDEC expires soon */
+ +	mfspr	r3,SPRN_HDEC
+ +	cmpwi	r3,512		/* 1 microsecond */
+ +	li	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+ +	blt	hdec_soon
+ +	b	31f
+++=======
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+ +
+ +	/*
+ +	 * PPC970 host -> guest partition switch code.
+ +	 * We have to lock against concurrent tlbies,
+ +	 * using native_tlbie_lock to lock against host tlbies
+ +	 * and kvm->arch.tlbie_lock to lock against guest tlbies.
+ +	 * We also have to invalidate the TLB since its
+ +	 * entries aren't tagged with the LPID.
+ +	 */
+ +30:	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	ld	r9,VCORE_KVM(r5)	/* pointer to struct kvm */
+ +
+ +	/* first take native_tlbie_lock */
+ +	.section ".toc","aw"
+ +toc_tlbie_lock:
+ +	.tc	native_tlbie_lock[TC],native_tlbie_lock
+ +	.previous
+ +	ld	r3,toc_tlbie_lock@toc(r2)
+ +#ifdef __BIG_ENDIAN__
+ +	lwz	r8,PACA_LOCK_TOKEN(r13)
+ +#else
+ +	lwz	r8,PACAPACAINDEX(r13)
+ +#endif
+ +24:	lwarx	r0,0,r3
+ +	cmpwi	r0,0
+ +	bne	24b
+ +	stwcx.	r8,0,r3
+ +	bne	24b
+ +	isync
+ +
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	ld	r7,VCORE_LPCR(r5)	/* use vcore->lpcr to store HID4 */
+ +	li	r0,0x18f
+ +	rotldi	r0,r0,HID4_LPID5_SH	/* all lpid bits in HID4 = 1 */
+ +	or	r0,r7,r0
+ +	ptesync
+ +	sync
+ +	mtspr	SPRN_HID4,r0		/* switch to reserved LPID */
+ +	isync
+ +	li	r0,0
+ +	stw	r0,0(r3)		/* drop native_tlbie_lock */
+ +
+ +	/* invalidate the whole TLB */
+ +	li	r0,256
+ +	mtctr	r0
+ +	li	r6,0
+ +25:	tlbiel	r6
+ +	addi	r6,r6,0x1000
+ +	bdnz	25b
+ +	ptesync
+ +
+ +	/* Take the guest's tlbie_lock */
+ +	addi	r3,r9,KVM_TLBIE_LOCK
+ +24:	lwarx	r0,0,r3
+ +	cmpwi	r0,0
+ +	bne	24b
+ +	stwcx.	r8,0,r3
+ +	bne	24b
+ +	isync
+ +	ld	r6,KVM_SDR1(r9)
+ +	mtspr	SPRN_SDR1,r6		/* switch to partition page table */
+ +
+ +	/* Set up HID4 with the guest's LPID etc. */
+ +	sync
+ +	mtspr	SPRN_HID4,r7
+ +	isync
+ +
+ +	/* drop the guest's tlbie_lock */
+ +	li	r0,0
+ +	stw	r0,0(r3)
+ +
+ +	/* Check if HDEC expires soon */
+ +	mfspr	r3,SPRN_HDEC
+ +	cmpwi	r3,10
+ +	li	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+ +	blt	hdec_soon
+  
+ +	/* Enable HDEC interrupts */
+ +	mfspr	r0,SPRN_HID0
+ +	li	r3,1
+ +	rldimi	r0,r3, HID0_HDICE_SH, 64-HID0_HDICE_SH-1
+ +	sync
+ +	mtspr	SPRN_HID0,r0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +	mfspr	r0,SPRN_HID0
+ +31:
+  	/* Do we have a guest vcpu to run? */
+- 	cmpdi	r4, 0
++ 10:	cmpdi	r4, 0
+  	beq	kvmppc_primary_no_guest
+  kvmppc_got_guest:
+  
+@@@ -1029,6 -970,27 +1083,30 @@@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR
+  	hrfid
+  	b	.
+  
+++<<<<<<< HEAD
+++=======
++ secondary_too_late:
++ 	li	r12, 0
++ 	cmpdi	r4, 0
++ 	beq	11f
++ 	stw	r12, VCPU_TRAP(r4)
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 11:	b	kvmhv_switch_to_host
++ 
++ hdec_soon:
++ 	li	r12, BOOK3S_INTERRUPT_HV_DECREMENTER
++ 	stw	r12, VCPU_TRAP(r4)
++ 	mr	r9, r4
++ #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
++ 	addi	r3, r4, VCPU_TB_RMEXIT
++ 	bl	kvmhv_accumulate_time
++ #endif
++ 	b	guest_exit_cont
++ 
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+  /******************************************************************************
+   *                                                                            *
+   *                               Exit code                                    *
+@@@ -1183,11 -1143,9 +1261,15 @@@ guest_exit_cont:		/* r9 = vcpu, r12 = t
+  	mfdsisr	r7
+  	std	r6, VCPU_DAR(r9)
+  	stw	r7, VCPU_DSISR(r9)
+ +BEGIN_FTR_SECTION
+  	/* don't overwrite fault_dar/fault_dsisr if HDSI */
+  	cmpwi	r12,BOOK3S_INTERRUPT_H_DATA_STORAGE
+++<<<<<<< HEAD
+ +	beq	6f
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+++=======
++ 	beq	mc_cont
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+  	std	r6, VCPU_FAULT_DAR(r9)
+  	stw	r7, VCPU_FAULT_DSISR(r9)
+  
+@@@ -1195,9 -1153,17 +1277,12 @@@
+  	cmpwi	r12, BOOK3S_INTERRUPT_MACHINE_CHECK
+  	beq	machine_check_realmode
+  mc_cont:
+ -#ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING
+ -	addi	r3, r9, VCPU_TB_RMEXIT
+ -	mr	r4, r9
+ -	bl	kvmhv_accumulate_time
+ -#endif
+  
++ 	/* Increment exit count, poke other threads to exit */
++ 	bl	kvmhv_commence_exit
++ 
+  	/* Save guest CTRL register, set runlatch to 1 */
+- 6:	mfspr	r6,SPRN_CTRLF
++ 	mfspr	r6,SPRN_CTRLF
+  	stw	r6,VCPU_CTRL(r9)
+  	andi.	r0,r6,1
+  	bne	4f
+@@@ -1555,71 -1505,14 +1640,78 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  	slbia
+  	ptesync
+  
+++<<<<<<< HEAD
+ +hdec_soon:			/* r12 = trap, r13 = paca */
+ +BEGIN_FTR_SECTION
+ +	b	32f
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+++=======
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+  	/*
+ -	 * POWER7/POWER8 guest -> host partition switch code.
+ +	 * POWER7 guest -> host partition switch code.
+  	 * We don't have to lock against tlbies but we do
+  	 * have to coordinate the hardware threads.
+  	 */
+++<<<<<<< HEAD
+ +	/* Increment the threads-exiting-guest count in the 0xff00
+ +	   bits of vcore->entry_exit_count */
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	addi	r6,r5,VCORE_ENTRY_EXIT
+ +41:	lwarx	r3,0,r6
+ +	addi	r0,r3,0x100
+ +	stwcx.	r0,0,r6
+ +	bne	41b
+ +	isync		/* order stwcx. vs. reading napping_threads */
+ +
+ +	/*
+ +	 * At this point we have an interrupt that we have to pass
+ +	 * up to the kernel or qemu; we can't handle it in real mode.
+ +	 * Thus we have to do a partition switch, so we have to
+ +	 * collect the other threads, if we are the first thread
+ +	 * to take an interrupt.  To do this, we set the HDEC to 0,
+ +	 * which causes an HDEC interrupt in all threads within 2ns
+ +	 * because the HDEC register is shared between all 4 threads.
+ +	 * However, we don't need to bother if this is an HDEC
+ +	 * interrupt, since the other threads will already be on their
+ +	 * way here in that case.
+ +	 */
+ +	cmpwi	r3,0x100	/* Are we the first here? */
+ +	bge	43f
+ +	cmpwi	r12,BOOK3S_INTERRUPT_HV_DECREMENTER
+ +	beq	40f
+ +	li	r0,0
+ +	mtspr	SPRN_HDEC,r0
+ +40:
+ +	/*
+ +	 * Send an IPI to any napping threads, since an HDEC interrupt
+ +	 * doesn't wake CPUs up from nap.
+ +	 */
+ +	lwz	r3,VCORE_NAPPING_THREADS(r5)
+ +	lbz	r4,HSTATE_PTID(r13)
+ +	li	r0,1
+ +	sld	r0,r0,r4
+ +	andc.	r3,r3,r0		/* no sense IPI'ing ourselves */
+ +	beq	43f
+ +	/* Order entry/exit update vs. IPIs */
+ +	sync
+ +	mulli	r4,r4,PACA_SIZE		/* get paca for thread 0 */
+ +	subf	r6,r4,r13
+ +42:	andi.	r0,r3,1
+ +	beq	44f
+ +	ld	r8,HSTATE_XICS_PHYS(r6)	/* get thread's XICS reg addr */
+ +	li	r0,IPI_PRIORITY
+ +	li	r7,XICS_MFRR
+ +	stbcix	r0,r7,r8		/* trigger the IPI */
+ +44:	srdi.	r3,r3,1
+ +	addi	r6,r6,PACA_SIZE
+ +	bne	42b
+ +
+ +secondary_too_late:
+++=======
++ kvmhv_switch_to_host:
+++>>>>>>> 6af27c847ad1 (KVM: PPC: Book3S HV: Streamline guest entry and exit)
+  	/* Secondary threads wait for primary to do partition switch */
+- 43:	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r5,HSTATE_KVM_VCORE(r13)
+  	ld	r4,VCORE_KVM(r5)	/* pointer to struct kvm */
+  	lbz	r3,HSTATE_PTID(r13)
+  	cmpwi	r3,0
+@@@ -2112,13 -2106,10 +2261,13 @@@ _GLOBAL(kvmppc_h_cede
+  	lbz	r5,VCPU_PRODDED(r3)
+  	cmpwi	r5,0
+  	bne	kvm_cede_prodded
+- 	li	r0,0		/* set trap to 0 to say hcall is handled */
+- 	stw	r0,VCPU_TRAP(r3)
++ 	li	r12,0		/* set trap to 0 to say hcall is handled */
++ 	stw	r12,VCPU_TRAP(r3)
+  	li	r0,H_SUCCESS
+  	std	r0,VCPU_GPR(R3)(r3)
+ +BEGIN_FTR_SECTION
+ +	b	kvm_cede_exit	/* just send it up to host on 970 */
+ +END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+  
+  	/*
+  	 * Set our bit in the bitmask of napping threads unless all the
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
