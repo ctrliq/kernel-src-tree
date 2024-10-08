@@ -1,0 +1,650 @@
+crypto: Resolve shadow warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mark Rustad <mark.d.rustad@intel.com>
+commit 3e3dc25fe7d5e33026bdfca5e8fab08be6a8729c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/3e3dc25f.failed
+
+Change formal parameters to not clash with global names to
+eliminate many W=2 warnings.
+
+	Signed-off-by: Mark Rustad <mark.d.rustad@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 3e3dc25fe7d5e33026bdfca5e8fab08be6a8729c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/tcrypt.c
+diff --cc crypto/tcrypt.c
+index 25a5934f0e50,890449e6e7ef..000000000000
+--- a/crypto/tcrypt.c
++++ b/crypto/tcrypt.c
+@@@ -137,9 -142,276 +137,280 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static u32 block_sizes[] = { 16, 64, 256, 1024, 8192, 0 };
+++=======
++ static int test_aead_jiffies(struct aead_request *req, int enc,
++ 				int blen, int secs)
++ {
++ 	unsigned long start, end;
++ 	int bcount;
++ 	int ret;
++ 
++ 	for (start = jiffies, end = start + secs * HZ, bcount = 0;
++ 	     time_before(jiffies, end); bcount++) {
++ 		if (enc)
++ 			ret = crypto_aead_encrypt(req);
++ 		else
++ 			ret = crypto_aead_decrypt(req);
++ 
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	printk("%d operations in %d seconds (%ld bytes)\n",
++ 	       bcount, secs, (long)bcount * blen);
++ 	return 0;
++ }
++ 
++ static int test_aead_cycles(struct aead_request *req, int enc, int blen)
++ {
++ 	unsigned long cycles = 0;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	local_irq_disable();
++ 
++ 	/* Warm-up run. */
++ 	for (i = 0; i < 4; i++) {
++ 		if (enc)
++ 			ret = crypto_aead_encrypt(req);
++ 		else
++ 			ret = crypto_aead_decrypt(req);
++ 
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	/* The real thing. */
++ 	for (i = 0; i < 8; i++) {
++ 		cycles_t start, end;
++ 
++ 		start = get_cycles();
++ 		if (enc)
++ 			ret = crypto_aead_encrypt(req);
++ 		else
++ 			ret = crypto_aead_decrypt(req);
++ 		end = get_cycles();
++ 
++ 		if (ret)
++ 			goto out;
++ 
++ 		cycles += end - start;
++ 	}
++ 
++ out:
++ 	local_irq_enable();
++ 
++ 	if (ret == 0)
++ 		printk("1 operation in %lu cycles (%d bytes)\n",
++ 		       (cycles + 4) / 8, blen);
++ 
++ 	return ret;
++ }
++ 
++ static u32 block_sizes[] = { 16, 64, 256, 1024, 8192, 0 };
++ static u32 aead_sizes[] = { 16, 64, 256, 512, 1024, 2048, 4096, 8192, 0 };
++ 
++ #define XBUFSIZE 8
++ #define MAX_IVLEN 32
++ 
++ static int testmgr_alloc_buf(char *buf[XBUFSIZE])
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < XBUFSIZE; i++) {
++ 		buf[i] = (void *)__get_free_page(GFP_KERNEL);
++ 		if (!buf[i])
++ 			goto err_free_buf;
++ 	}
++ 
++ 	return 0;
++ 
++ err_free_buf:
++ 	while (i-- > 0)
++ 		free_page((unsigned long)buf[i]);
++ 
++ 	return -ENOMEM;
++ }
++ 
++ static void testmgr_free_buf(char *buf[XBUFSIZE])
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < XBUFSIZE; i++)
++ 		free_page((unsigned long)buf[i]);
++ }
++ 
++ static void sg_init_aead(struct scatterlist *sg, char *xbuf[XBUFSIZE],
++ 			unsigned int buflen)
++ {
++ 	int np = (buflen + PAGE_SIZE - 1)/PAGE_SIZE;
++ 	int k, rem;
++ 
++ 	np = (np > XBUFSIZE) ? XBUFSIZE : np;
++ 	rem = buflen % PAGE_SIZE;
++ 	if (np > XBUFSIZE) {
++ 		rem = PAGE_SIZE;
++ 		np = XBUFSIZE;
++ 	}
++ 	sg_init_table(sg, np);
++ 	for (k = 0; k < np; ++k) {
++ 		if (k == (np-1))
++ 			sg_set_buf(&sg[k], xbuf[k], rem);
++ 		else
++ 			sg_set_buf(&sg[k], xbuf[k], PAGE_SIZE);
++ 	}
++ }
++ 
++ static void test_aead_speed(const char *algo, int enc, unsigned int secs,
++ 			    struct aead_speed_template *template,
++ 			    unsigned int tcount, u8 authsize,
++ 			    unsigned int aad_size, u8 *keysize)
++ {
++ 	unsigned int i, j;
++ 	struct crypto_aead *tfm;
++ 	int ret = -ENOMEM;
++ 	const char *key;
++ 	struct aead_request *req;
++ 	struct scatterlist *sg;
++ 	struct scatterlist *asg;
++ 	struct scatterlist *sgout;
++ 	const char *e;
++ 	void *assoc;
++ 	char iv[MAX_IVLEN];
++ 	char *xbuf[XBUFSIZE];
++ 	char *xoutbuf[XBUFSIZE];
++ 	char *axbuf[XBUFSIZE];
++ 	unsigned int *b_size;
++ 	unsigned int iv_len;
++ 
++ 	if (aad_size >= PAGE_SIZE) {
++ 		pr_err("associate data length (%u) too big\n", aad_size);
++ 		return;
++ 	}
++ 
++ 	if (enc == ENCRYPT)
++ 		e = "encryption";
++ 	else
++ 		e = "decryption";
++ 
++ 	if (testmgr_alloc_buf(xbuf))
++ 		goto out_noxbuf;
++ 	if (testmgr_alloc_buf(axbuf))
++ 		goto out_noaxbuf;
++ 	if (testmgr_alloc_buf(xoutbuf))
++ 		goto out_nooutbuf;
++ 
++ 	sg = kmalloc(sizeof(*sg) * 8 * 3, GFP_KERNEL);
++ 	if (!sg)
++ 		goto out_nosg;
++ 	asg = &sg[8];
++ 	sgout = &asg[8];
++ 
++ 	tfm = crypto_alloc_aead(algo, 0, 0);
++ 
++ 	if (IS_ERR(tfm)) {
++ 		pr_err("alg: aead: Failed to load transform for %s: %ld\n", algo,
++ 		       PTR_ERR(tfm));
++ 		goto out_notfm;
++ 	}
++ 
++ 	printk(KERN_INFO "\ntesting speed of %s (%s) %s\n", algo,
++ 			get_driver_name(crypto_aead, tfm), e);
++ 
++ 	req = aead_request_alloc(tfm, GFP_KERNEL);
++ 	if (!req) {
++ 		pr_err("alg: aead: Failed to allocate request for %s\n",
++ 		       algo);
++ 		goto out_noreq;
++ 	}
++ 
++ 	i = 0;
++ 	do {
++ 		b_size = aead_sizes;
++ 		do {
++ 			assoc = axbuf[0];
++ 			memset(assoc, 0xff, aad_size);
++ 			sg_init_one(&asg[0], assoc, aad_size);
++ 
++ 			if ((*keysize + *b_size) > TVMEMSIZE * PAGE_SIZE) {
++ 				pr_err("template (%u) too big for tvmem (%lu)\n",
++ 				       *keysize + *b_size,
++ 					TVMEMSIZE * PAGE_SIZE);
++ 				goto out;
++ 			}
++ 
++ 			key = tvmem[0];
++ 			for (j = 0; j < tcount; j++) {
++ 				if (template[j].klen == *keysize) {
++ 					key = template[j].key;
++ 					break;
++ 				}
++ 			}
++ 			ret = crypto_aead_setkey(tfm, key, *keysize);
++ 			ret = crypto_aead_setauthsize(tfm, authsize);
++ 
++ 			iv_len = crypto_aead_ivsize(tfm);
++ 			if (iv_len)
++ 				memset(&iv, 0xff, iv_len);
++ 
++ 			crypto_aead_clear_flags(tfm, ~0);
++ 			printk(KERN_INFO "test %u (%d bit key, %d byte blocks): ",
++ 					i, *keysize * 8, *b_size);
++ 
++ 
++ 			memset(tvmem[0], 0xff, PAGE_SIZE);
++ 
++ 			if (ret) {
++ 				pr_err("setkey() failed flags=%x\n",
++ 						crypto_aead_get_flags(tfm));
++ 				goto out;
++ 			}
++ 
++ 			sg_init_aead(&sg[0], xbuf,
++ 				    *b_size + (enc ? authsize : 0));
++ 
++ 			sg_init_aead(&sgout[0], xoutbuf,
++ 				    *b_size + (enc ? authsize : 0));
++ 
++ 			aead_request_set_crypt(req, sg, sgout, *b_size, iv);
++ 			aead_request_set_assoc(req, asg, aad_size);
++ 
++ 			if (secs)
++ 				ret = test_aead_jiffies(req, enc, *b_size,
++ 							secs);
++ 			else
++ 				ret = test_aead_cycles(req, enc, *b_size);
++ 
++ 			if (ret) {
++ 				pr_err("%s() failed return code=%d\n", e, ret);
++ 				break;
++ 			}
++ 			b_size++;
++ 			i++;
++ 		} while (*b_size);
++ 		keysize++;
++ 	} while (*keysize);
++ 
++ out:
++ 	aead_request_free(req);
++ out_noreq:
++ 	crypto_free_aead(tfm);
++ out_notfm:
++ 	kfree(sg);
++ out_nosg:
++ 	testmgr_free_buf(xoutbuf);
++ out_nooutbuf:
++ 	testmgr_free_buf(axbuf);
++ out_noaxbuf:
++ 	testmgr_free_buf(xbuf);
++ out_noxbuf:
++ 	return;
++ }
+++>>>>>>> 3e3dc25fe7d5 (crypto: Resolve shadow warnings)
+  
+- static void test_cipher_speed(const char *algo, int enc, unsigned int sec,
++ static void test_cipher_speed(const char *algo, int enc, unsigned int secs,
+  			      struct cipher_speed_template *template,
+  			      unsigned int tcount, u8 *keysize)
+  {
+diff --git a/crypto/cryptd.c b/crypto/cryptd.c
+index 75c415d37086..650afac10fd7 100644
+--- a/crypto/cryptd.c
++++ b/crypto/cryptd.c
+@@ -233,7 +233,7 @@ static void cryptd_blkcipher_decrypt(struct crypto_async_request *req, int err)
+ }
+ 
+ static int cryptd_blkcipher_enqueue(struct ablkcipher_request *req,
+-				    crypto_completion_t complete)
++				    crypto_completion_t compl)
+ {
+ 	struct cryptd_blkcipher_request_ctx *rctx = ablkcipher_request_ctx(req);
+ 	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+@@ -241,7 +241,7 @@ static int cryptd_blkcipher_enqueue(struct ablkcipher_request *req,
+ 
+ 	queue = cryptd_get_queue(crypto_ablkcipher_tfm(tfm));
+ 	rctx->complete = req->base.complete;
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 
+ 	return cryptd_enqueue_request(queue, &req->base);
+ }
+@@ -414,7 +414,7 @@ static int cryptd_hash_setkey(struct crypto_ahash *parent,
+ }
+ 
+ static int cryptd_hash_enqueue(struct ahash_request *req,
+-				crypto_completion_t complete)
++				crypto_completion_t compl)
+ {
+ 	struct cryptd_hash_request_ctx *rctx = ahash_request_ctx(req);
+ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+@@ -422,7 +422,7 @@ static int cryptd_hash_enqueue(struct ahash_request *req,
+ 		cryptd_get_queue(crypto_ahash_tfm(tfm));
+ 
+ 	rctx->complete = req->base.complete;
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 
+ 	return cryptd_enqueue_request(queue, &req->base);
+ }
+@@ -667,14 +667,14 @@ static void cryptd_aead_decrypt(struct crypto_async_request *areq, int err)
+ }
+ 
+ static int cryptd_aead_enqueue(struct aead_request *req,
+-				    crypto_completion_t complete)
++				    crypto_completion_t compl)
+ {
+ 	struct cryptd_aead_request_ctx *rctx = aead_request_ctx(req);
+ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+ 	struct cryptd_queue *queue = cryptd_get_queue(crypto_aead_tfm(tfm));
+ 
+ 	rctx->complete = req->base.complete;
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 	return cryptd_enqueue_request(queue, &req->base);
+ }
+ 
+diff --git a/crypto/eseqiv.c b/crypto/eseqiv.c
+index 220c0d0c1a8d..78a72645390c 100644
+--- a/crypto/eseqiv.c
++++ b/crypto/eseqiv.c
+@@ -68,7 +68,7 @@ static int eseqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 	struct eseqiv_ctx *ctx = crypto_ablkcipher_ctx(geniv);
+ 	struct eseqiv_request_ctx *reqctx = skcipher_givcrypt_reqctx(req);
+ 	struct ablkcipher_request *subreq;
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	void *data;
+ 	struct scatterlist *osrc, *odst;
+ 	struct scatterlist *dst;
+@@ -86,7 +86,7 @@ static int eseqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 	ablkcipher_request_set_tfm(subreq, skcipher_geniv_cipher(geniv));
+ 
+ 	giv = req->giv;
+-	complete = req->creq.base.complete;
++	compl = req->creq.base.complete;
+ 	data = req->creq.base.data;
+ 
+ 	osrc = req->creq.src;
+@@ -101,11 +101,11 @@ static int eseqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 	if (vsrc != giv + ivsize && vdst != giv + ivsize) {
+ 		giv = PTR_ALIGN((u8 *)reqctx->tail,
+ 				crypto_ablkcipher_alignmask(geniv) + 1);
+-		complete = eseqiv_complete;
++		compl = eseqiv_complete;
+ 		data = req;
+ 	}
+ 
+-	ablkcipher_request_set_callback(subreq, req->creq.base.flags, complete,
++	ablkcipher_request_set_callback(subreq, req->creq.base.flags, compl,
+ 					data);
+ 
+ 	sg_init_table(reqctx->src, 2);
+diff --git a/crypto/gcm.c b/crypto/gcm.c
+index b4c252066f7b..d1ba33d58025 100644
+--- a/crypto/gcm.c
++++ b/crypto/gcm.c
+@@ -228,14 +228,14 @@ static void gcm_hash_final_done(struct crypto_async_request *areq, int err);
+ 
+ static int gcm_hash_update(struct aead_request *req,
+ 			   struct crypto_gcm_req_priv_ctx *pctx,
+-			   crypto_completion_t complete,
++			   crypto_completion_t compl,
+ 			   struct scatterlist *src,
+ 			   unsigned int len)
+ {
+ 	struct ahash_request *ahreq = &pctx->u.ahreq;
+ 
+ 	ahash_request_set_callback(ahreq, aead_request_flags(req),
+-				   complete, req);
++				   compl, req);
+ 	ahash_request_set_crypt(ahreq, src, NULL, len);
+ 
+ 	return crypto_ahash_update(ahreq);
+@@ -244,12 +244,12 @@ static int gcm_hash_update(struct aead_request *req,
+ static int gcm_hash_remain(struct aead_request *req,
+ 			   struct crypto_gcm_req_priv_ctx *pctx,
+ 			   unsigned int remain,
+-			   crypto_completion_t complete)
++			   crypto_completion_t compl)
+ {
+ 	struct ahash_request *ahreq = &pctx->u.ahreq;
+ 
+ 	ahash_request_set_callback(ahreq, aead_request_flags(req),
+-				   complete, req);
++				   compl, req);
+ 	sg_init_one(pctx->src, gcm_zeroes, remain);
+ 	ahash_request_set_crypt(ahreq, pctx->src, NULL, remain);
+ 
+@@ -375,14 +375,14 @@ static void __gcm_hash_assoc_remain_done(struct aead_request *req, int err)
+ {
+ 	struct crypto_gcm_req_priv_ctx *pctx = crypto_gcm_reqctx(req);
+ 	struct crypto_gcm_ghash_ctx *gctx = &pctx->ghash_ctx;
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	unsigned int remain = 0;
+ 
+ 	if (!err && gctx->cryptlen) {
+ 		remain = gcm_remain(gctx->cryptlen);
+-		complete = remain ? gcm_hash_crypt_done :
++		compl = remain ? gcm_hash_crypt_done :
+ 			gcm_hash_crypt_remain_done;
+-		err = gcm_hash_update(req, pctx, complete,
++		err = gcm_hash_update(req, pctx, compl,
+ 				      gctx->src, gctx->cryptlen);
+ 		if (err == -EINPROGRESS || err == -EBUSY)
+ 			return;
+@@ -429,14 +429,14 @@ static void gcm_hash_assoc_done(struct crypto_async_request *areq, int err)
+ static void __gcm_hash_init_done(struct aead_request *req, int err)
+ {
+ 	struct crypto_gcm_req_priv_ctx *pctx = crypto_gcm_reqctx(req);
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	unsigned int remain = 0;
+ 
+ 	if (!err && req->assoclen) {
+ 		remain = gcm_remain(req->assoclen);
+-		complete = remain ? gcm_hash_assoc_done :
++		compl = remain ? gcm_hash_assoc_done :
+ 			gcm_hash_assoc_remain_done;
+-		err = gcm_hash_update(req, pctx, complete,
++		err = gcm_hash_update(req, pctx, compl,
+ 				      req->assoc, req->assoclen);
+ 		if (err == -EINPROGRESS || err == -EBUSY)
+ 			return;
+@@ -462,7 +462,7 @@ static int gcm_hash(struct aead_request *req,
+ 	struct crypto_gcm_ghash_ctx *gctx = &pctx->ghash_ctx;
+ 	struct crypto_gcm_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	unsigned int remain;
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	int err;
+ 
+ 	ahash_request_set_tfm(ahreq, ctx->ghash);
+@@ -473,8 +473,8 @@ static int gcm_hash(struct aead_request *req,
+ 	if (err)
+ 		return err;
+ 	remain = gcm_remain(req->assoclen);
+-	complete = remain ? gcm_hash_assoc_done : gcm_hash_assoc_remain_done;
+-	err = gcm_hash_update(req, pctx, complete, req->assoc, req->assoclen);
++	compl = remain ? gcm_hash_assoc_done : gcm_hash_assoc_remain_done;
++	err = gcm_hash_update(req, pctx, compl, req->assoc, req->assoclen);
+ 	if (err)
+ 		return err;
+ 	if (remain) {
+@@ -484,8 +484,8 @@ static int gcm_hash(struct aead_request *req,
+ 			return err;
+ 	}
+ 	remain = gcm_remain(gctx->cryptlen);
+-	complete = remain ? gcm_hash_crypt_done : gcm_hash_crypt_remain_done;
+-	err = gcm_hash_update(req, pctx, complete, gctx->src, gctx->cryptlen);
++	compl = remain ? gcm_hash_crypt_done : gcm_hash_crypt_remain_done;
++	err = gcm_hash_update(req, pctx, compl, gctx->src, gctx->cryptlen);
+ 	if (err)
+ 		return err;
+ 	if (remain) {
+diff --git a/crypto/seqiv.c b/crypto/seqiv.c
+index e93fc415c1dc..f5dbb8ea6ea0 100644
+--- a/crypto/seqiv.c
++++ b/crypto/seqiv.c
+@@ -100,7 +100,7 @@ static int seqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 	struct crypto_ablkcipher *geniv = skcipher_givcrypt_reqtfm(req);
+ 	struct seqiv_ctx *ctx = crypto_ablkcipher_ctx(geniv);
+ 	struct ablkcipher_request *subreq = skcipher_givcrypt_reqctx(req);
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	void *data;
+ 	u8 *info;
+ 	unsigned int ivsize;
+@@ -108,7 +108,7 @@ static int seqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 
+ 	ablkcipher_request_set_tfm(subreq, skcipher_geniv_cipher(geniv));
+ 
+-	complete = req->creq.base.complete;
++	compl = req->creq.base.complete;
+ 	data = req->creq.base.data;
+ 	info = req->creq.info;
+ 
+@@ -122,11 +122,11 @@ static int seqiv_givencrypt(struct skcipher_givcrypt_request *req)
+ 		if (!info)
+ 			return -ENOMEM;
+ 
+-		complete = seqiv_complete;
++		compl = seqiv_complete;
+ 		data = req;
+ 	}
+ 
+-	ablkcipher_request_set_callback(subreq, req->creq.base.flags, complete,
++	ablkcipher_request_set_callback(subreq, req->creq.base.flags, compl,
+ 					data);
+ 	ablkcipher_request_set_crypt(subreq, req->creq.src, req->creq.dst,
+ 				     req->creq.nbytes, info);
+@@ -146,7 +146,7 @@ static int seqiv_aead_givencrypt(struct aead_givcrypt_request *req)
+ 	struct seqiv_ctx *ctx = crypto_aead_ctx(geniv);
+ 	struct aead_request *areq = &req->areq;
+ 	struct aead_request *subreq = aead_givcrypt_reqctx(req);
+-	crypto_completion_t complete;
++	crypto_completion_t compl;
+ 	void *data;
+ 	u8 *info;
+ 	unsigned int ivsize;
+@@ -154,7 +154,7 @@ static int seqiv_aead_givencrypt(struct aead_givcrypt_request *req)
+ 
+ 	aead_request_set_tfm(subreq, aead_geniv_base(geniv));
+ 
+-	complete = areq->base.complete;
++	compl = areq->base.complete;
+ 	data = areq->base.data;
+ 	info = areq->iv;
+ 
+@@ -168,11 +168,11 @@ static int seqiv_aead_givencrypt(struct aead_givcrypt_request *req)
+ 		if (!info)
+ 			return -ENOMEM;
+ 
+-		complete = seqiv_aead_complete;
++		compl = seqiv_aead_complete;
+ 		data = req;
+ 	}
+ 
+-	aead_request_set_callback(subreq, areq->base.flags, complete, data);
++	aead_request_set_callback(subreq, areq->base.flags, compl, data);
+ 	aead_request_set_crypt(subreq, areq->src, areq->dst, areq->cryptlen,
+ 			       info);
+ 	aead_request_set_assoc(subreq, areq->assoc, areq->assoclen);
+* Unmerged path crypto/tcrypt.c
+diff --git a/include/crypto/aead.h b/include/crypto/aead.h
+index 0edf949f6369..94b19be67574 100644
+--- a/include/crypto/aead.h
++++ b/include/crypto/aead.h
+@@ -75,9 +75,9 @@ static inline void aead_givcrypt_free(struct aead_givcrypt_request *req)
+ 
+ static inline void aead_givcrypt_set_callback(
+ 	struct aead_givcrypt_request *req, u32 flags,
+-	crypto_completion_t complete, void *data)
++	crypto_completion_t compl, void *data)
+ {
+-	aead_request_set_callback(&req->areq, flags, complete, data);
++	aead_request_set_callback(&req->areq, flags, compl, data);
+ }
+ 
+ static inline void aead_givcrypt_set_crypt(struct aead_givcrypt_request *req,
+diff --git a/include/crypto/hash.h b/include/crypto/hash.h
+index 9af97d769656..74b13ec1ebd4 100644
+--- a/include/crypto/hash.h
++++ b/include/crypto/hash.h
+@@ -243,10 +243,10 @@ static inline struct ahash_request *ahash_request_cast(
+ 
+ static inline void ahash_request_set_callback(struct ahash_request *req,
+ 					      u32 flags,
+-					      crypto_completion_t complete,
++					      crypto_completion_t compl,
+ 					      void *data)
+ {
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 	req->base.data = data;
+ 	req->base.flags = flags;
+ }
+diff --git a/include/crypto/skcipher.h b/include/crypto/skcipher.h
+index 25fd6126522d..07d245f073d1 100644
+--- a/include/crypto/skcipher.h
++++ b/include/crypto/skcipher.h
+@@ -86,9 +86,9 @@ static inline void skcipher_givcrypt_free(struct skcipher_givcrypt_request *req)
+ 
+ static inline void skcipher_givcrypt_set_callback(
+ 	struct skcipher_givcrypt_request *req, u32 flags,
+-	crypto_completion_t complete, void *data)
++	crypto_completion_t compl, void *data)
+ {
+-	ablkcipher_request_set_callback(&req->creq, flags, complete, data);
++	ablkcipher_request_set_callback(&req->creq, flags, compl, data);
+ }
+ 
+ static inline void skcipher_givcrypt_set_crypt(
+diff --git a/include/linux/crypto.h b/include/linux/crypto.h
+index b0bb4f7d3929..8835cf0aca1a 100644
+--- a/include/linux/crypto.h
++++ b/include/linux/crypto.h
+@@ -730,9 +730,9 @@ static inline void ablkcipher_request_free(struct ablkcipher_request *req)
+ 
+ static inline void ablkcipher_request_set_callback(
+ 	struct ablkcipher_request *req,
+-	u32 flags, crypto_completion_t complete, void *data)
++	u32 flags, crypto_completion_t compl, void *data)
+ {
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 	req->base.data = data;
+ 	req->base.flags = flags;
+ }
+@@ -861,10 +861,10 @@ static inline void aead_request_free(struct aead_request *req)
+ 
+ static inline void aead_request_set_callback(struct aead_request *req,
+ 					     u32 flags,
+-					     crypto_completion_t complete,
++					     crypto_completion_t compl,
+ 					     void *data)
+ {
+-	req->base.complete = complete;
++	req->base.complete = compl;
+ 	req->base.data = data;
+ 	req->base.flags = flags;
+ }
