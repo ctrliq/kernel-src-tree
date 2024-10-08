@@ -1,0 +1,181 @@
+percpu_ida: Make percpu_ida_alloc + callers accept task state bitmask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Kent Overstreet <kmo@daterainc.com>
+commit 6f6b5d1ec56acdeab0503d2b823f6f88a0af493e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/6f6b5d1e.failed
+
+This patch changes percpu_ida_alloc() + callers to accept task state
+bitmask for prepare_to_wait() for code like target/iscsi that needs
+it for interruptible sleep, that is provided in a subsequent patch.
+
+It now expects TASK_UNINTERRUPTIBLE when the caller is able to sleep
+waiting for a new tag, or TASK_RUNNING when the caller cannot sleep,
+and is forced to return a negative value when no tags are available.
+
+v2 changes:
+  - Include blk-mq + tcm_fc + vhost/scsi + target/iscsi changes
+  - Drop signal_pending_state() call
+v3 changes:
+  - Only call prepare_to_wait() + finish_wait() when != TASK_RUNNING
+    (PeterZ)
+
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+	Cc: <stable@vger.kernel.org> #3.12+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 6f6b5d1ec56acdeab0503d2b823f6f88a0af493e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target_util.c
+#	drivers/target/tcm_fc/tfc_cmd.c
+#	drivers/vhost/scsi.c
+#	include/linux/percpu_ida.h
+#	lib/percpu_ida.c
+diff --cc drivers/target/iscsi/iscsi_target_util.c
+index 08a3bacef0c5,9b8e1db1257b..000000000000
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@@ -168,12 -155,19 +168,28 @@@ struct iscsi_cmd *iscsit_alloc_cmd(stru
+  struct iscsi_cmd *iscsit_allocate_cmd(struct iscsi_conn *conn, gfp_t gfp_mask)
+  {
+  	struct iscsi_cmd *cmd;
+++<<<<<<< HEAD
+ +
+ +	cmd = conn->conn_transport->iscsit_alloc_cmd(conn, gfp_mask);
+ +	if (!cmd) {
+ +		pr_err("Unable to allocate memory for struct iscsi_cmd.\n");
+ +		return NULL;
+ +	}
+++=======
++ 	struct se_session *se_sess = conn->sess->se_sess;
++ 	int size, tag, state = (gfp_mask & __GFP_WAIT) ? TASK_UNINTERRUPTIBLE :
++ 				TASK_RUNNING;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, state);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	size = sizeof(struct iscsi_cmd) + conn->conn_transport->priv_size;
++ 	cmd = (struct iscsi_cmd *)(se_sess->sess_cmd_map + (tag * size));
++ 	memset(cmd, 0, size);
++ 
++ 	cmd->se_cmd.map_tag = tag;
+++>>>>>>> 6f6b5d1ec56a (percpu_ida: Make percpu_ida_alloc + callers accept task state bitmask)
+  	cmd->conn = conn;
+  	INIT_LIST_HEAD(&cmd->i_conn_node);
+  	INIT_LIST_HEAD(&cmd->datain_list);
+diff --cc drivers/target/tcm_fc/tfc_cmd.c
+index b406f178ff39,8b2c1aaf81de..000000000000
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@@ -436,10 -435,17 +436,15 @@@ static void ft_recv_cmd(struct ft_sess 
+  {
+  	struct ft_cmd *cmd;
+  	struct fc_lport *lport = sess->tport->lport;
+ -	struct se_session *se_sess = sess->se_sess;
+ -	int tag;
+  
+++<<<<<<< HEAD
+ +	cmd = kzalloc(sizeof(*cmd), GFP_ATOMIC);
+ +	if (!cmd)
+++=======
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
+++>>>>>>> 6f6b5d1ec56a (percpu_ida: Make percpu_ida_alloc + callers accept task state bitmask)
+  		goto busy;
+ -
+ -	cmd = &((struct ft_cmd *)se_sess->sess_cmd_map)[tag];
+ -	memset(cmd, 0, sizeof(struct ft_cmd));
+ -
+ -	cmd->se_cmd.map_tag = tag;
+  	cmd->sess = sess;
+  	cmd->seq = lport->tt.seq_assign(lport, fp);
+  	if (!cmd->seq) {
+diff --cc drivers/vhost/scsi.c
+index 701420297225,2d084fb8d4d3..000000000000
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@@ -709,20 -726,30 +709,26 @@@ static struct tcm_vhost_cmd *vhost_scsi
+  		pr_err("Unable to locate active struct tcm_vhost_nexus\n");
+  		return ERR_PTR(-EIO);
+  	}
+ -	se_sess = tv_nexus->tvn_se_sess;
+  
+++<<<<<<< HEAD
+ +	tv_cmd = kzalloc(sizeof(struct tcm_vhost_cmd), GFP_ATOMIC);
+ +	if (!tv_cmd) {
+ +		pr_err("Unable to allocate struct tcm_vhost_cmd\n");
+++=======
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0) {
++ 		pr_err("Unable to obtain tag for tcm_vhost_cmd\n");
+++>>>>>>> 6f6b5d1ec56a (percpu_ida: Make percpu_ida_alloc + callers accept task state bitmask)
+  		return ERR_PTR(-ENOMEM);
+  	}
+ +	tv_cmd->tvc_tag = v_req->tag;
+ +	tv_cmd->tvc_task_attr = v_req->task_attr;
+ +	tv_cmd->tvc_exp_data_len = exp_data_len;
+ +	tv_cmd->tvc_data_direction = data_direction;
+ +	tv_cmd->tvc_nexus = tv_nexus;
+ +	tv_cmd->inflight = tcm_vhost_get_inflight(vq);
+  
+ -	cmd = &((struct tcm_vhost_cmd *)se_sess->sess_cmd_map)[tag];
+ -	sg = cmd->tvc_sgl;
+ -	pages = cmd->tvc_upages;
+ -	memset(cmd, 0, sizeof(struct tcm_vhost_cmd));
+ -
+ -	cmd->tvc_sgl = sg;
+ -	cmd->tvc_upages = pages;
+ -	cmd->tvc_se_cmd.map_tag = tag;
+ -	cmd->tvc_tag = v_req->tag;
+ -	cmd->tvc_task_attr = v_req->task_attr;
+ -	cmd->tvc_exp_data_len = exp_data_len;
+ -	cmd->tvc_data_direction = data_direction;
+ -	cmd->tvc_nexus = tv_nexus;
+ -	cmd->inflight = tcm_vhost_get_inflight(vq);
+ -
+ -	return cmd;
+ +	return tv_cmd;
+  }
+  
+  /*
+* Unmerged path include/linux/percpu_ida.h
+* Unmerged path lib/percpu_ida.c
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index d64a02fb1f73..5d70edc9855f 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -36,7 +36,8 @@ static unsigned int __blk_mq_get_tag(struct blk_mq_tags *tags, gfp_t gfp)
+ {
+ 	int tag;
+ 
+-	tag = percpu_ida_alloc(&tags->free_tags, gfp);
++	tag = percpu_ida_alloc(&tags->free_tags, (gfp & __GFP_WAIT) ?
++			       TASK_UNINTERRUPTIBLE : TASK_RUNNING);
+ 	if (tag < 0)
+ 		return BLK_MQ_TAG_FAIL;
+ 	return tag + tags->nr_reserved_tags;
+@@ -52,7 +53,8 @@ static unsigned int __blk_mq_get_reserved_tag(struct blk_mq_tags *tags,
+ 		return BLK_MQ_TAG_FAIL;
+ 	}
+ 
+-	tag = percpu_ida_alloc(&tags->reserved_tags, gfp);
++	tag = percpu_ida_alloc(&tags->reserved_tags, (gfp & __GFP_WAIT) ?
++			       TASK_UNINTERRUPTIBLE : TASK_RUNNING);
+ 	if (tag < 0)
+ 		return BLK_MQ_TAG_FAIL;
+ 	return tag;
+* Unmerged path drivers/target/iscsi/iscsi_target_util.c
+* Unmerged path drivers/target/tcm_fc/tfc_cmd.c
+* Unmerged path drivers/vhost/scsi.c
+* Unmerged path include/linux/percpu_ida.h
+* Unmerged path lib/percpu_ida.c
