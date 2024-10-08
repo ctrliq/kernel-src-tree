@@ -1,0 +1,4500 @@
+scsi: always assign block layer tags if enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [scsi] always assign block layer tags if enabled (Don Dutile) [1169955 1259940 1262728 1275187 1275209 1275423 1275425 1289615 1291874 1292284 1292872 1296195 1296269 1296338 1296344 1298707 1302166 1310156]
+Rebuild_FUZZ: 93.18%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 2ecb204d07ac8debe3893c362415919bc78bebd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/2ecb204d.failed
+
+Allow a driver to ask for block layer tags by setting .use_blk_tags in the
+host template, in which case it will always see a valid value in
+request->tag, similar to the behavior when using blk-mq.  This means even
+SCSI "untagged" commands will now have a tag, which is especially useful
+when using a host-wide tag map.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mike Christie <michaelc@cs.wisc.edu>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+(cherry picked from commit 2ecb204d07ac8debe3893c362415919bc78bebd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/esas2r/esas2r_main.c
+#	drivers/scsi/ipr.c
+#	drivers/scsi/lpfc/lpfc_scsi.c
+#	drivers/scsi/scsi.c
+#	drivers/scsi/ufs/ufshcd.c
+#	drivers/usb/storage/uas.c
+diff --cc drivers/scsi/ipr.c
+index f2968d957de1,f84fcb9a6ed7..000000000000
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@@ -6581,6 -6316,8 +6581,11 @@@ static struct scsi_host_template driver
+  	.shost_attrs = ipr_ioa_attrs,
+  	.sdev_attrs = ipr_dev_attrs,
+  	.proc_name = IPR_NAME,
+++<<<<<<< HEAD
+++=======
++ 	.no_write_same = 1,
++ 	.use_blk_tags = 1,
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  };
+  
+  /**
+diff --cc drivers/scsi/lpfc/lpfc_scsi.c
+index 3eb3ea7b0233,a24106a70968..000000000000
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@@ -6022,7 -5982,8 +6019,12 @@@ struct scsi_host_template lpfc_templat
+  	.max_sectors		= 0xFFFF,
+  	.vendor_id		= LPFC_NL_VENDOR_ID,
+  	.change_queue_depth	= lpfc_change_queue_depth,
+++<<<<<<< HEAD
+ +	.change_queue_type	= lpfc_change_queue_type,
+++=======
++ 	.change_queue_type	= scsi_change_queue_type,
++ 	.use_blk_tags		= 1,
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  };
+  
+  struct scsi_host_template lpfc_vport_template = {
+@@@ -6045,5 -6006,6 +6047,10 @@@
+  	.shost_attrs		= lpfc_vport_attrs,
+  	.max_sectors		= 0xFFFF,
+  	.change_queue_depth	= lpfc_change_queue_depth,
+++<<<<<<< HEAD
+ +	.change_queue_type	= lpfc_change_queue_type,
+++=======
++ 	.change_queue_type	= scsi_change_queue_type,
++ 	.use_blk_tags		= 1,
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  };
+diff --cc drivers/scsi/scsi.c
+index a9080c4f426e,a3426f1bf0dd..000000000000
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@@ -853,6 -858,22 +853,25 @@@ int scsi_track_queue_full(struct scsi_d
+  EXPORT_SYMBOL(scsi_track_queue_full);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * scsi_change_queue_type() - Change a device's queue type
++  * @sdev:     The SCSI device whose queue depth is to change
++  * @tag_type: Identifier for queue type
++  */
++ int scsi_change_queue_type(struct scsi_device *sdev, int tag_type)
++ {
++ 	if (!sdev->tagged_supported)
++ 		return 0;
++ 
++ 	scsi_adjust_queue_depth(sdev, tag_type, sdev->queue_depth);
++ 	return tag_type;
++ 
++ }
++ EXPORT_SYMBOL(scsi_change_queue_type);
++ 
++ /**
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+   * scsi_vpd_inquiry - Request a device provide us with a VPD page
+   * @sdev: The device to ask
+   * @buffer: Where to put the result
+diff --cc drivers/scsi/ufs/ufshcd.c
+index c32a478df81b,48c7f9e8f256..000000000000
+--- a/drivers/scsi/ufs/ufshcd.c
++++ b/drivers/scsi/ufs/ufshcd.c
+@@@ -884,49 -1571,2553 +884,178 @@@ static int ufshcd_initialize_hba(struc
+  }
+  
+  /**
+ - * ufshcd_query_flag() - API function for sending flag query requests
+ - * hba: per-adapter instance
+ - * query_opcode: flag query to perform
+ - * idn: flag idn to access
+ - * flag_res: the flag value after the query request completes
+ + * ufshcd_do_reset - reset the host controller
+ + * @hba: per adapter instance
+   *
+ - * Returns 0 for success, non-zero in case of failure
+ + * Returns SUCCESS/FAILED
+   */
+ -static int ufshcd_query_flag(struct ufs_hba *hba, enum query_opcode opcode,
+ -			enum flag_idn idn, bool *flag_res)
+ +static int ufshcd_do_reset(struct ufs_hba *hba)
+  {
+ -	struct ufs_query_req *request = NULL;
+ -	struct ufs_query_res *response = NULL;
+ -	int err, index = 0, selector = 0;
+ +	struct ufshcd_lrb *lrbp;
+ +	unsigned long flags;
+ +	int tag;
+  
+ -	BUG_ON(!hba);
+ +	/* block commands from midlayer */
+ +	scsi_block_requests(hba->host);
+  
+ -	ufshcd_hold(hba, false);
+ -	mutex_lock(&hba->dev_cmd.lock);
+ -	ufshcd_init_query(hba, &request, &response, opcode, idn, index,
+ -			selector);
+ -
+ -	switch (opcode) {
+ -	case UPIU_QUERY_OPCODE_SET_FLAG:
+ -	case UPIU_QUERY_OPCODE_CLEAR_FLAG:
+ -	case UPIU_QUERY_OPCODE_TOGGLE_FLAG:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST;
+ -		break;
+ -	case UPIU_QUERY_OPCODE_READ_FLAG:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_READ_REQUEST;
+ -		if (!flag_res) {
+ -			/* No dummy reads */
+ -			dev_err(hba->dev, "%s: Invalid argument for read request\n",
+ -					__func__);
+ -			err = -EINVAL;
+ -			goto out_unlock;
+ -		}
+ -		break;
+ -	default:
+ -		dev_err(hba->dev,
+ -			"%s: Expected query flag opcode but got = %d\n",
+ -			__func__, opcode);
+ -		err = -EINVAL;
+ -		goto out_unlock;
+ -	}
+ +	spin_lock_irqsave(hba->host->host_lock, flags);
+ +	hba->ufshcd_state = UFSHCD_STATE_RESET;
+  
+ -	err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_QUERY, QUERY_REQ_TIMEOUT);
+ +	/* send controller to reset state */
+ +	ufshcd_hba_stop(hba);
+ +	spin_unlock_irqrestore(hba->host->host_lock, flags);
+  
+ -	if (err) {
+ -		dev_err(hba->dev,
+ -			"%s: Sending flag query for idn %d failed, err = %d\n",
+ -			__func__, idn, err);
+ -		goto out_unlock;
+ +	/* abort outstanding commands */
+ +	for (tag = 0; tag < hba->nutrs; tag++) {
+ +		if (test_bit(tag, &hba->outstanding_reqs)) {
+ +			lrbp = &hba->lrb[tag];
+ +			scsi_dma_unmap(lrbp->cmd);
+ +			lrbp->cmd->result = DID_RESET << 16;
+ +			lrbp->cmd->scsi_done(lrbp->cmd);
+ +			lrbp->cmd = NULL;
+ +		}
+  	}
+  
+ -	if (flag_res)
+ -		*flag_res = (be32_to_cpu(response->upiu_res.value) &
+ -				MASK_QUERY_UPIU_FLAG_LOC) & 0x1;
+ -
+ -out_unlock:
+ -	mutex_unlock(&hba->dev_cmd.lock);
+ -	ufshcd_release(hba);
+ -	return err;
+ -}
+ +	/* clear outstanding request/task bit maps */
+ +	hba->outstanding_reqs = 0;
+ +	hba->outstanding_tasks = 0;
+  
+++<<<<<<< HEAD
+ +	/* start the initialization process */
+ +	if (ufshcd_initialize_hba(hba)) {
+ +		dev_err(hba->dev,
+ +			"Reset: Controller initialization failed\n");
+ +		return FAILED;
+++=======
++ /**
+ - * ufshcd_query_attr - API function for sending attribute requests
+ - * hba: per-adapter instance
+ - * opcode: attribute opcode
+ - * idn: attribute idn to access
+ - * index: index field
+ - * selector: selector field
+ - * attr_val: the attribute value after the query request completes
+++ * ufshcd_verify_dev_init() - Verify device initialization
+++ * @hba: per-adapter instance
++  *
+ - * Returns 0 for success, non-zero in case of failure
+ -*/
+ -static int ufshcd_query_attr(struct ufs_hba *hba, enum query_opcode opcode,
+ -			enum attr_idn idn, u8 index, u8 selector, u32 *attr_val)
+++ * Send NOP OUT UPIU and wait for NOP IN response to check whether the
+++ * device Transport Protocol (UTP) layer is ready after a reset.
+++ * If the UTP layer at the device side is not initialized, it may
+++ * not respond with NOP IN UPIU within timeout of %NOP_OUT_TIMEOUT
+++ * and we retry sending NOP OUT for %NOP_OUT_RETRIES iterations.
+++ */
+++static int ufshcd_verify_dev_init(struct ufs_hba *hba)
++ {
+ -	struct ufs_query_req *request = NULL;
+ -	struct ufs_query_res *response = NULL;
+ -	int err;
+ -
+ -	BUG_ON(!hba);
+++	int err = 0;
+++	int retries;
++ 
++ 	ufshcd_hold(hba, false);
+ -	if (!attr_val) {
+ -		dev_err(hba->dev, "%s: attribute value required for opcode 0x%x\n",
+ -				__func__, opcode);
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+ -
++ 	mutex_lock(&hba->dev_cmd.lock);
+ -	ufshcd_init_query(hba, &request, &response, opcode, idn, index,
+ -			selector);
+ -
+ -	switch (opcode) {
+ -	case UPIU_QUERY_OPCODE_WRITE_ATTR:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST;
+ -		request->upiu_req.value = cpu_to_be32(*attr_val);
+ -		break;
+ -	case UPIU_QUERY_OPCODE_READ_ATTR:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_READ_REQUEST;
+ -		break;
+ -	default:
+ -		dev_err(hba->dev, "%s: Expected query attr opcode but got = 0x%.2x\n",
+ -				__func__, opcode);
+ -		err = -EINVAL;
+ -		goto out_unlock;
+ -	}
+++	for (retries = NOP_OUT_RETRIES; retries > 0; retries--) {
+++		err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_NOP,
+++					       NOP_OUT_TIMEOUT);
++ 
+ -	err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_QUERY, QUERY_REQ_TIMEOUT);
+++		if (!err || err == -ETIMEDOUT)
+++			break;
++ 
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: opcode 0x%.2x for idn %d failed, err = %d\n",
+ -				__func__, opcode, idn, err);
+ -		goto out_unlock;
+++		dev_dbg(hba->dev, "%s: error %d retrying\n", __func__, err);
++ 	}
+ -
+ -	*attr_val = be32_to_cpu(response->upiu_res.value);
+ -
+ -out_unlock:
++ 	mutex_unlock(&hba->dev_cmd.lock);
+ -out:
++ 	ufshcd_release(hba);
+++
+++	if (err)
+++		dev_err(hba->dev, "%s: NOP OUT failed %d\n", __func__, err);
++ 	return err;
++ }
++ 
++ /**
+ - * ufshcd_query_descriptor - API function for sending descriptor requests
+ - * hba: per-adapter instance
+ - * opcode: attribute opcode
+ - * idn: attribute idn to access
+ - * index: index field
+ - * selector: selector field
+ - * desc_buf: the buffer that contains the descriptor
+ - * buf_len: length parameter passed to the device
+++ * ufshcd_set_queue_depth - set lun queue depth
+++ * @sdev: pointer to SCSI device
++  *
+ - * Returns 0 for success, non-zero in case of failure.
+ - * The buf_len parameter will contain, on return, the length parameter
+ - * received on the response.
+++ * Read bLUQueueDepth value and activate scsi tagged command
+++ * queueing. For WLUN, queue depth is set to 1. For best-effort
+++ * cases (bLUQueueDepth = 0) the queue depth is set to a maximum
+++ * value that host can queue.
++  */
+ -static int ufshcd_query_descriptor(struct ufs_hba *hba,
+ -			enum query_opcode opcode, enum desc_idn idn, u8 index,
+ -			u8 selector, u8 *desc_buf, int *buf_len)
+++static void ufshcd_set_queue_depth(struct scsi_device *sdev)
++ {
+ -	struct ufs_query_req *request = NULL;
+ -	struct ufs_query_res *response = NULL;
+ -	int err;
+ -
+ -	BUG_ON(!hba);
+++	int ret = 0;
+++	u8 lun_qdepth;
+++	struct ufs_hba *hba;
++ 
+ -	ufshcd_hold(hba, false);
+ -	if (!desc_buf) {
+ -		dev_err(hba->dev, "%s: descriptor buffer required for opcode 0x%x\n",
+ -				__func__, opcode);
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+++	hba = shost_priv(sdev->host);
++ 
+ -	if (*buf_len <= QUERY_DESC_MIN_SIZE || *buf_len > QUERY_DESC_MAX_SIZE) {
+ -		dev_err(hba->dev, "%s: descriptor buffer size (%d) is out of range\n",
+ -				__func__, *buf_len);
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+++	lun_qdepth = hba->nutrs;
+++	ret = ufshcd_read_unit_desc_param(hba,
+++					  ufshcd_scsi_to_upiu_lun(sdev->lun),
+++					  UNIT_DESC_PARAM_LU_Q_DEPTH,
+++					  &lun_qdepth,
+++					  sizeof(lun_qdepth));
++ 
+ -	mutex_lock(&hba->dev_cmd.lock);
+ -	ufshcd_init_query(hba, &request, &response, opcode, idn, index,
+ -			selector);
+ -	hba->dev_cmd.query.descriptor = desc_buf;
+ -	request->upiu_req.length = cpu_to_be16(*buf_len);
+ -
+ -	switch (opcode) {
+ -	case UPIU_QUERY_OPCODE_WRITE_DESC:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST;
+ -		break;
+ -	case UPIU_QUERY_OPCODE_READ_DESC:
+ -		request->query_func = UPIU_QUERY_FUNC_STANDARD_READ_REQUEST;
+ -		break;
+ -	default:
+ -		dev_err(hba->dev,
+ -				"%s: Expected query descriptor opcode but got = 0x%.2x\n",
+ -				__func__, opcode);
+ -		err = -EINVAL;
+ -		goto out_unlock;
+ -	}
+ -
+ -	err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_QUERY, QUERY_REQ_TIMEOUT);
+ -
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: opcode 0x%.2x for idn %d failed, err = %d\n",
+ -				__func__, opcode, idn, err);
+ -		goto out_unlock;
+ -	}
+ -
+ -	hba->dev_cmd.query.descriptor = NULL;
+ -	*buf_len = be16_to_cpu(response->upiu_res.length);
+ -
+ -out_unlock:
+ -	mutex_unlock(&hba->dev_cmd.lock);
+ -out:
+ -	ufshcd_release(hba);
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_read_desc_param - read the specified descriptor parameter
+ - * @hba: Pointer to adapter instance
+ - * @desc_id: descriptor idn value
+ - * @desc_index: descriptor index
+ - * @param_offset: offset of the parameter to read
+ - * @param_read_buf: pointer to buffer where parameter would be read
+ - * @param_size: sizeof(param_read_buf)
+ - *
+ - * Return 0 in case of success, non-zero otherwise
+ - */
+ -static int ufshcd_read_desc_param(struct ufs_hba *hba,
+ -				  enum desc_idn desc_id,
+ -				  int desc_index,
+ -				  u32 param_offset,
+ -				  u8 *param_read_buf,
+ -				  u32 param_size)
+ -{
+ -	int ret;
+ -	u8 *desc_buf;
+ -	u32 buff_len;
+ -	bool is_kmalloc = true;
+ -
+ -	/* safety checks */
+ -	if (desc_id >= QUERY_DESC_IDN_MAX)
+ -		return -EINVAL;
+ -
+ -	buff_len = ufs_query_desc_max_size[desc_id];
+ -	if ((param_offset + param_size) > buff_len)
+ -		return -EINVAL;
+ -
+ -	if (!param_offset && (param_size == buff_len)) {
+ -		/* memory space already available to hold full descriptor */
+ -		desc_buf = param_read_buf;
+ -		is_kmalloc = false;
+ -	} else {
+ -		/* allocate memory to hold full descriptor */
+ -		desc_buf = kmalloc(buff_len, GFP_KERNEL);
+ -		if (!desc_buf)
+ -			return -ENOMEM;
+ -	}
+ -
+ -	ret = ufshcd_query_descriptor(hba, UPIU_QUERY_OPCODE_READ_DESC,
+ -				      desc_id, desc_index, 0, desc_buf,
+ -				      &buff_len);
+ -
+ -	if (ret || (buff_len < ufs_query_desc_max_size[desc_id]) ||
+ -	    (desc_buf[QUERY_DESC_LENGTH_OFFSET] !=
+ -	     ufs_query_desc_max_size[desc_id])
+ -	    || (desc_buf[QUERY_DESC_DESC_TYPE_OFFSET] != desc_id)) {
+ -		dev_err(hba->dev, "%s: Failed reading descriptor. desc_id %d param_offset %d buff_len %d ret %d",
+ -			__func__, desc_id, param_offset, buff_len, ret);
+ -		if (!ret)
+ -			ret = -EINVAL;
+ -
+ -		goto out;
+ -	}
+ -
+ -	if (is_kmalloc)
+ -		memcpy(param_read_buf, &desc_buf[param_offset], param_size);
+ -out:
+ -	if (is_kmalloc)
+ -		kfree(desc_buf);
+ -	return ret;
+ -}
+ -
+ -static inline int ufshcd_read_desc(struct ufs_hba *hba,
+ -				   enum desc_idn desc_id,
+ -				   int desc_index,
+ -				   u8 *buf,
+ -				   u32 size)
+ -{
+ -	return ufshcd_read_desc_param(hba, desc_id, desc_index, 0, buf, size);
+ -}
+ -
+ -static inline int ufshcd_read_power_desc(struct ufs_hba *hba,
+ -					 u8 *buf,
+ -					 u32 size)
+ -{
+ -	return ufshcd_read_desc(hba, QUERY_DESC_IDN_POWER, 0, buf, size);
+ -}
+ -
+ -/**
+ - * ufshcd_read_unit_desc_param - read the specified unit descriptor parameter
+ - * @hba: Pointer to adapter instance
+ - * @lun: lun id
+ - * @param_offset: offset of the parameter to read
+ - * @param_read_buf: pointer to buffer where parameter would be read
+ - * @param_size: sizeof(param_read_buf)
+ - *
+ - * Return 0 in case of success, non-zero otherwise
+ - */
+ -static inline int ufshcd_read_unit_desc_param(struct ufs_hba *hba,
+ -					      int lun,
+ -					      enum unit_desc_param param_offset,
+ -					      u8 *param_read_buf,
+ -					      u32 param_size)
+ -{
+ -	/*
+ -	 * Unit descriptors are only available for general purpose LUs (LUN id
+ -	 * from 0 to 7) and RPMB Well known LU.
+ -	 */
+ -	if (lun != UFS_UPIU_RPMB_WLUN && (lun >= UFS_UPIU_MAX_GENERAL_LUN))
+ -		return -EOPNOTSUPP;
+ -
+ -	return ufshcd_read_desc_param(hba, QUERY_DESC_IDN_UNIT, lun,
+ -				      param_offset, param_read_buf, param_size);
+ -}
+ -
+ -/**
+ - * ufshcd_memory_alloc - allocate memory for host memory space data structures
+ - * @hba: per adapter instance
+ - *
+ - * 1. Allocate DMA memory for Command Descriptor array
+ - *	Each command descriptor consist of Command UPIU, Response UPIU and PRDT
+ - * 2. Allocate DMA memory for UTP Transfer Request Descriptor List (UTRDL).
+ - * 3. Allocate DMA memory for UTP Task Management Request Descriptor List
+ - *	(UTMRDL)
+ - * 4. Allocate memory for local reference block(lrb).
+ - *
+ - * Returns 0 for success, non-zero in case of failure
+ - */
+ -static int ufshcd_memory_alloc(struct ufs_hba *hba)
+ -{
+ -	size_t utmrdl_size, utrdl_size, ucdl_size;
+ -
+ -	/* Allocate memory for UTP command descriptors */
+ -	ucdl_size = (sizeof(struct utp_transfer_cmd_desc) * hba->nutrs);
+ -	hba->ucdl_base_addr = dmam_alloc_coherent(hba->dev,
+ -						  ucdl_size,
+ -						  &hba->ucdl_dma_addr,
+ -						  GFP_KERNEL);
+ -
+ -	/*
+ -	 * UFSHCI requires UTP command descriptor to be 128 byte aligned.
+ -	 * make sure hba->ucdl_dma_addr is aligned to PAGE_SIZE
+ -	 * if hba->ucdl_dma_addr is aligned to PAGE_SIZE, then it will
+ -	 * be aligned to 128 bytes as well
+ -	 */
+ -	if (!hba->ucdl_base_addr ||
+ -	    WARN_ON(hba->ucdl_dma_addr & (PAGE_SIZE - 1))) {
+ -		dev_err(hba->dev,
+ -			"Command Descriptor Memory allocation failed\n");
+ -		goto out;
+ -	}
+ -
+ -	/*
+ -	 * Allocate memory for UTP Transfer descriptors
+ -	 * UFSHCI requires 1024 byte alignment of UTRD
+ -	 */
+ -	utrdl_size = (sizeof(struct utp_transfer_req_desc) * hba->nutrs);
+ -	hba->utrdl_base_addr = dmam_alloc_coherent(hba->dev,
+ -						   utrdl_size,
+ -						   &hba->utrdl_dma_addr,
+ -						   GFP_KERNEL);
+ -	if (!hba->utrdl_base_addr ||
+ -	    WARN_ON(hba->utrdl_dma_addr & (PAGE_SIZE - 1))) {
+ -		dev_err(hba->dev,
+ -			"Transfer Descriptor Memory allocation failed\n");
+ -		goto out;
+ -	}
+ -
+ -	/*
+ -	 * Allocate memory for UTP Task Management descriptors
+ -	 * UFSHCI requires 1024 byte alignment of UTMRD
+ -	 */
+ -	utmrdl_size = sizeof(struct utp_task_req_desc) * hba->nutmrs;
+ -	hba->utmrdl_base_addr = dmam_alloc_coherent(hba->dev,
+ -						    utmrdl_size,
+ -						    &hba->utmrdl_dma_addr,
+ -						    GFP_KERNEL);
+ -	if (!hba->utmrdl_base_addr ||
+ -	    WARN_ON(hba->utmrdl_dma_addr & (PAGE_SIZE - 1))) {
+ -		dev_err(hba->dev,
+ -		"Task Management Descriptor Memory allocation failed\n");
+ -		goto out;
+ -	}
+ -
+ -	/* Allocate memory for local reference block */
+ -	hba->lrb = devm_kzalloc(hba->dev,
+ -				hba->nutrs * sizeof(struct ufshcd_lrb),
+ -				GFP_KERNEL);
+ -	if (!hba->lrb) {
+ -		dev_err(hba->dev, "LRB Memory allocation failed\n");
+ -		goto out;
+ -	}
+ -	return 0;
+ -out:
+ -	return -ENOMEM;
+ -}
+ -
+ -/**
+ - * ufshcd_host_memory_configure - configure local reference block with
+ - *				memory offsets
+ - * @hba: per adapter instance
+ - *
+ - * Configure Host memory space
+ - * 1. Update Corresponding UTRD.UCDBA and UTRD.UCDBAU with UCD DMA
+ - * address.
+ - * 2. Update each UTRD with Response UPIU offset, Response UPIU length
+ - * and PRDT offset.
+ - * 3. Save the corresponding addresses of UTRD, UCD.CMD, UCD.RSP and UCD.PRDT
+ - * into local reference block.
+ - */
+ -static void ufshcd_host_memory_configure(struct ufs_hba *hba)
+ -{
+ -	struct utp_transfer_cmd_desc *cmd_descp;
+ -	struct utp_transfer_req_desc *utrdlp;
+ -	dma_addr_t cmd_desc_dma_addr;
+ -	dma_addr_t cmd_desc_element_addr;
+ -	u16 response_offset;
+ -	u16 prdt_offset;
+ -	int cmd_desc_size;
+ -	int i;
+ -
+ -	utrdlp = hba->utrdl_base_addr;
+ -	cmd_descp = hba->ucdl_base_addr;
+ -
+ -	response_offset =
+ -		offsetof(struct utp_transfer_cmd_desc, response_upiu);
+ -	prdt_offset =
+ -		offsetof(struct utp_transfer_cmd_desc, prd_table);
+ -
+ -	cmd_desc_size = sizeof(struct utp_transfer_cmd_desc);
+ -	cmd_desc_dma_addr = hba->ucdl_dma_addr;
+ -
+ -	for (i = 0; i < hba->nutrs; i++) {
+ -		/* Configure UTRD with command descriptor base address */
+ -		cmd_desc_element_addr =
+ -				(cmd_desc_dma_addr + (cmd_desc_size * i));
+ -		utrdlp[i].command_desc_base_addr_lo =
+ -				cpu_to_le32(lower_32_bits(cmd_desc_element_addr));
+ -		utrdlp[i].command_desc_base_addr_hi =
+ -				cpu_to_le32(upper_32_bits(cmd_desc_element_addr));
+ -
+ -		/* Response upiu and prdt offset should be in double words */
+ -		utrdlp[i].response_upiu_offset =
+ -				cpu_to_le16((response_offset >> 2));
+ -		utrdlp[i].prd_table_offset =
+ -				cpu_to_le16((prdt_offset >> 2));
+ -		utrdlp[i].response_upiu_length =
+ -				cpu_to_le16(ALIGNED_UPIU_SIZE >> 2);
+ -
+ -		hba->lrb[i].utr_descriptor_ptr = (utrdlp + i);
+ -		hba->lrb[i].ucd_req_ptr =
+ -			(struct utp_upiu_req *)(cmd_descp + i);
+ -		hba->lrb[i].ucd_rsp_ptr =
+ -			(struct utp_upiu_rsp *)cmd_descp[i].response_upiu;
+ -		hba->lrb[i].ucd_prdt_ptr =
+ -			(struct ufshcd_sg_entry *)cmd_descp[i].prd_table;
+ -	}
+ -}
+ -
+ -/**
+ - * ufshcd_dme_link_startup - Notify Unipro to perform link startup
+ - * @hba: per adapter instance
+ - *
+ - * UIC_CMD_DME_LINK_STARTUP command must be issued to Unipro layer,
+ - * in order to initialize the Unipro link startup procedure.
+ - * Once the Unipro links are up, the device connected to the controller
+ - * is detected.
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -static int ufshcd_dme_link_startup(struct ufs_hba *hba)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -	int ret;
+ -
+ -	uic_cmd.command = UIC_CMD_DME_LINK_STARTUP;
+ -
+ -	ret = ufshcd_send_uic_cmd(hba, &uic_cmd);
+ -	if (ret)
+ -		dev_err(hba->dev,
+ -			"dme-link-startup: error code %d\n", ret);
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_dme_set_attr - UIC command for DME_SET, DME_PEER_SET
+ - * @hba: per adapter instance
+ - * @attr_sel: uic command argument1
+ - * @attr_set: attribute set type as uic command argument2
+ - * @mib_val: setting value as uic command argument3
+ - * @peer: indicate whether peer or local
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -int ufshcd_dme_set_attr(struct ufs_hba *hba, u32 attr_sel,
+ -			u8 attr_set, u32 mib_val, u8 peer)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -	static const char *const action[] = {
+ -		"dme-set",
+ -		"dme-peer-set"
+ -	};
+ -	const char *set = action[!!peer];
+ -	int ret;
+ -
+ -	uic_cmd.command = peer ?
+ -		UIC_CMD_DME_PEER_SET : UIC_CMD_DME_SET;
+ -	uic_cmd.argument1 = attr_sel;
+ -	uic_cmd.argument2 = UIC_ARG_ATTR_TYPE(attr_set);
+ -	uic_cmd.argument3 = mib_val;
+ -
+ -	ret = ufshcd_send_uic_cmd(hba, &uic_cmd);
+ -	if (ret)
+ -		dev_err(hba->dev, "%s: attr-id 0x%x val 0x%x error code %d\n",
+ -			set, UIC_GET_ATTR_ID(attr_sel), mib_val, ret);
+ -
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL_GPL(ufshcd_dme_set_attr);
+ -
+ -/**
+ - * ufshcd_dme_get_attr - UIC command for DME_GET, DME_PEER_GET
+ - * @hba: per adapter instance
+ - * @attr_sel: uic command argument1
+ - * @mib_val: the value of the attribute as returned by the UIC command
+ - * @peer: indicate whether peer or local
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -int ufshcd_dme_get_attr(struct ufs_hba *hba, u32 attr_sel,
+ -			u32 *mib_val, u8 peer)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -	static const char *const action[] = {
+ -		"dme-get",
+ -		"dme-peer-get"
+ -	};
+ -	const char *get = action[!!peer];
+ -	int ret;
+ -
+ -	uic_cmd.command = peer ?
+ -		UIC_CMD_DME_PEER_GET : UIC_CMD_DME_GET;
+ -	uic_cmd.argument1 = attr_sel;
+ -
+ -	ret = ufshcd_send_uic_cmd(hba, &uic_cmd);
+ -	if (ret) {
+ -		dev_err(hba->dev, "%s: attr-id 0x%x error code %d\n",
+ -			get, UIC_GET_ATTR_ID(attr_sel), ret);
+ -		goto out;
+ -	}
+ -
+ -	if (mib_val)
+ -		*mib_val = uic_cmd.argument3;
+ -out:
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL_GPL(ufshcd_dme_get_attr);
+ -
+ -/**
+ - * ufshcd_uic_pwr_ctrl - executes UIC commands (which affects the link power
+ - * state) and waits for it to take effect.
+ - *
+ - * @hba: per adapter instance
+ - * @cmd: UIC command to execute
+ - *
+ - * DME operations like DME_SET(PA_PWRMODE), DME_HIBERNATE_ENTER &
+ - * DME_HIBERNATE_EXIT commands take some time to take its effect on both host
+ - * and device UniPro link and hence it's final completion would be indicated by
+ - * dedicated status bits in Interrupt Status register (UPMS, UHES, UHXS) in
+ - * addition to normal UIC command completion Status (UCCS). This function only
+ - * returns after the relevant status bits indicate the completion.
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
+ -{
+ -	struct completion uic_async_done;
+ -	unsigned long flags;
+ -	u8 status;
+ -	int ret;
+ -
+ -	mutex_lock(&hba->uic_cmd_mutex);
+ -	init_completion(&uic_async_done);
+ -
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	hba->uic_async_done = &uic_async_done;
+ -	ret = __ufshcd_send_uic_cmd(hba, cmd);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -	if (ret) {
+ -		dev_err(hba->dev,
+ -			"pwr ctrl cmd 0x%x with mode 0x%x uic error %d\n",
+ -			cmd->command, cmd->argument3, ret);
+ -		goto out;
+ -	}
+ -	ret = ufshcd_wait_for_uic_cmd(hba, cmd);
+ -	if (ret) {
+ -		dev_err(hba->dev,
+ -			"pwr ctrl cmd 0x%x with mode 0x%x uic error %d\n",
+ -			cmd->command, cmd->argument3, ret);
+ -		goto out;
+ -	}
+ -
+ -	if (!wait_for_completion_timeout(hba->uic_async_done,
+ -					 msecs_to_jiffies(UIC_CMD_TIMEOUT))) {
+ -		dev_err(hba->dev,
+ -			"pwr ctrl cmd 0x%x with mode 0x%x completion timeout\n",
+ -			cmd->command, cmd->argument3);
+ -		ret = -ETIMEDOUT;
+ -		goto out;
+ -	}
+ -
+ -	status = ufshcd_get_upmcrs(hba);
+ -	if (status != PWR_LOCAL) {
+ -		dev_err(hba->dev,
+ -			"pwr ctrl cmd 0x%0x failed, host umpcrs:0x%x\n",
+ -			cmd->command, status);
+ -		ret = (status != PWR_OK) ? status : -1;
+ -	}
+ -out:
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	hba->uic_async_done = NULL;
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -	mutex_unlock(&hba->uic_cmd_mutex);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_uic_change_pwr_mode - Perform the UIC power mode chage
+ - *				using DME_SET primitives.
+ - * @hba: per adapter instance
+ - * @mode: powr mode value
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -static int ufshcd_uic_change_pwr_mode(struct ufs_hba *hba, u8 mode)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -	int ret;
+ -
+ -	uic_cmd.command = UIC_CMD_DME_SET;
+ -	uic_cmd.argument1 = UIC_ARG_MIB(PA_PWRMODE);
+ -	uic_cmd.argument3 = mode;
+ -	ufshcd_hold(hba, false);
+ -	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
+ -	ufshcd_release(hba);
+ -
+ -	return ret;
+ -}
+ -
+ -static int ufshcd_uic_hibern8_enter(struct ufs_hba *hba)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -
+ -	uic_cmd.command = UIC_CMD_DME_HIBER_ENTER;
+ -
+ -	return ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
+ -}
+ -
+ -static int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
+ -{
+ -	struct uic_command uic_cmd = {0};
+ -	int ret;
+ -
+ -	uic_cmd.command = UIC_CMD_DME_HIBER_EXIT;
+ -	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
+ -	if (ret) {
+ -		ufshcd_set_link_off(hba);
+ -		ret = ufshcd_host_reset_and_restore(hba);
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_get_max_pwr_mode - reads the max power mode negotiated with device
+ - * @hba: per-adapter instance
+ - */
+ -static int ufshcd_get_max_pwr_mode(struct ufs_hba *hba)
+ -{
+ -	struct ufs_pa_layer_attr *pwr_info = &hba->max_pwr_info.info;
+ -
+ -	if (hba->max_pwr_info.is_valid)
+ -		return 0;
+ -
+ -	pwr_info->pwr_tx = FASTAUTO_MODE;
+ -	pwr_info->pwr_rx = FASTAUTO_MODE;
+ -	pwr_info->hs_rate = PA_HS_MODE_B;
+ -
+ -	/* Get the connected lane count */
+ -	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDRXDATALANES),
+ -			&pwr_info->lane_rx);
+ -	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDTXDATALANES),
+ -			&pwr_info->lane_tx);
+ -
+ -	if (!pwr_info->lane_rx || !pwr_info->lane_tx) {
+ -		dev_err(hba->dev, "%s: invalid connected lanes value. rx=%d, tx=%d\n",
+ -				__func__,
+ -				pwr_info->lane_rx,
+ -				pwr_info->lane_tx);
+ -		return -EINVAL;
+ -	}
+ -
+ -	/*
+ -	 * First, get the maximum gears of HS speed.
+ -	 * If a zero value, it means there is no HSGEAR capability.
+ -	 * Then, get the maximum gears of PWM speed.
+ -	 */
+ -	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR), &pwr_info->gear_rx);
+ -	if (!pwr_info->gear_rx) {
+ -		ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXPWMGEAR),
+ -				&pwr_info->gear_rx);
+ -		if (!pwr_info->gear_rx) {
+ -			dev_err(hba->dev, "%s: invalid max pwm rx gear read = %d\n",
+ -				__func__, pwr_info->gear_rx);
+ -			return -EINVAL;
+ -		}
+ -		pwr_info->pwr_rx = SLOWAUTO_MODE;
+ -	}
+ -
+ -	ufshcd_dme_peer_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR),
+ -			&pwr_info->gear_tx);
+ -	if (!pwr_info->gear_tx) {
+ -		ufshcd_dme_peer_get(hba, UIC_ARG_MIB(PA_MAXRXPWMGEAR),
+ -				&pwr_info->gear_tx);
+ -		if (!pwr_info->gear_tx) {
+ -			dev_err(hba->dev, "%s: invalid max pwm tx gear read = %d\n",
+ -				__func__, pwr_info->gear_tx);
+ -			return -EINVAL;
+ -		}
+ -		pwr_info->pwr_tx = SLOWAUTO_MODE;
+ -	}
+ -
+ -	hba->max_pwr_info.is_valid = true;
+ -	return 0;
+ -}
+ -
+ -static int ufshcd_change_power_mode(struct ufs_hba *hba,
+ -			     struct ufs_pa_layer_attr *pwr_mode)
+ -{
+ -	int ret;
+ -
+ -	/* if already configured to the requested pwr_mode */
+ -	if (pwr_mode->gear_rx == hba->pwr_info.gear_rx &&
+ -	    pwr_mode->gear_tx == hba->pwr_info.gear_tx &&
+ -	    pwr_mode->lane_rx == hba->pwr_info.lane_rx &&
+ -	    pwr_mode->lane_tx == hba->pwr_info.lane_tx &&
+ -	    pwr_mode->pwr_rx == hba->pwr_info.pwr_rx &&
+ -	    pwr_mode->pwr_tx == hba->pwr_info.pwr_tx &&
+ -	    pwr_mode->hs_rate == hba->pwr_info.hs_rate) {
+ -		dev_dbg(hba->dev, "%s: power already configured\n", __func__);
+ -		return 0;
+ -	}
+ -
+ -	/*
+ -	 * Configure attributes for power mode change with below.
+ -	 * - PA_RXGEAR, PA_ACTIVERXDATALANES, PA_RXTERMINATION,
+ -	 * - PA_TXGEAR, PA_ACTIVETXDATALANES, PA_TXTERMINATION,
+ -	 * - PA_HSSERIES
+ -	 */
+ -	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXGEAR), pwr_mode->gear_rx);
+ -	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVERXDATALANES),
+ -			pwr_mode->lane_rx);
+ -	if (pwr_mode->pwr_rx == FASTAUTO_MODE ||
+ -			pwr_mode->pwr_rx == FAST_MODE)
+ -		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXTERMINATION), TRUE);
+ -	else
+ -		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXTERMINATION), FALSE);
+ -
+ -	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXGEAR), pwr_mode->gear_tx);
+ -	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVETXDATALANES),
+ -			pwr_mode->lane_tx);
+ -	if (pwr_mode->pwr_tx == FASTAUTO_MODE ||
+ -			pwr_mode->pwr_tx == FAST_MODE)
+ -		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXTERMINATION), TRUE);
+ -	else
+ -		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXTERMINATION), FALSE);
+ -
+ -	if (pwr_mode->pwr_rx == FASTAUTO_MODE ||
+ -	    pwr_mode->pwr_tx == FASTAUTO_MODE ||
+ -	    pwr_mode->pwr_rx == FAST_MODE ||
+ -	    pwr_mode->pwr_tx == FAST_MODE)
+ -		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_HSSERIES),
+ -						pwr_mode->hs_rate);
+ -
+ -	ret = ufshcd_uic_change_pwr_mode(hba, pwr_mode->pwr_rx << 4
+ -			| pwr_mode->pwr_tx);
+ -
+ -	if (ret) {
+ -		dev_err(hba->dev,
+ -			"%s: power mode change failed %d\n", __func__, ret);
+ -	} else {
+ -		if (hba->vops && hba->vops->pwr_change_notify)
+ -			hba->vops->pwr_change_notify(hba,
+ -				POST_CHANGE, NULL, pwr_mode);
+ -
+ -		memcpy(&hba->pwr_info, pwr_mode,
+ -			sizeof(struct ufs_pa_layer_attr));
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_config_pwr_mode - configure a new power mode
+ - * @hba: per-adapter instance
+ - * @desired_pwr_mode: desired power configuration
+ - */
+ -static int ufshcd_config_pwr_mode(struct ufs_hba *hba,
+ -		struct ufs_pa_layer_attr *desired_pwr_mode)
+ -{
+ -	struct ufs_pa_layer_attr final_params = { 0 };
+ -	int ret;
+ -
+ -	if (hba->vops && hba->vops->pwr_change_notify)
+ -		hba->vops->pwr_change_notify(hba,
+ -		     PRE_CHANGE, desired_pwr_mode, &final_params);
+ -	else
+ -		memcpy(&final_params, desired_pwr_mode, sizeof(final_params));
+ -
+ -	ret = ufshcd_change_power_mode(hba, &final_params);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_complete_dev_init() - checks device readiness
+ - * hba: per-adapter instance
+ - *
+ - * Set fDeviceInit flag and poll until device toggles it.
+ - */
+ -static int ufshcd_complete_dev_init(struct ufs_hba *hba)
+ -{
+ -	int i, retries, err = 0;
+ -	bool flag_res = 1;
+ -
+ -	for (retries = QUERY_REQ_RETRIES; retries > 0; retries--) {
+ -		/* Set the fDeviceInit flag */
+ -		err = ufshcd_query_flag(hba, UPIU_QUERY_OPCODE_SET_FLAG,
+ -					QUERY_FLAG_IDN_FDEVICEINIT, NULL);
+ -		if (!err || err == -ETIMEDOUT)
+ -			break;
+ -		dev_dbg(hba->dev, "%s: error %d retrying\n", __func__, err);
+ -	}
+ -	if (err) {
+ -		dev_err(hba->dev,
+ -			"%s setting fDeviceInit flag failed with error %d\n",
+ -			__func__, err);
+ -		goto out;
+ -	}
+ -
+ -	/* poll for max. 100 iterations for fDeviceInit flag to clear */
+ -	for (i = 0; i < 100 && !err && flag_res; i++) {
+ -		for (retries = QUERY_REQ_RETRIES; retries > 0; retries--) {
+ -			err = ufshcd_query_flag(hba,
+ -					UPIU_QUERY_OPCODE_READ_FLAG,
+ -					QUERY_FLAG_IDN_FDEVICEINIT, &flag_res);
+ -			if (!err || err == -ETIMEDOUT)
+ -				break;
+ -			dev_dbg(hba->dev, "%s: error %d retrying\n", __func__,
+ -					err);
+ -		}
+ -	}
+ -	if (err)
+ -		dev_err(hba->dev,
+ -			"%s reading fDeviceInit flag failed with error %d\n",
+ -			__func__, err);
+ -	else if (flag_res)
+ -		dev_err(hba->dev,
+ -			"%s fDeviceInit was not cleared by the device\n",
+ -			__func__);
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_make_hba_operational - Make UFS controller operational
+ - * @hba: per adapter instance
+ - *
+ - * To bring UFS host controller to operational state,
+ - * 1. Enable required interrupts
+ - * 2. Configure interrupt aggregation
+ - * 3. Program UTRL and UTMRL base addres
+ - * 4. Configure run-stop-registers
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -static int ufshcd_make_hba_operational(struct ufs_hba *hba)
+ -{
+ -	int err = 0;
+ -	u32 reg;
+ -
+ -	/* Enable required interrupts */
+ -	ufshcd_enable_intr(hba, UFSHCD_ENABLE_INTRS);
+ -
+ -	/* Configure interrupt aggregation */
+ -	ufshcd_config_intr_aggr(hba, hba->nutrs - 1, INT_AGGR_DEF_TO);
+ -
+ -	/* Configure UTRL and UTMRL base address registers */
+ -	ufshcd_writel(hba, lower_32_bits(hba->utrdl_dma_addr),
+ -			REG_UTP_TRANSFER_REQ_LIST_BASE_L);
+ -	ufshcd_writel(hba, upper_32_bits(hba->utrdl_dma_addr),
+ -			REG_UTP_TRANSFER_REQ_LIST_BASE_H);
+ -	ufshcd_writel(hba, lower_32_bits(hba->utmrdl_dma_addr),
+ -			REG_UTP_TASK_REQ_LIST_BASE_L);
+ -	ufshcd_writel(hba, upper_32_bits(hba->utmrdl_dma_addr),
+ -			REG_UTP_TASK_REQ_LIST_BASE_H);
+ -
+ -	/*
+ -	 * UCRDY, UTMRLDY and UTRLRDY bits must be 1
+ -	 * DEI, HEI bits must be 0
+ -	 */
+ -	reg = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
+ -	if (!(ufshcd_get_lists_status(reg))) {
+ -		ufshcd_enable_run_stop_reg(hba);
+ -	} else {
+ -		dev_err(hba->dev,
+ -			"Host controller not ready to process requests");
+ -		err = -EIO;
+ -		goto out;
+ -	}
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_hba_enable - initialize the controller
+ - * @hba: per adapter instance
+ - *
+ - * The controller resets itself and controller firmware initialization
+ - * sequence kicks off. When controller is ready it will set
+ - * the Host Controller Enable bit to 1.
+ - *
+ - * Returns 0 on success, non-zero value on failure
+ - */
+ -static int ufshcd_hba_enable(struct ufs_hba *hba)
+ -{
+ -	int retry;
+ -
+ -	/*
+ -	 * msleep of 1 and 5 used in this function might result in msleep(20),
+ -	 * but it was necessary to send the UFS FPGA to reset mode during
+ -	 * development and testing of this driver. msleep can be changed to
+ -	 * mdelay and retry count can be reduced based on the controller.
+ -	 */
+ -	if (!ufshcd_is_hba_active(hba)) {
+ -
+ -		/* change controller state to "reset state" */
+ -		ufshcd_hba_stop(hba);
+ -
+ -		/*
+ -		 * This delay is based on the testing done with UFS host
+ -		 * controller FPGA. The delay can be changed based on the
+ -		 * host controller used.
+ -		 */
+ -		msleep(5);
+ -	}
+ -
+ -	/* UniPro link is disabled at this point */
+ -	ufshcd_set_link_off(hba);
+ -
+ -	if (hba->vops && hba->vops->hce_enable_notify)
+ -		hba->vops->hce_enable_notify(hba, PRE_CHANGE);
+ -
+ -	/* start controller initialization sequence */
+ -	ufshcd_hba_start(hba);
+ -
+ -	/*
+ -	 * To initialize a UFS host controller HCE bit must be set to 1.
+ -	 * During initialization the HCE bit value changes from 1->0->1.
+ -	 * When the host controller completes initialization sequence
+ -	 * it sets the value of HCE bit to 1. The same HCE bit is read back
+ -	 * to check if the controller has completed initialization sequence.
+ -	 * So without this delay the value HCE = 1, set in the previous
+ -	 * instruction might be read back.
+ -	 * This delay can be changed based on the controller.
+ -	 */
+ -	msleep(1);
+ -
+ -	/* wait for the host controller to complete initialization */
+ -	retry = 10;
+ -	while (ufshcd_is_hba_active(hba)) {
+ -		if (retry) {
+ -			retry--;
+ -		} else {
+ -			dev_err(hba->dev,
+ -				"Controller enable failed\n");
+ -			return -EIO;
+ -		}
+ -		msleep(5);
+ -	}
+ -
+ -	/* enable UIC related interrupts */
+ -	ufshcd_enable_intr(hba, UFSHCD_UIC_MASK);
+ -
+ -	if (hba->vops && hba->vops->hce_enable_notify)
+ -		hba->vops->hce_enable_notify(hba, POST_CHANGE);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * ufshcd_link_startup - Initialize unipro link startup
+ - * @hba: per adapter instance
+ - *
+ - * Returns 0 for success, non-zero in case of failure
+ - */
+ -static int ufshcd_link_startup(struct ufs_hba *hba)
+ -{
+ -	int ret;
+ -	int retries = DME_LINKSTARTUP_RETRIES;
+ -
+ -	do {
+ -		if (hba->vops && hba->vops->link_startup_notify)
+ -			hba->vops->link_startup_notify(hba, PRE_CHANGE);
+ -
+ -		ret = ufshcd_dme_link_startup(hba);
+ -
+ -		/* check if device is detected by inter-connect layer */
+ -		if (!ret && !ufshcd_is_device_present(hba)) {
+ -			dev_err(hba->dev, "%s: Device not present\n", __func__);
+ -			ret = -ENXIO;
+ -			goto out;
+ -		}
+ -
+ -		/*
+ -		 * DME link lost indication is only received when link is up,
+ -		 * but we can't be sure if the link is up until link startup
+ -		 * succeeds. So reset the local Uni-Pro and try again.
+ -		 */
+ -		if (ret && ufshcd_hba_enable(hba))
+ -			goto out;
+ -	} while (ret && retries--);
+ -
+ -	if (ret)
+ -		/* failed to get the link up... retire */
+ -		goto out;
+ -
+ -	/* Include any host controller configuration via UIC commands */
+ -	if (hba->vops && hba->vops->link_startup_notify) {
+ -		ret = hba->vops->link_startup_notify(hba, POST_CHANGE);
+ -		if (ret)
+ -			goto out;
+ -	}
+ -
+ -	ret = ufshcd_make_hba_operational(hba);
+ -out:
+ -	if (ret)
+ -		dev_err(hba->dev, "link startup failed %d\n", ret);
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_verify_dev_init() - Verify device initialization
+ - * @hba: per-adapter instance
+ - *
+ - * Send NOP OUT UPIU and wait for NOP IN response to check whether the
+ - * device Transport Protocol (UTP) layer is ready after a reset.
+ - * If the UTP layer at the device side is not initialized, it may
+ - * not respond with NOP IN UPIU within timeout of %NOP_OUT_TIMEOUT
+ - * and we retry sending NOP OUT for %NOP_OUT_RETRIES iterations.
+ - */
+ -static int ufshcd_verify_dev_init(struct ufs_hba *hba)
+ -{
+ -	int err = 0;
+ -	int retries;
+ -
+ -	ufshcd_hold(hba, false);
+ -	mutex_lock(&hba->dev_cmd.lock);
+ -	for (retries = NOP_OUT_RETRIES; retries > 0; retries--) {
+ -		err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_NOP,
+ -					       NOP_OUT_TIMEOUT);
+ -
+ -		if (!err || err == -ETIMEDOUT)
+ -			break;
+ -
+ -		dev_dbg(hba->dev, "%s: error %d retrying\n", __func__, err);
+ -	}
+ -	mutex_unlock(&hba->dev_cmd.lock);
+ -	ufshcd_release(hba);
+ -
+ -	if (err)
+ -		dev_err(hba->dev, "%s: NOP OUT failed %d\n", __func__, err);
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_set_queue_depth - set lun queue depth
+ - * @sdev: pointer to SCSI device
+ - *
+ - * Read bLUQueueDepth value and activate scsi tagged command
+ - * queueing. For WLUN, queue depth is set to 1. For best-effort
+ - * cases (bLUQueueDepth = 0) the queue depth is set to a maximum
+ - * value that host can queue.
+ - */
+ -static void ufshcd_set_queue_depth(struct scsi_device *sdev)
+ -{
+ -	int ret = 0;
+ -	u8 lun_qdepth;
+ -	struct ufs_hba *hba;
+ -
+ -	hba = shost_priv(sdev->host);
+ -
+ -	lun_qdepth = hba->nutrs;
+ -	ret = ufshcd_read_unit_desc_param(hba,
+ -					  ufshcd_scsi_to_upiu_lun(sdev->lun),
+ -					  UNIT_DESC_PARAM_LU_Q_DEPTH,
+ -					  &lun_qdepth,
+ -					  sizeof(lun_qdepth));
+ -
+ -	/* Some WLUN doesn't support unit descriptor */
+ -	if (ret == -EOPNOTSUPP)
+ -		lun_qdepth = 1;
+ -	else if (!lun_qdepth)
+ -		/* eventually, we can figure out the real queue depth */
+ -		lun_qdepth = hba->nutrs;
+ -	else
+ -		lun_qdepth = min_t(int, lun_qdepth, hba->nutrs);
+ -
+ -	dev_dbg(hba->dev, "%s: activate tcq with queue depth %d\n",
+ -			__func__, lun_qdepth);
+ -	if (sdev->tagged_supported)
+ -		scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), lun_qdepth);
+ -}
+ -
+ -/*
+ - * ufshcd_get_lu_wp - returns the "b_lu_write_protect" from UNIT DESCRIPTOR
+ - * @hba: per-adapter instance
+ - * @lun: UFS device lun id
+ - * @b_lu_write_protect: pointer to buffer to hold the LU's write protect info
+ - *
+ - * Returns 0 in case of success and b_lu_write_protect status would be returned
+ - * @b_lu_write_protect parameter.
+ - * Returns -ENOTSUPP if reading b_lu_write_protect is not supported.
+ - * Returns -EINVAL in case of invalid parameters passed to this function.
+ - */
+ -static int ufshcd_get_lu_wp(struct ufs_hba *hba,
+ -			    u8 lun,
+ -			    u8 *b_lu_write_protect)
+ -{
+ -	int ret;
+ -
+ -	if (!b_lu_write_protect)
+ -		ret = -EINVAL;
+ -	/*
+ -	 * According to UFS device spec, RPMB LU can't be write
+ -	 * protected so skip reading bLUWriteProtect parameter for
+ -	 * it. For other W-LUs, UNIT DESCRIPTOR is not available.
+ -	 */
+ -	else if (lun >= UFS_UPIU_MAX_GENERAL_LUN)
+ -		ret = -ENOTSUPP;
+ -	else
+ -		ret = ufshcd_read_unit_desc_param(hba,
+ -					  lun,
+ -					  UNIT_DESC_PARAM_LU_WR_PROTECT,
+ -					  b_lu_write_protect,
+ -					  sizeof(*b_lu_write_protect));
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ufshcd_get_lu_power_on_wp_status - get LU's power on write protect
+ - * status
+ - * @hba: per-adapter instance
+ - * @sdev: pointer to SCSI device
+ - *
+ - */
+ -static inline void ufshcd_get_lu_power_on_wp_status(struct ufs_hba *hba,
+ -						    struct scsi_device *sdev)
+ -{
+ -	if (hba->dev_info.f_power_on_wp_en &&
+ -	    !hba->dev_info.is_lu_power_on_wp) {
+ -		u8 b_lu_write_protect;
+ -
+ -		if (!ufshcd_get_lu_wp(hba, ufshcd_scsi_to_upiu_lun(sdev->lun),
+ -				      &b_lu_write_protect) &&
+ -		    (b_lu_write_protect == UFS_LU_POWER_ON_WP))
+ -			hba->dev_info.is_lu_power_on_wp = true;
+ -	}
+ -}
+ -
+ -/**
+ - * ufshcd_slave_alloc - handle initial SCSI device configurations
+ - * @sdev: pointer to SCSI device
+ - *
+ - * Returns success
+ - */
+ -static int ufshcd_slave_alloc(struct scsi_device *sdev)
+ -{
+ -	struct ufs_hba *hba;
+ -
+ -	hba = shost_priv(sdev->host);
+ -	sdev->tagged_supported = 1;
+ -
+ -	/* Mode sense(6) is not supported by UFS, so use Mode sense(10) */
+ -	sdev->use_10_for_ms = 1;
+ -	scsi_set_tag_type(sdev, MSG_SIMPLE_TAG);
+ -
+ -	/* allow SCSI layer to restart the device in case of errors */
+ -	sdev->allow_restart = 1;
+ -
+ -	/* REPORT SUPPORTED OPERATION CODES is not supported */
+ -	sdev->no_report_opcodes = 1;
+ -
+ -
+ -	ufshcd_set_queue_depth(sdev);
+ -
+ -	ufshcd_get_lu_power_on_wp_status(hba, sdev);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * ufshcd_change_queue_depth - change queue depth
+ - * @sdev: pointer to SCSI device
+ - * @depth: required depth to set
+ - * @reason: reason for changing the depth
+ - *
+ - * Change queue depth according to the reason and make sure
+ - * the max. limits are not crossed.
+ - */
+ -static int ufshcd_change_queue_depth(struct scsi_device *sdev,
+ -		int depth, int reason)
+ -{
+ -	struct ufs_hba *hba = shost_priv(sdev->host);
+ -
+ -	if (depth > hba->nutrs)
+ -		depth = hba->nutrs;
+ -
+ -	switch (reason) {
+ -	case SCSI_QDEPTH_DEFAULT:
+ -	case SCSI_QDEPTH_RAMP_UP:
+ -		if (!sdev->tagged_supported)
+ -			depth = 1;
+ -		scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), depth);
+ -		break;
+ -	case SCSI_QDEPTH_QFULL:
+ -		scsi_track_queue_full(sdev, depth);
+ -		break;
+ -	default:
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	return depth;
+ -}
+ -
+ -/**
+ - * ufshcd_slave_configure - adjust SCSI device configurations
+ - * @sdev: pointer to SCSI device
+ - */
+ -static int ufshcd_slave_configure(struct scsi_device *sdev)
+ -{
+ -	struct request_queue *q = sdev->request_queue;
+ -
+ -	blk_queue_update_dma_pad(q, PRDT_DATA_BYTE_COUNT_PAD - 1);
+ -	blk_queue_max_segment_size(q, PRDT_DATA_BYTE_COUNT_MAX);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * ufshcd_slave_destroy - remove SCSI device configurations
+ - * @sdev: pointer to SCSI device
+ - */
+ -static void ufshcd_slave_destroy(struct scsi_device *sdev)
+ -{
+ -	struct ufs_hba *hba;
+ -
+ -	hba = shost_priv(sdev->host);
+ -	/* Drop the reference as it won't be needed anymore */
+ -	if (ufshcd_scsi_to_upiu_lun(sdev->lun) == UFS_UPIU_UFS_DEVICE_WLUN)
+ -		hba->sdev_ufs_device = NULL;
+ -}
+ -
+ -/**
+ - * ufshcd_task_req_compl - handle task management request completion
+ - * @hba: per adapter instance
+ - * @index: index of the completed request
+ - * @resp: task management service response
+ - *
+ - * Returns non-zero value on error, zero on success
+ - */
+ -static int ufshcd_task_req_compl(struct ufs_hba *hba, u32 index, u8 *resp)
+ -{
+ -	struct utp_task_req_desc *task_req_descp;
+ -	struct utp_upiu_task_rsp *task_rsp_upiup;
+ -	unsigned long flags;
+ -	int ocs_value;
+ -	int task_result;
+ -
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -
+ -	/* Clear completed tasks from outstanding_tasks */
+ -	__clear_bit(index, &hba->outstanding_tasks);
+ -
+ -	task_req_descp = hba->utmrdl_base_addr;
+ -	ocs_value = ufshcd_get_tmr_ocs(&task_req_descp[index]);
+ -
+ -	if (ocs_value == OCS_SUCCESS) {
+ -		task_rsp_upiup = (struct utp_upiu_task_rsp *)
+ -				task_req_descp[index].task_rsp_upiu;
+ -		task_result = be32_to_cpu(task_rsp_upiup->header.dword_1);
+ -		task_result = ((task_result & MASK_TASK_RESPONSE) >> 8);
+ -		if (resp)
+ -			*resp = (u8)task_result;
+ -	} else {
+ -		dev_err(hba->dev, "%s: failed, ocs = 0x%x\n",
+ -				__func__, ocs_value);
+ -	}
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	return ocs_value;
+ -}
+ -
+ -/**
+ - * ufshcd_scsi_cmd_status - Update SCSI command result based on SCSI status
+ - * @lrb: pointer to local reference block of completed command
+ - * @scsi_status: SCSI command status
+ - *
+ - * Returns value base on SCSI command status
+ - */
+ -static inline int
+ -ufshcd_scsi_cmd_status(struct ufshcd_lrb *lrbp, int scsi_status)
+ -{
+ -	int result = 0;
+ -
+ -	switch (scsi_status) {
+ -	case SAM_STAT_CHECK_CONDITION:
+ -		ufshcd_copy_sense_data(lrbp);
+ -	case SAM_STAT_GOOD:
+ -		result |= DID_OK << 16 |
+ -			  COMMAND_COMPLETE << 8 |
+ -			  scsi_status;
+ -		break;
+ -	case SAM_STAT_TASK_SET_FULL:
+ -	case SAM_STAT_BUSY:
+ -	case SAM_STAT_TASK_ABORTED:
+ -		ufshcd_copy_sense_data(lrbp);
+ -		result |= scsi_status;
+ -		break;
+ -	default:
+ -		result |= DID_ERROR << 16;
+ -		break;
+ -	} /* end of switch */
+ -
+ -	return result;
+ -}
+ -
+ -/**
+ - * ufshcd_transfer_rsp_status - Get overall status of the response
+ - * @hba: per adapter instance
+ - * @lrb: pointer to local reference block of completed command
+ - *
+ - * Returns result of the command to notify SCSI midlayer
+ - */
+ -static inline int
+ -ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
+ -{
+ -	int result = 0;
+ -	int scsi_status;
+ -	int ocs;
+ -
+ -	/* overall command status of utrd */
+ -	ocs = ufshcd_get_tr_ocs(lrbp);
+ -
+ -	switch (ocs) {
+ -	case OCS_SUCCESS:
+ -		result = ufshcd_get_req_rsp(lrbp->ucd_rsp_ptr);
+ -
+ -		switch (result) {
+ -		case UPIU_TRANSACTION_RESPONSE:
+ -			/*
+ -			 * get the response UPIU result to extract
+ -			 * the SCSI command status
+ -			 */
+ -			result = ufshcd_get_rsp_upiu_result(lrbp->ucd_rsp_ptr);
+ -
+ -			/*
+ -			 * get the result based on SCSI status response
+ -			 * to notify the SCSI midlayer of the command status
+ -			 */
+ -			scsi_status = result & MASK_SCSI_STATUS;
+ -			result = ufshcd_scsi_cmd_status(lrbp, scsi_status);
+ -
+ -			if (ufshcd_is_exception_event(lrbp->ucd_rsp_ptr))
+ -				schedule_work(&hba->eeh_work);
+ -			break;
+ -		case UPIU_TRANSACTION_REJECT_UPIU:
+ -			/* TODO: handle Reject UPIU Response */
+ -			result = DID_ERROR << 16;
+ -			dev_err(hba->dev,
+ -				"Reject UPIU not fully implemented\n");
+ -			break;
+ -		default:
+ -			result = DID_ERROR << 16;
+ -			dev_err(hba->dev,
+ -				"Unexpected request response code = %x\n",
+ -				result);
+ -			break;
+ -		}
+ -		break;
+ -	case OCS_ABORTED:
+ -		result |= DID_ABORT << 16;
+ -		break;
+ -	case OCS_INVALID_COMMAND_STATUS:
+ -		result |= DID_REQUEUE << 16;
+ -		break;
+ -	case OCS_INVALID_CMD_TABLE_ATTR:
+ -	case OCS_INVALID_PRDT_ATTR:
+ -	case OCS_MISMATCH_DATA_BUF_SIZE:
+ -	case OCS_MISMATCH_RESP_UPIU_SIZE:
+ -	case OCS_PEER_COMM_FAILURE:
+ -	case OCS_FATAL_ERROR:
+ -	default:
+ -		result |= DID_ERROR << 16;
+ -		dev_err(hba->dev,
+ -		"OCS error from controller = %x\n", ocs);
+ -		break;
+ -	} /* end of switch */
+ -
+ -	return result;
+ -}
+ -
+ -/**
+ - * ufshcd_uic_cmd_compl - handle completion of uic command
+ - * @hba: per adapter instance
+ - * @intr_status: interrupt status generated by the controller
+ - */
+ -static void ufshcd_uic_cmd_compl(struct ufs_hba *hba, u32 intr_status)
+ -{
+ -	if ((intr_status & UIC_COMMAND_COMPL) && hba->active_uic_cmd) {
+ -		hba->active_uic_cmd->argument2 |=
+ -			ufshcd_get_uic_cmd_result(hba);
+ -		hba->active_uic_cmd->argument3 =
+ -			ufshcd_get_dme_attr_val(hba);
+ -		complete(&hba->active_uic_cmd->done);
+ -	}
+ -
+ -	if ((intr_status & UFSHCD_UIC_PWR_MASK) && hba->uic_async_done)
+ -		complete(hba->uic_async_done);
+ -}
+ -
+ -/**
+ - * ufshcd_transfer_req_compl - handle SCSI and query command completion
+ - * @hba: per adapter instance
+ - */
+ -static void ufshcd_transfer_req_compl(struct ufs_hba *hba)
+ -{
+ -	struct ufshcd_lrb *lrbp;
+ -	struct scsi_cmnd *cmd;
+ -	unsigned long completed_reqs;
+ -	u32 tr_doorbell;
+ -	int result;
+ -	int index;
+ -
+ -	/* Resetting interrupt aggregation counters first and reading the
+ -	 * DOOR_BELL afterward allows us to handle all the completed requests.
+ -	 * In order to prevent other interrupts starvation the DB is read once
+ -	 * after reset. The down side of this solution is the possibility of
+ -	 * false interrupt if device completes another request after resetting
+ -	 * aggregation and before reading the DB.
+ -	 */
+ -	ufshcd_reset_intr_aggr(hba);
+ -
+ -	tr_doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
+ -	completed_reqs = tr_doorbell ^ hba->outstanding_reqs;
+ -
+ -	for_each_set_bit(index, &completed_reqs, hba->nutrs) {
+ -		lrbp = &hba->lrb[index];
+ -		cmd = lrbp->cmd;
+ -		if (cmd) {
+ -			result = ufshcd_transfer_rsp_status(hba, lrbp);
+ -			scsi_dma_unmap(cmd);
+ -			cmd->result = result;
+ -			/* Mark completed command as NULL in LRB */
+ -			lrbp->cmd = NULL;
+ -			clear_bit_unlock(index, &hba->lrb_in_use);
+ -			/* Do not touch lrbp after scsi done */
+ -			cmd->scsi_done(cmd);
+ -			__ufshcd_release(hba);
+ -		} else if (lrbp->command_type == UTP_CMD_TYPE_DEV_MANAGE) {
+ -			if (hba->dev_cmd.complete)
+ -				complete(hba->dev_cmd.complete);
+ -		}
+ -	}
+ -
+ -	/* clear corresponding bits of completed commands */
+ -	hba->outstanding_reqs ^= completed_reqs;
+ -
+ -	ufshcd_clk_scaling_update_busy(hba);
+ -
+ -	/* we might have free'd some tags above */
+ -	wake_up(&hba->dev_cmd.tag_wq);
+ -}
+ -
+ -/**
+ - * ufshcd_disable_ee - disable exception event
+ - * @hba: per-adapter instance
+ - * @mask: exception event to disable
+ - *
+ - * Disables exception event in the device so that the EVENT_ALERT
+ - * bit is not set.
+ - *
+ - * Returns zero on success, non-zero error value on failure.
+ - */
+ -static int ufshcd_disable_ee(struct ufs_hba *hba, u16 mask)
+ -{
+ -	int err = 0;
+ -	u32 val;
+ -
+ -	if (!(hba->ee_ctrl_mask & mask))
+ -		goto out;
+ -
+ -	val = hba->ee_ctrl_mask & ~mask;
+ -	val &= 0xFFFF; /* 2 bytes */
+ -	err = ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
+ -			QUERY_ATTR_IDN_EE_CONTROL, 0, 0, &val);
+ -	if (!err)
+ -		hba->ee_ctrl_mask &= ~mask;
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_enable_ee - enable exception event
+ - * @hba: per-adapter instance
+ - * @mask: exception event to enable
+ - *
+ - * Enable corresponding exception event in the device to allow
+ - * device to alert host in critical scenarios.
+ - *
+ - * Returns zero on success, non-zero error value on failure.
+ - */
+ -static int ufshcd_enable_ee(struct ufs_hba *hba, u16 mask)
+ -{
+ -	int err = 0;
+ -	u32 val;
+ -
+ -	if (hba->ee_ctrl_mask & mask)
+ -		goto out;
+ -
+ -	val = hba->ee_ctrl_mask | mask;
+ -	val &= 0xFFFF; /* 2 bytes */
+ -	err = ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
+ -			QUERY_ATTR_IDN_EE_CONTROL, 0, 0, &val);
+ -	if (!err)
+ -		hba->ee_ctrl_mask |= mask;
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_enable_auto_bkops - Allow device managed BKOPS
+ - * @hba: per-adapter instance
+ - *
+ - * Allow device to manage background operations on its own. Enabling
+ - * this might lead to inconsistent latencies during normal data transfers
+ - * as the device is allowed to manage its own way of handling background
+ - * operations.
+ - *
+ - * Returns zero on success, non-zero on failure.
+ - */
+ -static int ufshcd_enable_auto_bkops(struct ufs_hba *hba)
+ -{
+ -	int err = 0;
+ -
+ -	if (hba->auto_bkops_enabled)
+ -		goto out;
+ -
+ -	err = ufshcd_query_flag(hba, UPIU_QUERY_OPCODE_SET_FLAG,
+ -			QUERY_FLAG_IDN_BKOPS_EN, NULL);
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: failed to enable bkops %d\n",
+ -				__func__, err);
+ -		goto out;
+ -	}
+ -
+ -	hba->auto_bkops_enabled = true;
+ -
+ -	/* No need of URGENT_BKOPS exception from the device */
+ -	err = ufshcd_disable_ee(hba, MASK_EE_URGENT_BKOPS);
+ -	if (err)
+ -		dev_err(hba->dev, "%s: failed to disable exception event %d\n",
+ -				__func__, err);
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_disable_auto_bkops - block device in doing background operations
+ - * @hba: per-adapter instance
+ - *
+ - * Disabling background operations improves command response latency but
+ - * has drawback of device moving into critical state where the device is
+ - * not-operable. Make sure to call ufshcd_enable_auto_bkops() whenever the
+ - * host is idle so that BKOPS are managed effectively without any negative
+ - * impacts.
+ - *
+ - * Returns zero on success, non-zero on failure.
+ - */
+ -static int ufshcd_disable_auto_bkops(struct ufs_hba *hba)
+ -{
+ -	int err = 0;
+ -
+ -	if (!hba->auto_bkops_enabled)
+ -		goto out;
+ -
+ -	/*
+ -	 * If host assisted BKOPs is to be enabled, make sure
+ -	 * urgent bkops exception is allowed.
+ -	 */
+ -	err = ufshcd_enable_ee(hba, MASK_EE_URGENT_BKOPS);
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: failed to enable exception event %d\n",
+ -				__func__, err);
+ -		goto out;
+ -	}
+ -
+ -	err = ufshcd_query_flag(hba, UPIU_QUERY_OPCODE_CLEAR_FLAG,
+ -			QUERY_FLAG_IDN_BKOPS_EN, NULL);
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: failed to disable bkops %d\n",
+ -				__func__, err);
+ -		ufshcd_disable_ee(hba, MASK_EE_URGENT_BKOPS);
+ -		goto out;
+ -	}
+ -
+ -	hba->auto_bkops_enabled = false;
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_force_reset_auto_bkops - force enable of auto bkops
+ - * @hba: per adapter instance
+ - *
+ - * After a device reset the device may toggle the BKOPS_EN flag
+ - * to default value. The s/w tracking variables should be updated
+ - * as well. Do this by forcing enable of auto bkops.
+ - */
+ -static void  ufshcd_force_reset_auto_bkops(struct ufs_hba *hba)
+ -{
+ -	hba->auto_bkops_enabled = false;
+ -	hba->ee_ctrl_mask |= MASK_EE_URGENT_BKOPS;
+ -	ufshcd_enable_auto_bkops(hba);
+ -}
+ -
+ -static inline int ufshcd_get_bkops_status(struct ufs_hba *hba, u32 *status)
+ -{
+ -	return ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_READ_ATTR,
+ -			QUERY_ATTR_IDN_BKOPS_STATUS, 0, 0, status);
+ -}
+ -
+ -/**
+ - * ufshcd_bkops_ctrl - control the auto bkops based on current bkops status
+ - * @hba: per-adapter instance
+ - * @status: bkops_status value
+ - *
+ - * Read the bkops_status from the UFS device and Enable fBackgroundOpsEn
+ - * flag in the device to permit background operations if the device
+ - * bkops_status is greater than or equal to "status" argument passed to
+ - * this function, disable otherwise.
+ - *
+ - * Returns 0 for success, non-zero in case of failure.
+ - *
+ - * NOTE: Caller of this function can check the "hba->auto_bkops_enabled" flag
+ - * to know whether auto bkops is enabled or disabled after this function
+ - * returns control to it.
+ - */
+ -static int ufshcd_bkops_ctrl(struct ufs_hba *hba,
+ -			     enum bkops_status status)
+ -{
+ -	int err;
+ -	u32 curr_status = 0;
+ -
+ -	err = ufshcd_get_bkops_status(hba, &curr_status);
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: failed to get BKOPS status %d\n",
+ -				__func__, err);
+ -		goto out;
+ -	} else if (curr_status > BKOPS_STATUS_MAX) {
+ -		dev_err(hba->dev, "%s: invalid BKOPS status %d\n",
+ -				__func__, curr_status);
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	if (curr_status >= status)
+ -		err = ufshcd_enable_auto_bkops(hba);
+ -	else
+ -		err = ufshcd_disable_auto_bkops(hba);
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_urgent_bkops - handle urgent bkops exception event
+ - * @hba: per-adapter instance
+ - *
+ - * Enable fBackgroundOpsEn flag in the device to permit background
+ - * operations.
+ - *
+ - * If BKOPs is enabled, this function returns 0, 1 if the bkops in not enabled
+ - * and negative error value for any other failure.
+ - */
+ -static int ufshcd_urgent_bkops(struct ufs_hba *hba)
+ -{
+ -	return ufshcd_bkops_ctrl(hba, BKOPS_STATUS_PERF_IMPACT);
+ -}
+ -
+ -static inline int ufshcd_get_ee_status(struct ufs_hba *hba, u32 *status)
+ -{
+ -	return ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_READ_ATTR,
+ -			QUERY_ATTR_IDN_EE_STATUS, 0, 0, status);
+ -}
+ -
+ -/**
+ - * ufshcd_exception_event_handler - handle exceptions raised by device
+ - * @work: pointer to work data
+ - *
+ - * Read bExceptionEventStatus attribute from the device and handle the
+ - * exception event accordingly.
+ - */
+ -static void ufshcd_exception_event_handler(struct work_struct *work)
+ -{
+ -	struct ufs_hba *hba;
+ -	int err;
+ -	u32 status = 0;
+ -	hba = container_of(work, struct ufs_hba, eeh_work);
+ -
+ -	pm_runtime_get_sync(hba->dev);
+ -	err = ufshcd_get_ee_status(hba, &status);
+ -	if (err) {
+ -		dev_err(hba->dev, "%s: failed to get exception status %d\n",
+ -				__func__, err);
+ -		goto out;
+ -	}
+ -
+ -	status &= hba->ee_ctrl_mask;
+ -	if (status & MASK_EE_URGENT_BKOPS) {
+ -		err = ufshcd_urgent_bkops(hba);
+ -		if (err < 0)
+ -			dev_err(hba->dev, "%s: failed to handle urgent bkops %d\n",
+ -					__func__, err);
+ -	}
+ -out:
+ -	pm_runtime_put_sync(hba->dev);
+ -	return;
+ -}
+ -
+ -/**
+ - * ufshcd_err_handler - handle UFS errors that require s/w attention
+ - * @work: pointer to work structure
+ - */
+ -static void ufshcd_err_handler(struct work_struct *work)
+ -{
+ -	struct ufs_hba *hba;
+ -	unsigned long flags;
+ -	u32 err_xfer = 0;
+ -	u32 err_tm = 0;
+ -	int err = 0;
+ -	int tag;
+ -
+ -	hba = container_of(work, struct ufs_hba, eh_work);
+ -
+ -	pm_runtime_get_sync(hba->dev);
+ -	ufshcd_hold(hba, false);
+ -
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	if (hba->ufshcd_state == UFSHCD_STATE_RESET) {
+ -		spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -		goto out;
+ -	}
+ -
+ -	hba->ufshcd_state = UFSHCD_STATE_RESET;
+ -	ufshcd_set_eh_in_progress(hba);
+ -
+ -	/* Complete requests that have door-bell cleared by h/w */
+ -	ufshcd_transfer_req_compl(hba);
+ -	ufshcd_tmc_handler(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	/* Clear pending transfer requests */
+ -	for_each_set_bit(tag, &hba->outstanding_reqs, hba->nutrs)
+ -		if (ufshcd_clear_cmd(hba, tag))
+ -			err_xfer |= 1 << tag;
+ -
+ -	/* Clear pending task management requests */
+ -	for_each_set_bit(tag, &hba->outstanding_tasks, hba->nutmrs)
+ -		if (ufshcd_clear_tm_cmd(hba, tag))
+ -			err_tm |= 1 << tag;
+ -
+ -	/* Complete the requests that are cleared by s/w */
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	ufshcd_transfer_req_compl(hba);
+ -	ufshcd_tmc_handler(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	/* Fatal errors need reset */
+ -	if (err_xfer || err_tm || (hba->saved_err & INT_FATAL_ERRORS) ||
+ -			((hba->saved_err & UIC_ERROR) &&
+ -			 (hba->saved_uic_err & UFSHCD_UIC_DL_PA_INIT_ERROR))) {
+ -		err = ufshcd_reset_and_restore(hba);
+ -		if (err) {
+ -			dev_err(hba->dev, "%s: reset and restore failed\n",
+ -					__func__);
+ -			hba->ufshcd_state = UFSHCD_STATE_ERROR;
+ -		}
+ -		/*
+ -		 * Inform scsi mid-layer that we did reset and allow to handle
+ -		 * Unit Attention properly.
+ -		 */
+ -		scsi_report_bus_reset(hba->host, 0);
+ -		hba->saved_err = 0;
+ -		hba->saved_uic_err = 0;
+ -	}
+ -	ufshcd_clear_eh_in_progress(hba);
+ -
+ -out:
+ -	scsi_unblock_requests(hba->host);
+ -	ufshcd_release(hba);
+ -	pm_runtime_put_sync(hba->dev);
+ -}
+ -
+ -/**
+ - * ufshcd_update_uic_error - check and set fatal UIC error flags.
+ - * @hba: per-adapter instance
+ - */
+ -static void ufshcd_update_uic_error(struct ufs_hba *hba)
+ -{
+ -	u32 reg;
+ -
+ -	/* PA_INIT_ERROR is fatal and needs UIC reset */
+ -	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER);
+ -	if (reg & UIC_DATA_LINK_LAYER_ERROR_PA_INIT)
+ -		hba->uic_error |= UFSHCD_UIC_DL_PA_INIT_ERROR;
+ -
+ -	/* UIC NL/TL/DME errors needs software retry */
+ -	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_NETWORK_LAYER);
+ -	if (reg)
+ -		hba->uic_error |= UFSHCD_UIC_NL_ERROR;
+ -
+ -	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_TRANSPORT_LAYER);
+ -	if (reg)
+ -		hba->uic_error |= UFSHCD_UIC_TL_ERROR;
+ -
+ -	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DME);
+ -	if (reg)
+ -		hba->uic_error |= UFSHCD_UIC_DME_ERROR;
+ -
+ -	dev_dbg(hba->dev, "%s: UIC error flags = 0x%08x\n",
+ -			__func__, hba->uic_error);
+ -}
+ -
+ -/**
+ - * ufshcd_check_errors - Check for errors that need s/w attention
+ - * @hba: per-adapter instance
+ - */
+ -static void ufshcd_check_errors(struct ufs_hba *hba)
+ -{
+ -	bool queue_eh_work = false;
+ -
+ -	if (hba->errors & INT_FATAL_ERRORS)
+ -		queue_eh_work = true;
+ -
+ -	if (hba->errors & UIC_ERROR) {
+ -		hba->uic_error = 0;
+ -		ufshcd_update_uic_error(hba);
+ -		if (hba->uic_error)
+ -			queue_eh_work = true;
+ -	}
+ -
+ -	if (queue_eh_work) {
+ -		/* handle fatal errors only when link is functional */
+ -		if (hba->ufshcd_state == UFSHCD_STATE_OPERATIONAL) {
+ -			/* block commands from scsi mid-layer */
+ -			scsi_block_requests(hba->host);
+ -
+ -			/* transfer error masks to sticky bits */
+ -			hba->saved_err |= hba->errors;
+ -			hba->saved_uic_err |= hba->uic_error;
+ -
+ -			hba->ufshcd_state = UFSHCD_STATE_ERROR;
+ -			schedule_work(&hba->eh_work);
+ -		}
+ -	}
+ -	/*
+ -	 * if (!queue_eh_work) -
+ -	 * Other errors are either non-fatal where host recovers
+ -	 * itself without s/w intervention or errors that will be
+ -	 * handled by the SCSI core layer.
+ -	 */
+ -}
+ -
+ -/**
+ - * ufshcd_tmc_handler - handle task management function completion
+ - * @hba: per adapter instance
+ - */
+ -static void ufshcd_tmc_handler(struct ufs_hba *hba)
+ -{
+ -	u32 tm_doorbell;
+ -
+ -	tm_doorbell = ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL);
+ -	hba->tm_condition = tm_doorbell ^ hba->outstanding_tasks;
+ -	wake_up(&hba->tm_wq);
+ -}
+ -
+ -/**
+ - * ufshcd_sl_intr - Interrupt service routine
+ - * @hba: per adapter instance
+ - * @intr_status: contains interrupts generated by the controller
+ - */
+ -static void ufshcd_sl_intr(struct ufs_hba *hba, u32 intr_status)
+ -{
+ -	hba->errors = UFSHCD_ERROR_MASK & intr_status;
+ -	if (hba->errors)
+ -		ufshcd_check_errors(hba);
+ -
+ -	if (intr_status & UFSHCD_UIC_MASK)
+ -		ufshcd_uic_cmd_compl(hba, intr_status);
+ -
+ -	if (intr_status & UTP_TASK_REQ_COMPL)
+ -		ufshcd_tmc_handler(hba);
+ -
+ -	if (intr_status & UTP_TRANSFER_REQ_COMPL)
+ -		ufshcd_transfer_req_compl(hba);
+ -}
+ -
+ -/**
+ - * ufshcd_intr - Main interrupt service routine
+ - * @irq: irq number
+ - * @__hba: pointer to adapter instance
+ - *
+ - * Returns IRQ_HANDLED - If interrupt is valid
+ - *		IRQ_NONE - If invalid interrupt
+ - */
+ -static irqreturn_t ufshcd_intr(int irq, void *__hba)
+ -{
+ -	u32 intr_status;
+ -	irqreturn_t retval = IRQ_NONE;
+ -	struct ufs_hba *hba = __hba;
+ -
+ -	spin_lock(hba->host->host_lock);
+ -	intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+ -
+ -	if (intr_status) {
+ -		ufshcd_writel(hba, intr_status, REG_INTERRUPT_STATUS);
+ -		ufshcd_sl_intr(hba, intr_status);
+ -		retval = IRQ_HANDLED;
+ -	}
+ -	spin_unlock(hba->host->host_lock);
+ -	return retval;
+ -}
+ -
+ -static int ufshcd_clear_tm_cmd(struct ufs_hba *hba, int tag)
+ -{
+ -	int err = 0;
+ -	u32 mask = 1 << tag;
+ -	unsigned long flags;
+ -
+ -	if (!test_bit(tag, &hba->outstanding_tasks))
+ -		goto out;
+ -
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	ufshcd_writel(hba, ~(1 << tag), REG_UTP_TASK_REQ_LIST_CLEAR);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	/* poll for max. 1 sec to clear door bell register by h/w */
+ -	err = ufshcd_wait_for_register(hba,
+ -			REG_UTP_TASK_REQ_DOOR_BELL,
+ -			mask, 0, 1000, 1000);
+ -out:
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_issue_tm_cmd - issues task management commands to controller
+ - * @hba: per adapter instance
+ - * @lun_id: LUN ID to which TM command is sent
+ - * @task_id: task ID to which the TM command is applicable
+ - * @tm_function: task management function opcode
+ - * @tm_response: task management service response return value
+ - *
+ - * Returns non-zero value on error, zero on success.
+ - */
+ -static int ufshcd_issue_tm_cmd(struct ufs_hba *hba, int lun_id, int task_id,
+ -		u8 tm_function, u8 *tm_response)
+ -{
+ -	struct utp_task_req_desc *task_req_descp;
+ -	struct utp_upiu_task_req *task_req_upiup;
+ -	struct Scsi_Host *host;
+ -	unsigned long flags;
+ -	int free_slot;
+ -	int err;
+ -	int task_tag;
+ -
+ -	host = hba->host;
+ -
+ -	/*
+ -	 * Get free slot, sleep if slots are unavailable.
+ -	 * Even though we use wait_event() which sleeps indefinitely,
+ -	 * the maximum wait time is bounded by %TM_CMD_TIMEOUT.
+ -	 */
+ -	wait_event(hba->tm_tag_wq, ufshcd_get_tm_free_slot(hba, &free_slot));
+ -	ufshcd_hold(hba, false);
+ -
+ -	spin_lock_irqsave(host->host_lock, flags);
+ -	task_req_descp = hba->utmrdl_base_addr;
+ -	task_req_descp += free_slot;
+ -
+ -	/* Configure task request descriptor */
+ -	task_req_descp->header.dword_0 = cpu_to_le32(UTP_REQ_DESC_INT_CMD);
+ -	task_req_descp->header.dword_2 =
+ -			cpu_to_le32(OCS_INVALID_COMMAND_STATUS);
+ -
+ -	/* Configure task request UPIU */
+ -	task_req_upiup =
+ -		(struct utp_upiu_task_req *) task_req_descp->task_req_upiu;
+ -	task_tag = hba->nutrs + free_slot;
+ -	task_req_upiup->header.dword_0 =
+ -		UPIU_HEADER_DWORD(UPIU_TRANSACTION_TASK_REQ, 0,
+ -					      lun_id, task_tag);
+ -	task_req_upiup->header.dword_1 =
+ -		UPIU_HEADER_DWORD(0, tm_function, 0, 0);
+ -	/*
+ -	 * The host shall provide the same value for LUN field in the basic
+ -	 * header and for Input Parameter.
+ -	 */
+ -	task_req_upiup->input_param1 = cpu_to_be32(lun_id);
+ -	task_req_upiup->input_param2 = cpu_to_be32(task_id);
+ -
+ -	/* send command to the controller */
+ -	__set_bit(free_slot, &hba->outstanding_tasks);
+ -	ufshcd_writel(hba, 1 << free_slot, REG_UTP_TASK_REQ_DOOR_BELL);
+ -
+ -	spin_unlock_irqrestore(host->host_lock, flags);
+ -
+ -	/* wait until the task management command is completed */
+ -	err = wait_event_timeout(hba->tm_wq,
+ -			test_bit(free_slot, &hba->tm_condition),
+ -			msecs_to_jiffies(TM_CMD_TIMEOUT));
+ -	if (!err) {
+ -		dev_err(hba->dev, "%s: task management cmd 0x%.2x timed-out\n",
+ -				__func__, tm_function);
+ -		if (ufshcd_clear_tm_cmd(hba, free_slot))
+ -			dev_WARN(hba->dev, "%s: unable clear tm cmd (slot %d) after timeout\n",
+ -					__func__, free_slot);
+ -		err = -ETIMEDOUT;
+ -	} else {
+ -		err = ufshcd_task_req_compl(hba, free_slot, tm_response);
+ -	}
+ -
+ -	clear_bit(free_slot, &hba->tm_condition);
+ -	ufshcd_put_tm_slot(hba, free_slot);
+ -	wake_up(&hba->tm_tag_wq);
+ -
+ -	ufshcd_release(hba);
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_eh_device_reset_handler - device reset handler registered to
+ - *                                    scsi layer.
+ - * @cmd: SCSI command pointer
+ - *
+ - * Returns SUCCESS/FAILED
+ - */
+ -static int ufshcd_eh_device_reset_handler(struct scsi_cmnd *cmd)
+ -{
+ -	struct Scsi_Host *host;
+ -	struct ufs_hba *hba;
+ -	unsigned int tag;
+ -	u32 pos;
+ -	int err;
+ -	u8 resp = 0xF;
+ -	struct ufshcd_lrb *lrbp;
+ -	unsigned long flags;
+ -
+ -	host = cmd->device->host;
+ -	hba = shost_priv(host);
+ -	tag = cmd->request->tag;
+ -
+ -	lrbp = &hba->lrb[tag];
+ -	err = ufshcd_issue_tm_cmd(hba, lrbp->lun, 0, UFS_LOGICAL_RESET, &resp);
+ -	if (err || resp != UPIU_TASK_MANAGEMENT_FUNC_COMPL) {
+ -		if (!err)
+ -			err = resp;
+ -		goto out;
+ -	}
+ -
+ -	/* clear the commands that were pending for corresponding LUN */
+ -	for_each_set_bit(pos, &hba->outstanding_reqs, hba->nutrs) {
+ -		if (hba->lrb[pos].lun == lrbp->lun) {
+ -			err = ufshcd_clear_cmd(hba, pos);
+ -			if (err)
+ -				break;
+ -		}
+ -	}
+ -	spin_lock_irqsave(host->host_lock, flags);
+ -	ufshcd_transfer_req_compl(hba);
+ -	spin_unlock_irqrestore(host->host_lock, flags);
+ -out:
+ -	if (!err) {
+ -		err = SUCCESS;
+ -	} else {
+ -		dev_err(hba->dev, "%s: failed with err %d\n", __func__, err);
+ -		err = FAILED;
+ -	}
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_abort - abort a specific command
+ - * @cmd: SCSI command pointer
+ - *
+ - * Abort the pending command in device by sending UFS_ABORT_TASK task management
+ - * command, and in host controller by clearing the door-bell register. There can
+ - * be race between controller sending the command to the device while abort is
+ - * issued. To avoid that, first issue UFS_QUERY_TASK to check if the command is
+ - * really issued and then try to abort it.
+ - *
+ - * Returns SUCCESS/FAILED
+ - */
+ -static int ufshcd_abort(struct scsi_cmnd *cmd)
+ -{
+ -	struct Scsi_Host *host;
+ -	struct ufs_hba *hba;
+ -	unsigned long flags;
+ -	unsigned int tag;
+ -	int err = 0;
+ -	int poll_cnt;
+ -	u8 resp = 0xF;
+ -	struct ufshcd_lrb *lrbp;
+ -	u32 reg;
+ -
+ -	host = cmd->device->host;
+ -	hba = shost_priv(host);
+ -	tag = cmd->request->tag;
+ -
+ -	ufshcd_hold(hba, false);
+ -	/* If command is already aborted/completed, return SUCCESS */
+ -	if (!(test_bit(tag, &hba->outstanding_reqs)))
+ -		goto out;
+ -
+ -	reg = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
+ -	if (!(reg & (1 << tag))) {
+ -		dev_err(hba->dev,
+ -		"%s: cmd was completed, but without a notifying intr, tag = %d",
+ -		__func__, tag);
+ -	}
+ -
+ -	lrbp = &hba->lrb[tag];
+ -	for (poll_cnt = 100; poll_cnt; poll_cnt--) {
+ -		err = ufshcd_issue_tm_cmd(hba, lrbp->lun, lrbp->task_tag,
+ -				UFS_QUERY_TASK, &resp);
+ -		if (!err && resp == UPIU_TASK_MANAGEMENT_FUNC_SUCCEEDED) {
+ -			/* cmd pending in the device */
+ -			break;
+ -		} else if (!err && resp == UPIU_TASK_MANAGEMENT_FUNC_COMPL) {
+ -			/*
+ -			 * cmd not pending in the device, check if it is
+ -			 * in transition.
+ -			 */
+ -			reg = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
+ -			if (reg & (1 << tag)) {
+ -				/* sleep for max. 200us to stabilize */
+ -				usleep_range(100, 200);
+ -				continue;
+ -			}
+ -			/* command completed already */
+ -			goto out;
+ -		} else {
+ -			if (!err)
+ -				err = resp; /* service response error */
+ -			goto out;
+ -		}
+ -	}
+ -
+ -	if (!poll_cnt) {
+ -		err = -EBUSY;
+ -		goto out;
+ -	}
+ -
+ -	err = ufshcd_issue_tm_cmd(hba, lrbp->lun, lrbp->task_tag,
+ -			UFS_ABORT_TASK, &resp);
+ -	if (err || resp != UPIU_TASK_MANAGEMENT_FUNC_COMPL) {
+ -		if (!err)
+ -			err = resp; /* service response error */
+ -		goto out;
+ -	}
+ -
+ -	err = ufshcd_clear_cmd(hba, tag);
+ -	if (err)
+ -		goto out;
+ -
+ -	scsi_dma_unmap(cmd);
+ -
+ -	spin_lock_irqsave(host->host_lock, flags);
+ -	__clear_bit(tag, &hba->outstanding_reqs);
+ -	hba->lrb[tag].cmd = NULL;
+ -	spin_unlock_irqrestore(host->host_lock, flags);
+ -
+ -	clear_bit_unlock(tag, &hba->lrb_in_use);
+ -	wake_up(&hba->dev_cmd.tag_wq);
+ -
+ -out:
+ -	if (!err) {
+ -		err = SUCCESS;
+ -	} else {
+ -		dev_err(hba->dev, "%s: failed with err %d\n", __func__, err);
+ -		err = FAILED;
+ -	}
+ -
+ -	/*
+ -	 * This ufshcd_release() corresponds to the original scsi cmd that got
+ -	 * aborted here (as we won't get any IRQ for it).
+ -	 */
+ -	ufshcd_release(hba);
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_host_reset_and_restore - reset and restore host controller
+ - * @hba: per-adapter instance
+ - *
+ - * Note that host controller reset may issue DME_RESET to
+ - * local and remote (device) Uni-Pro stack and the attributes
+ - * are reset to default state.
+ - *
+ - * Returns zero on success, non-zero on failure
+ - */
+ -static int ufshcd_host_reset_and_restore(struct ufs_hba *hba)
+ -{
+ -	int err;
+ -	unsigned long flags;
+ -
+ -	/* Reset the host controller */
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	ufshcd_hba_stop(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	err = ufshcd_hba_enable(hba);
+ -	if (err)
+ -		goto out;
+ -
+ -	/* Establish the link again and restore the device */
+ -	err = ufshcd_probe_hba(hba);
+ -
+ -	if (!err && (hba->ufshcd_state != UFSHCD_STATE_OPERATIONAL))
+ -		err = -EIO;
+ -out:
+ -	if (err)
+ -		dev_err(hba->dev, "%s: Host init failed %d\n", __func__, err);
+ -
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_reset_and_restore - reset and re-initialize host/device
+ - * @hba: per-adapter instance
+ - *
+ - * Reset and recover device, host and re-establish link. This
+ - * is helpful to recover the communication in fatal error conditions.
+ - *
+ - * Returns zero on success, non-zero on failure
+ - */
+ -static int ufshcd_reset_and_restore(struct ufs_hba *hba)
+ -{
+ -	int err = 0;
+ -	unsigned long flags;
+ -	int retries = MAX_HOST_RESET_RETRIES;
+ -
+ -	do {
+ -		err = ufshcd_host_reset_and_restore(hba);
+ -	} while (err && --retries);
+ -
+ -	/*
+ -	 * After reset the door-bell might be cleared, complete
+ -	 * outstanding requests in s/w here.
+ -	 */
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	ufshcd_transfer_req_compl(hba);
+ -	ufshcd_tmc_handler(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_eh_host_reset_handler - host reset handler registered to scsi layer
+ - * @cmd - SCSI command pointer
+ - *
+ - * Returns SUCCESS/FAILED
+ - */
+ -static int ufshcd_eh_host_reset_handler(struct scsi_cmnd *cmd)
+ -{
+ -	int err;
+ -	unsigned long flags;
+ -	struct ufs_hba *hba;
+ -
+ -	hba = shost_priv(cmd->device->host);
+ -
+ -	ufshcd_hold(hba, false);
+ -	/*
+ -	 * Check if there is any race with fatal error handling.
+ -	 * If so, wait for it to complete. Even though fatal error
+ -	 * handling does reset and restore in some cases, don't assume
+ -	 * anything out of it. We are just avoiding race here.
+ -	 */
+ -	do {
+ -		spin_lock_irqsave(hba->host->host_lock, flags);
+ -		if (!(work_pending(&hba->eh_work) ||
+ -				hba->ufshcd_state == UFSHCD_STATE_RESET))
+ -			break;
+ -		spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -		dev_dbg(hba->dev, "%s: reset in progress\n", __func__);
+ -		flush_work(&hba->eh_work);
+ -	} while (1);
+ -
+ -	hba->ufshcd_state = UFSHCD_STATE_RESET;
+ -	ufshcd_set_eh_in_progress(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	err = ufshcd_reset_and_restore(hba);
+ -
+ -	spin_lock_irqsave(hba->host->host_lock, flags);
+ -	if (!err) {
+ -		err = SUCCESS;
+ -		hba->ufshcd_state = UFSHCD_STATE_OPERATIONAL;
+ -	} else {
+ -		err = FAILED;
+ -		hba->ufshcd_state = UFSHCD_STATE_ERROR;
+ -	}
+ -	ufshcd_clear_eh_in_progress(hba);
+ -	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -
+ -	ufshcd_release(hba);
+ -	return err;
+ -}
+ -
+ -/**
+ - * ufshcd_get_max_icc_level - calculate the ICC level
+ - * @sup_curr_uA: max. current supported by the regulator
+ - * @start_scan: row at the desc table to start scan from
+ - * @buff: power descriptor buffer
+ - *
+ - * Returns calculated max ICC level for specific regulator
+ - */
+ -static u32 ufshcd_get_max_icc_level(int sup_curr_uA, u32 start_scan, char *buff)
+ -{
+ -	int i;
+ -	int curr_uA;
+ -	u16 data;
+ -	u16 unit;
+ -
+ -	for (i = start_scan; i >= 0; i--) {
+ -		data = be16_to_cpu(*((u16 *)(buff + 2*i)));
+ -		unit = (data & ATTR_ICC_LVL_UNIT_MASK) >>
+ -						ATTR_ICC_LVL_UNIT_OFFSET;
+ -		curr_uA = data & ATTR_ICC_LVL_VALUE_MASK;
+ -		switch (unit) {
+ -		case UFSHCD_NANO_AMP:
+ -			curr_uA = curr_uA / 1000;
+ -			break;
+ -		case UFSHCD_MILI_AMP:
+ -			curr_uA = curr_uA * 1000;
+ -			break;
+ -		case UFSHCD_AMP:
+ -			curr_uA = curr_uA * 1000 * 1000;
+ -			break;
+ -		case UFSHCD_MICRO_AMP:
+ -		default:
+ -			break;
+ -		}
+ -		if (sup_curr_uA >= curr_uA)
+ -			break;
+ -	}
+ -	if (i < 0) {
+ -		i = 0;
+ -		pr_err("%s: Couldn't find valid icc_level = %d", __func__, i);
+ -	}
+ -
+ -	return (u32)i;
+ -}
+ -
+ -/**
+ - * ufshcd_calc_icc_level - calculate the max ICC level
+ - * In case regulators are not initialized we'll return 0
+ - * @hba: per-adapter instance
+ - * @desc_buf: power descriptor buffer to extract ICC levels from.
+ - * @len: length of desc_buff
+ - *
+ - * Returns calculated ICC level
+ - */
+ -static u32 ufshcd_find_max_sup_active_icc_level(struct ufs_hba *hba,
+ -							u8 *desc_buf, int len)
+ -{
+ -	u32 icc_level = 0;
+ -
+ -	if (!hba->vreg_info.vcc || !hba->vreg_info.vccq ||
+ -						!hba->vreg_info.vccq2) {
+ -		dev_err(hba->dev,
+ -			"%s: Regulator capability was not set, actvIccLevel=%d",
+ -							__func__, icc_level);
+ -		goto out;
+ -	}
+ -
+ -	if (hba->vreg_info.vcc)
+ -		icc_level = ufshcd_get_max_icc_level(
+ -				hba->vreg_info.vcc->max_uA,
+ -				POWER_DESC_MAX_ACTV_ICC_LVLS - 1,
+ -				&desc_buf[PWR_DESC_ACTIVE_LVLS_VCC_0]);
+ -
+ -	if (hba->vreg_info.vccq)
+ -		icc_level = ufshcd_get_max_icc_level(
+ -				hba->vreg_info.vccq->max_uA,
+ -				icc_level,
+ -				&desc_buf[PWR_DESC_ACTIVE_LVLS_VCCQ_0]);
+ -
+ -	if (hba->vreg_info.vccq2)
+ -		icc_level = ufshcd_get_max_icc_level(
+ -				hba->vreg_info.vccq2->max_uA,
+ -				icc_level,
+ -				&desc_buf[PWR_DESC_ACTIVE_LVLS_VCCQ2_0]);
+ -out:
+ -	return icc_level;
+ -}
+ -
+ -static void ufshcd_init_icc_levels(struct ufs_hba *hba)
+ -{
+ -	int ret;
+ -	int buff_len = QUERY_DESC_POWER_MAX_SIZE;
+ -	u8 desc_buf[QUERY_DESC_POWER_MAX_SIZE];
+ -
+ -	ret = ufshcd_read_power_desc(hba, desc_buf, buff_len);
+ -	if (ret) {
+ -		dev_err(hba->dev,
+ -			"%s: Failed reading power descriptor.len = %d ret = %d",
+ -			__func__, buff_len, ret);
+ -		return;
+ -	}
+ -
+ -	hba->init_prefetch_data.icc_level =
+ -			ufshcd_find_max_sup_active_icc_level(hba,
+ -			desc_buf, buff_len);
+ -	dev_dbg(hba->dev, "%s: setting icc_level 0x%x",
+ -			__func__, hba->init_prefetch_data.icc_level);
+ -
+ -	ret = ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_WRITE_ATTR,
+ -			QUERY_ATTR_IDN_ACTIVE_ICC_LVL, 0, 0,
+ -			&hba->init_prefetch_data.icc_level);
+ -
+ -	if (ret)
+ -		dev_err(hba->dev,
+ -			"%s: Failed configuring bActiveICCLevel = %d ret = %d",
+ -			__func__, hba->init_prefetch_data.icc_level , ret);
+++	/* Some WLUN doesn't support unit descriptor */
+++	if (ret == -EOPNOTSUPP)
+++		lun_qdepth = 1;
+++	else if (!lun_qdepth)
+++		/* eventually, we can figure out the real queue depth */
+++		lun_qdepth = hba->nutrs;
+++	else
+++		lun_qdepth = min_t(int, lun_qdepth, hba->nutrs);
++ 
+++	dev_dbg(hba->dev, "%s: activate tcq with queue depth %d\n",
+++			__func__, lun_qdepth);
+++	if (sdev->tagged_supported)
+++		scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), lun_qdepth);
++ }
++ 
+ -/**
+ - * ufshcd_scsi_add_wlus - Adds required W-LUs
+++/*
+++ * ufshcd_get_lu_wp - returns the "b_lu_write_protect" from UNIT DESCRIPTOR
++  * @hba: per-adapter instance
+++ * @lun: UFS device lun id
+++ * @b_lu_write_protect: pointer to buffer to hold the LU's write protect info
++  *
+ - * UFS device specification requires the UFS devices to support 4 well known
+ - * logical units:
+ - *	"REPORT_LUNS" (address: 01h)
+ - *	"UFS Device" (address: 50h)
+ - *	"RPMB" (address: 44h)
+ - *	"BOOT" (address: 30h)
+ - * UFS device's power management needs to be controlled by "POWER CONDITION"
+ - * field of SSU (START STOP UNIT) command. But this "power condition" field
+ - * will take effect only when its sent to "UFS device" well known logical unit
+ - * hence we require the scsi_device instance to represent this logical unit in
+ - * order for the UFS host driver to send the SSU command for power management.
+ -
+ - * We also require the scsi_device instance for "RPMB" (Replay Protected Memory
+ - * Block) LU so user space process can control this LU. User space may also
+ - * want to have access to BOOT LU.
+ -
+ - * This function adds scsi device instances for each of all well known LUs
+ - * (except "REPORT LUNS" LU).
+ - *
+ - * Returns zero on success (all required W-LUs are added successfully),
+ - * non-zero error value on failure (if failed to add any of the required W-LU).
+++ * Returns 0 in case of success and b_lu_write_protect status would be returned
+++ * @b_lu_write_protect parameter.
+++ * Returns -ENOTSUPP if reading b_lu_write_protect is not supported.
+++ * Returns -EINVAL in case of invalid parameters passed to this function.
++  */
+ -static int ufshcd_scsi_add_wlus(struct ufs_hba *hba)
+++static int ufshcd_get_lu_wp(struct ufs_hba *hba,
+++			    u8 lun,
+++			    u8 *b_lu_write_protect)
++ {
+ -	int ret = 0;
+ -
+ -	hba->sdev_ufs_device = __scsi_add_device(hba->host, 0, 0,
+ -		ufshcd_upiu_wlun_to_scsi_wlun(UFS_UPIU_UFS_DEVICE_WLUN), NULL);
+ -	if (IS_ERR(hba->sdev_ufs_device)) {
+ -		ret = PTR_ERR(hba->sdev_ufs_device);
+ -		hba->sdev_ufs_device = NULL;
+ -		goto out;
+ -	}
+ -
+ -	hba->sdev_boot = __scsi_add_device(hba->host, 0, 0,
+ -		ufshcd_upiu_wlun_to_scsi_wlun(UFS_UPIU_BOOT_WLUN), NULL);
+ -	if (IS_ERR(hba->sdev_boot)) {
+ -		ret = PTR_ERR(hba->sdev_boot);
+ -		hba->sdev_boot = NULL;
+ -		goto remove_sdev_ufs_device;
+ -	}
+ -
+ -	hba->sdev_rpmb = __scsi_add_device(hba->host, 0, 0,
+ -		ufshcd_upiu_wlun_to_scsi_wlun(UFS_UPIU_RPMB_WLUN), NULL);
+ -	if (IS_ERR(hba->sdev_rpmb)) {
+ -		ret = PTR_ERR(hba->sdev_rpmb);
+ -		hba->sdev_rpmb = NULL;
+ -		goto remove_sdev_boot;
+ -	}
+ -	goto out;
+++	int ret;
++ 
+ -remove_sdev_boot:
+ -	scsi_remove_device(hba->sdev_boot);
+ -remove_sdev_ufs_device:
+ -	scsi_remove_device(hba->sdev_ufs_device);
+ -out:
+++	if (!b_lu_write_protect)
+++		ret = -EINVAL;
+++	/*
+++	 * According to UFS device spec, RPMB LU can't be write
+++	 * protected so skip reading bLUWriteProtect parameter for
+++	 * it. For other W-LUs, UNIT DESCRIPTOR is not available.
+++	 */
+++	else if (lun >= UFS_UPIU_MAX_GENERAL_LUN)
+++		ret = -ENOTSUPP;
+++	else
+++		ret = ufshcd_read_unit_desc_param(hba,
+++					  lun,
+++					  UNIT_DESC_PARAM_LU_WR_PROTECT,
+++					  b_lu_write_protect,
+++					  sizeof(*b_lu_write_protect));
++ 	return ret;
++ }
++ 
++ /**
+ - * ufshcd_scsi_remove_wlus - Removes the W-LUs which were added by
+ - *			     ufshcd_scsi_add_wlus()
+++ * ufshcd_get_lu_power_on_wp_status - get LU's power on write protect
+++ * status
++  * @hba: per-adapter instance
+++ * @sdev: pointer to SCSI device
++  *
++  */
+ -static void ufshcd_scsi_remove_wlus(struct ufs_hba *hba)
+++static inline void ufshcd_get_lu_power_on_wp_status(struct ufs_hba *hba,
+++						    struct scsi_device *sdev)
++ {
+ -	if (hba->sdev_ufs_device) {
+ -		scsi_remove_device(hba->sdev_ufs_device);
+ -		hba->sdev_ufs_device = NULL;
+ -	}
+ -
+ -	if (hba->sdev_boot) {
+ -		scsi_remove_device(hba->sdev_boot);
+ -		hba->sdev_boot = NULL;
+ -	}
+++	if (hba->dev_info.f_power_on_wp_en &&
+++	    !hba->dev_info.is_lu_power_on_wp) {
+++		u8 b_lu_write_protect;
++ 
+ -	if (hba->sdev_rpmb) {
+ -		scsi_remove_device(hba->sdev_rpmb);
+ -		hba->sdev_rpmb = NULL;
+++		if (!ufshcd_get_lu_wp(hba, ufshcd_scsi_to_upiu_lun(sdev->lun),
+++				      &b_lu_write_protect) &&
+++		    (b_lu_write_protect == UFS_LU_POWER_ON_WP))
+++			hba->dev_info.is_lu_power_on_wp = true;
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  	}
+ +	return SUCCESS;
+  }
+  
+  /**
+@@@ -958,315 -4207,459 +1087,321 @@@ static int ufshcd_slave_alloc(struct sc
+  }
+  
+  /**
+ - * ufshcd_async_scan - asynchronous execution for probing hba
+ - * @data: data pointer to pass to this function
+ - * @cookie: cookie data
+ + * ufshcd_slave_destroy - remove SCSI device configurations
+ + * @sdev: pointer to SCSI device
+   */
+ -static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+ -{
+ -	struct ufs_hba *hba = (struct ufs_hba *)data;
+ -
+ -	ufshcd_probe_hba(hba);
+ -}
+ -
+ -static struct scsi_host_template ufshcd_driver_template = {
+ -	.module			= THIS_MODULE,
+ -	.name			= UFSHCD,
+ -	.proc_name		= UFSHCD,
+ -	.queuecommand		= ufshcd_queuecommand,
+ -	.slave_alloc		= ufshcd_slave_alloc,
+ -	.slave_configure	= ufshcd_slave_configure,
+ -	.slave_destroy		= ufshcd_slave_destroy,
+ -	.change_queue_depth	= ufshcd_change_queue_depth,
+ -	.eh_abort_handler	= ufshcd_abort,
+ -	.eh_device_reset_handler = ufshcd_eh_device_reset_handler,
+ -	.eh_host_reset_handler   = ufshcd_eh_host_reset_handler,
+ -	.this_id		= -1,
+ -	.sg_tablesize		= SG_ALL,
+ -	.cmd_per_lun		= UFSHCD_CMD_PER_LUN,
+ -	.can_queue		= UFSHCD_CAN_QUEUE,
+ -	.max_host_blocked	= 1,
+ -	.use_blk_tags		= 1,
+ -};
+ -
+ -static int ufshcd_config_vreg_load(struct device *dev, struct ufs_vreg *vreg,
+ -				   int ua)
+ -{
+ -	int ret = 0;
+ -	struct regulator *reg = vreg->reg;
+ -	const char *name = vreg->name;
+ -
+ -	BUG_ON(!vreg);
+ -
+ -	ret = regulator_set_optimum_mode(reg, ua);
+ -	if (ret >= 0) {
+ -		/*
+ -		 * regulator_set_optimum_mode() returns new regulator
+ -		 * mode upon success.
+ -		 */
+ -		ret = 0;
+ -	} else {
+ -		dev_err(dev, "%s: %s set optimum mode(ua=%d) failed, err=%d\n",
+ -				__func__, name, ua, ret);
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static inline int ufshcd_config_vreg_lpm(struct ufs_hba *hba,
+ -					 struct ufs_vreg *vreg)
+ -{
+ -	return ufshcd_config_vreg_load(hba->dev, vreg, UFS_VREG_LPM_LOAD_UA);
+ -}
+ -
+ -static inline int ufshcd_config_vreg_hpm(struct ufs_hba *hba,
+ -					 struct ufs_vreg *vreg)
+ -{
+ -	return ufshcd_config_vreg_load(hba->dev, vreg, vreg->max_uA);
+ -}
+ -
+ -static int ufshcd_config_vreg(struct device *dev,
+ -		struct ufs_vreg *vreg, bool on)
+ +static void ufshcd_slave_destroy(struct scsi_device *sdev)
+  {
+ -	int ret = 0;
+ -	struct regulator *reg = vreg->reg;
+ -	const char *name = vreg->name;
+ -	int min_uV, uA_load;
+ -
+ -	BUG_ON(!vreg);
+ -
+ -	if (regulator_count_voltages(reg) > 0) {
+ -		min_uV = on ? vreg->min_uV : 0;
+ -		ret = regulator_set_voltage(reg, min_uV, vreg->max_uV);
+ -		if (ret) {
+ -			dev_err(dev, "%s: %s set voltage failed, err=%d\n",
+ -					__func__, name, ret);
+ -			goto out;
+ -		}
+ +	struct ufs_hba *hba;
+  
+ -		uA_load = on ? vreg->max_uA : 0;
+ -		ret = ufshcd_config_vreg_load(dev, vreg, uA_load);
+ -		if (ret)
+ -			goto out;
+ -	}
+ -out:
+ -	return ret;
+ +	hba = shost_priv(sdev->host);
+++<<<<<<< HEAD
+ +	scsi_deactivate_tcq(sdev, hba->nutrs);
+++=======
+++	/* Drop the reference as it won't be needed anymore */
+++	if (ufshcd_scsi_to_upiu_lun(sdev->lun) == UFS_UPIU_UFS_DEVICE_WLUN)
+++		hba->sdev_ufs_device = NULL;
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  }
+  
+ -static int ufshcd_enable_vreg(struct device *dev, struct ufs_vreg *vreg)
+ +/**
+ + * ufshcd_task_req_compl - handle task management request completion
+ + * @hba: per adapter instance
+ + * @index: index of the completed request
+ + *
+ + * Returns SUCCESS/FAILED
+ + */
+ +static int ufshcd_task_req_compl(struct ufs_hba *hba, u32 index)
+  {
+ -	int ret = 0;
+ -
+ -	if (!vreg || vreg->enabled)
+ -		goto out;
+ -
+ -	ret = ufshcd_config_vreg(dev, vreg, true);
+ -	if (!ret)
+ -		ret = regulator_enable(vreg->reg);
+ +	struct utp_task_req_desc *task_req_descp;
+ +	struct utp_upiu_task_rsp *task_rsp_upiup;
+ +	unsigned long flags;
+ +	int ocs_value;
+ +	int task_result;
+  
+ -	if (!ret)
+ -		vreg->enabled = true;
+ -	else
+ -		dev_err(dev, "%s: %s enable failed, err=%d\n",
+ -				__func__, vreg->name, ret);
+ -out:
+ -	return ret;
+ -}
+ +	spin_lock_irqsave(hba->host->host_lock, flags);
+  
+ -static int ufshcd_disable_vreg(struct device *dev, struct ufs_vreg *vreg)
+ -{
+ -	int ret = 0;
+ +	/* Clear completed tasks from outstanding_tasks */
+ +	__clear_bit(index, &hba->outstanding_tasks);
+  
+ -	if (!vreg || !vreg->enabled)
+ -		goto out;
+ +	task_req_descp = hba->utmrdl_base_addr;
+ +	ocs_value = ufshcd_get_tmr_ocs(&task_req_descp[index]);
+  
+ -	ret = regulator_disable(vreg->reg);
+ +	if (ocs_value == OCS_SUCCESS) {
+ +		task_rsp_upiup = (struct utp_upiu_task_rsp *)
+ +				task_req_descp[index].task_rsp_upiu;
+ +		task_result = be32_to_cpu(task_rsp_upiup->header.dword_1);
+ +		task_result = ((task_result & MASK_TASK_RESPONSE) >> 8);
+  
+ -	if (!ret) {
+ -		/* ignore errors on applying disable config */
+ -		ufshcd_config_vreg(dev, vreg, false);
+ -		vreg->enabled = false;
+ +		if (task_result != UPIU_TASK_MANAGEMENT_FUNC_COMPL &&
+ +		    task_result != UPIU_TASK_MANAGEMENT_FUNC_SUCCEEDED)
+ +			task_result = FAILED;
+ +		else
+ +			task_result = SUCCESS;
+  	} else {
+ -		dev_err(dev, "%s: %s disable failed, err=%d\n",
+ -				__func__, vreg->name, ret);
+ +		task_result = FAILED;
+ +		dev_err(hba->dev,
+ +			"trc: Invalid ocs = %x\n", ocs_value);
+  	}
+ -out:
+ -	return ret;
+ +	spin_unlock_irqrestore(hba->host->host_lock, flags);
+ +	return task_result;
+  }
+  
+ -static int ufshcd_setup_vreg(struct ufs_hba *hba, bool on)
+ +/**
+ + * ufshcd_adjust_lun_qdepth - Update LUN queue depth if device responds with
+ + *			      SAM_STAT_TASK_SET_FULL SCSI command status.
+ + * @cmd: pointer to SCSI command
+ + */
+ +static void ufshcd_adjust_lun_qdepth(struct scsi_cmnd *cmd)
+  {
+ -	int ret = 0;
+ -	struct device *dev = hba->dev;
+ -	struct ufs_vreg_info *info = &hba->vreg_info;
+ -
+ -	if (!info)
+ -		goto out;
+ -
+ -	ret = ufshcd_toggle_vreg(dev, info->vcc, on);
+ -	if (ret)
+ -		goto out;
+ +	struct ufs_hba *hba;
+ +	int i;
+ +	int lun_qdepth = 0;
+  
+ -	ret = ufshcd_toggle_vreg(dev, info->vccq, on);
+ -	if (ret)
+ -		goto out;
+ +	hba = shost_priv(cmd->device->host);
+  
+ -	ret = ufshcd_toggle_vreg(dev, info->vccq2, on);
+ -	if (ret)
+ -		goto out;
+ +	/*
+ +	 * LUN queue depth can be obtained by counting outstanding commands
+ +	 * on the LUN.
+ +	 */
+ +	for (i = 0; i < hba->nutrs; i++) {
+ +		if (test_bit(i, &hba->outstanding_reqs)) {
+  
+ -out:
+ -	if (ret) {
+ -		ufshcd_toggle_vreg(dev, info->vccq2, false);
+ -		ufshcd_toggle_vreg(dev, info->vccq, false);
+ -		ufshcd_toggle_vreg(dev, info->vcc, false);
+ +			/*
+ +			 * Check if the outstanding command belongs
+ +			 * to the LUN which reported SAM_STAT_TASK_SET_FULL.
+ +			 */
+ +			if (cmd->device->lun == hba->lrb[i].lun)
+ +				lun_qdepth++;
+ +		}
+  	}
+ -	return ret;
+ -}
+ -
+ -static int ufshcd_setup_hba_vreg(struct ufs_hba *hba, bool on)
+ -{
+ -	struct ufs_vreg_info *info = &hba->vreg_info;
+ -
+ -	if (info)
+ -		return ufshcd_toggle_vreg(hba->dev, info->vdd_hba, on);
+ -
+ -	return 0;
+ -}
+ -
+ -static int ufshcd_get_vreg(struct device *dev, struct ufs_vreg *vreg)
+ -{
+ -	int ret = 0;
+  
+ -	if (!vreg)
+ -		goto out;
+ -
+ -	vreg->reg = devm_regulator_get(dev, vreg->name);
+ -	if (IS_ERR(vreg->reg)) {
+ -		ret = PTR_ERR(vreg->reg);
+ -		dev_err(dev, "%s: %s get failed, err=%d\n",
+ -				__func__, vreg->name, ret);
+ -	}
+ -out:
+ -	return ret;
+ +	/*
+ +	 * LUN queue depth will be total outstanding commands, except the
+ +	 * command for which the LUN reported SAM_STAT_TASK_SET_FULL.
+ +	 */
+ +	scsi_adjust_queue_depth(cmd->device, MSG_SIMPLE_TAG, lun_qdepth - 1);
+  }
+  
+ -static int ufshcd_init_vreg(struct ufs_hba *hba)
+ +/**
+ + * ufshcd_scsi_cmd_status - Update SCSI command result based on SCSI status
+ + * @lrb: pointer to local reference block of completed command
+ + * @scsi_status: SCSI command status
+ + *
+ + * Returns value base on SCSI command status
+ + */
+ +static inline int
+ +ufshcd_scsi_cmd_status(struct ufshcd_lrb *lrbp, int scsi_status)
+  {
+ -	int ret = 0;
+ -	struct device *dev = hba->dev;
+ -	struct ufs_vreg_info *info = &hba->vreg_info;
+ -
+ -	if (!info)
+ -		goto out;
+ +	int result = 0;
+  
+ -	ret = ufshcd_get_vreg(dev, info->vcc);
+ -	if (ret)
+ -		goto out;
+ +	switch (scsi_status) {
+ +	case SAM_STAT_GOOD:
+ +		result |= DID_OK << 16 |
+ +			  COMMAND_COMPLETE << 8 |
+ +			  SAM_STAT_GOOD;
+ +		break;
+ +	case SAM_STAT_CHECK_CONDITION:
+ +		result |= DID_OK << 16 |
+ +			  COMMAND_COMPLETE << 8 |
+ +			  SAM_STAT_CHECK_CONDITION;
+ +		ufshcd_copy_sense_data(lrbp);
+ +		break;
+ +	case SAM_STAT_BUSY:
+ +		result |= SAM_STAT_BUSY;
+ +		break;
+ +	case SAM_STAT_TASK_SET_FULL:
+  
+ -	ret = ufshcd_get_vreg(dev, info->vccq);
+ -	if (ret)
+ -		goto out;
+ +		/*
+ +		 * If a LUN reports SAM_STAT_TASK_SET_FULL, then the LUN queue
+ +		 * depth needs to be adjusted to the exact number of
+ +		 * outstanding commands the LUN can handle at any given time.
+ +		 */
+ +		ufshcd_adjust_lun_qdepth(lrbp->cmd);
+ +		result |= SAM_STAT_TASK_SET_FULL;
+ +		break;
+ +	case SAM_STAT_TASK_ABORTED:
+ +		result |= SAM_STAT_TASK_ABORTED;
+ +		break;
+ +	default:
+ +		result |= DID_ERROR << 16;
+ +		break;
+ +	} /* end of switch */
+  
+ -	ret = ufshcd_get_vreg(dev, info->vccq2);
+ -out:
+ -	return ret;
+ +	return result;
+  }
+  
+ -static int ufshcd_init_hba_vreg(struct ufs_hba *hba)
+ +/**
+ + * ufshcd_transfer_rsp_status - Get overall status of the response
+ + * @hba: per adapter instance
+ + * @lrb: pointer to local reference block of completed command
+ + *
+ + * Returns result of the command to notify SCSI midlayer
+ + */
+ +static inline int
+ +ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
+  {
+ -	struct ufs_vreg_info *info = &hba->vreg_info;
+ +	int result = 0;
+ +	int scsi_status;
+ +	int ocs;
+  
+ -	if (info)
+ -		return ufshcd_get_vreg(hba->dev, info->vdd_hba);
+ +	/* overall command status of utrd */
+ +	ocs = ufshcd_get_tr_ocs(lrbp);
+  
+ -	return 0;
+ -}
+ +	switch (ocs) {
+ +	case OCS_SUCCESS:
+  
+ -static int __ufshcd_setup_clocks(struct ufs_hba *hba, bool on,
+ -					bool skip_ref_clk)
+ -{
+ -	int ret = 0;
+ -	struct ufs_clk_info *clki;
+ -	struct list_head *head = &hba->clk_list_head;
+ -	unsigned long flags;
+ +		/* check if the returned transfer response is valid */
+ +		result = ufshcd_is_valid_req_rsp(lrbp->ucd_rsp_ptr);
+ +		if (result) {
+ +			dev_err(hba->dev,
+ +				"Invalid response = %x\n", result);
+ +			break;
+ +		}
+  
+ -	if (!head || list_empty(head))
+ -		goto out;
+ +		/*
+ +		 * get the response UPIU result to extract
+ +		 * the SCSI command status
+ +		 */
+ +		result = ufshcd_get_rsp_upiu_result(lrbp->ucd_rsp_ptr);
+  
+ -	list_for_each_entry(clki, head, list) {
+ -		if (!IS_ERR_OR_NULL(clki->clk)) {
+ -			if (skip_ref_clk && !strcmp(clki->name, "ref_clk"))
+ -				continue;
+ -
+ -			if (on && !clki->enabled) {
+ -				ret = clk_prepare_enable(clki->clk);
+ -				if (ret) {
+ -					dev_err(hba->dev, "%s: %s prepare enable failed, %d\n",
+ -						__func__, clki->name, ret);
+ -					goto out;
+ -				}
+ -			} else if (!on && clki->enabled) {
+ -				clk_disable_unprepare(clki->clk);
+ -			}
+ -			clki->enabled = on;
+ -			dev_dbg(hba->dev, "%s: clk: %s %sabled\n", __func__,
+ -					clki->name, on ? "en" : "dis");
+ -		}
+ -	}
+ +		/*
+ +		 * get the result based on SCSI status response
+ +		 * to notify the SCSI midlayer of the command status
+ +		 */
+ +		scsi_status = result & MASK_SCSI_STATUS;
+ +		result = ufshcd_scsi_cmd_status(lrbp, scsi_status);
+ +		break;
+ +	case OCS_ABORTED:
+ +		result |= DID_ABORT << 16;
+ +		break;
+ +	case OCS_INVALID_CMD_TABLE_ATTR:
+ +	case OCS_INVALID_PRDT_ATTR:
+ +	case OCS_MISMATCH_DATA_BUF_SIZE:
+ +	case OCS_MISMATCH_RESP_UPIU_SIZE:
+ +	case OCS_PEER_COMM_FAILURE:
+ +	case OCS_FATAL_ERROR:
+ +	default:
+ +		result |= DID_ERROR << 16;
+ +		dev_err(hba->dev,
+ +		"OCS error from controller = %x\n", ocs);
+ +		break;
+ +	} /* end of switch */
+  
+ -	if (hba->vops && hba->vops->setup_clocks)
+ -		ret = hba->vops->setup_clocks(hba, on);
+ -out:
+ -	if (ret) {
+ -		list_for_each_entry(clki, head, list) {
+ -			if (!IS_ERR_OR_NULL(clki->clk) && clki->enabled)
+ -				clk_disable_unprepare(clki->clk);
+ -		}
+ -	} else if (!ret && on) {
+ -		spin_lock_irqsave(hba->host->host_lock, flags);
+ -		hba->clk_gating.state = CLKS_ON;
+ -		spin_unlock_irqrestore(hba->host->host_lock, flags);
+ -	}
+ -	return ret;
+ +	return result;
+  }
+  
+ -static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on)
+ +/**
+ + * ufshcd_transfer_req_compl - handle SCSI and query command completion
+ + * @hba: per adapter instance
+ + */
+ +static void ufshcd_transfer_req_compl(struct ufs_hba *hba)
+  {
+ -	return  __ufshcd_setup_clocks(hba, on, false);
+ -}
+ +	struct ufshcd_lrb *lrb;
+ +	unsigned long completed_reqs;
+ +	u32 tr_doorbell;
+ +	int result;
+ +	int index;
+  
+ -static int ufshcd_init_clocks(struct ufs_hba *hba)
+ -{
+ -	int ret = 0;
+ -	struct ufs_clk_info *clki;
+ -	struct device *dev = hba->dev;
+ -	struct list_head *head = &hba->clk_list_head;
+ +	lrb = hba->lrb;
+ +	tr_doorbell =
+ +		readl(hba->mmio_base + REG_UTP_TRANSFER_REQ_DOOR_BELL);
+ +	completed_reqs = tr_doorbell ^ hba->outstanding_reqs;
+  
+ -	if (!head || list_empty(head))
+ -		goto out;
+ +	for (index = 0; index < hba->nutrs; index++) {
+ +		if (test_bit(index, &completed_reqs)) {
+  
+ -	list_for_each_entry(clki, head, list) {
+ -		if (!clki->name)
+ -			continue;
+ +			result = ufshcd_transfer_rsp_status(hba, &lrb[index]);
+  
+ -		clki->clk = devm_clk_get(dev, clki->name);
+ -		if (IS_ERR(clki->clk)) {
+ -			ret = PTR_ERR(clki->clk);
+ -			dev_err(dev, "%s: %s clk get failed, %d\n",
+ -					__func__, clki->name, ret);
+ -			goto out;
+ -		}
+ +			if (lrb[index].cmd) {
+ +				scsi_dma_unmap(lrb[index].cmd);
+ +				lrb[index].cmd->result = result;
+ +				lrb[index].cmd->scsi_done(lrb[index].cmd);
+  
+ -		if (clki->max_freq) {
+ -			ret = clk_set_rate(clki->clk, clki->max_freq);
+ -			if (ret) {
+ -				dev_err(hba->dev, "%s: %s clk set rate(%dHz) failed, %d\n",
+ -					__func__, clki->name,
+ -					clki->max_freq, ret);
+ -				goto out;
+ +				/* Mark completed command as NULL in LRB */
+ +				lrb[index].cmd = NULL;
+  			}
+ -			clki->curr_freq = clki->max_freq;
+ -		}
+ -		dev_dbg(dev, "%s: clk: %s, rate: %lu\n", __func__,
+ -				clki->name, clk_get_rate(clki->clk));
+ -	}
+ -out:
+ -	return ret;
+ +		} /* end of if */
+ +	} /* end of for */
+ +
+ +	/* clear corresponding bits of completed commands */
+ +	hba->outstanding_reqs ^= completed_reqs;
+ +
+ +	/* Reset interrupt aggregation counters */
+ +	ufshcd_config_int_aggr(hba, INT_AGGR_RESET);
+  }
+  
+ -static int ufshcd_variant_hba_init(struct ufs_hba *hba)
+ +/**
+ + * ufshcd_uic_cc_handler - handle UIC command completion
+ + * @work: pointer to a work queue structure
+ + *
+ + * Returns 0 on success, non-zero value on failure
+ + */
+ +static void ufshcd_uic_cc_handler (struct work_struct *work)
+  {
+ -	int err = 0;
+ +	struct ufs_hba *hba;
+  
+ -	if (!hba->vops)
+ -		goto out;
+ +	hba = container_of(work, struct ufs_hba, uic_workq);
+  
+ -	if (hba->vops->init) {
+ -		err = hba->vops->init(hba);
+ -		if (err)
+ -			goto out;
+ -	}
+ +	if ((hba->active_uic_cmd.command == UIC_CMD_DME_LINK_STARTUP) &&
+ +	    !(ufshcd_get_uic_cmd_result(hba))) {
+  
+ -	if (hba->vops->setup_regulators) {
+ -		err = hba->vops->setup_regulators(hba, true);
+ -		if (err)
+ -			goto out_exit;
+ +		if (ufshcd_make_hba_operational(hba))
+ +			dev_err(hba->dev,
+ +				"cc: hba not operational state\n");
+ +		return;
+  	}
+ -
+ -	goto out;
+ -
+ -out_exit:
+ -	if (hba->vops->exit)
+ -		hba->vops->exit(hba);
+ -out:
+ -	if (err)
+ -		dev_err(hba->dev, "%s: variant %s init failed err %d\n",
+ -			__func__, hba->vops ? hba->vops->name : "", err);
+ -	return err;
+  }
+  
+ -static void ufshcd_variant_hba_exit(struct ufs_hba *hba)
+ +/**
+ + * ufshcd_fatal_err_handler - handle fatal errors
+ + * @hba: per adapter instance
+ + */
+ +static void ufshcd_fatal_err_handler(struct work_struct *work)
+  {
+ -	if (!hba->vops)
+ -		return;
+ -
+ -	if (hba->vops->setup_clocks)
+ -		hba->vops->setup_clocks(hba, false);
+ -
+ -	if (hba->vops->setup_regulators)
+ -		hba->vops->setup_regulators(hba, false);
+ +	struct ufs_hba *hba;
+ +	hba = container_of(work, struct ufs_hba, feh_workq);
+  
+ -	if (hba->vops->exit)
+ -		hba->vops->exit(hba);
+ +	/* check if reset is already in progress */
+ +	if (hba->ufshcd_state != UFSHCD_STATE_RESET)
+ +		ufshcd_do_reset(hba);
+  }
+  
+ -static int ufshcd_hba_init(struct ufs_hba *hba)
+ +/**
+ + * ufshcd_err_handler - Check for fatal errors
+ + * @work: pointer to a work queue structure
+ + */
+ +static void ufshcd_err_handler(struct ufs_hba *hba)
+  {
+ -	int err;
+ -
+ -	/*
+ -	 * Handle host controller power separately from the UFS device power
+ -	 * rails as it will help controlling the UFS host controller power
+ -	 * collapse easily which is different than UFS device power collapse.
+ -	 * Also, enable the host controller power before we go ahead with rest
+ -	 * of the initialization here.
+ -	 */
+ -	err = ufshcd_init_hba_vreg(hba);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = ufshcd_setup_hba_vreg(hba, true);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = ufshcd_init_clocks(hba);
+ -	if (err)
+ -		goto out_disable_hba_vreg;
+ -
+ -	err = ufshcd_setup_clocks(hba, true);
+ -	if (err)
+ -		goto out_disable_hba_vreg;
+ -
+ -	err = ufshcd_init_vreg(hba);
+ -	if (err)
+ -		goto out_disable_clks;
+ -
+ -	err = ufshcd_setup_vreg(hba, true);
+ -	if (err)
+ -		goto out_disable_clks;
+ -
+ -	err = ufshcd_variant_hba_init(hba);
+ -	if (err)
+ -		goto out_disable_vreg;
+ +	u32 reg;
+  
+ -	hba->is_powered = true;
+ -	goto out;
+ +	if (hba->errors & INT_FATAL_ERRORS)
+ +		goto fatal_eh;
+  
+ -out_disable_vreg:
+ -	ufshcd_setup_vreg(hba, false);
+ -out_disable_clks:
+ -	ufshcd_setup_clocks(hba, false);
+ -out_disable_hba_vreg:
+ -	ufshcd_setup_hba_vreg(hba, false);
+ -out:
+ -	return err;
+ -}
+ +	if (hba->errors & UIC_ERROR) {
+  
+ -static void ufshcd_hba_exit(struct ufs_hba *hba)
+ -{
+ -	if (hba->is_powered) {
+ -		ufshcd_variant_hba_exit(hba);
+ -		ufshcd_setup_vreg(hba, false);
+ -		ufshcd_setup_clocks(hba, false);
+ -		ufshcd_setup_hba_vreg(hba, false);
+ -		hba->is_powered = false;
+ +		reg = readl(hba->mmio_base +
+ +			    REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER);
+ +		if (reg & UIC_DATA_LINK_LAYER_ERROR_PA_INIT)
+ +			goto fatal_eh;
+  	}
+ +	return;
+ +fatal_eh:
+ +	hba->ufshcd_state = UFSHCD_STATE_ERROR;
+ +	schedule_work(&hba->feh_workq);
+  }
+  
+ -static int
+ -ufshcd_send_request_sense(struct ufs_hba *hba, struct scsi_device *sdp)
+ +/**
+ + * ufshcd_tmc_handler - handle task management function completion
+ + * @hba: per adapter instance
+ + */
+ +static void ufshcd_tmc_handler(struct ufs_hba *hba)
+  {
+ -	unsigned char cmd[6] = {REQUEST_SENSE,
+ -				0,
+ -				0,
+ -				0,
+ -				SCSI_SENSE_BUFFERSIZE,
+ -				0};
+ -	char *buffer;
+ -	int ret;
+ -
+ -	buffer = kzalloc(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL);
+ -	if (!buffer) {
+ -		ret = -ENOMEM;
+ -		goto out;
+ -	}
+ -
+ -	ret = scsi_execute_req_flags(sdp, cmd, DMA_FROM_DEVICE, buffer,
+ -				SCSI_SENSE_BUFFERSIZE, NULL,
+ -				msecs_to_jiffies(1000), 3, NULL, REQ_PM);
+ -	if (ret)
+ -		pr_err("%s: failed with err %d\n", __func__, ret);
+ +	u32 tm_doorbell;
+  
+ -	kfree(buffer);
+ -out:
+ -	return ret;
+ +	tm_doorbell = readl(hba->mmio_base + REG_UTP_TASK_REQ_DOOR_BELL);
+ +	hba->tm_condition = tm_doorbell ^ hba->outstanding_tasks;
+ +	wake_up_interruptible(&hba->ufshcd_tm_wait_queue);
+  }
+  
+  /**
+@@@ -1464,120 -5075,154 +1599,125 @@@ static int ufshcd_host_reset(struct scs
+  }
+  
+  /**
+ - * ufshcd_system_suspend - system suspend routine
+ - * @hba: per adapter instance
+ - * @pm_op: runtime PM or system PM
+ - *
+ - * Check the description of ufshcd_suspend() function for more details.
+ + * ufshcd_abort - abort a specific command
+ + * @cmd: SCSI command pointer
+   *
+ - * Returns 0 for success and non-zero for failure
+ + * Returns SUCCESS/FAILED
+   */
+ -int ufshcd_system_suspend(struct ufs_hba *hba)
+ +static int ufshcd_abort(struct scsi_cmnd *cmd)
+  {
+ -	int ret = 0;
+ +	struct Scsi_Host *host;
+ +	struct ufs_hba *hba;
+ +	unsigned long flags;
+ +	unsigned int tag;
+ +	int err;
+  
+ -	if (!hba || !hba->is_powered)
+ -		goto out;
+ +	host = cmd->device->host;
+ +	hba = shost_priv(host);
+ +	tag = cmd->request->tag;
+  
+ -	if (pm_runtime_suspended(hba->dev)) {
+ -		if (hba->rpm_lvl == hba->spm_lvl)
+ -			/*
+ -			 * There is possibility that device may still be in
+ -			 * active state during the runtime suspend.
+ -			 */
+ -			if ((ufs_get_pm_lvl_to_dev_pwr_mode(hba->spm_lvl) ==
+ -			    hba->curr_dev_pwr_mode) && !hba->auto_bkops_enabled)
+ -				goto out;
+ +	spin_lock_irqsave(host->host_lock, flags);
+  
+ -		/*
+ -		 * UFS device and/or UFS link low power states during runtime
+ -		 * suspend seems to be different than what is expected during
+ -		 * system suspend. Hence runtime resume the devic & link and
+ -		 * let the system suspend low power states to take effect.
+ -		 * TODO: If resume takes longer time, we might have optimize
+ -		 * it in future by not resuming everything if possible.
+ -		 */
+ -		ret = ufshcd_runtime_resume(hba);
+ -		if (ret)
+ -			goto out;
+ +	/* check if command is still pending */
+ +	if (!(test_bit(tag, &hba->outstanding_reqs))) {
+ +		err = FAILED;
+ +		spin_unlock_irqrestore(host->host_lock, flags);
+ +		goto out;
+  	}
+ +	spin_unlock_irqrestore(host->host_lock, flags);
+  
+ -	ret = ufshcd_suspend(hba, UFS_SYSTEM_PM);
+ -out:
+ -	if (!ret)
+ -		hba->is_sys_suspended = true;
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL(ufshcd_system_suspend);
+ +	err = ufshcd_issue_tm_cmd(hba, &hba->lrb[tag], UFS_ABORT_TASK);
+ +	if (err == FAILED)
+ +		goto out;
+  
+ -/**
+ - * ufshcd_system_resume - system resume routine
+ - * @hba: per adapter instance
+ - *
+ - * Returns 0 for success and non-zero for failure
+ - */
+ +	scsi_dma_unmap(cmd);
+  
+ -int ufshcd_system_resume(struct ufs_hba *hba)
+ -{
+ -	if (!hba || !hba->is_powered || pm_runtime_suspended(hba->dev))
+ -		/*
+ -		 * Let the runtime resume take care of resuming
+ -		 * if runtime suspended.
+ -		 */
+ -		return 0;
+ +	spin_lock_irqsave(host->host_lock, flags);
+  
+ -	return ufshcd_resume(hba, UFS_SYSTEM_PM);
+ +	/* clear the respective UTRLCLR register bit */
+ +	ufshcd_utrl_clear(hba, tag);
+ +
+ +	__clear_bit(tag, &hba->outstanding_reqs);
+ +	hba->lrb[tag].cmd = NULL;
+ +	spin_unlock_irqrestore(host->host_lock, flags);
+ +out:
+ +	return err;
+  }
+ -EXPORT_SYMBOL(ufshcd_system_resume);
+ +
+ +static struct scsi_host_template ufshcd_driver_template = {
+ +	.module			= THIS_MODULE,
+ +	.name			= UFSHCD,
+ +	.proc_name		= UFSHCD,
+ +	.queuecommand		= ufshcd_queuecommand,
+ +	.slave_alloc		= ufshcd_slave_alloc,
+ +	.slave_destroy		= ufshcd_slave_destroy,
+ +	.eh_abort_handler	= ufshcd_abort,
+ +	.eh_device_reset_handler = ufshcd_device_reset,
+ +	.eh_host_reset_handler	= ufshcd_host_reset,
+ +	.this_id		= -1,
+ +	.sg_tablesize		= SG_ALL,
+ +	.cmd_per_lun		= UFSHCD_CMD_PER_LUN,
+ +	.can_queue		= UFSHCD_CAN_QUEUE,
+++<<<<<<< HEAD
+++=======
+++	.max_host_blocked	= 1,
+++	.use_blk_tags		= 1,
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+ +};
+  
+  /**
+ - * ufshcd_runtime_suspend - runtime suspend routine
+ + * ufshcd_suspend - suspend power management function
+   * @hba: per adapter instance
+ + * @state: power state
+   *
+ - * Check the description of ufshcd_suspend() function for more details.
+ - *
+ - * Returns 0 for success and non-zero for failure
+ + * Returns -ENOSYS
+   */
+ -int ufshcd_runtime_suspend(struct ufs_hba *hba)
+ +int ufshcd_suspend(struct ufs_hba *hba, pm_message_t state)
+  {
+ -	if (!hba || !hba->is_powered)
+ -		return 0;
+ +	/*
+ +	 * TODO:
+ +	 * 1. Block SCSI requests from SCSI midlayer
+ +	 * 2. Change the internal driver state to non operational
+ +	 * 3. Set UTRLRSR and UTMRLRSR bits to zero
+ +	 * 4. Wait until outstanding commands are completed
+ +	 * 5. Set HCE to zero to send the UFS host controller to reset state
+ +	 */
+  
+ -	return ufshcd_suspend(hba, UFS_RUNTIME_PM);
+ +	return -ENOSYS;
+  }
+ -EXPORT_SYMBOL(ufshcd_runtime_suspend);
+ +EXPORT_SYMBOL_GPL(ufshcd_suspend);
+  
+  /**
+ - * ufshcd_runtime_resume - runtime resume routine
+ + * ufshcd_resume - resume power management function
+   * @hba: per adapter instance
+   *
+ - * This function basically brings the UFS device, UniPro link and controller
+ - * to active state. Following operations are done in this function:
+ - *
+ - * 1. Turn on all the controller related clocks
+ - * 2. Bring the UniPro link out of Hibernate state
+ - * 3. If UFS device is in sleep state, turn ON VCC rail and bring the UFS device
+ - *    to active state.
+ - * 4. If auto-bkops is enabled on the device, disable it.
+ - *
+ - * So following would be the possible power state after this function return
+ - * successfully:
+ - *	S1: UFS device in Active state with VCC rail ON
+ - *	    UniPro link in Active state
+ - *	    All the UFS/UniPro controller clocks are ON
+ - *
+ - * Returns 0 for success and non-zero for failure
+ + * Returns -ENOSYS
+   */
+ -int ufshcd_runtime_resume(struct ufs_hba *hba)
+ +int ufshcd_resume(struct ufs_hba *hba)
+  {
+ -	if (!hba || !hba->is_powered)
+ -		return 0;
+ -	else
+ -		return ufshcd_resume(hba, UFS_RUNTIME_PM);
+ -}
+ -EXPORT_SYMBOL(ufshcd_runtime_resume);
+ +	/*
+ +	 * TODO:
+ +	 * 1. Set HCE to 1, to start the UFS host controller
+ +	 * initialization process
+ +	 * 2. Set UTRLRSR and UTMRLRSR bits to 1
+ +	 * 3. Change the internal driver state to operational
+ +	 * 4. Unblock SCSI requests from SCSI midlayer
+ +	 */
+  
+ -int ufshcd_runtime_idle(struct ufs_hba *hba)
+ -{
+ -	return 0;
+ +	return -ENOSYS;
+  }
+ -EXPORT_SYMBOL(ufshcd_runtime_idle);
+ +EXPORT_SYMBOL_GPL(ufshcd_resume);
+  
+  /**
+ - * ufshcd_shutdown - shutdown routine
+ + * ufshcd_hba_free - free allocated memory for
+ + *			host memory space data structures
+   * @hba: per adapter instance
+ - *
+ - * This function would power off both UFS device and UFS link.
+ - *
+ - * Returns 0 always to allow force shutdown even in case of errors.
+   */
+ -int ufshcd_shutdown(struct ufs_hba *hba)
+ +static void ufshcd_hba_free(struct ufs_hba *hba)
+  {
+ -	int ret = 0;
+ -
+ -	if (ufshcd_is_ufs_dev_poweroff(hba) && ufshcd_is_link_off(hba))
+ -		goto out;
+ -
+ -	if (pm_runtime_suspended(hba->dev)) {
+ -		ret = ufshcd_runtime_resume(hba);
+ -		if (ret)
+ -			goto out;
+ -	}
+ -
+ -	ret = ufshcd_suspend(hba, UFS_SHUTDOWN_PM);
+ -out:
+ -	if (ret)
+ -		dev_err(hba->dev, "%s failed, err %d\n", __func__, ret);
+ -	/* allow force shutdown even in case of errors */
+ -	return 0;
+ +	iounmap(hba->mmio_base);
+ +	ufshcd_free_hba_memory(hba);
+  }
+ -EXPORT_SYMBOL(ufshcd_shutdown);
+  
+  /**
+   * ufshcd_remove - de-allocate SCSI host and host memory space
+diff --cc drivers/usb/storage/uas.c
+index df7dc8365e91,ee69b82fc7d1..000000000000
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@@ -850,7 -816,14 +849,18 @@@ static struct scsi_host_template uas_ho
+  	.sg_tablesize = SG_NONE,
+  	.cmd_per_lun = 1,	/* until we override it */
+  	.skip_settle_delay = 1,
+++<<<<<<< HEAD
+ +	.ordered_tag = 1,
+++=======
++ 
++ 	/*
++ 	 * The uas drivers expects tags not to be bigger than the maximum
++ 	 * per-device queue depth, which is not true with the blk-mq tag
++ 	 * allocator.
++ 	 */
++ 	.disable_blk_mq = true,
++ 	.use_blk_tags = 1,
+++>>>>>>> 2ecb204d07ac (scsi: always assign block layer tags if enabled)
+  };
+  
+  #define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
+* Unmerged path drivers/scsi/esas2r/esas2r_main.c
+diff --git a/Documentation/scsi/scsi_mid_low_api.txt b/Documentation/scsi/scsi_mid_low_api.txt
+index d6a9bdeee7f2..a67194209581 100644
+--- a/Documentation/scsi/scsi_mid_low_api.txt
++++ b/Documentation/scsi/scsi_mid_low_api.txt
+@@ -366,13 +366,11 @@ is initialized. The functions below are listed alphabetically and their
+ names all start with "scsi_".
+ 
+ Summary:
+-   scsi_activate_tcq - turn on tag command queueing
+    scsi_add_device - creates new scsi device (lu) instance
+    scsi_add_host - perform sysfs registration and set up transport class
+    scsi_adjust_queue_depth - change the queue depth on a SCSI device
+    scsi_bios_ptable - return copy of block device's partition table
+    scsi_block_requests - prevent further commands being queued to given host
+-   scsi_deactivate_tcq - turn off tag command queueing
+    scsi_host_alloc - return a new scsi_host instance whose refcount==1
+    scsi_host_get - increments Scsi_Host instance's refcount
+    scsi_host_put - decrements Scsi_Host instance's refcount (free if 0)
+@@ -389,24 +387,6 @@ Summary:
+ 
+ Details:
+ 
+-/**
+- * scsi_activate_tcq - turn on tag command queueing ("ordered" task attribute)
+- * @sdev:       device to turn on TCQ for
+- * @depth:      queue depth
+- *
+- *      Returns nothing
+- *
+- *      Might block: no
+- *
+- *      Notes: Eventually, it is hoped depth would be the maximum depth
+- *      the device could cope with and the real queue depth
+- *      would be adjustable from 0 to depth.
+- *
+- *      Defined (inline) in: include/scsi/scsi_tcq.h
+- **/
+-void scsi_activate_tcq(struct scsi_device *sdev, int depth)
+-
+-
+ /**
+  * scsi_add_device - creates new scsi device (lu) instance
+  * @shost:   pointer to scsi host instance
+@@ -471,9 +451,7 @@ int scsi_add_host(struct Scsi_Host *shost, struct device * dev)
+  *
+  *      Notes: Can be invoked any time on a SCSI device controlled by this
+  *      LLD. [Specifically during and after slave_configure() and prior to
+- *      slave_destroy().] Can safely be invoked from interrupt code. Actual
+- *      queue depth change may be delayed until the next command is being
+- *      processed. See also scsi_activate_tcq() and scsi_deactivate_tcq().
++ *      slave_destroy().] Can safely be invoked from interrupt code.
+  *
+  *      Defined in: drivers/scsi/scsi.c [see source code for more notes]
+  *
+@@ -514,20 +492,6 @@ unsigned char *scsi_bios_ptable(struct block_device *dev)
+ void scsi_block_requests(struct Scsi_Host * shost)
+ 
+ 
+-/**
+- * scsi_deactivate_tcq - turn off tag command queueing
+- * @sdev:       device to turn off TCQ for
+- * @depth:      queue depth (stored in sdev)
+- *
+- *      Returns nothing
+- *
+- *      Might block: no
+- *
+- *      Defined (inline) in: include/scsi/scsi_tcq.h
+- **/
+-void scsi_deactivate_tcq(struct scsi_device *sdev, int depth)
+-
+-
+ /**
+  * scsi_host_alloc - create a scsi host adapter instance and perform basic
+  *                   initialization.
+diff --git a/drivers/message/fusion/mptsas.c b/drivers/message/fusion/mptsas.c
+index 134221e1b4dd..d25bac624a9b 100644
+--- a/drivers/message/fusion/mptsas.c
++++ b/drivers/message/fusion/mptsas.c
+@@ -1996,6 +1996,7 @@ static struct scsi_host_template mptsas_driver_template = {
+ 	.cmd_per_lun			= 7,
+ 	.use_clustering			= ENABLE_CLUSTERING,
+ 	.shost_attrs			= mptscsih_host_attrs,
++	.use_blk_tags			= 1,
+ };
+ 
+ static int mptsas_get_linkerrors(struct sas_phy *phy)
+diff --git a/drivers/scsi/53c700.c b/drivers/scsi/53c700.c
+index 1d90a96ad3da..e092b3ab0ed0 100644
+--- a/drivers/scsi/53c700.c
++++ b/drivers/scsi/53c700.c
+@@ -327,6 +327,7 @@ NCR_700_detect(struct scsi_host_template *tpnt,
+ 	tpnt->slave_alloc = NCR_700_slave_alloc;
+ 	tpnt->change_queue_depth = NCR_700_change_queue_depth;
+ 	tpnt->change_queue_type = NCR_700_change_queue_type;
++	tpnt->use_blk_tags = 1;
+ 
+ 	if(tpnt->name == NULL)
+ 		tpnt->name = "53c700";
+@@ -902,7 +903,7 @@ process_message(struct Scsi_Host *host,	struct NCR_700_Host_Parameters *hostdata
+ 			NCR_700_set_tag_neg_state(SCp->device, NCR_700_FINISHED_TAG_NEGOTIATION);
+ 			hostdata->tag_negotiated &= ~(1<<scmd_id(SCp));
+ 			SCp->device->tagged_supported = 0;
+-			scsi_deactivate_tcq(SCp->device, host->cmd_per_lun);
++			scsi_adjust_queue_depth(SCp->device, 0, host->cmd_per_lun);
+ 		} else {
+ 			shost_printk(KERN_WARNING, host,
+ 				"(%d:%d) Unexpected REJECT Message %s\n",
+@@ -2048,8 +2049,7 @@ NCR_700_slave_configure(struct scsi_device *SDp)
+ 
+ 	/* to do here: allocate memory; build a queue_full list */
+ 	if(SDp->tagged_supported) {
+-		scsi_set_tag_type(SDp, MSG_ORDERED_TAG);
+-		scsi_activate_tcq(SDp, NCR_700_DEFAULT_TAGS);
++		scsi_adjust_queue_depth(SDp, MSG_ORDERED_TAG, NCR_700_DEFAULT_TAGS);
+ 		NCR_700_set_tag_neg_state(SDp, NCR_700_START_TAG_NEGOTIATION);
+ 	} else {
+ 		/* initialise to default depth */
+@@ -2093,8 +2093,6 @@ static int NCR_700_change_queue_type(struct scsi_device *SDp, int tag_type)
+ 	struct NCR_700_Host_Parameters *hostdata = 
+ 		(struct NCR_700_Host_Parameters *)SDp->host->hostdata[0];
+ 
+-	scsi_set_tag_type(SDp, tag_type);
+-
+ 	/* We have a global (per target) flag to track whether TCQ is
+ 	 * enabled, so we'll be turning it off for the entire target here.
+ 	 * our tag algorithm will fail if we mix tagged and untagged commands,
+@@ -2105,12 +2103,12 @@ static int NCR_700_change_queue_type(struct scsi_device *SDp, int tag_type)
+ 	if (!tag_type) {
+ 		/* shift back to the default unqueued number of commands
+ 		 * (the user can still raise this) */
+-		scsi_deactivate_tcq(SDp, SDp->host->cmd_per_lun);
++		scsi_adjust_queue_depth(SDp, 0, SDp->host->cmd_per_lun);
+ 		hostdata->tag_negotiated &= ~(1 << sdev_id(SDp));
+ 	} else {
+ 		/* Here, we cleared the negotiation flag above, so this
+ 		 * will force the driver to renegotiate */
+-		scsi_activate_tcq(SDp, SDp->queue_depth);
++		scsi_adjust_queue_depth(SDp, tag_type, SDp->queue_depth);
+ 		if (change_tag)
+ 			NCR_700_set_tag_neg_state(SDp, NCR_700_START_TAG_NEGOTIATION);
+ 	}
+diff --git a/drivers/scsi/aic7xxx/aic79xx_osm.c b/drivers/scsi/aic7xxx/aic79xx_osm.c
+index 69d5c43a65e5..d642e5bb0b52 100644
+--- a/drivers/scsi/aic7xxx/aic79xx_osm.c
++++ b/drivers/scsi/aic7xxx/aic79xx_osm.c
+@@ -925,6 +925,7 @@ struct scsi_host_template aic79xx_driver_template = {
+ 	.slave_configure	= ahd_linux_slave_configure,
+ 	.target_alloc		= ahd_linux_target_alloc,
+ 	.target_destroy		= ahd_linux_target_destroy,
++	.use_blk_tags		= 1,
+ };
+ 
+ /******************************** Bus DMA *************************************/
+@@ -1468,12 +1469,12 @@ ahd_platform_set_tags(struct ahd_softc *ahd, struct scsi_device *sdev,
+ 
+ 	switch ((dev->flags & (AHD_DEV_Q_BASIC|AHD_DEV_Q_TAGGED))) {
+ 	case AHD_DEV_Q_BASIC:
+-		scsi_set_tag_type(sdev, MSG_SIMPLE_TASK);
+-		scsi_activate_tcq(sdev, dev->openings + dev->active);
++		scsi_adjust_queue_depth(sdev, MSG_SIMPLE_TASK,
++				dev->openings + dev->active);
+ 		break;
+ 	case AHD_DEV_Q_TAGGED:
+-		scsi_set_tag_type(sdev, MSG_ORDERED_TASK);
+-		scsi_activate_tcq(sdev, dev->openings + dev->active);
++		scsi_adjust_queue_depth(sdev, MSG_ORDERED_TASK,
++				dev->openings + dev->active);
+ 		break;
+ 	default:
+ 		/*
+@@ -1482,7 +1483,7 @@ ahd_platform_set_tags(struct ahd_softc *ahd, struct scsi_device *sdev,
+ 		 * serially on the controller/device.  This should
+ 		 * remove some latency.
+ 		 */
+-		scsi_deactivate_tcq(sdev, 1);
++		scsi_adjust_queue_depth(sdev, 0, 1);
+ 		break;
+ 	}
+ }
+diff --git a/drivers/scsi/aic7xxx/aic7xxx_osm.c b/drivers/scsi/aic7xxx/aic7xxx_osm.c
+index c0c62583b542..7d65d2de85d3 100644
+--- a/drivers/scsi/aic7xxx/aic7xxx_osm.c
++++ b/drivers/scsi/aic7xxx/aic7xxx_osm.c
+@@ -822,6 +822,7 @@ struct scsi_host_template aic7xxx_driver_template = {
+ 	.slave_configure	= ahc_linux_slave_configure,
+ 	.target_alloc		= ahc_linux_target_alloc,
+ 	.target_destroy		= ahc_linux_target_destroy,
++	.use_blk_tags		= 1,
+ };
+ 
+ /**************************** Tasklet Handler *********************************/
+@@ -1344,12 +1345,12 @@ ahc_platform_set_tags(struct ahc_softc *ahc, struct scsi_device *sdev,
+ 	}
+ 	switch ((dev->flags & (AHC_DEV_Q_BASIC|AHC_DEV_Q_TAGGED))) {
+ 	case AHC_DEV_Q_BASIC:
+-		scsi_set_tag_type(sdev, MSG_SIMPLE_TAG);
+-		scsi_activate_tcq(sdev, dev->openings + dev->active);
++		scsi_adjust_queue_depth(sdev, MSG_SIMPLE_TASK,
++				dev->openings + dev->active);
+ 		break;
+ 	case AHC_DEV_Q_TAGGED:
+-		scsi_set_tag_type(sdev, MSG_ORDERED_TAG);
+-		scsi_activate_tcq(sdev, dev->openings + dev->active);
++		scsi_adjust_queue_depth(sdev, MSG_ORDERED_TASK,
++				dev->openings + dev->active);
+ 		break;
+ 	default:
+ 		/*
+@@ -1358,7 +1359,7 @@ ahc_platform_set_tags(struct ahc_softc *ahc, struct scsi_device *sdev,
+ 		 * serially on the controller/device.  This should
+ 		 * remove some latency.
+ 		 */
+-		scsi_deactivate_tcq(sdev, 2);
++		scsi_adjust_queue_depth(sdev, 0, 2);
+ 		break;
+ 	}
+ }
+diff --git a/drivers/scsi/aic94xx/aic94xx_init.c b/drivers/scsi/aic94xx/aic94xx_init.c
+index e633d4ca83b9..49e4465fb578 100644
+--- a/drivers/scsi/aic94xx/aic94xx_init.c
++++ b/drivers/scsi/aic94xx/aic94xx_init.c
+@@ -75,6 +75,7 @@ static struct scsi_host_template aic94xx_sht = {
+ 	.eh_bus_reset_handler	= sas_eh_bus_reset_handler,
+ 	.target_destroy		= sas_target_destroy,
+ 	.ioctl			= sas_ioctl,
++	.use_blk_tags		= 1,
+ };
+ 
+ static int asd_map_memio(struct asd_ha_struct *asd_ha)
+diff --git a/drivers/scsi/bfa/bfad_im.c b/drivers/scsi/bfa/bfad_im.c
+index 32cf7eb8e2c0..6a247a8c0faa 100644
+--- a/drivers/scsi/bfa/bfad_im.c
++++ b/drivers/scsi/bfa/bfad_im.c
+@@ -772,11 +772,7 @@ bfad_thread_workq(struct bfad_s *bfad)
+ static int
+ bfad_im_slave_configure(struct scsi_device *sdev)
+ {
+-	if (sdev->tagged_supported)
+-		scsi_activate_tcq(sdev, bfa_lun_queue_depth);
+-	else
+-		scsi_deactivate_tcq(sdev, bfa_lun_queue_depth);
+-
++	scsi_adjust_queue_depth(sdev, 0, bfa_lun_queue_depth);
+ 	return 0;
+ }
+ 
+@@ -800,6 +796,7 @@ struct scsi_host_template bfad_im_scsi_host_template = {
+ 	.shost_attrs = bfad_im_host_attrs,
+ 	.max_sectors = BFAD_MAX_SECTORS,
+ 	.vendor_id = BFA_PCI_VENDOR_ID_BROCADE,
++	.use_blk_tags = 1,
+ };
+ 
+ struct scsi_host_template bfad_im_vport_template = {
+@@ -821,6 +818,7 @@ struct scsi_host_template bfad_im_vport_template = {
+ 	.use_clustering = ENABLE_CLUSTERING,
+ 	.shost_attrs = bfad_im_vport_attrs,
+ 	.max_sectors = BFAD_MAX_SECTORS,
++	.use_blk_tags = 1,
+ };
+ 
+ bfa_status_t
+diff --git a/drivers/scsi/bnx2fc/bnx2fc_fcoe.c b/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
+index ec669ac17ded..6b81325c85ad 100644
+--- a/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
++++ b/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
+@@ -2879,6 +2879,7 @@ static struct scsi_host_template bnx2fc_shost_template = {
+ 	.use_clustering		= ENABLE_CLUSTERING,
+ 	.sg_tablesize		= BNX2FC_MAX_BDS_PER_CMD,
+ 	.max_sectors		= 1024,
++	.use_blk_tags		= 1,
+ };
+ 
+ static struct libfc_function_template bnx2fc_libfc_fcn_templ = {
+diff --git a/drivers/scsi/csiostor/csio_scsi.c b/drivers/scsi/csiostor/csio_scsi.c
+index 17717d0fa0c2..8712e78f7245 100644
+--- a/drivers/scsi/csiostor/csio_scsi.c
++++ b/drivers/scsi/csiostor/csio_scsi.c
+@@ -2262,11 +2262,7 @@ csio_slave_alloc(struct scsi_device *sdev)
+ static int
+ csio_slave_configure(struct scsi_device *sdev)
+ {
+-	if (sdev->tagged_supported)
+-		scsi_activate_tcq(sdev, csio_lun_qdepth);
+-	else
+-		scsi_deactivate_tcq(sdev, csio_lun_qdepth);
+-
++	scsi_adjust_queue_depth(sdev, 0, csio_lun_qdepth);
+ 	return 0;
+ }
+ 
+@@ -2311,6 +2307,7 @@ struct scsi_host_template csio_fcoe_shost_template = {
+ 	.use_clustering		= ENABLE_CLUSTERING,
+ 	.shost_attrs		= csio_fcoe_lport_attrs,
+ 	.max_sectors		= CSIO_MAX_SECTOR_SIZE,
++	.use_blk_tags		= 1,
+ };
+ 
+ struct scsi_host_template csio_fcoe_shost_vport_template = {
+@@ -2330,6 +2327,7 @@ struct scsi_host_template csio_fcoe_shost_vport_template = {
+ 	.use_clustering		= ENABLE_CLUSTERING,
+ 	.shost_attrs		= csio_fcoe_vport_attrs,
+ 	.max_sectors		= CSIO_MAX_SECTOR_SIZE,
++	.use_blk_tags		= 1,
+ };
+ 
+ /*
+* Unmerged path drivers/scsi/esas2r/esas2r_main.c
+diff --git a/drivers/scsi/esp_scsi.c b/drivers/scsi/esp_scsi.c
+index 55548dc5cec3..09bfb34b085f 100644
+--- a/drivers/scsi/esp_scsi.c
++++ b/drivers/scsi/esp_scsi.c
+@@ -2419,10 +2419,9 @@ static int esp_slave_configure(struct scsi_device *dev)
+ 		queue_depth = dev->host->cmd_per_lun;
+ 
+ 	if (goal_tags) {
+-		scsi_set_tag_type(dev, MSG_ORDERED_TAG);
+-		scsi_activate_tcq(dev, queue_depth);
++		scsi_adjust_queue_depth(dev, MSG_ORDERED_TAG, queue_depth);
+ 	} else {
+-		scsi_deactivate_tcq(dev, queue_depth);
++		scsi_adjust_queue_depth(dev, 0, queue_depth);
+ 	}
+ 	tp->flags |= ESP_TGT_DISCONNECT;
+ 
+@@ -2631,6 +2630,7 @@ struct scsi_host_template scsi_esp_template = {
+ 	.use_clustering		= ENABLE_CLUSTERING,
+ 	.max_sectors		= 0xffff,
+ 	.skip_settle_delay	= 1,
++	.use_blk_tags		= 1,
+ };
+ EXPORT_SYMBOL(scsi_esp_template);
+ 
+diff --git a/drivers/scsi/fcoe/fcoe.c b/drivers/scsi/fcoe/fcoe.c
+index e678ac0b5aac..8b3f48a279f8 100644
+--- a/drivers/scsi/fcoe/fcoe.c
++++ b/drivers/scsi/fcoe/fcoe.c
+@@ -288,6 +288,7 @@ static struct scsi_host_template fcoe_shost_template = {
+ 	.use_clustering = ENABLE_CLUSTERING,
+ 	.sg_tablesize = SG_ALL,
+ 	.max_sectors = 0xffff,
++	.use_blk_tags = 1,
+ };
+ 
+ /**
+diff --git a/drivers/scsi/fnic/fnic_main.c b/drivers/scsi/fnic/fnic_main.c
+index 5ca553c98c20..f4b38a45baaf 100644
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@ -100,7 +100,7 @@ static int fnic_slave_alloc(struct scsi_device *sdev)
+ 	if (!rport || fc_remote_port_chkready(rport))
+ 		return -ENXIO;
+ 
+-	scsi_activate_tcq(sdev, fnic_max_qdepth);
++	scsi_adjust_queue_depth(sdev, 0, fnic_max_qdepth);
+ 	return 0;
+ }
+ 
+@@ -121,6 +121,7 @@ static struct scsi_host_template fnic_host_template = {
+ 	.sg_tablesize = FNIC_MAX_SG_DESC_CNT,
+ 	.max_sectors = 0xffff,
+ 	.shost_attrs = fnic_attrs,
++	.use_blk_tags = 1,
+ };
+ 
+ static void
+diff --git a/drivers/scsi/ibmvscsi/ibmvfc.c b/drivers/scsi/ibmvscsi/ibmvfc.c
+index 6ae5e47dc4e3..d0f9da7be9b1 100644
+--- a/drivers/scsi/ibmvscsi/ibmvfc.c
++++ b/drivers/scsi/ibmvscsi/ibmvfc.c
+@@ -2899,11 +2899,11 @@ static int ibmvfc_slave_configure(struct scsi_device *sdev)
+ 	if (sdev->type == TYPE_DISK)
+ 		sdev->allow_restart = 1;
+ 
+-	if (sdev->tagged_supported) {
+-		scsi_set_tag_type(sdev, MSG_SIMPLE_TAG);
+-		scsi_activate_tcq(sdev, sdev->queue_depth);
+-	} else
+-		scsi_deactivate_tcq(sdev, sdev->queue_depth);
++	if (sdev->tagged_supported)
++		scsi_adjust_queue_depth(sdev, MSG_SIMPLE_TAG,
++				sdev->queue_depth);
++	else
++		scsi_adjust_queue_depth(sdev, 0, sdev->queue_depth);
+ 	spin_unlock_irqrestore(shost->host_lock, flags);
+ 	return 0;
+ }
+@@ -3142,6 +3142,7 @@ static struct scsi_host_template driver_template = {
+ 	.max_sectors = IBMVFC_MAX_SECTORS,
+ 	.use_clustering = ENABLE_CLUSTERING,
+ 	.shost_attrs = ibmvfc_attrs,
++	.use_blk_tags = 1,
+ };
+ 
+ /**
+* Unmerged path drivers/scsi/ipr.c
+diff --git a/drivers/scsi/isci/init.c b/drivers/scsi/isci/init.c
+index 122172239fc4..74767a8d7cdf 100644
+--- a/drivers/scsi/isci/init.c
++++ b/drivers/scsi/isci/init.c
+@@ -172,6 +172,7 @@ static struct scsi_host_template isci_sht = {
+ 	.target_destroy			= sas_target_destroy,
+ 	.ioctl				= sas_ioctl,
+ 	.shost_attrs			= isci_host_attrs,
++	.use_blk_tags			= 1,
+ };
+ 
+ static struct sas_domain_function_template isci_transport_ops  = {
+diff --git a/drivers/scsi/libfc/fc_fcp.c b/drivers/scsi/libfc/fc_fcp.c
+index 09c81b2f2169..257d1db9028b 100644
+--- a/drivers/scsi/libfc/fc_fcp.c
++++ b/drivers/scsi/libfc/fc_fcp.c
+@@ -2160,12 +2160,7 @@ int fc_slave_alloc(struct scsi_device *sdev)
+ 	if (!rport || fc_remote_port_chkready(rport))
+ 		return -ENXIO;
+ 
+-	if (sdev->tagged_supported)
+-		scsi_activate_tcq(sdev, FC_FCP_DFLT_QUEUE_DEPTH);
+-	else
+-		scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
+-					FC_FCP_DFLT_QUEUE_DEPTH);
+-
++	scsi_adjust_queue_depth(sdev, 0, FC_FCP_DFLT_QUEUE_DEPTH);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(fc_slave_alloc);
+diff --git a/drivers/scsi/libsas/sas_scsi_host.c b/drivers/scsi/libsas/sas_scsi_host.c
+index da2e3e6a7730..45795abf21bb 100644
+--- a/drivers/scsi/libsas/sas_scsi_host.c
++++ b/drivers/scsi/libsas/sas_scsi_host.c
+@@ -880,15 +880,13 @@ int sas_slave_configure(struct scsi_device *scsi_dev)
+ 	sas_read_port_mode_page(scsi_dev);
+ 
+ 	if (scsi_dev->tagged_supported) {
+-		scsi_set_tag_type(scsi_dev, MSG_SIMPLE_TAG);
+-		scsi_activate_tcq(scsi_dev, SAS_DEF_QD);
++		scsi_adjust_queue_depth(scsi_dev, MSG_SIMPLE_TAG, SAS_DEF_QD);
+ 	} else {
+ 		SAS_DPRINTK("device %llx, LUN %x doesn't support "
+ 			    "TCQ\n", SAS_ADDR(dev->sas_addr),
+ 			    scsi_dev->lun);
+ 		scsi_dev->tagged_supported = 0;
+-		scsi_set_tag_type(scsi_dev, 0);
+-		scsi_deactivate_tcq(scsi_dev, 1);
++		scsi_adjust_queue_depth(scsi_dev, 0, 1);
+ 	}
+ 
+ 	scsi_dev->allow_restart = 1;
+@@ -931,10 +929,7 @@ int sas_change_queue_type(struct scsi_device *scsi_dev, int qt)
+ 	if (!scsi_dev->tagged_supported)
+ 		return 0;
+ 
+-	scsi_deactivate_tcq(scsi_dev, 1);
+-
+-	scsi_set_tag_type(scsi_dev, qt);
+-	scsi_activate_tcq(scsi_dev, scsi_dev->queue_depth);
++	scsi_adjust_queue_depth(scsi_dev, qt, scsi_dev->queue_depth);
+ 
+ 	return qt;
+ }
+* Unmerged path drivers/scsi/lpfc/lpfc_scsi.c
+diff --git a/drivers/scsi/mvsas/mv_init.c b/drivers/scsi/mvsas/mv_init.c
+index 02474d41dbc6..339ae8972c58 100644
+--- a/drivers/scsi/mvsas/mv_init.c
++++ b/drivers/scsi/mvsas/mv_init.c
+@@ -67,6 +67,7 @@ static struct scsi_host_template mvs_sht = {
+ 	.target_destroy		= sas_target_destroy,
+ 	.ioctl			= sas_ioctl,
+ 	.shost_attrs		= mvst_host_attrs,
++	.use_blk_tags		= 1,
+ };
+ 
+ static struct sas_domain_function_template mvs_transport_ops = {
+diff --git a/drivers/scsi/pm8001/pm8001_init.c b/drivers/scsi/pm8001/pm8001_init.c
+index bd6a3b0d923d..56811576c3bd 100644
+--- a/drivers/scsi/pm8001/pm8001_init.c
++++ b/drivers/scsi/pm8001/pm8001_init.c
+@@ -89,6 +89,7 @@ static struct scsi_host_template pm8001_sht = {
+ 	.target_destroy		= sas_target_destroy,
+ 	.ioctl			= sas_ioctl,
+ 	.shost_attrs		= pm8001_host_attrs,
++	.use_blk_tags		= 1,
+ };
+ 
+ /**
+diff --git a/drivers/scsi/pmcraid.c b/drivers/scsi/pmcraid.c
+index 16da4df74d03..7481c23e8008 100644
+--- a/drivers/scsi/pmcraid.c
++++ b/drivers/scsi/pmcraid.c
+@@ -251,7 +251,6 @@ static int pmcraid_slave_configure(struct scsi_device *scsi_dev)
+ 
+ 	if (scsi_dev->tagged_supported &&
+ 	    (RES_IS_GSCSI(res->cfg_entry) || RES_IS_VSET(res->cfg_entry))) {
+-		scsi_activate_tcq(scsi_dev, scsi_dev->queue_depth);
+ 		scsi_adjust_queue_depth(scsi_dev, MSG_SIMPLE_TAG,
+ 					scsi_dev->host->cmd_per_lun);
+ 	} else {
+@@ -4329,7 +4328,8 @@ static struct scsi_host_template pmcraid_host_template = {
+ 	.cmd_per_lun = PMCRAID_MAX_CMD_PER_LUN,
+ 	.use_clustering = ENABLE_CLUSTERING,
+ 	.shost_attrs = pmcraid_host_attrs,
+-	.proc_name = PMCRAID_DRIVER_NAME
++	.proc_name = PMCRAID_DRIVER_NAME,
++	.use_blk_tags = 1,
+ };
+ 
+ /*
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index fab9f3d4c99d..53b99c1f8f24 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -270,6 +270,7 @@ struct scsi_host_template qla2xxx_driver_template = {
+ 	.shost_attrs		= qla2x00_host_attrs,
+ 
+ 	.supported_mode		= MODE_INITIATOR,
++	.use_blk_tags		= 1,
+ };
+ 
+ static struct scsi_transport_template *qla2xxx_transport_template = NULL;
+@@ -1391,10 +1392,7 @@ qla2xxx_slave_configure(struct scsi_device *sdev)
+ 	if (IS_T10_PI_CAPABLE(vha->hw))
+ 		blk_queue_update_dma_alignment(sdev->request_queue, 0x7);
+ 
+-	if (sdev->tagged_supported)
+-		scsi_activate_tcq(sdev, req->max_q_depth);
+-	else
+-		scsi_deactivate_tcq(sdev, req->max_q_depth);
++	scsi_adjust_queue_depth(sdev, 0, req->max_q_depth);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/scsi/qla4xxx/ql4_os.c b/drivers/scsi/qla4xxx/ql4_os.c
+index 25e77ecb8b9a..51626ca664c0 100644
+--- a/drivers/scsi/qla4xxx/ql4_os.c
++++ b/drivers/scsi/qla4xxx/ql4_os.c
+@@ -163,7 +163,6 @@ static int qla4xxx_eh_target_reset(struct scsi_cmnd *cmd);
+ static int qla4xxx_eh_host_reset(struct scsi_cmnd *cmd);
+ static int qla4xxx_slave_alloc(struct scsi_device *device);
+ static int qla4xxx_slave_configure(struct scsi_device *device);
+-static void qla4xxx_slave_destroy(struct scsi_device *sdev);
+ static umode_t qla4_attr_is_visible(int param_type, int param);
+ static int qla4xxx_host_reset(struct Scsi_Host *shost, int reset_type);
+ static int qla4xxx_change_queue_depth(struct scsi_device *sdev, int qdepth,
+@@ -206,7 +205,6 @@ static struct scsi_host_template qla4xxx_driver_template = {
+ 
+ 	.slave_configure	= qla4xxx_slave_configure,
+ 	.slave_alloc		= qla4xxx_slave_alloc,
+-	.slave_destroy		= qla4xxx_slave_destroy,
+ 	.change_queue_depth	= qla4xxx_change_queue_depth,
+ 
+ 	.this_id		= -1,
+@@ -218,6 +216,7 @@ static struct scsi_host_template qla4xxx_driver_template = {
+ 	.shost_attrs		= qla4xxx_host_attrs,
+ 	.host_reset		= qla4xxx_host_reset,
+ 	.vendor_id		= SCSI_NL_VID_TYPE_PCI | PCI_VENDOR_ID_QLOGIC,
++	.use_blk_tags		= 1,
+ };
+ 
+ static struct iscsi_transport qla4xxx_iscsi_transport = {
+@@ -9070,7 +9069,7 @@ static int qla4xxx_slave_alloc(struct scsi_device *sdev)
+ 	if (ql4xmaxqdepth != 0 && ql4xmaxqdepth <= 0xffffU)
+ 		queue_depth = ql4xmaxqdepth;
+ 
+-	scsi_activate_tcq(sdev, queue_depth);
++	scsi_adjust_queue_depth(sdev, 0, queue_depth);
+ 	return 0;
+ }
+ 
+@@ -9080,11 +9079,6 @@ static int qla4xxx_slave_configure(struct scsi_device *sdev)
+ 	return 0;
+ }
+ 
+-static void qla4xxx_slave_destroy(struct scsi_device *sdev)
+-{
+-	scsi_deactivate_tcq(sdev, 1);
+-}
+-
+ static int qla4xxx_change_queue_depth(struct scsi_device *sdev, int qdepth,
+ 				      int reason)
+ {
+* Unmerged path drivers/scsi/scsi.c
+diff --git a/drivers/scsi/scsi_scan.c b/drivers/scsi/scsi_scan.c
+index 20209c4d4196..1dc07fc1a21a 100644
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -294,6 +294,12 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
+ 	}
+ 	WARN_ON_ONCE(!blk_get_queue(sdev->request_queue));
+ 	sdev->request_queue->queuedata = sdev;
++
++	if (!shost_use_blk_mq(sdev->host) &&
++	    (shost->bqt || shost->hostt->use_blk_tags)) {
++		blk_queue_init_tags(sdev->request_queue,
++				    sdev->host->cmd_per_lun, shost->bqt);
++	}
+ 	scsi_adjust_queue_depth(sdev, 0, sdev->host->cmd_per_lun);
+ 
+ 	scsi_sysfs_device_initialize(sdev);
+diff --git a/drivers/scsi/stex.c b/drivers/scsi/stex.c
+index 1f4e62b61b83..14640be2f368 100644
+--- a/drivers/scsi/stex.c
++++ b/drivers/scsi/stex.c
+@@ -549,7 +549,7 @@ stex_slave_alloc(struct scsi_device *sdev)
+ 	/* Cheat: usually extracted from Inquiry data */
+ 	sdev->tagged_supported = 1;
+ 
+-	scsi_activate_tcq(sdev, sdev->host->can_queue);
++	scsi_adjust_queue_depth(sdev, 0, sdev->host->can_queue);
+ 
+ 	return 0;
+ }
+@@ -565,12 +565,6 @@ stex_slave_config(struct scsi_device *sdev)
+ 	return 0;
+ }
+ 
+-static void
+-stex_slave_destroy(struct scsi_device *sdev)
+-{
+-	scsi_deactivate_tcq(sdev, 1);
+-}
+-
+ static int
+ stex_queuecommand_lck(struct scsi_cmnd *cmd, void (*done)(struct scsi_cmnd *))
+ {
+@@ -1390,10 +1384,10 @@ static struct scsi_host_template driver_template = {
+ 	.queuecommand			= stex_queuecommand,
+ 	.slave_alloc			= stex_slave_alloc,
+ 	.slave_configure		= stex_slave_config,
+-	.slave_destroy			= stex_slave_destroy,
+ 	.eh_abort_handler		= stex_abort,
+ 	.eh_host_reset_handler		= stex_reset,
+ 	.this_id			= -1,
++	.use_blk_tags			= 1,
+ };
+ 
+ static struct pci_device_id stex_pci_tbl[] = {
+diff --git a/drivers/scsi/tmscsim.c b/drivers/scsi/tmscsim.c
+index 11423615c2ea..484681594ba8 100644
+--- a/drivers/scsi/tmscsim.c
++++ b/drivers/scsi/tmscsim.c
+@@ -2189,7 +2189,7 @@ static int dc390_slave_configure(struct scsi_device *sdev)
+ 	acb->scan_devices = 0;
+ 	if (sdev->tagged_supported && (dcb->DevMode & TAG_QUEUEING_)) {
+ 		dcb->SyncMode |= EN_TAG_QUEUEING;
+-		scsi_activate_tcq(sdev, acb->TagMaxNum);
++		scsi_adjust_queue_depth(sdev, 0, acb->TagMaxNum);
+ 	}
+ 
+ 	return 0;
+@@ -2211,6 +2211,7 @@ static struct scsi_host_template driver_template = {
+ 	.cmd_per_lun		= 1,
+ 	.use_clustering		= ENABLE_CLUSTERING,
+ 	.max_sectors		= 0x4000, /* 8MiB = 16 * 1024 * 512 */
++	.use_blk_tags		= 1,
+ };
+ 
+ /***********************************************************************
+* Unmerged path drivers/scsi/ufs/ufshcd.c
+diff --git a/drivers/target/loopback/tcm_loop.c b/drivers/target/loopback/tcm_loop.c
+index 072063c96590..ec6d9db3db55 100644
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@ -392,7 +392,6 @@ static int tcm_loop_slave_alloc(struct scsi_device *sd)
+ static int tcm_loop_slave_configure(struct scsi_device *sd)
+ {
+ 	if (sd->tagged_supported) {
+-		scsi_activate_tcq(sd, sd->queue_depth);
+ 		scsi_adjust_queue_depth(sd, MSG_SIMPLE_TAG,
+ 					sd->host->cmd_per_lun);
+ 	} else {
+@@ -421,6 +420,7 @@ static struct scsi_host_template tcm_loop_driver_template = {
+ 	.slave_alloc		= tcm_loop_slave_alloc,
+ 	.slave_configure	= tcm_loop_slave_configure,
+ 	.module			= THIS_MODULE,
++	.use_blk_tags		= 1,
+ };
+ 
+ static int tcm_loop_driver_probe(struct device *dev)
+* Unmerged path drivers/usb/storage/uas.c
+diff --git a/include/scsi/scsi_host.h b/include/scsi/scsi_host.h
+index 007ac0394801..c337bb51bed5 100644
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -446,6 +446,11 @@ struct scsi_host_template {
+ 	 */
+ 	unsigned char present;
+ 
++	/*
++	 * Let the block layer assigns tags to all commands.
++	 */
++	unsigned use_blk_tags:1;
++
+ 	/*
+ 	 * This specifies the mode that a LLD supports.
+ 	 */
+diff --git a/include/scsi/scsi_tcq.h b/include/scsi/scsi_tcq.h
+index 6c017b8e848a..c041d9140b87 100644
+--- a/include/scsi/scsi_tcq.h
++++ b/include/scsi/scsi_tcq.h
+@@ -52,40 +52,6 @@ static inline void scsi_set_tag_type(struct scsi_device *sdev, int tag)
+ 		break;
+ 	}
+ }
+-/**
+- * scsi_activate_tcq - turn on tag command queueing
+- * @SDpnt:	device to turn on TCQ for
+- * @depth:	queue depth
+- *
+- * Notes:
+- *	Eventually, I hope depth would be the maximum depth
+- *	the device could cope with and the real queue depth
+- *	would be adjustable from 0 to depth.
+- **/
+-static inline void scsi_activate_tcq(struct scsi_device *sdev, int depth)
+-{
+-	if (!sdev->tagged_supported)
+-		return;
+-
+-	if (shost_use_blk_mq(sdev->host))
+-		queue_flag_set_unlocked(QUEUE_FLAG_QUEUED, sdev->request_queue);
+-	else if (!blk_queue_tagged(sdev->request_queue))
+-		blk_queue_init_tags(sdev->request_queue, depth,
+-				    sdev->host->bqt);
+-
+-	scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), depth);
+-}
+-
+-/**
+- * scsi_deactivate_tcq - turn off tag command queueing
+- * @SDpnt:	device to turn off TCQ for
+- **/
+-static inline void scsi_deactivate_tcq(struct scsi_device *sdev, int depth)
+-{
+-	if (blk_queue_tagged(sdev->request_queue))
+-		blk_queue_free_tags(sdev->request_queue);
+-	scsi_adjust_queue_depth(sdev, 0, depth);
+-}
+ 
+ /**
+  * scsi_populate_tag_msg - place a tag message in a buffer
