@@ -892,6 +892,8 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
 		goto out;
 	}
 
+	skb_set_inner_ipproto(skb, IPPROTO_IPV6);
+
 	err = iptunnel_xmit(skb->sk, rt, skb, fl4.saddr, fl4.daddr,
 			    IPPROTO_IPV6, tos, ttl, df);
 	iptunnel_xmit_stats(err, &dev->stats, dev->tstats);
@@ -914,6 +916,8 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb = iptunnel_handle_offloads(skb, false, SKB_GSO_IPIP);
 	if (IS_ERR(skb))
 		goto out;
+
+	skb_set_inner_ipproto(skb, IPPROTO_IPIP);
 
 	ip_tunnel_xmit(skb, dev, tiph, IPPROTO_IPIP);
 	return NETDEV_TX_OK;
