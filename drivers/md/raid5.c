@@ -4102,11 +4102,10 @@ static int raid5_congested(struct mddev *mddev, int bits)
 /* We want read requests to align with chunks where possible,
  * but write requests don't need to.
  */
-static int raid5_mergeable_bvec(struct request_queue *q,
+static int raid5_mergeable_bvec(struct mddev *mddev,
 				struct bvec_merge_data *bvm,
 				struct bio_vec *biovec)
 {
-	struct mddev *mddev = q->queuedata;
 	sector_t sector = bvm->bi_sector + get_start_sect(bvm->bi_bdev);
 	int max;
 	unsigned int chunk_sectors = mddev->chunk_sectors;
@@ -6175,8 +6174,6 @@ static int run(struct mddev *mddev)
 		if (mddev->queue->backing_dev_info.ra_pages < 2 * stripe)
 			mddev->queue->backing_dev_info.ra_pages = 2 * stripe;
 
-		blk_queue_merge_bvec(mddev->queue, raid5_mergeable_bvec);
-
 		chunk_size = mddev->chunk_sectors << 9;
 		blk_queue_io_min(mddev->queue, chunk_size);
 		blk_queue_io_opt(mddev->queue, chunk_size *
@@ -7054,6 +7051,7 @@ static struct md_personality raid6_personality =
 	.quiesce	= raid5_quiesce,
 	.takeover	= raid6_takeover,
 	.congested	= raid5_congested,
+	.mergeable_bvec	= raid5_mergeable_bvec,
 };
 static struct md_personality raid5_personality =
 {
@@ -7077,6 +7075,7 @@ static struct md_personality raid5_personality =
 	.quiesce	= raid5_quiesce,
 	.takeover	= raid5_takeover,
 	.congested	= raid5_congested,
+	.mergeable_bvec	= raid5_mergeable_bvec,
 };
 
 static struct md_personality raid4_personality =
@@ -7101,6 +7100,7 @@ static struct md_personality raid4_personality =
 	.quiesce	= raid5_quiesce,
 	.takeover	= raid4_takeover,
 	.congested	= raid5_congested,
+	.mergeable_bvec	= raid5_mergeable_bvec,
 };
 
 static int __init raid5_init(void)
