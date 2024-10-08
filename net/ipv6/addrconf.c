@@ -3434,7 +3434,7 @@ static int if6_seq_show(struct seq_file *seq, void *v)
 		   ifp->idev->dev->ifindex,
 		   ifp->prefix_len,
 		   ifp->scope,
-		   ifp->flags,
+		   (u8) ifp->flags,
 		   ifp->idev->dev->name);
 	return 0;
 }
