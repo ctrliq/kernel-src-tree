@@ -1,0 +1,181 @@
+CIFS: Fix SMB2 readdir error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Pavel Shilovsky <pshilovsky@samba.org>
+commit 52755808d4525f4d5b86d112d36ffc7a46f3fb48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/52755808.failed
+
+SMB2 servers indicates the end of a directory search with
+STATUS_NO_MORE_FILE error code that is not processed now.
+This causes generic/257 xfstest to fail. Fix this by triggering
+the end of search by this error code in SMB2_query_directory.
+
+Also when negotiating CIFS protocol we tell the server to close
+the search automatically at the end and there is no need to do
+it itself. In the case of SMB2 protocol, we need to close it
+explicitly - separate close directory checks for different
+protocols.
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Pavel Shilovsky <pshilovsky@samba.org>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 52755808d4525f4d5b86d112d36ffc7a46f3fb48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+diff --cc fs/cifs/cifsglob.h
+index 4309c5862bd8,ce24c1fc2123..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -406,6 -406,11 +406,14 @@@ struct smb_version_operations 
+  			int);
+  	/* writepages retry size */
+  	unsigned int (*wp_retry_size)(struct inode *);
+++<<<<<<< HEAD
+++=======
++ 	/* get mtu credits */
++ 	int (*wait_mtu_credits)(struct TCP_Server_Info *, unsigned int,
++ 				unsigned int *, unsigned int *);
++ 	/* check if we need to issue closedir */
++ 	bool (*dir_needs_close)(struct cifsFileInfo *);
+++>>>>>>> 52755808d452 (CIFS: Fix SMB2 readdir error handling)
+  };
+  
+  struct smb_version_values {
+* Unmerged path fs/cifs/cifsglob.h
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 7c01aa5c37dd..08da66e4b27c 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -766,7 +766,7 @@ int cifs_closedir(struct inode *inode, struct file *file)
+ 
+ 	cifs_dbg(FYI, "Freeing private data in close dir\n");
+ 	spin_lock(&cifs_file_list_lock);
+-	if (!cfile->srch_inf.endOfSearch && !cfile->invalidHandle) {
++	if (server->ops->dir_needs_close(cfile)) {
+ 		cfile->invalidHandle = true;
+ 		spin_unlock(&cifs_file_list_lock);
+ 		if (server->ops->close_dir)
+diff --git a/fs/cifs/readdir.c b/fs/cifs/readdir.c
+index ada7f3752db8..79b2dd6306ed 100644
+--- a/fs/cifs/readdir.c
++++ b/fs/cifs/readdir.c
+@@ -593,7 +593,7 @@ find_cifs_entry(const unsigned int xid, struct cifs_tcon *tcon,
+ 		/* close and restart search */
+ 		cifs_dbg(FYI, "search backing up - close and restart search\n");
+ 		spin_lock(&cifs_file_list_lock);
+-		if (!cfile->srch_inf.endOfSearch && !cfile->invalidHandle) {
++		if (server->ops->dir_needs_close(cfile)) {
+ 			cfile->invalidHandle = true;
+ 			spin_unlock(&cifs_file_list_lock);
+ 			if (server->ops->close)
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 8a963426d810..d74a28ea5295 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -1015,6 +1015,12 @@ cifs_wp_retry_size(struct inode *inode)
+ 	return CIFS_SB(inode->i_sb)->wsize;
+ }
+ 
++static bool
++cifs_dir_needs_close(struct cifsFileInfo *cfile)
++{
++	return !cfile->srch_inf.endOfSearch && !cfile->invalidHandle;
++}
++
+ struct smb_version_operations smb1_operations = {
+ 	.send_cancel = send_nt_cancel,
+ 	.compare_fids = cifs_compare_fids,
+@@ -1085,6 +1091,7 @@ struct smb_version_operations smb1_operations = {
+ 	.create_mf_symlink = cifs_create_mf_symlink,
+ 	.is_read_op = cifs_is_read_op,
+ 	.wp_retry_size = cifs_wp_retry_size,
++	.dir_needs_close = cifs_dir_needs_close,
+ #ifdef CONFIG_CIFS_XATTR
+ 	.query_all_EAs = CIFSSMBQAllEAs,
+ 	.set_EA = CIFSSMBSetEA,
+diff --git a/fs/cifs/smb2maperror.c b/fs/cifs/smb2maperror.c
+index e31a9dfdcd39..a689514e260f 100644
+--- a/fs/cifs/smb2maperror.c
++++ b/fs/cifs/smb2maperror.c
+@@ -214,7 +214,7 @@ static const struct status_to_posix_error smb2_error_map_table[] = {
+ 	{STATUS_BREAKPOINT, -EIO, "STATUS_BREAKPOINT"},
+ 	{STATUS_SINGLE_STEP, -EIO, "STATUS_SINGLE_STEP"},
+ 	{STATUS_BUFFER_OVERFLOW, -EIO, "STATUS_BUFFER_OVERFLOW"},
+-	{STATUS_NO_MORE_FILES, -EIO, "STATUS_NO_MORE_FILES"},
++	{STATUS_NO_MORE_FILES, -ENODATA, "STATUS_NO_MORE_FILES"},
+ 	{STATUS_WAKE_SYSTEM_DEBUGGER, -EIO, "STATUS_WAKE_SYSTEM_DEBUGGER"},
+ 	{STATUS_HANDLES_CLOSED, -EIO, "STATUS_HANDLES_CLOSED"},
+ 	{STATUS_NO_INHERITANCE, -EIO, "STATUS_NO_INHERITANCE"},
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 78de2c9b38f8..2e32113e81d9 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -1174,6 +1174,12 @@ smb2_wp_retry_size(struct inode *inode)
+ 		     SMB2_MAX_BUFFER_SIZE);
+ }
+ 
++static bool
++smb2_dir_needs_close(struct cifsFileInfo *cfile)
++{
++	return !cfile->invalidHandle;
++}
++
+ struct smb_version_operations smb20_operations = {
+ 	.compare_fids = smb2_compare_fids,
+ 	.setup_request = smb2_setup_request,
+@@ -1248,6 +1254,7 @@ struct smb_version_operations smb20_operations = {
+ 	.parse_lease_buf = smb2_parse_lease_buf,
+ 	.clone_range = smb2_clone_range,
+ 	.wp_retry_size = smb2_wp_retry_size,
++	.dir_needs_close = smb2_dir_needs_close,
+ };
+ 
+ struct smb_version_operations smb21_operations = {
+@@ -1324,6 +1331,7 @@ struct smb_version_operations smb21_operations = {
+ 	.parse_lease_buf = smb2_parse_lease_buf,
+ 	.clone_range = smb2_clone_range,
+ 	.wp_retry_size = smb2_wp_retry_size,
++	.dir_needs_close = smb2_dir_needs_close,
+ };
+ 
+ struct smb_version_operations smb30_operations = {
+@@ -1403,6 +1411,7 @@ struct smb_version_operations smb30_operations = {
+ 	.clone_range = smb2_clone_range,
+ 	.validate_negotiate = smb3_validate_negotiate,
+ 	.wp_retry_size = smb2_wp_retry_size,
++	.dir_needs_close = smb2_dir_needs_close,
+ };
+ 
+ struct smb_version_values smb20_values = {
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 83619ebafd96..fc264574b0b3 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -2134,6 +2134,10 @@ SMB2_query_directory(const unsigned int xid, struct cifs_tcon *tcon,
+ 	rsp = (struct smb2_query_directory_rsp *)iov[0].iov_base;
+ 
+ 	if (rc) {
++		if (rc == -ENODATA && rsp->hdr.Status == STATUS_NO_MORE_FILES) {
++			srch_inf->endOfSearch = true;
++			rc = 0;
++		}
+ 		cifs_stats_fail_inc(tcon, SMB2_QUERY_DIRECTORY_HE);
+ 		goto qdir_exit;
+ 	}
+@@ -2171,11 +2175,6 @@ SMB2_query_directory(const unsigned int xid, struct cifs_tcon *tcon,
+ 	else
+ 		cifs_dbg(VFS, "illegal search buffer type\n");
+ 
+-	if (rsp->hdr.Status == STATUS_NO_MORE_FILES)
+-		srch_inf->endOfSearch = 1;
+-	else
+-		srch_inf->endOfSearch = 0;
+-
+ 	return rc;
+ 
+ qdir_exit:
