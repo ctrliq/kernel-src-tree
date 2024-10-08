@@ -1,0 +1,210 @@
+virtio_net: make all RX paths handle erors consistently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [virt] virtio-net: make all RX paths handle errors consistently (Jason Wang) [1032457]
+Rebuild_FUZZ: 97.30%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit f121159d72091f25afb22007c833e60a6845e912
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/f121159d.failed
+
+receive mergeable now handles errors internally.
+Do same for big and small packet paths, otherwise
+the logic is too hard to follow.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f121159d72091f25afb22007c833e60a6845e912)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index c6961d4ae5c6,916241d16c67..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -294,36 -299,120 +294,72 @@@ static struct sk_buff *page_to_skb(stru
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+ +static int receive_mergeable(struct receive_queue *rq, struct sk_buff *skb)
+++=======
++ static struct sk_buff *receive_small(void *buf, unsigned int len)
++ {
++ 	struct sk_buff * skb = buf;
++ 
++ 	len -= sizeof(struct virtio_net_hdr);
++ 	skb_trim(skb, len);
++ 
++ 	return skb;
++ }
++ 
++ static struct sk_buff *receive_big(struct net_device *dev,
++ 				   struct receive_queue *rq,
++ 				   void *buf,
++ 				   unsigned int len)
++ {
++ 	struct page *page = buf;
++ 	struct sk_buff *skb = page_to_skb(rq, page, 0, len, PAGE_SIZE);
++ 
++ 	if (unlikely(!skb))
++ 		goto err;
++ 
++ 	return skb;
++ 
++ err:
++ 	dev->stats.rx_dropped++;
++ 	give_pages(rq, page);
++ 	return NULL;
++ }
++ 
++ static struct sk_buff *receive_mergeable(struct net_device *dev,
++ 					 struct receive_queue *rq,
++ 					 void *buf,
++ 					 unsigned int len)
+++>>>>>>> f121159d7209 (virtio_net: make all RX paths handle erors consistently)
+  {
+ -	struct skb_vnet_hdr *hdr = buf;
+ -	int num_buf = hdr->mhdr.num_buffers;
+ -	struct page *page = virt_to_head_page(buf);
+ -	int offset = buf - page_address(page);
+ -	struct sk_buff *head_skb = page_to_skb(rq, page, offset, len,
+ -					       MERGE_BUFFER_LEN);
+ -	struct sk_buff *curr_skb = head_skb;
+ -
+ -	if (unlikely(!curr_skb))
+ -		goto err_skb;
+ +	struct skb_vnet_hdr *hdr = skb_vnet_hdr(skb);
+ +	struct page *page;
+ +	int num_buf, i, len;
+  
+ +	num_buf = hdr->mhdr.num_buffers;
+  	while (--num_buf) {
+ -		int num_skb_frags;
+ -
+ -		buf = virtqueue_get_buf(rq->vq, &len);
+ -		if (unlikely(!buf)) {
+ -			pr_debug("%s: rx error: %d buffers out of %d missing\n",
+ -				 dev->name, num_buf, hdr->mhdr.num_buffers);
+ -			dev->stats.rx_length_errors++;
+ -			goto err_buf;
+ +		i = skb_shinfo(skb)->nr_frags;
+ +		if (i >= MAX_SKB_FRAGS) {
+ +			pr_debug("%s: packet too long\n", skb->dev->name);
+ +			skb->dev->stats.rx_length_errors++;
+ +			return -EINVAL;
+  		}
+ -		if (unlikely(len > MERGE_BUFFER_LEN)) {
+ -			pr_debug("%s: rx error: merge buffer too long\n",
+ -				 dev->name);
+ -			len = MERGE_BUFFER_LEN;
+ +		page = virtqueue_get_buf(rq->vq, &len);
+ +		if (!page) {
+ +			pr_debug("%s: rx error: %d buffers missing\n",
+ +				 skb->dev->name, hdr->mhdr.num_buffers);
+ +			skb->dev->stats.rx_length_errors++;
+ +			return -EINVAL;
+  		}
+  
+ -		page = virt_to_head_page(buf);
+ -		--rq->num;
+ -
+ -		num_skb_frags = skb_shinfo(curr_skb)->nr_frags;
+ -		if (unlikely(num_skb_frags == MAX_SKB_FRAGS)) {
+ -			struct sk_buff *nskb = alloc_skb(0, GFP_ATOMIC);
+ +		if (len > PAGE_SIZE)
+ +			len = PAGE_SIZE;
+  
+ -			if (unlikely(!nskb))
+ -				goto err_skb;
+ -			if (curr_skb == head_skb)
+ -				skb_shinfo(curr_skb)->frag_list = nskb;
+ -			else
+ -				curr_skb->next = nskb;
+ -			curr_skb = nskb;
+ -			head_skb->truesize += nskb->truesize;
+ -			num_skb_frags = 0;
+ -		}
+ -		if (curr_skb != head_skb) {
+ -			head_skb->data_len += len;
+ -			head_skb->len += len;
+ -			head_skb->truesize += MERGE_BUFFER_LEN;
+ -		}
+ -		offset = buf - page_address(page);
+ -		if (skb_can_coalesce(curr_skb, num_skb_frags, page, offset)) {
+ -			put_page(page);
+ -			skb_coalesce_rx_frag(curr_skb, num_skb_frags - 1,
+ -					     len, MERGE_BUFFER_LEN);
+ -		} else {
+ -			skb_add_rx_frag(curr_skb, num_skb_frags, page,
+ -					offset, len, MERGE_BUFFER_LEN);
+ -		}
+ -	}
+ -
+ -	return head_skb;
+ +		set_skb_frag(skb, page, 0, &len);
+  
+ -err_skb:
+ -	put_page(page);
+ -	while (--num_buf) {
+ -		buf = virtqueue_get_buf(rq->vq, &len);
+ -		if (unlikely(!buf)) {
+ -			pr_debug("%s: rx error: %d buffers missing\n",
+ -				 dev->name, num_buf);
+ -			dev->stats.rx_length_errors++;
+ -			break;
+ -		}
+ -		page = virt_to_head_page(buf);
+ -		put_page(page);
+  		--rq->num;
+  	}
+ -err_buf:
+ -	dev->stats.rx_dropped++;
+ -	dev_kfree_skb(head_skb);
+ -	return NULL;
+ +	return 0;
+  }
+  
+  static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
+@@@ -345,24 -435,15 +380,36 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!vi->mergeable_rx_bufs && !vi->big_packets) {
+ +		skb = buf;
+ +		len -= sizeof(struct virtio_net_hdr);
+ +		skb_trim(skb, len);
+ +	} else {
+ +		page = buf;
+ +		skb = page_to_skb(rq, page, len);
+ +		if (unlikely(!skb)) {
+ +			dev->stats.rx_dropped++;
+ +			give_pages(rq, page);
+ +			return;
+ +		}
+ +		if (vi->mergeable_rx_bufs)
+ +			if (receive_mergeable(rq, skb)) {
+ +				dev_kfree_skb(skb);
+ +				return;
+ +			}
+ +	}
+++=======
++ 	if (vi->mergeable_rx_bufs)
++ 		skb = receive_mergeable(dev, rq, buf, len);
++ 	else if (vi->big_packets)
++ 		skb = receive_big(dev, rq, buf, len);
++ 	else
++ 		skb = receive_small(buf, len);
++ 
++ 	if (unlikely(!skb))
++ 		return;
+++>>>>>>> f121159d7209 (virtio_net: make all RX paths handle erors consistently)
+  
+  	hdr = skb_vnet_hdr(skb);
+  
+* Unmerged path drivers/net/virtio_net.c
