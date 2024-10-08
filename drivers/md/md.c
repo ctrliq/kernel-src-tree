@@ -75,8 +75,6 @@ static struct workqueue_struct *md_misc_wq;
 static int remove_and_add_spares(struct mddev *mddev,
 				 struct md_rdev *this);
 
-#define MD_BUG(x...) { printk("md: bug in file %s, line %d\n", __FILE__, __LINE__); md_print_devices(); }
-
 /*
  * Default number of read corrections we'll attempt on an rdev
  * before ejecting it from the array. We divide the read error
@@ -684,9 +682,6 @@ static inline sector_t calc_dev_sboffset(struct md_rdev *rdev)
 
 static int alloc_disk_sb(struct md_rdev * rdev)
 {
-	if (rdev->sb_page)
-		MD_BUG();
-
 	rdev->sb_page = alloc_page(GFP_KERNEL);
 	if (!rdev->sb_page) {
 		printk(KERN_ALERT "md: out of memory.\n");
@@ -786,10 +781,7 @@ EXPORT_SYMBOL_GPL(sync_page_io);
 static int read_disk_sb(struct md_rdev * rdev, int size)
 {
 	char b[BDEVNAME_SIZE];
-	if (!rdev->sb_page) {
-		MD_BUG();
-		return -EINVAL;
-	}
+
 	if (rdev->sb_loaded)
 		return 0;
 
@@ -2022,11 +2014,6 @@ static int bind_rdev_to_array(struct md_rdev * rdev, struct mddev * mddev)
 	char *s;
 	int err;
 
-	if (rdev->mddev) {
-		MD_BUG();
-		return -EINVAL;
-	}
-
 	/* prevent duplicates */
 	if (find_rdev(mddev, rdev->bdev->bd_dev))
 		return -EEXIST;
@@ -2108,10 +2095,7 @@ static void md_delayed_delete(struct work_struct *ws)
 static void unbind_rdev_from_array(struct md_rdev * rdev)
 {
 	char b[BDEVNAME_SIZE];
-	if (!rdev->mddev) {
-		MD_BUG();
-		return;
-	}
+
 	bd_unlink_disk_holder(rdev->bdev, rdev->mddev->gendisk);
 	list_del_rcu(&rdev->same_set);
 	printk(KERN_INFO "md: unbind<%s>\n", bdevname(rdev->bdev,b));
@@ -2156,8 +2140,6 @@ static void unlock_rdev(struct md_rdev *rdev)
 {
 	struct block_device *bdev = rdev->bdev;
 	rdev->bdev = NULL;
-	if (!bdev)
-		MD_BUG();
 	blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
 }
 
@@ -2166,10 +2148,9 @@ void md_autodetect_dev(dev_t dev);
 static void export_rdev(struct md_rdev * rdev)
 {
 	char b[BDEVNAME_SIZE];
+
 	printk(KERN_INFO "md: export_rdev(%s)\n",
 		bdevname(rdev->bdev,b));
-	if (rdev->mddev)
-		MD_BUG();
 	md_rdev_clear(rdev);
 #ifndef MODULE
 	if (test_bit(AutoDetected, &rdev->flags))
@@ -2436,15 +2417,12 @@ repeat:
 		mddev->can_decrease_events = nospares;
 	}
 
-	if (!mddev->events) {
-		/*
-		 * oops, this 64-bit counter should never wrap.
-		 * Either we are in around ~1 trillion A.C., assuming
-		 * 1 reboot per second, or we have a bug:
-		 */
-		MD_BUG();
-		mddev->events --;
-	}
+	/*
+	 * This 64-bit counter should never wrap.
+	 * Either we are in around ~1 trillion A.C., assuming
+	 * 1 reboot per second, or we have a bug...
+	 */
+	WARN_ON(mddev->events == 0);
 
 	rdev_for_each(rdev, mddev) {
 		if (rdev->badblocks.changed)
@@ -6830,11 +6808,6 @@ void md_unregister_thread(struct md_thread **threadp)
 
 void md_error(struct mddev *mddev, struct md_rdev *rdev)
 {
-	if (!mddev) {
-		MD_BUG();
-		return;
-	}
-
 	if (!rdev || test_bit(Faulty, &rdev->flags))
 		return;
 
@@ -6894,13 +6867,7 @@ static void status_resync(struct seq_file *seq, struct mddev * mddev)
 	else
 		max_sectors = mddev->dev_sectors;
 
-	/*
-	 * Should not happen.
-	 */
-	if (!max_sectors) {
-		MD_BUG();
-		return;
-	}
+	WARN_ON(max_sectors == 0);
 	/* Pick 'scale' such that (resync>>scale)*1000 will fit
 	 * in a sector_t, and (max_sectors>>scale) will fit in a
 	 * u32, as those are the requirements for sector_div.
@@ -8654,10 +8621,9 @@ static void autostart_arrays(int part)
 		if (IS_ERR(rdev))
 			continue;
 
-		if (test_bit(Faulty, &rdev->flags)) {
-			MD_BUG();
+		if (test_bit(Faulty, &rdev->flags))
 			continue;
-		}
+
 		set_bit(AutoDetected, &rdev->flags);
 		list_add(&rdev->same_set, &pending_raid_disks);
 		i_passed++;
