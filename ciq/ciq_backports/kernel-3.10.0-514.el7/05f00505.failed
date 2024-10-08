@@ -1,0 +1,148 @@
+ipvs: fix crash if scheduler is changed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 05f00505a89acd21f5d0d20f5797dfbc4cf85243
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/05f00505.failed
+
+I overlooked the svc->sched_data usage from schedulers
+when the services were converted to RCU in 3.10. Now
+the rare ipvsadm -E command can change the scheduler
+but due to the reverse order of ip_vs_bind_scheduler
+and ip_vs_unbind_scheduler we provide new sched_data
+to the old scheduler resulting in a crash.
+
+To fix it without changing the scheduler methods we
+have to use synchronize_rcu() only for the editing case.
+It means all svc->scheduler readers should expect a
+NULL value. To avoid breakage for the service listing
+and ipvsadm -R we can use the "none" name to indicate
+that scheduler is not assigned, a state when we drop
+new connections.
+
+	Reported-by: Alexander Vasiliev <a.vasylev@404-group.com>
+Fixes: ceec4c381681 ("ipvs: convert services to rcu")
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit 05f00505a89acd21f5d0d20f5797dfbc4cf85243)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_core.c
+#	net/netfilter/ipvs/ip_vs_ctl.c
+diff --cc net/netfilter/ipvs/ip_vs_core.c
+index f9e5f557d613,38fbc194b9cb..000000000000
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@@ -305,7 -319,13 +305,17 @@@ ip_vs_sched_persist(struct ip_vs_servic
+  		 * return *ignored=0 i.e. ICMP and NF_DROP
+  		 */
+  		sched = rcu_dereference(svc->scheduler);
+++<<<<<<< HEAD
+ +		dest = sched->schedule(svc, skb);
+++=======
++ 		if (sched) {
++ 			/* read svc->sched_data after svc->scheduler */
++ 			smp_rmb();
++ 			dest = sched->schedule(svc, skb, iph);
++ 		} else {
++ 			dest = NULL;
++ 		}
+++>>>>>>> 05f00505a89a (ipvs: fix crash if scheduler is changed)
+  		if (!dest) {
+  			IP_VS_DBG(1, "p-schedule: no dest found.\n");
+  			kfree(param.pe_data);
+@@@ -452,7 -473,13 +462,17 @@@ ip_vs_schedule(struct ip_vs_service *sv
+  	}
+  
+  	sched = rcu_dereference(svc->scheduler);
+++<<<<<<< HEAD
+ +	dest = sched->schedule(svc, skb);
+++=======
++ 	if (sched) {
++ 		/* read svc->sched_data after svc->scheduler */
++ 		smp_rmb();
++ 		dest = sched->schedule(svc, skb, iph);
++ 	} else {
++ 		dest = NULL;
++ 	}
+++>>>>>>> 05f00505a89a (ipvs: fix crash if scheduler is changed)
+  	if (dest == NULL) {
+  		IP_VS_DBG(1, "Schedule: no dest found.\n");
+  		return NULL;
+diff --cc net/netfilter/ipvs/ip_vs_ctl.c
+index 13c85fbc0b3a,24c554201a76..000000000000
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@@ -2462,8 -2442,11 +2478,14 @@@ static voi
+  ip_vs_copy_service(struct ip_vs_service_entry *dst, struct ip_vs_service *src)
+  {
+  	struct ip_vs_scheduler *sched;
+++<<<<<<< HEAD
+++=======
++ 	struct ip_vs_kstats kstats;
++ 	char *sched_name;
+++>>>>>>> 05f00505a89a (ipvs: fix crash if scheduler is changed)
+  
+  	sched = rcu_dereference_protected(src->scheduler, 1);
++ 	sched_name = sched ? sched->name : "none";
+  	dst->protocol = src->protocol;
+  	dst->addr = src->addr.ip;
+  	dst->port = src->port;
+@@@ -2894,6 -2909,8 +2916,11 @@@ static int ip_vs_genl_fill_service(stru
+  	struct nlattr *nl_service;
+  	struct ip_vs_flags flags = { .flags = svc->flags,
+  				     .mask = ~0 };
+++<<<<<<< HEAD
+++=======
++ 	struct ip_vs_kstats kstats;
++ 	char *sched_name;
+++>>>>>>> 05f00505a89a (ipvs: fix crash if scheduler is changed)
+  
+  	nl_service = nla_nest_start(skb, IPVS_CMD_ATTR_SERVICE);
+  	if (!nl_service)
+* Unmerged path net/netfilter/ipvs/ip_vs_core.c
+* Unmerged path net/netfilter/ipvs/ip_vs_ctl.c
+diff --git a/net/netfilter/ipvs/ip_vs_sched.c b/net/netfilter/ipvs/ip_vs_sched.c
+index 4dbcda6258bc..21b6b515a09c 100644
+--- a/net/netfilter/ipvs/ip_vs_sched.c
++++ b/net/netfilter/ipvs/ip_vs_sched.c
+@@ -74,7 +74,7 @@ void ip_vs_unbind_scheduler(struct ip_vs_service *svc,
+ 
+ 	if (sched->done_service)
+ 		sched->done_service(svc);
+-	/* svc->scheduler can not be set to NULL */
++	/* svc->scheduler can be set to NULL only by caller */
+ }
+ 
+ 
+@@ -148,21 +148,21 @@ void ip_vs_scheduler_put(struct ip_vs_scheduler *scheduler)
+ 
+ void ip_vs_scheduler_err(struct ip_vs_service *svc, const char *msg)
+ {
+-	struct ip_vs_scheduler *sched;
++	struct ip_vs_scheduler *sched = rcu_dereference(svc->scheduler);
++	char *sched_name = sched ? sched->name : "none";
+ 
+-	sched = rcu_dereference(svc->scheduler);
+ 	if (svc->fwmark) {
+ 		IP_VS_ERR_RL("%s: FWM %u 0x%08X - %s\n",
+-			     sched->name, svc->fwmark, svc->fwmark, msg);
++			     sched_name, svc->fwmark, svc->fwmark, msg);
+ #ifdef CONFIG_IP_VS_IPV6
+ 	} else if (svc->af == AF_INET6) {
+ 		IP_VS_ERR_RL("%s: %s [%pI6c]:%d - %s\n",
+-			     sched->name, ip_vs_proto_name(svc->protocol),
++			     sched_name, ip_vs_proto_name(svc->protocol),
+ 			     &svc->addr.in6, ntohs(svc->port), msg);
+ #endif
+ 	} else {
+ 		IP_VS_ERR_RL("%s: %s %pI4:%d - %s\n",
+-			     sched->name, ip_vs_proto_name(svc->protocol),
++			     sched_name, ip_vs_proto_name(svc->protocol),
+ 			     &svc->addr.ip, ntohs(svc->port), msg);
+ 	}
+ }
