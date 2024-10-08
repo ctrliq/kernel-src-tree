@@ -1,0 +1,346 @@
+usb: block suspension of superspeed port while hispeed peer is active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [usb] block suspension of superspeed port while hispeed peer is active (Don Zickus) [1110939]
+Rebuild_FUZZ: 96.24%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7ad3c47088f9faec463f5226e5e968a5c3b0e593
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/7ad3c470.failed
+
+ClearPortFeature(PORT_POWER) on a usb3 port places the port in either a
+DSPORT.Powered-off-detect / DSPORT.Powered-off-reset loop, or the
+DSPORT.Powered-off state.  There is no way to ensure that RX
+terminations will persist in this state, so it is possible a device will
+degrade to its usb2 connection.  Prevent this by blocking power-off of a
+usb3 port while its usb2 peer is active, and powering on a usb3 port
+before its usb2 peer.
+
+By default the latency between peer power-on events is 0.  In order for
+the device to not see usb2 active while usb3 is still powering up inject
+the hub recommended power_on_good delay.  In support of satisfying the
+power_on_good delay outside of hub_power_on() refactor the places where
+the delay is consumed to call a new hub_power_on_good_delay() helper.
+
+Finally, because this introduces several new checks for whether a port
+is_superspeed, cache that disctinction at port creation so that we don't
+need to keep looking up the parent hub device.
+
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+[alan]: add a 'superspeed' flag to the port
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 7ad3c47088f9faec463f5226e5e968a5c3b0e593)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/hub.c
+#	drivers/usb/core/port.c
+diff --cc drivers/usb/core/hub.c
+index 2f5db8b4a93a,e492bca74425..000000000000
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@@ -1041,9 -1043,12 +1027,18 @@@ static void hub_activate(struct usb_hu
+  		 * for HUB_POST_RESET, but it's easier not to.
+  		 */
+  		if (type == HUB_INIT) {
+++<<<<<<< HEAD
+ +			delay = hub_power_on(hub, false);
+ +			PREPARE_DELAYED_WORK(&hub->init_work, hub_init_func2);
+ +			schedule_delayed_work(&hub->init_work,
+++=======
++ 			unsigned delay = hub_power_on_good_delay(hub);
++ 
++ 			hub_power_on(hub, false);
++ 			INIT_DELAYED_WORK(&hub->init_work, hub_init_func2);
++ 			queue_delayed_work(system_power_efficient_wq,
++ 					&hub->init_work,
+++>>>>>>> 7ad3c47088f9 (usb: block suspension of superspeed port while hispeed peer is active)
+  					msecs_to_jiffies(delay));
+  
+  			/* Suppress autosuspend until init is done */
+diff --cc drivers/usb/core/port.c
+index 2898ed18ec97,827b0d38f73d..000000000000
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@@ -152,9 -172,215 +172,218 @@@ struct device_type usb_port_device_typ
+  	.pm =		&usb_port_pm_ops,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct device_driver usb_port_driver = {
++ 	.name = "usb",
++ 	.owner = THIS_MODULE,
++ };
++ 
++ static int link_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	struct usb_port *ss_port, *hs_port;
++ 	int rc;
++ 
++ 	if (left->peer == right && right->peer == left)
++ 		return 0;
++ 
++ 	if (left->peer || right->peer) {
++ 		struct usb_port *lpeer = left->peer;
++ 		struct usb_port *rpeer = right->peer;
++ 
++ 		WARN(1, "failed to peer %s and %s (%s -> %p) (%s -> %p)\n",
++ 			dev_name(&left->dev), dev_name(&right->dev),
++ 			dev_name(&left->dev), lpeer,
++ 			dev_name(&right->dev), rpeer);
++ 		return -EBUSY;
++ 	}
++ 
++ 	rc = sysfs_create_link(&left->dev.kobj, &right->dev.kobj, "peer");
++ 	if (rc)
++ 		return rc;
++ 	rc = sysfs_create_link(&right->dev.kobj, &left->dev.kobj, "peer");
++ 	if (rc) {
++ 		sysfs_remove_link(&left->dev.kobj, "peer");
++ 		return rc;
++ 	}
++ 
++ 	/*
++ 	 * We need to wake the HiSpeed port to make sure we don't race
++ 	 * setting ->peer with usb_port_runtime_suspend().  Otherwise we
++ 	 * may miss a suspend event for the SuperSpeed port.
++ 	 */
++ 	if (left->is_superspeed) {
++ 		ss_port = left;
++ 		WARN_ON(right->is_superspeed);
++ 		hs_port = right;
++ 	} else {
++ 		ss_port = right;
++ 		WARN_ON(!right->is_superspeed);
++ 		hs_port = left;
++ 	}
++ 	pm_runtime_get_sync(&hs_port->dev);
++ 
++ 	left->peer = right;
++ 	right->peer = left;
++ 
++ 	/*
++ 	 * The SuperSpeed reference is dropped when the HiSpeed port in
++ 	 * this relationship suspends, i.e. when it is safe to allow a
++ 	 * SuperSpeed connection to drop since there is no risk of a
++ 	 * device degrading to its powered-off HiSpeed connection.
++ 	 *
++ 	 * Also, drop the HiSpeed ref taken above.
++ 	 */
++ 	pm_runtime_get_sync(&ss_port->dev);
++ 	pm_runtime_put(&hs_port->dev);
++ 
++ 	return 0;
++ }
++ 
++ static void link_peers_report(struct usb_port *left, struct usb_port *right)
++ {
++ 	int rc;
++ 
++ 	rc = link_peers(left, right);
++ 	if (rc == 0) {
++ 		dev_dbg(&left->dev, "peered to %s\n", dev_name(&right->dev));
++ 	} else {
++ 		dev_warn(&left->dev, "failed to peer to %s (%d)\n",
++ 				dev_name(&right->dev), rc);
++ 		pr_warn_once("usb: port power management may be unreliable\n");
++ 	}
++ }
++ 
++ static void unlink_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	struct usb_port *ss_port, *hs_port;
++ 
++ 	WARN(right->peer != left || left->peer != right,
++ 			"%s and %s are not peers?\n",
++ 			dev_name(&left->dev), dev_name(&right->dev));
++ 
++ 	/*
++ 	 * We wake the HiSpeed port to make sure we don't race its
++ 	 * usb_port_runtime_resume() event which takes a SuperSpeed ref
++ 	 * when ->peer is !NULL.
++ 	 */
++ 	if (left->is_superspeed) {
++ 		ss_port = left;
++ 		hs_port = right;
++ 	} else {
++ 		ss_port = right;
++ 		hs_port = left;
++ 	}
++ 
++ 	pm_runtime_get_sync(&hs_port->dev);
++ 
++ 	sysfs_remove_link(&left->dev.kobj, "peer");
++ 	right->peer = NULL;
++ 	sysfs_remove_link(&right->dev.kobj, "peer");
++ 	left->peer = NULL;
++ 
++ 	/* Drop the SuperSpeed ref held on behalf of the active HiSpeed port */
++ 	pm_runtime_put(&ss_port->dev);
++ 
++ 	/* Drop the ref taken above */
++ 	pm_runtime_put(&hs_port->dev);
++ }
++ 
++ /*
++  * For each usb hub device in the system check to see if it is in the
++  * peer domain of the given port_dev, and if it is check to see if it
++  * has a port that matches the given port by location
++  */
++ static int match_location(struct usb_device *peer_hdev, void *p)
++ {
++ 	int port1;
++ 	struct usb_hcd *hcd, *peer_hcd;
++ 	struct usb_port *port_dev = p, *peer;
++ 	struct usb_hub *peer_hub = usb_hub_to_struct_hub(peer_hdev);
++ 	struct usb_device *hdev = to_usb_device(port_dev->dev.parent->parent);
++ 
++ 	if (!peer_hub)
++ 		return 0;
++ 
++ 	hcd = bus_to_hcd(hdev->bus);
++ 	peer_hcd = bus_to_hcd(peer_hdev->bus);
++ 	/* peer_hcd is provisional until we verify it against the known peer */
++ 	if (peer_hcd != hcd->shared_hcd)
++ 		return 0;
++ 
++ 	for (port1 = 1; port1 <= peer_hdev->maxchild; port1++) {
++ 		peer = peer_hub->ports[port1 - 1];
++ 		if (peer && peer->location == port_dev->location) {
++ 			link_peers_report(port_dev, peer);
++ 			return 1; /* done */
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Find the peer port either via explicit platform firmware "location"
++  * data, the peer hcd for root hubs, or the upstream peer relationship
++  * for all other hubs.
++  */
++ static void find_and_link_peer(struct usb_hub *hub, int port1)
++ {
++ 	struct usb_port *port_dev = hub->ports[port1 - 1], *peer;
++ 	struct usb_device *hdev = hub->hdev;
++ 	struct usb_device *peer_hdev;
++ 	struct usb_hub *peer_hub;
++ 
++ 	/*
++ 	 * If location data is available then we can only peer this port
++ 	 * by a location match, not the default peer (lest we create a
++ 	 * situation where we need to go back and undo a default peering
++ 	 * when the port is later peered by location data)
++ 	 */
++ 	if (port_dev->location) {
++ 		/* we link the peer in match_location() if found */
++ 		usb_for_each_dev(port_dev, match_location);
++ 		return;
++ 	} else if (!hdev->parent) {
++ 		struct usb_hcd *hcd = bus_to_hcd(hdev->bus);
++ 		struct usb_hcd *peer_hcd = hcd->shared_hcd;
++ 
++ 		if (!peer_hcd)
++ 			return;
++ 
++ 		peer_hdev = peer_hcd->self.root_hub;
++ 	} else {
++ 		struct usb_port *upstream;
++ 		struct usb_device *parent = hdev->parent;
++ 		struct usb_hub *parent_hub = usb_hub_to_struct_hub(parent);
++ 
++ 		if (!parent_hub)
++ 			return;
++ 
++ 		upstream = parent_hub->ports[hdev->portnum - 1];
++ 		if (!upstream || !upstream->peer)
++ 			return;
++ 
++ 		peer_hdev = upstream->peer->child;
++ 	}
++ 
++ 	peer_hub = usb_hub_to_struct_hub(peer_hdev);
++ 	if (!peer_hub || port1 > peer_hdev->maxchild)
++ 		return;
++ 
++ 	/*
++ 	 * we found a valid default peer, last check is to make sure it
++ 	 * does not have location data
++ 	 */
++ 	peer = peer_hub->ports[port1 - 1];
++ 	if (peer && peer->location == 0)
++ 		link_peers_report(port_dev, peer);
++ }
++ 
+++>>>>>>> 7ad3c47088f9 (usb: block suspension of superspeed port while hispeed peer is active)
+  int usb_hub_create_port_device(struct usb_hub *hub, int port1)
+  {
+ -	struct usb_port *port_dev;
+ +	struct usb_port *port_dev = NULL;
+  	int retval;
+  
+  	port_dev = kzalloc(sizeof(*port_dev), GFP_KERNEL);
+@@@ -169,8 -395,11 +398,16 @@@
+  	port_dev->dev.parent = hub->intfdev;
+  	port_dev->dev.groups = port_dev_group;
+  	port_dev->dev.type = &usb_port_device_type;
+++<<<<<<< HEAD
+ +	dev_set_name(&port_dev->dev, "port%d", port1);
+ +
+++=======
++ 	port_dev->dev.driver = &usb_port_driver;
++ 	if (hub_is_superspeed(hub->hdev))
++ 		port_dev->is_superspeed = 1;
++ 	dev_set_name(&port_dev->dev, "%s-port%d", dev_name(&hub->hdev->dev),
++ 			port1);
+++>>>>>>> 7ad3c47088f9 (usb: block suspension of superspeed port while hispeed peer is active)
+  	retval = device_register(&port_dev->dev);
+  	if (retval)
+  		goto error_register;
+* Unmerged path drivers/usb/core/hub.c
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index e10d5b4e1587..1ec25a2bca80 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -87,6 +87,7 @@ struct usb_hub {
+  * @port_owner: port's owner
+  * @connect_type: port's connect type
+  * @portnum: port index num based one
++ * @is_superspeed cache super-speed status
+  */
+ struct usb_port {
+ 	struct usb_device *child;
+@@ -94,6 +95,7 @@ struct usb_port {
+ 	struct dev_state *port_owner;
+ 	enum usb_port_connect_type connect_type;
+ 	u8 portnum;
++	unsigned int is_superspeed:1;
+ };
+ 
+ #define to_usb_port(_dev) \
+@@ -121,6 +123,19 @@ static inline bool hub_is_port_power_switchable(struct usb_hub *hub)
+ 	return (le16_to_cpu(hcs) & HUB_CHAR_LPSM) < HUB_CHAR_NO_LPSM;
+ }
+ 
++static inline int hub_is_superspeed(struct usb_device *hdev)
++{
++	return hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS;
++}
++
++static inline unsigned hub_power_on_good_delay(struct usb_hub *hub)
++{
++	unsigned delay = hub->descriptor->bPwrOn2PwrGood * 2;
++
++	/* Wait at least 100 msec for power to become stable */
++	return max(delay, 100U);
++}
++
+ static inline int hub_port_debounce_be_connected(struct usb_hub *hub,
+ 		int port1)
+ {
+* Unmerged path drivers/usb/core/port.c
