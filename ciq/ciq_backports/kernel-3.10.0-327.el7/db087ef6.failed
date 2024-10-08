@@ -1,0 +1,182 @@
+uprobes/x86: Make arch_uretprobe_is_alive(RP_CHECK_CALL) more clever
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Make arch_uretprobe_is_alive(RP_CHECK_CALL) more clever (Oleg Nesterov) [1207373]
+Rebuild_FUZZ: 96.97%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit db087ef69a2b155ae001665bf0b3806abde7ee34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/db087ef6.failed
+
+The previous change documents that cleanup_return_instances()
+can't always detect the dead frames, the stack can grow. But
+there is one special case which imho worth fixing:
+arch_uretprobe_is_alive() can return true when the stack didn't
+actually grow, but the next "call" insn uses the already
+invalidated frame.
+
+Test-case:
+
+	#include <stdio.h>
+	#include <setjmp.h>
+
+	jmp_buf jmp;
+	int nr = 1024;
+
+	void func_2(void)
+	{
+		if (--nr == 0)
+			return;
+		longjmp(jmp, 1);
+	}
+
+	void func_1(void)
+	{
+		setjmp(jmp);
+		func_2();
+	}
+
+	int main(void)
+	{
+		func_1();
+		return 0;
+	}
+
+If you ret-probe func_1() and func_2() prepare_uretprobe() hits
+the MAX_URETPROBE_DEPTH limit and "return" from func_2() is not
+reported.
+
+When we know that the new call is not chained, we can do the
+more strict check. In this case "sp" points to the new ret-addr,
+so every frame which uses the same "sp" must be dead. The only
+complication is that arch_uretprobe_is_alive() needs to know was
+it chained or not, so we add the new RP_CHECK_CHAIN_CALL enum
+and change prepare_uretprobe() to pass RP_CHECK_CALL only if
+!chained.
+
+Note: arch_uretprobe_is_alive() could also re-read *sp and check
+if this word is still trampoline_vaddr. This could obviously
+improve the logic, but I would like to avoid another
+copy_from_user() especially in the case when we can't avoid the
+false "alive == T" positives.
+
+	Tested-by: Pratyush Anand <panand@redhat.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Acked-by: Anton Arapov <arapov@gmail.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20150721134028.GA4786@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit db087ef69a2b155ae001665bf0b3806abde7ee34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/uprobes.c
+#	include/linux/uprobes.h
+#	kernel/events/uprobes.c
+diff --cc arch/x86/kernel/uprobes.c
+index 5d1cbfe4ae58,bf4db6eaec8f..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -926,3 -985,12 +926,15 @@@ arch_uretprobe_hijack_return_addr(unsig
+  
+  	return -1;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool arch_uretprobe_is_alive(struct return_instance *ret, enum rp_check ctx,
++ 				struct pt_regs *regs)
++ {
++ 	if (ctx == RP_CHECK_CALL) /* sp was just decremented by "call" insn */
++ 		return regs->sp < ret->stack;
++ 	else
++ 		return regs->sp <= ret->stack;
++ }
+++>>>>>>> db087ef69a2b (uprobes/x86: Make arch_uretprobe_is_alive(RP_CHECK_CALL) more clever)
+diff --cc include/linux/uprobes.h
+index 13a7f13ff0d3,0bdc72f36905..000000000000
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@@ -75,31 -90,26 +75,42 @@@ struct uprobe_task 
+  
+  	struct return_instance		*return_instances;
+  	unsigned int			depth;
+ -};
+ +	struct uprobe			*active_uprobe;
+  
+ -struct return_instance {
+ -	struct uprobe		*uprobe;
+ -	unsigned long		func;
+ -	unsigned long		stack;		/* stack pointer */
+ -	unsigned long		orig_ret_vaddr; /* original return address */
+ -	bool			chained;	/* true, if instance is nested */
+ +	unsigned long			xol_vaddr;
+ +	unsigned long			vaddr;
+ +};
+  
+ -	struct return_instance	*next;		/* keep as stack */
+ +/*
+ + * On a breakpoint hit, thread contests for a slot.  It frees the
+ + * slot after singlestep. Currently a fixed number of slots are
+ + * allocated.
+ + */
+ +struct xol_area {
+ +	wait_queue_head_t 	wq;		/* if all slots are busy */
+ +	atomic_t 		slot_count;	/* number of in-use slots */
+ +	unsigned long 		*bitmap;	/* 0 = free slot */
+ +	struct page 		*page;
+ +
+ +	/*
+ +	 * We keep the vma's vm_start rather than a pointer to the vma
+ +	 * itself.  The probed process or a naughty kernel module could make
+ +	 * the vma go away, and we must handle that reasonably gracefully.
+ +	 */
+ +	unsigned long 		vaddr;		/* Page(s) of instruction slots */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum rp_check {
++ 	RP_CHECK_CALL,
++ 	RP_CHECK_CHAIN_CALL,
++ 	RP_CHECK_RET,
++ };
++ 
++ struct xol_area;
++ 
+++>>>>>>> db087ef69a2b (uprobes/x86: Make arch_uretprobe_is_alive(RP_CHECK_CALL) more clever)
+  struct uprobes_state {
+  	struct xol_area		*xol_area;
+  };
+diff --cc kernel/events/uprobes.c
+index 969436d08697,0f370ef57a02..000000000000
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@@ -1466,10 -1511,13 +1466,17 @@@ static unsigned long get_trampoline_vad
+  	return trampoline_vaddr;
+  }
+  
+- static void cleanup_return_instances(struct uprobe_task *utask, struct pt_regs *regs)
++ static void cleanup_return_instances(struct uprobe_task *utask, bool chained,
++ 					struct pt_regs *regs)
+  {
+  	struct return_instance *ri = utask->return_instances;
+++<<<<<<< HEAD
+ +	while (ri && !arch_uretprobe_is_alive(ri, regs)) {
+++=======
++ 	enum rp_check ctx = chained ? RP_CHECK_CHAIN_CALL : RP_CHECK_CALL;
++ 
++ 	while (ri && !arch_uretprobe_is_alive(ri, ctx, regs)) {
+++>>>>>>> db087ef69a2b (uprobes/x86: Make arch_uretprobe_is_alive(RP_CHECK_CALL) more clever)
+  		ri = free_ret_instance(ri);
+  		utask->depth--;
+  	}
+* Unmerged path arch/x86/kernel/uprobes.c
+* Unmerged path include/linux/uprobes.h
+* Unmerged path kernel/events/uprobes.c
