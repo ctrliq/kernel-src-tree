@@ -838,7 +838,10 @@ struct ib_cq *mlx5_ib_create_cq(struct ib_device *ibdev,
 
 	mlx5_ib_dbg(dev, "cqn 0x%x\n", cq->mcq.cqn);
 	cq->mcq.irqn = irqn;
-	cq->mcq.comp  = mlx5_ib_cq_comp;
+	if (context)
+		cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
+	else
+		cq->mcq.comp  = mlx5_ib_cq_comp;
 	cq->mcq.event = mlx5_ib_cq_event;
 
 	if (context)
