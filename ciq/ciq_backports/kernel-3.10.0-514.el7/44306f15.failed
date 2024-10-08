@@ -1,0 +1,174 @@
+IB/hfi1: Reduce kernel context pio buffer allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Jianxin Xiong <jianxin.xiong@intel.com>
+commit 44306f15f0575bff67a923c28aff6e7b2d33021f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/44306f15.failed
+
+The pio buffers were pooled evenly among all kernel contexts and
+user contexts. However, the demand from kernel contexts is much
+lower than user contexts. This patch reduces the allocation for
+kernel contexts and thus makes more credits available for PSM,
+helping performance. This is especially useful on high core-count
+systems where large numbers of contexts are used.
+
+A new context type SC_VL15 is added to distinguish the context used
+for VL15 from other kernel contexts. The reason is that VL15 needs
+to support 2KB sized packet while other kernel contexts need only
+support packets up to the size determined by "piothreshold", which
+has a default value of 256.
+
+The new allocation method allows triple buffering of largest pio
+packets configured for these contexts. This is sufficient to maintain
+verbs performance. The largest pio packet size is 2048B for VL15
+and "piothreshold" for other kernel contexts. A cap is applied to
+"piothreshold" to avoid excessive buffer allocation.
+
+The special case that SDMA is disable is handled differently. In
+that case, the original pooling allocation is used to better
+support the much higher pio traffic.
+
+Notice that if adaptive pio is disabled (piothreshold==0), the pio
+buffer size doesn't matter for non-VL15 kernel send contexts when
+SDMA is enabled because pio is not used at all on these contexts
+and thus the new allocation is still valid. If SDMA is disabled then
+pooling allocation is used as mentioned in previous paragraph.
+
+Adjustment is also made to the calculation of the credit return
+threshold for the kernel contexts. Instead of purely based on
+the MTU size, a percentage based threshold is also considered and
+the smaller one of the two is chosen. This is necessary to ensure
+that with the reduced buffer allocation credits are returned in
+time to avoid unnecessary stall in the send path.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Mark Debbage <mark.debbage@intel.com>
+	Reviewed-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Jianxin Xiong <jianxin.xiong@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 44306f15f0575bff67a923c28aff6e7b2d33021f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+#	drivers/staging/hfi1/pio.c
+diff --cc drivers/staging/hfi1/chip.c
+index 689fb76865d1,96badb49da9e..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -9675,13 -9646,17 +9676,27 @@@ static void set_send_length(struct hfi1
+  	/* adjust kernel credit return thresholds based on new MTUs */
+  	/* all kernel receive contexts have the same hdrqentsize */
+  	for (i = 0; i < ppd->vls_supported; i++) {
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+ +		sc_set_cr_threshold(dd->vld[i].sc,
+ +			sc_mtu_to_threshold(dd->vld[i].sc, dd->vld[i].mtu,
+ +				dd->rcd[0]->rcvhdrqentsize));
+ +	}
+ +	sc_set_cr_threshold(dd->vld[15].sc,
+ +		sc_mtu_to_threshold(dd->vld[15].sc, dd->vld[15].mtu,
+ +			dd->rcd[0]->rcvhdrqentsize));
+++=======
++ 		thres = min(sc_percent_to_threshold(dd->vld[i].sc, 50),
++ 			    sc_mtu_to_threshold(dd->vld[i].sc,
++ 						dd->vld[i].mtu,
++ 						dd->rcd[0]->rcvhdrqentsize));
++ 		sc_set_cr_threshold(dd->vld[i].sc, thres);
++ 	}
++ 	thres = min(sc_percent_to_threshold(dd->vld[15].sc, 50),
++ 		    sc_mtu_to_threshold(dd->vld[15].sc,
++ 					dd->vld[15].mtu,
++ 					dd->rcd[0]->rcvhdrqentsize));
++ 	sc_set_cr_threshold(dd->vld[15].sc, thres);
+++>>>>>>> 44306f15f057 (IB/hfi1: Reduce kernel context pio buffer allocation):drivers/staging/rdma/hfi1/chip.c
+  
+  	/* Adjust maximum MTU for the port in DC */
+  	dcmtu = maxvlmtu == 10240 ? DCC_CFG_PORT_MTU_CAP_10240 :
+diff --cc drivers/staging/hfi1/pio.c
+index d2fa2da3517d,c67b9ad3fcf4..000000000000
+--- a/drivers/staging/hfi1/pio.c
++++ b/drivers/staging/hfi1/pio.c
+@@@ -312,7 -335,7 +336,11 @@@ int init_sc_pools_and_sizes(struct hfi1
+  		if (i == SC_ACK) {
+  			count = dd->n_krcv_queues;
+  		} else if (i == SC_KERNEL) {
+++<<<<<<< HEAD:drivers/staging/hfi1/pio.c
+ +			count = num_vls + 1 /* VL15 */;
+++=======
++ 			count = INIT_SC_PER_VL * num_vls;
+++>>>>>>> 44306f15f057 (IB/hfi1: Reduce kernel context pio buffer allocation):drivers/staging/rdma/hfi1/pio.c
+  		} else if (count == SCC_PER_CPU) {
+  			count = dd->num_rcv_contexts - dd->n_krcv_queues;
+  		} else if (count < 0) {
+@@@ -797,9 -823,11 +828,11 @@@ struct send_context *sc_alloc(struct hf
+  		thresh = sc_percent_to_threshold(sc, 50);
+  	} else if (type == SC_USER) {
+  		thresh = sc_percent_to_threshold(sc,
+ -						 user_credit_return_threshold);
+ +				user_credit_return_threshold);
+  	} else { /* kernel */
+- 		thresh = sc_mtu_to_threshold(sc, hfi1_max_mtu, hdrqentsize);
++ 		thresh = min(sc_percent_to_threshold(sc, 50),
++ 			     sc_mtu_to_threshold(sc, hfi1_max_mtu,
++ 						 hdrqentsize));
+  	}
+  	reg = thresh << SC(CREDIT_CTRL_THRESHOLD_SHIFT);
+  	/* add in early return */
+@@@ -1691,10 -1721,216 +1725,10 @@@ done
+  int init_pervl_scs(struct hfi1_devdata *dd)
+  {
+  	int i;
+ -	u64 mask, all_vl_mask = (u64)0x80ff; /* VLs 0-7, 15 */
+ -	u64 data_vls_mask = (u64)0x00ff; /* VLs 0-7 */
+ +	u64 mask, all_vl_mask = (u64) 0x80ff; /* VLs 0-7, 15 */
+  	u32 ctxt;
+ -	struct hfi1_pportdata *ppd = dd->pport;
+  
+- 	dd->vld[15].sc = sc_alloc(dd, SC_KERNEL,
++ 	dd->vld[15].sc = sc_alloc(dd, SC_VL15,
+  				  dd->rcd[0]->rcvhdrqentsize, dd->node);
+  	if (!dd->vld[15].sc)
+  		goto nomem;
+* Unmerged path drivers/staging/hfi1/chip.c
+diff --git a/drivers/staging/hfi1/diag.c b/drivers/staging/hfi1/diag.c
+index 525941d8b049..20bd6a7e89a8 100644
+--- a/drivers/staging/hfi1/diag.c
++++ b/drivers/staging/hfi1/diag.c
+@@ -415,7 +415,8 @@ static ssize_t diagpkt_send(struct diag_pkt *dp)
+ 		goto bail;
+ 	}
+ 	/* can only use kernel contexts */
+-	if (dd->send_contexts[dp->sw_index].type != SC_KERNEL) {
++	if (dd->send_contexts[dp->sw_index].type != SC_KERNEL &&
++	    dd->send_contexts[dp->sw_index].type != SC_VL15) {
+ 		ret = -EINVAL;
+ 		goto bail;
+ 	}
+* Unmerged path drivers/staging/hfi1/pio.c
+diff --git a/drivers/staging/hfi1/pio.h b/drivers/staging/hfi1/pio.h
+index c2498f71658f..4d85fd42a65e 100644
+--- a/drivers/staging/hfi1/pio.h
++++ b/drivers/staging/hfi1/pio.h
+@@ -55,7 +55,8 @@
+ #define SC_KERNEL 0
+ #define SC_ACK    1
+ #define SC_USER   2
+-#define SC_MAX    3
++#define SC_VL15   3
++#define SC_MAX    4
+ 
+ /* invalid send context index */
+ #define INVALID_SCI 0xff
+@@ -191,6 +192,7 @@ void sc_group_release_update(struct hfi1_devdata *dd, u32 hw_context);
+ void sc_add_credit_return_intr(struct send_context *sc);
+ void sc_del_credit_return_intr(struct send_context *sc);
+ void sc_set_cr_threshold(struct send_context *sc, u32 new_threshold);
++u32 sc_percent_to_threshold(struct send_context *sc, u32 percent);
+ u32 sc_mtu_to_threshold(struct send_context *sc, u32 mtu, u32 hdrqentsize);
+ void hfi1_sc_wantpiobuf_intr(struct send_context *sc, u32 needint);
+ void sc_wait(struct hfi1_devdata *dd);
