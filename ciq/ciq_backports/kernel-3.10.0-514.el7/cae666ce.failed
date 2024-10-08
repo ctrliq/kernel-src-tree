@@ -1,0 +1,348 @@
+drm/i915: Add get_eld audio component
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [include] alsa: drm/i915: Add get_eld audio component (Jaroslav Kysela) [1288993]
+Rebuild_FUZZ: 92.50%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit cae666ceb8c3f154351f7df29c522f7a7016bdc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cae666ce.failed
+
+Implement a new i915_audio_component_ops, get_eld().  It's called by
+the audio driver to fetch the current audio status and ELD of the
+given HDMI/DP port.  It returns the size of expected ELD bytes if it's
+valid, zero if no valid ELD is found, or a negative error code.  The
+current state of audio on/off is stored in the given pointer, too.
+
+Note that the returned size isn't limited to the given max bytes.  If
+the size is greater than the max bytes, it means that only a part of
+ELD has been copied back.
+
+For achieving this implementation, a new field audio_connector is
+added to struct intel_digital_port.  It points to the connector
+assigned to the given digital port.  It's set/reset at each audio
+enable/disable call in intel_audio.c, and protected with av_mutex.
+
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit cae666ceb8c3f154351f7df29c522f7a7016bdc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_audio.c
+#	drivers/gpu/drm/i915/intel_drv.h
+#	include/drm/i915_component.h
+diff --cc drivers/gpu/drm/i915/intel_audio.c
+index e35997ebb331,eeac9f763110..000000000000
+--- a/drivers/gpu/drm/i915/intel_audio.c
++++ b/drivers/gpu/drm/i915/intel_audio.c
+@@@ -419,11 -515,16 +419,15 @@@ void intel_audio_codec_enable(struct in
+  	if (intel_pipe_has_type(crtc, INTEL_OUTPUT_DISPLAYPORT))
+  		connector->eld[5] |= (1 << 2);
+  
+ -	connector->eld[6] = drm_av_sync_delay(connector, adjusted_mode) / 2;
+ +	connector->eld[6] = drm_av_sync_delay(connector, mode) / 2;
+  
+  	if (dev_priv->display.audio_codec_enable)
+ -		dev_priv->display.audio_codec_enable(connector, intel_encoder,
+ -						     adjusted_mode);
+ +		dev_priv->display.audio_codec_enable(connector, intel_encoder, mode);
+  
++ 	mutex_lock(&dev_priv->av_mutex);
++ 	intel_dig_port->audio_connector = connector;
++ 	mutex_unlock(&dev_priv->av_mutex);
++ 
+  	if (acomp && acomp->audio_ops && acomp->audio_ops->pin_eld_notify)
+  		acomp->audio_ops->pin_eld_notify(acomp->audio_ops->audio_ptr, (int) port);
+  }
+@@@ -527,12 -632,126 +535,132 @@@ static int i915_audio_component_get_cdc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int i915_audio_component_sync_audio_rate(struct device *dev,
++ 						int port, int rate)
++ {
++ 	struct drm_i915_private *dev_priv = dev_to_i915(dev);
++ 	struct drm_device *drm_dev = dev_priv->dev;
++ 	struct intel_encoder *intel_encoder;
++ 	struct intel_digital_port *intel_dig_port;
++ 	struct intel_crtc *crtc;
++ 	struct drm_display_mode *mode;
++ 	struct i915_audio_component *acomp = dev_priv->audio_component;
++ 	enum pipe pipe = -1;
++ 	u32 tmp;
++ 	int n;
++ 
++ 	/* HSW, BDW, SKL, KBL need this fix */
++ 	if (!IS_SKYLAKE(dev_priv) &&
++ 	    !IS_KABYLAKE(dev_priv) &&
++ 	    !IS_BROADWELL(dev_priv) &&
++ 	    !IS_HASWELL(dev_priv))
++ 		return 0;
++ 
++ 	mutex_lock(&dev_priv->av_mutex);
++ 	/* 1. get the pipe */
++ 	for_each_intel_encoder(drm_dev, intel_encoder) {
++ 		if (intel_encoder->type != INTEL_OUTPUT_HDMI)
++ 			continue;
++ 		intel_dig_port = enc_to_dig_port(&intel_encoder->base);
++ 		if (port == intel_dig_port->port) {
++ 			crtc = to_intel_crtc(intel_encoder->base.crtc);
++ 			if (!crtc) {
++ 				DRM_DEBUG_KMS("%s: crtc is NULL\n", __func__);
++ 				continue;
++ 			}
++ 			pipe = crtc->pipe;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (pipe == INVALID_PIPE) {
++ 		DRM_DEBUG_KMS("no pipe for the port %c\n", port_name(port));
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return -ENODEV;
++ 	}
++ 	DRM_DEBUG_KMS("pipe %c connects port %c\n",
++ 				  pipe_name(pipe), port_name(port));
++ 	mode = &crtc->config->base.adjusted_mode;
++ 
++ 	/* port must be valid now, otherwise the pipe will be invalid */
++ 	acomp->aud_sample_rate[port] = rate;
++ 
++ 	/* 2. check whether to set the N/CTS/M manually or not */
++ 	if (!audio_rate_need_prog(crtc, mode)) {
++ 		tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 		tmp &= ~AUD_CONFIG_N_PROG_ENABLE;
++ 		I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return 0;
++ 	}
++ 
++ 	n = audio_config_get_n(mode, rate);
++ 	if (n == 0) {
++ 		DRM_DEBUG_KMS("Using automatic mode for N value on port %c\n",
++ 					  port_name(port));
++ 		tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 		tmp &= ~AUD_CONFIG_N_PROG_ENABLE;
++ 		I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 		mutex_unlock(&dev_priv->av_mutex);
++ 		return 0;
++ 	}
++ 
++ 	/* 3. set the N/CTS/M */
++ 	tmp = I915_READ(HSW_AUD_CFG(pipe));
++ 	tmp = audio_config_setup_n_reg(n, tmp);
++ 	I915_WRITE(HSW_AUD_CFG(pipe), tmp);
++ 
++ 	mutex_unlock(&dev_priv->av_mutex);
++ 	return 0;
++ }
++ 
++ static int i915_audio_component_get_eld(struct device *dev, int port,
++ 					bool *enabled,
++ 					unsigned char *buf, int max_bytes)
++ {
++ 	struct drm_i915_private *dev_priv = dev_to_i915(dev);
++ 	struct drm_device *drm_dev = dev_priv->dev;
++ 	struct intel_encoder *intel_encoder;
++ 	struct intel_digital_port *intel_dig_port;
++ 	const u8 *eld;
++ 	int ret = -EINVAL;
++ 
++ 	mutex_lock(&dev_priv->av_mutex);
++ 	for_each_intel_encoder(drm_dev, intel_encoder) {
++ 		if (intel_encoder->type != INTEL_OUTPUT_DISPLAYPORT &&
++ 		    intel_encoder->type != INTEL_OUTPUT_HDMI)
++ 			continue;
++ 		intel_dig_port = enc_to_dig_port(&intel_encoder->base);
++ 		if (port == intel_dig_port->port) {
++ 			ret = 0;
++ 			*enabled = intel_dig_port->audio_connector != NULL;
++ 			if (!*enabled)
++ 				break;
++ 			eld = intel_dig_port->audio_connector->eld;
++ 			ret = drm_eld_size(eld);
++ 			memcpy(buf, eld, min(max_bytes, ret));
++ 			break;
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&dev_priv->av_mutex);
++ 	return ret;
++ }
++ 
+++>>>>>>> cae666ceb8c3 (drm/i915: Add get_eld audio component)
+  static const struct i915_audio_component_ops i915_audio_component_ops = {
+  	.owner		= THIS_MODULE,
+  	.get_power	= i915_audio_component_get_power,
+  	.put_power	= i915_audio_component_put_power,
+  	.codec_wake_override = i915_audio_component_codec_wake_override,
+  	.get_cdclk_freq	= i915_audio_component_get_cdclk_freq,
+++<<<<<<< HEAD
+++=======
++ 	.sync_audio_rate = i915_audio_component_sync_audio_rate,
++ 	.get_eld	= i915_audio_component_get_eld,
+++>>>>>>> cae666ceb8c3 (drm/i915: Add get_eld audio component)
+  };
+  
+  static int i915_audio_component_bind(struct device *i915_dev,
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09,fe58a5722b16..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -679,6 -813,9 +679,12 @@@ struct intel_digital_port 
+  	struct intel_dp dp;
+  	struct intel_hdmi hdmi;
+  	enum irqreturn (*hpd_pulse)(struct intel_digital_port *, bool);
+++<<<<<<< HEAD
+++=======
++ 	bool release_cl2_override;
++ 	/* for communication with audio component; protected by av_mutex */
++ 	const struct drm_connector *audio_connector;
+++>>>>>>> cae666ceb8c3 (drm/i915: Add get_eld audio component)
+  };
+  
+  struct intel_dp_mst_encoder {
+diff --cc include/drm/i915_component.h
+index e6d35d7239c0,b46fa0ef3005..000000000000
+--- a/include/drm/i915_component.h
++++ b/include/drm/i915_component.h
+@@@ -24,34 -24,102 +24,116 @@@
+  #ifndef _I915_COMPONENT_H_
+  #define _I915_COMPONENT_H_
+  
+++<<<<<<< HEAD
+++=======
++ /* MAX_PORT is the number of port
++  * It must be sync with I915_MAX_PORTS defined i915_drv.h
++  * 5 should be enough as only HSW, BDW, SKL need such fix.
++  */
++ #define MAX_PORTS 5
++ 
++ /**
++  * struct i915_audio_component_ops - Ops implemented by i915 driver, called by hda driver
++  */
++ struct i915_audio_component_ops {
++ 	/**
++ 	 * @owner: i915 module
++ 	 */
++ 	struct module *owner;
++ 	/**
++ 	 * @get_power: get the POWER_DOMAIN_AUDIO power well
++ 	 *
++ 	 * Request the power well to be turned on.
++ 	 */
++ 	void (*get_power)(struct device *);
++ 	/**
++ 	 * @put_power: put the POWER_DOMAIN_AUDIO power well
++ 	 *
++ 	 * Allow the power well to be turned off.
++ 	 */
++ 	void (*put_power)(struct device *);
++ 	/**
++ 	 * @codec_wake_override: Enable/disable codec wake signal
++ 	 */
++ 	void (*codec_wake_override)(struct device *, bool enable);
++ 	/**
++ 	 * @get_cdclk_freq: Get the Core Display Clock in kHz
++ 	 */
++ 	int (*get_cdclk_freq)(struct device *);
++ 	/**
++ 	 * @sync_audio_rate: set n/cts based on the sample rate
++ 	 *
++ 	 * Called from audio driver. After audio driver sets the
++ 	 * sample rate, it will call this function to set n/cts
++ 	 */
++ 	int (*sync_audio_rate)(struct device *, int port, int rate);
++ 	/**
++ 	 * @get_eld: fill the audio state and ELD bytes for the given port
++ 	 *
++ 	 * Called from audio driver to get the HDMI/DP audio state of the given
++ 	 * digital port, and also fetch ELD bytes to the given pointer.
++ 	 *
++ 	 * It returns the byte size of the original ELD (not the actually
++ 	 * copied size), zero for an invalid ELD, or a negative error code.
++ 	 *
++ 	 * Note that the returned size may be over @max_bytes.  Then it
++ 	 * implies that only a part of ELD has been copied to the buffer.
++ 	 */
++ 	int (*get_eld)(struct device *, int port, bool *enabled,
++ 		       unsigned char *buf, int max_bytes);
++ };
++ 
++ /**
++  * struct i915_audio_component_audio_ops - Ops implemented by hda driver, called by i915 driver
++  */
++ struct i915_audio_component_audio_ops {
++ 	/**
++ 	 * @audio_ptr: Pointer to be used in call to pin_eld_notify
++ 	 */
++ 	void *audio_ptr;
++ 	/**
++ 	 * @pin_eld_notify: Notify the HDA driver that pin sense and/or ELD information has changed
++ 	 *
++ 	 * Called when the i915 driver has set up audio pipeline or has just
++ 	 * begun to tear it down. This allows the HDA driver to update its
++ 	 * status accordingly (even when the HDA controller is in power save
++ 	 * mode).
++ 	 */
++ 	void (*pin_eld_notify)(void *audio_ptr, int port);
++ };
++ 
++ /**
++  * struct i915_audio_component - Used for direct communication between i915 and hda drivers
++  */
+++>>>>>>> cae666ceb8c3 (drm/i915: Add get_eld audio component)
+  struct i915_audio_component {
+ -	/**
+ -	 * @dev: i915 device, used as parameter for ops
+ -	 */
+  	struct device *dev;
+ -	/**
+ -	 * @aud_sample_rate: the array of audio sample rate per port
+ -	 */
+ -	int aud_sample_rate[MAX_PORTS];
+ -	/**
+ -	 * @ops: Ops implemented by i915 driver, called by hda driver
+ -	 */
+ -	const struct i915_audio_component_ops *ops;
+ -	/**
+ -	 * @audio_ops: Ops implemented by hda driver, called by i915 driver
+ -	 */
+ -	const struct i915_audio_component_audio_ops *audio_ops;
+ +
+ +	const struct i915_audio_component_ops {
+ +		struct module *owner;
+ +		void (*get_power)(struct device *);
+ +		void (*put_power)(struct device *);
+ +		void (*codec_wake_override)(struct device *, bool enable);
+ +		int (*get_cdclk_freq)(struct device *);
+ +		/**
+ +		 * @sync_audio_rate: set n/cts based on the sample rate
+ +		 *
+ +		 * Called from audio driver. After audio driver sets the
+ +		 * sample rate, it will call this function to set n/cts
+ +		 */
+ +		int (*sync_audio_rate)(struct device *, int port, int rate);
+ +	} *ops;
+ +
+ +	const struct i915_audio_component_audio_ops {
+ +		void *audio_ptr;
+ +		/**
+ +		 * Call from i915 driver, notifying the HDA driver that
+ +		 * pin sense and/or ELD information has changed.
+ +		 * @audio_ptr:		HDA driver object
+ +		 * @port:		Which port has changed (PORTA / PORTB / PORTC etc)
+ +		 */
+ +		void (*pin_eld_notify)(void *audio_ptr, int port);
+ +	} *audio_ops;
+  };
+  
+  #endif /* _I915_COMPONENT_H_ */
+* Unmerged path drivers/gpu/drm/i915/intel_audio.c
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+* Unmerged path include/drm/i915_component.h
