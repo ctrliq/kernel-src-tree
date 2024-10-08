@@ -1,0 +1,614 @@
+netfilter: nf_tables: implement set transaction support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit cc02e457bb86f7b6ffee3651bab22d104b60effb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/cc02e457.failed
+
+Set elements are the last object type not supporting transaction support.
+Implement similar to the existing rule transactions:
+
+The global transaction counter keeps track of two generations, current
+and next. Each element contains a bitmask specifying in which generations
+it is inactive.
+
+New elements start out as inactive in the current generation and active
+in the next. On commit, the previous next generation becomes the current
+generation and the element becomes active. The bitmask is then cleared
+to indicate that the element is active in all future generations. If the
+transaction is aborted, the element is removed from the set before it
+becomes active.
+
+When removing an element, it gets marked as inactive in the next generation.
+On commit the next generation becomes active and the therefor the element
+inactive. It is then taken out of then set and released. On abort, the
+element is marked as active for the next generation again.
+
+Lookups ignore elements not active in the current generation.
+
+The current set types (hash/rbtree) both use a field in the extension area
+to store the generation mask. This (currently) does not require any
+additional memory since we have some free space in there.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit cc02e457bb86f7b6ffee3651bab22d104b60effb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_hash.c
+#	net/netfilter/nft_rbtree.c
+diff --cc include/net/netfilter/nf_tables.h
+index dfbfaba8ffd8,b8cd60dcb4e1..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -137,19 -138,12 +137,21 @@@ struct nft_userdata 
+  /**
+   *	struct nft_set_elem - generic representation of set elements
+   *
+-  *	@cookie: implementation specific element cookie
+   *	@key: element key
+++<<<<<<< HEAD
+ + *	@data: element data (maps only)
+ + *	@flags: element flags (end of interval)
+ + *
+ + *	The cookie can be used to store a handle to the element for subsequent
+ + *	removal.
+++=======
++  *	@priv: element private data and extensions
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+   */
+  struct nft_set_elem {
+- 	void			*cookie;
+  	struct nft_data		key;
+ -	void			*priv;
+ +	struct nft_data		data;
+ +	u32			flags;
+  };
+  
+  struct nft_set;
+@@@ -218,11 -217,13 +222,19 @@@ struct nft_set_estimate 
+  struct nft_set_ops {
+  	bool				(*lookup)(const struct nft_set *set,
+  						  const struct nft_data *key,
+++<<<<<<< HEAD
+ +						  struct nft_data *data);
+ +	int				(*get)(const struct nft_set *set,
+ +					       struct nft_set_elem *elem);
+++=======
++ 						  const struct nft_set_ext **ext);
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  	int				(*insert)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
++ 	void				(*activate)(const struct nft_set *set,
++ 						    const struct nft_set_elem *elem);
++ 	void *				(*deactivate)(const struct nft_set *set,
++ 						      const struct nft_set_elem *elem);
+  	void				(*remove)(const struct nft_set *set,
+  						  const struct nft_set_elem *elem);
+  	void				(*walk)(const struct nft_ctx *ctx,
+diff --cc net/netfilter/nf_tables_api.c
+index 3f30139c9b48,5604c2df05d1..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3171,12 -3222,10 +3172,16 @@@ static int nft_add_set_elem(struct nft_
+  	if (d1.type != NFT_DATA_VALUE || d1.len != set->klen)
+  		goto err2;
+  
+++<<<<<<< HEAD
+ +	err = -EEXIST;
+ +	if (set->ops->get(set, &elem) == 0)
+ +		goto err2;
+++=======
++ 	nft_set_ext_add(&tmpl, NFT_SET_EXT_KEY);
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  
+  	if (nla[NFTA_SET_ELEM_DATA] != NULL) {
+ -		err = nft_data_init(ctx, &data, &d2, nla[NFTA_SET_ELEM_DATA]);
+ +		err = nft_data_init(ctx, &elem.data, &d2, nla[NFTA_SET_ELEM_DATA]);
+  		if (err < 0)
+  			goto err2;
+  
+@@@ -3197,15 -3246,27 +3202,16 @@@
+  			if (err < 0)
+  				goto err3;
+  		}
+ -
+ -		nft_set_ext_add(&tmpl, NFT_SET_EXT_DATA);
+  	}
+  
+ -	err = -ENOMEM;
+ -	elem.priv = nft_set_elem_init(set, &tmpl, &elem.key, &data, GFP_KERNEL);
+ -	if (elem.priv == NULL)
+ -		goto err3;
+ -
+ -	ext = nft_set_elem_ext(set, elem.priv);
+ -	if (flags)
+ -		*nft_set_ext_flags(ext) = flags;
+ -
+  	trans = nft_trans_elem_alloc(ctx, NFT_MSG_NEWSETELEM, set);
+  	if (trans == NULL)
+ -		goto err4;
+ +		goto err3;
+  
++ 	ext->genmask = nft_genmask_cur(ctx->net);
+  	err = set->ops->insert(set, &elem);
+  	if (err < 0)
+ -		goto err5;
+ +		goto err4;
+  
+  	nft_trans_elem(trans) = elem;
+  	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+@@@ -3633,13 -3708,8 +3646,16 @@@ static int nf_tables_commit(struct sk_b
+  			nf_tables_setelem_notify(&trans->ctx, te->set,
+  						 &te->elem,
+  						 NFT_MSG_DELSETELEM, 0);
+++<<<<<<< HEAD
+ +			te->set->ops->get(te->set, &te->elem);
+ +			nft_data_uninit(&te->elem.key, NFT_DATA_VALUE);
+ +			if (te->set->flags & NFT_SET_MAP &&
+ +			    !(te->elem.flags & NFT_SET_ELEM_INTERVAL_END))
+ +				nft_data_uninit(&te->elem.data, te->set->dtype);
+++=======
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  			te->set->ops->remove(te->set, &te->elem);
+ +			nft_trans_destroy(trans);
+  			break;
+  		}
+  	}
+@@@ -3742,16 -3815,15 +3758,24 @@@ static int nf_tables_abort(struct sk_bu
+  		case NFT_MSG_NEWSETELEM:
+  			nft_trans_elem_set(trans)->nelems--;
+  			te = (struct nft_trans_elem *)trans->data;
+ -
+++<<<<<<< HEAD
+ +			te->set->ops->get(te->set, &te->elem);
+ +			nft_data_uninit(&te->elem.key, NFT_DATA_VALUE);
+ +			if (te->set->flags & NFT_SET_MAP &&
+ +			    !(te->elem.flags & NFT_SET_ELEM_INTERVAL_END))
+ +				nft_data_uninit(&te->elem.data, te->set->dtype);
+++=======
+++
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  			te->set->ops->remove(te->set, &te->elem);
+ +			nft_trans_destroy(trans);
+  			break;
+  		case NFT_MSG_DELSETELEM:
++ 			te = (struct nft_trans_elem *)trans->data;
++ 
+  			nft_trans_elem_set(trans)->nelems++;
++ 			te->set->ops->activate(te->set, &te->elem);
++ 
+  			nft_trans_destroy(trans);
+  			break;
+  		}
+diff --cc net/netfilter/nft_hash.c
+index f14a5e14123a,c7e1a9d7d46f..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -23,22 -23,65 +23,68 @@@
+  /* We target a hash table size of 4, element hint is 75% of final size */
+  #define NFT_HASH_ELEMENT_HINT 3
+  
+ -struct nft_hash {
+ -	struct rhashtable		ht;
+ -};
+ -
+  struct nft_hash_elem {
+  	struct rhash_head		node;
+ -	struct nft_set_ext		ext;
+ +	struct nft_data			key;
+ +	struct nft_data			data[];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nft_hash_cmp_arg {
++ 	const struct nft_set		*set;
++ 	const struct nft_data		*key;
++ 	u8				genmask;
++ };
++ 
++ static const struct rhashtable_params nft_hash_params;
++ 
++ static inline u32 nft_hash_key(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nft_hash_cmp_arg *arg = data;
++ 
++ 	return jhash(arg->key, len, seed);
++ }
++ 
++ static inline u32 nft_hash_obj(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nft_hash_elem *he = data;
++ 
++ 	return jhash(nft_set_ext_key(&he->ext), len, seed);
++ }
++ 
++ static inline int nft_hash_cmp(struct rhashtable_compare_arg *arg,
++ 			       const void *ptr)
++ {
++ 	const struct nft_hash_cmp_arg *x = arg->key;
++ 	const struct nft_hash_elem *he = ptr;
++ 
++ 	if (nft_data_cmp(nft_set_ext_key(&he->ext), x->key, x->set->klen))
++ 		return 1;
++ 	if (!nft_set_elem_active(&he->ext, x->genmask))
++ 		return 1;
++ 	return 0;
++ }
++ 
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  static bool nft_hash_lookup(const struct nft_set *set,
+  			    const struct nft_data *key,
+ -			    const struct nft_set_ext **ext)
+ +			    struct nft_data *data)
+  {
+ -	struct nft_hash *priv = nft_set_priv(set);
+ +	const struct rhashtable *priv = nft_set_priv(set);
+  	const struct nft_hash_elem *he;
+++<<<<<<< HEAD
+++=======
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_cur(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = key,
++ 	};
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  
+ -	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ -	if (he != NULL)
+ -		*ext = &he->ext;
+ +	he = rhashtable_lookup(priv, key);
+ +	if (he && set->flags & NFT_SET_MAP)
+ +		nft_data_copy(data, he->data);
+  
+  	return !!he;
+  }
+@@@ -46,115 -89,103 +92,186 @@@
+  static int nft_hash_insert(const struct nft_set *set,
+  			   const struct nft_set_elem *elem)
+  {
+++<<<<<<< HEAD
+ +	struct rhashtable *priv = nft_set_priv(set);
+ +	struct nft_hash_elem *he;
+ +	unsigned int size;
+++=======
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he = elem->priv;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = &elem->key,
++ 	};
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+ +
+ +	if (elem->flags != 0)
+ +		return -EINVAL;
+  
+ -	return rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
+ -					    nft_hash_params);
+ +	size = sizeof(*he);
+ +	if (set->flags & NFT_SET_MAP)
+ +		size += sizeof(he->data[0]);
+ +
+ +	he = kzalloc(size, GFP_KERNEL);
+ +	if (he == NULL)
+ +		return -ENOMEM;
+ +
+ +	nft_data_copy(&he->key, &elem->key);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_copy(he->data, &elem->data);
+ +
+ +	rhashtable_insert(priv, &he->node);
+ +
+ +	return 0;
+ +}
+ +
+ +static void nft_hash_elem_destroy(const struct nft_set *set,
+ +				  struct nft_hash_elem *he)
+ +{
+ +	nft_data_uninit(&he->key, NFT_DATA_VALUE);
+ +	if (set->flags & NFT_SET_MAP)
+ +		nft_data_uninit(he->data, set->dtype);
+ +	kfree(he);
+  }
+  
+- static void nft_hash_remove(const struct nft_set *set,
+- 			    const struct nft_set_elem *elem)
++ static void nft_hash_activate(const struct nft_set *set,
++ 			      const struct nft_set_elem *elem)
+  {
+++<<<<<<< HEAD
+ +	struct rhashtable *priv = nft_set_priv(set);
+ +
+ +	rhashtable_remove(priv, elem->cookie);
+ +	synchronize_rcu();
+ +	kfree(elem->cookie);
+ +}
+ +
+ +struct nft_compare_arg {
+ +	const struct nft_set *set;
+ +	struct nft_set_elem *elem;
+ +};
+ +
+ +static bool nft_hash_compare(void *ptr, void *arg)
+ +{
+ +	struct nft_hash_elem *he = ptr;
+ +	struct nft_compare_arg *x = arg;
+ +
+ +	if (!nft_data_cmp(&he->key, &x->elem->key, x->set->klen)) {
+ +		x->elem->cookie = he;
+ +		x->elem->flags = 0;
+ +		if (x->set->flags & NFT_SET_MAP)
+ +			nft_data_copy(&x->elem->data, he->data);
+ +
+ +		return true;
+ +	}
+ +
+ +	return false;
+++=======
++ 	struct nft_hash_elem *he = elem->priv;
++ 
++ 	nft_set_elem_change_active(set, &he->ext);
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  }
+  
+- static int nft_hash_get(const struct nft_set *set, struct nft_set_elem *elem)
++ static void *nft_hash_deactivate(const struct nft_set *set,
++ 				 const struct nft_set_elem *elem)
+  {
+++<<<<<<< HEAD
+ +	const struct rhashtable *priv = nft_set_priv(set);
+ +	struct nft_compare_arg arg = {
+ +		.set = set,
+ +		.elem = elem,
+ +	};
+ +
+ +	if (rhashtable_lookup_compare(priv, &elem->key,
+ +				      &nft_hash_compare, &arg))
+ +		return 0;
+ +
+ +	return -ENOENT;
+++=======
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he;
++ 	struct nft_hash_cmp_arg arg = {
++ 		.genmask = nft_genmask_next(read_pnet(&set->pnet)),
++ 		.set	 = set,
++ 		.key	 = &elem->key,
++ 	};
++ 
++ 	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
++ 	if (he != NULL)
++ 		nft_set_elem_change_active(set, &he->ext);
++ 
++ 	return he;
++ }
++ 
++ static void nft_hash_remove(const struct nft_set *set,
++ 			    const struct nft_set_elem *elem)
++ {
++ 	struct nft_hash *priv = nft_set_priv(set);
++ 	struct nft_hash_elem *he = elem->priv;
++ 
++ 	rhashtable_remove_fast(&priv->ht, &he->node, nft_hash_params);
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  }
+  
+  static void nft_hash_walk(const struct nft_ctx *ctx, const struct nft_set *set,
+  			  struct nft_set_iter *iter)
+  {
+ -	struct nft_hash *priv = nft_set_priv(set);
+ -	struct nft_hash_elem *he;
+ -	struct rhashtable_iter hti;
+ +	const struct rhashtable *priv = nft_set_priv(set);
+ +	const struct bucket_table *tbl;
+ +	const struct nft_hash_elem *he;
+  	struct nft_set_elem elem;
+++<<<<<<< HEAD
+ +	unsigned int i;
+++=======
++ 	u8 genmask = nft_genmask_cur(read_pnet(&set->pnet));
++ 	int err;
+ -
+ -	err = rhashtable_walk_init(&priv->ht, &hti);
+ -	iter->err = err;
+ -	if (err)
+ -		return;
+ -
+ -	err = rhashtable_walk_start(&hti);
+ -	if (err && err != -EAGAIN) {
+ -		iter->err = err;
+ -		goto out;
+ -	}
+ -
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+ +
+ +	tbl = rht_dereference_rcu(priv->tbl, priv);
+ +	for (i = 0; i < tbl->size; i++) {
+ +		struct rhash_head *pos;
+ +
+ +		rht_for_each_entry_rcu(he, pos, tbl, i, node) {
+ +			if (iter->count < iter->skip)
+ +				goto cont;
+ +
+++<<<<<<< HEAD
+ +			memcpy(&elem.key, &he->key, sizeof(elem.key));
+ +			if (set->flags & NFT_SET_MAP)
+ +				memcpy(&elem.data, he->data, sizeof(elem.data));
+ +			elem.flags = 0;
+++=======
++ 	while ((he = rhashtable_walk_next(&hti))) {
++ 		if (IS_ERR(he)) {
++ 			err = PTR_ERR(he);
++ 			if (err != -EAGAIN) {
++ 				iter->err = err;
++ 				goto out;
++ 			}
++ 
++ 			continue;
++ 		}
++ 
++ 		if (iter->count < iter->skip)
++ 			goto cont;
++ 		if (!nft_set_elem_active(&he->ext, genmask))
++ 			goto cont;
++ 
++ 		elem.priv = he;
++ 
++ 		iter->err = iter->fn(ctx, set, iter, &elem);
++ 		if (iter->err < 0)
++ 			goto out;
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  
+ +			iter->err = iter->fn(ctx, set, iter, &elem);
+ +			if (iter->err < 0)
+ +				return;
+  cont:
+ -		iter->count++;
+ +			iter->count++;
+ +		}
+  	}
+ -
+ -out:
+ -	rhashtable_walk_stop(&hti);
+ -	rhashtable_walk_exit(&hti);
+  }
+  
+  static unsigned int nft_hash_privsize(const struct nlattr * const nla[])
+diff --cc net/netfilter/nft_rbtree.c
+index 2c75361077f7,42d0ca45fb9e..000000000000
+--- a/net/netfilter/nft_rbtree.c
++++ b/net/netfilter/nft_rbtree.c
+@@@ -26,14 -26,13 +26,15 @@@ struct nft_rbtree 
+  
+  struct nft_rbtree_elem {
+  	struct rb_node		node;
+ -	struct nft_set_ext	ext;
+ +	u16			flags;
+ +	struct nft_data		key;
+ +	struct nft_data		data[];
+  };
+  
++ 
+  static bool nft_rbtree_lookup(const struct nft_set *set,
+  			      const struct nft_data *key,
+ -			      const struct nft_set_ext **ext)
+ +			      struct nft_data *data)
+  {
+  	const struct nft_rbtree *priv = nft_set_priv(set);
+  	const struct nft_rbtree_elem *rbe, *interval = NULL;
+@@@ -53,12 -53,17 +55,22 @@@
+  			parent = parent->rb_right;
+  		else {
+  found:
+++<<<<<<< HEAD
+ +			if (rbe->flags & NFT_SET_ELEM_INTERVAL_END)
+++=======
++ 			if (!nft_set_elem_active(&rbe->ext, genmask)) {
++ 				parent = parent->rb_left;
++ 				continue;
++ 			}
++ 			if (nft_set_ext_exists(&rbe->ext, NFT_SET_EXT_FLAGS) &&
++ 			    *nft_set_ext_flags(&rbe->ext) &
++ 			    NFT_SET_ELEM_INTERVAL_END)
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  				goto out;
+ -			spin_unlock_bh(&nft_rbtree_lock);
+ +			if (set->flags & NFT_SET_MAP)
+ +				nft_data_copy(data, rbe->data);
+  
+ -			*ext = &rbe->ext;
+ +			spin_unlock_bh(&nft_rbtree_lock);
+  			return true;
+  		}
+  	}
+@@@ -149,10 -131,18 +165,19 @@@ static void nft_rbtree_remove(const str
+  	spin_lock_bh(&nft_rbtree_lock);
+  	rb_erase(&rbe->node, &priv->root);
+  	spin_unlock_bh(&nft_rbtree_lock);
+ +	kfree(rbe);
+  }
+  
+- static int nft_rbtree_get(const struct nft_set *set, struct nft_set_elem *elem)
++ static void nft_rbtree_activate(const struct nft_set *set,
++ 				const struct nft_set_elem *elem)
++ {
++ 	struct nft_rbtree_elem *rbe = elem->priv;
++ 
++ 	nft_set_elem_change_active(set, &rbe->ext);
++ }
++ 
++ static void *nft_rbtree_deactivate(const struct nft_set *set,
++ 				   const struct nft_set_elem *elem)
+  {
+  	const struct nft_rbtree *priv = nft_set_priv(set);
+  	const struct rb_node *parent = priv->root.rb_node;
+@@@ -168,15 -160,15 +194,24 @@@
+  		else if (d > 0)
+  			parent = parent->rb_right;
+  		else {
+++<<<<<<< HEAD
+ +			elem->cookie = rbe;
+ +			if (set->flags & NFT_SET_MAP &&
+ +			    !(rbe->flags & NFT_SET_ELEM_INTERVAL_END))
+ +				nft_data_copy(&elem->data, rbe->data);
+ +			elem->flags = rbe->flags;
+ +			return 0;
+++=======
++ 			if (!nft_set_elem_active(&rbe->ext, genmask)) {
++ 				parent = parent->rb_left;
++ 				continue;
++ 			}
++ 			nft_set_elem_change_active(set, &rbe->ext);
++ 			return rbe;
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  		}
+  	}
+- 	return -ENOENT;
++ 	return NULL;
+  }
+  
+  static void nft_rbtree_walk(const struct nft_ctx *ctx,
+@@@ -184,21 -176,21 +219,30 @@@
+  			    struct nft_set_iter *iter)
+  {
+  	const struct nft_rbtree *priv = nft_set_priv(set);
+ -	struct nft_rbtree_elem *rbe;
+ +	const struct nft_rbtree_elem *rbe;
+  	struct nft_set_elem elem;
+  	struct rb_node *node;
++ 	u8 genmask = nft_genmask_cur(read_pnet(&set->pnet));
+  
+  	spin_lock_bh(&nft_rbtree_lock);
+  	for (node = rb_first(&priv->root); node != NULL; node = rb_next(node)) {
++ 		rbe = rb_entry(node, struct nft_rbtree_elem, node);
++ 
+  		if (iter->count < iter->skip)
+  			goto cont;
++ 		if (!nft_set_elem_active(&rbe->ext, genmask))
++ 			goto cont;
+  
+++<<<<<<< HEAD
+ +		rbe = rb_entry(node, struct nft_rbtree_elem, node);
+ +		nft_data_copy(&elem.key, &rbe->key);
+ +		if (set->flags & NFT_SET_MAP &&
+ +		    !(rbe->flags & NFT_SET_ELEM_INTERVAL_END))
+ +			nft_data_copy(&elem.data, rbe->data);
+ +		elem.flags = rbe->flags;
+++=======
++ 		elem.priv = rbe;
+++>>>>>>> cc02e457bb86 (netfilter: nf_tables: implement set transaction support)
+  
+  		iter->err = iter->fn(ctx, set, iter, &elem);
+  		if (iter->err < 0) {
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_hash.c
+* Unmerged path net/netfilter/nft_rbtree.c
