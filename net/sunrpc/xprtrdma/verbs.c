@@ -1565,9 +1565,8 @@ rpcrdma_register_frmr_external(struct rpcrdma_mr_seg *seg,
 	frmr_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
 	frmr_wr.wr.fast_reg.length = page_no << PAGE_SHIFT;
 	if (frmr_wr.wr.fast_reg.length < len) {
-		while (seg1->mr_nsegs--)
-			rpcrdma_unmap_one(ia, seg++);
-		return -EIO;
+		rc = -EIO;
+		goto out_err;
 	}
 
 	/* Bump the key */
@@ -1585,8 +1584,7 @@ rpcrdma_register_frmr_external(struct rpcrdma_mr_seg *seg,
 	if (rc) {
 		dprintk("RPC:       %s: failed ib_post_send for register,"
 			" status %i\n", __func__, rc);
-		while (i--)
-			rpcrdma_unmap_one(ia, --seg);
+		goto out_err;
 	} else {
 		seg1->mr_rkey = seg1->mr_chunk.rl_mw->r.frmr.fr_mr->rkey;
 		seg1->mr_base = seg1->mr_dma + pageoff;
@@ -1594,6 +1592,10 @@ rpcrdma_register_frmr_external(struct rpcrdma_mr_seg *seg,
 		seg1->mr_len = len;
 	}
 	*nsegs = i;
+	return 0;
+out_err:
+	while (i--)
+		rpcrdma_unmap_one(ia, --seg);
 	return rc;
 }
 
