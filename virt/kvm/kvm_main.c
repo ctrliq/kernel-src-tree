@@ -2767,8 +2767,7 @@ static void hardware_enable_nolock(void *junk)
 	if (r) {
 		cpumask_clear_cpu(cpu, cpus_hardware_enabled);
 		atomic_inc(&hardware_enable_failed);
-		printk(KERN_INFO "kvm: enabling virtualization on "
-				 "CPU%d failed\n", cpu);
+		pr_info("kvm: enabling virtualization on CPU%d failed\n", cpu);
 	}
 }
 
@@ -2862,12 +2861,12 @@ static int kvm_cpu_hotplug(struct notifier_block *notifier, unsigned long val,
 	val &= ~CPU_TASKS_FROZEN;
 	switch (val) {
 	case CPU_DYING:
-		printk(KERN_INFO "kvm: disabling virtualization on CPU%d\n",
+		pr_info("kvm: disabling virtualization on CPU%d\n",
 		       cpu);
 		hardware_disable();
 		break;
 	case CPU_STARTING:
-		printk(KERN_INFO "kvm: enabling virtualization on CPU%d\n",
+		pr_info("kvm: enabling virtualization on CPU%d\n",
 		       cpu);
 		hardware_enable();
 		break;
@@ -2884,7 +2883,7 @@ static int kvm_reboot(struct notifier_block *notifier, unsigned long val,
 	 *
 	 * And Intel TXT required VMX off for all cpu when system shutdown.
 	 */
-	printk(KERN_INFO "kvm: exiting hardware virtualization\n");
+	pr_info("kvm: exiting hardware virtualization\n");
 	kvm_rebooting = true;
 	on_each_cpu(hardware_disable_nolock, NULL, 1);
 	return NOTIFY_OK;
@@ -3313,7 +3312,7 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 
 	r = misc_register(&kvm_dev);
 	if (r) {
-		printk(KERN_ERR "kvm: misc device register failed\n");
+		pr_err("kvm: misc device register failed\n");
 		goto out_unreg;
 	}
 
@@ -3324,7 +3323,7 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 
 	r = kvm_init_debug();
 	if (r) {
-		printk(KERN_ERR "kvm: create debugfs files failed\n");
+		pr_err("kvm: create debugfs files failed\n");
 		goto out_undebugfs;
 	}
 
