@@ -1,0 +1,127 @@
+vhost: fix ref cnt checking deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [virt] vhost/net: fix ref cnt checking deadlock ("Michael S. Tsirkin") [1065878]
+Rebuild_FUZZ: 94.74%
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 0ad8b480d6ee916aa84324f69acf690142aecd0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/0ad8b480.failed
+
+vhost checked the counter within the refcnt before decrementing.  It
+really wanted to know that it is the one that has the last reference, as
+a way to batch freeing resources a bit more efficiently.
+
+Note: we only let refcount go to 0 on device release.
+
+This works well but we now access the ref counter twice so there's a
+race: all users might see a high count and decide to defer freeing
+resources.
+In the end no one initiates freeing resources until the last reference
+is gone (which is on VM shotdown so might happen after a looooong time).
+
+Let's do what we probably should have done straight away:
+switch from kref to plain atomic, documenting the
+semantics, return the refcount value atomically after decrement,
+then use that to avoid the deadlock.
+
+	Reported-by: Qin Chuanyu <qinchuanyu@huawei.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ad8b480d6ee916aa84324f69acf690142aecd0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/net.c
+diff --cc drivers/vhost/net.c
+index 91ba620fdb5d,41be4de37e81..000000000000
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@@ -305,22 -306,22 +305,29 @@@ static void vhost_zerocopy_callback(str
+  {
+  	struct vhost_net_ubuf_ref *ubufs = ubuf->ctx;
+  	struct vhost_virtqueue *vq = ubufs->vq;
+- 	int cnt = atomic_read(&ubufs->kref.refcount);
++ 	int cnt;
++ 
+++<<<<<<< HEAD
+++=======
++ 	/* set len to mark this desc buffers done DMA */
++ 	vq->heads[ubuf->desc].len = success ?
++ 		VHOST_DMA_DONE_LEN : VHOST_DMA_FAILED_LEN;
++ 	cnt = vhost_net_ubuf_put(ubufs);
+  
+++>>>>>>> 0ad8b480d6ee (vhost: fix ref cnt checking deadlock)
+  	/*
+  	 * Trigger polling thread if guest stopped submitting new buffers:
+- 	 * in this case, the refcount after decrement will eventually reach 1
+- 	 * so here it is 2.
++ 	 * in this case, the refcount after decrement will eventually reach 1.
+  	 * We also trigger polling periodically after each 16 packets
+  	 * (the value 16 here is more or less arbitrary, it's tuned to trigger
+  	 * less than 10% of times).
+  	 */
+- 	if (cnt <= 2 || !(cnt % 16))
++ 	if (cnt <= 1 || !(cnt % 16))
+  		vhost_poll_queue(&vq->poll);
+ +	/* set len to mark this desc buffers done DMA */
+ +	vq->heads[ubuf->desc].len = success ?
+ +		VHOST_DMA_DONE_LEN : VHOST_DMA_FAILED_LEN;
+ +	vhost_net_ubuf_put(ubufs);
+  }
+  
+  /* Expects to be always run from workqueue - which acts as
+@@@ -405,32 -408,23 +412,43 @@@ static void handle_tx(struct vhost_net 
+  
+  		/* use msg_control to pass vhost zerocopy ubuf info to skb */
+  		if (zcopy_used) {
+ -			struct ubuf_info *ubuf;
+ -			ubuf = nvq->ubuf_info + nvq->upend_idx;
+ -
+  			vq->heads[nvq->upend_idx].id = head;
+++<<<<<<< HEAD
+ +			if (!vhost_net_tx_select_zcopy(net) ||
+ +			    len < VHOST_GOODCOPY_LEN) {
+ +				/* copy don't need to wait for DMA done */
+ +				vq->heads[nvq->upend_idx].len =
+ +							VHOST_DMA_DONE_LEN;
+ +				msg.msg_control = NULL;
+ +				msg.msg_controllen = 0;
+ +				ubufs = NULL;
+ +			} else {
+ +				struct ubuf_info *ubuf;
+ +				ubuf = nvq->ubuf_info + nvq->upend_idx;
+ +
+ +				vq->heads[nvq->upend_idx].len =
+ +					VHOST_DMA_IN_PROGRESS;
+ +				ubuf->callback = vhost_zerocopy_callback;
+ +				ubuf->ctx = nvq->ubufs;
+ +				ubuf->desc = nvq->upend_idx;
+ +				msg.msg_control = ubuf;
+ +				msg.msg_controllen = sizeof(ubuf);
+ +				ubufs = nvq->ubufs;
+ +				kref_get(&ubufs->kref);
+ +			}
+++=======
++ 			vq->heads[nvq->upend_idx].len = VHOST_DMA_IN_PROGRESS;
++ 			ubuf->callback = vhost_zerocopy_callback;
++ 			ubuf->ctx = nvq->ubufs;
++ 			ubuf->desc = nvq->upend_idx;
++ 			msg.msg_control = ubuf;
++ 			msg.msg_controllen = sizeof(ubuf);
++ 			ubufs = nvq->ubufs;
++ 			atomic_inc(&ubufs->refcount);
+++>>>>>>> 0ad8b480d6ee (vhost: fix ref cnt checking deadlock)
+  			nvq->upend_idx = (nvq->upend_idx + 1) % UIO_MAXIOV;
+ -		} else {
+ +		} else
+  			msg.msg_control = NULL;
+ -			ubufs = NULL;
+ -		}
+  		/* TODO: Check specific error and bomb out unless ENOBUFS? */
+  		err = sock->ops->sendmsg(NULL, sock, &msg, len);
+  		if (unlikely(err < 0)) {
+* Unmerged path drivers/vhost/net.c
