@@ -1,0 +1,124 @@
+ipv6: distinguish frag queues by device for multicast and link-local packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Michal Kubeček <mkubecek@suse.cz>
+commit 264640fc2c5f4f913db5c73fa3eb1ead2c45e9d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/264640fc.failed
+
+If a fragmented multicast packet is received on an ethernet device which
+has an active macvlan on top of it, each fragment is duplicated and
+received both on the underlying device and the macvlan. If some
+fragments for macvlan are processed before the whole packet for the
+underlying device is reassembled, the "overlapping fragments" test in
+ip6_frag_queue() discards the whole fragment queue.
+
+To resolve this, add device ifindex to the search key and require it to
+match reassembling multicast packets and packets to link-local
+addresses.
+
+Note: similar patch has been already submitted by Yoshifuji Hideaki in
+
+  http://patchwork.ozlabs.org/patch/220979/
+
+but got lost and forgotten for some reason.
+
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 264640fc2c5f4f913db5c73fa3eb1ead2c45e9d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/reassembly.c
+diff --cc net/ipv6/reassembly.c
+index cc85a9ba5010,45f5ae51de65..000000000000
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@@ -178,9 -181,9 +181,9 @@@ static void ip6_frag_expire(unsigned lo
+  	ip6_expire_frag_queue(net, fq, &ip6_frags);
+  }
+  
+ -static struct frag_queue *
+ +static __inline__ struct frag_queue *
+  fq_find(struct net *net, __be32 id, const struct in6_addr *src,
+- 	const struct in6_addr *dst, u8 ecn)
++ 	const struct in6_addr *dst, int iif, u8 ecn)
+  {
+  	struct inet_frag_queue *q;
+  	struct ip6_create_arg arg;
+@@@ -190,9 -193,9 +193,10 @@@
+  	arg.user = IP6_DEFRAG_LOCAL_DELIVER;
+  	arg.src = src;
+  	arg.dst = dst;
++ 	arg.iif = iif;
+  	arg.ecn = ecn;
+  
+ +	read_lock(&ip6_frags.lock);
+  	hash = inet6_hash_frag(id, src, dst);
+  
+  	q = inet_frag_find(&net->ipv6.frags, &ip6_frags, &arg, hash);
+@@@ -552,14 -554,9 +556,19 @@@ static int ipv6_frag_rcv(struct sk_buf
+  		return 1;
+  	}
+  
+ +	evicted = inet_frag_evictor(&net->ipv6.frags, &ip6_frags, false);
+ +	if (evicted)
+ +		IP6_ADD_STATS_BH(net, ip6_dst_idev(skb_dst(skb)),
+ +				 IPSTATS_MIB_REASMFAILS, evicted);
+ +
+  	fq = fq_find(net, fhdr->identification, &hdr->saddr, &hdr->daddr,
+++<<<<<<< HEAD
+ +		     ip6_frag_ecn(hdr));
+ +	if (fq != NULL) {
+++=======
++ 		     skb->dev ? skb->dev->ifindex : 0, ip6_frag_ecn(hdr));
++ 	if (fq) {
+++>>>>>>> 264640fc2c5f (ipv6: distinguish frag queues by device for multicast and link-local packets)
+  		int ret;
+  
+  		spin_lock(&fq->q.lock);
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index 746418990199..7520381d7e63 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -484,6 +484,7 @@ struct ip6_create_arg {
+ 	u32 user;
+ 	const struct in6_addr *src;
+ 	const struct in6_addr *dst;
++	int iif;
+ 	u8 ecn;
+ };
+ 
+diff --git a/net/ipv6/netfilter/nf_conntrack_reasm.c b/net/ipv6/netfilter/nf_conntrack_reasm.c
+index b752efdfc3e8..46d95ecb12fb 100644
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -184,7 +184,7 @@ static void nf_ct_frag6_expire(unsigned long data)
+ /* Creation primitives. */
+ static inline struct frag_queue *fq_find(struct net *net, __be32 id,
+ 					 u32 user, struct in6_addr *src,
+-					 struct in6_addr *dst, u8 ecn)
++					 struct in6_addr *dst, int iif, u8 ecn)
+ {
+ 	struct inet_frag_queue *q;
+ 	struct ip6_create_arg arg;
+@@ -194,6 +194,7 @@ static inline struct frag_queue *fq_find(struct net *net, __be32 id,
+ 	arg.user = user;
+ 	arg.src = src;
+ 	arg.dst = dst;
++	arg.iif = iif;
+ 	arg.ecn = ecn;
+ 
+ 	read_lock_bh(&nf_frags.lock);
+@@ -602,7 +603,7 @@ struct sk_buff *nf_ct_frag6_gather(struct sk_buff *skb, u32 user)
+ 	local_bh_enable();
+ 
+ 	fq = fq_find(net, fhdr->identification, user, &hdr->saddr, &hdr->daddr,
+-		     ip6_frag_ecn(hdr));
++		     skb->dev ? skb->dev->ifindex : 0, ip6_frag_ecn(hdr));
+ 	if (fq == NULL) {
+ 		pr_debug("Can't find and can't create new queue\n");
+ 		goto ret_orig;
+* Unmerged path net/ipv6/reassembly.c
