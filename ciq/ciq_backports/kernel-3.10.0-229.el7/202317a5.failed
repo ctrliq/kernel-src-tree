@@ -1,0 +1,407 @@
+ACPI / scan: Add acpi_device objects for all device nodes in the namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [acpi] scan: Add acpi_device objects for all device nodes in the namespace (Myron Stowe) [1128632]
+Rebuild_FUZZ: 95.04%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 202317a573b20d77a9abb7c16a3fd5b40cef3d9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/202317a5.failed
+
+Modify the ACPI namespace scanning code to register a struct
+acpi_device object for every namespace node representing a device,
+processor and so on, even if the device represented by that namespace
+node is reported to be not present and not functional by _STA.
+
+There are multiple reasons to do that.  First of all, it avoids
+quite a lot of overhead when struct acpi_device objects are
+deleted every time acpi_bus_trim() is run and then added again
+by a subsequent acpi_bus_scan() for the same scope, although the
+namespace objects they correspond to stay in memory all the time
+(which always is the case on a vast majority of systems).
+
+Second, it will allow user space to see that there are namespace
+nodes representing devices that are not present at the moment and may
+be added to the system.  It will also allow user space to evaluate
+_SUN for those nodes to check what physical slots the "missing"
+devices may be put into and it will make sense to add a sysfs
+attribute for _STA evaluation after this change (that will be
+useful for thermal management on some systems).
+
+Next, it will help to consolidate the ACPI hotplug handling among
+subsystems by making it possible to store hotplug-related information
+in struct acpi_device objects in a standard common way.
+
+Finally, it will help to avoid a race condition related to the
+deletion of ACPI namespace nodes.  Namely, namespace nodes may be
+deleted as a result of a table unload triggered by _EJ0 or _DCK.
+If a hotplug notification for one of those nodes is triggered
+right before the deletion and it executes a hotplug callback
+via acpi_hotplug_execute(), the ACPI handle passed to that
+callback may be stale when the callback actually runs.  One way
+to work around that is to always pass struct acpi_device pointers
+to hotplug callbacks after doing a get_device() on the objects in
+question which eliminates the use-after-free possibility (the ACPI
+handles in those objects are invalidated by acpi_scan_drop_device(),
+so they will trigger ACPICA errors on attempts to use them).
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 202317a573b20d77a9abb7c16a3fd5b40cef3d9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/internal.h
+#	drivers/acpi/scan.c
+#	drivers/pci/hotplug/acpiphp_glue.c
+#	include/acpi/acpi_bus.h
+diff --cc drivers/acpi/internal.h
+index f9b49d659abb,809b8082c134..000000000000
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@@ -86,7 -89,8 +86,12 @@@ void acpi_device_add_finalize(struct ac
+  void acpi_free_pnp_ids(struct acpi_device_pnp *pnp);
+  int acpi_bind_one(struct device *dev, acpi_handle handle);
+  int acpi_unbind_one(struct device *dev);
+++<<<<<<< HEAD
+ +void acpi_bus_device_eject(struct acpi_device *device, u32 ost_src);
+++=======
++ void acpi_bus_device_eject(void *data, u32 ost_src);
++ bool acpi_device_is_present(struct acpi_device *adev);
+++>>>>>>> 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+  
+  /* --------------------------------------------------------------------------
+                                    Power Resource
+diff --cc drivers/acpi/scan.c
+index 2bbdeee33be4,bc52192785f1..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -320,9 -324,10 +319,14 @@@ void acpi_bus_device_eject(struct acpi_
+  	goto out;
+  }
+  
+ -static void acpi_scan_bus_device_check(void *data, u32 ost_source)
+ +static void acpi_scan_bus_device_check(acpi_handle handle, u32 ost_source)
+  {
+++<<<<<<< HEAD
+ +	struct acpi_device *device = NULL;
+++=======
++ 	acpi_handle handle = data;
++ 	struct acpi_device *device;
+++>>>>>>> 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+  	u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+  	int error;
+  
+@@@ -1051,33 -1112,6 +1057,36 @@@ int acpi_device_add(struct acpi_device 
+  	return result;
+  }
+  
+++<<<<<<< HEAD
+ +static void acpi_device_unregister(struct acpi_device *device)
+ +{
+ +	mutex_lock(&acpi_device_lock);
+ +	if (device->parent)
+ +		list_del(&device->node);
+ +
+ +	list_del(&device->wakeup_list);
+ +	mutex_unlock(&acpi_device_lock);
+ +
+ +	acpi_detach_data(device->handle, acpi_bus_data_handler);
+ +
+ +	acpi_power_add_remove_device(device, false);
+ +	acpi_device_remove_files(device);
+ +	if (device->remove)
+ +		device->remove(device);
+ +
+ +	device_del(&device->dev);
+ +	/*
+ +	 * Transition the device to D3cold to drop the reference counts of all
+ +	 * power resources the device depends on and turn off the ones that have
+ +	 * no more references.
+ +	 */
+ +	acpi_device_set_power(device, ACPI_STATE_D3_COLD);
+ +	device->handle = NULL;
+ +	put_device(&device->dev);
+ +}
+ +
+++=======
+++>>>>>>> 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+  /* --------------------------------------------------------------------------
+                                   Driver Management
+     -------------------------------------------------------------------------- */
+diff --cc drivers/pci/hotplug/acpiphp_glue.c
+index 212725764a09,67be6bab7535..000000000000
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@@ -585,52 -466,31 +585,59 @@@ static unsigned char acpiphp_max_busnr(
+  	return max;
+  }
+  
+ +
+  /**
+ - * acpiphp_bus_trim - Trim device objects in an ACPI namespace subtree.
+ - * @handle: ACPI device object handle to start from.
+ + * acpiphp_bus_add - add a new bus to acpi subsystem
+ + * @func: acpiphp_func of the bridge
+   */
+ -static void acpiphp_bus_trim(acpi_handle handle)
+ +static int acpiphp_bus_add(struct acpiphp_func *func)
+  {
+ -	struct acpi_device *adev = NULL;
+ +	struct acpi_device *device;
+ +	int ret_val;
+  
+ -	acpi_bus_get_device(handle, &adev);
+ -	if (adev)
+ -		acpi_bus_trim(adev);
+ +	if (!acpi_bus_get_device(func->handle, &device)) {
+ +		pr_debug("bus exists... trim\n");
+ +		/* this shouldn't be in here, so remove
+ +		 * the bus then re-add it...
+ +		 */
+ +		acpi_bus_trim(device);
+ +	}
+ +
+ +	ret_val = acpi_bus_scan(func->handle);
+ +	if (!ret_val)
+ +		ret_val = acpi_bus_get_device(func->handle, &device);
+ +
+ +	if (ret_val)
+ +		pr_debug("error adding bus, %x\n", -ret_val);
+ +
+ +	return ret_val;
+  }
+  
+ +
+++<<<<<<< HEAD
+  /**
+ - * acpiphp_bus_add - Scan ACPI namespace subtree.
+ - * @handle: ACPI object handle to start the scan from.
+ + * acpiphp_bus_trim - trim a bus from acpi subsystem
+ + * @handle: handle to acpi namespace
+   */
+ -static void acpiphp_bus_add(acpi_handle handle)
+ +static int acpiphp_bus_trim(acpi_handle handle)
+  {
+ -	struct acpi_device *adev = NULL;
+ +	struct acpi_device *device;
+ +	int retval;
+  
+ +	retval = acpi_bus_get_device(handle, &device);
+ +	if (retval) {
+ +		pr_debug("acpi_device not found\n");
+ +		return retval;
+ +	}
+ +
+ +	acpi_bus_trim(device);
+ +	return 0;
+++=======
++ 	acpi_bus_scan(handle);
++ 	acpi_bus_get_device(handle, &adev);
++ 	if (acpi_device_enumerated(adev))
++ 		acpi_device_set_power(adev, ACPI_STATE_D0);
+++>>>>>>> 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+  }
+  
+  static void acpiphp_set_acpi_region(struct acpiphp_slot *slot)
+diff --cc include/acpi/acpi_bus.h
+index be0290eb08d8,e748dbfca9d5..000000000000
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@@ -399,6 -388,14 +401,17 @@@ int acpi_match_device_ids(struct acpi_d
+  int acpi_create_dir(struct acpi_device *);
+  void acpi_remove_dir(struct acpi_device *);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool acpi_device_enumerated(struct acpi_device *adev)
++ {
++ 	return adev && adev->flags.initialized && adev->flags.visited;
++ }
++ 
++ typedef void (*acpi_hp_callback)(void *data, u32 src);
++ 
++ acpi_status acpi_hotplug_execute(acpi_hp_callback func, void *data, u32 src);
+++>>>>>>> 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+  
+  /**
+   * module_acpi_driver(acpi_driver) - Helper macro for registering an ACPI driver
+diff --git a/Documentation/acpi/namespace.txt b/Documentation/acpi/namespace.txt
+index 260f6a3661fa..1860cb3865c6 100644
+--- a/Documentation/acpi/namespace.txt
++++ b/Documentation/acpi/namespace.txt
+@@ -235,10 +235,6 @@ Wysocki <rafael.j.wysocki@intel.com>.
+       named object's type in the second column).  In that case the object's
+       directory in sysfs will contain the 'path' attribute whose value is
+       the full path to the node from the namespace root.
+-      struct acpi_device objects are created for the ACPI namespace nodes
+-      whose _STA control methods return PRESENT or FUNCTIONING.  The power
+-      resource nodes or nodes without _STA are assumed to be both PRESENT
+-      and FUNCTIONING.
+    F:
+       The struct acpi_device object is created for a fixed hardware
+       feature (as indicated by the fixed feature flag's name in the second
+@@ -340,7 +336,7 @@ Wysocki <rafael.j.wysocki@intel.com>.
+      | +-------------+-------+----------------+
+      |   |
+      |   | +- - - - - - - +- - - - - - +- - - - - - - -+
+-     |   +-| * PNP0C0D:00 | \_SB_.LID0 | acpi:PNP0C0D: |
++     |   +-| PNP0C0D:00 | \_SB_.LID0 | acpi:PNP0C0D: |
+      |   | +- - - - - - - +- - - - - - +- - - - - - - -+
+      |   |
+      |   | +------------+------------+-----------------------+
+@@ -390,6 +386,3 @@ Wysocki <rafael.j.wysocki@intel.com>.
+             attribute (as described earlier in this document).
+    NOTE: N/A indicates the device object does not have the 'path' or the
+          'modalias' attribute.
+-   NOTE: The PNP0C0D device listed above is highlighted (marked by "*")
+-         to indicate it will be created only when its _STA methods return
+-         PRESENT or FUNCTIONING.
+diff --git a/drivers/acpi/device_pm.c b/drivers/acpi/device_pm.c
+index 2efd5a58cd12..2f186de72330 100644
+--- a/drivers/acpi/device_pm.c
++++ b/drivers/acpi/device_pm.c
+@@ -264,6 +264,8 @@ int acpi_bus_init_power(struct acpi_device *device)
+ 		return -EINVAL;
+ 
+ 	device->power.state = ACPI_STATE_UNKNOWN;
++	if (!acpi_device_is_present(device))
++		return 0;
+ 
+ 	result = acpi_device_get_power(device, &state);
+ 	if (result)
+@@ -310,15 +312,18 @@ int acpi_device_fix_up_power(struct acpi_device *device)
+ 	return ret;
+ }
+ 
+-int acpi_bus_update_power(acpi_handle handle, int *state_p)
++int acpi_device_update_power(struct acpi_device *device, int *state_p)
+ {
+-	struct acpi_device *device;
+ 	int state;
+ 	int result;
+ 
+-	result = acpi_bus_get_device(handle, &device);
+-	if (result)
++	if (device->power.state == ACPI_STATE_UNKNOWN) {
++		result = acpi_bus_init_power(device);
++		if (!result && state_p)
++			*state_p = device->power.state;
++
+ 		return result;
++	}
+ 
+ 	result = acpi_device_get_power(device, &state);
+ 	if (result)
+@@ -346,6 +351,15 @@ int acpi_bus_update_power(acpi_handle handle, int *state_p)
+ 
+ 	return 0;
+ }
++
++int acpi_bus_update_power(acpi_handle handle, int *state_p)
++{
++	struct acpi_device *device;
++	int result;
++
++	result = acpi_bus_get_device(handle, &device);
++	return result ? result : acpi_device_update_power(device, state_p);
++}
+ EXPORT_SYMBOL_GPL(acpi_bus_update_power);
+ 
+ bool acpi_bus_power_manageable(acpi_handle handle)
+diff --git a/drivers/acpi/dock.c b/drivers/acpi/dock.c
+index 9a2e19a821db..de0b95aa008e 100644
+--- a/drivers/acpi/dock.c
++++ b/drivers/acpi/dock.c
+@@ -309,14 +309,11 @@ static int dock_present(struct dock_station *ds)
+  */
+ static void dock_create_acpi_device(acpi_handle handle)
+ {
+-	struct acpi_device *device;
++	struct acpi_device *device = NULL;
+ 	int ret;
+ 
+-	if (acpi_bus_get_device(handle, &device)) {
+-		/*
+-		 * no device created for this object,
+-		 * so we should create one.
+-		 */
++	acpi_bus_get_device(handle, &device);
++	if (!acpi_device_enumerated(device)) {
+ 		ret = acpi_bus_scan(handle);
+ 		if (ret)
+ 			pr_debug("error adding bus, %x\n", -ret);
+* Unmerged path drivers/acpi/internal.h
+diff --git a/drivers/acpi/pci_root.c b/drivers/acpi/pci_root.c
+index 652517550b2a..75436dde12ff 100644
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@ -640,9 +640,10 @@ void __init acpi_pci_root_init(void)
+ 
+ static void handle_root_bridge_insertion(acpi_handle handle)
+ {
+-	struct acpi_device *device;
++	struct acpi_device *device = NULL;
+ 
+-	if (!acpi_bus_get_device(handle, &device)) {
++	acpi_bus_get_device(handle, &device);
++	if (acpi_device_enumerated(device)) {
+ 		dev_printk(KERN_DEBUG, &device->dev,
+ 			   "acpi device already exists; ignoring notify\n");
+ 		return;
+* Unmerged path drivers/acpi/scan.c
+* Unmerged path drivers/pci/hotplug/acpiphp_glue.c
+diff --git a/drivers/xen/xen-acpi-cpuhotplug.c b/drivers/xen/xen-acpi-cpuhotplug.c
+index 8dae6c13063a..73496c3d18ae 100644
+--- a/drivers/xen/xen-acpi-cpuhotplug.c
++++ b/drivers/xen/xen-acpi-cpuhotplug.c
+@@ -269,7 +269,8 @@ static void acpi_processor_hotplug_notify(acpi_handle handle,
+ 		if (!is_processor_present(handle))
+ 			break;
+ 
+-		if (!acpi_bus_get_device(handle, &device))
++		acpi_bus_get_device(handle, &device);
++		if (acpi_device_enumerated(device))
+ 			break;
+ 
+ 		result = acpi_bus_scan(handle);
+@@ -277,8 +278,9 @@ static void acpi_processor_hotplug_notify(acpi_handle handle,
+ 			pr_err(PREFIX "Unable to add the device\n");
+ 			break;
+ 		}
+-		result = acpi_bus_get_device(handle, &device);
+-		if (result) {
++		device = NULL;
++		acpi_bus_get_device(handle, &device);
++		if (!acpi_device_enumerated(device)) {
+ 			pr_err(PREFIX "Missing device object\n");
+ 			break;
+ 		}
+diff --git a/drivers/xen/xen-acpi-memhotplug.c b/drivers/xen/xen-acpi-memhotplug.c
+index 9083f1e474f8..9b056f06691f 100644
+--- a/drivers/xen/xen-acpi-memhotplug.c
++++ b/drivers/xen/xen-acpi-memhotplug.c
+@@ -169,7 +169,7 @@ static int acpi_memory_get_device(acpi_handle handle,
+ 	acpi_scan_lock_acquire();
+ 
+ 	acpi_bus_get_device(handle, &device);
+-	if (device)
++	if (acpi_device_enumerated(device))
+ 		goto end;
+ 
+ 	/*
+@@ -182,8 +182,9 @@ static int acpi_memory_get_device(acpi_handle handle,
+ 		result = -EINVAL;
+ 		goto out;
+ 	}
+-	result = acpi_bus_get_device(handle, &device);
+-	if (result) {
++	device = NULL;
++	acpi_bus_get_device(handle, &device);
++	if (!acpi_device_enumerated(device)) {
+ 		pr_warn(PREFIX "Missing device object\n");
+ 		result = -EINVAL;
+ 		goto out;
+* Unmerged path include/acpi/acpi_bus.h
