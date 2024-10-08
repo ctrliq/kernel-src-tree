@@ -1,0 +1,131 @@
+mmc: sdhci: allow sdio interrupts while sdhci runtime suspended
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mmc] sdhci: allow sdio interrupts while sdhci runtime suspended (Don Zickus) [1127975 1277866 1280133 1286932 1297039]
+Rebuild_FUZZ: 95.87%
+commit-author Russell King <rmk+kernel@arm.linux.org.uk>
+commit be138554a7923658ded799b0e8794d9c1d08a6e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/be138554.failed
+
+Allow SDIO interrupts to be received while the SDHCI host is runtime
+suspended.  We do this by leaving the AHB clock enabled while the
+host is runtime suspended so we can access the SDHCI registers, and
+so read and raise the SDIO card interrupt.
+
+	Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+	Tested-by: Markus Pargmann <mpa@pengutronix.de>
+	Tested-by: Stephen Warren <swarren@nvidia.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Chris Ball <chris@printf.net>
+(cherry picked from commit be138554a7923658ded799b0e8794d9c1d08a6e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-esdhc-imx.c
+diff --cc drivers/mmc/host/sdhci-esdhc-imx.c
+index 98f46704baa6,b0b4eea8d232..000000000000
+--- a/drivers/mmc/host/sdhci-esdhc-imx.c
++++ b/drivers/mmc/host/sdhci-esdhc-imx.c
+@@@ -659,6 -1160,47 +659,50 @@@ static int sdhci_esdhc_imx_remove(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_RUNTIME
++ static int sdhci_esdhc_runtime_suspend(struct device *dev)
++ {
++ 	struct sdhci_host *host = dev_get_drvdata(dev);
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 	int ret;
++ 
++ 	ret = sdhci_runtime_suspend_host(host);
++ 
++ 	if (!sdhci_sdio_irq_enabled(host)) {
++ 		clk_disable_unprepare(imx_data->clk_per);
++ 		clk_disable_unprepare(imx_data->clk_ipg);
++ 	}
++ 	clk_disable_unprepare(imx_data->clk_ahb);
++ 
++ 	return ret;
++ }
++ 
++ static int sdhci_esdhc_runtime_resume(struct device *dev)
++ {
++ 	struct sdhci_host *host = dev_get_drvdata(dev);
++ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++ 	struct pltfm_imx_data *imx_data = pltfm_host->priv;
++ 
++ 	if (!sdhci_sdio_irq_enabled(host)) {
++ 		clk_prepare_enable(imx_data->clk_per);
++ 		clk_prepare_enable(imx_data->clk_ipg);
++ 	}
++ 	clk_prepare_enable(imx_data->clk_ahb);
++ 
++ 	return sdhci_runtime_resume_host(host);
++ }
++ #endif
++ 
++ static const struct dev_pm_ops sdhci_esdhc_pmops = {
++ 	SET_SYSTEM_SLEEP_PM_OPS(sdhci_pltfm_suspend, sdhci_pltfm_resume)
++ 	SET_RUNTIME_PM_OPS(sdhci_esdhc_runtime_suspend,
++ 				sdhci_esdhc_runtime_resume, NULL)
++ };
++ 
+++>>>>>>> be138554a792 (mmc: sdhci: allow sdio interrupts while sdhci runtime suspended)
+  static struct platform_driver sdhci_esdhc_imx_driver = {
+  	.driver		= {
+  		.name	= "sdhci-esdhc-imx",
+* Unmerged path drivers/mmc/host/sdhci-esdhc-imx.c
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 9a66ab1fa866..066671bcc680 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -1711,8 +1711,7 @@ static int sdhci_get_ro(struct mmc_host *mmc)
+ 
+ static void sdhci_enable_sdio_irq_nolock(struct sdhci_host *host, int enable)
+ {
+-	/* SDIO IRQ will be enabled as appropriate in runtime resume */
+-	if (!(host->flags & SDHCI_DEVICE_DEAD) || host->runtime_suspended) {
++	if (!(host->flags & SDHCI_DEVICE_DEAD)) {
+ 		if (enable)
+ 			sdhci_unmask_irqs(host, SDHCI_INT_CARD_INT);
+ 		else
+@@ -2426,7 +2425,7 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
+ 
+ 	spin_lock(&host->lock);
+ 
+-	if (host->runtime_suspended) {
++	if (host->runtime_suspended && !sdhci_sdio_irq_enabled(host)) {
+ 		spin_unlock(&host->lock);
+ 		return IRQ_NONE;
+ 	}
+@@ -2692,7 +2691,7 @@ int sdhci_runtime_suspend_host(struct sdhci_host *host)
+ 	}
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+-	sdhci_mask_irqs(host, SDHCI_INT_ALL_MASK);
++	sdhci_mask_irqs(host, SDHCI_INT_ALL_MASK & ~SDHCI_INT_CARD_INT);
+ 	spin_unlock_irqrestore(&host->lock, flags);
+ 
+ 	synchronize_hardirq(host->irq);
+diff --git a/drivers/mmc/host/sdhci.h b/drivers/mmc/host/sdhci.h
+index 0a3ed01887db..fc6f81d2f377 100644
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -397,6 +397,11 @@ extern void sdhci_remove_host(struct sdhci_host *host, int dead);
+ extern void sdhci_send_command(struct sdhci_host *host,
+ 				struct mmc_command *cmd);
+ 
++static inline bool sdhci_sdio_irq_enabled(struct sdhci_host *host)
++{
++	return !!(host->flags & SDHCI_SDIO_IRQ_ENABLED);
++}
++
+ #ifdef CONFIG_PM
+ extern int sdhci_suspend_host(struct sdhci_host *host);
+ extern int sdhci_resume_host(struct sdhci_host *host);
