@@ -1,0 +1,219 @@
+crypto: nx - make platform drivers directly register with crypto
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [crypto] nx - make platform drivers directly register with crypto (Gustavo Duarte) [1238571 1245132]
+Rebuild_FUZZ: 93.33%
+commit-author Dan Streetman <ddstreet@ieee.org>
+commit 03952d98015326a07ae1cf7adb4c43265ec4058f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/03952d98.failed
+
+Remove the common 'platform' registration module, and move the crypto
+compression driver registration into each of the pSeries and PowerNV
+platform NX 842 drivers.  Change the nx-842.c code into simple common
+functions that each platform driver uses to perform constraints-based
+buffer changes, i.e. realigning and/or resizing buffers to match the
+driver's hardware requirements.
+
+The common 'platform' module was my mistake to create - since each
+platform driver will only load/operate when running on its own
+platform (i.e. a pSeries platform or a PowerNV platform), they can
+directly register with the crypto subsystem, using the same alg and
+driver name.  This removes unneeded complexity.
+
+	Signed-off-by: Dan Streetman <ddstreet@ieee.org>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 03952d98015326a07ae1cf7adb4c43265ec4058f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/nx/Makefile
+#	drivers/crypto/nx/nx-842-powernv.c
+#	drivers/crypto/nx/nx-842-pseries.c
+#	drivers/crypto/nx/nx-842.c
+#	drivers/crypto/nx/nx-842.h
+diff --cc drivers/crypto/nx/Makefile
+index 8669ffa8dc5c,b727821c8ed4..000000000000
+--- a/drivers/crypto/nx/Makefile
++++ b/drivers/crypto/nx/Makefile
+@@@ -10,5 -10,8 +10,13 @@@ nx-crypto-objs := nx.o 
+  		  nx-sha256.o \
+  		  nx-sha512.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_CRYPTO_DEV_NX_COMPRESS) += nx-compress.o
+ +nx-compress-objs := nx-842-pseries.o
+++=======
++ obj-$(CONFIG_CRYPTO_DEV_NX_COMPRESS_PSERIES) += nx-compress-pseries.o nx-compress.o
++ obj-$(CONFIG_CRYPTO_DEV_NX_COMPRESS_POWERNV) += nx-compress-powernv.o nx-compress.o
++ nx-compress-objs := nx-842.o
++ nx-compress-pseries-objs := nx-842-pseries.o
++ nx-compress-powernv-objs := nx-842-powernv.o
+++>>>>>>> 03952d980153 (crypto: nx - make platform drivers directly register with crypto)
+diff --cc drivers/crypto/nx/nx-842-pseries.c
+index 76beaceab79e,b6a26907e11f..000000000000
+--- a/drivers/crypto/nx/nx-842-pseries.c
++++ b/drivers/crypto/nx/nx-842-pseries.c
+@@@ -36,27 -29,62 +36,29 @@@
+  MODULE_LICENSE("GPL");
+  MODULE_AUTHOR("Robert Jennings <rcj@linux.vnet.ibm.com>");
+  MODULE_DESCRIPTION("842 H/W Compression driver for IBM Power processors");
++ MODULE_ALIAS_CRYPTO("842");
++ MODULE_ALIAS_CRYPTO("842-nx");
+  
+ -static struct nx842_constraints nx842_pseries_constraints = {
+ -	.alignment =	DDE_BUFFER_ALIGN,
+ -	.multiple =	DDE_BUFFER_LAST_MULT,
+ -	.minimum =	DDE_BUFFER_LAST_MULT,
+ -	.maximum =	PAGE_SIZE, /* dynamic, max_sync_size */
+ +#define SHIFT_4K 12
+ +#define SHIFT_64K 16
+ +#define SIZE_4K (1UL << SHIFT_4K)
+ +#define SIZE_64K (1UL << SHIFT_64K)
+ +
+ +/* IO buffer must be 128 byte aligned */
+ +#define IO_BUFFER_ALIGN 128
+ +
+ +struct nx842_header {
+ +	int blocks_nr; /* number of compressed blocks */
+ +	int offset; /* offset of the first block (from beginning of header) */
+ +	int sizes[0]; /* size of compressed blocks */
+  };
+  
+ -static int check_constraints(unsigned long buf, unsigned int *len, bool in)
+ +static inline int nx842_header_size(const struct nx842_header *hdr)
+  {
+ -	if (!IS_ALIGNED(buf, nx842_pseries_constraints.alignment)) {
+ -		pr_debug("%s buffer 0x%lx not aligned to 0x%x\n",
+ -			 in ? "input" : "output", buf,
+ -			 nx842_pseries_constraints.alignment);
+ -		return -EINVAL;
+ -	}
+ -	if (*len % nx842_pseries_constraints.multiple) {
+ -		pr_debug("%s buffer len 0x%x not multiple of 0x%x\n",
+ -			 in ? "input" : "output", *len,
+ -			 nx842_pseries_constraints.multiple);
+ -		if (in)
+ -			return -EINVAL;
+ -		*len = round_down(*len, nx842_pseries_constraints.multiple);
+ -	}
+ -	if (*len < nx842_pseries_constraints.minimum) {
+ -		pr_debug("%s buffer len 0x%x under minimum 0x%x\n",
+ -			 in ? "input" : "output", *len,
+ -			 nx842_pseries_constraints.minimum);
+ -		return -EINVAL;
+ -	}
+ -	if (*len > nx842_pseries_constraints.maximum) {
+ -		pr_debug("%s buffer len 0x%x over maximum 0x%x\n",
+ -			 in ? "input" : "output", *len,
+ -			 nx842_pseries_constraints.maximum);
+ -		if (in)
+ -			return -EINVAL;
+ -		*len = nx842_pseries_constraints.maximum;
+ -	}
+ -	return 0;
+ +	return sizeof(struct nx842_header) +
+ +			hdr->blocks_nr * sizeof(hdr->sizes[0]);
+  }
+  
+ -/* I assume we need to align the CSB? */
+ -#define WORKMEM_ALIGN	(256)
+ -
+ -struct nx842_workmem {
+ -	/* scatterlist */
+ -	char slin[4096];
+ -	char slout[4096];
+ -	/* coprocessor status/parameter block */
+ -	struct nx_csbcpb csbcpb;
+ -
+ -	char padding[WORKMEM_ALIGN];
+ -} __aligned(WORKMEM_ALIGN);
+ -
+  /* Macros for fields within nx_csbcpb */
+  /* Check the valid bit within the csbcpb valid field */
+  #define NX842_CSBCBP_VALID_CHK(x) (x & BIT_MASK(7))
+@@@ -1131,8 -950,36 +1133,41 @@@ static struct attribute_group nx842_att
+  	.attrs = nx842_sysfs_entries,
+  };
+  
+++<<<<<<< HEAD
+ +static int __init nx842_probe(struct vio_dev *viodev,
+ +				  const struct vio_device_id *id)
+++=======
++ static struct nx842_driver nx842_pseries_driver = {
++ 	.name =		KBUILD_MODNAME,
++ 	.owner =	THIS_MODULE,
++ 	.workmem_size =	sizeof(struct nx842_workmem),
++ 	.constraints =	&nx842_pseries_constraints,
++ 	.compress =	nx842_pseries_compress,
++ 	.decompress =	nx842_pseries_decompress,
++ };
++ 
++ static int nx842_pseries_crypto_init(struct crypto_tfm *tfm)
++ {
++ 	return nx842_crypto_init(tfm, &nx842_pseries_driver);
++ }
++ 
++ static struct crypto_alg nx842_pseries_alg = {
++ 	.cra_name		= "842",
++ 	.cra_driver_name	= "842-nx",
++ 	.cra_priority		= 300,
++ 	.cra_flags		= CRYPTO_ALG_TYPE_COMPRESS,
++ 	.cra_ctxsize		= sizeof(struct nx842_crypto_ctx),
++ 	.cra_module		= THIS_MODULE,
++ 	.cra_init		= nx842_pseries_crypto_init,
++ 	.cra_exit		= nx842_crypto_exit,
++ 	.cra_u			= { .compress = {
++ 	.coa_compress		= nx842_crypto_compress,
++ 	.coa_decompress		= nx842_crypto_decompress } }
++ };
++ 
++ static int nx842_probe(struct vio_dev *viodev,
++ 		       const struct vio_device_id *id)
+++>>>>>>> 03952d980153 (crypto: nx - make platform drivers directly register with crypto)
+  {
+  	struct nx842_devdata *old_devdata, *new_devdata = NULL;
+  	unsigned long flags;
+@@@ -1245,7 -1104,15 +1288,19 @@@ static int __init nx842_pseries_init(vo
+  	}
+  	RCU_INIT_POINTER(devdata, new_devdata);
+  
+++<<<<<<< HEAD
+ +	return vio_register_driver(&nx842_driver);
+++=======
++ 	ret = vio_register_driver(&nx842_vio_driver);
++ 	if (ret) {
++ 		pr_err("Could not register VIO driver %d\n", ret);
++ 
++ 		kfree(new_devdata);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 03952d980153 (crypto: nx - make platform drivers directly register with crypto)
+  }
+  
+  module_init(nx842_pseries_init);
+@@@ -1255,7 -1122,8 +1310,12 @@@ static void __exit nx842_pseries_exit(v
+  	struct nx842_devdata *old_devdata;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	pr_info("Exiting IBM Power 842 compression driver\n");
+++=======
++ 	crypto_unregister_alg(&nx842_pseries_alg);
++ 
+++>>>>>>> 03952d980153 (crypto: nx - make platform drivers directly register with crypto)
+  	spin_lock_irqsave(&devdata_mutex, flags);
+  	old_devdata = rcu_dereference_check(devdata,
+  			lockdep_is_held(&devdata_mutex));
+* Unmerged path drivers/crypto/nx/nx-842-powernv.c
+* Unmerged path drivers/crypto/nx/nx-842.c
+* Unmerged path drivers/crypto/nx/nx-842.h
+* Unmerged path drivers/crypto/nx/Makefile
+* Unmerged path drivers/crypto/nx/nx-842-powernv.c
+* Unmerged path drivers/crypto/nx/nx-842-pseries.c
+* Unmerged path drivers/crypto/nx/nx-842.c
+* Unmerged path drivers/crypto/nx/nx-842.h
