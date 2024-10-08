@@ -1,0 +1,158 @@
+net: sctp: fix permissions for rto_alpha and rto_beta knobs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [net] sctp: fix permissions for rto_alpha and rto_beta knobs (Daniel Borkmann) [1110290]
+Rebuild_FUZZ: 95.58%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit b58537a1f5629bdc98a8b9dc2051ce0e952f6b4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b58537a1.failed
+
+Commit 3fd091e73b81 ("[SCTP]: Remove multiple levels of msecs
+to jiffies conversions.") has silently changed permissions for
+rto_alpha and rto_beta knobs from 0644 to 0444. The purpose of
+this was to discourage users from tweaking rto_alpha and
+rto_beta knobs in production environments since they are key
+to correctly compute rtt/srtt.
+
+RFC4960 under section 6.3.1. RTO Calculation says regarding
+rto_alpha and rto_beta under rule C3 and C4:
+
+  [...]
+  C3)  When a new RTT measurement R' is made, set
+
+       RTTVAR <- (1 - RTO.Beta) * RTTVAR + RTO.Beta * |SRTT - R'|
+
+       and
+
+       SRTT <- (1 - RTO.Alpha) * SRTT + RTO.Alpha * R'
+
+       Note: The value of SRTT used in the update to RTTVAR
+       is its value before updating SRTT itself using the
+       second assignment. After the computation, update
+       RTO <- SRTT + 4 * RTTVAR.
+
+  C4)  When data is in flight and when allowed by rule C5
+       below, a new RTT measurement MUST be made each round
+       trip. Furthermore, new RTT measurements SHOULD be
+       made no more than once per round trip for a given
+       destination transport address. There are two reasons
+       for this recommendation: First, it appears that
+       measuring more frequently often does not in practice
+       yield any significant benefit [ALLMAN99]; second,
+       if measurements are made more often, then the values
+       of RTO.Alpha and RTO.Beta in rule C3 above should be
+       adjusted so that SRTT and RTTVAR still adjust to
+       changes at roughly the same rate (in terms of how many
+       round trips it takes them to reflect new values) as
+       they would if making only one measurement per
+       round-trip and using RTO.Alpha and RTO.Beta as given
+       in rule C3. However, the exact nature of these
+       adjustments remains a research issue.
+  [...]
+
+While it is discouraged to adjust rto_alpha and rto_beta
+and not further specified how to adjust them, the RFC also
+doesn't explicitly forbid it, but rather gives a RECOMMENDED
+default value (rto_alpha=3, rto_beta=2). We have a couple
+of users relying on the old permissions before they got
+changed. That said, if someone really has the urge to adjust
+them, we could allow it with a warning in the log.
+
+Fixes: 3fd091e73b81 ("[SCTP]: Remove multiple levels of msecs to jiffies conversions.")
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Cc: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b58537a1f5629bdc98a8b9dc2051ce0e952f6b4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/sysctl.c
+diff --cc net/sctp/sysctl.c
+index a63b3c8535e2,dcb19592761e..000000000000
+--- a/net/sctp/sysctl.c
++++ b/net/sctp/sysctl.c
+@@@ -36,11 -32,10 +36,13 @@@
+   *    Ardelle Fan           <ardelle.fan@intel.com>
+   *    Ryan Layer            <rmlayer@us.ibm.com>
+   *    Sridhar Samudrala     <sri@us.ibm.com>
+ + *
+ + * Any bugs reported given to us we will try to fix... any fixes shared will
+ + * be incorporated into the next SCTP release.
+   */
+  
++ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++ 
+  #include <net/sctp/structs.h>
+  #include <net/sctp/sctp.h>
+  #include <linux/sysctl.h>
+@@@ -71,6 -71,12 +78,15 @@@ static int proc_sctp_do_rto_min(struct 
+  static int proc_sctp_do_rto_max(struct ctl_table *ctl, int write,
+  				void __user *buffer, size_t *lenp,
+  				loff_t *ppos);
+++<<<<<<< HEAD
+++=======
++ static int proc_sctp_do_alpha_beta(struct ctl_table *ctl, int write,
++ 				   void __user *buffer, size_t *lenp,
++ 				   loff_t *ppos);
++ static int proc_sctp_do_auth(struct ctl_table *ctl, int write,
++ 			     void __user *buffer, size_t *lenp,
++ 			     loff_t *ppos);
+++>>>>>>> b58537a1f562 (net: sctp: fix permissions for rto_alpha and rto_beta knobs)
+  
+  static struct ctl_table sctp_table[] = {
+  	{
+@@@ -407,6 -417,47 +427,50 @@@ static int proc_sctp_do_rto_max(struct 
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int proc_sctp_do_alpha_beta(struct ctl_table *ctl, int write,
++ 				   void __user *buffer, size_t *lenp,
++ 				   loff_t *ppos)
++ {
++ 	pr_warn_once("Changing rto_alpha or rto_beta may lead to "
++ 		     "suboptimal rtt/srtt estimations!\n");
++ 
++ 	return proc_dointvec_minmax(ctl, write, buffer, lenp, ppos);
++ }
++ 
++ static int proc_sctp_do_auth(struct ctl_table *ctl, int write,
++ 			     void __user *buffer, size_t *lenp,
++ 			     loff_t *ppos)
++ {
++ 	struct net *net = current->nsproxy->net_ns;
++ 	struct ctl_table tbl;
++ 	int new_value, ret;
++ 
++ 	memset(&tbl, 0, sizeof(struct ctl_table));
++ 	tbl.maxlen = sizeof(unsigned int);
++ 
++ 	if (write)
++ 		tbl.data = &new_value;
++ 	else
++ 		tbl.data = &net->sctp.auth_enable;
++ 
++ 	ret = proc_dointvec(&tbl, write, buffer, lenp, ppos);
++ 
++ 	if (write) {
++ 		struct sock *sk = net->sctp.ctl_sock;
++ 
++ 		net->sctp.auth_enable = new_value;
++ 		/* Update the value in the control socket */
++ 		lock_sock(sk);
++ 		sctp_sk(sk)->ep->auth_enable = new_value;
++ 		release_sock(sk);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> b58537a1f562 (net: sctp: fix permissions for rto_alpha and rto_beta knobs)
+  int sctp_sysctl_net_register(struct net *net)
+  {
+  	struct ctl_table *table;
+* Unmerged path net/sctp/sysctl.c
