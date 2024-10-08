@@ -1,0 +1,419 @@
+block: remove old blk_iopoll_enabled variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [block] remove old blk_iopoll_enabled variable (Jeff Moyer) [1336479]
+Rebuild_FUZZ: 91.57%
+commit-author Jens Axboe <axboe@fb.com>
+commit 89f8b33ca1ea881d1d84542282cb85d07d02e78d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/89f8b33c.failed
+
+This was a debugging measure to toggle enabled/disabled
+when testing. But for real production setups, it's not
+safe to toggle this setting without either reloading
+drivers of quiescing IO first. Neither of which the toggle
+enforces.
+
+Additionally, it makes drivers deal with the conditional
+state.
+
+Remove it completely. It's up to the driver whether iopoll
+is enabled or not.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 89f8b33ca1ea881d1d84542282cb85d07d02e78d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sysctl.c
+diff --cc kernel/sysctl.c
+index 650fd94446e0,ef0bf04e8649..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -1113,24 -1091,6 +1110,27 @@@ static struct ctl_table kern_table[] = 
+  		.proc_handler	= proc_dointvec,
+  	},
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BLOCK
+ +	{
+ +		.procname	= "blk_iopoll",
+ +		.data		= &blk_iopoll_enabled,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec,
+ +	},
+ +#endif
+ +	{
+ +		.procname	= "panic_on_warn",
+ +		.data		= &panic_on_warn,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec_minmax,
+ +		.extra1		= &zero,
+ +		.extra2		= &one,
+ +	},
+++=======
+++>>>>>>> 89f8b33ca1ea (block: remove old blk_iopoll_enabled variable)
+  	{ }
+  };
+  
+diff --git a/block/blk-iopoll.c b/block/blk-iopoll.c
+index 1855bf51edb0..c11d24e379e2 100644
+--- a/block/blk-iopoll.c
++++ b/block/blk-iopoll.c
+@@ -14,9 +14,6 @@
+ 
+ #include "blk.h"
+ 
+-int blk_iopoll_enabled = 1;
+-EXPORT_SYMBOL(blk_iopoll_enabled);
+-
+ static unsigned int blk_iopoll_budget __read_mostly = 256;
+ 
+ static DEFINE_PER_CPU(struct list_head, blk_cpu_iopoll);
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index 29e4d80b9729..2de88f7c63a5 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -901,7 +901,6 @@ static irqreturn_t be_isr_msix(int irq, void *dev_id)
+ 	struct be_queue_info *cq;
+ 	unsigned int num_eq_processed;
+ 	struct be_eq_obj *pbe_eq;
+-	unsigned long flags;
+ 
+ 	pbe_eq = dev_id;
+ 	eq = &pbe_eq->q;
+@@ -910,31 +909,15 @@ static irqreturn_t be_isr_msix(int irq, void *dev_id)
+ 
+ 	phba = pbe_eq->phba;
+ 	num_eq_processed = 0;
+-	if (blk_iopoll_enabled) {
+-		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+-					& EQE_VALID_MASK) {
+-			if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+-				blk_iopoll_sched(&pbe_eq->iopoll);
+-
+-			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+-			queue_tail_inc(eq);
+-			eqe = queue_tail_node(eq);
+-			num_eq_processed++;
+-		}
+-	} else {
+-		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+-						& EQE_VALID_MASK) {
+-			spin_lock_irqsave(&phba->isr_lock, flags);
+-			pbe_eq->todo_cq = true;
+-			spin_unlock_irqrestore(&phba->isr_lock, flags);
+-			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+-			queue_tail_inc(eq);
+-			eqe = queue_tail_node(eq);
+-			num_eq_processed++;
+-		}
++	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++				& EQE_VALID_MASK) {
++		if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
++			blk_iopoll_sched(&pbe_eq->iopoll);
+ 
+-		if (pbe_eq->todo_cq)
+-			queue_work(phba->wq, &pbe_eq->work_cqs);
++		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
++		queue_tail_inc(eq);
++		eqe = queue_tail_node(eq);
++		num_eq_processed++;
+ 	}
+ 
+ 	if (num_eq_processed)
+@@ -955,7 +938,6 @@ static irqreturn_t be_isr(int irq, void *dev_id)
+ 	struct hwi_context_memory *phwi_context;
+ 	struct be_eq_entry *eqe = NULL;
+ 	struct be_queue_info *eq;
+-	struct be_queue_info *cq;
+ 	struct be_queue_info *mcc;
+ 	unsigned long flags, index;
+ 	unsigned int num_mcceq_processed, num_ioeq_processed;
+@@ -981,72 +963,40 @@ static irqreturn_t be_isr(int irq, void *dev_id)
+ 
+ 	num_ioeq_processed = 0;
+ 	num_mcceq_processed = 0;
+-	if (blk_iopoll_enabled) {
+-		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+-					& EQE_VALID_MASK) {
+-			if (((eqe->dw[offsetof(struct amap_eq_entry,
+-			     resource_id) / 32] &
+-			     EQE_RESID_MASK) >> 16) == mcc->id) {
+-				spin_lock_irqsave(&phba->isr_lock, flags);
+-				pbe_eq->todo_mcc_cq = true;
+-				spin_unlock_irqrestore(&phba->isr_lock, flags);
+-				num_mcceq_processed++;
+-			} else {
+-				if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
+-					blk_iopoll_sched(&pbe_eq->iopoll);
+-				num_ioeq_processed++;
+-			}
+-			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+-			queue_tail_inc(eq);
+-			eqe = queue_tail_node(eq);
+-		}
+-		if (num_ioeq_processed || num_mcceq_processed) {
+-			if (pbe_eq->todo_mcc_cq)
+-				queue_work(phba->wq, &pbe_eq->work_cqs);
+-
+-			if ((num_mcceq_processed) && (!num_ioeq_processed))
+-				hwi_ring_eq_db(phba, eq->id, 0,
+-					      (num_ioeq_processed +
+-					       num_mcceq_processed) , 1, 1);
+-			else
+-				hwi_ring_eq_db(phba, eq->id, 0,
+-					       (num_ioeq_processed +
+-						num_mcceq_processed), 0, 1);
+-
+-			return IRQ_HANDLED;
+-		} else
+-			return IRQ_NONE;
+-	} else {
+-		cq = &phwi_context->be_cq[0];
+-		while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
+-						& EQE_VALID_MASK) {
+-
+-			if (((eqe->dw[offsetof(struct amap_eq_entry,
+-			     resource_id) / 32] &
+-			     EQE_RESID_MASK) >> 16) != cq->id) {
+-				spin_lock_irqsave(&phba->isr_lock, flags);
+-				pbe_eq->todo_mcc_cq = true;
+-				spin_unlock_irqrestore(&phba->isr_lock, flags);
+-			} else {
+-				spin_lock_irqsave(&phba->isr_lock, flags);
+-				pbe_eq->todo_cq = true;
+-				spin_unlock_irqrestore(&phba->isr_lock, flags);
+-			}
+-			AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
+-			queue_tail_inc(eq);
+-			eqe = queue_tail_node(eq);
++	while (eqe->dw[offsetof(struct amap_eq_entry, valid) / 32]
++				& EQE_VALID_MASK) {
++		if (((eqe->dw[offsetof(struct amap_eq_entry,
++		     resource_id) / 32] &
++		     EQE_RESID_MASK) >> 16) == mcc->id) {
++			spin_lock_irqsave(&phba->isr_lock, flags);
++			pbe_eq->todo_mcc_cq = true;
++			spin_unlock_irqrestore(&phba->isr_lock, flags);
++			num_mcceq_processed++;
++		} else {
++			if (!blk_iopoll_sched_prep(&pbe_eq->iopoll))
++				blk_iopoll_sched(&pbe_eq->iopoll);
+ 			num_ioeq_processed++;
+ 		}
+-		if (pbe_eq->todo_cq || pbe_eq->todo_mcc_cq)
++		AMAP_SET_BITS(struct amap_eq_entry, valid, eqe, 0);
++		queue_tail_inc(eq);
++		eqe = queue_tail_node(eq);
++	}
++	if (num_ioeq_processed || num_mcceq_processed) {
++		if (pbe_eq->todo_mcc_cq)
+ 			queue_work(phba->wq, &pbe_eq->work_cqs);
+ 
+-		if (num_ioeq_processed) {
++		if ((num_mcceq_processed) && (!num_ioeq_processed))
+ 			hwi_ring_eq_db(phba, eq->id, 0,
+-				       num_ioeq_processed, 1, 1);
+-			return IRQ_HANDLED;
+-		} else
+-			return IRQ_NONE;
+-	}
++				      (num_ioeq_processed +
++				       num_mcceq_processed) , 1, 1);
++		else
++			hwi_ring_eq_db(phba, eq->id, 0,
++				       (num_ioeq_processed +
++					num_mcceq_processed), 0, 1);
++
++		return IRQ_HANDLED;
++	} else
++		return IRQ_NONE;
+ }
+ 
+ static int beiscsi_init_irqs(struct beiscsi_hba *phba)
+@@ -5344,11 +5294,10 @@ static void beiscsi_quiesce(struct beiscsi_hba *phba,
+ 	pci_disable_msix(phba->pcidev);
+ 	cancel_delayed_work_sync(&phba->beiscsi_hw_check_task);
+ 
+-	if (blk_iopoll_enabled)
+-		for (i = 0; i < phba->num_cpus; i++) {
+-			pbe_eq = &phwi_context->be_eq[i];
+-			blk_iopoll_disable(&pbe_eq->iopoll);
+-		}
++	for (i = 0; i < phba->num_cpus; i++) {
++		pbe_eq = &phwi_context->be_eq[i];
++		blk_iopoll_disable(&pbe_eq->iopoll);
++	}
+ 
+ 	if (unload_state == BEISCSI_CLEAN_UNLOAD) {
+ 		destroy_workqueue(phba->wq);
+@@ -5631,32 +5580,18 @@ static void beiscsi_eeh_resume(struct pci_dev *pdev)
+ 	phwi_ctrlr = phba->phwi_ctrlr;
+ 	phwi_context = phwi_ctrlr->phwi_ctxt;
+ 
+-	if (blk_iopoll_enabled) {
+-		for (i = 0; i < phba->num_cpus; i++) {
+-			pbe_eq = &phwi_context->be_eq[i];
+-			blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
+-					be_iopoll);
+-			blk_iopoll_enable(&pbe_eq->iopoll);
+-		}
+-
+-		i = (phba->msix_enabled) ? i : 0;
+-		/* Work item for MCC handling */
++	for (i = 0; i < phba->num_cpus; i++) {
+ 		pbe_eq = &phwi_context->be_eq[i];
+-		INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+-	} else {
+-		if (phba->msix_enabled) {
+-			for (i = 0; i <= phba->num_cpus; i++) {
+-				pbe_eq = &phwi_context->be_eq[i];
+-				INIT_WORK(&pbe_eq->work_cqs,
+-					  beiscsi_process_all_cqs);
+-			}
+-		} else {
+-			pbe_eq = &phwi_context->be_eq[0];
+-			INIT_WORK(&pbe_eq->work_cqs,
+-				  beiscsi_process_all_cqs);
+-		}
++		blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
++				be_iopoll);
++		blk_iopoll_enable(&pbe_eq->iopoll);
+ 	}
+ 
++	i = (phba->msix_enabled) ? i : 0;
++	/* Work item for MCC handling */
++	pbe_eq = &phwi_context->be_eq[i];
++	INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
++
+ 	ret = beiscsi_init_irqs(phba);
+ 	if (ret < 0) {
+ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+@@ -5818,32 +5753,18 @@ static int beiscsi_dev_probe(struct pci_dev *pcidev,
+ 	phwi_ctrlr = phba->phwi_ctrlr;
+ 	phwi_context = phwi_ctrlr->phwi_ctxt;
+ 
+-	if (blk_iopoll_enabled) {
+-		for (i = 0; i < phba->num_cpus; i++) {
+-			pbe_eq = &phwi_context->be_eq[i];
+-			blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
+-					be_iopoll);
+-			blk_iopoll_enable(&pbe_eq->iopoll);
+-		}
+-
+-		i = (phba->msix_enabled) ? i : 0;
+-		/* Work item for MCC handling */
++	for (i = 0; i < phba->num_cpus; i++) {
+ 		pbe_eq = &phwi_context->be_eq[i];
+-		INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
+-	} else {
+-		if (phba->msix_enabled) {
+-			for (i = 0; i <= phba->num_cpus; i++) {
+-				pbe_eq = &phwi_context->be_eq[i];
+-				INIT_WORK(&pbe_eq->work_cqs,
+-					  beiscsi_process_all_cqs);
+-			}
+-		} else {
+-				pbe_eq = &phwi_context->be_eq[0];
+-				INIT_WORK(&pbe_eq->work_cqs,
+-					  beiscsi_process_all_cqs);
+-			}
++		blk_iopoll_init(&pbe_eq->iopoll, be_iopoll_budget,
++				be_iopoll);
++		blk_iopoll_enable(&pbe_eq->iopoll);
+ 	}
+ 
++	i = (phba->msix_enabled) ? i : 0;
++	/* Work item for MCC handling */
++	pbe_eq = &phwi_context->be_eq[i];
++	INIT_WORK(&pbe_eq->work_cqs, beiscsi_process_all_cqs);
++
+ 	ret = beiscsi_init_irqs(phba);
+ 	if (ret < 0) {
+ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+@@ -5875,11 +5796,10 @@ static int beiscsi_dev_probe(struct pci_dev *pcidev,
+ 
+ free_blkenbld:
+ 	destroy_workqueue(phba->wq);
+-	if (blk_iopoll_enabled)
+-		for (i = 0; i < phba->num_cpus; i++) {
+-			pbe_eq = &phwi_context->be_eq[i];
+-			blk_iopoll_disable(&pbe_eq->iopoll);
+-		}
++	for (i = 0; i < phba->num_cpus; i++) {
++		pbe_eq = &phwi_context->be_eq[i];
++		blk_iopoll_disable(&pbe_eq->iopoll);
++	}
+ free_twq:
+ 	beiscsi_clean_port(phba);
+ 	beiscsi_free_mem(phba);
+diff --git a/drivers/scsi/ipr.c b/drivers/scsi/ipr.c
+index 3131cefaf4a9..0586b84c3f2c 100644
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@ -3697,16 +3697,14 @@ static ssize_t ipr_store_iopoll_weight(struct device *dev,
+ 		return strlen(buf);
+ 	}
+ 
+-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
++	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
+ 			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
+ 	}
+ 
+ 	spin_lock_irqsave(shost->host_lock, lock_flags);
+ 	ioa_cfg->iopoll_weight = user_iopoll_weight;
+-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
++	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
+ 			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
+ 					ioa_cfg->iopoll_weight, ipr_iopoll);
+@@ -5733,8 +5731,7 @@ static irqreturn_t ipr_isr_mhrrq(int irq, void *devp)
+ 		return IRQ_NONE;
+ 	}
+ 
+-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
++	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		if ((be32_to_cpu(*hrrq->hrrq_curr) & IPR_HRRQ_TOGGLE_BIT) ==
+ 		       hrrq->toggle_bit) {
+ 			if (!blk_iopoll_sched_prep(&hrrq->iopoll))
+@@ -10357,8 +10354,7 @@ static int ipr_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
+ 	scsi_scan_host(ioa_cfg->host);
+ 	ioa_cfg->iopoll_weight = ioa_cfg->chip_cfg->iopoll_weight;
+ 
+-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
++	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++) {
+ 			blk_iopoll_init(&ioa_cfg->hrrq[i].iopoll,
+ 					ioa_cfg->iopoll_weight, ipr_iopoll);
+@@ -10388,8 +10384,7 @@ static void ipr_shutdown(struct pci_dev *pdev)
+ 	int i;
+ 
+ 	spin_lock_irqsave(ioa_cfg->host->host_lock, lock_flags);
+-	if (blk_iopoll_enabled && ioa_cfg->iopoll_weight &&
+-			ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
++	if (ioa_cfg->iopoll_weight && ioa_cfg->sis64 && ioa_cfg->nvectors > 1) {
+ 		ioa_cfg->iopoll_weight = 0;
+ 		for (i = 1; i < ioa_cfg->hrrq_num; i++)
+ 			blk_iopoll_disable(&ioa_cfg->hrrq[i].iopoll);
+diff --git a/include/linux/blk-iopoll.h b/include/linux/blk-iopoll.h
+index 308734d3d4a2..77ae77c0b704 100644
+--- a/include/linux/blk-iopoll.h
++++ b/include/linux/blk-iopoll.h
+@@ -43,6 +43,4 @@ extern void __blk_iopoll_complete(struct blk_iopoll *);
+ extern void blk_iopoll_enable(struct blk_iopoll *);
+ extern void blk_iopoll_disable(struct blk_iopoll *);
+ 
+-extern int blk_iopoll_enabled;
+-
+ #endif
+* Unmerged path kernel/sysctl.c
