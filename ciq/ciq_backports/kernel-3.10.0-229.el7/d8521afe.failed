@@ -1,0 +1,322 @@
+usb: assign default peer ports for root hubs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [usb] assign default peer ports for root hubs (Don Zickus) [1110939]
+Rebuild_FUZZ: 93.98%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit d8521afe35862f4fbe3ccd6ca37897c0a304edf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d8521afe.failed
+
+Assume that the peer of a superspeed port is the port with the same id
+on the shared_hcd root hub.  This identification scheme is required of
+external hubs by the USB3 spec [1].  However, for root hubs, tier mismatch
+may be in effect [2].  Tier mismatch can only be enumerated via platform
+firmware.  For now, simply perform the nominal association.
+
+A new lock 'usb_port_peer_mutex' is introduced to synchronize port
+device add/remove with peer lookups.  It protects peering against
+changes to hcd->shared_hcd, hcd->self.root_hub, hdev->maxchild, and
+port_dev->child pointers.
+
+[1]: usb 3.1 section 10.3.3
+[2]: xhci 1.1 appendix D
+
+	Cc: Alan Stern <stern@rowland.harvard.edu>
+[alan: usb_port_peer_mutex locking scheme]
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d8521afe35862f4fbe3ccd6ca37897c0a304edf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/hcd.c
+#	drivers/usb/core/hub.h
+#	drivers/usb/core/port.c
+diff --cc drivers/usb/core/hcd.c
+index 72b62e0d6494,b81407518fdf..000000000000
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@@ -2825,9 -2868,15 +2851,18 @@@ void usb_remove_hcd(struct usb_hcd *hcd
+  			free_irq(hcd->irq, hcd);
+  	}
+  
+- 	usb_put_dev(hcd->self.root_hub);
+  	usb_deregister_bus(&hcd->self);
+  	hcd_buffer_destroy(hcd);
+++<<<<<<< HEAD
+++=======
++ 	if (hcd->remove_phy && hcd->phy) {
++ 		usb_phy_shutdown(hcd->phy);
++ 		usb_put_phy(hcd->phy);
++ 		hcd->phy = NULL;
++ 	}
++ 
++ 	usb_put_invalidate_rhdev(hcd);
+++>>>>>>> d8521afe3586 (usb: assign default peer ports for root hubs)
+  }
+  EXPORT_SYMBOL_GPL(usb_remove_hcd);
+  
+diff --cc drivers/usb/core/hub.h
+index 048812399485,fcad5f9d12f0..000000000000
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@@ -90,7 -91,8 +91,12 @@@ struct usb_hub 
+  struct usb_port {
+  	struct usb_device *child;
+  	struct device dev;
+++<<<<<<< HEAD
+ +	struct dev_state *port_owner;
+++=======
++ 	struct usb_dev_state *port_owner;
++ 	struct usb_port *peer;
+++>>>>>>> d8521afe3586 (usb: assign default peer ports for root hubs)
+  	enum usb_port_connect_type connect_type;
+  	u8 portnum;
+  	unsigned power_is_on:1;
+diff --cc drivers/usb/core/port.c
+index 168fa6ee3348,5ecdbf31dfcb..000000000000
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@@ -152,9 -152,71 +152,74 @@@ struct device_type usb_port_device_typ
+  	.pm =		&usb_port_pm_ops,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct device_driver usb_port_driver = {
++ 	.name = "usb",
++ 	.owner = THIS_MODULE,
++ };
++ 
++ static void link_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	if (left->peer == right && right->peer == left)
++ 		return;
++ 
++ 	if (left->peer || right->peer) {
++ 		struct usb_port *lpeer = left->peer;
++ 		struct usb_port *rpeer = right->peer;
++ 
++ 		WARN(1, "failed to peer %s and %s (%s -> %p) (%s -> %p)\n",
++ 			dev_name(&left->dev), dev_name(&right->dev),
++ 			dev_name(&left->dev), lpeer,
++ 			dev_name(&right->dev), rpeer);
++ 		return;
++ 	}
++ 
++ 	left->peer = right;
++ 	right->peer = left;
++ }
++ 
++ static void unlink_peers(struct usb_port *left, struct usb_port *right)
++ {
++ 	WARN(right->peer != left || left->peer != right,
++ 			"%s and %s are not peers?\n",
++ 			dev_name(&left->dev), dev_name(&right->dev));
++ 
++ 	right->peer = NULL;
++ 	left->peer = NULL;
++ }
++ 
++ /* set the default peer port for root hubs */
++ static void find_and_link_peer(struct usb_hub *hub, int port1)
++ {
++ 	struct usb_port *port_dev = hub->ports[port1 - 1], *peer;
++ 	struct usb_device *hdev = hub->hdev;
++ 
++ 	if (!hdev->parent) {
++ 		struct usb_hub *peer_hub;
++ 		struct usb_device *peer_hdev;
++ 		struct usb_hcd *hcd = bus_to_hcd(hdev->bus);
++ 		struct usb_hcd *peer_hcd = hcd->shared_hcd;
++ 
++ 		if (!peer_hcd)
++ 			return;
++ 
++ 		peer_hdev = peer_hcd->self.root_hub;
++ 		peer_hub = usb_hub_to_struct_hub(peer_hdev);
++ 		if (!peer_hub || port1 > peer_hdev->maxchild)
++ 			return;
++ 
++ 		peer = peer_hub->ports[port1 - 1];
++ 
++ 		if (peer)
++ 			link_peers(port_dev, peer);
++ 	}
++ }
++ 
+++>>>>>>> d8521afe3586 (usb: assign default peer ports for root hubs)
+  int usb_hub_create_port_device(struct usb_hub *hub, int port1)
+  {
+- 	struct usb_port *port_dev = NULL;
++ 	struct usb_port *port_dev;
+  	int retval;
+  
+  	port_dev = kzalloc(sizeof(*port_dev), GFP_KERNEL);
+* Unmerged path drivers/usb/core/hcd.c
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index fecd71f106f9..464514056824 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -55,6 +55,9 @@ static DECLARE_WAIT_QUEUE_HEAD(khubd_wait);
+ 
+ static struct task_struct *khubd_task;
+ 
++/* synchronize hub-port add/remove and peering operations */
++DEFINE_MUTEX(usb_port_peer_mutex);
++
+ /* cycle leds on hubs that aren't blinking for attention */
+ static bool blinkenlights = 0;
+ module_param (blinkenlights, bool, S_IRUGO);
+@@ -1305,6 +1308,7 @@ static int hub_configure(struct usb_hub *hub,
+ 	char *message = "out of memory";
+ 	unsigned unit_load;
+ 	unsigned full_load;
++	unsigned maxchild;
+ 
+ 	hub->buffer = kmalloc(sizeof(*hub->buffer), GFP_KERNEL);
+ 	if (!hub->buffer) {
+@@ -1343,12 +1347,11 @@ static int hub_configure(struct usb_hub *hub,
+ 		goto fail;
+ 	}
+ 
+-	hdev->maxchild = hub->descriptor->bNbrPorts;
+-	dev_info (hub_dev, "%d port%s detected\n", hdev->maxchild,
+-		(hdev->maxchild == 1) ? "" : "s");
++	maxchild = hub->descriptor->bNbrPorts;
++	dev_info(hub_dev, "%d port%s detected\n", maxchild,
++			(maxchild == 1) ? "" : "s");
+ 
+-	hub->ports = kzalloc(hdev->maxchild * sizeof(struct usb_port *),
+-			     GFP_KERNEL);
++	hub->ports = kzalloc(maxchild * sizeof(struct usb_port *), GFP_KERNEL);
+ 	if (!hub->ports) {
+ 		ret = -ENOMEM;
+ 		goto fail;
+@@ -1369,11 +1372,11 @@ static int hub_configure(struct usb_hub *hub,
+ 		int	i;
+ 		char	portstr [USB_MAXCHILDREN + 1];
+ 
+-		for (i = 0; i < hdev->maxchild; i++)
++		for (i = 0; i < maxchild; i++)
+ 			portstr[i] = hub->descriptor->u.hs.DeviceRemovable
+ 				    [((i + 1) / 8)] & (1 << ((i + 1) % 8))
+ 				? 'F' : 'R';
+-		portstr[hdev->maxchild] = 0;
++		portstr[maxchild] = 0;
+ 		dev_dbg(hub_dev, "compound device; port removable status: %s\n", portstr);
+ 	} else
+ 		dev_dbg(hub_dev, "standalone hub\n");
+@@ -1485,7 +1488,7 @@ static int hub_configure(struct usb_hub *hub,
+ 		if (hcd->power_budget > 0)
+ 			hdev->bus_mA = hcd->power_budget;
+ 		else
+-			hdev->bus_mA = full_load * hdev->maxchild;
++			hdev->bus_mA = full_load * maxchild;
+ 		if (hdev->bus_mA >= full_load)
+ 			hub->mA_per_port = full_load;
+ 		else {
+@@ -1500,7 +1503,7 @@ static int hub_configure(struct usb_hub *hub,
+ 			hub->descriptor->bHubContrCurrent);
+ 		hub->limited_power = 1;
+ 
+-		if (remaining < hdev->maxchild * unit_load)
++		if (remaining < maxchild * unit_load)
+ 			dev_warn(hub_dev,
+ 					"insufficient power available "
+ 					"to use all downstream ports\n");
+@@ -1568,15 +1571,19 @@ static int hub_configure(struct usb_hub *hub,
+ 	if (hub->has_indicators && blinkenlights)
+ 		hub->indicator [0] = INDICATOR_CYCLE;
+ 
+-	for (i = 0; i < hdev->maxchild; i++) {
++	mutex_lock(&usb_port_peer_mutex);
++	for (i = 0; i < maxchild; i++) {
+ 		ret = usb_hub_create_port_device(hub, i + 1);
+ 		if (ret < 0) {
+ 			dev_err(hub->intfdev,
+ 				"couldn't create port%d device.\n", i + 1);
+-			hdev->maxchild = i;
+-			goto fail_keep_maxchild;
++			break;
+ 		}
+ 	}
++	hdev->maxchild = i;
++	mutex_unlock(&usb_port_peer_mutex);
++	if (ret < 0)
++		goto fail;
+ 
+ 	usb_hub_adjust_deviceremovable(hdev, hub->descriptor);
+ 
+@@ -1584,8 +1591,6 @@ static int hub_configure(struct usb_hub *hub,
+ 	return 0;
+ 
+ fail:
+-	hdev->maxchild = 0;
+-fail_keep_maxchild:
+ 	dev_err (hub_dev, "config failed, %s (err %d)\n",
+ 			message, ret);
+ 	/* hub_disconnect() frees urb and descriptor */
+@@ -1621,6 +1626,8 @@ static void hub_disconnect(struct usb_interface *intf)
+ 	hub->error = 0;
+ 	hub_quiesce(hub, HUB_DISCONNECT);
+ 
++	mutex_lock(&usb_port_peer_mutex);
++
+ 	/* Avoid races with recursively_mark_NOTATTACHED() */
+ 	spin_lock_irq(&device_state_lock);
+ 	port1 = hdev->maxchild;
+@@ -1631,6 +1638,8 @@ static void hub_disconnect(struct usb_interface *intf)
+ 	for (; port1 > 0; --port1)
+ 		usb_hub_remove_port_device(hub, port1);
+ 
++	mutex_unlock(&usb_port_peer_mutex);
++
+ 	if (hub->hdev->speed == USB_SPEED_HIGH)
+ 		highspeed_hubs--;
+ 
+@@ -4616,6 +4625,8 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
+ 		 */
+ 		status = 0;
+ 
++		mutex_lock(&usb_port_peer_mutex);
++
+ 		/* We mustn't add new devices if the parent hub has
+ 		 * been disconnected; we would race with the
+ 		 * recursively_mark_NOTATTACHED() routine.
+@@ -4626,14 +4637,17 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
+ 		else
+ 			hub->ports[port1 - 1]->child = udev;
+ 		spin_unlock_irq(&device_state_lock);
++		mutex_unlock(&usb_port_peer_mutex);
+ 
+ 		/* Run it through the hoops (find a driver, etc) */
+ 		if (!status) {
+ 			status = usb_new_device(udev);
+ 			if (status) {
++				mutex_lock(&usb_port_peer_mutex);
+ 				spin_lock_irq(&device_state_lock);
+ 				hub->ports[port1 - 1]->child = NULL;
+ 				spin_unlock_irq(&device_state_lock);
++				mutex_unlock(&usb_port_peer_mutex);
+ 			}
+ 		}
+ 
+* Unmerged path drivers/usb/core/hub.h
+* Unmerged path drivers/usb/core/port.c
+diff --git a/drivers/usb/core/usb.h b/drivers/usb/core/usb.h
+index 0923add72b59..42c6d53f1edd 100644
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -123,6 +123,7 @@ static inline int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
+ #endif
+ 
+ extern struct bus_type usb_bus_type;
++extern struct mutex usb_port_peer_mutex;
+ extern struct device_type usb_device_type;
+ extern struct device_type usb_if_device_type;
+ extern struct device_type usb_ep_device_type;
