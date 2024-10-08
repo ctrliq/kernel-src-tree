@@ -1,0 +1,138 @@
+KVM: x86: Move TSC scaling logic out of call-back adjust_tsc_offset()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Haozhong Zhang <haozhong.zhang@intel.com>
+commit 58ea6767874e791a6c4f5c96c7d9155de4b1af28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/58ea6767.failed
+
+For both VMX and SVM, if the 2nd argument of call-back
+adjust_tsc_offset() is the host TSC, then adjust_tsc_offset() will scale
+it first. This patch moves this common TSC scaling logic to its caller
+adjust_tsc_offset_host() and rename the call-back adjust_tsc_offset() to
+adjust_tsc_offset_guest().
+
+	Signed-off-by: Haozhong Zhang <haozhong.zhang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 58ea6767874e791a6c4f5c96c7d9155de4b1af28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/svm.c
+index f4d872b9eba6,b5824a3894bf..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1062,12 -987,6 +1062,15 @@@ static void svm_adjust_tsc_offset_guest
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (host) {
+ +		if (svm->tsc_ratio != TSC_RATIO_DEFAULT)
+ +			WARN_ON(adjustment < 0);
+ +		adjustment = svm_scale_tsc(vcpu, (u64)adjustment);
+ +	}
+ +
+++=======
+++>>>>>>> 58ea6767874e (KVM: x86: Move TSC scaling logic out of call-back adjust_tsc_offset())
+  	svm->vmcb->control.tsc_offset += adjustment;
+  	if (is_guest_mode(vcpu))
+  		svm->nested.hsave->control.tsc_offset += adjustment;
+@@@ -4433,11 -4352,9 +4436,15 @@@ static struct kvm_x86_ops svm_x86_ops 
+  
+  	.has_wbinvd_exit = svm_has_wbinvd_exit,
+  
+ +	.set_tsc_khz = svm_set_tsc_khz,
+  	.read_tsc_offset = svm_read_tsc_offset,
+  	.write_tsc_offset = svm_write_tsc_offset,
+++<<<<<<< HEAD
+ +	.adjust_tsc_offset = svm_adjust_tsc_offset,
+ +	.compute_tsc_offset = svm_compute_tsc_offset,
+++=======
++ 	.adjust_tsc_offset_guest = svm_adjust_tsc_offset_guest,
+++>>>>>>> 58ea6767874e (KVM: x86: Move TSC scaling logic out of call-back adjust_tsc_offset())
+  	.read_l1_tsc = svm_read_l1_tsc,
+  
+  	.set_tdp_cr3 = set_tdp_cr3,
+diff --cc arch/x86/kvm/vmx.c
+index 2e741a634171,c0fb398ac50e..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9924,11 -10805,9 +9924,15 @@@ static struct kvm_x86_ops vmx_x86_ops 
+  
+  	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
+  
+ +	.set_tsc_khz = vmx_set_tsc_khz,
+  	.read_tsc_offset = vmx_read_tsc_offset,
+  	.write_tsc_offset = vmx_write_tsc_offset,
+++<<<<<<< HEAD
+ +	.adjust_tsc_offset = vmx_adjust_tsc_offset,
+ +	.compute_tsc_offset = vmx_compute_tsc_offset,
+++=======
++ 	.adjust_tsc_offset_guest = vmx_adjust_tsc_offset_guest,
+++>>>>>>> 58ea6767874e (KVM: x86: Move TSC scaling logic out of call-back adjust_tsc_offset())
+  	.read_l1_tsc = vmx_read_l1_tsc,
+  
+  	.set_tdp_cr3 = vmx_set_cr3,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c40aad26d942..17b03e959652 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -790,7 +790,7 @@ struct kvm_x86_ops {
+ 	int (*get_lpage_level)(void);
+ 	bool (*rdtscp_supported)(void);
+ 	bool (*invpcid_supported)(void);
+-	void (*adjust_tsc_offset)(struct kvm_vcpu *vcpu, s64 adjustment, bool host);
++	void (*adjust_tsc_offset_guest)(struct kvm_vcpu *vcpu, s64 adjustment);
+ 
+ 	void (*set_tdp_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
+ 
+@@ -854,17 +854,6 @@ struct kvm_arch_async_pf {
+ 
+ extern struct kvm_x86_ops *kvm_x86_ops;
+ 
+-static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
+-					   s64 adjustment)
+-{
+-	kvm_x86_ops->adjust_tsc_offset(vcpu, adjustment, false);
+-}
+-
+-static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
+-{
+-	kvm_x86_ops->adjust_tsc_offset(vcpu, adjustment, true);
+-}
+-
+ int kvm_mmu_module_init(void);
+ void kvm_mmu_module_exit(void);
+ 
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 24f418aad1ea..f217008b0212 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1435,6 +1435,20 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 
+ EXPORT_SYMBOL_GPL(kvm_write_tsc);
+ 
++static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
++					   s64 adjustment)
++{
++	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
++}
++
++static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
++{
++	if (vcpu->arch.tsc_scaling_ratio != kvm_default_tsc_scaling_ratio)
++		WARN_ON(adjustment < 0);
++	adjustment = kvm_scale_tsc(vcpu, (u64) adjustment);
++	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
++}
++
+ #ifdef CONFIG_X86_64
+ 
+ static cycle_t read_tsc(void)
