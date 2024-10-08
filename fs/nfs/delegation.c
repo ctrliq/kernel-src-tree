@@ -459,14 +459,20 @@ restart:
 								super_list) {
 			if (!nfs_delegation_need_return(delegation))
 				continue;
-			inode = nfs_delegation_grab_inode(delegation);
-			if (inode == NULL)
+			if (!nfs_sb_active(server->super))
 				continue;
+			inode = nfs_delegation_grab_inode(delegation);
+			if (inode == NULL) {
+				rcu_read_unlock();
+				nfs_sb_deactive(server->super);
+				goto restart;
+			}
 			delegation = nfs_start_delegation_return_locked(NFS_I(inode));
 			rcu_read_unlock();
 
 			err = nfs_end_delegation_return(inode, delegation, 0);
 			iput(inode);
+			nfs_sb_deactive(server->super);
 			if (!err)
 				goto restart;
 			set_bit(NFS4CLNT_DELEGRETURN, &clp->cl_state);
@@ -800,9 +806,14 @@ restart:
 			if (test_bit(NFS_DELEGATION_NEED_RECLAIM,
 						&delegation->flags) == 0)
 				continue;
-			inode = nfs_delegation_grab_inode(delegation);
-			if (inode == NULL)
+			if (!nfs_sb_active(server->super))
 				continue;
+			inode = nfs_delegation_grab_inode(delegation);
+			if (inode == NULL) {
+				rcu_read_unlock();
+				nfs_sb_deactive(server->super);
+				goto restart;
+			}
 			delegation = nfs_start_delegation_return_locked(NFS_I(inode));
 			rcu_read_unlock();
 			if (delegation != NULL) {
@@ -812,6 +823,7 @@ restart:
 					nfs_free_delegation(delegation);
 			}
 			iput(inode);
+			nfs_sb_deactive(server->super);
 			goto restart;
 		}
 	}
