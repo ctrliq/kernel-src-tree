@@ -1,0 +1,143 @@
+tcp: avoid possible arithmetic overflows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit fcdd1cf4dd63aecf86c987d7f4ec7187be5c2fbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fcdd1cf4.failed
+
+icsk_rto is a 32bit field, and icsk_backoff can reach 15 by default,
+or more if some sysctl (eg tcp_retries2) are changed.
+
+Better use 64bit to perform icsk_rto << icsk_backoff operations
+
+As Joe Perches suggested, add a helper for this.
+
+Yuchung spotted the tcp_v4_err() case.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fcdd1cf4dd63aecf86c987d7f4ec7187be5c2fbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_ipv4.c
+diff --cc net/ipv4/tcp_ipv4.c
+index c8ee0750a071,3b2e49cb2b61..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -432,9 -430,9 +432,15 @@@ void tcp_v4_err(struct sk_buff *icmp_sk
+  			break;
+  
+  		icsk->icsk_backoff--;
+++<<<<<<< HEAD
+ +		inet_csk(sk)->icsk_rto = (tp->srtt ? __tcp_set_rto(tp) :
+ +			TCP_TIMEOUT_INIT) << icsk->icsk_backoff;
+ +		tcp_bound_rto(sk);
+++=======
++ 		icsk->icsk_rto = tp->srtt_us ? __tcp_set_rto(tp) :
++ 					       TCP_TIMEOUT_INIT;
++ 		icsk->icsk_rto = inet_csk_rto_backoff(icsk, TCP_RTO_MAX);
+++>>>>>>> fcdd1cf4dd63 (tcp: avoid possible arithmetic overflows)
+  
+  		skb = tcp_write_queue_head(sk);
+  		BUG_ON(!skb);
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index c55aeed41ace..f4d1ff0a9214 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -241,6 +241,15 @@ static inline void inet_csk_reset_xmit_timer(struct sock *sk, const int what,
+ #endif
+ }
+ 
++static inline unsigned long
++inet_csk_rto_backoff(const struct inet_connection_sock *icsk,
++		     unsigned long max_when)
++{
++        u64 when = (u64)icsk->icsk_rto << icsk->icsk_backoff;
++
++        return (unsigned long)min_t(u64, when, max_when);
++}
++
+ struct sock *inet_csk_accept(struct sock *sk, int flags, int *err);
+ 
+ struct request_sock *inet_csk_search_req(const struct sock *sk,
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index b7e10e9c0e98..ff23d9d5521b 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3183,9 +3183,10 @@ static void tcp_ack_probe(struct sock *sk)
+ 		 * This function is not for random using!
+ 		 */
+ 	} else {
++		unsigned long when = inet_csk_rto_backoff(icsk, TCP_RTO_MAX);
++
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-					  min(icsk->icsk_rto << icsk->icsk_backoff, TCP_RTO_MAX),
+-					  TCP_RTO_MAX);
++					  when, TCP_RTO_MAX);
+ 	}
+ }
+ 
+* Unmerged path net/ipv4/tcp_ipv4.c
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 5abc01454eff..9cf2dd115290 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -3233,6 +3233,7 @@ void tcp_send_probe0(struct sock *sk)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	unsigned long probe_max;
+ 	int err;
+ 
+ 	err = tcp_write_wakeup(sk);
+@@ -3248,9 +3249,7 @@ void tcp_send_probe0(struct sock *sk)
+ 		if (icsk->icsk_backoff < sysctl_tcp_retries2)
+ 			icsk->icsk_backoff++;
+ 		icsk->icsk_probes_out++;
+-		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-					  min(icsk->icsk_rto << icsk->icsk_backoff, TCP_RTO_MAX),
+-					  TCP_RTO_MAX);
++		probe_max = TCP_RTO_MAX;
+ 	} else {
+ 		/* If packet was not sent due to local congestion,
+ 		 * do not backoff and do not remember icsk_probes_out.
+@@ -3260,9 +3259,9 @@ void tcp_send_probe0(struct sock *sk)
+ 		 */
+ 		if (!icsk->icsk_probes_out)
+ 			icsk->icsk_probes_out = 1;
+-		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-					  min(icsk->icsk_rto << icsk->icsk_backoff,
+-					      TCP_RESOURCE_PROBE_INTERVAL),
+-					  TCP_RTO_MAX);
++		probe_max = TCP_RESOURCE_PROBE_INTERVAL;
+ 	}
++	inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
++				  inet_csk_rto_backoff(icsk, probe_max),
++				  TCP_RTO_MAX);
+ }
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 286227abed10..f34a3734c402 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -181,7 +181,7 @@ static int tcp_write_timeout(struct sock *sk)
+ 
+ 		retry_until = sysctl_tcp_retries2;
+ 		if (sock_flag(sk, SOCK_DEAD)) {
+-			const int alive = (icsk->icsk_rto < TCP_RTO_MAX);
++			const int alive = icsk->icsk_rto < TCP_RTO_MAX;
+ 
+ 			retry_until = tcp_orphan_retries(sk, alive);
+ 			do_reset = alive ||
+@@ -295,7 +295,7 @@ static void tcp_probe_timer(struct sock *sk)
+ 	max_probes = sysctl_tcp_retries2;
+ 
+ 	if (sock_flag(sk, SOCK_DEAD)) {
+-		const int alive = ((icsk->icsk_rto << icsk->icsk_backoff) < TCP_RTO_MAX);
++		const int alive = inet_csk_rto_backoff(icsk, TCP_RTO_MAX) < TCP_RTO_MAX;
+ 
+ 		max_probes = tcp_orphan_retries(sk, alive);
+ 
