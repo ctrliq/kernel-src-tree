@@ -1,0 +1,1597 @@
+IB/qib, staging/rdma/hfi1: add s_hlock for use in post send
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] ib/qib, rdma/hfi1: add s_hlock for use in post send (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 92.73%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 46a80d62e6e0ccfc9d8a05c5b773405b84a4afd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/46a80d62.failed
+
+This patch adds an additional lock to reduce contention on the s_lock.
+
+This lock is used in post_send() so that the post_send is not
+serialized with the send engine and other send related processing.
+
+To do this the s_next_psn is now maintained on post_send() while
+post_send() related fields are moved to a new cache line.  There is
+an s_avail maintained for the post_send() to mitigate trading cache
+lines with the send engine.  The lock is released/acquired around
+releasing the just built packet to the egress mechanism.
+
+	Reviewed-by: Jubin John <jubin.john@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 46a80d62e6e0ccfc9d8a05c5b773405b84a4afd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_rc.c
+#	drivers/infiniband/hw/qib/qib_uc.c
+#	drivers/infiniband/hw/qib/qib_ud.c
+#	drivers/infiniband/hw/qib/qib_verbs.c
+#	drivers/infiniband/hw/qib/qib_verbs.h
+#	drivers/staging/hfi1/qp.h
+#	drivers/staging/hfi1/rc.c
+#	drivers/staging/hfi1/ruc.c
+#	drivers/staging/hfi1/uc.c
+#	drivers/staging/hfi1/ud.c
+#	drivers/staging/hfi1/verbs.c
+#	drivers/staging/rdma/hfi1/qp.c
+#	drivers/staging/rdma/hfi1/verbs.h
+diff --cc drivers/infiniband/hw/qib/qib_rc.c
+index c23ede5294da,9088e26d3ac8..000000000000
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@@ -226,9 -226,11 +226,11 @@@ bail
+   * qib_make_rc_req - construct a request packet (SEND, RDMA r/w, ATOMIC)
+   * @qp: a pointer to the QP
+   *
++  * Assumes the s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int qib_make_rc_req(struct rvt_qp *qp)
+ +int qib_make_rc_req(struct qib_qp *qp)
+  {
+  	struct qib_qp_priv *priv = qp->priv;
+  	struct qib_ibdev *dev = to_idev(qp->ibqp.device);
+@@@ -249,22 -250,17 +250,17 @@@
+  	if (qp->remote_ah_attr.ah_flags & IB_AH_GRH)
+  		ohdr = &priv->s_hdr->u.l.oth;
+  
+- 	/*
+- 	 * The lock is needed to synchronize between the sending tasklet,
+- 	 * the receive interrupt handler, and timeout resends.
+- 	 */
+- 	spin_lock_irqsave(&qp->s_lock, flags);
+- 
+  	/* Sending responses has higher priority over sending requests. */
+ -	if ((qp->s_flags & RVT_S_RESP_PENDING) &&
+ +	if ((qp->s_flags & QIB_S_RESP_PENDING) &&
+  	    qib_make_rc_ack(dev, qp, ohdr, pmtu))
+  		goto done;
+  
+ -	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_SEND_OK)) {
+ -		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+ +	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_SEND_OK)) {
+ +		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_dma_busy)) {
+@@@ -318,11 -314,11 +314,11 @@@
+  			 */
+  			if ((wqe->wr.send_flags & IB_SEND_FENCE) &&
+  			    qp->s_num_rd_atomic) {
+ -				qp->s_flags |= RVT_S_WAIT_FENCE;
+ +				qp->s_flags |= QIB_S_WAIT_FENCE;
+  				goto bail;
+  			}
+- 			wqe->psn = qp->s_next_psn;
+  			newreq = 1;
++ 			qp->s_psn = wqe->psn;
+  		}
+  		/*
+  		 * Note that we have to be careful not to modify the
+@@@ -336,14 -332,12 +332,12 @@@
+  		case IB_WR_SEND:
+  		case IB_WR_SEND_WITH_IMM:
+  			/* If no credit, return. */
+ -			if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT) &&
+ +			if (!(qp->s_flags & QIB_S_UNLIMITED_CREDIT) &&
+  			    qib_cmp24(wqe->ssn, qp->s_lsn + 1) > 0) {
+ -				qp->s_flags |= RVT_S_WAIT_SSN_CREDIT;
+ +				qp->s_flags |= QIB_S_WAIT_SSN_CREDIT;
+  				goto bail;
+  			}
+- 			wqe->lpsn = wqe->psn;
+  			if (len > pmtu) {
+- 				wqe->lpsn += (len - 1) / pmtu;
+  				qp->s_state = OP(SEND_FIRST);
+  				len = pmtu;
+  				break;
+@@@ -369,20 -363,19 +363,18 @@@
+  			/* FALLTHROUGH */
+  		case IB_WR_RDMA_WRITE_WITH_IMM:
+  			/* If no credit, return. */
+ -			if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT) &&
+ +			if (!(qp->s_flags & QIB_S_UNLIMITED_CREDIT) &&
+  			    qib_cmp24(wqe->ssn, qp->s_lsn + 1) > 0) {
+ -				qp->s_flags |= RVT_S_WAIT_SSN_CREDIT;
+ +				qp->s_flags |= QIB_S_WAIT_SSN_CREDIT;
+  				goto bail;
+  			}
+ -
+  			ohdr->u.rc.reth.vaddr =
+ -				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ +				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
+  			ohdr->u.rc.reth.rkey =
+ -				cpu_to_be32(wqe->rdma_wr.rkey);
+ +				cpu_to_be32(wqe->wr.wr.rdma.rkey);
+  			ohdr->u.rc.reth.length = cpu_to_be32(len);
+  			hwords += sizeof(struct ib_reth) / sizeof(u32);
+- 			wqe->lpsn = wqe->psn;
+  			if (len > pmtu) {
+- 				wqe->lpsn += (len - 1) / pmtu;
+  				qp->s_state = OP(RDMA_WRITE_FIRST);
+  				len = pmtu;
+  				break;
+@@@ -415,20 -408,14 +407,13 @@@
+  					goto bail;
+  				}
+  				qp->s_num_rd_atomic++;
+ -				if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT))
+ +				if (!(qp->s_flags & QIB_S_UNLIMITED_CREDIT))
+  					qp->s_lsn++;
+- 				/*
+- 				 * Adjust s_next_psn to count the
+- 				 * expected number of responses.
+- 				 */
+- 				if (len > pmtu)
+- 					qp->s_next_psn += (len - 1) / pmtu;
+- 				wqe->lpsn = qp->s_next_psn++;
+  			}
+ -
+  			ohdr->u.rc.reth.vaddr =
+ -				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ +				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
+  			ohdr->u.rc.reth.rkey =
+ -				cpu_to_be32(wqe->rdma_wr.rkey);
+ +				cpu_to_be32(wqe->wr.wr.rdma.rkey);
+  			ohdr->u.rc.reth.length = cpu_to_be32(len);
+  			qp->s_state = OP(RDMA_READ_REQUEST);
+  			hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+@@@ -452,16 -439,15 +437,15 @@@
+  					goto bail;
+  				}
+  				qp->s_num_rd_atomic++;
+ -				if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT))
+ +				if (!(qp->s_flags & QIB_S_UNLIMITED_CREDIT))
+  					qp->s_lsn++;
+- 				wqe->lpsn = wqe->psn;
+  			}
+ -			if (wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+ +			if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+  				qp->s_state = OP(COMPARE_SWAP);
+  				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+ -					wqe->atomic_wr.swap);
+ +					wqe->wr.wr.atomic.swap);
+  				ohdr->u.atomic_eth.compare_data = cpu_to_be64(
+ -					wqe->atomic_wr.compare_add);
+ +					wqe->wr.wr.atomic.compare_add);
+  			} else {
+  				qp->s_state = OP(FETCH_ADD);
+  				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+@@@ -628,13 -607,9 +605,15 @@@
+  	qp->s_cur_size = len;
+  	qib_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24), bth2);
+  done:
+- 	ret = 1;
+- 	goto unlock;
+- 
++ 	return 1;
+  bail:
+++<<<<<<< HEAD
+ +	qp->s_flags &= ~QIB_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/qib/qib_uc.c
+index bab9aeb5dd9e,7bdbc79ceaa3..000000000000
+--- a/drivers/infiniband/hw/qib/qib_uc.c
++++ b/drivers/infiniband/hw/qib/qib_uc.c
+@@@ -41,27 -41,27 +41,39 @@@
+   * qib_make_uc_req - construct a request packet (SEND, RDMA write)
+   * @qp: a pointer to the QP
+   *
++  * Assumes the s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int qib_make_uc_req(struct rvt_qp *qp)
+ +int qib_make_uc_req(struct qib_qp *qp)
+  {
+  	struct qib_qp_priv *priv = qp->priv;
+  	struct qib_other_headers *ohdr;
+++<<<<<<< HEAD
+ +	struct qib_swqe *wqe;
+ +	unsigned long flags;
+++=======
++ 	struct rvt_swqe *wqe;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	u32 hwords;
+  	u32 bth0;
+  	u32 len;
+  	u32 pmtu = qp->pmtu;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&qp->s_lock, flags);
+ +
+ +	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_SEND_OK)) {
+ +		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+++=======
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_SEND_OK)) {
++ 		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_dma_busy)) {
+@@@ -86,11 -86,12 +98,12 @@@
+  	qp->s_wqe = NULL;
+  	switch (qp->s_state) {
+  	default:
+ -		if (!(ib_rvt_state_ops[qp->state] &
+ -		    RVT_PROCESS_NEXT_SEND_OK))
+ +		if (!(ib_qib_state_ops[qp->state] &
+ +		    QIB_PROCESS_NEXT_SEND_OK))
+  			goto bail;
+  		/* Check if send work queue is empty. */
+- 		if (qp->s_cur == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_cur == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/*
+  		 * Start a new request.
+@@@ -215,15 -215,11 +227,17 @@@
+  	qp->s_cur_sge = &qp->s_sge;
+  	qp->s_cur_size = len;
+  	qib_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24),
+- 			    qp->s_next_psn++ & QIB_PSN_MASK);
++ 			    qp->s_psn++ & QIB_PSN_MASK);
+  done:
+- 	ret = 1;
+- 	goto unlock;
+- 
++ 	return 1;
+  bail:
+++<<<<<<< HEAD
+ +	qp->s_flags &= ~QIB_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/qib/qib_ud.c
+index 75faa5bd8dd6,d9502137de62..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@@ -230,17 -234,18 +230,23 @@@ drop
+   * qib_make_ud_req - construct a UD request packet
+   * @qp: the QP
+   *
++  * Assumes the s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int qib_make_ud_req(struct rvt_qp *qp)
+ +int qib_make_ud_req(struct qib_qp *qp)
+  {
+  	struct qib_qp_priv *priv = qp->priv;
+  	struct qib_other_headers *ohdr;
+  	struct ib_ah_attr *ah_attr;
+  	struct qib_pportdata *ppd;
+  	struct qib_ibport *ibp;
+++<<<<<<< HEAD
+ +	struct qib_swqe *wqe;
+ +	unsigned long flags;
+++=======
++ 	struct rvt_swqe *wqe;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	u32 nwords;
+  	u32 extra_bytes;
+  	u32 bth0;
+@@@ -249,13 -254,12 +255,19 @@@
+  	int ret = 0;
+  	int next_cur;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&qp->s_lock, flags);
+ +
+ +	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_NEXT_SEND_OK)) {
+ +		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+++=======
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
++ 		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_dma_busy)) {
+@@@ -267,10 -271,12 +279,12 @@@
+  		goto done;
+  	}
+  
+- 	if (qp->s_cur == qp->s_head)
++ 	/* see post_one_send() */
++ 	smp_read_barrier_depends();
++ 	if (qp->s_cur == ACCESS_ONCE(qp->s_head))
+  		goto bail;
+  
+ -	wqe = rvt_get_swqe_ptr(qp, qp->s_cur);
+ +	wqe = get_swqe_ptr(qp, qp->s_cur);
+  	next_cur = qp->s_cur + 1;
+  	if (next_cur >= qp->s_size)
+  		next_cur = 0;
+@@@ -370,11 -378,11 +386,16 @@@
+  	/*
+  	 * Use the multicast QP if the destination LID is a multicast LID.
+  	 */
+ -	ohdr->bth[1] = ah_attr->dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE) &&
+ -		ah_attr->dlid != be16_to_cpu(IB_LID_PERMISSIVE) ?
+ +	ohdr->bth[1] = ah_attr->dlid >= QIB_MULTICAST_LID_BASE &&
+ +		ah_attr->dlid != QIB_PERMISSIVE_LID ?
+  		cpu_to_be32(QIB_MULTICAST_QPN) :
+++<<<<<<< HEAD
+ +		cpu_to_be32(wqe->wr.wr.ud.remote_qpn);
+ +	ohdr->bth[2] = cpu_to_be32(qp->s_next_psn++ & QIB_PSN_MASK);
+++=======
++ 		cpu_to_be32(wqe->ud_wr.remote_qpn);
++ 	ohdr->bth[2] = cpu_to_be32(wqe->psn & QIB_PSN_MASK);
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	/*
+  	 * Qkeys with the high order bit set mean use the
+  	 * qkey from the QP context instead of the WR (see 10.2.5).
+@@@ -384,13 -392,9 +405,15 @@@
+  	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+  
+  done:
+- 	ret = 1;
+- 	goto unlock;
+- 
++ 	return 1;
+  bail:
+++<<<<<<< HEAD
+ +	qp->s_flags &= ~QIB_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/qib/qib_verbs.c
+index c4417a1f33be,5cf019fb50d9..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@@ -2283,11 -1661,60 +2283,35 @@@ int qib_register_ib_device(struct qib_d
+  	dd->verbs_dev.rdi.driver_f.port_callback = qib_create_port_files;
+  	dd->verbs_dev.rdi.driver_f.get_card_name = qib_get_card_name;
+  	dd->verbs_dev.rdi.driver_f.get_pci_dev = qib_get_pci_dev;
+++<<<<<<< HEAD
+ +	dd->verbs_dev.rdi.dparms.props.max_pd = ib_qib_max_pds;
+ +	dd->verbs_dev.rdi.flags = (RVT_FLAG_MR_INIT_DRIVER |
+ +				   RVT_FLAG_QP_INIT_DRIVER |
+ +				   RVT_FLAG_CQ_INIT_DRIVER);
+++=======
++ 	dd->verbs_dev.rdi.driver_f.check_ah = qib_check_ah;
++ 	dd->verbs_dev.rdi.driver_f.check_send_wqe = qib_check_send_wqe;
++ 	dd->verbs_dev.rdi.driver_f.notify_new_ah = qib_notify_new_ah;
++ 	dd->verbs_dev.rdi.driver_f.alloc_qpn = qib_alloc_qpn;
++ 	dd->verbs_dev.rdi.driver_f.qp_priv_alloc = qib_qp_priv_alloc;
++ 	dd->verbs_dev.rdi.driver_f.qp_priv_free = qib_qp_priv_free;
++ 	dd->verbs_dev.rdi.driver_f.free_all_qps = qib_free_all_qps;
++ 	dd->verbs_dev.rdi.driver_f.notify_qp_reset = qib_notify_qp_reset;
++ 	dd->verbs_dev.rdi.driver_f.do_send = qib_do_send;
++ 	dd->verbs_dev.rdi.driver_f.schedule_send = qib_schedule_send;
++ 	dd->verbs_dev.rdi.driver_f.quiesce_qp = qib_quiesce_qp;
++ 	dd->verbs_dev.rdi.driver_f.stop_send_queue = qib_stop_send_queue;
++ 	dd->verbs_dev.rdi.driver_f.flush_qp_waiters = qib_flush_qp_waiters;
++ 	dd->verbs_dev.rdi.driver_f.notify_error_qp = qib_notify_error_qp;
++ 	dd->verbs_dev.rdi.driver_f.mtu_to_path_mtu = qib_mtu_to_path_mtu;
++ 	dd->verbs_dev.rdi.driver_f.mtu_from_qp = qib_mtu_from_qp;
++ 	dd->verbs_dev.rdi.driver_f.get_pmtu_from_attr = qib_get_pmtu_from_attr;
++ 	dd->verbs_dev.rdi.driver_f.schedule_send_no_lock = _qib_schedule_send;
++ 	dd->verbs_dev.rdi.driver_f.query_port_state = qib_query_port;
++ 	dd->verbs_dev.rdi.driver_f.shut_down_port = qib_shut_down_port;
++ 	dd->verbs_dev.rdi.driver_f.cap_mask_chg = qib_cap_mask_chg;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  
+ -	dd->verbs_dev.rdi.dparms.max_rdma_atomic = QIB_MAX_RDMA_ATOMIC;
+ -	dd->verbs_dev.rdi.driver_f.get_guid_be = qib_get_guid_be;
+ -	dd->verbs_dev.rdi.dparms.lkey_table_size = qib_lkey_table_size;
+ -	dd->verbs_dev.rdi.dparms.qp_table_size = ib_qib_qp_table_size;
+ -	dd->verbs_dev.rdi.dparms.qpn_start = 1;
+ -	dd->verbs_dev.rdi.dparms.qpn_res_start = QIB_KD_QP;
+ -	dd->verbs_dev.rdi.dparms.qpn_res_end = QIB_KD_QP; /* Reserve one QP */
+ -	dd->verbs_dev.rdi.dparms.qpn_inc = 1;
+ -	dd->verbs_dev.rdi.dparms.qos_shift = 1;
+ -	dd->verbs_dev.rdi.dparms.psn_mask = QIB_PSN_MASK;
+ -	dd->verbs_dev.rdi.dparms.psn_shift = QIB_PSN_SHIFT;
+ -	dd->verbs_dev.rdi.dparms.psn_modify_mask = QIB_PSN_MASK;
+ -	dd->verbs_dev.rdi.dparms.nports = dd->num_pports;
+ -	dd->verbs_dev.rdi.dparms.npkeys = qib_get_npkeys(dd);
+ -	dd->verbs_dev.rdi.dparms.node = dd->assigned_node_id;
+ -	dd->verbs_dev.rdi.dparms.core_cap_flags = RDMA_CORE_PORT_IBA_IB;
+ -	dd->verbs_dev.rdi.dparms.max_mad_size = IB_MGMT_MAD_SIZE;
+ -
+ -	snprintf(dd->verbs_dev.rdi.dparms.cq_name,
+ -		 sizeof(dd->verbs_dev.rdi.dparms.cq_name),
+ -		 "qib_cq%d", dd->unit);
+ -
+ -	qib_fill_device_attr(dd);
+ -
+ -	ppd = dd->pport;
+ -	for (i = 0; i < dd->num_pports; i++, ppd++) {
+ -		ctxt = ppd->hw_pidx;
+ -		rvt_init_port(&dd->verbs_dev.rdi,
+ -			      &ppd->ibport_data.rvp,
+ -			      i,
+ -			      dd->rcd[ctxt]->pkeys);
+ -	}
+  
+  	ret = rvt_register_device(&dd->verbs_dev.rdi);
+  	if (ret)
+@@@ -2375,22 -1778,36 +2399,39 @@@ void qib_unregister_ib_device(struct qi
+  				  dd->pport->sdma_descq_cnt *
+  					sizeof(struct qib_pio_header),
+  				  dev->pio_hdrs, dev->pio_hdrs_phys);
+ +	lk_tab_size = dev->lk_table.max * sizeof(*dev->lk_table.table);
+ +	vfree(dev->lk_table.table);
+ +	kfree(dev->qp_table);
+  }
+  
+- /*
+-  * This must be called with s_lock held.
++ /**
++  * _qib_schedule_send - schedule progress
++  * @qp - the qp
++  *
++  * This schedules progress w/o regard to the s_flags.
++  *
++  * It is only used in post send, which doesn't hold
++  * the s_lock.
+   */
+- void qib_schedule_send(struct qib_qp *qp)
++ void _qib_schedule_send(struct rvt_qp *qp)
+  {
++ 	struct qib_ibport *ibp =
++ 		to_iport(qp->ibqp.device, qp->port_num);
++ 	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+  	struct qib_qp_priv *priv = qp->priv;
+- 	if (qib_send_ok(qp)) {
+- 		struct qib_ibport *ibp =
+- 			to_iport(qp->ibqp.device, qp->port_num);
+- 		struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+  
+- 		queue_work(ppd->qib_wq, &priv->s_work);
+- 	}
++ 	queue_work(ppd->qib_wq, &priv->s_work);
++ }
++ 
++ /**
++  * qib_schedule_send - schedule progress
++  * @qp - the qp
++  *
++  * This schedules qp progress.  The s_lock
++  * should be held.
++  */
+ -void qib_schedule_send(struct rvt_qp *qp)
+++void qib_schedule_send(struct qib_qp *qp)
++ {
++ 	if (qib_send_ok(qp))
++ 		_qib_schedule_send(qp);
+  }
+diff --cc drivers/infiniband/hw/qib/qib_verbs.h
+index ca366073af4f,d137d714935d..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@@ -858,17 -291,15 +858,22 @@@ static inline struct qib_ibdev *to_idev
+   * Send if not busy or waiting for I/O and either
+   * a RC response is pending or we can process send work requests.
+   */
+ -static inline int qib_send_ok(struct rvt_qp *qp)
+ +static inline int qib_send_ok(struct qib_qp *qp)
+  {
+ -	return !(qp->s_flags & (RVT_S_BUSY | RVT_S_ANY_WAIT_IO)) &&
+ -		(qp->s_hdrwords || (qp->s_flags & RVT_S_RESP_PENDING) ||
+ -		 !(qp->s_flags & RVT_S_ANY_WAIT_SEND));
+ +	return !(qp->s_flags & (QIB_S_BUSY | QIB_S_ANY_WAIT_IO)) &&
+ +		(qp->s_hdrwords || (qp->s_flags & QIB_S_RESP_PENDING) ||
+ +		 !(qp->s_flags & QIB_S_ANY_WAIT_SEND));
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * This must be called with s_lock held.
+ + */
+ +void qib_schedule_send(struct qib_qp *qp);
+++=======
++ void _qib_schedule_send(struct rvt_qp *qp);
++ void qib_schedule_send(struct rvt_qp *qp);
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send)
+  
+  static inline int qib_pkey_ok(u16 pkey1, u16 pkey2)
+  {
+diff --cc drivers/staging/hfi1/qp.h
+index 1144470a6bc0,98827b5dd2a1..000000000000
+--- a/drivers/staging/hfi1/qp.h
++++ b/drivers/staging/hfi1/qp.h
+@@@ -246,44 -135,27 +246,49 @@@ void qp_iter_print(struct seq_file *s, 
+   * qp_comm_est - handle trap with QP established
+   * @qp: the QP
+   */
+ -void qp_comm_est(struct rvt_qp *qp);
+ +void qp_comm_est(struct hfi1_qp *qp);
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/qp.h
+ +/**
+ + * _hfi1_schedule_send - schedule progress
+ + * @qp: the QP
+ + *
+ + * This schedules qp progress w/o regard to the s_flags.
+ + *
+ + * It is only used in the post send, which doesn't hold
+ + * the s_lock.
+ + */
+ +static inline void _hfi1_schedule_send(struct hfi1_qp *qp)
+ +{
+ +	struct hfi1_qp_priv *priv = qp->priv;
+ +	struct hfi1_ibport *ibp =
+ +		to_iport(qp->ibqp.device, qp->port_num);
+ +	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+ +	struct hfi1_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+ +
+ +	iowait_schedule(&priv->s_iowait, ppd->hfi1_wq,
+ +			priv->s_sde ?
+ +			priv->s_sde->cpu :
+ +			cpumask_first(cpumask_of_node(dd->assigned_node_id)));
+ +}
+ +
+ +/**
+ + * hfi1_schedule_send - schedule progress
+ + * @qp: the QP
+ + *
+ + * This schedules qp progress and caller should hold
+ + * the s_lock.
+ + */
+ +static inline void hfi1_schedule_send(struct hfi1_qp *qp)
+ +{
+ +	if (hfi1_send_ok(qp))
+ +		_hfi1_schedule_send(qp);
+ +}
+++=======
++ void _hfi1_schedule_send(struct rvt_qp *qp);
++ void hfi1_schedule_send(struct rvt_qp *qp);
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/qp.h
+  
+ -void hfi1_migrate_qp(struct rvt_qp *qp);
+ +void hfi1_migrate_qp(struct hfi1_qp *qp);
+  
+ -/*
+ - * Functions provided by hfi1 driver for rdmavt to use
+ - */
+ -void *qp_priv_alloc(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ -		    gfp_t gfp);
+ -void qp_priv_free(struct rvt_dev_info *rdi, struct rvt_qp *qp);
+ -unsigned free_all_qps(struct rvt_dev_info *rdi);
+ -void notify_qp_reset(struct rvt_qp *qp);
+ -int get_pmtu_from_attr(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ -		       struct ib_qp_attr *attr);
+ -void flush_qp_waiters(struct rvt_qp *qp);
+ -void notify_error_qp(struct rvt_qp *qp);
+ -void stop_send_queue(struct rvt_qp *qp);
+ -void quiesce_qp(struct rvt_qp *qp);
+ -u32 mtu_from_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp, u32 pmtu);
+ -int mtu_to_path_mtu(u32 mtu);
+  #endif /* _QP_H */
+diff --cc drivers/staging/hfi1/rc.c
+index dd57d65aa9b2,a62c9424fa86..000000000000
+--- a/drivers/staging/hfi1/rc.c
++++ b/drivers/staging/hfi1/rc.c
+@@@ -255,9 -367,11 +255,11 @@@ bail
+   * hfi1_make_rc_req - construct a request packet (SEND, RDMA r/w, ATOMIC)
+   * @qp: a pointer to the QP
+   *
++  * Assumes s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int hfi1_make_rc_req(struct rvt_qp *qp)
+ +int hfi1_make_rc_req(struct hfi1_qp *qp)
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+  	struct hfi1_ibdev *dev = to_idev(qp->ibqp.device);
+@@@ -280,22 -393,17 +281,17 @@@
+  	if (qp->remote_ah_attr.ah_flags & IB_AH_GRH)
+  		ohdr = &priv->s_hdr->ibh.u.l.oth;
+  
+- 	/*
+- 	 * The lock is needed to synchronize between the sending tasklet,
+- 	 * the receive interrupt handler, and timeout re-sends.
+- 	 */
+- 	spin_lock_irqsave(&qp->s_lock, flags);
+- 
+  	/* Sending responses has higher priority over sending requests. */
+ -	if ((qp->s_flags & RVT_S_RESP_PENDING) &&
+ +	if ((qp->s_flags & HFI1_S_RESP_PENDING) &&
+  	    make_rc_ack(dev, qp, ohdr, pmtu))
+  		goto done;
+  
+ -	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_SEND_OK)) {
+ -		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+ +	if (!(ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_SEND_OK)) {
+ +		if (!(ib_hfi1_state_ops[qp->state] & HFI1_FLUSH_SEND))
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_iowait.sdma_busy)) {
+@@@ -348,11 -456,11 +344,11 @@@
+  			 */
+  			if ((wqe->wr.send_flags & IB_SEND_FENCE) &&
+  			    qp->s_num_rd_atomic) {
+ -				qp->s_flags |= RVT_S_WAIT_FENCE;
+ +				qp->s_flags |= HFI1_S_WAIT_FENCE;
+  				goto bail;
+  			}
+- 			wqe->psn = qp->s_next_psn;
+  			newreq = 1;
++ 			qp->s_psn = wqe->psn;
+  		}
+  		/*
+  		 * Note that we have to be careful not to modify the
+@@@ -366,14 -474,12 +362,12 @@@
+  		case IB_WR_SEND:
+  		case IB_WR_SEND_WITH_IMM:
+  			/* If no credit, return. */
+ -			if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT) &&
+ +			if (!(qp->s_flags & HFI1_S_UNLIMITED_CREDIT) &&
+  			    cmp_msn(wqe->ssn, qp->s_lsn + 1) > 0) {
+ -				qp->s_flags |= RVT_S_WAIT_SSN_CREDIT;
+ +				qp->s_flags |= HFI1_S_WAIT_SSN_CREDIT;
+  				goto bail;
+  			}
+- 			wqe->lpsn = wqe->psn;
+  			if (len > pmtu) {
+- 				wqe->lpsn += (len - 1) / pmtu;
+  				qp->s_state = OP(SEND_FIRST);
+  				len = pmtu;
+  				break;
+@@@ -405,14 -511,12 +399,12 @@@
+  				goto bail;
+  			}
+  			ohdr->u.rc.reth.vaddr =
+ -				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ +				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
+  			ohdr->u.rc.reth.rkey =
+ -				cpu_to_be32(wqe->rdma_wr.rkey);
+ +				cpu_to_be32(wqe->wr.wr.rdma.rkey);
+  			ohdr->u.rc.reth.length = cpu_to_be32(len);
+  			hwords += sizeof(struct ib_reth) / sizeof(u32);
+- 			wqe->lpsn = wqe->psn;
+  			if (len > pmtu) {
+- 				wqe->lpsn += (len - 1) / pmtu;
+  				qp->s_state = OP(RDMA_WRITE_FIRST);
+  				len = pmtu;
+  				break;
+@@@ -445,20 -549,13 +437,13 @@@
+  					goto bail;
+  				}
+  				qp->s_num_rd_atomic++;
+ -				if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT))
+ +				if (!(qp->s_flags & HFI1_S_UNLIMITED_CREDIT))
+  					qp->s_lsn++;
+- 				/*
+- 				 * Adjust s_next_psn to count the
+- 				 * expected number of responses.
+- 				 */
+- 				if (len > pmtu)
+- 					qp->s_next_psn += (len - 1) / pmtu;
+- 				wqe->lpsn = qp->s_next_psn++;
+  			}
+  			ohdr->u.rc.reth.vaddr =
+ -				cpu_to_be64(wqe->rdma_wr.remote_addr);
+ +				cpu_to_be64(wqe->wr.wr.rdma.remote_addr);
+  			ohdr->u.rc.reth.rkey =
+ -				cpu_to_be32(wqe->rdma_wr.rkey);
+ +				cpu_to_be32(wqe->wr.wr.rdma.rkey);
+  			ohdr->u.rc.reth.length = cpu_to_be32(len);
+  			qp->s_state = OP(RDMA_READ_REQUEST);
+  			hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+@@@ -482,9 -579,8 +467,8 @@@
+  					goto bail;
+  				}
+  				qp->s_num_rd_atomic++;
+ -				if (!(qp->s_flags & RVT_S_UNLIMITED_CREDIT))
+ +				if (!(qp->s_flags & HFI1_S_UNLIMITED_CREDIT))
+  					qp->s_lsn++;
+- 				wqe->lpsn = wqe->psn;
+  			}
+  			if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+  				qp->s_state = OP(COMPARE_SWAP);
+@@@ -665,13 -754,9 +642,15 @@@
+  		bth2,
+  		middle);
+  done:
+- 	ret = 1;
+- 	goto unlock;
+- 
++ 	return 1;
+  bail:
+++<<<<<<< HEAD:drivers/staging/hfi1/rc.c
+ +	qp->s_flags &= ~HFI1_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/rc.c
+  	return ret;
+  }
+  
+diff --cc drivers/staging/hfi1/ruc.c
+index c4280b6f47d4,6114550bb73f..000000000000
+--- a/drivers/staging/hfi1/ruc.c
++++ b/drivers/staging/hfi1/ruc.c
+@@@ -380,20 -385,21 +380,21 @@@ static void ruc_loopback(struct hfi1_q
+  	spin_lock_irqsave(&sqp->s_lock, flags);
+  
+  	/* Return if we are already busy processing a work request. */
+ -	if ((sqp->s_flags & (RVT_S_BUSY | RVT_S_ANY_WAIT)) ||
+ -	    !(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_OR_FLUSH_SEND))
+ +	if ((sqp->s_flags & (HFI1_S_BUSY | HFI1_S_ANY_WAIT)) ||
+ +	    !(ib_hfi1_state_ops[sqp->state] & HFI1_PROCESS_OR_FLUSH_SEND))
+  		goto unlock;
+  
+ -	sqp->s_flags |= RVT_S_BUSY;
+ +	sqp->s_flags |= HFI1_S_BUSY;
+  
+  again:
+- 	if (sqp->s_last == sqp->s_head)
++ 	smp_read_barrier_depends(); /* see post_one_send() */
++ 	if (sqp->s_last == ACCESS_ONCE(sqp->s_head))
+  		goto clr_busy;
+ -	wqe = rvt_get_swqe_ptr(sqp, sqp->s_last);
+ +	wqe = get_swqe_ptr(sqp, sqp->s_last);
+  
+  	/* Return if it is not OK to start a new work request. */
+ -	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
+ -		if (!(ib_rvt_state_ops[sqp->state] & RVT_FLUSH_SEND))
+ +	if (!(ib_hfi1_state_ops[sqp->state] & HFI1_PROCESS_NEXT_SEND_OK)) {
+ +		if (!(ib_hfi1_state_ops[sqp->state] & HFI1_FLUSH_SEND))
+  			goto clr_busy;
+  		/* We are in the error state, flush the work request. */
+  		send_status = IB_WC_WR_FLUSH_ERR;
+@@@ -846,11 -870,11 +847,17 @@@ void hfi1_do_send(struct work_struct *w
+  		return;
+  	}
+  
+ -	qp->s_flags |= RVT_S_BUSY;
+ +	qp->s_flags |= HFI1_S_BUSY;
+ +
+++<<<<<<< HEAD:drivers/staging/hfi1/ruc.c
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+  
+ +	timeout = jiffies + SEND_RESCHED_TIMEOUT;
+++=======
++ 	timeout = jiffies + (timeout_int) / 8;
++ 	cpu = priv->s_sde ? priv->s_sde->cpu :
++ 			cpumask_first(cpumask_of_node(ps.ppd->dd->node));
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ruc.c
+  	do {
+  		/* Check for a constructed packet to be sent. */
+  		if (qp->s_hdrwords != 0) {
+@@@ -859,18 -884,31 +867,41 @@@
+  			 * the send tasklet will be woken up later.
+  			 */
+  			if (hfi1_verbs_send(qp, &ps))
+- 				break;
++ 				return;
+  			/* Record that s_hdr is empty. */
+  			qp->s_hdrwords = 0;
+++<<<<<<< HEAD:drivers/staging/hfi1/ruc.c
+ +		}
+ +
+ +		/* allow other tasks to run */
+ +		if (unlikely(time_after(jiffies, timeout))) {
+ +			cond_resched();
+ +			ps.ppd->dd->verbs_dev.n_send_schedule++;
+ +			timeout = jiffies + SEND_RESCHED_TIMEOUT;
+++=======
++ 			/* allow other tasks to run */
++ 			if (unlikely(time_after(jiffies, timeout))) {
++ 				if (workqueue_congested(cpu,
++ 							ps.ppd->hfi1_wq)) {
++ 					spin_lock_irqsave(&qp->s_lock, flags);
++ 					qp->s_flags &= ~RVT_S_BUSY;
++ 					hfi1_schedule_send(qp);
++ 					spin_unlock_irqrestore(&qp->s_lock,
++ 							       flags);
++ 					this_cpu_inc(
++ 						*ps.ppd->dd->send_schedule);
++ 					return;
++ 				}
++ 				cond_resched();
++ 				this_cpu_inc(*ps.ppd->dd->send_schedule);
++ 				timeout = jiffies + (timeout_int) / 8;
++ 			}
++ 			spin_lock_irqsave(&qp->s_lock, flags);
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ruc.c
+  		}
+  	} while (make_req(qp));
++ 
++ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+  }
+  
+  /*
+diff --cc drivers/staging/hfi1/uc.c
+index fc90d4f544e4,f884b5c8051b..000000000000
+--- a/drivers/staging/hfi1/uc.c
++++ b/drivers/staging/hfi1/uc.c
+@@@ -59,14 -59,15 +59,20 @@@
+   * hfi1_make_uc_req - construct a request packet (SEND, RDMA write)
+   * @qp: a pointer to the QP
+   *
++  * Assume s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int hfi1_make_uc_req(struct rvt_qp *qp)
+ +int hfi1_make_uc_req(struct hfi1_qp *qp)
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+  	struct hfi1_other_headers *ohdr;
+++<<<<<<< HEAD:drivers/staging/hfi1/uc.c
+ +	struct hfi1_swqe *wqe;
+ +	unsigned long flags;
+++=======
++ 	struct rvt_swqe *wqe;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/uc.c
+  	u32 hwords = 5;
+  	u32 bth0 = 0;
+  	u32 len;
+@@@ -74,13 -75,12 +80,19 @@@
+  	int ret = 0;
+  	int middle = 0;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/uc.c
+ +	spin_lock_irqsave(&qp->s_lock, flags);
+ +
+ +	if (!(ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_SEND_OK)) {
+ +		if (!(ib_hfi1_state_ops[qp->state] & HFI1_FLUSH_SEND))
+++=======
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_SEND_OK)) {
++ 		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/uc.c
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_iowait.sdma_busy)) {
+@@@ -102,11 -102,12 +114,12 @@@
+  	qp->s_wqe = NULL;
+  	switch (qp->s_state) {
+  	default:
+ -		if (!(ib_rvt_state_ops[qp->state] &
+ -		    RVT_PROCESS_NEXT_SEND_OK))
+ +		if (!(ib_hfi1_state_ops[qp->state] &
+ +		    HFI1_PROCESS_NEXT_SEND_OK))
+  			goto bail;
+  		/* Check if send work queue is empty. */
+- 		if (qp->s_cur == qp->s_head) {
++ 		smp_read_barrier_depends(); /* see post_one_send() */
++ 		if (qp->s_cur == ACCESS_ONCE(qp->s_head)) {
+  			clear_ahg(qp);
+  			goto bail;
+  		}
+@@@ -235,15 -235,12 +247,18 @@@
+  	qp->s_cur_sge = &qp->s_sge;
+  	qp->s_cur_size = len;
+  	hfi1_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24),
+- 			     mask_psn(qp->s_next_psn++), middle);
++ 			     mask_psn(qp->s_psn++), middle);
+  done:
+- 	ret = 1;
+- 	goto unlock;
++ 	return 1;
+  
+  bail:
+++<<<<<<< HEAD:drivers/staging/hfi1/uc.c
+ +	qp->s_flags &= ~HFI1_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/uc.c
+  	return ret;
+  }
+  
+diff --cc drivers/staging/hfi1/ud.c
+index a7f67b0111da,ba78e2e3e0bb..000000000000
+--- a/drivers/staging/hfi1/ud.c
++++ b/drivers/staging/hfi1/ud.c
+@@@ -260,17 -261,18 +260,23 @@@ drop
+   * hfi1_make_ud_req - construct a UD request packet
+   * @qp: the QP
+   *
++  * Assume s_lock is held.
++  *
+   * Return 1 if constructed; otherwise, return 0.
+   */
+ -int hfi1_make_ud_req(struct rvt_qp *qp)
+ +int hfi1_make_ud_req(struct hfi1_qp *qp)
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+  	struct hfi1_other_headers *ohdr;
+  	struct ib_ah_attr *ah_attr;
+  	struct hfi1_pportdata *ppd;
+  	struct hfi1_ibport *ibp;
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+ +	struct hfi1_swqe *wqe;
+ +	unsigned long flags;
+++=======
++ 	struct rvt_swqe *wqe;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ud.c
+  	u32 nwords;
+  	u32 extra_bytes;
+  	u32 bth0;
+@@@ -280,13 -282,12 +286,19 @@@
+  	int next_cur;
+  	u8 sc5;
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+ +	spin_lock_irqsave(&qp->s_lock, flags);
+ +
+ +	if (!(ib_hfi1_state_ops[qp->state] & HFI1_PROCESS_NEXT_SEND_OK)) {
+ +		if (!(ib_hfi1_state_ops[qp->state] & HFI1_FLUSH_SEND))
+++=======
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
++ 		if (!(ib_rvt_state_ops[qp->state] & RVT_FLUSH_SEND))
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ud.c
+  			goto bail;
+  		/* We are in the error state, flush the work request. */
+- 		if (qp->s_last == qp->s_head)
++ 		smp_read_barrier_depends(); /* see post_one_send */
++ 		if (qp->s_last == ACCESS_ONCE(qp->s_head))
+  			goto bail;
+  		/* If DMAs are in progress, we can't flush immediately. */
+  		if (atomic_read(&priv->s_iowait.sdma_busy)) {
+@@@ -298,10 -299,12 +310,12 @@@
+  		goto done;
+  	}
+  
+- 	if (qp->s_cur == qp->s_head)
++ 	/* see post_one_send() */
++ 	smp_read_barrier_depends();
++ 	if (qp->s_cur == ACCESS_ONCE(qp->s_head))
+  		goto bail;
+  
+ -	wqe = rvt_get_swqe_ptr(qp, qp->s_cur);
+ +	wqe = get_swqe_ptr(qp, qp->s_cur);
+  	next_cur = qp->s_cur + 1;
+  	if (next_cur >= qp->s_size)
+  		next_cur = 0;
+@@@ -309,13 -312,14 +323,14 @@@
+  	/* Construct the header. */
+  	ibp = to_iport(qp->ibqp.device, qp->port_num);
+  	ppd = ppd_from_ibp(ibp);
+ -	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
+ -	if (ah_attr->dlid < be16_to_cpu(IB_MULTICAST_LID_BASE) ||
+ -	    ah_attr->dlid == be16_to_cpu(IB_LID_PERMISSIVE)) {
+ +	ah_attr = &to_iah(wqe->wr.wr.ud.ah)->attr;
+ +	if (ah_attr->dlid < HFI1_MULTICAST_LID_BASE ||
+ +	    ah_attr->dlid == HFI1_PERMISSIVE_LID) {
+  		lid = ah_attr->dlid & ~((1 << ppd->lmc) - 1);
+  		if (unlikely(!loopback && (lid == ppd->lid ||
+ -		    (lid == be16_to_cpu(IB_LID_PERMISSIVE) &&
+ +		    (lid == HFI1_PERMISSIVE_LID &&
+  		     qp->ibqp.qp_type == IB_QPT_GSI)))) {
++ 			unsigned long flags;
+  			/*
+  			 * If DMAs are in progress, we can't generate
+  			 * a completion for the loopback packet since
+@@@ -406,8 -411,8 +422,13 @@@
+  	else
+  		bth0 |= hfi1_get_pkey(ibp, qp->s_pkey_index);
+  	ohdr->bth[0] = cpu_to_be32(bth0);
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+ +	ohdr->bth[1] = cpu_to_be32(wqe->wr.wr.ud.remote_qpn);
+ +	ohdr->bth[2] = cpu_to_be32(mask_psn(qp->s_next_psn++));
+++=======
++ 	ohdr->bth[1] = cpu_to_be32(wqe->ud_wr.remote_qpn);
++ 	ohdr->bth[2] = cpu_to_be32(mask_psn(wqe->psn));
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ud.c
+  	/*
+  	 * Qkeys with the high order bit set mean use the
+  	 * qkey from the QP context instead of the WR (see 10.2.5).
+@@@ -422,13 -427,9 +443,15 @@@
+  	priv->s_hdr->sde = NULL;
+  
+  done:
+- 	ret = 1;
+- 	goto unlock;
+- 
++ 	return 1;
+  bail:
+++<<<<<<< HEAD:drivers/staging/hfi1/ud.c
+ +	qp->s_flags &= ~HFI1_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&qp->s_lock, flags);
+++=======
++ 	qp->s_flags &= ~RVT_S_BUSY;
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/ud.c
+  	return ret;
+  }
+  
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,1df464815247..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -2000,13 -1495,79 +2000,87 @@@ int hfi1_register_ib_device(struct hfi1
+  	strncpy(ibdev->node_desc, init_utsname()->nodename,
+  		sizeof(ibdev->node_desc));
+  
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	ret = ib_register_device(ibdev, hfi1_create_port_files);
+++=======
++ 	/*
++ 	 * Fill in rvt info object.
++ 	 */
++ 	dd->verbs_dev.rdi.driver_f.port_callback = hfi1_create_port_files;
++ 	dd->verbs_dev.rdi.driver_f.get_card_name = get_card_name;
++ 	dd->verbs_dev.rdi.driver_f.get_pci_dev = get_pci_dev;
++ 	dd->verbs_dev.rdi.driver_f.check_ah = hfi1_check_ah;
++ 	dd->verbs_dev.rdi.driver_f.notify_new_ah = hfi1_notify_new_ah;
++ 	dd->verbs_dev.rdi.driver_f.get_guid_be = hfi1_get_guid_be;
++ 	dd->verbs_dev.rdi.driver_f.query_port_state = query_port;
++ 	dd->verbs_dev.rdi.driver_f.shut_down_port = shut_down_port;
++ 	dd->verbs_dev.rdi.driver_f.cap_mask_chg = hfi1_cap_mask_chg;
++ 	/*
++ 	 * Fill in rvt info device attributes.
++ 	 */
++ 	hfi1_fill_device_attr(dd);
++ 
++ 	/* queue pair */
++ 	dd->verbs_dev.rdi.dparms.qp_table_size = hfi1_qp_table_size;
++ 	dd->verbs_dev.rdi.dparms.qpn_start = 0;
++ 	dd->verbs_dev.rdi.dparms.qpn_inc = 1;
++ 	dd->verbs_dev.rdi.dparms.qos_shift = dd->qos_shift;
++ 	dd->verbs_dev.rdi.dparms.qpn_res_start = kdeth_qp << 16;
++ 	dd->verbs_dev.rdi.dparms.qpn_res_end =
++ 	dd->verbs_dev.rdi.dparms.qpn_res_start + 65535;
++ 	dd->verbs_dev.rdi.dparms.max_rdma_atomic = HFI1_MAX_RDMA_ATOMIC;
++ 	dd->verbs_dev.rdi.dparms.psn_mask = PSN_MASK;
++ 	dd->verbs_dev.rdi.dparms.psn_shift = PSN_SHIFT;
++ 	dd->verbs_dev.rdi.dparms.psn_modify_mask = PSN_MODIFY_MASK;
++ 	dd->verbs_dev.rdi.dparms.core_cap_flags = RDMA_CORE_PORT_INTEL_OPA;
++ 	dd->verbs_dev.rdi.dparms.max_mad_size = OPA_MGMT_MAD_SIZE;
++ 
++ 	dd->verbs_dev.rdi.driver_f.qp_priv_alloc = qp_priv_alloc;
++ 	dd->verbs_dev.rdi.driver_f.qp_priv_free = qp_priv_free;
++ 	dd->verbs_dev.rdi.driver_f.free_all_qps = free_all_qps;
++ 	dd->verbs_dev.rdi.driver_f.notify_qp_reset = notify_qp_reset;
++ 	dd->verbs_dev.rdi.driver_f.do_send = hfi1_do_send;
++ 	dd->verbs_dev.rdi.driver_f.schedule_send = hfi1_schedule_send;
++ 	dd->verbs_dev.rdi.driver_f.schedule_send_no_lock = _hfi1_schedule_send;
++ 	dd->verbs_dev.rdi.driver_f.get_pmtu_from_attr = get_pmtu_from_attr;
++ 	dd->verbs_dev.rdi.driver_f.notify_error_qp = notify_error_qp;
++ 	dd->verbs_dev.rdi.driver_f.flush_qp_waiters = flush_qp_waiters;
++ 	dd->verbs_dev.rdi.driver_f.stop_send_queue = stop_send_queue;
++ 	dd->verbs_dev.rdi.driver_f.quiesce_qp = quiesce_qp;
++ 	dd->verbs_dev.rdi.driver_f.notify_error_qp = notify_error_qp;
++ 	dd->verbs_dev.rdi.driver_f.mtu_from_qp = mtu_from_qp;
++ 	dd->verbs_dev.rdi.driver_f.mtu_to_path_mtu = mtu_to_path_mtu;
++ 	dd->verbs_dev.rdi.driver_f.check_modify_qp = hfi1_check_modify_qp;
++ 	dd->verbs_dev.rdi.driver_f.modify_qp = hfi1_modify_qp;
++ 	dd->verbs_dev.rdi.driver_f.check_send_wqe = hfi1_check_send_wqe;
++ 
++ 	/* completeion queue */
++ 	snprintf(dd->verbs_dev.rdi.dparms.cq_name,
++ 		 sizeof(dd->verbs_dev.rdi.dparms.cq_name),
++ 		 "hfi1_cq%d", dd->unit);
++ 	dd->verbs_dev.rdi.dparms.node = dd->node;
++ 
++ 	/* misc settings */
++ 	dd->verbs_dev.rdi.flags = 0; /* Let rdmavt handle it all */
++ 	dd->verbs_dev.rdi.dparms.lkey_table_size = hfi1_lkey_table_size;
++ 	dd->verbs_dev.rdi.dparms.nports = dd->num_pports;
++ 	dd->verbs_dev.rdi.dparms.npkeys = hfi1_get_npkeys(dd);
++ 
++ 	ppd = dd->pport;
++ 	for (i = 0; i < dd->num_pports; i++, ppd++)
++ 		rvt_init_port(&dd->verbs_dev.rdi,
++ 			      &ppd->ibport_data.rvp,
++ 			      i,
++ 			      ppd->pkeys);
++ 
++ 	ret = rvt_register_device(&dd->verbs_dev.rdi);
+++>>>>>>> 46a80d62e6e0 (IB/qib, staging/rdma/hfi1: add s_hlock for use in post send):drivers/staging/rdma/hfi1/verbs.c
+  	if (ret)
+ -		goto err_verbs_txreq;
+ +		goto err_reg;
+ +
+ +	ret = hfi1_create_agents(dev);
+ +	if (ret)
+ +		goto err_agents;
+  
+  	ret = hfi1_verbs_register_sysfs(dd);
+  	if (ret)
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index cf1dd6e9d434..b13fda8d69ba 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -1326,6 +1326,42 @@ void qib_get_credit(struct qib_qp *qp, u32 aeth)
+ 	}
+ }
+ 
++/**
++ * qib_check_send_wqe - validate wr/wqe
++ * @qp - The qp
++ * @wqe - The built wqe
++ *
++ * validate wr/wqe.  This is called
++ * prior to inserting the wqe into
++ * the ring but after the wqe has been
++ * setup.
++ *
++ * Returns 0 on success, -EINVAL on failure
++ */
++int qib_check_send_wqe(struct rvt_qp *qp,
++		       struct rvt_swqe *wqe)
++{
++	struct rvt_ah *ah;
++
++	switch (qp->ibqp.qp_type) {
++	case IB_QPT_RC:
++	case IB_QPT_UC:
++		if (wqe->length > 0x80000000U)
++			return -EINVAL;
++		break;
++	case IB_QPT_SMI:
++	case IB_QPT_GSI:
++	case IB_QPT_UD:
++		ah = ibah_to_rvtah(wqe->ud_wr.ah);
++		if (wqe->length > (1 << ah->log_pmtu))
++			return -EINVAL;
++		break;
++	default:
++		break;
++	}
++	return 0;
++}
++
+ #ifdef CONFIG_DEBUG_FS
+ 
+ struct qib_qp_iter {
+* Unmerged path drivers/infiniband/hw/qib/qib_rc.c
+diff --git a/drivers/infiniband/hw/qib/qib_ruc.c b/drivers/infiniband/hw/qib/qib_ruc.c
+index e9132f7a68b0..b723840e14c2 100644
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@ -383,7 +383,8 @@ static void qib_ruc_loopback(struct qib_qp *sqp)
+ 	sqp->s_flags |= QIB_S_BUSY;
+ 
+ again:
+-	if (sqp->s_last == sqp->s_head)
++	smp_read_barrier_depends(); /* see post_one_send() */
++	if (sqp->s_last == ACCESS_ONCE(sqp->s_head))
+ 		goto clr_busy;
+ 	wqe = get_swqe_ptr(sqp, sqp->s_last);
+ 
+@@ -751,22 +752,24 @@ void qib_do_send(struct work_struct *work)
+ 
+ 	qp->s_flags |= QIB_S_BUSY;
+ 
+-	spin_unlock_irqrestore(&qp->s_lock, flags);
+-
+ 	do {
+ 		/* Check for a constructed packet to be sent. */
+ 		if (qp->s_hdrwords != 0) {
++			spin_unlock_irqrestore(&qp->s_lock, flags);
+ 			/*
+ 			 * If the packet cannot be sent now, return and
+ 			 * the send tasklet will be woken up later.
+ 			 */
+ 			if (qib_verbs_send(qp, priv->s_hdr, qp->s_hdrwords,
+ 					   qp->s_cur_sge, qp->s_cur_size))
+-				break;
++				return;
+ 			/* Record that s_hdr is empty. */
+ 			qp->s_hdrwords = 0;
++			spin_lock_irqsave(&qp->s_lock, flags);
+ 		}
+ 	} while (make_req(qp));
++
++	spin_unlock_irqrestore(&qp->s_lock, flags);
+ }
+ 
+ /*
+* Unmerged path drivers/infiniband/hw/qib/qib_uc.c
+* Unmerged path drivers/infiniband/hw/qib/qib_ud.c
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.c
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.h
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index e8d0da89ea8e..f7f0d855abd2 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -401,6 +401,7 @@ void rvt_reset_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ 		rdi->driver_f.flush_qp_waiters(qp);
+ 		qp->s_flags &= ~(RVT_S_TIMER | RVT_S_ANY_WAIT);
+ 		spin_unlock(&qp->s_lock);
++		spin_unlock(&qp->s_hlock);
+ 		spin_unlock_irq(&qp->r_lock);
+ 
+ 		/* Stop the send queue and the retry timer */
+@@ -416,6 +417,7 @@ void rvt_reset_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ 
+ 		/* grab the lock b/c it was locked at call time */
+ 		spin_lock_irq(&qp->r_lock);
++		spin_lock(&qp->s_hlock);
+ 		spin_lock(&qp->s_lock);
+ 
+ 		rvt_clear_mr_refs(qp, 1);
+@@ -611,6 +613,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 		 * except for qp->ibqp.qp_num.
+ 		 */
+ 		spin_lock_init(&qp->r_lock);
++		spin_lock_init(&qp->s_hlock);
+ 		spin_lock_init(&qp->s_lock);
+ 		spin_lock_init(&qp->r_rq.lock);
+ 		atomic_set(&qp->refcount, 0);
+@@ -621,6 +624,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 		qp->state = IB_QPS_RESET;
+ 		qp->s_wq = swq;
+ 		qp->s_size = init_attr->cap.max_send_wr + 1;
++		qp->s_avail = init_attr->cap.max_send_wr;
+ 		qp->s_max_sge = init_attr->cap.max_send_sge;
+ 		if (init_attr->sq_sig_type == IB_SIGNAL_REQ_WR)
+ 			qp->s_flags = RVT_S_SIGNAL_REQ_WR;
+@@ -767,6 +771,7 @@ void rvt_clear_mr_refs(struct rvt_qp *qp, int clr_sends)
+ 						wqe->ud_wr.ah)->refcount);
+ 			if (++qp->s_last >= qp->s_size)
+ 				qp->s_last = 0;
++			smp_wmb(); /* see qp_set_savail */
+ 		}
+ 		if (qp->s_rdma_mr) {
+ 			rvt_put_mr(qp->s_rdma_mr);
+@@ -821,7 +826,7 @@ int rvt_error_qp(struct rvt_qp *qp, enum ib_wc_status err)
+ 	rdi->driver_f.notify_error_qp(qp);
+ 
+ 	/* Schedule the sending tasklet to drain the send work queue. */
+-	if (qp->s_last != qp->s_head)
++	if (ACCESS_ONCE(qp->s_last) != qp->s_head)
+ 		rdi->driver_f.schedule_send(qp);
+ 
+ 	rvt_clear_mr_refs(qp, 0);
+@@ -967,6 +972,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 	link = rdma_port_get_link_layer(ibqp->device, qp->port_num);
+ 
+ 	spin_lock_irq(&qp->r_lock);
++	spin_lock(&qp->s_hlock);
+ 	spin_lock(&qp->s_lock);
+ 
+ 	cur_state = attr_mask & IB_QP_CUR_STATE ?
+@@ -1146,6 +1152,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 	if (attr_mask & IB_QP_PATH_MTU) {
+ 		qp->pmtu = rdi->driver_f.mtu_from_qp(rdi, qp, pmtu);
+ 		qp->path_mtu = rdi->driver_f.mtu_to_path_mtu(qp->pmtu);
++		qp->log_pmtu = ilog2(qp->pmtu);
+ 	}
+ 
+ 	if (attr_mask & IB_QP_RETRY_CNT) {
+@@ -1181,6 +1188,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		rdi->driver_f.modify_qp(qp, attr, attr_mask, udata);
+ 
+ 	spin_unlock(&qp->s_lock);
++	spin_unlock(&qp->s_hlock);
+ 	spin_unlock_irq(&qp->r_lock);
+ 
+ 	if (cur_state == IB_QPS_RESET && new_state == IB_QPS_INIT)
+@@ -1202,6 +1210,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 
+ inval:
+ 	spin_unlock(&qp->s_lock);
++	spin_unlock(&qp->s_hlock);
+ 	spin_unlock_irq(&qp->r_lock);
+ 	return -EINVAL;
+ }
+@@ -1221,9 +1230,11 @@ int rvt_destroy_qp(struct ib_qp *ibqp)
+ 	struct rvt_dev_info *rdi = ib_to_rvt(ibqp->device);
+ 
+ 	spin_lock_irq(&qp->r_lock);
++	spin_lock(&qp->s_hlock);
+ 	spin_lock(&qp->s_lock);
+ 	rvt_reset_qp(rdi, qp, ibqp->qp_type);
+ 	spin_unlock(&qp->s_lock);
++	spin_unlock(&qp->s_hlock);
+ 	spin_unlock_irq(&qp->r_lock);
+ 
+ 	/* qpn is now available for use again */
+@@ -1348,6 +1359,28 @@ int rvt_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+ 	return 0;
+ }
+ 
++/**
++ * qp_get_savail - return number of avail send entries
++ *
++ * @qp - the qp
++ *
++ * This assumes the s_hlock is held but the s_last
++ * qp variable is uncontrolled.
++ */
++static inline u32 qp_get_savail(struct rvt_qp *qp)
++{
++	u32 slast;
++	u32 ret;
++
++	smp_read_barrier_depends(); /* see rc.c */
++	slast = ACCESS_ONCE(qp->s_last);
++	if (qp->s_head >= slast)
++		ret = qp->s_size - (qp->s_head - slast);
++	else
++		ret = slast - qp->s_head;
++	return ret - 1;
++}
++
+ /**
+  * rvt_post_one_wr - post one RC, UC, or UD send work request
+  * @qp: the QP to post on
+@@ -1363,6 +1396,8 @@ static int rvt_post_one_wr(struct rvt_qp *qp, struct ib_send_wr *wr)
+ 	struct rvt_lkey_table *rkt;
+ 	struct rvt_pd *pd;
+ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++	u8 log_pmtu;
++	int ret;
+ 
+ 	/* IB spec says that num_sge == 0 is OK. */
+ 	if (unlikely(wr->num_sge > qp->s_max_sge))
+@@ -1394,16 +1429,16 @@ static int rvt_post_one_wr(struct rvt_qp *qp, struct ib_send_wr *wr)
+ 	} else if (wr->opcode >= IB_WR_RDMA_READ && !qp->s_max_rd_atomic) {
+ 		return -EINVAL;
+ 	}
+-
++	/* check for avail */
++	if (unlikely(!qp->s_avail)) {
++		qp->s_avail = qp_get_savail(qp);
++		WARN_ON(qp->s_avail > (qp->s_size - 1));
++		if (!qp->s_avail)
++			return -ENOMEM;
++	}
+ 	next = qp->s_head + 1;
+ 	if (next >= qp->s_size)
+ 		next = 0;
+-	if (next == qp->s_last)
+-		return -ENOMEM;
+-
+-	if (rdi->driver_f.check_send_wr &&
+-	    rdi->driver_f.check_send_wr(qp, wr))
+-		return -EINVAL;
+ 
+ 	rkt = &rdi->lkey_table;
+ 	pd = ibpd_to_rvtpd(qp->ibqp.pd);
+@@ -1435,21 +1470,39 @@ static int rvt_post_one_wr(struct rvt_qp *qp, struct ib_send_wr *wr)
+ 				continue;
+ 			ok = rvt_lkey_ok(rkt, pd, &wqe->sg_list[j],
+ 					 &wr->sg_list[i], acc);
+-			if (!ok)
++			if (!ok) {
++				ret = -EINVAL;
+ 				goto bail_inval_free;
++			}
+ 			wqe->length += length;
+ 			j++;
+ 		}
+ 		wqe->wr.num_sge = j;
+ 	}
+-	if (qp->ibqp.qp_type == IB_QPT_UC ||
+-	    qp->ibqp.qp_type == IB_QPT_RC) {
+-		if (wqe->length > 0x80000000U)
++
++	/* general part of wqe valid - allow for driver checks */
++	if (rdi->driver_f.check_send_wqe) {
++		ret = rdi->driver_f.check_send_wqe(qp, wqe);
++		if (ret)
+ 			goto bail_inval_free;
+-	} else {
++	}
++
++	log_pmtu = qp->log_pmtu;
++	if (qp->ibqp.qp_type != IB_QPT_UC &&
++	    qp->ibqp.qp_type != IB_QPT_RC) {
++		struct rvt_ah *ah = ibah_to_rvtah(wqe->ud_wr.ah);
++
++		log_pmtu = ah->log_pmtu;
+ 		atomic_inc(&ibah_to_rvtah(ud_wr(wr)->ah)->refcount);
+ 	}
++
+ 	wqe->ssn = qp->s_ssn++;
++	wqe->psn = qp->s_next_psn;
++	wqe->lpsn = wqe->psn +
++			(wqe->length ? ((wqe->length - 1) >> log_pmtu) : 0);
++	qp->s_next_psn = wqe->lpsn + 1;
++	smp_wmb(); /* see request builders */
++	qp->s_avail--;
+ 	qp->s_head = next;
+ 
+ 	return 0;
+@@ -1461,7 +1514,7 @@ bail_inval_free:
+ 
+ 		rvt_put_mr(sge->mr);
+ 	}
+-	return -EINVAL;
++	return ret;
+ }
+ 
+ /**
+@@ -1482,14 +1535,14 @@ int rvt_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 	unsigned nreq = 0;
+ 	int err = 0;
+ 
+-	spin_lock_irqsave(&qp->s_lock, flags);
++	spin_lock_irqsave(&qp->s_hlock, flags);
+ 
+ 	/*
+ 	 * Ensure QP state is such that we can send. If not bail out early,
+ 	 * there is no need to do this every time we post a send.
+ 	 */
+ 	if (unlikely(!(ib_rvt_state_ops[qp->state] & RVT_POST_SEND_OK))) {
+-		spin_unlock_irqrestore(&qp->s_lock, flags);
++		spin_unlock_irqrestore(&qp->s_hlock, flags);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1509,11 +1562,13 @@ int rvt_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 		nreq++;
+ 	}
+ bail:
+-	if (nreq && !call_send)
+-		rdi->driver_f.schedule_send(qp);
+-	spin_unlock_irqrestore(&qp->s_lock, flags);
+-	if (nreq && call_send)
+-		rdi->driver_f.do_send(qp);
++	spin_unlock_irqrestore(&qp->s_hlock, flags);
++	if (nreq) {
++		if (call_send)
++			rdi->driver_f.schedule_send_no_lock(qp);
++		else
++			rdi->driver_f.do_send(qp);
++	}
+ 	return err;
+ }
+ 
+* Unmerged path drivers/staging/hfi1/qp.h
+* Unmerged path drivers/staging/hfi1/rc.c
+* Unmerged path drivers/staging/hfi1/ruc.c
+* Unmerged path drivers/staging/hfi1/uc.c
+* Unmerged path drivers/staging/hfi1/ud.c
+* Unmerged path drivers/staging/hfi1/verbs.c
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
+* Unmerged path drivers/staging/rdma/hfi1/verbs.h
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index 4242fea9cf4e..275388ecddc9 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -220,6 +220,7 @@ struct rvt_ah {
+ };
+ 
+ struct rvt_dev_info;
++struct rvt_swqe;
+ struct rvt_driver_provided {
+ 	/*
+ 	 * The work to create port files in /sys/class Infiniband is different
+@@ -240,6 +241,7 @@ struct rvt_driver_provided {
+ 	void (*qp_priv_free)(struct rvt_dev_info *rdi, struct rvt_qp *qp);
+ 	void (*notify_qp_reset)(struct rvt_qp *qp);
+ 	void (*schedule_send)(struct rvt_qp *qp);
++	void (*schedule_send_no_lock)(struct rvt_qp *qp);
+ 	void (*do_send)(struct rvt_qp *qp);
+ 	int (*get_pmtu_from_attr)(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ 				  struct ib_qp_attr *attr);
+@@ -273,7 +275,7 @@ struct rvt_driver_provided {
+ 	void (*modify_qp)(struct rvt_qp *qp, struct ib_qp_attr *attr,
+ 			  int attr_mask, struct ib_udata *udata);
+ 
+-	int (*check_send_wr)(struct rvt_qp *qp, struct ib_send_wr *wr);
++	int (*check_send_wqe)(struct rvt_qp *qp, struct rvt_swqe *wqe);
+ 
+ 	void (*notify_create_mad_agent)(struct rvt_dev_info *rdi, int port_idx);
+ 	void (*notify_free_mad_agent)(struct rvt_dev_info *rdi, int port_idx);
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index aed13e13591c..dfc91f457caf 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -248,11 +248,12 @@ struct rvt_qp {
+ 	enum ib_mtu path_mtu;
+ 	int srate_mbps;		/* s_srate (below) converted to Mbit/s */
+ 	u32 remote_qpn;
+-	u32 pmtu;		/* decoded from path_mtu */
+ 	u32 qkey;               /* QKEY for this QP (for UD or RD) */
+ 	u32 s_size;             /* send work queue size */
+ 	u32 s_ahgpsn;           /* set to the psn in the copy of the header */
+ 
++	u16 pmtu;		/* decoded from path_mtu */
++	u8 log_pmtu;		/* shift for pmtu */
+ 	u8 state;               /* QP state */
+ 	u8 allowed_ops;		/* high order bits of allowed opcodes */
+ 	u8 qp_access_flags;
+@@ -297,6 +298,13 @@ struct rvt_qp {
+ 	struct rvt_sge_state r_sge;     /* current receive data */
+ 	struct rvt_rq r_rq;             /* receive work queue */
+ 
++	/* post send line */
++	spinlock_t s_hlock ____cacheline_aligned_in_smp;
++	u32 s_head;             /* new entries added here */
++	u32 s_next_psn;         /* PSN for next request */
++	u32 s_avail;            /* number of entries avail */
++	u32 s_ssn;              /* SSN of tail entry */
++
+ 	spinlock_t s_lock ____cacheline_aligned_in_smp;
+ 	struct rvt_sge_state *s_cur_sge;
+ 	u32 s_flags;
+@@ -306,19 +314,16 @@ struct rvt_qp {
+ 	u32 s_cur_size;         /* size of send packet in bytes */
+ 	u32 s_len;              /* total length of s_sge */
+ 	u32 s_rdma_read_len;    /* total length of s_rdma_read_sge */
+-	u32 s_next_psn;         /* PSN for next request */
+ 	u32 s_last_psn;         /* last response PSN processed */
+ 	u32 s_sending_psn;      /* lowest PSN that is being sent */
+ 	u32 s_sending_hpsn;     /* highest PSN that is being sent */
+ 	u32 s_psn;              /* current packet sequence number */
+ 	u32 s_ack_rdma_psn;     /* PSN for sending RDMA read responses */
+ 	u32 s_ack_psn;          /* PSN for acking sends and RDMA writes */
+-	u32 s_head;             /* new entries added here */
+ 	u32 s_tail;             /* next entry to process */
+ 	u32 s_cur;              /* current work queue entry */
+ 	u32 s_acked;            /* last un-ACK'ed entry */
+ 	u32 s_last;             /* last completed entry */
+-	u32 s_ssn;              /* SSN of tail entry */
+ 	u32 s_lsn;              /* limit sequence number (credit) */
+ 	u16 s_hdrwords;         /* size of s_hdr in 32 bit words */
+ 	u16 s_rdma_ack_cnt;
