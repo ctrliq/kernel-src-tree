@@ -1,0 +1,930 @@
+nfs: move nfs_pgio_data and remove nfs_rw_header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Weston Andros Adamson <dros@primarydata.com>
+commit 1e7f3a485922211b6e4a082ebc6bf05810b0b6ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1e7f3a48.failed
+
+nfs_rw_header was used to allocate an nfs_pgio_header along with an
+nfs_pgio_data, because a _header would need at least one _data.
+
+Now there is only ever one nfs_pgio_data for each nfs_pgio_header -- move
+it to nfs_pgio_header and get rid of nfs_rw_header.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 1e7f3a485922211b6e4a082ebc6bf05810b0b6ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+#	fs/nfs/internal.h
+#	fs/nfs/pagelist.c
+#	fs/nfs/pnfs.c
+#	fs/nfs/read.c
+#	fs/nfs/write.c
+#	include/linux/nfs_page.h
+#	include/linux/nfs_xdr.h
+diff --cc fs/nfs/direct.c
+index ddbc02a05958,179de67ca907..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -108,6 -108,97 +108,100 @@@ static inline int put_dreq(struct nfs_d
+  	return atomic_dec_and_test(&dreq->io_count);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * nfs_direct_select_verf - select the right verifier
++  * @dreq - direct request possibly spanning multiple servers
++  * @ds_clp - nfs_client of data server or NULL if MDS / non-pnfs
++  * @ds_idx - index of data server in data server list, only valid if ds_clp set
++  *
++  * returns the correct verifier to use given the role of the server
++  */
++ static struct nfs_writeverf *
++ nfs_direct_select_verf(struct nfs_direct_req *dreq,
++ 		       struct nfs_client *ds_clp,
++ 		       int ds_idx)
++ {
++ 	struct nfs_writeverf *verfp = &dreq->verf;
++ 
++ #ifdef CONFIG_NFS_V4_1
++ 	if (ds_clp) {
++ 		/* pNFS is in use, use the DS verf */
++ 		if (ds_idx >= 0 && ds_idx < dreq->ds_cinfo.nbuckets)
++ 			verfp = &dreq->ds_cinfo.buckets[ds_idx].direct_verf;
++ 		else
++ 			WARN_ON_ONCE(1);
++ 	}
++ #endif
++ 	return verfp;
++ }
++ 
++ 
++ /*
++  * nfs_direct_set_hdr_verf - set the write/commit verifier
++  * @dreq - direct request possibly spanning multiple servers
++  * @hdr - pageio header to validate against previously seen verfs
++  *
++  * Set the server's (MDS or DS) "seen" verifier
++  */
++ static void nfs_direct_set_hdr_verf(struct nfs_direct_req *dreq,
++ 				    struct nfs_pgio_header *hdr)
++ {
++ 	struct nfs_writeverf *verfp;
++ 
++ 	verfp = nfs_direct_select_verf(dreq, hdr->data.ds_clp,
++ 				      hdr->data.ds_idx);
++ 	WARN_ON_ONCE(verfp->committed >= 0);
++ 	memcpy(verfp, &hdr->verf, sizeof(struct nfs_writeverf));
++ 	WARN_ON_ONCE(verfp->committed < 0);
++ }
++ 
++ /*
++  * nfs_direct_cmp_hdr_verf - compare verifier for pgio header
++  * @dreq - direct request possibly spanning multiple servers
++  * @hdr - pageio header to validate against previously seen verf
++  *
++  * set the server's "seen" verf if not initialized.
++  * returns result of comparison between @hdr->verf and the "seen"
++  * verf of the server used by @hdr (DS or MDS)
++  */
++ static int nfs_direct_set_or_cmp_hdr_verf(struct nfs_direct_req *dreq,
++ 					  struct nfs_pgio_header *hdr)
++ {
++ 	struct nfs_writeverf *verfp;
++ 
++ 	verfp = nfs_direct_select_verf(dreq, hdr->data.ds_clp,
++ 					 hdr->data.ds_idx);
++ 	if (verfp->committed < 0) {
++ 		nfs_direct_set_hdr_verf(dreq, hdr);
++ 		return 0;
++ 	}
++ 	return memcmp(verfp, &hdr->verf, sizeof(struct nfs_writeverf));
++ }
++ 
++ #if IS_ENABLED(CONFIG_NFS_V3) || IS_ENABLED(CONFIG_NFS_V4)
++ /*
++  * nfs_direct_cmp_commit_data_verf - compare verifier for commit data
++  * @dreq - direct request possibly spanning multiple servers
++  * @data - commit data to validate against previously seen verf
++  *
++  * returns result of comparison between @data->verf and the verf of
++  * the server used by @data (DS or MDS)
++  */
++ static int nfs_direct_cmp_commit_data_verf(struct nfs_direct_req *dreq,
++ 					   struct nfs_commit_data *data)
++ {
++ 	struct nfs_writeverf *verfp;
++ 
++ 	verfp = nfs_direct_select_verf(dreq, data->ds_clp,
++ 					 data->ds_commit_index);
++ 	WARN_ON_ONCE(verfp->committed < 0);
++ 	return memcmp(verfp, &data->verf, sizeof(struct nfs_writeverf));
++ }
++ #endif
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  /**
+   * nfs_direct_IO - NFS address space operation for direct I/O
+   * @rw: direction (read or write)
+diff --cc fs/nfs/internal.h
+index 96bd22580dbf,5cda049c8f9b..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -238,6 -237,14 +238,17 @@@ extern void nfs_pgheader_init(struct nf
+  void nfs_set_pgio_error(struct nfs_pgio_header *hdr, int error, loff_t pos);
+  int nfs_iocounter_wait(struct nfs_io_counter *c);
+  
+++<<<<<<< HEAD
+++=======
++ extern const struct nfs_pageio_ops nfs_pgio_rw_ops;
++ struct nfs_pgio_header *nfs_pgio_header_alloc(const struct nfs_rw_ops *);
++ void nfs_pgio_header_free(struct nfs_pgio_header *);
++ void nfs_pgio_data_destroy(struct nfs_pgio_data *);
++ int nfs_generic_pgio(struct nfs_pageio_descriptor *, struct nfs_pgio_header *);
++ int nfs_initiate_pgio(struct rpc_clnt *, struct nfs_pgio_data *,
++ 		      const struct rpc_call_ops *, int, int);
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  static inline void nfs_iocounter_init(struct nfs_io_counter *c)
+  {
+  	c->flags = 0;
+diff --cc fs/nfs/pagelist.c
+index 00f3d2d2a504,e4cde476562f..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -307,6 -452,192 +307,195 @@@ size_t nfs_generic_pg_test(struct nfs_p
+  }
+  EXPORT_SYMBOL_GPL(nfs_generic_pg_test);
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs_pgio_header *nfs_pgio_header_alloc(const struct nfs_rw_ops *ops)
++ {
++ 	struct nfs_pgio_header *hdr = ops->rw_alloc_header();
++ 
++ 	if (hdr) {
++ 		INIT_LIST_HEAD(&hdr->pages);
++ 		spin_lock_init(&hdr->lock);
++ 		atomic_set(&hdr->refcnt, 0);
++ 		hdr->rw_ops = ops;
++ 	}
++ 	return hdr;
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_alloc);
++ 
++ /*
++  * nfs_pgio_header_free - Free a read or write header
++  * @hdr: The header to free
++  */
++ void nfs_pgio_header_free(struct nfs_pgio_header *hdr)
++ {
++ 	hdr->rw_ops->rw_free_header(hdr);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_free);
++ 
++ /**
++  * nfs_pgio_data_alloc - Allocate pageio data
++  * @hdr: The header making a request
++  * @pagecount: Number of pages to create
++  */
++ static bool nfs_pgio_data_init(struct nfs_pgio_header *hdr,
++ 			       unsigned int pagecount)
++ {
++ 	if (nfs_pgarray_set(&hdr->data.pages, pagecount)) {
++ 		hdr->data.header = hdr;
++ 		atomic_inc(&hdr->refcnt);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ /**
++  * nfs_pgio_data_destroy - Properly free pageio data
++  * @data: The data to destroy
++  */
++ void nfs_pgio_data_destroy(struct nfs_pgio_data *data)
++ {
++ 	struct nfs_pgio_header *hdr = data->header;
++ 
++ 	put_nfs_open_context(data->args.context);
++ 	if (data->pages.pagevec != data->pages.page_array)
++ 		kfree(data->pages.pagevec);
++ 	if (atomic_dec_and_test(&hdr->refcnt))
++ 		hdr->completion_ops->completion(hdr);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_data_destroy);
++ 
++ /**
++  * nfs_pgio_rpcsetup - Set up arguments for a pageio call
++  * @data: The pageio data
++  * @count: Number of bytes to read
++  * @offset: Initial offset
++  * @how: How to commit data (writes only)
++  * @cinfo: Commit information for the call (writes only)
++  */
++ static void nfs_pgio_rpcsetup(struct nfs_pgio_data *data,
++ 			      unsigned int count, unsigned int offset,
++ 			      int how, struct nfs_commit_info *cinfo)
++ {
++ 	struct nfs_page *req = data->header->req;
++ 
++ 	/* Set up the RPC argument and reply structs
++ 	 * NB: take care not to mess about with data->commit et al. */
++ 
++ 	data->args.fh     = NFS_FH(data->header->inode);
++ 	data->args.offset = req_offset(req) + offset;
++ 	/* pnfs_set_layoutcommit needs this */
++ 	data->mds_offset = data->args.offset;
++ 	data->args.pgbase = req->wb_pgbase + offset;
++ 	data->args.pages  = data->pages.pagevec;
++ 	data->args.count  = count;
++ 	data->args.context = get_nfs_open_context(req->wb_context);
++ 	data->args.lock_context = req->wb_lock_context;
++ 	data->args.stable  = NFS_UNSTABLE;
++ 	switch (how & (FLUSH_STABLE | FLUSH_COND_STABLE)) {
++ 	case 0:
++ 		break;
++ 	case FLUSH_COND_STABLE:
++ 		if (nfs_reqs_to_commit(cinfo))
++ 			break;
++ 	default:
++ 		data->args.stable = NFS_FILE_SYNC;
++ 	}
++ 
++ 	data->res.fattr   = &data->fattr;
++ 	data->res.count   = count;
++ 	data->res.eof     = 0;
++ 	data->res.verf    = &data->verf;
++ 	nfs_fattr_init(&data->fattr);
++ }
++ 
++ /**
++  * nfs_pgio_prepare - Prepare pageio data to go over the wire
++  * @task: The current task
++  * @calldata: pageio data to prepare
++  */
++ static void nfs_pgio_prepare(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	int err;
++ 	err = NFS_PROTO(data->header->inode)->pgio_rpc_prepare(task, data);
++ 	if (err)
++ 		rpc_exit(task, err);
++ }
++ 
++ int nfs_initiate_pgio(struct rpc_clnt *clnt, struct nfs_pgio_data *data,
++ 		      const struct rpc_call_ops *call_ops, int how, int flags)
++ {
++ 	struct rpc_task *task;
++ 	struct rpc_message msg = {
++ 		.rpc_argp = &data->args,
++ 		.rpc_resp = &data->res,
++ 		.rpc_cred = data->header->cred,
++ 	};
++ 	struct rpc_task_setup task_setup_data = {
++ 		.rpc_client = clnt,
++ 		.task = &data->task,
++ 		.rpc_message = &msg,
++ 		.callback_ops = call_ops,
++ 		.callback_data = data,
++ 		.workqueue = nfsiod_workqueue,
++ 		.flags = RPC_TASK_ASYNC | flags,
++ 	};
++ 	int ret = 0;
++ 
++ 	data->header->rw_ops->rw_initiate(data, &msg, &task_setup_data, how);
++ 
++ 	dprintk("NFS: %5u initiated pgio call "
++ 		"(req %s/%llu, %u bytes @ offset %llu)\n",
++ 		data->task.tk_pid,
++ 		data->header->inode->i_sb->s_id,
++ 		(unsigned long long)NFS_FILEID(data->header->inode),
++ 		data->args.count,
++ 		(unsigned long long)data->args.offset);
++ 
++ 	task = rpc_run_task(&task_setup_data);
++ 	if (IS_ERR(task)) {
++ 		ret = PTR_ERR(task);
++ 		goto out;
++ 	}
++ 	if (how & FLUSH_SYNC) {
++ 		ret = rpc_wait_for_completion_task(task);
++ 		if (ret == 0)
++ 			ret = task->tk_status;
++ 	}
++ 	rpc_put_task(task);
++ out:
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nfs_initiate_pgio);
++ 
++ /**
++  * nfs_pgio_error - Clean up from a pageio error
++  * @desc: IO descriptor
++  * @hdr: pageio header
++  */
++ static int nfs_pgio_error(struct nfs_pageio_descriptor *desc,
++ 			  struct nfs_pgio_header *hdr)
++ {
++ 	set_bit(NFS_IOHDR_REDO, &hdr->flags);
++ 	nfs_pgio_data_destroy(&hdr->data);
++ 	desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 	return -ENOMEM;
++ }
++ 
++ /**
++  * nfs_pgio_release - Release pageio data
++  * @calldata: The pageio data to release
++  */
++ static void nfs_pgio_release(void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	if (data->header->rw_ops->rw_release)
++ 		data->header->rw_ops->rw_release(data);
++ 	nfs_pgio_data_destroy(data);
++ }
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  /**
+   * nfs_pageio_init - initialise a page io descriptor
+   * @desc: pointer to descriptor
+@@@ -340,6 -673,91 +529,94 @@@ void nfs_pageio_init(struct nfs_pageio_
+  }
+  EXPORT_SYMBOL_GPL(nfs_pageio_init);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * nfs_pgio_result - Basic pageio error handling
++  * @task: The task that ran
++  * @calldata: Pageio data to check
++  */
++ static void nfs_pgio_result(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_data *data = calldata;
++ 	struct inode *inode = data->header->inode;
++ 
++ 	dprintk("NFS: %s: %5u, (status %d)\n", __func__,
++ 		task->tk_pid, task->tk_status);
++ 
++ 	if (data->header->rw_ops->rw_done(task, data, inode) != 0)
++ 		return;
++ 	if (task->tk_status < 0)
++ 		nfs_set_pgio_error(data->header, task->tk_status, data->args.offset);
++ 	else
++ 		data->header->rw_ops->rw_result(task, data);
++ }
++ 
++ /*
++  * Create an RPC task for the given read or write request and kick it.
++  * The page must have been locked by the caller.
++  *
++  * It may happen that the page we're passed is not marked dirty.
++  * This is the case if nfs_updatepage detects a conflicting request
++  * that has been written but not committed.
++  */
++ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
++ 		     struct nfs_pgio_header *hdr)
++ {
++ 	struct nfs_page		*req;
++ 	struct page		**pages;
++ 	struct nfs_pgio_data	*data;
++ 	struct list_head *head = &desc->pg_list;
++ 	struct nfs_commit_info cinfo;
++ 
++ 	if (!nfs_pgio_data_init(hdr, nfs_page_array_len(desc->pg_base,
++ 			   desc->pg_count)))
++ 		return nfs_pgio_error(desc, hdr);
++ 
++ 	data = &hdr->data;
++ 	nfs_init_cinfo(&cinfo, desc->pg_inode, desc->pg_dreq);
++ 	pages = data->pages.pagevec;
++ 	while (!list_empty(head)) {
++ 		req = nfs_list_entry(head->next);
++ 		nfs_list_remove_request(req);
++ 		nfs_list_add_request(req, &hdr->pages);
++ 		*pages++ = req->wb_page;
++ 	}
++ 
++ 	if ((desc->pg_ioflags & FLUSH_COND_STABLE) &&
++ 	    (desc->pg_moreio || nfs_reqs_to_commit(&cinfo)))
++ 		desc->pg_ioflags &= ~FLUSH_COND_STABLE;
++ 
++ 	/* Set up the argument struct */
++ 	nfs_pgio_rpcsetup(data, desc->pg_count, 0, desc->pg_ioflags, &cinfo);
++ 	desc->pg_rpc_callops = &nfs_pgio_common_ops;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nfs_generic_pgio);
++ 
++ static int nfs_generic_pg_pgios(struct nfs_pageio_descriptor *desc)
++ {
++ 	struct nfs_pgio_header *hdr;
++ 	int ret;
++ 
++ 	hdr = nfs_pgio_header_alloc(desc->pg_rw_ops);
++ 	if (!hdr) {
++ 		desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 		return -ENOMEM;
++ 	}
++ 	nfs_pgheader_init(desc, hdr, nfs_pgio_header_free);
++ 	atomic_inc(&hdr->refcnt);
++ 	ret = nfs_generic_pgio(desc, hdr);
++ 	if (ret == 0)
++ 		ret = nfs_initiate_pgio(NFS_CLIENT(hdr->inode),
++ 					&hdr->data, desc->pg_rpc_callops,
++ 					desc->pg_ioflags, 0);
++ 	if (atomic_dec_and_test(&hdr->refcnt))
++ 		hdr->completion_ops->completion(hdr);
++ 	return ret;
++ }
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  static bool nfs_match_open_context(const struct nfs_open_context *ctx1,
+  		const struct nfs_open_context *ctx2)
+  {
+diff --cc fs/nfs/pnfs.c
+index eed474e3fcc7,067104cce181..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1546,7 -1546,7 +1546,11 @@@ pnfs_write_through_mds(struct nfs_pagei
+  		nfs_pageio_reset_write_mds(desc);
+  		desc->pg_recoalesce = 1;
+  	}
+++<<<<<<< HEAD
+ +	nfs_writedata_release(data);
+++=======
++ 	nfs_pgio_data_destroy(data);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  }
+  
+  static enum pnfs_try_status
+@@@ -1572,42 -1572,36 +1576,58 @@@ pnfs_try_to_write_data(struct nfs_write
+  }
+  
+  static void
+ -pnfs_do_write(struct nfs_pageio_descriptor *desc,
+ -	      struct nfs_pgio_header *hdr, int how)
+ +pnfs_do_multiple_writes(struct nfs_pageio_descriptor *desc, struct list_head *head, int how)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_write_data *data;
+++=======
++ 	struct nfs_pgio_data *data = &hdr->data;
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  	const struct rpc_call_ops *call_ops = desc->pg_rpc_callops;
+  	struct pnfs_layout_segment *lseg = desc->pg_lseg;
+ -	enum pnfs_try_status trypnfs;
+  
+  	desc->pg_lseg = NULL;
+ -	trypnfs = pnfs_try_to_write_data(data, call_ops, lseg, how);
+ -	if (trypnfs == PNFS_NOT_ATTEMPTED)
+ -		pnfs_write_through_mds(desc, data);
+ +	while (!list_empty(head)) {
+ +		enum pnfs_try_status trypnfs;
+ +
+ +		data = list_first_entry(head, struct nfs_write_data, list);
+ +		list_del_init(&data->list);
+ +
+ +		trypnfs = pnfs_try_to_write_data(data, call_ops, lseg, how);
+ +		if (trypnfs == PNFS_NOT_ATTEMPTED)
+ +			pnfs_write_through_mds(desc, data);
+ +	}
+  	pnfs_put_lseg(lseg);
+  }
+  
+  static void pnfs_writehdr_free(struct nfs_pgio_header *hdr)
+  {
+  	pnfs_put_lseg(hdr->lseg);
+++<<<<<<< HEAD
+ +	nfs_writehdr_free(hdr);
+++=======
++ 	nfs_pgio_header_free(hdr);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  }
+  EXPORT_SYMBOL_GPL(pnfs_writehdr_free);
+  
+  int
+  pnfs_generic_pg_writepages(struct nfs_pageio_descriptor *desc)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_write_header *whdr;
+ +	struct nfs_pgio_header *hdr;
+ +	int ret;
+ +
+ +	whdr = nfs_writehdr_alloc();
+ +	if (!whdr) {
+++=======
++ 	struct nfs_pgio_header *hdr;
++ 	int ret;
++ 
++ 	hdr = nfs_pgio_header_alloc(desc->pg_rw_ops);
++ 	if (!hdr) {
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  		desc->pg_completion_ops->error_cleanup(&desc->pg_list);
+  		pnfs_put_lseg(desc->pg_lseg);
+  		desc->pg_lseg = NULL;
+@@@ -1701,7 -1694,7 +1720,11 @@@ pnfs_read_through_mds(struct nfs_pageio
+  		nfs_pageio_reset_read_mds(desc);
+  		desc->pg_recoalesce = 1;
+  	}
+++<<<<<<< HEAD
+ +	nfs_readdata_release(data);
+++=======
++ 	nfs_pgio_data_destroy(data);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  }
+  
+  /*
+@@@ -1730,42 -1723,35 +1753,58 @@@ pnfs_try_to_read_data(struct nfs_read_d
+  }
+  
+  static void
+ -pnfs_do_read(struct nfs_pageio_descriptor *desc, struct nfs_pgio_header *hdr)
+ +pnfs_do_multiple_reads(struct nfs_pageio_descriptor *desc, struct list_head *head)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_read_data *data;
+++=======
++ 	struct nfs_pgio_data *data = &hdr->data;
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  	const struct rpc_call_ops *call_ops = desc->pg_rpc_callops;
+  	struct pnfs_layout_segment *lseg = desc->pg_lseg;
+ -	enum pnfs_try_status trypnfs;
+  
+  	desc->pg_lseg = NULL;
+ -	trypnfs = pnfs_try_to_read_data(data, call_ops, lseg);
+ -	if (trypnfs == PNFS_NOT_ATTEMPTED)
+ -		pnfs_read_through_mds(desc, data);
+ +	while (!list_empty(head)) {
+ +		enum pnfs_try_status trypnfs;
+ +
+ +		data = list_first_entry(head, struct nfs_read_data, list);
+ +		list_del_init(&data->list);
+ +
+ +		trypnfs = pnfs_try_to_read_data(data, call_ops, lseg);
+ +		if (trypnfs == PNFS_NOT_ATTEMPTED)
+ +			pnfs_read_through_mds(desc, data);
+ +	}
+  	pnfs_put_lseg(lseg);
+  }
+  
+  static void pnfs_readhdr_free(struct nfs_pgio_header *hdr)
+  {
+  	pnfs_put_lseg(hdr->lseg);
+++<<<<<<< HEAD
+ +	nfs_readhdr_free(hdr);
+++=======
++ 	nfs_pgio_header_free(hdr);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  }
+  EXPORT_SYMBOL_GPL(pnfs_readhdr_free);
+  
+  int
+  pnfs_generic_pg_readpages(struct nfs_pageio_descriptor *desc)
+  {
+++<<<<<<< HEAD
+ +	struct nfs_read_header *rhdr;
+ +	struct nfs_pgio_header *hdr;
+ +	int ret;
+ +
+ +	rhdr = nfs_readhdr_alloc();
+ +	if (!rhdr) {
+++=======
++ 	struct nfs_pgio_header *hdr;
++ 	int ret;
++ 
++ 	hdr = nfs_pgio_header_alloc(desc->pg_rw_ops);
++ 	if (!hdr) {
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  		desc->pg_completion_ops->error_cleanup(&desc->pg_list);
+  		ret = -ENOMEM;
+  		pnfs_put_lseg(desc->pg_lseg);
+diff --cc fs/nfs/read.c
+index d58a7ae6152b,d9df4ab3737b..000000000000
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@@ -34,76 -32,16 +34,84 @@@ static const struct nfs_pgio_completion
+  
+  static struct kmem_cache *nfs_rdata_cachep;
+  
+++<<<<<<< HEAD
+ +struct nfs_read_header *nfs_readhdr_alloc(void)
+++=======
++ static struct nfs_pgio_header *nfs_readhdr_alloc(void)
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  {
+ -	return kmem_cache_zalloc(nfs_rdata_cachep, GFP_KERNEL);
+ +	struct nfs_read_header *rhdr;
+ +
+ +	rhdr = kmem_cache_zalloc(nfs_rdata_cachep, GFP_KERNEL);
+ +	if (rhdr) {
+ +		struct nfs_pgio_header *hdr = &rhdr->header;
+ +
+ +		INIT_LIST_HEAD(&hdr->pages);
+ +		INIT_LIST_HEAD(&hdr->rpc_list);
+ +		spin_lock_init(&hdr->lock);
+ +		atomic_set(&hdr->refcnt, 0);
+ +	}
+ +	return rhdr;
+  }
+ +EXPORT_SYMBOL_GPL(nfs_readhdr_alloc);
+  
+ +static struct nfs_read_data *nfs_readdata_alloc(struct nfs_pgio_header *hdr,
+ +						unsigned int pagecount)
+ +{
+ +	struct nfs_read_data *data, *prealloc;
+ +
+ +	prealloc = &container_of(hdr, struct nfs_read_header, header)->rpc_data;
+ +	if (prealloc->header == NULL)
+ +		data = prealloc;
+ +	else
+ +		data = kzalloc(sizeof(*data), GFP_KERNEL);
+ +	if (!data)
+ +		goto out;
+ +
+ +	if (nfs_pgarray_set(&data->pages, pagecount)) {
+ +		data->header = hdr;
+ +		atomic_inc(&hdr->refcnt);
+ +	} else {
+ +		if (data != prealloc)
+ +			kfree(data);
+ +		data = NULL;
+ +	}
+ +out:
+ +	return data;
+ +}
+ +
+++<<<<<<< HEAD
+ +void nfs_readhdr_free(struct nfs_pgio_header *hdr)
+++=======
++ static void nfs_readhdr_free(struct nfs_pgio_header *rhdr)
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  {
+ +	struct nfs_read_header *rhdr = container_of(hdr, struct nfs_read_header, header);
+ +
+  	kmem_cache_free(nfs_rdata_cachep, rhdr);
+  }
+ +EXPORT_SYMBOL_GPL(nfs_readhdr_free);
+ +
+ +void nfs_readdata_release(struct nfs_read_data *rdata)
+ +{
+ +	struct nfs_pgio_header *hdr = rdata->header;
+ +	struct nfs_read_header *read_header = container_of(hdr, struct nfs_read_header, header);
+ +
+ +	put_nfs_open_context(rdata->args.context);
+ +	if (rdata->pages.pagevec != rdata->pages.page_array)
+ +		kfree(rdata->pages.pagevec);
+ +	if (rdata == &read_header->rpc_data) {
+ +		rdata->header = NULL;
+ +		rdata = NULL;
+ +	}
+ +	if (atomic_dec_and_test(&hdr->refcnt))
+ +		hdr->completion_ops->completion(hdr);
+ +	/* Note: we only free the rpc_task after callbacks are done.
+ +	 * See the comment in rpc_free_task() for why
+ +	 */
+ +	kfree(rdata);
+ +}
+ +EXPORT_SYMBOL_GPL(nfs_readdata_release);
+  
+  static
+  int nfs_return_empty_page(struct page *page)
+@@@ -679,7 -404,7 +687,11 @@@ out
+  int __init nfs_init_readpagecache(void)
+  {
+  	nfs_rdata_cachep = kmem_cache_create("nfs_read_data",
+++<<<<<<< HEAD
+ +					     sizeof(struct nfs_read_header),
+++=======
++ 					     sizeof(struct nfs_pgio_header),
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  					     0, SLAB_HWCACHE_ALIGN,
+  					     NULL);
+  	if (nfs_rdata_cachep == NULL)
+diff --cc fs/nfs/write.c
+index 7571542ecbdc,d694952f0071..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -70,76 -70,19 +70,88 @@@ void nfs_commit_free(struct nfs_commit_
+  }
+  EXPORT_SYMBOL_GPL(nfs_commit_free);
+  
+++<<<<<<< HEAD
+ +struct nfs_write_header *nfs_writehdr_alloc(void)
+ +{
+ +	struct nfs_write_header *p = mempool_alloc(nfs_wdata_mempool, GFP_NOIO);
+ +
+ +	if (p) {
+ +		struct nfs_pgio_header *hdr = &p->header;
+++=======
++ static struct nfs_pgio_header *nfs_writehdr_alloc(void)
++ {
++ 	struct nfs_pgio_header *p = mempool_alloc(nfs_wdata_mempool, GFP_NOIO);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  
+ -	if (p)
+  		memset(p, 0, sizeof(*p));
+ +		INIT_LIST_HEAD(&hdr->pages);
+ +		INIT_LIST_HEAD(&hdr->rpc_list);
+ +		spin_lock_init(&hdr->lock);
+ +		atomic_set(&hdr->refcnt, 0);
+ +		hdr->verf = &p->verf;
+ +	}
+  	return p;
+  }
+ +EXPORT_SYMBOL_GPL(nfs_writehdr_alloc);
+ +
+++<<<<<<< HEAD
+ +static struct nfs_write_data *nfs_writedata_alloc(struct nfs_pgio_header *hdr,
+ +						  unsigned int pagecount)
+ +{
+ +	struct nfs_write_data *data, *prealloc;
+  
+ +	prealloc = &container_of(hdr, struct nfs_write_header, header)->rpc_data;
+ +	if (prealloc->header == NULL)
+ +		data = prealloc;
+ +	else
+ +		data = kzalloc(sizeof(*data), GFP_KERNEL);
+ +	if (!data)
+ +		goto out;
+ +
+ +	if (nfs_pgarray_set(&data->pages, pagecount)) {
+ +		data->header = hdr;
+ +		atomic_inc(&hdr->refcnt);
+ +	} else {
+ +		if (data != prealloc)
+ +			kfree(data);
+ +		data = NULL;
+ +	}
+ +out:
+ +	return data;
+ +}
+ +
+ +void nfs_writehdr_free(struct nfs_pgio_header *hdr)
+ +{
+ +	struct nfs_write_header *whdr = container_of(hdr, struct nfs_write_header, header);
+ +	mempool_free(whdr, nfs_wdata_mempool);
+++=======
++ static void nfs_writehdr_free(struct nfs_pgio_header *hdr)
++ {
++ 	mempool_free(hdr, nfs_wdata_mempool);
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+ +}
+ +EXPORT_SYMBOL_GPL(nfs_writehdr_free);
+ +
+ +void nfs_writedata_release(struct nfs_write_data *wdata)
+ +{
+ +	struct nfs_pgio_header *hdr = wdata->header;
+ +	struct nfs_write_header *write_header = container_of(hdr, struct nfs_write_header, header);
+ +
+ +	put_nfs_open_context(wdata->args.context);
+ +	if (wdata->pages.pagevec != wdata->pages.page_array)
+ +		kfree(wdata->pages.pagevec);
+ +	if (wdata == &write_header->rpc_data) {
+ +		wdata->header = NULL;
+ +		wdata = NULL;
+ +	}
+ +	if (atomic_dec_and_test(&hdr->refcnt))
+ +		hdr->completion_ops->completion(hdr);
+ +	/* Note: we only free the rpc_task after callbacks are done.
+ +	 * See the comment in rpc_free_task() for why
+ +	 */
+ +	kfree(wdata);
+  }
+ +EXPORT_SYMBOL_GPL(nfs_writedata_release);
+  
+  static void nfs_context_set_write_error(struct nfs_open_context *ctx, int error)
+  {
+@@@ -1972,7 -1655,7 +1984,11 @@@ int nfs_migrate_page(struct address_spa
+  int __init nfs_init_writepagecache(void)
+  {
+  	nfs_wdata_cachep = kmem_cache_create("nfs_write_data",
+++<<<<<<< HEAD
+ +					     sizeof(struct nfs_write_header),
+++=======
++ 					     sizeof(struct nfs_pgio_header),
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  					     0, SLAB_HWCACHE_ALIGN,
+  					     NULL);
+  	if (nfs_wdata_cachep == NULL)
+diff --cc include/linux/nfs_page.h
+index 214e09851870,43592651cd5a..000000000000
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@@ -51,6 -60,17 +51,20 @@@ struct nfs_pageio_ops 
+  	int	(*pg_doio)(struct nfs_pageio_descriptor *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs_rw_ops {
++ 	const fmode_t rw_mode;
++ 	struct nfs_pgio_header *(*rw_alloc_header)(void);
++ 	void (*rw_free_header)(struct nfs_pgio_header *);
++ 	void (*rw_release)(struct nfs_pgio_data *);
++ 	int  (*rw_done)(struct rpc_task *, struct nfs_pgio_data *, struct inode *);
++ 	void (*rw_result)(struct rpc_task *, struct nfs_pgio_data *);
++ 	void (*rw_initiate)(struct nfs_pgio_data *, struct rpc_message *,
++ 			    struct rpc_task_setup *, int);
++ };
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  struct nfs_pageio_descriptor {
+  	struct list_head	pg_list;
+  	unsigned long		pg_bytes_written;
+diff --cc include/linux/nfs_xdr.h
+index 381f832b03c6,e1c9437e8aac..000000000000
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@@ -1270,14 -1257,30 +1270,37 @@@ enum 
+  	NFS_IOHDR_NEED_RESCHED,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs_pgio_data {
++ 	struct nfs_pgio_header	*header;
++ 	struct list_head	list;
++ 	struct rpc_task		task;
++ 	struct nfs_fattr	fattr;
++ 	struct nfs_writeverf	verf;		/* Used for writes */
++ 	struct nfs_pgio_args	args;		/* argument struct */
++ 	struct nfs_pgio_res	res;		/* result struct */
++ 	unsigned long		timestamp;	/* For lease renewal */
++ 	int (*pgio_done_cb)(struct rpc_task *task, struct nfs_pgio_data *data);
++ 	__u64			mds_offset;	/* Filelayout dense stripe */
++ 	struct nfs_page_array	pages;
++ 	struct nfs_client	*ds_clp;	/* pNFS data server */
++ 	int			ds_idx;		/* ds index if ds_clp is set */
++ };
++ 
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  struct nfs_pgio_header {
+  	struct inode		*inode;
+  	struct rpc_cred		*cred;
+  	struct list_head	pages;
+++<<<<<<< HEAD
+ +	struct list_head	rpc_list;
+++=======
++ 	struct nfs_pgio_data	data;
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  	atomic_t		refcnt;
+  	struct nfs_page		*req;
+ -	struct nfs_writeverf	verf;		/* Used for writes */
+ +	struct nfs_writeverf	*verf;
+  	struct pnfs_layout_segment *lseg;
+  	loff_t			io_start;
+  	const struct rpc_call_ops *mds_ops;
+@@@ -1293,32 -1297,6 +1316,35 @@@
+  	unsigned long		flags;
+  };
+  
+++<<<<<<< HEAD
+ +struct nfs_read_header {
+ +	struct nfs_pgio_header	header;
+ +	struct nfs_read_data	rpc_data;
+ +};
+ +
+ +struct nfs_write_data {
+ +	struct nfs_pgio_header	*header;
+ +	struct list_head	list;
+ +	struct rpc_task		task;
+ +	struct nfs_fattr	fattr;
+ +	struct nfs_writeverf	verf;
+ +	struct nfs_pgio_args	args;		/* argument struct */
+ +	struct nfs_pgio_res	res;		/* result struct */
+ +	unsigned long		timestamp;	/* For lease renewal */
+ +	int (*write_done_cb) (struct rpc_task *task, struct nfs_write_data *data);
+ +	__u64			mds_offset;	/* Filelayout dense stripe */
+ +	struct nfs_page_array	pages;
+ +	struct nfs_client	*ds_clp;	/* pNFS data server */
+ +};
+ +
+ +struct nfs_write_header {
+ +	struct nfs_pgio_header	header;
+ +	struct nfs_write_data	rpc_data;
+ +	struct nfs_writeverf	verf;
+ +};
+ +
+++=======
+++>>>>>>> 1e7f3a485922 (nfs: move nfs_pgio_data and remove nfs_rw_header)
+  struct nfs_mds_commit_info {
+  	atomic_t rpcs_out;
+  	unsigned long		ncommit;
+* Unmerged path fs/nfs/direct.c
+* Unmerged path fs/nfs/internal.h
+* Unmerged path fs/nfs/pagelist.c
+* Unmerged path fs/nfs/pnfs.c
+* Unmerged path fs/nfs/read.c
+* Unmerged path fs/nfs/write.c
+* Unmerged path include/linux/nfs_page.h
+* Unmerged path include/linux/nfs_xdr.h
