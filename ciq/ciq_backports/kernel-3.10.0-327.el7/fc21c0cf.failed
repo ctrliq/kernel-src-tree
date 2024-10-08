@@ -1,0 +1,210 @@
+revert "softirq: Add support for triggering softirq work on softirqs"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit fc21c0cff2f425891b28ff6fb6b03b325c977428
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fc21c0cf.failed
+
+This commit was incomplete in that code to remove items from the per-cpu
+lists was missing and never acquired a user in the 5 years it has been in
+the tree.  We're going to implement what it seems to try to archive in a
+simpler way, and this code is in the way of doing so.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fc21c0cff2f425891b28ff6fb6b03b325c977428)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/softirq.c
+diff --cc kernel/softirq.c
+index b22ec12c9af1,11025ccc06dd..000000000000
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@@ -618,129 -625,6 +616,132 @@@ void tasklet_hrtimer_init(struct taskle
+  }
+  EXPORT_SYMBOL_GPL(tasklet_hrtimer_init);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Remote softirq bits
+ + */
+ +
+ +DEFINE_PER_CPU(struct list_head [NR_SOFTIRQS], softirq_work_list);
+ +EXPORT_PER_CPU_SYMBOL(softirq_work_list);
+ +
+ +static void __local_trigger(struct call_single_data *cp, int softirq)
+ +{
+ +	struct list_head *head = &__get_cpu_var(softirq_work_list[softirq]);
+ +
+ +	list_add_tail(&cp->list, head);
+ +
+ +	/* Trigger the softirq only if the list was previously empty.  */
+ +	if (head->next == &cp->list)
+ +		raise_softirq_irqoff(softirq);
+ +}
+ +
+ +#ifdef CONFIG_USE_GENERIC_SMP_HELPERS
+ +static void remote_softirq_receive(void *data)
+ +{
+ +	struct call_single_data *cp = data;
+ +	unsigned long flags;
+ +	int softirq;
+ +
+ +	softirq = *(int *)cp->info;
+ +	local_irq_save(flags);
+ +	__local_trigger(cp, softirq);
+ +	local_irq_restore(flags);
+ +}
+ +
+ +static int __try_remote_softirq(struct call_single_data *cp, int cpu, int softirq)
+ +{
+ +	if (cpu_online(cpu)) {
+ +		cp->func = remote_softirq_receive;
+ +		cp->info = &softirq;
+ +		cp->flags = 0;
+ +
+ +		smp_call_function_single_async(cpu, cp);
+ +		return 0;
+ +	}
+ +	return 1;
+ +}
+ +#else /* CONFIG_USE_GENERIC_SMP_HELPERS */
+ +static int __try_remote_softirq(struct call_single_data *cp, int cpu, int softirq)
+ +{
+ +	return 1;
+ +}
+ +#endif
+ +
+ +/**
+ + * __send_remote_softirq - try to schedule softirq work on a remote cpu
+ + * @cp: private SMP call function data area
+ + * @cpu: the remote cpu
+ + * @this_cpu: the currently executing cpu
+ + * @softirq: the softirq for the work
+ + *
+ + * Attempt to schedule softirq work on a remote cpu.  If this cannot be
+ + * done, the work is instead queued up on the local cpu.
+ + *
+ + * Interrupts must be disabled.
+ + */
+ +void __send_remote_softirq(struct call_single_data *cp, int cpu, int this_cpu, int softirq)
+ +{
+ +	if (cpu == this_cpu || __try_remote_softirq(cp, cpu, softirq))
+ +		__local_trigger(cp, softirq);
+ +}
+ +EXPORT_SYMBOL(__send_remote_softirq);
+ +
+ +/**
+ + * send_remote_softirq - try to schedule softirq work on a remote cpu
+ + * @cp: private SMP call function data area
+ + * @cpu: the remote cpu
+ + * @softirq: the softirq for the work
+ + *
+ + * Like __send_remote_softirq except that disabling interrupts and
+ + * computing the current cpu is done for the caller.
+ + */
+ +void send_remote_softirq(struct call_single_data *cp, int cpu, int softirq)
+ +{
+ +	unsigned long flags;
+ +	int this_cpu;
+ +
+ +	local_irq_save(flags);
+ +	this_cpu = smp_processor_id();
+ +	__send_remote_softirq(cp, cpu, this_cpu, softirq);
+ +	local_irq_restore(flags);
+ +}
+ +EXPORT_SYMBOL(send_remote_softirq);
+ +
+ +static int remote_softirq_cpu_notify(struct notifier_block *self,
+ +					       unsigned long action, void *hcpu)
+ +{
+ +	/*
+ +	 * If a CPU goes away, splice its entries to the current CPU
+ +	 * and trigger a run of the softirq
+ +	 */
+ +	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN) {
+ +		int cpu = (unsigned long) hcpu;
+ +		int i;
+ +
+ +		local_irq_disable();
+ +		for (i = 0; i < NR_SOFTIRQS; i++) {
+ +			struct list_head *head = &per_cpu(softirq_work_list[i], cpu);
+ +			struct list_head *local_head;
+ +
+ +			if (list_empty(head))
+ +				continue;
+ +
+ +			local_head = &__get_cpu_var(softirq_work_list[i]);
+ +			list_splice_init(head, local_head);
+ +			raise_softirq_irqoff(i);
+ +		}
+ +		local_irq_enable();
+ +	}
+ +
+ +	return NOTIFY_OK;
+ +}
+ +
+ +static struct notifier_block remote_softirq_cpu_notifier = {
+ +	.notifier_call	= remote_softirq_cpu_notify,
+ +};
+ +
+++=======
+++>>>>>>> fc21c0cff2f4 (revert "softirq: Add support for triggering softirq work on softirqs")
+  void __init softirq_init(void)
+  {
+  	int cpu;
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index e8401d092732..6b254dd50e1b 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -11,8 +11,6 @@
+ #include <linux/irqnr.h>
+ #include <linux/hardirq.h>
+ #include <linux/irqflags.h>
+-#include <linux/smp.h>
+-#include <linux/percpu.h>
+ #include <linux/hrtimer.h>
+ #include <linux/kref.h>
+ #include <linux/workqueue.h>
+@@ -483,15 +481,6 @@ extern void __raise_softirq_irqoff(unsigned int nr);
+ extern void raise_softirq_irqoff(unsigned int nr);
+ extern void raise_softirq(unsigned int nr);
+ 
+-/* This is the worklist that queues up per-cpu softirq work.
+- *
+- * send_remote_sendirq() adds work to these lists, and
+- * the softirq handler itself dequeues from them.  The queues
+- * are protected by disabling local cpu interrupts and they must
+- * only be accessed by the local cpu that they are for.
+- */
+-DECLARE_PER_CPU(struct list_head [NR_SOFTIRQS], softirq_work_list);
+-
+ DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
+ 
+ static inline struct task_struct *this_cpu_ksoftirqd(void)
+@@ -499,17 +488,6 @@ static inline struct task_struct *this_cpu_ksoftirqd(void)
+ 	return this_cpu_read(ksoftirqd);
+ }
+ 
+-/* Try to send a softirq to a remote cpu.  If this cannot be done, the
+- * work will be queued to the local cpu.
+- */
+-extern void send_remote_softirq(struct call_single_data *cp, int cpu, int softirq);
+-
+-/* Like send_remote_softirq(), but the caller must disable local cpu interrupts
+- * and compute the current cpu, passed in as 'this_cpu'.
+- */
+-extern void __send_remote_softirq(struct call_single_data *cp, int cpu,
+-				  int this_cpu, int softirq);
+-
+ /* Tasklets --- multithreaded analogue of BHs.
+ 
+    Main feature differing them of generic softirqs: tasklet
+* Unmerged path kernel/softirq.c
