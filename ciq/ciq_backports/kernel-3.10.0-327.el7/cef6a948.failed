@@ -1,0 +1,162 @@
+NVMe: Command abort handling fixes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit cef6a948271d5437f96e731878f2e9cb8c9820b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cef6a948.failed
+
+Aborts all requeued commands prior to killing the request_queue. For
+commands that time out on a dying request queue, set the "Do Not Retry"
+bit on the command status so the command cannot be requeued. Finanally, if
+the driver is requested to abort a command it did not start, do nothing.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit cef6a948271d5437f96e731878f2e9cb8c9820b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 48e1152870d9,ad9a9b61fc1d..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1228,61 -1030,86 +1228,105 @@@ static void nvme_abort_cmd(int cmdid, s
+  	if (!dev->abort_limit)
+  		return;
+  
+ -	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ -									false);
+ -	if (IS_ERR(abort_req))
+ +	adminq = rcu_dereference(dev->queues[0]);
+ +	a_cmdid = alloc_cmdid(adminq, CMD_CTX_ABORT, special_completion,
+ +								ADMIN_TIMEOUT);
+ +	if (a_cmdid < 0)
+  		return;
+  
+ -	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+ -	nvme_set_info(abort_cmd, abort_req, abort_completion);
+ -
+  	memset(&cmd, 0, sizeof(cmd));
+  	cmd.abort.opcode = nvme_admin_abort_cmd;
+ -	cmd.abort.cid = req->tag;
+ -	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+ -	cmd.abort.command_id = abort_req->tag;
+ +	cmd.abort.cid = cmdid;
+ +	cmd.abort.sqid = nvmeq->qid;
+ +	cmd.abort.command_id = a_cmdid;
+  
+  	--dev->abort_limit;
+ -	cmd_rq->aborted = 1;
+ +	info[cmdid].aborted = 1;
+ +	info[cmdid].timeout = jiffies + ADMIN_TIMEOUT;
+  
+ -	dev_warn(nvmeq->q_dmadev, "Aborting I/O %d QID %d\n", req->tag,
+ +	dev_warn(nvmeq->q_dmadev, "Aborting I/O %d QID %d\n", cmdid,
+  							nvmeq->qid);
+ -	if (nvme_submit_cmd(dev->queues[0], &cmd) < 0) {
+ -		dev_warn(nvmeq->q_dmadev,
+ -				"Could not abort I/O %d QID %d",
+ -				req->tag, nvmeq->qid);
+ -		blk_mq_free_request(abort_req);
+ -	}
+ +	nvme_submit_cmd(adminq, &cmd);
+  }
+  
+ -static void nvme_cancel_queue_ios(struct blk_mq_hw_ctx *hctx,
+ -				struct request *req, void *data, bool reserved)
+ -{
+ +/**
+ + * nvme_cancel_ios - Cancel outstanding I/Os
+ + * @queue: The queue to cancel I/Os on
+ + * @timeout: True to only cancel I/Os which have timed out
+ + */
+ +static void nvme_cancel_ios(struct nvme_queue *nvmeq, bool timeout)
+ +{
+++<<<<<<< HEAD
+ +	int depth = nvmeq->q_depth - 1;
+ +	struct nvme_cmd_info *info = nvme_cmd_info(nvmeq);
+ +	unsigned long now = jiffies;
+ +	int cmdid;
+++=======
++ 	struct nvme_queue *nvmeq = data;
++ 	void *ctx;
++ 	nvme_completion_fn fn;
++ 	struct nvme_cmd_info *cmd;
++ 	struct nvme_completion cqe;
++ 
++ 	if (!blk_mq_request_started(req))
++ 		return;
+++>>>>>>> cef6a948271d (NVMe: Command abort handling fixes)
+  
+ -	cmd = blk_mq_rq_to_pdu(req);
+ +	for_each_set_bit(cmdid, nvmeq->cmdid_data, depth) {
+ +		void *ctx;
+ +		nvme_completion_fn fn;
+ +		static struct nvme_completion cqe = {
+ +			.status = cpu_to_le16(NVME_SC_ABORT_REQ << 1),
+ +		};
+  
+++<<<<<<< HEAD
+ +		if (timeout && !time_after(now, info[cmdid].timeout))
+ +			continue;
+ +		if (info[cmdid].ctx == CMD_CTX_CANCELLED)
+ +			continue;
+ +		if (timeout && info[cmdid].ctx == CMD_CTX_ASYNC)
+ +			continue;
+ +		if (timeout && nvmeq->dev->initialized) {
+ +			nvme_abort_cmd(cmdid, nvmeq);
+ +			continue;
+ +		}
+ +		dev_warn(nvmeq->q_dmadev, "Cancelling I/O %d QID %d\n", cmdid,
+ +								nvmeq->qid);
+ +		ctx = cancel_cmdid(nvmeq, cmdid, &fn);
+ +		fn(nvmeq, ctx, &cqe);
+++=======
++ 	if (cmd->ctx == CMD_CTX_CANCELLED)
++ 		return;
++ 
++ 	if (blk_queue_dying(req->q))
++ 		cqe.status = cpu_to_le16((NVME_SC_ABORT_REQ | NVME_SC_DNR) << 1);
++ 	else
++ 		cqe.status = cpu_to_le16(NVME_SC_ABORT_REQ << 1);
++ 
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Cancelling I/O %d QID %d\n",
++ 						req->tag, nvmeq->qid);
++ 	ctx = cancel_cmd_info(cmd, &fn);
++ 	fn(nvmeq, ctx, &cqe);
++ }
++ 
++ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
++ {
++ 	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
++ 	struct nvme_queue *nvmeq = cmd->nvmeq;
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Timeout I/O %d QID %d\n", req->tag,
++ 							nvmeq->qid);
++ 
++ 	if (!nvmeq->dev->initialized) {
++ 		/*
++ 		 * Force cancelled command frees the request, which requires we
++ 		 * return BLK_EH_NOT_HANDLED.
++ 		 */
++ 		nvme_cancel_queue_ios(nvmeq->hctx, req, nvmeq, reserved);
++ 		return BLK_EH_NOT_HANDLED;
+++>>>>>>> cef6a948271d (NVMe: Command abort handling fixes)
+  	}
+ -	nvme_abort_req(req);
+ -
+ -	/*
+ -	 * The aborted req will be completed on receiving the abort req.
+ -	 * We enable the timer again. If hit twice, it'll cause a device reset,
+ -	 * as the device then is in a faulty state.
+ -	 */
+ -	return BLK_EH_RESET_TIMER;
+  }
+  
+  static void nvme_free_queue(struct nvme_queue *nvmeq)
+* Unmerged path drivers/block/nvme-core.c
