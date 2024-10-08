@@ -66,6 +66,8 @@
 #include "nfs4session.h"
 #include "fscache.h"
 
+#include "nfs4trace.h"
+
 #define NFSDBG_FACILITY		NFSDBG_PROC
 
 #define NFS4_POLL_RETRY_MIN	(HZ/10)
@@ -3871,6 +3873,7 @@ static void nfs4_renew_done(struct rpc_task *task, void *calldata)
 	struct nfs_client *clp = data->client;
 	unsigned long timestamp = data->timestamp;
 
+	trace_nfs4_renew_async(clp, task->tk_status);
 	if (task->tk_status < 0) {
 		/* Unless we're shutting down, schedule state recovery! */
 		if (test_bit(NFS_CS_RENEWD, &clp->cl_res_state) == 0)
@@ -4388,6 +4391,7 @@ int nfs4_proc_setclientid(struct nfs_client *clp, u32 program,
 		clp->cl_rpcclient->cl_auth->au_ops->au_name,
 		setclientid.sc_name_len, setclientid.sc_name);
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_setclientid(clp, status);
 	dprintk("NFS reply setclientid: %d\n", status);
 	return status;
 }
@@ -4415,6 +4419,7 @@ int nfs4_proc_setclientid_confirm(struct nfs_client *clp,
 		clp->cl_rpcclient->cl_auth->au_ops->au_name,
 		clp->cl_clientid);
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_setclientid_confirm(clp, status);
 	dprintk("NFS reply setclientid_confirm: %d\n", status);
 	return status;
 }
@@ -5550,6 +5555,7 @@ int nfs4_proc_bind_conn_to_session(struct nfs_client *clp, struct rpc_cred *cred
 	}
 
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_bind_conn_to_session(clp, status);
 	if (status == 0) {
 		if (memcmp(res.session->sess_id.data,
 		    clp->cl_session->sess_id.data, NFS4_MAX_SESSIONID_LEN)) {
@@ -5635,6 +5641,7 @@ int nfs4_proc_exchange_id(struct nfs_client *clp, struct rpc_cred *cred)
 	}
 
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_exchange_id(clp, status);
 	if (status == 0)
 		status = nfs4_check_cl_exchange_flags(res.flags);
 
@@ -5695,6 +5702,7 @@ static int _nfs4_proc_destroy_clientid(struct nfs_client *clp,
 	int status;
 
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_destroy_clientid(clp, status);
 	if (status)
 		dprintk("NFS: Got error %d from the server %s on "
 			"DESTROY_CLIENTID.", status, clp->cl_hostname);
@@ -5958,6 +5966,7 @@ static int _nfs4_proc_create_session(struct nfs_client *clp,
 	args.flags = (SESSION4_PERSIST | SESSION4_BACK_CHAN);
 
 	status = rpc_call_sync(session->clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_create_session(clp, status);
 
 	if (!status) {
 		/* Verify the session's negotiated channel_attrs values */
@@ -6021,6 +6030,7 @@ int nfs4_proc_destroy_session(struct nfs4_session *session,
 		return status;
 
 	status = rpc_call_sync(session->clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
+	trace_nfs4_destroy_session(session->clp, status);
 
 	if (status)
 		dprintk("NFS: Got error %d from the server on DESTROY_SESSION. "
@@ -6070,6 +6080,7 @@ static void nfs41_sequence_call_done(struct rpc_task *task, void *data)
 	if (!nfs41_sequence_done(task, task->tk_msg.rpc_resp))
 		return;
 
+	trace_nfs4_sequence(clp, task->tk_status);
 	if (task->tk_status < 0) {
 		dprintk("%s ERROR %d\n", __func__, task->tk_status);
 		if (atomic_read(&clp->cl_count) == 1)
@@ -6222,6 +6233,7 @@ static void nfs4_reclaim_complete_done(struct rpc_task *task, void *data)
 	if (!nfs41_sequence_done(task, res))
 		return;
 
+	trace_nfs4_reclaim_complete(clp, task->tk_status);
 	if (nfs41_reclaim_complete_handle_errors(task, clp) == -EAGAIN) {
 		rpc_restart_call_prepare(task);
 		return;
