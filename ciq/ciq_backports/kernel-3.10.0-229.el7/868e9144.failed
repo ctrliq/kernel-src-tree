@@ -1,0 +1,119 @@
+qlcnic: Allow setting TX interrupt coalescing parameters from VF.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [ethernet] qlcnic: Allow setting TX interrupt coalescing parameters from VF (Chad Dupuis) [1089352]
+Rebuild_FUZZ: 99.22%
+commit-author Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+commit 868e9144314a00f04ee30ab1288338e510b4cf3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/868e9144.failed
+
+o Tx interrupt coalescing parameters can now be set from VF.
+o Added validation code in PF to validate the parameters.
+
+	Signed-off-by: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 868e9144314a00f04ee30ab1288338e510b4cf3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+diff --cc drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index d1c2562bf5f0,5ceff4796df6..000000000000
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@@ -1862,15 -2061,19 +1862,31 @@@ static int qlcnic_alloc_adapter_resourc
+  		err = -ENOMEM;
+  		goto err_out;
+  	}
+++<<<<<<< HEAD
+ +	/* Initialize interrupt coalesce parameters */
+ +	ahw->coal.flag = QLCNIC_INTR_DEFAULT;
+ +	ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX;
+ +	ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
+ +	ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
+ +	if (qlcnic_83xx_check(adapter)) {
+ +		ahw->coal.tx_time_us = QLCNIC_DEF_INTR_COALESCE_TX_TIME_US;
+ +		ahw->coal.tx_packets = QLCNIC_DEF_INTR_COALESCE_TX_PACKETS;
+ +	}
+++=======
++ 
++ 	if (qlcnic_83xx_check(adapter)) {
++ 		ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX_TX;
++ 		ahw->coal.tx_time_us = QLCNIC_DEF_INTR_COALESCE_TX_TIME_US;
++ 		ahw->coal.tx_packets = QLCNIC_DEF_INTR_COALESCE_TX_PACKETS;
++ 		ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
++ 		ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
++ 	} else {
++ 		ahw->coal.type = QLCNIC_INTR_COAL_TYPE_RX;
++ 		ahw->coal.rx_time_us = QLCNIC_DEF_INTR_COALESCE_RX_TIME_US;
++ 		ahw->coal.rx_packets = QLCNIC_DEF_INTR_COALESCE_RX_PACKETS;
++ 	}
++ 
+++>>>>>>> 868e9144314a (qlcnic: Allow setting TX interrupt coalescing parameters from VF.)
+  	/* clear stats */
+  	memset(&adapter->stats, 0, sizeof(adapter->stats));
+  err_out:
+* Unmerged path drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index d73eb55d90fa..825b4e7187e0 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -16,6 +16,7 @@
+ #define QLC_VF_FLOOD_BIT	BIT_16
+ #define QLC_FLOOD_MODE		0x5
+ #define QLC_SRIOV_ALLOW_VLAN0	BIT_19
++#define QLC_INTR_COAL_TYPE_MASK	0x7
+ 
+ static int qlcnic_sriov_pf_get_vport_handle(struct qlcnic_adapter *, u8);
+ 
+@@ -1171,19 +1172,41 @@ static int qlcnic_sriov_validate_cfg_intrcoal(struct qlcnic_adapter *adapter,
+ {
+ 	struct qlcnic_nic_intr_coalesce *coal = &adapter->ahw->coal;
+ 	u16 ctx_id, pkts, time;
++	int err = -EINVAL;
++	u8 type;
+ 
++	type = cmd->req.arg[1] & QLC_INTR_COAL_TYPE_MASK;
+ 	ctx_id = cmd->req.arg[1] >> 16;
+ 	pkts = cmd->req.arg[2] & 0xffff;
+ 	time = cmd->req.arg[2] >> 16;
+ 
+-	if (ctx_id != vf->rx_ctx_id)
+-		return -EINVAL;
+-	if (pkts > coal->rx_packets)
+-		return -EINVAL;
+-	if (time < coal->rx_time_us)
+-		return -EINVAL;
++	switch (type) {
++	case QLCNIC_INTR_COAL_TYPE_RX:
++		if (ctx_id != vf->rx_ctx_id || pkts > coal->rx_packets ||
++		    time < coal->rx_time_us)
++			goto err_label;
++		break;
++	case QLCNIC_INTR_COAL_TYPE_TX:
++		if (ctx_id != vf->tx_ctx_id || pkts > coal->tx_packets ||
++		    time < coal->tx_time_us)
++			goto err_label;
++		break;
++	default:
++		netdev_err(adapter->netdev, "Invalid coalescing type 0x%x received\n",
++			   type);
++		return err;
++	}
+ 
+ 	return 0;
++
++err_label:
++	netdev_err(adapter->netdev, "Expected: rx_ctx_id 0x%x rx_packets 0x%x rx_time_us 0x%x tx_ctx_id 0x%x tx_packets 0x%x tx_time_us 0x%x\n",
++		   vf->rx_ctx_id, coal->rx_packets, coal->rx_time_us,
++		   vf->tx_ctx_id, coal->tx_packets, coal->tx_time_us);
++	netdev_err(adapter->netdev, "Received: ctx_id 0x%x packets 0x%x time_us 0x%x type 0x%x\n",
++		   ctx_id, pkts, time, type);
++
++	return err;
+ }
+ 
+ static int qlcnic_sriov_pf_cfg_intrcoal_cmd(struct qlcnic_bc_trans *tran,
