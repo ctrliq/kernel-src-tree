@@ -1,0 +1,125 @@
+Revert "netfilter: bridge: query conntrack about skb dnat"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit faecbb45ebefb20260ad4a631e011e93c896cb73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/faecbb45.failed
+
+This reverts commit c055d5b03bb4cb69d349d787c9787c0383abd8b2.
+
+There are two issues:
+'dnat_took_place' made me think that this is related to
+-j DNAT/MASQUERADE.
+
+But thats only one part of the story.  This is also relevant for SNAT
+when we undo snat translation in reverse/reply direction.
+
+Furthermore, I originally wanted to do this mainly to avoid
+storing ipv6 addresses once we make DNAT/REDIRECT work
+for ipv6 on bridges.
+
+However, I forgot about SNPT/DNPT which is stateless.
+
+So we can't escape storing address for ipv6 anyway. Might as
+well do it for ipv4 too.
+
+Reported-and-tested-by: Bernhard Thaler <bernhard.thaler@wvnet.at>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit faecbb45ebefb20260ad4a631e011e93c896cb73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index 2e271768b46a,f15154a879c7..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -169,7 -169,14 +169,12 @@@ struct nf_bridge_info 
+  	unsigned int		mask;
+  	struct net_device	*physindev;
+  	struct net_device	*physoutdev;
+++<<<<<<< HEAD
+ +	unsigned long		data[32 / sizeof(unsigned long)];
+++=======
++ 	char			neigh_header[8];
++ 	__be32			ipv4_daddr;
+++>>>>>>> faecbb45ebef (Revert "netfilter: bridge: query conntrack about skb dnat")
+  };
+  #endif
+  
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+index bfa28cea8c79..a3631beeda84 100644
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -36,10 +36,6 @@
+ #include <net/ipv6.h>
+ #include <net/route.h>
+ 
+-#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+-#include <net/netfilter/nf_conntrack.h>
+-#endif
+-
+ #include <asm/uaccess.h>
+ #include "br_private.h"
+ #ifdef CONFIG_SYSCTL
+@@ -372,24 +368,15 @@ free_skb:
+ 	return 0;
+ }
+ 
+-static bool dnat_took_place(const struct sk_buff *skb)
++static bool daddr_was_changed(const struct sk_buff *skb,
++			      const struct nf_bridge_info *nf_bridge)
+ {
+-#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+-	enum ip_conntrack_info ctinfo;
+-	struct nf_conn *ct;
+-
+-	ct = nf_ct_get(skb, &ctinfo);
+-	if (!ct || nf_ct_is_untracked(ct))
+-		return false;
+-
+-	return test_bit(IPS_DST_NAT_BIT, &ct->status);
+-#else
+-	return false;
+-#endif
++	return ip_hdr(skb)->daddr != nf_bridge->ipv4_daddr;
+ }
+ 
+ /* This requires some explaining. If DNAT has taken place,
+  * we will need to fix up the destination Ethernet address.
++ * This is also true when SNAT takes place (for the reply direction).
+  *
+  * There are two cases to consider:
+  * 1. The packet was DNAT'ed to a device in the same bridge
+@@ -439,7 +426,7 @@ static int br_nf_pre_routing_finish(struct sock *sk, struct sk_buff *skb)
+ 		nf_bridge->mask ^= BRNF_PKT_TYPE;
+ 	}
+ 	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+-	if (dnat_took_place(skb)) {
++	if (daddr_was_changed(skb, nf_bridge)) {
+ 		if ((err = ip_route_input(skb, iph->daddr, iph->saddr, iph->tos, dev))) {
+ 			struct in_device *in_dev = __in_dev_get_rcu(dev);
+ 
+@@ -653,6 +640,7 @@ static unsigned int br_nf_pre_routing(const struct nf_hook_ops *ops,
+ 				      const struct net_device *out,
+ 				      const struct nf_hook_state *state)
+ {
++	struct nf_bridge_info *nf_bridge;
+ 	struct net_bridge_port *p;
+ 	struct net_bridge *br;
+ 	__u32 len = nf_bridge_encap_header_len(skb);
+@@ -690,6 +678,9 @@ static unsigned int br_nf_pre_routing(const struct nf_hook_ops *ops,
+ 	if (!setup_pre_routing(skb))
+ 		return NF_DROP;
+ 
++	nf_bridge = nf_bridge_info_get(skb);
++	nf_bridge->ipv4_daddr = ip_hdr(skb)->daddr;
++
+ 	skb->protocol = htons(ETH_P_IP);
+ 
+ 	NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, state->sk, skb,
