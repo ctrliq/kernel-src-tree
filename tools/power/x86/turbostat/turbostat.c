@@ -1922,8 +1922,6 @@ int has_config_tdp(unsigned int family, unsigned int model)
 
 	switch (model) {
 	case 0x3A:	/* IVB */
-	case 0x3E:	/* IVB Xeon */
-
 	case 0x3C:	/* HSW */
 	case 0x3F:	/* HSX */
 	case 0x45:	/* HSW */
