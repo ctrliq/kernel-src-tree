@@ -1,0 +1,136 @@
+tun/macvtap: use consume_skb() instead of kfree_skb() when needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit f51a5e82ea9aaf05106c00d976e772ca384a9199
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f51a5e82.failed
+
+To be more friendly with drop monitor, we should only call kfree_skb() when
+the packets were dropped and use consume_skb() in other cases.
+
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f51a5e82ea9aaf05106c00d976e772ca384a9199)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvtap.c
+#	drivers/net/tun.c
+diff --cc drivers/net/macvtap.c
+index 6326656f5ac1,ba1e5db2152e..000000000000
+--- a/drivers/net/macvtap.c
++++ b/drivers/net/macvtap.c
+@@@ -952,24 -844,26 +952,40 @@@ static ssize_t macvtap_do_read(struct m
+  
+  		/* Read frames from the queue */
+  		skb = skb_dequeue(&q->sk.sk_receive_queue);
+ -		if (skb)
+ -			break;
+ -		if (noblock) {
+ -			ret = -EAGAIN;
+ -			break;
+ +		if (!skb) {
+ +			if (noblock) {
+ +				ret = -EAGAIN;
+ +				break;
+ +			}
+ +			if (signal_pending(current)) {
+ +				ret = -ERESTARTSYS;
+ +				break;
+ +			}
+ +			/* Nothing to read, let's sleep */
+ +			schedule();
+ +			continue;
+  		}
+++<<<<<<< HEAD
+ +		ret = macvtap_put_user(q, skb, iv, len);
+ +		kfree_skb(skb);
+ +		break;
+++=======
++ 		if (signal_pending(current)) {
++ 			ret = -ERESTARTSYS;
++ 			break;
++ 		}
++ 		/* Nothing to read, let's sleep */
++ 		schedule();
++ 	}
++ 	if (skb) {
++ 		ret = macvtap_put_user(q, skb, to);
++ 		if (unlikely(ret < 0))
++ 			kfree_skb(skb);
++ 		else
++ 			consume_skb(skb);
+++>>>>>>> f51a5e82ea9a (tun/macvtap: use consume_skb() instead of kfree_skb() when needed)
+  	}
+ +
+  	if (!noblock)
+  		finish_wait(sk_sleep(&q->sk), &wait);
+  	return ret;
+diff --cc drivers/net/tun.c
+index f05cf4bfbe66,9c58286b8a42..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -1358,39 -1349,23 +1358,47 @@@ static ssize_t tun_do_read(struct tun_s
+  
+  	tun_debug(KERN_INFO, tun, "tun_do_read\n");
+  
+ -	if (!iov_iter_count(to))
+ -		return 0;
+ +	if (unlikely(!noblock))
+ +		add_wait_queue(&tfile->wq.wait, &wait);
+ +	while (len) {
+ +		current->state = TASK_INTERRUPTIBLE;
+  
+ -	if (tun->dev->reg_state != NETREG_REGISTERED)
+ -		return -EIO;
+ +		/* Read frames from the queue */
+ +		if (!(skb = skb_dequeue(&tfile->socket.sk->sk_receive_queue))) {
+ +			if (noblock) {
+ +				ret = -EAGAIN;
+ +				break;
+ +			}
+ +			if (signal_pending(current)) {
+ +				ret = -ERESTARTSYS;
+ +				break;
+ +			}
+ +			if (tun->dev->reg_state != NETREG_REGISTERED) {
+ +				ret = -EIO;
+ +				break;
+ +			}
+  
+ -	/* Read frames from queue */
+ -	skb = __skb_recv_datagram(tfile->socket.sk, noblock ? MSG_DONTWAIT : 0,
+ -				  &peeked, &off, &err);
+ -	if (!skb)
+ -		return 0;
+ +			/* Nothing to read, let's sleep */
+ +			schedule();
+ +			continue;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		ret = tun_put_user(tun, tfile, skb, iv, len);
+ +		kfree_skb(skb);
+ +		break;
+ +	}
+  
+ +	current->state = TASK_RUNNING;
+ +	if (unlikely(!noblock))
+ +		remove_wait_queue(&tfile->wq.wait, &wait);
+++=======
++ 	ret = tun_put_user(tun, tfile, skb, to);
++ 	if (unlikely(ret < 0))
++ 		kfree_skb(skb);
++ 	else
++ 		consume_skb(skb);
+++>>>>>>> f51a5e82ea9a (tun/macvtap: use consume_skb() instead of kfree_skb() when needed)
+  
+  	return ret;
+  }
+* Unmerged path drivers/net/macvtap.c
+* Unmerged path drivers/net/tun.c
