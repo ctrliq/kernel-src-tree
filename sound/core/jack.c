@@ -74,6 +74,10 @@ static int snd_jack_dev_register(struct snd_device *device)
 
 	snprintf(jack->name, sizeof(jack->name), "%s %s",
 		 card->shortname, jack->id);
+
+	if (!jack->input_dev)
+		return 0;
+
 	jack->input_dev->name = jack->name;
 
 	/* Default to the sound card device. */
@@ -175,6 +179,8 @@ EXPORT_SYMBOL(snd_jack_new);
 void snd_jack_set_parent(struct snd_jack *jack, struct device *parent)
 {
 	WARN_ON(jack->registered);
+	if (!jack->input_dev)
+		return;
 
 	jack->input_dev->dev.parent = parent;
 }
