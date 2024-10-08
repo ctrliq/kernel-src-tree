@@ -280,6 +280,8 @@ struct huge_bootmem_page {
 };
 
 struct page *alloc_huge_page_node(struct hstate *h, int nid);
+struct page *alloc_huge_page_noerr(struct vm_area_struct *vma,
+				unsigned long addr, int avoid_reserve);
 
 /* arch callback */
 int __init alloc_bootmem_huge_page(struct hstate *h);
@@ -418,6 +420,7 @@ static inline bool hugepages_supported(void)
 #else	/* CONFIG_HUGETLB_PAGE */
 struct hstate {};
 #define alloc_huge_page_node(h, nid) NULL
+#define alloc_huge_page_noerr(v, a, r) NULL
 #define alloc_bootmem_huge_page(h) NULL
 #define hstate_file(f) NULL
 #define hstate_sizelog(s) NULL
