@@ -1,0 +1,273 @@
+rhashtable: provide len to obj_hashfn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Patrick McHardy <kaber@trash.net>
+commit 49f7b33e63fec9d16e7ee62ba8f8ab4159cbdc26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/49f7b33e.failed
+
+nftables sets will be converted to use so called setextensions, moving
+the key to a non-fixed position. To hash it, the obj_hashfn must be used,
+however it so far doesn't receive the length parameter.
+
+Pass the key length to obj_hashfn() and convert existing users.
+
+	Signed-off-by: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 49f7b33e63fec9d16e7ee62ba8f8ab4159cbdc26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rhashtable.h
+#	net/netlink/af_netlink.c
+diff --cc include/linux/rhashtable.h
+index 0839d7b8cd60,e23d242d1230..000000000000
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@@ -32,7 -88,9 +32,13 @@@ struct bucket_table 
+  };
+  
+  typedef u32 (*rht_hashfn_t)(const void *data, u32 len, u32 seed);
+++<<<<<<< HEAD
+ +typedef u32 (*rht_obj_hashfn_t)(const void *data, u32 seed);
+++=======
++ typedef u32 (*rht_obj_hashfn_t)(const void *data, u32 len, u32 seed);
++ typedef int (*rht_obj_cmpfn_t)(struct rhashtable_compare_arg *arg,
++ 			       const void *obj);
+++>>>>>>> 49f7b33e63fe (rhashtable: provide len to obj_hashfn)
+  
+  struct rhashtable;
+  
+@@@ -77,16 -136,179 +83,175 @@@ struct rhashtable_params 
+   */
+  struct rhashtable {
+  	struct bucket_table __rcu	*tbl;
+ -	atomic_t			nelems;
+ -	unsigned int			key_len;
+ -	unsigned int			elasticity;
+ +	size_t				nelems;
+ +	size_t				shift;
+  	struct rhashtable_params	p;
+ -	struct work_struct		run_work;
+ -	struct mutex                    mutex;
+ -	spinlock_t			lock;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rhashtable_walker - Hash table walker
++  * @list: List entry on list of walkers
++  * @tbl: The table that we were walking over
++  */
++ struct rhashtable_walker {
++ 	struct list_head list;
++ 	struct bucket_table *tbl;
++ };
++ 
++ /**
++  * struct rhashtable_iter - Hash table iterator, fits into netlink cb
++  * @ht: Table to iterate through
++  * @p: Current pointer
++  * @walker: Associated rhashtable walker
++  * @slot: Current slot
++  * @skip: Number of entries to skip in slot
++  */
++ struct rhashtable_iter {
++ 	struct rhashtable *ht;
++ 	struct rhash_head *p;
++ 	struct rhashtable_walker *walker;
++ 	unsigned int slot;
++ 	unsigned int skip;
++ };
++ 
++ static inline unsigned long rht_marker(const struct rhashtable *ht, u32 hash)
++ {
++ 	return NULLS_MARKER(ht->p.nulls_base + hash);
++ }
++ 
++ #define INIT_RHT_NULLS_HEAD(ptr, ht, hash) \
++ 	((ptr) = (typeof(ptr)) rht_marker(ht, hash))
++ 
++ static inline bool rht_is_a_nulls(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr & 1);
++ }
++ 
++ static inline unsigned long rht_get_nulls_value(const struct rhash_head *ptr)
++ {
++ 	return ((unsigned long) ptr) >> 1;
++ }
++ 
++ static inline void *rht_obj(const struct rhashtable *ht,
++ 			    const struct rhash_head *he)
++ {
++ 	return (char *)he - ht->p.head_offset;
++ }
++ 
++ static inline unsigned int rht_bucket_index(const struct bucket_table *tbl,
++ 					    unsigned int hash)
++ {
++ 	return (hash >> RHT_HASH_RESERVED_SPACE) & (tbl->size - 1);
++ }
++ 
++ static inline unsigned int rht_key_hashfn(
++ 	struct rhashtable *ht, const struct bucket_table *tbl,
++ 	const void *key, const struct rhashtable_params params)
++ {
++ 	unsigned int hash;
++ 
++ 	/* params must be equal to ht->p if it isn't constant. */
++ 	if (!__builtin_constant_p(params.key_len))
++ 		hash = ht->p.hashfn(key, ht->key_len, tbl->hash_rnd);
++ 	else if (params.key_len) {
++ 		unsigned int key_len = params.key_len;
++ 
++ 		if (params.hashfn)
++ 			hash = params.hashfn(key, key_len, tbl->hash_rnd);
++ 		else if (key_len & (sizeof(u32) - 1))
++ 			hash = jhash(key, key_len, tbl->hash_rnd);
++ 		else
++ 			hash = jhash2(key, key_len / sizeof(u32),
++ 				      tbl->hash_rnd);
++ 	} else {
++ 		unsigned int key_len = ht->p.key_len;
++ 
++ 		if (params.hashfn)
++ 			hash = params.hashfn(key, key_len, tbl->hash_rnd);
++ 		else
++ 			hash = jhash(key, key_len, tbl->hash_rnd);
++ 	}
++ 
++ 	return rht_bucket_index(tbl, hash);
++ }
++ 
++ static inline unsigned int rht_head_hashfn(
++ 	struct rhashtable *ht, const struct bucket_table *tbl,
++ 	const struct rhash_head *he, const struct rhashtable_params params)
++ {
++ 	const char *ptr = rht_obj(ht, he);
++ 
++ 	return likely(params.obj_hashfn) ?
++ 	       rht_bucket_index(tbl, params.obj_hashfn(ptr, params.key_len ?:
++ 							    ht->p.key_len,
++ 						       tbl->hash_rnd)) :
++ 	       rht_key_hashfn(ht, tbl, ptr + params.key_offset, params);
++ }
++ 
++ /**
++  * rht_grow_above_75 - returns true if nelems > 0.75 * table-size
++  * @ht:		hash table
++  * @tbl:	current table
++  */
++ static inline bool rht_grow_above_75(const struct rhashtable *ht,
++ 				     const struct bucket_table *tbl)
++ {
++ 	/* Expand table when exceeding 75% load */
++ 	return atomic_read(&ht->nelems) > (tbl->size / 4 * 3) &&
++ 	       (!ht->p.max_size || tbl->size < ht->p.max_size);
++ }
++ 
++ /**
++  * rht_shrink_below_30 - returns true if nelems < 0.3 * table-size
++  * @ht:		hash table
++  * @tbl:	current table
++  */
++ static inline bool rht_shrink_below_30(const struct rhashtable *ht,
++ 				       const struct bucket_table *tbl)
++ {
++ 	/* Shrink table beneath 30% load */
++ 	return atomic_read(&ht->nelems) < (tbl->size * 3 / 10) &&
++ 	       tbl->size > ht->p.min_size;
++ }
++ 
++ /**
++  * rht_grow_above_100 - returns true if nelems > table-size
++  * @ht:		hash table
++  * @tbl:	current table
++  */
++ static inline bool rht_grow_above_100(const struct rhashtable *ht,
++ 				      const struct bucket_table *tbl)
++ {
++ 	return atomic_read(&ht->nelems) > tbl->size;
++ }
++ 
++ /* The bucket lock is selected based on the hash and protects mutations
++  * on a group of hash buckets.
++  *
++  * A maximum of tbl->size/2 bucket locks is allocated. This ensures that
++  * a single lock always covers both buckets which may both contains
++  * entries which link to the same bucket of the old table during resizing.
++  * This allows to simplify the locking as locking the bucket in both
++  * tables during resize always guarantee protection.
++  *
++  * IMPORTANT: When holding the bucket lock of both the old and new table
++  * during expansions and shrinking, the old bucket lock must always be
++  * acquired first.
++  */
++ static inline spinlock_t *rht_bucket_lock(const struct bucket_table *tbl,
++ 					  unsigned int hash)
++ {
++ 	return &tbl->locks[hash & tbl->locks_mask];
++ }
++ 
+++>>>>>>> 49f7b33e63fe (rhashtable: provide len to obj_hashfn)
+  #ifdef CONFIG_PROVE_LOCKING
+ -int lockdep_rht_mutex_is_held(struct rhashtable *ht);
+ +int lockdep_rht_mutex_is_held(const struct rhashtable *ht);
+  int lockdep_rht_bucket_is_held(const struct bucket_table *tbl, u32 hash);
+  #else
+ -static inline int lockdep_rht_mutex_is_held(struct rhashtable *ht)
+ +static inline int lockdep_rht_mutex_is_held(const struct rhashtable *ht)
+  {
+  	return 1;
+  }
+diff --cc net/netlink/af_netlink.c
+index 9d53ffe3d114,19909d0786a2..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -3146,6 -3127,24 +3146,27 @@@ static struct pernet_operations __net_i
+  	.exit = netlink_net_exit,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline u32 netlink_hash(const void *data, u32 len, u32 seed)
++ {
++ 	const struct netlink_sock *nlk = data;
++ 	struct netlink_compare_arg arg;
++ 
++ 	netlink_compare_arg_init(&arg, sock_net(&nlk->sk), nlk->portid);
++ 	return jhash2((u32 *)&arg, netlink_compare_arg_len / sizeof(u32), seed);
++ }
++ 
++ static const struct rhashtable_params netlink_rhashtable_params = {
++ 	.head_offset = offsetof(struct netlink_sock, node),
++ 	.key_len = netlink_compare_arg_len,
++ 	.obj_hashfn = netlink_hash,
++ 	.obj_cmpfn = netlink_compare,
++ 	.max_size = 65536,
++ 	.automatic_shrinking = true,
++ };
++ 
+++>>>>>>> 49f7b33e63fe (rhashtable: provide len to obj_hashfn)
+  static int __init netlink_proto_init(void)
+  {
+  	int i;
+* Unmerged path include/linux/rhashtable.h
+diff --git a/lib/rhashtable.c b/lib/rhashtable.c
+index 6d0c4774001c..f732f3ac41ba 100644
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@ -497,7 +497,7 @@ static size_t rounded_hashtable_size(struct rhashtable_params *params)
+  *	struct rhash_head	node;
+  * };
+  *
+- * u32 my_hash_fn(const void *data, u32 seed)
++ * u32 my_hash_fn(const void *data, u32 len, u32 seed)
+  * {
+  *	struct test_obj *obj = data;
+  *
+* Unmerged path net/netlink/af_netlink.c
