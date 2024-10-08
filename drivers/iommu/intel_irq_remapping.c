@@ -665,8 +665,7 @@ error:
 	 */
 
 	if (x2apic_present)
-		WARN(1, KERN_WARNING
-			"Failed to enable irq remapping.  You are vulnerable to irq-injection attacks.\n");
+		pr_warn("Failed to enable irq remapping.  You are vulnerable to irq-injection attacks.\n");
 
 	return -1;
 }
