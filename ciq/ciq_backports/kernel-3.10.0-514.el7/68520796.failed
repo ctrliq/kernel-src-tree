@@ -1,0 +1,213 @@
+sched: Move h_load calculation to task_h_load()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 685207963be973fbb73550db6edaf920a283e1a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/68520796.failed
+
+The bad thing about update_h_load(), which computes hierarchical load
+factor for task groups, is that it is called for each task group in the
+system before every load balancer run, and since rebalance can be
+triggered very often, this function can eat really a lot of cpu time if
+there are many cpu cgroups in the system.
+
+Although the situation was improved significantly by commit a35b646
+('sched, cgroup: Reduce rq->lock hold times for large cgroup
+hierarchies'), the problem still can arise under some kinds of loads,
+e.g. when cpus are switching from idle to busy and back very frequently.
+
+For instance, when I start 1000 of processes that wake up every
+millisecond on my 8 cpus host, 'top' and 'perf top' show:
+
+Cpu(s): 17.8%us, 24.3%sy,  0.0%ni, 57.9%id,  0.0%wa,  0.0%hi,  0.0%si
+Events: 243K cycles
+  7.57%  [kernel]               [k] __schedule
+  7.08%  [kernel]               [k] timerqueue_add
+  6.13%  libc-2.12.so           [.] usleep
+
+Then if I create 10000 *idle* cpu cgroups (no processes in them), cpu
+usage increases significantly although the 'wakers' are still executing
+in the root cpu cgroup:
+
+Cpu(s): 19.1%us, 48.7%sy,  0.0%ni, 31.6%id,  0.0%wa,  0.0%hi,  0.7%si
+Events: 230K cycles
+ 24.56%  [kernel]            [k] tg_load_down
+  5.76%  [kernel]            [k] __schedule
+
+This happens because this particular kind of load triggers 'new idle'
+rebalance very frequently, which requires calling update_h_load(),
+which, in turn, calls tg_load_down() for every *idle* cpu cgroup even
+though it is absolutely useless, because idle cpu cgroups have no tasks
+to pull.
+
+This patch tries to improve the situation by making h_load calculation
+proceed only when h_load is really necessary. To achieve this, it
+substitutes update_h_load() with update_cfs_rq_h_load(), which computes
+h_load only for a given cfs_rq and all its ascendants, and makes the
+load balancer call this function whenever it considers if a task should
+be pulled, i.e. it moves h_load calculations directly to task_h_load().
+For h_load of the same cfs_rq not to be updated multiple times (in case
+several tasks in the same cgroup are considered during the same balance
+run), the patch keeps the time of the last h_load update for each cfs_rq
+and breaks calculation when it finds h_load to be uptodate.
+
+The benefit of it is that h_load is computed only for those cfs_rq's,
+which really need it, in particular all idle task groups are skipped.
+Although this, in fact, moves h_load calculation under rq lock, it
+should not affect latency much, because the amount of work done under rq
+lock while trying to pull tasks is limited by sched_nr_migrate.
+
+After the patch applied with the setup described above (1000 wakers in
+the root cgroup and 10000 idle cgroups), I get:
+
+Cpu(s): 16.9%us, 24.8%sy,  0.0%ni, 58.4%id,  0.0%wa,  0.0%hi,  0.0%si
+Events: 242K cycles
+  7.57%  [kernel]                  [k] __schedule
+  6.70%  [kernel]                  [k] timerqueue_add
+  5.93%  libc-2.12.so              [.] usleep
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1373896159-1278-1-git-send-email-vdavydov@parallels.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 685207963be973fbb73550db6edaf920a283e1a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/fair.c
+index e3632fb98b67,765d87acdf05..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5283,61 -4175,55 +5283,85 @@@ static void update_blocked_averages(in
+   * This needs to be done in a top-down fashion because the load of a child
+   * group is a fraction of its parents load.
+   */
+- static int tg_load_down(struct task_group *tg, void *data)
++ static void update_cfs_rq_h_load(struct cfs_rq *cfs_rq)
+  {
+++<<<<<<< HEAD
+ +	unsigned long load;
+ +	long cpu = (long)data;
+ +
+ +	if (!tg->parent) {
+ +		load = cpu_rq(cpu)->load.weight;
+ +	} else {
+ +		load = tg->parent->cfs_rq[cpu]->h_load;
+ +		load *= tg->se[cpu]->load.weight;
+ +		load /= tg->parent->cfs_rq[cpu]->load.weight + 1;
+ +	}
+ +
+ +	tg->cfs_rq[cpu]->h_load = load;
+ +
+ +	return 0;
+ +}
+ +
+ +static void update_h_load(long cpu)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+++=======
++ 	struct rq *rq = rq_of(cfs_rq);
++ 	struct sched_entity *se = cfs_rq->tg->se[cpu_of(rq)];
+++>>>>>>> 685207963be9 (sched: Move h_load calculation to task_h_load())
+  	unsigned long now = jiffies;
++ 	unsigned long load;
+  
+- 	if (rq->h_load_throttle == now)
++ 	if (cfs_rq->last_h_load_update == now)
+  		return;
+  
+- 	rq->h_load_throttle = now;
++ 	cfs_rq->h_load_next = NULL;
++ 	for_each_sched_entity(se) {
++ 		cfs_rq = cfs_rq_of(se);
++ 		cfs_rq->h_load_next = se;
++ 		if (cfs_rq->last_h_load_update == now)
++ 			break;
++ 	}
+  
+- 	rcu_read_lock();
+- 	walk_tg_tree(tg_load_down, tg_nop, (void *)cpu);
+- 	rcu_read_unlock();
++ 	if (!se) {
++ 		cfs_rq->h_load = rq->avg.load_avg_contrib;
++ 		cfs_rq->last_h_load_update = now;
++ 	}
++ 
++ 	while ((se = cfs_rq->h_load_next) != NULL) {
++ 		load = cfs_rq->h_load;
++ 		load = div64_ul(load * se->avg.load_avg_contrib,
++ 				cfs_rq->runnable_load_avg + 1);
++ 		cfs_rq = group_cfs_rq(se);
++ 		cfs_rq->h_load = load;
++ 		cfs_rq->last_h_load_update = now;
++ 	}
+  }
+  
+  static unsigned long task_h_load(struct task_struct *p)
+  {
+  	struct cfs_rq *cfs_rq = task_cfs_rq(p);
+ +	unsigned long load;
+  
+++<<<<<<< HEAD
+ +	load = p->se.load.weight;
+ +	load = div_u64(load * cfs_rq->h_load, cfs_rq->load.weight + 1);
+ +
+ +	return load;
+++=======
++ 	update_cfs_rq_h_load(cfs_rq);
++ 	return div64_ul(p->se.avg.load_avg_contrib * cfs_rq->h_load,
++ 			cfs_rq->runnable_load_avg + 1);
+++>>>>>>> 685207963be9 (sched: Move h_load calculation to task_h_load())
+  }
+  #else
+  static inline void update_blocked_averages(int cpu)
+  {
+  }
+  
+- static inline void update_h_load(long cpu)
+- {
+- }
+- 
+  static unsigned long task_h_load(struct task_struct *p)
+  {
+ -	return p->se.avg.load_avg_contrib;
+ +	return p->se.load.weight;
+  }
+  #endif
+  
+diff --cc kernel/sched/sched.h
+index b976abe32e72,5e129efb84ce..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -276,15 -276,15 +276,19 @@@ struct cfs_rq 
+  	 * This allows for the description of both thread and group usage (in
+  	 * the FAIR_GROUP_SCHED case).
+  	 */
+ -	unsigned long runnable_load_avg, blocked_load_avg;
+ -	atomic64_t decay_counter;
+ +	u64 runnable_load_avg, blocked_load_avg;
+ +	atomic64_t decay_counter, removed_load;
+  	u64 last_decay;
+ -	atomic_long_t removed_load;
+ -
+ +#endif /* CONFIG_FAIR_GROUP_SCHED */
+ +/* These always depend on CONFIG_FAIR_GROUP_SCHED */
+  #ifdef CONFIG_FAIR_GROUP_SCHED
+ -	/* Required to track per-cpu representation of a task_group */
+  	u32 tg_runnable_contrib;
+++<<<<<<< HEAD
+ +	u64 tg_load_contrib;
+ +#endif /* CONFIG_FAIR_GROUP_SCHED */
+++=======
++ 	unsigned long tg_load_contrib;
+++>>>>>>> 685207963be9 (sched: Move h_load calculation to task_h_load())
+  
+  	/*
+  	 *   h_load = weight * f(tg)
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/sched.h
