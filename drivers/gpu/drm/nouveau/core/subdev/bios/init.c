@@ -2196,5 +2196,5 @@ nvbios_init(struct nouveau_subdev *subdev, bool execute)
 		ret = nvbios_exec(&init);
 	}
 
-	return 0;
+	return ret;
 }
