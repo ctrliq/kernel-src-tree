@@ -1,0 +1,224 @@
+panic, x86: Fix re-entrance problem due to panic on NMI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+commit 1717f2096b543cede7a380c858c765c41936bc35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1717f209.failed
+
+If panic on NMI happens just after panic() on the same CPU, panic() is
+recursively called. Kernel stalls, as a result, after failing to acquire
+panic_lock.
+
+To avoid this problem, don't call panic() in NMI context if we've
+already entered panic().
+
+For that, introduce nmi_panic() macro to reduce code duplication. In
+the case of panic on NMI, don't return from NMI handlers if another CPU
+already panicked.
+
+	Signed-off-by: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Chris Metcalf <cmetcalf@ezchip.com>
+	Cc: David Hildenbrand <dahi@linux.vnet.ibm.com>
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Gobinda Charan Maji <gobinda.cemk07@gmail.com>
+	Cc: HATAYAMA Daisuke <d.hatayama@jp.fujitsu.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Javi Merino <javi.merino@arm.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: kexec@lists.infradead.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: lkml <linux-kernel@vger.kernel.org>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Michal Nazarewicz <mina86@mina86.com>
+	Cc: Nicolas Iooss <nicolas.iooss_linux@m4x.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Cc: Seth Jennings <sjenning@redhat.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+Link: http://lkml.kernel.org/r/20151210014626.25437.13302.stgit@softrs
+[ Cleanup comments, fixup formatting. ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 1717f2096b543cede7a380c858c765c41936bc35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/watchdog.c
+diff --cc kernel/watchdog.c
+index edde5b1f4a45,b9be18fae154..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -306,12 -334,24 +306,16 @@@ static void watchdog_overflow_callback(
+  		if (__this_cpu_read(hard_watchdog_warn) == true)
+  			return;
+  
+ -		pr_emerg("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+ -		print_modules();
+ -		print_irqtrace_events(current);
+ -		if (regs)
+ -			show_regs(regs);
+ -		else
+ -			dump_stack();
+ -
+ -		/*
+ -		 * Perform all-CPU dump only once to avoid multiple hardlockups
+ -		 * generating interleaving traces
+ -		 */
+ -		if (sysctl_hardlockup_all_cpu_backtrace &&
+ -				!test_and_set_bit(0, &hardlockup_allcpu_dumped))
+ -			trigger_allbutself_cpu_backtrace();
+ -
+  		if (hardlockup_panic)
+++<<<<<<< HEAD
+ +			panic("Watchdog detected hard LOCKUP on cpu %d",
+ +			      this_cpu);
+ +		else
+ +			WARN(1, "Watchdog detected hard LOCKUP on cpu %d",
+ +			     this_cpu);
+++=======
++ 			nmi_panic("Hard LOCKUP");
+++>>>>>>> 1717f2096b54 (panic, x86: Fix re-entrance problem due to panic on NMI)
+  
+  		__this_cpu_write(hard_watchdog_warn, true);
+  		return;
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index 60308053fdb2..7117b2dd18c8 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -186,7 +186,7 @@ pci_serr_error(unsigned char reason, struct pt_regs *regs)
+ #endif
+ 
+ 	if (panic_on_unrecovered_nmi)
+-		panic("NMI: Not continuing");
++		nmi_panic("NMI: Not continuing");
+ 
+ 	pr_emerg("Dazed and confused, but trying to continue\n");
+ 
+@@ -209,8 +209,16 @@ io_check_error(unsigned char reason, struct pt_regs *regs)
+ 		 reason, smp_processor_id());
+ 	show_regs(regs);
+ 
+-	if (panic_on_io_nmi)
+-		panic("NMI IOCK error: Not continuing");
++	if (panic_on_io_nmi) {
++		nmi_panic("NMI IOCK error: Not continuing");
++
++		/*
++		 * If we end up here, it means we have received an NMI while
++		 * processing panic(). Simply return without delaying and
++		 * re-enabling NMIs.
++		 */
++		return;
++	}
+ 
+ 	/* Re-enable the IOCK line, wait for a few seconds */
+ 	reason = (reason & NMI_REASON_CLEAR_MASK) | NMI_REASON_CLEAR_IOCHK;
+@@ -250,7 +258,7 @@ unknown_nmi_error(unsigned char reason, struct pt_regs *regs)
+ 
+ 	pr_emerg("Do you have a strange power saving mode enabled?\n");
+ 	if (unknown_nmi_panic || panic_on_unrecovered_nmi)
+-		panic("NMI: Not continuing");
++		nmi_panic("NMI: Not continuing");
+ 
+ 	pr_emerg("Dazed and confused, but trying to continue\n");
+ }
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index 27e50d389c3f..72c0a0fc92cc 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -441,6 +441,26 @@ extern int panic_on_unrecovered_nmi;
+ extern int panic_on_io_nmi;
+ extern int panic_on_warn;
+ extern int sysctl_panic_on_stackoverflow;
++/*
++ * panic_cpu is used for synchronizing panic() and crash_kexec() execution. It
++ * holds a CPU number which is executing panic() currently. A value of
++ * PANIC_CPU_INVALID means no CPU has entered panic() or crash_kexec().
++ */
++extern atomic_t panic_cpu;
++#define PANIC_CPU_INVALID	-1
++
++/*
++ * A variant of panic() called from NMI context. We return if we've already
++ * panicked on this CPU.
++ */
++#define nmi_panic(fmt, ...)						\
++do {									\
++	int cpu = raw_smp_processor_id();				\
++									\
++	if (atomic_cmpxchg(&panic_cpu, PANIC_CPU_INVALID, cpu) != cpu)	\
++		panic(fmt, ##__VA_ARGS__);				\
++} while (0)
++
+ /*
+  * Only to be used by arch init code. If the user over-wrote the default
+  * CONFIG_PANIC_TIMEOUT, honor it.
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 77e119fb43e1..10088fc6625d 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -59,6 +59,8 @@ void __weak panic_smp_self_stop(void)
+ 		cpu_relax();
+ }
+ 
++atomic_t panic_cpu = ATOMIC_INIT(PANIC_CPU_INVALID);
++
+ /**
+  *	panic - halt the system
+  *	@fmt: The text string to print
+@@ -69,17 +71,17 @@ void __weak panic_smp_self_stop(void)
+  */
+ void panic(const char *fmt, ...)
+ {
+-	static DEFINE_SPINLOCK(panic_lock);
+ 	static char buf[1024];
+ 	va_list args;
+ 	long i, i_next = 0;
+ 	int state = 0;
++	int old_cpu, this_cpu;
+ 
+ 	/*
+ 	 * Disable local interrupts. This will prevent panic_smp_self_stop
+ 	 * from deadlocking the first cpu that invokes the panic, since
+ 	 * there is nothing to prevent an interrupt handler (that runs
+-	 * after the panic_lock is acquired) from invoking panic again.
++	 * after setting panic_cpu) from invoking panic() again.
+ 	 */
+ 	local_irq_disable();
+ 
+@@ -92,8 +94,16 @@ void panic(const char *fmt, ...)
+ 	 * multiple parallel invocations of panic, all other CPUs either
+ 	 * stop themself or will wait until they are stopped by the 1st CPU
+ 	 * with smp_send_stop().
++	 *
++	 * `old_cpu == PANIC_CPU_INVALID' means this is the 1st CPU which
++	 * comes here, so go ahead.
++	 * `old_cpu == this_cpu' means we came from nmi_panic() which sets
++	 * panic_cpu to this CPU.  In this case, this is also the 1st CPU.
+ 	 */
+-	if (!spin_trylock(&panic_lock))
++	this_cpu = raw_smp_processor_id();
++	old_cpu  = atomic_cmpxchg(&panic_cpu, PANIC_CPU_INVALID, this_cpu);
++
++	if (old_cpu != PANIC_CPU_INVALID && old_cpu != this_cpu)
+ 		panic_smp_self_stop();
+ 
+ 	console_verbose();
+* Unmerged path kernel/watchdog.c
