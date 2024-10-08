@@ -1,0 +1,119 @@
+tcp: remove TCP_SKB_CB(skb)->when
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 7faee5c0d514162853a343d93e4a0b6bb8bfec21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7faee5c0.failed
+
+After commit 740b0f1841f6 ("tcp: switch rtt estimations to usec resolution"),
+we no longer need to maintain timestamps in two different fields.
+
+TCP_SKB_CB(skb)->when can be removed, as same information sits in skb_mstamp.stamp_jiffies
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7faee5c0d514162853a343d93e4a0b6bb8bfec21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_output.c
+diff --cc include/net/tcp.h
+index 81f472949625,a4201ef216e8..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -716,7 -704,7 +722,11 @@@ struct tcp_skb_cb 
+  	} header;	/* For incoming frames		*/
+  	__u32		seq;		/* Starting sequence number	*/
+  	__u32		end_seq;	/* SEQ + FIN + SYN + datalen	*/
+++<<<<<<< HEAD
+ +	__u32		when;		/* used to compute rtt's	*/
+++=======
++ 	__u32		tcp_tw_isn;	/* isn chosen by tcp_timewait_state_process() */
+++>>>>>>> 7faee5c0d514 (tcp: remove TCP_SKB_CB(skb)->when)
+  	__u8		tcp_flags;	/* TCP header flags. (tcp[13])	*/
+  
+  	__u8		sacked;		/* State flags for SACK/FACK.	*/
+diff --cc net/ipv4/tcp_output.c
+index 5abc01454eff,3b22dcb7bb5c..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -982,7 -972,10 +979,14 @@@ static int tcp_transmit_skb(struct soc
+  		TCP_ADD_STATS(sock_net(sk), TCP_MIB_OUTSEGS,
+  			      tcp_skb_pcount(skb));
+  
+++<<<<<<< HEAD
+ +	err = icsk->icsk_af_ops->queue_xmit(skb, &inet->cork.fl);
+++=======
++ 	/* Our usage of tstamp should remain private */
++ 	skb->tstamp.tv64 = 0;
++ 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
++ 
+++>>>>>>> 7faee5c0d514 (tcp: remove TCP_SKB_CB(skb)->when)
+  	if (likely(err <= 0))
+  		return err;
+  
+@@@ -1142,8 -1149,8 +1146,7 @@@ int tcp_fragment(struct sock *sk, struc
+  	/* Looks stupid, but our code really uses when of
+  	 * skbs, which it never sent before. --ANK
+  	 */
+- 	TCP_SKB_CB(buff)->when = TCP_SKB_CB(skb)->when;
+  	buff->tstamp = skb->tstamp;
+ -	tcp_fragment_tstamp(skb, buff);
+  
+  	old_factor = tcp_skb_pcount(skb);
+  
+* Unmerged path include/net/tcp.h
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 6394ffe428d8..555ef594e6ba 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2941,7 +2941,8 @@ void tcp_rearm_rto(struct sock *sk)
+ 		if (icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
+ 		    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
+ 			struct sk_buff *skb = tcp_write_queue_head(sk);
+-			const u32 rto_time_stamp = TCP_SKB_CB(skb)->when + rto;
++			const u32 rto_time_stamp =
++				tcp_skb_timestamp(skb) + rto;
+ 			s32 delta = (s32)(rto_time_stamp - tcp_time_stamp);
+ 			/* delta may not be positive if the socket is locked
+ 			 * when the retrans timer fires and is rescheduled.
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index f2224d131626..d3f3b1ddccbf 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -439,8 +439,9 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
+ 		skb = tcp_write_queue_head(sk);
+ 		BUG_ON(!skb);
+ 
+-		remaining = icsk->icsk_rto - min(icsk->icsk_rto,
+-				tcp_time_stamp - TCP_SKB_CB(skb)->when);
++		remaining = icsk->icsk_rto -
++			    min(icsk->icsk_rto,
++				tcp_time_stamp - tcp_skb_timestamp(skb));
+ 
+ 		if (remaining) {
+ 			inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+* Unmerged path net/ipv4/tcp_output.c
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 286227abed10..674cda0801c8 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -135,10 +135,9 @@ static bool retransmits_timed_out(struct sock *sk,
+ 	if (!inet_csk(sk)->icsk_retransmits)
+ 		return false;
+ 
+-	if (unlikely(!tcp_sk(sk)->retrans_stamp))
+-		start_ts = TCP_SKB_CB(tcp_write_queue_head(sk))->when;
+-	else
+-		start_ts = tcp_sk(sk)->retrans_stamp;
++	start_ts = tcp_sk(sk)->retrans_stamp;
++	if (unlikely(!start_ts))
++		start_ts = tcp_skb_timestamp(tcp_write_queue_head(sk));
+ 
+ 	if (likely(timeout == 0)) {
+ 		linear_backoff_thresh = ilog2(TCP_RTO_MAX/rto_base);
