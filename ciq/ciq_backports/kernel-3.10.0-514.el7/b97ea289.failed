@@ -1,0 +1,338 @@
+PCI: Assign resources before drivers claim devices (pci_scan_root_bus())
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [pci] Assign resources before drivers claim devices (pci_scan_root_bus()) (Myron Stowe) [1332667]
+Rebuild_FUZZ: 96.40%
+commit-author Yijing Wang <wangyijing@huawei.com>
+commit b97ea289cf6aff8d4cbcefe2b707bb9b00a73c73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b97ea289.failed
+
+Previously, pci_scan_root_bus() created a root PCI bus, enumerated the
+devices on it, and called pci_bus_add_devices(), which made the devices
+available for drivers to claim them.
+
+Most callers assigned resources to devices after pci_scan_root_bus()
+returns, which may be after drivers have claimed the devices.  This is
+incorrect; the PCI core should not change device resources while a driver
+is managing the device.
+
+Remove pci_bus_add_devices() from pci_scan_root_bus() and do it after any
+resource assignment in the callers.
+
+Note that ARM's pci_common_init_dev() already called pci_bus_add_devices()
+after pci_scan_root_bus(), so we only need to remove the first call:
+
+  pci_common_init_dev
+    pcibios_init_hw
+      pci_scan_root_bus
+        pci_bus_add_devices        # first call
+    pci_bus_assign_resources
+    pci_bus_add_devices            # second call
+
+[bhelgaas: changelog, drop "root_bus" var in alpha common_init_pci(),
+return failure earlier in mn10300, add "return" in x86 pcibios_scan_root(),
+return early if xtensa platform_pcibios_fixup() fails]
+	Signed-off-by: Yijing Wang <wangyijing@huawei.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+CC: Richard Henderson <rth@twiddle.net>
+CC: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+CC: Matt Turner <mattst88@gmail.com>
+CC: David Howells <dhowells@redhat.com>
+CC: Tony Luck <tony.luck@intel.com>
+CC: Michal Simek <monstr@monstr.eu>
+CC: Ralf Baechle <ralf@linux-mips.org>
+CC: Koichi Yasutake <yasutake.koichi@jp.panasonic.com>
+CC: Sebastian Ott <sebott@linux.vnet.ibm.com>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Chris Metcalf <cmetcalf@ezchip.com>
+CC: Chris Zankel <chris@zankel.net>
+CC: Max Filippov <jcmvbkbc@gmail.com>
+CC: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit b97ea289cf6aff8d4cbcefe2b707bb9b00a73c73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/sn/kernel/io_init.c
+#	arch/sh/drivers/pci/pci.c
+#	arch/tile/kernel/pci_gx.c
+#	arch/xtensa/kernel/pci.c
+#	drivers/pci/host/pci-versatile.c
+diff --cc arch/ia64/sn/kernel/io_init.c
+index 238e2c511d94,1be65eb074ec..000000000000
+--- a/arch/ia64/sn/kernel/io_init.c
++++ b/arch/ia64/sn/kernel/io_init.c
+@@@ -316,26 -258,22 +316,35 @@@ sn_pci_controller_fixup(int segment, in
+  	 */
+  	controller->platform_data = prom_bussoft_ptr;
+  
+ -	sn_legacy_pci_window_fixup(res,
+ -			prom_bussoft_ptr->bs_legacy_io,
+ -			prom_bussoft_ptr->bs_legacy_mem);
+ -	pci_add_resource_offset(&resources,	&res[0],
+ -			prom_bussoft_ptr->bs_legacy_io);
+ -	pci_add_resource_offset(&resources,	&res[1],
+ -			prom_bussoft_ptr->bs_legacy_mem);
+ -
+ +	sn_legacy_pci_window_fixup(controller,
+ +				   prom_bussoft_ptr->bs_legacy_io,
+ +				   prom_bussoft_ptr->bs_legacy_mem);
+ +	for (i = 0; i < controller->windows; i++)
+ +		pci_add_resource_offset(&resources,
+ +					&controller->window[i].resource,
+ +					controller->window[i].offset);
+  	bus = pci_scan_root_bus(NULL, busnum, &pci_root_ops, controller,
+  				&resources);
+++<<<<<<< HEAD
+ + 	if (bus == NULL)
+ + 		goto error_return; /* error, or bus already scanned */
+ +
+ +	bus->sysdata = controller;
+ +
+ +	return;
+ +
+ +error_return:
+ +
+ +	kfree(controller);
+ +	return;
+++=======
++  	if (bus == NULL) {
++ 		kfree(res);
++ 		kfree(controller);
++ 		return;
++ 	}
++ 	pci_bus_add_devices(bus);
+++>>>>>>> b97ea289cf6a (PCI: Assign resources before drivers claim devices (pci_scan_root_bus()))
+  }
+  
+  /*
+diff --cc arch/sh/drivers/pci/pci.c
+index 102f5d58b037,efc10519916a..000000000000
+--- a/arch/sh/drivers/pci/pci.c
++++ b/arch/sh/drivers/pci/pci.c
+@@@ -69,7 -69,7 +69,11 @@@ static void pcibios_scanbus(struct pci_
+  
+  		pci_bus_size_bridges(bus);
+  		pci_bus_assign_resources(bus);
+++<<<<<<< HEAD
+ +		pci_enable_bridges(bus);
+++=======
++ 		pci_bus_add_devices(bus);
+++>>>>>>> b97ea289cf6a (PCI: Assign resources before drivers claim devices (pci_scan_root_bus()))
+  	} else {
+  		pci_free_resource_list(&resources);
+  	}
+diff --cc arch/tile/kernel/pci_gx.c
+index 11425633b2d7,b1df847d0686..000000000000
+--- a/arch/tile/kernel/pci_gx.c
++++ b/arch/tile/kernel/pci_gx.c
+@@@ -1008,6 -1031,7 +1008,10 @@@ alloc_mem_map_failed
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		pci_bus_add_devices(root_bus);
+++>>>>>>> b97ea289cf6a (PCI: Assign resources before drivers claim devices (pci_scan_root_bus()))
+  	}
+  
+  	return 0;
+diff --cc arch/xtensa/kernel/pci.c
+index 126c18839409,b848cc3dc913..000000000000
+--- a/arch/xtensa/kernel/pci.c
++++ b/arch/xtensa/kernel/pci.c
+@@@ -174,7 -174,7 +174,11 @@@ static int __init pcibios_init(void
+  	struct pci_controller *pci_ctrl;
+  	struct list_head resources;
+  	struct pci_bus *bus;
+++<<<<<<< HEAD
+ +	int next_busno = 0, i;
+++=======
++ 	int next_busno = 0, ret;
+++>>>>>>> b97ea289cf6a (PCI: Assign resources before drivers claim devices (pci_scan_root_bus()))
+  
+  	printk("PCI: Probing PCI hardware\n");
+  
+* Unmerged path drivers/pci/host/pci-versatile.c
+diff --git a/arch/alpha/kernel/pci.c b/arch/alpha/kernel/pci.c
+index edb4e0097b75..94adf71c4ba0 100644
+--- a/arch/alpha/kernel/pci.c
++++ b/arch/alpha/kernel/pci.c
+@@ -340,6 +340,8 @@ common_init_pci(void)
+ 
+ 		bus = pci_scan_root_bus(NULL, next_busno, alpha_mv.pci_ops,
+ 					hose, &resources);
++		if (!bus)
++			continue;
+ 		hose->bus = bus;
+ 		hose->need_domain_info = need_domain_info;
+ 		next_busno = bus->busn_res.end + 1;
+@@ -355,6 +357,11 @@ common_init_pci(void)
+ 
+ 	pci_assign_unassigned_resources();
+ 	pci_fixup_irqs(alpha_mv.pci_swizzle, alpha_mv.pci_map_irq);
++	for (hose = hose_head; hose; hose = hose->next) {
++		bus = hose->bus;
++		if (bus)
++			pci_bus_add_devices(bus);
++	}
+ }
+ 
+ 
+diff --git a/arch/frv/mb93090-mb00/pci-vdk.c b/arch/frv/mb93090-mb00/pci-vdk.c
+index 0aa35f0eb0db..f48327417d9f 100644
+--- a/arch/frv/mb93090-mb00/pci-vdk.c
++++ b/arch/frv/mb93090-mb00/pci-vdk.c
+@@ -348,6 +348,7 @@ void __init pcibios_fixup_bus(struct pci_bus *bus)
+ 
+ int __init pcibios_init(void)
+ {
++	struct pci_bus *bus;
+ 	struct pci_ops *dir = NULL;
+ 	LIST_HEAD(resources);
+ 
+@@ -415,13 +416,16 @@ int __init pcibios_init(void)
+ 	printk("PCI: Probing PCI hardware\n");
+ 	pci_add_resource(&resources, &pci_ioport_resource);
+ 	pci_add_resource(&resources, &pci_iomem_resource);
+-	pci_scan_root_bus(NULL, 0, pci_root_ops, NULL, &resources);
++	bus = pci_scan_root_bus(NULL, 0, pci_root_ops, NULL, &resources);
+ 
+ 	pcibios_irq_init();
+ 	pcibios_fixup_peer_bridges();
+ 	pcibios_fixup_irqs();
+ 	pcibios_resource_survey();
++	if (!bus)
++		return 0;
+ 
++	pci_bus_add_devices(bus);
+ 	return 0;
+ }
+ 
+* Unmerged path arch/ia64/sn/kernel/io_init.c
+diff --git a/arch/microblaze/pci/pci-common.c b/arch/microblaze/pci/pci-common.c
+index d24fcb62cde2..5d633fcc7b50 100644
+--- a/arch/microblaze/pci/pci-common.c
++++ b/arch/microblaze/pci/pci-common.c
+@@ -1489,6 +1489,10 @@ static int __init pcibios_init(void)
+ 
+ 	/* Call common code to handle resource allocation */
+ 	pcibios_resource_survey();
++	list_for_each_entry_safe(hose, tmp, &hose_list, list_node) {
++		if (hose->bus)
++			pci_bus_add_devices(hose->bus);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/arch/mips/pci/pci.c b/arch/mips/pci/pci.c
+index 594e60d6a43b..ba0104033b3c 100644
+--- a/arch/mips/pci/pci.c
++++ b/arch/mips/pci/pci.c
+@@ -115,6 +115,7 @@ static void pcibios_scanbus(struct pci_controller *hose)
+ 			pci_bus_assign_resources(bus);
+ 			pci_enable_bridges(bus);
+ 		}
++		pci_bus_add_devices(bus);
+ 	}
+ }
+ 
+diff --git a/arch/mn10300/unit-asb2305/pci.c b/arch/mn10300/unit-asb2305/pci.c
+index e37fac0461f3..242ad954859d 100644
+--- a/arch/mn10300/unit-asb2305/pci.c
++++ b/arch/mn10300/unit-asb2305/pci.c
+@@ -348,6 +348,7 @@ static int __init pcibios_init(void)
+ {
+ 	resource_size_t io_offset, mem_offset;
+ 	LIST_HEAD(resources);
++	struct pci_bus *bus;
+ 
+ 	ioport_resource.start	= 0xA0000000;
+ 	ioport_resource.end	= 0xDFFFFFFF;
+@@ -377,11 +378,14 @@ static int __init pcibios_init(void)
+ 
+ 	pci_add_resource_offset(&resources, &pci_ioport_resource, io_offset);
+ 	pci_add_resource_offset(&resources, &pci_iomem_resource, mem_offset);
+-	pci_scan_root_bus(NULL, 0, &pci_direct_ampci, NULL, &resources);
++	bus = pci_scan_root_bus(NULL, 0, &pci_direct_ampci, NULL, &resources);
++	if (!bus)
++		return 0;
+ 
+ 	pcibios_irq_init();
+ 	pcibios_fixup_irqs();
+ 	pcibios_resource_survey();
++	pci_bus_add_devices(bus);
+ 	return 0;
+ }
+ 
+diff --git a/arch/s390/pci/pci.c b/arch/s390/pci/pci.c
+index 2654ac28ffc0..778b563a6baf 100644
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -883,8 +883,8 @@ static int zpci_scan_bus(struct zpci_dev *zdev)
+ 		zpci_cleanup_bus_resources(zdev);
+ 		return -EIO;
+ 	}
+-
+ 	zdev->bus->max_bus_speed = zdev->max_bus_speed;
++	pci_bus_add_devices(zdev->bus);
+ 	return 0;
+ }
+ 
+* Unmerged path arch/sh/drivers/pci/pci.c
+diff --git a/arch/sparc/kernel/leon_pci.c b/arch/sparc/kernel/leon_pci.c
+index 88aaaa57bb64..34b16ba7ce6b 100644
+--- a/arch/sparc/kernel/leon_pci.c
++++ b/arch/sparc/kernel/leon_pci.c
+@@ -40,6 +40,7 @@ void leon_pci_init(struct platform_device *ofdev, struct leon_pci_info *info)
+ 
+ 		/* Assign devices with resources */
+ 		pci_assign_unassigned_resources();
++		pci_bus_add_devices(root_bus);
+ 	} else {
+ 		pci_free_resource_list(&resources);
+ 	}
+diff --git a/arch/tile/kernel/pci.c b/arch/tile/kernel/pci.c
+index 67237d34c2e2..4863add2b958 100644
+--- a/arch/tile/kernel/pci.c
++++ b/arch/tile/kernel/pci.c
+@@ -347,6 +347,8 @@ int __init pcibios_init(void)
+ 			struct pci_bus *next_bus;
+ 			struct pci_dev *dev;
+ 
++			pci_bus_add_devices(root_bus);
++
+ 			list_for_each_entry(dev, &root_bus->devices, bus_list) {
+ 				/*
+ 				 * Find the PCI host controller, ie. the 1st
+* Unmerged path arch/tile/kernel/pci_gx.c
+diff --git a/arch/x86/pci/common.c b/arch/x86/pci/common.c
+index 51526b34e489..15e0a2a551b9 100644
+--- a/arch/x86/pci/common.c
++++ b/arch/x86/pci/common.c
+@@ -490,7 +490,9 @@ void pcibios_scan_root(int busnum)
+ 	if (!bus) {
+ 		pci_free_resource_list(&resources);
+ 		kfree(sd);
++		return;
+ 	}
++	pci_bus_add_devices(bus);
+ }
+ 
+ void __init pcibios_set_cache_line_size(void)
+* Unmerged path arch/xtensa/kernel/pci.c
+* Unmerged path drivers/pci/host/pci-versatile.c
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index d406323a17b0..614d97f4ea80 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -2143,7 +2143,6 @@ struct pci_bus *pci_scan_root_bus(struct device *parent, int bus,
+ 	if (!found)
+ 		pci_bus_update_busn_res_end(b, max);
+ 
+-	pci_bus_add_devices(b);
+ 	return b;
+ }
+ EXPORT_SYMBOL(pci_scan_root_bus);
