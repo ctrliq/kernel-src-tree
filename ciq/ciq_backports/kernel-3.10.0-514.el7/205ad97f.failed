@@ -1,0 +1,160 @@
+ACPI / property: Fix subnode lookup scope for data-only subnodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 205ad97fc5a6386214323641dd28b822cb6fc624
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/205ad97f.failed
+
+The correct scope for looking up the objects to generate data packages for
+data-only subnodes pointed to by another data-only subnode is the scope
+of the parent of that subnode and not the scope containing the _DSD object
+at the top of the hierarchy (the latter works only if all of the objects
+returning data-only subnode packages in a given hierarchy are in the same
+scope).
+
+Fix the code to work as expected.
+
+Fixes: 445b0eb058f5 (ACPI / property: Add support for data-only subnodes)
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit 205ad97fc5a6386214323641dd28b822cb6fc624)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/property.c
+diff --cc drivers/acpi/property.c
+index 3d47281953cd,88f4306744c0..000000000000
+--- a/drivers/acpi/property.c
++++ b/drivers/acpi/property.c
+@@@ -24,6 -29,123 +24,126 @@@ static const u8 prp_uuid[16] = 
+  	0x14, 0xd8, 0xff, 0xda, 0xba, 0x6e, 0x8c, 0x4d,
+  	0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01
+  };
+++<<<<<<< HEAD
+++=======
++ /* ACPI _DSD data subnodes UUID: dbb8e3e6-5886-4ba6-8795-1319f52a966b */
++ static const u8 ads_uuid[16] = {
++ 	0xe6, 0xe3, 0xb8, 0xdb, 0x86, 0x58, 0xa6, 0x4b,
++ 	0x87, 0x95, 0x13, 0x19, 0xf5, 0x2a, 0x96, 0x6b
++ };
++ 
++ static bool acpi_enumerate_nondev_subnodes(acpi_handle scope,
++ 					   const union acpi_object *desc,
++ 					   struct acpi_device_data *data);
++ static bool acpi_extract_properties(const union acpi_object *desc,
++ 				    struct acpi_device_data *data);
++ 
++ static bool acpi_nondev_subnode_ok(acpi_handle scope,
++ 				   const union acpi_object *link,
++ 				   struct list_head *list)
++ {
++ 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
++ 	struct acpi_data_node *dn;
++ 	acpi_handle handle;
++ 	acpi_status status;
++ 
++ 	dn = kzalloc(sizeof(*dn), GFP_KERNEL);
++ 	if (!dn)
++ 		return false;
++ 
++ 	dn->name = link->package.elements[0].string.pointer;
++ 	dn->fwnode.type = FWNODE_ACPI_DATA;
++ 	INIT_LIST_HEAD(&dn->data.subnodes);
++ 
++ 	status = acpi_get_handle(scope, link->package.elements[1].string.pointer,
++ 				 &handle);
++ 	if (ACPI_FAILURE(status))
++ 		goto fail;
++ 
++ 	status = acpi_evaluate_object_typed(handle, NULL, NULL, &buf,
++ 					    ACPI_TYPE_PACKAGE);
++ 	if (ACPI_FAILURE(status))
++ 		goto fail;
++ 
++ 	if (acpi_extract_properties(buf.pointer, &dn->data))
++ 		dn->handle = handle;
++ 
++ 	/*
++ 	 * The scope for the subnode object lookup is the one of the namespace
++ 	 * node (device) containing the object that has returned the package.
++ 	 * That is, it's the scope of that object's parent.
++ 	 */
++ 	status = acpi_get_parent(handle, &scope);
++ 	if (ACPI_SUCCESS(status)
++ 	    && acpi_enumerate_nondev_subnodes(scope, buf.pointer, &dn->data))
++ 		dn->handle = handle;
++ 
++ 	if (dn->handle) {
++ 		dn->data.pointer = buf.pointer;
++ 		list_add_tail(&dn->sibling, list);
++ 		return true;
++ 	}
++ 
++ 	acpi_handle_debug(handle, "Invalid properties/subnodes data, skipping\n");
++ 
++  fail:
++ 	ACPI_FREE(buf.pointer);
++ 	kfree(dn);
++ 	return false;
++ }
++ 
++ static int acpi_add_nondev_subnodes(acpi_handle scope,
++ 				    const union acpi_object *links,
++ 				    struct list_head *list)
++ {
++ 	bool ret = false;
++ 	int i;
++ 
++ 	for (i = 0; i < links->package.count; i++) {
++ 		const union acpi_object *link;
++ 
++ 		link = &links->package.elements[i];
++ 		/* Only two elements allowed, both must be strings. */
++ 		if (link->package.count == 2
++ 		    && link->package.elements[0].type == ACPI_TYPE_STRING
++ 		    && link->package.elements[1].type == ACPI_TYPE_STRING
++ 		    && acpi_nondev_subnode_ok(scope, link, list))
++ 			ret = true;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static bool acpi_enumerate_nondev_subnodes(acpi_handle scope,
++ 					   const union acpi_object *desc,
++ 					   struct acpi_device_data *data)
++ {
++ 	int i;
++ 
++ 	/* Look for the ACPI data subnodes UUID. */
++ 	for (i = 0; i < desc->package.count; i += 2) {
++ 		const union acpi_object *uuid, *links;
++ 
++ 		uuid = &desc->package.elements[i];
++ 		links = &desc->package.elements[i + 1];
++ 
++ 		/*
++ 		 * The first element must be a UUID and the second one must be
++ 		 * a package.
++ 		 */
++ 		if (uuid->type != ACPI_TYPE_BUFFER || uuid->buffer.length != 16
++ 		    || links->type != ACPI_TYPE_PACKAGE)
++ 			break;
++ 
++ 		if (memcmp(uuid->buffer.pointer, ads_uuid, sizeof(ads_uuid)))
++ 			continue;
++ 
++ 		return acpi_add_nondev_subnodes(scope, links, &data->subnodes);
++ 	}
++ 
++ 	return false;
++ }
+++>>>>>>> 205ad97fc5a6 (ACPI / property: Fix subnode lookup scope for data-only subnodes)
+  
+  static bool acpi_property_value_ok(const union acpi_object *value)
+  {
+* Unmerged path drivers/acpi/property.c
