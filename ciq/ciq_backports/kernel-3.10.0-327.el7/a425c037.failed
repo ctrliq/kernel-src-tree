@@ -1,0 +1,187 @@
+ovl: Fix opaque regression in ovl_lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author hujianyang <hujianyang@huawei.com>
+commit a425c037f3dd8a56469158ab5f37beb46402d958
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a425c037.failed
+
+Current multi-layer support overlayfs has a regression in
+.lookup(). If there is a directory in upperdir and a regular
+file has same name in lowerdir in a merged directory, lower
+file is hidden and upper directory is set to opaque in former
+case. But it is changed in present code.
+
+In lowerdir lookup path, if a found inode is not directory,
+the type checking of previous inode is missing. This inode
+will be copied to the lowerstack of ovl_entry directly.
+
+That will lead to several wrong conditions, for example,
+the reading of the directory in upperdir may return an error
+like:
+
+   ls: reading directory .: Not a directory
+
+This patch makes the lowerdir lookup path check the opaque
+for non-directory file too.
+
+	Signed-off-by: hujianyang <hujianyang@huawei.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+(cherry picked from commit a425c037f3dd8a56469158ab5f37beb46402d958)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/super.c
+index 094d071a44c7,9e94f4acef1a..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -319,56 -332,104 +319,117 @@@ struct dentry *ovl_lookup(struct inode 
+  			  unsigned int flags)
+  {
+  	struct ovl_entry *oe;
+ -	struct ovl_entry *poe = dentry->d_parent->d_fsdata;
+ -	struct path *stack = NULL;
+ -	struct dentry *upperdir, *upperdentry = NULL;
+ -	unsigned int ctr = 0;
+ +	struct dentry *upperdir;
+ +	struct dentry *lowerdir;
+ +	struct dentry *upperdentry = NULL;
+ +	struct dentry *lowerdentry = NULL;
+  	struct inode *inode = NULL;
+ -	bool upperopaque = false;
+ -	struct dentry *this, *prev = NULL;
+ -	unsigned int i;
+  	int err;
+  
+ -	upperdir = ovl_upperdentry_dereference(poe);
+ -	if (upperdir) {
+ -		this = ovl_lookup_real(upperdir, &dentry->d_name);
+ -		err = PTR_ERR(this);
+ -		if (IS_ERR(this))
+ -			goto out;
+ +	err = -ENOMEM;
+ +	oe = ovl_alloc_entry();
+ +	if (!oe)
+ +		goto out;
+  
+ -		if (this) {
+ -			if (ovl_is_whiteout(this)) {
+ -				dput(this);
+ -				this = NULL;
+ -				upperopaque = true;
+ -			} else if (poe->numlower && ovl_is_opaquedir(this)) {
+ -				upperopaque = true;
+ +	upperdir = ovl_dentry_upper(dentry->d_parent);
+ +	lowerdir = ovl_dentry_lower(dentry->d_parent);
+ +
+ +	if (upperdir) {
+ +		upperdentry = ovl_lookup_real(upperdir, &dentry->d_name);
+ +		err = PTR_ERR(upperdentry);
+ +		if (IS_ERR(upperdentry))
+ +			goto out_put_dir;
+ +
+ +		if (lowerdir && upperdentry) {
+ +			if (ovl_is_whiteout(upperdentry)) {
+ +				dput(upperdentry);
+ +				upperdentry = NULL;
+ +				oe->opaque = true;
+ +			} else if (ovl_is_opaquedir(upperdentry)) {
+ +				oe->opaque = true;
+  			}
+  		}
+ -		upperdentry = prev = this;
+ +	}
+ +	if (lowerdir && !oe->opaque) {
+ +		lowerdentry = ovl_lookup_real(lowerdir, &dentry->d_name);
+ +		err = PTR_ERR(lowerdentry);
+ +		if (IS_ERR(lowerdentry))
+ +			goto out_dput_upper;
+  	}
+  
+ -	if (!upperopaque && poe->numlower) {
+ -		err = -ENOMEM;
+ -		stack = kcalloc(poe->numlower, sizeof(struct path), GFP_KERNEL);
+ -		if (!stack)
+ -			goto out_put_upper;
+ +	if (lowerdentry && upperdentry &&
+ +	    (!S_ISDIR(upperdentry->d_inode->i_mode) ||
+ +	     !S_ISDIR(lowerdentry->d_inode->i_mode))) {
+ +		dput(lowerdentry);
+ +		lowerdentry = NULL;
+ +		oe->opaque = true;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (lowerdentry || upperdentry) {
+++=======
++ 	for (i = 0; !upperopaque && i < poe->numlower; i++) {
++ 		bool opaque = false;
++ 		struct path lowerpath = poe->lowerstack[i];
++ 
++ 		this = ovl_lookup_real(lowerpath.dentry, &dentry->d_name);
++ 		err = PTR_ERR(this);
++ 		if (IS_ERR(this)) {
++ 			/*
++ 			 * If it's positive, then treat ENAMETOOLONG as ENOENT.
++ 			 */
++ 			if (err == -ENAMETOOLONG && (upperdentry || ctr))
++ 				continue;
++ 			goto out_put;
++ 		}
++ 		if (!this)
++ 			continue;
++ 		if (ovl_is_whiteout(this)) {
++ 			dput(this);
++ 			break;
++ 		}
++ 		/*
++ 		 * Only makes sense to check opaque dir if this is not the
++ 		 * lowermost layer.
++ 		 */
++ 		if (i < poe->numlower - 1 && ovl_is_opaquedir(this))
++ 			opaque = true;
++ 
++ 		if (prev && (!S_ISDIR(prev->d_inode->i_mode) ||
++ 			     !S_ISDIR(this->d_inode->i_mode))) {
++ 			/*
++ 			 * FIXME: check for upper-opaqueness maybe better done
++ 			 * in remove code.
++ 			 */
++ 			if (prev == upperdentry)
++ 				upperopaque = true;
++ 			dput(this);
++ 			break;
++ 		}
++ 		/*
++ 		 * If this is a non-directory then stop here.
++ 		 */
++ 		if (!S_ISDIR(this->d_inode->i_mode))
++ 			opaque = true;
++ 
++ 		stack[ctr].dentry = this;
++ 		stack[ctr].mnt = lowerpath.mnt;
++ 		ctr++;
++ 		prev = this;
++ 		if (opaque)
++ 			break;
++ 	}
++ 
++ 	oe = ovl_alloc_entry(ctr);
++ 	err = -ENOMEM;
++ 	if (!oe)
++ 		goto out_put;
++ 
++ 	if (upperdentry || ctr) {
+++>>>>>>> a425c037f3dd (ovl: Fix opaque regression in ovl_lookup)
+  		struct dentry *realdentry;
+  
+ -		realdentry = upperdentry ? upperdentry : stack[0].dentry;
+ -
+ +		realdentry = upperdentry ? upperdentry : lowerdentry;
+  		err = -ENOMEM;
+  		inode = ovl_new_inode(dentry->d_sb, realdentry->d_inode->i_mode,
+  				      oe);
+* Unmerged path fs/overlayfs/super.c
