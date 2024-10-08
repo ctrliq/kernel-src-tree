@@ -1116,6 +1116,16 @@ void __kprobes program_check_exception(struct pt_regs *regs)
 	}
 #endif
 
+	/*
+	 * If we took the program check in the kernel skip down to sending a
+	 * SIGILL. The subsequent cases all relate to emulating instructions
+	 * which we should only do for userspace. We also do not want to enable
+	 * interrupts for kernel faults because that might lead to further
+	 * faults, and loose the context of the original exception.
+	 */
+	if (!user_mode(regs))
+		goto sigill;
+
 	/* We restore the interrupt state now */
 	if (!arch_irq_disabled_regs(regs))
 		local_irq_enable();
@@ -1159,6 +1169,7 @@ void __kprobes program_check_exception(struct pt_regs *regs)
 		}
 	}
 
+sigill:
 	if (reason & REASON_PRIVILEGED)
 		_exception(SIGILL, regs, ILL_PRVOPC, regs->nip);
 	else
