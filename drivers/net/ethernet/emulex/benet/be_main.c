@@ -1415,12 +1415,12 @@ static inline bool csum_passed(struct be_rx_compl_info *rxcp)
 				(rxcp->ip_csum || rxcp->ipv6);
 }
 
-static struct be_rx_page_info *get_rx_page_info(struct be_rx_obj *rxo,
-						u16 frag_idx)
+static struct be_rx_page_info *get_rx_page_info(struct be_rx_obj *rxo)
 {
 	struct be_adapter *adapter = rxo->adapter;
 	struct be_rx_page_info *rx_page_info;
 	struct be_queue_info *rxq = &rxo->q;
+	u16 frag_idx = rxq->tail;
 
 	rx_page_info = &rxo->page_info_tbl[frag_idx];
 	BUG_ON(!rx_page_info->page);
@@ -1432,6 +1432,7 @@ static struct be_rx_page_info *get_rx_page_info(struct be_rx_obj *rxo,
 		rx_page_info->last_page_user = false;
 	}
 
+	queue_tail_inc(rxq);
 	atomic_dec(&rxq->used);
 	return rx_page_info;
 }
@@ -1440,15 +1441,13 @@ static struct be_rx_page_info *get_rx_page_info(struct be_rx_obj *rxo,
 static void be_rx_compl_discard(struct be_rx_obj *rxo,
 				struct be_rx_compl_info *rxcp)
 {
-	struct be_queue_info *rxq = &rxo->q;
 	struct be_rx_page_info *page_info;
 	u16 i, num_rcvd = rxcp->num_rcvd;
 
 	for (i = 0; i < num_rcvd; i++) {
-		page_info = get_rx_page_info(rxo, rxcp->rxq_idx);
+		page_info = get_rx_page_info(rxo);
 		put_page(page_info->page);
 		memset(page_info, 0, sizeof(*page_info));
-		index_inc(&rxcp->rxq_idx, rxq->len);
 	}
 }
 
@@ -1459,13 +1458,12 @@ static void be_rx_compl_discard(struct be_rx_obj *rxo,
 static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 			     struct be_rx_compl_info *rxcp)
 {
-	struct be_queue_info *rxq = &rxo->q;
 	struct be_rx_page_info *page_info;
 	u16 i, j;
 	u16 hdr_len, curr_frag_len, remaining;
 	u8 *start;
 
-	page_info = get_rx_page_info(rxo, rxcp->rxq_idx);
+	page_info = get_rx_page_info(rxo);
 	start = page_address(page_info->page) + page_info->page_offset;
 	prefetch(start);
 
@@ -1499,10 +1497,9 @@ static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 	}
 
 	/* More frags present for this completion */
-	index_inc(&rxcp->rxq_idx, rxq->len);
 	remaining = rxcp->pkt_size - curr_frag_len;
 	for (i = 1, j = 0; i < rxcp->num_rcvd; i++) {
-		page_info = get_rx_page_info(rxo, rxcp->rxq_idx);
+		page_info = get_rx_page_info(rxo);
 		curr_frag_len = min(remaining, rx_frag_size);
 
 		/* Coalesce all frags from the same physical page in one slot */
@@ -1523,7 +1520,6 @@ static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 		skb->data_len += curr_frag_len;
 		skb->truesize += rx_frag_size;
 		remaining -= curr_frag_len;
-		index_inc(&rxcp->rxq_idx, rxq->len);
 		page_info->page = NULL;
 	}
 	BUG_ON(j > MAX_SKB_FRAGS);
@@ -1571,7 +1567,6 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 	struct be_adapter *adapter = rxo->adapter;
 	struct be_rx_page_info *page_info;
 	struct sk_buff *skb = NULL;
-	struct be_queue_info *rxq = &rxo->q;
 	u16 remaining, curr_frag_len;
 	u16 i, j;
 
@@ -1583,7 +1578,7 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 
 	remaining = rxcp->pkt_size;
 	for (i = 0, j = -1; i < rxcp->num_rcvd; i++) {
-		page_info = get_rx_page_info(rxo, rxcp->rxq_idx);
+		page_info = get_rx_page_info(rxo);
 
 		curr_frag_len = min(remaining, rx_frag_size);
 
@@ -1601,7 +1596,6 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 		skb_frag_size_add(&skb_shinfo(skb)->frags[j], curr_frag_len);
 		skb->truesize += rx_frag_size;
 		remaining -= curr_frag_len;
-		index_inc(&rxcp->rxq_idx, rxq->len);
 		memset(page_info, 0, sizeof(*page_info));
 	}
 	BUG_ON(j > MAX_SKB_FRAGS);
@@ -1635,8 +1629,6 @@ static void be_parse_rx_compl_v1(struct be_eth_rx_compl *compl,
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v1, l4_cksm, compl);
 	rxcp->ipv6 =
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v1, ip_version, compl);
-	rxcp->rxq_idx =
-		AMAP_GET_BITS(struct amap_eth_rx_compl_v1, fragndx, compl);
 	rxcp->num_rcvd =
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v1, numfrags, compl);
 	rxcp->pkt_type =
@@ -1667,8 +1659,6 @@ static void be_parse_rx_compl_v0(struct be_eth_rx_compl *compl,
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v0, l4_cksm, compl);
 	rxcp->ipv6 =
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v0, ip_version, compl);
-	rxcp->rxq_idx =
-		AMAP_GET_BITS(struct amap_eth_rx_compl_v0, fragndx, compl);
 	rxcp->num_rcvd =
 		AMAP_GET_BITS(struct amap_eth_rx_compl_v0, numfrags, compl);
 	rxcp->pkt_type =
@@ -1884,7 +1874,6 @@ static void be_rx_cq_clean(struct be_rx_obj *rxo)
 	struct be_rx_compl_info *rxcp;
 	struct be_adapter *adapter = rxo->adapter;
 	int flush_wait = 0;
-	u16 tail;
 
 	/* Consume pending rx completions.
 	 * Wait for the flush completion (identified by zero num_rcvd)
@@ -1917,9 +1906,8 @@ static void be_rx_cq_clean(struct be_rx_obj *rxo)
 	be_cq_notify(adapter, rx_cq->id, false, 0);
 
 	/* Then free posted rx buffers that were not used */
-	tail = (rxq->head + rxq->len - atomic_read(&rxq->used)) % rxq->len;
-	for (; atomic_read(&rxq->used) > 0; index_inc(&tail, rxq->len)) {
-		page_info = get_rx_page_info(rxo, tail);
+	while (atomic_read(&rxq->used) > 0) {
+		page_info = get_rx_page_info(rxo);
 		put_page(page_info->page);
 		memset(page_info, 0, sizeof(*page_info));
 	}
