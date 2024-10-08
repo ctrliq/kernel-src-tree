@@ -1,0 +1,228 @@
+xfs: abort metadata writeback on permanent errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit ac8809f9ab01a73de1a47b5a37bd8dcca8712fb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/ac8809f9.failed
+
+If we are doing aysnc writeback of metadata, we can get write errors
+but have nobody to report them to. At the moment, we simply attempt
+to reissue the write from io completion in the hope that it's a
+transient error.
+
+When it's not a transient error, the buffer is stuck forever in
+this loop, and we cannot break out of it. Eventually, unmount will
+hang because the AIL cannot be emptied and everything goes downhill
+from them.
+
+To solve this problem, only retry the write IO once before aborting
+it. We don't throw the buffer away because some transient errors can
+last minutes (e.g.  FC path failover) or even hours (thin
+provisioned devices that have run out of backing space) before they
+go away. Hence we really want to keep trying until we can't try any
+more.
+
+Because the buffer was not cleaned, however, it does not get removed
+from the AIL and hence the next pass across the AIL will start IO on
+it again. As such, we still get the "retry forever" semantics that
+we currently have, but we allow other access to the buffer in the
+mean time. Meanwhile the filesystem can continue to modify the
+buffer and relog it, so the IO errors won't hang the log or the
+filesystem.
+
+Now when we are pushing the AIL, we can see all these "permanent IO
+error" buffers and we can issue a warning about failures before we
+retry the IO. We can also catch these buffers when unmounting an
+issue a corruption warning, too.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Ben Myers <bpm@sgi.com>
+
+(cherry picked from commit ac8809f9ab01a73de1a47b5a37bd8dcca8712fb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index cb1b47901055,afe7645e4b2b..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1506,33 -1489,64 +1506,54 @@@ voi
+  xfs_wait_buftarg(
+  	struct xfs_buftarg	*btp)
+  {
+ -	LIST_HEAD(dispose);
+ -	int loop = 0;
+ +	struct xfs_buf		*bp;
+  
+++<<<<<<< HEAD
+ +restart:
+ +	spin_lock(&btp->bt_lru_lock);
+ +	while (!list_empty(&btp->bt_lru)) {
+ +		bp = list_first_entry(&btp->bt_lru, struct xfs_buf, b_lru);
+ +		if (atomic_read(&bp->b_hold) > 1) {
+ +			trace_xfs_buf_wait_buftarg(bp, _RET_IP_);
+ +			list_move_tail(&bp->b_lru, &btp->bt_lru);
+ +			spin_unlock(&btp->bt_lru_lock);
+++=======
++ 	/* loop until there is nothing left on the lru list. */
++ 	while (list_lru_count(&btp->bt_lru)) {
++ 		list_lru_walk(&btp->bt_lru, xfs_buftarg_wait_rele,
++ 			      &dispose, LONG_MAX);
++ 
++ 		while (!list_empty(&dispose)) {
++ 			struct xfs_buf *bp;
++ 			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
++ 			list_del_init(&bp->b_lru);
++ 			if (bp->b_flags & XBF_WRITE_FAIL) {
++ 				xfs_alert(btp->bt_mount,
++ "Corruption Alert: Buffer at block 0x%llx had permanent write failures!\n"
++ "Please run xfs_repair to determine the extent of the problem.",
++ 					(long long)bp->b_bn);
++ 			}
++ 			xfs_buf_rele(bp);
++ 		}
++ 		if (loop++ != 0)
+++>>>>>>> ac8809f9ab01 (xfs: abort metadata writeback on permanent errors)
+  			delay(100);
+ +			goto restart;
+ +		}
+ +		/*
+ +		 * clear the LRU reference count so the buffer doesn't get
+ +		 * ignored in xfs_buf_rele().
+ +		 */
+ +		atomic_set(&bp->b_lru_ref, 0);
+ +		spin_unlock(&btp->bt_lru_lock);
+ +		xfs_buf_rele(bp);
+ +		spin_lock(&btp->bt_lru_lock);
+  	}
+ +	spin_unlock(&btp->bt_lru_lock);
+  }
+  
+ -static enum lru_status
+ -xfs_buftarg_isolate(
+ -	struct list_head	*item,
+ -	spinlock_t		*lru_lock,
+ -	void			*arg)
+ -{
+ -	struct xfs_buf		*bp = container_of(item, struct xfs_buf, b_lru);
+ -	struct list_head	*dispose = arg;
+ -
+ -	/*
+ -	 * we are inverting the lru lock/bp->b_lock here, so use a trylock.
+ -	 * If we fail to get the lock, just skip it.
+ -	 */
+ -	if (!spin_trylock(&bp->b_lock))
+ -		return LRU_SKIP;
+ -	/*
+ -	 * Decrement the b_lru_ref count unless the value is already
+ -	 * zero. If the value is already zero, we need to reclaim the
+ -	 * buffer, otherwise it gets another trip through the LRU.
+ -	 */
+ -	if (!atomic_add_unless(&bp->b_lru_ref, -1, 0)) {
+ -		spin_unlock(&bp->b_lock);
+ -		return LRU_ROTATE;
+ -	}
+ -
+ -	bp->b_state |= XFS_BSTATE_DISPOSE;
+ -	list_move(item, dispose);
+ -	spin_unlock(&bp->b_lock);
+ -	return LRU_REMOVED;
+ -}
+ -
+ -static unsigned long
+ -xfs_buftarg_shrink_scan(
+ +int
+ +xfs_buftarg_shrink(
+  	struct shrinker		*shrink,
+  	struct shrink_control	*sc)
+  {
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index acdd0f60fafa..ea897ebb7745 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -44,6 +44,7 @@ typedef enum {
+ #define XBF_ASYNC	 (1 << 4) /* initiator will not wait for completion */
+ #define XBF_DONE	 (1 << 5) /* all pages in the buffer uptodate */
+ #define XBF_STALE	 (1 << 6) /* buffer has been staled, do not find it */
++#define XBF_WRITE_FAIL	 (1 << 24)/* async writes have failed on this buffer */
+ 
+ /* I/O hints for the BIO layer */
+ #define XBF_SYNCIO	 (1 << 10)/* treat this buffer as synchronous I/O */
+@@ -70,6 +71,7 @@ typedef unsigned int xfs_buf_flags_t;
+ 	{ XBF_ASYNC,		"ASYNC" }, \
+ 	{ XBF_DONE,		"DONE" }, \
+ 	{ XBF_STALE,		"STALE" }, \
++	{ XBF_WRITE_FAIL,	"WRITE_FAIL" }, \
+ 	{ XBF_SYNCIO,		"SYNCIO" }, \
+ 	{ XBF_FUA,		"FUA" }, \
+ 	{ XBF_FLUSH,		"FLUSH" }, \
+@@ -81,6 +83,7 @@ typedef unsigned int xfs_buf_flags_t;
+ 	{ _XBF_COMPOUND,	"COMPOUND" }, \
+ 	{ _XBF_LRU_DISPOSE,	"LRU_DISPOSE" }
+ 
++
+ /*
+  * The xfs_buftarg contains 2 notions of "sector size" -
+  *
+@@ -312,7 +315,8 @@ extern void xfs_buf_terminate(void);
+ 
+ #define XFS_BUF_ZEROFLAGS(bp) \
+ 	((bp)->b_flags &= ~(XBF_READ|XBF_WRITE|XBF_ASYNC| \
+-			    XBF_SYNCIO|XBF_FUA|XBF_FLUSH))
++			    XBF_SYNCIO|XBF_FUA|XBF_FLUSH| \
++			    XBF_WRITE_FAIL))
+ 
+ void xfs_buf_stale(struct xfs_buf *bp);
+ #define XFS_BUF_UNSTALE(bp)	((bp)->b_flags &= ~XBF_STALE)
+diff --git a/fs/xfs/xfs_buf_item.c b/fs/xfs/xfs_buf_item.c
+index 0b8551a96aee..83600947ed60 100644
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@ -501,6 +501,14 @@ xfs_buf_item_unpin(
+ 	}
+ }
+ 
++/*
++ * Buffer IO error rate limiting. Limit it to no more than 10 messages per 30
++ * seconds so as to not spam logs too much on repeated detection of the same
++ * buffer being bad..
++ */
++
++DEFINE_RATELIMIT_STATE(xfs_buf_write_fail_rl_state, 30 * HZ, 10);
++
+ STATIC uint
+ xfs_buf_item_push(
+ 	struct xfs_log_item	*lip,
+@@ -529,6 +537,14 @@ xfs_buf_item_push(
+ 
+ 	trace_xfs_buf_item_push(bip);
+ 
++	/* has a previous flush failed due to IO errors? */
++	if ((bp->b_flags & XBF_WRITE_FAIL) &&
++	    ___ratelimit(&xfs_buf_write_fail_rl_state, "XFS:")) {
++		xfs_warn(bp->b_target->bt_mount,
++"Detected failing async write on buffer block 0x%llx. Retrying async write.\n",
++			 (long long)bp->b_bn);
++	}
++
+ 	if (!xfs_buf_delwri_queue(bp, buffer_list))
+ 		rval = XFS_ITEM_FLUSHING;
+ 	xfs_buf_unlock(bp);
+@@ -1101,8 +1117,9 @@ xfs_buf_iodone_callbacks(
+ 
+ 		xfs_buf_ioerror(bp, 0); /* errno of 0 unsets the flag */
+ 
+-		if (!XFS_BUF_ISSTALE(bp)) {
+-			bp->b_flags |= XBF_WRITE | XBF_ASYNC | XBF_DONE;
++		if (!(bp->b_flags & (XBF_STALE|XBF_WRITE_FAIL))) {
++			bp->b_flags |= XBF_WRITE | XBF_ASYNC |
++				       XBF_DONE | XBF_WRITE_FAIL;
+ 			xfs_buf_iorequest(bp);
+ 		} else {
+ 			xfs_buf_relse(bp);
