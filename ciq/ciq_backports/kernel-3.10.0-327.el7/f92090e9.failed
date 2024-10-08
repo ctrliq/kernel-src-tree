@@ -1,0 +1,209 @@
+xfs: xfs_ioctl_setattr_check_projid can be static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author kbuild test robot <fengguang.wu@intel.com>
+commit f92090e95cd26ea0a80dc8305b685cc30f6a501f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f92090e9.failed
+
+fs/xfs/xfs_ioctl.c:1146:1: sparse: symbol 'xfs_ioctl_setattr_check_projid' was not declared. Should it be static?
+
+Also fix xfs_ioctl_setattr_check_extsize at the same time.
+
+	Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit f92090e95cd26ea0a80dc8305b685cc30f6a501f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_ioctl.c
+index c6e180d60c21,f1dc90be508c..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -1045,9 -1013,174 +1045,180 @@@ xfs_diflags_to_linux
+  		inode->i_flags &= ~S_NOATIME;
+  }
+  
+++<<<<<<< HEAD
+ +#define FSX_PROJID	1
+ +#define FSX_EXTSIZE	2
+ +#define FSX_XFLAGS	4
+++=======
++ static int
++ xfs_ioctl_setattr_xflags(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	struct fsxattr		*fa)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 
++ 	/* Can't change realtime flag if any extents are allocated. */
++ 	if ((ip->i_d.di_nextents || ip->i_delayed_blks) &&
++ 	    XFS_IS_REALTIME_INODE(ip) != (fa->fsx_xflags & XFS_XFLAG_REALTIME))
++ 		return -EINVAL;
++ 
++ 	/* If realtime flag is set then must have realtime device */
++ 	if (fa->fsx_xflags & XFS_XFLAG_REALTIME) {
++ 		if (mp->m_sb.sb_rblocks == 0 || mp->m_sb.sb_rextsize == 0 ||
++ 		    (ip->i_d.di_extsize % mp->m_sb.sb_rextsize))
++ 			return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * Can't modify an immutable/append-only file unless
++ 	 * we have appropriate permission.
++ 	 */
++ 	if (((ip->i_d.di_flags & (XFS_DIFLAG_IMMUTABLE | XFS_DIFLAG_APPEND)) ||
++ 	     (fa->fsx_xflags & (XFS_XFLAG_IMMUTABLE | XFS_XFLAG_APPEND))) &&
++ 	    !capable(CAP_LINUX_IMMUTABLE))
++ 		return -EPERM;
++ 
++ 	xfs_set_diflags(ip, fa->fsx_xflags);
++ 	xfs_diflags_to_linux(ip);
++ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
++ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++ 	XFS_STATS_INC(xs_ig_attrchg);
++ 	return 0;
++ }
++ 
++ /*
++  * Set up the transaction structure for the setattr operation, checking that we
++  * have permission to do so. On success, return a clean transaction and the
++  * inode locked exclusively ready for further operation specific checks. On
++  * failure, return an error without modifying or locking the inode.
++  */
++ static struct xfs_trans *
++ xfs_ioctl_setattr_get_trans(
++ 	struct xfs_inode	*ip)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 
++ 	if (mp->m_flags & XFS_MOUNT_RDONLY)
++ 		return ERR_PTR(-EROFS);
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return ERR_PTR(-EIO);
++ 
++ 	tp = xfs_trans_alloc(mp, XFS_TRANS_SETATTR_NOT_SIZE);
++ 	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
++ 	if (error)
++ 		goto out_cancel;
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	/*
++ 	 * CAP_FOWNER overrides the following restrictions:
++ 	 *
++ 	 * The user ID of the calling process must be equal to the file owner
++ 	 * ID, except in cases where the CAP_FSETID capability is applicable.
++ 	 */
++ 	if (!inode_owner_or_capable(VFS_I(ip))) {
++ 		error = -EPERM;
++ 		goto out_cancel;
++ 	}
++ 
++ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
++ 		xfs_trans_set_sync(tp);
++ 
++ 	return tp;
++ 
++ out_cancel:
++ 	xfs_trans_cancel(tp, 0);
++ 	return ERR_PTR(error);
++ }
++ 
++ /*
++  * extent size hint validation is somewhat cumbersome. Rules are:
++  *
++  * 1. extent size hint is only valid for directories and regular files
++  * 2. XFS_XFLAG_EXTSIZE is only valid for regular files
++  * 3. XFS_XFLAG_EXTSZINHERIT is only valid for directories.
++  * 4. can only be changed on regular files if no extents are allocated
++  * 5. can be changed on directories at any time
++  * 6. extsize hint of 0 turns off hints, clears inode flags.
++  * 7. Extent size must be a multiple of the appropriate block size.
++  * 8. for non-realtime files, the extent size hint must be limited
++  *    to half the AG size to avoid alignment extending the extent beyond the
++  *    limits of the AG.
++  */
++ static int
++ xfs_ioctl_setattr_check_extsize(
++ 	struct xfs_inode	*ip,
++ 	struct fsxattr		*fa)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 
++ 	if ((fa->fsx_xflags & XFS_XFLAG_EXTSIZE) && !S_ISREG(ip->i_d.di_mode))
++ 		return -EINVAL;
++ 
++ 	if ((fa->fsx_xflags & XFS_XFLAG_EXTSZINHERIT) &&
++ 	    !S_ISDIR(ip->i_d.di_mode))
++ 		return -EINVAL;
++ 
++ 	if (S_ISREG(ip->i_d.di_mode) && ip->i_d.di_nextents &&
++ 	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
++ 		return -EINVAL;
++ 
++ 	if (fa->fsx_extsize != 0) {
++ 		xfs_extlen_t    size;
++ 		xfs_fsblock_t   extsize_fsb;
++ 
++ 		extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
++ 		if (extsize_fsb > MAXEXTLEN)
++ 			return -EINVAL;
++ 
++ 		if (XFS_IS_REALTIME_INODE(ip) ||
++ 		    (fa->fsx_xflags & XFS_XFLAG_REALTIME)) {
++ 			size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
++ 		} else {
++ 			size = mp->m_sb.sb_blocksize;
++ 			if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
++ 				return -EINVAL;
++ 		}
++ 
++ 		if (fa->fsx_extsize % size)
++ 			return -EINVAL;
++ 	} else
++ 		fa->fsx_xflags &= ~(XFS_XFLAG_EXTSIZE | XFS_XFLAG_EXTSZINHERIT);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ xfs_ioctl_setattr_check_projid(
++ 	struct xfs_inode	*ip,
++ 	struct fsxattr		*fa)
++ {
++ 	/* Disallow 32bit project ids if projid32bit feature is not enabled. */
++ 	if (fa->fsx_projid > (__uint16_t)-1 &&
++ 	    !xfs_sb_version_hasprojid32bit(&ip->i_mount->m_sb))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Project Quota ID state is only allowed to change from within the init
++ 	 * namespace. Enforce that restriction only if we are trying to change
++ 	 * the quota ID state. Everything else is allowed in user namespaces.
++ 	 */
++ 	if (current_user_ns() == &init_user_ns)
++ 		return 0;
++ 
++ 	if (xfs_get_projid(ip) != fa->fsx_projid)
++ 		return -EINVAL;
++ 	if ((fa->fsx_xflags & XFS_XFLAG_PROJINHERIT) !=
++ 	    (ip->i_d.di_flags & XFS_DIFLAG_PROJINHERIT))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
+++>>>>>>> f92090e95cd2 (xfs: xfs_ioctl_setattr_check_projid can be static)
+  
+  STATIC int
+  xfs_ioctl_setattr(
+* Unmerged path fs/xfs/xfs_ioctl.c
