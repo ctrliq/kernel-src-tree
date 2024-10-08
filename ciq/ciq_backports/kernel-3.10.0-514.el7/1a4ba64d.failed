@@ -1,0 +1,147 @@
+netfilter: bridge: use rcu hook to resolve br_netfilter dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 1a4ba64d16a42c1b31d52b671accd7f9103e2626
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1a4ba64d.failed
+
+e5de75b ("netfilter: bridge: move DNAT helper to br_netfilter") results
+in the following link problem:
+
+net/bridge/br_device.c:29: undefined reference to `br_nf_prerouting_finish_bridge`
+
+Moreover it creates a hard dependency between br_netfilter and the
+bridge core, which is what we've been trying to avoid so far.
+
+Resolve this problem by using a hook structure so we reduce #ifdef
+pollution and keep bridge netfilter specific code under br_netfilter.c
+which was the original intention.
+
+	Reported-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 1a4ba64d16a42c1b31d52b671accd7f9103e2626)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_device.c
+#	net/bridge/br_netfilter.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_device.c
+index 5e3347b02745,4ff77a16956c..000000000000
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@@ -36,9 -40,8 +40,14 @@@ netdev_tx_t br_dev_xmit(struct sk_buff 
+  	u16 vid = 0;
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
+ +		br_nf_pre_routing_finish_bridge_slow(skb);
+++=======
++ 	nf_ops = rcu_dereference(nf_br_ops);
++ 	if (nf_ops && nf_ops->br_dev_xmit_hook(skb)) {
+++>>>>>>> 1a4ba64d16a4 (netfilter: bridge: use rcu hook to resolve br_netfilter dependency)
+  		rcu_read_unlock();
+  		return NETDEV_TX_OK;
+  	}
+diff --cc net/bridge/br_netfilter.c
+index d354bf857875,b260a97275db..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -908,6 -892,41 +908,44 @@@ static unsigned int ip_sabotage_in(cons
+  	return NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This is called when br_netfilter has called into iptables/netfilter,
++  * and DNAT has taken place on a bridge-forwarded packet.
++  *
++  * neigh->output has created a new MAC header, with local br0 MAC
++  * as saddr.
++  *
++  * This restores the original MAC saddr of the bridged packet
++  * before invoking bridge forward logic to transmit the packet.
++  */
++ static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
++ {
++ 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
++ 
++ 	skb_pull(skb, ETH_HLEN);
++ 	nf_bridge->mask &= ~BRNF_BRIDGED_DNAT;
++ 
++ 	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN-ETH_ALEN),
++ 				       skb->nf_bridge->data, ETH_HLEN-ETH_ALEN);
++ 	skb->dev = nf_bridge->physindev;
++ 	br_handle_frame_finish(skb);
++ }
++ 
++ static int br_nf_dev_xmit(struct sk_buff *skb)
++ {
++ 	if (skb->nf_bridge && (skb->nf_bridge->mask & BRNF_BRIDGED_DNAT)) {
++ 		br_nf_pre_routing_finish_bridge_slow(skb);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static const struct nf_br_ops br_ops = {
++ 	.br_dev_xmit_hook =	br_nf_dev_xmit,
++ };
++ 
+++>>>>>>> 1a4ba64d16a4 (netfilter: bridge: use rcu hook to resolve br_netfilter dependency)
+  void br_netfilter_enable(void)
+  {
+  }
+@@@ -1055,8 -1069,9 +1094,9 @@@ int __init br_netfilter_init(void
+  	return 0;
+  }
+  
+ -static void __exit br_netfilter_fini(void)
+ +void br_netfilter_fini(void)
+  {
++ 	RCU_INIT_POINTER(nf_br_ops, NULL);
+  	nf_unregister_hooks(br_nf_ops, ARRAY_SIZE(br_nf_ops));
+  #ifdef CONFIG_SYSCTL
+  	unregister_net_sysctl_table(brnf_sysctl_header);
+diff --cc net/bridge/br_private.h
+index 42f63e0bc8cf,b46fa0c5b8ec..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -743,14 -763,19 +743,29 @@@ static inline int br_vlan_enabled(struc
+  }
+  #endif
+  
++ struct nf_br_ops {
++ 	int (*br_dev_xmit_hook)(struct sk_buff *skb);
++ };
++ extern const struct nf_br_ops __rcu *nf_br_ops;
++ 
+  /* br_netfilter.c */
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+ +int br_netfilter_init(void);
+ +void br_netfilter_fini(void);
+ +void br_netfilter_rtable_init(struct net_bridge *);
+ +#else
+ +#define br_netfilter_init()	(0)
+ +#define br_netfilter_fini()	do { } while(0)
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ int br_nf_core_init(void);
++ void br_nf_core_fini(void);
++ void br_netfilter_rtable_init(struct net_bridge *);
++ #else
++ static inline int br_nf_core_init(void) { return 0; }
++ static inline void br_nf_core_fini(void) {}
+++>>>>>>> 1a4ba64d16a4 (netfilter: bridge: use rcu hook to resolve br_netfilter dependency)
+  #define br_netfilter_rtable_init(x)
+  #endif
+  
+* Unmerged path net/bridge/br_device.c
+* Unmerged path net/bridge/br_netfilter.c
+* Unmerged path net/bridge/br_private.h
