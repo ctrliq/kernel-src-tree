@@ -1,0 +1,383 @@
+ip_tunnel: Ops registration for secondary encap (fou, gue)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit a8c5f90fb59a2d3bff0bd29adbb3e39fe0dd52f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/a8c5f90f.failed
+
+Instead of calling fou and gue functions directly from ip_tunnel
+use ops for these that were previously registered. This patch adds the
+logic to add and remove encapsulation operations for ip_tunnel,
+and modified fou (and gue) to register with ip_tunnels.
+
+This patch also addresses a circular dependency between ip_tunnel
+and fou that was causing link errors when CONFIG_NET_IP_TUNNEL=y
+and CONFIG_NET_FOU=m. References to fou an gue have been removed from
+ip_tunnel.c
+
+	Reported-by: Randy Dunlap <rdunlap@infradead.org>
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a8c5f90fb59a2d3bff0bd29adbb3e39fe0dd52f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fou.h
+#	net/ipv4/fou.c
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/fou.c
+index 606c520ffd5a,fe0907774ce8..000000000000
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@@ -489,6 -668,200 +489,203 @@@ static const struct genl_ops fou_nl_ops
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ size_t fou_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	return sizeof(struct udphdr);
++ }
++ EXPORT_SYMBOL(fou_encap_hlen);
++ 
++ size_t gue_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	size_t len;
++ 	bool need_priv = false;
++ 
++ 	len = sizeof(struct udphdr) + sizeof(struct guehdr);
++ 
++ 	if (e->flags & TUNNEL_ENCAP_FLAG_REMCSUM) {
++ 		len += GUE_PLEN_REMCSUM;
++ 		need_priv = true;
++ 	}
++ 
++ 	len += need_priv ? GUE_LEN_PRIV : 0;
++ 
++ 	return len;
++ }
++ EXPORT_SYMBOL(gue_encap_hlen);
++ 
++ static void fou_build_udp(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 			  struct flowi4 *fl4, u8 *protocol, __be16 sport)
++ {
++ 	struct udphdr *uh;
++ 
++ 	skb_push(skb, sizeof(struct udphdr));
++ 	skb_reset_transport_header(skb);
++ 
++ 	uh = udp_hdr(skb);
++ 
++ 	uh->dest = e->dport;
++ 	uh->source = sport;
++ 	uh->len = htons(skb->len);
++ 	uh->check = 0;
++ 	udp_set_csum(!(e->flags & TUNNEL_ENCAP_FLAG_CSUM), skb,
++ 		     fl4->saddr, fl4->daddr, skb->len);
++ 
++ 	*protocol = IPPROTO_UDP;
++ }
++ 
++ int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	__be16 sport;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(fou_build_header);
++ 
++ int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 		     u8 *protocol, struct flowi4 *fl4)
++ {
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 	struct guehdr *guehdr;
++ 	size_t hdrlen, optlen = 0;
++ 	__be16 sport;
++ 	void *data;
++ 	bool need_priv = false;
++ 
++ 	if ((e->flags & TUNNEL_ENCAP_FLAG_REMCSUM) &&
++ 	    skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		csum = false;
++ 		optlen += GUE_PLEN_REMCSUM;
++ 		type |= SKB_GSO_TUNNEL_REMCSUM;
++ 		need_priv = true;
++ 	}
++ 
++ 	optlen += need_priv ? GUE_LEN_PRIV : 0;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	/* Get source port (based on flow hash) before skb_push */
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 
++ 	hdrlen = sizeof(struct guehdr) + optlen;
++ 
++ 	skb_push(skb, hdrlen);
++ 
++ 	guehdr = (struct guehdr *)skb->data;
++ 
++ 	guehdr->control = 0;
++ 	guehdr->version = 0;
++ 	guehdr->hlen = optlen >> 2;
++ 	guehdr->flags = 0;
++ 	guehdr->proto_ctype = *protocol;
++ 
++ 	data = &guehdr[1];
++ 
++ 	if (need_priv) {
++ 		__be32 *flags = data;
++ 
++ 		guehdr->flags |= GUE_FLAG_PRIV;
++ 		*flags = 0;
++ 		data += GUE_LEN_PRIV;
++ 
++ 		if (type & SKB_GSO_TUNNEL_REMCSUM) {
++ 			u16 csum_start = skb_checksum_start_offset(skb);
++ 			__be16 *pd = data;
++ 
++ 			if (csum_start < hdrlen)
++ 				return -EINVAL;
++ 
++ 			csum_start -= hdrlen;
++ 			pd[0] = htons(csum_start);
++ 			pd[1] = htons(csum_start + skb->csum_offset);
++ 
++ 			if (!skb_is_gso(skb)) {
++ 				skb->ip_summed = CHECKSUM_NONE;
++ 				skb->encapsulation = 0;
++ 			}
++ 
++ 			*flags |= GUE_PFLAG_REMCSUM;
++ 			data += GUE_PLEN_REMCSUM;
++ 		}
++ 
++ 	}
++ 
++ 	fou_build_udp(skb, e, fl4, protocol, sport);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(gue_build_header);
++ 
++ #ifdef CONFIG_NET_FOU_IP_TUNNELS
++ 
++ static const struct ip_tunnel_encap_ops __read_mostly fou_iptun_ops = {
++ 	.encap_hlen = fou_encap_hlen,
++ 	.build_header = fou_build_header,
++ };
++ 
++ static const struct ip_tunnel_encap_ops __read_mostly gue_iptun_ops = {
++ 	.encap_hlen = gue_encap_hlen,
++ 	.build_header = gue_build_header,
++ };
++ 
++ static int ip_tunnel_encap_add_fou_ops(void)
++ {
++ 	int ret;
++ 
++ 	ret = ip_tunnel_encap_add_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 	if (ret < 0) {
++ 		pr_err("can't add fou ops\n");
++ 		return ret;
++ 	}
++ 
++ 	ret = ip_tunnel_encap_add_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
++ 	if (ret < 0) {
++ 		pr_err("can't add gue ops\n");
++ 		ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ip_tunnel_encap_del_fou_ops(void)
++ {
++ 	ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
++ 	ip_tunnel_encap_del_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
++ }
++ 
++ #else
++ 
++ static int ip_tunnel_encap_add_fou_ops(void)
++ {
++ 	return 0;
++ }
++ 
++ static int ip_tunnel_encap_del_fou_ops(void)
++ {
++ }
++ 
++ #endif
++ 
+++>>>>>>> a8c5f90fb59a (ip_tunnel: Ops registration for secondary encap (fou, gue))
+  static int __init fou_init(void)
+  {
+  	int ret;
+diff --cc net/ipv4/ip_tunnel.c
+index 1129aec53c2c,63e745aadab6..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -54,6 -55,7 +54,10 @@@
+  #include <net/net_namespace.h>
+  #include <net/netns/generic.h>
+  #include <net/rtnetlink.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/udp.h>
+++>>>>>>> a8c5f90fb59a (ip_tunnel: Ops registration for secondary encap (fou, gue))
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+  #include <net/ipv6.h>
+@@@ -479,6 -488,95 +483,98 @@@ drop
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_rcv);
+  
+++<<<<<<< HEAD
+++=======
++ static int ip_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	const struct ip_tunnel_encap_ops *ops;
++ 	int hlen = -EINVAL;
++ 
++ 	if (e->type == TUNNEL_ENCAP_NONE)
++ 		return 0;
++ 
++ 	if (e->type >= MAX_IPTUN_ENCAP_OPS)
++ 		return -EINVAL;
++ 
++ 	rcu_read_lock();
++ 	ops = rcu_dereference(iptun_encaps[e->type]);
++ 	if (likely(ops && ops->encap_hlen))
++ 		hlen = ops->encap_hlen(e);
++ 	rcu_read_unlock();
++ 
++ 	return hlen;
++ }
++ 
++ const struct ip_tunnel_encap_ops __rcu *
++ 		iptun_encaps[MAX_IPTUN_ENCAP_OPS] __read_mostly;
++ 
++ int ip_tunnel_encap_add_ops(const struct ip_tunnel_encap_ops *ops,
++ 			    unsigned int num)
++ {
++ 	return !cmpxchg((const struct ip_tunnel_encap_ops **)
++ 			&iptun_encaps[num],
++ 			NULL, ops) ? 0 : -1;
++ }
++ EXPORT_SYMBOL(ip_tunnel_encap_add_ops);
++ 
++ int ip_tunnel_encap_del_ops(const struct ip_tunnel_encap_ops *ops,
++ 			    unsigned int num)
++ {
++ 	int ret;
++ 
++ 	ret = (cmpxchg((const struct ip_tunnel_encap_ops **)
++ 		       &iptun_encaps[num],
++ 		       ops, NULL) == ops) ? 0 : -1;
++ 
++ 	synchronize_net();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(ip_tunnel_encap_del_ops);
++ 
++ int ip_tunnel_encap_setup(struct ip_tunnel *t,
++ 			  struct ip_tunnel_encap *ipencap)
++ {
++ 	int hlen;
++ 
++ 	memset(&t->encap, 0, sizeof(t->encap));
++ 
++ 	hlen = ip_encap_hlen(ipencap);
++ 	if (hlen < 0)
++ 		return hlen;
++ 
++ 	t->encap.type = ipencap->type;
++ 	t->encap.sport = ipencap->sport;
++ 	t->encap.dport = ipencap->dport;
++ 	t->encap.flags = ipencap->flags;
++ 
++ 	t->encap_hlen = hlen;
++ 	t->hlen = t->encap_hlen + t->tun_hlen;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_encap_setup);
++ 
++ int ip_tunnel_encap(struct sk_buff *skb, struct ip_tunnel *t,
++ 		    u8 *protocol, struct flowi4 *fl4)
++ {
++ 	const struct ip_tunnel_encap_ops *ops;
++ 	int ret = -EINVAL;
++ 
++ 	if (t->encap.type == TUNNEL_ENCAP_NONE)
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	ops = rcu_dereference(iptun_encaps[t->encap.type]);
++ 	if (likely(ops && ops->build_header))
++ 		ret = ops->build_header(skb, &t->encap, protocol, fl4);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(ip_tunnel_encap);
++ 
+++>>>>>>> a8c5f90fb59a (ip_tunnel: Ops registration for secondary encap (fou, gue))
+  static int tnl_update_pmtu(struct net_device *dev, struct sk_buff *skb,
+  			    struct rtable *rt, __be16 df)
+  {
+* Unmerged path include/net/fou.h
+* Unmerged path include/net/fou.h
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 8d95b01ba42b..1565d811589e 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -106,6 +106,22 @@ struct ip_tunnel_net {
+ 	struct hlist_head tunnels[IP_TNL_HASH_SIZE];
+ };
+ 
++struct ip_tunnel_encap_ops {
++	size_t (*encap_hlen)(struct ip_tunnel_encap *e);
++	int (*build_header)(struct sk_buff *skb, struct ip_tunnel_encap *e,
++			    u8 *protocol, struct flowi4 *fl4);
++};
++
++#define MAX_IPTUN_ENCAP_OPS 8
++
++extern const struct ip_tunnel_encap_ops __rcu *
++		iptun_encaps[MAX_IPTUN_ENCAP_OPS];
++
++int ip_tunnel_encap_add_ops(const struct ip_tunnel_encap_ops *op,
++			    unsigned int num);
++int ip_tunnel_encap_del_ops(const struct ip_tunnel_encap_ops *op,
++			    unsigned int num);
++
+ #ifdef CONFIG_INET
+ 
+ int ip_tunnel_init(struct net_device *dev);
+* Unmerged path net/ipv4/fou.c
+* Unmerged path net/ipv4/ip_tunnel.c
