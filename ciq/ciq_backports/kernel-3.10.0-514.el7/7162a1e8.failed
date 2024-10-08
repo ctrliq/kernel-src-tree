@@ -1,0 +1,87 @@
+mm: fix mlock accouting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] fix mlock accouting (Hendrik Brueckner) [1334242]
+Rebuild_FUZZ: 90.48%
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 7162a1e87b3e380133dadc7909081bb70d0a7041
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7162a1e8.failed
+
+Tetsuo Handa reported underflow of NR_MLOCK on munlock.
+
+Testcase:
+
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <sys/mman.h>
+
+    #define BASE ((void *)0x400000000000)
+    #define SIZE (1UL << 21)
+
+    int main(int argc, char *argv[])
+    {
+        void *addr;
+
+        system("grep Mlocked /proc/meminfo");
+        addr = mmap(BASE, SIZE, PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE | MAP_LOCKED | MAP_FIXED,
+                -1, 0);
+        if (addr == MAP_FAILED)
+            printf("mmap() failed\n"), exit(1);
+        munmap(addr, SIZE);
+        system("grep Mlocked /proc/meminfo");
+        return 0;
+    }
+
+It happens on munlock_vma_page() due to unfortunate choice of nr_pages
+data type:
+
+    __mod_zone_page_state(zone, NR_MLOCK, -nr_pages);
+
+For unsigned int nr_pages, implicitly casted to long in
+__mod_zone_page_state(), it becomes something around UINT_MAX.
+
+munlock_vma_page() usually called for THP as small pages go though
+pagevec.
+
+Let's make nr_pages signed int.
+
+Similar fixes in 6cdb18ad98a4 ("mm/vmstat: fix overflow in
+mod_zone_page_state()") used `long' type, but `int' here is OK for a
+count of the number of sub-pages in a huge page.
+
+Fixes: ff6a6da60b89 ("mm: accelerate munlock() treatment of THP pages")
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Tested-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Michel Lespinasse <walken@google.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: <stable@vger.kernel.org>  [4.4+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7162a1e87b3e380133dadc7909081bb70d0a7041)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mlock.c
+diff --cc mm/mlock.c
+index cd6ffab75dd7,96f001041928..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -105,7 -175,8 +105,12 @@@ void mlock_vma_page(struct page *page
+   */
+  unsigned int munlock_vma_page(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	unsigned int page_mask = 0;
+++=======
++ 	int nr_pages;
++ 	struct zone *zone = page_zone(page);
+++>>>>>>> 7162a1e87b3e (mm: fix mlock accouting)
+  
+  	/* For try_to_munlock() and to serialize with page migration */
+  	BUG_ON(!PageLocked(page));
+* Unmerged path mm/mlock.c
