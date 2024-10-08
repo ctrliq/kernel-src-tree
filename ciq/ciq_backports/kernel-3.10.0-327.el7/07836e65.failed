@@ -1,0 +1,229 @@
+NVMe: Fix potential corruption during shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 07836e659c81ec6b0d683dfbf7958339a22a7b69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/07836e65.failed
+
+The driver has to end unreturned commands at some point even if the
+controller has not provided a completion. The driver tried to be safe by
+deleting IO queues prior to ending all unreturned commands. That should
+cause the controller to internally abort inflight commands, but IO queue
+deletion request does not have to be successful, so all bets are off. We
+still have to make progress, so to be extra safe, this patch doesn't
+clear a queue to release the dma mapping for a command until after the
+pci device has been disabled.
+
+This patch removes the special handling during device initialization
+so controller recovery can be done all the time. This is possible since
+initialization is not inlined with pci probe anymore.
+
+	Reported-by: Nilish Choudhury <nilesh.choudhury@oracle.com>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit 07836e659c81ec6b0d683dfbf7958339a22a7b69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 4365f3348321,0f388206b15b..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -1285,26 -1240,56 +1285,77 @@@ static void nvme_cancel_ios(struct nvme
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_cancel_queue_ios(struct blk_mq_hw_ctx *hctx,
++ 				struct request *req, void *data, bool reserved)
++ {
++ 	struct nvme_queue *nvmeq = data;
++ 	void *ctx;
++ 	nvme_completion_fn fn;
++ 	struct nvme_cmd_info *cmd;
++ 	struct nvme_completion cqe;
++ 
++ 	if (!blk_mq_request_started(req))
++ 		return;
++ 
++ 	cmd = blk_mq_rq_to_pdu(req);
++ 
++ 	if (cmd->ctx == CMD_CTX_CANCELLED)
++ 		return;
++ 
++ 	if (blk_queue_dying(req->q))
++ 		cqe.status = cpu_to_le16((NVME_SC_ABORT_REQ | NVME_SC_DNR) << 1);
++ 	else
++ 		cqe.status = cpu_to_le16(NVME_SC_ABORT_REQ << 1);
++ 
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Cancelling I/O %d QID %d\n",
++ 						req->tag, nvmeq->qid);
++ 	ctx = cancel_cmd_info(cmd, &fn);
++ 	fn(nvmeq, ctx, &cqe);
++ }
++ 
++ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
++ {
++ 	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
++ 	struct nvme_queue *nvmeq = cmd->nvmeq;
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Timeout I/O %d QID %d\n", req->tag,
++ 							nvmeq->qid);
++ 	spin_lock_irq(&nvmeq->q_lock);
++ 	nvme_abort_req(req);
++ 	spin_unlock_irq(&nvmeq->q_lock);
++ 
++ 	/*
++ 	 * The aborted req will be completed on receiving the abort req.
++ 	 * We enable the timer again. If hit twice, it'll cause a device reset,
++ 	 * as the device then is in a faulty state.
++ 	 */
++ 	return BLK_EH_RESET_TIMER;
++ }
++ 
+++>>>>>>> 07836e659c81 (NVMe: Fix potential corruption during shutdown)
+  static void nvme_free_queue(struct nvme_queue *nvmeq)
+  {
+ +	spin_lock_irq(&nvmeq->q_lock);
+ +	while (bio_list_peek(&nvmeq->sq_cong)) {
+ +		struct bio *bio = bio_list_pop(&nvmeq->sq_cong);
+ +		bio_endio(bio, -EIO);
+ +	}
+ +	while (!list_empty(&nvmeq->iod_bio)) {
+ +		static struct nvme_completion cqe = {
+ +			.status = cpu_to_le16(
+ +				(NVME_SC_ABORT_REQ | NVME_SC_DNR) << 1),
+ +		};
+ +		struct nvme_iod *iod = list_first_entry(&nvmeq->iod_bio,
+ +							struct nvme_iod,
+ +							node);
+ +		list_del(&iod->node);
+ +		bio_completion(nvmeq, iod, &cqe);
+ +	}
+ +	spin_unlock_irq(&nvmeq->q_lock);
+ +
+  	dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
+  				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
+  	dma_free_coherent(nvmeq->q_dmadev, SQ_SIZE(nvmeq->q_depth),
+@@@ -1360,9 -1335,11 +1411,14 @@@ static int nvme_suspend_queue(struct nv
+  
+  static void nvme_clear_queue(struct nvme_queue *nvmeq)
+  {
+ -	struct blk_mq_hw_ctx *hctx = nvmeq->hctx;
+ -
+  	spin_lock_irq(&nvmeq->q_lock);
+++<<<<<<< HEAD
+ +	nvme_process_cq(nvmeq);
+ +	nvme_cancel_ios(nvmeq, false);
+++=======
++ 	if (hctx && hctx->tags)
++ 		blk_mq_tag_busy_iter(hctx, nvme_cancel_queue_ios, nvmeq);
+++>>>>>>> 07836e659c81 (NVMe: Fix potential corruption during shutdown)
+  	spin_unlock_irq(&nvmeq->q_lock);
+  }
+  
+@@@ -1381,7 -1358,12 +1437,16 @@@ static void nvme_disable_queue(struct n
+  		adapter_delete_sq(dev, qid);
+  		adapter_delete_cq(dev, qid);
+  	}
+++<<<<<<< HEAD
+ +	nvme_clear_queue(nvmeq);
+++=======
++ 	if (!qid && dev->admin_q)
++ 		blk_mq_freeze_queue_start(dev->admin_q);
++ 
++ 	spin_lock_irq(&nvmeq->q_lock);
++ 	nvme_process_cq(nvmeq);
++ 	spin_unlock_irq(&nvmeq->q_lock);
+++>>>>>>> 07836e659c81 (NVMe: Fix potential corruption during shutdown)
+  }
+  
+  static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
+@@@ -2705,16 -2657,16 +2767,14 @@@ static void nvme_dev_shutdown(struct nv
+  	int i;
+  	u32 csts = -1;
+  
+- 	dev->initialized = 0;
+  	nvme_dev_list_remove(dev);
+  
+ -	if (dev->bar) {
+ -		nvme_freeze_queues(dev);
+ +	if (dev->bar)
+  		csts = readl(&dev->bar->csts);
+ -	}
+  	if (csts & NVME_CSTS_CFS || !(csts & NVME_CSTS_RDY)) {
+  		for (i = dev->queue_count - 1; i >= 0; i--) {
+ -			struct nvme_queue *nvmeq = dev->queues[i];
+ +			struct nvme_queue *nvmeq = raw_nvmeq(dev, i);
+  			nvme_suspend_queue(nvmeq);
+- 			nvme_clear_queue(nvmeq);
+  		}
+  	} else {
+  		nvme_disable_io_queues(dev);
+@@@ -2929,11 -2937,13 +2992,10 @@@ static int nvme_dev_resume(struct nvme_
+  		return ret;
+  	if (dev->online_queues < 2) {
+  		spin_lock(&dev_list_lock);
+ -		dev->reset_workfn = nvme_remove_disks;
+ +		PREPARE_WORK(&dev->reset_work, nvme_remove_disks);
+  		queue_work(nvme_workq, &dev->reset_work);
+  		spin_unlock(&dev_list_lock);
+ -	} else {
+ -		nvme_unfreeze_queues(dev);
+ -		nvme_set_irq_hints(dev);
+  	}
+- 	dev->initialized = 1;
+  	return 0;
+  }
+  
+@@@ -3033,6 -3036,29 +3095,32 @@@ static int nvme_probe(struct pci_dev *p
+  	return result;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_async_probe(struct work_struct *work)
++ {
++ 	struct nvme_dev *dev = container_of(work, struct nvme_dev, probe_work);
++ 	int result;
++ 
++ 	result = nvme_dev_start(dev);
++ 	if (result)
++ 		goto reset;
++ 
++ 	if (dev->online_queues > 1)
++ 		result = nvme_dev_add(dev);
++ 	if (result)
++ 		goto reset;
++ 
++ 	nvme_set_irq_hints(dev);
++ 	return;
++  reset:
++ 	if (!work_busy(&dev->reset_work)) {
++ 		dev->reset_workfn = nvme_reset_failed_dev;
++ 		queue_work(nvme_workq, &dev->reset_work);
++ 	}
++ }
++ 
+++>>>>>>> 07836e659c81 (NVMe: Fix potential corruption during shutdown)
+  static void nvme_reset_notify(struct pci_dev *pdev, bool prepare)
+  {
+  	struct nvme_dev *dev = pci_get_drvdata(pdev);
+* Unmerged path drivers/block/nvme-core.c
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index 0ee15565532d..65a7939d6ec5 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -98,7 +98,6 @@ struct nvme_dev {
+ 	u16 abort_limit;
+ 	u8 event_limit;
+ 	u8 vwc;
+-	u8 initialized;
+ };
+ 
+ /*
