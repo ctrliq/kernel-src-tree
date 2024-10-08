@@ -895,7 +895,7 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type,
 
 	host_err = ima_file_check(file, may_flags);
 	if (host_err) {
-		nfsd_close(file);
+		fput(file);
 		goto out_nfserr;
 	}
 
@@ -910,15 +910,6 @@ out_nfserr:
 out:
 	validate_process_creds();
 	return err;
-}
-
-/*
- * Close a file.
- */
-void
-nfsd_close(struct file *filp)
-{
-	fput(filp);
 }
 
 /*
@@ -1191,7 +1182,7 @@ void nfsd_put_tmp_read_open(struct file *file, struct raparms *ra)
 		ra->p_count--;
 		spin_unlock(&rab->pb_lock);
 	}
-	nfsd_close(file);
+	fput(file);
 }
 
 /*
@@ -1244,7 +1235,7 @@ nfsd_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
 		if (cnt)
 			err = nfsd_vfs_write(rqstp, fhp, file, offset, vec, vlen,
 					     cnt, stablep);
-		nfsd_close(file);
+		fput(file);
 	}
 out:
 	return err;
@@ -1289,7 +1280,7 @@ nfsd_commit(struct svc_rqst *rqstp, struct svc_fh *fhp,
 			err = nfserr_notsupp;
 	}
 
-	nfsd_close(file);
+	fput(file);
 out:
 	return err;
 }
@@ -2123,7 +2114,7 @@ nfsd_readdir(struct svc_rqst *rqstp, struct svc_fh *fhp, loff_t *offsetp,
 	if (err == nfserr_eof || err == nfserr_toosmall)
 		err = nfs_ok; /* can still be found in ->err */
 out_close:
-	nfsd_close(file);
+	fput(file);
 out:
 	return err;
 }
