@@ -6931,7 +6931,7 @@ static int _nfs4_proc_exchange_id(struct nfs_client *clp, struct rpc_cred *cred,
 		/* unsupported! */
 		WARN_ON_ONCE(1);
 		status = -EINVAL;
-		goto out_server_scope;
+		goto out_impl_id;
 	}
 
 	status = rpc_call_sync(clp->cl_rpcclient, &msg, RPC_TASK_TIMEOUT);
@@ -6959,6 +6959,7 @@ static int _nfs4_proc_exchange_id(struct nfs_client *clp, struct rpc_cred *cred,
 		/* use the most recent implementation id */
 		kfree(clp->cl_implid);
 		clp->cl_implid = res.impl_id;
+		res.impl_id = NULL;
 
 		if (clp->cl_serverscope != NULL &&
 		    !nfs41_same_server_scope(clp->cl_serverscope,
@@ -6972,15 +6973,16 @@ static int _nfs4_proc_exchange_id(struct nfs_client *clp, struct rpc_cred *cred,
 
 		if (clp->cl_serverscope == NULL) {
 			clp->cl_serverscope = res.server_scope;
-			goto out;
+			res.server_scope = NULL;
 		}
-	} else
-		kfree(res.impl_id);
+	}
 
-out_server_owner:
-	kfree(res.server_owner);
+out_impl_id:
+	kfree(res.impl_id);
 out_server_scope:
 	kfree(res.server_scope);
+out_server_owner:
+	kfree(res.server_owner);
 out:
 	if (clp->cl_implid != NULL)
 		dprintk("NFS reply exchange_id: Server Implementation ID: "
