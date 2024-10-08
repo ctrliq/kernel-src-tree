@@ -1,0 +1,644 @@
+mm: remove remaining references to NUMA hinting bits and helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [mm] remove remaining references to NUMA hinting bits and helpers (Gustavo Duarte) [1217743]
+Rebuild_FUZZ: 96.77%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 21d9ee3eda7792c45880b2f11bff8e95c9a061fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/21d9ee3e.failed
+
+This patch removes the NUMA PTE bits and associated helpers.  As a
+side-effect it increases the maximum possible swap space on x86-64.
+
+One potential source of problems is races between the marking of PTEs
+PROT_NONE, NUMA hinting faults and migration.  It must be guaranteed that
+a PTE being protected is not faulted in parallel, seen as a pte_none and
+corrupting memory.  The base case is safe but transhuge has problems in
+the past due to an different migration mechanism and a dependance on page
+lock to serialise migrations and warrants a closer look.
+
+task_work hinting update			parallel fault
+------------------------			--------------
+change_pmd_range
+  change_huge_pmd
+    __pmd_trans_huge_lock
+      pmdp_get_and_clear
+						__handle_mm_fault
+						pmd_none
+						  do_huge_pmd_anonymous_page
+						  read? pmd_lock blocks until hinting complete, fail !pmd_none test
+						  write? __do_huge_pmd_anonymous_page acquires pmd_lock, checks pmd_none
+      pmd_modify
+      set_pmd_at
+
+task_work hinting update			parallel migration
+------------------------			------------------
+change_pmd_range
+  change_huge_pmd
+    __pmd_trans_huge_lock
+      pmdp_get_and_clear
+						__handle_mm_fault
+						  do_huge_pmd_numa_page
+						    migrate_misplaced_transhuge_page
+						    pmd_lock waits for updates to complete, recheck pmd_same
+      pmd_modify
+      set_pmd_at
+
+Both of those are safe and the case where a transhuge page is inserted
+during a protection update is unchanged.  The case where two processes try
+migrating at the same time is unchanged by this series so should still be
+ok.  I could not find a case where we are accidentally depending on the
+PTE not being cleared and flushed.  If one is missed, it'll manifest as
+corruption problems that start triggering shortly after this series is
+merged and only happen when NUMA balancing is enabled.
+
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Tested-by: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Dave Jones <davej@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Mark Brown <broonie@kernel.org>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 21d9ee3eda7792c45880b2f11bff8e95c9a061fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/pgtable.h
+#	arch/x86/include/asm/pgtable.h
+#	arch/x86/include/asm/pgtable_64.h
+#	arch/x86/include/asm/pgtable_types.h
+#	include/asm-generic/pgtable.h
+#	include/linux/swapops.h
+diff --cc arch/powerpc/include/asm/pgtable.h
+index 4fbc04254e64,79fee2eb8d56..000000000000
+--- a/arch/powerpc/include/asm/pgtable.h
++++ b/arch/powerpc/include/asm/pgtable.h
+@@@ -38,84 -40,22 +38,103 @@@ static inline int pte_none(pte_t pte)		
+  static inline pgprot_t pte_pgprot(pte_t pte)	{ return __pgprot(pte_val(pte) & PAGE_PROT_BITS); }
+  
+  #ifdef CONFIG_NUMA_BALANCING
+++<<<<<<< HEAD
+ +
+ +static inline int pte_present(pte_t pte)
+ +{
+ +	return pte_val(pte) & (_PAGE_PRESENT | _PAGE_NUMA);
+ +}
+ +
+ +#define pte_numa pte_numa
+ +static inline int pte_numa(pte_t pte)
+ +{
+ +	return (pte_val(pte) &
+ +		(_PAGE_NUMA|_PAGE_PRESENT)) == _PAGE_NUMA;
+ +}
+ +
+ +#define pte_mknonnuma pte_mknonnuma
+ +static inline pte_t pte_mknonnuma(pte_t pte)
+ +{
+ +	pte_val(pte) &= ~_PAGE_NUMA;
+ +	pte_val(pte) |=  _PAGE_PRESENT | _PAGE_ACCESSED;
+ +	return pte;
+ +}
+ +
+ +#define pte_mknuma pte_mknuma
+ +static inline pte_t pte_mknuma(pte_t pte)
+ +{
+ +	/*
+ +	 * We should not set _PAGE_NUMA on non present ptes. Also clear the
+ +	 * present bit so that hash_page will return 1 and we collect this
+ +	 * as numa fault.
+ +	 */
+ +	if (pte_present(pte)) {
+ +		pte_val(pte) |= _PAGE_NUMA;
+ +		pte_val(pte) &= ~_PAGE_PRESENT;
+ +	} else
+ +		VM_BUG_ON(1);
+ +	return pte;
+ +}
+ +
+ +#define ptep_set_numa ptep_set_numa
+ +static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pte_t *ptep)
+ +{
+ +	if ((pte_val(*ptep) & _PAGE_PRESENT) == 0)
+ +		VM_BUG_ON(1);
+ +
+ +	pte_update(mm, addr, ptep, _PAGE_PRESENT, _PAGE_NUMA, 0);
+ +	return;
+ +}
+ +
+ +#define pmd_numa pmd_numa
+ +static inline int pmd_numa(pmd_t pmd)
+ +{
+ +	return pte_numa(pmd_pte(pmd));
+ +}
+ +
+ +#define pmdp_set_numa pmdp_set_numa
+ +static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pmd_t *pmdp)
+ +{
+ +	if ((pmd_val(*pmdp) & _PAGE_PRESENT) == 0)
+ +		VM_BUG_ON(1);
+ +
+ +	pmd_hugepage_update(mm, addr, pmdp, _PAGE_PRESENT, _PAGE_NUMA);
+ +	return;
+ +}
+ +
+ +#define pmd_mknonnuma pmd_mknonnuma
+ +static inline pmd_t pmd_mknonnuma(pmd_t pmd)
+ +{
+ +	return pte_pmd(pte_mknonnuma(pmd_pte(pmd)));
+ +}
+ +
+ +#define pmd_mknuma pmd_mknuma
+ +static inline pmd_t pmd_mknuma(pmd_t pmd)
+ +{
+ +	return pte_pmd(pte_mknuma(pmd_pte(pmd)));
+ +}
+ +
+ +# else
+++=======
++ /*
++  * These work without NUMA balancing but the kernel does not care. See the
++  * comment in include/asm-generic/pgtable.h . On powerpc, this will only
++  * work for user pages and always return true for kernel pages.
++  */
++ static inline int pte_protnone(pte_t pte)
++ {
++ 	return (pte_val(pte) &
++ 		(_PAGE_PRESENT | _PAGE_USER)) == _PAGE_PRESENT;
++ }
++ 
++ static inline int pmd_protnone(pmd_t pmd)
++ {
++ 	return pte_protnone(pmd_pte(pmd));
++ }
++ #endif /* CONFIG_NUMA_BALANCING */
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  
+  static inline int pte_present(pte_t pte)
+  {
+diff --cc arch/x86/include/asm/pgtable.h
+index baa6c1dd0ecb,34d42a7d5595..000000000000
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@@ -292,9 -300,32 +292,9 @@@ static inline pmd_t pmd_mkwrite(pmd_t p
+  
+  static inline pmd_t pmd_mknotpresent(pmd_t pmd)
+  {
+- 	return pmd_clear_flags(pmd, _PAGE_PRESENT);
++ 	return pmd_clear_flags(pmd, _PAGE_PRESENT | _PAGE_PROTNONE);
+  }
+  
+ -#ifdef CONFIG_HAVE_ARCH_SOFT_DIRTY
+ -static inline int pte_soft_dirty(pte_t pte)
+ -{
+ -	return pte_flags(pte) & _PAGE_SOFT_DIRTY;
+ -}
+ -
+ -static inline int pmd_soft_dirty(pmd_t pmd)
+ -{
+ -	return pmd_flags(pmd) & _PAGE_SOFT_DIRTY;
+ -}
+ -
+ -static inline pte_t pte_mksoft_dirty(pte_t pte)
+ -{
+ -	return pte_set_flags(pte, _PAGE_SOFT_DIRTY);
+ -}
+ -
+ -static inline pmd_t pmd_mksoft_dirty(pmd_t pmd)
+ -{
+ -	return pmd_set_flags(pmd, _PAGE_SOFT_DIRTY);
+ -}
+ -
+ -#endif /* CONFIG_HAVE_ARCH_SOFT_DIRTY */
+ -
+  /*
+   * Mask out unsupported bits in a present pgprot.  Non-present pgprots
+   * can use those bits for other purposes, so leave them be.
+@@@ -411,8 -443,7 +411,12 @@@ static inline int pte_same(pte_t a, pte
+  
+  static inline int pte_present(pte_t a)
+  {
+++<<<<<<< HEAD
+ +	return pte_flags(a) & (_PAGE_PRESENT | _PAGE_PROTNONE |
+ +			       _PAGE_NUMA);
+++=======
++ 	return pte_flags(a) & (_PAGE_PRESENT | _PAGE_PROTNONE);
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  }
+  
+  #define pte_accessible pte_accessible
+@@@ -421,8 -452,8 +425,13 @@@ static inline bool pte_accessible(struc
+  	if (pte_flags(a) & _PAGE_PRESENT)
+  		return true;
+  
+++<<<<<<< HEAD
+ +	if ((pte_flags(a) & (_PAGE_PROTNONE | _PAGE_NUMA)) &&
+ +			tlb_flush_pending(mm))
+++=======
++ 	if ((pte_flags(a) & _PAGE_PROTNONE) &&
++ 			mm_tlb_flush_pending(mm))
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  		return true;
+  
+  	return false;
+@@@ -441,10 -472,25 +450,9 @@@ static inline int pmd_present(pmd_t pmd
+  	 * the _PAGE_PSE flag will remain set at all times while the
+  	 * _PAGE_PRESENT bit is clear).
+  	 */
+- 	return pmd_flags(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_PSE |
+- 				 _PAGE_NUMA);
++ 	return pmd_flags(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_PSE);
+  }
+  
+ -#ifdef CONFIG_NUMA_BALANCING
+ -/*
+ - * These work without NUMA balancing but the kernel does not care. See the
+ - * comment in include/asm-generic/pgtable.h
+ - */
+ -static inline int pte_protnone(pte_t pte)
+ -{
+ -	return pte_flags(pte) & _PAGE_PROTNONE;
+ -}
+ -
+ -static inline int pmd_protnone(pmd_t pmd)
+ -{
+ -	return pmd_flags(pmd) & _PAGE_PROTNONE;
+ -}
+ -#endif /* CONFIG_NUMA_BALANCING */
+ -
+  static inline int pmd_none(pmd_t pmd)
+  {
+  	/* Only check low word on 32-bit platforms, since it might be
+@@@ -824,6 -862,23 +827,26 @@@ static inline void update_mmu_cache_pmd
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_HAVE_ARCH_SOFT_DIRTY
++ static inline pte_t pte_swp_mksoft_dirty(pte_t pte)
++ {
++ 	return pte_set_flags(pte, _PAGE_SWP_SOFT_DIRTY);
++ }
++ 
++ static inline int pte_swp_soft_dirty(pte_t pte)
++ {
++ 	return pte_flags(pte) & _PAGE_SWP_SOFT_DIRTY;
++ }
++ 
++ static inline pte_t pte_swp_clear_soft_dirty(pte_t pte)
++ {
++ 	return pte_clear_flags(pte, _PAGE_SWP_SOFT_DIRTY);
++ }
++ #endif
++ 
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  #include <asm-generic/pgtable.h>
+  #endif	/* __ASSEMBLY__ */
+  
+diff --cc arch/x86/include/asm/pgtable_64.h
+index d117450cea6b,2ee781114d34..000000000000
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@@ -151,13 -141,8 +151,18 @@@ static inline int pgd_large(pgd_t pgd) 
+  #define pte_unmap(pte) ((void)(pte))/* NOP */
+  
+  /* Encode and de-code a swap entry */
+++<<<<<<< HEAD
+ +#if _PAGE_BIT_FILE < _PAGE_BIT_PROTNONE
+ +#define SWP_TYPE_BITS (_PAGE_BIT_FILE - _PAGE_BIT_PRESENT - 1)
+ +#define SWP_OFFSET_SHIFT (_PAGE_BIT_PROTNONE + 1)
+ +#else
+ +#define SWP_TYPE_BITS (_PAGE_BIT_PROTNONE - _PAGE_BIT_PRESENT - 1)
+ +#define SWP_OFFSET_SHIFT (_PAGE_BIT_FILE + 1)
+ +#endif
+++=======
++ #define SWP_TYPE_BITS 5
++ #define SWP_OFFSET_SHIFT (_PAGE_BIT_PROTNONE + 1)
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  
+  #define MAX_SWAPFILES_CHECK() BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > SWP_TYPE_BITS)
+  
+diff --cc arch/x86/include/asm/pgtable_types.h
+index 35216aeb100f,8c7c10802e9c..000000000000
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@@ -57,6 -55,34 +57,37 @@@
+  #define _PAGE_HIDDEN	(_AT(pteval_t, 0))
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The same hidden bit is used by kmemcheck, but since kmemcheck
++  * works on kernel pages while soft-dirty engine on user space,
++  * they do not conflict with each other.
++  */
++ 
++ #ifdef CONFIG_MEM_SOFT_DIRTY
++ #define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_SOFT_DIRTY)
++ #else
++ #define _PAGE_SOFT_DIRTY	(_AT(pteval_t, 0))
++ #endif
++ 
++ /*
++  * Tracking soft dirty bit when a page goes to a swap is tricky.
++  * We need a bit which can be stored in pte _and_ not conflict
++  * with swap entry format. On x86 bits 6 and 7 are *not* involved
++  * into swap entry computation, but bit 6 is used for nonlinear
++  * file mapping, so we borrow bit 7 for soft dirty tracking.
++  *
++  * Please note that this bit must be treated as swap dirty page
++  * mark if and only if the PTE has present bit clear!
++  */
++ #ifdef CONFIG_MEM_SOFT_DIRTY
++ #define _PAGE_SWP_SOFT_DIRTY	_PAGE_PSE
++ #else
++ #define _PAGE_SWP_SOFT_DIRTY	(_AT(pteval_t, 0))
++ #endif
++ 
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  #if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+  #define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
+  #else
+@@@ -94,14 -99,31 +125,18 @@@
+  /* Set of bits not changed in pte_modify */
+  #define _PAGE_CHG_MASK	(PTE_PFN_MASK | _PAGE_PCD | _PAGE_PWT |		\
+  			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY |	\
+++<<<<<<< HEAD
+ +			 _PAGE_SOFTDIRTY)
+++=======
++ 			 _PAGE_SOFT_DIRTY)
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  #define _HPAGE_CHG_MASK (_PAGE_CHG_MASK | _PAGE_PSE)
+  
+ -/*
+ - * The cache modes defined here are used to translate between pure SW usage
+ - * and the HW defined cache mode bits and/or PAT entries.
+ - *
+ - * The resulting bits for PWT, PCD and PAT should be chosen in a way
+ - * to have the WB mode at index 0 (all bits clear). This is the default
+ - * right now and likely would break too much if changed.
+ - */
+ -#ifndef __ASSEMBLY__
+ -enum page_cache_mode {
+ -	_PAGE_CACHE_MODE_WB = 0,
+ -	_PAGE_CACHE_MODE_WC = 1,
+ -	_PAGE_CACHE_MODE_UC_MINUS = 2,
+ -	_PAGE_CACHE_MODE_UC = 3,
+ -	_PAGE_CACHE_MODE_WT = 4,
+ -	_PAGE_CACHE_MODE_WP = 5,
+ -	_PAGE_CACHE_MODE_NUM = 8
+ -};
+ -#endif
+ -
+ -#define _PAGE_CACHE_MASK	(_PAGE_PAT | _PAGE_PCD | _PAGE_PWT)
+ -#define _PAGE_NOCACHE		(cachemode2protval(_PAGE_CACHE_MODE_UC))
+ +#define _PAGE_CACHE_MASK	(_PAGE_PCD | _PAGE_PWT)
+ +#define _PAGE_CACHE_WB		(0)
+ +#define _PAGE_CACHE_WC		(_PAGE_PWT)
+ +#define _PAGE_CACHE_UC_MINUS	(_PAGE_PCD)
+ +#define _PAGE_CACHE_UC		(_PAGE_PCD | _PAGE_PWT)
+  
+  #define PAGE_NONE	__pgprot(_PAGE_PROTNONE | _PAGE_ACCESSED)
+  #define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | \
+diff --cc include/asm-generic/pgtable.h
+index 52e84dd2949b,4d46085c1b90..000000000000
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@@ -594,164 -669,24 +594,184 @@@ static inline int pmd_trans_unstable(pm
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NUMA_BALANCING
+ +#ifdef CONFIG_ARCH_USES_NUMA_PROT_NONE
+ +/*
+ + * _PAGE_NUMA works identical to _PAGE_PROTNONE (it's actually the
+ + * same bit too). It's set only when _PAGE_PRESET is not set and it's
+ + * never set if _PAGE_PRESENT is set.
+ + *
+ + * pte/pmd_present() returns true if pte/pmd_numa returns true. Page
+ + * fault triggers on those regions if pte/pmd_numa returns true
+ + * (because _PAGE_PRESENT is not set).
+ + */
+ +#ifndef pte_numa
+ +static inline int pte_numa(pte_t pte)
+ +{
+ +	return (pte_flags(pte) &
+ +		(_PAGE_NUMA|_PAGE_PRESENT)) == _PAGE_NUMA;
+ +}
+ +#endif
+ +
+ +#ifndef pmd_numa
+ +static inline int pmd_numa(pmd_t pmd)
+ +{
+ +	return (pmd_flags(pmd) &
+ +		(_PAGE_NUMA|_PAGE_PRESENT)) == _PAGE_NUMA;
+ +}
+ +#endif
+ +
+ +/*
+ + * pte/pmd_mknuma sets the _PAGE_ACCESSED bitflag automatically
+ + * because they're called by the NUMA hinting minor page fault. If we
+ + * wouldn't set the _PAGE_ACCESSED bitflag here, the TLB miss handler
+ + * would be forced to set it later while filling the TLB after we
+ + * return to userland. That would trigger a second write to memory
+ + * that we optimize away by setting _PAGE_ACCESSED here.
+ + */
+ +#ifndef pte_mknonnuma
+ +static inline pte_t pte_mknonnuma(pte_t pte)
+ +{
+ +	pteval_t val = pte_val(pte);
+ +
+ +	val &= ~_PAGE_NUMA;
+ +	val |= (_PAGE_PRESENT|_PAGE_ACCESSED);
+ +	return __pte(val);
+ +}
+ +#endif
+ +
+ +#ifndef pmd_mknonnuma
+ +static inline pmd_t pmd_mknonnuma(pmd_t pmd)
+ +{
+ +	pmdval_t val = pmd_val(pmd);
+ +
+ +	val &= ~_PAGE_NUMA;
+ +	val |= (_PAGE_PRESENT|_PAGE_ACCESSED);
+ +
+ +	return __pmd(val);
+ +}
+ +#endif
+ +
+ +#ifndef pte_mknuma
+ +static inline pte_t pte_mknuma(pte_t pte)
+ +{
+ +	pteval_t val = pte_val(pte);
+ +
+ +	val &= ~_PAGE_PRESENT;
+ +	val |= _PAGE_NUMA;
+ +
+ +	return __pte(val);
+ +}
+ +#endif
+ +
+ +#ifndef ptep_set_numa
+ +static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pte_t *ptep)
+ +{
+ +	pte_t ptent = *ptep;
+ +
+ +	ptent = pte_mknuma(ptent);
+ +	set_pte_at(mm, addr, ptep, ptent);
+ +	return;
+ +}
+ +#endif
+ +
+ +#ifndef pmd_mknuma
+ +static inline pmd_t pmd_mknuma(pmd_t pmd)
+ +{
+ +	pmdval_t val = pmd_val(pmd);
+ +
+ +	val &= ~_PAGE_PRESENT;
+ +	val |= _PAGE_NUMA;
+ +
+ +	return __pmd(val);
+ +}
+ +#endif
+ +
+ +#ifndef pmdp_set_numa
+ +static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pmd_t *pmdp)
+ +{
+ +	pmd_t pmd = *pmdp;
+ +
+ +	pmd = pmd_mknuma(pmd);
+ +	set_pmd_at(mm, addr, pmdp, pmd);
+ +	return;
+ +}
+ +#endif
+ +#else
+ +extern int pte_numa(pte_t pte);
+ +extern int pmd_numa(pmd_t pmd);
+ +extern pte_t pte_mknonnuma(pte_t pte);
+ +extern pmd_t pmd_mknonnuma(pmd_t pmd);
+ +extern pte_t pte_mknuma(pte_t pte);
+ +extern pmd_t pmd_mknuma(pmd_t pmd);
+ +extern void ptep_set_numa(struct mm_struct *mm, unsigned long addr, pte_t *ptep);
+ +extern void pmdp_set_numa(struct mm_struct *mm, unsigned long addr, pmd_t *pmdp);
+ +#endif /* CONFIG_ARCH_USES_NUMA_PROT_NONE */
+ +#else
+ +static inline int pmd_numa(pmd_t pmd)
+++=======
++ #ifndef CONFIG_NUMA_BALANCING
++ /*
++  * Technically a PTE can be PROTNONE even when not doing NUMA balancing but
++  * the only case the kernel cares is for NUMA balancing and is only ever set
++  * when the VMA is accessible. For PROT_NONE VMAs, the PTEs are not marked
++  * _PAGE_PROTNONE so by by default, implement the helper as "always no". It
++  * is the responsibility of the caller to distinguish between PROT_NONE
++  * protections and NUMA hinting fault protections.
++  */
++ static inline int pte_protnone(pte_t pte)
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+ +{
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +static inline int pte_numa(pte_t pte)
+  {
+  	return 0;
+  }
+  
+ +static inline pte_t pte_mknonnuma(pte_t pte)
+ +{
+ +	return pte;
+ +}
+ +
+ +static inline pmd_t pmd_mknonnuma(pmd_t pmd)
+ +{
+ +	return pmd;
+ +}
+ +
+ +static inline pte_t pte_mknuma(pte_t pte)
+ +{
+ +	return pte;
+ +}
+ +
+ +static inline void ptep_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pte_t *ptep)
+ +{
+ +	return;
+ +}
+ +
+ +
+ +static inline pmd_t pmd_mknuma(pmd_t pmd)
+ +{
+ +	return pmd;
+ +}
+ +
+ +static inline void pmdp_set_numa(struct mm_struct *mm, unsigned long addr,
+ +				 pmd_t *pmdp)
+ +{
+ +	return ;
+ +}
+++=======
++ static inline int pmd_protnone(pmd_t pmd)
++ {
++ 	return 0;
++ }
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  #endif /* CONFIG_NUMA_BALANCING */
+  
+  #endif /* CONFIG_MMU */
+diff --cc include/linux/swapops.h
+index dff14c873903,cedf3d3c373f..000000000000
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@@ -54,7 -54,7 +54,11 @@@ static inline pgoff_t swp_offset(swp_en
+  /* check whether a pte points to a swap entry */
+  static inline int is_swap_pte(pte_t pte)
+  {
+++<<<<<<< HEAD
+ +	return !pte_none(pte) && !pte_present(pte) && !pte_file(pte);
+++=======
++ 	return !pte_none(pte) && !pte_present(pte);
+++>>>>>>> 21d9ee3eda77 (mm: remove remaining references to NUMA hinting bits and helpers)
+  }
+  #endif
+  
+* Unmerged path arch/powerpc/include/asm/pgtable.h
+diff --git a/arch/powerpc/include/asm/pte-hash64.h b/arch/powerpc/include/asm/pte-hash64.h
+index 2505d8eab15c..55aea0caf95e 100644
+--- a/arch/powerpc/include/asm/pte-hash64.h
++++ b/arch/powerpc/include/asm/pte-hash64.h
+@@ -27,12 +27,6 @@
+ #define _PAGE_RW		0x0200 /* software: user write access allowed */
+ #define _PAGE_BUSY		0x0800 /* software: PTE & hash are busy */
+ 
+-/*
+- * Used for tracking numa faults
+- */
+-#define _PAGE_NUMA	0x00000010 /* Gather numa placement stats */
+-
+-
+ /* No separate kernel read-only */
+ #define _PAGE_KERNEL_RW		(_PAGE_RW | _PAGE_DIRTY) /* user access blocked by key */
+ #define _PAGE_KERNEL_RO		 _PAGE_KERNEL_RW
+* Unmerged path arch/x86/include/asm/pgtable.h
+* Unmerged path arch/x86/include/asm/pgtable_64.h
+* Unmerged path arch/x86/include/asm/pgtable_types.h
+* Unmerged path include/asm-generic/pgtable.h
+* Unmerged path include/linux/swapops.h
