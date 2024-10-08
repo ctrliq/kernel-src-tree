@@ -1,0 +1,167 @@
+xfs: trim eofblocks before collapse range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 41b9d7263ea1e270019c5d04fa0ab15db50b9725
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/41b9d726.failed
+
+xfs_collapse_file_space() currently writes back the entire file
+undergoing collapse range to settle things down for the extent shift
+algorithm. While this prevents changes to the extent list during the
+collapse operation, the writeback itself is not enough to prevent
+unnecessary collapse failures.
+
+The current shift algorithm uses the extent index to iterate the in-core
+extent list. If a post-eof delalloc extent persists after the writeback
+(e.g., a prior zero range op where the end of the range aligns with eof
+can separate the post-eof blocks such that they are not written back and
+converted), xfs_bmap_shift_extents() becomes confused over the encoded
+br_startblock value and fails the collapse.
+
+As with the full writeback, this is a temporary fix until the algorithm
+is improved to cope with a volatile extent list and avoid attempts to
+shift post-eof extents.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 41b9d7263ea1e270019c5d04fa0ab15db50b9725)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index e2ea28ff57bf,1707980f9a4b..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1436,6 -1435,120 +1436,123 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * xfs_collapse_file_space()
++  *	This routine frees disk space and shift extent for the given file.
++  *	The first thing we do is to free data blocks in the specified range
++  *	by calling xfs_free_file_space(). It would also sync dirty data
++  *	and invalidate page cache over the region on which collapse range
++  *	is working. And Shift extent records to the left to cover a hole.
++  * RETURNS:
++  *	0 on success
++  *	errno on error
++  *
++  */
++ int
++ xfs_collapse_file_space(
++ 	struct xfs_inode	*ip,
++ 	xfs_off_t		offset,
++ 	xfs_off_t		len)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	xfs_extnum_t		current_ext = 0;
++ 	struct xfs_bmap_free	free_list;
++ 	xfs_fsblock_t		first_block;
++ 	int			committed;
++ 	xfs_fileoff_t		start_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
++ 
++ 	trace_xfs_collapse_file_space(ip);
++ 
++ 	start_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Writeback the entire file and force remove any post-eof blocks. The
++ 	 * writeback prevents changes to the extent list via concurrent
++ 	 * writeback and the eofblocks trim prevents the extent shift algorithm
++ 	 * from running into a post-eof delalloc extent.
++ 	 *
++ 	 * XXX: This is a temporary fix until the extent shift loop below is
++ 	 * converted to use offsets and lookups within the ILOCK rather than
++ 	 * carrying around the index into the extent list for the next
++ 	 * iteration.
++ 	 */
++ 	error = filemap_write_and_wait(VFS_I(ip)->i_mapping);
++ 	if (error)
++ 		return error;
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(mp, ip, false);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	error = xfs_free_file_space(ip, offset, len);
++ 	if (error)
++ 		return error;
++ 
++ 	while (!error && !done) {
++ 		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 		/*
++ 		 * We would need to reserve permanent block for transaction.
++ 		 * This will come into picture when after shifting extent into
++ 		 * hole we found that adjacent extents can be merged which
++ 		 * may lead to freeing of a block during record update.
++ 		 */
++ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 		if (error) {
++ 			xfs_trans_cancel(tp, 0);
++ 			break;
++ 		}
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out;
++ 
++ 		xfs_trans_ijoin(tp, ip, 0);
++ 
++ 		xfs_bmap_init(&free_list, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &done, start_fsb,
++ 					       shift_fsb, &current_ext,
++ 					       &first_block, &free_list,
++ 					       XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++ 		xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 	}
++ 
++ 	return error;
++ 
++ out:
++ 	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 41b9d7263ea1 (xfs: trim eofblocks before collapse range)
+   * We need to check that the format of the data fork in the temporary inode is
+   * valid for the target inode before doing the swap. This is not a problem with
+   * attr1 because of the fixed fork offset, but attr2 has a dynamically sized
+* Unmerged path fs/xfs/xfs_bmap_util.c
