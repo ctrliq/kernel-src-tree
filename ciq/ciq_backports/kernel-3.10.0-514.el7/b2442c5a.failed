@@ -1,0 +1,133 @@
+xfs: call dax_fault on read page faults for DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b2442c5a7fe92cca08437070c8a45a7aa0d1703e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/b2442c5a.failed
+
+When modifying the patch series to handle the XFS MMAP_LOCK nesting
+of page faults, I botched the conversion of the read page fault
+path, and so it is only every calling through the page cache. Re-add
+the necessary __dax_fault() call for such files.
+
+Because the get_blocks callback on read faults may not set up the
+mapping buffer correctly to allow unwritten extent completion to be
+run, we need to allow callers of __dax_fault() to pass a null
+complete_unwritten() callback. The DAX code always zeros the
+unwritten page when it is read faulted so there are no stale data
+exposure issues with not doing the conversion. The only downside
+will be the potential for increased CPU overhead on repeated read
+faults of the same page. If this proves to be a problem, then the
+filesystem needs to fix it's get_block callback and provide a
+convert_unwritten() callback to the read fault path.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Matthew Wilcox <willy@linux.intel.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit b2442c5a7fe92cca08437070c8a45a7aa0d1703e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index ff72b4ea0a57,db4acc1c3e73..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1562,21 -1486,75 +1562,66 @@@ xfs_filemap_page_mkwrite
+  	struct vm_area_struct	*vma,
+  	struct vm_fault		*vmf)
+  {
+ -	struct inode		*inode = file_inode(vma->vm_file);
+ +	struct xfs_inode	*ip = XFS_I(vma->vm_file->f_mapping->host);
+  	int			ret;
+  
+ -	trace_xfs_filemap_page_mkwrite(XFS_I(inode));
+ +	trace_xfs_filemap_page_mkwrite(ip);
+  
+ -	sb_start_pagefault(inode->i_sb);
+ +	sb_start_pagefault(VFS_I(ip)->i_sb);
+  	file_update_time(vma->vm_file);
+++<<<<<<< HEAD
+ +	xfs_ilock(ip, XFS_MMAPLOCK_SHARED);
+ +
+ +	ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
+ +
+ +	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
+ +	sb_end_pagefault(VFS_I(ip)->i_sb);
+++=======
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 
++ 	if (IS_DAX(inode)) {
++ 		ret = __dax_mkwrite(vma, vmf, xfs_get_blocks_direct,
++ 				    xfs_end_io_dax_write);
++ 	} else {
++ 		ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
++ 		ret = block_page_mkwrite_return(ret);
++ 	}
++ 
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	sb_end_pagefault(inode->i_sb);
++ 
++ 	return ret;
++ }
++ 
++ STATIC int
++ xfs_filemap_fault(
++ 	struct vm_area_struct	*vma,
++ 	struct vm_fault		*vmf)
++ {
++ 	struct inode		*inode = file_inode(vma->vm_file);
++ 	int			ret;
++ 
++ 	trace_xfs_filemap_fault(XFS_I(inode));
++ 
++ 	/* DAX can shortcut the normal fault path on write faults! */
++ 	if ((vmf->flags & FAULT_FLAG_WRITE) && IS_DAX(inode))
++ 		return xfs_filemap_page_mkwrite(vma, vmf);
++ 
++ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
++ 	if (IS_DAX(inode)) {
++ 		/*
++ 		 * we do not want to trigger unwritten extent conversion on read
++ 		 * faults - that is unnecessary overhead and would also require
++ 		 * changes to xfs_get_blocks_direct() to map unwritten extent
++ 		 * ioend for conversion on read-only mappings.
++ 		 */
++ 		ret = __dax_fault(vma, vmf, xfs_get_blocks_direct, NULL);
++ 	} else
++ 		ret = filemap_fault(vma, vmf);
++ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+++>>>>>>> b2442c5a7fe9 (xfs: call dax_fault on read page faults for DAX)
+  
+ -	return ret;
+ -}
+ -
+ -static const struct vm_operations_struct xfs_file_vm_ops = {
+ -	.fault		= xfs_filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+ -	.page_mkwrite	= xfs_filemap_page_mkwrite,
+ -};
+ -
+ -STATIC int
+ -xfs_file_mmap(
+ -	struct file	*filp,
+ -	struct vm_area_struct *vma)
+ -{
+ -	file_accessed(filp);
+ -	vma->vm_ops = &xfs_file_vm_ops;
+ -	if (IS_DAX(file_inode(filp)))
+ -		vma->vm_flags |= VM_MIXEDMAP;
+ -	return 0;
+ +	return block_page_mkwrite_return(ret);
+  }
+  
+  const struct file_operations xfs_file_operations = {
+* Unmerged path fs/dax.c
+* Unmerged path fs/dax.c
+* Unmerged path fs/xfs/xfs_file.c
