@@ -1,0 +1,249 @@
+kprobes/x86: Call out into INT3 handler directly instead of using notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] kernel: Call out into INT3 handler directly instead of using notifier (Luiz Capitulino) [1291899]
+Rebuild_FUZZ: 92.31%
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit 17f41571bb2c4a398785452ac2718a6c5d77180e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/17f41571.failed
+
+In fd4363fff3d96 ("x86: Introduce int3 (breakpoint)-based
+instruction patching"), the mechanism that was introduced for
+notifying alternatives code from int3 exception handler that and
+exception occured was die_notifier.
+
+This is however problematic, as early code might be using jump
+labels even before the notifier registration has been performed,
+which will then lead to an oops due to unhandled exception. One
+of such occurences has been encountered by Fengguang:
+
+ int3: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+ Modules linked in:
+ CPU: 1 PID: 0 Comm: swapper/1 Not tainted 3.11.0-rc1-01429-g04bf576 #8
+ task: ffff88000da1b040 ti: ffff88000da1c000 task.ti: ffff88000da1c000
+ RIP: 0010:[<ffffffff811098cc>]  [<ffffffff811098cc>] ttwu_do_wakeup+0x28/0x225
+ RSP: 0000:ffff88000dd03f10  EFLAGS: 00000006
+ RAX: 0000000000000000 RBX: ffff88000dd12940 RCX: ffffffff81769c40
+ RDX: 0000000000000002 RSI: 0000000000000000 RDI: 0000000000000001
+ RBP: ffff88000dd03f28 R08: ffffffff8176a8c0 R09: 0000000000000002
+ R10: ffffffff810ff484 R11: ffff88000dd129e8 R12: ffff88000dbc90c0
+ R13: ffff88000dbc90c0 R14: ffff88000da1dfd8 R15: ffff88000da1dfd8
+ FS:  0000000000000000(0000) GS:ffff88000dd00000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+ CR2: 00000000ffffffff CR3: 0000000001c88000 CR4: 00000000000006e0
+ Stack:
+  ffff88000dd12940 ffff88000dbc90c0 ffff88000da1dfd8 ffff88000dd03f48
+  ffffffff81109e2b ffff88000dd12940 0000000000000000 ffff88000dd03f68
+  ffffffff81109e9e 0000000000000000 0000000000012940 ffff88000dd03f98
+ Call Trace:
+  <IRQ>
+  [<ffffffff81109e2b>] ttwu_do_activate.constprop.56+0x6d/0x79
+  [<ffffffff81109e9e>] sched_ttwu_pending+0x67/0x84
+  [<ffffffff8110c845>] scheduler_ipi+0x15a/0x2b0
+  [<ffffffff8104dfb4>] smp_reschedule_interrupt+0x38/0x41
+  [<ffffffff8173bf5d>] reschedule_interrupt+0x6d/0x80
+  <EOI>
+  [<ffffffff810ff484>] ? __atomic_notifier_call_chain+0x5/0xc1
+  [<ffffffff8105cc30>] ? native_safe_halt+0xd/0x16
+  [<ffffffff81015f10>] default_idle+0x147/0x282
+  [<ffffffff81017026>] arch_cpu_idle+0x3d/0x5d
+  [<ffffffff81127d6a>] cpu_idle_loop+0x46d/0x5db
+  [<ffffffff81127f5c>] cpu_startup_entry+0x84/0x84
+  [<ffffffff8104f4f8>] start_secondary+0x3c8/0x3d5
+  [...]
+
+Fix this by directly calling poke_int3_handler() from the int3
+exception handler (analogically to what ftrace has been doing
+already), instead of relying on notifier, registration of which
+might not have yet been finalized by the time of the first trap.
+
+Reported-and-tested-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: H. Peter Anvin <hpa@linux.intel.com>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+Link: http://lkml.kernel.org/r/alpine.LNX.2.00.1307231007490.14024@pobox.suse.cz
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 17f41571bb2c4a398785452ac2718a6c5d77180e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/alternative.c
+diff --cc arch/x86/kernel/alternative.c
+index 0ab49366a7a6,15e8563e5c24..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -689,110 -687,3 +687,113 @@@ void *text_poke_bp(void *addr, const vo
+  	return addr;
+  }
+  
+++<<<<<<< HEAD
+ +/* this one needs to run before anything else handles it as a
+ + * regular exception */
+ +static struct notifier_block int3_nb = {
+ +	.priority = 0x7fffffff,
+ +	.notifier_call = int3_notify
+ +};
+ +
+ +static int __init int3_init(void)
+ +{
+ +	return register_die_notifier(&int3_nb);
+ +}
+ +
+ +arch_initcall(int3_init);
+ +/*
+ + * Cross-modifying kernel text with stop_machine().
+ + * This code originally comes from immediate value.
+ + */
+ +static atomic_t stop_machine_first;
+ +static int wrote_text;
+ +
+ +struct text_poke_params {
+ +	struct text_poke_param *params;
+ +	int nparams;
+ +};
+ +
+ +static int __kprobes stop_machine_text_poke(void *data)
+ +{
+ +	struct text_poke_params *tpp = data;
+ +	struct text_poke_param *p;
+ +	int i;
+ +
+ +	if (atomic_xchg(&stop_machine_first, 0)) {
+ +		for (i = 0; i < tpp->nparams; i++) {
+ +			p = &tpp->params[i];
+ +			text_poke(p->addr, p->opcode, p->len);
+ +		}
+ +		smp_wmb();	/* Make sure other cpus see that this has run */
+ +		wrote_text = 1;
+ +	} else {
+ +		while (!wrote_text)
+ +			cpu_relax();
+ +		smp_mb();	/* Load wrote_text before following execution */
+ +	}
+ +
+ +	for (i = 0; i < tpp->nparams; i++) {
+ +		p = &tpp->params[i];
+ +		flush_icache_range((unsigned long)p->addr,
+ +				   (unsigned long)p->addr + p->len);
+ +	}
+ +	/*
+ +	 * Intel Archiecture Software Developer's Manual section 7.1.3 specifies
+ +	 * that a core serializing instruction such as "cpuid" should be
+ +	 * executed on _each_ core before the new instruction is made visible.
+ +	 */
+ +	sync_core();
+ +	return 0;
+ +}
+ +
+ +/**
+ + * text_poke_smp - Update instructions on a live kernel on SMP
+ + * @addr: address to modify
+ + * @opcode: source of the copy
+ + * @len: length to copy
+ + *
+ + * Modify multi-byte instruction by using stop_machine() on SMP. This allows
+ + * user to poke/set multi-byte text on SMP. Only non-NMI/MCE code modifying
+ + * should be allowed, since stop_machine() does _not_ protect code against
+ + * NMI and MCE.
+ + *
+ + * Note: Must be called under get_online_cpus() and text_mutex.
+ + */
+ +void *__kprobes text_poke_smp(void *addr, const void *opcode, size_t len)
+ +{
+ +	struct text_poke_params tpp;
+ +	struct text_poke_param p;
+ +
+ +	p.addr = addr;
+ +	p.opcode = opcode;
+ +	p.len = len;
+ +	tpp.params = &p;
+ +	tpp.nparams = 1;
+ +	atomic_set(&stop_machine_first, 1);
+ +	wrote_text = 0;
+ +	/* Use __stop_machine() because the caller already got online_cpus. */
+ +	__stop_machine(stop_machine_text_poke, (void *)&tpp, cpu_online_mask);
+ +	return addr;
+ +}
+ +
+ +/**
+ + * text_poke_smp_batch - Update instructions on a live kernel on SMP
+ + * @params: an array of text_poke parameters
+ + * @n: the number of elements in params.
+ + *
+ + * Modify multi-byte instruction by using stop_machine() on SMP. Since the
+ + * stop_machine() is heavy task, it is better to aggregate text_poke requests
+ + * and do it once if possible.
+ + *
+ + * Note: Must be called under get_online_cpus() and text_mutex.
+ + */
+ +void __kprobes text_poke_smp_batch(struct text_poke_param *params, int n)
+ +{
+ +	struct text_poke_params tpp = {.params = params, .nparams = n};
+ +
+ +	atomic_set(&stop_machine_first, 1);
+ +	wrote_text = 0;
+ +	__stop_machine(stop_machine_text_poke, (void *)&tpp, cpu_online_mask);
+ +}
+++=======
+++>>>>>>> 17f41571bb2c (kprobes/x86: Call out into INT3 handler directly instead of using notifier)
+diff --git a/arch/x86/include/asm/alternative.h b/arch/x86/include/asm/alternative.h
+index c658c63bd7d0..87e309068892 100644
+--- a/arch/x86/include/asm/alternative.h
++++ b/arch/x86/include/asm/alternative.h
+@@ -5,6 +5,7 @@
+ #include <linux/stddef.h>
+ #include <linux/stringify.h>
+ #include <asm/asm.h>
++#include <asm/ptrace.h>
+ 
+ /*
+  * Alternative inline assembly for SMP.
+@@ -247,6 +248,7 @@ struct text_poke_param {
+ };
+ 
+ extern void *text_poke(void *addr, const void *opcode, size_t len);
++extern int poke_int3_handler(struct pt_regs *regs);
+ extern void *text_poke_bp(void *addr, const void *opcode, size_t len, void *handler);
+ extern void *text_poke_smp(void *addr, const void *opcode, size_t len);
+ extern void text_poke_smp_batch(struct text_poke_param *params, int n);
+* Unmerged path arch/x86/kernel/alternative.c
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 9823443df079..c2c10274b567 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -58,6 +58,7 @@
+ #include <asm/mce.h>
+ #include <asm/fixmap.h>
+ #include <asm/mach_traps.h>
++#include <asm/alternative.h>
+ 
+ #ifdef CONFIG_X86_64
+ #include <asm/x86_init.h>
+@@ -308,6 +309,9 @@ dotraplinkage void __kprobes notrace do_int3(struct pt_regs *regs, long error_co
+ 	    ftrace_int3_handler(regs))
+ 		return;
+ #endif
++	if (poke_int3_handler(regs))
++		return;
++
+ 	prev_state = exception_enter();
+ #ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
+ 	if (kgdb_ll_trap(DIE_INT3, "int3", regs, error_code, X86_TRAP_BP,
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index 33e58bfb97ad..8772e68a8359 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -1692,7 +1692,7 @@ EXPORT_SYMBOL_GPL(unregister_kprobes);
+ 
+ static struct notifier_block kprobe_exceptions_nb = {
+ 	.notifier_call = kprobe_exceptions_notify,
+-	.priority = 0x7ffffff0 /* High priority, but not first.  */
++	.priority = 0x7fffffff /* we need to be notified first */
+ };
+ 
+ unsigned long __weak arch_deref_entry_point(void *entry)
