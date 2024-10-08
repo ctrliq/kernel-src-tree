@@ -1,0 +1,523 @@
+mm: send one IPI per CPU to TLB flush all entries after unmapping pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] send one IPI per CPU to TLB flush all entries after unmapping pages (George Beshers) [727269]
+Rebuild_FUZZ: 97.10%
+commit-author Mel Gorman <mgorman@suse.de>
+commit 72b252aed506b8f1a03f7abd29caef4cdf6a043b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/72b252ae.failed
+
+An IPI is sent to flush remote TLBs when a page is unmapped that was
+potentially accesssed by other CPUs.  There are many circumstances where
+this happens but the obvious one is kswapd reclaiming pages belonging to a
+running process as kswapd and the task are likely running on separate
+CPUs.
+
+On small machines, this is not a significant problem but as machine gets
+larger with more cores and more memory, the cost of these IPIs can be
+high.  This patch uses a simple structure that tracks CPUs that
+potentially have TLB entries for pages being unmapped.  When the unmapping
+is complete, the full TLB is flushed on the assumption that a refill cost
+is lower than flushing individual entries.
+
+Architectures wishing to do this must give the following guarantee.
+
+        If a clean page is unmapped and not immediately flushed, the
+        architecture must guarantee that a write to that linear address
+        from a CPU with a cached TLB entry will trap a page fault.
+
+This is essentially what the kernel already depends on but the window is
+much larger with this patch applied and is worth highlighting.  The
+architecture should consider whether the cost of the full TLB flush is
+higher than sending an IPI to flush each individual entry.  An additional
+architecture helper called flush_tlb_local is required.  It's a trivial
+wrapper with some accounting in the x86 case.
+
+The impact of this patch depends on the workload as measuring any benefit
+requires both mapped pages co-located on the LRU and memory pressure.  The
+case with the biggest impact is multiple processes reading mapped pages
+taken from the vm-scalability test suite.  The test case uses NR_CPU
+readers of mapped files that consume 10*RAM.
+
+Linear mapped reader on a 4-node machine with 64G RAM and 48 CPUs
+
+                                           4.2.0-rc1          4.2.0-rc1
+                                             vanilla       flushfull-v7
+Ops lru-file-mmap-read-elapsed      159.62 (  0.00%)   120.68 ( 24.40%)
+Ops lru-file-mmap-read-time_range    30.59 (  0.00%)     2.80 ( 90.85%)
+Ops lru-file-mmap-read-time_stddv     6.70 (  0.00%)     0.64 ( 90.38%)
+
+           4.2.0-rc1    4.2.0-rc1
+             vanilla flushfull-v7
+User          581.00       611.43
+System       5804.93      4111.76
+Elapsed       161.03       122.12
+
+This is showing that the readers completed 24.40% faster with 29% less
+system CPU time.  From vmstats, it is known that the vanilla kernel was
+interrupted roughly 900K times per second during the steady phase of the
+test and the patched kernel was interrupts 180K times per second.
+
+The impact is lower on a single socket machine.
+
+                                           4.2.0-rc1          4.2.0-rc1
+                                             vanilla       flushfull-v7
+Ops lru-file-mmap-read-elapsed       25.33 (  0.00%)    20.38 ( 19.54%)
+Ops lru-file-mmap-read-time_range     0.91 (  0.00%)     1.44 (-58.24%)
+Ops lru-file-mmap-read-time_stddv     0.28 (  0.00%)     0.47 (-65.34%)
+
+           4.2.0-rc1    4.2.0-rc1
+             vanilla flushfull-v7
+User           58.09        57.64
+System        111.82        76.56
+Elapsed        27.29        22.55
+
+It's still a noticeable improvement with vmstat showing interrupts went
+from roughly 500K per second to 45K per second.
+
+The patch will have no impact on workloads with no memory pressure or have
+relatively few mapped pages.  It will have an unpredictable impact on the
+workload running on the CPU being flushed as it'll depend on how many TLB
+entries need to be refilled and how long that takes.  Worst case, the TLB
+will be completely cleared of active entries when the target PFNs were not
+resident at all.
+
+[sasha.levin@oracle.com: trace tlb flush after disabling preemption in try_to_unmap_flush]
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Reviewed-by: Rik van Riel <riel@redhat.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 72b252aed506b8f1a03f7abd29caef4cdf6a043b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	mm/vmscan.c
+diff --cc arch/x86/Kconfig
+index 3fae2a63357c,117e2f373e50..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -21,54 -17,118 +21,140 @@@ config X86_6
+  ### Arch settings
+  config X86
+  	def_bool y
+ -	select ACPI_LEGACY_TABLES_LOOKUP	if ACPI
+ -	select ACPI_SYSTEM_POWER_STATES_SUPPORT	if ACPI
+ -	select ANON_INODES
+ -	select ARCH_CLOCKSOURCE_DATA
+ -	select ARCH_DISCARD_MEMBLOCK
+ -	select ARCH_HAS_ATOMIC64_DEC_IF_POSITIVE
+  	select ARCH_HAS_DEBUG_STRICT_USER_COPY_CHECKS
+++<<<<<<< HEAD
+ +	select HAVE_AOUT if X86_32
+ +	select HAVE_UNSTABLE_SCHED_CLOCK
+ +	select ARCH_SUPPORTS_NUMA_BALANCING
+ +	select ARCH_SUPPORTS_INT128 if X86_64
+ +	select ARCH_WANTS_PROT_NUMA_PROT_NONE
+++=======
++ 	select ARCH_HAS_ELF_RANDOMIZE
++ 	select ARCH_HAS_FAST_MULTIPLIER
++ 	select ARCH_HAS_GCOV_PROFILE_ALL
++ 	select ARCH_HAS_PMEM_API
++ 	select ARCH_HAS_SG_CHAIN
++ 	select ARCH_HAVE_NMI_SAFE_CMPXCHG
++ 	select ARCH_MIGHT_HAVE_ACPI_PDC		if ACPI
++ 	select ARCH_MIGHT_HAVE_PC_PARPORT
++ 	select ARCH_MIGHT_HAVE_PC_SERIO
++ 	select ARCH_SUPPORTS_ATOMIC_RMW
++ 	select ARCH_SUPPORTS_DEFERRED_STRUCT_PAGE_INIT
++ 	select ARCH_SUPPORTS_INT128		if X86_64
++ 	select ARCH_SUPPORTS_NUMA_BALANCING	if X86_64
++ 	select ARCH_USE_BUILTIN_BSWAP
++ 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_64
++ 	select ARCH_USE_QUEUED_RWLOCKS
++ 	select ARCH_USE_QUEUED_SPINLOCKS
++ 	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if SMP
++ 	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
++ 	select ARCH_WANT_FRAME_POINTERS
++ 	select ARCH_WANT_IPC_PARSE_VERSION	if X86_32
++ 	select ARCH_WANT_OPTIONAL_GPIOLIB
++ 	select BUILDTIME_EXTABLE_SORT
++ 	select CLKEVT_I8253
++ 	select CLKSRC_I8253			if X86_32
++ 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
++ 	select CLOCKSOURCE_WATCHDOG
++ 	select CLONE_BACKWARDS			if X86_32
++ 	select COMPAT_OLD_SIGACTION		if IA32_EMULATION
++ 	select DCACHE_WORD_ACCESS
++ 	select EDAC_ATOMIC_SCRUB
++ 	select EDAC_SUPPORT
++ 	select GENERIC_CLOCKEVENTS
++ 	select GENERIC_CLOCKEVENTS_BROADCAST	if X86_64 || (X86_32 && X86_LOCAL_APIC)
++ 	select GENERIC_CLOCKEVENTS_MIN_ADJUST
++ 	select GENERIC_CMOS_UPDATE
++ 	select GENERIC_CPU_AUTOPROBE
++ 	select GENERIC_EARLY_IOREMAP
++ 	select GENERIC_FIND_FIRST_BIT
++ 	select GENERIC_IOMAP
++ 	select GENERIC_IRQ_PROBE
++ 	select GENERIC_IRQ_SHOW
++ 	select GENERIC_PENDING_IRQ		if SMP
++ 	select GENERIC_SMP_IDLE_THREAD
++ 	select GENERIC_STRNCPY_FROM_USER
++ 	select GENERIC_STRNLEN_USER
++ 	select GENERIC_TIME_VSYSCALL
++ 	select HAVE_ACPI_APEI			if ACPI
++ 	select HAVE_ACPI_APEI_NMI		if ACPI
++ 	select HAVE_ALIGNED_STRUCT_PAGE		if SLUB
++ 	select HAVE_AOUT			if X86_32
++ 	select HAVE_ARCH_AUDITSYSCALL
++ 	select HAVE_ARCH_HUGE_VMAP		if X86_64 || X86_PAE
++ 	select HAVE_ARCH_JUMP_LABEL
++ 	select HAVE_ARCH_KASAN			if X86_64 && SPARSEMEM_VMEMMAP
++ 	select HAVE_ARCH_KGDB
++ 	select HAVE_ARCH_KMEMCHECK
++ 	select HAVE_ARCH_SECCOMP_FILTER
++ 	select HAVE_ARCH_SOFT_DIRTY		if X86_64
++ 	select HAVE_ARCH_TRACEHOOK
++ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
++ 	select HAVE_BPF_JIT			if X86_64
++ 	select HAVE_CC_STACKPROTECTOR
++ 	select HAVE_CMPXCHG_DOUBLE
++ 	select HAVE_CMPXCHG_LOCAL
++ 	select HAVE_CONTEXT_TRACKING		if X86_64
++ 	select HAVE_COPY_THREAD_TLS
++ 	select HAVE_C_RECORDMCOUNT
++ 	select HAVE_DEBUG_KMEMLEAK
++ 	select HAVE_DEBUG_STACKOVERFLOW
++ 	select HAVE_DMA_API_DEBUG
++ 	select HAVE_DMA_ATTRS
++ 	select HAVE_DMA_CONTIGUOUS
++ 	select HAVE_DYNAMIC_FTRACE
++ 	select HAVE_DYNAMIC_FTRACE_WITH_REGS
++ 	select HAVE_EFFICIENT_UNALIGNED_ACCESS
++ 	select HAVE_FENTRY			if X86_64
++ 	select HAVE_FTRACE_MCOUNT_RECORD
++ 	select HAVE_FUNCTION_GRAPH_FP_TEST
++ 	select HAVE_FUNCTION_GRAPH_TRACER
++ 	select HAVE_FUNCTION_TRACER
++ 	select HAVE_GENERIC_DMA_COHERENT	if X86_32
++ 	select HAVE_HW_BREAKPOINT
+++>>>>>>> 72b252aed506 (mm: send one IPI per CPU to TLB flush all entries after unmapping pages)
+  	select HAVE_IDE
+ +	select HAVE_OPROFILE
+ +	select HAVE_PCSPKR_PLATFORM
+ +	select HAVE_PERF_EVENTS
+  	select HAVE_IOREMAP_PROT
+ -	select HAVE_IRQ_EXIT_ON_IRQ_STACK	if X86_64
+ -	select HAVE_IRQ_TIME_ACCOUNTING
+ -	select HAVE_KERNEL_BZIP2
+ -	select HAVE_KERNEL_GZIP
+ -	select HAVE_KERNEL_LZ4
+ -	select HAVE_KERNEL_LZMA
+ -	select HAVE_KERNEL_LZO
+ -	select HAVE_KERNEL_XZ
+  	select HAVE_KPROBES
+ -	select HAVE_KPROBES_ON_FTRACE
+ -	select HAVE_KRETPROBES
+ -	select HAVE_KVM
+ -	select HAVE_LIVEPATCH			if X86_64
+  	select HAVE_MEMBLOCK
+  	select HAVE_MEMBLOCK_NODE_MAP
+ -	select HAVE_MIXED_BREAKPOINTS_REGS
+ -	select HAVE_OPROFILE
+ +	select ARCH_DISCARD_MEMBLOCK
+ +	select ARCH_WANT_OPTIONAL_GPIOLIB
+ +	select ARCH_WANT_FRAME_POINTERS
+ +	select HAVE_DMA_ATTRS
+ +	select HAVE_DMA_CONTIGUOUS if !SWIOTLB
+ +	select HAVE_KRETPROBES
+  	select HAVE_OPTPROBES
+ -	select HAVE_PCSPKR_PLATFORM
+ -	select HAVE_PERF_EVENTS
+ +	select HAVE_KPROBES_ON_FTRACE
+ +	select HAVE_FTRACE_MCOUNT_RECORD
+ +	select HAVE_FENTRY if X86_64
+ +	select HAVE_C_RECORDMCOUNT
+ +	select HAVE_DYNAMIC_FTRACE
+ +	select HAVE_DYNAMIC_FTRACE_WITH_REGS
+ +	select HAVE_FUNCTION_TRACER
+ +	select HAVE_FUNCTION_GRAPH_TRACER
+ +	select HAVE_FUNCTION_GRAPH_FP_TEST
+ +	select HAVE_SYSCALL_TRACEPOINTS
+ +	select SYSCTL_EXCEPTION_TRACE
+ +	select HAVE_KVM
+ +	select HAVE_ARCH_KGDB
+ +	select HAVE_ARCH_TRACEHOOK
+ +	select HAVE_GENERIC_DMA_COHERENT if X86_32
+ +	select HAVE_EFFICIENT_UNALIGNED_ACCESS
+ +	select USER_STACKTRACE_SUPPORT
+ +	select HAVE_REGS_AND_STACK_ACCESS_API
+ +	select HAVE_DMA_API_DEBUG
+ +	select HAVE_KERNEL_GZIP
+ +	select HAVE_KERNEL_BZIP2
+ +	select HAVE_KERNEL_LZMA
+ +	select HAVE_KERNEL_XZ
+ +	select HAVE_KERNEL_LZO
+ +	select HAVE_HW_BREAKPOINT
+ +	select HAVE_MIXED_BREAKPOINTS_REGS
+ +	select PERF_EVENTS
+  	select HAVE_PERF_EVENTS_NMI
+  	select HAVE_PERF_REGS
+  	select HAVE_PERF_USER_STACK_DUMP
+diff --cc mm/vmscan.c
+index 7592127381db,99ec00d6a5dd..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1068,6 -1208,8 +1069,11 @@@ keep
+  		VM_BUG_ON_PAGE(PageLRU(page) || PageUnevictable(page), page);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	mem_cgroup_uncharge_list(&free_pages);
++ 	try_to_unmap_flush();
+++>>>>>>> 72b252aed506 (mm: send one IPI per CPU to TLB flush all entries after unmapping pages)
+  	free_hot_cold_page_list(&free_pages, true);
+  
+  	list_splice(&ret_pages, page_list);
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 50a7fc0f824a..3e41fd3dc902 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -173,6 +173,12 @@ static inline void reset_lazy_tlbstate(void)
+ 
+ #endif	/* SMP */
+ 
++/* Not inlined due to inc_irq_stat not being defined yet */
++#define flush_tlb_local() {		\
++	inc_irq_stat(irq_tlb_count);	\
++	local_flush_tlb();		\
++}
++
+ #ifndef CONFIG_PARAVIRT
+ #define flush_tlb_others(mask, mm, start, end)	\
+ 	native_flush_tlb_others(mask, mm, start, end)
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 6dacb93a6d94..5d87b65ca62e 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -80,6 +80,9 @@ enum ttu_flags {
+ 	TTU_IGNORE_MLOCK = (1 << 8),	/* ignore mlock */
+ 	TTU_IGNORE_ACCESS = (1 << 9),	/* don't age */
+ 	TTU_IGNORE_HWPOISON = (1 << 10),/* corrupted page is recoverable */
++	TTU_BATCH_FLUSH = (1 << 11),	/* Batch TLB flushes where possible
++					 * and caller guarantees they will
++					 * do a final flush if necessary */
+ };
+ 
+ #ifdef CONFIG_MMU
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e57aba91f593..9ce540510350 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1114,6 +1114,18 @@ enum perf_event_task_context {
+ 	perf_nr_task_contexts,
+ };
+ 
++/* Track pages that require TLB flushes */
++struct tlbflush_unmap_batch {
++	/*
++	 * Each bit set is a CPU that potentially has a TLB entry for one of
++	 * the PFNs being flushed. See set_tlb_ubc_flush_pending().
++	 */
++	struct cpumask cpumask;
++
++	/* True if any bit in cpumask is set */
++	bool flush_required;
++};
++
+ struct task_struct {
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+ 	void *stack;
+@@ -1466,6 +1478,10 @@ struct task_struct {
+ 	unsigned long numa_pages_migrated;
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
++#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++	struct tlbflush_unmap_batch tlb_ubc;
++#endif
++
+ 	struct rcu_head rcu;
+ 
+ 	/*
+diff --git a/init/Kconfig b/init/Kconfig
+index 9c03541a6bec..91a98e04c2da 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -772,6 +772,16 @@ config HAVE_UNSTABLE_SCHED_CLOCK
+ config ARCH_SUPPORTS_NUMA_BALANCING
+ 	bool
+ 
++#
++# For architectures that prefer to flush all TLBs after a number of pages
++# are unmapped instead of sending one IPI per page to flush. The architecture
++# must provide guarantees on what happens if a clean TLB cache entry is
++# written after the unmap. Details are in mm/rmap.c near the check for
++# should_defer_flush. The architecture should also consider if the full flush
++# and the refill costs are offset by the savings of sending fewer IPIs.
++config ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++	bool
++
+ #
+ # For architectures that know their GCC __int128 support is sound
+ #
+diff --git a/mm/internal.h b/mm/internal.h
+index d07fa9595ecf..5e802e614493 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -373,4 +373,15 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
+ #define ALLOC_CMA		0x80 /* allow allocations from CMA areas */
+ #define ALLOC_FAIR		0x100 /* fair zone allocation */
+ 
++enum ttu_flags;
++struct tlbflush_unmap_batch;
++
++#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++void try_to_unmap_flush(void);
++#else
++static inline void try_to_unmap_flush(void)
++{
++}
++
++#endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
+ #endif	/* __MM_INTERNAL_H */
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 4c545e1f57dc..07faef4fd57b 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -60,6 +60,8 @@
+ 
+ #include <asm/tlbflush.h>
+ 
++#include <trace/events/tlb.h>
++
+ #include "internal.h"
+ 
+ static struct kmem_cache *anon_vma_cachep;
+@@ -534,6 +536,89 @@ vma_address(struct page *page, struct vm_area_struct *vma)
+ 	return address;
+ }
+ 
++#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++static void percpu_flush_tlb_batch_pages(void *data)
++{
++	/*
++	 * All TLB entries are flushed on the assumption that it is
++	 * cheaper to flush all TLBs and let them be refilled than
++	 * flushing individual PFNs. Note that we do not track mm's
++	 * to flush as that might simply be multiple full TLB flushes
++	 * for no gain.
++	 */
++	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
++	flush_tlb_local();
++}
++
++/*
++ * Flush TLB entries for recently unmapped pages from remote CPUs. It is
++ * important if a PTE was dirty when it was unmapped that it's flushed
++ * before any IO is initiated on the page to prevent lost writes. Similarly,
++ * it must be flushed before freeing to prevent data leakage.
++ */
++void try_to_unmap_flush(void)
++{
++	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++	int cpu;
++
++	if (!tlb_ubc->flush_required)
++		return;
++
++	cpu = get_cpu();
++
++	trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, -1UL);
++
++	if (cpumask_test_cpu(cpu, &tlb_ubc->cpumask))
++		percpu_flush_tlb_batch_pages(&tlb_ubc->cpumask);
++
++	if (cpumask_any_but(&tlb_ubc->cpumask, cpu) < nr_cpu_ids) {
++		smp_call_function_many(&tlb_ubc->cpumask,
++			percpu_flush_tlb_batch_pages, (void *)tlb_ubc, true);
++	}
++	cpumask_clear(&tlb_ubc->cpumask);
++	tlb_ubc->flush_required = false;
++	put_cpu();
++}
++
++static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
++		struct page *page)
++{
++	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++
++	cpumask_or(&tlb_ubc->cpumask, &tlb_ubc->cpumask, mm_cpumask(mm));
++	tlb_ubc->flush_required = true;
++}
++
++/*
++ * Returns true if the TLB flush should be deferred to the end of a batch of
++ * unmap operations to reduce IPIs.
++ */
++static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
++{
++	bool should_defer = false;
++
++	if (!(flags & TTU_BATCH_FLUSH))
++		return false;
++
++	/* If remote CPUs need to be flushed then defer batch the flush */
++	if (cpumask_any_but(mm_cpumask(mm), get_cpu()) < nr_cpu_ids)
++		should_defer = true;
++	put_cpu();
++
++	return should_defer;
++}
++#else
++static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
++		struct page *page)
++{
++}
++
++static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
++{
++	return false;
++}
++#endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
++
+ /*
+  * At what user virtual address is page expected in vma?
+  * Caller should check the page is actually part of the vma.
+@@ -1218,7 +1303,24 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 
+ 	/* Nuke the page table entry. */
+ 	flush_cache_page(vma, address, page_to_pfn(page));
+-	pteval = ptep_clear_flush(vma, address, pte);
++	if (should_defer_flush(mm, flags)) {
++		/*
++		 * We clear the PTE but do not flush so potentially a remote
++		 * CPU could still be writing to the page. If the entry was
++		 * previously clean then the architecture must guarantee that
++		 * a clear->dirty transition on a cached TLB entry is written
++		 * through and traps if the PTE is unmapped.
++		 */
++		pteval = ptep_get_and_clear(mm, address, pte);
++
++		/* Potentially writable TLBs must be flushed before IO */
++		if (pte_dirty(pteval))
++			flush_tlb_page(vma, address);
++		else
++			set_tlb_ubc_flush_pending(mm, page);
++	} else {
++		pteval = ptep_clear_flush(vma, address, pte);
++	}
+ 
+ 	/* Move the dirty bit to the physical page now the pte is gone. */
+ 	if (pte_dirty(pteval))
+* Unmerged path mm/vmscan.c
