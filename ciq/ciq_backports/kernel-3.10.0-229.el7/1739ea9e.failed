@@ -1,0 +1,230 @@
+powerpc: Fix regression of per-CPU DSCR setting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [powerpc] Fix regression of per-CPU DSCR setting (Don Zickus) [1127366]
+Rebuild_FUZZ: 89.41%
+commit-author Sam bobroff <sam.bobroff@au1.ibm.com>
+commit 1739ea9e13e636590dd56c2f4ca85e783da512e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/1739ea9e.failed
+
+Since commit "efcac65 powerpc: Per process DSCR + some fixes (try#4)"
+it is no longer possible to set the DSCR on a per-CPU basis.
+
+The old behaviour was to minipulate the DSCR SPR directly but this is no
+longer sufficient: the value is quickly overwritten by context switching.
+
+This patch stores the per-CPU DSCR value in a kernel variable rather than
+directly in the SPR and it is used whenever a process has not set the DSCR
+itself. The sysfs interface (/sys/devices/system/cpu/cpuN/dscr) is unchanged.
+
+Writes to the old global default (/sys/devices/system/cpu/dscr_default)
+now set all of the per-CPU values and reads return the last written value.
+
+The new per-CPU default is added to the paca_struct and is used everywhere
+outside of sysfs.c instead of the old global default.
+
+	Signed-off-by: Sam Bobroff <sam.bobroff@au1.ibm.com>
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+(cherry picked from commit 1739ea9e13e636590dd56c2f4ca85e783da512e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 0ae4c28ae4b6,12f4ce5b4f78..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -209,17 -284,12 +209,23 @@@ kvm_start_guest
+  	cmpdi	r4,0
+  	/* if we have no vcpu to run, go back to sleep */
+  	beq	kvm_no_guest
+ +	b	30f
+  
+++<<<<<<< HEAD
+ +27:	/* XXX should handle hypervisor maintenance interrupts etc. here */
+ +	b	kvm_no_guest
+ +28:	/* SRR1 said external but ICP said nope?? */
+ +	b	kvm_no_guest
+ +29:	/* External non-IPI interrupt to offline secondary thread? help?? */
+ +	stw	r8,HSTATE_SAVED_XIRR(r13)
+ +	b	kvm_no_guest
+++=======
++ 	/* Set HSTATE_DSCR(r13) to something sensible */
++ 	ld	r6, PACA_DSCR(r13)
++ 	std	r6, HSTATE_DSCR(r13)
+++>>>>>>> 1739ea9e13e6 (powerpc: Fix regression of per-CPU DSCR setting)
+  
+ -	bl	kvmppc_hv_entry
+ +30:	bl	kvmppc_hv_entry
+  
+  	/* Back from the guest, go back to nap */
+  	/* Clear our vcpu pointer so we don't come back in early */
+diff --git a/arch/powerpc/include/asm/paca.h b/arch/powerpc/include/asm/paca.h
+index c3523d1dda58..3e456d4ee4e9 100644
+--- a/arch/powerpc/include/asm/paca.h
++++ b/arch/powerpc/include/asm/paca.h
+@@ -93,7 +93,10 @@ struct paca_struct {
+ 	struct slb_shadow *slb_shadow_ptr;
+ 	struct dtl_entry *dispatch_log;
+ 	struct dtl_entry *dispatch_log_end;
++#endif /* CONFIG_PPC_STD_MMU_64 */
++	u64 dscr_default;		/* per-CPU default DSCR */
+ 
++#ifdef CONFIG_PPC_STD_MMU_64
+ 	/*
+ 	 * Now, starting in cacheline 2, the exception save areas
+ 	 */
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 79fa5c26d629..da7960505642 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -239,6 +239,7 @@ int main(void)
+ #endif
+ 	DEFINE(PACAHWCPUID, offsetof(struct paca_struct, hw_cpu_id));
+ 	DEFINE(PACAKEXECSTATE, offsetof(struct paca_struct, kexec_state));
++	DEFINE(PACA_DSCR, offsetof(struct paca_struct, dscr_default));
+ 	DEFINE(PACA_STARTTIME, offsetof(struct paca_struct, starttime));
+ 	DEFINE(PACA_STARTTIME_USER, offsetof(struct paca_struct, starttime_user));
+ 	DEFINE(PACA_USER_TIME, offsetof(struct paca_struct, user_time));
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 6d856d63cf19..c5b65c9a4290 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -392,12 +392,6 @@ _GLOBAL(ret_from_kernel_thread)
+ 	li	r3,0
+ 	b	syscall_exit
+ 
+-	.section	".toc","aw"
+-DSCR_DEFAULT:
+-	.tc dscr_default[TC],dscr_default
+-
+-	.section	".text"
+-
+ /*
+  * This routine switches between two different tasks.  The process
+  * state of one is saved on its kernel stack.  Then the state
+@@ -582,11 +576,10 @@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
+ #ifdef CONFIG_PPC64
+ BEGIN_FTR_SECTION
+ 	lwz	r6,THREAD_DSCR_INHERIT(r4)
+-	ld	r7,DSCR_DEFAULT@toc(2)
+ 	ld	r0,THREAD_DSCR(r4)
+ 	cmpwi	r6,0
+ 	bne	1f
+-	ld	r0,0(r7)
++	ld	r0,PACA_DSCR(r13)
+ 1:
+ BEGIN_FTR_SECTION_NESTED(70)
+ 	mfspr	r8, SPRN_FSCR
+diff --git a/arch/powerpc/kernel/sysfs.c b/arch/powerpc/kernel/sysfs.c
+index cd369bc5499d..49b17e274292 100644
+--- a/arch/powerpc/kernel/sysfs.c
++++ b/arch/powerpc/kernel/sysfs.c
+@@ -181,7 +181,6 @@ SYSFS_PMCSETUP(pmc8, SPRN_PMC8);
+ SYSFS_PMCSETUP(mmcra, SPRN_MMCRA);
+ SYSFS_SPRSETUP(purr, SPRN_PURR);
+ SYSFS_SPRSETUP(spurr, SPRN_SPURR);
+-SYSFS_SPRSETUP(dscr, SPRN_DSCR);
+ SYSFS_SPRSETUP(pir, SPRN_PIR);
+ 
+ /*
+@@ -191,12 +190,27 @@ SYSFS_SPRSETUP(pir, SPRN_PIR);
+ */
+ static DEVICE_ATTR(mmcra, 0600, show_mmcra, store_mmcra);
+ static DEVICE_ATTR(spurr, 0400, show_spurr, NULL);
+-static DEVICE_ATTR(dscr, 0600, show_dscr, store_dscr);
+ static DEVICE_ATTR(purr, 0400, show_purr, store_purr);
+ static DEVICE_ATTR(pir, 0400, show_pir, NULL);
+ 
+-unsigned long dscr_default = 0;
+-EXPORT_SYMBOL(dscr_default);
++static unsigned long dscr_default;
++
++static void read_dscr(void *val)
++{
++	*(unsigned long *)val = get_paca()->dscr_default;
++}
++
++static void write_dscr(void *val)
++{
++	get_paca()->dscr_default = *(unsigned long *)val;
++	if (!current->thread.dscr_inherit) {
++		current->thread.dscr = *(unsigned long *)val;
++		mtspr(SPRN_DSCR, *(unsigned long *)val);
++	}
++}
++
++SYSFS_SPRSETUP_SHOW_STORE(dscr);
++static DEVICE_ATTR(dscr, 0600, show_dscr, store_dscr);
+ 
+ static void add_write_permission_dev_attr(struct device_attribute *attr)
+ {
+@@ -209,14 +223,6 @@ static ssize_t show_dscr_default(struct device *dev,
+ 	return sprintf(buf, "%lx\n", dscr_default);
+ }
+ 
+-static void update_dscr(void *dummy)
+-{
+-	if (!current->thread.dscr_inherit) {
+-		current->thread.dscr = dscr_default;
+-		mtspr(SPRN_DSCR, dscr_default);
+-	}
+-}
+-
+ static ssize_t __used store_dscr_default(struct device *dev,
+ 		struct device_attribute *attr, const char *buf,
+ 		size_t count)
+@@ -229,7 +235,7 @@ static ssize_t __used store_dscr_default(struct device *dev,
+ 		return -EINVAL;
+ 	dscr_default = val;
+ 
+-	on_each_cpu(update_dscr, NULL, 1);
++	on_each_cpu(write_dscr, &val, 1);
+ 
+ 	return count;
+ }
+diff --git a/arch/powerpc/kernel/tm.S b/arch/powerpc/kernel/tm.S
+index 0b97954f4f77..f2c740895409 100644
+--- a/arch/powerpc/kernel/tm.S
++++ b/arch/powerpc/kernel/tm.S
+@@ -78,12 +78,6 @@ _GLOBAL(tm_abort)
+ 	TABORT(R3)
+ 	blr
+ 
+-	.section	".toc","aw"
+-DSCR_DEFAULT:
+-	.tc dscr_default[TC],dscr_default
+-
+-	.section	".text"
+-
+ /* void tm_reclaim(struct thread_struct *thread,
+  *                 unsigned long orig_msr,
+  *		   uint8_t cause)
+@@ -291,9 +285,8 @@ dont_backup_fp:
+ 	mtlr	r0
+ 	ld	r2, 40(r1)
+ 
+-	/* Load system default DSCR */
+-	ld	r4, DSCR_DEFAULT@toc(r2)
+-	ld	r0, 0(r4)
++	/* Load CPU's default DSCR */
++	ld	r0, PACA_DSCR(r13)
+ 	mtspr	SPRN_DSCR, r0
+ 
+ 	blr
+@@ -448,9 +441,8 @@ restore_gprs:
+ 	mtlr	r0
+ 	ld	r2, 40(r1)
+ 
+-	/* Load system default DSCR */
+-	ld	r4, DSCR_DEFAULT@toc(r2)
+-	ld	r0, 0(r4)
++	/* Load CPU's default DSCR */
++	ld	r0, PACA_DSCR(r13)
+ 	mtspr	SPRN_DSCR, r0
+ 
+ 	blr
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
