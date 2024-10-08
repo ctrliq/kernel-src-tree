@@ -1,0 +1,297 @@
+uprobes/x86: Emulate relative call's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [kernel] uprobes: Emulate relative call's (Oleg Nesterov) [1073627]
+Rebuild_FUZZ: 94.12%
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 8e89c0be171b1a9ed2ba67168733ca811bb45d5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/8e89c0be.failed
+
+See the previous "Emulate unconditional relative jmp's" which explains
+why we can not execute "jmp" out-of-line, the same applies to "call".
+
+Emulating of rip-relative call is trivial, we only need to additionally
+push the ret-address. If this fails, we execute this instruction out of
+line and this should trigger the trap, the probed application should die
+or the same insn will be restarted if a signal handler expands the stack.
+We do not even need ->post_xol() for this case.
+
+But there is a corner (and almost theoretical) case: another thread can
+expand the stack right before we execute this insn out of line. In this
+case it hit the same problem we are trying to solve. So we simply turn
+the probed insn into "call 1f; 1:" and add ->post_xol() which restores
+->sp and restarts.
+
+Many thanks to Jonathan who finally found the standalone reproducer,
+otherwise I would never resolve the "random SIGSEGV's under systemtap"
+bug-report. Now that the problem is clear we can write the simplified
+test-case:
+
+	void probe_func(void), callee(void);
+
+	int failed = 1;
+
+	asm (
+		".text\n"
+		".align 4096\n"
+		".globl probe_func\n"
+		"probe_func:\n"
+		"call callee\n"
+		"ret"
+	);
+
+	/*
+	 * This assumes that:
+	 *
+	 *	- &probe_func = 0x401000 + a_bit, aligned = 0x402000
+	 *
+	 *	- xol_vma->vm_start = TASK_SIZE_MAX - PAGE_SIZE = 0x7fffffffe000
+	 *	  as xol_add_vma() asks; the 1st slot = 0x7fffffffe080
+	 *
+	 * so we can target the non-canonical address from xol_vma using
+	 * the simple math below, 100 * 4096 is just the random offset
+	 */
+	asm (".org . + 0x800000000000 - 0x7fffffffe080 - 5 - 1  + 100 * 4096\n");
+
+	void callee(void)
+	{
+		failed = 0;
+	}
+
+	int main(void)
+	{
+		probe_func();
+		return failed;
+	}
+
+It SIGSEGV's if you probe "probe_func" (although this is not very reliable,
+randomize_va_space/etc can change the placement of xol area).
+
+Note: as Denys Vlasenko pointed out, amd and intel treat "callw" (0x66 0xe8)
+differently. This patch relies on lib/insn.c and thus implements the intel's
+behaviour: 0x66 is simply ignored. Fortunately nothing sane should ever use
+this insn, so we postpone the fix until we decide what should we do; emulate
+or not, support or not, etc.
+
+	Reported-by: Jonathan Lebon <jlebon@redhat.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 8e89c0be171b1a9ed2ba67168733ca811bb45d5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/uprobes.h
+#	arch/x86/kernel/uprobes.c
+diff --cc arch/x86/include/asm/uprobes.h
+index 6e5197910fd8,93bee7b93854..000000000000
+--- a/arch/x86/include/asm/uprobes.h
++++ b/arch/x86/include/asm/uprobes.h
+@@@ -33,12 -33,27 +33,21 @@@ typedef u8 uprobe_opcode_t
+  #define UPROBE_SWBP_INSN		0xcc
+  #define UPROBE_SWBP_INSN_SIZE		   1
+  
+ -struct uprobe_xol_ops;
+ -
+  struct arch_uprobe {
+ -	union {
+ -		u8			insn[MAX_UINSN_BYTES];
+ -		u8			ixol[MAX_UINSN_BYTES];
+ -	};
+ -
+  	u16				fixups;
+ -	const struct uprobe_xol_ops	*ops;
+ -
+ -	union {
+ +	u8				insn[MAX_UINSN_BYTES];
+  #ifdef CONFIG_X86_64
+ -		unsigned long			rip_rela_target_address;
+ +	unsigned long			rip_rela_target_address;
+  #endif
+++<<<<<<< HEAD
+++=======
++ 		struct {
++ 			s32	offs;
++ 			u8	ilen;
++ 			u8	opc1;
++ 		}				branch;
++ 	};
+++>>>>>>> 8e89c0be171b (uprobes/x86: Emulate relative call's)
+  };
+  
+  struct arch_uprobe_task {
+diff --cc arch/x86/kernel/uprobes.c
+index 7ea7d2b3594b,0914435001f5..000000000000
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@@ -402,6 -402,163 +402,166 @@@ static int validate_insn_bits(struct ar
+  }
+  #endif /* CONFIG_X86_64 */
+  
+++<<<<<<< HEAD
+++=======
++ struct uprobe_xol_ops {
++ 	bool	(*emulate)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*pre_xol)(struct arch_uprobe *, struct pt_regs *);
++ 	int	(*post_xol)(struct arch_uprobe *, struct pt_regs *);
++ };
++ 
++ static inline int sizeof_long(void)
++ {
++ 	return is_ia32_task() ? 4 : 8;
++ }
++ 
++ static int default_pre_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	pre_xol_rip_insn(auprobe, regs, &current->utask->autask);
++ 	return 0;
++ }
++ 
++ /*
++  * Adjust the return address pushed by a call insn executed out of line.
++  */
++ static int adjust_ret_addr(unsigned long sp, long correction)
++ {
++ 	int rasize = sizeof_long();
++ 	long ra;
++ 
++ 	if (copy_from_user(&ra, (void __user *)sp, rasize))
++ 		return -EFAULT;
++ 
++ 	ra += correction;
++ 	if (copy_to_user((void __user *)sp, &ra, rasize))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	struct uprobe_task *utask = current->utask;
++ 	long correction = (long)(utask->vaddr - utask->xol_vaddr);
++ 
++ 	handle_riprel_post_xol(auprobe, regs, &correction);
++ 	if (auprobe->fixups & UPROBE_FIX_IP)
++ 		regs->ip += correction;
++ 
++ 	if (auprobe->fixups & UPROBE_FIX_CALL) {
++ 		if (adjust_ret_addr(regs->sp, correction)) {
++ 			regs->sp += sizeof_long();
++ 			return -ERESTART;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct uprobe_xol_ops default_xol_ops = {
++ 	.pre_xol  = default_pre_xol_op,
++ 	.post_xol = default_post_xol_op,
++ };
++ 
++ static bool branch_is_call(struct arch_uprobe *auprobe)
++ {
++ 	return auprobe->branch.opc1 == 0xe8;
++ }
++ 
++ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	unsigned long new_ip = regs->ip += auprobe->branch.ilen;
++ 
++ 	if (branch_is_call(auprobe)) {
++ 		unsigned long new_sp = regs->sp - sizeof_long();
++ 		/*
++ 		 * If it fails we execute this (mangled, see the comment in
++ 		 * branch_clear_offset) insn out-of-line. In the likely case
++ 		 * this should trigger the trap, and the probed application
++ 		 * should die or restart the same insn after it handles the
++ 		 * signal, arch_uprobe_post_xol() won't be even called.
++ 		 *
++ 		 * But there is corner case, see the comment in ->post_xol().
++ 		 */
++ 		if (copy_to_user((void __user *)new_sp, &new_ip, sizeof_long()))
++ 			return false;
++ 		regs->sp = new_sp;
++ 	}
++ 
++ 	regs->ip = new_ip + auprobe->branch.offs;
++ 	return true;
++ }
++ 
++ static int branch_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
++ {
++ 	BUG_ON(!branch_is_call(auprobe));
++ 	/*
++ 	 * We can only get here if branch_emulate_op() failed to push the ret
++ 	 * address _and_ another thread expanded our stack before the (mangled)
++ 	 * "call" insn was executed out-of-line. Just restore ->sp and restart.
++ 	 * We could also restore ->ip and try to call branch_emulate_op() again.
++ 	 */
++ 	regs->sp += sizeof_long();
++ 	return -ERESTART;
++ }
++ 
++ static void branch_clear_offset(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	/*
++ 	 * Turn this insn into "call 1f; 1:", this is what we will execute
++ 	 * out-of-line if ->emulate() fails. We only need this to generate
++ 	 * a trap, so that the probed task receives the correct signal with
++ 	 * the properly filled siginfo.
++ 	 *
++ 	 * But see the comment in ->post_xol(), in the unlikely case it can
++ 	 * succeed. So we need to ensure that the new ->ip can not fall into
++ 	 * the non-canonical area and trigger #GP.
++ 	 *
++ 	 * We could turn it into (say) "pushf", but then we would need to
++ 	 * divorce ->insn[] and ->ixol[]. We need to preserve the 1st byte
++ 	 * of ->insn[] for set_orig_insn().
++ 	 */
++ 	memset(auprobe->insn + insn_offset_immediate(insn),
++ 		0, insn->immediate.nbytes);
++ }
++ 
++ static struct uprobe_xol_ops branch_xol_ops = {
++ 	.emulate  = branch_emulate_op,
++ 	.post_xol = branch_post_xol_op,
++ };
++ 
++ /* Returns -ENOSYS if branch_xol_ops doesn't handle this insn */
++ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
++ {
++ 	u8 opc1 = OPCODE1(insn);
++ 
++ 	/* has the side-effect of processing the entire instruction */
++ 	insn_get_length(insn);
++ 	if (WARN_ON_ONCE(!insn_complete(insn)))
++ 		return -ENOEXEC;
++ 
++ 	switch (opc1) {
++ 	case 0xeb:	/* jmp 8 */
++ 	case 0xe9:	/* jmp 32 */
++ 	case 0x90:	/* prefix* + nop; same as jmp with .offs = 0 */
++ 		break;
++ 
++ 	case 0xe8:	/* call relative */
++ 		branch_clear_offset(auprobe, insn);
++ 		break;
++ 	default:
++ 		return -ENOSYS;
++ 	}
++ 
++ 	auprobe->branch.opc1 = opc1;
++ 	auprobe->branch.ilen = insn->length;
++ 	auprobe->branch.offs = insn->immediate.value;
++ 
++ 	auprobe->ops = &branch_xol_ops;
++ 	return 0;
++ }
++ 
+++>>>>>>> 8e89c0be171b (uprobes/x86: Emulate relative call's)
+  /**
+   * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
+   * @mm: the probed address space.
+* Unmerged path arch/x86/include/asm/uprobes.h
+* Unmerged path arch/x86/kernel/uprobes.c
