@@ -1,0 +1,160 @@
+Bluetooth: Release RFCOMM port when the last user closes the TTY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [bluetooth] Release RFCOMM port when the last user closes the TTY (Lubomir Rintel) [1241844]
+Rebuild_FUZZ: 90.60%
+commit-author Gianluca Anzolin <gianluca@sottospazio.it>
+commit 5b899241874dcc1a2b932a668731c80a3a869575
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/5b899241.failed
+
+This patch fixes a userspace regression introduced by the commit
+29cd718b.
+
+If the rfcomm device was created with the flag RFCOMM_RELEASE_ONHUP the
+user space expects that the tty_port is released as soon as the last
+process closes the tty.
+
+The current code attempts to release the port in the function
+rfcomm_dev_state_change(). However it won't get a reference to the
+relevant tty to send a HUP: at that point the tty is already destroyed
+and therefore NULL.
+
+This patch fixes the regression by taking over the tty refcount in the
+tty install method(). This way the tty_port is automatically released as
+soon as the tty is destroyed.
+
+As a consequence the check for RFCOMM_RELEASE_ONHUP flag in the hangup()
+method is now redundant. Instead we have to be careful with the reference
+counting in the rfcomm_release_dev() function.
+
+	Signed-off-by: Gianluca Anzolin <gianluca@sottospazio.it>
+	Reported-by: Alexander Holler <holler@ahsoftware.de>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 5b899241874dcc1a2b932a668731c80a3a869575)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/rfcomm/tty.c
+diff --cc net/bluetooth/rfcomm/tty.c
+index 62bd75eda078,a535ef148ef6..000000000000
+--- a/net/bluetooth/rfcomm/tty.c
++++ b/net/bluetooth/rfcomm/tty.c
+@@@ -419,11 -431,16 +419,23 @@@ static int rfcomm_release_dev(void __us
+  		rfcomm_dlc_close(dev->dlc, 0);
+  
+  	/* Shut down TTY synchronously before freeing rfcomm_dev */
+++<<<<<<< HEAD
+ +	if (dev->port.tty)
+ +		tty_vhangup(dev->port.tty);
+++=======
++ 	tty = tty_port_tty_get(&dev->port);
++ 	if (tty) {
++ 		tty_vhangup(tty);
++ 		tty_kref_put(tty);
++ 	}
++ 
++ 	if (!test_bit(RFCOMM_RELEASE_ONHUP, &dev->flags) &&
++ 	    !test_and_set_bit(RFCOMM_TTY_RELEASED, &dev->flags))
++ 		tty_port_put(&dev->port);
+++>>>>>>> 5b899241874d (Bluetooth: Release RFCOMM port when the last user closes the TTY)
+  
+ +	if (!test_bit(RFCOMM_RELEASE_ONHUP, &dev->flags))
+ +		rfcomm_dev_del(dev);
+  	tty_port_put(&dev->port);
+  	return 0;
+  }
+@@@ -683,51 -671,20 +695,68 @@@ static int rfcomm_tty_install(struct tt
+  
+  	/* install the tty_port */
+  	err = tty_port_install(&dev->port, driver, tty);
+++<<<<<<< HEAD
+ +	if (err < 0)
+ +		goto error_no_dlc;
+ +
+ +	err = rfcomm_dlc_open(dlc, &dev->src, &dev->dst, dev->channel);
+ +	if (err < 0)
+ +		goto error_no_dlc;
+ +
+ +	/* Wait for DLC to connect */
+ +	add_wait_queue(&dev->wait, &wait);
+ +	while (1) {
+ +		set_current_state(TASK_INTERRUPTIBLE);
+ +
+ +		if (dlc->state == BT_CLOSED) {
+ +			err = -dev->err;
+ +			break;
+ +		}
+ +
+ +		if (dlc->state == BT_CONNECTED)
+ +			break;
+ +
+ +		if (signal_pending(current)) {
+ +			err = -EINTR;
+ +			break;
+ +		}
+ +
+ +		tty_unlock(tty);
+ +		schedule();
+ +		tty_lock(tty);
+ +	}
+ +	set_current_state(TASK_RUNNING);
+ +	remove_wait_queue(&dev->wait, &wait);
+ +
+ +	if (err < 0)
+ +		goto error_no_connection;
+ +
+ +	device_move(dev->tty_dev, rfcomm_get_device(dev),
+ +		    DPM_ORDER_DEV_AFTER_PARENT);
+ +	return 0;
+ +
+ +error_no_connection:
+ +	rfcomm_dlc_close(dlc, err);
+ +error_no_dlc:
+ +	clear_bit(RFCOMM_TTY_ATTACHED, &dev->flags);
+ +	tty_port_put(&dev->port);
+ +	return err;
+++=======
++ 	if (err) {
++ 		rfcomm_tty_cleanup(tty);
++ 		return err;
++ 	}
++ 
++ 	/* take over the tty_port reference if the port was created with the
++ 	 * flag RFCOMM_RELEASE_ONHUP. This will force the release of the port
++ 	 * when the last process closes the tty. The behaviour is expected by
++ 	 * userspace.
++ 	 */
++ 	if (test_bit(RFCOMM_RELEASE_ONHUP, &dev->flags))
++ 		tty_port_put(&dev->port);
++ 
++ 	return 0;
+++>>>>>>> 5b899241874d (Bluetooth: Release RFCOMM port when the last user closes the TTY)
+  }
+  
+  static int rfcomm_tty_open(struct tty_struct *tty, struct file *filp)
+@@@ -1074,17 -1020,7 +1103,21 @@@ static void rfcomm_tty_hangup(struct tt
+  
+  	BT_DBG("tty %p dev %p", tty, dev);
+  
+++<<<<<<< HEAD
+ +	if (!dev)
+ +		return;
+ +
+ +	rfcomm_tty_flush_buffer(tty);
+ +
+ +	if (test_bit(RFCOMM_RELEASE_ONHUP, &dev->flags)) {
+ +		if (rfcomm_dev_get(dev->id) == NULL)
+ +			return;
+ +		rfcomm_dev_del(dev);
+ +		tty_port_put(&dev->port);
+ +	}
+++=======
++ 	tty_port_hangup(&dev->port);
+++>>>>>>> 5b899241874d (Bluetooth: Release RFCOMM port when the last user closes the TTY)
+  }
+  
+  static int rfcomm_tty_tiocmget(struct tty_struct *tty)
+* Unmerged path net/bluetooth/rfcomm/tty.c
