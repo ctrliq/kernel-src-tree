@@ -2614,6 +2614,7 @@ static const struct net_device_ops igbvf_netdev_ops = {
 	.ndo_poll_controller	= igbvf_netpoll,
 #endif
 	.ndo_set_features	= igbvf_set_features,
+	.ndo_features_check	= passthru_features_check,
 };
 
 /**
