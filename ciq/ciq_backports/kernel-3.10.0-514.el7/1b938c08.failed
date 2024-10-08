@@ -1,0 +1,151 @@
+fs/buffer.c: remove block_write_full_page_endio()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [fs] buffer: remove block_write_full_page_endio() (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 94.62%
+commit-author Matthew Wilcox <matthew.r.wilcox@intel.com>
+commit 1b938c0827478df268d2336469ec48d400a2eb3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1b938c08.failed
+
+The last in-tree caller of block_write_full_page_endio() was removed in
+January 2013.  It's time to remove the EXPORT_SYMBOL, which leaves
+block_write_full_page() as the only caller of
+block_write_full_page_endio(), so inline block_write_full_page_endio()
+into block_write_full_page().
+
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Dheeraj Reddy <dheeraj.reddy@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1b938c0827478df268d2336469ec48d400a2eb3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/page-io.c
+#	fs/ocfs2/file.c
+diff --cc fs/ext4/page-io.c
+index 7d6335f93656,1a64e7a52b84..000000000000
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@@ -458,6 -428,19 +458,22 @@@ int ext4_bio_write_page(struct ext4_io_
+  	do {
+  		block_start = bh_offset(bh);
+  		if (block_start >= len) {
+++<<<<<<< HEAD
+++=======
++ 			/*
++ 			 * Comments copied from block_write_full_page:
++ 			 *
++ 			 * The page straddles i_size.  It must be zeroed out on
++ 			 * each and every writepage invocation because it may
++ 			 * be mmapped.  "A file is mapped in multiples of the
++ 			 * page size.  For a file that is not a multiple of
++ 			 * the  page size, the remaining memory is zeroed when
++ 			 * mapped, and writes to that region are not written
++ 			 * out to the file."
++ 			 */
++ 			zero_user_segment(page, block_start,
++ 					  block_start + blocksize);
+++>>>>>>> 1b938c082747 (fs/buffer.c: remove block_write_full_page_endio())
+  			clear_buffer_dirty(bh);
+  			set_buffer_uptodate(bh);
+  			continue;
+diff --cc fs/ocfs2/file.c
+index 2bcf1677a59b,8eb6e5732d3b..000000000000
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@@ -823,8 -824,23 +823,26 @@@ static int ocfs2_write_zero_page(struc
+  			ret = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (handle)
+++=======
++ 	if (handle) {
++ 		/*
++ 		 * fs-writeback will release the dirty pages without page lock
++ 		 * whose offset are over inode size, the release happens at
++ 		 * block_write_full_page().
++ 		 */
++ 		i_size_write(inode, abs_to);
++ 		inode->i_blocks = ocfs2_inode_sector_count(inode);
++ 		di->i_size = cpu_to_le64((u64)i_size_read(inode));
++ 		inode->i_mtime = inode->i_ctime = CURRENT_TIME;
++ 		di->i_mtime = di->i_ctime = cpu_to_le64(inode->i_mtime.tv_sec);
++ 		di->i_ctime_nsec = cpu_to_le32(inode->i_mtime.tv_nsec);
++ 		di->i_mtime_nsec = di->i_ctime_nsec;
++ 		ocfs2_journal_dirty(handle, di_bh);
++ 		ocfs2_update_inode_fsync_trans(handle, inode, 1);
+++>>>>>>> 1b938c082747 (fs/buffer.c: remove block_write_full_page_endio())
+  		ocfs2_commit_trans(OCFS2_SB(inode->i_sb), handle);
+ -	}
+  
+  out_unlock:
+  	unlock_page(page);
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 58d670e9b7cf..e4ad0a8e7d53 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -2867,10 +2867,9 @@ EXPORT_SYMBOL(block_truncate_page);
+ 
+ /*
+  * The generic ->writepage function for buffer-backed address_spaces
+- * this form passes in the end_io handler used to finish the IO.
+  */
+-int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+-			struct writeback_control *wbc, bh_end_io_t *handler)
++int block_write_full_page(struct page *page, get_block_t *get_block,
++			struct writeback_control *wbc)
+ {
+ 	struct inode * const inode = page->mapping->host;
+ 	loff_t i_size = i_size_read(inode);
+@@ -2880,7 +2879,7 @@ int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+ 	/* Is the page fully inside i_size? */
+ 	if (page->index < end_index)
+ 		return __block_write_full_page(inode, page, get_block, wbc,
+-					       handler);
++					       end_buffer_async_write);
+ 
+ 	/* Is the page fully outside i_size? (truncate in progress) */
+ 	offset = i_size & (PAGE_CACHE_SIZE-1);
+@@ -2903,18 +2902,8 @@ int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+ 	 * writes to that region are not written out to the file."
+ 	 */
+ 	zero_user_segment(page, offset, PAGE_CACHE_SIZE);
+-	return __block_write_full_page(inode, page, get_block, wbc, handler);
+-}
+-EXPORT_SYMBOL(block_write_full_page_endio);
+-
+-/*
+- * The generic ->writepage function for buffer-backed address_spaces
+- */
+-int block_write_full_page(struct page *page, get_block_t *get_block,
+-			struct writeback_control *wbc)
+-{
+-	return block_write_full_page_endio(page, get_block, wbc,
+-					   end_buffer_async_write);
++	return __block_write_full_page(inode, page, get_block, wbc,
++							end_buffer_async_write);
+ }
+ EXPORT_SYMBOL(block_write_full_page);
+ 
+* Unmerged path fs/ext4/page-io.c
+* Unmerged path fs/ocfs2/file.c
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index 7a002c1c49a9..4e9dbc368e2d 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -206,8 +206,6 @@ void block_invalidatepage_range(struct page *page, unsigned int offset,
+ 				unsigned int length);
+ int block_write_full_page(struct page *page, get_block_t *get_block,
+ 				struct writeback_control *wbc);
+-int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+-			struct writeback_control *wbc, bh_end_io_t *handler);
+ int block_read_full_page(struct page*, get_block_t*);
+ int block_is_partially_uptodate(struct page *page, read_descriptor_t *desc,
+ 				unsigned long from);
