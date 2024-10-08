@@ -1,0 +1,163 @@
+xfs: prevent dropping ioend completions during buftarg wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 800b2694f890cc35a1bda63501fc71c94389d517
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/800b2694.failed
+
+xfs_wait_buftarg() waits for all pending I/O, drains the ioend
+completion workqueue and walks the LRU until all buffers in the cache
+have been released. This is traditionally an unmount operation` but the
+mechanism is also reused during filesystem freeze.
+
+xfs_wait_buftarg() invokes drain_workqueue() as part of the quiesce,
+which is intended more for a shutdown sequence in that it indicates to
+the queue that new operations are not expected once the drain has begun.
+New work jobs after this point result in a WARN_ON_ONCE() and are
+otherwise dropped.
+
+With filesystem freeze, however, read operations are allowed and can
+proceed during or after the workqueue drain. If such a read occurs
+during the drain sequence, the workqueue infrastructure complains about
+the queued ioend completion work item and drops it on the floor. As a
+result, the buffer remains on the LRU and the freeze never completes.
+
+Despite the fact that the overall buffer cache cleanup is not necessary
+during freeze, fix up this operation such that it is safe to invoke
+during non-unmount quiesce operations. Replace the drain_workqueue()
+call with flush_workqueue(), which runs a similar serialization on
+pending workqueue jobs without causing new jobs to be dropped. This is
+safe for unmount as unmount independently locks out new operations by
+the time xfs_wait_buftarg() is invoked.
+
+cc: <stable@vger.kernel.org>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 800b2694f890cc35a1bda63501fc71c94389d517)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index c8156d3de9e4,b5b9bffe3520..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1522,39 -1594,82 +1522,77 @@@ voi
+  xfs_wait_buftarg(
+  	struct xfs_buftarg	*btp)
+  {
+ -	LIST_HEAD(dispose);
+ -	int loop = 0;
+ +	struct xfs_buf		*bp;
+  
+++<<<<<<< HEAD
+ +restart:
+ +	spin_lock(&btp->bt_lru_lock);
+ +	while (!list_empty(&btp->bt_lru)) {
+ +		bp = list_first_entry(&btp->bt_lru, struct xfs_buf, b_lru);
+ +		if (atomic_read(&bp->b_hold) > 1) {
+ +			trace_xfs_buf_wait_buftarg(bp, _RET_IP_);
+ +			list_move_tail(&bp->b_lru, &btp->bt_lru);
+ +			spin_unlock(&btp->bt_lru_lock);
+++=======
++ 	/*
++ 	 * First wait on the buftarg I/O count for all in-flight buffers to be
++ 	 * released. This is critical as new buffers do not make the LRU until
++ 	 * they are released.
++ 	 *
++ 	 * Next, flush the buffer workqueue to ensure all completion processing
++ 	 * has finished. Just waiting on buffer locks is not sufficient for
++ 	 * async IO as the reference count held over IO is not released until
++ 	 * after the buffer lock is dropped. Hence we need to ensure here that
++ 	 * all reference counts have been dropped before we start walking the
++ 	 * LRU list.
++ 	 */
++ 	while (percpu_counter_sum(&btp->bt_io_count))
++ 		delay(100);
++ 	flush_workqueue(btp->bt_mount->m_buf_workqueue);
++ 
++ 	/* loop until there is nothing left on the lru list. */
++ 	while (list_lru_count(&btp->bt_lru)) {
++ 		list_lru_walk(&btp->bt_lru, xfs_buftarg_wait_rele,
++ 			      &dispose, LONG_MAX);
++ 
++ 		while (!list_empty(&dispose)) {
++ 			struct xfs_buf *bp;
++ 			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
++ 			list_del_init(&bp->b_lru);
++ 			if (bp->b_flags & XBF_WRITE_FAIL) {
++ 				xfs_alert(btp->bt_mount,
++ "Corruption Alert: Buffer at block 0x%llx had permanent write failures!",
++ 					(long long)bp->b_bn);
++ 				xfs_alert(btp->bt_mount,
++ "Please run xfs_repair to determine the extent of the problem.");
++ 			}
++ 			xfs_buf_rele(bp);
++ 		}
++ 		if (loop++ != 0)
+++>>>>>>> 800b2694f890 (xfs: prevent dropping ioend completions during buftarg wait)
+  			delay(100);
+ +			goto restart;
+ +		}
+ +		/*
+ +		 * clear the LRU reference count so the buffer doesn't get
+ +		 * ignored in xfs_buf_rele().
+ +		 */
+ +		atomic_set(&bp->b_lru_ref, 0);
+ +		spin_unlock(&btp->bt_lru_lock);
+ +		if (bp->b_flags & XBF_WRITE_FAIL) {
+ +			xfs_alert(btp->bt_mount,
+ +"Corruption Alert: Buffer at block 0x%llx had permanent write failures!\n"
+ +"Please run xfs_repair to determine the extent of the problem.",
+ +				(long long)bp->b_bn);
+ +		}
+ +		xfs_buf_rele(bp);
+ +		spin_lock(&btp->bt_lru_lock);
+  	}
+ +	spin_unlock(&btp->bt_lru_lock);
+  }
+  
+ -static enum lru_status
+ -xfs_buftarg_isolate(
+ -	struct list_head	*item,
+ -	struct list_lru_one	*lru,
+ -	spinlock_t		*lru_lock,
+ -	void			*arg)
+ -{
+ -	struct xfs_buf		*bp = container_of(item, struct xfs_buf, b_lru);
+ -	struct list_head	*dispose = arg;
+ -
+ -	/*
+ -	 * we are inverting the lru lock/bp->b_lock here, so use a trylock.
+ -	 * If we fail to get the lock, just skip it.
+ -	 */
+ -	if (!spin_trylock(&bp->b_lock))
+ -		return LRU_SKIP;
+ -	/*
+ -	 * Decrement the b_lru_ref count unless the value is already
+ -	 * zero. If the value is already zero, we need to reclaim the
+ -	 * buffer, otherwise it gets another trip through the LRU.
+ -	 */
+ -	if (!atomic_add_unless(&bp->b_lru_ref, -1, 0)) {
+ -		spin_unlock(&bp->b_lock);
+ -		return LRU_ROTATE;
+ -	}
+ -
+ -	bp->b_state |= XFS_BSTATE_DISPOSE;
+ -	list_lru_isolate_move(lru, item, dispose);
+ -	spin_unlock(&bp->b_lock);
+ -	return LRU_REMOVED;
+ -}
+ -
+ -static unsigned long
+ -xfs_buftarg_shrink_scan(
+ +int
+ +xfs_buftarg_shrink(
+  	struct shrinker		*shrink,
+  	struct shrink_control	*sc)
+  {
+* Unmerged path fs/xfs/xfs_buf.c
