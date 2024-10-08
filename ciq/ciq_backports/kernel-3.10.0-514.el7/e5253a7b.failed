@@ -1,0 +1,144 @@
+libceph: allocate dummy osdmap in ceph_osdc_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit e5253a7bde13788d9dc75f42eb47ea119af5609f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e5253a7b.failed
+
+This leads to a simpler osdmap handling code, particularly when dealing
+with pi->was_full, which is introduced in a later commit.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit e5253a7bde13788d9dc75f42eb47ea119af5609f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/osd_client.c
+diff --cc net/ceph/osd_client.c
+index 4e649b707367,9c35fd84a410..000000000000
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@@ -2133,11 -2347,10 +2133,9 @@@ void ceph_osdc_handle_map(struct ceph_o
+  		nr_maps--;
+  	}
+  
+- 	if (!osdc->osdmap)
+- 		goto bad;
+  done:
+  	downgrade_write(&osdc->map_sem);
+ -	ceph_monc_got_map(&osdc->client->monc, CEPH_SUB_OSDMAP,
+ -			  osdc->osdmap->epoch);
+ +	ceph_monc_got_osdmap(&osdc->client->monc, osdc->osdmap->epoch);
+  
+  	/*
+  	 * subscribe to subsequent osdmap updates if full to ensure
+@@@ -2592,18 -2705,18 +2589,22 @@@ int ceph_osdc_init(struct ceph_osd_clie
+  	osdc->event_tree = RB_ROOT;
+  	osdc->event_count = 0;
+  
+ +	schedule_delayed_work(&osdc->osds_timeout_work,
+ +	   round_jiffies_relative(osdc->client->options->osd_idle_ttl * HZ));
+ +
+  	err = -ENOMEM;
++ 	osdc->osdmap = ceph_osdmap_alloc();
++ 	if (!osdc->osdmap)
++ 		goto out;
++ 
+  	osdc->req_mempool = mempool_create_slab_pool(10,
+  						     ceph_osd_request_cache);
+  	if (!osdc->req_mempool)
+- 		goto out;
++ 		goto out_map;
+  
+  	err = ceph_msgpool_init(&osdc->msgpool_op, CEPH_MSG_OSD_OP,
+ -				PAGE_SIZE, 10, true, "osd_op");
+ +				OSD_OP_FRONT_LEN, 10, true,
+ +				"osd_op");
+  	if (err < 0)
+  		goto out_mempool;
+  	err = ceph_msgpool_init(&osdc->msgpool_op_reply, CEPH_MSG_OSD_OPREPLY,
+@@@ -2635,11 -2754,16 +2638,24 @@@ void ceph_osdc_stop(struct ceph_osd_cli
+  	destroy_workqueue(osdc->notify_wq);
+  	cancel_delayed_work_sync(&osdc->timeout_work);
+  	cancel_delayed_work_sync(&osdc->osds_timeout_work);
+++<<<<<<< HEAD
+ +	if (osdc->osdmap) {
+ +		ceph_osdmap_destroy(osdc->osdmap);
+ +		osdc->osdmap = NULL;
+ +	}
+ +	remove_all_osds(osdc);
+++=======
++ 
++ 	mutex_lock(&osdc->request_mutex);
++ 	while (!RB_EMPTY_ROOT(&osdc->osds)) {
++ 		struct ceph_osd *osd = rb_entry(rb_first(&osdc->osds),
++ 						struct ceph_osd, o_node);
++ 		remove_osd(osdc, osd);
++ 	}
++ 	mutex_unlock(&osdc->request_mutex);
++ 
++ 	ceph_osdmap_destroy(osdc->osdmap);
+++>>>>>>> e5253a7bde13 (libceph: allocate dummy osdmap in ceph_osdc_init())
+  	mempool_destroy(osdc->req_mempool);
+  	ceph_msgpool_destroy(&osdc->msgpool_op);
+  	ceph_msgpool_destroy(&osdc->msgpool_op_reply);
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index e8bf68758dc4..6386f1ba3867 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -196,6 +196,7 @@ static inline int ceph_decode_pgid(void **p, void *end, struct ceph_pg *pgid)
+ 	return 0;
+ }
+ 
++struct ceph_osdmap *ceph_osdmap_alloc(void);
+ extern struct ceph_osdmap *ceph_osdmap_decode(void **p, void *end);
+ struct ceph_osdmap *osdmap_apply_incremental(void **p, void *end,
+ 					     struct ceph_osdmap *map);
+* Unmerged path net/ceph/osd_client.c
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 86f7347de0b2..e6d68fdc5efa 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -707,6 +707,23 @@ bad:
+ /*
+  * osd map
+  */
++struct ceph_osdmap *ceph_osdmap_alloc(void)
++{
++	struct ceph_osdmap *map;
++
++	map = kzalloc(sizeof(*map), GFP_NOIO);
++	if (!map)
++		return NULL;
++
++	map->pg_pools = RB_ROOT;
++	map->pool_max = -1;
++	map->pg_temp = RB_ROOT;
++	map->primary_temp = RB_ROOT;
++	mutex_init(&map->crush_scratch_mutex);
++
++	return map;
++}
++
+ void ceph_osdmap_destroy(struct ceph_osdmap *map)
+ {
+ 	dout("osdmap_destroy %p\n", map);
+@@ -1230,14 +1247,10 @@ struct ceph_osdmap *ceph_osdmap_decode(void **p, void *end)
+ 	struct ceph_osdmap *map;
+ 	int ret;
+ 
+-	map = kzalloc(sizeof(*map), GFP_NOFS);
++	map = ceph_osdmap_alloc();
+ 	if (!map)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	map->pg_temp = RB_ROOT;
+-	map->primary_temp = RB_ROOT;
+-	mutex_init(&map->crush_scratch_mutex);
+-
+ 	ret = osdmap_decode(p, end, map);
+ 	if (ret) {
+ 		ceph_osdmap_destroy(map);
