@@ -414,6 +414,7 @@ static int azx_pcm_close(struct snd_pcm_substream *substream)
 		hinfo->ops.close(hinfo, apcm->codec, substream);
 	snd_hda_power_down(apcm->codec);
 	mutex_unlock(&chip->open_mutex);
+	snd_hda_codec_pcm_put(apcm->info);
 	return 0;
 }
 
@@ -800,6 +801,7 @@ static int azx_pcm_open(struct snd_pcm_substream *substream)
 	int err;
 	int buff_step;
 
+	snd_hda_codec_pcm_get(apcm->info);
 	mutex_lock(&chip->open_mutex);
 	azx_dev = azx_assign_device(chip, substream);
 	if (azx_dev == NULL) {
@@ -881,6 +883,7 @@ static int azx_pcm_open(struct snd_pcm_substream *substream)
 	snd_hda_power_down(apcm->codec);
  unlock:
 	mutex_unlock(&chip->open_mutex);
+	snd_hda_codec_pcm_put(apcm->info);
 	return err;
 }
 
