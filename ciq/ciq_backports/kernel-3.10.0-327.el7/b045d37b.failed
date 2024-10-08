@@ -1,0 +1,146 @@
+ip_tunnel: fix panic in ip_tunnel_xmit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit b045d37bd68c20ca88123c2b363cac5e3dae815f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/b045d37b.failed
+
+Setting rt variable to NULL at the beginning of ip_tunnel_xmit()
+missed possible use of this variable as a scratch value.
+
+Also fixes a possible dst leak in tunnel_dst_check() :
+If we had to call tunnel_dst_reset(), we forgot to
+release the reference on dst.
+
+Merges tunnel_dst_get()/tunnel_dst_check() into
+a single tunnel_rtable_get() function for clarity.
+
+Many thanks to Tommi for his report and tests.
+
+Fixes: 7d442fab0a67 ("ipv4: Cache dst in tunnels")
+	Reported-by: Tommi Rantala <tt.rantala@gmail.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Tested-by: Tommi Rantala <tt.rantala@gmail.com>
+	Cc: Tom Herbert <therbert@google.com>
+	Cc: Maciej Żenczykowski <maze@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b045d37bd68c20ca88123c2b363cac5e3dae815f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 97e997263ac1,50228be5c17b..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,6 -68,57 +68,60 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 			     struct dst_entry *dst)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	if (dst) {
++ 		if (dst->flags & DST_NOCACHE)
++ 			dst = NULL;
++ 		else
++ 			dst_clone(dst);
++ 	}
++ 	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
++ 	dst_release(old_dst);
++ }
++ 
++ static void tunnel_dst_set(struct ip_tunnel *t, struct dst_entry *dst)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst);
++ }
++ 
++ static void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL);
++ }
++ 
++ static void tunnel_dst_reset_all(struct ip_tunnel *t)
++ {
++ 	int i;
++ 
++ 	for_each_possible_cpu(i)
++ 		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL);
++ }
++ 
++ static struct rtable *tunnel_rtable_get(struct ip_tunnel *t, u32 cookie)
++ {
++ 	struct dst_entry *dst;
++ 
++ 	rcu_read_lock();
++ 	dst = rcu_dereference(this_cpu_ptr(t->dst_cache)->dst);
++ 	if (dst) {
++ 		if (dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
++ 			rcu_read_unlock();
++ 			tunnel_dst_reset(t);
++ 			return NULL;
++ 		}
++ 		dst_hold(dst);
++ 	}
++ 	rcu_read_unlock();
++ 	return (struct rtable *)dst;
++ }
++ 
+++>>>>>>> b045d37bd68c (ip_tunnel: fix panic in ip_tunnel_xmit())
+  /* Often modified stats are per cpu, other are shared (netdev->stats) */
+  struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+  						struct rtnl_link_stats64 *tot)
+@@@ -589,22 -639,31 +643,39 @@@ void ip_tunnel_xmit(struct sk_buff *skb
+  	tos = tnl_params->tos;
+  	if (tos & 0x1) {
+  		tos &= ~0x1;
+ -		if (skb->protocol == htons(ETH_P_IP)) {
+ +		if (skb->protocol == htons(ETH_P_IP))
+  			tos = inner_iph->tos;
+ -			connected = false;
+ -		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+ +		else if (skb->protocol == htons(ETH_P_IPV6))
+  			tos = ipv6_get_dsfield((const struct ipv6hdr *)inner_iph);
+ -			connected = false;
+ -		}
+  	}
+  
+++<<<<<<< HEAD
+ +	rt = ip_route_output_tunnel(tunnel->net, &fl4,
+ +				    protocol,
+ +				    dst, tnl_params->saddr,
+ +				    tunnel->parms.o_key,
+ +				    RT_TOS(tos),
+ +				    tunnel->parms.link);
+ +	if (IS_ERR(rt)) {
+ +		dev->stats.tx_carrier_errors++;
+ +		goto tx_error;
+++=======
++ 	init_tunnel_flow(&fl4, protocol, dst, tnl_params->saddr,
++ 			 tunnel->parms.o_key, RT_TOS(tos), tunnel->parms.link);
++ 
++ 	rt = connected ? tunnel_rtable_get(tunnel, 0) : NULL;
++ 
++ 	if (!rt) {
++ 		rt = ip_route_output_key(tunnel->net, &fl4);
++ 
++ 		if (IS_ERR(rt)) {
++ 			dev->stats.tx_carrier_errors++;
++ 			goto tx_error;
++ 		}
++ 		if (connected)
++ 			tunnel_dst_set(tunnel, &rt->dst);
+++>>>>>>> b045d37bd68c (ip_tunnel: fix panic in ip_tunnel_xmit())
+  	}
+ -
+  	if (rt->dst.dev == dev) {
+  		ip_rt_put(rt);
+  		dev->stats.collisions++;
+* Unmerged path net/ipv4/ip_tunnel.c
