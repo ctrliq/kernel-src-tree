@@ -1,0 +1,187 @@
+drm/i915: Get rid of intel_dp_dpcd_read_wake()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] i915: Get rid of intel_dp_dpcd_read_wake() (Rob Clark) [1072036 1115530 1202702 1211398 1235963 1272159]
+Rebuild_FUZZ: 95.45%
+commit-author Lyude <cpaul@redhat.com>
+commit 9f085ebb1a50f2728946028548c08860a9005c27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9f085ebb.failed
+
+Since we've fixed up drm_dp_dpcd_read() to allow for retries when things
+timeout, there's no use for having this function anymore. Good riddens.
+
+	Signed-off-by: Lyude <cpaul@redhat.com>
+	Tested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460559513-32280-5-git-send-email-cpaul@redhat.com
+(cherry picked from commit 9f085ebb1a50f2728946028548c08860a9005c27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_dp.c
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index 1a4b33ea5453,b52676a032f9..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -2818,51 -3067,51 +2818,18 @@@ static void chv_dp_pre_pll_enable(struc
+  		val |= CHV_CMN_USEDCLKCHANNEL;
+  	vlv_dpio_write(dev_priv, pipe, CHV_CMN_DW19(ch), val);
+  
+ -	mutex_unlock(&dev_priv->sb_lock);
+ -}
+ -
+ -static void chv_dp_post_pll_disable(struct intel_encoder *encoder)
+ -{
+ -	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ -	enum pipe pipe = to_intel_crtc(encoder->base.crtc)->pipe;
+ -	u32 val;
+ -
+ -	mutex_lock(&dev_priv->sb_lock);
+ -
+ -	/* disable left/right clock distribution */
+ -	if (pipe != PIPE_B) {
+ -		val = vlv_dpio_read(dev_priv, pipe, _CHV_CMN_DW5_CH0);
+ -		val &= ~(CHV_BUFLEFTENA1_MASK | CHV_BUFRIGHTENA1_MASK);
+ -		vlv_dpio_write(dev_priv, pipe, _CHV_CMN_DW5_CH0, val);
+ -	} else {
+ -		val = vlv_dpio_read(dev_priv, pipe, _CHV_CMN_DW1_CH1);
+ -		val &= ~(CHV_BUFLEFTENA2_MASK | CHV_BUFRIGHTENA2_MASK);
+ -		vlv_dpio_write(dev_priv, pipe, _CHV_CMN_DW1_CH1, val);
+ -	}
+ -
+ -	mutex_unlock(&dev_priv->sb_lock);
+ -
+ -	/*
+ -	 * Leave the power down bit cleared for at least one
+ -	 * lane so that chv_powergate_phy_ch() will power
+ -	 * on something when the channel is otherwise unused.
+ -	 * When the port is off and the override is removed
+ -	 * the lanes power down anyway, so otherwise it doesn't
+ -	 * really matter what the state of power down bits is
+ -	 * after this.
+ -	 */
+ -	chv_phy_powergate_lanes(encoder, false, 0x0);
+ +	mutex_unlock(&dev_priv->dpio_lock);
+  }
+  
+- /*
+-  * Native read with retry for link status and receiver capability reads for
+-  * cases where the sink may still be asleep.
+-  *
+-  * Sinks are *supposed* to come up within 1ms from an off state, but we're also
+-  * supposed to retry 3 times per the spec.
+-  */
+- static ssize_t
+- intel_dp_dpcd_read_wake(struct drm_dp_aux *aux, unsigned int offset,
+- 			void *buffer, size_t size)
+- {
+- 	ssize_t ret;
+- 	int i;
+- 
+- 	/*
+- 	 * Sometime we just get the same incorrect byte repeated
+- 	 * over the entire buffer. Doing just one throw away read
+- 	 * initially seems to "solve" it.
+- 	 */
+- 	drm_dp_dpcd_read(aux, DP_DPCD_REV, buffer, 1);
+- 
+- 	for (i = 0; i < 3; i++) {
+- 		ret = drm_dp_dpcd_read(aux, offset, buffer, size);
+- 		if (ret == size)
+- 			return ret;
+- 		msleep(1);
+- 	}
+- 
+- 	return ret;
+- }
+- 
+  /*
+   * Fetch AUX CH registers 0x202 - 0x207 which contain
+   * link status information
+   */
+ -bool
+ +static bool
+  intel_dp_get_link_status(struct intel_dp *intel_dp, uint8_t link_status[DP_LINK_STATUS_SIZE])
+  {
+- 	return intel_dp_dpcd_read_wake(&intel_dp->aux,
+- 				       DP_LANE0_1_STATUS,
+- 				       link_status,
+- 				       DP_LINK_STATUS_SIZE) == DP_LINK_STATUS_SIZE;
++ 	return drm_dp_dpcd_read(&intel_dp->aux, DP_LANE0_1_STATUS, link_status,
++ 				DP_LINK_STATUS_SIZE) == DP_LINK_STATUS_SIZE;
+  }
+  
+  /* These are source-specific values. */
+@@@ -3771,6 -3755,27 +3738,30 @@@ intel_dp_get_dpcd(struct intel_dp *inte
+  	if (intel_dp->dpcd[DP_DPCD_REV] == 0)
+  		return false; /* DPCD not present */
+  
+++<<<<<<< HEAD
+++=======
++ 	if (drm_dp_dpcd_read(&intel_dp->aux, DP_SINK_COUNT,
++ 			     &intel_dp->sink_count, 1) < 0)
++ 		return false;
++ 
++ 	/*
++ 	 * Sink count can change between short pulse hpd hence
++ 	 * a member variable in intel_dp will track any changes
++ 	 * between short pulse interrupts.
++ 	 */
++ 	intel_dp->sink_count = DP_GET_SINK_COUNT(intel_dp->sink_count);
++ 
++ 	/*
++ 	 * SINK_COUNT == 0 and DOWNSTREAM_PORT_PRESENT == 1 implies that
++ 	 * a dongle is present but no display. Unless we require to know
++ 	 * if a dongle is present or not, we don't need to update
++ 	 * downstream port information. So, an early return here saves
++ 	 * time from performing other operations which are not required.
++ 	 */
++ 	if (!intel_dp->sink_count)
++ 		return false;
++ 
+++>>>>>>> 9f085ebb1a50 (drm/i915: Get rid of intel_dp_dpcd_read_wake())
+  	/* Check if the panel supports PSR */
+  	memset(intel_dp->psr_dpcd, 0, sizeof(intel_dp->psr_dpcd));
+  	if (is_edp(intel_dp)) {
+@@@ -3781,16 -3786,26 +3772,34 @@@
+  			dev_priv->psr.sink_support = true;
+  			DRM_DEBUG_KMS("Detected EDP PSR Panel.\n");
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (INTEL_INFO(dev)->gen >= 9 &&
++ 			(intel_dp->psr_dpcd[0] & DP_PSR2_IS_SUPPORTED)) {
++ 			uint8_t frame_sync_cap;
++ 
++ 			dev_priv->psr.sink_support = true;
++ 			drm_dp_dpcd_read(&intel_dp->aux,
++ 					 DP_SINK_DEVICE_AUX_FRAME_SYNC_CAP,
++ 					 &frame_sync_cap, 1);
++ 			dev_priv->psr.aux_frame_sync = frame_sync_cap ? true : false;
++ 			/* PSR2 needs frame sync as well */
++ 			dev_priv->psr.psr2_support = dev_priv->psr.aux_frame_sync;
++ 			DRM_DEBUG_KMS("PSR2 %s on sink",
++ 				dev_priv->psr.psr2_support ? "supported" : "not supported");
++ 		}
+++>>>>>>> 9f085ebb1a50 (drm/i915: Get rid of intel_dp_dpcd_read_wake())
+  	}
+  
+ -	DRM_DEBUG_KMS("Display Port TPS3 support: source %s, sink %s\n",
+ -		      yesno(intel_dp_source_supports_hbr2(intel_dp)),
+ -		      yesno(drm_dp_tps3_supported(intel_dp->dpcd)));
+ +	/* Training Pattern 3 support, both source and sink */
+ +	if (intel_dp->dpcd[DP_DPCD_REV] >= 0x12 &&
+ +	    intel_dp->dpcd[DP_MAX_LANE_COUNT] & DP_TPS3_SUPPORTED &&
+ +	    (IS_HASWELL(dev_priv) || INTEL_INFO(dev_priv)->gen >= 8)) {
+ +		intel_dp->use_tps3 = true;
+ +		DRM_DEBUG_KMS("Displayport TPS3 supported\n");
+ +	} else
+ +		intel_dp->use_tps3 = false;
+  
+  	/* Intermediate frequency support */
+  	if (is_edp(intel_dp) &&
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
