@@ -231,7 +231,7 @@ static int cpufreq_stats_create_table(struct cpufreq_policy *policy,
 	stat->time_in_state = kzalloc(alloc_size, GFP_KERNEL);
 	if (!stat->time_in_state) {
 		ret = -ENOMEM;
-		goto error_out;
+		goto error_alloc;
 	}
 	stat->freq_table = (unsigned int *)(stat->time_in_state + count);
 
@@ -253,6 +253,8 @@ static int cpufreq_stats_create_table(struct cpufreq_policy *policy,
 	spin_unlock(&cpufreq_stats_lock);
 	cpufreq_cpu_put(data);
 	return 0;
+error_alloc:
+	sysfs_remove_group(&policy->kobj, &stats_attr_group);
 error_out:
 	cpufreq_cpu_put(data);
 error_get_fail:
