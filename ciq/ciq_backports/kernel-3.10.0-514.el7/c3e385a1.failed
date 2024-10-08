@@ -1,0 +1,217 @@
+megaraid_sas: reduce memory footprints in kdump mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sumit Saxena <sumit.saxena@broadcom.com>
+commit c3e385a1b985a9202ba7fbd0bdbdcb909905d00c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/c3e385a1.failed
+
+This patch will reduce memory footprints of megaraid_sas driver when
+booted in kdump mode.  Driver will not allocate memory for optional and
+perfromance oriented features.  Below are key changes done in
+megaraid_sas driver to do this:
+
+1. Limit Controller's queue depth to 100 in kdump mode.
+
+2. Do not allocate memory for system info buffer and PD info buffer.
+
+3. Disable performance oriented features e.g. Disable RDPQ mode, disable
+   dual queue depth, restrict to single MSI-x vector.
+
+	Signed-off-by: Sumit Saxena <sumit.saxena@broadcom.com>
+	Reviewed-by: Hannes Reinicke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c3e385a1b985a9202ba7fbd0bdbdcb909905d00c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index 154bb3479f01,858820255dcb..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -5487,14 -5770,6 +5480,17 @@@ static int megasas_probe_one(struct pci
+  	spin_lock_init(&instance->crashdump_lock);
+  	instance->crash_dump_buf = NULL;
+  
+++<<<<<<< HEAD
+ +	if (!reset_devices)
+ +		instance->crash_dump_buf = pci_alloc_consistent(pdev,
+ +						CRASH_DMA_BUF_SIZE,
+ +						&instance->crash_dump_h);
+ +	if (!instance->crash_dump_buf)
+ +		dev_err(&instance->pdev->dev, "Can't allocate Firmware "
+ +			"crash dump DMA buffer\n");
+ +
+++=======
+++>>>>>>> c3e385a1b985 (megaraid_sas: reduce memory footprints in kdump mode)
+  	megasas_poll_wait_aen = 0;
+  	instance->flag_ieee = 0;
+  	instance->ev = NULL;
+@@@ -5513,6 -5788,27 +5509,30 @@@
+  		goto fail_alloc_dma_buf;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!reset_devices) {
++ 		instance->system_info_buf = pci_zalloc_consistent(pdev,
++ 					sizeof(struct MR_DRV_SYSTEM_INFO),
++ 					&instance->system_info_h);
++ 		if (!instance->system_info_buf)
++ 			dev_info(&instance->pdev->dev, "Can't allocate system info buffer\n");
++ 
++ 		instance->pd_info = pci_alloc_consistent(pdev,
++ 			sizeof(struct MR_PD_INFO), &instance->pd_info_h);
++ 
++ 		if (!instance->pd_info)
++ 			dev_err(&instance->pdev->dev, "Failed to alloc mem for pd_info\n");
++ 
++ 		instance->crash_dump_buf = pci_alloc_consistent(pdev,
++ 						CRASH_DMA_BUF_SIZE,
++ 						&instance->crash_dump_h);
++ 		if (!instance->crash_dump_buf)
++ 			dev_err(&pdev->dev, "Can't allocate Firmware "
++ 				"crash dump DMA buffer\n");
++ 	}
++ 
+++>>>>>>> c3e385a1b985 (megaraid_sas: reduce memory footprints in kdump mode)
+  	/*
+  	 * Initialize locks and queues
+  	 */
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index c3d8c908e26e,320c1a0952d0..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -206,54 -209,70 +206,97 @@@ megasas_fire_cmd_fusion(struct megasas_
+  #endif
+  }
+  
+ +
+  /**
+ - * megasas_fusion_update_can_queue -	Do all Adapter Queue depth related calculations here
+ - * @instance:							Adapter soft state
+ - * fw_boot_context:						Whether this function called during probe or after OCR
+ - *
+ - * This function is only for fusion controllers.
+ - * Update host can queue, if firmware downgrade max supported firmware commands.
+ - * Firmware upgrade case will be skiped because underlying firmware has
+ - * more resource than exposed to the OS.
+ - *
+ + * megasas_teardown_frame_pool_fusion -	Destroy the cmd frame DMA pool
+ + * @instance:				Adapter soft state
+   */
+ -static void
+ -megasas_fusion_update_can_queue(struct megasas_instance *instance, int fw_boot_context)
+ +static void megasas_teardown_frame_pool_fusion(
+ +	struct megasas_instance *instance)
+  {
+ -	u16 cur_max_fw_cmds = 0;
+ -	u16 ldio_threshold = 0;
+ -	struct megasas_register_set __iomem *reg_set;
+ +	int i;
+ +	struct fusion_context *fusion = instance->ctrl_context;
+  
+ -	reg_set = instance->reg_set;
+ +	u16 max_cmd = instance->max_fw_cmds;
+  
+ -	cur_max_fw_cmds = readl(&instance->reg_set->outbound_scratch_pad_3) & 0x00FFFF;
+ +	struct megasas_cmd_fusion *cmd;
+  
+++<<<<<<< HEAD
+ +	if (!fusion->sg_dma_pool || !fusion->sense_dma_pool) {
+ +		printk(KERN_ERR "megasas: dma pool is null. SG Pool %p, "
+ +		       "sense pool : %p\n", fusion->sg_dma_pool,
+ +		       fusion->sense_dma_pool);
+ +		return;
+++=======
++ 	if (dual_qdepth_disable || !cur_max_fw_cmds)
++ 		cur_max_fw_cmds = instance->instancet->read_fw_status_reg(reg_set) & 0x00FFFF;
++ 	else
++ 		ldio_threshold =
++ 			(instance->instancet->read_fw_status_reg(reg_set) & 0x00FFFF) - MEGASAS_FUSION_IOCTL_CMDS;
++ 
++ 	dev_info(&instance->pdev->dev,
++ 			"Current firmware maximum commands: %d\t LDIO threshold: %d\n",
++ 			cur_max_fw_cmds, ldio_threshold);
++ 
++ 	if (fw_boot_context == OCR_CONTEXT) {
++ 		cur_max_fw_cmds = cur_max_fw_cmds - 1;
++ 		if (cur_max_fw_cmds <= instance->max_fw_cmds) {
++ 			instance->cur_can_queue =
++ 				cur_max_fw_cmds - (MEGASAS_FUSION_INTERNAL_CMDS +
++ 						MEGASAS_FUSION_IOCTL_CMDS);
++ 			instance->host->can_queue = instance->cur_can_queue;
++ 			instance->ldio_threshold = ldio_threshold;
++ 		}
++ 	} else {
++ 		instance->max_fw_cmds = cur_max_fw_cmds;
++ 		instance->ldio_threshold = ldio_threshold;
++ 
++ 		if (!instance->is_rdpq)
++ 			instance->max_fw_cmds = min_t(u16, instance->max_fw_cmds, 1024);
++ 
++ 		if (reset_devices)
++ 			instance->max_fw_cmds = min(instance->max_fw_cmds,
++ 						(u16)MEGASAS_KDUMP_QUEUE_DEPTH);
++ 		/*
++ 		* Reduce the max supported cmds by 1. This is to ensure that the
++ 		* reply_q_sz (1 more than the max cmd that driver may send)
++ 		* does not exceed max cmds that the FW can support
++ 		*/
++ 		instance->max_fw_cmds = instance->max_fw_cmds-1;
++ 
++ 		instance->max_scsi_cmds = instance->max_fw_cmds -
++ 				(MEGASAS_FUSION_INTERNAL_CMDS +
++ 				MEGASAS_FUSION_IOCTL_CMDS);
++ 		instance->cur_can_queue = instance->max_scsi_cmds;
+++>>>>>>> c3e385a1b985 (megaraid_sas: reduce memory footprints in kdump mode)
+ +	}
+ +
+ +	/*
+ +	 * Return all frames to pool
+ +	 */
+ +	for (i = 0; i < max_cmd; i++) {
+ +
+ +		cmd = fusion->cmd_list[i];
+ +
+ +		if (cmd->sg_frame)
+ +			pci_pool_free(fusion->sg_dma_pool, cmd->sg_frame,
+ +				      cmd->sg_frame_phys_addr);
+ +
+ +		if (cmd->sense)
+ +			pci_pool_free(fusion->sense_dma_pool, cmd->sense,
+ +				      cmd->sense_phys_addr);
+  	}
+ +
+ +	/*
+ +	 * Now destroy the pool itself
+ +	 */
+ +	pci_pool_destroy(fusion->sg_dma_pool);
+ +	pci_pool_destroy(fusion->sense_dma_pool);
+ +
+ +	fusion->sg_dma_pool = NULL;
+ +	fusion->sense_dma_pool = NULL;
+  }
+ +
+  /**
+   * megasas_free_cmds_fusion -	Free all the cmds in the free cmd pool
+   * @instance:		Adapter soft state
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index d4c399b43165..1cce9d554d17 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1084,6 +1084,8 @@ struct megasas_ctrl_info {
+ #define VD_EXT_DEBUG 0
+ 
+ 
++#define MEGASAS_KDUMP_QUEUE_DEPTH               100
++
+ enum MR_SCSI_CMD_TYPE {
+ 	READ_WRITE_LDIO = 0,
+ 	NON_READ_WRITE_LDIO = 1,
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
