@@ -1,0 +1,419 @@
+ext4: add DAX functionality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 923ae0ff9250430133b3310fe62c47538cf1cbc1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/923ae0ff.failed
+
+This is a port of the DAX functionality found in the current version of
+ext2.
+
+[matthew.r.wilcox@intel.com: heavily tweaked]
+[akpm@linux-foundation.org: remap_pages went away]
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Andreas Dilger <andreas.dilger@intel.com>
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Boaz Harrosh <boaz@plexistor.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 923ae0ff9250430133b3310fe62c47538cf1cbc1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/dax.txt
+#	fs/ext4/file.c
+#	fs/ext4/indirect.c
+#	fs/ext4/inode.c
+#	fs/ext4/namei.c
+diff --cc fs/ext4/file.c
+index 3034d6b4eaee,33a09da16c9c..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -92,24 -89,29 +92,30 @@@ ext4_unaligned_aio(struct inode *inode
+  }
+  
+  static ssize_t
+ -ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ +ext4_file_dio_write(struct kiocb *iocb, const struct iovec *iov,
+ +		    unsigned long nr_segs, loff_t pos)
+  {
+  	struct file *file = iocb->ki_filp;
+ -	struct inode *inode = file_inode(iocb->ki_filp);
+ -	struct mutex *aio_mutex = NULL;
+ +	struct inode *inode = file->f_mapping->host;
+  	struct blk_plug plug;
+++<<<<<<< HEAD
+ +	int unaligned_aio = 0;
+++=======
++ 	int o_direct = io_is_direct(file);
++ 	int overwrite = 0;
++ 	size_t length = iov_iter_count(from);
+++>>>>>>> 923ae0ff9250 (ext4: add DAX functionality)
+  	ssize_t ret;
+ -	loff_t pos = iocb->ki_pos;
+ +	int overwrite = 0;
+ +	size_t length = iov_length(iov, nr_segs);
+  
+ -	/*
+ -	 * Unaligned direct AIO must be serialized; see comment above
+ -	 * In the case of O_APPEND, assume that we must always serialize
+ -	 */
+ -	if (o_direct &&
+ -	    ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS) &&
+ -	    !is_sync_kiocb(iocb) &&
+ -	    (file->f_flags & O_APPEND ||
+ -	     ext4_unaligned_aio(inode, from, pos))) {
+ -		aio_mutex = ext4_aio_mutex(inode);
+ -		mutex_lock(aio_mutex);
+ +	if (ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS) &&
+ +	    !is_sync_kiocb(iocb))
+ +		unaligned_aio = ext4_unaligned_aio(inode, iov, nr_segs, pos);
+ +
+ +	/* Unaligned direct AIO must be serialized; see comment above */
+ +	if (unaligned_aio) {
+ +		mutex_lock(ext4_aio_mutex(inode));
+  		ext4_unwritten_wait(inode);
+  	}
+  
+@@@ -200,10 -188,33 +206,30 @@@ ext4_file_write(struct kiocb *iocb, con
+  	return ret;
+  }
+  
++ #ifdef CONFIG_FS_DAX
++ static int ext4_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_fault(vma, vmf, ext4_get_block);
++ 					/* Is this the right get_block? */
++ }
++ 
++ static int ext4_dax_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return dax_mkwrite(vma, vmf, ext4_get_block);
++ }
++ 
++ static const struct vm_operations_struct ext4_dax_vm_ops = {
++ 	.fault		= ext4_dax_fault,
++ 	.page_mkwrite	= ext4_dax_mkwrite,
++ };
++ #else
++ #define ext4_dax_vm_ops	ext4_file_vm_ops
++ #endif
++ 
+  static const struct vm_operations_struct ext4_file_vm_ops = {
+  	.fault		= filemap_fault,
+ -	.map_pages	= filemap_map_pages,
+  	.page_mkwrite   = ext4_page_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+  };
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --cc fs/ext4/indirect.c
+index cf83aba7d248,6b9878a24182..000000000000
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@@ -692,15 -689,22 +692,34 @@@ retry
+  			inode_dio_done(inode);
+  			goto locked;
+  		}
+++<<<<<<< HEAD
+ +		ret = __blockdev_direct_IO(rw, iocb, inode,
+ +				 inode->i_sb->s_bdev, iov,
+ +				 offset, nr_segs,
+ +				 ext4_get_block, NULL, NULL, 0);
+ +		inode_dio_done(inode);
+ +	} else {
+ +locked:
+ +		ret = blockdev_direct_IO(rw, iocb, inode, iov,
+ +				 offset, nr_segs, ext4_get_block);
+++=======
++ 		if (IS_DAX(inode))
++ 			ret = dax_do_io(rw, iocb, inode, iter, offset,
++ 					ext4_get_block, NULL, 0);
++ 		else
++ 			ret = __blockdev_direct_IO(rw, iocb, inode,
++ 					inode->i_sb->s_bdev, iter, offset,
++ 					ext4_get_block, NULL, NULL, 0);
++ 		inode_dio_done(inode);
++ 	} else {
++ locked:
++ 		if (IS_DAX(inode))
++ 			ret = dax_do_io(rw, iocb, inode, iter, offset,
++ 					ext4_get_block, NULL, DIO_LOCKING);
++ 		else
++ 			ret = blockdev_direct_IO(rw, iocb, inode, iter,
++ 					offset, ext4_get_block);
+++>>>>>>> 923ae0ff9250 (ext4: add DAX functionality)
+  
+  		if (unlikely((rw & WRITE) && ret < 0)) {
+  			loff_t isize = i_size_read(inode);
+diff --cc fs/ext4/inode.c
+index 7e00e3fcc247,28555f191b62..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -702,8 -702,17 +714,18 @@@ static int _ext4_get_block(struct inod
+  
+  	ret = ext4_map_blocks(handle, inode, &map, flags);
+  	if (ret > 0) {
+ -		ext4_io_end_t *io_end = ext4_inode_aio(inode);
+ -
+  		map_bh(bh, inode->i_sb, map.m_pblk);
+  		bh->b_state = (bh->b_state & ~EXT4_MAP_FLAGS) | map.m_flags;
+++<<<<<<< HEAD
+++=======
++ 		if (IS_DAX(inode) && buffer_unwritten(bh) && !io_end) {
++ 			bh->b_assoc_map = inode->i_mapping;
++ 			bh->b_private = (void *)(unsigned long)iblock;
++ 			bh->b_end_io = ext4_end_io_unwritten;
++ 		}
++ 		if (io_end && io_end->flag & EXT4_IO_END_UNWRITTEN)
++ 			set_buffer_defer_completion(bh);
+++>>>>>>> 923ae0ff9250 (ext4: add DAX functionality)
+  		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
+  		ret = 0;
+  	}
+@@@ -3056,13 -3027,14 +3078,24 @@@ static ssize_t ext4_ext_direct_IO(int r
+  		get_block_func = ext4_get_block_write;
+  		dio_flags = DIO_LOCKING;
+  	}
+++<<<<<<< HEAD
+ +	ret = __blockdev_direct_IO(rw, iocb, inode,
+ +				   inode->i_sb->s_bdev, iov,
+ +				   offset, nr_segs,
+ +				   get_block_func,
+ +				   ext4_end_io_dio,
+ +				   NULL,
+ +				   dio_flags);
+++=======
++ 	if (IS_DAX(inode))
++ 		ret = dax_do_io(rw, iocb, inode, iter, offset, get_block_func,
++ 				ext4_end_io_dio, dio_flags);
++ 	else
++ 		ret = __blockdev_direct_IO(rw, iocb, inode,
++ 					   inode->i_sb->s_bdev, iter, offset,
++ 					   get_block_func,
++ 					   ext4_end_io_dio, NULL, dio_flags);
+++>>>>>>> 923ae0ff9250 (ext4: add DAX functionality)
+  
+  	/*
+  	 * Put our reference to io_end. This can free the io_end structure e.g.
+@@@ -4111,12 -4084,14 +4158,15 @@@ struct inode *ext4_iget(struct super_bl
+  
+  	if (S_ISREG(inode->i_mode)) {
+  		inode->i_op = &ext4_file_inode_operations;
+- 		inode->i_fop = &ext4_file_operations;
++ 		if (test_opt(inode->i_sb, DAX))
++ 			inode->i_fop = &ext4_dax_file_operations;
++ 		else
++ 			inode->i_fop = &ext4_file_operations;
+  		ext4_set_aops(inode);
+  	} else if (S_ISDIR(inode->i_mode)) {
+ -		inode->i_op = &ext4_dir_inode_operations;
+ +		inode->i_op = &ext4_dir_inode_operations.ops;
+  		inode->i_fop = &ext4_dir_operations;
+ +		inode->i_flags |= S_IOPS_WRAPPER;
+  	} else if (S_ISLNK(inode->i_mode)) {
+  		if (ext4_inode_is_fast_symlink(inode)) {
+  			inode->i_op = &ext4_fast_symlink_inode_operations;
+diff --cc fs/ext4/namei.c
+index 06be148622f8,28fe71a2904c..000000000000
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@@ -2307,6 -2284,47 +2310,50 @@@ retry
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ext4_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
++ {
++ 	handle_t *handle;
++ 	struct inode *inode;
++ 	int err, retries = 0;
++ 
++ 	dquot_initialize(dir);
++ 
++ retry:
++ 	inode = ext4_new_inode_start_handle(dir, mode,
++ 					    NULL, 0, NULL,
++ 					    EXT4_HT_DIR,
++ 			EXT4_MAXQUOTAS_INIT_BLOCKS(dir->i_sb) +
++ 			  4 + EXT4_XATTR_TRANS_BLOCKS);
++ 	handle = ext4_journal_current_handle();
++ 	err = PTR_ERR(inode);
++ 	if (!IS_ERR(inode)) {
++ 		inode->i_op = &ext4_file_inode_operations;
++ 		if (test_opt(inode->i_sb, DAX))
++ 			inode->i_fop = &ext4_dax_file_operations;
++ 		else
++ 			inode->i_fop = &ext4_file_operations;
++ 		ext4_set_aops(inode);
++ 		d_tmpfile(dentry, inode);
++ 		err = ext4_orphan_add(handle, inode);
++ 		if (err)
++ 			goto err_unlock_inode;
++ 		mark_inode_dirty(inode);
++ 		unlock_new_inode(inode);
++ 	}
++ 	if (handle)
++ 		ext4_journal_stop(handle);
++ 	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries))
++ 		goto retry;
++ 	return err;
++ err_unlock_inode:
++ 	ext4_journal_stop(handle);
++ 	unlock_new_inode(inode);
++ 	return err;
++ }
++ 
+++>>>>>>> 923ae0ff9250 (ext4: add DAX functionality)
+  struct ext4_dir_entry_2 *ext4_init_dot_dotdot(struct inode *inode,
+  			  struct ext4_dir_entry_2 *de,
+  			  int blocksize, int csum_size,
+* Unmerged path Documentation/filesystems/dax.txt
+* Unmerged path Documentation/filesystems/dax.txt
+diff --git a/Documentation/filesystems/ext4.txt b/Documentation/filesystems/ext4.txt
+index b91cfaaf6a0f..175b0ec84341 100644
+--- a/Documentation/filesystems/ext4.txt
++++ b/Documentation/filesystems/ext4.txt
+@@ -386,6 +386,10 @@ max_dir_size_kb=n	This limits the size of directories so that any
+ i_version		Enable 64-bit inode version support. This option is
+ 			off by default.
+ 
++dax			Use direct access (no page cache).  See
++			Documentation/filesystems/dax.txt.  Note that
++			this option is incompatible with data=journal.
++
+ Data Mode
+ =========
+ There are 3 different data modes:
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 5dda1d21c88f..b0b66a53efdb 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -963,6 +963,11 @@ struct ext4_inode_info {
+ #define EXT4_MOUNT_ERRORS_MASK		0x00070
+ #define EXT4_MOUNT_MINIX_DF		0x00080	/* Mimics the Minix statfs */
+ #define EXT4_MOUNT_NOLOAD		0x00100	/* Don't use existing journal*/
++#ifdef CONFIG_FS_DAX
++#define EXT4_MOUNT_DAX			0x00200	/* Direct Access */
++#else
++#define EXT4_MOUNT_DAX			0
++#endif
+ #define EXT4_MOUNT_DATA_FLAGS		0x00C00	/* Mode for data writes: */
+ #define EXT4_MOUNT_JOURNAL_DATA		0x00400	/* Write data to journal */
+ #define EXT4_MOUNT_ORDERED_DATA		0x00800	/* Flush data before commit */
+@@ -2582,6 +2587,7 @@ extern const struct file_operations ext4_dir_operations;
+ /* file.c */
+ extern const struct inode_operations ext4_file_inode_operations;
+ extern const struct file_operations ext4_file_operations;
++extern const struct file_operations ext4_dax_file_operations;
+ extern loff_t ext4_llseek(struct file *file, loff_t offset, int origin);
+ 
+ /* inline.c */
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/indirect.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/ext4/namei.c
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 31618f12ab5f..f596ef9b68bd 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1159,7 +1159,7 @@ enum {
+ 	Opt_usrjquota, Opt_grpjquota, Opt_offusrjquota, Opt_offgrpjquota,
+ 	Opt_jqfmt_vfsold, Opt_jqfmt_vfsv0, Opt_jqfmt_vfsv1, Opt_quota,
+ 	Opt_noquota, Opt_barrier, Opt_nobarrier, Opt_err,
+-	Opt_usrquota, Opt_grpquota, Opt_i_version,
++	Opt_usrquota, Opt_grpquota, Opt_i_version, Opt_dax,
+ 	Opt_stripe, Opt_delalloc, Opt_nodelalloc, Opt_mblk_io_submit,
+ 	Opt_nomblk_io_submit, Opt_block_validity, Opt_noblock_validity,
+ 	Opt_inode_readahead_blks, Opt_journal_ioprio,
+@@ -1222,6 +1222,7 @@ static const match_table_t tokens = {
+ 	{Opt_barrier, "barrier"},
+ 	{Opt_nobarrier, "nobarrier"},
+ 	{Opt_i_version, "i_version"},
++	{Opt_dax, "dax"},
+ 	{Opt_stripe, "stripe=%u"},
+ 	{Opt_delalloc, "delalloc"},
+ 	{Opt_nodelalloc, "nodelalloc"},
+@@ -1406,6 +1407,7 @@ static const struct mount_opts {
+ 	{Opt_min_batch_time, 0, MOPT_GTE0},
+ 	{Opt_inode_readahead_blks, 0, MOPT_GTE0},
+ 	{Opt_init_itable, 0, MOPT_GTE0},
++	{Opt_dax, EXT4_MOUNT_DAX, MOPT_SET},
+ 	{Opt_stripe, 0, MOPT_GTE0},
+ 	{Opt_resuid, 0, MOPT_GTE0},
+ 	{Opt_resgid, 0, MOPT_GTE0},
+@@ -1641,6 +1643,11 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
+ 			return -1;
+ 		}
+ 		sbi->s_jquota_fmt = m->mount_opt;
++#endif
++#ifndef CONFIG_FS_DAX
++	} else if (token == Opt_dax) {
++		ext4_msg(sb, KERN_INFO, "dax option not supported");
++		return -1;
+ #endif
+ 	} else {
+ 		if (!args->from)
+@@ -3624,6 +3631,11 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 				 "both data=journal and dioread_nolock");
+ 			goto failed_mount;
+ 		}
++		if (test_opt(sb, DAX)) {
++			ext4_msg(sb, KERN_ERR, "can't mount with "
++				 "both data=journal and dax");
++			goto failed_mount;
++		}
+ 		if (test_opt(sb, DELALLOC))
+ 			clear_opt(sb, DELALLOC);
+ 	}
+@@ -3687,6 +3699,19 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 		goto failed_mount;
+ 	}
+ 
++	if (sbi->s_mount_opt & EXT4_MOUNT_DAX) {
++		if (blocksize != PAGE_SIZE) {
++			ext4_msg(sb, KERN_ERR,
++					"error: unsupported blocksize for dax");
++			goto failed_mount;
++		}
++		if (!sb->s_bdev->bd_disk->fops->direct_access) {
++			ext4_msg(sb, KERN_ERR,
++					"error: device does not support dax");
++			goto failed_mount;
++		}
++	}
++
+ 	if (sb->s_blocksize != blocksize) {
+ 		/* Validate the filesystem blocksize */
+ 		if (!sb_set_blocksize(sb, blocksize)) {
+@@ -4910,6 +4935,18 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
+ 			err = -EINVAL;
+ 			goto restore_opts;
+ 		}
++		if (test_opt(sb, DAX)) {
++			ext4_msg(sb, KERN_ERR, "can't mount with "
++				 "both data=journal and dax");
++			err = -EINVAL;
++			goto restore_opts;
++		}
++	}
++
++	if ((sbi->s_mount_opt ^ old_opts.s_mount_opt) & EXT4_MOUNT_DAX) {
++		ext4_msg(sb, KERN_WARNING, "warning: refusing change of "
++			"dax flag with busy inodes while remounting");
++		sbi->s_mount_opt ^= EXT4_MOUNT_DAX;
+ 	}
+ 
+ 	if (sbi->s_mount_flags & EXT4_MF_FS_ABORTED)
