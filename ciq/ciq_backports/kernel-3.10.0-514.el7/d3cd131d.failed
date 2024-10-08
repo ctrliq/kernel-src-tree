@@ -1,0 +1,291 @@
+mm, meminit: replace rwsem with completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] meminit: replace rwsem with completion (George Beshers) [727269]
+Rebuild_FUZZ: 95.00%
+commit-author Nicolai Stange <nicstange@gmail.com>
+commit d3cd131d935ab3bab700491edbbd7cad4040ce50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/d3cd131d.failed
+
+Commit 0e1cc95b4cc7 ("mm: meminit: finish initialisation of struct pages
+before basic setup") introduced a rwsem to signal completion of the
+initialization workers.
+
+Lockdep complains about possible recursive locking:
+  =============================================
+  [ INFO: possible recursive locking detected ]
+  4.1.0-12802-g1dc51b8 #3 Not tainted
+  ---------------------------------------------
+  swapper/0/1 is trying to acquire lock:
+  (pgdat_init_rwsem){++++.+},
+    at: [<ffffffff8424c7fb>] page_alloc_init_late+0xc7/0xe6
+
+  but task is already holding lock:
+  (pgdat_init_rwsem){++++.+},
+    at: [<ffffffff8424c772>] page_alloc_init_late+0x3e/0xe6
+
+Replace the rwsem by a completion together with an atomic
+"outstanding work counter".
+
+[peterz@infradead.org: Barrier removal on the grounds of being pointless]
+[mgorman@suse.de: Applied review feedback]
+	Signed-off-by: Nicolai Stange <nicstange@gmail.com>
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Alex Ng <alexng@microsoft.com>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d3cd131d935ab3bab700491edbbd7cad4040ce50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index 20d353397e7d,322628278ae4..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -781,8 -978,234 +781,237 @@@ void __init __free_pages_bootmem(struc
+  	__free_pages(page, order);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_HAVE_ARCH_EARLY_PFN_TO_NID) || \
++ 	defined(CONFIG_HAVE_MEMBLOCK_NODE_MAP)
++ 
++ static struct mminit_pfnnid_cache early_pfnnid_cache __meminitdata;
++ 
++ int __meminit early_pfn_to_nid(unsigned long pfn)
++ {
++ 	static DEFINE_SPINLOCK(early_pfn_lock);
++ 	int nid;
++ 
++ 	spin_lock(&early_pfn_lock);
++ 	nid = __early_pfn_to_nid(pfn, &early_pfnnid_cache);
++ 	if (nid < 0)
++ 		nid = 0;
++ 	spin_unlock(&early_pfn_lock);
++ 
++ 	return nid;
++ }
++ #endif
++ 
++ #ifdef CONFIG_NODES_SPAN_OTHER_NODES
++ static inline bool __meminit meminit_pfn_in_nid(unsigned long pfn, int node,
++ 					struct mminit_pfnnid_cache *state)
++ {
++ 	int nid;
++ 
++ 	nid = __early_pfn_to_nid(pfn, state);
++ 	if (nid >= 0 && nid != node)
++ 		return false;
++ 	return true;
++ }
++ 
++ /* Only safe to use early in boot when initialisation is single-threaded */
++ static inline bool __meminit early_pfn_in_nid(unsigned long pfn, int node)
++ {
++ 	return meminit_pfn_in_nid(pfn, node, &early_pfnnid_cache);
++ }
++ 
++ #else
++ 
++ static inline bool __meminit early_pfn_in_nid(unsigned long pfn, int node)
++ {
++ 	return true;
++ }
++ static inline bool __meminit meminit_pfn_in_nid(unsigned long pfn, int node,
++ 					struct mminit_pfnnid_cache *state)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ 
++ void __init __free_pages_bootmem(struct page *page, unsigned long pfn,
++ 							unsigned int order)
++ {
++ 	if (early_page_uninitialised(pfn))
++ 		return;
++ 	return __free_pages_boot_core(page, pfn, order);
++ }
++ 
++ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
++ static void __init deferred_free_range(struct page *page,
++ 					unsigned long pfn, int nr_pages)
++ {
++ 	int i;
++ 
++ 	if (!page)
++ 		return;
++ 
++ 	/* Free a large naturally-aligned chunk if possible */
++ 	if (nr_pages == MAX_ORDER_NR_PAGES &&
++ 	    (pfn & (MAX_ORDER_NR_PAGES-1)) == 0) {
++ 		set_pageblock_migratetype(page, MIGRATE_MOVABLE);
++ 		__free_pages_boot_core(page, pfn, MAX_ORDER-1);
++ 		return;
++ 	}
++ 
++ 	for (i = 0; i < nr_pages; i++, page++, pfn++)
++ 		__free_pages_boot_core(page, pfn, 0);
++ }
++ 
++ /* Completion tracking for deferred_init_memmap() threads */
++ static atomic_t pgdat_init_n_undone __initdata;
++ static __initdata DECLARE_COMPLETION(pgdat_init_all_done_comp);
++ 
++ static inline void __init pgdat_init_report_one_done(void)
++ {
++ 	if (atomic_dec_and_test(&pgdat_init_n_undone))
++ 		complete(&pgdat_init_all_done_comp);
++ }
++ 
++ /* Initialise remaining memory on a node */
++ static int __init deferred_init_memmap(void *data)
++ {
++ 	pg_data_t *pgdat = data;
++ 	int nid = pgdat->node_id;
++ 	struct mminit_pfnnid_cache nid_init_state = { };
++ 	unsigned long start = jiffies;
++ 	unsigned long nr_pages = 0;
++ 	unsigned long walk_start, walk_end;
++ 	int i, zid;
++ 	struct zone *zone;
++ 	unsigned long first_init_pfn = pgdat->first_deferred_pfn;
++ 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
++ 
++ 	if (first_init_pfn == ULONG_MAX) {
++ 		pgdat_init_report_one_done();
++ 		return 0;
++ 	}
++ 
++ 	/* Bind memory initialisation thread to a local node if possible */
++ 	if (!cpumask_empty(cpumask))
++ 		set_cpus_allowed_ptr(current, cpumask);
++ 
++ 	/* Sanity check boundaries */
++ 	BUG_ON(pgdat->first_deferred_pfn < pgdat->node_start_pfn);
++ 	BUG_ON(pgdat->first_deferred_pfn > pgdat_end_pfn(pgdat));
++ 	pgdat->first_deferred_pfn = ULONG_MAX;
++ 
++ 	/* Only the highest zone is deferred so find it */
++ 	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
++ 		zone = pgdat->node_zones + zid;
++ 		if (first_init_pfn < zone_end_pfn(zone))
++ 			break;
++ 	}
++ 
++ 	for_each_mem_pfn_range(i, nid, &walk_start, &walk_end, NULL) {
++ 		unsigned long pfn, end_pfn;
++ 		struct page *page = NULL;
++ 		struct page *free_base_page = NULL;
++ 		unsigned long free_base_pfn = 0;
++ 		int nr_to_free = 0;
++ 
++ 		end_pfn = min(walk_end, zone_end_pfn(zone));
++ 		pfn = first_init_pfn;
++ 		if (pfn < walk_start)
++ 			pfn = walk_start;
++ 		if (pfn < zone->zone_start_pfn)
++ 			pfn = zone->zone_start_pfn;
++ 
++ 		for (; pfn < end_pfn; pfn++) {
++ 			if (!pfn_valid_within(pfn))
++ 				goto free_range;
++ 
++ 			/*
++ 			 * Ensure pfn_valid is checked every
++ 			 * MAX_ORDER_NR_PAGES for memory holes
++ 			 */
++ 			if ((pfn & (MAX_ORDER_NR_PAGES - 1)) == 0) {
++ 				if (!pfn_valid(pfn)) {
++ 					page = NULL;
++ 					goto free_range;
++ 				}
++ 			}
++ 
++ 			if (!meminit_pfn_in_nid(pfn, nid, &nid_init_state)) {
++ 				page = NULL;
++ 				goto free_range;
++ 			}
++ 
++ 			/* Minimise pfn page lookups and scheduler checks */
++ 			if (page && (pfn & (MAX_ORDER_NR_PAGES - 1)) != 0) {
++ 				page++;
++ 			} else {
++ 				nr_pages += nr_to_free;
++ 				deferred_free_range(free_base_page,
++ 						free_base_pfn, nr_to_free);
++ 				free_base_page = NULL;
++ 				free_base_pfn = nr_to_free = 0;
++ 
++ 				page = pfn_to_page(pfn);
++ 				cond_resched();
++ 			}
++ 
++ 			if (page->flags) {
++ 				VM_BUG_ON(page_zone(page) != zone);
++ 				goto free_range;
++ 			}
++ 
++ 			__init_single_page(page, pfn, zid, nid);
++ 			if (!free_base_page) {
++ 				free_base_page = page;
++ 				free_base_pfn = pfn;
++ 				nr_to_free = 0;
++ 			}
++ 			nr_to_free++;
++ 
++ 			/* Where possible, batch up pages for a single free */
++ 			continue;
++ free_range:
++ 			/* Free the current block of pages to allocator */
++ 			nr_pages += nr_to_free;
++ 			deferred_free_range(free_base_page, free_base_pfn,
++ 								nr_to_free);
++ 			free_base_page = NULL;
++ 			free_base_pfn = nr_to_free = 0;
++ 		}
++ 
++ 		first_init_pfn = max(end_pfn, first_init_pfn);
++ 	}
++ 
++ 	/* Sanity check that the next zone really is unpopulated */
++ 	WARN_ON(++zid < MAX_NR_ZONES && populated_zone(++zone));
++ 
++ 	pr_info("node %d initialised, %lu pages in %ums\n", nid, nr_pages,
++ 					jiffies_to_msecs(jiffies - start));
++ 
++ 	pgdat_init_report_one_done();
++ 	return 0;
++ }
++ 
++ void __init page_alloc_init_late(void)
++ {
++ 	int nid;
++ 
++ 	/* There will be num_node_state(N_MEMORY) threads */
++ 	atomic_set(&pgdat_init_n_undone, num_node_state(N_MEMORY));
++ 	for_each_node_state(nid, N_MEMORY) {
++ 		kthread_run(deferred_init_memmap, NODE_DATA(nid), "pgdatinit%d", nid);
++ 	}
++ 
++ 	/* Block until all are initialised */
++ 	wait_for_completion(&pgdat_init_all_done_comp);
++ }
++ #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
++ 
+++>>>>>>> d3cd131d935a (mm, meminit: replace rwsem with completion)
+  #ifdef CONFIG_CMA
+ -/* Free whole pageblock and set its migration type to MIGRATE_CMA. */
+ +/* Free whole pageblock and set it's migration type to MIGRATE_CMA. */
+  void __init init_cma_reserved_pageblock(struct page *page)
+  {
+  	unsigned i = pageblock_nr_pages;
+* Unmerged path mm/page_alloc.c
