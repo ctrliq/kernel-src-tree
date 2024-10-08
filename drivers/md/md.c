@@ -2686,6 +2686,7 @@ slot_store(struct md_rdev *rdev, const char *buf, size_t len)
 		/* Activating a spare .. or possibly reactivating
 		 * if we ever get bitmaps working here.
 		 */
+		int err;
 
 		if (rdev->raid_disk != -1)
 			return -EBUSY;
