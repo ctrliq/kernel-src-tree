@@ -1,0 +1,206 @@
+ALSA: hda - Drop power_save value indirection in hda_bus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] hda - Drop power_save value indirection in hda_bus (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 94.34%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit bb573928e187fc5b1f91c3a7684791d5dfcca640
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bb573928.failed
+
+We used to pass the power_save option value to hda_bus via a given
+pointer.  This was needed to refer to the value from the HD-audio core
+side.  However, after the transition to the runtime PM, this is no
+longer needed.
+
+This patch drops the power_save value indirection in hda_bus above,
+and let the controller driver reprograms the autosuspend value
+explicitly by a new helper, snd_hda_set_power_save().  Without this
+call, the HD-audio core doesn't set up the autosuspend and flip the
+runtime PM.  (User may still be able to set up via sysfs, though.)
+
+Along with this change, the pointer argument of azx_bus_create() is
+dropped as well.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit bb573928e187fc5b1f91c3a7684791d5dfcca640)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_intel.c
+diff --cc sound/pci/hda/hda_intel.c
+index 0301732dd71a,40540048b002..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -1939,7 -1930,8 +1936,12 @@@ static int azx_probe_continue(struct az
+  	power_down_all_codecs(chip);
+  	azx_notifier_register(chip);
+  	azx_add_card_list(chip);
+++<<<<<<< HEAD
+ +	if ((chip->driver_caps & AZX_DCAPS_PM_RUNTIME) || hda->use_vga_switcheroo)
+++=======
++ 	snd_hda_set_power_save(chip->bus, power_save * 1000);
++ 	if (azx_has_pm_runtime(chip) || hda->use_vga_switcheroo)
+++>>>>>>> bb573928e187 (ALSA: hda - Drop power_save value indirection in hda_bus)
+  		pm_runtime_put_noidle(&pci->dev);
+  
+  out_free:
+diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
+index d0dbc62c9147..36cebe0e76b2 100644
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -1175,10 +1175,8 @@ static int snd_hda_codec_dev_register(struct snd_device *device)
+ 	struct hda_codec *codec = device->device_data;
+ 
+ 	snd_hda_register_beep_device(codec);
+-	if (device_is_registered(hda_codec_dev(codec))) {
+-		snd_hda_power_sync(codec);
++	if (device_is_registered(hda_codec_dev(codec)))
+ 		pm_runtime_enable(hda_codec_dev(codec));
+-	}
+ 	return 0;
+ }
+ 
+@@ -4778,21 +4776,10 @@ void snd_hda_power_down(struct hda_codec *codec)
+ }
+ EXPORT_SYMBOL_GPL(snd_hda_power_down);
+ 
+-/**
+- * snd_hda_power_sync - Synchronize the power_save option
+- * @codec: HD-audio codec
+- *
+- * Synchronize the runtime PM autosuspend state from the power_save option.
+- */
+-void snd_hda_power_sync(struct hda_codec *codec)
++static void codec_set_power_save(struct hda_codec *codec, int delay)
+ {
+ 	struct device *dev = hda_codec_dev(codec);
+-	int delay;
+ 
+-	if (!codec->bus->power_save)
+-		return;
+-
+-	delay = *codec->bus->power_save * 1000;
+ 	if (delay > 0) {
+ 		pm_runtime_set_autosuspend_delay(dev, delay);
+ 		pm_runtime_use_autosuspend(dev);
+@@ -4804,7 +4791,22 @@ void snd_hda_power_sync(struct hda_codec *codec)
+ 		pm_runtime_forbid(dev);
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(snd_hda_power_sync);
++
++/**
++ * snd_hda_set_power_save - reprogram autosuspend for the given delay
++ * @bus: HD-audio bus
++ * @delay: autosuspend delay in msec, 0 = off
++ *
++ * Synchronize the runtime PM autosuspend state from the power_save option.
++ */
++void snd_hda_set_power_save(struct hda_bus *bus, int delay)
++{
++	struct hda_codec *c;
++
++	list_for_each_entry(c, &bus->codec_list, list)
++		codec_set_power_save(c, delay);
++}
++EXPORT_SYMBOL_GPL(snd_hda_set_power_save);
+ 
+ /**
+  * snd_hda_check_amp_list_power - Check the amp list and update the power
+diff --git a/sound/pci/hda/hda_codec.h b/sound/pci/hda/hda_codec.h
+index 593956fc384b..89908f5b9601 100644
+--- a/sound/pci/hda/hda_codec.h
++++ b/sound/pci/hda/hda_codec.h
+@@ -122,7 +122,6 @@ struct hda_bus {
+ 	void *private_data;
+ 	struct pci_dev *pci;
+ 	const char *modelname;
+-	int *power_save;
+ 	struct hda_bus_ops ops;
+ 
+ 	/* codec linked list */
+@@ -592,12 +591,12 @@ const char *snd_hda_get_jack_location(u32 cfg);
+ #ifdef CONFIG_PM
+ void snd_hda_power_up(struct hda_codec *codec);
+ void snd_hda_power_down(struct hda_codec *codec);
+-void snd_hda_power_sync(struct hda_codec *codec);
++void snd_hda_set_power_save(struct hda_bus *bus, int delay);
+ void snd_hda_update_power_acct(struct hda_codec *codec);
+ #else
+ static inline void snd_hda_power_up(struct hda_codec *codec) {}
+ static inline void snd_hda_power_down(struct hda_codec *codec) {}
+-static inline void snd_hda_power_sync(struct hda_codec *codec) {}
++static inline void snd_hda_set_power_save(struct hda_bus *bus, int delay) {}
+ #endif
+ 
+ #ifdef CONFIG_SND_HDA_PATCH_LOADER
+diff --git a/sound/pci/hda/hda_controller.c b/sound/pci/hda/hda_controller.c
+index a14aba1015db..813eb1963140 100644
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@ -1836,7 +1836,7 @@ static struct hda_bus_ops bus_ops = {
+ };
+ 
+ /* HD-audio bus initialization */
+-int azx_bus_create(struct azx *chip, const char *model, int *power_save_to)
++int azx_bus_create(struct azx *chip, const char *model)
+ {
+ 	struct hda_bus *bus;
+ 	int err;
+@@ -1850,9 +1850,6 @@ int azx_bus_create(struct azx *chip, const char *model, int *power_save_to)
+ 	bus->pci = chip->pci;
+ 	bus->modelname = model;
+ 	bus->ops = bus_ops;
+-#ifdef CONFIG_PM
+-	bus->power_save = power_save_to;
+-#endif
+ 
+ 	if (chip->driver_caps & AZX_DCAPS_RIRB_DELAY) {
+ 		dev_dbg(chip->card->dev, "Enable delay in RIRB handling\n");
+diff --git a/sound/pci/hda/hda_controller.h b/sound/pci/hda/hda_controller.h
+index 2993061145a5..be66a93e7bc3 100644
+--- a/sound/pci/hda/hda_controller.h
++++ b/sound/pci/hda/hda_controller.h
+@@ -43,7 +43,7 @@ void azx_enter_link_reset(struct azx *chip);
+ irqreturn_t azx_interrupt(int irq, void *dev_id);
+ 
+ /* Codec interface */
+-int azx_bus_create(struct azx *chip, const char *model, int *power_save_to);
++int azx_bus_create(struct azx *chip, const char *model);
+ int azx_probe_codecs(struct azx *chip, unsigned int max_slots);
+ int azx_codec_configure(struct azx *chip);
+ int azx_init_stream(struct azx *chip);
+* Unmerged path sound/pci/hda/hda_intel.c
+diff --git a/sound/pci/hda/hda_tegra.c b/sound/pci/hda/hda_tegra.c
+index a67269dbf5b1..3424950eb86b 100644
+--- a/sound/pci/hda/hda_tegra.c
++++ b/sound/pci/hda/hda_tegra.c
+@@ -82,7 +82,7 @@ module_param(power_save, bint, 0644);
+ MODULE_PARM_DESC(power_save,
+ 		 "Automatic power-saving timeout (in seconds, 0 = disable).");
+ #else
+-static int power_save = 0;
++#define power_save	0
+ #endif
+ 
+ /*
+@@ -497,7 +497,7 @@ static int hda_tegra_probe(struct platform_device *pdev)
+ 		goto out_free;
+ 
+ 	/* create codec instances */
+-	err = azx_bus_create(chip, NULL, &power_save);
++	err = azx_bus_create(chip, NULL);
+ 	if (err < 0)
+ 		goto out_free;
+ 
+@@ -526,6 +526,7 @@ static int hda_tegra_probe(struct platform_device *pdev)
+ 	chip->running = 1;
+ 	power_down_all_codecs(chip);
+ 	azx_notifier_register(chip);
++	snd_hda_set_power_save(chip->bus, power_save * 1000);
+ 
+ 	return 0;
+ 
