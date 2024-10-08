@@ -1,0 +1,266 @@
+target/iscsi: Replace conn->login_ip with login_sockaddr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Andy Grover <agrover@redhat.com>
+commit dc58f760e2e1f8f2265b581d35f211415c4fee0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/dc58f760.failed
+
+Very similar to how it went with local_sockaddr.
+
+It was embedded in iscsi_login_stats so some changes there, and we needed
+to copy in a sockaddr_storage comparison function. Hopefully the kernel
+will get a standard one soon, our implementation makes the 3rd.
+
+isert_set_conn_info() became much smaller.
+
+IPV6_ADDRESS_SPACE define goes away, had to modify a call to in6_pton(),
+can just use -1 since we are sure string is null-terminated.
+
+	Signed-off-by: Andy Grover <agrover@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit dc58f760e2e1f8f2265b581d35f211415c4fee0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/target/iscsi/iscsi_target_core.h
+diff --cc include/target/iscsi/iscsi_target_core.h
+index 41cfb95c7cde,f3eb99809557..000000000000
+--- a/include/target/iscsi/iscsi_target_core.h
++++ b/include/target/iscsi/iscsi_target_core.h
+@@@ -528,14 -528,7 +528,18 @@@ struct iscsi_conn 
+  	u32			exp_statsn;
+  	/* Per connection status sequence number */
+  	u32			stat_sn;
+++<<<<<<< HEAD
+ +	/* IFMarkInt's Current Value */
+ +	u32			if_marker;
+ +	/* OFMarkInt's Current Value */
+ +	u32			of_marker;
+ +	/* Used for calculating OFMarker offset to next PDU */
+ +	u32			of_marker_offset;
+ +#define IPV6_ADDRESS_SPACE				48
+ +	unsigned char		login_ip[IPV6_ADDRESS_SPACE];
+++=======
++ 	struct __kernel_sockaddr_storage login_sockaddr;
+++>>>>>>> dc58f760e2e1 (target/iscsi: Replace conn->login_ip with login_sockaddr)
+  	struct __kernel_sockaddr_storage local_sockaddr;
+  	int			conn_usage_count;
+  	int			conn_waiting_on_uc;
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 9f196c329e45..c1e8768572e1 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -3212,28 +3212,11 @@ isert_set_conn_info(struct iscsi_np *np, struct iscsi_conn *conn,
+ {
+ 	struct rdma_cm_id *cm_id = isert_conn->cm_id;
+ 	struct rdma_route *cm_route = &cm_id->route;
+-	struct sockaddr_in *sock_in;
+-	struct sockaddr_in6 *sock_in6;
+ 
+ 	conn->login_family = np->np_sockaddr.ss_family;
+ 
+-	if (np->np_sockaddr.ss_family == AF_INET6) {
+-		sock_in6 = (struct sockaddr_in6 *)&cm_route->addr.dst_addr;
+-		snprintf(conn->login_ip, sizeof(conn->login_ip), "%pI6c",
+-			 &sock_in6->sin6_addr.in6_u);
+-		conn->login_port = ntohs(sock_in6->sin6_port);
+-
+-		sock_in6 = (struct sockaddr_in6 *)&cm_route->addr.src_addr;
+-		memcpy(&conn->local_sockaddr , &sock_in6, sizeof(sock_in6));
+-	} else {
+-		sock_in = (struct sockaddr_in *)&cm_route->addr.dst_addr;
+-		sprintf(conn->login_ip, "%pI4",
+-			&sock_in->sin_addr.s_addr);
+-		conn->login_port = ntohs(sock_in->sin_port);
+-
+-		sock_in = (struct sockaddr_in *)&cm_route->addr.src_addr;
+-		memcpy(&conn->local_sockaddr , &sock_in, sizeof(sock_in));
+-	}
++	conn->login_sockaddr = cm_route->addr.dst_addr;
++	conn->local_sockaddr = cm_route->addr.src_addr;
+ }
+ 
+ static int
+diff --git a/drivers/target/iscsi/iscsi_target_configfs.c b/drivers/target/iscsi/iscsi_target_configfs.c
+index 39bfc6509663..8fbc336634fe 100644
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@ -271,7 +271,7 @@ static struct se_tpg_np *lio_target_call_addnptotpg(
+ 		sock_in6 = (struct sockaddr_in6 *)&sockaddr;
+ 		sock_in6->sin6_family = AF_INET6;
+ 		sock_in6->sin6_port = htons((unsigned short)port);
+-		ret = in6_pton(str, IPV6_ADDRESS_SPACE,
++		ret = in6_pton(str, -1,
+ 				(void *)&sock_in6->sin6_addr.in6_u, -1, &end);
+ 		if (ret <= 0) {
+ 			pr_err("in6_pton returned: %d\n", ret);
+@@ -755,7 +755,7 @@ static ssize_t lio_target_nacl_show_info(
+ 				break;
+ 			}
+ 
+-			rb += sprintf(page+rb, "   Address %s %s", conn->login_ip,
++			rb += sprintf(page+rb, "   Address %pISc %s", &conn->login_sockaddr,
+ 				(conn->network_transport == ISCSI_TCP) ?
+ 				"TCP" : "SCTP");
+ 			rb += sprintf(page+rb, "  StatSN: 0x%08x\n",
+diff --git a/drivers/target/iscsi/iscsi_target_login.c b/drivers/target/iscsi/iscsi_target_login.c
+index af49b793be31..c7fef77e245b 100644
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -784,8 +784,8 @@ int iscsi_post_login_handler(
+ 			stop_timer = 1;
+ 		}
+ 
+-		pr_debug("iSCSI Login successful on CID: %hu from %s to"
+-			" %pISpc,%hu\n", conn->cid, conn->login_ip,
++		pr_debug("iSCSI Login successful on CID: %hu from %pISpc to"
++			" %pISpc,%hu\n", conn->cid, &conn->login_sockaddr,
+ 			&conn->local_sockaddr, tpg->tpgt);
+ 
+ 		list_add_tail(&conn->conn_list, &sess->sess_conn_list);
+@@ -830,8 +830,8 @@ int iscsi_post_login_handler(
+ 	pr_debug("Moving to TARG_SESS_STATE_LOGGED_IN.\n");
+ 	sess->session_state = TARG_SESS_STATE_LOGGED_IN;
+ 
+-	pr_debug("iSCSI Login successful on CID: %hu from %s to %pISpc,%hu\n",
+-		conn->cid, conn->login_ip, &conn->local_sockaddr,
++	pr_debug("iSCSI Login successful on CID: %hu from %pISpc to %pISpc,%hu\n",
++		conn->cid, &conn->login_sockaddr, &conn->local_sockaddr,
+ 		tpg->tpgt);
+ 
+ 	spin_lock_bh(&sess->conn_lock);
+@@ -1071,13 +1071,15 @@ int iscsit_accept_np(struct iscsi_np *np, struct iscsi_conn *conn)
+ 		rc = conn->sock->ops->getname(conn->sock,
+ 				(struct sockaddr *)&sock_in6, &err, 1);
+ 		if (!rc) {
+-			if (!ipv6_addr_v4mapped(&sock_in6.sin6_addr))
+-				snprintf(conn->login_ip, sizeof(conn->login_ip), "[%pI6c]",
+-					&sock_in6.sin6_addr.in6_u);
+-			else
+-				snprintf(conn->login_ip, sizeof(conn->login_ip), "%pI4",
+-					&sock_in6.sin6_addr.s6_addr32[3]);
+-			conn->login_port = ntohs(sock_in6.sin6_port);
++			if (!ipv6_addr_v4mapped(&sock_in6.sin6_addr)) {
++				memcpy(&conn->login_sockaddr, &sock_in6, sizeof(sock_in6));
++			} else {
++				/* Pretend to be an ipv4 socket */
++				sock_in.sin_family = AF_INET;
++				sock_in.sin_port = sock_in6.sin6_port;
++				memcpy(&sock_in.sin_addr, &sock_in6.sin6_addr.s6_addr32[3], 4);
++				memcpy(&conn->login_sockaddr, &sock_in, sizeof(sock_in));
++			}
+ 		}
+ 
+ 		rc = conn->sock->ops->getname(conn->sock,
+@@ -1098,11 +1100,8 @@ int iscsit_accept_np(struct iscsi_np *np, struct iscsi_conn *conn)
+ 
+ 		rc = conn->sock->ops->getname(conn->sock,
+ 				(struct sockaddr *)&sock_in, &err, 1);
+-		if (!rc) {
+-			sprintf(conn->login_ip, "%pI4",
+-					&sock_in.sin_addr.s_addr);
+-			conn->login_port = ntohs(sock_in.sin_port);
+-		}
++		if (!rc)
++			memcpy(&conn->login_sockaddr, &sock_in, sizeof(sock_in));
+ 
+ 		rc = conn->sock->ops->getname(conn->sock,
+ 				(struct sockaddr *)&sock_in, &err, 0);
+@@ -1367,8 +1366,8 @@ static int __iscsi_target_login_thread(struct iscsi_np *np)
+ 
+ 	conn->network_transport = np->np_network_transport;
+ 
+-	pr_debug("Received iSCSI login request from %s on %s Network"
+-		" Portal %pISpc\n", conn->login_ip, np->np_transport->name,
++	pr_debug("Received iSCSI login request from %pISpc on %s Network"
++		" Portal %pISpc\n", &conn->login_sockaddr, np->np_transport->name,
+ 		&conn->local_sockaddr);
+ 
+ 	pr_debug("Moving to TARG_CONN_STATE_IN_LOGIN.\n");
+diff --git a/drivers/target/iscsi/iscsi_target_stat.c b/drivers/target/iscsi/iscsi_target_stat.c
+index 5e1349a3b143..9dd94ff0b62c 100644
+--- a/drivers/target/iscsi/iscsi_target_stat.c
++++ b/drivers/target/iscsi/iscsi_target_stat.c
+@@ -430,7 +430,7 @@ static ssize_t iscsi_stat_tgt_attr_show_attr_fail_intr_addr(
+ 	int ret;
+ 
+ 	spin_lock(&lstat->lock);
+-	ret = snprintf(page, PAGE_SIZE, "%s\n", lstat->last_intr_fail_ip_addr);
++	ret = snprintf(page, PAGE_SIZE, "%pISc\n", &lstat->last_intr_fail_sockaddr);
+ 	spin_unlock(&lstat->lock);
+ 
+ 	return ret;
+diff --git a/drivers/target/iscsi/iscsi_target_util.c b/drivers/target/iscsi/iscsi_target_util.c
+index d56e38a96f25..b98daa1b4c55 100644
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@ -1423,6 +1423,33 @@ int tx_data(
+ 	return iscsit_do_tx_data(conn, &c);
+ }
+ 
++static bool sockaddr_equal(struct sockaddr_storage *x, struct sockaddr_storage *y)
++{
++	switch (x->ss_family) {
++	case AF_INET: {
++		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
++		struct sockaddr_in *siny = (struct sockaddr_in *)y;
++		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
++			return false;
++		if (sinx->sin_port != siny->sin_port)
++			return false;
++		break;
++	}
++	case AF_INET6: {
++		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
++		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
++		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
++			return false;
++		if (sinx->sin6_port != siny->sin6_port)
++			return false;
++		break;
++	}
++	default:
++		return false;
++	}
++	return true;
++}
++
+ void iscsit_collect_login_stats(
+ 	struct iscsi_conn *conn,
+ 	u8 status_class,
+@@ -1439,7 +1466,7 @@ void iscsit_collect_login_stats(
+ 	ls = &tiqn->login_stats;
+ 
+ 	spin_lock(&ls->lock);
+-	if (!strcmp(conn->login_ip, ls->last_intr_fail_ip_addr) &&
++	if (sockaddr_equal(&conn->login_sockaddr, &ls->last_intr_fail_sockaddr) &&
+ 	    ((get_jiffies_64() - ls->last_fail_time) < 10)) {
+ 		/* We already have the failure info for this login */
+ 		spin_unlock(&ls->lock);
+@@ -1479,8 +1506,7 @@ void iscsit_collect_login_stats(
+ 
+ 		ls->last_intr_fail_ip_family = conn->login_family;
+ 
+-		snprintf(ls->last_intr_fail_ip_addr, IPV6_ADDRESS_SPACE,
+-				"%s", conn->login_ip);
++		ls->last_intr_fail_sockaddr = conn->login_sockaddr;
+ 		ls->last_fail_time = get_jiffies_64();
+ 	}
+ 
+* Unmerged path include/target/iscsi/iscsi_target_core.h
+diff --git a/include/target/iscsi/iscsi_target_stat.h b/include/target/iscsi/iscsi_target_stat.h
+index 3ff76b4faad3..f2a583cdf08b 100644
+--- a/include/target/iscsi/iscsi_target_stat.h
++++ b/include/target/iscsi/iscsi_target_stat.h
+@@ -50,7 +50,7 @@ struct iscsi_login_stats {
+ 	u64		last_fail_time;		/* time stamp (jiffies) */
+ 	u32		last_fail_type;
+ 	int		last_intr_fail_ip_family;
+-	unsigned char	last_intr_fail_ip_addr[IPV6_ADDRESS_SPACE];
++	struct __kernel_sockaddr_storage last_intr_fail_sockaddr;
+ 	char		last_intr_fail_name[224];
+ } ____cacheline_aligned;
+ 
