@@ -1,0 +1,206 @@
+fib_trie: Correctly handle case of key == 0 in leaf_walk_rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 3ec320dd5c9465fbed3c84dd14ed3941ce757823
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3ec320dd.failed
+
+In the case of a trie that had no tnodes with a key of 0 the initial
+look-up would fail resulting in an out-of-bounds cindex on the first tnode.
+This resulted in an entire trie being skipped.
+
+In order resolve this I have updated the cindex logic in the initial
+look-up so that if the key is zero we will always traverse the child zero
+path.
+
+Fixes: 8be33e95 ("fib_trie: Fib walk rcu should take a tnode and key instead of a trie and a leaf")
+	Reported-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Tested-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3ec320dd5c9465fbed3c84dd14ed3941ce757823)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_trie.c
+index 8be89b1a8b93,44cab1d41463..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1562,38 -1520,144 +1562,158 @@@ int fib_table_delete(struct fib_table *
+  	return 0;
+  }
+  
+ -/* Scan for the next leaf starting at the provided key value */
+ -static struct key_vector *leaf_walk_rcu(struct key_vector **tn, t_key key)
+ +static int trie_flush_list(struct list_head *head)
+  {
+++<<<<<<< HEAD
+ +	struct fib_alias *fa, *fa_node;
+++=======
++ 	struct key_vector *pn, *n = *tn;
++ 	unsigned long cindex;
++ 
++ 	/* this loop is meant to try and find the key in the trie */
++ 	do {
++ 		/* record parent and next child index */
++ 		pn = n;
++ 		cindex = key ? get_index(key, pn) : 0;
++ 
++ 		if (cindex >> pn->bits)
++ 			break;
++ 
++ 		/* descend into the next child */
++ 		n = get_child_rcu(pn, cindex++);
++ 		if (!n)
++ 			break;
++ 
++ 		/* guarantee forward progress on the keys */
++ 		if (IS_LEAF(n) && (n->key >= key))
++ 			goto found;
++ 	} while (IS_TNODE(n));
++ 
++ 	/* this loop will search for the next leaf with a greater key */
++ 	while (!IS_TRIE(pn)) {
++ 		/* if we exhausted the parent node we will need to climb */
++ 		if (cindex >= (1ul << pn->bits)) {
++ 			t_key pkey = pn->key;
++ 
++ 			pn = node_parent_rcu(pn);
++ 			cindex = get_index(pkey, pn) + 1;
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child_rcu(pn, cindex++);
++ 		if (!n)
++ 			continue;
++ 
++ 		/* no need to compare keys since we bumped the index */
++ 		if (IS_LEAF(n))
++ 			goto found;
++ 
++ 		/* Rescan start scanning in new node */
++ 		pn = n;
++ 		cindex = 0;
++ 	}
++ 
++ 	*tn = pn;
++ 	return NULL; /* Root of trie */
++ found:
++ 	/* if we are at the limit for keys just return NULL for the tnode */
++ 	*tn = pn;
++ 	return n;
++ }
++ 
++ /* Caller must hold RTNL */
++ void fib_table_flush_external(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order */
++ 	for (;;) {
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			/* cannot resize the trie vector */
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			/* no need to resize like in flush below */
++ 			pn = node_parent(pn);
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			struct fib_info *fi = fa->fa_info;
++ 
++ 			if (!fi || !(fi->fib_flags & RTNH_F_EXTERNAL))
++ 				continue;
++ 
++ 			netdev_switch_fib_ipv4_del(n->key,
++ 						   KEYLENGTH - fa->fa_slen,
++ 						   fi, fa->fa_tos,
++ 						   fa->fa_type, tb->tb_id);
++ 		}
++ 	}
++ }
++ 
++ /* Caller must hold RTNL. */
++ int fib_table_flush(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
+++>>>>>>> 3ec320dd5c94 (fib_trie: Correctly handle case of key == 0 in leaf_walk_rcu)
+  	int found = 0;
+  
+ -	/* walk trie in reverse order */
+ -	for (;;) {
+ -		unsigned char slen = 0;
+ -		struct key_vector *n;
+ +	list_for_each_entry_safe(fa, fa_node, head, fa_list) {
+ +		struct fib_info *fi = fa->fa_info;
+  
+ -		if (!(cindex--)) {
+ -			t_key pkey = pn->key;
+ +		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
+ +			list_del_rcu(&fa->fa_list);
+ +			fib_release_info(fa->fa_info);
+ +			alias_free_mem_rcu(fa);
+ +			found++;
+ +		}
+ +	}
+ +	return found;
+ +}
+  
+ -			/* cannot resize the trie vector */
+ -			if (IS_TRIE(pn))
+ -				break;
+ +static int trie_flush_leaf(struct tnode *l)
+ +{
+ +	int found = 0;
+ +	struct hlist_head *lih = &l->list;
+ +	struct hlist_node *tmp;
+ +	struct leaf_info *li = NULL;
+ +	unsigned char plen = KEYLENGTH;
+  
+ -			/* resize completed node */
+ -			pn = resize(t, pn);
+ -			cindex = get_index(pkey, pn);
+ +	hlist_for_each_entry_safe(li, tmp, lih, hlist) {
+ +		found += trie_flush_list(&li->falh);
+  
+ +		if (list_empty(&li->falh)) {
+ +			hlist_del_rcu(&li->hlist);
+ +			free_leaf_info(li);
+  			continue;
+  		}
+  
+* Unmerged path net/ipv4/fib_trie.c
