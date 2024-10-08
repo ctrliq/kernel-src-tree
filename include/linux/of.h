@@ -414,6 +414,9 @@ static inline void __of_use_dn(const struct device_node *np)
 #define for_each_child_of_node(parent, child) \
 	while (__of_use_dn(parent), __of_use_dn(child), 0)
 
+#define for_each_available_child_of_node(parent, child) \
+	while (0)
+
 static inline struct device_node *of_get_child_by_name(
 					const struct device_node *node,
 					const char *name)
