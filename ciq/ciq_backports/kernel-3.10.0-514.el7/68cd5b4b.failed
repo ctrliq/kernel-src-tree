@@ -1,0 +1,167 @@
+ceph: make fsync() wait unsafe requests that created/modified inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 68cd5b4b7612c2956d8553dfb39490b29f32566d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/68cd5b4b.failed
+
+If we get a unsafe reply for request that created/modified inode,
+add the unsafe request to a list in the newly created/modified
+inode. So we can make fsync() wait these unsafe requests.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 68cd5b4b7612c2956d8553dfb39490b29f32566d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/caps.c
+diff --cc fs/ceph/caps.c
+index f05879a2377f,c69e1253b47b..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -1947,6 -1969,49 +1947,52 @@@ out
+  	spin_unlock(&ci->i_unsafe_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * wait for any unsafe requests to complete.
++  */
++ static int unsafe_request_wait(struct inode *inode)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_mds_request *req1 = NULL, *req2 = NULL;
++ 	int ret, err = 0;
++ 
++ 	spin_lock(&ci->i_unsafe_lock);
++ 	if (S_ISDIR(inode->i_mode) && !list_empty(&ci->i_unsafe_dirops)) {
++ 		req1 = list_last_entry(&ci->i_unsafe_dirops,
++ 					struct ceph_mds_request,
++ 					r_unsafe_dir_item);
++ 		ceph_mdsc_get_request(req1);
++ 	}
++ 	if (!list_empty(&ci->i_unsafe_iops)) {
++ 		req2 = list_last_entry(&ci->i_unsafe_iops,
++ 					struct ceph_mds_request,
++ 					r_unsafe_target_item);
++ 		ceph_mdsc_get_request(req2);
++ 	}
++ 	spin_unlock(&ci->i_unsafe_lock);
++ 
++ 	dout("unsafe_requeset_wait %p wait on tid %llu %llu\n",
++ 	     inode, req1 ? req1->r_tid : 0ULL, req2 ? req2->r_tid : 0ULL);
++ 	if (req1) {
++ 		ret = !wait_for_completion_timeout(&req1->r_safe_completion,
++ 					ceph_timeout_jiffies(req1->r_timeout));
++ 		if (ret)
++ 			err = -EIO;
++ 		ceph_mdsc_put_request(req1);
++ 	}
++ 	if (req2) {
++ 		ret = !wait_for_completion_timeout(&req2->r_safe_completion,
++ 					ceph_timeout_jiffies(req2->r_timeout));
++ 		if (ret)
++ 			err = -EIO;
++ 		ceph_mdsc_put_request(req2);
++ 	}
++ 	return err;
++ }
++ 
+++>>>>>>> 68cd5b4b7612 (ceph: make fsync() wait unsafe requests that created/modified inode)
+  int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+  {
+  	struct inode *inode = file->f_mapping->host;
+@@@ -1966,6 -2035,8 +2012,11 @@@
+  	dirty = try_flush_caps(inode, &flush_tid);
+  	dout("fsync dirty caps are %s\n", ceph_cap_string(dirty));
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = unsafe_request_wait(inode);
++ 
+++>>>>>>> 68cd5b4b7612 (ceph: make fsync() wait unsafe requests that created/modified inode)
+  	/*
+  	 * only wait on non-file metadata writeback (the mds
+  	 * can recover size and mtime, so we don't need to
+* Unmerged path fs/ceph/caps.c
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index a649a586cda7..38d7eec00809 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -447,6 +447,7 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
+ 
+ 	INIT_LIST_HEAD(&ci->i_unsafe_writes);
+ 	INIT_LIST_HEAD(&ci->i_unsafe_dirops);
++	INIT_LIST_HEAD(&ci->i_unsafe_iops);
+ 	spin_lock_init(&ci->i_unsafe_lock);
+ 
+ 	ci->i_snap_realm = NULL;
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index ed1203ecdcf6..cce42dc472ec 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -666,6 +666,12 @@ static void __unregister_request(struct ceph_mds_client *mdsc,
+ 		list_del_init(&req->r_unsafe_dir_item);
+ 		spin_unlock(&ci->i_unsafe_lock);
+ 	}
++	if (req->r_target_inode && req->r_got_unsafe) {
++		struct ceph_inode_info *ci = ceph_inode(req->r_target_inode);
++		spin_lock(&ci->i_unsafe_lock);
++		list_del_init(&req->r_unsafe_target_item);
++		spin_unlock(&ci->i_unsafe_lock);
++	}
+ 
+ 	if (req->r_unsafe_dir) {
+ 		iput(req->r_unsafe_dir);
+@@ -1695,6 +1701,7 @@ ceph_mdsc_create_request(struct ceph_mds_client *mdsc, int op, int mode)
+ 	req->r_started = jiffies;
+ 	req->r_resend_mds = -1;
+ 	INIT_LIST_HEAD(&req->r_unsafe_dir_item);
++	INIT_LIST_HEAD(&req->r_unsafe_target_item);
+ 	req->r_fmode = -1;
+ 	kref_init(&req->r_kref);
+ 	INIT_LIST_HEAD(&req->r_wait);
+@@ -2514,6 +2521,13 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 	up_read(&mdsc->snap_rwsem);
+ 	if (realm)
+ 		ceph_put_snap_realm(mdsc, realm);
++
++	if (err == 0 && req->r_got_unsafe && req->r_target_inode) {
++		struct ceph_inode_info *ci = ceph_inode(req->r_target_inode);
++		spin_lock(&ci->i_unsafe_lock);
++		list_add_tail(&req->r_unsafe_target_item, &ci->i_unsafe_iops);
++		spin_unlock(&ci->i_unsafe_lock);
++	}
+ out_err:
+ 	mutex_lock(&mdsc->mutex);
+ 	if (!req->r_aborted) {
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index 5eac18eb8eca..2f31e8ae2db0 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -236,6 +236,9 @@ struct ceph_mds_request {
+ 	struct inode	*r_unsafe_dir;
+ 	struct list_head r_unsafe_dir_item;
+ 
++	/* unsafe requests that modify the target inode */
++	struct list_head r_unsafe_target_item;
++
+ 	struct ceph_mds_session *r_session;
+ 
+ 	int               r_attempts;   /* resend attempts */
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index b25ba3fc8533..40108ac96f3b 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -328,6 +328,7 @@ struct ceph_inode_info {
+ 
+ 	struct list_head i_unsafe_writes; /* uncommitted sync writes */
+ 	struct list_head i_unsafe_dirops; /* uncommitted mds dir ops */
++	struct list_head i_unsafe_iops;   /* uncommitted mds inode ops */
+ 	spinlock_t i_unsafe_lock;
+ 
+ 	struct ceph_snap_realm *i_snap_realm; /* snap realm (if caps) */
