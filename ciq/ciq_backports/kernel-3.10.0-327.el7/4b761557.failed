@@ -1,0 +1,144 @@
+hpsa: clean up some error reporting output in abort handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Robert Elliott <elliott@hp.com>
+commit 4b761557d79a321e51050edc1da01f95872f0e70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/4b761557.failed
+
+report more useful information on aborts
+
+	Reviewed-by: Scott Teel <scott.teel@pmcs.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@pmcs.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@Suse.de>
+	Signed-off-by: Robert Elliott <elliott@hp.com>
+	Signed-off-by: Don Brace <don.brace@pmcs.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit 4b761557d79a321e51050edc1da01f95872f0e70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 713a62ac835d,baf7fd0575ee..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -4445,38 -5082,88 +4445,95 @@@ static int hpsa_eh_abort_handler(struc
+  		return FAILED;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If controller locked up, we can guarantee command won't complete */
++ 	if (lockup_detected(h)) {
++ 		hpsa_show_dev_msg(KERN_WARNING, h, dev,
++ 					"ABORT FAILED, lockup detected");
++ 		return FAILED;
++ 	}
++ 
++ 	/* This is a good time to check if controller lockup has occurred */
++ 	if (detect_controller_lockup(h)) {
++ 		hpsa_show_dev_msg(KERN_WARNING, h, dev,
++ 					"ABORT FAILED, new lockup detected");
++ 		return FAILED;
++ 	}
++ 
++ 	/* Check that controller supports some kind of task abort */
++ 	if (!(HPSATMF_PHYS_TASK_ABORT & h->TMFSupportFlags) &&
++ 		!(HPSATMF_LOG_TASK_ABORT & h->TMFSupportFlags))
++ 		return FAILED;
++ 
++ 	memset(msg, 0, sizeof(msg));
++ 	ml += sprintf(msg+ml, "scsi %d:%d:%d:%llu %s %p",
++ 		h->scsi_host->host_no, sc->device->channel,
++ 		sc->device->id, sc->device->lun,
++ 		"Aborting command", sc);
++ 
+++>>>>>>> 4b761557d79a (hpsa: clean up some error reporting output in abort handler)
+  	/* Get SCSI command to be aborted */
+  	abort = (struct CommandList *) sc->host_scribble;
+  	if (abort == NULL) {
+ -		/* This can happen if the command already completed. */
+ -		return SUCCESS;
+ -	}
+ -	refcount = atomic_inc_return(&abort->refcount);
+ -	if (refcount == 1) { /* Command is done already. */
+ -		cmd_free(h, abort);
+ -		return SUCCESS;
+ -	}
+ -
+ -	/* Don't bother trying the abort if we know it won't work. */
+ -	if (abort->cmd_type != CMD_IOACCEL2 &&
+ -		abort->cmd_type != CMD_IOACCEL1 && !dev->supports_aborts) {
+ -		cmd_free(h, abort);
+ +		dev_err(&h->pdev->dev, "%s FAILED, Command to abort is NULL.\n",
+ +				msg);
+  		return FAILED;
+  	}
+ -
+  	hpsa_get_tag(h, abort, &taglower, &tagupper);
+ -	reply_queue = hpsa_extract_reply_queue(h, abort);
+  	ml += sprintf(msg+ml, "Tag:0x%08x:%08x ", tagupper, taglower);
+ -	as  = abort->scsi_cmd;
+ +	as  = (struct scsi_cmnd *) abort->scsi_cmd;
+  	if (as != NULL)
+++<<<<<<< HEAD
+ +		ml += sprintf(msg+ml, "Command:0x%x SN:0x%lx ",
+ +			as->cmnd[0], as->serial_number);
+ +	dev_dbg(&h->pdev->dev, "%s\n", msg);
+ +	dev_warn(&h->pdev->dev, "Abort request on C%d:B%d:T%d:L%d\n",
+ +		h->scsi_host->host_no, dev->bus, dev->target, dev->lun);
+++=======
++ 		ml += sprintf(msg+ml,
++ 			"CDBLen: %d CDB: 0x%02x%02x... SN: 0x%lx ",
++ 			as->cmd_len, as->cmnd[0], as->cmnd[1],
++ 			as->serial_number);
++ 	dev_warn(&h->pdev->dev, "%s BEING SENT\n", msg);
++ 	hpsa_show_dev_msg(KERN_WARNING, h, dev, "Aborting command");
++ 
+++>>>>>>> 4b761557d79a (hpsa: clean up some error reporting output in abort handler)
+  	/*
+  	 * Command is in flight, or possibly already completed
+  	 * by the firmware (but not to the scsi mid layer) but we can't
+  	 * distinguish which.  Send the abort down.
+  	 */
+++<<<<<<< HEAD
+ +	rc = hpsa_send_abort_both_ways(h, dev->scsi3addr, abort);
+ +	if (rc != 0) {
+ +		dev_dbg(&h->pdev->dev, "%s Request FAILED.\n", msg);
+ +		dev_warn(&h->pdev->dev, "FAILED abort on device C%d:B%d:T%d:L%d\n",
+ +			h->scsi_host->host_no,
+ +			dev->bus, dev->target, dev->lun);
+++=======
++ 	if (wait_for_available_abort_cmd(h)) {
++ 		dev_warn(&h->pdev->dev,
++ 			"%s FAILED, timeout waiting for an abort command to become available.\n",
++ 			msg);
++ 		cmd_free(h, abort);
+  		return FAILED;
+  	}
+- 	dev_info(&h->pdev->dev, "%s REQUEST SUCCEEDED.\n", msg);
++ 	rc = hpsa_send_abort_both_ways(h, dev->scsi3addr, abort, reply_queue);
++ 	atomic_inc(&h->abort_cmds_available);
++ 	wake_up_all(&h->abort_cmd_wait_queue);
++ 	if (rc != 0) {
++ 		dev_warn(&h->pdev->dev, "%s SENT, FAILED\n", msg);
++ 		hpsa_show_dev_msg(KERN_WARNING, h, dev,
++ 				"FAILED to abort command");
++ 		cmd_free(h, abort);
+++>>>>>>> 4b761557d79a (hpsa: clean up some error reporting output in abort handler)
++ 		return FAILED;
++ 	}
++ 	dev_info(&h->pdev->dev, "%s SENT, SUCCESS\n", msg);
+  
+- 	/* If the abort(s) above completed and actually aborted the
++ 	/*
++ 	 * If the abort(s) above completed and actually aborted the
+  	 * command, then the command to be aborted should already be
+  	 * completed.  If not, wait around a bit more to see if they
+  	 * manage to complete normally.
+* Unmerged path drivers/scsi/hpsa.c
