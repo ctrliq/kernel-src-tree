@@ -1,0 +1,110 @@
+aacraid: IOP RESET command handling changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Mahesh Rajashekhara <Mahesh.Rajashekhara@pmcs.com>
+commit dafde947bce37b10f3681d6b9df473ba7136fc05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dafde947.failed
+
+This patch fixes the IOP_RESET issue. Sending IOP_RESET command need to wait
+for only 10 sec instead of 5 minutes in case of firmware does not response
+IOP_RESET command.  Disable interrupt before setup interrupt routine to
+prevent spurious interrupts.
+
+	Signed-off-by: Mahesh Rajashekhara <Mahesh.Rajashekhara@pmcs.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Murthy Bhat <Murthy.Bhat@pmcs.com>
+	Signed-off-by: James Bottomley <JBottomley@Odin.com>
+(cherry picked from commit dafde947bce37b10f3681d6b9df473ba7136fc05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/aacraid.h
+#	drivers/scsi/aacraid/src.c
+diff --cc drivers/scsi/aacraid/aacraid.h
+index 0b48b47d8620,9b469a4254b7..000000000000
+--- a/drivers/scsi/aacraid/aacraid.h
++++ b/drivers/scsi/aacraid/aacraid.h
+@@@ -1156,6 -1216,12 +1156,15 @@@ struct aac_de
+  	int			sync_mode;
+  	struct fib		*sync_fib;
+  	struct list_head	sync_fib_list;
+++<<<<<<< HEAD
+++=======
++ 	u32			doorbell_mask;
++ 	u32			max_msix;	/* max. MSI-X vectors */
++ 	u32			vector_cap;	/* MSI-X vector capab.*/
++ 	int			msi_enabled;	/* MSI/MSI-X enabled */
++ 	struct msix_entry	msixentry[AAC_MAX_MSIX];
++ 	struct aac_msix_ctx	aac_msix[AAC_MAX_MSIX]; /* context */
+++>>>>>>> dafde947bce3 (aacraid: IOP RESET command handling changes)
+  };
+  
+  #define aac_adapter_interrupt(dev) \
+diff --cc drivers/scsi/aacraid/src.c
+index 7e17107643d4,4a963cd4a941..000000000000
+--- a/drivers/scsi/aacraid/src.c
++++ b/drivers/scsi/aacraid/src.c
+@@@ -498,14 -579,33 +503,42 @@@ static int aac_src_restart_adapter(stru
+  		if (bled)
+  			printk(KERN_ERR "%s%d: adapter kernel panic'd %x.\n",
+  				dev->name, dev->id, bled);
++ 		dev->a_ops.adapter_enable_int = aac_src_disable_interrupt;
+  		bled = aac_adapter_sync_cmd(dev, IOP_RESET_ALWAYS,
+  			0, 0, 0, 0, 0, 0, &var, &reset_mask, NULL, NULL, NULL);
+++<<<<<<< HEAD
+ +			if (bled || (var != 0x00000001))
+ +				return -EINVAL;
+ +		if (dev->supplement_adapter_info.SupportedOptions2 &
+ +			AAC_OPTION_DOORBELL_RESET) {
+ +			src_writel(dev, MUnit.IDR, reset_mask);
+ +			msleep(5000); /* Delay 5 seconds */
+++=======
++ 		if ((bled || (var != 0x00000001)) &&
++ 		    !dev->doorbell_mask)
++ 			return -EINVAL;
++ 		else if (dev->doorbell_mask) {
++ 			reset_mask = dev->doorbell_mask;
++ 			bled = 0;
++ 			var = 0x00000001;
++ 		}
++ 
++ 		if ((dev->pdev->device == PMC_DEVICE_S7 ||
++ 		    dev->pdev->device == PMC_DEVICE_S8 ||
++ 		    dev->pdev->device == PMC_DEVICE_S9) && dev->msi_enabled) {
++ 			aac_src_access_devreg(dev, AAC_ENABLE_INTX);
++ 			dev->msi_enabled = 0;
++ 			msleep(5000); /* Delay 5 seconds */
++ 		}
++ 
++ 		if (!bled && (dev->supplement_adapter_info.SupportedOptions2 &
++ 		    AAC_OPTION_DOORBELL_RESET)) {
++ 			src_writel(dev, MUnit.IDR, reset_mask);
++ 			ssleep(45);
++ 		} else {
++ 			src_writel(dev, MUnit.IDR, 0x100);
++ 			ssleep(45);
+++>>>>>>> dafde947bce3 (aacraid: IOP RESET command handling changes)
+  		}
+  	}
+  
+* Unmerged path drivers/scsi/aacraid/aacraid.h
+diff --git a/drivers/scsi/aacraid/comminit.c b/drivers/scsi/aacraid/comminit.c
+index 177b094c7792..4d68e25f7fdf 100644
+--- a/drivers/scsi/aacraid/comminit.c
++++ b/drivers/scsi/aacraid/comminit.c
+@@ -350,8 +350,10 @@ struct aac_dev *aac_init_adapter(struct aac_dev *dev)
+ 	dev->raw_io_interface = dev->raw_io_64 = 0;
+ 
+ 	if ((!aac_adapter_sync_cmd(dev, GET_ADAPTER_PROPERTIES,
+-		0, 0, 0, 0, 0, 0, status+0, status+1, status+2, NULL, NULL)) &&
++		0, 0, 0, 0, 0, 0,
++		status+0, status+1, status+2, status+3, NULL)) &&
+ 	 		(status[0] == 0x00000001)) {
++		dev->doorbell_mask = status[3];
+ 		if (status[1] & le32_to_cpu(AAC_OPT_NEW_COMM_64))
+ 			dev->raw_io_64 = 1;
+ 		dev->sync_mode = aac_sync_mode;
+* Unmerged path drivers/scsi/aacraid/src.c
