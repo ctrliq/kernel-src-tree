@@ -1,0 +1,276 @@
+Btrfs: do file data check by sub-bio's self
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Miao Xie <miaox@cn.fujitsu.com>
+commit c1dc08967f69c6b5067f8302c600f6628123f3bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/c1dc0896.failed
+
+Direct IO splits the original bio to several sub-bios because of the limit of
+raid stripe, and the filesystem will wait for all sub-bios and then run final
+end io process.
+
+But it was very hard to implement the data repair when dio read failure happens,
+because at the final end io function, we didn't know which mirror the data was
+read from. So in order to implement the data repair, we have to move the file data
+check in the final end io function to the sub-bio end io function, in which we can
+get the mirror number of the device we access. This patch did this work as the
+first step of the direct io data repair implementation.
+
+	Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit c1dc08967f69c6b5067f8302c600f6628123f3bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/btrfs_inode.h
+#	fs/btrfs/extent_io.c
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/btrfs_inode.h
+index 1aa38414f6c8,4d309471294e..000000000000
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@@ -272,7 -266,12 +275,16 @@@ struct btrfs_dio_private 
+  
+  	/* dio_bio came from fs/direct-io.c */
+  	struct bio *dio_bio;
+++<<<<<<< HEAD
+ +	u8 csum[0];
+++=======
++ 
++ 	/*
++ 	 * The original bio may be splited to several sub-bios, this is
++ 	 * done during endio of sub-bios
++ 	 */
++ 	int (*subio_endio)(struct inode *, struct btrfs_io_bio *);
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  };
+  
+  /*
+diff --cc fs/btrfs/extent_io.c
+index f96ea62e4cf9,ad04f85ac45d..000000000000
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@@ -2474,7 -2472,7 +2474,11 @@@ static void end_bio_extent_readpage(str
+  		struct inode *inode = page->mapping->host;
+  
+  		pr_debug("end_bio_extent_readpage: bi_sector=%llu, err=%d, "
+++<<<<<<< HEAD
+ +			 "mirror=%lu\n", (u64)bio->bi_sector, err,
+++=======
++ 			 "mirror=%u\n", (u64)bio->bi_iter.bi_sector, err,
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  			 io_bio->mirror_num);
+  		tree = &BTRFS_I(inode)->io_tree;
+  
+diff --cc fs/btrfs/inode.c
+index a4bd5317d647,09d8c5ee8869..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -7186,47 -7242,39 +7186,81 @@@ unlock_err
+  	return ret;
+  }
+  
+- static void btrfs_endio_direct_read(struct bio *bio, int err)
++ static int btrfs_subio_endio_read(struct inode *inode,
++ 				  struct btrfs_io_bio *io_bio)
+  {
+++<<<<<<< HEAD
+ +	struct btrfs_dio_private *dip = bio->bi_private;
+ +	struct bio_vec *bvec_end = bio->bi_io_vec + bio->bi_vcnt - 1;
+ +	struct bio_vec *bvec = bio->bi_io_vec;
+ +	struct inode *inode = dip->inode;
+ +	struct btrfs_root *root = BTRFS_I(inode)->root;
+ +	struct bio *dio_bio;
+ +	u32 *csums = (u32 *)dip->csum;
+ +	int index = 0;
+ +	u64 start;
+ +
+ +	start = dip->logical_offset;
+ +	do {
+ +		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
+ +			struct page *page = bvec->bv_page;
+ +			char *kaddr;
+ +			u32 csum = ~(u32)0;
+ +			unsigned long flags;
+ +
+ +			local_irq_save(flags);
+ +			kaddr = kmap_atomic(page);
+ +			csum = btrfs_csum_data(kaddr + bvec->bv_offset,
+ +					       csum, bvec->bv_len);
+ +			btrfs_csum_final(csum, (char *)&csum);
+ +			kunmap_atomic(kaddr);
+ +			local_irq_restore(flags);
+ +
+ +			flush_dcache_page(bvec->bv_page);
+ +			if (csum != csums[index]) {
+ +				btrfs_err(root->fs_info, "csum failed ino %llu off %llu csum %u expected csum %u",
+ +					  btrfs_ino(inode), start, csum,
+ +					  csums[index]);
+ +				err = -EIO;
+ +			}
+ +		}
+ +
+ +		start += bvec->bv_len;
+ +		bvec++;
+ +		index++;
+ +	} while (bvec <= bvec_end);
+++=======
++ 	struct bio_vec *bvec;
++ 	u64 start;
++ 	int i;
++ 	int ret;
++ 	int err = 0;
++ 
++ 	if (BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)
++ 		return 0;
++ 
++ 	start = io_bio->logical;
++ 	bio_for_each_segment_all(bvec, &io_bio->bio, i) {
++ 		ret = __readpage_endio_check(inode, io_bio, i, bvec->bv_page,
++ 					     0, start, bvec->bv_len);
++ 		if (ret)
++ 			err = -EIO;
++ 		start += bvec->bv_len;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static void btrfs_endio_direct_read(struct bio *bio, int err)
++ {
++ 	struct btrfs_dio_private *dip = bio->bi_private;
++ 	struct inode *inode = dip->inode;
++ 	struct bio *dio_bio;
++ 	struct btrfs_io_bio *io_bio = btrfs_io_bio(bio);
++ 
++ 	if (!err && (dip->flags & BTRFS_DIO_ORIG_BIO_SUBMITTED))
++ 		err = btrfs_subio_endio_read(inode, io_bio);
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  
+  	unlock_extent(&BTRFS_I(inode)->io_tree, dip->logical_offset,
+  		      dip->logical_offset + dip->bytes - 1);
+@@@ -7307,7 -7359,15 +7342,19 @@@ static void btrfs_end_dio_bio(struct bi
+  		btrfs_err(BTRFS_I(dip->inode)->root->fs_info,
+  			  "direct IO failed ino %llu rw %lu sector %#Lx len %u err no %d",
+  		      btrfs_ino(dip->inode), bio->bi_rw,
+++<<<<<<< HEAD
+ +		      (unsigned long long)bio->bi_sector, bio->bi_size, err);
+++=======
++ 		      (unsigned long long)bio->bi_iter.bi_sector,
++ 		      bio->bi_iter.bi_size, err);
++ 	} else if (dip->subio_endio) {
++ 		ret = dip->subio_endio(dip->inode, btrfs_io_bio(bio));
++ 		if (ret)
++ 			err = ret;
++ 	}
++ 
++ 	if (err) {
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  		dip->errors = 1;
+  
+  		/*
+@@@ -7376,9 -7468,9 +7455,15 @@@ static inline int __btrfs_submit_dio_bi
+  		ret = btrfs_csum_one_bio(root, inode, bio, file_offset, 1);
+  		if (ret)
+  			goto err;
+++<<<<<<< HEAD
+ +	} else if (!skip_sum) {
+ +		ret = btrfs_lookup_bio_sums_dio(root, inode, dip, bio,
+ +						file_offset);
+++=======
++ 	} else {
++ 		ret = btrfs_lookup_and_bind_dio_csum(root, inode, dip, bio,
++ 						     file_offset);
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  		if (ret)
+  			goto err;
+  	}
+@@@ -7412,8 -7503,9 +7497,9 @@@ static int btrfs_submit_direct_hook(in
+  	if (ret)
+  		return -EIO;
+  
+ -	if (map_length >= orig_bio->bi_iter.bi_size) {
+ +	if (map_length >= orig_bio->bi_size) {
+  		bio = orig_bio;
++ 		dip->flags |= BTRFS_DIO_ORIG_BIO_SUBMITTED;
+  		goto submit;
+  	}
+  
+@@@ -7464,8 -7557,9 +7551,9 @@@
+  				goto out_err;
+  			bio->bi_private = dip;
+  			bio->bi_end_io = btrfs_end_dio_bio;
++ 			btrfs_io_bio(bio)->logical = file_offset;
+  
+ -			map_length = orig_bio->bi_iter.bi_size;
+ +			map_length = orig_bio->bi_size;
+  			ret = btrfs_map_block(root->fs_info, rw,
+  					      start_sector << 9,
+  					      &map_length, NULL, 0);
+@@@ -7521,15 -7614,7 +7609,19 @@@ static void btrfs_submit_direct(int rw
+  		goto free_ordered;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!skip_sum && !write) {
+ +		csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
+ +		sum_len = dio_bio->bi_size >> inode->i_sb->s_blocksize_bits;
+ +		sum_len *= csum_size;
+ +	} else {
+ +		sum_len = 0;
+ +	}
+ +
+ +	dip = kmalloc(sizeof(*dip) + sum_len, GFP_NOFS);
+++=======
++ 	dip = kzalloc(sizeof(*dip), GFP_NOFS);
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  	if (!dip) {
+  		ret = -ENOMEM;
+  		goto free_io_bio;
+@@@ -7538,10 -7623,9 +7630,9 @@@
+  	dip->private = dio_bio->bi_private;
+  	dip->inode = inode;
+  	dip->logical_offset = file_offset;
+ -	dip->bytes = dio_bio->bi_iter.bi_size;
+ -	dip->disk_bytenr = (u64)dio_bio->bi_iter.bi_sector << 9;
+ +	dip->bytes = dio_bio->bi_size;
+ +	dip->disk_bytenr = (u64)dio_bio->bi_sector << 9;
+  	io_bio->bi_private = dip;
+- 	dip->errors = 0;
+  	dip->orig_bio = io_bio;
+  	dip->dio_bio = dio_bio;
+  	atomic_set(&dip->pending_bios, 0);
+@@@ -7555,6 -7643,8 +7650,11 @@@
+  	if (!ret)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (btrfs_bio->end_io)
++ 		btrfs_bio->end_io(btrfs_bio, ret);
+++>>>>>>> c1dc08967f69 (Btrfs: do file data check by sub-bio's self)
+  free_io_bio:
+  	bio_put(io_bio);
+  
+* Unmerged path fs/btrfs/btrfs_inode.h
+* Unmerged path fs/btrfs/extent_io.c
+* Unmerged path fs/btrfs/inode.c
+diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+index 2b37da3dd408..91998bc0b4c4 100644
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@ -268,8 +268,9 @@ struct btrfs_fs_devices {
+  */
+ typedef void (btrfs_io_bio_end_io_t) (struct btrfs_io_bio *bio, int err);
+ struct btrfs_io_bio {
+-	unsigned long mirror_num;
+-	unsigned long stripe_index;
++	unsigned int mirror_num;
++	unsigned int stripe_index;
++	u64 logical;
+ 	u8 *csum;
+ 	u8 csum_inline[BTRFS_BIO_INLINE_CSUM_SIZE];
+ 	u8 *csum_allocated;
