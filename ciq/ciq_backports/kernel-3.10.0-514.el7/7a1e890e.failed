@@ -1,0 +1,157 @@
+usbnet: Fix tx_bytes statistic running backward in cdc_ncm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ben Hutchings <ben.hutchings@codethink.co.uk>
+commit 7a1e890e2168e33fb62d84528e996b8b4b478fea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/7a1e890e.failed
+
+cdc_ncm disagrees with usbnet about how much framing overhead should
+be counted in the tx_bytes statistics, and tries 'fix' this by
+decrementing tx_bytes on the transmit path.  But statistics must never
+be decremented except due to roll-over; this will thoroughly confuse
+user-space.  Also, tx_bytes is only incremented by usbnet in the
+completion path.
+
+Fix this by requiring drivers that set FLAG_MULTI_FRAME to set a
+tx_bytes delta along with the tx_packets count.
+
+Fixes: beeecd42c3b4 ("net: cdc_ncm/cdc_mbim: adding NCM protocol statistics")
+	Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+(cherry picked from commit 7a1e890e2168e33fb62d84528e996b8b4b478fea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/asix_common.c
+#	drivers/net/usb/cdc_ncm.c
+#	drivers/net/usb/sr9800.c
+#	drivers/net/usb/usbnet.c
+#	include/linux/usb/usbnet.h
+diff --cc drivers/net/usb/asix_common.c
+index 5c55f11572ba,75d6f26729a3..000000000000
+--- a/drivers/net/usb/asix_common.c
++++ b/drivers/net/usb/asix_common.c
+@@@ -188,6 -188,8 +188,11 @@@ struct sk_buff *asix_tx_fixup(struct us
+  		memcpy(skb_tail_pointer(skb), &padbytes, sizeof(padbytes));
+  		skb_put(skb, sizeof(padbytes));
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	usbnet_set_skb_tx_stats(skb, 1, 0);
+++>>>>>>> 7a1e890e2168 (usbnet: Fix tx_bytes statistic running backward in cdc_ncm)
+  	return skb;
+  }
+  
+diff --cc drivers/net/usb/cdc_ncm.c
+index e977104210f9,c3e4da9e79ca..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -806,7 -1172,18 +806,22 @@@ cdc_ncm_fill_tx_frame(struct usbnet *de
+  
+  	/* return skb */
+  	ctx->tx_curr_skb = NULL;
+++<<<<<<< HEAD
+ +	dev->net->stats.tx_packets += ctx->tx_curr_frame_num;
+++=======
++ 
++ 	/* keep private stats: framing overhead and number of NTBs */
++ 	ctx->tx_overhead += skb_out->len - ctx->tx_curr_frame_payload;
++ 	ctx->tx_ntbs++;
++ 
++ 	/* usbnet will count all the framing overhead by default.
++ 	 * Adjust the stats so that the tx_bytes counter show real
++ 	 * payload data instead.
++ 	 */
++ 	usbnet_set_skb_tx_stats(skb_out, n,
++ 				ctx->tx_curr_frame_payload - skb_out->len);
++ 
+++>>>>>>> 7a1e890e2168 (usbnet: Fix tx_bytes statistic running backward in cdc_ncm)
+  	return skb_out;
+  
+  exit_no_skb:
+diff --cc drivers/net/usb/sr9800.c
+index 801710883727,953de13267df..000000000000
+--- a/drivers/net/usb/sr9800.c
++++ b/drivers/net/usb/sr9800.c
+@@@ -140,6 -144,7 +140,10 @@@ static struct sk_buff *sr_tx_fixup(stru
+  		skb_put(skb, sizeof(padbytes));
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	usbnet_set_skb_tx_stats(skb, 1, 0);
+++>>>>>>> 7a1e890e2168 (usbnet: Fix tx_bytes statistic running backward in cdc_ncm)
+  	return skb;
+  }
+  
+diff --cc drivers/net/usb/usbnet.c
+index 449835f4331e,777757ae1973..000000000000
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@@ -1347,7 -1346,19 +1347,23 @@@ netdev_tx_t usbnet_start_xmit (struct s
+  		} else
+  			urb->transfer_flags |= URB_ZERO_PACKET;
+  	}
+++<<<<<<< HEAD
+ +	entry->length = urb->transfer_buffer_length = length;
+++=======
++ 	urb->transfer_buffer_length = length;
++ 
++ 	if (info->flags & FLAG_MULTI_PACKET) {
++ 		/* Driver has set number of packets and a length delta.
++ 		 * Calculate the complete length and ensure that it's
++ 		 * positive.
++ 		 */
++ 		entry->length += length;
++ 		if (WARN_ON_ONCE(entry->length <= 0))
++ 			entry->length = length;
++ 	} else {
++ 		usbnet_set_skb_tx_stats(skb, 1, length);
++ 	}
+++>>>>>>> 7a1e890e2168 (usbnet: Fix tx_bytes statistic running backward in cdc_ncm)
+  
+  	spin_lock_irqsave(&dev->txq.lock, flags);
+  	retval = usb_autopm_get_interface_async(dev->intf);
+diff --cc include/linux/usb/usbnet.h
+index d9a4905e01d0,6e0ce8c7b8cb..000000000000
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@@ -227,9 -227,23 +227,29 @@@ struct skb_data {	/* skb->cb is one of 
+  	struct urb		*urb;
+  	struct usbnet		*dev;
+  	enum skb_state		state;
+++<<<<<<< HEAD
+ +	size_t			length;
+ +};
+ +
+++=======
++ 	long			length;
++ 	unsigned long		packets;
++ };
++ 
++ /* Drivers that set FLAG_MULTI_PACKET must call this in their
++  * tx_fixup method before returning an skb.
++  */
++ static inline void
++ usbnet_set_skb_tx_stats(struct sk_buff *skb,
++ 			unsigned long packets, long bytes_delta)
++ {
++ 	struct skb_data *entry = (struct skb_data *) skb->cb;
++ 
++ 	entry->packets = packets;
++ 	entry->length = bytes_delta;
++ }
++ 
+++>>>>>>> 7a1e890e2168 (usbnet: Fix tx_bytes statistic running backward in cdc_ncm)
+  extern int usbnet_open(struct net_device *net);
+  extern int usbnet_stop(struct net_device *net);
+  extern netdev_tx_t usbnet_start_xmit(struct sk_buff *skb,
+* Unmerged path drivers/net/usb/asix_common.c
+* Unmerged path drivers/net/usb/cdc_ncm.c
+* Unmerged path drivers/net/usb/sr9800.c
+* Unmerged path drivers/net/usb/usbnet.c
+* Unmerged path include/linux/usb/usbnet.h
