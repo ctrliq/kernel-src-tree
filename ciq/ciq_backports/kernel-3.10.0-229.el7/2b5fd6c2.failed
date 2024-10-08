@@ -1,0 +1,166 @@
+ALSA: hda - Move the dsp loader to hda_controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [alsa] hda: Move the dsp loader to hda_controller (Jaroslav Kysela) [1112200]
+Rebuild_FUZZ: 90.11%
+commit-author Dylan Reid <dgreid@chromium.org>
+commit 2b5fd6c2e9f2398962a932f85d951bce794f97f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/2b5fd6c2.failed
+
+Moving the DSP loading functionality to hda_controller.c means that
+the dsp lock doesn't need to be shared in hda_intel and
+hda_controller.  The forthcoming platform driver doesn't need the DSP
+loading code, but sharing it doesn't hurt.
+
+Tested on Chromebook Pixel's ca0132 that uses the DSP loader.
+
+	Signed-off-by: Dylan Reid <dgreid@chromium.org>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 2b5fd6c2e9f2398962a932f85d951bce794f97f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_controller.c
+#	sound/pci/hda/hda_controller.h
+#	sound/pci/hda/hda_intel.c
+diff --cc sound/pci/hda/hda_intel.c
+index f803cf3b4c64,80250b3a6fc3..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -2371,125 -1345,6 +2362,128 @@@ static void azx_stop_chip(struct azx *c
+  	chip->initialized = 0;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SND_HDA_DSP_LOADER
+ +/*
+ + * DSP loading code (e.g. for CA0132)
+ + */
+ +
+ +/* use the first stream for loading DSP */
+ +static struct azx_dev *
+ +azx_get_dsp_loader_dev(struct azx *chip)
+ +{
+ +	return &chip->azx_dev[chip->playback_index_offset];
+ +}
+ +
+ +static int azx_load_dsp_prepare(struct hda_bus *bus, unsigned int format,
+ +				unsigned int byte_size,
+ +				struct snd_dma_buffer *bufp)
+ +{
+ +	u32 *bdl;
+ +	struct azx *chip = bus->private_data;
+ +	struct azx_dev *azx_dev;
+ +	int err;
+ +
+ +	azx_dev = azx_get_dsp_loader_dev(chip);
+ +
+ +	dsp_lock(azx_dev);
+ +	spin_lock_irq(&chip->reg_lock);
+ +	if (azx_dev->running || azx_dev->locked) {
+ +		spin_unlock_irq(&chip->reg_lock);
+ +		err = -EBUSY;
+ +		goto unlock;
+ +	}
+ +	azx_dev->prepared = 0;
+ +	chip->saved_azx_dev = *azx_dev;
+ +	azx_dev->locked = 1;
+ +	spin_unlock_irq(&chip->reg_lock);
+ +
+ +	err = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV_SG,
+ +				  chip->card->dev,
+ +				  byte_size, bufp);
+ +	if (err < 0)
+ +		goto err_alloc;
+ +
+ +	mark_pages_wc(chip, bufp, true);
+ +	azx_dev->bufsize = byte_size;
+ +	azx_dev->period_bytes = byte_size;
+ +	azx_dev->format_val = format;
+ +
+ +	azx_stream_reset(chip, azx_dev);
+ +
+ +	/* reset BDL address */
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPL, 0);
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPU, 0);
+ +
+ +	azx_dev->frags = 0;
+ +	bdl = (u32 *)azx_dev->bdl.area;
+ +	err = setup_bdle(chip, bufp, azx_dev, &bdl, 0, byte_size, 0);
+ +	if (err < 0)
+ +		goto error;
+ +
+ +	azx_setup_controller(chip, azx_dev);
+ +	dsp_unlock(azx_dev);
+ +	return azx_dev->stream_tag;
+ +
+ + error:
+ +	mark_pages_wc(chip, bufp, false);
+ +	snd_dma_free_pages(bufp);
+ + err_alloc:
+ +	spin_lock_irq(&chip->reg_lock);
+ +	if (azx_dev->opened)
+ +		*azx_dev = chip->saved_azx_dev;
+ +	azx_dev->locked = 0;
+ +	spin_unlock_irq(&chip->reg_lock);
+ + unlock:
+ +	dsp_unlock(azx_dev);
+ +	return err;
+ +}
+ +
+ +static void azx_load_dsp_trigger(struct hda_bus *bus, bool start)
+ +{
+ +	struct azx *chip = bus->private_data;
+ +	struct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);
+ +
+ +	if (start)
+ +		azx_stream_start(chip, azx_dev);
+ +	else
+ +		azx_stream_stop(chip, azx_dev);
+ +	azx_dev->running = start;
+ +}
+ +
+ +static void azx_load_dsp_cleanup(struct hda_bus *bus,
+ +				 struct snd_dma_buffer *dmab)
+ +{
+ +	struct azx *chip = bus->private_data;
+ +	struct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);
+ +
+ +	if (!dmab->area || !azx_dev->locked)
+ +		return;
+ +
+ +	dsp_lock(azx_dev);
+ +	/* reset BDL address */
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPL, 0);
+ +	azx_sd_writel(chip, azx_dev, SD_BDLPU, 0);
+ +	azx_sd_writel(chip, azx_dev, SD_CTL, 0);
+ +	azx_dev->bufsize = 0;
+ +	azx_dev->period_bytes = 0;
+ +	azx_dev->format_val = 0;
+ +
+ +	mark_pages_wc(chip, dmab, false);
+ +	snd_dma_free_pages(dmab);
+ +	dmab->area = NULL;
+ +
+ +	spin_lock_irq(&chip->reg_lock);
+ +	if (azx_dev->opened)
+ +		*azx_dev = chip->saved_azx_dev;
+ +	azx_dev->locked = 0;
+ +	spin_unlock_irq(&chip->reg_lock);
+ +	dsp_unlock(azx_dev);
+ +}
+ +#endif /* CONFIG_SND_HDA_DSP_LOADER */
+ +
+++=======
+++>>>>>>> 2b5fd6c2e9f2 (ALSA: hda - Move the dsp loader to hda_controller)
+  #ifdef CONFIG_PM
+  /* power-up/down the controller */
+  static void azx_power_notify(struct hda_bus *bus, bool power_up)
+* Unmerged path sound/pci/hda/hda_controller.c
+* Unmerged path sound/pci/hda/hda_controller.h
+* Unmerged path sound/pci/hda/hda_controller.c
+* Unmerged path sound/pci/hda/hda_controller.h
+* Unmerged path sound/pci/hda/hda_intel.c
