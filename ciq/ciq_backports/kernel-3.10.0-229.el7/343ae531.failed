@@ -1,0 +1,205 @@
+nfs: Fix unused variable error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Anna Schumaker <Anna.Schumaker@netapp.com>
+commit 343ae531f12b046ddfe54b0aa91b11b257f0c55f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/343ae531.failed
+
+inode is unused when CONFIG_SUNRPC_DEBUG=n.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 343ae531f12b046ddfe54b0aa91b11b257f0c55f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 3e37cab99ceb,6e2c0bce5926..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -307,6 -452,177 +307,180 @@@ size_t nfs_generic_pg_test(struct nfs_p
+  }
+  EXPORT_SYMBOL_GPL(nfs_generic_pg_test);
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs_pgio_header *nfs_pgio_header_alloc(const struct nfs_rw_ops *ops)
++ {
++ 	struct nfs_pgio_header *hdr = ops->rw_alloc_header();
++ 
++ 	if (hdr) {
++ 		INIT_LIST_HEAD(&hdr->pages);
++ 		spin_lock_init(&hdr->lock);
++ 		hdr->rw_ops = ops;
++ 	}
++ 	return hdr;
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_alloc);
++ 
++ /*
++  * nfs_pgio_header_free - Free a read or write header
++  * @hdr: The header to free
++  */
++ void nfs_pgio_header_free(struct nfs_pgio_header *hdr)
++ {
++ 	hdr->rw_ops->rw_free_header(hdr);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_header_free);
++ 
++ /**
++  * nfs_pgio_data_destroy - make @hdr suitable for reuse
++  *
++  * Frees memory and releases refs from nfs_generic_pgio, so that it may
++  * be called again.
++  *
++  * @hdr: A header that has had nfs_generic_pgio called
++  */
++ void nfs_pgio_data_destroy(struct nfs_pgio_header *hdr)
++ {
++ 	put_nfs_open_context(hdr->args.context);
++ 	if (hdr->page_array.pagevec != hdr->page_array.page_array)
++ 		kfree(hdr->page_array.pagevec);
++ }
++ EXPORT_SYMBOL_GPL(nfs_pgio_data_destroy);
++ 
++ /**
++  * nfs_pgio_rpcsetup - Set up arguments for a pageio call
++  * @hdr: The pageio hdr
++  * @count: Number of bytes to read
++  * @offset: Initial offset
++  * @how: How to commit data (writes only)
++  * @cinfo: Commit information for the call (writes only)
++  */
++ static void nfs_pgio_rpcsetup(struct nfs_pgio_header *hdr,
++ 			      unsigned int count, unsigned int offset,
++ 			      int how, struct nfs_commit_info *cinfo)
++ {
++ 	struct nfs_page *req = hdr->req;
++ 
++ 	/* Set up the RPC argument and reply structs
++ 	 * NB: take care not to mess about with hdr->commit et al. */
++ 
++ 	hdr->args.fh     = NFS_FH(hdr->inode);
++ 	hdr->args.offset = req_offset(req) + offset;
++ 	/* pnfs_set_layoutcommit needs this */
++ 	hdr->mds_offset = hdr->args.offset;
++ 	hdr->args.pgbase = req->wb_pgbase + offset;
++ 	hdr->args.pages  = hdr->page_array.pagevec;
++ 	hdr->args.count  = count;
++ 	hdr->args.context = get_nfs_open_context(req->wb_context);
++ 	hdr->args.lock_context = req->wb_lock_context;
++ 	hdr->args.stable  = NFS_UNSTABLE;
++ 	switch (how & (FLUSH_STABLE | FLUSH_COND_STABLE)) {
++ 	case 0:
++ 		break;
++ 	case FLUSH_COND_STABLE:
++ 		if (nfs_reqs_to_commit(cinfo))
++ 			break;
++ 	default:
++ 		hdr->args.stable = NFS_FILE_SYNC;
++ 	}
++ 
++ 	hdr->res.fattr   = &hdr->fattr;
++ 	hdr->res.count   = count;
++ 	hdr->res.eof     = 0;
++ 	hdr->res.verf    = &hdr->verf;
++ 	nfs_fattr_init(&hdr->fattr);
++ }
++ 
++ /**
++  * nfs_pgio_prepare - Prepare pageio hdr to go over the wire
++  * @task: The current task
++  * @calldata: pageio header to prepare
++  */
++ static void nfs_pgio_prepare(struct rpc_task *task, void *calldata)
++ {
++ 	struct nfs_pgio_header *hdr = calldata;
++ 	int err;
++ 	err = NFS_PROTO(hdr->inode)->pgio_rpc_prepare(task, hdr);
++ 	if (err)
++ 		rpc_exit(task, err);
++ }
++ 
++ int nfs_initiate_pgio(struct rpc_clnt *clnt, struct nfs_pgio_header *hdr,
++ 		      const struct rpc_call_ops *call_ops, int how, int flags)
++ {
++ 	struct rpc_task *task;
++ 	struct rpc_message msg = {
++ 		.rpc_argp = &hdr->args,
++ 		.rpc_resp = &hdr->res,
++ 		.rpc_cred = hdr->cred,
++ 	};
++ 	struct rpc_task_setup task_setup_data = {
++ 		.rpc_client = clnt,
++ 		.task = &hdr->task,
++ 		.rpc_message = &msg,
++ 		.callback_ops = call_ops,
++ 		.callback_data = hdr,
++ 		.workqueue = nfsiod_workqueue,
++ 		.flags = RPC_TASK_ASYNC | flags,
++ 	};
++ 	int ret = 0;
++ 
++ 	hdr->rw_ops->rw_initiate(hdr, &msg, &task_setup_data, how);
++ 
++ 	dprintk("NFS: %5u initiated pgio call "
++ 		"(req %s/%llu, %u bytes @ offset %llu)\n",
++ 		hdr->task.tk_pid,
++ 		hdr->inode->i_sb->s_id,
++ 		(unsigned long long)NFS_FILEID(hdr->inode),
++ 		hdr->args.count,
++ 		(unsigned long long)hdr->args.offset);
++ 
++ 	task = rpc_run_task(&task_setup_data);
++ 	if (IS_ERR(task)) {
++ 		ret = PTR_ERR(task);
++ 		goto out;
++ 	}
++ 	if (how & FLUSH_SYNC) {
++ 		ret = rpc_wait_for_completion_task(task);
++ 		if (ret == 0)
++ 			ret = task->tk_status;
++ 	}
++ 	rpc_put_task(task);
++ out:
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nfs_initiate_pgio);
++ 
++ /**
++  * nfs_pgio_error - Clean up from a pageio error
++  * @desc: IO descriptor
++  * @hdr: pageio header
++  */
++ static int nfs_pgio_error(struct nfs_pageio_descriptor *desc,
++ 			  struct nfs_pgio_header *hdr)
++ {
++ 	set_bit(NFS_IOHDR_REDO, &hdr->flags);
++ 	nfs_pgio_data_destroy(hdr);
++ 	hdr->completion_ops->completion(hdr);
++ 	desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ 	return -ENOMEM;
++ }
++ 
++ /**
++  * nfs_pgio_release - Release pageio data
++  * @calldata: The pageio header to release
++  */
++ static void nfs_pgio_release(void *calldata)
++ {
++ 	struct nfs_pgio_header *hdr = calldata;
++ 	if (hdr->rw_ops->rw_release)
++ 		hdr->rw_ops->rw_release(hdr);
++ 	nfs_pgio_data_destroy(hdr);
++ 	hdr->completion_ops->completion(hdr);
++ }
++ 
+++>>>>>>> 343ae531f12b (nfs: Fix unused variable error)
+  /**
+   * nfs_pageio_init - initialise a page io descriptor
+   * @desc: pointer to descriptor
+* Unmerged path fs/nfs/pagelist.c
