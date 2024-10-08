@@ -1,0 +1,187 @@
+ipv4: fix dst race in sk_dst_get()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit f88649721268999bdff09777847080a52004f691
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f8864972.failed
+
+When IP route cache had been removed in linux-3.6, we broke assumption
+that dst entries were all freed after rcu grace period. DST_NOCACHE
+dst were supposed to be freed from dst_release(). But it appears
+we want to keep such dst around, either in UDP sockets or tunnels.
+
+In sk_dst_get() we need to make sure dst refcount is not 0
+before incrementing it, or else we might end up freeing a dst
+twice.
+
+DST_NOCACHE set on a dst does not mean this dst can not be attached
+to a socket or a tunnel.
+
+Then, before actual freeing, we need to observe a rcu grace period
+to make sure all other cpus can catch the fact the dst is no longer
+usable.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Dormando <dormando@rydia.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f88649721268999bdff09777847080a52004f691)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 26bb30d12002,54b6731dab55..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -68,50 -68,53 +68,87 @@@ static unsigned int ip_tunnel_hash(stru
+  			 IP_TNL_HASH_BITS);
+  }
+  
+++<<<<<<< HEAD
+ +/* Often modified stats are per cpu, other are shared (netdev->stats) */
+ +struct rtnl_link_stats64 *ip_tunnel_get_stats64(struct net_device *dev,
+ +						struct rtnl_link_stats64 *tot)
+++=======
++ static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
++ 			     struct dst_entry *dst)
++ {
++ 	struct dst_entry *old_dst;
++ 
++ 	dst_clone(dst);
++ 	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
++ 	dst_release(old_dst);
++ }
++ 
++ static void tunnel_dst_set(struct ip_tunnel *t, struct dst_entry *dst)
++ {
++ 	__tunnel_dst_set(this_cpu_ptr(t->dst_cache), dst);
++ }
++ 
++ static void tunnel_dst_reset(struct ip_tunnel *t)
++ {
++ 	tunnel_dst_set(t, NULL);
++ }
++ 
++ void ip_tunnel_dst_reset_all(struct ip_tunnel *t)
+++>>>>>>> f88649721268 (ipv4: fix dst race in sk_dst_get())
+  {
+  	int i;
+  
+ -	for_each_possible_cpu(i)
+ -		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL);
+ -}
+ -EXPORT_SYMBOL(ip_tunnel_dst_reset_all);
+ -
+ -static struct rtable *tunnel_rtable_get(struct ip_tunnel *t, u32 cookie)
+ -{
+ -	struct dst_entry *dst;
+ -
+ +	for_each_possible_cpu(i) {
+ +		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+ +		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+ +		unsigned int start;
+ +
+ +		do {
+ +			start = u64_stats_fetch_begin_bh(&tstats->syncp);
+ +			rx_packets = tstats->rx_packets;
+ +			tx_packets = tstats->tx_packets;
+ +			rx_bytes = tstats->rx_bytes;
+ +			tx_bytes = tstats->tx_bytes;
+ +		} while (u64_stats_fetch_retry_bh(&tstats->syncp, start));
+ +
+++<<<<<<< HEAD
+ +		tot->rx_packets += rx_packets;
+ +		tot->tx_packets += tx_packets;
+ +		tot->rx_bytes   += rx_bytes;
+ +		tot->tx_bytes   += tx_bytes;
+++=======
++ 	rcu_read_lock();
++ 	dst = rcu_dereference(this_cpu_ptr(t->dst_cache)->dst);
++ 	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++ 		dst = NULL;
++ 	if (dst) {
++ 		if (dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
++ 			tunnel_dst_reset(t);
++ 			dst_release(dst);
++ 			dst = NULL;
++ 		}
+++>>>>>>> f88649721268 (ipv4: fix dst race in sk_dst_get())
+  	}
+ -	rcu_read_unlock();
+ -	return (struct rtable *)dst;
+ +
+ +	tot->multicast = dev->stats.multicast;
+ +
+ +	tot->rx_crc_errors = dev->stats.rx_crc_errors;
+ +	tot->rx_fifo_errors = dev->stats.rx_fifo_errors;
+ +	tot->rx_length_errors = dev->stats.rx_length_errors;
+ +	tot->rx_frame_errors = dev->stats.rx_frame_errors;
+ +	tot->rx_errors = dev->stats.rx_errors;
+ +
+ +	tot->tx_fifo_errors = dev->stats.tx_fifo_errors;
+ +	tot->tx_carrier_errors = dev->stats.tx_carrier_errors;
+ +	tot->tx_dropped = dev->stats.tx_dropped;
+ +	tot->tx_aborted_errors = dev->stats.tx_aborted_errors;
+ +	tot->tx_errors = dev->stats.tx_errors;
+ +
+ +	tot->collisions  = dev->stats.collisions;
+ +
+ +	return tot;
+  }
+ +EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
+  
+  static bool ip_tunnel_key_match(const struct ip_tunnel_parm *p,
+  				__be16 flags, __be32 key)
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 64ff6c79a908..c46c6b29f2cf 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1768,8 +1768,8 @@ sk_dst_get(struct sock *sk)
+ 
+ 	rcu_read_lock();
+ 	dst = rcu_dereference(sk->sk_dst_cache);
+-	if (dst)
+-		dst_hold(dst);
++	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++		dst = NULL;
+ 	rcu_read_unlock();
+ 	return dst;
+ }
+diff --git a/net/core/dst.c b/net/core/dst.c
+index df9cc810ec8e..c0e021871df8 100644
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -267,6 +267,15 @@ again:
+ }
+ EXPORT_SYMBOL(dst_destroy);
+ 
++static void dst_destroy_rcu(struct rcu_head *head)
++{
++	struct dst_entry *dst = container_of(head, struct dst_entry, rcu_head);
++
++	dst = dst_destroy(dst);
++	if (dst)
++		__dst_free(dst);
++}
++
+ void dst_release(struct dst_entry *dst)
+ {
+ 	if (dst) {
+@@ -274,11 +283,8 @@ void dst_release(struct dst_entry *dst)
+ 
+ 		newrefcnt = atomic_dec_return(&dst->__refcnt);
+ 		WARN_ON(newrefcnt < 0);
+-		if (unlikely(dst->flags & DST_NOCACHE) && !newrefcnt) {
+-			dst = dst_destroy(dst);
+-			if (dst)
+-				__dst_free(dst);
+-		}
++		if (unlikely(dst->flags & DST_NOCACHE) && !newrefcnt)
++			call_rcu(&dst->rcu_head, dst_destroy_rcu);
+ 	}
+ }
+ EXPORT_SYMBOL(dst_release);
+* Unmerged path net/ipv4/ip_tunnel.c
