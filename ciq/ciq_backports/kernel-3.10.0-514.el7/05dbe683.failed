@@ -1,0 +1,164 @@
+Btrfs: unify subvol= and subvolid= mounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Omar Sandoval <osandov@osandov.com>
+commit 05dbe6837b60465db6a61d1f0cabe745e20aadc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/05dbe683.failed
+
+Currently, mounting a subvolume with subvolid= takes a different code
+path than mounting with subvol=. This isn't really a big deal except for
+the fact that mounts done with subvolid= or the default subvolume don't
+have a dentry that's connected to the dentry tree like in the subvol=
+case. To unify the code paths, when given subvolid= or using the default
+subvolume ID, translate it into a subvolume name by walking
+ROOT_BACKREFs in the root tree and INODE_REFs in the filesystem trees.
+
+	Reviewed-by: David Sterba <dsterba@suse.cz>
+	Signed-off-by: Omar Sandoval <osandov@osandov.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 05dbe6837b60465db6a61d1f0cabe745e20aadc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/super.c
+diff --cc fs/btrfs/super.c
+index 656008880e8a,6fa4aaf0543a..000000000000
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@@ -844,22 -978,7 +978,12 @@@ static int get_default_subvol_objectid(
+  	struct btrfs_dir_item *di;
+  	struct btrfs_path *path;
+  	struct btrfs_key location;
+++<<<<<<< HEAD
+ +	struct inode *inode;
+ +	struct dentry *dentry;
+++=======
+++>>>>>>> 05dbe6837b60 (Btrfs: unify subvol= and subvolid= mounting)
+  	u64 dir_id;
+- 	int new = 0;
+- 
+- 	/*
+- 	 * We have a specific subvol we want to mount, just setup location and
+- 	 * go look up the root.
+- 	 */
+- 	if (subvol_objectid) {
+- 		location.objectid = subvol_objectid;
+- 		location.type = BTRFS_ROOT_ITEM_KEY;
+- 		location.offset = (u64)-1;
+- 		goto find_root;
+- 	}
+  
+  	path = btrfs_alloc_path();
+  	if (!path)
+@@@ -891,48 -1009,8 +1014,53 @@@
+  
+  	btrfs_dir_item_key_to_cpu(path->nodes[0], di, &location);
+  	btrfs_free_path(path);
+++<<<<<<< HEAD
+ +
+ +find_root:
+ +	new_root = btrfs_read_fs_root_no_name(fs_info, &location);
+ +	if (IS_ERR(new_root))
+ +		return ERR_CAST(new_root);
+ +
+ +	if (!(sb->s_flags & MS_RDONLY)) {
+ +		int ret;
+ +		down_read(&fs_info->cleanup_work_sem);
+ +		ret = btrfs_orphan_cleanup(new_root);
+ +		up_read(&fs_info->cleanup_work_sem);
+ +		if (ret)
+ +			return ERR_PTR(ret);
+ +	}
+ +
+ +	dir_id = btrfs_root_dirid(&new_root->root_item);
+ +setup_root:
+ +	location.objectid = dir_id;
+ +	location.type = BTRFS_INODE_ITEM_KEY;
+ +	location.offset = 0;
+ +
+ +	inode = btrfs_iget(sb, &location, new_root, &new);
+ +	if (IS_ERR(inode))
+ +		return ERR_CAST(inode);
+ +
+ +	/*
+ +	 * If we're just mounting the root most subvol put the inode and return
+ +	 * a reference to the dentry.  We will have already gotten a reference
+ +	 * to the inode in btrfs_fill_super so we're good to go.
+ +	 */
+ +	if (!new && sb->s_root->d_inode == inode) {
+ +		iput(inode);
+ +		return dget(sb->s_root);
+ +	}
+ +
+ +	dentry = d_obtain_alias(inode);
+ +	if (!IS_ERR(dentry)) {
+ +		spin_lock(&dentry->d_lock);
+ +		dentry->d_flags &= ~DCACHE_DISCONNECTED;
+ +		spin_unlock(&dentry->d_lock);
+ +	}
+ +	return dentry;
+++=======
++ 	*objectid = location.objectid;
++ 	return 0;
+++>>>>>>> 05dbe6837b60 (Btrfs: unify subvol= and subvolid= mounting)
+  }
+  
+  static int btrfs_fill_super(struct super_block *sb,
+@@@ -1221,12 -1319,32 +1368,39 @@@ static struct dentry *mount_subvol(cons
+  	/* mount_subtree() drops our reference on the vfsmount. */
+  	mnt = NULL;
+  
+ -	if (!IS_ERR(root)) {
+ +	if (!IS_ERR(root) && !is_subvolume_inode(root->d_inode)) {
+  		struct super_block *s = root->d_sb;
+++<<<<<<< HEAD
+ +		dput(root);
+ +		root = ERR_PTR(-EINVAL);
+ +		deactivate_locked_super(s);
+ +		pr_err("BTRFS: '%s' is not a valid subvolume\n", subvol_name);
+++=======
++ 		struct inode *root_inode = d_inode(root);
++ 		u64 root_objectid = BTRFS_I(root_inode)->root->root_key.objectid;
++ 
++ 		ret = 0;
++ 		if (!is_subvolume_inode(root_inode)) {
++ 			pr_err("BTRFS: '%s' is not a valid subvolume\n",
++ 			       subvol_name);
++ 			ret = -EINVAL;
++ 		}
++ 		if (subvol_objectid && root_objectid != subvol_objectid) {
++ 			/*
++ 			 * This will also catch a race condition where a
++ 			 * subvolume which was passed by ID is renamed and
++ 			 * another subvolume is renamed over the old location.
++ 			 */
++ 			pr_err("BTRFS: subvol '%s' does not match subvolid %llu\n",
++ 			       subvol_name, subvol_objectid);
++ 			ret = -EINVAL;
++ 		}
++ 		if (ret) {
++ 			dput(root);
++ 			root = ERR_PTR(ret);
++ 			deactivate_locked_super(s);
++ 		}
+++>>>>>>> 05dbe6837b60 (Btrfs: unify subvol= and subvolid= mounting)
+  	}
+  
+  out:
+@@@ -1317,9 -1434,10 +1490,9 @@@ static struct dentry *btrfs_mount(struc
+  		return ERR_PTR(error);
+  	}
+  
+- 	if (subvol_name) {
++ 	if (subvol_name || subvol_objectid != BTRFS_FS_TREE_OBJECTID) {
+  		/* mount_subvol() will free subvol_name. */
+ -		return mount_subvol(subvol_name, subvol_objectid, flags,
+ -				    device_name, data);
+ +		return mount_subvol(subvol_name, flags, device_name, data);
+  	}
+  
+  	security_init_mnt_opts(&new_sec_opts);
+* Unmerged path fs/btrfs/super.c
