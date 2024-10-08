@@ -158,7 +158,6 @@ static int zpci_set_airq(struct zpci_dev *zdev)
 	fib->aisbo = zdev->aisb & 63;
 
 	rc = zpci_mod_fc(req, fib);
-	pr_debug("%s mpcifc returned noi: %d\n", __func__, fib->noi);
 
 	free_page((unsigned long) fib);
 	return rc;
@@ -462,7 +461,6 @@ int arch_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
 	struct msi_desc *msi;
 	int rc;
 
-	pr_debug("%s: requesting %d MSI-X interrupts...", __func__, nvec);
 	if (type != PCI_CAP_ID_MSIX && type != PCI_CAP_ID_MSI)
 		return -EINVAL;
 	msi_vecs = min(nvec, ZPCI_MSI_VEC_MAX);
@@ -522,7 +520,6 @@ out_iv:
 out_si:
 	airq_iv_free_bit(zpci_aisb_iv, aisb);
 out:
-	dev_err(&pdev->dev, "register MSI failed with: %d\n", rc);
 	return rc;
 }
 
@@ -532,14 +529,10 @@ void arch_teardown_msi_irqs(struct pci_dev *pdev)
 	struct msi_desc *msi;
 	int rc;
 
-	pr_info("%s: on pdev: %p\n", __func__, pdev);
-
 	/* Disable adapter interrupts */
 	rc = zpci_clear_airq(zdev);
-	if (rc) {
-		dev_err(&pdev->dev, "deregister MSI failed with: %d\n", rc);
+	if (rc)
 		return;
-	}
 
 	list_for_each_entry(msi, &pdev->msi_list, list)
 		zpci_teardown_msi_irq(zdev, msi);
@@ -705,8 +698,11 @@ static struct resource *zpci_alloc_bus_resource(unsigned long start, unsigned lo
 	r->name = name;
 
 	rc = request_resource(&iomem_resource, r);
-	if (rc)
-		pr_debug("request resource %pR failed\n", r);
+	if (rc) {
+		kfree(r->name);
+		kfree(r);
+		return ERR_PTR(-ENOMEM);
+	}
 	return r;
 }
 
@@ -902,7 +898,6 @@ int zpci_enable_device(struct zpci_dev *zdev)
 	rc = clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES);
 	if (rc)
 		goto out;
-	pr_info("Enabled fh: 0x%x fid: 0x%x\n", zdev->fh, zdev->fid);
 
 	rc = zpci_dma_init_device(zdev);
 	if (rc)
@@ -1046,10 +1041,6 @@ static int __init pci_base_init(void)
 	if (!test_facility(2) || !test_facility(69)
 	    || !test_facility(71) || !test_facility(72))
 		return 0;
-
-	pr_info("Probing PCI hardware: PCI:%d  SID:%d  AEN:%d\n",
-		test_facility(69), test_facility(70),
-		test_facility(71));
 
 	rc = zpci_debug_init();
 	if (rc)
