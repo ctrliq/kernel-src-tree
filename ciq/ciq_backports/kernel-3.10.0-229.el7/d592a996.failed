@@ -1,0 +1,193 @@
+raid5: add an option to avoid copy data from bio to stripe cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shaohua Li <shli@kernel.org>
+commit d592a9969141e67a3874c808999a4db4bf82ed83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d592a996.failed
+
+The stripe cache has two goals:
+1. cache data, so next time if data can be found in stripe cache, disk access
+can be avoided.
+2. stable data. data is copied from bio to stripe cache and calculated parity.
+data written to disk is from stripe cache, so if upper layer changes bio data,
+data written to disk isn't impacted.
+
+In my environment, I can guarantee 2 will not happen. And BDI_CAP_STABLE_WRITES
+can guarantee 2 too. For 1, it's not common too. block plug mechanism will
+dispatch a bunch of sequentail small requests together. And since I'm using
+SSD, I'm using small chunk size. It's rare case stripe cache is really useful.
+
+So I'd like to avoid the copy from bio to stripe cache and it's very helpful
+for performance. In my 1M randwrite tests, avoid the copy can increase the
+performance more than 30%.
+
+Of course, this shouldn't be enabled by default. It's reported enabling
+BDI_CAP_STABLE_WRITES can harm some workloads before, so I added an option to
+control it.
+
+Neilb:
+  changed BUG_ON to WARN_ON
+  Removed some assignments from raid5_build_block which are now not needed.
+
+	Signed-off-by: Shaohua Li <shli@fusionio.com>
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit d592a9969141e67a3874c808999a4db4bf82ed83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index a0cc3d4bd175,d69fd9888c2c..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -908,11 -907,14 +913,14 @@@ static void ops_run_io(struct stripe_he
+  				rbi->bi_rw, i);
+  			atomic_inc(&sh->count);
+  			if (use_new_offset(conf, sh))
+ -				rbi->bi_iter.bi_sector = (sh->sector
+ +				rbi->bi_sector = (sh->sector
+  						  + rrdev->new_data_offset);
+  			else
+ -				rbi->bi_iter.bi_sector = (sh->sector
+ +				rbi->bi_sector = (sh->sector
+  						  + rrdev->data_offset);
++ 			if (test_bit(R5_SkipCopy, &sh->dev[i].flags))
++ 				WARN_ON(test_bit(R5_UPTODATE, &sh->dev[i].flags));
++ 			sh->dev[i].rvec.bv_page = sh->dev[i].page;
+  			rbi->bi_vcnt = 1;
+  			rbi->bi_io_vec[0].bv_len = STRIPE_SIZE;
+  			rbi->bi_io_vec[0].bv_offset = 0;
+@@@ -941,12 -943,13 +949,13 @@@
+  }
+  
+  static struct dma_async_tx_descriptor *
+- async_copy_data(int frombio, struct bio *bio, struct page *page,
+- 	sector_t sector, struct dma_async_tx_descriptor *tx)
++ async_copy_data(int frombio, struct bio *bio, struct page **page,
++ 	sector_t sector, struct dma_async_tx_descriptor *tx,
++ 	struct stripe_head *sh)
+  {
+ -	struct bio_vec bvl;
+ -	struct bvec_iter iter;
+ +	struct bio_vec *bvl;
+  	struct page *bio_page;
+ +	int i;
+  	int page_offset;
+  	struct async_submit_ctl submit;
+  	enum async_tx_flags flags = 0;
+@@@ -977,13 -980,18 +986,25 @@@
+  			clen = len;
+  
+  		if (clen > 0) {
+++<<<<<<< HEAD
+ +			b_offset += bvl->bv_offset;
+ +			bio_page = bvl->bv_page;
+ +			if (frombio)
+ +				tx = async_memcpy(page, bio_page, page_offset,
+++=======
++ 			b_offset += bvl.bv_offset;
++ 			bio_page = bvl.bv_page;
++ 			if (frombio) {
++ 				if (sh->raid_conf->skip_copy &&
++ 				    b_offset == 0 && page_offset == 0 &&
++ 				    clen == STRIPE_SIZE)
++ 					*page = bio_page;
++ 				else
++ 					tx = async_memcpy(*page, bio_page, page_offset,
+++>>>>>>> d592a9969141 (raid5: add an option to avoid copy data from bio to stripe cache)
+  						  b_offset, clen, &submit);
+- 			else
+- 				tx = async_memcpy(bio_page, page, b_offset,
++ 			} else
++ 				tx = async_memcpy(bio_page, *page, b_offset,
+  						  page_offset, clen, &submit);
+  		}
+  		/* chain the operations */
+@@@ -1057,10 -1065,10 +1078,10 @@@ static void ops_run_biofill(struct stri
+  			dev->read = rbi = dev->toread;
+  			dev->toread = NULL;
+  			spin_unlock_irq(&sh->stripe_lock);
+ -			while (rbi && rbi->bi_iter.bi_sector <
+ +			while (rbi && rbi->bi_sector <
+  				dev->sector + STRIPE_SECTORS) {
+- 				tx = async_copy_data(0, rbi, dev->page,
+- 					dev->sector, tx);
++ 				tx = async_copy_data(0, rbi, &dev->page,
++ 					dev->sector, tx, sh);
+  				rbi = r5_next_bio(rbi, dev->sector);
+  			}
+  		}
+@@@ -1398,8 -1406,9 +1419,9 @@@ ops_run_biodrain(struct stripe_head *sh
+  			BUG_ON(dev->written);
+  			wbi = dev->written = chosen;
+  			spin_unlock_irq(&sh->stripe_lock);
++ 			WARN_ON(dev->page != dev->orig_page);
+  
+ -			while (wbi && wbi->bi_iter.bi_sector <
+ +			while (wbi && wbi->bi_sector <
+  				dev->sector + STRIPE_SECTORS) {
+  				if (wbi->bi_rw & REQ_FUA)
+  					set_bit(R5_WantFUA, &dev->flags);
+@@@ -2764,8 -2778,13 +2791,13 @@@ handle_failed_stripe(struct r5conf *con
+  		/* and fail all 'written' */
+  		bi = sh->dev[i].written;
+  		sh->dev[i].written = NULL;
++ 		if (test_and_clear_bit(R5_SkipCopy, &sh->dev[i].flags)) {
++ 			WARN_ON(test_bit(R5_UPTODATE, &sh->dev[i].flags));
++ 			sh->dev[i].page = sh->dev[i].orig_page;
++ 		}
++ 
+  		if (bi) bitmap_end = 1;
+ -		while (bi && bi->bi_iter.bi_sector <
+ +		while (bi && bi->bi_sector <
+  		       sh->dev[i].sector + STRIPE_SECTORS) {
+  			struct bio *bi2 = r5_next_bio(bi, sh->dev[i].sector);
+  			clear_bit(BIO_UPTODATE, &bi->bi_flags);
+@@@ -3011,9 -3034,13 +3044,13 @@@ static void handle_stripe_clean_event(s
+  				pr_debug("Return write for disc %d\n", i);
+  				if (test_and_clear_bit(R5_Discard, &dev->flags))
+  					clear_bit(R5_UPTODATE, &dev->flags);
++ 				if (test_and_clear_bit(R5_SkipCopy, &dev->flags)) {
++ 					WARN_ON(test_bit(R5_UPTODATE, &dev->flags));
++ 					dev->page = dev->orig_page;
++ 				}
+  				wbi = dev->written;
+  				dev->written = NULL;
+ -				while (wbi && wbi->bi_iter.bi_sector <
+ +				while (wbi && wbi->bi_sector <
+  					dev->sector + STRIPE_SECTORS) {
+  					wbi2 = r5_next_bio(wbi, dev->sector);
+  					if (!raid5_dec_bi_active_stripes(wbi)) {
+* Unmerged path drivers/md/raid5.c
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 37a5959439f1..8448b16d0b87 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -232,7 +232,7 @@ struct stripe_head {
+ 		 */
+ 		struct bio	req, rreq;
+ 		struct bio_vec	vec, rvec;
+-		struct page	*page;
++		struct page	*page, *orig_page;
+ 		struct bio	*toread, *read, *towrite, *written;
+ 		sector_t	sector;			/* sector of this page */
+ 		unsigned long	flags;
+@@ -299,6 +299,7 @@ enum r5dev_flags {
+ 			 * data in, and now is a good time to write it out.
+ 			 */
+ 	R5_Discard,	/* Discard the stripe */
++	R5_SkipCopy,	/* Don't copy data from bio to stripe cache */
+ };
+ 
+ /*
+@@ -436,6 +437,7 @@ struct r5conf {
+ 	atomic_t		pending_full_writes; /* full write backlog */
+ 	int			bypass_count; /* bypassed prereads */
+ 	int			bypass_threshold; /* preread nice */
++	int			skip_copy; /* Don't copy data from bio to stripe cache */
+ 	struct list_head	*last_hold; /* detect hold_list promotions */
+ 
+ 	atomic_t		reshape_stripes; /* stripes with pending writes for reshape */
