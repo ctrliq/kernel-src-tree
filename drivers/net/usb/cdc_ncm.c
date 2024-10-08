@@ -99,8 +99,8 @@ static u8 cdc_ncm_setup(struct usbnet *dev)
 			      0, iface_no, &ctx->ncm_parm,
 			      sizeof(ctx->ncm_parm));
 	if (err < 0) {
-		dev_dbg(&dev->intf->dev, "failed GET_NTB_PARAMETERS\n");
-		return 1;
+		dev_err(&dev->intf->dev, "failed GET_NTB_PARAMETERS\n");
+		return err; /* GET_NTB_PARAMETERS is required */
 	}
 
 	/* read correct set of parameters according to device mode */
