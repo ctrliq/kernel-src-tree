@@ -1,7 +1,7 @@
 /*******************************************************************************
  *
  * Intel Ethernet Controller XL710 Family Linux Driver
- * Copyright(c) 2013 - 2015 Intel Corporation.
+ * Copyright(c) 2013 - 2016 Intel Corporation.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -2697,10 +2697,15 @@ static int i40e_set_priv_flags(struct net_device *dev, u32 flags)
 		pf->auto_disable_flags |= I40E_FLAG_FD_ATR_ENABLED;
 	}
 
-	if (flags & I40E_PRIV_FLAGS_VEB_STATS)
+	if ((flags & I40E_PRIV_FLAGS_VEB_STATS) &&
+	    !(pf->flags & I40E_FLAG_VEB_STATS_ENABLED)) {
 		pf->flags |= I40E_FLAG_VEB_STATS_ENABLED;
-	else
+		reset_required = true;
+	} else if (!(flags & I40E_PRIV_FLAGS_VEB_STATS) &&
+		   (pf->flags & I40E_FLAG_VEB_STATS_ENABLED)) {
 		pf->flags &= ~I40E_FLAG_VEB_STATS_ENABLED;
+		reset_required = true;
+	}
 
 	/* if needed, issue reset to cause things to take effect */
 	if (reset_required)
