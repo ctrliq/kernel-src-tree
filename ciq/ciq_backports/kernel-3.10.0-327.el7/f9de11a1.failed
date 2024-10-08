@@ -1,0 +1,102 @@
+bonding: add ip checks when store ip target
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Wang Weidong <wangweidong1@huawei.com>
+commit f9de11a165943a55e0fbda714caf60eaeb276a42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/f9de11a1.failed
+
+I met a Bug when I add ip target with the wrong ip address:
+
+echo +500.500.500.500 > /sys/class/net/bond0/bonding/arp_ip_target
+
+the wrong ip address will transfor to 245.245.245.244 and add
+to the ip target success, it is uncorrect, so I add checks to avoid
+adding wrong address.
+
+The in4_pton() will set wrong ip address to 0.0.0.0, it will return by
+the next check and will not add to ip target.
+
+v2
+According Veaceslav's opinion, simplify the code.
+
+v3
+According Veaceslav's opinion, add broadcast check and make a micro
+definition to package it.
+
+v4
+Solve the problem of the format which David point out.
+
+	Suggested-by: Veaceslav Falico <vfalico@redhat.com>
+	Suggested-by: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f9de11a165943a55e0fbda714caf60eaeb276a42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bonding.h
+index 743d73f75728,ca31286aa028..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -58,6 -58,14 +58,17 @@@
+  #define TX_QUEUE_OVERRIDE(mode)				\
+  			(((mode) == BOND_MODE_ACTIVEBACKUP) ||	\
+  			 ((mode) == BOND_MODE_ROUNDROBIN))
+++<<<<<<< HEAD
+++=======
++ 
++ #define BOND_MODE_IS_LB(mode)			\
++ 		(((mode) == BOND_MODE_TLB) ||	\
++ 		 ((mode) == BOND_MODE_ALB))
++ 
++ #define IS_IP_TARGET_UNUSABLE_ADDRESS(a)	\
++ 	((htonl(INADDR_BROADCAST) == a) ||	\
++ 	 ipv4_is_zeronet(a))
+++>>>>>>> f9de11a16594 (bonding: add ip checks when store ip target)
+  /*
+   * Less bad way to call ioctl from within the kernel; this needs to be
+   * done some other way to get the call out of interrupt context.
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index 739d4dbe8629..b2ddd43cae7a 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -662,15 +662,14 @@ static ssize_t bonding_store_arp_targets(struct device *d,
+ 	int ind, i, j, ret = -EINVAL;
+ 
+ 	targets = bond->params.arp_targets;
+-	newtarget = in_aton(buf + 1);
++	if (!in4_pton(buf + 1, -1, (u8 *)&newtarget, -1, NULL) ||
++	    IS_IP_TARGET_UNUSABLE_ADDRESS(newtarget)) {
++		pr_err("%s: invalid ARP target %pI4 specified for addition\n",
++		       bond->dev->name, &newtarget);
++		goto out;
++	}
+ 	/* look for adds */
+ 	if (buf[0] == '+') {
+-		if ((newtarget == 0) || (newtarget == htonl(INADDR_BROADCAST))) {
+-			pr_err("%s: invalid ARP target %pI4 specified for addition\n",
+-			       bond->dev->name, &newtarget);
+-			goto out;
+-		}
+-
+ 		if (bond_get_targets_ip(targets, newtarget) != -1) { /* dup */
+ 			pr_err("%s: ARP target %pI4 is already present\n",
+ 			       bond->dev->name, &newtarget);
+@@ -693,12 +692,6 @@ static ssize_t bonding_store_arp_targets(struct device *d,
+ 		targets[ind] = newtarget;
+ 		write_unlock_bh(&bond->lock);
+ 	} else if (buf[0] == '-')	{
+-		if ((newtarget == 0) || (newtarget == htonl(INADDR_BROADCAST))) {
+-			pr_err("%s: invalid ARP target %pI4 specified for removal\n",
+-			       bond->dev->name, &newtarget);
+-			goto out;
+-		}
+-
+ 		ind = bond_get_targets_ip(targets, newtarget);
+ 		if (ind == -1) {
+ 			pr_err("%s: unable to remove nonexistent ARP target %pI4.\n",
+* Unmerged path drivers/net/bonding/bonding.h
