@@ -1618,8 +1618,10 @@ void pci_pme_active(struct pci_dev *dev, bool enable)
 		if (enable) {
 			pme_dev = kmalloc(sizeof(struct pci_pme_device),
 					  GFP_KERNEL);
-			if (!pme_dev)
-				goto out;
+			if (!pme_dev) {
+				dev_warn(&dev->dev, "can't enable PME#\n");
+				return;
+			}
 			pme_dev->dev = dev;
 			mutex_lock(&pci_pme_list_mutex);
 			list_add(&pme_dev->list, &pci_pme_list);
@@ -1640,7 +1642,6 @@ void pci_pme_active(struct pci_dev *dev, bool enable)
 		}
 	}
 
-out:
 	dev_dbg(&dev->dev, "PME# %s\n", enable ? "enabled" : "disabled");
 }
 
