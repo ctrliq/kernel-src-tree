@@ -1,0 +1,1954 @@
+s390/hmcdrv: HMC drive CD/DVD access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] hmcdrv: HMC drive CD/DVD access (Hendrik Brueckner) [1182294]
+Rebuild_FUZZ: 92.54%
+commit-author Ralf Hoppe <rhoppe@de.ibm.com>
+commit 8f933b1043e1e51f4776fc1ffe86752c7785fd4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/8f933b10.failed
+
+This device driver allows accessing a HMC drive CD/DVD-ROM.
+It can be used in a LPAR and z/VM environment.
+
+	Reviewed-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Ralf Hoppe <rhoppe@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 8f933b1043e1e51f4776fc1ffe86752c7785fd4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/char/Makefile
+diff --cc drivers/s390/char/Makefile
+index ead8e89a1fbf,6fa9364d1c07..000000000000
+--- a/drivers/s390/char/Makefile
++++ b/drivers/s390/char/Makefile
+@@@ -32,4 -32,7 +32,11 @@@ obj-$(CONFIG_MONWRITER) += monwriter.
+  obj-$(CONFIG_S390_VMUR) += vmur.o
+  
+  zcore_mod-objs := sclp_sdias.o zcore.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_ZFCPDUMP) += zcore_mod.o
+++=======
++ obj-$(CONFIG_CRASH_DUMP) += zcore_mod.o
++ 
++ hmcdrv-objs := hmcdrv_mod.o hmcdrv_dev.o hmcdrv_ftp.o hmcdrv_cache.o diag_ftp.o sclp_ftp.o
++ obj-$(CONFIG_HMC_DRV) += hmcdrv.o
+++>>>>>>> 8f933b1043e1 (s390/hmcdrv: HMC drive CD/DVD access)
+diff --git a/arch/s390/include/asm/irq.h b/arch/s390/include/asm/irq.h
+index 15c258edc318..ba5208ff3fb9 100644
+--- a/arch/s390/include/asm/irq.h
++++ b/arch/s390/include/asm/irq.h
+@@ -26,6 +26,7 @@ enum interruption_class {
+ 	IRQEXT_CMS,
+ 	IRQEXT_CMC,
+ 	IRQEXT_CMR,
++	IRQEXT_FTP,
+ 	IRQIO_CIO,
+ 	IRQIO_QAI,
+ 	IRQIO_DAS,
+diff --git a/arch/s390/kernel/irq.c b/arch/s390/kernel/irq.c
+index e63edadc6fd6..a8516ba93458 100644
+--- a/arch/s390/kernel/irq.c
++++ b/arch/s390/kernel/irq.c
+@@ -67,6 +67,7 @@ static const struct irq_class irqclass_sub_desc[NR_ARCH_IRQS] = {
+ 	{.irq = IRQEXT_CMS, .name = "CMS", .desc = "[EXT] CPU-Measurement: Sampling"},
+ 	{.irq = IRQEXT_CMC, .name = "CMC", .desc = "[EXT] CPU-Measurement: Counter"},
+ 	{.irq = IRQEXT_CMR, .name = "CMR", .desc = "[EXT] CPU-Measurement: RI"},
++	{.irq = IRQEXT_FTP, .name = "FTP", .desc = "[EXT] HMC FTP Service"},
+ 	{.irq = IRQIO_CIO,  .name = "CIO", .desc = "[I/O] Common I/O Layer Interrupt"},
+ 	{.irq = IRQIO_QAI,  .name = "QAI", .desc = "[I/O] QDIO Adapter Interrupt"},
+ 	{.irq = IRQIO_DAS,  .name = "DAS", .desc = "[I/O] DASD"},
+diff --git a/drivers/s390/char/Kconfig b/drivers/s390/char/Kconfig
+index 71bf959732fe..dc24ecfac2d1 100644
+--- a/drivers/s390/char/Kconfig
++++ b/drivers/s390/char/Kconfig
+@@ -102,6 +102,19 @@ config SCLP_ASYNC
+ 	  want for inform other people about your kernel panics,
+ 	  need this feature and intend to run your kernel in LPAR.
+ 
++config HMC_DRV
++	def_tristate m
++	prompt "Support for file transfers from HMC drive CD/DVD-ROM"
++	depends on 64BIT
++	select CRC16
++	help
++	  This option enables support for file transfers from a Hardware
++	  Management Console (HMC) drive CD/DVD-ROM. It is available as a
++	  module, called 'hmcdrv', and also as kernel built-in. There is one
++	  optional parameter for this module: cachesize=N, which modifies the
++	  transfer cache size from it's default value 0.5MB to N bytes. If N
++	  is zero, then no caching is performed.
++
+ config S390_TAPE
+ 	def_tristate m
+ 	prompt "S/390 tape device support"
+* Unmerged path drivers/s390/char/Makefile
+diff --git a/drivers/s390/char/diag_ftp.c b/drivers/s390/char/diag_ftp.c
+new file mode 100644
+index 000000000000..93889632fdf9
+--- /dev/null
++++ b/drivers/s390/char/diag_ftp.c
+@@ -0,0 +1,237 @@
++/*
++ *    DIAGNOSE X'2C4' instruction based HMC FTP services, useable on z/VM
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ *
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/irq.h>
++#include <linux/wait.h>
++#include <linux/string.h>
++#include <asm/ctl_reg.h>
++
++#include "hmcdrv_ftp.h"
++#include "diag_ftp.h"
++
++/* DIAGNOSE X'2C4' return codes in Ry */
++#define DIAG_FTP_RET_OK	0 /* HMC FTP started successfully */
++#define DIAG_FTP_RET_EBUSY	4 /* HMC FTP service currently busy */
++#define DIAG_FTP_RET_EIO	8 /* HMC FTP service I/O error */
++/* and an artificial extension */
++#define DIAG_FTP_RET_EPERM	2 /* HMC FTP service privilege error */
++
++/* FTP service status codes (after INTR at guest real location 133) */
++#define DIAG_FTP_STAT_OK	0U /* request completed successfully */
++#define DIAG_FTP_STAT_PGCC	4U /* program check condition */
++#define DIAG_FTP_STAT_PGIOE	8U /* paging I/O error */
++#define DIAG_FTP_STAT_TIMEOUT	12U /* timeout */
++#define DIAG_FTP_STAT_EBASE	16U /* base of error codes from SCLP */
++#define DIAG_FTP_STAT_LDFAIL	(DIAG_FTP_STAT_EBASE + 1U) /* failed */
++#define DIAG_FTP_STAT_LDNPERM	(DIAG_FTP_STAT_EBASE + 2U) /* not allowed */
++#define DIAG_FTP_STAT_LDRUNS	(DIAG_FTP_STAT_EBASE + 3U) /* runs */
++#define DIAG_FTP_STAT_LDNRUNS	(DIAG_FTP_STAT_EBASE + 4U) /* not runs */
++
++/**
++ * struct diag_ftp_ldfpl - load file FTP parameter list (LDFPL)
++ * @bufaddr: real buffer address (at 4k boundary)
++ * @buflen: length of buffer
++ * @offset: dir/file offset
++ * @intparm: interruption parameter (unused)
++ * @transferred: bytes transferred
++ * @fsize: file size, filled on GET
++ * @failaddr: failing address
++ * @spare: padding
++ * @fident: file name - ASCII
++ */
++struct diag_ftp_ldfpl {
++	u64 bufaddr;
++	u64 buflen;
++	u64 offset;
++	u64 intparm;
++	u64 transferred;
++	u64 fsize;
++	u64 failaddr;
++	u64 spare;
++	u8 fident[HMCDRV_FTP_FIDENT_MAX];
++} __packed;
++
++static DECLARE_COMPLETION(diag_ftp_rx_complete);
++static int diag_ftp_subcode;
++
++/**
++ * diag_ftp_handler() - FTP services IRQ handler
++ * @extirq: external interrupt (sub-) code
++ * @param32: 32-bit interruption parameter from &struct diag_ftp_ldfpl
++ * @param64: unused (for 64-bit interrupt parameters)
++ */
++static void diag_ftp_handler(struct ext_code extirq,
++			     unsigned int param32,
++			     unsigned long param64)
++{
++	if ((extirq.subcode >> 8) != 8)
++		return; /* not a FTP services sub-code */
++
++	inc_irq_stat(IRQEXT_FTP);
++	diag_ftp_subcode = extirq.subcode & 0xffU;
++	complete(&diag_ftp_rx_complete);
++}
++
++/**
++ * diag_ftp_2c4() - DIAGNOSE X'2C4' service call
++ * @fpl: pointer to prepared LDFPL
++ * @cmd: FTP command to be executed
++ *
++ * Performs a DIAGNOSE X'2C4' call with (input/output) FTP parameter list
++ * @fpl and FTP function code @cmd. In case of an error the function does
++ * nothing and returns an (negative) error code.
++ *
++ * Notes:
++ * 1. This function only initiates a transfer, so the caller must wait
++ *    for completion (asynchronous execution).
++ * 2. The FTP parameter list @fpl must be aligned to a double-word boundary.
++ * 3. fpl->bufaddr must be a real address, 4k aligned
++ */
++static int diag_ftp_2c4(struct diag_ftp_ldfpl *fpl,
++			enum hmcdrv_ftp_cmdid cmd)
++{
++	int rc;
++
++	asm volatile(
++		"	diag	%[addr],%[cmd],0x2c4\n"
++		"0:	j	2f\n"
++		"1:	la	%[rc],%[err]\n"
++		"2:\n"
++		EX_TABLE(0b, 1b)
++		: [rc] "=d" (rc), "+m" (*fpl)
++		: [cmd] "0" (cmd), [addr] "d" (virt_to_phys(fpl)),
++		  [err] "i" (DIAG_FTP_RET_EPERM)
++		: "cc");
++
++	switch (rc) {
++	case DIAG_FTP_RET_OK:
++		return 0;
++	case DIAG_FTP_RET_EBUSY:
++		return -EBUSY;
++	case DIAG_FTP_RET_EPERM:
++		return -EPERM;
++	case DIAG_FTP_RET_EIO:
++	default:
++		return -EIO;
++	}
++}
++
++/**
++ * diag_ftp_cmd() - executes a DIAG X'2C4' FTP command, targeting a HMC
++ * @ftp: pointer to FTP command specification
++ * @fsize: return of file size (or NULL if undesirable)
++ *
++ * Attention: Notice that this function is not reentrant - so the caller
++ * must ensure locking.
++ *
++ * Return: number of bytes read/written or a (negative) error code
++ */
++ssize_t diag_ftp_cmd(const struct hmcdrv_ftp_cmdspec *ftp, size_t *fsize)
++{
++	struct diag_ftp_ldfpl *ldfpl;
++	ssize_t len;
++#ifdef DEBUG
++	unsigned long start_jiffies;
++
++	pr_debug("starting DIAG X'2C4' on '%s', requesting %zd bytes\n",
++		 ftp->fname, ftp->len);
++	start_jiffies = jiffies;
++#endif
++	init_completion(&diag_ftp_rx_complete);
++
++	ldfpl = (void *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
++	if (!ldfpl) {
++		len = -ENOMEM;
++		goto out;
++	}
++
++	len = strlcpy(ldfpl->fident, ftp->fname, sizeof(ldfpl->fident));
++	if (len >= HMCDRV_FTP_FIDENT_MAX) {
++		len = -EINVAL;
++		goto out_free;
++	}
++
++	ldfpl->transferred = 0;
++	ldfpl->fsize = 0;
++	ldfpl->offset = ftp->ofs;
++	ldfpl->buflen = ftp->len;
++	ldfpl->bufaddr = virt_to_phys(ftp->buf);
++
++	len = diag_ftp_2c4(ldfpl, ftp->id);
++	if (len)
++		goto out_free;
++
++	/*
++	 * There is no way to cancel the running diag X'2C4', the code
++	 * needs to wait unconditionally until the transfer is complete.
++	 */
++	wait_for_completion(&diag_ftp_rx_complete);
++
++#ifdef DEBUG
++	pr_debug("completed DIAG X'2C4' after %lu ms\n",
++		 (jiffies - start_jiffies) * 1000 / HZ);
++	pr_debug("status of DIAG X'2C4' is %u, with %lld/%lld bytes\n",
++		 diag_ftp_subcode, ldfpl->transferred, ldfpl->fsize);
++#endif
++
++	switch (diag_ftp_subcode) {
++	case DIAG_FTP_STAT_OK: /* success */
++		len = ldfpl->transferred;
++		if (fsize)
++			*fsize = ldfpl->fsize;
++		break;
++	case DIAG_FTP_STAT_LDNPERM:
++		len = -EPERM;
++		break;
++	case DIAG_FTP_STAT_LDRUNS:
++		len = -EBUSY;
++		break;
++	case DIAG_FTP_STAT_LDFAIL:
++		len = -ENOENT; /* no such file or media */
++		break;
++	default:
++		len = -EIO;
++		break;
++	}
++
++out_free:
++	free_page((unsigned long) ldfpl);
++out:
++	return len;
++}
++
++/**
++ * diag_ftp_startup() - startup of FTP services, when running on z/VM
++ *
++ * Return: 0 on success, else an (negative) error code
++ */
++int diag_ftp_startup(void)
++{
++	int rc;
++
++	rc = register_external_irq(EXT_IRQ_CP_SERVICE, diag_ftp_handler);
++	if (rc)
++		return rc;
++
++	ctl_set_bit(0, 63 - 22);
++	return 0;
++}
++
++/**
++ * diag_ftp_shutdown() - shutdown of FTP services, when running on z/VM
++ */
++void diag_ftp_shutdown(void)
++{
++	ctl_clear_bit(0, 63 - 22);
++	unregister_external_irq(EXT_IRQ_CP_SERVICE, diag_ftp_handler);
++}
+diff --git a/drivers/s390/char/diag_ftp.h b/drivers/s390/char/diag_ftp.h
+new file mode 100644
+index 000000000000..3abd2614053a
+--- /dev/null
++++ b/drivers/s390/char/diag_ftp.h
+@@ -0,0 +1,21 @@
++/*
++ *    DIAGNOSE X'2C4' instruction based SE/HMC FTP Services, useable on z/VM
++ *
++ *    Notice that all functions exported here are not reentrant.
++ *    So usage should be exclusive, ensured by the caller (e.g. using a
++ *    mutex).
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef __DIAG_FTP_H__
++#define __DIAG_FTP_H__
++
++#include "hmcdrv_ftp.h"
++
++int diag_ftp_startup(void);
++void diag_ftp_shutdown(void);
++ssize_t diag_ftp_cmd(const struct hmcdrv_ftp_cmdspec *ftp, size_t *fsize);
++
++#endif	 /* __DIAG_FTP_H__ */
+diff --git a/drivers/s390/char/hmcdrv_cache.c b/drivers/s390/char/hmcdrv_cache.c
+new file mode 100644
+index 000000000000..4cda5ada143a
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_cache.c
+@@ -0,0 +1,252 @@
++/*
++ *    SE/HMC Drive (Read) Cache Functions
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ *
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/jiffies.h>
++
++#include "hmcdrv_ftp.h"
++#include "hmcdrv_cache.h"
++
++#define HMCDRV_CACHE_TIMEOUT		30 /* aging timeout in seconds */
++
++/**
++ * struct hmcdrv_cache_entry - file cache (only used on read/dir)
++ * @id: FTP command ID
++ * @content: kernel-space buffer, 4k aligned
++ * @len: size of @content cache (0 if caching disabled)
++ * @ofs: start of content within file (-1 if no cached content)
++ * @fname: file name
++ * @fsize: file size
++ * @timeout: cache timeout in jiffies
++ *
++ * Notice that the first three members (id, fname, fsize) are cached on all
++ * read/dir requests. But content is cached only under some preconditions.
++ * Uncached content is signalled by a negative value of @ofs.
++ */
++struct hmcdrv_cache_entry {
++	enum hmcdrv_ftp_cmdid id;
++	char fname[HMCDRV_FTP_FIDENT_MAX];
++	size_t fsize;
++	loff_t ofs;
++	unsigned long timeout;
++	void *content;
++	size_t len;
++};
++
++static int hmcdrv_cache_order; /* cache allocated page order */
++
++static struct hmcdrv_cache_entry hmcdrv_cache_file = {
++	.fsize = SIZE_MAX,
++	.ofs = -1,
++	.len = 0,
++	.fname = {'\0'}
++};
++
++/**
++ * hmcdrv_cache_get() - looks for file data/content in read cache
++ * @ftp: pointer to FTP command specification
++ *
++ * Return: number of bytes read from cache or a negative number if nothing
++ * in content cache (for the file/cmd specified in @ftp)
++ */
++static ssize_t hmcdrv_cache_get(const struct hmcdrv_ftp_cmdspec *ftp)
++{
++	loff_t pos; /* position in cache (signed) */
++	ssize_t len;
++
++	if ((ftp->id != hmcdrv_cache_file.id) ||
++	    strcmp(hmcdrv_cache_file.fname, ftp->fname))
++		return -1;
++
++	if (ftp->ofs >= hmcdrv_cache_file.fsize) /* EOF ? */
++		return 0;
++
++	if ((hmcdrv_cache_file.ofs < 0) || /* has content? */
++	    time_after(jiffies, hmcdrv_cache_file.timeout))
++		return -1;
++
++	/* there seems to be cached content - calculate the maximum number
++	 * of bytes that can be returned (regarding file size and offset)
++	 */
++	len = hmcdrv_cache_file.fsize - ftp->ofs;
++
++	if (len > ftp->len)
++		len = ftp->len;
++
++	/* check if the requested chunk falls into our cache (which starts
++	 * at offset 'hmcdrv_cache_file.ofs' in the file of interest)
++	 */
++	pos = ftp->ofs - hmcdrv_cache_file.ofs;
++
++	if ((pos >= 0) &&
++	    ((pos + len) <= hmcdrv_cache_file.len)) {
++
++		memcpy(ftp->buf,
++		       hmcdrv_cache_file.content + pos,
++		       len);
++		pr_debug("using cached content of '%s', returning %zd/%zd bytes\n",
++			 hmcdrv_cache_file.fname, len,
++			 hmcdrv_cache_file.fsize);
++
++		return len;
++	}
++
++	return -1;
++}
++
++/**
++ * hmcdrv_cache_do() - do a HMC drive CD/DVD transfer with cache update
++ * @ftp: pointer to FTP command specification
++ * @func: FTP transfer function to be used
++ *
++ * Return: number of bytes read/written or a (negative) error code
++ */
++static ssize_t hmcdrv_cache_do(const struct hmcdrv_ftp_cmdspec *ftp,
++			       hmcdrv_cache_ftpfunc func)
++{
++	ssize_t len;
++
++	/* only cache content if the read/dir cache really exists
++	 * (hmcdrv_cache_file.len > 0), is large enough to handle the
++	 * request (hmcdrv_cache_file.len >= ftp->len) and there is a need
++	 * to do so (ftp->len > 0)
++	 */
++	if ((ftp->len > 0) && (hmcdrv_cache_file.len >= ftp->len)) {
++
++		/* because the cache is not located at ftp->buf, we have to
++		 * assemble a new HMC drive FTP cmd specification (pointing
++		 * to our cache, and using the increased size)
++		 */
++		struct hmcdrv_ftp_cmdspec cftp = *ftp; /* make a copy */
++		cftp.buf = hmcdrv_cache_file.content;  /* and update */
++		cftp.len = hmcdrv_cache_file.len;      /* buffer data */
++
++		len = func(&cftp, &hmcdrv_cache_file.fsize); /* now do */
++
++		if (len > 0) {
++			pr_debug("caching %zd bytes content for '%s'\n",
++				 len, ftp->fname);
++
++			if (len > ftp->len)
++				len = ftp->len;
++
++			hmcdrv_cache_file.ofs = ftp->ofs;
++			hmcdrv_cache_file.timeout = jiffies +
++				HMCDRV_CACHE_TIMEOUT * HZ;
++			memcpy(ftp->buf, hmcdrv_cache_file.content, len);
++		}
++	} else {
++		len = func(ftp, &hmcdrv_cache_file.fsize);
++		hmcdrv_cache_file.ofs = -1; /* invalidate content */
++	}
++
++	if (len > 0) {
++		/* cache some file info (FTP command, file name and file
++		 * size) unconditionally
++		 */
++		strlcpy(hmcdrv_cache_file.fname, ftp->fname,
++			HMCDRV_FTP_FIDENT_MAX);
++		hmcdrv_cache_file.id = ftp->id;
++		pr_debug("caching cmd %d, file size %zu for '%s'\n",
++			 ftp->id, hmcdrv_cache_file.fsize, ftp->fname);
++	}
++
++	return len;
++}
++
++/**
++ * hmcdrv_cache_cmd() - perform a cached HMC drive CD/DVD transfer
++ * @ftp: pointer to FTP command specification
++ * @func: FTP transfer function to be used
++ *
++ * Attention: Notice that this function is not reentrant - so the caller
++ * must ensure exclusive execution.
++ *
++ * Return: number of bytes read/written or a (negative) error code
++ */
++ssize_t hmcdrv_cache_cmd(const struct hmcdrv_ftp_cmdspec *ftp,
++			 hmcdrv_cache_ftpfunc func)
++{
++	ssize_t len;
++
++	if ((ftp->id == HMCDRV_FTP_DIR) || /* read cache */
++	    (ftp->id == HMCDRV_FTP_NLIST) ||
++	    (ftp->id == HMCDRV_FTP_GET)) {
++
++		len = hmcdrv_cache_get(ftp);
++
++		if (len >= 0) /* got it from cache ? */
++			return len; /* yes */
++
++		len = hmcdrv_cache_do(ftp, func);
++
++		if (len >= 0)
++			return len;
++
++	} else {
++		len = func(ftp, NULL); /* simply do original command */
++	}
++
++	/* invalidate the (read) cache in case there was a write operation
++	 * or an error on read/dir
++	 */
++	hmcdrv_cache_file.id = HMCDRV_FTP_NOOP;
++	hmcdrv_cache_file.fsize = LLONG_MAX;
++	hmcdrv_cache_file.ofs = -1;
++
++	return len;
++}
++
++/**
++ * hmcdrv_cache_startup() - startup of HMC drive cache
++ * @cachesize: cache size
++ *
++ * Return: 0 on success, else a (negative) error code
++ */
++int hmcdrv_cache_startup(size_t cachesize)
++{
++	if (cachesize > 0) { /* perform caching ? */
++		hmcdrv_cache_order = get_order(cachesize);
++		hmcdrv_cache_file.content =
++			(void *) __get_free_pages(GFP_KERNEL | GFP_DMA,
++						  hmcdrv_cache_order);
++
++		if (!hmcdrv_cache_file.content) {
++			pr_err("Allocating the requested cache size of %zu bytes failed\n",
++			       cachesize);
++			return -ENOMEM;
++		}
++
++		pr_debug("content cache enabled, size is %zu bytes\n",
++			 cachesize);
++	}
++
++	hmcdrv_cache_file.len = cachesize;
++	return 0;
++}
++
++/**
++ * hmcdrv_cache_shutdown() - shutdown of HMC drive cache
++ */
++void hmcdrv_cache_shutdown(void)
++{
++	if (hmcdrv_cache_file.content) {
++		free_pages((unsigned long) hmcdrv_cache_file.content,
++			   hmcdrv_cache_order);
++		hmcdrv_cache_file.content = NULL;
++	}
++
++	hmcdrv_cache_file.id = HMCDRV_FTP_NOOP;
++	hmcdrv_cache_file.fsize = LLONG_MAX;
++	hmcdrv_cache_file.ofs = -1;
++	hmcdrv_cache_file.len = 0; /* no cache */
++}
+diff --git a/drivers/s390/char/hmcdrv_cache.h b/drivers/s390/char/hmcdrv_cache.h
+new file mode 100644
+index 000000000000..a14b57526781
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_cache.h
+@@ -0,0 +1,24 @@
++/*
++ *    SE/HMC Drive (Read) Cache Functions
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef __HMCDRV_CACHE_H__
++#define __HMCDRV_CACHE_H__
++
++#include <linux/mmzone.h>
++#include "hmcdrv_ftp.h"
++
++#define HMCDRV_CACHE_SIZE_DFLT	(MAX_ORDER_NR_PAGES * PAGE_SIZE / 2UL)
++
++typedef ssize_t (*hmcdrv_cache_ftpfunc)(const struct hmcdrv_ftp_cmdspec *ftp,
++					size_t *fsize);
++
++ssize_t hmcdrv_cache_cmd(const struct hmcdrv_ftp_cmdspec *ftp,
++			 hmcdrv_cache_ftpfunc func);
++int hmcdrv_cache_startup(size_t cachesize);
++void hmcdrv_cache_shutdown(void);
++
++#endif	 /* __HMCDRV_CACHE_H__ */
+diff --git a/drivers/s390/char/hmcdrv_dev.c b/drivers/s390/char/hmcdrv_dev.c
+new file mode 100644
+index 000000000000..0c5176179c17
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_dev.c
+@@ -0,0 +1,370 @@
++/*
++ *    HMC Drive CD/DVD Device
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ *
++ *    This file provides a Linux "misc" character device for access to an
++ *    assigned HMC drive CD/DVD-ROM. It works as follows: First create the
++ *    device by calling hmcdrv_dev_init(). After open() a lseek(fd, 0,
++ *    SEEK_END) indicates that a new FTP command follows (not needed on the
++ *    first command after open). Then write() the FTP command ASCII string
++ *    to it, e.g. "dir /" or "nls <directory>" or "get <filename>". At the
++ *    end read() the response.
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/miscdevice.h>
++#include <linux/device.h>
++#include <linux/capability.h>
++#include <linux/delay.h>
++#include <linux/uaccess.h>
++
++#include "hmcdrv_dev.h"
++#include "hmcdrv_ftp.h"
++
++/* If the following macro is defined, then the HMC device creates it's own
++ * separated device class (and dynamically assigns a major number). If not
++ * defined then the HMC device is assigned to the "misc" class devices.
++ *
++#define HMCDRV_DEV_CLASS "hmcftp"
++ */
++
++#define HMCDRV_DEV_NAME  "hmcdrv"
++#define HMCDRV_DEV_BUSY_DELAY	 500 /* delay between -EBUSY trials in ms */
++#define HMCDRV_DEV_BUSY_RETRIES  3   /* number of retries on -EBUSY */
++
++struct hmcdrv_dev_node {
++
++#ifdef HMCDRV_DEV_CLASS
++	struct cdev dev; /* character device structure */
++	umode_t mode;	 /* mode of device node (unused, zero) */
++#else
++	struct miscdevice dev; /* "misc" device structure */
++#endif
++
++};
++
++static int hmcdrv_dev_open(struct inode *inode, struct file *fp);
++static int hmcdrv_dev_release(struct inode *inode, struct file *fp);
++static loff_t hmcdrv_dev_seek(struct file *fp, loff_t pos, int whence);
++static ssize_t hmcdrv_dev_read(struct file *fp, char __user *ubuf,
++			       size_t len, loff_t *pos);
++static ssize_t hmcdrv_dev_write(struct file *fp, const char __user *ubuf,
++				size_t len, loff_t *pos);
++static ssize_t hmcdrv_dev_transfer(char __kernel *cmd, loff_t offset,
++				   char __user *buf, size_t len);
++
++/*
++ * device operations
++ */
++static const struct file_operations hmcdrv_dev_fops = {
++	.open = hmcdrv_dev_open,
++	.llseek = hmcdrv_dev_seek,
++	.release = hmcdrv_dev_release,
++	.read = hmcdrv_dev_read,
++	.write = hmcdrv_dev_write,
++};
++
++static struct hmcdrv_dev_node hmcdrv_dev; /* HMC device struct (static) */
++
++#ifdef HMCDRV_DEV_CLASS
++
++static struct class *hmcdrv_dev_class; /* device class pointer */
++static dev_t hmcdrv_dev_no; /* device number (major/minor) */
++
++/**
++ * hmcdrv_dev_name() - provides a naming hint for a device node in /dev
++ * @dev: device for which the naming/mode hint is
++ * @mode: file mode for device node created in /dev
++ *
++ * See: devtmpfs.c, function devtmpfs_create_node()
++ *
++ * Return: recommended device file name in /dev
++ */
++static char *hmcdrv_dev_name(struct device *dev, umode_t *mode)
++{
++	char *nodename = NULL;
++	const char *devname = dev_name(dev); /* kernel device name */
++
++	if (devname)
++		nodename = kasprintf(GFP_KERNEL, "%s", devname);
++
++	/* on device destroy (rmmod) the mode pointer may be NULL
++	 */
++	if (mode)
++		*mode = hmcdrv_dev.mode;
++
++	return nodename;
++}
++
++#endif	/* HMCDRV_DEV_CLASS */
++
++/*
++ * open()
++ */
++static int hmcdrv_dev_open(struct inode *inode, struct file *fp)
++{
++	int rc;
++
++	/* check for non-blocking access, which is really unsupported
++	 */
++	if (fp->f_flags & O_NONBLOCK)
++		return -EINVAL;
++
++	/* Because it makes no sense to open this device read-only (then a
++	 * FTP command cannot be emitted), we respond with an error.
++	 */
++	if ((fp->f_flags & O_ACCMODE) == O_RDONLY)
++		return -EINVAL;
++
++	/* prevent unloading this module as long as anyone holds the
++	 * device file open - so increment the reference count here
++	 */
++	if (!try_module_get(THIS_MODULE))
++		return -ENODEV;
++
++	fp->private_data = NULL; /* no command yet */
++	rc = hmcdrv_ftp_startup();
++	if (rc)
++		module_put(THIS_MODULE);
++
++	pr_debug("open file '/dev/%s' with return code %d\n",
++		 fp->f_dentry->d_name.name, rc);
++	return rc;
++}
++
++/*
++ * release()
++ */
++static int hmcdrv_dev_release(struct inode *inode, struct file *fp)
++{
++	pr_debug("closing file '/dev/%s'\n", fp->f_dentry->d_name.name);
++	kfree(fp->private_data);
++	fp->private_data = NULL;
++	hmcdrv_ftp_shutdown();
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++/*
++ * lseek()
++ */
++static loff_t hmcdrv_dev_seek(struct file *fp, loff_t pos, int whence)
++{
++	switch (whence) {
++	case SEEK_CUR: /* relative to current file position */
++		pos += fp->f_pos; /* new position stored in 'pos' */
++		break;
++
++	case SEEK_SET: /* absolute (relative to beginning of file) */
++		break; /* SEEK_SET */
++
++		/* We use SEEK_END as a special indicator for a SEEK_SET
++		 * (set absolute position), combined with a FTP command
++		 * clear.
++		 */
++	case SEEK_END:
++		if (fp->private_data) {
++			kfree(fp->private_data);
++			fp->private_data = NULL;
++		}
++
++		break; /* SEEK_END */
++
++	default: /* SEEK_DATA, SEEK_HOLE: unsupported */
++		return -EINVAL;
++	}
++
++	if (pos < 0)
++		return -EINVAL;
++
++	if (fp->f_pos != pos)
++		++fp->f_version;
++
++	fp->f_pos = pos;
++	return pos;
++}
++
++/*
++ * transfer (helper function)
++ */
++static ssize_t hmcdrv_dev_transfer(char __kernel *cmd, loff_t offset,
++				   char __user *buf, size_t len)
++{
++	ssize_t retlen;
++	unsigned trials = HMCDRV_DEV_BUSY_RETRIES;
++
++	do {
++		retlen = hmcdrv_ftp_cmd(cmd, offset, buf, len);
++
++		if (retlen != -EBUSY)
++			break;
++
++		msleep(HMCDRV_DEV_BUSY_DELAY);
++
++	} while (--trials > 0);
++
++	return retlen;
++}
++
++/*
++ * read()
++ */
++static ssize_t hmcdrv_dev_read(struct file *fp, char __user *ubuf,
++			       size_t len, loff_t *pos)
++{
++	ssize_t retlen;
++
++	if (((fp->f_flags & O_ACCMODE) == O_WRONLY) ||
++	    (fp->private_data == NULL)) { /* no FTP cmd defined ? */
++		return -EBADF;
++	}
++
++	retlen = hmcdrv_dev_transfer((char *) fp->private_data,
++				     *pos, ubuf, len);
++
++	pr_debug("read from file '/dev/%s' at %lld returns %zd/%zu\n",
++		 fp->f_dentry->d_name.name, (long long) *pos, retlen, len);
++
++	if (retlen > 0)
++		*pos += retlen;
++
++	return retlen;
++}
++
++/*
++ * write()
++ */
++static ssize_t hmcdrv_dev_write(struct file *fp, const char __user *ubuf,
++				size_t len, loff_t *pos)
++{
++	ssize_t retlen;
++
++	pr_debug("writing file '/dev/%s' at pos. %lld with length %zd\n",
++		 fp->f_dentry->d_name.name, (long long) *pos, len);
++
++	if (!fp->private_data) { /* first expect a cmd write */
++		fp->private_data = kmalloc(len + 1, GFP_KERNEL);
++
++		if (!fp->private_data)
++			return -ENOMEM;
++
++		if (!copy_from_user(fp->private_data, ubuf, len)) {
++			((char *)fp->private_data)[len] = '\0';
++			return len;
++		}
++
++		kfree(fp->private_data);
++		fp->private_data = NULL;
++		return -EFAULT;
++	}
++
++	retlen = hmcdrv_dev_transfer((char *) fp->private_data,
++				     *pos, (char __user *) ubuf, len);
++	if (retlen > 0)
++		*pos += retlen;
++
++	pr_debug("write to file '/dev/%s' returned %zd\n",
++		 fp->f_dentry->d_name.name, retlen);
++
++	return retlen;
++}
++
++/**
++ * hmcdrv_dev_init() - creates a HMC drive CD/DVD device
++ *
++ * This function creates a HMC drive CD/DVD kernel device and an associated
++ * device under /dev, using a dynamically allocated major number.
++ *
++ * Return: 0 on success, else an error code.
++ */
++int hmcdrv_dev_init(void)
++{
++	int rc;
++
++#ifdef HMCDRV_DEV_CLASS
++	struct device *dev;
++
++	rc = alloc_chrdev_region(&hmcdrv_dev_no, 0, 1, HMCDRV_DEV_NAME);
++
++	if (rc)
++		goto out_err;
++
++	cdev_init(&hmcdrv_dev.dev, &hmcdrv_dev_fops);
++	hmcdrv_dev.dev.owner = THIS_MODULE;
++	rc = cdev_add(&hmcdrv_dev.dev, hmcdrv_dev_no, 1);
++
++	if (rc)
++		goto out_unreg;
++
++	/* At this point the character device exists in the kernel (see
++	 * /proc/devices), but not under /dev nor /sys/devices/virtual. So
++	 * we have to create an associated class (see /sys/class).
++	 */
++	hmcdrv_dev_class = class_create(THIS_MODULE, HMCDRV_DEV_CLASS);
++
++	if (IS_ERR(hmcdrv_dev_class)) {
++		rc = PTR_ERR(hmcdrv_dev_class);
++		goto out_devdel;
++	}
++
++	/* Finally a device node in /dev has to be established (as 'mkdev'
++	 * does from the command line). Notice that assignment of a device
++	 * node name/mode function is optional (only for mode != 0600).
++	 */
++	hmcdrv_dev.mode = 0; /* "unset" */
++	hmcdrv_dev_class->devnode = hmcdrv_dev_name;
++
++	dev = device_create(hmcdrv_dev_class, NULL, hmcdrv_dev_no, NULL,
++			    "%s", HMCDRV_DEV_NAME);
++	if (!IS_ERR(dev))
++		return 0;
++
++	rc = PTR_ERR(dev);
++	class_destroy(hmcdrv_dev_class);
++	hmcdrv_dev_class = NULL;
++
++out_devdel:
++	cdev_del(&hmcdrv_dev.dev);
++
++out_unreg:
++	unregister_chrdev_region(hmcdrv_dev_no, 1);
++
++out_err:
++
++#else  /* !HMCDRV_DEV_CLASS */
++	hmcdrv_dev.dev.minor = MISC_DYNAMIC_MINOR;
++	hmcdrv_dev.dev.name = HMCDRV_DEV_NAME;
++	hmcdrv_dev.dev.fops = &hmcdrv_dev_fops;
++	hmcdrv_dev.dev.mode = 0; /* finally produces 0600 */
++	rc = misc_register(&hmcdrv_dev.dev);
++#endif	/* HMCDRV_DEV_CLASS */
++
++	return rc;
++}
++
++/**
++ * hmcdrv_dev_exit() - destroys a HMC drive CD/DVD device
++ */
++void hmcdrv_dev_exit(void)
++{
++#ifdef HMCDRV_DEV_CLASS
++	if (!IS_ERR_OR_NULL(hmcdrv_dev_class)) {
++		device_destroy(hmcdrv_dev_class, hmcdrv_dev_no);
++		class_destroy(hmcdrv_dev_class);
++	}
++
++	cdev_del(&hmcdrv_dev.dev);
++	unregister_chrdev_region(hmcdrv_dev_no, 1);
++#else  /* !HMCDRV_DEV_CLASS */
++	misc_deregister(&hmcdrv_dev.dev);
++#endif	/* HMCDRV_DEV_CLASS */
++}
+diff --git a/drivers/s390/char/hmcdrv_dev.h b/drivers/s390/char/hmcdrv_dev.h
+new file mode 100644
+index 000000000000..cb17f07e02de
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_dev.h
+@@ -0,0 +1,14 @@
++/*
++ *    SE/HMC Drive FTP Device
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef __HMCDRV_DEV_H__
++#define __HMCDRV_DEV_H__
++
++int hmcdrv_dev_init(void);
++void hmcdrv_dev_exit(void);
++
++#endif	 /* __HMCDRV_DEV_H__ */
+diff --git a/drivers/s390/char/hmcdrv_ftp.c b/drivers/s390/char/hmcdrv_ftp.c
+new file mode 100644
+index 000000000000..4bd63322fc29
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_ftp.c
+@@ -0,0 +1,343 @@
++/*
++ *    HMC Drive FTP Services
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/export.h>
++
++#include <linux/ctype.h>
++#include <linux/crc16.h>
++
++#include "hmcdrv_ftp.h"
++#include "hmcdrv_cache.h"
++#include "sclp_ftp.h"
++#include "diag_ftp.h"
++
++/**
++ * struct hmcdrv_ftp_ops - HMC drive FTP operations
++ * @startup: startup function
++ * @shutdown: shutdown function
++ * @cmd: FTP transfer function
++ */
++struct hmcdrv_ftp_ops {
++	int (*startup)(void);
++	void (*shutdown)(void);
++	ssize_t (*transfer)(const struct hmcdrv_ftp_cmdspec *ftp,
++			    size_t *fsize);
++};
++
++static enum hmcdrv_ftp_cmdid hmcdrv_ftp_cmd_getid(const char *cmd, int len);
++static int hmcdrv_ftp_parse(char *cmd, struct hmcdrv_ftp_cmdspec *ftp);
++
++static struct hmcdrv_ftp_ops *hmcdrv_ftp_funcs; /* current operations */
++static DEFINE_MUTEX(hmcdrv_ftp_mutex); /* mutex for hmcdrv_ftp_funcs */
++static unsigned hmcdrv_ftp_refcnt; /* start/shutdown reference counter */
++
++/**
++ * hmcdrv_ftp_cmd_getid() - determine FTP command ID from a command string
++ * @cmd: FTP command string (NOT zero-terminated)
++ * @len: length of FTP command string in @cmd
++ */
++static enum hmcdrv_ftp_cmdid hmcdrv_ftp_cmd_getid(const char *cmd, int len)
++{
++	/* HMC FTP command descriptor */
++	struct hmcdrv_ftp_cmd_desc {
++		const char *str;	   /* command string */
++		enum hmcdrv_ftp_cmdid cmd; /* associated command as enum */
++	};
++
++	/* Description of all HMC drive FTP commands
++	 *
++	 * Notes:
++	 * 1. Array size should be a prime number.
++	 * 2. Do not change the order of commands in table (because the
++	 *    index is determined by CRC % ARRAY_SIZE).
++	 * 3. Original command 'nlist' was renamed, else the CRC would
++	 *    collide with 'append' (see point 2).
++	 */
++	static const struct hmcdrv_ftp_cmd_desc ftpcmds[7] = {
++
++		{.str = "get", /* [0] get (CRC = 0x68eb) */
++		 .cmd = HMCDRV_FTP_GET},
++		{.str = "dir", /* [1] dir (CRC = 0x6a9e) */
++		 .cmd = HMCDRV_FTP_DIR},
++		{.str = "delete", /* [2] delete (CRC = 0x53ae) */
++		 .cmd = HMCDRV_FTP_DELETE},
++		{.str = "nls", /* [3] nls (CRC = 0xf87c) */
++		 .cmd = HMCDRV_FTP_NLIST},
++		{.str = "put", /* [4] put (CRC = 0xac56) */
++		 .cmd = HMCDRV_FTP_PUT},
++		{.str = "append", /* [5] append (CRC = 0xf56e) */
++		 .cmd = HMCDRV_FTP_APPEND},
++		{.str = NULL} /* [6] unused */
++	};
++
++	const struct hmcdrv_ftp_cmd_desc *pdesc;
++
++	u16 crc = 0xffffU;
++
++	if (len == 0)
++		return HMCDRV_FTP_NOOP; /* error indiactor */
++
++	crc = crc16(crc, cmd, len);
++	pdesc = ftpcmds + (crc % ARRAY_SIZE(ftpcmds));
++	pr_debug("FTP command '%s' has CRC 0x%04x, at table pos. %lu\n",
++		 cmd, crc, (crc % ARRAY_SIZE(ftpcmds)));
++
++	if (!pdesc->str || strncmp(pdesc->str, cmd, len))
++		return HMCDRV_FTP_NOOP;
++
++	pr_debug("FTP command '%s' found, with ID %d\n",
++		 pdesc->str, pdesc->cmd);
++
++	return pdesc->cmd;
++}
++
++/**
++ * hmcdrv_ftp_parse() - HMC drive FTP command parser
++ * @cmd: FTP command string "<cmd> <filename>"
++ * @ftp: Pointer to FTP command specification buffer (output)
++ *
++ * Return: 0 on success, else a (negative) error code
++ */
++static int hmcdrv_ftp_parse(char *cmd, struct hmcdrv_ftp_cmdspec *ftp)
++{
++	char *start;
++	int argc = 0;
++
++	ftp->id = HMCDRV_FTP_NOOP;
++	ftp->fname = NULL;
++
++	while (*cmd != '\0') {
++
++		while (isspace(*cmd))
++			++cmd;
++
++		if (*cmd == '\0')
++			break;
++
++		start = cmd;
++
++		switch (argc) {
++		case 0: /* 1st argument (FTP command) */
++			while ((*cmd != '\0') && !isspace(*cmd))
++				++cmd;
++			ftp->id = hmcdrv_ftp_cmd_getid(start, cmd - start);
++			break;
++		case 1: /* 2nd / last argument (rest of line) */
++			while ((*cmd != '\0') && !iscntrl(*cmd))
++				++cmd;
++			ftp->fname = start;
++			/* fall through */
++		default:
++			*cmd = '\0';
++			break;
++		} /* switch */
++
++		++argc;
++	} /* while */
++
++	if (!ftp->fname || (ftp->id == HMCDRV_FTP_NOOP))
++		return -EINVAL;
++
++	return 0;
++}
++
++/**
++ * hmcdrv_ftp_do() - perform a HMC drive FTP, with data from kernel-space
++ * @ftp: pointer to FTP command specification
++ *
++ * Return: number of bytes read/written or a negative error code
++ */
++ssize_t hmcdrv_ftp_do(const struct hmcdrv_ftp_cmdspec *ftp)
++{
++	ssize_t len;
++
++	mutex_lock(&hmcdrv_ftp_mutex);
++
++	if (hmcdrv_ftp_funcs && hmcdrv_ftp_refcnt) {
++		pr_debug("starting transfer, cmd %d for '%s' at %lld with %zd bytes\n",
++			 ftp->id, ftp->fname, (long long) ftp->ofs, ftp->len);
++		len = hmcdrv_cache_cmd(ftp, hmcdrv_ftp_funcs->transfer);
++	} else {
++		len = -ENXIO;
++	}
++
++	mutex_unlock(&hmcdrv_ftp_mutex);
++	return len;
++}
++EXPORT_SYMBOL(hmcdrv_ftp_do);
++
++/**
++ * hmcdrv_ftp_probe() - probe for the HMC drive FTP service
++ *
++ * Return: 0 if service is available, else an (negative) error code
++ */
++int hmcdrv_ftp_probe(void)
++{
++	int rc;
++
++	struct hmcdrv_ftp_cmdspec ftp = {
++		.id = HMCDRV_FTP_NOOP,
++		.ofs = 0,
++		.fname = "",
++		.len = PAGE_SIZE
++	};
++
++	ftp.buf = (void *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
++
++	if (!ftp.buf)
++		return -ENOMEM;
++
++	rc = hmcdrv_ftp_startup();
++
++	if (rc)
++		return rc;
++
++	rc = hmcdrv_ftp_do(&ftp);
++	free_page((unsigned long) ftp.buf);
++	hmcdrv_ftp_shutdown();
++
++	switch (rc) {
++	case -ENOENT: /* no such file/media or currently busy, */
++	case -EBUSY:  /* but service seems to be available */
++		rc = 0;
++		break;
++	default: /* leave 'rc' as it is for [0, -EPERM, -E...] */
++		if (rc > 0)
++			rc = 0; /* clear length (success) */
++		break;
++	} /* switch */
++
++	return rc;
++}
++EXPORT_SYMBOL(hmcdrv_ftp_probe);
++
++/**
++ * hmcdrv_ftp_cmd() - Perform a HMC drive FTP, with data from user-space
++ *
++ * @cmd: FTP command string "<cmd> <filename>"
++ * @offset: file position to read/write
++ * @buf: user-space buffer for read/written directory/file
++ * @len: size of @buf (read/dir) or number of bytes to write
++ *
++ * This function must not be called before hmcdrv_ftp_startup() was called.
++ *
++ * Return: number of bytes read/written or a negative error code
++ */
++ssize_t hmcdrv_ftp_cmd(char __kernel *cmd, loff_t offset,
++		       char __user *buf, size_t len)
++{
++	int order;
++
++	struct hmcdrv_ftp_cmdspec ftp = {.len = len, .ofs = offset};
++	ssize_t retlen = hmcdrv_ftp_parse(cmd, &ftp);
++
++	if (retlen)
++		return retlen;
++
++	order = get_order(ftp.len);
++	ftp.buf = (void *) __get_free_pages(GFP_KERNEL | GFP_DMA, order);
++
++	if (!ftp.buf)
++		return -ENOMEM;
++
++	switch (ftp.id) {
++	case HMCDRV_FTP_DIR:
++	case HMCDRV_FTP_NLIST:
++	case HMCDRV_FTP_GET:
++		retlen = hmcdrv_ftp_do(&ftp);
++
++		if ((retlen >= 0) &&
++		    copy_to_user(buf, ftp.buf, retlen))
++			retlen = -EFAULT;
++		break;
++
++	case HMCDRV_FTP_PUT:
++	case HMCDRV_FTP_APPEND:
++		if (!copy_from_user(ftp.buf, buf, ftp.len))
++			retlen = hmcdrv_ftp_do(&ftp);
++		else
++			retlen = -EFAULT;
++		break;
++
++	case HMCDRV_FTP_DELETE:
++		retlen = hmcdrv_ftp_do(&ftp);
++		break;
++
++	default:
++		retlen = -EOPNOTSUPP;
++		break;
++	}
++
++	free_pages((unsigned long) ftp.buf, order);
++	return retlen;
++}
++
++/**
++ * hmcdrv_ftp_startup() - startup of HMC drive FTP functionality for a
++ * dedicated (owner) instance
++ *
++ * Return: 0 on success, else an (negative) error code
++ */
++int hmcdrv_ftp_startup(void)
++{
++	static struct hmcdrv_ftp_ops hmcdrv_ftp_zvm = {
++		.startup = diag_ftp_startup,
++		.shutdown = diag_ftp_shutdown,
++		.transfer = diag_ftp_cmd
++	};
++
++	static struct hmcdrv_ftp_ops hmcdrv_ftp_lpar = {
++		.startup = sclp_ftp_startup,
++		.shutdown = sclp_ftp_shutdown,
++		.transfer = sclp_ftp_cmd
++	};
++
++	int rc = 0;
++
++	mutex_lock(&hmcdrv_ftp_mutex); /* block transfers while start-up */
++
++	if (hmcdrv_ftp_refcnt == 0) {
++		if (MACHINE_IS_VM)
++			hmcdrv_ftp_funcs = &hmcdrv_ftp_zvm;
++		else if (MACHINE_IS_LPAR || MACHINE_IS_KVM)
++			hmcdrv_ftp_funcs = &hmcdrv_ftp_lpar;
++		else
++			rc = -EOPNOTSUPP;
++
++		if (hmcdrv_ftp_funcs)
++			rc = hmcdrv_ftp_funcs->startup();
++	}
++
++	if (!rc)
++		++hmcdrv_ftp_refcnt;
++
++	mutex_unlock(&hmcdrv_ftp_mutex);
++	return rc;
++}
++EXPORT_SYMBOL(hmcdrv_ftp_startup);
++
++/**
++ * hmcdrv_ftp_shutdown() - shutdown of HMC drive FTP functionality for a
++ * dedicated (owner) instance
++ */
++void hmcdrv_ftp_shutdown(void)
++{
++	mutex_lock(&hmcdrv_ftp_mutex);
++	--hmcdrv_ftp_refcnt;
++
++	if ((hmcdrv_ftp_refcnt == 0) && hmcdrv_ftp_funcs)
++		hmcdrv_ftp_funcs->shutdown();
++
++	mutex_unlock(&hmcdrv_ftp_mutex);
++}
++EXPORT_SYMBOL(hmcdrv_ftp_shutdown);
+diff --git a/drivers/s390/char/hmcdrv_ftp.h b/drivers/s390/char/hmcdrv_ftp.h
+new file mode 100644
+index 000000000000..f3643a7b3676
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_ftp.h
+@@ -0,0 +1,63 @@
++/*
++ *    SE/HMC Drive FTP Services
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef __HMCDRV_FTP_H__
++#define __HMCDRV_FTP_H__
++
++#include <linux/types.h> /* size_t, loff_t */
++
++/*
++ * HMC drive FTP Service max. length of path (w/ EOS)
++ */
++#define HMCDRV_FTP_FIDENT_MAX 192
++
++/**
++ * enum hmcdrv_ftp_cmdid - HMC drive FTP commands
++ * @HMCDRV_FTP_NOOP: do nothing (only for probing)
++ * @HMCDRV_FTP_GET: read a file
++ * @HMCDRV_FTP_PUT: (over-) write a file
++ * @HMCDRV_FTP_APPEND: append to a file
++ * @HMCDRV_FTP_DIR: list directory long (ls -l)
++ * @HMCDRV_FTP_NLIST: list files, no directories (name list)
++ * @HMCDRV_FTP_DELETE: delete a file
++ * @HMCDRV_FTP_CANCEL: cancel operation (SCLP/LPAR only)
++ */
++enum hmcdrv_ftp_cmdid {
++	HMCDRV_FTP_NOOP = 0,
++	HMCDRV_FTP_GET = 1,
++	HMCDRV_FTP_PUT = 2,
++	HMCDRV_FTP_APPEND = 3,
++	HMCDRV_FTP_DIR = 4,
++	HMCDRV_FTP_NLIST = 5,
++	HMCDRV_FTP_DELETE = 6,
++	HMCDRV_FTP_CANCEL = 7
++};
++
++/**
++ * struct hmcdrv_ftp_cmdspec - FTP command specification
++ * @id: FTP command ID
++ * @ofs: offset in file
++ * @fname: filename (ASCII), null-terminated
++ * @buf: kernel-space transfer data buffer, 4k aligned
++ * @len: (max) number of bytes to transfer from/to @buf
++ */
++struct hmcdrv_ftp_cmdspec {
++	enum hmcdrv_ftp_cmdid id;
++	loff_t ofs;
++	const char *fname;
++	void __kernel *buf;
++	size_t len;
++};
++
++int hmcdrv_ftp_startup(void);
++void hmcdrv_ftp_shutdown(void);
++int hmcdrv_ftp_probe(void);
++ssize_t hmcdrv_ftp_do(const struct hmcdrv_ftp_cmdspec *ftp);
++ssize_t hmcdrv_ftp_cmd(char __kernel *cmd, loff_t offset,
++		       char __user *buf, size_t len);
++
++#endif	 /* __HMCDRV_FTP_H__ */
+diff --git a/drivers/s390/char/hmcdrv_mod.c b/drivers/s390/char/hmcdrv_mod.c
+new file mode 100644
+index 000000000000..505c6a78ee1a
+--- /dev/null
++++ b/drivers/s390/char/hmcdrv_mod.c
+@@ -0,0 +1,64 @@
++/*
++ *    HMC Drive DVD Module
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/version.h>
++#include <linux/stat.h>
++
++#include "hmcdrv_ftp.h"
++#include "hmcdrv_dev.h"
++#include "hmcdrv_cache.h"
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Copyright 2013 IBM Corporation");
++MODULE_DESCRIPTION("HMC drive DVD access");
++
++/*
++ * module parameter 'cachesize'
++ */
++static size_t hmcdrv_mod_cachesize = HMCDRV_CACHE_SIZE_DFLT;
++module_param_named(cachesize, hmcdrv_mod_cachesize, ulong, S_IRUGO);
++
++/**
++ * hmcdrv_mod_init() - module init function
++ */
++static int __init hmcdrv_mod_init(void)
++{
++	int rc = hmcdrv_ftp_probe(); /* perform w/o cache */
++
++	if (rc)
++		return rc;
++
++	rc = hmcdrv_cache_startup(hmcdrv_mod_cachesize);
++
++	if (rc)
++		return rc;
++
++	rc = hmcdrv_dev_init();
++
++	if (rc)
++		hmcdrv_cache_shutdown();
++
++	return rc;
++}
++
++/**
++ * hmcdrv_mod_exit() - module exit function
++ */
++static void __exit hmcdrv_mod_exit(void)
++{
++	hmcdrv_dev_exit();
++	hmcdrv_cache_shutdown();
++}
++
++module_init(hmcdrv_mod_init);
++module_exit(hmcdrv_mod_exit);
+diff --git a/drivers/s390/char/sclp.h b/drivers/s390/char/sclp.h
+index fea76aed9eea..4d46349762d1 100644
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -19,6 +19,7 @@
+ 
+ #define EVTYP_OPCMD		0x01
+ #define EVTYP_MSG		0x02
++#define EVTYP_DIAG_TEST		0x07
+ #define EVTYP_STATECHANGE	0x08
+ #define EVTYP_PMSGCMD		0x09
+ #define EVTYP_CNTLPROGOPCMD	0x20
+@@ -32,6 +33,7 @@
+ 
+ #define EVTYP_OPCMD_MASK	0x80000000
+ #define EVTYP_MSG_MASK		0x40000000
++#define EVTYP_DIAG_TEST_MASK	0x02000000
+ #define EVTYP_STATECHANGE_MASK	0x01000000
+ #define EVTYP_PMSGCMD_MASK	0x00800000
+ #define EVTYP_CTLPROGOPCMD_MASK	0x00000001
+diff --git a/drivers/s390/char/sclp_diag.h b/drivers/s390/char/sclp_diag.h
+new file mode 100644
+index 000000000000..59c4afa5e670
+--- /dev/null
++++ b/drivers/s390/char/sclp_diag.h
+@@ -0,0 +1,89 @@
++/*
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef _SCLP_DIAG_H
++#define _SCLP_DIAG_H
++
++#include <linux/types.h>
++
++/* return codes for Diagnostic Test FTP Service, as indicated in member
++ * sclp_diag_ftp::ldflg
++ */
++#define SCLP_DIAG_FTP_OK	0x80U /* success */
++#define SCLP_DIAG_FTP_LDFAIL	0x01U /* load failed */
++#define SCLP_DIAG_FTP_LDNPERM	0x02U /* not allowed */
++#define SCLP_DIAG_FTP_LDRUNS	0x03U /* LD runs */
++#define SCLP_DIAG_FTP_LDNRUNS	0x04U /* LD does not run */
++
++#define SCLP_DIAG_FTP_XPCX	0x80 /* PCX communication code */
++#define SCLP_DIAG_FTP_ROUTE	4 /* routing code for new FTP service */
++
++/*
++ * length of Diagnostic Test FTP Service event buffer
++ */
++#define SCLP_DIAG_FTP_EVBUF_LEN				\
++	(offsetof(struct sclp_diag_evbuf, mdd) +	\
++	 sizeof(struct sclp_diag_ftp))
++
++/**
++ * struct sclp_diag_ftp - Diagnostic Test FTP Service model-dependent data
++ * @pcx: code for PCX communication (should be 0x80)
++ * @ldflg: load flag (see defines above)
++ * @cmd: FTP command
++ * @pgsize: page size (0 = 4kB, 1 = large page size)
++ * @srcflg: source flag
++ * @spare: reserved (zeroes)
++ * @offset: file offset
++ * @fsize: file size
++ * @length: buffer size resp. bytes transferred
++ * @failaddr: failing address
++ * @bufaddr: buffer address, virtual
++ * @asce: region or segment table designation
++ * @fident: file name (ASCII, zero-terminated)
++ */
++struct sclp_diag_ftp {
++	u8 pcx;
++	u8 ldflg;
++	u8 cmd;
++	u8 pgsize;
++	u8 srcflg;
++	u8 spare;
++	u64 offset;
++	u64 fsize;
++	u64 length;
++	u64 failaddr;
++	u64 bufaddr;
++	u64 asce;
++
++	u8 fident[256];
++} __packed;
++
++/**
++ * struct sclp_diag_evbuf - Diagnostic Test (ET7) Event Buffer
++ * @hdr: event buffer header
++ * @route: diagnostic route
++ * @mdd: model-dependent data (@route dependent)
++ */
++struct sclp_diag_evbuf {
++	struct evbuf_header hdr;
++	u16 route;
++
++	union {
++		struct sclp_diag_ftp ftp;
++	} mdd;
++} __packed;
++
++/**
++ * struct sclp_diag_sccb - Diagnostic Test (ET7) SCCB
++ * @hdr: SCCB header
++ * @evbuf: event buffer
++ */
++struct sclp_diag_sccb {
++
++	struct sccb_header hdr;
++	struct sclp_diag_evbuf evbuf;
++} __packed;
++
++#endif /* _SCLP_DIAG_H */
+diff --git a/drivers/s390/char/sclp_ftp.c b/drivers/s390/char/sclp_ftp.c
+new file mode 100644
+index 000000000000..6561cc5b2d5d
+--- /dev/null
++++ b/drivers/s390/char/sclp_ftp.c
+@@ -0,0 +1,275 @@
++/*
++ *    SCLP Event Type (ET) 7 - Diagnostic Test FTP Services, useable on LPAR
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ *
++ */
++
++#define KMSG_COMPONENT "hmcdrv"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/io.h>
++#include <linux/wait.h>
++#include <linux/string.h>
++#include <linux/jiffies.h>
++#include <asm/sysinfo.h>
++#include <asm/ebcdic.h>
++
++#include "sclp.h"
++#include "sclp_diag.h"
++#include "sclp_ftp.h"
++
++static DECLARE_COMPLETION(sclp_ftp_rx_complete);
++static u8 sclp_ftp_ldflg;
++static u64 sclp_ftp_fsize;
++static u64 sclp_ftp_length;
++
++/**
++ * sclp_ftp_txcb() - Diagnostic Test FTP services SCLP command callback
++ */
++static void sclp_ftp_txcb(struct sclp_req *req, void *data)
++{
++	struct completion *completion = data;
++
++#ifdef DEBUG
++	pr_debug("SCLP (ET7) TX-IRQ, SCCB @ 0x%p: %*phN\n",
++		 req->sccb, 24, req->sccb);
++#endif
++	complete(completion);
++}
++
++/**
++ * sclp_ftp_rxcb() - Diagnostic Test FTP services receiver event callback
++ */
++static void sclp_ftp_rxcb(struct evbuf_header *evbuf)
++{
++	struct sclp_diag_evbuf *diag = (struct sclp_diag_evbuf *) evbuf;
++
++	/*
++	 * Check for Diagnostic Test FTP Service
++	 */
++	if (evbuf->type != EVTYP_DIAG_TEST ||
++	    diag->route != SCLP_DIAG_FTP_ROUTE ||
++	    diag->mdd.ftp.pcx != SCLP_DIAG_FTP_XPCX ||
++	    evbuf->length < SCLP_DIAG_FTP_EVBUF_LEN)
++		return;
++
++#ifdef DEBUG
++	pr_debug("SCLP (ET7) RX-IRQ, Event @ 0x%p: %*phN\n",
++		 evbuf, 24, evbuf);
++#endif
++
++	/*
++	 * Because the event buffer is located in a page which is owned
++	 * by the SCLP core, all data of interest must be copied. The
++	 * error indication is in 'sclp_ftp_ldflg'
++	 */
++	sclp_ftp_ldflg = diag->mdd.ftp.ldflg;
++	sclp_ftp_fsize = diag->mdd.ftp.fsize;
++	sclp_ftp_length = diag->mdd.ftp.length;
++
++	complete(&sclp_ftp_rx_complete);
++}
++
++/**
++ * sclp_ftp_et7() - start a Diagnostic Test FTP Service SCLP request
++ * @ftp: pointer to FTP descriptor
++ *
++ * Return: 0 on success, else a (negative) error code
++ */
++static int sclp_ftp_et7(const struct hmcdrv_ftp_cmdspec *ftp)
++{
++	struct completion completion;
++	struct sclp_diag_sccb *sccb;
++	struct sclp_req *req;
++	size_t len;
++	int rc;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	sccb = (void *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
++	if (!req || !sccb) {
++		rc = -ENOMEM;
++		goto out_free;
++	}
++
++	sccb->hdr.length = SCLP_DIAG_FTP_EVBUF_LEN +
++		sizeof(struct sccb_header);
++	sccb->evbuf.hdr.type = EVTYP_DIAG_TEST;
++	sccb->evbuf.hdr.length = SCLP_DIAG_FTP_EVBUF_LEN;
++	sccb->evbuf.hdr.flags = 0; /* clear processed-buffer */
++	sccb->evbuf.route = SCLP_DIAG_FTP_ROUTE;
++	sccb->evbuf.mdd.ftp.pcx = SCLP_DIAG_FTP_XPCX;
++	sccb->evbuf.mdd.ftp.srcflg = 0;
++	sccb->evbuf.mdd.ftp.pgsize = 0;
++	sccb->evbuf.mdd.ftp.asce = _ASCE_REAL_SPACE;
++	sccb->evbuf.mdd.ftp.ldflg = SCLP_DIAG_FTP_LDFAIL;
++	sccb->evbuf.mdd.ftp.fsize = 0;
++	sccb->evbuf.mdd.ftp.cmd = ftp->id;
++	sccb->evbuf.mdd.ftp.offset = ftp->ofs;
++	sccb->evbuf.mdd.ftp.length = ftp->len;
++	sccb->evbuf.mdd.ftp.bufaddr = virt_to_phys(ftp->buf);
++
++	len = strlcpy(sccb->evbuf.mdd.ftp.fident, ftp->fname,
++		      HMCDRV_FTP_FIDENT_MAX);
++	if (len >= HMCDRV_FTP_FIDENT_MAX) {
++		rc = -EINVAL;
++		goto out_free;
++	}
++
++	req->command = SCLP_CMDW_WRITE_EVENT_DATA;
++	req->sccb = sccb;
++	req->status = SCLP_REQ_FILLED;
++	req->callback = sclp_ftp_txcb;
++	req->callback_data = &completion;
++
++	init_completion(&completion);
++
++	rc = sclp_add_request(req);
++	if (rc)
++		goto out_free;
++
++	/* Wait for end of ftp sclp command. */
++	wait_for_completion(&completion);
++
++#ifdef DEBUG
++	pr_debug("status of SCLP (ET7) request is 0x%04x (0x%02x)\n",
++		 sccb->hdr.response_code, sccb->evbuf.hdr.flags);
++#endif
++
++	/*
++	 * Check if sclp accepted the request. The data transfer runs
++	 * asynchronously and the completion is indicated with an
++	 * sclp ET7 event.
++	 */
++	if (req->status != SCLP_REQ_DONE ||
++	    (sccb->evbuf.hdr.flags & 0x80) == 0 || /* processed-buffer */
++	    (sccb->hdr.response_code & 0xffU) != 0x20U) {
++		rc = -EIO;
++	}
++
++out_free:
++	free_page((unsigned long) sccb);
++	kfree(req);
++	return rc;
++}
++
++/**
++ * sclp_ftp_cmd() - executes a HMC related SCLP Diagnose (ET7) FTP command
++ * @ftp: pointer to FTP command specification
++ * @fsize: return of file size (or NULL if undesirable)
++ *
++ * Attention: Notice that this function is not reentrant - so the caller
++ * must ensure locking.
++ *
++ * Return: number of bytes read/written or a (negative) error code
++ */
++ssize_t sclp_ftp_cmd(const struct hmcdrv_ftp_cmdspec *ftp, size_t *fsize)
++{
++	ssize_t len;
++#ifdef DEBUG
++	unsigned long start_jiffies;
++
++	pr_debug("starting SCLP (ET7), cmd %d for '%s' at %lld with %zd bytes\n",
++		 ftp->id, ftp->fname, (long long) ftp->ofs, ftp->len);
++	start_jiffies = jiffies;
++#endif
++
++	init_completion(&sclp_ftp_rx_complete);
++
++	/* Start ftp sclp command. */
++	len = sclp_ftp_et7(ftp);
++	if (len)
++		goto out_unlock;
++
++	/*
++	 * There is no way to cancel the sclp ET7 request, the code
++	 * needs to wait unconditionally until the transfer is complete.
++	 */
++	wait_for_completion(&sclp_ftp_rx_complete);
++
++#ifdef DEBUG
++	pr_debug("completed SCLP (ET7) request after %lu ms (all)\n",
++		 (jiffies - start_jiffies) * 1000 / HZ);
++	pr_debug("return code of SCLP (ET7) FTP Service is 0x%02x, with %lld/%lld bytes\n",
++		 sclp_ftp_ldflg, sclp_ftp_length, sclp_ftp_fsize);
++#endif
++
++	switch (sclp_ftp_ldflg) {
++	case SCLP_DIAG_FTP_OK:
++		len = sclp_ftp_length;
++		if (fsize)
++			*fsize = sclp_ftp_fsize;
++		break;
++	case SCLP_DIAG_FTP_LDNPERM:
++		len = -EPERM;
++		break;
++	case SCLP_DIAG_FTP_LDRUNS:
++		len = -EBUSY;
++		break;
++	case SCLP_DIAG_FTP_LDFAIL:
++		len = -ENOENT;
++		break;
++	default:
++		len = -EIO;
++		break;
++	}
++
++out_unlock:
++	return len;
++}
++
++/*
++ * ET7 event listener
++ */
++static struct sclp_register sclp_ftp_event = {
++	.send_mask = EVTYP_DIAG_TEST_MASK,    /* want tx events */
++	.receive_mask = EVTYP_DIAG_TEST_MASK, /* want rx events */
++	.receiver_fn = sclp_ftp_rxcb,	      /* async callback (rx) */
++	.state_change_fn = NULL,
++	.pm_event_fn = NULL,
++};
++
++/**
++ * sclp_ftp_startup() - startup of FTP services, when running on LPAR
++ */
++int sclp_ftp_startup(void)
++{
++#ifdef DEBUG
++	unsigned long info;
++#endif
++	int rc;
++
++	rc = sclp_register(&sclp_ftp_event);
++	if (rc)
++		return rc;
++
++#ifdef DEBUG
++	info = get_zeroed_page(GFP_KERNEL);
++
++	if (info != 0) {
++		struct sysinfo_2_2_2 *info222 = (struct sysinfo_2_2_2 *)info;
++
++		if (!stsi(info222, 2, 2, 2)) { /* get SYSIB 2.2.2 */
++			info222->name[sizeof(info222->name) - 1] = '\0';
++			EBCASC_500(info222->name, sizeof(info222->name) - 1);
++			pr_debug("SCLP (ET7) FTP Service working on LPAR %u (%s)\n",
++				 info222->lpar_number, info222->name);
++		}
++
++		free_page(info);
++	}
++#endif	/* DEBUG */
++	return 0;
++}
++
++/**
++ * sclp_ftp_shutdown() - shutdown of FTP services, when running on LPAR
++ */
++void sclp_ftp_shutdown(void)
++{
++	sclp_unregister(&sclp_ftp_event);
++}
+diff --git a/drivers/s390/char/sclp_ftp.h b/drivers/s390/char/sclp_ftp.h
+new file mode 100644
+index 000000000000..98ba3183e7d9
+--- /dev/null
++++ b/drivers/s390/char/sclp_ftp.h
+@@ -0,0 +1,21 @@
++/*
++ *    SCLP Event Type (ET) 7 - Diagnostic Test FTP Services, useable on LPAR
++ *
++ *    Notice that all functions exported here are not reentrant.
++ *    So usage should be exclusive, ensured by the caller (e.g. using a
++ *    mutex).
++ *
++ *    Copyright IBM Corp. 2013
++ *    Author(s): Ralf Hoppe (rhoppe@de.ibm.com)
++ */
++
++#ifndef __SCLP_FTP_H__
++#define __SCLP_FTP_H__
++
++#include "hmcdrv_ftp.h"
++
++int sclp_ftp_startup(void);
++void sclp_ftp_shutdown(void);
++ssize_t sclp_ftp_cmd(const struct hmcdrv_ftp_cmdspec *ftp, size_t *fsize);
++
++#endif	 /* __SCLP_FTP_H__ */
