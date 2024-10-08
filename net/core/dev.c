@@ -3768,7 +3768,13 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff 
 
 	skb_gro_reset_offset(skb);
 	gro_list_prepare(napi, skb);
-	NAPI_GRO_CB(skb)->csum = skb->csum; /* Needed for CHECKSUM_COMPLETE */
+
+	if (skb->ip_summed == CHECKSUM_COMPLETE) {
+		NAPI_GRO_CB(skb)->csum = skb->csum;
+		NAPI_GRO_CB(skb)->csum_valid = 1;
+	} else {
+		NAPI_GRO_CB(skb)->csum_valid = 0;
+	}
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(ptype, head, list) {
@@ -3781,6 +3787,7 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff 
 		NAPI_GRO_CB(skb)->flush = 0;
 		NAPI_GRO_CB(skb)->free = 0;
 		NAPI_GRO_CB(skb)->udp_mark = 0;
+		NAPI_GRO_CB(skb)->encapsulation = 0;
 
 		pp = ptype->callbacks.gro_receive(&napi->gro_list, skb);
 		break;
@@ -3991,6 +3998,31 @@ gro_result_t napi_gro_frags(struct napi_struct *napi)
 	return napi_frags_finish(napi, skb, dev_gro_receive(napi, skb));
 }
 EXPORT_SYMBOL(napi_gro_frags);
+
+/* Compute the checksum from gro_offset and return the folded value
+ * after adding in any pseudo checksum.
+ */
+__sum16 __skb_gro_checksum_complete(struct sk_buff *skb)
+{
+	__wsum wsum;
+	__sum16 sum;
+
+	wsum = skb_checksum(skb, skb_gro_offset(skb), skb_gro_len(skb), 0);
+
+	/* NAPI_GRO_CB(skb)->csum holds pseudo checksum */
+	sum = csum_fold(csum_add(NAPI_GRO_CB(skb)->csum, wsum));
+	if (likely(!sum)) {
+		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+		    !skb->csum_complete_sw)
+			netdev_rx_csum_fault(skb->dev);
+	}
+
+	NAPI_GRO_CB(skb)->csum = wsum;
+	NAPI_GRO_CB(skb)->csum_valid = 1;
+
+	return sum;
+}
+EXPORT_SYMBOL(__skb_gro_checksum_complete);
 
 /*
  * net_rps_action sends any pending IPI's for rps.
