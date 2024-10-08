@@ -1,0 +1,645 @@
+NVMe: Remove hctx reliance for multi-namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 42483228d4c019ffc86b8dbea7dfbc3f9566fe7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/42483228.failed
+
+The driver needs to track shared tags to support multiple namespaces
+that may be dynamically allocated or deleted. Relying on the first
+request_queue's hctx's is not appropriate as we cannot clear outstanding
+tags for all namespaces using this handle, nor can the driver easily track
+all request_queue's hctx as namespaces are attached/detached. Instead,
+this patch uses the nvme_dev's tagset to get the shared tag resources
+instead of through a request_queue hctx.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 42483228d4c019ffc86b8dbea7dfbc3f9566fe7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index 29d2b5fb1975,513908ff46c4..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -95,12 -102,9 +95,13 @@@ struct nvme_queue 
+  	spinlock_t q_lock;
+  	struct nvme_command *sq_cmds;
+  	volatile struct nvme_completion *cqes;
++ 	struct blk_mq_tags **tags;
+  	dma_addr_t sq_dma_addr;
+  	dma_addr_t cq_dma_addr;
+ +	wait_queue_head_t sq_full;
+ +	wait_queue_t sq_cong_wait;
+ +	struct bio_list sq_cong;
+ +	struct list_head iod_bio;
+  	u32 __iomem *q_db;
+  	u16 q_depth;
+  	s16 cq_vector;
+@@@ -110,10 -114,7 +111,13 @@@
+  	u16 qid;
+  	u8 cq_phase;
+  	u8 cqe_seen;
+ +	u8 q_suspended;
+ +	cpumask_var_t cpu_mask;
+  	struct async_cmd_info cmdinfo;
+++<<<<<<< HEAD
+ +	unsigned long cmdid_data[];
+++=======
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  };
+  
+  /*
+@@@ -141,62 -142,115 +145,149 @@@ typedef void (*nvme_completion_fn)(stru
+  struct nvme_cmd_info {
+  	nvme_completion_fn fn;
+  	void *ctx;
+ +	unsigned long timeout;
+  	int aborted;
+ -	struct nvme_queue *nvmeq;
+ -	struct nvme_iod iod[0];
+  };
+  
+ -/*
+ - * Max size of iod being embedded in the request payload
+ - */
+ -#define NVME_INT_PAGES		2
+ -#define NVME_INT_BYTES(dev)	(NVME_INT_PAGES * (dev)->page_size)
+ -#define NVME_INT_MASK		0x01
+ +static struct nvme_cmd_info *nvme_cmd_info(struct nvme_queue *nvmeq)
+ +{
+ +	return (void *)&nvmeq->cmdid_data[BITS_TO_LONGS(nvmeq->q_depth)];
+ +}
+  
+ -/*
+ - * Will slightly overestimate the number of pages needed.  This is OK
+ - * as it only leads to a small amount of wasted memory for the lifetime of
+ - * the I/O.
+ - */
+ -static int nvme_npages(unsigned size, struct nvme_dev *dev)
+ +static unsigned nvme_queue_extra(int depth)
+  {
+ -	unsigned nprps = DIV_ROUND_UP(size + dev->page_size, dev->page_size);
+ -	return DIV_ROUND_UP(8 * nprps, PAGE_SIZE - 8);
+ +	return DIV_ROUND_UP(depth, 8) + (depth * sizeof(struct nvme_cmd_info));
+  }
+  
+ -static unsigned int nvme_cmd_size(struct nvme_dev *dev)
+ +/**
+ + * alloc_cmdid() - Allocate a Command ID
+ + * @nvmeq: The queue that will be used for this command
+ + * @ctx: A pointer that will be passed to the handler
+ + * @handler: The function to call on completion
+ + *
+ + * Allocate a Command ID for a queue.  The data passed in will
+ + * be passed to the completion handler.  This is implemented by using
+ + * the bottom two bits of the ctx pointer to store the handler ID.
+ + * Passing in a pointer that's not 4-byte aligned will cause a BUG.
+ + * We can change this if it becomes a problem.
+ + *
+ + * May be called with local interrupts disabled and the q_lock held,
+ + * or with interrupts enabled and no locks held.
+ + */
+ +static int alloc_cmdid(struct nvme_queue *nvmeq, void *ctx,
+ +				nvme_completion_fn handler, unsigned timeout)
+  {
+ +	int depth = nvmeq->q_depth - 1;
+ +	struct nvme_cmd_info *info = nvme_cmd_info(nvmeq);
+ +	int cmdid;
+ +
+ +	do {
+ +		cmdid = find_first_zero_bit(nvmeq->cmdid_data, depth);
+ +		if (cmdid >= depth)
+ +			return -EBUSY;
+ +	} while (test_and_set_bit(cmdid, nvmeq->cmdid_data));
+ +
+ +	info[cmdid].fn = handler;
+ +	info[cmdid].ctx = ctx;
+ +	info[cmdid].timeout = jiffies + timeout;
+ +	info[cmdid].aborted = 0;
+ +	return cmdid;
+ +}
+ +
+ +static int alloc_cmdid_killable(struct nvme_queue *nvmeq, void *ctx,
+ +				nvme_completion_fn handler, unsigned timeout)
+ +{
+++<<<<<<< HEAD
+ +	int cmdid;
+ +	wait_event_killable(nvmeq->sq_full,
+ +		(cmdid = alloc_cmdid(nvmeq, ctx, handler, timeout)) >= 0);
+ +	return (cmdid < 0) ? -EINTR : cmdid;
+++=======
++ 	unsigned int ret = sizeof(struct nvme_cmd_info);
++ 
++ 	ret += sizeof(struct nvme_iod);
++ 	ret += sizeof(__le64 *) * nvme_npages(NVME_INT_BYTES(dev), dev);
++ 	ret += sizeof(struct scatterlist) * NVME_INT_PAGES;
++ 
++ 	return ret;
++ }
++ 
++ static int nvme_admin_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
++ 				unsigned int hctx_idx)
++ {
++ 	struct nvme_dev *dev = data;
++ 	struct nvme_queue *nvmeq = dev->queues[0];
++ 
++ 	WARN_ON(hctx_idx != 0);
++ 	WARN_ON(dev->admin_tagset.tags[0] != hctx->tags);
++ 	WARN_ON(nvmeq->tags);
++ 
++ 	hctx->driver_data = nvmeq;
++ 	nvmeq->tags = &dev->admin_tagset.tags[0];
++ 	return 0;
++ }
++ 
++ static int nvme_admin_init_request(void *data, struct request *req,
++ 				unsigned int hctx_idx, unsigned int rq_idx,
++ 				unsigned int numa_node)
++ {
++ 	struct nvme_dev *dev = data;
++ 	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
++ 	struct nvme_queue *nvmeq = dev->queues[0];
++ 
++ 	BUG_ON(!nvmeq);
++ 	cmd->nvmeq = nvmeq;
++ 	return 0;
++ }
++ 
++ static int nvme_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
++ 			  unsigned int hctx_idx)
++ {
++ 	struct nvme_dev *dev = data;
++ 	struct nvme_queue *nvmeq = dev->queues[hctx_idx + 1];
++ 
++ 	if (!nvmeq->tags)
++ 		nvmeq->tags = &dev->tagset.tags[hctx_idx];
++ 
++ 	WARN_ON(dev->tagset.tags[hctx_idx] != hctx->tags);
++ 	hctx->driver_data = nvmeq;
++ 	return 0;
++ }
++ 
++ static int nvme_init_request(void *data, struct request *req,
++ 				unsigned int hctx_idx, unsigned int rq_idx,
++ 				unsigned int numa_node)
++ {
++ 	struct nvme_dev *dev = data;
++ 	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
++ 	struct nvme_queue *nvmeq = dev->queues[hctx_idx + 1];
++ 
++ 	BUG_ON(!nvmeq);
++ 	cmd->nvmeq = nvmeq;
++ 	return 0;
++ }
++ 
++ static void nvme_set_info(struct nvme_cmd_info *cmd, void *ctx,
++ 				nvme_completion_fn handler)
++ {
++ 	cmd->fn = handler;
++ 	cmd->ctx = ctx;
++ 	cmd->aborted = 0;
++ 	blk_mq_start_request(blk_mq_rq_from_pdu(cmd));
++ }
++ 
++ static void *iod_get_private(struct nvme_iod *iod)
++ {
++ 	return (void *) (iod->private & ~0x1UL);
++ }
++ 
++ /*
++  * If bit 0 is set, the iod is embedded in the request payload.
++  */
++ static bool iod_should_kfree(struct nvme_iod *iod)
++ {
++ 	return (iod->private & NVME_INT_MASK) == 0;
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  }
+  
+  /* Special values must be less than 0x1000 */
+@@@ -243,6 -279,45 +334,48 @@@ static void special_completion(struct n
+  	dev_warn(nvmeq->q_dmadev, "Unknown special completion %p\n", ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *cancel_cmd_info(struct nvme_cmd_info *cmd, nvme_completion_fn *fn)
++ {
++ 	void *ctx;
++ 
++ 	if (fn)
++ 		*fn = cmd->fn;
++ 	ctx = cmd->ctx;
++ 	cmd->fn = special_completion;
++ 	cmd->ctx = CMD_CTX_CANCELLED;
++ 	return ctx;
++ }
++ 
++ static void async_req_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 
++ 	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ)
++ 		++nvmeq->dev->event_limit;
++ 	if (status == NVME_SC_SUCCESS)
++ 		dev_warn(nvmeq->q_dmadev,
++ 			"async event result %08x\n", result);
++ }
++ 
++ static void abort_completion(struct nvme_queue *nvmeq, void *ctx,
++ 						struct nvme_completion *cqe)
++ {
++ 	struct request *req = ctx;
++ 
++ 	u16 status = le16_to_cpup(&cqe->status) >> 1;
++ 	u32 result = le32_to_cpup(&cqe->result);
++ 
++ 	blk_mq_free_request(req);
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
++ 	++nvmeq->dev->abort_limit;
++ }
++ 
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  static void async_completion(struct nvme_queue *nvmeq, void *ctx,
+  						struct nvme_completion *cqe)
+  {
+@@@ -250,6 -325,15 +383,18 @@@
+  	cmdinfo->result = le32_to_cpup(&cqe->result);
+  	cmdinfo->status = le16_to_cpup(&cqe->status) >> 1;
+  	queue_kthread_work(cmdinfo->worker, &cmdinfo->work);
+++<<<<<<< HEAD
+++=======
++ 	blk_mq_free_request(cmdinfo->req);
++ }
++ 
++ static inline struct nvme_cmd_info *get_cmd_from_tag(struct nvme_queue *nvmeq,
++ 				  unsigned int tag)
++ {
++ 	struct request *req = blk_mq_tag_to_rq(*nvmeq->tags, tag);
++ 
++ 	return blk_mq_rq_to_pdu(req);
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  }
+  
+  /*
+@@@ -1000,86 -987,103 +1145,128 @@@ static void sync_completion(struct nvme
+   * Returns 0 on success.  If the result is negative, it's a Linux error code;
+   * if the result is positive, it's an NVM Express status code
+   */
+ -int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ -		void *buffer, void __user *ubuffer, unsigned bufflen,
+ -		u32 *result, unsigned timeout)
+ +static int nvme_submit_sync_cmd(struct nvme_dev *dev, int q_idx,
+ +						struct nvme_command *cmd,
+ +						u32 *result, unsigned timeout)
+  {
+ -	bool write = cmd->common.opcode & 1;
+ -	struct bio *bio = NULL;
+ -	struct request *req;
+ -	int ret;
+ +	int cmdid, ret;
+ +	struct sync_cmd_info cmdinfo;
+ +	struct nvme_queue *nvmeq;
+  
+ -	req = blk_mq_alloc_request(q, write, GFP_KERNEL, false);
+ -	if (IS_ERR(req))
+ -		return PTR_ERR(req);
+ +	nvmeq = lock_nvmeq(dev, q_idx);
+ +	if (!nvmeq)
+ +		return -ENODEV;
+  
+ -	req->cmd_type = REQ_TYPE_DRV_PRIV;
+ -	req->cmd_flags = REQ_FAILFAST_DRIVER;
+ -	req->__data_len = 0;
+ -	req->__sector = (sector_t) -1;
+ -	req->bio = req->biotail = NULL;
+ +	cmdinfo.task = current;
+ +	cmdinfo.status = -EINTR;
+  
+ -	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
+ +	cmdid = alloc_cmdid(nvmeq, &cmdinfo, sync_completion, timeout);
+ +	if (cmdid < 0) {
+ +		unlock_nvmeq(nvmeq);
+ +		return cmdid;
+ +	}
+ +	cmd->common.command_id = cmdid;
+  
+ -	req->cmd = (unsigned char *)cmd;
+ -	req->cmd_len = sizeof(struct nvme_command);
+ -	req->special = (void *)0;
+ +	set_current_state(TASK_KILLABLE);
+ +	ret = nvme_submit_cmd(nvmeq, cmd);
+ +	if (ret) {
+ +		free_cmdid(nvmeq, cmdid, NULL);
+ +		unlock_nvmeq(nvmeq);
+ +		set_current_state(TASK_RUNNING);
+ +		return ret;
+ +	}
+ +	unlock_nvmeq(nvmeq);
+ +	schedule_timeout(timeout);
+  
+ -	if (buffer && bufflen) {
+ -		ret = blk_rq_map_kern(q, req, buffer, bufflen, __GFP_WAIT);
+ -		if (ret)
+ -			goto out;
+ -	} else if (ubuffer && bufflen) {
+ -		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen, __GFP_WAIT);
+ -		if (ret)
+ -			goto out;
+ -		bio = req->bio;
+ +	if (cmdinfo.status == -EINTR) {
+ +		nvmeq = lock_nvmeq(dev, q_idx);
+ +		if (nvmeq) {
+ +			nvme_abort_command(nvmeq, cmdid);
+ +			unlock_nvmeq(nvmeq);
+ +		}
+ +		return -EINTR;
+  	}
+  
+ -	blk_execute_rq(req->q, NULL, req, 0);
+ -	if (bio)
+ -		blk_rq_unmap_user(bio);
+  	if (result)
+ -		*result = (u32)(uintptr_t)req->special;
+ -	ret = req->errors;
+ - out:
+ -	blk_mq_free_request(req);
+ -	return ret;
+ +		*result = cmdinfo.result;
+ +
+ +	return cmdinfo.status;
+  }
+  
+ -int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ -		void *buffer, unsigned bufflen)
+ +int nvme_submit_async_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ +						struct async_cmd_info *cmdinfo,
+ +						unsigned timeout)
+  {
+ -	return __nvme_submit_sync_cmd(q, cmd, buffer, NULL, bufflen, NULL, 0);
+ -}
+ +	int cmdid;
+  
+++<<<<<<< HEAD
+ +	cmdid = alloc_cmdid_killable(nvmeq, cmdinfo, async_completion, timeout);
+ +	if (cmdid < 0)
+ +		return cmdid;
+++=======
++ static int nvme_submit_async_admin_req(struct nvme_dev *dev)
++ {
++ 	struct nvme_queue *nvmeq = dev->queues[0];
++ 	struct nvme_command c;
++ 	struct nvme_cmd_info *cmd_info;
++ 	struct request *req;
++ 
++ 	req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC, true);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 
++ 	req->cmd_flags |= REQ_NO_TIMEOUT;
++ 	cmd_info = blk_mq_rq_to_pdu(req);
++ 	nvme_set_info(cmd_info, NULL, async_req_completion);
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.common.opcode = nvme_admin_async_event;
++ 	c.common.command_id = req->tag;
++ 
++ 	blk_mq_free_request(req);
++ 	return __nvme_submit_cmd(nvmeq, &c);
++ }
++ 
++ static int nvme_submit_admin_async_cmd(struct nvme_dev *dev,
++ 			struct nvme_command *cmd,
++ 			struct async_cmd_info *cmdinfo, unsigned timeout)
++ {
++ 	struct nvme_queue *nvmeq = dev->queues[0];
++ 	struct request *req;
++ 	struct nvme_cmd_info *cmd_rq;
++ 
++ 	req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_KERNEL, false);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 
++ 	req->timeout = timeout;
++ 	cmd_rq = blk_mq_rq_to_pdu(req);
++ 	cmdinfo->req = req;
++ 	nvme_set_info(cmd_rq, cmdinfo, async_completion);
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  	cmdinfo->status = -EINTR;
+ +	cmd->common.command_id = cmdid;
+ +	return nvme_submit_cmd(nvmeq, cmd);
+ +}
+ +
+ +int nvme_submit_admin_cmd(struct nvme_dev *dev, struct nvme_command *cmd,
+ +								u32 *result)
+ +{
+ +	return nvme_submit_sync_cmd(dev, 0, cmd, result, ADMIN_TIMEOUT);
+ +}
+  
+ -	cmd->common.command_id = req->tag;
+ +int nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_command *cmd,
+ +								u32 *result)
+ +{
+ +	return nvme_submit_sync_cmd(dev, this_cpu_read(*dev->io_queue), cmd,
+ +						result,	NVME_IO_TIMEOUT);
+ +}
+  
+ -	return nvme_submit_cmd(nvmeq, cmd);
+ +int nvme_submit_admin_cmd_async(struct nvme_dev *dev, struct nvme_command *cmd,
+ +						struct async_cmd_info *cmdinfo)
+ +{
+ +	return nvme_submit_async_cmd(raw_nvmeq(dev, 0), cmd, cmdinfo,
+ +								ADMIN_TIMEOUT);
+  }
+  
+  static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
+@@@ -1279,26 -1301,55 +1466,76 @@@ static void nvme_cancel_ios(struct nvme
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_cancel_queue_ios(struct request *req, void *data, bool reserved)
++ {
++ 	struct nvme_queue *nvmeq = data;
++ 	void *ctx;
++ 	nvme_completion_fn fn;
++ 	struct nvme_cmd_info *cmd;
++ 	struct nvme_completion cqe;
++ 
++ 	if (!blk_mq_request_started(req))
++ 		return;
++ 
++ 	cmd = blk_mq_rq_to_pdu(req);
++ 
++ 	if (cmd->ctx == CMD_CTX_CANCELLED)
++ 		return;
++ 
++ 	if (blk_queue_dying(req->q))
++ 		cqe.status = cpu_to_le16((NVME_SC_ABORT_REQ | NVME_SC_DNR) << 1);
++ 	else
++ 		cqe.status = cpu_to_le16(NVME_SC_ABORT_REQ << 1);
++ 
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Cancelling I/O %d QID %d\n",
++ 						req->tag, nvmeq->qid);
++ 	ctx = cancel_cmd_info(cmd, &fn);
++ 	fn(nvmeq, ctx, &cqe);
++ }
++ 
++ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
++ {
++ 	struct nvme_cmd_info *cmd = blk_mq_rq_to_pdu(req);
++ 	struct nvme_queue *nvmeq = cmd->nvmeq;
++ 
++ 	dev_warn(nvmeq->q_dmadev, "Timeout I/O %d QID %d\n", req->tag,
++ 							nvmeq->qid);
++ 	spin_lock_irq(&nvmeq->q_lock);
++ 	nvme_abort_req(req);
++ 	spin_unlock_irq(&nvmeq->q_lock);
++ 
++ 	/*
++ 	 * The aborted req will be completed on receiving the abort req.
++ 	 * We enable the timer again. If hit twice, it'll cause a device reset,
++ 	 * as the device then is in a faulty state.
++ 	 */
++ 	return BLK_EH_RESET_TIMER;
++ }
++ 
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  static void nvme_free_queue(struct nvme_queue *nvmeq)
+  {
+ +	spin_lock_irq(&nvmeq->q_lock);
+ +	while (bio_list_peek(&nvmeq->sq_cong)) {
+ +		struct bio *bio = bio_list_pop(&nvmeq->sq_cong);
+ +		bio_endio(bio, -EIO);
+ +	}
+ +	while (!list_empty(&nvmeq->iod_bio)) {
+ +		static struct nvme_completion cqe = {
+ +			.status = cpu_to_le16(
+ +				(NVME_SC_ABORT_REQ | NVME_SC_DNR) << 1),
+ +		};
+ +		struct nvme_iod *iod = list_first_entry(&nvmeq->iod_bio,
+ +							struct nvme_iod,
+ +							node);
+ +		list_del(&iod->node);
+ +		bio_completion(nvmeq, iod, &cqe);
+ +	}
+ +	spin_unlock_irq(&nvmeq->q_lock);
+ +
+  	dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
+  				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
+  	dma_free_coherent(nvmeq->q_dmadev, SQ_SIZE(nvmeq->q_depth),
+@@@ -1355,8 -1399,8 +1592,13 @@@ static int nvme_suspend_queue(struct nv
+  static void nvme_clear_queue(struct nvme_queue *nvmeq)
+  {
+  	spin_lock_irq(&nvmeq->q_lock);
+++<<<<<<< HEAD
+ +	nvme_process_cq(nvmeq);
+ +	nvme_cancel_ios(nvmeq, false);
+++=======
++ 	if (nvmeq->tags && *nvmeq->tags)
++ 		blk_mq_all_tag_busy_iter(*nvmeq->tags, nvme_cancel_queue_ios, nvmeq);
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  	spin_unlock_irq(&nvmeq->q_lock);
+  }
+  
+@@@ -1555,6 -1589,60 +1797,63 @@@ static int nvme_shutdown_ctrl(struct nv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct blk_mq_ops nvme_mq_admin_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_admin_init_hctx,
++ 	.init_request	= nvme_admin_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static struct blk_mq_ops nvme_mq_ops = {
++ 	.queue_rq	= nvme_queue_rq,
++ 	.map_queue	= blk_mq_map_queue,
++ 	.init_hctx	= nvme_init_hctx,
++ 	.init_request	= nvme_init_request,
++ 	.timeout	= nvme_timeout,
++ };
++ 
++ static void nvme_dev_remove_admin(struct nvme_dev *dev)
++ {
++ 	if (dev->admin_q && !blk_queue_dying(dev->admin_q)) {
++ 		blk_cleanup_queue(dev->admin_q);
++ 		blk_mq_free_tag_set(&dev->admin_tagset);
++ 	}
++ }
++ 
++ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
++ {
++ 	if (!dev->admin_q) {
++ 		dev->admin_tagset.ops = &nvme_mq_admin_ops;
++ 		dev->admin_tagset.nr_hw_queues = 1;
++ 		dev->admin_tagset.queue_depth = NVME_AQ_DEPTH - 1;
++ 		dev->admin_tagset.reserved_tags = 1;
++ 		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
++ 		dev->admin_tagset.numa_node = dev_to_node(dev->dev);
++ 		dev->admin_tagset.cmd_size = nvme_cmd_size(dev);
++ 		dev->admin_tagset.driver_data = dev;
++ 
++ 		if (blk_mq_alloc_tag_set(&dev->admin_tagset))
++ 			return -ENOMEM;
++ 
++ 		dev->admin_q = blk_mq_init_queue(&dev->admin_tagset);
++ 		if (IS_ERR(dev->admin_q)) {
++ 			blk_mq_free_tag_set(&dev->admin_tagset);
++ 			return -ENOMEM;
++ 		}
++ 		if (!blk_get_queue(dev->admin_q)) {
++ 			nvme_dev_remove_admin(dev);
++ 			return -ENODEV;
++ 		}
++ 	} else
++ 		blk_mq_unfreeze_queue(dev->admin_q);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  static int nvme_configure_admin_queue(struct nvme_dev *dev)
+  {
+  	int result;
+@@@ -2848,6 -2702,22 +3147,25 @@@ static const struct file_operations nvm
+  	.compat_ioctl	= nvme_dev_ioctl,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_set_irq_hints(struct nvme_dev *dev)
++ {
++ 	struct nvme_queue *nvmeq;
++ 	int i;
++ 
++ 	for (i = 0; i < dev->online_queues; i++) {
++ 		nvmeq = dev->queues[i];
++ 
++ 		if (!nvmeq->tags || !(*nvmeq->tags))
++ 			continue;
++ 
++ 		irq_set_affinity_hint(dev->entry[nvmeq->cq_vector].vector,
++ 					blk_mq_tags_cpumask(*nvmeq->tags));
++ 	}
++ }
++ 
+++>>>>>>> 42483228d4c0 (NVMe: Remove hctx reliance for multi-namespace)
+  static int nvme_dev_start(struct nvme_dev *dev)
+  {
+  	int result;
+* Unmerged path drivers/block/nvme-core.c
