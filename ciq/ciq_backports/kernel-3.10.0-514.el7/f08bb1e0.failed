@@ -1,0 +1,129 @@
+sd: Fix excessive capacity printing on devices with blocks bigger than 512 bytes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Martin K. Petersen <martin.petersen@oracle.com>
+commit f08bb1e0dbdd0297258d0b8cd4dbfcc057e57b2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f08bb1e0.failed
+
+During revalidate we check whether device capacity has changed before we
+decide whether to output disk information or not.
+
+The check for old capacity failed to take into account that we scaled
+sdkp->capacity based on the reported logical block size. And therefore
+the capacity test would always fail for devices with sectors bigger than
+512 bytes and we would print several copies of the same discovery
+information.
+
+Avoid scaling sdkp->capacity and instead adjust the value on the fly
+when setting the block device capacity and generating fake C/H/S
+geometry.
+
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Cc: <stable@vger.kernel.org>
+	Reported-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Hannes Reinicke <hare@suse.de>
+	Reviewed-by: Ewan Milne <emilne@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f08bb1e0dbdd0297258d0b8cd4dbfcc057e57b2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.c
+diff --cc drivers/scsi/sd.c
+index 26f434ffa9f6,8401697ff6aa..000000000000
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@@ -2353,22 -2335,9 +2354,25 @@@ got_data
+  		}
+  	}
+  
+ -	if (sdkp->capacity > 0xffffffff)
+ +	if (sdkp->capacity > 0xffffffff) {
+  		sdp->use_16_for_rw = 1;
+ -
+ +		sdkp->max_xfer_blocks = SD_MAX_XFER_BLOCKS;
+ +	} else
+ +		sdkp->max_xfer_blocks = SD_DEF_XFER_BLOCKS;
+ +
+++<<<<<<< HEAD
+ +	/* Rescale capacity to 512-byte units */
+ +	if (sector_size == 4096)
+ +		sdkp->capacity <<= 3;
+ +	else if (sector_size == 2048)
+ +		sdkp->capacity <<= 2;
+ +	else if (sector_size == 1024)
+ +		sdkp->capacity <<= 1;
+ +	else if (sector_size == 256)
+ +		sdkp->capacity >>= 1;
+ +
+++=======
+++>>>>>>> f08bb1e0dbdd (sd: Fix excessive capacity printing on devices with blocks bigger than 512 bytes)
+  	blk_queue_physical_block_size(sdp->request_queue,
+  				      sdkp->physical_block_size);
+  	sdkp->device->sector_size = sector_size;
+@@@ -2893,13 -2864,31 +2897,13 @@@ static int sd_revalidate_disk(struct ge
+  	 */
+  	sd_set_flush_flag(sdkp);
+  
+ -	/* Initial block count limit based on CDB TRANSFER LENGTH field size. */
+ -	dev_max = sdp->use_16_for_rw ? SD_MAX_XFER_BLOCKS : SD_DEF_XFER_BLOCKS;
+ -
+ -	/* Some devices report a maximum block count for READ/WRITE requests. */
+ -	dev_max = min_not_zero(dev_max, sdkp->max_xfer_blocks);
+ -	q->limits.max_dev_sectors = logical_to_sectors(sdp, dev_max);
+ -
+ -	/*
+ -	 * Use the device's preferred I/O size for reads and writes
+ -	 * unless the reported value is unreasonably small, large, or
+ -	 * garbage.
+ -	 */
+ -	if (sdkp->opt_xfer_blocks &&
+ -	    sdkp->opt_xfer_blocks <= dev_max &&
+ -	    sdkp->opt_xfer_blocks <= SD_DEF_XFER_BLOCKS &&
+ -	    sdkp->opt_xfer_blocks * sdp->sector_size >= PAGE_CACHE_SIZE)
+ -		rw_max = q->limits.io_opt =
+ -			sdkp->opt_xfer_blocks * sdp->sector_size;
+ -	else
+ -		rw_max = BLK_DEF_MAX_SECTORS;
+ +	max_xfer = sdkp->max_xfer_blocks;
+ +	max_xfer <<= ilog2(sdp->sector_size) - 9;
+  
+ -	/* Combine with controller limits */
+ -	q->limits.max_sectors = min(rw_max, queue_max_hw_sectors(q));
+ +	sdkp->disk->queue->limits.max_sectors =
+ +		min_not_zero(queue_max_hw_sectors(sdkp->disk->queue), max_xfer);
+  
+- 	set_capacity(disk, sdkp->capacity);
++ 	set_capacity(disk, logical_to_sectors(sdp, sdkp->capacity));
+  	sd_config_write_same(sdkp);
+  	kfree(buffer);
+  
+* Unmerged path drivers/scsi/sd.c
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index ec5c656025d2..8224f2ff42c4 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -67,7 +67,7 @@ struct scsi_disk {
+ 	struct device	dev;
+ 	struct gendisk	*disk;
+ 	atomic_t	openers;
+-	sector_t	capacity;	/* size in 512-byte sectors */
++	sector_t	capacity;	/* size in logical blocks */
+ 	u32		max_xfer_blocks;
+ 	u32		max_ws_blocks;
+ 	u32		max_unmap_blocks;
+@@ -157,6 +157,11 @@ static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
+ 	return 0;
+ }
+ 
++static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blocks)
++{
++	return blocks << (ilog2(sdev->sector_size) - 9);
++}
++
+ /*
+  * A DIF-capable target device can be formatted with different
+  * protection schemes.  Currently 0 through 3 are defined:
