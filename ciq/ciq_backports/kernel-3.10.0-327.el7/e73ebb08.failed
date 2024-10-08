@@ -1,0 +1,262 @@
+tcp: stretch ACK fixes prep
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Neal Cardwell <ncardwell@google.com>
+commit e73ebb0881ea5534ce606c1d71b4ac44db5c6930
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e73ebb08.failed
+
+LRO, GRO, delayed ACKs, and middleboxes can cause "stretch ACKs" that
+cover more than the RFC-specified maximum of 2 packets. These stretch
+ACKs can cause serious performance shortfalls in common congestion
+control algorithms that were designed and tuned years ago with
+receiver hosts that were not using LRO or GRO, and were instead
+politely ACKing every other packet.
+
+This patch series fixes Reno and CUBIC to handle stretch ACKs.
+
+This patch prepares for the upcoming stretch ACK bug fix patches. It
+adds an "acked" parameter to tcp_cong_avoid_ai() to allow for future
+fixes to tcp_cong_avoid_ai() to correctly handle stretch ACKs, and
+changes all congestion control algorithms to pass in 1 for the ACKed
+count. It also changes tcp_slow_start() to return the number of packet
+ACK "credits" that were not processed in slow start mode, and can be
+processed by the congestion control module in additive increase mode.
+
+In future patches we will fix tcp_cong_avoid_ai() to handle stretch
+ACKs, and fix Reno and CUBIC handling of stretch ACKs in slow start
+and additive increase mode.
+
+	Reported-by: Eyal Perry <eyalpe@mellanox.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e73ebb0881ea5534ce606c1d71b4ac44db5c6930)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/ipv4/tcp_cong.c
+diff --cc include/net/tcp.h
+index 0373da38f3bc,9d9111ef43ae..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -828,26 -822,32 +828,40 @@@ struct tcp_congestion_ops 
+  	struct module 	*owner;
+  };
+  
+ -int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ -void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ -
+ +extern int tcp_register_congestion_control(struct tcp_congestion_ops *type);
+ +extern void tcp_unregister_congestion_control(struct tcp_congestion_ops *type);
+ +
+++<<<<<<< HEAD
+ +extern void tcp_init_congestion_control(struct sock *sk);
+ +extern void tcp_cleanup_congestion_control(struct sock *sk);
+ +extern int tcp_set_default_congestion_control(const char *name);
+ +extern void tcp_get_default_congestion_control(char *name);
+ +extern void tcp_get_available_congestion_control(char *buf, size_t len);
+ +extern void tcp_get_allowed_congestion_control(char *buf, size_t len);
+ +extern int tcp_set_allowed_congestion_control(char *allowed);
+ +extern int tcp_set_congestion_control(struct sock *sk, const char *name);
+ +extern void tcp_slow_start(struct tcp_sock *tp);
+ +extern void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
+++=======
++ void tcp_assign_congestion_control(struct sock *sk);
++ void tcp_init_congestion_control(struct sock *sk);
++ void tcp_cleanup_congestion_control(struct sock *sk);
++ int tcp_set_default_congestion_control(const char *name);
++ void tcp_get_default_congestion_control(char *name);
++ void tcp_get_available_congestion_control(char *buf, size_t len);
++ void tcp_get_allowed_congestion_control(char *buf, size_t len);
++ int tcp_set_allowed_congestion_control(char *allowed);
++ int tcp_set_congestion_control(struct sock *sk, const char *name);
++ u32 tcp_slow_start(struct tcp_sock *tp, u32 acked);
++ void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w, u32 acked);
+++>>>>>>> e73ebb0881ea (tcp: stretch ACK fixes prep)
+  
+ -u32 tcp_reno_ssthresh(struct sock *sk);
+ -void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 acked);
+ +extern struct tcp_congestion_ops tcp_init_congestion_ops;
+ +extern u32 tcp_reno_ssthresh(struct sock *sk);
+ +extern void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight);
+ +extern u32 tcp_reno_min_cwnd(const struct sock *sk);
+  extern struct tcp_congestion_ops tcp_reno;
+  
+ -static inline bool tcp_ca_needs_ecn(const struct sock *sk)
+ -{
+ -	const struct inet_connection_sock *icsk = inet_csk(sk);
+ -
+ -	return icsk->icsk_ca_ops->flags & TCP_CONG_NEEDS_ECN;
+ -}
+ -
+  static inline void tcp_set_ca_state(struct sock *sk, const u8 ca_state)
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+diff --cc net/ipv4/tcp_cong.c
+index 511547b93096,6826017c12d1..000000000000
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@@ -282,55 -282,25 +282,68 @@@ int tcp_set_congestion_control(struct s
+  	return err;
+  }
+  
+ -/* Slow start is used when congestion window is no greater than the slow start
+ - * threshold. We base on RFC2581 and also handle stretch ACKs properly.
+ - * We do not implement RFC3465 Appropriate Byte Counting (ABC) per se but
+ - * something better;) a packet is only considered (s)acked in its entirety to
+ - * defend the ACK attacks described in the RFC. Slow start processes a stretch
+ - * ACK of degree N as if N acks of degree 1 are received back to back except
+ - * ABC caps N to 2. Slow start exits when cwnd grows over ssthresh and
+ - * returns the leftover acks to adjust cwnd in congestion avoidance mode.
+ +/* RFC2861 Check whether we are limited by application or congestion window
+ + * This is the inverse of cwnd check in tcp_tso_should_defer
+   */
+++<<<<<<< HEAD
+ +bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+++=======
++ u32 tcp_slow_start(struct tcp_sock *tp, u32 acked)
+++>>>>>>> e73ebb0881ea (tcp: stretch ACK fixes prep)
+ +{
+ +	const struct tcp_sock *tp = tcp_sk(sk);
+ +	u32 left;
+ +
+++<<<<<<< HEAD
+ +	if (in_flight >= tp->snd_cwnd)
+ +		return true;
+ +
+ +	left = tp->snd_cwnd - in_flight;
+ +	if (sk_can_gso(sk) &&
+ +	    left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&
+ +	    left < tp->xmit_size_goal_segs)
+ +		return true;
+ +	return left <= tcp_max_tso_deferred_mss(tp);
+ +}
+ +EXPORT_SYMBOL_GPL(tcp_is_cwnd_limited);
+ +
+ +/*
+ + * Slow start is used when congestion window is less than slow start
+ + * threshold. This version implements the basic RFC2581 version
+ + * and optionally supports:
+ + * 	RFC3742 Limited Slow Start  	  - growth limited to max_ssthresh
+ + *	RFC3465 Appropriate Byte Counting - growth limited by bytes acknowledged
+ + */
+ +void tcp_slow_start(struct tcp_sock *tp)
+  {
+ -	u32 cwnd = tp->snd_cwnd + acked;
+ +	int cnt; /* increase in packets */
+ +	unsigned int delta = 0;
+ +	u32 snd_cwnd = tp->snd_cwnd;
+ +
+ +	if (unlikely(!snd_cwnd)) {
+ +		pr_err_once("snd_cwnd is nul, please report this bug.\n");
+ +		snd_cwnd = 1U;
+ +	}
+ +
+ +	if (sysctl_tcp_max_ssthresh > 0 && tp->snd_cwnd > sysctl_tcp_max_ssthresh)
+ +		cnt = sysctl_tcp_max_ssthresh >> 1;	/* limited slow start */
+ +	else
+ +		cnt = snd_cwnd;				/* exponential increase */
+  
+ +	tp->snd_cwnd_cnt += cnt;
+ +	while (tp->snd_cwnd_cnt >= snd_cwnd) {
+ +		tp->snd_cwnd_cnt -= snd_cwnd;
+ +		delta++;
+ +	}
+ +	tp->snd_cwnd = min(snd_cwnd + delta, tp->snd_cwnd_clamp);
+++=======
++ 	if (cwnd > tp->snd_ssthresh)
++ 		cwnd = tp->snd_ssthresh + 1;
++ 	acked -= cwnd - tp->snd_cwnd;
++ 	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
++ 
++ 	return acked;
+++>>>>>>> e73ebb0881ea (tcp: stretch ACK fixes prep)
+  }
+  EXPORT_SYMBOL_GPL(tcp_slow_start);
+  
+@@@ -363,10 -333,10 +376,10 @@@ void tcp_reno_cong_avoid(struct sock *s
+  
+  	/* In "safe" area, increase. */
+  	if (tp->snd_cwnd <= tp->snd_ssthresh)
+ -		tcp_slow_start(tp, acked);
+ +		tcp_slow_start(tp);
+  	/* In dangerous area, increase slowly. */
+  	else
+- 		tcp_cong_avoid_ai(tp, tp->snd_cwnd);
++ 		tcp_cong_avoid_ai(tp, tp->snd_cwnd, 1);
+  }
+  EXPORT_SYMBOL_GPL(tcp_reno_cong_avoid);
+  
+* Unmerged path include/net/tcp.h
+diff --git a/net/ipv4/tcp_bic.c b/net/ipv4/tcp_bic.c
+index f45e1c242440..7e44e3df75e4 100644
+--- a/net/ipv4/tcp_bic.c
++++ b/net/ipv4/tcp_bic.c
+@@ -152,7 +152,7 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 		tcp_slow_start(tp);
+ 	else {
+ 		bictcp_update(ca, tp->snd_cwnd);
+-		tcp_cong_avoid_ai(tp, ca->cnt);
++		tcp_cong_avoid_ai(tp, ca->cnt, 1);
+ 	}
+ 
+ }
+* Unmerged path net/ipv4/tcp_cong.c
+diff --git a/net/ipv4/tcp_cubic.c b/net/ipv4/tcp_cubic.c
+index e784aa6cee64..0d8f23947c97 100644
+--- a/net/ipv4/tcp_cubic.c
++++ b/net/ipv4/tcp_cubic.c
+@@ -318,7 +318,7 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 		tcp_slow_start(tp);
+ 	} else {
+ 		bictcp_update(ca, tp->snd_cwnd);
+-		tcp_cong_avoid_ai(tp, ca->cnt);
++		tcp_cong_avoid_ai(tp, ca->cnt, 1);
+ 	}
+ 
+ }
+diff --git a/net/ipv4/tcp_scalable.c b/net/ipv4/tcp_scalable.c
+index 8ce55b8aaec8..68147fadaf5e 100644
+--- a/net/ipv4/tcp_scalable.c
++++ b/net/ipv4/tcp_scalable.c
+@@ -25,7 +25,8 @@ static void tcp_scalable_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 	if (tp->snd_cwnd <= tp->snd_ssthresh)
+ 		tcp_slow_start(tp);
+ 	else
+-		tcp_cong_avoid_ai(tp, min(tp->snd_cwnd, TCP_SCALABLE_AI_CNT));
++		tcp_cong_avoid_ai(tp, min(tp->snd_cwnd, TCP_SCALABLE_AI_CNT),
++				  1);
+ }
+ 
+ static u32 tcp_scalable_ssthresh(struct sock *sk)
+diff --git a/net/ipv4/tcp_veno.c b/net/ipv4/tcp_veno.c
+index b4d1858be550..27cce2db54e0 100644
+--- a/net/ipv4/tcp_veno.c
++++ b/net/ipv4/tcp_veno.c
+@@ -159,7 +159,7 @@ static void tcp_veno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 				/* In the "non-congestive state", increase cwnd
+ 				 *  every rtt.
+ 				 */
+-				tcp_cong_avoid_ai(tp, tp->snd_cwnd);
++				tcp_cong_avoid_ai(tp, tp->snd_cwnd, 1);
+ 			} else {
+ 				/* In the "congestive state", increase cwnd
+ 				 * every other rtt.
+diff --git a/net/ipv4/tcp_yeah.c b/net/ipv4/tcp_yeah.c
+index 05c3b6f0e8e1..1374a3bf897a 100644
+--- a/net/ipv4/tcp_yeah.c
++++ b/net/ipv4/tcp_yeah.c
+@@ -94,7 +94,7 @@ static void tcp_yeah_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 
+ 	} else {
+ 		/* Reno */
+-		tcp_cong_avoid_ai(tp, tp->snd_cwnd);
++		tcp_cong_avoid_ai(tp, tp->snd_cwnd, 1);
+ 	}
+ 
+ 	/* The key players are v_vegas.beg_snd_una and v_beg_snd_nxt.
