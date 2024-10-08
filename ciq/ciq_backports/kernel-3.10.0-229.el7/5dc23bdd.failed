@@ -1,0 +1,162 @@
+ext4: remove ext4_ioend_wait()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 5dc23bdd5f846ef868e82f789dfd9b13093f9ba6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/5dc23bdd.failed
+
+Now that we clear PageWriteback after extent conversion, there's no
+need to wait for io_end processing in ext4_evict_inode().  Running
+AIO/DIO keeps file reference until aio_complete() is called so
+ext4_evict_inode() cannot be called.  For io_end structures resulting
+from buffered IO waiting is happening because we wait for
+PageWriteback in truncate_inode_pages().
+
+	Reviewed-by: Zheng Liu <wenqing.lz@taobao.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit 5dc23bdd5f846ef868e82f789dfd9b13093f9ba6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+#	fs/ext4/page-io.c
+diff --cc fs/ext4/inode.c
+index 1f3c615673a9,442c5d2e0978..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -213,8 -214,9 +213,14 @@@ void ext4_evict_inode(struct inode *ino
+  			jbd2_complete_transaction(journal, commit_tid);
+  			filemap_write_and_wait(&inode->i_data);
+  		}
+++<<<<<<< HEAD
+ +		truncate_inode_pages_final(&inode->i_data);
+ +		ext4_ioend_shutdown(inode);
+++=======
++ 		truncate_inode_pages(&inode->i_data, 0);
++ 
++ 		WARN_ON(atomic_read(&EXT4_I(inode)->i_ioend_count));
+++>>>>>>> 5dc23bdd5f84 (ext4: remove ext4_ioend_wait())
+  		goto no_delete;
+  	}
+  
+@@@ -223,9 -225,9 +229,14 @@@
+  
+  	if (ext4_should_order_data(inode))
+  		ext4_begin_ordered_truncate(inode, 0);
+++<<<<<<< HEAD
+ +	truncate_inode_pages_final(&inode->i_data);
+ +	ext4_ioend_shutdown(inode);
+++=======
++ 	truncate_inode_pages(&inode->i_data, 0);
+++>>>>>>> 5dc23bdd5f84 (ext4: remove ext4_ioend_wait())
+  
++ 	WARN_ON(atomic_read(&EXT4_I(inode)->i_ioend_count));
+  	if (is_bad_inode(inode))
+  		goto no_delete;
+  
+diff --cc fs/ext4/page-io.c
+index 44bfba203e32,ce8c15a7eabc..000000000000
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@@ -47,22 -46,64 +47,83 @@@ void ext4_exit_pageio(void
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * This function is called by ext4_evict_inode() to make sure there is
+ + * no more pending I/O completion work left to do.
+ + */
+ +void ext4_ioend_shutdown(struct inode *inode)
+ +{
+ +	wait_queue_head_t *wq = ext4_ioend_wq(inode);
+ +
+ +	wait_event(*wq, (atomic_read(&EXT4_I(inode)->i_ioend_count) == 0));
+ +	/*
+ +	 * We need to make sure the work structure is finished being
+ +	 * used before we let the inode get destroyed.
+ +	 */
+ +	if (work_pending(&EXT4_I(inode)->i_rsv_conversion_work))
+ +		cancel_work_sync(&EXT4_I(inode)->i_rsv_conversion_work);
+ +	if (work_pending(&EXT4_I(inode)->i_unrsv_conversion_work))
+ +		cancel_work_sync(&EXT4_I(inode)->i_unrsv_conversion_work);
+++=======
++  * Print an buffer I/O error compatible with the fs/buffer.c.  This
++  * provides compatibility with dmesg scrapers that look for a specific
++  * buffer I/O error message.  We really need a unified error reporting
++  * structure to userspace ala Digital Unix's uerf system, but it's
++  * probably not going to happen in my lifetime, due to LKML politics...
++  */
++ static void buffer_io_error(struct buffer_head *bh)
++ {
++ 	char b[BDEVNAME_SIZE];
++ 	printk(KERN_ERR "Buffer I/O error on device %s, logical block %llu\n",
++ 			bdevname(bh->b_bdev, b),
++ 			(unsigned long long)bh->b_blocknr);
++ }
++ 
++ static void ext4_finish_bio(struct bio *bio)
++ {
++ 	int i;
++ 	int error = !test_bit(BIO_UPTODATE, &bio->bi_flags);
++ 
++ 	for (i = 0; i < bio->bi_vcnt; i++) {
++ 		struct bio_vec *bvec = &bio->bi_io_vec[i];
++ 		struct page *page = bvec->bv_page;
++ 		struct buffer_head *bh, *head;
++ 		unsigned bio_start = bvec->bv_offset;
++ 		unsigned bio_end = bio_start + bvec->bv_len;
++ 		unsigned under_io = 0;
++ 		unsigned long flags;
++ 
++ 		if (!page)
++ 			continue;
++ 
++ 		if (error) {
++ 			SetPageError(page);
++ 			set_bit(AS_EIO, &page->mapping->flags);
++ 		}
++ 		bh = head = page_buffers(page);
++ 		/*
++ 		 * We check all buffers in the page under BH_Uptodate_Lock
++ 		 * to avoid races with other end io clearing async_write flags
++ 		 */
++ 		local_irq_save(flags);
++ 		bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
++ 		do {
++ 			if (bh_offset(bh) < bio_start ||
++ 			    bh_offset(bh) + bh->b_size > bio_end) {
++ 				if (buffer_async_write(bh))
++ 					under_io++;
++ 				continue;
++ 			}
++ 			clear_buffer_async_write(bh);
++ 			if (error)
++ 				buffer_io_error(bh);
++ 		} while ((bh = bh->b_this_page) != head);
++ 		bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
++ 		local_irq_restore(flags);
++ 		if (!under_io)
++ 			end_page_writeback(page);
++ 	}
+++>>>>>>> 5dc23bdd5f84 (ext4: remove ext4_ioend_wait())
+  }
+  
+  static void ext4_release_io_end(ext4_io_end_t *io_end)
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 36c22c987577..5c186982a4a2 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2665,7 +2665,6 @@ extern int ext4_move_extents(struct file *o_filp, struct file *d_filp,
+ /* page-io.c */
+ extern int __init ext4_init_pageio(void);
+ extern void ext4_exit_pageio(void);
+-extern void ext4_ioend_shutdown(struct inode *);
+ extern ext4_io_end_t *ext4_init_io_end(struct inode *inode, gfp_t flags);
+ extern ext4_io_end_t *ext4_get_io_end(ext4_io_end_t *io_end);
+ extern int ext4_put_io_end(ext4_io_end_t *io_end);
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/ext4/page-io.c
