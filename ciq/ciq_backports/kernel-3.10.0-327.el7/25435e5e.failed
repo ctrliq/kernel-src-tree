@@ -1,0 +1,160 @@
+gfs2: allow quota_check and inplace_reserve to return available blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Abhi Das <adas@redhat.com>
+commit 25435e5ed611f310dda889940cbc4c45b3ecd9ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/25435e5e.failed
+
+struct gfs2_alloc_parms is passed to gfs2_quota_check() and
+gfs2_inplace_reserve() with ap->target containing the number of
+blocks being requested for allocation in the current operation.
+
+We add a new field to struct gfs2_alloc_parms called 'allowed'.
+gfs2_quota_check() and gfs2_inplace_reserve() return the max
+blocks allowed by quota and the max blocks allowed by the chosen
+rgrp respectively in 'allowed'.
+
+A new field 'min_target', when non-zero, tells gfs2_quota_check()
+and gfs2_inplace_reserve() to not return -EDQUOT/-ENOSPC when
+there are atleast 'min_target' blocks allowable/available. The
+assumption is that the caller is ok with just 'min_target' blocks
+and will likely proceed with allocating them.
+
+	Signed-off-by: Abhi Das <adas@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+(cherry picked from commit 25435e5ed611f310dda889940cbc4c45b3ecd9ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/quota.c
+#	fs/gfs2/rgrp.c
+diff --cc fs/gfs2/incore.h
+index 0b1540793164,58b75abf6ab2..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -291,8 -301,10 +291,14 @@@ struct gfs2_blkreserv 
+   * to the allocation code.
+   */
+  struct gfs2_alloc_parms {
+++<<<<<<< HEAD
+ +	u32 target;
+++=======
++ 	u64 target;
++ 	u32 min_target;
+++>>>>>>> 25435e5ed611 (gfs2: allow quota_check and inplace_reserve to return available blocks)
+  	u32 aflags;
++ 	u64 allowed;
+  };
+  
+  enum {
+diff --cc fs/gfs2/quota.c
+index c9e262bf7ba3,55614685a31c..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -1085,7 -1094,25 +1085,29 @@@ static int print_message(struct gfs2_qu
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid)
+++=======
++ /**
++  * gfs2_quota_check - check if allocating new blocks will exceed quota
++  * @ip:  The inode for which this check is being performed
++  * @uid: The uid to check against
++  * @gid: The gid to check against
++  * @ap:  The allocation parameters. ap->target contains the requested
++  *       blocks. ap->min_target, if set, contains the minimum blks
++  *       requested.
++  *
++  * Returns: 0 on success.
++  *                  min_req = ap->min_target ? ap->min_target : ap->target;
++  *                  quota must allow atleast min_req blks for success and
++  *                  ap->allowed is set to the number of blocks allowed
++  *
++  *          -EDQUOT otherwise, quota violation. ap->allowed is set to number
++  *                  of blocks available.
++  */
++ int gfs2_quota_check(struct gfs2_inode *ip, kuid_t uid, kgid_t gid,
++ 		     struct gfs2_alloc_parms *ap)
+++>>>>>>> 25435e5ed611 (gfs2: allow quota_check and inplace_reserve to return available blocks)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+  	struct gfs2_quota_data *qd;
+@@@ -1111,18 -1141,24 +1136,36 @@@
+  		value += qd->qd_change;
+  		spin_unlock(&qd_lock);
+  
+++<<<<<<< HEAD
+ +		if (be64_to_cpu(qd->qd_qb.qb_limit) && (s64)be64_to_cpu(qd->qd_qb.qb_limit) < value) {
+ +			print_message(qd, "exceeded");
+ +			quota_send_warning(qd->qd_id,
+ +					   sdp->sd_vfs->s_dev, QUOTA_NL_BHARDWARN);
+ +
+ +			error = -EDQUOT;
+ +			break;
+ +		} else if (be64_to_cpu(qd->qd_qb.qb_warn) &&
+ +			   (s64)be64_to_cpu(qd->qd_qb.qb_warn) < value &&
+++=======
++ 		if (limit > 0 && (limit - value) < ap->allowed)
++ 			ap->allowed = limit - value;
++ 		/* If we can't meet the target */
++ 		if (limit && limit < (value + (s64)ap->target)) {
++ 			/* If no min_target specified or we don't meet
++ 			 * min_target, return -EDQUOT */
++ 			if (!ap->min_target || ap->min_target > ap->allowed) {
++ 				print_message(qd, "exceeded");
++ 				quota_send_warning(qd->qd_id,
++ 						   sdp->sd_vfs->s_dev,
++ 						   QUOTA_NL_BHARDWARN);
++ 				error = -EDQUOT;
++ 				break;
++ 			}
++ 		} else if (warn && warn < value &&
+++>>>>>>> 25435e5ed611 (gfs2: allow quota_check and inplace_reserve to return available blocks)
+  			   time_after_eq(jiffies, qd->qd_last_warn +
+- 					 gfs2_tune_get(sdp,
+- 						gt_quota_warn_period) * HZ)) {
++ 					 gfs2_tune_get(sdp, gt_quota_warn_period)
++ 					 * HZ)) {
+  			quota_send_warning(qd->qd_id,
+  					   sdp->sd_vfs->s_dev, QUOTA_NL_BSOFTWARN);
+  			error = print_message(qd, "warning");
+diff --cc fs/gfs2/rgrp.c
+index 343571dc8841,6af2396a317c..000000000000
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@@ -1981,7 -2020,7 +1989,11 @@@ int gfs2_inplace_reserve(struct gfs2_in
+  		/* Skip unuseable resource groups */
+  		if ((rs->rs_rbm.rgd->rd_flags & (GFS2_RGF_NOALLOC |
+  						 GFS2_RDF_ERROR)) ||
+++<<<<<<< HEAD
+ +		    (ap && (ap->target > rs->rs_rbm.rgd->rd_extfail_pt)))
+++=======
++ 		    (loops == 0 && ap->target > rs->rs_rbm.rgd->rd_extfail_pt))
+++>>>>>>> 25435e5ed611 (gfs2: allow quota_check and inplace_reserve to return available blocks)
+  			goto skip_rgrp;
+  
+  		if (sdp->sd_args.ar_rgrplvb)
+* Unmerged path fs/gfs2/incore.h
+* Unmerged path fs/gfs2/quota.c
+* Unmerged path fs/gfs2/rgrp.c
+diff --git a/fs/gfs2/rgrp.h b/fs/gfs2/rgrp.h
+index fa653ce050c8..29a412e222e9 100644
+--- a/fs/gfs2/rgrp.h
++++ b/fs/gfs2/rgrp.h
+@@ -41,7 +41,8 @@ extern void gfs2_rgrp_go_unlock(struct gfs2_holder *gh);
+ extern struct gfs2_alloc *gfs2_alloc_get(struct gfs2_inode *ip);
+ 
+ #define GFS2_AF_ORLOV 1
+-extern int gfs2_inplace_reserve(struct gfs2_inode *ip, const struct gfs2_alloc_parms *ap);
++extern int gfs2_inplace_reserve(struct gfs2_inode *ip,
++				struct gfs2_alloc_parms *ap);
+ extern void gfs2_inplace_release(struct gfs2_inode *ip);
+ 
+ extern int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *n,
