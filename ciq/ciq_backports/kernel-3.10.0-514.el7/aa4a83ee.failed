@@ -1,0 +1,382 @@
+net: sctp: fix suboptimal edge-case on non-active active/retrans path selection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] sctp: fix suboptimal edge-case on non-active active/retrans path selection (Xin Long) [1333696]
+Rebuild_FUZZ: 96.73%
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit aa4a83ee8bbc08342c4acfd59ef234cac51a1eef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/aa4a83ee.failed
+
+In SCTP, selection of active (T.ACT) and retransmission (T.RET)
+transports is being done whenever transport control operations
+(UP, DOWN, PF, ...) are engaged through sctp_assoc_control_transport().
+
+Commits 4c47af4d5eb2 ("net: sctp: rework multihoming retransmission
+path selection to rfc4960") and a7288c4dd509 ("net: sctp: improve
+sctp_select_active_and_retran_path selection") have both improved
+it towards a more fine-grained and optimal path selection.
+
+Currently, the selection algorithm for T.ACT and T.RET is as follows:
+
+1) Elect the two most recently used ACTIVE transports T1, T2 for
+   T.ACT, T.RET, where T.ACT<-T1 and T1 is most recently used
+2) In case primary path T.PRI not in {T1, T2} but ACTIVE, set
+   T.ACT<-T.PRI and T.RET<-T1
+3) If only T1 is ACTIVE from the set, set T.ACT<-T1 and T.RET<-T1
+4) If none is ACTIVE, set T.ACT<-best(T.PRI, T.RET, T3) where
+   T3 is the most recently used (if avail) in PF, set T.RET<-T.PRI
+
+Prior to above commits, 4) was simply a camp on T.ACT<-T.PRI and
+T.RET<-T.PRI, ignoring possible paths in PF. Camping on T.PRI is
+still slightly suboptimal as it can lead to the following scenario:
+
+Setup:
+        <A>                                <B>
+    T1: p1p1 (10.0.10.10) <==>  .'`)  <==> p1p1 (10.0.10.12)  <= T.PRI
+    T2: p1p2 (10.0.10.20) <==> (_ . ) <==> p1p2 (10.0.10.22)
+
+    net.sctp.rto_min = 1000
+    net.sctp.path_max_retrans = 2
+    net.sctp.pf_retrans = 0
+    net.sctp.hb_interval = 1000
+
+T.PRI is permanently down, T2 is put briefly into PF state (e.g. due to
+link flapping). Here, the first time transmission is sent over PF path
+T2 as it's the only non-INACTIVE path, but the retransmitted data-chunks
+are sent over the INACTIVE path T1 (T.PRI), which is not good.
+
+After the patch, it's choosing better transports in both cases by
+modifying step 4):
+
+4) If none is ACTIVE, set T.ACT_new<-best(T.ACT_old, T3) where T3 is
+   the most recently used (if avail) in PF, set T.RET<-T.ACT_new
+
+This will still select a best possible path in PF if available (which
+can also include T.PRI/T.RET), and set both T.ACT/T.RET to it.
+
+In case sctp_assoc_control_transport() *just* put T.ACT_old into INACTIVE
+as it transitioned from ACTIVE->PF->INACTIVE and stays in INACTIVE just
+for a very short while before going back ACTIVE, it will guarantee that
+this path will be reselected for T.ACT/T.RET since T3 (PF) is not
+available.
+
+Previously, this was not possible, as we would only select between T.PRI
+and T.RET, and a possible T3 would be NULL due to the fact that we have
+just transitioned T3 in sctp_assoc_control_transport() from PF->INACTIVE
+and would select a suboptimal path when T.PRI/T.RET have worse properties.
+
+In the case that T.ACT_old permanently went to INACTIVE during this
+transition and there's no PF path available, plus T.PRI and T.RET are
+INACTIVE as well, we would now camp on T.ACT_old, but if everything is
+being INACTIVE there's really not much we can do except hoping for a
+successful HB to bring one of the transports back up again and, thus
+cause a new selection through sctp_assoc_control_transport().
+
+Now both tests work fine:
+
+Case 1:
+
+ 1. T1 S(ACTIVE) T.ACT
+    T2 S(ACTIVE) T.RET
+
+ 2. T1 S(ACTIVE) T.ACT, T.RET
+    T2 S(PF)
+
+ 3. T1 S(ACTIVE) T.ACT, T.RET
+    T2 S(INACTIVE)
+
+ 5. T1 S(PF) T.ACT, T.RET
+    T2 S(INACTIVE)
+
+[ 5.1 T1 S(INACTIVE) T.ACT, T.RET
+      T2 S(INACTIVE) ]
+
+ 6. T1 S(ACTIVE) T.ACT, T.RET
+    T2 S(INACTIVE)
+
+ 7. T1 S(ACTIVE) T.ACT
+    T2 S(ACTIVE) T.RET
+
+Case 2:
+
+ 1. T1 S(ACTIVE) T.ACT
+    T2 S(ACTIVE) T.RET
+
+ 2. T1 S(PF)
+    T2 S(ACTIVE) T.ACT, T.RET
+
+ 3. T1 S(INACTIVE)
+    T2 S(ACTIVE) T.ACT, T.RET
+
+ 5. T1 S(INACTIVE)
+    T2 S(PF) T.ACT, T.RET
+
+[ 5.1 T1 S(INACTIVE)
+      T2 S(INACTIVE) T.ACT, T.RET ]
+
+ 6. T1 S(INACTIVE)
+    T2 S(ACTIVE) T.ACT, T.RET
+
+ 7. T1 S(ACTIVE) T.ACT
+    T2 S(ACTIVE) T.RET
+
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Acked-by: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aa4a83ee8bbc08342c4acfd59ef234cac51a1eef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/associola.c
+diff --cc net/sctp/associola.c
+index 95613ef42a0c,a88b8524846e..000000000000
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@@ -1295,72 -1187,190 +1295,93 @@@ void sctp_assoc_update(struct sctp_asso
+  }
+  
+  /* Update the retran path for sending a retransmitted packet.
+ - * See also RFC4960, 6.4. Multi-Homed SCTP Endpoints:
+ - *
+ - *   When there is outbound data to send and the primary path
+ - *   becomes inactive (e.g., due to failures), or where the
+ - *   SCTP user explicitly requests to send data to an
+ - *   inactive destination transport address, before reporting
+ - *   an error to its ULP, the SCTP endpoint should try to send
+ - *   the data to an alternate active destination transport
+ - *   address if one exists.
+ - *
+ - *   When retransmitting data that timed out, if the endpoint
+ - *   is multihomed, it should consider each source-destination
+ - *   address pair in its retransmission selection policy.
+ - *   When retransmitting timed-out data, the endpoint should
+ - *   attempt to pick the most divergent source-destination
+ - *   pair from the original source-destination pair to which
+ - *   the packet was transmitted.
+ - *
+ - *   Note: Rules for picking the most divergent source-destination
+ - *   pair are an implementation decision and are not specified
+ - *   within this document.
+ - *
+ - * Our basic strategy is to round-robin transports in priorities
+ - * according to sctp_state_prio_map[] e.g., if no such
+ - * transport with state SCTP_ACTIVE exists, round-robin through
+ - * SCTP_UNKNOWN, etc. You get the picture.
+ + * Round-robin through the active transports, else round-robin
+ + * through the inactive transports as this is the next best thing
+ + * we can try.
+   */
+ -static const u8 sctp_trans_state_to_prio_map[] = {
+ -	[SCTP_ACTIVE]	= 3,	/* best case */
+ -	[SCTP_UNKNOWN]	= 2,
+ -	[SCTP_PF]	= 1,
+ -	[SCTP_INACTIVE] = 0,	/* worst case */
+ -};
+ -
+ -static u8 sctp_trans_score(const struct sctp_transport *trans)
+ -{
+ -	return sctp_trans_state_to_prio_map[trans->state];
+ -}
+ -
+ -static struct sctp_transport *sctp_trans_elect_tie(struct sctp_transport *trans1,
+ -						   struct sctp_transport *trans2)
+ -{
+ -	if (trans1->error_count > trans2->error_count) {
+ -		return trans2;
+ -	} else if (trans1->error_count == trans2->error_count &&
+ -		   ktime_after(trans2->last_time_heard,
+ -			       trans1->last_time_heard)) {
+ -		return trans2;
+ -	} else {
+ -		return trans1;
+ -	}
+ -}
+ -
+ -static struct sctp_transport *sctp_trans_elect_best(struct sctp_transport *curr,
+ -						    struct sctp_transport *best)
+ -{
+ -	u8 score_curr, score_best;
+ -
+ -	if (best == NULL || curr == best)
+ -		return curr;
+ -
+ -	score_curr = sctp_trans_score(curr);
+ -	score_best = sctp_trans_score(best);
+ -
+ -	/* First, try a score-based selection if both transport states
+ -	 * differ. If we're in a tie, lets try to make a more clever
+ -	 * decision here based on error counts and last time heard.
+ -	 */
+ -	if (score_curr > score_best)
+ -		return curr;
+ -	else if (score_curr == score_best)
+ -		return sctp_trans_elect_tie(curr, best);
+ -	else
+ -		return best;
+ -}
+ -
+  void sctp_assoc_update_retran_path(struct sctp_association *asoc)
+  {
+ -	struct sctp_transport *trans = asoc->peer.retran_path;
+ -	struct sctp_transport *trans_next = NULL;
+ +	struct sctp_transport *t, *next;
+ +	struct list_head *head = &asoc->peer.transport_addr_list;
+ +	struct list_head *pos;
+  
+ -	/* We're done as we only have the one and only path. */
+  	if (asoc->peer.transport_count == 1)
+  		return;
+ -	/* If active_path and retran_path are the same and active,
+ -	 * then this is the only active path. Use it.
+ -	 */
+ -	if (asoc->peer.active_path == asoc->peer.retran_path &&
+ -	    asoc->peer.active_path->state == SCTP_ACTIVE)
+ -		return;
+  
+ -	/* Iterate from retran_path's successor back to retran_path. */
+ -	for (trans = list_next_entry(trans, transports); 1;
+ -	     trans = list_next_entry(trans, transports)) {
+ -		/* Manually skip the head element. */
+ -		if (&trans->transports == &asoc->peer.transport_addr_list)
+ -			continue;
+ -		if (trans->state == SCTP_UNCONFIRMED)
+ -			continue;
+ -		trans_next = sctp_trans_elect_best(trans, trans_next);
+ -		/* Active is good enough for immediate return. */
+ -		if (trans_next->state == SCTP_ACTIVE)
+ -			break;
+ -		/* We've reached the end, time to update path. */
+ -		if (trans == asoc->peer.retran_path)
+ -			break;
+ -	}
+ +	/* Find the next transport in a round-robin fashion. */
+ +	t = asoc->peer.retran_path;
+ +	pos = &t->transports;
+ +	next = NULL;
+  
+ -	asoc->peer.retran_path = trans_next;
+ +	while (1) {
+ +		/* Skip the head. */
+ +		if (pos->next == head)
+ +			pos = head->next;
+ +		else
+ +			pos = pos->next;
+  
+ -	pr_debug("%s: association:%p updated new path to addr:%pISpc\n",
+ -		 __func__, asoc, &asoc->peer.retran_path->ipaddr.sa);
+ -}
+ +		t = list_entry(pos, struct sctp_transport, transports);
+  
+ -static void sctp_select_active_and_retran_path(struct sctp_association *asoc)
+ -{
+ -	struct sctp_transport *trans, *trans_pri = NULL, *trans_sec = NULL;
+ -	struct sctp_transport *trans_pf = NULL;
+ -
+ -	/* Look for the two most recently used active transports. */
+ -	list_for_each_entry(trans, &asoc->peer.transport_addr_list,
+ -			    transports) {
+ -		/* Skip uninteresting transports. */
+ -		if (trans->state == SCTP_INACTIVE ||
+ -		    trans->state == SCTP_UNCONFIRMED)
+ -			continue;
+ -		/* Keep track of the best PF transport from our
+ -		 * list in case we don't find an active one.
+ +		/* We have exhausted the list, but didn't find any
+ +		 * other active transports.  If so, use the next
+ +		 * transport.
+  		 */
+ -		if (trans->state == SCTP_PF) {
+ -			trans_pf = sctp_trans_elect_best(trans, trans_pf);
+ -			continue;
+ -		}
+ -		/* For active transports, pick the most recent ones. */
+ -		if (trans_pri == NULL ||
+ -		    ktime_after(trans->last_time_heard,
+ -				trans_pri->last_time_heard)) {
+ -			trans_sec = trans_pri;
+ -			trans_pri = trans;
+ -		} else if (trans_sec == NULL ||
+ -			   ktime_after(trans->last_time_heard,
+ -				       trans_sec->last_time_heard)) {
+ -			trans_sec = trans;
+ +		if (t == asoc->peer.retran_path) {
+ +			t = next;
+ +			break;
+  		}
+ -	}
+  
+ -	/* RFC 2960 6.4 Multi-Homed SCTP Endpoints
+ -	 *
+ -	 * By default, an endpoint should always transmit to the primary
+ -	 * path, unless the SCTP user explicitly specifies the
+ -	 * destination transport address (and possibly source transport
+ -	 * address) to use. [If the primary is active but not most recent,
+ -	 * bump the most recently used transport.]
+ -	 */
+ -	if ((asoc->peer.primary_path->state == SCTP_ACTIVE ||
+ -	     asoc->peer.primary_path->state == SCTP_UNKNOWN) &&
+ -	     asoc->peer.primary_path != trans_pri) {
+ -		trans_sec = trans_pri;
+ -		trans_pri = asoc->peer.primary_path;
+ +		/* Try to find an active transport. */
+ +
+ +		if ((t->state == SCTP_ACTIVE) ||
+ +		    (t->state == SCTP_UNKNOWN)) {
+ +			break;
+ +		} else {
+ +			/* Keep track of the next transport in case
+ +			 * we don't find any active transport.
+ +			 */
+ +			if (t->state != SCTP_UNCONFIRMED && !next)
+ +				next = t;
+ +		}
+  	}
+  
+ +	if (t)
+ +		asoc->peer.retran_path = t;
+ +	else
+ +		t = asoc->peer.retran_path;
+ +
+++<<<<<<< HEAD
+ +	SCTP_DEBUG_PRINTK_IPADDR("sctp_assoc_update_retran_path:association"
+ +				 " %p addr: ",
+ +				 " port: %d\n",
+ +				 asoc,
+ +				 (&t->ipaddr),
+ +				 ntohs(t->ipaddr.v4.sin_port));
+++=======
++ 	/* We did not find anything useful for a possible retransmission
++ 	 * path; either primary path that we found is the the same as
++ 	 * the current one, or we didn't generally find an active one.
++ 	 */
++ 	if (trans_sec == NULL)
++ 		trans_sec = trans_pri;
++ 
++ 	/* If we failed to find a usable transport, just camp on the
++ 	 * active or pick a PF iff it's the better choice.
++ 	 */
++ 	if (trans_pri == NULL) {
++ 		trans_pri = sctp_trans_elect_best(asoc->peer.active_path, trans_pf);
++ 		trans_sec = trans_pri;
++ 	}
++ 
++ 	/* Set the active and retran transports. */
++ 	asoc->peer.active_path = trans_pri;
++ 	asoc->peer.retran_path = trans_sec;
+++>>>>>>> aa4a83ee8bbc (net: sctp: fix suboptimal edge-case on non-active active/retrans path selection)
+  }
+  
+ -struct sctp_transport *
+ -sctp_assoc_choose_alter_transport(struct sctp_association *asoc,
+ -				  struct sctp_transport *last_sent_to)
+ +/* Choose the transport for sending retransmit packet.  */
+ +struct sctp_transport *sctp_assoc_choose_alter_transport(
+ +	struct sctp_association *asoc, struct sctp_transport *last_sent_to)
+  {
+  	/* If this is the first time packet is sent, use the active path,
+  	 * else use the retran path. If the last packet was sent over the
+* Unmerged path net/sctp/associola.c
