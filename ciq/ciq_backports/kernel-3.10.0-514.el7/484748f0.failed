@@ -1,0 +1,352 @@
+slab: infrastructure for bulk object allocation and freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Lameter <cl@linux.com>
+commit 484748f0b65a1950b2b93f444a2287e8dd2cedd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/484748f0.failed
+
+Add the basic infrastructure for alloc/free operations on pointer arrays.
+It includes a generic function in the common slab code that is used in
+this infrastructure patch to create the unoptimized functionality for slab
+bulk operations.
+
+Allocators can then provide optimized allocation functions for situations
+in which large numbers of objects are needed.  These optimization may
+avoid taking locks repeatedly and bypass metadata creation if all objects
+in slab pages can be used to provide the objects required.
+
+Allocators can extend the skeletons provided and add their own code to the
+bulk alloc and free functions.  They can keep the generic allocation and
+freeing and just fall back to those if optimizations would not work (like
+for example when debugging is on).
+
+	Signed-off-by: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 484748f0b65a1950b2b93f444a2287e8dd2cedd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/slab.h
+diff --cc include/linux/slab.h
+index 45cf2dc0539d,7e37d448ed91..000000000000
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@@ -297,92 -284,102 +297,122 @@@ static __always_inline int kmalloc_inde
+  	/* Will never be reached. Needed because the compiler may complain */
+  	return -1;
+  }
+ +
+ +#ifdef CONFIG_SLAB
+ +#include <linux/slab_def.h>
+ +#elif defined(CONFIG_SLUB)
+ +#include <linux/slub_def.h>
+ +#else
+ +#error "Unknown slab allocator"
+ +#endif
+ +
+ +/*
+ + * Determine size used for the nth kmalloc cache.
+ + * return size or 0 if a kmalloc cache for that
+ + * size does not exist
+ + */
+ +static __always_inline int kmalloc_size(int n)
+ +{
+ +	if (n > 2)
+ +		return 1 << n;
+ +
+ +	if (n == 1 && KMALLOC_MIN_SIZE <= 32)
+ +		return 96;
+ +
+ +	if (n == 2 && KMALLOC_MIN_SIZE <= 64)
+ +		return 192;
+ +
+ +	return 0;
+ +}
+  #endif /* !CONFIG_SLOB */
+  
+++<<<<<<< HEAD
+ +/*
+ + * Setting ARCH_SLAB_MINALIGN in arch headers allows a different alignment.
+ + * Intended for arches that get misalignment faults even for 64 bit integer
+ + * aligned buffers.
+ + */
+ +#ifndef ARCH_SLAB_MINALIGN
+ +#define ARCH_SLAB_MINALIGN __alignof__(unsigned long long)
+++=======
++ void *__kmalloc(size_t size, gfp_t flags);
++ void *kmem_cache_alloc(struct kmem_cache *, gfp_t flags);
++ void kmem_cache_free(struct kmem_cache *, void *);
++ 
++ /*
++  * Bulk allocation and freeing operations. These are accellerated in an
++  * allocator specific way to avoid taking locks repeatedly or building
++  * metadata structures unnecessarily.
++  *
++  * Note that interrupts must be enabled when calling these functions.
++  */
++ void kmem_cache_free_bulk(struct kmem_cache *, size_t, void **);
++ bool kmem_cache_alloc_bulk(struct kmem_cache *, gfp_t, size_t, void **);
++ 
++ #ifdef CONFIG_NUMA
++ void *__kmalloc_node(size_t size, gfp_t flags, int node);
++ void *kmem_cache_alloc_node(struct kmem_cache *, gfp_t flags, int node);
++ #else
++ static __always_inline void *__kmalloc_node(size_t size, gfp_t flags, int node)
++ {
++ 	return __kmalloc(size, flags);
++ }
++ 
++ static __always_inline void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t flags, int node)
++ {
++ 	return kmem_cache_alloc(s, flags);
++ }
+++>>>>>>> 484748f0b65a (slab: infrastructure for bulk object allocation and freeing)
+  #endif
+ +/*
+ + * This is the main placeholder for memcg-related information in kmem caches.
+ + * struct kmem_cache will hold a pointer to it, so the memory cost while
+ + * disabled is 1 pointer. The runtime cost while enabled, gets bigger than it
+ + * would otherwise be if that would be bundled in kmem_cache: we'll need an
+ + * extra pointer chase. But the trade off clearly lays in favor of not
+ + * penalizing non-users.
+ + *
+ + * Both the root cache and the child caches will have it. For the root cache,
+ + * this will hold a dynamically allocated array large enough to hold
+ + * information about the currently limited memcgs in the system.
+ + *
+ + * Child caches will hold extra metadata needed for its operation. Fields are:
+ + *
+ + * @memcg: pointer to the memcg this cache belongs to
+ + * @list: list_head for the list of all caches in this memcg
+ + * @root_cache: pointer to the global, root cache, this cache was derived from
+ + * @dead: set to true after the memcg dies; the cache may still be around.
+ + * @nr_pages: number of pages that belongs to this cache.
+ + * @destroy: worker to be called whenever we are ready, or believe we may be
+ + *           ready, to destroy this cache.
+ + */
+ +struct memcg_cache_params {
+ +	bool is_root_cache;
+ +	union {
+ +		struct kmem_cache *memcg_caches[0];
+ +		struct {
+ +			struct mem_cgroup *memcg;
+ +			struct list_head list;
+ +			struct kmem_cache *root_cache;
+ +			bool dead;
+ +			atomic_t nr_pages;
+ +			struct work_struct destroy;
+ +		};
+ +	};
+ +};
+  
+ -#ifdef CONFIG_TRACING
+ -extern void *kmem_cache_alloc_trace(struct kmem_cache *, gfp_t, size_t);
+ -
+ -#ifdef CONFIG_NUMA
+ -extern void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -					   gfp_t gfpflags,
+ -					   int node, size_t size);
+ -#else
+ -static __always_inline void *
+ -kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -			      gfp_t gfpflags,
+ -			      int node, size_t size)
+ -{
+ -	return kmem_cache_alloc_trace(s, gfpflags, size);
+ -}
+ -#endif /* CONFIG_NUMA */
+ -
+ -#else /* CONFIG_TRACING */
+ -static __always_inline void *kmem_cache_alloc_trace(struct kmem_cache *s,
+ -		gfp_t flags, size_t size)
+ -{
+ -	void *ret = kmem_cache_alloc(s, flags);
+ -
+ -	kasan_kmalloc(s, ret, size);
+ -	return ret;
+ -}
+ -
+ -static __always_inline void *
+ -kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ -			      gfp_t gfpflags,
+ -			      int node, size_t size)
+ -{
+ -	void *ret = kmem_cache_alloc_node(s, gfpflags, node);
+ -
+ -	kasan_kmalloc(s, ret, size);
+ -	return ret;
+ -}
+ -#endif /* CONFIG_TRACING */
+ -
+ -extern void *kmalloc_order(size_t size, gfp_t flags, unsigned int order);
+ +int memcg_update_all_caches(int num_memcgs);
+  
+ -#ifdef CONFIG_TRACING
+ -extern void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order);
+ -#else
+ -static __always_inline void *
+ -kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ -{
+ -	return kmalloc_order(size, flags, order);
+ -}
+ -#endif
+ -
+ -static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ -{
+ -	unsigned int order = get_order(size);
+ -	return kmalloc_order_trace(size, flags, order);
+ -}
+ +struct seq_file;
+ +int cache_show(struct kmem_cache *s, struct seq_file *m);
+ +void print_slabinfo_header(struct seq_file *m);
+  
+  /**
+ - * kmalloc - allocate memory
+ - * @size: how many bytes of memory are required.
+ + * kmalloc_array - allocate memory for an array.
+ + * @n: number of elements.
+ + * @size: element size.
+   * @flags: the type of memory to allocate.
+   *
+ - * kmalloc is the normal method of allocating memory
+ - * for objects smaller than page size in the kernel.
+ - *
+   * The @flags argument may be one of:
+   *
+   * %GFP_USER - Allocate memory on behalf of user.  May sleep.
+* Unmerged path include/linux/slab.h
+diff --git a/mm/slab.c b/mm/slab.c
+index 2343cb092452..8ba22a61c5a0 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -3628,6 +3628,19 @@ void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc);
+ 
++void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++{
++	__kmem_cache_free_bulk(s, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_free_bulk);
++
++bool kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++								void **p)
++{
++	return __kmem_cache_alloc_bulk(s, flags, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++
+ #ifdef CONFIG_TRACING
+ void *
+ kmem_cache_alloc_trace(struct kmem_cache *cachep, gfp_t flags, size_t size)
+diff --git a/mm/slab.h b/mm/slab.h
+index 4d6d836247dd..41fd9cc82ab5 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -113,6 +113,15 @@ void slabinfo_show_stats(struct seq_file *m, struct kmem_cache *s);
+ ssize_t slabinfo_write(struct file *file, const char __user *buffer,
+ 		       size_t count, loff_t *ppos);
+ 
++/*
++ * Generic implementation of bulk operations
++ * These are useful for situations in which the allocator cannot
++ * perform optimizations. In that case segments of the objecct listed
++ * may be allocated or freed using these operations.
++ */
++void __kmem_cache_free_bulk(struct kmem_cache *, size_t, void **);
++bool __kmem_cache_alloc_bulk(struct kmem_cache *, gfp_t, size_t, void **);
++
+ #ifdef CONFIG_MEMCG_KMEM
+ static inline bool is_root_cache(struct kmem_cache *s)
+ {
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index a45665bac0bc..c7c12ecb48d9 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -81,6 +81,29 @@ static inline int kmem_cache_sanity_check(struct mem_cgroup *memcg,
+ }
+ #endif
+ 
++void __kmem_cache_free_bulk(struct kmem_cache *s, size_t nr, void **p)
++{
++	size_t i;
++
++	for (i = 0; i < nr; i++)
++		kmem_cache_free(s, p[i]);
++}
++
++bool __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t nr,
++								void **p)
++{
++	size_t i;
++
++	for (i = 0; i < nr; i++) {
++		void *x = p[i] = kmem_cache_alloc(s, flags);
++		if (!x) {
++			__kmem_cache_free_bulk(s, i, p);
++			return false;
++		}
++	}
++	return true;
++}
++
+ #ifdef CONFIG_MEMCG_KMEM
+ int memcg_update_all_caches(int num_memcgs)
+ {
+diff --git a/mm/slob.c b/mm/slob.c
+index eeed4a05a2ef..6cef85f73477 100644
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@ -594,6 +594,19 @@ void kmem_cache_free(struct kmem_cache *c, void *b)
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
++void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++{
++	__kmem_cache_free_bulk(s, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_free_bulk);
++
++bool kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++								void **p)
++{
++	return __kmem_cache_alloc_bulk(s, flags, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++
+ int __kmem_cache_shutdown(struct kmem_cache *c)
+ {
+ 	/* No way to check for remaining objects */
+diff --git a/mm/slub.c b/mm/slub.c
+index 9bb60eec298f..71012a4c5447 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2659,6 +2659,20 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
++void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++{
++	__kmem_cache_free_bulk(s, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_free_bulk);
++
++bool kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++								void **p)
++{
++	return __kmem_cache_alloc_bulk(s, flags, size, p);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++
++
+ /*
+  * Object placement in a slab is made very easy because we always start at
+  * offset 0. If we tune the size of the object to the alignment then we can
