@@ -1,0 +1,155 @@
+cxgb4: Enhance driver to update FW, when FW is too old
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 21d11bd6f0f15c9c782d1f09557bb71f582a3f53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/21d11bd6.failed
+
+t4_check_fw_version() can return several error codes (-EINVAL, -EBUSY,
+-EAGAIN). The present code sets the adapter state to UNINIT only if its
+an EFAULT. In all the error cases set the adapter to uninitialized state.
+
+In t4_check_fw_version() if call to t4_get_fw_version() fails, repeat the
+operation a few times before returning failure.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 21d11bd6f0f15c9c782d1f09557bb71f582a3f53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 2a3e5627b439,c29227ee9ee8..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -5566,6 -3696,10 +5566,13 @@@ static int adap_init0(struct adapter *a
+  	 */
+  	t4_get_fw_version(adap, &adap->params.fw_vers);
+  	t4_get_tp_version(adap, &adap->params.tp_vers);
+++<<<<<<< HEAD
+++=======
++ 	ret = t4_check_fw_version(adap);
++ 	/* If firmware is too old (not supported by driver) force an update. */
++ 	if (ret)
++ 		state = DEV_STATE_UNINIT;
+++>>>>>>> 21d11bd6f0f1 (cxgb4: Enhance driver to update FW, when FW is too old)
+  	if ((adap->flags & MASTER_PF) && state != DEV_STATE_INIT) {
+  		struct fw_info *fw_info;
+  		struct fw_hdr *card_fw;
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 4234b8c917e7,cf61a5869c6e..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@@ -984,6 -2934,102 +984,105 @@@ int t4_get_tp_version(struct adapter *a
+  			     1, vers, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *	t4_get_exprom_version - return the Expansion ROM version (if any)
++  *	@adapter: the adapter
++  *	@vers: where to place the version
++  *
++  *	Reads the Expansion ROM header from FLASH and returns the version
++  *	number (if present) through the @vers return value pointer.  We return
++  *	this in the Firmware Version Format since it's convenient.  Return
++  *	0 on success, -ENOENT if no Expansion ROM is present.
++  */
++ int t4_get_exprom_version(struct adapter *adap, u32 *vers)
++ {
++ 	struct exprom_header {
++ 		unsigned char hdr_arr[16];	/* must start with 0x55aa */
++ 		unsigned char hdr_ver[4];	/* Expansion ROM version */
++ 	} *hdr;
++ 	u32 exprom_header_buf[DIV_ROUND_UP(sizeof(struct exprom_header),
++ 					   sizeof(u32))];
++ 	int ret;
++ 
++ 	ret = t4_read_flash(adap, FLASH_EXP_ROM_START,
++ 			    ARRAY_SIZE(exprom_header_buf), exprom_header_buf,
++ 			    0);
++ 	if (ret)
++ 		return ret;
++ 
++ 	hdr = (struct exprom_header *)exprom_header_buf;
++ 	if (hdr->hdr_arr[0] != 0x55 || hdr->hdr_arr[1] != 0xaa)
++ 		return -ENOENT;
++ 
++ 	*vers = (FW_HDR_FW_VER_MAJOR_V(hdr->hdr_ver[0]) |
++ 		 FW_HDR_FW_VER_MINOR_V(hdr->hdr_ver[1]) |
++ 		 FW_HDR_FW_VER_MICRO_V(hdr->hdr_ver[2]) |
++ 		 FW_HDR_FW_VER_BUILD_V(hdr->hdr_ver[3]));
++ 	return 0;
++ }
++ 
++ /**
++  *	t4_check_fw_version - check if the FW is supported with this driver
++  *	@adap: the adapter
++  *
++  *	Checks if an adapter's FW is compatible with the driver.  Returns 0
++  *	if there's exact match, a negative error if the version could not be
++  *	read or there's a major version mismatch
++  */
++ int t4_check_fw_version(struct adapter *adap)
++ {
++ 	int i, ret, major, minor, micro;
++ 	int exp_major, exp_minor, exp_micro;
++ 	unsigned int chip_version = CHELSIO_CHIP_VERSION(adap->params.chip);
++ 
++ 	ret = t4_get_fw_version(adap, &adap->params.fw_vers);
++ 	/* Try multiple times before returning error */
++ 	for (i = 0; (ret == -EBUSY || ret == -EAGAIN) && i < 3; i++)
++ 		ret = t4_get_fw_version(adap, &adap->params.fw_vers);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	major = FW_HDR_FW_VER_MAJOR_G(adap->params.fw_vers);
++ 	minor = FW_HDR_FW_VER_MINOR_G(adap->params.fw_vers);
++ 	micro = FW_HDR_FW_VER_MICRO_G(adap->params.fw_vers);
++ 
++ 	switch (chip_version) {
++ 	case CHELSIO_T4:
++ 		exp_major = T4FW_MIN_VERSION_MAJOR;
++ 		exp_minor = T4FW_MIN_VERSION_MINOR;
++ 		exp_micro = T4FW_MIN_VERSION_MICRO;
++ 		break;
++ 	case CHELSIO_T5:
++ 		exp_major = T5FW_MIN_VERSION_MAJOR;
++ 		exp_minor = T5FW_MIN_VERSION_MINOR;
++ 		exp_micro = T5FW_MIN_VERSION_MICRO;
++ 		break;
++ 	case CHELSIO_T6:
++ 		exp_major = T6FW_MIN_VERSION_MAJOR;
++ 		exp_minor = T6FW_MIN_VERSION_MINOR;
++ 		exp_micro = T6FW_MIN_VERSION_MICRO;
++ 		break;
++ 	default:
++ 		dev_err(adap->pdev_dev, "Unsupported chip type, %x\n",
++ 			adap->chip);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (major < exp_major || (major == exp_major && minor < exp_minor) ||
++ 	    (major == exp_major && minor == exp_minor && micro < exp_micro)) {
++ 		dev_err(adap->pdev_dev,
++ 			"Card has firmware version %u.%u.%u, minimum "
++ 			"supported firmware is %u.%u.%u.\n", major, minor,
++ 			micro, exp_major, exp_minor, exp_micro);
++ 		return -EFAULT;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> 21d11bd6f0f1 (cxgb4: Enhance driver to update FW, when FW is too old)
+  /* Is the given firmware API compatible with the one the driver was compiled
+   * with?
+   */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
