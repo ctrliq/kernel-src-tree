@@ -1,0 +1,105 @@
+vfio-pci: Use mutex around open, release, and remove
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 61d792562b53c610f9fe917f2bbc22218aa39c22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/61d79256.failed
+
+Serializing open/release allows us to fix a refcnt error if we fail
+to enable the device and lets us prevent devices from being unbound
+or opened, giving us an opportunity to do bus resets on release.  No
+restriction added to serialize binding devices to vfio-pci while the
+mutex is held though.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 61d792562b53c610f9fe917f2bbc22218aa39c22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci.c
+diff --cc drivers/vfio/pci/vfio_pci.c
+index a22e87f88fa7,c9d756b7ee9e..000000000000
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@@ -163,28 -165,45 +165,61 @@@ static void vfio_pci_release(void *devi
+  {
+  	struct vfio_pci_device *vdev = device_data;
+  
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&vdev->refcnt))
+++=======
++ 	mutex_lock(&driver_lock);
++ 
++ 	if (!(--vdev->refcnt)) {
++ 		vfio_spapr_pci_eeh_release(vdev->pdev);
+++>>>>>>> 61d792562b53 (vfio-pci: Use mutex around open, release, and remove)
+  		vfio_pci_disable(vdev);
+ -	}
+  
++ 	mutex_unlock(&driver_lock);
++ 
+  	module_put(THIS_MODULE);
+  }
+  
+  static int vfio_pci_open(void *device_data)
+  {
+  	struct vfio_pci_device *vdev = device_data;
+++<<<<<<< HEAD
+++=======
++ 	int ret = 0;
+++>>>>>>> 61d792562b53 (vfio-pci: Use mutex around open, release, and remove)
+  
+  	if (!try_module_get(THIS_MODULE))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	if (atomic_inc_return(&vdev->refcnt) == 1) {
+ +		int ret = vfio_pci_enable(vdev);
+++=======
++ 	mutex_lock(&driver_lock);
++ 
++ 	if (!vdev->refcnt) {
++ 		ret = vfio_pci_enable(vdev);
++ 		if (ret)
++ 			goto error;
++ 
++ 		ret = vfio_spapr_pci_eeh_open(vdev->pdev);
+++>>>>>>> 61d792562b53 (vfio-pci: Use mutex around open, release, and remove)
+  		if (ret) {
+ -			vfio_pci_disable(vdev);
+ -			goto error;
+ +			module_put(THIS_MODULE);
+ +			return ret;
+  		}
+  	}
+++<<<<<<< HEAD
+ +
+ +	return 0;
+++=======
++ 	vdev->refcnt++;
++ error:
++ 	mutex_unlock(&driver_lock);
++ 	if (ret)
++ 		module_put(THIS_MODULE);
++ 	return ret;
+++>>>>>>> 61d792562b53 (vfio-pci: Use mutex around open, release, and remove)
+  }
+  
+  static int vfio_pci_get_irq_count(struct vfio_pci_device *vdev, int irq_type)
+* Unmerged path drivers/vfio/pci/vfio_pci.c
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 9c6d5d0f3b02..31e7a30196ab 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -55,7 +55,7 @@ struct vfio_pci_device {
+ 	bool			bardirty;
+ 	bool			has_vga;
+ 	struct pci_saved_state	*pci_saved_state;
+-	atomic_t		refcnt;
++	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
+ };
+ 
