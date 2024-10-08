@@ -1,0 +1,118 @@
+ipv6: update Destination Cache entries when gateway turn into host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Duan Jiong <duanj.fnst@cn.fujitsu.com>
+commit be7a010d6fa33dca9327ad8e91844278dfd1e712
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/be7a010d.failed
+
+RFC 4861 states in 7.2.5:
+
+	The IsRouter flag in the cache entry MUST be set based on the
+         Router flag in the received advertisement.  In those cases
+         where the IsRouter flag changes from TRUE to FALSE as a result
+         of this update, the node MUST remove that router from the
+         Default Router List and update the Destination Cache entries
+         for all destinations using that neighbor as a router as
+         specified in Section 7.3.3.  This is needed to detect when a
+         node that is used as a router stops forwarding packets due to
+         being configured as a host.
+
+Currently, when dealing with NA Message which IsRouter flag changes from
+TRUE to FALSE, the kernel only removes router from the Default Router List,
+and don't update the Destination Cache entries.
+
+Now in order to update those Destination Cache entries, i introduce
+function rt6_clean_tohost().
+
+	Signed-off-by: Duan Jiong <duanj.fnst@cn.fujitsu.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit be7a010d6fa33dca9327ad8e91844278dfd1e712)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_route.h
+diff --cc include/net/ip6_route.h
+index 2b786b7e3585,216cecce65e9..000000000000
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@@ -145,10 -123,11 +145,18 @@@ struct rt6_rtnl_dump_arg 
+  	struct net *net;
+  };
+  
+++<<<<<<< HEAD
+ +extern int rt6_dump_route(struct rt6_info *rt, void *p_arg);
+ +extern void rt6_ifdown(struct net *net, struct net_device *dev);
+ +extern void rt6_mtu_change(struct net_device *dev, unsigned int mtu);
+ +extern void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
+++=======
++ int rt6_dump_route(struct rt6_info *rt, void *p_arg);
++ void rt6_ifdown(struct net *net, struct net_device *dev);
++ void rt6_mtu_change(struct net_device *dev, unsigned int mtu);
++ void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
++ void rt6_clean_tohost(struct net *net, struct in6_addr *gateway);
+++>>>>>>> be7a010d6fa3 (ipv6: update Destination Cache entries when gateway turn into host)
+  
+  
+  /*
+* Unmerged path include/net/ip6_route.h
+diff --git a/net/ipv6/ndisc.c b/net/ipv6/ndisc.c
+index ae7c23f6bf32..72bd4506c52e 100644
+--- a/net/ipv6/ndisc.c
++++ b/net/ipv6/ndisc.c
+@@ -852,7 +852,7 @@ out:
+ static void ndisc_recv_na(struct sk_buff *skb)
+ {
+ 	struct nd_msg *msg = (struct nd_msg *)skb_transport_header(skb);
+-	const struct in6_addr *saddr = &ipv6_hdr(skb)->saddr;
++	struct in6_addr *saddr = &ipv6_hdr(skb)->saddr;
+ 	const struct in6_addr *daddr = &ipv6_hdr(skb)->daddr;
+ 	u8 *lladdr = NULL;
+ 	u32 ndoptlen = skb_tail_pointer(skb) - (skb_transport_header(skb) +
+@@ -945,10 +945,7 @@ static void ndisc_recv_na(struct sk_buff *skb)
+ 			/*
+ 			 * Change: router to host
+ 			 */
+-			struct rt6_info *rt;
+-			rt = rt6_get_dflt_router(saddr, dev);
+-			if (rt)
+-				ip6_del_rt(rt);
++			rt6_clean_tohost(dev_net(dev),  saddr);
+ 		}
+ 
+ out:
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 35dcf004a256..6fb57ee0943a 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2247,6 +2247,27 @@ void rt6_remove_prefsrc(struct inet6_ifaddr *ifp)
+ 	fib6_clean_all(net, fib6_remove_prefsrc, 0, &adni);
+ }
+ 
++#define RTF_RA_ROUTER		(RTF_ADDRCONF | RTF_DEFAULT | RTF_GATEWAY)
++#define RTF_CACHE_GATEWAY	(RTF_GATEWAY | RTF_CACHE)
++
++/* Remove routers and update dst entries when gateway turn into host. */
++static int fib6_clean_tohost(struct rt6_info *rt, void *arg)
++{
++	struct in6_addr *gateway = (struct in6_addr *)arg;
++
++	if ((((rt->rt6i_flags & RTF_RA_ROUTER) == RTF_RA_ROUTER) ||
++	     ((rt->rt6i_flags & RTF_CACHE_GATEWAY) == RTF_CACHE_GATEWAY)) &&
++	     ipv6_addr_equal(gateway, &rt->rt6i_gateway)) {
++		return -1;
++	}
++	return 0;
++}
++
++void rt6_clean_tohost(struct net *net, struct in6_addr *gateway)
++{
++	fib6_clean_all(net, fib6_clean_tohost, gateway);
++}
++
+ struct arg_dev_net {
+ 	struct net_device *dev;
+ 	struct net *net;
