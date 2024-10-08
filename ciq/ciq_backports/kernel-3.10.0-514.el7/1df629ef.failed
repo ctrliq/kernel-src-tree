@@ -1,0 +1,681 @@
+mei: support for fixed address clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit 1df629ef4d553cc2bebde565462b36465521284f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1df629ef.failed
+
+Fixed address is simplified FW client that doesn't require
+connection and doesn't support flow control.
+So it can be only one host client per fixed FW client.
+Fixed client access is available only for drivers on mei bus,
+connection from user-space is blocked.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 1df629ef4d553cc2bebde565462b36465521284f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/client.h
+#	drivers/misc/mei/hbm.c
+#	drivers/misc/mei/interrupt.c
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,36706705dfdc..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -448,6 -730,120 +448,123 @@@ bool mei_hbuf_acquire(struct mei_devic
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * mei_cl_set_disconnected - set disconnected state and clear
++  *   associated states and resources
++  *
++  * @cl: host client
++  */
++ void mei_cl_set_disconnected(struct mei_cl *cl)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 
++ 	if (cl->state == MEI_FILE_DISCONNECTED ||
++ 	    cl->state == MEI_FILE_INITIALIZING)
++ 		return;
++ 
++ 	cl->state = MEI_FILE_DISCONNECTED;
++ 	mei_io_list_flush(&dev->ctrl_rd_list, cl);
++ 	mei_io_list_flush(&dev->ctrl_wr_list, cl);
++ 	cl->mei_flow_ctrl_creds = 0;
++ 	cl->timer_count = 0;
++ 
++ 	if (!cl->me_cl)
++ 		return;
++ 
++ 	if (!WARN_ON(cl->me_cl->connect_count == 0))
++ 		cl->me_cl->connect_count--;
++ 
++ 	if (cl->me_cl->connect_count == 0)
++ 		cl->me_cl->mei_flow_ctrl_creds = 0;
++ 
++ 	mei_me_cl_put(cl->me_cl);
++ 	cl->me_cl = NULL;
++ }
++ 
++ static int mei_cl_set_connecting(struct mei_cl *cl, struct mei_me_client *me_cl)
++ {
++ 	if (!mei_me_cl_get(me_cl))
++ 		return -ENOENT;
++ 
++ 	/* only one connection is allowed for fixed address clients */
++ 	if (me_cl->props.fixed_address) {
++ 		if (me_cl->connect_count) {
++ 			mei_me_cl_put(me_cl);
++ 			return -EBUSY;
++ 		}
++ 	}
++ 
++ 	cl->me_cl = me_cl;
++ 	cl->state = MEI_FILE_CONNECTING;
++ 	cl->me_cl->connect_count++;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * mei_cl_send_disconnect - send disconnect request
++  *
++  * @cl: host client
++  * @cb: callback block
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ static int mei_cl_send_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb)
++ {
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev = cl->dev;
++ 
++ 	ret = mei_hbm_cl_disconnect_req(dev, cl);
++ 	cl->status = ret;
++ 	if (ret) {
++ 		cl->state = MEI_FILE_DISCONNECT_REPLY;
++ 		return ret;
++ 	}
++ 
++ 	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
++ 	cl->timer_count = MEI_CONNECT_TIMEOUT;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * mei_cl_irq_disconnect - processes close related operation from
++  *	interrupt thread context - send disconnect request
++  *
++  * @cl: client
++  * @cb: callback block.
++  * @cmpl_list: complete list.
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
++ 			    struct mei_cl_cb *cmpl_list)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 	u32 msg_slots;
++ 	int slots;
++ 	int ret;
++ 
++ 	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
++ 	slots = mei_hbuf_empty_slots(dev);
++ 
++ 	if (slots < msg_slots)
++ 		return -EMSGSIZE;
++ 
++ 	ret = mei_cl_send_disconnect(cl, cb);
++ 	if (ret)
++ 		list_move_tail(&cb->list, &cmpl_list->list);
++ 
++ 	return ret;
++ }
++ 
++ 
++ 
++ /**
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+   * mei_cl_disconnect - disconnect host client from the me one
+   *
+   * @cl: host client
+@@@ -469,12 -865,17 +586,21 @@@ int mei_cl_disconnect(struct mei_cl *cl
+  
+  	cl_dbg(dev, cl, "disconnecting");
+  
+ -	if (!mei_cl_is_connected(cl))
+ +	if (cl->state != MEI_FILE_DISCONNECTING)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+++=======
++ 	if (mei_cl_is_fixed_address(cl)) {
++ 		mei_cl_set_disconnected(cl);
++ 		return 0;
++ 	}
++ 
++ 	rets = pm_runtime_get(dev->dev);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+  		return rets;
+  	}
+@@@ -578,20 -1031,28 +704,37 @@@ int mei_cl_connect(struct mei_cl *cl, s
+  
+  	dev = cl->dev;
+  
+++<<<<<<< HEAD
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+++=======
++ 	rets = mei_cl_set_connecting(cl, me_cl);
++ 	if (rets)
++ 		return rets;
++ 
++ 	if (mei_cl_is_fixed_address(cl)) {
++ 		cl->state = MEI_FILE_CONNECTED;
++ 		return 0;
++ 	}
++ 
++ 	rets = pm_runtime_get(dev->dev);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+- 		return rets;
++ 		goto nortpm;
+  	}
+  
+ -	cb = mei_io_cb_init(cl, MEI_FOP_CONNECT, file);
+ -	rets = cb ? 0 : -ENOMEM;
+ -	if (rets)
+ +	cb = mei_io_cb_init(cl, file);
+ +	if (!cb) {
+ +		rets = -ENOMEM;
+  		goto out;
+ +	}
+  
+++<<<<<<< HEAD
+ +	cb->fop_type = MEI_FOP_CONNECT;
+++=======
++ 	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  
+  	/* run hbuf acquire last so we don't have to undo */
+  	if (!mei_cl_is_other_connecting(cl) && mei_hbuf_acquire(dev)) {
+@@@ -625,13 -1075,17 +768,21 @@@
+  	}
+  
+  	rets = cl->status;
+ +
+  out:
+  	cl_dbg(dev, cl, "rpm: autosuspend\n");
+ -	pm_runtime_mark_last_busy(dev->dev);
+ -	pm_runtime_put_autosuspend(dev->dev);
+ +	pm_runtime_mark_last_busy(&dev->pdev->dev);
+ +	pm_runtime_put_autosuspend(&dev->pdev->dev);
+  
+  	mei_io_cb_free(cb);
+++<<<<<<< HEAD
+++=======
++ 
++ nortpm:
++ 	if (!mei_cl_is_connected(cl))
++ 		mei_cl_set_disconnected(cl);
++ 
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	return rets;
+  }
+  
+@@@ -646,32 -1129,24 +797,51 @@@
+   */
+  int mei_cl_flow_ctrl_creds(struct mei_cl *cl)
+  {
+++<<<<<<< HEAD
+ +	struct mei_device *dev;
+ +	struct mei_me_client *me_cl;
+ +	int id;
+ +
+ +	if (WARN_ON(!cl || !cl->dev))
+++=======
++ 	int rets;
++ 
++ 	if (WARN_ON(!cl || !cl->me_cl))
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  		return -EINVAL;
+  
+ +	dev = cl->dev;
+ +
+ +	if (!dev->me_clients_num)
+ +		return 0;
+ +
+  	if (cl->mei_flow_ctrl_creds > 0)
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0) {
+ +		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+ +		return id;
+ +	}
+ +
+ +	me_cl = &dev->me_clients[id];
+ +	if (me_cl->mei_flow_ctrl_creds) {
+ +		if (WARN_ON(me_cl->props.single_recv_buf == 0))
+ +			return -EINVAL;
+ +		return 1;
+++=======
++ 	if (mei_cl_is_fixed_address(cl)) {
++ 		rets = mei_cl_read_start(cl, mei_cl_mtu(cl), NULL);
++ 		if (rets && rets != -EBUSY)
++ 			return rets;
++ 		return 1;
++ 	}
++ 
++ 	if (mei_cl_is_single_recv_buf(cl)) {
++ 		if (cl->me_cl->mei_flow_ctrl_creds > 0)
++ 			return 1;
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	}
+  	return 0;
+  }
+@@@ -688,26 -1162,16 +858,34 @@@
+   */
+  int mei_cl_flow_ctrl_reduce(struct mei_cl *cl)
+  {
+ -	if (WARN_ON(!cl || !cl->me_cl))
+ +	struct mei_device *dev;
+ +	struct mei_me_client *me_cl;
+ +	int id;
+ +
+ +	if (WARN_ON(!cl || !cl->dev))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	dev = cl->dev;
+ +
+ +	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (id < 0) {
+ +		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+ +		return id;
+ +	}
+ +
+ +	me_cl = &dev->me_clients[id];
+ +	if (me_cl->props.single_recv_buf != 0) {
+ +		if (WARN_ON(me_cl->mei_flow_ctrl_creds <= 0))
+++=======
++ 	if (mei_cl_is_fixed_address(cl))
++ 		return 0;
++ 
++ 	if (mei_cl_is_single_recv_buf(cl)) {
++ 		if (WARN_ON(cl->me_cl->mei_flow_ctrl_creds <= 0))
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  			return -EINVAL;
+ -		cl->me_cl->mei_flow_ctrl_creds--;
+ +		me_cl->mei_flow_ctrl_creds--;
+  	} else {
+  		if (WARN_ON(cl->mei_flow_ctrl_creds <= 0))
+  			return -EINVAL;
+@@@ -738,54 -1203,49 +916,78 @@@ int mei_cl_read_start(struct mei_cl *cl
+  	if (!mei_cl_is_connected(cl))
+  		return -ENODEV;
+  
+ -	/* HW currently supports only one pending read */
+ -	if (!list_empty(&cl->rd_pending))
+ +	if (cl->read_cb) {
+ +		cl_dbg(dev, cl, "read is pending.\n");
+  		return -EBUSY;
+ -
+ -	if (!mei_me_cl_is_active(cl->me_cl)) {
+ -		cl_err(dev, cl, "no such me client\n");
+ +	}
+ +	i = mei_me_cl_by_id(dev, cl->me_client_id);
+ +	if (i < 0) {
+ +		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+  		return  -ENOTTY;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* always allocate at least client max message */
++ 	length = max_t(size_t, length, mei_cl_mtu(cl));
++ 	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_READ, fp);
++ 	if (!cb)
++ 		return -ENOMEM;
++ 
++ 	if (mei_cl_is_fixed_address(cl)) {
++ 		list_add_tail(&cb->list, &cl->rd_pending);
++ 		return 0;
++ 	}
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  
+ -	rets = pm_runtime_get(dev->dev);
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+  	if (rets < 0 && rets != -EINPROGRESS) {
+ -		pm_runtime_put_noidle(dev->dev);
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+  		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+- 		return rets;
++ 		goto nortpm;
+  	}
+  
+++<<<<<<< HEAD
+ +	cb = mei_io_cb_init(cl, NULL);
+ +	if (!cb) {
+ +		rets = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	/* always allocate at least client max message */
+ +	length = max_t(size_t, length, dev->me_clients[i].props.max_msg_length);
+ +	rets = mei_io_cb_alloc_resp_buf(cb, length);
+ +	if (rets)
+ +		goto out;
+ +
+ +	cb->fop_type = MEI_FOP_READ;
+++=======
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	if (mei_hbuf_acquire(dev)) {
+ -		rets = mei_hbm_cl_flow_control_req(dev, cl);
+ -		if (rets < 0)
+ +		if (mei_hbm_cl_flow_control_req(dev, cl)) {
+ +			rets = -ENODEV;
+  			goto out;
+ +		}
+  
+ -		list_add_tail(&cb->list, &cl->rd_pending);
+ +		list_add_tail(&cb->list, &dev->read_list.list);
+  	} else {
++ 		rets = 0;
+  		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+  	}
+  
+ +	cl->read_cb = cb;
+ +
+  out:
+  	cl_dbg(dev, cl, "rpm: autosuspend\n");
+++<<<<<<< HEAD
+ +	pm_runtime_mark_last_busy(&dev->pdev->dev);
+ +	pm_runtime_put_autosuspend(&dev->pdev->dev);
+ +
+++=======
++ 	pm_runtime_mark_last_busy(dev->dev);
++ 	pm_runtime_put_autosuspend(dev->dev);
++ nortpm:
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	if (rets)
+  		mei_io_cb_free(cb);
+  
+@@@ -833,8 -1293,8 +1035,13 @@@ int mei_cl_irq_write(struct mei_cl *cl
+  	len = buf->size - cb->buf_idx;
+  	msg_slots = mei_data2slots(len);
+  
+++<<<<<<< HEAD
+ +	mei_hdr.host_addr = cl->host_client_id;
+ +	mei_hdr.me_addr = cl->me_client_id;
+++=======
++ 	mei_hdr.host_addr = mei_cl_host_addr(cl);
++ 	mei_hdr.me_addr = mei_cl_me_id(cl);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	mei_hdr.reserved = 0;
+  	mei_hdr.internal = cb->internal;
+  
+@@@ -916,8 -1377,8 +1123,13 @@@ int mei_cl_write(struct mei_cl *cl, str
+  	cb->buf_idx = 0;
+  	cl->writing_state = MEI_IDLE;
+  
+++<<<<<<< HEAD
+ +	mei_hdr.host_addr = cl->host_client_id;
+ +	mei_hdr.me_addr = cl->me_client_id;
+++=======
++ 	mei_hdr.host_addr = mei_cl_host_addr(cl);
++ 	mei_hdr.me_addr = mei_cl_me_id(cl);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  	mei_hdr.reserved = 0;
+  	mei_hdr.msg_complete = 0;
+  	mei_hdr.internal = cb->internal;
+diff --cc drivers/misc/mei/client.h
+index f2a130967f1e,8d7f057f1045..000000000000
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@@ -72,17 -126,91 +72,32 @@@ static inline bool mei_cl_is_connected(
+  {
+  	return  cl->state == MEI_FILE_CONNECTED;
+  }
+ -
+ -/**
+ - * mei_cl_me_id - me client id
+ - *
+ - * @cl: host client
+ - *
+ - * Return: me client id or 0 if client is not connected
+ - */
+ -static inline u8 mei_cl_me_id(const struct mei_cl *cl)
+ -{
+ -	return cl->me_cl ? cl->me_cl->client_id : 0;
+ -}
+ -
+ -/**
+ - * mei_cl_mtu - maximal message that client can send and receive
+ - *
+ - * @cl: host client
+ - *
+ - * Return: mtu
+ - */
+ -static inline size_t mei_cl_mtu(const struct mei_cl *cl)
+ -{
+ -	return cl->me_cl->props.max_msg_length;
+ -}
+ -
+ -/**
+ - * mei_cl_is_fixed_address - check whether the me client uses fixed address
+ - *
+ - * @cl: host client
+ - *
+ - * Return: true if the client is connected and it has fixed me address
+ - */
+ -static inline bool mei_cl_is_fixed_address(const struct mei_cl *cl)
+ +static inline bool mei_cl_is_transitioning(struct mei_cl *cl)
+  {
+ -	return cl->me_cl && cl->me_cl->props.fixed_address;
+ -}
+ -
+ -/**
+ - * mei_cl_is_single_recv_buf- check whether the me client
+ - *       uses single receiving buffer
+ - *
+ - * @cl: host client
+ - *
+ - * Return: true if single_recv_buf == 1; 0 otherwise
+ - */
+ -static inline bool mei_cl_is_single_recv_buf(const struct mei_cl *cl)
+ -{
+ -	return cl->me_cl->props.single_recv_buf;
+ -}
+ -
+ -/**
+ - * mei_cl_uuid -  client's uuid
+ - *
+ - * @cl: host client
+ - *
+ - * Return: return uuid of connected me client
+ - */
+ -static inline const uuid_le *mei_cl_uuid(const struct mei_cl *cl)
+ -{
+ -	return mei_me_cl_uuid(cl->me_cl);
+ +	return  MEI_FILE_INITIALIZING == cl->state ||
+ +		MEI_FILE_DISCONNECTED == cl->state ||
+ +		MEI_FILE_DISCONNECTING == cl->state;
+  }
+  
+++<<<<<<< HEAD
+ +bool mei_cl_is_other_connecting(struct mei_cl *cl);
+++=======
++ /**
++  * mei_cl_host_addr - client's host address
++  *
++  * @cl: host client
++  *
++  * Return: 0 for fixed address client, host address for dynamic client
++  */
++ static inline u8 mei_cl_host_addr(const struct mei_cl *cl)
++ {
++ 	return  mei_cl_is_fixed_address(cl) ? 0 : cl->host_client_id;
++ }
++ 
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  int mei_cl_disconnect(struct mei_cl *cl);
+ -void mei_cl_set_disconnected(struct mei_cl *cl);
+ -int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
+ -			  struct mei_cl_cb *cmpl_list);
+ -int mei_cl_connect(struct mei_cl *cl, struct mei_me_client *me_cl,
+ -		   struct file *file);
+ -int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
+ -			      struct mei_cl_cb *cmpl_list);
+ -int mei_cl_read_start(struct mei_cl *cl, size_t length, struct file *fp);
+ -int mei_cl_irq_read_msg(struct mei_cl *cl, struct mei_msg_hdr *hdr,
+ -			struct mei_cl_cb *cmpl_list);
+ +int mei_cl_connect(struct mei_cl *cl, struct file *file);
+ +int mei_cl_read_start(struct mei_cl *cl, size_t length);
+  int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb, bool blocking);
+  int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
+  		     struct mei_cl_cb *cmpl_list);
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,a4f283165a33..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -152,8 -150,8 +152,13 @@@ void mei_hbm_cl_hdr(struct mei_cl *cl, 
+  	memset(cmd, 0, len);
+  
+  	cmd->hbm_cmd = hbm_cmd;
+++<<<<<<< HEAD
+ +	cmd->host_addr = cl->host_client_id;
+ +	cmd->me_addr = cl->me_client_id;
+++=======
++ 	cmd->host_addr = mei_cl_host_addr(cl);
++ 	cmd->me_addr = mei_cl_me_id(cl);
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  }
+  
+  /**
+@@@ -177,21 -177,42 +182,26 @@@ int mei_hbm_cl_write(struct mei_device 
+  }
+  
+  /**
+ - * mei_hbm_cl_addr_equal - check if the client's and
+ - *	the message address match
+ + * mei_hbm_cl_addr_equal - tells if they have the same address
+   *
+ - * @cl: client
+ - * @cmd: hbm client message
+ + * @cl: - client
+ + * @buf: buffer with cl header
+   *
+ - * Return: true if addresses are the same
+ + * returns true if addresses are the same
+   */
+  static inline
+ -bool mei_hbm_cl_addr_equal(struct mei_cl *cl, struct mei_hbm_cl_cmd *cmd)
+ +bool mei_hbm_cl_addr_equal(struct mei_cl *cl, void *buf)
+  {
+++<<<<<<< HEAD
+ +	struct mei_hbm_cl_cmd *cmd = buf;
+ +	return cl->host_client_id == cmd->host_addr &&
+ +		cl->me_client_id == cmd->me_addr;
+++=======
++ 	return  mei_cl_host_addr(cl) == cmd->host_addr &&
++ 		mei_cl_me_id(cl) == cmd->me_addr;
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  }
+  
+ -/**
+ - * mei_hbm_cl_find_by_cmd - find recipient client
+ - *
+ - * @dev: the device structure
+ - * @buf: a buffer with hbm cl command
+ - *
+ - * Return: the recipient client or NULL if not found
+ - */
+ -static inline
+ -struct mei_cl *mei_hbm_cl_find_by_cmd(struct mei_device *dev, void *buf)
+ -{
+ -	struct mei_hbm_cl_cmd *cmd = (struct mei_hbm_cl_cmd *)buf;
+ -	struct mei_cl *cl;
+ -
+ -	list_for_each_entry(cl, &dev->file_list, link)
+ -		if (mei_hbm_cl_addr_equal(cl, cmd))
+ -			return cl;
+ -	return NULL;
+ -}
+ -
+ -
+  /**
+   * mei_hbm_start_wait - wait for start response message.
+   *
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,3f3405269c39..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -67,23 -65,26 +67,28 @@@ EXPORT_SYMBOL_GPL(mei_irq_compl_handler
+  static inline int mei_cl_hbm_equal(struct mei_cl *cl,
+  			struct mei_msg_hdr *mei_hdr)
+  {
+++<<<<<<< HEAD
+ +	return cl->host_client_id == mei_hdr->host_addr &&
+ +		cl->me_client_id == mei_hdr->me_addr;
+++=======
++ 	return  mei_cl_host_addr(cl) == mei_hdr->host_addr &&
++ 		mei_cl_me_id(cl) == mei_hdr->me_addr;
+++>>>>>>> 1df629ef4d55 (mei: support for fixed address clients)
+  }
+ -
+  /**
+ - * mei_irq_discard_msg  - discard received message
+ + * mei_cl_is_reading - checks if the client
+ +		is the one to read this message
+ + *
+ + * @cl: mei client
+ + * @mei_hdr: header of mei message
+   *
+ - * @dev: mei device
+ - * @hdr: message header
+ + * returns true on match and false otherwise
+   */
+ -static inline
+ -void mei_irq_discard_msg(struct mei_device *dev, struct mei_msg_hdr *hdr)
+ +static bool mei_cl_is_reading(struct mei_cl *cl, struct mei_msg_hdr *mei_hdr)
+  {
+ -	/*
+ -	 * no need to check for size as it is guarantied
+ -	 * that length fits into rd_msg_buf
+ -	 */
+ -	mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
+ -	dev_dbg(dev->dev, "discarding message " MEI_HDR_FMT "\n",
+ -		MEI_HDR_PRM(hdr));
+ +	return mei_cl_hbm_equal(cl, mei_hdr) &&
+ +		cl->state == MEI_FILE_CONNECTED &&
+ +		cl->reading_state != MEI_READ_COMPLETE;
+  }
+  
+  /**
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/client.h
+* Unmerged path drivers/misc/mei/hbm.c
+* Unmerged path drivers/misc/mei/interrupt.c
