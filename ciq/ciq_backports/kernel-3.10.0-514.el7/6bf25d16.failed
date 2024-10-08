@@ -1,0 +1,143 @@
+nvme: switch abort_limit to an atomic_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6bf25d16410d8d95e3552f31c6a99e3fc3d31752
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6bf25d16.failed
+
+There is no lock to sychronize access to the abort_limit field of
+struct nvme_ctrl, so switch it to an atomic_t.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 6bf25d16410d8d95e3552f31c6a99e3fc3d31752)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,1ad7f18d48e2..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -332,7 -388,7 +332,11 @@@ static void abort_completion(struct nvm
+  	blk_mq_free_request(req);
+  
+  	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	++nvmeq->dev->abort_limit;
+++=======
++ 	atomic_inc(&nvmeq->dev->ctrl.abort_limit);
+++>>>>>>> 6bf25d16410d (nvme: switch abort_limit to an atomic_t):drivers/nvme/host/pci.c
+  }
+  
+  static void async_completion(struct nvme_queue *nvmeq, void *ctx,
+@@@ -1096,30 -1089,50 +1100,42 @@@ static void nvme_abort_req(struct reque
+  	struct nvme_cmd_info *abort_cmd;
+  	struct nvme_command cmd;
+  
+ -	/*
+ -	 * Shutdown immediately if controller times out while starting. The
+ -	 * reset work will see the pci device disabled when it gets the forced
+ -	 * cancellation error. All outstanding requests are completed on
+ -	 * shutdown, so we return BLK_EH_HANDLED.
+ -	 */
+ -	if (test_bit(NVME_CTRL_RESETTING, &dev->flags)) {
+ -		dev_warn(dev->dev,
+ -			 "I/O %d QID %d timeout, disable controller\n",
+ -			 req->tag, nvmeq->qid);
+ -		nvme_dev_shutdown(dev);
+ -		req->errors = NVME_SC_CANCELLED;
+ -		return BLK_EH_HANDLED;
+ -	}
+ -
+ -	/*
+ - 	 * Shutdown the controller immediately and schedule a reset if the
+ - 	 * command was already aborted once before and still hasn't been
+ - 	 * returned to the driver, or if this is the admin queue.
+ -	 */
+  	if (!nvmeq->qid || cmd_rq->aborted) {
+ -		dev_warn(dev->dev,
+ -			 "I/O %d QID %d timeout, reset controller\n",
+ -			 req->tag, nvmeq->qid);
+ -		nvme_dev_shutdown(dev);
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(&dev_list_lock, flags);
+ +		if (work_busy(&dev->reset_work))
+ +			goto out;
+ +		list_del_init(&dev->node);
+ +		dev_warn(&dev->pci_dev->dev,
+ +			"I/O %d QID %d timeout, reset controller\n",
+ +							req->tag, nvmeq->qid);
+ +		PREPARE_WORK(&dev->reset_work, nvme_reset_failed_dev);
+  		queue_work(nvme_workq, &dev->reset_work);
+ -
+ -		/*
+ -		 * Mark the request as handled, since the inline shutdown
+ -		 * forces all outstanding requests to complete.
+ -		 */
+ -		req->errors = NVME_SC_CANCELLED;
+ -		return BLK_EH_HANDLED;
+ + out:
+ +		spin_unlock_irqrestore(&dev_list_lock, flags);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	if (!dev->abort_limit)
+ +		return;
+ +
+ +	abort_req = blk_mq_alloc_request(dev->admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+ +	if (IS_ERR(abort_req))
+ +		return;
+++=======
++ 	if (atomic_dec_and_test(&dev->ctrl.abort_limit))
++ 		return BLK_EH_RESET_TIMER;
++ 
++ 	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE,
++ 			BLK_MQ_REQ_NOWAIT);
++ 	if (IS_ERR(abort_req)) {
++ 		atomic_inc(&dev->ctrl.abort_limit);
++ 		return BLK_EH_RESET_TIMER;
++ 	}
+++>>>>>>> 6bf25d16410d (nvme: switch abort_limit to an atomic_t):drivers/nvme/host/pci.c
+  
+  	abort_cmd = blk_mq_rq_to_pdu(abort_req);
+  	nvme_set_info(abort_cmd, abort_req, abort_completion);
+@@@ -1130,12 -1143,18 +1146,15 @@@
+  	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+  	cmd.abort.command_id = abort_req->tag;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	--dev->abort_limit;
+++=======
+++>>>>>>> 6bf25d16410d (nvme: switch abort_limit to an atomic_t):drivers/nvme/host/pci.c
+  	cmd_rq->aborted = 1;
+  
+ -	dev_warn(nvmeq->q_dmadev, "I/O %d QID %d timeout, aborting\n",
+ -				 req->tag, nvmeq->qid);
+ +	dev_warn(nvmeq->q_dmadev, "Aborting I/O %d QID %d\n", req->tag,
+ +							nvmeq->qid);
+  	nvme_submit_cmd(dev->queues[0], &cmd);
+ -
+ -	/*
+ -	 * The aborted req will be completed on receiving the abort req.
+ -	 * We enable the timer again. If hit twice, it'll cause a device reset,
+ -	 * as the device then is in a faulty state.
+ -	 */
+ -	return BLK_EH_RESET_TIMER;
+  }
+  
+  static void nvme_cancel_queue_ios(struct request *req, void *data, bool reserved)
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
