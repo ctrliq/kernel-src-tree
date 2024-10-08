@@ -802,7 +802,7 @@ $(foreach feat,$(FEATURE_DISPLAY),$(call feature_check,$(feat)))
 
 ifeq ($(VF),1)
   feature_display := 1
-  display_vf := 1
+  feature_verbose := 1
 endif
 
 ifeq ($(feature_display),1)
@@ -815,7 +815,7 @@ ifeq ($(feature_display),1)
   endif
 endif
 
-ifeq ($(display_vf),1)
+ifeq ($(feature_verbose),1)
   TMP := $(filter-out $(FEATURE_DISPLAY),$(FEATURE_TESTS))
   $(foreach feat,$(TMP),$(call feature_print_status,$(feat),))
   $(info )
