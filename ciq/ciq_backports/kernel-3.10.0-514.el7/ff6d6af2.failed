@@ -1,0 +1,1061 @@
+xfs: per-filesystem stats counter implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bill O'Donnell <billodo@redhat.com>
+commit ff6d6af2351caea7db681f4539d0d893e400557a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ff6d6af2.failed
+
+This patch modifies the stats counting macros and the callers
+to those macros to properly increment, decrement, and add-to
+the xfs stats counts. The counts for global and per-fs stats
+are correctly advanced, and cleared by writing a "1" to the
+corresponding clear file.
+
+global counts: /sys/fs/xfs/stats/stats
+per-fs counts: /sys/fs/xfs/sda*/stats/stats
+
+global clear:  /sys/fs/xfs/stats/stats_clear
+per-fs clear:  /sys/fs/xfs/sda*/stats/stats_clear
+
+[dchinner: cleaned up macro variables, removed CONFIG_FS_PROC around
+ stats structures and macros. ]
+
+	Signed-off-by: Bill O'Donnell <billodo@redhat.com>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit ff6d6af2351caea7db681f4539d0d893e400557a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_qm.c
+diff --cc fs/xfs/xfs_dquot.c
+index a0f4af03c7d8,7ac6c5c586cb..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -849,14 -845,8 +849,19 @@@ xfs_qm_dqput
+  		struct xfs_quotainfo	*qi = dqp->q_mount->m_quotainfo;
+  		trace_xfs_dqput_free(dqp);
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&qi->qi_lru_lock);
+ +		if (list_empty(&dqp->q_lru)) {
+ +			list_add_tail(&dqp->q_lru, &qi->qi_lru_list);
+ +			qi->qi_lru_count++;
+ +			XFS_STATS_INC(xs_qm_dquot_unused);
+ +		}
+ +		mutex_unlock(&qi->qi_lru_lock);
+ +
+++=======
++ 		if (list_lru_add(&qi->qi_lru, &dqp->q_lru))
++ 			XFS_STATS_INC(dqp->q_mount, xs_qm_dquot_unused);
+++>>>>>>> ff6d6af2351c (xfs: per-filesystem stats counter implementation)
+  	}
+  	xfs_dqunlock(dqp);
+  }
+diff --cc fs/xfs/xfs_qm.c
+index c93b497fa09e,7af7648c06c6..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -181,12 -182,9 +181,17 @@@ xfs_qm_dqpurge
+  	 * We move dquots to the freelist as soon as their reference count
+  	 * hits zero, so it really should be on the freelist here.
+  	 */
+ +	mutex_lock(&qi->qi_lru_lock);
+  	ASSERT(!list_empty(&dqp->q_lru));
+++<<<<<<< HEAD
+ +	list_del_init(&dqp->q_lru);
+ +	qi->qi_lru_count--;
+ +	XFS_STATS_DEC(xs_qm_dquot_unused);
+ +	mutex_unlock(&qi->qi_lru_lock);
+++=======
++ 	list_lru_del(&qi->qi_lru, &dqp->q_lru);
++ 	XFS_STATS_DEC(mp, xs_qm_dquot_unused);
+++>>>>>>> ff6d6af2351c (xfs: per-filesystem stats counter implementation)
+  
+  	xfs_qm_dqdestroy(dqp);
+  	return 0;
+@@@ -424,6 -422,144 +429,147 @@@ xfs_qm_dqdetach
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct xfs_qm_isolate {
++ 	struct list_head	buffers;
++ 	struct list_head	dispose;
++ };
++ 
++ static enum lru_status
++ xfs_qm_dquot_isolate(
++ 	struct list_head	*item,
++ 	struct list_lru_one	*lru,
++ 	spinlock_t		*lru_lock,
++ 	void			*arg)
++ 		__releases(lru_lock) __acquires(lru_lock)
++ {
++ 	struct xfs_dquot	*dqp = container_of(item,
++ 						struct xfs_dquot, q_lru);
++ 	struct xfs_qm_isolate	*isol = arg;
++ 
++ 	if (!xfs_dqlock_nowait(dqp))
++ 		goto out_miss_busy;
++ 
++ 	/*
++ 	 * This dquot has acquired a reference in the meantime remove it from
++ 	 * the freelist and try again.
++ 	 */
++ 	if (dqp->q_nrefs) {
++ 		xfs_dqunlock(dqp);
++ 		XFS_STATS_INC(dqp->q_mount, xs_qm_dqwants);
++ 
++ 		trace_xfs_dqreclaim_want(dqp);
++ 		list_lru_isolate(lru, &dqp->q_lru);
++ 		XFS_STATS_DEC(dqp->q_mount, xs_qm_dquot_unused);
++ 		return LRU_REMOVED;
++ 	}
++ 
++ 	/*
++ 	 * If the dquot is dirty, flush it. If it's already being flushed, just
++ 	 * skip it so there is time for the IO to complete before we try to
++ 	 * reclaim it again on the next LRU pass.
++ 	 */
++ 	if (!xfs_dqflock_nowait(dqp)) {
++ 		xfs_dqunlock(dqp);
++ 		goto out_miss_busy;
++ 	}
++ 
++ 	if (XFS_DQ_IS_DIRTY(dqp)) {
++ 		struct xfs_buf	*bp = NULL;
++ 		int		error;
++ 
++ 		trace_xfs_dqreclaim_dirty(dqp);
++ 
++ 		/* we have to drop the LRU lock to flush the dquot */
++ 		spin_unlock(lru_lock);
++ 
++ 		error = xfs_qm_dqflush(dqp, &bp);
++ 		if (error) {
++ 			xfs_warn(dqp->q_mount, "%s: dquot %p flush failed",
++ 				 __func__, dqp);
++ 			goto out_unlock_dirty;
++ 		}
++ 
++ 		xfs_buf_delwri_queue(bp, &isol->buffers);
++ 		xfs_buf_relse(bp);
++ 		goto out_unlock_dirty;
++ 	}
++ 	xfs_dqfunlock(dqp);
++ 
++ 	/*
++ 	 * Prevent lookups now that we are past the point of no return.
++ 	 */
++ 	dqp->dq_flags |= XFS_DQ_FREEING;
++ 	xfs_dqunlock(dqp);
++ 
++ 	ASSERT(dqp->q_nrefs == 0);
++ 	list_lru_isolate_move(lru, &dqp->q_lru, &isol->dispose);
++ 	XFS_STATS_DEC(dqp->q_mount, xs_qm_dquot_unused);
++ 	trace_xfs_dqreclaim_done(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaims);
++ 	return LRU_REMOVED;
++ 
++ out_miss_busy:
++ 	trace_xfs_dqreclaim_busy(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
++ 	return LRU_SKIP;
++ 
++ out_unlock_dirty:
++ 	trace_xfs_dqreclaim_busy(dqp);
++ 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
++ 	xfs_dqunlock(dqp);
++ 	spin_lock(lru_lock);
++ 	return LRU_RETRY;
++ }
++ 
++ static unsigned long
++ xfs_qm_shrink_scan(
++ 	struct shrinker		*shrink,
++ 	struct shrink_control	*sc)
++ {
++ 	struct xfs_quotainfo	*qi = container_of(shrink,
++ 					struct xfs_quotainfo, qi_shrinker);
++ 	struct xfs_qm_isolate	isol;
++ 	unsigned long		freed;
++ 	int			error;
++ 
++ 	if ((sc->gfp_mask & (__GFP_FS|__GFP_WAIT)) != (__GFP_FS|__GFP_WAIT))
++ 		return 0;
++ 
++ 	INIT_LIST_HEAD(&isol.buffers);
++ 	INIT_LIST_HEAD(&isol.dispose);
++ 
++ 	freed = list_lru_shrink_walk(&qi->qi_lru, sc,
++ 				     xfs_qm_dquot_isolate, &isol);
++ 
++ 	error = xfs_buf_delwri_submit(&isol.buffers);
++ 	if (error)
++ 		xfs_warn(NULL, "%s: dquot reclaim failed", __func__);
++ 
++ 	while (!list_empty(&isol.dispose)) {
++ 		struct xfs_dquot	*dqp;
++ 
++ 		dqp = list_first_entry(&isol.dispose, struct xfs_dquot, q_lru);
++ 		list_del_init(&dqp->q_lru);
++ 		xfs_qm_dqfree_one(dqp);
++ 	}
++ 
++ 	return freed;
++ }
++ 
++ static unsigned long
++ xfs_qm_shrink_count(
++ 	struct shrinker		*shrink,
++ 	struct shrink_control	*sc)
++ {
++ 	struct xfs_quotainfo	*qi = container_of(shrink,
++ 					struct xfs_quotainfo, qi_shrinker);
++ 
++ 	return list_lru_shrink_count(&qi->qi_lru, sc);
++ }
++ 
+++>>>>>>> ff6d6af2351c (xfs: per-filesystem stats counter implementation)
+  /*
+   * This initializes all the quota information that's kept in the
+   * mount structure
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 516162be1398..8a9d9f4451cd 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -637,8 +637,8 @@ xfs_alloc_ag_vextent(
+ 				 -((long)(args->len)));
+ 	}
+ 
+-	XFS_STATS_INC(xs_allocx);
+-	XFS_STATS_ADD(xs_allocb, args->len);
++	XFS_STATS_INC(args->mp, xs_allocx);
++	XFS_STATS_ADD(args->mp, xs_allocb, args->len);
+ 	return error;
+ }
+ 
+@@ -1776,8 +1776,8 @@ xfs_free_ag_extent(
+ 
+ 	if (!isfl)
+ 		xfs_trans_mod_sb(tp, XFS_TRANS_SB_FDBLOCKS, (long)len);
+-	XFS_STATS_INC(xs_freex);
+-	XFS_STATS_ADD(xs_freeb, len);
++	XFS_STATS_INC(mp, xs_freex);
++	XFS_STATS_ADD(mp, xs_freeb, len);
+ 
+ 	trace_xfs_free_extent(mp, agno, bno, len, isfl, haveleft, haveright);
+ 
+diff --git a/fs/xfs/libxfs/xfs_attr.c b/fs/xfs/libxfs/xfs_attr.c
+index 0a472fbe06d4..1269249aad28 100644
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -125,7 +125,7 @@ xfs_attr_get(
+ 	uint			lock_mode;
+ 	int			error;
+ 
+-	XFS_STATS_INC(xs_attr_get);
++	XFS_STATS_INC(ip->i_mount, xs_attr_get);
+ 
+ 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ 		return -EIO;
+@@ -207,7 +207,7 @@ xfs_attr_set(
+ 	int			rsvd = (flags & ATTR_ROOT) != 0;
+ 	int			error, err2, committed, local;
+ 
+-	XFS_STATS_INC(xs_attr_set);
++	XFS_STATS_INC(mp, xs_attr_set);
+ 
+ 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
+ 		return -EIO;
+@@ -413,7 +413,7 @@ xfs_attr_remove(
+ 	xfs_fsblock_t		firstblock;
+ 	int			error;
+ 
+-	XFS_STATS_INC(xs_attr_remove);
++	XFS_STATS_INC(mp, xs_attr_remove);
+ 
+ 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
+ 		return -EIO;
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 7500d26379cf..f15d0a98a1dc 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -1438,7 +1438,7 @@ xfs_bmap_search_extents(
+ 	xfs_ifork_t	*ifp;		/* inode fork pointer */
+ 	xfs_bmbt_rec_host_t  *ep;            /* extent record pointer */
+ 
+-	XFS_STATS_INC(xs_look_exlist);
++	XFS_STATS_INC(ip->i_mount, xs_look_exlist);
+ 	ifp = XFS_IFORK_PTR(ip, fork);
+ 
+ 	ep = xfs_bmap_search_multi_extents(ifp, bno, eofp, lastxp, gotp, prevp);
+@@ -1735,7 +1735,7 @@ xfs_bmap_add_extent_delay_real(
+ 	ASSERT(!bma->cur ||
+ 	       (bma->cur->bc_private.b.flags & XFS_BTCUR_BPRV_WASDEL));
+ 
+-	XFS_STATS_INC(xs_add_exlist);
++	XFS_STATS_INC(mp, xs_add_exlist);
+ 
+ #define	LEFT		r[0]
+ #define	RIGHT		r[1]
+@@ -2289,7 +2289,7 @@ xfs_bmap_add_extent_unwritten_real(
+ 	ASSERT(*idx <= ifp->if_bytes / sizeof(struct xfs_bmbt_rec));
+ 	ASSERT(!isnullstartblock(new->br_startblock));
+ 
+-	XFS_STATS_INC(xs_add_exlist);
++	XFS_STATS_INC(mp, xs_add_exlist);
+ 
+ #define	LEFT		r[0]
+ #define	RIGHT		r[1]
+@@ -2949,7 +2949,7 @@ xfs_bmap_add_extent_hole_real(
+ 	ASSERT(!bma->cur ||
+ 	       !(bma->cur->bc_private.b.flags & XFS_BTCUR_BPRV_WASDEL));
+ 
+-	XFS_STATS_INC(xs_add_exlist);
++	XFS_STATS_INC(mp, xs_add_exlist);
+ 
+ 	state = 0;
+ 	if (whichfork == XFS_ATTR_FORK)
+@@ -4037,7 +4037,7 @@ xfs_bmapi_read(
+ 	if (XFS_FORCED_SHUTDOWN(mp))
+ 		return -EIO;
+ 
+-	XFS_STATS_INC(xs_blk_mapr);
++	XFS_STATS_INC(mp, xs_blk_mapr);
+ 
+ 	ifp = XFS_IFORK_PTR(ip, whichfork);
+ 
+@@ -4221,7 +4221,7 @@ xfs_bmapi_delay(
+ 	if (XFS_FORCED_SHUTDOWN(mp))
+ 		return -EIO;
+ 
+-	XFS_STATS_INC(xs_blk_mapw);
++	XFS_STATS_INC(mp, xs_blk_mapw);
+ 
+ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
+ 		error = xfs_iread_extents(NULL, ip, XFS_DATA_FORK);
+@@ -4524,7 +4524,7 @@ xfs_bmapi_write(
+ 
+ 	ifp = XFS_IFORK_PTR(ip, whichfork);
+ 
+-	XFS_STATS_INC(xs_blk_mapw);
++	XFS_STATS_INC(mp, xs_blk_mapw);
+ 
+ 	if (*firstblock == NULLFSBLOCK) {
+ 		if (XFS_IFORK_FORMAT(ip, whichfork) == XFS_DINODE_FMT_BTREE)
+@@ -4717,12 +4717,12 @@ xfs_bmap_del_extent(
+ 	xfs_filblks_t		temp2;	/* for indirect length calculations */
+ 	int			state = 0;
+ 
+-	XFS_STATS_INC(xs_del_exlist);
++	mp = ip->i_mount;
++	XFS_STATS_INC(mp, xs_del_exlist);
+ 
+ 	if (whichfork == XFS_ATTR_FORK)
+ 		state |= BMAP_ATTRFORK;
+ 
+-	mp = ip->i_mount;
+ 	ifp = XFS_IFORK_PTR(ip, whichfork);
+ 	ASSERT((*idx >= 0) && (*idx < ifp->if_bytes /
+ 		(uint)sizeof(xfs_bmbt_rec_t)));
+@@ -5068,7 +5068,7 @@ xfs_bunmapi(
+ 		*done = 1;
+ 		return 0;
+ 	}
+-	XFS_STATS_INC(xs_blk_unmap);
++	XFS_STATS_INC(mp, xs_blk_unmap);
+ 	isrt = (whichfork == XFS_DATA_FORK) && XFS_IS_REALTIME_INODE(ip);
+ 	start = bno;
+ 	bno = start + len - 1;
+diff --git a/fs/xfs/libxfs/xfs_btree.h b/fs/xfs/libxfs/xfs_btree.h
+index 8f18bab73ea5..992dec0638f3 100644
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@ -84,31 +84,38 @@ union xfs_btree_rec {
+ /*
+  * Generic stats interface
+  */
+-#define __XFS_BTREE_STATS_INC(type, stat) \
+-	XFS_STATS_INC(xs_ ## type ## _2_ ## stat)
+-#define XFS_BTREE_STATS_INC(cur, stat)  \
++#define __XFS_BTREE_STATS_INC(mp, type, stat) \
++	XFS_STATS_INC(mp, xs_ ## type ## _2_ ## stat)
++#define XFS_BTREE_STATS_INC(cur, stat)	\
+ do {    \
++	struct xfs_mount *__mp = cur->bc_mp; \
+ 	switch (cur->bc_btnum) {  \
+-	case XFS_BTNUM_BNO: __XFS_BTREE_STATS_INC(abtb, stat); break;	\
+-	case XFS_BTNUM_CNT: __XFS_BTREE_STATS_INC(abtc, stat); break;	\
+-	case XFS_BTNUM_BMAP: __XFS_BTREE_STATS_INC(bmbt, stat); break;	\
+-	case XFS_BTNUM_INO: __XFS_BTREE_STATS_INC(ibt, stat); break;	\
+-	case XFS_BTNUM_FINO: __XFS_BTREE_STATS_INC(fibt, stat); break;	\
++	case XFS_BTNUM_BNO: __XFS_BTREE_STATS_INC(__mp, abtb, stat); break; \
++	case XFS_BTNUM_CNT: __XFS_BTREE_STATS_INC(__mp, abtc, stat); break; \
++	case XFS_BTNUM_BMAP: __XFS_BTREE_STATS_INC(__mp, bmbt, stat); break; \
++	case XFS_BTNUM_INO: __XFS_BTREE_STATS_INC(__mp, ibt, stat); break; \
++	case XFS_BTNUM_FINO: __XFS_BTREE_STATS_INC(__mp, fibt, stat); break; \
+ 	case XFS_BTNUM_MAX: ASSERT(0); /* fucking gcc */ ; break;	\
+ 	}       \
+ } while (0)
+ 
+-#define __XFS_BTREE_STATS_ADD(type, stat, val) \
+-	XFS_STATS_ADD(xs_ ## type ## _2_ ## stat, val)
++#define __XFS_BTREE_STATS_ADD(mp, type, stat, val) \
++	XFS_STATS_ADD(mp, xs_ ## type ## _2_ ## stat, val)
+ #define XFS_BTREE_STATS_ADD(cur, stat, val)  \
+ do {    \
++	struct xfs_mount *__mp = cur->bc_mp; \
+ 	switch (cur->bc_btnum) {  \
+-	case XFS_BTNUM_BNO: __XFS_BTREE_STATS_ADD(abtb, stat, val); break; \
+-	case XFS_BTNUM_CNT: __XFS_BTREE_STATS_ADD(abtc, stat, val); break; \
+-	case XFS_BTNUM_BMAP: __XFS_BTREE_STATS_ADD(bmbt, stat, val); break; \
+-	case XFS_BTNUM_INO: __XFS_BTREE_STATS_ADD(ibt, stat, val); break; \
+-	case XFS_BTNUM_FINO: __XFS_BTREE_STATS_ADD(fibt, stat, val); break; \
+-	case XFS_BTNUM_MAX: ASSERT(0); /* fucking gcc */ ; break;	\
++	case XFS_BTNUM_BNO:	\
++		__XFS_BTREE_STATS_ADD(__mp, abtb, stat, val); break; \
++	case XFS_BTNUM_CNT:	\
++		__XFS_BTREE_STATS_ADD(__mp, abtc, stat, val); break; \
++	case XFS_BTNUM_BMAP:	\
++		__XFS_BTREE_STATS_ADD(__mp, bmbt, stat, val); break; \
++	case XFS_BTNUM_INO:	\
++		__XFS_BTREE_STATS_ADD(__mp, ibt, stat, val); break; \
++	case XFS_BTNUM_FINO:	\
++		__XFS_BTREE_STATS_ADD(__mp, fibt, stat, val); break; \
++	case XFS_BTNUM_MAX: ASSERT(0); /* fucking gcc */ ; break; \
+ 	}       \
+ } while (0)
+ 
+diff --git a/fs/xfs/libxfs/xfs_dir2.c b/fs/xfs/libxfs/xfs_dir2.c
+index a69fb3a1e161..0974a3247628 100644
+--- a/fs/xfs/libxfs/xfs_dir2.c
++++ b/fs/xfs/libxfs/xfs_dir2.c
+@@ -271,7 +271,7 @@ xfs_dir_createname(
+ 		rval = xfs_dir_ino_validate(tp->t_mountp, inum);
+ 		if (rval)
+ 			return rval;
+-		XFS_STATS_INC(xs_dir_create);
++		XFS_STATS_INC(dp->i_mount, xs_dir_create);
+ 	}
+ 
+ 	args = kmem_zalloc(sizeof(*args), KM_SLEEP | KM_NOFS);
+@@ -364,7 +364,7 @@ xfs_dir_lookup(
+ 	int		v;		/* type-checking value */
+ 
+ 	ASSERT(S_ISDIR(dp->i_d.di_mode));
+-	XFS_STATS_INC(xs_dir_lookup);
++	XFS_STATS_INC(dp->i_mount, xs_dir_lookup);
+ 
+ 	/*
+ 	 * We need to use KM_NOFS here so that lockdep will not throw false
+@@ -441,7 +441,7 @@ xfs_dir_removename(
+ 	int		v;		/* type-checking value */
+ 
+ 	ASSERT(S_ISDIR(dp->i_d.di_mode));
+-	XFS_STATS_INC(xs_dir_remove);
++	XFS_STATS_INC(dp->i_mount, xs_dir_remove);
+ 
+ 	args = kmem_zalloc(sizeof(*args), KM_SLEEP | KM_NOFS);
+ 	if (!args)
+diff --git a/fs/xfs/xfs_attr_list.c b/fs/xfs/xfs_attr_list.c
+index 65fb37a18e92..0ef7c2ed3f8a 100644
+--- a/fs/xfs/xfs_attr_list.c
++++ b/fs/xfs/xfs_attr_list.c
+@@ -511,7 +511,7 @@ xfs_attr_list_int(
+ 	xfs_inode_t *dp = context->dp;
+ 	uint		lock_mode;
+ 
+-	XFS_STATS_INC(xs_attr_list);
++	XFS_STATS_INC(dp->i_mount, xs_attr_list);
+ 
+ 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
+ 		return -EIO;
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index e2006546526b..97358e0bec64 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -255,7 +255,7 @@ _xfs_buf_alloc(
+ 	atomic_set(&bp->b_pin_count, 0);
+ 	init_waitqueue_head(&bp->b_waiters);
+ 
+-	XFS_STATS_INC(xb_create);
++	XFS_STATS_INC(target->bt_mount, xb_create);
+ 	trace_xfs_buf_init(bp, _RET_IP_);
+ 
+ 	return bp;
+@@ -411,12 +411,12 @@ retry:
+ 		"possible memory allocation deadlock in %s (mode:0x%x)",
+ 					__func__, gfp_mask);
+ 
+-			XFS_STATS_INC(xb_page_retries);
++			XFS_STATS_INC(bp->b_target->bt_mount, xb_page_retries);
+ 			congestion_wait(BLK_RW_ASYNC, HZ/50);
+ 			goto retry;
+ 		}
+ 
+-		XFS_STATS_INC(xb_page_found);
++		XFS_STATS_INC(bp->b_target->bt_mount, xb_page_found);
+ 
+ 		nbytes = min_t(size_t, size, PAGE_SIZE - offset);
+ 		size -= nbytes;
+@@ -572,7 +572,7 @@ _xfs_buf_find(
+ 		new_bp->b_pag = pag;
+ 		spin_unlock(&pag->pag_buf_lock);
+ 	} else {
+-		XFS_STATS_INC(xb_miss_locked);
++		XFS_STATS_INC(btp->bt_mount, xb_miss_locked);
+ 		spin_unlock(&pag->pag_buf_lock);
+ 		xfs_perag_put(pag);
+ 	}
+@@ -585,11 +585,11 @@ found:
+ 	if (!xfs_buf_trylock(bp)) {
+ 		if (flags & XBF_TRYLOCK) {
+ 			xfs_buf_rele(bp);
+-			XFS_STATS_INC(xb_busy_locked);
++			XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
+ 			return NULL;
+ 		}
+ 		xfs_buf_lock(bp);
+-		XFS_STATS_INC(xb_get_locked_waited);
++		XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+ 	}
+ 
+ 	/*
+@@ -605,7 +605,7 @@ found:
+ 	}
+ 
+ 	trace_xfs_buf_find(bp, flags, _RET_IP_);
+-	XFS_STATS_INC(xb_get_locked);
++	XFS_STATS_INC(btp->bt_mount, xb_get_locked);
+ 	return bp;
+ }
+ 
+@@ -659,7 +659,7 @@ found:
+ 		}
+ 	}
+ 
+-	XFS_STATS_INC(xb_get);
++	XFS_STATS_INC(target->bt_mount, xb_get);
+ 	trace_xfs_buf_get(bp, flags, _RET_IP_);
+ 	return bp;
+ }
+@@ -699,7 +699,7 @@ xfs_buf_read_map(
+ 		trace_xfs_buf_read(bp, flags, _RET_IP_);
+ 
+ 		if (!XFS_BUF_ISDONE(bp)) {
+-			XFS_STATS_INC(xb_get_read);
++			XFS_STATS_INC(target->bt_mount, xb_get_read);
+ 			bp->b_ops = ops;
+ 			_xfs_buf_read(bp, flags);
+ 		} else if (flags & XBF_ASYNC) {
+diff --git a/fs/xfs/xfs_dir2_readdir.c b/fs/xfs/xfs_dir2_readdir.c
+index 42f778c02964..9b2ee4f2e937 100644
+--- a/fs/xfs/xfs_dir2_readdir.c
++++ b/fs/xfs/xfs_dir2_readdir.c
+@@ -672,7 +672,7 @@ xfs_readdir(
+ 		return -EIO;
+ 
+ 	ASSERT(S_ISDIR(dp->i_d.di_mode));
+-	XFS_STATS_INC(xs_dir_getdents);
++	XFS_STATS_INC(dp->i_mount, xs_dir_getdents);
+ 
+ 	args.dp = dp;
+ 	args.geo = dp->i_mount->m_dir_geo;
+* Unmerged path fs/xfs/xfs_dquot.c
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index a566879771ae..b9760e1fa4f0 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -279,7 +279,7 @@ xfs_file_aio_read(
+ 	int			ioflags = 0;
+ 	xfs_fsize_t		n;
+ 
+-	XFS_STATS_INC(xs_read_calls);
++	XFS_STATS_INC(mp, xs_read_calls);
+ 
+ 	BUG_ON(iocb->ki_pos != pos);
+ 
+@@ -363,7 +363,7 @@ xfs_file_aio_read(
+ 
+ 	ret = generic_file_aio_read(iocb, iovp, nr_segs, pos);
+ 	if (ret > 0)
+-		XFS_STATS_ADD(xs_read_bytes, ret);
++		XFS_STATS_ADD(mp, xs_read_bytes, ret);
+ 
+ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+ 	return ret;
+@@ -381,7 +381,7 @@ xfs_file_splice_read(
+ 	int			ioflags = 0;
+ 	ssize_t			ret;
+ 
+-	XFS_STATS_INC(xs_read_calls);
++	XFS_STATS_INC(ip->i_mount, xs_read_calls);
+ 
+ 	if (infilp->f_mode & FMODE_NOCMTIME)
+ 		ioflags |= XFS_IO_INVIS;
+@@ -395,7 +395,7 @@ xfs_file_splice_read(
+ 
+ 	ret = generic_file_splice_read(infilp, ppos, pipe, count, flags);
+ 	if (ret > 0)
+-		XFS_STATS_ADD(xs_read_bytes, ret);
++		XFS_STATS_ADD(ip->i_mount, xs_read_bytes, ret);
+ 
+ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+ 	return ret;
+@@ -882,7 +882,7 @@ xfs_file_aio_write(
+ 	ssize_t			ret;
+ 	size_t			ocount = 0;
+ 
+-	XFS_STATS_INC(xs_write_calls);
++	XFS_STATS_INC(ip->i_mount, xs_write_calls);
+ 
+ 	BUG_ON(iocb->ki_pos != pos);
+ 
+@@ -907,7 +907,7 @@ xfs_file_aio_write(
+ 	if (ret > 0) {
+ 		ssize_t err;
+ 
+-		XFS_STATS_ADD(xs_write_bytes, ret);
++		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+ 
+ 		/* Handle various SYNC-type writes */
+ 		err = generic_write_sync(file, pos, ret);
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 0d61d590794f..e94c8fc20577 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -63,7 +63,7 @@ xfs_inode_alloc(
+ 		return NULL;
+ 	}
+ 
+-	XFS_STATS_INC(vn_active);
++	XFS_STATS_INC(mp, vn_active);
+ 	ASSERT(atomic_read(&ip->i_pincount) == 0);
+ 	ASSERT(!spin_is_locked(&ip->i_flags_lock));
+ 	ASSERT(!xfs_isiflocked(ip));
+@@ -129,7 +129,7 @@ xfs_inode_free(
+ 	/* asserts to verify all state is correct here */
+ 	ASSERT(atomic_read(&ip->i_pincount) == 0);
+ 	ASSERT(!xfs_isiflocked(ip));
+-	XFS_STATS_DEC(vn_active);
++	XFS_STATS_DEC(ip->i_mount, vn_active);
+ 
+ 	call_rcu(&VFS_I(ip)->i_rcu, xfs_inode_free_callback);
+ }
+@@ -159,7 +159,7 @@ xfs_iget_cache_hit(
+ 	spin_lock(&ip->i_flags_lock);
+ 	if (ip->i_ino != ino) {
+ 		trace_xfs_iget_skip(ip);
+-		XFS_STATS_INC(xs_ig_frecycle);
++		XFS_STATS_INC(mp, xs_ig_frecycle);
+ 		error = -EAGAIN;
+ 		goto out_error;
+ 	}
+@@ -177,7 +177,7 @@ xfs_iget_cache_hit(
+ 	 */
+ 	if (ip->i_flags & (XFS_INEW|XFS_IRECLAIM)) {
+ 		trace_xfs_iget_skip(ip);
+-		XFS_STATS_INC(xs_ig_frecycle);
++		XFS_STATS_INC(mp, xs_ig_frecycle);
+ 		error = -EAGAIN;
+ 		goto out_error;
+ 	}
+@@ -259,7 +259,7 @@ xfs_iget_cache_hit(
+ 		xfs_ilock(ip, lock_flags);
+ 
+ 	xfs_iflags_clear(ip, XFS_ISTALE | XFS_IDONTCACHE);
+-	XFS_STATS_INC(xs_ig_found);
++	XFS_STATS_INC(mp, xs_ig_found);
+ 
+ 	return 0;
+ 
+@@ -342,7 +342,7 @@ xfs_iget_cache_miss(
+ 	error = radix_tree_insert(&pag->pag_ici_root, agino, ip);
+ 	if (unlikely(error)) {
+ 		WARN_ON(error != -EEXIST);
+-		XFS_STATS_INC(xs_ig_dup);
++		XFS_STATS_INC(mp, xs_ig_dup);
+ 		error = -EAGAIN;
+ 		goto out_preload_end;
+ 	}
+@@ -412,7 +412,7 @@ xfs_iget(
+ 	if (!ino || XFS_INO_TO_AGNO(mp, ino) >= mp->m_sb.sb_agcount)
+ 		return -EINVAL;
+ 
+-	XFS_STATS_INC(xs_ig_attempts);
++	XFS_STATS_INC(mp, xs_ig_attempts);
+ 
+ 	/* get the perag structure and ensure that it's inode capable */
+ 	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ino));
+@@ -429,7 +429,7 @@ again:
+ 			goto out_error_or_again;
+ 	} else {
+ 		rcu_read_unlock();
+-		XFS_STATS_INC(xs_ig_missed);
++		XFS_STATS_INC(mp, xs_ig_missed);
+ 
+ 		error = xfs_iget_cache_miss(mp, pag, tp, ino, &ip,
+ 							flags, lock_flags);
+@@ -965,7 +965,7 @@ reclaim:
+ 	xfs_ifunlock(ip);
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 
+-	XFS_STATS_INC(xs_ig_reclaims);
++	XFS_STATS_INC(ip->i_mount, xs_ig_reclaims);
+ 	/*
+ 	 * Remove the inode from the per-AG radix tree.
+ 	 *
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 45346a11363a..7bb81b6086c8 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3289,8 +3289,8 @@ xfs_iflush_cluster(
+ 	}
+ 
+ 	if (clcount) {
+-		XFS_STATS_INC(xs_icluster_flushcnt);
+-		XFS_STATS_ADD(xs_icluster_flushinode, clcount);
++		XFS_STATS_INC(mp, xs_icluster_flushcnt);
++		XFS_STATS_ADD(mp, xs_icluster_flushinode, clcount);
+ 	}
+ 
+ out_free:
+@@ -3363,7 +3363,7 @@ xfs_iflush(
+ 	struct xfs_dinode	*dip;
+ 	int			error;
+ 
+-	XFS_STATS_INC(xs_iflush_count);
++	XFS_STATS_INC(mp, xs_iflush_count);
+ 
+ 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL|XFS_ILOCK_SHARED));
+ 	ASSERT(xfs_isiflocked(ip));
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 6326af4aa381..b7a6b52c7139 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1054,7 +1054,7 @@ xfs_ioctl_setattr_xflags(
+ 	xfs_diflags_to_linux(ip);
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+-	XFS_STATS_INC(xs_ig_attrchg);
++	XFS_STATS_INC(mp, xs_ig_attrchg);
+ 	return 0;
+ }
+ 
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 38e633bad8c2..9a85bc9684aa 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -670,7 +670,7 @@ xfs_iomap_write_allocate(
+ 	count_fsb = imap->br_blockcount;
+ 	map_start_fsb = imap->br_startoff;
+ 
+-	XFS_STATS_ADD(xs_xstrat_bytes, XFS_FSB_TO_B(mp, count_fsb));
++	XFS_STATS_ADD(mp, xs_xstrat_bytes, XFS_FSB_TO_B(mp, count_fsb));
+ 
+ 	while (count_fsb != 0) {
+ 		/*
+@@ -777,7 +777,7 @@ xfs_iomap_write_allocate(
+ 		if ((offset_fsb >= imap->br_startoff) &&
+ 		    (offset_fsb < (imap->br_startoff +
+ 				   imap->br_blockcount))) {
+-			XFS_STATS_INC(xs_xstrat_quick);
++			XFS_STATS_INC(mp, xs_xstrat_quick);
+ 			return 0;
+ 		}
+ 
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index 5e33f3364b73..2735a1b9b2b9 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -695,7 +695,7 @@ xfs_setattr_nonsize(
+ 
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 
+-	XFS_STATS_INC(xs_ig_attrchg);
++	XFS_STATS_INC(mp, xs_ig_attrchg);
+ 
+ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
+ 		xfs_trans_set_sync(tp);
+@@ -920,7 +920,7 @@ xfs_setattr_size(
+ 
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 
+-	XFS_STATS_INC(xs_ig_attrchg);
++	XFS_STATS_INC(mp, xs_ig_attrchg);
+ 
+ 	if (mp->m_flags & XFS_MOUNT_WSYNC)
+ 		xfs_trans_set_sync(tp);
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 3dfa2dbca48d..11f9c82612ec 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -268,7 +268,7 @@ xlog_grant_head_wait(
+ 		__set_current_state(TASK_UNINTERRUPTIBLE);
+ 		spin_unlock(&head->lock);
+ 
+-		XFS_STATS_INC(xs_sleep_logspace);
++		XFS_STATS_INC(log->l_mp, xs_sleep_logspace);
+ 
+ 		trace_xfs_log_grant_sleep(log, tic);
+ 		schedule();
+@@ -379,7 +379,7 @@ xfs_log_regrant(
+ 	if (XLOG_FORCED_SHUTDOWN(log))
+ 		return -EIO;
+ 
+-	XFS_STATS_INC(xs_try_logspace);
++	XFS_STATS_INC(mp, xs_try_logspace);
+ 
+ 	/*
+ 	 * This is a new transaction on the ticket, so we need to change the
+@@ -448,7 +448,7 @@ xfs_log_reserve(
+ 	if (XLOG_FORCED_SHUTDOWN(log))
+ 		return -EIO;
+ 
+-	XFS_STATS_INC(xs_try_logspace);
++	XFS_STATS_INC(mp, xs_try_logspace);
+ 
+ 	ASSERT(*ticp == NULL);
+ 	tic = xlog_ticket_alloc(log, unit_bytes, cnt, client, permanent,
+@@ -1751,7 +1751,7 @@ xlog_sync(
+ 	int		v2 = xfs_sb_version_haslogv2(&log->l_mp->m_sb);
+ 	int		size;
+ 
+-	XFS_STATS_INC(xs_log_writes);
++	XFS_STATS_INC(log->l_mp, xs_log_writes);
+ 	ASSERT(atomic_read(&iclog->ic_refcnt) == 0);
+ 
+ 	/* Add for LR header */
+@@ -1788,7 +1788,7 @@ xlog_sync(
+ 	bp = iclog->ic_bp;
+ 	XFS_BUF_SET_ADDR(bp, BLOCK_LSN(be64_to_cpu(iclog->ic_header.h_lsn)));
+ 
+-	XFS_STATS_ADD(xs_log_blocks, BTOBB(count));
++	XFS_STATS_ADD(log->l_mp, xs_log_blocks, BTOBB(count));
+ 
+ 	/* Do we need to split this write into 2 parts? */
+ 	if (XFS_BUF_ADDR(bp) + BTOBB(count) > log->l_logBBsize) {
+@@ -2898,7 +2898,7 @@ restart:
+ 
+ 	iclog = log->l_iclog;
+ 	if (iclog->ic_state != XLOG_STATE_ACTIVE) {
+-		XFS_STATS_INC(xs_log_noiclogs);
++		XFS_STATS_INC(log->l_mp, xs_log_noiclogs);
+ 
+ 		/* Wait for log writes to have flushed */
+ 		xlog_wait(&log->l_flush_wait, &log->l_icloglock);
+@@ -3197,7 +3197,7 @@ _xfs_log_force(
+ 	struct xlog_in_core	*iclog;
+ 	xfs_lsn_t		lsn;
+ 
+-	XFS_STATS_INC(xs_log_force);
++	XFS_STATS_INC(mp, xs_log_force);
+ 
+ 	xlog_cil_force(log);
+ 
+@@ -3282,7 +3282,7 @@ maybe_sleep:
+ 			spin_unlock(&log->l_icloglock);
+ 			return -EIO;
+ 		}
+-		XFS_STATS_INC(xs_log_force_sleep);
++		XFS_STATS_INC(mp, xs_log_force_sleep);
+ 		xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
+ 		/*
+ 		 * No need to grab the log lock here since we're
+@@ -3347,7 +3347,7 @@ _xfs_log_force_lsn(
+ 
+ 	ASSERT(lsn != 0);
+ 
+-	XFS_STATS_INC(xs_log_force);
++	XFS_STATS_INC(mp, xs_log_force);
+ 
+ 	lsn = xlog_cil_force_lsn(log, lsn);
+ 	if (lsn == NULLCOMMITLSN)
+@@ -3396,7 +3396,7 @@ try_again:
+ 			     (XLOG_STATE_WANT_SYNC | XLOG_STATE_SYNCING))) {
+ 				ASSERT(!(iclog->ic_state & XLOG_STATE_IOERROR));
+ 
+-				XFS_STATS_INC(xs_log_force_sleep);
++				XFS_STATS_INC(mp, xs_log_force_sleep);
+ 
+ 				xlog_wait(&iclog->ic_prev->ic_write_wait,
+ 							&log->l_icloglock);
+@@ -3426,7 +3426,7 @@ try_again:
+ 				spin_unlock(&log->l_icloglock);
+ 				return -EIO;
+ 			}
+-			XFS_STATS_INC(xs_log_force_sleep);
++			XFS_STATS_INC(mp, xs_log_force_sleep);
+ 			xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
+ 			/*
+ 			 * No need to grab the log lock here since we're
+* Unmerged path fs/xfs/xfs_qm.c
+diff --git a/fs/xfs/xfs_stats.h b/fs/xfs/xfs_stats.h
+index 54f2260299d1..483b0eff1988 100644
+--- a/fs/xfs/xfs_stats.h
++++ b/fs/xfs/xfs_stats.h
+@@ -18,7 +18,6 @@
+ #ifndef __XFS_STATS_H__
+ #define __XFS_STATS_H__
+ 
+-#if defined(CONFIG_PROC_FS) && !defined(XFS_STATS_OFF)
+ 
+ #include <linux/percpu.h>
+ 
+@@ -218,14 +217,25 @@ int xfs_stats_format(struct xfsstats __percpu *stats, char *buf);
+ void xfs_stats_clearall(struct xfsstats __percpu *stats);
+ extern struct xstats xfsstats;
+ 
+-#define XFS_STATS_INC(v)	\
+-	(per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v++)
++#define XFS_STATS_INC(mp, v)					\
++do {								\
++	per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v++;	\
++	per_cpu_ptr(mp->m_stats.xs_stats, current_cpu())->v++;	\
++} while (0)
+ 
+-#define XFS_STATS_DEC(v)	\
+-	(per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v--)
++#define XFS_STATS_DEC(mp, v)					\
++do {								\
++	per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v--;	\
++	per_cpu_ptr(mp->m_stats.xs_stats, current_cpu())->v--;	\
++} while (0)
+ 
+-#define XFS_STATS_ADD(v, inc)	\
+-	(per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v += (inc))
++#define XFS_STATS_ADD(mp, v, inc)					\
++do {									\
++	per_cpu_ptr(xfsstats.xs_stats, current_cpu())->v += (inc);	\
++	per_cpu_ptr(mp->m_stats.xs_stats, current_cpu())->v += (inc);	\
++} while (0)
++
++#if defined(CONFIG_PROC_FS)
+ 
+ extern int xfs_init_procfs(void);
+ extern void xfs_cleanup_procfs(void);
+@@ -233,10 +243,6 @@ extern void xfs_cleanup_procfs(void);
+ 
+ #else	/* !CONFIG_PROC_FS */
+ 
+-# define XFS_STATS_INC(count)
+-# define XFS_STATS_DEC(count)
+-# define XFS_STATS_ADD(count, inc)
+-
+ static inline int xfs_init_procfs(void)
+ {
+ 	return 0;
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 4162ddd6cfe7..a7affc21a15f 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -944,7 +944,7 @@ xfs_fs_destroy_inode(
+ 
+ 	trace_xfs_destroy_inode(ip);
+ 
+-	XFS_STATS_INC(vn_reclaim);
++	XFS_STATS_INC(ip->i_mount, vn_reclaim);
+ 
+ 	ASSERT(XFS_FORCED_SHUTDOWN(ip->i_mount) || ip->i_delayed_blks == 0);
+ 
+@@ -1006,8 +1006,8 @@ xfs_fs_evict_inode(
+ 
+ 	truncate_inode_pages_final(&inode->i_data);
+ 	clear_inode(inode);
+-	XFS_STATS_INC(vn_rele);
+-	XFS_STATS_INC(vn_remove);
++	XFS_STATS_INC(ip->i_mount, vn_rele);
++	XFS_STATS_INC(ip->i_mount, vn_remove);
+ 
+ 	xfs_inactive(ip);
+ }
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 220ef2c906b2..d3e957037565 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -947,9 +947,9 @@ xfs_trans_commit(
+ 	 */
+ 	if (sync) {
+ 		error = _xfs_log_force_lsn(mp, commit_lsn, XFS_LOG_SYNC, NULL);
+-		XFS_STATS_INC(xs_trans_sync);
++		XFS_STATS_INC(mp, xs_trans_sync);
+ 	} else {
+-		XFS_STATS_INC(xs_trans_async);
++		XFS_STATS_INC(mp, xs_trans_async);
+ 	}
+ 
+ 	return error;
+@@ -972,7 +972,7 @@ out_unreserve:
+ 	xfs_trans_free_items(tp, NULLCOMMITLSN, error ? XFS_TRANS_ABORT : 0);
+ 	xfs_trans_free(tp);
+ 
+-	XFS_STATS_INC(xs_trans_empty);
++	XFS_STATS_INC(mp, xs_trans_empty);
+ 	return error;
+ }
+ 
+diff --git a/fs/xfs/xfs_trans_ail.c b/fs/xfs/xfs_trans_ail.c
+index 573aefb5a573..7dda726157f5 100644
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@ -349,7 +349,7 @@ xfsaild_push(
+ 	     xfs_ail_min_lsn(ailp))) {
+ 		ailp->xa_log_flush = 0;
+ 
+-		XFS_STATS_INC(xs_push_ail_flush);
++		XFS_STATS_INC(mp, xs_push_ail_flush);
+ 		xfs_log_force(mp, XFS_LOG_SYNC);
+ 	}
+ 
+@@ -371,7 +371,7 @@ xfsaild_push(
+ 		goto out_done;
+ 	}
+ 
+-	XFS_STATS_INC(xs_push_ail);
++	XFS_STATS_INC(mp, xs_push_ail);
+ 
+ 	lsn = lip->li_lsn;
+ 	while ((XFS_LSN_CMP(lip->li_lsn, target) <= 0)) {
+@@ -385,7 +385,7 @@ xfsaild_push(
+ 		lock_result = lip->li_ops->iop_push(lip, &ailp->xa_buf_list);
+ 		switch (lock_result) {
+ 		case XFS_ITEM_SUCCESS:
+-			XFS_STATS_INC(xs_push_ail_success);
++			XFS_STATS_INC(mp, xs_push_ail_success);
+ 			trace_xfs_ail_push(lip);
+ 
+ 			ailp->xa_last_pushed_lsn = lsn;
+@@ -403,7 +403,7 @@ xfsaild_push(
+ 			 * re-try the flushing relatively soon if most of the
+ 			 * AIL is beeing flushed.
+ 			 */
+-			XFS_STATS_INC(xs_push_ail_flushing);
++			XFS_STATS_INC(mp, xs_push_ail_flushing);
+ 			trace_xfs_ail_flushing(lip);
+ 
+ 			flushing++;
+@@ -411,14 +411,14 @@ xfsaild_push(
+ 			break;
+ 
+ 		case XFS_ITEM_PINNED:
+-			XFS_STATS_INC(xs_push_ail_pinned);
++			XFS_STATS_INC(mp, xs_push_ail_pinned);
+ 			trace_xfs_ail_pinned(lip);
+ 
+ 			stuck++;
+ 			ailp->xa_log_flush++;
+ 			break;
+ 		case XFS_ITEM_LOCKED:
+-			XFS_STATS_INC(xs_push_ail_locked);
++			XFS_STATS_INC(mp, xs_push_ail_locked);
+ 			trace_xfs_ail_locked(lip);
+ 
+ 			stuck++;
