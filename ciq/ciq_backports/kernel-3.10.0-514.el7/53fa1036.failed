@@ -1,0 +1,249 @@
+sctp: fix some rhashtable functions using in sctp proc/diag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 53fa10369c45a51947f06e8b622d2fa2cc64fda1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/53fa1036.failed
+
+When rhashtable_walk_init return err, no release function should be
+called, and when rhashtable_walk_start return err, we should only invoke
+rhashtable_walk_exit to release the source.
+
+But now when sctp_transport_walk_start return err, we just call
+rhashtable_walk_stop/exit, and never care about if rhashtable_walk_init
+or start return err, which is so bad.
+
+We will fix it by calling rhashtable_walk_exit if rhashtable_walk_start
+return err in sctp_transport_walk_start, and if sctp_transport_walk_start
+return err, we do not need to call sctp_transport_walk_stop any more.
+
+For sctp proc, we will use 'iter->start_fail' to decide if we will call
+rhashtable_walk_stop/exit.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 53fa10369c45a51947f06e8b622d2fa2cc64fda1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/proc.c
+#	net/sctp/socket.c
+diff --cc net/sctp/proc.c
+index aaeecb033eeb,4cb5aedfe3ee..000000000000
+--- a/net/sctp/proc.c
++++ b/net/sctp/proc.c
+@@@ -288,16 -277,52 +288,62 @@@ void sctp_eps_proc_exit(struct net *net
+  	remove_proc_entry("eps", net->sctp.proc_net_sctp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct sctp_ht_iter {
++ 	struct seq_net_private p;
++ 	struct rhashtable_iter hti;
++ 	int start_fail;
++ };
+++>>>>>>> 53fa10369c45 (sctp: fix some rhashtable functions using in sctp proc/diag)
+  
+ -static void *sctp_transport_seq_start(struct seq_file *seq, loff_t *pos)
+ +static void * sctp_assocs_seq_start(struct seq_file *seq, loff_t *pos)
+  {
+ -	struct sctp_ht_iter *iter = seq->private;
+ -	int err = sctp_transport_walk_start(&iter->hti);
+ +	if (*pos >= sctp_assoc_hashsize)
+ +		return NULL;
+ +
+++<<<<<<< HEAD
+ +	if (*pos < 0)
+ +		*pos = 0;
+  
+ +	if (*pos == 0)
+++=======
++ 	if (err) {
++ 		iter->start_fail = 1;
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	return sctp_transport_get_idx(seq_file_net(seq), &iter->hti, *pos);
++ }
++ 
++ static void sctp_transport_seq_stop(struct seq_file *seq, void *v)
++ {
++ 	struct sctp_ht_iter *iter = seq->private;
++ 
++ 	if (iter->start_fail)
++ 		return;
++ 	sctp_transport_walk_stop(&iter->hti);
++ }
++ 
++ static void *sctp_transport_seq_next(struct seq_file *seq, void *v, loff_t *pos)
++ {
++ 	struct sctp_ht_iter *iter = seq->private;
++ 
++ 	++*pos;
++ 
++ 	return sctp_transport_get_next(seq_file_net(seq), &iter->hti);
++ }
++ 
++ /* Display sctp associations (/proc/net/sctp/assocs). */
++ static int sctp_assocs_seq_show(struct seq_file *seq, void *v)
++ {
++ 	struct sctp_transport *transport;
++ 	struct sctp_association *assoc;
++ 	struct sctp_ep_common *epb;
++ 	struct sock *sk;
++ 
++ 	if (v == SEQ_START_TOKEN) {
+++>>>>>>> 53fa10369c45 (sctp: fix some rhashtable functions using in sctp proc/diag)
+  		seq_printf(seq, " ASSOC     SOCK   STY SST ST HBKT "
+  				"ASSOC-ID TX_QUEUE RX_QUEUE UID INODE LPORT "
+  				"RPORT LADDRS <-> RADDRS "
+diff --cc net/sctp/socket.c
+index 8d54b357f982,777d0324594a..000000000000
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@@ -4173,6 -4288,136 +4173,139 @@@ int sctp_get_sctp_info(struct sock *sk
+  }
+  EXPORT_SYMBOL_GPL(sctp_get_sctp_info);
+  
+++<<<<<<< HEAD
+++=======
++ /* use callback to avoid exporting the core structure */
++ int sctp_transport_walk_start(struct rhashtable_iter *iter)
++ {
++ 	int err;
++ 
++ 	err = rhashtable_walk_init(&sctp_transport_hashtable, iter,
++ 				   GFP_KERNEL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = rhashtable_walk_start(iter);
++ 	if (err && err != -EAGAIN) {
++ 		rhashtable_walk_exit(iter);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void sctp_transport_walk_stop(struct rhashtable_iter *iter)
++ {
++ 	rhashtable_walk_stop(iter);
++ 	rhashtable_walk_exit(iter);
++ }
++ 
++ struct sctp_transport *sctp_transport_get_next(struct net *net,
++ 					       struct rhashtable_iter *iter)
++ {
++ 	struct sctp_transport *t;
++ 
++ 	t = rhashtable_walk_next(iter);
++ 	for (; t; t = rhashtable_walk_next(iter)) {
++ 		if (IS_ERR(t)) {
++ 			if (PTR_ERR(t) == -EAGAIN)
++ 				continue;
++ 			break;
++ 		}
++ 
++ 		if (net_eq(sock_net(t->asoc->base.sk), net) &&
++ 		    t->asoc->peer.primary_path == t)
++ 			break;
++ 	}
++ 
++ 	return t;
++ }
++ 
++ struct sctp_transport *sctp_transport_get_idx(struct net *net,
++ 					      struct rhashtable_iter *iter,
++ 					      int pos)
++ {
++ 	void *obj = SEQ_START_TOKEN;
++ 
++ 	while (pos && (obj = sctp_transport_get_next(net, iter)) &&
++ 	       !IS_ERR(obj))
++ 		pos--;
++ 
++ 	return obj;
++ }
++ 
++ int sctp_for_each_endpoint(int (*cb)(struct sctp_endpoint *, void *),
++ 			   void *p) {
++ 	int err = 0;
++ 	int hash = 0;
++ 	struct sctp_ep_common *epb;
++ 	struct sctp_hashbucket *head;
++ 
++ 	for (head = sctp_ep_hashtable; hash < sctp_ep_hashsize;
++ 	     hash++, head++) {
++ 		read_lock(&head->lock);
++ 		sctp_for_each_hentry(epb, &head->chain) {
++ 			err = cb(sctp_ep(epb), p);
++ 			if (err)
++ 				break;
++ 		}
++ 		read_unlock(&head->lock);
++ 	}
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(sctp_for_each_endpoint);
++ 
++ int sctp_transport_lookup_process(int (*cb)(struct sctp_transport *, void *),
++ 				  struct net *net,
++ 				  const union sctp_addr *laddr,
++ 				  const union sctp_addr *paddr, void *p)
++ {
++ 	struct sctp_transport *transport;
++ 	int err = 0;
++ 
++ 	rcu_read_lock();
++ 	transport = sctp_addrs_lookup_transport(net, laddr, paddr);
++ 	if (!transport || !sctp_transport_hold(transport))
++ 		goto out;
++ 	err = cb(transport, p);
++ 	sctp_transport_put(transport);
++ 
++ out:
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(sctp_transport_lookup_process);
++ 
++ int sctp_for_each_transport(int (*cb)(struct sctp_transport *, void *),
++ 			    struct net *net, int pos, void *p) {
++ 	struct rhashtable_iter hti;
++ 	void *obj;
++ 	int err;
++ 
++ 	err = sctp_transport_walk_start(&hti);
++ 	if (err)
++ 		return err;
++ 
++ 	sctp_transport_get_idx(net, &hti, pos);
++ 	obj = sctp_transport_get_next(net, &hti);
++ 	for (; obj && !IS_ERR(obj); obj = sctp_transport_get_next(net, &hti)) {
++ 		struct sctp_transport *transport = obj;
++ 
++ 		if (!sctp_transport_hold(transport))
++ 			continue;
++ 		err = cb(transport, p);
++ 		sctp_transport_put(transport);
++ 		if (err)
++ 			break;
++ 	}
++ 	sctp_transport_walk_stop(&hti);
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(sctp_for_each_transport);
++ 
+++>>>>>>> 53fa10369c45 (sctp: fix some rhashtable functions using in sctp proc/diag)
+  /* 7.2.1 Association Status (SCTP_STATUS)
+  
+   * Applications can retrieve current status information about an
+* Unmerged path net/sctp/proc.c
+* Unmerged path net/sctp/socket.c
