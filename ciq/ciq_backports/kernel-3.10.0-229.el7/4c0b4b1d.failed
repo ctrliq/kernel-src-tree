@@ -1,0 +1,257 @@
+pefile: Parse the "Microsoft individual code signing" data blob
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 4c0b4b1d1ae0cbc86f150e2905a1c3d2a17b7c1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4c0b4b1d.failed
+
+The PKCS#7 certificate should contain a "Microsoft individual code signing"
+data blob as its signed content.  This blob contains a digest of the signed
+content of the PE binary and the OID of the digest algorithm used (typically
+SHA256).
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Acked-by: Vivek Goyal <vgoyal@redhat.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 4c0b4b1d1ae0cbc86f150e2905a1c3d2a17b7c1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/asymmetric_keys/Makefile
+#	crypto/asymmetric_keys/verify_pefile.c
+#	crypto/asymmetric_keys/verify_pefile.h
+diff --cc crypto/asymmetric_keys/Makefile
+index cd8388e5f2f1,e47fcd9ac5e8..000000000000
+--- a/crypto/asymmetric_keys/Makefile
++++ b/crypto/asymmetric_keys/Makefile
+@@@ -26,3 -25,40 +26,43 @@@ $(obj)/x509_rsakey-asn1.o: $(obj)/x509_
+  
+  clean-files	+= x509-asn1.c x509-asn1.h
+  clean-files	+= x509_rsakey-asn1.c x509_rsakey-asn1.h
+++<<<<<<< HEAD
+++=======
++ 
++ #
++ # PKCS#7 message handling
++ #
++ obj-$(CONFIG_PKCS7_MESSAGE_PARSER) += pkcs7_message.o
++ pkcs7_message-y := \
++ 	pkcs7-asn1.o \
++ 	pkcs7_parser.o \
++ 	pkcs7_trust.o \
++ 	pkcs7_verify.o
++ 
++ $(obj)/pkcs7_parser.o: $(obj)/pkcs7-asn1.h
++ $(obj)/pkcs7-asn1.o: $(obj)/pkcs7-asn1.c $(obj)/pkcs7-asn1.h
++ 
++ clean-files	+= pkcs7-asn1.c pkcs7-asn1.h
++ 
++ #
++ # PKCS#7 parser testing key
++ #
++ obj-$(CONFIG_PKCS7_TEST_KEY) += pkcs7_test_key.o
++ pkcs7_test_key-y := \
++ 	pkcs7_key_type.o
++ 
++ #
++ # Signed PE binary-wrapped key handling
++ #
++ obj-$(CONFIG_SIGNED_PE_FILE_VERIFICATION) += verify_signed_pefile.o
++ 
++ verify_signed_pefile-y := \
++ 	verify_pefile.o \
++ 	mscode_parser.o \
++ 	mscode-asn1.o
++ 
++ $(obj)/mscode_parser.o: $(obj)/mscode-asn1.h $(obj)/mscode-asn1.h
++ $(obj)/mscode-asn1.o: $(obj)/mscode-asn1.c $(obj)/mscode-asn1.h
++ 
++ clean-files	+= mscode-asn1.c mscode-asn1.h
+++>>>>>>> 4c0b4b1d1ae0 (pefile: Parse the "Microsoft individual code signing" data blob)
+* Unmerged path crypto/asymmetric_keys/verify_pefile.c
+* Unmerged path crypto/asymmetric_keys/verify_pefile.h
+* Unmerged path crypto/asymmetric_keys/Makefile
+diff --git a/crypto/asymmetric_keys/mscode.asn1 b/crypto/asymmetric_keys/mscode.asn1
+new file mode 100644
+index 000000000000..6d09ba48c41c
+--- /dev/null
++++ b/crypto/asymmetric_keys/mscode.asn1
+@@ -0,0 +1,28 @@
++--- Microsoft individual code signing data blob parser
++---
++--- Copyright (C) 2012 Red Hat, Inc. All Rights Reserved.
++--- Written by David Howells (dhowells@redhat.com)
++---
++--- This program is free software; you can redistribute it and/or
++--- modify it under the terms of the GNU General Public Licence
++--- as published by the Free Software Foundation; either version
++--- 2 of the Licence, or (at your option) any later version.
++---
++
++MSCode ::= SEQUENCE {
++	type			SEQUENCE {
++		contentType	ContentType,
++		parameters	ANY
++	},
++	content			SEQUENCE {
++		digestAlgorithm	DigestAlgorithmIdentifier,
++		digest		OCTET STRING ({ mscode_note_digest })
++	}
++}
++
++ContentType ::= OBJECT IDENTIFIER ({ mscode_note_content_type })
++
++DigestAlgorithmIdentifier ::= SEQUENCE {
++	algorithm   OBJECT IDENTIFIER ({ mscode_note_digest_algo }),
++	parameters  ANY OPTIONAL
++}
+diff --git a/crypto/asymmetric_keys/mscode_parser.c b/crypto/asymmetric_keys/mscode_parser.c
+new file mode 100644
+index 000000000000..09336c32b3d4
+--- /dev/null
++++ b/crypto/asymmetric_keys/mscode_parser.c
+@@ -0,0 +1,120 @@
++/* Parse a Microsoft Individual Code Signing blob
++ *
++ * Copyright (C) 2014 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#define pr_fmt(fmt) "MSCODE: "fmt
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/oid_registry.h>
++#include <crypto/pkcs7.h>
++#include "verify_pefile.h"
++#include "mscode-asn1.h"
++
++/*
++ * Parse a Microsoft Individual Code Signing blob
++ */
++int mscode_parse(struct pefile_context *ctx)
++{
++	const void *content_data;
++	size_t data_len;
++	int ret;
++
++	ret = pkcs7_get_content_data(ctx->pkcs7, &content_data, &data_len, 1);
++
++	if (ret) {
++		pr_debug("PKCS#7 message does not contain data\n");
++		return ret;
++	}
++
++	pr_devel("Data: %zu [%*ph]\n", data_len, (unsigned)(data_len),
++		 content_data);
++
++	return asn1_ber_decoder(&mscode_decoder, ctx, content_data, data_len);
++}
++
++/*
++ * Check the content type OID
++ */
++int mscode_note_content_type(void *context, size_t hdrlen,
++			     unsigned char tag,
++			     const void *value, size_t vlen)
++{
++	enum OID oid;
++
++	oid = look_up_OID(value, vlen);
++	if (oid == OID__NR) {
++		char buffer[50];
++
++		sprint_oid(value, vlen, buffer, sizeof(buffer));
++		pr_err("Unknown OID: %s\n", buffer);
++		return -EBADMSG;
++	}
++
++	if (oid != OID_msIndividualSPKeyPurpose) {
++		pr_err("Unexpected content type OID %u\n", oid);
++		return -EBADMSG;
++	}
++
++	return 0;
++}
++
++/*
++ * Note the digest algorithm OID
++ */
++int mscode_note_digest_algo(void *context, size_t hdrlen,
++			    unsigned char tag,
++			    const void *value, size_t vlen)
++{
++	struct pefile_context *ctx = context;
++	char buffer[50];
++	enum OID oid;
++
++	oid = look_up_OID(value, vlen);
++	switch (oid) {
++	case OID_md4:
++		ctx->digest_algo = HASH_ALGO_MD4;
++		break;
++	case OID_md5:
++		ctx->digest_algo = HASH_ALGO_MD5;
++		break;
++	case OID_sha1:
++		ctx->digest_algo = HASH_ALGO_SHA1;
++		break;
++	case OID_sha256:
++		ctx->digest_algo = HASH_ALGO_SHA256;
++		break;
++
++	case OID__NR:
++		sprint_oid(value, vlen, buffer, sizeof(buffer));
++		pr_err("Unknown OID: %s\n", buffer);
++		return -EBADMSG;
++
++	default:
++		pr_err("Unsupported content type: %u\n", oid);
++		return -ENOPKG;
++	}
++
++	return 0;
++}
++
++/*
++ * Note the digest we're guaranteeing with this certificate
++ */
++int mscode_note_digest(void *context, size_t hdrlen,
++		       unsigned char tag,
++		       const void *value, size_t vlen)
++{
++	struct pefile_context *ctx = context;
++
++	ctx->digest = value;
++	ctx->digest_len = vlen;
++	return 0;
++}
+* Unmerged path crypto/asymmetric_keys/verify_pefile.c
+* Unmerged path crypto/asymmetric_keys/verify_pefile.h
+diff --git a/include/linux/oid_registry.h b/include/linux/oid_registry.h
+index 6926db724258..d105bca8b74a 100644
+--- a/include/linux/oid_registry.h
++++ b/include/linux/oid_registry.h
+@@ -52,8 +52,13 @@ enum OID {
+ 	OID_md4,			/* 1.2.840.113549.2.4 */
+ 	OID_md5,			/* 1.2.840.113549.2.5 */
+ 
+-	OID_certAuthInfoAccess,		/* 1.3.6.1.5.5.7.1.1 */
++	/* Microsoft Authenticode & Software Publishing */
++	OID_msIndirectData,		/* 1.3.6.1.4.1.311.2.1.4 */
++	OID_msPeImageDataObjId,		/* 1.3.6.1.4.1.311.2.1.15 */
++	OID_msIndividualSPKeyPurpose,	/* 1.3.6.1.4.1.311.2.1.21 */
+ 	OID_msOutlookExpress,		/* 1.3.6.1.4.1.311.16.4 */
++
++	OID_certAuthInfoAccess,		/* 1.3.6.1.5.5.7.1.1 */
+ 	OID_sha1,			/* 1.3.14.3.2.26 */
+ 
+ 	/* Distinguished Name attribute IDs [RFC 2256] */
