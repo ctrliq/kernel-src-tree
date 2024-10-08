@@ -235,7 +235,8 @@ int adf_dev_stop(struct adf_accel_dev *accel_dev)
 	struct adf_hw_device_data *hw_data = accel_dev->hw_device;
 	struct service_hndl *service;
 	struct list_head *list_itr;
-	int ret, wait = 0;
+	bool wait = false;
+	int ret;
 
 	if (!adf_dev_started(accel_dev) &&
 	    !test_bit(ADF_STATUS_STARTING, &accel_dev->status)) {
@@ -258,7 +259,7 @@ int adf_dev_stop(struct adf_accel_dev *accel_dev)
 		if (!ret) {
 			clear_bit(accel_dev->accel_id, &service->start_status);
 		} else if (ret == -EAGAIN) {
-			wait = 1;
+			wait = true;
 			clear_bit(accel_dev->accel_id, &service->start_status);
 		}
 	}
