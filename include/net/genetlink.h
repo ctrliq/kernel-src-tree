@@ -373,4 +373,12 @@ static inline int genl_set_err(struct net *net, u32 portid, u32 group, int code)
 	return netlink_set_err(net->genl_sock, portid, group, code);
 }
 
+static inline int genl_has_listeners(struct genl_family *family,
+				     struct sock *sk, unsigned int group)
+{
+	if (WARN_ON_ONCE(group >= family->n_mcgrps))
+		return -EINVAL;
+	group = family->mcgrp_offset + group;
+	return netlink_has_listeners(sk, group);
+}
 #endif	/* __NET_GENERIC_NETLINK_H */
