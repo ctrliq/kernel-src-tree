@@ -3657,6 +3657,7 @@ static unsigned int perf_poll(struct file *file, poll_table *wait)
 	struct ring_buffer *rb;
 	unsigned int events = POLL_HUP;
 
+	poll_wait(file, &event->waitq, wait);
 	/*
 	 * Pin the event->rb by taking event->mmap_mutex; otherwise
 	 * perf_event_set_output() can swizzle our rb and make us miss wakeups.
@@ -3666,9 +3667,6 @@ static unsigned int perf_poll(struct file *file, poll_table *wait)
 	if (rb)
 		events = atomic_xchg(&rb->poll, 0);
 	mutex_unlock(&event->mmap_mutex);
-
-	poll_wait(file, &event->waitq, wait);
-
 	return events;
 }
 
