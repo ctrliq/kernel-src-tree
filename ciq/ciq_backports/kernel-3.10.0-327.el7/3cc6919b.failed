@@ -1,0 +1,226 @@
+backlight: Add backlight device (un)registration notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 3cc6919bd61315ea60baf95f3f9868aacfd1ace4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3cc6919b.failed
+
+Some firmware drivers, ie acpi-video want to get themselves out of the
+way (in some cases) when their also is a raw backlight device available.
+
+Due to module loading ordering being unknown, acpi-video cannot be certain
+that the backlight_device_registered(BACKLIGHT_RAW) it does for this is
+the final verdict wrt there being a BACKLIGHT_RAW device.
+
+By adding notification acpi-video can listen for backlight devices showing
+up after it has loaded, and unregister its backlight device if desired.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Acked-by: Jingoo Han <jg1.han@samsung.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 3cc6919bd61315ea60baf95f3f9868aacfd1ace4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/backlight/backlight.c
+#	include/linux/backlight.h
+diff --cc drivers/video/backlight/backlight.c
+index e3c279083253,428089009cd5..000000000000
+--- a/drivers/video/backlight/backlight.c
++++ b/drivers/video/backlight/backlight.c
+@@@ -21,6 -21,10 +21,13 @@@
+  #include <asm/backlight.h>
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static struct list_head backlight_dev_list;
++ static struct mutex backlight_dev_list_mutex;
++ static struct blocking_notifier_head backlight_notifier;
++ 
+++>>>>>>> 3cc6919bd613 (backlight: Add backlight device (un)registration notification)
+  static const char *const backlight_types[] = {
+  	[BACKLIGHT_RAW] = "raw",
+  	[BACKLIGHT_PLATFORM] = "platform",
+@@@ -340,6 -367,13 +347,16 @@@ struct backlight_device *backlight_devi
+  	mutex_unlock(&pmac_backlight_mutex);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&backlight_dev_list_mutex);
++ 	list_add(&new_bd->entry, &backlight_dev_list);
++ 	mutex_unlock(&backlight_dev_list_mutex);
++ 
++ 	blocking_notifier_call_chain(&backlight_notifier,
++ 				     BACKLIGHT_REGISTERED, new_bd);
++ 
+++>>>>>>> 3cc6919bd613 (backlight: Add backlight device (un)registration notification)
+  	return new_bd;
+  }
+  EXPORT_SYMBOL(backlight_device_register);
+@@@ -370,6 -430,111 +391,114 @@@ void backlight_device_unregister(struc
+  }
+  EXPORT_SYMBOL(backlight_device_unregister);
+  
+++<<<<<<< HEAD
+++=======
++ static void devm_backlight_device_release(struct device *dev, void *res)
++ {
++ 	struct backlight_device *backlight = *(struct backlight_device **)res;
++ 
++ 	backlight_device_unregister(backlight);
++ }
++ 
++ static int devm_backlight_device_match(struct device *dev, void *res,
++ 					void *data)
++ {
++ 	struct backlight_device **r = res;
++ 
++ 	return *r == data;
++ }
++ 
++ /**
++  * backlight_register_notifier - get notified of backlight (un)registration
++  * @nb: notifier block with the notifier to call on backlight (un)registration
++  *
++  * @return 0 on success, otherwise a negative error code
++  *
++  * Register a notifier to get notified when backlight devices get registered
++  * or unregistered.
++  */
++ int backlight_register_notifier(struct notifier_block *nb)
++ {
++ 	return blocking_notifier_chain_register(&backlight_notifier, nb);
++ }
++ EXPORT_SYMBOL(backlight_register_notifier);
++ 
++ /**
++  * backlight_unregister_notifier - unregister a backlight notifier
++  * @nb: notifier block to unregister
++  *
++  * @return 0 on success, otherwise a negative error code
++  *
++  * Register a notifier to get notified when backlight devices get registered
++  * or unregistered.
++  */
++ int backlight_unregister_notifier(struct notifier_block *nb)
++ {
++ 	return blocking_notifier_chain_unregister(&backlight_notifier, nb);
++ }
++ EXPORT_SYMBOL(backlight_unregister_notifier);
++ 
++ /**
++  * devm_backlight_device_register - resource managed backlight_device_register()
++  * @dev: the device to register
++  * @name: the name of the device
++  * @parent: a pointer to the parent device
++  * @devdata: an optional pointer to be stored for private driver use
++  * @ops: the backlight operations structure
++  * @props: the backlight properties
++  *
++  * @return a struct backlight on success, or an ERR_PTR on error
++  *
++  * Managed backlight_device_register(). The backlight_device returned
++  * from this function are automatically freed on driver detach.
++  * See backlight_device_register() for more information.
++  */
++ struct backlight_device *devm_backlight_device_register(struct device *dev,
++ 	const char *name, struct device *parent, void *devdata,
++ 	const struct backlight_ops *ops,
++ 	const struct backlight_properties *props)
++ {
++ 	struct backlight_device **ptr, *backlight;
++ 
++ 	ptr = devres_alloc(devm_backlight_device_release, sizeof(*ptr),
++ 			GFP_KERNEL);
++ 	if (!ptr)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	backlight = backlight_device_register(name, parent, devdata, ops,
++ 						props);
++ 	if (!IS_ERR(backlight)) {
++ 		*ptr = backlight;
++ 		devres_add(dev, ptr);
++ 	} else {
++ 		devres_free(ptr);
++ 	}
++ 
++ 	return backlight;
++ }
++ EXPORT_SYMBOL(devm_backlight_device_register);
++ 
++ /**
++  * devm_backlight_device_unregister - resource managed backlight_device_unregister()
++  * @dev: the device to unregister
++  * @bd: the backlight device to unregister
++  *
++  * Deallocated a backlight allocated with devm_backlight_device_register().
++  * Normally this function will not need to be called and the resource management
++  * code will ensure that the resource is freed.
++  */
++ void devm_backlight_device_unregister(struct device *dev,
++ 				struct backlight_device *bd)
++ {
++ 	int rc;
++ 
++ 	rc = devres_release(dev, devm_backlight_device_release,
++ 				devm_backlight_device_match, bd);
++ 	WARN_ON(rc);
++ }
++ EXPORT_SYMBOL(devm_backlight_device_unregister);
++ 
+++>>>>>>> 3cc6919bd613 (backlight: Add backlight device (un)registration notification)
+  #ifdef CONFIG_OF
+  static int of_parent_match(struct device *dev, const void *data)
+  {
+@@@ -413,9 -578,12 +542,18 @@@ static int __init backlight_class_init(
+  		return PTR_ERR(backlight_class);
+  	}
+  
+++<<<<<<< HEAD
+ +	backlight_class->dev_attrs = bl_device_attributes;
+ +	backlight_class->suspend = backlight_suspend;
+ +	backlight_class->resume = backlight_resume;
+++=======
++ 	backlight_class->dev_groups = bl_device_groups;
++ 	backlight_class->pm = &backlight_class_dev_pm_ops;
++ 	INIT_LIST_HEAD(&backlight_dev_list);
++ 	mutex_init(&backlight_dev_list_mutex);
++ 	BLOCKING_INIT_NOTIFIER_HEAD(&backlight_notifier);
++ 
+++>>>>>>> 3cc6919bd613 (backlight: Add backlight device (un)registration notification)
+  	return 0;
+  }
+  
+diff --cc include/linux/backlight.h
+index da9a0825e007,adb14a8616df..000000000000
+--- a/include/linux/backlight.h
++++ b/include/linux/backlight.h
+@@@ -114,9 -128,18 +119,15 @@@ static inline void backlight_update_sta
+  extern struct backlight_device *backlight_device_register(const char *name,
+  	struct device *dev, void *devdata, const struct backlight_ops *ops,
+  	const struct backlight_properties *props);
+ -extern struct backlight_device *devm_backlight_device_register(
+ -	struct device *dev, const char *name, struct device *parent,
+ -	void *devdata, const struct backlight_ops *ops,
+ -	const struct backlight_properties *props);
+  extern void backlight_device_unregister(struct backlight_device *bd);
+ -extern void devm_backlight_device_unregister(struct device *dev,
+ -					struct backlight_device *bd);
+  extern void backlight_force_update(struct backlight_device *bd,
+  				   enum backlight_update_reason reason);
+++<<<<<<< HEAD
+++=======
++ extern bool backlight_device_registered(enum backlight_type type);
++ extern int backlight_register_notifier(struct notifier_block *nb);
++ extern int backlight_unregister_notifier(struct notifier_block *nb);
+++>>>>>>> 3cc6919bd613 (backlight: Add backlight device (un)registration notification)
+  
+  #define to_backlight_device(obj) container_of(obj, struct backlight_device, dev)
+  
+* Unmerged path drivers/video/backlight/backlight.c
+* Unmerged path include/linux/backlight.h
