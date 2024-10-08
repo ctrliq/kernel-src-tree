@@ -1,0 +1,177 @@
+mm: fix XIP fault vs truncate race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [mm] fix XIP fault vs truncate race (Eric Sandeen) [1274459]
+Rebuild_FUZZ: 93.75%
+commit-author Matthew Wilcox <matthew.r.wilcox@intel.com>
+commit 283307c7607de2a06d3bfae4cfbf5a566d457090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/283307c7.failed
+
+DAX is a replacement for the variation of XIP currently supported by the
+ext2 filesystem.  We have three different things in the tree called 'XIP',
+and the new focus is on access to data rather than executables, so a name
+change was in order.  DAX stands for Direct Access.  The X is for
+eXciting.
+
+The new focus on data access has resulted in more careful attention to
+races that exist in the current XIP code, but are not hit by the use-case
+that it was designed for.  XIP's architecture worked fine for ext2, but
+DAX is architected to work with modern filsystems such as ext4 and XFS.
+DAX is not intended for use with btrfs; the value that btrfs adds relies
+on manipulating data and writing data to different locations, while DAX's
+value is for write-in-place and keeping the kernel from touching the data.
+
+DAX was developed in order to support NV-DIMMs, but it's become clear that
+its usefuless extends beyond NV-DIMMs and there are several potential
+customers including the tracing machinery.  Other people want to place the
+kernel log in an area of memory, as long as they have a BIOS that does not
+clear DRAM on reboot.
+
+Patch 1 is a bug fix, probably worth including in 3.18.
+
+Patches 2 & 3 are infrastructure for DAX.
+
+Patches 4-8 replace the XIP code with its DAX equivalents, transforming
+ext2 to use the DAX code as we go.  Note that patch 10 is the
+Documentation patch.
+
+Patches 9-15 clean up after the XIP code, removing the infrastructure
+that is no longer needed and renaming various XIP things to DAX.
+Most of these patches were added after Jan found things he didn't
+like in an earlier version of the ext4 patch ... that had been copied
+from ext2.  So ext2 i being transformed to do things the same way that
+ext4 will later.  The ability to mount ext2 filesystems with the 'xip'
+option is retained, although the 'dax' option is now preferred.
+
+Patch 16 adds some DAX infrastructure to support ext4.
+
+Patch 17 adds DAX support to ext4.  It is broadly similar to ext2's DAX
+support, but it is more efficient than ext4's due to its support for
+unwritten extents.
+
+Patch 18 is another cleanup patch renaming XIP to DAX.
+
+My thanks to Mathieu Desnoyers for his reviews of the v11 patchset.  Most
+of the changes below were based on his feedback.
+
+This patch (of 18):
+
+Pagecache faults recheck i_size after taking the page lock to ensure that
+the fault didn't race against a truncate.  We don't have a page to lock in
+the XIP case, so use i_mmap_lock_read() instead.  It is locked in the
+truncate path in unmap_mapping_range() after updating i_size.  So while we
+hold it in the fault path, we are guaranteed that either i_size has
+already been updated in the truncate path, or that the truncate will
+subsequently call zap_page_range_single() and so remove the mapping we
+have just inserted.
+
+There is a window of time in which i_size has been reduced and the thread
+has a mapping to a page which will be removed from the file, but this is
+harmless as the page will not be allocated to a different purpose before
+the thread's access to it is revoked.
+
+[akpm@linux-foundation.org: switch to i_mmap_lock_read(), add comment in unmap_single_vma()]
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Andreas Dilger <andreas.dilger@intel.com>
+	Cc: Boaz Harrosh <boaz@plexistor.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 283307c7607de2a06d3bfae4cfbf5a566d457090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index fce51319197b,1b04e13b9993..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3190,12 -2329,11 +3190,17 @@@ void unmap_mapping_range(struct address
+  		details.last_index = ULONG_MAX;
+  
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&mapping->i_mmap_mutex);
+++=======
++ 	/* DAX uses i_mmap_lock to serialise file truncate vs page fault */
++ 	i_mmap_lock_write(mapping);
+++>>>>>>> 283307c7607d (mm: fix XIP fault vs truncate race)
+  	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap)))
+  		unmap_mapping_range_tree(&mapping->i_mmap, &details);
+ -	i_mmap_unlock_write(mapping);
+ +	if (unlikely(!list_empty(&mapping->i_mmap_nonlinear)))
+ +		unmap_mapping_range_list(&mapping->i_mmap_nonlinear, &details);
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+  }
+  EXPORT_SYMBOL(unmap_mapping_range);
+  
+diff --git a/mm/filemap_xip.c b/mm/filemap_xip.c
+index 28fe26b64f8a..5214867d1e0d 100644
+--- a/mm/filemap_xip.c
++++ b/mm/filemap_xip.c
+@@ -260,8 +260,20 @@ again:
+ 		__xip_unmap(mapping, vmf->pgoff);
+ 
+ found:
++		/*
++		 * We must recheck i_size under i_mmap_rwsem to prevent races
++		 * with truncation
++		 */
++		i_mmap_lock_read(mapping);
++		size = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
++							PAGE_CACHE_SHIFT;
++		if (unlikely(vmf->pgoff >= size)) {
++			i_mmap_unlock_read(mapping);
++			return VM_FAULT_SIGBUS;
++		}
+ 		err = vm_insert_mixed(vma, (unsigned long)vmf->virtual_address,
+ 							xip_pfn);
++		i_mmap_unlock_read(mapping);
+ 		if (err == -ENOMEM)
+ 			return VM_FAULT_OOM;
+ 		/*
+@@ -285,16 +297,30 @@ found:
+ 		}
+ 		if (error != -ENODATA)
+ 			goto out;
++
++		/*
++		 * We must recheck i_size under i_mmap_rwsem to prevent races
++		 * with truncation
++		 */
++		i_mmap_lock_read(mapping);
++		size = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
++							PAGE_CACHE_SHIFT;
++		if (unlikely(vmf->pgoff >= size)) {
++			ret = VM_FAULT_SIGBUS;
++			goto unlock;
++		}
+ 		/* not shared and writable, use xip_sparse_page() */
+ 		page = xip_sparse_page();
+ 		if (!page)
+-			goto out;
++			goto unlock;
+ 		err = vm_insert_page(vma, (unsigned long)vmf->virtual_address,
+ 							page);
+ 		if (err == -ENOMEM)
+-			goto out;
++			goto unlock;
+ 
+ 		ret = VM_FAULT_NOPAGE;
++unlock:
++		i_mmap_unlock_read(mapping);
+ out:
+ 		write_seqcount_end(&xip_sparse_seq);
+ 		mutex_unlock(&xip_sparse_mutex);
+* Unmerged path mm/memory.c
