@@ -75,7 +75,7 @@ MODULE_PARM_DESC(log_ecn_error, "Log packets received with corrupted ECN");
 
 static int vxlan_net_id;
 
-static const u8 all_zeros_mac[ETH_ALEN];
+static const u8 all_zeros_mac[ETH_ALEN + 2];
 
 /* per-network namespace private data for this module */
 struct vxlan_net {
