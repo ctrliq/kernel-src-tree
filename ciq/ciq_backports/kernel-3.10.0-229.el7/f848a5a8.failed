@@ -1,0 +1,122 @@
+KVM: support any-length wildcard ioeventfd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit f848a5a8dcb655553423f77cc98909a04e64173d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/f848a5a8.failed
+
+It is sometimes benefitial to ignore IO size, and only match on address.
+In hindsight this would have been a better default than matching length
+when KVM_IOEVENTFD_FLAG_DATAMATCH is not set, In particular, this kind
+of access can be optimized on VMX: there no need to do page lookups.
+This can currently be done with many ioeventfds but in a suboptimal way.
+
+However we can't change kernel/userspace ABI without risk of breaking
+some applications.
+Use len = 0 to mean "ignore length for matching" in a more optimal way.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+(cherry picked from commit f848a5a8dcb655553423f77cc98909a04e64173d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index 1ba9af99e2bc,39098a61f41c..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -667,8 -736,14 +667,14 @@@ struct kvm_ppc_smmu_info 
+  #define KVM_CAP_IRQ_MPIC 90
+  #define KVM_CAP_PPC_RTAS 91
+  #define KVM_CAP_IRQ_XICS 92
+ -#define KVM_CAP_ARM_EL1_32BIT 93
+ -#define KVM_CAP_SPAPR_MULTITCE 94
+ -#define KVM_CAP_EXT_EMUL_CPUID 95
+  #define KVM_CAP_HYPERV_TIME 96
+  #define KVM_CAP_IOAPIC_POLARITY_IGNORED 97
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ENABLE_CAP_VM 98
++ #define KVM_CAP_S390_IRQCHIP 99
++ #define KVM_CAP_IOEVENTFD_NO_LENGTH 100
+++>>>>>>> f848a5a8dcb6 (KVM: support any-length wildcard ioeventfd)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ab543d399746..68516915713f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2630,6 +2630,7 @@ int kvm_dev_ioctl_check_extension(long ext)
+ 	case KVM_CAP_IRQ_INJECT_STATUS:
+ 	case KVM_CAP_IRQFD:
+ 	case KVM_CAP_IOEVENTFD:
++	case KVM_CAP_IOEVENTFD_NO_LENGTH:
+ 	case KVM_CAP_PIT2:
+ 	case KVM_CAP_PIT_STATE2:
+ 	case KVM_CAP_SET_IDENTITY_MAP_ADDR:
+* Unmerged path include/uapi/linux/kvm.h
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index 49583d2b0281..20c3af7692c5 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -605,7 +605,15 @@ ioeventfd_in_range(struct _ioeventfd *p, gpa_t addr, int len, const void *val)
+ {
+ 	u64 _val;
+ 
+-	if (!(addr == p->addr && len == p->length))
++	if (addr != p->addr)
++		/* address must be precise for a hit */
++		return false;
++
++	if (!p->length)
++		/* length = 0 means only look at the address, so always a hit */
++		return true;
++
++	if (len != p->length)
+ 		/* address-range must be precise for a hit */
+ 		return false;
+ 
+@@ -676,9 +684,11 @@ ioeventfd_check_collision(struct kvm *kvm, struct _ioeventfd *p)
+ 
+ 	list_for_each_entry(_p, &kvm->ioeventfds, list)
+ 		if (_p->bus_idx == p->bus_idx &&
+-		    _p->addr == p->addr && _p->length == p->length &&
+-		    (_p->wildcard || p->wildcard ||
+-		     _p->datamatch == p->datamatch))
++		    _p->addr == p->addr &&
++		    (!_p->length || !p->length ||
++		     (_p->length == p->length &&
++		      (_p->wildcard || p->wildcard ||
++		       _p->datamatch == p->datamatch))))
+ 			return true;
+ 
+ 	return false;
+@@ -702,8 +712,9 @@ kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
+ 	int                       ret;
+ 
+ 	bus_idx = ioeventfd_bus_from_flags(args->flags);
+-	/* must be natural-word sized */
++	/* must be natural-word sized, or 0 to ignore length */
+ 	switch (args->len) {
++	case 0:
+ 	case 1:
+ 	case 2:
+ 	case 4:
+@@ -721,6 +732,12 @@ kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
+ 	if (args->flags & ~KVM_IOEVENTFD_VALID_FLAG_MASK)
+ 		return -EINVAL;
+ 
++	/* ioeventfd with no length can't be combined with DATAMATCH */
++	if (!args->len &&
++	    args->flags & (KVM_IOEVENTFD_FLAG_PIO |
++			   KVM_IOEVENTFD_FLAG_DATAMATCH))
++		return -EINVAL;
++
+ 	eventfd = eventfd_ctx_fdget(args->fd);
+ 	if (IS_ERR(eventfd))
+ 		return PTR_ERR(eventfd);
