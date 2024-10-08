@@ -1,0 +1,128 @@
+zram: rework reset and destroy path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+commit a096cafc31862c54da0b56c8441dc14023437008
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a096cafc.failed
+
+We need to return set_capacity(disk, 0) from reset_store() back to
+zram_reset_device(), a catch by Ganesh Mahendran.  Potentially, we can
+race set_capacity() calls from init and reset paths.
+
+The problem is that zram_reset_device() is also getting called from
+zram_exit(), which performs operations in misleading reversed order -- we
+first create_device() and then init it, while zram_exit() perform
+destroy_device() first and then does zram_reset_device().  This is done to
+remove sysfs group before we reset device, so we can continue with device
+reset/destruction not being raced by sysfs attr write (f.e.  disksize).
+
+Apart from that, destroy_device() releases zram->disk (but we still have
+->disk pointer), so we cannot acces zram->disk in later
+zram_reset_device() call, which may cause additional errors in the future.
+
+So, this patch rework and cleanup destroy path.
+
+1) remove several unneeded goto labels in zram_init()
+
+2) factor out zram_init() error path and zram_exit() into
+   destroy_devices() function, which takes the number of devices to
+   destroy as its argument.
+
+3) remove sysfs group in destroy_devices() first, so we can reorder
+   operations -- reset device (as expected) goes before disk destroy and
+   queue cleanup.  So we can always access ->disk in zram_reset_device().
+
+4) and, finally, return set_capacity() back under ->init_lock.
+
+[akpm@linux-foundation.org: tweak comment]
+	Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reported-by: Ganesh Mahendran <opensource.ganesh@gmail.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Jerome Marchand <jmarchan@redhat.com>
+	Cc: Nitin Gupta <ngupta@vflare.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a096cafc31862c54da0b56c8441dc14023437008)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/zram/zram_drv.c
+diff --cc drivers/block/zram/zram_drv.c
+index 993edf69896a,81ac8fd53340..000000000000
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@@ -672,20 -732,10 +672,23 @@@ static void zram_reset_device(struct zr
+  	zram->meta = NULL;
+  	/* Reset stats */
+  	memset(&zram->stats, 0, sizeof(zram->stats));
+- 
+  	zram->disksize = 0;
+++<<<<<<< HEAD
+ +	if (reset_capacity)
+ +		set_capacity(zram->disk, 0);
+++=======
++ 	set_capacity(zram->disk, 0);
+++>>>>>>> a096cafc3186 (zram: rework reset and destroy path)
+  
+  	up_write(&zram->init_lock);
+ +
+ +	/*
+ +	 * Revalidate disk out of the init_lock to avoid lockdep splat.
+ +	 * It's okay because disk's capacity is protected by init_lock
+ +	 * so that revalidate_disk always sees up-to-date capacity.
+ +	 */
+ +	if (reset_capacity)
+ +		revalidate_disk(zram->disk);
+  }
+  
+  static ssize_t disksize_store(struct device *dev,
+@@@ -775,9 -826,12 +778,16 @@@ static ssize_t reset_store(struct devic
+  
+  	/* Make sure all pending I/O is finished */
+  	fsync_bdev(bdev);
+++<<<<<<< HEAD
+++=======
++ 	zram_reset_device(zram);
++ 
++ 	mutex_unlock(&bdev->bd_mutex);
++ 	revalidate_disk(zram->disk);
+++>>>>>>> a096cafc3186 (zram: rework reset and destroy path)
+  	bdput(bdev);
+  
+ +	zram_reset_device(zram, true);
+  	return len;
+  
+  out:
+@@@ -1055,24 -1178,7 +1073,28 @@@ out_error
+  
+  static void __exit zram_exit(void)
+  {
+++<<<<<<< HEAD
+ +	int i;
+ +	struct zram *zram;
+ +
+ +	for (i = 0; i < num_devices; i++) {
+ +		zram = &zram_devices[i];
+ +
+ +		destroy_device(zram);
+ +		/*
+ +		 * Shouldn't access zram->disk after destroy_device
+ +		 * because destroy_device already released zram->disk.
+ +		 */
+ +		zram_reset_device(zram, false);
+ +	}
+ +
+ +	unregister_blkdev(zram_major, "zram");
+ +
+ +	kfree(zram_devices);
+ +	pr_debug("Cleanup done!\n");
+++=======
++ 	destroy_devices(num_devices);
+++>>>>>>> a096cafc3186 (zram: rework reset and destroy path)
+  }
+  
+  module_init(zram_init);
+* Unmerged path drivers/block/zram/zram_drv.c
