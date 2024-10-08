@@ -1,0 +1,178 @@
+powerpc/mm/thp: Return pte address if we find trans_splitting.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [powerpc] mm: Return pte address if we find trans_splitting (Gustavo Duarte) [1233071]
+Rebuild_FUZZ: 88.29%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 7d6e7f7ffaba4e013c7a0589140431799bc17985
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/7d6e7f7f.failed
+
+For THP that is marked trans splitting, we return the pte.
+This require the callers to handle the pmd_trans_splitting scenario,
+if they care. All the current callers are either looking at pfn or
+write_ok, hence we don't need to update them.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 7d6e7f7ffaba4e013c7a0589140431799bc17985)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+#	arch/powerpc/kvm/book3s_hv_rm_mmu.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index f682ff67a26c,0fe9c92e78ed..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -675,19 -537,17 +675,21 @@@ int kvmppc_book3s_hv_page_fault(struct 
+  		}
+  		/* if the guest wants write access, see if that is OK */
+  		if (!writing && hpte_is_writable(r)) {
+- 			unsigned int hugepage_shift;
+  			pte_t *ptep, pte;
+++<<<<<<< HEAD
+ +
+++=======
++ 			unsigned long flags;
+++>>>>>>> 7d6e7f7ffaba (powerpc/mm/thp: Return pte address if we find trans_splitting.)
+  			/*
+  			 * We need to protect against page table destruction
+- 			 * while looking up and updating the pte.
++ 			 * hugepage split and collapse.
+  			 */
+ -			local_irq_save(flags);
+ +			rcu_read_lock_sched();
+  			ptep = find_linux_pte_or_hugepte(current->mm->pgd,
+- 							 hva, &hugepage_shift);
++ 							 hva, NULL);
+  			if (ptep) {
+- 				pte = kvmppc_read_update_linux_pte(ptep, 1,
+- 							   hugepage_shift);
++ 				pte = kvmppc_read_update_linux_pte(ptep, 1);
+  				if (pte_write(pte))
+  					write_ok = 1;
+  			}
+diff --cc arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index f1ee45edf8d1,d839f08cb903..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@@ -213,29 -190,37 +213,35 @@@ long kvmppc_do_h_enter(struct kvm *kvm
+  	slot_fn = gfn - memslot->base_gfn;
+  	rmap = &memslot->arch.rmap[slot_fn];
+  
+ -	/* Translate to host virtual address */
+ -	hva = __gfn_to_hva_memslot(memslot, gfn);
+ -	/*
+ -	 * If we had a page table table change after lookup, we would
+ -	 * retry via mmu_notifier_retry.
+ -	 */
+ -	if (realmode)
+ -		ptep = __find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+ -	else {
+ -		local_irq_save(irq_flags);
+ -		ptep = find_linux_pte_or_hugepte(pgdir, hva, &hpage_shift);
+ -	}
+ -	if (ptep) {
+ -		pte_t pte;
+ -		unsigned int host_pte_size;
+ -
+ -		if (hpage_shift)
+ -			host_pte_size = 1ul << hpage_shift;
+ -		else
+ -			host_pte_size = PAGE_SIZE;
+ -		/*
+ -		 * We should always find the guest page size
+ -		 * to <= host page size, if host is using hugepage
+ -		 */
+ -		if (host_pte_size < psize) {
+ -			if (!realmode)
+ -				local_irq_restore(flags);
+ +	if (!kvm->arch.using_mmu_notifiers) {
+ +		physp = memslot->arch.slot_phys;
+ +		if (!physp)
+  			return H_PARAMETER;
+++<<<<<<< HEAD
+ +		physp += slot_fn;
+ +		if (realmode)
+ +			physp = real_vmalloc_addr(physp);
+ +		pa = *physp;
+ +		if (!pa)
+ +			return H_TOO_HARD;
+ +		is_io = pa & (HPTE_R_I | HPTE_R_W);
+ +		pte_size = PAGE_SIZE << (pa & KVMPPC_PAGE_ORDER_MASK);
+ +		pa &= PAGE_MASK;
+ +		pa |= gpa & ~PAGE_MASK;
+ +	} else {
+ +		/* Translate to host virtual address */
+ +		hva = __gfn_to_hva_memslot(memslot, gfn);
+ +
+ +		/* Look up the Linux PTE for the backing page */
+ +		pte_size = psize;
+ +		pte = lookup_linux_pte_and_update(pgdir, hva, writing,
+ +						  &pte_size);
+ +		if (pte_present(pte) && !pte_numa(pte)) {
+++=======
++ 		}
++ 		pte = kvmppc_read_update_linux_pte(ptep, writing);
++ 		if (pte_present(pte) && !pte_protnone(pte)) {
+++>>>>>>> 7d6e7f7ffaba (powerpc/mm/thp: Return pte address if we find trans_splitting.)
+  			if (writing && !pte_write(pte))
+  				/* make the actual HPTE be read-only */
+  				ptel = hpte_make_readonly(ptel);
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index 893b466027eb..b66eedb50584 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -273,11 +273,9 @@ static inline int hpte_cache_flags_ok(unsigned long ptel, unsigned long io_type)
+ 
+ /*
+  * If it's present and writable, atomically set dirty and referenced bits and
+- * return the PTE, otherwise return 0. If we find a transparent hugepage
+- * and if it is marked splitting we return 0;
++ * return the PTE, otherwise return 0.
+  */
+-static inline pte_t kvmppc_read_update_linux_pte(pte_t *ptep, int writing,
+-						 unsigned int hugepage)
++static inline pte_t kvmppc_read_update_linux_pte(pte_t *ptep, int writing)
+ {
+ 	pte_t old_pte, new_pte = __pte(0);
+ 
+@@ -290,12 +288,6 @@ static inline pte_t kvmppc_read_update_linux_pte(pte_t *ptep, int writing,
+ 			cpu_relax();
+ 			continue;
+ 		}
+-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-		/* If hugepage and is trans splitting return None */
+-		if (unlikely(hugepage &&
+-			     pmd_trans_splitting(pte_pmd(old_pte))))
+-			return __pte(0);
+-#endif
+ 		/* If pte is not present return None */
+ 		if (unlikely(!(old_pte & _PAGE_PRESENT)))
+ 			return __pte(0);
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_mmu.c
+diff --git a/arch/powerpc/mm/hugetlbpage.c b/arch/powerpc/mm/hugetlbpage.c
+index 2b186fc7d583..4ca4662b7228 100644
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@ -990,12 +990,11 @@ pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea, unsigned *shift
+ 			 * A hugepage collapse is captured by pmd_none, because
+ 			 * it mark the pmd none and do a hpte invalidate.
+ 			 *
+-			 * A hugepage split is captured by pmd_trans_splitting
+-			 * because we mark the pmd trans splitting and do a
+-			 * hpte invalidate
+-			 *
++			 * We don't worry about pmd_trans_splitting here, The
++			 * caller if it needs to handle the splitting case
++			 * should check for that.
+ 			 */
+-			if (pmd_none(pmd) || pmd_trans_splitting(pmd))
++			if (pmd_none(pmd))
+ 				return NULL;
+ 
+ 			if (pmd_huge(pmd) || pmd_large(pmd)) {
