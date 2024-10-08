@@ -1,0 +1,180 @@
+AHCI: Move host activation code into ahci_host_activate()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Alexander Gordeev <agordeev@redhat.com>
+commit d1028e2f95b75acab4f1046acae1b1ca7d7b2577
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/d1028e2f.failed
+
+Currently host activation done by calling either function
+ahci_host_activate() or ata_host_activate(). Consolidate
+the code by only calling ahci_host_activate() for all AHCI
+devices.
+
+	Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: linux-ide@vger.kernel.org
+(cherry picked from commit d1028e2f95b75acab4f1046acae1b1ca7d7b2577)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/ahci.c
+#	drivers/ata/libahci.c
+#	drivers/ata/libahci_platform.c
+diff --cc drivers/ata/ahci.c
+index 2fc38f7d1744,d0ac38bd2d51..000000000000
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@@ -1444,11 -1427,7 +1444,15 @@@ static int ahci_init_one(struct pci_de
+  
+  	pci_set_master(pdev);
+  
+++<<<<<<< HEAD
+ +	if (hpriv->flags & AHCI_HFLAG_MULTI_MSI)
+ +		return ahci_host_activate(host, pdev->irq, n_msis);
+ +
+ +	return ata_host_activate(host, pdev->irq, ahci_interrupt, IRQF_SHARED,
+ +				 &ahci_sht);
+++=======
++ 	return ahci_host_activate(host, pdev->irq, &ahci_sht);
+++>>>>>>> d1028e2f95b7 (AHCI: Move host activation code into ahci_host_activate())
+  }
+  
+  module_pci_driver(ahci_pci_driver);
+diff --cc drivers/ata/libahci.c
+index 198a9d07a8bc,0080551f6e33..000000000000
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@@ -2458,6 -2469,81 +2455,84 @@@ void ahci_set_em_messages(struct ahci_h
+  }
+  EXPORT_SYMBOL_GPL(ahci_set_em_messages);
+  
+++<<<<<<< HEAD
+++=======
++ static int ahci_host_activate_multi_irqs(struct ata_host *host, int irq,
++ 					 struct scsi_host_template *sht)
++ {
++ 	int i, rc;
++ 
++ 	rc = ata_host_start(host);
++ 	if (rc)
++ 		return rc;
++ 
++ 	for (i = 0; i < host->n_ports; i++) {
++ 		struct ahci_port_priv *pp = host->ports[i]->private_data;
++ 
++ 		/* Do not receive interrupts sent by dummy ports */
++ 		if (!pp) {
++ 			disable_irq(irq + i);
++ 			continue;
++ 		}
++ 
++ 		rc = devm_request_threaded_irq(host->dev, irq + i,
++ 					       ahci_hw_interrupt,
++ 					       ahci_thread_fn, IRQF_SHARED,
++ 					       pp->irq_desc, host->ports[i]);
++ 		if (rc)
++ 			goto out_free_irqs;
++ 	}
++ 
++ 	for (i = 0; i < host->n_ports; i++)
++ 		ata_port_desc(host->ports[i], "irq %d", irq + i);
++ 
++ 	rc = ata_host_register(host, sht);
++ 	if (rc)
++ 		goto out_free_all_irqs;
++ 
++ 	return 0;
++ 
++ out_free_all_irqs:
++ 	i = host->n_ports;
++ out_free_irqs:
++ 	for (i--; i >= 0; i--)
++ 		devm_free_irq(host->dev, irq + i, host->ports[i]);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  *	ahci_host_activate - start AHCI host, request IRQs and register it
++  *	@host: target ATA host
++  *	@irq: base IRQ number to request
++  *	@sht: scsi_host_template to use when registering the host
++  *
++  *	Similar to ata_host_activate, but requests IRQs according to AHCI-1.1
++  *	when multiple MSIs were allocated. That is one MSI per port, starting
++  *	from @irq.
++  *
++  *	LOCKING:
++  *	Inherited from calling layer (may sleep).
++  *
++  *	RETURNS:
++  *	0 on success, -errno otherwise.
++  */
++ int ahci_host_activate(struct ata_host *host, int irq,
++ 		       struct scsi_host_template *sht)
++ {
++ 	struct ahci_host_priv *hpriv = host->private_data;
++ 	int rc;
++ 
++ 	if (hpriv->flags & AHCI_HFLAG_MULTI_MSI)
++ 		rc = ahci_host_activate_multi_irqs(host, irq, sht);
++ 	else
++ 		rc = ata_host_activate(host, irq, ahci_interrupt,
++ 				       IRQF_SHARED, sht);
++ 	return rc;
++ }
++ EXPORT_SYMBOL_GPL(ahci_host_activate);
++ 
+++>>>>>>> d1028e2f95b7 (AHCI: Move host activation code into ahci_host_activate())
+  MODULE_AUTHOR("Jeff Garzik");
+  MODULE_DESCRIPTION("Common AHCI SATA low-level routines");
+  MODULE_LICENSE("GPL");
+* Unmerged path drivers/ata/libahci_platform.c
+diff --git a/drivers/ata/acard-ahci.c b/drivers/ata/acard-ahci.c
+index bd3f2b9202dd..b9ed236f52d1 100644
+--- a/drivers/ata/acard-ahci.c
++++ b/drivers/ata/acard-ahci.c
+@@ -498,8 +498,7 @@ static int acard_ahci_init_one(struct pci_dev *pdev, const struct pci_device_id
+ 	acard_ahci_pci_print_info(host);
+ 
+ 	pci_set_master(pdev);
+-	return ata_host_activate(host, pdev->irq, ahci_interrupt, IRQF_SHARED,
+-				 &acard_ahci_sht);
++	return ahci_host_activate(host, pdev->irq, &acard_ahci_sht);
+ }
+ 
+ module_pci_driver(acard_ahci_pci_driver);
+* Unmerged path drivers/ata/ahci.c
+diff --git a/drivers/ata/ahci.h b/drivers/ata/ahci.h
+index 16b1c42fa23e..c5c9c08e0745 100644
+--- a/drivers/ata/ahci.h
++++ b/drivers/ata/ahci.h
+@@ -366,9 +366,6 @@ int ahci_port_resume(struct ata_port *ap);
+ void ahci_set_em_messages(struct ahci_host_priv *hpriv,
+ 			  struct ata_port_info *pi);
+ int ahci_reset_em(struct ata_host *host);
+-irqreturn_t ahci_interrupt(int irq, void *dev_instance);
+-irqreturn_t ahci_hw_interrupt(int irq, void *dev_instance);
+-irqreturn_t ahci_thread_fn(int irq, void *dev_instance);
+ void ahci_print_info(struct ata_host *host, const char *scc_s);
+ int ahci_host_activate(struct ata_host *host, int irq, unsigned int n_msis);
+ 
+* Unmerged path drivers/ata/libahci.c
+* Unmerged path drivers/ata/libahci_platform.c
+diff --git a/drivers/ata/sata_highbank.c b/drivers/ata/sata_highbank.c
+index dd71250942a9..053082bfb0b5 100644
+--- a/drivers/ata/sata_highbank.c
++++ b/drivers/ata/sata_highbank.c
+@@ -373,8 +373,7 @@ static int ahci_highbank_probe(struct platform_device *pdev)
+ 	ahci_init_controller(host);
+ 	ahci_print_info(host, "platform");
+ 
+-	rc = ata_host_activate(host, irq, ahci_interrupt, 0,
+-					&ahci_highbank_platform_sht);
++	rc = ahci_host_activate(host, irq, &ahci_highbank_platform_sht);
+ 	if (rc)
+ 		goto err0;
+ 
