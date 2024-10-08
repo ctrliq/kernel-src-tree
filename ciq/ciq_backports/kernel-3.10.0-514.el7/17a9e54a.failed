@@ -1,0 +1,201 @@
+hpsa: do not get enclosure info for external devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Don Brace <don.brace@microsemi.com>
+commit 17a9e54a99e68feb083b5ea0e6843686b7b327b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/17a9e54a.failed
+
+Stop annoying "Error, could not get enclosure information"
+messages.
+
+	Reviewed-by: Mahesh Rajashekhara <mahesh.rajashekhara@microsemi.com>
+	Reviewed-by: Justin Lindley <justin.lindley@microsemi.com>
+	Reviewed-by: Scott Teel <scott.teel@microsemi.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Reviewed-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 17a9e54a99e68feb083b5ea0e6843686b7b327b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 68754355feaa,098e8deb9212..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -3021,6 -3186,151 +3021,153 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * get enclosure information
++  * struct ReportExtendedLUNdata *rlep - Used for BMIC drive number
++  * struct hpsa_scsi_dev_t *encl_dev - device entry for enclosure
++  * Uses id_physical_device to determine the box_index.
++  */
++ static void hpsa_get_enclosure_info(struct ctlr_info *h,
++ 			unsigned char *scsi3addr,
++ 			struct ReportExtendedLUNdata *rlep, int rle_index,
++ 			struct hpsa_scsi_dev_t *encl_dev)
++ {
++ 	int rc = -1;
++ 	struct CommandList *c = NULL;
++ 	struct ErrorInfo *ei = NULL;
++ 	struct bmic_sense_storage_box_params *bssbp = NULL;
++ 	struct bmic_identify_physical_device *id_phys = NULL;
++ 	struct ext_report_lun_entry *rle = &rlep->LUN[rle_index];
++ 	u16 bmic_device_index = 0;
++ 
++ 	bmic_device_index = GET_BMIC_DRIVE_NUMBER(&rle->lunid[0]);
++ 
++ 	if (bmic_device_index == 0xFF00 || MASKED_DEVICE(&rle->lunid[0])) {
++ 		rc = IO_OK;
++ 		goto out;
++ 	}
++ 
++ 	bssbp = kzalloc(sizeof(*bssbp), GFP_KERNEL);
++ 	if (!bssbp)
++ 		goto out;
++ 
++ 	id_phys = kzalloc(sizeof(*id_phys), GFP_KERNEL);
++ 	if (!id_phys)
++ 		goto out;
++ 
++ 	rc = hpsa_bmic_id_physical_device(h, scsi3addr, bmic_device_index,
++ 						id_phys, sizeof(*id_phys));
++ 	if (rc) {
++ 		dev_warn(&h->pdev->dev, "%s: id_phys failed %d bdi[0x%x]\n",
++ 			__func__, encl_dev->external, bmic_device_index);
++ 		goto out;
++ 	}
++ 
++ 	c = cmd_alloc(h);
++ 
++ 	rc = fill_cmd(c, BMIC_SENSE_STORAGE_BOX_PARAMS, h, bssbp,
++ 			sizeof(*bssbp), 0, RAID_CTLR_LUNID, TYPE_CMD);
++ 
++ 	if (rc)
++ 		goto out;
++ 
++ 	if (id_phys->phys_connector[1] == 'E')
++ 		c->Request.CDB[5] = id_phys->box_index;
++ 	else
++ 		c->Request.CDB[5] = 0;
++ 
++ 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c, PCI_DMA_FROMDEVICE,
++ 						NO_TIMEOUT);
++ 	if (rc)
++ 		goto out;
++ 
++ 	ei = c->err_info;
++ 	if (ei->CommandStatus != 0 && ei->CommandStatus != CMD_DATA_UNDERRUN) {
++ 		rc = -1;
++ 		goto out;
++ 	}
++ 
++ 	encl_dev->box[id_phys->active_path_number] = bssbp->phys_box_on_port;
++ 	memcpy(&encl_dev->phys_connector[id_phys->active_path_number],
++ 		bssbp->phys_connector, sizeof(bssbp->phys_connector));
++ 
++ 	rc = IO_OK;
++ out:
++ 	kfree(bssbp);
++ 	kfree(id_phys);
++ 
++ 	if (c)
++ 		cmd_free(h, c);
++ 
++ 	if (rc != IO_OK)
++ 		hpsa_show_dev_msg(KERN_INFO, h, encl_dev,
++ 			"Error, could not get enclosure information\n");
++ }
++ 
++ static u64 hpsa_get_sas_address_from_report_physical(struct ctlr_info *h,
++ 						unsigned char *scsi3addr)
++ {
++ 	struct ReportExtendedLUNdata *physdev;
++ 	u32 nphysicals;
++ 	u64 sa = 0;
++ 	int i;
++ 
++ 	physdev = kzalloc(sizeof(*physdev), GFP_KERNEL);
++ 	if (!physdev)
++ 		return 0;
++ 
++ 	if (hpsa_scsi_do_report_phys_luns(h, physdev, sizeof(*physdev))) {
++ 		dev_err(&h->pdev->dev, "report physical LUNs failed.\n");
++ 		kfree(physdev);
++ 		return 0;
++ 	}
++ 	nphysicals = get_unaligned_be32(physdev->LUNListLength) / 24;
++ 
++ 	for (i = 0; i < nphysicals; i++)
++ 		if (!memcmp(&physdev->LUN[i].lunid[0], scsi3addr, 8)) {
++ 			sa = get_unaligned_be64(&physdev->LUN[i].wwid[0]);
++ 			break;
++ 		}
++ 
++ 	kfree(physdev);
++ 
++ 	return sa;
++ }
++ 
++ static void hpsa_get_sas_address(struct ctlr_info *h, unsigned char *scsi3addr,
++ 					struct hpsa_scsi_dev_t *dev)
++ {
++ 	int rc;
++ 	u64 sa = 0;
++ 
++ 	if (is_hba_lunid(scsi3addr)) {
++ 		struct bmic_sense_subsystem_info *ssi;
++ 
++ 		ssi = kzalloc(sizeof(*ssi), GFP_KERNEL);
++ 		if (ssi == NULL) {
++ 			dev_warn(&h->pdev->dev,
++ 				"%s: out of memory\n", __func__);
++ 			return;
++ 		}
++ 
++ 		rc = hpsa_bmic_sense_subsystem_information(h,
++ 					scsi3addr, 0, ssi, sizeof(*ssi));
++ 		if (rc == 0) {
++ 			sa = get_unaligned_be64(ssi->primary_world_wide_id);
++ 			h->sas_address = sa;
++ 		}
++ 
++ 		kfree(ssi);
++ 	} else
++ 		sa = hpsa_get_sas_address_from_report_physical(h, scsi3addr);
++ 
++ 	dev->sas_address = sa;
++ }
++ 
++ /* Get a device id from inquiry page 0x83 */
+++>>>>>>> 17a9e54a99e6 (hpsa: do not get enclosure info for external devices)
+  static int hpsa_vpd_page_supported(struct ctlr_info *h,
+  	unsigned char scsi3addr[], u8 page)
+  {
+@@@ -3889,8 -4199,11 +4036,16 @@@ static void hpsa_update_scsi_devices(st
+  			ncurrent++;
+  			break;
+  		case TYPE_ENCLOSURE:
+++<<<<<<< HEAD
+ +			if (h->hba_mode_enabled)
+ +				ncurrent++;
+++=======
++ 			if (!this_device->external)
++ 				hpsa_get_enclosure_info(h, lunaddrbytes,
++ 						physdev_list, phys_dev_index,
++ 						this_device);
++ 			ncurrent++;
+++>>>>>>> 17a9e54a99e6 (hpsa: do not get enclosure info for external devices)
+  			break;
+  		case TYPE_RAID:
+  			/* Only present the Smartarray HBA as a RAID controller.
+* Unmerged path drivers/scsi/hpsa.c
