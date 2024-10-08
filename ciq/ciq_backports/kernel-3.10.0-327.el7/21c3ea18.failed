@@ -1,0 +1,185 @@
+xfs: unlock i_mutex in xfs_break_layouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 21c3ea18819b5f650c75f59a0457415bc05d2b17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/21c3ea18.failed
+
+We want to drop all I/O path locks when recalling layouts, and that includes
+i_mutex for the write path.  Without this we get stuck processe when recalls
+take too long.
+
+[dchinner: fix build with !CONFIG_PNFS]
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 21c3ea18819b5f650c75f59a0457415bc05d2b17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_ioctl.c
+#	fs/xfs/xfs_iops.c
+#	fs/xfs/xfs_pnfs.c
+#	fs/xfs/xfs_pnfs.h
+diff --cc fs/xfs/xfs_file.c
+index 91b548987ce6,f63aeddd31d5..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -569,6 -555,10 +569,13 @@@ restart
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+++=======
++ 	error = xfs_break_layouts(inode, iolock, true);
++ 	if (error)
++ 		return error;
++ 
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+  	/*
+  	 * If the offset is beyond the size of the file, we need to zero any
+  	 * blocks that fall between the existing EOF and the start of this
+@@@ -856,10 -837,15 +863,18 @@@ xfs_file_fallocate
+  
+  	if (!S_ISREG(inode->i_mode))
+  		return -EINVAL;
+ -	if (mode & ~XFS_FALLOC_FL_SUPPORTED)
+ +	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 	xfs_ilock(ip, iolock);
++ 	error = xfs_break_layouts(inode, &iolock, false);
++ 	if (error)
++ 		goto out_unlock;
++ 
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+  	if (mode & FALLOC_FL_PUNCH_HOLE) {
+  		error = xfs_free_file_space(ip, offset, len);
+  		if (error)
+diff --cc fs/xfs/xfs_ioctl.c
+index c6e180d60c21,3a21cc71fda0..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -666,7 -638,10 +666,14 @@@ xfs_ioc_space
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+ +	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 	xfs_ilock(ip, iolock);
++ 	error = xfs_break_layouts(inode, &iolock, false);
++ 	if (error)
++ 		goto out_unlock;
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+  
+  	switch (bf->l_whence) {
+  	case 0: /*SEEK_SET*/
+diff --cc fs/xfs/xfs_iops.c
+index 4f197837766a,1d4efee4be17..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -933,9 -985,13 +933,19 @@@ xfs_vn_setattr
+  	int			error;
+  
+  	if (iattr->ia_valid & ATTR_SIZE) {
+++<<<<<<< HEAD
+ +		xfs_ilock(ip, XFS_IOLOCK_EXCL);
+ +		error = xfs_setattr_size(ip, iattr);
+ +		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 		uint		iolock = XFS_IOLOCK_EXCL;
++ 
++ 		xfs_ilock(ip, iolock);
++ 		error = xfs_break_layouts(dentry->d_inode, &iolock, true);
++ 		if (!error)
++ 			error = xfs_setattr_size(ip, iattr);
++ 		xfs_iunlock(ip, iolock);
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+  	} else {
+  		error = xfs_setattr_nonsize(ip, iattr, 0);
+  	}
+diff --cc fs/xfs/xfs_pnfs.c
+index 974f228f4916,cbb424f4d93a..000000000000
+--- a/fs/xfs/xfs_pnfs.c
++++ b/fs/xfs/xfs_pnfs.c
+@@@ -19,6 -19,41 +19,44 @@@
+  #include "xfs_pnfs.h"
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Ensure that we do not have any outstanding pNFS layouts that can be used by
++  * clients to directly read from or write to this inode.  This must be called
++  * before every operation that can remove blocks from the extent map.
++  * Additionally we call it during the write operation, where aren't concerned
++  * about exposing unallocated blocks but just want to provide basic
++  * synchronization between a local writer and pNFS clients.  mmap writes would
++  * also benefit from this sort of synchronization, but due to the tricky locking
++  * rules in the page fault path we don't bother.
++  */
++ int
++ xfs_break_layouts(
++ 	struct inode		*inode,
++ 	uint			*iolock,
++ 	bool			with_imutex)
++ {
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	int			error;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_SHARED|XFS_IOLOCK_EXCL));
++ 
++ 	while ((error = break_layout(inode, false) == -EWOULDBLOCK)) {
++ 		xfs_iunlock(ip, *iolock);
++ 		if (with_imutex && (*iolock & XFS_IOLOCK_EXCL))
++ 			mutex_unlock(&inode->i_mutex);
++ 		error = break_layout(inode, true);
++ 		*iolock = XFS_IOLOCK_EXCL;
++ 		if (with_imutex)
++ 			mutex_lock(&inode->i_mutex);
++ 		xfs_ilock(ip, *iolock);
++ 	}
++ 
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+   * Get a unique ID including its location so that the client can identify
+   * the exported device.
+   */
+diff --cc fs/xfs/xfs_pnfs.h
+index 0d91255a89ae,8147ac108820..000000000000
+--- a/fs/xfs/xfs_pnfs.h
++++ b/fs/xfs/xfs_pnfs.h
+@@@ -7,5 -7,13 +7,16 @@@ int xfs_fs_map_blocks(struct inode *ino
+  		struct iomap *iomap, bool write, u32 *device_generation);
+  int xfs_fs_commit_blocks(struct inode *inode, struct iomap *maps, int nr_maps,
+  		struct iattr *iattr);
+++<<<<<<< HEAD
+++=======
++ 
++ int xfs_break_layouts(struct inode *inode, uint *iolock, bool with_imutex);
++ #else
++ static inline int
++ xfs_break_layouts(struct inode *inode, uint *iolock, bool with_imutex)
++ {
++ 	return 0;
++ }
+++>>>>>>> 21c3ea18819b (xfs: unlock i_mutex in xfs_break_layouts)
+  #endif /* CONFIG_NFSD_PNFS */
+  #endif /* _XFS_PNFS_H */
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_ioctl.c
+* Unmerged path fs/xfs/xfs_iops.c
+* Unmerged path fs/xfs/xfs_pnfs.c
+* Unmerged path fs/xfs/xfs_pnfs.h
