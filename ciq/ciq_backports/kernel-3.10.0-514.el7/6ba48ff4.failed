@@ -1,0 +1,285 @@
+x86: Remove arbitrary instruction size limit in instruction decoder
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [x86] Remove arbitrary instruction size limit in instruction decoder (Rui Wang) [1138650]
+Rebuild_FUZZ: 96.12%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 6ba48ff46f764414f979d2eacb23c4e6296bcc95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/6ba48ff4.failed
+
+The current x86 instruction decoder steps along through the
+instruction stream but always ensures that it never steps farther
+than the largest possible instruction size (MAX_INSN_SIZE).
+
+The MPX code is now going to be doing some decoding of userspace
+instructions.  We copy those from userspace in to the kernel and
+they're obviously completely untrusted coming from userspace.  In
+addition to the constraint that instructions can only be so long,
+we also have to be aware of how long the buffer is that came in
+from userspace.  This _looks_ to be similar to what the perf and
+kprobes is doing, but it's unclear to me whether they are
+affected.
+
+The whole reason we need this is that it is perfectly valid to be
+executing an instruction within MAX_INSN_SIZE bytes of an
+unreadable page. We should be able to gracefully handle short
+reads in those cases.
+
+This adds support to the decoder to record how long the buffer
+being decoded is and to refuse to "validate" the instruction if
+we would have gone over the end of the buffer to decode it.
+
+The kprobes code probably needs to be looked at here a bit more
+carefully.  This patch still respects the MAX_INSN_SIZE limit
+there but the kprobes code does look like it might be able to
+be a bit more strict than it currently is.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Jim Keniston <jkenisto@us.ibm.com>
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: x86@kernel.org
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
+	Cc: Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+Link: http://lkml.kernel.org/r/20141114153957.E6B01535@viggo.jf.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 6ba48ff46f764414f979d2eacb23c4e6296bcc95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/perf_event_intel_lbr.c
+diff --cc arch/x86/kernel/cpu/perf_event_intel_lbr.c
+index af2f337a2b28,58f1a94beaf0..000000000000
+--- a/arch/x86/kernel/cpu/perf_event_intel_lbr.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
+@@@ -630,8 -493,10 +630,15 @@@ static int branch_type(unsigned long fr
+  			return X86_BR_NONE;
+  
+  		/* may fail if text not present */
+++<<<<<<< HEAD
+ +		bytes = copy_from_user_nmi(buf, (void __user *)from, size);
+ +		if (bytes != size)
+++=======
++ 		bytes_left = copy_from_user_nmi(buf, (void __user *)from,
++ 						MAX_INSN_SIZE);
++ 		bytes_read = MAX_INSN_SIZE - bytes_left;
++ 		if (!bytes_read)
+++>>>>>>> 6ba48ff46f76 (x86: Remove arbitrary instruction size limit in instruction decoder)
+  			return X86_BR_NONE;
+  
+  		addr = buf;
+diff --git a/arch/x86/include/asm/insn.h b/arch/x86/include/asm/insn.h
+index 48eb30a86062..47f29b1d1846 100644
+--- a/arch/x86/include/asm/insn.h
++++ b/arch/x86/include/asm/insn.h
+@@ -65,6 +65,7 @@ struct insn {
+ 	unsigned char x86_64;
+ 
+ 	const insn_byte_t *kaddr;	/* kernel address of insn to analyze */
++	const insn_byte_t *end_kaddr;	/* kernel address of last insn in buffer */
+ 	const insn_byte_t *next_byte;
+ };
+ 
+@@ -96,7 +97,7 @@ struct insn {
+ #define X86_VEX_P(vex)	((vex) & 0x03)		/* VEX3 Byte2, VEX2 Byte1 */
+ #define X86_VEX_M_MAX	0x1f			/* VEX3.M Maximum value */
+ 
+-extern void insn_init(struct insn *insn, const void *kaddr, int x86_64);
++extern void insn_init(struct insn *insn, const void *kaddr, int buf_len, int x86_64);
+ extern void insn_get_prefixes(struct insn *insn);
+ extern void insn_get_opcode(struct insn *insn);
+ extern void insn_get_modrm(struct insn *insn);
+@@ -115,12 +116,13 @@ static inline void insn_get_attribute(struct insn *insn)
+ extern int insn_rip_relative(struct insn *insn);
+ 
+ /* Init insn for kernel text */
+-static inline void kernel_insn_init(struct insn *insn, const void *kaddr)
++static inline void kernel_insn_init(struct insn *insn,
++				    const void *kaddr, int buf_len)
+ {
+ #ifdef CONFIG_X86_64
+-	insn_init(insn, kaddr, 1);
++	insn_init(insn, kaddr, buf_len, 1);
+ #else /* CONFIG_X86_32 */
+-	insn_init(insn, kaddr, 0);
++	insn_init(insn, kaddr, buf_len, 0);
+ #endif
+ }
+ 
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_ds.c b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+index 5397e918fe15..bcb8ca64d25c 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@ -740,6 +740,7 @@ static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
+ 	unsigned long ip = regs->ip;
+ 	int is_64bit = 0;
+ 	void *kaddr;
++	int size;
+ 
+ 	/*
+ 	 * We don't need to fixup if the PEBS assist is fault like
+@@ -774,11 +775,12 @@ static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
+ 		return 1;
+ 	}
+ 
++	size = ip - to;
+ 	if (!kernel_ip(ip)) {
+-		int size, bytes;
++		int bytes;
+ 		u8 *buf = this_cpu_read(insn_buffer);
+ 
+-		size = ip - to; /* Must fit our buffer, see above */
++		/* 'size' must fit our buffer, see above */
+ 		bytes = copy_from_user_nmi(buf, (void __user *)to, size);
+ 		if (bytes != size)
+ 			return 0;
+@@ -796,11 +798,20 @@ static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
+ #ifdef CONFIG_X86_64
+ 		is_64bit = kernel_ip(to) || !test_thread_flag(TIF_IA32);
+ #endif
+-		insn_init(&insn, kaddr, is_64bit);
++		insn_init(&insn, kaddr, size, is_64bit);
+ 		insn_get_length(&insn);
++		/*
++		 * Make sure there was not a problem decoding the
++		 * instruction and getting the length.  This is
++		 * doubly important because we have an infinite
++		 * loop if insn.length=0.
++		 */
++		if (!insn.length)
++			break;
+ 
+ 		to += insn.length;
+ 		kaddr += insn.length;
++		size -= insn.length;
+ 	} while (to < ip);
+ 
+ 	if (to == ip) {
+* Unmerged path arch/x86/kernel/cpu/perf_event_intel_lbr.c
+diff --git a/arch/x86/kernel/kprobes/core.c b/arch/x86/kernel/kprobes/core.c
+index 0c6c07cea3f7..c9cea856b19e 100644
+--- a/arch/x86/kernel/kprobes/core.c
++++ b/arch/x86/kernel/kprobes/core.c
+@@ -281,7 +281,7 @@ static int __kprobes can_probe(unsigned long paddr)
+ 		 * normally used, we just go through if there is no kprobe.
+ 		 */
+ 		__addr = recover_probed_instruction(buf, addr);
+-		kernel_insn_init(&insn, (void *)__addr);
++		kernel_insn_init(&insn, (void *)__addr, MAX_INSN_SIZE);
+ 		insn_get_length(&insn);
+ 
+ 		/*
+@@ -326,8 +326,10 @@ int __kprobes __copy_instruction(u8 *dest, u8 *src)
+ {
+ 	struct insn insn;
+ 	kprobe_opcode_t buf[MAX_INSN_SIZE];
++	unsigned long recovered_insn =
++		recover_probed_instruction(buf, (unsigned long)src);
+ 
+-	kernel_insn_init(&insn, (void *)recover_probed_instruction(buf, (unsigned long)src));
++	kernel_insn_init(&insn, (void *)recovered_insn, MAX_INSN_SIZE);
+ 	insn_get_length(&insn);
+ 	/* Another subsystem puts a breakpoint, failed to recover */
+ 	if (insn.opcode.bytes[0] == BREAKPOINT_INSTRUCTION)
+@@ -338,7 +340,7 @@ int __kprobes __copy_instruction(u8 *dest, u8 *src)
+ 	if (insn_rip_relative(&insn)) {
+ 		s64 newdisp;
+ 		u8 *disp;
+-		kernel_insn_init(&insn, dest);
++		kernel_insn_init(&insn, dest, insn.length);
+ 		insn_get_displacement(&insn);
+ 		/*
+ 		 * The copied instruction uses the %rip-relative addressing
+diff --git a/arch/x86/kernel/kprobes/opt.c b/arch/x86/kernel/kprobes/opt.c
+index 76dc6f095724..d41a3039e9dc 100644
+--- a/arch/x86/kernel/kprobes/opt.c
++++ b/arch/x86/kernel/kprobes/opt.c
+@@ -252,13 +252,15 @@ static int __kprobes can_optimize(unsigned long paddr)
+ 	/* Decode instructions */
+ 	addr = paddr - offset;
+ 	while (addr < paddr - offset + size) { /* Decode until function end */
++		unsigned long recovered_insn;
+ 		if (search_exception_tables(addr))
+ 			/*
+ 			 * Since some fixup code will jumps into this function,
+ 			 * we can't optimize kprobe in this function.
+ 			 */
+ 			return 0;
+-		kernel_insn_init(&insn, (void *)recover_probed_instruction(buf, addr));
++		recovered_insn = recover_probed_instruction(buf, addr);
++		kernel_insn_init(&insn, (void *)recovered_insn, MAX_INSN_SIZE);
+ 		insn_get_length(&insn);
+ 		/* Another subsystem puts a breakpoint */
+ 		if (insn.opcode.bytes[0] == BREAKPOINT_INSTRUCTION)
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index d4fb4c8f5f4e..26a4003a37d8 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -219,7 +219,7 @@ static int uprobe_init_insn(struct arch_uprobe *auprobe, struct insn *insn, bool
+ {
+ 	u32 volatile *good_insns;
+ 
+-	insn_init(insn, auprobe->insn, x86_64);
++	insn_init(insn, auprobe->insn, sizeof(auprobe->insn), x86_64);
+ 	/* has the side-effect of processing the entire instruction */
+ 	insn_get_length(insn);
+ 	if (WARN_ON_ONCE(!insn_complete(insn)))
+diff --git a/arch/x86/lib/insn.c b/arch/x86/lib/insn.c
+index 54fcffed28ed..2480978b31cc 100644
+--- a/arch/x86/lib/insn.c
++++ b/arch/x86/lib/insn.c
+@@ -28,7 +28,7 @@
+ 
+ /* Verify next sizeof(t) bytes can be on the same instruction */
+ #define validate_next(t, insn, n)	\
+-	((insn)->next_byte + sizeof(t) + n - (insn)->kaddr <= MAX_INSN_SIZE)
++	((insn)->next_byte + sizeof(t) + n < (insn)->end_kaddr)
+ 
+ #define __get_next(t, insn)	\
+ 	({ t r = *(t*)insn->next_byte; insn->next_byte += sizeof(t); r; })
+@@ -50,10 +50,11 @@
+  * @kaddr:	address (in kernel memory) of instruction (or copy thereof)
+  * @x86_64:	!0 for 64-bit kernel or 64-bit app
+  */
+-void insn_init(struct insn *insn, const void *kaddr, int x86_64)
++void insn_init(struct insn *insn, const void *kaddr, int buf_len, int x86_64)
+ {
+ 	memset(insn, 0, sizeof(*insn));
+ 	insn->kaddr = kaddr;
++	insn->end_kaddr = kaddr + buf_len;
+ 	insn->next_byte = kaddr;
+ 	insn->x86_64 = x86_64 ? 1 : 0;
+ 	insn->opnd_bytes = 4;
+diff --git a/arch/x86/tools/insn_sanity.c b/arch/x86/tools/insn_sanity.c
+index 872eb60e7806..ba70ff232917 100644
+--- a/arch/x86/tools/insn_sanity.c
++++ b/arch/x86/tools/insn_sanity.c
+@@ -254,7 +254,7 @@ int main(int argc, char **argv)
+ 			continue;
+ 
+ 		/* Decode an instruction */
+-		insn_init(&insn, insn_buf, x86_64);
++		insn_init(&insn, insn_buf, sizeof(insn_buf), x86_64);
+ 		insn_get_length(&insn);
+ 
+ 		if (insn.next_byte <= insn.kaddr ||
+diff --git a/arch/x86/tools/test_get_len.c b/arch/x86/tools/test_get_len.c
+index 13403fc95a96..56f04db0c9c0 100644
+--- a/arch/x86/tools/test_get_len.c
++++ b/arch/x86/tools/test_get_len.c
+@@ -149,7 +149,7 @@ int main(int argc, char **argv)
+ 				break;
+ 		}
+ 		/* Decode an instruction */
+-		insn_init(&insn, insn_buf, x86_64);
++		insn_init(&insn, insn_buf, sizeof(insn_buf), x86_64);
+ 		insn_get_length(&insn);
+ 		if (insn.length != nb) {
+ 			warnings++;
