@@ -1,0 +1,237 @@
+direct-io: Handle O_(D)SYNC AIO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 02afc27faec94c9e068517a22acf55400976c698
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/02afc27f.failed
+
+Call generic_write_sync() from the deferred I/O completion handler if
+O_DSYNC is set for a write request.  Also make sure various callers
+don't call generic_write_sync if the direct I/O code returns
+-EIOCBQUEUED.
+
+Based on an earlier patch from Jan Kara <jack@suse.cz> with updates from
+Jeff Moyer <jmoyer@redhat.com> and Darrick J. Wong <darrick.wong@oracle.com>.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 02afc27faec94c9e068517a22acf55400976c698)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+#	fs/direct-io.c
+diff --cc fs/cifs/file.c
+index 0bc0fad7f772,9d0dd952ad79..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2705,26 -2544,23 +2705,38 @@@ cifs_writev(struct kiocb *iocb, const s
+  	 * with a brlock that prevents writing.
+  	 */
+  	down_read(&cinode->lock_sem);
+ -	if (!cifs_find_lock_conflict(cfile, pos, iov_length(iov, nr_segs),
+ +	mutex_lock(&inode->i_mutex);
+ +	if (file->f_flags & O_APPEND)
+ +		lock_pos = i_size_read(inode);
+ +	if (!cifs_find_lock_conflict(cfile, lock_pos, iov_length(iov, nr_segs),
+  				     server->vals->exclusive_lock_type, NULL,
+  				     CIFS_WRITE_OP)) {
+ -		mutex_lock(&inode->i_mutex);
+  		rc = __generic_file_aio_write(iocb, iov, nr_segs,
+ -					       &iocb->ki_pos);
+ +						&iocb->ki_pos);
+ +		mutex_unlock(&inode->i_mutex);
+ +
+ +		if (rc > 0) {
+ +			ssize_t err;
+ +
+ +			err = generic_write_sync(file, iocb->ki_pos - rc, rc);
+ +			if (err < 0)
+ +				rc = err;
+ +		}
+ +	} else {
+  		mutex_unlock(&inode->i_mutex);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (rc > 0) {
++ 		ssize_t err;
++ 
++ 		err = generic_write_sync(file, pos, rc);
++ 		if (err < 0 && rc > 0)
++ 			rc = err;
++ 	}
++ 
+++>>>>>>> 02afc27faec9 (direct-io: Handle O_(D)SYNC AIO)
+  	up_read(&cinode->lock_sem);
+  	return rc;
+  }
+diff --cc fs/direct-io.c
+index 50921773621f,1782023bd68a..000000000000
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@@ -258,19 -262,24 +258,34 @@@ static ssize_t dio_complete(struct dio 
+  	if (ret == 0)
+  		ret = transferred;
+  
+ -	if (dio->end_io && dio->result)
+ -		dio->end_io(dio->iocb, offset, transferred, dio->private);
+ -
+ +	if (dio->end_io && dio->result) {
+ +		dio->end_io(dio->iocb, offset, transferred,
+ +			    dio->private, ret, is_async);
+ +	} else {
+ +		if (dio->flags & DIO_IGNORE_TRUNCATE)
+ +			__inode_dio_done(dio->inode);
+ +		else
+ +			inode_dio_done(dio->inode);
+ +
+++<<<<<<< HEAD
+ +		if (is_async)
+ +			aio_complete(dio->iocb, ret, 0);
+++=======
++ 	inode_dio_done(dio->inode);
++ 	if (is_async) {
++ 		if (dio->rw & WRITE) {
++ 			int err;
++ 
++ 			err = generic_write_sync(dio->iocb->ki_filp, offset,
++ 						 transferred);
++ 			if (err < 0 && ret > 0)
++ 				ret = err;
++ 		}
++ 
++ 		aio_complete(dio->iocb, ret, 0);
+++>>>>>>> 02afc27faec9 (direct-io: Handle O_(D)SYNC AIO)
+  	}
+  
+ -	kmem_cache_free(dio_cache, dio);
+  	return ret;
+  }
+  
+@@@ -1133,31 -1193,40 +1148,66 @@@ do_blockdev_direct_IO(int rw, struct ki
+  	}
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Will be decremented at I/O completion time. For a block device
+ +	 * we don't need to protect against truncate, so don't increment
+ +	 * the inode direct IO count.
+ +	 */
+ +	if (!(dio->flags & DIO_IGNORE_TRUNCATE))
+ +		atomic_inc(&inode->i_dio_count);
+ +
+ +	/*
+ +	 * For file extending writes updating i_size before data writeouts
+ +	 * complete can expose uninitialized blocks in dumb filesystems.
+ +	 * In that case we need to wait for I/O completion even if asked
+ +	 * for an asynchronous write.
+ +	 */
+ +	if (is_sync_kiocb(iocb))
+ +		dio->is_async = false;
+ +	else if (!(dio->flags & DIO_ASYNC_EXTEND) &&
+ +            (rw & WRITE) && end > i_size_read(inode))
+ +		dio->is_async = false;
+ +	else
+ +		dio->is_async = true;
+ +
+ +	retval = 0;
+ +
+++=======
++ 	 * For file extending writes updating i_size before data
++ 	 * writeouts complete can expose uninitialized blocks. So
++ 	 * even for AIO, we need to wait for i/o to complete before
++ 	 * returning in this case.
++ 	 */
++ 	dio->is_async = !is_sync_kiocb(iocb) && !((rw & WRITE) &&
++ 		(end > i_size_read(inode)));
+++>>>>>>> 02afc27faec9 (direct-io: Handle O_(D)SYNC AIO)
+  	dio->inode = inode;
+  	dio->rw = rw;
++ 
++ 	/*
++ 	 * For AIO O_(D)SYNC writes we need to defer completions to a workqueue
++ 	 * so that we can call ->fsync.
++ 	 */
++ 	if (dio->is_async && (rw & WRITE) &&
++ 	    ((iocb->ki_filp->f_flags & O_DSYNC) ||
++ 	     IS_SYNC(iocb->ki_filp->f_mapping->host))) {
++ 		retval = dio_set_defer_completion(dio);
++ 		if (retval) {
++ 			/*
++ 			 * We grab i_mutex only for reads so we don't have
++ 			 * to release it here
++ 			 */
++ 			kmem_cache_free(dio_cache, dio);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Will be decremented at I/O completion time.
++ 	 */
++ 	atomic_inc(&inode->i_dio_count);
++ 
++ 	retval = 0;
+  	sdio.blkbits = blkbits;
+  	sdio.blkfactor = i_blkbits - blkbits;
+  	sdio.block_in_file = offset >> blkbits;
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 14346e1bdb83..8d56d31c9a7e 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1535,7 +1535,7 @@ ssize_t blkdev_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 
+ 	blk_start_plug(&plug);
+ 	ret = __generic_file_aio_write(iocb, iov, nr_segs, &iocb->ki_pos);
+-	if (ret > 0 || ret == -EIOCBQUEUED) {
++	if (ret > 0) {
+ 		ssize_t err;
+ 
+ 		err = generic_write_sync(file, pos, ret);
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 46fb6197a7ed..245269e4eaa4 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1836,7 +1836,7 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
+ 	 * transaction will appear to have already occured.
+ 	 */
+ 	BTRFS_I(inode)->last_sub_trans = root->log_transid;
+-	if (num_written > 0 || num_written == -EIOCBQUEUED) {
++	if (num_written > 0) {
+ 		err = generic_write_sync(file, pos, num_written);
+ 		if (err < 0 && num_written > 0)
+ 			num_written = err;
+* Unmerged path fs/cifs/file.c
+* Unmerged path fs/direct-io.c
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 3034d6b4eaee..1f9ebb226d12 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -149,7 +149,7 @@ ext4_file_dio_write(struct kiocb *iocb, const struct iovec *iov,
+ 	ret = __generic_file_aio_write(iocb, iov, nr_segs, &iocb->ki_pos);
+ 	mutex_unlock(&inode->i_mutex);
+ 
+-	if (ret > 0 || ret == -EIOCBQUEUED) {
++	if (ret > 0) {
+ 		ssize_t err;
+ 
+ 		err = generic_write_sync(file, pos, ret);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index c892a9baf867..b2c3ac1527c3 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3047,7 +3047,7 @@ ssize_t generic_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 	ret = __generic_file_aio_write(iocb, iov, nr_segs, &iocb->ki_pos);
+ 	mutex_unlock(&inode->i_mutex);
+ 
+-	if (ret > 0 || ret == -EIOCBQUEUED) {
++	if (ret > 0) {
+ 		ssize_t err;
+ 
+ 		err = generic_write_sync(file, pos, ret);
