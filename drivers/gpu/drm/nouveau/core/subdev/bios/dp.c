@@ -147,7 +147,8 @@ nvbios_dpcfg_entry(struct nouveau_bios *bios, u16 outp, u8 idx,
 		outp = nvbios_dp_table(bios, ver, hdr, cnt, len);
 		*hdr = *hdr + (*len * * cnt);
 		*len = nv_ro08(bios, outp + 0x06);
-		*cnt = nv_ro08(bios, outp + 0x07);
+		*cnt = nv_ro08(bios, outp + 0x07) *
+		       nv_ro08(bios, outp + 0x05);
 	}
 
 	if (idx < *cnt)
@@ -196,6 +197,8 @@ nvbios_dpcfg_match(struct nouveau_bios *bios, u16 outp, u8 pc, u8 vs, u8 pe,
 	if (*ver >= 0x30) {
 		const u8 vsoff[] = { 0, 4, 7, 9 };
 		idx = (pc * 10) + vsoff[vs] + pe;
+		if (*ver >= 0x40 && *hdr >= 0x12)
+			idx += nv_ro08(bios, outp + 0x11) * 40;
 	} else {
 		while ((data = nvbios_dpcfg_entry(bios, outp, ++idx,
 						  ver, hdr, cnt, len))) {
