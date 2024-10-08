@@ -1,0 +1,163 @@
+net: bulk free SKBs that were delay free'ed due to IRQ context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] bulk free SKBs that were delay free'ed due to IRQ context (Ivan Vecera) [1268334]
+Rebuild_FUZZ: 95.80%
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 15fad714be86eab13e7568fecaf475b2a9730d3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/15fad714.failed
+
+The network stack defers SKBs free, in-case free happens in IRQ or
+when IRQs are disabled. This happens in __dev_kfree_skb_irq() that
+writes SKBs that were free'ed during IRQ to the softirq completion
+queue (softnet_data.completion_queue).
+
+These SKBs are naturally delayed, and cleaned up during NET_TX_SOFTIRQ
+in function net_tx_action().  Take advantage of this a use the skb
+defer and flush API, as we are already in softirq context.
+
+For modern drivers this rarely happens. Although most drivers do call
+dev_kfree_skb_any(), which detects the situation and calls
+__dev_kfree_skb_irq() when needed.  This due to netpoll can call from
+IRQ context.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 15fad714be86eab13e7568fecaf475b2a9730d3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/skbuff.c
+diff --cc include/linux/skbuff.h
+index afd3465150d2,6ec86f1a2ed9..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -2155,6 -2404,10 +2155,13 @@@ static inline struct sk_buff *napi_allo
+  {
+  	return __napi_alloc_skb(napi, length, GFP_ATOMIC);
+  }
+++<<<<<<< HEAD
+++=======
++ void napi_consume_skb(struct sk_buff *skb, int budget);
++ 
++ void __kfree_skb_flush(void);
++ void __kfree_skb_defer(struct sk_buff *skb);
+++>>>>>>> 15fad714be86 (net: bulk free SKBs that were delay free'ed due to IRQ context)
+  
+  /**
+   * __dev_alloc_pages - allocate page for network Rx
+diff --cc net/core/skbuff.c
+index fc02ef9734c7,a5bd067ec1a3..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -831,6 -755,80 +831,83 @@@ void consume_skb(struct sk_buff *skb
+  }
+  EXPORT_SYMBOL(consume_skb);
+  
+++<<<<<<< HEAD
+++=======
++ void __kfree_skb_flush(void)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 
++ 	/* flush skb_cache if containing objects */
++ 	if (nc->skb_count) {
++ 		kmem_cache_free_bulk(skbuff_head_cache, nc->skb_count,
++ 				     nc->skb_cache);
++ 		nc->skb_count = 0;
++ 	}
++ }
++ 
++ static inline void _kfree_skb_defer(struct sk_buff *skb)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 
++ 	/* drop skb->head and call any destructors for packet */
++ 	skb_release_all(skb);
++ 
++ 	/* record skb to CPU local list */
++ 	nc->skb_cache[nc->skb_count++] = skb;
++ 
++ #ifdef CONFIG_SLUB
++ 	/* SLUB writes into objects when freeing */
++ 	prefetchw(skb);
++ #endif
++ 
++ 	/* flush skb_cache if it is filled */
++ 	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
++ 		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
++ 				     nc->skb_cache);
++ 		nc->skb_count = 0;
++ 	}
++ }
++ void __kfree_skb_defer(struct sk_buff *skb)
++ {
++ 	_kfree_skb_defer(skb);
++ }
++ 
++ void napi_consume_skb(struct sk_buff *skb, int budget)
++ {
++ 	if (unlikely(!skb))
++ 		return;
++ 
++ 	/* if budget is 0 assume netpoll w/ IRQs disabled */
++ 	if (unlikely(!budget)) {
++ 		dev_consume_skb_irq(skb);
++ 		return;
++ 	}
++ 
++ 	if (likely(atomic_read(&skb->users) == 1))
++ 		smp_rmb();
++ 	else if (likely(!atomic_dec_and_test(&skb->users)))
++ 		return;
++ 	/* if reaching here SKB is ready to free */
++ 	trace_consume_skb(skb);
++ 
++ 	/* if SKB is a clone, don't handle this case */
++ 	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
++ 		__kfree_skb(skb);
++ 		return;
++ 	}
++ 
++ 	_kfree_skb_defer(skb);
++ }
++ EXPORT_SYMBOL(napi_consume_skb);
++ 
++ /* Make sure a field is enclosed inside headers_start/headers_end section */
++ #define CHECK_SKB_FIELD(field) \
++ 	BUILD_BUG_ON(offsetof(struct sk_buff, field) <		\
++ 		     offsetof(struct sk_buff, headers_start));	\
++ 	BUILD_BUG_ON(offsetof(struct sk_buff, field) >		\
++ 		     offsetof(struct sk_buff, headers_end));	\
++ 
+++>>>>>>> 15fad714be86 (net: bulk free SKBs that were delay free'ed due to IRQ context)
+  static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+  {
+  	new->tstamp		= old->tstamp;
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index e416d49ce837..4802aa3743ba 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3269,8 +3269,14 @@ static void net_tx_action(struct softirq_action *h)
+ 				trace_consume_skb(skb);
+ 			else
+ 				trace_kfree_skb(skb, net_tx_action);
+-			__kfree_skb(skb);
++
++			if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
++				__kfree_skb(skb);
++			else
++				__kfree_skb_defer(skb);
+ 		}
++
++		__kfree_skb_flush();
+ 	}
+ 
+ 	if (sd->output_queue) {
+* Unmerged path net/core/skbuff.c
