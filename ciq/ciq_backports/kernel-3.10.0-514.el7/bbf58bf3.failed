@@ -1,0 +1,158 @@
+NFSv4.2/pnfs: Make the layoutstats timer configurable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit bbf58bf3488e41f346536aa89d62bdf2fe771128
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bbf58bf3.failed
+
+Allow advanced users to set the layoutstats timer in order to lengthen
+or shorten the period between layoutstat transmissions to the server.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit bbf58bf3488e41f346536aa89d62bdf2fe771128)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index ae25804d58d5,3530bb703214..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -2206,3 -2225,67 +2206,70 @@@ struct nfs4_threshold *pnfs_mdsthreshol
+  	}
+  	return thp;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #if IS_ENABLED(CONFIG_NFS_V4_2)
++ int
++ pnfs_report_layoutstat(struct inode *inode, gfp_t gfp_flags)
++ {
++ 	struct pnfs_layoutdriver_type *ld = NFS_SERVER(inode)->pnfs_curr_ld;
++ 	struct nfs_server *server = NFS_SERVER(inode);
++ 	struct nfs_inode *nfsi = NFS_I(inode);
++ 	struct nfs42_layoutstat_data *data;
++ 	struct pnfs_layout_hdr *hdr;
++ 	int status = 0;
++ 
++ 	if (!pnfs_enabled_sb(server) || !ld->prepare_layoutstats)
++ 		goto out;
++ 
++ 	if (!nfs_server_capable(inode, NFS_CAP_LAYOUTSTATS))
++ 		goto out;
++ 
++ 	if (test_and_set_bit(NFS_INO_LAYOUTSTATS, &nfsi->flags))
++ 		goto out;
++ 
++ 	spin_lock(&inode->i_lock);
++ 	if (!NFS_I(inode)->layout) {
++ 		spin_unlock(&inode->i_lock);
++ 		goto out;
++ 	}
++ 	hdr = NFS_I(inode)->layout;
++ 	pnfs_get_layout_hdr(hdr);
++ 	spin_unlock(&inode->i_lock);
++ 
++ 	data = kzalloc(sizeof(*data), gfp_flags);
++ 	if (!data) {
++ 		status = -ENOMEM;
++ 		goto out_put;
++ 	}
++ 
++ 	data->args.fh = NFS_FH(inode);
++ 	data->args.inode = inode;
++ 	nfs4_stateid_copy(&data->args.stateid, &hdr->plh_stateid);
++ 	status = ld->prepare_layoutstats(&data->args);
++ 	if (status)
++ 		goto out_free;
++ 
++ 	status = nfs42_proc_layoutstats_generic(NFS_SERVER(inode), data);
++ 
++ out:
++ 	dprintk("%s returns %d\n", __func__, status);
++ 	return status;
++ 
++ out_free:
++ 	kfree(data);
++ out_put:
++ 	pnfs_put_layout_hdr(hdr);
++ 	smp_mb__before_atomic();
++ 	clear_bit(NFS_INO_LAYOUTSTATS, &nfsi->flags);
++ 	smp_mb__after_atomic();
++ 	goto out;
++ }
++ EXPORT_SYMBOL_GPL(pnfs_report_layoutstat);
++ #endif
++ 
++ unsigned int layoutstats_timer;
++ module_param(layoutstats_timer, uint, 0644);
++ EXPORT_SYMBOL_GPL(layoutstats_timer);
+++>>>>>>> bbf58bf3488e (NFSv4.2/pnfs: Make the layoutstats timer configurable)
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index c1ad82cf3a0a..ce5c126ea72b 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1933,6 +1933,15 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			The default parameter value of '0' causes the kernel
+ 			not to attempt recovery of lost locks.
+ 
++	nfs4.layoutstats_timer =
++			[NFSv4.2] Change the rate at which the kernel sends
++			layoutstats to the pNFS metadata server.
++
++			Setting this to value to 0 causes the kernel to use
++			whatever value is the default set by the layout
++			driver. A non-zero value sets the minimum interval
++			in seconds between layoutstats transmissions.
++
+ 	nfsd.nfs4_disable_idmapping=
+ 			[NFSv4] When set to the default of '1', the NFSv4
+ 			server will return only numeric uids and gids to
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.c b/fs/nfs/flexfilelayout/flexfilelayout.c
+index 0a92c66de517..4dffeb47cd66 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -464,14 +464,17 @@ nfs4_ff_layoutstat_start_io(struct nfs4_ff_layout_mirror *mirror,
+ 			    ktime_t now)
+ {
+ 	static const ktime_t notime = {0};
++	s64 report_interval = FF_LAYOUTSTATS_REPORT_INTERVAL;
+ 
+ 	nfs4_ff_start_busy_timer(&layoutstat->busy_timer, now);
+ 	if (ktime_equal(mirror->start_time, notime))
+ 		mirror->start_time = now;
+ 	if (ktime_equal(mirror->last_report_time, notime))
+ 		mirror->last_report_time = now;
++	if (layoutstats_timer != 0)
++		report_interval = (s64)layoutstats_timer * 1000LL;
+ 	if (ktime_to_ms(ktime_sub(now, mirror->last_report_time)) >=
+-			FF_LAYOUTSTATS_REPORT_INTERVAL) {
++			report_interval) {
+ 		mirror->last_report_time = now;
+ 		return true;
+ 	}
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 9c425a959f66..64e0d52baf24 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -523,12 +523,15 @@ pnfs_use_threshold(struct nfs4_threshold **dst, struct nfs4_threshold *src,
+ 					nfss->pnfs_curr_ld->id == src->l_type);
+ }
+ 
++extern unsigned int layoutstats_timer;
++
+ #ifdef NFS_DEBUG
+ void nfs4_print_deviceid(const struct nfs4_deviceid *dev_id);
+ #else
+ static inline void nfs4_print_deviceid(const struct nfs4_deviceid *dev_id)
+ {
+ }
++
+ #endif /* NFS_DEBUG */
+ #else  /* CONFIG_NFS_V4_1 */
+ 
