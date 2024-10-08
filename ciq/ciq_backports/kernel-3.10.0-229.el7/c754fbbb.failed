@@ -1,0 +1,465 @@
+GFS2: Use RCU/hlist_bl based hash for quotas
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Steven Whitehouse <swhiteho@redhat.com>
+commit c754fbbb1b6bf462c6ddba48b19f20adf2335cac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/c754fbbb.failed
+
+Prior to this patch, GFS2 kept all the quotas for each
+super block in a single linked list. This is rather slow
+when there are large numbers of quotas.
+
+This patch introduces a hlist_bl based hash table, similar
+to the one used for glocks. The initial look up of the quota
+is now lockless in the case where it is already cached,
+although we still have to take the per quota spinlock in
+order to bump the ref count. Either way though, this is a
+big improvement on what was there before.
+
+The qd_lock and the per super block list is preserved, for
+the time being. However it is intended that since this is no
+longer used for its original role, it should be possible to
+shrink the number of items on that list in due course and
+remove the requirement to take qd_lock in qd_get.
+
+	Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+	Cc: Abhijith Das <adas@redhat.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+(cherry picked from commit c754fbbb1b6bf462c6ddba48b19f20adf2335cac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/quota.c
+#	fs/gfs2/quota.h
+diff --cc fs/gfs2/incore.h
+index 88b757b58e69,59d99ec9d875..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -413,12 -428,14 +413,21 @@@ enum 
+  };
+  
+  struct gfs2_quota_data {
++ 	struct hlist_bl_node qd_hlist;
+  	struct list_head qd_list;
+++<<<<<<< HEAD
+ +	struct list_head qd_reclaim;
+++=======
++ 	struct kqid qd_id;
++ 	struct gfs2_sbd *qd_sbd;
++ 	struct lockref qd_lockref;
++ 	struct list_head qd_lru;
++ 	unsigned qd_hash;
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+ +
+ +	struct lockref qd_lockref;
+  
+ +	struct kqid qd_id;
+  	unsigned long qd_flags;		/* QDF_... */
+  
+  	s64 qd_change;
+diff --cc fs/gfs2/quota.c
+index 679b366e073c,a1df01d381a8..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -51,6 -51,11 +51,14 @@@
+  #include <linux/quota.h>
+  #include <linux/dqblk_xfs.h>
+  #include <linux/lockref.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/list_lru.h>
++ #include <linux/rcupdate.h>
++ #include <linux/rculist_bl.h>
++ #include <linux/bit_spinlock.h>
++ #include <linux/jhash.h>
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  
+  #include "gfs2.h"
+  #include "incore.h"
+@@@ -66,37 -71,63 +74,82 @@@
+  #include "inode.h"
+  #include "util.h"
+  
+++<<<<<<< HEAD
+ +struct gfs2_quota_change_host {
+ +	u64 qc_change;
+ +	u32 qc_flags; /* GFS2_QCF_... */
+ +	struct kqid qc_id;
+ +};
+ +
+ +static LIST_HEAD(qd_lru_list);
+ +static atomic_t qd_lru_count = ATOMIC_INIT(0);
+ +static DEFINE_SPINLOCK(qd_lru_lock);
+ +
+ +int gfs2_shrink_qd_memory(struct shrinker *shrink, struct shrink_control *sc)
+++=======
++ #define GFS2_QD_HASH_SHIFT      12
++ #define GFS2_QD_HASH_SIZE       (1 << GFS2_QD_HASH_SHIFT)
++ #define GFS2_QD_HASH_MASK       (GFS2_QD_HASH_SIZE - 1)
++ 
++ /* Lock order: qd_lock -> bucket lock -> qd->lockref.lock -> lru lock */
++ static DEFINE_SPINLOCK(qd_lock);
++ struct list_lru gfs2_qd_lru;
++ 
++ static struct hlist_bl_head qd_hash_table[GFS2_QD_HASH_SIZE];
++ 
++ static unsigned int gfs2_qd_hash(const struct gfs2_sbd *sdp,
++ 				 const struct kqid qid)
++ {
++ 	unsigned int h;
++ 
++ 	h = jhash(&sdp, sizeof(struct gfs2_sbd *), 0);
++ 	h = jhash(&qid, sizeof(struct kqid), h);
++ 
++ 	return h & GFS2_QD_HASH_MASK;
++ }
++ 
++ static inline void spin_lock_bucket(unsigned int hash)
++ {
++         hlist_bl_lock(&qd_hash_table[hash]);
++ }
++ 
++ static inline void spin_unlock_bucket(unsigned int hash)
++ {
++         hlist_bl_unlock(&qd_hash_table[hash]);
++ }
++ 
++ static void gfs2_qd_dealloc(struct rcu_head *rcu)
++ {
++ 	struct gfs2_quota_data *qd = container_of(rcu, struct gfs2_quota_data, qd_rcu);
++ 	kmem_cache_free(gfs2_quotad_cachep, qd);
++ }
++ 
++ static void gfs2_qd_dispose(struct list_head *list)
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  {
+  	struct gfs2_quota_data *qd;
+  	struct gfs2_sbd *sdp;
+ +	int nr_to_scan = sc->nr_to_scan;
+  
+ -	while (!list_empty(list)) {
+ -		qd = list_entry(list->next, struct gfs2_quota_data, qd_lru);
+ -		sdp = qd->qd_gl->gl_sbd;
+ +	if (nr_to_scan == 0)
+ +		goto out;
+  
+ -		list_del(&qd->qd_lru);
+ +	if (!(sc->gfp_mask & __GFP_FS))
+ +		return -1;
+ +
+ +	spin_lock(&qd_lru_lock);
+ +	while (nr_to_scan && !list_empty(&qd_lru_list)) {
+ +		qd = list_entry(qd_lru_list.next,
+ +				struct gfs2_quota_data, qd_reclaim);
+ +		sdp = qd->qd_gl->gl_sbd;
+  
+  		/* Free from the filesystem-specific list */
+ -		spin_lock(&qd_lock);
+  		list_del(&qd->qd_list);
+ -		spin_unlock(&qd_lock);
+  
++ 		spin_lock_bucket(qd->qd_hash);
++ 		hlist_bl_del_rcu(&qd->qd_hlist);
++ 		spin_unlock_bucket(qd->qd_hash);
++ 
+  		gfs2_assert_warn(sdp, !qd->qd_change);
+  		gfs2_assert_warn(sdp, !qd->qd_slot_count);
+  		gfs2_assert_warn(sdp, !qd->qd_bh_count);
+@@@ -105,19 -136,59 +158,23 @@@
+  		atomic_dec(&sdp->sd_quota_count);
+  
+  		/* Delete it from the common reclaim list */
+++<<<<<<< HEAD
+ +		list_del_init(&qd->qd_reclaim);
+ +		atomic_dec(&qd_lru_count);
+ +		spin_unlock(&qd_lru_lock);
+ +		kmem_cache_free(gfs2_quotad_cachep, qd);
+ +		spin_lock(&qd_lru_lock);
+ +		nr_to_scan--;
+++=======
++ 		call_rcu(&qd->qd_rcu, gfs2_qd_dealloc);
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  	}
+ -}
+ -
+ -
+ -static enum lru_status gfs2_qd_isolate(struct list_head *item, spinlock_t *lock, void *arg)
+ -{
+ -	struct list_head *dispose = arg;
+ -	struct gfs2_quota_data *qd = list_entry(item, struct gfs2_quota_data, qd_lru);
+ -
+ -	if (!spin_trylock(&qd->qd_lockref.lock))
+ -		return LRU_SKIP;
+ -
+ -	if (qd->qd_lockref.count == 0) {
+ -		lockref_mark_dead(&qd->qd_lockref);
+ -		list_move(&qd->qd_lru, dispose);
+ -	}
+ -
+ -	spin_unlock(&qd->qd_lockref.lock);
+ -	return LRU_REMOVED;
+ -}
+ -
+ -static unsigned long gfs2_qd_shrink_scan(struct shrinker *shrink,
+ -					 struct shrink_control *sc)
+ -{
+ -	LIST_HEAD(dispose);
+ -	unsigned long freed;
+ +	spin_unlock(&qd_lru_lock);
+  
+ -	if (!(sc->gfp_mask & __GFP_FS))
+ -		return SHRINK_STOP;
+ -
+ -	freed = list_lru_walk_node(&gfs2_qd_lru, sc->nid, gfs2_qd_isolate,
+ -				   &dispose, &sc->nr_to_scan);
+ -
+ -	gfs2_qd_dispose(&dispose);
+ -
+ -	return freed;
+ -}
+ -
+ -static unsigned long gfs2_qd_shrink_count(struct shrinker *shrink,
+ -					  struct shrink_control *sc)
+ -{
+ -	return vfs_pressure_ratio(list_lru_count_node(&gfs2_qd_lru, sc->nid));
+ +out:
+ +	return (atomic_read(&qd_lru_count) * sysctl_vfs_cache_pressure) / 100;
+  }
+  
+ -struct shrinker gfs2_qd_shrinker = {
+ -	.count_objects = gfs2_qd_shrink_count,
+ -	.scan_objects = gfs2_qd_shrink_scan,
+ -	.seeks = DEFAULT_SEEKS,
+ -	.flags = SHRINKER_NUMA_AWARE,
+ -};
+ -
+ -
+  static u64 qd2index(struct gfs2_quota_data *qd)
+  {
+  	struct kqid qid = qd->qd_id;
+@@@ -149,7 -220,8 +206,12 @@@ static struct gfs2_quota_data *qd_alloc
+  	spin_lock_init(&qd->qd_lockref.lock);
+  	qd->qd_id = qid;
+  	qd->qd_slot = -1;
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&qd->qd_reclaim);
+++=======
++ 	INIT_LIST_HEAD(&qd->qd_lru);
++ 	qd->qd_hash = hash;
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  
+  	error = gfs2_glock_get(sdp, qd2index(qd),
+  			      &gfs2_quota_glops, CREATE, &qd->qd_gl);
+@@@ -168,54 -260,41 +250,83 @@@ static struct gfs2_quota_data *gfs2_qd_
+  static int qd_get(struct gfs2_sbd *sdp, struct kqid qid,
+  		  struct gfs2_quota_data **qdp)
+  {
+- 	struct gfs2_quota_data *qd = NULL, *new_qd = NULL;
+- 	int error, found;
++ 	struct gfs2_quota_data *qd, *new_qd;
++ 	unsigned int hash = gfs2_qd_hash(sdp, qid);
+  
+- 	*qdp = NULL;
++ 	rcu_read_lock();
++ 	*qdp = qd = gfs2_qd_search_bucket(hash, sdp, qid);
++ 	rcu_read_unlock();
+  
+++<<<<<<< HEAD
+ +	for (;;) {
+ +		found = 0;
+ +		spin_lock(&qd_lru_lock);
+ +		list_for_each_entry(qd, &sdp->sd_quota_list, qd_list) {
+ +			if (qid_eq(qd->qd_id, qid)) {
+ +				lockref_get(&qd->qd_lockref);
+ +				if (!list_empty(&qd->qd_reclaim)) {
+ +					/* Remove it from reclaim list */
+ +					list_del_init(&qd->qd_reclaim);
+ +					atomic_dec(&qd_lru_count);
+ +				}
+ +				found = 1;
+ +				break;
+ +			}
+ +		}
+++=======
++ 	if (qd)
++ 		return 0;
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  
+- 		if (!found)
+- 			qd = NULL;
++ 	new_qd = qd_alloc(hash, sdp, qid);
++ 	if (!new_qd)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +		if (!qd && new_qd) {
+ +			qd = new_qd;
+ +			list_add(&qd->qd_list, &sdp->sd_quota_list);
+ +			atomic_inc(&sdp->sd_quota_count);
+ +			new_qd = NULL;
+ +		}
+ +
+ +		spin_unlock(&qd_lru_lock);
+ +
+ +		if (qd) {
+ +			if (new_qd) {
+ +				gfs2_glock_put(new_qd->qd_gl);
+ +				kmem_cache_free(gfs2_quotad_cachep, new_qd);
+ +			}
+ +			*qdp = qd;
+ +			return 0;
+ +		}
+ +
+ +		error = qd_alloc(sdp, qid, &new_qd);
+ +		if (error)
+ +			return error;
+++=======
++ 	spin_lock(&qd_lock);
++ 	spin_lock_bucket(hash);
++ 	*qdp = qd = gfs2_qd_search_bucket(hash, sdp, qid);
++ 	if (qd == NULL) {
++ 		*qdp = new_qd;
++ 		list_add(&new_qd->qd_list, &sdp->sd_quota_list);
++ 		hlist_bl_add_head_rcu(&new_qd->qd_hlist, &qd_hash_table[hash]);
++ 		atomic_inc(&sdp->sd_quota_count);
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  	}
++ 	spin_unlock_bucket(hash);
++ 	spin_unlock(&qd_lock);
++ 
++ 	if (qd) {
++ 		gfs2_glock_put(new_qd->qd_gl);
++ 		kmem_cache_free(gfs2_quotad_cachep, new_qd);
++ 	}
++ 
++ 	return 0;
+  }
+  
++ 
+  static void qd_hold(struct gfs2_quota_data *qd)
+  {
+  	struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+@@@ -1255,19 -1312,23 +1367,25 @@@ int gfs2_quota_init(struct gfs2_sbd *sd
+  			goto fail;
+  		}
+  
+ -		qc = (const struct gfs2_quota_change *)(bh->b_data + sizeof(struct gfs2_meta_header));
+  		for (y = 0; y < sdp->sd_qc_per_block && slot < sdp->sd_quota_slots;
+  		     y++, slot++) {
+ +			struct gfs2_quota_change_host qc;
+  			struct gfs2_quota_data *qd;
+ -			s64 qc_change = be64_to_cpu(qc->qc_change);
+ -			u32 qc_flags = be32_to_cpu(qc->qc_flags);
+ -			enum quota_type qtype = (qc_flags & GFS2_QCF_USER) ?
+ -						USRQUOTA : GRPQUOTA;
+ -			struct kqid qc_id = make_kqid(&init_user_ns, qtype,
+ -						      be32_to_cpu(qc->qc_id));
+ -			qc++;
+ -			if (!qc_change)
+ +
+ +			gfs2_quota_change_in(&qc, bh->b_data +
+ +					  sizeof(struct gfs2_meta_header) +
+ +					  y * sizeof(struct gfs2_quota_change));
+ +			if (!qc.qc_change)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			error = qd_alloc(sdp, qc.qc_id, &qd);
+ +			if (error) {
+++=======
++ 			hash = gfs2_qd_hash(sdp, qc_id);
++ 			qd = qd_alloc(hash, sdp, qc_id);
++ 			if (qd == NULL) {
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  				brelse(bh);
+  				goto fail;
+  			}
+@@@ -1281,8 -1342,12 +1399,12 @@@
+  			gfs2_icbit_munge(sdp, sdp->sd_quota_bitmap, slot, 1);
+  			list_add(&qd->qd_list, &sdp->sd_quota_list);
+  			atomic_inc(&sdp->sd_quota_count);
+ -			spin_unlock(&qd_lock);
+ +			spin_unlock(&qd_lru_lock);
+  
++ 			spin_lock_bucket(hash);
++ 			hlist_bl_add_head_rcu(&qd->qd_hlist, &qd_hash_table[hash]);
++ 			spin_unlock_bucket(hash);
++ 
+  			found++;
+  		}
+  
+@@@ -1329,14 -1394,16 +1451,19 @@@ void gfs2_quota_cleanup(struct gfs2_sb
+  		spin_unlock(&qd->qd_lockref.lock);
+  
+  		list_del(&qd->qd_list);
++ 
+  		/* Also remove if this qd exists in the reclaim list */
+ -		list_lru_del(&gfs2_qd_lru, &qd->qd_lru);
+ +		if (!list_empty(&qd->qd_reclaim)) {
+ +			list_del_init(&qd->qd_reclaim);
+ +			atomic_dec(&qd_lru_count);
+ +		}
+  		atomic_dec(&sdp->sd_quota_count);
+ -		spin_unlock(&qd_lock);
+ +		spin_unlock(&qd_lru_lock);
+  
++ 		spin_lock_bucket(qd->qd_hash);
++ 		hlist_bl_del_rcu(&qd->qd_hlist);
++ 		spin_unlock_bucket(qd->qd_hash);
++ 
+  		if (!qd->qd_lockref.count) {
+  			gfs2_assert_warn(sdp, !qd->qd_change);
+  			gfs2_assert_warn(sdp, !qd->qd_slot_count);
+@@@ -1345,11 -1412,11 +1472,11 @@@
+  		gfs2_assert_warn(sdp, !qd->qd_bh_count);
+  
+  		gfs2_glock_put(qd->qd_gl);
+- 		kmem_cache_free(gfs2_quotad_cachep, qd);
++ 		call_rcu(&qd->qd_rcu, gfs2_qd_dealloc);
+  
+ -		spin_lock(&qd_lock);
+ +		spin_lock(&qd_lru_lock);
+  	}
+ -	spin_unlock(&qd_lock);
+ +	spin_unlock(&qd_lru_lock);
+  
+  	gfs2_assert_warn(sdp, !atomic_read(&sdp->sd_quota_count));
+  
+diff --cc fs/gfs2/quota.h
+index 4f5e6e44ed83,55d506eb3c4a..000000000000
+--- a/fs/gfs2/quota.h
++++ b/fs/gfs2/quota.h
+@@@ -53,8 -54,9 +53,14 @@@ static inline int gfs2_quota_lock_check
+  	return ret;
+  }
+  
+ +extern int gfs2_shrink_qd_memory(struct shrinker *shrink,
+ +				 struct shrink_control *sc);
+  extern const struct quotactl_ops gfs2_quotactl_ops;
+++<<<<<<< HEAD
+++=======
++ extern struct shrinker gfs2_qd_shrinker;
++ extern struct list_lru gfs2_qd_lru;
++ extern void __init gfs2_quota_hash_init(void);
+++>>>>>>> c754fbbb1b6b (GFS2: Use RCU/hlist_bl based hash for quotas)
+  
+  #endif /* __QUOTA_DOT_H__ */
+* Unmerged path fs/gfs2/incore.h
+diff --git a/fs/gfs2/main.c b/fs/gfs2/main.c
+index e04d0e09ee7b..ad67bd6d910c 100644
+--- a/fs/gfs2/main.c
++++ b/fs/gfs2/main.c
+@@ -81,6 +81,7 @@ static int __init init_gfs2_fs(void)
+ 
+ 	gfs2_str2qstr(&gfs2_qdot, ".");
+ 	gfs2_str2qstr(&gfs2_qdotdot, "..");
++	gfs2_quota_hash_init();
+ 
+ 	error = gfs2_sys_init();
+ 	if (error)
+* Unmerged path fs/gfs2/quota.c
+* Unmerged path fs/gfs2/quota.h
