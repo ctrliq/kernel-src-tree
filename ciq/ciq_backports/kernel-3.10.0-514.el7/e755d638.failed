@@ -1,0 +1,118 @@
+NFS41: make sure sending LAYOUTRETURN before close if marked so
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit e755d638e91be254d441602e8d7d9f1d9c944556
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/e755d638.failed
+
+If layout is marked by NFS_LAYOUT_RETURN_BEFORE_CLOSE, we should always
+send LAYOUTRETURN before close, and we don't need to do ROC drain if we
+do send LAYOUTRETURN.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit e755d638e91be254d441602e8d7d9f1d9c944556)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index 657667b370f5,e101a491e4e7..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1059,41 -1064,60 +1059,86 @@@ bool pnfs_roc(struct inode *ino
+  	struct pnfs_layout_segment *lseg, *tmp;
+  	nfs4_stateid stateid;
+  	LIST_HEAD(tmp_list);
+- 	bool found = false, layoutreturn = false;
++ 	bool found = false, layoutreturn = false, roc = false;
+  
+  	spin_lock(&ino->i_lock);
+ -	lo = nfsi->layout;
+ +	lo = NFS_I(ino)->layout;
+  	if (!lo || !test_and_clear_bit(NFS_LAYOUT_ROC, &lo->plh_flags) ||
+  	    test_bit(NFS_LAYOUT_BULK_RECALL, &lo->plh_flags))
+++<<<<<<< HEAD
+ +		goto out_nolayout;
+++=======
++ 		goto out_noroc;
++ 
++ 	/* no roc if we hold a delegation */
++ 	if (nfs4_check_delegation(ino, FMODE_READ))
++ 		goto out_noroc;
++ 
++ 	list_for_each_entry(ctx, &nfsi->open_files, list) {
++ 		state = ctx->state;
++ 		/* Don't return layout if there is open file state */
++ 		if (state != NULL && state->state != 0)
++ 			goto out_noroc;
++ 	}
++ 
++ 	stateid = lo->plh_stateid;
++ 	/* always send layoutreturn if being marked so */
++ 	if (test_and_clear_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
++ 				   &lo->plh_flags))
++ 		layoutreturn = pnfs_prepare_layoutreturn(lo);
++ 
+++>>>>>>> e755d638e91b (NFS41: make sure sending LAYOUTRETURN before close if marked so)
+  	pnfs_clear_retry_layoutget(lo);
+  	list_for_each_entry_safe(lseg, tmp, &lo->plh_segs, pls_list)
+- 		if (test_bit(NFS_LSEG_ROC, &lseg->pls_flags)) {
++ 		/* If we are sending layoutreturn, invalidate all valid lsegs */
++ 		if (layoutreturn || test_bit(NFS_LSEG_ROC, &lseg->pls_flags)) {
+  			mark_lseg_invalid(lseg, &tmp_list);
+  			found = true;
+  		}
+++<<<<<<< HEAD
+ +	if (!found)
+ +		goto out_nolayout;
+ +	lo->plh_block_lgets++;
+ +	pnfs_get_layout_hdr(lo); /* matched in pnfs_roc_release */
+ +	spin_unlock(&ino->i_lock);
+ +	pnfs_free_lseg_list(&tmp_list);
+ +	pnfs_layoutcommit_inode(ino, true);
+ +	return true;
+ +
+ +out_nolayout:
+ +	if (lo) {
+ +		stateid = lo->plh_stateid;
+ +		if (test_and_clear_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
+ +					   &lo->plh_flags))
+ +			layoutreturn = pnfs_prepare_layoutreturn(lo);
+ +	}
+ +	spin_unlock(&ino->i_lock);
+ +	if (layoutreturn) {
+ +		pnfs_layoutcommit_inode(ino, true);
+++=======
++ 	/* pnfs_prepare_layoutreturn() grabs lo ref and it will be put
++ 	 * in pnfs_roc_release(). We don't really send a layoutreturn but
++ 	 * still want others to view us like we are sending one!
++ 	 *
++ 	 * If pnfs_prepare_layoutreturn() fails, it means someone else is doing
++ 	 * LAYOUTRETURN, so we proceed like there are no layouts to return.
++ 	 *
++ 	 * ROC in three conditions:
++ 	 * 1. there are ROC lsegs
++ 	 * 2. we don't send layoutreturn
++ 	 * 3. no others are sending layoutreturn
++ 	 */
++ 	if (found && !layoutreturn && pnfs_prepare_layoutreturn(lo))
++ 		roc = true;
++ 
++ out_noroc:
++ 	spin_unlock(&ino->i_lock);
++ 	pnfs_free_lseg_list(&tmp_list);
++ 	pnfs_layoutcommit_inode(ino, true);
++ 	if (layoutreturn)
+++>>>>>>> e755d638e91b (NFS41: make sure sending LAYOUTRETURN before close if marked so)
+  		pnfs_send_layoutreturn(lo, stateid, IOMODE_ANY, true);
+- 	}
+- 	return false;
++ 	return roc;
+  }
+  
+  void pnfs_roc_release(struct inode *ino)
+* Unmerged path fs/nfs/pnfs.c
