@@ -1,0 +1,347 @@
+KVM: Rename kvm_arch_mmu_write_protect_pt_masked to be more generic for log dirty
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [kvm] Rename kvm_arch_mmu_write_protect_pt_masked to be more generic for log dirty (Bandan Das) [1209995]
+Rebuild_FUZZ: 96.82%
+commit-author Kai Huang <kai.huang@linux.intel.com>
+commit 3b0f1d01e501792d8d89ab4371bc9e8cd2a10032
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3b0f1d01.failed
+
+We don't have to write protect guest memory for dirty logging if architecture
+supports hardware dirty logging, such as PML on VMX, so rename it to be more
+generic.
+
+	Signed-off-by: Kai Huang <kai.huang@linux.intel.com>
+	Reviewed-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3b0f1d01e501792d8d89ab4371bc9e8cd2a10032)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kvm/mmu.c
+diff --cc arch/arm/kvm/mmu.c
+index 84ba67b982c0,6034697ede3f..000000000000
+--- a/arch/arm/kvm/mmu.c
++++ b/arch/arm/kvm/mmu.c
+@@@ -517,18 -903,237 +517,234 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool transparent_hugepage_adjust(pfn_t *pfnp, phys_addr_t *ipap)
++ {
++ 	pfn_t pfn = *pfnp;
++ 	gfn_t gfn = *ipap >> PAGE_SHIFT;
++ 
++ 	if (PageTransCompound(pfn_to_page(pfn))) {
++ 		unsigned long mask;
++ 		/*
++ 		 * The address we faulted on is backed by a transparent huge
++ 		 * page.  However, because we map the compound huge page and
++ 		 * not the individual tail page, we need to transfer the
++ 		 * refcount to the head page.  We have to be careful that the
++ 		 * THP doesn't start to split while we are adjusting the
++ 		 * refcounts.
++ 		 *
++ 		 * We are sure this doesn't happen, because mmu_notifier_retry
++ 		 * was successful and we are holding the mmu_lock, so if this
++ 		 * THP is trying to split, it will be blocked in the mmu
++ 		 * notifier before touching any of the pages, specifically
++ 		 * before being able to call __split_huge_page_refcount().
++ 		 *
++ 		 * We can therefore safely transfer the refcount from PG_tail
++ 		 * to PG_head and switch the pfn from a tail page to the head
++ 		 * page accordingly.
++ 		 */
++ 		mask = PTRS_PER_PMD - 1;
++ 		VM_BUG_ON((gfn & mask) != (pfn & mask));
++ 		if (pfn & mask) {
++ 			*ipap &= PMD_MASK;
++ 			kvm_release_pfn_clean(pfn);
++ 			pfn &= ~mask;
++ 			kvm_get_pfn(pfn);
++ 			*pfnp = pfn;
++ 		}
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool kvm_is_write_fault(struct kvm_vcpu *vcpu)
++ {
++ 	if (kvm_vcpu_trap_is_iabt(vcpu))
++ 		return false;
++ 
++ 	return kvm_vcpu_dabt_iswrite(vcpu);
++ }
++ 
++ static bool kvm_is_device_pfn(unsigned long pfn)
++ {
++ 	return !pfn_valid(pfn);
++ }
++ 
++ /**
++  * stage2_wp_ptes - write protect PMD range
++  * @pmd:	pointer to pmd entry
++  * @addr:	range start address
++  * @end:	range end address
++  */
++ static void stage2_wp_ptes(pmd_t *pmd, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pte_t *pte;
++ 
++ 	pte = pte_offset_kernel(pmd, addr);
++ 	do {
++ 		if (!pte_none(*pte)) {
++ 			if (!kvm_s2pte_readonly(pte))
++ 				kvm_set_s2pte_readonly(pte);
++ 		}
++ 	} while (pte++, addr += PAGE_SIZE, addr != end);
++ }
++ 
++ /**
++  * stage2_wp_pmds - write protect PUD range
++  * @pud:	pointer to pud entry
++  * @addr:	range start address
++  * @end:	range end address
++  */
++ static void stage2_wp_pmds(pud_t *pud, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pmd_t *pmd;
++ 	phys_addr_t next;
++ 
++ 	pmd = pmd_offset(pud, addr);
++ 
++ 	do {
++ 		next = kvm_pmd_addr_end(addr, end);
++ 		if (!pmd_none(*pmd)) {
++ 			if (kvm_pmd_huge(*pmd)) {
++ 				if (!kvm_s2pmd_readonly(pmd))
++ 					kvm_set_s2pmd_readonly(pmd);
++ 			} else {
++ 				stage2_wp_ptes(pmd, addr, next);
++ 			}
++ 		}
++ 	} while (pmd++, addr = next, addr != end);
++ }
++ 
++ /**
++   * stage2_wp_puds - write protect PGD range
++   * @pgd:	pointer to pgd entry
++   * @addr:	range start address
++   * @end:	range end address
++   *
++   * Process PUD entries, for a huge PUD we cause a panic.
++   */
++ static void  stage2_wp_puds(pgd_t *pgd, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pud_t *pud;
++ 	phys_addr_t next;
++ 
++ 	pud = pud_offset(pgd, addr);
++ 	do {
++ 		next = kvm_pud_addr_end(addr, end);
++ 		if (!pud_none(*pud)) {
++ 			/* TODO:PUD not supported, revisit later if supported */
++ 			BUG_ON(kvm_pud_huge(*pud));
++ 			stage2_wp_pmds(pud, addr, next);
++ 		}
++ 	} while (pud++, addr = next, addr != end);
++ }
++ 
++ /**
++  * stage2_wp_range() - write protect stage2 memory region range
++  * @kvm:	The KVM pointer
++  * @addr:	Start address of range
++  * @end:	End address of range
++  */
++ static void stage2_wp_range(struct kvm *kvm, phys_addr_t addr, phys_addr_t end)
++ {
++ 	pgd_t *pgd;
++ 	phys_addr_t next;
++ 
++ 	pgd = kvm->arch.pgd + pgd_index(addr);
++ 	do {
++ 		/*
++ 		 * Release kvm_mmu_lock periodically if the memory region is
++ 		 * large. Otherwise, we may see kernel panics with
++ 		 * CONFIG_DETECT_HUNG_TASK, CONFIG_LOCKUP_DETECTOR,
++ 		 * CONFIG_LOCKDEP. Additionally, holding the lock too long
++ 		 * will also starve other vCPUs.
++ 		 */
++ 		if (need_resched() || spin_needbreak(&kvm->mmu_lock))
++ 			cond_resched_lock(&kvm->mmu_lock);
++ 
++ 		next = kvm_pgd_addr_end(addr, end);
++ 		if (pgd_present(*pgd))
++ 			stage2_wp_puds(pgd, addr, next);
++ 	} while (pgd++, addr = next, addr != end);
++ }
++ 
++ /**
++  * kvm_mmu_wp_memory_region() - write protect stage 2 entries for memory slot
++  * @kvm:	The KVM pointer
++  * @slot:	The memory slot to write protect
++  *
++  * Called to start logging dirty pages after memory region
++  * KVM_MEM_LOG_DIRTY_PAGES operation is called. After this function returns
++  * all present PMD and PTEs are write protected in the memory region.
++  * Afterwards read of dirty page log can be called.
++  *
++  * Acquires kvm_mmu_lock. Called with kvm->slots_lock mutex acquired,
++  * serializing operations for VM memory regions.
++  */
++ void kvm_mmu_wp_memory_region(struct kvm *kvm, int slot)
++ {
++ 	struct kvm_memory_slot *memslot = id_to_memslot(kvm->memslots, slot);
++ 	phys_addr_t start = memslot->base_gfn << PAGE_SHIFT;
++ 	phys_addr_t end = (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	stage2_wp_range(kvm, start, end);
++ 	spin_unlock(&kvm->mmu_lock);
++ 	kvm_flush_remote_tlbs(kvm);
++ }
++ 
++ /**
++  * kvm_mmu_write_protect_pt_masked() - write protect dirty pages
++  * @kvm:	The KVM pointer
++  * @slot:	The memory slot associated with mask
++  * @gfn_offset:	The gfn offset in memory slot
++  * @mask:	The mask of dirty pages at offset 'gfn_offset' in this memory
++  *		slot to be write protected
++  *
++  * Walks bits set in mask write protects the associated pte's. Caller must
++  * acquire kvm_mmu_lock.
++  */
++ static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
++ 		struct kvm_memory_slot *slot,
++ 		gfn_t gfn_offset, unsigned long mask)
++ {
++ 	phys_addr_t base_gfn = slot->base_gfn + gfn_offset;
++ 	phys_addr_t start = (base_gfn +  __ffs(mask)) << PAGE_SHIFT;
++ 	phys_addr_t end = (base_gfn + __fls(mask) + 1) << PAGE_SHIFT;
++ 
++ 	stage2_wp_range(kvm, start, end);
++ }
++ 
++ /*
++  * kvm_arch_mmu_enable_log_dirty_pt_masked - enable dirty logging for selected
++  * dirty pages.
++  *
++  * It calls kvm_mmu_write_protect_pt_masked to write protect selected pages to
++  * enable dirty logging for them.
++  */
++ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
++ 		struct kvm_memory_slot *slot,
++ 		gfn_t gfn_offset, unsigned long mask)
++ {
++ 	kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++ }
++ 
+++>>>>>>> 3b0f1d01e501 (KVM: Rename kvm_arch_mmu_write_protect_pt_masked to be more generic for log dirty)
+  static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ -			  struct kvm_memory_slot *memslot, unsigned long hva,
+ +			  gfn_t gfn, struct kvm_memory_slot *memslot,
+  			  unsigned long fault_status)
+  {
+ +	pte_t new_pte;
+ +	pfn_t pfn;
+  	int ret;
+ -	bool write_fault, writable, hugetlb = false, force_pte = false;
+ +	bool write_fault, writable;
+  	unsigned long mmu_seq;
+ -	gfn_t gfn = fault_ipa >> PAGE_SHIFT;
+ -	struct kvm *kvm = vcpu->kvm;
+  	struct kvm_mmu_memory_cache *memcache = &vcpu->arch.mmu_page_cache;
+ -	struct vm_area_struct *vma;
+ -	pfn_t pfn;
+ -	pgprot_t mem_type = PAGE_S2;
+ -	bool fault_ipa_uncached;
+ -	bool logging_active = memslot_is_logging(memslot);
+ -	unsigned long flags = 0;
+  
+ -	write_fault = kvm_is_write_fault(vcpu);
+ +	write_fault = kvm_is_write_fault(kvm_vcpu_get_hsr(vcpu));
+  	if (fault_status == FSC_PERM && !write_fault) {
+  		kvm_err("Unexpected L2 read permission error\n");
+  		return -EFAULT;
+* Unmerged path arch/arm/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 2e21e1e0dc32..1ed7fcc20926 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -1216,7 +1216,7 @@ static bool __rmap_write_protect(struct kvm *kvm, unsigned long *rmapp,
+ }
+ 
+ /**
+- * kvm_arch_mmu_write_protect_pt_masked - write protect selected PT level pages
++ * kvm_mmu_write_protect_pt_masked - write protect selected PT level pages
+  * @kvm: kvm instance
+  * @slot: slot to protect
+  * @gfn_offset: start of the BITS_PER_LONG pages we care about
+@@ -1225,7 +1225,7 @@ static bool __rmap_write_protect(struct kvm *kvm, unsigned long *rmapp,
+  * Used when we do not need to care about huge page mappings: e.g. during dirty
+  * logging we do not have any such mappings.
+  */
+-void kvm_arch_mmu_write_protect_pt_masked(struct kvm *kvm,
++static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
+ 				     struct kvm_memory_slot *slot,
+ 				     gfn_t gfn_offset, unsigned long mask)
+ {
+@@ -1241,6 +1241,23 @@ void kvm_arch_mmu_write_protect_pt_masked(struct kvm *kvm,
+ 	}
+ }
+ 
++/**
++ * kvm_arch_mmu_enable_log_dirty_pt_masked - enable dirty logging for selected
++ * PT level pages.
++ *
++ * It calls kvm_mmu_write_protect_pt_masked to write protect selected pages to
++ * enable dirty logging for them.
++ *
++ * Used when we do not need to care about huge page mappings: e.g. during dirty
++ * logging we do not have any such mappings.
++ */
++void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
++				struct kvm_memory_slot *slot,
++				gfn_t gfn_offset, unsigned long mask)
++{
++	kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
++}
++
+ static bool rmap_write_protect(struct kvm *kvm, u64 gfn)
+ {
+ 	struct kvm_memory_slot *slot;
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 0d7110e044b1..6afae93c8a77 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -597,7 +597,7 @@ int kvm_get_dirty_log(struct kvm *kvm,
+ int kvm_get_dirty_log_protect(struct kvm *kvm,
+ 			struct kvm_dirty_log *log, bool *is_dirty);
+ 
+-void kvm_arch_mmu_write_protect_pt_masked(struct kvm *kvm,
++void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
+ 					struct kvm_memory_slot *slot,
+ 					gfn_t gfn_offset,
+ 					unsigned long mask);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 85e30f60e9b6..3412fa007ef6 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -1059,7 +1059,7 @@ int kvm_get_dirty_log_protect(struct kvm *kvm,
+ 		dirty_bitmap_buffer[i] = mask;
+ 
+ 		offset = i * BITS_PER_LONG;
+-		kvm_arch_mmu_write_protect_pt_masked(kvm, memslot, offset,
++		kvm_arch_mmu_enable_log_dirty_pt_masked(kvm, memslot, offset,
+ 								mask);
+ 	}
+ 
